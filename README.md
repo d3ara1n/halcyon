@@ -6,6 +6,19 @@
 
 参阅 `./notes/{doc}.md`
 
+## 快速开始
+
+### 先决条件
+
+- Rust nightly（由仓库根的 `rust-toolchain` 指定，首次构建自动安装）
+- RISC-V 目标与组件：`rustup target add riscv64gc-unknown-none-elf && rustup component add rust-src llvm-tools`
+- 系统工具（macOS / Homebrew）：`brew install just dtc qemu riscv64-elf-binutils riscv64-elf-gdb`
+  - `riscv64-elf-binutils` 提供 kernel 链接器 `riscv64-elf-ld`
+  - `riscv64-elf-gdb` 用于调试
+- 拉取子模块：`git submodule update --init`（`dtb_parser` 是内核硬依赖）
+
+> QEMU 默认以内置 OpenSBI 固件作为 `-bios`，无需自行编译 OpenSBI。
+
 ## 进度
 
 - [ ] IPC
@@ -37,10 +50,6 @@
 
 - [x] qemu-virt: 4 cores 128MB ram with MMU
 - [x] qemu-sifive_u: 5 cores(#0 disabled) 128MB ram with MMU
-- [ ] k210: 2 cores 8MB ram with MMU *内存太少了哇*
-- [ ] D1s(F133): single core 64MB with MMU
-
-只有 virt 能跑，其他的会遇到莫名bug
 
 ## 标准库
 
@@ -50,30 +59,32 @@
 
 ## 源码使用
 
-构建系统用的 Justfile, 可执行名为 `/bin/just`
+构建系统用 [Just](https://just.systems)，可执行名为 `just`。
 
-使用参数 `PLATFORM` 和 `MODEL` 来对应 `platforms/{{PLATFORM}}/{{MODEL}}/*` 的设备文件。
-由于我不知道如何用 just 做到使用 dict 保存并应用 PLATFORM/MODEL 到 OpenSBI/PLATFORM/FW_CONFIG 的特定配置，编译或者运行需要 `just build(或run)_$MODEL`，要求指定型号。
-
-### 构建
+运行（自动编译内核与 initfs 并启动 QEMU）：
 
 ```sh
-just PLATFORM=foo MODEL=bar build
+just virt       # qemu virt: 4 核
+just sifive_u   # qemu sifive_u: 5 核（#0 禁用）
 ```
 
-### 运行
-
-需要 `qemu-system-riscv64`
+仅编译内核：
 
 ```sh
-just run
+just build_kernel
 ```
 
-### 调试
-
-~~~用 gdb 调试会有字长问题，这里用`riscv64-elf-gdb`~~~
-用 riscv64-elf-gdb 调试会有 rust-testsuit 问题，这里用 `git-multiarch`
+调试：让 QEMU 以 `-s -S` 启动并暂停等待，再用 `riscv64-elf-gdb` 连接：
 
 ```sh
-just debug
+# 终端 1
+just PLATFORM=qemu MODEL=virt run_qemu -smp cores=4 -s -S
+# 终端 2
+riscv64-elf-gdb artifacts/erhino_kernel -ex 'target remote :1234'
+```
+
+导出 QEMU 生成的设备树：
+
+```sh
+just run_qemu_dump_dtb
 ```

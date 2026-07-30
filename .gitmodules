@@ -1,9 +1,3 @@
-[submodule "submodules/opensbi"]
-	path = submodules/opensbi
-	url = git@github.com:riscv-software-src/opensbi.git
 [submodule "submodules/dtb_parser"]
 	path = submodules/dtb_parser
 	url = git@github.com:d3ara1n/dtb_parser.git
-[submodule "submodules/u-boot"]
-	path = submodules/u-boot
-	url = git@github.com:u-boot/u-boot.git

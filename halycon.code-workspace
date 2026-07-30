@@ -123,10 +123,7 @@
 			"./os/Cargo.toml",
 			"./user/Cargo.toml"
 		],
-		"rust-analyzer.showUnlinkedFileNotification": false,
-		"terminal.integrated.env.linux": {
-			"CROSS_COMPILE": "riscv64-linux-gnu-"
-		},
+		"rust-analyzer.showUnlinkedFileNotification": false
 	},
 	"tasks": {
 		"version": "2.0.0",
@@ -183,7 +180,7 @@
 					"engineLogging": false
 				},
 				"MIMode": "gdb",
-				"miDebuggerPath": "gdb-multiarch",
+				"miDebuggerPath": "riscv64-elf-gdb",
 				"miDebuggerArgs": "-ex 'set arch riscv:rv64'",
 			},
 		]
