@@ -60,7 +60,7 @@ make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/srv_* "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/drv_* "{{TARGET_DIR}}/initfs/bin"
-    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | tar -cvf ../initfs.tar -T -
+    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | tar --format=ustar -cvf ../initfs.tar -T -
 
 build_kernel: 
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}\033[0m"
