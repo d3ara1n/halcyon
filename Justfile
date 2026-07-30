@@ -53,19 +53,19 @@ make_dtb: artifact_dir
     @dtc -O dtb -o "{{DTB}}" "{{DTS}}"
 
 build_user: artifact_dir
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --bins {{RELEASE}} -Z unstable-options --out-dir "{{TARGET_DIR}}/build"
+    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --bins {{RELEASE}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     @echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
 make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/srv_* "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/drv_* "{{TARGET_DIR}}/initfs/bin"
-    @cd "{{TARGET_DIR}}/initfs" && find . -type f | tar --transform 's/^..//' -cvf ../initfs.tar --files-from=/dev/stdin
+    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | tar -cvf ../initfs.tar -T -
 
 build_kernel: 
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}\033[0m"
     @cp "{{MEMORY_SCRIPT}}" "{{TARGET_DIR}}"
-    @cd os && RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} -Z unstable-options --out-dir {{TARGET_DIR}}
+    @cd os && RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} -Z unstable-options --artifact-dir {{TARGET_DIR}}
     @rust-objcopy {{KERNEL_ELF}} -S -O binary {{KERNEL_BIN}} -B=riscv64
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
 

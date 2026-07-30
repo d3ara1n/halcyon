@@ -1,7 +1,7 @@
-use core::{alloc::Layout, panic::PanicInfo};
+use core::{alloc::Layout, panic::PanicInfo, ptr::NonNull};
 use erhino_shared::proc::{Pid, SystemSignal, Termination};
 use erhino_shared::sync::spin::SimpleLock;
-use talc::{Source, Talc, TalcLock};
+use talc::{base::binning::Binning, base::Talc, source::Source, TalcLock};
 
 use crate::call::sys_extend;
 use crate::env;
@@ -21,7 +21,7 @@ impl HeapRecuse {
 }
 
 unsafe impl Source for HeapRecuse {
-    fn acquire<B: talc::Binning>(talc: &mut Talc<Self, B>, layout: Layout) -> Result<(), ()> {
+    fn acquire<B: Binning>(talc: &mut Talc<Self, B>, layout: Layout) -> Result<(), ()> {
         let mut count = 1;
         let single = 4096;
         while count * single < layout.size() {
@@ -37,9 +37,9 @@ unsafe impl Source for HeapRecuse {
             let end = if old_end == 0 {
                 unsafe { talc.claim(base, size).expect("initial heap claim failed") }
             } else {
-                unsafe { talc.extend(old_end as *mut u8, new_end) }
+                unsafe { talc.extend(NonNull::new(old_end as *mut u8).unwrap(), new_end) }
             };
-            talc.source.heap_end = end as usize;
+            talc.source.heap_end = end.as_ptr() as usize;
             Ok(())
         } else {
             Err(())
@@ -67,7 +67,7 @@ fn lang_start<T: Termination + 'static>(
             let start = offset - INITIAL_HEAP_SIZE;
             // SAFETY: [start, offset) 是 sys_extend 刚申请的内存，交给分配器。
             if let Some(heap_end) = unsafe { talc.claim(start as *mut u8, INITIAL_HEAP_SIZE) } {
-                talc.source.heap_end = heap_end as usize;
+                talc.source.heap_end = heap_end.as_ptr() as usize;
             } else {
                 panic!();
             }
@@ -91,7 +91,7 @@ fn handle_panic(info: &PanicInfo) -> ! {
             "Panicking in {} at line {}: {}",
             location.file(),
             location.line(),
-            info.message().unwrap()
+            info.message()
         );
     } else {
         debug!("Panicking: no information available.");
