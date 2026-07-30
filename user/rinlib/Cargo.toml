@@ -9,7 +9,7 @@ edition = "2021"
 
 [dependencies]
 erhino_shared = { path = "../../shared" }
-talc = "3.0"
+talc = "5.0"
 lock_api = "0.4"
 flagset = "0.4"
 num-traits = { version = "0.2", default-features = false }

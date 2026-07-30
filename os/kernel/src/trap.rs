@@ -1,14 +1,13 @@
-use core::fmt::Display;
+use core::{fmt::Display, sync::atomic::Ordering};
 
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
     mem::{Address, MemoryOperation}, proc::Tid,
 };
 use num_traits::FromPrimitive;
-use riscv::register::{
-    satp,
-    scause::{self, Exception, Interrupt, Scause, Trap},
-    sepc, stval,
+use riscv::{
+    interrupt::{Trap, supervisor::{Exception, Interrupt}},
+    register::{satp, scause::{self, Scause}, sepc, stval},
 };
 
 use crate::{
@@ -86,7 +85,7 @@ impl TrapFrame {
         self.x[2] = stack_address as u64;
         self.pc = entry_point as u64;
         self.kernel_tp = 0u64;
-        self.kernel_satp = unsafe { KERNEL_SATP } as u64;
+        self.kernel_satp = KERNEL_SATP.load(Ordering::Relaxed) as u64;
         self.kernel_trap = _kernel_trap as u64;
         self.user_trap = user_trap as u64;
     }
@@ -141,19 +140,19 @@ fn kernel_dump() -> ! {
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe fn handle_kernel_trap(cause: Scause, _val: usize) {
-    match cause.cause() {
+    match cause.cause().try_into::<Interrupt, Exception>().unwrap() {
         // 也有可能是进程剩余时间片太短，还没进入用户空间就触发异常，直接转发给 hart 会导致 hart 的串行特性失效，一种解决办法是 user_ trap 时关闭 stie 和 seie
         Trap::Interrupt(Interrupt::SupervisorTimer) => todo!("nested supervisor timer"),
         _ => kernel_dump(),
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe fn handle_user_trap(cause: Scause, val: usize) -> (usize, Address) {
     if let HartKind::Application(hart) = hart::this_hart() {
-        match cause.cause() {
+        match cause.cause().try_into::<Interrupt, Exception>().unwrap() {
             Trap::Interrupt(Interrupt::SupervisorTimer) => hart.trap(TrapCause::TimerInterrupt),
             Trap::Exception(exception) => match exception {
                 Exception::Breakpoint => hart.trap(TrapCause::Breakpoint),

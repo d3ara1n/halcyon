@@ -122,7 +122,7 @@ impl<S: Scheduler, R: RandomGenerator> ApplicationHart<S, R> {
         debug!("#{} awaken", self.id());
         self.scheduler.schedule();
         if let Some((_, trampoline, satp, trapframe)) = self.scheduler.context() {
-            unsafe { _switch(KERNEL_SATP, trampoline, satp, trapframe) }
+            unsafe { _switch(KERNEL_SATP.load(Ordering::Relaxed), trampoline, satp, trapframe) }
         } else {
             self.go_idle()
         }
@@ -149,7 +149,7 @@ impl<S: Scheduler, R: RandomGenerator> ApplicationHart<S, R> {
                 let length = arg1;
                 match process.read(address, length) {
                     Ok(buffer) => {
-                        let str = unsafe { String::from_utf8_unchecked(buffer) };
+                        let str = String::from_utf8_lossy(&buffer);
                         println!(
                             "\x1b[0;34mUSER\x1b[0m {}({}): {}",
                             context.pid(),

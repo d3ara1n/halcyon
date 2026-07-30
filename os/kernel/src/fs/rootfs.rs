@@ -494,7 +494,7 @@ impl Rootfs {
                     }
                     _ => Err(FilesystemAbstractLayerError::Mistyped),
                 },
-                _ => unreachable!(),
+                _ => Err(FilesystemAbstractLayerError::InvalidPath),
             }
         } else {
             Ok(container)

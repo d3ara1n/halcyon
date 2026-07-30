@@ -3,30 +3,30 @@ name = "erhino_kernel"
 version = "0.1.0"
 authors = ["Chien Zhang (zqy0224@live.com)"]
 description = "kernel.bin"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-riscv = "0.11"
+riscv = "0.14"
 erhino_shared = { path = "../../shared" }
-buddy_system_allocator = { version = "0.9", default-features = false, features = [
-    "const_fn",
+buddy_system_allocator = { version = "0.13", default-features = false, features = [
+    "alloc",
     "use_spin",
 ] }
 num-traits = { version = "0.2", default-features = false }
-num-derive = "0.4"
+num-derive = "0.5"
 # will colored supports no_std? https://github.com/colored-rs/colored/issues/140
 # colored = "2.0"
 dtb_parser = { path = "../../submodules/dtb_parser", default-features = false }
-hashbrown = "0.14"
+hashbrown = "0.17"
 flagset = "0.4"
-elf_rs = "0.3"
-strum = { version = "0.26", default-features = false }
-strum_macros = "0.26"
+elf_rs = "0.3.1"
+strum = { version = "0.28", default-features = false }
+strum_macros = "0.28"
 semver = { version = "1.0", default-features = false }
-tar-no-std = "0.2"
+tar-no-std = "0.4"
 lock_api = "0.4"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 postcard = "1.0"
-goblin = { version = "0.8", default-features = false, features = ["elf64"] }
+goblin = { version = "0.9", default-features = false, features = ["elf64"] }

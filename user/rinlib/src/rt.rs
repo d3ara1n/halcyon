@@ -1,7 +1,7 @@
 use core::{alloc::Layout, panic::PanicInfo};
 use erhino_shared::proc::{Pid, SystemSignal, Termination};
 use erhino_shared::sync::spin::SimpleLock;
-use talc::{OomHandler, Span, Talc, Talck};
+use talc::{Source, Talc, TalcLock};
 
 use crate::call::sys_extend;
 use crate::env;
@@ -9,36 +9,37 @@ use crate::{call::sys_exit, debug, ipc::signal};
 
 const INITIAL_HEAP_SIZE: usize = 1 * 0x1000;
 
+#[derive(Debug)]
 struct HeapRecuse {
-    heap: Span,
+    heap_end: usize,
 }
 
 impl HeapRecuse {
     const fn new() -> Self {
-        Self {
-            heap: Span::empty(),
-        }
+        Self { heap_end: 0 }
     }
 }
 
-impl OomHandler for HeapRecuse {
-    fn handle_oom(talc: &mut Talc<Self>, layout: Layout) -> Result<(), ()> {
+unsafe impl Source for HeapRecuse {
+    fn acquire<B: talc::Binning>(talc: &mut Talc<Self, B>, layout: Layout) -> Result<(), ()> {
         let mut count = 1;
         let single = 4096;
         while count * single < layout.size() {
             count *= 2;
         }
-        let old = talc.oom_handler.heap;
+        let old_end = talc.source.heap_end;
         if let Ok(offset) = unsafe { sys_extend(count) } {
             let size = count * single;
-            let new = if old.is_empty() {
-                Span::new((offset - size) as *mut u8, offset as *mut u8)
+            let new_end = offset as *mut u8;
+            let base = (offset - size) as *mut u8;
+            // SAFETY: [base, offset) 是 sys_extend 刚向内核申请的内存，独占交给分配器；
+            // 首次 claim，之后假设新内存与既有 heap 连续而 extend。
+            let end = if old_end == 0 {
+                unsafe { talc.claim(base, size).expect("initial heap claim failed") }
             } else {
-                old.extend(0, size)
+                unsafe { talc.extend(old_end as *mut u8, new_end) }
             };
-            unsafe {
-                talc.oom_handler.heap = talc.extend(old, new);
-            }
+            talc.source.heap_end = end as usize;
             Ok(())
         } else {
             Err(())
@@ -47,7 +48,7 @@ impl OomHandler for HeapRecuse {
 }
 
 #[global_allocator]
-static mut HEAP_ALLOCATOR: Talck<SimpleLock, HeapRecuse> = Talc::new(HeapRecuse::new()).lock();
+static HEAP_ALLOCATOR: TalcLock<SimpleLock, HeapRecuse> = TalcLock::new(HeapRecuse::new());
 
 #[lang = "start"]
 fn lang_start<T: Termination + 'static>(
@@ -61,12 +62,12 @@ fn lang_start<T: Termination + 'static>(
     unsafe {
         env::PID.set(pid).unwrap();
         env::PARENT_PID.set(parent).unwrap();
-        let mut talc = HEAP_ALLOCATOR.talc();
+        let mut talc = HEAP_ALLOCATOR.lock();
         if let Ok(offset) = sys_extend(INITIAL_HEAP_SIZE) {
             let start = offset - INITIAL_HEAP_SIZE;
-            if let Ok(heap) = talc.claim(Span::from_base_size(start as *mut u8, INITIAL_HEAP_SIZE))
-            {
-                talc.oom_handler.heap = heap;
+            // SAFETY: [start, offset) 是 sys_extend 刚申请的内存，交给分配器。
+            if let Some(heap_end) = unsafe { talc.claim(start as *mut u8, INITIAL_HEAP_SIZE) } {
+                talc.source.heap_end = heap_end as usize;
             } else {
                 panic!();
             }

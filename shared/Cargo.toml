@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 num-traits = { version = "0.2", default-features = false}
-num-derive = "0.4"
+num-derive = "0.5"
 flagset = "0.4"
 lock_api = "0.4"

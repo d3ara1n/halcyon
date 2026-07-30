@@ -1,4 +1,7 @@
-use core::arch::asm;
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use strum_macros::EnumIter;
 
 use crate::hart::HartId;
@@ -217,25 +220,21 @@ pub fn debug_console_write_byte(byte: u8) -> SbiResult {
     sbi_call(SbiExtension::DebugConsole, 2, byte as usize, 0 as usize, 0)
 }
 
-static mut TIME_SUPPORTED: bool = false;
-static mut DEBUG_CONSOLE_SUPPORTED: bool = false;
+static TIME_SUPPORTED: AtomicBool = AtomicBool::new(false);
+static DEBUG_CONSOLE_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_debug_console_supported() -> bool {
-    unsafe { DEBUG_CONSOLE_SUPPORTED }
+    DEBUG_CONSOLE_SUPPORTED.load(Ordering::Relaxed)
 }
 
 pub fn is_time_supported() -> bool {
-    unsafe { TIME_SUPPORTED }
+    TIME_SUPPORTED.load(Ordering::Relaxed)
 }
 pub fn init() {
     if let Ok(res) = sbi_probe_extension(SbiExtension::DebugConsole) {
-        unsafe {
-            DEBUG_CONSOLE_SUPPORTED = res != 0;
-        }
+        DEBUG_CONSOLE_SUPPORTED.store(res != 0, Ordering::Relaxed);
     }
     if let Ok(res) = sbi_probe_extension(SbiExtension::Time) {
-        unsafe {
-            TIME_SUPPORTED = res != 0;
-        }
+        TIME_SUPPORTED.store(res != 0, Ordering::Relaxed);
     }
 }

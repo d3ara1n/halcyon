@@ -123,7 +123,7 @@ unsafe impl RawMutex for SimpleLock {
     }
 
     unsafe fn unlock(&self) {
-        self.lock.store(false, Ordering::Relaxed);
+        self.lock.store(false, Ordering::Release);
     }
 
     fn try_lock(&self) -> bool {

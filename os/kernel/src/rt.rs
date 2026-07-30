@@ -69,7 +69,7 @@ fn handle_panic(info: &PanicInfo) -> ! {
             hart::hartid(),
             location.file(),
             location.line(),
-            info.message().unwrap()
+            info.message()
         );
     } else {
         println!(

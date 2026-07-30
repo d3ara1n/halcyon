@@ -271,7 +271,7 @@ impl ProcessCell {
         } else {
             0 as Tid
         };
-        let generation = unsafe { &PROC_TABLE }.gen();
+        let generation = unsafe { &PROC_TABLE }.current_generation();
         let trapframe = Self::address_of_trapframe::<PageEntryImpl>(self.layout.trampoline, tid);
         let stack = ProcessCell::address_of_stack(self.layout.stack_point, tid);
         let entry = thread.entry_point;
@@ -398,7 +398,7 @@ impl ProcessTable {
         }
     }
 
-    pub fn gen(&self) -> usize {
+    pub fn current_generation(&self) -> usize {
         self.generation.load(Ordering::Relaxed)
     }
 

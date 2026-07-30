@@ -1,6 +1,6 @@
 use erhino_shared::mem::Address;
 
-extern "C" {
+unsafe extern "C" {
     pub fn _memory_start();
     pub fn _kernel_start();
     pub fn _bss_start();

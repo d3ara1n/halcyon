@@ -1,6 +1,7 @@
 #![no_std]
-#![feature(lang_items, alloc_error_handler, panic_info_message, let_chains)]
+#![feature(lang_items, alloc_error_handler, panic_info_message)]
 #![allow(internal_features)]
+#![allow(static_mut_refs)]
 
 use core::{arch::global_asm, slice::from_raw_parts};
 
@@ -52,7 +53,7 @@ pub fn main() {
     if let Some((addr, size)) = board.initfs() {
         println!("[InitFS ] @{:#x}({:#x})", addr, size);
         let ramfs = unsafe { from_raw_parts(addr as *const u8, size) };
-        let archive = TarArchiveRef::new(ramfs);
+        let archive = TarArchiveRef::new(ramfs).expect("initfs archive corrupt");
         let files = archive.entries();
         fs::create(
             Path::from("/boot").unwrap(),
@@ -63,7 +64,9 @@ pub fn main() {
         )
         .unwrap();
         for file in files {
-            let path = Path::from(&format!("/boot/{}", file.filename())).unwrap();
+            let filename = file.filename();
+            let name = filename.as_str().unwrap_or("");
+            let path = Path::from(&format!("/boot/{}", name)).unwrap();
             let parent = path.parent().unwrap();
             fs::make_directory(
                 parent,
@@ -78,7 +81,7 @@ pub fn main() {
                 DentryAttribute::Executable | DentryAttribute::Readable,
             )
             .unwrap();
-            if file.filename().starts_with("bin/") {
+            if name.starts_with("bin/") {
                 let process = Process::from_elf(file.data()).unwrap();
                 SchedulerImpl::add(process, None);
             }

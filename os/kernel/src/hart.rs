@@ -50,7 +50,7 @@ pub fn init() {
             }
         }
         let timer = TimerImpl::new(cpu.freq());
-        let seed = timer.uptime();
+        let seed = riscv::register::time::read();
         let hart = ApplicationHart::new(
             cpu.id(),
             UnfairScheduler::new(cpu.id(), timer),

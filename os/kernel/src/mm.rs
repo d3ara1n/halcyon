@@ -1,4 +1,7 @@
-use core::cell::OnceCell;
+use core::{
+    cell::OnceCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use erhino_shared::proc::Tid;
 
@@ -17,8 +20,8 @@ pub mod usage;
 type KernelUnit = MemoryUnit<PageEntryImpl>;
 
 pub static mut KERNEL_UNIT: OnceCell<KernelUnit> = OnceCell::new();
-#[export_name = "_kernel_satp"]
-pub static mut KERNEL_SATP: usize = 0;
+#[unsafe(export_name = "_kernel_satp")]
+pub static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 
 #[allow(unused)]
 pub enum ProcessAddressRegion {
@@ -60,6 +63,6 @@ pub fn init() {
         if let Err(_) = KERNEL_UNIT.set(unit) {
             panic!("set KERNEL_UNIT shared data failed")
         }
-        KERNEL_SATP = satp;
+        KERNEL_SATP.store(satp, Ordering::Relaxed);
     }
 }
