@@ -1,4 +1,4 @@
-#![feature(lang_items, panic_info_message, alloc_error_handler)]
+#![feature(lang_items, alloc_error_handler)]
 // Don't link to std. We are std.
 #![no_std]
 #![allow(internal_features)]
@@ -10,11 +10,11 @@ pub extern crate alloc;
 
 mod call;
 pub mod dbg;
+pub mod env;
+pub mod fs;
 pub mod ipc;
 pub mod mm;
 pub mod preclude;
+pub mod process;
 mod rt;
 pub mod thread;
-pub mod process;
-pub mod fs;
-pub mod env;

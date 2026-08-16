@@ -1,5 +1,5 @@
 #![no_std]
-#![feature(lang_items, alloc_error_handler, panic_info_message)]
+#![feature(lang_items, alloc_error_handler)]
 #![allow(internal_features)]
 #![allow(static_mut_refs)]
 
