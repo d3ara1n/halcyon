@@ -2,13 +2,11 @@
 
 记录会随时间消灭的问题，修复后删除条目；持久性约定在 AGENTS.md。
 
-## rust-analyzer 无法区分 os / user 的 target
+## rust-analyzer 环境前提
 
-`halycon.code-workspace` 用 `linkedProjects` 把 shared/os/user 链进同一个 rust-analyzer 实例，但 `cargo.target` 是实例级单值，全局设为 `riscv64gc-unknown-none-elf`——user/ 的自定义 target（`rinlib/riscv64-unknown-erhino-elf.json` + build-std）在分析时被忽略。user 侧补全/类型大体可用，但 check-on-save 与真实构建（`just`）结果不一致，cfg / target feature 相关的差异不可见。
+多 workspace 各自 target 无需编辑器配置：RA 按 workspace root 读取 `.cargo/config.toml` 的 `build.target`（2026-08 实测，含 user/ 自定义 JSON target）。
 
-上游未解决：linkedProjects 不支持 per-project target（rust-lang/rust-analyzer#8521）；子目录 `.cargo/config.toml` 的 `build.target` 不被尊重（#11064、#11900）；JSON 自定义 target 还需 `-Zjson-target-spec`（#21821）。
-
-根治方向：VSCode multi-root（os / user / shared 各为 folder，各自 `.vscode/settings.json` 配 target，每 folder 独立 ra 实例），代价是根目录文件不属于任何 folder。未实施。
+钉住的 nightly 需 `rustup component add rust-analyzer`（rust-toolchain 换 nightly 版本后要重装）。Zed 在 PATH 上找不到可用 RA 时会静默回退到自己下载的 stable RA，与 nightly cargo 可能不匹配。
 
 ## static mut 全局（review #6 未完成）
 

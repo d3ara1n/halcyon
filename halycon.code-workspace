@@ -1,11 +1,25 @@
 {
 	"folders": [
 		{
+			"path": "os"
+		},
+		{
+			"path": "user"
+		},
+		{
+			"path": "shared"
+		},
+		{
+			// 根放最后：嵌套目录的资源设置取列表中第一个包含它的 folder，
+			// os/user/shared 的 rust-analyzer 设置优先于根（根已禁 RA）
+			"name": "halcyon",
 			"path": "."
 		}
 	],
 	"settings": {
-		"rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
+		"rust-analyzer.showUnlinkedFileNotification": false,
+		"rust-analyzer.cfg.setTest": false,
+		"rust-analyzer.check.allTargets": false,
 		"cSpell.words": [
 			"abiname",
 			"Aclint",
@@ -116,14 +130,7 @@
 			"virt",
 			"xlen"
 		],
-		"cSpell.language": "en,lorem",
-		"rust-analyzer.imports.prefer.no.std": true,
-		"rust-analyzer.linkedProjects": [
-			"./shared/Cargo.toml",
-			"./os/Cargo.toml",
-			"./user/Cargo.toml"
-		],
-		"rust-analyzer.showUnlinkedFileNotification": false
+		"cSpell.language": "en,lorem"
 	},
 	"tasks": {
 		"version": "2.0.0",
@@ -141,6 +148,9 @@
 					"-s",
 					"-S"
 				],
+				"options": {
+					"cwd": "${workspaceFolder:halcyon}"
+				},
 				"isBackground": true,
 				"problemMatcher": [
 					{
@@ -159,7 +169,7 @@
 						}
 					}
 				]
-			},
+			}
 		]
 	},
 	"launch": {
@@ -171,8 +181,8 @@
 				"request": "launch",
 				"preLaunchTask": "launch_gdb_server",
 				"miDebuggerServerAddress": "localhost:1234",
-				"program": "${workspaceRoot}/artifacts/erhino_kernel",
-				"cwd": "${workspaceFolder}",
+				"program": "${workspaceFolder:halcyon}/artifacts/erhino_kernel",
+				"cwd": "${workspaceFolder:halcyon}",
 				"launchCompleteCommand": "exec-continue",
 				"environment": [],
 				"externalConsole": false,
@@ -181,8 +191,8 @@
 				},
 				"MIMode": "gdb",
 				"miDebuggerPath": "riscv64-elf-gdb",
-				"miDebuggerArgs": "-ex 'set arch riscv:rv64'",
-			},
+				"miDebuggerArgs": "-ex 'set arch riscv:rv64'"
+			}
 		]
 	}
 }

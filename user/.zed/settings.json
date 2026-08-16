@@ -1,0 +1,17 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // no_std target 无 test crate：避免 cfg(test) 变体和 --all-targets 触发
+        // E0463: can't find crate for `test`（workspace 无 #[test]，无损失）。
+        // target 不在此设：user/.cargo/config.toml 是唯一事实来源
+        "cfg": {
+          "setTest": false
+        },
+        "check": {
+          "allTargets": false
+        }
+      }
+    }
+  }
+}
