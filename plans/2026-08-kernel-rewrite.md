@@ -68,6 +68,12 @@ frame 分配器 + 页表 + MemoryUnit。**必须先设计后编码**：区域切
 2. 毫秒级：host `cargo test`（M2 起的纯逻辑 crate）
 3. 集成：`just virt`（4 核）/ `just sifive_u`——QEMU 不自退，agent 环境必须「启动→观察→kill」一条命令自包含；判定看启动日志关键行而非退出码
 
+## 设计原则
+
+全周期章法见仓库 `AGENTS.md`「设计原则」，重写期间额外遵守：
+
+- **会话隔离点**：每轮工作在「决策入档、代码全绿已提交、下一步序列在文档中」处收口，不留半成品跨会话。
+
 ## 工作约定提醒
 
 - 统一走 `just`，不裸 `cargo build`（linker/RUSTFLAGS 靠 Justfile 注入）
