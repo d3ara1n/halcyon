@@ -51,32 +51,26 @@ pub fn console_write(args: Arguments<'_>) {
 /// 话题标签宽度（对齐）。
 const TOPIC_WIDTH: usize = 8;
 
-/// 等级色（亮色系，与话题常规色分两档视觉层次）。
-/// COLOR_ERROR/COLOR_DEBUG 的引用在等级宏体内，宏未被调用时视为 dead，
-/// 调用点随 IPC/FS/设备接入出现。
-pub const COLOR_INFO: &str = "0;92";
-#[allow(dead_code)]
-pub const COLOR_WARN: &str = "0;93";
-#[allow(dead_code)]
-pub const COLOR_ERROR: &str = "0;91";
-pub const COLOR_DEBUG: &str = "0;95";
+/// 等级色（基础调色板，随终端亮暗主题）：颜色只来源于等级——
+/// info 绿、warn 黄、error 红、debug 灰；log! 无等级故无色，
+/// 正文颜色由发送方自行拼入消息。色只染话题头，不染正文。
+pub const COLOR_INFO: &str = "32";
+pub const COLOR_WARN: &str = "33";
+#[allow(dead_code)] // 引用在 error! 宏体内，调用点随非致命错误场景出现
+pub const COLOR_ERROR: &str = "31";
+pub const COLOR_DEBUG: &str = "90";
 
-/// 话题 → ANSI 颜色码。未列出的话题用灰色，新增话题在此登记。
-fn topic_color(topic: &str) -> &'static str {
-    match topic {
-        "Task" => "0;33",                      // 黄：任务生命周期
-        "Hart" => "0;32",                      // 绿：hart 装配
-        "MM" | "Frame" | "Heap" | "InitFS" | "Memory" => "0;36", // 青：内存与装载
-        _ => "0;90",
-    }
-}
-
-/// 话题行输出：`[topic     ] message`，标签按话题映射色着色、固定宽度对齐。
+/// 无色话题行（log!）：`[topic     ] message`，对齐不者色。
 pub fn log_topic(topic: &str, args: Arguments<'_>) {
-    log_tagged(topic, topic_color(topic), args);
+    console_write(format_args!(
+        "[{:<width$}] {}\n",
+        topic,
+        args,
+        width = TOPIC_WIDTH,
+    ));
 }
 
-/// 指定色的话题行输出（等级宏与用户态日志入口）。
+/// 等级话题行（等级宏）：话题头按等级色着色、固定宽度对齐，正文不着色。
 pub fn log_tagged(tag: &str, color: &str, args: Arguments<'_>) {
     console_write(format_args!(
         "\x1b[{}m[{:<width$}]\x1b[0m {}\n",
