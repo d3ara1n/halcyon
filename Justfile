@@ -20,7 +20,10 @@ KERNEL_BIN := KERNEL_ELF+".bin"
 DTB := TARGET_DIR/"device.dtb"
 
 # QEMU
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file=artifacts/initfs.tar,addr=0xB0000000"
+# initfs 装载地址：virt DRAM 1GiB 取高址；sifive_u 实际 DRAM 仅 128MiB，
+# 取 dtb 声明的 0x86000000（与 dts 的 initfs reg 保持一致）。
+INITFS_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file=artifacts/initfs.tar,addr="+INITFS_ADDR
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -60,7 +63,7 @@ make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/srv_* "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/drv_* "{{TARGET_DIR}}/initfs/bin"
-    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | tar --format=ustar -cvf ../initfs.tar -T -
+    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | tar --format=ustar -cvf ../initfs.tar -T -
 
 build_kernel: 
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}\033[0m"

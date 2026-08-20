@@ -188,3 +188,8 @@ pub unsafe fn sys_receive(buffer: &[u8]) -> SystemCallResult<usize> {
         0,
     )
 }
+
+// 当前线程睡眠指定毫秒（异步 syscall：内核登记期限，到期唤醒）
+pub unsafe fn sys_sleep(ms: u64) -> SystemCallResult<()> {
+    sys_call(SystemCall::Sleep, ms as usize, 0, 0, 0).map(|_| ())
+}

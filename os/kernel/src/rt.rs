@@ -61,21 +61,55 @@ fn rust_start<T: Termination + 'static>(
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_entry(_hartid: usize, _dtb: usize) -> ! {
     println!("[Hart #{:>2}] online", hart::hartid());
-    hart::park()
+    crate::sched::run()
 }
 
 /// 内核态 trap 的兜底：协作式内核中 trap 即致命。
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_kernel_trap(cause: usize, val: usize, pc: usize) -> ! {
+    // 现场采集（无锁 RawWriter）：satp/sstatus + 若为访存 fault，
+    // 按当前 satp 走三级页表定位断点。
+    let (satp, sstatus): (usize, usize);
+    // SAFETY: 只读 CSR。
+    unsafe {
+        core::arch::asm!("csrr {}, satp", out(reg) satp, options(nomem));
+        core::arch::asm!("csrr {}, sstatus", out(reg) sstatus, options(nomem));
+    }
     let _ = write!(
         RawWriter,
-        "\x1b[0;31mkernel trap\x1b[0m: unexpected trap in S-mode\n  cause={:#x} val={:#x} pc={:#x} hart={}\n",
+        "\x1b[0;31mkernel trap\x1b[0m: unexpected trap in S-mode\n  cause={:#x} val={:#x} pc={:#x} hart={} satp={:#x} sstatus={:#x}\n",
         cause,
         val,
         pc,
         hart::hartid(),
+        satp,
+        sstatus,
     );
+    if matches!(cause, 12 | 13 | 15) && satp >> 60 == 8 {
+        dump_page_walk(satp & 0xFFF_FFFF_FFFF, val);
+    }
     hart::park()
+}
+
+/// 按 root PPN 走 Sv39 三级表，打印 stval 的叶 PTE（诊断页故障用）。
+fn dump_page_walk(root_ppn: usize, va: usize) {
+    let vpn = [va >> 30 & 0x1FF, va >> 21 & 0x1FF, va >> 12 & 0x1FF];
+    let mut table = root_ppn << 12;
+    let _ = write!(RawWriter, "  walk va={:#x}:", va);
+    for (level, &idx) in vpn.iter().enumerate() {
+        // SAFETY: 表帧位于直映射覆盖的 DRAM 内（帧池分配约束）。
+        let pte = unsafe { *((crate::mm::phys_to_virt(table) + idx * 8) as *const u64) };
+        let _ = write!(RawWriter, " L{}[{}]={:#x}", 2 - level, idx, pte);
+        if pte & 1 == 0 {
+            break;
+        }
+        if pte & 0xE != 0 || level == 2 {
+            let _ = write!(RawWriter, " <- leaf");
+            break;
+        }
+        table = ((pte >> 10 & 0xFFF_FFFF_FFFF) << 12) as usize;
+    }
+    let _ = writeln!(RawWriter);
 }
 
 #[panic_handler]

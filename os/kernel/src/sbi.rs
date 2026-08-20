@@ -1,4 +1,4 @@
-//! SBI 调用封装（M0 子集：探测、控制台、HSM 启动）。
+//! SBI 调用封装（探测、控制台、HSM 启动、时钟、IPI）。
 
 use core::{
     arch::asm,
@@ -9,6 +9,8 @@ use core::{
 pub enum SbiExtension {
     LegacyConsolePutchar,
     Base,
+    Timer,
+    Ipi,
     HartStateManagement,
     DebugConsole,
 }
@@ -18,6 +20,8 @@ impl SbiExtension {
         match self {
             SbiExtension::LegacyConsolePutchar => 0x01,
             SbiExtension::Base => 0x10,
+            SbiExtension::Timer => 0x54494D45,
+            SbiExtension::Ipi => 0x735049,
             SbiExtension::HartStateManagement => 0x48534D,
             SbiExtension::DebugConsole => 0x4442434E,
         }
@@ -121,4 +125,32 @@ pub fn debug_console_write(text: &str) -> SbiResult {
 /// HSM：启动指定 hart，入口收到 a0 = hartid，a1 = opaque。
 pub fn hart_start(hartid: usize, start_addr: usize, opaque: usize) -> SbiResult {
     sbi_call(SbiExtension::HartStateManagement, 0, hartid, start_addr, opaque)
+}
+
+/// 读 mtime（S 态可直接读 time CSR）。
+#[inline]
+pub fn read_time() -> u64 {
+    let t: u64;
+    // SAFETY: time 是 S 态可读的只读 CSR。
+    unsafe { asm!("csrr {}, time", out(reg) t, options(nomem)) };
+    t
+}
+
+/// TIME：编程下次时钟中断（stime_value 到达时置 STIP）。
+/// `u64::MAX / 2` 为卸载语义——远超 mtime 可达范围，不触发亦不溢出。
+pub fn set_timer(stime: u64) {
+    let _ = sbi_call(SbiExtension::Timer, 0, stime as usize, 0, 0);
+}
+
+/// IPI：门铃。`mask` 按 hartid 置位（bit i = hartid i），
+/// SBI 以 hart_mask 的物理地址取位图。
+pub fn send_ipi(mask: &u64) {
+    let pa = crate::mm::virt_to_phys(mask as *const u64 as usize);
+    let _ = sbi_call(SbiExtension::Ipi, 0, pa, 0, 0);
+}
+
+/// 清除本 hart 的软件中断 pending（SSIP 位可由 S 态写）。
+pub fn clear_ssip() {
+    // SAFETY: 仅清 sip.SSIP 位。
+    unsafe { asm!("csrc sip, {mask}", mask = in(reg) 2, options(nomem)) };
 }

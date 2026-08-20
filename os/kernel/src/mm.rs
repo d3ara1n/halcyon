@@ -61,6 +61,30 @@ static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 ///
 /// 切换安全性：镜像/栈/跳板表都在 DRAM 槽内，切换前后 VMA 不变
 /// （跳板别名与直映射对同一物理段呈现相同 VMA），执行流无缝。
+/// 直映射 vpn2 槽位数（init 后恒定，用户表 root 拷贝用）。
+static DIRECT_SLOT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 已建立的直映射顶层槽数（高半区 [256, 256+n)）。
+pub fn direct_slots() -> usize {
+    DIRECT_SLOT_COUNT.load(Ordering::Relaxed)
+}
+
+/// 把内核高半区顶层项拷进用户表 root：用户表创建后立即调用，
+/// 此后任意用户 satp 下内核代码恒可执行（共享映射，见 notes/internals.md）。
+///
+/// # Safety
+/// `root` 必须是刚分配、尚未映射任何用户页的页表 root 帧。
+pub unsafe fn install_kernel_top_level(root: page_table::FrameNumber) {
+    // SAFETY: 静态表 init 后只读；目标 root 帧刚分配归调用方。
+    let src = unsafe { &*KERNEL_PG_DIR.0.get() };
+    let dst = unsafe {
+        &mut *(phys_to_virt(root.addr()) as *mut [Pte; ENTRIES])
+    };
+    let slots = direct_slots();
+    dst[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots]
+        .copy_from_slice(&src[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots]);
+}
+
 pub fn init(board: &BoardInfo) {
     let dram_end = board
         .memories()
@@ -86,6 +110,7 @@ pub fn init(board: &BoardInfo) {
 
     let satp = (SV39 << 60) | (virt_to_phys(dir as usize) >> 12);
     KERNEL_SATP.store(satp, Ordering::Release);
+    DIRECT_SLOT_COUNT.store(slots, Ordering::Relaxed);
     // SAFETY: satp 装载与全量 sfence 是 S 态特权指令；直映射已覆盖
     // 当前执行流的全部后续访问（代码/数据/栈同 VMA 换底）。
     unsafe {
@@ -101,4 +126,16 @@ pub fn init(board: &BoardInfo) {
         slots * GIB,
         KERNEL_VA_BASE
     );
+}
+
+/// 为当前 hart 开启 SUM 位（S 态直访用户页，syscall 读用户内存的前提）。
+/// SUM 是 per-hart 位，各 hart 在调度循环入口自行调用。
+pub fn enable_sum() {
+    // SAFETY: 仅置 sstatus.SM 位。
+    unsafe {
+        asm!(
+            "csrs  sstatus, {sum}",
+            sum = in(reg) 1 << 18,
+        );
+    }
 }

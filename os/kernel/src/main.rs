@@ -18,10 +18,15 @@ mod external;
 mod frame;
 mod hart;
 mod heap;
+mod initfs;
 mod mm;
 mod rt;
 mod sbi;
+mod sched;
 mod sync;
+mod syscall;
+mod task;
+mod trap;
 global_asm!(include_str!("assembly.asm"));
 
 const BANNER: &str = include_str!("../banner.txt");
@@ -62,10 +67,16 @@ pub fn main() {
     frame::init(&board);
     frame::smoke();
     heap::smoke();
+    sched::init(board.timebase);
 
     crate::println!("[Hart #{:>2}] online (boot)", hart::hartid());
+    if let Some((addr, len)) = board.initfs {
+        initfs::load(addr, len);
+    } else {
+        crate::println!("[InitFS  ] 设备树无 initfs，无服务可装载");
+    }
     wake_secondary_harts(&board);
-    hart::park();
+    sched::run()
 }
 
 /// 按 CPU 列表唤醒除 boot hart 外的全部 hart。

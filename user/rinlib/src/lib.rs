@@ -9,6 +9,7 @@ pub use flagset;
 pub extern crate alloc;
 
 mod call;
+pub use call::sys_sleep;
 pub mod dbg;
 pub mod env;
 pub mod fs;

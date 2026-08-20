@@ -74,8 +74,14 @@ _awaken:
     sd      sp, 8(tp)           # HartLocal.kernel_sp
     la      t0, _kernel_trap
     csrw    stvec, t0
-    li      t0, 0b01 << 13      # sstatus.FS = Initial，SIE = 0（协作式内核）
-    csrw    sstatus, t0
+    # sstatus 只动本宏职责位：SIE 清零（协作式）、FS 置 Initial；
+    # 不整写——SUM 等其余位由 mm::init 管理，secondary 启动时已置位。
+    li      t0, 0b10
+    csrc    sstatus, t0
+    li      t0, 3 << 13
+    csrc    sstatus, t0
+    li      t0, 1 << 13
+    csrs    sstatus, t0
 .endm
 
 .global _start_high
@@ -118,6 +124,177 @@ _kernel_trap:
     call    handle_kernel_trap
 1:  wfi
     j       1b
+
+# ---------------------------------------------------------------------------
+# 用户态 trap 与返回（契约见 trap.rs；偏移与 HartLocal::off 绑定）
+# ---------------------------------------------------------------------------
+
+.section .text
+.align 4
+.global _user_trap
+# 从用户态陷入：sscratch = HartLocal。存用户现场 → 切内核栈 → 进 Rust。
+_user_trap:
+    csrrw  t6, sscratch, t6        # t6 = HartLocal；sscratch = 用户 t6
+    sd     t5, 40(t6)              # HL_SCRATCH      # 用户 t5 暂存锚槽
+    ld     t5, 24(t6)              # HL_FRAME        # t5 = TrapFrame*
+    sd     x1, 8(t5)
+    sd     x2, 16(t5)
+    sd     x3, 24(t5)
+    sd     x4, 32(t5)              # 用户 tp
+    sd     x5, 40(t5)
+    sd     x6, 48(t5)
+    sd     x7, 56(t5)
+    sd     x8, 64(t5)
+    sd     x9, 72(t5)
+    sd     x10, 80(t5)
+    sd     x11, 88(t5)
+    sd     x12, 96(t5)
+    sd     x13, 104(t5)
+    sd     x14, 112(t5)
+    sd     x15, 120(t5)
+    sd     x16, 128(t5)
+    sd     x17, 136(t5)
+    sd     x18, 144(t5)
+    sd     x19, 152(t5)
+    sd     x20, 160(t5)
+    sd     x21, 168(t5)
+    sd     x22, 176(t5)
+    sd     x23, 184(t5)
+    sd     x24, 192(t5)
+    sd     x27, 216(t5)
+    sd     x28, 224(t5)
+    sd     x29, 232(t5)
+    ld     t0, 40(t6)              # HL_SCRATCH     # t0 = 用户 x30（进入时暂存）
+    sd     t0, 240(t5)
+    csrr   t0, sscratch            # t0 = 用户 x31（进入时交换暂存）
+    sd     t0, 248(t5)
+    # 浮点条件保存：FS==Dirty 才存，存后置 Clean（内核不用浮点，fcsr 不动）
+    csrr   t0, sstatus
+    srli   t0, t0, 13
+    andi   t0, t0, 3
+    li     t1, 3
+    bne    t0, t1, 1f
+    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fsd    f\i, 256+8*\i(t5)
+    .endr
+    li     t0, 3 << 13
+    csrc   sstatus, t0
+    li     t0, 2 << 13
+    csrs   sstatus, t0
+1:  csrr   t0, sepc
+    sd     t0, 512(t5)             # TF_SEPC
+    # 内核现场：tp 换锚、sp 切调度栈、stvec 指内核致命路径
+    mv     tp, t6
+    ld     sp, 16(t6)              # HL_SCHED_SP
+    la     t0, _kernel_trap
+    csrw   stvec, t0
+    csrr   a0, scause
+    csrr   a1, stval
+    mv     a2, t5
+    call   handle_user_trap        # 返回 a0 = Outcome（0 = Resume）
+    bnez   a0, 2f
+    j      _resume_user            # Resume：tp 在 Rust 调用中保持不变
+2:  # Switch：恢复调度循环现场（sched_sp 起 ra + s0..s11）
+    ld     ra, 0(sp)
+    ld     s0, 8(sp)
+    ld     s1, 16(sp)
+    ld     s2, 24(sp)
+    ld     s3, 32(sp)
+    ld     s4, 40(sp)
+    ld     s5, 48(sp)
+    ld     s6, 56(sp)
+    ld     s7, 64(sp)
+    ld     s8, 72(sp)
+    ld     s9, 80(sp)
+    ld     s10, 88(sp)
+    ld     s11, 96(sp)
+    addi   sp, sp, 104
+    ret
+
+.align 4
+.global _ret_to_user
+# 调度循环调用（tp = HartLocal，执行点已装）：保存循环现场并记恢复点，
+# 尾接 _resume_user 装帧 sret；Switch 发生时经恢复点正常返回。
+_ret_to_user:
+    addi   sp, sp, -104
+    sd     ra, 0(sp)
+    sd     s0, 8(sp)
+    sd     s1, 16(sp)
+    sd     s2, 24(sp)
+    sd     s3, 32(sp)
+    sd     s4, 40(sp)
+    sd     s5, 48(sp)
+    sd     s6, 56(sp)
+    sd     s7, 64(sp)
+    sd     s8, 72(sp)
+    sd     s9, 80(sp)
+    sd     s10, 88(sp)
+    sd     s11, 96(sp)
+    sd     sp, 16(tp)              # HL_SCHED_SP
+    # 换用户地址空间：调度循环在此处切换线程，用户 satp 从锚装入。
+    # （Resume 路径不经此段——同进程返回，satp 未变。）
+    ld     t0, 32(tp)              # HL_USER_SATP
+    csrw   satp, t0
+    sfence.vma
+    # 尾接装帧
+
+_resume_user:
+# 装帧回用户态（tp = HartLocal；用户态锚 sscratch = tp、stvec = _user_trap）
+    la     t0, _user_trap
+    csrw   stvec, t0
+    ld     t5, 24(tp)              # HL_FRAME
+    csrw   sscratch, tp
+    # 浮点条件恢复：FS==Clean → 恢复 + 置 Dirty；否则置 Initial
+    csrr   t0, sstatus
+    srli   t0, t0, 13
+    andi   t0, t0, 3
+    li     t1, 2
+    bne    t0, t1, 3f
+    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld    f\i, 256+8*\i(t5)
+    .endr
+    li     t0, 3 << 13
+    csrc   sstatus, t0
+    li     t0, 3 << 13
+    csrs   sstatus, t0
+    j      4f
+3:  li     t0, 3 << 13
+    csrc   sstatus, t0
+    li     t0, 1 << 13
+    csrs   sstatus, t0
+4:  ld     t0, 512(t5)             # TF_SEPC
+    csrw   sepc, t0
+    # 恢复通用：t6 先备好不再用，t5 基址最后恢复
+    ld     x1, 8(t5)
+    ld     sp, 16(t5)
+    ld     gp, 24(t5)
+    ld     tp, 32(t5)
+    ld     x5, 40(t5)
+    ld     x6, 48(t5)
+    ld     x7, 56(t5)
+    ld     x8, 64(t5)
+    ld     x9, 72(t5)
+    ld     x10, 80(t5)
+    ld     x11, 88(t5)
+    ld     x12, 96(t5)
+    ld     x13, 104(t5)
+    ld     x14, 112(t5)
+    ld     x15, 120(t5)
+    ld     x16, 128(t5)
+    ld     x17, 136(t5)
+    ld     x18, 144(t5)
+    ld     x19, 152(t5)
+    ld     x20, 160(t5)
+    ld     x21, 168(t5)
+    ld     x22, 176(t5)
+    ld     x23, 184(t5)
+    ld     x24, 192(t5)
+    ld     x27, 216(t5)
+    ld     x28, 224(t5)
+    ld     x29, 232(t5)
+    ld     t6, 248(t5)             # x31（t6 此后不再作锚）
+    ld     t5, 240(t5)             # x30 最后恢复（t5 基址终结）
+    sret
 
 # ---------------------------------------------------------------------------
 # PA 段数据：跳板 root 表与跨空间字面量

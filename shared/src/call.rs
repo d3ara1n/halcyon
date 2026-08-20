@@ -70,6 +70,8 @@ pub enum SystemCall {
     ThreadJoin = 0x23,
     /// Kill owned thread
     ThreadKill = 0x24,
+    /// 当前线程睡眠指定毫秒（异步：登记期限后 Waiting，到期唤醒）
+    Sleep = 0x25,
 
     // -----Signal-----
     /// Return from signal handler
