@@ -14,6 +14,12 @@
 
 冷路径的一把大锁在本系统规模（4-5 hart）下争用可忽略；无锁结构（slot array、RCU 等）只在争用真实出现后才值得引入。
 
+## 内核中断模型
+
+协作式内核：内核态全程关中断（trap 进入 S 态即 SIE=0，sret 回用户态才恢复），调度只发生在用户 trap 返回路径，内核没有嵌套执行流。内核态 timer trap 不视为致命：重设 tick 后原路返回，避免长内核路径误杀。
+
+推论：内核锁只需防跨核争用；锁原语的关中断语义在此模型下是零成本保险，保留以防纪律腐化。
+
 ## tp 寄存器
 
 内核态的 tp 不是 thread pointer，是 hart pointer。每个 hart 启动时设置 tp 指向自己的 HartLocal 结构，此后保持不变量：
@@ -25,6 +31,12 @@
 - trap 进出与上下文切换必须保存/恢复 tp（tp 即通用寄存器 x4，用户态用它做 TLS，内核态占用它）
 - HartLocal 按 cache line 对齐；跨 hart 交互只能走全局层或 IPI，HartLocal 严格私有
 - 数组包装处唯一一处 `unsafe impl Sync`，SAFETY 注明上述访问不变量
+
+## trap 帧与 trampoline
+
+沿用实测布局（考古报告 §2），四项升级：TrapFrame（纯用户现场）与 TrampolineControl（kernel_tp/kernel_satp/trap 入口等切换常量）类型分离；汇编偏移与 Rust 结构用静态断言绑定；命名修正（如实为 trapframe 地址的 trampoline 变量）；内核栈指针存于 HartLocal，_user_trap 直接加载，不再用链接常量计算。
+
+帧内 kernel_tp 字段存 HartLocal 指针（旧内核存 hartid 整数）。
 
 ## 锁原语
 
