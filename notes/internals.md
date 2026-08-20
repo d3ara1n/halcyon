@@ -32,11 +32,21 @@
 - HartLocal 按 cache line 对齐；跨 hart 交互只能走全局层或 IPI，HartLocal 严格私有
 - 数组包装处唯一一处 `unsafe impl Sync`，SAFETY 注明上述访问不变量
 
-## trap 帧与 trampoline
+## 地址空间
 
-沿用实测布局（考古报告 §2），四项升级：TrapFrame（纯用户现场）与 TrampolineControl（kernel_tp/kernel_satp/trap 入口等切换常量）类型分离；汇编偏移与 Rust 结构用静态断言绑定；命名修正（如实为 trapframe 地址的 trampoline 变量）；内核栈指针存于 HartLocal，_user_trap 直接加载，不再用链接常量计算。
+Sv39，canonical 半区边界即用户/内核分界（对齐 Linux 布局）：
 
-帧内 kernel_tp 字段存 HartLocal 指针（旧内核存 hartid 整数）。
+- 用户：低半区 `[0, 2^38)`（256GiB），完全归用户。
+- 内核：高半区 `[0xFFFFFFC0_00000000, 2^39)`，含内核镜像与物理内存直映射（phys_to_virt 线性偏移）；vmalloc 等区域 M4+ 按需扩展。
+- 每个用户页表 root 复制内核高半区顶层项（创建时拷 8-16 字节）→ 任意时刻内核代码恒可执行：trap 不切 satp，stvec 恒指内核 .text；satp 更换只发生在进程地址空间更换。
+- 用户内存访问开 SUM 位直接走 VA，不再软件遍历页表 translate。
+- secondary hart 经 HSM 启动时 satp 为 bare：经 identity 早期页表开 MMU 后跳高半区（对应 Linux head.S 的 trampoline_pg_dir → relocate_enable_mmu 一次性机构）。
+
+设计依据：trap 是最热路径，共享映射消灭了 trampoline 页/双地址空间切换/软件 translate 三套机制（旧内核复杂度最集中处）。
+
+## trap 帧与上下文
+
+共享映射下无 trampoline：trap 入口直接是内核 .text。trap 帧存内核侧每线程存储（内核堆/每线程内核栈，M3 定），sscratch 指向本 hart 的 trap 锚（内核 sp 等），汇编经锚定位帧。TrapFrame（纯用户现场）与调度控制字段类型分离；汇编偏移与 Rust 结构静态断言绑定。trap 进出仅保存/恢复通用+浮点寄存器与 sepc，tp 不变量在汇编中维护。
 
 ## 锁原语
 
@@ -49,15 +59,14 @@ Spinlock 包装为 `lock_api::RawMutex`，同一实现注入两处：
 
 睡眠锁在任务模型落地、出现可睡眠上下文后再引入。
 
-## 堆分配器
+## 堆与物理帧
 
-talc。选择理由：
+分层管理两种语义不同的资源：
 
-- TalcLock 的锁由内核注入（见锁原语）
-- `claim` 支持注册 DTB 解析出的多段可用内存，堆可按需扩展
-- 小对象开销低（每次分配 1×usize 元数据），适配 Arc/Vec 混合负载
+- 帧池：buddy_system_allocator 的 frame_allocator 模块（自旋锁用内核 Spinlock 包装），DTB 内存段全部注册；管页粒度、物理连续、整批生死（进程退出整批归还）的物理帧。FrameTracker RAII 归还。
+- 堆（talc）：管任意尺寸小对象；arena 由帧池供给（M2 起替换 M0 的静态 arena，消灭最后的 static mut）。
 
-堆分配不在热路径，不设 per-hart 堆，留作演进方向。
+理由：帧与小对象生命周期模式不同，分层使碎片域独立、锁独立；这也是 Linux（buddy+slab）的通行分层。
 
 ## 进程表
 
