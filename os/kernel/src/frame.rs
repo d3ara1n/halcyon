@@ -75,7 +75,7 @@ pub fn init(board: &BoardInfo) {
     assert!(regions > 0, "剔除启动占用后无任何空闲内存段");
 
     let free = p.free_frames();
-    crate::log!(
+    log!(
         Frame,
         "{} region(s), {} frame(s) free ({:#x} bytes)",
         regions,
@@ -150,5 +150,5 @@ pub fn smoke() {
     // SAFETY: 同上；首帧首槽读回验证分配即清零。
     let first = unsafe { *(mm::phys_to_virt(t2.base.addr()) as *const usize) };
     assert!(first == 0, "分配未清零");
-    crate::log!(Frame, "smoke: alloc/write/dealloc/re-zero ok");
+    log!(Frame, "smoke: alloc/write/dealloc/re-zero ok");
 }

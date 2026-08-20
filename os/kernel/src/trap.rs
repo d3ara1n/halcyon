@@ -120,7 +120,7 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut T
         other if is_user_exception(other) => {
             // 用户态异常一律杀进程（notes/task.md「生命周期」）。
             let pid = thread.map(|t| t.process.pid).unwrap_or(0);
-            crate::log!(
+            warn!(
                 Task,
                 "pid {} 异常终止: scause={} stval={:#x} sepc={:#x}",
                 pid,

@@ -57,5 +57,5 @@ pub fn smoke() {
     assert_eq!(v.iter().sum::<u32>(), (0..8192u32).sum::<u32>());
     let claimed = before - frame::free_frames();
     assert!(claimed > 0, "堆分配未从帧池取帧");
-    crate::log!(Heap, "{} frame(s) claimed, alloc/verify ok", claimed);
+    log!(Heap, "{} frame(s) claimed, alloc/verify ok", claimed);
 }

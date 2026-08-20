@@ -67,30 +67,39 @@ pub fn dispatch(frame: &mut TrapFrame, thread: &Thread) -> Outcome {
     }
 }
 
-/// Debug(ptr, len)：读用户内存打印（rinlib debug!/println! 的观测通道）。
-/// SUM 位常开（mm::init 置），前置逐页校验映射后直访用户 VA。
+/// Debug(tag, msg, level)：读用户内存打印（rinlib 日志宏的内核端）。
+/// SUM 位常开，前置逐页校验映射后直访；拷入内核堆再输出（console 的
+/// SBI 通道只接受内核内存）。空 tag 纯行输出，否则 `[tag     ] msg`
+/// 按等级/话题色着色对齐（见 console::log_user）。
 fn debug_print(frame: &mut TrapFrame, thread: &Thread) {
-    let ptr = frame.x[10] as usize;
-    let len = frame.x[11] as usize;
-    let ok = thread
-        .process
-        .space
-        .lock()
-        .validate(ptr, len);
-    if !ok {
+    let tag_ptr = frame.x[10] as usize;
+    let tag_len = frame.x[11] as usize;
+    let msg_ptr = frame.x[12] as usize;
+    let msg_len = frame.x[13] as usize;
+    let level = frame.x[14] as u8;
+    let mut space = thread.process.space.lock();
+    if !space.validate(tag_ptr, tag_len) || !space.validate(msg_ptr, msg_len) {
+        drop(space);
         respond_error(frame, SystemCallError::MemoryNotAccessible);
         return;
     }
-    // SAFETY: 区间已逐页校验映射且在用户半区内，SUM 下可读。
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    // 拷入内核堆再打印：console 的 SBI 通道只接受内核内存
-    // （DBCN 需物理地址，用户指针不可跨内核边界）。
-    let owned = bytes.to_vec();
-    match core::str::from_utf8(&owned) {
-        Ok(text) => crate::println!("{}", text),
-        Err(_) => crate::log!(Task, "debug: {} 字节非 UTF-8，拒印", len),
+    // SAFETY: 两区间已逐页校验映射且在用户半区内，SUM 下可读。
+    let tag = unsafe { core::slice::from_raw_parts(tag_ptr as *const u8, tag_len) };
+    let msg = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, msg_len) };
+    let owned_tag = tag.to_vec();
+    let owned = msg.to_vec();
+    drop(space);
+    match core::str::from_utf8(&owned_tag) {
+        Ok(tag) if !tag.is_empty() => match core::str::from_utf8(&owned) {
+            Ok(msg) => crate::console::log_user(tag, level, format_args!("{}", msg)),
+            Err(_) => crate::console::log_user(tag, level, format_args!("非 UTF-8 消息 {} 字节", msg_len)),
+        },
+        _ => match core::str::from_utf8(&owned) {
+            Ok(msg) => println!("{}", msg),
+            Err(_) => println!("非 UTF-8 消息 {} 字节", msg_len),
+        },
     }
-    respond_ok(frame, len);
+    respond_ok(frame, msg_len);
 }
 
 /// Extend(pages)：从 brk 起映射页（不要求物理连续），返回新 brk。

@@ -60,7 +60,7 @@ fn rust_start<T: Termination + 'static>(
 /// secondary hart 入口（HSM opaque 传入），dtb 参数无效。
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_entry(_hartid: usize, _dtb: usize) -> ! {
-    crate::log!(Hart, "#{:>2} online", hart::hartid());
+    info!(Hart, "#{:>2} online", hart::hartid());
     crate::sched::run()
 }
 

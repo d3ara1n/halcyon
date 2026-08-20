@@ -121,7 +121,7 @@ pub fn init(board: &BoardInfo) {
         );
     }
 
-    crate::log!(
+    log!(
         MM,
         "direct map [0, {:#x}), kernel @ {:#x}",
         slots * GIB,

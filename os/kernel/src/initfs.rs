@@ -13,7 +13,7 @@ pub fn load(addr: usize, len: usize) {
             return;
         }
         let Some(image) = elf::parse(entry.data).ok() else {
-            crate::log!(InitFS, "{} 非法 ELF，跳过", entry.name);
+            warn!(InitFS, "{} 非法 ELF，跳过", entry.name);
             return;
         };
         let pid = table::alloc_pid();
@@ -21,11 +21,11 @@ pub fn load(addr: usize, len: usize) {
             Ok(thread) => {
                 sched::enqueue(thread);
                 spawned += 1;
-                crate::log!(Task, "pid {} <- {}", pid, entry.name);
+                log!(Task, "pid {} <- {}", pid, entry.name);
             }
-            Err(e) => crate::log!(InitFS, "{} 装载失败: {:?}", entry.name, e),
+            Err(e) => warn!(InitFS, "{} 装载失败: {:?}", entry.name, e),
         }
     })
     .expect("initfs 归档格式错误");
-    crate::log!(InitFS, "{} 个服务已装载", spawned);
+    log!(InitFS, "{} 个服务已装载", spawned);
 }

@@ -12,8 +12,10 @@ extern crate alloc;
 use core::arch::global_asm;
 use dtb::Fdt;
 
-mod board;
+// 宏经文本作用域全 crate 可见（#[macro_use]），模块内裸用 log!/println!。
+#[macro_use]
 mod console;
+mod board;
 mod external;
 mod frame;
 mod hart;
@@ -45,22 +47,22 @@ unsafe fn fdt_from(pa: usize) -> Fdt<'static> {
 }
 
 pub fn main() {
-    crate::println!("{}", BANNER);
+    println!("{}", BANNER);
 
     // SAFETY: dtb PA 来自 boot 契约（a1），位于直映射覆盖的 DRAM 内。
     let fdt = unsafe { fdt_from(rt::dtb()) };
     let board = board::parse(&fdt);
 
     for region in board.memories() {
-        crate::log!(Memory, "@{:#x} ({:#x})", region.start, region.len);
+        log!(Memory, "@{:#x} ({:#x})", region.start, region.len);
     }
-    crate::log!(Timebase, "{} Hz", board.timebase);
+    log!(Timebase, "{} Hz", board.timebase);
     if let Some((addr, len)) = board.initfs {
-        crate::log!(InitFS, "@{:#x} ({:#x})", addr, len);
+        log!(InitFS, "@{:#x} ({:#x})", addr, len);
     }
 
     for cpu in board.cpus() {
-        crate::log!(Hart, "#{:>2} {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
+        log!(Hart, "#{:>2} {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
     }
 
     mm::init(&board);
@@ -69,11 +71,11 @@ pub fn main() {
     heap::smoke();
     sched::init(board.timebase);
 
-    crate::log!(Hart, "#{:>2} online (boot)", hart::hartid());
+    info!(Hart, "#{:>2} online (boot)", hart::hartid());
     if let Some((addr, len)) = board.initfs {
         initfs::load(addr, len);
     } else {
-        crate::log!(InitFS, "设备树无 initfs，无服务可装载");
+        log!(InitFS, "设备树无 initfs，无服务可装载");
     }
     wake_secondary_harts(&board);
     sched::run()
@@ -95,7 +97,7 @@ fn wake_secondary_harts(board: &board::BoardInfo) {
         let awaken = external::awaken_pa();
         match sbi::hart_start(cpu.hartid, awaken, entry) {
             Ok(_) => {}
-            Err(err) => crate::log!(Warn, "hart {} 启动失败: {:?}", cpu.hartid, err),
+            Err(err) => warn!(Hart, "hart {} 启动失败: {:?}", cpu.hartid, err),
         }
     }
 }

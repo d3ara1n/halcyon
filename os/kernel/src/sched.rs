@@ -222,7 +222,7 @@ fn reap(t: Arc<Thread>) {
     };
     let now = sbi::read_time();
     let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
-    crate::log!(
+    log!(
         Task,
         "pid {} 回收: exit={:?} {} 次调度, 存活 {} ms",
         pid,
