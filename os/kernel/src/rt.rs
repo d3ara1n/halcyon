@@ -20,7 +20,7 @@ use core::{
 
 use erhino_shared::proc::Termination;
 
-use crate::{console::console_write_raw, external, hart, println, sbi};
+use crate::{console::console_write_raw, external, hart, sbi};
 
 static DTB: AtomicUsize = AtomicUsize::new(0);
 
@@ -60,7 +60,7 @@ fn rust_start<T: Termination + 'static>(
 /// secondary hart 入口（HSM opaque 传入），dtb 参数无效。
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_entry(_hartid: usize, _dtb: usize) -> ! {
-    println!("[Hart #{:>2}] online", hart::hartid());
+    crate::log!(Hart, "#{:>2} online", hart::hartid());
     crate::sched::run()
 }
 

@@ -9,7 +9,7 @@
 use frame_pool::{FramePool, PoolMemory, RegionNode};
 use page_table::{FrameNumber, PAGE_BITS};
 
-use crate::{board::BoardInfo, external, mm, println, sync::Spinlock};
+use crate::{board::BoardInfo, external, mm, sync::Spinlock};
 
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
 
@@ -75,8 +75,9 @@ pub fn init(board: &BoardInfo) {
     assert!(regions > 0, "剔除启动占用后无任何空闲内存段");
 
     let free = p.free_frames();
-    println!(
-        "[Frame   ] {} region(s), {} frame(s) free ({:#x} bytes)",
+    crate::log!(
+        Frame,
+        "{} region(s), {} frame(s) free ({:#x} bytes)",
         regions,
         free,
         free * PAGE_SIZE
@@ -149,5 +150,5 @@ pub fn smoke() {
     // SAFETY: 同上；首帧首槽读回验证分配即清零。
     let first = unsafe { *(mm::phys_to_virt(t2.base.addr()) as *const usize) };
     assert!(first == 0, "分配未清零");
-    println!("[Frame   ] smoke: alloc/write/dealloc/re-zero ok");
+    crate::log!(Frame, "smoke: alloc/write/dealloc/re-zero ok");
 }

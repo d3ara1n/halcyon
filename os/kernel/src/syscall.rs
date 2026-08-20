@@ -88,7 +88,7 @@ fn debug_print(frame: &mut TrapFrame, thread: &Thread) {
     let owned = bytes.to_vec();
     match core::str::from_utf8(&owned) {
         Ok(text) => crate::println!("{}", text),
-        Err(_) => crate::println!("[Task    ] debug: {} 字节非 UTF-8，拒印", len),
+        Err(_) => crate::log!(Task, "debug: {} 字节非 UTF-8，拒印", len),
     }
     respond_ok(frame, len);
 }

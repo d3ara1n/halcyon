@@ -48,6 +48,31 @@ pub fn console_write(args: Arguments<'_>) {
     console.write_fmt(args).ok();
 }
 
+/// 话题标签宽度（对齐）。
+const TOPIC_WIDTH: usize = 8;
+
+/// 话题 → ANSI 颜色码。未列出的话题用灰色，新增话题在此登记。
+fn topic_color(topic: &str) -> &'static str {
+    match topic {
+        "Task" => "0;33",                      // 黄：任务生命周期
+        "Hart" => "0;32",                      // 绿：hart 装配
+        "MM" | "Frame" | "Heap" | "InitFS" | "Memory" => "0;36", // 青：内存与装载
+        "Warn" => "0;35",                     // 品红：警告
+        _ => "0;90",
+    }
+}
+
+/// 话题行输出：`[topic     ] message`，标签按话题着色、固定宽度对齐。
+pub fn log_topic(topic: &str, args: Arguments<'_>) {
+    console_write(format_args!(
+        "\x1b[{}m[{:<width$}]\x1b[0m {}\n",
+        topic_color(topic),
+        topic,
+        args,
+        width = TOPIC_WIDTH,
+    ));
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
@@ -68,44 +93,37 @@ macro_rules! println {
     };
 }
 
+/// 话题制日志：`log!(Task, "pid {} 回收", pid)` 输出着色对齐的
+/// `[Task    ] pid 3 回收`；无话题形态 `log!("{}", x)` 纯输出。
 #[macro_export]
-macro_rules! debug {
-    ($fmt:expr) => {
-        #[cfg(debug_assertions)]
-        $crate::print!(concat!("\x1b[0;35mDEBG\x1b[0m ", $fmt, "\n"))
+macro_rules! log {
+    ($topic:ident, $($arg:tt)+) => {
+        $crate::console::log_topic(stringify!($topic), format_args!($($arg)+))
     };
-    ($fmt:expr, $($args:tt)+) => {
-        #[cfg(debug_assertions)]
-        $crate::print!(concat!("\x1b[0;35mDEBG\x1b[0m ", $fmt, "\n"), $($args)+)
+    ($fmt:expr) => {
+        $crate::print!(concat!($fmt, "\n"))
+    };
+    ($fmt:expr, $($arg:tt)+) => {
+        $crate::print!(concat!($fmt, "\n"), $($arg)+)
     };
 }
 
+/// [`log!`] 的 debug-only 变体：release 构建静默（编译期消除）。
 #[macro_export]
-macro_rules! info {
+macro_rules! dbg {
+    ($topic:ident, $($arg:tt)+) => {
+        if cfg!(debug_assertions) {
+            $crate::console::log_topic(stringify!($topic), format_args!($($arg)+))
+        }
+    };
     ($fmt:expr) => {
-        $crate::print!(concat!("\x1b[0;32mINFO\x1b[0m ", $fmt, "\n"))
+        if cfg!(debug_assertions) {
+            $crate::print!(concat!($fmt, "\n"))
+        }
     };
-    ($fmt:expr, $($args:tt)+) => {
-        $crate::print!(concat!("\x1b[0;32mINFO\x1b[0m ", $fmt, "\n"), $($args)+)
-    };
-}
-
-#[macro_export]
-macro_rules! warning {
-    ($fmt:expr) => {
-        $crate::print!(concat!("\x1b[0;33mWARN\x1b[0m ", $fmt, "\n"))
-    };
-    ($fmt:expr, $($args:tt)+) => {
-        $crate::print!(concat!("\x1b[0;33mWARN\x1b[0m ", $fmt, "\n"), $($args)+)
-    };
-}
-
-#[macro_export]
-macro_rules! error {
-    ($fmt:expr) => {
-        $crate::print!(concat!("\x1b[0;31mERRO\x1b[0m ", $fmt, "\n"))
-    };
-    ($fmt:expr, $($args:tt)+) => {
-        $crate::print!(concat!("\x1b[0;31mERRO\x1b[0m ", $fmt, "\n"), $($args)+)
+    ($fmt:expr, $($arg:tt)+) => {
+        if cfg!(debug_assertions) {
+            $crate::print!(concat!($fmt, "\n"), $($arg)+)
+        }
     };
 }

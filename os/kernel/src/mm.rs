@@ -16,7 +16,7 @@ use core::{
 
 use page_table::{flags, Ppn, Pte, ENTRIES};
 
-use crate::{board::BoardInfo, println};
+use crate::board::BoardInfo;
 
 /// 内核高半区基址：VMA = PA + KERNEL_VA_BASE（与链接脚本常量一致）。
 pub const KERNEL_VA_BASE: usize = 0xFFFF_FFC0_0000_0000;
@@ -121,8 +121,9 @@ pub fn init(board: &BoardInfo) {
         );
     }
 
-    println!(
-        "[MM      ] direct map [0, {:#x}), kernel @ {:#x}",
+    crate::log!(
+        MM,
+        "direct map [0, {:#x}), kernel @ {:#x}",
         slots * GIB,
         KERNEL_VA_BASE
     );

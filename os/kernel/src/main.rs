@@ -52,15 +52,15 @@ pub fn main() {
     let board = board::parse(&fdt);
 
     for region in board.memories() {
-        crate::println!("[Memory  ] @{:#x} ({:#x})", region.start, region.len);
+        crate::log!(Memory, "@{:#x} ({:#x})", region.start, region.len);
     }
-    crate::println!("[Timebase] {} Hz", board.timebase);
+    crate::log!(Timebase, "{} Hz", board.timebase);
     if let Some((addr, len)) = board.initfs {
-        crate::println!("[InitFS  ] @{:#x} ({:#x})", addr, len);
+        crate::log!(InitFS, "@{:#x} ({:#x})", addr, len);
     }
 
     for cpu in board.cpus() {
-        crate::println!("[Hart #{:>2}] {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
+        crate::log!(Hart, "#{:>2} {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
     }
 
     mm::init(&board);
@@ -69,11 +69,11 @@ pub fn main() {
     heap::smoke();
     sched::init(board.timebase);
 
-    crate::println!("[Hart #{:>2}] online (boot)", hart::hartid());
+    crate::log!(Hart, "#{:>2} online (boot)", hart::hartid());
     if let Some((addr, len)) = board.initfs {
         initfs::load(addr, len);
     } else {
-        crate::println!("[InitFS  ] 设备树无 initfs，无服务可装载");
+        crate::log!(InitFS, "设备树无 initfs，无服务可装载");
     }
     wake_secondary_harts(&board);
     sched::run()
@@ -95,7 +95,7 @@ fn wake_secondary_harts(board: &board::BoardInfo) {
         let awaken = external::awaken_pa();
         match sbi::hart_start(cpu.hartid, awaken, entry) {
             Ok(_) => {}
-            Err(err) => crate::warning!("hart {} 启动失败: {:?}", cpu.hartid, err),
+            Err(err) => crate::log!(Warn, "hart {} 启动失败: {:?}", cpu.hartid, err),
         }
     }
 }
