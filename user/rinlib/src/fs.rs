@@ -1,6 +1,6 @@
 use core::mem::size_of;
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
     fal::{DentryAttribute, DentryObject, DentryType, Mid, PropertyKind},
@@ -45,6 +45,7 @@ unsafe fn read_dentry_from_object_bytes(
     count: usize,
     request_path: &str,
 ) -> Result<Dentry, FileSystemError> {
+    unsafe {
     if count > 0 {
         let size = size_of::<DentryObject>();
         let first = &*(bytes.as_ptr() as *const DentryObject);
@@ -192,6 +193,7 @@ unsafe fn read_dentry_from_object_bytes(
     } else {
         Err(FileSystemError::NotAvailable)
     }
+    }
 }
 
 pub fn check(path: &str) -> Result<Dentry, FileSystemError> {
@@ -252,22 +254,29 @@ pub fn create_property<A: Into<FlagSet<DentryAttribute>>>(
     }
 }
 
+// 桩接口：签名即 API 契约，实现随内核 FAL 里程碑接通（expect 在实现
+// 后变为未满足期望，提醒移除属性）。
+#[expect(unused_variables, reason = "桩：实现随 FAL 里程碑")]
 pub fn link(path: &str, target: &str) -> Result<(), FileSystemError> {
     todo!()
 }
 
+#[expect(unused_variables, reason = "桩：实现随 FAL 里程碑")]
 pub fn delete(path: &str) -> Result<(), FileSystemError> {
     todo!()
 }
 
+#[expect(unused_variables, reason = "桩：实现随 FAL 里程碑")]
 pub fn r#move(from: &str, to: &str) -> Result<(), FileSystemError> {
     todo!()
 }
 
+#[expect(unused_variables, reason = "桩：实现随 FAL 里程碑")]
 pub fn mount(path: &str, mid: Mid) -> Result<(), FileSystemError> {
     todo!()
 }
 
+#[expect(unused_variables, reason = "桩：实现随 FAL 里程碑")]
 pub fn unmount(path: &str) -> Result<(), FileSystemError> {
     todo!()
 }

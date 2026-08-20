@@ -18,7 +18,7 @@ pub enum SignalError {
 pub fn set_handler<S: Into<FlagSet<SystemSignal>>>(mask: S, handler: fn(SystemSignal)) {
     unsafe {
         SIGNAL_HANDLER = Some(handler);
-        sys_signal_set(mask.into(), signal_handler_wrapper as usize).expect("this wont failed");
+        sys_signal_set(mask.into(), signal_handler_wrapper as *const () as usize).expect("this wont failed");
     }
 }
 

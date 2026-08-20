@@ -3,7 +3,7 @@ name = "libdrv"
 version = "0.1.0"
 authors = ["Chien Zhang (zqy0224@live.com)"]
 description = "Driver framework"
-edition = "2021"
+edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

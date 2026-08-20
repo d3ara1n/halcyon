@@ -26,6 +26,7 @@ impl From<SystemCallError> for TunnelError {
     }
 }
 
+#[expect(dead_code, reason = "Runnel 协议结构，隧道里程碑接入")]
 pub struct Tunnel {
     key: usize,
     field: *mut u8,
@@ -69,6 +70,7 @@ pub fn link(id: usize) -> Result<Tunnel, TunnelError> {
     }
 }
 
+#[expect(dead_code, reason = "Runnel 协议结构，隧道里程碑接入")]
 pub struct Runnel {
     inner: Tunnel,
 }

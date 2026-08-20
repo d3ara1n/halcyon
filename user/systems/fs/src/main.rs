@@ -83,6 +83,5 @@ fn print_dentry(dentry: &Dentry, path: &Path, buffer: &mut String) -> core::fmt:
         Dentry::Stream(stream) => {
             writeln!(buffer, "{}: {}B", stream.name(), stream.size())
         }
-        _ => todo!(),
     }
 }

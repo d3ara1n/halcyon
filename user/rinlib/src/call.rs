@@ -30,18 +30,21 @@ unsafe fn raw_call(
 ) -> (usize, usize) {
     let mut error_code;
     let mut result;
-    asm!("ecall", in("x17") id, inlateout("x10") arg0 => error_code, inlateout("x11") arg1 => result, in("x12") arg2, in("x13") arg3);
+    unsafe {
+        asm!("ecall", in("x17") id, inlateout("x10") arg0 => error_code, inlateout("x11") arg1 => result, in("x12") arg2, in("x13") arg3);
+    }
     (error_code, result)
 }
 
-unsafe fn sys_call(
+fn sys_call(
     call: SystemCall,
     arg0: usize,
     arg1: usize,
     arg2: usize,
     arg3: usize,
 ) -> SystemCallResult<usize> {
-    let (error, ret) = raw_call(call as usize, arg0, arg1, arg2, arg3);
+    // SAFETY: ecall 是唯一内核入口，参数按 ABI 传寄存器。
+    let (error, ret) = unsafe { raw_call(call as usize, arg0, arg1, arg2, arg3) };
     if error == 0 {
         Ok(ret)
     } else {

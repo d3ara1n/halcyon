@@ -60,13 +60,13 @@ fn lang_start<T: Termination + 'static>(
     let pid = argc as usize as Pid;
     let parent = argv as usize as Pid;
     unsafe {
-        env::PID.set(pid).unwrap();
-        env::PARENT_PID.set(parent).unwrap();
+        env::set_pid(pid);
+        env::set_parent_pid(parent);
         let mut talc = HEAP_ALLOCATOR.lock();
         if let Ok(offset) = sys_extend(INITIAL_HEAP_SIZE) {
             let start = offset - INITIAL_HEAP_SIZE;
             // SAFETY: [start, offset) 是 sys_extend 刚申请的内存，交给分配器。
-            if let Some(heap_end) = unsafe { talc.claim(start as *mut u8, INITIAL_HEAP_SIZE) } {
+            if let Some(heap_end) = talc.claim(start as *mut u8, INITIAL_HEAP_SIZE) {
                 talc.source.heap_end = heap_end.as_ptr() as usize;
             } else {
                 panic!();
