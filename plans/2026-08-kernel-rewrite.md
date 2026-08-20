@@ -8,7 +8,7 @@
 **保留（重写时不得改变，除非明确论证不适用）：**
 
 - `notes/` 全部设计文档是架构事实来源：task（进程/线程=资源容器/执行容器概念）、ipc、message、tunnel、signal、fal、fs、device、ecs、call、service、framework。
-- **shared/ ABI 原样冻结**：syscall 表、消息格式、FAL 接口、同步原语不动。内核与用户态的边界不重定义。
+- **shared/ ABI 不冻结**：最终 ABI 相似即可，允许随新设计演进（演进时内核与用户态两侧同步改）。重写期间现有 user/ 二进制持续作为集成对照负载。
 - **user/ 与 rinlib 不动**。重写期间用户态二进制持续作为集成测试负载。
 - **hart 分离设计**（每核独立调度上下文、`hart::` 模块划分）保留。
 - 构建体系：Just + 自定义 target + linker 脚本的结构沿用（条目可精简，机制不变）。
@@ -32,12 +32,12 @@
 
 ### M0 · 地基起楼
 
-linker script、rt（boot/panic/alloc）、console、sbi 封装、board/dtb 解析。
+linker script、rt（boot/panic/alloc——talc 堆，claim DTB 多段内存）、console、sbi 封装、board/dtb 解析。
 **验收**：`just virt` 出 banner 与 `[Hart #N]` 行；`cargo check` 零 `static_mut_refs` 豁免。
 
 ### M1 · 同步原语与全局结构
 
-`shared::sync` 之上的内核锁体系；全局状态改造——init-once 用 `OnceLock`，标量用 Atomic，复合容器按 hart 分片或显式锁保护，禁 `static mut`。
+自研关中断 Spinlock（LR/SC + sstatus.SIE，包装为 `lock_api::RawMutex`，注入 talc 与全局容器）；全局状态按 `notes/internals.md` 分层改造——hart 私有走 tp（HartLocal），init-once 用 `OnceLock`，标量用 Atomic，复合容器 `OnceLock<Spinlock<T>>`，禁 `static mut`。
 **验收**：M0 验收保持 + 全仓 grep 无 `static mut`（外部汇编符号除外）。
 
 ### M2 · 内存管理（重写核心）
