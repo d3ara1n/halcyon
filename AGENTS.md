@@ -35,7 +35,7 @@ plans/     compass.md（跨会话导航：方向/位置/戒律）+ 考古与教�
   ```sh
   cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb --target aarch64-apple-darwin
   ```
-- 集成验证：`just virt`（4 核）/ `just sifive_u`（5 核，#0 禁用）。对照负载跑完后系统静默自停机（SBI SRST），QEMU 退出即通过；仍需防挂起与异常 panic——agent 环境带超时跑，判定看启动日志关键行而非仅退出码。
+- 集成验证：`just virt`（4 核）--对照负载跑完后系统静默自停机（SBI SRST），QEMU 退出即通过；agent 环境仍需带超时防挂起，判定看启动日志关键行。**sifive_u 不自终止**（QEMU 未接 poweroff 设备，SRST 为 noop），已知问题：随机挂起在任意输出点（老平台硬件差异，SBI 未完全抹平）与满载发热。策略：**按标准行事，不为奇异平台打补丁**；常规验证 virt 覆盖，仅在涉及时（5 核拓扑、cpu0 禁用、DRAM 布局）才跑 sifive_u，且 **timeout 3 秒**（正常 1 秒内完成服务并停机，超过即挂起，kill 掉不追查）。
 - 开发机是 macOS：`just dtc qemu riscv64-elf-binutils riscv64-elf-gdb` 来自 Homebrew。打 tar 包时注意 bsdtar 的 `._` AppleDouble 文件会污染 initfs（历史上因此 panic 过）。
 - Rust nightly（`rust-toolchain` 钉住），edition 2024。
 

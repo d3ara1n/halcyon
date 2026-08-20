@@ -177,8 +177,12 @@ pub fn system_reset(reset_type: u32, reset_reason: u32) -> SbiResult {
     )
 }
 
-/// 停机。SRST 成功后不返回；不可用时永久停放（无其他终态可选）。
+/// 停机。SRST 成功后不返回；不可用时（如 QEMU sifive_u 未接 poweroff
+/// 设备，SRST 为 noop）告警后永久停放——真硬件无停机设备时的唯一
+/// 诚实终态。
 pub fn shutdown() -> ! {
-    let _ = system_reset(RESET_SHUTDOWN, 0);
+    if system_reset(RESET_SHUTDOWN, 0).is_err() {
+        warn!(SBI, "SRST 停机不可用，永久停放");
+    }
     crate::hart::park()
 }
