@@ -42,6 +42,8 @@ linker script、rt（boot/panic/alloc——talc 堆，claim DTB 多段内存）�
 
 ### M2 · 内存管理（重写核心）
 
+设计先行，见 `notes/mm.md`（帧池/sv39 纯逻辑 crate/高半区启动协议）。
+
 frame 分配器 + 页表 + MemoryUnit。**必须先设计后编码**：区域切段算法（按当前级别对齐边界切 `[vpn, vpn+count)`，每段单一路径），LeafTable/MidTable 类型分离，映射冲突显式报错。
 **纯逻辑 crate 双目标**：页表编码/索引/分配逻辑放独立 crate，`cargo test` 在 macOS host 上跑（不依赖 QEMU），内核 target 复用同一份代码。测试用例含 2026-08-mm-map-bug.md 的数值：`vpn=65, count=8192`（32MB 未对齐扩展）。
 **验收**：host 单测绿（含未对齐/跨表/大页分裂/重复映射冲突/free 后重映射）+ `just virt` 用户程序加载运行。
