@@ -63,7 +63,7 @@ static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 /// （跳板别名与直映射对同一物理段呈现相同 VMA），执行流无缝。
 pub fn init(board: &BoardInfo) {
     let dram_end = board
-        .memories
+        .memories()
         .iter()
         .map(|r| r.start + r.len)
         .max()

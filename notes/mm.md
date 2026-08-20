@@ -36,7 +36,7 @@ pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
 
 - 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）、initfs 所在段（loader 加载的 tar 区）。
 - `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账（M3）。
-- 内核堆 arena 由此供给：M2 初始化时取若干连续帧 `claim` 进 talc，替换 M0 静态 arena，消灭最后一处 `static mut`。
+- 内核堆由帧池供血：talc 内存源（FrameSource）耗尽时取 1MiB 连续帧块 claim 建新区，帧块所有权终身归堆（acquire 内不可碰堆与锁，无归还记账）；启动路径（DTB 解析/帧池注册）零堆依赖，引导序线性：帧池 → 堆首分配 → 一切堆消费者。
 
 ### 测试集（host）
 

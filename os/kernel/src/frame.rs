@@ -6,14 +6,15 @@
 //! - 全局容器：`Spinlock<Option<FramePool>>`，初始化后只读访问；
 //! - 启动注册：DTB memory 段剔除 SBI + 内核镜像/栈 + initfs 占用。
 
-use alloc::vec::Vec;
-
 use frame_pool::{FramePool, PoolMemory, RegionNode};
 use page_table::{FrameNumber, PAGE_BITS};
 
 use crate::{board::BoardInfo, external, mm, println, sync::Spinlock};
 
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
+
+/// 帧大小（字节）。堆供血等帧池消费方使用。
+pub const FRAME_SIZE: usize = PAGE_SIZE;
 
 /// 帧内存的真实访问：高半区直映射。
 struct PhysAccess;
@@ -54,15 +55,19 @@ fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {
 /// 解析板级信息并初始化帧池：DTB memory 段剔除启动占用后注册。
 pub fn init(board: &BoardInfo) {
     let kernel_end = mm::virt_to_phys(external::_kernel_end as *const () as usize);
-    let holes: Vec<(usize, usize)> =
-        core::iter::once((external::sbi_start(), kernel_end))
-            .chain(board.initfs.map(|(addr, len)| (addr, len)))
-            .collect();
+    // 启动占用最多两洞（镜像/栈 + initfs），固定容量——启动路径零堆依赖
+    let mut holes = [(0usize, 0usize); 2];
+    holes[0] = (external::sbi_start(), kernel_end);
+    let mut hole_count = 1usize;
+    if let Some((addr, len)) = board.initfs {
+        holes[1] = (addr, addr + len);
+        hole_count = 2;
+    }
 
     let mut p = FramePool::new(PhysAccess);
     let mut regions = 0;
-    for region in &board.memories {
-        subtract(region.start, region.start + region.len, &holes, |s, e| {
+    for region in board.memories() {
+        subtract(region.start, region.start + region.len, &holes[..hole_count], |s, e| {
             p.add_region(FrameNumber::from_addr(s), FrameNumber::from_addr(e));
             regions += 1;
         });

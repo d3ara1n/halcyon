@@ -10,7 +10,7 @@
 extern crate alloc;
 
 use core::arch::global_asm;
-use dtb_parser::DeviceTree;
+use dtb::Fdt;
 
 mod board;
 mod console;
@@ -26,15 +26,27 @@ global_asm!(include_str!("assembly.asm"));
 
 const BANNER: &str = include_str!("../banner.txt");
 
+/// 从物理地址构造 DTB 视图（地址纪律：PA 经 phys_to_virt，totalsize 定界）。
+///
+/// # Safety
+/// DTB PA 必须位于直映射覆盖的 DRAM 内（OpenSBI 契约），头部可信。
+unsafe fn fdt_from(pa: usize) -> Fdt<'static> {
+    let va = mm::phys_to_virt(pa);
+    // SAFETY: 读 DTB 头 totalsize（偏移 4，u32 大端）。
+    let total = unsafe { ((va + 4) as *const u32).read_volatile().swap_bytes() } as usize;
+    // SAFETY: [va, va+total) 在直映射覆盖内，只读访问。
+    let data = unsafe { core::slice::from_raw_parts(va as *const u8, total) };
+    Fdt::new(data).expect("设备树不可用")
+}
+
 pub fn main() {
     crate::println!("{}", BANNER);
 
-    // 经高半区直映射访问 DTB（PA 访问仅限 .text.init 的裸机段；正式
-    // 内核表无低半区 identity，PA 直访在切表后会 page fault）。
-    let dtb_va = mm::phys_to_virt(rt::dtb());
-    let board = board::parse(DeviceTree::from_address(dtb_va).expect("设备树不可用"));
+    // SAFETY: dtb PA 来自 boot 契约（a1），位于直映射覆盖的 DRAM 内。
+    let fdt = unsafe { fdt_from(rt::dtb()) };
+    let board = board::parse(&fdt);
 
-    for region in &board.memories {
+    for region in board.memories() {
         crate::println!("[Memory  ] @{:#x} ({:#x})", region.start, region.len);
     }
     crate::println!("[Timebase] {} Hz", board.timebase);
@@ -42,13 +54,14 @@ pub fn main() {
         crate::println!("[InitFS  ] @{:#x} ({:#x})", addr, len);
     }
 
-    for cpu in &board.cpus {
+    for cpu in board.cpus() {
         crate::println!("[Hart #{:>2}] {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
     }
 
     mm::init(&board);
     frame::init(&board);
     frame::smoke();
+    heap::smoke();
 
     crate::println!("[Hart #{:>2}] online (boot)", hart::hartid());
     wake_secondary_harts(&board);
@@ -58,7 +71,7 @@ pub fn main() {
 /// 按 CPU 列表唤醒除 boot hart 外的全部 hart。
 fn wake_secondary_harts(board: &board::BoardInfo) {
     let boot = hart::hartid();
-    for cpu in &board.cpus {
+    for cpu in board.cpus() {
         if cpu.hartid == boot || cpu.mmu == board::MmuType::Bare {
             continue;
         }

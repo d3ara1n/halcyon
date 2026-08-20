@@ -4,14 +4,12 @@ Rust 编写的 RV64 教学操作系统。仓库叫 halcyon，操作系统叫 eRh
 
 ## 仓库结构
 
-三个独立 cargo workspace + 一个硬依赖子模块，靠 path 依赖串联。拆成三个是因为 os（`riscv64gc-unknown-none-elf`）与 user（自定义 JSON target + build-std）运行时不同：cargo 不支持嵌套 workspace，一次构建也只有一个 target，无法合入单一 workspace。
+三个独立 cargo workspace，靠 path 依赖串联。拆成三个是因为 os（`riscv64gc-unknown-none-elf`）与 user（自定义 JSON target + build-std）运行时不同：cargo 不支持嵌套 workspace，一次构建也只有一个 target，无法合入单一 workspace。
 
 ```
-os/        内核 workspace（erhino_kernel，no_std）
-  └─ platforms/  链接脚本 linker.ld、各平台 dts（qemu/virt、qemu/sifive_u）
+os/        内核 workspace（erhino_kernel，no_std；page_table/frame_pool/dtb 为纯逻辑 crate，host 可测）
 user/      用户态 workspace（rinlib、systems/、frameworks/、drivers/）
 shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、FAL 接口、同步原语）
-submodules/dtb_parser  内核硬依赖，克隆后必须 git submodule update --init
 notes/     设计文档，是架构意图的事实来源（改动涉及 IPC/FAL/任务模型时先读对应篇）
 plans/     待办计划；2026-07-code-review.md 有未完成的 P0/P1/P2 事项
 ```

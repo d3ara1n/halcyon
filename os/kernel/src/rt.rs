@@ -5,7 +5,8 @@
 //! `#[lang = "start"]`；secondary hart 不走此路径，由 HSM 直接进入
 //! [`secondary_entry`]。
 //!
-//! 初始化顺序：SBI 探测 → `main`（内核主体，含堆初始化）→ 停放。
+//! 初始化顺序：SBI 探测 → 板级解析（零堆）→ 高半区切换 → 帧池 →
+//! 堆（首次分配时从帧池取块）→ 内核主体 → 嚇醒 secondary → 停放。
 //!
 //! panic 与 trap 路径不依赖堆与 console 锁。
 

@@ -1,3 +1,0 @@
-[submodule "submodules/dtb_parser"]
-	path = submodules/dtb_parser
-	url = git@github.com:d3ara1n/dtb_parser.git

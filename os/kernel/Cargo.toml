@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 erhino_shared = { path = "../../shared" }
-dtb_parser = { path = "../../submodules/dtb_parser", default-features = false }
+dtb = { path = "../dtb" }
 lock_api = "0.4"
 talc = "5"
 page_table = { path = "../page_table" }
