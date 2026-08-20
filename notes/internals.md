@@ -48,6 +48,13 @@ Sv39，canonical 半区边界即用户/内核分界（对齐 Linux 布局）：
 
 共享映射下无 trampoline：trap 入口直接是内核 .text。trap 帧存内核侧每线程存储（内核堆/每线程内核栈，M3 定），sscratch 指向本 hart 的 trap 锚（内核 sp 等），汇编经锚定位帧。TrapFrame（纯用户现场）与调度控制字段类型分离；汇编偏移与 Rust 结构静态断言绑定。trap 进出仅保存/恢复通用+浮点寄存器与 sepc，tp 不变量在汇编中维护。
 
+## hart 种类
+
+`HartKind`（Disabled | Application 起步）是异构扩展点，M3 随调度器引入；dtb 的 mmu-type/isa 解析结果决定 kind。
+
+- 效能核（有 MMU、无 FPU 或低频）：现有设计天然支持——FP 条件保存（FS=Dirty 才存）零开销、每 hart CpuClock 用自身频率、核类型作为 M3 调度器的任务放置输入。
+- 实时核（无 MMU）：高半区内核镜像无法在其执行，形态为 AMP 独立镜像 + 物理内存 carveout + IPI 通信，作为重写完成后的独立项目；现阶段仅约束设计不闭死（跨 hart 共享数据不假设全体核有 MMU）。
+
 ## 锁原语
 
 内核自研 Spinlock：LR/SC 争用，持有期间关本地中断（sstatus.SIE 清零）。关中断是正确性要求而非优化——中断处理函数若获取本 hart 正持有的锁，同核死锁。
