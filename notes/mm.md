@@ -4,17 +4,43 @@
 
 ## 帧池
 
-物理帧的唯一来源，包 buddy_system_allocator 的 frame_allocator 模块，自旋锁用内核 `Spinlock` 包装。
+物理帧的唯一来源，自研 **in-band 有序空闲链**（os/frame_pool，纯逻辑 crate），包装进内核 `Spinlock`，经 `PoolMemory` trait 抽象内存访问——与 page_table 同一「host 可测」流水线。
+
+选型（2026-08，弃 buddy_system_allocator）：其 free list 元数据是堆上 BTreeSet，每次分配碰 talc+锁，帧池与堆形成运行时互依；且 alloc 按 2 的幂取整，与精确 count 记账不合。frame-alloc（TUM 2026-07）设计对路但 RISC-V/SMP 未测试。自研理由：算法需求收敛（任意 count 连续、精确记账、零堆依赖），in-band 结构比 buddy 更简单。
+
+### 结构
+
+空闲区间按地址排序成单链，节点 `{len, next}` 内嵌于区间首帧的前两个 usize——**空闲内存自身承载元数据**，零堆依赖、零外部存储。节点内容是帧号而非地址（`next` 为 usize，`usize::MAX` 哨兵表链尾，不依赖 Rust 对 Option 的内部表示），与地址转换解耦：内核从 bare 切到高半区直映射时，`FramePool::into_mem` 取回后端、换转换函数重建实例即可，链结构零迁移。
 
 ```rust
-pub fn add_region(start: FrameNumber, end: FrameNumber);          // 启动期注册 DTB 内存段
-pub fn alloc_contiguous(count: usize) -> Option<FrameNumber>;     // 整块清零
-pub fn dealloc(base: FrameNumber, count: usize);
+pub struct RegionNode { pub len: usize, pub next: usize }
+
+pub trait PoolMemory {
+    fn read_meta(&mut self, frame: FrameNumber) -> RegionNode;
+    fn write_meta(&mut self, frame: FrameNumber, node: RegionNode);
+    fn clear_frames(&mut self, base: FrameNumber, count: usize);
+}
+
+pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
 ```
+
+- 内核实现：`phys_to_virt` 转换后裸访问（bare 期恒等），unsafe 边界收敛在此；host 实现：`BTreeMap` 模拟帧槽。
+
+### 操作与契约
+
+- `add_region(start, end)`：注册启动期空闲区间（DTB memory 剔除内核镜像/栈/initfs 后），地址序入链。
+- `alloc_contiguous(count)`：first-fit 取首个足够区间，**从尾端切**——低地址区间先消耗，大区间主体保持完整；整取时重链，否则节点原地减 len；返回前整块清零（安全 + 上层拿来即用）。
+- `alloc_at(base, count)`：取指定区间（启动协议三件套、页表解映射回投）；区间内三向切割，左右残段各自成节点；不可用（未注册/已分配）返回 `Err`。
+- `dealloc(base, count)`：按地址序插入 + 相邻三向合并。debug 断言拒绝与现有空闲区间重叠（双重释放检测）。
+- 复杂度：分配/释放 O(空闲区间数)，教学规模无压力；分桶/命中提示等优化留待需要时在范式内逐点做。
 
 - 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）、initfs 所在段（loader 加载的 tar 区）。
 - `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账（M3）。
 - 内核堆 arena 由此供给：M2 初始化时取若干连续帧 `claim` 进 talc，替换 M0 静态 arena，消灭最后一处 `static mut`。
+
+### 测试集（host）
+
+整取整还、尾端切地址递减、三向合并、双重释放、alloc_at 中切/边切/失败、多区域跨链、碎片化后总帧数守恒、空池与大请求拒绝。
 
 ## 页表模式选择
 
@@ -98,7 +124,7 @@ HSM 唤醒入口指向 PA 侧 `_start` 等价段：各自装 `TRAMPOLINE_PG_DIR`
 ## 施工顺序
 
 1. `os/page_table` crate：类型/Pte/FrameMemory/TableTree 切段算法 + host 测试集全绿（含 mm-map-bug 数值用例）。
-2. 帧池：buddy frame_allocator + Spinlock 包装，DTB 段注册（剔除内核镜像/栈/initfs 占用）。
+2. 帧池：os/frame_pool 纯逻辑 crate（host 测试集）+ 内核 Spinlock 包装，DTB 段注册（剔除内核镜像/栈/initfs 占用）。
 3. 启动协议：链接脚本高半区化（VMA/LMA 分离）+ TRAMPOLINE_PG_DIR 双 mega 项 + _start PA 段 + secondary 同路径。
 4. 收口：堆 arena 切帧池供给（消灭 HEAP_ARENA）、just virt 高半区 MMU 下回验收线（banner + 4 核 online）。
 

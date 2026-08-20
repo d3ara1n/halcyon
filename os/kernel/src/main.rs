@@ -15,6 +15,7 @@ use dtb_parser::DeviceTree;
 mod board;
 mod console;
 mod external;
+mod frame;
 mod hart;
 mod heap;
 mod rt;
@@ -40,6 +41,9 @@ pub fn main() {
     for cpu in &board.cpus {
         crate::println!("[Hart #{:>2}] {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
     }
+
+    frame::init(&board);
+    frame::smoke();
 
     crate::println!("[Hart #{:>2}] online (boot)", hart::hartid());
     wake_secondary_harts(&board);
