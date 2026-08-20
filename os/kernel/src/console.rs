@@ -52,10 +52,14 @@ pub fn console_write(args: Arguments<'_>) {
 const TOPIC_WIDTH: usize = 8;
 
 /// 等级色（亮色系，与话题常规色分两档视觉层次）。
+/// COLOR_ERROR/COLOR_DEBUG 的引用在等级宏体内，宏未被调用时视为 dead，
+/// 调用点随 IPC/FS/设备接入出现。
 pub const COLOR_INFO: &str = "0;92";
+#[allow(dead_code)]
 pub const COLOR_WARN: &str = "0;93";
+#[allow(dead_code)]
 pub const COLOR_ERROR: &str = "0;91";
-pub const COLOR_DBG: &str = "0;95";
+pub const COLOR_DEBUG: &str = "0;95";
 
 /// 话题 → ANSI 颜色码。未列出的话题用灰色，新增话题在此登记。
 fn topic_color(topic: &str) -> &'static str {
@@ -83,17 +87,6 @@ pub fn log_tagged(tag: &str, color: &str, args: Arguments<'_>) {
     ));
 }
 
-/// 用户态日志入口：等级（0=无）选亮色，无等级时按话题色（未登记灰色）。
-pub fn log_user(tag: &str, level: u8, args: Arguments<'_>) {
-    let color = match level {
-        1 => COLOR_INFO,
-        2 => COLOR_WARN,
-        3 => COLOR_ERROR,
-        4 => COLOR_DBG,
-        _ => topic_color(tag),
-    };
-    log_tagged(tag, color, args);
-}
 
 macro_rules! print {
     ($($arg:tt)*) => {
@@ -167,11 +160,11 @@ macro_rules! error {
 }
 
 /// [`log!`] 的 debug-only 变体：release 构建静默（编译期消除）。
-#[allow(unused_macros)] // debug-only 变体；内核侧暂无高频追踪点
-macro_rules! dbg {
+#[allow(unused_macros)] // 门面五级对齐；内核侧暂无高频追踪点，随 IPC/FS 接入使用
+macro_rules! debug {
     ($topic:ident, $($arg:tt)+) => {
         if cfg!(debug_assertions) {
-            $crate::console::log_tagged(stringify!($topic), $crate::console::COLOR_DBG, format_args!($($arg)+))
+            $crate::console::log_tagged(stringify!($topic), $crate::console::COLOR_DEBUG, format_args!($($arg)+))
         }
     };
     ($fmt:expr) => {

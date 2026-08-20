@@ -1,6 +1,6 @@
 #![no_std]
 
-use rinlib::debug;
+use rinlib::preclude::*;
 
 fn main() {
     debug!("sifive_spi!");

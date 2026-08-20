@@ -34,20 +34,6 @@ unsafe fn raw_call(
     (error_code, result)
 }
 
-unsafe fn raw_call5(
-    id: usize,
-    arg0: usize,
-    arg1: usize,
-    arg2: usize,
-    arg3: usize,
-    arg4: usize,
-) -> (usize, usize) {
-    let mut error_code;
-    let mut result;
-    asm!("ecall", in("x17") id, inlateout("x10") arg0 => error_code, inlateout("x11") arg1 => result, in("x12") arg2, in("x13") arg3, in("x14") arg4);
-    (error_code, result)
-}
-
 unsafe fn sys_call(
     call: SystemCall,
     arg0: usize,
@@ -63,37 +49,9 @@ unsafe fn sys_call(
     }
 }
 
-unsafe fn sys_call5(
-    call: SystemCall,
-    arg0: usize,
-    arg1: usize,
-    arg2: usize,
-    arg3: usize,
-    arg4: usize,
-) -> SystemCallResult<usize> {
-    let (error, ret) = raw_call5(call as usize, arg0, arg1, arg2, arg3, arg4);
-    if error == 0 {
-        Ok(ret)
-    } else {
-        Err(to_error(error))
-    }
-}
-
 // returns actual byte count sent to debug stream
 pub unsafe fn sys_debug(msg: &str) -> SystemCallResult<usize> {
-    sys_call5(SystemCall::Debug, 0, 0, msg.as_ptr() as usize, msg.len(), 0)
-}
-
-// 带话题与等级的日志输出（内核统一着色对齐；level 见 shared::call::debug_level）
-pub unsafe fn sys_debug_leveled(tag: &str, msg: &str, level: u8) -> SystemCallResult<usize> {
-    sys_call5(
-        SystemCall::Debug,
-        tag.as_ptr() as usize,
-        tag.len(),
-        msg.as_ptr() as usize,
-        msg.len(),
-        level as usize,
-    )
+    sys_call(SystemCall::Debug, msg.as_ptr() as usize, msg.len(), 0, 0)
 }
 
 // returns the new heap top address, or the current when size is 0

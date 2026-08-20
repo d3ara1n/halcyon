@@ -38,15 +38,6 @@ pub enum SystemCallError {
     NotSupported = 0x34,
 }
 
-/// Debug 调用的等级参数（a4）：决定内核侧着色；0 = 无等级（按话题色）。
-pub mod debug_level {
-    pub const NONE: u8 = 0;
-    pub const INFO: u8 = 1;
-    pub const WARN: u8 = 2;
-    pub const ERROR: u8 = 3;
-    pub const DBG: u8 = 4;
-}
-
 /// Predefined system calls
 ///
 /// Only accessible in userspace
@@ -57,7 +48,7 @@ pub enum SystemCall {
     // System reserved
     /// Makes kernel panic
     Die = 0x0,
-    /// 写调试流：a0=tag_ptr a1=tag_len a2=msg_ptr a3=msg_len a4=level（见 [`debug_level`]）
+    /// 写调试流（测试观测通道）：a0=msg_ptr a1=msg_len
     Debug = 0x01,
 
     // -----Process control-----

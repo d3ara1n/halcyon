@@ -67,39 +67,29 @@ pub fn dispatch(frame: &mut TrapFrame, thread: &Thread) -> Outcome {
     }
 }
 
-/// Debug(tag, msg, level)：读用户内存打印（rinlib 日志宏的内核端）。
-/// SUM 位常开，前置逐页校验映射后直访；拷入内核堆再输出（console 的
-/// SBI 通道只接受内核内存）。空 tag 纯行输出，否则 `[tag     ] msg`
-/// 按等级/话题色着色对齐（见 console::log_user）。
+/// Debug(ptr, len)：读用户内存打印（rinlib debug! 的观测通道，测试用）。
+/// 纯透传零策略：拷入内核堆后以 `[pid N]` 话题、debug 等级色输出；
+/// 要自定义格式/颜色的用户态自己拼进消息字符串。正式的用户态输出
+/// 是未来的 console 服务（设备租借 + IPC），不经过内核日志。
 fn debug_print(frame: &mut TrapFrame, thread: &Thread) {
-    let tag_ptr = frame.x[10] as usize;
-    let tag_len = frame.x[11] as usize;
-    let msg_ptr = frame.x[12] as usize;
-    let msg_len = frame.x[13] as usize;
-    let level = frame.x[14] as u8;
+    let ptr = frame.x[10] as usize;
+    let len = frame.x[11] as usize;
     let mut space = thread.process.space.lock();
-    if !space.validate(tag_ptr, tag_len) || !space.validate(msg_ptr, msg_len) {
+    if !space.validate(ptr, len) {
         drop(space);
         respond_error(frame, SystemCallError::MemoryNotAccessible);
         return;
     }
-    // SAFETY: 两区间已逐页校验映射且在用户半区内，SUM 下可读。
-    let tag = unsafe { core::slice::from_raw_parts(tag_ptr as *const u8, tag_len) };
-    let msg = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, msg_len) };
-    let owned_tag = tag.to_vec();
-    let owned = msg.to_vec();
+    // SAFETY: 区间已逐页校验映射且在用户半区内，SUM 下可读。
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let owned = bytes.to_vec();
     drop(space);
-    match core::str::from_utf8(&owned_tag) {
-        Ok(tag) if !tag.is_empty() => match core::str::from_utf8(&owned) {
-            Ok(msg) => crate::console::log_user(tag, level, format_args!("{}", msg)),
-            Err(_) => crate::console::log_user(tag, level, format_args!("非 UTF-8 消息 {} 字节", msg_len)),
-        },
-        _ => match core::str::from_utf8(&owned) {
-            Ok(msg) => println!("{}", msg),
-            Err(_) => println!("非 UTF-8 消息 {} 字节", msg_len),
-        },
+    let tag = alloc::format!("pid {}", thread.process.pid);
+    match core::str::from_utf8(&owned) {
+        Ok(msg) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("{}", msg)),
+        Err(_) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("非 UTF-8 消息 {} 字节", len)),
     }
-    respond_ok(frame, msg_len);
+    respond_ok(frame, len);
 }
 
 /// Extend(pages)：从 brk 起映射页（不要求物理连续），返回新 brk。
