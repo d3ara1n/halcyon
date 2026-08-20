@@ -81,11 +81,12 @@ pub fn main() {
     sched::run()
 }
 
-/// 按 CPU 列表唤醒除 boot hart 外的全部 hart。
+/// 按 CPU 列表唤醒除 boot hart 外的全部 hart，并登记预期在线集合
+/// （静默停机判定要求全员到齐 idle）。
 fn wake_secondary_harts(board: &board::BoardInfo) {
     let boot = hart::hartid();
     for cpu in board.cpus() {
-        if cpu.hartid == boot || cpu.mmu == board::MmuType::Bare {
+        if cpu.mmu == board::MmuType::Bare {
             continue;
         }
         assert!(
@@ -93,6 +94,10 @@ fn wake_secondary_harts(board: &board::BoardInfo) {
             "hart {} 超出 HART_NUM_LIMIT",
             cpu.hartid
         );
+        sched::expect_hart(cpu.hartid);
+        if cpu.hartid == boot {
+            continue;
+        }
         let entry = rt::secondary_entry as *const () as usize;
         let awaken = external::awaken_pa();
         match sbi::hart_start(cpu.hartid, awaken, entry) {

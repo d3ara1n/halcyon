@@ -13,6 +13,7 @@ pub enum SbiExtension {
     Ipi,
     HartStateManagement,
     DebugConsole,
+    SystemReset,
 }
 
 impl SbiExtension {
@@ -24,6 +25,7 @@ impl SbiExtension {
             SbiExtension::Ipi => 0x735049,
             SbiExtension::HartStateManagement => 0x48534D,
             SbiExtension::DebugConsole => 0x4442434E,
+            SbiExtension::SystemReset => 0x53525354,
         }
     }
 }
@@ -153,4 +155,30 @@ pub fn send_ipi(mask: &u64) {
 pub fn clear_ssip() {
     // SAFETY: 仅清 sip.SSIP 位。
     unsafe { asm!("csrc sip, {mask}", mask = in(reg) 2, options(nomem)) };
+}
+
+/// SRST 复位类型。
+pub const RESET_SHUTDOWN: u32 = 0;
+/// SRST 复位类型（保留完整面；冷/热重启随重启需求启用）。
+#[allow(dead_code)]
+pub const RESET_COLD_REBOOT: u32 = 1;
+#[allow(dead_code)]
+pub const RESET_WARM_REBOOT: u32 = 2;
+
+/// SRST：系统停机/重启（QEMU virt/sifive_u 的 OpenSBI 均支持，
+/// 开机日志 `SysReset: yes` 即本扩展）。
+pub fn system_reset(reset_type: u32, reset_reason: u32) -> SbiResult {
+    sbi_call(
+        SbiExtension::SystemReset,
+        0,
+        reset_type as usize,
+        reset_reason as usize,
+        0,
+    )
+}
+
+/// 停机。SRST 成功后不返回；不可用时永久停放（无其他终态可选）。
+pub fn shutdown() -> ! {
+    let _ = system_reset(RESET_SHUTDOWN, 0);
+    crate::hart::park()
 }

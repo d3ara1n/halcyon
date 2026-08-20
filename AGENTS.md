@@ -35,7 +35,7 @@ plans/     compass.md（跨会话导航：方向/位置/戒律）+ 考古与教�
   ```sh
   cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb --target aarch64-apple-darwin
   ```
-- 集成验证：`just virt`（4 核）/ `just sifive_u`（5 核，#0 禁用）。QEMU 不会自行退出，agent 环境必须「启动→观察→kill」一条命令自包含，判定看启动日志关键行而非退出码。
+- 集成验证：`just virt`（4 核）/ `just sifive_u`（5 核，#0 禁用）。对照负载跑完后系统静默自停机（SBI SRST），QEMU 退出即通过；仍需防挂起与异常 panic——agent 环境带超时跑，判定看启动日志关键行而非仅退出码。
 - 开发机是 macOS：`just dtc qemu riscv64-elf-binutils riscv64-elf-gdb` 来自 Homebrew。打 tar 包时注意 bsdtar 的 `._` AppleDouble 文件会污染 initfs（历史上因此 panic 过）。
 - Rust nightly（`rust-toolchain` 钉住），edition 2024。
 

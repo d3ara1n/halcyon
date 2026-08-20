@@ -79,6 +79,15 @@ static TIMERS: Spinlock<Vec<Deadline>> = Spinlock::new(Vec::new());
 /// 空闲 hart 位图（IPI 门铃的目标集）。
 static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 
+/// 预期在线的 hart 位图（main 按板级 CPU 列表置位；静默判定要求
+/// 全员到齐并进入 idle，防止「部分 hart 还没醒来/还在跑」时误停机）。
+static EXPECTED_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// 登记预期在线 hart（main 启动期调用，Application 核各置一位）。
+pub fn expect_hart(hartid: usize) {
+    EXPECTED_MASK.fetch_or(1u64 << hartid, Ordering::SeqCst);
+}
+
 /// 每毫秒 tick 数（init 时按 timebase 换算）。
 static TICKS_PER_MS: AtomicUsize = AtomicUsize::new(1);
 
@@ -234,11 +243,15 @@ fn reap(t: Arc<Thread>) {
     drop(process); // 地址空间随 Drop 链归还全部帧
 }
 
-/// idle：登记空闲位 → 按期限表 arm（无期限则卸载）→ wfi。
+/// idle：登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→ wfi。
 /// 醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
 fn idle() {
     let bit = 1u64 << hart::hartid();
     IDLE_MASK.fetch_or(bit, Ordering::SeqCst);
+    if is_quiescent() {
+        log!(Sched, "系统静默（无唤醒主人），停机");
+        sbi::shutdown();
+    }
 
     let earliest = TIMERS.lock().iter().map(|d| d.at).min();
     match earliest {
@@ -263,4 +276,15 @@ fn sip_stip_pending() -> bool {
     // SAFETY: 只读 sip。
     unsafe { asm!("csrr {}, sip", out(reg) sip, options(nomem, preserves_flags)) };
     sip & (1 << 5) != 0
+}
+
+/// 终端静默：无任何唤醒主人——预期 hart 全部已进 idle（无人能再
+/// 产生工作：enqueue 只来自运行中的 hart）、就绪队列空、期限表空、
+/// 无设备中断使能（当前无设备；接入后设备即主人，谓词自然失效）。
+/// 新增等待源（IPC 等）时本谓词必须同步扩展：每种 Waiting 都要有
+/// 可枚举的主人，否则静默误判为停机。
+fn is_quiescent() -> bool {
+    IDLE_MASK.load(Ordering::SeqCst) == EXPECTED_MASK.load(Ordering::SeqCst)
+        && !DOMAIN.has_ready()
+        && TIMERS.lock().is_empty()
 }
