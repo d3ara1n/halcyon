@@ -107,11 +107,13 @@ pub fn legacy_console_putchar(char: u8) {
 }
 
 pub fn debug_console_write(text: &str) -> SbiResult {
+    // DBCN 契约：base_addr 是物理地址（SBI 在 M-mode 地址空间解引用），
+    // 内核在高半区运行，指针必须先转 PA（纯算术，与当前 satp 无关）。
     sbi_call(
         SbiExtension::DebugConsole,
         0, // write
         text.len(),
-        text.as_ptr() as usize,
+        crate::mm::virt_to_phys(text.as_ptr() as usize),
         0,
     )
 }

@@ -18,6 +18,7 @@ mod external;
 mod frame;
 mod hart;
 mod heap;
+mod mm;
 mod rt;
 mod sbi;
 mod sync;
@@ -28,7 +29,10 @@ const BANNER: &str = include_str!("../banner.txt");
 pub fn main() {
     crate::println!("{}", BANNER);
 
-    let board = board::parse(DeviceTree::from_address(rt::dtb()).expect("设备树不可用"));
+    // 经高半区直映射访问 DTB（PA 访问仅限 .text.init 的裸机段；正式
+    // 内核表无低半区 identity，PA 直访在切表后会 page fault）。
+    let dtb_va = mm::phys_to_virt(rt::dtb());
+    let board = board::parse(DeviceTree::from_address(dtb_va).expect("设备树不可用"));
 
     for region in &board.memories {
         crate::println!("[Memory  ] @{:#x} ({:#x})", region.start, region.len);
@@ -42,6 +46,7 @@ pub fn main() {
         crate::println!("[Hart #{:>2}] {:?} @ {} Hz", cpu.hartid, cpu.mmu, cpu.freq);
     }
 
+    mm::init(&board);
     frame::init(&board);
     frame::smoke();
 
@@ -63,7 +68,7 @@ fn wake_secondary_harts(board: &board::BoardInfo) {
             cpu.hartid
         );
         let entry = rt::secondary_entry as *const () as usize;
-        let awaken = external::_awaken as *const () as usize;
+        let awaken = external::awaken_pa();
         match sbi::hart_start(cpu.hartid, awaken, entry) {
             Ok(_) => {}
             Err(err) => crate::warning!("hart {} 启动失败: {:?}", cpu.hartid, err),

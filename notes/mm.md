@@ -99,7 +99,7 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 
 ### 启动：PA 执行 → 高半区
 
-OpenSBI 加载 ELF 按 `p_paddr` 落在 PA，`_start` 在 **bare satp、PC=PA** 下执行：
+QEMU 以 raw binary 引导（`-kernel` 加载 ELF 会按 VMA 估算内核末端，高半区 VMA 直接溢出 DRAM；raw bin 由 `riscv64-elf-objcopy -O binary` 按 LMA 生成，ELF 仅供 gdb/符号），`_start` 在 **bare satp、PC=PA** 下执行：
 
 1. `_start` 及开 MMU 前的全部代码与位置无关纪律：`la` 取到的是 VMA，访问 PA 需减链接期常量 `_va_pa_delta`（镜像 VMA 基 - LMA 基）；
 2. `TRAMPOLINE_PG_DIR`：静态 root 表，两条 mega 项——首 1GiB PA identity 映射 + 同一物理段的高半区映射（内核镜像/栈/bss 都在首 1GiB 内）；
@@ -107,6 +107,8 @@ OpenSBI 加载 ELF 按 `p_paddr` 落在 PA，`_start` 在 **bare satp、PC=PA** 
 4. 高半区继续段：构建正式内核页表（直映射区全量），切换 satp，此后内核恒在高半区执行。
 
 对应 Linux `head.S` 的 `trampoline_pg_dir → relocate_enable_mmu` 一次性机构。
+
+**地址纪律**（高半区迁移的指针契约，两处实战教训）：raw 引导无 ELF 加载器清 bss，各空间 bss 由各自入口汇编清零；SBI ecall 的地址参数（DBCN base_addr、HSM start_addr）一律传 PA，内核指针必须先 `virt_to_phys`；正式内核表无低半区 identity 映射，切表后一切 PA 访问必须经 `phys_to_virt`，裸 PA 直访仅限 `.text.init` 裸机段。
 
 ### secondary hart
 

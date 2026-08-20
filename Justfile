@@ -19,8 +19,8 @@ KERNEL_BIN := KERNEL_ELF+".bin"
 
 DTB := TARGET_DIR/"device.dtb"
 
-# qemu
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_ELF+"' -dtb '"+DTB+"' -device loader,file=artifacts/initfs.tar,addr=0xB0000000"
+# QEMU
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file=artifacts/initfs.tar,addr=0xB0000000"
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -66,7 +66,7 @@ build_kernel:
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}\033[0m"
     @cp "{{MEMORY_SCRIPT}}" "{{TARGET_DIR}}"
     @cd os && RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} -Z unstable-options --artifact-dir {{TARGET_DIR}}
-    @rust-objcopy {{KERNEL_ELF}} -S -O binary {{KERNEL_BIN}} -B=riscv64
+    @riscv64-elf-objcopy {{KERNEL_ELF}} -O binary {{KERNEL_BIN}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
 
 run_qemu +OPTIONS: make_dtb make_initfs build_kernel

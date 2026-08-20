@@ -1,9 +1,9 @@
 //! 物理帧池内核侧：真实内存访问 + 全局容器 + 启动注册（见 notes/mm.md「帧池」）。
 //!
 //! 帧池算法在 os/frame_pool（纯逻辑，host 可测），本模块只做三件事：
-//! - [`PhysAccess`]：PoolMemory 的内核实现——当前 bare satp 下 PA 恒等
-//!   访问；高半区切换后改为 `phys_to_virt`，链结构零迁移（节点存帧号）。
-//! - 全局容器：`OnceCell<Spinlock<FramePool>>`，初始化后只读访问。
+//! - [`PhysAccess`]：PoolMemory 的内核实现——经 `mm::phys_to_virt` 访问
+//!   （初始化于 mm::init 之后，恒在高半区直映射下工作）；
+//! - 全局容器：`Spinlock<Option<FramePool>>`，初始化后只读访问；
 //! - 启动注册：DTB memory 段剔除 SBI + 内核镜像/栈 + initfs 占用。
 
 use alloc::vec::Vec;
@@ -11,18 +11,18 @@ use alloc::vec::Vec;
 use frame_pool::{FramePool, PoolMemory, RegionNode};
 use page_table::{FrameNumber, PAGE_BITS};
 
-use crate::{board::BoardInfo, external, println, sync::Spinlock};
+use crate::{board::BoardInfo, external, mm, println, sync::Spinlock};
 
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
 
-/// 帧内存的真实访问：bare satp 下 PA 恒等。
+/// 帧内存的真实访问：高半区直映射。
 struct PhysAccess;
 
 impl PoolMemory for PhysAccess {
     fn read_meta(&mut self, frame: FrameNumber) -> RegionNode {
         // SAFETY: 空闲区间首帧已注册，元数据槽（前两个 usize）有效；
         // 页对齐地址，usize 对齐访问成立。
-        let slot = unsafe { &*(frame.addr() as *const [usize; 2]) };
+        let slot = unsafe { &*(mm::phys_to_virt(frame.addr()) as *const [usize; 2]) };
         RegionNode {
             len: slot[0],
             next: slot[1],
@@ -31,7 +31,7 @@ impl PoolMemory for PhysAccess {
 
     fn write_meta(&mut self, frame: FrameNumber, node: RegionNode) {
         // SAFETY: 同上；写入槽位是池对空闲区间的唯一记账。
-        let slot = unsafe { &mut *(frame.addr() as *mut [usize; 2]) };
+        let slot = unsafe { &mut *(mm::phys_to_virt(frame.addr()) as *mut [usize; 2]) };
         *slot = [node.len, node.next];
     }
 
@@ -39,7 +39,7 @@ impl PoolMemory for PhysAccess {
         // SAFETY: [base, base+count) 刚被切出为已分配，清零不破坏任何
         // 空闲链节点（节点只挂空闲区间首帧）。
         unsafe {
-            core::ptr::write_bytes(base.addr() as *mut u8, 0, count * PAGE_SIZE);
+            core::ptr::write_bytes(mm::phys_to_virt(base.addr()) as *mut u8, 0, count * PAGE_SIZE);
         }
     }
 }
@@ -53,9 +53,9 @@ fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {
 
 /// 解析板级信息并初始化帧池：DTB memory 段剔除启动占用后注册。
 pub fn init(board: &BoardInfo) {
-    let kernel_end = external::_kernel_end as *const () as usize;
+    let kernel_end = mm::virt_to_phys(external::_kernel_end as *const () as usize);
     let holes: Vec<(usize, usize)> =
-        core::iter::once((external::_memory_start as *const () as usize, kernel_end))
+        core::iter::once((external::sbi_start(), kernel_end))
             .chain(board.initfs.map(|(addr, len)| (addr, len)))
             .collect();
 
@@ -130,8 +130,8 @@ impl Drop for FrameTracker {
 /// 冒烟：分配→写入→归还→重取验证清零，全程真硬件访问。
 pub fn smoke() {
     let t = alloc_contiguous(8).expect("冒烟分配失败");
-    let slots = t.base.addr() as *mut usize;
-    // SAFETY: 冒烟持有 [base, base+8)，写首 8 槽不越界。
+    let slots = mm::phys_to_virt(t.base.addr()) as *mut usize;
+    // SAFETY: 冒烟持有 [base, base+8)，写首 8 槽不越界；高半区直映射下访问。
     unsafe {
         for i in 0..8 {
             slots.add(i).write_volatile(0xDEAD_0000 + i);
@@ -142,7 +142,7 @@ pub fn smoke() {
     assert_eq!(free_frames(), before + 8, "帧归还记账不符");
     let t2 = alloc_contiguous(8).expect("重取失败");
     // SAFETY: 同上；首帧首槽读回验证分配即清零。
-    let zeroed = unsafe { (t2.base.addr() as *const usize).read_volatile() == 0 };
-    assert!(zeroed, "分配未清零");
+    let first = unsafe { *(mm::phys_to_virt(t2.base.addr()) as *const usize) };
+    assert!(first == 0, "分配未清零");
     println!("[Frame   ] smoke: alloc/write/dealloc/re-zero ok");
 }

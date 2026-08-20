@@ -46,7 +46,7 @@ fn rust_start<T: Termination + 'static>(
     _sigpipe: u8,
 ) -> isize {
     assert_eq!(
-        external::hart_num_limit as *const () as usize,
+        external::hart_num_limit(),
         hart::HART_NUM_LIMIT,
         "链接脚本 HART_NUM_LIMIT 与 hart::HART_NUM_LIMIT 不一致"
     );
