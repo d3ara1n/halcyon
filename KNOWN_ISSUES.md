@@ -2,6 +2,10 @@
 
 记录会随时间消灭的问题，修复后删除条目；持久性约定在 AGENTS.md。
 
+## 调度挂起（待重写解决）
+
+mm bug 修复后 4 核不再 panic，但单核 `-smp cores=1` 仍在 fs 的 32MB extend 后挂起：gdb 见 fs 阻塞在用户态等待循环，pm/init 从未被调度；4 核下 fs main 也未在观测窗口内完成。调度/唤醒路径问题，重写 M3 消灭，背景见 `plans/2026-08-mm-map-bug.md`「附带发现」。
+
 ## rust-analyzer 环境前提
 
 多 workspace 各自 target 无需编辑器配置：RA 按 workspace root 读取 `.cargo/config.toml` 的 `build.target`（2026-08 实测，含 user/ 自定义 JSON target）。

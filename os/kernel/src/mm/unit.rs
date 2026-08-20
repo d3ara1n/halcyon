@@ -177,7 +177,7 @@ impl<E: PageTableEntry + Sized + 'static> MemoryUnit<E> {
                             .map(|f| freed += f)?;
                         if count > max_remaining {
                             Self::free_internal(
-                                table,
+                                container,
                                 vpn + max_remaining,
                                 count - max_remaining,
                                 level,
@@ -365,7 +365,7 @@ impl<E: PageTableEntry + Sized + 'static> MemoryUnit<E> {
                                     None
                                 };
                                 Self::map_internal(
-                                    table,
+                                    container,
                                     vpn + max_remaining,
                                     next,
                                     count - max_remaining,
