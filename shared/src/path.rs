@@ -190,7 +190,7 @@ impl Path {
     }
 
     /// Get a iterator to iterate over path components
-    pub fn iter(&self) -> PathIterator {
+    pub fn iter(&self) -> PathIterator<'_> {
         PathIterator::from_path(self)
     }
 

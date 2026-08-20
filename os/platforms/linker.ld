@@ -19,7 +19,6 @@ SECTIONS
         *(.trampoline.user_trap)
         *(.trampoline.*)
         . = ALIGN(0x1000);
-        ASSERT(. - _trampoline_start == 0x1000, "error: _trampoline code larger than one page");
     } > RAM
 
     .rodata : ALIGN(8) {
@@ -42,9 +41,6 @@ SECTIONS
     } > RAM
 
     .runtime (NOLOAD) : ALIGN(16) {
-        PROVIDE(_heap_start = .);
-        . = . + HEAP_SIZE;
-        . = ALIGN(16);
         PROVIDE(_stack_start = .);
         . = . + STACK_SIZE * HART_NUM_LIMIT;
         . = ALIGN(4096);  

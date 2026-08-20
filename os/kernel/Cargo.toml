@@ -1,0 +1,10 @@
+[package]
+name = "erhino_kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../shared" }
+dtb_parser = { path = "../../submodules/dtb_parser", default-features = false }
+lock_api = "0.4"
+talc = "5"
