@@ -1,5 +1,7 @@
 # Halcyon 代码 Review 后续计划
 
+> **定位：旧实现 review 档案。** 大部分文件与结构已被重写，本篇只用于提取缺陷模式和回归样本，不作为当前代码事实、待办清单或正确实现参照。当前系统审查见 `plans/reviews/system-audit/`。
+>
 > 来源：2026-07 对全工程（os / user / shared）的一次完整 review。
 > 行号以 review 时为准；本次已修复部分的小幅偏移用 `grep` 定位即可。
 > `- [ ]` 可逐条 tick。

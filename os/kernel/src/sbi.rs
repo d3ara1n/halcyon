@@ -85,10 +85,10 @@ fn sbi_call(eid: SbiExtension, fid: usize, arg0: usize, arg1: usize, arg2: usize
     }
 }
 
-static DEBUG_CONSOLE_SUPPORTED: AtomicBool = AtomicBool::new(false);
+static DEBUG_CONSOLE_READY: AtomicBool = AtomicBool::new(false);
 
-pub fn is_debug_console_supported() -> bool {
-    DEBUG_CONSOLE_SUPPORTED.load(Ordering::Relaxed)
+pub fn is_debug_console_ready() -> bool {
+    DEBUG_CONSOLE_READY.load(Ordering::Relaxed)
 }
 
 /// 启动早期确认现代 SBI 基线与必需扩展。
@@ -98,9 +98,8 @@ pub fn init() {
         "BASE.get_spec_version",
     );
     let major = version >> 24 & 0x7f;
-    let minor = version & 0x00ff_ffff;
-    if major == 0 && minor < 2 {
-        fatal("SBI specification older than 0.2", SbiError::NotSupported);
+    if major < 2 {
+        fatal("SBI specification older than 2.0", SbiError::NotSupported);
     }
 
     for extension in [
@@ -117,7 +116,7 @@ pub fn init() {
             fatal("required SBI extension unavailable", SbiError::NotSupported);
         }
     }
-    DEBUG_CONSOLE_SUPPORTED.store(true, Ordering::Release);
+    DEBUG_CONSOLE_READY.store(true, Ordering::Release);
 }
 
 /// 将维持内核不变量的 SBI 失败转为可观测的致命错误。
@@ -158,16 +157,10 @@ pub(crate) fn legacy_console_putchar(byte: u8) {
     }
 }
 
-/// DBCN write 允许部分写入；循环直到整段文本完成，零进度视为致命错误。
-pub fn debug_console_write_all(text: &str) {
-    let bytes = text.as_bytes();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let written = require(debug_console_write_bytes(&bytes[offset..]), "DBCN.write");
-        if written == 0 || written > bytes.len() - offset {
-            fatal("DBCN.write returned invalid length", SbiError::Failed);
-        }
-        offset += written;
+/// DBCN 仅承载内核观测日志：单次尽力写入，部分写、零写或错误均丢弃。
+pub fn debug_console_write_best_effort(text: &str) {
+    if !text.is_empty() {
+        let _ = debug_console_write_bytes(text.as_bytes());
     }
 }
 

@@ -102,21 +102,19 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 QEMU 以 raw binary 引导（`-kernel` 加载 ELF 会按 VMA 估算内核末端，高半区 VMA 直接溢出 DRAM；raw bin 由 `riscv64-elf-objcopy -O binary` 按 LMA 生成，ELF 仅供 gdb/符号），`_start` 在 **bare satp、PC=PA** 下执行：
 
 1. `_start` 及开 MMU 前的全部代码与位置无关纪律：`la` 取到的是 VMA，访问 PA 需减链接期常量 `_va_pa_delta`（镜像 VMA 基 - LMA 基）；
-2. `TRAMPOLINE_PG_DIR`：静态 root 表，两条 mega 项——首 1GiB PA identity 映射 + 同一物理段的高半区映射（内核镜像/栈/bss 都在首 1GiB 内）；
-3. 装 `satp = TRAMPOLINE_PG_DIR`，`sfence.vma`，`jalr` 跳 `继续标签 + _va_pa_delta`... 即跳到高半区地址的同一代码；
-4. 高半区继续段：构建正式内核页表（直映射区全量），切换 satp，此后内核恒在高半区执行。
+2. cold-bootstrap 临时 root 表覆盖当前 PA 与同一物理段的高半区别名；
+3. 写入临时 satp、`sfence.vma` 后跳到高半区；
+4. 高半区继续段构建正式内核页表（直映射区全量），写正式 satp并再次 `sfence.vma`，此后内核恒在高半区执行。
 
-对应 Linux `head.S` 的 `trampoline_pg_dir → relocate_enable_mmu` 一次性机构。
-
-**地址纪律**（高半区迁移的指针契约，两处实战教训）：raw 引导无 ELF 加载器清 bss，各空间 bss 由各自入口汇编清零；SBI ecall 的地址参数（DBCN base_addr、HSM start_addr）一律传 PA，内核指针必须先 `virt_to_phys`；正式内核表无低半区 identity 映射，切表后一切 PA 访问必须经 `phys_to_virt`，裸 PA 直访仅限 `.text.init` 裸机段。
+**地址纪律**：raw 引导无 ELF 加载器清 bss，各空间 bss 由对应入口汇编清零；SBI ecall 的地址参数（DBCN base_addr、HSM start_addr）一律传 PA，内核指针必须先 `virt_to_phys`；正式内核表无低半区 identity 映射，切表后一切 PA 访问必须经 `phys_to_virt`。裸 PA 直访只存在于 bootstrap 与永久 secondary PA 前导。
 
 ### secondary hart
 
-HSM 唤醒入口指向 PA 侧 `_start` 等价段：各自装 `TRAMPOLINE_PG_DIR` 跳高半区后，再走 `_awaken` 装配（tp/栈/stvec）。不再需要裸 PA 长驻路径。
+HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按“过渡 satp→`sfence.vma`→高半区→正式 satp→`sfence.vma`”进入 formal entry。它不复用可回收的 cold-bootstrap 环境。完整生命周期见 [`execution-context.md`](execution-context.md)。
 
-### trap（M3 实现，mm 侧契约）
+### trap
 
-无 trampoline 页：`stvec` 恒指内核 .text（任意用户页表共享内核顶层项，trap 不切 satp）。用户内存访问开 SUM 位直访 VA。trap 帧存内核侧（M3 定存储位置），`sscratch` 存本 hart 陷阱锚。
+任意用户页表共享内核高半区，用户 trap 不切 satp；`stvec` 恒指共同内核入口。用户上下文存于内核对象，`sscratch` 存本 hart 陷阱锚。内核稳态 SUM=0，只有 user-copy guard 可以临时直访用户 VA。
 
 ## 用户地址空间（M3 消费）
 

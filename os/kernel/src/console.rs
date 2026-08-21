@@ -1,6 +1,6 @@
 //! 内核控制台。
 //!
-//! 输出走 SBI（DBCN 优先，legacy putchar 回退）。多 hart 并发输出由
+//! 输出走 SBI（初始化后 DBCN，初始化前 legacy putchar）。多 hart 并发输出由
 //! [`Spinlock`] 串行化；panic 路径绕过锁直写（见 [`console_write_raw`]），
 //! 避免 panic 时持锁交叉导致死锁。
 
@@ -18,8 +18,8 @@ impl Console {
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if sbi::is_debug_console_supported() {
-            sbi::debug_console_write_all(s);
+        if sbi::is_debug_console_ready() {
+            sbi::debug_console_write_best_effort(s);
             Ok(())
         } else {
             for b in s.bytes() {
@@ -34,8 +34,8 @@ static CONSOLE: Spinlock<Console> = Spinlock::new(Console::new());
 
 /// 绕过锁的直写，仅 panic 等不可依赖锁纪律的路径使用。
 pub fn console_write_raw(s: &str) {
-    if sbi::is_debug_console_supported() {
-        sbi::debug_console_write_all(s);
+    if sbi::is_debug_console_ready() {
+        sbi::debug_console_write_best_effort(s);
     } else {
         for b in s.bytes() {
             sbi::legacy_console_putchar(b);

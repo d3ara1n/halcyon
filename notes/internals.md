@@ -29,6 +29,12 @@
 - 内核锁只需防跨核争用；锁原语的关中断语义在此模型下是零成本保险，保留以防纪律腐化。
 - 阻塞的表达方式是异步 syscall（见 `call.md`），不是内核睡眠——协作式定性下不存在可挂起的内核执行流。
 
+## SBI 平台基线
+
+内核要求 SBI 2.0 或更高版本，并把 TIME、IPI、HSM、DBCN 作为必需扩展；SRST 是可选终态能力，失败时系统永久停放。版本号和必需扩展在启动期通过 BASE 探测，不从机器型号推断。
+
+DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只承载内核日志和 Debug syscall 的观测输出，不是功能模块。输出为单次非阻塞 best-effort：部分写、零写或错误都允许丢失，任何日志失败均不得改变调度、IPC、内存管理等功能路径。legacy putchar 只在 DBCN 尚未就绪时提供早期 best-effort 诊断，不是运行期兼容层。
+
 ## 唤醒所有权
 
 **每个唤醒必须有主人，无主的周期性唤醒（保险 timer、心跳）不存在。** hart 敢睡，当且仅当「自己的期限已上闹钟，或别人的请求会按门铃」：
@@ -67,32 +73,23 @@ IPI 通路分两层：**门铃**（`send_ipi` + SSIP 处理 + 醒后查待办）
 
 ## 地址空间
 
-Sv39，canonical 半区边界即用户/内核分界（对齐 Linux 布局）：
+Sv39，canonical 半区边界即用户/内核分界：
 
 - 用户：低半区 `[0, 2^38)`（256GiB），完全归用户。
 - 内核：高半区 `[0xFFFFFFC0_00000000, 2^39)`，含内核镜像与物理内存直映射（phys_to_virt 线性偏移）；vmalloc 等区域 M4+ 按需扩展。
-- 每个用户页表 root 复制内核高半区顶层项（创建时拷 8-16 字节）→ 任意时刻内核代码恒可执行：trap 不切 satp，stvec 恒指内核 .text；satp 更换只发生在进程地址空间更换。
-- 用户内存访问开 SUM 位直接走 VA，不再软件遍历页表 translate。
-- secondary hart 经 HSM 启动时 satp 为 bare：经 identity 早期页表开 MMU 后跳高半区（对应 Linux head.S 的 trampoline_pg_dir → relocate_enable_mmu 一次性机构）。
+- 每个用户页表 root 复制内核高半区顶层项（创建时拷 8-16 字节）→ 任意时刻内核代码恒可执行：用户 trap 不切 satp，satp 更换只发生在进程地址空间更换。
+- 内核稳态 SUM=0；用户 VA 只在显式 user-copy guard 内直接访问，不回退到软件遍历页表 translate。
+- secondary hart 从 HSM Bare 状态经永久 identity/高半区别名过渡页表进入正式高半区环境。
 
-设计依据：trap 是最热路径，共享映射消灭了 trampoline 页/双地址空间切换/软件 translate 三套机制（旧内核复杂度最集中处）。
+设计依据：共享高半区让用户 trap 直接进入共同内核入口，不需要 trampoline 页或双地址空间切换；SUM guard 则把用户访问权限收敛到显式边界。
 
-## trap 帧与上下文
+## 执行上下文与 hart 能力
 
-共享映射下无 trampoline：trap 入口直接是内核 .text，用户表与内核表高半区同构，**trap 全程不切 satp**。
+bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserContext/FP、调度域和指令发布的统一契约见 [`execution-context.md`](execution-context.md)。
 
-- **TrapFrame**（纯用户现场，每线程一份，内核堆分配）：`x[32] + f[32] + fcsr + fp_valid + sepc` 共 536 字节；Rust 结构与汇编偏移经 const 断言绑定。tp 即用户 x4，作为普通寄存器保存/恢复。调度控制字段与 TrapFrame 类型分离，放执行点（HartLocal）。
-- **trap 锚**：sscratch 在用户态恒指本 hart 的 HartLocal。trap 进入后 `csrrw` 交换定位锚，从锚取当前 TrapFrame 指针与调度栈位置；sret 前置回。锚内容（当前帧指针、user satp、调度循环栈位）就是执行点状态。
-- **浮点 FS 条件保存**：FP 有效性属于线程帧而非 hart。trap 时仅 FS==Dirty 才更新 `f[32] + fcsr` 并标记帧有效；sret 按帧有效位恢复并置 FS=Clean，用户再次写 FP 后由硬件转为 Dirty。线程迁移不依赖目标 hart 残留的 FS 状态。
-- **SIE 纪律**：sret 由硬件以 SPIE 恢复 SIE=1（用户态可打断）；trap 进入自动清零；调度循环与内核态恒关。
-- **出口二值**：trap 处理返回 Resume（装帧 sret，直接回用户态）或 Switch（恢复调度循环现场，回本 hart 调度循环）。调度循环是 per-hart 栈上的常驻 Rust 函数，`ret_to_user` 保存循环现场后 sret；trap handler 深度 1 调用，无嵌套执行流。
+内核态运行期间 tp 指向当前 HartLocal；正式 sscratch 恒指同一 HartLocal；SPP 是 trap 来源的唯一真值。U 态忽略 sstatus.SIE，内核以 `sie` 精确选择 SSIP/STIP 等来源，S 态协作式执行期间 SIE 恒为 0。
 
-## hart 种类
-
-`HartKind`（Disabled | Application 起步）是异构扩展点，随调度器引入；dtb 的 mmu-type/isa 解析结果决定 kind。调度域以 HartKind 为划分依据（见 `task.md`「调度」）：效能核/快核各属其域、各配类组合，实时核 AMP 独立；M3 单域，HartKind 先落枚举。
-
-- 效能核（有 MMU、无 FPU 或低频）：现有设计天然支持——FP 条件保存（FS=Dirty 才存）零开销、每 hart CpuClock 用自身频率、核类型作为 M3 调度器的任务放置输入。
-- 实时核（无 MMU）：高半区内核镜像无法在其执行，形态为 AMP 独立镜像 + 物理内存 carveout + IPI 通信，作为重写完成后的独立项目；现阶段仅约束设计不闭死（跨 hart 共享数据不假设全体核有 MMU）。
+无 MMU hart 不能进入当前共享高半区内核，形态仍是 AMP 独立镜像、物理内存 carveout 与 IPI 通信；它不属于本执行环境的 admitted hart 集合。
 
 ## 锁原语
 

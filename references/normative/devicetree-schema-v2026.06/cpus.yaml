@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: GPL-2.0 OR BSD-2-clause
+# Copyright (C) 2018-2019 SiFive, Inc.
+#
+# Description text is from the Devicetree Specification at
+#   https://www.devicetree.org/specifications/
+# which is
+# Copyright 2008,2011 Power.org, Inc.
+# Copyright 2008,2011 Freescale Semiconductor, Inc.
+# Copyright 2008,2011 International Business Machines Corporation
+# Copyright 2016,2017 Linaro,Ltd.
+# Copyright 2016,2017 Arm,Ltd.
+#
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cpus.yaml#
+$schema: http://devicetree.org/meta-schemas/base.yaml#
+
+title: Common CPU Nodes properties
+
+maintainers:
+  - Devicetree Specification Mailing List <devicetree-spec@vger.kernel.org>
+
+description: |+
+  In Devicetree data files, the layout of CPUs is described in the
+  "cpus" node.  This node in turn contains a number of subnodes
+  representing CPUs, which define properties for every cpu.
+
+  Bindings for CPU nodes follow the Devicetree Specification, available from:
+
+  https://www.devicetree.org/specifications/
+
+properties:
+  $nodename:
+    const: cpus
+    description:
+      A /cpus node is required for all Devicetrees.  It does not represent
+      a real device in the system, but acts as a container for child "cpu"
+      nodes which represent the systems' CPUs.
+
+  '#address-cells':
+    minimum: 1
+    description:
+      The value specifies how many cells each element of the reg property
+      array takes in children of this node.
+
+  '#size-cells':
+    const: 0
+
+  cpu-map:
+    $ref: /schemas/cpu-map.yaml#
+
+patternProperties:
+  '^cpu@[0-9a-f]+$':
+    $ref: cpu.yaml#
+
+required:
+  - '#address-cells'
+  - '#size-cells'
+
+additionalProperties: true
+
+...
