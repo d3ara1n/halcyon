@@ -1,334 +1,367 @@
 .option norvc
-.attribute arch, "rv64gc"
+.attribute arch, "rv64imac_zicsr_zifencei"
 
 # ---------------------------------------------------------------------------
-# PA 入口段（VMA = LMA = PA）：OpenSBI / SBI HSM 在裸 satp 下跳入。
+# 执行环境装配（契约见 notes/execution-context.md；偏移常量由 Rust
+# offset_of! 经 main.rs 的 global_asm! 注入，本文件不维护数字真值）。
 #
-# 纪律：本段代码不得用 `la` 引用高半区符号——PC 相对寻址 ±2GiB，
-# 跨空间必溢出；对高半区的引用一律经 .data.init 的 64 位字面量间接。
-# raw binary 引导无 ELF 加载器清 bss：各空间 bss 由各自入口清零
-#（.bss.init 在此清，高半区 .bss 由 _start_high 清）。
+# 三段空间：
+# - .text.init / .bootstrap.*（PA，VMA=LMA）：cold boot 专用，全员 Online
+#   后回收帧池；
+# - .text.entry（PA，VMA=LMA）：永久 hart-entry 设施——secondary PA 前导、
+#   早期 fatal vector；共享过渡页表 root 在链接脚本 .bss.entry；
+# - 高半区段：正式运行环境。
+#
+# 启动发布协议：record 以 Release/Acquire 发布（Starting 后 secondary 才
+# 消费；Online 由 formal entry 发布）。平台对普通主存硬件 cache coherent。
 # ---------------------------------------------------------------------------
 
 .section .text.init
 .global _start
-# OpenSBI 进入：a0 = boot hartid，a1 = dtb PA；bare satp，PC = PA。
-# 职责：写跳板 root 表两项（DRAM 槽 identity + 高半区别名），开 MMU，
-# 跳高半区。a0/a1 原样带过。
+# cold boot 入口：OpenSBI 跳到加载地址起点。a0 = boot hartid，a1 = dtb PA；
+# bare satp，PC = PA。职责：清零并填写共享过渡页表（DRAM 槽 identity +
+# 高半区别名），开 MMU，跳高半区 bootstrap 续段。a0/a1 原样带过。
 _start:
-    # 清 .bss.init（含跳板 root 表），再写入两项
-    la      t0, __bss_init_start
-    la      t2, __bss_init_end
-1:  sd      zero, 0(t0)
-    addi    t0, t0, 8
-    bltu    t0, t2, 1b
-    la      t0, TRAMPOLINE_PG_DIR
-    la      t1, _BOOT_CONSTS
-    ld      t2, 0(t1)          # 跳板 PTE：V|R|W|X|G|A|D + DRAM 槽基 ppn
-    ld      t3, 8(t1)          # DRAM 槽 vpn2 槽号
-    slli    t4, t3, 3
-    add     t4, t0, t4
-    sd      t2, 0(t4)          # root[slot]：identity（切换后旧 PC 仍有效）
-    addi    t5, t3, 256
-    slli    t5, t5, 3
-    add     t5, t0, t5
-    sd      t2, 0(t5)          # root[slot+256]：高半区别名（同一物理段）
-    ld      t6, 16(t1)         # _start_high 的 VMA 字面量
-    srli    t0, t0, 12         # satp.ppn = 表 PA >> 12
-    li      t1, 8 << 60        # satp.mode = Sv39
+    la      sp, __bootstrap_stack_top       # bootstrap 临时栈
+    la      t0, __transition_root_pa
+    li      t1, 4096
+    add     t1, t0, t1
+    mv      t2, t0
+1:  sd      zero, 0(t2)                     # 清零过渡 root 一页
+    addi    t2, t2, 8
+    bltu    t2, t1, 1b
+    la      t3, _BOOT_CONSTS
+    ld      t4, 8(t3)                       # DRAM 槽 vpn2 槽号
+    ld      t5, 16(t3)                      # _start_high 的 VMA 字面量
+    slli    t6, t4, 3
+    add     t6, t0, t6
+    ld      t3, 0(t3)                       # (DRAM 槽 PA>>2)|V|R|W|X|G|A|D
+    sd      t3, 0(t6)                       # identity（切换后旧 PC 有效）
+    addi    t6, t4, 256
+    slli    t6, t6, 3
+    add     t6, t0, t6
+    sd      t3, 0(t6)                       # 高半区别名（同一物理段）
+    srli    t0, t0, 12                      # satp.ppn
+    li      t1, 8 << 60                     # Sv39
     or      t0, t0, t1
     csrw    satp, t0
-    sfence.vma
-    jr      t6
+    sfence.vma                              # 过渡翻译同步
+    jr      t5                              # → 高半区 _start_high
 
+# 低段跨空间字面量：入口代码经此间接取高半区地址与 ABS 常量
+#（R_RISCV_64 无范围限制）。
+.section .data.init
+.global _BOOT_CONSTS
+_BOOT_CONSTS:
+    .quad _trampoline_pte       # [0] (DRAM 槽 PA >> 2) | 0xEF
+    .quad _trampoline_slot      # [1] DRAM 槽 vpn2 槽号
+    .quad _start_high           # [2] boot 高半区续段 VMA
+
+# 高半区跨空间字面量表：高地址代码（Rust）经 PCREL 读内存取值，
+# 杜绝对低段符号与 ABS 常量的跨空间寻址（.quad 绝对重定位无范围限制）。
+.section .data
+.global _ENTRY_CONSTS
+_ENTRY_CONSTS:
+    .quad SBI_START             # [0] SBI 段物理起点
+    .quad STACK_SIZE            # [1] 每 hart 栈大小
+    .quad HART_NUM_LIMIT        # [2] hart 数上限
+    .quad _awaken               # [3] secondary PA 入口
+    .quad __transition_root_pa  # [4] 共享过渡页表 root PA
+    .quad __bootstrap_start     # [5] bootstrap 可回收区间起点
+    .quad __bootstrap_free_end  # [6] bootstrap 可回收区间终点
+    .quad __bootstrap_stack_top # [7] bootstrap 临时栈顶（PA）
+    .quad KERNEL_VA_BASE        # [8] 高半区基址
+    .quad __bootstrap_stack_top # [9] 同 [7]：_start_high 别名换算用
+
+.section .text.entry
+.global _pa_fatal
+# Bare 下早期 fatal vector：任何异常停驻等待复位（无栈、无诊断面）。
+_pa_fatal:
+1:  wfi
+    j       1b
+
+# PA 段永久常量：高半区基址（_awaken 换算 record VA 用）。
+.section .data.entry
+.global _ENTRY_PA_CONSTS
+_ENTRY_PA_CONSTS:
+    .quad KERNEL_VA_BASE
+
+.section .text.entry
 .global _awaken
-# HSM secondary 入口：a0 = hartid，a1 = opaque（secondary_entry VMA）。
-# 跳板表项由 boot hart 在 _start 写好；这里只装跳板 satp 跳高半区。
+# HSM secondary PA 前导（永久设施）：a0 = hartid，a1 = opaque = record PA。
+# Acquire 消费 record → 写共享过渡表（幂等）→ 切过渡 satp → 跳高半区。
 _awaken:
-    la      t0, TRAMPOLINE_PG_DIR
+    la      t0, _pa_fatal
+    csrw    stvec, t0
+1:  ld      t2, {REC_STATE}(a1)             # 等 record ≥ Starting
+    fence   r, rw                           # acquire 语义（RVWMO）
+    andi    t2, t2, 0xff
+    li      t3, 1                           # Starting
+    blt     t2, t3, 1b
+    la      t0, __transition_root_pa        # 与 boot 共用的过渡 root
+    li      t1, 4096
+    add     t1, t0, t1
+    mv      t2, t0
+2:  sd      zero, 0(t2)
+    addi    t2, t2, 8
+    bltu    t2, t1, 2b
+    la      t3, _BOOT_CONSTS
+    ld      t4, 8(t3)                       # DRAM 槽 vpn2 槽号
+    ld      t5, 0(t3)                       # 跳板 PTE
+    slli    t6, t4, 3
+    add     t6, t0, t6
+    sd      t5, 0(t6)
+    addi    t6, t4, 256
+    slli    t6, t6, 3
+    add     t6, t0, t6
+    sd      t5, 0(t6)
     srli    t0, t0, 12
     li      t1, 8 << 60
     or      t0, t0, t1
     csrw    satp, t0
-    sfence.vma
-    la      t1, _BOOT_CONSTS
-    ld      t0, 24(t1)         # _awaken_high 的 VMA 字面量
-    jr      t0
+    sfence.vma                              # 过渡翻译同步
+    # record VA = PA + KERNEL_VA_BASE（过渡别名下换算；此后正式映射下
+    # 只有高半区 VA 可达，_enter_hart_high 统一以 VA 消费 record）。
+    la      t5, _ENTRY_PA_CONSTS
+    ld      t5, 0(t5)
+    add     a1, a1, t5
+    ld      t6, {REC_ENTRY_HIGH}(a1)
+    jr      t6                              # → _enter_hart_high
 
 # ---------------------------------------------------------------------------
-# 高半区段：跳板 satp（boot 早期）或正式内核表（其后）下执行
+# 高半区段：正式运行环境
 # ---------------------------------------------------------------------------
-
-.section .text
-# hart 装配：tp/sp/stvec/sstatus（约定见 hart.rs）
-.macro HART_SETUP
-    la      t0, HART_LOCALS
-    slli    t1, a0, 6
-    add     tp, t0, t1
-    sd      a0, 0(tp)           # HartLocal.hartid
-    la      t3, _PA_CONSTS
-    ld      t0, 8(t3)           # STACK_SIZE
-    mul     t1, a0, t0
-    la      sp, _kernel_end
-    sub     sp, sp, t1
-    sd      sp, 8(tp)           # HartLocal.kernel_sp
-    la      t0, _kernel_trap
-    csrw    stvec, t0
-    # sstatus 只动本宏职责位：SIE 清零（协作式）、FS 置 Initial；
-    # 不整写——SUM 等其余位由 mm::init 管理，secondary 启动时已置位。
-    li      t0, 0b10
-    csrc    sstatus, t0
-    li      t0, 3 << 13
-    csrc    sstatus, t0
-    li      t0, 1 << 13
-    csrs    sstatus, t0
-.endm
-
-.global _start_high
-# boot hart 高半区继续：a0 = hartid，a1 = dtb PA；跳板 satp。
-# 正式内核表由 Rust 侧 mm::init 构建并切换。
-_start_high:
-    # 清高半区 .bss（同空间 la，无跨空间溢出）
-    la      t0, _bss_start
-    la      t2, _bss_end
-1:  sd      zero, 0(t0)
-    addi    t0, t0, 8
-    bltu    t0, t2, 1b
-    HART_SETUP
-    mv      a2, a1              # dtb
-    la      a1, main            # rustc lang_start 包装器
-    mv      ra, a1
-    mv      a1, a2
-    ret                         # → main(argc=hartid, argv=dtb)
-
-.global _awaken_high
-# secondary 高半区继续：a0 = hartid，a1 = secondary_entry。
-# 切到正式内核表（boot hart 的 mm::init 已写好 KERNEL_SATP）。
-_awaken_high:
-    la      t0, KERNEL_SATP
-    ld      t0, 0(t0)
-    csrw    satp, t0
-    sfence.vma
-    HART_SETUP
-    mv      ra, a1
-    ret                         # → secondary_entry(a0=hartid)
 
 .section .text
 .align 4
-.global _kernel_trap
-# 协作式内核：内核态 trap 一律视为致命，现场转储后停机
-_kernel_trap:
-    csrr    a0, scause
-    csrr    a1, stval
-    csrr    a2, sepc
-    call    handle_kernel_trap
+.global _start_high
+# boot 高半区 bootstrap 续段（过渡 satp 别名空间）：清 .bss、装最小环境，
+# 进入 Rust main 前半（单核构造 registry/records）。a0 = hartid, a1 = dtb。
+_start_high:
+    la      t0, _bss_start
+    la      t1, _bss_end
+1:  sd      zero, 0(t0)                     # 清高半区 .bss
+    addi    t0, t0, 8
+    bltu    t0, t1, 1b
+.option push
+.option norelax
+    la      gp, __global_pointer$           # kernel gp 规范序列
+.option pop
+    la      t0, _ENTRY_CONSTS
+    ld      sp, 72(t0)                      # bootstrap 栈顶（PA）
+    ld      t1, 64(t0)                      # KERNEL_VA_BASE
+    add     sp, sp, t1                      # sp 切到高半区别名：bootstrap 阶段
+                                            # 全部地址为规范高半区 VA
+    la      t0, _bootstrap_fatal
+    csrw    stvec, t0                       # 正式环境建立前的兜底 vector
+    csrw    sscratch, zero                  # bootstrap 无锚：trap 即 fatal
+    call    main                            # rustc lang_start 包装器
+1:  wfi                                     # main 不返回；防御性停驻
+    j       1b
+
+.global _bootstrap_fatal
+# bootstrap 阶段 fatal（正式 trap 环境建立前）：最小诊断后停驻。
+_bootstrap_fatal:
+    csrr a0, scause
+    csrr a1, stval
+    csrr a2, sepc
+    call bootstrap_fatal_report
 1:  wfi
     j       1b
 
+.align 4
+.global _enter_hart_high
+# 两条启动路径的唯一汇合点（非返回）：a0 = raw hartid，a1 = &HartBootRecord
+# （VA）。切换正式 satp 并同步翻译，建立 gp/tp/sscratch/sp 与 HartLocal
+# 初值后进入 Rust formal entry。
+_enter_hart_high:
+    ld      t0, {REC_KERNEL_SATP}(a1)
+    csrw    satp, t0
+    sfence.vma                              # 正式地址翻译同步
+.option push
+.option norelax
+    la      gp, __global_pointer$           # kernel gp 规范序列
+.option pop
+    ld      tp, {REC_HART_LOCAL}(a1)
+    ld      sp, {REC_STACK_TOP}(a1)
+    csrw    sscratch, tp                    # 正式环境恒 HartLocal
+    sd      a0, {HL_HARTID}(tp)
+    sd      sp, {HL_KERNEL_SP}(tp)
+    ld      t0, {REC_EMERGENCY_SP}(a1)
+    sd      t0, {HL_EMERGENCY_SP}(tp)
+    ld      t0, {REC_SLOT}(a1)
+    sd      t0, {HL_SLOT}(tp)
+    li      t0, -1                          # fatal guard = 无 fatal
+    sd      t0, {HL_FATAL_GUARD}(tp)
+    sd      zero, {HL_FP_ENABLED}(tp)
+    mv      a0, a1
+    call    hart_formal_entry               # CSR 基线/stvec/Online/分流
+
 # ---------------------------------------------------------------------------
-# 用户态 trap 与返回（契约见 trap.rs；偏移与 HartLocal::off 绑定）
+# 共同 trap 入口（direct mode，正式 stvec 恒指此处）
 # ---------------------------------------------------------------------------
 
-.section .text
 .align 4
-.global _user_trap
-# 从用户态陷入：sscratch = HartLocal。存用户现场 → 切内核栈 → 进 Rust。
-_user_trap:
-    csrrw  t6, sscratch, t6        # t6 = HartLocal；sscratch = 用户 t6
-    sd     t5, 40(t6)              # HL_SCRATCH      # 用户 t5 暂存锚槽
-    ld     t5, 24(t6)              # HL_FRAME        # t5 = TrapFrame*
-    sd     x1, 8(t5)
-    sd     x2, 16(t5)
-    sd     x3, 24(t5)
-    sd     x4, 32(t5)              # 用户 tp
-    sd     x5, 40(t5)
-    sd     x6, 48(t5)
-    sd     x7, 56(t5)
-    sd     x8, 64(t5)
-    sd     x9, 72(t5)
-    sd     x10, 80(t5)
-    sd     x11, 88(t5)
-    sd     x12, 96(t5)
-    sd     x13, 104(t5)
-    sd     x14, 112(t5)
-    sd     x15, 120(t5)
-    sd     x16, 128(t5)
-    sd     x17, 136(t5)
-    sd     x18, 144(t5)
-    sd     x19, 152(t5)
-    sd     x20, 160(t5)
-    sd     x21, 168(t5)
-    sd     x22, 176(t5)
-    sd     x23, 184(t5)
-    sd     x24, 192(t5)
-    sd     x25, 200(t5)
-    sd     x26, 208(t5)
-    sd     x27, 216(t5)
-    sd     x28, 224(t5)
-    sd     x29, 232(t5)
-    ld     t0, 40(t6)              # HL_SCRATCH     # t0 = 用户 x30（进入时暂存）
-    sd     t0, 240(t5)
-    csrr   t0, sscratch            # t0 = 用户 x31（进入时交换暂存）
-    sd     t0, 248(t5)
-    # 浮点条件保存：Dirty 才更新线程帧；有效性随 TrapFrame 迁移，
-    # 不从目标 hart 的 FS 残留状态推断。
-    csrr   t0, sstatus
-    srli   t0, t0, 13
-    andi   t0, t0, 3
-    li     t1, 3
-    bne    t0, t1, 1f
-    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    fsd    f\i, 256+8*\i(t5)
+.global _trap_entry
+_trap_entry:
+    csrrw   t6, sscratch, t6                # t6 = HL；原 t6 → sscratch
+    sd      t5, {HL_SCRATCH}(t6)            # 原 t5 → 槽 1
+    csrr    t5, sscratch
+    sd      t5, {HL_SCRATCH2}(t6)           # 原 t6 → 槽 2
+    csrw    sscratch, t6                    # 锚恢复：正式环境恒 HartLocal，
+                                            # 同步异常窗口自此处闭合
+    # 来源唯一真值：硬件 SPP。SPP=1 一律 fatal——返回用户尾部的同步异常
+    # SPP 仍为 1，绝无把内核现场解释成 UserContext 的窗口。
+    csrr    t0, sstatus
+    srli    t0, t0, 8
+    andi    t0, t0, 1
+    bnez    t0, _fatal_entry
+
+    # ---- U 态来源：保存 UserContext ----
+    ld      t5, {HL_FRAME_PTR}(t6)
+    .irp i, 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29
+    sd      x\i, ({UC_X0} + 8*\i)(t5)
     .endr
-    csrr   t0, fcsr
-    sd     t0, 512(t5)             # TF_FCSR
-    li     t0, 1
-    sd     t0, 520(t5)             # TF_FP_VALID
-    li     t0, 3 << 13
-    csrc   sstatus, t0
-    li     t0, 2 << 13
-    csrs   sstatus, t0
-1:  csrr   t0, sepc
-    sd     t0, 528(t5)             # TF_SEPC
-    # 内核现场：tp 换锚、sp 切调度栈、stvec 指内核致命路径
-    mv     tp, t6
-    ld     sp, 16(t6)              # HL_SCHED_SP
-    la     t0, _kernel_trap
-    csrw   stvec, t0
-    csrr   a0, scause
-    csrr   a1, stval
-    mv     a2, t5
-    call   handle_user_trap        # 返回 a0 = Outcome（0 = Resume）
-    bnez   a0, 2f
-    j      _resume_user            # Resume：tp 在 Rust 调用中保持不变
-2:  # Switch：恢复调度循环现场（sched_sp 起 ra + s0..s11）
-    ld     ra, 0(sp)
-    ld     s0, 8(sp)
-    ld     s1, 16(sp)
-    ld     s2, 24(sp)
-    ld     s3, 32(sp)
-    ld     s4, 40(sp)
-    ld     s5, 48(sp)
-    ld     s6, 56(sp)
-    ld     s7, 64(sp)
-    ld     s8, 72(sp)
-    ld     s9, 80(sp)
-    ld     s10, 88(sp)
-    ld     s11, 96(sp)
-    addi   sp, sp, 104
-    ret
+    ld      t0, {HL_SCRATCH}(t6)            # 用户 x30
+    sd      t0, {UC_X30}(t5)
+    ld      t0, {HL_SCRATCH2}(t6)           # 用户 x31
+    sd      t0, {UC_X31}(t5)
+    # FP 条件保存：Dirty ⇔ 当前线程为 D64 且用过 FP。Base 出口恒 FS=Off，
+    # FS=Off 下用户 FP 指令 illegal 而 FS 不变 ⇒ Dirty 不可能出现在 Base；
+    # 无 F/D hart 上 FS 恒 Off（WARL），此分支不可达 ⇒ helper 调用安全。
+    csrr    t0, sstatus
+    srli    t0, t0, 13
+    andi    t0, t0, 3
+    li      t1, 3
+    bne     t0, t1, 1f
+    addi    a0, t5, {UC_FP}
+    call    _save_fp                        # ctx_fp helper：FPR/fcsr 全量入帧
+1:
+    li      t0, (3 << 13)
+    csrc    sstatus, t0                     # 内核稳态 FS=Off
+    csrr    t0, sepc
+    sd      t0, {UC_SEPC}(t5)
+    # 切内核现场：tp=HL、handler 栈=调度循环栈；stvec 恒共同入口，无需切换；
+    # SUM/MXR 稳态恒 0（用户访问走 RAII guard）。
+    mv      tp, t6
+    ld      sp, {HL_SCHED_SP}(tp)
+    csrr    a0, scause
+    csrr    a1, stval
+    mv      a2, t5
+    call    handle_user_trap                # 返回 a0 = Outcome（0 = Resume）
+    beqz    a0, _resume_user
+    # Switch：恢复调度循环现场（112B SchedulerFrame 对称恢复）
+    ld      ra, {SF_RA}(sp)
+    ld      s0, ({SF_S0} + 8*0)(sp)
+    ld      s1, ({SF_S0} + 8*1)(sp)
+    ld      s2, ({SF_S0} + 8*2)(sp)
+    ld      s3, ({SF_S0} + 8*3)(sp)
+    ld      s4, ({SF_S0} + 8*4)(sp)
+    ld      s5, ({SF_S0} + 8*5)(sp)
+    ld      s6, ({SF_S0} + 8*6)(sp)
+    ld      s7, ({SF_S0} + 8*7)(sp)
+    ld      s8, ({SF_S0} + 8*8)(sp)
+    ld      s9, ({SF_S0} + 8*9)(sp)
+    ld      s10, ({SF_S0} + 8*10)(sp)
+    ld      s11, ({SF_S0} + 8*11)(sp)
+    addi    sp, sp, {SF_SIZE}
+    ret                                     # a0 = Outcome 直达 Rust 调用者
+
+.align 4
+.global _fatal_entry
+# S 态来源（含返回用户尾部的同步异常）：per-hart emergency 栈上建立首帧。
+_fatal_entry:
+    addi    t1, tp, {HL_FATAL_GUARD}
+    li      t2, 1
+    amoswap.d.aqrl t0, t2, (t1)             # test-and-set 递归 guard
+    li      t3, -1
+    beq     t0, t3, 1f                      # 「无 fatal」（old==MAX）→ 首帧保存
+2:  wfi                                     # 二次 fatal：首帧已是证据，
+    j       2b                              # 无栈停驻等待复位
+1:
+    sd      a0, {HL_SCRATCH}(tp)            # 抢救原始 a0/a1/sp
+    sd      a1, {HL_SCRATCH2}(tp)
+    sd      sp, {HL_FATAL_SP}(tp)
+    ld      sp, {HL_EMERGENCY_SP}(tp)
+    addi    sp, sp, -{FF_SIZE}
+    mv      a0, sp                          # &FatalFrame（x10 记录机制值）
+    .irp i, 1,3,4,5,6,7,8,9,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29
+    sd      x\i, ({FF_X0} + 8*\i)(a0)
+    .endr
+    ld      t0, {HL_SCRATCH}(tp)
+    sd      t0, {FF_X10}(a0)                # 原 a0
+    ld      t0, {HL_SCRATCH2}(tp)
+    sd      t0, {FF_X11}(a0)                # 原 a1
+    ld      t0, {HL_FATAL_SP}(tp)
+    sd      t0, {FF_X2}(a0)                 # 原 sp
+    ld      t0, {HL_SCRATCH}(tp)
+    sd      t0, {FF_X30}(a0)                # 入口序列后的 t5（机制值）
+    csrr    t0, sscratch
+    sd      t0, {FF_X31}(a0)                # 原 t6（经 sscratch 中转）
+    csrr    t0, scause
+    sd      t0, {FF_SCAUSE}(a0)
+    csrr    t0, stval
+    sd      t0, {FF_STVAL}(a0)
+    csrr    t0, sepc
+    sd      t0, {FF_SEPC}(a0)
+    csrr    t0, satp
+    sd      t0, {FF_SATP}(a0)
+    csrr    t0, sstatus
+    sd      t0, {FF_SSTATUS}(a0)
+    call    handle_fatal                    # 完整证据已建立，进入软件诊断
 
 .align 4
 .global _ret_to_user
-# 调度循环调用（tp = HartLocal，执行点已装）：保存循环现场并记恢复点，
-# 尾接 _resume_user 装帧 sret；Switch 发生时经恢复点正常返回。
+# 调度循环调用（tp = HL，执行点已装）：保存循环现场并记恢复点，
+# 切换地址空间（伴随 fence.i），尾接 pre-sret 装帧。
 _ret_to_user:
-    addi   sp, sp, -104
-    sd     ra, 0(sp)
-    sd     s0, 8(sp)
-    sd     s1, 16(sp)
-    sd     s2, 24(sp)
-    sd     s3, 32(sp)
-    sd     s4, 40(sp)
-    sd     s5, 48(sp)
-    sd     s6, 56(sp)
-    sd     s7, 64(sp)
-    sd     s8, 72(sp)
-    sd     s9, 80(sp)
-    sd     s10, 88(sp)
-    sd     s11, 96(sp)
-    sd     sp, 16(tp)              # HL_SCHED_SP
-    # 换用户地址空间：调度循环在此处切换线程，用户 satp 从锚装入。
-    # （Resume 路径不经此段——同进程返回，satp 未变。）
-    ld     t0, 32(tp)              # HL_USER_SATP
-    csrw   satp, t0
+    addi    sp, sp, -{SF_SIZE}
+    sd      ra, {SF_RA}(sp)
+    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11
+    sd      s\i, ({SF_S0} + 8*\i)(sp)
+    .endr
+    sd      sp, {HL_SCHED_SP}(tp)
+    # 换用户地址空间：调度循环在此切换线程。Resume 路径不经此处
+    # （同进程返回，satp 未变）；每次空间切换保守执行本地 fence.i，
+    # 覆盖该空间任何新发布代码代次的首次执行。
+    ld      t0, {HL_USER_SATP}(tp)
+    csrw    satp, t0
     sfence.vma
-    # 尾接装帧
+    fence.i
+    # fall through → pre-sret 装帧
 
 _resume_user:
-# 装帧回用户态（tp = HartLocal；用户态锚 sscratch = tp、stvec = _user_trap）
-    la     t0, _user_trap
-    csrw   stvec, t0
-    ld     t5, 24(tp)              # HL_FRAME
-    csrw   sscratch, tp
-    # 浮点条件恢复：以线程帧的有效位为准，迁移到任意 hart 均一致。
-    ld     t0, 520(t5)             # TF_FP_VALID
-    beqz   t0, 3f
-    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    fld    f\i, 256+8*\i(t5)
+# pre-sret CSR 边界 + 用户现场装载（tp = HL；sscratch/stvec 恒定不动）
+    ld      t0, {HL_FP_ENABLED}(tp)
+    beqz    t0, 1f
+    li      t0, {CSR_FS_CLEAN}
+    csrs    sstatus, t0                     # 先开 FS=Clean：FS=Off 下 fld 非法
+    ld      a0, {HL_FRAME_PTR}(tp)
+    addi    a0, a0, {UC_FP}
+    call    _restore_fp                     # D64：完整恢复 FPR/fcsr
+    j       2f
+1:
+    li      t0, {CSR_FS_MASK}
+    csrc    sstatus, t0                     # Base：FS=Off，从不触碰 FP helper
+2:
+    li      t0, {CSR_PRE_SRET_CLEAR}
+    csrc    sstatus, t0                     # SIE/SPIE/SPP/SUM/MXR 清零、VS=Off；
+                                            # U 态忽略 SIE，中断来源由 sie 控制
+    # LR/SC reservation 清除：对 per-hart 保留槽 dummy SC（失败即目的达成）
+    addi    t0, tp, {HL_RESERVATION}
+    lr.d    t1, (t0)
+    sc.d    t1, t1, (t0)
+    # 装载用户现场
+    ld      t5, {HL_FRAME_PTR}(tp)
+    ld      t0, {UC_SEPC}(t5)
+    csrw    sepc, t0
+    ld      x1, ({UC_X0} + 8*1)(t5)
+    ld      sp, ({UC_X0} + 8*2)(t5)
+    ld      gp, ({UC_X0} + 8*3)(t5)
+    ld      tp, ({UC_X0} + 8*4)(t5)
+    .irp i, 5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29
+    ld      x\i, ({UC_X0} + 8*\i)(t5)
     .endr
-    ld     t0, 512(t5)             # TF_FCSR
-    csrw   fcsr, t0
-    li     t0, 3 << 13
-    csrc   sstatus, t0
-    li     t0, 2 << 13             # Clean：用户写 FP 后硬件转 Dirty
-    csrs   sstatus, t0
-    j      4f
-3:  li     t0, 3 << 13
-    csrc   sstatus, t0
-    li     t0, 1 << 13
-    csrs   sstatus, t0
-4:  ld     t0, 528(t5)             # TF_SEPC
-    csrw   sepc, t0
-    # 恢复通用：t6 先备好不再用，t5 基址最后恢复
-    ld     x1, 8(t5)
-    ld     sp, 16(t5)
-    ld     gp, 24(t5)
-    ld     tp, 32(t5)
-    ld     x5, 40(t5)
-    ld     x6, 48(t5)
-    ld     x7, 56(t5)
-    ld     x8, 64(t5)
-    ld     x9, 72(t5)
-    ld     x10, 80(t5)
-    ld     x11, 88(t5)
-    ld     x12, 96(t5)
-    ld     x13, 104(t5)
-    ld     x14, 112(t5)
-    ld     x15, 120(t5)
-    ld     x16, 128(t5)
-    ld     x17, 136(t5)
-    ld     x18, 144(t5)
-    ld     x19, 152(t5)
-    ld     x20, 160(t5)
-    ld     x21, 168(t5)
-    ld     x22, 176(t5)
-    ld     x23, 184(t5)
-    ld     x24, 192(t5)
-    ld     x25, 200(t5)
-    ld     x26, 208(t5)
-    ld     x27, 216(t5)
-    ld     x28, 224(t5)
-    ld     x29, 232(t5)
-    ld     t6, 248(t5)             # x31（t6 此后不再作锚）
-    ld     t5, 240(t5)             # x30 最后恢复（t5 基址终结）
+    ld      t6, {UC_X31}(t5)                # x31 先于 x30（t5 最后终结）
+    ld      t5, {UC_X30}(t5)
     sret
-
-# ---------------------------------------------------------------------------
-# PA 段数据：跳板 root 表与跨空间字面量
-# ---------------------------------------------------------------------------
-
-# 高半区链接期常量表：高地址代码（Rust/汇编）经 PCREL 读内存取值，
-# 杜绝对低段符号与 ABS 常量的跨空间寻址（.quad 绝对重定位无范围限制）
-.section .data
-.global _PA_CONSTS
-_PA_CONSTS:
-    .quad SBI_START         # [0] SBI 段物理起点
-    .quad STACK_SIZE        # [1] 每 hart 栈大小
-    .quad HART_NUM_LIMIT    # [2] hart 数上限
-    .quad _awaken           # [3] secondary PA 入口
-
-# 低段跨空间字面量：入口代码经此间接取高半区地址（R_RISCV_64 无范围限制）
-.section .data.init
-.global _BOOT_CONSTS
-_BOOT_CONSTS:
-    .quad _trampoline_pte       # (DRAM 槽 PA >> 2) | 0xEF
-    .quad _trampoline_slot      # DRAM 槽 vpn2 槽号
-    .quad _start_high
-    .quad _awaken_high
-
-.section .bss.init
-.align 12
-.global TRAMPOLINE_PG_DIR
-TRAMPOLINE_PG_DIR:
-    .zero 4096

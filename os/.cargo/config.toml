@@ -1,2 +1,7 @@
 [build]
-target = "riscv64gc-unknown-none-elf"
+target = "riscv64imac-unknown-erhino.json"
+
+# JSON target spec 解析许可；build-std 只用于内核构建（Justfile ZFLAGS），
+# 不能全局开启——否则 host 测试会与 sysroot 的 core/alloc 重复。
+[unstable]
+json-target-spec = true

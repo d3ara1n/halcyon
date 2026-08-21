@@ -1,43 +1,17 @@
-//! trap 路径：用户现场进出内核的唯一通路（见 notes/internals.md「trap 帧与上下文」）。
+//! trap 路径：用户现场进出内核的唯一通路。
 //!
-//! 汇编契约（`assembly.asm` `_user_trap` / `_ret_to_user`）：
-//! - 用户态 stvec → `_user_trap`，sscratch 恒指本 hart 的 HartLocal（trap 锚）；
-//! - 内核态 stvec → `_kernel_trap`（协作式定性下内核态中断不可能发生，一律致命）；
-//! - trap 全程不切 satp（用户表含内核高半区），handler 栈从锚的 sched_sp 向下生长；
-//! - 出口经返回值编码：Resume 装帧 sret 直接回用户态；其余恢复调度循环现场返回，
-//!   由调度循环处置当前线程（Requeue / Drop / Park）。
+//! 汇编契约（`assembly.asm` `_trap_entry` / `_resume_user`）：
+//! - stvec 恒指共同 direct-mode 入口，sscratch 恒指 HartLocal；
+//! - 硬件 SPP 是来源唯一真值：SPP=0 保存 UserContext 进入本模块；
+//!   SPP=1 保存 FatalFrame 进入 emergency fatal（见 rt::handle_fatal）；
+//! - trap 全程不切 satp（用户表含内核高半区），handler 栈为调度循环栈；
+//! - 出口经返回值编码：Resume 装帧 sret 直接回用户态；其余恢复
+//!   SchedulerFrame 返回调度循环，由其处置当前线程。
 //!
-//! TrapFrame 布局与汇编偏移由 `OFFSETS` 断言表双向绑定。
+//! scause 按 `(is_interrupt, code)` 分发（TRAP-004 收口）：只有中断 1/5
+//! 进入 SSIP/STIP，只有异常 8 是 U ecall；其余用户同步异常一律终止进程。
 
-use crate::{hart, sbi, sched, syscall};
-
-/// 用户现场（`x[32] + f[32] + fcsr + fp_valid + sepc`）。
-///
-/// 访问纪律：帧只在所属线程的执行 hart 上被访问——汇编存取发生在
-/// 线程休眠于本 hart 期间，Rust 侧（syscall 写响应）同样处于该区间。
-#[repr(C)]
-pub struct TrapFrame {
-    pub x: [u64; 32],
-    pub f: [u64; 32],
-    pub fcsr: u64,
-    pub fp_valid: u64,
-    pub sepc: u64,
-}
-
-/// 帧内偏移（字节），汇编侧以字面量 + 同名注释访问（hart::off 同理，
-/// 见该表说明）。
-pub mod frame_off {
-    pub const FCSR: usize = 512;
-    pub const FP_VALID: usize = 520;
-    pub const SEPC: usize = 528;
-}
-
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 536);
-const _: () = assert!(core::mem::offset_of!(TrapFrame, fcsr) == frame_off::FCSR);
-const _: () = assert!(core::mem::offset_of!(TrapFrame, fp_valid) == frame_off::FP_VALID);
-const _: () = assert!(core::mem::offset_of!(TrapFrame, sepc) == frame_off::SEPC);
-// HartLocal 槽位偏移与汇编字面量的关键绑定（全表见 hart::off）。
-const _: () = assert!(hart::off::FRAME_PTR == 24 && hart::off::SCHED_SP == 16);
+use crate::{context::UserContext, hart, sched, sbi, syscall};
 
 /// trap 处理出口，汇编经 a0 返回给调度循环（0 保留给 Resume）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +31,8 @@ pub enum Outcome {
 /// 的非 Resume 分支；Resume 分支不返回（汇编直接 sret）。
 ///
 /// # Safety
-/// 调用前须已 `set_context` 装好执行点（帧 / satp / 线程），且 tp 不变量成立。
+/// 调用前须已 `set_context` 装好执行点（帧 / satp / 线程 / FP 档位），
+/// 且 tp 不变量成立。
 #[inline]
 pub unsafe fn ret_to_user() -> Outcome {
     unsafe extern "C" {
@@ -74,31 +49,27 @@ pub unsafe fn ret_to_user() -> Outcome {
     }
 }
 
-/// scause 编号：用户态软件中断（IPI 门铃）。
+// scause (is_interrupt, code)：中断来源（supervisor.adoc「Supervisor Cause」）。
 const SSIP: usize = 1;
-/// scause：时钟中断。
 const STIP: usize = 5;
-/// scause：用户态 ecall。
+/// U ecall 是 exception 8。
 const U_ECALL: usize = 8;
-/// scause：用户态异常（非法指令 / 断点 / 各类页故障）——一律程序缺陷。
-fn is_user_exception(scause: usize) -> bool {
-    matches!(scause, 2 | 3 | 4 | 12 | 13 | 15 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24)
-}
 
 /// 汇编调用入口：处理一次用户 trap，返回出口编码。
 ///
 /// # Safety
-/// 仅由 `_user_trap` 汇编按锚契约调用；frame 指向当前线程帧。
+/// 仅由 `_trap_entry` 汇编按锚契约调用；frame 指向当前线程的 UserContext。
 #[unsafe(no_mangle)]
-unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut TrapFrame) -> usize {
-    // SAFETY: 锚指向当前线程帧，本 hart 独占（模块契约）。
+unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut UserContext) -> usize {
+    // SAFETY: 锚指向当前线程现场，本 hart 独占（模块契约）。
     let frame = unsafe { &mut *frame };
     let thread = hart::current().current_thread();
-    // scause 最高位为中断标志，掩出编号统一分发。
+
+    let is_interrupt = scause >> 63 == 1;
     let code = scause & !(1 << 63);
 
-    match code {
-        U_ECALL => {
+    match (is_interrupt, code) {
+        (false, U_ECALL) => {
             let Some(t) = thread else { unreachable!("ecall 无当前线程") };
             match syscall::dispatch(frame, t) {
                 syscall::Outcome::Completed => Outcome::Resume as usize,
@@ -109,12 +80,12 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut T
                 }
             }
         }
-        STIP => {
+        (true, STIP) => {
             // 量子耗尽或 sleep 期限到达：卸载定时器 → 唤醒到期 → 轮转。
             sched::on_timer();
             Outcome::Requeue as usize
         }
-        SSIP => {
+        (true, SSIP) => {
             // 门铃：清中断源；有新待办才值得切走，否则原地继续。
             sbi::clear_ssip();
             if sched::domain_has_ready() {
@@ -123,14 +94,15 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut T
                 Outcome::Resume as usize
             }
         }
-        other if is_user_exception(other) => {
-            // 用户态异常一律杀进程（notes/task.md「生命周期」）。
+        (false, _) => {
+            // 用户态同步异常一律终止进程（notes/task.md「生命周期」）；
+            // 不以裸编号匹配中断语义（TRAP-004）。
             let pid = thread.map(|t| t.process.pid).unwrap_or(0);
             warn!(
                 Task,
-                "pid {} 异常终止: scause={} stval={:#x} sepc={:#x}",
+                "pid {} 异常终止: scause={:#x} stval={:#x} sepc={:#x}",
                 pid,
-                code,
+                scause,
                 stval,
                 frame.sepc
             );
@@ -139,9 +111,9 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut T
             }
             Outcome::Killed as usize
         }
-        other => {
-            // 未知 trap 属内核 bug，致命。
-            panic!("unexpected user trap: scause={:#x} stval={:#x}", other, stval);
+        (true, other) => {
+            // 未接入的中断来源进入用户 trap 路径属内核 bug，致命。
+            panic!("unexpected interrupt in user trap: code={other:#x} stval={stval:#x}");
         }
     }
 }

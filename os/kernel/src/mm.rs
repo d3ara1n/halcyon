@@ -129,14 +129,29 @@ pub fn init(board: &BoardInfo) {
     );
 }
 
-/// 为当前 hart 开启 SUM 位（S 态直访用户页，syscall 读用户内存的前提）。
-/// SUM 是 per-hart 位，各 hart 在调度循环入口自行调用。
-pub fn enable_sum() {
-    // SAFETY: 仅置 sstatus.SM 位。
-    unsafe {
-        asm!(
-            "csrs  sstatus, {sum}",
-            sum = in(reg) 1 << 18,
-        );
+/// 正式内核 satp 值（registry 构造 record 用）。
+pub fn kernel_satp() -> usize {
+    KERNEL_SATP.load(Ordering::Acquire)
+}
+
+/// 用户内存访问的 RAII guard：构造时临时开启 SUM，Drop 恢复关闭。
+/// 内核稳态 SUM=0 是不变量；只有完成地址验证并持有所需对象锁后，
+/// user-copy 才允许经本 guard 临时开启。
+pub struct SumGuard;
+
+impl SumGuard {
+    /// # Safety
+    /// 调用方须已完成用户区间验证并持有所需锁，guard 存活期不重入调度。
+    pub unsafe fn open() -> Self {
+        // SAFETY: 仅置 sstatus.SUM 位。
+        unsafe { asm!("csrs sstatus, {bit}", bit = in(reg) 1 << 18, options(nomem)) };
+        SumGuard
+    }
+}
+
+impl Drop for SumGuard {
+    fn drop(&mut self) {
+        // SAFETY: 仅清 sstatus.SUM 位。
+        unsafe { asm!("csrc sstatus, {bit}", bit = in(reg) 1 << 18, options(nomem)) };
     }
 }

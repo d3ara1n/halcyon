@@ -18,3 +18,4 @@ Cargo.lock
 *.pdb
 
 .gdb_history
+os/cargo/

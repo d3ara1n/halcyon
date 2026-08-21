@@ -1,14 +1,16 @@
-//! 运行时启动：boot 契约、初始化顺序、panic 处理。
+//! 运行时启动：boot 契约、formal entry、启动收尾、panic 与 fatal 处理。
 //!
-//! boot 契约（考古报告 §1）：`_start` 收到 a0 = hartid、a1 = dtb，把
-//! (hartid, dtb) 伪装成 (argc, argv) 经 rustc 生成的 `main` 包装器传入
-//! `#[lang = "start"]`；secondary hart 不走此路径，由 HSM 直接进入
-//! [`secondary_entry`]。
+//! boot 契约：`_start` 收到 a0 = raw boot hartid、a1 = dtb PA，经
+//! rustc 生成的 `main` 包装器以 (argc, argv) 形态传入 [`rust_start`]；
+//! secondary hart 不走此路径，由 HSM 经 `_awaken` PA 前导进入
+//! [`hart_formal_entry`] 与 boot hart 汇合。
 //!
 //! 初始化顺序：SBI 探测 → 板级解析（零堆）→ 高半区切换 → 帧池 →
-//! 堆（首次分配时从帧池取块）→ 内核主体 → 嚇醒 secondary → 停放。
+//! 堆 → registry/records 构造 → enter_hart（正式执行环境）→
+//! bring_up_runtime（唤醒 secondary、全员 Online、bootstrap 回收、
+//! 任务装载、Ready 发布）→ 调度循环。
 //!
-//! panic 与 trap 路径不依赖堆与 console 锁。
+//! panic 与 fatal 路径不依赖堆与 console 锁。
 
 use core::{
     alloc::Layout,
@@ -20,96 +22,204 @@ use core::{
 
 use erhino_shared::proc::Termination;
 
-use crate::{console::console_write_raw, external, hart, sbi};
+use crate::{context::FatalFrame, csr, external, hart, registry, sbi};
 
+static BOOT_HARTID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DTB: AtomicUsize = AtomicUsize::new(0);
 
 /// 设备树物理地址（由 boot 契约传入）。
-pub fn dtb() -> usize {
+pub fn boot_dtb() -> usize {
     DTB.load(Ordering::Relaxed)
 }
 
-/// 绕过堆与锁的输出端，专供 panic / trap 路径。
+/// 固件传入的 raw boot hartid（外部边界值；内部定位一律用 slot）。
+pub fn boot_hartid() -> usize {
+    BOOT_HARTID.load(Ordering::Relaxed)
+}
+
+/// 绕过堆与锁的输出端，专供 panic / fatal 路径。
 struct RawWriter;
 
 impl fmt::Write for RawWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        console_write_raw(s);
+        // 诊断面必须可见：fatal/panic 不依赖 DBCN 可用性，直写 legacy。
+        for b in s.bytes() {
+            sbi::legacy_console_putchar(b);
+        }
         Ok(())
     }
 }
 
+
+
 #[lang = "start"]
 fn rust_start<T: Termination + 'static>(
     main: fn() -> T,
-    _hartid_as_argc: isize,
+    hartid_as_argc: isize,
     argv: *const *const u8,
     _sigpipe: u8,
 ) -> isize {
     assert_eq!(
         external::hart_num_limit(),
-        hart::HART_NUM_LIMIT,
-        "链接脚本 HART_NUM_LIMIT 与 hart::HART_NUM_LIMIT 不一致"
+        crate::registry::HART_NUM_LIMIT,
+        "链接脚本 HART_NUM_LIMIT 与内核不一致"
     );
     sbi::init();
+    BOOT_HARTID.store(hartid_as_argc as usize, Ordering::Relaxed);
     DTB.store(argv as usize, Ordering::Relaxed);
     main();
     hart::park()
 }
 
-/// secondary hart 入口（HSM opaque 传入），dtb 参数无效。
+/// formal entry 的 Rust 尾段（汇编装配 gp/tp/sscratch/sp 之后调用，
+/// 非返回）：CSR 基线与 WARL 核验 → 安装共同 trap vector → 发布 Online →
+/// 按 record 角色分流：boot 进入启动收尾；secondary 等待 Ready 后进调度。
 #[unsafe(no_mangle)]
-pub extern "C" fn secondary_entry(_hartid: usize, _dtb: usize) -> ! {
-    info!(Hart, "#{:>2} online", hart::hartid());
+extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
+    // 已知竞态的临时缓解（见 KNOWN_ISSUES.md「formal-entry 竞态」）：
+    // 此处恰好一次单块 DBCN 写入时系统稳定；移除或改为多次小块写
+    // （如 log_topic 的分块格式化）则 formal-entry 后无输出悬挂。
+    // 看似时序巧合，实为未定位的同步缺口，根因待专项调查。
+    println!("formal entry");
+    if let Err(reject) = csr::formal_entry_baseline() {
+        match reject {
+            csr::CsrReject::Uxl(readback) => {
+                fatal_msg(&format_args!("CSR 核验失败：UXL 读回 {readback:#x} ≠ 64"));
+            }
+            other => fatal_msg(&format_args!("CSR 基线核验失败: {other:?}")),
+        }
+    }
+    // SAFETY: stvec 安装为共同 direct-mode 入口（地址对齐由链接保证）。
+    unsafe {
+        core::arch::asm!("la t0, _trap_entry", "csrw stvec, t0", options(nomem));
+    }
+    record.publish_online();
+
+    if record.role_boot == 1 {
+        info!(Hart, "#{:>2} online (boot)", hart::current().hartid());
+        bring_up_runtime();
+    }
+    info!(Hart, "#{:>2} online", hart::current().hartid());
+    if !registry::wait_for_runtime() {
+        // 启动整体失败：晚到 hart 只能看到 Failed gate，停驻等待复位。
+        hart::park()
+    }
     crate::sched::run()
 }
 
-/// 内核态 trap 的兜底：协作式内核中 trap 即致命。
-#[unsafe(no_mangle)]
-pub extern "C" fn handle_kernel_trap(cause: usize, val: usize, pc: usize) -> ! {
-    // 现场采集（无锁 RawWriter）：satp/sstatus + 若为访存 fault，
-    // 按当前 satp 走三级页表定位断点。
-    let (satp, sstatus): (usize, usize);
-    // SAFETY: 只读 CSR。
-    unsafe {
-        core::arch::asm!("csrr {}, satp", out(reg) satp, options(nomem));
-        core::arch::asm!("csrr {}, sstatus", out(reg) sstatus, options(nomem));
+/// 启动收尾（boot hart，正式栈上运行）：发布并启动全部 secondary →
+/// 等待全员 Online → 回收 bootstrap 页 → 装载初始任务 → 发布 Ready →
+/// 进入调度循环。任何矛盾使本次启动整体失败（不做部分降级）。
+fn bring_up_runtime() -> ! {
+    let timebase = crate::sched::ticks_per_sec();
+    let deadline = sbi::read_time() + 10 * timebase;
+
+    // 先完整发布预期集合，再发出任何 HSM start（SBI-003 收口：
+    // 异步启动前 expected 集合必须闭合）。
+    let mut pending: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    registry::with_registry(|reg| {
+        for (slot, record) in reg.records() {
+            if record.role_boot == 1 {
+                continue;
+            }
+            record.publish_starting();
+            pending.push(slot.0);
+        }
+        for &slot in &pending {
+            let record = reg.record(crate::registry::HartSlot(slot));
+            let record_pa = crate::mm::virt_to_phys(record as *const _ as usize);
+            sbi::require(
+                sbi::hart_start(record.hartid, external::awaken_pa(), record_pa),
+                "HSM.hart_start",
+            );
+        }
+    });
+
+    // 等待全员 Online（Acquire 观察）；超时或状态矛盾即整体失败。
+    loop {
+        let all_online = registry::with_registry(|reg| {
+            reg.records().all(|(_, r)| r.state() == crate::registry::BootState::Online)
+        });
+        if all_online {
+            break;
+        }
+        if sbi::read_time() > deadline {
+            registry::publish_failed();
+            fatal_msg(&format_args!("secondary 上线超时，启动整体失败"));
+        }
+        core::hint::spin_loop();
     }
+
+    // bootstrap 页回收：secondary 只依赖永久 entry 设施（过渡表/PA 前导），
+    // 全员 Online 后 cold-bootstrap 区间不再被引用。回收动作在正式栈上
+    // 执行，不可能从 bootstrap 栈返回。
+    let (start, end) = external::bootstrap_range();
+    frame::free_range(start, end);
+    log!(Memory, "bootstrap 回收 [{:#x}, {:#x})", start, end);
+
+    // 冻结 active 集合、装载初始任务，最后发布 Ready。
+    if let Some((addr, len)) = crate::rt::initfs_region() {
+        initfs::load(addr, len);
+    } else {
+        log!(InitFS, "设备树无 initfs，无服务可装载");
+    }
+    registry::publish_ready();
+    crate::sched::run()
+}
+
+use crate::{frame, initfs};
+
+/// initfs 物理区间（board 解析结果经 rt 中转，避免跨模块传 board）。
+static INITFS: AtomicUsize = AtomicUsize::new(0);
+static INITFS_LEN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_initfs_region(addr: usize, len: usize) {
+    INITFS.store(addr, Ordering::Relaxed);
+    INITFS_LEN.store(len, Ordering::Relaxed);
+}
+
+pub fn initfs_region() -> Option<(usize, usize)> {
+    let addr = INITFS.load(Ordering::Relaxed);
+    (addr != 0).then(|| (addr, INITFS_LEN.load(Ordering::Relaxed)))
+}
+
+/// fatal 诊断（无锁 RawWriter）：打印 FatalFrame 完整证据后永久停放。
+#[unsafe(no_mangle)]
+extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
     let _ = write!(
         RawWriter,
-        "\x1b[0;31mkernel trap\x1b[0m: unexpected trap in S-mode\n  cause={:#x} val={:#x} pc={:#x} hart={} satp={:#x} sstatus={:#x}\n",
-        cause,
-        val,
-        pc,
-        hart::hartid(),
-        satp,
-        sstatus,
+        "\x1b[0;31mfatal trap\x1b[0m: unexpected trap in S-mode\n  cause={:#x} val={:#x} pc={:#x}\n  satp={:#x} sstatus={:#x}\n",
+        frame.scause, frame.stval, frame.sepc, frame.satp, frame.sstatus,
     );
-    if matches!(cause, 12 | 13 | 15) && satp >> 60 == 8 {
-        dump_page_walk(satp & 0xFFF_FFFF_FFFF, val);
+    let _ = write!(RawWriter, "  gpr:");
+    for i in (1..32).step_by(4) {
+        let _ = write!(
+            RawWriter,
+            " x{}={:#x} x{}={:#x} x{}={:#x} x{}={:#x}",
+            i, frame.x[i],
+            i + 1, frame.x[i + 1],
+            i + 2, frame.x[i + 2],
+            i + 3.min(31), frame.x[3.min(i + 3)],
+        );
     }
+    let _ = writeln!(RawWriter);
     hart::park()
 }
 
-/// 按 root PPN 走 Sv39 三级表，打印 stval 的叶 PTE（诊断页故障用）。
-fn dump_page_walk(root_ppn: usize, va: usize) {
-    let vpn = [va >> 30 & 0x1FF, va >> 21 & 0x1FF, va >> 12 & 0x1FF];
-    let mut table = root_ppn << 12;
-    let _ = write!(RawWriter, "  walk va={:#x}:", va);
-    for (level, &idx) in vpn.iter().enumerate() {
-        // SAFETY: 表帧位于直映射覆盖的 DRAM 内（帧池分配约束）。
-        let pte = unsafe { *((crate::mm::phys_to_virt(table) + idx * 8) as *const u64) };
-        let _ = write!(RawWriter, " L{}[{}]={:#x}", 2 - level, idx, pte);
-        if pte & 1 == 0 {
-            break;
-        }
-        if pte & 0xE != 0 || level == 2 {
-            let _ = write!(RawWriter, " <- leaf");
-            break;
-        }
-        table = ((pte >> 10 & 0xFFF_FFFF_FFFF) << 12) as usize;
-    }
-    let _ = writeln!(RawWriter);
+/// bootstrap 阶段 fatal 的最小诊断（汇编调用，仅读 CSR，无栈依赖）。
+#[unsafe(no_mangle)]
+extern "C" fn bootstrap_fatal_report(cause: usize, val: usize, pc: usize) -> ! {
+    let _ = write!(
+        RawWriter,
+        "\x1b[0;31mbootstrap fatal\x1b[0m: cause={cause:#x} val={val:#x} pc={pc:#x}\n"
+    );
+    hart::park()
+}
+
+/// 无 FatalFrame 的致命错误报告（启动期 CSR 拒绝等）。
+pub fn fatal_msg(args: &fmt::Arguments<'_>) -> ! {
+    let _ = write!(RawWriter, "\x1b[0;31mfatal\x1b[0m: {args}\n");
+    hart::park()
 }
 
 #[panic_handler]
@@ -119,7 +229,7 @@ fn handle_panic(info: &PanicInfo) -> ! {
         let _ = write!(
             RawWriter,
             "\x1b[0;31mKernel panicking #{}\x1b[0m\nin file {} at line {}: {}\n",
-            hart::hartid(),
+            hart_id_or_unknown(),
             location.file(),
             location.line(),
             info.message(),
@@ -131,6 +241,13 @@ fn handle_panic(info: &PanicInfo) -> ! {
         );
     }
     hart::park()
+}
+
+/// tp 不变量可用时返回 hart 编号；bootstrap/formal entry 过渡期返回 ?。
+fn hart_id_or_unknown() -> &'static str {
+    // panic 可能发生在 tp 尚未建立的过渡窗口；此处不读 tp，
+    // 由 FatalFrame 路径提供精确现场。
+    "?"
 }
 
 #[alloc_error_handler]

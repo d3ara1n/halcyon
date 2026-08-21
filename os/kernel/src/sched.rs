@@ -14,6 +14,7 @@ use erhino_shared::proc::Pid;
 
 use crate::sync::Spinlock;
 use crate::{hart, sbi, trap::{self, Outcome}};
+use crate::sbi::DISARM;
 use crate::task::{table, Thread};
 
 /// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/task.md）。
@@ -79,23 +80,11 @@ static TIMERS: Spinlock<Vec<Deadline>> = Spinlock::new(Vec::new());
 /// 空闲 hart 位图（IPI 门铃的目标集）。
 static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 
-/// 预期在线的 hart 位图（main 按板级 CPU 列表置位；静默判定要求
-/// 全员到齐并进入 idle，防止「部分 hart 还没醒来/还在跑」时误停机）。
-static EXPECTED_MASK: AtomicU64 = AtomicU64::new(0);
-
-/// 登记预期在线 hart（main 启动期调用，Application 核各置一位）。
-pub fn expect_hart(hartid: usize) {
-    EXPECTED_MASK.fetch_or(1u64 << hartid, Ordering::SeqCst);
-}
-
 /// 每毫秒 tick 数（init 时按 timebase 换算）。
 static TICKS_PER_MS: AtomicUsize = AtomicUsize::new(1);
 
 /// 时间片量子（毫秒）。
 const QUANTUM_MS: u64 = 10;
-
-/// 定时器卸载值：SBI TIME 规范规定使用无符号最大值。
-const DISARM: u64 = u64::MAX;
 
 pub fn init(timebase: usize) {
     TICKS_PER_MS.store((timebase / 1000).max(1), Ordering::Relaxed);
@@ -103,6 +92,11 @@ pub fn init(timebase: usize) {
 
 fn ticks_per_ms() -> u64 {
     TICKS_PER_MS.load(Ordering::Relaxed) as u64
+}
+
+/// 每秒 tick 数（bring_up_runtime 的上线超时计算用）。
+pub fn ticks_per_sec() -> u64 {
+    ticks_per_ms() * 1000
 }
 
 /// 登记 sleep 期限并立即 arm 本 hart 定时器（唤醒所有权：期限的主人保证闹钟）。
@@ -156,11 +150,13 @@ fn wake_expired() {
 // ---------------------------------------------------------------------------
 
 /// 线程入队并按门铃唤醒空闲 hart（IPI = 他方请求，见 notes/internals.md）。
+/// IDLE_MASK 是 slot 位图；SBI 边界经 registry 展开为 raw hartid 逐个发送，
+/// 绝不把内部位图直接解释为 SBI hart mask。
 pub fn enqueue(t: Arc<Thread>) {
     FAIR.enqueue(t);
     let mask = IDLE_MASK.load(Ordering::SeqCst);
     if mask != 0 {
-        sbi::require(sbi::send_ipi(mask), "IPI.send");
+        crate::registry::ipi_slots(mask);
     }
 }
 
@@ -187,19 +183,15 @@ pub fn report_exit(t: &Thread, code: i64) {
 
 /// hart 主循环：pick → 进用户态 → Switch 处置 → 循环；空则 idle。
 pub fn run() -> ! {
-    // 本 hart 内核现场初始化：SUM（直访用户页）与局部中断使能
-    // （timer 量子/期限、IPI 门铃）。SUM 是 per-hart 位，各 hart 自开。
-    crate::mm::enable_sum();
-    // SAFETY: 仅置 sie.STIE(bit5)|SSIE(bit1) 位。
-    unsafe { asm!("csrs sie, {bits}", bits = in(reg) 0b0010_0010) };
-
+    // 内核现场（sie/SUM/FS 稳态）已由 formal entry 集中建立；
+    // 本循环只维护执行点与量子。
     let me = hart::current();
     loop {
         let Some(t) = DOMAIN.pick() else {
             idle();
             continue;
         };
-        me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t));
+        me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         t.switches.fetch_add(1, Ordering::Relaxed);
         arm_quantum();
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
@@ -293,7 +285,7 @@ fn sip_stip_pending() -> bool {
 /// 新增等待源（IPC 等）时本谓词必须同步扩展：每种 Waiting 都要有
 /// 可枚举的主人，否则静默误判为停机。
 fn is_quiescent() -> bool {
-    IDLE_MASK.load(Ordering::SeqCst) == EXPECTED_MASK.load(Ordering::SeqCst)
+    IDLE_MASK.load(Ordering::SeqCst) == crate::registry::active_slot_mask()
         && !DOMAIN.has_ready()
         && TIMERS.lock().is_empty()
 }

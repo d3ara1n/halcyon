@@ -1,5 +1,7 @@
 [build]
-target = "rinlib/riscv64-unknown-erhino-elf.json"
+# 默认 Base64 用户环境（RV64IMAC/LP64，FS=Off）；
+# 需要 FP 的程序显式用 rinlib/riscv64gc-unknown-erhino-elf.json（LP64D）。
+target = "rinlib/riscv64imac-unknown-erhino-elf.json"
 
 [unstable]
 build-std = ["core", "alloc"]

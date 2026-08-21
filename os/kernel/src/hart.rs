@@ -9,19 +9,24 @@
 
 use core::{arch::asm, sync::atomic::AtomicUsize};
 
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_ZERO: AtomicUsize = AtomicUsize::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_MAX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 /// 与链接脚本 `HART_NUM_LIMIT` 一致（rust_start 启动时校验）。
 pub const HART_NUM_LIMIT: usize = 8;
 
-/// HartLocal 的字节大小，`HART_SETUP` 宏用 `slli 6` 计算 tp，两者由下方断言绑定。
-pub const HART_LOCAL_SIZE: usize = 64;
+/// HartLocal 的字节大小：两 cache line，16 槽。`HART_SETUP` 宏用
+/// `slli 7` 计算 tp，两者由下方断言绑定。
+pub const HART_LOCAL_SIZE: usize = 128;
 
 const _: () = assert!(HART_LOCAL_SIZE.is_power_of_two());
 const _: () = assert!(core::mem::size_of::<HartLocal>() == HART_LOCAL_SIZE);
 const _: () = assert!(core::mem::align_of::<HartLocal>() == 64);
 
-/// 槽位偏移（字节）。汇编侧以字面量偏移 + 同名注释访问（assembly.asm
-/// `_user_trap`/`_resume_user`，LLVM 汇编器不支持 `.eqv` 展开），
-/// 本表是唯一真值，改布局时两侧同步。
+/// 槽位偏移（字节）。汇编侧经 abi::asm 的 `offset_of!` 注入访问，
+/// 本表是唯一真值。
 #[allow(dead_code)]
 pub mod off {
     pub const HARTID: usize = 0;
@@ -31,6 +36,20 @@ pub mod off {
     pub const USER_SATP: usize = 32;
     pub const TRAP_SCRATCH: usize = 40;
     pub const CURRENT_THREAD: usize = 48;
+    /// 稠密内核身份（registry 分配；raw hartid 不兼任内部索引）。
+    pub const SLOT: usize = 56;
+    /// per-hart emergency 栈顶（fatal 路径切入）。
+    pub const EMERGENCY_SP: usize = 64;
+    /// fatal 递归 guard（usize::MAX = 无 fatal；首帧建立后置 1）。
+    pub const FATAL_GUARD: usize = 72;
+    /// trap 进入序列的第二暂存槽（用户 t6 中转）。
+    pub const TRAP_SCRATCH2: usize = 80;
+    /// 当前线程 FP 使能档位（D64=1/Base=0；调度循环装执行点时写入）。
+    pub const FP_ENABLED: usize = 88;
+    /// fatal 路径暂借槽（原 S 态 sp 中转；仅 fatal 入口序列使用）。
+    pub const FATAL_SP: usize = 96;
+    /// per-hart LR/SC reservation 清除槽（dummy SC 目标）。
+    pub const RESERVATION: usize = 104;
 }
 
 /// 单个 hart 的私有状态（trap 锚 + 执行点），占一个 cache line。
@@ -54,7 +73,21 @@ pub struct HartLocal {
     /// 当前线程指针（执行点状态）。调度循环持有 Arc 时非空；
     /// trap handler 经此取线程上下文（pid 等），不做引用计数操作。
     current_thread: AtomicUsize,
-    _reserved: [AtomicUsize; 1],
+    /// 稠密身份（registry 分配；raw hartid 不兼任内部索引）。
+    slot: AtomicUsize,
+    /// fatal 路径的 emergency 栈顶（formal entry 装配）。
+    emergency_sp: AtomicUsize,
+    /// fatal 递归 guard：usize::MAX = 无 fatal；首个 fatal 建立首帧后置 1，
+    /// 再入者不得覆盖首帧、直接进入无栈停驻。
+    fatal_guard: AtomicUsize,
+    /// trap 进入序列的第二暂存槽。
+    trap_scratch2: AtomicUsize,
+    /// 当前线程 FP 使能档位。
+    fp_enabled: AtomicUsize,
+    /// fatal 入口序列的原 sp 中转。
+    fatal_sp: AtomicUsize,
+    /// dummy SC 目标（reservation 清除）。
+    reservation: AtomicUsize,
 }
 
 impl HartLocal {
@@ -66,7 +99,13 @@ impl HartLocal {
         user_satp: AtomicUsize::new(0),
         trap_scratch: AtomicUsize::new(0),
         current_thread: AtomicUsize::new(0),
-        _reserved: [AtomicUsize::new(0); 1],
+        slot: ATOMIC_MAX,
+        emergency_sp: ATOMIC_ZERO,
+        fatal_guard: ATOMIC_MAX,
+        trap_scratch2: ATOMIC_ZERO,
+        fp_enabled: ATOMIC_ZERO,
+        fatal_sp: ATOMIC_ZERO,
+        reservation: ATOMIC_ZERO,
     };
 
     /// hart 编号。
@@ -80,9 +119,9 @@ impl HartLocal {
         self.kernel_sp.load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 当前线程的 TrapFrame 指针；无当前线程时为 0（汇编与断言使用）。
+    /// 当前线程的 UserContext 指针；无当前线程时为 0（汇编与断言使用）。
     #[expect(dead_code, reason = "汇编经槽位直接访问")]
-    pub fn frame_ptr(&self) -> *mut crate::trap::TrapFrame {
+    pub fn frame_ptr(&self) -> *mut crate::context::UserContext {
         self.frame_ptr.load(core::sync::atomic::Ordering::Relaxed) as *mut _
     }
 
@@ -98,12 +137,14 @@ impl HartLocal {
         }
     }
 
-    /// 设置执行点（进入用户态前由调度循环写入）。
+    /// 设置执行点（进入用户态前由调度循环写入）；fp_enabled 决定
+    /// pre-sret 边界的 FS 档位（D64 完整恢复 / Base 恒 Off）。
     pub fn set_context(
         &self,
-        frame: *mut crate::trap::TrapFrame,
+        frame: *mut crate::context::UserContext,
         user_satp: usize,
         thread: *const crate::task::Thread,
+        fp_enabled: bool,
     ) {
         self.frame_ptr
             .store(frame as usize, core::sync::atomic::Ordering::Relaxed);
@@ -111,6 +152,8 @@ impl HartLocal {
             .store(user_satp, core::sync::atomic::Ordering::Relaxed);
         self.current_thread
             .store(thread as usize, core::sync::atomic::Ordering::Relaxed);
+        self.fp_enabled
+            .store(fp_enabled as usize, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// 清执行点（线程离开本 hart 后调用，杜绝悬挂指针）。
@@ -126,6 +169,12 @@ impl HartLocal {
 /// （访问纪律见 notes/internals.md）；字段为原子类型，静态声明无需 unsafe。
 #[unsafe(no_mangle)]
 static HART_LOCALS: [HartLocal; HART_NUM_LIMIT] = [HartLocal::ZERO; HART_NUM_LIMIT];
+
+/// 按 slot 取 HartLocal 静态槽地址（registry 构造 record 用；运行期定位
+/// 一律经 tp 不变量）。
+pub fn hart_local_addr(slot: usize) -> usize {
+    core::ptr::addr_of!(HART_LOCALS[slot]) as usize
+}
 
 /// 当前 hart 的私有状态。要求 tp 不变量已由启动汇编建立。
 #[inline]

@@ -1,8 +1,8 @@
 //! 内核控制台。
 //!
 //! 输出走 SBI（初始化后 DBCN，初始化前 legacy putchar）。多 hart 并发输出由
-//! [`Spinlock`] 串行化；panic 路径绕过锁直写（见 [`console_write_raw`]），
-//! 避免 panic 时持锁交叉导致死锁。
+//! [`Spinlock`] 串行化；panic/fatal 路径经 [`crate::rt::RawWriter`] 直写
+//! legacy putchar，不依赖锁与 DBCN 可用性。
 
 use core::fmt::{self, Arguments, Write};
 
@@ -31,17 +31,6 @@ impl Write for Console {
 }
 
 static CONSOLE: Spinlock<Console> = Spinlock::new(Console::new());
-
-/// 绕过锁的直写，仅 panic 等不可依赖锁纪律的路径使用。
-pub fn console_write_raw(s: &str) {
-    if sbi::is_debug_console_ready() {
-        sbi::debug_console_write_best_effort(s);
-    } else {
-        for b in s.bytes() {
-            sbi::legacy_console_putchar(b);
-        }
-    }
-}
 
 /// 常规格式化输出（持锁，多 hart 安全）。
 pub fn console_write(args: Arguments<'_>) {

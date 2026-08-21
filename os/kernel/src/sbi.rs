@@ -174,6 +174,9 @@ fn debug_console_write_bytes(bytes: &[u8]) -> SbiResult {
     )
 }
 
+/// TIME 的卸载值：SBI 规范规定使用无符号最大值。
+pub const DISARM: u64 = u64::MAX;
+
 /// HSM：启动指定 hart，入口收到 a0 = hartid，a1 = opaque。
 pub fn hart_start(hartid: usize, start_addr: usize, opaque: usize) -> SbiResult {
     sbi_call(

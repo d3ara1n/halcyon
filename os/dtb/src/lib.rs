@@ -10,7 +10,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 use core::{fmt, str};
+
+pub mod topology;
 
 const FDT_MAGIC: u32 = 0xD00D_FEED;
 const FDT_BEGIN_NODE: u32 = 0x1;
@@ -239,6 +243,24 @@ impl<'f, 'a: 'f> Node<'f, 'a> {
         be32(data, 0)
     }
 
+    /// 属性值为字符串列表（DT 规范 string-array：NUL 结尾字符串依此相连，
+    /// 列表以数据末尾或空段结束）。任一段非合法 UTF-8 视为属性缺失——
+    /// 与全树验证同哲学：错误在访问器边界收敛为「不存在」。
+    pub fn prop_str_list(&self, name: &str) -> Option<StringList<'a>> {
+        let data = self.prop(name)?;
+        let mut pos = 0;
+        while pos < data.len() {
+            let end = pos + data[pos..].iter().position(|&b| b == 0)?; // 每段必须 NUL 结尾
+            str::from_utf8(&data[pos..end]).ok()?;
+            let step = end - pos + 1;
+            if step == 1 {
+                break; // 空段：列表终止
+            }
+            pos += step;
+        }
+        Some(StringList { data, pos: 0 })
+    }
+
     /// 首个名为 `name` 的直接子节点。
     pub fn child(&self, name: &str) -> Option<Node<'f, 'a>> {
         self.children().find(|n| n.name().is_ok_and(|n| n == name))
@@ -310,6 +332,30 @@ impl<'f, 'a: 'f> Iterator for Children<'f, 'a> {
                 }
             }
         }
+    }
+}
+
+/// 字符串列表视图（[`Node::prop_str_list`] 产生）。
+#[derive(Debug, Clone, Copy)]
+pub struct StringList<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for StringList<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let end = self.pos + self.data[self.pos..].iter().position(|&b| b == 0)?;
+        let s = str::from_utf8(&self.data[self.pos..end]).ok()?;
+        if s.is_empty() {
+            return None; // 空段：列表终止
+        }
+        self.pos = end + 1;
+        Some(s)
     }
 }
 

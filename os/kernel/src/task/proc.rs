@@ -8,9 +8,9 @@ use erhino_shared::proc::{Pid, Tid};
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
 use crate::{
+    context::UserContext,
     frame::{self, FrameTracker},
     mm, sbi,
-    trap::TrapFrame,
 };
 
 /// 页大小（字节）。
@@ -271,7 +271,9 @@ pub struct Thread {
     /// 退出码（Exit / 异常终止共用；回收时打印）。锁内 Option，
     /// 写于本 hart 的退出路径，读于回收（同 hart 顺序发生）。
     pub(crate) exit_code: crate::sync::Spinlock<Option<i64>>,
-    frame: UnsafeCell<TrapFrame>,
+    /// 用户执行需求（ELF 判定；eligibility 由 domain 能力另行核验）。
+    pub requirement: elf::IsaRequirement,
+    frame: UnsafeCell<UserContext>,
 }
 
 // SAFETY: TrapFrame 只在所属线程的执行 hart 上被访问（汇编存帧于线程
@@ -280,29 +282,31 @@ unsafe impl Sync for Thread {}
 
 impl Thread {
     /// 创建主线程：a0 = pid、a1 = parent（rinlib 启动契约），sp = 半区顶。
-    fn new_main(process: Arc<Process>, entry: usize) -> Self {
-        let mut frame = TrapFrame {
-            x: [0; 32],
-            f: [0; 32],
-            fcsr: 0,
-            fp_valid: 0,
-            sepc: entry as u64,
-        };
-        frame.x[2] = USER_TOP as u64; // sp
-        frame.x[10] = process.pid as u64; // a0
-        frame.x[11] = process.parent as u64; // a1
+    /// FP 状态创建即全零——不存在依赖 hart 残留的 valid 状态。
+    fn new_main(process: Arc<Process>, entry: usize, requirement: elf::IsaRequirement) -> Self {
+        let mut ctx = UserContext::zeroed();
+        ctx.sepc = entry as u64;
+        ctx.x[2] = USER_TOP as u64; // sp
+        ctx.x[10] = process.pid as u64; // a0
+        ctx.x[11] = process.parent as u64; // a1
         Self {
             tid: 0,
             process,
             created_tick: sbi::read_time(),
             switches: AtomicU64::new(0),
             exit_code: crate::sync::Spinlock::new(None),
-            frame: UnsafeCell::new(frame),
+            requirement,
+            frame: UnsafeCell::new(ctx),
         }
     }
 
-    pub fn frame_ptr(&self) -> *mut TrapFrame {
+    pub fn frame_ptr(&self) -> *mut UserContext {
         self.frame.get()
+    }
+
+    /// pre-sret FP 档位：D64 线程完整恢复，Base 恒 FS=Off。
+    pub fn uses_fp(&self) -> bool {
+        self.requirement == elf::IsaRequirement::D64
     }
 
     /// 用户 satp（进程地址空间不变，直接读缓存）。
@@ -312,14 +316,23 @@ impl Thread {
 }
 
 /// 从 ELF 装载一个进程并创建主线程（initfs 启动路径）。
-pub fn spawn_from_elf(pid: Pid, parent: Pid, elf: &elf::Elf, file: &[u8]) -> Result<Arc<Thread>, SpaceError> {
+///
+/// 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/TSO/
+/// 未建模状态扩展在 load 时明确拒绝，不降级为 Base。W^X：段内容写入
+/// 尚不可执行的地址空间，装载完成后经入队 Release 发布（见 sched::enqueue）。
+pub fn spawn_from_elf(pid: Pid, parent: Pid, image: &elf::Elf, file: &[u8]) -> Result<Arc<Thread>, SpaceError> {
+    let requirement = elf::isa_requirement(file).expect("用户执行需求被拒绝");
     let process = Arc::new(Process::new(pid, parent)?);
     {
         let mut space = process.space.lock();
-        space.load_elf(&elf.segments, file)?;
+        space.load_elf(&image.segments, file)?;
         space.map_stack()?;
     }
-    let thread = Arc::new(Thread::new_main(process.clone(), elf.entry as usize));
+    let thread = Arc::new(Thread::new_main(
+        process.clone(),
+        image.entry as usize,
+        requirement,
+    ));
     *process.main_thread.lock() = Some(thread.clone());
     super::table::insert(process);
     Ok(thread)

@@ -116,6 +116,16 @@ pub fn alloc_contiguous(count: usize) -> Option<FrameTracker> {
     with_pool(|p| p.alloc_contiguous(count)).map(|base| FrameTracker { base, count })
 }
 
+/// 归还一段页对齐物理区间（bootstrap 回收用；区间必须此前被剔除）。
+pub fn free_range(start_pa: usize, end_pa: usize) {
+    assert!(start_pa % PAGE_SIZE == 0 && end_pa % PAGE_SIZE == 0 && start_pa < end_pa);
+    with_pool(|p| {
+        for frame in (start_pa..end_pa).step_by(PAGE_SIZE) {
+            p.dealloc(page_table::FrameNumber::from_addr(frame), 1);
+        }
+    });
+}
+
 /// 帧池剩余空闲帧数。
 pub fn free_frames() -> usize {
     with_pool(|p| p.free_frames())

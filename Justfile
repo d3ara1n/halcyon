@@ -15,16 +15,18 @@ RUSTFLAGS_USER := ""
 TARGET_DIR := invocation_directory()/"artifacts"
 KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
 
-KERNEL_ELF := TARGET_DIR/"erhino_kernel"
+# 平台产物按 MODEL 隔离：切平台不可能读到旧平台的 dtb/内核
+MODEL_DIR := TARGET_DIR/PLATFORM/MODEL
+KERNEL_ELF := MODEL_DIR/"erhino_kernel"
 KERNEL_BIN := KERNEL_ELF+".bin"
-
-DTB := TARGET_DIR/"device.dtb"
+DTB := MODEL_DIR/"device.dtb"
+INITFS := TARGET_DIR/"initfs.tar"   # 用户态产物，平台无关
 
 # QEMU
 # initfs 装载地址：virt DRAM 1GiB 取高址；sifive_u 实际 DRAM 仅 128MiB，
 # 取 dtb 声明的 0x86000000（与 dts 的 initfs reg 保持一致）。
 INITFS_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file=artifacts/initfs.tar,addr="+INITFS_ADDR
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+INITFS+",addr="+INITFS_ADDR
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -32,6 +34,13 @@ GDB_TARGET := KERNEL_ELF
 
 alias b := build_kernel
 alias c := clean
+
+# 内核 target 的 build-std 许可（host 测试走 --target host，不受影响）
+ZFLAGS := "-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# 秒级检查：与 build_kernel 同参
+check:
+    @cd os && cargo check {{ZFLAGS}}
 
 clean:
     #!/usr/bin/env bash
@@ -64,12 +73,13 @@ make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/srv_* "{{TARGET_DIR}}/initfs/bin"
     @cp {{TARGET_DIR}}/build/drv_* "{{TARGET_DIR}}/initfs/bin"
-    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | tar --format=ustar -cvf ../initfs.tar -T -
+    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | tar --format=ustar -cvf "{{INITFS}}" -T -
 
 build_kernel: artifact_dir
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}/{{MODEL}}\033[0m"
-    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}"
+    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
     @riscv64-elf-objcopy {{KERNEL_ELF}} -O binary {{KERNEL_BIN}}
+    @python3 os/tools/audit_elf.py {{KERNEL_ELF}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
 
 run_qemu +OPTIONS: make_dtb make_initfs build_kernel
