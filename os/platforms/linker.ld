@@ -1,8 +1,6 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-INCLUDE "../artifacts/memory.x"
-
 SECTIONS
 {
     HART_NUM_LIMIT = 8;

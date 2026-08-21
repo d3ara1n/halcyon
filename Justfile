@@ -4,15 +4,16 @@ RELEASE := if MODE == "release" { "--release" } else { "" }
 
 # platform
 PLATFORM := "qemu"
-MODEL := "sifive_u"
+MODEL := "virt"
 DTS := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"device.dts"
 MEMORY_SCRIPT := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"memory.x"
 
 # compile
-RUSTFLAGS_OS := "-Clink-arg=-Tplatforms/linker.ld -Clinker=riscv64-elf-ld"
+RUSTFLAGS_OS := "-Clinker=riscv64-elf-ld"
 RUSTFLAGS_USER := ""
 
 TARGET_DIR := invocation_directory()/"artifacts"
+KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
 
 KERNEL_ELF := TARGET_DIR/"erhino_kernel"
 KERNEL_BIN := KERNEL_ELF+".bin"
@@ -65,10 +66,9 @@ make_initfs: build_user
     @cp {{TARGET_DIR}}/build/drv_* "{{TARGET_DIR}}/initfs/bin"
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | tar --format=ustar -cvf ../initfs.tar -T -
 
-build_kernel: 
-    @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}\033[0m"
-    @cp "{{MEMORY_SCRIPT}}" "{{TARGET_DIR}}"
-    @cd os && RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} -Z unstable-options --artifact-dir {{TARGET_DIR}}
+build_kernel: artifact_dir
+    @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}/{{MODEL}}\033[0m"
+    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}"
     @riscv64-elf-objcopy {{KERNEL_ELF}} -O binary {{KERNEL_BIN}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
 
