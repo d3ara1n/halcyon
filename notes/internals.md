@@ -81,9 +81,9 @@ Sv39，canonical 半区边界即用户/内核分界（对齐 Linux 布局）：
 
 共享映射下无 trampoline：trap 入口直接是内核 .text，用户表与内核表高半区同构，**trap 全程不切 satp**。
 
-- **TrapFrame**（纯用户现场，每线程一份，内核堆分配）：`x[32] + f[32] + sepc` 共 520 字节；Rust 结构与汇编偏移经 const 断言绑定。tp 即用户 x4，作为普通寄存器保存/恢复。调度控制字段与 TrapFrame 类型分离，放执行点（HartLocal）。
+- **TrapFrame**（纯用户现场，每线程一份，内核堆分配）：`x[32] + f[32] + fcsr + fp_valid + sepc` 共 536 字节；Rust 结构与汇编偏移经 const 断言绑定。tp 即用户 x4，作为普通寄存器保存/恢复。调度控制字段与 TrapFrame 类型分离，放执行点（HartLocal）。
 - **trap 锚**：sscratch 在用户态恒指本 hart 的 HartLocal。trap 进入后 `csrrw` 交换定位锚，从锚取当前 TrapFrame 指针与调度栈位置；sret 前置回。锚内容（当前帧指针、user satp、调度循环栈位）就是执行点状态。
-- **浮点 FS 条件保存**：sret 进用户态前置 FS=Initial；trap 时 FS==Dirty 才存 `f[32]` 并清为 Clean（内核不用浮点，fcsr 不被内核改动故无需保存）；Resume 时 FS==Clean 则恢复并置回 Dirty。
+- **浮点 FS 条件保存**：FP 有效性属于线程帧而非 hart。trap 时仅 FS==Dirty 才更新 `f[32] + fcsr` 并标记帧有效；sret 按帧有效位恢复并置 FS=Clean，用户再次写 FP 后由硬件转为 Dirty。线程迁移不依赖目标 hart 残留的 FS 状态。
 - **SIE 纪律**：sret 由硬件以 SPIE 恢复 SIE=1（用户态可打断）；trap 进入自动清零；调度循环与内核态恒关。
 - **出口二值**：trap 处理返回 Resume（装帧 sret，直接回用户态）或 Switch（恢复调度循环现场，回本 hart 调度循环）。调度循环是 per-hart 栈上的常驻 Rust 函数，`ret_to_user` 保存循环现场后 sret；trap handler 深度 1 调用，无嵌套执行流。
 

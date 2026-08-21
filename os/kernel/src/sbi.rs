@@ -2,12 +2,12 @@
 
 use core::{
     arch::asm,
+    fmt::Write,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SbiExtension {
-    LegacyConsolePutchar,
     Base,
     Timer,
     Ipi,
@@ -19,7 +19,6 @@ pub enum SbiExtension {
 impl SbiExtension {
     const fn number(self) -> usize {
         match self {
-            SbiExtension::LegacyConsolePutchar => 0x01,
             SbiExtension::Base => 0x10,
             SbiExtension::Timer => 0x54494D45,
             SbiExtension::Ipi => 0x735049,
@@ -41,10 +40,15 @@ pub enum SbiError {
     AlreadyStarted,
     AlreadyStopped,
     NoSharedMemory,
+    InvalidState,
+    BadRange,
+    Timeout,
+    Io,
+    DeniedLocked,
     Undefined(isize),
 }
 
-pub type SbiResult = Result<isize, SbiError>;
+pub type SbiResult = Result<usize, SbiError>;
 
 /// 标准 SBI ecall（fid 有效），返回。
 #[inline]
@@ -62,7 +66,7 @@ fn sbi_call(eid: SbiExtension, fid: usize, arg0: usize, arg1: usize, arg2: usize
         );
     }
     match error {
-        0 => Ok(value),
+        0 => Ok(value as usize),
         -1 => Err(SbiError::Failed),
         -2 => Err(SbiError::NotSupported),
         -3 => Err(SbiError::InvalidParameter),
@@ -72,20 +76,12 @@ fn sbi_call(eid: SbiExtension, fid: usize, arg0: usize, arg1: usize, arg2: usize
         -7 => Err(SbiError::AlreadyStarted),
         -8 => Err(SbiError::AlreadyStopped),
         -9 => Err(SbiError::NoSharedMemory),
+        -10 => Err(SbiError::InvalidState),
+        -11 => Err(SbiError::BadRange),
+        -12 => Err(SbiError::Timeout),
+        -13 => Err(SbiError::Io),
+        -14 => Err(SbiError::DeniedLocked),
         other => Err(SbiError::Undefined(other)),
-    }
-}
-
-/// legacy ecall（无 fid，返回值在 a0）。
-#[inline]
-fn legacy_call(eid: SbiExtension, arg0: usize) {
-    // SAFETY: 同上，legacy 寄存器约定。
-    unsafe {
-        asm!(
-            "ecall",
-            inlateout("a0") arg0 as isize => _,
-            in("a7") eid.number() as isize,
-        );
     }
 }
 
@@ -95,38 +91,105 @@ pub fn is_debug_console_supported() -> bool {
     DEBUG_CONSOLE_SUPPORTED.load(Ordering::Relaxed)
 }
 
-/// 启动早期探测扩展可用性。
+/// 启动早期确认现代 SBI 基线与必需扩展。
 pub fn init() {
-    if let Ok(res) = sbi_call(
-        SbiExtension::Base,
-        3, // probe_extension
-        SbiExtension::DebugConsole.number() as isize as usize,
-        0,
-        0,
-    ) {
-        DEBUG_CONSOLE_SUPPORTED.store(res != 0, Ordering::Relaxed);
+    let version = require(
+        sbi_call(SbiExtension::Base, 0, 0, 0, 0),
+        "BASE.get_spec_version",
+    );
+    let major = version >> 24 & 0x7f;
+    let minor = version & 0x00ff_ffff;
+    if major == 0 && minor < 2 {
+        fatal("SBI specification older than 0.2", SbiError::NotSupported);
+    }
+
+    for extension in [
+        SbiExtension::Timer,
+        SbiExtension::Ipi,
+        SbiExtension::HartStateManagement,
+        SbiExtension::DebugConsole,
+    ] {
+        let supported = require(
+            sbi_call(SbiExtension::Base, 3, extension.number(), 0, 0),
+            "BASE.probe_extension",
+        );
+        if supported == 0 {
+            fatal("required SBI extension unavailable", SbiError::NotSupported);
+        }
+    }
+    DEBUG_CONSOLE_SUPPORTED.store(true, Ordering::Release);
+}
+
+/// 将维持内核不变量的 SBI 失败转为可观测的致命错误。
+pub fn require(result: SbiResult, operation: &str) -> usize {
+    match result {
+        Ok(value) => value,
+        Err(err) => fatal(operation, err),
     }
 }
 
-pub fn legacy_console_putchar(char: u8) {
-    legacy_call(SbiExtension::LegacyConsolePutchar, char as usize);
+struct LegacyWriter;
+
+impl Write for LegacyWriter {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        for byte in text.bytes() {
+            legacy_console_putchar(byte);
+        }
+        Ok(())
+    }
 }
 
-pub fn debug_console_write(text: &str) -> SbiResult {
-    // DBCN 契约：base_addr 是物理地址（SBI 在 M-mode 地址空间解引用），
-    // 内核在高半区运行，指针必须先转 PA（纯算术，与当前 satp 无关）。
+fn fatal(operation: &str, err: SbiError) -> ! {
+    let _ = LegacyWriter.write_fmt(format_args!(
+        "\x1b[0;31mSBI fatal\x1b[0m: {} failed: {:?}\n",
+        operation, err
+    ));
+    crate::hart::park()
+}
+
+/// 仅用于现代 DBCN 尚不可用时报告启动失败；不作为运行期兼容路径。
+pub(crate) fn legacy_console_putchar(byte: u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") byte as usize => _,
+            in("a7") 0x01usize,
+        );
+    }
+}
+
+/// DBCN write 允许部分写入；循环直到整段文本完成，零进度视为致命错误。
+pub fn debug_console_write_all(text: &str) {
+    let bytes = text.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written = require(debug_console_write_bytes(&bytes[offset..]), "DBCN.write");
+        if written == 0 || written > bytes.len() - offset {
+            fatal("DBCN.write returned invalid length", SbiError::Failed);
+        }
+        offset += written;
+    }
+}
+
+fn debug_console_write_bytes(bytes: &[u8]) -> SbiResult {
     sbi_call(
         SbiExtension::DebugConsole,
-        0, // write
-        text.len(),
-        crate::mm::virt_to_phys(text.as_ptr() as usize),
+        0,
+        bytes.len(),
+        crate::mm::virt_to_phys(bytes.as_ptr() as usize),
         0,
     )
 }
 
 /// HSM：启动指定 hart，入口收到 a0 = hartid，a1 = opaque。
 pub fn hart_start(hartid: usize, start_addr: usize, opaque: usize) -> SbiResult {
-    sbi_call(SbiExtension::HartStateManagement, 0, hartid, start_addr, opaque)
+    sbi_call(
+        SbiExtension::HartStateManagement,
+        0,
+        hartid,
+        start_addr,
+        opaque,
+    )
 }
 
 /// 读 mtime（S 态可直接读 time CSR）。
@@ -139,16 +202,13 @@ pub fn read_time() -> u64 {
 }
 
 /// TIME：编程下次时钟中断（stime_value 到达时置 STIP）。
-/// `u64::MAX / 2` 为卸载语义——远超 mtime 可达范围，不触发亦不溢出。
-pub fn set_timer(stime: u64) {
-    let _ = sbi_call(SbiExtension::Timer, 0, stime as usize, 0, 0);
+pub fn set_timer(stime: u64) -> SbiResult {
+    sbi_call(SbiExtension::Timer, 0, stime as usize, 0, 0)
 }
 
-/// IPI：门铃。`mask` 按 hartid 置位（bit i = hartid i），
-/// SBI 以 hart_mask 的物理地址取位图。
-pub fn send_ipi(mask: &u64) {
-    let pa = crate::mm::virt_to_phys(mask as *const u64 as usize);
-    let _ = sbi_call(SbiExtension::Ipi, 0, pa, 0, 0);
+/// IPI：现代 SBI ABI 的 `hart_mask` 是值而非指针，base 固定为 0。
+pub fn send_ipi(mask: u64) -> SbiResult {
+    sbi_call(SbiExtension::Ipi, 0, mask as usize, 0, 0)
 }
 
 /// 清除本 hart 的软件中断 pending（SSIP 位可由 S 态写）。
@@ -177,12 +237,11 @@ pub fn system_reset(reset_type: u32, reset_reason: u32) -> SbiResult {
     )
 }
 
-/// 停机。SRST 成功后不返回；不可用时（如 QEMU sifive_u 未接 poweroff
-/// 设备，SRST 为 noop）告警后永久停放——真硬件无停机设备时的唯一
-/// 诚实终态。
+/// 停机。SRST 成功后不返回；平台没有关机后端时记录具体错误并永久停放。
 pub fn shutdown() -> ! {
-    if system_reset(RESET_SHUTDOWN, 0).is_err() {
-        warn!(SBI, "SRST 停机不可用，永久停放");
+    match system_reset(RESET_SHUTDOWN, 0) {
+        Ok(value) => warn!(SBI, "SRST 成功后意外返回: {}", value),
+        Err(err) => warn!(SBI, "SRST 停机不可用: {:?}", err),
     }
     crate::hart::park()
 }

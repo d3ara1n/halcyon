@@ -11,7 +11,7 @@
 
 use crate::{hart, sbi, sched, syscall};
 
-/// 用户现场（`x[32] + f[32] + sepc`）。
+/// 用户现场（`x[32] + f[32] + fcsr + fp_valid + sepc`）。
 ///
 /// 访问纪律：帧只在所属线程的执行 hart 上被访问——汇编存取发生在
 /// 线程休眠于本 hart 期间，Rust 侧（syscall 写响应）同样处于该区间。
@@ -19,16 +19,22 @@ use crate::{hart, sbi, sched, syscall};
 pub struct TrapFrame {
     pub x: [u64; 32],
     pub f: [u64; 32],
+    pub fcsr: u64,
+    pub fp_valid: u64,
     pub sepc: u64,
 }
 
 /// 帧内偏移（字节），汇编侧以字面量 + 同名注释访问（hart::off 同理，
 /// 见该表说明）。
 pub mod frame_off {
-    pub const SEPC: usize = 512;
+    pub const FCSR: usize = 512;
+    pub const FP_VALID: usize = 520;
+    pub const SEPC: usize = 528;
 }
 
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 520);
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 536);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, fcsr) == frame_off::FCSR);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, fp_valid) == frame_off::FP_VALID);
 const _: () = assert!(core::mem::offset_of!(TrapFrame, sepc) == frame_off::SEPC);
 // HartLocal 槽位偏移与汇编字面量的关键绑定（全表见 hart::off）。
 const _: () = assert!(hart::off::FRAME_PTR == 24 && hart::off::SCHED_SP == 16);

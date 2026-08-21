@@ -100,9 +100,6 @@ fn wake_secondary_harts(board: &board::BoardInfo) {
         }
         let entry = rt::secondary_entry as *const () as usize;
         let awaken = external::awaken_pa();
-        match sbi::hart_start(cpu.hartid, awaken, entry) {
-            Ok(_) => {}
-            Err(err) => warn!(Hart, "hart {} 启动失败: {:?}", cpu.hartid, err),
-        }
+        sbi::require(sbi::hart_start(cpu.hartid, awaken, entry), "HSM.hart_start");
     }
 }

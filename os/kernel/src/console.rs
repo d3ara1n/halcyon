@@ -19,7 +19,8 @@ impl Console {
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if sbi::is_debug_console_supported() {
-            sbi::debug_console_write(s).map(|_| ()).map_err(|_| fmt::Error)
+            sbi::debug_console_write_all(s);
+            Ok(())
         } else {
             for b in s.bytes() {
                 sbi::legacy_console_putchar(b);
@@ -34,7 +35,7 @@ static CONSOLE: Spinlock<Console> = Spinlock::new(Console::new());
 /// 绕过锁的直写，仅 panic 等不可依赖锁纪律的路径使用。
 pub fn console_write_raw(s: &str) {
     if sbi::is_debug_console_supported() {
-        let _ = sbi::debug_console_write(s);
+        sbi::debug_console_write_all(s);
     } else {
         for b in s.bytes() {
             sbi::legacy_console_putchar(b);

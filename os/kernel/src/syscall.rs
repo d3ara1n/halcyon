@@ -113,4 +113,4 @@ fn respond_error(frame: &mut TrapFrame, err: SystemCallError) {
 }
 
 /// TrapFrame sepc 偏移的存在性绑定（respond 路径依赖）。
-const _: () = assert!(frame_off::SEPC == 512);
+const _: () = assert!(frame_off::SEPC == 528);

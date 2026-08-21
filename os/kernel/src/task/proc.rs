@@ -284,6 +284,8 @@ impl Thread {
         let mut frame = TrapFrame {
             x: [0; 32],
             f: [0; 32],
+            fcsr: 0,
+            fp_valid: 0,
             sepc: entry as u64,
         };
         frame.x[2] = USER_TOP as u64; // sp

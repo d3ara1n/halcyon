@@ -161,6 +161,8 @@ _user_trap:
     sd     x22, 176(t5)
     sd     x23, 184(t5)
     sd     x24, 192(t5)
+    sd     x25, 200(t5)
+    sd     x26, 208(t5)
     sd     x27, 216(t5)
     sd     x28, 224(t5)
     sd     x29, 232(t5)
@@ -168,7 +170,8 @@ _user_trap:
     sd     t0, 240(t5)
     csrr   t0, sscratch            # t0 = 用户 x31（进入时交换暂存）
     sd     t0, 248(t5)
-    # 浮点条件保存：FS==Dirty 才存，存后置 Clean（内核不用浮点，fcsr 不动）
+    # 浮点条件保存：Dirty 才更新线程帧；有效性随 TrapFrame 迁移，
+    # 不从目标 hart 的 FS 残留状态推断。
     csrr   t0, sstatus
     srli   t0, t0, 13
     andi   t0, t0, 3
@@ -177,12 +180,16 @@ _user_trap:
     .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     fsd    f\i, 256+8*\i(t5)
     .endr
+    csrr   t0, fcsr
+    sd     t0, 512(t5)             # TF_FCSR
+    li     t0, 1
+    sd     t0, 520(t5)             # TF_FP_VALID
     li     t0, 3 << 13
     csrc   sstatus, t0
     li     t0, 2 << 13
     csrs   sstatus, t0
 1:  csrr   t0, sepc
-    sd     t0, 512(t5)             # TF_SEPC
+    sd     t0, 528(t5)             # TF_SEPC
     # 内核现场：tp 换锚、sp 切调度栈、stvec 指内核致命路径
     mv     tp, t6
     ld     sp, 16(t6)              # HL_SCHED_SP
@@ -244,25 +251,24 @@ _resume_user:
     csrw   stvec, t0
     ld     t5, 24(tp)              # HL_FRAME
     csrw   sscratch, tp
-    # 浮点条件恢复：FS==Clean → 恢复 + 置 Dirty；否则置 Initial
-    csrr   t0, sstatus
-    srli   t0, t0, 13
-    andi   t0, t0, 3
-    li     t1, 2
-    bne    t0, t1, 3f
+    # 浮点条件恢复：以线程帧的有效位为准，迁移到任意 hart 均一致。
+    ld     t0, 520(t5)             # TF_FP_VALID
+    beqz   t0, 3f
     .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     fld    f\i, 256+8*\i(t5)
     .endr
+    ld     t0, 512(t5)             # TF_FCSR
+    csrw   fcsr, t0
     li     t0, 3 << 13
     csrc   sstatus, t0
-    li     t0, 3 << 13
+    li     t0, 2 << 13             # Clean：用户写 FP 后硬件转 Dirty
     csrs   sstatus, t0
     j      4f
 3:  li     t0, 3 << 13
     csrc   sstatus, t0
     li     t0, 1 << 13
     csrs   sstatus, t0
-4:  ld     t0, 512(t5)             # TF_SEPC
+4:  ld     t0, 528(t5)             # TF_SEPC
     csrw   sepc, t0
     # 恢复通用：t6 先备好不再用，t5 基址最后恢复
     ld     x1, 8(t5)
@@ -289,6 +295,8 @@ _resume_user:
     ld     x22, 176(t5)
     ld     x23, 184(t5)
     ld     x24, 192(t5)
+    ld     x25, 200(t5)
+    ld     x26, 208(t5)
     ld     x27, 216(t5)
     ld     x28, 224(t5)
     ld     x29, 232(t5)

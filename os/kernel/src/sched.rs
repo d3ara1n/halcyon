@@ -94,8 +94,8 @@ static TICKS_PER_MS: AtomicUsize = AtomicUsize::new(1);
 /// 时间片量子（毫秒）。
 const QUANTUM_MS: u64 = 10;
 
-/// 定时器卸载值：远超 mtime 可达范围。
-const DISARM: u64 = u64::MAX / 2;
+/// 定时器卸载值：SBI TIME 规范规定使用无符号最大值。
+const DISARM: u64 = u64::MAX;
 
 pub fn init(timebase: usize) {
     TICKS_PER_MS.store((timebase / 1000).max(1), Ordering::Relaxed);
@@ -119,7 +119,7 @@ pub fn sleep_register(ms: u64, pid: Pid) {
 fn arm_earliest() {
     let timers = TIMERS.lock();
     if let Some(min) = timers.iter().map(|d| d.at).min() {
-        sbi::set_timer(min);
+        sbi::require(sbi::set_timer(min), "TIME.set_timer");
     }
 }
 
@@ -158,16 +158,16 @@ fn wake_expired() {
 /// 线程入队并按门铃唤醒空闲 hart（IPI = 他方请求，见 notes/internals.md）。
 pub fn enqueue(t: Arc<Thread>) {
     FAIR.enqueue(t);
-    let mask = IDLE_MASK.load(Ordering::Relaxed);
+    let mask = IDLE_MASK.load(Ordering::SeqCst);
     if mask != 0 {
-        sbi::send_ipi(&mask);
+        sbi::require(sbi::send_ipi(mask), "IPI.send");
     }
 }
 
 /// timer trap（量子耗尽或 sleep 到期）：卸载 → 唤醒到期；当前线程由
 /// trap 出口 Requeue 轮转。
 pub fn on_timer() {
-    sbi::set_timer(DISARM);
+    sbi::require(sbi::set_timer(DISARM), "TIME.set_timer");
     wake_expired();
 }
 
@@ -218,7 +218,10 @@ pub fn run() -> ! {
 fn arm_quantum() {
     let quantum = sbi::read_time() + QUANTUM_MS * ticks_per_ms();
     let earliest = TIMERS.lock().iter().map(|d| d.at).min();
-    sbi::set_timer(earliest.unwrap_or(quantum).min(quantum));
+    sbi::require(
+        sbi::set_timer(earliest.unwrap_or(quantum).min(quantum)),
+        "TIME.set_timer",
+    );
 }
 
 /// 回收退出线程：摘进程表 → 打统计 → drop 链释放地址空间（表帧/数据帧 RAII）。
@@ -248,6 +251,12 @@ fn reap(t: Arc<Thread>) {
 fn idle() {
     let bit = 1u64 << hart::hartid();
     IDLE_MASK.fetch_or(bit, Ordering::SeqCst);
+    // 入队与登记 idle 的交错由双重检查闭合：登记后若已有工作，
+    // 说明入队发生在第一次 pick 之后，立即撤销 idle 身份并重试。
+    if DOMAIN.has_ready() {
+        IDLE_MASK.fetch_and(!bit, Ordering::SeqCst);
+        return;
+    }
     if is_quiescent() {
         log!(Sched, "系统静默（无唤醒主人），停机");
         sbi::shutdown();
@@ -255,9 +264,9 @@ fn idle() {
 
     let earliest = TIMERS.lock().iter().map(|d| d.at).min();
     match earliest {
-        Some(at) => sbi::set_timer(at),
-        None => sbi::set_timer(DISARM),
-    }
+        Some(at) => sbi::require(sbi::set_timer(at), "TIME.set_timer"),
+        None => sbi::require(sbi::set_timer(DISARM), "TIME.set_timer"),
+    };
     // SAFETY: wfi 等待局部使能的中断 pending 唤醒。
     unsafe { asm!("wfi", options(nomem, preserves_flags)) };
     sbi::clear_ssip();
@@ -265,7 +274,7 @@ fn idle() {
 
     if sip_stip_pending() {
         // 期限到达唤醒（回主循环前把到期线程入队）。
-        sbi::set_timer(DISARM);
+        sbi::require(sbi::set_timer(DISARM), "TIME.set_timer");
         wake_expired();
     }
 }
