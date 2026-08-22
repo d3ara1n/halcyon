@@ -8,7 +8,7 @@ cold boot 是独立临时环境，不属于任何正式 hart：使用专用 stac
 
 正式 hart 由 `HartBootRecord` 描述。boot hart 以固件传入的 raw hartid 查询自己的正式 slot；secondary 由 HSM opaque 获得 record PA。secondary 从 Bare 经永久 PA 前导和 identity/高半区别名过渡页表进入高半区；切换过渡与正式 satp 后分别执行地址翻译同步。两条路径在高半区 formal entry 汇合，统一建立 gp、tp、sscratch、stack、satp、CSR 和 trap vector。
 
-cold-bootstrap 专用页对齐区间在最后引用消失后回收；secondary PA 前导与过渡页表属于永久 hart-entry 设施。所有 admitted hart 的启动记录先发布，再发 HSM start；record 与 RuntimeGate 使用 Release/Acquire。全体 Online、调度域与初始任务就绪后才发布 Ready。任何 HSM 状态矛盾、启动错误或上线超时使本次启动整体失败，不在不确定集合上降级运行。
+cold-bootstrap 专用页对齐区间在最后引用消失后回收；secondary PA 前导与过渡页表属于永久 hart-entry 设施。过渡页表由 cold boot 一次建成；secondary 只幂等补写自己使用的槽位，禁止对共享暂存结构做先清后建的重建——并发执行下清零会拆掉先行者脚下的翻译。所有 admitted hart 的启动记录先发布，再发 HSM start；record 与 RuntimeGate 使用 Release/Acquire。全体 Online、调度域与初始任务就绪后才发布 Ready。任何 HSM 状态矛盾、启动错误或上线超时使本次启动整体失败，不在不确定集合上降级运行。
 
 ## 身份、能力与拓扑
 
