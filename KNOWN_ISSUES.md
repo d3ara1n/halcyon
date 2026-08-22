@@ -47,8 +47,29 @@ worktree A/B + 探针二分取得的硬结论：
    被污染的 scratch 恢复，呈现「OpenSBI 脏值 + 客户机 sp/tp」混合现场，
    随后 pc=0 野跳。真正的第一写者在数据帧归还时机相关的路径上。
 
-下一步：以「谁在归还窗口内仍在写这些帧」为纲审查 623cba7 的 Drop 链
-与生命周期发布时序；或用 QEMU `-d exec` 以外的手段抓第一笔野写。
+观察者效应已量化：FREE 路径加真实指令延迟即 100% 抑制、空操作探针
+崩溃回归、全量内存记录亦完全抑制——窗口为纳秒级。取证基建已就位：
+QEMU monitor `pmemsave` 提取 DIAG_BUF（崩溃后全 hart 停放、内存稳定，
+物理地址直读，绕开 gdb 批量模式与串口乱流两坑）。
+
+下一步候选：① `-icount` 固定客户机指令时序使竞态确定性复现，再叠加
+全量日志（日志改变指令数但竞态仍以某速率显形）；② 精读 Drop 链与
+等待模型发布时序的内存序论证；③ 抓第一笔野写的物理地址反查归属。
+
+补充排除：帧池空闲链与 TableTree Drop 链的**顺序**逻辑均经宿主测试
+验证无罪（`frame_pool/tests/replay_f3.rs`、`page_table/tests/drop_chain.rs`），
+独立 review 亦结构性排除等待完成方与 reap 的 UserContext 交错
+（Arc 强持有阻断）。⇒ 缺陷为纯多 hart 时序类，静态瞪眼与顺序重放
+均不可达，须确定性复现或动态抓捕。
+
+## page_table unmap_range 跨表批量解除算错子表基址
+
+`os/page_table/src/lib.rs` `unmap_range` 对每个递归子表都用初始
+`vpn_start` 推导 `table_base`，未传入该表实际覆盖的 VA 基址——跨
+512 页边界的批量解除会解除错误的 PTE 区间并遗留残留映射，随后归还
+数据帧即形成 UAF。当前唯一调用方 `extend_heap` 回滚逐页调用单页
+unmap，不触发该路径；属潜伏缺陷，接入批量 unmap 前必须修复并补
+跨表测试。
 
 trap/上下文、hart 身份、能力调度与启动发布的已知契约缺口记录在
 `plans/reviews/system-audit/01-sbi.md`、`02-trap-context.md`，统一设计见
