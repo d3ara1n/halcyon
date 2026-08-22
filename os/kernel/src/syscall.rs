@@ -7,7 +7,7 @@
 use num_traits::{FromPrimitive, ToPrimitive};
 use erhino_shared::call::{SystemCall, SystemCallError};
 
-use crate::{context::UserContext, mm::SumGuard, sched, task::Thread};
+use crate::{context::UserContext, sched, task::Thread, uaccess};
 
 /// syscall 处理出口（见 notes/call.md「异步调用」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +43,9 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             if ms == 0 {
                 respond_ok(frame, 0);
             } else {
-                // 登记期限（发起 hart 立即 arm 定时器，唤醒所有权）。
-                sched::sleep_register(ms, thread.process.pid);
+                // 只登记本 hart 意图槽；全局发布由调度循环在线程离开
+                // 执行点后完成（sched::park_publish，唤醒所有权随迁）。
+                sched::park_request_sleep(ms);
                 return Outcome::Wait; // 不前进 sepc，完成唤醒后由帧携带结果
             }
             Outcome::Completed
@@ -73,29 +74,31 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
 fn debug_print(frame: &mut UserContext, thread: &Thread) {
     let ptr = frame.x[10] as usize;
     let len = frame.x[11] as usize;
-    let mut space = thread.process.space.lock();
-    if !space.validate(ptr, len) {
-        drop(space);
+    // 限长先行（防恶意长度），再分配缓冲并拷入。
+    if len > uaccess::MAX_USER_ACCESS {
         respond_error(frame, SystemCallError::MemoryNotAccessible);
         return;
     }
-    // SAFETY: 区间已逐页校验映射且在用户半区内；guard 存活期不重入调度。
-    let _sum = unsafe { SumGuard::open() };
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    let owned = bytes.to_vec();
-    drop(_sum);
+    let mut space = thread.process.space.lock();
+    let mut buf = alloc::vec![0u8; len];
+    if let Err(e) = uaccess::copy_from_user(&mut space, &mut buf, ptr) {
+        drop(space);
+        respond_error(frame, e.into());
+        return;
+    }
+    drop(space);
     let tag = alloc::format!("pid {}", thread.process.pid);
-    match core::str::from_utf8(&owned) {
+    match core::str::from_utf8(&buf) {
         Ok(msg) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("{}", msg)),
         Err(_) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("非 UTF-8 消息 {} 字节", len)),
     }
     respond_ok(frame, len);
 }
 
-/// Extend(pages)：从 brk 起映射页（不要求物理连续），返回新 brk。
-/// 语义沿用旧 ABI：size 参数为页数、返回值为新堆末尾字节地址（rinlib 契约）。
-fn extend_heap(frame: &mut UserContext, thread: &Thread, pages: usize) {
-    match thread.process.space.lock().extend_heap(pages) {
+/// Extend(bytes)：sbrk 语义——申请 bytes 字节，内核取整到页粒度，返回
+/// 新堆顶；bytes = 0 查询当前堆顶。页大小是实现细节，不经 ABI 泄漏。
+fn extend_heap(frame: &mut UserContext, thread: &Thread, bytes: usize) {
+    match thread.process.space.lock().extend_heap(bytes) {
         Ok(brk) => respond_ok(frame, brk),
         Err(_) => respond_error(frame, SystemCallError::OutOfMemory),
     }

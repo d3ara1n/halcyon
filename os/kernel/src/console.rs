@@ -41,6 +41,18 @@ pub fn console_write(args: Arguments<'_>) {
 /// 话题标签宽度（对齐）。
 const TOPIC_WIDTH: usize = 8;
 
+/// 把话题标签空格填充到固定宽度（栈上，零分配）。
+///
+/// 不用 `{:<width$}` 动态宽度：core fmt 的动态宽度取参路径带
+/// `unreachable_unchecked` 前置检查（nightly 实测在嵌套 Arguments 场景
+/// 触发致命 panic），日志路径不值得冒这个险；手动填空格语义等价。
+fn fill_padded<'a>(buf: &'a mut [u8; TOPIC_WIDTH], topic: &str) -> &'a str {
+    let n = topic.len().min(TOPIC_WIDTH);
+    buf[..n].copy_from_slice(&topic.as_bytes()[..n]);
+    // SAFETY: 原标签是 UTF-8，尾部填充是空格，整体必为合法 UTF-8。
+    unsafe { core::str::from_utf8_unchecked(buf) }
+}
+
 /// 等级色（基础调色板，随终端亮暗主题）：颜色只来源于等级——
 /// info 绿、warn 黄、error 红、debug 灰；log! 无等级故无色，
 /// 正文颜色由发送方自行拼入消息。色只染话题头，不染正文。
@@ -50,25 +62,16 @@ pub const COLOR_WARN: &str = "33";
 pub const COLOR_ERROR: &str = "31";
 pub const COLOR_DEBUG: &str = "90";
 
-/// 无色话题行（log!）：`[topic     ] message`，对齐不者色。
+/// 无色话题行（log!）：`[topic     ] message`，对齐不着色。
 pub fn log_topic(topic: &str, args: Arguments<'_>) {
-    console_write(format_args!(
-        "[{:<width$}] {}\n",
-        topic,
-        args,
-        width = TOPIC_WIDTH,
-    ));
+    let mut buf = [b' '; TOPIC_WIDTH];
+    console_write(format_args!("[{}] {}\n", fill_padded(&mut buf, topic), args));
 }
 
 /// 等级话题行（等级宏）：话题头按等级色着色、固定宽度对齐，正文不着色。
 pub fn log_tagged(tag: &str, color: &str, args: Arguments<'_>) {
-    console_write(format_args!(
-        "\x1b[{}m[{:<width$}]\x1b[0m {}\n",
-        color,
-        tag,
-        args,
-        width = TOPIC_WIDTH,
-    ));
+    let mut buf = [b' '; TOPIC_WIDTH];
+    console_write(format_args!("\x1b[{}m[{}]\x1b[0m {}\n", color, fill_padded(&mut buf, tag), args));
 }
 
 

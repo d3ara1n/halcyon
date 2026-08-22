@@ -1,6 +1,6 @@
 //! 锁原语（见 notes/internals.md「锁原语」）。
 //!
-//! - [`RawSpinlock`]：纯 LR/SC 自旋锁，不含中断处理，实现 `lock_api::RawMutex`
+//! - [`RawSpinlock`]：CAS 自旋锁，不含中断处理，实现 `lock_api::RawMutex`
 //!   供 talc 等外部泛型使用（协作式内核内 SIE 恒 0，无需关中断）。
 //! - [`Spinlock<T>`]：内核自用容器，获取期间额外关闭本地中断——
 //!   中断处理路径若触碰本 hart 持有的锁会同核死锁，关中断是正确性要求。
@@ -52,9 +52,8 @@ pub fn restore_interrupts(state: InterruptState) {
     }
 }
 
-/// LR/SC 自旋锁（无中断语义）。
-///
-/// 锁字为 u32 以满足 LR/SC 的字对齐要求。
+/// CAS 自旋锁（无中断语义）。内存序由原子语义背书：acquire 成功路径
+/// Acquire、release Release，跨核临界区可见性不依赖手写栅栏。
 pub struct RawSpinlock {
     locked: AtomicU32,
 }
@@ -68,19 +67,12 @@ impl RawSpinlock {
 
     /// 自旋直到获取。
     fn acquire(&self) {
-        // SAFETY: LR/SC 序列对任意对齐 u32 正确；输出寄存器仅为临时值。
-        unsafe {
-            core::arch::asm!(
-                "1:  lr.w    {tmp}, ({lock})",
-                "    bnez    {tmp}, 1b",
-                "    li      {one}, 1",
-                "    sc.w    {res}, {one}, ({lock})",
-                "    bnez    {res}, 1b",
-                lock = in(reg) self.locked.as_ptr(),
-                tmp = out(reg) _,
-                one = out(reg) _,
-                res = out(reg) _,
-            )
+        while self
+            .locked
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
         }
     }
 
@@ -96,8 +88,6 @@ impl RawSpinlock {
             .is_ok()
     }
 }
-
-// SAFETY: RawSpinlock 仅通过原子与 LR/SC 访问锁字，可跨核共享。
 unsafe impl lock_api::RawMutex for RawSpinlock {
     const INIT: Self = Self::new();
     type GuardMarker = lock_api::GuardNoSend;

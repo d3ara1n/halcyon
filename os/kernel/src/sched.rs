@@ -10,7 +10,6 @@ use core::{
 };
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use erhino_shared::proc::Pid;
 
 use crate::sync::Spinlock;
 use crate::{hart, sbi, trap::{self, Outcome}};
@@ -67,15 +66,93 @@ impl SchedDomain {
 }
 
 // ---------------------------------------------------------------------------
-// 期限表（内核请求的等待对象，见 notes/call.md「异步调用」）
+// 等待模型（notes/call.md「异步调用」）：等待条目 + 代数仲裁 + 发布时序
 // ---------------------------------------------------------------------------
 
-struct Deadline {
-    at: u64,
-    pid: Pid,
+/// 等待凭据：等待条目强持有等待中的线程（线程的强引用随容器走：
+/// 就绪队列 / 执行点循环栈 / 等待条目，见 task.md「单一归属不变量」），
+/// generation 是单次完成与取消仲裁的唯一凭据。
+struct Waiter {
+    thread: Arc<Thread>,
+    generation: u64,
 }
 
-static TIMERS: Spinlock<Vec<Deadline>> = Spinlock::new(Vec::new());
+/// 等待类别。IPC 的 Recv/Tunnel 等待作为新变体横向加入，结构不变。
+#[derive(Clone, Copy)]
+enum WaitKind {
+    Sleep,
+}
+
+/// 期限表条目：到期时间 + 谁在等 + 完成后做什么。
+struct DeadlineEntry {
+    at: u64,
+    waiter: Waiter,
+    kind: WaitKind,
+}
+
+static TIMERS: Spinlock<Vec<DeadlineEntry>> = Spinlock::new(Vec::new());
+
+/// 等待意图类别（HartLocal.park_kind 槽的取值，hart 私有槽无并发）。
+const PARK_NONE: usize = 0;
+const PARK_SLEEP: usize = 1;
+
+/// dispatcher 侧登记：把等待意图写入本 hart 槽。此刻**不碰任何全局
+/// 结构**——发布由调度循环在线程离开执行点之后完成（park_publish），
+/// 保证「可被唤醒」严格晚于「无容器」，完成方永远见不到仍在本 hart
+/// 执行的线程。
+pub fn park_request_sleep(ms: u64) {
+    let me = hart::current();
+    me.park_arg.store(ms as usize, Ordering::Relaxed);
+    // Kind 最后写：与汇编侧「数据先于标记」同一发布纪律。
+    me.park_kind.store(PARK_SLEEP, Ordering::Relaxed);
+}
+
+/// 调度循环 Park 分支调用：消费意图槽，向全局期限表发布等待并 arm。
+/// 发起 hart 即期限主人（唤醒所有权：立即 arm 自己的 timer）。
+fn park_publish(t: &Arc<Thread>) {
+    let me = hart::current();
+    let kind = me.park_kind.swap(PARK_NONE, Ordering::Relaxed);
+    match kind {
+        PARK_SLEEP => {
+            let ms = me.park_arg.load(Ordering::Relaxed) as u64;
+            let generation = t.wait_gen.fetch_add(1, Ordering::AcqRel) + 1;
+            let at = sbi::read_time().saturating_add(ms.saturating_mul(ticks_per_ms()));
+            TIMERS.lock().push(DeadlineEntry {
+                at,
+                waiter: Waiter { thread: t.clone(), generation },
+                kind: WaitKind::Sleep,
+            });
+            arm_earliest();
+        }
+        _ => unreachable!("Park 出口必有等待意图"),
+    }
+}
+
+/// 完成一次等待：代数仲裁（CAS 消费，单次完成）→ 写结果 → 入队。
+/// 线程已死（upgrade 失败）或已被取消/完成（gen 不匹配）则惰性丢弃。
+fn complete(entry: DeadlineEntry) {
+    // 线程强引用随条目而来；gen 不匹配（已被取消/完成）时本函数返回，
+    // 条目连同其 Arc 一并丢弃——若这是最后一份强引用，线程随之消亡
+    //（仅取消场景可能发生；sleep 等待的条目唯一且必被完成）。
+    let t = entry.waiter.thread;
+    if t.wait_gen
+        .compare_exchange(entry.waiter.generation, entry.waiter.generation + 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    match entry.kind {
+        WaitKind::Sleep => {
+            // SAFETY: gen 已消费 ⇒ 该等待恰被本次完成；线程处于 Waiting
+            //（无容器、无 hart 执行——发布时序保证），独占写帧安全。
+            let frame = unsafe { &mut *t.frame_ptr() };
+            frame.x[10] = 0; // NoError
+            frame.x[11] = 0;
+            frame.sepc += 4;
+            enqueue(t);
+        }
+    }
+}
 
 /// 空闲 hart 位图（IPI 门铃的目标集）。
 static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
@@ -99,16 +176,6 @@ pub fn ticks_per_sec() -> u64 {
     ticks_per_ms() * 1000
 }
 
-/// 登记 sleep 期限并立即 arm 本 hart 定时器（唤醒所有权：期限的主人保证闹钟）。
-pub fn sleep_register(ms: u64, pid: Pid) {
-    if ms == 0 {
-        return;
-    }
-    let at = sbi::read_time() + ms * ticks_per_ms();
-    TIMERS.lock().push(Deadline { at, pid });
-    arm_earliest();
-}
-
 /// 把定时器设到期限表最早期限（表空则不动）。
 fn arm_earliest() {
     let timers = TIMERS.lock();
@@ -117,31 +184,17 @@ fn arm_earliest() {
     }
 }
 
-/// 唤醒全部到期线程（锁序单向：期限表锁 → 类锁，先收集后入队）。
+/// 唤醒全部到期等待者（先收集后完成：锁序单向，期限内不做长工作）。
 fn wake_expired() {
     let now = sbi::read_time();
-    let expired: Vec<Pid> = {
+    let due: Vec<DeadlineEntry> = {
         let mut timers = TIMERS.lock();
         let (due, rest): (Vec<_>, Vec<_>) = timers.drain(..).partition(|d| d.at <= now);
         *timers = rest;
-        due.into_iter().map(|d| d.pid).collect()
+        due
     };
-    for pid in expired {
-        // 进程可能已退出（惰性清理：找不到即丢弃过期登记）。
-        if let Some(p) = table::get(pid) {
-            if let Some(t) = p.main_thread() {
-                // sleep 完成动作：写 ecall 响应（a0=NoError、sepc+4）后入队——
-                // Wait 语义下 ecall 未前进，唤醒前补上结果（M4 泛化为内核
-                // 请求的完成回调，见 notes/call.md）。
-                // SAFETY: 线程处于 Waiting（不在任何容器、无 hart 执行），
-                // 经进程表独占引用写其帧安全。
-                let frame = unsafe { &mut *t.frame_ptr() };
-                frame.x[10] = 0; // NoError
-                frame.x[11] = 0;
-                frame.sepc += 4;
-                enqueue(t);
-            }
-        }
+    for entry in due {
+        complete(entry);
     }
 }
 
@@ -200,7 +253,8 @@ pub fn run() -> ! {
         match outcome {
             Outcome::Requeue => FAIR.enqueue(t),
             Outcome::Killed => reap(t),
-            Outcome::Park => {} // 已登记内核请求（单一归属：无容器，等待 wake）
+            // 已离开执行点，此刻发布等待：完成方可安全触达该线程。
+            Outcome::Park => park_publish(&t),
             Outcome::Resume => unreachable!("Resume 不经过调度循环"),
         }
     }
@@ -241,7 +295,7 @@ fn reap(t: Arc<Thread>) {
 /// idle：登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→ wfi。
 /// 醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
 fn idle() {
-    let bit = 1u64 << hart::hartid();
+    let bit = 1u64 << hart::current().slot();
     IDLE_MASK.fetch_or(bit, Ordering::SeqCst);
     // 入队与登记 idle 的交错由双重检查闭合：登记后若已有工作，
     // 说明入队发生在第一次 pick 之后，立即撤销 idle 身份并重试。
@@ -250,7 +304,11 @@ fn idle() {
         return;
     }
     if is_quiescent() {
-        log!(Sched, "系统静默（无唤醒主人），停机");
+        log!(
+            Sched,
+            "系统静默（无唤醒主人），停机；余 {} 帧",
+            crate::frame::free_frames()
+        );
         sbi::shutdown();
     }
 

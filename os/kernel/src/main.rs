@@ -42,6 +42,7 @@ mod sync;
 mod syscall;
 mod task;
 mod trap;
+mod uaccess;
 
 // 汇编布局契约：offset_of! 是唯一真值，经 const operands 注入
 // assembly.asm（见 abi::asm 常量表）。

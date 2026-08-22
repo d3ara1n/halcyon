@@ -34,7 +34,3 @@ pub fn insert(process: Arc<Process>) {
 pub fn remove(pid: Pid) -> Option<Arc<Process>> {
     TABLE.map.lock().remove(&pid)
 }
-
-pub fn get(pid: Pid) -> Option<Arc<Process>> {
-    TABLE.map.lock().get(&pid).cloned()
-}

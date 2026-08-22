@@ -50,6 +50,12 @@ pub mod off {
     pub const FATAL_SP: usize = 96;
     /// per-hart LR/SC reservation 清除槽（dummy SC 目标）。
     pub const RESERVATION: usize = 104;
+    /// 等待意图槽：dispatcher 写入（syscall::dispatch），调度循环在
+    /// clear_context 后的 Park 分支消费发布（sched::park_publish）。
+    /// 发布严格晚于线程离开一切 hart 引用，闭合双容器竞态窗口。
+    pub const PARK_KIND: usize = 112;
+    /// 等待意图参数（如 sleep 的毫秒数）。
+    pub const PARK_ARG: usize = 120;
 }
 
 /// 单个 hart 的私有状态（trap 锚 + 执行点），占一个 cache line。
@@ -88,6 +94,10 @@ pub struct HartLocal {
     fatal_sp: AtomicUsize,
     /// dummy SC 目标（reservation 清除）。
     reservation: AtomicUsize,
+    /// 等待意图类别（0 = 无；语义见 sched::PARK_*）。
+    pub(crate) park_kind: AtomicUsize,
+    /// 等待意图参数。
+    pub(crate) park_arg: AtomicUsize,
 }
 
 impl HartLocal {
@@ -106,11 +116,18 @@ impl HartLocal {
         fp_enabled: ATOMIC_ZERO,
         fatal_sp: ATOMIC_ZERO,
         reservation: ATOMIC_ZERO,
+        park_kind: ATOMIC_ZERO,
+        park_arg: ATOMIC_ZERO,
     };
 
     /// hart 编号。
     pub fn hartid(&self) -> usize {
         self.hartid.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 稠密内核身份（内部位图/索引一律用它，见 registry.rs 模块注释）。
+    pub fn slot(&self) -> usize {
+        self.slot.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// 本 hart 的内核栈顶（boot 期装配；调度循环启动前的兑底栈锚）。
@@ -162,6 +179,8 @@ impl HartLocal {
             .store(0, core::sync::atomic::Ordering::Relaxed);
         self.user_satp
             .store(0, core::sync::atomic::Ordering::Relaxed);
+        self.current_thread.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.fp_enabled.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -184,12 +203,6 @@ pub fn current() -> &'static HartLocal {
     unsafe { asm!("mv {}, tp", out(reg) ptr) };
     // SAFETY: 指向静态数组内本 hart 的槽位，生命周期 'static。
     unsafe { &*ptr }
-}
-
-/// 当前 hart 编号。
-#[inline]
-pub fn hartid() -> usize {
-    current().hartid()
 }
 
 /// 永久停放当前 hart：SIE 关闭下 wfi 等待。致命错误的终态；

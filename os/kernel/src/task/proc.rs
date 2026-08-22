@@ -193,46 +193,83 @@ impl AddressSpace {
         self.alloc_map(USER_TOP - STACK_SIZE, STACK_SIZE / PAGE_SIZE, flags::USER_DATA)
     }
 
-    /// 堆扩展：从 brk 起映射 `pages` 页（逐页取帧，不要求物理连续），
-    /// 返回新 brk。虚拟连续性由「从 brk 起步」结构性保证。
-    /// 新 PTE 对当前 satp 立即生效（进程运行中扩展，无 satp 切换可依赖）。
-    pub fn extend_heap(&mut self, pages: usize) -> Result<usize, SpaceError> {
-        if pages == 0 {
+    /// 堆扩展（sbrk 语义）：申请 `bytes` 字节，内核内部向上取整到页粒度，
+    /// 返回新堆顶（页对齐字节地址）。页大小是实现细节，不经 ABI 泄漏；
+    /// `bytes == 0` 为查询：返回当前堆顶。虚拟连续性由「从 brk 起步」
+    /// 结构性保证；新 PTE 对当前 satp 立即生效。
+    /// 映射事务要么全成要么全无：中途失败回滚本次已映页，brk 不前进。
+    pub fn extend_heap(&mut self, bytes: usize) -> Result<usize, SpaceError> {
+        const MAX_EXTEND_BYTES: usize = 256 << 20;
+        if bytes == 0 {
             return Ok(self.brk);
         }
-        if self.brk + pages * PAGE_SIZE > USER_TOP - STACK_SIZE {
+        if bytes > MAX_EXTEND_BYTES {
             return Err(SpaceError::BadSegment);
         }
-        for i in 0..pages {
-            self.alloc_map(self.brk + i * PAGE_SIZE, 1, flags::USER_DATA)?;
+        let pages = bytes.div_ceil(PAGE_SIZE);
+        let delta = pages.checked_mul(PAGE_SIZE).ok_or(SpaceError::BadSegment)?;
+        let new_brk = self.brk.checked_add(delta).ok_or(SpaceError::BadSegment)?;
+        if new_brk > USER_TOP - STACK_SIZE {
+            return Err(SpaceError::BadSegment);
         }
-        self.brk += pages * PAGE_SIZE;
+        let base_vpn_v = self.brk / PAGE_SIZE;
+        let committed = self.frames.len();
+        for i in 0..pages {
+            if let Err(e) = self.alloc_map(self.brk + i * PAGE_SIZE, 1, flags::USER_DATA) {
+                // 回滚：撤销本次已映页（帧随 FrameTracker 归还帧池），brk 不动。
+                for j in (0..i).rev() {
+                    self.tree.unmap(Vpn(base_vpn_v + j), 1);
+                }
+                self.frames.truncate(committed);
+                return Err(e);
+            }
+        }
+        self.brk = new_brk;
         // SAFETY: sfence.vma 对当前 ASID 冲刷 stale TLB，使新 PTE 可见。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
-        Ok(self.brk)
+        Ok(new_brk)
     }
 
-    /// 校验用户区间 [ptr, ptr+len) 每页均已映射（syscall 访问前置检查）。
-    pub fn validate(&mut self, ptr: usize, len: usize) -> bool {
-        if ptr.checked_add(len).is_none_or(|end| end > USER_TOP) {
-            return false;
+    /// 校验用户区间 [ptr, ptr+len) 逐页可访问：不溢出、不出用户半区、
+    /// 每页已映射且含 U 标志与所需方向权限（读 R / 写 W）。
+    /// 供 [`crate::uaccess`] 前置校验；限长由调用方先行把关。
+    pub(crate) fn check_range(&mut self, ptr: usize, len: usize, writable: bool) -> Result<(), crate::uaccess::AccessError> {
+        use crate::uaccess::AccessError;
+        let Some(end) = ptr.checked_add(len) else {
+            return Err(AccessError::BadRange);
+        };
+        if end > USER_TOP || ptr >= USER_TOP && len == 0 {
+            return Err(AccessError::BadRange);
         }
-        let first = ptr / PAGE_SIZE;
-        let last = (ptr + len.max(1) - 1) / PAGE_SIZE;
-        (first..=last).all(|vpn| self.tree.translate(Vpn(vpn)).is_some())
+        let need = if writable { flags::W } else { flags::R };
+        if len == 0 {
+            return Ok(());
+        }
+        for vpn in ptr / PAGE_SIZE..(end - 1) / PAGE_SIZE + 1 {
+            match self.tree.translate(Vpn(vpn)) {
+                Some(m) => {
+                    if m.flags & flags::U == 0 || m.flags & need == 0 {
+                        return Err(AccessError::Permission);
+                    }
+                }
+                None => return Err(AccessError::NotMapped),
+            }
+        }
+        Ok(())
     }
 }
 
 /// 进程：资源容器（地址空间、父子关系；邮箱/信号/隧道随 IPC 里程碑挂入）。
+///
+/// 所有权方向：线程强持有进程（Thread.process: Arc<Process>）；一切
+/// 「从等待对象/表结构找线程」的反向引用一律持 Weak<Thread>，不在此
+/// 处回指——强引用环会让 reap 永不释放帧。
 pub struct Process {
     pub pid: Pid,
     pub parent: Pid,
     pub space: crate::sync::Spinlock<AddressSpace>,
     /// 信号配置（SignalSet 记录式实现：接受设置，注入/返回语义随信号里程碑交付）。
     pub signal: crate::sync::Spinlock<SignalConfig>,
-    /// 主线程（M3 单线程；多线程里程碑改为线程表）。锁内 Option，
-    /// 设置于装载期，此后只读。
-    main_thread: crate::sync::Spinlock<Option<Arc<Thread>>>,
 }
 
 /// 信号处理配置（rinlib 启动契约：main 前注册 Terminate 处理器）。
@@ -249,13 +286,7 @@ impl Process {
             parent,
             space: crate::sync::Spinlock::new(AddressSpace::new()?),
             signal: crate::sync::Spinlock::new(SignalConfig { mask: 0, handler: 0 }),
-            main_thread: crate::sync::Spinlock::new(None),
         })
-    }
-
-    /// 主线程引用（wake 路径解析）。
-    pub fn main_thread(&self) -> Option<Arc<Thread>> {
-        self.main_thread.lock().clone()
     }
 }
 
@@ -271,13 +302,20 @@ pub struct Thread {
     /// 退出码（Exit / 异常终止共用；回收时打印）。锁内 Option，
     /// 写于本 hart 的退出路径，读于回收（同 hart 顺序发生）。
     pub(crate) exit_code: crate::sync::Spinlock<Option<i64>>,
+    /// 等待代数：每次登记新等待自增；等待条目携带登记时的值，完成方
+    /// 以 CAS(gen → gen+1) 消费——单次完成与取消仲裁的唯一凭据
+    /// （见 sched::complete）。消费后线程离开 Waiting，再次登记得到
+    /// 全新代数，历史条目永不误中。
+    pub(crate) wait_gen: AtomicU64,
     /// 用户执行需求（ELF 判定；eligibility 由 domain 能力另行核验）。
     pub requirement: elf::IsaRequirement,
     frame: UnsafeCell<UserContext>,
 }
 
-// SAFETY: TrapFrame 只在所属线程的执行 hart 上被访问（汇编存帧于线程
-// 挂起在本 hart 期间，syscall 写响应同样处于该区间）；其余字段原子或只读。
+// SAFETY: UserContext 只在两种互斥状态下被访问：线程在本 hart 执行/
+// 挂起期间（trap 路径与 dispatcher 经执行点独占写）；或线程已无容器
+// （Waiting：发布时序保证完成方只见已离开一切 hart 引用的线程，见
+// sched::park_publish）。其余字段原子或只读。
 unsafe impl Sync for Thread {}
 
 impl Thread {
@@ -295,6 +333,7 @@ impl Thread {
             created_tick: sbi::read_time(),
             switches: AtomicU64::new(0),
             exit_code: crate::sync::Spinlock::new(None),
+            wait_gen: AtomicU64::new(0),
             requirement,
             frame: UnsafeCell::new(ctx),
         }
@@ -333,7 +372,6 @@ pub fn spawn_from_elf(pid: Pid, parent: Pid, image: &elf::Elf, file: &[u8]) -> R
         image.entry as usize,
         requirement,
     ));
-    *process.main_thread.lock() = Some(thread.clone());
     super::table::insert(process);
     Ok(thread)
 }

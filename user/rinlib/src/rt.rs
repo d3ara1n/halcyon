@@ -22,28 +22,31 @@ impl HeapRecuse {
 
 unsafe impl Source for HeapRecuse {
     fn acquire<B: Binning>(talc: &mut Talc<Self, B>, layout: Layout) -> Result<(), ()> {
-        let mut count = 1;
-        let single = 4096;
-        while count * single < layout.size() {
-            count *= 2;
-        }
-        let old_end = talc.source.heap_end;
-        if let Ok(offset) = unsafe { sys_extend(count) } {
-            let size = count * single;
-            let new_end = offset as *mut u8;
-            let base = (offset - size) as *mut u8;
-            // SAFETY: [base, offset) 是 sys_extend 刚向内核申请的内存，独占交给分配器；
-            // 首次 claim，之后假设新内存与既有 heap 连续而 extend。
-            let end = if old_end == 0 {
-                unsafe { talc.claim(base, size).expect("initial heap claim failed") }
-            } else {
-                unsafe { talc.extend(NonNull::new(old_end as *mut u8).unwrap(), new_end) }
-            };
-            talc.source.heap_end = end.as_ptr() as usize;
-            Ok(())
+        // sbrk 语义：Extend(0) 查询堆顶，Extend(n) 申请 n 字节返回新堆顶。
+        // 页大小是内核实现细节，用户态只认字节；实际获得区间由前后两次
+        // 堆顶差值得出（含内核取整），不自行推算。
+        let old_end = if talc.source.heap_end != 0 {
+            talc.source.heap_end
         } else {
-            Err(())
+            unsafe { sys_extend(0) }.map_err(|_| ())?
+        };
+        let new_end = unsafe { sys_extend(layout.size()) }.map_err(|_| ())?;
+        if new_end <= old_end {
+            return Err(());
         }
+        let size = new_end - old_end;
+        let base = old_end as *mut u8;
+        // SAFETY: [base, new_end) 是 sys_extend 刚向内核申请的内存，独占交
+        // 给分配器；首次 claim 建区，后续沿旧堆顶向新堆顶 extend。
+        let end = unsafe {
+            if talc.source.heap_end == 0 {
+                talc.claim(base, size).ok_or(())?
+            } else {
+                talc.extend(NonNull::new(old_end as *mut u8).ok_or(())?, new_end as *mut u8)
+            }
+        };
+        talc.source.heap_end = end.as_ptr() as usize;
+        Ok(())
     }
 }
 
@@ -63,17 +66,16 @@ fn lang_start<T: Termination + 'static>(
         env::set_pid(pid);
         env::set_parent_pid(parent);
         let mut talc = HEAP_ALLOCATOR.lock();
-        if let Ok(offset) = sys_extend(INITIAL_HEAP_SIZE) {
-            let start = offset - INITIAL_HEAP_SIZE;
-            // SAFETY: [start, offset) 是 sys_extend 刚申请的内存，交给分配器。
-            if let Some(heap_end) = talc.claim(start as *mut u8, INITIAL_HEAP_SIZE) {
-                talc.source.heap_end = heap_end.as_ptr() as usize;
-            } else {
-                panic!();
-            }
-        } else {
-            panic!();
-        }
+        // sbrk 语义（见 HeapRecuse::acquire）：查询起点、申请 INITIAL_HEAP_SIZE
+        // 字节、以返回值差值为实际获得区间。
+        let start = sys_extend(0).expect("heap base query failed");
+        let end = sys_extend(INITIAL_HEAP_SIZE).expect("initial heap allocation failed");
+        debug_assert!(end > start);
+        // SAFETY: [start, end) 是刚申请的内存，独占交给分配器。
+        let heap_end = talc
+            .claim(start as *mut u8, end - start)
+            .expect("initial heap claim failed");
+        talc.source.heap_end = heap_end.as_ptr() as usize;
     }
     signal::set_handler(SystemSignal::Terminate, default_signal_handler);
     let code = main().to_exit_code();
