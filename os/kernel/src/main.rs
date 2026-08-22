@@ -195,7 +195,6 @@ fn construct_registry(board: &BoardInfo) {
         let top = stack_region_top - slot.0 * stack_size;
         record.emergency_sp = top;
         record.stack_top = top - EMERGENCY_SIZE;
-        record.transition_root_pa = external::transition_root_pa();
     }
     reg.record_mut(reg.slot_of(rt::boot_hartid()).unwrap()).role_boot = 1;
 

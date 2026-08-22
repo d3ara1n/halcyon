@@ -65,8 +65,6 @@ pub struct HartBootRecord {
     pub stack_top: usize,
     /// 本 hart emergency 栈顶（fatal 路径；正式栈区最高页）。
     pub emergency_sp: usize,
-    /// secondary 过渡页表 root 的 PA（satp=Bare 下寻址）；boot hart 为 0。
-    pub transition_root_pa: usize,
     /// 0 = secondary，1 = boot hart。
     pub role_boot: usize,
     _pad1: [usize; 2],
@@ -84,7 +82,6 @@ impl HartBootRecord {
             hart_local: 0,
             stack_top: 0,
             emergency_sp: 0,
-            transition_root_pa: 0,
             role_boot: 0,
             _pad1: [0; 2],
         }
@@ -118,8 +115,7 @@ const _: () = assert!(core::mem::offset_of!(HartBootRecord, entry_high) == 32);
 const _: () = assert!(core::mem::offset_of!(HartBootRecord, hart_local) == 40);
 const _: () = assert!(core::mem::offset_of!(HartBootRecord, stack_top) == 48);
 const _: () = assert!(core::mem::offset_of!(HartBootRecord, emergency_sp) == 56);
-const _: () = assert!(core::mem::offset_of!(HartBootRecord, transition_root_pa) == 64);
-const _: () = assert!(core::mem::offset_of!(HartBootRecord, role_boot) == 72);
+const _: () = assert!(core::mem::offset_of!(HartBootRecord, role_boot) == 64);
 
 // ---------------------------------------------------------------------------
 // HartRegistry：双向 HartId ↔ HartSlot 映射 + record 存储

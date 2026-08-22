@@ -7,7 +7,7 @@
 // 跨空间常量表（布局契约见 assembly.asm `_ENTRY_CONSTS`）。
 unsafe extern "C" {
     #[link_name = "_ENTRY_CONSTS"]
-    static ENTRY_CONSTS: [usize; 10];
+    static ENTRY_CONSTS: [usize; 9];
 }
 
 /// SBI 段物理起点（帧池剔除区间用）。
@@ -28,19 +28,13 @@ pub fn awaken_pa() -> usize {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[3])) }
 }
 
-/// 共享过渡页表 root PA。
-pub fn transition_root_pa() -> usize {
-    // SAFETY: 同上。
-    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[4])) }
-}
-
 /// bootstrap 可回收区间 [start, end)（PA）。
 pub fn bootstrap_range() -> (usize, usize) {
     // SAFETY: 链接期物化的只读常量。
     unsafe {
         (
+            core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[4])),
             core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[5])),
-            core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[6])),
         )
     }
 }

@@ -66,12 +66,11 @@ _ENTRY_CONSTS:
     .quad STACK_SIZE            # [1] 每 hart 栈大小
     .quad HART_NUM_LIMIT        # [2] hart 数上限
     .quad _awaken               # [3] secondary PA 入口
-    .quad __transition_root_pa  # [4] 共享过渡页表 root PA
-    .quad __bootstrap_start     # [5] bootstrap 可回收区间起点
-    .quad __bootstrap_free_end  # [6] bootstrap 可回收区间终点
-    .quad __bootstrap_stack_top # [7] bootstrap 临时栈顶（PA）
-    .quad KERNEL_VA_BASE        # [8] 高半区基址
-    .quad __bootstrap_stack_top # [9] 同 [7]：_start_high 别名换算用
+    .quad __bootstrap_start     # [4] bootstrap 可回收区间起点
+    .quad __bootstrap_free_end  # [5] bootstrap 可回收区间终点
+    .quad __bootstrap_stack_top # [6] bootstrap 临时栈顶（PA）
+    .quad KERNEL_VA_BASE        # [7] 高半区基址
+    .quad __bootstrap_stack_top # [8] 同 [6]：_start_high 别名换算用
 
 .section .text.entry
 .global _pa_fatal
@@ -89,34 +88,21 @@ _ENTRY_PA_CONSTS:
 .section .text.entry
 .global _awaken
 # HSM secondary PA 前导（永久设施）：a0 = hartid，a1 = opaque = record PA。
-# Acquire 消费 record → 幂等补写自己用的两个过渡 PTE → 切过渡 satp →
-# 跳高半区。
+# Acquire 消费 record → 切过渡 satp（只读）→ 跳高半区。
 #
-# 并发纪律：多个 secondary 会同时在 _awaken 内执行，禁止对共享过渡
-# root 做任何先清后写的重建——后来者清零会拆掉先行者脚下的翻译
-# （曾致取指页错→_pa_fatal 静默停放的启动随机停滞）。root 由 cold
-# boot 一次性建成；这里只写恒同值的固定槽位，相同值并发写同一地址
-# 是安全的，无读改写、无擦除。
+# 并发纪律：多个 secondary 会同时在此执行，但过渡表只读——由 cold boot
+# 独占建成，此后任何 hart 不得再写（曾经并发先清后建，后来者清零拆掉
+# 先行者脚下翻译，致取指页错→_pa_fatal 静默停放）。可见性由 record 的
+# Release/Acquire 保证。
 _awaken:
     la      t0, _pa_fatal
     csrw    stvec, t0
 1:  ld      t2, {REC_STATE}(a1)             # 等 record ≥ Starting
-    fence   r, rw                           # acquire 语义（RVWMO）；
-                                            # 同时保证可见 boot 早先写入的过渡 PTE
+    fence   r, rw                           # acquire：保证可见 boot 早先写下的过渡 PTE
     andi    t2, t2, 0xff
     li      t3, 1                           # Starting
     blt     t2, t3, 1b
-    la      t0, __transition_root_pa        # 与 boot 共用的过渡 root
-    la      t3, _BOOT_CONSTS
-    ld      t4, 8(t3)                       # DRAM 槽 vpn2 槽号
-    ld      t5, 0(t3)                       # 跳板 PTE
-    slli    t6, t4, 3
-    add     t6, t0, t6
-    sd      t5, 0(t6)                       # identity（幂等重写，值恒同）
-    addi    t6, t4, 256
-    slli    t6, t6, 3
-    add     t6, t0, t6
-    sd      t5, 0(t6)                       # 高半区别名（同上）
+    la      t0, __transition_root_pa        # 过渡 root（只读）
     srli    t0, t0, 12
     li      t1, 8 << 60
     or      t0, t0, t1
@@ -150,8 +136,8 @@ _start_high:
     la      gp, __global_pointer$           # kernel gp 规范序列
 .option pop
     la      t0, _ENTRY_CONSTS
-    ld      sp, 72(t0)                      # bootstrap 栈顶（PA）
-    ld      t1, 64(t0)                      # KERNEL_VA_BASE
+    ld      sp, 64(t0)                      # bootstrap 栈顶（PA）
+    ld      t1, 56(t0)                      # KERNEL_VA_BASE
     add     sp, sp, t1                      # sp 切到高半区别名：bootstrap 阶段
                                             # 全部地址为规范高半区 VA
     la      t0, _bootstrap_fatal

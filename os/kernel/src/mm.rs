@@ -2,8 +2,8 @@
 //!
 //! 汇编侧机构：`_start` 在 bare satp 下写跳板 root 表（DRAM 槽 identity
 //! + 高半区别名）开 MMU 跳高半区；本模块在高半区构建正式内核页表
-//! （静态 root + 直映射 mega 项）并切换，`KERNEL_SATP` 供 secondary
-//! hart 的 `_awaken_high` 加载同一张表。
+//! （静态 root + 直映射 mega 项）并切换，`KERNEL_SATP` 经 registry 填入
+//! record，secondary 的 `_enter_hart_high` 从 record 加载同一张表。
 //!
 //! 页表模式当前固定 Sv39；按 DTB mmu-type 自动选式是后续工作
 //! （见 notes/mm.md「页表模式选择」）。
@@ -52,8 +52,7 @@ unsafe impl Sync for RootTable {}
 
 static KERNEL_PG_DIR: RootTable = RootTable(UnsafeCell::new([Pte::invalid(); ENTRIES]));
 
-/// 汇编可寻址的内核 satp 值（`_awaken_high` 加载切换）。
-#[unsafe(no_mangle)]
+/// 正式内核 satp 值（init 发布、`kernel_satp()` 消费填 record）。
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 
 /// 构建并启用内核直映射：PA `[0, N GiB)` 以 1GiB mega 项映射到高半区，

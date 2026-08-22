@@ -1,7 +1,7 @@
 //! hart 私有状态（hart 私有层，见 notes/internals.md）。
 //!
 //! 访问不变量：内核态运行期间 `tp ≡ 当前 hart 的 HartLocal 地址`，
-//! 由 `_start_high`/`_awaken_high` 设置、trap 路径维护。
+//! 由 `_enter_hart_high`（两条启动路径的汇合点）设置、trap 路径维护。
 //! HartLocal 只被所属 hart 读写，跨 hart 交互必须走全局层或 IPI。
 //!
 //! HartLocal 同时是 trap 锚：用户态 sscratch 恒指本结构，trap 进出
