@@ -8,8 +8,6 @@ pub type Pid = u32;
 /// Tid(u32) type for thread
 /// If uniform thread-id required, It is uni_tid = ((pid << 32) | tid)
 pub type Tid = u32;
-/// Rid(u64) type for kernel request(Pending)/response(Fed)
-pub type Rid = u64;
 /// SignalMap(u64) for process
 pub type SignalMap = u64;
 
@@ -45,20 +43,6 @@ flags! {
         /// All of them
         All = (ProcessPermission::Valid | ProcessPermission::Process | ProcessPermission::Service | ProcessPermission::Memory | ProcessPermission::Net).bits()
     }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-/// States of process execution unit
-pub enum ExecutionState {
-    /// Can be picked as running
-    Ready,
-    /// Code is being executed
-    Running,
-    /// Waiting for a kernel request
-    Pending(Rid),
-    Fed(Rid),
-    /// Finished, thread would be cleaned up
-    Dead,
 }
 
 /// Process's main function product
