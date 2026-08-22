@@ -76,11 +76,6 @@ fn rust_start<T: Termination + 'static>(
 /// 按 record 角色分流：boot 进入启动收尾；secondary 等待 Ready 后进调度。
 #[unsafe(no_mangle)]
 extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
-    // 已知竞态的临时缓解（见 KNOWN_ISSUES.md「formal-entry 竞态」）：
-    // 此处恰好一次单块 DBCN 写入时系统稳定；移除或改为多次小块写
-    // （如 log_topic 的分块格式化）则 formal-entry 后无输出悬挂。
-    // 看似时序巧合，实为未定位的同步缺口，根因待专项调查。
-    println!("formal entry");
     if let Err(reject) = csr::formal_entry_baseline() {
         match reject {
             csr::CsrReject::Uxl(readback) => {
@@ -199,7 +194,7 @@ extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
             i, frame.x[i],
             i + 1, frame.x[i + 1],
             i + 2, frame.x[i + 2],
-            i + 3.min(31), frame.x[3.min(i + 3)],
+            (i + 3).min(31), frame.x[(i + 3).min(31)],
         );
     }
     let _ = writeln!(RawWriter);

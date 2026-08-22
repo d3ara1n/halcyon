@@ -15,7 +15,7 @@ use dtb::Fdt;
 
 use crate::{
     board::BoardInfo,
-    registry::{HartBootRecord, HartRegistry, HART_NUM_LIMIT},
+    registry::{HartBootRecord, HartRegistry},
 };
 
 // 宏经文本作用域全 crate 可见（#[macro_use]），模块内裸用 log!/println!。
@@ -200,9 +200,4 @@ fn construct_registry(board: &BoardInfo) {
     reg.record_mut(reg.slot_of(rt::boot_hartid()).unwrap()).role_boot = 1;
 
     registry::install(reg);
-}
-
-/// HART_NUM_LIMIT 与链接脚本互校（保持既有契约）。
-pub fn check_hart_limit(link_limit: usize) {
-    assert_eq!(link_limit, HART_NUM_LIMIT, "链接脚本 HART_NUM_LIMIT 与内核不一致");
 }

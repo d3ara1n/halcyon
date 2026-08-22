@@ -159,8 +159,10 @@ _start_high:
 1:  wfi                                     # main 不返回；防御性停驻
     j       1b
 
+.align 2
 .global _bootstrap_fatal
 # bootstrap 阶段 fatal（正式 trap 环境建立前）：最小诊断后停驻。
+# 对齐是硬性要求：本地址会装入 stvec，低位非零会改变 mode 字段。
 _bootstrap_fatal:
     csrr a0, scause
     csrr a1, stval

@@ -25,9 +25,6 @@ pub const SSTATUS_UXL: usize = 0b11 << 32;
 /// FS=Clean（machine.adoc「Extension Context Status」编码 10）：D64 恢复前
 /// 临时开启的档位。Off/Initial/Dirty 不出现在 Rust 侧——稳态 Off 由
 /// OWNED_STATUS_CLEAR/PRE_SRET_CLEAR 覆盖，Dirty 判定在汇编内联完成。
-/// FS=Clean（machine.adoc「Extension Context Status」编码 10）：D64 恢复前
-/// 临时开启的档位。Off/Initial/Dirty 不出现在 Rust 侧——稳态 Off 由
-/// OWNED_STATUS_CLEAR/PRE_SRET_CLEAR 覆盖，Dirty 判定在汇编内联完成。
 pub const FS_CLEAN: usize = 0b10;
 
 /// UXL 值：XLEN=64。
@@ -93,18 +90,22 @@ fn write_scounteren_zero() {
     unsafe { asm!("csrw scounteren, zero", options(nomem)) };
 }
 
-#[inline]
-fn write_senvcfg(v: usize) {
-    // SAFETY: 写回按拥有掩码修改后的值。
-    unsafe { asm!("csrw senvcfg, {v}", v = in(reg) v, options(nomem)) };
-}
-
+// senvcfg 探测/收口的守卫动作（经 csr_try 进入，a0 入参、a0 返回值）：
+// 读：原始值；写读回：写入拥有字段清零后的目标值并返回硬件实际值。
+// 任一步异常都由 csr_try 整体放弃——部分实现的平台（如 sifive_u 模型
+// 可读不可写）不会以裸 trap 形式逃逸出守卫窗口。
 core::arch::global_asm!(
     "
     .section .text
     .align 2
     .global _read_senvcfg
 _read_senvcfg:
+    csrr a0, senvcfg
+    ret
+    .align 2
+    .global _write_read_senvcfg
+_write_read_senvcfg:
+    csrw senvcfg, a0
     csrr a0, senvcfg
     ret
    "
@@ -117,16 +118,24 @@ _read_senvcfg:
 /// 带恢复路径的 CSR 序列探测：执行 `action`，若期间发生异常则放弃整个
 /// 序列并返回 `None`（未实现/不可用），否则返回其返回值。
 ///
-/// 恢复路径依赖 trap 不破坏 s1 与 sp；trap 的 SPIE/SPP 污染由调用方
+/// 调用约定要点：action 是普通 Rust ABI 函数，以 `ret`（经 ra）返回；
+/// 因此跳转前先把 ra 指向成功续段（3:），再无链接跳入 action。若把
+/// 返回地址链入 ra 以外的寄存器（如 `jalr t0`），action 会直接返回到
+/// 本函数的调用者：跳过 stvec/栈恢复、泄漏帧、且调用者把原始 CSR 值
+/// 误读为 `Option` 判别值（曾致 formal-entry 竞态）。
+///
+/// 恢复路径依赖 trap 不破坏 t1 与 sp；trap 的 SPIE/SPP 污染由调用方
 /// （formal entry）末尾重归零值。
 ///
 /// # Safety
-/// `action` 只能执行无副作用的 CSR 读序列。
-pub unsafe fn csr_try(action: unsafe extern "C" fn() -> usize) -> Option<usize> {
+/// `action` 只能执行无副作用的单参数 CSR 序列（a0 入参、a0 返回值），
+/// 不得触碰内存或调用其他函数。
+pub unsafe fn csr_try(action: unsafe extern "C" fn(usize) -> usize, arg: usize) -> Option<usize> {
     let result: usize;
     // SAFETY: 恢复路径在汇编内完成 stvec/sp/ra 还原；异常时直接放弃动作。
     // trap 不换栈，栈上旧 stvec 槽在恢复点仍有效；action 不得触碰
-    // [sp-32, sp) 栈区（当前调用方仅传入纯 CSR 读序列）。
+    // [sp-32, sp) 栈区（当前调用方仅传入纯 CSR 序列）。trap 与成功两条
+    // 路径在共同出口对称退栈，不得提前 ret——外层还有编译器生成的帧。
     unsafe {
         core::arch::asm!(
             "addi sp, sp, -32",
@@ -134,28 +143,27 @@ pub unsafe fn csr_try(action: unsafe extern "C" fn() -> usize) -> Option<usize> 
             "csrr t0, stvec",
             "sd   t0, 16(sp)",
             "la   t0, 2f",
-            "csrw stvec, t0",
-            "jalr t0, 0({action})",        // 成功则返回到这里，a0 = 返回值
-            "j    3f",
+            "csrw stvec, t0",              // 异常恢复向量（direct mode）
+            "la   ra, 3f",                 // action 以 ret（经 ra）返回，先指向成功续段
+            "mv   a0, {arg}",              // 入参经 a0
+            "jr   t1",                     // 无链接进入 action（jalr x0）
             " .align 2",                    // 向量地址必须 4 字节对齐（direct mode）
-            "2:",                          // trap 恢复：弃整个动作
-            "ld   t0, 16(sp)",
-            "csrw stvec, t0",
-            "ld   ra, 24(sp)",
-            "addi sp, sp, 32",
-            "li   {result}, -1",
-            "ret",
+            "2:",
+            "li   {result}, -1",          // trap 恢复：弃整个动作
+            "j    4f",
             "3:",
+            "mv   {result}, a0",          // 成功：a0 = 动作返回值
+            "4:",                          // 共同出口：两路径对称退栈，不提前 ret
             "ld   t0, 16(sp)",
             "csrw stvec, t0",
             "ld   ra, 24(sp)",
             "addi sp, sp, 32",
-            "mv   {result}, a0",
-            action = in(reg) action,
+            in("t1") action,
+            arg = in(reg) arg,
             result = lateout(reg) result,
-            out("t0") _,
-            out("a0") _,                          // 动作返回值 / 恢复路径调试占用
-            out("a7") _,                          // 恢复路径调试 ecall 占用
+            out("t0") _,                          // 向量装填与恢复中转
+            out("a0") _,                          // 动作返回值经 a0 中转
+            out("a7") _,                          // 动作内部可能用作 ecall 号
         );
     }
     (result != usize::MAX).then_some(result)
@@ -163,7 +171,9 @@ pub unsafe fn csr_try(action: unsafe extern "C" fn() -> usize) -> Option<usize> 
 
 unsafe extern "C" {
     #[link_name = "_read_senvcfg"]
-    fn __read_senvcfg() -> usize;
+    fn __read_senvcfg(arg: usize) -> usize;
+    #[link_name = "_write_read_senvcfg"]
+    fn __write_read_senvcfg(arg: usize) -> usize;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +228,12 @@ pub fn formal_entry_baseline() -> Result<(), CsrReject> {
     write_scounteren_zero();
 
     // 环境面：senvcfg 自 privileged 1.12 才存在（sifive_u 等为 1.10），
-    // 未实现的 CSR 不访问——经带恢复路径的探测守卫；实现提供时仅清
-    // 拥有字段并核验，未知/WPRI 位原样保留。
-    if let Some(raw) = unsafe { csr_try(__read_senvcfg) } {
+    // 未实现的 CSR 不访问——读与写读回都在带恢复路径的探测守卫内，
+    // 任一异常视为不可用；实现提供时仅清拥有字段并核验，未知/WPRI
+    // 位原样保留。可读不可写的部分实现同样拒绝（违约即整体失败）。
+    if let Some(raw) = unsafe { csr_try(__read_senvcfg, 0) } {
         let cleared = raw & !SENVCFG_OWNED;
-        write_senvcfg(cleared);
-        if unsafe { csr_try(__read_senvcfg) } != Some(cleared) {
+        if unsafe { csr_try(__write_read_senvcfg, cleared) } != Some(cleared) {
             return Err(CsrReject::Senvcfg);
         }
     }

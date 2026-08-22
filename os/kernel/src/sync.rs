@@ -12,6 +12,8 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use crate::csr::SSTATUS_SIE;
+
 /// 获取前的本地中断状态。
 #[must_use]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,12 +29,12 @@ pub fn disable_interrupts() -> InterruptState {
         core::arch::asm!(
             "csrrc {old}, sstatus, {mask}",
             old = out(reg) old,
-            mask = in(reg) 0b10,
+            mask = in(reg) SSTATUS_SIE,
             options(nomem)
         )
     }
     InterruptState {
-        sie_was_enabled: old & 0b10 != 0,
+        sie_was_enabled: old & SSTATUS_SIE != 0,
     }
 }
 
@@ -43,7 +45,7 @@ pub fn restore_interrupts(state: InterruptState) {
         unsafe {
             core::arch::asm!(
                 "csrrs x0, sstatus, {mask}",
-                mask = in(reg) 0b10,
+                mask = in(reg) SSTATUS_SIE,
                 options(nomem)
             )
         }
