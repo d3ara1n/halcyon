@@ -269,25 +269,22 @@ _fatal_entry:
 2:  wfi                                     # 二次 fatal：首帧已是证据，
     j       2b                              # 无栈停驻等待复位
 1:
-    sd      a0, {HL_SCRATCH}(tp)            # 抢救原始 a0/a1/sp
-    sd      a1, {HL_SCRATCH2}(tp)
+    # a0/a1 直接入帧，不复用入口槽——槽内是入口序列抢救的原 t5/t6。
     sd      sp, {HL_FATAL_SP}(tp)
     ld      sp, {HL_EMERGENCY_SP}(tp)
     addi    sp, sp, -{FF_SIZE}
-    mv      a0, sp                          # &FatalFrame（x10 记录机制值）
+    sd      a0, {FF_X10}(sp)
+    sd      a1, {FF_X11}(sp)
+    mv      a0, sp                          # &FatalFrame
     .irp i, 1,3,4,5,6,7,8,9,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29
     sd      x\i, ({FF_X0} + 8*\i)(a0)
     .endr
-    ld      t0, {HL_SCRATCH}(tp)
-    sd      t0, {FF_X10}(a0)                # 原 a0
-    ld      t0, {HL_SCRATCH2}(tp)
-    sd      t0, {FF_X11}(a0)                # 原 a1
     ld      t0, {HL_FATAL_SP}(tp)
     sd      t0, {FF_X2}(a0)                 # 原 sp
     ld      t0, {HL_SCRATCH}(tp)
-    sd      t0, {FF_X30}(a0)                # 入口序列后的 t5（机制值）
-    csrr    t0, sscratch
-    sd      t0, {FF_X31}(a0)                # 原 t6（经 sscratch 中转）
+    sd      t0, {FF_X30}(a0)                # 原 t5（入口槽 1）
+    ld      t0, {HL_SCRATCH2}(tp)
+    sd      t0, {FF_X31}(a0)                # 原 t6（入口槽 2）
     csrr    t0, scause
     sd      t0, {FF_SCAUSE}(a0)
     csrr    t0, stval
