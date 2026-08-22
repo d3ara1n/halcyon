@@ -93,5 +93,20 @@ run_qemu_dump_dtb:
 virt:
     @just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
 
+# sifive_u 无 shutdown 设备：负载完成后 QEMU 不自退出，运行阶段以 timeout
+# 收束（AGENTS.md：运行阶段硬上限 10s）；通过与否以日志关键行人工判定
+# （全员回收 / [Sched] 系统静默）。
 sifive_u:
-    @just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu -smp cores=5
+    @just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_timed -smp cores=5
+
+[private]
+run_qemu_timed +OPTIONS: make_dtb build_kernel
+    #!/usr/bin/env bash
+    set +e
+    timeout 10 {{QEMU_LAUNCH}} {{OPTIONS}}
+    code=$?
+    if [ "$code" -eq 124 ]; then
+        echo -e "\033[0;33msifive_u: 运行阶段超时收束（平台无 shutdown 设备）；请核对上方日志关键行\033[0m"
+        exit 0
+    fi
+    exit "$code"

@@ -46,6 +46,7 @@ plans/     compass.md（跨会话导航：方向/位置/戒律）+ 考古与教�
   ```
   Co-Authored-By: <实际模型显示名> <对应 provider 的 noreply 邮箱>
   ```
+  不确定自己是什么模型时直接问用户，不猜测；模型没有对应邮箱时缺省用 `noreply@pi.dev`，不得伪造真实 provider 域名。
 - 设计取舍记录在 notes/，不要在代码里留「原来是 A 改成 B」式的历史注释，追溯看 git log。
 
 ## 设计原则
