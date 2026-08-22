@@ -2,18 +2,21 @@
 
 记录会随时间消灭的问题，修复后删除条目；持久性约定在 AGENTS.md。
 
-## qemu sifive_u 静默判定不收敛
+## sifive_u 非确定性内核野跳转
 
-四服务负载在 `sifive_u` 5 核下能全部装载、运行并回收（4 hart Online、四个
-pid 全部 reap），但 `[Sched] 系统静默` 判定不触发，QEMU 停不下来（该平台本
-就无 shutdown 设备）。历史上更严重的「服务未完成即随机停滞」样本，其启动期
-成因（过渡页表并发清零竞态）已于 2026-08 修复，见
-`plans/2026-08-execution-context-stall.md`；剩余问题定位在 idle/静默谓词与
-5-hart 收敛路径，尚未归因。
+四服务负载在 sifive_u 5 核下能全部装载、运行并回收，静默判定与 SRST
+停机在多数轮次收敛（2026-09 地基工程后；此前的两大根因——IDLE_MASK
+slot/raw 混用、Extend 单位错配引发的 OOM 自锁——已修复，见
+`plans/2026-09-pre-ipc-groundwork.md`）。
 
-QEMU monitor 样本曾显示未完成进程仍在用户态分配器/原子路径执行，PC 会变化，
-未见内核 trap。trap/上下文、hart 身份、能力调度与启动发布的已知契约缺口记录
-在 `plans/reviews/system-audit/01-sbi.md`、`02-trap-context.md`，统一设计见
+剩余问题：约 1/3 轮次出现 S 态致命 trap——**cause=0xc（取指页故障）、
+stval=0x0、sepc=0x0** 的内核野跳转，所在 hart 停驻进而阻塞静默收敛。
+完整 GPR 转储可由 fatal 路径取得，直接证据已在手，待专项归因。历史
+启动期成因（过渡页表并发清零竞态）已于 2026-08 修复，见
+`plans/2026-08-execution-context-stall.md`。
+
+trap/上下文、hart 身份、能力调度与启动发布的已知契约缺口记录在
+`plans/reviews/system-audit/01-sbi.md`、`02-trap-context.md`，统一设计见
 `notes/execution-context.md`。在取得直接证据前不得添加平台专用补丁。
 `just sifive_u` 已内置运行阶段超时收束，通过与否看日志关键行。
 

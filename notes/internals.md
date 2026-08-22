@@ -93,7 +93,7 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 ## 锁原语
 
-内核自研 Spinlock：LR/SC 争用，持有期间关本地中断（sstatus.SIE 清零）。关中断是正确性要求而非优化——中断处理函数若获取本 hart 正持有的锁，同核死锁。
+内核自研 Spinlock：原子 CAS 争用（acquire 成功路径 Acquire、release Release，内存序由原子语义背书），持有期间关本地中断（sstatus.SIE 清零）。关中断是正确性要求而非优化——中断处理函数若获取本 hart 正持有的锁，同核死锁。
 
 Spinlock 包装为 `lock_api::RawMutex`，同一实现注入两处：
 
