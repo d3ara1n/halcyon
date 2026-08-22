@@ -89,32 +89,34 @@ _ENTRY_PA_CONSTS:
 .section .text.entry
 .global _awaken
 # HSM secondary PA 前导（永久设施）：a0 = hartid，a1 = opaque = record PA。
-# Acquire 消费 record → 写共享过渡表（幂等）→ 切过渡 satp → 跳高半区。
+# Acquire 消费 record → 幂等补写自己用的两个过渡 PTE → 切过渡 satp →
+# 跳高半区。
+#
+# 并发纪律：多个 secondary 会同时在 _awaken 内执行，禁止对共享过渡
+# root 做任何先清后写的重建——后来者清零会拆掉先行者脚下的翻译
+# （曾致取指页错→_pa_fatal 静默停放的启动随机停滞）。root 由 cold
+# boot 一次性建成；这里只写恒同值的固定槽位，相同值并发写同一地址
+# 是安全的，无读改写、无擦除。
 _awaken:
     la      t0, _pa_fatal
     csrw    stvec, t0
 1:  ld      t2, {REC_STATE}(a1)             # 等 record ≥ Starting
-    fence   r, rw                           # acquire 语义（RVWMO）
+    fence   r, rw                           # acquire 语义（RVWMO）；
+                                            # 同时保证可见 boot 早先写入的过渡 PTE
     andi    t2, t2, 0xff
     li      t3, 1                           # Starting
     blt     t2, t3, 1b
     la      t0, __transition_root_pa        # 与 boot 共用的过渡 root
-    li      t1, 4096
-    add     t1, t0, t1
-    mv      t2, t0
-2:  sd      zero, 0(t2)
-    addi    t2, t2, 8
-    bltu    t2, t1, 2b
     la      t3, _BOOT_CONSTS
     ld      t4, 8(t3)                       # DRAM 槽 vpn2 槽号
     ld      t5, 0(t3)                       # 跳板 PTE
     slli    t6, t4, 3
     add     t6, t0, t6
-    sd      t5, 0(t6)
+    sd      t5, 0(t6)                       # identity（幂等重写，值恒同）
     addi    t6, t4, 256
     slli    t6, t6, 3
     add     t6, t0, t6
-    sd      t5, 0(t6)
+    sd      t5, 0(t6)                       # 高半区别名（同上）
     srli    t0, t0, 12
     li      t1, 8 << 60
     or      t0, t0, t1
