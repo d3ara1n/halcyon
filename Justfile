@@ -52,7 +52,7 @@ clean:
     fi
     cargo clean --manifest-path os/Cargo.toml
 
-artifact_dir: 
+artifact_dir:
     #!/usr/bin/env bash
     if [ ! -d "artifacts" ]; then
     	mkdir artifacts
@@ -111,7 +111,7 @@ clean-qemu *args:
 run_qemu_timed +OPTIONS: make_dtb build_kernel
     #!/usr/bin/env bash
     set +e
-    timeout --foreground 10 {{QEMU_LAUNCH}} {{OPTIONS}}
+    timeout --foreground 4 {{QEMU_LAUNCH}} {{OPTIONS}}
     code=$?
     if [ "$code" -eq 124 ]; then
         echo -e "\033[0;33msifive_u: run phase timed out (platform has no shutdown device); verify key log lines above\033[0m"
