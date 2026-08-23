@@ -103,7 +103,7 @@ sifive_u:
 run_qemu_timed +OPTIONS: make_dtb build_kernel
     #!/usr/bin/env bash
     set +e
-    timeout 10 {{QEMU_LAUNCH}} {{OPTIONS}}
+    timeout --foreground 10 {{QEMU_LAUNCH}} {{OPTIONS}}
     code=$?
     if [ "$code" -eq 124 ]; then
         echo -e "\033[0;33msifive_u: 运行阶段超时收束（平台无 shutdown 设备）；请核对上方日志关键行\033[0m"
