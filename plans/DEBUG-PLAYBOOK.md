@@ -2,7 +2,7 @@
 
 非确定性损坏/挂起类问题的调查方法论。源自 sifive_u 野跳转归因
 （2026-08 ~ 09，三天，最终根因为 `free_subtree` 巨型栈帧越界）；
-工具级坑位见 `plans/tooling-pitfalls.md`，本篇只记方法。
+工具级坑位见 `plans/TOOLING-PITFALLS.md`，本篇只记方法。
 
 ## 流程
 
@@ -49,7 +49,7 @@ hart 当时在干什么才是随机场。资源量敏感的现象，先做静态
   `sub sp,sp,N` 合计），对照栈预算；debug 构建帧远大于 release，
   `[T; 512]` 这类按值拷贝是大帧头号来源；
 - Rust 没有 `-Wframe-larger-than` 等价物，构建期审计靠 objdump
-  （扩展点：`os/tools/audit_elf.py`），见 `plans/2026-09-stack-guard.md` 方案 C。
+  （扩展点：`os/tools/audit_elf.py`），见 `plans/todo-2026-09-stack-guard.md` 方案 C。
 
 静态尺寸审计成本分钟级，应排在任何动态取证之前。
 

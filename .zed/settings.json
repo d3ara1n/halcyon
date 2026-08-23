@@ -9,7 +9,15 @@
           "setTest": false
         },
         "check": {
-          "allTargets": false
+          "allTargets": false,
+          // os/ 内核构建需要 build-std，但 config 不能全局开启（host 测试会
+          // 与 sysroot 的 core/alloc 重复，见 os/.cargo/config.toml 注释），
+          // 平时靠 Justfile 注入。extraEnv 只作用于 RA 自己的 cargo check，
+          // CLI/测试不受影响；对 user/ 与其 config 内的 build-std 重复无害。
+          "extraEnv": {
+            "CARGO_UNSTABLE_BUILD_STD": "core,alloc",
+            "CARGO_UNSTABLE_BUILD_STD_FEATURES": "compiler-builtins-mem"
+          }
         }
       }
     }

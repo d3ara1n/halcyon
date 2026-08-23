@@ -22,7 +22,7 @@ os/        内核 workspace：
 shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、FAL 接口、同步原语）
 user/      用户态 workspace（rinlib、systems/、frameworks/、drivers/）
 notes/     设计文档（架构事实来源）
-plans/     compass.md（跨会话导航：方向/位置/戒律）+ 考古与教训档案（按需参考，非任务）
+plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（跨会话导航）
 ```
 
 对照负载：`user/systems/` + `user/drivers/` 的四个服务（fs/init/pm/drv_spi_sifive）是集成验证负载，其中 fs 依赖 FAL——fs「干净被杀」（用户态 panic → 退出回收，内核不崩）是其依赖面就绪前的达标线。
@@ -48,6 +48,16 @@ plans/     compass.md（跨会话导航：方向/位置/戒律）+ 考古与教�
   ```
   不确定自己是什么模型时直接问用户，不猜测；模型没有对应邮箱时缺省用 `noreply@pi.dev`，不得伪造真实 provider 域名。
 - 设计取舍记录在 notes/，不要在代码里留「原来是 A 改成 B」式的历史注释，追溯看 git log。
+
+### plans/ 命名纪律
+
+文件名即性质，从名字直接读出生命周期，不靠打开内容判断：
+
+- **全大写**（`COMPASS.md`、`DEBUG-PLAYBOOK.md`、`TOOLING-PITFALLS.md`）：常驻手册，长期有效、经常阅读；
+- **`todo-<日期>-<主题>.md`**：待实施计划。完成后归档，有留存价值的结论转 notes/ 或 KNOWN_ISSUES；
+- **`<类型>-<日期>-<主题>.md`**：调查复盘与参考资料（现有类型 `review-` 调查归档、`ref-` 对照资料），只读；
+- **`archived/`**：已结束且无留存价值的计划尸体，只进不出；
+- 新类型前缀按需增设，但必须能一句话说清其生命周期；不引入需要枚举场景才能维持的分类。
 
 ## 设计原则
 

@@ -84,7 +84,7 @@ PTE。多个 secondary 被 HSM 近乎同时唤醒并发执行该段——后来�
 
 ## 工具用法与坑
 
-见 `plans/tooling-pitfalls.md`（集中维护的踩坑记录，本次新坑已并入）。
+见 `plans/TOOLING-PITFALLS.md`（集中维护的踩坑记录，本次新坑已并入）。
 
 ## 遗留
 

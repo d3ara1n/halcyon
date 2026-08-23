@@ -2,7 +2,7 @@
 
 > 持续累积的踩坑记录：每次调试新踩的坑合并进来，避免重复踩。
 > 案例级的前因后果见各 dated postmortem（如
-> `2026-08-execution-context-stall.md`），本文件只收可复用的经验。
+> `review-2026-08-execution-context-stall.md`），本文件只收可复用的经验。
 
 ## 排查手法优先级
 
@@ -48,6 +48,12 @@
   都不得提前 ret，trap 与成功路径汇聚同一出口对称退栈。
 - objdump 显示 `.insn 4, 0x…` 是 CSR 名不认识：手动解码 bits[31:20]
   即 CSR 地址（如 senvcfg=0x10A）。
+- **编辑器 LSP 检查内核需自行注入 build-std**：os/ 的 config 不能全局
+  开 build-std（host 测试与 sysroot 的 core/alloc 重复，E0152 实测），
+  CLI 走 Justfile 注入；编辑器侧各自配——Zed 用 `.zed/settings.json`
+  的 check.extraEnv 设 `CARGO_UNSTABLE_BUILD_STD`（只作用于 RA 自己的
+  cargo check），否则内核 crate 全线 E0463「can't find crate for core」。
+  换编辑器时按同思路配 LSP。
 
 ## 平台差异实证
 
