@@ -1,4 +1,4 @@
-//! Hart 身份与启动发布（notes/execution-context.md「Bootstrap 与正式环境」
+//! Hart 身份与启动发布（notes/impls/execution-context.md「Bootstrap 与正式环境」
 //! 「身份、能力与拓扑」）。
 //!
 //! 三种事实互不混用：[`HartId`] 是 DT/SBI 的 raw hartid，可稀疏；

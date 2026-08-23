@@ -1,5 +1,5 @@
 //! 持久执行现场的三个容器：UserContext、FatalFrame、SchedulerFrame。
-//! 三者不复用（notes/execution-context.md「布局的单一真值」）。
+//! 三者不复用（notes/impls/execution-context.md「布局的单一真值」）。
 //!
 //! 所有被汇编访问的字段偏移以本文件的 `offset_of!` 为唯一真值，
 //! 经 `global_asm!` const operands 注入（见 assembly 侧引用）；

@@ -1,4 +1,4 @@
-//! hart 私有状态（hart 私有层，见 notes/internals.md）。
+//! hart 私有状态（hart 私有层，见 notes/impls/internals.md）。
 //!
 //! 访问不变量：内核态运行期间 `tp ≡ 当前 hart 的 HartLocal 地址`，
 //! 由 `_enter_hart_high`（两条启动路径的汇合点）设置、trap 路径维护。
@@ -185,7 +185,7 @@ impl HartLocal {
 }
 
 /// tp 指向的数组，`HART_SETUP` 按 hartid 索引。每个元素只被所属 hart 经 tp 访问
-/// （访问纪律见 notes/internals.md）；字段为原子类型，静态声明无需 unsafe。
+/// （访问纪律见 notes/impls/internals.md）；字段为原子类型，静态声明无需 unsafe。
 #[unsafe(no_mangle)]
 static HART_LOCALS: [HartLocal; HART_NUM_LIMIT] = [HartLocal::ZERO; HART_NUM_LIMIT];
 

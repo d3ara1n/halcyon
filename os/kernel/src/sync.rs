@@ -1,4 +1,4 @@
-//! 锁原语（见 notes/internals.md「锁原语」）。
+//! 锁原语（见 notes/impls/internals.md「锁原语」）。
 //!
 //! - [`RawSpinlock`]：CAS 自旋锁，不含中断处理，实现 `lock_api::RawMutex`
 //!   供 talc 等外部泛型使用（协作式内核内 SIE 恒 0，无需关中断）。

@@ -1,4 +1,4 @@
-//! 内核堆（见 notes/internals.md「堆分配器」、notes/mm.md「帧池」）。
+//! 内核堆（见 notes/impls/internals.md「堆分配器」、notes/impls/mm.md「帧池」）。
 //!
 //! talc 经 [`FrameSource`] 按需供血：堆耗尽时从帧池取 1 MiB 连续帧块
 //! 建立新堆区（talc 支持多块不连续区域）。帧块所有权随 claim 转移给

@@ -1,5 +1,5 @@
 //! CSR 所有权：formal hart entry、内核稳态与用户出口三个边界集中拥有
-//! 全部项目依赖字段（notes/execution-context.md「Trap 与 CSR」）。
+//! 全部项目依赖字段（notes/impls/execution-context.md「Trap 与 CSR」）。
 //!
 //! 原则：字段级操作，不整写 WPRI；未知/WPRI 位保持原值；WARL 字段写后
 //! 读回核验，违约即拒绝该 hart（启动整体失败）。未 advertised 的可选
@@ -180,7 +180,7 @@ unsafe extern "C" {
 // 边界程序
 // ---------------------------------------------------------------------------
 
-/// formal entry 的 CSR 基线（notes/execution-context.md「CSR 所有权表」
+/// formal entry 的 CSR 基线（notes/impls/execution-context.md「CSR 所有权表」
 /// 「formal hart entry」列）：
 ///
 /// - `sie` 精确为 SSIE|STIE；SSIP 清零；timer 先经 SBI TIME 卸载；

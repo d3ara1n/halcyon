@@ -1,4 +1,4 @@
-//! 进程表：全局层容器（见 notes/internals.md「进程表」）。
+//! 进程表：全局层容器（见 notes/impls/internals.md「进程表」）。
 //!
 //! 封装 `Spinlock<BTreeMap>`，只暴露 get/insert/remove；pid 单调分配不复用。
 //! 内部实现可替换（slot array 等），调用方无感。

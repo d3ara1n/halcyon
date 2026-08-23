@@ -1,4 +1,4 @@
-//! 用户浮点状态与 F/D 汇编 helper（notes/execution-context.md「用户上下文与 FP」）。
+//! 用户浮点状态与 F/D 汇编 helper（notes/impls/execution-context.md「用户上下文与 FP」）。
 //!
 //! `FpState` 是用户可见 FP 持久状态的唯一容器，创建时完整清零——不存在
 //! 依赖 hart 残留的 valid 状态。save/restore 是只有 eligible hart 才能

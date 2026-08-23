@@ -1,4 +1,4 @@
-//! syscall 分发（notes/call.md）：a7 调用号、a0–a5 参数；
+//! syscall 分发（notes/impls/call.md）：a7 调用号、a0–a5 参数；
 //! 返回 a0 = 错误码（0 = NoError）、a1 = 返回值，sepc 前进 4。
 //!
 //! 出口三值 `Outcome`——同步调用 Completed；异步调用登记内核请求后 Wait
@@ -9,7 +9,7 @@ use erhino_shared::call::{SystemCall, SystemCallError};
 
 use crate::{context::UserContext, sched, task::Thread, uaccess};
 
-/// syscall 处理出口（见 notes/call.md「异步调用」）。
+/// syscall 处理出口（见 notes/impls/call.md「异步调用」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// 结果已写入 UserContext，Resume 回用户态。
