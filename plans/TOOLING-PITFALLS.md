@@ -29,6 +29,17 @@
   while the target is running"：把序列拆短、输出重定向到文件、外层用
   timeout 包住 gdb 自身。
 
+## CPU 节流（tools/qemu-throttle.sh）
+
+- `just virt` 默认节流到 50% CPU（Justfile `THROTTLE`）：guest 跑飞/panic 时 QEMU
+  满核空转的兜底——QEMU 无内置 CPU 限制参数（`-icount` 对死循环无效），靠 OS 层
+  SIGSTOP/SIGCONT 冻结进程实现，对 guest 透明（感知为时间暂停）。
+- **调试（gdb -s）务必 `THROTTLE=100` 全速**：节流 = 周期性冻结整个 QEMU，
+  gdb 交互一卡一卡、`-icount` 复现时序也被拖慢。
+- 节流档下 QEMU 被后台化，终端 Ctrl-C 不再直达 guest（脚本捕获后清理退出）。
+- 脚本退出/被杀必先 SIGCONT 解冻再清理，仅 SIGKILL 才可能残留 STOP 态
+  （进程活着但完全不动），`kill -CONT <pid>` 解冻。
+
 ## 输出与日志
 
 - **stdout 经管道/文件是缓冲的**：SIGTERM 杀 QEMU 丢失未刷出的尾部输出。
