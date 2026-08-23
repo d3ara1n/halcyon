@@ -40,14 +40,14 @@ impl FrameMemory for Mem {
     }
     fn free_frame(&mut self, frame: FrameNumber) {
         let in_live = with_ledger(|l| l.live.take(&(frame.0 as u64))).is_some();
-        assert!(in_live, "释放未持有帧 {:#x}（live 集合中不存在）", frame.0);
+        assert!(in_live, "freed unheld frame {:#x} (absent from live set)", frame.0);
         let p = LEDGER2.lock().unwrap().as_mut().unwrap().0.remove(&(frame.0 as u64));
-        assert!(p.is_some(), "释放无存储的帧 {:#x}", frame.0);
+        assert!(p.is_some(), "freed frame without storage {:#x}", frame.0);
         unsafe { drop(Box::from_raw(p.unwrap())) };
     }
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [page_table::Pte; 512] {
         let mut g = LEDGER2.lock().unwrap();
-        let t = g.as_mut().unwrap().0.get_mut(&(frame.0 as u64)).expect("访问未持有表");
+        let t = g.as_mut().unwrap().0.get_mut(&(frame.0 as u64)).expect("accessed unheld table");
         unsafe { &mut **t }
     }
 }
@@ -79,6 +79,6 @@ fn drop_chain_accounting() {
     } // Drop：递归释放全部表帧
 
     with_ledger(|l| {
-        assert!(l.live.is_empty(), "泄漏的表帧: {:?}", l.live);
+        assert!(l.live.is_empty(), "leaked table frames: {:?}", l.live);
     });
 }

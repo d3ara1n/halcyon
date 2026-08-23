@@ -40,7 +40,7 @@ fn parse_load_segments_sorted() {
     let elf = parse(&buf).unwrap();
     assert_eq!(elf.entry, 0x1000);
     assert_eq!(elf.segments.len(), 2);
-    assert_eq!(elf.segments[0].vaddr, 0x1000, "按 vaddr 排序");
+    assert_eq!(elf.segments[0].vaddr, 0x1000, "segments sorted by vaddr");
     assert_eq!(elf.segments[1].vaddr, 0x2000);
     assert_eq!(elf.segments[0].memsz, 8192, "BSS = memsz - filesz");
     assert_eq!(elf.segments[0].offset, 0);

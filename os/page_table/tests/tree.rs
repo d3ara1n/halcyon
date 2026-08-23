@@ -53,7 +53,7 @@ impl FrameMemory for MockFrames {
 type Tree = TableTree<MockFrames, 3>;
 
 fn tree(counters: &Rc<Counters>) -> Tree {
-    Tree::new(MockFrames::new(counters.clone())).expect("建树失败")
+    Tree::new(MockFrames::new(counters.clone())).expect("failed to build tree")
 }
 
 /// mm-map-bug 数值原案：未对齐起点跨多张表的 32MB 区间（8192 页）。
@@ -66,13 +66,13 @@ fn big_unaligned_cross_table() {
 
     // 抽查边界与中段：物理连续、全部可译
     for vpn in [65, 66, 511, 512, 513, 4096, 8256, 8257 - 1] {
-        let m = t.translate(Vpn(vpn)).expect("应当已映射");
+        let m = t.translate(Vpn(vpn)).expect("expected mapped");
         assert_eq!(m.ppn.0, ppn + (vpn - start), "vpn={}", vpn);
         assert_eq!(m.flags, flags::USER_DATA);
     }
     assert!(t.translate(Vpn(start + count)).is_none());
     drop(t);
-    assert_eq!(counters.live.get(), 0, "表帧未全部归还");
+    assert_eq!(counters.live.get(), 0, "table frames not fully returned");
 }
 
 /// 表对齐 + 物理对齐 → 2MiB mega。
@@ -82,7 +82,7 @@ fn table_aligned_creates_mega() {
     let mut t = tree(&counters);
     t.map(Vpn(512 * 3), 512, Ppn(512 * 7), flags::KERNEL_DIRECT).unwrap();
     let m = t.translate(Vpn(512 * 3 + 123)).unwrap();
-    assert_eq!(m.level, 1, "应落在 2MiB mega");
+    assert_eq!(m.level, 1, "expected 2MiB mega level");
     assert_eq!(m.ppn.0, 512 * 7 + 123);
 }
 
@@ -234,7 +234,7 @@ fn drop_frees_all_frames() {
         t.map(Vpn(0), 1, Ppn(1), flags::USER_RODATA).unwrap();
         assert!(counters.live.get() > 1);
     }
-    assert_eq!(counters.live.get(), 0, "表帧未全部归还");
+    assert_eq!(counters.live.get(), 0, "table frames not fully returned");
 }
 
 /// clear_slots 只清槽位、不递归回收：被剥离分支的子树帧仍记账为存活，
@@ -257,11 +257,12 @@ fn clear_slots_detaches_without_recursion() {
     }
 
     // 剥离槽位：不归还任何帧，翻译随之消失。
+    // 记账：root(1) + 用户映射的中间表/叶表(2) + 手工 sub/leaf(2) = 5。
     t.clear_slots(FrameNumber(0), 500, 501);
-    assert_eq!(counters.live.get(), 3, "剥离不得归还子树帧");
-    assert!(t.translate(Vpn(500 * 512 + 7)).is_none(), "剥离后应不可译");
+    assert_eq!(counters.live.get(), 5, "detach must not return subtree frames");
+    assert!(t.translate(Vpn(500 * 512 + 7)).is_none(), "detached slot must not translate");
 
     // Drop 后只回收用户侧帧；外部子树的 2 帧归调用方所有，仍存活。
     drop(t);
-    assert_eq!(counters.live.get(), 2, "Drop 不得回收已剥离的内核子树");
+    assert_eq!(counters.live.get(), 2, "Drop must not reclaim detached kernel subtree");
 }

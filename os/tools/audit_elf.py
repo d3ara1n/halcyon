@@ -111,7 +111,7 @@ def scan_frames(disasm: str) -> list[tuple[str, int, str]]:
 
 
 def fail(msg: str) -> None:
-    print(f"审计失败: {msg}")
+    print(f"audit failed: {msg}")
     sys.exit(1)
 
 
@@ -132,15 +132,15 @@ def main() -> None:
         [READELF, "-h", elf], capture_output=True, text=True, check=True
     ).stdout
     if "ELF64" not in header:
-        fail("非 ELF64")
+        fail("not an ELF64 binary")
     if "RISC-V" not in header:
-        fail("非 RISC-V")
+        fail("not a RISC-V binary")
     flags_line = next(
         line for line in header.splitlines() if line.strip().startswith("Flags:")
     )
     if "soft-float" not in flags_line:
         # LP64 整数 ABI 是内核基线；double/single ABI 直接违约。
-        fail(f"内核必须为 soft-float (LP64) ABI：{flags_line.strip()}")
+        fail(f"kernel must be soft-float (LP64) ABI: {flags_line.strip()}")
 
     # ---- FP 指令分布 ----
     disasm = subprocess.run(
@@ -168,10 +168,10 @@ def main() -> None:
             violations.append(f"[{current}] {line.strip()}")
 
     if not ctx_fp_seen:
-        fail("缺少 .text.ctx_fp 节（用户 FP helper 未链接进来？）")
+        fail("missing .text.ctx_fp section (user FP helpers not linked?)")
     if violations:
         shown = "\n".join(violations[:20])
-        fail(f".text.ctx_fp 之外出现 FP 指令/CSR 访问（共 {len(violations)} 处）：\n{shown}")
+        fail(f"FP instruction/FP CSR access outside .text.ctx_fp ({len(violations)} site(s)):\n{shown}")
 
     # ---- 单函数栈帧上限 ----
     frames = [f for f in scan_frames(disasm) if f[1] > 0]
@@ -181,11 +181,11 @@ def main() -> None:
         shown = "\n".join(
             f"  {f[1]:#x} @ {f[2]}  {f[0][:80]}" for f in over[:10]
         )
-        fail(f"{len(over)} 个函数栈帧超过 {max_frame:#x}：\n{shown}")
+        fail(f"{len(over)} function frame(s) exceed {max_frame:#x}:\n{shown}")
 
     peak = max((f for f in frames), key=lambda f: f[1], default=None)
-    peak_info = f"，最大栈帧 {peak[1]:#x}（{peak[0][:60]}）" if peak else ""
-    print(f"内核 ELF 审计通过：LP64 soft-float ABI，FP 面收敛于 .text.ctx_fp{peak_info}")
+    peak_info = f", max frame {peak[1]:#x} ({peak[0][:60]})" if peak else ""
+    print(f"kernel ELF audit passed: LP64 soft-float ABI, FP confined to .text.ctx_fp{peak_info}")
 
 
 if __name__ == "__main__":

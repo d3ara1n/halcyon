@@ -1,4 +1,4 @@
-//! 物理帧池：in-band 有序空闲链（见 notes/mm.md「帧池」）。
+//! 物理帧池：in-band 有序空闲链（见 notes/impls/mm.md「帧池」）。
 //!
 //! 空闲区间按地址排序成单链，节点内嵌于区间首帧——空闲内存自身承载
 //! 元数据，零堆依赖。本 crate 是纯逻辑，所有帧访问经 [`PoolMemory`]
@@ -104,7 +104,7 @@ impl<M: PoolMemory> FramePool<M> {
     /// 启动期按 DTB 剔除后逐段调用；调用方保证区间互斥且不与已注册
     /// 区间重叠，重叠属板级配置错误，不在此校验。
     pub fn add_region(&mut self, start: FrameNumber, end: FrameNumber) {
-        debug_assert!(start.0 < end.0, "空区间");
+        debug_assert!(start.0 < end.0, "empty region");
         self.insert_free(start, end.0 - start.0);
         self.free_frames += end.0 - start.0;
     }
@@ -118,7 +118,7 @@ impl<M: PoolMemory> FramePool<M> {
     /// 当前消费者（堆 arena、页表帧）均无对齐需求，接口不设对齐参数；
     /// 如需对齐分配再在接口上扩展，勿在调用侧硬凑。
     pub fn alloc_contiguous(&mut self, count: usize) -> Option<FrameNumber> {
-        debug_assert!(count > 0, "零帧分配");
+        debug_assert!(count > 0, "zero-frame allocation");
         let mut prev: Option<FrameNumber> = None;
         let mut cur = self.head?;
         loop {
@@ -145,7 +145,7 @@ impl<M: PoolMemory> FramePool<M> {
     ///
     /// 供启动协议三件套与页表解映射回投等已知地址的分配。
     pub fn alloc_at(&mut self, base: FrameNumber, count: usize) -> Result<(), AllocAtError> {
-        debug_assert!(count > 0, "零帧分配");
+        debug_assert!(count > 0, "zero-frame allocation");
         let end = base.0 + count;
         let mut prev: Option<FrameNumber> = None;
         let mut cur = self.head.ok_or(AllocAtError::Unavailable)?;
@@ -176,7 +176,7 @@ impl<M: PoolMemory> FramePool<M> {
     /// debug 断言拒绝与现有空闲区间重叠——归还区域必须是已分配
     /// 状态，重叠意味着双重释放或记账错误。
     pub fn dealloc(&mut self, base: FrameNumber, count: usize) {
-        debug_assert!(count > 0, "零帧归还");
+        debug_assert!(count > 0, "zero-frame deallocation");
         self.insert_free(base, count);
         self.free_frames += count;
     }
@@ -275,7 +275,7 @@ impl<M: PoolMemory> FramePool<M> {
             let node = self.mem.read_meta(c);
             debug_assert!(
                 c.0 >= end || base.0 >= c.0 + node.len,
-                "区间 [{:#x}, {:#x}) 与空闲区间 [{:#x}, {:#x}) 重叠：双重释放或记账错误",
+                "region [{:#x}, {:#x}) overlaps free region [{:#x}, {:#x}): double free or accounting bug",
                 base.0,
                 end,
                 c.0,

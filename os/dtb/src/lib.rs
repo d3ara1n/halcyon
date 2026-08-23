@@ -42,10 +42,10 @@ pub enum FdtError {
 impl fmt::Display for FdtError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadMagic => write!(f, "设备树魔数不符"),
-            Self::Truncated => write!(f, "设备树数据截断"),
-            Self::UnexpectedToken => write!(f, "设备树 token 序列非法"),
-            Self::InvalidUtf8 => write!(f, "设备树字符串非 UTF-8"),
+            Self::BadMagic => write!(f, "device tree magic mismatch"),
+            Self::Truncated => write!(f, "device tree data truncated"),
+            Self::UnexpectedToken => write!(f, "invalid device tree token stream"),
+            Self::InvalidUtf8 => write!(f, "device tree string is not UTF-8"),
         }
     }
 }

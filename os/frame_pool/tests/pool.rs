@@ -1,6 +1,6 @@
 //! 帧池 in-band 空闲链测试（host）。
 //!
-//! 用例清单见 notes/mm.md「帧池·测试集」；`boot_layout_dual_region`
+//! 用例清单见 notes/impls/mm.md「帧池·测试集」；`boot_layout_dual_region`
 //! 模拟 virt 启动剔除（SBI + 内核镜像/栈 + initfs）后的多区间注册。
 //! host 测试需显式 `--target aarch64-apple-darwin`（os/.cargo
 //! build.target 指向 riscv）。
@@ -21,7 +21,7 @@ impl PoolMemory for MockMem {
         let slot = self
             .slots
             .get(&frame.0)
-            .unwrap_or_else(|| panic!("读未初始化帧 {:#x} 的元数据", frame.0));
+            .unwrap_or_else(|| panic!("read metadata of uninitialized frame {:#x}", frame.0));
         RegionNode {
             len: slot[0],
             next: slot[1],
@@ -140,7 +140,7 @@ fn alloc_zeroes_frames() {
     assert_eq!(base, frame(3));
     let mem = p.into_mem();
     for f in 3..8 {
-        assert_eq!(mem.slots[&f], [0; 2], "帧 {:#x} 未清零", f);
+        assert_eq!(mem.slots[&f], [0; 2], "frame {:#x} not zeroed", f);
     }
     // 余量节点 [0,3)：len=3、next=链尾哨兵
     assert_eq!(mem.slots[&0], [3, usize::MAX]);
@@ -171,7 +171,7 @@ fn alloc_at_cases() {
 
 /// 零帧分配 / 双重释放 → debug 断言。
 #[test]
-#[should_panic(expected = "零帧分配")]
+#[should_panic(expected = "zero-frame allocation")]
 fn zero_count_alloc_panics() {
     let mut p = pool();
     p.add_region(frame(0), frame(4));
@@ -179,7 +179,7 @@ fn zero_count_alloc_panics() {
 }
 
 #[test]
-#[should_panic(expected = "重叠")]
+#[should_panic(expected = "overlaps")]
 fn double_free_panics() {
     let mut p = pool();
     p.add_region(frame(0), frame(8));
@@ -237,7 +237,7 @@ fn stress_conservation() {
             p.dealloc(frame(b), c);
         }
         let expected: usize = held.iter().map(|(_, c)| c).sum();
-        assert_eq!(p.free_frames() + expected, total, "帧数不守恒 @{}", round);
+        assert_eq!(p.free_frames() + expected, total, "frame count not conserved @{}", round);
     }
 
     for (b, c) in held.drain(..) {

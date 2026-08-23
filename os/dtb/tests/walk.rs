@@ -18,7 +18,7 @@ fn virt_layout() {
 
     let names: Vec<_> = root.children().filter_map(|n| n.name().ok()).collect();
     for expect in ["cpus", "chosen", "memory@80000000"] {
-        assert!(names.iter().any(|n| n.starts_with(expect)), "缺 {expect}: {names:?}");
+        assert!(names.iter().any(|n| n.starts_with(expect)), "missing {expect}: {names:?}");
     }
 
     // /cpus：timebase、#address-cells=1、4 个 cpu 子节点

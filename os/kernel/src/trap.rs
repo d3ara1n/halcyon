@@ -45,7 +45,7 @@ pub unsafe fn ret_to_user() -> Outcome {
         1 => Outcome::Requeue,
         2 => Outcome::Killed,
         3 => Outcome::Park,
-        _ => unreachable!("trap 汇编返回了非法出口编码"),
+        _ => unreachable!("trap assembly returned an invalid outcome encoding"),
     }
 }
 
@@ -70,7 +70,7 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
 
     match (is_interrupt, code) {
         (false, U_ECALL) => {
-            let Some(t) = thread else { unreachable!("ecall 无当前线程") };
+            let Some(t) = thread else { unreachable!("no current thread on ecall") };
             match syscall::dispatch(frame, t) {
                 syscall::Outcome::Completed => Outcome::Resume as usize,
                 syscall::Outcome::Wait => Outcome::Park as usize,
@@ -95,7 +95,7 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
             }
         }
         (false, _) => {
-            // 用户态同步异常一律终止进程（notes/task.md「生命周期」）；
+            // 用户态同步异常一律终止进程（notes/impls/task.md「生命周期」）；
             // 不以裸编号匹配中断语义（TRAP-004）。
             let pid = thread.map(|t| t.process.pid).unwrap_or(0);
             warn!(

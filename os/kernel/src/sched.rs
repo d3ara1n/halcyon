@@ -124,7 +124,7 @@ fn park_publish(t: &Arc<Thread>) {
             });
             arm_earliest();
         }
-        _ => unreachable!("Park 出口必有等待意图"),
+        _ => unreachable!("Park outcome must carry a wait intent"),
     }
 }
 
@@ -262,7 +262,7 @@ pub fn run() -> ! {
             Outcome::Killed => reap(t),
             // 已离开执行点，此刻发布等待：完成方可安全触达该线程。
             Outcome::Park => park_publish(&t),
-            Outcome::Resume => unreachable!("Resume 不经过调度循环"),
+            Outcome::Resume => unreachable!("Resume never passes through the scheduling loop"),
         }
     }
 }

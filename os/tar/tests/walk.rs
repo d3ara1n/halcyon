@@ -35,14 +35,14 @@ fn walk_files_and_dirs() {
     assert_eq!(
         names,
         vec![("bin/".to_string(), 0), ("bin/srv_init".to_string(), 12)],
-        "目录零长、文件按 size"
+        "directory zero-length, file by size"
     );
 }
 
 #[test]
 fn empty_archive() {
     let archive = vec![0u8; 1024];
-    walk(&archive, |_| panic!("空归档不应有项")).unwrap();
+    walk(&archive, |_| panic!("empty archive must yield no entries")).unwrap();
 }
 
 #[test]

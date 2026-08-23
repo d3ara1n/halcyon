@@ -225,7 +225,7 @@ pub struct TableTree<M: FrameMemory, const LEVELS: usize> {
 impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
     /// 建树：分配并清零 root。
     pub fn new(mut mem: M) -> Result<Self, FrameExhausted> {
-        assert!(LEVELS >= 2 && LEVELS <= 5, "仅支持 sv39..sv57（LEVELS 2..5）");
+        assert!(LEVELS >= 2 && LEVELS <= 5, "only sv39..sv57 supported (LEVELS 2..5)");
         let root = mem.alloc_frame()?;
         mem.table_mut(root).fill(Pte::invalid());
         Ok(Self { mem, root })
@@ -411,7 +411,7 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         idx: usize,
         level: usize,
     ) -> Result<FrameNumber, MapError> {
-        debug_assert!(level >= 1, "level 0 叶不能再分裂");
+        debug_assert!(level >= 1, "level-0 leaf cannot split further");
         let entry = self.mem.table_mut(frame)[idx];
         debug_assert!(entry.is_leaf());
 
