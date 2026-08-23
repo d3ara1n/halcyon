@@ -452,8 +452,10 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         if level == 0 {
             return;
         }
-        let entries: [Pte; ENTRIES] = *self.mem.table_mut(frame);
-        for entry in entries {
+        // 按索引逐项读取：整表按值拷贝会在栈上生成 4KiB 数组，debug 构建
+        // 下函数栈帧超过每 hart 栈预算，内核栈溢出踩踏相邻 hart 栈。
+        for i in 0..ENTRIES {
+            let entry = self.mem.table_mut(frame)[i];
             if entry.is_branch() {
                 let sub = entry.next_frame();
                 self.free_subtree(sub, level - 1);
