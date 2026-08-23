@@ -13,7 +13,7 @@ unmap，不触发该路径；属潜伏缺陷，接入批量 unmap 前必须修�
 
 trap/上下文、hart 身份、能力调度与启动发布的已知契约缺口记录在
 `plans/reviews/system-audit/01-sbi.md`、`02-trap-context.md`，统一设计见
-`notes/execution-context.md`。在取得直接证据前不得添加平台专用补丁。
+`notes/impls/execution-context.md`。在取得直接证据前不得添加平台专用补丁。
 `just sifive_u` 已内置运行阶段超时收束，通过与否看日志关键行。
 
 ## rust_analyzer 环境前提

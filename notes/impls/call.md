@@ -1,5 +1,7 @@
 # 内核调用
 
+> 异步调用的构想（内核请求、不阻塞内核）与 Remote Call 的设计定位源自 [`../ideas/call.md`](../ideas/call.md)；本篇记录其在内核中的落地形态。
+
 内核调用分两类：系统调用（用户进程 ↔ 内核）与 remote call（hart ↔ hart，内核态内部）。
 
 ## System Call
