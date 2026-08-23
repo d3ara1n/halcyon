@@ -108,7 +108,7 @@ unsafe fn fdt_from(pa: usize) -> Fdt<'static> {
     let total = unsafe { ((va + 4) as *const u32).read_volatile().swap_bytes() } as usize;
     // SAFETY: [va, va+total) 在直映射覆盖内，只读访问。
     let data = unsafe { core::slice::from_raw_parts(va as *const u8, total) };
-    Fdt::new(data).expect("设备树不可用")
+    Fdt::new(data).expect("device tree unavailable")
 }
 
 pub fn main() {
@@ -131,8 +131,8 @@ pub fn main() {
 
     mm::init(&board);
     frame::init(&board);
-    frame::smoke();
-    heap::smoke();
+    frame::selftest();
+    heap::selftest();
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
     sched::init(board.timebase);
@@ -146,7 +146,7 @@ pub fn main() {
     let boot_record = registry::with_registry(|reg| {
         let boot_slot = reg
             .slot_of(rt::boot_hartid())
-            .expect("boot hart 未被 DT 准入");
+            .expect("boot hart not admitted by device tree");
         reg.record(boot_slot) as *const HartBootRecord as usize
     });
     enter_hart(boot_record, rt::boot_hartid());
@@ -180,7 +180,7 @@ fn construct_registry(board: &BoardInfo) {
     }
     assert!(
         reg.slot_of(rt::boot_hartid()).is_some(),
-        "boot hart 未被设备树准入"
+        "boot hart not admitted by device tree"
     );
 
     let kernel_satp = mm::kernel_satp();

@@ -100,7 +100,7 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
             let pid = thread.map(|t| t.process.pid).unwrap_or(0);
             warn!(
                 Task,
-                "pid {} 异常终止: scause={:#x} stval={:#x} sepc={:#x}",
+                "pid {} aborted: scause={:#x} stval={:#x} sepc={:#x}",
                 pid,
                 scause,
                 stval,

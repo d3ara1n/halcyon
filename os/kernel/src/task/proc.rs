@@ -360,7 +360,7 @@ impl Thread {
 /// 未建模状态扩展在 load 时明确拒绝，不降级为 Base。W^X：段内容写入
 /// 尚不可执行的地址空间，装载完成后经入队 Release 发布（见 sched::enqueue）。
 pub fn spawn_from_elf(pid: Pid, parent: Pid, image: &elf::Elf, file: &[u8]) -> Result<Arc<Thread>, SpaceError> {
-    let requirement = elf::isa_requirement(file).expect("用户执行需求被拒绝");
+    let requirement = elf::isa_requirement(file).expect("userspace execution requirement rejected");
     let process = Arc::new(Process::new(pid, parent)?);
     {
         let mut space = process.space.lock();

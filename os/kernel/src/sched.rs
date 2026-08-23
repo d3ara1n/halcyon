@@ -276,13 +276,13 @@ fn arm_quantum() {
 fn reap(t: Arc<Thread>) {
     let pid = t.process.pid;
     let Some(process) = table::remove(pid) else {
-        panic!("退出的 pid {} 不在进程表内", pid);
+        panic!("exited pid {} not in process table", pid);
     };
     let now = sbi::read_time();
     let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
     log!(
         Task,
-        "pid {} 回收: exit={:?} {} 次调度, 存活 {} ms",
+        "pid {} reaped: exit={:?}, {} switches, lifespan {} ms",
         pid,
         *t.exit_code.lock(),
         t.switches.load(Ordering::Relaxed),
@@ -306,7 +306,7 @@ fn idle() {
     if is_quiescent() {
         log!(
             Sched,
-            "系统静默（无唤醒主人），停机；余 {} 帧",
+            "system quiescent (no waker), powering off; {} frame(s) free",
             crate::frame::free_frames()
         );
         sbi::shutdown();

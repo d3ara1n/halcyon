@@ -62,7 +62,7 @@ fn rust_start<T: Termination + 'static>(
     assert_eq!(
         external::hart_num_limit(),
         crate::registry::HART_NUM_LIMIT,
-        "链接脚本 HART_NUM_LIMIT 与内核不一致"
+        "HART_NUM_LIMIT mismatch between linker script and kernel"
     );
     sbi::init();
     BOOT_HARTID.store(hartid_as_argc as usize, Ordering::Relaxed);
@@ -79,9 +79,9 @@ extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
     if let Err(reject) = csr::formal_entry_baseline() {
         match reject {
             csr::CsrReject::Uxl(readback) => {
-                fatal_msg(&format_args!("CSR 核验失败：UXL 读回 {readback:#x} ≠ 64"));
+                fatal_msg(&format_args!("CSR baseline check failed: UXL readback {readback:#x} != 64"));
             }
-            other => fatal_msg(&format_args!("CSR 基线核验失败: {other:?}")),
+            other => fatal_msg(&format_args!("CSR baseline check failed: {other:?}")),
         }
     }
     // SAFETY: stvec 安装为共同 direct-mode 入口（地址对齐由链接保证）。
@@ -140,7 +140,7 @@ fn bring_up_runtime() -> ! {
         }
         if sbi::read_time() > deadline {
             registry::publish_failed();
-            fatal_msg(&format_args!("secondary 上线超时，启动整体失败"));
+            fatal_msg(&format_args!("secondary hart bring-up timed out; boot aborted"));
         }
         core::hint::spin_loop();
     }
@@ -150,13 +150,13 @@ fn bring_up_runtime() -> ! {
     // 执行，不可能从 bootstrap 栈返回。
     let (start, end) = external::bootstrap_range();
     frame::free_range(start, end);
-    log!(Memory, "bootstrap 回收 [{:#x}, {:#x})", start, end);
+    log!(Memory, "bootstrap reclaim [{:#x}, {:#x})", start, end);
 
     // 冻结 active 集合、装载初始任务，最后发布 Ready。
     if let Some((addr, len)) = crate::rt::initfs_region() {
         initfs::load(addr, len);
     } else {
-        log!(InitFS, "设备树无 initfs，无服务可装载");
+        log!(InitFS, "no initfs in device tree; no services to load");
     }
     registry::publish_ready();
     crate::sched::run()

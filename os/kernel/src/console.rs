@@ -93,8 +93,8 @@ macro_rules! println {
     };
 }
 
-/// 话题制日志：`log!(Task, "pid {} 回收", pid)` 输出着色对齐的
-/// `[Task    ] pid 3 回收`；无话题形态 `log!("{}", x)` 纯输出。
+/// 话题制日志：`log!(Task, "reaped pid {}", pid)` 输出着色对齐的
+/// `[Task    ] reaped pid 3`；无话题形态 `log!("{}", x)` 纯输出。
 macro_rules! log {
     ($topic:ident, $($arg:tt)+) => {
         $crate::console::log_topic(stringify!($topic), format_args!($($arg)+))

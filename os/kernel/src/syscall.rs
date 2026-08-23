@@ -90,7 +90,7 @@ fn debug_print(frame: &mut UserContext, thread: &Thread) {
     let tag = alloc::format!("pid {}", thread.process.pid);
     match core::str::from_utf8(&buf) {
         Ok(msg) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("{}", msg)),
-        Err(_) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("非 UTF-8 消息 {} 字节", len)),
+        Err(_) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("non-UTF-8 message, {} bytes", len)),
     }
     respond_ok(frame, len);
 }

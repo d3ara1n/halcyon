@@ -50,12 +50,12 @@ unsafe impl Source for FrameSource {
 #[global_allocator]
 static HEAP: TalcLock<RawSpinlock, FrameSource, DefaultBinning> = TalcLock::new(FrameSource);
 
-/// 堆供血冒烟：首次分配触发 FrameSource claim，验证帧池→堆链路与数据完整性。
-pub fn smoke() {
+/// 堆供血自检：首次分配触发 FrameSource claim，验证帧池→堆链路与数据完整性。
+pub fn selftest() {
     let before = frame::free_frames();
     let v: alloc::vec::Vec<u32> = (0..8192u32).collect();
     assert_eq!(v.iter().sum::<u32>(), (0..8192u32).sum::<u32>());
     let claimed = before - frame::free_frames();
-    assert!(claimed > 0, "堆分配未从帧池取帧");
+    assert!(claimed > 0, "heap did not claim frames from the pool");
     log!(Heap, "{} frame(s) claimed, alloc/verify ok", claimed);
 }

@@ -108,7 +108,7 @@ impl BoardInfo {
         let Some(map_node) = cpus.child("cpu-map") else {
             return;
         };
-        let leaves = topology::parse(&map_node).expect("cpu-map 结构非法");
+        let leaves = topology::parse(&map_node).expect("malformed cpu-map");
         let ac = cells(&cpus, "#address-cells", 1);
         let phandles = topology::cpu_phandle_hartids(&cpus, ac);
         self.topology = Some(
@@ -119,7 +119,7 @@ impl BoardInfo {
                         .iter()
                         .find(|(ph, _)| *ph == leaf.cpu)
                         .map(|(_, hid)| *hid as usize)
-                        .unwrap_or_else(|| panic!("cpu-map 引用未知 phandle {:#x}", leaf.cpu));
+                        .unwrap_or_else(|| panic!("cpu-map references unknown phandle {:#x}", leaf.cpu));
                     (hartid, leaf.path)
                 })
                 .collect(),
@@ -149,16 +149,16 @@ fn parse_cpu(node: &dtb::Node) -> Option<Cpu> {
     // 现代 ISA 属性是准入前提，缺失或基线不足属平台契约违约。
     let base = node
         .prop_str("riscv,isa-base")
-        .unwrap_or_else(|| panic!("cpu {hartid} 缺 riscv,isa-base（旧 riscv,isa 已不支持）"));
-    assert!(base == "rv64i", "cpu {hartid} isa-base {base:?} 非 rv64i");
+        .unwrap_or_else(|| panic!("cpu {hartid} missing riscv,isa-base (legacy riscv,isa unsupported)"));
+    assert!(base == "rv64i", "cpu {hartid} isa-base {base:?} is not rv64i");
     assert!(
         node.prop_str_list("riscv,isa-extensions").is_some(),
-        "cpu {hartid} 缺 riscv,isa-extensions"
+        "cpu {hartid} missing riscv,isa-extensions"
     );
     for required in BASELINE_EXTENSIONS {
         assert!(
             has_extension(node, required),
-            "cpu {hartid} 缺内核基线扩展 {required}"
+            "cpu {hartid} missing required baseline extension {required}"
         );
     }
     let caps = HartCapabilities {
@@ -169,7 +169,7 @@ fn parse_cpu(node: &dtb::Node) -> Option<Cpu> {
     };
     assert!(
         !(caps.d && !caps.f),
-        "cpu {hartid} 声明 d 却缺 f（绑定约束违约）"
+        "cpu {hartid} declares d but lacks f (binding constraint violated)"
     );
 
     let mmu = match node.prop_str("mmu-type") {
@@ -197,9 +197,9 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
             cells(&chosen, "#size-cells", root_sc),
         );
         if let Some(node) = chosen.child("initfs") {
-            let reg = node.prop("reg").expect("initfs 节点缺 reg");
-            let addr = cells_u64(reg, ac).expect("initfs reg 地址宽度异常") as usize;
-            let len = cells_u64(&reg[ac * 4..], sc).expect("initfs reg 长度宽度异常") as usize;
+            let reg = node.prop("reg").expect("initfs node missing reg");
+            let addr = cells_u64(reg, ac).expect("unexpected initfs reg address-cell width") as usize;
+            let len = cells_u64(&reg[ac * 4..], sc).expect("unexpected initfs reg size-cell width") as usize;
             initfs = Some((addr, len));
         }
     }
@@ -216,9 +216,9 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
     if let Some(cpus_node) = root.child("cpus") {
         timebase = cpus_node
             .prop_u32("timebase-frequency")
-            .expect("cpus 节点缺 timebase-frequency") as usize;
+            .expect("cpus node missing timebase-frequency") as usize;
         for cpu_node in cpus_node.children() {
-            let name = cpu_node.name().expect("节点名不可达错误");
+            let name = cpu_node.name().expect("cpu node name unavailable");
             if name.split('@').next() != Some("cpu") {
                 continue;
             }
@@ -226,11 +226,11 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
                 continue;
             };
             cpu.freq = cpu_node.prop_u32("clock-frequency").map(|f| f as usize).unwrap_or(timebase);
-            assert!(cpu_len < HART_NUM_LIMIT, "cpu 数超出 HART_NUM_LIMIT");
+            assert!(cpu_len < HART_NUM_LIMIT, "cpu count exceeds HART_NUM_LIMIT");
             cpus[cpu_len] = cpu;
             cpu_len += 1;
         }
-        assert!(cpu_len > 0, "设备树无可用 cpu 节点");
+        assert!(cpu_len > 0, "device tree has no usable cpu nodes");
         // cpu-map 拓扑不在此解析：启动路径零堆，由 load_topology 在
         // 帧池/堆就绪后填充。
     }
@@ -242,15 +242,15 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
         if node.prop_str("device_type") != Some("memory") {
             continue;
         }
-        let reg = node.prop("reg").expect("memory 节点缺 reg");
-        assert!(memory_len < MAX_MEMORY_REGIONS, "memory 节点数超上限");
+        let reg = node.prop("reg").expect("memory node missing reg");
+        assert!(memory_len < MAX_MEMORY_REGIONS, "memory node count exceeds limit");
         memories[memory_len] = MemoryRegion {
-            start: cells_u64(reg, root_ac).expect("memory reg 地址宽度异常") as usize,
-            len: cells_u64(&reg[root_ac * 4..], root_sc).expect("memory reg 长度宽度异常") as usize,
+            start: cells_u64(reg, root_ac).expect("unexpected memory reg address-cell width") as usize,
+            len: cells_u64(&reg[root_ac * 4..], root_sc).expect("unexpected memory reg size-cell width") as usize,
         };
         memory_len += 1;
     }
-    assert!(memory_len > 0, "设备树无 memory 节点");
+    assert!(memory_len > 0, "device tree has no memory node");
 
     BoardInfo {
         cpus,

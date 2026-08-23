@@ -49,7 +49,7 @@ static POOL: Spinlock<Option<FramePool<PhysAccess>>> = Spinlock::new(None);
 
 /// 持锁访问帧池（初始化前访问为致命错误）。
 fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {
-    f(POOL.lock().as_mut().expect("帧池未初始化"))
+    f(POOL.lock().as_mut().expect("frame pool not initialized"))
 }
 
 /// 解析板级信息并初始化帧池：DTB memory 段剔除启动占用后注册。
@@ -72,7 +72,7 @@ pub fn init(board: &BoardInfo) {
             regions += 1;
         });
     }
-    assert!(regions > 0, "剔除启动占用后无任何空闲内存段");
+    assert!(regions > 0, "no free memory regions after boot reservations");
 
     let free = p.free_frames();
     log!(
@@ -143,11 +143,11 @@ impl Drop for FrameTracker {
     }
 }
 
-/// 冒烟：分配→写入→归还→重取验证清零，全程真硬件访问。
-pub fn smoke() {
-    let t = alloc_contiguous(8).expect("冒烟分配失败");
+/// 自检：分配→写入→归还→重取验证清零，全程真硬件访问。
+pub fn selftest() {
+    let t = alloc_contiguous(8).expect("self-test allocation failed");
     let slots = mm::phys_to_virt(t.base.addr()) as *mut usize;
-    // SAFETY: 冒烟持有 [base, base+8)，写首 8 槽不越界；高半区直映射下访问。
+    // SAFETY: 自检持有 [base, base+8)，写首 8 槽不越界；高半区直映射下访问。
     unsafe {
         for i in 0..8 {
             slots.add(i).write_volatile(0xDEAD_0000 + i);
@@ -155,10 +155,10 @@ pub fn smoke() {
     }
     let before = free_frames();
     drop(t);
-    assert_eq!(free_frames(), before + 8, "帧归还记账不符");
-    let t2 = alloc_contiguous(8).expect("重取失败");
+    assert_eq!(free_frames(), before + 8, "frame return accounting mismatch");
+    let t2 = alloc_contiguous(8).expect("reallocation failed");
     // SAFETY: 同上；首帧首槽读回验证分配即清零。
     let first = unsafe { *(mm::phys_to_virt(t2.base.addr()) as *const usize) };
-    assert!(first == 0, "分配未清零");
-    log!(Frame, "smoke: alloc/write/dealloc/re-zero ok");
+    assert!(first == 0, "allocation not zeroed");
+    log!(Frame, "self-test passed: alloc/write/dealloc/re-zero ok");
 }

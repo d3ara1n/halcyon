@@ -194,7 +194,7 @@ pub fn formal_entry_baseline() -> Result<(), CsrReject> {
     // 来源是否置入 S 态由 sie 来源位控制（TRAP-008 收口结论）。
     write_sie(SIE_SSIE | SIE_STIE);
     clear_ssip();
-    sbi::set_timer(sbi::DISARM).expect("formal entry 卸载 timer");
+    sbi::set_timer(sbi::DISARM).expect("failed to disarm timer in formal entry");
 
     // 状态面：清本项目拥有的全部控制位（FS/VS=Off、SUM/MXR=0、SIE=0）。
     clear_sstatus(OWNED_STATUS_CLEAR);

@@ -143,7 +143,7 @@ impl HartRegistry {
     /// 登记一个 admitted hart（按升序遍历 DT CPU 的顺序即 slot 序）。
     /// 返回分配的 slot。
     pub fn admit(&mut self, id: HartId) -> HartSlot {
-        assert!(self.len < HART_NUM_LIMIT, "admitted hart 数超出上限");
+        assert!(self.len < HART_NUM_LIMIT, "admitted hart count exceeds limit");
         let slot = HartSlot(self.len);
         self.ids[self.len] = id;
         let record = &mut self.records[self.len];
@@ -189,13 +189,13 @@ static REGISTRY: Spinlock<Option<HartRegistry>> = Spinlock::new(None);
 /// boot 构造完成后安装（只能发生一次）。
 pub fn install(registry: HartRegistry) {
     let mut guard = REGISTRY.lock();
-    assert!(guard.is_none(), "registry 重复安装");
+    assert!(guard.is_none(), "registry already installed");
     *guard = Some(registry);
 }
 
 /// 访问注册表（未安装即 panic——调用时序违约）。
 pub fn with_registry<R>(f: impl FnOnce(&HartRegistry) -> R) -> R {
-    f(REGISTRY.lock().as_ref().expect("registry 未初始化"))
+    f(REGISTRY.lock().as_ref().expect("registry not initialized"))
 }
 
 /// admitted 集合的 slot 位图（静默判定与 IPI 目标展开用）。

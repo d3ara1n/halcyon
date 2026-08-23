@@ -95,7 +95,7 @@ virt:
 
 # sifive_u 无 shutdown 设备：负载完成后 QEMU 不自退出，运行阶段以 timeout
 # 收束（AGENTS.md：运行阶段硬上限 10s）；通过与否以日志关键行人工判定
-# （全员回收 / [Sched] 系统静默）。
+# （全员回收 / [Sched] system quiescent）。
 sifive_u:
     @just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_timed -smp cores=5
 
@@ -106,7 +106,7 @@ run_qemu_timed +OPTIONS: make_dtb build_kernel
     timeout --foreground 10 {{QEMU_LAUNCH}} {{OPTIONS}}
     code=$?
     if [ "$code" -eq 124 ]; then
-        echo -e "\033[0;33msifive_u: 运行阶段超时收束（平台无 shutdown 设备）；请核对上方日志关键行\033[0m"
+        echo -e "\033[0;33msifive_u: run phase timed out (platform has no shutdown device); verify key log lines above\033[0m"
         exit 0
     fi
     exit "$code"

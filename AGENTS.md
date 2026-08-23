@@ -42,6 +42,7 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 ## 约定
 
 - 文档、注释、提交信息都用中文。格式上使用 Conventional Commits，以前的提交未使用标准格式，不当作参考。
+- **运行时输出统一正式英文**：内核与用户态日志、panic/assert/expect 消息、构建工具输出（如 Justfile 的 echo）一律用正式英文措辞，保证可 grep、可跨终端阅读；中文仅出现在文档、注释与提交信息中。
 - `git tag pre-ai` 之前的提交全部为人工编写，不含 AI 参与；之后的提交如由 AI 辅助，提交前按当前会话的实际模型与 provider 生成 `Co-Authored-By` trailer。格式为：
   ```
   Co-Authored-By: <实际模型显示名> <对应 provider 的 noreply 邮箱>

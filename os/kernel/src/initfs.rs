@@ -13,7 +13,7 @@ pub fn load(addr: usize, len: usize) {
             return;
         }
         let Some(image) = elf::parse(entry.data).ok() else {
-            warn!(InitFS, "{} 非法 ELF，跳过", entry.name);
+            warn!(InitFS, "{}: invalid ELF, skipped", entry.name);
             return;
         };
         let pid = table::alloc_pid();
@@ -21,11 +21,11 @@ pub fn load(addr: usize, len: usize) {
             Ok(thread) => {
                 sched::enqueue(thread);
                 spawned += 1;
-                log!(Task, "pid {} <- {}", pid, entry.name);
+                log!(Task, "spawned pid {} <- {}", pid, entry.name);
             }
-            Err(e) => warn!(InitFS, "{} 装载失败: {:?}", entry.name, e),
+            Err(e) => warn!(InitFS, "failed to load {}: {:?}", entry.name, e),
         }
     })
-    .expect("initfs 归档格式错误");
-    log!(InitFS, "{} 个服务已装载", spawned);
+    .expect("malformed initfs archive");
+    log!(InitFS, "{} service(s) loaded", spawned);
 }

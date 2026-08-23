@@ -90,11 +90,11 @@ pub fn init(board: &BoardInfo) {
         .iter()
         .map(|r| r.start + r.len)
         .max()
-        .expect("DTB 无 memory 节点");
+        .expect("DTB has no memory node");
     let slots = (dram_end + GIB - 1) / GIB;
     assert!(
         (1..=DIRECT_VPN2_LIMIT).contains(&slots),
-        "直映射槽数异常：{slots}"
+        "unexpected direct-map slot count: {slots}"
     );
 
     // SAFETY: boot 早期单 hart 独占（UnsafeCell 隔离），此后只读。

@@ -236,8 +236,8 @@ pub fn system_reset(reset_type: u32, reset_reason: u32) -> SbiResult {
 /// 停机。SRST 成功后不返回；平台没有关机后端时记录具体错误并永久停放。
 pub fn shutdown() -> ! {
     match system_reset(RESET_SHUTDOWN, 0) {
-        Ok(value) => warn!(SBI, "SRST 成功后意外返回: {}", value),
-        Err(err) => warn!(SBI, "SRST 停机不可用: {:?}", err),
+        Ok(value) => warn!(SBI, "SRST returned unexpectedly after success: {}", value),
+        Err(err) => warn!(SBI, "SRST shutdown unavailable: {:?}", err),
     }
     crate::hart::park()
 }
