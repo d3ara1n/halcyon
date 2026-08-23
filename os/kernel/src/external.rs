@@ -7,7 +7,7 @@
 // 跨空间常量表（布局契约见 assembly.asm `_ENTRY_CONSTS`）。
 unsafe extern "C" {
     #[link_name = "_ENTRY_CONSTS"]
-    static ENTRY_CONSTS: [usize; 9];
+    static ENTRY_CONSTS: [usize; 11];
 }
 
 /// SBI 段物理起点（帧池剔除区间用）。
@@ -40,8 +40,6 @@ pub fn bootstrap_range() -> (usize, usize) {
 }
 
 unsafe extern "C" {
-    /// 内核镜像末端（高半区 VMA，含栈区；换算 PA 用 `mm::virt_to_phys`）。
-    pub fn _kernel_end();
     /// 高半区 formal entry 汇合点（高半区内符号，可直接取地址）。
     fn _enter_hart_high();
 }
@@ -51,9 +49,17 @@ pub fn enter_hart_high_va() -> usize {
     _enter_hart_high as *const () as usize
 }
 
-/// 栈区高端（VMA）：hart i 的栈顶 = stack_region_top - i * hart_stack_size()。
-pub fn stack_region_top() -> usize {
-    _kernel_end as *const () as usize
+/// 栈窗口基（VMA）：正式内核栈的专用虚拟分区，与直映射解耦；
+/// 布局与 guard 见 `mm::stack_slot_range`。
+pub fn stack_window_base() -> usize {
+    // SAFETY: 链接期物化的只读常量。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[9])) }
+}
+
+/// 内核静态占用物理末端（SBI + 镜像 + 栈），帧池注册剔除区间用。
+pub fn kernel_pa_end() -> usize {
+    // SAFETY: 链接期物化的只读常量。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[10])) }
 }
 
 /// 每 hart 栈大小。

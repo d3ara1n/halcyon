@@ -1,4 +1,4 @@
-//! 调度：域—类—执行点三层（notes/task.md「调度」）+ 调度循环 + 期限表。
+//! 调度：域—类—执行点三层（notes/impls/task.md「调度」）+ 调度循环 + 期限表。
 //!
 //! 单一归属不变量：线程任意时刻恰处于「类队列 | 本 hart current | 无容器」，
 //! 全部转换经本模块入口（enqueue / pick / wake）在锁内完成。
@@ -12,11 +12,11 @@ use core::{
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
 use crate::sync::Spinlock;
-use crate::{hart, sbi, trap::{self, Outcome}};
+use crate::{hart, mm, sbi, trap::{self, Outcome}};
 use crate::sbi::DISARM;
 use crate::task::{table, Thread};
 
-/// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/task.md）。
+/// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/impls/task.md）。
 pub trait SchedClass: Sync {
     fn enqueue(&self, t: Arc<Thread>);
     fn pick(&self) -> Option<Arc<Thread>>;
@@ -66,7 +66,7 @@ impl SchedDomain {
 }
 
 // ---------------------------------------------------------------------------
-// 等待模型（notes/call.md「异步调用」）：等待条目 + 代数仲裁 + 发布时序
+// 等待模型（notes/impls/call.md「异步调用」）：等待条目 + 代数仲裁 + 发布时序
 // ---------------------------------------------------------------------------
 
 /// 等待凭据：等待条目强持有等待中的线程（线程的强引用随容器走：
@@ -202,7 +202,7 @@ fn wake_expired() {
 // 入口：enqueue（新就绪 / 唤醒）与定时器事件
 // ---------------------------------------------------------------------------
 
-/// 线程入队并按门铃唤醒空闲 hart（IPI = 他方请求，见 notes/internals.md）。
+/// 线程入队并按门铃唤醒空闲 hart（IPI = 他方请求，见 notes/impls/internals.md）。
 /// IDLE_MASK 是 slot 位图；SBI 边界经 registry 展开为 raw hartid 逐个发送，
 /// 绝不把内部位图直接解释为 SBI hart mask。
 pub fn enqueue(t: Arc<Thread>) {
@@ -227,11 +227,15 @@ pub fn domain_has_ready() -> bool {
 
 /// 记录退出码（Exit / 异常终止共用；回收时随统计打印）。
 pub fn report_exit(t: &Thread, code: i64) {
+    // 死亡即刻归一到内核地址空间（mm::normalize_satp）：此刻进程 root
+    // 仍完整，静态读取安全；此后 teardown/调度不得再依赖该 root——
+    // AddressSpace::drop 会剥离内核顶层项，滞留其下任何 TLB miss 即 fatal。
+    mm::normalize_satp();
     *t.exit_code.lock() = Some(code);
 }
 
 // ---------------------------------------------------------------------------
-// 调度循环（每 hart 常驻，见 notes/internals.md「trap 帧与上下文」）
+// 调度循环（每 hart 常驻，见 notes/impls/internals.md「trap 帧与上下文」）
 // ---------------------------------------------------------------------------
 
 /// hart 主循环：pick → 进用户态 → Switch 处置 → 循环；空则 idle。
@@ -240,6 +244,9 @@ pub fn run() -> ! {
     // 本循环只维护执行点与量子。
     let me = hart::current();
     loop {
+        // 归一到内核地址空间（见 mm::normalize_satp）：刚结束的线程
+        // root 可能已被回收，调度循环不得依赖它的内核映射。
+        mm::normalize_satp();
         let Some(t) = DOMAIN.pick() else {
             idle();
             continue;

@@ -66,18 +66,30 @@ SECTIONS
 
     .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_VA_BASE) ALIGN(8) {
         PROVIDE(_bss_start = .);
-        *(.sbss)
-        *(.bss)
+        /* 后缀变体必须显式收编：漏收则成孤儿段被排在段外，
+           物理占用脱离 _bss_end 记账（栈打包基址会踩上去）。 */
+        *(.sbss .sbss.*)
+        *(.bss .bss.*)
         . = ALIGN(8);
         PROVIDE(_bss_end = .);
     }
 
-    .runtime (NOLOAD) : AT(ADDR(.runtime) - KERNEL_VA_BASE) ALIGN(16) {
-        PROVIDE(_stack_start = .);
-        . = . + STACK_SIZE * HART_NUM_LIMIT;
-        . = ALIGN(4096);
-        PROVIDE(_kernel_end = .);
+    /* 栈窗口：正式内核栈的专用虚拟分区（高半区顶 vpn2 槽，与直映射
+       解耦）。每槽步长 STACK_SIZE + 4096（4096 必须与 mm::GUARD_SIZE
+       一致），槽底 4KiB 为 guard 页（mm 建表时不映射），栈溢出立即
+       触发 page fault。纯虚拟预留，不占物理镜像体积；物理占用由
+       __kernel_pa_end 表达。 */
+    STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000;
+    .stack_window STACK_WINDOW_VA_BASE (NOLOAD) : ALIGN(4096) {
+        PROVIDE(__stack_window_base = .);
+        . = . + (STACK_SIZE + 4096) * HART_NUM_LIMIT;
+        PROVIDE(__stack_window_end = .);
     }
+
+    /* 内核静态占用的物理末端（SBI + 镜像 + 栈），帧池注册剔除区间用；
+       页对齐保证栈打包基址与帧粒度一致。 */
+    PROVIDE(__kernel_pa_end = ALIGN(ADDR(.bss) - KERNEL_VA_BASE + SIZEOF(.bss)
+                                    + STACK_SIZE * HART_NUM_LIMIT, 4096));
 
     /DISCARD/ : {
         *(.eh_frame)

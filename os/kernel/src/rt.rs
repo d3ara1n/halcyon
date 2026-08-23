@@ -162,7 +162,11 @@ fn bring_up_runtime() -> ! {
     crate::sched::run()
 }
 
-use crate::{frame, initfs};
+/// RISC-V 异常 cause：load/store page fault（guard 命中判定只关心这两者）。
+const LOAD_PAGE_FAULT: u64 = 13;
+const STORE_PAGE_FAULT: u64 = 15;
+
+use crate::{frame, initfs, mm};
 
 /// initfs 物理区间（board 解析结果经 rt 中转，避免跨模块传 board）。
 static INITFS: AtomicUsize = AtomicUsize::new(0);
@@ -181,9 +185,19 @@ pub fn initfs_region() -> Option<(usize, usize)> {
 /// fatal 诊断（无锁 RawWriter）：打印 FatalFrame 完整证据后永久停放。
 #[unsafe(no_mangle)]
 extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
+    // guard 页命中是内核栈溢出的第一现场特征，单独点出便于定位。
+    let hint =
+        if matches!(frame.scause, LOAD_PAGE_FAULT | STORE_PAGE_FAULT)
+            && mm::is_guard_fault(frame.stval as usize)
+        {
+        " (kernel stack overflow: guard page hit)"
+    } else {
+        ""
+    };
     let _ = write!(
         RawWriter,
-        "\x1b[0;31mfatal trap\x1b[0m: unexpected trap in S-mode\n  cause={:#x} val={:#x} pc={:#x}\n  satp={:#x} sstatus={:#x}\n",
+        "\x1b[0;31mfatal trap\x1b[0m: unexpected trap in S-mode{}\n  cause={:#x} val={:#x} pc={:#x}\n  satp={:#x} sstatus={:#x}\n",
+        hint,
         frame.scause, frame.stval, frame.sepc, frame.satp, frame.sstatus,
     );
     let _ = write!(RawWriter, "  gpr:");

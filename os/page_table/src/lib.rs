@@ -1,4 +1,4 @@
-//! Sv39/48/57 页表纯逻辑（见 notes/mm.md「页表纯逻辑」）。
+//! Sv39/48/57 页表纯逻辑（见 notes/impls/mm.md「页表纯逻辑」）。
 //!
 //! 本 crate 只管表结构：`TableTree` 经 `FrameMemory` 抽象访问表帧，
 //! 不直接解引用物理地址，host 与内核 target 复用同一份代码。
@@ -285,6 +285,22 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
     }
 
     /// 查询 `vpn` 的映射。
+    /// 底层表存储访问（内核建表路径与 host 测试构造外部子树用）。
+    pub fn mem_mut(&mut self) -> &mut M {
+        &mut self.mem
+    }
+
+    /// 清空 `frame` 表内 [start, end) 槽位：不递归、不归还任何子树帧。
+    ///
+    /// 用于剥离启动期拷贝进用户 root 的内核共享顶层项——这些子树归
+    /// 内核所有，teardown（Drop 的 free_subtree）不得回收；先剥离，
+    /// 递归释放就只触及用户部分。
+    pub fn clear_slots(&mut self, frame: FrameNumber, start: usize, end: usize) {
+        for i in start..end {
+            self.mem.table_mut(frame)[i] = Pte::invalid();
+        }
+    }
+
     pub fn translate(&mut self, vpn: Vpn) -> Option<Mapped> {
         if vpn.0 >= max_vpn(LEVELS) {
             return None;

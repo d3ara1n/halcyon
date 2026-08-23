@@ -1,6 +1,6 @@
 //! TableTree 切段算法与生命周期测试（host）。
 //!
-//! 用例清单见 notes/mm.md「测试集」；`big_unaligned_cross_table`
+//! 用例清单见 notes/impls/mm.md「测试集」；`big_unaligned_cross_table`
 //! 是 mm-map-bug 的数值原案。
 
 use core::cell::Cell;
@@ -235,4 +235,33 @@ fn drop_frees_all_frames() {
         assert!(counters.live.get() > 1);
     }
     assert_eq!(counters.live.get(), 0, "表帧未全部归还");
+}
+
+/// clear_slots 只清槽位、不递归回收：被剥离分支的子树帧仍记账为存活，
+/// 随后 Drop 也不得触碰它们（内核共享顶层项剥离的数值契约）。
+#[test]
+fn clear_slots_detaches_without_recursion() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    // 用户侧一页 + 模拟共享进来的顶层分支项（指向手工构造的外部表）。
+    t.map(Vpn(0), 1, Ppn(1), flags::USER_DATA).unwrap();
+
+    // 在 root 空槽挂一个分支项，其下再挂一层叶表与一个叶子映射。
+    let sub = t.mem_mut().alloc_frame().unwrap();
+    let leaf = t.mem_mut().alloc_frame().unwrap();
+    {
+        let tables = &mut *t.mem_mut();
+        tables.tables[sub.0][7] = Pte::branch(leaf);
+        tables.tables[leaf.0][9] = Pte::leaf(Ppn(0x999), flags::KERNEL_DIRECT);
+        tables.tables[0][500] = Pte::branch(sub); // root 是 0 号帧
+    }
+
+    // 剥离槽位：不归还任何帧，翻译随之消失。
+    t.clear_slots(FrameNumber(0), 500, 501);
+    assert_eq!(counters.live.get(), 3, "剥离不得归还子树帧");
+    assert!(t.translate(Vpn(500 * 512 + 7)).is_none(), "剥离后应不可译");
+
+    // Drop 后只回收用户侧帧；外部子树的 2 帧归调用方所有，仍存活。
+    drop(t);
+    assert_eq!(counters.live.get(), 2, "Drop 不得回收已剥离的内核子树");
 }

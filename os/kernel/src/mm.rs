@@ -1,12 +1,13 @@
-//! 内核地址空间与启动切换（见 notes/mm.md「内核地址空间与启动协议」）。
+//! 内核地址空间与启动切换（见 notes/impls/mm.md「内核地址空间与启动协议」）。
 //!
 //! 汇编侧机构：`_start` 在 bare satp 下写跳板 root 表（DRAM 槽 identity
 //! + 高半区别名）开 MMU 跳高半区；本模块在高半区构建正式内核页表
-//! （静态 root + 直映射 mega 项）并切换，`KERNEL_SATP` 经 registry 填入
-//! record，secondary 的 `_enter_hart_high` 从 record 加载同一张表。
+//! （静态 root + 直映射 mega 项 + 栈窗口子树）并切换，`KERNEL_SATP`
+//! 经 registry 填入 record，secondary 的 `_enter_hart_high` 从 record
+//! 加载同一张表。
 //!
 //! 页表模式当前固定 Sv39；按 DTB mmu-type 自动选式是后续工作
-//! （见 notes/mm.md「页表模式选择」）。
+//! （见 notes/impls/mm.md「页表模式选择」）。
 
 use core::{
     arch::asm,
@@ -14,9 +15,9 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use page_table::{flags, Ppn, Pte, ENTRIES};
+use page_table::{FrameNumber, PAGE_BITS, Ppn, Pte, flags, ENTRIES};
 
-use crate::board::BoardInfo;
+use crate::{board::BoardInfo, external};
 
 /// 内核高半区基址：VMA = PA + KERNEL_VA_BASE（与链接脚本常量一致）。
 pub const KERNEL_VA_BASE: usize = 0xFFFF_FFC0_0000_0000;
@@ -33,12 +34,44 @@ const DIRECT_VPN2_BASE: usize = 256;
 /// sv39 顶层可用槽数（直映射上限 [0, 2^38) 物理）。
 const DIRECT_VPN2_LIMIT: usize = 256;
 
+/// 栈窗口 vpn2 槽号：高半区顶槽，与直映射槽数解耦的独立分区
+/// （链接脚本 `STACK_WINDOW_VA_BASE`）。
+const STACK_WINDOW_SLOT: usize = DIRECT_VPN2_BASE + DIRECT_VPN2_LIMIT - 1;
+
+/// 每 hart 栈区下方的 guard 页大小：不映射，溢出即 page fault。
+/// 链接脚本 `.stack_window` 的步长字面量 4096 必须与本值一致。
+const GUARD_SIZE: usize = 4096;
+
+const _: () = assert!(GUARD_SIZE == 1 << PAGE_BITS, "guard must be one page");
+
+/// 栈窗口叶表预留数（2MiB 单元数）：当前平台最大跨度
+/// (0x40000 + 0x1000) * 8 ≈ 2.03MiB 跨两个单元，余量为扩展预留。
+const WINDOW_LEAF_MAX: usize = 4;
+
 pub fn phys_to_virt(pa: usize) -> usize {
     pa + KERNEL_VA_BASE
 }
 
+/// VA→PA 全函数：直映射区走线性算术；栈窗口按建表时的槽打包公式
+/// 回推（与 `map_stack_window` 互逆）。同一物理页可同时出现在两个
+/// 映射里（直映射别名 + 窗口规范地址），PA→VA 无唯一逆——
+/// `phys_to_virt` 恒给直映射别名，本函数接受任意已映射内核 VA。
 pub fn virt_to_phys(va: usize) -> usize {
-    va - KERNEL_VA_BASE
+    let window = external::stack_window_base();
+    let stack_size = external::hart_stack_size();
+    let stride = stack_size + GUARD_SIZE;
+    let end = window + stride * external::hart_num_limit();
+    if (window..end).contains(&va) {
+        let off = va - window;
+        debug_assert!(
+            off % stride >= GUARD_SIZE,
+            "virt_to_phys on unmapped guard page"
+        );
+        let pa_base = external::kernel_pa_end() - stack_size * external::hart_num_limit();
+        pa_base + (off / stride) * stack_size + (off % stride - GUARD_SIZE)
+    } else {
+        va - KERNEL_VA_BASE
+    }
 }
 
 /// 正式内核页表 root。静态表（Linux swapper_pg_dir 同构）：帧池就绪前
@@ -51,6 +84,16 @@ struct RootTable(UnsafeCell<[Pte; ENTRIES]>);
 unsafe impl Sync for RootTable {}
 
 static KERNEL_PG_DIR: RootTable = RootTable(UnsafeCell::new([Pte::invalid(); ENTRIES]));
+
+/// 栈窗口子表（静态预留，不入帧池，与 KERNEL_PG_DIR 同构）：
+/// 一张中间表 + `WINDOW_LEAF_MAX` 张叶表，init 前单 hart 独占写、其后只读。
+#[repr(align(4096))]
+struct WindowTables(UnsafeCell<[[Pte; ENTRIES]; 1 + WINDOW_LEAF_MAX]>);
+
+// SAFETY: 同 KERNEL_PG_DIR。
+unsafe impl Sync for WindowTables {}
+
+static WINDOW_TABLES: WindowTables = WindowTables(UnsafeCell::new([[Pte::invalid(); ENTRIES]; 1 + WINDOW_LEAF_MAX]));
 
 /// 正式内核 satp 值（init 发布、`kernel_satp()` 消费填 record）。
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
@@ -68,8 +111,18 @@ pub fn direct_slots() -> usize {
     DIRECT_SLOT_COUNT.load(Ordering::Relaxed)
 }
 
+/// 用户 root 中归内核所有的顶层槽区间（直映射区 + 栈窗口），
+/// 与拷贝范围严格对应；剥离用。
+pub fn kernel_top_level_range() -> (usize, usize, usize) {
+    // (direct_start, direct_end, window_slot)
+    let slots = direct_slots();
+    (DIRECT_VPN2_BASE, DIRECT_VPN2_BASE + slots, STACK_WINDOW_SLOT)
+}
+
 /// 把内核高半区顶层项拷进用户表 root：用户表创建后立即调用，
-/// 此后任意用户 satp 下内核代码恒可执行（共享映射，见 notes/internals.md）。
+/// 此后任意用户 satp 下内核代码恒可执行（共享映射，见 notes/impls/internals.md）。
+/// 配对纪律：进程 teardown 前必须先 `detach_kernel_top_level` 剥离，
+/// 否则树回收会把内核共享子表当用户页表拆掉。
 ///
 /// # Safety
 /// `root` 必须是刚分配、尚未映射任何用户页的页表 root 帧。
@@ -82,6 +135,9 @@ pub unsafe fn install_kernel_top_level(root: page_table::FrameNumber) {
     let slots = direct_slots();
     dst[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots]
         .copy_from_slice(&src[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots]);
+    // 栈窗口槽同样共享：trap 在用户 satp 下即取调度栈指针（无 U 位，
+    // 用户态不可访问）。子表 init 后只读，跨地址空间共享安全。
+    dst[STACK_WINDOW_SLOT] = src[STACK_WINDOW_SLOT];
 }
 
 pub fn init(board: &BoardInfo) {
@@ -108,6 +164,9 @@ pub fn init(board: &BoardInfo) {
     }
 
     let satp = (SV39 << 60) | (virt_to_phys(dir as usize) >> 12);
+
+    map_stack_window();
+
     KERNEL_SATP.store(satp, Ordering::Release);
     DIRECT_SLOT_COUNT.store(slots, Ordering::Relaxed);
     // SAFETY: satp 装载与全量 sfence 是 S 态特权指令；直映射已覆盖
@@ -131,6 +190,88 @@ pub fn init(board: &BoardInfo) {
 /// 正式内核 satp 值（registry 构造 record 用）。
 pub fn kernel_satp() -> usize {
     KERNEL_SATP.load(Ordering::Acquire)
+}
+
+/// 构建栈窗口映射（init 内、satp 发布前调用）：每槽步长
+/// `hart_stack_size + GUARD_SIZE`，槽底 guard 页不映射，栈溢出立即
+/// page fault；物理侧按槽连续打包在内核静态占用末段，guard 不占帧。
+fn map_stack_window() {
+    let stack_size = external::hart_stack_size();
+    let hart_limit = external::hart_num_limit();
+    let stride = stack_size + GUARD_SIZE;
+    let span = stride * hart_limit;
+    const MIDDLE_SPAN: usize = 1 << 21;
+    assert!(
+        span <= MIDDLE_SPAN * WINDOW_LEAF_MAX,
+        "stack window exceeds reserved leaf tables"
+    );
+
+    let window = external::stack_window_base();
+    let pa_base = external::kernel_pa_end() - stack_size * hart_limit;
+
+    // SAFETY: 静态子表 init 前单 hart 独占写（同 KERNEL_PG_DIR），此后只读。
+    unsafe {
+        let tables = &mut *WINDOW_TABLES.0.get();
+        let (middle, leaves) = tables.split_at_mut(1);
+        let middle = &mut middle[0];
+
+        for unit in 0..span.div_ceil(MIDDLE_SPAN) {
+            middle[unit] = Pte::branch(FrameNumber::from_addr(virt_to_phys(
+                leaves[unit].as_ptr() as usize,
+            )));
+        }
+        for slot in 0..hart_limit {
+            let slot_pa = pa_base + slot * stack_size;
+            for off in (GUARD_SIZE..stride).step_by(GUARD_SIZE) {
+                let va = window + slot * stride + off;
+                let unit = (va - window) / MIDDLE_SPAN;
+                let idx = ((va - window) % MIDDLE_SPAN) / GUARD_SIZE;
+                let ppn = Ppn((slot_pa + off - GUARD_SIZE) >> PAGE_BITS);
+                leaves[unit][idx] = Pte::leaf(ppn, flags::KERNEL_DIRECT);
+            }
+        }
+        (*KERNEL_PG_DIR.0.get())[STACK_WINDOW_SLOT] =
+            Pte::branch(FrameNumber::from_addr(virt_to_phys(middle.as_ptr() as usize)));
+    }
+
+    log!(
+        MM,
+        "stack window @ {:#x}: {} slots x {:#x} (+guard)",
+        window,
+        hart_limit,
+        stack_size
+    );
+}
+
+/// 栈窗口布局：slot 槽的栈区 VA 区间 [base, top)。top 为槽顶
+/// （emergency 栈占最高页，正式 sp 从 top 减 emergency 大小处起）。
+pub fn stack_slot_range(slot: usize, stack_size: usize) -> (usize, usize) {
+    let base = external::stack_window_base() + slot * (stack_size + GUARD_SIZE) + GUARD_SIZE;
+    (base, base + stack_size)
+}
+
+/// 故障 VA 是否落在某 guard 洞内：内核栈向下溢出的第一现场特征。
+pub fn is_guard_fault(va: usize) -> bool {
+    let window = external::stack_window_base();
+    let stride = external::hart_stack_size() + GUARD_SIZE;
+    let end = window + stride * external::hart_num_limit();
+    window <= va && va < end && (va - window) % stride < GUARD_SIZE
+}
+
+/// 调度循环入口归一：当前 satp 非正式内核表则切回并同步翻译。
+///
+/// 离开用户执行点后，刚结束线程的 root 可能已被 teardown 剥离内核
+/// 顶层项（`AddressSpace::drop`），不得再作为内核执行的翻译来源。
+/// Resume 热路径不经调度循环，此处切换零热路径开销。
+pub fn normalize_satp() {
+    let want = kernel_satp();
+    let cur: usize;
+    // SAFETY: 只读 satp。
+    unsafe { asm!("csrr {}, satp", out(reg) cur, options(nomem)) };
+    if cur != want {
+        // SAFETY: 换表后全量 sfence；内核高半区两表同 VA，执行流无缝。
+        unsafe { asm!("csrw satp, {satp}", "sfence.vma", satp = in(reg) want) };
+    }
 }
 
 /// 用户内存访问的 RAII guard：构造时临时开启 SUM，Drop 恢复关闭。

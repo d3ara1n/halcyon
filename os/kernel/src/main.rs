@@ -1,7 +1,7 @@
 //! erhino 内核（重写版）。
 //!
 //! 架构与内部机制见 `notes/`；旧实现的设计考古见
-//! `plans/2026-08-legacy-kernel-design.md`。
+//! `plans/ref-2026-08-legacy-kernel-design.md`。
 
 #![no_std]
 #![feature(lang_items, alloc_error_handler)]
@@ -166,7 +166,7 @@ fn enter_hart(record: usize, hartid: usize) -> ! {
     }
 }
 
-/// boot 单核构造正式 registry 与全部启动记录（notes/execution-context.md
+/// boot 单核构造正式 registry 与全部启动记录（notes/impls/execution-context.md
 /// 「Bootstrap 与正式环境」）：admitted raw hartid 升序分配稠密 slot；
 /// record 先完整构造并发布，HSM start 在 bring_up_runtime 中才发出。
 fn construct_registry(board: &BoardInfo) {
@@ -185,15 +185,15 @@ fn construct_registry(board: &BoardInfo) {
 
     let kernel_satp = mm::kernel_satp();
     let entry_high = external::enter_hart_high_va();
-    let stack_region_top = external::stack_region_top();
     let stack_size = external::hart_stack_size();
 
     for (slot, record) in reg.records_mut() {
         record.kernel_satp = kernel_satp;
         record.entry_high = entry_high;
         record.hart_local = hart::hart_local_addr(slot.0);
-        // 每 hart 栈区最高页划为 emergency 栈；正式 sp 从其下开始。
-        let top = stack_region_top - slot.0 * stack_size;
+        // 栈窗口布局（见 mm::stack_slot_range）：每槽步长 stack_size + guard，
+        // 槽内最高页划为 emergency 栈；正式 sp 从其下开始。
+        let (_, top) = mm::stack_slot_range(slot.0, stack_size);
         record.emergency_sp = top;
         record.stack_top = top - EMERGENCY_SIZE;
     }

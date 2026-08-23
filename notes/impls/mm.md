@@ -82,7 +82,7 @@ pub trait FrameMemory {
 
 ### 测试集（host）
 
-切段算法数值用例：未对齐跨表大区间（mm-map-bug 原案 `vpn=65, count=8192`）、整表对齐、大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap。
+切段算法数值用例：未对齐跨表大区间（mm-map-bug 原案 `vpn=65, count=8192`）、整表对齐、大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、clear_slots 剥离不递归。
 
 ## 内核地址空间与启动协议
 
@@ -95,7 +95,17 @@ pub fn phys_to_virt(pa: usize) -> usize { pa + KERNEL_VA_BASE }
 pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 ```
 
-直映射范围 `[0, max(DRAM 末, MMIO 窗口末))`，按 1GiB mega 项映射（virt 平台 MMIO 0x10000000 起，被首项覆盖）。比 Linux 的分区直映射（image/vmalloc/modules 分区）简化为单一区——我们的规模不需要分区，偏移纪律更简单。
+直映射范围 `[0, max(DRAM 末, MMIO 窗口末))`，按 1GiB mega 项映射（virt 平台 MMIO 0x10000000 起，被首项覆盖）。比 Linux 的分区直映射（image/vmalloc/modules 分区）简化为两个分区：直映射单一区 + 栈窗口（见下）；不再增加分区的门槛是真实需求。
+
+### 栈窗口
+
+正式内核栈的专用虚拟分区：高半区顶 vpn2 槽（链接脚本 `STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000`，与直映射槽数解耦）。目的：每 hart 槽底放一页不映射的 guard 页，栈向下溢出立即 store page fault，溢出即时可见（对照 `plans/DEBUG-PLAYBOOK.md` 的静默踩踏事故；构建期兜底见 os/tools/audit_elf.py）。
+
+- **布局**：每槽步长 `stack_size + GUARD_SIZE(4KiB)`，低→高 `[guard | formal | emergency]`；槽内最高页为 emergency 栈，正式 sp 从其下开始（`mm::stack_slot_range` 是唯一布局真值）。
+- **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）对窗口逐页映射、guard 置 invalid；所有 hart 与全部用户表共享同一子树。物理侧按槽连续打包在内核静态占用末段（基址 `__kernel_pa_end - 总栈量`），guard 不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**（绕过即无防护）。
+- **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + 窗口打包公式互逆）；同一物理页有两个内核 VA，PA→VA 无唯一逆——`phys_to_virt` 恒给直映射别名。SBI ecall 传 PA 前必须经它（console 缓冲在栈上即依赖此）。
+- **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；进程 teardown 前 `AddressSpace::drop` 必须先剥离这些共享顶层项（`TableTree::clear_slots`），否则树回收会把内核子表当用户页表拆掉回投（双重释放 + 栈内存被复用）。
+- **边界**：bootstrap 过渡环境的栈在过渡表的 mega 映射里，不受此防护管辖——bootstrap 期栈溢出不可观测，接受为已知边界（窗口短，audit_elf 兑底大帧）。
 
 ### 启动：PA 执行 → 高半区
 
@@ -114,11 +124,11 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 ### trap
 
-任意用户页表共享内核高半区，用户 trap 不切 satp；`stvec` 恒指共同内核入口。用户上下文存于内核对象，`sscratch` 存本 hart 陷阱锚。内核稳态 SUM=0，只有 user-copy guard 可以临时直访用户 VA。
+任意用户页表共享内核高半区与栈窗口，用户 trap 不切 satp；`stvec` 恒指共同内核入口。用户上下文存于内核对象，`sscratch` 存本 hart 陷阱锚。内核稳态 SUM=0，只有 user-copy guard 可以临时直访用户 VA。
 
 ## 用户地址空间（M3 消费）
 
-- 低半区 `[0, 2^38)` 完全归用户，进程页表 root 创建时拷贝内核高半区顶层项；
+- 低半区 `[0, 2^38)` 完全归用户，进程页表 root 创建时拷贝内核高半区顶层项（含栈窗口槽）；
 - 用户区布局（程序/堆/栈/隧道区）沿用旧设计，M3 随任务模型定稿。
 
 ## 施工顺序

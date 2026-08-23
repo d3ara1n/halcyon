@@ -1,4 +1,4 @@
-//! 物理帧池内核侧：真实内存访问 + 全局容器 + 启动注册（见 notes/mm.md「帧池」）。
+//! 物理帧池内核侧：真实内存访问 + 全局容器 + 启动注册（见 notes/impls/mm.md「帧池」）。
 //!
 //! 帧池算法在 os/frame_pool（纯逻辑，host 可测），本模块只做三件事：
 //! - [`PhysAccess`]：PoolMemory 的内核实现——经 `mm::phys_to_virt` 访问
@@ -54,7 +54,7 @@ fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {
 
 /// 解析板级信息并初始化帧池：DTB memory 段剔除启动占用后注册。
 pub fn init(board: &BoardInfo) {
-    let kernel_end = mm::virt_to_phys(external::_kernel_end as *const () as usize);
+    let kernel_end = external::kernel_pa_end();
     // 启动占用最多两洞（镜像/栈 + initfs），固定容量——启动路径零堆依赖
     let mut holes = [(0usize, 0usize); 2];
     holes[0] = (external::sbi_start(), kernel_end);

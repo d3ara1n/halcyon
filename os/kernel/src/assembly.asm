@@ -2,7 +2,7 @@
 .attribute arch, "rv64imac_zicsr_zifencei"
 
 # ---------------------------------------------------------------------------
-# 执行环境装配（契约见 notes/execution-context.md；偏移常量由 Rust
+# 执行环境装配（契约见 notes/impls/execution-context.md；偏移常量由 Rust
 # offset_of! 经 main.rs 的 global_asm! 注入，本文件不维护数字真值）。
 #
 # 三段空间：
@@ -71,6 +71,8 @@ _ENTRY_CONSTS:
     .quad __bootstrap_stack_top # [6] bootstrap 临时栈顶（PA）
     .quad KERNEL_VA_BASE        # [7] 高半区基址
     .quad __bootstrap_stack_top # [8] 同 [6]：_start_high 别名换算用
+    .quad __stack_window_base   # [9] 栈窗口基（高半区顶槽 VMA）
+    .quad __kernel_pa_end       # [10] 内核静态占用物理末端
 
 .section .text.entry
 .global _pa_fatal

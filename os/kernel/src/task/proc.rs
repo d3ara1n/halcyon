@@ -1,4 +1,4 @@
-//! 进程与线程：资源容器 / 执行容器（见 notes/task.md）。
+//! 进程与线程：资源容器 / 执行容器（见 notes/impls/task.md）。
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU64;
@@ -84,8 +84,20 @@ pub struct AddressSpace {
     frames: Vec<FrameTracker>,
 }
 
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        // 先剥离共享的内核顶层项（直映射 + 栈窗口）：这些子树归内核，
+        // 随后的树回收（free_subtree）只许触及用户部分。
+        let root = self.tree.root_frame();
+        let (start, end, window) = mm::kernel_top_level_range();
+        self.tree.clear_slots(root, start, end);
+        self.tree.clear_slots(root, window, window + 1);
+    }
+}
+
 impl AddressSpace {
-    /// 新地址空间：建树 + 拷内核高半区顶层项（共享映射）。
+    /// 新地址空间：建树 + 拷内核高半区顶层项（共享映射）。与 Drop
+    /// 的剥离配对：拷入什么，teardown 前必须剥掉什么。
     pub fn new() -> Result<Self, SpaceError> {
         let tree = TableTree::new(TableMem).map_err(|_| SpaceError::NoFrame)?;
         // SAFETY: root 刚分配、尚未映射任何用户页。
@@ -297,7 +309,7 @@ pub struct Thread {
     pub process: Arc<Process>,
     /// 创建时刻（mtime tick），退出统计用。
     pub created_tick: u64,
-    /// 被调度次数（公平性观测，见 notes/task.md）。
+    /// 被调度次数（公平性观测，见 notes/impls/task.md）。
     pub switches: AtomicU64,
     /// 退出码（Exit / 异常终止共用；回收时打印）。锁内 Option，
     /// 写于本 hart 的退出路径，读于回收（同 hart 顺序发生）。

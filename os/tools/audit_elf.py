@@ -8,7 +8,7 @@
 
 3. 单函数最大栈帧不超过 --max-frame（默认 0xc00）：扫描 sp 减量
    （含 lui+addi 装载立即数后 sub sp,sp,reg 的模式），防止巨型栈帧
-   溢出每 hart 栈预算（plans/todo-2026-09-stack-guard.md 方案 C）。
+   溢出每 hart 栈预算（notes/impls/mm.md「栈窗口」的构建期兑底（原方案 C））。
 
 用法：audit_elf.py <kernel.elf> [--max-frame N]
 （依赖 riscv64-elf-readelf / objdump）。
