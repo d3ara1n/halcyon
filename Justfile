@@ -99,6 +99,11 @@ virt:
 sifive_u:
     @just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_timed -smp cores=5
 
+# 清理泄漏的孤儿 qemu（PPID=1 残留；agent 裸跑 run_qemu 后易遗漏）。
+# 默认一键清理孤儿；传参透传脚本：-l 仅列出，-y 跳过确认，-f 连有父进程的一并杀。
+clean-qemu *args:
+    @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
+
 [private]
 run_qemu_timed +OPTIONS: make_dtb build_kernel
     #!/usr/bin/env bash
