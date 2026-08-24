@@ -71,16 +71,23 @@ pub unsafe fn sys_thread_spawn(func_point: Address) -> SystemCallResult<Tid> {
     sys_call(SystemCall::ThreadSpawn, func_point, 0, 0, 0).map(|t| t as Tid)
 }
 
-pub unsafe fn sys_tunnel_build() -> SystemCallResult<usize> {
-    sys_call(SystemCall::TunnelBuild, 0, 0, 0, 0)
-}
-
-pub unsafe fn sys_tunnel_link(key: usize) -> SystemCallResult<Address> {
-    sys_call(SystemCall::TunnelLink, key, 0, 0, 0)
-}
-
 pub unsafe fn sys_tunnel_dispose(key: usize) -> SystemCallResult<()> {
     sys_call(SystemCall::TunnelDispose, key, 0, 0, 0).map(|_| {})
+}
+
+/// 创建隧道：零态页映射到 addr，返回隧道 id
+pub unsafe fn sys_tunnel_create(addr: usize) -> SystemCallResult<u64> {
+    sys_call(SystemCall::TunnelCreate, addr, 0, 0, 0).map(|id| id as u64)
+}
+
+/// 凭 id 挂接第二端点到 addr
+pub unsafe fn sys_tunnel_attach(id: u64, addr: usize) -> SystemCallResult<()> {
+    sys_call(SystemCall::TunnelAttach, id as usize, addr, 0, 0).map(|_| ())
+}
+
+/// 门铃：在对端信号状态提交 DATA 事件（唤醒是提示，真值在控制块）
+pub unsafe fn sys_tunnel_notify(id: u64) -> SystemCallResult<()> {
+    sys_call(SystemCall::TunnelNotify, id as usize, 0, 0, 0).map(|_| ())
 }
 
 // 返回需要准备的 buffer 大小

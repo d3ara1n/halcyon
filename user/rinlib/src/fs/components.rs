@@ -7,7 +7,6 @@ use flagset::FlagSet;
 
 use crate::{
     call::{sys_read, sys_write},
-    ipc::tunnel::Runnel,
 };
 
 use super::FileSystemError;
@@ -310,10 +309,6 @@ impl Stream {
 
     pub fn attributes(&self) -> &FlagSet<DentryAttribute> {
         &self.attributes
-    }
-
-    pub fn open(&self) -> Result<Runnel, FileSystemError> {
-        todo!()
     }
 
     pub fn read(&self, length: usize) -> Result<StreamValue, FileSystemError> {

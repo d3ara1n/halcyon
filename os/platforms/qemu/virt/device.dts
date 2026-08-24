@@ -63,7 +63,7 @@
 			riscv,cboz-block-size = <0x40>;
 			riscv,cbom-block-size = <0x40>;
 			riscv,isa-base = "rv64i";
-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr", "zkr";
 			mmu-type = "riscv,sv57";
 
 			interrupt-controller {
@@ -83,7 +83,7 @@
 			riscv,cboz-block-size = <0x40>;
 			riscv,cbom-block-size = <0x40>;
 			riscv,isa-base = "rv64i";
-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr", "zkr";
 			mmu-type = "riscv,sv57";
 
 			interrupt-controller {
@@ -103,7 +103,7 @@
 			riscv,cboz-block-size = <0x40>;
 			riscv,cbom-block-size = <0x40>;
 			riscv,isa-base = "rv64i";
-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr", "zkr";
 			mmu-type = "riscv,sv57";
 
 			interrupt-controller {
@@ -123,7 +123,7 @@
 			riscv,cboz-block-size = <0x40>;
 			riscv,cbom-block-size = <0x40>;
 			riscv,isa-base = "rv64i";
-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr", "zkr";
 			mmu-type = "riscv,sv57";
 
 			interrupt-controller {

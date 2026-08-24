@@ -26,7 +26,9 @@ INITFS := TARGET_DIR/"initfs.tar"   # 用户态产物，平台无关
 # initfs 装载地址：virt DRAM 1GiB 取高址；sifive_u 实际 DRAM 仅 128MiB，
 # 取 dtb 声明的 0x86000000（与 dts 的 initfs reg 保持一致）。
 INITFS_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+INITFS+",addr="+INITFS_ADDR
+# virt 开启 Zkr（seed CSR 硬件熵源，rand 模块主路）；sifive_u 平台无此扩展。
+QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+INITFS+",addr="+INITFS_ADDR+" " + QEMU_CPU
 # CPU 节流百分比（tools/qemu-throttle.sh）：跑飞/panic 时 QEMU 满核空转的兜底。
 # 1-99 按比例节流；100 = 全速。默认 50，全速需显式 THROTTLE=100。
 THROTTLE := "50"

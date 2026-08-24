@@ -14,6 +14,12 @@ pub const PROCESS_USER_MASK: SignalMap = !TERMINATE;
 /// `NONEMPTY ⇔ 队列非空`，由内核维护。
 pub const NONEMPTY: SignalMap = 1 << 0;
 
+/// 隧道端点的信号位：对端摇了门铃（含义由协议解读，唤醒只是提示）。
+/// 消费式清除，清铃前置条件见 Runnel 规格。
+pub const TUNNEL_DATA: SignalMap = 1 << 0;
+/// 隧道端点的信号位：对端已消亡或拆除（终态位，持续可见至本端销毁）。
+pub const TUNNEL_PEER_CLOSED: SignalMap = 1 << 1;
+
 /// 单次 SignalWait 的等待项数上限。
 pub const SIGNAL_WAIT_MAX: usize = 64;
 
@@ -25,6 +31,8 @@ pub enum ObjectKind {
     SelfProcess = 0,
     /// 自身邮箱（NONEMPTY）。
     Mailbox = 1,
+    /// 自身已挂接的隧道端点（DATA / PEER_CLOSED），id 为隧道 id。
+    TunnelEndpoint = 2,
 }
 
 /// 一个等待项：关注哪个对象 + 关注哪些位。

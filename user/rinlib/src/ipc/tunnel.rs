@@ -1,85 +1,35 @@
+//! 隧道系统调用的 rinlib 封装。协议层体验在 librunnel，这里只暴露
+//! 机制级原语。
+
 use erhino_shared::{call::SystemCallError, mem::Address};
 
-use crate::call::{sys_tunnel_build, sys_tunnel_dispose, sys_tunnel_link};
+use crate::call::{
+    sys_tunnel_attach, sys_tunnel_create, sys_tunnel_dispose, sys_tunnel_notify,
+};
 
-pub const TUNNEL_FIELD_SIZE: usize = 4096;
+type SystemCallResult<T> = Result<T, SystemCallError>;
 
-#[derive(Debug)]
-pub enum TunnelError {
-    Unknown,
-    NotAccessible,
-    IllegalAddress,
-    OutOfMemory,
+/// 创建隧道：零态页映射到 addr，返回隧道 id。
+pub fn create(addr: usize) -> SystemCallResult<u64> {
+    unsafe { sys_tunnel_create(addr) }
 }
 
-impl From<SystemCallError> for TunnelError {
-    fn from(value: SystemCallError) -> Self {
-        match value {
-            SystemCallError::ObjectNotAccessible | SystemCallError::ObjectNotFound => {
-                TunnelError::NotAccessible
-            }
-            SystemCallError::MemoryNotAccessible | SystemCallError::OutOfMemory => {
-                TunnelError::OutOfMemory
-            }
-            _ => Self::Unknown,
-        }
-    }
+/// 凭 id 挂接本进程第二端点到 addr。
+pub fn attach(id: u64, addr: usize) -> SystemCallResult<()> {
+    unsafe { sys_tunnel_attach(id, addr) }
 }
 
-#[expect(dead_code, reason = "Runnel 协议结构，隧道里程碑接入")]
-pub struct Tunnel {
-    key: usize,
-    field: *mut u8,
+/// 拆除本端点；双端皆亡时内核归还帧。
+pub fn dispose(id: u64) -> SystemCallResult<()> {
+    unsafe { sys_tunnel_dispose(id as usize) }
 }
 
-impl Tunnel {
-    fn from_address(key: usize, addr: Address) -> Result<Self, TunnelError> {
-        if addr & (TUNNEL_FIELD_SIZE - 1) == 0 {
-            Ok(Self {
-                key,
-                field: addr as *mut u8,
-            })
-        } else {
-            Err(TunnelError::IllegalAddress)
-        }
-    }
-
-    pub fn key(&self) -> usize {
-        self.key
-    }
-
-    pub fn dispose(self) {
-        // cleanup
-        if let Ok(_) = unsafe { sys_tunnel_dispose(self.key) } {
-            // ignore
-        }
-    }
+/// 摇门铃：在对端信号状态提交 DATA 事件。
+pub fn notify(id: u64) -> SystemCallResult<()> {
+    unsafe { sys_tunnel_notify(id) }
 }
 
-pub fn make() -> Result<Tunnel, TunnelError> {
-    match unsafe { sys_tunnel_build() } {
-        Ok(id) => link(id),
-        Err(err) => Err(err.into()),
-    }
-}
-
-pub fn link(id: usize) -> Result<Tunnel, TunnelError> {
-    match unsafe { sys_tunnel_link(id) } {
-        Ok(addr) => Tunnel::from_address(id, addr),
-        Err(err) => Err(err.into()),
-    }
-}
-
-#[expect(dead_code, reason = "Runnel 协议结构，隧道里程碑接入")]
-pub struct Runnel {
-    inner: Tunnel,
-}
-
-impl Runnel {
-}
-
-impl From<Tunnel> for Runnel {
-    fn from(inner: Tunnel) -> Self {
-        Self { inner }
-    }
-}
+/// 保留 Address 引用（attach 地址参数的类型化文档）。
+const _: () = {
+    let _ = core::mem::size_of::<Address>();
+};

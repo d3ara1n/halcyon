@@ -323,6 +323,8 @@ fn arm_quantum() {
 /// 此刻线程不在任何容器、无其他 hart 能触达——本 hart 独占，无需额外锁。
 fn reap(t: Arc<Thread>) {
     let pid = t.process.pid;
+    // 隧道端点清扫：在地址空间拆除前注销登记并通知幸存端（PEER_CLOSED）。
+    crate::task::tunnel::process_died(pid);
     let Some(process) = table::remove(pid) else {
         panic!("exited pid {} not in process table", pid);
     };

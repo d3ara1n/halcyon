@@ -3,5 +3,6 @@
 pub mod ipc;
 pub mod proc;
 pub mod table;
+pub mod tunnel;
 
 pub use proc::{spawn_from_elf, Thread};

@@ -114,6 +114,34 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 }
             }
         }
+        SystemCall::TunnelCreate => {
+            match crate::task::tunnel::create(thread, a0) {
+                Ok(id) => respond_ok(frame, id as usize),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
+        SystemCall::TunnelAttach => {
+            match crate::task::tunnel::attach(thread, a0 as u64, frame.x[11] as usize) {
+                Ok(()) => respond_ok(frame, 0),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
+        SystemCall::TunnelDispose => {
+            match crate::task::tunnel::dispose(thread, a0 as u64) {
+                Ok(()) => respond_ok(frame, 0),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
+        SystemCall::TunnelNotify => {
+            match crate::task::tunnel::notify(thread, a0 as u64) {
+                Ok(()) => respond_ok(frame, 0),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
         // 未实现面：一律返回错误（内核不可被用户调用 panic）。
         _ => {
             respond_error(frame, SystemCallError::FunctionNotAvailable);

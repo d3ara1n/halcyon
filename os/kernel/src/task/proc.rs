@@ -279,6 +279,31 @@ impl AddressSpace {
             .translate(Vpn(va / PAGE_SIZE))
             .map(|m| m.ppn.0 * PAGE_SIZE)
     }
+
+    /// 将所有权归外部的物理页映射到指定用户 VA（共享内存机制专用，
+    /// 如隧道）。帧生命周期归登记方：本空间的页表回收只清 PTE、不归还
+    /// 该帧——Drop 链只释放 `frames` 里登记的帧，外部映射天然安全。
+    /// 栈窗口与越界地址直接拒绝；冲突由 map 的 Conflict 报出。
+    pub fn map_external(&mut self, va: usize, pa: usize) -> Result<(), SpaceError> {
+        if va % PAGE_SIZE != 0 || va >= USER_TOP - STACK_SIZE {
+            return Err(SpaceError::BadSegment);
+        }
+        self.tree
+            .map(Vpn(va / PAGE_SIZE), 1, Ppn(pa / PAGE_SIZE), flags::USER_DATA)?;
+        // SAFETY: sfence 当前 ASID 冲刷 stale TLB 使新 PTE 生效。
+        unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
+        Ok(())
+    }
+
+    /// 解除本空间内一页外部映射（Dispose 路径）。
+    pub fn unmap_external(&mut self, va: usize) {
+        if va % PAGE_SIZE != 0 || va >= USER_TOP {
+            return;
+        }
+        self.tree.unmap(Vpn(va / PAGE_SIZE), 1);
+        // SAFETY: 同 map_external。
+        unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
+    }
 }
 
 /// 进程：资源容器（地址空间、父子关系、邮箱与进程级信号状态；隧道随

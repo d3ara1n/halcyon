@@ -107,16 +107,17 @@ pub enum SystemCall {
     Free = 0x52,
 
     // -----Tunnel-----
-    /// Allocate a key-marked random page
-    TunnelBuild = 0x60,
-    /// Link a allocated page with a key
-    TunnelLink = 0x61,
-    /// Dispose the tunnel and restore the slot
-    TunnelDispose = 0x62,
-    /// Interrupt for receiving
-    TunnelRequest = 0x6a,
-    /// Interrupt for transmitting
-    TunnelResponse = 0x6b,
+    /// Create a tunnel: zero page + registry entry mapped at given VA;
+    /// returns the tunnel id (48bit random)
+    TunnelCreate = 0x60,          // addr → id
+    /// Attach the peer endpoint by tunnel id at given VA
+    TunnelAttach = 0x61,          // id, addr
+    /// Dispose own endpoint; when both ends are gone the frame is released.
+    /// Survivor keeps its mapping and observes PEER_CLOSED.
+    TunnelDispose = 0x62,         // id
+    /// Ring the doorbell: submit a DATA event on the peer endpoint's signal
+    /// state (wake is a hint; truth lives in the protocol control block)
+    TunnelNotify = 0x6a,          // id
 
     // -----Filesystem abstract layer-----
     /// Check if dentry exist

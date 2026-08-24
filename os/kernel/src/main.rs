@@ -33,6 +33,7 @@ mod external;
 mod frame;
 mod hart;
 mod heap;
+mod rand;
 mod initfs;
 mod mm;
 mod rt;
@@ -136,6 +137,14 @@ pub fn main() {
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
     sched::init(board.timebase);
+    // 随机数源初始化（boot hart）：Zkr 主路 + 启动时刻测量值兜底混合。
+    let boot_caps = board
+        .cpus()
+        .iter()
+        .find(|c| c.hartid == rt::boot_hartid())
+        .map(|c| c.caps.zkr)
+        .unwrap_or(false);
+    rand::init(boot_caps, sbi::read_time());
     if let Some((addr, len)) = board.initfs {
         rt::set_initfs_region(addr, len);
     }

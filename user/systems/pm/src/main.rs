@@ -1,25 +1,75 @@
-//! pm：sleep 异步通路与消息投递的集成验证负载。两次睡眠后向 init
-//! （pid 3，initfs 装载顺序固定）发一条消息：init 若已阻塞在邮箱上
-//! 则走到达移交唤醒路径，否则消息入队走快路径——两种时序都必须收敛。
+//! pm：sleep 异步通路 + 消息接收 + Runnel 数据面的集成验证负载。
+//!
+//! 剧本：两次睡眠（timer 通路观测）→ 阻塞等 init 的隧道 id 消息 →
+//! attach → 写入 8192 字节校验模式（跨回绕、逐批摇铃）→ EOF+摇铃 →
+//! 退出（触发对端 PEER_CLOSED）。
 
 #![no_std]
 
-use rinlib::{ipc::message::send, preclude::*, sys_sleep};
+use rinlib::{
+    ipc::{
+        message::wait_message,
+    },
+    preclude::*,
+    sys_sleep,
+};
+use librunnel::blocking;
 
-/// init 的 pid（initfs 服务装载顺序：drv/fs/init/pm）。
-const INIT_PID: u32 = 3;
+/// 隧道页映射地址：与 init 约定的一致（各自进程空间内的同一常量）。
+const TUNNEL_VA: usize = 0x4000_0000;
+const STREAM_LEN: usize = 8192;
 
 fn main() {
     debug!("Hello, pm!");
     // sleep 异步通路验证：登记期限 → Waiting → timer 唤醒 → 继续。
-    // 生效与否在内核回收行的「存活时长」观测（应 ≥ 40ms + 开销）。
     unsafe {
         sys_sleep(30).expect("sleep");
         sys_sleep(10).expect("sleep again");
     }
     debug!("awake after two sleeps");
-    match send(INIT_PID, 514, &[1u8, 9u8, 1u8, 9u8]) {
-        Ok(()) => debug!("pinged init"),
-        Err(e) => debug!("send to init failed: {:?}", e),
+
+    // 阻塞等 init 的隧道 id（消息到达 → 移交唤醒）。
+    let (digest, payload) = match wait_message() {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("wait_message failed: {:?}", e);
+            return;
+        }
+    };
+    if digest.payload_length != 8 {
+        debug!("unexpected message kind {}", digest.kind);
+        return;
     }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&payload[..8]);
+    let id = u64::from_le_bytes(id_bytes);
+
+    let tunnel = match blocking::attach(id, TUNNEL_VA) {
+        Ok(t) => t,
+        Err(e) => {
+            debug!("tunnel attach failed: {:?}", e);
+            return;
+        }
+    };
+    debug!("tunnel attached id={:#x}", id);
+
+    // 校验模式写入：i%251+1，跨回绕分批，每批落页即摇铃。
+    let mut sent = 0usize;
+    let mut chunk = [0u8; 512];
+    while sent < STREAM_LEN {
+        let n = (STREAM_LEN - sent).min(chunk.len());
+        for (i, b) in chunk.iter_mut().enumerate().take(n) {
+            *b = ((sent + i) % 251 + 1) as u8;
+        }
+        if let Err(e) = tunnel.write_all(&chunk[..n]) {
+            debug!("stream write failed at {}: {:?}", sent, e);
+            return;
+        }
+        sent += n;
+    }
+    if let Err(e) = tunnel.finish() {
+        debug!("finish failed: {:?}", e);
+        return;
+    }
+    debug!("stream written {} bytes", sent);
 }

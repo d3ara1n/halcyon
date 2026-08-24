@@ -62,22 +62,31 @@ pub(crate) struct ObjectWaiter {
 ///
 /// 到达规则：命中首个匹配等待者则定向移交；无人匹配则按位或并入粘滞
 /// 余量。公平性由队列结构保证，内核不做挑选。
+/// `terminal_mask` 标记永不消费清除的终态位（如隧道 `PEER_CLOSED`）：
+/// 无论何种清除路径，终态位都豁免。
 pub struct SignalState {
     mask: u64,
+    terminal_mask: u64,
     waiters: VecDeque<ObjectWaiter>,
 }
 
 impl SignalState {
     pub const fn new() -> Self {
-        Self { mask: 0, waiters: VecDeque::new() }
+        Self { mask: 0, terminal_mask: 0, waiters: VecDeque::new() }
+    }
+
+    /// 带终态位的构造（隧道端点用：PEER_CLOSED 置位后持续可见至销毁）。
+    pub const fn with_terminal(terminal_mask: u64) -> Self {
+        Self { mask: 0, terminal_mask, waiters: VecDeque::new() }
     }
 
     /// 提交一个事件：置位 + 定向唤醒首个匹配的 Signal 等待者。
     ///
     /// `clear_on_deliver` 决定移交成功后是否从粘滞余量清除已交付的位：
-    /// 进程级信号位是消费式（命中即清），邮箱 NONEMPTY 是内核托管位
-    /// （随队列生灭，绝不在消费点清除）。返回是否有人被唤醒。
-    fn submit(&mut self, bits: u64, clear_on_deliver: bool) -> bool {
+    /// 进程级信号位与隧道 DATA 是消费式（命中即清），邮箱 NONEMPTY 是
+    /// 内核托管位（随队列生灭，绝不在消费点清除）。终态位一律豁免清除。
+    /// 返回是否有人被唤醒。
+    pub(crate) fn submit(&mut self, bits: u64, clear_on_deliver: bool) -> bool {
         self.mask |= bits;
         let pos = self.waiters.iter().position(
             |w| matches!(&w.request, WaitRequest::Signal { interest, .. } if interest & bits != 0),
@@ -98,7 +107,8 @@ impl SignalState {
             f.sepc += 4;
         });
         if woken && clear_on_deliver {
-            self.mask &= !delivered;
+            // 终态位豁免清除（持续可见语义）。
+            self.mask &= !(delivered & !self.terminal_mask);
         }
         woken
     }
@@ -106,6 +116,21 @@ impl SignalState {
     /// 注册一个等待条目（发布路径专用：调用方持对象锁、已做双检）。
     fn enroll(&mut self, waiter: ObjectWaiter) {
         self.waiters.push_back(waiter);
+    }
+
+    /// 消费式命中测试：命中即清除（终态位豁免）。进程信号与隧道端点用。
+    pub(crate) fn hit_consume(&mut self, interest: u64) -> Option<u64> {
+        (self.mask & interest != 0).then(|| {
+            let bits = self.mask & interest;
+            self.mask &= !(bits & !self.terminal_mask);
+            bits
+        })
+    }
+
+    /// 只读命中测试（内核托管位的报告语义，如 NONEMPTY——清除责任
+    /// 在队列变更点，不在消费者）。
+    fn hit_peek(&self, interest: u64) -> Option<u64> {
+        (self.mask & interest != 0).then_some(self.mask & interest)
     }
 }
 
@@ -297,6 +322,8 @@ pub fn signal_send(_thread: &Thread, pid: Pid, mask: u64) -> Result<bool, System
 pub enum SigTarget {
     Process,
     Mailbox,
+    /// 自身已挂接的隧道端点；载荷为隧道 id。
+    Tunnel(u64),
 }
 
 /// SignalWait 的分流结果。
@@ -335,24 +362,25 @@ pub fn signal_wait(thread: &Thread, items_ptr: usize, count: usize) -> Result<Wa
         let target = match item.kind {
             0 => SigTarget::Process,
             1 => SigTarget::Mailbox,
-            _ => return Err(SystemCallError::NotSupported), // 隧道端点随 tunnel 里程碑接入
+            2 => SigTarget::Tunnel(item.id),
+            _ => return Err(SystemCallError::NotSupported),
         };
-        // 快路径：粘滞余量已命中则即时完成。进程位消费式清除；邮箱位
-        // 是内核托管位，只报告不清除（队列排空时由 take/discard 清）。
+        // 快路径：粘滞余量已命中则即时完成。进程位与隧道 DATA 消费式
+        // 清除（终态位豁免）；邮箱位是内核托管位，只报告不清除（队列
+        // 排空时由 take/discard 清）。
         let hit = match target {
-            SigTarget::Process => {
-                let mut sig = thread.process.signals.lock();
-                if sig.mask & interest != 0 {
-                    let bits = sig.mask & interest;
-                    sig.mask &= !interest;
-                    Some(bits)
-                } else {
-                    None
-                }
-            }
+            SigTarget::Process => thread.process.signals.lock().hit_consume(interest),
             SigTarget::Mailbox => {
                 let mb = thread.process.mailbox.lock();
-                (mb.sig.mask & interest != 0).then_some(mb.sig.mask & interest)
+                mb.sig.hit_peek(interest)
+            }
+            SigTarget::Tunnel(id) => {
+                let entry = super::tunnel::lookup(id).ok_or(SystemCallError::ObjectNotFound)?;
+                let mut entry = entry.lock();
+                let sig = entry
+                    .endpoint_sig_of(thread.process.pid)
+                    .ok_or(SystemCallError::ObjectNotFound)?;
+                sig.hit_consume(interest)
             }
         };
         if let Some(bits) = hit {
@@ -411,35 +439,55 @@ pub(crate) fn publish_recv(t: &Arc<Thread>, buf: usize, len: usize) {
 pub(crate) fn publish_signal_wait(t: &Arc<Thread>, targets: Vec<(SigTarget, u64)>) {
     let generation = t.wait_gen.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
     for (index, (target, interest)) in targets.iter().enumerate() {
+        // 双检 + 登记：命中语义与快路径一致（进程/隧道消费式，邮箱托管）。
         let hit = match target {
             SigTarget::Process => {
                 let mut sig = t.process.signals.lock();
-                if sig.mask & interest != 0 {
-                    let bits = sig.mask & interest;
-                    sig.mask &= !interest;
-                    Some(bits)
-                } else {
-                    sig.enroll(ObjectWaiter {
-                        thread: t.clone(),
-                        generation,
-                        request: WaitRequest::Signal { index, interest: *interest },
-                    });
-                    None
+                match sig.hit_consume(*interest) {
+                    Some(bits) => Some(bits),
+                    None => {
+                        sig.enroll(ObjectWaiter {
+                            thread: t.clone(),
+                            generation,
+                            request: WaitRequest::Signal { index, interest: *interest },
+                        });
+                        None
+                    }
                 }
             }
             SigTarget::Mailbox => {
                 let mut mb = t.process.mailbox.lock();
-                if mb.sig.mask & interest != 0 {
-                    Some(mb.sig.mask & interest) // 内核托管位：报告不清除
-                } else {
-                    mb.sig.enroll(ObjectWaiter {
-                        thread: t.clone(),
-                        generation,
-                        request: WaitRequest::Signal { index, interest: *interest },
-                    });
-                    None
-                }
+                mb.sig.hit_peek(*interest).map_or_else(
+                    || {
+                        mb.sig.enroll(ObjectWaiter {
+                            thread: t.clone(),
+                            generation,
+                            request: WaitRequest::Signal { index, interest: *interest },
+                        });
+                        None
+                    },
+                    Some,
+                )
             }
+            SigTarget::Tunnel(id) => match super::tunnel::lookup(*id) {
+                Some(entry) => {
+                    let mut entry = entry.lock();
+                    let hit = entry
+                        .endpoint_sig_of(t.process.pid)
+                        .and_then(|sig| sig.hit_consume(*interest));
+                    if hit.is_none() {
+                        if let Some(sig) = entry.endpoint_sig_of(t.process.pid) {
+                            sig.enroll(ObjectWaiter {
+                                thread: t.clone(),
+                                generation,
+                                request: WaitRequest::Signal { index, interest: *interest },
+                            });
+                        }
+                    }
+                    hit
+                }
+                None => None, // 隧道已消失：条目永不命中，等待者由代数仲裁惰性处理
+            },
         };
         if let Some(bits) = hit {
             // 作废本轮已推送的同代条目：代数再进一步，它们成为死条目，
