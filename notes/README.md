@@ -17,7 +17,7 @@
 | 内存管理 | — | [mm](impls/mm.md) |
 | 内核内部机制（中断 / 锁 / 唤醒） | — | [internals](impls/internals.md) |
 | 执行环境（boot / trap / 上下文） | — | [execution-context](impls/execution-context.md) |
-| IPC 总览（消息 / 信号 / 隧道） | [ipc](ideas/ipc.md)、[message](ideas/message.md)、[signal](ideas/signal.md)、[tunnel](ideas/tunnel.md) | — |
+| IPC 总览（消息 / 信号 / 隧道） | [ipc](ideas/ipc.md)、[message](ideas/message.md)、[signal](ideas/signal.md)、[tunnel](ideas/tunnel.md)、[runnel](ideas/runnel.md) | — |
 | 文件系统（FAL / 服务框架） | [fs](ideas/fs.md)、[fal](ideas/fal.md)、[framework](ideas/framework.md) | — |
 | 设备租借 | [device](ideas/device.md) | — |
 | 服务进程 | [service](ideas/service.md) | — |
