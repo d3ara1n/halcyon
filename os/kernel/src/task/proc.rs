@@ -271,24 +271,34 @@ impl AddressSpace {
     }
 }
 
-/// 进程：资源容器（地址空间、父子关系；邮箱/信号/隧道随 IPC 里程碑挂入）。
+impl AddressSpace {
+    /// 查询单页物理地址（跨地址空间完成路径用，见 [`crate::uaccess`]）；
+    /// 页必须已映射。仅取地址，权限校验仍由 check_range 承担。
+    pub(crate) fn page_pa(&mut self, va: usize) -> Option<usize> {
+        self.tree
+            .translate(Vpn(va / PAGE_SIZE))
+            .map(|m| m.ppn.0 * PAGE_SIZE)
+    }
+}
+
+/// 进程：资源容器（地址空间、父子关系、邮箱与进程级信号状态；隧道随
+/// tunnel 里程碑挂入）。
 ///
 /// 所有权方向：线程强持有进程（Thread.process: Arc<Process>）；一切
 /// 「从等待对象/表结构找线程」的反向引用一律持 Weak<Thread>，不在此
-/// 处回指——强引用环会让 reap 永不释放帧。
+/// 处回指——强引用环会让 reap 永不释放帧。IPC 等待条目同样强持线程，
+/// 但条目是瞬态的（唤醒即摘除），不构成持久环：进程仅在最后一个线程
+/// 消亡后随 Drop 链释放（多线程 kill 里程碑需补「杀等待中线程」的
+/// 队列清扫）。
 pub struct Process {
     pub pid: Pid,
     pub parent: Pid,
     pub space: crate::sync::Spinlock<AddressSpace>,
-    /// 信号配置（SignalSet 记录式实现：接受设置，注入/返回语义随信号里程碑交付）。
-    pub signal: crate::sync::Spinlock<SignalConfig>,
-}
-
-/// 信号处理配置（rinlib 启动契约：main 前注册 Terminate 处理器）。
-#[derive(Clone, Copy)]
-pub struct SignalConfig {
-    pub mask: u64,
-    pub handler: usize,
+    /// 邮箱（有界 FIFO，契约见 notes/ideas/message.md）。Pid=0 的内核
+    /// 邮箱独立存在于 ipc::KERNEL_MAILBOX，不经进程表。
+    pub mailbox: crate::sync::Spinlock<crate::task::ipc::Mailbox>,
+    /// 进程级信号状态（TERMINATE + 用户自定义区，契约见 notes/ideas/signal.md）。
+    pub signals: crate::sync::Spinlock<crate::task::ipc::SignalState>,
 }
 
 impl Process {
@@ -297,7 +307,8 @@ impl Process {
             pid,
             parent,
             space: crate::sync::Spinlock::new(AddressSpace::new()?),
-            signal: crate::sync::Spinlock::new(SignalConfig { mask: 0, handler: 0 }),
+            mailbox: crate::sync::Spinlock::new(crate::task::ipc::Mailbox::new()),
+            signals: crate::sync::Spinlock::new(crate::task::ipc::SignalState::new()),
         })
     }
 }

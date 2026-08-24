@@ -12,15 +12,14 @@ pub type Tid = u32;
 pub type SignalMap = u64;
 
 flags! {
-    /// Predefined signal numbers
+    /// Predefined process-level signal bits（契约见 notes/ideas/signal.md：
+    /// 进程对象信号状态的用户可见预定义区；其余位归用户协议自定义）。
     #[derive(FromPrimitive, ToPrimitive)]
     pub enum SystemSignal: SignalMap {
         /// Reserved
         None = 0,
         /// Request to finalize the job and quit. It's a REQUEST! Use kill syscall to finalize a process without notifying
         Terminate = 1 << 0,
-        /// Notify the process should check itself for (device interrupts, events listened)
-        Notify = 1 << 1,
     }
 }
 

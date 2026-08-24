@@ -24,3 +24,5 @@ pub mod path;
 pub mod time;
 /// Messaging primitives
 pub mod message;
+/// Signal primitives
+pub mod signal;

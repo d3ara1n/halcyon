@@ -2,6 +2,15 @@
 
 记录会随时间消灭的问题，修复后删除条目；持久性约定在 AGENTS.md。
 
+## fs 集成负载在 FAL 桩上 unwrap panic
+
+`ea24d68` 将用户态桩接口语义恢复为返回错误后，`systems/fs` 的
+`create_directory(...).unwrap()`（main.rs:19）即 panic 退出回收——
+错误码经 FileSystemError 映射为 `Unknown`，可读性也差。行为本身
+符合「FAL 未实现 → 服务被杀」的预期，但集成负载失效：fs 的 main
+后续段落（目录枚举/属性读写）不再被执行。接入 FAL 时以真实实现
+消解；若在那之前需要跑 fs 后续段落，先给 fs main 补优雅的错误处理。
+
 ## page_table unmap_range 跨表批量解除算错子表基址
 
 `os/page_table/src/lib.rs` `unmap_range` 对每个递归子表都用初始

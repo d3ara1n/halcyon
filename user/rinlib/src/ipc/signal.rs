@@ -1,43 +1,23 @@
+//! 信号封装（契约见 notes/ideas/signal.md）：对象切面状态位 +
+//! 等待者队列。分发到用户代码由 rt 层的监听机制承担，本模块只暴露
+//! 机制级原语。
+
 use erhino_shared::{
     call::SystemCallError,
-    proc::{Pid, SignalMap, SystemSignal},
+    proc::{Pid, SignalMap},
 };
-use flagset::FlagSet;
-use num_traits::FromPrimitive;
 
-use crate::call::{sys_signal_return, sys_signal_send, sys_signal_set};
+use crate::call::{sys_signal_send, sys_signal_wait};
 
-static mut SIGNAL_HANDLER: Option<fn(SystemSignal)> = None;
-
-#[derive(Debug)]
-pub enum SignalError {
-    InternalError,
-    ProcessNotFound,
+/// 向目标进程提交信号位（置位 + 唤醒等待者，永不阻塞）。返回是否移交
+/// 唤醒了等待者（false = 已并入粘滞余量）。
+pub fn send(pid: Pid, mask: SignalMap) -> Result<bool, SystemCallError> {
+    unsafe { sys_signal_send(pid, mask) }
 }
 
-pub fn set_handler<S: Into<FlagSet<SystemSignal>>>(mask: S, handler: fn(SystemSignal)) {
-    unsafe {
-        SIGNAL_HANDLER = Some(handler);
-        sys_signal_set(mask.into(), signal_handler_wrapper as *const () as usize).expect("this wont failed");
-    }
-}
-
-pub fn send(pid: Pid, signal: SystemSignal) -> Result<bool, SignalError> {
-    unsafe {
-        sys_signal_send(pid, signal).map_err(|e| match e {
-            SystemCallError::ObjectNotFound => SignalError::ProcessNotFound,
-            _ => SignalError::InternalError,
-        })
-    }
-}
-
-fn signal_handler_wrapper(signal: SignalMap) {
-    if let Some(handler) = unsafe { SIGNAL_HANDLER } {
-        if let Some(signal) = SystemSignal::from_u64(signal) {
-            handler(signal)
-        }
-    }
-    unsafe {
-        sys_signal_return().expect("wont failed if signal_handler called only by kernel");
-    }
+/// 阻塞等待任一对象的关注位命中，返回 `(命中项下标, 命中位)`。
+/// 注意：进程级信号位是消费式清除（命中即清）；邮箱 NONEMPTY 为内核
+/// 托管位，命中不清除。
+pub fn wait(items: &[erhino_shared::signal::SignalItem]) -> Result<(usize, SignalMap), SystemCallError> {
+    unsafe { sys_signal_wait(items) }
 }

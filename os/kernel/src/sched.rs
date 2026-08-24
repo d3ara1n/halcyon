@@ -9,8 +9,11 @@ use core::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+use erhino_shared::call::SystemCallError;
+use num_traits::ToPrimitive;
 
+use crate::context::UserContext;
 use crate::sync::Spinlock;
 use crate::{hart, mm, sbi, trap::{self, Outcome}};
 use crate::sbi::DISARM;
@@ -72,29 +75,26 @@ impl SchedDomain {
 /// 等待凭据：等待条目强持有等待中的线程（线程的强引用随容器走：
 /// 就绪队列 / 执行点循环栈 / 等待条目，见 task.md「单一归属不变量」），
 /// generation 是单次完成与取消仲裁的唯一凭据。
-struct Waiter {
-    thread: Arc<Thread>,
-    generation: u64,
+pub(crate) struct Waiter {
+    pub(crate) thread: Arc<Thread>,
+    pub(crate) generation: u64,
 }
 
-/// 等待类别。IPC 的 Recv/Tunnel 等待作为新变体横向加入，结构不变。
-#[derive(Clone, Copy)]
-enum WaitKind {
-    Sleep,
-}
-
-/// 期限表条目：到期时间 + 谁在等 + 完成后做什么。
+/// 期限表条目：到期时间 + 谁在等。当前仅 sleep 一种期限等待；新增
+/// 期限类等待时再引入类别字段。
 struct DeadlineEntry {
     at: u64,
     waiter: Waiter,
-    kind: WaitKind,
 }
 
 static TIMERS: Spinlock<Vec<DeadlineEntry>> = Spinlock::new(Vec::new());
 
-/// 等待意图类别（HartLocal.park_kind 槽的取值，hart 私有槽无并发）。
+/// 等待意图槽取值（HartLocal.park_kind；hart 私有槽无并发）。IPC 两类
+/// 的参数是装箱的内核对象指针（park_arg 携带，发布时回收）。
 const PARK_NONE: usize = 0;
 const PARK_SLEEP: usize = 1;
+const PARK_RECV: usize = 2;
+const PARK_SIGNAL: usize = 3;
 
 /// dispatcher 侧登记：把等待意图写入本 hart 槽。此刻**不碰任何全局
 /// 结构**——发布由调度循环在线程离开执行点之后完成（park_publish），
@@ -105,6 +105,23 @@ pub fn park_request_sleep(ms: u64) {
     me.park_arg.store(ms as usize, Ordering::Relaxed);
     // Kind 最后写：与汇编侧「数据先于标记」同一发布纪律。
     me.park_kind.store(PARK_SLEEP, Ordering::Relaxed);
+}
+
+/// Receive 阻塞形态的登记：参数装箱，发布时由 ipc::publish_recv 回收。
+pub fn park_request_recv(buf: usize, len: usize) {
+    let me = hart::current();
+    me.park_arg.store(
+        alloc::boxed::Box::into_raw(alloc::boxed::Box::new((buf, len))) as usize,
+        Ordering::Relaxed,
+    );
+    me.park_kind.store(PARK_RECV, Ordering::Relaxed);
+}
+
+/// SignalWait 阻塞形态的登记：目标表装箱，发布时由 ipc::publish_signal_wait 回收。
+pub fn park_request_signal(targets: *mut Vec<(crate::task::ipc::SigTarget, u64)>) {
+    let me = hart::current();
+    me.park_arg.store(targets as usize, Ordering::Relaxed);
+    me.park_kind.store(PARK_SIGNAL, Ordering::Relaxed);
 }
 
 /// 调度循环 Park 分支调用：消费意图槽，向全局期限表发布等待并 arm。
@@ -120,9 +137,21 @@ fn park_publish(t: &Arc<Thread>) {
             TIMERS.lock().push(DeadlineEntry {
                 at,
                 waiter: Waiter { thread: t.clone(), generation },
-                kind: WaitKind::Sleep,
             });
             arm_earliest();
+        }
+        PARK_RECV => {
+            let p = me.park_arg.load(Ordering::Relaxed) as *mut (usize, usize);
+            // SAFETY: 指针由 park_request_recv 装箱产生，仅此处回收一次。
+            let (buf, len) = unsafe { *Box::from_raw(p) };
+            crate::task::ipc::publish_recv(t, buf, len);
+        }
+        PARK_SIGNAL => {
+            let p = me.park_arg.load(Ordering::Relaxed)
+                as *mut Vec<(crate::task::ipc::SigTarget, u64)>;
+            // SAFETY: 指针由 syscall 分发路径装箱产生，仅此处回收一次。
+            let targets = unsafe { *Box::from_raw(p) };
+            crate::task::ipc::publish_signal_wait(t, targets);
         }
         _ => unreachable!("Park outcome must carry a wait intent"),
     }
@@ -131,27 +160,39 @@ fn park_publish(t: &Arc<Thread>) {
 /// 完成一次等待：代数仲裁（CAS 消费，单次完成）→ 写结果 → 入队。
 /// 线程已死（upgrade 失败）或已被取消/完成（gen 不匹配）则惰性丢弃。
 fn complete(entry: DeadlineEntry) {
-    // 线程强引用随条目而来；gen 不匹配（已被取消/完成）时本函数返回，
-    // 条目连同其 Arc 一并丢弃——若这是最后一份强引用，线程随之消亡
-    //（仅取消场景可能发生；sleep 等待的条目唯一且必被完成）。
-    let t = entry.waiter.thread;
-    if t.wait_gen
-        .compare_exchange(entry.waiter.generation, entry.waiter.generation + 1, Ordering::AcqRel, Ordering::Acquire)
+    fulfill(entry.waiter.thread, entry.waiter.generation, |f| {
+        f.x[10] = 0; // NoError
+        f.x[11] = 0;
+        f.sepc += 4;
+    });
+}
+
+/// 完成一次 IPC/期限等待：代数仲裁（CAS 消费，单次完成）→ 回调写结果
+/// → 入队。返回 false 表示条目已死（gen 不匹配，已被取消或在别处完成），
+/// 条目连同其 Arc 一并丢弃——若这是最后一份强引用，线程随之消亡。
+pub(crate) fn fulfill(thread: Arc<Thread>, generation: u64, f: impl FnOnce(&mut UserContext)) -> bool {
+    if thread
+        .wait_gen
+        .compare_exchange(generation, generation + 1, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return;
+        return false;
     }
-    match entry.kind {
-        WaitKind::Sleep => {
-            // SAFETY: gen 已消费 ⇒ 该等待恰被本次完成；线程处于 Waiting
-            //（无容器、无 hart 执行——发布时序保证），独占写帧安全。
-            let frame = unsafe { &mut *t.frame_ptr() };
-            frame.x[10] = 0; // NoError
-            frame.x[11] = 0;
-            frame.sepc += 4;
-            enqueue(t);
-        }
-    }
+    // SAFETY: gen 已消费 ⇒ 该等待恰被本次完成；线程处于 Waiting
+    //（无容器、无 hart 执行——发布时序保证），独占写帧安全。
+    let frame = unsafe { &mut *thread.frame_ptr() };
+    f(frame);
+    enqueue(thread);
+    true
+}
+
+/// 以错误码完成一次等待（[`fulfill`] 的错误帧便捷形式）。
+pub(crate) fn respond_error_to(thread: Arc<Thread>, generation: u64, err: SystemCallError) -> bool {
+    let code = err.to_usize().unwrap_or(1) as u64;
+    fulfill(thread, generation, |f| {
+        f.x[10] = code;
+        f.sepc += 4;
+    })
 }
 
 /// 空闲 hart 位图（IPI 门铃的目标集）。
@@ -347,8 +388,10 @@ fn sip_stip_pending() -> bool {
 /// 终端静默：无任何唤醒主人——预期 hart 全部已进 idle（无人能再
 /// 产生工作：enqueue 只来自运行中的 hart）、就绪队列空、期限表空、
 /// 无设备中断使能（当前无设备；接入后设备即主人，谓词自然失效）。
-/// 新增等待源（IPC 等）时本谓词必须同步扩展：每种 Waiting 都要有
-/// 可枚举的主人，否则静默误判为停机。
+/// 新增等待源时本谓词必须同步扩展：每种 Waiting 都要有可枚举的主人，
+/// 否则静默误判为停机。IPC 等待者（邮箱/信号）刻意**不**阻止静默：
+/// hart 全 idle 时不存在能投递消息/信号的执行流，等待者永无主人，
+/// 停机即正确终态。
 fn is_quiescent() -> bool {
     IDLE_MASK.load(Ordering::SeqCst) == crate::registry::active_slot_mask()
         && !DOMAIN.has_ready()

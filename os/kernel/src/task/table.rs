@@ -30,6 +30,11 @@ pub fn insert(process: Arc<Process>) {
     TABLE.map.lock().insert(process.pid, process);
 }
 
+/// 查询进程（IPC 投递目标解析等）。
+pub fn get(pid: Pid) -> Option<Arc<Process>> {
+    TABLE.map.lock().get(&pid).cloned()
+}
+
 /// 摘除进程（退出回收的第一步；返回值 Drop 即释放地址空间）。
 pub fn remove(pid: Pid) -> Option<Arc<Process>> {
     TABLE.map.lock().remove(&pid)

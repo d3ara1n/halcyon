@@ -1,11 +1,11 @@
 use core::{alloc::Layout, panic::PanicInfo, ptr::NonNull};
-use erhino_shared::proc::{Pid, SystemSignal, Termination};
+use erhino_shared::proc::{Pid, Termination};
 use erhino_shared::sync::spin::SimpleLock;
 use talc::{base::binning::Binning, base::Talc, source::Source, TalcLock};
 
 use crate::call::sys_extend;
 use crate::env;
-use crate::{call::sys_exit, debug, ipc::signal};
+use crate::{call::sys_exit, debug};
 
 const INITIAL_HEAP_SIZE: usize = 1 * 0x1000;
 
@@ -77,7 +77,8 @@ fn lang_start<T: Termination + 'static>(
             .expect("initial heap claim failed");
         talc.source.heap_end = heap_end.as_ptr() as usize;
     }
-    signal::set_handler(SystemSignal::Terminate, default_signal_handler);
+    // 信号分发说明：内核只做置位与唤醒，进程级信号的接收/分发由程序
+    // 自行安排（监听线程模式待多线程里程碑接入 rt；见 notes/ideas/signal.md）。
     let code = main().to_exit_code();
     unsafe {
         loop {
@@ -108,13 +109,4 @@ fn handle_panic(info: &PanicInfo) -> ! {
 #[alloc_error_handler]
 fn handle_alloc_error(layout: Layout) -> ! {
     panic!("Heap allocation error, layout = {:?}", layout);
-}
-
-fn default_signal_handler(signal: SystemSignal) {
-    match signal {
-        SystemSignal::Terminate => unsafe {
-            sys_exit(1).expect("no wish to die");
-        },
-        _ => {}
-    };
 }

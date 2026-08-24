@@ -36,6 +36,8 @@ pub enum SystemCallError {
     ReachLimit = 0x33,
     /// Cannot perform operation on this type of objects
     NotSupported = 0x34,
+    /// Target mailbox is full (message delivery never blocks)
+    MailboxFull = 0x35,
 }
 
 /// Predefined system calls
@@ -73,24 +75,25 @@ pub enum SystemCall {
     /// 当前线程睡眠指定毫秒（异步：登记期限后 Waiting，到期唤醒）
     Sleep = 0x25,
     // -----Signal-----
-    /// Return from signal handler
-    SignalReturn = 0x30,
-    /// Send a signal to the process
+    /// Submit signal bits to a process (delivery = sticky OR + wake, never blocks)
     SignalSend = 0x31,
-    /// Set signal handler for the current process
-    SignalSet = 0x32,
+    /// Block until any watched object's signal state hits; args: items_ptr, count.
+    /// Each item is a [`crate::signal::SignalItem`]. On wake, a1 =
+    /// `(item_index << 56) | delivered_bits`.
+    SignalWait = 0x32,
 
     // -----Messaging-----
-    /// Send a message carrying a huge payload then block until message received
+    /// Deliver target/kind/payload to the target process's mailbox. Never blocks:
+    /// full mailbox returns [`SystemCallError::MailboxFull`] immediately.
     Send = 0x40,
-    /// Check the mailbox if there is a message and get the payload size
-    /// 
-    /// **Note**: Empty mailbox causes an expected error [SystemCallError::ObjectNotAvailable].
-    /// `Peek` will steal the content in the mailbox of the process and put it into the thread private space for `Receive` to use
+    /// Non-blocking check of own mailbox; writes [`crate::message::MessageDigest`]
+    /// to the given buffer and returns payload length. Empty mailbox yields
+    /// [`SystemCallError::ObjectNotAvailable`]. Does not alter mailbox state.
     Peek = 0x41,
     /// Empty the mailbox
     Discard = 0x42,
-    /// Retrieve payload
+    /// Take the head message payload into buf. Blocks (thread Waiting) while
+    /// mailbox is empty; wakes with a1 = payload length on arrival.
     Receive = 0x43,
     
     // -----Process memory-----

@@ -1,15 +1,15 @@
-use core::{arch::asm, mem::size_of};
+use core::arch::asm;
 
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
     fal::{DentryAttribute, DentryType},
     mem::Address,
     message::MessageDigest,
-    proc::{ExitCode, Pid, SystemSignal, Tid},
+    proc::{ExitCode, Pid, SignalMap, Tid},
+    signal::SignalItem,
 };
 use flagset::FlagSet;
 use num_traits::FromPrimitive;
-use num_traits::ToPrimitive;
 
 type SystemCallResult<T> = Result<T, SystemCallError>;
 
@@ -83,30 +83,6 @@ pub unsafe fn sys_tunnel_dispose(key: usize) -> SystemCallResult<()> {
     sys_call(SystemCall::TunnelDispose, key, 0, 0, 0).map(|_| {})
 }
 
-pub unsafe fn sys_signal_set(
-    mask: FlagSet<SystemSignal>,
-    handler: Address,
-) -> SystemCallResult<()> {
-    sys_call(SystemCall::SignalSet, mask.bits() as usize, handler, 0, 0).map(|_| ())
-}
-
-pub unsafe fn sys_signal_send(pid: Pid, signal: SystemSignal) -> SystemCallResult<bool> {
-    sys_call(
-        SystemCall::SignalSend,
-        pid as usize,
-        signal
-            .to_u64()
-            .expect("cast system signal to signal map wont failed") as usize,
-        0,
-        0,
-    )
-    .map(|f| f != 0)
-}
-
-pub unsafe fn sys_signal_return() -> SystemCallResult<()> {
-    sys_call(SystemCall::SignalReturn, 0, 0, 0, 0).map(|_| ())
-}
-
 // 返回需要准备的 buffer 大小
 pub unsafe fn sys_access(path: &str) -> SystemCallResult<usize> {
     sys_call(SystemCall::Access, path.as_ptr() as usize, path.len(), 0, 0)
@@ -171,18 +147,21 @@ pub unsafe fn sys_send(target: Pid, kind: usize, buffer: &[u8]) -> SystemCallRes
     .map(|_| ())
 }
 
-pub unsafe fn sys_peek(digest_buffer: &[u8]) -> SystemCallResult<bool> {
+/// 非阻塞检查邮箱队头：有则填充 digest 并返回负载长度，空箱返回
+/// ObjectNotAvailable。
+pub unsafe fn sys_peek(digest: *mut MessageDigest) -> SystemCallResult<usize> {
     sys_call(
         SystemCall::Peek,
-        digest_buffer.as_ptr() as usize,
-        size_of::<MessageDigest>(),
+        digest as usize,
+        0,
         0,
         0,
     )
-    .map(|b| b > 0)
 }
 
-pub unsafe fn sys_receive(buffer: &[u8]) -> SystemCallResult<usize> {
+/// 取队头消息负载到 buffer（长度须经 Peek 预知）。空箱时**阻塞**：
+/// 线程转 Waiting，消息到达即唤醒，返回负载长度。
+pub unsafe fn sys_receive(buffer: &mut [u8]) -> SystemCallResult<usize> {
     sys_call(
         SystemCall::Receive,
         buffer.as_ptr() as usize,
@@ -190,6 +169,28 @@ pub unsafe fn sys_receive(buffer: &[u8]) -> SystemCallResult<usize> {
         0,
         0,
     )
+}
+
+pub unsafe fn sys_discard() -> SystemCallResult<()> {
+    sys_call(SystemCall::Discard, 0, 0, 0, 0).map(|_| ())
+}
+
+/// 向目标进程提交信号位。返回是否移交唤醒了等待者（false = 已并入粘滞余量）。
+pub unsafe fn sys_signal_send(pid: Pid, mask: SignalMap) -> SystemCallResult<bool> {
+    sys_call(SystemCall::SignalSend, pid as usize, mask as usize, 0, 0).map(|w| w != 0)
+}
+
+/// 阻塞等待任一对象的关注位命中。items 见 [`SignalItem`]；返回
+/// `(命中项下标, 命中位)`。
+pub unsafe fn sys_signal_wait(items: &[SignalItem]) -> SystemCallResult<(usize, SignalMap)> {
+    let packed = sys_call(
+        SystemCall::SignalWait,
+        items.as_ptr() as usize,
+        items.len(),
+        0,
+        0,
+    )?;
+    Ok((packed >> 56, (packed & 0x00FF_FFFF_FFFF_FFFF) as SignalMap))
 }
 
 // 当前线程睡眠指定毫秒（异步 syscall：内核登记期限，到期唤醒）

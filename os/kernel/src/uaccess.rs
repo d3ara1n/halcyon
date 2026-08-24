@@ -10,7 +10,7 @@
 //! `Process.space` 锁，同进程无并发映射变更者。
 
 use crate::mm::SumGuard;
-use crate::task::proc::AddressSpace;
+use crate::task::proc::{AddressSpace, PAGE_SIZE};
 
 /// 单次访问上限（防恶意长度；Debug 消息与初期 IPC 载荷远小于此）。
 pub const MAX_USER_ACCESS: usize = 1 << 20;
@@ -58,7 +58,6 @@ pub fn copy_from_user(
 }
 
 /// 从内核拷入用户内存（dst 为用户 VA，src 为内核缓冲）。
-#[expect(dead_code, reason = "IPC 消息投递的首个消费者随下一里程碑接入")]
 pub fn copy_to_user(
     space: &mut AddressSpace,
     dst: usize,
@@ -73,6 +72,38 @@ pub fn copy_to_user(
     // SAFETY: 同上。
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
+    }
+    Ok(())
+}
+
+/// 跨地址空间拷入用户缓冲：完成方上下文目标空间**未激活**（调度循环/
+/// 异核唤醒路径，SUM 直访不可用），逐页 translate 后经直映射写入。
+/// 校验与拷贝同持 `space` 锁，无 TOCTOU；页间边界由逐页循环消除。
+pub fn put_user_indirect(
+    space: &mut AddressSpace,
+    dst: usize,
+    src: &[u8],
+) -> Result<(), AccessError> {
+    if src.len() > MAX_USER_ACCESS {
+        return Err(AccessError::BadRange);
+    }
+    space.check_range(dst, src.len(), true)?;
+    let mut off = 0;
+    while off < src.len() {
+        let va = dst + off;
+        let in_page = va % PAGE_SIZE;
+        let n = (PAGE_SIZE - in_page).min(src.len() - off);
+        let pa = space.page_pa(va).ok_or(AccessError::NotMapped)?;
+        // SAFETY: 页已校验含 U|W；pa 来自该页 translate，直映射区间
+        // [pa+in_page, pa+in_page+n) 不出页且与 src 不重叠。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src[off..].as_ptr(),
+                crate::mm::phys_to_virt(pa + in_page) as *mut u8,
+                n,
+            );
+        }
+        off += n;
     }
     Ok(())
 }

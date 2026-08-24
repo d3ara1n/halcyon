@@ -7,7 +7,9 @@
 use num_traits::{FromPrimitive, ToPrimitive};
 use erhino_shared::call::{SystemCall, SystemCallError};
 
-use crate::{context::UserContext, sched, task::Thread, uaccess};
+use crate::{context::UserContext, sched, task::ipc, task::Thread, uaccess};
+
+use alloc::boxed::Box;
 
 /// syscall 处理出口（见 notes/impls/call.md「异步调用」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,14 +52,67 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
             Outcome::Completed
         }
-        SystemCall::SignalSet => {
-            // 记录式实现：接受 mask/handler 配置，信号注入/返回语义随信号里程碑交付。
-            let mut signal = thread.process.signal.lock();
-            signal.mask = frame.x[10];
-            signal.handler = frame.x[11] as usize;
-            drop(signal);
-            respond_ok(frame, 0);
+        SystemCall::Send => {
+            // Send(target, kind, buf, len)：永不阻塞，满箱 MailboxFull。
+            match ipc::send(thread, frame.x[12] as usize, frame.x[13] as usize, a0 as u32, frame.x[11] as usize) {
+                Ok(len) => respond_ok(frame, len),
+                Err(e) => respond_error(frame, e),
+            }
             Outcome::Completed
+        }
+        SystemCall::Peek => {
+            match ipc::peek(thread, a0) {
+                Ok(len) => respond_ok(frame, len),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
+        SystemCall::Discard => {
+            match ipc::discard(thread) {
+                Ok(()) => respond_ok(frame, 0),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
+        SystemCall::Receive => {
+            match ipc::receive(thread, a0, frame.x[11] as usize) {
+                ipc::RecvOutcome::Done(result) => {
+                    match result {
+                        Ok(len) => respond_ok(frame, len),
+                        Err(e) => respond_error(frame, e),
+                    }
+                    Outcome::Completed
+                }
+                ipc::RecvOutcome::Block => {
+                    // 空箱阻塞：登记意图后转 Waiting；完成时帧携带
+                    // a1 = 负载长度，sepc 由完成方前进。
+                    sched::park_request_recv(a0, frame.x[11] as usize);
+                    Outcome::Wait
+                }
+            }
+        }
+        SystemCall::SignalSend => {
+            match ipc::signal_send(thread, a0 as u32, frame.x[11]) {
+                Ok(woken) => respond_ok(frame, woken as usize),
+                Err(e) => respond_error(frame, e),
+            }
+            Outcome::Completed
+        }
+        SystemCall::SignalWait => {
+            match ipc::signal_wait(thread, a0, frame.x[11] as usize) {
+                Ok(ipc::WaitPlan::Now { index, bits }) => {
+                    respond_ok(frame, ((index as u64) << 56 | bits) as usize);
+                    Outcome::Completed
+                }
+                Ok(ipc::WaitPlan::Park(targets)) => {
+                    sched::park_request_signal(Box::into_raw(Box::new(targets)));
+                    Outcome::Wait
+                }
+                Err(e) => {
+                    respond_error(frame, e);
+                    Outcome::Completed
+                }
+            }
         }
         // 未实现面：一律返回错误（内核不可被用户调用 panic）。
         _ => {
