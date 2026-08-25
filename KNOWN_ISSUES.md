@@ -11,6 +11,19 @@
 后续段落（目录枚举/属性读写）不再被执行。接入 FAL 时以真实实现
 消解；若在那之前需要跑 fs 后续段落，先给 fs main 补优雅的错误处理。
 
+## 用户态多线程落地前的写回 panic 面
+
+IPC 对象层 review（`plans/review-2026-08-ipc-object.md`）确认：
+`MailboxCreate`/`HandleDuplicate`/`MailboxMakeSendOnce`/`TunnelCreate`/
+`TunnelAttach`/`Receive` 的用户写回以 `expect("validated ... must remain
+writable")` 收尾，前提是「check_range 到写回之间同进程无映射变更」。当前
+单线程进程下成立；`ThreadSpawn` 落地后，同进程异 hart 线程可在两次
+space 锁之间 `HandleClose` tunnel endpoint（经 `unmap_external` 解除映射），
+若被解除的页恰为某输出缓冲，写回校验失败即 panic 内核——违反「用户可
+触发的 fault 杀进程绝不 panic」戒律。接入用户态多线程（服务化阶段）前
+改为锁内复检 + 优雅错误或进程终止路径，并同步修正 `uaccess.rs` 头注释
+「同进程无并发映射变更者」的前提表述。
+
 ## page_table unmap_range 跨表批量解除算错子表基址
 
 `os/page_table/src/lib.rs` `unmap_range` 对每个递归子表都用初始
