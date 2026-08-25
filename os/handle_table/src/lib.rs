@@ -353,6 +353,9 @@ impl<T, R> HandleTable<T, R> {
         Ok(index)
     }
 
+    /// 空槽线性扫描（已知简化）：满表前每次 insert/reserve O(n)，
+    /// 65 536 槽上限下可被逐项 close/duplicate 放大；pm 接入形成真实
+    /// 负载时收敛为空闲链（notes/impls/ipc.md「Handle 与对象」）。
     fn reserve_slot(&mut self, token: u64) -> Result<Handle, TableError> {
         if let Some(index) =
             (1..self.slots.len()).find(|&i| matches!(self.slots[i].state, SlotState::Vacant))

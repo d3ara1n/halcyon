@@ -6,6 +6,8 @@
 
 `os/handle_table` 是不依赖内核环境的 generation slot 表，负责 rights 裁剪、duplicate、原子 move、reservation/commit/rollback 和 generation 回绕退休。内核包装位于 `os/kernel/src/task/handle.rs`。`Process` 在 `os/kernel/src/task/proc.rs` 持有表；退出时逐项摘除，释放表锁后才执行 lifecycle callback。
 
+**（已知简化）**空槽查找是线性扫描（`reserve_slot`）：单进程 65 536 槽上限下，逐项 close/duplicate 循环可放大到 O(n²)；pm 接管进程创建形成真实 Handle 负载时收敛为空闲链。
+
 `os/kernel/src/task/object.rs` 定义 `KernelObject`、`HandleRole` 和每对象 `ObjectWaitState`。当前对象类型为 Mailbox、Notification、Tunnel Endpoint 与 Tunnel Invitation；Handle role 含 MailboxOwner、MailboxSender、消费式 MailboxSenderOnce、Notification 双方与 Tunnel 双方。rights 与 role 同时验证；Endpoint、Invitation、一次性投递权和 owner 的关闭语义由对象实现，不由 HandleTable 猜测。消费式 role 的两个实例：Invitation 在 attach 时消费，MailboxSenderOnce 在首次成功 Send 时由 `os/kernel/src/task/mailbox.rs` 的 send 在同一表锁临界区内摘除（解析、入箱、消费原子化；该项同时作为 transit move 入箱时消费顺延到接收方）。`MailboxMakeSendOnce`（0x45）从具 DUPLICATE 权的 MailboxSender 派生，请求 rights 必须同时是源项 rights 与 role 允许集（WRITE|WAIT|TRANSFER）的子集，否则拒绝——与 HandleDuplicate 同判，不截剪也不放大。
 
 当前装载器在进程 runnable 前安装启动 Mailbox owner，并在 `os/kernel/src/initfs.rs` 投递版本化 STARTUP 消息及 grants。rinlib 暂以 `StartupMailbox` 查询该 Handle；这是通用 startup-resource 枚举落地前的过渡实现，不是固定入口寄存器或最终资源发现接口。
@@ -16,9 +18,13 @@
 
 WaitMany 是对象等待的唯一用户入口。Sleep 也构造 `WaitAction::Sleep` 的空对象 WaitPlan；`os/kernel/src/sched.rs` 的期限表持有同一个 WaitContext，到期以 `Deadline` outcome 竞争，不再使用独立等待代数。
 
+**（已知简化）**WaitMany 尚无期限参数，deliver 的 `(WaitMany, Deadline|Cancelled)` 分支不可达、以 FunctionNotAvailable 占位；等待面获得期限/取消 ABI 时需给出正式完成语义（Cancel reason 或超时指示），不得沿用错误码占位。
+
 ## 消息与 Notification
 
-`os/kernel/src/task/mailbox.rs` 实现唯一 receiver-owner、多 sender、16 条 FIFO、READABLE/WRITABLE/CLOSED 和 transit Handles。Send 在 `HandleTable → Mailbox` 锁序下先确认容量，再一次性摘除全部源 Handle 并发布消息。Receive 先预留目标 slots、以 token 独占队头，复制完整输出后提交；任一步失败都保留队头并回滚 reservation。Discard 关闭消息中的 transit Handles。邮箱电平由 `MailboxState::publish` 从状态派生：READABLE ⇔ 队列非空，WRITABLE ⇔ 占用（队列加在逯接收占位）低于 `MAILBOX_CAPACITY`，CLOSED 终态独占；所有迁移点调用同一发布函数，不做增量转移。Receive 与 Discard 的 syscall 尾部在表锁外调用 finish_waiters 唤醒等待容量的发送者。
+`os/kernel/src/task/mailbox.rs` 实现唯一 receiver-owner、多 sender、16 条 FIFO、READABLE/WRITABLE/CLOSED 和 transit Handles。Send 在 `HandleTable → Mailbox` 锁序下先确认容量，再一次性摘除全部源 Handle 并发布消息。Receive 先预留目标 slots、以 token 独占队头，复制完整输出后提交；任一步失败都保留队头并回滚 reservation。
+
+**（已知简化）**接收事务窗口内不重发布电平：队头已出队但 READABLE 乐观保持，并发 WaitMany 可得 Signaled 后撞 ObjectBusy（良性自愈）。单接收者模型下无观察者；用户态多线程落地后成为可观察的虚假唤醒面（语义仍正确，仅多一次重试），届时评估事务内降级电平。Discard 关闭消息中的 transit Handles。邮箱电平由 `MailboxState::publish` 从状态派生：READABLE ⇔ 队列非空，WRITABLE ⇔ 占用（队列加在逯接收占位）低于 `MAILBOX_CAPACITY`，CLOSED 终态独占；所有迁移点调用同一发布函数，不做增量转移。Receive 与 Discard 的 syscall 尾部在表锁外调用 finish_waiters 唤醒等待容量的发送者。
 
 `os/kernel/src/task/notification.rs` 实现 OR 累积的 pending bits。对象 READABLE 只表示 pending 非零；`NotificationTake` 是唯一消费入口，普通 WaitMany 不清位。
 

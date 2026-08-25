@@ -145,6 +145,9 @@ impl Mailbox {
     }
 
     /// 调用方已持 HandleTable 锁；本方法再取 Mailbox 锁并原子预留 slots/队头。
+    /// 已知简化：事务窗口内不重发布电平（READABLE 乐观保持，ObjectBusy
+    /// 兜底）；用户态多线程落地后评估事务内降级
+    /// （notes/impls/ipc.md「消息与 Notification」）。
     pub fn begin_receive(
         &self,
         table: &mut ProcessHandleTable,

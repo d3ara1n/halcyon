@@ -270,6 +270,9 @@ impl WaitContext {
                 frame.x[10] = error.to_usize().unwrap_or(1) as u64;
                 frame.sepc += 4;
             }
+            // 已知简化：占位语义——WaitMany 无期限参数时本分支不可达；
+            // 等待面获得期限/取消 ABI 时需给正式完成语义
+            // （notes/impls/ipc.md「等待与期限」）。
             (WaitAction::WaitMany { .. }, WaitOutcome::Cancelled | WaitOutcome::Deadline) => {
                 frame.x[10] = SystemCallError::FunctionNotAvailable.to_usize().unwrap_or(1) as u64;
                 frame.sepc += 4;
