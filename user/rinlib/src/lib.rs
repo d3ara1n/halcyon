@@ -12,7 +12,6 @@ mod call;
 pub use call::sys_sleep;
 pub mod dbg;
 pub mod env;
-pub mod fs;
 pub mod ipc;
 pub mod mm;
 pub mod preclude;

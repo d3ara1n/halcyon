@@ -1,0 +1,10 @@
+[package]
+name = "libfs"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Client-side namespace library: prefix table, walking and symlink expansion"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared" }
+libfal = { path = "../libfal" }

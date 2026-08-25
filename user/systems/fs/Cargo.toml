@@ -2,10 +2,14 @@
 name = "srv_fs"
 version = "0.1.0"
 authors = ["Chien Zhang (zqy0224@live.com)"]
-description = "Filesystem in userspace"
+description = "Filesystem service: in-memory FAL provider and acceptance workload"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 rinlib = { path = "../../rinlib" }
+erhino_shared = { path = "../../../shared" }
+libfal = { path = "../../frameworks/libfal" }
+libfs = { path = "../../frameworks/libfs" }
+librpc = { path = "../../frameworks/librpc" }

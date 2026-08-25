@@ -2,7 +2,6 @@ use core::arch::asm;
 
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
-    fal::{DentryAttribute, DentryType},
     mem::Address,
     message::{HandleMove, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
@@ -130,59 +129,6 @@ pub unsafe fn sys_tunnel_acknowledge_data(endpoint: Handle) -> SystemCallResult<
         0,
         0,
         0,
-    )
-    .map(|_| ())
-}
-
-// 返回需要准备的 buffer 大小
-pub unsafe fn sys_access(path: &str) -> SystemCallResult<usize> {
-    sys_call(SystemCall::Access, path.as_ptr() as usize, path.len(), 0, 0)
-}
-
-// 返回在 buffer 中实际写入的 Dentry 数量
-pub unsafe fn sys_inspect(path: &str, buffer: &[u8]) -> SystemCallResult<usize> {
-    sys_call(
-        SystemCall::Inspect,
-        path.as_ptr() as usize,
-        path.len(),
-        buffer.as_ptr() as usize,
-        buffer.len(),
-    )
-}
-
-// 实际写入在 buffer 有效部分的长度
-pub unsafe fn sys_read(path: &str, buffer: &[u8]) -> SystemCallResult<usize> {
-    sys_call(
-        SystemCall::Read,
-        path.as_ptr() as usize,
-        path.len(),
-        buffer.as_ptr() as usize,
-        buffer.len(),
-    )
-}
-
-pub unsafe fn sys_write(path: &str, buffer: &[u8]) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::Write,
-        path.as_ptr() as usize,
-        path.len(),
-        buffer.as_ptr() as usize,
-        buffer.len(),
-    )
-    .map(|_| ())
-}
-
-pub unsafe fn sys_create(
-    path: &str,
-    kind: DentryType,
-    attr: FlagSet<DentryAttribute>,
-) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::Create,
-        path.as_ptr() as usize,
-        path.len(),
-        kind as u8 as usize,
-        attr.bits() as usize,
     )
     .map(|_| ())
 }

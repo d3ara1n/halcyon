@@ -1,0 +1,14 @@
+[package]
+name = "librpc"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Generic RPC framing over mailbox messages"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared" }
+
+# 同步调用层依赖 rinlib（RISC-V ecall），仅内核目标编译；
+# framing 核心保持零 syscall 依赖，host 可测。
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }

@@ -87,6 +87,8 @@ pub enum Status {
     CursorInvalid = 9,
     /// Handle slot 的对象种类与 kind 期望不符。
     HandleKindMismatch = 10,
+    /// op 内部行走遭遇符号链接：客户端展开后重试。
+    SymbolicLinkEncountered = 11,
     /// 提供者内部错误。
     Internal = 0xFFFF,
 }
@@ -105,6 +107,7 @@ impl Status {
             8 => Some(Self::TooManyLinks),
             9 => Some(Self::CursorInvalid),
             10 => Some(Self::HandleKindMismatch),
+            11 => Some(Self::SymbolicLinkEncountered),
             0xFFFF => Some(Self::Internal),
             _ => None,
         }
@@ -191,10 +194,10 @@ mod tests {
 
     #[test]
     fn status_roundtrip() {
-        for raw in 0..=10u32 {
+        for raw in 0..=11u32 {
             assert_eq!(Status::from_u32(raw).map(|s| s as u32), Some(raw));
         }
         assert_eq!(Status::from_u32(0xFFFF).map(|s| s as u32), Some(0xFFFF));
-        assert_eq!(Status::from_u32(11), None);
+        assert_eq!(Status::from_u32(12), None);
     }
 }

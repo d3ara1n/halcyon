@@ -18,6 +18,8 @@
 | 内核内部机制（中断 / 锁 / 唤醒） | — | [internals](impls/internals.md) |
 | 执行环境（boot / trap / 上下文） | — | [execution-context](impls/execution-context.md) |
 | 对象、Handle、启动授权与服务寻址 | [object](ideas/object.md) | [IPC 对象实现](impls/ipc.md) |
+| 通用 RPC（mailbox 上的调用形态） | [rpc](ideas/rpc.md) | [FAL 实现](impls/fal.md) |
+| 文件系统（FAL / 命名空间 / 走路） | [fal](ideas/fal.md) | [fal](impls/fal.md) |
 | 等待、对象状态与 Notification | [wait](ideas/wait.md)、[signal](ideas/signal.md) | [IPC 对象实现](impls/ipc.md) |
 | IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象实现](impls/ipc.md) |
 | 通用 RPC（信封、关联与并发） | [rpc](ideas/rpc.md) | — |

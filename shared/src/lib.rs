@@ -16,10 +16,6 @@ pub mod proc;
 pub mod service;
 /// Locks
 pub mod sync;
-/// Filesystem abstract layer
-pub mod fal;
-/// eRhino path string utilities
-pub mod path;
 /// Time-related functions
 pub mod time;
 /// 内核对象、Handle、rights 与对象状态

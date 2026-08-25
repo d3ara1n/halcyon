@@ -7,37 +7,46 @@
 
 use crate::{
     bytes::{DecodeError, DecodeResult, Reader, Writer},
+    lookup::ResolvePolicy,
     node::NodeKind,
 };
 
-/// Enumerate 请求 body。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnumerateRequest {
+/// Enumerate 请求 body：寻址前奏 + cursor + 页预算。
+pub struct EnumerateRequest<'a> {
+    /// 相对 Handle slot 1 目录的路径。
+    pub rel: &'a [u8],
     /// 0 = 从头开始；否则为上次应答的 next_cursor。
     pub cursor: u64,
     /// 本页名字 + 目录项头字节的预算。
     pub max_bytes: u32,
 }
 
-impl EnumerateRequest {
+impl EnumerateRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
+        writer.u32(ResolvePolicy::FollowAll as u32);
+        writer.u32(0);
+        writer.u16(self.rel.len() as u16);
+        writer.bytes(self.rel);
         writer.u64(self.cursor);
         writer.u32(self.max_bytes);
         writer.u32(0);
         writer.written()
     }
 
-    pub fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+    pub fn decode(bytes: &[u8]) -> DecodeResult<(&[u8], u64, u32)> {
         let mut reader = Reader::new(bytes);
+        let policy = ResolvePolicy::from_u32(reader.u32()?).ok_or(DecodeError)?;
+        let reserved = reader.u32()?;
+        let rel = reader.sized_bytes()?;
         let cursor = reader.u64()?;
         let max_bytes = reader.u32()?;
-        let reserved = reader.u32()?;
+        let tail = reader.u32()?;
         reader.finish()?;
-        if reserved != 0 {
+        if reserved != 0 || tail != 0 || policy != ResolvePolicy::FollowAll {
             return Err(DecodeError);
         }
-        Ok(Self { cursor, max_bytes })
+        Ok((rel, cursor, max_bytes))
     }
 }
 
@@ -132,10 +141,10 @@ mod tests {
 
     #[test]
     fn request_roundtrip() {
-        let mut buffer = [0u8; 32];
-        let request = EnumerateRequest { cursor: 0x1234, max_bytes: 512 };
+        let mut buffer = [0u8; 64];
+        let request = EnumerateRequest { rel: b"a/b", cursor: 0x1234, max_bytes: 512 };
         let used = request.encode(&mut buffer);
-        assert_eq!(EnumerateRequest::decode(&buffer[..used]).unwrap(), request);
+        assert_eq!(EnumerateRequest::decode(&buffer[..used]).unwrap(), (b"a/b".as_slice(), 0x1234, 512));
     }
 
     #[test]

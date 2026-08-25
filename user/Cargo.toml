@@ -7,6 +7,7 @@ members = [
     "frameworks/libsrv",
     "frameworks/libdrv",
     "frameworks/libfal",
+    "frameworks/libfs",
     "frameworks/librpc",
     "frameworks/librunnel",
     "drivers/spi_sifive"

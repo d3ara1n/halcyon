@@ -12,12 +12,18 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 pub mod bytes;
 pub mod enumerate;
 pub mod header;
+pub mod io;
 pub mod lookup;
+pub mod memfs;
 pub mod node;
+pub mod op;
 pub mod property;
+pub mod provider;
 
 use librpc::PREFIX_LEN;
 

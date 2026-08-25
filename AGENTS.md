@@ -23,7 +23,7 @@
 os/        内核 workspace：
              kernel/          erhino_kernel（no_std）
              dtb/ frame_pool/ page_table/ tar/ elf/   纯逻辑 crate，host 可测
-shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、FAL 接口、同步原语）
+shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、同步原语）；FAL 是纯用户态线协议，落 user/frameworks/libfal，不在此处
 user/      用户态 workspace（rinlib、systems/、frameworks/、drivers/）
 notes/     设计文档：
              根      导读、索引与跨专题通用内容
