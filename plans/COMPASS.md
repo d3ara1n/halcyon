@@ -17,7 +17,8 @@
 ## 位置
 
 - 已完成：boot/高半区启动协议、帧池（os/frame_pool）、堆、Sv39 页表（os/page_table）、板级解析（os/dtb）、任务模型（trap 路径与 trap 锚、域—类调度、进程/线程、initfs/ELF 装载、syscall 面 Debug/Exit/Extend/Sleep、进程回收、timer/IPI 通路）与执行环境重构（a9a65cb）。IPC 前地基工程已完成（hart 身份统一、锁内存序、所有权单向化、uaccess 集中化、Extend 字节 sbrk 语义；见 `plans/archived/2026-09-pre-ipc-groundwork.md`）。IPC 对象 / Handle 重建也已完成：进程本地 HandleTable、WaitContext、显式 Mailbox/Notification、原子 Handle move、Endpoint/Invitation 与 Acquire/Release Runnel 已贯通，实施档案见 [已归档计划](archived/2026-08-ipc-object-foundation.md)，实现现状见 `notes/impls/ipc.md`。
-- 当前：进入用户态 FAL/FS 集成。IPC 不保留 PID Send、全局 tunnel id、阻塞 Receive、ObjectKind/id Wait 或旧 signal 兼容层；旧实现风险档案仍见 [IPC 三面 review](review-2026-08-ipc.md)。
+- 当前：进入用户态 FAL/FS 集成。IPC 不保留 PID Send、全局 tunnel id、阻塞 Receive、ObjectKind/id Wait 或旧 signal 兼容层；旧实现风险档案见 [IPC 三面 review](review-2026-08-ipc.md)，后续统一审查的提交边界与上下文见 [IPC 对象 review todo](todo-2026-08-ipc-object-review.md)。
+- 启动资源债务：当前 `StartupMailbox` 只是迁移过渡，Mailbox 不应成为固定进程入口资源；在 pm/init 接管 ProcessCreate/ProcessStart 前完成 [进程身份与启动资源交付](todo-2026-08-process-startup-resources.md) 的方案确认与改造。
 - 对照负载：`user/systems/` 与 `user/drivers/` 四服务。fs 经用户态 FAL 服务完成正常路径是下一验收线；当前 FAL 桩导致 fs panic 退出回收，见 `KNOWN_ISSUES.md`。
 - 自然序往后：用户态 FAL/FS 集成 → 服务化（pm 接管 spawn；用户态多线程、运行时监听与退出语义）→ 设备/中断接入 → 异构（效能核多域、实时核 AMP）。
 
