@@ -74,7 +74,10 @@ impl Caller {
         if let Some(port) = self.port {
             return Ok(port);
         }
-        let port = mailbox_create(Rights::READ | Rights::WAIT, Rights::WRITE | Rights::DUPLICATE)?;
+        let port = mailbox_create(
+            Rights::READ | Rights::WAIT,
+            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+        )?;
         self.port = Some(port);
         Ok(port)
     }
@@ -121,13 +124,22 @@ impl Caller {
         moves_storage[1..1 + extra_moves.len()].copy_from_slice(extra_moves);
         let moves = &moves_storage[..1 + extra_moves.len()];
 
-        send_blocking(service, protocol_id, &payload[..used], moves)?;
+        send_blocking(service, protocol_id, &payload[..used], moves)
+            .map_err(|error| {
+                // 发送失败：尚未转移的 reply_once 留在本地，关闭防止泄漏。
+                let _ = close(reply_once);
+                error
+            })?;
 
         let items = [
             WaitItem::new(port.owner, ObjectSignals::READABLE | ObjectSignals::CLOSED, 0),
             WaitItem::new(service, ObjectSignals::CLOSED, 1),
         ];
-        let result = wait_many(&items, deadline_ms)?;
+        let result = wait_many(&items, deadline_ms).map_err(|error| {
+            // 等待失败：迟到回复可能落地，废弃端口隔离。
+            self.discard_port();
+            error
+        })?;
         match WaitReason::from_u32(result.reason) {
             Some(WaitReason::Deadline) => {
                 self.discard_port();
@@ -139,7 +151,11 @@ impl Caller {
                 Err(CallError::System(SystemCallError::ObjectClosed))
             }
             _ => {
-                let message = receive(port.owner)?;
+                let message = receive(port.owner).map_err(|error| {
+                    // 接收失败：同上，废弃端口隔离迟到回复。
+                    self.discard_port();
+                    error
+                })?;
                 if message.header.kind != protocol_id {
                     return Err(CallError::Frame(FrameRejection::ProtocolMismatch));
                 }

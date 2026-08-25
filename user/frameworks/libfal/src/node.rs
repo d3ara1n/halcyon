@@ -62,6 +62,9 @@ impl core::ops::BitAnd for NodeAttributes {
     }
 }
 
+/// 路径分量的非法字节：通配符与分隔符。
+const ILLEGAL_COMPONENT_BYTES: &[u8] = b"/*?\\";
+
 /// 路径合法性：协议固定契约，客户端库与提供者各自执行同一规则。
 ///
 /// 规则：UTF-8；`/` 分隔；不允许空段、`.`、`..` 与通配符；请求路径
@@ -80,7 +83,10 @@ pub fn validate_path(path: &[u8]) -> bool {
         return false;
     }
     path.split(|&b| b == b'/').all(|segment| {
-        !segment.is_empty() && segment != b"." && segment != b".."
+        !segment.is_empty()
+            && segment != b"."
+            && segment != b".."
+            && !segment.iter().any(|&b| ILLEGAL_COMPONENT_BYTES.contains(&b))
     })
 }
 
@@ -105,6 +111,14 @@ mod tests {
         assert!(&b"a/../b"[..3] == b"a/." && !validate_path(b"a/../b"));
         assert!(!validate_path(b"a/"));
         assert!(!validate_path(&[0xFF, 0xFE]));
+    }
+
+    #[test]
+    fn rejects_wildcards() {
+        assert!(!validate_path(b"a/*"));
+        assert!(!validate_path(b"*.tar"));
+        assert!(!validate_path(b"a/b?c"));
+        assert!(!validate_path(b"back\\slash"));
     }
 
     #[test]

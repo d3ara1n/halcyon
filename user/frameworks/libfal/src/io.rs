@@ -14,17 +14,16 @@ impl ReadAtRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let used = self.address.encode(out)?;
         let mut writer = Writer::new(&mut out[used..]);
-        writer.u64(self.offset);
-        writer.u32(self.len);
-        writer.u32(0);
+        writer.u64(self.offset)?;
+        writer.u32(self.len)?;
+        writer.u32(0)?;
         Ok(used + writer.written())
     }
 
     /// 解码：返回（策略、rel、offset、len）。
     pub fn decode(bytes: &[u8]) -> DecodeResult<(crate::lookup::ResolvePolicy, &[u8], u64, u32)> {
-        let (policy, rel) = OpAddress::decode(bytes)?;
-        let rest = &bytes[10 + rel.len()..];
-        let mut reader = Reader::new(rest);
+        let (policy, rel, used) = OpAddress::decode(bytes)?;
+        let mut reader = Reader::new(&bytes[used..]);
         let offset = reader.u64()?;
         let len = reader.u32()?;
         let reserved = reader.u32()?;
@@ -47,18 +46,15 @@ impl WriteAtRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let used = self.address.encode(out)?;
         let mut writer = Writer::new(&mut out[used..]);
-        writer.u64(self.offset);
-        if !writer.sized_bytes(self.bytes) {
-            return Err(crate::bytes::DecodeError);
-        }
+        writer.u64(self.offset)?;
+        writer.sized_bytes(self.bytes)?;
         Ok(used + writer.written())
     }
 
     /// 解码：返回（策略、rel、offset、bytes）；应答为写入字节数（u32）。
     pub fn decode(bytes: &[u8]) -> DecodeResult<(crate::lookup::ResolvePolicy, &[u8], u64, &[u8])> {
-        let (policy, rel) = OpAddress::decode(bytes)?;
-        let rest = &bytes[10 + rel.len()..];
-        let mut reader = Reader::new(rest);
+        let (policy, rel, used) = OpAddress::decode(bytes)?;
+        let mut reader = Reader::new(&bytes[used..]);
         let offset = reader.u64()?;
         let data = reader.sized_bytes()?;
         reader.finish()?;

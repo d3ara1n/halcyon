@@ -154,12 +154,14 @@ impl MemFs {
         }
     }
 
-    /// 节点查询：FollowAll 下终段链接返回边界，NoFollowFinal 返回节点。
+    /// 节点查询：FollowAll 下终段链接返回边界，NoFollowFinal 且链接
+    /// 为终段时返回节点（中途链接仍返边界——终段策略只对终段生效）。
     pub fn lookup(&self, policy: ResolvePolicy, rel: &[u8]) -> Result<MemLookup, Status> {
         match self.walk(rel)? {
             Walked::Reached(node) => Ok(node.found(false)),
             Walked::HitLink { node, at } => {
-                if policy == ResolvePolicy::NoFollowFinal {
+                let segments = split_rel(rel)?;
+                if policy == ResolvePolicy::NoFollowFinal && at + 1 == segments.len() {
                     return Ok(node.found(true));
                 }
                 let segments = split_rel(rel)?;
@@ -275,13 +277,19 @@ impl MemFs {
         }
     }
 
-    /// 写属性值（整体替换）。
+    /// 写属性值（整体替换）：值必须通过协议解码校验且在 VALUE_MAX 内——
+    /// 提供者把写入值当不可信输入，不存储任意字节。
     pub fn property_write(
         &mut self,
         _policy: ResolvePolicy,
         rel: &[u8],
         value: &[u8],
     ) -> Result<(), Status> {
+        if value.len() > crate::property::VALUE_MAX
+            || crate::property::DecodedValue::decode(value).is_err()
+        {
+            return Err(Status::IllegalArgument);
+        }
         match self.walk_mut(rel)? {
             Node::Property { attributes, value: stored } => {
                 if !attributes.contains(NodeAttributes::WRITEABLE) {
@@ -335,8 +343,10 @@ impl MemFs {
                 if !attributes.contains(NodeAttributes::WRITEABLE) {
                     return Err(Status::NotAccessible);
                 }
-                let start = offset as usize;
-                let end = start + bytes.len();
+                let start = usize::try_from(offset).map_err(|_| Status::IllegalArgument)?;
+                let end = start
+                    .checked_add(bytes.len())
+                    .ok_or(Status::IllegalArgument)?;
                 if end > data.len() {
                     data.resize(end, 0);
                 }
@@ -362,19 +372,21 @@ impl MemFs {
         };
         let generation = cursor >> 32;
         let index = (cursor & 0xFFFF_FFFF) as usize;
-        if cursor != 0 && generation != self.generation {
+        if cursor != 0 && (generation != self.generation || index > directory.len()) {
             return Err(Status::CursorInvalid);
         }
         let mut entries = Vec::new();
         let mut used = 0usize;
         let mut position = 0usize;
         let mut next = 0u64;
+        // 项成本 = u16 长度前缀 + 名字 + kind u32 + 保留 u32。
+        const ENTRY_OVERHEAD: usize = 2 + 4 + 4;
         for (name, child) in directory {
             if position < index {
                 position += 1;
                 continue;
             }
-            let cost = name.len() + 12;
+            let cost = name.len() + ENTRY_OVERHEAD;
             if used + cost > max_bytes as usize && !entries.is_empty() {
                 next = (self.generation << 32) | position as u64;
                 break;
@@ -464,6 +476,12 @@ mod tests {
         let found = fs.lookup(ResolvePolicy::NoFollowFinal, b"lnk").unwrap();
         assert!(matches!(&found,
             MemLookup::Found { kind: NodeKind::SymbolicLink, target: Some(t), .. } if t == "target"));
+
+        // 中途链接 + NoFollowFinal：策略只对终段生效，仍返边界。
+        fs.create(b"dir", NodeKind::Directory, rw()).unwrap();
+        fs.link(b"dir/inner", b"x").unwrap();
+        let outcome = fs.lookup(ResolvePolicy::NoFollowFinal, b"dir/inner/tail").unwrap();
+        assert!(matches!(outcome, MemLookup::Link { .. }));
         assert!(matches!(
             fs.property_read(ResolvePolicy::FollowAll, b"lnk"),
             Err(Status::SymbolicLinkEncountered)
@@ -489,8 +507,42 @@ mod tests {
     fn property_write_and_read() {
         let mut fs = MemFs::new();
         fs.create(b"answer", NodeKind::Property, rw()).unwrap();
-        fs.property_write(ResolvePolicy::FollowAll, b"answer", &[42]).unwrap();
-        assert_eq!(fs.property_read(ResolvePolicy::FollowAll, b"answer").unwrap(), &[42]);
+        let mut buffer = [0u8; 16];
+        let used = crate::property::PropertyValue::Integer(42)
+            .encode(&mut buffer)
+            .unwrap();
+        fs.property_write(ResolvePolicy::FollowAll, b"answer", &buffer[..used]).unwrap();
+        assert_eq!(
+            fs.property_read(ResolvePolicy::FollowAll, b"answer").unwrap(),
+            &buffer[..used]
+        );
+    }
+
+    #[test]
+    fn property_write_rejects_invalid_encoding() {
+        let mut fs = MemFs::new();
+        fs.create(b"p", NodeKind::Property, rw()).unwrap();
+        // 非 DecodedValue 可解码字节：拒绝。
+        assert!(matches!(
+            fs.property_write(ResolvePolicy::FollowAll, b"p", &[0xFF, 0xEE]),
+            Err(Status::IllegalArgument)
+        ));
+        // 合法 Integer 编码：接受。
+        let mut buffer = [0u8; 16];
+        let used = crate::property::PropertyValue::Integer(7)
+            .encode(&mut buffer)
+            .unwrap();
+        fs.property_write(ResolvePolicy::FollowAll, b"p", &buffer[..used]).unwrap();
+    }
+
+    #[test]
+    fn write_at_rejects_huge_offset() {
+        let mut fs = MemFs::new();
+        fs.create(b"s", NodeKind::Stream, rw()).unwrap();
+        assert!(matches!(
+            fs.write_at(ResolvePolicy::FollowAll, b"s", u64::MAX, &[1]),
+            Err(Status::IllegalArgument)
+        ));
     }
 
     #[test]

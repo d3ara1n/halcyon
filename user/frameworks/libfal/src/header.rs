@@ -126,13 +126,14 @@ impl FalHeader {
         Self { version: FAL_VERSION, kind, total_len }
     }
 
-    /// 编码进 16 字节定宽区（保留区置零）。
-    pub fn encode(&self, out: &mut [u8]) {
+    /// 编码进 16 字节定宽区（保留区置零）；短缓冲即协议错误。
+    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<()> {
         let mut writer = Writer::new(out);
-        writer.u16(self.version);
-        writer.u16(self.kind as u16);
-        writer.u32(self.total_len);
-        writer.u64(0);
+        writer.u16(self.version)?;
+        writer.u16(self.kind as u16)?;
+        writer.u32(self.total_len)?;
+        writer.u64(0)?;
+        Ok(())
     }
 
     /// 从 16 字节定宽区解码并验证版本与保留区。

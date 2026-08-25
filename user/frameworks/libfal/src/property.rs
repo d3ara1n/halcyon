@@ -102,44 +102,38 @@ impl PropertyValue<'_> {
         let mut writer = Writer::new(out);
         match self {
             Self::Integer(value) => {
-                writer.u32(ValueType::Integer as u32);
-                writer.u32(0);
-                writer.u64(*value as u64);
+                writer.u32(ValueType::Integer as u32)?;
+                writer.u32(0)?;
+                writer.u64(*value as u64)?;
             }
             Self::Decimal(value) => {
-                writer.u32(ValueType::Decimal as u32);
-                writer.u32(0);
-                writer.u64(value.to_bits());
+                writer.u32(ValueType::Decimal as u32)?;
+                writer.u32(0)?;
+                writer.u64(value.to_bits())?;
             }
             Self::Str(value) => {
-                writer.u32(ValueType::String as u32);
-                writer.u32(0);
-                if !writer.sized_bytes(value) {
-                    return Err(DecodeError);
-                }
+                writer.u32(ValueType::String as u32)?;
+                writer.u32(0)?;
+                writer.sized_bytes(value)?;
             }
             Self::Blob(value) => {
-                writer.u32(ValueType::Blob as u32);
-                writer.u32(0);
-                if !writer.sized_bytes(value) {
-                    return Err(DecodeError);
-                }
+                writer.u32(ValueType::Blob as u32)?;
+                writer.u32(0)?;
+                writer.sized_bytes(value)?;
             }
             Self::Handle { kind, slot } => {
-                writer.u32(ValueType::HandleRef as u32);
-                writer.u32(*kind as u32);
-                writer.u16(*slot);
-                writer.u16(0);
+                writer.u32(ValueType::HandleRef as u32)?;
+                writer.u32(*kind as u32)?;
+                writer.u16(*slot)?;
+                writer.u16(0)?;
             }
             Self::Array { element, items } => {
-                writer.u32(ValueType::Array as u32);
-                writer.u32(*element as u32);
-                writer.u32(items.len() as u32);
-                writer.u32(0);
+                writer.u32(ValueType::Array as u32)?;
+                writer.u32(*element as u32)?;
+                writer.u32(items.len() as u32)?;
+                writer.u32(0)?;
                 for item in items.iter() {
-                    if !writer.sized_bytes(item.0) {
-                        return Err(DecodeError);
-                    }
+                    writer.sized_bytes(item.0)?;
                 }
             }
         }

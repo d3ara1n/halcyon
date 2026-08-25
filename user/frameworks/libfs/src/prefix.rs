@@ -50,15 +50,16 @@ impl PrefixTable {
         Ok(String::from(trimmed))
     }
 
-    /// 挂载：插入或替换同前缀条目。
-    pub fn mount(&mut self, prefix: &str, directory: Handle) -> Result<(), PrefixError> {
+    /// 挂载：插入或替换同前缀条目。替换时返还旧 Handle（关闭权在
+    /// 调用方——前缀表只是登记处，不是 Handle 所有者）。
+    pub fn mount(&mut self, prefix: &str, directory: Handle) -> Result<Option<Handle>, PrefixError> {
         let prefix = Self::normalize(prefix)?;
         if let Some(entry) = self.entries.iter_mut().find(|e| e.prefix == prefix) {
-            entry.directory = directory;
-        } else {
-            self.entries.push(MountEntry { prefix, directory });
+            let replaced = core::mem::replace(&mut entry.directory, directory);
+            return Ok(Some(replaced));
         }
-        Ok(())
+        self.entries.push(MountEntry { prefix, directory });
+        Ok(None)
     }
 
     /// 卸载：移除条目并返回其 Handle（关闭由调用方决定）。
@@ -126,7 +127,8 @@ mod tests {
         let mut table = PrefixTable::new();
         table.mount("/a/b/", handle(1)).unwrap();
         assert_eq!(table.entries()[0].prefix, "/a/b");
-        table.mount("/a/b", handle(2)).unwrap();
+        // 重挂载返还旧 Handle，由调用方决定关闭。
+        assert_eq!(table.mount("/a/b", handle(2)).unwrap(), Some(handle(1)));
         assert_eq!(table.entries().len(), 1);
         assert_eq!(table.entries()[0].directory, handle(2));
     }

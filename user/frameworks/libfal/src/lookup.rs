@@ -43,11 +43,9 @@ pub struct LookupRequest<'a> {
 impl LookupRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let mut writer = Writer::new(out);
-        writer.u32(self.policy as u32);
-        writer.u32(0);
-        if !writer.bytes(self.path) {
-            return Err(DecodeError);
-        }
+        writer.u32(self.policy as u32)?;
+        writer.u32(0)?;
+        writer.bytes(self.path)?;
         Ok(writer.written())
     }
 
@@ -81,12 +79,12 @@ pub struct NodeInfo<'a> {
 impl NodeInfo<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let mut writer = Writer::new(out);
-        writer.u32(self.kind as u32);
-        writer.u32(self.attributes.raw());
-        writer.u64(self.size);
-        writer.u32(0);
-        if self.kind == NodeKind::SymbolicLink && !writer.sized_bytes(self.value) {
-            return Err(DecodeError);
+        writer.u32(self.kind as u32)?;
+        writer.u32(self.attributes.raw())?;
+        writer.u64(self.size)?;
+        writer.u32(0)?;
+        if self.kind == NodeKind::SymbolicLink {
+            writer.sized_bytes(self.value)?;
         }
         Ok(writer.written())
     }
@@ -116,9 +114,8 @@ pub struct Boundary<'a> {
 impl Boundary<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let mut writer = Writer::new(out);
-        if !writer.sized_bytes(self.consumed) || !writer.sized_bytes(self.remaining) {
-            return Err(DecodeError);
-        }
+        writer.sized_bytes(self.consumed)?;
+        writer.sized_bytes(self.remaining)?;
         Ok(writer.written())
     }
 
@@ -142,12 +139,9 @@ pub struct LinkBoundary<'a> {
 impl LinkBoundary<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let mut writer = Writer::new(out);
-        if !writer.sized_bytes(self.consumed)
-            || !writer.sized_bytes(self.target)
-            || !writer.sized_bytes(self.remaining)
-        {
-            return Err(DecodeError);
-        }
+        writer.sized_bytes(self.consumed)?;
+        writer.sized_bytes(self.target)?;
+        writer.sized_bytes(self.remaining)?;
         Ok(writer.written())
     }
 

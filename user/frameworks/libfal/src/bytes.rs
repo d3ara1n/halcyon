@@ -19,44 +19,42 @@ impl<'a> Writer<'a> {
         self.buffer.len() - self.position
     }
 
-    fn put(&mut self, bytes: &[u8]) {
+    fn put(&mut self, bytes: &[u8]) -> DecodeResult<()> {
+        if self.remaining() < bytes.len() {
+            return Err(DecodeError);
+        }
         self.buffer[self.position..self.position + bytes.len()].copy_from_slice(bytes);
         self.position += bytes.len();
+        Ok(())
     }
 
-    pub fn u8(&mut self, value: u8) {
-        self.put(&[value]);
+    pub fn u8(&mut self, value: u8) -> DecodeResult<()> {
+        self.put(&[value])
     }
 
-    pub fn u16(&mut self, value: u16) {
-        self.put(&value.to_le_bytes());
+    pub fn u16(&mut self, value: u16) -> DecodeResult<()> {
+        self.put(&value.to_le_bytes())
     }
 
-    pub fn u32(&mut self, value: u32) {
-        self.put(&value.to_le_bytes());
+    pub fn u32(&mut self, value: u32) -> DecodeResult<()> {
+        self.put(&value.to_le_bytes())
     }
 
-    pub fn u64(&mut self, value: u64) {
-        self.put(&value.to_le_bytes());
+    pub fn u64(&mut self, value: u64) -> DecodeResult<()> {
+        self.put(&value.to_le_bytes())
     }
 
-    /// 溢出即返回 false，调用方转协议错误。
-    pub fn bytes(&mut self, value: &[u8]) -> bool {
-        if self.remaining() < value.len() {
-            return false;
+    pub fn bytes(&mut self, value: &[u8]) -> DecodeResult<()> {
+        self.put(value)
+    }
+
+    /// 长度前缀（u16）的字节段；超长即协议错误。
+    pub fn sized_bytes(&mut self, value: &[u8]) -> DecodeResult<()> {
+        if value.len() > u16::MAX as usize {
+            return Err(DecodeError);
         }
-        self.put(value);
-        true
-    }
-
-    /// 长度前缀（u16）的字节段；超长返回 false。
-    pub fn sized_bytes(&mut self, value: &[u8]) -> bool {
-        if value.len() > u16::MAX as usize || self.remaining() < 2 + value.len() {
-            return false;
-        }
-        self.u16(value.len() as u16);
-        self.put(value);
-        true
+        self.u16(value.len() as u16)?;
+        self.put(value)
     }
 }
 
@@ -78,6 +76,11 @@ impl<'a> Reader<'a> {
 
     pub fn remaining(&self) -> usize {
         self.buffer.len() - self.position
+    }
+
+    /// 已消费的字节数（定位后续参数用）。
+    pub fn consumed(&self) -> usize {
+        self.position
     }
 
     fn take(&mut self, len: usize) -> DecodeResult<&'a [u8]> {
@@ -135,11 +138,11 @@ mod tests {
     fn writer_reader_roundtrip() {
         let mut buffer = [0u8; 32];
         let mut writer = Writer::new(&mut buffer);
-        writer.u8(0xAB);
-        writer.u16(0x0102);
-        writer.u32(0x0304_0506);
-        writer.u64(0x07);
-        assert!(writer.sized_bytes(b"erhino"));
+        writer.u8(0xAB).unwrap();
+        writer.u16(0x0102).unwrap();
+        writer.u32(0x0304_0506).unwrap();
+        writer.u64(0x07).unwrap();
+        writer.sized_bytes(b"erhino").unwrap();
         let used = writer.written();
 
         let mut reader = Reader::new(&buffer[..used]);
@@ -155,10 +158,14 @@ mod tests {
     fn writer_rejects_overflow() {
         let mut buffer = [0u8; 4];
         let mut writer = Writer::new(&mut buffer);
-        assert!(!writer.bytes(&[0; 5]));
+        assert_eq!(writer.bytes(&[0; 5]), Err(DecodeError));
         let mut tight = [0u8; 3];
         let mut writer = Writer::new(&mut tight);
-        assert!(!writer.sized_bytes(b"abcd"));
+        assert_eq!(writer.sized_bytes(b"abcd"), Err(DecodeError));
+        // 定宽写同样拒绝短缓冲。
+        let mut narrow = [0u8; 3];
+        let mut writer = Writer::new(&mut narrow);
+        assert_eq!(writer.u32(1), Err(DecodeError));
     }
 
     #[test]

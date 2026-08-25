@@ -49,6 +49,8 @@ pub enum FrameError {
     UnknownKind(u16),
     /// 保留区非零（写者违约）。
     ReservedNotZero,
+    /// txid 为零（wire 约束：非零、单调、不重用）。
+    ZeroTxid,
 }
 
 /// 通用 RPC 前缀：request / response / oneway 的公共 framing。
@@ -88,15 +90,24 @@ impl RpcPrefix {
             return Err(FrameError::ReservedNotZero);
         }
         let txid = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        if txid == 0 {
+            return Err(FrameError::ZeroTxid);
+        }
         Ok(Self { version, kind, txid })
     }
 }
 
-/// per-process 单调 txid 分配：非零起始、不重用（见 rpc.md「并发与回复路由」）。
+/// per-process 单调 txid 分配：非零起始、不重用、跳过回绕产出的 0
+/// （见 rpc.md「并发与回复路由」）。
 static NEXT_TXID: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_txid() -> u64 {
-    NEXT_TXID.fetch_add(1, Ordering::Relaxed)
+    loop {
+        let candidate = NEXT_TXID.fetch_add(1, Ordering::Relaxed);
+        if candidate != 0 {
+            return candidate;
+        }
+    }
 }
 
 /// 同步调用层依赖 ecall，仅内核目标编译；framing 核心 host 可测。
@@ -138,6 +149,13 @@ mod tests {
         RpcPrefix::new(RpcMessageKind::Response, 2).encode(&mut buffer);
         buffer[7] = 1;
         assert_eq!(RpcPrefix::decode(&buffer), Err(FrameError::ReservedNotZero));
+    }
+
+    #[test]
+    fn decode_rejects_zero_txid() {
+        let mut buffer = [0u8; PREFIX_LEN];
+        RpcPrefix::new(RpcMessageKind::Request, 0).encode(&mut buffer);
+        assert_eq!(RpcPrefix::decode(&buffer), Err(FrameError::ZeroTxid));
     }
 
     #[test]

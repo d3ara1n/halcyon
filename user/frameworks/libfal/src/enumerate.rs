@@ -71,11 +71,9 @@ impl EnumerateResponse<'_> {
         writer.u32(self.entries.len() as u32);
         writer.u32(0);
         for entry in self.entries {
-            if !writer.sized_bytes(entry.name) {
-                return Err(DecodeError);
-            }
-            writer.u32(entry.kind as u32);
-            writer.u32(0);
+            writer.sized_bytes(entry.name)?;
+            writer.u32(entry.kind as u32)?;
+            writer.u32(0)?;
         }
         Ok(writer.written())
     }
@@ -179,7 +177,7 @@ mod tests {
         let mut buffer = [0u8; 10];
         let mut writer = Writer::new(&mut buffer);
         writer.u16(4);
-        assert!(writer.bytes(b"boot"));
+        assert!(writer.bytes(b"boot").is_ok());
         writer.u32(NodeKind::Directory as u32);
         let used = writer.written();
         // 保留区缺失

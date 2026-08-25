@@ -31,6 +31,7 @@ use libfs::{
     prefix::PrefixTable,
     resolve::{LookupOutcome, Position, WalkTransport},
 };
+use libfal::lookup::ResolvePolicy::{FollowAll, NoFollowFinal};
 use rinlib::{
     ipc::{
         message::{create as mailbox_create, make_send_once, receive, send},
@@ -42,6 +43,18 @@ use rinlib::{
 
 /// 泵等待的期限（毫秒）：演示负载的诊断上限，正常往返毫秒级完成。
 const PUMP_DEADLINE_MS: u64 = 500;
+
+/// 应答承载：消息上限扣除 RpcPrefix 与 FalHeader——由协议常量推导。
+const REPLY_BODY_MAX: usize =
+    erhino_shared::message::PAYLOAD_MAX - librpc::PREFIX_LEN - libfal::FAL_HEADER_LEN;
+
+/// 解码/编码违约时的 Internal 状态应答。
+fn internal_served(out: &mut [u8]) -> provider::Served {
+    let mut writer = libfal::bytes::Writer::new(out);
+    let _ = writer.u32(Status::Internal as u32);
+    let _ = writer.u32(0);
+    provider::Served { kind: Kind::Lookup, len: writer.written() }
+}
 
 struct Fs {
     provider: MemFs,
@@ -127,39 +140,68 @@ impl Fs {
     }
 
     /// 服务提供者邮箱的队头请求：解码 → memfs → 经 send-once 回复。
+    /// 请求槽位契约：恰好 2 个 Handle（slot 0 回复授权、slot 1 帧锚）；
+    /// 任何不消费的 Handle 显式关闭——Handle 生命周期由本函数守恒。
     fn serve_one(&mut self) {
         let message = receive(self.owner).expect("provider receive failed");
-        if message.header.kind != PROTOCOL_ID || message.handles.len() < 1 {
-            return;
-        }
-        let prefix = match librpc::RpcPrefix::decode(&message.payload) {
-            Ok(prefix) => prefix,
-            Err(_) => return,
-        };
-        let request = &message.payload[librpc::PREFIX_LEN..];
-        let mut out = [0u8; 512];
-        let served = match provider::serve(&mut self.provider, request, &mut out) {
-            Ok(served) => served,
-            Err(_) => {
-                // 解码违约：以 Internal 状态应答，保持协议闭环。
-                let mut writer = libfal::bytes::Writer::new(&mut out);
-                writer.u32(Status::Internal as u32);
-                writer.u32(0);
-                provider::Served { kind: Kind::Lookup, len: writer.written() }
+        let reply_to = match self.validate_request(&message) {
+            Ok(reply_to) => reply_to,
+            Err(()) => {
+                // 槽位契约违反：关闭全部转入 Handle，静默丢弃。
+                for handle in message.handles {
+                    let _ = rinlib::ipc::object::close(handle);
+                }
+                return;
             }
         };
 
-        let mut reply = [0u8; 544];
-        let prefix_out = librpc::RpcPrefix::new(librpc::RpcMessageKind::Response, prefix.txid);
-        prefix_out.encode(&mut reply);
-        let len = provider::encode_reply(
+        let mut out = [0u8; REPLY_BODY_MAX];
+        let served = match librpc::RpcPrefix::decode(&message.payload) {
+            Ok(prefix) => match provider::serve(
+                &mut self.provider,
+                &message.payload[librpc::PREFIX_LEN..],
+                &mut out,
+            ) {
+                Ok(served) => (prefix.txid, served),
+                Err(_) => (prefix.txid, internal_served(&mut out)),
+            },
+            Err(_) => {
+                // framing 违约无 txid 可回：以 1 占位（调用侧 txid 校验拒收）。
+                (1, internal_served(&mut out))
+            }
+        };
+
+        let mut reply = [0u8; librpc::PREFIX_LEN + REPLY_BODY_MAX];
+        librpc::RpcPrefix::new(librpc::RpcMessageKind::Response, served.0)
+            .encode(&mut reply);
+        let len = match provider::encode_reply(
             &mut reply[librpc::PREFIX_LEN..],
-            served.kind,
-            &out[..served.len],
-        );
-        // 单 outstanding 调用下回复箱至多一条在途，永不触满。
-        send(message.handles[0], PROTOCOL_ID, &reply[..librpc::PREFIX_LEN + len], &[])
-            .expect("reply send failed");
+            served.1.kind,
+            &out[..served.1.len],
+        ) {
+            Ok(len) => len,
+            Err(_) => {
+                // 应答超出承载：关回复权，让调用方 Deadline/超时路径收口。
+                let _ = rinlib::ipc::object::close(reply_to);
+                return;
+            }
+        };
+        // 单 outstanding 调用下回复箱至多一条在途，永不触满；失败同样
+        // 只关已持有的回复权，不 panic。
+        if send(reply_to, PROTOCOL_ID, &reply[..librpc::PREFIX_LEN + len], &[]).is_err() {
+            let _ = rinlib::ipc::object::close(reply_to);
+        }
+    }
+
+    /// 槽位契约校验：成功时摘出 slot 0 回复授权并关闭 slot 1 帧锚
+    /// （同进程泵不按锚分树，跨进程批次接入锚授权）。
+    fn validate_request(&mut self, message: &rinlib::ipc::message::ReceivedMessage) -> Result<Handle, ()> {
+        if message.header.kind != PROTOCOL_ID || message.handles.len() != 2 {
+            return Err(());
+        }
+        let reply_to = message.handles[0];
+        let _ = rinlib::ipc::object::close(message.handles[1]);
+        Ok(reply_to)
     }
 }
 
@@ -210,9 +252,14 @@ impl WalkTransport for Fs {
         let variant = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
         match variant {
             0 => {
-                let (kind, attributes, size, _) =
+                let (kind, attributes, size, value) =
                     NodeInfo::decode(&rest[4..]).map_err(|_| Status::Internal)?;
-                Ok(LookupOutcome::Found(libfs::resolve::NodeSummary { kind, attributes, size }))
+                Ok(LookupOutcome::Found(libfs::resolve::NodeSummary {
+                    kind,
+                    attributes,
+                    size,
+                    value: alloc::vec::Vec::from(value),
+                }))
             }
             1 => {
                 let (consumed, target, remaining) =
@@ -237,7 +284,7 @@ impl Fs {
         let body = {
             let mut buffer = [0u8; 128];
             let used = op::CreateRequest {
-                address: op::OpAddress { policy: ResolvePolicy::FollowAll, rel: rel.as_bytes() },
+                address: op::OpAddress { policy: FollowAll, rel: rel.as_bytes() },
                 kind,
                 attributes,
             }
@@ -254,7 +301,7 @@ impl Fs {
         let body = {
             let mut buffer = [0u8; 128];
             let used = op::LinkRequest {
-                address: op::OpAddress { policy: ResolvePolicy::FollowAll, rel: rel.as_bytes() },
+                address: op::OpAddress { policy: FollowAll, rel: rel.as_bytes() },
                 target: target.as_bytes(),
             }
             .encode(&mut buffer)
@@ -306,13 +353,15 @@ impl Fs {
         let body = {
             let mut buffer = [0u8; 256];
             let mut writer = libfal::bytes::Writer::new(&mut buffer);
-            writer.u32(ResolvePolicy::FollowAll as u32);
-            writer.u32(0);
-            writer.u16(position.rel.len() as u16);
-            writer.bytes(position.rel.as_bytes());
-            if !writer.sized_bytes(value) {
-                return Err(Status::IllegalArgument);
-            }
+            writer.u32(FollowAll as u32).map_err(|_| Status::IllegalArgument)?;
+            writer.u32(0).map_err(|_| Status::IllegalArgument)?;
+            writer
+                .u16(position.rel.len() as u16)
+                .map_err(|_| Status::IllegalArgument)?;
+            writer
+                .bytes(position.rel.as_bytes())
+                .map_err(|_| Status::IllegalArgument)?;
+            writer.sized_bytes(value).map_err(|_| Status::IllegalArgument)?;
             let used = writer.written();
             buffer[..used].to_vec()
         };
@@ -323,14 +372,9 @@ impl Fs {
     fn read(&mut self, position: &Position) -> Result<Vec<u8>, Status> {
         let body = {
             let mut buffer = [0u8; 64];
-            let used = op::PropertyReadRequest {
-                address: op::OpAddress {
-                    policy: ResolvePolicy::FollowAll,
-                    rel: position.rel.as_bytes(),
-                },
-            }
-            .encode(&mut buffer)
-            .map_err(|_| Status::IllegalPath)?;
+            let used = op::OpAddress { policy: FollowAll, rel: position.rel.as_bytes() }
+                .encode(&mut buffer)
+                .map_err(|_| Status::IllegalPath)?;
             buffer[..used].to_vec()
         };
         let reply = self.call(Kind::Read, &body, position.anchor)?;
@@ -345,7 +389,7 @@ impl Fs {
             let mut buffer = [0u8; 96];
             let used = io::ReadAtRequest {
                 address: op::OpAddress {
-                    policy: ResolvePolicy::FollowAll,
+                    policy: FollowAll,
                     rel: position.rel.as_bytes(),
                 },
                 offset,
@@ -367,7 +411,7 @@ impl Fs {
             let mut buffer = [0u8; 192];
             let used = io::WriteAtRequest {
                 address: op::OpAddress {
-                    policy: ResolvePolicy::FollowAll,
+                    policy: FollowAll,
                     rel: position.rel.as_bytes(),
                 },
                 offset,
@@ -401,21 +445,21 @@ fn main() {
     debug!("Hello, fs!");
     let mut fs = Fs::new();
     let mut table = PrefixTable::new();
-    table.mount("/", fs.peer).expect("mount root failed");
+    assert!(table.mount("/", fs.peer).expect("mount root failed").is_none());
     let rw = NodeAttributes::READABLE | NodeAttributes::WRITEABLE;
     let rwx = rw | NodeAttributes::EXECUTABLE;
 
-    let root = libfs::resolve::resolve(&mut fs, &table, "/", ResolvePolicy::FollowAll)
+    let root = libfs::resolve::resolve(&mut fs, &table, "/", FollowAll)
         .expect("root resolve failed");
 
     // 目录与属性创建。
     fs.create(&root, "hello", NodeKind::Directory, rwx).expect("create /hello failed");
-    let hello = libfs::resolve::resolve(&mut fs, &table, "/hello", ResolvePolicy::FollowAll)
+    let hello = libfs::resolve::resolve(&mut fs, &table, "/hello", FollowAll)
         .expect("resolve /hello failed");
     fs.create(&hello, "world", NodeKind::Property, rw).expect("create /hello/world failed");
 
     // 属性写读：Integers（Array<Integer> 类型系统往返）。
-    let world = libfs::resolve::resolve(&mut fs, &table, "/hello/world", ResolvePolicy::FollowAll)
+    let world = libfs::resolve::resolve(&mut fs, &table, "/hello/world", FollowAll)
         .expect("resolve /hello/world failed");
     let first = 114514i64.to_le_bytes();
     let second = (-1919810i64).to_le_bytes();
@@ -436,10 +480,15 @@ fn main() {
         other => panic!("unexpected property value: {:?}", other),
     }
 
-    // 符号链接：创建后 FollowAll 解析应展开至 world 属性。
+    // 符号链接：NoFollowFinal 查询链接本身——target 随 NodeInfo value 尾返回。
     fs.link(&hello, "lnk", "world").expect("create /hello/lnk failed");
+    let link_node = libfs::resolve::resolve(&mut fs, &table, "/hello/lnk", NoFollowFinal)
+        .expect("no-follow resolve failed");
+    assert_eq!(link_node.info.kind, NodeKind::SymbolicLink);
+    assert_eq!(link_node.info.value, b"world");
+    debug!("lnk target via Found value: {:?}", core::str::from_utf8(&link_node.info.value));
     let via_link =
-        libfs::resolve::resolve(&mut fs, &table, "/hello/lnk", ResolvePolicy::FollowAll)
+        libfs::resolve::resolve(&mut fs, &table, "/hello/lnk", FollowAll)
             .expect("symlink resolve failed");
     assert_eq!(via_link.info.kind, NodeKind::Property);
     assert_eq!(via_link.rel, "hello/world");
@@ -447,10 +496,10 @@ fn main() {
 
     // 流：偏移写读。
     fs.create(&root, "bin", NodeKind::Directory, rwx).expect("create /bin failed");
-    let bin = libfs::resolve::resolve(&mut fs, &table, "/bin", ResolvePolicy::FollowAll)
+    let bin = libfs::resolve::resolve(&mut fs, &table, "/bin", FollowAll)
         .expect("resolve /bin failed");
     fs.create(&bin, "srv_init", NodeKind::Stream, rw).expect("create /bin/srv_init failed");
-    let stream = libfs::resolve::resolve(&mut fs, &table, "/bin/srv_init", ResolvePolicy::FollowAll)
+    let stream = libfs::resolve::resolve(&mut fs, &table, "/bin/srv_init", FollowAll)
         .expect("resolve /bin/srv_init failed");
     fs.write_at(&stream, 0, &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0])
         .expect("write_at failed");

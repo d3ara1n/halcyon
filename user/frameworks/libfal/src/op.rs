@@ -1,6 +1,6 @@
 //! 非 Lookup 操作的 body 编解码。
 //!
-//! 所有操作共享寻址前奏：`(policy, reserved, rel_path)`——`rel` 相对
+//! 所有操作共享寻址前奏：`(policy, reserved, sized rel)`——`rel` 相对
 //! Handle slot 1 的帧锚目录（来自客户端走路引擎的 `Position`）。提供者
 //! 在 op 内部行走时遭遇符号链接返回 [`Status::SymbolicLinkEncountered`]，
 //! 客户端展开后重试（与走路共享展开上限）。
@@ -15,18 +15,21 @@ pub struct OpAddress<'a> {
     pub rel: &'a [u8],
 }
 
+/// 寻址前奏的固定字节数：policy u32 + reserved u32 + sized rel 头。
+pub const ADDRESS_HEADER_LEN: usize = 8 + 2;
+
 impl OpAddress<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let mut writer = Writer::new(out);
-        writer.u32(self.policy as u32);
-        writer.u32(0);
-        if !writer.sized_bytes(self.rel) {
-            return Err(DecodeError);
-        }
+        writer.u32(self.policy as u32)?;
+        writer.u32(0)?;
+        writer.sized_bytes(self.rel)?;
         Ok(writer.written())
     }
 
-    pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8])> {
+    /// 解码寻址前奏：返回（策略、rel、前奏消费的字节数）。
+    /// 调用方以消费长度定位后续参数，禁止各处重复偏移算术。
+    pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8], usize)> {
         let mut reader = Reader::new(bytes);
         let policy = ResolvePolicy::from_u32(reader.u32()?).ok_or(DecodeError)?;
         let reserved = reader.u32()?;
@@ -34,7 +37,7 @@ impl OpAddress<'_> {
         if reserved != 0 {
             return Err(DecodeError);
         }
-        Ok((policy, rel))
+        Ok((policy, rel, reader.consumed()))
     }
 }
 
@@ -49,15 +52,14 @@ impl CreateRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let used = self.address.encode(out)?;
         let mut writer = Writer::new(&mut out[used..]);
-        writer.u32(self.kind as u32);
-        writer.u32(self.attributes.raw());
+        writer.u32(self.kind as u32)?;
+        writer.u32(self.attributes.raw())?;
         Ok(used + writer.written())
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8], NodeKind, NodeAttributes)> {
-        let (policy, rel) = OpAddress::decode(bytes)?;
-        let rest = &bytes[8 + 2 + rel.len()..];
-        let mut reader = Reader::new(rest);
+        let (policy, rel, used) = OpAddress::decode(bytes)?;
+        let mut reader = Reader::new(&bytes[used..]);
         let kind = NodeKind::from_u32(reader.u32()?).ok_or(DecodeError)?;
         let attributes = NodeAttributes::from_raw(reader.u32()?);
         reader.finish()?;
@@ -75,64 +77,16 @@ impl LinkRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let used = self.address.encode(out)?;
         let mut writer = Writer::new(&mut out[used..]);
-        if !writer.sized_bytes(self.target) {
-            return Err(DecodeError);
-        }
+        writer.sized_bytes(self.target)?;
         Ok(used + writer.written())
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8], &[u8])> {
-        let (policy, rel) = OpAddress::decode(bytes)?;
-        let rest = &bytes[8 + 2 + rel.len()..];
-        let mut reader = Reader::new(rest);
+        let (policy, rel, used) = OpAddress::decode(bytes)?;
+        let mut reader = Reader::new(&bytes[used..]);
         let target = reader.sized_bytes()?;
         reader.finish()?;
         Ok((policy, rel, target))
-    }
-}
-
-/// Delete：删除节点。
-pub struct DeleteRequest<'a> {
-    pub address: OpAddress<'a>,
-}
-
-impl DeleteRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        self.address.encode(out)
-    }
-
-    pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8])> {
-        OpAddress::decode(bytes)
-    }
-}
-
-/// PropertyRead：读属性值（应答为属性值编码）。
-pub struct PropertyReadRequest<'a> {
-    pub address: OpAddress<'a>,
-}
-
-impl PropertyReadRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        self.address.encode(out)
-    }
-
-    pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8])> {
-        OpAddress::decode(bytes)
-    }
-}
-
-/// ReadSymbolicLink：应答为 target 文本。
-pub struct ReadSymbolicLinkRequest<'a> {
-    pub address: OpAddress<'a>,
-}
-
-impl ReadSymbolicLinkRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        self.address.encode(out)
-    }
-
-    pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8])> {
-        OpAddress::decode(bytes)
     }
 }
 
@@ -157,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn symlink_create_roundtrip() {
+    fn link_roundtrip() {
         let mut buffer = [0u8; 64];
         let request = LinkRequest {
             address: OpAddress { policy: ResolvePolicy::FollowAll, rel: b"a/lnk" },
