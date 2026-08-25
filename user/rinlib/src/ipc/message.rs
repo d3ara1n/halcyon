@@ -10,7 +10,10 @@ use erhino_shared::{
     wait::{WaitItem, WaitResult},
 };
 
-use crate::call::{sys_discard, sys_mailbox_create, sys_peek, sys_receive, sys_send, sys_wait_many};
+use crate::call::{
+    sys_discard, sys_mailbox_create, sys_mailbox_make_send_once, sys_peek, sys_receive, sys_send,
+    sys_wait_many,
+};
 
 pub struct ReceivedMessage {
     pub header: MessageHeader,
@@ -74,6 +77,53 @@ pub fn receive(mailbox: Handle) -> Result<ReceivedMessage, SystemCallError> {
 pub fn discard(mailbox: Handle) -> Result<(), SystemCallError> {
     // SAFETY: Handle 是值参数。
     unsafe { sys_discard(mailbox) }
+}
+
+/// 从具 DUPLICATE 权的 sender 派生一次性投递权：承载一条消息后由内核
+/// 摘除，经消息转移后由接收方继续一次性使用（Mach send-once 对应物）。
+pub fn make_send_once(
+    source: Handle,
+    rights: Rights,
+) -> Result<Handle, SystemCallError> {
+    let mut output = Handle::INVALID;
+    // SAFETY: output 在 ecall 期间有效且可写。
+    unsafe { sys_mailbox_make_send_once(source, rights, &mut output)? };
+    Ok(output)
+}
+
+/// 阻塞投递：满箱时等待 WRITABLE 电平（或 CLOSED 出错）后重试。
+/// 与 [`wait_message`] 对偶，构成发送侧流控闭环。
+pub fn send_blocking(
+    mailbox: Handle,
+    kind: u64,
+    payload: &[u8],
+    moves: &[HandleMove],
+) -> Result<(), SystemCallError> {
+    loop {
+        match send(mailbox, kind, payload, moves) {
+            Ok(()) => return Ok(()),
+            Err(SystemCallError::MailboxFull) => {}
+            Err(error) => return Err(error),
+        }
+        let items = [WaitItem::new(
+            mailbox,
+            ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+            0,
+        )];
+        let mut result = WaitResult::new(
+            0,
+            ObjectSignals::NONE,
+            0,
+            erhino_shared::wait::WaitReason::Signaled,
+        );
+        // SAFETY: 输入和输出在阻塞 syscall 完成前都位于当前栈帧。
+        unsafe { sys_wait_many(&items, &mut result)? };
+        if result.observed.intersects(ObjectSignals::CLOSED)
+            && !result.observed.intersects(ObjectSignals::WRITABLE)
+        {
+            return Err(SystemCallError::ObjectClosed);
+        }
+    }
 }
 
 /// 阻塞取得下一条消息：先尝试 Receive，空箱才等待 READABLE 并回环。

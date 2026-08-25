@@ -384,9 +384,8 @@ pub fn attach(
         entry.object().clone()
     };
     let invitation = concrete_invitation(&object)?;
-    let reservation = table.reserve(1, token).map_err(handle::map_error)?;
-    let endpoint_handle = reservation.handles()[0];
     let endpoint = Endpoint::new(invitation.connection.clone(), invitation.side, va);
+    // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let endpoint_entry = handle::entry(
         Endpoint::object_ref(&endpoint),
         HandleRole::TunnelEndpoint,
@@ -396,6 +395,8 @@ pub fn attach(
     let mut entries = Vec::new();
     entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(endpoint_entry);
+    let reservation = table.reserve(1, token).map_err(handle::map_error)?;
+    let endpoint_handle = reservation.handles()[0];
 
     let mut connection = invitation.connection.state.lock();
     if invitation.closed.load(Ordering::Acquire)
@@ -423,12 +424,12 @@ pub fn attach(
     let consumed = table
         .remove(invitation_handle)
         .expect("validated Tunnel invitation must remain installed");
-    table
-        .commit(reservation, entries)
-        .expect("TunnelAttach reservation must remain owned");
     // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
     unsafe { crate::uaccess::write_user_value(&mut space, output, &endpoint_handle) }
         .expect("validated TunnelAttach output must remain writable");
+    table
+        .commit(reservation, entries)
+        .expect("TunnelAttach reservation must remain owned");
     drop(consumed); // invitation 是被消费而非关闭，不执行 lifecycle callback。
     Ok(())
 }

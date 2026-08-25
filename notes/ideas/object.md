@@ -22,7 +22,9 @@ Handle 是固定宽度、不透明的 `u64` 值：高 32 位为 generation，低
 
 对象在有效 Handle、消息中转项或对象内部引用需要它时存活。关闭一个 Handle 只放弃该引用；对象的逻辑关闭由 lifecycle role 决定，不等同于最后一个任意 Handle 消失。
 
-邮箱由唯一 receiver-owner 维持开放。`MailboxCreate` 向创建进程交付该不可复制、不可转移的 owner Handle，以及可复制、可转移的 sender Handle；进程内各线程共享 owner 的接收能力。owner 关闭或其进程退出后邮箱进入 `CLOSED`，清除队列及其中未接收的转入 Handle，残留 sender 只观察关闭。Notification 同样有唯一且不可复制、不可转移的 owner，以及可按授权复制或转移的 signaler；owner 关闭使它终态。
+邮箱由唯一 receiver-owner 维持开放。`MailboxCreate` 向创建进程交付该不可复制、不可转移的 owner Handle，以及可复制、可转移的 sender Handle；进程内各线程共享 owner 的接收能力。owner 关闭或其进程退出后邮箱进入 `CLOSED`，清除队列及其中未接收的转入 Handle，残留 sender 只观察关闭。sender 还可派生一次性投递权：承载一条消息后由内核摘除，经消息转移后由接收方继续一次性使用。Notification 同样有唯一且不可复制、不可转移的 owner，以及可按授权复制或转移的 signaler；owner 关闭使它终态。
+
+某些 role 是消费式的：执行其定义操作后终态，失败不消费。隧道的 invitation 在 attach 时消费，邮箱的一次性投递权在首次成功投递时消费；两者是同一条 role 维度规则的两个实例，不依赖任何 rights 位表达生命周期。
 
 隧道的端点 lease 和 invitation 则由 Connection 的参与方关系定义。所有关闭都是单向迁移；终态信号持续可见，已关闭对象不可复活，也不把资源重新解释为另一对象。
 

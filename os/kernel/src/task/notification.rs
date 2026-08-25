@@ -179,23 +179,19 @@ pub fn create(
     );
 
     let token = super::handle::transaction_token();
-    let reservation = thread
-        .process
-        .handles
-        .lock()
-        .reserve(2, token)
-        .map_err(super::handle::map_error)?;
-    let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
-    let copied = {
-        let mut space = thread.process.space.lock();
-        // SAFETY: HandlePair 仅含两个无 padding 的 Handle。
-        unsafe { crate::uaccess::write_user_value(&mut space, output, &pair) }
-    };
     let mut table = thread.process.handles.lock();
-    if let Err(error) = copied {
+    let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
+    let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
+    let mut space = thread.process.space.lock();
+    if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
+        drop(space);
         table.rollback(reservation).expect("NotificationCreate reservation must remain owned");
         return Err(error.into());
     }
+    // SAFETY: HandlePair 无 padding，输出已在同一 space 锁下校验。
+    unsafe { crate::uaccess::write_user_value(&mut space, output, &pair) }
+        .expect("validated NotificationCreate output must remain writable");
+    drop(space);
     table.commit(reservation, entries).expect("NotificationCreate reservation must remain owned");
     Ok(())
 }

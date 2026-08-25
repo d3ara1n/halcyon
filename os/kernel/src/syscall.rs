@@ -187,6 +187,19 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::MailboxMakeSendOnce => {
+            respond_result(
+                frame,
+                mailbox::make_send_once(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::TunnelCreate => {
             respond_result(
                 frame,

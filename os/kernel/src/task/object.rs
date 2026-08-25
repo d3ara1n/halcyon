@@ -35,6 +35,8 @@ pub enum ObjectKind {
 pub enum HandleRole {
     MailboxOwner,
     MailboxSender,
+    /// 一次性投递权：成功 Send 后由内核摘除，失败不消费。
+    MailboxSenderOnce,
     NotificationOwner,
     NotificationSignaler,
     TunnelEndpoint,
@@ -81,7 +83,13 @@ impl ObjectWaitState {
         self.signals
     }
 
+    /// 电平更新。终态冻结：CLOSED 置位后任何更新不再生效——
+    /// 「单向迁移、终态不可复活」由所有对象共用的这一结构保证，
+    /// 跨关闭窗口的事务收尾无需逐点防御。
     pub fn update(&mut self, clear: ObjectSignals, set: ObjectSignals) -> ObjectSignals {
+        if self.signals.contains(ObjectSignals::CLOSED) {
+            return self.signals;
+        }
         self.signals &= !clear;
         self.signals |= set;
         self.signals

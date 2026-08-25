@@ -3,7 +3,8 @@
 use crate::object::{Handle, ProcessId, Rights};
 
 /// 邮箱容量（条数）。满箱时 `Send` 立即返回
-/// [`crate::call::SystemCallError::MailboxFull`]，流控由上层协议承担。
+/// [`crate::call::SystemCallError::MailboxFull`]；发送侧可观察 `WRITABLE`
+/// 电平并经 WaitMany 等待腾位（rinlib `send_blocking` 封装该闭环）。
 pub const MAILBOX_CAPACITY: usize = 16;
 
 /// 单条消息负载上限（字节）。超限在发送侧拒绝（IllegalArgument），

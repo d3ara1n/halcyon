@@ -277,6 +277,21 @@ pub unsafe fn sys_discard(mailbox: Handle) -> SystemCallResult<()> {
     sys_call(SystemCall::Discard, mailbox.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
+pub unsafe fn sys_mailbox_make_send_once(
+    source: Handle,
+    rights: Rights,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MailboxMakeSendOnce,
+        source.raw() as usize,
+        rights.raw() as usize,
+        output as *mut Handle as usize,
+        0,
+    )
+    .map(|_| ())
+}
+
 pub unsafe fn sys_wait_many(items: &[WaitItem], result: &mut WaitResult) -> SystemCallResult<()> {
     sys_call(
         SystemCall::WaitMany,

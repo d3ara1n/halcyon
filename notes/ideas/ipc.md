@@ -6,7 +6,7 @@ IPC 由共同的[对象与 Handle](object.md)模型组成。每个通信对象�
 
 - **消息**（[message](message.md)）是控制面：有界、非阻塞的邮箱投递，承载小批量数据、内核 sender envelope 和受 rights 约束的 Handle move；
 - **对象状态与 Notification**（[signal](signal.md)）是事件面：对象以非消费式电平表达可读、关闭等条件，Notification 提供显式消费的 OR 位集合；
-- **隧道**（[tunnel](tunnel.md)）是数据面：两个不可转移的本地端点映射同一页，供协议直接交换批量数据。所有页内协议还须遵守[共享内存协议公共契约](shared-memory.md)。
+- **隧道**（[tunnel](tunnel.md)）是数据面：两个不可转移的本地端点映射同一段连续页区间，供协议直接交换批量数据。所有页内协议还须遵守[共享内存协议公共契约](shared-memory.md)。
 
 [Runnel](runnel.md) 是隧道页上的官方单工 FIFO 字节流协议。控制请求、流式数据和状态提示各归其面；协议可以组合三者，但不得让一个面伪造另一个面的所有权或流控。
 

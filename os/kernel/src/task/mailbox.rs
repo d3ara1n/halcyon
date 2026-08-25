@@ -45,6 +45,30 @@ struct MailboxState {
     closed: bool,
 }
 
+impl MailboxState {
+    /// 电平是状态的函数：READABLE ⇔ 队列非空，WRITABLE ⇔ 占用（队列加
+    /// 在逯接收占位）低于容量，CLOSED 终态独占。所有迁移点调用同一发布
+    /// 函数，不做增量转移——新增迁移点不可能遗漏或漂移。
+    fn publish(&mut self) {
+        if self.closed {
+            self.wait.update(
+                ObjectSignals::READABLE | ObjectSignals::WRITABLE,
+                ObjectSignals::CLOSED,
+            );
+            return;
+        }
+        let occupied = self.queue.len() + usize::from(self.receiving.is_some());
+        let mut level = ObjectSignals::NONE;
+        if !self.queue.is_empty() {
+            level |= ObjectSignals::READABLE;
+        }
+        if occupied < MAILBOX_CAPACITY {
+            level |= ObjectSignals::WRITABLE;
+        }
+        self.wait.update(ObjectSignals::READABLE | ObjectSignals::WRITABLE, level);
+    }
+}
+
 pub struct Mailbox {
     #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
@@ -56,7 +80,8 @@ impl Mailbox {
         Arc::new(Self {
             header: ObjectHeader::new(),
             state: Spinlock::new(MailboxState {
-                wait: ObjectWaitState::new(ObjectSignals::NONE),
+                // 空箱对 sender 可写；WRITABLE 电平由容量变化维护。
+                wait: ObjectWaitState::new(ObjectSignals::WRITABLE),
                 queue: VecDeque::new(),
                 receiving: None,
                 closed: false,
@@ -82,7 +107,7 @@ impl Mailbox {
             payload,
             handles,
         });
-        state.wait.update(ObjectSignals::NONE, ObjectSignals::READABLE);
+        state.publish();
     }
 
     /// 调用方已持 HandleTable 锁；本方法只再取 Mailbox 锁。
@@ -104,7 +129,7 @@ impl Mailbox {
         state.queue.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
         let handles = table.extract_moves(moves).map_err(super::handle::map_error)?;
         state.queue.push_back(Message { header, payload, handles });
-        state.wait.update(ObjectSignals::NONE, ObjectSignals::READABLE);
+        state.publish();
         Ok(())
     }
 
@@ -151,9 +176,8 @@ impl Mailbox {
         let mut state = self.state.lock();
         assert!(state.receiving == Some(token), "mailbox receive token mismatch");
         state.receiving = None;
-        if state.queue.is_empty() {
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::NONE);
-        }
+        // owner 关闭后终态冻结由 update 保证，此处无需防御。
+        state.publish();
     }
 
     /// 返回 Some 表示 owner 已关闭，消息不得重新入队，调用方须关闭 transit。
@@ -165,7 +189,7 @@ impl Mailbox {
             return Some(message);
         }
         state.queue.push_front(message);
-        state.wait.update(ObjectSignals::NONE, ObjectSignals::READABLE);
+        state.publish();
         None
     }
 
@@ -178,9 +202,7 @@ impl Mailbox {
             return Err(SystemCallError::ObjectBusy);
         }
         let message = state.queue.pop_front().ok_or(SystemCallError::ObjectNotAvailable)?;
-        if state.queue.is_empty() {
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::NONE);
-        }
+        state.publish();
         Ok(message)
     }
 
@@ -191,7 +213,7 @@ impl Mailbox {
                 return;
             }
             state.closed = true;
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::CLOSED);
+            state.publish();
         }
         self.finish_waiters();
 
@@ -226,6 +248,7 @@ impl KernelObject for Mailbox {
             HandleRole::MailboxSender => {
                 Some(Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)
             }
+            HandleRole::MailboxSenderOnce => Some(Rights::WRITE | Rights::WAIT | Rights::TRANSFER),
             _ => None,
         }
     }
@@ -233,7 +256,9 @@ impl KernelObject for Mailbox {
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
         match role {
             HandleRole::MailboxOwner => Some(ObjectSignals::READABLE | ObjectSignals::CLOSED),
-            HandleRole::MailboxSender => Some(ObjectSignals::CLOSED),
+            HandleRole::MailboxSender | HandleRole::MailboxSenderOnce => {
+                Some(ObjectSignals::WRITABLE | ObjectSignals::CLOSED)
+            }
             _ => None,
         }
     }
@@ -257,7 +282,10 @@ impl KernelObject for Mailbox {
     }
 
     fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::MailboxSender);
+        debug_assert!(matches!(
+            role,
+            HandleRole::MailboxSender | HandleRole::MailboxSenderOnce
+        ));
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -285,24 +313,67 @@ pub fn create(
     );
 
     let token = super::handle::transaction_token();
-    let reservation = thread
-        .process
-        .handles
-        .lock()
-        .reserve(2, token)
-        .map_err(super::handle::map_error)?;
-    let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
-    let copied = {
-        let mut space = thread.process.space.lock();
-        // SAFETY: HandlePair 仅含两个无 padding 的 Handle。
-        unsafe { uaccess::write_user_value(&mut space, output, &pair) }
-    };
     let mut table = thread.process.handles.lock();
-    if let Err(error) = copied {
+    let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
+    let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
+    let mut space = thread.process.space.lock();
+    if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
+        drop(space);
         table.rollback(reservation).expect("MailboxCreate reservation must remain owned");
         return Err(error.into());
     }
+    // SAFETY: HandlePair 无 padding，输出已在同一 space 锁下校验。
+    unsafe { uaccess::write_user_value(&mut space, output, &pair) }
+        .expect("validated MailboxCreate output must remain writable");
+    drop(space);
     table.commit(reservation, entries).expect("MailboxCreate reservation must remain owned");
+    Ok(())
+}
+
+/// 从具 DUPLICATE 权的 sender 派生一次性投递权：role 换为 MailboxSenderOnce，
+/// 请求 rights 必须同时是源项与 role 允许集的子集，否则拒绝（与
+/// HandleDuplicate 同判：不截剪、不放大）。
+pub fn make_send_once(
+    thread: &Thread,
+    source: Handle,
+    rights: Rights,
+    output: usize,
+) -> Result<(), SystemCallError> {
+    let token = super::handle::transaction_token();
+    let mut table = thread.process.handles.lock();
+    let source_entry = table.get(source, Rights::DUPLICATE).map_err(super::handle::map_error)?;
+    if *source_entry.role() != HandleRole::MailboxSender
+        || source_entry.object().kind() != ObjectKind::Mailbox
+    {
+        return Err(SystemCallError::WrongObjectType);
+    }
+    if !rights.is_subset_of(source_entry.rights()) {
+        return Err(SystemCallError::RightsDenied);
+    }
+    // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries.push(super::handle::entry(
+        source_entry.object().clone(),
+        HandleRole::MailboxSenderOnce,
+        rights,
+    )
+    .map_err(super::handle::map_error)?);
+    let reservation = table.reserve(1, token).map_err(super::handle::map_error)?;
+    let once = reservation.handles()[0];
+    let mut space = thread.process.space.lock();
+    if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
+        drop(space);
+        table.rollback(reservation).expect("make-send-once reservation must remain owned");
+        return Err(error.into());
+    }
+    // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
+    unsafe { uaccess::write_user_value(&mut space, output, &once) }
+        .expect("validated make-send-once output must remain writable");
+    drop(space);
+    table
+        .commit(reservation, entries)
+        .expect("make-send-once reservation must remain owned");
     Ok(())
 }
 
@@ -351,18 +422,39 @@ pub fn send(
         moves.push((item.handle, item.rights));
     }
 
-    let object = resolve(thread, mailbox_handle, Rights::WRITE, HandleRole::MailboxSender)?;
-    let mailbox = concrete(&object)?;
     let message_header = MessageHeader::new(
         thread.process.pid as u64,
         header.kind,
         header.payload_len,
         header.handle_count,
     );
-    {
+    let object = {
         let mut table = thread.process.handles.lock();
+        // 解析与入队同临界区：MailboxSenderOnce 的消费与投递原子化，
+        // 并发线程无法在解析后、入队前摘除一次性项。
+        let entry = table.get(mailbox_handle, Rights::WRITE).map_err(super::handle::map_error)?;
+        let once = match *entry.role() {
+            HandleRole::MailboxSender | HandleRole::MailboxSenderOnce => {
+                *entry.role() == HandleRole::MailboxSenderOnce
+            }
+            _ => return Err(SystemCallError::WrongObjectType),
+        };
+        let object = entry.object().clone();
+        if object.kind() != ObjectKind::Mailbox {
+            return Err(SystemCallError::WrongObjectType);
+        }
+        let mailbox = concrete(&object)?;
         mailbox.enqueue_with(&mut table, &moves, message_header, payload)?;
-    }
+        if once {
+            // 消费式 role：成功投递即摘除源项（消费而非关闭，不执行
+            // lifecycle callback）。若该项同时作为 transit move 进入了
+            // 本条消息，extract_moves 已先行摘除，remove 的两种结果
+            // （Ok(entry) / Err(StaleHandle)）都已消费。
+            drop(table.remove(mailbox_handle));
+        }
+        object
+    };
+    let mailbox = concrete(&object)?;
     mailbox.finish_waiters();
     Ok(())
 }
@@ -448,12 +540,17 @@ pub fn receive(
         table.commit(reservation, handles).expect("Receive reservation must remain owned");
         mailbox.commit_receive(token);
     }
+    // 腾出容量后唤醒等待 WRITABLE 的发送者。
+    mailbox.finish_waiters();
     Ok(())
 }
 
 pub fn discard(thread: &Thread, mailbox_handle: Handle) -> Result<(), SystemCallError> {
     let object = resolve(thread, mailbox_handle, Rights::READ, HandleRole::MailboxOwner)?;
-    concrete(&object)?.discard()?.close_transit_handles();
+    let mailbox = concrete(&object)?;
+    mailbox.discard()?.close_transit_handles();
+    // 腾出容量后唤醒等待 WRITABLE 的发送者。
+    mailbox.finish_waiters();
     Ok(())
 }
 

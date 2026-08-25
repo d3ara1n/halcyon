@@ -69,23 +69,20 @@ pub fn duplicate(
     let mut entries = Vec::new();
     entries.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
     let token = transaction_token();
-    let (reservation, duplicated) = {
-        let mut table = thread.process.handles.lock();
-        entries.push(table.derive(source, rights).map_err(map_error)?);
-        let reservation = table.reserve(1, token).map_err(map_error)?;
-        let duplicated = reservation.handles()[0];
-        (reservation, duplicated)
-    };
-    let copied = {
-        let mut space = thread.process.space.lock();
-        // SAFETY: Handle 是无 padding 的 u64 newtype，任意位型有效。
-        unsafe { crate::uaccess::write_user_value(&mut space, output, &duplicated) }
-    };
     let mut table = thread.process.handles.lock();
-    if let Err(error) = copied {
+    entries.push(table.derive(source, rights).map_err(map_error)?);
+    let reservation = table.reserve(1, token).map_err(map_error)?;
+    let duplicated = reservation.handles()[0];
+    let mut space = thread.process.space.lock();
+    if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
+        drop(space);
         table.rollback(reservation).expect("duplicate reservation must remain owned");
         return Err(error.into());
     }
+    // SAFETY: Handle 是无 padding 的 u64 newtype，输出已在同一 space 锁下校验。
+    unsafe { crate::uaccess::write_user_value(&mut space, output, &duplicated) }
+        .expect("validated duplicate output must remain writable");
+    drop(space);
     table.commit(reservation, entries).expect("duplicate reservation must remain owned");
     Ok(())
 }

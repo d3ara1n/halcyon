@@ -114,6 +114,8 @@ pub enum SystemCall {
     Receive = 0x43,
     /// 丢弃队头及其 transit Handles。
     Discard = 0x44,
+    /// 从具 DUPLICATE 权的 sender 派生一次性投递权（send-once）。
+    MailboxMakeSendOnce = 0x45,
     
     // -----Process memory-----
     /// Map a range of virtual addresses for the process with kernel served pages
