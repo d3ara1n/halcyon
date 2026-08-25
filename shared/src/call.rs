@@ -55,23 +55,15 @@ pub enum SystemCallError {
 /// Predefined system calls
 ///
 /// Only accessible in userspace
-/// ipc_call is sent through SystemCall::IPC
 #[repr(usize)]
 #[derive(Debug, FromPrimitive, ToPrimitive, Clone, Copy)]
 pub enum SystemCall {
-    // System reserved
-    /// Makes kernel panic
-    Die = 0x0,
     /// 写调试流（测试观测通道）：a0=msg_ptr a1=msg_len
     Debug = 0x01,
 
     // -----Process control-----
     /// Finalized process notifies kernel to cleanup
     Exit = 0x10,
-    /// Spawn a process from the given bytes
-    ExecuteBytes = 0x16,
-    /// Spawn a process from the file
-    ExecuteFile = 0x17,
     /// 临时启动资源查询：返回本进程 bootstrap Mailbox owner Handle。
     /// 后续由通用 startup-resource 枚举替代。
     StartupMailbox = 0x18,
@@ -118,14 +110,8 @@ pub enum SystemCall {
     MailboxMakeSendOnce = 0x45,
     
     // -----Process memory-----
-    /// Map a range of virtual addresses for the process with kernel served pages
+    /// 字节粒度 sbrk：按请求量扩展/收缩堆，返回新堆顶。
     Extend = 0x50,
-    /// Map a range of virtual addresses for the process with specific range of physical addresses
-    /// 
-    /// **Permissions**: *Haven't determined yet*
-    Map = 0x51,
-    /// Tell kernel to reuse a range of virtual addresses
-    Free = 0x52,
 
     // -----Tunnel-----
     /// 创建共享页、Endpoint 和一次性 Invitation。
@@ -133,11 +119,7 @@ pub enum SystemCall {
     /// 原子消费 Invitation 并建立对端 Endpoint。
     TunnelAttach = 0x61,
     /// 向对端 Endpoint 发布 DATA 提示。
-    TunnelNotify = 0x63,
+    TunnelNotify = 0x62,
     /// 在协议无进展点确认本端 DATA 提示。
-    TunnelAcknowledgeData = 0x64,
-    /// Mount a filesystem service as a mount point at rootfs
-    Mount = 0x7a,
-    /// Unmount a mount point from rootfs
-    Unmount = 0x7b,
+    TunnelAcknowledgeData = 0x63,
 }

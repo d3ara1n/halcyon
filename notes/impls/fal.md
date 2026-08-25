@@ -5,7 +5,7 @@
 ## 分层落点
 
 - `user/frameworks/librpc`：通用 RPC framing。`RpcPrefix`（16B LE：rpc 版本、request/response/oneway、txid、保留区零校验）+ per-process 单调非零 txid。同步 `Caller`：懒创建 ReplyPort、slot 0 约定（期待回复的 request move 裁剪至 WRITE|TRANSFER 的 send-once）、单 outstanding、超时关 port 废弃重建、迟到回复随 owner 关闭消亡。异步 dispatcher（免 tombstone：无 pending 静默丢弃）尚未接入。
-- `user/frameworks/libfal`：FAL 线协议与提供者积木。`PROTOCOL_ID = "FAL1"` 占消息 kind；payload 布局 `[RpcPrefix][FalHeader][body]`，FalHeader 16B（协议版本、kind、总长度、保留区 u64）；Handle 槽约定 slot 0 = 回复授权、slot 1 = 帧锚目录。kind 号冻结 13 个（Lookup…ReadSymbolicLink）；Status 12 值含 `SymbolicLinkEncountered`（op 内部行走遇链接，客户端展开重试）。
+- `user/frameworks/libfal`：FAL 线协议与提供者积木。`PROTOCOL_ID = "FAL1"` 占消息 kind；payload 布局 `[RpcPrefix][FalHeader][body]`，FalHeader 16B（协议版本、kind、总长度、保留区 u64）；Handle 槽约定 slot 0 = 回复授权、slot 1 = 帧锚目录。kind 号冻结 12 个，动词自含对象（Lookup/Enumerate/Create/Link/Read/Write/Open/ReadAt/WriteAt/Move/Copy/Delete——Read/Write 指 Property 整值，At 后缀指 Stream 偏移，Link 创建符号链接）；Found 应答的 NodeInfo 带 kind 判别的自描述 value 尾（SymbolicLink = target，NoFollowFinal 终段即得）；Status 12 值含 `SymbolicLinkEncountered`（op 内部行走遇链接，客户端展开重试）。
   - `bytes.rs` LE 编解码游标；`node.rs` 四类节点 + RWX 标记 + `validate_path`（相对、无 `.`/`..`/空段/通配符、UTF-8、≤512）。
   - `lookup.rs` 三值应答与 `ResolvePolicy`；`op.rs`/`io.rs` 非 Lookup 操作的寻址前奏 `(policy, reserved, rel)` + 参数；`enumerate.rs` cursor 分页；`property.rs` 属性类型系统（Integer/Decimal/String/Blob/`Handle[T]`/`Array<T>`，watch 位 create/delete/modify/rename）。
   - `memfs.rs` 内存树参考积木：walk 核心统一 X 穿越/R 枚举/W 增删检查，链接只返边界不解释，枚举 cursor 编码 `(generation, index)`，代数不符即 CursorInvalid。

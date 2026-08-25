@@ -63,35 +63,46 @@ impl LookupRequest<'_> {
     }
 }
 
-/// Found 应答 body：节点类型、标记与节点尺寸（流为字节数）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NodeInfo {
+/// Found 应答 body：节点类型、标记、尺寸与可选自描述尾。
+///
+/// 尾随槽位（sized bytes）按 kind 判别：今天是 SymbolicLink 的
+/// target 文本；无尾的 kind 到 size 截止。多态收敛在判别式上，
+/// 新节点类型的自描述走同一槽位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeInfo<'a> {
     pub kind: NodeKind,
     pub attributes: NodeAttributes,
+    /// 语义随 kind：Directory = 子项数，其余 = 字节数。
     pub size: u64,
+    /// SymbolicLink 的 target 文本；其余 kind 为空。
+    pub value: &'a [u8],
 }
 
-impl NodeInfo {
-    pub fn encode(&self, out: &mut [u8]) -> usize {
+impl NodeInfo<'_> {
+    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let mut writer = Writer::new(out);
         writer.u32(self.kind as u32);
         writer.u32(self.attributes.raw());
         writer.u64(self.size);
         writer.u32(0);
-        writer.written()
+        if self.kind == NodeKind::SymbolicLink && !writer.sized_bytes(self.value) {
+            return Err(DecodeError);
+        }
+        Ok(writer.written())
     }
 
-    pub fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+    pub fn decode(bytes: &[u8]) -> DecodeResult<(NodeKind, NodeAttributes, u64, &[u8])> {
         let mut reader = Reader::new(bytes);
         let kind = NodeKind::from_u32(reader.u32()?).ok_or(DecodeError)?;
         let attributes = NodeAttributes::from_raw(reader.u32()?);
         let size = reader.u64()?;
         let reserved = reader.u32()?;
-        reader.finish()?;
         if reserved != 0 {
             return Err(DecodeError);
         }
-        Ok(Self { kind, attributes, size })
+        let value = if kind == NodeKind::SymbolicLink { reader.sized_bytes()? } else { &[] };
+        reader.finish()?;
+        Ok((kind, attributes, size, value))
     }
 }
 
@@ -171,15 +182,30 @@ mod tests {
             kind: NodeKind::Stream,
             attributes: NodeAttributes::READABLE | NodeAttributes::EXECUTABLE,
             size: 8192,
+            value: &[],
         };
-        let used = info.encode(&mut buffer);
-        assert_eq!(NodeInfo::decode(&buffer[..used]).unwrap(), NodeInfo {
-            kind: NodeKind::Stream,
-            attributes: NodeAttributes::from_raw(
-                NodeAttributes::READABLE.raw() | NodeAttributes::EXECUTABLE.raw()
-            ),
-            size: 8192,
-        });
+        let used = info.encode(&mut buffer).unwrap();
+        let (kind, attributes, size, value) = NodeInfo::decode(&buffer[..used]).unwrap();
+        assert_eq!(kind, NodeKind::Stream);
+        assert!(attributes.contains(NodeAttributes::READABLE | NodeAttributes::EXECUTABLE));
+        assert_eq!(size, 8192);
+        assert_eq!(value, &[][..]);
+    }
+
+    #[test]
+    fn node_info_link_carries_target() {
+        let mut buffer = [0u8; 32];
+        let info = NodeInfo {
+            kind: NodeKind::SymbolicLink,
+            attributes: NodeAttributes::NONE,
+            size: 6,
+            value: b"target",
+        };
+        let used = info.encode(&mut buffer).unwrap();
+        let (kind, _, size, value) = NodeInfo::decode(&buffer[..used]).unwrap();
+        assert_eq!(kind, NodeKind::SymbolicLink);
+        assert_eq!(size, 6);
+        assert_eq!(value, b"target");
     }
 
     #[test]

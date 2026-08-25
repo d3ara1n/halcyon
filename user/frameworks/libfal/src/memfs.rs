@@ -39,14 +39,21 @@ impl Node {
         }
     }
 
-    fn info(&self) -> NodeInfo {
-        let size = match self {
+    fn size(&self) -> u64 {
+        match self {
             Self::Directory { children, .. } => children.len() as u64,
             Self::Property { value, .. } => value.len() as u64,
             Self::Stream { data, .. } => data.len() as u64,
             Self::SymbolicLink { target } => target.len() as u64,
+        }
+    }
+
+    fn found(&self, include_target: bool) -> MemLookup {
+        let target = match (self, include_target) {
+            (Self::SymbolicLink { target }, true) => Some(target.clone()),
+            _ => None,
         };
-        NodeInfo { kind: self.kind(), attributes: self.attributes(), size }
+        MemLookup::Found { kind: self.kind(), attributes: self.attributes(), size: self.size(), target }
     }
 }
 
@@ -79,8 +86,9 @@ pub struct MemFs {
 }
 
 /// Lookup 的提供者侧结果（单提供者：Delegate 不出现）。
+/// Found 携带节点元数据；SymbolicLink 终段（NoFollowFinal）含 target。
 pub enum MemLookup {
-    Found(NodeInfo),
+    Found { kind: NodeKind, attributes: NodeAttributes, size: u64, target: Option<String> },
     Link { parent_rel: String, target: String, remaining: String },
 }
 
@@ -149,10 +157,10 @@ impl MemFs {
     /// 节点查询：FollowAll 下终段链接返回边界，NoFollowFinal 返回节点。
     pub fn lookup(&self, policy: ResolvePolicy, rel: &[u8]) -> Result<MemLookup, Status> {
         match self.walk(rel)? {
-            Walked::Reached(node) => Ok(MemLookup::Found(node.info())),
+            Walked::Reached(node) => Ok(node.found(false)),
             Walked::HitLink { node, at } => {
                 if policy == ResolvePolicy::NoFollowFinal {
-                    return Ok(MemLookup::Found(node.info()));
+                    return Ok(node.found(true));
                 }
                 let segments = split_rel(rel)?;
                 let Node::SymbolicLink { target } = node else {
@@ -213,7 +221,7 @@ impl MemFs {
     }
 
     /// 创建符号链接（持久化路径文本，不解释）。
-    pub fn create_symlink(&mut self, rel: &[u8], target: &[u8]) -> Result<(), Status> {
+    pub fn link(&mut self, rel: &[u8], target: &[u8]) -> Result<(), Status> {
         let target = core::str::from_utf8(target).map_err(|_| Status::IllegalArgument)?;
         let parent_rel = parent_of(rel)?;
         let directory = self.walk_mut(parent_rel)?;
@@ -285,14 +293,6 @@ impl MemFs {
                 Ok(())
             }
             Node::SymbolicLink { .. } => Err(Status::SymbolicLinkEncountered),
-            _ => Err(Status::HandleKindMismatch),
-        }
-    }
-
-    /// 读符号链接 target。
-    pub fn read_symlink(&self, policy: ResolvePolicy, rel: &[u8]) -> Result<&str, Status> {
-        match self.node_at(policy, rel)? {
-            Node::SymbolicLink { target } => Ok(target),
             _ => Err(Status::HandleKindMismatch),
         }
     }
@@ -433,7 +433,7 @@ mod tests {
         fs.create(b"hello/world", NodeKind::Property, rw()).unwrap();
 
         let found = fs.lookup(ResolvePolicy::FollowAll, b"hello/world").unwrap();
-        assert!(matches!(found, MemLookup::Found(info) if info.kind == NodeKind::Property));
+        assert!(matches!(&found, MemLookup::Found { kind, .. } if *kind == NodeKind::Property));
 
         assert!(matches!(fs.create(b"hello", NodeKind::Directory, rw()), Err(Status::Exists)));
         fs.delete(b"hello/world").unwrap();
@@ -445,14 +445,14 @@ mod tests {
     fn root_lookup_and_info() {
         let fs = MemFs::new();
         let found = fs.lookup(ResolvePolicy::FollowAll, b"").unwrap();
-        assert!(matches!(found, MemLookup::Found(info) if info.kind == NodeKind::Directory));
+        assert!(matches!(&found, MemLookup::Found { kind, .. } if *kind == NodeKind::Directory));
     }
 
     #[test]
     fn symlink_boundary_not_interpreted() {
         let mut fs = MemFs::new();
         fs.create(b"target", NodeKind::Property, rw()).unwrap();
-        fs.create_symlink(b"lnk", b"target").unwrap();
+        fs.link(b"lnk", b"target").unwrap();
 
         match fs.lookup(ResolvePolicy::FollowAll, b"lnk").unwrap() {
             MemLookup::Link { parent_rel, target, remaining } => {
@@ -460,13 +460,14 @@ mod tests {
             }
             _ => panic!("expected link boundary"),
         }
+        // NoFollowFinal 终段链接：Found 含 target。
         let found = fs.lookup(ResolvePolicy::NoFollowFinal, b"lnk").unwrap();
-        assert!(matches!(found, MemLookup::Found(info) if info.kind == NodeKind::SymbolicLink));
+        assert!(matches!(&found,
+            MemLookup::Found { kind: NodeKind::SymbolicLink, target: Some(t), .. } if t == "target"));
         assert!(matches!(
             fs.property_read(ResolvePolicy::FollowAll, b"lnk"),
             Err(Status::SymbolicLinkEncountered)
         ));
-        assert_eq!(fs.read_symlink(ResolvePolicy::NoFollowFinal, b"lnk").unwrap(), "target");
     }
 
     #[test]

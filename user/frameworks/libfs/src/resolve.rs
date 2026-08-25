@@ -12,16 +12,25 @@ use alloc::{string::String, vec::Vec};
 use erhino_shared::object::Handle;
 use libfal::{
     header::Status,
-    lookup::{NodeInfo, ResolvePolicy},
+    lookup::ResolvePolicy,
+    node::{NodeAttributes, NodeKind},
 };
 
 use crate::prefix::PrefixTable;
 use crate::{BYTE_LIMIT, COMPONENT_LIMIT, SYMLINK_LIMIT};
 
+/// Found 的节点元数据摘要（客户端所有权形态；value 尾由传输层交付调用方）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeSummary {
+    pub kind: NodeKind,
+    pub attributes: NodeAttributes,
+    pub size: u64,
+}
+
 /// 单次 Lookup 的客户端视图结果（真实传输把线形映射到这里）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LookupOutcome {
-    Found(NodeInfo),
+    Found(NodeSummary),
     Delegate { dir: Handle, consumed: String, remaining: String },
     Link { consumed: String, target: String, remaining: String },
 }
@@ -74,7 +83,7 @@ impl ResolveError {
 pub struct Position {
     pub anchor: Handle,
     pub rel: String,
-    pub info: NodeInfo,
+    pub info: NodeSummary,
 }
 
 /// ResolveParent 的结果：父目录位置 + 终段名。
@@ -316,8 +325,8 @@ mod tests {
         Handle::from_raw(raw)
     }
 
-    fn info(kind: NodeKind) -> NodeInfo {
-        NodeInfo { kind, attributes: NodeAttributes::NONE, size: 0 }
+    fn info(kind: NodeKind) -> NodeSummary {
+        NodeSummary { kind, attributes: NodeAttributes::NONE, size: 0 }
     }
 
     /// mock 提供者图（grant "/" → A=1）：

@@ -7,36 +7,35 @@ pub const FAL_VERSION: u16 = 1;
 
 /// 协议 kind：请求/应答共用的操作判别。
 ///
-/// kind 号是版本冻结的契约；body 编解码随实现按需接入。
+/// kind 号是版本冻结的契约；动词自含对象——Read/Write 整值语义指向
+/// Property，At 后缀是定位读写指向 Stream，无前缀无歧义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Kind {
-    /// 节点查询：路径相对 Handle slot 1 的目录，三值应答。
+    /// 走路三值应答：Found（含元数据与 value 尾）/ Delegate / Link。
     Lookup = 0x01,
     /// 目录枚举：固定宽目录项头 + 内联名字，cursor 分页。
     Enumerate = 0x02,
-    /// 属性读取。
-    PropertyRead = 0x03,
-    /// 属性写入。
-    PropertyWrite = 0x04,
-    /// 创建节点（目录/属性/流）。
-    Create = 0x05,
-    /// 删除节点。
-    Delete = 0x06,
-    /// 移动节点。
-    Move = 0x07,
-    /// 复制节点。
-    Copy = 0x08,
+    /// 在目录下创建节点（目录/属性/流）。
+    Create = 0x03,
+    /// 创建符号链接（持久化 target 文本）。
+    Link = 0x04,
+    /// 读属性整值。
+    Read = 0x05,
+    /// 写属性整值（替换）。
+    Write = 0x06,
     /// 打开流：应答转交一次性 tunnel peer invitation（slot 1）。
-    Open = 0x09,
-    /// 偏移读：字节直接置于应答 payload。
-    ReadAt = 0x0A,
-    /// 偏移写。
-    WriteAt = 0x0B,
-    /// 创建符号链接（持久化路径文本）。
-    CreateSymbolicLink = 0x0C,
-    /// 读取符号链接 target 文本。
-    ReadSymbolicLink = 0x0D,
+    Open = 0x07,
+    /// 偏移读流：字节直接置于应答 payload。
+    ReadAt = 0x08,
+    /// 偏移写流。
+    WriteAt = 0x09,
+    /// 移动节点。
+    Move = 0x0A,
+    /// 复制节点。
+    Copy = 0x0B,
+    /// 删除节点。
+    Delete = 0x0C,
 }
 
 impl Kind {
@@ -44,17 +43,16 @@ impl Kind {
         match raw {
             0x01 => Some(Self::Lookup),
             0x02 => Some(Self::Enumerate),
-            0x03 => Some(Self::PropertyRead),
-            0x04 => Some(Self::PropertyWrite),
-            0x05 => Some(Self::Create),
-            0x06 => Some(Self::Delete),
-            0x07 => Some(Self::Move),
-            0x08 => Some(Self::Copy),
-            0x09 => Some(Self::Open),
-            0x0A => Some(Self::ReadAt),
-            0x0B => Some(Self::WriteAt),
-            0x0C => Some(Self::CreateSymbolicLink),
-            0x0D => Some(Self::ReadSymbolicLink),
+            0x03 => Some(Self::Create),
+            0x04 => Some(Self::Link),
+            0x05 => Some(Self::Read),
+            0x06 => Some(Self::Write),
+            0x07 => Some(Self::Open),
+            0x08 => Some(Self::ReadAt),
+            0x09 => Some(Self::WriteAt),
+            0x0A => Some(Self::Move),
+            0x0B => Some(Self::Copy),
+            0x0C => Some(Self::Delete),
             _ => None,
         }
     }
@@ -163,17 +161,16 @@ mod tests {
         for kind in [
             Kind::Lookup,
             Kind::Enumerate,
-            Kind::PropertyRead,
-            Kind::PropertyWrite,
             Kind::Create,
-            Kind::Delete,
-            Kind::Move,
-            Kind::Copy,
+            Kind::Link,
+            Kind::Read,
+            Kind::Write,
             Kind::Open,
             Kind::ReadAt,
             Kind::WriteAt,
-            Kind::CreateSymbolicLink,
-            Kind::ReadSymbolicLink,
+            Kind::Move,
+            Kind::Copy,
+            Kind::Delete,
         ] {
             let header = FalHeader::new(kind, 0x1234);
             header.encode(&mut buffer);
@@ -185,7 +182,7 @@ mod tests {
     fn header_rejects_unknown_and_dirty_reserved() {
         let mut buffer = [0u8; 16];
         FalHeader::new(Kind::Lookup, 8).encode(&mut buffer);
-        buffer[2] = 0x7F;
+        buffer[2] = 0x0D;
         assert_eq!(FalHeader::decode(&buffer), Err(DecodeError));
         buffer[2] = 0x01;
         buffer[15] = 1;

@@ -22,7 +22,8 @@ use libfal::{
     lookup::{self, LookupRequest, NodeInfo, ResolvePolicy},
     memfs::MemFs,
     node::{NodeAttributes, NodeKind},
-    op, property::{self, EncodedItem},
+    op,
+    property::{self, EncodedItem},
     provider,
     PROTOCOL_ID,
 };
@@ -209,8 +210,9 @@ impl WalkTransport for Fs {
         let variant = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
         match variant {
             0 => {
-                let info = NodeInfo::decode(&rest[4..]).map_err(|_| Status::Internal)?;
-                Ok(LookupOutcome::Found(info))
+                let (kind, attributes, size, _) =
+                    NodeInfo::decode(&rest[4..]).map_err(|_| Status::Internal)?;
+                Ok(LookupOutcome::Found(libfs::resolve::NodeSummary { kind, attributes, size }))
             }
             1 => {
                 let (consumed, target, remaining) =
@@ -247,11 +249,11 @@ impl Fs {
         expect_ok(&reply).map(|_| ())
     }
 
-    fn create_symlink(&mut self, position: &Position, name: &str, target: &str) -> Result<(), Status> {
+    fn link(&mut self, position: &Position, name: &str, target: &str) -> Result<(), Status> {
         let rel = join_rel(&position.rel, name);
         let body = {
             let mut buffer = [0u8; 128];
-            let used = op::CreateSymbolicLinkRequest {
+            let used = op::LinkRequest {
                 address: op::OpAddress { policy: ResolvePolicy::FollowAll, rel: rel.as_bytes() },
                 target: target.as_bytes(),
             }
@@ -259,7 +261,7 @@ impl Fs {
             .map_err(|_| Status::IllegalPath)?;
             buffer[..used].to_vec()
         };
-        let reply = self.call(Kind::CreateSymbolicLink, &body, position.anchor)?;
+        let reply = self.call(Kind::Link, &body, position.anchor)?;
         expect_ok(&reply).map(|_| ())
     }
 
@@ -300,7 +302,7 @@ impl Fs {
         }
     }
 
-    fn property_write(&mut self, position: &Position, value: &[u8]) -> Result<(), Status> {
+    fn write(&mut self, position: &Position, value: &[u8]) -> Result<(), Status> {
         let body = {
             let mut buffer = [0u8; 256];
             let mut writer = libfal::bytes::Writer::new(&mut buffer);
@@ -314,11 +316,11 @@ impl Fs {
             let used = writer.written();
             buffer[..used].to_vec()
         };
-        let reply = self.call(Kind::PropertyWrite, &body, position.anchor)?;
+        let reply = self.call(Kind::Write, &body, position.anchor)?;
         expect_ok(&reply).map(|_| ())
     }
 
-    fn property_read(&mut self, position: &Position) -> Result<Vec<u8>, Status> {
+    fn read(&mut self, position: &Position) -> Result<Vec<u8>, Status> {
         let body = {
             let mut buffer = [0u8; 64];
             let used = op::PropertyReadRequest {
@@ -331,7 +333,7 @@ impl Fs {
             .map_err(|_| Status::IllegalPath)?;
             buffer[..used].to_vec()
         };
-        let reply = self.call(Kind::PropertyRead, &body, position.anchor)?;
+        let reply = self.call(Kind::Read, &body, position.anchor)?;
         let rest = expect_ok(&reply)?;
         let mut reader = libfal::bytes::Reader::new(rest);
         let value = reader.sized_bytes().map_err(|_| Status::Internal)?;
@@ -425,8 +427,8 @@ fn main() {
             .expect("property encode failed");
         buffer[..used].to_vec()
     };
-    fs.property_write(&world, &encoded).expect("property write failed");
-    let value = fs.property_read(&world).expect("property read failed");
+    fs.write(&world, &encoded).expect("property write failed");
+    let value = fs.read(&world).expect("property read failed");
     match property::DecodedValue::decode(&value).expect("property decode failed") {
         property::DecodedValue::Array { element, body } => {
             debug!("world = Array<{:?}> {} bytes", element, body.len());
@@ -435,7 +437,7 @@ fn main() {
     }
 
     // 符号链接：创建后 FollowAll 解析应展开至 world 属性。
-    fs.create_symlink(&hello, "lnk", "world").expect("create /hello/lnk failed");
+    fs.link(&hello, "lnk", "world").expect("create /hello/lnk failed");
     let via_link =
         libfs::resolve::resolve(&mut fs, &table, "/hello/lnk", ResolvePolicy::FollowAll)
             .expect("symlink resolve failed");

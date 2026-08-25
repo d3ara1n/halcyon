@@ -38,11 +38,18 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
             let (policy, rel) = crate::lookup::LookupRequest::decode(body)?;
             let mut writer = Writer::new(out);
             match fs.lookup(policy, rel) {
-                Ok(MemLookup::Found(info)) => {
+                Ok(MemLookup::Found { kind, attributes, size, target }) => {
                     writer.u32(Status::Ok as u32);
                     writer.u32(0);
                     let used = writer.written();
-                    Ok(Served { kind: header.kind, len: used + info.encode(&mut out[used..]) })
+                    let info = crate::lookup::NodeInfo {
+                        kind,
+                        attributes,
+                        size,
+                        value: target.as_deref().map(str::as_bytes).unwrap_or_default(),
+                    };
+                    let len = info.encode(&mut out[used..])?;
+                    Ok(Served { kind: header.kind, len: used + len })
                 }
                 Ok(MemLookup::Link { parent_rel, target, remaining }) => {
                     writer.u32(Status::Ok as u32);
@@ -84,7 +91,7 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                 Err(status) => Ok(status_only(out, status)),
             }
         }
-        Kind::PropertyRead => {
+        Kind::Read => {
             let (policy, rel) = OpAddress::decode(body)?;
             let mut writer = Writer::new(out);
             match fs.property_read(policy, rel) {
@@ -100,7 +107,7 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                 Err(status) => Ok(status_only(out, status)),
             }
         }
-        Kind::PropertyWrite => {
+        Kind::Write => {
             let (policy, rel) = OpAddress::decode(body)?;
             let mut reader = reader_after_address(rel, body)?;
             let value = reader.sized_bytes()?;
@@ -116,26 +123,10 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                 Err(status) => Ok(status_only(out, status)),
             }
         }
-        Kind::CreateSymbolicLink => {
-            let (_, rel, target) = crate::op::CreateSymbolicLinkRequest::decode(body)?;
-            match fs.create_symlink(rel, target) {
+        Kind::Link => {
+            let (_, rel, target) = crate::op::LinkRequest::decode(body)?;
+            match fs.link(rel, target) {
                 Ok(()) => Ok(status_only(out, Status::Ok)),
-                Err(status) => Ok(status_only(out, status)),
-            }
-        }
-        Kind::ReadSymbolicLink => {
-            let (policy, rel) = OpAddress::decode(body)?;
-            let mut writer = Writer::new(out);
-            match fs.read_symlink(policy, rel) {
-                Ok(target) => {
-                    writer.u32(Status::Ok as u32);
-                    let used = writer.written();
-                    let mut inner = Writer::new(&mut out[used..]);
-                    if !inner.sized_bytes(target.as_bytes()) {
-                        return Err(DecodeError);
-                    }
-                    Ok(Served { kind: header.kind, len: used + inner.written() })
-                }
                 Err(status) => Ok(status_only(out, status)),
             }
         }
@@ -251,8 +242,8 @@ mod tests {
         let mut reader = Reader::new(&out[..served.len]);
         assert_eq!(reader.u32().unwrap(), Status::Ok as u32);
         assert_eq!(reader.u32().unwrap(), 0);
-        let info = crate::lookup::NodeInfo::decode(&out[8..served.len]).unwrap();
-        assert_eq!(info.kind, NodeKind::Directory);
+        let (kind, _, _, _) = crate::lookup::NodeInfo::decode(&out[8..served.len]).unwrap();
+        assert_eq!(kind, NodeKind::Directory);
     }
 
     #[test]
@@ -273,7 +264,7 @@ mod tests {
             buffer.truncate(used);
             buffer
         };
-        let request = build_request(Kind::CreateSymbolicLink, &body);
+        let request = build_request(Kind::Link, &body);
         let mut out = [0u8; 256];
         serve(&mut fs, &request, &mut out).unwrap();
 

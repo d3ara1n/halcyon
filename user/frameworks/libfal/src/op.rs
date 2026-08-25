@@ -65,13 +65,13 @@ impl CreateRequest<'_> {
     }
 }
 
-/// CreateSymbolicLink：创建持久化路径文本。
-pub struct CreateSymbolicLinkRequest<'a> {
+/// Link：创建符号链接（持久化路径文本）。
+pub struct LinkRequest<'a> {
     pub address: OpAddress<'a>,
     pub target: &'a [u8],
 }
 
-impl CreateSymbolicLinkRequest<'_> {
+impl LinkRequest<'_> {
     pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
         let used = self.address.encode(out)?;
         let mut writer = Writer::new(&mut out[used..]);
@@ -159,12 +159,12 @@ mod tests {
     #[test]
     fn symlink_create_roundtrip() {
         let mut buffer = [0u8; 64];
-        let request = CreateSymbolicLinkRequest {
+        let request = LinkRequest {
             address: OpAddress { policy: ResolvePolicy::FollowAll, rel: b"a/lnk" },
             target: b"../elsewhere",
         };
         let used = request.encode(&mut buffer).unwrap();
-        let (policy, rel, target) = CreateSymbolicLinkRequest::decode(&buffer[..used]).unwrap();
+        let (policy, rel, target) = LinkRequest::decode(&buffer[..used]).unwrap();
         assert_eq!((policy, rel, target), (ResolvePolicy::FollowAll, &b"a/lnk"[..], &b"../elsewhere"[..]));
     }
 }
