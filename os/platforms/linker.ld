@@ -74,15 +74,20 @@ SECTIONS
         PROVIDE(_bss_end = .);
     }
 
-    /* 栈窗口：正式内核栈的专用虚拟分区（高半区顶 vpn2 槽，与直映射
-       解耦）。每槽步长 STACK_SIZE + 4096（4096 必须与 mm::GUARD_SIZE
-       一致），槽底 4KiB 为 guard 页（mm 建表时不映射），栈溢出立即
-       触发 page fault。纯虚拟预留，不占物理镜像体积；物理占用由
-       __kernel_pa_end 表达。 */
+    /* 栈窗口布局真值（数字只写此处；Rust 经 _ENTRY_CONSTS、audit_elf.py
+       从 ELF 符号表读取同一值）：
+       - STACK_GUARD：guard 洞跨度，必须 ≥ 构建审计允许的单函数最大帧
+         （audit_elf.py 构建期强制），否则一次 sp 下调可越过 guard 洞；
+       - EMERGENCY_SIZE：fatal 路径专用 emergency 栈，占槽顶。
+       每槽 VA 布局（stride = STACK_SIZE + 2*STACK_GUARD）：
+         [ 槽底 guard | formal | emergency guard | emergency ]
+       物理侧每槽连续打包 STACK_SIZE（formal+emergency 相邻），guard 纯虚拟。 */
+    STACK_GUARD = 0x2000;
+    EMERGENCY_SIZE = 0x1000;
     STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000;
     .stack_window STACK_WINDOW_VA_BASE (NOLOAD) : ALIGN(4096) {
         PROVIDE(__stack_window_base = .);
-        . = . + (STACK_SIZE + 4096) * HART_NUM_LIMIT;
+        . = . + (STACK_SIZE + 2 * STACK_GUARD) * HART_NUM_LIMIT;
         PROVIDE(__stack_window_end = .);
     }
 

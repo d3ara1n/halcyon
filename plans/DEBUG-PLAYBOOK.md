@@ -49,7 +49,8 @@ hart 当时在干什么才是随机场。资源量敏感的现象，先做静态
   `sub sp,sp,N` 合计），对照栈预算；debug 构建帧远大于 release，
   `[T; 512]` 这类按值拷贝是大帧头号来源；
 - Rust 没有 `-Wframe-larger-than` 等价物，构建期审计靠 objdump
-  （扩展点：`os/tools/audit_elf.py`），见 `plans/todo-2026-09-stack-guard.md` 方案 C。
+  （`os/tools/audit_elf.py`，帧上限不大于链接脚本 `STACK_GUARD`，
+  构建期从 ELF 符号表强制），见 `notes/impls/mm.md`「栈窗口」。
 
 静态尺寸审计成本分钟级，应排在任何动态取证之前。
 

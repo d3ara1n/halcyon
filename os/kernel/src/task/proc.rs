@@ -93,6 +93,8 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         // 先剥离共享的内核顶层项（直映射 + 栈窗口）：这些子树归内核，
         // 随后的树回收（free_subtree）只许触及用户部分。
+        // 已知简化：配对纪律靠本调用点自觉；扩展共享分区或新增 teardown
+        // 路径时收敛为 root 槽所有权登记（见 notes/impls/mm.md「Root 借用模型」）。
         let root = self.tree.root_frame();
         let (start, end, window) = mm::kernel_top_level_range();
         self.tree.clear_slots(root, start, end);

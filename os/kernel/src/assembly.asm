@@ -73,6 +73,8 @@ _ENTRY_CONSTS:
     .quad __bootstrap_stack_top # [8] 同 [6]：_start_high 别名换算用
     .quad __stack_window_base   # [9] 栈窗口基（高半区顶槽 VMA）
     .quad __kernel_pa_end       # [10] 内核静态占用物理末端
+    .quad STACK_GUARD           # [11] guard 洞跨度（≥ 审计最大单帧）
+    .quad EMERGENCY_SIZE        # [12] emergency 栈大小（占槽顶）
 
 .section .text.entry
 .global _pa_fatal

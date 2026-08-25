@@ -95,9 +95,6 @@ global_asm!(
 
 const BANNER: &str = include_str!("../banner.txt");
 
-/// emergency 栈大小（每 hart 正式栈区最高页）。
-const EMERGENCY_SIZE: usize = 4096;
-
 /// 从物理地址构造 DTB 视图（地址纪律：PA 经 phys_to_virt，totalsize 定界）。
 ///
 /// # Safety
@@ -185,17 +182,16 @@ fn construct_registry(board: &BoardInfo) {
 
     let kernel_satp = mm::kernel_satp();
     let entry_high = external::enter_hart_high_va();
-    let stack_size = external::hart_stack_size();
+    let layout = mm::stack_layout();
 
     for (slot, record) in reg.records_mut() {
         record.kernel_satp = kernel_satp;
         record.entry_high = entry_high;
         record.hart_local = hart::hart_local_addr(slot.0);
-        // 栈窗口布局（见 mm::stack_slot_range）：每槽步长 stack_size + guard，
-        // 槽内最高页划为 emergency 栈；正式 sp 从其下开始。
-        let (_, top) = mm::stack_slot_range(slot.0, stack_size);
-        record.emergency_sp = top;
-        record.stack_top = top - EMERGENCY_SIZE;
+        // 栈窗口布局（mm::stack_layout 单一真值）：formal sp 从 emergency
+        // guard 洞下方起；emergency 占槽顶，fatal 路径专用。
+        record.emergency_sp = layout.emergency_top(slot.0);
+        record.stack_top = layout.formal_top(slot.0);
     }
     reg.record_mut(reg.slot_of(rt::boot_hartid()).unwrap()).role_boot = 1;
 

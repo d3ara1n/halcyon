@@ -14,4 +14,5 @@ tar = { path = "../tar" }
 elf = { path = "../elf" }
 handle_table = { path = "../handle_table" }
 wait_context = { path = "../wait_context" }
+stack_layout = { path = "../stack_layout" }
 num-traits = { version = "0.2", default-features = false }

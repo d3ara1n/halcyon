@@ -8,5 +8,6 @@ members = [
     "elf",
     "handle_table",
     "wait_context",
+    "stack_layout",
 ]
 resolver = "2"

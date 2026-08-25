@@ -85,6 +85,8 @@ pub mod flags {
 
     /// 内核直映射区（含 MMIO）。
     pub const KERNEL_DIRECT: u64 = V | R | W | X | A | D | G;
+    /// 内核栈窗口页：RW、不可执行（栈上永不取指；guard 洞不映射）。
+    pub const KERNEL_STACK: u64 = V | R | W | A | D | G;
     /// 内核代码/数据（镜像区，不用 G——进程表会拷贝顶层项，粒度到项即可）。
     pub const KERNEL_IMAGE: u64 = V | R | W | X | A | D;
     /// 用户代码。

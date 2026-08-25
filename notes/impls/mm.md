@@ -34,7 +34,7 @@ pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
 - `dealloc(base, count)`：按地址序插入 + 相邻三向合并。debug 断言拒绝与现有空闲区间重叠（双重释放检测）。
 - 复杂度：分配/释放 O(空闲区间数)，教学规模无压力；分桶/命中提示等优化留待需要时在范式内逐点做。
 
-- 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）、initfs 所在段（loader 加载的 tar 区）。
+- 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）、initfs 所在段（loader 加载的 tar 区）。**（已知简化）**占用剔除目前是启动期固定两洞 + bootstrap `free_range` 回投两条路径；接入新占用方（保留设备区/新平台保留段）时，应收敛为排序合并、重叠校验的 Boot Reservations 集合，让非法重叠在注册期即被拒绝。
 - `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账（M3）。
 - 内核堆由帧池供血：talc 内存源（FrameSource）耗尽时取 1MiB 连续帧块 claim 建新区，帧块所有权终身归堆（acquire 内不可碰堆与锁，无归还记账）；启动路径（DTB 解析/帧池注册）零堆依赖，引导序线性：帧池 → 堆首分配 → 一切堆消费者。
 
@@ -65,6 +65,8 @@ pub trait FrameMemory {
 - `FrameNumber(usize)`、`Vpn(usize)`（4KiB 页号）、`Ppn(usize)`——newtype，禁止裸 usize 传递。
 - `Pte(u64)`：编码/解码、标志位（V R W X U G A D）、`leaf()`/`branch()` 判别；组合常量（用户页、内核直映射页等）集中定义。
 - `TableTree<M: FrameMemory, const LEVELS: usize>`：root 帧（经 `M` 分配/释放）、`map / unmap / translate`；`type Sv39<M> = TableTree<M, 3>`。
+
+**Root 借用模型（已知简化）**：TableTree 名义拥有全部中间表，但用户 root 拷入内核共享子树（直映射/栈窗口槽，见「栈窗口」），靠 `AddressSpace::drop` 手工 `clear_slots` 配对剥离——所有权事实与类型声明不一致，配对纪律靠调用点自觉。扩展用户表共享分区（procfs/调试映射）或新增 teardown 路径时，应收敛为 root 槽所有权显式登记（Drop 只递归 owned 槽），消灭逐点配对并移除通用 `clear_slots` 逃生口。
 
 ### 区域切段算法
 
@@ -99,11 +101,12 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 
 ### 栈窗口
 
-正式内核栈的专用虚拟分区：高半区顶 vpn2 槽（链接脚本 `STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000`，与直映射槽数解耦）。目的：每 hart 槽底放一页不映射的 guard 页，栈向下溢出立即 store page fault，溢出即时可见（对照 `plans/DEBUG-PLAYBOOK.md` 的静默踩踏事故；构建期兜底见 os/tools/audit_elf.py）。
+正式内核栈的专用虚拟分区：高半区顶 vpn2 槽（链接脚本 `STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000`，与直映射解耦——直映射槽数上限 255，满配也只到 510，与顶槽结构性互斥）。目的：栈向下溢出立即 store page fault，溢出即时可见（对照 `plans/DEBUG-PLAYBOOK.md` 的静默踩踏事故；构建期兑底见 os/tools/audit_elf.py）。
 
-- **布局**：每槽步长 `stack_size + GUARD_SIZE(4KiB)`，低→高 `[guard | formal | emergency]`；槽内最高页为 emergency 栈，正式 sp 从其下开始（`mm::stack_slot_range` 是唯一布局真值）。
-- **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）对窗口逐页映射、guard 置 invalid；所有 hart 与全部用户表共享同一子树。物理侧按槽连续打包在内核静态占用末段（基址 `__kernel_pa_end - 总栈量`），guard 不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**（绕过即无防护）。
-- **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + 窗口打包公式互逆）；同一物理页有两个内核 VA，PA→VA 无唯一逆——`phys_to_virt` 恒给直映射别名。SBI ecall 传 PA 前必须经它（console 缓冲在栈上即依赖此）。
+- **布局真值链**：`os/stack_layout` 纯逻辑 crate 是几何唯一真值（构造期整体校验，host 可测）；数字只写在链接脚本（`STACK_SIZE`/`STACK_GUARD`/`EMERGENCY_SIZE`/`HART_NUM_LIMIT`/窗口基址）→ 汇编 `_ENTRY_CONSTS` 物化 → 内核 `mm::stack_layout()` 构造消费；audit_elf.py 从 ELF 符号表读 `STACK_GUARD` 构建期强制「单函数最大帧 ≤ guard 洞跨度」——否则一次 sp 下调整体越过洞落入邻槽，即时可见失效。
+- **布局**：每槽 `[槽底 guard | formal (stack_size − emergency) | emergency guard | emergency]`，步长 `stack_size + 2×guard`。formal sp 从 emergency guard 洞下方起；emergency 占槽顶、fatal 路径专用，独立 guard 使其溢出不再踩入 formal。物理侧按槽连续打包 `stack_size` 字节（formal+emergency 相邻），guard 纯虚拟不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**（绕过即无防护）。
+- **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）按 `layout.mappings` 逐页映射（RW、不可执行——`flags::KERNEL_STACK` 无 X）、guard 洞置 invalid；所有 hart 与全部用户表共享同一子树。
+- **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + `layout.translate` 互逆）；同一物理页有两个内核 VA，PA→VA 无唯一逆——`phys_to_virt` 恒给直映射别名。SBI ecall 传 PA 前必须经它（console 缓冲在栈上即依赖此）。
 - **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；进程 teardown 前 `AddressSpace::drop` 必须先剥离这些共享顶层项（`TableTree::clear_slots`），否则树回收会把内核子表当用户页表拆掉回投（双重释放 + 栈内存被复用）。
 - **边界**：bootstrap 过渡环境的栈在过渡表的 mega 映射里，不受此防护管辖——bootstrap 期栈溢出不可观测，接受为已知边界（窗口短，audit_elf 兑底大帧）。
 

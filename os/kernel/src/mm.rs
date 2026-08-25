@@ -16,6 +16,8 @@ use core::{
 };
 
 use page_table::{FrameNumber, PAGE_BITS, Ppn, Pte, flags, ENTRIES};
+use stack_layout::StackWindowLayout;
+use stack_layout::PAGE_SIZE;
 
 use crate::{board::BoardInfo, external};
 
@@ -31,21 +33,16 @@ const GIB: usize = 1 << 30;
 /// 直映射 vpn2 起始槽（高半区首槽；由 KERNEL_VA_BASE 推得）。
 const DIRECT_VPN2_BASE: usize = 256;
 
-/// sv39 顶层可用槽数（直映射上限 [0, 2^38) 物理）。
-const DIRECT_VPN2_LIMIT: usize = 256;
+/// sv39 顶层直映射槽数上限：直映射占 [256, 256+limit)，栈窗口恒占顶槽
+/// 511——上限 255 使两分区结构性互斥（满配也只到 510，永不覆盖窗口）。
+const DIRECT_VPN2_LIMIT: usize = 255;
 
-/// 栈窗口 vpn2 槽号：高半区顶槽，与直映射槽数解耦的独立分区
-/// （链接脚本 `STACK_WINDOW_VA_BASE`）。
-const STACK_WINDOW_SLOT: usize = DIRECT_VPN2_BASE + DIRECT_VPN2_LIMIT - 1;
-
-/// 每 hart 栈区下方的 guard 页大小：不映射，溢出即 page fault。
-/// 链接脚本 `.stack_window` 的步长字面量 4096 必须与本值一致。
-const GUARD_SIZE: usize = 4096;
-
-const _: () = assert!(GUARD_SIZE == 1 << PAGE_BITS, "guard must be one page");
+/// 栈窗口 vpn2 槽号：sv39 顶层顶槽（链接脚本 STACK_WINDOW_VA_BASE 恒指
+/// 此；与直映射槽数解耦的独立分区）。layout 构造时校验两省一致。
+const STACK_WINDOW_SLOT: usize = ENTRIES - 1;
 
 /// 栈窗口叶表预留数（2MiB 单元数）：当前平台最大跨度
-/// (0x40000 + 0x1000) * 8 ≈ 2.03MiB 跨两个单元，余量为扩展预留。
+/// (0x40000 + 2×0x2000) * 8 ≈ 2.13MiB 跨两个单元，余量为扩展预留。
 const WINDOW_LEAF_MAX: usize = 4;
 
 pub fn phys_to_virt(pa: usize) -> usize {
@@ -57,21 +54,31 @@ pub fn phys_to_virt(pa: usize) -> usize {
 /// 映射里（直映射别名 + 窗口规范地址），PA→VA 无唯一逆——
 /// `phys_to_virt` 恒给直映射别名，本函数接受任意已映射内核 VA。
 pub fn virt_to_phys(va: usize) -> usize {
-    let window = external::stack_window_base();
-    let stack_size = external::hart_stack_size();
-    let stride = stack_size + GUARD_SIZE;
-    let end = window + stride * external::hart_num_limit();
-    if (window..end).contains(&va) {
-        let off = va - window;
-        debug_assert!(
-            off % stride >= GUARD_SIZE,
-            "virt_to_phys on unmapped guard page"
-        );
-        let pa_base = external::kernel_pa_end() - stack_size * external::hart_num_limit();
-        pa_base + (off / stride) * stack_size + (off % stride - GUARD_SIZE)
+    let layout = stack_layout();
+    if va >= layout.window() && va < layout.window() + layout.span() {
+        layout
+            .translate(va)
+            .expect("virt_to_phys on unmapped stack-window guard page")
     } else {
         va - KERNEL_VA_BASE
     }
+}
+
+/// 栈窗口布局（单一几何真值，见 `os/stack_layout`）：从链接期常量构造并
+/// 校验；非法配置在此即刻 panic，绝不静默接受错误布局。
+pub fn stack_layout() -> StackWindowLayout {
+    let stack_size = external::hart_stack_size();
+    let slots = external::hart_num_limit();
+    StackWindowLayout::new(
+        external::stack_window_base(),
+        slots,
+        stack_size,
+        external::stack_guard(),
+        external::emergency_size(),
+        external::kernel_pa_end() - stack_size * slots,
+        STACK_WINDOW_SLOT,
+    )
+    .expect("stack window layout violates invariants")
 }
 
 /// 正式内核页表 root。静态表（Linux swapper_pg_dir 同构）：帧池就绪前
@@ -192,22 +199,17 @@ pub fn kernel_satp() -> usize {
     KERNEL_SATP.load(Ordering::Acquire)
 }
 
-/// 构建栈窗口映射（init 内、satp 发布前调用）：每槽步长
-/// `hart_stack_size + GUARD_SIZE`，槽底 guard 页不映射，栈溢出立即
-/// page fault；物理侧按槽连续打包在内核静态占用末段，guard 不占帧。
+/// 构建栈窗口映射（init 内、satp 发布前调用）：每槽布局
+/// `[槽底 guard | formal | emergency guard | emergency]`（`os/stack_layout`
+/// 单一真值），guard 洞不映射，栈溢出立即 page fault；物理侧按槽连续
+/// 打包在内核静态占用末段，guard 不占帧。
 fn map_stack_window() {
-    let stack_size = external::hart_stack_size();
-    let hart_limit = external::hart_num_limit();
-    let stride = stack_size + GUARD_SIZE;
-    let span = stride * hart_limit;
+    let layout = stack_layout();
     const MIDDLE_SPAN: usize = 1 << 21;
     assert!(
-        span <= MIDDLE_SPAN * WINDOW_LEAF_MAX,
+        layout.span() <= MIDDLE_SPAN * WINDOW_LEAF_MAX,
         "stack window exceeds reserved leaf tables"
     );
-
-    let window = external::stack_window_base();
-    let pa_base = external::kernel_pa_end() - stack_size * hart_limit;
 
     // SAFETY: 静态子表 init 前单 hart 独占写（同 KERNEL_PG_DIR），此后只读。
     unsafe {
@@ -215,19 +217,17 @@ fn map_stack_window() {
         let (middle, leaves) = tables.split_at_mut(1);
         let middle = &mut middle[0];
 
-        for unit in 0..span.div_ceil(MIDDLE_SPAN) {
+        for unit in 0..layout.span().div_ceil(MIDDLE_SPAN) {
             middle[unit] = Pte::branch(FrameNumber::from_addr(virt_to_phys(
                 leaves[unit].as_ptr() as usize,
             )));
         }
-        for slot in 0..hart_limit {
-            let slot_pa = pa_base + slot * stack_size;
-            for off in (GUARD_SIZE..stride).step_by(GUARD_SIZE) {
-                let va = window + slot * stride + off;
-                let unit = (va - window) / MIDDLE_SPAN;
-                let idx = ((va - window) % MIDDLE_SPAN) / GUARD_SIZE;
-                let ppn = Ppn((slot_pa + off - GUARD_SIZE) >> PAGE_BITS);
-                leaves[unit][idx] = Pte::leaf(ppn, flags::KERNEL_DIRECT);
+        for slot in 0..layout.slots() {
+            for (va, pa) in layout.mappings(slot) {
+                let off = va - layout.window();
+                let unit = off / MIDDLE_SPAN;
+                let idx = (off % MIDDLE_SPAN) / PAGE_SIZE;
+                leaves[unit][idx] = Pte::leaf(Ppn(pa >> PAGE_BITS), flags::KERNEL_STACK);
             }
         }
         (*KERNEL_PG_DIR.0.get())[STACK_WINDOW_SLOT] =
@@ -236,26 +236,18 @@ fn map_stack_window() {
 
     log!(
         MM,
-        "stack window @ {:#x}: {} slots x {:#x} (+guard)",
-        window,
-        hart_limit,
-        stack_size
+        "stack window @ {:#x}: {} slots x {:#x} (+{} guard, emergency {:#x})",
+        layout.window(),
+        layout.slots(),
+        layout.stack_size(),
+        layout.guard(),
+        layout.emergency()
     );
 }
 
-/// 栈窗口布局：slot 槽的栈区 VA 区间 [base, top)。top 为槽顶
-/// （emergency 栈占最高页，正式 sp 从 top 减 emergency 大小处起）。
-pub fn stack_slot_range(slot: usize, stack_size: usize) -> (usize, usize) {
-    let base = external::stack_window_base() + slot * (stack_size + GUARD_SIZE) + GUARD_SIZE;
-    (base, base + stack_size)
-}
-
-/// 故障 VA 是否落在某 guard 洞内：内核栈向下溢出的第一现场特征。
+/// 故障 VA 是否落在某 guard 洞内：内核栈溢出的第一现场特征。
 pub fn is_guard_fault(va: usize) -> bool {
-    let window = external::stack_window_base();
-    let stride = external::hart_stack_size() + GUARD_SIZE;
-    let end = window + stride * external::hart_num_limit();
-    window <= va && va < end && (va - window) % stride < GUARD_SIZE
+    stack_layout().in_guard(va)
 }
 
 /// 调度循环入口归一：当前 satp 非正式内核表则切回并同步翻译。
@@ -263,6 +255,9 @@ pub fn is_guard_fault(va: usize) -> bool {
 /// 离开用户执行点后，刚结束线程的 root 可能已被 teardown 剥离内核
 /// 顶层项（`AddressSpace::drop`），不得再作为内核执行的翻译来源。
 /// Resume 热路径不经调度循环，此处切换零热路径开销。
+/// 已知简化：归一分布于本处与 report_exit；接入新终止来源（kill/
+/// 线程退出）时收敛为非 Resume 出口统一切内核表
+/// （notes/impls/execution-context.md「地址空间归属纪律」）。
 pub fn normalize_satp() {
     let want = kernel_satp();
     let cur: usize;

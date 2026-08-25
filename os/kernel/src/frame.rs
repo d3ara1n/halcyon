@@ -53,6 +53,8 @@ fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {
 }
 
 /// 解析板级信息并初始化帧池：DTB memory 段剔除启动占用后注册。
+/// 已知简化：占用剔除固定两洞；接入新占用方/新平台时收敛为排序
+/// 合并、重叠校验的 reservation 集合（notes/impls/mm.md「帧池」）。
 pub fn init(board: &BoardInfo) {
     let kernel_end = external::kernel_pa_end();
     // 启动占用最多两洞（镜像/栈 + initfs），固定容量——启动路径零堆依赖

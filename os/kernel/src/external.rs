@@ -7,7 +7,7 @@
 // 跨空间常量表（布局契约见 assembly.asm `_ENTRY_CONSTS`）。
 unsafe extern "C" {
     #[link_name = "_ENTRY_CONSTS"]
-    static ENTRY_CONSTS: [usize; 11];
+    static ENTRY_CONSTS: [usize; 13];
 }
 
 /// SBI 段物理起点（帧池剔除区间用）。
@@ -50,7 +50,7 @@ pub fn enter_hart_high_va() -> usize {
 }
 
 /// 栈窗口基（VMA）：正式内核栈的专用虚拟分区，与直映射解耦；
-/// 布局与 guard 见 `mm::stack_slot_range`。
+/// 布局与 guard 见 `os/stack_layout`（单一几何真值）。
 pub fn stack_window_base() -> usize {
     // SAFETY: 链接期物化的只读常量。
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[9])) }
@@ -66,4 +66,16 @@ pub fn kernel_pa_end() -> usize {
 pub fn hart_stack_size() -> usize {
     // SAFETY: 链接期物化的只读常量。
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[1])) }
+}
+
+/// guard 洞跨度（≥ 构建审计允许的单函数最大帧；数字真值在链接脚本）。
+pub fn stack_guard() -> usize {
+    // SAFETY: 同上。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[11])) }
+}
+
+/// emergency 栈大小（占槽顶，fatal 路径专用）。
+pub fn emergency_size() -> usize {
+    // SAFETY: 同上。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[12])) }
 }

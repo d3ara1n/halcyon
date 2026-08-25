@@ -6,9 +6,11 @@
 2. FP 指令与浮点 CSR（fcsr/fflags/frm）访问只允许出现在 .text.ctx_fp
    （capability-guarded 的用户 FP helper）；其余任何 section 不得出现。
 
-3. 单函数最大栈帧不超过 --max-frame（默认 0xc00）：扫描 sp 减量
+3. 单函数最大栈帧不超过 --max-frame（默认 0x1800）：扫描 sp 减量
    （含 lui+addi 装载立即数后 sub sp,sp,reg 的模式），防止巨型栈帧
-   溢出每 hart 栈预算（notes/impls/mm.md「栈窗口」的构建期兑底（原方案 C））。
+   跳过 guard 洞落入邻槽（notes/impls/mm.md「栈窗口」的构建期兑底）；
+   max-frame 必须不大于链接脚本 STACK_GUARD（本脚本从 ELF 符号表读取
+   并强制——guard 与帧上限共享同一真值链）。
 
 用法：audit_elf.py <kernel.elf> [--max-frame N]
 （依赖 riscv64-elf-readelf / objdump）。
@@ -21,10 +23,10 @@ import sys
 READELF = "riscv64-elf-readelf"
 OBJDUMP = "riscv64-elf-objdump"
 
-# 默认帧上限：正常栈预算（sifive_u 每 hart 0x4000 减 emergency 页 =
-# 0x3000）的一半。当前最大合法函数为 compiler_builtins memmove
-# （debug 构建 0x1620）；release 帧更小，同一阈值对两 MODE 都成立。
-# 更深的调用链总和超限由 guard page 兑底（todo-2026-09-stack-guard.md）。
+# 默认帧上限：guard 洞跨度的安全余量（必须 ≤ 链接脚本 STACK_GUARD，
+# 本脚本从 ELF 符号表读取并强制）。当前最大合法函数为 compiler_builtins
+# memmove（debug 构建 0x1620）；release 帧更小，同一阈值对两 MODE 都成立。
+# 更深的调用链总和超限由 guard 洞兑底（notes/impls/mm.md「栈窗口」）。
 DEFAULT_MAX_FRAME = 0x1800
 
 # objdump 反汇编行：地址: 字节 助记符 操作数。字节列为若干组 4 位
@@ -172,6 +174,27 @@ def main() -> None:
     if violations:
         shown = "\n".join(violations[:20])
         fail(f"FP instruction/FP CSR access outside .text.ctx_fp ({len(violations)} site(s)):\n{shown}")
+
+    # ---- guard 洞跨度不变量 ----
+    # 单帧超过 guard 洞跨度时，一次 sp 下调可整体越过洞落入邻槽映射段，
+    # 「溢出即时可见」失效。guard 真值在链接脚本 STACK_GUARD，从 ELF
+    # 符号表读取（数字只写一处，内核与审计共享）。
+    syms = subprocess.run(
+        [READELF, "--syms", elf], capture_output=True, text=True, check=True
+    ).stdout
+    guard_values = [
+        int(line.split()[1], 16)
+        for line in syms.splitlines()
+        if line.split() and line.split()[-1] == "STACK_GUARD"
+    ]
+    if len(guard_values) != 1:
+        fail(f"expected exactly one STACK_GUARD symbol, found {len(guard_values)}")
+    stack_guard = guard_values[0]
+    if max_frame > stack_guard:
+        fail(
+            f"max frame {max_frame:#x} exceeds stack guard span {stack_guard:#x}; "
+            "raise STACK_GUARD in os/platforms/linker.ld or lower --max-frame"
+        )
 
     # ---- 单函数栈帧上限 ----
     frames = [f for f in scan_frames(disasm) if f[1] > 0]
