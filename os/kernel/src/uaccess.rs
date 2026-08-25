@@ -57,6 +57,40 @@ pub fn copy_from_user(
     Ok(())
 }
 
+/// 读取一个无 padding 且任意位型均有效的定宽 ABI 值。
+///
+/// # Safety
+/// `T` 必须是纯整数/整数 newtype 组成的 ABI 类型；任何字节组合都必须有效。
+pub unsafe fn read_user_value<T: Copy>(
+    space: &mut AddressSpace,
+    src: usize,
+) -> Result<T, AccessError> {
+    let mut value = core::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: MaybeUninit 的整段存储可作为待写字节；成功后全部字节已初始化。
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
+    };
+    copy_from_user(space, bytes, src)?;
+    // SAFETY: 调用方保证任意位型对 T 有效，且 copy_from_user 已写满全部字节。
+    Ok(unsafe { value.assume_init() })
+}
+
+/// 写出一个不含未初始化 padding 的定宽 ABI 值。
+///
+/// # Safety
+/// `T` 的对象表示不得包含 padding 或其它未初始化字节。
+pub unsafe fn write_user_value<T: Copy>(
+    space: &mut AddressSpace,
+    dst: usize,
+    value: &T,
+) -> Result<(), AccessError> {
+    // SAFETY: 调用方保证 T 的完整对象表示均已初始化。
+    let bytes = unsafe {
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    };
+    copy_to_user(space, dst, bytes)
+}
+
 /// 从内核拷入用户内存（dst 为用户 VA，src 为内核缓冲）。
 pub fn copy_to_user(
     space: &mut AddressSpace,

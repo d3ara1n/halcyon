@@ -17,8 +17,11 @@
 | 内存管理 | — | [mm](impls/mm.md) |
 | 内核内部机制（中断 / 锁 / 唤醒） | — | [internals](impls/internals.md) |
 | 执行环境（boot / trap / 上下文） | — | [execution-context](impls/execution-context.md) |
-| IPC 总览（消息 / 信号 / 隧道） | [ipc](ideas/ipc.md)、[message](ideas/message.md)、[signal](ideas/signal.md)、[tunnel](ideas/tunnel.md)、[runnel](ideas/runnel.md) | — |
-| 文件系统（FAL / 服务框架） | [fs](ideas/fs.md)、[fal](ideas/fal.md)、[framework](ideas/framework.md) | — |
+| 对象、Handle、启动授权与服务寻址 | [object](ideas/object.md) | [IPC 对象实现](impls/ipc.md) |
+| 等待、对象状态与 Notification | [wait](ideas/wait.md)、[signal](ideas/signal.md) | [IPC 对象实现](impls/ipc.md) |
+| IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象实现](impls/ipc.md) |
+| 共享内存数据面 | [shared-memory](ideas/shared-memory.md)、[tunnel](ideas/tunnel.md)、[runnel](ideas/runnel.md) | [IPC 对象实现](impls/ipc.md) |
+| 用户态文件系统（VFS / FAL / 服务框架） | [fs](ideas/fs.md)、[fal](ideas/fal.md)、[framework](ideas/framework.md) | — |
 | 设备租借 | [device](ideas/device.md) | — |
 | 服务进程 | [service](ideas/service.md) | — |
 | ECS | [ecs](ideas/ecs.md) | — |

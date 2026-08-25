@@ -1,5 +1,4 @@
 use flagset::flags;
-use num_derive::{FromPrimitive, ToPrimitive};
 
 /// ExitCode(i64) type for process
 pub type ExitCode = i64;
@@ -8,21 +7,6 @@ pub type Pid = u32;
 /// Tid(u32) type for thread
 /// If uniform thread-id required, It is uni_tid = ((pid << 32) | tid)
 pub type Tid = u32;
-/// SignalMap(u64) for process
-pub type SignalMap = u64;
-
-flags! {
-    /// Predefined process-level signal bits（契约见 notes/ideas/signal.md：
-    /// 进程对象信号状态的用户可见预定义区；其余位归用户协议自定义）。
-    #[derive(FromPrimitive, ToPrimitive)]
-    pub enum SystemSignal: SignalMap {
-        /// Reserved
-        None = 0,
-        /// Request to finalize the job and quit. It's a REQUEST! Use kill syscall to finalize a process without notifying
-        Terminate = 1 << 0,
-    }
-}
-
 flags! {
     /// Permission of the process
     /// Invalid when fork means copy the permissions from the parent

@@ -22,7 +22,11 @@ pub mod fal;
 pub mod path;
 /// Time-related functions
 pub mod time;
+/// 内核对象、Handle、rights 与对象状态
+pub mod object;
 /// Messaging primitives
 pub mod message;
 /// Signal primitives
-pub mod signal;
+pub mod startup;
+/// 统一对象等待
+pub mod wait;

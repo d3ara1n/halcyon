@@ -1,15 +1,14 @@
 //! pm：sleep 异步通路 + 消息接收 + Runnel 数据面的集成验证负载。
 //!
-//! 剧本：两次睡眠（timer 通路观测）→ 阻塞等 init 的隧道 id 消息 →
-//! attach → 写入 8192 字节校验模式（跨回绕、逐批摇铃）→ EOF+摇铃 →
+//! 剧本：两次睡眠（timer 通路观测）→ 阻塞等 init 的 Invitation 消息 →
+//! 消费 Invitation → 写入 8192 字节校验模式（跨回绕、逐批摇铃）→ EOF+摇铃 →
 //! 退出（触发对端 PEER_CLOSED）。
 
 #![no_std]
 
 use rinlib::{
-    ipc::{
-        message::wait_message,
-    },
+    env,
+    ipc::message::wait_message,
     preclude::*,
     sys_sleep,
 };
@@ -28,30 +27,28 @@ fn main() {
     }
     debug!("awake after two sleeps");
 
-    // 阻塞等 init 的隧道 id（消息到达 → 移交唤醒）。
-    let (digest, payload) = match wait_message() {
+    // 阻塞等 init 转移 Tunnel Invitation（消息到达 → WaitMany 唤醒）。
+    let message = match wait_message(env::startup_mailbox()) {
         Ok(r) => r,
         Err(e) => {
             debug!("wait_message failed: {:?}", e);
             return;
         }
     };
-    if digest.payload_length != 8 {
-        debug!("unexpected message kind {}", digest.kind);
+    if message.header.payload_len != 0 || message.handles.len() != 1 {
+        debug!("unexpected message kind {}", message.header.kind);
         return;
     }
-    let mut id_bytes = [0u8; 8];
-    id_bytes.copy_from_slice(&payload[..8]);
-    let id = u64::from_le_bytes(id_bytes);
+    let invitation = message.handles[0];
 
-    let tunnel = match blocking::attach(id, TUNNEL_VA) {
+    let mut tunnel = match blocking::attach_producer(invitation, TUNNEL_VA) {
         Ok(t) => t,
         Err(e) => {
             debug!("tunnel attach failed: {:?}", e);
             return;
         }
     };
-    debug!("tunnel attached id={:#x}", id);
+    debug!("tunnel attached");
 
     // 校验模式写入：i%251+1，跨回绕分批，每批落页即摇铃。
     let mut sent = 0usize;

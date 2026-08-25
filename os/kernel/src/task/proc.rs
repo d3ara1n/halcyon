@@ -4,7 +4,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU64;
 
 use alloc::{sync::Arc, vec::Vec};
-use erhino_shared::proc::{Pid, Tid};
+use erhino_shared::{
+    object::{Handle, Rights},
+    proc::{Pid, Tid},
+};
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
 use crate::{
@@ -82,6 +85,8 @@ pub struct AddressSpace {
     brk: usize,
     /// 全部用户数据帧（表帧归树）。
     frames: Vec<FrameTracker>,
+    /// 对象拥有的外部映射 reservation；普通地址空间操作不得接管。
+    external_mappings: Vec<usize>,
 }
 
 impl Drop for AddressSpace {
@@ -103,7 +108,13 @@ impl AddressSpace {
         // SAFETY: root 刚分配、尚未映射任何用户页。
         unsafe { mm::install_kernel_top_level(tree.root_frame()) };
         let satp = (8usize << 60) | tree.satp_ppn();
-        Ok(Self { tree, satp, brk: 0, frames: Vec::new() })
+        Ok(Self {
+            tree,
+            satp,
+            brk: 0,
+            frames: Vec::new(),
+            external_mappings: Vec::new(),
+        })
     }
 
     /// 本地址空间的 satp 组装值（含模式位）。
@@ -288,53 +299,91 @@ impl AddressSpace {
         if va % PAGE_SIZE != 0 || va >= USER_TOP - STACK_SIZE {
             return Err(SpaceError::BadSegment);
         }
+        if self.external_mappings.contains(&va) {
+            return Err(SpaceError::Conflict);
+        }
+        self.external_mappings
+            .try_reserve(1)
+            .map_err(|_| SpaceError::NoFrame)?;
         self.tree
             .map(Vpn(va / PAGE_SIZE), 1, Ppn(pa / PAGE_SIZE), flags::USER_DATA)?;
+        self.external_mappings.push(va);
         // SAFETY: sfence 当前 ASID 冲刷 stale TLB 使新 PTE 生效。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
         Ok(())
     }
 
-    /// 解除本空间内一页外部映射（Dispose 路径）。
+    /// 只有持有对象 lease 的关闭路径才能解除外部 reservation。
     pub fn unmap_external(&mut self, va: usize) {
-        if va % PAGE_SIZE != 0 || va >= USER_TOP {
+        let Some(index) = self.external_mappings.iter().position(|mapped| *mapped == va) else {
             return;
-        }
+        };
+        self.external_mappings.swap_remove(index);
         self.tree.unmap(Vpn(va / PAGE_SIZE), 1);
         // SAFETY: 同 map_external。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
     }
 }
 
-/// 进程：资源容器（地址空间、父子关系、邮箱与进程级信号状态；隧道随
-/// tunnel 里程碑挂入）。
+/// 进程资源容器：地址空间、父子身份与进程本地 HandleTable。
 ///
-/// 所有权方向：线程强持有进程（Thread.process: Arc<Process>）；一切
-/// 「从等待对象/表结构找线程」的反向引用一律持 Weak<Thread>，不在此
-/// 处回指——强引用环会让 reap 永不释放帧。IPC 等待条目同样强持线程，
-/// 但条目是瞬态的（唤醒即摘除），不构成持久环：进程仅在最后一个线程
-/// 消亡后随 Drop 链释放（多线程 kill 里程碑需补「杀等待中线程」的
-/// 队列清扫）。
+/// 线程强持 Process；对象与 WaitContext 只在操作期间持线程或进程引用。
+/// HandleTable drain 先摘项再执行对象 callback，避免生命周期回调反向进入表锁。
 pub struct Process {
     pub pid: Pid,
     pub parent: Pid,
     pub space: crate::sync::Spinlock<AddressSpace>,
-    /// 邮箱（有界 FIFO，契约见 notes/ideas/message.md）。Pid=0 的内核
-    /// 邮箱独立存在于 ipc::KERNEL_MAILBOX，不经进程表。
-    pub mailbox: crate::sync::Spinlock<crate::task::ipc::Mailbox>,
-    /// 进程级信号状态（TERMINATE + 用户自定义区，契约见 notes/ideas/signal.md）。
-    pub signals: crate::sync::Spinlock<crate::task::ipc::SignalState>,
+    /// 新对象 ABI 的进程本地 Handle 表。
+    pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
+    /// 控制面迁移期间由 StartupMailbox 查询；后续并入通用启动资源枚举。
+    pub(crate) bootstrap_mailbox: Handle,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // 进程已无外部引用，唯一借用下逐项摘除；对象回调发生在表项
+        // 已移除之后，且不持 HandleTable 锁。
+        let mut cursor = 1;
+        loop {
+            let entry = self.handles.get_mut().take_next(&mut cursor);
+            let Some(entry) = entry else { break };
+            super::handle::close_entry(entry, self, true);
+        }
+    }
 }
 
 impl Process {
-    fn new(pid: Pid, parent: Pid) -> Result<Self, SpaceError> {
-        Ok(Self {
-            pid,
-            parent,
-            space: crate::sync::Spinlock::new(AddressSpace::new()?),
-            mailbox: crate::sync::Spinlock::new(crate::task::ipc::Mailbox::new()),
-            signals: crate::sync::Spinlock::new(crate::task::ipc::SignalState::new()),
-        })
+    fn new(
+        pid: Pid,
+        parent: Pid,
+    ) -> Result<(Self, Arc<super::mailbox::Mailbox>, super::handle::ProcessHandleEntry), SpaceError> {
+        let mailbox = super::mailbox::Mailbox::new();
+        let object = super::mailbox::Mailbox::object_ref(&mailbox);
+        let owner = super::handle::entry(
+            object.clone(),
+            super::object::HandleRole::MailboxOwner,
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+        )
+        .map_err(|_| SpaceError::NoFrame)?;
+        let sender = super::handle::entry(
+            object,
+            super::object::HandleRole::MailboxSender,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        )
+        .map_err(|_| SpaceError::NoFrame)?;
+        let mut handles = super::handle::ProcessHandleTable::new();
+        let bootstrap_mailbox = handles.insert(owner).map_err(|_| SpaceError::NoFrame)?;
+        Ok((
+            Self {
+                pid,
+                parent,
+                space: crate::sync::Spinlock::new(AddressSpace::new()?),
+                handles: crate::sync::Spinlock::new(handles),
+                bootstrap_mailbox,
+            },
+            mailbox,
+            sender,
+        ))
     }
 }
 
@@ -350,11 +399,6 @@ pub struct Thread {
     /// 退出码（Exit / 异常终止共用；回收时打印）。锁内 Option，
     /// 写于本 hart 的退出路径，读于回收（同 hart 顺序发生）。
     pub(crate) exit_code: crate::sync::Spinlock<Option<i64>>,
-    /// 等待代数：每次登记新等待自增；等待条目携带登记时的值，完成方
-    /// 以 CAS(gen → gen+1) 消费——单次完成与取消仲裁的唯一凭据
-    /// （见 sched::complete）。消费后线程离开 Waiting，再次登记得到
-    /// 全新代数，历史条目永不误中。
-    pub(crate) wait_gen: AtomicU64,
     /// 用户执行需求（ELF 判定；eligibility 由 domain 能力另行核验）。
     pub requirement: elf::IsaRequirement,
     frame: UnsafeCell<UserContext>,
@@ -381,7 +425,6 @@ impl Thread {
             created_tick: sbi::read_time(),
             switches: AtomicU64::new(0),
             exit_code: crate::sync::Spinlock::new(None),
-            wait_gen: AtomicU64::new(0),
             requirement,
             frame: UnsafeCell::new(ctx),
         }
@@ -407,9 +450,21 @@ impl Thread {
 /// 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/TSO/
 /// 未建模状态扩展在 load 时明确拒绝，不降级为 Base。W^X：段内容写入
 /// 尚不可执行的地址空间，装载完成后经入队 Release 发布（见 sched::enqueue）。
-pub fn spawn_from_elf(pid: Pid, parent: Pid, image: &elf::Elf, file: &[u8]) -> Result<Arc<Thread>, SpaceError> {
+pub struct SpawnedProcess {
+    pub thread: Arc<Thread>,
+    pub(crate) bootstrap_mailbox: Arc<super::mailbox::Mailbox>,
+    pub(crate) sender_grant: Option<super::handle::ProcessHandleEntry>,
+}
+
+pub fn spawn_from_elf(
+    pid: Pid,
+    parent: Pid,
+    image: &elf::Elf,
+    file: &[u8],
+) -> Result<SpawnedProcess, SpaceError> {
     let requirement = elf::isa_requirement(file).expect("userspace execution requirement rejected");
-    let process = Arc::new(Process::new(pid, parent)?);
+    let (process, bootstrap_mailbox, sender_grant) = Process::new(pid, parent)?;
+    let process = Arc::new(process);
     {
         let mut space = process.space.lock();
         space.load_elf(&image.segments, file)?;
@@ -421,5 +476,9 @@ pub fn spawn_from_elf(pid: Pid, parent: Pid, image: &elf::Elf, file: &[u8]) -> R
         requirement,
     ));
     super::table::insert(process);
-    Ok(thread)
+    Ok(SpawnedProcess {
+        thread,
+        bootstrap_mailbox,
+        sender_grant: Some(sender_grant),
+    })
 }

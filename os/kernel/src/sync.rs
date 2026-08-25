@@ -132,6 +132,12 @@ impl<T> Spinlock<T> {
         }
     }
 
+    /// 持有容器唯一借用时直接访问数据，不需要加锁。
+    pub fn get_mut(&mut self) -> &mut T {
+        // SAFETY: `&mut self` 保证不存在任何并发守卫或其它访问者。
+        unsafe { &mut *self.data.get() }
+    }
+
     /// 获取锁：关本地中断后自旋等待。
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
         let state = disable_interrupts();

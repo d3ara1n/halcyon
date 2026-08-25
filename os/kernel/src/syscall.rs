@@ -4,12 +4,13 @@
 //! 出口三值 `Outcome`——同步调用 Completed；异步调用登记内核请求后 Wait
 //! （完成时 wake 回 Ready）；Killed 终止进程。未知调用号返回错误，绝不 panic。
 
+use erhino_shared::{
+    call::{SystemCall, SystemCallError},
+    object::{Handle, Rights},
+};
 use num_traits::{FromPrimitive, ToPrimitive};
-use erhino_shared::call::{SystemCall, SystemCallError};
 
-use crate::{context::UserContext, sched, task::ipc, task::Thread, uaccess};
-
-use alloc::boxed::Box;
+use crate::{context::UserContext, sched, task::{handle, mailbox, notification, wait, Thread}, uaccess};
 
 /// syscall 处理出口（见 notes/impls/call.md「异步调用」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,10 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::Exit => Outcome::Killed(a0 as i64),
+        SystemCall::StartupMailbox => {
+            respond_ok(frame, thread.process.bootstrap_mailbox.raw() as usize);
+            Outcome::Completed
+        }
         SystemCall::Extend => {
             extend_heap(frame, thread, a0);
             Outcome::Completed
@@ -47,99 +52,174 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             } else {
                 // 只登记本 hart 意图槽；全局发布由调度循环在线程离开
                 // 执行点后完成（sched::park_publish，唤醒所有权随迁）。
-                sched::park_request_sleep(ms);
+                let deadline = sched::deadline_after_ms(ms);
+                sched::park_request_wait(wait::sleep_plan(deadline));
                 return Outcome::Wait; // 不前进 sepc，完成唤醒后由帧携带结果
             }
             Outcome::Completed
         }
-        SystemCall::Send => {
-            // Send(target, kind, buf, len)：永不阻塞，满箱 MailboxFull。
-            match ipc::send(thread, frame.x[12] as usize, frame.x[13] as usize, a0 as u32, frame.x[11] as usize) {
-                Ok(len) => respond_ok(frame, len),
-                Err(e) => respond_error(frame, e),
+        SystemCall::HandleClose => {
+            respond_result(frame, handle::close(thread, Handle::from_raw(frame.x[10])).map(|_| 0));
+            Outcome::Completed
+        }
+        SystemCall::HandleDuplicate => {
+            respond_result(
+                frame,
+                handle::duplicate(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::WaitMany => match wait::prepare(
+            thread,
+            frame.x[10] as usize,
+            frame.x[11] as usize,
+            frame.x[12] as usize,
+        ) {
+            Ok(wait::WaitStart::Ready) => {
+                respond_ok(frame, 0);
+                Outcome::Completed
             }
+            Ok(wait::WaitStart::Park(plan)) => {
+                sched::park_request_wait(plan);
+                Outcome::Wait
+            }
+            Err(error) => {
+                respond_error(frame, error);
+                Outcome::Completed
+            }
+        },
+        SystemCall::NotificationCreate => {
+            respond_result(
+                frame,
+                notification::create(
+                    thread,
+                    Rights::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::NotificationSignal => {
+            respond_result(
+                frame,
+                notification::signal(thread, Handle::from_raw(frame.x[10]), frame.x[11]).map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::NotificationTake => {
+            respond_result(
+                frame,
+                notification::take(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11],
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::MailboxCreate => {
+            respond_result(
+                frame,
+                mailbox::create(
+                    thread,
+                    Rights::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::Send => {
+            respond_result(
+                frame,
+                mailbox::send(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                    frame.x[13] as usize,
+                    frame.x[14] as usize,
+                    frame.x[15] as usize,
+                )
+                .map(|_| 0),
+            );
             Outcome::Completed
         }
         SystemCall::Peek => {
-            match ipc::peek(thread, a0) {
-                Ok(len) => respond_ok(frame, len),
-                Err(e) => respond_error(frame, e),
-            }
-            Outcome::Completed
-        }
-        SystemCall::Discard => {
-            match ipc::discard(thread) {
-                Ok(()) => respond_ok(frame, 0),
-                Err(e) => respond_error(frame, e),
-            }
+            respond_result(
+                frame,
+                mailbox::peek(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
+            );
             Outcome::Completed
         }
         SystemCall::Receive => {
-            match ipc::receive(thread, a0, frame.x[11] as usize) {
-                ipc::RecvOutcome::Done(result) => {
-                    match result {
-                        Ok(len) => respond_ok(frame, len),
-                        Err(e) => respond_error(frame, e),
-                    }
-                    Outcome::Completed
-                }
-                ipc::RecvOutcome::Block => {
-                    // 空箱阻塞：登记意图后转 Waiting；完成时帧携带
-                    // a1 = 负载长度，sepc 由完成方前进。
-                    sched::park_request_recv(a0, frame.x[11] as usize);
-                    Outcome::Wait
-                }
-            }
-        }
-        SystemCall::SignalSend => {
-            match ipc::signal_send(thread, a0 as u32, frame.x[11]) {
-                Ok(woken) => respond_ok(frame, woken as usize),
-                Err(e) => respond_error(frame, e),
-            }
+            respond_result(
+                frame,
+                mailbox::receive(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                    frame.x[13] as usize,
+                    frame.x[14] as usize,
+                    frame.x[15] as usize,
+                )
+                .map(|_| 0),
+            );
             Outcome::Completed
         }
-        SystemCall::SignalWait => {
-            match ipc::signal_wait(thread, a0, frame.x[11] as usize) {
-                Ok(ipc::WaitPlan::Now { index, bits }) => {
-                    respond_ok(frame, ((index as u64) << 56 | bits) as usize);
-                    Outcome::Completed
-                }
-                Ok(ipc::WaitPlan::Park(targets)) => {
-                    sched::park_request_signal(Box::into_raw(Box::new(targets)));
-                    Outcome::Wait
-                }
-                Err(e) => {
-                    respond_error(frame, e);
-                    Outcome::Completed
-                }
-            }
+        SystemCall::Discard => {
+            respond_result(
+                frame,
+                mailbox::discard(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
+            );
+            Outcome::Completed
         }
         SystemCall::TunnelCreate => {
-            match crate::task::tunnel::create(thread, a0) {
-                Ok(id) => respond_ok(frame, id as usize),
-                Err(e) => respond_error(frame, e),
-            }
+            respond_result(
+                frame,
+                crate::task::tunnel::create(thread, a0, frame.x[11] as usize).map(|_| 0),
+            );
             Outcome::Completed
         }
         SystemCall::TunnelAttach => {
-            match crate::task::tunnel::attach(thread, a0 as u64, frame.x[11] as usize) {
-                Ok(()) => respond_ok(frame, 0),
-                Err(e) => respond_error(frame, e),
-            }
-            Outcome::Completed
-        }
-        SystemCall::TunnelDispose => {
-            match crate::task::tunnel::dispose(thread, a0 as u64) {
-                Ok(()) => respond_ok(frame, 0),
-                Err(e) => respond_error(frame, e),
-            }
+            respond_result(
+                frame,
+                crate::task::tunnel::attach(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
             Outcome::Completed
         }
         SystemCall::TunnelNotify => {
-            match crate::task::tunnel::notify(thread, a0 as u64) {
-                Ok(()) => respond_ok(frame, 0),
-                Err(e) => respond_error(frame, e),
-            }
+            respond_result(
+                frame,
+                crate::task::tunnel::notify(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::TunnelAcknowledgeData => {
+            respond_result(
+                frame,
+                crate::task::tunnel::acknowledge_data(thread, Handle::from_raw(frame.x[10]))
+                    .map(|_| 0),
+            );
             Outcome::Completed
         }
         // 未实现面：一律返回错误（内核不可被用户调用 panic）。
@@ -184,6 +264,13 @@ fn extend_heap(frame: &mut UserContext, thread: &Thread, bytes: usize) {
     match thread.process.space.lock().extend_heap(bytes) {
         Ok(brk) => respond_ok(frame, brk),
         Err(_) => respond_error(frame, SystemCallError::OutOfMemory),
+    }
+}
+
+fn respond_result(frame: &mut UserContext, result: Result<usize, SystemCallError>) {
+    match result {
+        Ok(value) => respond_ok(frame, value),
+        Err(error) => respond_error(frame, error),
     }
 }
 

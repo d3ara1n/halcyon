@@ -27,8 +27,6 @@ pub struct HartCapabilities {
     pub q: bool,
     /// V 扩展（向量）。
     pub v: bool,
-    /// Zkr 扩展（seed CSR 硬件熵源）。
-    pub zkr: bool,
 }
 
 impl HartCapabilities {
@@ -168,7 +166,6 @@ fn parse_cpu(node: &dtb::Node) -> Option<Cpu> {
         d: has_extension(node, "d"),
         q: has_extension(node, "q"),
         v: has_extension(node, "v"),
-        zkr: has_extension(node, "zkr"),
     };
     assert!(
         !(caps.d && !caps.f),

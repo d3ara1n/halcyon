@@ -1,60 +1,106 @@
-//! 消息封装（契约见 notes/ideas/message.md）：Send 永不阻塞，Receive
-//! 阻塞等待；[`wait_message`] 组合 Peek/SignalWait/Receive 提供完整的
-//! 「取下一条消息」服务循环原语。
+//! 显式 Mailbox 消息封装（契约见 notes/ideas/message.md）。
+//! Send/Receive 都是非阻塞事务；阻塞只由 WaitMany 组合完成。
 
 use alloc::vec::Vec;
 
 use erhino_shared::{
     call::SystemCallError,
-    message::MessageDigest,
-    proc::Pid,
-    signal::{ObjectKind, SignalItem, NONEMPTY},
+    message::{HandleMove, MessageHeader},
+    object::{Handle, HandlePair, ObjectSignals, Rights},
+    wait::{WaitItem, WaitResult},
 };
 
-use crate::call::{sys_discard, sys_receive, sys_send, sys_signal_wait, sys_peek};
+use crate::call::{sys_discard, sys_mailbox_create, sys_peek, sys_receive, sys_send, sys_wait_many};
 
-/// 投递消息到目标邮箱。**永不阻塞**：满箱返回 `MailboxFull`，流控由
-/// 调用方承担（请求-应答配对协议天然限流）。
-pub fn send(target: Pid, kind: usize, payload: &[u8]) -> Result<(), SystemCallError> {
-    unsafe { sys_send(target, kind, payload) }
+pub struct ReceivedMessage {
+    pub header: MessageHeader,
+    pub payload: Vec<u8>,
+    pub handles: Vec<Handle>,
 }
 
-/// 非阻塞检查自身邮箱队头。空箱返回 `Err(ObjectNotAvailable)`。
-pub fn peek() -> Result<MessageDigest, SystemCallError> {
-    let mut digest = MessageDigest::new(0, 0, 0);
-    unsafe { sys_peek(&mut digest)? };
-    Ok(digest)
+pub fn create(
+    owner_rights: Rights,
+    sender_rights: Rights,
+) -> Result<HandlePair, SystemCallError> {
+    let mut output = HandlePair::new(Handle::INVALID, Handle::INVALID);
+    // SAFETY: output 在 ecall 期间有效且可写。
+    unsafe { sys_mailbox_create(owner_rights, sender_rights, &mut output)? };
+    Ok(output)
 }
 
-/// 抛弃自身邮箱队头消息。空箱返回 `Err(ObjectNotAvailable)`。
-pub fn discard() -> Result<(), SystemCallError> {
-    unsafe { sys_discard() }
+/// 向显式 sender Handle 投递负载和 Handle moves。永不阻塞。
+pub fn send(
+    mailbox: Handle,
+    kind: u64,
+    payload: &[u8],
+    moves: &[HandleMove],
+) -> Result<(), SystemCallError> {
+    // SAFETY: wrapper 仅在 ecall 期间借用切片。
+    unsafe { sys_send(mailbox, kind, payload, moves) }
 }
 
-/// 阻塞取自身邮箱队头消息：负载拷入 buffer（长度须与队头消息一致，
-/// 先经 [`peek`] 获得），返回负载长度。空箱时线程睡眠等待到达。
-pub fn receive(buffer: &mut [u8]) -> Result<usize, SystemCallError> {
-    unsafe { sys_receive(buffer) }
+/// 非阻塞观察队头。空箱返回 ObjectNotAvailable。
+pub fn peek(mailbox: Handle) -> Result<MessageHeader, SystemCallError> {
+    let mut header = MessageHeader::new(0, 0, 0, 0);
+    // SAFETY: output 在 ecall 期间有效且可写。
+    unsafe { sys_peek(mailbox, &mut header)? };
+    Ok(header)
 }
 
-/// 取下一条消息的完整原语（服务主循环用）：
-/// 有消息 → 立即返回；空箱 → 等待 NONEMPTY 信号再重查。
-///
-/// 唤醒后回环重查是必要的：NONEMPTY 为内核托管位，唤醒与取走之间
-/// 可能被同进程其他消费者排空。
-pub fn wait_message() -> Result<(MessageDigest, Vec<u8>), SystemCallError> {
+/// 非阻塞原子接收队头及其 Handles。
+pub fn receive(mailbox: Handle) -> Result<ReceivedMessage, SystemCallError> {
+    let header = peek(mailbox)?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(header.payload_len as usize)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    payload.resize(header.payload_len as usize, 0);
+    let mut handles = Vec::new();
+    handles
+        .try_reserve_exact(header.handle_count as usize)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    handles.resize(header.handle_count as usize, Handle::INVALID);
+    let mut received = MessageHeader::new(0, 0, 0, 0);
+    // SAFETY: 三个输出缓冲在 ecall 期间保持有效且容量与切片一致。
+    unsafe { sys_receive(mailbox, &mut received, &mut payload, &mut handles)? };
+    Ok(ReceivedMessage {
+        header: received,
+        payload,
+        handles,
+    })
+}
+
+/// 丢弃队头；消息携带的 transit Handles 由内核关闭。
+pub fn discard(mailbox: Handle) -> Result<(), SystemCallError> {
+    // SAFETY: Handle 是值参数。
+    unsafe { sys_discard(mailbox) }
+}
+
+/// 阻塞取得下一条消息：先尝试 Receive，空箱才等待 READABLE 并回环。
+pub fn wait_message(mailbox: Handle) -> Result<ReceivedMessage, SystemCallError> {
     loop {
-        if let Ok(digest) = peek() {
-            let mut buf = Vec::new();
-            buf.resize_with(digest.payload_length, Default::default);
-            unsafe { sys_receive(&mut buf)? };
-            return Ok((digest, buf));
+        match receive(mailbox) {
+            Ok(message) => return Ok(message),
+            Err(SystemCallError::ObjectNotAvailable) => {}
+            Err(error) => return Err(error),
         }
-        let items = [SignalItem {
-            kind: ObjectKind::Mailbox as u64,
-            id: 0,
-            interest: NONEMPTY,
-        }];
-        unsafe { sys_signal_wait(&items)? };
+        let items = [WaitItem::new(
+            mailbox,
+            ObjectSignals::READABLE | ObjectSignals::CLOSED,
+            0,
+        )];
+        let mut result = WaitResult::new(
+            0,
+            ObjectSignals::NONE,
+            0,
+            erhino_shared::wait::WaitReason::Signaled,
+        );
+        // SAFETY: 输入和输出在阻塞 syscall 完成前都位于当前栈帧。
+        unsafe { sys_wait_many(&items, &mut result)? };
+        if result.observed.intersects(ObjectSignals::CLOSED)
+            && !result.observed.intersects(ObjectSignals::READABLE)
+        {
+            return Err(SystemCallError::ObjectClosed);
+        }
     }
 }

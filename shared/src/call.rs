@@ -2,7 +2,7 @@ use num_derive::{FromPrimitive, ToPrimitive};
 
 /// Predefined system call errors
 #[repr(usize)]
-#[derive(Debug, FromPrimitive, ToPrimitive)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum SystemCallError {
     // Generic errors
     /// [SystemCallError::NoError] means no errors at all
@@ -38,6 +38,18 @@ pub enum SystemCallError {
     NotSupported = 0x34,
     /// Target mailbox is full (message delivery never blocks)
     MailboxFull = 0x35,
+    /// 对象存在尚未完成的独占事务。
+    ObjectBusy = 0x36,
+    /// 输出容量无法容纳完整结果。
+    BufferTooSmall = 0x37,
+    /// 对象已经进入不可逆关闭状态。
+    ObjectClosed = 0x38,
+    /// Handle 不具备操作所需 rights。
+    RightsDenied = 0x39,
+    /// Handle 的对象类型或 lifecycle role 不符合操作要求。
+    WrongObjectType = 0x3a,
+    /// Handle generation 已不匹配槽位。
+    StaleHandle = 0x3b,
 }
 
 /// Predefined system calls
@@ -60,6 +72,9 @@ pub enum SystemCall {
     ExecuteBytes = 0x16,
     /// Spawn a process from the file
     ExecuteFile = 0x17,
+    /// 临时启动资源查询：返回本进程 bootstrap Mailbox owner Handle。
+    /// 后续由通用 startup-resource 枚举替代。
+    StartupMailbox = 0x18,
 
     // -----Thread-----
     /// Finalized thread notifies kernel to cleanup
@@ -74,27 +89,31 @@ pub enum SystemCall {
     ThreadKill = 0x24,
     /// 当前线程睡眠指定毫秒（异步：登记期限后 Waiting，到期唤醒）
     Sleep = 0x25,
-    // -----Signal-----
-    /// Submit signal bits to a process (delivery = sticky OR + wake, never blocks)
-    SignalSend = 0x31,
-    /// Block until any watched object's signal state hits; args: items_ptr, count.
-    /// Each item is a [`crate::signal::SignalItem`]. On wake, a1 =
-    /// `(item_index << 56) | delivered_bits`.
-    SignalWait = 0x32,
+    // -----对象与等待-----
+    /// 关闭一个进程本地 Handle。
+    HandleClose = 0x30,
+    /// 裁剪 rights 后复制 Handle。
+    HandleDuplicate = 0x31,
+    /// 等待任一对象电平命中。
+    WaitMany = 0x32,
+    /// 创建 Notification owner/signaler 对。
+    NotificationCreate = 0x33,
+    /// 向 Notification OR 提交待决位。
+    NotificationSignal = 0x34,
+    /// 原子取走 Notification 待决位。
+    NotificationTake = 0x35,
 
-    // -----Messaging-----
-    /// Deliver target/kind/payload to the target process's mailbox. Never blocks:
-    /// full mailbox returns [`SystemCallError::MailboxFull`] immediately.
-    Send = 0x40,
-    /// Non-blocking check of own mailbox; writes [`crate::message::MessageDigest`]
-    /// to the given buffer and returns payload length. Empty mailbox yields
-    /// [`SystemCallError::ObjectNotAvailable`]. Does not alter mailbox state.
-    Peek = 0x41,
-    /// Empty the mailbox
-    Discard = 0x42,
-    /// Take the head message payload into buf. Blocks (thread Waiting) while
-    /// mailbox is empty; wakes with a1 = payload length on arrival.
+    // -----消息-----
+    /// 创建 Mailbox receiver-owner/sender 对。
+    MailboxCreate = 0x40,
+    /// 向 sender Handle 指向的邮箱原子投递消息和 Handle moves。
+    Send = 0x41,
+    /// 非阻塞观察队头 MessageHeader。
+    Peek = 0x42,
+    /// 非阻塞原子接收完整消息。
     Receive = 0x43,
+    /// 丢弃队头及其 transit Handles。
+    Discard = 0x44,
     
     // -----Process memory-----
     /// Map a range of virtual addresses for the process with kernel served pages
@@ -107,17 +126,14 @@ pub enum SystemCall {
     Free = 0x52,
 
     // -----Tunnel-----
-    /// Create a tunnel: zero page + registry entry mapped at given VA;
-    /// returns the tunnel id (48bit random)
-    TunnelCreate = 0x60,          // addr → id
-    /// Attach the peer endpoint by tunnel id at given VA
-    TunnelAttach = 0x61,          // id, addr
-    /// Dispose own endpoint; when both ends are gone the frame is released.
-    /// Survivor keeps its mapping and observes PEER_CLOSED.
-    TunnelDispose = 0x62,         // id
-    /// Ring the doorbell: submit a DATA event on the peer endpoint's signal
-    /// state (wake is a hint; truth lives in the protocol control block)
-    TunnelNotify = 0x6a,          // id
+    /// 创建共享页、Endpoint 和一次性 Invitation。
+    TunnelCreate = 0x60,
+    /// 原子消费 Invitation 并建立对端 Endpoint。
+    TunnelAttach = 0x61,
+    /// 向对端 Endpoint 发布 DATA 提示。
+    TunnelNotify = 0x63,
+    /// 在协议无进展点确认本端 DATA 提示。
+    TunnelAcknowledgeData = 0x64,
 
     // -----Filesystem abstract layer-----
     /// Check if dentry exist

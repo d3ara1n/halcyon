@@ -1,3 +1,12 @@
 [workspace]
-members = ["kernel", "page_table", "frame_pool", "dtb", "tar", "elf"]
+members = [
+    "kernel",
+    "page_table",
+    "frame_pool",
+    "dtb",
+    "tar",
+    "elf",
+    "handle_table",
+    "wait_context",
+]
 resolver = "2"

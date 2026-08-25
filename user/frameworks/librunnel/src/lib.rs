@@ -1,339 +1,465 @@
-//! Runnel——跑在隧道页上的单工 FIFO 字节流协议（规格见
-//! notes/ideas/runnel.md）。本库是规格的参考实现：控制块访问、环形
-//! 游标算术、内存序配对与摇铃纪律都收敛在这里，消费者无法写错。
-//!
-//! 分层：
-//! - **协议核心**（本文件主体）：页布局、游标算术、非阻塞 I/O 与内存序
-//!   配对。零 syscall 依赖，host 可测（规格不变量的全部可测形态都在
-//!   `#[cfg(test)]`）；
-//! - **阻塞流式**（`riscv64` 目标专属）：组合信号面等待与门铃的
-//!   `write_all`/`read_exact_or_eof`，把「排空后清铃」纪律封装为唯一的
-//!   正确循环形态。
-//!
-//! 单工页上铃铛含义由方向唯一确定：本端摇铃 = 「我这边状态变了」，读端
-//! 醒来查到的是数据到达、写端醒来查到的是空间腾出。
+//! Runnel：共享 Tunnel 页上的单工 SPSC 字节流。
+//! 控制字段使用原子 Acquire/Release；角色视图、对端游标校验与 Broken
+//! 状态都封装在本库，调用方不能直接改写协议字段。
 
 #![cfg_attr(not(test), no_std)]
 
-use core::ptr;
+use core::{
+    ptr,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
-use erhino_shared::call::SystemCallError;
+use erhino_shared::{call::SystemCallError, object::Handle};
 
-/// 页内布局常量（规格钉死，不得改动语义）。
 pub const PAGE_SIZE: usize = 4096;
-/// 控制块大小。
 pub const CTRL_SIZE: usize = 128;
-/// 数据区起始偏移。
 pub const DATA_OFF: usize = CTRL_SIZE;
-/// 环形容量（全数据区，不牺牲判满格）。
 pub const CAP: usize = PAGE_SIZE - DATA_OFF;
-/// 布局版本锚点。
-pub const MAGIC: u32 = 0x524E_4C31; // "RNL1"
-pub const VERSION: u16 = 1;
+/// little-endian 字节序列 `RNL1`。
+pub const MAGIC: u32 = 0x314C_4E52;
+pub const VERSION: u32 = 1;
 
-// 控制块字段偏移。
 const OFF_MAGIC: usize = 0x00;
 const OFF_VERSION: usize = 0x04;
 const OFF_HEAD: usize = 0x08;
 const OFF_TAIL: usize = 0x0C;
 const OFF_EOF: usize = 0x10;
 
-/// 已用量：模 2³² 回绕差值（规格「不变量」节）。
 #[inline]
 pub fn used(head: u32, tail: u32) -> u32 {
     head.wrapping_sub(tail)
 }
 
-/// 当前可写字节数。
 #[inline]
 pub fn free(head: u32, tail: u32) -> usize {
     CAP - used(head, tail) as usize
 }
 
-// ---------------------------------------------------------------------------
-// 内存访问原语：控制块字段 volatile + 显式栅栏；数据字节普通拷贝。
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn load_u32(base: *mut u8, off: usize) -> u32 {
-    // SAFETY: base 为已映射页内偏移，调用方保证对齐与有效性。
-    unsafe { (base.add(off) as *const u32).read_volatile() }
-}
-
-#[inline]
-fn store_u32(base: *mut u8, off: usize, v: u32) {
-    // SAFETY: 同上。
-    unsafe { (base.add(off) as *mut u32).write_volatile(v) }
-}
-
-/// release 栅栏：此前写入对本端读者可见后才发布游标。
-#[inline]
-fn fence_release() {
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("fence rw, w", options(nomem))
-    }
-    #[cfg(not(target_arch = "riscv64"))]
-    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-}
-
-/// acquire 栅栏：取得游标后才能信任数据内容。
-#[inline]
-fn fence_acquire() {
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("fence r, rw", options(nomem))
-    }
-    #[cfg(not(target_arch = "riscv64"))]
-    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-}
-
-/// 协议错误。
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnelError {
-    /// 页不是 Runnel 协议页（magic/version 不符）。
     BadMagic,
-    /// 对端已消亡或拆除（PEER_CLOSED）。
+    Broken,
     Closed,
-    /// 底层系统调用失败。
     Syscall(SystemCallError),
 }
 
 impl From<SystemCallError> for RunnelError {
-    fn from(e: SystemCallError) -> Self {
-        Self::Syscall(e)
+    fn from(error: SystemCallError) -> Self {
+        Self::Syscall(error)
     }
 }
 
-/// 协议端点：本进程视角下的一页隧道 + 自己的隧道 id。
-///
-/// 构造入口见 [`blocking::create`] / [`blocking::attach`]（riscv64）；
-/// 测试与工具场景可用 [`Endpoint::from_raw`] 直接包一个已映射页。
-pub struct Endpoint {
+struct RawEndpoint {
     base: *mut u8,
-    id: u64,
+    handle: Handle,
+    broken: bool,
 }
 
-unsafe impl Send for Endpoint {}
+unsafe impl Send for RawEndpoint {}
 
-impl Endpoint {
-    /// # Safety
-    /// `base` 指向本进程已映射的隧道页。
-    pub unsafe fn from_raw(base: *mut u8, id: u64) -> Self {
-        Self { base, id }
+impl RawEndpoint {
+    unsafe fn creator(base: *mut u8, handle: Handle) -> Self {
+        let mut endpoint = Self { base, handle, broken: false };
+        endpoint.initialize();
+        endpoint
     }
 
-    pub fn id(&self) -> u64 {
-        self.id
+    unsafe fn attached(base: *mut u8, handle: Handle) -> Result<Self, RunnelError> {
+        let endpoint = Self { base, handle, broken: false };
+        if endpoint.atomic(OFF_MAGIC).load(Ordering::Acquire).to_le() != MAGIC
+            || endpoint.atomic(OFF_VERSION).load(Ordering::Relaxed).to_le() != VERSION
+        {
+            return Err(RunnelError::BadMagic);
+        }
+        Ok(endpoint)
     }
 
-    /// 创建方一次性写入版本锚点（规格：其余字段零态即合法初态）。
-    pub fn init_creator(&self) {
-        store_u32(self.base, OFF_MAGIC, MAGIC);
-        store_u32(self.base, OFF_VERSION, VERSION as u32);
+    fn initialize(&mut self) {
+        // 创建方独占尚未发布的零态页；控制区全部清零后用 release magic
+        // 发布。attach 的 acquire magic 取得此前全部初始化写。
+        unsafe { ptr::write_bytes(self.base, 0, CTRL_SIZE) };
+        self.atomic(OFF_VERSION).store(VERSION.to_le(), Ordering::Relaxed);
+        self.atomic(OFF_HEAD).store(0, Ordering::Relaxed);
+        self.atomic(OFF_TAIL).store(0, Ordering::Relaxed);
+        self.atomic(OFF_EOF).store(0, Ordering::Relaxed);
+        self.atomic(OFF_MAGIC).store(MAGIC.to_le(), Ordering::Release);
     }
 
-    /// 校验页为 Runnel 协议页（attach 路径用）。
-    pub fn validate(&self) -> Result<(), RunnelError> {
-        let ok = load_u32(self.base, OFF_MAGIC) == MAGIC
-            && load_u32(self.base, OFF_VERSION) as u16 == VERSION;
-        if ok {
-            fence_acquire(); // 取得 magic 后才能信任整页布局
-            Ok(())
+    fn atomic(&self, offset: usize) -> &AtomicU32 {
+        debug_assert_eq!((self.base as usize + offset) % core::mem::align_of::<AtomicU32>(), 0);
+        // SAFETY: Tunnel 映射覆盖整页，控制字段天然对齐且其全部并发访问
+        // 都通过 AtomicU32；对象生命周期保证映射在视图存活期有效。
+        unsafe { &*self.base.add(offset).cast::<AtomicU32>() }
+    }
+
+    fn ensure_usable(&self) -> Result<(), RunnelError> {
+        if self.broken {
+            Err(RunnelError::Broken)
         } else {
-            Err(RunnelError::BadMagic)
+            Ok(())
         }
     }
 
-    pub fn writable(&self) -> usize {
-        let head = load_u32(self.base, OFF_HEAD);
-        fence_acquire();
-        let tail = load_u32(self.base, OFF_TAIL);
-        free(head, tail)
+    fn fail<T>(&mut self) -> Result<T, RunnelError> {
+        self.broken = true;
+        Err(RunnelError::Broken)
     }
 
-    pub fn readable(&self) -> usize {
-        let tail = load_u32(self.base, OFF_TAIL);
-        fence_acquire();
-        let head = load_u32(self.base, OFF_HEAD);
-        used(head, tail) as usize
+    fn handle(&self) -> Handle {
+        self.handle
     }
 
-    /// 尽力写一批字节，返回实际写入数。**不摇铃**——批量场景在
-    /// [`blocking::EndpointExt::write_all`] 统一摇铃，手工轮询场景自行
-    /// 决定摇铃时机。
-    pub fn write(&self, buf: &[u8]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
-        let head = load_u32(self.base, OFF_HEAD);
-        fence_acquire();
-        let tail = load_u32(self.base, OFF_TAIL);
-        let n = free(head, tail).min(buf.len());
-        self.copy_into_ring(head, buf, n);
-        fence_release(); // 规范义务：数据先于游标可见
-        store_u32(self.base, OFF_HEAD, head.wrapping_add(n as u32));
-        n
-    }
-
-    /// 尽力读一批字节，返回实际读取数。不摇铃。
-    pub fn read(&self, buf: &mut [u8]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
-        let tail = load_u32(self.base, OFF_TAIL);
-        fence_acquire();
-        let head = load_u32(self.base, OFF_HEAD);
-        let n = (used(head, tail) as usize).min(buf.len());
-        self.copy_from_ring(tail, buf, n);
-        fence_release(); // 复用缓冲区前的发布次序（覆盖旧数据的写先于 tail 发布）
-        store_u32(self.base, OFF_TAIL, tail.wrapping_add(n as u32));
-        n
-    }
-
-    /// 流结束标记（生产者专用；置位后按规格不再写）。
-    pub fn set_eof(&self) {
-        store_u32(self.base, OFF_EOF, 1);
-        fence_release(); // eof 发布不早于其语义前提（数据已在环内）
-    }
-
-    /// 流是否已正常终止：排空且 eof（规格「EOF」节）。
-    pub fn eof_reached(&self) -> bool {
-        let tail = load_u32(self.base, OFF_TAIL);
-        fence_acquire();
-        let head = load_u32(self.base, OFF_HEAD);
-        let eof = load_u32(self.base, OFF_EOF);
-        head == tail && eof == 1
-    }
-
-    /// 环形拷入：自动处理回绕的两段拷贝。
-    fn copy_into_ring(&self, head: u32, src: &[u8], n: usize) {
-        let off = (head % CAP as u32) as usize;
-        let first = (CAP - off).min(n);
-        // SAFETY: off + n ≤ CAP 保证两段都不越页；n ≤ src.len() 由调用方保证。
+    fn copy_into_ring(&self, head: u32, source: &[u8], count: usize) {
+        let offset = (head % CAP as u32) as usize;
+        let first = (CAP - offset).min(count);
+        // SAFETY: 已验证 used<=CAP，count<=free 且 count<=source.len()。
         unsafe {
-            ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(DATA_OFF + off), first);
-            if n > first {
+            ptr::copy_nonoverlapping(source.as_ptr(), self.base.add(DATA_OFF + offset), first);
+            if count > first {
                 ptr::copy_nonoverlapping(
-                    src.as_ptr().add(first),
+                    source.as_ptr().add(first),
                     self.base.add(DATA_OFF),
-                    n - first,
+                    count - first,
                 );
             }
         }
     }
 
-    /// 环形拷出：对称处理回绕。
-    fn copy_from_ring(&self, tail: u32, dst: &mut [u8], n: usize) {
-        let off = (tail % CAP as u32) as usize;
-        let first = (CAP - off).min(n);
-        // SAFETY: 同 copy_into_ring；n ≤ dst.len() 由调用方保证。
+    fn copy_from_ring(&self, tail: u32, output: &mut [u8], count: usize) {
+        let offset = (tail % CAP as u32) as usize;
+        let first = (CAP - offset).min(count);
+        // SAFETY: 已验证 used<=CAP，count<=used 且 count<=output.len()。
         unsafe {
-            ptr::copy_nonoverlapping(self.base.add(DATA_OFF + off), dst.as_mut_ptr(), first);
-            if n > first {
+            ptr::copy_nonoverlapping(self.base.add(DATA_OFF + offset), output.as_mut_ptr(), first);
+            if count > first {
                 ptr::copy_nonoverlapping(
                     self.base.add(DATA_OFF),
-                    dst.as_mut_ptr().add(first),
-                    n - first,
+                    output.as_mut_ptr().add(first),
+                    count - first,
                 );
             }
         }
     }
 }
 
-/// 阻塞流式扩展：依赖内核信号面与门铃，仅在内核目标上编译
-/// （host 测试只覆盖协议核心——阻塞循环的正确性由排空纪律的结构形状
-/// 保证，见各方法的文档）。
+/// 唯一写 head/eof、只读 tail 的生产者视图。
+pub struct Producer {
+    raw: RawEndpoint,
+    head: u32,
+    tail_shadow: u32,
+    eof: bool,
+}
+
+impl Producer {
+    /// # Safety
+    /// `base` 是刚由 TunnelCreate 映射、尚未发布的完整页。
+    pub unsafe fn from_creator(base: *mut u8, handle: Handle) -> Self {
+        Self {
+            raw: unsafe { RawEndpoint::creator(base, handle) },
+            head: 0,
+            tail_shadow: 0,
+            eof: false,
+        }
+    }
+
+    /// # Safety
+    /// `base` 是刚由 TunnelAttach 映射的完整页。
+    pub unsafe fn from_attached(base: *mut u8, handle: Handle) -> Result<Self, RunnelError> {
+        let mut raw = unsafe { RawEndpoint::attached(base, handle)? };
+        let head = raw.atomic(OFF_HEAD).load(Ordering::Relaxed).to_le();
+        let tail = raw.atomic(OFF_TAIL).load(Ordering::Acquire).to_le();
+        let eof = raw.atomic(OFF_EOF).load(Ordering::Acquire).to_le();
+        if used(head, tail) as usize > CAP || eof > 1 {
+            return raw.fail();
+        }
+        Ok(Self { raw, head, tail_shadow: tail, eof: eof == 1 })
+    }
+
+    pub fn handle(&self) -> Handle {
+        self.raw.handle()
+    }
+
+    fn refresh_tail(&mut self) -> Result<u32, RunnelError> {
+        self.raw.ensure_usable()?;
+        if self.raw.atomic(OFF_HEAD).load(Ordering::Relaxed).to_le() != self.head
+            || self.raw.atomic(OFF_EOF).load(Ordering::Acquire).to_le() != u32::from(self.eof)
+        {
+            return self.raw.fail();
+        }
+        let tail = self.raw.atomic(OFF_TAIL).load(Ordering::Acquire).to_le();
+        let outstanding = used(self.head, self.tail_shadow);
+        let advanced = tail.wrapping_sub(self.tail_shadow);
+        if advanced > outstanding || used(self.head, tail) as usize > CAP {
+            return self.raw.fail();
+        }
+        self.tail_shadow = tail;
+        Ok(tail)
+    }
+
+    pub fn writable(&mut self) -> Result<usize, RunnelError> {
+        let tail = self.refresh_tail()?;
+        Ok(free(self.head, tail))
+    }
+
+    pub fn write(&mut self, input: &[u8]) -> Result<usize, RunnelError> {
+        if input.is_empty() {
+            self.raw.ensure_usable()?;
+            return Ok(0);
+        }
+        if self.eof {
+            return self.raw.fail();
+        }
+        let tail = self.refresh_tail()?;
+        let count = free(self.head, tail).min(input.len());
+        self.raw.copy_into_ring(self.head, input, count);
+        self.head = self.head.wrapping_add(count as u32);
+        // 数据普通写先于 release head；消费者 acquire head 后才读数据。
+        self.raw
+            .atomic(OFF_HEAD)
+            .store(self.head.to_le(), Ordering::Release);
+        Ok(count)
+    }
+
+    pub fn set_eof(&mut self) -> Result<(), RunnelError> {
+        self.raw.ensure_usable()?;
+        if self.eof {
+            return Ok(());
+        }
+        self.refresh_tail()?;
+        self.eof = true;
+        self.raw.atomic(OFF_EOF).store(1u32.to_le(), Ordering::Release);
+        Ok(())
+    }
+}
+
+/// 唯一写 tail、只读 head/eof 的消费者视图。
+pub struct Consumer {
+    raw: RawEndpoint,
+    tail: u32,
+    head_shadow: u32,
+    eof_head: Option<u32>,
+}
+
+impl Consumer {
+    /// # Safety
+    /// `base` 是刚由 TunnelCreate 映射、尚未发布的完整页。
+    pub unsafe fn from_creator(base: *mut u8, handle: Handle) -> Self {
+        Self {
+            raw: unsafe { RawEndpoint::creator(base, handle) },
+            tail: 0,
+            head_shadow: 0,
+            eof_head: None,
+        }
+    }
+
+    /// # Safety
+    /// `base` 是刚由 TunnelAttach 映射的完整页。
+    pub unsafe fn from_attached(base: *mut u8, handle: Handle) -> Result<Self, RunnelError> {
+        let mut raw = unsafe { RawEndpoint::attached(base, handle)? };
+        let tail = raw.atomic(OFF_TAIL).load(Ordering::Relaxed).to_le();
+        let eof = raw.atomic(OFF_EOF).load(Ordering::Acquire).to_le();
+        let head = raw.atomic(OFF_HEAD).load(Ordering::Acquire).to_le();
+        if used(head, tail) as usize > CAP || eof > 1 {
+            return raw.fail();
+        }
+        Ok(Self {
+            raw,
+            tail,
+            head_shadow: head,
+            eof_head: (eof == 1).then_some(head),
+        })
+    }
+
+    pub fn handle(&self) -> Handle {
+        self.raw.handle()
+    }
+
+    fn accept_head(&mut self, head: u32) -> Result<u32, RunnelError> {
+        if self.raw.atomic(OFF_TAIL).load(Ordering::Relaxed).to_le() != self.tail {
+            return self.raw.fail();
+        }
+        let capacity = CAP as u32 - used(self.head_shadow, self.tail);
+        let advanced = head.wrapping_sub(self.head_shadow);
+        if advanced > capacity || used(head, self.tail) as usize > CAP {
+            return self.raw.fail();
+        }
+        self.head_shadow = head;
+        Ok(head)
+    }
+
+    fn refresh_head(&mut self) -> Result<(u32, bool), RunnelError> {
+        self.raw.ensure_usable()?;
+        let eof = self.raw.atomic(OFF_EOF).load(Ordering::Acquire).to_le();
+        if eof > 1 {
+            return self.raw.fail();
+        }
+        // eof 必须先于这一次 head 取得；观察到 EOF 后冻结最终 head。
+        let head = self.raw.atomic(OFF_HEAD).load(Ordering::Acquire).to_le();
+        let head = self.accept_head(head)?;
+        if eof == 1 {
+            match self.eof_head {
+                Some(final_head) if final_head != head => return self.raw.fail(),
+                None => self.eof_head = Some(head),
+                _ => {}
+            }
+        }
+        Ok((head, eof == 1))
+    }
+
+    pub fn readable(&mut self) -> Result<usize, RunnelError> {
+        let (head, _) = self.refresh_head()?;
+        Ok(used(head, self.tail) as usize)
+    }
+
+    pub fn read(&mut self, output: &mut [u8]) -> Result<usize, RunnelError> {
+        if output.is_empty() {
+            self.raw.ensure_usable()?;
+            return Ok(0);
+        }
+        let (head, _) = self.refresh_head()?;
+        let count = (used(head, self.tail) as usize).min(output.len());
+        self.raw.copy_from_ring(self.tail, output, count);
+        self.tail = self.tail.wrapping_add(count as u32);
+        // 数据读取先于 release tail；生产者 acquire tail 后才覆写空间。
+        self.raw
+            .atomic(OFF_TAIL)
+            .store(self.tail.to_le(), Ordering::Release);
+        Ok(count)
+    }
+
+    /// 先 acquire eof，再 acquire head；观察到 EOF 后以冻结的最终 head 判排空。
+    pub fn eof_reached(&mut self) -> Result<bool, RunnelError> {
+        let (head, eof) = self.refresh_head()?;
+        Ok(eof && head == self.tail)
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 pub mod blocking {
     use super::*;
-    use erhino_shared::signal::{ObjectKind, SignalItem, TUNNEL_DATA, TUNNEL_PEER_CLOSED};
-    use rinlib::ipc::{signal, tunnel};
+    use erhino_shared::{
+        object::ObjectSignals,
+        wait::WaitItem,
+    };
+    use rinlib::ipc::{object, tunnel, wait};
 
-    /// 创建隧道并初始化协议页（创建方入口）。`addr` 为本进程内的页对齐地址。
-    pub fn create(addr: usize) -> Result<Endpoint, RunnelError> {
-        let id = tunnel::create(addr)?;
-        // SAFETY: addr 刚由内核映射，页对齐且归本进程独占初始化窗口。
-        let ep = unsafe { Endpoint::from_raw(addr as *mut u8, id) };
-        ep.init_creator();
-        Ok(ep)
+    pub fn create_consumer(addr: usize) -> Result<(Consumer, Handle), RunnelError> {
+        let pair = tunnel::create(addr)?;
+        // SAFETY: TunnelCreate 刚建立完整映射，尚未向 peer 发布 Invitation。
+        let consumer = unsafe { Consumer::from_creator(addr as *mut u8, pair.owner) };
+        Ok((consumer, pair.peer))
     }
 
-    /// 凭隧道 id 挂接对端并校验 magic/version。
-    pub fn attach(id: u64, addr: usize) -> Result<Endpoint, RunnelError> {
-        tunnel::attach(id, addr)?;
-        // SAFETY: addr 刚由内核映射。
-        let ep = unsafe { Endpoint::from_raw(addr as *mut u8, id) };
-        ep.validate()?;
-        Ok(ep)
+    pub fn create_producer(addr: usize) -> Result<(Producer, Handle), RunnelError> {
+        let pair = tunnel::create(addr)?;
+        // SAFETY: 同 create_consumer。
+        let producer = unsafe { Producer::from_creator(addr as *mut u8, pair.owner) };
+        Ok((producer, pair.peer))
     }
 
-    impl Endpoint {
-        /// 摇门铃：声明本端状态已变（写完数据 / 腾出空间）。
-        pub fn ring(&self) -> Result<(), RunnelError> {
-            tunnel::notify(self.id)?;
+    pub fn attach_producer(invitation: Handle, addr: usize) -> Result<Producer, RunnelError> {
+        let handle = tunnel::attach(invitation, addr)?;
+        // SAFETY: TunnelAttach 刚建立完整映射。
+        match unsafe { Producer::from_attached(addr as *mut u8, handle) } {
+            Ok(producer) => Ok(producer),
+            Err(error) => {
+                let _ = object::close(handle);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn attach_consumer(invitation: Handle, addr: usize) -> Result<Consumer, RunnelError> {
+        let handle = tunnel::attach(invitation, addr)?;
+        // SAFETY: TunnelAttach 刚建立完整映射。
+        match unsafe { Consumer::from_attached(addr as *mut u8, handle) } {
+            Ok(consumer) => Ok(consumer),
+            Err(error) => {
+                let _ = object::close(handle);
+                Err(error)
+            }
+        }
+    }
+
+    fn ring(handle: Handle) -> Result<(), RunnelError> {
+        tunnel::notify(handle).map_err(|error| match error {
+            SystemCallError::ObjectClosed => RunnelError::Closed,
+            _ => RunnelError::Syscall(error),
+        })
+    }
+
+    fn acknowledge(handle: Handle) -> Result<(), RunnelError> {
+        tunnel::acknowledge_data(handle)?;
+        Ok(())
+    }
+
+    fn wait_event(handle: Handle) -> Result<(), RunnelError> {
+        let result = wait::wait_many(&[WaitItem::new(
+            handle,
+            ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+            0,
+        )])?;
+        if result
+            .observed
+            .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)
+        {
+            Err(RunnelError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    impl Producer {
+        pub fn close(self) -> Result<(), RunnelError> {
+            object::close(self.handle())?;
             Ok(())
         }
 
-        /// 拆除本端（Dispose）。
-        pub fn dispose(self) -> Result<(), RunnelError> {
-            tunnel::dispose(self.id)?;
-            Ok(())
-        }
-
-        /// 结束流：置 EOF **并**摇铃。eof 是带内标记、门铃是带外唤醒，
-        /// 二者缺一不可——只置位不摇铃，读端会在排空后永久睡眠。
-        pub fn finish(&self) -> Result<(), RunnelError> {
-            self.set_eof();
-            self.ring()
-        }
-
-        /// 阻塞写完全部数据。满则等待对端腾空间的门铃；每批落页后摇铃
-        /// 唤醒读端。对端消亡返回 [`RunnelError::Closed`]。
-        pub fn write_all(&self, mut buf: &[u8]) -> Result<(), RunnelError> {
-            while !buf.is_empty() {
-                let n = self.write(buf);
-                buf = &buf[n..];
-                match buf.is_empty() {
-                    false if n == 0 => self.wait_event()?, // 满：等空间腾出门铃
-                    false => {}                            // 有进展但未完：继续尽力写
-                    true => self.ring()?,                  // 全部落页：唤醒读端
+        pub fn write_all(&mut self, mut input: &[u8]) -> Result<(), RunnelError> {
+            while !input.is_empty() {
+                let count = self.write(input)?;
+                if count != 0 {
+                    input = &input[count..];
+                    ring(self.handle())?;
+                    continue;
+                }
+                acknowledge(self.handle())?;
+                if self.writable()? == 0 {
+                    wait_event(self.handle())?;
                 }
             }
             Ok(())
         }
 
-        /// 阻塞读满 `buf`。排空且未 EOF 才等待（清铃前置条件的结构性
-        /// 落实：等待只发生在刚观察到空页之后）；读到 EOF 且无剩余数据时
-        /// 返回实际读取数（可短于 buf 长度）。对端消亡返回 Closed，
-        /// 此时已读到的数据仍然有效。
-        pub fn read_exact_or_eof(&self, buf: &mut [u8]) -> Result<usize, RunnelError> {
+        pub fn finish(&mut self) -> Result<(), RunnelError> {
+            self.set_eof()?;
+            ring(self.handle())
+        }
+    }
+
+    impl Consumer {
+        pub fn close(self) -> Result<(), RunnelError> {
+            object::close(self.handle())?;
+            Ok(())
+        }
+
+        pub fn read_exact_or_eof(&mut self, output: &mut [u8]) -> Result<usize, RunnelError> {
             let mut total = 0;
             loop {
-                total += self.read(&mut buf[total..]);
-                if total == buf.len() {
+                let count = self.read(&mut output[total..])?;
+                total += count;
+                if count != 0 {
+                    ring(self.handle())?;
+                }
+                if total == output.len() || self.eof_reached()? {
                     return Ok(total);
                 }
-                if self.eof_reached() {
-                    return Ok(total); // EOF：允许短读
+                if self.readable()? == 0 {
+                    acknowledge(self.handle())?;
+                    if self.readable()? == 0 && !self.eof_reached()? {
+                        wait_event(self.handle())?;
+                    }
                 }
-                if self.readable() == 0 {
-                    self.wait_event()?;
-                }
-                // 未排空则立即重试（仍有余量可读，不烧等待名额）。
-            }
-        }
-
-        /// 等待本端任一事件（数据到达 / 空间腾出 / 对端关闭）。
-        fn wait_event(&self) -> Result<(), RunnelError> {
-            let items = [SignalItem {
-                kind: ObjectKind::TunnelEndpoint as u64,
-                id: self.id,
-                interest: TUNNEL_DATA | TUNNEL_PEER_CLOSED,
-            }];
-            match signal::wait(&items)? {
-                (_, bits) if bits & TUNNEL_PEER_CLOSED != 0 => Err(RunnelError::Closed),
-                _ => Ok(()),
             }
         }
     }
@@ -342,99 +468,157 @@ pub mod blocking {
 const _: () = {
     assert!(CTRL_SIZE >= OFF_EOF + core::mem::size_of::<u32>());
     assert!(CAP > 0);
+    assert!(OFF_MAGIC % core::mem::align_of::<AtomicU32>() == 0);
+    assert!(OFF_VERSION % core::mem::align_of::<AtomicU32>() == 0);
+    assert!(OFF_HEAD % core::mem::align_of::<AtomicU32>() == 0);
+    assert!(OFF_TAIL % core::mem::align_of::<AtomicU32>() == 0);
+    assert!(OFF_EOF % core::mem::align_of::<AtomicU32>() == 0);
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{boxed::Box, vec};
 
-    /// 模拟一对端点：同一页的两个视角（单线程交错测试的合法简化）。
+    #[repr(align(4096))]
+    struct Page([u8; PAGE_SIZE]);
+
     struct Pair {
-        _page: Box<[u8; PAGE_SIZE]>,
-        producer: Endpoint,
-        consumer: Endpoint,
+        _page: Box<Page>,
+        producer: Producer,
+        consumer: Consumer,
     }
 
     impl Pair {
         fn new() -> Self {
-            let mut page = Box::new([0u8; PAGE_SIZE]);
-            let base = page.as_mut_ptr();
-            // SAFETY: base 指向活着的堆上页，生命周期由 Self 持有。
-            let producer = unsafe { Endpoint::from_raw(base, 7) };
-            let consumer = unsafe { Endpoint::from_raw(base, 7) };
-            producer.init_creator();
-            assert_eq!(load_u32(base, OFF_MAGIC), MAGIC);
+            let mut page = Box::new(Page([0u8; PAGE_SIZE]));
+            let base = page.0.as_mut_ptr();
+            // SAFETY: page 覆盖完整布局且由 Pair 保持存活。
+            let consumer = unsafe { Consumer::from_creator(base, Handle::from_raw(1)) };
+            let producer = unsafe { Producer::from_attached(base, Handle::from_raw(2)) }.unwrap();
+            assert_eq!(&page.0[..4], b"RNL1");
             Self { _page: page, producer, consumer }
         }
     }
 
     #[test]
     fn cursor_wraps_at_u32_boundary() {
-        // 自由计数越过 2³² 后差值语义不变（规格「不变量」节）。
         let tail = u32::MAX - 10;
         let head = u32::MAX - 2;
         assert_eq!(used(head, tail), 8);
-        let head = 2; // 再写 5 字节：MAX-2 越过回绕点落到 2，used = 8+5
-        assert_eq!(used(head, tail), 13);
+        assert_eq!(used(2, tail), 13);
     }
 
     #[test]
     fn empty_and_full_boundaries() {
-        let p = Pair::new();
-        assert_eq!(p.producer.writable(), CAP);
-        assert_eq!(p.consumer.readable(), 0);
-        // 写满：used == CAP、free == 0（不牺牲判满格）。
+        let mut pair = Pair::new();
+        assert_eq!(pair.producer.writable().unwrap(), CAP);
+        assert_eq!(pair.consumer.readable().unwrap(), 0);
         let all = [0xABu8; CAP];
-        assert_eq!(p.producer.write(&all), CAP);
-        assert_eq!(p.producer.writable(), 0);
-        assert_eq!(p.consumer.readable(), CAP);
-        // 排空。
-        let mut out = vec![0u8; CAP];
-        assert_eq!(p.consumer.read(&mut out), CAP);
-        assert!(out.iter().all(|&b| b == 0xAB));
-        assert_eq!(p.consumer.readable(), 0);
+        assert_eq!(pair.producer.write(&all).unwrap(), CAP);
+        assert_eq!(pair.producer.writable().unwrap(), 0);
+        assert_eq!(pair.consumer.readable().unwrap(), CAP);
+        let mut output = vec![0u8; CAP];
+        assert_eq!(pair.consumer.read(&mut output).unwrap(), CAP);
+        assert!(output.iter().all(|&byte| byte == 0xAB));
     }
 
     #[test]
     fn wrap_around_split_copy() {
-        let p = Pair::new();
-        // 写游标贴近页尾：迫使数据分两段落页。
+        let mut pair = Pair::new();
         let warm = [0u8; CAP - 3];
-        assert_eq!(p.producer.write(&warm), CAP - 3);
+        assert_eq!(pair.producer.write(&warm).unwrap(), CAP - 3);
         let mut drain = [0u8; CAP - 3];
-        assert_eq!(p.consumer.read(&mut drain), CAP - 3);
-        assert_eq!(p.producer.writable(), CAP); // 逻辑空但 head 已贴尾
-
-        let payload: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        assert_eq!(p.producer.write(&payload), 10); // 尾段 3 + 回绕头部 7
-        assert_eq!(p.consumer.readable(), 10);
-        let mut out = [0u8; 10];
-        assert_eq!(p.consumer.read(&mut out), 10);
-        assert_eq!(out, payload);
+        assert_eq!(pair.consumer.read(&mut drain).unwrap(), CAP - 3);
+        let payload = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(pair.producer.write(&payload).unwrap(), payload.len());
+        let mut output = [0u8; 10];
+        assert_eq!(pair.consumer.read(&mut output).unwrap(), output.len());
+        assert_eq!(output, payload);
     }
 
     #[test]
-    fn eof_semantics() {
-        let p = Pair::new();
-        assert!(!p.consumer.eof_reached());
-        assert_eq!(p.producer.write(b"hi"), 2);
-        p.producer.set_eof();
-        // 未排空时 EOF 不算到达。
-        assert!(!p.consumer.eof_reached());
-        let mut out = [0u8; 4];
-        // 直接用核心层模拟 read_exact_or_eof 的排空判定。
-        let n = {
-            let got = p.consumer.read(&mut out);
-            if p.consumer.eof_reached() { got } else { unreachable!() }
-        };
-        assert_eq!(n, 2); // 短读
-        assert!(p.consumer.eof_reached());
+    fn eof_is_visible_only_after_drain() {
+        let mut pair = Pair::new();
+        assert_eq!(pair.producer.write(b"hi").unwrap(), 2);
+        pair.producer.set_eof().unwrap();
+        assert!(!pair.consumer.eof_reached().unwrap());
+        let mut output = [0u8; 4];
+        assert_eq!(pair.consumer.read(&mut output).unwrap(), 2);
+        assert!(pair.consumer.eof_reached().unwrap());
+    }
+
+    #[test]
+    fn head_cannot_advance_after_eof_publication() {
+        let mut pair = Pair::new();
+        pair.producer.set_eof().unwrap();
+        assert!(pair.consumer.eof_reached().unwrap());
+        pair.consumer
+            .raw
+            .atomic(OFF_HEAD)
+            .store(1u32.to_le(), Ordering::Release);
+        assert_eq!(pair.consumer.eof_reached(), Err(RunnelError::Broken));
+    }
+
+    #[test]
+    fn impossible_peer_cursor_breaks_endpoint_permanently() {
+        let mut pair = Pair::new();
+        pair.consumer
+            .raw
+            .atomic(OFF_HEAD)
+            .store((CAP as u32 + 1).to_le(), Ordering::Release);
+        assert_eq!(pair.consumer.readable(), Err(RunnelError::Broken));
+        assert_eq!(pair.consumer.readable(), Err(RunnelError::Broken));
     }
 
     #[test]
     fn zero_length_io_is_noop() {
-        let p = Pair::new();
-        assert_eq!(p.producer.write(&[]), 0);
-        assert_eq!(p.consumer.read(&mut []), 0);
+        let mut pair = Pair::new();
+        assert_eq!(pair.producer.write(&[]).unwrap(), 0);
+        assert_eq!(pair.consumer.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_roles_survive_many_wraps() {
+        const TOTAL: usize = CAP * 257 + 113;
+        let mut page = Box::new(Page([0u8; PAGE_SIZE]));
+        let base = page.0.as_mut_ptr();
+        // SAFETY: page 在 scoped threads 完成前保持存活。
+        let mut consumer = unsafe { Consumer::from_creator(base, Handle::from_raw(1)) };
+        let mut producer = unsafe { Producer::from_attached(base, Handle::from_raw(2)) }.unwrap();
+        let expected: Vec<u8> = (0..TOTAL).map(|index| (index % 251 + 1) as u8).collect();
+        let mut output = vec![0u8; TOTAL];
+        std::thread::scope(|scope| {
+            let input = &expected;
+            let writer = scope.spawn(move || {
+                let mut offset = 0;
+                while offset < input.len() {
+                    let count = producer.write(&input[offset..]).unwrap();
+                    if count == 0 {
+                        std::thread::yield_now();
+                    } else {
+                        offset += count;
+                    }
+                }
+                producer.set_eof().unwrap();
+            });
+
+            let mut offset = 0;
+            while offset < output.len() {
+                let count = consumer.read(&mut output[offset..]).unwrap();
+                if count == 0 {
+                    if consumer.eof_reached().unwrap() {
+                        break;
+                    }
+                    std::thread::yield_now();
+                } else {
+                    offset += count;
+                }
+            }
+            writer.join().unwrap();
+            assert_eq!(offset, TOTAL);
+            assert!(consumer.eof_reached().unwrap());
+        });
+        assert_eq!(output, expected);
     }
 }

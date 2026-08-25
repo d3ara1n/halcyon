@@ -1,6 +1,6 @@
 //! 进程表：全局层容器（见 notes/impls/internals.md「进程表」）。
 //!
-//! 封装 `Spinlock<BTreeMap>`，只暴露 get/insert/remove；pid 单调分配不复用。
+//! 封装 `Spinlock<BTreeMap>`，负责 insert/remove；pid 单调分配不复用。
 //! 内部实现可替换（slot array 等），调用方无感。
 
 use alloc::{collections::BTreeMap, sync::Arc};
@@ -28,11 +28,6 @@ pub fn alloc_pid() -> Pid {
 
 pub fn insert(process: Arc<Process>) {
     TABLE.map.lock().insert(process.pid, process);
-}
-
-/// 查询进程（IPC 投递目标解析等）。
-pub fn get(pid: Pid) -> Option<Arc<Process>> {
-    TABLE.map.lock().get(&pid).cloned()
 }
 
 /// 摘除进程（退出回收的第一步；返回值 Drop 即释放地址空间）。
