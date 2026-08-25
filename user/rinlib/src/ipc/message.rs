@@ -7,7 +7,7 @@ use erhino_shared::{
     call::SystemCallError,
     message::{HandleMove, MessageHeader},
     object::{Handle, HandlePair, ObjectSignals, Rights},
-    wait::{WaitItem, WaitResult},
+    wait::{WaitItem, WaitResult, WAIT_DEADLINE_INFINITE},
 };
 
 use crate::call::{
@@ -117,7 +117,7 @@ pub fn send_blocking(
             erhino_shared::wait::WaitReason::Signaled,
         );
         // SAFETY: 输入和输出在阻塞 syscall 完成前都位于当前栈帧。
-        unsafe { sys_wait_many(&items, &mut result)? };
+        unsafe { sys_wait_many(&items, &mut result, WAIT_DEADLINE_INFINITE)? };
         if result.observed.intersects(ObjectSignals::CLOSED)
             && !result.observed.intersects(ObjectSignals::WRITABLE)
         {
@@ -146,7 +146,7 @@ pub fn wait_message(mailbox: Handle) -> Result<ReceivedMessage, SystemCallError>
             erhino_shared::wait::WaitReason::Signaled,
         );
         // SAFETY: 输入和输出在阻塞 syscall 完成前都位于当前栈帧。
-        unsafe { sys_wait_many(&items, &mut result)? };
+        unsafe { sys_wait_many(&items, &mut result, WAIT_DEADLINE_INFINITE)? };
         if result.observed.intersects(ObjectSignals::CLOSED)
             && !result.observed.intersects(ObjectSignals::READABLE)
         {

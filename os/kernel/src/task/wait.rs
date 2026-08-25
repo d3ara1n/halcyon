@@ -4,12 +4,12 @@ use alloc::{sync::{Arc, Weak}, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
     object::ObjectSignals,
-    wait::{WAIT_MANY_MAX, WaitCookie, WaitItem, WaitReason, WaitResult},
+    wait::{WAIT_DEADLINE_INFINITE, WAIT_MANY_MAX, WaitCookie, WaitItem, WaitReason, WaitResult},
 };
 use num_traits::ToPrimitive;
 use wait_context::{ArmResult, OfferResult, WaitCore};
 
-use crate::{sched, sync::Spinlock, uaccess};
+use crate::{context::UserContext, sched, sync::Spinlock, uaccess};
 
 use super::{
     Thread,
@@ -38,11 +38,13 @@ pub enum WaitStart {
 }
 
 /// WaitMany syscall 入口：复制 ABI、解析 Handle/rights，并完成初始检查。
+/// `deadline_ms` 为相对毫秒期限，`0` 表示无限等待。
 pub fn prepare(
     thread: &Thread,
     items_ptr: usize,
     count: usize,
     result_ptr: usize,
+    deadline_ms: u64,
 ) -> Result<WaitStart, SystemCallError> {
     if count == 0 || count > WAIT_MANY_MAX {
         return Err(SystemCallError::IllegalArgument);
@@ -112,10 +114,16 @@ pub fn prepare(
         }
     }
 
+    let deadline = if deadline_ms == WAIT_DEADLINE_INFINITE {
+        None
+    } else {
+        Some(sched::deadline_after_ms(deadline_ms))
+    };
+
     Ok(WaitStart::Park(WaitPlan {
         items,
         action: WaitAction::WaitMany { result_ptr },
-        deadline: None,
+        deadline,
     }))
 }
 
@@ -244,36 +252,23 @@ impl WaitContext {
         let frame = unsafe { &mut *thread.frame_ptr() };
         match (self.action, outcome) {
             (WaitAction::WaitMany { result_ptr }, WaitOutcome::Object(result)) => {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (&result as *const WaitResult).cast::<u8>(),
-                        core::mem::size_of::<WaitResult>(),
-                    )
-                };
-                let copied = {
-                    let mut space = thread.process.space.lock();
-                    uaccess::put_user_indirect(&mut space, result_ptr, bytes)
-                };
-                match copied {
-                    Ok(()) => {
-                        frame.x[10] = 0;
-                        frame.x[11] = 0;
-                    }
-                    Err(error) => {
-                        let error = SystemCallError::from(error);
-                        frame.x[10] = error.to_usize().unwrap_or(1) as u64;
-                    }
-                }
-                frame.sepc += 4;
+                deliver_wait_result(thread, frame, result_ptr, result);
+            }
+            (WaitAction::WaitMany { result_ptr }, WaitOutcome::Deadline) => {
+                deliver_wait_result(
+                    thread,
+                    frame,
+                    result_ptr,
+                    WaitResult::new(0, ObjectSignals::NONE, u32::MAX, WaitReason::Deadline),
+                );
             }
             (WaitAction::WaitMany { .. }, WaitOutcome::Error(error)) => {
                 frame.x[10] = error.to_usize().unwrap_or(1) as u64;
                 frame.sepc += 4;
             }
-            // 已知简化：占位语义——WaitMany 无期限参数时本分支不可达；
-            // 等待面获得期限/取消 ABI 时需给正式完成语义
-            // （notes/impls/ipc.md「等待与期限」）。
-            (WaitAction::WaitMany { .. }, WaitOutcome::Cancelled | WaitOutcome::Deadline) => {
+            // 已知简化：占位语义——显式取消 ABI 接入前本分支不可达；
+            // 接入时需给正式完成语义（notes/impls/ipc.md「等待与期限」）。
+            (WaitAction::WaitMany { .. }, WaitOutcome::Cancelled) => {
                 frame.x[10] = SystemCallError::FunctionNotAvailable.to_usize().unwrap_or(1) as u64;
                 frame.sepc += 4;
             }
@@ -356,6 +351,37 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
             // offer 方已取得完成权并负责清理/交付。
         }
     }
+}
+
+/// 将 WaitResult 写回用户现场并推进 sepc；写回失败则携带错误返回。
+fn deliver_wait_result(
+    thread: &Thread,
+    frame: &mut UserContext,
+    result_ptr: usize,
+    result: WaitResult,
+) {
+    // SAFETY: WaitResult 字段和 reserved 全部初始化，结构无 padding。
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&result as *const WaitResult).cast::<u8>(),
+            core::mem::size_of::<WaitResult>(),
+        )
+    };
+    let copied = {
+        let mut space = thread.process.space.lock();
+        uaccess::put_user_indirect(&mut space, result_ptr, bytes)
+    };
+    match copied {
+        Ok(()) => {
+            frame.x[10] = 0;
+            frame.x[11] = 0;
+        }
+        Err(error) => {
+            let error = SystemCallError::from(error);
+            frame.x[10] = error.to_usize().unwrap_or(1) as u64;
+        }
+    }
+    frame.sepc += 4;
 }
 
 fn deliver_install_error(thread: Arc<Thread>, _action: WaitAction, error: SystemCallError) {

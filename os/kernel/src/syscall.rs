@@ -80,6 +80,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             frame.x[10] as usize,
             frame.x[11] as usize,
             frame.x[12] as usize,
+            frame.x[13] as u64,
         ) {
             Ok(wait::WaitStart::Ready) => {
                 respond_ok(frame, 0);

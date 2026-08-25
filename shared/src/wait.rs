@@ -36,7 +36,24 @@ pub enum WaitReason {
     Signaled = 0,
     Closed = 1,
     Cancelled = 2,
+    /// 期限到达，无任何观察项完成；此时 `item_index` 为 `u32::MAX`。
+    Deadline = 3,
 }
+
+impl WaitReason {
+    pub const fn from_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Signaled),
+            1 => Some(Self::Closed),
+            2 => Some(Self::Cancelled),
+            3 => Some(Self::Deadline),
+            _ => None,
+        }
+    }
+}
+
+/// WaitMany 的可选期限参数值：无限等待。
+pub const WAIT_DEADLINE_INFINITE: u64 = 0;
 
 /// WaitMany 的唯一完成结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

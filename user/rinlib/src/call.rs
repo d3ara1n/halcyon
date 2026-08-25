@@ -292,13 +292,17 @@ pub unsafe fn sys_mailbox_make_send_once(
     .map(|_| ())
 }
 
-pub unsafe fn sys_wait_many(items: &[WaitItem], result: &mut WaitResult) -> SystemCallResult<()> {
+pub unsafe fn sys_wait_many(
+    items: &[WaitItem],
+    result: &mut WaitResult,
+    deadline_ms: u64,
+) -> SystemCallResult<()> {
     sys_call(
         SystemCall::WaitMany,
         items.as_ptr() as usize,
         items.len(),
         result as *mut WaitResult as usize,
-        0,
+        deadline_ms as usize,
     )
     .map(|_| ())
 }

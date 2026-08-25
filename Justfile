@@ -2,6 +2,9 @@
 MODE := "debug"
 RELEASE := if MODE == "release" { "--release" } else { "" }
 
+# 用户态 target 同样需要 build-std 许可（config 不能全局开启，同内核）
+ZFLAGS_USER := "-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
 # platform
 PLATFORM := "qemu"
 MODEL := "virt"
@@ -71,7 +74,7 @@ make_dtb: artifact_dir
     @dtc -O dtb -o "{{DTB}}" "{{DTS}}"
 
 build_user: artifact_dir
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --bins {{RELEASE}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     @echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
 make_initfs: build_user

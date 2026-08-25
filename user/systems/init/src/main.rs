@@ -25,7 +25,7 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         startup::GRANT_PM_MAILBOX,
-        wait::WaitItem,
+        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
 };
 use librunnel::blocking;
@@ -68,11 +68,16 @@ fn main() {
                 );
                 let moved = message.handles[0];
                 notification::signal(moved, 0x5).expect("notification signal failed");
-                let result = wait_many(&[WaitItem::new(
-                    event.owner,
-                    ObjectSignals::READABLE,
-                    7,
-                )])
+                let result = wait_many(
+                    &[
+                        WaitItem::new(
+                            event.owner,
+                            ObjectSignals::READABLE,
+                            7,
+                        ),
+                    ],
+                    WAIT_DEADLINE_INFINITE,
+                )
                 .expect("notification wait failed");
                 let bits = notification::take(event.owner, u64::MAX)
                     .expect("notification take failed");
@@ -132,7 +137,7 @@ fn main() {
         ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
         0,
     )];
-    match wait_many(&items) {
+    match wait_many(&items, WAIT_DEADLINE_INFINITE) {
         Ok(result) => debug!("peer closed observed: bits={:#x}", result.observed.raw()),
         Err(e) => debug!("peer-closed wait failed: {:?}", e),
     }
@@ -255,11 +260,16 @@ fn test_writable_level() {
         Rights::WRITE | Rights::WAIT,
     )
     .expect("writable mailbox create failed");
-    let result = wait_many(&[WaitItem::new(
-        mailbox.peer,
-        ObjectSignals::WRITABLE,
-        1,
-    )])
+    let result = wait_many(
+        &[
+            WaitItem::new(
+                mailbox.peer,
+                ObjectSignals::WRITABLE,
+                1,
+            ),
+        ],
+        WAIT_DEADLINE_INFINITE,
+    )
     .expect("empty mailbox must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
 
@@ -267,11 +277,16 @@ fn test_writable_level() {
         send(mailbox.peer, 0, &[], &[]).expect("writable fill failed");
     }
     discard(mailbox.owner).expect("writable make-room failed");
-    let result = wait_many(&[WaitItem::new(
-        mailbox.peer,
-        ObjectSignals::WRITABLE,
-        2,
-    )])
+    let result = wait_many(
+        &[
+            WaitItem::new(
+                mailbox.peer,
+                ObjectSignals::WRITABLE,
+                2,
+            ),
+        ],
+        WAIT_DEADLINE_INFINITE,
+    )
     .expect("mailbox below capacity must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
 
@@ -311,8 +326,13 @@ fn test_writable_wake(pm_mailbox: Handle) {
         .expect("wake request send failed");
 
     // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
-    wait_many(&[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)])
-        .expect("wake notification wait failed");
+    wait_many(
+        &[
+            WaitItem::new(done.owner, ObjectSignals::READABLE, 0),
+        ],
+        WAIT_DEADLINE_INFINITE,
+    )
+    .expect("wake notification wait failed");
     notification::take(done.owner, u64::MAX).expect("wake notification take failed");
     discard(target.owner).expect("wake make-room failed");
 
@@ -397,11 +417,16 @@ fn test_tunnel_lifecycle() {
     for _ in 0..TUNNEL_STRESS {
         let abandoned = tunnel_sys::create(LIFECYCLE_VA).expect("lifecycle tunnel create failed");
         close(abandoned.peer).expect("invitation close failed");
-        let result = wait_many(&[WaitItem::new(
-            abandoned.owner,
-            ObjectSignals::PEER_CLOSED,
-            0,
-        )])
+        let result = wait_many(
+            &[
+                WaitItem::new(
+                    abandoned.owner,
+                    ObjectSignals::PEER_CLOSED,
+                    0,
+                ),
+            ],
+            WAIT_DEADLINE_INFINITE,
+        )
         .expect("abandoned invitation wait failed");
         assert!(result.observed.intersects(ObjectSignals::PEER_CLOSED));
         close(abandoned.owner).expect("lifecycle endpoint close failed");

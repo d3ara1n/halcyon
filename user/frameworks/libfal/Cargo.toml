@@ -2,9 +2,8 @@
 name = "libfal"
 version = "0.1.0"
 authors = ["Chien Zhang (zqy0224@live.com)"]
-description = "Filesystem framework"
+description = "Filesystem abstract layer: wire protocol and provider building blocks"
 edition = "2024"
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rinlib = { path = "../../rinlib" }
+librpc = { path = "../librpc" }

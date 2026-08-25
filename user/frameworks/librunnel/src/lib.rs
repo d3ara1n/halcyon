@@ -339,7 +339,7 @@ pub mod blocking {
     use super::*;
     use erhino_shared::{
         object::ObjectSignals,
-        wait::WaitItem,
+        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     };
     use rinlib::ipc::{object, tunnel, wait};
 
@@ -394,11 +394,16 @@ pub mod blocking {
     }
 
     fn wait_event(handle: Handle) -> Result<(), RunnelError> {
-        let result = wait::wait_many(&[WaitItem::new(
-            handle,
-            ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-            0,
-        )])?;
+        let result = wait::wait_many(
+            &[
+                WaitItem::new(
+                    handle,
+                    ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                    0,
+                ),
+            ],
+            WAIT_DEADLINE_INFINITE,
+        )?;
         if result
             .observed
             .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)

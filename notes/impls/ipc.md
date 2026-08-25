@@ -16,9 +16,9 @@
 
 `os/wait_context` 提供 `Installing → Armed → Finishing → Done` 状态机和单 outcome 仲裁。`os/kernel/src/task/wait.rs` 负责解析 Handle、保存对象强引用、安装订阅、跨对象逐项清理和写回 `WaitResult`。对象更新只改变非消费式电平并 offer 匹配 Context；同一 Context 只有一个完成者取得线程所有权。终态冻结住在 `ObjectWaitState::update`：CLOSED 置位后任何更新不再生效，「单向迁移、终态不可复活」由所有对象共用的这一结构保证，跨关闭窗口的事务收尾无需逐点防御。
 
-WaitMany 是对象等待的唯一用户入口。Sleep 也构造 `WaitAction::Sleep` 的空对象 WaitPlan；`os/kernel/src/sched.rs` 的期限表持有同一个 WaitContext，到期以 `Deadline` outcome 竞争，不再使用独立等待代数。
+WaitMany 是对象等待的唯一用户入口，带可选期限参数（相对毫秒，0 为无限）：到期以 `Deadline` outcome 竞争完成，交付 `reason == Deadline` 的 `WaitResult`（`item_index` 为 `u32::MAX`），无任何观察项被消费。Sleep 也构造 `WaitAction::Sleep` 的空对象 WaitPlan；`os/kernel/src/sched.rs` 的期限表持有同一个 WaitContext，到期以 `Deadline` outcome 竞争，不再使用独立等待代数。
 
-**（已知简化）**WaitMany 尚无期限参数，deliver 的 `(WaitMany, Deadline|Cancelled)` 分支不可达、以 FunctionNotAvailable 占位；等待面获得期限/取消 ABI 时需给出正式完成语义（Cancel reason 或超时指示），不得沿用错误码占位。
+**（已知简化）**显式取消 ABI 尚未接入，deliver 的 `(WaitMany, Cancelled)` 分支不可达、以 FunctionNotAvailable 占位；接入时需给正式完成语义（Cancel reason），不得沿用错误码占位。
 
 ## 消息与 Notification
 

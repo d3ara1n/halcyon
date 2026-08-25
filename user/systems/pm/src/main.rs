@@ -15,7 +15,7 @@ use rinlib::{
         call::SystemCallError,
         message::MAILBOX_CAPACITY,
         object::ObjectSignals,
-        wait::WaitItem,
+        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
     sys_sleep,
 };
@@ -121,7 +121,7 @@ fn main() {
                 if woke {
                     notification::signal(spin, 1).expect("spurious wake signal failed");
                 }
-                let result = wait_many(&items).expect("writable wait failed");
+                let result = wait_many(&items, WAIT_DEADLINE_INFINITE).expect("writable wait failed");
                 assert!(result.observed.intersects(ObjectSignals::WRITABLE));
                 woke = true;
             }
