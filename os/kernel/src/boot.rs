@@ -63,8 +63,9 @@ pub fn load(address: usize, length: usize) {
     .expect("initial process cannot be launched");
 
     // initial ELF 已复制进目标 owned pages，StartupBlock prefix 也已构造完成；
-    // payload_off 页对齐，因此 package prefix 可整体回投，只有实际映入 init
-    // 的 payload 页继续由启动 reservation 持有。
+    // payload_off 页对齐，prefix 可整体回投。payload 页已在映入时收编为
+    // init 地址空间的 owned backing（proc::map_bootstrap_block），随其
+    // 销毁自然归还帧池，启动保留洞无需持有到系统结束。
     frame::free_range(address, payload_pa);
     log!(Memory, "BootPackage prefix reclaim [{:#x}, {:#x})", address, payload_pa);
 

@@ -432,8 +432,9 @@ impl AddressSpace {
     }
 
     /// Bootstrap 专用 StartupBlock：prefix 复制到地址空间自有只读页，
-    /// 紧随其后的 opaque payload 直接借用 BootPackage 物理页。该入口不由
-    /// syscall 暴露；借用页由系统级 BootPackage reservation 保持。
+    /// 紧随其后的 opaque payload 页在映入时即移交为本地址空间 owned
+    /// backing（自帧池启动保留洞收编，Drop 时首次归还池）。该入口不由
+    /// syscall 暴露；payload 生命周期随 init 地址空间，无 pid 特判。
     pub fn map_bootstrap_block(
         &mut self,
         prefix: &[u8],
@@ -459,7 +460,9 @@ impl AddressSpace {
             return Err(SpaceError::BadSegment);
         }
 
-        self.frames.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
+        self.frames
+            .try_reserve(1 + usize::from(payload_pages > 0))
+            .map_err(|_| SpaceError::NoFrame)?;
         let tracker = frame::alloc_contiguous(prefix_pages).ok_or(SpaceError::NoFrame)?;
         let base_vpn = base / PAGE_SIZE;
         let prefix_ppn = tracker.base.addr() / PAGE_SIZE;
@@ -507,6 +510,12 @@ impl AddressSpace {
                     return Err(error.into());
                 }
             }
+            // SAFETY: payload 帧来自帧池启动保留洞（从未入空闲链），
+            // 收编为 owned tracker 后由 Drop 在地址空间销毁时首次归还池。
+            self.frames.push(FrameTracker {
+                base: FrameNumber(payload_pa / PAGE_SIZE),
+                count: payload_pages,
+            });
         }
         self.frames.push(tracker);
         self.brk = end;
