@@ -1,4 +1,8 @@
 //! little-endian 定宽编解码游标：协议层的唯一字节出入通道。
+//!
+//! 容量契约：写入侧不可失败——调用方先以 `encoded_len()` 计算所需
+//! 字节数并预留空间（`reserve`/按精确尺寸分配），溢出即编程错误，
+//! 以 panic 报告而非错误值；解码面对不可信输入，保持可失败。
 
 /// 编码游标：顺序写入 LE 定宽字段与原始字节。
 pub struct Writer<'a> {
@@ -19,42 +23,44 @@ impl<'a> Writer<'a> {
         self.buffer.len() - self.position
     }
 
-    fn put(&mut self, bytes: &[u8]) -> DecodeResult<()> {
-        if self.remaining() < bytes.len() {
-            return Err(DecodeError);
-        }
+    /// 编码前容量契约：为后续写入预留 `needed` 字节；不足即调用方
+    /// 未按 `encoded_len()` 预留，属编程错误。
+    pub fn reserve(&mut self, needed: usize) {
+        assert!(self.remaining() >= needed, "writer buffer under-sized");
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        self.reserve(bytes.len());
         self.buffer[self.position..self.position + bytes.len()].copy_from_slice(bytes);
         self.position += bytes.len();
-        Ok(())
     }
 
-    pub fn u8(&mut self, value: u8) -> DecodeResult<()> {
-        self.put(&[value])
+    pub fn u8(&mut self, value: u8) {
+        self.put(&[value]);
     }
 
-    pub fn u16(&mut self, value: u16) -> DecodeResult<()> {
-        self.put(&value.to_le_bytes())
+    pub fn u16(&mut self, value: u16) {
+        self.put(&value.to_le_bytes());
     }
 
-    pub fn u32(&mut self, value: u32) -> DecodeResult<()> {
-        self.put(&value.to_le_bytes())
+    pub fn u32(&mut self, value: u32) {
+        self.put(&value.to_le_bytes());
     }
 
-    pub fn u64(&mut self, value: u64) -> DecodeResult<()> {
-        self.put(&value.to_le_bytes())
+    pub fn u64(&mut self, value: u64) {
+        self.put(&value.to_le_bytes());
     }
 
-    pub fn bytes(&mut self, value: &[u8]) -> DecodeResult<()> {
-        self.put(value)
+    pub fn bytes(&mut self, value: &[u8]) {
+        self.put(value);
     }
 
-    /// 长度前缀（u16）的字节段；超长即协议错误。
-    pub fn sized_bytes(&mut self, value: &[u8]) -> DecodeResult<()> {
-        if value.len() > u16::MAX as usize {
-            return Err(DecodeError);
-        }
-        self.u16(value.len() as u16)?;
-        self.put(value)
+    /// 长度前缀（u16）的字节段；段长超界即输入校验缺失，同样只可能
+    /// 是编程错误（合法输入的长度约束在协议入口校验）。
+    pub fn sized_bytes(&mut self, value: &[u8]) {
+        assert!(value.len() <= u16::MAX as usize, "segment exceeds u16 length");
+        self.u16(value.len() as u16);
+        self.put(value);
     }
 }
 
@@ -138,11 +144,12 @@ mod tests {
     fn writer_reader_roundtrip() {
         let mut buffer = [0u8; 32];
         let mut writer = Writer::new(&mut buffer);
-        writer.u8(0xAB).unwrap();
-        writer.u16(0x0102).unwrap();
-        writer.u32(0x0304_0506).unwrap();
-        writer.u64(0x07).unwrap();
-        writer.sized_bytes(b"erhino").unwrap();
+        writer.reserve(1 + 2 + 4 + 8 + 2 + 6);
+        writer.u8(0xAB);
+        writer.u16(0x0102);
+        writer.u32(0x0304_0506);
+        writer.u64(0x07);
+        writer.sized_bytes(b"erhino");
         let used = writer.written();
 
         let mut reader = Reader::new(&buffer[..used]);
@@ -155,17 +162,27 @@ mod tests {
     }
 
     #[test]
-    fn writer_rejects_overflow() {
+    #[should_panic(expected = "writer buffer under-sized")]
+    fn writer_panics_on_overflow() {
         let mut buffer = [0u8; 4];
         let mut writer = Writer::new(&mut buffer);
-        assert_eq!(writer.bytes(&[0; 5]), Err(DecodeError));
-        let mut tight = [0u8; 3];
-        let mut writer = Writer::new(&mut tight);
-        assert_eq!(writer.sized_bytes(b"abcd"), Err(DecodeError));
-        // 定宽写同样拒绝短缓冲。
-        let mut narrow = [0u8; 3];
-        let mut writer = Writer::new(&mut narrow);
-        assert_eq!(writer.u32(1), Err(DecodeError));
+        writer.bytes(&[0; 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "writer buffer under-sized")]
+    fn writer_panics_on_undersized_reserve() {
+        let mut buffer = [0u8; 3];
+        let mut writer = Writer::new(&mut buffer);
+        writer.reserve(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "segment exceeds u16 length")]
+    fn writer_panics_on_oversized_segment() {
+        let mut buffer = [0u8; 16];
+        let mut writer = Writer::new(&mut buffer);
+        writer.sized_bytes(&[0u8; u16::MAX as usize + 1]);
     }
 
     #[test]

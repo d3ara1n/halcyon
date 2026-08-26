@@ -9,7 +9,7 @@
 use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, vec::Vec};
 
 use crate::header::Status;
-use crate::lookup::{NodeInfo, ResolvePolicy};
+use crate::lookup::ResolvePolicy;
 use crate::node::{validate_path, NodeAttributes, NodeKind};
 
 #[derive(Debug, Clone)]
@@ -509,8 +509,7 @@ mod tests {
         fs.create(b"answer", NodeKind::Property, rw()).unwrap();
         let mut buffer = [0u8; 16];
         let used = crate::property::PropertyValue::Integer(42)
-            .encode(&mut buffer)
-            .unwrap();
+            .encode(&mut buffer);
         fs.property_write(ResolvePolicy::FollowAll, b"answer", &buffer[..used]).unwrap();
         assert_eq!(
             fs.property_read(ResolvePolicy::FollowAll, b"answer").unwrap(),
@@ -530,8 +529,7 @@ mod tests {
         // 合法 Integer 编码：接受。
         let mut buffer = [0u8; 16];
         let used = crate::property::PropertyValue::Integer(7)
-            .encode(&mut buffer)
-            .unwrap();
+            .encode(&mut buffer);
         fs.property_write(ResolvePolicy::FollowAll, b"p", &buffer[..used]).unwrap();
     }
 

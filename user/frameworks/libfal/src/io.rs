@@ -11,13 +11,19 @@ pub struct ReadAtRequest<'a> {
 }
 
 impl ReadAtRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        let used = self.address.encode(out)?;
+    /// 线长：寻址前奏 + offset u64 + len u32 + reserved u32。
+    pub fn encoded_len(&self) -> usize {
+        self.address.encoded_len() + 16
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
+        let used = self.address.encode(out);
         let mut writer = Writer::new(&mut out[used..]);
-        writer.u64(self.offset)?;
-        writer.u32(self.len)?;
-        writer.u32(0)?;
-        Ok(used + writer.written())
+        writer.reserve(16);
+        writer.u64(self.offset);
+        writer.u32(self.len);
+        writer.u32(0);
+        used + writer.written()
     }
 
     /// 解码：返回（策略、rel、offset、len）。
@@ -43,12 +49,18 @@ pub struct WriteAtRequest<'a> {
 }
 
 impl WriteAtRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        let used = self.address.encode(out)?;
+    /// 线长：寻址前奏 + offset u64 + sized bytes。
+    pub fn encoded_len(&self) -> usize {
+        self.address.encoded_len() + 8 + 2 + self.bytes.len()
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
+        let used = self.address.encode(out);
         let mut writer = Writer::new(&mut out[used..]);
-        writer.u64(self.offset)?;
-        writer.sized_bytes(self.bytes)?;
-        Ok(used + writer.written())
+        writer.reserve(8 + 2 + self.bytes.len());
+        writer.u64(self.offset);
+        writer.sized_bytes(self.bytes);
+        used + writer.written()
     }
 
     /// 解码：返回（策略、rel、offset、bytes）；应答为写入字节数（u32）。
@@ -75,7 +87,7 @@ mod tests {
             offset: 8,
             len: 32,
         };
-        let used = request.encode(&mut buffer).unwrap();
+        let used = request.encode(&mut buffer);
         assert_eq!(
             ReadAtRequest::decode(&buffer[..used]).unwrap(),
             (ResolvePolicy::FollowAll, &b"bin/init"[..], 8, 32)
@@ -90,7 +102,7 @@ mod tests {
             offset: 16,
             bytes: &[1, 2, 3, 4],
         };
-        let used = request.encode(&mut buffer).unwrap();
+        let used = request.encode(&mut buffer);
         assert_eq!(
             WriteAtRequest::decode(&buffer[..used]).unwrap(),
             (ResolvePolicy::FollowAll, &b"out"[..], 16, &[1, 2, 3, 4][..])

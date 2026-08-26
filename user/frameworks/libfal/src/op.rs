@@ -19,12 +19,18 @@ pub struct OpAddress<'a> {
 pub const ADDRESS_HEADER_LEN: usize = 8 + 2;
 
 impl OpAddress<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：policy u32 + reserved u32 + sized rel（u16 前缀）。
+    pub fn encoded_len(&self) -> usize {
+        ADDRESS_HEADER_LEN + self.rel.len()
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
-        writer.u32(self.policy as u32)?;
-        writer.u32(0)?;
-        writer.sized_bytes(self.rel)?;
-        Ok(writer.written())
+        writer.reserve(self.encoded_len());
+        writer.u32(self.policy as u32);
+        writer.u32(0);
+        writer.sized_bytes(self.rel);
+        writer.written()
     }
 
     /// 解码寻址前奏：返回（策略、rel、前奏消费的字节数）。
@@ -49,12 +55,18 @@ pub struct CreateRequest<'a> {
 }
 
 impl CreateRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        let used = self.address.encode(out)?;
+    /// 线长：寻址前奏 + kind u32 + attributes u32。
+    pub fn encoded_len(&self) -> usize {
+        self.address.encoded_len() + 8
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
+        let used = self.address.encode(out);
         let mut writer = Writer::new(&mut out[used..]);
-        writer.u32(self.kind as u32)?;
-        writer.u32(self.attributes.raw())?;
-        Ok(used + writer.written())
+        writer.reserve(8);
+        writer.u32(self.kind as u32);
+        writer.u32(self.attributes.raw());
+        used + writer.written()
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8], NodeKind, NodeAttributes)> {
@@ -73,12 +85,48 @@ pub struct LinkRequest<'a> {
     pub target: &'a [u8],
 }
 
-impl LinkRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
-        let used = self.address.encode(out)?;
+/// Write：写属性整值（整体替换）。
+pub struct WriteRequest<'a> {
+    pub address: OpAddress<'a>,
+    pub value: &'a [u8],
+}
+
+impl WriteRequest<'_> {
+    /// 线长：寻址前奏 + sized value。
+    pub fn encoded_len(&self) -> usize {
+        self.address.encoded_len() + 2 + self.value.len()
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
+        let used = self.address.encode(out);
         let mut writer = Writer::new(&mut out[used..]);
-        writer.sized_bytes(self.target)?;
-        Ok(used + writer.written())
+        writer.reserve(2 + self.value.len());
+        writer.sized_bytes(self.value);
+        used + writer.written()
+    }
+
+    /// 解码：返回（策略、rel、value）。
+    pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8], &[u8])> {
+        let (policy, rel, used) = OpAddress::decode(bytes)?;
+        let mut reader = Reader::new(&bytes[used..]);
+        let value = reader.sized_bytes()?;
+        reader.finish()?;
+        Ok((policy, rel, value))
+    }
+}
+
+impl LinkRequest<'_> {
+    /// 线长：寻址前奏 + sized target。
+    pub fn encoded_len(&self) -> usize {
+        self.address.encoded_len() + 2 + self.target.len()
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
+        let used = self.address.encode(out);
+        let mut writer = Writer::new(&mut out[used..]);
+        writer.reserve(2 + self.target.len());
+        writer.sized_bytes(self.target);
+        used + writer.written()
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8], &[u8])> {
@@ -102,7 +150,7 @@ mod tests {
             kind: NodeKind::Property,
             attributes: NodeAttributes::READABLE | NodeAttributes::WRITEABLE,
         };
-        let used = request.encode(&mut buffer).unwrap();
+        let used = request.encode(&mut buffer);
         let (policy, rel, kind, attributes) = CreateRequest::decode(&buffer[..used]).unwrap();
         assert_eq!(policy, ResolvePolicy::FollowAll);
         assert_eq!(rel, b"a/b/new");
@@ -117,7 +165,7 @@ mod tests {
             address: OpAddress { policy: ResolvePolicy::FollowAll, rel: b"a/lnk" },
             target: b"../elsewhere",
         };
-        let used = request.encode(&mut buffer).unwrap();
+        let used = request.encode(&mut buffer);
         let (policy, rel, target) = LinkRequest::decode(&buffer[..used]).unwrap();
         assert_eq!((policy, rel, target), (ResolvePolicy::FollowAll, &b"a/lnk"[..], &b"../elsewhere"[..]));
     }

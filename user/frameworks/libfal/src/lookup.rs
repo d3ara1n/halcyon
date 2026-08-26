@@ -41,12 +41,18 @@ pub struct LookupRequest<'a> {
 }
 
 impl LookupRequest<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：policy u32 + reserved u32 + 路径字节（非前缀，随 body 终点结束）。
+    pub fn encoded_len(&self) -> usize {
+        8 + self.path.len()
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
-        writer.u32(self.policy as u32)?;
-        writer.u32(0)?;
-        writer.bytes(self.path)?;
-        Ok(writer.written())
+        writer.reserve(self.encoded_len());
+        writer.u32(self.policy as u32);
+        writer.u32(0);
+        writer.bytes(self.path);
+        writer.written()
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(ResolvePolicy, &[u8])> {
@@ -77,16 +83,24 @@ pub struct NodeInfo<'a> {
 }
 
 impl NodeInfo<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：kind u32 + attributes u32 + size u64 + reserved u32，
+    /// 符号链接另带 sized target。
+    pub fn encoded_len(&self) -> usize {
+        let fixed = 4 + 4 + 8 + 4;
+        if self.kind == NodeKind::SymbolicLink { fixed + 2 + self.value.len() } else { fixed }
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
-        writer.u32(self.kind as u32)?;
-        writer.u32(self.attributes.raw())?;
-        writer.u64(self.size)?;
-        writer.u32(0)?;
+        writer.reserve(self.encoded_len());
+        writer.u32(self.kind as u32);
+        writer.u32(self.attributes.raw());
+        writer.u64(self.size);
+        writer.u32(0);
         if self.kind == NodeKind::SymbolicLink {
-            writer.sized_bytes(self.value)?;
+            writer.sized_bytes(self.value);
         }
-        Ok(writer.written())
+        writer.written()
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(NodeKind, NodeAttributes, u64, &[u8])> {
@@ -112,11 +126,17 @@ pub struct Boundary<'a> {
 }
 
 impl Boundary<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：两个 sized 段（各 u16 前缀）。
+    pub fn encoded_len(&self) -> usize {
+        (2 + self.consumed.len()) + (2 + self.remaining.len())
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
-        writer.sized_bytes(self.consumed)?;
-        writer.sized_bytes(self.remaining)?;
-        Ok(writer.written())
+        writer.reserve(self.encoded_len());
+        writer.sized_bytes(self.consumed);
+        writer.sized_bytes(self.remaining);
+        writer.written()
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(&[u8], &[u8])> {
@@ -137,12 +157,20 @@ pub struct LinkBoundary<'a> {
 }
 
 impl LinkBoundary<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：三个 sized 段（各 u16 前缀）。
+    pub fn encoded_len(&self) -> usize {
+        (2 + self.consumed.len())
+            + (2 + self.target.len())
+            + (2 + self.remaining.len())
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
-        writer.sized_bytes(self.consumed)?;
-        writer.sized_bytes(self.target)?;
-        writer.sized_bytes(self.remaining)?;
-        Ok(writer.written())
+        writer.reserve(self.encoded_len());
+        writer.sized_bytes(self.consumed);
+        writer.sized_bytes(self.target);
+        writer.sized_bytes(self.remaining);
+        writer.written()
     }
 
     pub fn decode(bytes: &[u8]) -> DecodeResult<(&[u8], &[u8], &[u8])> {
@@ -163,7 +191,7 @@ mod tests {
     fn request_roundtrip() {
         let mut buffer = [0u8; 64];
         let request = LookupRequest { policy: ResolvePolicy::NoFollowFinal, path: b"a/b/c" };
-        let used = request.encode(&mut buffer).unwrap();
+        let used = request.encode(&mut buffer);
         let (policy, path) = LookupRequest::decode(&buffer[..used]).unwrap();
         assert_eq!(policy, ResolvePolicy::NoFollowFinal);
         assert_eq!(path, b"a/b/c");
@@ -178,7 +206,7 @@ mod tests {
             size: 8192,
             value: &[],
         };
-        let used = info.encode(&mut buffer).unwrap();
+        let used = info.encode(&mut buffer);
         let (kind, attributes, size, value) = NodeInfo::decode(&buffer[..used]).unwrap();
         assert_eq!(kind, NodeKind::Stream);
         assert!(attributes.contains(NodeAttributes::READABLE | NodeAttributes::EXECUTABLE));
@@ -195,7 +223,7 @@ mod tests {
             size: 6,
             value: b"target",
         };
-        let used = info.encode(&mut buffer).unwrap();
+        let used = info.encode(&mut buffer);
         let (kind, _, size, value) = NodeInfo::decode(&buffer[..used]).unwrap();
         assert_eq!(kind, NodeKind::SymbolicLink);
         assert_eq!(size, 6);
@@ -206,11 +234,11 @@ mod tests {
     fn boundary_and_link_boundary_roundtrip() {
         let mut buffer = [0u8; 64];
         let boundary = Boundary { consumed: b"a/b", remaining: b"c/d" };
-        let used = boundary.encode(&mut buffer).unwrap();
+        let used = boundary.encode(&mut buffer);
         assert_eq!(Boundary::decode(&buffer[..used]).unwrap(), (b"a/b".as_slice(), b"c/d".as_slice()));
 
         let link = LinkBoundary { consumed: b"a", target: b"../x", remaining: b"c" };
-        let used = link.encode(&mut buffer).unwrap();
+        let used = link.encode(&mut buffer);
         assert_eq!(
             LinkBoundary::decode(&buffer[..used]).unwrap(),
             (b"a".as_slice(), b"../x".as_slice(), b"c".as_slice())

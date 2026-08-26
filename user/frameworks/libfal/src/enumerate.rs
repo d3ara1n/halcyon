@@ -22,12 +22,17 @@ pub struct EnumerateRequest<'a> {
 }
 
 impl EnumerateRequest<'_> {
+    /// 线长：寻址前奏 + cursor u64 + max_bytes u32 + reserved u32。
+    pub fn encoded_len(&self) -> usize {
+        8 + 2 + self.rel.len() + 8 + 4 + 4
+    }
+
     pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
+        writer.reserve(self.encoded_len());
         writer.u32(ResolvePolicy::FollowAll as u32);
         writer.u32(0);
-        writer.u16(self.rel.len() as u16);
-        writer.bytes(self.rel);
+        writer.sized_bytes(self.rel);
         writer.u64(self.cursor);
         writer.u32(self.max_bytes);
         writer.u32(0);
@@ -57,6 +62,13 @@ pub struct DirectoryEntry<'a> {
     pub name: &'a [u8],
 }
 
+/// Enumerate 应答 body 固定部分：next_cursor u64 + count u32 + reserved u32。
+pub const RESPONSE_FIXED_LEN: usize = 8 + 4 + 4;
+
+/// 单个目录项的线字节数：sized name + kind u32 + reserved u32。
+/// 与提供者的页预算记账共用同一口径。
+pub const ENTRY_OVERHEAD: usize = 2 + 4 + 4;
+
 /// Enumerate 应答 body：next_cursor + 项数 + 目录项序列。
 pub struct EnumerateResponse<'a> {
     /// 0 = 枚举完毕；否则回带续查。
@@ -65,17 +77,25 @@ pub struct EnumerateResponse<'a> {
 }
 
 impl EnumerateResponse<'_> {
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：固定头 + 逐目录项（sized name + kind u32 + reserved u32）。
+    pub fn encoded_len(&self) -> usize {
+        RESPONSE_FIXED_LEN
+            + self.entries.iter().map(|e| ENTRY_OVERHEAD + e.name.len()).sum::<usize>()
+    }
+
+    /// 编码不可失败：页预算（含应答承载折算）由提供者前置保证。
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
+        writer.reserve(self.encoded_len());
         writer.u64(self.next_cursor);
         writer.u32(self.entries.len() as u32);
         writer.u32(0);
         for entry in self.entries {
-            writer.sized_bytes(entry.name)?;
-            writer.u32(entry.kind as u32)?;
-            writer.u32(0)?;
+            writer.sized_bytes(entry.name);
+            writer.u32(entry.kind as u32);
+            writer.u32(0);
         }
-        Ok(writer.written())
+        writer.written()
     }
 }
 
@@ -154,7 +174,7 @@ mod tests {
             DirectoryEntry { kind: NodeKind::Property, name: b"version" },
         ];
         let response = EnumerateResponse { next_cursor: 7, entries: &entries };
-        let used = response.encode(&mut buffer).unwrap();
+        let used = response.encode(&mut buffer);
 
         // 应答头（cursor + 计数）解码，随后逐项解码。
         let (next_cursor, count, entry_bytes) =
@@ -173,11 +193,12 @@ mod tests {
 
     #[test]
     fn truncated_entry_stream_is_rejected() {
-        // 单项（名字 4 字节 + 两个 u32）被截断时整体拒绝。
+        // 单项（名字 4 字节 + kind + 保留区）被截断时整体拒绝。
         let mut buffer = [0u8; 10];
         let mut writer = Writer::new(&mut buffer);
+        writer.reserve(writer.remaining());
         writer.u16(4);
-        assert!(writer.bytes(b"boot").is_ok());
+        writer.bytes(b"boot");
         writer.u32(NodeKind::Directory as u32);
         let used = writer.written();
         // 保留区缺失

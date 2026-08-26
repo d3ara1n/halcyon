@@ -48,12 +48,26 @@ const PUMP_DEADLINE_MS: u64 = 500;
 const REPLY_BODY_MAX: usize =
     erhino_shared::message::PAYLOAD_MAX - librpc::PREFIX_LEN - libfal::FAL_HEADER_LEN;
 
+// 承载交叉校验：最坏属性值应答（状态字 + sized 前缀 + 满尺寸值）必须
+// 装得下——VALUE_MAX 由同一条路径推导，此断言钉住两侧不漂移。
+const _: () = assert!(
+    REPLY_BODY_MAX >= 4 + 2 + libfal::property::VALUE_MAX,
+    "reply budget must carry maximal property value"
+);
+
 /// 解码/编码违约时的 Internal 状态应答。
 fn internal_served(out: &mut [u8]) -> provider::Served {
     let mut writer = libfal::bytes::Writer::new(out);
-    let _ = writer.u32(Status::Internal as u32);
-    let _ = writer.u32(0);
+    writer.reserve(8);
+    writer.u32(Status::Internal as u32);
+    writer.u32(0);
     provider::Served { kind: Kind::Lookup, len: writer.written() }
+}
+
+/// 路径长度协议校验：超长属输入违约，在组包入口显式拒绝——编码层
+/// 对合法输入不可失败。
+fn check_path_len(bytes: &[u8]) -> Result<(), Status> {
+    if bytes.len() > libfal::PATH_MAX { Err(Status::IllegalPath) } else { Ok(()) }
 }
 
 struct Fs {
@@ -87,8 +101,17 @@ impl Fs {
 
     /// 一次经内核 mailbox 的调用-服务往返；返回 FalHeader 之后的应答 body。
     fn call(&mut self, kind: Kind, body: &[u8], anchor: Handle) -> Result<Vec<u8>, Status> {
+        // 消息总长契约在入口显式校验，而非依赖内核报错。
+        if librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN + body.len()
+            > erhino_shared::message::PAYLOAD_MAX
+        {
+            return Err(Status::IllegalArgument);
+        }
         self.txid += 1;
-        let mut payload = [0u8; 512];
+        let mut payload = alloc::vec![
+            0u8;
+            librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN + body.len()
+        ];
         let used = build_request(&mut payload, self.txid, kind, body);
 
         // slot 0：一次性回复授权（携 TRANSIT 以便暂存于消息）；
@@ -174,18 +197,11 @@ impl Fs {
         let mut reply = [0u8; librpc::PREFIX_LEN + REPLY_BODY_MAX];
         librpc::RpcPrefix::new(librpc::RpcMessageKind::Response, served.0)
             .encode(&mut reply);
-        let len = match provider::encode_reply(
+        let len = provider::encode_reply(
             &mut reply[librpc::PREFIX_LEN..],
             served.1.kind,
             &out[..served.1.len],
-        ) {
-            Ok(len) => len,
-            Err(_) => {
-                // 应答超出承载：关回复权，让调用方 Deadline/超时路径收口。
-                let _ = rinlib::ipc::object::close(reply_to);
-                return;
-            }
-        };
+        );
         // 单 outstanding 调用下回复箱至多一条在途，永不触满；失败同样
         // 只关已持有的回复权，不 panic。
         if send(reply_to, PROTOCOL_ID, &reply[..librpc::PREFIX_LEN + len], &[]).is_err() {
@@ -206,11 +222,12 @@ impl Fs {
 }
 
 fn build_request(out: &mut [u8], txid: u64, kind: Kind, body: &[u8]) -> usize {
+    let start = librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN;
+    assert!(out.len() >= start + body.len(), "request buffer under-sized");
     let prefix = librpc::RpcPrefix::new(librpc::RpcMessageKind::Request, txid);
     prefix.encode(out);
     let header = FalHeader::new(kind, (libfal::FAL_HEADER_LEN + body.len()) as u32);
     header.encode(&mut out[librpc::PREFIX_LEN..]);
-    let start = librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN;
     out[start..start + body.len()].copy_from_slice(body);
     start + body.len()
 }
@@ -240,10 +257,11 @@ impl WalkTransport for Fs {
         policy: ResolvePolicy,
         path: &str,
     ) -> Result<LookupOutcome, Status> {
-        let mut body = [0u8; 128];
-        let used = LookupRequest { policy, path: path.as_bytes() }
-            .encode(&mut body)
-            .map_err(|_| Status::IllegalPath)?;
+        let check = check_path_len(path.as_bytes());
+        check?;
+        let request = LookupRequest { policy, path: path.as_bytes() };
+        let mut body = alloc::vec![0u8; request.encoded_len()];
+        let used = request.encode(&mut body);
         let reply = self.call(Kind::Lookup, &body[..used], dir)?;
         let rest = expect_ok(&reply)?;
         if rest.len() < 4 {
@@ -281,34 +299,29 @@ impl WalkTransport for Fs {
 impl Fs {
     fn create(&mut self, position: &Position, name: &str, kind: NodeKind, attributes: NodeAttributes) -> Result<(), Status> {
         let rel = join_rel(&position.rel, name);
-        let body = {
-            let mut buffer = [0u8; 128];
-            let used = op::CreateRequest {
-                address: op::OpAddress { policy: FollowAll, rel: rel.as_bytes() },
-                kind,
-                attributes,
-            }
-            .encode(&mut buffer)
-            .map_err(|_| Status::IllegalPath)?;
-            buffer[..used].to_vec()
+        check_path_len(rel.as_bytes())?;
+        let request = op::CreateRequest {
+            address: op::OpAddress { policy: FollowAll, rel: rel.as_bytes() },
+            kind,
+            attributes,
         };
-        let reply = self.call(Kind::Create, &body, position.anchor)?;
+        let mut buffer = alloc::vec![0u8; request.encoded_len()];
+        let used = request.encode(&mut buffer);
+        let reply = self.call(Kind::Create, &buffer[..used], position.anchor)?;
         expect_ok(&reply).map(|_| ())
     }
 
     fn link(&mut self, position: &Position, name: &str, target: &str) -> Result<(), Status> {
         let rel = join_rel(&position.rel, name);
-        let body = {
-            let mut buffer = [0u8; 128];
-            let used = op::LinkRequest {
-                address: op::OpAddress { policy: FollowAll, rel: rel.as_bytes() },
-                target: target.as_bytes(),
-            }
-            .encode(&mut buffer)
-            .map_err(|_| Status::IllegalPath)?;
-            buffer[..used].to_vec()
+        check_path_len(rel.as_bytes())?;
+        check_path_len(target.as_bytes())?;
+        let request = op::LinkRequest {
+            address: op::OpAddress { policy: FollowAll, rel: rel.as_bytes() },
+            target: target.as_bytes(),
         };
-        let reply = self.call(Kind::Link, &body, position.anchor)?;
+        let mut buffer = alloc::vec![0u8; request.encoded_len()];
+        let used = request.encode(&mut buffer);
+        let reply = self.call(Kind::Link, &buffer[..used], position.anchor)?;
         expect_ok(&reply).map(|_| ())
     }
 
@@ -319,17 +332,15 @@ impl Fs {
         let mut entries = Vec::new();
         let mut cursor = 0u64;
         loop {
-            let body = {
-                let mut buffer = [0u8; 128];
-                let request = enumerate::EnumerateRequest {
-                    rel: position.rel.as_bytes(),
-                    cursor,
-                    max_bytes: 256,
-                };
-                let used = request.encode(&mut buffer);
-                buffer[..used].to_vec()
+            check_path_len(position.rel.as_bytes())?;
+            let request = enumerate::EnumerateRequest {
+                rel: position.rel.as_bytes(),
+                cursor,
+                max_bytes: 256,
             };
-            let reply = self.call(Kind::Enumerate, &body, position.anchor)?;
+            let mut buffer = alloc::vec![0u8; request.encoded_len()];
+            let used = request.encode(&mut buffer);
+            let reply = self.call(Kind::Enumerate, &buffer[..used], position.anchor)?;
             let rest = expect_ok(&reply)?;
             let (next, count, entry_bytes) =
                 enumerate::decode_response_header(rest).map_err(|_| Status::Internal)?;
@@ -350,34 +361,23 @@ impl Fs {
     }
 
     fn write(&mut self, position: &Position, value: &[u8]) -> Result<(), Status> {
-        let body = {
-            let mut buffer = [0u8; 256];
-            let mut writer = libfal::bytes::Writer::new(&mut buffer);
-            writer.u32(FollowAll as u32).map_err(|_| Status::IllegalArgument)?;
-            writer.u32(0).map_err(|_| Status::IllegalArgument)?;
-            writer
-                .u16(position.rel.len() as u16)
-                .map_err(|_| Status::IllegalArgument)?;
-            writer
-                .bytes(position.rel.as_bytes())
-                .map_err(|_| Status::IllegalArgument)?;
-            writer.sized_bytes(value).map_err(|_| Status::IllegalArgument)?;
-            let used = writer.written();
-            buffer[..used].to_vec()
+        check_path_len(position.rel.as_bytes())?;
+        let request = op::WriteRequest {
+            address: op::OpAddress { policy: FollowAll, rel: position.rel.as_bytes() },
+            value,
         };
-        let reply = self.call(Kind::Write, &body, position.anchor)?;
+        let mut buffer = alloc::vec![0u8; request.encoded_len()];
+        let used = request.encode(&mut buffer);
+        let reply = self.call(Kind::Write, &buffer[..used], position.anchor)?;
         expect_ok(&reply).map(|_| ())
     }
 
     fn read(&mut self, position: &Position) -> Result<Vec<u8>, Status> {
-        let body = {
-            let mut buffer = [0u8; 64];
-            let used = op::OpAddress { policy: FollowAll, rel: position.rel.as_bytes() }
-                .encode(&mut buffer)
-                .map_err(|_| Status::IllegalPath)?;
-            buffer[..used].to_vec()
-        };
-        let reply = self.call(Kind::Read, &body, position.anchor)?;
+        check_path_len(position.rel.as_bytes())?;
+        let address = op::OpAddress { policy: FollowAll, rel: position.rel.as_bytes() };
+        let mut buffer = alloc::vec![0u8; address.encoded_len()];
+        let used = address.encode(&mut buffer);
+        let reply = self.call(Kind::Read, &buffer[..used], position.anchor)?;
         let rest = expect_ok(&reply)?;
         let mut reader = libfal::bytes::Reader::new(rest);
         let value = reader.sized_bytes().map_err(|_| Status::Internal)?;
@@ -385,21 +385,18 @@ impl Fs {
     }
 
     fn read_at(&mut self, position: &Position, offset: u64, len: u32) -> Result<Vec<u8>, Status> {
-        let body = {
-            let mut buffer = [0u8; 96];
-            let used = io::ReadAtRequest {
-                address: op::OpAddress {
-                    policy: FollowAll,
-                    rel: position.rel.as_bytes(),
-                },
-                offset,
-                len,
-            }
-            .encode(&mut buffer)
-            .map_err(|_| Status::IllegalPath)?;
-            buffer[..used].to_vec()
+        check_path_len(position.rel.as_bytes())?;
+        let request = io::ReadAtRequest {
+            address: op::OpAddress {
+                policy: FollowAll,
+                rel: position.rel.as_bytes(),
+            },
+            offset,
+            len,
         };
-        let reply = self.call(Kind::ReadAt, &body, position.anchor)?;
+        let mut buffer = alloc::vec![0u8; request.encoded_len()];
+        let used = request.encode(&mut buffer);
+        let reply = self.call(Kind::ReadAt, &buffer[..used], position.anchor)?;
         let rest = expect_ok(&reply)?;
         let mut reader = libfal::bytes::Reader::new(rest);
         let bytes = reader.sized_bytes().map_err(|_| Status::Internal)?;
@@ -407,21 +404,18 @@ impl Fs {
     }
 
     fn write_at(&mut self, position: &Position, offset: u64, bytes: &[u8]) -> Result<u32, Status> {
-        let body = {
-            let mut buffer = [0u8; 192];
-            let used = io::WriteAtRequest {
-                address: op::OpAddress {
-                    policy: FollowAll,
-                    rel: position.rel.as_bytes(),
-                },
-                offset,
-                bytes,
-            }
-            .encode(&mut buffer)
-            .map_err(|_| Status::IllegalPath)?;
-            buffer[..used].to_vec()
+        check_path_len(position.rel.as_bytes())?;
+        let request = io::WriteAtRequest {
+            address: op::OpAddress {
+                policy: FollowAll,
+                rel: position.rel.as_bytes(),
+            },
+            offset,
+            bytes,
         };
-        let reply = self.call(Kind::WriteAt, &body, position.anchor)?;
+        let mut buffer = alloc::vec![0u8; request.encoded_len()];
+        let used = request.encode(&mut buffer);
+        let reply = self.call(Kind::WriteAt, &buffer[..used], position.anchor)?;
         let rest = expect_ok(&reply)?;
         if rest.len() < 4 {
             return Err(Status::Internal);
@@ -467,8 +461,7 @@ fn main() {
     let encoded = {
         let mut buffer = [0u8; 64];
         let used = property::PropertyValue::Array { element: property::ValueType::Integer, items: &items }
-            .encode(&mut buffer)
-            .expect("property encode failed");
+            .encode(&mut buffer);
         buffer[..used].to_vec()
     };
     fs.write(&world, &encoded).expect("property write failed");

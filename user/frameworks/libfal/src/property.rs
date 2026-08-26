@@ -7,9 +7,10 @@
 
 use crate::bytes::{DecodeError, DecodeResult, Reader, Writer};
 
-/// 属性值尺寸上限：FAL 版本常量，不超过消息 payload 上限；
-/// 更大的内容属于流。
-pub const VALUE_MAX: usize = 4096;
+/// 属性值尺寸上限：FAL 版本常量，由最坏应答路径推导——消息 payload
+/// 上限（4096）扣除 RpcPrefix、FalHeader、状态字与 sized 前缀后恰好
+/// 容纳；更大的内容属于流。
+pub const VALUE_MAX: usize = 4058;
 
 /// 语义类型标签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,47 +98,61 @@ pub enum DecodedValue<'a> {
 }
 
 impl PropertyValue<'_> {
-    /// 编码进 `out`，返回写入字节数；超限返回 [`DecodeError`]。
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<usize> {
+    /// 线长：tag u32 + 类型相关字段。
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Self::Integer(_) | Self::Decimal(_) => 4 + 4 + 8,
+            Self::Str(value) | Self::Blob(value) => 4 + 4 + 2 + value.len(),
+            Self::Handle { .. } => 4 + 4 + 4,
+            Self::Array { items, .. } => {
+                16 + items.iter().map(|item| 2 + item.0.len()).sum::<usize>()
+            }
+        }
+    }
+
+    /// 编码进 `out`，返回写入字节数；容量不足即调用方契约违反
+    /// （应先按 `encoded_len()` 分配），以 panic 报告编程错误。
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let mut writer = Writer::new(out);
+        writer.reserve(self.encoded_len());
         match self {
             Self::Integer(value) => {
-                writer.u32(ValueType::Integer as u32)?;
-                writer.u32(0)?;
-                writer.u64(*value as u64)?;
+                writer.u32(ValueType::Integer as u32);
+                writer.u32(0);
+                writer.u64(*value as u64);
             }
             Self::Decimal(value) => {
-                writer.u32(ValueType::Decimal as u32)?;
-                writer.u32(0)?;
-                writer.u64(value.to_bits())?;
+                writer.u32(ValueType::Decimal as u32);
+                writer.u32(0);
+                writer.u64(value.to_bits());
             }
             Self::Str(value) => {
-                writer.u32(ValueType::String as u32)?;
-                writer.u32(0)?;
-                writer.sized_bytes(value)?;
+                writer.u32(ValueType::String as u32);
+                writer.u32(0);
+                writer.sized_bytes(value);
             }
             Self::Blob(value) => {
-                writer.u32(ValueType::Blob as u32)?;
-                writer.u32(0)?;
-                writer.sized_bytes(value)?;
+                writer.u32(ValueType::Blob as u32);
+                writer.u32(0);
+                writer.sized_bytes(value);
             }
             Self::Handle { kind, slot } => {
-                writer.u32(ValueType::HandleRef as u32)?;
-                writer.u32(*kind as u32)?;
-                writer.u16(*slot)?;
-                writer.u16(0)?;
+                writer.u32(ValueType::HandleRef as u32);
+                writer.u32(*kind as u32);
+                writer.u16(*slot);
+                writer.u16(0);
             }
             Self::Array { element, items } => {
-                writer.u32(ValueType::Array as u32)?;
-                writer.u32(*element as u32)?;
-                writer.u32(items.len() as u32)?;
-                writer.u32(0)?;
+                writer.u32(ValueType::Array as u32);
+                writer.u32(*element as u32);
+                writer.u32(items.len() as u32);
+                writer.u32(0);
                 for item in items.iter() {
-                    writer.sized_bytes(item.0)?;
+                    writer.sized_bytes(item.0);
                 }
             }
         }
-        Ok(writer.written())
+        writer.written()
     }
 }
 
@@ -223,7 +238,7 @@ mod tests {
             (PropertyValue::Str(b"hello"), DecodedValue::Str(b"hello")),
             (PropertyValue::Blob(&[1, 2, 3]), DecodedValue::Blob(&[1, 2, 3])),
         ] {
-            let used = encoded.encode(&mut buffer).unwrap();
+            let used = encoded.encode(&mut buffer);
             assert_eq!(DecodedValue::decode(&buffer[..used]).unwrap(), decoded);
         }
     }
@@ -232,7 +247,7 @@ mod tests {
     fn handle_ref_roundtrip_and_slot_guard() {
         let mut buffer = [0u8; 16];
         let value = PropertyValue::Handle { kind: HandleKindTag::MailboxSender, slot: 1 };
-        let used = value.encode(&mut buffer).unwrap();
+        let used = value.encode(&mut buffer);
         assert_eq!(
             DecodedValue::decode(&buffer[..used]).unwrap(),
             DecodedValue::Handle { kind: HandleKindTag::MailboxSender, slot: 1 }
@@ -255,7 +270,7 @@ mod tests {
         let second = (-1919810i64).to_le_bytes();
         let items = [EncodedItem(&first), EncodedItem(&second)];
         let value = PropertyValue::Array { element: ValueType::Integer, items: &items };
-        let used = value.encode(&mut buffer).unwrap();
+        let used = value.encode(&mut buffer);
         match DecodedValue::decode(&buffer[..used]).unwrap() {
             DecodedValue::Array { element, body } => {
                 assert_eq!(element, ValueType::Integer);

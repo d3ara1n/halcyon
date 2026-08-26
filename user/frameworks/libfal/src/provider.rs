@@ -6,8 +6,8 @@
 //! v1 分发面无出站 Handle（委托与 Handle 属性随相应 kind 接入）。
 
 use alloc::vec::Vec;
-use crate::bytes::{DecodeError, DecodeResult, Reader, Writer};
-use crate::enumerate::EnumerateResponse;
+use crate::bytes::{DecodeError, Writer};
+use crate::enumerate::{EnumerateResponse, RESPONSE_FIXED_LEN};
 use crate::header::{FalHeader, Kind, Status};
 use crate::memfs::{MemFs, MemLookup};
 use crate::op::OpAddress;
@@ -30,21 +30,27 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
         return Err(DecodeError);
     }
     let body = &request[FAL_HEADER_LEN..];
+    // 应答承载预算：状态字之后的剩余空间。变长应答（目录页、流读、
+    // 属性值）在调用提供者之前以它为上限折算——容量决策前置，编码
+    // 层对合法输入不可失败。
+    let carry = out.len().saturating_sub(4);
     let status_only = |out: &mut [u8], status: Status| -> Served {
         let mut writer = Writer::new(out);
-        let _ = writer.u32(status as u32);
-        let _ = writer.u32(0);
+        writer.reserve(8);
+        writer.u32(status as u32);
+        writer.u32(0);
         Served { kind: header.kind, len: writer.written() }
     };
 
     match header.kind {
         Kind::Lookup => {
             let (policy, rel) = crate::lookup::LookupRequest::decode(body)?;
-            let mut writer = Writer::new(out);
             match fs.lookup(policy, rel) {
                 Ok(MemLookup::Found { kind, attributes, size, target }) => {
-                    writer.u32(Status::Ok as u32)?;
-                    writer.u32(0)?;
+                    let mut writer = Writer::new(out);
+                    writer.reserve(8);
+                    writer.u32(Status::Ok as u32);
+                    writer.u32(0);
                     let used = writer.written();
                     let info = crate::lookup::NodeInfo {
                         kind,
@@ -52,19 +58,21 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                         size,
                         value: target.as_deref().map(str::as_bytes).unwrap_or_default(),
                     };
-                    let len = info.encode(&mut out[used..])?;
+                    let len = info.encode(&mut out[used..]);
                     Ok(Served { kind: header.kind, len: used + len })
                 }
                 Ok(MemLookup::Link { parent_rel, target, remaining }) => {
-                    writer.u32(Status::Ok as u32)?;
-                    writer.u32(1)?; // 变体：符号链接边界
+                    let mut writer = Writer::new(out);
+                    writer.reserve(8);
+                    writer.u32(Status::Ok as u32);
+                    writer.u32(1); // 变体：符号链接边界
                     let used = writer.written();
                     let link = crate::lookup::LinkBoundary {
                         consumed: parent_rel.as_bytes(),
                         target: target.as_bytes(),
                         remaining: remaining.as_bytes(),
                     };
-                    let len = link.encode(&mut out[used..])?;
+                    let len = link.encode(&mut out[used..]);
                     Ok(Served { kind: header.kind, len: used + len })
                 }
                 Err(status) => Ok(status_only(out, status)),
@@ -72,10 +80,13 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
         }
         Kind::Enumerate => {
             let (rel, cursor, max_bytes) = crate::enumerate::EnumerateRequest::decode(body)?;
-            let mut writer = Writer::new(out);
-            match fs.enumerate(rel, cursor, max_bytes) {
+            // 页预算以应答剩余空间封顶（固定头扣除后），memfs 在预算内打包。
+            let page_budget = carry.saturating_sub(RESPONSE_FIXED_LEN) as u32;
+            match fs.enumerate(rel, cursor, max_bytes.min(page_budget)) {
                 Ok(page) => {
-                    writer.u32(Status::Ok as u32)?;
+                    let mut writer = Writer::new(out);
+                    writer.reserve(4);
+                    writer.u32(Status::Ok as u32);
                     let entries: Vec<crate::enumerate::DirectoryEntry> = page
                         .entries
                         .iter()
@@ -89,31 +100,30 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                         entries: &entries,
                     };
                     let used = writer.written();
-                    let len = response.encode(&mut out[used..])?;
+                    let len = response.encode(&mut out[used..]);
                     Ok(Served { kind: header.kind, len: used + len })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
         }
         Kind::Read => {
-            let (policy, rel, used_addr) = OpAddress::decode(body)?;
-            let mut writer = Writer::new(out);
+            let (policy, rel, _) = OpAddress::decode(body)?;
             match fs.property_read(policy, rel) {
                 Ok(value) => {
-                    writer.u32(Status::Ok as u32)?;
+                    let mut writer = Writer::new(out);
+                    writer.reserve(4);
+                    writer.u32(Status::Ok as u32);
                     let used = writer.written();
                     let mut inner = Writer::new(&mut out[used..]);
-                    inner.sized_bytes(value)?;
+                    inner.reserve(2 + value.len());
+                    inner.sized_bytes(value);
                     Ok(Served { kind: header.kind, len: used + inner.written() })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
         }
         Kind::Write => {
-            let (policy, rel, used_addr) = OpAddress::decode(body)?;
-            let mut reader = Reader::new(&body[used_addr..]);
-            let value = reader.sized_bytes()?;
-            reader.finish()?;
+            let (policy, rel, value) = crate::op::WriteRequest::decode(body)?;
             match fs.property_write(policy, rel, value) {
                 Ok(()) => Ok(status_only(out, Status::Ok)),
                 Err(status) => Ok(status_only(out, status)),
@@ -142,13 +152,17 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
         }
         Kind::ReadAt => {
             let (policy, rel, offset, len) = crate::io::ReadAtRequest::decode(body)?;
-            let mut writer = Writer::new(out);
-            match fs.read_at(policy, rel, offset, len) {
+            // 短读合法：请求长度以应答剩余空间封顶（sized 前缀扣除后）。
+            let carry = carry.saturating_sub(2).min(u32::MAX as usize) as u32;
+            match fs.read_at(policy, rel, offset, len.min(carry)) {
                 Ok(bytes) => {
-                    writer.u32(Status::Ok as u32)?;
+                    let mut writer = Writer::new(out);
+                    writer.reserve(4);
+                    writer.u32(Status::Ok as u32);
                     let used = writer.written();
                     let mut inner = Writer::new(&mut out[used..]);
-                    inner.sized_bytes(bytes)?;
+                    inner.reserve(2 + bytes.len());
+                    inner.sized_bytes(bytes);
                     Ok(Served { kind: header.kind, len: used + inner.written() })
                 }
                 Err(status) => Ok(status_only(out, status)),
@@ -156,11 +170,12 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
         }
         Kind::WriteAt => {
             let (policy, rel, offset, bytes) = crate::io::WriteAtRequest::decode(body)?;
-            let mut writer = Writer::new(out);
             match fs.write_at(policy, rel, offset, bytes) {
                 Ok(written) => {
-                    writer.u32(Status::Ok as u32)?;
-                    writer.u32(written)?;
+                    let mut writer = Writer::new(out);
+                    writer.reserve(8);
+                    writer.u32(Status::Ok as u32);
+                    writer.u32(written);
                     Ok(Served { kind: header.kind, len: writer.written() })
                 }
                 Err(status) => Ok(status_only(out, status)),
@@ -171,15 +186,17 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
     }
 }
 
-/// 构造完整应答 payload（RpcPrefix 由传输层前置）。
-pub fn encode_reply(out: &mut [u8], kind: Kind, body: &[u8]) -> DecodeResult<usize> {
-    if out.len() < FAL_HEADER_LEN + body.len() {
-        return Err(DecodeError);
-    }
+/// 构造完整应答 payload（RpcPrefix 由传输层前置）；短缓冲即调用方
+/// 契约违反——变长应答已由 serve 入口预算折算，这里只可能是编程错误。
+pub fn encode_reply(out: &mut [u8], kind: Kind, body: &[u8]) -> usize {
+    assert!(
+        out.len() >= FAL_HEADER_LEN + body.len(),
+        "reply buffer under-sized"
+    );
     let header = FalHeader::new(kind, (FAL_HEADER_LEN + body.len()) as u32);
-    header.encode(&mut out[..FAL_HEADER_LEN])?;
+    header.encode(&mut out[..FAL_HEADER_LEN]);
     out[FAL_HEADER_LEN..FAL_HEADER_LEN + body.len()].copy_from_slice(body);
-    Ok(FAL_HEADER_LEN + body.len())
+    FAL_HEADER_LEN + body.len()
 }
 
 #[cfg(test)]
@@ -187,6 +204,7 @@ mod tests {
     use super::*;
     use crate::lookup::ResolvePolicy;
     use alloc::vec::Vec;
+    use crate::bytes::Reader;
     use crate::lookup::LookupRequest;
     use crate::node::{NodeAttributes, NodeKind};
 
@@ -194,14 +212,14 @@ mod tests {
     fn build_request(kind: Kind, body: &[u8]) -> Vec<u8> {
         let mut buffer = vec![0u8; FAL_HEADER_LEN + body.len()];
         let header = FalHeader::new(kind, (FAL_HEADER_LEN + body.len()) as u32);
-        header.encode(&mut buffer).unwrap();
+        header.encode(&mut buffer);
         buffer[FAL_HEADER_LEN..].copy_from_slice(body);
         buffer
     }
 
     fn address(rel: &[u8]) -> Vec<u8> {
         let mut buffer = vec![0u8; 10 + rel.len()];
-        OpAddress { policy: ResolvePolicy::FollowAll, rel }.encode(&mut buffer).unwrap();
+        OpAddress { policy: ResolvePolicy::FollowAll, rel }.encode(&mut buffer);
         buffer
     }
 
@@ -213,12 +231,13 @@ mod tests {
             let mut buffer = vec![0u8; 32];
             let used = {
                 let mut writer = Writer::new(&mut buffer);
-                writer.u32(ResolvePolicy::FollowAll as u32).unwrap();
-                writer.u32(0).unwrap();
-                writer.u16(5).unwrap();
-                assert!(writer.bytes(b"hello").is_ok());
-                writer.u32(NodeKind::Directory as u32).unwrap();
-                writer.u32(NodeAttributes::READABLE.raw() | NodeAttributes::EXECUTABLE.raw()).unwrap();
+                writer.reserve(8 + 2 + 5 + 8);
+                writer.u32(ResolvePolicy::FollowAll as u32);
+                writer.u32(0);
+                writer.u16(5);
+                writer.bytes(b"hello");
+                writer.u32(NodeKind::Directory as u32);
+                writer.u32(NodeAttributes::READABLE.raw() | NodeAttributes::EXECUTABLE.raw());
                 writer.written()
             };
             buffer.truncate(used);
@@ -232,8 +251,7 @@ mod tests {
 
         let mut buffer = vec![0u8; 64];
         let used = LookupRequest { policy: ResolvePolicy::FollowAll, path: b"hello" }
-            .encode(&mut buffer)
-            .unwrap();
+            .encode(&mut buffer);
         let request = build_request(Kind::Lookup, &buffer[..used]);
         let served = serve(&mut fs, &request, &mut out).unwrap();
         assert_eq!(served.kind, Kind::Lookup);
@@ -251,12 +269,13 @@ mod tests {
             let mut buffer = vec![0u8; 64];
             let used = {
                 let mut writer = Writer::new(&mut buffer);
-                writer.u32(ResolvePolicy::FollowAll as u32).unwrap();
-                writer.u32(0).unwrap();
-                writer.u16(3).unwrap();
-                assert!(writer.bytes(b"lnk").is_ok());
-                writer.u16(3).unwrap();
-                assert!(writer.bytes(b"tgt").is_ok());
+                writer.reserve(8 + 2 * (2 + 3));
+                writer.u32(ResolvePolicy::FollowAll as u32);
+                writer.u32(0);
+                writer.u16(3);
+                writer.bytes(b"lnk");
+                writer.u16(3);
+                writer.bytes(b"tgt");
                 writer.written()
             };
             buffer.truncate(used);
@@ -268,8 +287,7 @@ mod tests {
 
         let mut buffer = vec![0u8; 64];
         let used =
-            LookupRequest { policy: ResolvePolicy::FollowAll, path: b"lnk" }.encode(&mut buffer)
-                .unwrap();
+            LookupRequest { policy: ResolvePolicy::FollowAll, path: b"lnk" }.encode(&mut buffer);
         let request = build_request(Kind::Lookup, &buffer[..used]);
         let served = serve(&mut fs, &request, &mut out).unwrap();
         let mut reader = Reader::new(&out[..served.len]);
@@ -286,9 +304,9 @@ mod tests {
 
     #[test]
     fn reply_encoding_roundtrip() {
-        let mut body = [0u8; 8];
+        let body = [0u8; 8];
         let mut out = [0u8; 32];
-        let served_len = encode_reply(&mut out, Kind::Delete, &body).unwrap();
+        let served_len = encode_reply(&mut out, Kind::Delete, &body);
         assert_eq!(served_len, FAL_HEADER_LEN + 8);
         let header = FalHeader::decode(&out[..FAL_HEADER_LEN]).unwrap();
         assert_eq!(header.kind, Kind::Delete);

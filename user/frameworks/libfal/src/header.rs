@@ -1,6 +1,6 @@
 //! FAL header（紧随 RpcPrefix）与协议状态码。
 
-use crate::bytes::{DecodeError, DecodeResult, Reader, Writer};
+use crate::{bytes::{DecodeError, DecodeResult, Reader, Writer}, FAL_HEADER_LEN};
 
 /// 当前 FAL 协议版本。
 pub const FAL_VERSION: u16 = 1;
@@ -126,14 +126,14 @@ impl FalHeader {
         Self { version: FAL_VERSION, kind, total_len }
     }
 
-    /// 编码进 16 字节定宽区（保留区置零）；短缓冲即协议错误。
-    pub fn encode(&self, out: &mut [u8]) -> DecodeResult<()> {
+    /// 编码进 16 字节定宽区（保留区置零）；短缓冲即调用方契约违反。
+    pub fn encode(&self, out: &mut [u8]) {
         let mut writer = Writer::new(out);
-        writer.u16(self.version)?;
-        writer.u16(self.kind as u16)?;
-        writer.u32(self.total_len)?;
-        writer.u64(0)?;
-        Ok(())
+        writer.reserve(FAL_HEADER_LEN);
+        writer.u16(self.version);
+        writer.u16(self.kind as u16);
+        writer.u32(self.total_len);
+        writer.u64(0);
     }
 
     /// 从 16 字节定宽区解码并验证版本与保留区。
