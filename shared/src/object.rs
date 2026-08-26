@@ -202,8 +202,8 @@ impl HandlePair {
     }
 }
 
-/// 内核生成且在本次启动中不复用的进程身份。
-pub type ProcessId = u64;
+/// 内核生成且在本次启动中不复用的进程身份；与 [`crate::proc::Pid`] 同一类型。
+pub type ProcessId = crate::proc::Pid;
 
 const _: () = {
     assert!(core::mem::size_of::<Handle>() == 8);

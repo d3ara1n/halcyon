@@ -42,7 +42,7 @@ pub struct SpawnRequest<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spawned {
-    pub pid: u32,
+    pub pid: u64,
     pub control: Handle,
 }
 

@@ -2,10 +2,9 @@ use crate::object::{Handle, Rights};
 
 /// ExitCode(i64) type for process
 pub type ExitCode = i64;
-/// Pid(u32) type for process
-pub type Pid = u32;
+/// Pid(u64) type for process；单调不复用，宽度与 ProcessId 一致。
+pub type Pid = u64;
 /// Tid(u32) type for thread
-/// If uniform thread-id required, It is uni_tid = ((pid << 32) | tid)
 pub type Tid = u32;
 
 /// 当前用户地址空间 ABI；process loader 与内核共同遵守。
@@ -64,7 +63,7 @@ pub enum ExecutionProfile {
 pub struct ProcessCreateResult {
     pub builder: Handle,
     pub pid: Pid,
-    pub reserved: u32,
+    pub reserved: u64,
 }
 
 /// ProcessStart 直接 grant 项；目标 rights 只能收窄。
@@ -92,7 +91,7 @@ pub struct ProcessStartDescriptor {
 
 const _: () = {
     assert!(core::mem::size_of::<ProcessMapFlags>() == 4);
-    assert!(core::mem::size_of::<ProcessCreateResult>() == 16);
+    assert!(core::mem::size_of::<ProcessCreateResult>() == 24);
     assert!(core::mem::size_of::<HandleGrant>() == 16);
     assert!(core::mem::size_of::<ProcessStartDescriptor>() == 56);
 };

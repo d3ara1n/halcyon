@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use erhino_shared::{
     object::Handle,
@@ -10,8 +10,8 @@ use erhino_shared::{
 /// 块为只读映射的不可变快照，写入后仅读。
 static BLOCK: AtomicUsize = AtomicUsize::new(0);
 /// 0 = 未初始化（启动契约：lang_start 在任何用户代码前写入）。
-static PID: AtomicU32 = AtomicU32::new(0);
-static PARENT_PID: AtomicU32 = AtomicU32::new(0);
+static PID: AtomicU64 = AtomicU64::new(0);
+static PARENT_PID: AtomicU64 = AtomicU64::new(0);
 
 /// 解析并校验内核定义的 StartupBlock 外层。payload 内容完全不解释；
 /// launcher 与当前进程自行约定其格式。
@@ -53,7 +53,7 @@ pub fn parent_pid() -> Pid {
 pub fn startup_handles() -> &'static [Handle] {
     let (base, header) = block_and_header();
     // SAFETY: init 已验证 Handle 区位于完整块内；块基页对齐且 header 为
-    // 40 字节，数组起点保持 Handle 所需的 8 字节对齐。
+    // 48 字节，数组起点保持 Handle 所需的 8 字节对齐。
     unsafe {
         core::slice::from_raw_parts(
             base.byte_add(core::mem::size_of::<StartupBlockHeader>())

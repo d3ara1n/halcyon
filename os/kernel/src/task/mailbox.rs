@@ -479,7 +479,7 @@ pub fn send(
             return Err(SystemCallError::WrongObjectType);
         }
         let message_header = MessageHeader::new(
-            thread.process.pid as u64,
+            thread.process.pid,
             badge,
             header.kind,
             header.payload_len,

@@ -25,6 +25,7 @@ pub struct StartupBlockHeader {
     pub block_len: u32,
     pub version: u16,
     pub reserved0: u16,
+    /// 仅表示 provenance，不能推导管理、继承或回收权。
     pub pid: Pid,
     /// 仅表示创建关系，不能推导管理、继承或回收权。
     pub parent_pid: Pid,
@@ -36,7 +37,7 @@ pub struct StartupBlockHeader {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<StartupBlockHeader>() == 40);
+    assert!(core::mem::size_of::<StartupBlockHeader>() == 48);
     assert!(core::mem::align_of::<StartupBlockHeader>() == 8);
 };
 
@@ -221,7 +222,7 @@ mod tests {
         assert_eq!(header.version, STARTUP_VERSION);
         assert_eq!((header.pid, header.parent_pid), (11, 4));
         assert_eq!(header.handle_count, 2);
-        assert_eq!(header.payload_off as usize, 40 + 2 * core::mem::size_of::<Handle>());
+        assert_eq!(header.payload_off as usize, core::mem::size_of::<StartupBlockHeader>() + 2 * core::mem::size_of::<Handle>());
         assert_eq!(header.payload_len as usize, payload.len());
         assert_eq!(header.block_len as usize, block.len());
         assert_eq!(header.reserved0, 0);
