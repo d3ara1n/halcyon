@@ -23,7 +23,7 @@
 - StartupBlock v2 与 BootPackage 启动链已落地：outer 为 Header + 实际 child Handle 数组 + 可零 padding + opaque payload；内核只解析 fixed envelope 与唯一 init ELF，以 borrowed 只读页把 payload 交给 init。实现现状见 `notes/impls/startup.md`。
 - 对照负载：`user/systems/` 与 `user/drivers/` 四服务。fs 经用户态 FAL 真路径完成创建/枚举/属性/符号链接/偏移读写，验收线已过（`bf32c1c`）；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
 - 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、Building-only Map/Write、事务化 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy。D64、ProcessKill/JobKill、exit-status 查询等待调度域 eligibility 与完整进程终止屏障后接线；initfs manifest/archive 另案设计。方向见 `notes/ideas/bootstrap.md`，实现见 `notes/impls/startup.md`。
-- 下一自然序：完整进程生命周期与用户态多线程屏障（[`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md)）→ FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构；initfs 内部协议在需要正式服务编排时单独设计。
+- 下一自然序：先执行 BootPackage / launcher 统一审查（[`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md)），确认基座可承接后再进入完整进程生命周期与用户态多线程屏障（[`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md)）→ FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构；initfs 内部协议在需要正式服务编排时单独设计。
 
 ## 戒律
 
