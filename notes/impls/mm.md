@@ -28,13 +28,13 @@ pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
 
 ### 操作与契约
 
-- `add_region(start, end)`：注册启动期空闲区间（DTB memory 剔除内核镜像/栈/initfs 后），地址序入链。
+- `add_region(start, end)`：注册启动期空闲区间（DTB memory 剔除内核镜像/栈/实际 BootPackage 后），地址序入链。
 - `alloc_contiguous(count)`：first-fit 取首个足够区间，**从尾端切**——低地址区间先消耗，大区间主体保持完整；整取时重链，否则节点原地减 len；返回前整块清零（安全 + 上层拿来即用）。
 - `alloc_at(base, count)`：取指定区间（启动协议三件套、页表解映射回投）；区间内三向切割，左右残段各自成节点；不可用（未注册/已分配）返回 `Err`。
 - `dealloc(base, count)`：按地址序插入 + 相邻三向合并。debug 断言拒绝与现有空闲区间重叠（双重释放检测）。
 - 复杂度：分配/释放 O(空闲区间数)，教学规模无压力；分桶/命中提示等优化留待需要时在范式内逐点做。
 
-- 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）、initfs 所在段（loader 加载的 tar 区）。**（已知简化）**占用剔除目前是启动期固定两洞 + bootstrap `free_range` 回投两条路径；接入新占用方（保留设备区/新平台保留段）时，应收敛为排序合并、重叠校验的 Boot Reservations 集合，让非法重叠在注册期即被拒绝。
+- 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）与 BootPackage envelope 声明的实际 `total_len`。DTS capacity 只用于 loader/validator 边界，不会整段退出帧池；窗口必须完整落在某个 DT memory region 内。**（已知简化）**占用剔除目前是启动期固定两洞 + bootstrap `free_range` 回投两条路径；接入新占用方时，应收敛为排序合并、重叠校验的 Boot Reservations 集合。
 - `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账（M3）。
 - 内核堆由帧池供血：talc 内存源（FrameSource）耗尽时取 1MiB 连续帧块 claim 建新区，帧块所有权终身归堆（acquire 内不可碰堆与锁，无归还记账）；启动路径（DTB 解析/帧池注册）零堆依赖，引导序线性：帧池 → 堆首分配 → 一切堆消费者。
 
@@ -80,11 +80,11 @@ pub trait FrameMemory {
 
 - 冲突策略：目标位置已有有效映射时，**同 flags 幂等成功，异 flags 返回 `MapConflict`**——禁止静默改权限（旧 `ensure_managed_leaf_created` 的教训）。
 - 大页分裂：在已映射 2MiB 区间内需要 4KiB 粒度时，`split` 分配叶表、512 项继承原 flags 展开。level 0 禁止 non-leaf，debug_assert。
-- `unmap` 走同一套切段逻辑，对称解除；空中间表归还帧。
+- `unmap` 走同一套切段逻辑，对称解除；递归显式携带当前子表的实际覆盖基址，跨 512 页边界不会复用初始请求基址。mega 部分解除必须先成功分裂，表帧耗尽会返回 `FrameExhausted` 并保持原映射；空中间表当前保留到整棵 AddressSpace Drop。
 
 ### 测试集（host）
 
-切段算法数值用例：未对齐跨表大区间（mm-map-bug 原案 `vpn=65, count=8192`）、整表对齐、大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、clear_slots 剥离不递归。
+切段算法数值用例：未对齐跨表大区间（mm-map-bug 原案 `vpn=65, count=8192`）、跨子表批量 unmap、整表/大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、split OOM 保持原映射、clear_slots 剥离不递归。
 
 ## 内核地址空间与启动协议
 
@@ -133,6 +133,9 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 - 低半区 `[0, 2^38)` 完全归用户，进程页表 root 创建时拷贝内核高半区顶层项（含栈窗口槽）；
 - 当前布局为 ELF/StartupBlock/堆/主线程栈，具体区间见 [`task.md`](task.md)；
+- owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的 FrameTracker 持有；任何 PTE 安装前先 `try_reserve` 记账容量，批量安装逐页进行，失败按逆序 unmap 后才释放 backing；
+- bootstrap StartupBlock prefix 是 owned 页，opaque payload 是 BootPackage reservation 持有的 borrowed backing；initial ELF 复制完成后 package prefix 回投帧池，地址空间销毁只清 payload PTE；
+- ProcessMap 只服务 Building process，创建 anonymous zero pages并使用最终权限，拒绝 W+X；ProcessWrite 经物理直映射写 backing，Running 发布后不再存在该写入口；
 - Tunnel 映射由 Endpoint lease 记入 `AddressSpace.external_mappings`，关闭时解除。
 
 ## 异构 hart 与 rv32（纪律）

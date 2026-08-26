@@ -15,15 +15,6 @@ space 锁之间 `HandleClose` tunnel endpoint（经 `unmap_external` 解除映�
 改为锁内复检 + 优雅错误或进程终止路径，并同步修正 `uaccess.rs` 头注释
 「同进程无并发映射变更者」的前提表述。
 
-## page_table unmap_range 跨表批量解除算错子表基址
-
-`os/page_table/src/lib.rs` `unmap_range` 对每个递归子表都用初始
-`vpn_start` 推导 `table_base`，未传入该表实际覆盖的 VA 基址——跨
-512 页边界的批量解除会解除错误的 PTE 区间并遗留残留映射，随后归还
-数据帧即形成 UAF。当前唯一调用方 `extend_heap` 回滚逐页调用单页
-unmap，不触发该路径；属潜伏缺陷，接入批量 unmap 前必须修复并补
-跨表测试。
-
 trap/上下文、hart 身份、能力调度与启动发布的已知契约缺口记录在
 `plans/reviews/system-audit/01-sbi.md`、`02-trap-context.md`，统一设计见
 `notes/impls/execution-context.md`。在取得直接证据前不得添加平台专用补丁。

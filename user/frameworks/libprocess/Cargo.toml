@@ -1,0 +1,9 @@
+[package]
+name = "libprocess"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared" }
+rinlib = { path = "../../rinlib" }
+elf = { path = "../../../os/elf" }

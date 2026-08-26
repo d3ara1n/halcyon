@@ -15,8 +15,8 @@ pub const STARTUP_VERSION: u16 = 2;
 /// 块基魔数（"STARTUPB"）。
 pub const STARTUP_BLOCK_MAGIC: u64 = u64::from_le_bytes(*b"STARTUPB");
 
-/// 启动块头。其后紧跟 `handle_count` 个实际 child-local Handle，再后是
-/// `[payload_off, payload_off + payload_len)` 的不透明 payload。
+/// 启动块头。其后紧跟 `handle_count` 个实际 child-local Handle；允许以
+/// 零字节填充到 payload_off，再放置不透明 payload。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct StartupBlockHeader {
@@ -29,7 +29,7 @@ pub struct StartupBlockHeader {
     /// 仅表示创建关系，不能推导管理、继承或回收权。
     pub parent_pid: Pid,
     pub handle_count: u32,
-    /// payload 相对块基的规范偏移。
+    /// payload 相对块基的偏移；不得早于 Handle 数组末尾。
     pub payload_off: u32,
     pub payload_len: u32,
     pub reserved: u32,
@@ -58,7 +58,8 @@ pub enum StartupParseError {
     UnsupportedVersion,
     NonzeroReserved,
     GeometryOverflow,
-    NoncanonicalPayloadOffset,
+    PayloadBeforeHandles,
+    NonzeroPadding,
     InvalidHandle,
 }
 
@@ -84,17 +85,21 @@ pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, Startu
     let handle_bytes = (header.handle_count as usize)
         .checked_mul(core::mem::size_of::<Handle>())
         .ok_or(StartupParseError::GeometryOverflow)?;
-    let payload_off = core::mem::size_of::<StartupBlockHeader>()
+    let handles_end = core::mem::size_of::<StartupBlockHeader>()
         .checked_add(handle_bytes)
         .ok_or(StartupParseError::GeometryOverflow)?;
-    if header.payload_off as usize != payload_off {
-        return Err(StartupParseError::NoncanonicalPayloadOffset);
+    let payload_off = header.payload_off as usize;
+    if payload_off < handles_end {
+        return Err(StartupParseError::PayloadBeforeHandles);
     }
     let payload_end = payload_off
         .checked_add(header.payload_len as usize)
         .ok_or(StartupParseError::GeometryOverflow)?;
     if payload_end != block.len() {
         return Err(StartupParseError::LengthMismatch);
+    }
+    if block[handles_end..payload_off].iter().any(|byte| *byte != 0) {
+        return Err(StartupParseError::NonzeroPadding);
     }
     for index in 0..header.handle_count as usize {
         let offset = core::mem::size_of::<StartupBlockHeader>()
@@ -110,10 +115,9 @@ pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, Startu
     Ok(header)
 }
 
-/// 以实际 child-local Handle 构造完整启动块。
+/// 以实际 child-local Handle 构造完整、紧凑的启动块。
 ///
-/// 输出布局固定为 `[header][Handle × N][opaque payload]`。Handle 数值由
-/// child HandleTable 的 reservation 提供，不能由数组下标重新推导。
+/// Handle 数值由 child HandleTable reservation 提供，不能由数组下标推导。
 pub fn build_startup_block(
     pid: Pid,
     parent_pid: Pid,
@@ -127,8 +131,35 @@ pub fn build_startup_block(
     let payload_off = core::mem::size_of::<StartupBlockHeader>()
         .checked_add(handle_bytes)
         .ok_or(StartupBuildError::Overflow)?;
+    let mut block = build_startup_prefix(pid, parent_pid, handles, payload_off, payload.len())?;
+    block
+        .try_reserve_exact(payload.len())
+        .map_err(|_| StartupBuildError::AllocationFailed)?;
+    block.extend_from_slice(payload);
+    Ok(block)
+}
+
+/// 构造 `[header][Handles][zero padding]` prefix，payload 由调用方以其他
+/// backing 紧接在 `payload_off` 映射。返回 Vec 长度恒为 payload_off。
+pub fn build_startup_prefix(
+    pid: Pid,
+    parent_pid: Pid,
+    handles: &[Handle],
+    payload_off: usize,
+    payload_len: usize,
+) -> Result<Vec<u8>, StartupBuildError> {
+    let handle_bytes = handles
+        .len()
+        .checked_mul(core::mem::size_of::<Handle>())
+        .ok_or(StartupBuildError::Overflow)?;
+    let handles_end = core::mem::size_of::<StartupBlockHeader>()
+        .checked_add(handle_bytes)
+        .ok_or(StartupBuildError::Overflow)?;
+    if payload_off < handles_end {
+        return Err(StartupBuildError::Overflow);
+    }
     let total = payload_off
-        .checked_add(payload.len())
+        .checked_add(payload_len)
         .ok_or(StartupBuildError::Overflow)?;
     let header = StartupBlockHeader {
         magic: STARTUP_BLOCK_MAGIC,
@@ -139,18 +170,18 @@ pub fn build_startup_block(
         parent_pid,
         handle_count: u32::try_from(handles.len()).map_err(|_| StartupBuildError::Overflow)?,
         payload_off: u32::try_from(payload_off).map_err(|_| StartupBuildError::Overflow)?,
-        payload_len: u32::try_from(payload.len()).map_err(|_| StartupBuildError::Overflow)?,
+        payload_len: u32::try_from(payload_len).map_err(|_| StartupBuildError::Overflow)?,
         reserved: 0,
     };
 
-    let mut block = Vec::new();
-    block
-        .try_reserve_exact(total)
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve_exact(payload_off)
         .map_err(|_| StartupBuildError::AllocationFailed)?;
-    append_value(&mut block, &header);
-    append_values(&mut block, handles);
-    block.extend_from_slice(payload);
-    Ok(block)
+    append_value(&mut prefix, &header);
+    append_values(&mut prefix, handles);
+    prefix.resize(payload_off, 0);
+    Ok(prefix)
 }
 
 fn append_value<T: Copy>(output: &mut Vec<u8>, value: &T) {
@@ -222,6 +253,24 @@ mod tests {
     }
 
     #[test]
+    fn padded_prefix_can_back_an_external_payload() {
+        let handles = [Handle::from_parts(3, 7)];
+        let mut block = build_startup_prefix(2, 1, &handles, 4096, 7)
+            .expect("page-aligned prefix must assemble");
+        assert_eq!(block.len(), 4096);
+        block.extend_from_slice(b"payload");
+        let header = validate_startup_block(&block).expect("padded block must validate");
+        assert_eq!(header.payload_off, 4096);
+        assert_eq!(&block[4096..], b"payload");
+
+        block[128] = 1;
+        assert_eq!(
+            validate_startup_block(&block),
+            Err(StartupParseError::NonzeroPadding)
+        );
+    }
+
+    #[test]
     fn validator_rejects_outer_geometry_corruption() {
         assert_eq!(
             validate_startup_block(&[0; 8]),
@@ -242,7 +291,7 @@ mod tests {
         corrupted[payload_off..payload_off + 4].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(
             validate_startup_block(&corrupted),
-            Err(StartupParseError::NoncanonicalPayloadOffset)
+            Err(StartupParseError::PayloadBeforeHandles)
         );
 
         let mut corrupted = valid.clone();

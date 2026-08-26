@@ -35,6 +35,8 @@
 
 时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取全局期限表最早项与量子截止的较近者设置本 hart timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
+ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。当前没有代码代次与 active-hart 集合，因此调度循环在每次新 dispatch 前执行本 hart `fence.i`；首次执行和迁移都不会观察帧复用前的旧指令缓存。Running process 没有 Building 写入口，Resume 热路径无需重复同步。
+
 ### 单一归属不变量
 
 任意线程任意时刻恰处于一个归属：
@@ -55,10 +57,18 @@
 - **发布时序**：「可被唤醒」严格晚于「离开一切 hart 引用」——dispatcher 只把等待意图写入 HartLocal 私有槽，调度循环在 `clear_context` 之后的 Park 分支才向全局等待结构发布。完成方永远见不到仍在本 hart 执行的线程，双容器竞态在结构上不可能。
 - **代数仲裁**：每次阻塞创建独立 `WaitContext/WaitCore`，状态为 `Installing → Armed → Finishing → Done`。对象命中、deadline 与取消候选通过同一个 outcome 竞争；唯一赢家取得线程所有权并负责跨对象清理。期限表强持同一 WaitContext，过期扫描只 offer Deadline，不存在每线程 `wait_gen` 平行机制。
 
+## Job、Building process 与发布
+
+root Job 由 `boot.rs` 铸造，完整 JobControl 作为 init 的启动 Handle。JobCreate 派生层级；ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable 与 affine ProcessBuilder。Building process 不进入进程表和调度器，关闭 builder 直接释放半成品。
+
+ProcessStart 在提交前预构造主线程，并分别在进程表与公平类队列放入 reservation marker；marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/output 全部准备成功后，提交只替换预留项，不分配。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。完整事务见 [`startup.md`](startup.md)。
+
+当前 ProcessControl 随 Running process 绑定，进程回收后保留轻量 CLOSED/exit-code 壳供 WaitMany 观察；关闭 control 不终止进程。显式 kill 与状态查询尚未接入。D64 profile 在 capability-derived 调度域接线前明确拒绝，避免线程落到不兼容 hart。
+
 ## 生命周期
 
-- **创建**：initfs 装载（ELF 解析 → LOAD 段映射 → TrapFrame 初始化 → 入队）。ELF/tar 解析是纯逻辑 crate（host 可测），与内核侧装载解耦。
-- **退出**（Exit syscall / 用户态页故障）：当前线程不再入队 → 调度循环回收：摘进程表 → Drop 地址空间（表帧随页表树 Drop、数据帧 RAII 归还）。当前一进程一线程，因此切换点已保证无其他 hart 触达该地址空间；ThreadSpawn 前必须增加线程成员表、active-hart 收束与远端 TLB invalidate/ack，不能延用该前提。
+- **创建**：唯一 init 由内核从 BootPackage initial ELF 构造；后续进程由用户态 `libprocess` 驱动 ProcessBuilder 映射、回填并发布。内核不解析 initfs 或服务拓扑。
+- **退出**（Exit syscall / 用户态页故障）：当前线程不再入队 → 调度循环回收：摘进程表 → Drop 地址空间（表帧随页表树 Drop、数据帧 RAII 归还）→ ProcessControl 发布 CLOSED。当前一进程一线程，因此切换点已保证无其他 hart 触达该地址空间；ThreadSpawn 前必须增加线程成员表、active-hart 收束与远端 TLB invalidate/ack，不能延用该前提。
 - **用户态页故障一律杀进程**：本内核无按需分配，所有区域创建时显式映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）后走退出路径，绝不 panic 内核。
 
 ## sleep

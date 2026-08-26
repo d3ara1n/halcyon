@@ -48,7 +48,7 @@
 
 ## (将)受支持的平台
 
-- [x] qemu-virt: 4 cores 128MB ram with MMU
+- [x] qemu-virt: 4 cores 1GiB ram with MMU
 - [x] qemu-sifive_u: 5 cores(#0 disabled) 128MB ram with MMU
 
 ## 标准库

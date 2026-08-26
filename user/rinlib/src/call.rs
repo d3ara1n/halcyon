@@ -1,3 +1,4 @@
+#[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
 use erhino_shared::{
@@ -5,7 +6,7 @@ use erhino_shared::{
     mem::Address,
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
-    proc::{ExitCode, Tid},
+    proc::{ExitCode, ProcessCreateResult, ProcessMapFlags, ProcessStartDescriptor, Tid},
     wait::{WaitItem, WaitResult},
 };
 use num_traits::FromPrimitive;
@@ -20,6 +21,7 @@ fn to_error(error: usize) -> SystemCallError {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 unsafe fn raw_call(
     id: usize,
     arg0: usize,
@@ -35,6 +37,19 @@ unsafe fn raw_call(
         asm!("ecall", in("x17") id, inlateout("x10") arg0 => error_code, inlateout("x11") arg1 => result, in("x12") arg2, in("x13") arg3, in("x14") arg4, in("x15") arg5);
     }
     (error_code, result)
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+unsafe fn raw_call(
+    _id: usize,
+    _arg0: usize,
+    _arg1: usize,
+    _arg2: usize,
+    _arg3: usize,
+    _arg4: usize,
+    _arg5: usize,
+) -> (usize, usize) {
+    panic!("system calls are unavailable on the host target")
 }
 
 fn sys_call(
@@ -81,6 +96,81 @@ pub unsafe fn sys_extend(size: usize) -> SystemCallResult<Address> {
 // returns nothing
 pub unsafe fn sys_exit(code: ExitCode) -> SystemCallResult<()> {
     sys_call(SystemCall::Exit, code as usize, 0, 0, 0).map(|_| ())
+}
+
+pub unsafe fn sys_job_create(
+    parent: Handle,
+    rights: Rights,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::JobCreate,
+        parent.raw() as usize,
+        rights.raw() as usize,
+        output as *mut Handle as usize,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_create(
+    job: Handle,
+    output: &mut ProcessCreateResult,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessCreate,
+        job.raw() as usize,
+        output as *mut ProcessCreateResult as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_map(
+    builder: Handle,
+    target: usize,
+    len: usize,
+    permissions: ProcessMapFlags,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessMap,
+        builder.raw() as usize,
+        target,
+        len,
+        permissions.raw() as usize,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_write(
+    builder: Handle,
+    target: usize,
+    source: &[u8],
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessWrite,
+        builder.raw() as usize,
+        target,
+        source.as_ptr() as usize,
+        source.len(),
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_start(
+    builder: Handle,
+    descriptor: &ProcessStartDescriptor,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessStart,
+        builder.raw() as usize,
+        descriptor as *const ProcessStartDescriptor as usize,
+        output as *mut Handle as usize,
+        0,
+    )
+    .map(|_| ())
 }
 
 pub unsafe fn sys_thread_spawn(func_point: Address) -> SystemCallResult<Tid> {

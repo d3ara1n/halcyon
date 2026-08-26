@@ -24,21 +24,37 @@ pub trait SchedClass: Sync {
 }
 
 /// 公平类：FIFO 轮转 + 固定量子。
+enum ReadyEntry {
+    Reserved(u64),
+    Thread(Arc<Thread>),
+}
+
 pub struct FairClass {
-    ready: Spinlock<VecDeque<Arc<Thread>>>,
+    ready: Spinlock<VecDeque<ReadyEntry>>,
 }
 
 impl SchedClass for FairClass {
     fn enqueue(&self, t: Arc<Thread>) {
-        self.ready.lock().push_back(t);
+        self.ready.lock().push_back(ReadyEntry::Thread(t));
     }
 
     fn pick(&self) -> Option<Arc<Thread>> {
-        self.ready.lock().pop_front()
+        let mut ready = self.ready.lock();
+        let count = ready.len();
+        for _ in 0..count {
+            match ready.pop_front()? {
+                ReadyEntry::Thread(thread) => return Some(thread),
+                reserved @ ReadyEntry::Reserved(_) => ready.push_back(reserved),
+            }
+        }
+        None
     }
 
     fn has_ready(&self) -> bool {
-        !self.ready.lock().is_empty()
+        self.ready
+            .lock()
+            .iter()
+            .any(|entry| matches!(entry, ReadyEntry::Thread(_)))
     }
 }
 
@@ -51,6 +67,40 @@ pub struct SchedDomain {
 static FAIR: FairClass = FairClass {
     ready: Spinlock::new(VecDeque::new()),
 };
+static NEXT_READY_RESERVATION: AtomicU64 = AtomicU64::new(1);
+
+pub struct ReadyReservation(u64);
+
+pub fn reserve_ready() -> Result<ReadyReservation, ()> {
+    let token = NEXT_READY_RESERVATION.fetch_add(1, Ordering::Relaxed);
+    if token == 0 {
+        return Err(());
+    }
+    let mut ready = FAIR.ready.lock();
+    ready.try_reserve(1).map_err(|_| ())?;
+    ready.push_back(ReadyEntry::Reserved(token));
+    Ok(ReadyReservation(token))
+}
+
+pub fn commit_ready(reservation: ReadyReservation, thread: Arc<Thread>) {
+    let mut ready = FAIR.ready.lock();
+    let entry = ready
+        .iter_mut()
+        .find(|entry| matches!(entry, ReadyEntry::Reserved(token) if *token == reservation.0))
+        .expect("ready reservation disappeared");
+    *entry = ReadyEntry::Thread(thread);
+    drop(ready);
+    wake_idle_one();
+}
+
+pub fn rollback_ready(reservation: ReadyReservation) {
+    let mut ready = FAIR.ready.lock();
+    let index = ready
+        .iter()
+        .position(|entry| matches!(entry, ReadyEntry::Reserved(token) if *token == reservation.0))
+        .expect("ready reservation disappeared");
+    ready.remove(index);
+}
 
 /// 系统调度域（M3 单域；多域时由 HartKind 划分，执行点持域指针）。
 pub static DOMAIN: SchedDomain = SchedDomain { classes: [&FAIR] };
@@ -180,6 +230,10 @@ fn wake_expired() {
 /// 绝不把内部位图直接解释为 SBI hart mask。
 pub fn enqueue(t: Arc<Thread>) {
     FAIR.enqueue(t);
+    wake_idle_one();
+}
+
+fn wake_idle_one() {
     let mask = IDLE_MASK.load(Ordering::SeqCst);
     if mask != 0 {
         crate::registry::ipi_slots(mask);
@@ -227,6 +281,11 @@ pub fn run() -> ! {
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         t.switches.fetch_add(1, Ordering::Relaxed);
         arm_quantum();
+        // ProcessWrite 可经另一 hart 的直映射回填刚分配的可执行页。当前未
+        // 建代码代次/active-hart 集合，因此每次新 dispatch 在本 hart 执行
+        // fence.i，确保首次执行及迁移都不观察帧复用前的旧 I-cache 内容。
+        // SAFETY: fence.i 是本 hart 指令流同步，不触碰内存。
+        unsafe { asm!("fence.i", options(nostack, preserves_flags)) };
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
         let outcome = unsafe { trap::ret_to_user() };
         me.clear_context();
@@ -258,18 +317,23 @@ fn reap(t: Arc<Thread>) {
     let Some(process) = table::remove(pid) else {
         panic!("exited pid {} not in process table", pid);
     };
+    let exit = *t.exit_code.lock();
+    let control = process.take_control();
     let now = sbi::read_time();
     let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
     log!(
         Task,
         "pid {} reaped: exit={:?}, {} switches, lifespan {} ms",
         pid,
-        *t.exit_code.lock(),
+        exit,
         t.switches.load(Ordering::Relaxed),
         elapsed_ms
     );
     drop(t);
-    drop(process); // 地址空间随 Drop 链归还全部帧
+    drop(process); // 地址空间与 HandleTable teardown 完成后才发布终态
+    if let Some(control) = control {
+        control.finish(exit.unwrap_or(-1));
+    }
 }
 
 /// idle：登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→ wfi。

@@ -7,10 +7,11 @@
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
     object::{Handle, Rights},
+    proc::ProcessMapFlags,
 };
 use num_traits::{FromPrimitive, ToPrimitive};
 
-use crate::{context::UserContext, sched, task::{handle, mailbox, notification, wait, Thread}, uaccess};
+use crate::{context::UserContext, sched, task::{self, handle, mailbox, notification, wait, Thread}, uaccess};
 
 /// syscall 处理出口（见 notes/impls/call.md「异步调用」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,72 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::Exit => Outcome::Killed(a0 as i64),
+        SystemCall::JobCreate => {
+            respond_result(
+                frame,
+                task::job::create(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessCreate => {
+            respond_result(
+                frame,
+                task::process::create(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessMap => {
+            respond_result(
+                frame,
+                task::process::map(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                    ProcessMapFlags::from_raw(frame.x[13] as u32),
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessWrite => {
+            respond_result(
+                frame,
+                task::process::write(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                    frame.x[13] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessStart => {
+            respond_result(
+                frame,
+                task::process::start(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::Extend => {
             extend_heap(frame, thread, a0);
             Outcome::Completed

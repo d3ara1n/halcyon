@@ -9,9 +9,9 @@
 	chosen {
 		#address-cells = <0x2>;
 		#size-cells = <0x01>;
-		initfs {
+		boot-package@86000000 {
 			reg = <0x0 0x86000000 0x2000000>;
-			compatible = "tar";
+			compatible = "erhino,boot-package-v1";
 		};
 	};
 

@@ -54,7 +54,9 @@ impl Rights {
     pub const MAP: Self = Self(1 << 7);
     /// 允许 ProcessStart 等直接跨 HandleTable grant，不进入对象容器。
     pub const GRANT: Self = Self(1 << 8);
-    pub const KNOWN: Self = Self((1 << 9) - 1);
+    /// 允许在 Job 等创建域内构造新对象。
+    pub const CREATE: Self = Self(1 << 9);
+    pub const KNOWN: Self = Self((1 << 10) - 1);
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)

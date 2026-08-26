@@ -3,28 +3,33 @@ ENTRY(main)
 
 SECTIONS
 {
-  .text : ALIGN(16) {
-    *(.text)
+  . = ALIGN(4096);
+  .text : {
+    *(.text .text.*)
   }
 
-  .rodata : ALIGN(16) {
-    *(.srodata)
-    *(.rodata)
+  . = ALIGN(4096);
+  .rodata : {
+    *(.srodata .srodata.*)
+    *(.rodata .rodata.*)
   }
 
-  .data : ALIGN(16) {
-    *(.sdata)
-    *(.data)
+  . = ALIGN(4096);
+  .data : {
+    *(.sdata .sdata.*)
+    *(.data .data.*)
   }
 
-  .bss (NOLOAD) : ALIGN(16) {
+  . = ALIGN(4096);
+  .bss (NOLOAD) : {
     PROVIDE(_bss_start = .);
-    *(.sbss)
-    *(.bss)
+    *(.sbss .sbss.*)
+    *(.bss .bss.*)
+    *(COMMON)
     PROVIDE(_bss_end = .);
   }
 
   /DISCARD/ : {
-    *(.eh_frame)
+    *(.eh_frame .eh_frame.*)
   }
 }

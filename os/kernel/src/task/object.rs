@@ -24,6 +24,9 @@ pub const OBJECT_WAIT_LIMIT: usize = 1024;
 /// 用户 Handle 所指对象的内核类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
+    Job,
+    ProcessBuilder,
+    ProcessControl,
     Mailbox,
     Notification,
     TunnelEndpoint,
@@ -33,6 +36,9 @@ pub enum ObjectKind {
 /// Handle 在对象生命周期中的角色。rights 决定操作，role 决定关系。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleRole {
+    JobControl,
+    ProcessBuilder,
+    ProcessControl,
     MailboxOwner,
     MailboxSender,
     /// 一次性投递权：成功 Send 后由内核摘除，失败不消费。

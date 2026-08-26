@@ -11,7 +11,7 @@ QEMU `sifive_u` 模拟 SiFive FU740（U74 核心簇）。该模型年代早、�
 
 - hart 0 是无 MMU 的 E51 监视核，可运行 hart 为 1–4；
 - boot hart 不固定（实测同命令两次运行分别为不同 hartid）；
-- DRAM 仅 128 MiB，initfs 装载地址 0x86000000（见 memory.x / Justfile）；
+- DRAM 仅 128 MiB，BootPackage 装载地址 0x86000000（见 memory.x / Justfile）；
 - timebase 为 1 MHz；
 - 无平台 shutdown 设备：SRST 可能存在但 shutdown 不保证 QEMU 退出，
   运行阶段以 timeout 收束（Justfile `run_qemu_timed`）。

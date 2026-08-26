@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+/// BootPackage 固定外层
+pub mod boot;
 /// System calls
 pub mod call;
 /// Memory related

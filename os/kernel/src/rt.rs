@@ -152,12 +152,10 @@ fn bring_up_runtime() -> ! {
     frame::free_range(start, end);
     log!(Memory, "bootstrap reclaim [{:#x}, {:#x})", start, end);
 
-    // 冻结 active 集合、装载初始任务，最后发布 Ready。
-    if let Some((addr, len)) = crate::rt::initfs_region() {
-        initfs::load(addr, len);
-    } else {
-        log!(InitFS, "no initfs in device tree; no services to load");
-    }
+    // 冻结 active 集合、装载唯一 initial process，最后发布 Ready。
+    let (addr, len) = crate::rt::boot_package_region()
+        .expect("BootPackage unavailable; initial process cannot start");
+    boot::load(addr, len);
     registry::publish_ready();
     crate::sched::run()
 }
@@ -166,20 +164,20 @@ fn bring_up_runtime() -> ! {
 const LOAD_PAGE_FAULT: u64 = 13;
 const STORE_PAGE_FAULT: u64 = 15;
 
-use crate::{frame, initfs, mm};
+use crate::{boot, frame, mm};
 
-/// initfs 物理区间（board 解析结果经 rt 中转，避免跨模块传 board）。
-static INITFS: AtomicUsize = AtomicUsize::new(0);
-static INITFS_LEN: AtomicUsize = AtomicUsize::new(0);
+/// BootPackage 实际物理区间（board 解析结果经 rt 中转）。
+static BOOT_PACKAGE: AtomicUsize = AtomicUsize::new(0);
+static BOOT_PACKAGE_LEN: AtomicUsize = AtomicUsize::new(0);
 
-pub fn set_initfs_region(addr: usize, len: usize) {
-    INITFS.store(addr, Ordering::Relaxed);
-    INITFS_LEN.store(len, Ordering::Relaxed);
+pub fn set_boot_package_region(addr: usize, len: usize) {
+    BOOT_PACKAGE.store(addr, Ordering::Relaxed);
+    BOOT_PACKAGE_LEN.store(len, Ordering::Relaxed);
 }
 
-pub fn initfs_region() -> Option<(usize, usize)> {
-    let addr = INITFS.load(Ordering::Relaxed);
-    (addr != 0).then(|| (addr, INITFS_LEN.load(Ordering::Relaxed)))
+pub fn boot_package_region() -> Option<(usize, usize)> {
+    let addr = BOOT_PACKAGE.load(Ordering::Relaxed);
+    (addr != 0).then(|| (addr, BOOT_PACKAGE_LEN.load(Ordering::Relaxed)))
 }
 
 /// fatal 诊断（无锁 RawWriter）：打印 FatalFrame 完整证据后永久停放。

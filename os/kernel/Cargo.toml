@@ -10,7 +10,6 @@ lock_api = "0.4"
 talc = "5"
 page_table = { path = "../page_table" }
 frame_pool = { path = "../frame_pool" }
-tar = { path = "../tar" }
 elf = { path = "../elf" }
 handle_table = { path = "../handle_table" }
 wait_context = { path = "../wait_context" }

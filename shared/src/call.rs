@@ -15,8 +15,8 @@ pub enum SystemCallError {
     IllegalArgument = 0x3,
     /// System call can not be performed
     FunctionNotAvailable = 0x04,
-    // Role of process
-    /// Process must need the permission to do the system call
+    // Capability policy
+    /// 调用者缺少请求操作所需 authority。
     PermissionDenied = 0x10,
     // Memory related
     /// System is out of memory or the process reached the allocation limit
@@ -64,6 +64,16 @@ pub enum SystemCall {
     // -----Process control-----
     /// Finalized process notifies kernel to cleanup
     Exit = 0x10,
+    /// 从已有 JobControl 创建子 JobControl。
+    JobCreate = 0x11,
+    /// 在 Job 内创建空的 Building process，返回 affine ProcessBuilder。
+    ProcessCreate = 0x12,
+    /// 为 Building process 映射 anonymous zero pages。
+    ProcessMap = 0x13,
+    /// 向 Building process 已映射页写入有界数据。
+    ProcessWrite = 0x14,
+    /// 消费 ProcessBuilder，安装 grants 并首次发布进程。
+    ProcessStart = 0x15,
 
     // -----Thread-----
     /// Finalized thread notifies kernel to cleanup

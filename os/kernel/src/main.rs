@@ -4,7 +4,7 @@
 //! `plans/ref-2026-08-legacy-kernel-design.md`。
 
 #![no_std]
-#![feature(lang_items, alloc_error_handler)]
+#![feature(lang_items, alloc_error_handler, allocator_api)]
 #![allow(internal_features)]
 
 extern crate alloc;
@@ -33,7 +33,7 @@ mod external;
 mod frame;
 mod hart;
 mod heap;
-mod initfs;
+mod boot;
 mod mm;
 mod rt;
 mod sbi;
@@ -118,8 +118,8 @@ pub fn main() {
         log!(Memory, "@{:#x} ({:#x})", region.start, region.len);
     }
     log!(Timebase, "{} Hz", board.timebase);
-    if let Some((addr, len)) = board.initfs {
-        log!(InitFS, "@{:#x} ({:#x})", addr, len);
+    if let Some((addr, capacity)) = board.boot_package {
+        log!(Boot, "window @{:#x} ({:#x})", addr, capacity);
     }
 
     for cpu in board.cpus() {
@@ -127,14 +127,19 @@ pub fn main() {
     }
 
     mm::init(&board);
+    if let Some((addr, capacity)) = board.boot_package {
+        let actual = boot::inspect(addr, capacity);
+        board.set_boot_package_len(actual);
+        log!(Boot, "package @{:#x} ({:#x})", addr, actual);
+    }
     frame::init(&board);
     frame::selftest();
     heap::selftest();
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
     sched::init(board.timebase);
-    if let Some((addr, len)) = board.initfs {
-        rt::set_initfs_region(addr, len);
+    if let Some((addr, len)) = board.boot_package {
+        rt::set_boot_package_region(addr, len);
     }
 
     construct_registry(&board);

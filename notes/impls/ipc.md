@@ -7,9 +7,11 @@
 `os/handle_table` 是纯逻辑 generation slot 表。entry 保存 object、role、rights 与不可变 badge；duplicate、rights 裁剪、TRANSIT 和 GRANT 均保持 badge。表提供两条原子摘除：
 
 - `extract_moves` 要求 TRANSIT，供 Mailbox message；
-- `extract_grants` 要求 GRANT，供未来公开 ProcessStart 的直接跨表安装。
+- `extract_grants` 要求 GRANT，供 ProcessStart 的直接跨 HandleTable 安装。
 
 `os/kernel/src/task/handle.rs` 负责对象 allowed-rights 校验与表锁外生命周期回调。Mailbox/Notification owner 最大 rights 含 GRANT、不含 TRANSIT/DUPLICATE；sender、signaler、send-once 与 invitation 按 role 支持 TRANSIT/GRANT；Tunnel Endpoint 与 VM lease 绑定，两者均无。
+
+ProcessStart 在调用者 HandleTable 锁下复检全部 source，然后一次性 extract；此前已预留 child slots 与 StartupBlock 实际 Handle。失败保持每个 source 原值，成功后 entries 直接 commit 到 child，不经过消息对象或 transit buffer。
 
 空槽查找当前仍为线性扫描；真实大 Handle 负载出现前收敛为空闲链。
 

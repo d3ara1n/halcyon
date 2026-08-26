@@ -1,4 +1,4 @@
-//! 板级信息：从设备树就地解析 CPU（现代 ISA 属性）、内存与 initfs 位置。
+//! 板级信息：从设备树就地解析 CPU（现代 ISA 属性）、内存与 BootPackage 窗口。
 //!
 //! 启动路径（帧池/堆就绪前）零堆依赖：结果存固定容量数组，
 //! 容量即板级契约上限（HART_NUM_LIMIT / MAX_MEMORY_REGIONS），
@@ -77,7 +77,9 @@ pub struct BoardInfo {
     memories: [MemoryRegion; MAX_MEMORY_REGIONS],
     memory_len: usize,
     pub timebase: usize,
-    pub initfs: Option<(usize, usize)>,
+    /// 外部加载器提供的 BootPackage 物理窗口；初始为 DT capacity，
+    /// envelope 校验后收窄为实际 total_len。
+    pub boot_package: Option<(usize, usize)>,
     /// 可选 cpu-map 拓扑：(raw hartid, socket 起的层级路径)。
     /// 由 [`parse_topology`] 在帧池/堆就绪后填充。
     topology: Option<alloc::vec::Vec<(usize, alloc::vec::Vec<TopoLevel>)>>,
@@ -90,6 +92,14 @@ impl BoardInfo {
 
     pub fn memories(&self) -> &[MemoryRegion] {
         &self.memories[..self.memory_len]
+    }
+
+    pub fn set_boot_package_len(&mut self, actual: usize) {
+        let Some((address, capacity)) = self.boot_package else {
+            panic!("BootPackage window unavailable");
+        };
+        assert!(actual > 0 && actual <= capacity, "BootPackage length exceeds DT window");
+        self.boot_package = Some((address, actual));
     }
 
     /// 平坦拓扑（cpu-map 缺省时）：全部 admitted hart 同属一个无层级集合。
@@ -189,18 +199,27 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
         cells(&root, "#size-cells", 1),
     );
 
-    // /chosen/initfs：cells 沿 chosen 覆盖继承自 root
-    let mut initfs = None;
+    // /chosen/boot-package：cells 沿 chosen 覆盖继承自 root。
+    let mut boot_package = None;
     if let Some(chosen) = root.child("chosen") {
         let (ac, sc) = (
             cells(&chosen, "#address-cells", root_ac),
             cells(&chosen, "#size-cells", root_sc),
         );
-        if let Some(node) = chosen.child("initfs") {
-            let reg = node.prop("reg").expect("initfs node missing reg");
-            let addr = cells_u64(reg, ac).expect("unexpected initfs reg address-cell width") as usize;
-            let len = cells_u64(&reg[ac * 4..], sc).expect("unexpected initfs reg size-cell width") as usize;
-            initfs = Some((addr, len));
+        if let Some(node) = chosen.children().find(|node| {
+            node.name()
+                .is_ok_and(|name| name.split('@').next() == Some("boot-package"))
+        }) {
+            assert!(
+                node.prop_str("compatible") == Some("erhino,boot-package-v1"),
+                "unsupported boot-package compatible"
+            );
+            let reg = node.prop("reg").expect("boot-package node missing reg");
+            let addr = cells_u64(reg, ac)
+                .expect("unexpected boot-package reg address-cell width") as usize;
+            let len = cells_u64(&reg[ac * 4..], sc)
+                .expect("unexpected boot-package reg size-cell width") as usize;
+            boot_package = Some((addr, len));
         }
     }
 
@@ -251,6 +270,18 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
         memory_len += 1;
     }
     assert!(memory_len > 0, "device tree has no memory node");
+    if let Some((address, capacity)) = boot_package {
+        let end = address
+            .checked_add(capacity)
+            .expect("boot-package physical window overflows");
+        assert!(
+            memories[..memory_len].iter().any(|memory| {
+                address >= memory.start
+                    && end <= memory.start.checked_add(memory.len).unwrap_or(0)
+            }),
+            "boot-package physical window lies outside DT memory"
+        );
+    }
 
     BoardInfo {
         cpus,
@@ -258,7 +289,7 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
         memories,
         memory_len,
         timebase,
-        initfs,
+        boot_package,
         topology: None,
     }
 }

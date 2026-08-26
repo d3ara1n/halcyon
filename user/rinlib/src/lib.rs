@@ -1,4 +1,4 @@
-#![feature(lang_items, alloc_error_handler)]
+#![cfg_attr(target_arch = "riscv64", feature(lang_items, alloc_error_handler))]
 // Don't link to std. We are std.
 #![no_std]
 #![allow(internal_features)]
@@ -16,5 +16,6 @@ pub mod ipc;
 pub mod mm;
 pub mod preclude;
 pub mod process;
+#[cfg(target_arch = "riscv64")]
 mod rt;
 pub mod thread;

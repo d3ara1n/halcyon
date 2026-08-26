@@ -4,7 +4,7 @@
 //! - [`PhysAccess`]：PoolMemory 的内核实现——经 `mm::phys_to_virt` 访问
 //!   （初始化于 mm::init 之后，恒在高半区直映射下工作）；
 //! - 全局容器：`Spinlock<Option<FramePool>>`，初始化后只读访问；
-//! - 启动注册：DTB memory 段剔除 SBI + 内核镜像/栈 + initfs 占用。
+//! - 启动注册：DTB memory 段剔除 SBI + 内核镜像/栈 + BootPackage 实际占用。
 
 use frame_pool::{FramePool, PoolMemory, RegionNode};
 use page_table::{FrameNumber, PAGE_BITS};
@@ -57,11 +57,11 @@ fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {
 /// 合并、重叠校验的 reservation 集合（notes/impls/mm.md「帧池」）。
 pub fn init(board: &BoardInfo) {
     let kernel_end = external::kernel_pa_end();
-    // 启动占用最多两洞（镜像/栈 + initfs），固定容量——启动路径零堆依赖
+    // 启动占用最多两洞（镜像/栈 + BootPackage），固定容量——启动路径零堆依赖
     let mut holes = [(0usize, 0usize); 2];
     holes[0] = (external::sbi_start(), kernel_end);
     let mut hole_count = 1usize;
-    if let Some((addr, len)) = board.initfs {
+    if let Some((addr, len)) = board.boot_package {
         holes[1] = (addr, addr + len);
         hole_count = 2;
     }

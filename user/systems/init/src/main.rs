@@ -24,9 +24,11 @@ use rinlib::{
         call::SystemCallError,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
+        proc::HandleGrant,
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
 };
+use libprocess::{SpawnRequest, spawn};
 use librunnel::blocking;
 
 /// 隧道页在本进程的映射地址（VA 分配器落地前由调用方自报）。
@@ -38,8 +40,71 @@ const STREAM_LEN: usize = 8192;
 const CONTROL_STRESS: usize = 128;
 const TUNNEL_STRESS: usize = 64;
 
+fn launch_test_services() -> Option<Handle> {
+    let root_job = env::startup_handle(0)?;
+    let pm_mailbox = create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+        Rights::WRITE
+            | Rights::WAIT
+            | Rights::TRANSIT
+            | Rights::GRANT
+            | Rights::DUPLICATE,
+    )
+    .ok()?;
+    let control_rights = Rights::READ
+        | Rights::WAIT
+        | Rights::MANAGE
+        | Rights::DUPLICATE
+        | Rights::TRANSIT
+        | Rights::GRANT;
+    let mut pm_started = false;
+    let result = tar::walk(env::startup_payload(), |entry| {
+        if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
+            return;
+        }
+        let pm_grants = [HandleGrant {
+            handle: pm_mailbox.owner,
+            rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+        }];
+        let grants = if entry.name == "bin/srv_pm" {
+            pm_grants.as_slice()
+        } else {
+            &[]
+        };
+        match spawn(SpawnRequest {
+            job: root_job,
+            image: entry.data,
+            payload: &[],
+            grants,
+            control_rights,
+        }) {
+            Ok(process) => {
+                debug!("started {} as pid {}", entry.name, process.pid);
+                let _ = close(process.control);
+                if entry.name == "bin/srv_pm" {
+                    pm_started = true;
+                }
+            }
+            Err(error) => debug!("failed to start {}: {:?}", entry.name, error),
+        }
+    });
+    if let Err(error) = result {
+        debug!("initfs parse failed: {:?}", error);
+    }
+    if !pm_started {
+        let _ = close(pm_mailbox.owner);
+        let _ = close(pm_mailbox.peer);
+        return None;
+    }
+    Some(pm_mailbox.peer)
+}
+
 fn main() {
     debug!("Hello, init!");
+    let Some(pm_mailbox) = launch_test_services() else {
+        debug!("pm service launch failed");
+        return;
+    };
     let pair = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
@@ -106,10 +171,6 @@ fn main() {
         }
     };
     debug!("tunnel created");
-    let Some(pm_mailbox) = env::startup_handle(0) else {
-        debug!("pm mailbox grant is missing");
-        return;
-    };
     let invitation_move = [HandleMove {
         handle: invitation,
         rights: Rights::MAP,

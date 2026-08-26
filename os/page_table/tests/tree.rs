@@ -11,6 +11,7 @@ use std::rc::Rc;
 #[derive(Default)]
 struct Counters {
     live: Cell<usize>,
+    deny_alloc: Cell<bool>,
 }
 
 struct MockFrames {
@@ -31,6 +32,9 @@ impl MockFrames {
 
 impl FrameMemory for MockFrames {
     fn alloc_frame(&mut self) -> Result<FrameNumber, FrameExhausted> {
+        if self.counters.deny_alloc.get() {
+            return Err(FrameExhausted);
+        }
         self.counters.live.set(self.counters.live.get() + 1);
         if let Some(f) = self.free.pop() {
             Ok(FrameNumber(f))
@@ -164,10 +168,28 @@ fn unmap_then_remap() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     t.map(Vpn(100), 100, Ppn(200), flags::USER_DATA).unwrap();
-    t.unmap(Vpn(100), 100);
+    t.unmap(Vpn(100), 100).unwrap();
     assert!(t.translate(Vpn(150)).is_none());
     t.map(Vpn(100), 100, Ppn(900), flags::USER_CODE).unwrap();
     assert_eq!(t.translate(Vpn(150)).unwrap().ppn.0, 950);
+}
+
+/// 跨 512 页子表边界批量解除，必须使用每个子表的真实覆盖基址。
+#[test]
+fn unmap_crosses_child_table_boundary() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    t.map(Vpn(480), 80, Ppn(1000), flags::USER_DATA).unwrap();
+    t.unmap(Vpn(500), 40).unwrap();
+    for vpn in 480..500 {
+        assert!(t.translate(Vpn(vpn)).is_some(), "left neighbor {vpn}");
+    }
+    for vpn in 500..540 {
+        assert!(t.translate(Vpn(vpn)).is_none(), "stale mapping {vpn}");
+    }
+    for vpn in 540..560 {
+        assert!(t.translate(Vpn(vpn)).is_some(), "right neighbor {vpn}");
+    }
 }
 
 /// 部分解除 mega：分裂，邻居保留。
@@ -179,12 +201,26 @@ fn partial_unmap_splits_mega() {
     t.map(Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
     assert_eq!(t.translate(Vpn(base + 5)).unwrap().level, 1);
 
-    t.unmap(Vpn(base + 100), 1);
+    t.unmap(Vpn(base + 100), 1).unwrap();
     assert!(t.translate(Vpn(base + 100)).is_none());
     // 分裂后邻居变 4KiB 叶但映射保持
     for off in [0, 99, 101, 511] {
         let m = t.translate(Vpn(base + off)).unwrap();
         assert_eq!(m.ppn.0, base + off, "off={}", off);
+    }
+}
+
+/// mega 分裂分配失败必须显式返回错误，原映射保持完整。
+#[test]
+fn partial_unmap_split_oom_preserves_mapping() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let base = 512 * 10;
+    t.map(Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
+    counters.deny_alloc.set(true);
+    assert_eq!(t.unmap(Vpn(base + 123), 1), Err(MapError::FrameExhausted));
+    for off in [0, 122, 123, 124, 511] {
+        assert_eq!(t.translate(Vpn(base + off)).unwrap().ppn.0, base + off);
     }
 }
 

@@ -13,7 +13,8 @@
 | 主题 | idea | impl |
 |---|---|---|
 | 对象、Capability、Handle、运输与根授权 | [object](ideas/object.md) | [IPC 对象](impls/ipc.md) |
-| 进程启动与 StartupBlock | [object](ideas/object.md)、[service](ideas/service.md) | [startup](impls/startup.md) |
+| Bootstrap、init 与用户态 launcher | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
+| 普通进程启动与 StartupBlock | [object](ideas/object.md)、[service](ideas/service.md) | [startup](impls/startup.md) |
 | 任务、Job、进程、线程与调度 | [task](ideas/task.md) | [task](impls/task.md) |
 | 执行环境（boot / trap / hart capability） | [task](ideas/task.md) | [execution-context](impls/execution-context.md) |
 | 内存管理 | — | [mm](impls/mm.md) |

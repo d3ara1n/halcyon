@@ -11,7 +11,7 @@ extern crate alloc;
 /// 一个 PT_LOAD 段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadSegment {
-    /// 装载目标虚拟地址（页对齐）。
+    /// 装载目标虚拟地址；页内偏移须与文件 offset 同余。
     pub vaddr: u64,
     /// 段内容在文件中的偏移。
     pub offset: u64,

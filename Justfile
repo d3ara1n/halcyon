@@ -23,15 +23,16 @@ MODEL_DIR := TARGET_DIR/PLATFORM/MODEL
 KERNEL_ELF := MODEL_DIR/"erhino_kernel"
 KERNEL_BIN := KERNEL_ELF+".bin"
 DTB := MODEL_DIR/"device.dtb"
-INITFS := TARGET_DIR/"initfs.tar"   # 用户态产物，平台无关
+INIT_PAYLOAD := TARGET_DIR/"initfs.tar" # init 私有 payload，内核不解释
+BOOT_PACKAGE := TARGET_DIR/"boot-package.bin"
 
 # QEMU
-# initfs 装载地址：virt DRAM 1GiB 取高址；sifive_u 实际 DRAM 仅 128MiB，
-# 取 dtb 声明的 0x86000000（与 dts 的 initfs reg 保持一致）。
-INITFS_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
+# BootPackage 装载地址：virt DRAM 1GiB 取高址；sifive_u 实际 DRAM 仅 128MiB，
+# 取 dtb 声明的 0x86000000（与 dts 的 boot-package reg 保持一致）。
+BOOT_PACKAGE_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
 # 与 virt DTS 声明的 Zkr 能力一致；sifive_u 不声明该扩展。
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+INITFS+",addr="+INITFS_ADDR+" " + QEMU_CPU
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
 # CPU 节流百分比（tools/qemu-throttle.sh）：跑飞/panic 时 QEMU 满核空转的兜底。
 # 1-99 按比例节流；100 = 全速。默认 50，全速需显式 THROTTLE=100。
 THROTTLE := "50"
@@ -75,13 +76,19 @@ make_dtb: artifact_dir
 
 build_user: artifact_dir
     @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    @python3 tools/audit-user-elf.py {{TARGET_DIR}}/build/srv_* {{TARGET_DIR}}/build/drv_*
     @echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
 make_initfs: build_user
+    @rm -rf "{{TARGET_DIR}}/initfs"
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
-    @cp {{TARGET_DIR}}/build/srv_* "{{TARGET_DIR}}/initfs/bin"
-    @cp {{TARGET_DIR}}/build/drv_* "{{TARGET_DIR}}/initfs/bin"
-    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | tar --format=ustar -cvf "{{INITFS}}" -T -
+    @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
+    @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
+    @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
+    @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
+
+make_boot_package: make_initfs
+    @python3 tools/make-boot-package.py --init "{{TARGET_DIR}}/build/srv_init" --payload "{{INIT_PAYLOAD}}" --output "{{BOOT_PACKAGE}}"
 
 build_kernel: artifact_dir
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}/{{MODEL}}\033[0m"
@@ -90,7 +97,7 @@ build_kernel: artifact_dir
     @python3 os/tools/audit_elf.py {{KERNEL_ELF}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
 
-run_qemu +OPTIONS: make_dtb make_initfs build_kernel
+run_qemu +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating (CPU throttled to {{THROTTLE}}%)\033[0m"
     @tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
 
@@ -113,7 +120,7 @@ clean-qemu *args:
     @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
 
 [private]
-run_qemu_timed +OPTIONS: make_dtb build_kernel
+run_qemu_timed +OPTIONS: make_dtb make_boot_package build_kernel
     #!/usr/bin/env bash
     set +e
     timeout --foreground 4 {{QEMU_LAUNCH}} {{OPTIONS}}

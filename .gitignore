@@ -3,6 +3,8 @@
 debug/
 target/
 artifacts/
+__pycache__/
+*.py[cod]
 
 .vscode/
 .idea/

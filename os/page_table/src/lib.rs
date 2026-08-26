@@ -278,12 +278,12 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
     /// 解除 `[vpn, vpn+count)` 的映射。
     ///
     /// 语义宽松：区间内未映射的部分跳过；跨 mega 部分覆盖的先分裂再解除。
-    pub fn unmap(&mut self, vpn: Vpn, count: usize) {
-        let Some(end) = vpn.0.checked_add(count) else { return };
+    pub fn unmap(&mut self, vpn: Vpn, count: usize) -> Result<(), MapError> {
+        let end = vpn.0.checked_add(count).ok_or(MapError::OutOfRange)?;
         if end > max_vpn(LEVELS) {
-            return;
+            return Err(MapError::OutOfRange);
         }
-        self.unmap_range(self.root, LEVELS - 1, vpn.0, end);
+        self.unmap_range(self.root, LEVELS - 1, 0, vpn.0, end)
     }
 
     /// 查询 `vpn` 的映射。
@@ -433,10 +433,16 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
     }
 
     /// 递归解除 `[vpn_start, vpn_end)` 在 `frame`（`level` 级表）内的映射。
-    fn unmap_range(&mut self, frame: FrameNumber, level: usize, vpn_start: usize, vpn_end: usize) {
-        // 本表覆盖的页范围对齐
-        let table_pages = pages_at(level + 1); // 一张 level 级表覆盖 pages_at(level+1) 页
-        let table_base = (vpn_start / table_pages) * table_pages;
+    /// `table_base` 是该 frame 实际覆盖的首 VPN，递归时随子表推进，不能
+    /// 从初始请求起点重新推导。
+    fn unmap_range(
+        &mut self,
+        frame: FrameNumber,
+        level: usize,
+        table_base: usize,
+        vpn_start: usize,
+        vpn_end: usize,
+    ) -> Result<(), MapError> {
         for i in 0..ENTRIES {
             let slot_base = table_base + i * pages_at(level);
             let slot_pages = pages_at(level);
@@ -453,16 +459,17 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
                     // 整个 mega 被覆盖：直接解除
                     self.mem.table_mut(frame)[i] = Pte::invalid();
                 } else {
-                    // 部分覆盖：分裂后下钻（表帧耗尽时跳过，宽松语义）
-                    if let Ok(sub) = self.split_mega(frame, i, level) {
-                        self.unmap_range(sub, level - 1, vpn_start, vpn_end);
-                    }
+                    // 部分覆盖：分裂后下钻；表帧耗尽必须返回错误，调用方
+                    // 不得在 PTE 尚存时归还数据帧。
+                    let sub = self.split_mega(frame, i, level)?;
+                    self.unmap_range(sub, level - 1, slot_base, vpn_start, vpn_end)?;
                 }
             } else {
                 let sub = entry.next_frame();
-                self.unmap_range(sub, level - 1, vpn_start, vpn_end);
+                self.unmap_range(sub, level - 1, slot_base, vpn_start, vpn_end)?;
             }
         }
+        Ok(())
     }
 
     /// 递归释放 `frame` 子树中全部分支表帧（不含 `frame` 自身）。

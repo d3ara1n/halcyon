@@ -1,58 +1,88 @@
-# 启动资源交付实现
+# 启动资源与用户态 launcher 实现
 
-方向见 [`../ideas/object.md`](../ideas/object.md)「StartupBlock」与 [`../ideas/task.md`](../ideas/task.md)。当前内核已落地通用 StartupBlock v2；公开用户态 ProcessCreate/ProcessStart 尚未接入，boot loader 暂代 launcher。
+方向见 [`../ideas/bootstrap.md`](../ideas/bootstrap.md)、[`../ideas/object.md`](../ideas/object.md) 与 [`../ideas/task.md`](../ideas/task.md)。当前启动链已经收敛为 BootPackage → 唯一 init → 用户态 launcher；内核不再遍历归档或识别服务名称。
 
-## Outer ABI
+## BootPackage v1
+
+`shared/src/boot.rs` 定义 64 字节 little-endian envelope：magic、version、header_len、flags、total_len、initial ELF offset/length、payload offset/length 与 reserved。validator 使用 checked arithmetic，要求 canonical offset、页对齐 payload、零 padding 和窗口内完整几何；payload 可以为空。
+
+`tools/make-boot-package.py` 原子生成 `artifacts/boot-package.bin`。Just 构建链把 `srv_init` 作为唯一 initial ELF，其余测试程序暂以确定序 ustar 组成 opaque payload。DTS `/chosen/boot-package` 只声明物理装载窗口；`os/kernel/src/board.rs` 同时验证窗口完整落在 DT memory 内。
+
+`os/kernel/src/boot.rs` 在帧池注册前读取并验证 envelope，以实际 `total_len` 收窄保留区；DTS capacity 不会整段退出帧池。内核只把 initial ELF 交给 bootstrap loader，不解释 payload 字节。
+
+## StartupBlock outer ABI
 
 `shared/src/startup.rs` 定义：
 
 ```text
 [StartupBlockHeader (40 B)]
 [Handle × handle_count]
+[zero padding]
 [opaque payload]
 ```
 
-Header 包含 magic、版本、块长、pid、parent_pid、Handle 数、payload 偏移/长度与 reserved。`validate_startup_block` 只校验 outer 几何、reserved 和实际 Handle 值，不解释 payload。
+Header 包含 magic、版本、块长、pid、parent_pid、Handle 数、payload 偏移/长度与 reserved。几何不变量是 `handles_end <= payload_off`；间隙必须为零。普通 builder 仍生成紧凑块，bootstrap builder 允许把 prefix 补齐到页边界。
 
-旧 descriptor/tag 与“index → slot+1、generation 1”推导已删除。Handle 区直接保存 child HandleTable reservation 产生的真实值，允许非连续 slot 和任意有效 generation。
+Handle 区直接保存 child HandleTable reservation 产生的真实值，不允许由 index 推导 slot/generation。validator 只校验 outer、实际 Handle 与 padding，不解释 payload。
 
-## launch 事务
+## 唯一 init bootstrap
 
-`os/kernel/src/task/proc.rs::launch` 的当前顺序：
+`os/kernel/src/boot.rs` 是 BootPackage initial-process loader；它不依赖 `tar` crate、不查找 `bin/`、不含 pm/fs/driver 策略。流程是：
 
-1. 为全部输入 entries 在尚未发布的 child HandleTable 中 reserve；
-2. 以 reservation 的实际 Handle、`Process.pid/parent` 与 launcher payload 调用 `build_startup_block`；
-3. `AddressSpace::map_startup_block` 在 ELF 后、堆前只读映射完整 outer；
-4. commit entries；
-5. 创建主线程，`a0 = block base`、`a1 = block length`；
-6. 插入进程表，调用方随后 enqueue 发布 runnable。
+1. 解析 initial ELF，创建 pid 1 的 AddressSpace；
+2. 创建 root Job，并为 init 生成完整 JobControl；
+3. 以实际 child Handle 构造页对齐 StartupBlock prefix；
+4. prefix 使用 owned 只读页，BootPackage payload 使用 borrowed `U|R|A` PTE，二者组成连续用户 VA 块；
+5. 预构造主线程、插入进程表并 enqueue。
 
-reserve/build/map 失败都 rollback 临时 Handle，并按目标进程退出语义关闭未安装 entries；进程不进入表。commit 后不再存在可恢复失败步骤。块帧归 `AddressSpace.frames`，随进程回收。
+initial ELF 复制完成且 StartupBlock prefix 构造后，`[package base, payload_pa)` 页对齐前缀立即回投帧池；只有实际映入 init 的 payload 页由启动保留区持有到系统结束。进程销毁只清 borrowed PTE，不归还这些帧。最后一页可见尾部来自 packer 的零 padding，不可写、不可执行。
 
-## 当前 boot launcher
+## 公开 Job/Process 构造 ABI
 
-`os/kernel/src/initfs.rs` 装载四个服务，暂时创建 pm Mailbox：
+`shared/src/proc.rs` 与 `shared/src/call.rs` 定义 JobCreate、ProcessCreate、ProcessMap、ProcessWrite、ProcessStart 的 fixed-width ABI；rinlib 封装位于 `user/rinlib/src/process.rs`。
 
-- pm 的 StartupBlock `Handles[0]` 是 owner，目标 rights 含 READ/WAIT/MANAGE/GRANT；
-- init 的 `Handles[0]` 是 badge-0 sender，含 WRITE/WAIT/TRANSIT/GRANT/DUPLICATE；
-- fs 与驱动当前无启动 Handle；
-- payload 当前为空。
+- `JobControl`：持 CREATE 的 capability 才能派生 Job 或创建进程；root Job 只交给 init。
+- `ProcessBuilder`：affine Building authority，不可 duplicate；关闭即回收未发布 Process。
+- `ProcessMap`：为 Building process 建 anonymous zero pages，最终 PTE 禁止 W+X。
+- `ProcessWrite`：从调用进程已验证的用户缓冲向 Building backing 回填，不要求目标最终 PTE 可写。
+- `ProcessStart`：验证入口 X 映射、栈 W 映射、profile、payload、grants 与输出，成功消费 builder 并返回 ProcessControl。
 
-Handle[0] 的业务语义只是 boot launcher 与对应二进制的临时约定，不属于 outer ABI。服务化后由用户态 LauncherParcel 在 opaque payload 内按索引描述资源。
+### ProcessStart 事务
 
-## 接收方
+提交前依次完成：
 
-`user/rinlib/src/rt.rs` 在任何用户代码前把入口 a0/a1 交给 `env::init`。`user/rinlib/src/env.rs` 使用 shared validator 校验 outer，然后提供：
+1. 拷入 descriptor、payload 与 grants；
+2. reserve child Handle slots，以真实 Handle 构造并映射 StartupBlock；
+3. 预构造 ProcessControl、主线程 Arc；
+4. 在进程表和 ready queue 放入不可见 reservation marker；
+5. reserve 调用者输出 slot，并在同一 HandleTable 锁下复检、原子 extract GRANT entries。
 
-- `pid()`、`parent_pid()`；
-- `startup_handles()`、`startup_handle(index)`；
-- `startup_payload()`。
+提交区只做已预留结构的替换、builder 消费、Handle commit、输出写回、ProcessControl 绑定与 ready marker 发布，不再分配。此前任一步失败都会回滚 StartupBlock、两类 marker、Handle reservations；调用者 grants 与 builder 保持原值。
 
-rinlib 不解释 payload，不按 tag 查资源，也不猜 Handle 数值。解析失败触发用户态 panic 并干净退出，不影响内核。
+进程表使用 PID 单调不复用的 Vec 容器；reservation marker 对查找与回收不可见。公平类队列同样用 marker 预留容量，`pick` 跳过 marker，`has_ready` 不把 marker 视为 runnable，因此不改变 FIFO 或静默判定。
+
+当前 ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；显式 ProcessKill、exit-status 查询与 JobKill 尚未接入，留给完整进程终止/多线程屏障阶段。D64 profile 在调度域 eligibility 接线前明确返回 NotSupported。
+
+## 用户态公共 loader
+
+`os/elf` 是内核 bootstrap 与用户态共同依赖的纯逻辑 ELF parser。`user/frameworks/libprocess` 负责：
+
+- 要求 entry 落在实际 executable segment 字节区间；
+- 拒绝 segment byte overlap、文件越界、W-only 与页级 W+X 权限并集；
+- 合并连续同权限页并分块 ProcessMap；
+- 分块 ProcessWrite program segment，依赖匿名页初始清零形成 BSS；
+- 映射固定主栈并组装 ProcessStart descriptor。
+
+这只是实现集中化，不产生 authority；调用者仍须显式持有 JobControl。动态链接器、共享代码页与 MemoryObject 不在当前实现面。
+
+## 当前 init 集成政策
+
+`user/systems/init` 从 `startup_payload()` 读取 opaque 字节。当前仅为对照负载使用最小 ustar walker，按归档条目启动 driver、fs、pm，并为 pm 组装现有 Mailbox grant。归档格式、manifest、服务拓扑和长期授权转交仍属 init 私有设计，内核 ABI 不含这些概念。
 
 ## 验证
 
-- shared host 测试覆盖实际非默认 Handle 值、空资源、opaque payload 和 outer 几何损坏；
-- handle_table host 测试覆盖 reservation、TRANSIT/GRANT 与 badge 保持；
-- init/pm 集成负载从实际 StartupBlock Handle[0] 建立跨进程 Tunnel 与流控；
-- `just virt` 四服务完成后全员回收并静默停机。
+- shared host 测试覆盖 BootPackage canonical geometry、零 padding、空 payload 与 StartupBlock padded prefix；
+- page_table host 测试覆盖跨子表 unmap、mega split OOM 保持原映射；
+- libprocess host 测试覆盖 entry、segment overlap 与页级 W^X 拒绝；
+- HandleTable host 测试覆盖 reservation、TRANSIT/GRANT 与 badge；
+- virt/sifive_u 均由 init 启动其余三类负载，完成现有 IPC/FAL/Runnel 验收、全员回收与静默判定。

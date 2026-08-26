@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU64;
 
 use alloc::{sync::Arc, vec::Vec};
-use erhino_shared::proc::{Pid, Tid};
+use erhino_shared::proc::{Pid, ProcessMapFlags, Tid};
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
 use crate::{
@@ -14,13 +14,14 @@ use crate::{
 };
 
 /// 页大小（字节）。
-pub const PAGE_SIZE: usize = 1 << page_table::PAGE_BITS;
+pub const PAGE_SIZE: usize = erhino_shared::proc::PROCESS_PAGE_SIZE;
+const _: () = assert!(PAGE_SIZE == 1 << page_table::PAGE_BITS);
 
 /// 用户半区顶（256GiB），主线程栈顶。
-pub const USER_TOP: usize = 1 << 38;
+pub const USER_TOP: usize = erhino_shared::proc::PROCESS_USER_TOP;
 
 /// 主线程栈大小（8MiB），钉在半区顶。
-pub const STACK_SIZE: usize = 8 << 20;
+pub const STACK_SIZE: usize = erhino_shared::proc::PROCESS_MAIN_STACK_SIZE;
 
 /// sv39 三级页表。
 const LEVELS: usize = 3;
@@ -40,7 +41,8 @@ impl From<MapError> for SpaceError {
     fn from(e: MapError) -> Self {
         match e {
             MapError::Conflict { .. } => SpaceError::Conflict,
-            _ => SpaceError::BadSegment,
+            MapError::FrameExhausted => SpaceError::NoFrame,
+            MapError::OutOfRange => SpaceError::BadSegment,
         }
     }
 }
@@ -129,10 +131,136 @@ impl AddressSpace {
 
     /// 申请 `count` 页（整段物理连续，利于大页），登记映射与帧所有权。
     fn alloc_map(&mut self, vaddr: usize, count: usize, flags: u64) -> Result<(), SpaceError> {
+        self.frames.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
         let tracker = frame::alloc_contiguous(count).ok_or(SpaceError::NoFrame)?;
-        self.tree
-            .map(Vpn(vaddr / PAGE_SIZE), count, Ppn(tracker.base.addr() / PAGE_SIZE), flags)?;
+        let base_vpn = vaddr / PAGE_SIZE;
+        let base_ppn = tracker.base.addr() / PAGE_SIZE;
+        for index in 0..count {
+            if let Err(error) = self
+                .tree
+                .map(Vpn(base_vpn + index), 1, Ppn(base_ppn + index), flags)
+            {
+                for rollback in (0..index).rev() {
+                    self.tree
+                        .unmap(Vpn(base_vpn + rollback), 1)
+                        .expect("single-page allocation rollback cannot fail");
+                }
+                return Err(error.into());
+            }
+        }
         self.frames.push(tracker);
+        Ok(())
+    }
+
+    /// 为 Building process 映射 anonymous zero pages。映像区与固定主栈
+    /// 窗口不能由一次调用跨越；只有映像区推进 StartupBlock/heap 基准。
+    pub fn map_anonymous(
+        &mut self,
+        vaddr: usize,
+        len: usize,
+        permissions: ProcessMapFlags,
+    ) -> Result<(), SpaceError> {
+        if len == 0
+            || vaddr % PAGE_SIZE != 0
+            || len % PAGE_SIZE != 0
+            || !permissions.is_known()
+            || permissions.raw() == 0
+            || permissions.contains(ProcessMapFlags::WRITE) && !permissions.contains(ProcessMapFlags::READ)
+            || permissions.contains(ProcessMapFlags::WRITE | ProcessMapFlags::EXECUTE)
+        {
+            return Err(SpaceError::BadSegment);
+        }
+        let end = vaddr.checked_add(len).ok_or(SpaceError::BadSegment)?;
+        let stack_base = USER_TOP - STACK_SIZE;
+        if end > USER_TOP || vaddr < stack_base && end > stack_base {
+            return Err(SpaceError::BadSegment);
+        }
+        let mut pte_flags = flags::V | flags::U | flags::A;
+        if permissions.contains(ProcessMapFlags::READ) {
+            pte_flags |= flags::R;
+        }
+        if permissions.contains(ProcessMapFlags::WRITE) {
+            pte_flags |= flags::W | flags::D;
+        }
+        if permissions.contains(ProcessMapFlags::EXECUTE) {
+            pte_flags |= flags::X;
+        }
+
+        let pages = len / PAGE_SIZE;
+        let committed = self.frames.len();
+        for index in 0..pages {
+            if let Err(error) = self.alloc_map(vaddr + index * PAGE_SIZE, 1, pte_flags) {
+                for rollback in (0..index).rev() {
+                    self.tree
+                        .unmap(Vpn(vaddr / PAGE_SIZE + rollback), 1)
+                        .expect("single-page ProcessMap rollback cannot fail");
+                }
+                self.frames.truncate(committed);
+                return Err(error);
+            }
+        }
+        if end <= stack_base {
+            self.brk = self.brk.max(end);
+        }
+        Ok(())
+    }
+
+    /// Building-only 回填；先验证完整目标区间已映射，再经物理直映射写入，
+    /// 不要求目标最终 PTE 可写。
+    pub fn write_building(&mut self, target: usize, source: &[u8]) -> Result<(), SpaceError> {
+        let end = target.checked_add(source.len()).ok_or(SpaceError::BadSegment)?;
+        if end > USER_TOP {
+            return Err(SpaceError::BadSegment);
+        }
+        if !source.is_empty() {
+            for vpn in target / PAGE_SIZE..(end - 1) / PAGE_SIZE + 1 {
+                let Some(mapping) = self.tree.translate(Vpn(vpn)) else {
+                    return Err(SpaceError::BadSegment);
+                };
+                if mapping.flags & flags::U == 0 {
+                    return Err(SpaceError::BadSegment);
+                }
+            }
+        }
+
+        let mut copied = 0;
+        while copied < source.len() {
+            let va = target + copied;
+            let in_page = va % PAGE_SIZE;
+            let count = (PAGE_SIZE - in_page).min(source.len() - copied);
+            let mapping = self.tree.translate(Vpn(va / PAGE_SIZE)).expect("prevalidated mapping");
+            let pa = mapping.ppn.0 * PAGE_SIZE + in_page;
+            // SAFETY: Building process 尚不可运行；目标映射完整验证且其 backing
+            // 由本地址空间拥有。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source[copied..].as_ptr(),
+                    mm::phys_to_virt(pa) as *mut u8,
+                    count,
+                );
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
+    pub fn validate_initial_context(&mut self, entry: usize, stack_pointer: usize) -> Result<(), SpaceError> {
+        if stack_pointer == 0 || stack_pointer % 16 != 0 || self.brk == 0 {
+            return Err(SpaceError::BadSegment);
+        }
+        let entry_mapping = self
+            .tree
+            .translate(Vpn(entry / PAGE_SIZE))
+            .ok_or(SpaceError::BadSegment)?;
+        let stack_mapping = self
+            .tree
+            .translate(Vpn((stack_pointer - 1) / PAGE_SIZE))
+            .ok_or(SpaceError::BadSegment)?;
+        if entry_mapping.flags & (flags::U | flags::X) != (flags::U | flags::X)
+            || stack_mapping.flags & (flags::U | flags::W) != (flags::U | flags::W)
+        {
+            return Err(SpaceError::BadSegment);
+        }
         Ok(())
     }
 
@@ -149,7 +277,12 @@ impl AddressSpace {
                 return Err(SpaceError::BadSegment);
             }
             let start = seg.vaddr as usize;
-            let end = start + seg.memsz as usize;
+            if start % PAGE_SIZE != seg.offset as usize % PAGE_SIZE {
+                return Err(SpaceError::BadSegment);
+            }
+            let end = start
+                .checked_add(seg.memsz as usize)
+                .ok_or(SpaceError::BadSegment)?;
             if end > USER_TOP {
                 return Err(SpaceError::BadSegment);
             }
@@ -169,12 +302,25 @@ impl AddressSpace {
             top = top.max(end);
         }
 
+        if plan.values().any(|fl| {
+            fl & flags::W != 0 && fl & flags::R == 0
+                || fl & (flags::W | flags::X) == (flags::W | flags::X)
+        })
+        {
+            return Err(SpaceError::BadSegment);
+        }
+
         // 阶段二：逐页映射（记录 vpn → 物理帧，回填阶段查用）。
-        let mut pages: BTreeMap<usize, usize> = BTreeMap::new();
+        // 两个 Vec 都在安装 PTE 前一次性预留，之后的记账不得因扩容 panic。
+        let mut pages: Vec<(usize, usize)> = Vec::new();
+        pages.try_reserve(plan.len()).map_err(|_| SpaceError::NoFrame)?;
+        self.frames
+            .try_reserve(plan.len())
+            .map_err(|_| SpaceError::NoFrame)?;
         for (&vpn, &fl) in &plan {
             let tracker = frame::alloc_contiguous(1).ok_or(SpaceError::NoFrame)?;
             self.tree.map(Vpn(vpn), 1, Ppn(tracker.base.addr() / PAGE_SIZE), fl)?;
-            pages.insert(vpn, tracker.base.addr());
+            pages.push((vpn, tracker.base.addr()));
             self.frames.push(tracker);
         }
 
@@ -189,7 +335,10 @@ impl AddressSpace {
             while off < src.len() {
                 let in_page = va % PAGE_SIZE;
                 let n = (PAGE_SIZE - in_page).min(src.len() - off);
-                let frame = pages[&(va / PAGE_SIZE)];
+                let page_index = pages
+                    .binary_search_by_key(&(va / PAGE_SIZE), |&(vpn, _)| vpn)
+                    .expect("ELF page plan must cover every segment byte");
+                let frame = pages[page_index].1;
                 // SAFETY: 目标页为本空间独占（刚映射），直映射可写。
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -233,13 +382,25 @@ impl AddressSpace {
         if end > USER_TOP - STACK_SIZE {
             return Err(SpaceError::BadSegment);
         }
+        self.frames.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
         let tracker = frame::alloc_contiguous(pages).ok_or(SpaceError::NoFrame)?;
-        self.tree.map(
-            Vpn(base / PAGE_SIZE),
-            pages,
-            Ppn(tracker.base.addr() / PAGE_SIZE),
-            flags::USER_RODATA,
-        )?; // 失败时 tracker Drop 归还帧
+        let base_vpn = base / PAGE_SIZE;
+        let base_ppn = tracker.base.addr() / PAGE_SIZE;
+        for index in 0..pages {
+            if let Err(error) = self.tree.map(
+                Vpn(base_vpn + index),
+                1,
+                Ppn(base_ppn + index),
+                flags::USER_RODATA,
+            ) {
+                for rollback in (0..index).rev() {
+                    self.tree
+                        .unmap(Vpn(base_vpn + rollback), 1)
+                        .expect("single-page StartupBlock map rollback cannot fail");
+                }
+                return Err(error.into());
+            }
+        }
         // SAFETY: 刚分配的独占帧经直映射别名写入；用户侧 PTE 只读，
         // 进程对块内容也不可写。
         unsafe {
@@ -251,6 +412,104 @@ impl AddressSpace {
         }
         self.brk = end;
         self.frames.push(tracker);
+        Ok(base)
+    }
+
+    /// 回滚尚未发布的普通 StartupBlock。调用者保证它是最后一次 owned
+    /// mapping，且尚无线程可运行。
+    pub fn rollback_startup_block(&mut self, base: usize, byte_len: usize) {
+        let pages = byte_len.div_ceil(PAGE_SIZE);
+        let span = pages * PAGE_SIZE;
+        assert_eq!(self.brk, base + span, "startup rollback is not the latest mapping");
+        for index in 0..pages {
+            self.tree
+                .unmap(Vpn(base / PAGE_SIZE + index), 1)
+                .expect("single-page StartupBlock rollback cannot fail");
+        }
+        let tracker = self.frames.pop().expect("startup mapping tracker missing");
+        assert_eq!(tracker.count, pages, "startup mapping tracker size mismatch");
+        self.brk = base;
+    }
+
+    /// Bootstrap 专用 StartupBlock：prefix 复制到地址空间自有只读页，
+    /// 紧随其后的 opaque payload 直接借用 BootPackage 物理页。该入口不由
+    /// syscall 暴露；借用页由系统级 BootPackage reservation 保持。
+    pub fn map_bootstrap_block(
+        &mut self,
+        prefix: &[u8],
+        payload_pa: usize,
+        payload_len: usize,
+    ) -> Result<usize, SpaceError> {
+        if prefix.is_empty()
+            || prefix.len() % PAGE_SIZE != 0
+            || payload_pa % PAGE_SIZE != 0
+            || self.brk == 0
+        {
+            return Err(SpaceError::BadSegment);
+        }
+        let base = self.brk;
+        let prefix_pages = prefix.len() / PAGE_SIZE;
+        let payload_pages = payload_len.div_ceil(PAGE_SIZE);
+        let pages = prefix_pages
+            .checked_add(payload_pages)
+            .ok_or(SpaceError::BadSegment)?;
+        let span = pages.checked_mul(PAGE_SIZE).ok_or(SpaceError::BadSegment)?;
+        let end = base.checked_add(span).ok_or(SpaceError::BadSegment)?;
+        if end > USER_TOP - STACK_SIZE {
+            return Err(SpaceError::BadSegment);
+        }
+
+        self.frames.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
+        let tracker = frame::alloc_contiguous(prefix_pages).ok_or(SpaceError::NoFrame)?;
+        let base_vpn = base / PAGE_SIZE;
+        let prefix_ppn = tracker.base.addr() / PAGE_SIZE;
+        for index in 0..prefix_pages {
+            if let Err(error) = self.tree.map(
+                Vpn(base_vpn + index),
+                1,
+                Ppn(prefix_ppn + index),
+                flags::USER_RODATA,
+            ) {
+                for rollback in (0..index).rev() {
+                    self.tree
+                        .unmap(Vpn(base_vpn + rollback), 1)
+                        .expect("single-page bootstrap prefix rollback cannot fail");
+                }
+                return Err(error.into());
+            }
+        }
+        // SAFETY: prefix tracker 为本地址空间独占，用户映射只读。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                prefix.as_ptr(),
+                mm::phys_to_virt(tracker.base.addr()) as *mut u8,
+                prefix.len(),
+            );
+        }
+        if payload_pages > 0 {
+            for index in 0..payload_pages {
+                if let Err(error) = self.tree.map(
+                    Vpn(base_vpn + prefix_pages + index),
+                    1,
+                    Ppn(payload_pa / PAGE_SIZE + index),
+                    flags::USER_RODATA,
+                ) {
+                    for rollback in (0..index).rev() {
+                        self.tree
+                            .unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
+                            .expect("single-page bootstrap payload rollback cannot fail");
+                    }
+                    for rollback in 0..prefix_pages {
+                        self.tree
+                            .unmap(Vpn(base_vpn + rollback), 1)
+                            .expect("single-page bootstrap prefix rollback cannot fail");
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        self.frames.push(tracker);
+        self.brk = end;
         Ok(base)
     }
 
@@ -279,7 +538,9 @@ impl AddressSpace {
             if let Err(e) = self.alloc_map(self.brk + i * PAGE_SIZE, 1, flags::USER_DATA) {
                 // 回滚：撤销本次已映页（帧随 FrameTracker 归还帧池），brk 不动。
                 for j in (0..i).rev() {
-                    self.tree.unmap(Vpn(base_vpn_v + j), 1);
+                    self.tree
+                        .unmap(Vpn(base_vpn_v + j), 1)
+                        .expect("single-page heap rollback cannot fail");
                 }
                 self.frames.truncate(committed);
                 return Err(e);
@@ -357,7 +618,9 @@ impl AddressSpace {
             return;
         };
         self.external_mappings.swap_remove(index);
-        self.tree.unmap(Vpn(va / PAGE_SIZE), 1);
+        self.tree
+            .unmap(Vpn(va / PAGE_SIZE), 1)
+            .expect("single-page external unmap cannot fail");
         // SAFETY: 同 map_external。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
     }
@@ -371,9 +634,13 @@ pub struct Process {
     pub pid: Pid,
     /// 仅用于诊断的创建关系；不产生管理、继承或回收权。
     pub parent: Pid,
+    /// 创建域只维持 Job 生命周期；管理 authority 仍只来自 Handle。
+    #[expect(dead_code, reason = "Job 预算与域终止接线时使用")]
+    pub(crate) job: super::object::ObjectRef,
     pub space: crate::sync::Spinlock<AddressSpace>,
     /// 新对象 ABI 的进程本地 Handle 表。
     pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
+    pub(crate) control: crate::sync::Spinlock<Option<Arc<super::process::ProcessControl>>>,
 }
 
 impl Drop for Process {
@@ -390,13 +657,28 @@ impl Drop for Process {
 }
 
 impl Process {
-    fn new(pid: Pid, parent: Pid) -> Result<Self, SpaceError> {
+    pub(crate) fn new(
+        pid: Pid,
+        parent: Pid,
+        job: super::object::ObjectRef,
+    ) -> Result<Self, SpaceError> {
         Ok(Self {
             pid,
             parent,
+            job,
             space: crate::sync::Spinlock::new(AddressSpace::new()?),
             handles: crate::sync::Spinlock::new(super::handle::ProcessHandleTable::new()),
+            control: crate::sync::Spinlock::new(None),
         })
+    }
+
+    pub(crate) fn attach_control(&self, control: Arc<super::process::ProcessControl>) {
+        let previous = self.control.lock().replace(control);
+        debug_assert!(previous.is_none());
+    }
+
+    pub(crate) fn take_control(&self) -> Option<Arc<super::process::ProcessControl>> {
+        self.control.lock().take()
     }
 }
 
@@ -431,12 +713,13 @@ impl Thread {
         process: Arc<Process>,
         entry: usize,
         requirement: elf::IsaRequirement,
+        stack_pointer: usize,
         block_va: usize,
         block_len: usize,
     ) -> Self {
         let mut ctx = UserContext::zeroed();
         ctx.sepc = entry as u64;
-        ctx.x[2] = USER_TOP as u64; // sp
+        ctx.x[2] = stack_pointer as u64;
         ctx.x[10] = block_va as u64; // a0 = StartupBlock base
         ctx.x[11] = block_len as u64; // a1 = StartupBlock length
         Self {
@@ -475,13 +758,14 @@ pub struct SpawnedProcess {
 pub fn spawn_from_elf(
     pid: Pid,
     parent: Pid,
+    job: super::object::ObjectRef,
     image: &elf::Elf,
     file: &[u8],
 ) -> Result<SpawnedProcess, SpaceError> {
     // 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/
     // TSO/未建模状态扩展在 load 时明确拒绝，不降级为 Base。
     let requirement = elf::isa_requirement(file).expect("userspace execution requirement rejected");
-    let process = Arc::new(Process::new(pid, parent)?);
+    let process = Arc::new(Process::new(pid, parent, job)?);
     {
         let mut space = process.space.lock();
         space.load_elf(&image.segments, file)?;
@@ -494,15 +778,35 @@ pub fn spawn_from_elf(
     })
 }
 
-/// launch 事务：为 child 预留真实 Handle → 由内核构造通用 StartupBlock
-/// （身份 + Handle 数组 + opaque payload）→ 只读映射 → 原子安装 Handle →
-/// 创建主线程并入进程表。payload 语义只属于 launcher 与接收进程。
+pub(crate) fn prepare_main_thread(
+    process: Arc<Process>,
+    entry: usize,
+    requirement: elf::IsaRequirement,
+    stack_pointer: usize,
+    block_va: usize,
+    block_len: usize,
+) -> Result<Arc<Thread>, SpaceError> {
+    Arc::try_new(Thread::new_main(
+        process,
+        entry,
+        requirement,
+        stack_pointer,
+        block_va,
+        block_len,
+    ))
+    .map_err(|_| SpaceError::NoFrame)
+}
+
+/// Bootstrap launch 事务：为 init 预留真实 Handle → 构造 prefix 并把
+/// BootPackage payload 借入同一 StartupBlock VA → 原子安装 Handle → 创建
+/// 主线程并入进程表。普通 ProcessStart 走 `task::process` 的 copied payload。
 ///
 /// 失败全量回滚：临时 Handle 数值随 reservation 作废，输入 entries 按目标
 /// 进程退出语义关闭，进程表不出现半初始化项。W^X 发布边界仍是后续
 /// `sched::enqueue` 的 Release。
-pub fn launch(
+pub fn launch_bootstrap(
     spawned: SpawnedProcess,
+    payload_pa: usize,
     payload: &[u8],
     handles: Vec<super::handle::ProcessHandleEntry>,
 ) -> Result<Arc<Thread>, SpaceError> {
@@ -527,11 +831,12 @@ pub fn launch(
         }
     };
 
-    let block = match erhino_shared::startup::build_startup_block(
+    let block = match erhino_shared::startup::build_startup_prefix(
         process.pid,
         process.parent,
         reservation.handles(),
-        payload,
+        PAGE_SIZE,
+        payload.len(),
     ) {
         Ok(block) => block,
         Err(error) => {
@@ -550,7 +855,12 @@ pub fn launch(
         }
     };
 
-    let block_va = match process.space.lock().map_startup_block(&block) {
+    let block_len = block.len() + payload.len();
+    let block_va = match process
+        .space
+        .lock()
+        .map_bootstrap_block(&block, payload_pa, payload.len())
+    {
         Ok(va) => va,
         Err(error) => {
             process
@@ -571,13 +881,14 @@ pub fn launch(
         .commit(reservation, handles)
         .expect("launch reservation count matches entries");
 
-    let thread = Arc::new(Thread::new_main(
+    let thread = prepare_main_thread(
         process.clone(),
         entry,
         requirement,
+        USER_TOP,
         block_va,
-        block.len(),
-    ));
-    super::table::insert(process);
+        block_len,
+    )?;
+    super::table::insert_boot(process);
     Ok(thread)
 }
