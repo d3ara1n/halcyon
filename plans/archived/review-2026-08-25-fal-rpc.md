@@ -1,6 +1,6 @@
 # Review：FAL/RPC 集成批次
 
-日期：2026-08-25。对象：`54d3e02`（设计入档 + WaitMany deadline + librpc/libfal 线协议）、`bf32c1c`（libfs + memfs/provider + fs 真实化 + 旧 ABI 清除）、`277a87c`（syscall 清表 + kind 动词化）。reviewer：CosmicGale（GPT 5.6 Sol，只读审查），归档：ClearCreek。计划：[todo-2026-08-25-fal-rpc-review.md](../todo-2026-08-25-fal-rpc-review.md)。
+日期：2026-08-25。对象：`54d3e02`（设计入档 + WaitMany deadline + librpc/libfal 线协议）、`bf32c1c`（libfs + memfs/provider + fs 真实化 + 旧 ABI 清除）、`277a87c`（syscall 清表 + kind 动词化）。reviewer：CosmicGale（GPT 5.6 Sol，只读审查），归档：ClearCreek。计划：[2026-08-25-fal-rpc-review.md](2026-08-25-fal-rpc-review.md)。
 
 **裁决：修复后收口。** 首轮不可收口（1 blocker + 8 major + 5 minor，集中于同进程泵未覆盖的真路径）；修复批落地 B1、M1–M3、M5–M8、m1–m5 全部项，M4（slot 1 锚授权）与 M7 的 Delegate 映射随跨进程批次（见下）；基线复验全绿（host 59 项、三 workspace check、just virt 四服务 + fs 验收线）。
 

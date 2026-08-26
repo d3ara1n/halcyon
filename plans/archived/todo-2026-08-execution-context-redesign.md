@@ -1,6 +1,6 @@
 # 执行环境整体重构提案
 
-> 架构决策已确认，稳定契约见 `notes/execution-context.md`。本篇保留推导、边界细节与后续实施导航；当前代码尚未完成切换。
+> 架构决策已确认，稳定契约见 `notes/impls/execution-context.md`。本篇保留推导与边界细节；整体切换已随 a9a65cb 落地并归档。
 
 ## 1. 推导边界
 
@@ -221,14 +221,14 @@ kernel gp 在 bootstrap/formal entry/用户 trap 后均由同一规范序列建�
 
 ## 11. 落地顺序
 
-稳定结论已写入 `notes/execution-context.md`。实现先准备不会被执行的契约数据面，最后以一个原子里程碑激活正式环境：
+稳定结论已写入 `notes/impls/execution-context.md`。实现先准备不会被执行的契约数据面，最后以一个原子里程碑激活正式环境：
 
 1. 固定现代 DT schemas；补 DT string-list/cpu-map 与 ELF attributes 的 host parser/tests；更新平台 DTS。
 2. 建立 IMAC/LP64 构建、独立 FP helper section、链接后 ISA/ABI 审计和 Rust const offsets。
 3. 准备但不激活 BootstrapContext、HartRegistry/HartSlot、HartBootRecord、RuntimeGate、per-domain scheduler、UserContext/FpState 与共同 trap/CSR helper。
 4. 原子激活完整执行边界：PA 过渡入口、高半区 formal entry、共同 trap、CSR 表、112-byte frame、scause、SUM guard、reservation clear、I-cache 发布和 capability-aware domain 同时替换旧路径；不存在“新 formal entry 配旧 vector/CSR”的中间运行模型。
 5. 切换默认用户 LP64 target，保留显式 D64 构建入口；用合成 DT/ELF/topology 做 host contract tests。
-6. 对最终 diff 做独立规范 review，逐项关闭 `01-sbi.md`、`02-trap-context.md` findings，并按实现反馈同步 `notes/`。
+6. 对最终 diff 做独立规范 review，逐项关闭 `plans/review-2026-08-audit-01-sbi.md`、`plans/review-2026-08-audit-02-trap-context.md` findings，并按实现反馈同步 `notes/`。
 
 实施中可以按依赖保持工作区暂时不可运行，但不提交或保留过渡兼容模型。
 

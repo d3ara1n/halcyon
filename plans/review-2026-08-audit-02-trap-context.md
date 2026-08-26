@@ -3,8 +3,8 @@
 - 基线：`c449f00186a8533c4ca8fb04c93dc8e735602b3a`
 - 状态：首审、独立核验与架构决策完成；代码修复统一纳入执行环境重构
 - 外部规范：RISC-V Privileged v1.13（`references/normative/riscv-isa-v20250508/`）、RISC-V psABI v1.0
-- 项目设计：`notes/execution-context.md`
-- 重构导航：`plans/reviews/system-audit/context-redesign.md`
+- 项目设计：`notes/impls/execution-context.md`
+- 重构导航：`archived/todo-2026-08-execution-context-redesign.md`（已完成，随 a9a65cb 落地）
 
 ## 代码表面
 
@@ -25,10 +25,10 @@
 | CSR-1 | SPP 决定 SRET 返回特权级；HSM 未保证其它 sstatus 字段 | `supervisor.adoc`「sstatus」、SBI HSM | HART_SETUP、`_resume_user` | 违反，见 TRAP-001 |
 | CSR-2 | U 态忽略 SIE；中断来源由 `sie` 逐项使能 | `supervisor.adoc`「sstatus」「sip/sie」 | HART_SETUP、`sched::run`、notes | `sie` 未精确初始化，notes 漂移 |
 | TRAP-1 | scause Interrupt bit 与 code 必须共同解释 | `supervisor.adoc`「scause」 | `handle_user_trap` | 违反，见 TRAP-004 |
-| TRAP-2 | U 态同步异常不得破坏内核 | `notes/task.md` 生命周期 | `handle_user_trap` | 部分异常会误分发或 panic |
+| TRAP-2 | U 态同步异常不得破坏内核 | `notes/impls/task.md` 生命周期 | `handle_user_trap` | 部分异常会误分发或 panic |
 | FP-1 | Dirty 才需保存；Initial 恢复必须建立初始常量 | `machine.adoc`「Extension Context Status」 | FP save/restore、`fp_valid` | Dirty/valid 路径正确，invalid 路径泄漏，见 TRAP-002 |
-| ANCHOR-1 | 内核态 tp 指 HartLocal、stvec 指内核入口 | `notes/internals.md` | trap 过渡序列 | 稳态正确，过渡窗口不闭合，见 TRAP-006 |
-| LAYOUT-1 | 汇编偏移与 Rust 实际字段布局机械绑定 | `notes/internals.md`、模块注释 | `frame_off`、`hart::off` | 当前数值正确，绑定不完整，见 TRAP-007 |
+| ANCHOR-1 | 内核态 tp 指 HartLocal、stvec 指内核入口 | `notes/impls/internals.md` | trap 过渡序列 | 稳态正确，过渡窗口不闭合，见 TRAP-006 |
+| LAYOUT-1 | 汇编偏移与 Rust 实际字段布局机械绑定 | `notes/impls/internals.md`、模块注释 | `frame_off`、`hart::off` | 当前数值正确，绑定不完整，见 TRAP-007 |
 
 ## Findings
 
@@ -156,7 +156,7 @@ kernel gp 正式初始化并在用户 trap 边界恢复。内核切换到 RV64IM
 
 ### 契约
 
-`notes/internals.md` 规定内核态 tp 恒指 HartLocal、stvec 指内核致命入口。SIE=0 只能屏蔽中断，不能防止同步异常。
+`notes/impls/internals.md` 规定内核态 tp 恒指 HartLocal、stvec 指内核致命入口。SIE=0 只能屏蔽中断，不能防止同步异常。
 
 ### 实现
 
@@ -200,7 +200,7 @@ TrapFrame 只对 fcsr/fp_valid/sepc 使用实际 `offset_of!`，没有绑定 x/f
 - 置信度：已确认
 - 状态：已收口
 
-`supervisor.adoc` 规定 U 态忽略 SIE，S 级中断天然全局可进入，具体来源由 `sie` 控制。已在 `notes/internals.md` 与 `notes/execution-context.md` 收口为：内核 S 态 SIE=0；U 态不受 SIE gate，SSIE/STIE 等来源由 `sie` 精确使能。
+`supervisor.adoc` 规定 U 态忽略 SIE，S 级中断天然全局可进入，具体来源由 `sie` 控制。已在 `notes/impls/internals.md` 与 `notes/impls/execution-context.md` 收口为：内核 S 态 SIE=0；U 态不受 SIE gate，SSIE/STIE 等来源由 `sie` 精确使能。
 
 ## 正确实现与边界
 
@@ -225,6 +225,6 @@ TrapFrame 只对 fcsr/fp_valid/sepc 使用实际 `offset_of!`，没有绑定 x/f
 - kernel gp 正式初始化；汇编偏移由 Rust `offset_of!` 经 `global_asm!` 注入。
 - 内核使用 RV64IMAC/LP64 整数 ABI，普通内核代码禁止 FP/V；用户 FP helper 是 capability-guarded 的局部汇编。
 - stvec 恒指共同入口，sscratch 恒为 HartLocal，SPP 是来源真值；S 态 trap 进入 emergency fatal。
-- CSR、SUM、LR/SC reservation、I-cache 发布、HartSlot/bootstrap 与 capability-aware domain 按 `notes/execution-context.md` 统一收口。
+- CSR、SUM、LR/SC reservation、I-cache 发布、HartSlot/bootstrap 与 capability-aware domain 按 `notes/impls/execution-context.md` 统一收口。
 
 TRAP-001 至 TRAP-007 不在旧路径逐项打补丁，防止形成马上被删除的过渡模型；当前代码在整体重构完成前不能宣称支持恶意用户负载或无 F/D 异构 hart。

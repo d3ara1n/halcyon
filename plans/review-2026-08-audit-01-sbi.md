@@ -3,8 +3,8 @@
 - 基线：`c449f00186a8533c4ca8fb04c93dc8e735602b3a`
 - 状态：首审与独立核验完成；DBCN/平台基线已收口，启动与 CSR 问题纳入执行环境重构
 - 外部规范：`references/normative/riscv-sbi-v3.0/`
-- 项目设计：`notes/internals.md`、`notes/execution-context.md`
-- 重构导航：`plans/reviews/system-audit/context-redesign.md`
+- 项目设计：`notes/impls/internals.md`、`notes/impls/execution-context.md`
+- 重构导航：`archived/todo-2026-08-execution-context-redesign.md`（已完成，随 a9a65cb 落地）
 
 ## 代码表面
 
@@ -135,7 +135,7 @@ DBCN 的函数表标明其自 SBI 2.0 出现；BASE 允许通过 probe 查询扩
 
 ### 处理方向
 
-已选择并写入 `notes/internals.md`：SBI 2.0+；TIME/IPI/HSM/DBCN 必需，SRST 可选。DBCN 仅承载 best-effort 观测输出；legacy putchar 只用于 DBCN 尚未就绪时的早期诊断。
+已选择并写入 `notes/impls/internals.md`：SBI 2.0+；TIME/IPI/HSM/DBCN 必需，SRST 可选。DBCN 仅承载 best-effort 观测输出；legacy putchar 只用于 DBCN 尚未就绪时的早期诊断。
 
 ## SBI-005：boot 到 secondary 的共享状态发布尚无内存模型证明
 
@@ -183,4 +183,4 @@ secondary 会读取 boot 写入的跳板页表、`KERNEL_SATP` 和 DBCN 支持�
 - DBCN：单次非阻塞 best-effort，任何输出失败不影响其它模块。
 - SBI 基线：2.0+；TIME/IPI/HSM/DBCN 必需，SRST 可选。
 
-SBI-002、SBI-003、SBI-005 不在旧启动路径逐项补丁；统一由 `notes/execution-context.md` 的 BootstrapContext、HartBootRecord、formal entry 与 Release/Acquire RuntimeGate 收口。当前代码在整体重构完成前仍不满足这些契约。
+SBI-002、SBI-003、SBI-005 不在旧启动路径逐项补丁；统一由 `notes/impls/execution-context.md` 的 BootstrapContext、HartBootRecord、formal entry 与 Release/Acquire RuntimeGate 收口。当前代码在整体重构完成前仍不满足这些契约。
