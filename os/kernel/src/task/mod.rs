@@ -9,4 +9,4 @@ pub mod table;
 pub mod tunnel;
 pub mod wait;
 
-pub use proc::{spawn_from_elf, Thread};
+pub use proc::{launch, spawn_from_elf, Thread};

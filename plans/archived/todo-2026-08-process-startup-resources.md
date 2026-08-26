@@ -1,12 +1,24 @@
 # todo：进程身份与启动资源交付
 
-状态：**待设计**。本计划替换 IPC 重建期间的 `StartupMailbox` 过渡模式；核心设计需先比较方案并由用户确认，再修改 ABI 和代码。
+状态：**已完成（2026-10）**。方案 A 机制 + C 门面已实施完毕，方向入 `notes/ideas/object.md`/`service.md`，实现记录入 `notes/impls/startup.md`，本计划归档。
 
 ## 前置结论（方向已定）
 
 - startup 的内核形状只有两个物理动作：进程 runnable 前批量原子安装 Handle（根图的唯一例外），与投递版本化 STARTUP 消息。清单的语义——tag、类型、标签、名字前缀——是授权方与接收方库之间的版本化用户态协议，内核零解释；Mailbox 无特殊形状，`StartupGrant` 即 descriptor 的雏形。
 - 因此下述 A/B/C 的分歧只在清单的存放与读取时机，上述底座不变。
 - namespace 授权的形状是成对交付：`StartupGrant`（新 tag）+ payload 中的（名字前缀, handle_index）；前缀是消息字节，内核无感。成对交付才是完整授权语义——“给你一个目录，并声明它在你的视图中的名字”。
+
+## 已确认方案（2026-10，A 机制 + C 门面）
+
+经外部调研（`ref-2026-08-startup-research.md`）与多轮讨论拍板：
+
+- **机制选 A（用户只读映射启动块）**，不选 B（查询 ABI）/C-proper（Process-self 对象）：A 是唯一让内核在 launch 事务结束后完全退出启动事务的形状——零常驻清单、零启动 syscall、块随地址空间生灭；B 会扩大 uaccess 写回 panic 面，C 的唯一刚需（入口查身份）已被「身份进块头」消解。
+- **入口契约**：`a0` = 块指针（动态 VA，映像后、堆前），`sp` = `USER_TOP`；pid/parent_pid 进块头。不引入固定块地址，不自定义 `_start`（Rust `#[lang = "start"]` 从 argc/argv 槽位取 a0/a1 已够用）。
+- **launch transaction**：装载 ELF → 分配帧写入 manifest 字节 → 只读映射（R|U 无 W）→ handles[] 按数组顺序装进槽位 0..N（连续槽位约定，descriptor 的 handle_index 语义即槽位号）→ 设入口寄存器 → enqueue。失败全量回滚；runnable 即事务终结，内核对启动零尾随状态。块帧记入 `AddressSpace.frames`，生命周期归进程。
+- **manifest 对内核是不透明字节串**：内核不 parse、不校验头；块长度与 handle 数来自 launch 参数。版本化、未知 tag 忽略规则、payload 透传（如 fs 路由表）全在 rinlib 侧。
+- **资源三分**：信息（args/配置/归档字节，随块过境）、能力（create 类 syscall，对所有进程无差别开放，不存在下放）、权利（对他人对象的 Handle，只能沿进程树向下流动且单调收窄；权利之源是对象创建者，不是内核）。「服务出生自带 mailbox」是 pm 的组装惯例（声明驱动），不是内核机制。
+- **init 终态**：普通 rinlib 进程，manifest = 身份 + 整个 initfs 归档字节（payload 区透传，tag 语义属 boot loader ↔ init 私有协议），handles 可以为零（需邮箱自己 create）。本次不实施归档 handover（两步走）：本次内核 loader 仍起四服务但按新契约组 manifest；归档 handover 与「内核只 spawn init」收缩留到服务化阶段（ProcessCreate 就绪后组装代码平移到 init）。
+- **manifest 上限是 launcher 策略参数**（机制只受帧池约束），不写死在 ABI。
 
 ## 问题
 
@@ -91,4 +103,7 @@
 
 ## 完成条件
 
-经用户确认最终方案后，shared/kernel/rinlib/loader/服务一次纵向切换；所有验证通过，方向进入 notes、实现进入 `notes/impls/`，本计划归档。
+- [x] shared/kernel/rinlib/loader/服务一次纵向切换：StartupBlock ABI（`shared/src/startup.rs`）、launch 事务（`task::launch` + `map_startup_block`）、rinlib 块解析（`env::init`）与 loader 组装（`initfs.rs`）；
+- [x] 验证：`virt` 与 `sifive_u` 四服务全绿（含 fs 验收线、init/pm 全套 IPC 测试）；帧守恒与基线一致（quiescent 差 251 帧）；无 Handle/空清单进程（fs/drv）正常启动；结果只依赖 a0；shared host 测试钉住块布局与槽位约定；
+- [x] `StartupMailbox`、`Process.bootstrap_mailbox`、`enqueue_startup` 与强制 STARTUP 接收路径全部删除，代码零残留；
+- [x] 方向入 notes（ideas/object.md、ideas/service.md）、实现入 notes/impls/startup.md，本计划归档。

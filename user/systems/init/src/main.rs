@@ -24,7 +24,7 @@ use rinlib::{
         call::SystemCallError,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
-        startup::GRANT_PM_MAILBOX,
+        startup::TAG_PM_MAILBOX,
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
 };
@@ -106,7 +106,7 @@ fn main() {
         }
     };
     debug!("tunnel created");
-    let Some(pm_mailbox) = env::startup_handle(GRANT_PM_MAILBOX) else {
+    let Some(pm_mailbox) = env::startup_handle(TAG_PM_MAILBOX) else {
         debug!("pm mailbox grant is missing");
         return;
     };

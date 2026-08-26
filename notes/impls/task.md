@@ -7,13 +7,14 @@
 低半区 `[0, 2^38)`，无 trampoline 与隧道区——共享内核映射后用户半区完整归用户：
 
 ```
-[0, brk)              ELF 段（text/rodata/data/bss，LOAD 段原样映射）
-[brk, 栈区底)         堆，Extend 向上扩展，逐页映射
+[0, brk')             ELF 段（text/rodata/data/bss，LOAD 段原样映射）
+[brk', block_end)     StartupBlock（只读，launch 映射；见 startup.md）
+[block_end, 栈区底)   堆，Extend 向上扩展，逐页映射
 [栈区底, 2^38)        栈区：主线程栈 8MiB 钉在半区顶，未来线程栈向下生长
 ```
 
-- 堆扩展（Extend）从当前 brk 起逐页映射，返回新 brk。物理连续性不做要求，虚拟连续性由「从 brk 起步映射」结构性保证。
-- 主线程初始 sp = `2^38`（栈顶，16 字节对齐）；a0 = pid、a1 = parent 是入口参数（rinlib 启动契约）。
+- 堆扩展（Extend）从当前 brk 起逐页映射，返回新 brk；brk 基点在 launch 时越过启动块，块与堆结构性互不重叠。物理连续性不做要求，虚拟连续性由「从 brk 起步映射」结构性保证。
+- 主线程初始 sp = `2^38`（栈顶，16 字节对齐）；a0 = StartupBlock 基址、a1 = 块字节数是入口参数（rinlib 启动契约，见 [startup.md](startup.md)）。
 - 用户 tp 置 0（rinlib 未用 TLS；引入 TLS 时再定义 ABI）。
 - ASID 恒 0，地址空间切换时 `sfence.vma` 全量冲刷；ASID 分配（sv39 仅 9 位，需复用策略）作为优化留待演进——启用时同步引入 remote call 的 TLB shootdown 消费者。
 

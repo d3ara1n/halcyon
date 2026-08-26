@@ -64,9 +64,6 @@ pub enum SystemCall {
     // -----Process control-----
     /// Finalized process notifies kernel to cleanup
     Exit = 0x10,
-    /// 临时启动资源查询：返回本进程 bootstrap Mailbox owner Handle。
-    /// 后续由通用 startup-resource 枚举替代。
-    StartupMailbox = 0x18,
 
     // -----Thread-----
     /// Finalized thread notifies kernel to cleanup

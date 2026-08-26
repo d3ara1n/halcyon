@@ -22,7 +22,7 @@ pub mod time;
 pub mod object;
 /// Messaging primitives
 pub mod message;
-/// Signal primitives
+/// 启动资源交付（StartupBlock：只读映射块 + descriptor 清单）
 pub mod startup;
 /// 统一对象等待
 pub mod wait;

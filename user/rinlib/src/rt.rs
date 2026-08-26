@@ -1,12 +1,9 @@
 use core::{alloc::Layout, panic::PanicInfo, ptr::NonNull};
-use erhino_shared::{
-    proc::{Pid, Termination},
-    startup::{MESSAGE_KIND_STARTUP, STARTUP_VERSION, StartupGrant, StartupHeader},
-};
+use erhino_shared::proc::Termination;
 use erhino_shared::sync::spin::SimpleLock;
 use talc::{base::binning::Binning, base::Talc, source::Source, TalcLock};
 
-use crate::call::{sys_extend, sys_startup_mailbox};
+use crate::call::sys_extend;
 use crate::env;
 use crate::{call::sys_exit, debug};
 
@@ -63,13 +60,12 @@ fn lang_start<T: Termination + 'static>(
     argv: *const *const u8,
     _sigpipe: u8,
 ) -> isize {
-    let pid = argc as usize as Pid;
-    let parent = argv as usize as Pid;
+    // 启动契约（shared::startup）：launch 在进程 runnable 前只读映射
+    // StartupBlock，a0 持块基、a1 持块字节数（分别落在 argc/argv 槽位；
+    // argv 槽位因此不再是保留未用，语义即「指针 + 长度」）。
+    // 解析失败即拒绝启动，不进入 main。
+    env::init(argc as usize as *const u8, argv as usize);
     unsafe {
-        env::set_pid(pid);
-        env::set_parent_pid(parent);
-        let startup_mailbox = sys_startup_mailbox().expect("startup mailbox query failed");
-        env::set_startup_mailbox(startup_mailbox);
         let mut talc = HEAP_ALLOCATOR.lock();
         // sbrk 语义（见 HeapRecuse::acquire）：查询起点、申请 INITIAL_HEAP_SIZE
         // 字节、以返回值差值为实际获得区间。
@@ -82,7 +78,6 @@ fn lang_start<T: Termination + 'static>(
             .expect("initial heap claim failed");
         talc.source.heap_end = heap_end.as_ptr() as usize;
     }
-    load_startup();
     // 信号分发说明：内核只做置位与唤醒，进程级信号的接收/分发由程序
     // 自行安排（监听线程模式待多线程里程碑接入 rt；见 notes/ideas/signal.md）。
     let code = main().to_exit_code();
@@ -91,47 +86,6 @@ fn lang_start<T: Termination + 'static>(
             sys_exit(code).expect("this can't be wrong");
         }
     }
-}
-
-fn load_startup() {
-    let message = crate::ipc::message::receive(env::startup_mailbox())
-        .expect("startup message receive failed");
-    assert!(message.header.kind == MESSAGE_KIND_STARTUP, "invalid startup message kind");
-    assert!(
-        message.payload.len() >= core::mem::size_of::<StartupHeader>(),
-        "truncated startup message"
-    );
-    // SAFETY: 长度已检查，read_unaligned 不要求 payload 对齐；结构只有整数字段。
-    let header = unsafe {
-        core::ptr::read_unaligned(message.payload.as_ptr().cast::<StartupHeader>())
-    };
-    assert!(
-        header.version == STARTUP_VERSION && header.kind == 0 && header.reserved == [0; 2],
-        "unsupported startup message"
-    );
-    let grants_len = (header.grant_count as usize)
-        .checked_mul(core::mem::size_of::<StartupGrant>())
-        .expect("startup grant length overflow");
-    let expected = core::mem::size_of::<StartupHeader>()
-        .checked_add(grants_len)
-        .expect("startup message length overflow");
-    assert!(message.payload.len() == expected, "invalid startup message length");
-    assert!(
-        message.handles.len() == header.grant_count as usize,
-        "startup grant/handle count mismatch"
-    );
-    let grants_ptr = unsafe { message.payload.as_ptr().add(core::mem::size_of::<StartupHeader>()) };
-    // SAFETY: payload 长度覆盖全部元素；逐项 unaligned 读取到本地数组。
-    let mut grants = alloc::vec::Vec::new();
-    grants
-        .try_reserve_exact(header.grant_count as usize)
-        .expect("startup grant allocation failed");
-    for index in 0..header.grant_count as usize {
-        let ptr = unsafe { grants_ptr.add(index * core::mem::size_of::<StartupGrant>()) };
-        grants.push(unsafe { core::ptr::read_unaligned(ptr.cast::<StartupGrant>()) });
-    }
-    assert!(grants.iter().all(|grant| grant.reserved == 0), "invalid startup grant");
-    env::set_startup_grants(&grants, &message.handles);
 }
 
 #[panic_handler]

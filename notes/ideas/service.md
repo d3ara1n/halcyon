@@ -4,9 +4,9 @@
 
 ## 启动与授权
 
-`ProcessCreate`/`ProcessStart` 是建立进程与其初始资源的统一事务。新进程在 runnable 前获得可枚举的 typed/tagged startup resources，服务像读取参数一样主动发现所需 grants；Mailbox receiver 是可选资源，不占固定入口寄存器或固定 Handle 数值。获得启动邮箱的服务再从版本化 `STARTUP` 消息或后续授权消息取得动态资源，不凭 PID 或全局对象名取得权限。
+进程启动 = 一个只读启动快照 + 一组已安装 Handle：快照携带身份（pid/parent）、args、配置等**信息**，Handle 安装交付对他人对象的**权利**；快照与安装在同一 launch 事务内原子完成，新进程 runnable 前定形。服务像读取参数一样按 tag 主动发现所需资源；Mailbox receiver 是可选资源，不占固定入口寄存器或固定 Handle 数值，需要而未被授予的进程自己创建。
 
-成熟用户环境中 init 读取 initfs 配置，创建服务并按最小权限原则交付设备、内存、服务依赖和管理 Handle。init 尚未接管时，内核启动装载者只通过同一内部 launch primitive 暂代根授权方：sender 为零，按集成配置给 `srv_init` grants。未来把策略整体移入 init 后，删除内核策略，不改变 startup-resource、消息或 Handle move 契约。
+成熟用户环境中 init 读取启动快照携带的 initfs 配置，创建服务并按最小权限原则交付设备、内存、服务依赖和管理 Handle。init 尚未接管时，内核启动装载者以同一 launch 事务暂代授权方（为集成负载组装邮箱对）；策略整体迁入 init 后内核只启动 init，不改变快照、Handle move 或对象契约，也不保留 `Send(pid)` 后门。
 
 ## 发现与调用
 

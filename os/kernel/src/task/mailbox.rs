@@ -93,23 +93,6 @@ impl Mailbox {
         this.clone()
     }
 
-    /// 装载器在进程 runnable 前投递启动消息。此时邮箱尚不可并发访问。
-    pub(crate) fn enqueue_startup(
-        &self,
-        kind: u64,
-        payload: Vec<u8>,
-        handles: Vec<ProcessHandleEntry>,
-    ) {
-        let mut state = self.state.lock();
-        assert!(!state.closed && state.queue.is_empty() && state.receiving.is_none());
-        state.queue.push_back(Message {
-            header: MessageHeader::new(0, kind, payload.len() as u32, handles.len() as u32),
-            payload,
-            handles,
-        });
-        state.publish();
-    }
-
     /// 调用方已持 HandleTable 锁；本方法只再取 Mailbox 锁。
     pub fn enqueue_with(
         &self,

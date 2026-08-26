@@ -1,9 +1,12 @@
-//! initfs 装载：tar 就地遍历 → ELF 解析 → 建立启动授权 → 统一入队。
+//! initfs 装载：tar 就地遍历 → ELF 解析 → 组装启动授权 → 统一 launch。
+//!
+//! 本模块是启动资源交付的内核授权方（过渡）：按服务身份现写 manifest
+//! 字节并安装 Handle。服务化阶段该策略整体迁往 init/pm，launch 机制
+//! 原样复用（见 plans/todo-2026-08-process-startup-resources.md）。
 
 use alloc::vec::Vec;
-use erhino_shared::startup::{
-    GRANT_PM_MAILBOX, MESSAGE_KIND_STARTUP, StartupGrant, StartupHeader,
-};
+use erhino_shared::object::Rights;
+use erhino_shared::startup::{StartupManifest, TAG_MAILBOX_OWNER, TAG_PM_MAILBOX};
 
 use crate::{mm, sched, task, task::table};
 use tar;
@@ -54,57 +57,64 @@ pub fn load(addr: usize, len: usize) {
     })
     .expect("malformed initfs archive");
 
-    let mut pm_sender = pending
-        .iter_mut()
-        .find(|item| item.kind == ServiceKind::Pm)
-        .and_then(|item| item.spawned.sender_grant.take());
+    // pm 邮箱对（授权方惯例「服务出生自带邮箱」的组装点）：owner 授 pm，
+    // sender 授 init。清单与 Handle 的顺序无关，未认领侧不泄漏。
+    let (mut pm_owner, mut pm_sender) = pending
+        .iter()
+        .any(|item| item.kind == ServiceKind::Pm)
+        .then(|| {
+            let mailbox = task::mailbox::Mailbox::new();
+            let object = task::mailbox::Mailbox::object_ref(&mailbox);
+            let owner = task::handle::entry(
+                object.clone(),
+                task::object::HandleRole::MailboxOwner,
+                Rights::READ | Rights::WAIT | Rights::MANAGE,
+            )
+            .expect("mailbox owner entry rights");
+            let sender = task::handle::entry(
+                object,
+                task::object::HandleRole::MailboxSender,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+            )
+            .expect("mailbox sender entry rights");
+            (owner, sender)
+        })
+        .map_or((None, None), |(owner, sender)| (Some(owner), Some(sender)));
 
-    let mut spawned_count = 0;
-    for mut item in pending {
+    let mut launched = 0;
+    for item in pending {
+        let mut manifest = StartupManifest::new();
         let mut handles = Vec::new();
-        let mut grants = Vec::new();
-        if item.kind == ServiceKind::Init {
-            if let Some(sender) = pm_sender.take() {
-                handles.push(sender);
-                grants.push(StartupGrant::new(GRANT_PM_MAILBOX, 0));
+        match item.kind {
+            ServiceKind::Pm => {
+                if let Some(owner) = pm_owner.take() {
+                    manifest.add(TAG_MAILBOX_OWNER, Some(0), &[]);
+                    handles.push(owner);
+                }
             }
+            ServiceKind::Init => {
+                if let Some(sender) = pm_sender.take() {
+                    manifest.add(TAG_PM_MAILBOX, Some(0), &[]);
+                    handles.push(sender);
+                }
+            }
+            ServiceKind::Other => {}
         }
-        if let Some(unused) = item.spawned.sender_grant.take() {
-            task::handle::close_transit(unused);
+        let manifest = manifest
+            .finish(item.pid, 0, handles.len() as u32)
+            .expect("startup manifest assembly");
+        match task::launch(item.spawned, &manifest, handles) {
+            Ok(thread) => {
+                sched::enqueue(thread);
+                launched += 1;
+                log!(Task, "started pid {}", item.pid);
+            }
+            Err(e) => warn!(InitFS, "failed to launch pid {}: {:?}", item.pid, e),
         }
-        let payload = startup_payload(&grants);
-        item.spawned.bootstrap_mailbox.enqueue_startup(
-            MESSAGE_KIND_STARTUP,
-            payload,
-            handles,
-        );
-        sched::enqueue(item.spawned.thread);
-        spawned_count += 1;
-        log!(Task, "started pid {}", item.pid);
     }
-    if let Some(unclaimed) = pm_sender {
-        task::handle::close_transit(unclaimed);
+    // 授权与接收方成对交付；接收方缺席时 transit 关闭未领侧，不泄漏。
+    for entry in [pm_owner.take(), pm_sender.take()].into_iter().flatten() {
+        task::handle::close_transit(entry);
     }
-    log!(InitFS, "{} service(s) loaded", spawned_count);
-}
-
-fn startup_payload(grants: &[StartupGrant]) -> Vec<u8> {
-    let header = StartupHeader::new(grants.len() as u32);
-    let total = core::mem::size_of::<StartupHeader>()
-        + grants.len() * core::mem::size_of::<StartupGrant>();
-    let mut payload = Vec::new();
-    payload.try_reserve_exact(total).expect("startup payload allocation failed");
-    append_value(&mut payload, &header);
-    for grant in grants {
-        append_value(&mut payload, grant);
-    }
-    payload
-}
-
-fn append_value<T: Copy>(output: &mut Vec<u8>, value: &T) {
-    // SAFETY: Startup ABI structs are fully initialized and contain no padding.
-    let bytes = unsafe {
-        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
-    };
-    output.extend_from_slice(bytes);
+    log!(InitFS, "{} service(s) loaded", launched);
 }

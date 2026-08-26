@@ -14,6 +14,7 @@
 |------|------|------|
 | 内核调用（syscall / remote call） | [call](ideas/call.md) | [call](impls/call.md) |
 | 任务模型（进程 / 线程 / 调度） | [task](ideas/task.md) | [task](impls/task.md) |
+| 启动资源交付（StartupBlock / launch 事务） | [object](ideas/object.md)、[service](ideas/service.md) | [startup](impls/startup.md) |
 | 内存管理 | — | [mm](impls/mm.md) |
 | 内核内部机制（中断 / 锁 / 唤醒） | — | [internals](impls/internals.md) |
 | 执行环境（boot / trap / 上下文） | — | [execution-context](impls/execution-context.md) |

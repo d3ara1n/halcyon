@@ -37,10 +37,6 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::Exit => Outcome::Killed(a0 as i64),
-        SystemCall::StartupMailbox => {
-            respond_ok(frame, thread.process.bootstrap_mailbox.raw() as usize);
-            Outcome::Completed
-        }
         SystemCall::Extend => {
             extend_heap(frame, thread, a0);
             Outcome::Completed

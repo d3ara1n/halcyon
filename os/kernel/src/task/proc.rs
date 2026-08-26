@@ -4,10 +4,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU64;
 
 use alloc::{sync::Arc, vec::Vec};
-use erhino_shared::{
-    object::{Handle, Rights},
-    proc::{Pid, Tid},
-};
+use erhino_shared::proc::{Pid, Tid};
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
 use crate::{
@@ -218,6 +215,45 @@ impl AddressSpace {
         self.alloc_map(USER_TOP - STACK_SIZE, STACK_SIZE / PAGE_SIZE, flags::USER_DATA)
     }
 
+    /// 只读映射启动块：块基取当前 brk（ELF 尾页对齐处），字节经直映射
+    /// 别名写入，brk 越过块尾——堆从块后扩展（sbrk 语义对块无感）。
+    /// 块帧记入 `frames`，生命周期随进程地址空间。
+    pub fn map_startup_block(&mut self, bytes: &[u8]) -> Result<usize, SpaceError> {
+        if bytes.is_empty() || self.brk == 0 {
+            return Err(SpaceError::BadSegment); // 空清单或 ELF 未装载
+        }
+        let base = self.brk;
+        let pages = bytes.len().div_ceil(PAGE_SIZE);
+        let Some(span) = pages.checked_mul(PAGE_SIZE) else {
+            return Err(SpaceError::BadSegment);
+        };
+        let Some(end) = base.checked_add(span) else {
+            return Err(SpaceError::BadSegment);
+        };
+        if end > USER_TOP - STACK_SIZE {
+            return Err(SpaceError::BadSegment);
+        }
+        let tracker = frame::alloc_contiguous(pages).ok_or(SpaceError::NoFrame)?;
+        self.tree.map(
+            Vpn(base / PAGE_SIZE),
+            pages,
+            Ppn(tracker.base.addr() / PAGE_SIZE),
+            flags::USER_RODATA,
+        )?; // 失败时 tracker Drop 归还帧
+        // SAFETY: 刚分配的独占帧经直映射别名写入；用户侧 PTE 只读，
+        // 进程对块内容也不可写。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                mm::phys_to_virt(tracker.base.addr()) as *mut u8,
+                bytes.len(),
+            );
+        }
+        self.brk = end;
+        self.frames.push(tracker);
+        Ok(base)
+    }
+
     /// 堆扩展（sbrk 语义）：申请 `bytes` 字节，内核内部向上取整到页粒度，
     /// 返回新堆顶（页对齐字节地址）。页大小是实现细节，不经 ABI 泄漏；
     /// `bytes == 0` 为查询：返回当前堆顶。虚拟连续性由「从 brk 起步」
@@ -333,12 +369,12 @@ impl AddressSpace {
 /// HandleTable drain 先摘项再执行对象 callback，避免生命周期回调反向进入表锁。
 pub struct Process {
     pub pid: Pid,
+    /// 进程关系身份；内核侧消费（pm 接管 spawn/回收通知）在服务化阶段。
+    #[expect(dead_code, reason = "pm/进程关系里程碑使用")]
     pub parent: Pid,
     pub space: crate::sync::Spinlock<AddressSpace>,
     /// 新对象 ABI 的进程本地 Handle 表。
     pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
-    /// 控制面迁移期间由 StartupMailbox 查询；后续并入通用启动资源枚举。
-    pub(crate) bootstrap_mailbox: Handle,
 }
 
 impl Drop for Process {
@@ -355,37 +391,13 @@ impl Drop for Process {
 }
 
 impl Process {
-    fn new(
-        pid: Pid,
-        parent: Pid,
-    ) -> Result<(Self, Arc<super::mailbox::Mailbox>, super::handle::ProcessHandleEntry), SpaceError> {
-        let mailbox = super::mailbox::Mailbox::new();
-        let object = super::mailbox::Mailbox::object_ref(&mailbox);
-        let owner = super::handle::entry(
-            object.clone(),
-            super::object::HandleRole::MailboxOwner,
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-        )
-        .map_err(|_| SpaceError::NoFrame)?;
-        let sender = super::handle::entry(
-            object,
-            super::object::HandleRole::MailboxSender,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
-        )
-        .map_err(|_| SpaceError::NoFrame)?;
-        let mut handles = super::handle::ProcessHandleTable::new();
-        let bootstrap_mailbox = handles.insert(owner).map_err(|_| SpaceError::NoFrame)?;
-        Ok((
-            Self {
-                pid,
-                parent,
-                space: crate::sync::Spinlock::new(AddressSpace::new()?),
-                handles: crate::sync::Spinlock::new(handles),
-                bootstrap_mailbox,
-            },
-            mailbox,
-            sender,
-        ))
+    fn new(pid: Pid, parent: Pid) -> Result<Self, SpaceError> {
+        Ok(Self {
+            pid,
+            parent,
+            space: crate::sync::Spinlock::new(AddressSpace::new()?),
+            handles: crate::sync::Spinlock::new(super::handle::ProcessHandleTable::new()),
+        })
     }
 }
 
@@ -413,14 +425,21 @@ pub struct Thread {
 unsafe impl Sync for Thread {}
 
 impl Thread {
-    /// 创建主线程：a0 = pid、a1 = parent（rinlib 启动契约），sp = 半区顶。
-    /// FP 状态创建即全零——不存在依赖 hart 残留的 valid 状态。
-    fn new_main(process: Arc<Process>, entry: usize, requirement: elf::IsaRequirement) -> Self {
+    /// 创建主线程：a0 = 启动块基、a1 = 块字节数（rinlib 启动契约，见
+    /// shared::startup），sp = 半区顶。FP 状态创建即全零——不存在依赖
+    /// hart 残留的 valid 状态。
+    fn new_main(
+        process: Arc<Process>,
+        entry: usize,
+        requirement: elf::IsaRequirement,
+        block_va: usize,
+        block_len: usize,
+    ) -> Self {
         let mut ctx = UserContext::zeroed();
         ctx.sepc = entry as u64;
         ctx.x[2] = USER_TOP as u64; // sp
-        ctx.x[10] = process.pid as u64; // a0
-        ctx.x[11] = process.parent as u64; // a1
+        ctx.x[10] = block_va as u64; // a0 = StartupBlock base
+        ctx.x[11] = block_len as u64; // a1 = StartupBlock length
         Self {
             tid: 0,
             process,
@@ -447,15 +466,11 @@ impl Thread {
     }
 }
 
-/// 从 ELF 装载一个进程并创建主线程（initfs 启动路径）。
-///
-/// 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/TSO/
-/// 未建模状态扩展在 load 时明确拒绝，不降级为 Base。W^X：段内容写入
-/// 尚不可执行的地址空间，装载完成后经入队 Release 发布（见 sched::enqueue）。
+/// launch 前的进程骨架：ELF 已装载、栈已映射、尚未入表 runnable。
 pub struct SpawnedProcess {
-    pub thread: Arc<Thread>,
-    pub(crate) bootstrap_mailbox: Arc<super::mailbox::Mailbox>,
-    pub(crate) sender_grant: Option<super::handle::ProcessHandleEntry>,
+    process: Arc<Process>,
+    entry: usize,
+    requirement: elf::IsaRequirement,
 }
 
 pub fn spawn_from_elf(
@@ -464,23 +479,86 @@ pub fn spawn_from_elf(
     image: &elf::Elf,
     file: &[u8],
 ) -> Result<SpawnedProcess, SpaceError> {
+    // 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/
+    // TSO/未建模状态扩展在 load 时明确拒绝，不降级为 Base。
     let requirement = elf::isa_requirement(file).expect("userspace execution requirement rejected");
-    let (process, bootstrap_mailbox, sender_grant) = Process::new(pid, parent)?;
-    let process = Arc::new(process);
+    let process = Arc::new(Process::new(pid, parent)?);
     {
         let mut space = process.space.lock();
         space.load_elf(&image.segments, file)?;
         space.map_stack()?;
     }
+    Ok(SpawnedProcess {
+        process,
+        entry: image.entry as usize,
+        requirement,
+    })
+}
+
+/// launch 事务：只读映射启动块 → 按数组序安装 Handle → 创建主线程
+/// （a0 = 块基）→ 入进程表。manifest 对内核是不透明字节串（长度即块长，
+/// Handle 数即安装数）；失败全量回滚——已装 Handle 随 Process Drop 关闭，
+/// 未消费 Handle 由本函数 close_transit，进程表不出现半初始化条目。
+/// W^X：段内容写入尚不可执行的地址空间，随后入队 Release 发布
+/// （见 sched::enqueue）。
+pub fn launch(
+    spawned: SpawnedProcess,
+    manifest: &[u8],
+    handles: Vec<super::handle::ProcessHandleEntry>,
+) -> Result<Arc<Thread>, SpaceError> {
+    let SpawnedProcess {
+        process,
+        entry,
+        requirement,
+    } = spawned;
+
+    let block_va = match process.space.lock().map_startup_block(manifest) {
+        Ok(va) => va,
+        Err(error) => {
+            for handle in handles {
+                // 未安装项按目标进程退出路径关闭（owner 侧触发对象 close
+                // 语义；transit 词汇不适用于直接授权项）。
+                super::handle::close_entry(handle, &process, true);
+            }
+            return Err(error);
+        }
+    };
+
+    // 安装采用 reserve→commit 事务：空表顺序预留必得槽位 1..=N、
+    // generation 1（shared::startup::startup_handle 槽位约定，内核侧显式
+    // 断言）；commit 一次可见，不产生半安装状态。
+    {
+        let mut table = process.handles.lock();
+        let token = super::handle::transaction_token();
+        let reservation = match table.reserve(handles.len(), token) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                drop(table);
+                for handle in handles {
+                    super::handle::close_entry(handle, &process, true);
+                }
+                return Err(SpaceError::NoFrame);
+            }
+        };
+        for (index, handle) in reservation.handles().iter().enumerate() {
+            assert_eq!(
+                *handle,
+                erhino_shared::startup::startup_handle(index as u32),
+                "launch slot contract violated"
+            );
+        }
+        table
+            .commit(reservation, handles)
+            .expect("reservation count matches entries");
+    }
+
     let thread = Arc::new(Thread::new_main(
         process.clone(),
-        image.entry as usize,
+        entry,
         requirement,
+        block_va,
+        manifest.len(),
     ));
     super::table::insert(process);
-    Ok(SpawnedProcess {
-        thread,
-        bootstrap_mailbox,
-        sender_grant: Some(sender_grant),
-    })
+    Ok(thread)
 }

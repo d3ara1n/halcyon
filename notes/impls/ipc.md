@@ -10,7 +10,7 @@
 
 `os/kernel/src/task/object.rs` 定义 `KernelObject`、`HandleRole` 和每对象 `ObjectWaitState`。当前对象类型为 Mailbox、Notification、Tunnel Endpoint 与 Tunnel Invitation；Handle role 含 MailboxOwner、MailboxSender、消费式 MailboxSenderOnce、Notification 双方与 Tunnel 双方。rights 与 role 同时验证；Endpoint、Invitation、一次性投递权和 owner 的关闭语义由对象实现，不由 HandleTable 猜测。消费式 role 的两个实例：Invitation 在 attach 时消费，MailboxSenderOnce 在首次成功 Send 时由 `os/kernel/src/task/mailbox.rs` 的 send 在同一表锁临界区内摘除（解析、入箱、消费原子化；该项同时作为 transit move 入箱时消费顺延到接收方）。`MailboxMakeSendOnce`（0x45）从具 DUPLICATE 权的 MailboxSender 派生，请求 rights 必须同时是源项 rights 与 role 允许集（WRITE|WAIT|TRANSFER）的子集，否则拒绝——与 HandleDuplicate 同判，不截剪也不放大。
 
-当前装载器在进程 runnable 前安装启动 Mailbox owner，并在 `os/kernel/src/initfs.rs` 投递版本化 STARTUP 消息及 grants。rinlib 暂以 `StartupMailbox` 查询该 Handle；这是通用 startup-resource 枚举落地前的过渡实现，不是固定入口寄存器或最终资源发现接口。
+启动资源交付已定型为 StartupBlock 机制（见 [startup.md](startup.md)）：launch 事务在进程 runnable 前只读映射版本化清单块并按数组序安装 Handle，块内容对内核不透明， rinlib 主动解析；Mailbox 与其他 typed grants 一样是可选启动资源，无固定入口、固定槽位或专用 syscall。
 
 ## 等待与期限
 

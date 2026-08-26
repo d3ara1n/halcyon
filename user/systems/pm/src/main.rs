@@ -15,6 +15,7 @@ use rinlib::{
         call::SystemCallError,
         message::MAILBOX_CAPACITY,
         object::ObjectSignals,
+        startup::TAG_MAILBOX_OWNER,
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
     sys_sleep,
@@ -31,6 +32,8 @@ const WRITABLE_WAKE_TAIL: u64 = 642;
 
 fn main() {
     debug!("Hello, pm!");
+    // 服务出生自带的邮箱 owner（StartupBlock 授予；见 shared::startup）。
+    let mailbox = env::startup_handle(TAG_MAILBOX_OWNER).expect("pm: mailbox owner grant is missing");
     // sleep 异步通路验证：登记期限 → Waiting → timer 唤醒 → 继续。
     unsafe {
         sys_sleep(30).expect("sleep");
@@ -39,7 +42,7 @@ fn main() {
     debug!("awake after two sleeps");
 
     // 阻塞等 init 转移 Tunnel Invitation（消息到达 → WaitMany 唤醒）。
-    let message = match wait_message(env::startup_mailbox()) {
+    let message = match wait_message(mailbox) {
         Ok(r) => r,
         Err(e) => {
             debug!("wait_message failed: {:?}", e);
@@ -84,7 +87,7 @@ fn main() {
     // 流控验证：请求携带 [目标邮箱 sender(WRITE|WAIT)、确认 signaler、
     // 虚假唤醒 signaler]。内联 send/wait 循环：醒来后再撞满箱即为虚假
     // 唤醒（唤醒必须由腾位引起），置 spin 位供 init 校验。
-    let message = match wait_message(env::startup_mailbox()) {
+    let message = match wait_message(mailbox) {
         Ok(r) => r,
         Err(e) => {
             debug!("wake request wait failed: {:?}", e);
