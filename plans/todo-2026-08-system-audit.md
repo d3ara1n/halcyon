@@ -12,8 +12,8 @@
 
 按依赖顺序审查，每片固定自己的起始 commit：
 
-1. SBI 边界与地址纪律（已完成，[分片报告](review-2026-08-audit-01-sbi.md)）；
-2. trapframe、上下文切换与 CSR（已完成，[分片报告](review-2026-08-audit-02-trap-context.md)）；
+1. SBI 边界与地址纪律（已完成，[分片报告](archived/review-2026-08-audit-01-sbi.md)）；
+2. trapframe、上下文切换与 CSR（已完成，[分片报告](archived/review-2026-08-audit-02-trap-context.md)）；
 3. 启动、页表与 TLB；
 4. SMP、调度与对象生命周期；
 5. syscall 与 `shared/` ABI；

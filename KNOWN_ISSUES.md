@@ -4,7 +4,7 @@
 
 ## 用户态多线程落地前的写回 panic 面
 
-IPC 对象层 review（`plans/review-2026-08-ipc-object.md`）确认：
+IPC 对象层 review（`plans/archived/review-2026-08-ipc-object.md`）确认：
 `MailboxCreate`/`HandleDuplicate`/`MailboxMakeSendOnce`/`TunnelCreate`/
 `TunnelAttach`/`Receive` 的用户写回以 `expect("validated ... must remain
 writable")` 收尾，前提是「check_range 到写回之间同进程无映射变更」。当前

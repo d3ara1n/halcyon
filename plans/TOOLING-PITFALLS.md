@@ -2,7 +2,7 @@
 
 > 持续累积的踩坑记录：每次调试新踩的坑合并进来，避免重复踩。
 > 案例级的前因后果见各 dated postmortem（如
-> `review-2026-08-execution-context-stall.md`），本文件只收可复用的经验。
+> `archived/review-2026-08-execution-context-stall.md`），本文件只收可复用的经验。
 
 ## 排查手法优先级
 

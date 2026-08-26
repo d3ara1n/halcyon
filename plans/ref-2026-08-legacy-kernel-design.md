@@ -1,7 +1,7 @@
 # 旧内核设计考古（27b8c98）
 
 > 用途：重写时的「按需参考档案」，不是照抄蓝本；同时是逐模块重写 notes/ 的底稿。
-> 证据来源：`git show 27b8c98:os/kernel/src/**` 第一手源码 + `artifacts/erhino_kernel` 反汇编实证（boot 契约）+ shared/ ABI（未被删除，即事实）。所有行级 bug/教训引用见 `plans/review-2026-07-code-review.md` 与 `plans/review-2026-08-mm-map-bug.md`，本文只记设计、不复述根因。
+> 证据来源：`git show 27b8c98:os/kernel/src/**` 第一手源码 + `artifacts/erhino_kernel` 反汇编实证（boot 契约）+ shared/ ABI（未被删除，即事实）。所有行级 bug/教训引用见 `plans/archived/review-2026-07-code-review.md` 与 `plans/archived/review-2026-08-mm-map-bug.md`，本文只记设计、不复述根因。
 > 一句话总览：**这是一个「协作式内核 + 抢占式用户态」的设计**——内核态全程关中断、无内核线程切换，所有调度转折点都在用户 trap 返回路径上；多 hart 共享一个全局进程/线程环，各 hart 从环上抢线程。
 
 ---
@@ -365,12 +365,12 @@ usage（页计数）旁挂 Process，无依赖
 12. **CpuClock 毫秒换算 + put_off 的 `usize::MAX-1` 防溢出、LCG 种子取真实 mtime**——细节已验证，照抄。
 
 ### 必须推翻（有教训，引用 plans/ 两篇）
-1. **手写多级页表递归映射算法**（map_internal/free_internal 三路分支）——`plans/review-2026-08-mm-map-bug.md` 全档：未对齐分支 container/level 传错、`ensure_managed_leaf_created` 静默改权限清 X、`split_page_into_table` level 0 非法、进程隔离假象。替代：区域切段（先按对齐边界切段再逐段单一路径）或堆大页对齐约定；`LeafTable/MidTable` 类型区分 + level 0 禁 non-leaf 的 debug_assert；映射冲突显式报错（同权限幂等/异权限 EntryOverwrite）；页表纯逻辑上 host 单测（用 mm-map-bug 的 `vpn=65, count=8192, brk=0x21000` 用例）。
-2. **共享调度环 + 多 hart 抢 + `Arc<UpSafeCell>` get_mut**——`plans/review-2026-07-code-review.md` P0#4：SMP 别名 UB。改 per-cpu run queue 或全局调度大锁（方案 A/B/C 三选一，重写计划 M3）。
+1. **手写多级页表递归映射算法**（map_internal/free_internal 三路分支）——`plans/archived/review-2026-08-mm-map-bug.md` 全档：未对齐分支 container/level 传错、`ensure_managed_leaf_created` 静默改权限清 X、`split_page_into_table` level 0 非法、进程隔离假象。替代：区域切段（先按对齐边界切段再逐段单一路径）或堆大页对齐约定；`LeafTable/MidTable` 类型区分 + level 0 禁 non-leaf 的 debug_assert；映射冲突显式报错（同权限幂等/异权限 EntryOverwrite）；页表纯逻辑上 host 单测（用 mm-map-bug 的 `vpn=65, count=8192, brk=0x21000` 用例）。
+2. **共享调度环 + 多 hart 抢 + `Arc<UpSafeCell>` get_mut**——`plans/archived/review-2026-07-code-review.md` P0#4：SMP 别名 UB。改 per-cpu run queue 或全局调度大锁（方案 A/B/C 三选一，重写计划 M3）。
 3. **全局 static mut 状态**——review P0#6（edition 2024 后 30 个 `static_mut_refs` 硬错误）：PROC_TABLE/FRAME_ALLOCATOR/ROOT/MOUNTPOINTS/HARTS/KERNEL_UNIT/BOARD 全部改安全抽象（internals.md 的 OnceLock+Spinlock / ProcessTable 封装）。
 4. **进程/线程对象永不回收**——review P1：Dead 只被 find_next 跳过，页帧泄漏；用户态 fault 用 `todo!()` panic 杀整机（app.rs:674）——用户 fault 的终态是杀进程（回收资源、通知 pm）。
 5. **无锁序 + 不关中断的 spin**——review P1 + console 注释「SpinLock is causing deadlock while trap」：按 internals.md 的中断纪律重写（持有期间关 SIE），panic 路径独立 bypass。
-6. **单核调度挂起 = 核内抢占失效**——`plans/review-2026-08-mm-map-bug.md` 附带发现；本考古已定位直接根因：`last_tick_time` 无写入点 → `timeslice` 恒 0 → `check_grow` 恒真 → `find_next` 恒重选当前线程（unfair.rs 692-698 vs 346 初始化）。4 核「能跑」只是各核 try_lock 抢到不同进程的假象。重写必须修复记账写入点或换 per-cpu run queue；与「异步=重调度重试」同源，需 Kernel Request/Pending/Fed 真状态机（notes/call.md 目标）。
+6. **单核调度挂起 = 核内抢占失效**——`plans/archived/review-2026-08-mm-map-bug.md` 附带发现；本考古已定位直接根因：`last_tick_time` 无写入点 → `timeslice` 恒 0 → `check_grow` 恒真 → `find_next` 恒重选当前线程（unfair.rs 692-698 vs 346 初始化）。4 核「能跑」只是各核 try_lock 抢到不同进程的假象。重写必须修复记账写入点或换 per-cpu run queue；与「异步=重调度重试」同源，需 Kernel Request/Pending/Fed 真状态机（notes/call.md 目标）。
 7. **FAL 远程转发空白**——`ForeignMountPoint => todo!()` 在 fs.rs + app.rs 共 10 处、Mount/Unmount 无调用方、转发消息协议未定义（重写计划 M4 验收点）。
 8. **Path 允许 ./.. + is_qualified 子串误判 + 40% 死代码**——review P2/P3：Path 层拒绝 Current/Parent、组件级判断、删死代码。
 9. **DentryObject `#[repr(C)]` 原生端序 + padding 泄漏**——review P2：用已依赖的 serde+postcard 或显式 packed+逐字段序列化。
