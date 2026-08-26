@@ -24,7 +24,7 @@
 - 对照负载：`user/systems/` 与 `user/drivers/` 四服务。fs 经用户态 FAL 真路径完成创建/枚举/属性/符号链接/偏移读写，验收线已过（`bf32c1c`）；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
 - 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、Building-only Map/Write、事务化 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy。D64、ProcessKill/JobKill、exit-status 查询等待调度域 eligibility 与完整进程终止屏障后接线；initfs manifest/archive 另案设计。方向见 `notes/ideas/bootstrap.md`，实现见 `notes/impls/startup.md`。
 - 系统审查（7 分片）进行中：01 SBI 边界与 02 trap/上下文已完成，未收口项随执行环境重构（a9a65cb）闭合；03–07 待做。总纲与模板见 [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md)。
-- 下一自然序：先执行 BootPackage / launcher 统一审查（[`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md)），确认基座可承接后再进入完整进程生命周期与用户态多线程屏障（[`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md)）→ FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构；initfs 内部协议在需要正式服务编排时单独设计。
+- 下一自然序：完整进程生命周期与用户态多线程屏障（[`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md)）→ FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构。BootPackage / launcher 基座已过机制层审查（[`review-2026-08-26-bootstrap-launcher-mechanism.md`](review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；其十切片代码审查（[`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md)）降级为机会型任务，有空就做、不阻塞主线；initfs 内部协议在需要正式服务编排时单独设计。
 
 ## 戒律
 

@@ -35,7 +35,7 @@ Handle 区直接保存 child HandleTable reservation 产生的真实值，不允
 4. prefix 使用 owned 只读页，BootPackage payload 使用 borrowed `U|R|A` PTE，二者组成连续用户 VA 块；
 5. 预构造主线程、插入进程表并 enqueue。
 
-initial ELF 复制完成且 StartupBlock prefix 构造后，`[package base, payload_pa)` 页对齐前缀立即回投帧池；只有实际映入 init 的 payload 页由启动保留区持有到系统结束。进程销毁只清 borrowed PTE，不归还这些帧。最后一页可见尾部来自 packer 的零 padding，不可写、不可执行。
+initial ELF 复制完成且 StartupBlock prefix 构造后，`[package base, payload_pa)` 页对齐前缀立即回投帧池；payload 页在映入 init 时即收编为该地址空间的 owned backing，随地址空间销毁自然归还帧池——无 pid 特判、无启动保留洞滞留。最后一页可见尾部来自 packer 的零 padding，不可写、不可执行。
 
 ## 公开 Job/Process 构造 ABI
 

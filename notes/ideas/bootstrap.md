@@ -42,7 +42,7 @@ init 虚拟地址空间中的 StartupBlock
 
 StartupBlock outer 允许 Handle 数组结束与 payload 起点之间存在零填充。普通进程的小 payload 可以紧凑复制；init 的大 payload 从 BootPackage 页直接映射到同一连续虚拟块，`startup_payload()` 对二者提供相同切片语义。
 
-映射必须为用户可读、不可写、不可执行。payload 页由 bootstrap backing 持有，不进入普通进程可转授对象图；关闭 Handle 不能影响它，init 地址空间销毁时只解除用户映射。BootPackage 物理占用按 envelope 的实际总长保留，而不是按 Devicetree 中的最大装载窗口保留。
+映射必须为用户可读、不可写、不可执行。payload 页不进入普通进程可转授对象图：关闭 Handle 不能影响它，也没有任何运行时入口能重新映射或转授这些页；页所有权在映入 init 时即移交为该地址空间的 backing，随地址空间销毁自然归还物理池。BootPackage 物理占用按 envelope 的实际总长保留，而不是按 Devicetree 中的最大装载窗口保留。
 
 这种映射不是进程特权口子：没有运行时入口能选择物理地址，也没有其他进程可请求同类映射。它与 initial ELF、主栈和 StartupBlock prefix 一样，是内核构造首地址空间的固定部分。
 

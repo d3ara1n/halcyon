@@ -63,6 +63,8 @@ root Job 由 `boot.rs` 铸造，完整 JobControl 作为 init 的启动 Handle�
 
 ProcessStart 在提交前预构造主线程，并分别在进程表与公平类队列放入 reservation marker；marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/output 全部准备成功后，提交只替换预留项，不分配。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。完整事务见 [`startup.md`](startup.md)。
 
+> 演进点：marker 预留（reserve/commit/rollback）当前由公平类的自由函数承载，不在 `SchedClass` trait 契约内。接入 D64 eligibility 时，ProcessStart 的发布必须按线程执行需求路由进兼容域——届时需把预留语义上收为所有类实现的接口，或由域层提供统一的预留通道；不得把现有自由函数当稳定接口直接跨域复用。
+
 当前 ProcessControl 随 Running process 绑定，进程回收后保留轻量 CLOSED/exit-code 壳供 WaitMany 观察；关闭 control 不终止进程。显式 kill 与状态查询尚未接入。D64 profile 在 capability-derived 调度域接线前明确拒绝，避免线程落到不兼容 hart。
 
 ## 生命周期
