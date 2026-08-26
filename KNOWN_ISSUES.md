@@ -15,11 +15,6 @@ space 锁之间 `HandleClose` tunnel endpoint（经 `unmap_external` 解除映�
 改为锁内复检 + 优雅错误或进程终止路径，并同步修正 `uaccess.rs` 头注释
 「同进程无并发映射变更者」的前提表述。
 
-trap/上下文、hart 身份、能力调度与启动发布的已知契约缺口记录在
-`plans/reviews/system-audit/01-sbi.md`、`02-trap-context.md`，统一设计见
-`notes/impls/execution-context.md`。在取得直接证据前不得添加平台专用补丁。
-`just sifive_u` 已内置运行阶段超时收束，通过与否看日志关键行。
-
 ## rust_analyzer 环境前提
 
 多 workspace 各自 target 无需编辑器配置：RA 按 workspace root 读取 `.cargo/config.toml` 的 `build.target`（2026-08 实测，含 user/ 自定义 JSON target）。
