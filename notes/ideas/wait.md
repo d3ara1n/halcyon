@@ -20,7 +20,7 @@
 
 ## Notification：可消费的独立对象
 
-Notification 不是 ObjectSignals 的别名，而是独立对象，适用于「按位 OR 累积，再由消费者显式取走」。它由唯一 owner 维持开放；owner Handle 不可复制或转移。获授权的 signaler 可提交位掩码，重复提交同一位合并；存在待决位时 `READABLE` 为真。
+Notification 不是 ObjectSignals 的别名，而是独立对象，适用于「按位 OR 累积，再由消费者显式取走」。它由唯一 owner 维持开放；owner 不可复制或 TRANSIT，只可直接 GRANT。获授权的 signaler 可提交位掩码，重复提交同一位合并；存在待决位时 `READABLE` 为真。
 
 消费者先以 WaitMany 等待 `READABLE`，再调用取走操作原子取得并清除所选位；未选位继续保持。WaitMany 不改变待决位，多个消费者以取走操作协调竞争。计数或带负载事件仍使用消息或共享内存协议。
 

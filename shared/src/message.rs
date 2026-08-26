@@ -35,25 +35,37 @@ impl SendHeader {
     }
 }
 
-/// 新消息 ABI 的接收侧 envelope。
+/// Mailbox sender capability 携带的不可变授权上下文。
+pub type MailboxBadge = u64;
+
+/// 新消息 ABI 的接收侧 envelope。两项来源信息均由内核生成：PID 只表示
+/// 发送进程 provenance，badge 表示目标 sender capability 的授权上下文。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct MessageHeader {
-    pub sender: ProcessId,
+    pub sender_pid: ProcessId,
+    pub sender_badge: MailboxBadge,
     pub kind: u64,
     pub payload_len: u32,
     pub handle_count: u32,
-    pub reserved: [u64; 5],
+    pub reserved: [u64; 4],
 }
 
 impl MessageHeader {
-    pub const fn new(sender: ProcessId, kind: u64, payload_len: u32, handle_count: u32) -> Self {
+    pub const fn new(
+        sender_pid: ProcessId,
+        sender_badge: MailboxBadge,
+        kind: u64,
+        payload_len: u32,
+        handle_count: u32,
+    ) -> Self {
         Self {
-            sender,
+            sender_pid,
+            sender_badge,
             kind,
             payload_len,
             handle_count,
-            reserved: [0; 5],
+            reserved: [0; 4],
         }
     }
 }

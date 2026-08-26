@@ -4,7 +4,7 @@
 
 ## 建立与邀请
 
-`TunnelCreate` 分配零态页，建立持有该帧的 Connection，并向创建者交付一个映射在本地的 Endpoint Handle 与一次性 peer invitation Handle。Endpoint 不可 duplicate、不可 transfer；invitation 不可 duplicate，只能以 `TRANSFER` 经消息交给预期对端。它不是随机字符串、全局登记 key 或可猜测 bearer id。
+`TunnelCreate` 分配零态页，建立持有该帧的 Connection，并向创建者交付一个映射在本地的 Endpoint Handle 与一次性 peer invitation Handle。Endpoint 与本进程 VM lease 绑定，不可 duplicate、TRANSIT 或 GRANT；invitation 不可 duplicate，可按授权 TRANSIT 或直接 GRANT 给预期对端。它不是随机字符串、全局登记 key 或可猜测 bearer id。
 
 持 invitation 的一方调用 `TunnelAttach`，在本地选择合法映射位置后原子消费 invitation 并取得第二个 Endpoint。Connection 创建时 A 端存活、B 端为 invitation；invitation 被丢弃即通知 A 对端放弃；A 先关闭使 invitation 终态且 attach 失败；attach 先完成则 B 存活，此后 A 关闭通知 B。映射、权限、输出空间或预留失败均不消费 invitation。
 

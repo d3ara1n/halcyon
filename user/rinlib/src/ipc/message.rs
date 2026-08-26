@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 
 use erhino_shared::{
     call::SystemCallError,
-    message::{HandleMove, MessageHeader},
+    message::{HandleMove, MailboxBadge, MessageHeader},
     object::{Handle, HandlePair, ObjectSignals, Rights},
     wait::{WaitItem, WaitResult, WAIT_DEADLINE_INFINITE},
 };
 
 use crate::call::{
-    sys_discard, sys_mailbox_create, sys_mailbox_make_send_once, sys_peek, sys_receive, sys_send,
-    sys_wait_many,
+    sys_discard, sys_mailbox_create, sys_mailbox_make_send_once, sys_mailbox_mint_sender, sys_peek,
+    sys_receive, sys_send, sys_wait_many,
 };
 
 pub struct ReceivedMessage {
@@ -44,7 +44,7 @@ pub fn send(
 
 /// 非阻塞观察队头。空箱返回 ObjectNotAvailable。
 pub fn peek(mailbox: Handle) -> Result<MessageHeader, SystemCallError> {
-    let mut header = MessageHeader::new(0, 0, 0, 0);
+    let mut header = MessageHeader::new(0, 0, 0, 0, 0);
     // SAFETY: output 在 ecall 期间有效且可写。
     unsafe { sys_peek(mailbox, &mut header)? };
     Ok(header)
@@ -63,7 +63,7 @@ pub fn receive(mailbox: Handle) -> Result<ReceivedMessage, SystemCallError> {
         .try_reserve_exact(header.handle_count as usize)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     handles.resize(header.handle_count as usize, Handle::INVALID);
-    let mut received = MessageHeader::new(0, 0, 0, 0);
+    let mut received = MessageHeader::new(0, 0, 0, 0, 0);
     // SAFETY: 三个输出缓冲在 ecall 期间保持有效且容量与切片一致。
     unsafe { sys_receive(mailbox, &mut received, &mut payload, &mut handles)? };
     Ok(ReceivedMessage {
@@ -88,6 +88,18 @@ pub fn make_send_once(
     let mut output = Handle::INVALID;
     // SAFETY: output 在 ecall 期间有效且可写。
     unsafe { sys_mailbox_make_send_once(source, rights, &mut output)? };
+    Ok(output)
+}
+
+/// 由 mailbox owner 铸造带不可变 badge 的 sender capability。
+pub fn mint_sender(
+    owner: Handle,
+    badge: MailboxBadge,
+    rights: Rights,
+) -> Result<Handle, SystemCallError> {
+    let mut output = Handle::INVALID;
+    // SAFETY: output 在 ecall 期间有效且可写。
+    unsafe { sys_mailbox_mint_sender(owner, badge, rights, &mut output)? };
     Ok(output)
 }
 

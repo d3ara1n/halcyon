@@ -20,7 +20,7 @@ WaitMany 以 `{ handle, signals, cookie }` 项观察组合对象，结果以 coo
 
 ## Notification
 
-Notification 显式创建、可等待。创建者获得唯一 owner Handle，不能复制或转移；owner 关闭即对象关闭。持有 `SIGNAL` 的 signaler 可以按授权复制或转移，并向对象提交位掩码；待决位按 OR 累积，至少一位待决时 `READABLE` 为真。
+Notification 显式创建、可等待。创建者获得唯一 owner Handle：不可复制或 TRANSIT，可在 ProcessStart 中直接 GRANT；owner 关闭即对象关闭。持有 `SIGNAL` 的 signaler 可以按授权 duplicate、TRANSIT 或 GRANT，并向对象提交位掩码；待决位按 OR 累积，至少一位待决时 `READABLE` 为真。
 
 持有读取权者通过专门取走操作原子取得并清除所选位，未选择的位保留。这把「通知发生」和「由谁消费」分开：等待只负责唤醒，取走才改变 Notification 内容。Notification 无负载、无顺序、无计数；需要身份、次数或数据使用消息，需要高频共享状态使用隧道协议。
 

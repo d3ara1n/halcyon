@@ -269,7 +269,8 @@ impl KernelObject for Invitation {
     }
 
     fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::TunnelInvitation).then_some(Rights::MAP | Rights::TRANSFER)
+        (role == HandleRole::TunnelInvitation)
+            .then_some(Rights::MAP | Rights::TRANSIT | Rights::GRANT)
     }
 
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
@@ -337,7 +338,7 @@ pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCal
         handle::entry(
             Invitation::object_ref(&invitation),
             HandleRole::TunnelInvitation,
-            Rights::MAP | Rights::TRANSFER,
+            Rights::MAP | Rights::TRANSIT,
         )
         .map_err(handle::map_error)?,
     );

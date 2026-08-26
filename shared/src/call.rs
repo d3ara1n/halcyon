@@ -105,7 +105,9 @@ pub enum SystemCall {
     Discard = 0x44,
     /// 从具 DUPLICATE 权的 sender 派生一次性投递权（send-once）。
     MailboxMakeSendOnce = 0x45,
-    
+    /// 由 mailbox owner 铸造带不可变 badge 的 sender capability。
+    MailboxMintSender = 0x46,
+
     // -----Process memory-----
     /// 字节粒度 sbrk：按请求量扩展/收缩堆，返回新堆顶。
     Extend = 0x50,

@@ -6,7 +6,8 @@ use core::any::Any;
 use erhino_shared::{
     call::SystemCallError,
     message::{
-        HandleMove, MAILBOX_CAPACITY, MESSAGE_HANDLE_MAX, MessageHeader, PAYLOAD_MAX, SendHeader,
+        HandleMove, MAILBOX_CAPACITY, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX,
+        SendHeader,
     },
     object::{Handle, HandlePair, ObjectSignals, Rights},
 };
@@ -230,11 +231,19 @@ impl KernelObject for Mailbox {
 
     fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
         match role {
-            HandleRole::MailboxOwner => Some(Rights::READ | Rights::WAIT | Rights::MANAGE),
-            HandleRole::MailboxSender => {
-                Some(Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)
+            HandleRole::MailboxOwner => {
+                Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
             }
-            HandleRole::MailboxSenderOnce => Some(Rights::WRITE | Rights::WAIT | Rights::TRANSFER),
+            HandleRole::MailboxSender => Some(
+                Rights::WRITE
+                    | Rights::WAIT
+                    | Rights::TRANSIT
+                    | Rights::GRANT
+                    | Rights::DUPLICATE,
+            ),
+            HandleRole::MailboxSenderOnce => {
+                Some(Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT)
+            }
             _ => None,
         }
     }
@@ -316,6 +325,48 @@ pub fn create(
     Ok(())
 }
 
+/// 由 owner 铸造同一 mailbox 的 sender capability。badge 是该 capability
+/// 的不可变授权上下文，后续 duplicate、move 与 send-once 派生均保持。
+pub fn mint_sender(
+    thread: &Thread,
+    owner: Handle,
+    badge: MailboxBadge,
+    rights: Rights,
+    output: usize,
+) -> Result<(), SystemCallError> {
+    let token = super::handle::transaction_token();
+    let mut table = thread.process.handles.lock();
+    let owner_entry = table.get(owner, Rights::MANAGE).map_err(super::handle::map_error)?;
+    if *owner_entry.role() != HandleRole::MailboxOwner
+        || owner_entry.object().kind() != ObjectKind::Mailbox
+    {
+        return Err(SystemCallError::WrongObjectType);
+    }
+    let object = owner_entry.object().clone();
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries.push(
+        super::handle::entry_with_badge(object, HandleRole::MailboxSender, rights, badge)
+            .map_err(super::handle::map_error)?,
+    );
+    let reservation = table.reserve(1, token).map_err(super::handle::map_error)?;
+    let sender = reservation.handles()[0];
+    let mut space = thread.process.space.lock();
+    if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
+        drop(space);
+        table.rollback(reservation).expect("mint-sender reservation must remain owned");
+        return Err(error.into());
+    }
+    // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
+    unsafe { uaccess::write_user_value(&mut space, output, &sender) }
+        .expect("validated mint-sender output must remain writable");
+    drop(space);
+    table
+        .commit(reservation, entries)
+        .expect("mint-sender reservation must remain owned");
+    Ok(())
+}
+
 /// 从具 DUPLICATE 权的 sender 派生一次性投递权：role 换为 MailboxSenderOnce，
 /// 请求 rights 必须同时是源项与 role 允许集的子集，否则拒绝（与
 /// HandleDuplicate 同判：不截剪、不放大）。
@@ -336,15 +387,15 @@ pub fn make_send_once(
     if !rights.is_subset_of(source_entry.rights()) {
         return Err(SystemCallError::RightsDenied);
     }
+    let object = source_entry.object().clone();
+    let badge = source_entry.badge();
     // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let mut entries = Vec::new();
     entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
-    entries.push(super::handle::entry(
-        source_entry.object().clone(),
-        HandleRole::MailboxSenderOnce,
-        rights,
-    )
-    .map_err(super::handle::map_error)?);
+    entries.push(
+        super::handle::entry_with_badge(object, HandleRole::MailboxSenderOnce, rights, badge)
+            .map_err(super::handle::map_error)?,
+    );
     let reservation = table.reserve(1, token).map_err(super::handle::map_error)?;
     let once = reservation.handles()[0];
     let mut space = thread.process.space.lock();
@@ -408,12 +459,6 @@ pub fn send(
         moves.push((item.handle, item.rights));
     }
 
-    let message_header = MessageHeader::new(
-        thread.process.pid as u64,
-        header.kind,
-        header.payload_len,
-        header.handle_count,
-    );
     let object = {
         let mut table = thread.process.handles.lock();
         // 解析与入队同临界区：MailboxSenderOnce 的消费与投递原子化，
@@ -425,18 +470,29 @@ pub fn send(
             }
             _ => return Err(SystemCallError::WrongObjectType),
         };
+        if once && moves.iter().any(|(handle, _)| *handle == mailbox_handle) {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let badge = entry.badge();
         let object = entry.object().clone();
         if object.kind() != ObjectKind::Mailbox {
             return Err(SystemCallError::WrongObjectType);
         }
+        let message_header = MessageHeader::new(
+            thread.process.pid as u64,
+            badge,
+            header.kind,
+            header.payload_len,
+            header.handle_count,
+        );
         let mailbox = concrete(&object)?;
         mailbox.enqueue_with(&mut table, &moves, message_header, payload)?;
         if once {
-            // 消费式 role：成功投递即摘除源项（消费而非关闭，不执行
-            // lifecycle callback）。若该项同时作为 transit move 进入了
-            // 本条消息，extract_moves 已先行摘除，remove 的两种结果
-            // （Ok(entry) / Err(StaleHandle)）都已消费。
-            drop(table.remove(mailbox_handle));
+            // 消费式 role：成功投递后源项仍在表内，直接摘除且不执行
+            // lifecycle callback。target 与 transit alias 已在入队前拒绝。
+            table
+                .remove(mailbox_handle)
+                .expect("successful send-once target must remain installed");
         }
         object
     };

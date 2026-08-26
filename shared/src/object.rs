@@ -47,11 +47,14 @@ impl Rights {
     pub const WRITE: Self = Self(1 << 1);
     pub const WAIT: Self = Self(1 << 2);
     pub const SIGNAL: Self = Self(1 << 3);
-    pub const TRANSFER: Self = Self(1 << 4);
+    /// 允许 entry 暂存于有缓冲消息并由接收方安装。
+    pub const TRANSIT: Self = Self(1 << 4);
     pub const DUPLICATE: Self = Self(1 << 5);
     pub const MANAGE: Self = Self(1 << 6);
     pub const MAP: Self = Self(1 << 7);
-    pub const KNOWN: Self = Self((1 << 8) - 1);
+    /// 允许 ProcessStart 等直接跨 HandleTable grant，不进入对象容器。
+    pub const GRANT: Self = Self(1 << 8);
+    pub const KNOWN: Self = Self((1 << 9) - 1);
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)

@@ -171,7 +171,7 @@ pub trait KernelObject: Any + Send + Sync {
     /// Handle 从表中移除且表锁已释放后的 lifecycle 回调。
     fn close_handle(&self, role: HandleRole, owner: &Process, exiting: bool);
 
-    /// 消息中的 transit Handle 被丢弃；只有允许 TRANSFER 的 role 可进入。
+    /// 消息中的 transit Handle 被丢弃；只有持 TRANSIT 的 entry 可进入。
     fn close_transit(&self, role: HandleRole);
 
     fn as_any(&self) -> &dyn Any;

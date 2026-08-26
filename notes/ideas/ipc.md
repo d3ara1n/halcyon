@@ -1,17 +1,21 @@
 # 进程间通信
 
-IPC 由共同的[对象与 Handle](object.md)模型组成。每个通信对象只经进程本地 Handle 引用，lifecycle role 与 rights 共同决定可执行操作；PID 用于身份和管理，不是通信地址。对象状态由[等待](wait.md)统一观察，任何阻塞只经 `WaitMany`。
+IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信对象只经进程本地 Handle 操作，role、rights 与对象状态共同决定合法行为；PID 是 provenance，不是通信地址或 authority。等待统一由 [WaitMany](wait.md) 完成。
 
 ## 三个面
 
-- **消息**（[message](message.md)）是控制面：有界、非阻塞的邮箱投递，承载小批量数据、内核 sender envelope 和受 rights 约束的 Handle move；
+- **消息**（[message](message.md)）是控制面：有界、非阻塞的 Mailbox 投递，承载小 payload、内核生成的 `sender_pid/sender_badge` envelope 与原子 TRANSIT Handle；
 - **对象状态与 Notification**（[signal](signal.md)）是事件面：对象以非消费式电平表达可读、关闭等条件，Notification 提供显式消费的 OR 位集合；
-- **隧道**（[tunnel](tunnel.md)）是数据面：两个不可转移的本地端点映射同一段连续页区间，供协议直接交换批量数据。所有页内协议还须遵守[共享内存协议公共契约](shared-memory.md)。
+- **Tunnel**（[tunnel](tunnel.md)）是数据面：两个与本地 VM lease 绑定的 Endpoint 映射同一共享区间，页内协议遵守[共享内存公共契约](shared-memory.md)。
 
-[Runnel](runnel.md) 是隧道页上的官方单工 FIFO 字节流协议。控制请求、流式数据和状态提示各归其面；协议可以组合三者，但不得让一个面伪造另一个面的所有权或流控。
+[Runnel](runnel.md) 是 Tunnel 页上的官方单工 FIFO 字节流协议。控制请求、流数据和状态提示可以组合，但不得让一个面伪造另一个面的 authority、生命周期或流控。
 
 ## 共同边界
 
-内核负责对象引用、rights 校验、消息事务、映射生命周期、状态发布与等待完成；它不解释消息 kind、不解析共享页、不代替服务鉴权。服务发现返回授权后的邮箱 sender Handle；协议以不可伪造的 sender 身份和显式转入的回复 Handle 建立会话。
+内核负责对象引用、rights、badge 保存、Handle 运输、消息事务、映射生命周期、状态发布与等待完成；它不解释 kind、badge 业务含义、RPC、路径或共享页。
 
-IPC 操作立即完成或返回错误；等待资源变化时，调用者先检查对象状态，再调用 WaitMany。启动时唯一的根图由 `ProcessCreate`/`ProcessStart` 在进程可运行前以通用 startup resources 建立；Mailbox receiver 只是可选 grant，取得后可承载版本化 `STARTUP` 消息。该根图建立过程不是 PID 消息寻址的例外。
+`TRANSIT` 允许 Handle 暂存于消息，`GRANT` 允许 ProcessStart 直接跨表安装。unique owner 只走直接 GRANT；sender、signaler 与 invitation 可按授权经消息委托；Endpoint 与 VM 绑定而不移动。
+
+协议使用 badged sender 表达不可伪造的服务端授权上下文，`sender_pid` 只作 provenance。回复必须取得显式 send-once 或 sender capability，不能由 PID 或 badge 数值推导。
+
+启动根图由 ProcessStart 在进程 runnable 前通过通用 StartupBlock 和直接 GRANT 建立。Mailbox owner 只是可选启动资源，不占固定寄存器或固定 Handle 数值。

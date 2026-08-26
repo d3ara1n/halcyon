@@ -68,12 +68,12 @@ impl Fs {
     fn new() -> Self {
         let provider_mailbox = mailbox_create(
             Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
         )
         .expect("provider mailbox create failed");
         let reply = mailbox_create(
             Rights::READ | Rights::WAIT,
-            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSIT,
         )
         .expect("reply mailbox create failed");
         Self {
@@ -91,14 +91,14 @@ impl Fs {
         let mut payload = [0u8; 512];
         let used = build_request(&mut payload, self.txid, kind, body);
 
-        // slot 0：一次性回复授权（携 TRANSFER 以便随消息转移）；
+        // slot 0：一次性回复授权（携 TRANSIT 以便暂存于消息）；
         // slot 1：帧锚目录（副本，不消耗本地 grant）。
-        let reply_once = make_send_once(self.reply.peer, Rights::WRITE | Rights::TRANSFER)
+        let reply_once = make_send_once(self.reply.peer, Rights::WRITE | Rights::TRANSIT)
             .map_err(map_system)?;
-        let anchor_dup = duplicate(anchor, Rights::WRITE | Rights::TRANSFER)
+        let anchor_dup = duplicate(anchor, Rights::WRITE | Rights::TRANSIT)
             .map_err(map_system)?;
         let moves = [
-            HandleMove { handle: reply_once, rights: Rights::WRITE | Rights::TRANSFER },
+            HandleMove { handle: reply_once, rights: Rights::WRITE | Rights::TRANSIT },
             HandleMove { handle: anchor_dup, rights: Rights::WRITE },
         ];
         send(self.peer, PROTOCOL_ID, &payload[..used], &moves).map_err(map_system)?;

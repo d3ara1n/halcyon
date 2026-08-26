@@ -1,49 +1,91 @@
-# 对象与 Handle
+# 对象、Capability 与 Handle
 
-对象是内核管理且可被进程引用的资源：邮箱、通知、隧道端点以及未来的内存、设备和服务登记项都遵循同一模型。对象的身份、存活和权限由内核维持；用户态只持有进程本地的 **Handle**。
+对象是内核管理且可由进程引用的资源。用户态不直接持有对象身份，而是在自己的 HandleTable 中持有一项 **capability entry**；**Handle** 只是该 entry 的进程本地不透明名字。
 
-## Handle 是唯一的可操作引用
+## Handle 是本地名字
 
-Handle 是固定宽度、不透明的 `u64` 值：高 32 位为 generation，低 32 位为槽位；值零永远无效。槽位复用时 generation 必须改变，因此旧值不能取得新对象；generation 回绕的槽位永久退休，不能再次分配。
+Handle 是固定宽度 `u64`：高 32 位为 generation，低 32 位为槽位，零值永远无效。槽位复用时 generation 必须改变；generation 回绕的槽位永久退休。因此旧值不能取得后来占据同一槽位的新对象。
 
-每一项 Handle 同时关联对象、rights 与其类型定义的 lifecycle role。role 表达接收所有者、端点 lease 等对象关系，rights 只表达可做的操作；两者彼此独立，不能互相伪造或替代。每项操作同时要求 Handle 指向正确对象、对象仍接受该操作、role 合法且 rights 覆盖操作。rights 是可裁剪集合：
+Handle 不能序列化为跨进程凭据。把其数值写入文件、共享内存或普通 payload，不会让另一进程取得引用。
+
+## Capability entry
+
+每项 entry 由四个正交维度组成：
+
+```text
+object + lifecycle role + rights + immutable badge
+```
+
+- **object**：被引用的内核对象；
+- **role**：owner、sender、invitation、endpoint 等对象关系与生命周期位置；
+- **rights**：允许执行的操作；
+- **badge**：对象类型可解释的不可变授权上下文，普通 entry 为零。
+
+role 不能由 rights 伪造；badge 不改变对象身份或生命周期。duplicate、移动和 rights 裁剪都保持 object、role 与 badge，只能缩小 rights。
+
+通用 rights：
 
 - `READ`、`WRITE`：读取或修改对象内容；
-- `WAIT`：观察对象状态并登记等待；
-- `SIGNAL`：提交对象允许持有者提交的状态；
-- `TRANSFER`：把此 Handle 移入消息；
-- `DUPLICATE`：派生 rights 不超过原项的新 Handle；
-- `MANAGE`：执行对象定义的管理或关闭操作；
-- `MAP`：建立对象允许的映射。
+- `WAIT`：观察对象电平并登记等待；
+- `SIGNAL`：提交对象允许的状态；
+- `DUPLICATE`：派生 rights 不超过原项的新 entry；
+- `MANAGE`：执行对象定义的管理操作；
+- `MAP`：建立对象允许的映射；
+- `TRANSIT`：允许 entry 暂存于有缓冲消息，随后由接收方安装；
+- `GRANT`：允许 ProcessStart 等事务把 entry 直接安装到另一 HandleTable。
 
-派生或转移只能保留或缩小 rights，不能放大；没有 `TRANSFER` 的项不能经消息外泄。对象类型可定义更细操作，但不得绕过 Handle、role 与 rights 检查。
+`TRANSIT` 与 `GRANT` 分离，因为两条运输的存储拓扑不同：消息会把 capability 暂存在内核对象图中，直接 grant 不进入对象容器。操作同时要求对象类型、role、对象状态和 rights 全部合法。
 
 ## 所有权与终态
 
-对象在有效 Handle、消息中转项或对象内部引用需要它时存活。关闭一个 Handle 只放弃该引用；对象的逻辑关闭由 lifecycle role 决定，不等同于最后一个任意 Handle 消失。
+对象在有效 Handle、消息 transit entry 或对象内部引用需要它时存活。关闭 Handle 只放弃该引用；对象的逻辑终态由 lifecycle role 决定，不等同于最后一个任意引用消失。
 
-邮箱由唯一 receiver-owner 维持开放。`MailboxCreate` 向创建进程交付该不可复制、不可转移的 owner Handle，以及可复制、可转移的 sender Handle；进程内各线程共享 owner 的接收能力。owner 关闭或其进程退出后邮箱进入 `CLOSED`，清除队列及其中未接收的转入 Handle，残留 sender 只观察关闭。sender 还可派生一次性投递权：承载一条消息后由内核摘除，经消息转移后由接收方继续一次性使用。Notification 同样有唯一且不可复制、不可转移的 owner，以及可按授权复制或转移的 signaler；owner 关闭使它终态。
+Mailbox 有唯一 receiver-owner。owner 不可复制，可持 `GRANT` 直接交付给 Building child，但不能持 `TRANSIT` 进入消息；sender 可复制、可按授权 TRANSIT/GRANT，并可携带 mailbox owner 铸造的 badge。owner 关闭或所在进程退出后 Mailbox 进入 `CLOSED`，清空队列及未接收 entry；残留 sender 只观察终态。
 
-某些 role 是消费式的：执行其定义操作后终态，失败不消费。隧道的 invitation 在 attach 时消费，邮箱的一次性投递权在首次成功投递时消费；两者是同一条 role 维度规则的两个实例，不依赖任何 rights 位表达生命周期。
+Notification 同样有唯一 owner 和可委托 signaler。owner 只直接 grant，不进入消息；signaler 可按授权 TRANSIT/GRANT。owner 关闭使 Notification 终态。
 
-隧道的端点 lease 和 invitation 则由 Connection 的参与方关系定义。所有关闭都是单向迁移；终态信号持续可见，已关闭对象不可复活，也不把资源重新解释为另一对象。
+某些 role 是 affine 且消费式的：Mailbox send-once 在首次成功投递后消费，Tunnel invitation 在成功 attach 后消费。失败不消费。它们可以移动但不能复制。
 
-进程退出时，内核先取消未完成等待和执行，再 drain Handle 表、待接收消息与本地对象关系。drain 与正常关闭使用相同释放语义：端点关闭通知对端，消息中的转入 Handle 被关闭，最后引用释放对象资源。已送入其他进程邮箱的 Handle 属于该消息，不随发送方退出回滚。
+Tunnel Endpoint 与进程 VM lease 绑定，既不能 TRANSIT，也不能 GRANT；跨进程建立对端使用 invitation。
 
-## Handle 转移
+所有关闭都是单向迁移。终态信号持续可见，对象不可复活，也不把旧资源重新解释为另一对象。
 
-消息是 Handle 的唯一跨进程转移通道。发送者选择待转移项，内核校验 `TRANSFER`、保留对象引用、撤销发送方项并把裁剪后的项封入消息；投递失败时发送方项保持原状。消息持有这些引用，绝不暴露临时全局名。
+## 两种跨表交付
 
-接收方只有在输出缓冲和 Handle 表都容纳完整消息时才能接收。内核安装全部转入 Handle、写出完整消息并移除队头；失败不出队、不部分安装。调用期间输出用户区由调用者独占，失败输出不可解释，不得被当作部分交付使用。
+### 消息 transit
 
-## 身份、寻址与启动授权
+发送者提交 `HandleMove[]`。内核验证每项 `TRANSIT`、目标 rights 不放大且没有重复源项，随后原子摘除全部源 entry 并封入消息。失败保持源表不变。
 
-PID 是内核赋予进程的身份和管理对象，可用于审计、父子关系、回收和诊断，但不是普通 IPC 地址或 bearer token。消息 envelope 的 sender 由内核填写，不自动提供回复能力；回复方必须取得明确交付的邮箱 sender Handle。普通 `Send` 的目标始终是授权的邮箱 Handle；服务发现返回受 rights 约束的服务 Handle，不返回 PID。
+接收方只有在输出缓冲与 HandleTable 都容纳完整消息时才安装全部 entry、写出完整结果并移除队头；失败不部分安装、不出队。Discard、Mailbox 关闭或进程退出会按 role 关闭未接收的 transit entry。
 
-启动交付把**信息**与**权利**分层。信息（args、配置、归档字节）随一个只读映射的版本化启动快照过境，入口唯一参数指向该快照，身份（pid、parent）也在其中；快照内容对内核不透明，语义由授权方与接收方运行时之间的协议演进。权利则是新进程 runnable 前原子安装的一组 Handle（根图的唯一例外），描述快照里逐项引用。Mailbox 只是可选资源之一，不占固定入口寄存器、固定 Handle 数值或特殊对象槽位；需要它而未被授予的进程可以自己创建（能力面对所有进程无差别开放），「服务出生自带邮箱」是授权方的组装惯例而非内核机制。
+### 直接 grant
 
-权利之源是对象创建者，不是内核：谁建对象谁持全权，随后沿进程树向下分发、单调收窄；内核只保管创建与传递原语，结构上不是授予者。终态下内核只启动 init 一个进程——其快照携带 initfs 归档字节（信息），handles 可以为零——此后全部授权策略在用户态生长。当前内核装载者以同一 launch 事务暂代授权方（为集成负载组装邮箱对），策略迁往 init/pm 时机制不变。
+ProcessStart 等事务从授权方表中原子摘除持 `GRANT` 的 entry，直接安装到尚未 runnable 的目标表。它不经过对象队列，适合 affine owner、启动内存与设备资源。目标 rights 仍只能收窄。
+
+两种运输都属于 capability move，但不能以一项 rights 冒充另一种存储拓扑。
+
+## 身份、授权与平台根
+
+PID 是内核分配的 provenance 与诊断身份，可用于审计、创建关系和故障定位，但不是 IPC 地址或 authority。`parent_pid` 只表示谁创建了进程，不产生管理、继承或回收权；管理权来自显式 Process capability。
+
+普通对象的初始 capability 由创建者持有。MMIO、IRQ、DMA、物理资源和 root Job 不能由用户凭空创建：内核依据可信平台事实铸造这些 primordial capabilities，并在初始 launch 中交付 init。内核是技术铸造者，init/resource manager 才是策略授予者；后续权利沿 capability 图传播，而不是沿 PID 树或进程权限等级传播。
+
+系统不要求 uid/gid 或进程权限级别。若未来增加多用户，认证和 ACL 位于用户态 grant 铸造阶段；最终对象操作仍以 capability 为必要授权。
+
+## StartupBlock
+
+进程启动由内核构造一个只读的通用 StartupBlock：
+
+```text
+Header(pid, parent_pid, geometry)
+actual child-local Handles[]
+opaque Payload[]
+```
+
+内核理解 outer 几何和实际 Handle 数组，但不解释 Payload，也不为 Handle 赋予业务 tag。launcher 与 child 可把 Payload 约定为 LauncherParcel、InitParcel、initfs 或其他格式，并用数组索引关联 Handle 语义。
+
+launch 在首次 runnable 前完成 Handle 预留、outer 构造、只读映射与原子安装；失败全部回滚。入口 `a0/a1` 只界定完整 StartupBlock，不依赖固定 Handle 数值、固定对象槽位或专用 mailbox 寄存器。
 
 ## 边界
 
-Handle 不是可序列化的全局标识，不能写进共享内存、文件或裸消息负载后在另一进程直接使用。跨进程交付必须使用消息 Handle move。对象模型提供引用、rights、lifecycle role 和终态；服务协议如何认证调用者、如何解释 kind 与负载，仍属于上层。
+对象模型只提供引用、role、rights、badge、运输和终态。服务协议如何解释 badge、认证请求、派生更窄 grant、执行配额或撤销，属于用户态协议。sender PID 可作 provenance，不能代替显式 capability。

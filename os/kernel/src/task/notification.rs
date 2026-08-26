@@ -116,10 +116,16 @@ impl KernelObject for Notification {
 
     fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
         match role {
-            HandleRole::NotificationOwner => Some(Rights::READ | Rights::WAIT | Rights::MANAGE),
-            HandleRole::NotificationSignaler => {
-                Some(Rights::SIGNAL | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)
+            HandleRole::NotificationOwner => {
+                Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
             }
+            HandleRole::NotificationSignaler => Some(
+                Rights::SIGNAL
+                    | Rights::WAIT
+                    | Rights::TRANSIT
+                    | Rights::GRANT
+                    | Rights::DUPLICATE,
+            ),
             _ => None,
         }
     }

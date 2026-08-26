@@ -43,14 +43,33 @@ pub fn entry(
     Ok(Entry::new(object, role, rights))
 }
 
+/// 构造带对象专用不可变 badge 的表项；badge 随 duplicate/move 保持。
+pub fn entry_with_badge(
+    object: ObjectRef,
+    role: HandleRole,
+    rights: Rights,
+    badge: u64,
+) -> Result<ProcessHandleEntry, TableError> {
+    if !rights.is_known() {
+        return Err(TableError::RightsDenied);
+    }
+    let allowed = object
+        .allowed_rights(role)
+        .ok_or(TableError::RightsDenied)?;
+    if !rights.is_subset_of(allowed) {
+        return Err(TableError::RightsDenied);
+    }
+    Ok(Entry::new_with_badge(object, role, rights, badge))
+}
+
 /// 表项已从 HandleTable 摘除且表锁已释放；现在执行对象生命周期动作。
 pub fn close_entry(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
-    let (object, role, _) = entry.into_parts();
+    let (object, role, _, _) = entry.into_parts();
     object.close_handle(role, owner, exiting);
 }
 
 pub fn close_transit(entry: ProcessHandleEntry) {
-    let (object, role, _) = entry.into_parts();
+    let (object, role, _, _) = entry.into_parts();
     object.close_transit(role);
 }
 

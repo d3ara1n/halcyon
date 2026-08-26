@@ -1,7 +1,8 @@
-//! 版本化启动块（StartupBlock）：launch 事务把授权方组装的清单字节只读
-//! 映射进新进程地址空间，入口 `a0` 指向块基。内容对内核不透明——tag、
-//! descriptor 与 payload 的语义属于授权方与接收方运行时（rinlib）之间的
-//! 版本化协议；内核只负责复制字节与按数组序安装 Handle。
+//! 通用启动块（StartupBlock）：内核在进程首次运行前构造并只读映射。
+//!
+//! 块只承载内核生成的进程身份、已安装的 child-local Handle 数组，以及
+//! launcher 与接收进程自行解释的不透明 payload。内核不解释 payload，
+//! 也不为 Handle 赋予业务 tag；两者的关联由 payload 协议按数组索引表达。
 
 use alloc::vec::Vec;
 
@@ -9,184 +10,161 @@ use crate::object::Handle;
 use crate::proc::Pid;
 
 /// 块格式版本。
-pub const STARTUP_VERSION: u16 = 1;
+pub const STARTUP_VERSION: u16 = 2;
 
 /// 块基魔数（"STARTUPB"）。
 pub const STARTUP_BLOCK_MAGIC: u64 = u64::from_le_bytes(*b"STARTUPB");
 
-/// descriptor 无关联 Handle 的 `handle_index` 哨兵。
-pub const NO_HANDLE: u32 = u32::MAX;
-
-// —— 标准 tag（授权方与接收方库共享的常量；内核不解释语义）——
-
-/// 服务出生自带的邮箱 owner（授权方惯例，非内核机制）。
-pub const TAG_MAILBOX_OWNER: u64 = 1;
-/// init 持有的 pm 邮箱 sender（内核 boot loader ↔ init 私有协议）。
-pub const TAG_PM_MAILBOX: u64 = 2;
-/// init 的 initfs 归档字节（boot loader ↔ init 私有协议；服务化阶段启用）。
-pub const TAG_INITFS_ARCHIVE: u64 = 3;
-
-/// launch 槽位约定：按数组顺序安装的第 `index` 个 Handle（0 起）。
-/// 新进程 Handle 表为空表，顺序安装必落槽位 `index + 1`、generation 1；
-/// 内核在安装时断言成立，接收方据此从块内 index 复原 Handle 数值。
-pub const fn startup_handle(index: u32) -> Handle {
-    Handle::from_parts(index + 1, 1)
-}
-
-/// 启动块头：位于块基，随后是 `descriptor_count` 个 descriptor，最后是
-/// 各 descriptor 经 `data_off`/`data_len` 引用的 payload 字节区。
+/// 启动块头。其后紧跟 `handle_count` 个实际 child-local Handle，再后是
+/// `[payload_off, payload_off + payload_len)` 的不透明 payload。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct StartupBlockHeader {
     pub magic: u64,
-    /// 块总长（字节，含头、descriptor 表与 payload）。
+    /// 块总长（字节，含头、Handle 数组与 payload）。
     pub block_len: u32,
     pub version: u16,
     pub reserved0: u16,
     pub pid: Pid,
+    /// 仅表示创建关系，不能推导管理、继承或回收权。
     pub parent_pid: Pid,
-    pub descriptor_count: u32,
-    /// launch 安装的 Handle 总数；descriptor 的 `handle_index` 上界。
     pub handle_count: u32,
-    pub reserved: [u32; 2],
-}
-
-/// 一项启动资源描述：tag 语义属授权方 ↔ 接收方协议；Handle 引用与
-/// payload 引用可独立或并存。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C, align(8))]
-pub struct StartupDescriptor {
-    pub tag: u64,
-    /// 关联的 Handle 序号（见 [`startup_handle`]），或 [`NO_HANDLE`]。
-    pub handle_index: u32,
-    /// payload 区相对块基的偏移（字节）。
-    pub data_off: u32,
-    /// payload 长度（字节）。
-    pub data_len: u32,
+    /// payload 相对块基的规范偏移。
+    pub payload_off: u32,
+    pub payload_len: u32,
     pub reserved: u32,
 }
 
 const _: () = {
     assert!(core::mem::size_of::<StartupBlockHeader>() == 40);
-    assert!(core::mem::size_of::<StartupDescriptor>() == 24);
+    assert!(core::mem::align_of::<StartupBlockHeader>() == 8);
 };
 
-/// 组装失败：授权方构造出接收方必拒绝的块，或无法表示的几何。
+/// 内核构造启动块时遇到的几何或分配错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupBuildError {
     /// 区段偏移/长度超出 u32 表示域或总长溢出。
     Overflow,
-    /// tag 重复（查找键必须唯一）。
-    DuplicateTag,
-    /// `handle_index` 超出 `handle_count` 上界。
-    HandleIndexOutOfRange,
+    /// 无法为完整块预留内存。
+    AllocationFailed,
 }
 
-/// 启动块组装器：授权方（当前为内核 boot loader，未来为 init/pm）构造
-/// manifest 字节。`handle_index` 必须与 launch 传入的 Handle 数组序一致。
-/// payload 区偏移在 [`StartupManifest::finish`] 统一计算——descriptor 表
-/// 长度随后续 add 增长，提前计算会与表区重叠。
-#[derive(Debug, Default)]
-pub struct StartupManifest {
-    entries: Vec<ManifestEntry>,
-    payload: Vec<u8>,
+/// StartupBlock 外层校验错误；payload 内容不参与校验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupParseError {
+    TruncatedHeader,
+    LengthMismatch,
+    BadMagic,
+    UnsupportedVersion,
+    NonzeroReserved,
+    GeometryOverflow,
+    NoncanonicalPayloadOffset,
+    InvalidHandle,
 }
 
-#[derive(Debug)]
-struct ManifestEntry {
-    tag: u64,
-    handle_index: u32,
-    /// payload 区内的 [start, end) 字节区间。
-    data: (usize, usize),
-}
-
-impl StartupManifest {
-    pub const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            payload: Vec::new(),
-        }
+/// 校验内核定义的 outer 几何并返回已解码 header。输入无需对齐。
+pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, StartupParseError> {
+    if block.len() < core::mem::size_of::<StartupBlockHeader>() {
+        return Err(StartupParseError::TruncatedHeader);
     }
-
-    /// 追加一项资源描述：`handle_index = Some(i)` 表示第 i 个安装的
-    /// Handle；`data` 为可选的 payload 字节（如字符串、路由表、归档）。
-    pub fn add(&mut self, tag: u64, handle_index: Option<u32>, data: &[u8]) -> &mut Self {
-        let start = self.payload.len();
-        self.payload.extend_from_slice(data);
-        self.entries.push(ManifestEntry {
-            tag,
-            handle_index: handle_index.unwrap_or(NO_HANDLE),
-            data: (start, self.payload.len()),
-        });
-        self
+    // SAFETY: 长度已覆盖完整 header；使用 unaligned 读取，不要求输入对齐。
+    let header = unsafe { core::ptr::read_unaligned(block.as_ptr().cast::<StartupBlockHeader>()) };
+    if header.block_len as usize != block.len() {
+        return Err(StartupParseError::LengthMismatch);
     }
-
-    /// 产出完整块字节：`[header][descriptors][payload]`。拒绝接收方必
-    /// 拒绝的几何（重复 tag、越界 `handle_index`）与无法表示的尺寸。
-    pub fn finish(
-        self,
-        pid: Pid,
-        parent_pid: Pid,
-        handle_count: u32,
-    ) -> Result<Vec<u8>, StartupBuildError> {
-        let descriptor_bytes = self
-            .entries
-            .len()
-            .checked_mul(core::mem::size_of::<StartupDescriptor>())
-            .ok_or(StartupBuildError::Overflow)?;
-        let payload_base = core::mem::size_of::<StartupBlockHeader>() + descriptor_bytes;
-        let total = payload_base
-            .checked_add(self.payload.len())
-            .ok_or(StartupBuildError::Overflow)?;
-        let mut seen = alloc::collections::BTreeSet::new();
-        for entry in &self.entries {
-            if !seen.insert(entry.tag) {
-                return Err(StartupBuildError::DuplicateTag);
-            }
-            if entry.handle_index != NO_HANDLE && entry.handle_index >= handle_count {
-                return Err(StartupBuildError::HandleIndexOutOfRange);
-            }
-        }
-        let header = StartupBlockHeader {
-            magic: STARTUP_BLOCK_MAGIC,
-            block_len: u32::try_from(total).map_err(|_| StartupBuildError::Overflow)?,
-            version: STARTUP_VERSION,
-            reserved0: 0,
-            pid,
-            parent_pid,
-            descriptor_count: u32::try_from(self.entries.len())
-                .map_err(|_| StartupBuildError::Overflow)?,
-            handle_count,
-            reserved: [0; 2],
+    if header.magic != STARTUP_BLOCK_MAGIC {
+        return Err(StartupParseError::BadMagic);
+    }
+    if header.version != STARTUP_VERSION {
+        return Err(StartupParseError::UnsupportedVersion);
+    }
+    if header.reserved0 != 0 || header.reserved != 0 {
+        return Err(StartupParseError::NonzeroReserved);
+    }
+    let handle_bytes = (header.handle_count as usize)
+        .checked_mul(core::mem::size_of::<Handle>())
+        .ok_or(StartupParseError::GeometryOverflow)?;
+    let payload_off = core::mem::size_of::<StartupBlockHeader>()
+        .checked_add(handle_bytes)
+        .ok_or(StartupParseError::GeometryOverflow)?;
+    if header.payload_off as usize != payload_off {
+        return Err(StartupParseError::NoncanonicalPayloadOffset);
+    }
+    let payload_end = payload_off
+        .checked_add(header.payload_len as usize)
+        .ok_or(StartupParseError::GeometryOverflow)?;
+    if payload_end != block.len() {
+        return Err(StartupParseError::LengthMismatch);
+    }
+    for index in 0..header.handle_count as usize {
+        let offset = core::mem::size_of::<StartupBlockHeader>()
+            + index * core::mem::size_of::<Handle>();
+        // SAFETY: 规范几何已证明本项完整位于 block 内；输入无需对齐。
+        let handle = unsafe {
+            core::ptr::read_unaligned(block.as_ptr().byte_add(offset).cast::<Handle>())
         };
-        let mut block = Vec::new();
-        block
-            .try_reserve_exact(total)
-            .map_err(|_| StartupBuildError::Overflow)?;
-        append_value(&mut block, &header);
-        for entry in &self.entries {
-            append_value(
-                &mut block,
-                &StartupDescriptor {
-                    tag: entry.tag,
-                    handle_index: entry.handle_index,
-                    data_off: u32::try_from(payload_base + entry.data.0)
-                        .map_err(|_| StartupBuildError::Overflow)?,
-                    data_len: u32::try_from(entry.data.1 - entry.data.0)
-                        .map_err(|_| StartupBuildError::Overflow)?,
-                    reserved: 0,
-                },
-            );
+        if !handle.is_valid() {
+            return Err(StartupParseError::InvalidHandle);
         }
-        block.extend_from_slice(&self.payload);
-        Ok(block)
     }
+    Ok(header)
+}
+
+/// 以实际 child-local Handle 构造完整启动块。
+///
+/// 输出布局固定为 `[header][Handle × N][opaque payload]`。Handle 数值由
+/// child HandleTable 的 reservation 提供，不能由数组下标重新推导。
+pub fn build_startup_block(
+    pid: Pid,
+    parent_pid: Pid,
+    handles: &[Handle],
+    payload: &[u8],
+) -> Result<Vec<u8>, StartupBuildError> {
+    let handle_bytes = handles
+        .len()
+        .checked_mul(core::mem::size_of::<Handle>())
+        .ok_or(StartupBuildError::Overflow)?;
+    let payload_off = core::mem::size_of::<StartupBlockHeader>()
+        .checked_add(handle_bytes)
+        .ok_or(StartupBuildError::Overflow)?;
+    let total = payload_off
+        .checked_add(payload.len())
+        .ok_or(StartupBuildError::Overflow)?;
+    let header = StartupBlockHeader {
+        magic: STARTUP_BLOCK_MAGIC,
+        block_len: u32::try_from(total).map_err(|_| StartupBuildError::Overflow)?,
+        version: STARTUP_VERSION,
+        reserved0: 0,
+        pid,
+        parent_pid,
+        handle_count: u32::try_from(handles.len()).map_err(|_| StartupBuildError::Overflow)?,
+        payload_off: u32::try_from(payload_off).map_err(|_| StartupBuildError::Overflow)?,
+        payload_len: u32::try_from(payload.len()).map_err(|_| StartupBuildError::Overflow)?,
+        reserved: 0,
+    };
+
+    let mut block = Vec::new();
+    block
+        .try_reserve_exact(total)
+        .map_err(|_| StartupBuildError::AllocationFailed)?;
+    append_value(&mut block, &header);
+    append_values(&mut block, handles);
+    block.extend_from_slice(payload);
+    Ok(block)
 }
 
 fn append_value<T: Copy>(output: &mut Vec<u8>, value: &T) {
-    // SAFETY: Startup ABI structs are fully initialized and contain no padding.
+    // SAFETY: StartupBlockHeader 所有字段均已初始化且布局无 padding。
     let bytes = unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    };
+    output.extend_from_slice(bytes);
+}
+
+fn append_values<T: Copy>(output: &mut Vec<u8>, values: &[T]) {
+    // SAFETY: Handle 是无 padding 的 u64 newtype；切片长度按 size_of_val 取值。
+    let bytes = unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     };
     output.extend_from_slice(bytes);
 }
@@ -195,81 +173,91 @@ fn append_value<T: Copy>(output: &mut Vec<u8>, value: &T) {
 mod tests {
     use super::*;
 
-    /// 布局真值：块内区段几何由头与 descriptor 的偏移共同决定，
-    /// 组装器输出必须与接收方（rinlib env）的重读几何完全一致。
     #[test]
-    fn manifest_layout_roundtrips() {
-        let mut manifest = StartupManifest::new();
-        manifest
-            .add(TAG_PM_MAILBOX, Some(0), &[])
-            .add(TAG_INITFS_ARCHIVE, None, b"archive bytes")
-            .add(0xdead_beef, Some(1), b"");
-        let block = manifest
-            .finish(7, 0, 2)
-            .expect("valid manifest must assemble");
+    fn block_carries_actual_handles_and_opaque_payload() {
+        let handles = [
+            Handle::from_parts(7, 3),
+            Handle::from_parts(2, u32::MAX - 1),
+        ];
+        let payload = b"\0launcher\xffpayload";
+        let block = build_startup_block(11, 4, &handles, payload)
+            .expect("valid startup block must assemble");
 
-        // SAFETY: 块是刚构造的字节向量，头长度已由组装器保证。
+        // SAFETY: 块由组装器构造且至少包含完整头。
         let header =
             unsafe { core::ptr::read_unaligned(block.as_ptr().cast::<StartupBlockHeader>()) };
         assert_eq!(header.magic, STARTUP_BLOCK_MAGIC);
         assert_eq!(header.version, STARTUP_VERSION);
-        assert_eq!((header.pid, header.parent_pid), (7, 0));
-        assert_eq!(header.descriptor_count, 3);
+        assert_eq!((header.pid, header.parent_pid), (11, 4));
         assert_eq!(header.handle_count, 2);
+        assert_eq!(header.payload_off as usize, 40 + 2 * core::mem::size_of::<Handle>());
+        assert_eq!(header.payload_len as usize, payload.len());
         assert_eq!(header.block_len as usize, block.len());
         assert_eq!(header.reserved0, 0);
-        assert_eq!(header.reserved, [0; 2]);
+        assert_eq!(header.reserved, 0);
 
-        let descriptors = unsafe {
-            core::slice::from_raw_parts(
-                block.as_ptr().byte_add(core::mem::size_of::<StartupBlockHeader>()).cast::<StartupDescriptor>(),
-                3,
-            )
-        };
-        let [pm, archive, extra] = descriptors else { unreachable!() };
-        assert_eq!((*pm).tag, TAG_PM_MAILBOX);
-        assert_eq!((*pm).handle_index, 0);
-        assert_eq!((*archive).handle_index, NO_HANDLE);
-        assert_eq!((*archive).data_off as usize,
-            core::mem::size_of::<StartupBlockHeader>() + 3 * core::mem::size_of::<StartupDescriptor>());
-        assert_eq!((*archive).data_len as usize, b"archive bytes".len());
-        assert_eq!((*extra).tag, 0xdead_beef);
-        for descriptor in descriptors {
-            assert_eq!(descriptor.reserved, 0);
-            assert!(descriptor.data_off as usize + descriptor.data_len as usize <= block.len());
+        let mut actual = [Handle::INVALID; 2];
+        for (index, output) in actual.iter_mut().enumerate() {
+            let offset = core::mem::size_of::<StartupBlockHeader>()
+                + index * core::mem::size_of::<Handle>();
+            // SAFETY: builder 已输出完整 Handle 字节；测试 Vec 基址无需对齐。
+            *output = unsafe {
+                core::ptr::read_unaligned(block.as_ptr().byte_add(offset).cast::<Handle>())
+            };
         }
-        assert_eq!(&block[(*archive).data_off as usize..(*archive).data_off as usize + (*archive).data_len as usize], b"archive bytes");
+        assert_eq!(actual, handles);
+        assert_eq!(validate_startup_block(&block), Ok(header));
+        assert_eq!(&block[header.payload_off as usize..], payload);
     }
 
-    /// 槽位约定：handle_index i ↔ Handle::from_parts(i + 1, 1)，
-    /// 与内核空表顺序安装的 slot/generation 对应。
     #[test]
-    fn slot_contract_matches_fresh_table_geometry() {
-        assert_eq!(startup_handle(0), Handle::from_parts(1, 1));
-        assert_eq!(startup_handle(2), Handle::from_parts(3, 1));
-        assert!(startup_handle(0).is_valid());
+    fn empty_handles_and_payload_are_valid() {
+        let block = build_startup_block(1, 0, &[], &[])
+            .expect("empty startup resources must be valid");
+        let header = validate_startup_block(&block).expect("empty block must validate");
+        assert_eq!(header.handle_count, 0);
+        assert_eq!(header.payload_len, 0);
+        assert_eq!(header.payload_off as usize, core::mem::size_of::<StartupBlockHeader>());
+        assert_eq!(block.len(), core::mem::size_of::<StartupBlockHeader>());
     }
 
-    /// 组装器拒绝接收方必拒绝的几何：重复 tag、越界 handle_index。
     #[test]
-    fn builder_rejects_invalid_geometry() {
-        let mut manifest = StartupManifest::new();
-        manifest.add(TAG_PM_MAILBOX, Some(0), &[]).add(TAG_PM_MAILBOX, None, &[]);
+    fn validator_rejects_outer_geometry_corruption() {
         assert_eq!(
-            manifest.finish(1, 0, 1).unwrap_err(),
-            StartupBuildError::DuplicateTag
+            validate_startup_block(&[0; 8]),
+            Err(StartupParseError::TruncatedHeader)
         );
 
-        let mut manifest = StartupManifest::new();
-        manifest.add(TAG_PM_MAILBOX, Some(1), &[]);
+        let valid = build_startup_block(1, 0, &[Handle::from_parts(9, 4)], b"payload")
+            .expect("fixture must assemble");
+        let mut corrupted = valid.clone();
+        corrupted[0] ^= 1;
         assert_eq!(
-            manifest.finish(1, 0, 1).unwrap_err(),
-            StartupBuildError::HandleIndexOutOfRange
+            validate_startup_block(&corrupted),
+            Err(StartupParseError::BadMagic)
         );
 
-        // NO_HANDLE 哨兵不受 handle_count 约束。
-        let mut manifest = StartupManifest::new();
-        manifest.add(TAG_INITFS_ARCHIVE, None, b"x");
-        assert!(manifest.finish(1, 0, 0).is_ok());
+        let mut corrupted = valid.clone();
+        let payload_off = core::mem::offset_of!(StartupBlockHeader, payload_off);
+        corrupted[payload_off..payload_off + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            validate_startup_block(&corrupted),
+            Err(StartupParseError::NoncanonicalPayloadOffset)
+        );
+
+        let mut corrupted = valid.clone();
+        let reserved = core::mem::offset_of!(StartupBlockHeader, reserved);
+        corrupted[reserved..reserved + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            validate_startup_block(&corrupted),
+            Err(StartupParseError::NonzeroReserved)
+        );
+
+        let mut corrupted = valid;
+        corrupted.truncate(corrupted.len() - 1);
+        assert_eq!(
+            validate_startup_block(&corrupted),
+            Err(StartupParseError::LengthMismatch)
+        );
     }
 }

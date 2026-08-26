@@ -31,14 +31,21 @@ pub struct Entry<T, R> {
     object: T,
     role: R,
     rights: Rights,
+    /// capability 副本携带的不可变 badge；具体语义由对象类型解释。
+    badge: u64,
 }
 
 impl<T, R> Entry<T, R> {
     pub const fn new(object: T, role: R, rights: Rights) -> Self {
+        Self::new_with_badge(object, role, rights, 0)
+    }
+
+    pub const fn new_with_badge(object: T, role: R, rights: Rights, badge: u64) -> Self {
         Self {
             object,
             role,
             rights,
+            badge,
         }
     }
 
@@ -54,8 +61,12 @@ impl<T, R> Entry<T, R> {
         self.rights
     }
 
-    pub fn into_parts(self) -> (T, R, Rights) {
-        (self.object, self.role, self.rights)
+    pub const fn badge(&self) -> u64 {
+        self.badge
+    }
+
+    pub fn into_parts(self) -> (T, R, Rights, u64) {
+        (self.object, self.role, self.rights, self.badge)
     }
 
     fn with_rights(mut self, rights: Rights) -> Self {
@@ -70,6 +81,7 @@ impl<T: Clone, R: Clone> Clone for Entry<T, R> {
             object: self.object.clone(),
             role: self.role.clone(),
             rights: self.rights,
+            badge: self.badge,
         }
     }
 }
@@ -198,30 +210,48 @@ impl<T, R> HandleTable<T, R> {
         self.insert(derived)
     }
 
-    /// 原子验证并移除一批待转移 Handle。任何验证失败都保持表不变。
+    /// 原子验证并移除一批待进入有缓冲消息的 Handle。任何验证失败都保持
+    /// 表不变；每项源 entry 必须持 TRANSIT。
     pub fn extract_moves(
         &mut self,
         moves: &[(Handle, Rights)],
     ) -> Result<Vec<Entry<T, R>>, TableError> {
+        self.extract_with(moves, Rights::TRANSIT)
+    }
+
+    /// 原子验证并移除一批待直接安装到另一 HandleTable 的 Handle。任何
+    /// 验证失败都保持表不变；每项源 entry 必须持 GRANT。
+    pub fn extract_grants(
+        &mut self,
+        grants: &[(Handle, Rights)],
+    ) -> Result<Vec<Entry<T, R>>, TableError> {
+        self.extract_with(grants, Rights::GRANT)
+    }
+
+    fn extract_with(
+        &mut self,
+        items: &[(Handle, Rights)],
+        transport: Rights,
+    ) -> Result<Vec<Entry<T, R>>, TableError> {
         let mut extracted = Vec::new();
         extracted
-            .try_reserve(moves.len())
+            .try_reserve(items.len())
             .map_err(|_| TableError::AllocationFailed)?;
 
-        for (i, (handle, rights)) in moves.iter().copied().enumerate() {
-            if moves[..i].iter().any(|(prior, _)| *prior == handle) {
+        for (i, (handle, rights)) in items.iter().copied().enumerate() {
+            if items[..i].iter().any(|(prior, _)| *prior == handle) {
                 return Err(TableError::DuplicateHandle);
             }
             if !rights.is_known() {
                 return Err(TableError::RightsDenied);
             }
-            let entry = self.get(handle, Rights::TRANSFER)?;
+            let entry = self.get(handle, transport)?;
             if !rights.is_subset_of(entry.rights) {
                 return Err(TableError::RightsDenied);
             }
         }
 
-        for (handle, rights) in moves.iter().copied() {
+        for (handle, rights) in items.iter().copied() {
             extracted.push(self.remove(handle)?.with_rights(rights));
         }
         Ok(extracted)
@@ -431,6 +461,10 @@ mod tests {
         Entry::new(value, role, rights)
     }
 
+    fn badged_entry(value: u32, role: Role, rights: Rights, badge: u64) -> Entry<u32, Role> {
+        Entry::new_with_badge(value, role, rights, badge)
+    }
+
     #[test]
     fn stale_handle_never_names_reused_slot() {
         let mut table = HandleTable::with_limit(2);
@@ -468,17 +502,34 @@ mod tests {
         assert_eq!(*table.get(copy, Rights::WRITE).unwrap().object(), 7);
         assert_eq!(
             table
-                .duplicate(source, Rights::WRITE | Rights::TRANSFER)
+                .duplicate(source, Rights::WRITE | Rights::TRANSIT)
                 .unwrap_err(),
             TableError::RightsDenied
         );
     }
 
     #[test]
+    fn duplicate_and_move_preserve_badge() {
+        let mut table = HandleTable::new();
+        let source = table
+            .insert(badged_entry(
+                7,
+                Role::Sender,
+                Rights::WRITE | Rights::TRANSIT | Rights::DUPLICATE,
+                0xfeed_beef,
+            ))
+            .unwrap();
+        let copy = table.duplicate(source, Rights::WRITE | Rights::TRANSIT).unwrap();
+        assert_eq!(table.get(copy, Rights::WRITE).unwrap().badge(), 0xfeed_beef);
+        let moved = table.extract_moves(&[(copy, Rights::WRITE)]).unwrap();
+        assert_eq!(moved[0].badge(), 0xfeed_beef);
+    }
+
+    #[test]
     fn failed_move_keeps_every_source() {
         let mut table = HandleTable::new();
         let a = table
-            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSFER))
+            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSIT))
             .unwrap();
         let b = table.insert(entry(2, Role::Owner, Rights::READ)).unwrap();
         assert_eq!(
@@ -492,10 +543,34 @@ mod tests {
     }
 
     #[test]
+    fn transit_and_direct_grant_require_distinct_rights() {
+        let mut table = HandleTable::new();
+        let owner = table
+            .insert(entry(1, Role::Owner, Rights::READ | Rights::GRANT))
+            .unwrap();
+        assert_eq!(
+            table.extract_moves(&[(owner, Rights::READ)]).unwrap_err(),
+            TableError::RightsDenied
+        );
+        assert!(table.get(owner, Rights::READ).is_ok());
+        let granted = table.extract_grants(&[(owner, Rights::READ)]).unwrap();
+        assert_eq!(granted[0].rights(), Rights::READ);
+
+        let sender = table
+            .insert(entry(2, Role::Sender, Rights::WRITE | Rights::TRANSIT))
+            .unwrap();
+        assert_eq!(
+            table.extract_grants(&[(sender, Rights::WRITE)]).unwrap_err(),
+            TableError::RightsDenied
+        );
+        assert!(table.get(sender, Rights::WRITE).is_ok());
+    }
+
+    #[test]
     fn successful_move_retires_source_values() {
         let mut table = HandleTable::new();
         let a = table
-            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSFER))
+            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSIT))
             .unwrap();
         let moved = table.extract_moves(&[(a, Rights::WRITE)]).unwrap();
         assert_eq!(moved[0].rights(), Rights::WRITE);

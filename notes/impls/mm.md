@@ -1,6 +1,6 @@
 # 内存管理
 
-分四层：帧池（物理帧）、Sv39 纯逻辑（可 host 测试）、内核地址空间与启动协议、用户地址空间。地址空间布局见 `internals.md`；旧实现的教训见 `plans/review-2026-08-mm-map-bug.md`（六条注意事项全部为本文设计的反面输入）。
+分四层：帧池（物理帧）、Sv39 纯逻辑（可 host 测试）、内核地址空间与启动协议、用户地址空间。地址空间布局见 `internals.md`。
 
 ## 帧池
 
@@ -129,21 +129,13 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 任意用户页表共享内核高半区与栈窗口，用户 trap 不切 satp；`stvec` 恒指共同内核入口。用户上下文存于内核对象，`sscratch` 存本 hart 陷阱锚。内核稳态 SUM=0，只有 user-copy guard 可以临时直访用户 VA。
 
-## 用户地址空间（M3 消费）
+## 用户地址空间
 
 - 低半区 `[0, 2^38)` 完全归用户，进程页表 root 创建时拷贝内核高半区顶层项（含栈窗口槽）；
-- 用户区布局（程序/堆/栈/隧道区）沿用旧设计，M3 随任务模型定稿。
-
-## 施工顺序
-
-1. `os/page_table` crate：类型/Pte/FrameMemory/TableTree 切段算法 + host 测试集全绿（含 mm-map-bug 数值用例）。
-2. 帧池：os/frame_pool 纯逻辑 crate（host 测试集）+ 内核 Spinlock 包装，DTB 段注册（剔除内核镜像/栈/initfs 占用）。
-3. 启动协议：链接脚本高半区化（VMA/LMA 分离）+ TRAMPOLINE_PG_DIR 双 mega 项 + _start PA 段 + secondary 同路径。
-4. 收口：堆 arena 切帧池供给（消灭 HEAP_ARENA）、just virt 高半区 MMU 下回验收线（banner + 4 核 online）。
-
-步骤 3 动启动路径，独立成段实施。
+- 当前布局为 ELF/StartupBlock/堆/主线程栈，具体区间见 [`task.md`](task.md)；
+- Tunnel 映射由 Endpoint lease 记入 `AddressSpace.external_mappings`，关闭时解除。
 
 ## 异构 hart 与 rv32（纪律）
 
-- HartKind 扩展点与实时核 AMP 方向见 `internals.md`「hart 种类」；跨 hart 共享数据不假设全体核有 MMU。
+- admitted hart、无 MMU hart 与 AMP 边界见 [`execution-context.md`](execution-context.md)；跨 hart 共享数据不假设全体核有 MMU。
 - rv32 无设备目标，park。纪律：地址运算一律 usize（不用 u64 写死）；64 位魔数仅限本 crate（rv64 家族专属）；shared ABI 的地址类字段用 usize——rv32 目标下内核与用户两侧同宽，天然成立；仅面向网络/外部交换的数据交换才需要定宽编码。

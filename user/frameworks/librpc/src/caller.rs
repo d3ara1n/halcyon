@@ -52,7 +52,8 @@ impl From<SystemCallError> for CallError {
 
 /// 一条已验证的应答：RpcPrefix 已剥离，payload 为协议层字节。
 pub struct Reply {
-    pub sender: u64,
+    pub sender_pid: u64,
+    pub sender_badge: u64,
     pub payload: Vec<u8>,
     pub handles: Vec<Handle>,
 }
@@ -76,7 +77,7 @@ impl Caller {
         }
         let port = mailbox_create(
             Rights::READ | Rights::WAIT,
-            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSIT,
         )?;
         self.port = Some(port);
         Ok(port)
@@ -114,13 +115,13 @@ impl Caller {
         let used = crate::PREFIX_LEN + body.len();
         payload[crate::PREFIX_LEN..used].copy_from_slice(body);
 
-        // slot 0：裁剪至 WRITE|TRANSFER 的一次性回复授权（跨协议公共约定；
-        // TRANSFER 是随消息 move 的内核前提）。
-        let reply_once = make_send_once(port.peer, Rights::WRITE | Rights::TRANSFER)?;
+        // slot 0：裁剪至 WRITE|TRANSIT 的一次性回复授权（跨协议公共约定；
+        // TRANSIT 是暂存于消息并由接收方安装的内核前提）。
+        let reply_once = make_send_once(port.peer, Rights::WRITE | Rights::TRANSIT)?;
         let mut moves_storage = [HandleMove { handle: Handle::INVALID, rights: Rights::NONE };
             1 + MESSAGE_HANDLE_MAX];
         moves_storage[0] =
-            HandleMove { handle: reply_once, rights: Rights::WRITE | Rights::TRANSFER };
+            HandleMove { handle: reply_once, rights: Rights::WRITE | Rights::TRANSIT };
         moves_storage[1..1 + extra_moves.len()].copy_from_slice(extra_moves);
         let moves = &moves_storage[..1 + extra_moves.len()];
 
@@ -168,7 +169,8 @@ impl Caller {
                     return Err(CallError::Frame(FrameRejection::TxidMismatch));
                 }
                 Ok(Reply {
-                    sender: message.header.sender,
+                    sender_pid: message.header.sender_pid,
+                    sender_badge: message.header.sender_badge,
                     payload: message.payload[crate::PREFIX_LEN..].to_vec(),
                     handles: message.handles,
                 })

@@ -220,7 +220,7 @@ impl AddressSpace {
     /// 块帧记入 `frames`，生命周期随进程地址空间。
     pub fn map_startup_block(&mut self, bytes: &[u8]) -> Result<usize, SpaceError> {
         if bytes.is_empty() || self.brk == 0 {
-            return Err(SpaceError::BadSegment); // 空清单或 ELF 未装载
+            return Err(SpaceError::BadSegment); // 空块或 ELF 未装载
         }
         let base = self.brk;
         let pages = bytes.len().div_ceil(PAGE_SIZE);
@@ -369,8 +369,7 @@ impl AddressSpace {
 /// HandleTable drain 先摘项再执行对象 callback，避免生命周期回调反向进入表锁。
 pub struct Process {
     pub pid: Pid,
-    /// 进程关系身份；内核侧消费（pm 接管 spawn/回收通知）在服务化阶段。
-    #[expect(dead_code, reason = "pm/进程关系里程碑使用")]
+    /// 仅用于诊断的创建关系；不产生管理、继承或回收权。
     pub parent: Pid,
     pub space: crate::sync::Spinlock<AddressSpace>,
     /// 新对象 ABI 的进程本地 Handle 表。
@@ -495,15 +494,16 @@ pub fn spawn_from_elf(
     })
 }
 
-/// launch 事务：只读映射启动块 → 按数组序安装 Handle → 创建主线程
-/// （a0 = 块基）→ 入进程表。manifest 对内核是不透明字节串（长度即块长，
-/// Handle 数即安装数）；失败全量回滚——已装 Handle 随 Process Drop 关闭，
-/// 未消费 Handle 由本函数 close_transit，进程表不出现半初始化条目。
-/// W^X：段内容写入尚不可执行的地址空间，随后入队 Release 发布
-/// （见 sched::enqueue）。
+/// launch 事务：为 child 预留真实 Handle → 由内核构造通用 StartupBlock
+/// （身份 + Handle 数组 + opaque payload）→ 只读映射 → 原子安装 Handle →
+/// 创建主线程并入进程表。payload 语义只属于 launcher 与接收进程。
+///
+/// 失败全量回滚：临时 Handle 数值随 reservation 作废，输入 entries 按目标
+/// 进程退出语义关闭，进程表不出现半初始化项。W^X 发布边界仍是后续
+/// `sched::enqueue` 的 Release。
 pub fn launch(
     spawned: SpawnedProcess,
-    manifest: &[u8],
+    payload: &[u8],
     handles: Vec<super::handle::ProcessHandleEntry>,
 ) -> Result<Arc<Thread>, SpaceError> {
     let SpawnedProcess {
@@ -512,25 +512,10 @@ pub fn launch(
         requirement,
     } = spawned;
 
-    let block_va = match process.space.lock().map_startup_block(manifest) {
-        Ok(va) => va,
-        Err(error) => {
-            for handle in handles {
-                // 未安装项按目标进程退出路径关闭（owner 侧触发对象 close
-                // 语义；transit 词汇不适用于直接授权项）。
-                super::handle::close_entry(handle, &process, true);
-            }
-            return Err(error);
-        }
-    };
-
-    // 安装采用 reserve→commit 事务：空表顺序预留必得槽位 1..=N、
-    // generation 1（shared::startup::startup_handle 槽位约定，内核侧显式
-    // 断言）；commit 一次可见，不产生半安装状态。
-    {
+    let token = super::handle::transaction_token();
+    let reservation = {
         let mut table = process.handles.lock();
-        let token = super::handle::transaction_token();
-        let reservation = match table.reserve(handles.len(), token) {
+        match table.reserve(handles.len(), token) {
             Ok(reservation) => reservation,
             Err(_) => {
                 drop(table);
@@ -539,25 +524,59 @@ pub fn launch(
                 }
                 return Err(SpaceError::NoFrame);
             }
-        };
-        for (index, handle) in reservation.handles().iter().enumerate() {
-            assert_eq!(
-                *handle,
-                erhino_shared::startup::startup_handle(index as u32),
-                "launch slot contract violated"
-            );
         }
-        table
-            .commit(reservation, handles)
-            .expect("reservation count matches entries");
-    }
+    };
+
+    let block = match erhino_shared::startup::build_startup_block(
+        process.pid,
+        process.parent,
+        reservation.handles(),
+        payload,
+    ) {
+        Ok(block) => block,
+        Err(error) => {
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry(handle, &process, true);
+            }
+            return Err(match error {
+                erhino_shared::startup::StartupBuildError::Overflow => SpaceError::BadSegment,
+                erhino_shared::startup::StartupBuildError::AllocationFailed => SpaceError::NoFrame,
+            });
+        }
+    };
+
+    let block_va = match process.space.lock().map_startup_block(&block) {
+        Ok(va) => va,
+        Err(error) => {
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry(handle, &process, true);
+            }
+            return Err(error);
+        }
+    };
+
+    process
+        .handles
+        .lock()
+        .commit(reservation, handles)
+        .expect("launch reservation count matches entries");
 
     let thread = Arc::new(Thread::new_main(
         process.clone(),
         entry,
         requirement,
         block_va,
-        manifest.len(),
+        block.len(),
     ));
     super::table::insert(process);
     Ok(thread)

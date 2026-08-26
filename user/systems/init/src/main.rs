@@ -13,9 +13,9 @@
 use rinlib::{
     env,
     ipc::{
-        message::{create, discard, make_send_once, receive, send, wait_message},
+        message::{create, discard, make_send_once, mint_sender, receive, send, wait_message},
         notification,
-        object::close,
+        object::{close, duplicate},
         tunnel as tunnel_sys,
         wait::wait_many,
     },
@@ -24,7 +24,6 @@ use rinlib::{
         call::SystemCallError,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
-        startup::TAG_PM_MAILBOX,
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
 };
@@ -43,13 +42,13 @@ fn main() {
     debug!("Hello, init!");
     let pair = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("mailbox create failed");
 
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("notification create failed");
     let moves = [HandleMove {
@@ -92,6 +91,7 @@ fn main() {
     let _ = close(pair.peer);
     let _ = close(pair.owner);
 
+    test_capability_badges_and_affine_owners();
     stress_control_plane();
     test_tunnel_lifecycle();
     test_send_once();
@@ -106,7 +106,7 @@ fn main() {
         }
     };
     debug!("tunnel created");
-    let Some(pm_mailbox) = env::startup_handle(TAG_PM_MAILBOX) else {
+    let Some(pm_mailbox) = env::startup_handle(0) else {
         debug!("pm mailbox grant is missing");
         return;
     };
@@ -150,17 +150,135 @@ const WRITABLE_WAKE_REQUEST: u64 = 640;
 const WRITABLE_WAKE_FILL: u64 = 641;
 const WRITABLE_WAKE_TAIL: u64 = 642;
 
+/// badged sender 的来源盖章，以及 owner 的 GRANT/TRANSIT 运输边界。
+fn test_capability_badges_and_affine_owners() {
+    const BADGE: u64 = 0x51a7_0bad_f00d;
+    assert!(matches!(
+        create(
+            Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::TRANSIT,
+            Rights::WRITE,
+        ),
+        Err(SystemCallError::RightsDenied)
+    ));
+    let mailbox = create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+    )
+    .expect("badged mailbox create failed");
+    let badged = mint_sender(
+        mailbox.owner,
+        BADGE,
+        Rights::WRITE | Rights::TRANSIT | Rights::DUPLICATE,
+    )
+    .expect("badged sender mint failed");
+    let copy = duplicate(badged, Rights::WRITE).expect("badged sender duplicate failed");
+    assert!(matches!(
+        mint_sender(mailbox.owner, BADGE + 1, Rights::SIGNAL),
+        Err(SystemCallError::RightsDenied)
+    ));
+    let transport = create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE,
+        Rights::WRITE | Rights::TRANSIT,
+    )
+    .expect("capability transport mailbox create failed");
+
+    send(mailbox.peer, 880, &[], &[]).expect("default sender send failed");
+    send(badged, 881, &[], &[]).expect("badged sender send failed");
+    send(copy, 882, &[], &[]).expect("badged sender copy send failed");
+    for (kind, badge) in [(880, 0), (881, BADGE), (882, BADGE)] {
+        let message = receive(mailbox.owner).expect("badged message receive failed");
+        assert_eq!(message.header.kind, kind);
+        assert_eq!(message.header.sender_pid, env::pid() as u64);
+        assert_eq!(message.header.sender_badge, badge);
+    }
+    let once = make_send_once(badged, Rights::WRITE)
+        .expect("badged send-once mint failed");
+    send(once, 887, &[], &[]).expect("badged send-once send failed");
+    let message = receive(mailbox.owner).expect("badged send-once receive failed");
+    assert_eq!(message.header.sender_badge, BADGE);
+
+    let transit = duplicate(badged, Rights::WRITE | Rights::TRANSIT)
+        .expect("badged transit copy failed");
+    let moves = [HandleMove {
+        handle: transit,
+        rights: Rights::WRITE,
+    }];
+    send(transport.peer, 888, &[], &moves).expect("badged sender transit failed");
+    let transferred = receive(transport.owner)
+        .expect("badged sender transit receive failed")
+        .handles[0];
+    send(transferred, 889, &[], &[]).expect("transferred badged sender send failed");
+    let message = receive(mailbox.owner).expect("transferred badged message receive failed");
+    assert_eq!(message.header.sender_badge, BADGE);
+    close(transferred).expect("transferred badged sender close failed");
+    close(copy).expect("badged sender copy close failed");
+    close(badged).expect("badged sender close failed");
+
+    assert!(matches!(
+        duplicate(mailbox.owner, Rights::READ),
+        Err(SystemCallError::RightsDenied)
+    ));
+    let owner_move = [HandleMove {
+        handle: mailbox.owner,
+        rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
+    }];
+    assert!(matches!(
+        send(transport.peer, 883, &[], &owner_move),
+        Err(SystemCallError::RightsDenied)
+    ));
+    send(mailbox.peer, 884, &[], &[]).expect("owner must survive rejected transit");
+    assert_eq!(
+        receive(mailbox.owner)
+            .expect("owner receive after rejected transit failed")
+            .header
+            .kind,
+        884
+    );
+
+    let event = notification::create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+        Rights::SIGNAL,
+    )
+    .expect("affine notification create failed");
+    assert!(matches!(
+        mint_sender(event.owner, BADGE, Rights::WRITE),
+        Err(SystemCallError::WrongObjectType)
+    ));
+    let owner_move = [HandleMove {
+        handle: event.owner,
+        rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
+    }];
+    assert!(matches!(
+        send(transport.peer, 886, &[], &owner_move),
+        Err(SystemCallError::RightsDenied)
+    ));
+    notification::signal(event.peer, 1).expect("notification owner must survive rejected transit");
+    assert_eq!(
+        notification::take(event.owner, 1)
+            .expect("notification take after rejected transit failed"),
+        1
+    );
+
+    close(event.peer).expect("notification signaler close failed");
+    close(event.owner).expect("notification owner close failed");
+    close(mailbox.peer).expect("default sender close failed");
+    close(mailbox.owner).expect("mailbox owner close failed");
+    close(transport.peer).expect("owner transport sender close failed");
+    close(transport.owner).expect("owner transport owner close failed");
+    debug!("capability badge and owner transport passed");
+}
+
 /// 一次性投递权（send-once）：本进程内验证 mint、用后即摘、
 /// 经消息转移后由接收方一次性使用，以及原 sender 不受影响。
 fn test_send_once() {
     let mailbox = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once mailbox create failed");
     let once = make_send_once(
         mailbox.peer,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
     )
     .expect("make send once failed");
     send(once, 900, &[1], &[]).expect("send once failed");
@@ -171,7 +289,7 @@ fn test_send_once() {
 
     let once = make_send_once(
         mailbox.peer,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
     )
     .expect("transferred send-once mint failed");
     let moves = [HandleMove { handle: once, rights: Rights::WRITE }];
@@ -196,10 +314,10 @@ fn test_send_once() {
     // 满箱失败不消费：撞 MailboxFull 后腾位，同一 once 仍可投递。
     let full = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once full mailbox create failed");
-    let once = make_send_once(full.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
+    let once = make_send_once(full.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("send-once full mint failed");
     for _ in 0..MAILBOX_CAPACITY {
         send(full.peer, 0, &[], &[]).expect("send-once full fill failed");
@@ -220,33 +338,32 @@ fn test_send_once() {
     close(full.peer).expect("send-once full sender close failed");
     close(full.owner).expect("send-once full owner close failed");
 
-    // once 同时作为发送目标与 transit move：作为 move 先被摘除，目标消费
-    // 遇 StaleHandle 无害；接收方取得该 once 并一次性使用。
+    // once 同时作为发送目标与 transit move 会突破一次投递保证，必须在
+    // 任何入队或摘除前整体拒绝；失败不消费 once。
     let both = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once both mailbox create failed");
-    let once = make_send_once(both.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
+    let once = make_send_once(both.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("send-once both mint failed");
     assert!(matches!(
         make_send_once(once, Rights::WRITE),
         Err(SystemCallError::RightsDenied)
     ));
     let moves = [HandleMove { handle: once, rights: Rights::WRITE }];
-    send(once, 920, &[], &moves).expect("send-once as target and move failed");
     assert!(matches!(
-        send(once, 921, &[], &[]),
+        send(once, 920, &[], &moves),
+        Err(SystemCallError::IllegalArgument)
+    ));
+    send(once, 921, &[], &[]).expect("rejected alias must not consume send-once");
+    assert!(matches!(
+        send(once, 922, &[], &[]),
         Err(SystemCallError::StaleHandle)
     ));
-    let message = receive(both.owner).expect("send-once both receive failed");
-    assert_eq!(message.header.kind, 920);
-    send(message.handles[0], 922, &[], &[]).expect("transferred once send failed");
-    assert!(matches!(
-        send(message.handles[0], 923, &[], &[]),
-        Err(SystemCallError::StaleHandle)
-    ));
-    discard(both.owner).expect("send-once both drain failed");
+    let message = receive(both.owner).expect("send-once alias recovery receive failed");
+    assert_eq!(message.header.kind, 921);
+    assert!(message.handles.is_empty());
     close(both.peer).expect("send-once both sender close failed");
     close(both.owner).expect("send-once both owner close failed");
     debug!("send-once passed");
@@ -304,17 +421,17 @@ fn test_writable_level() {
 fn test_writable_wake(pm_mailbox: Handle) {
     let target = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
     )
     .expect("wake target mailbox create failed");
     let done = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::TRANSFER,
+        Rights::SIGNAL | Rights::TRANSIT,
     )
     .expect("wake done notification create failed");
     let spin = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::TRANSFER,
+        Rights::SIGNAL | Rights::TRANSIT,
     )
     .expect("wake spin notification create failed");
     let moves = [
@@ -361,12 +478,12 @@ fn stress_control_plane() {
     for index in 0..CONTROL_STRESS {
         let mailbox = create(
             Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
         )
         .expect("stress mailbox create failed");
         let event = notification::create(
             Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::SIGNAL | Rights::TRANSFER,
+            Rights::SIGNAL | Rights::TRANSIT,
         )
         .expect("stress notification create failed");
         let moves = [HandleMove { handle: event.peer, rights: Rights::SIGNAL }];
@@ -386,7 +503,7 @@ fn stress_control_plane() {
 
     let mailbox = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("full mailbox create failed");
     for _ in 0..MAILBOX_CAPACITY {
@@ -394,7 +511,7 @@ fn stress_control_plane() {
     }
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::TRANSFER,
+        Rights::SIGNAL | Rights::TRANSIT,
     )
     .expect("full mailbox notification create failed");
     let moves = [HandleMove { handle: event.peer, rights: Rights::SIGNAL }];

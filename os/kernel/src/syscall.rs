@@ -197,6 +197,20 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::MailboxMintSender => {
+            respond_result(
+                frame,
+                mailbox::mint_sender(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11],
+                    Rights::from_raw(frame.x[12]),
+                    frame.x[13] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::TunnelCreate => {
             respond_result(
                 frame,

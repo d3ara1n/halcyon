@@ -3,7 +3,7 @@ use core::arch::asm;
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
     mem::Address,
-    message::{HandleMove, MessageHeader, SendHeader},
+    message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
     proc::{ExitCode, Tid},
     wait::{WaitItem, WaitResult},
@@ -229,6 +229,22 @@ pub unsafe fn sys_mailbox_make_send_once(
         rights.raw() as usize,
         output as *mut Handle as usize,
         0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_mailbox_mint_sender(
+    owner: Handle,
+    badge: MailboxBadge,
+    rights: Rights,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MailboxMintSender,
+        owner.raw() as usize,
+        badge as usize,
+        rights.raw() as usize,
+        output as *mut Handle as usize,
     )
     .map(|_| ())
 }

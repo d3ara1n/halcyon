@@ -1,12 +1,11 @@
 //! initfs 装载：tar 就地遍历 → ELF 解析 → 组装启动授权 → 统一 launch。
 //!
-//! 本模块是启动资源交付的内核授权方（过渡）：按服务身份现写 manifest
-//! 字节并安装 Handle。服务化阶段该策略整体迁往 init/pm，launch 机制
+//! 本模块是启动资源交付的内核授权方（过渡）：按服务身份组装 opaque
+//! payload 与 Handle grants。服务化阶段该策略整体迁往 init/pm，launch 机制
 //! 原样复用（见 plans/todo-2026-08-process-startup-resources.md）。
 
 use alloc::vec::Vec;
 use erhino_shared::object::Rights;
-use erhino_shared::startup::{StartupManifest, TAG_MAILBOX_OWNER, TAG_PM_MAILBOX};
 
 use crate::{mm, sched, task, task::table};
 use tar;
@@ -58,7 +57,7 @@ pub fn load(addr: usize, len: usize) {
     .expect("malformed initfs archive");
 
     // pm 邮箱对（授权方惯例「服务出生自带邮箱」的组装点）：owner 授 pm，
-    // sender 授 init。清单与 Handle 的顺序无关，未认领侧不泄漏。
+    // sender 授 init。双方约定各自 StartupBlock Handle[0] 的语义。
     let (mut pm_owner, mut pm_sender) = pending
         .iter()
         .any(|item| item.kind == ServiceKind::Pm)
@@ -68,13 +67,17 @@ pub fn load(addr: usize, len: usize) {
             let owner = task::handle::entry(
                 object.clone(),
                 task::object::HandleRole::MailboxOwner,
-                Rights::READ | Rights::WAIT | Rights::MANAGE,
+                Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
             )
             .expect("mailbox owner entry rights");
             let sender = task::handle::entry(
                 object,
                 task::object::HandleRole::MailboxSender,
-                Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
+                Rights::WRITE
+                    | Rights::WAIT
+                    | Rights::TRANSIT
+                    | Rights::GRANT
+                    | Rights::DUPLICATE,
             )
             .expect("mailbox sender entry rights");
             (owner, sender)
@@ -83,27 +86,21 @@ pub fn load(addr: usize, len: usize) {
 
     let mut launched = 0;
     for item in pending {
-        let mut manifest = StartupManifest::new();
         let mut handles = Vec::new();
         match item.kind {
             ServiceKind::Pm => {
                 if let Some(owner) = pm_owner.take() {
-                    manifest.add(TAG_MAILBOX_OWNER, Some(0), &[]);
                     handles.push(owner);
                 }
             }
             ServiceKind::Init => {
                 if let Some(sender) = pm_sender.take() {
-                    manifest.add(TAG_PM_MAILBOX, Some(0), &[]);
                     handles.push(sender);
                 }
             }
             ServiceKind::Other => {}
         }
-        let manifest = manifest
-            .finish(item.pid, 0, handles.len() as u32)
-            .expect("startup manifest assembly");
-        match task::launch(item.spawned, &manifest, handles) {
+        match task::launch(item.spawned, &[], handles) {
             Ok(thread) => {
                 sched::enqueue(thread);
                 launched += 1;

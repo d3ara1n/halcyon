@@ -15,7 +15,6 @@ use rinlib::{
         call::SystemCallError,
         message::MAILBOX_CAPACITY,
         object::ObjectSignals,
-        startup::TAG_MAILBOX_OWNER,
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
     sys_sleep,
@@ -32,8 +31,8 @@ const WRITABLE_WAKE_TAIL: u64 = 642;
 
 fn main() {
     debug!("Hello, pm!");
-    // 服务出生自带的邮箱 owner（StartupBlock 授予；见 shared::startup）。
-    let mailbox = env::startup_handle(TAG_MAILBOX_OWNER).expect("pm: mailbox owner grant is missing");
+    // 服务出生自带的邮箱 owner（StartupBlock Handle[0]）。
+    let mailbox = env::startup_handle(0).expect("pm: mailbox owner grant is missing");
     // sleep 异步通路验证：登记期限 → Waiting → timer 唤醒 → 继续。
     unsafe {
         sys_sleep(30).expect("sleep");
