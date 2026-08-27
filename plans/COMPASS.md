@@ -22,10 +22,11 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | 文件 | 概要 |
 |---|---|
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已完成收口，03–07 待做 |
-| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——step 1–7 已实施收口（step 7 多线程 teardown barrier 与写回 panic 面消解见 [todo-2026-08-28-thread-teardown-barrier.md](todo-2026-08-28-thread-teardown-barrier.md)）；剩余 step 8–10：D64 eligibility、多核验证矩阵、文档终态收口 |
+| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——step 1–7 已实施收口（step 7 多线程 teardown barrier 与写回 panic 面消解，review 计划见 [todo-2026-08-28-thread-teardown-review.md](todo-2026-08-28-thread-teardown-review.md)）；剩余 step 8–10：D64 eligibility、多核验证矩阵、文档终态收口 |
 | [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备接入重审、IPC 压力验证线、notes 结构整改、F2/F4 注记 |
 | [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart 期限表、MappingLease、公理层与文档自洽的复核轴 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
+| [`todo-2026-08-28-thread-teardown-review.md`](todo-2026-08-28-thread-teardown-review.md) | 生命周期 step 7（多线程 teardown barrier，提交 d741880）的未来审查计划：成员表不变量、游标取消锁序、汇编出口归一、写回复检即杀 |
 
 常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
 
