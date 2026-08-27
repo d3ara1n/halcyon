@@ -176,6 +176,9 @@ pub(crate) mod ladder {
     use super::Rank;
 
     #[inline(always)]
+    pub fn mark_tp_ready() {}
+
+    #[inline(always)]
     pub fn push(_rank: Rank, _key: u64) {}
 
     #[inline(always)]
