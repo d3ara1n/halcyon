@@ -6,6 +6,18 @@
 
 命名空间由启动授权组装：授权方以成对的（名字前缀, DirectoryGrant）交付初始路由表，运行中的扩充只能来自显式 capability 交付。挂载不是协议对象，没有全局挂载表和权威根目录；视图随 grant 交付产生、随 Handle 关闭消亡，不被其他进程的重挂载改写。路径规范化由客户端库执行，provider 以 badged sender 绑定目录根和 FAL rights，并把请求内容当不可信输入重新校验（详见 [FAL](fal.md)）。服务发布与发现使用原子 service record 和 endpoint capability。
 
+## 命名与布局
+
+路径段使用完整领域词，不发明缩写；顶层命名采用 PascalCase。系统默认命名空间的顶层概念域：
+
+```text
+/System    系统投影：Processes（Job/进程）、Services（服务目录）、Devices（设备发现）
+/Programs  可执行装载（initfs manifest 展开的程序）
+/Volumes   存储卷挂点
+```
+
+清单只收概念域已成型的顶层，新顶层随概念域成型增设。布局是投影政策，不是 ABI：它约束 init 的默认前缀表与各投影者的风格基线，每个顶层子树的内部形状由其投影者设计时定义（设备投影见 [device](device.md)，服务目录见 [service](service.md)）。协议与代码不得把系统路径字面量当接口依赖——路径只存在于装配政策与用户输入两端，协议层传递 DirectoryGrant 与名字。
+
 ## 操作面
 
 节点检查、目录枚举、元数据读取或修改、创建、删除、移动、复制和打开流都是 FAL RPC kind。小型请求和应答使用消息；大块内容通过隧道传输。协议规定固定宽字段、字节序、版本、长度、错误和分页，避免把本机结构体布局或内核地址作为接口。

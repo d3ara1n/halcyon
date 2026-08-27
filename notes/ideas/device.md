@@ -14,4 +14,4 @@
 
 ## 发现与投影
 
-`/sys/dev` 可以是设备管理服务向 FAL 提供的用户态投影，用于枚举、属性和服务发现；它不是设备 authority 的来源。客户端真正获得的是协议 endpoint 或设备 lease capability，路径字符串本身不授权访问。
+`/System/Devices` 可以是设备管理服务向 FAL 提供的用户态投影，用于枚举、属性和服务发现；它不是设备 authority 的来源。客户端真正获得的是协议 endpoint 或设备 lease capability，路径字符串本身不授权访问。
