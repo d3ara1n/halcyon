@@ -20,16 +20,37 @@ use rinlib::{
         wait::wait_many,
     },
     preclude::*,
+    process,
     shared::{
         call::SystemCallError,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
-        proc::HandleGrant,
+        proc::{HandleGrant, ProcessExitReason, ProcessState},
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
 };
 use libprocess::{SpawnRequest, spawn};
 use librunnel::blocking;
+
+/// 受监督服务：init 保留的 control 与 pid。
+struct Supervised {
+    pid: u64,
+    control: Handle,
+}
+
+/// init 自身 control（launch_bootstrap 安装为启动 Handle 1）。
+fn self_control() -> Handle {
+    env::startup_handle(1).expect("init must hold its own ProcessControl")
+}
+
+const SUPERVISOR_RIGHTS: Rights = Rights::from_raw(
+    Rights::READ.raw()
+        | Rights::WAIT.raw()
+        | Rights::MANAGE.raw()
+        | Rights::DUPLICATE.raw()
+        | Rights::TRANSIT.raw()
+        | Rights::GRANT.raw(),
+);
 
 /// 隧道页在本进程的映射地址（VA 分配器落地前由调用方自报）。
 const TUNNEL_VA: usize = 0x4000_0000;
@@ -40,8 +61,9 @@ const STREAM_LEN: usize = 8192;
 const CONTROL_STRESS: usize = 128;
 const TUNNEL_STRESS: usize = 64;
 
-fn launch_test_services() -> Option<Handle> {
-    let root_job = env::startup_handle(0)?;
+fn launch_test_services() -> Result<(Handle, alloc::vec::Vec<Supervised>), (&'static str, alloc::vec::Vec<Supervised>)> {
+    let root_job = env::startup_handle(0)
+        .ok_or(("missing root job", alloc::vec::Vec::new()))?;
     let pm_mailbox = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
         Rights::WRITE
@@ -50,13 +72,9 @@ fn launch_test_services() -> Option<Handle> {
             | Rights::GRANT
             | Rights::DUPLICATE,
     )
-    .ok()?;
-    let control_rights = Rights::READ
-        | Rights::WAIT
-        | Rights::MANAGE
-        | Rights::DUPLICATE
-        | Rights::TRANSIT
-        | Rights::GRANT;
+    .map_err(|_| ("pm mailbox create failed", alloc::vec::Vec::new()))?;
+    let control_rights = SUPERVISOR_RIGHTS;
+    let mut supervised = alloc::vec::Vec::new();
     let mut pm_started = false;
     let result = tar::walk(env::startup_payload(), |entry| {
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
@@ -80,7 +98,21 @@ fn launch_test_services() -> Option<Handle> {
         }) {
             Ok(process) => {
                 debug!("started {} as pid {}", entry.name, process.pid);
-                let _ = close(process.control);
+                // 持久 init 保留 control：监督、等待与收束的 authority 源。
+                if entry.name == "bin/srv_target" {
+                    // live 外部 kill 正路径：目标处于 Waiting（Sleep 期限
+                    // 等待）或 Running（4 核竞态）——分别验证 WaitContext
+                    // 取消与 IPI 吸收；或已越过终止边界则幂等接受。
+                    let target = alloc::vec::Vec::from([Supervised {
+                        pid: process.pid,
+                        control: process.control,
+                    }]);
+                    process::kill(target[0].control, 0x77)
+                        .expect("live kill of a fresh process must be accepted");
+                    kill_and_supervise(target);
+                } else {
+                    supervised.push(Supervised { pid: process.pid, control: process.control });
+                }
                 if entry.name == "bin/srv_pm" {
                     pm_started = true;
                 }
@@ -94,16 +126,49 @@ fn launch_test_services() -> Option<Handle> {
     if !pm_started {
         let _ = close(pm_mailbox.owner);
         let _ = close(pm_mailbox.peer);
-        return None;
+        // 已启动的服务仍需收束：失败路径统一携带 supervised 交回
+        // kill_and_supervise，不丢弃。
+        return Err(("pm service launch failed", supervised));
     }
-    Some(pm_mailbox.peer)
+    Ok((pm_mailbox.peer, supervised))
 }
 
 fn main() {
     debug!("Hello, init!");
-    let Some(pm_mailbox) = launch_test_services() else {
-        debug!("pm service launch failed");
-        return;
+    match run() {
+        Ok(()) => {}
+        Err((stage, supervised)) => {
+            debug!("init test stage failed: {}", stage);
+            kill_and_supervise(supervised);
+        }
+    }
+    self_terminate();
+}
+
+/// 失败收尾：对保留 control 的服务 kill → 等待收束 → Drain → close，
+/// 不打印成功后依赖 Drain 回调。
+fn kill_and_supervise(supervised: alloc::vec::Vec<Supervised>) {
+    for target in &supervised {
+        let _ = process::kill(target.control, 0x1F);
+    }
+    if let Err(error) = supervise_services(supervised) {
+        debug!("failure-path supervision degraded: {:?}", error);
+    }
+}
+
+/// 终局：自终止（Running 目标的 live kill；不返回用户态）。
+fn self_terminate() {
+    if let Err(error) = process::kill(self_control(), 0x5AA) {
+        debug!("BUG: self kill returned: {:?}", error);
+    }
+    debug!("BUG: self kill must not return to user");
+}
+
+/// 全部测试剧本。失败只短路后续阶段，不绕过收尾监督。
+fn run() -> Result<(), (&'static str, alloc::vec::Vec<Supervised>)> {
+    let (pm_mailbox, supervised) = match launch_test_services() {
+        Ok(launched) => launched,
+        Err(failure) => return Err(failure),
     };
     let pair = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
@@ -167,7 +232,7 @@ fn main() {
         Ok(t) => t,
         Err(e) => {
             debug!("tunnel create failed: {:?}", e);
-            return;
+            return Err(("tunnel create failed", supervised));
         }
     };
     debug!("tunnel created");
@@ -177,7 +242,7 @@ fn main() {
     }];
     if let Err(e) = send(pm_mailbox, 514, &[], &invitation_move) {
         debug!("send tunnel invitation failed: {:?}", e);
-        return;
+        return Err(("send tunnel invitation failed", supervised));
     }
 
     let mut buf = [0u8; STREAM_LEN];
@@ -192,7 +257,18 @@ fn main() {
     // —— 流控唤醒面：pm 填满目标邮箱后在 WRITABLE 上阻塞，腾位唤醒 ——
     test_writable_wake(pm_mailbox);
 
-    // —— 事件面：等 pm 退出后的 PEER_CLOSED 终态位 ——
+    // —— live kill 正路径：Building 目标的确定性 kill/drain/终态验证 ——
+    test_building_kill(env::startup_handle(0).expect("init holds root job"));
+
+    // —— 监督闭环：等待全部服务 REAPABLE/CLOSED，Drain 至 Complete，
+    // 查询稳定终态后释放 control。对象 close 回调（含 pm 隧道端点的
+    // PEER_CLOSED 发布）发生在 Drain 期间——监督先于对端终态等待。 ——
+    if let Err(error) = supervise_services(supervised) {
+        debug!("supervision degraded: {:?}", error);
+    }
+    debug!("all services supervised to completion");
+
+    // —— 事件面：对端终态位（Drain 已置位，电平等待立即返回）——
     let items = [WaitItem::new(
         tunnel.handle(),
         ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
@@ -203,6 +279,90 @@ fn main() {
         Err(e) => debug!("peer-closed wait failed: {:?}", e),
     }
     let _ = tunnel.close();
+    Ok(())
+}
+
+/// 监督循环：对保留的每个 control 等待 REAPABLE|CLOSED，Drain 至
+/// Complete，再以固定宽快照确认终态。逐项推进，全部完成后返回。
+fn supervise_services(
+    mut supervised: alloc::vec::Vec<Supervised>,
+) -> Result<(), SystemCallError> {
+    while !supervised.is_empty() {
+        let items: alloc::vec::Vec<WaitItem> = supervised
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                WaitItem::new(s.control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, index as u64)
+            })
+            .collect();
+        let result = wait_many(&items, WAIT_DEADLINE_INFINITE)?;
+        let index = result.cookie as usize;
+        let Some(target) = supervised.get(index) else { break };
+        let pid = target.pid;
+        let control = target.control;
+        let drained = process::drain_to_completion(control);
+        let snapshot = process::query(control);
+        match (drained, snapshot) {
+            (Ok(work), Ok(snapshot)) => {
+                debug!(
+                    "pid {} supervised: work={}, state={}, reason={}, code={}",
+                    pid,
+                    work,
+                    snapshot.state,
+                    snapshot.reason,
+                    snapshot.code
+                );
+            }
+            (work, query) => {
+                debug!("pid {} supervision degraded: drain={:?} query={:?}", pid, work, query);
+            }
+        }
+        let _ = close(control);
+        supervised.swap_remove(index);
+    }
+    Ok(())
+}
+
+/// Building 目标的确定性 kill：Create 后未 Start，kill 冻结终因
+/// (Killed, code)，builder 关闭的 abandonment 竞争不覆盖；Drain 至
+/// Complete 后 shell 快照应稳定报 Dead/Killed/code。
+fn test_building_kill(root_job: Handle) {
+    let created = match process::create(root_job, SUPERVISOR_RIGHTS) {
+        Ok(created) => created,
+        Err(error) => {
+            debug!("building kill: create failed: {:?}", error);
+            return;
+        }
+    };
+    let before = process::query(created.control);
+    if let Ok(snapshot) = before {
+        debug!("building kill: initial state={}", snapshot.state);
+    }
+    if let Err(error) = process::kill(created.control, 0x123) {
+        debug!("building kill: kill failed: {:?}", error);
+        let _ = close(created.builder);
+        let _ = close(created.control);
+        return;
+    }
+    let _ = close(created.builder);
+    let drained = process::drain_to_completion(created.control);
+    let snapshot = process::query(created.control);
+    match (drained, snapshot) {
+        (Ok(_), Ok(snapshot))
+            if snapshot.state == ProcessState::Dead as u32
+                && snapshot.reason == ProcessExitReason::Killed as u32
+                && snapshot.code == 0x123 =>
+        {
+            debug!("building kill passed: pid {} Dead/Killed/{:#x}", created.pid, snapshot.code);
+        }
+        (work, snapshot) => {
+            debug!(
+                "building kill FAILED: drain={:?} snapshot={:?}",
+                work, snapshot
+            );
+        }
+    }
+    let _ = close(created.control);
 }
 
 /// 与 pm 约定的流控验证消息号：请求携带 [目标邮箱 sender、确认 signaler、

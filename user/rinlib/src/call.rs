@@ -6,7 +6,10 @@ use erhino_shared::{
     mem::Address,
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
-    proc::{ExitCode, ProcessCreateResult, ProcessMapFlags, ProcessStartDescriptor, Tid},
+    proc::{
+        ExitCode, ProcessCreateResult, ProcessDrainResult, ProcessMapFlags, ProcessSnapshot,
+        ProcessStartDescriptor, Tid,
+    },
     wait::{WaitItem, WaitResult},
 };
 use num_traits::FromPrimitive;
@@ -115,13 +118,54 @@ pub unsafe fn sys_job_create(
 
 pub unsafe fn sys_process_create(
     job: Handle,
+    control_rights: Rights,
     output: &mut ProcessCreateResult,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ProcessCreate,
         job.raw() as usize,
+        control_rights.raw() as usize,
         output as *mut ProcessCreateResult as usize,
         0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_query(
+    control: Handle,
+    output: &mut ProcessSnapshot,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessQuery,
+        control.raw() as usize,
+        output as *mut ProcessSnapshot as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_kill(control: Handle, code: i64) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessKill,
+        control.raw() as usize,
+        code as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_drain(
+    control: Handle,
+    max_work: u32,
+    output: &mut ProcessDrainResult,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessDrain,
+        control.raw() as usize,
+        max_work as usize,
+        output as *mut ProcessDrainResult as usize,
         0,
     )
     .map(|_| ())
@@ -161,13 +205,12 @@ pub unsafe fn sys_process_write(
 pub unsafe fn sys_process_start(
     builder: Handle,
     descriptor: &ProcessStartDescriptor,
-    output: &mut Handle,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ProcessStart,
         builder.raw() as usize,
         descriptor as *const ProcessStartDescriptor as usize,
-        output as *mut Handle as usize,
+        0,
         0,
     )
     .map(|_| ())

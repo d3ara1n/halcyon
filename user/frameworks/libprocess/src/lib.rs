@@ -52,7 +52,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
     let requirement = elf::isa_requirement(request.image).map_err(SpawnError::Requirement)?;
     let plan = page_plan(&image, request.image.len())?;
 
-    let created = process::create(request.job)?;
+    let created = process::create(request.job, request.control_rights)?;
     let builder = created.builder;
 
     let result = (|| {
@@ -73,15 +73,17 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
             grant_count: u32::try_from(request.grants.len()).map_err(|_| SpawnError::InvalidImage)?,
             profile: profile as u32,
             reserved: 0,
-            control_rights: request.control_rights,
         };
-        let control = process::start(builder, &descriptor)?;
-        Ok(Spawned { pid: created.pid, control })
+        process::start(builder, &descriptor)?;
+        Ok(Spawned { pid: created.pid, control: created.control })
     })();
 
     if result.is_err() {
-        // Start 失败保持 builder；关闭它回收 Building process。
+        // Start/map/write 失败保持 builder；关闭它触发 Building abandonment
+        // → REAPABLE，随后持 control 把收束推进到 Complete 再关闭。
         let _ = close(builder);
+        let _ = process::drain_to_completion(created.control);
+        let _ = close(created.control);
     }
     result
 }
