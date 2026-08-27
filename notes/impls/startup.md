@@ -77,7 +77,15 @@ ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；
 
 ## 当前 init 集成政策
 
-`user/systems/init` 从 `startup_payload()` 读取 opaque 字节。当前仅为对照负载使用最小 ustar walker，按归档条目启动 driver、fs、pm，并为 pm 组装现有 Mailbox grant。归档格式、manifest、服务拓扑和长期授权转交仍属 init 私有设计，内核 ABI 不含这些概念。
+`user/systems/init` 从 `startup_payload()` 读取 opaque 字节：最小 ustar walker、按归档条目序启动，仍是私有政策。init 是持久 root supervisor：
+
+- 拓扑：root Job 只含 init 与 services Job；服务全部入 services 域；
+  `pm_domain`（委托域，预置 Running 靶，JobControl 经 StartupBlock grants 交 pm，init 保留复制件作直接收束权）与 acceptance（一次性验收自测收容所，用完 job_kill 收净）是 services 的子 Job；
+- 监督：对每个服务保留 ProcessControl，等 REAPABLE|CLOSED → Drain 至 Complete → 固定宽快照 → close；不重启（重启政策维度存在，当前配置为无）；
+- 委托：pm 只持 pm_domain 的 MANAGE|READ|WAIT（无 CREATE），对域内成员走 枚举 → 派生（铸造路径）→ kill → drain → 封口；
+- 终态：全部收束后 init 常驻等待管理端点，不自我终止；系统经 quiescent 判定静默停机（IPC 等待者不阻止静默，见 `impls/internals.md`）。
+
+manifest、initfs 正式格式与服务编排协议仍属未来设计，内核 ABI 不含这些概念。
 
 ## 验证
 
@@ -85,4 +93,4 @@ ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；
 - page_table host 测试覆盖跨子表 unmap、mega split OOM 保持原映射；
 - libprocess host 测试覆盖 entry、segment overlap 与页级 W^X 拒绝；
 - HandleTable host 测试覆盖 reservation、TRANSIT/GRANT 与 badge；
-- virt/sifive_u 均由 init 启动其余三类负载，完成现有 IPC/FAL/Runnel 验收、全员回收与静默判定。
+- virt/sifive_u 均由 init 启动其余三类负载，完成现有 IPC/FAL/Runnel/Job 管理面验收、pm 委托域收束、全员回收与静默判定；virt 经 SRST 自退，sifive_u 无 shutdown 设备以日志关键行判定。

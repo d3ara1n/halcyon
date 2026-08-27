@@ -1,24 +1,37 @@
-//! pm：sleep 异步通路 + 消息接收 + Runnel 数据面 + 发送侧流控的集成验证负载。
+//! pm：受托进程管理服务 + IPC 集成验证负载。
 //!
 //! 剧本：两次睡眠（timer 通路观测）→ 阻塞等 init 的 Invitation 消息 →
 //! 消费 Invitation → 写入 8192 字节校验模式（跨回绕、逐批摇铃）→ EOF+摇铃 →
 //! 接收流控验证请求：填满目标邮箱、确认满箱错误、在 WRITABLE 上阻塞，
-//! 被 init 腾位唤醒后补发末尾消息 → 退出（触发对端 PEER_CLOSED）。
+//! 被 init 腾位唤醒后补发末尾消息 → 收束显式委托的 pm_domain 子域
+//! （枚举 → 派生 kill → drain → 封口）→ 退出（触发对端 PEER_CLOSED）。
+//!
+//! pm 只持委托域的 JobControl（MANAGE|READ|WAIT，经 StartupBlock grants
+//! 交付），域外无任何进程管理 authority；递归收束是本服务组合内核原语
+//! 的用户态政策，init 保留直接收束权作兜底。
 
 #![no_std]
 
 use rinlib::{
     env,
-    ipc::{message::{send, wait_message}, notification, wait::wait_many},
+    ipc::{
+        message::{send, wait_message},
+        notification,
+        object::close,
+        wait::wait_many,
+    },
     preclude::*,
+    process,
     shared::{
         call::SystemCallError,
         message::MAILBOX_CAPACITY,
-        object::ObjectSignals,
+        object::{Handle, ObjectSignals},
+        proc::{JobMemberKind, JobState, ProcessExitReason, ProcessState},
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
     sys_sleep,
 };
+use libprocess::{DERIVED_CONTROL_RIGHTS, enumerate_members};
 use librunnel::blocking;
 
 /// 隧道页映射地址：与 init 约定的一致（各自进程空间内的同一常量）。
@@ -131,4 +144,82 @@ fn main() {
         }
     }
     debug!("writable wake passed");
+
+    // —— 委托域管理：pm 作为受托管理者收束显式委托的子域 ——
+    // StartupBlock Handle[1] = init 授出的 pm_domain JobControl。
+    let domain = env::startup_handle(1).expect("pm: delegated domain control is missing");
+    manage_delegated_domain(domain);
+    debug!("pm: delegated domain managed");
+}
+
+/// 委托域管理：域内 Running 成员逐一收束（派生 → kill → 等 REAPABLE →
+/// drain 至 Complete → 终态查询），最后封口本域——sealed 且空即完成，
+/// CLOSED 电平可等待。pm 不持域外任何 authority；失败只降级日志，
+/// 域的终局由 init 以保留的直接收束权兜底。
+fn manage_delegated_domain(domain: Handle) {
+    let members = match enumerate_members(domain, JobMemberKind::MemberProcesses) {
+        Ok(members) => members,
+        Err(error) => {
+            debug!("pm: domain enumerate failed: {:?}", error);
+            return;
+        }
+    };
+    for pid in members {
+        // init 已弃置域内成员的 control，派生走铸造路径。
+        let control = match process::derive_job(
+            domain,
+            JobMemberKind::MemberProcesses,
+            pid,
+            DERIVED_CONTROL_RIGHTS,
+        ) {
+            Ok(control) => control,
+            // 成员已完成移表（ID 不复用，永不错指）：收敛方向，跳过。
+            Err(SystemCallError::ObjectNotFound) => continue,
+            Err(error) => {
+                debug!("pm: domain derive pid {} failed: {:?}", pid, error);
+                return;
+            }
+        };
+        if let Err(error) = process::kill(control, 0x66) {
+            debug!("pm: domain kill pid {} failed: {:?}", pid, error);
+            let _ = close(control);
+            continue;
+        }
+        let waited = wait_many(
+            &[WaitItem::new(
+                control,
+                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                0,
+            )],
+            WAIT_DEADLINE_INFINITE,
+        );
+        let drained = process::drain_to_completion(control);
+        let snapshot = process::query(control);
+        let collected = waited.is_ok()
+            && drained.is_ok()
+            && matches!(&snapshot, Ok(s) if s.state == ProcessState::Dead as u32
+                && s.reason == ProcessExitReason::Killed as u32
+                && s.code == 0x66);
+        debug!(
+            "pm: delegated member pid {} collected: {}",
+            pid,
+            if collected { "Dead/Killed/0x66" } else { "degraded" }
+        );
+        let _ = close(control);
+    }
+    let sealed = process::seal_job(domain);
+    let waited = wait_many(
+        &[WaitItem::new(domain, ObjectSignals::CLOSED, 0)],
+        WAIT_DEADLINE_INFINITE,
+    );
+    let snapshot = process::query_job(domain);
+    let passed = sealed.is_ok()
+        && waited.is_ok()
+        && matches!(&snapshot, Ok(s) if s.state == JobState::Dead as u32);
+    debug!(
+        "pm: delegated domain seal {} (state {:?})",
+        if passed { "passed" } else { "FAILED" },
+        snapshot.as_ref().map(|s| s.state)
+    );
+    let _ = close(domain);
 }

@@ -1,12 +1,19 @@
-//! init：消息 + 信号 + 隧道/Runnel 全通路的集成验证负载。
+//! init：持久 root supervisor 与消息/信号/隧道/Runnel 全通路集成验证负载。
 //!
 //! 剧本：
-//! 1. 创建显式 Mailbox 并同步自发自收一条消息；
-//! 2. 创建 Runnel 隧道，把 Invitation 经启动授权的 pm sender 转移，随后阻塞读
-//!    8192 字节（跨回绕、走到达移交唤醒）并校验数据；
-//! 3. 与 pm 协作验证发送侧流控：pm 填满目标邮箱后在 WRITABLE 上阻塞，
-//!    init 腾出容量唤醒，pm 补发尾部消息；
-//! 4. 等 pm 退出后的 PEER_CLOSED 终态位，关闭本端（帧归还）。
+//! 1. 建立 services Job 拓扑：全部服务入域；pm_domain 是授给 pm 的显式
+//!    委托域（域内预置 Running 靶，JobControl 经 StartupBlock grants 交付，
+//!    init 保留复制件作直接收束权）；acceptance 域收容一次性验收自测；
+//! 2. IPC 自测：Mailbox 自发自收、badged sender、send-once、流控电平；
+//! 3. 数据面：Runnel 隧道 Invitation 经 pm sender 转移，阻塞读 8192 字节
+//!    （跨回绕、到达移交唤醒）并校验；与 pm 协作验证发送侧流控唤醒；
+//! 4. Job 管理面验收：封口与完成传播、派生兑底、递归 JobKill 组合、
+//!    seal 闸门与枚举收敛；acceptance 域用完即收；
+//! 5. 监督闭环：全部服务等 REAPABLE|CLOSED → Drain 至 Complete → 终态
+//!    快照 → close；pm_domain 由 pm 自行收束，未收束时 init 兜底；
+//! 6. 等 pm 退出后的 PEER_CLOSED 终态位，关闭本端（帧归还）；
+//! 7. 稳态：常驻管理端点等待。init 不自我终止——无人能再投递的等待
+//!    不构成工作，系统随静默停机判定收束。
 
 #![no_std]
 
@@ -44,11 +51,82 @@ struct Supervised {
     control: Handle,
 }
 
-/// init 自身 control（launch_bootstrap 安装为启动 Handle 1）。
-fn self_control() -> Handle {
-    env::startup_handle(1).expect("init must hold its own ProcessControl")
+/// 拓扑语义名登记：内核无名字概念，init 在建域与启动时记录 jid/pid
+/// 到名字的映射，供拓扑打印对照（条目个位数，线性查找）。
+struct TopologyNames {
+    jobs: alloc::vec::Vec<(u64, alloc::string::String)>,
+    processes: alloc::vec::Vec<(u64, alloc::string::String)>,
 }
 
+impl TopologyNames {
+    fn new() -> Self {
+        Self {
+            jobs: alloc::vec::Vec::new(),
+            processes: alloc::vec::Vec::new(),
+        }
+    }
+
+    fn register_job(&mut self, handle: Handle, name: &str) {
+        if let Ok(snapshot) = process::query_job(handle) {
+            self.jobs
+                .push((snapshot.jid, alloc::string::String::from(name)));
+        }
+    }
+
+    fn register_process(&mut self, pid: u64, name: &str) {
+        self.processes
+            .push((pid, alloc::string::String::from(name)));
+    }
+
+    fn job_name(&self, jid: u64) -> &str {
+        self.jobs
+            .iter()
+            .find(|(id, _)| *id == jid)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("?")
+    }
+
+    fn process_name(&self, pid: u64) -> &str {
+        self.processes
+            .iter()
+            .find(|(id, _)| *id == pid)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("?")
+    }
+}
+
+fn job_state_name(state: u32) -> &'static str {
+    match state {
+        0 => "Open",
+        1 => "Sealed",
+        2 => "Dead",
+        _ => "unknown",
+    }
+}
+
+fn process_state_name(state: u32) -> &'static str {
+    match state {
+        0 => "Building",
+        1 => "Running",
+        2 => "Terminating",
+        3 => "Dead",
+        _ => "unknown",
+    }
+}
+
+fn exit_reason_name(reason: u32) -> &'static str {
+    match reason {
+        0 => "None",
+        1 => "Exited",
+        2 => "Fault",
+        3 => "Killed",
+        4 => "Abandoned",
+        _ => "unknown",
+    }
+}
+
+/// 服务 ProcessControl 的监督基准权利：init 保留 control 用于查询、等待、
+/// 终止与受保护收束，并可复制/运输/转授。
 const SUPERVISOR_RIGHTS: Rights = Rights::from_raw(
     Rights::READ.raw()
         | Rights::WAIT.raw()
@@ -69,6 +147,13 @@ const JOB_FULL_RIGHTS: Rights = Rights::from_raw(
         | Rights::GRANT.raw(),
 );
 
+/// 委托域授出的 JobControl 权利：seal/派生 kill 需 MANAGE，枚举与查询
+/// 需 READ，等 CLOSED 需 WAIT。不含 CREATE——pm 只管理显式委托的域，
+/// 不在域内扩张拓扑。
+const DELEGATED_DOMAIN_RIGHTS: Rights = Rights::from_raw(
+    Rights::MANAGE.raw() | Rights::READ.raw() | Rights::WAIT.raw(),
+);
+
 /// 隧道页在本进程的映射地址（VA 分配器落地前由调用方自报）。
 const TUNNEL_VA: usize = 0x4000_0000;
 const LIFECYCLE_VA: usize = TUNNEL_VA + 0x1000;
@@ -78,13 +163,19 @@ const STREAM_LEN: usize = 8192;
 const CONTROL_STRESS: usize = 128;
 const TUNNEL_STRESS: usize = 64;
 
-fn launch_test_services()
--> Result<
+/// 从 initfs 私有政策（ustar 字母序）启动服务拓扑：普通服务入 services
+/// Job；srv_pm 额外经 StartupBlock grants 取得 pm_domain 委托域的
+/// JobControl；srv_target 起两个实例——acceptance 域的派生 kill 靶
+/// （验收线 1）与 pm_domain 的委托靶（control 即弃，pm 派生走铸造路径）。
+fn launch_test_services(
+    services: Handle,
+    pm_domain: Handle,
+    acceptance: Handle,
+    names: &mut TopologyNames,
+) -> Result<
     (Handle, alloc::vec::Vec<Supervised>, Option<alloc::vec::Vec<u8>>),
-    (&'static str, alloc::vec::Vec<Supervised>),
+    &'static str,
 > {
-    let root_job = env::startup_handle(0)
-        .ok_or(("missing root job", alloc::vec::Vec::new()))?;
     let pm_mailbox = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
         Rights::WRITE
@@ -93,7 +184,11 @@ fn launch_test_services()
             | Rights::GRANT
             | Rights::DUPLICATE,
     )
-    .map_err(|_| ("pm mailbox create failed", alloc::vec::Vec::new()))?;
+    .map_err(|_| "pm mailbox create failed")?;
+    // GRANT 是直接跨表安装：授出的源 handle 被消费，先复制保留 init 对
+    // 委托域的直接收束权（兜底 job_kill 的 authority 源）。
+    let delegated_domain = duplicate(pm_domain, JOB_FULL_RIGHTS)
+        .map_err(|_| "pm domain duplicate failed")?;
     let control_rights = SUPERVISOR_RIGHTS;
     let mut supervised = alloc::vec::Vec::new();
     let mut pm_started = false;
@@ -103,17 +198,26 @@ fn launch_test_services()
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
             return;
         }
-        let pm_grants = [HandleGrant {
-            handle: pm_mailbox.owner,
-            rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-        }];
-        let grants = if entry.name == "bin/srv_pm" {
-            pm_grants.as_slice()
+        let pm_grants = [
+            HandleGrant {
+                handle: pm_mailbox.owner,
+                rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+            },
+            HandleGrant {
+                handle: delegated_domain,
+                rights: DELEGATED_DOMAIN_RIGHTS,
+            },
+        ];
+        // srv_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
+        let (job, grants): (Handle, &[HandleGrant]) = if entry.name == "bin/srv_target" {
+            (acceptance, &[])
+        } else if entry.name == "bin/srv_pm" {
+            (services, pm_grants.as_slice())
         } else {
-            &[]
+            (services, &[])
         };
         match spawn(SpawnRequest {
-            job: root_job,
+            job,
             image: entry.data,
             payload: &[],
             grants,
@@ -121,13 +225,32 @@ fn launch_test_services()
         }) {
             Ok(process) => {
                 debug!("started {} as pid {}", entry.name, process.pid);
+                names.register_process(process.pid, entry.name);
                 // 持久 init 保留 control：监督、等待与收束的 authority 源。
                 if entry.name == "bin/srv_target" {
                     target_image = Some(alloc::vec::Vec::from(entry.data));
                     // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
-                    // root Job 枚举可见 srv_target 的 pid，派生 MANAGE
+                    // acceptance Job 枚举可见 srv_target 的 pid，派生 MANAGE
                     // control 后 kill——保留 control 在派生接管后关闭。
-                    test_derive_kill(root_job, process.pid, process.control);
+                    test_derive_kill(acceptance, process.pid, process.control);
+                    // 委托域靶：control 即弃（关闭 control 永不隐式终止），
+                    // pm 的派生因此走铸造路径，域内收束权归 pm。
+                    match spawn(SpawnRequest {
+                        job: pm_domain,
+                        image: entry.data,
+                        payload: &[],
+                        grants: &[],
+                        control_rights,
+                    }) {
+                        Ok(second) => {
+                            debug!("pm domain target started as pid {}", second.pid);
+                            names.register_process(second.pid, "bin/srv_target@pm_domain");
+                            let _ = close(second.control);
+                        }
+                        Err(error) => {
+                            debug!("pm domain target spawn failed: {:?}", error);
+                        }
+                    }
                 } else {
                     supervised.push(Supervised { pid: process.pid, control: process.control });
                 }
@@ -144,27 +267,56 @@ fn launch_test_services()
     if !pm_started {
         let _ = close(pm_mailbox.owner);
         let _ = close(pm_mailbox.peer);
-        // 已启动的服务仍需收束：失败路径统一携带 supervised 交回
-        // kill_and_supervise，不丢弃。
-        return Err(("pm service launch failed", supervised));
+        // 已启动的服务交回 main 的整树收束（job_kill(services)）兜底。
+        return Err("pm service launch failed");
     }
     Ok((pm_mailbox.peer, supervised, target_image))
 }
 
 fn main() {
     debug!("Hello, init!");
-    match run() {
-        Ok(()) => {}
-        Err((stage, supervised)) => {
-            debug!("init test stage failed: {}", stage);
-            kill_and_supervise(supervised);
+    let root_job = env::startup_handle(0).expect("init must hold root JobControl");
+    let services = match process::create_job(root_job, JOB_FULL_RIGHTS) {
+        Ok(job) => job,
+        Err(error) => {
+            debug!("services job create failed: {:?}", error);
+            steady_state();
+            return;
+        }
+    };
+    debug!("services job established");
+    if let Err(stage) = run(services) {
+        debug!("init stage failed: {}", stage);
+        // 整树收束：seal + 逐成员 kill + 子域递归 + CLOSED 屏障，一次性
+        // 覆盖 services 全部成员与委托/验收子域。
+        if let Err(error) = job_kill(services, 0x1F) {
+            debug!("failure-path teardown degraded: {:?}", error);
         }
     }
-    self_terminate();
+    steady_state();
 }
 
-/// 失败收尾：对保留 control 的服务 kill → 等待收束 → Drain → close，
-/// 不打印成功后依赖 Drain 回调。
+/// 稳态：持久 root supervisor 的最终形态。受管服务全部收束后 init 常驻
+/// 等待管理端点——当前无客户端，无人能再投递，等待不构成工作，系统随
+/// 静默停机判定（quiescent）收束；设备接入后设备即工作源，终态改由
+/// 显式关机路径决定。init 不自我终止：退出是管理根失效，不是正常路径。
+fn steady_state() {
+    let endpoint = create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT,
+    )
+    .expect("steady-state endpoint create failed");
+    debug!("init: steady-state supervision (persistent root supervisor)");
+    match wait_message(endpoint.owner) {
+        Ok(message) => {
+            debug!("BUG: steady-state endpoint received kind {}", message.header.kind)
+        }
+        Err(error) => debug!("steady-state wait ended: {:?}", error),
+    }
+}
+
+/// 小集合收束辅助：对保留 control 的服务 kill → 等待收束 → Drain →
+/// close（验收线 1 的派生接管路径复用）。
 fn kill_and_supervise(supervised: alloc::vec::Vec<Supervised>) {
     for target in &supervised {
         let _ = process::kill(target.control, 0x1F);
@@ -174,20 +326,26 @@ fn kill_and_supervise(supervised: alloc::vec::Vec<Supervised>) {
     }
 }
 
-/// 终局：自终止（Running 目标的 live kill；不返回用户态）。
-fn self_terminate() {
-    if let Err(error) = process::kill(self_control(), 0x5AA) {
-        debug!("BUG: self kill returned: {:?}", error);
-    }
-    debug!("BUG: self kill must not return to user");
-}
+/// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
+fn run(services: Handle) -> Result<(), &'static str> {
+    let root_job = env::startup_handle(0).expect("init must hold root JobControl");
+    let pm_domain = process::create_job(services, JOB_FULL_RIGHTS)
+        .map_err(|_| "pm domain job create failed")?;
+    let acceptance = process::create_job(services, JOB_FULL_RIGHTS)
+        .map_err(|_| "acceptance job create failed")?;
+    let mut names = TopologyNames::new();
+    names.register_job(root_job, "root");
+    names.register_job(services, "services");
+    names.register_job(pm_domain, "pm_domain");
+    names.register_job(acceptance, "acceptance");
+    names.register_process(env::pid() as u64, "init");
+    let (pm_mailbox, supervised, target_image) =
+        launch_test_services(services, pm_domain, acceptance, &mut names)?;
 
-/// 全部测试剧本。失败只短路后续阶段，不绕过收尾监督。
-fn run() -> Result<(), (&'static str, alloc::vec::Vec<Supervised>)> {
-    let (pm_mailbox, supervised, target_image) = match launch_test_services() {
-        Ok(launched) => launched,
-        Err(failure) => return Err(failure),
-    };
+    // 运行时拓扑快照（调试参考）：此刻服务在域内运行，验收自测尚未
+    // 展开；Drv之类短寿命服务可能已 REAPABLE 待收。
+    debug!("topology: runtime snapshot after service launch");
+    dump_topology(root_job, &names, 0);
     let pair = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
@@ -250,7 +408,7 @@ fn run() -> Result<(), (&'static str, alloc::vec::Vec<Supervised>)> {
         Ok(t) => t,
         Err(e) => {
             debug!("tunnel create failed: {:?}", e);
-            return Err(("tunnel create failed", supervised));
+            return Err("tunnel create failed");
         }
     };
     debug!("tunnel created");
@@ -260,7 +418,7 @@ fn run() -> Result<(), (&'static str, alloc::vec::Vec<Supervised>)> {
     }];
     if let Err(e) = send(pm_mailbox, 514, &[], &invitation_move) {
         debug!("send tunnel invitation failed: {:?}", e);
-        return Err(("send tunnel invitation failed", supervised));
+        return Err("send tunnel invitation failed");
     }
 
     let mut buf = [0u8; STREAM_LEN];
@@ -276,17 +434,22 @@ fn run() -> Result<(), (&'static str, alloc::vec::Vec<Supervised>)> {
     test_writable_wake(pm_mailbox);
 
     // —— live kill 正路径：Building 目标的确定性 kill/drain/终态验证 ——
-    test_building_kill(env::startup_handle(0).expect("init holds root job"));
+    test_building_kill(acceptance);
 
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image.as_deref() {
-        Some(image) => test_job_management(
-            env::startup_handle(0).expect("init holds root job"),
-            image,
-        ),
+        Some(image) => test_job_management(acceptance, image),
         None => debug!("job management tests skipped: target image unavailable"),
     }
+
+    // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
+    // 稳态拓扑。
+    match job_kill(acceptance, 0x1E) {
+        Ok(()) => debug!("acceptance domain collected"),
+        Err(error) => debug!("acceptance collection degraded: {:?}", error),
+    }
+    let _ = close(acceptance);
 
     // —— 监督闭环：等待全部服务 REAPABLE/CLOSED，Drain 至 Complete，
     // 查询稳定终态后释放 control。对象 close 回调（含 pm 隧道端点的
@@ -307,7 +470,93 @@ fn run() -> Result<(), (&'static str, alloc::vec::Vec<Supervised>)> {
         Err(e) => debug!("peer-closed wait failed: {:?}", e),
     }
     let _ = tunnel.close();
+
+    // —— 委托域终局：pm 的管理段应已把 pm_domain 收束到 Dead；降级时
+    // init 以保留的直接收束权兜底（job_kill = seal + 枚举派生 kill +
+    // drain + CLOSED 屏障）。 ——
+    let domain_state = process::query_job(pm_domain);
+    if matches!(&domain_state, Ok(s) if s.state == JobState::Dead as u32) {
+        debug!("pm delegated domain confirmed Dead");
+    } else {
+        debug!("pm delegated domain not collected by pm; init collecting");
+        let _ = job_kill(pm_domain, 0x1F);
+    }
+
+    // 终态拓扑快照（调试参考）：预期 root 仅剩 init + services，services
+    // 空（Dead 的 pm_domain/acceptance 已从成员表移除）——收束干净的不变量。
+    debug!("topology: final snapshot before steady state");
+    dump_topology(root_job, &names, 0);
+    let _ = close(pm_domain);
     Ok(())
+}
+
+/// 递归打印 Job/Process 拓扑（调试参考）：直接成员经派生 control 查询
+/// 生命周期快照后即关，child Job 派生 JobControl 下钻——纯观察，不消费
+/// authority、不改状态。青色 topology 标记便于在灰度用户态日志中定位
+/// （rinlib debug! 元许在消息内自拼 ANSI）。
+fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let job_snapshot = process::query_job(job).ok();
+    let members =
+        enumerate_members(job, JobMemberKind::MemberProcesses).unwrap_or_default();
+    let children =
+        enumerate_members(job, JobMemberKind::ChildJobs).unwrap_or_default();
+    match &job_snapshot {
+        Some(snapshot) => debug!(
+            "\x1b[36mtopology\x1b[0m: {indent}job {} (jid {}, {}, members {}, children {})",
+            names.job_name(snapshot.jid),
+            snapshot.jid,
+            job_state_name(snapshot.state),
+            members.len(),
+            children.len()
+        ),
+        None => debug!(
+            "\x1b[36mtopology\x1b[0m: {indent}job query failed (members {}, children {})",
+            members.len(),
+            children.len()
+        ),
+    }
+    for pid in members {
+        let process_snapshot = process::derive_job(
+            job,
+            JobMemberKind::MemberProcesses,
+            pid,
+            DERIVED_CONTROL_RIGHTS,
+        )
+        .ok()
+        .and_then(|control| {
+            let snapshot = process::query(control).ok();
+            let _ = close(control);
+            snapshot
+        });
+        match process_snapshot {
+            Some(snapshot) => debug!(
+                "\x1b[36mtopology\x1b[0m: {indent}  process {} (pid {}, {}, reason {}, code {})",
+                names.process_name(pid),
+                pid,
+                process_state_name(snapshot.state),
+                exit_reason_name(snapshot.reason),
+                snapshot.code
+            ),
+            None => debug!(
+                "\x1b[36mtopology\x1b[0m: {indent}  process pid {} (query failed)",
+                pid
+            ),
+        }
+    }
+    for jid in children {
+        match process::derive_job(job, JobMemberKind::ChildJobs, jid, DELEGATED_DOMAIN_RIGHTS) {
+            Ok(child) => {
+                dump_topology(child, names, depth + 1);
+                let _ = close(child);
+            }
+            Err(error) => debug!(
+                "\x1b[36mtopology\x1b[0m: {indent}  child jid {} derive failed: {:?}",
+                jid,
+                error
+            ),
+        }
+    }
 }
 
 /// 监督循环：对保留的每个 control 等待 REAPABLE|CLOSED，Drain 至
@@ -354,8 +603,8 @@ fn supervise_services(
 /// Building 目标的确定性 kill：Create 后未 Start，kill 冻结终因
 /// (Killed, code)，builder 关闭的 abandonment 竞争不覆盖；Drain 至
 /// Complete 后 shell 快照应稳定报 Dead/Killed/code。
-fn test_building_kill(root_job: Handle) {
-    let created = match process::create(root_job, SUPERVISOR_RIGHTS) {
+fn test_building_kill(job: Handle) {
+    let created = match process::create(job, SUPERVISOR_RIGHTS) {
         Ok(created) => created,
         Err(error) => {
             debug!("building kill: create failed: {:?}", error);
@@ -393,13 +642,13 @@ fn test_building_kill(root_job: Handle) {
     let _ = close(created.control);
 }
 
-/// 验收线 1：枚举→派生→kill 通路。srv_target 的 pid 经 root Job 枚举
-/// 可见，JobDerive 派生 MANAGE control 后 kill 并监督收束；原保留
+/// 验收线 1：枚举→派生→kill 通路。srv_target 的 pid 经 acceptance Job
+/// 枚举可见，JobDerive 派生 MANAGE control 后 kill 并监督收束；原保留
 /// control 在派生接管后关闭（关闭 control 永不隐式终止）。任一步失败
 /// 降级回保留 control 路径，不影响既有验收面。
-fn test_derive_kill(root_job: Handle, pid: u64, retained: Handle) {
+fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
     let derived = (|| {
-        let members = enumerate_members(root_job, JobMemberKind::MemberProcesses)?;
+        let members = enumerate_members(job, JobMemberKind::MemberProcesses)?;
         if !members.contains(&pid) {
             debug!(
                 "derive kill: pid {} missing among {} members",
@@ -414,7 +663,7 @@ fn test_derive_kill(root_job: Handle, pid: u64, retained: Handle) {
             members.len()
         );
         process::derive_job(
-            root_job,
+            job,
             JobMemberKind::MemberProcesses,
             pid,
             DERIVED_CONTROL_RIGHTS,
@@ -441,19 +690,19 @@ fn test_derive_kill(root_job: Handle, pid: u64, retained: Handle) {
 
 /// Job 管理面验收入口（step 5）。真跨核竞态矩阵（含并发 Create/枚举
 /// 乱序窗口）归 step 9 验证矩阵，此处只覆盖可确定性制造的场景。
-fn test_job_management(root_job: Handle, image: &[u8]) {
-    test_job_seal_completion(root_job);
-    test_derive_fallback(root_job);
-    test_job_kill_composition(root_job, image);
-    seal_before_start(root_job);
-    seal_before_create(root_job);
-    enumerate_convergence(root_job);
+fn test_job_management(job: Handle, image: &[u8]) {
+    test_job_seal_completion(job);
+    test_derive_fallback(job);
+    test_job_kill_composition(job, image);
+    seal_before_start(job);
+    seal_before_create(job);
+    enumerate_convergence(job);
 }
 
 /// 验收线 2：封口与完成传播——空 child Job seal 后 CLOSED 电平可等待、
 /// 快照转 Dead；重复 seal 幂管；完成后从 root 子表移除（枚举收敛）。
-fn test_job_seal_completion(root_job: Handle) {
-    let Ok(child) = process::create_job(root_job, JOB_FULL_RIGHTS) else {
+fn test_job_seal_completion(job: Handle) {
+    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
         debug!("job seal completion FAILED: job create failed");
         return;
     };
@@ -466,7 +715,7 @@ fn test_job_seal_completion(root_job: Handle) {
     // 幂管：Dead 上重复 seal 成功且不改变状态。
     let resealed = process::seal_job(child);
     let resnapshot = process::query_job(child);
-    let children = enumerate_members(root_job, JobMemberKind::ChildJobs);
+    let children = enumerate_members(job, JobMemberKind::ChildJobs);
     let passed = sealed.is_ok()
         && waited.is_ok()
         && matches!(&snapshot, Ok(s) if s.state == JobState::Dead as u32)
@@ -493,8 +742,8 @@ fn test_job_seal_completion(root_job: Handle) {
 /// 验收线 3：派生兑底——control 全消散的 REAPABLE 进程经枚举+派生接管，
 /// drain 至 Complete。铸造的新 shell 必须重放 REAPABLE，否则 drain
 /// 入口直接拒绝——本场景即验证该重放。
-fn test_derive_fallback(root_job: Handle) {
-    let Ok(created) = process::create(root_job, SUPERVISOR_RIGHTS) else {
+fn test_derive_fallback(job: Handle) {
+    let Ok(created) = process::create(job, SUPERVISOR_RIGHTS) else {
         debug!("derive fallback FAILED: create failed");
         return;
     };
@@ -509,10 +758,10 @@ fn test_derive_fallback(root_job: Handle) {
     let _ = close(created.builder);
     // control 消散：无人收束，只能靠枚举+派生接管。
     let _ = close(created.control);
-    let members = enumerate_members(root_job, JobMemberKind::MemberProcesses);
+    let members = enumerate_members(job, JobMemberKind::MemberProcesses);
     let visible = matches!(&members, Ok(list) if list.contains(&pid));
     let minted = process::derive_job(
-        root_job,
+        job,
         JobMemberKind::MemberProcesses,
         pid,
         DERIVED_CONTROL_RIGHTS,
@@ -556,8 +805,8 @@ fn test_derive_fallback(root_job: Handle) {
 /// + 一个 Building 成员，两者 control 均消散——libprocess::job_kill 一把
 /// 收束（seal → 枚举 → 派生 kill → drain → 等 CLOSED 全链，派生走铸造
 /// 路径）。
-fn test_job_kill_composition(root_job: Handle, image: &[u8]) {
-    let Ok(child) = process::create_job(root_job, JOB_FULL_RIGHTS) else {
+fn test_job_kill_composition(job: Handle, image: &[u8]) {
+    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
         debug!("job kill composition FAILED: job create failed");
         return;
     };
@@ -608,8 +857,8 @@ fn test_job_kill_composition(root_job: Handle, image: &[u8]) {
 /// seal 先于 Start 的提交闸门：Building 成员在 seal 后 Start 返回
 /// ObjectClosed（链锁内上行检查，两种线性化顺序的另一侧）；随后
 /// kill/drain 收束，Job 因 sealed+空完成并发布 CLOSED。
-fn seal_before_start(root_job: Handle) {
-    let Ok(child) = process::create_job(root_job, JOB_FULL_RIGHTS) else {
+fn seal_before_start(job: Handle) {
+    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
         debug!("seal gate (start) FAILED: job create failed");
         return;
     };
@@ -681,8 +930,8 @@ fn seal_before_start(root_job: Handle) {
 
 /// seal 先于 Create：封口后成员/子 Job 创建口永久关闭（ObjectClosed）；
 /// 空封口立即完成并发布 CLOSED。
-fn seal_before_create(root_job: Handle) {
-    let Ok(child) = process::create_job(root_job, JOB_FULL_RIGHTS) else {
+fn seal_before_create(job: Handle) {
+    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
         debug!("seal gate (create) FAILED: job create failed");
         return;
     };
@@ -711,11 +960,11 @@ fn seal_before_create(root_job: Handle) {
 
 /// 枚举收敛（可制造子集）：创建/收束交错下，新 Pid 单调递增、Dead
 /// 后从成员表消失；连续两轮全量枚举无残留。真跨核并发窗口归 step 9。
-fn enumerate_convergence(root_job: Handle) {
+fn enumerate_convergence(job: Handle) {
     let mut ok = true;
     let mut previous = 0u64;
     for round in 0..4u64 {
-        let Ok(created) = process::create(root_job, SUPERVISOR_RIGHTS) else {
+        let Ok(created) = process::create(job, SUPERVISOR_RIGHTS) else {
             ok = false;
             debug!("enumerate convergence FAILED: create failed at round {}", round);
             break;
@@ -742,7 +991,7 @@ fn enumerate_convergence(root_job: Handle) {
             debug!("enumerate convergence FAILED: drain {:?}", error);
         }
         let _ = close(created.control);
-        match enumerate_members(root_job, JobMemberKind::MemberProcesses) {
+        match enumerate_members(job, JobMemberKind::MemberProcesses) {
             Ok(members) => {
                 if members.contains(&created.pid) {
                     ok = false;
