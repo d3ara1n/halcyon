@@ -27,7 +27,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备接入重审、IPC 压力验证线、notes 结构整改、F2/F4 注记 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
 
-常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码的统一阶段性 Review；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
+常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
 
 ## 位置
 
