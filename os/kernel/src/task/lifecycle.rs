@@ -4,8 +4,10 @@
 //! 锁序契约（顶级锁）：lifecycle 锁只改状态、终因、成员记录、active
 //! mask 与 Building 操作计数，锁内不调用 subscribe/offer/enqueue/IPI/
 //! 对象 close/uaccess/页表操作——这些动作经 [`TerminationTodo`] 延迟到
-//! 锁外执行。任何对象锁、WaitContext/期限表锁、调度类锁、地址空间/
-//! HandleTable 锁内不得反向获取 lifecycle 锁。
+//! 锁外执行。方向约束：lifecycle 锁内不得出游获取任何其他锁（对象锁、
+//! WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁）；反向的
+//! 单向嵌套（如 ProcessControl 快照在对象锁内进入 lifecycle）因
+//! lifecycle 不出游而安全，不构成环。
 //!
 //! 成员记录是线程容器的唯一真值，但 `Gone` 只在线程强引用真正消散后
 //! 由持有方写入（pick 吸收的 reap / WaitContext 完成方 / Start 收尾方）：

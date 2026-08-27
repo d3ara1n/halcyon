@@ -142,15 +142,17 @@ capability-derived 调度域接线前明确拒绝。
 
 ### 锁序契约（lifecycle 顶级锁）
 
-Process lifecycle 锁是跨子系统转换的顶级状态锁：
+Process lifecycle 锁是跨子系统转换的顶级状态锁，方向约束是
+**lifecycle 锁内不出游**：
 
-- 不得在对象锁、WaitContext/期限表锁、调度类锁、地址空间/HandleTable
-  锁内反向获取 lifecycle；
-- lifecycle 锁内只改状态、成员记录、active 位图、终因，取得 weak
-  context/待办标记；
 - 不在 lifecycle 锁内调用 subscribe/unsubscribe、offer/finish、enqueue、
   IPI、对象 close callback、uaccess 或页表操作——这些动作经
-  TerminationTodo 在解锁后执行。
+  TerminationTodo 在解锁后执行；
+- 不在 lifecycle 锁内获取任何其他锁（对象锁、WaitContext/期限表锁、
+  调度类锁、地址空间/HandleTable 锁）；
+- 反向的单向嵌套——在其他锁内进入 lifecycle（如 ProcessControl 快照
+  在 shell state 锁内调 lifecycle 快照）——因 lifecycle 不出游而安全，
+  不构成环，属合法调用序。
 
 JobState 锁与之同纪律：成员摘除/层级变更在锁外驱动 lifecycle 动作，
 对象锁（JobControl wait）不与 JobState 锁嵌套。

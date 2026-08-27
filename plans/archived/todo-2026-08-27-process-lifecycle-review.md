@@ -1,3 +1,5 @@
+> 已收口：Review 报告见 [`review-2026-08-27-process-lifecycle-code-review.md`](review-2026-08-27-process-lifecycle-code-review.md)（七轴全过，PLR-1 已修、PLR-2 登记）。
+
 # 进程生命周期 step 2–4 统一代码 Review（挂账）
 
 > 验收已通过（设计拍板入档 + 实现完成 + 测试全绿并已提交）；按
