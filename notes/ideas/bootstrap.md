@@ -102,11 +102,11 @@ Building → Running → Terminating → Dead
 
 - **ProcessBuilder**：Building 阶段唯一、affine 的构造权；关闭即放弃构造并使目标进入终止收束；
 - **ProcessControl**：ProcessCreate 即产生的稳定管理/观察 capability，贯穿 Building、Running、Terminating 与 Dead；管理、等待、复制和运输由 rights 收窄；
-- **JobControl**：创建、封口、分页枚举直接成员、预算和故障收束的 authority，不是进程权限等级。
+- **JobControl**：创建、封口、分页枚举与按 ID 派生直接成员、故障收束的 authority，不是进程权限等级。
 
 ProcessStart 成功时只消费 builder，原子安装 GRANT entries、映射通用 StartupBlock、设置首线程上下文并发布进程；ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。失败保持 builder、control、调用方 Handles 与目标不可运行状态；同一 builder 不得同时作为 ProcessStart target 与 grant 项。
 
-内核只提供 JobSeal、直接成员的有界分页枚举和单进程控制原语；递归 JobKill 由 pm 在用户态组合。Open Job 变空后仍可用于服务重启，Sealed Job 才在全部成员和 child Jobs 收束后进入 Dead。多数进程不持 JobControl，只通过 pm 协议请求创建或管理。
+内核只提供 JobSeal、直接成员的有界分页枚举、按 ID 派生 capability 和单进程控制原语；递归 JobKill 由 pm 在用户态组合。Open Job 变空后仍可用于服务重启，Sealed Job 才在全部成员和 child Jobs 收束后进入 Dead。多数进程不持 JobControl，只通过 pm 协议请求创建或管理。
 
 Dead 表示进程的地址空间和 HandleTable 已经完成释放；exit status 与终态信号由仍存活的 ProcessControl shell 观察，观察 capability 不让已死亡进程继续占用运行资源。大规模 Handle 与页表收束由持管理 authority 的服务以有界内核原语分批驱动，Terminating 在最后一批完成前持续成立。
 

@@ -22,7 +22,8 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | 文件 | 概要 |
 |---|---|
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已完成收口，03–07 待做 |
-| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——~~step 1–4 已实施并收口（代码 Review 已完成，见 [archived/review-2026-08-27-process-lifecycle-code-review.md](archived/review-2026-08-27-process-lifecycle-code-review.md)）~~；剩余 step 5–10：JobSeal/分页枚举与递归 JobKill 组合、持久 init 正式监督政策、ThreadSpawn 前 barrier 泛化、D64 eligibility、多核验证矩阵、文档终态收口 |
+| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——~~step 1–4 已实施并收口（代码 Review 已完成，见 [archived/review-2026-08-27-process-lifecycle-code-review.md](archived/review-2026-08-27-process-lifecycle-code-review.md)）~~；剩余 step 5–10：JobSeal/分页枚举与递归 JobKill 组合、持久 init 正式监督政策、ThreadSpawn 前 barrier 泛化、D64 eligibility、多核验证矩阵、文档终态收口。**step 5（Job 管理面）设计已拍板冻结**（第二批决策 9–15 + 已确认的 Job ABI） |
+| [`todo-2026-08-27-job-management-impl.md`](todo-2026-08-27-job-management-impl.md) | step 5 实施唯一入口：设计已冻结，实施边界/验收线/纪律/代码入口见本文件；设计权在设计方，实施侧遇缺口回报不自行拍板 |
 | [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备接入重审、IPC 压力验证线、notes 结构整改、F2/F4 注记 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
 
@@ -37,7 +38,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 - StartupBlock v2 与 BootPackage 启动链已落地：outer 为 Header + 实际 child Handle 数组 + 可零 padding + opaque payload；内核只解析 fixed envelope 与唯一 init ELF，以 borrowed 只读页把 payload 交给 init。实现现状见 `notes/impls/startup.md`。
 - 对照负载：`user/systems/` 与 `user/drivers/` 四服务。fs 经用户态 FAL 真路径完成创建/枚举/属性/符号链接/偏移读写，验收线已过（`bf32c1c`）；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
 - 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、Building-only Map/Write、事务化 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy。进程生命周期改造已实施（见上）。剩余方向：内核提供 JobSeal/分页枚举，递归 JobKill 由 init/pm 等用户态管理者组合（step 5），持久 init 是当前系统配置的 root supervisor；D64 仍等待调度域 eligibility（step 8）。initfs manifest/archive 另案设计。方向见 `notes/ideas/{task,bootstrap}.md`，实现现状见 `notes/impls/{startup,task}.md`。
-- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
+- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。step 5（Job 管理面）设计已拍板（2026-08-27：枚举游标分页/JobDerive/seal 只封创建/JobId/预算原则入 ideas），实施见 [`todo-2026-08-27-job-management-impl.md`](todo-2026-08-27-job-management-impl.md)。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
 
 ## 戒律
 

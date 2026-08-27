@@ -4,13 +4,15 @@
 
 ## Job：创建域与资源预算
 
-Job 是进程创建与资源核算的层级容器。root Job 由内核在初始 launch 中交给 init；持有相应 capability 的服务可以创建子 Job、设定预算并在该域内创建进程。
+Job 是进程创建与资源预算的层级容器。root Job 由内核在初始 launch 中交给 init；持有相应 capability 的服务可以创建子 Job 并在该域内创建进程。
 
-Job 表达配额、故障收束和管理域，不是用户身份或进程权限等级。设备、目录和服务访问仍由各自 capability 授权。
+Job 表达故障收束和管理域，不是用户身份或进程权限等级。设备、目录和服务访问仍由各自 capability 授权。
 
-Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保持可用，允许管理者按政策重新创建服务；JobSeal 是幂等的封口操作，使本 Job 及后代不再接受新 Job、Building process 或 ProcessStart。Job 层级深度最多为 32，创建和启动沿有界祖先链检查 effective seal，因而根封口无需递归遍历即可立即覆盖后代。Sealed Job 在直接进程全部 Dead、child Jobs 全部 Dead 后进入 Dead，并以 JobControl 的 CLOSED 电平发布完成。关闭 JobControl 只消散 authority，不封口或终止成员。
+资源预算以对象界定而非记账。库存资源（内存）以持有表达：对象拥有帧、映射借出视图、分配即派生切片。流量资源（CPU）以预约表达：budget/period 的预约对象是 capability，无预约或预算耗尽的线程不被调度，refill 状态即调度器真值。域的上限由域内可达的持有物与预约决定，内核不维护动态计数；上限的分配与超额政策归用户态资源服务。线程洪水由结构消化：spawn 不增 CPU 配额（共享预约），且消耗域 backing。当前系统是同一原则的扁平从简态（全局帧池、映射即移交、全局公平类）；MemoryObject 与 CPU 预约随不可信域/异构域接入引入，与 D64 eligibility 同批设计。
 
-内核维护 Job 层级、直接成员关系、封口状态和完成计数，并向持 MANAGE authority 的管理者提供有界分页枚举与派生 child JobControl、ProcessControl 的机制；内核不递归遍历无界子树执行 JobKill。JobKill 是 init、pm 等用户态管理者组合 JobSeal、分页枚举、ProcessKill、资源收束和 CLOSED 等待形成的政策操作。树遍历、失败恢复、批量顺序和重启决策归用户态，单个状态转换和 capability 派生仍由内核强制。
+Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保持可用，允许管理者按政策重新创建服务；JobSeal 是幂等的封口操作，使本 Job 及后代不再接受新 Job、Building process 或 ProcessStart。Job 层级深度最多为 32，创建和启动沿有界祖先链检查 effective seal，因而根封口无需递归遍历即可立即覆盖后代。封口只封创建、不向下传播终止；完成只看本 Job 自身的 sealed 与成员收束，递归封口与递归终止都是用户态政策（逐层 JobSeal 组合）。Sealed Job 在直接进程全部 Dead、child Jobs 全部 Dead 后进入 Dead，并以 JobControl 的 CLOSED 电平发布完成。关闭 JobControl 只消散 authority，不封口或终止成员。
+
+内核维护 Job 层级、直接成员关系、封口状态和完成计数，并向持 MANAGE authority 的管理者提供有界分页枚举与派生 child JobControl、ProcessControl 的机制；枚举与派生以单调不复用的 Pid/JobId 寻址——ID 不构成全局操作入口，唯一操作角色是在已持 JobControl 的直接成员域内作派生选择子，authority 完全来自 capability；内核不递归遍历无界子树执行 JobKill。JobKill 是 init、pm 等用户态管理者组合 JobSeal、分页枚举、ProcessKill、资源收束和 CLOSED 等待形成的政策操作。树遍历、失败恢复、批量顺序和重启决策归用户态，单个状态转换和 capability 派生仍由内核强制。
 
 ## 进程：独立资源环境
 
@@ -19,8 +21,8 @@ Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保�
 - 用户地址空间与内存布局；
 - HandleTable；
 - 线程成员关系；
-- Job 归属与资源记账；
-- 仅用于诊断的 PID、`parent_pid` 与退出信息。
+- Job 归属与资源归属（预算以持有与预约表达，不记账）；
+- PID、`parent_pid` 与退出信息：以诊断为主；PID 另在 JobControl 枚举域内充当派生选择子（见「Job」节），不构成全局操作入口。
 
 进程不以“驱动级”“服务级”等 ambient 权限授权 syscall。ProcessCreate 同时产生 affine ProcessBuilder 与稳定的 ProcessControl：前者只授权构造，后者从 Building 起授权查询、终止、等待和受保护资源收束；观察者可持去除 MANAGE 的 READ/WAIT control。创建关系本身不产生管理权。
 
@@ -50,7 +52,7 @@ ProcessKill 是持 MANAGE authority 对 Building 或 Running process 发出的�
 某调度类 Ready 队列 | 某 hart current | 无容器（Waiting/Dead）
 ```
 
-硬件 capability 决定线程可进入的调度域，调度类只表达选择策略；两者不得称为进程权限。
+硬件 capability 决定线程可进入的调度域，调度类只表达选择策略；两者不得称为进程权限。线程对 CPU 的消耗从预约对象扣减：预约决定配额（能否跑），调度类决定次序（先后），两者作用于不同谓词，配额过滤在 pick 边界进行；预约、Job 归属与调度域 eligibility 互为线程的正交面，预约对象双面桥接 capability 世界与调度器世界，不重复记账。
 
 ## 权利派生
 

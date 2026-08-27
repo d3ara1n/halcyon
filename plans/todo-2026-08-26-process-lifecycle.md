@@ -59,6 +59,25 @@ ProcessDrain(control, max_work) -> ProcessDrainResult
 - `ProcessDrainResult` 为 16 字节、8 字节对齐：`work_done:u32`、`status:u32`、`reserved:u64`；`ProcessDrainStatus` 固定为 More=0、Complete=1。reserved 必须为零，不计算精确 remaining。Dead 上调用幂等返回 `{0, Complete}`；并发批次以 ObjectBusy 仲裁。
 - Handle 先于地址空间收束，使对象 close callback 仍可撤销 external mapping；最后一批地址空间资源完成后，ProcessDrain 原子清 REAPABLE、置 Dead/CLOSED。
 
+### 已确认的 Job ABI
+
+```text
+JobSeal(job_control) -> ()
+JobQuery(job_control, out: *JobSnapshot) -> ()
+JobEnumerate(job_control, kind, cursor, buf: *u64, buf_len) -> JobEnumerateResult
+JobDerive(job_control, kind, id, rights, out: *Handle) -> ()
+```
+
+- 调用号接 Process 控制段：`JobSeal = 0x19`、`JobQuery = 0x1a`、`JobEnumerate = 0x1b`、`JobDerive = 0x1c`。
+- `JobSeal` 要求 MANAGE，幂等：重复 seal 成功且不改变既有状态；sealed 后该 Job 及全部后代的创建/启动口经上行检查永久关闭（ObjectClosed）。
+- `JobQuery` 要求 READ。`JobSnapshot` 为 40 字节、8 字节对齐：`jid:u64`、`parent_jid:u64`（root 为 0）、`state:u32`、`live_processes:u32`、`live_children:u32`、`reserved:u32`、`reserved2:u64`。`JobState` 判别值固定 Open=0、Sealed=1、Dead=2；未知判别值由用户态拒绝。计数是非精确近似值（不构成协议依据）；Dead 后返回冻结快照。
+- `JobEnumerate` 要求 READ；`kind` 固定 0 = child Jobs（JobId 序）、1 = member processes（Pid 序）。按 ID 升序返回 ≤ min(buf_len, JOB_ENUMERATE_MAX) 个 8 字节 ID；`cursor` 为上批 `next_cursor`（首批传 0）；遇未决事务占位即终止本批，`next_cursor` 严格小于该占位 ID，占位不输出。
+- `JobEnumerateResult` 为 16 字节、8 字节对齐：`next_cursor:u64`（本批最后返回条目的 ID，无返回时等于入参 cursor）、`actual:u32`、`more:u32`（0/1）。契约：`more=1 ⇒ actual ≥ 1 ∨ next_cursor == 入参 cursor`（后者是占位屏障的零进展情形，调用方以原 cursor 重试；占位窗口是创建方单个 syscall 内的临界区，协作式内核下有界完成，重试不活锁）；`more=0` 表示表内无任何 ID > next_cursor 的（可见或占位）条目。违反即内核违约，用户态拒绝——rinlib 校验拒绝 `more=1 ∧ actual=0 ∧ next_cursor ≠ 入参 cursor`。`buf_len` 必须非零（0 为 IllegalArgument，对齐 ProcessDrain max_work=0 先例）；`buf_len` 超过 MAX 按 MAX 截断，不以 BufferTooSmall 表达。
+- `JobDerive` 要求 MANAGE；kind 同上；`rights` 必须为源 JobControl handle rights ∩ 目标角色 allowed_rights 的子集，超集 RightsDenied；目标不在直接成员表（含已完成移表）ObjectNotFound。ID（Pid/JobId）不构成全局操作入口——唯一操作角色是 JobControl 直接成员域内的派生选择子。
+- JobCreate 超出层级深度上限 32 返回 IllegalArgument（父链深度是 parent handle 的属性，参数非法类）。
+- Job 的 ObjectSignals 维持仅 CLOSED：Job 无收束工作，完成即 CLOSED；等待 CLOSED 即「直接成员全部完成」屏障。
+- `JOB_ENUMERATE_MAX` 为 shared 编译期常量，定值 128。
+
 ### 调度域 eligibility
 
 把 ELF execution profile 转换为 compatible domain，明确无兼容 hart、运行中 capability 变化及迁移语义；完成后再接受 D64。
@@ -74,17 +93,29 @@ ProcessDrain(control, max_work) -> ProcessDrainResult
 7. **Dead shell**：control 冻结 snapshot、只 weak 指 core；Dead 发布时 core 完成收束、从 Job 成员表移除后直接释放。control Handle 只保活 shell。
 8. **跨 hart kill 最小正确版随 step 2/3 落地**：lifecycle/active bitmap 在进入 user satp 前登记；Kill 向 active mask 发 IPI；SSIP 独立检查 terminating；目标统一非-Resume 出口先切 kernel satp + 本地全量 SFENCE.VMA，再清 active bit/ack。step 7 是 ThreadSpawn 前的泛化与压力验证，不是补基本正确性。
 
+## 已拍板的结构决策（2026-08-27 第二批：Job 管理面，step 5 前置）
+
+取证与完整推导（含被否选项）见 [archived/todo-2026-08-27-job-management-design.md](archived/todo-2026-08-27-job-management-design.md) 与 [ref-2026-08-27-job-enumerate-derive-research.md](ref-2026-08-27-job-enumerate-derive-research.md)。
+
+9. **枚举 = 单调 ID 序游标分页**：`JobEnumerate` 以「上批最后返回条目的 ID」为游标——ID 单调不复用 ⇒ 免内核枚举状态、断点续扫、竞态良定义（`id > cursor` 的存活成员必然在后续批出现，ID ≤ cursor 未返回者必然已移除）；单批条目数内核常量封顶；遇未决事务占位即终止本批、游标停在其前（屏障闭合「跳过占位又越过它」的漏项窗口）。条目仅 8 字节 ID，状态经派生后 Query——观察不消费 authority、不占 HandleTable 槽。
+10. **派生 = JobDerive 按 ID 单目标**：kind 区分 child Job→JobControl 与 member process→ProcessControl；请求 rights ⊆ 源 handle rights ∩ 目标角色 allowed_rights，超集 RightsDenied（显式拒绝，不学 seL4 静默降级）；目标不在直接成员表 ObjectNotFound——ID 不复用保证 NotFound 只意味着「已完成」，永不错指。ID（Pid/JobId）不构成全局操作入口，唯一操作角色是 JobControl 直接成员域内的派生选择子。派生复用存活的 ProcessControl shell（单一 shell 身份，REAPABLE/CLOSED 电平不分叉）；shell 已消散时从 core 铸造新 shell，并在铸造点重放已达成的电平（如 REAPABLE），派生兜底由此接上 drain 入口。
+11. **seal 只封创建，完成 = 自身 sealed && empty**：JobSeal 是 O(1) 置位（不扫表——宽度无界）；创建/启动提交点沿父链上行 ≤32 检查任一祖先 sealed → ObjectClosed（决策 6 语义）。完成条件是自身 sealed && members 空 && children 空，三触发点（seal 时已空／成员移除后空／子完成后空）事件驱动、自底向上传播、单步有界。递归封口与递归 JobKill 是用户态政策（逐层枚举+seal+kill+drain）；「只 seal 根不 seal 子」会被未 seal 的 child 卡住 CLOSED，属调用者政策不完整，可由派生兜底救回。否决「effective_sealed 完成条件」（祖先 seal 向下游历无界、协作式内核无后台触达）与「内核递归」（Zircon 宏内核惯性，无界路径）。root Job 由 static anchor 永持，完成发 CLOSED 但不移除不释放。
+12. **JobId 引入与派生兜底**：`JobId(u64)` 全局单调不复用，root 恒 1，与 Pid 分立空间。决策 2 的「Job 派生兜底」由 JobDerive 直接覆盖，无需专门机制：进程 Building 提交点入表、Dead 发布点移表，REAPABLE 而 control 全消散者必然仍在表内——枚举可见、从 core 铸造 MANAGE control、drain 至 Complete；authority 消散的空壳 child Job 同构可救（派生 JobControl + 显式 seal → 完成）。
+13. **rights 复用**：JobSeal/JobDerive 要求 MANAGE，JobQuery/JobEnumerate 要求 READ；不新增 ENUMERATE 位（枚举=观察、派生=铸权，现有位语义自然，避免「能查状态不能查成员」的人为割裂）。
+14. **JobQuery 固定宽快照**：`JobSnapshot` 40 字节——jid、parent_jid（root 为 0）、state（Open=0/Sealed=1/Dead=2）、live_processes/live_children（非精确近似值，不构成协议依据，正确性走 CLOSED 等待与枚举收敛）、reserved 必须为零；Dead 后冻结快照，观察壳由存活 JobControl 保活；未知判别值用户态拒绝。
+15. **实施约束（结构）**：成员/子表改按 ID 有序的 fallible 结构（首版有序 Vec + try_reserve + 二分定位：单批枚举自 partition_point 连续取 O(log n + N) 达成固定上界，插入/删除 O(width) memmove 仅在创建路径、不在完成标准的固定上界清单，以「宽度使 memmove 可观测」为换 fallible 有序树的触发条件；alloc BTreeMap 无失败路径、帧耗尽即 alloc_error_handler 内核 fatal，违反 OOM 戒律故不用；Vec+swap_remove 退役——序被破坏且无法做占位屏障）；Pid 分配挪入 owner Job 锁内与占位同临界区（消除多核「先分配后入表」乱序漏项）；「上行检查+提交」在先父后子链锁（≤32 把）内线性化，锁序规范 **Job 链锁 → lifecycle 锁 → 对象锁**（seal 持单锁与提交在 owner 锁互斥，等价 Ziron「AddChild 与 Kill 同锁」）；完成传播放子锁后取父锁（延迟触发安全：sealed ⇒ 无新成员，判定幂等）。
+
 ## 实施顺序
 
 1. ~~调研成熟系统的 process/job kill、wait、dead-object shell 与 SMP 线程组退出路径，确认状态机和责任边界；~~ 已完成，证据见 `ref-2026-08-task-termination-research.md`，方向已进入 `notes/ideas/{task,bootstrap}.md`；
 2. ~~将 ProcessControl 前移到 ProcessCreate，建立 Process lifecycle 锁、无强引用环的线程成员表（含跨 hart IPI 最小正确版与 WaitContext cancellation 契约，见上「已拍板的结构决策」）；~~ 已完成（含 C1-C5/H1-H3/M1-M2 集中修复：Building 操作准入、Gone 时点、Start pin 事务、root 帧有界释放、硬预算计费、零分配发布、快照一致性、创建事务序）；
 3. ~~实现 fixed-width ProcessQuery、Building/Running ProcessKill、ProcessControl rights 与 CLOSED 等待；~~ 已完成；
 4. ~~实现固定预算 Process 收束游标和管理电平，同批给持久 init 加最小监督闭环（保留 controls、WaitMany(REAPABLE|CLOSED)、Drain 至 Complete），证明最后线程、active-hart ack、Handle/page-table drain 与 Dead 发布的顺序；~~ 已完成（live kill 正路径：srv_target Waiting 取消 + Building kill + 自终止）；
-5. 实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill；
+5. 实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill（设计已拍板：第二批结构决策与「已确认的 Job ABI」）；
 6. 以当前 ustar 私有政策由持久 init 硬编码建立 services Job、启动并监督其中的 `srv_pm` 等服务；pm 只管理显式委托的子域，不提前设计 manifest；
 7. 接入 ThreadSpawn 前完成多线程 teardown barrier；active hart 必须切回 kernel satp、执行本地全量 SFENCE.VMA 后才确认离场，不以 SBI 请求已发送代替完成；
 8. 接入 capability-derived 调度域 eligibility，再开放 D64；
-9. 对 Building/Ready/Running/Waiting、自杀、重复 kill、并发 Exit/fault、pm 接管、Job 枚举竞态和最后 control 关闭做 host/virt 多核验证；
+9. 对 Building/Ready/Running/Waiting、自杀、重复 kill、并发 Exit/fault、pm 接管、Job 枚举/派生/seal/完成传播竞态（含多核 ID 乱序分配窗口）和最后 control 关闭做 host/virt 多核验证；
 10. 同步 `notes/impls/{task,execution-context,ipc,startup}.md`。
 
 ## 完成标准
