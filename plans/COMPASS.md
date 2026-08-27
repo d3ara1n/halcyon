@@ -40,7 +40,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 - StartupBlock v2 与 BootPackage 启动链已落地：outer 为 Header + 实际 child Handle 数组 + 可零 padding + opaque payload；内核只解析 fixed envelope 与唯一 init ELF，payload 以只读页交给 init（映入即收编 owned backing）。实现现状见 `notes/impls/startup.md`。
 - 对照负载：`user/systems/` 与 `user/drivers/` 四服务。fs 经用户态 FAL 真路径完成创建/枚举/属性/符号链接/偏移读写，验收线已过（`bf32c1c`）；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
 - 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、Building-only Map/Write、事务化 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy。进程生命周期改造已实施（见上）。剩余方向：内核提供 JobSeal/分页枚举，递归 JobKill 由 init/pm 等用户态管理者组合（step 5），持久 init 是当前系统配置的 root supervisor；D64 仍等待调度域 eligibility（step 8）。initfs manifest/archive 另案设计。方向见 `notes/ideas/{task,bootstrap}.md`，实现现状见 `notes/impls/{startup,task}.md`。
-- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。**step 7（ThreadSpawn 前多线程 teardown barrier）已实施收口（2026-08-28）**：线程成员表（tid 寻址、离场即摘）取代单值记录，等待取消锁外游标化（零分配），归一收敛到 trap 汇编非 Resume 出口，KNOWN_ISSUES 写回 panic 面消解（deliver_output 复检即杀 + 分发出口终止检查）；ThreadSpawn 接入面清单入档计划篇。下一项是 step 8：capability-derived 调度域 eligibility，再开放 D64（届时 F2 ready-marker 预留域路由承接项触发）。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
+- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。**step 7（ThreadSpawn 前多线程 teardown barrier）已实施收口（2026-08-28）**：线程成员表（tid 寻址、离场即摘）取代单值记录，等待取消锁外游标化（零分配），归一收敛到 trap 汇编非 Resume 出口，KNOWN_ISSUES 写回 panic 面消解（deliver_output 复检即杀 + 分发出口终止检查）；ThreadSpawn 接入面清单入档计划篇。**首次 release 验证暴露并修复 trap 入口 x5 破坏**（SPP 检查在保存前用 t0，每次用户 trap 覆写用户 x5；修复经已保存的 t5 中转，寄存器纪律入档 execution-context.md，调查档案 [archived/review-2026-08-28-release-trap-entry-x5.md](archived/review-2026-08-28-release-trap-entry-x5.md)）；自此 release 验证线纳入阶段收尾必跑（`just virt-release`）。下一项是 step 8：capability-derived 调度域 eligibility，再开放 D64（届时 F2 ready-marker 预留域路由承接项触发）。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
 
 ## 戒律
 
@@ -51,4 +51,4 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 - 用户内存访问：SUM 直访 + translate 前置校验，不软件遍历页表拷贝。
 - 框架先行、实现从简：结构一次到位，实现按需求渐进替换（如调度域/类）。
 - 共享 ABI 改动内核与用户态两侧同步，不留单边。
-- 文档即决策：方向性结论进 notes/，本文件只导航；每轮收口于「决策入档、代码全绿已提交、下一步自然序明确」。
+- 文档即决策：方向性结论进 notes/，本文件只导航；每轮收口于「决策入档、代码全绿（debug 与 release）已提交、下一步自然序明确」。

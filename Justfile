@@ -111,6 +111,13 @@ run_qemu_dump_dtb:
 virt:
     @just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
 
+# release 验证线（阶段收尾必跑）：debug 代码生成不在 ecall 周边把活值留在
+# t 系寄存器，用户侧寄存器保持语义只有 release 能测出（2026-08-28 trap
+# 入口 x5 破坏事故，调查档案见 plans/archived/）。通过标准与 virt 同：
+# 全负载验收线 + 静默停机退出。
+virt-release:
+    @just PLATFORM=qemu MODEL=virt MODE=release run_qemu -smp cores=4
+
 # sifive_u 无 shutdown 设备：负载完成后 QEMU 不自退出，运行阶段以 timeout
 # 收束（AGENTS.md：运行阶段硬上限 10s）；通过与否以日志关键行人工判定
 # （全员回收 / [Sched] system quiescent）。

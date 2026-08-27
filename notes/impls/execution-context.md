@@ -47,7 +47,7 @@ Base64 从不执行 FP 保存恢复，用户出口 FS=Off。D64 每次切入完�
 
 formal stvec 恒指共同 direct-mode 入口。正式环境中 sscratch 恒指 HartLocal；入口用 HartLocal scratch 保全临时寄存器，硬件 SPP 是来源的唯一真值：SPP=0 才保存 UserContext，SPP=1 进入 per-hart emergency fatal。返回用户尾部发生同步异常时仍按 S 态 fatal 处理，不存在双 vector 过渡窗口。
 
-入口序列的寄存器纪律：UserContext 保存完成前，进入序列不得触碰任何未保存的用户寄存器——scratch 中转（t5/t6）与来源检查（SPP）都只能使用已保全的寄存器（SPP 检查经已存入 scratch 槽的 t5 中转）。用户 ABI 意义上全部 GPR 跨 ecall 保持（a0/a1 承载返回值除外），用户代码生成有权把活值留在任意寄存器（含 t 系）跨 syscall；违反该纪律的破坏只在使用 release 用户代码时可观测（debug 代码生成不在 ecall 周边把活值留在 t 系寄存器），曾致 release 构建连锁用户态违约与停机失败（调查档案见 `plans/review-2026-08-28-release-trap-entry-x5.md`）。新增进入序列（SDT 首帧保护等）同样受此纪律约束。
+入口序列的寄存器纪律：UserContext 保存完成前，进入序列不得触碰任何未保存的用户寄存器——scratch 中转（t5/t6）与来源检查（SPP）都只能使用已保全的寄存器（SPP 检查经已存入 scratch 槽的 t5 中转）。用户 ABI 意义上全部 GPR 跨 ecall 保持（a0/a1 承载返回值除外），用户代码生成有权把活值留在任意寄存器（含 t 系）跨 syscall；违反该纪律的破坏只在使用 release 用户代码时可观测（debug 代码生成不在 ecall 周边把活值留在 t 系寄存器），曾致 release 构建连锁用户态违约与停机失败（调查档案见 `plans/archived/review-2026-08-28-release-trap-entry-x5.md`）。新增进入序列（SDT 首帧保护等）同样受此纪律约束。
 
 fatal 首帧保存到独立 FatalFrame；递归 guard 防止诊断故障覆盖原始证据。存在 Ssdbltrp 时，首要状态保存期间保留 SDT 的硬件保护，首帧建立后再清 SDT进入软件诊断。
 
