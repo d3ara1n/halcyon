@@ -440,6 +440,15 @@ fn main() {
     let mut fs = Fs::new();
     let mut table = PrefixTable::new();
     assert!(table.mount("/", fs.peer).expect("mount root failed").is_none());
+    // 调试参考：前缀表是 fs 进程的私有状态（无查询 ABI，init 不可见），
+    // 开发期挂载后自打印内部状态。
+    for entry in table.entries() {
+        debug!(
+            "\x1b[36mfs-table\x1b[0m: {} -> directory handle {:#x}",
+            entry.prefix,
+            entry.directory.raw()
+        );
+    }
     let rw = NodeAttributes::READABLE | NodeAttributes::WRITEABLE;
     let rwx = rw | NodeAttributes::EXECUTABLE;
 

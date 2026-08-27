@@ -34,8 +34,10 @@ BOOT_PACKAGE_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
 QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
 # CPU 节流百分比（tools/qemu-throttle.sh）：跑飞/panic 时 QEMU 满核空转的兜底。
-# 1-99 按比例节流；100 = 全速。默认 50，全速需显式 THROTTLE=100。
-THROTTLE := "50"
+# 1-99 按比例节流；100 = 全速。默认 50；自定义经环境变量：
+# `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与
+# --set 均不穿透嵌套子进程，故不用它们传油门）。
+THROTTLE := env_var_or_default("THROTTLE", "50")
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -124,7 +126,7 @@ clean-qemu *args:
 run_qemu_timed +OPTIONS: make_dtb make_boot_package build_kernel
     #!/usr/bin/env bash
     set +e
-    timeout --foreground 4 {{QEMU_LAUNCH}} {{OPTIONS}}
+    timeout --foreground 5 {{QEMU_LAUNCH}} {{OPTIONS}}
     code=$?
     if [ "$code" -eq 124 ]; then
         echo -e "\033[0;33msifive_u: run phase timed out (platform has no shutdown device); verify key log lines above\033[0m"
