@@ -15,7 +15,7 @@ use talc::{
     DefaultBinning,
 };
 
-use crate::{frame, mm, sync::RawSpinlock};
+use crate::{frame, mm, sync::{ranks, RankedRawSpinlock}};
 
 /// 每次扩堆帧块：1 MiB（256 帧）。
 const CHUNK: usize = 1 << 20;
@@ -46,9 +46,11 @@ unsafe impl Source for FrameSource {
     }
 }
 
-/// 全局分配器：talc，锁注入内核自研的 [`RawSpinlock`]，内存源接帧池。
+/// 全局分配器：talc，锁注入带锁序秩的内核自研 [`RankedRawSpinlock`]，
+/// 内存源接帧池。
 #[global_allocator]
-static HEAP: TalcLock<RawSpinlock, FrameSource, DefaultBinning> = TalcLock::new(FrameSource);
+static HEAP: TalcLock<RankedRawSpinlock<{ ranks::HEAP.0 }>, FrameSource, DefaultBinning> =
+    TalcLock::new(FrameSource);
 
 /// 堆供血自检：首次分配触发 FrameSource claim，验证帧池→堆链路与数据完整性。
 pub fn selftest() {

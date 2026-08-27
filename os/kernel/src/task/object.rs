@@ -34,6 +34,13 @@ pub enum ObjectKind {
 }
 
 /// Handle 在对象生命周期中的角色。rights 决定操作，role 决定关系。
+///
+/// 收束公理（close fanout 上界的结构来源）：owner 不可 TRANSIT，
+/// 因此消息内不含容器角色，唯一可 TRANSIT 的角色 close 恒为 O(1)
+/// 叶子操作（不同步排空另一对象容器）。新增 role 时必须维持该
+/// 推导：可 TRANSIT ⟹ close 是叶子；需要级联收束的容器角色只能作
+/// owner 直接 GRANT，或改走 REAPABLE + 有界 drain（见 ideas/object.md
+/// 「收束分层」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleRole {
     JobControl,

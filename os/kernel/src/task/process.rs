@@ -53,8 +53,14 @@ impl ProcessBuilder {
     fn new(process: Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
             header: ObjectHeader::new(),
-            state: crate::sync::Spinlock::new(BuilderState { process: Some(Arc::downgrade(&process)) }),
-            wait: crate::sync::Spinlock::new(ObjectWaitState::new(ObjectSignals::NONE)),
+            state: crate::sync::Spinlock::new(
+                crate::sync::ranks::OBJECT_WAIT,
+                BuilderState { process: Some(Arc::downgrade(&process)) },
+            ),
+            wait: crate::sync::Spinlock::new(
+                crate::sync::ranks::OBJECT_WAIT,
+                ObjectWaitState::new(ObjectSignals::NONE),
+            ),
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -163,7 +169,7 @@ impl ProcessControl {
     pub(crate) fn new(core: &Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
             header: ObjectHeader::new(),
-            state: crate::sync::Spinlock::new(ControlState {
+            state: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, ControlState {
                 wait: ObjectWaitState::new(ObjectSignals::NONE),
                 core: Arc::downgrade(core),
                 dead: None,
@@ -806,6 +812,10 @@ pub fn drain(
         process.lifecycle.mark_dead();
         process.job().remove_member(process.pid);
     }
+    // drain_gate 必须先于 process 强引用释放：complete 分支后 core 可能
+    // 只剩本局部强引用，Process::Drop 的 close 回调链不得发生在 gate
+    // 持有之下（显式 drop，不依赖声明顺序的逆序巧合）。
+    drop(_gate);
     write_drain_result(
         thread,
         output,

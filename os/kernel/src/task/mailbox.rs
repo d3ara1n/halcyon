@@ -80,7 +80,7 @@ impl Mailbox {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             header: ObjectHeader::new(),
-            state: Spinlock::new(MailboxState {
+            state: Spinlock::new(crate::sync::ranks::MAILBOX, MailboxState {
                 // 空箱对 sender 可写；WRITABLE 电平由容量变化维护。
                 wait: ObjectWaitState::new(ObjectSignals::WRITABLE),
                 queue: VecDeque::new(),

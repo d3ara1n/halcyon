@@ -184,7 +184,7 @@ impl HartRegistry {
 
 use crate::sync::Spinlock;
 
-static REGISTRY: Spinlock<Option<HartRegistry>> = Spinlock::new(None);
+static REGISTRY: Spinlock<Option<HartRegistry>> = Spinlock::new(crate::sync::ranks::LEAF, None);
 
 /// boot 构造完成后安装（只能发生一次）。
 pub fn install(registry: HartRegistry) {

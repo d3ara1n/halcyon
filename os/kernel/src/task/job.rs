@@ -97,7 +97,8 @@ pub struct Job {
 }
 
 /// root Job 的内核 static anchor（强持至本次启动结束）。
-static ROOT: crate::sync::Spinlock<Option<Arc<Job>>> = crate::sync::Spinlock::new(None);
+static ROOT: crate::sync::Spinlock<Option<Arc<Job>>> =
+    crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
 
 /// 下一个 JobId（单调不复用；root 恒 1 = 首次分配）。
 static NEXT_JID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -219,19 +220,27 @@ impl Job {
     pub fn root() -> Arc<Self> {
         let mut root = ROOT.lock();
         if root.is_none() {
+            let jid = alloc_jid();
             *root = Some(
                 Arc::try_new(Self {
                     header: ObjectHeader::new(),
-                    jid: alloc_jid(),
+                    jid,
                     parent_jid: 0,
                     parent: None,
-                    state: crate::sync::Spinlock::new(JobInner {
-                        children: Vec::new(),
-                        members: Vec::new(),
-                        sealed: false,
-                        dead: false,
-                    }),
-                    wait: crate::sync::Spinlock::new(ObjectWaitState::new(ObjectSignals::NONE)),
+                    state: crate::sync::Spinlock::chained(
+                        crate::sync::ranks::JOB_INNER,
+                        jid,
+                        JobInner {
+                            children: Vec::new(),
+                            members: Vec::new(),
+                            sealed: false,
+                            dead: false,
+                        },
+                    ),
+                    wait: crate::sync::Spinlock::new(
+                        crate::sync::ranks::OBJECT_WAIT,
+                        ObjectWaitState::new(ObjectSignals::NONE),
+                    ),
                 })
                 .expect("root Job allocation failed"),
             );
@@ -249,13 +258,20 @@ impl Job {
             jid,
             parent_jid,
             parent: Some(Arc::downgrade(parent)),
-            state: crate::sync::Spinlock::new(JobInner {
-                children: Vec::new(),
-                members: Vec::new(),
-                sealed: false,
-                dead: false,
-            }),
-            wait: crate::sync::Spinlock::new(ObjectWaitState::new(ObjectSignals::NONE)),
+            state: crate::sync::Spinlock::chained(
+                crate::sync::ranks::JOB_INNER,
+                jid,
+                JobInner {
+                    children: Vec::new(),
+                    members: Vec::new(),
+                    sealed: false,
+                    dead: false,
+                },
+            ),
+            wait: crate::sync::Spinlock::new(
+                crate::sync::ranks::OBJECT_WAIT,
+                ObjectWaitState::new(ObjectSignals::NONE),
+            ),
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }

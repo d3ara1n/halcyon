@@ -76,6 +76,8 @@ fn rust_start<T: Termination + 'static>(
 /// 按 record 角色分流：boot 进入启动收尾；secondary 等待 Ready 后进调度。
 #[unsafe(no_mangle)]
 extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
+    // tp 已由汇编装配为 HartLocal；ladder 自此切换至 per-hart 帧。
+    crate::sync::ladder::mark_tp_ready();
     if let Err(reject) = csr::formal_entry_baseline() {
         match reject {
             csr::CsrReject::Uxl(readback) => {

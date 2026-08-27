@@ -86,7 +86,7 @@ impl Lifecycle {
     pub(crate) fn building() -> Self {
         Self {
             state: AtomicUsize::new(state_index(ProcessState::Building)),
-            inner: crate::sync::Spinlock::new(LifecycleInner {
+            inner: crate::sync::Spinlock::new(crate::sync::ranks::LIFECYCLE, LifecycleInner {
                 reason: ProcessExitReason::None,
                 code: 0,
                 member: ThreadRecord::Gone,

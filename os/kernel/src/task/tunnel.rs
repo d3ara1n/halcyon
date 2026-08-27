@@ -2,7 +2,7 @@
 //! 是一次性可转移授权。不存在全局 id 或 registry。
 
 use alloc::{sync::{Arc, Weak}, vec::Vec};
-use core::{any::Any, sync::atomic::{AtomicBool, Ordering}};
+use core::{any::Any, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 use erhino_shared::{
     call::SystemCallError,
@@ -46,25 +46,65 @@ enum PeerNotice {
     Invitation(Weak<Invitation>),
 }
 
+/// Endpoint 对本进程 VM 一处外部映射的所有权凭证。release 是唯一解除
+/// 路径：close 显式调用，Drop 兕底——「外部映射在 AddressSpace 收束前
+/// 必已清空」由类型保证（drain 阶段入口的 debug_assert 是复核而非兑底），
+/// 不依赖 close 路径逐点记得 unmap；create/attach 的失败回滚路径随
+/// Endpoint Drop 自动解除映射。
+pub struct MappingLease {
+    owner: Weak<Process>,
+    va: AtomicUsize,
+}
+
+impl MappingLease {
+    fn new(owner: &Arc<Process>, va: usize) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            va: AtomicUsize::new(va),
+        }
+    }
+
+    /// 解除外部映射（幂等；0 = 已解除）。owner 已消散说明地址空间
+    /// 已亡，无处可解。
+    fn release(&self) {
+        let va = self.va.swap(0, Ordering::AcqRel);
+        if va == 0 {
+            return;
+        }
+        if let Some(owner) = self.owner.upgrade() {
+            owner.space.lock().unmap_external(va);
+        }
+    }
+}
+
+impl Drop for MappingLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct Endpoint {
     #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
     connection: Arc<Connection>,
     side: usize,
-    va: usize,
+    lease: MappingLease,
     closed: AtomicBool,
     wait: Spinlock<ObjectWaitState>,
 }
 
 impl Endpoint {
-    fn new(connection: Arc<Connection>, side: usize, va: usize) -> Arc<Self> {
+    fn new(connection: Arc<Connection>, side: usize, owner: &Arc<Process>, va: usize) -> Arc<Self> {
         Arc::new(Self {
             header: ObjectHeader::new(),
             connection,
             side,
-            va,
+            lease: MappingLease::new(owner, va),
             closed: AtomicBool::new(false),
-            wait: Spinlock::new(ObjectWaitState::new(ObjectSignals::NONE)),
+            wait: Spinlock::new(
+                crate::sync::ranks::OBJECT_WAIT,
+                ObjectWaitState::new(ObjectSignals::NONE),
+            ),
         })
     }
 
@@ -89,7 +129,7 @@ impl Endpoint {
         }
     }
 
-    fn close(&self, owner: &Process) {
+    fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -117,7 +157,7 @@ impl Endpoint {
             }
         };
 
-        owner.space.lock().unmap_external(self.va);
+        self.lease.release();
         self.finish_waiters();
         match notice {
             Some(PeerNotice::Endpoint(endpoint)) => {
@@ -184,9 +224,9 @@ impl KernelObject for Endpoint {
         self.wait.lock().unsubscribe(id);
     }
 
-    fn close_handle(&self, role: HandleRole, owner: &Process, _exiting: bool) {
+    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
         debug_assert!(role == HandleRole::TunnelEndpoint);
-        self.close(owner);
+        self.close();
     }
 
     fn close_transit(&self, _role: HandleRole) {
@@ -214,7 +254,10 @@ impl Invitation {
             connection,
             side,
             closed: AtomicBool::new(false),
-            wait: Spinlock::new(ObjectWaitState::new(ObjectSignals::NONE)),
+            wait: Spinlock::new(
+                crate::sync::ranks::OBJECT_WAIT,
+                ObjectWaitState::new(ObjectSignals::NONE),
+            ),
         })
     }
 
@@ -308,13 +351,13 @@ pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCal
     let tracker = frame::alloc_contiguous(1).ok_or(SystemCallError::OutOfMemory)?;
     let pa = tracker.base.addr();
     let connection = Arc::new(Connection {
-        state: Spinlock::new(ConnectionState {
+        state: Spinlock::new(crate::sync::ranks::CONNECTION, ConnectionState {
             pa,
             frame: tracker,
             sides: [SideState::Closed, SideState::Closed],
         }),
     });
-    let endpoint = Endpoint::new(connection.clone(), 0, va);
+    let endpoint = Endpoint::new(connection.clone(), 0, &thread.process, va);
     let invitation = Invitation::new(connection.clone(), 1);
     {
         let mut state = connection.state.lock();
@@ -385,7 +428,7 @@ pub fn attach(
         entry.object().clone()
     };
     let invitation = concrete_invitation(&object)?;
-    let endpoint = Endpoint::new(invitation.connection.clone(), invitation.side, va);
+    let endpoint = Endpoint::new(invitation.connection.clone(), invitation.side, &thread.process, va);
     // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let endpoint_entry = handle::entry(
         Endpoint::object_ref(&endpoint),

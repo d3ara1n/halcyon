@@ -45,8 +45,25 @@ const STACK_WINDOW_SLOT: usize = ENTRIES - 1;
 /// (0x40000 + 2×0x2000) * 8 ≈ 2.13MiB 跨两个单元，余量为扩展预留。
 const WINDOW_LEAF_MAX: usize = 4;
 
+/// 栈物理打包区 `[base, kernel_pa_end)`：debug 防护用，map_stack_window
+/// 发布。phys_to_virt 拒绝栈 PA——栈内存只经 sp/窗口 VA 引用，直映射
+/// 别名绕过 guard 防护（见 impls/mm.md「栈窗口」）。
+static STACK_PA_RANGE: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
 pub fn phys_to_virt(pa: usize) -> usize {
+    debug_assert!(
+        !in_stack_pa_range(pa),
+        "phys_to_virt on kernel stack PA: stack memory must be accessed via the stack-window VA"
+    );
     pa + KERNEL_VA_BASE
+}
+
+fn in_stack_pa_range(pa: usize) -> bool {
+    let (base, end) = (
+        STACK_PA_RANGE.0.load(Ordering::Relaxed),
+        STACK_PA_RANGE.1.load(Ordering::Relaxed),
+    );
+    base != 0 && pa >= base && pa < end
 }
 
 /// VA→PA 全函数：直映射区走线性算术；栈窗口按建表时的槽打包公式
@@ -173,6 +190,13 @@ pub fn init(board: &BoardInfo) {
     let satp = (SV39 << 60) | (virt_to_phys(dir as usize) >> 12);
 
     map_stack_window();
+
+    let layout = stack_layout();
+    STACK_PA_RANGE.0.store(layout.phys_base(), Ordering::Relaxed);
+    STACK_PA_RANGE.1.store(
+        layout.phys_base() + layout.stack_size() * layout.slots(),
+        Ordering::Relaxed,
+    );
 
     KERNEL_SATP.store(satp, Ordering::Release);
     DIRECT_SLOT_COUNT.store(slots, Ordering::Relaxed);

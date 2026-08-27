@@ -36,7 +36,7 @@ impl Notification {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             header: ObjectHeader::new(),
-            state: Spinlock::new(NotificationState {
+            state: Spinlock::new(crate::sync::ranks::NOTIFICATION, NotificationState {
                 wait: ObjectWaitState::new(ObjectSignals::NONE),
                 pending: 0,
                 closed: false,

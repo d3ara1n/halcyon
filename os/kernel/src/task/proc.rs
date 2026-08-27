@@ -936,12 +936,16 @@ impl Process {
             pid,
             parent,
             job,
-            space: crate::sync::Spinlock::new(AddressSpace::new()?),
-            handles: crate::sync::Spinlock::new(super::handle::ProcessHandleTable::new()),
+            space: crate::sync::Spinlock::new(crate::sync::ranks::ADDRESS_SPACE, AddressSpace::new()?),
+            handles: crate::sync::Spinlock::chained(
+                crate::sync::ranks::HANDLE_TABLE,
+                pid,
+                super::handle::ProcessHandleTable::new(),
+            ),
             lifecycle: super::lifecycle::Lifecycle::building(),
-            control: crate::sync::Spinlock::new(None),
-            drain_gate: crate::sync::Spinlock::new(()),
-            drain_cursor: crate::sync::Spinlock::new(1),
+            control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
+            drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
+            drain_cursor: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_CURSOR, 1),
         })
     }
 

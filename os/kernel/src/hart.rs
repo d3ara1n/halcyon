@@ -205,6 +205,20 @@ pub fn current() -> &'static HartLocal {
     unsafe { &*ptr }
 }
 
+/// 从 tp 指针推导槽位索引：不依赖 registry 设置的 `slot` 字段，
+/// boot 期（slot 尚未分配）即可用。tp 不变量保证指针落在
+/// HART_LOCALS 数组内；越界即启动装配错误，立即暴露。
+#[cfg(debug_assertions)]
+pub fn tp_slot() -> usize {
+    let base = core::ptr::addr_of!(HART_LOCALS[0]) as usize;
+    let me = current() as *const HartLocal as usize;
+    debug_assert!(
+        me >= base && me < base + HART_LOCAL_SIZE * HART_NUM_LIMIT,
+        "tp does not point into HART_LOCALS"
+    );
+    (me - base) / HART_LOCAL_SIZE
+}
+
 /// 永久停放当前 hart：SIE 关闭下 wfi 等待。致命错误的终态；
 /// 调度循环的 idle 不走这里（见 sched.rs）。
 pub fn park() -> ! {

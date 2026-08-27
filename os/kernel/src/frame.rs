@@ -45,7 +45,8 @@ impl PoolMemory for PhysAccess {
     }
 }
 
-static POOL: Spinlock<Option<FramePool<PhysAccess>>> = Spinlock::new(None);
+static POOL: Spinlock<Option<FramePool<PhysAccess>>> =
+    Spinlock::new(crate::sync::ranks::POOL, None);
 
 /// 持锁访问帧池（初始化前访问为致命错误）。
 fn with_pool<R>(f: impl FnOnce(&mut FramePool<PhysAccess>) -> R) -> R {

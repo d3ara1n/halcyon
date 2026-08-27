@@ -30,7 +30,7 @@ impl Write for Console {
     }
 }
 
-static CONSOLE: Spinlock<Console> = Spinlock::new(Console::new());
+static CONSOLE: Spinlock<Console> = Spinlock::new(crate::sync::ranks::LEAF, Console::new());
 
 /// 常规格式化输出（持锁，多 hart 安全）。
 pub fn console_write(args: Arguments<'_>) {

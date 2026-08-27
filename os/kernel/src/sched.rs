@@ -65,7 +65,7 @@ pub struct SchedDomain {
 }
 
 static FAIR: FairClass = FairClass {
-    ready: Spinlock::new(VecDeque::new()),
+    ready: Spinlock::new(crate::sync::ranks::LEAF, VecDeque::new()),
 };
 static NEXT_READY_RESERVATION: AtomicU64 = AtomicU64::new(1);
 
@@ -125,7 +125,18 @@ struct DeadlineEntry {
     context: Arc<crate::task::wait::WaitContext>,
 }
 
-static TIMERS: Spinlock<Vec<DeadlineEntry>> = Spinlock::new(Vec::new());
+/// per-hart 期限表：期限主人是登记 hart（唤醒所有权），登记、arm、
+/// 到期扫描与 idle 装填都只碰本 hart 表；唯一跨 hart 访问是静默谓词的
+/// 只读遍历。锁防跨核并行下与该遍历的交错，本 hart 内无争用。
+static HART_TIMERS: [Spinlock<Vec<DeadlineEntry>>; hart::HART_NUM_LIMIT] =
+    [const { Spinlock::new(crate::sync::ranks::LEAF, Vec::new()) }; hart::HART_NUM_LIMIT];
+
+/// 本 hart 的期限表（slot 由 formal entry 设置，调用点均在调度循环或
+/// 其 Park 发布路径内）。
+#[inline]
+fn timers() -> &'static Spinlock<Vec<DeadlineEntry>> {
+    &HART_TIMERS[hart::current().slot()]
+}
 
 /// 等待意图槽取值（HartLocal.park_kind；hart 私有槽无并发）。IPC 两类
 /// 的参数是装箱的内核对象指针（park_arg 携带，发布时回收）。
@@ -146,7 +157,7 @@ pub fn park_request_wait(plan: crate::task::wait::WaitPlan) {
     me.park_kind.store(PARK_WAIT, Ordering::Relaxed);
 }
 
-/// 调度循环 Park 分支调用：消费意图槽，向全局期限表发布等待并 arm。
+/// 调度循环 Park 分支调用：消费意图槽，向本 hart 期限表发布等待并 arm。
 /// 发起 hart 即期限主人（唤醒所有权：立即 arm 自己的 timer）。
 fn park_publish(t: &Arc<Thread>) {
     let me = hart::current();
@@ -170,7 +181,7 @@ pub(crate) fn register_wait_deadline(
     at: u64,
     context: Arc<crate::task::wait::WaitContext>,
 ) -> Result<(), ()> {
-    let mut timers = TIMERS.lock();
+    let mut timers = timers().lock();
     timers.try_reserve(1).map_err(|_| ())?;
     timers.push(DeadlineEntry { at, context });
     drop(timers);
@@ -199,19 +210,20 @@ pub fn ticks_per_sec() -> u64 {
     ticks_per_ms() * 1000
 }
 
-/// 把定时器设到期限表最早期限（表空则不动）。
+/// 把本 hart 定时器设到期限表最早期限（表空则不动）。
 fn arm_earliest() {
-    let timers = TIMERS.lock();
+    let timers = timers().lock();
     if let Some(min) = timers.iter().map(|d| d.at).min() {
         sbi::require(sbi::set_timer(min), "TIME.set_timer");
     }
 }
 
-/// 唤醒全部到期等待者（先收集后完成：锁序单向，期限内不做长工作）。
+/// 唤醒本 hart 期限表中全部到期等待者（先收集后完成：锁序单向，
+/// 期限内不做长工作）。
 fn wake_expired() {
     let now = sbi::read_time();
     let due: Vec<DeadlineEntry> = {
-        let mut timers = TIMERS.lock();
+        let mut timers = timers().lock();
         let (due, rest): (Vec<_>, Vec<_>) = timers.drain(..).partition(|d| d.at <= now);
         *timers = rest;
         due
@@ -312,10 +324,10 @@ pub fn run() -> ! {
     }
 }
 
-/// 量子装填：时间片与期限表最早期限取近（不睡过期）。
+/// 量子装填：时间片与本 hart 期限表最早期限取近（不睡过期）。
 fn arm_quantum() {
     let quantum = sbi::read_time() + QUANTUM_MS * ticks_per_ms();
-    let earliest = TIMERS.lock().iter().map(|d| d.at).min();
+    let earliest = timers().lock().iter().map(|d| d.at).min();
     sbi::require(
         sbi::set_timer(earliest.unwrap_or(quantum).min(quantum)),
         "TIME.set_timer",
@@ -363,7 +375,7 @@ fn idle() {
         sbi::shutdown();
     }
 
-    let earliest = TIMERS.lock().iter().map(|d| d.at).min();
+    let earliest = timers().lock().iter().map(|d| d.at).min();
     match earliest {
         Some(at) => sbi::require(sbi::set_timer(at), "TIME.set_timer"),
         None => sbi::require(sbi::set_timer(DISARM), "TIME.set_timer"),
@@ -389,14 +401,14 @@ fn sip_stip_pending() -> bool {
 }
 
 /// 终端静默：无任何唤醒主人——预期 hart 全部已进 idle（无人能再
-/// 产生工作：enqueue 只来自运行中的 hart）、就绪队列空、期限表空、
-/// 无设备中断使能（当前无设备；接入后设备即主人，谓词自然失效）。
-/// 新增等待源时本谓词必须同步扩展：每种 Waiting 都要有可枚举的主人，
-/// 否则静默误判为停机。IPC 等待者（邮箱/信号）刻意**不**阻止静默：
-/// hart 全 idle 时不存在能投递消息/信号的执行流，等待者永无主人，
-/// 停机即正确终态。
+/// 产生工作：enqueue 只来自运行中的 hart）、就绪队列空、各 hart 期限
+/// 表皆空、无设备中断使能（当前无设备；接入后设备即主人，谓词自然
+/// 失效）。新增等待源时本谓词必须同步扩展：每种 Waiting 都要有可
+/// 枚举的主人，否则静默误判为停机。IPC 等待者（邮箱/信号）刻意**不**
+/// 阻止静默：hart 全 idle 时不存在能投递消息/信号的执行流，等待者
+/// 永无主人，停机即正确终态。
 fn is_quiescent() -> bool {
     IDLE_MASK.load(Ordering::SeqCst) == crate::registry::active_slot_mask()
         && !DOMAIN.has_ready()
-        && TIMERS.lock().is_empty()
+        && HART_TIMERS.iter().all(|t| t.lock().is_empty())
 }

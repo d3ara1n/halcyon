@@ -200,8 +200,8 @@ impl WaitContext {
         }
         Ok(Arc::new(Self {
             core: WaitCore::new(),
-            thread: Spinlock::new(Some(thread)),
-            registrations: Spinlock::new(registrations),
+            thread: Spinlock::new(crate::sync::ranks::LEAF, Some(thread)),
+            registrations: Spinlock::new(crate::sync::ranks::LEAF, registrations),
             action,
         }))
     }
