@@ -205,11 +205,14 @@ _trap_entry:
     csrw    sscratch, t6                    # 锚恢复：正式环境恒 HartLocal，
                                             # 同步异常窗口自此处闭合
     # 来源唯一真值：硬件 SPP。SPP=1 一律 fatal——返回用户尾部的同步异常
-    # SPP 仍为 1，绝无把内核现场解释成 UserContext 的窗口。
-    csrr    t0, sstatus
-    srli    t0, t0, 8
-    andi    t0, t0, 1
-    bnez    t0, _fatal_entry
+    # SPP 仍为 1，绝无把内核现场解释成 UserContext 的窗口。检查经已
+    # 保存的 t5 中转：进入序列在 UserContext 保存前不得触碰任何未保存
+    # 的用户寄存器（曾用 t0 做 SPP 检查，导致每次用户 trap 把用户 x5
+    # 覆写为 SPP 位——release 用户代码把活值存在 t0 跨 ecall 时即触发）。
+    csrr    t5, sstatus
+    srli    t5, t5, 8
+    andi    t5, t5, 1
+    bnez    t5, _fatal_entry
 
     # ---- U 态来源：保存 UserContext ----
     ld      t5, {HL_FRAME_PTR}(t6)
