@@ -16,6 +16,7 @@ use super::{
 
 pub type ProcessHandleTable = HandleTable<ObjectRef, HandleRole>;
 pub type ProcessHandleEntry = Entry<ObjectRef, HandleRole>;
+pub use handle_table::TakeNext;
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 

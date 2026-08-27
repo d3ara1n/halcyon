@@ -20,8 +20,8 @@ pub enum Outcome {
     Completed,
     /// 已登记内核请求，线程转 Waiting，Switch 回调度循环。
     Wait,
-    /// 进程终止（Exit / 致命错误），Switch 后回收。
-    Killed(i64),
+    /// 进程终止（终因已在 lifecycle 冻结），Switch 后回收。
+    Killed,
 }
 
 /// 分发一次系统调用（trap handler 调用）。
@@ -37,7 +37,13 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             debug_print(frame, thread);
             Outcome::Completed
         }
-        SystemCall::Exit => Outcome::Killed(a0 as i64),
+        SystemCall::Exit => {
+            thread
+                .process
+                .lifecycle
+                .request_termination(erhino_shared::proc::ProcessExitReason::Exited, a0 as i64, true);
+            Outcome::Killed
+        }
         SystemCall::JobCreate => {
             respond_result(
                 frame,
@@ -57,7 +63,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 task::process::create(
                     thread,
                     Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
                 )
                 .map(|_| 0),
             );
@@ -98,6 +105,44 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                     thread,
                     Handle::from_raw(frame.x[10]),
                     frame.x[11] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessQuery => {
+            respond_result(
+                frame,
+                task::process::query(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessKill => {
+            match task::process::kill(thread, Handle::from_raw(frame.x[10]), frame.x[11] as i64) {
+                Ok(task::process::KillOutcome::Accepted) => {
+                    respond_ok(frame, 0);
+                    Outcome::Completed
+                }
+                // 自杀式调用不返回用户态；终因已在 lifecycle 冻结。
+                Ok(task::process::KillOutcome::TerminatedCaller) => Outcome::Killed,
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
+        }
+        SystemCall::ProcessDrain => {
+            respond_result(
+                frame,
+                task::process::drain(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as u32,
                     frame.x[12] as usize,
                 )
                 .map(|_| 0),

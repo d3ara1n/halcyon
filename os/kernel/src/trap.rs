@@ -65,6 +65,14 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
     let frame = unsafe { &mut *frame };
     let thread = hart::current().current_thread();
 
+    // 终止吸收：kill 先行冻结终因后，目标线程在任何 trap 入口都不再
+    // 返回用户态（IPI 到达、量子耗尽、异常均在此汇合）。
+    if let Some(t) = thread {
+        if t.process.lifecycle.is_terminating() {
+            return Outcome::Killed as usize;
+        }
+    }
+
     let is_interrupt = scause >> 63 == 1;
     let code = scause & !(1 << 63);
 
@@ -74,10 +82,7 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
             match syscall::dispatch(frame, t) {
                 syscall::Outcome::Completed => Outcome::Resume as usize,
                 syscall::Outcome::Wait => Outcome::Park as usize,
-                syscall::Outcome::Killed(code) => {
-                    sched::report_exit(t, code);
-                    Outcome::Killed as usize
-                }
+                syscall::Outcome::Killed => Outcome::Killed as usize,
             }
         }
         (true, STIP) => {
@@ -96,7 +101,7 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
         }
         (false, _) => {
             // 用户态同步异常一律终止进程（notes/impls/task.md「生命周期」）；
-            // 不以裸编号匹配中断语义（TRAP-004）。
+            // 不以裸编号匹配中断语义（TRAP-004）。终因经稳定编码冻结。
             let pid = thread.map(|t| t.process.pid).unwrap_or(0);
             warn!(
                 Task,
@@ -107,7 +112,12 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
                 frame.sepc
             );
             if let Some(t) = thread {
-                sched::report_exit(t, -(code as i64));
+                let fault = erhino_shared::proc::ProcessFaultCode::from_scause(code);
+                t.process.lifecycle.request_termination(
+                    erhino_shared::proc::ProcessExitReason::Fault,
+                    fault as i64,
+                    true,
+                );
             }
             Outcome::Killed as usize
         }

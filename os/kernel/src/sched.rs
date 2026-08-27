@@ -14,7 +14,7 @@ use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use crate::sync::Spinlock;
 use crate::{hart, mm, sbi, trap::{self, Outcome}};
 use crate::sbi::DISARM;
-use crate::task::{table, Thread};
+use crate::task::Thread;
 
 /// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/impls/task.md）。
 pub trait SchedClass: Sync {
@@ -252,15 +252,6 @@ pub fn domain_has_ready() -> bool {
     DOMAIN.has_ready()
 }
 
-/// 记录退出码（Exit / 异常终止共用；回收时随统计打印）。
-pub fn report_exit(t: &Thread, code: i64) {
-    // 死亡即刻归一到内核地址空间（mm::normalize_satp）：此刻进程 root
-    // 仍完整，静态读取安全；此后 teardown/调度不得再依赖该 root——
-    // AddressSpace::drop 会剥离内核顶层项，滞留其下任何 TLB miss 即 fatal。
-    mm::normalize_satp();
-    *t.exit_code.lock() = Some(code);
-}
-
 // ---------------------------------------------------------------------------
 // 调度循环（每 hart 常驻，见 notes/impls/internals.md「trap 帧与上下文」）
 // ---------------------------------------------------------------------------
@@ -278,6 +269,11 @@ pub fn run() -> ! {
             idle();
             continue;
         };
+        // lifecycle gate：Terminating 线程不进用户态（惰性撤销）。
+        if !t.process.lifecycle.enter_running(me.slot()) {
+            reap(t);
+            continue;
+        }
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         t.switches.fetch_add(1, Ordering::Relaxed);
         arm_quantum();
@@ -289,11 +285,28 @@ pub fn run() -> ! {
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
         let outcome = unsafe { trap::ret_to_user() };
         me.clear_context();
+        // 非-Resume 出口统一先归一内核 satp（含全量 SFENCE.VMA），再处置
+        // 线程：active 位图与后续 teardown 不得在目标地址空间上进行。
+        mm::normalize_satp();
+        let slot = me.slot();
         match outcome {
-            Outcome::Requeue => FAIR.enqueue(t),
-            Outcome::Killed => reap(t),
+            Outcome::Requeue => {
+                t.process.lifecycle.on_requeue(slot);
+                if t.process.lifecycle.is_terminating() {
+                    reap(t);
+                } else {
+                    FAIR.enqueue(t);
+                }
+            }
+            Outcome::Killed => {
+                t.process.lifecycle.clear_active(slot);
+                reap(t);
+            }
             // 已离开执行点，此刻发布等待：完成方可安全触达该线程。
-            Outcome::Park => park_publish(&t),
+            Outcome::Park => {
+                t.process.lifecycle.clear_active(slot);
+                park_publish(&t);
+            }
             Outcome::Resume => unreachable!("Resume never passes through the scheduling loop"),
         }
     }
@@ -309,31 +322,25 @@ fn arm_quantum() {
     );
 }
 
-/// 回收退出线程：摘进程表 → 打统计 → drop 链释放地址空间（表帧/数据帧 RAII）。
-///
-/// 此刻线程不在任何容器、无其他 hart 能触达——本 hart 独占，无需额外锁。
+/// 回收终止线程：先 drop 线程强引用（REAPABLE 严格晚于最后一个容器
+/// 引用释放），再离场确认（全部离场则 REAPABLE 持续发布）。Dead 只由
+/// 管理者 ProcessDrain 的 Complete 分支发布（资源屏障语义）。
 fn reap(t: Arc<Thread>) {
-    let pid = t.process.pid;
-    let Some(process) = table::remove(pid) else {
-        panic!("exited pid {} not in process table", pid);
-    };
-    let exit = *t.exit_code.lock();
-    let control = process.take_control();
+    let process = t.process.clone();
+    let pid = process.pid;
+    let switches = t.switches.load(Ordering::Relaxed);
     let now = sbi::read_time();
     let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
+    drop(t);
+    crate::task::process::confirm_departure(&process);
     log!(
         Task,
-        "pid {} reaped: exit={:?}, {} switches, lifespan {} ms",
+        "pid {} reaped: {} switches, lifespan {} ms",
         pid,
-        exit,
-        t.switches.load(Ordering::Relaxed),
+        switches,
         elapsed_ms
     );
-    drop(t);
-    drop(process); // 地址空间与 HandleTable teardown 完成后才发布终态
-    if let Some(control) = control {
-        control.finish(exit.unwrap_or(-1));
-    }
+    drop(process);
 }
 
 /// idle：登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→ wfi。

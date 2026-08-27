@@ -149,7 +149,7 @@ pub enum WaitOutcome {
     Deadline,
     #[expect(dead_code, reason = "显式取消 ABI 接入后使用")]
     Cancelled,
-    #[expect(dead_code, reason = "多线程 kill/exit 清理接入后使用")]
+    /// 终止取消：线程不回用户态，随上下文消散（kill/abandonment 路径）。
     Abandoned,
 }
 
@@ -243,6 +243,12 @@ impl WaitContext {
             if !matches!(outcome, WaitOutcome::Abandoned) {
                 self.deliver(&thread, outcome);
                 sched::enqueue(thread);
+            } else {
+                // 终止取消：线程永不回用户态，随本上下文消散；
+                // 离场确认与 REAPABLE 电平由 process 侧统一发布。
+                let process = thread.process.clone();
+                drop(thread);
+                super::process::confirm_departure(&process);
             }
         }
         self.core.mark_done();
@@ -290,7 +296,9 @@ impl WaitContext {
     }
 }
 
-/// 调度循环在线程离开执行点后安装一次 WaitMany。
+/// 调度循环在线程离开执行点后安装一次 WaitMany：Waiting 记录与
+/// 可取消性在 lifecycle 锁内线性化；已 Terminating 则不发布等待，
+/// 直接以 Abandoned 取消（线程不回用户态）。
 pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
     let context = match WaitContext::new(thread, plan.action, plan.items.len()) {
         Ok(context) => context,
@@ -299,6 +307,15 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
             return;
         }
     };
+    {
+        let process = context_thread_process(&context);
+        if !process.lifecycle.park_waiting(&context) {
+            if context.offer(WaitOutcome::Abandoned) == wait_context::OfferResult::Complete {
+                finish_offered(context);
+            }
+            return;
+        }
+    }
 
     if let Some(deadline) = plan.deadline {
         if sched::register_wait_deadline(deadline, context.clone()).is_err() {
@@ -351,6 +368,17 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
             // offer 方已取得完成权并负责清理/交付。
         }
     }
+}
+
+/// 安装中的上下文必持有发起线程；取其进程引用做 lifecycle 线性化。
+fn context_thread_process(context: &Arc<WaitContext>) -> alloc::sync::Arc<super::proc::Process> {
+    context
+        .thread
+        .lock()
+        .as_ref()
+        .expect("installing context holds its thread")
+        .process
+        .clone()
 }
 
 /// 将 WaitResult 写回用户现场并推进 sepc；写回失败则携带错误返回。

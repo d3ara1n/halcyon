@@ -118,6 +118,18 @@ pub fn alloc_contiguous(count: usize) -> Option<FrameTracker> {
     with_pool(|p| p.alloc_contiguous(count)).map(|base| FrameTracker { base, count })
 }
 
+/// 有界归还一步（drain 用）：每调用至多 `budget` 步链扫描；完成返回
+/// (消耗步数, true)，预算耗尽持久化游标返回 (budget, false)。游标跨
+/// 调用复用，恢复时 O(1) 校验，失效则从链头重启。
+pub fn dealloc_step(
+    base: page_table::FrameNumber,
+    count: usize,
+    scan: &mut frame_pool::FreeScan,
+    budget: usize,
+) -> (usize, bool) {
+    with_pool(|p| p.dealloc_bounded(base, count, scan, budget))
+}
+
 /// 归还一段页对齐物理区间（bootstrap 回收用；区间必须此前被剔除）。
 pub fn free_range(start_pa: usize, end_pa: usize) {
     assert!(start_pa % PAGE_SIZE == 0 && end_pa % PAGE_SIZE == 0 && start_pa < end_pa);

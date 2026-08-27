@@ -6,7 +6,7 @@ use erhino_shared::{
     object::Rights,
 };
 
-use crate::{frame, mm, sched, task, task::table};
+use crate::{frame, mm, sched, task};
 
 const PAGE_SIZE: usize = task::proc::PAGE_SIZE;
 
@@ -26,20 +26,19 @@ pub fn load(address: usize, length: usize) {
         "BootPackage runtime length differs from inspected envelope"
     );
     let image = elf::parse(package.initial_elf).expect("BootPackage initial ELF is invalid");
-    let pid = table::alloc_pid();
+    let pid = task::alloc_pid();
     assert_eq!(pid, 1, "initial process must receive PID 1");
     let root_job = task::job::Job::root();
-    let root_job_object = task::job::Job::object_ref(&root_job);
     let spawned = task::spawn_from_elf(
         pid,
         0,
-        root_job_object.clone(),
+        root_job.clone(),
         &image,
         package.initial_elf,
     )
     .expect("initial process image cannot be constructed");
     let root_control = task::handle::entry(
-        root_job_object,
+        task::job::Job::object_ref(&root_job),
         task::object::HandleRole::JobControl,
         Rights::CREATE
             | Rights::MANAGE
