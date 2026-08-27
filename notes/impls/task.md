@@ -33,9 +33,9 @@
 - **调度域**：一组能力兼容且策略相同的 hart 共享的调度类层次，hart 经 HartLocal 指向所属域。硬件 capability 是准入事实，domain 是 capability 与调度策略的派生对象；能力需求不是调度 class。线程只归属一个 compatible domain，跨域迁移显式转移队列所有权。域内类按优先级序查询，先到先得。
 - **调度类**：一类线程的就绪容器 + 选择策略。实现整体可替换（轮转队列 / 无锁队列 / 窃取），加优先级类 = 向域的类数组插项——扩展是横向加项，不改结构。
 
-时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取全局期限表最早项与量子截止的较近者设置本 hart timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
+时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart 期限表最早项与量子截止的较近者设置本 hart timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
-ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。当前没有代码代次与 active-hart 集合，因此调度循环在每次新 dispatch 前执行本 hart `fence.i`；首次执行和迁移都不会观察帧复用前的旧指令缓存。Running process 没有 Building 写入口，Resume 热路径无需重复同步。
+ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。当前没有代码代次与 active-hart 集合，因此调度循环在每次新 dispatch 前执行本 hart `fence.i`；首次执行和迁移都不会观察帧复用前的旧指令缓存。Running process 没有 Building 写入口，Resume 热路径无需重复同步。替换为代码代次检查的触发条件：dispatch 路径的 fence.i 开销实测可见，或 active-hart 集合随多线程终止屏障落地而建立（目标态见 execution-context.md）。
 
 ### 单一归属不变量
 
@@ -45,7 +45,7 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。当�
 某类队列（Ready） ｜ 某 hart 的 current（Running） ｜ 无容器（Waiting/Dead）
 ```
 
-容器成员资格是状态真值，`Thread.state` 只是镜像；全部转换经调度器入口（`enqueue` / `pick` / `wake`）在锁内完成，锁序单向：期限表锁 → 类锁。
+容器成员资格是状态真值，`Thread.state` 只是镜像；全部转换经调度器入口（`enqueue` / `pick` / `wake`）在锁内完成；期限表与类队列均为无嵌套边的叶子锁（Lock Ladder LEAF 段）。
 
 ## 线程状态
 
@@ -177,40 +177,55 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
   ProcessControl、JobControl、ProcessBuilder）的 close_transit 均为
   叶子（no-op / O(1) abandon / O(1) 解除外部映射 + 对端信号），无同步
   递归 drain 另一容器的路径——单次 close 的成本是 ≤ ~130 步的固定
-  常数，不随进程状态增长。**新增可 transit 的容器 role 时必须重审
-  此证明**（任何在 close_transit 中同步排空另一对象容器的角色都会
-  破坏该固定上界，需改为有界 continuation）。
+  常数，不随进程状态增长。上界的结构来源是收束分层公理（ideas/
+  object.md「收束分层」）：可 TRANSIT ⟹ close 恒叶子，需要级联收束的
+  容器角色只能作 owner 直接 GRANT 或改走有界 drain；新增 role 时按
+  公理分类，无需重审枚举。
 - **用户态页故障一律杀进程**：本内核无按需分配，所有区域创建时显式
   映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）
   后走终止路径，绝不 panic 内核。
 
-### 锁序契约（顶级）
+### 锁序契约（Lock Ladder）
 
-顶级锁序规范：**Job 链锁（先父后子，≤32 把）→ lifecycle 锁 → 其他
-对象锁**。三类锁的共同纪律是「锁内不出游」：
+锁序由 Lock Ladder 运行时断言强制（`os/kernel/src/sync.rs` 的 `ranks`
+表，debug 构建）：每把锁在构造点声明 rank，获取时断言 per-hart 秩栈
+单调——新秩须大于栈顶，或同秩且链段 key 严格递增；违规即 panic
+（经 RawWriter，不依赖堆与锁）。release 构建零开销。bootstrap 期
+（tp 未建立，单核）使用专用帧，formal entry 汇合点切换至 per-hart 帧。
 
-- **Job 链锁（JobInner）**：只在链锁内改成员/子表与 sealed/dead 位；
-  ProcessStart 提交闸门在同一链锁临界区内嵌套调用 lifecycle 线性化
-  （锁序允许方向）。CLOSED 发布与完成传播在 JobInner 锁外执行（对象
-  wait 锁不与 JobInner 锁嵌套），传播逐级放子锁取父锁，无反向嵌套。
-  链锁按 root→owner 顺序获取；完成传播/单点操作（seal、摘除）只持
-  单把锁，不构成环。
-- **lifecycle 锁**：不在锁内调用 subscribe/unsubscribe、offer/finish、
-  enqueue、IPI、对象 close callback、uaccess 或页表操作——这些动作经
-  TerminationTodo 在解锁后执行；不在锁内获取任何其他锁（对象锁、
-  WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁、Job 锁）。
-  反向的单向嵌套——在其他锁内进入 lifecycle（如 ProcessControl 快照
-  在 shell state 锁内调 lifecycle 快照，或 Job 链锁内调 begin_running）
-  ——因 lifecycle 不出游而安全，不构成环，属合法调用序。
-- **对象锁**：JobControl/ProcessControl 的 wait 与 state 锁只做电平发布
-  与快照，不反向进入 Job/lifecycle 锁（JobInner 锁内不碰对象锁，
-  发布点全部在锁外）。
+秩分配（数字唯一真值在 `sync::ranks`，此处列序即序）：
 
-已知合法嵌套（穷举）：HandleTable 锁内经 JobCreate/ProcessCreate 的
-发布回调进入 JobInner 锁（层级提交在 table.commit 前，无反向路径：
-链锁路径不碰任何 HandleTable 锁）；ProcessStart 链锁内进入 lifecycle
-锁。
+| rank | 锁 | 链段 key |
+|---|---|---|
+| DRAIN_GATE | 收束批次仲裁，一次性覆盖最广，恒最先 | — |
+| DRAIN_CURSOR | HandleTable 收束游标 | — |
+| HANDLE_TABLE | caller→child 嵌套 | pid 递增 |
+| LEAF | CONSOLE、REGISTRY、ROOT anchor、就绪队列、per-hart 期限表、WaitContext 两锁 | — |
+| JOB_INNER | Job 链锁（≤32 把同持） | jid 递增 |
+| MAILBOX / CONNECTION | 对象状态锁 | — |
+| ADDRESS_SPACE | 用户地址空间 | — |
+| NOTIFICATION | 唯一以 space 为外层的对象锁边 | — |
+| OBJECT_WAIT | Job.wait、ProcessControl、Endpoint/Invitation、ProcessBuilder、Process.control 回指槽 | — |
+| LIFECYCLE | 生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入） | — |
+| HEAP | talc（RankedRawSpinlock 类型级注入；几乎被全部容器锁内获取，故置顶） | — |
+| POOL | 物理帧池（HEAP 与空间锁的内层） | — |
+
+三类锁的共同纪律「锁内不出游」不变：lifecycle 的出游动作经 TerminationTodo
+解锁后执行；对象电平发布在锁外 finish_waiters；close 回调在表锁释放
+后执行；drain 完成分支显式先释放 drain_gate 再让 process 强引用
+消亡（close 回调链不进 gate 持有区）。新增锁在构造点声明 rank 即受
+断言保护；需要同秩多持的锁用 `Spinlock::chained` 声明单调 key
+（Job 链锁 = jid、HandleTable 嵌套 = pid）。
+
+### reserve/commit/rollback 协议
+
+Job 成员表/子表、HandleTable 槽位与公平类就绪队列三处的 marker 事务
+遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
+凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
+不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；
+④全部在容器锁内完成，无分配失败路径。第四处出现该模式时评估共享
+骨架；StartupBlock 的逆序 unmap 属线性撤销，是合理差异。
 
 ## sleep
 
-第一个异步系统调用（模型见 [`call.md`](call.md)），用于验证整条异步通路：ms > 0 时登记期限后线程转 Waiting；期限到达由 timer 唤醒 `wake()` 回 Ready，sret 后 a0 = NoError。期限表全局共享，登记时由发起 hart 立即 arm 自己的 timer（唤醒所有权，见 `internals.md`）。
+第一个异步系统调用（模型见 [`call.md`](call.md)），用于验证整条异步通路：ms > 0 时登记期限后线程转 Waiting；期限到达由 timer 唤醒 `wake()` 回 Ready，sret 后 a0 = NoError。期限表 per-hart（`sched::HART_TIMERS[slot]`）：登记、arm、到期扫描都只碰本 hart 表，发起 hart 即期限主人（唤醒所有权，见 `internals.md`）；唯一跨 hart 访问是静默谓词的只读遍历。

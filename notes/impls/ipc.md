@@ -39,7 +39,7 @@ Receive 预留目标 slots、以 token 独占队头、完整写回后 commit；�
 
 ## Tunnel 与 Runnel
 
-`os/kernel/src/task/tunnel.rs` 不含全局 registry。Connection 持共享帧与双方状态；Endpoint 持本进程 VA lease，Invitation 是 affine capability。Invitation 支持 TRANSIT/GRANT，Endpoint 两者均不支持。Attach 在 HandleTable→Connection→AddressSpace 锁序下原子消费 invitation 并安装 Endpoint。
+`os/kernel/src/task/tunnel.rs` 不含全局 registry。Connection 持共享帧与双方状态；Endpoint 持本进程 VA lease（`MappingLease` RAII 凭证：release 是唯一解除路径，close 显式调用、Drop 兕底——外部映射在 AddressSpace 收束前必已清空由类型保证，create/attach 失败回滚随 Drop 自动解除），Invitation 是 affine capability。Invitation 支持 TRANSIT/GRANT，Endpoint 两者均不支持。Attach 在 HandleTable→Connection→AddressSpace 锁序下原子消费 invitation 并安装 Endpoint。
 
 `user/frameworks/librunnel` 使用对齐 AtomicU32、Release/Acquire、shadow 游标验证与检查—确认门铃—重查—WaitMany 闭环。格式错误和对端异常关闭永久进入 Broken。
 

@@ -15,7 +15,7 @@
 
 ### 异步调用
 
-处理即登记：内核接受请求、登记**内核请求**（KernelRequest：等待对象 + 期限 + 完成动作），线程转 Waiting（不回用户态），Switch 回调度循环。内核不等待——立即执行其他线程。
+处理即登记：内核接受请求、登记**内核请求**（KernelRequest：等待对象 + 期限 + 完成动作），线程转 Waiting（不回用户态），Switch 回调度循环。内核不等待——立即执行其他线程。KernelRequest 是概念名，落地结构是 `WaitContext`（`os/kernel/src/task/wait.rs`）：三要素分别对应 `registrations`（订阅集）、`WaitPlan.deadline`（期限表登记）与 `WaitAction`（完成动作，`deliver` 据此写回 TrapFrame）。
 
 请求完成时（对端投递、期限到达、跨核回调），`wake()` 将线程直接回 Ready；结果已写入其 TrapFrame，sret 回用户态即拿到结果，无中间状态、无重入重试。
 

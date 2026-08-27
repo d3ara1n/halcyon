@@ -23,6 +23,16 @@
 
 - [ ] fs 真路径验收达成后，一次性修订 object/message/startup/task 等 ideas 与对应 impls（核查是否已随各批提交同步完成）。
 
+## 来源 [`review-2026-08-27-mechanism-generalization.md`](review-2026-08-27-mechanism-generalization.md)
+
+机制层设计 review（特例补丁与可泛化机制）的未闭合承接项：
+
+- [x] **Lock Ladder**：已落地（2026-08-27）——`sync::ranks` 秩表 + per-hart 秩栈断言（同秩链段 key 递增：Job 链锁 jid、HandleTable pid）；bootstrap 专用帧经 formal entry 汇合点切换；talc 经 `RankedRawSpinlock` 类型级注入。锁序契约已按实测重写（impls/task.md），全负载 debug 构建验证无违规。
+- [x] **收束分层公理 + role 叶子公理**：已落地（2026-08-27）——ideas/object.md 新增「收束分层」节，object.rs role 注释同步；close fanout 上界由公理推导而非枚举重审。
+- [x] **MappingLease / StackVA**：已落地（2026-08-27）——`MappingLease` RAII 凭证（release 唯一解除路径，close 显式 + Drop 兕底，create/attach 失败回滚自动解除）；`phys_to_virt` debug 断言拒绝栈物理打包区。
+- [x] reserve/commit/rollback 协议成文（impls/task.md「reserve/commit/rollback 协议」）；第四处出现时评估共享骨架。
+- [x] TIMERS per-hart 化已落地；锁优化判据成文（impls/internals.md「全局状态分层」）。
+
 ## 来源 [`review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)
 
 - [x] **F4 Job「预算」**：已处理（2026-08-27 Job 管理面设计拍板）——ideas/task.md 补一句话契约（域内成员资源总量上限记账，接入时点待需求出现），Job ABI 不含预算面。

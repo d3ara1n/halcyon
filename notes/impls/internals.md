@@ -8,11 +8,11 @@
 
 | 层 | 归属 | 访问方式 | 典型内容 |
 |---|---|---|---|
-| hart 私有 | 单个 hart | tp 指针，无锁 | 执行点（当前线程、域指针、trap 锚）、hart 状态 |
+| hart 私有 | 单个 hart | tp 指针，无锁 | 执行点（当前线程、域指针、trap 锚）、hart 状态、per-hart 期限表 |
 | 对象私有 | 进程/线程 | 所属对象的锁、Arc 引用计数 | 内存布局、邮箱、子进程列表 |
-| 全局 | 全系统 | `OnceLock` + Spinlock 粗锁 | 进程表、调度域、期限表、帧分配器 |
+| 全局 | 全系统 | `OnceLock` + Spinlock 粗锁 | 调度域、帧分配器、PID/JobId 分配器 |
 
-冷路径的一把大锁在本系统规模（4-5 hart）下争用可忽略；无锁结构（slot array、RCU 等）只在争用真实出现后才值得引入。
+冷路径的一把大锁在本系统规模（4-5 hart）下争用可忽略；无锁结构（slot array、RCU 等）只在争用真实出现后才值得引入。锁优化判据：就绪队列 per-hart 化（+偷取）与 HandleTable 读路径无锁化的评估触发条件是实测 dispatch/IPC 争用可见或核数增长到两位数；期限表已 per-hart 化（唤醒所有权的结构化）。公平类全局单锁 FIFO 是「公平性靠结构性质」的最纯实现，不为理论争用放弃。
 
 就绪队列不在 hart 私有层——它是调度域的共享容器（结构见 `task.md`「调度」），同域 hart 经域容器锁竞争；队列结构与策略封装在调度类内可替换。
 
@@ -39,7 +39,7 @@ DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只�
 
 **每个唤醒必须有主人，无主的周期性唤醒（保险 timer、心跳）不存在。** hart 敢睡，当且仅当「自己的期限已上闹钟，或别人的请求会按门铃」：
 
-- **timer = 自己的确定期限**：只有存在特定、确定的期限（时间片、sleep）时才 `set_timer` 后入睡，不会睡过头。期限的主人负责登记时立即 arm 自己的 timer；期限登记不跟随线程迁移。
+- **timer = 自己的确定期限**：只有存在特定、确定的期限（时间片、sleep）时才 `set_timer` 后入睡，不会睡过头。期限表 per-hart：登记、arm、到期扫描都只碰本 hart 表，发起 hart 即期限主人；期限登记不跟随线程迁移。
 - **IPI = 他方的请求**：门铃语义（SBI `send_ipi` 无载荷，仅置目标核 SSIP）。发请求的一方必然醒着——睡着的一方发不出请求，逻辑上排除全员睡死。
 - **设备中断 = 设备的请求**：主人是设备（中断接入后生效）。
 
@@ -93,12 +93,11 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 ## 锁原语
 
-内核自研 Spinlock：原子 CAS 争用（acquire 成功路径 Acquire、release Release，内存序由原子语义背书），持有期间关本地中断（sstatus.SIE 清零）。关中断是正确性要求而非优化——中断处理函数若获取本 hart 正持有的锁，同核死锁。
+内核自研三件：
 
-Spinlock 包装为 `lock_api::RawMutex`，同一实现注入两处：
-
-- talc 堆分配器（TalcLock），堆分配纳入统一的中断纪律
-- 全局容器（`OnceLock<Spinlock<T>>`）
+- **`RawSpinlock`**：CAS 自旋原语（acquire 成功路径 Acquire、release Release，内存序由原子语义背书），无中断语义，是下面两者的内部实现；
+- **`Spinlock<T>`**：内核容器锁，获取期间关本地中断（sstatus.SIE 清零）。关中断是正确性要求而非优化——中断处理函数若获取本 hart 正持有的锁，同核死锁；构造点声明锁序 rank 参与 Lock Ladder 断言（机制与秩表见 `task.md`「锁序契约」）；
+- **`RankedRawSpinlock<const RANK>`**：实现 `lock_api::RawMutex`，供 talc 注入（TalcLock 控制实例化，秩只能走 const 泛型），trait 路径同样参与断言。
 
 睡眠锁与协作式定性不相容（内核无挂起的执行流，见「内核中断模型」）；长等待的表达方式是异步 syscall，不是内核睡眠。
 
@@ -111,6 +110,6 @@ Spinlock 包装为 `lock_api::RawMutex`，同一实现注入两处：
 
 理由：帧与小对象生命周期模式不同，分层使碎片域独立、锁独立；这也是 Linux（buddy+slab）的通行分层。堆→帧池单向依赖（不逆向），彻底消除帧池元数据碰堆的运行时环。
 
-## 进程表
+## 进程容器与 PID
 
-`ProcessTable` 封装 `OnceLock<Spinlock<BTreeMap<Pid, Arc<Process>>>>`，只暴露 get/insert/remove。pid 由 `AtomicU64` 单调递增分配，不复用。内部实现可替换（如 slot array），调用方无感。
+全局进程表已退役：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 由 `AtomicU64` 单调分配器分配、不复用，只作 provenance 诊断与 JobDerive 的派生选择子，不再充当任何容器键。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。

@@ -32,7 +32,7 @@ Handle 区直接保存 child HandleTable reservation 产生的真实值，不允
 1. 解析 initial ELF，创建 pid 1 的 AddressSpace；
 2. 创建 root Job，并为 init 生成完整 JobControl；
 3. 以实际 child Handle 构造页对齐 StartupBlock prefix；
-4. prefix 使用 owned 只读页，BootPackage payload 使用 borrowed `U|R|A` PTE，二者组成连续用户 VA 块；
+4. prefix 使用 owned 只读页，payload 以 BootPackage 保留区帧直接映射 `U|R|A` PTE（映入即收编为该地址空间的 owned backing），二者组成连续用户 VA 块；
 5. 预构造主线程、插入进程表并 enqueue。
 
 initial ELF 复制完成且 StartupBlock prefix 构造后，`[package base, payload_pa)` 页对齐前缀立即回投帧池；payload 页在映入 init 时即收编为该地址空间的 owned backing，随地址空间销毁自然归还帧池——无 pid 特判、无启动保留洞滞留。最后一页可见尾部来自 packer 的零 padding，不可写、不可执行。
@@ -54,14 +54,14 @@ initial ELF 复制完成且 StartupBlock prefix 构造后，`[package base, payl
 1. 拷入 descriptor、payload 与 grants；
 2. reserve child Handle slots，以真实 Handle 构造并映射 StartupBlock；
 3. 预构造 ProcessControl、主线程 Arc；
-4. 在进程表和 ready queue 放入不可见 reservation marker；
+4. 在公平类就绪队列放入不可见 reservation marker；
 5. reserve 调用者输出 slot，并在同一 HandleTable 锁下复检、原子 extract GRANT entries。
 
 提交区只做已预留结构的替换、builder 消费、Handle commit、输出写回、ProcessControl 绑定与 ready marker 发布，不再分配。此前任一步失败都会回滚 StartupBlock、两类 marker、Handle reservations；调用者 grants 与 builder 保持原值。
 
-进程表使用 PID 单调不复用的 Vec 容器；reservation marker 对查找与回收不可见。公平类队列同样用 marker 预留容量，`pick` 跳过 marker，`has_ready` 不把 marker 视为 runnable，因此不改变 FIFO 或静默判定。
+未 Dead 进程的生命周期根是 Job 直接成员表（ProcessCreate 的 marker 即落在该表）；PID 由全局单调分配器分配、不复用。公平类队列同样用 marker 预留容量，`pick` 跳过 marker，`has_ready` 不把 marker 视为 runnable，因此不改变 FIFO 或静默判定。
 
-当前 ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；显式 ProcessKill、exit-status 查询与 JobKill 尚未接入，留给完整进程终止/多线程屏障阶段。D64 profile 在调度域 eligibility 接线前明确返回 NotSupported。
+ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；异步幂等 ProcessKill、固定宽 ProcessQuery、REAPABLE 电平与有界 ProcessDrain 已接入；递归 JobKill 由用户态管理者经 JobSeal、分页枚举、JobDerive 与 ProcessKill 组合（公共实现在 `libprocess::job_kill`）。D64 profile 在调度域 eligibility 接线前明确返回 NotSupported。
 
 ## 用户态公共 loader
 
