@@ -181,6 +181,60 @@ impl<M: PoolMemory> FramePool<M> {
         self.free_frames += count;
     }
 
+    /// 有界归还：每调用至多消耗 `budget` 步链扫描定位插入位，找到后执行
+    /// O(1) 插入并返回 `(消耗步数, true)`；预算耗尽则持久化游标并返回
+    /// `(budget, false)`，下次续扫。游标恢复前 O(1) 校验邻接
+    /// （prev.next == cur / head == cur）；他方归还使其失效时从链头重启，
+    /// 本次仍受 budget 约束。完成插入计 1 步（保证每调用进展 ≥1）。
+    pub fn dealloc_bounded(
+        &mut self,
+        base: FrameNumber,
+        count: usize,
+        scan: &mut FreeScan,
+        budget: usize,
+    ) -> (usize, bool) {
+        debug_assert!(count > 0 && budget > 0, "zero-budget bounded dealloc");
+        let (mut prev, mut cur) = if scan.started {
+            let valid = match (scan.prev, scan.cur) {
+                (Some(p), Some(c)) => self.mem.read_meta(p).next_frame() == Some(c),
+                (Some(p), None) => self.mem.read_meta(p).next_frame().is_none(),
+                (None, Some(c)) => self.head == Some(c),
+                (None, None) => self.head.is_none(),
+            };
+            if valid { (scan.prev, scan.cur) } else { (None, self.head) }
+        } else {
+            (None, self.head)
+        };
+        scan.started = true;
+        let end = base.0 + count;
+        let mut steps = 0;
+        while let Some(c) = cur {
+            if steps >= budget {
+                scan.prev = prev;
+                scan.cur = cur;
+                return (steps, false);
+            }
+            let node = self.mem.read_meta(c);
+            debug_assert!(
+                c.0 >= end || base.0 >= c.0 + node.len,
+                "region [{:#x}, {:#x}) overlaps free region [{:#x}, {:#x}): double free or accounting bug",
+                base.0,
+                end,
+                c.0,
+                c.0 + node.len,
+            );
+            if c.0 > base.0 {
+                break;
+            }
+            prev = Some(c);
+            cur = node.next_frame();
+            steps += 1;
+        }
+        self.insert_at(base, count, prev, cur);
+        self.free_frames += count;
+        (steps + 1, true)
+    }
+
     /// 从区间 `cur`（前驱 `prev`）中切出 `[base, base + count)`，
     /// 左右残段各自成节点。
     ///
@@ -287,7 +341,18 @@ impl<M: PoolMemory> FramePool<M> {
             prev = Some(c);
             cur = node.next_frame();
         }
+        self.insert_at(base, count, prev, cur);
+    }
 
+    /// 在已定位的插入位（prev 前驱 / cur 后继）执行 O(1) 插入与合并。
+    fn insert_at(
+        &mut self,
+        base: FrameNumber,
+        count: usize,
+        prev: Option<FrameNumber>,
+        cur: Option<FrameNumber>,
+    ) {
+        let end = base.0 + count;
         // 前合并条件：prev 区间尾部紧贴 base 起点
         let merge_prev = match prev {
             Some(p) => {
@@ -337,4 +402,13 @@ impl<M: PoolMemory> FramePool<M> {
             }
         }
     }
+}
+
+/// 有界归还（`dealloc_bounded`）的扫描游标：记录插入位定位的
+/// (prev, cur)；`started == false` 表示尚未起步（首调用从链头开始）。
+#[derive(Clone, Copy, Default)]
+pub struct FreeScan {
+    prev: Option<FrameNumber>,
+    cur: Option<FrameNumber>,
+    started: bool,
 }

@@ -125,10 +125,16 @@ impl ObjectSignals {
     pub const READABLE: Self = Self(1 << 0);
     pub const WRITABLE: Self = Self(1 << 1);
     pub const DATA: Self = Self(1 << 2);
+    pub const REAPABLE: Self = Self(1 << 3);
     pub const PEER_CLOSED: Self = Self(1 << 62);
     pub const CLOSED: Self = Self(1 << 63);
     pub const KNOWN: Self = Self(
-        Self::READABLE.0 | Self::WRITABLE.0 | Self::DATA.0 | Self::PEER_CLOSED.0 | Self::CLOSED.0,
+        Self::READABLE.0
+            | Self::WRITABLE.0
+            | Self::DATA.0
+            | Self::REAPABLE.0
+            | Self::PEER_CLOSED.0
+            | Self::CLOSED.0,
     );
 
     pub const fn from_raw(raw: u64) -> Self {

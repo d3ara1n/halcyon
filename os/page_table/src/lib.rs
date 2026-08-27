@@ -292,6 +292,14 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         &mut self.mem
     }
 
+    /// 消耗树并交出 root 帧所有权（跳过 Drop 的递归扫描）：调用方保证
+    /// 全部子表已释放（有界收束的最终步骤）；root 由调用方经有界路径
+    /// 归还。
+    pub fn leak_root(self) -> FrameNumber {
+        let this = core::mem::ManuallyDrop::new(self);
+        this.root
+    }
+
     /// 清空 `frame` 表内 [start, end) 槽位：不递归、不归还任何子树帧。
     ///
     /// 用于剥离启动期拷贝进用户 root 的内核共享顶层项——这些子树归

@@ -74,6 +74,12 @@ pub enum SystemCall {
     ProcessWrite = 0x14,
     /// 消费 ProcessBuilder，安装 grants 并首次发布进程。
     ProcessStart = 0x15,
+    /// 读 ProcessControl 的固定宽生命周期快照。
+    ProcessQuery = 0x16,
+    /// 持 MANAGE authority 的异步幂等终止请求。
+    ProcessKill = 0x17,
+    /// REAPABLE/Dead 上推进有界资源收束批次。
+    ProcessDrain = 0x18,
 
     // -----Thread-----
     /// Finalized thread notifies kernel to cleanup

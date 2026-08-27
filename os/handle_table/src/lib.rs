@@ -91,6 +91,9 @@ enum SlotState<T, R> {
     Vacant,
     Occupied(Entry<T, R>),
     Reserved(u64),
+    /// 已验证并扣入某事务（ProcessStart 提交前）：对 get/close/extract
+    /// 不可见；commit_pinned 取出，unpin 无损还原。
+    Pinned(u64, Entry<T, R>),
     Retired,
 }
 
@@ -98,6 +101,15 @@ enum SlotState<T, R> {
 struct Slot<T, R> {
     generation: u32,
     state: SlotState<T, R>,
+}
+
+/// [`take_next_bounded`](HandleTable::take_next_bounded) 的结果。
+pub enum TakeNext<T, R> {
+    Entry(Entry<T, R>),
+    /// 预算耗尽且未到表尾：持久化游标，下次续扫。
+    Progress,
+    /// 已到表尾：本轮无剩余项。
+    Exhausted,
 }
 
 /// 一批尚未对进程可见的 Handle 槽位。
@@ -228,6 +240,91 @@ impl<T, R> HandleTable<T, R> {
         self.extract_with(grants, Rights::GRANT)
     }
 
+    /// 事务 pin：单临界区内验证 builder（需 `builder_right`）与全部
+    /// grants（需 GRANT 且 rights 子集）后把槽位翻转为 Pinned——对
+    /// 其他线程的 get/close/extract/drain 不可见；失败零副作用。
+    /// 调用方不得持本表锁反向获取生命周期锁。
+    pub fn pin_for_start(
+        &mut self,
+        builder: Handle,
+        builder_right: Rights,
+        grants: &[(Handle, Rights)],
+        token: u64,
+    ) -> Result<(), TableError> {
+        if token == 0 {
+            return Err(TableError::BadReservation);
+        }
+        for (i, (handle, rights)) in grants.iter().copied().enumerate() {
+            if grants[..i].iter().any(|(prior, _)| *prior == handle)
+                || handle == builder
+            {
+                return Err(TableError::DuplicateHandle);
+            }
+            if !rights.is_known() {
+                return Err(TableError::RightsDenied);
+            }
+            let entry = self.get(handle, Rights::GRANT)?;
+            if !rights.is_subset_of(entry.rights()) {
+                return Err(TableError::RightsDenied);
+            }
+        }
+        self.get(builder, builder_right)?;
+        // 验证全部通过：翻转（不可失败）。
+        for (handle, rights) in grants.iter().copied() {
+            let index = self.occupied_index(handle)?;
+            let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
+            let SlotState::Occupied(mut entry) = state else {
+                unreachable!()
+            };
+            entry.rights = rights;
+            self.slots[index].state = SlotState::Pinned(token, entry);
+        }
+        let index = self.occupied_index(builder)?;
+        let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
+        let SlotState::Occupied(entry) = state else {
+            unreachable!()
+        };
+        self.slots[index].state = SlotState::Pinned(token, entry);
+        Ok(())
+    }
+
+    /// 提交 pin：按槽序把全部 Pinned(token) 追加进调用方**已预留容量**的
+    /// `out`（容量 ≥ pin 数量时不可失败——无分配），槽位归 Vacant。
+    /// 返回追加的 entry 数。
+    pub fn commit_pinned_into(&mut self, token: u64, out: &mut Vec<Entry<T, R>>) -> usize {
+        let mut advanced = Vec::new();
+        let mut count = 0;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if matches!(&slot.state, SlotState::Pinned(t, _) if *t == token) {
+                let state = core::mem::replace(&mut slot.state, SlotState::Vacant);
+                let SlotState::Pinned(_, entry) = state else {
+                    unreachable!()
+                };
+                out.push(entry);
+                count += 1;
+                self.occupied -= 1;
+                advanced.push(index);
+            }
+        }
+        for index in advanced {
+            self.advance_generation(index);
+        }
+        count
+    }
+
+    /// 无损还原 Pinned(token) → Occupied（生命周期提交失败的事务回滚）。
+    pub fn unpin(&mut self, token: u64) {
+        for slot in self.slots.iter_mut() {
+            if matches!(&slot.state, SlotState::Pinned(t, _) if *t == token) {
+                let state = core::mem::replace(&mut slot.state, SlotState::Vacant);
+                let SlotState::Pinned(_, entry) = state else {
+                    unreachable!()
+                };
+                slot.state = SlotState::Occupied(entry);
+            }
+        }
+    }
+
     fn extract_with(
         &mut self,
         items: &[(Handle, Rights)],
@@ -340,10 +437,41 @@ impl<T, R> HandleTable<T, R> {
         None
     }
 
+    /// 有界版 take_next：本次至多扫描 `max_slots` 个槽位（Pinned 属于
+    /// 在途事务，跳过不消费）。Entry 表示摘到一项（游标已推进，调用方
+    /// 以游标增量计费）；Progress 表示预算耗尽未到表尾；Exhausted 表示
+    /// 已到表尾。
+    pub fn take_next_bounded(&mut self, cursor: &mut usize, max_slots: usize) -> TakeNext<T, R> {
+        let mut scanned = 0;
+        while *cursor < self.slots.len() {
+            if scanned >= max_slots {
+                return TakeNext::Progress;
+            }
+            let index = *cursor;
+            *cursor += 1;
+            scanned += 1;
+            if matches!(self.slots[index].state, SlotState::Occupied(_)) {
+                let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
+                let SlotState::Occupied(entry) = state else {
+                    unreachable!()
+                };
+                self.occupied -= 1;
+                self.advance_generation(index);
+                return TakeNext::Entry(entry);
+            }
+            if matches!(self.slots[index].state, SlotState::Reserved(_)) {
+                self.slots[index].state = SlotState::Vacant;
+                self.advance_generation(index);
+            }
+        }
+        TakeNext::Exhausted
+    }
+
     /// 消费整张表并零分配地迭代已安装项；进程退出路径使用。
     pub fn into_entries(self) -> impl Iterator<Item = Entry<T, R>> {
         self.slots.into_iter().filter_map(|slot| match slot.state {
             SlotState::Occupied(entry) => Some(entry),
+            SlotState::Pinned(_, _) => None,
             SlotState::Vacant | SlotState::Reserved(_) | SlotState::Retired => None,
         })
     }
@@ -361,6 +489,7 @@ impl<T, R> HandleTable<T, R> {
                     self.occupied -= 1;
                     self.advance_generation(index);
                 }
+                SlotState::Pinned(_, _) => self.advance_generation(index),
                 SlotState::Reserved(_) => self.advance_generation(index),
                 SlotState::Retired => self.slots[index].state = SlotState::Retired,
                 SlotState::Vacant => {}
@@ -647,5 +776,92 @@ mod tests {
                 .unwrap_err(),
             TableError::ReachLimit
         );
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    type Table = HandleTable<u32, u8>;
+
+    fn entry(value: u32) -> Entry<u32, u8> {
+        Entry::new(value, 1, Rights::READ | Rights::GRANT)
+    }
+
+    #[test]
+    fn pin_hides_entries_until_commit() {
+        let mut table = Table::new();
+        let h1 = table.insert(entry(10)).unwrap();
+        assert!(table.pin_for_start(h1, Rights::READ, &[], 7).is_ok());
+        // pin 后不可见：get / remove 均失效。
+        assert!(matches!(table.get(h1, Rights::READ), Err(TableError::StaleHandle)));
+        assert!(matches!(table.remove(h1), Err(TableError::StaleHandle)));
+        // 提交：取出且代际前进（旧值复活被拒）。
+        let mut out = Vec::new();
+        out.reserve(1);
+        assert_eq!(table.commit_pinned_into(7, &mut out), 1);
+        assert_eq!(*out[0].object(), 10);
+        assert!(matches!(table.get(h1, Rights::READ), Err(TableError::StaleHandle)));
+    }
+
+    #[test]
+    fn unpin_restores_entries_losslessly() {
+        let mut table = Table::new();
+        let h1 = table.insert(entry(20)).unwrap();
+        assert!(table.pin_for_start(h1, Rights::READ, &[], 9).is_ok());
+        table.unpin(9);
+        let entry = table.get(h1, Rights::READ).unwrap();
+        assert_eq!(*entry.object(), 20);
+        // 不同 token 的 commit/unpin 不触碰。
+        let mut out = Vec::new();
+        out.reserve(1);
+        assert_eq!(table.commit_pinned_into(8, &mut out), 0);
+    }
+
+    #[test]
+    fn pin_validates_before_mutating() {
+        let mut table = Table::new();
+        let h1 = table.insert(entry(30)).unwrap();
+        let h2 = table.insert(Entry::new(31, 1, Rights::READ)).unwrap();
+        let grants = [(h2, Rights::GRANT)];
+        // h2 缺 GRANT：整体失败，零副作用。
+        assert!(matches!(
+            table.pin_for_start(h1, Rights::READ, &grants, 5),
+            Err(TableError::RightsDenied)
+        ));
+        assert!(table.get(h1, Rights::READ).is_ok());
+        // builder alias 拒绝。
+        let alias = [(h1, Rights::GRANT)];
+        assert!(matches!(
+            table.pin_for_start(h1, Rights::READ, &alias, 5),
+            Err(TableError::DuplicateHandle)
+        ));
+    }
+
+    #[test]
+    fn take_next_bounded_respects_scan_budget() {
+        let mut table = Table::with_limit(4096);
+        let h1 = table.insert(entry(1)).unwrap();
+        // 表扩到大量空槽后放入第二项。
+        for i in 0..200 {
+            table.insert(entry(100 + i)).unwrap();
+        }
+        let mut cursor = 1;
+        // 每次只扫 2 槽：先遇到的是 Progress（未到表尾）。
+        let first = table.take_next_bounded(&mut cursor, 2);
+        let advanced = matches!(first, TakeNext::Progress) || matches!(first, TakeNext::Entry(_));
+        assert!(advanced);
+        // 小预算持续推进会最终 Exhausted。
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            match table.take_next_bounded(&mut cursor, 4) {
+                TakeNext::Exhausted => break,
+                _ => assert!(rounds < 500, "bounded scan never exhausts"),
+            }
+        }
+        assert!(table.is_empty());
+        let _ = h1;
     }
 }

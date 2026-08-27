@@ -246,3 +246,70 @@ fn stress_conservation() {
     assert_eq!(p.free_frames(), total);
     assert_eq!(p.alloc_contiguous(total), Some(frame(0)));
 }
+
+#[test]
+fn bounded_dealloc_resumes_across_budgets() {
+    let mut pool = pool();
+    pool.add_region(frame(100), frame(200));
+    // 制造碎片：从单区间切出多段，留下 8 个交错空闲区间。
+    let mut allocated = Vec::new();
+    for _ in 0..8 {
+        let base = pool.alloc_contiguous(1).unwrap();
+        allocated.push(base);
+    }
+    // 先释放偶数位，形成 4 个分离区间。
+    for base in allocated.iter().step_by(2) {
+        pool.dealloc(*base, 1);
+    }
+    assert_eq!(pool.region_count(), 5); // 4 小区间 + 尾部大区间
+
+    // 用 1 步预算逐步释放一个奇数位：必须经历多次 Progress 后完成。
+    let target = allocated[1];
+    let mut scan = frame_pool::FreeScan::default();
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        let (steps, done) = pool.dealloc_bounded(target, 1, &mut scan, 1);
+        assert_eq!(steps, 1);
+        if done {
+            break;
+        }
+        assert!(calls < 32, "bounded dealloc never completes");
+    }
+    // 完成后与相邻空闲区间合并：4+2 块顺序结构不变或减少。
+    assert!(pool.region_count() <= 5);
+    // 再验证一次幂等语义不可能：重复释放同一帧必须被 debug 断言拦截
+    // （此处不触发，仅确认池仍可用）。
+    let again = pool.alloc_contiguous(1);
+    assert!(again.is_some());
+}
+
+#[test]
+fn bounded_dealloc_cursor_invalidated_by_concurrent_free() {
+    let mut pool = pool();
+    pool.add_region(frame(100), frame(200));
+    let mut allocated = Vec::new();
+    for _ in 0..6 {
+        allocated.push(pool.alloc_contiguous(1).unwrap());
+    }
+    for base in allocated.iter().step_by(2) {
+        pool.dealloc(*base, 1);
+    }
+    // 预算 1 步推进游标后，他方（模拟另一 hart）无界归还改变链。
+    let target = allocated[3];
+    let mut scan = frame_pool::FreeScan::default();
+    let (_steps, done) = pool.dealloc_bounded(target, 1, &mut scan, 1);
+    assert!(!done);
+    pool.dealloc(allocated[5], 1); // 并发归还使游标邻接失效
+    // 续扫：校验失败 → 从链头重启，仍能正确完成。
+    loop {
+        let (_steps, done) = pool.dealloc_bounded(target, 1, &mut scan, 2);
+        if done {
+            break;
+        }
+    }
+    // 链结构仍然有序无重叠：分配全部成功。
+    for _ in 0..4 {
+        assert!(pool.alloc_contiguous(1).is_some());
+    }
+}
