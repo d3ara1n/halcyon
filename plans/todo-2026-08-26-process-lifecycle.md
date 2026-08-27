@@ -112,7 +112,7 @@ JobDerive(job_control, kind, id, rights, out: *Handle) -> ()
 3. ~~实现 fixed-width ProcessQuery、Building/Running ProcessKill、ProcessControl rights 与 CLOSED 等待；~~ 已完成；
 4. ~~实现固定预算 Process 收束游标和管理电平，同批给持久 init 加最小监督闭环（保留 controls、WaitMany(REAPABLE|CLOSED)、Drain 至 Complete），证明最后线程、active-hart ack、Handle/page-table drain 与 Dead 发布的顺序；~~ 已完成（live kill 正路径：srv_target Waiting 取消 + Building kill + 自终止）；
 5. ~~实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill~~ 已完成（2026-08-27：JobSeal/Query/Enumerate/Derive 四 syscall、有序 fallible 成员表、链锁封口闸门、完成传播与 libprocess 递归 job_kill；验收线 1–4 全过，virt ×6 / sifive_u / host 全绿，实施档案见 [archived/todo-2026-08-27-job-management-impl.md](archived/todo-2026-08-27-job-management-impl.md)）；
-6. 以当前 ustar 私有政策由持久 init 硬编码建立 services Job、启动并监督其中的 `srv_pm` 等服务；pm 只管理显式委托的子域，不提前设计 manifest；
+6. ~~以当前 ustar 私有政策由持久 init 硬编码建立 services Job、启动并监督其中的 `srv_pm` 等服务；pm 只管理显式委托的子域，不提前设计 manifest；~~ 已完成（2026-08-28：root → services → pm_domain/acceptance 拓扑；pm 经 StartupBlock grants 持 MANAGE|READ|WAIT 委托域 JobControl，对域内 Running 靶走 枚举→派生（铸造）→kill→drain→seal 全链；init 保留复制件兜底、失败整树 job_kill(services)、全部收束后进稳态不自终止，终态交 quiescent 静默停机；设计公理入档 ideas/bootstrap.md，拓扑快照两处打印；验收 virt ×7 / sifive_u（5s 窗口）/ host 全绿）；
 7. 接入 ThreadSpawn 前完成多线程 teardown barrier；active hart 必须切回 kernel satp、执行本地全量 SFENCE.VMA 后才确认离场，不以 SBI 请求已发送代替完成；
 8. 接入 capability-derived 调度域 eligibility，再开放 D64；
 9. 对 Building/Ready/Running/Waiting、自杀、重复 kill、并发 Exit/fault、pm 接管、Job 枚举/派生/seal/完成传播竞态（含多核 ID 乱序分配窗口）和最后 control 关闭做 host/virt 多核验证；
