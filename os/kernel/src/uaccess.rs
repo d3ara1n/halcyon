@@ -6,11 +6,14 @@
 //!   会在 S 态 fault 的缺口由此闭合）；
 //! - SUM guard 收编，调用方无感知。
 //!
-//! TOCTOU 不成立的前提由协作式内核背书：校验与拷贝之间持有
-//! `Process.space` 锁，同进程无并发映射变更者。
+//! 复检语义：每次访问在当次持有的 space 锁内重新校验（check 与拷贝
+//! 同一临界区），不存在 TOCTOU 窗口；多线程下同进程线程可在两次
+//! space 锁之间拆除输出页——复检失败不是编程错误，syscall 输出交付
+//! 统一走 [`deliver_output`]（冻结 store-access 终因并杀调用进程）。
 
 use crate::mm::SumGuard;
 use crate::task::proc::{AddressSpace, PAGE_SIZE};
+use crate::task::Thread;
 
 /// 单次访问上限（防恶意长度；Debug 消息与初期 IPC 载荷远小于此）。
 pub const MAX_USER_ACCESS: usize = 1 << 20;
@@ -89,6 +92,38 @@ pub unsafe fn write_user_value<T: Copy>(
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
     };
     copy_to_user(space, dst, bytes)
+}
+
+/// 交付 syscall 输出：写回当次复检，失败即冻结 (Fault, StoreAccess)
+/// 终止调用进程。
+///
+/// 复检失败唯一成因是同进程线程在两次 space 锁之间拆除了输出页
+/// （HandleClose → unmap_external）——等价于一次由内核代为检出的
+/// store access fault：用户可触发的 fault 杀进程，绝不 panic 内核；
+/// 副作用已发生的歧义由进程死亡清理兑底。调用方把 Err 向上传播
+/// 即可，分发出口的终止检查会把 Completed 改写为 Killed，线程不
+/// 回用户态。
+///
+/// # Safety
+/// `T` 的对象表示不得包含 padding 或其它未初始化字节（同
+/// [`write_user_value`]）。
+pub unsafe fn deliver_output<T: Copy>(
+    thread: &Thread,
+    space: &mut AddressSpace,
+    dst: usize,
+    value: &T,
+) -> Result<(), erhino_shared::call::SystemCallError> {
+    // SAFETY: 调用方保证 T 的完整对象表示均已初始化。
+    unsafe { write_user_value(space, dst, value) }.map_err(|error| {
+        let process = thread.process.clone();
+        let todo = process.lifecycle.request_termination(
+            erhino_shared::proc::ProcessExitReason::Fault,
+            erhino_shared::proc::ProcessFaultCode::StoreAccess as i64,
+            Some(thread.tid),
+        );
+        crate::task::process::run_termination_todo(&process, todo);
+        error.into()
+    })
 }
 
 /// 从内核拷入用户内存（dst 为用户 VA，src 为内核缓冲）。

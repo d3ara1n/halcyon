@@ -32,16 +32,19 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
     };
     let a0 = frame.x[10] as usize;
 
-    match call {
+    let outcome = match call {
         SystemCall::Debug => {
             debug_print(frame, thread);
             Outcome::Completed
         }
         SystemCall::Exit => {
-            thread
-                .process
-                .lifecycle
-                .request_termination(erhino_shared::proc::ProcessExitReason::Exited, a0 as i64, true);
+            let process = thread.process.clone();
+            let todo = thread.process.lifecycle.request_termination(
+                erhino_shared::proc::ProcessExitReason::Exited,
+                a0 as i64,
+                Some(thread.tid),
+            );
+            task::process::run_termination_todo(&process, todo);
             Outcome::Killed
         }
         SystemCall::JobCreate => {
@@ -413,7 +416,15 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             respond_error(frame, SystemCallError::FunctionNotAvailable);
             Outcome::Completed
         }
+    };
+    // 分发出口终止检查：syscall 执行期间冻结了终因（写回复检失败自杀、
+    // 异 hart kill）则线程不回用户态——收束确定性提前一个 syscall，
+    // 不依赖 sret 边界的 IPI 吸收时序。Wait 出口不改写：其 park 意图
+    // 由 park_publish 的终止分支消费（Abandoned），不产生泄漏。
+    if outcome == Outcome::Completed && thread.process.lifecycle.is_terminating() {
+        return Outcome::Killed;
     }
+    outcome
 }
 
 /// Debug(ptr, len)：读用户内存打印（rinlib debug! 的观测通道，测试用）。

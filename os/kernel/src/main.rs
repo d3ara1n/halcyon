@@ -48,6 +48,7 @@ mod uaccess;
 // assembly.asm（见 abi::asm 常量表）。
 global_asm!(
     include_str!("assembly.asm"),
+    KERNEL_SATP_SYM = sym mm::KERNEL_SATP,
     REC_STATE = const abi::asm::REC_STATE,
     REC_KERNEL_SATP = const abi::asm::REC_KERNEL_SATP,
     REC_ENTRY_HIGH = const abi::asm::REC_ENTRY_HIGH,

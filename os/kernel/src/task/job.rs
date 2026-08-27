@@ -690,10 +690,9 @@ pub fn query(thread: &Thread, control: Handle, output: usize) -> Result<(), Syst
     let snapshot = job.snapshot();
     let mut space = thread.process.space.lock();
     space.check_range(output, core::mem::size_of::<JobSnapshot>(), true)?;
-    // SAFETY: JobSnapshot 字段与 reserved 全部初始化，结构无 padding。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &snapshot) }
-        .expect("validated JobQuery output must remain writable");
-    Ok(())
+    // SAFETY: JobSnapshot 字段与 reserved 全部初始化，结构无 padding；
+    // 复检失败即杀本进程（deliver_output）。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &snapshot) }
 }
 
 /// JobEnumerate(control, kind, cursor, buf, buf_len, out)：READ；单调 ID
@@ -729,10 +728,9 @@ pub fn enumerate(
     // SAFETY: ids[..actual] 是已初始化的 u64 切片；区间已在前面校验。
     let bytes = unsafe { core::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), actual * core::mem::size_of::<u64>()) };
     crate::uaccess::copy_to_user(&mut space, buf, bytes)?;
-    // SAFETY: JobEnumerateResult 字段全部初始化，无 padding。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &result) }
-        .expect("validated JobEnumerate output must remain writable");
-    Ok(())
+    // SAFETY: JobEnumerateResult 字段全部初始化，无 padding；复检失败
+    // 即杀本进程（deliver_output）。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
 }
 
 /// JobDerive(control, kind, id, rights, out)：MANAGE；在直接成员域内按
@@ -797,9 +795,9 @@ fn install_one(
         table.rollback(reservation).expect("single-handle install reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &handle) }
-        .expect("validated handle output must remain writable");
+    // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &handle) }?;
     drop(space);
     // 发布序（同 ProcessCreate）：输出值此刻仍是 Reserved 槽号（其他
     // 线程不可用）；先完成不可失败的层级提交，再公开 capability——

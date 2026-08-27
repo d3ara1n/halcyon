@@ -22,7 +22,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | 文件 | 概要 |
 |---|---|
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已完成收口，03–07 待做 |
-| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——~~step 1–5 已实施并收口~~；~~step 6（持久 init 监督政策与 pm 委托域）已实施收口（2026-08-28，review 计划见 [todo-2026-08-28-persistent-init-review.md](todo-2026-08-28-persistent-init-review.md)）~~；剩余 step 7–10：ThreadSpawn 前 barrier 泛化、D64 eligibility、多核验证矩阵、文档终态收口 |
+| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——step 1–7 已实施收口（step 7 多线程 teardown barrier 与写回 panic 面消解见 [todo-2026-08-28-thread-teardown-barrier.md](todo-2026-08-28-thread-teardown-barrier.md)）；剩余 step 8–10：D64 eligibility、多核验证矩阵、文档终态收口 |
 | [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备接入重审、IPC 压力验证线、notes 结构整改、F2/F4 注记 |
 | [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart 期限表、MappingLease、公理层与文档自洽的复核轴 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
@@ -39,7 +39,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 - StartupBlock v2 与 BootPackage 启动链已落地：outer 为 Header + 实际 child Handle 数组 + 可零 padding + opaque payload；内核只解析 fixed envelope 与唯一 init ELF，payload 以只读页交给 init（映入即收编 owned backing）。实现现状见 `notes/impls/startup.md`。
 - 对照负载：`user/systems/` 与 `user/drivers/` 四服务。fs 经用户态 FAL 真路径完成创建/枚举/属性/符号链接/偏移读写，验收线已过（`bf32c1c`）；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
 - 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、Building-only Map/Write、事务化 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy。进程生命周期改造已实施（见上）。剩余方向：内核提供 JobSeal/分页枚举，递归 JobKill 由 init/pm 等用户态管理者组合（step 5），持久 init 是当前系统配置的 root supervisor；D64 仍等待调度域 eligibility（step 8）。initfs manifest/archive 另案设计。方向见 `notes/ideas/{task,bootstrap}.md`，实现现状见 `notes/impls/{startup,task}.md`。
-- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。下一项是 step 7：接入 ThreadSpawn 前完成多线程 teardown barrier（active hart 切回 kernel satp + 本地全量 SFENCE.VMA 后才确认离场）。step 6（持久 init 监督政策与 pm 委托域）已实施收口（2026-08-28，review 计划见 [todo-2026-08-28-persistent-init-review.md](todo-2026-08-28-persistent-init-review.md)）。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
+- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。**step 7（ThreadSpawn 前多线程 teardown barrier）已实施收口（2026-08-28）**：线程成员表（tid 寻址、离场即摘）取代单值记录，等待取消锁外游标化（零分配），归一收敛到 trap 汇编非 Resume 出口，KNOWN_ISSUES 写回 panic 面消解（deliver_output 复检即杀 + 分发出口终止检查）；ThreadSpawn 接入面清单入档计划篇。下一项是 step 8：capability-derived 调度域 eligibility，再开放 D64（届时 F2 ready-marker 预留域路由承接项触发）。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
 
 ## 戒律
 

@@ -12,7 +12,7 @@ use core::{
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 
 use crate::sync::Spinlock;
-use crate::{hart, mm, sbi, trap::{self, Outcome}};
+use crate::{hart, sbi, trap::{self, Outcome}};
 use crate::sbi::DISARM;
 use crate::task::Thread;
 
@@ -274,15 +274,14 @@ pub fn run() -> ! {
     // 本循环只维护执行点与量子。
     let me = hart::current();
     loop {
-        // 归一到内核地址空间（见 mm::normalize_satp）：刚结束的线程
-        // root 可能已被回收，调度循环不得依赖它的内核映射。
-        mm::normalize_satp();
+        // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
+        // SFENCE.VMA）：循环体结构性只运行于内核页表下。
         let Some(t) = DOMAIN.pick() else {
             idle();
             continue;
         };
         // lifecycle gate：Terminating 线程不进用户态（惰性撤销）。
-        if !t.process.lifecycle.enter_running(me.slot()) {
+        if !t.process.lifecycle.enter_running(t.tid, me.slot()) {
             reap(t);
             continue;
         }
@@ -297,13 +296,13 @@ pub fn run() -> ! {
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
         let outcome = unsafe { trap::ret_to_user() };
         me.clear_context();
-        // 非-Resume 出口统一先归一内核 satp（含全量 SFENCE.VMA），再处置
-        // 线程：active 位图与后续 teardown 不得在目标地址空间上进行。
-        mm::normalize_satp();
+        // 非-Resume 出口的归一（内核 satp + 全量 SFENCE.VMA）已由汇编
+        // 出口边界完成：active 位图与后续 teardown 不得在目标地址空间
+        // 上进行。
         let slot = me.slot();
         match outcome {
             Outcome::Requeue => {
-                t.process.lifecycle.on_requeue(slot);
+                t.process.lifecycle.on_requeue(t.tid, slot);
                 if t.process.lifecycle.is_terminating() {
                     reap(t);
                 } else {
@@ -340,15 +339,17 @@ fn arm_quantum() {
 fn reap(t: Arc<Thread>) {
     let process = t.process.clone();
     let pid = process.pid;
+    let tid = t.tid;
     let switches = t.switches.load(Ordering::Relaxed);
     let now = sbi::read_time();
     let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
     drop(t);
-    crate::task::process::confirm_departure(&process);
+    crate::task::process::confirm_departure(&process, tid);
     log!(
         Task,
-        "pid {} reaped: {} switches, lifespan {} ms",
+        "pid {} thread {} reaped: {} switches, lifespan {} ms",
         pid,
+        tid,
         switches,
         elapsed_ms
     );

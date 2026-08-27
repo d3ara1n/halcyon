@@ -119,8 +119,9 @@ unsafe impl Sync for WindowTables {}
 
 static WINDOW_TABLES: WindowTables = WindowTables(UnsafeCell::new([[Pte::invalid(); ENTRIES]; 1 + WINDOW_LEAF_MAX]));
 
-/// 正式内核 satp 值（init 发布、`kernel_satp()` 消费填 record）。
-static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
+/// 正式内核 satp 值（init 发布、`kernel_satp()` 消费填 record；
+/// trap 汇编非 Resume 出口经 sym 符号直接装载切回）。
+pub(crate) static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 
 /// 构建并启用内核直映射：PA `[0, N GiB)` 以 1GiB mega 项映射到高半区，
 /// N 覆盖全部 DRAM 与首 GiB 内的 MMIO 窗口；随后切换 satp 并广播。
@@ -272,25 +273,6 @@ fn map_stack_window() {
 /// 故障 VA 是否落在某 guard 洞内：内核栈溢出的第一现场特征。
 pub fn is_guard_fault(va: usize) -> bool {
     stack_layout().in_guard(va)
-}
-
-/// 调度循环入口归一：当前 satp 非正式内核表则切回并同步翻译。
-///
-/// 离开用户执行点后，刚结束线程的 root 可能已被 teardown 剥离内核
-/// 顶层项（`AddressSpace::drop`），不得再作为内核执行的翻译来源。
-/// Resume 热路径不经调度循环，此处切换零热路径开销。
-/// 已知简化：归一分布于本处与 report_exit；接入新终止来源（kill/
-/// 线程退出）时收敛为非 Resume 出口统一切内核表
-/// （notes/impls/execution-context.md「地址空间归属纪律」）。
-pub fn normalize_satp() {
-    let want = kernel_satp();
-    let cur: usize;
-    // SAFETY: 只读 satp。
-    unsafe { asm!("csrr {}, satp", out(reg) cur, options(nomem)) };
-    if cur != want {
-        // SAFETY: 换表后全量 sfence；内核高半区两表同 VA，执行流无缝。
-        unsafe { asm!("csrw satp, {satp}", "sfence.vma", satp = in(reg) want) };
-    }
 }
 
 /// 用户内存访问的 RAII guard：构造时临时开启 SUM，Drop 恢复关闭。

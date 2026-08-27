@@ -317,9 +317,9 @@ pub fn create(
         table.rollback(reservation).expect("MailboxCreate reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: HandlePair 无 padding，输出已在同一 space 锁下校验。
-    unsafe { uaccess::write_user_value(&mut space, output, &pair) }
-        .expect("validated MailboxCreate output must remain writable");
+    // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { uaccess::deliver_output(thread, &mut space, output, &pair) }?;
     drop(space);
     table.commit(reservation, entries).expect("MailboxCreate reservation must remain owned");
     Ok(())
@@ -357,9 +357,9 @@ pub fn mint_sender(
         table.rollback(reservation).expect("mint-sender reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
-    unsafe { uaccess::write_user_value(&mut space, output, &sender) }
-        .expect("validated mint-sender output must remain writable");
+    // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { uaccess::deliver_output(thread, &mut space, output, &sender) }?;
     drop(space);
     table
         .commit(reservation, entries)
@@ -404,9 +404,9 @@ pub fn make_send_once(
         table.rollback(reservation).expect("make-send-once reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
-    unsafe { uaccess::write_user_value(&mut space, output, &once) }
-        .expect("validated make-send-once output must remain writable");
+    // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { uaccess::deliver_output(thread, &mut space, output, &once) }?;
     drop(space);
     table
         .commit(reservation, entries)

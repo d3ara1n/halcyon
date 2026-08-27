@@ -20,6 +20,8 @@
 请求完成时（对端投递、期限到达、跨核回调），`wake()` 将线程直接回 Ready；结果已写入其 TrapFrame，sret 回用户态即拿到结果，无中间状态、无重入重试。
 
 - 出口三值：`SyscallOutcome { Completed, Wait, Killed(code) }`——所有 syscall 处理函数的统一签名，同步/异步在函数内部选择，分发层无差别处理。
+- 分发出口终止检查：handler 返回 Completed 后若 lifecycle 已 Terminating（syscall 执行期间被异 hart kill 冻结、或输出写回复检失败自杀），出口改写为 Killed——收束确定性提前一个 syscall，不依赖 sret 边界的 IPI 吸收时序。Wait 出口不改写：park 意图由 park_publish 的终止分支消费。
+- 输出写回复检（多线程前提）：每次访问在当次 space 锁内重新校验（check 与拷贝同一临界区）；syscall 输出交付统一走 `uaccess::deliver_output`——复检失败唯一成因是同进程线程在两次 space 锁之间拆除了输出页（HandleClose → unmap_external），等价于由内核代为检出的 store access fault，冻结 (Fault, StoreAccess) 并杀调用进程，绝不 panic 内核；副作用已发生的歧义由进程死亡清理兑底。等待交付路径（deliver_wait_result）语义不同：尽力送达、失败以 MemoryNotAccessible 告知线程，维持错误通道。
 - 期限登记时由发起 hart 立即 arm 自己的 timer（唤醒所有权，见 `internals.md`），期限不跟随线程迁移。
 - sleep(ms) 是第一个异步消费者（通路验证用）：登记期限 → `Wait` → 期限到达 `wake()` → a0 = NoError。
 

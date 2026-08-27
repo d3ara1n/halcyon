@@ -399,9 +399,9 @@ pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCal
         table.rollback(reservation).expect("TunnelCreate reservation must remain owned");
         return Err(map_space_error(error));
     }
-    // SAFETY: HandlePair 无 padding，输出已在同一 space 锁下校验。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &pair) }
-        .expect("validated TunnelCreate output must remain writable");
+    // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &pair) }?;
     table
         .commit(reservation, entries)
         .expect("TunnelCreate reservation must remain owned");
@@ -463,14 +463,19 @@ pub fn attach(
         return Err(map_space_error(error));
     }
 
+    // 先原子消费 invitation：remove 在表锁上与并发 close 竞争，胜者
+    // 唯一（同进程多线程前提）。胜出后才翻转 side——败者路径上
+    // invitation 的 abandon 自会将 side 置 Closed 并通知对端，本侧
+    // 端点对象随回滚消散、外部映射经 lease Drop 解除。
+    let Ok(consumed) = table.remove(invitation_handle) else {
+        table.rollback(reservation).expect("TunnelAttach reservation must remain owned");
+        return Err(SystemCallError::ObjectClosed);
+    };
     connection.sides[invitation.side] = SideState::Alive(Arc::downgrade(&endpoint));
     invitation.closed.store(true, Ordering::Release);
-    let consumed = table
-        .remove(invitation_handle)
-        .expect("validated Tunnel invitation must remain installed");
-    // SAFETY: Handle 无 padding，输出已在同一 space 锁下校验。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &endpoint_handle) }
-        .expect("validated TunnelAttach output must remain writable");
+    // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &endpoint_handle) }?;
     table
         .commit(reservation, entries)
         .expect("TunnelAttach reservation must remain owned");

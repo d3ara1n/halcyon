@@ -136,18 +136,26 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
   `libprocess` 驱动 ProcessBuilder 映射、回填并发布。内核不解析 initfs
   或服务拓扑。
 - **状态机**：`Building → Running → Terminating → Dead`，真值在
-  Process 内嵌 lifecycle（原子 state 快读 + 顶级锁保护终因/成员记录/
-  active 位图）。Exit、fault、ProcessKill 与 Building abandonment 在
+  Process 内嵌 lifecycle（原子 state 快读 + 顶级锁保护终因/线程成员
+  表/active 位图）。Exit、fault、ProcessKill 与 Building abandonment 在
   各自适用状态竞争首次终止线性化点冻结终因（reason + i64 code），
   后续事件幂等不覆盖；fault 经稳定 ProcessFaultCode 编码，不固化裸
-  scause。成员记录（Gone/Ready/Running/Waiting/Exiting）是线程容器
-  唯一真值：pick 后 trap 入口统一检查 Terminating（惰性撤销），enqueue
-  无条件入队不反向触碰 lifecycle 锁；Waiting 经 weak WaitContext 取消
-  （Abandoned 不回用户态，线程随上下文消散）；Running 由 kill 锁外发
-  IPI，目标在任意 trap 入口吸收为 Killed。
-- **退出收束**（有界分批，管理者驱动）：调度循环非-Resume 出口先归一
-  内核 satp（含全量 SFENCE.VMA）并清 active 位再处置线程；reap 先
-  drop 线程强引用再做离场确认（thread_departed → REAPABLE 持续电平）。
+  scause。线程成员表（按 tid 升序的有序 fallible Vec，离场即摘除、
+  表空即无线程）是线程容器唯一真值：pick 后 trap 入口统一检查
+  Terminating（惰性撤销），enqueue 无条件入队不反向触碰 lifecycle
+  锁；Waiting 由终止路径经锁外游标逐条 offer(Abandoned)（每次只持
+  一个 weak、零分配，单 outcome 仲裁与自然完成方无双重处置；对
+  唤醒后未再调度的 stale Waiting 记录 offer 必然落败，由 pick gate
+  吸收后 reap 摘除）；Running 由终止待办向冻结时刻的 active 位图
+  快照发 IPI（冻结后 enter_running 拒绝，位只减不增），目标在任意
+  trap 入口吸收为 Killed；自杀路径排除本 hart。末线程自然离场冻结
+  Exited 的边是 ThreadSpawn 接入点（结构上即 thread_departed 摘除
+  后加「表空且未终止」判定）。
+- **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
+  先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
+  终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)
+  「地址空间归属纪律」）；reap 先 drop 线程强引用再做离场确认
+  （thread_departed 摘成员 → REAPABLE 持续电平）。
   任何容器路径都只到达 REAPABLE；Dead 仅由 ProcessDrain 的 Complete
   分支发布：HandleTable 先逐槽扫描摘项（take_next_bounded 硬预算），
   对象 close 回调锁外执行（仍可用地址空间解除外部映射），随后

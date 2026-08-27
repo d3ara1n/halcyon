@@ -9,7 +9,7 @@ use erhino_shared::{
     proc::{
         ExecutionProfile, HandleGrant, Pid, ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus,
         PROCESS_DRAIN_MAX, ProcessExitReason, ProcessMapFlags, ProcessSnapshot,
-        ProcessStartDescriptor, ProcessState,
+        ProcessStartDescriptor, ProcessState, Tid,
     },
 };
 
@@ -95,7 +95,7 @@ impl ProcessBuilder {
         };
         let todo = process
             .lifecycle
-            .request_termination(ProcessExitReason::Abandoned, 0, false);
+            .request_termination(ProcessExitReason::Abandoned, 0, None);
         run_termination_todo(&process, todo);
     }
 }
@@ -373,9 +373,9 @@ fn create_staged(
         table.rollback(reservation).expect("ProcessCreate reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: ProcessCreateResult 无 padding，输出在同一 space 锁下验证。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &result) }
-        .expect("validated ProcessCreate output must remain writable");
+    // SAFETY: ProcessCreateResult 无 padding；复检失败即杀本进程
+    // （deliver_output），未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }?;
     drop(space);
     // 提交序（F4）：capability 对其他线程可见前先完成不可失败的成员
     // 提交——早干活（kill/drain）必命中已提交成员，不会把 Dead core
@@ -670,7 +670,7 @@ fn start_staged(
         .expect("ProcessStart child reservation count matches grants");
     builder.consume();
     super::handle::close_entry(builder_entry, &thread.process, false);
-    process.lifecycle.staging_ready();
+    process.lifecycle.staging_ready(child_thread.tid);
     crate::sched::commit_ready(ready_reservation, child_thread);
     Ok(())
 }
@@ -685,8 +685,13 @@ fn leave_building_op(process: &Arc<Process>) {
 
 /// 终止待办的锁外执行（IPI、等待取消、REAPABLE 发布）。任何容器路径都
 /// 只到达 REAPABLE；Dead 仅由 ProcessDrain 的 Complete 分支发布。
+/// 等待取消走锁外游标：每次只持一个 weak context，零分配——摘取与
+/// 自然完成的竞争由单 outcome 仲裁，胜者负责线程消散与离场确认。
 pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo) {
-    if let Some(weak) = todo.cancel_wait {
+    loop {
+        let Some(weak) = process.lifecycle.take_first_waiting() else {
+            break;
+        };
         if let Some(context) = weak.upgrade() {
             if context.offer(WaitOutcome::Abandoned) == OfferResult::Complete {
                 // 完成方负责收尾：线程 drop 与离场确认在 finish 内完成。
@@ -709,9 +714,9 @@ fn control_publish_reapable(control: &Option<Arc<ProcessControl>>) {
 }
 
 /// 线程离场确认（调用方已 drop 线程强引用：reap / WaitContext 完成
-/// 方 / Start 防御失败路径）：member → Gone；全部离场则发布 REAPABLE。
-pub fn confirm_departure(process: &Arc<Process>) {
-    if process.lifecycle.thread_departed() {
+/// 方 / Start 防御失败路径）：摘除成员；全部离场则发布 REAPABLE。
+pub fn confirm_departure(process: &Arc<Process>, tid: Tid) {
+    if process.lifecycle.thread_departed(tid) {
         control_publish_reapable(&process.control());
     }
 }
@@ -727,10 +732,9 @@ pub fn query(
     let snapshot = control.snapshot();
     let mut space = thread.process.space.lock();
     space.check_range(output, core::mem::size_of::<ProcessSnapshot>(), true)?;
-    // SAFETY: ProcessSnapshot 字段与 reserved 全部初始化，结构无 padding。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &snapshot) }
-        .expect("validated ProcessQuery output must remain writable");
-    Ok(())
+    // SAFETY: ProcessSnapshot 字段与 reserved 全部初始化，结构无 padding；
+    // 复检失败即杀本进程（deliver_output）。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &snapshot) }
 }
 
 /// ProcessKill 出口：自杀式调用已冻结终因，不返回用户态。
@@ -751,14 +755,15 @@ pub fn kill(
         return Ok(KillOutcome::Accepted); // 已 Dead：幂等成功
     };
     if process.pid == thread.process.pid {
-        process
+        let todo = process
             .lifecycle
-            .request_termination(ProcessExitReason::Killed, code, true);
+            .request_termination(ProcessExitReason::Killed, code, Some(thread.tid));
+        run_termination_todo(&process, todo);
         return Ok(KillOutcome::TerminatedCaller);
     }
     let todo = process
         .lifecycle
-        .request_termination(ProcessExitReason::Killed, code, false);
+        .request_termination(ProcessExitReason::Killed, code, None);
     run_termination_todo(&process, todo);
     Ok(KillOutcome::Accepted)
 }
@@ -838,10 +843,9 @@ fn write_drain_result(
 ) -> Result<(), SystemCallError> {
     let mut space = thread.process.space.lock();
     space.check_range(output, core::mem::size_of::<ProcessDrainResult>(), true)?;
-    // SAFETY: ProcessDrainResult 字段与 reserved 全部初始化，无 padding。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &result) }
-        .expect("validated ProcessDrain output must remain writable");
-    Ok(())
+    // SAFETY: ProcessDrainResult 字段与 reserved 全部初始化，无 padding；
+    // 复检失败即杀本进程（deliver_output）。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
 }
 
 fn resolve_builder(

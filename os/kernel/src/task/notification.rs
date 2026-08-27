@@ -194,9 +194,9 @@ pub fn create(
         table.rollback(reservation).expect("NotificationCreate reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: HandlePair 无 padding，输出已在同一 space 锁下校验。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &pair) }
-        .expect("validated NotificationCreate output must remain writable");
+    // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
+    // 未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &pair) }?;
     drop(space);
     table.commit(reservation, entries).expect("NotificationCreate reservation must remain owned");
     Ok(())

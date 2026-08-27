@@ -99,9 +99,9 @@ pub fn duplicate(
         table.rollback(reservation).expect("duplicate reservation must remain owned");
         return Err(error.into());
     }
-    // SAFETY: Handle 是无 padding 的 u64 newtype，输出已在同一 space 锁下校验。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &duplicated) }
-        .expect("validated duplicate output must remain writable");
+    // SAFETY: Handle 是无 padding 的 u64 newtype；复检失败即杀本进程
+    // （deliver_output），未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &duplicated) }?;
     drop(space);
     table.commit(reservation, entries).expect("duplicate reservation must remain owned");
     Ok(())

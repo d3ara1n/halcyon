@@ -55,9 +55,7 @@ CSR 由 formal entry、内核稳态和 pre-sret 三个边界集中拥有：`sie`
 
 ### 地址空间归属纪律
 
-调度循环与 teardown 只许运行在正式内核页表下：用户 root 属进程所有，`AddressSpace::drop` 会剥离拷入的内核顶层项并归还帧，滞留其下任何内核访问的 TLB miss 都不可恢复。因此线程死亡判定点（`report_exit`）即刻 `mm::normalize_satp` 切回内核表（此刻 root 仍完整，切换自身安全）；调度循环每轮入口再归一一次兑底。Resume 热路径不经调度循环、不换表，零开销不变。
-
-**（已知简化）**归一目前分布在 report_exit 与调度循环顶部两处，新终止来源（信号 kill、线程退出）各自记得补 normalize 是记账式风险；接入时应顺势收敛为汇编层非 Resume 出口统一切内核表——出口边界一处承担，终止来源不再需要知道归一的存在。
+调度循环与 teardown 只许运行在正式内核页表下：用户 root 属进程所有，`AddressSpace::drop` 会剥离拷入的内核顶层项并归还帧，滞留其下任何内核访问的 TLB miss 都不可恢复。归一由 trap 汇编的非 Resume 出口统一承担：`handle_user_trap` 返回非 Resume（Switch/Park/Killed）时，恢复调度循环现场前先装载 `KERNEL_SATP` 切内核表并执行本地全量 SFENCE.VMA——Rust 侧（active 位清除、reap、park 发布）结构性只运行于内核页表下，任何新终止来源无需各自记得归一。Resume 热路径不经调度循环、不换表（仅多一次出口编码比较），零开销不变。
 
 Rust `offset_of!` 是 UserContext、FpState、HartLocal、FatalFrame 与 SchedulerFrame 的布局真值，通过 `global_asm!` 常量注入汇编。调度现场总大小保持 16-byte 对齐。
 

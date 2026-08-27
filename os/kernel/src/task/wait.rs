@@ -247,8 +247,9 @@ impl WaitContext {
                 // 终止取消：线程永不回用户态，随本上下文消散；
                 // 离场确认与 REAPABLE 电平由 process 侧统一发布。
                 let process = thread.process.clone();
+                let tid = thread.tid;
                 drop(thread);
-                super::process::confirm_departure(&process);
+                super::process::confirm_departure(&process, tid);
             }
         }
         self.core.mark_done();
@@ -308,8 +309,8 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
         }
     };
     {
-        let process = context_thread_process(&context);
-        if !process.lifecycle.park_waiting(&context) {
+        let (process, tid) = context_thread_identity(&context);
+        if !process.lifecycle.park_waiting(tid, &context) {
             if context.offer(WaitOutcome::Abandoned) == wait_context::OfferResult::Complete {
                 finish_offered(context);
             }
@@ -370,15 +371,15 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
     }
 }
 
-/// 安装中的上下文必持有发起线程；取其进程引用做 lifecycle 线性化。
-fn context_thread_process(context: &Arc<WaitContext>) -> alloc::sync::Arc<super::proc::Process> {
-    context
-        .thread
-        .lock()
+/// 安装中的上下文必持有发起线程；取其进程引用与 tid 做 lifecycle 线性化。
+fn context_thread_identity(
+    context: &Arc<WaitContext>,
+) -> (alloc::sync::Arc<super::proc::Process>, erhino_shared::proc::Tid) {
+    let guard = context.thread.lock();
+    let thread = guard
         .as_ref()
-        .expect("installing context holds its thread")
-        .process
-        .clone()
+        .expect("installing context holds its thread");
+    (thread.process.clone(), thread.tid)
 }
 
 /// 将 WaitResult 写回用户现场并推进 sepc；写回失败则携带错误返回。

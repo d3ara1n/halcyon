@@ -113,11 +113,13 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
             );
             if let Some(t) = thread {
                 let fault = erhino_shared::proc::ProcessFaultCode::from_scause(code);
-                t.process.lifecycle.request_termination(
+                let todo = t.process.lifecycle.request_termination(
                     erhino_shared::proc::ProcessExitReason::Fault,
                     fault as i64,
-                    true,
+                    Some(t.tid),
                 );
+                let process = t.process.clone();
+                crate::task::process::run_termination_todo(&process, todo);
             }
             Outcome::Killed as usize
         }

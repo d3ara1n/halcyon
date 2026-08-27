@@ -2,6 +2,26 @@
 
 记录会随时间消灭的问题，修复后删除条目；持久性约定在 AGENTS.md。
 
+## release 构建不收束（steady-state 后无 quiescent 停机）
+
+release 构建从未纳入验证线；首次观测（2026-08-28，生命周期 step 7
+收口时）发现 `MODE=release` 下 virt 4 核全负载走到 `init: steady-state
+supervision` 后不再前进：无 `[Sched] system quiescent` 停机、QEMU 不
+退出（debug 模式同负载稳定收束，virt ×5 / sifive_u 全绿）。干净
+HEAD（b5c2bfe）同样复现，非 step 7 引入。
+
+伴随现象：收束路径与 debug 分叉——pm 委托域走了
+`pm delegated domain not collected by pm; init collecting` 兜底分支
+（debug 下为 `pm delegated domain confirmed Dead`），最终拓扑
+`job root (jid 1, Open, members 0, children 0)`（debug 下 root 仍含
+init 进程与 services 子 Job）。提示是仅在 release 时序下暴露的竞态或
+内存序问题，而非纯停机谓词缺陷。is_quiescent 三条件（全员 idle /
+就绪队列空 / 各 hart 期限表空）中何者不满足尚未定位。
+
+触发条件：排入 release 调查计划时定位（候选轴：收束竞态内存序、
+pm 收集超时路径、期限表残留、idle 掩码竞争）；release 验证线接入前
+必须解决。
+
 ## 帧池 free-list 无界扫描（非 Drain 路径）
 
 `FramePool::dealloc` 的插入位定位是 O(region_count) 地址序单链扫描
@@ -14,19 +34,6 @@
 触发条件：帧池 allocator 演进（buddy / 地址分桶多链）或实测碎片化导致
 可观察延迟时，把普通路径统一迁到有界归还（游标化）或重构底层数据
 结构。
-
-## 用户态多线程落地前的写回 panic 面
-
-IPC 对象层 review（`plans/archived/review-2026-08-ipc-object.md`）确认：
-`MailboxCreate`/`HandleDuplicate`/`MailboxMakeSendOnce`/`TunnelCreate`/
-`TunnelAttach`/`Receive` 的用户写回以 `expect("validated ... must remain
-writable")` 收尾，前提是「check_range 到写回之间同进程无映射变更」。当前
-单线程进程下成立；`ThreadSpawn` 落地后，同进程异 hart 线程可在两次
-space 锁之间 `HandleClose` tunnel endpoint（经 `unmap_external` 解除映射），
-若被解除的页恰为某输出缓冲，写回校验失败即 panic 内核——违反「用户可
-触发的 fault 杀进程绝不 panic」戒律。接入用户态多线程（服务化阶段）前
-改为锁内复检 + 优雅错误或进程终止路径，并同步修正 `uaccess.rs` 头注释
-「同进程无并发映射变更者」的前提表述。
 
 ## rust_analyzer 环境前提
 

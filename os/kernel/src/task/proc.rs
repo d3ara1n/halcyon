@@ -942,7 +942,7 @@ impl Process {
                 pid,
                 super::handle::ProcessHandleTable::new(),
             ),
-            lifecycle: super::lifecycle::Lifecycle::building(),
+            lifecycle: super::lifecycle::Lifecycle::building().map_err(|_| SpaceError::NoFrame)?,
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
             drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
             drain_cursor: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_CURSOR, 1),
@@ -1032,7 +1032,7 @@ impl Process {
 
 /// 线程：执行容器（用户现场 + 调度观测计数）。
 pub struct Thread {
-    #[expect(dead_code, reason = "多线程里程碑使用")]
+    /// 进程内线程号（成员表键；主线程恒 0）。
     pub tid: Tid,
     pub process: Arc<Process>,
     /// 创建时刻（mtime tick），退出统计用。

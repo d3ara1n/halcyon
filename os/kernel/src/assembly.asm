@@ -244,6 +244,14 @@ _trap_entry:
     mv      a2, t5
     call    handle_user_trap                # 返回 a0 = Outcome（0 = Resume）
     beqz    a0, _resume_user
+    # 非 Resume 出口统一归一（teardown barrier 出口边界）：切内核页表 +
+    # 本地全量 SFENCE.VMA。此后 Rust 侧（active 位清除、reap、park 发布）
+    # 结构性只运行于内核地址空间——任何新终止来源无需各自记得归一
+    # （notes/impls/execution-context.md「地址空间归属纪律」）。
+    la      t0, {KERNEL_SATP_SYM}
+    ld      t0, 0(t0)
+    csrw    satp, t0
+    sfence.vma
     # Switch：恢复调度循环现场（112B SchedulerFrame 对称恢复）
     ld      ra, {SF_RA}(sp)
     ld      s0, ({SF_S0} + 8*0)(sp)
