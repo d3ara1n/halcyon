@@ -7,13 +7,15 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use erhino_shared::{
     call::SystemCallError,
-    object::{Handle, Rights},
+    object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, ProcessMapFlags,
+        ExecutionProfile, HandleGrant, JobMemberKind, ProcessMapFlags,
         ProcessStartDescriptor, PROCESS_MAIN_STACK_SIZE, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
+        JOB_ENUMERATE_MAX,
     },
+    wait::{WaitItem, WAIT_DEADLINE_INFINITE},
 };
-use rinlib::{ipc::object::close, process};
+use rinlib::{ipc::object::close, ipc::wait::wait_many, process};
 
 const MAX_MAP_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
 const MAX_WRITE_BYTES: usize = 1 << 20;
@@ -86,6 +88,96 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
         let _ = close(created.control);
     }
     result
+}
+
+/// 派生监督所需的成员/子域 control rights：kill+drain 需 MANAGE，等
+/// REAPABLE/CLOSED 需 WAIT，终态查询需 READ。调用者的 JobControl 必须
+/// 持其超集，否则派生返回 RightsDenied。
+pub const DERIVED_CONTROL_RIGHTS: Rights = Rights::from_raw(
+    Rights::READ.raw() | Rights::WAIT.raw() | Rights::MANAGE.raw(),
+);
+
+/// 递归 JobKill（用户态政策，内核不递归）：逐层 `JobSeal → 枚举 members
+/// → 派生 kill → 等 REAPABLE → drain 至 Complete → 枚举 children 递归 →
+/// 等本层 CLOSED`。先 seal 后枚举：封口后成员集单调收缩，收敛性由
+/// 「枚举至空 + 派生 NotFound 即已完成」表达。派生 NotFound（目标已
+/// 完成移表，ID 不复用永不错指）跳过不报错。返回时本 Job 及全部后代
+/// 均已达 Dead/CLOSED（root 亦发 CLOSED 但不移除）。
+/// 要求：JobControl 持 MANAGE（seal/派生）与 READ（枚举）。
+pub fn job_kill(job: Handle, code: i64) -> Result<(), SystemCallError> {
+    process::seal_job(job)?;
+    kill_members(job, code)?;
+    kill_children(job, code)?;
+    // 完成屏障：直接成员全部完成后 CLOSED 置位（等待 CLOSED 即「直接
+    // 成员全部完成」，含子 Job 传播）。
+    wait_many(
+        &[WaitItem::new(job, ObjectSignals::CLOSED, 0)],
+        WAIT_DEADLINE_INFINITE,
+    )?;
+    Ok(())
+}
+
+fn kill_members(job: Handle, code: i64) -> Result<(), SystemCallError> {
+    for pid in enumerate_members(job, JobMemberKind::MemberProcesses)? {
+        let control = match process::derive_job(
+            job,
+            JobMemberKind::MemberProcesses,
+            pid,
+            DERIVED_CONTROL_RIGHTS,
+        ) {
+            Ok(control) => control,
+            // 成员已完成移表：收敛方向，跳过。
+            Err(SystemCallError::ObjectNotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        process::kill(control, code)?;
+        // kill 是异步请求：等 REAPABLE/CLOSED 后 drain 至 Complete。
+        wait_many(
+            &[WaitItem::new(control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, 0)],
+            WAIT_DEADLINE_INFINITE,
+        )?;
+        process::drain_to_completion(control)?;
+        close(control)?;
+    }
+    Ok(())
+}
+
+fn kill_children(job: Handle, code: i64) -> Result<(), SystemCallError> {
+    for jid in enumerate_members(job, JobMemberKind::ChildJobs)? {
+        let child = match process::derive_job(
+            job,
+            JobMemberKind::ChildJobs,
+            jid,
+            DERIVED_CONTROL_RIGHTS,
+        ) {
+            Ok(child) => child,
+            // child 已完成移表：跳过。
+            Err(SystemCallError::ObjectNotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        job_kill(child, code)?;
+        close(child)?;
+    }
+    Ok(())
+}
+
+/// 枚举至耗尽。占位屏障的零进展批（more=1 ∧ actual=0）以原 cursor
+/// 重试——占位窗口在创建方单个 syscall 内，重试不活锁。
+pub fn enumerate_members(
+    job: Handle,
+    kind: JobMemberKind,
+) -> Result<alloc::vec::Vec<u64>, SystemCallError> {
+    let mut ids = alloc::vec::Vec::new();
+    let mut buf = [0u64; JOB_ENUMERATE_MAX];
+    let mut cursor = 0u64;
+    loop {
+        let result = process::enumerate_job(job, kind, cursor, &mut buf)?;
+        ids.extend_from_slice(&buf[..result.actual as usize]);
+        if result.more == 0 {
+            return Ok(ids);
+        }
+        cursor = result.next_cursor;
+    }
 }
 
 fn page_plan(

@@ -178,6 +178,62 @@ pub enum ProcessDrainStatus {
 /// 单次 Drain 的工作上界（内核封顶；work unit 由内核定义）。
 pub const PROCESS_DRAIN_MAX: u32 = 256;
 
+/// JobId(u64) type；全局单调不复用，与 Pid 分立空间，root 恒为 1。
+pub type JobId = u64;
+
+/// 单次 JobEnumerate 的条目上界（内核封顶；条目为 8 字节 ID）。
+pub const JOB_ENUMERATE_MAX: usize = 128;
+
+/// JobControl 固定宽状态快照。计数是非精确近似值（不构成协议依据；
+/// 正确性走 CLOSED 等待与枚举收敛）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct JobSnapshot {
+    pub jid: JobId,
+    /// root 无父，为 0。
+    pub parent_jid: JobId,
+    pub state: u32,
+    pub live_processes: u32,
+    pub live_children: u32,
+    pub reserved: u32,
+    pub reserved2: u64,
+}
+
+/// Job 生命周期状态判别值（`JobSnapshot::state`）。
+/// Open 即使空也存活；Seal 只封创建；完成 = 自身 sealed && 成员空，
+/// 完成即 Dead/CLOSED。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum JobState {
+    Open = 0,
+    Sealed = 1,
+    Dead = 2,
+}
+
+/// 枚举/派生的成员维度判别值（JobEnumerate 与 JobDerive 的 kind）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum JobMemberKind {
+    /// 直接 child Jobs（JobId 序）。
+    ChildJobs = 0,
+    /// 直接 member processes（Pid 序）。
+    MemberProcesses = 1,
+}
+
+/// JobEnumerate 输出。契约：`more=1 ⇒ actual ≥ 1 ∨ next_cursor == 入参
+/// cursor`（后者是未决事务占位的零进展屏障，调用方以原 cursor 重试；
+/// 占位窗口在创建方单个 syscall 内，重试不活锁）；`more=0` 表示表内无
+/// 任何 ID > next_cursor 的（可见或占位）条目。违反即内核违约，
+/// 用户态拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct JobEnumerateResult {
+    /// 本批最后返回条目的 ID；无返回时等于入参 cursor。
+    pub next_cursor: u64,
+    pub actual: u32,
+    pub more: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<ProcessMapFlags>() == 4);
     assert!(core::mem::size_of::<ProcessCreateResult>() == 32);
@@ -188,6 +244,10 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessState>() == 4);
     assert!(core::mem::size_of::<ProcessExitReason>() == 4);
     assert!(core::mem::size_of::<ProcessDrainStatus>() == 4);
+    assert!(core::mem::size_of::<JobSnapshot>() == 40);
+    assert!(core::mem::size_of::<JobState>() == 4);
+    assert!(core::mem::size_of::<JobMemberKind>() == 4);
+    assert!(core::mem::size_of::<JobEnumerateResult>() == 16);
 };
 /// Process's main function product
 pub trait Termination {

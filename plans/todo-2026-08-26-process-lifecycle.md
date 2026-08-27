@@ -111,7 +111,7 @@ JobDerive(job_control, kind, id, rights, out: *Handle) -> ()
 2. ~~将 ProcessControl 前移到 ProcessCreate，建立 Process lifecycle 锁、无强引用环的线程成员表（含跨 hart IPI 最小正确版与 WaitContext cancellation 契约，见上「已拍板的结构决策」）；~~ 已完成（含 C1-C5/H1-H3/M1-M2 集中修复：Building 操作准入、Gone 时点、Start pin 事务、root 帧有界释放、硬预算计费、零分配发布、快照一致性、创建事务序）；
 3. ~~实现 fixed-width ProcessQuery、Building/Running ProcessKill、ProcessControl rights 与 CLOSED 等待；~~ 已完成；
 4. ~~实现固定预算 Process 收束游标和管理电平，同批给持久 init 加最小监督闭环（保留 controls、WaitMany(REAPABLE|CLOSED)、Drain 至 Complete），证明最后线程、active-hart ack、Handle/page-table drain 与 Dead 发布的顺序；~~ 已完成（live kill 正路径：srv_target Waiting 取消 + Building kill + 自终止）；
-5. 实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill（设计已拍板：第二批结构决策与「已确认的 Job ABI」）；
+5. ~~实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill~~ 已完成（2026-08-27：JobSeal/Query/Enumerate/Derive 四 syscall、有序 fallible 成员表、链锁封口闸门、完成传播与 libprocess 递归 job_kill；验收线 1–4 全过，virt ×6 / sifive_u / host 全绿，实施档案见 [archived/todo-2026-08-27-job-management-impl.md](archived/todo-2026-08-27-job-management-impl.md)）；
 6. 以当前 ustar 私有政策由持久 init 硬编码建立 services Job、启动并监督其中的 `srv_pm` 等服务；pm 只管理显式委托的子域，不提前设计 manifest；
 7. 接入 ThreadSpawn 前完成多线程 teardown barrier；active hart 必须切回 kernel satp、执行本地全量 SFENCE.VMA 后才确认离场，不以 SBI 请求已发送代替完成；
 8. 接入 capability-derived 调度域 eligibility，再开放 D64；

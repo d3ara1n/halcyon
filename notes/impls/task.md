@@ -67,12 +67,15 @@ ProcessBuilder 与从 Building 起即存在的 ProcessControl，并在事务提�
 把 Building process 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/
 回滚不遗留成员）。全局进程表已退役：单调 PID 分配器保留，未 Dead
 core 的生命周期根是 Job 成员表；Start 的事务 marker 同样落在成员表。
+每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
+释放，快照仍可应答）。
 
 ProcessStart 在提交前预构造主线程并在公平类队列放入 reservation marker；
 marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/输出全部
-准备成功后，提交区先做 lifecycle 线性化（Building→Running，kill/
-abandonment 先行则完整回滚返回 ObjectClosed），再替换预留项。PID 单调
-不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
+准备成功后，提交区先做链锁内封口检查与 lifecycle 线性化
+（Building→Running；kill/abandonment/seal 先行则完整回滚返回
+ObjectClosed），再替换预留项。PID 单调不复用，`parent_pid` 只供诊断，
+授权仅来自 Job/Process capabilities。
 
 ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
 （HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
@@ -85,6 +88,47 @@ capability-derived 调度域接线前明确拒绝。
 > ProcessStart 的发布必须按线程执行需求路由进兼容域——届时需把预留
 > 语义上收为所有类实现的接口，或由域层提供统一的预留通道；不得把现有
 > 自由函数当稳定接口直接跨域复用。
+
+## Job 管理面（`task/job.rs`）
+
+Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
+ `todo-2026-08-26-process-lifecycle.md` 第二批决策 9–15）：
+
+- **成员/子表**：按 ID 有序的 fallible 结构（首版有序 Vec + try_reserve +
+  二分定位，键为 Pid/JobId，条目为事务占位或强持对象）。枚举自
+  partition_point 连续取，单批 O(log n + N) 固定上界；插入/删除的
+  O(width) memmove 只在创建路径，不在完成标准的固定上界清单内；宽度
+  使 memmove 可观测时换 fallible 有序树（结构私有可换）。
+- **JobId**：全局单调不复用分配器（root 恒 1，与 Pid 分立空间）；
+  Pid/JobId 分配都在 owner Job 锁内与占位插入同临界区，表内 ID 序 =
+  分配序（消除多核乱序分配窗口下的枚举漏项）。
+- **创建/启动闸门**：JobCreate/ProcessCreate/ProcessStart 的「上行检查
+  祖先 seal + 提交」在先父后子链锁（≤JOB_DEPTH_MAX(32) 把，短临界区）
+  内线性化，与 JobSeal（持单锁）在 owner 锁上互斥，先到者定胜负；
+  任一祖先 sealed → ObjectClosed；JobCreate 超深度 32 → IllegalArgument。
+  祖先 weak 升级失败即「祖先已完成释放 ⟹ 曾 sealed」，同样 ObjectClosed。
+- **JobSeal**：O(1) 置位幂等，不扫表；Job 无收束工作，完成 = 自身
+  sealed ∧ 两表空，完成即置 dead 并发布 JobControl 的 CLOSED（等待
+  CLOSED 即「直接成员全部完成」屏障）。触发点三处（seal 时已空/成员
+  摘除后空/child 完成后空），事件驱动自底向上传播：逐级「放子锁、
+  取父锁」从父表移除并再判定，单步有界；root 完成发 CLOSED 但不从
+  任何表移除不释放。Dead 后两表必空（完成不变量即冻结），JobQuery
+  计数自然为零，快照的 jid/parent_jid 来自不可变字段。
+- **JobEnumerate**：游标分页（cursor = 上批最后返回条目 ID）；遇未决
+  事务占位即终止本批（屏障：next_cursor 严格小于占位 ID，占位不计
+  actual 但计入 more）；契约 `more=1 ⇒ actual ≥ 1 ∨ next_cursor ==
+  入参 cursor`（零进展屏障，调用方以原 cursor 重试——占位窗口在
+  创建方单个 syscall 内，协作式内核下有界完成，重试不活锁）。单批
+  上界 JOB_ENUMERATE_MAX(128)，条目 8 字节 ID。
+- **JobDerive**：按 ID 单目标派生（kind 0 = child JobControl，1 =
+  member ProcessControl）；请求 rights ⊆ 源 Handle rights ∩ 目标角色
+  allowed_rights，超集 RightsDenied；目标不在直接成员表（含已完成
+  移表）ObjectNotFound。派生 ProcessControl 复用存活 shell（单一
+  shell 身份，电平不分叉）；shell 已消散时从 core 铸造新 shell 并在
+  铸造点重放已达成的电平（REAPABLE）——control 消散的 REAPABLE
+  进程由此接回 drain 入口（派生兑底）。递归 JobKill 是用户态政策，
+  公共实现 `libprocess::job_kill`（逐层 seal → 枚举 → 派生 kill →
+  drain → 等 CLOSED）。
 
 ## 生命周期
 - **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（同样获得
@@ -140,22 +184,32 @@ capability-derived 调度域接线前明确拒绝。
   映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）
   后走终止路径，绝不 panic 内核。
 
-### 锁序契约（lifecycle 顶级锁）
+### 锁序契约（顶级）
 
-Process lifecycle 锁是跨子系统转换的顶级状态锁，方向约束是
-**lifecycle 锁内不出游**：
+顶级锁序规范：**Job 链锁（先父后子，≤32 把）→ lifecycle 锁 → 其他
+对象锁**。三类锁的共同纪律是「锁内不出游」：
 
-- 不在 lifecycle 锁内调用 subscribe/unsubscribe、offer/finish、enqueue、
-  IPI、对象 close callback、uaccess 或页表操作——这些动作经
-  TerminationTodo 在解锁后执行；
-- 不在 lifecycle 锁内获取任何其他锁（对象锁、WaitContext/期限表锁、
-  调度类锁、地址空间/HandleTable 锁）；
-- 反向的单向嵌套——在其他锁内进入 lifecycle（如 ProcessControl 快照
-  在 shell state 锁内调 lifecycle 快照）——因 lifecycle 不出游而安全，
-  不构成环，属合法调用序。
+- **Job 链锁（JobInner）**：只在链锁内改成员/子表与 sealed/dead 位；
+  ProcessStart 提交闸门在同一链锁临界区内嵌套调用 lifecycle 线性化
+  （锁序允许方向）。CLOSED 发布与完成传播在 JobInner 锁外执行（对象
+  wait 锁不与 JobInner 锁嵌套），传播逐级放子锁取父锁，无反向嵌套。
+  链锁按 root→owner 顺序获取；完成传播/单点操作（seal、摘除）只持
+  单把锁，不构成环。
+- **lifecycle 锁**：不在锁内调用 subscribe/unsubscribe、offer/finish、
+  enqueue、IPI、对象 close callback、uaccess 或页表操作——这些动作经
+  TerminationTodo 在解锁后执行；不在锁内获取任何其他锁（对象锁、
+  WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁、Job 锁）。
+  反向的单向嵌套——在其他锁内进入 lifecycle（如 ProcessControl 快照
+  在 shell state 锁内调 lifecycle 快照，或 Job 链锁内调 begin_running）
+  ——因 lifecycle 不出游而安全，不构成环，属合法调用序。
+- **对象锁**：JobControl/ProcessControl 的 wait 与 state 锁只做电平发布
+  与快照，不反向进入 Job/lifecycle 锁（JobInner 锁内不碰对象锁，
+  发布点全部在锁外）。
 
-JobState 锁与之同纪律：成员摘除/层级变更在锁外驱动 lifecycle 动作，
-对象锁（JobControl wait）不与 JobState 锁嵌套。
+已知合法嵌套（穷举）：HandleTable 锁内经 JobCreate/ProcessCreate 的
+发布回调进入 JobInner 锁（层级提交在 table.commit 前，无反向路径：
+链锁路径不碰任何 HandleTable 锁）；ProcessStart 链锁内进入 lifecycle
+锁。
 
 ## sleep
 

@@ -149,6 +149,56 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::JobSeal => {
+            respond_result(
+                frame,
+                task::job::seal(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::JobQuery => {
+            respond_result(
+                frame,
+                task::job::query(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::JobEnumerate => {
+            respond_result(
+                frame,
+                task::job::enumerate(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11],
+                    frame.x[12],
+                    frame.x[13] as usize,
+                    frame.x[14] as usize,
+                    frame.x[15] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::JobDerive => {
+            respond_result(
+                frame,
+                task::job::derive(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11],
+                    frame.x[12],
+                    Rights::from_raw(frame.x[13]),
+                    frame.x[14] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::Extend => {
             extend_heap(frame, thread, a0);
             Outcome::Completed

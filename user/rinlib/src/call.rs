@@ -7,8 +7,8 @@ use erhino_shared::{
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
     proc::{
-        ExitCode, ProcessCreateResult, ProcessDrainResult, ProcessMapFlags, ProcessSnapshot,
-        ProcessStartDescriptor, Tid,
+        ExitCode, JobEnumerateResult, JobSnapshot, ProcessCreateResult, ProcessDrainResult,
+        ProcessMapFlags, ProcessSnapshot, ProcessStartDescriptor, Tid,
     },
     wait::{WaitItem, WaitResult},
 };
@@ -112,6 +112,64 @@ pub unsafe fn sys_job_create(
         rights.raw() as usize,
         output as *mut Handle as usize,
         0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_job_seal(control: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::JobSeal, control.raw() as usize, 0, 0, 0).map(|_| ())
+}
+
+pub unsafe fn sys_job_query(control: Handle, output: &mut JobSnapshot) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::JobQuery,
+        control.raw() as usize,
+        output as *mut JobSnapshot as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_job_enumerate(
+    control: Handle,
+    kind: u32,
+    cursor: u64,
+    buf: *mut u64,
+    buf_len: usize,
+    output: &mut JobEnumerateResult,
+) -> SystemCallResult<()> {
+    sys_call6(
+        SystemCall::JobEnumerate,
+        [
+            control.raw() as usize,
+            kind as usize,
+            cursor as usize,
+            buf as usize,
+            buf_len,
+            output as *mut JobEnumerateResult as usize,
+        ],
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_job_derive(
+    control: Handle,
+    kind: u32,
+    id: u64,
+    rights: Rights,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call6(
+        SystemCall::JobDerive,
+        [
+            control.raw() as usize,
+            kind as usize,
+            id as usize,
+            rights.raw() as usize,
+            output as *mut Handle as usize,
+            0,
+        ],
     )
     .map(|_| ())
 }

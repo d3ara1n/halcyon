@@ -7,7 +7,7 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus,
+        ExecutionProfile, HandleGrant, Pid, ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus,
         PROCESS_DRAIN_MAX, ProcessExitReason, ProcessMapFlags, ProcessSnapshot,
         ProcessStartDescriptor, ProcessState,
     },
@@ -312,7 +312,24 @@ pub fn create(
         }
         Job::concrete(entry.object())?
     };
-    let pid = super::alloc_pid();
+    // 创建口闸门（链锁线性化）：链锁内上行检查祖先 seal、锁内分配 Pid
+    // 并插入成员占位；后续可失败构造统一由外层回滚占位。
+    let (pid, member_reservation) = job.gate_reserve_member()?;
+    let staged = create_staged(thread, &job, pid, control_rights, output, member_reservation);
+    if staged.is_err() {
+        job.rollback_member(member_reservation);
+    }
+    staged
+}
+
+fn create_staged(
+    thread: &Thread,
+    job: &Arc<Job>,
+    pid: Pid,
+    control_rights: Rights,
+    output: usize,
+    member_reservation: super::job::MemberReservation,
+) -> Result<(), SystemCallError> {
     let process = Arc::try_new(Process::new(pid, thread.process.pid, Arc::downgrade(&job)).map_err(map_space_error)?)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     let builder = ProcessBuilder::new(process.clone())?;
@@ -330,7 +347,6 @@ pub fn create(
         control_rights,
     )
     .map_err(super::handle::map_error)?;
-    let member_reservation = job.reserve_member(pid)?;
 
     let mut entries = Vec::new();
     entries.try_reserve(2).map_err(|_| SystemCallError::OutOfMemory)?;
@@ -349,8 +365,6 @@ pub fn create(
     if let Err(error) = space.check_range(output, core::mem::size_of::<ProcessCreateResult>(), true) {
         drop(space);
         table.rollback(reservation).expect("ProcessCreate reservation must remain owned");
-        drop(table);
-        job.rollback_member(member_reservation);
         return Err(error.into());
     }
     // SAFETY: ProcessCreateResult 无 padding，输出在同一 space 锁下验证。
@@ -620,13 +634,14 @@ fn start_staged(
         }
     }
 
-    // 生命周期线性化点：Building → Running（member=Staging，操作登记
-    // 被消费）。失败则无损 unpin 后整体回滚。
-    if !process.lifecycle.begin_running() {
+    // 提交线性化点：链锁内「上行检查祖先 seal + Building → Running」
+    // （member=Staging，操作登记被消费；lifecycle 锁嵌套于链锁内，锁序
+    // Job 链锁 → lifecycle 锁）。失败则无损 unpin 后整体回滚。
+    if let Err(error) = super::job::Job::start_commit_gate(process) {
         thread.process.handles.lock().unpin(pin_token);
         crate::sched::rollback_ready(ready_reservation);
         rollback_from_block(process, child_reservation, block_va, block.len());
-        return Err(pre(SystemCallError::ObjectClosed));
+        return Err(pre(error));
     }
 
     // 提交区：容量已预留、槽位已 pin——以下全部不可失败。
@@ -761,7 +776,7 @@ pub fn drain(
         let mut space = thread.process.space.lock();
         space.check_range(output, core::mem::size_of::<ProcessDrainResult>(), true)?;
     }
-    let object = resolve_control(thread, control, Rights::MANAGE)?;;
+    let object = resolve_control(thread, control, Rights::MANAGE)?;
     let control = concrete_control(&object)?;
     let dead_result = || ProcessDrainResult {
         work_done: 0,

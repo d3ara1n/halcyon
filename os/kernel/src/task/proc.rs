@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU64;
 
 use alloc::{sync::Arc, vec::Vec};
-use erhino_shared::proc::{Pid, ProcessMapFlags, Tid};
+use erhino_shared::{call::SystemCallError, proc::{Pid, ProcessMapFlags, ProcessState, Tid}};
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
 use crate::{
@@ -952,6 +952,37 @@ impl Process {
 
     pub(crate) fn control(&self) -> Option<Arc<super::process::ProcessControl>> {
         self.control.lock().as_ref().and_then(alloc::sync::Weak::upgrade)
+    }
+
+    /// 取存活 ProcessControl shell；已消散则从 core 铸造新 shell，并在
+    /// 铸造点重放已达成的电平——派生兑底由此接上 drain 入口。单一 shell
+    /// 身份：铸造在 control 槽锁内完成，并发派生只会得到同一对象
+    /// （两个 shell 的 wait 电平会分叉，绝不允许）。
+    ///
+    /// 电平重放含 Dead 补冻结：枚举先于移表的竞争窗口内 core 可能已
+    /// Dead——只补 REAPABLE 会漏终态冻结，后续 Query 命中「dead 未
+    /// 冻结」不变量升级失败。铸造路径上 snapshot 之后无并发 drain
+    /// （无任何存活 shell 可持 MANAGE），两步判定无翻转窗口。
+    pub(crate) fn revive_control(
+        self: &Arc<Self>,
+    ) -> Result<Arc<super::process::ProcessControl>, SystemCallError> {
+        let control = {
+            let mut slot = self.control.lock();
+            if let Some(control) = slot.as_ref().and_then(alloc::sync::Weak::upgrade) {
+                return Ok(control);
+            }
+            let control =
+                super::process::ProcessControl::new(self).map_err(|_| SystemCallError::OutOfMemory)?;
+            *slot = Some(Arc::downgrade(&control));
+            control
+        };
+        let (state, reason, code) = self.lifecycle.snapshot();
+        if state == ProcessState::Dead {
+            control.publish_dead(self.pid, self.parent, reason, code);
+        } else if self.lifecycle.is_reapable() {
+            control.publish_reapable();
+        }
+        Ok(control)
     }
 
     /// 所属 Job（生命周期根保证成员存续期 upgrade 必须成功）。

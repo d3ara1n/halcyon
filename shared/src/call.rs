@@ -80,6 +80,14 @@ pub enum SystemCall {
     ProcessKill = 0x17,
     /// REAPABLE/Dead 上推进有界资源收束批次。
     ProcessDrain = 0x18,
+    /// 封闭 Job 及其后代的创建/启动口（幂等）。
+    JobSeal = 0x19,
+    /// 读 JobControl 的固定宽生命周期快照。
+    JobQuery = 0x1a,
+    /// 单调 ID 序游标分页枚举 Job 直接成员。
+    JobEnumerate = 0x1b,
+    /// 在直接成员域内按 ID 派生 child JobControl / ProcessControl。
+    JobDerive = 0x1c,
 
     // -----Thread-----
     /// Finalized thread notifies kernel to cleanup

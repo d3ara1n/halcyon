@@ -1,15 +1,17 @@
 //! Job、affine ProcessBuilder 与 ProcessControl 的用户态基础封装。
 
 use crate::call::{
-    sys_job_create, sys_process_create, sys_process_drain, sys_process_kill, sys_process_map,
+    sys_job_create, sys_job_derive, sys_job_enumerate, sys_job_query, sys_job_seal,
+    sys_process_create, sys_process_drain, sys_process_kill, sys_process_map,
     sys_process_query, sys_process_start, sys_process_write,
 };
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
-        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags,
-        ProcessSnapshot, ProcessStartDescriptor, PROCESS_DRAIN_MAX,
+        JobEnumerateResult, JobMemberKind, JobSnapshot, JobState, ProcessCreateResult,
+        ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags, ProcessSnapshot,
+        ProcessStartDescriptor, JOB_ENUMERATE_MAX, PROCESS_DRAIN_MAX,
     },
 };
 
@@ -17,6 +19,85 @@ pub fn create_job(parent: Handle, rights: Rights) -> Result<Handle, SystemCallEr
     let mut output = Handle::INVALID;
     // SAFETY: output 在 syscall 期间有效且可写。
     unsafe { sys_job_create(parent, rights, &mut output)? };
+    Ok(output)
+}
+
+/// JobSeal：MANAGE；幂等封口——该 Job 及全部后代的创建/启动口永久
+/// 关闭（后续创建/启动返回 ObjectClosed）。
+pub fn seal_job(control: Handle) -> Result<(), SystemCallError> {
+    // SAFETY: 值参数由内核完整校验。
+    unsafe { sys_job_seal(control) }
+}
+
+/// JobQuery：READ；固定宽快照。未知 state 判别值与非零 reserved 拒绝
+/// （不降级解释）。
+pub fn query_job(control: Handle) -> Result<JobSnapshot, SystemCallError> {
+    let mut snapshot = JobSnapshot {
+        jid: 0,
+        parent_jid: 0,
+        state: 0,
+        live_processes: 0,
+        live_children: 0,
+        reserved: 0,
+        reserved2: 0,
+    };
+    // SAFETY: snapshot 在 syscall 期间有效且可写。
+    unsafe { sys_job_query(control, &mut snapshot)? };
+    if snapshot.reserved != 0
+        || snapshot.reserved2 != 0
+        || snapshot.state > JobState::Dead as u32
+    {
+        return Err(SystemCallError::InternalError);
+    }
+    Ok(snapshot)
+}
+
+/// JobEnumerate：READ；单调 ID 序游标分页。契约校验（违反即内核违约，
+/// 拒绝不降级）：`more=1 ⇒ actual ≥ 1 ∨ next_cursor == 入参 cursor`
+/// （后者是占位屏障零进展，调用方以原 cursor 重试）；actual 不超过
+/// min(buf_len, JOB_ENUMERATE_MAX)；actual > 0 时 next_cursor 必为本批
+/// 最后条目 ID（> 入参 cursor），actual == 0 时必等于入参 cursor。
+pub fn enumerate_job(
+    control: Handle,
+    kind: JobMemberKind,
+    cursor: u64,
+    buf: &mut [u64],
+) -> Result<JobEnumerateResult, SystemCallError> {
+    let mut result = JobEnumerateResult { next_cursor: 0, actual: 0, more: 0 };
+    // SAFETY: buf/result 在 syscall 期间有效且可写。
+    unsafe {
+        sys_job_enumerate(
+            control,
+            kind as u32,
+            cursor,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )?;
+    }
+    let cap = buf.len().min(JOB_ENUMERATE_MAX);
+    if result.more > 1
+        || result.actual as usize > cap
+        || result.actual == 0 && result.next_cursor != cursor
+        || result.actual > 0 && result.next_cursor <= cursor
+    {
+        return Err(SystemCallError::InternalError);
+    }
+    Ok(result)
+}
+
+/// JobDerive：MANAGE；在直接成员域内按 ID 派生 child JobControl /
+/// member ProcessControl。请求 rights 必须是源 Handle rights 与目标
+/// 角色 allowed_rights 交集的子集；目标已完成返回 ObjectNotFound。
+pub fn derive_job(
+    control: Handle,
+    kind: JobMemberKind,
+    id: u64,
+    rights: Rights,
+) -> Result<Handle, SystemCallError> {
+    let mut output = Handle::INVALID;
+    // SAFETY: output 在 syscall 期间有效且可写。
+    unsafe { sys_job_derive(control, kind as u32, id, rights, &mut output)? };
     Ok(output)
 }
 

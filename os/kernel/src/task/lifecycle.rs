@@ -1,13 +1,17 @@
 //! Process 生命周期状态机：Building → Running → Terminating → Dead 的
 //! 唯一真值、线程容器记录与终止待办（notes/ideas/task.md「进程」）。
 //!
-//! 锁序契约（顶级锁）：lifecycle 锁只改状态、终因、成员记录、active
-//! mask 与 Building 操作计数，锁内不调用 subscribe/offer/enqueue/IPI/
-//! 对象 close/uaccess/页表操作——这些动作经 [`TerminationTodo`] 延迟到
-//! 锁外执行。方向约束：lifecycle 锁内不得出游获取任何其他锁（对象锁、
-//! WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁）；反向的
-//! 单向嵌套（如 ProcessControl 快照在对象锁内进入 lifecycle）因
-//! lifecycle 不出游而安全，不构成环。
+//! 锁序契约（顶级）：**Job 链锁（先父后子，≤32 把）→ lifecycle 锁 →
+//! 其他对象锁**。lifecycle 锁可整体嵌套于 Job 链锁内（ProcessStart
+//! 提交闸门：链锁内上行检查祖先 seal 后同临界区调用 begin_running）；
+//! lifecycle 锁内只改状态、终因、成员记录、active mask 与 Building
+//! 操作计数，锁内不调用 subscribe/offer/enqueue/IPI/对象 close/
+//! uaccess/页表操作——这些动作经 [`TerminationTodo`] 延迟到锁外执行。
+//! 方向约束：lifecycle 锁内不得出游获取任何其他锁（对象锁、
+//! WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁、Job 链
+//! 锁）；反向的单向嵌套（如 ProcessControl 快照在对象锁内进入
+//! lifecycle，或链锁内进入 lifecycle）因 lifecycle 不出游而安全，不
+//! 构成环。
 //!
 //! 成员记录是线程容器的唯一真值，但 `Gone` 只在线程强引用真正消散后
 //! 由持有方写入（pick 吸收的 reap / WaitContext 完成方 / Start 收尾方）：
@@ -239,6 +243,17 @@ impl Lifecycle {
         let mut inner = self.inner.lock();
         inner.member = ThreadRecord::Gone;
         self.is_terminating()
+            && inner.active == 0
+            && inner.building_ops == 0
+    }
+
+    /// REAPABLE 条件谓词（派生铸造新 shell 的电平重放用）：已终止、
+    /// 线程已离场、无在途 Building 操作、无 active hart——与
+    /// thread_departed/leave_building_op 的发布判定同一合取。
+    pub(crate) fn is_reapable(&self) -> bool {
+        let inner = self.inner.lock();
+        self.is_terminating()
+            && matches!(inner.member, ThreadRecord::Gone)
             && inner.active == 0
             && inner.building_ops == 0
     }
