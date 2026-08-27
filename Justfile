@@ -84,6 +84,7 @@ make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
+    @ditto "{{TARGET_DIR}}/build/srv_target" "{{TARGET_DIR}}/initfs/bin/srv_target"
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 

@@ -1,0 +1,8 @@
+[package]
+name = "srv_target"
+version = "0.1.0"
+edition = "2024"
+description = "Kill supervision target"
+
+[dependencies]
+rinlib = {path = "../../rinlib"}
