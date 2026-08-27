@@ -53,25 +53,107 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。当�
 
 ### 等待的所有权与仲裁
 
-- **强引用随容器走**：线程的 Arc 恰由其所在容器持有——就绪队列、执行点调度循环、或等待条目。等待条目强持有等待中的线程；不存在从容器反向到线程的长期指针（进程不回指线程），退出回收的 Drop 链因此能真正释放帧。
+- **强引用随容器走**：线程的 Arc 恰由其所在容器持有——就绪队列、执行点调度循环、或等待条目。等待条目强持有等待中的线程；不存在从容器反向到线程的长期指针（进程不回指线程），退出回收的 Drop 链因此能真正释放帧。lifecycle 的 Waiting 记录只持 weak WaitContext（触达取消用），在 park 发布时于 lifecycle 锁内线性化。
 - **发布时序**：「可被唤醒」严格晚于「离开一切 hart 引用」——dispatcher 只把等待意图写入 HartLocal 私有槽，调度循环在 `clear_context` 之后的 Park 分支才向全局等待结构发布。完成方永远见不到仍在本 hart 执行的线程，双容器竞态在结构上不可能。
-- **代数仲裁**：每次阻塞创建独立 `WaitContext/WaitCore`，状态为 `Installing → Armed → Finishing → Done`。对象命中、deadline 与取消候选通过同一个 outcome 竞争；唯一赢家取得线程所有权并负责跨对象清理。期限表强持同一 WaitContext，过期扫描只 offer Deadline，不存在每线程 `wait_gen` 平行机制。
+- **代数仲裁**：每次阻塞创建独立 `WaitContext/WaitCore`，状态为 `Installing → Armed → Finishing → Done`。对象命中、deadline 与取消候选通过同一个 outcome 竞争；唯一赢家取得线程所有权并负责跨对象清理。终止取消（kill/abandonment）同样经 offer(Abandoned) 竞争；胜者负责线程消散与离场确认。期限表强持同一 WaitContext，过期扫描只 offer Deadline，不存在每线程 `wait_gen` 平行机制。
 
 ## Job、Building process 与发布
 
-root Job 由 `boot.rs` 铸造，完整 JobControl 作为 init 的启动 Handle。JobCreate 派生层级；ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable 与 affine ProcessBuilder。Building process 不进入进程表和调度器，关闭 builder 直接释放半成品。
+root Job 由内核 static anchor 强持（所有权图：anchor ─strong→ root Job，
+parent ─strong→ children，child ─weak→ parent；Job 直接成员表 ─strong→
+未 Dead 的 Process cores，Process ─weak→ Job）。JobCreate 派生层级；
+ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable、affine
+ProcessBuilder 与从 Building 起即存在的 ProcessControl，并在事务提交点
+把 Building process 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/
+回滚不遗留成员）。全局进程表已退役：单调 PID 分配器保留，未 Dead
+core 的生命周期根是 Job 成员表；Start 的事务 marker 同样落在成员表。
 
-ProcessStart 在提交前预构造主线程，并分别在进程表与公平类队列放入 reservation marker；marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/output 全部准备成功后，提交只替换预留项，不分配。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。完整事务见 [`startup.md`](startup.md)。
+ProcessStart 在提交前预构造主线程并在公平类队列放入 reservation marker；
+marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/输出全部
+准备成功后，提交区先做 lifecycle 线性化（Building→Running，kill/
+abandonment 先行则完整回滚返回 ObjectClosed），再替换预留项。PID 单调
+不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
 
-> 演进点：marker 预留（reserve/commit/rollback）当前由公平类的自由函数承载，不在 `SchedClass` trait 契约内。接入 D64 eligibility 时，ProcessStart 的发布必须按线程执行需求路由进兼容域——届时需把预留语义上收为所有类实现的接口，或由域层提供统一的预留通道；不得把现有自由函数当稳定接口直接跨域复用。
+ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
+（HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
+authority。固定宽 ProcessQuery、异步幂等 ProcessKill、REAPABLE 电平
+已接入；Dead 后 shell 冻结终态快照持续可查。D64 profile 在
+capability-derived 调度域接线前明确拒绝。
 
-当前 ProcessControl 随 Running process 绑定，进程回收后保留轻量 CLOSED/exit-code 壳供 WaitMany 观察；关闭 control 不终止进程。显式 kill 与状态查询尚未接入。D64 profile 在 capability-derived 调度域接线前明确拒绝，避免线程落到不兼容 hart。
+> 演进点：marker 预留（reserve/commit/rollback）当前由公平类的自由函数
+> 承载，不在 `SchedClass` trait 契约内。接入 D64 eligibility 时，
+> ProcessStart 的发布必须按线程执行需求路由进兼容域——届时需把预留
+> 语义上收为所有类实现的接口，或由域层提供统一的预留通道；不得把现有
+> 自由函数当稳定接口直接跨域复用。
 
 ## 生命周期
+- **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（同样获得
+  Building 起存在的 ProcessControl，无结构特例）；后续进程由用户态
+  `libprocess` 驱动 ProcessBuilder 映射、回填并发布。内核不解析 initfs
+  或服务拓扑。
+- **状态机**：`Building → Running → Terminating → Dead`，真值在
+  Process 内嵌 lifecycle（原子 state 快读 + 顶级锁保护终因/成员记录/
+  active 位图）。Exit、fault、ProcessKill 与 Building abandonment 在
+  各自适用状态竞争首次终止线性化点冻结终因（reason + i64 code），
+  后续事件幂等不覆盖；fault 经稳定 ProcessFaultCode 编码，不固化裸
+  scause。成员记录（Gone/Ready/Running/Waiting/Exiting）是线程容器
+  唯一真值：pick 后 trap 入口统一检查 Terminating（惰性撤销），enqueue
+  无条件入队不反向触碰 lifecycle 锁；Waiting 经 weak WaitContext 取消
+  （Abandoned 不回用户态，线程随上下文消散）；Running 由 kill 锁外发
+  IPI，目标在任意 trap 入口吸收为 Killed。
+- **退出收束**（有界分批，管理者驱动）：调度循环非-Resume 出口先归一
+  内核 satp（含全量 SFENCE.VMA）并清 active 位再处置线程；reap 先
+  drop 线程强引用再做离场确认（thread_departed → REAPABLE 持续电平）。
+  任何容器路径都只到达 REAPABLE；Dead 仅由 ProcessDrain 的 Complete
+  分支发布：HandleTable 先逐槽扫描摘项（take_next_bounded 硬预算），
+  对象 close 回调锁外执行（仍可用地址空间解除外部映射），随后
+  AddressSpace 分阶段：数据帧 tracker 逐个经帧池有界归还（FreeScan
+  游标可恢复、O(1) 校验重启），页表 L0/L1 表帧逐槽登记归还，root 帧
+  经 leak_root 交出后单独走 RootFree 阶段有界归还（绕过 TableTree
+  Drop 的递归扫描）。work unit 是真实执行步数（链扫描每步、槽位检查、
+  完成插入），预算是硬执行上界。完成时发布序固定：shell 先冻结终态
+  快照并置 CLOSED（原子清 REAPABLE，外部无 Dead+REAPABLE 混合视图）
+  → core 内部置 Dead → Job 成员表摘除（core 仅剩空壳）。并发批次以
+  drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存目标进程
+  （handle 游标 + 地址空间阶段游标 + 在途归还游标），同 authority 可
+  接管。init 持久保留全部服务 control：WaitMany(REAPABLE|CLOSED) →
+  Drain 至 Complete → 终态快照；对象 close 回调（如隧道 PEER_CLOSED）
+  发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
+- **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker，capability
+  可见前完成不可失败的成员提交；JobCreate 同构（child marker →
+  输出预留/写入（槽仍 Reserved，槽号对外不可用）→ 层级提交回调 →
+  table.commit，失败回滚 marker）。ProcessStart 提交前全部可失败
+  步骤完成（含 HandleTable pin：builder+grants 翻转 Pinned，多线程
+  调用方下其他线程不可见不可关），lifecycle 线性化失败则无损 unpin
+  后整体回滚；线性化后只余容量已预留的不可失败消费。
+- **close callback fanout 固定上界（约束）**：当前 role 集合下，唯一
+  级联关闭者是 MailboxOwner（close_owner 清空队列 ≤ MAILBOX_CAPACITY(16)
+  × MESSAGE_HANDLE_MAX(8) = 128 条 transit 条目），而全部可 transit
+  角色（MailboxSender/Once、NotificationSignaler、TunnelInvitation、
+  ProcessControl、JobControl、ProcessBuilder）的 close_transit 均为
+  叶子（no-op / O(1) abandon / O(1) 解除外部映射 + 对端信号），无同步
+  递归 drain 另一容器的路径——单次 close 的成本是 ≤ ~130 步的固定
+  常数，不随进程状态增长。**新增可 transit 的容器 role 时必须重审
+  此证明**（任何在 close_transit 中同步排空另一对象容器的角色都会
+  破坏该固定上界，需改为有界 continuation）。
+- **用户态页故障一律杀进程**：本内核无按需分配，所有区域创建时显式
+  映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）
+  后走终止路径，绝不 panic 内核。
 
-- **创建**：唯一 init 由内核从 BootPackage initial ELF 构造；后续进程由用户态 `libprocess` 驱动 ProcessBuilder 映射、回填并发布。内核不解析 initfs 或服务拓扑。
-- **退出**（Exit syscall / 用户态页故障）：当前线程不再入队 → 调度循环回收：摘进程表 → Drop 地址空间（表帧随页表树 Drop、数据帧 RAII 归还）→ ProcessControl 发布 CLOSED。当前一进程一线程，因此切换点已保证无其他 hart 触达该地址空间；ThreadSpawn 前必须增加线程成员表、active-hart 收束与远端 TLB invalidate/ack，不能延用该前提。
-- **用户态页故障一律杀进程**：本内核无按需分配，所有区域创建时显式映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）后走退出路径，绝不 panic 内核。
+### 锁序契约（lifecycle 顶级锁）
+
+Process lifecycle 锁是跨子系统转换的顶级状态锁：
+
+- 不得在对象锁、WaitContext/期限表锁、调度类锁、地址空间/HandleTable
+  锁内反向获取 lifecycle；
+- lifecycle 锁内只改状态、成员记录、active 位图、终因，取得 weak
+  context/待办标记；
+- 不在 lifecycle 锁内调用 subscribe/unsubscribe、offer/finish、enqueue、
+  IPI、对象 close callback、uaccess 或页表操作——这些动作经
+  TerminationTodo 在解锁后执行。
+
+JobState 锁与之同纪律：成员摘除/层级变更在锁外驱动 lifecycle 动作，
+对象锁（JobControl wait）不与 JobState 锁嵌套。
 
 ## sleep
 

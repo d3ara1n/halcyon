@@ -12,6 +12,7 @@
 | 邮箱 | `WRITABLE` | 占用低于容量，Send 可推进（sender 观察） |
 | 隧道端点 | `DATA` | 对端提交了状态改变提示 |
 | 隧道端点 | `PEER_CLOSED` | 对端已关闭，页内内容不再有对端保证 |
+| ProcessControl | `REAPABLE` | 线程与 active hart 已离场，管理者可推进有界资源收束 |
 | 任意对象 | `CLOSED` | 对象已进入不可复活的终态 |
 
 状态是条件，不是等待者私有的交付记录：多个等待者可同时观察同一位，WaitMany 返回绝不清除它。拥有语义的一方显式置位或清除；每种对象都必须定义清除前提。`CLOSED` 和 `PEER_CLOSED` 是持续可见的终态位。
@@ -26,6 +27,6 @@ Notification 显式创建、可等待。创建者获得唯一 owner Handle：不
 
 ## 终止请求与运行时分发
 
-进程终止请求可以由进程对象协议的状态位表达；它是协商请求而非强制回收。强制终结直接进入进程回收和 Handle drain。内核不向任意线程注入 handler 或改写用户执行现场。
+ProcessKill 是具 MANAGE authority 的显式异步操作，不以可由目标忽略的状态位表达。内核只请求各线程在安全边界离场，不向任意线程注入 handler 或改写用户执行现场。线程与 active hart 全部离场后 ProcessControl 置 REAPABLE；管理者以有界收束操作推进 Handle 和地址空间回收，最后清 REAPABLE 并置 CLOSED。
 
 用户态运行时若需回调，可由专门线程 WaitMany 于相关 Handle，在该线程普通调用栈上分发；程序也可显式检查对象状态。

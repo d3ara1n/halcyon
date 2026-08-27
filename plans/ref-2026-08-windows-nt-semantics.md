@@ -1,0 +1,35 @@
+# Windows NT：进程终止、句柄与 Job Object 语义取证
+
+> 取证日期：2026-08-26。来源限 Microsoft Learn 与 Microsoft 的 `win32metadata` Windows SDK 头文件镜像；本文件只记录 Windows 对外 API 所载明的事实。
+
+## `TerminateProcess`
+
+- `TerminateProcess` 无条件令目标进程退出；所需进程句柄权限为 `PROCESS_TERMINATE`。它停止进程中所有线程的执行，并请求取消所有未决 I/O；在这些 I/O 完成或取消前，已终止的进程不能退出。[`TerminateProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)
+- 调用者终止**自身**时，调用线程被停止且函数不返回；终止**其他**进程时，函数为异步：仅发起终止便立即返回。要确认目标已经终止，应对进程句柄调用 `WaitForSingleObject`。同一文档还规定：目标已终止而其句柄仍打开时，再调 `TerminateProcess` 失败，错误为 `ERROR_ACCESS_DENIED` (5)。[`TerminateProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)
+- Microsoft 的“Terminating a Process”页将终止的结果列为：剩余线程被标记终止、进程资源释放、其持有的内核对象句柄关闭、代码自内存移除、退出码设定、进程对象变为 signaled。该页也明确警告：若线程正等待内核对象，它在该等待完成前不会被终止，这会导致应用无响应。[`Terminating a Process`](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)
+- `TerminateProcess` 路径不调用附加 DLL 的 detach 通知。相对地，`ExitProcess` 会以“process detaching”值调用每个附加 DLL 的入口点。文档还明确：被 `TerminateProcess` 终止时，所有线程没有机会再运行代码，也不执行 termination-handler block。[`Terminating a Process`](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)
+- 终止一个进程**不会**终止它创建的子进程。[`Terminating a Process`](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)
+
+## 进程对象、句柄、终止后查询与等待
+
+- `CreateProcess` 返回的进程、主线程句柄“直到关闭前都有效”，即使其所代表的进程或线程已经终止。进程终止时，其内核对象也要等到所有持有该进程开放句柄的进程都释放那些句柄后才会销毁。[`Process Handles and Identifiers`](https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers)；[`TerminateProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)
+- 进程终止使进程对象进入 signaled 状态，从而释放等待该对象的线程。`WaitForSingleObject` 可以等待 process 对象；该函数要求所传句柄具有 `SYNCHRONIZE` 权限。若一个线程仍在等待时，另一线程关闭该句柄，等待行为未定义。[`Terminating a Process`](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)；[`WaitForSingleObject`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+- `GetExitCodeProcess` 立即返回。成功且进程尚未终止时输出 `STILL_ACTIVE`（它是 `STATUS_PENDING` 宏）；成功且进程已终止时输出由 `ExitProcess`/`TerminateProcess` 指定的值、`main`/`WinMain` 返回值，或导致未处理异常的异常值。该 API 要求 `PROCESS_QUERY_INFORMATION` 或 `PROCESS_QUERY_LIMITED_INFORMATION` 权限。[`GetExitCodeProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess)
+- `STILL_ACTIVE` 的数值为 259。Microsoft 明确警告：应用不能把 259 当作自己的退出码；否则检测此值的观察者会把已退出的进程误解为仍在运行，并可能无限循环。更一般地，因为该查询立即返回，得到 `STILL_ACTIVE` 只反映这次查询所观察到的尚未终止状态，不能作为随后仍存活的保证；以进程对象变 signaled 的 wait 确认终止，再读取退出码，才是文档指定的确认序列。[`GetExitCodeProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess)；[`TerminateProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)
+- 已退出但仍持有有效句柄时，文档明确支持的查询例子包括：`GetExitCodeProcess` 的退出码，以及 `GetProcessTimes` 的 `lpExitTime`。后者在进程未退出时该输出内容未定义；它同样要求查询权限。[`GetProcessTimes`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
+
+## Job Object：关闭、显式终止、存活与标志名称
+
+- Job object 是可命名、可安全控制、可共享的对象；对 job 的操作影响其关联进程。新建 job 时不关联任何进程。[`Job Objects`](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+- `CloseHandle(hJob)` 使**该** job handle 无效、递减对象的 handle count 并进行对象保留检查；它不是 `TerminateJobObject` 调用。对于没有 kill-on-close 限制的 job，Microsoft 明定该 job 在“最后一个 handle 已关闭**且**所有关联进程都已终止”时才销毁。因此关闭最后一个普通 job handle 本身不终止关联进程。[`CloseHandle`](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle)；[`Job Objects`](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+- `TerminateJobObject(hJob, code)` 要求 `JOB_OBJECT_TERMINATE` 权限，终止**当前**关联的所有进程；嵌套 job 时还包括其层级内所有 child job 的当前关联进程。关联进程不能延期或处理这次终止，语义等同于对每一个关联进程调用 `TerminateProcess`。[`TerminateJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject)
+- 存在的公开限制标志是 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`（值 `0x00002000`），不是 `JOB_OBJECT_TERMINATE_AT_CLOSE`。该标志经 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.BasicLimitInformation.LimitFlags` 设置；最后一个 job handle 关闭时，它使所有关联进程终止，之后 job 销毁。嵌套 job 上设此标志时，还终止该 job 及其 child job 的关联进程。[`JOBOBJECT_BASIC_LIMIT_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)；[`Job Objects`](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)；[Microsoft `winnt.h`](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/winnt.h)（当前文件定义 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，未定义 `JOB_OBJECT_TERMINATE_AT_CLOSE`）。
+
+## Job 成员资格、失败边界与会计
+
+- `AssignProcessToJobObject` 的 job 句柄必须有 `JOB_OBJECT_ASSIGN_PROCESS`；进程句柄必须同时有 `PROCESS_SET_QUOTA` 和 `PROCESS_TERMINATE`。同一 job 中的全部进程必须处于与 job 相同的 session。[`AssignProcessToJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject)
+- Windows 8 / Server 2012 起，进程可处于嵌套 job 层级中的多个 job。若进程已经属于 job，目标 job 必须为空或已位于该进程的嵌套 job 层级中，且不能设置 UI limits。旧系统（Windows 7/Server 2008 R2 及更早）中已在 job 的进程再次分配会以 `ERROR_ACCESS_DENIED` 失败。[`AssignProcessToJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject)
+- 创建嵌套层级时，文档规定先将所有进程分配到根 job，再将子集分配给直接 child，逐级进行；随机顺序可能暂时令 child 含有不在 parent 的进程，违反嵌套要求并使 `AssignProcessToJobObject` 失败。[`Nested Jobs`](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs)
+- 调用时若目标 job 或其父 job chain 中任一 job 正在终止，`AssignProcessToJobObject` 失败。若 job 的 user-mode 时间限制已耗尽，分配失败且指定进程被终止；若加入会使 active-process limit 超限，分配也失败且指定进程被终止。安全限制也可令正在运行的进程分配失败；`JOB_OBJECT_SECURITY_ONLY_TOKEN` 则要求进程以 suspended 状态创建。进程在加入前已进行的内存操作不被该调用检查。[`AssignProcessToJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject)
+- job 记录其全部关联进程的基本会计信息，包含已终止进程；`QueryInformationJobObject` 的 `JobObjectBasicAccountingInformation` 返回 `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`。其中 `TotalProcesses` 是 job 生命周期中关联过的进程总数（包括已终止者）；即使一次因 limit violation 而分配失败，该计数也递增。`ActiveProcesses` 是当前关联数；同一种失败路径会先暂时递增，待被终止进程退出且所有引用释放后递减。`TotalTerminatedProcesses` 只计因 limit violation 而终止的进程数。[`Job Objects`](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)；[`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)；[`QueryInformationJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject)
+- 嵌套层级中，会计先加到 immediate job，再聚合到 parent chain；每个 job 的会计包含该 job 自身及所有 child job 进程的资源用量。[`AssignProcessToJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject)；[`Nested Jobs`](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs)

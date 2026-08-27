@@ -48,7 +48,7 @@ StartupBlock outer 允许 Handle 数组结束与 payload 起点之间存在零�
 
 ## init 的职责与终止
 
-init 是临时的授权根，不是永久管理根。它初始取得完整 root JobControl 与平台 primordial capabilities，因此在机制上可以 spawn、kill、派生和授权；“不负责运行期管理”是启动配置规定的职责，而不是内核人为削弱其能力。
+init 是系统配置选定的持久 root supervisor。它初始取得完整 root JobControl 与平台 primordial capabilities，在用户态维护系统进程拓扑、恢复政策和长期 authority，因此可以 spawn、kill、派生、授权和收束服务。该职责来自初始 capability 图与配置，不由内核按 PID 或名称授予隐藏权限。
 
 init 独占解释 initfs，并按配置：
 
@@ -56,9 +56,11 @@ init 独占解释 initfs，并按配置：
 - 通过公共 loader 能力创建服务进程；
 - 创建 endpoint、Job 和管理 capability；
 - 将 ProcessControl、JobControl、设备资源与 namespace grants 交给相应服务；
-- 完成授权图发布后退出。
+- 完成授权图发布后进入持续监督循环。
 
-init 的正常退出、panic、fault 或显式 kill 都按普通进程处理。已经交付的 capabilities 与服务继续存在；仍只由 init 持有的 authority 随 HandleTable drain 消散。内核不级联终止服务、不自动重启 init，也不重新铸造丢失 authority。初始化配置必须保证所有需要长期存续的管理权在 init 退出前完成交付。
+init 位于其受管 services Job 之外，直接持有该 JobControl 及系统服务的 ProcessControls，负责服务的创建、退出处理、重启和递归收束。pm 是 services Job 内可被 init 监督的系统服务，可以管理 init 显式委托的子域或向其他进程提供进程管理协议，但不承担根监督链角色。
+
+init 的退出、panic、fault 或显式 kill 在内核中仍按普通进程处理：已经交付的 capabilities 与服务可以继续运行，内核不级联终止服务、不自动重启 init，也不重新铸造丢失 authority。但系统会失去唯一的拓扑维护、恢复和资源收束保证，进入配置定义的 unmanaged/failed 状态；平台可选择继续、停机或重启。这里没有 init 专用内核回收路径，只有用户态政策上的管理根失效。
 
 归档内路径只属于 initfs 协议。内核不提供按路径 spawn，也不因二进制名称授予 authority。
 
@@ -69,11 +71,11 @@ init 的正常退出、panic、fault 或显式 kill 都按普通进程处理。�
 ```text
 Job capability
   → ProcessCreate
-  → Building process + affine ProcessBuilder
+  → Building process + affine ProcessBuilder + ProcessControl
   → map anonymous target pages
   → copy bounded bytes into mapped target pages
   → ProcessStart(entry, stack, execution profile, grants, payload)
-  → Running process + ProcessControl
+  → consume ProcessBuilder and publish Running process
 ```
 
 launcher 负责 ELF program-header、段重叠、BSS、最终页权限、栈布局和执行需求。内核只验证地址范围、页权限、W^X、Building 状态、入口可执行、栈可写与 ABI 对齐，不读取文件名或 ELF 结构。
@@ -98,17 +100,19 @@ Process 生命周期：
 Building → Running → Terminating → Dead
 ```
 
-- **ProcessBuilder**：Building 阶段唯一、affine 的构造权；关闭即放弃并回收未发布进程；
-- **ProcessControl**：Running 后的显式管理/观察 capability；管理、等待、复制和运输由 rights 收窄；
-- **JobControl**：创建子 Job/Process、预算和故障收束的 authority，不是进程权限等级。
+- **ProcessBuilder**：Building 阶段唯一、affine 的构造权；关闭即放弃构造并使目标进入终止收束；
+- **ProcessControl**：ProcessCreate 即产生的稳定管理/观察 capability，贯穿 Building、Running、Terminating 与 Dead；管理、等待、复制和运输由 rights 收窄；
+- **JobControl**：创建、封口、分页枚举直接成员、预算和故障收束的 authority，不是进程权限等级。
 
-ProcessStart 成功时消费 builder，原子安装 GRANT entries、映射通用 StartupBlock、设置首线程上下文、发布进程并返回 ProcessControl。launcher 可以按配置保留、转交或立即关闭该 control；关闭 control 不终止进程。失败保持 builder、调用方 Handles 与目标不可运行状态；同一 builder 不得同时作为 ProcessStart target 与 grant 项。
+ProcessStart 成功时只消费 builder，原子安装 GRANT entries、映射通用 StartupBlock、设置首线程上下文并发布进程；ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。失败保持 builder、control、调用方 Handles 与目标不可运行状态；同一 builder 不得同时作为 ProcessStart target 与 grant 项。
 
-Dead 进程的地址空间和 HandleTable 应立即释放，exit status 与终态信号可由仍存活的 ProcessControl 观察；观察 capability 不应让已死亡进程继续占用运行资源。
+内核只提供 JobSeal、直接成员的有界分页枚举和单进程控制原语；递归 JobKill 由 pm 在用户态组合。Open Job 变空后仍可用于服务重启，Sealed Job 才在全部成员和 child Jobs 收束后进入 Dead。多数进程不持 JobControl，只通过 pm 协议请求创建或管理。
+
+Dead 表示进程的地址空间和 HandleTable 已经完成释放；exit status 与终态信号由仍存活的 ProcessControl shell 观察，观察 capability 不让已死亡进程继续占用运行资源。大规模 Handle 与页表收束由持管理 authority 的服务以有界内核原语分批驱动，Terminating 在最后一批完成前持续成立。
 
 ## 内核短路径
 
-进程构造 syscall 必须有明确上界：单次映射页数、单次写入字节、启动 Handle 数与普通 payload 长度都有限，launcher 以循环完成大映像。内核不在一个 syscall 中遍历 archive、解析 ELF、解析对象图或执行不受限路径策略。
+进程构造和收束 syscall 都必须有明确上界：单次映射页数、写入字节、启动 Handle 数、普通 payload 长度，以及单次关闭的 Handle 和回收的页表节点都有限；launcher 与 pm 以用户态循环完成大映像和大资源环境。内核不在一个 syscall 中遍历 archive、Job 子树、完整 HandleTable、完整地址空间、对象图或不受限路径策略。
 
 ## 外部参照的边界
 
