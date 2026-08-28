@@ -137,10 +137,10 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 [0, brk')             ELF LOAD 段
 [brk', block_end)     只读 StartupBlock
 [block_end, stack)    Extend 向上扩展的堆
-[2^38 - 8MiB, 2^38)  主线程栈
+[2^38 - 8MiB, 2^38)  首线程栈（libprocess 放置约定；内核仅映射 init bootstrap 栈）
 ```
 
-brk 在 launch 时越过 StartupBlock；Extend 从 brk 逐页映射并返回新 brk。主线程 sp 为 `2^38`，16 字节对齐。ASID 恒 0，地址空间切换执行全量 `sfence.vma`。
+brk 在 launch 时越过 init bootstrap 出生块；Extend 从 brk 逐页映射并返回新 brk。普通进程的出生块由组装者（libprocess）写入映像顶之上页对齐的约定区；首线程 sp 由组装者经 ProcessAttach 供给（libprocess 置于 `2^38`，16 字节对齐）。ASID 恒 0，地址空间切换执行全量 `sfence.vma`。
 
 - 进程页表 root 共享内核高半区顶层项；
 - owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的 FrameTracker 持有；任何 PTE 安装前先 `try_reserve` 记账容量，批量安装逐页进行，失败按逆序 unmap 后才释放 backing；

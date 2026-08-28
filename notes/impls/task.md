@@ -4,7 +4,7 @@
 
 ## 进程执行环境
 
-进程持有 AddressSpace 与 HandleTable；用户半区布局、brk、StartupBlock、主栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。任务侧在创建主线程时设置 sp 为用户半区顶（16 字节对齐），a0/a1 为 StartupBlock 基址与长度；用户 tp 当前置零。
+进程持有 AddressSpace 与 HandleTable；用户半区布局、brk、出生块约定区、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。执行需求（ELF 判定的 IsaRequirement）是进程级属性，Start 提交点冻结于 `Process.requirement`，线程经进程间接持有。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ProcessAttach 的 arg1/arg2 传入）；用户 tp 当前置零。
 
 ## 调度：域—类—执行点三层组合
 
@@ -34,7 +34,7 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。life
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Staging 表示 Start 已线性化但尚未提交 Ready，Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Staging 是成员表的 Building 期形态（预育表）——条目携带线程强引用，ProcessAttach 锁内原子插入（闭包式：tid 分配 + 构造 + 插入同临界区），Start 提交点在 begin_running 同一临界区整体转 Ready 并交出强引用，终止路径经 take_first_staging 游标摘除（打破 Staging↔Thread.process 引用环，环只在 Building 期存在）；Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 保留为非身份值（对齐 pid/JobId 哨兵纪律）。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
@@ -51,11 +51,11 @@ ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable、affine
 ProcessBuilder 与从 Building 起即存在的 ProcessControl，并在事务提交点
 把 Building process 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/
 回滚不遗留成员）。内核没有全局进程表：单调 PID 分配器只分配身份，
-未 Dead core 的生命周期根是 Job 成员表。ProcessCreate 使用成员占位，ProcessStart 另在目标调度类使用 Ready reservation。
+未 Dead core 的生命周期根是 Job 成员表。ProcessCreate 使用成员占位；组装序列为 ProcessMap/Write → ProcessGrant → ProcessAttach → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类逐条 reserve Ready。
 每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
 释放，快照仍可应答）。
 
-ProcessStart 负责 `Building → Running` 首次发布，并与 Job seal/termination 在 lifecycle 提交点竞争；完整 pin、grant 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
+ProcessStart 负责 `Building → Running` 首次发布（活体门：预育表非空；含预育原子提取），并与 Job seal/termination 在 lifecycle 提交点竞争；完整 pin、grant 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
 
 ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
 （HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
@@ -74,7 +74,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 - **JobId**：全局单调不复用分配器（root 恒 1，与 Pid 分立空间）；
   Pid/JobId 分配都在 owner Job 锁内与占位插入同临界区，表内 ID 序 =
   分配序（消除多核乱序分配窗口下的枚举漏项）。
-- **创建/启动闸门**：JobCreate/ProcessCreate/ProcessStart 的「上行检查
+- **创建/启动闸门**：JobCreate/ProcessCreate/ProcessStart（Attach/Grant 不上行检查，仅 Building 态准入）的「上行检查
   祖先 seal + 提交」在先父后子链锁（≤JOB_DEPTH_MAX(32) 把，短临界区）
   内线性化，与 JobSeal（持单锁）在 owner 锁上互斥，先到者定胜负；
   任一祖先 sealed → ObjectClosed；JobCreate 超深度 32 → IllegalArgument。
@@ -103,10 +103,10 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   drain → 等 CLOSED）。
 
 ## 生命周期
-- **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（同样获得
-  Building 起存在的 ProcessControl，无结构特例）；后续进程由用户态
-  `libprocess` 驱动 ProcessBuilder 映射、回填并发布。内核不解析 initfs
-  或服务拓扑。
+- **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（内嵌与
+  用户态同构的组装序列：Map/Write → 出生块 → Attach → Start，仅 payload
+  收编为 bootstrap 特例，无结构特例）；后续进程由用户态 `libprocess`
+  驱动 ProcessBuilder 组装。内核不解析 initfs 或服务拓扑。
 - **状态机**：`Building → Running → Terminating → Dead`，真值在
   Process 内嵌 lifecycle（原子 state 快读 + 顶级锁保护终因/线程成员
   表/active 位图）。Exit、fault、ProcessKill 与 Building abandonment 在
@@ -193,8 +193,10 @@ Job 成员表/子表、HandleTable 槽位与调度类就绪队列（`SchedClass`
 遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
 凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
 不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；
-④全部在容器锁内完成，无分配失败路径。StartupBlock 的逆序 unmap 属
-线性撤销，不使用 marker。
+④全部在容器锁内完成，无分配失败路径（attach_member 的插入为锁内
+try_reserve 原子可失败，失败无副作用——协议三要素成立，第四要素由
+「失败时条目不可见」替代）。出生块由组装者经 Write 交付，无内核
+回滚面。
 
 ## sleep
 

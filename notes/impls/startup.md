@@ -1,6 +1,6 @@
 # 启动资源与用户态 launcher 实现
 
-方向见 [`../ideas/bootstrap.md`](../ideas/bootstrap.md)、[`../ideas/object.md`](../ideas/object.md) 与 [`../ideas/task.md`](../ideas/task.md)。当前启动链是 BootPackage → 唯一 init → 用户态 launcher；内核不遍历归档、不识别服务名或服务拓扑。
+方向见 [`../ideas/bootstrap.md`](../ideas/bootstrap.md)、[`../ideas/object.md`](../ideas/object.md) 与 [`../ideas/task.md`](../ideas/task.md)。当前启动链是 BootPackage → 唯一 init → 用户态 launcher；内核不遍历归档、不识别服务名或服务拓扑。组装模型（线程是组装资源、双通道、生杀闭环）见 [`../ideas/task.md`](../ideas/task.md)「线程」；本篇记录机制落地。
 
 ## BootPackage v1
 
@@ -10,9 +10,9 @@
 
 `boot.rs` 在帧池注册前验证 envelope，并以实际 `total_len` 收窄保留区。内核只解析 initial ELF，不解释 payload。
 
-## StartupBlock outer ABI
+## 出生块（Birth Block）线格式
 
-`shared/src/startup.rs` 定义：
+出生块是**组装者与接收进程的用户约定数据**，内核不构造、不映射、不校验。`shared/src/startup.rs` 只保留线格式定义与构造/校验函数（用户态库工具），布局：
 
 ```text
 [StartupBlockHeader (48 B)]
@@ -21,53 +21,46 @@
 [opaque payload]
 ```
 
-Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload offset/length 与 reserved。几何要求 `handles_end <= payload_off`，间隙全零。普通 ProcessStart 构造紧凑块，bootstrap 允许把 prefix 补齐到页边界。
+Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload offset/length 与 reserved。几何要求 `handles_end <= payload_off`，间隙全零。Handle 数组保存目标进程 HandleTable 的真实句柄值（由 ProcessGrant 输出），不从 index 推导 slot/generation。
 
-Handle 数组保存 child HandleTable reservation 生成的真实值，不从 index 推导 slot/generation。outer validator 不解释 payload。
+接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（rinlib `env::init` 沿用旧 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl，Handle[1] init ProcessControl。普通进程 Handle 数组完全来自组装者的 grants，slot 含义由具体启动协议定义，不属于通用线格式。
 
-## 唯一 init bootstrap
-
-`os/kernel/src/boot.rs` 的流程是：
-
-1. 解析 initial ELF，创建 pid 1 的 AddressSpace 与 root Job 成员 core；
-2. 创建 root JobControl，并为 init 创建自身 ProcessControl；
-3. 以真实 child Handles 构造页对齐 StartupBlock prefix；
-4. prefix 使用 owned 只读页，payload 以 BootPackage 保留帧映射为 `U|R|A`，映入即收编为 init AddressSpace 的 owned backing；
-5. 构造主线程、绑定兼容调度域并 enqueue。
-
-init 的 StartupBlock Handle 顺序固定为：Handle[0] root JobControl，Handle[1] init ProcessControl。普通进程 Handle 数组完全来自 launcher 提供的 grants，slot 含义由具体启动协议定义，不属于通用 outer ABI。
-
-initial ELF 与 prefix 完成后，package 前缀页回投帧池；payload backing 随 init AddressSpace 回收。内核没有 pid 特判的保留洞。
-
-## Job/Process 构造 ABI
+## 组装 ABI（Building 期外部通道）
 
 `shared/src/proc.rs` 与 `shared/src/call.rs` 定义 fixed-width ABI，rinlib 封装位于 `user/rinlib/src/process.rs`：
 
 - JobControl `CREATE`：JobCreate、ProcessCreate；
 - JobControl `MANAGE`：JobSeal、JobDerive；`READ`：JobQuery、JobEnumerate；
 - ProcessCreate：一次事务交付 affine ProcessBuilder 与稳定 ProcessControl；
-- ProcessMap/Write：只操作 Building process，建立匿名零页并回填 backing；
-- ProcessStart：验证入口、栈、profile、payload 和 grants，成功消费 builder并首次发布进程；返回 `()`，ProcessControl 已由 ProcessCreate 交付。
+- ProcessMap/Write：Building process 的匿名零页映射与 backing 回填；
+- **ProcessGrant**：把 grants 从组装者表移入目标表，输出目标侧句柄值数组（组装者写入出生块）；
+- **ProcessAttach**：向 Building process 附入线程（`ProcessAttachDescriptor`：entry/sp/arg1/arg2），返回 tid；内核零资源分配（栈与出生块由组装者供给），无观察壳；
+- **ProcessStart**：活体检查门（已附线程 ≥1）→ `Building → Running` → 域绑定与执行需求冻结 → 预育线程整体入册；消费 builder。profile 为平铺参数。
 
-ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building abandonment。ProcessMap 最终权限拒绝 W+X；ProcessWrite 不要求最终 PTE 可写。
+ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building abandonment（预育线程与已装句柄随收束消解）。ProcessMap 最终权限拒绝 W+X；ProcessWrite 不要求最终 PTE 可写。
 
-### ProcessStart 事务
+### 三 op 事务
 
-提交前：
+**ProcessGrant**：拷入 grants → 调用者表 pin（原子验证 GRANT/rights 子集/去重，失败零副作用）→ 目标表 reserve 槽位 → 输出句柄值（copy_to_user，失败先 rollback 目标预留再 unpin 无损还原，终止由分发出口收束）→ 锁外提取 moved → 目标表 commit。单批上界 64。
 
-1. 拷入并验证 descriptor、payload 与 grants；
-2. 为按请求顺序承载 grant entries 的 Vec 预留容量；
-3. reserve child Handle slots，以真实 Handles 构造并映射 StartupBlock；
-4. 构造主线程并在目标调度类 reserve Ready 容量；
-5. 在调用者 HandleTable 同一临界区验证 builder MANAGE、grants GRANT/rights 子集/去重，并 pin 全部 entries。
+**ProcessAttach**：拷入 descriptor → 出生现场前置校验（entry 可执行、sp 可写且 16 对齐）→ `lifecycle::attach_member(闭包)`：lifecycle 锁内检查 Terminating/表长上限（`PROCESS_MAX_THREADS` 1024）、try_reserve 容量、闭包构造 Thread（tid 在锁内分配，从 1 起）、插入 `(tid, Staging{thread})`；失败零副作用（Closed/Limit/Oom）。Staging 条目携带线程强引用（预育表即成员表形态）；引用与 `Thread.process` 构成环，环只在 Building 期存在，终止游标 `take_first_staging` 打破。
 
-Job 祖先链锁内的 seal 检查与 `Building → Running` 是提交线性化点。提交后按 grant 请求顺序定点取 pinned entries、提交 child slots、消费 builder、绑定调度域并发布 Ready；该区不扫描聚合、不分配、不可失败。
+**ProcessStart**：解析 profile → 按预育数 reserve Ready 容量（计数读点与判点间的并发 attach 由 begin_running 的 expected 计数拒绝，ObjectBusy 重试）→ 调用者表 pin builder → Job 链锁内上行检查 seal + `begin_running(expected, out_staged)`（活体门 + `Building → Running` + Staging→Ready + 强引用交出**原子完成**，消除 gate 后被终止游标插队摘除的窗口）→ 提交区：绑定域、冻结 requirement、消费 builder、逐条 commit_ready。失败路径全部无损（unpin/rollback ready），Start 可重试。
 
-提交前任一失败都撤销 caller pins、Ready reservation、StartupBlock 映射和 child reservation；builder 与 grants 保持原值，Start 可重试。调用者 Handle 槽位顺序不影响 child Handle 数组顺序。
+## 唯一 init bootstrap（内核内嵌同构序列）
+
+`os/kernel/src/boot.rs` 以与用户态组装者同构的 op 序列构造 init（bootstrap 特例：进程未启动、无用户代码可执行）：
+
+1. 解析 initial ELF，创建 pid 1 的 AddressSpace（含 init 栈映射——内核供栈仅此一处 bootstrap 例外）与 root Job 成员 core；
+2. 创建 root JobControl 与 init ProcessControl，预留 Handle 槽并安装；
+3. 以真实句柄值构造出生块 prefix（用户态线格式），payload 以 BootPackage 保留帧映射为只读，映入即收编为 init 地址空间 owned backing；
+4. 冻结 requirement、绑定兼容域、`begin_running` 入册首线程并发布 Ready。
+
+initial ELF 与 prefix 完成后，package 前缀页回投帧池；payload backing 随 init 地址空间回收。内核没有 pid 特判的保留洞。
 
 ## 用户态公共 loader
 
-`os/elf` 是 bootstrap 与用户态共用的纯逻辑 parser。`user/frameworks/libprocess` 验证 entry、segment overlap、文件边界和页级 W^X，合并连续同权限页，分块 ProcessMap/ProcessWrite，映射固定主栈并组装 ProcessStart descriptor。它不产生 authority，调用者必须显式持 JobControl。
+`os/elf` 是 bootstrap 与用户态共用的纯逻辑 parser。`user/frameworks/libprocess` 验证 entry、segment overlap、文件边界和页级 W^X，合并连续同权限页，分块 ProcessMap/ProcessWrite；组装序列为 Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区（返回块基址）→ Attach（arg1/arg2 = 块基/块长）→ Start。它不产生 authority，调用者必须显式持 JobControl。
 
 ## init/pm 当前政策
 
@@ -81,13 +74,13 @@ root
    └─ acceptance
 ```
 
-所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，按 REAPABLE|CLOSED → ProcessDrain → Query 收束。pm 通过 StartupBlock grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留 pm_domain control 作为兜底。pm 对委托域执行枚举→派生→kill→drain→seal。
+所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，按 REAPABLE|CLOSED → ProcessDrain → Query 收束。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留 pm_domain control 作为兜底。pm 对委托域执行枚举→派生→kill→drain→seal。
 
 acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整域 job_kill。init 在全部服务完成后常驻管理端点，不自终止；无 runnable、无 timeout owner 时系统进入 quiescent shutdown。
 
 ## 验证
 
-- shared host：BootPackage/StartupBlock canonical geometry、零 padding 与空 payload；
-- handle_table host：Start pin 顺序、rights 回滚、reservation 与 TRANSIT/GRANT；
+- shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
+- handle_table host：pin 顺序（builder/grant 双形态）、rights 回滚、reservation 与 TRANSIT/GRANT；
 - libprocess host：entry、segment overlap 与页级 W^X；
-- QEMU acceptance：`virt`、`virt-release`、hetero、nofd 与 `sifive_u` 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态和 quiescent 锚点；失败锚点或缺失 profile 锚点使 recipe 失败。
+- QEMU acceptance：`virt`、`virt-release`、hetero、nofd 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态和 quiescent 锚点；`sifive_u` 同锚点集但存在未决卡死问题（见 `plans/todo-2026-09-thread-model.md`「批一未决问题」），修复后恢复常绿。
