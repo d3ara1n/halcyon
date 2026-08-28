@@ -116,7 +116,7 @@ JobDerive(job_control, kind, id, rights, out: *Handle) -> ()
 7. ~~接入 ThreadSpawn 前完成多线程 teardown barrier；active hart 必须切回 kernel satp、执行本地全量 SFENCE.VMA 后才确认离场，不以 SBI 请求已发送代替完成；~~ 已完成（2026-08-28：线程成员表（tid 寻址有序 fallible Vec、离场即摘）取代单值 ThreadRecord，Gone 态删除；等待取消改锁外游标零分配；IPI 目标 = 冻结时刻 active 位图快照；归一收敛到 trap 汇编非 Resume 出口（execution-context.md 已知简化消解）；同批消解 KNOWN_ISSUES 写回 panic 面（deliver_output 复检即杀 + 分发出口终止检查）；实施计划见 [archived/todo-2026-08-28-thread-teardown-barrier.md](archived/todo-2026-08-28-thread-teardown-barrier.md)，review 计划见 [todo-2026-08-28-thread-teardown-review.md](todo-2026-08-28-thread-teardown-review.md)，验收 virt ×4 / sifive_u / host 全绿）；
 8. ~~接入 capability-derived 调度域 eligibility，再开放 D64~~ 已完成（2026-08-28：签名等价类域推导、三处绑定冻结、最弱兼容域默认、F2 trait 上收、Q 谓词修正、srv_fp D64 验证负载与多域 DTB 变体验收线；设计决策与收口注记见 [todo-2026-08-28-domain-eligibility.md](todo-2026-08-28-domain-eligibility.md)）；
 9. 对 Building/Ready/Running/Waiting、自杀、重复 kill、并发 Exit/fault、pm 接管、Job 枚举/派生/seal/完成传播竞态（含多核 ID 乱序分配窗口）和最后 control 关闭做 host/virt 多核验证；
-10. 同步 `notes/impls/{task,execution-context,ipc,startup}.md`。
+10. 同步 `notes/impls/{task,execution-context,ipc,startup}.md`，并与 carryover 的 notes 结构整改合并执行（2026-08-28 拍板）：ideas/device.md 重写、ecs.md 降级、idea 层补方向性结论唯一归属、施工状态表述迁移、wait/fs 术语统一（Deadline 漂移）、README RPC 索引修正。
 
 ## 完成标准
 

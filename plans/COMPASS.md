@@ -22,14 +22,32 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | 文件 | 概要 |
 |---|---|
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已完成收口，03–07 待做 |
-| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——step 1–7 已实施收口（step 7 多线程 teardown barrier 与写回 panic 面消解，review 计划见 [todo-2026-08-28-thread-teardown-review.md](todo-2026-08-28-thread-teardown-review.md)）；剩余 step 9–10：多核验证矩阵、文档终态收口 |
-| [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备接入重审、IPC 压力验证线、notes 结构整改、F2/F4 注记 |
+| [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md) | 下一自然序主线：完整进程生命周期与终止屏障——step 1–8 已实施收口（step 8 调度域 eligibility 与 D64 开发，review 计划见 [todo-2026-08-28-domain-eligibility-review.md](todo-2026-08-28-domain-eligibility-review.md)）；剩余 step 9–10：多核验证矩阵、文档终态收口（含 notes 结构整改）；此后首选大项是多线程（ThreadSpawn）里程碑 |
+| [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备接入重审、IPC 压力验证线、notes 结构整改（已并入 step 10 批次） |
 | [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart 期限表、MappingLease、公理层与文档自洽的复核轴 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
 | [`todo-2026-08-28-thread-teardown-review.md`](todo-2026-08-28-thread-teardown-review.md) | 生命周期 step 7（多线程 teardown barrier，提交 d741880）的未来审查计划：成员表不变量、游标取消锁序、汇编出口归一、写回复检即杀 |
 | [`todo-2026-08-28-domain-eligibility.md`](todo-2026-08-28-domain-eligibility.md) | 生命周期 step 8：调度域 eligibility 接线与 D64 开放——已实施收口（签名等价类域推导、F2 trait 上收、srv_fp 验证负载、多域 DTB 变体全绿），review 计划见 [todo-2026-08-28-domain-eligibility-review.md](todo-2026-08-28-domain-eligibility-review.md) |
 
 常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
+
+## 挂起项
+
+无计划文档、纯等触发条件的延后项素引（收口时扫描本表：条件到即转正式计划或并入主线；本表只存索引，真值在详情列所指处）。有计划文档的排队看活跃计划表，会消灭的问题看 `KNOWN_ISSUES.md`，review 承接看 carryover——三者不在此重复。
+
+| 事项 | 触发 | 详情 |
+|---|---|---|
+| CPU 预约对象（budget/period、pick 边界配额过滤） | 不可信域接入 | `ideas/task.md`「Job」 |
+| MemoryObject（借出视图、派生切片） | 不可信域接入 | `ideas/task.md`「Job」 |
+| fence.i 代码代次优化 | **已满足**（step 7 active 集合）；另一半条件「开销实测可见」未验 | `impls/task.md`「调度」 |
+| 显式 affinity / 跨域迁移 ABI | 多线程（ThreadSpawn）/迁移纪元 | `todo-2026-08-28-domain-eligibility.md` 决策 3–4 |
+| Tunnel 多页数据面 | 吞吐需求 | `ideas/tunnel.md` |
+| initfs manifest / 服务编排 | 需要正式服务编排 | `ideas/bootstrap.md` |
+| ld-erhino 动态链接（PT_INTERP、共享库） | 无明确触发，构想态 | `ideas/bootstrap.md` |
+| F-only/Q/V/TSO 档位建模 | 真实需求出现 | `impls/execution-context.md` |
+| TLS ABI（用户 tp 置零中） | 需要 TLS 时 | `impls/task.md` |
+| 多用户 / ACL | 多用户需求 | `ideas/object.md` |
+| ASID 分配 + remote call TLB shootdown | 地址空间切换开销实测 | `impls/task.md` |
 
 ## 位置
 
@@ -41,7 +59,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 - StartupBlock v2 与 BootPackage 启动链已落地：outer 为 Header + 实际 child Handle 数组 + 可零 padding + opaque payload；内核只解析 fixed envelope 与唯一 init ELF，payload 以只读页交给 init（映入即收编 owned backing）。实现现状见 `notes/impls/startup.md`。
 - 对照负载：`user/systems/` 与 `user/drivers/` 五服务（fs/init/pm/drv_spi_sifive + D64 验证负载 srv_fp）。fs 经用户态 FAL 真路径完成创建/枚举/属性/符号链接/偏移读写，验收线已过（`bf32c1c`）；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
 - 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、Building-only Map/Write、事务化 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy。进程生命周期改造已实施（见上）。剩余方向：内核提供 JobSeal/分页枚举，递归 JobKill 由 init/pm 等用户态管理者组合（step 5），持久 init 是当前系统配置的 root supervisor。initfs manifest/archive 另案设计。方向见 `notes/ideas/{task,bootstrap}.md`，实现现状见 `notes/impls/{startup,task}.md`。
-- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。**step 7（ThreadSpawn 前多线程 teardown barrier）已实施收口（2026-08-28）**：线程成员表（tid 寻址、离场即摘）取代单值记录，等待取消锁外游标化（零分配），归一收敛到 trap 汇编非 Resume 出口，KNOWN_ISSUES 写回 panic 面消解（deliver_output 复检即杀 + 分发出口终止检查）；ThreadSpawn 接入面清单入档计划篇。**首次 release 验证暴露并修复 trap 入口 x5 破坏**（SPP 检查在保存前用 t0，每次用户 trap 覆写用户 x5；修复经已保存的 t5 中转，寄存器纪律入档 execution-context.md，调查档案 [archived/review-2026-08-28-release-trap-entry-x5.md](archived/review-2026-08-28-release-trap-entry-x5.md)）；自此 release 验证线纳入阶段收尾必跑（`just virt-release`）。**step 8（capability-derived 调度域 eligibility 与 D64 开放）已实施收口（2026-08-28）**：域按需求满足签名等价类推导（`os/sched_domain` 纯逻辑 crate，host 可测）、boot 冻结、Start 提交点绑定进程，多域默认落最弱兼容域；reserve/commit/rollback 上收 `SchedClass` trait（F2 勾销）；D64 兼容谓词修正（FLEN 恰 64，Q 排除）；验证面新增 `srv_fp` D64 负载（gc target：fsqrt/fmadd 位型、FPR/fcsr 跨 trap 往返、轮转复检）与 `virt-hetero`/`virt-nofd` 多域 DTB 变体（`tools/make-hetero-dts.py` + `ERHINO_DTB`）；virt/virt-release/hetero/nofd/sifive_u/host 全绿，方向公理入档 ideas/task.md「线程」。生命周期剩余 step 9（多核验证矩阵）与 step 10（文档终态收口）。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
+- 下一自然序：完整进程生命周期与用户态多线程屏障 → FAL 剩余面（DirectoryGrant、跨进程 provider、服务发现）→ 设备/中断接入 → 异构（分片计划见活跃计划表）。**step 7（ThreadSpawn 前多线程 teardown barrier）已实施收口（2026-08-28）**：线程成员表（tid 寻址、离场即摘）取代单值记录，等待取消锁外游标化（零分配），归一收敛到 trap 汇编非 Resume 出口，KNOWN_ISSUES 写回 panic 面消解（deliver_output 复检即杀 + 分发出口终止检查）；ThreadSpawn 接入面清单入档计划篇。**首次 release 验证暴露并修复 trap 入口 x5 破坏**（SPP 检查在保存前用 t0，每次用户 trap 覆写用户 x5；修复经已保存的 t5 中转，寄存器纪律入档 execution-context.md，调查档案 [archived/review-2026-08-28-release-trap-entry-x5.md](archived/review-2026-08-28-release-trap-entry-x5.md)）；自此 release 验证线纳入阶段收尾必跑（`just virt-release`）。**step 8（capability-derived 调度域 eligibility 与 D64 开放）已实施收口（2026-08-28）**：域按需求满足签名等价类推导（`os/sched_domain` 纯逻辑 crate，host 可测）、boot 冻结、Start 提交点绑定进程，多域默认落最弱兼容域；reserve/commit/rollback 上收 `SchedClass` trait（F2 勾销）；D64 兼容谓词修正（FLEN 恰 64，Q 排除）；验证面新增 `srv_fp` D64 负载（gc target：fsqrt/fmadd 位型、FPR/fcsr 跨 trap 往返、轮转复检）与 `virt-hetero`/`virt-nofd` 多域 DTB 变体（`tools/make-hetero-dts.py` + `ERHINO_DTB`）；virt/virt-release/hetero/nofd/sifive_u/host 全绿，方向公理入档 ideas/task.md「线程」。生命周期剩余 step 9（多核验证矩阵）与 step 10（文档终态收口，含 notes 结构整改）；**此后首选大项是多线程（ThreadSpawn）里程碑**——teardown barrier、线程成员表、active 位图、每线程 FP 状态与域绑定已全部就绪，它是 IPC 压力验证线、signal 监听线程模式与 TLS 的共同前置。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
 
 ## 戒律
 

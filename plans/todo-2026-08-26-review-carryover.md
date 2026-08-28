@@ -9,7 +9,7 @@
 
 ## 来源 [`review-2026-08-26-notes-design.md`](archived/review-2026-08-26-notes-design.md)
 
-文档结构问题（2026-08-26 核查均未处理）：
+文档结构问题（2026-08-26 核查均未处理；2026-08-28 拍板与生命周期 step 10 文档终态收口合并执行，见 [todo-2026-08-26-process-lifecycle.md](todo-2026-08-26-process-lifecycle.md) 实施顺序 10）：
 
 - [ ] `ideas/device.md` 与 capability/FAL/Notification 方向冲突，整体重写；
 - [ ] `ideas/ecs.md` 仍是应用构想，降级到 robotics/application 子域或 plans；
@@ -19,7 +19,7 @@
 - [ ] wait/signal、fs/fal 重复定义同一不变量，Deadline 术语漂移需统一；
 - [ ] `notes/README.md` RPC 索引重复且主题映射不准确。
 
-方向性后续（原「建议后续顺序」，已完成项已删）：
+方向性后续（原「建议后续顺序」，已完成项已删；fs 真路径验收后的一次性 notes 修订与上述结构整改同属 step 10 批次）：
 
 - [ ] fs 真路径验收达成后，一次性修订 object/message/startup/task 等 ideas 与对应 impls（核查是否已随各批提交同步完成）。
 
