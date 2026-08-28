@@ -31,8 +31,9 @@ BOOT_PACKAGE := TARGET_DIR/"boot-package.bin"
 
 # QEMU
 # BootPackage 装载地址：virt DRAM 1GiB 取高址；sifive_u 实际 DRAM 仅 128MiB，
-# 取 dtb 声明的 0x86000000（与 dts 的 boot-package reg 保持一致）。
-BOOT_PACKAGE_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x86000000" }
+# 取 dtb 声明的 0x84000000（与 dts 的 boot-package reg 保持一致；尾部 64MB 作装载区，
+# 帧池只按实际包长排除，扩窗零内存代价）。
+BOOT_PACKAGE_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x84000000" }
 # 与 virt DTS 声明的 Zkr 能力一致；sifive_u 不声明该扩展。
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
 QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
@@ -92,6 +93,7 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/srv_target" "{{TARGET_DIR}}/initfs/bin/srv_target"
     @ditto "{{TARGET_DIR}}/build/srv_fp" "{{TARGET_DIR}}/initfs/bin/srv_fp"
+    @ditto "{{TARGET_DIR}}/build/srv_hammer" "{{TARGET_DIR}}/initfs/bin/srv_hammer"
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 

@@ -9,8 +9,8 @@
 	chosen {
 		#address-cells = <0x2>;
 		#size-cells = <0x01>;
-		boot-package@86000000 {
-			reg = <0x0 0x86000000 0x2000000>;
+		boot-package@84000000 {
+			reg = <0x0 0x84000000 0x4000000>;
 			compatible = "erhino,boot-package-v1";
 		};
 	};
