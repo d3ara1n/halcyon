@@ -39,7 +39,7 @@
 
 - srv_fp 的 FPR probe（f30/f31 硬名）对编译器 FP 使用的假设：rinlib/debug!/sys_sleep 路径当前无 FP 指令生成——依赖 gcc target 全量重编（build-std）下 rinlib 也无 FP；若未来 rinlib 引入 FP（如格式化浮点），probe 可能被调用点 clobber，验收线将以 FAILED 暴露——假设是否值得在服务内注释或 probe 加固（读写间无任何 Rust 调用）。
 - fcsr RTZ 测试的数学前提（5/7 尾数余数 ≈ 6/7 ulp > 1/2）：RNE 进位、RTZ 截断必不同——前提的正确性复核。
-- make-hetero-dts.py 的变换稳健性：cpu 块边界识别（`cpu@N {` / `}`）对嵌套子节点（interrupt-controller）的块退出判定（子节点 `}` 是否会提前终止 cpu 块跟踪——当前实现 stripped == "}" 即清 cpu，嵌套子节点的 `}` 会把后续行视为块外！审查此 bug 面：isa-extensions 行在子节点前出现，当前 DT 形态下不触发，但脚本对任意 dts 非鲁棒）。
+- make-hetero-dts.py 的变换稳健性：初版块退出用 `}` 精确比较（DTS 块结束实为 `};`，死分支），靠后续 `cpu@N` 刷新碰巧正确——已在 `4280d3b` 改为花括号深度跟踪（嵌套子节点如 interrupt-controller 正确闭合）；审查修正版对单行多括号、cpu 块外 isa-extensions 等病态输入的行为与 hetero/all 两种变换的边界。
 - ERHINO_DTB 覆盖与 make_dtb 固定路径：变体 DTB 不再被官方构建覆写；DTB_DEFAULT/DTB 双变量的语义分界清晰。
 
 ### 既有回归面
