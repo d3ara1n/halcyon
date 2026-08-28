@@ -1,0 +1,8 @@
+[package]
+name = "srv_fp"
+version = "0.1.0"
+edition = "2024"
+description = "D64 eligibility verification workload (LP64D target only)"
+
+[dependencies]
+rinlib = {path = "../../rinlib"}

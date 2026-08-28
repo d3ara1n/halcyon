@@ -9,41 +9,13 @@
 //! 已弃用的 `riscv,isa` 不解析。每个 hart 独立读取 status 与能力。
 
 use dtb::{cells_u64, topology::{self, TopoLevel}, Fdt};
+pub use sched_domain::HartCapabilities;
 
 use crate::hart::HART_NUM_LIMIT;
 
 /// 内核基线要求的扩展集合（`i` 由 isa-base rv64i 隐含）：
 /// RV64IMAC + Zicsr + Zifencei + Zicntr。
 const BASELINE_EXTENSIONS: [&str; 6] = ["m", "a", "c", "zicsr", "zifencei", "zicntr"];
-
-/// hart 的用户可见持久状态扩展（DT 核验的硬件事实）。
-#[derive(Clone, Copy, Default, Debug)]
-pub struct HartCapabilities {
-    /// F 扩展（单精度浮点）。
-    pub f: bool,
-    /// D 扩展（双精度浮点，蕴含 F）。
-    pub d: bool,
-    /// Q 扩展（四精度浮点）。
-    pub q: bool,
-    /// V 扩展（向量）。
-    pub v: bool,
-}
-
-impl HartCapabilities {
-    /// 有效 FLEN：无 F 为 0、F 为 32、D 为 64。Q 不经此表达——
-    /// 它是独立状态模型，不是「更宽」的排序捷径。
-    /// （准备态：domain eligibility 接线后生效）
-    #[expect(dead_code)]
-    pub fn flen(&self) -> usize {
-        if self.d {
-            64
-        } else if self.f {
-            32
-        } else {
-            0
-        }
-    }
-}
 
 /// CPU 的 MMU 类型，`Bare` 表示不可运行本内核（无分页）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -32,7 +32,7 @@ notes/     设计文档：
 plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（跨会话导航）
 ```
 
-对照负载：`user/systems/` + `user/drivers/` 的四个服务（fs/init/pm/drv_spi_sifive）是集成验证负载，其中 fs 依赖 FAL——fs「干净被杀」（用户态 panic → 退出回收，内核不崩）是其依赖面就绪前的达标线。
+对照负载：`user/systems/` + `user/drivers/` 的五个服务（fs/init/pm/drv_spi_sifive/srv_fp，其中 srv_fp 是 D64 验证负载，经 gc target 单独构建）是集成验证负载，其中 fs 依赖 FAL——fs「干净被杀」（用户态 panic → 退出回收，内核不崩）是其依赖面就绪前的达标线。
 
 ## 构建与验证
 

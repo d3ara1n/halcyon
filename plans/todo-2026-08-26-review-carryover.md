@@ -36,4 +36,4 @@
 ## 来源 [`review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)
 
 - [x] **F4 Job「预算」**：已处理（2026-08-27 Job 管理面设计拍板）——ideas/task.md 补一句话契约（域内成员资源总量上限记账，接入时点待需求出现），Job ABI 不含预算面。
-- [ ] **F2 ready-marker 预留域路由**：预留语义目前硬连单一公平类的自由函数而非 `SchedClass` trait 契约；接 D64 时必须决定预留语义上收为调度类接口还是由域层提供统一通道。（触发：调度域 eligibility 接入、开放 D64 前）
+- [x] **F2 ready-marker 预留域路由**：已落地（2026-08-28，step 8）——reserve/commit/rollback 上收为 `SchedClass` trait 契约（域路由按 eligibility 选定目标类），实施与验证见 [todo-2026-08-28-domain-eligibility.md](todo-2026-08-28-domain-eligibility.md)。

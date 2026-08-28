@@ -460,11 +460,7 @@ pub fn start(
     }
     let requirement = match descriptor.profile {
         value if value == ExecutionProfile::Base64 as u32 => elf::IsaRequirement::Base64,
-        value if value == ExecutionProfile::D64 as u32 => {
-            // 多域 eligibility 尚未接线；接受后可能在无 D hart 的 S 态恢复
-            // FP 并 fatal。结构就绪前明确拒绝，不把错误声明变成内核异常。
-            return Err(SystemCallError::NotSupported);
-        }
+        value if value == ExecutionProfile::D64 as u32 => elf::IsaRequirement::D64,
         _ => return Err(SystemCallError::IllegalArgument),
     };
 
@@ -551,6 +547,11 @@ fn start_staged(
     grant_pairs: &[(Handle, Rights)],
 ) -> Result<(), StartFault> {
     use StartFault::PreCommit as pre;
+    // eligibility：执行需求 → 兼容域中最弱者（平台无兼容 hart 是
+    // NotSupported 的平台事实语义；域绑定在提交点冻结，见
+    // notes/impls/task.md）。
+    let domain = crate::sched::resolve_domain(requirement)
+        .ok_or(pre(SystemCallError::NotSupported))?;
     process
         .space
         .lock()
@@ -611,7 +612,7 @@ fn start_staged(
             return Err(pre(map_space_error(error)));
         }
     };
-    let ready_reservation = match crate::sched::reserve_ready() {
+    let ready_reservation = match crate::sched::reserve_ready(domain) {
         Ok(reservation) => reservation,
         Err(()) => {
             rollback_from_block(process, child_reservation, block_va, block.len());
@@ -651,6 +652,9 @@ fn start_staged(
     }
 
     // 提交区：容量已预留、槽位已 pin——以下全部不可失败。
+    // 域绑定在此冻结（Building→Running 线性化已完成，此后线程只经
+    // 所属域的类队列出现）。
+    process.bind_domain(domain);
     thread.process.handles.lock().commit_pinned_into(pin_token, &mut pinned);
     let mut moved = Vec::new();
     let mut builder_entry = None;

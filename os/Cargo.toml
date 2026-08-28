@@ -9,5 +9,6 @@ members = [
     "handle_table",
     "wait_context",
     "stack_layout",
+    "sched_domain",
 ]
 resolver = "2"

@@ -3,10 +3,14 @@
 //! 单一归属不变量：线程任意时刻恰处于「类队列 | 本 hart current | 无容器」，
 //! 全部转换经本模块入口（enqueue / pick / wake）在锁内完成。
 //! 公平性由 FIFO 队列的结构性质保证，无记账字段（旧内核死因的免疫）。
+//!
+//! 调度域按「需求满足签名」推导（sched_domain crate）：域 = 一组能力
+//! 兼容且策略相同的 hart，boot 构造后终身冻结；线程经进程绑定到唯一
+//! compatible domain（ProcessStart 提交点冻结），只在所属域的类队列出现。
 
 use core::{
     arch::asm,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
@@ -17,10 +21,21 @@ use crate::sbi::DISARM;
 use crate::task::Thread;
 
 /// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/impls/task.md）。
+/// reserve/commit/rollback 是就绪容量的事务预留契约（协议四要素，见
+/// notes/impls/task.md「reserve/commit/rollback 协议」）：占位对 pick/
+/// has_ready 不可见，token 全局单调防错认，commit/rollback 凭 token 定位。
+/// 容量必须预留在线程将要进入的目标容器（具体类队列）里，域层路由
+/// 不替代本契约。
 pub trait SchedClass: Sync {
     fn enqueue(&self, t: Arc<Thread>);
     fn pick(&self) -> Option<Arc<Thread>>;
     fn has_ready(&self) -> bool;
+    /// 预留一个就绪容量占位；失败表示容量不可用。
+    fn reserve(&self) -> Result<u64, ()>;
+    /// 凭 token 提交线程（不可失败：容量已预留）。
+    fn commit(&self, token: u64, t: Arc<Thread>);
+    /// 凭 token 回滚预留（不可失败：token 只被本事务消费）。
+    fn rollback(&self, token: u64);
 }
 
 /// 公平类：FIFO 轮转 + 固定量子。
@@ -31,6 +46,14 @@ enum ReadyEntry {
 
 pub struct FairClass {
     ready: Spinlock<VecDeque<ReadyEntry>>,
+}
+
+impl FairClass {
+    const fn new() -> Self {
+        Self {
+            ready: Spinlock::new(crate::sync::ranks::LEAF, VecDeque::new()),
+        }
+    }
 }
 
 impl SchedClass for FairClass {
@@ -56,63 +79,181 @@ impl SchedClass for FairClass {
             .iter()
             .any(|entry| matches!(entry, ReadyEntry::Thread(_)))
     }
-}
 
-/// 调度域：一组 hart 共享的类层次，按序查询、先到先得。
-/// 异构 hart（效能核/快核）即多域划分；当前单域单类。
-pub struct SchedDomain {
-    pub classes: [&'static dyn SchedClass; 1],
-}
-
-static FAIR: FairClass = FairClass {
-    ready: Spinlock::new(crate::sync::ranks::LEAF, VecDeque::new()),
-};
-static NEXT_READY_RESERVATION: AtomicU64 = AtomicU64::new(1);
-
-pub struct ReadyReservation(u64);
-
-pub fn reserve_ready() -> Result<ReadyReservation, ()> {
-    let token = NEXT_READY_RESERVATION.fetch_add(1, Ordering::Relaxed);
-    if token == 0 {
-        return Err(());
+    fn reserve(&self) -> Result<u64, ()> {
+        let token = NEXT_READY_RESERVATION.fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            return Err(());
+        }
+        let mut ready = self.ready.lock();
+        ready.try_reserve(1).map_err(|_| ())?;
+        ready.push_back(ReadyEntry::Reserved(token));
+        Ok(token)
     }
-    let mut ready = FAIR.ready.lock();
-    ready.try_reserve(1).map_err(|_| ())?;
-    ready.push_back(ReadyEntry::Reserved(token));
-    Ok(ReadyReservation(token))
+
+    fn commit(&self, token: u64, t: Arc<Thread>) {
+        let mut ready = self.ready.lock();
+        let entry = ready
+            .iter_mut()
+            .find(|entry| matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token))
+            .expect("ready reservation disappeared");
+        *entry = ReadyEntry::Thread(t);
+    }
+
+    fn rollback(&self, token: u64) {
+        let mut ready = self.ready.lock();
+        let index = ready
+            .iter()
+            .position(|entry| matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token))
+            .expect("ready reservation disappeared");
+        ready.remove(index);
+    }
 }
 
-pub fn commit_ready(reservation: ReadyReservation, thread: Arc<Thread>) {
-    let mut ready = FAIR.ready.lock();
-    let entry = ready
-        .iter_mut()
-        .find(|entry| matches!(entry, ReadyEntry::Reserved(token) if *token == reservation.0))
-        .expect("ready reservation disappeared");
-    *entry = ReadyEntry::Thread(thread);
-    drop(ready);
-    wake_idle_one();
+/// 调度域：一组能力兼容且策略相同的 hart 共享的类层次，按序查询、先到
+/// 先得。域按「需求满足签名」推导（sched_domain crate，方向公理见
+/// notes/ideas/task.md「线程」），boot 构造后终身冻结；域内 idle 位图是
+/// IPI 门铃的目标集（slot 位图，经 registry 展开为 raw hartid，绝不把
+/// 内部位图直接解释为 SBI hart mask）。
+pub struct SchedDomain {
+    classes: [&'static dyn SchedClass; 1],
+    idle_mask: AtomicU64,
 }
-
-pub fn rollback_ready(reservation: ReadyReservation) {
-    let mut ready = FAIR.ready.lock();
-    let index = ready
-        .iter()
-        .position(|entry| matches!(entry, ReadyEntry::Reserved(token) if *token == reservation.0))
-        .expect("ready reservation disappeared");
-    ready.remove(index);
-}
-
-/// 系统调度域（M3 单域；多域时由 HartKind 划分，执行点持域指针）。
-pub static DOMAIN: SchedDomain = SchedDomain { classes: [&FAIR] };
 
 impl SchedDomain {
-    pub fn pick(&self) -> Option<Arc<Thread>> {
+    fn pick(&self) -> Option<Arc<Thread>> {
         self.classes.iter().find_map(|c| c.pick())
     }
 
-    pub fn has_ready(&self) -> bool {
+    fn has_ready(&self) -> bool {
         self.classes.iter().any(|c| c.has_ready())
     }
+
+    /// 就绪入队（Requeue/wake 路径的公平类；今天单类，classes[0] 即公平类）。
+    fn enqueue_fair(&self, t: Arc<Thread>) {
+        self.classes[0].enqueue(t);
+    }
+
+    /// 唤醒本域一个空闲 hart（门铃只达本域 idle hart）。
+    fn wake_one(&self) {
+        let mask = self.idle_mask.load(Ordering::SeqCst);
+        if mask != 0 {
+            crate::registry::ipi_slots(mask);
+        }
+    }
+}
+
+static NEXT_READY_RESERVATION: AtomicU64 = AtomicU64::new(1);
+
+/// Start 事务的域预留凭据（域 + token；Copy，token 全局单调）。
+#[derive(Clone, Copy)]
+pub struct ReadyReservation {
+    domain: &'static SchedDomain,
+    token: u64,
+}
+
+/// 在目标域的公平类预留就绪容量（Start 事务用；域由 eligibility 解析）。
+pub fn reserve_ready(domain: &'static SchedDomain) -> Result<ReadyReservation, ()> {
+    let token = domain.classes[0].reserve()?;
+    Ok(ReadyReservation { domain, token })
+}
+
+pub fn commit_ready(reservation: ReadyReservation, thread: Arc<Thread>) {
+    reservation.domain.classes[0].commit(reservation.token, thread);
+    reservation.domain.wake_one();
+}
+
+pub fn rollback_ready(reservation: ReadyReservation) {
+    reservation.domain.classes[0].rollback(reservation.token);
+}
+
+// ---------------------------------------------------------------------------
+// 域表（boot 冻结）：划分真值 + slot/域下标 → 域对象
+// ---------------------------------------------------------------------------
+
+/// 域数上界：签名等价类数 ≤ admitted hart 数。
+const MAX_DOMAINS: usize = hart::HART_NUM_LIMIT;
+
+struct DomainTable {
+    /// 域划分（resolve 的唯一真值；需求位序见 sched_domain）。
+    plan: sched_domain::DomainPlan,
+    /// 域下标 → 域对象。
+    domains: [Option<&'static SchedDomain>; MAX_DOMAINS],
+    /// slot → 所属域。
+    by_slot: [Option<&'static SchedDomain>; hart::HART_NUM_LIMIT],
+}
+
+static DOMAINS: AtomicPtr<DomainTable> = AtomicPtr::new(core::ptr::null_mut());
+
+/// 域表访问（Release/Acquire 发布；未构造即访问是时序错误）。
+fn domains() -> &'static DomainTable {
+    let ptr = DOMAINS.load(Ordering::Acquire);
+    // SAFETY: boot 构造后终身有效（泄漏不释放）。
+    unsafe { ptr.as_ref() }.expect("domain table not built")
+}
+
+/// boot 单核构造域表（bring_up_runtime，全员 Online 后、初始任务装载
+/// 前）。域对象泄漏为 'static 终身冻结；hart→域归属与 caps 同属 boot
+/// 事实（运行中不变，见 notes/ideas/task.md「线程」绑定冻结点）。
+pub fn build_domains() {
+    let mut caps = Vec::new();
+    crate::registry::with_registry(|reg| {
+        for (slot, _) in reg.records() {
+            caps.push(crate::registry::load_caps(slot));
+        }
+    });
+    let plan = sched_domain::plan(&caps);
+    let mut domains: [Option<&'static SchedDomain>; MAX_DOMAINS] = [const { None }; MAX_DOMAINS];
+    for index in 0..plan.domain_count() {
+        let fair: &'static FairClass = Box::leak(Box::new(FairClass::new()));
+        domains[index] = Some(Box::leak(Box::new(SchedDomain {
+            classes: [fair],
+            idle_mask: AtomicU64::new(0),
+        })));
+    }
+    let mut by_slot: [Option<&'static SchedDomain>; hart::HART_NUM_LIMIT] =
+        [const { None }; hart::HART_NUM_LIMIT];
+    for slot in 0..caps.len() {
+        by_slot[slot] = domains[plan.slot_domain(slot)];
+    }
+    // 拓扑快照（验收观测行）：每域满足的需求与成员 slot。
+    for (index, _) in domains.iter().enumerate().take(plan.domain_count()) {
+        let members: Vec<usize> = (0..caps.len())
+            .filter(|slot| plan.slot_domain(*slot) == index)
+            .collect();
+        let labels: Vec<&str> = sched_domain::REQUIREMENTS
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| plan.signature(index) & (1 << bit) != 0)
+            .map(|(bit, _)| sched_domain::requirement_label(bit))
+            .collect();
+        log!(
+            Sched,
+            "domain {} [{}] -> harts {:?}",
+            index,
+            labels.join("+"),
+            members
+        );
+    }
+    let table = Box::leak(Box::new(DomainTable { plan, domains, by_slot }));
+    DOMAINS.store(table as *const _ as *mut _, Ordering::Release);
+}
+
+/// 本 hart 所属域（tp → slot → 域表；调度循环与 trap 路径专用）。
+#[inline]
+fn current_domain() -> &'static SchedDomain {
+    domains().by_slot[hart::current().slot()].expect("domain table not built")
+}
+
+/// requirement → 兼容域中最弱者（默认放置政策，见 sched_domain）。
+/// 无兼容域（平台事实）返回 None；Base64 恒有解（准入 ⇒ 基线 ⇒
+/// Base64 兼容的准入不变量）。
+pub fn resolve_domain(requirement: elf::IsaRequirement) -> Option<&'static SchedDomain> {
+    let table = domains();
+    table
+        .plan
+        .resolve(requirement)
+        .and_then(|index| table.domains[index])
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +329,6 @@ pub(crate) fn register_wait_deadline(
     arm_earliest();
     Ok(())
 }
-/// 空闲 hart 位图（IPI 门铃的目标集）。
-static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// 每毫秒 tick 数（init 时按 timebase 换算）。
 static TICKS_PER_MS: AtomicUsize = AtomicUsize::new(1);
@@ -237,19 +376,12 @@ fn wake_expired() {
 // 入口：enqueue（新就绪 / 唤醒）与定时器事件
 // ---------------------------------------------------------------------------
 
-/// 线程入队并按门铃唤醒空闲 hart（IPI = 他方请求，见 notes/impls/internals.md）。
-/// IDLE_MASK 是 slot 位图；SBI 边界经 registry 展开为 raw hartid 逐个发送，
-/// 绝不把内部位图直接解释为 SBI hart mask。
+/// 线程入队并按门铃唤醒其所属域的空闲 hart（IPI = 他方请求，见
+/// notes/impls/internals.md）。线程只在所属域的类队列出现。
 pub fn enqueue(t: Arc<Thread>) {
-    FAIR.enqueue(t);
-    wake_idle_one();
-}
-
-fn wake_idle_one() {
-    let mask = IDLE_MASK.load(Ordering::SeqCst);
-    if mask != 0 {
-        crate::registry::ipi_slots(mask);
-    }
+    let domain = t.process.domain();
+    domain.enqueue_fair(t);
+    domain.wake_one();
 }
 
 /// timer trap（量子耗尽或 sleep 到期）：卸载 → 唤醒到期；当前线程由
@@ -259,9 +391,9 @@ pub fn on_timer() {
     wake_expired();
 }
 
-/// 域内是否有就绪线程（SSIP 分支判断是否值得切走）。
+/// 本 hart 所属域是否有就绪线程（SSIP 分支判断是否值得切走）。
 pub fn domain_has_ready() -> bool {
-    DOMAIN.has_ready()
+    current_domain().has_ready()
 }
 
 // ---------------------------------------------------------------------------
@@ -269,17 +401,26 @@ pub fn domain_has_ready() -> bool {
 // ---------------------------------------------------------------------------
 
 /// hart 主循环：pick → 进用户态 → Switch 处置 → 循环；空则 idle。
+/// pick 只从本 hart 所属域取（域内类按优先级序），线程的域绑定与
+/// hart 的域归属在 boot/Start 各自冻结，运行期不迁移。
 pub fn run() -> ! {
     // 内核现场（sie/SUM/FS 稳态）已由 formal entry 集中建立；
-    // 本循环只维护执行点与量子。
+    // 本循环只维护执行点与量子。域终身冻结，循环外取一次。
     let me = hart::current();
+    let me_domain = current_domain();
     loop {
         // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
         // SFENCE.VMA）：循环体结构性只运行于内核页表下。
-        let Some(t) = DOMAIN.pick() else {
+        let Some(t) = me_domain.pick() else {
             idle();
             continue;
         };
+        // eligibility 纵深防御：线程只能在其绑定域的 hart 上运行
+        // （结构上 pick 只达本域队列，断言兜底域路由接线错误）。
+        debug_assert!(
+            core::ptr::eq(t.process.domain(), me_domain),
+            "thread must run in its bound domain"
+        );
         // lifecycle gate：Terminating 线程不进用户态（惰性撤销）。
         if !t.process.lifecycle.enter_running(t.tid, me.slot()) {
             reap(t);
@@ -306,7 +447,9 @@ pub fn run() -> ! {
                 if t.process.lifecycle.is_terminating() {
                     reap(t);
                 } else {
-                    FAIR.enqueue(t);
+                    // 轮转回所属域的公平类（不打门铃：本 hart 忙，
+                    // Requeue 线程由下一次 pick 自然推进）。
+                    t.process.domain().enqueue_fair(t);
                 }
             }
             Outcome::Killed => {
@@ -356,15 +499,16 @@ fn reap(t: Arc<Thread>) {
     drop(process);
 }
 
-/// idle：登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→ wfi。
-/// 醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
+/// idle：在本域登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→
+/// wfi。醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
 fn idle() {
+    let domain = current_domain();
     let bit = 1u64 << hart::current().slot();
-    IDLE_MASK.fetch_or(bit, Ordering::SeqCst);
-    // 入队与登记 idle 的交错由双重检查闭合：登记后若已有工作，
+    domain.idle_mask.fetch_or(bit, Ordering::SeqCst);
+    // 入队与登记 idle 的交错由双重检查闭合：登记后若本域已有工作，
     // 说明入队发生在第一次 pick 之后，立即撤销 idle 身份并重试。
-    if DOMAIN.has_ready() {
-        IDLE_MASK.fetch_and(!bit, Ordering::SeqCst);
+    if domain.has_ready() {
+        domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
         return;
     }
     if is_quiescent() {
@@ -384,7 +528,7 @@ fn idle() {
     // SAFETY: wfi 等待局部使能的中断 pending 唤醒。
     unsafe { asm!("wfi", options(nomem, preserves_flags)) };
     sbi::clear_ssip();
-    IDLE_MASK.fetch_and(!bit, Ordering::SeqCst);
+    domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
 
     if sip_stip_pending() {
         // 期限到达唤醒（回主循环前把到期线程入队）。
@@ -402,14 +546,23 @@ fn sip_stip_pending() -> bool {
 }
 
 /// 终端静默：无任何唤醒主人——预期 hart 全部已进 idle（无人能再
-/// 产生工作：enqueue 只来自运行中的 hart）、就绪队列空、各 hart 期限
-/// 表皆空、无设备中断使能（当前无设备；接入后设备即主人，谓词自然
+/// 产生工作：enqueue 只来自运行中的 hart）、所有域就绪队列空、各 hart
+/// 期限表皆空、无设备中断使能（当前无设备；接入后设备即主人，谓词自然
 /// 失效）。新增等待源时本谓词必须同步扩展：每种 Waiting 都要有可
 /// 枚举的主人，否则静默误判为停机。IPC 等待者（邮箱/信号）刻意**不**
 /// 阻止静默：hart 全 idle 时不存在能投递消息/信号的执行流，等待者
 /// 永无主人，停机即正确终态。
 fn is_quiescent() -> bool {
-    IDLE_MASK.load(Ordering::SeqCst) == crate::registry::active_slot_mask()
-        && !DOMAIN.has_ready()
+    let table = domains();
+    // hart 恰属一域：各域 idle 位图的并集即全局空闲位图。
+    let mut idle_union = 0u64;
+    for domain in table.domains.iter().take(table.plan.domain_count()) {
+        let Some(domain) = domain else { continue };
+        if domain.has_ready() {
+            return false;
+        }
+        idle_union |= domain.idle_mask.load(Ordering::SeqCst);
+    }
+    idle_union == crate::registry::active_slot_mask()
         && HART_TIMERS.iter().all(|t| t.lock().is_empty())
 }

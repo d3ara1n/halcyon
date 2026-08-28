@@ -22,7 +22,10 @@ KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
 MODEL_DIR := TARGET_DIR/PLATFORM/MODEL
 KERNEL_ELF := MODEL_DIR/"erhino_kernel"
 KERNEL_BIN := KERNEL_ELF+".bin"
-DTB := MODEL_DIR/"device.dtb"
+# 官方 DTB 固定生成路径；ERHINO_DTB 只覆盖 QEMU 载入的 -dtb（异构
+# 域变体用，见 virt-hetero/virt-nofd），不重定向 make_dtb 的产出。
+DTB_DEFAULT := MODEL_DIR/"device.dtb"
+DTB := env_var_or_default("ERHINO_DTB", DTB_DEFAULT)
 INIT_PAYLOAD := TARGET_DIR/"initfs.tar" # init 私有 payload，内核不解释
 BOOT_PACKAGE := TARGET_DIR/"boot-package.bin"
 
@@ -74,10 +77,11 @@ artifact_dir:
 
 make_dtb: artifact_dir
     @echo Selected DTS {{PLATFORM}}/{{MODEL}}.dts
-    @dtc -O dtb -o "{{DTB}}" "{{DTS}}"
+    @dtc -O dtb -o "{{DTB_DEFAULT}}" "{{DTS}}"
 
 build_user: artifact_dir
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude srv_fp --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p srv_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     @python3 tools/audit-user-elf.py {{TARGET_DIR}}/build/srv_* {{TARGET_DIR}}/build/drv_*
     @echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
@@ -87,6 +91,7 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/srv_target" "{{TARGET_DIR}}/initfs/bin/srv_target"
+    @ditto "{{TARGET_DIR}}/build/srv_fp" "{{TARGET_DIR}}/initfs/bin/srv_fp"
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 
@@ -110,6 +115,21 @@ run_qemu_dump_dtb:
 
 virt:
     @just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
+
+# 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
+# Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 服务
+# 只在 FD 域运行（fp verification passed）、全负载静默停机。
+virt-hetero:
+    @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
+    @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
+    @ERHINO_DTB=artifacts/virt-hetero.dtb just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
+
+# 无兼容域验证：全部 cpu 去掉 F/D，D64 profile 的 srv_fp 启动即拒绝
+# （NotSupported → init spawn 失败路径），Base64 负载照常收束。
+virt-nofd:
+    @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-nofd.dts all
+    @dtc -O dtb -o artifacts/virt-nofd.dtb artifacts/virt-nofd.dts
+    @ERHINO_DTB=artifacts/virt-nofd.dtb just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
 
 # release 验证线（阶段收尾必跑）：debug 代码生成不在 ecall 周边把活值留在
 # t 系寄存器，用户侧寄存器保持语义只有 release 能测出（2026-08-28 trap

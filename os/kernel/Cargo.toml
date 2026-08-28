@@ -11,6 +11,7 @@ talc = "5"
 page_table = { path = "../page_table" }
 frame_pool = { path = "../frame_pool" }
 elf = { path = "../elf" }
+sched_domain = { path = "../sched_domain" }
 handle_table = { path = "../handle_table" }
 wait_context = { path = "../wait_context" }
 stack_layout = { path = "../stack_layout" }

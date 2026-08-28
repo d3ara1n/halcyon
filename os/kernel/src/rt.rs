@@ -154,7 +154,9 @@ fn bring_up_runtime() -> ! {
     frame::free_range(start, end);
     log!(Memory, "bootstrap reclaim [{:#x}, {:#x})", start, end);
 
-    // 冻结 active 集合、装载唯一 initial process，最后发布 Ready。
+    // 冻结 active 集合、构造调度域（按能力签名划分，此后只读）、装载唯一
+    // initial process，最后发布 Ready。
+    crate::sched::build_domains();
     let (addr, len) = crate::rt::boot_package_region()
         .expect("BootPackage unavailable; initial process cannot start");
     boot::load(addr, len);

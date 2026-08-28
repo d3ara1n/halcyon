@@ -21,17 +21,18 @@
 ## 调度：域—类—执行点三层组合
 
 ```
-执行点（每 hart 一份，HartLocal）        调度域（共享）                    调度类（策略容器）
-┌─────────────────────────┐        ┌──────────────────────┐      ┌────────────────────┐
-│ current: Option<Thread> │        │ SchedDomain           │◀─────│ trait SchedClass    │
-│ domain: &SchedDomain    │───────▶│  classes: 优先级序数组 │      │ enqueue / pick /    │
-│ （调度循环 + idle 循环）  │        │ （M3: [Fair] 单类）     │      │ has_ready           │
-└─────────────────────────┘        └──────────────────────┘      └────────────────────┘
+执行点（每 hart 一份，HartLocal）  调度域（共享，boot 冻结）      调度类（策略容器）
+┌─────────────────────────┐  ┌──────────────────────┐  ┌─────────────────────────┐
+│ current: Option<Thread> │  │ SchedDomain           │◀─│ trait SchedClass         │
+│ （调度循环 + idle 循环）  │  │  classes: 优先级序数组 │  │ enqueue / pick /         │
+│ 域归属经 per-slot 域表   │─▶│  idle_mask: 域空闲位图 │  │ has_ready / reserve /    │
+└─────────────────────────┘  └──────────────────────┘  │ commit / rollback        │
+                                                       └─────────────────────────┘
 ```
 
-- **执行点**：hart 的运行现场（当前线程、所属域、trap 锚），见 `internals.md`「tp 寄存器」。调度循环与 idle 循环是执行点的行为。
-- **调度域**：一组能力兼容且策略相同的 hart 共享的调度类层次，hart 经 HartLocal 指向所属域。硬件 capability 是准入事实，domain 是 capability 与调度策略的派生对象；能力需求不是调度 class。线程只归属一个 compatible domain，跨域迁移显式转移队列所有权。域内类按优先级序查询，先到先得。
-- **调度类**：一类线程的就绪容器 + 选择策略。实现整体可替换（轮转队列 / 无锁队列 / 窃取），加优先级类 = 向域的类数组插项——扩展是横向加项，不改结构。
+- **执行点**：hart 的运行现场（当前线程、trap 锚），见 `internals.md`「tp 寄存器」。调度循环与 idle 循环是执行点的行为。
+- **调度域**：一组能力兼容且策略相同的 hart 共享的调度类层次，按「需求满足签名」等价类划分（`os/sched_domain` 纯逻辑 crate，host 可测）：满足同一组执行需求的 hart 构成一个域，与需求无关的能力差异不产生调度边界；新需求档位加入时划分自动细化且只分裂不迁毁既有绑定。域对象 boot 构造（bring_up_runtime，全员 Online 后、初始任务装载前）后 `Box::leak` 终身冻结；hart→域归属经 per-slot 域表（sched 的 `DomainTable.by_slot`，访问模式与 registry 的 `SLOT_CAPS` 同型），process→域绑定在 Start 提交点冻结、线程经进程间接持有。多域兼容时无状态默认落最弱兼容域（稀缺能力容量留给必须用它的线程）；无兼容域是平台事实，`ProcessStart` 返回 `NotSupported`、init bootstrap 路径 boot fatal。跨域迁移是显式政策操作（未提供）。域内 idle 位图是 IPI 门铃目标集，wake 只打本域 idle hart；静默谓词遍历全部域。D64 兼容判定要求 FLEN 恰为 64（`d ∧ ¬q`，Q 属 Fp128 独立状态模型）。
+- **调度类**：一类线程的就绪容器 + 选择策略。实现整体可替换（轮转队列 / 无锁队列 / 窃取），加优先级类 = 向域的类数组插项——扩展是横向加项，不改结构。reserve/commit/rollback 是类契约的一部分（容量必须预留在线程将要进入的目标容器，域路由不替代）。
 
 时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart 期限表最早项与量子截止的较近者设置本 hart timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
@@ -70,7 +71,8 @@ core 的生命周期根是 Job 成员表；Start 的事务 marker 同样落在�
 每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
 释放，快照仍可应答）。
 
-ProcessStart 在提交前预构造主线程并在公平类队列放入 reservation marker；
+ProcessStart 在提交前预构造主线程并在目标域（eligibility 解析）的公平类
+队列放入 reservation marker；
 marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/输出全部
 准备成功后，提交区先做链锁内封口检查与 lifecycle 线性化
 （Building→Running；kill/abandonment/seal 先行则完整回滚返回
@@ -80,14 +82,8 @@ ObjectClosed），再替换预留项。PID 单调不复用，`parent_pid` 只供
 ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
 （HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
 authority。固定宽 ProcessQuery、异步幂等 ProcessKill、REAPABLE 电平
-已接入；Dead 后 shell 冻结终态快照持续可查。D64 profile 在
-capability-derived 调度域接线前明确拒绝。
-
-> 演进点：marker 预留（reserve/commit/rollback）当前由公平类的自由函数
-> 承载，不在 `SchedClass` trait 契约内。接入 D64 eligibility 时，
-> ProcessStart 的发布必须按线程执行需求路由进兼容域——届时需把预留
-> 语义上收为所有类实现的接口，或由域层提供统一的预留通道；不得把现有
-> 自由函数当稳定接口直接跨域复用。
+已接入；Dead 后 shell 冻结终态快照持续可查。执行需求经
+`resolve_domain` 路由进兼容域（无兼容域 `NotSupported`），D64 已开放。
 
 ## Job 管理面（`task/job.rs`）
 
@@ -208,7 +204,7 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
 | DRAIN_GATE | 收束批次仲裁，一次性覆盖最广，恒最先 | — |
 | DRAIN_CURSOR | HandleTable 收束游标 | — |
 | HANDLE_TABLE | caller→child 嵌套 | pid 递增 |
-| LEAF | CONSOLE、REGISTRY、ROOT anchor、就绪队列、per-hart 期限表、WaitContext 两锁 | — |
+| LEAF | CONSOLE、REGISTRY、ROOT anchor、各域就绪队列、per-hart 期限表、WaitContext 两锁 | — |
 | JOB_INNER | Job 链锁（≤32 把同持） | jid 递增 |
 | MAILBOX / CONNECTION | 对象状态锁 | — |
 | ADDRESS_SPACE | 用户地址空间 | — |
@@ -227,7 +223,7 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
 
 ### reserve/commit/rollback 协议
 
-Job 成员表/子表、HandleTable 槽位与公平类就绪队列三处的 marker 事务
+Job 成员表/子表、HandleTable 槽位与调度类就绪队列（`SchedClass` trait 的 reserve/commit/rollback 契约，域路由按 eligibility 选定目标类）三处的 marker 事务
 遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
 凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
 不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；

@@ -297,3 +297,14 @@ pub fn store_caps(slot: HartSlot, caps: &HartCapabilities) {
     }
     SLOT_CAPS[slot.0].store(bits, Ordering::Release);
 }
+
+/// 读回 slot 的能力快照（boot 域构造用；编码与 store_caps 对偶）。
+pub fn load_caps(slot: HartSlot) -> HartCapabilities {
+    let bits = SLOT_CAPS[slot.0].load(Ordering::Acquire);
+    HartCapabilities {
+        f: bits & 1 != 0,
+        d: bits & (1 << 1) != 0,
+        q: bits & (1 << 2) != 0,
+        v: bits & (1 << 3) != 0,
+    }
+}

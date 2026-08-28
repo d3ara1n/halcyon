@@ -61,7 +61,7 @@ initial ELF 复制完成且 StartupBlock prefix 构造后，`[package base, payl
 
 未 Dead 进程的生命周期根是 Job 直接成员表（ProcessCreate 的 marker 即落在该表）；PID 由全局单调分配器分配、不复用。公平类队列同样用 marker 预留容量，`pick` 跳过 marker，`has_ready` 不把 marker 视为 runnable，因此不改变 FIFO 或静默判定。
 
-ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；异步幂等 ProcessKill、固定宽 ProcessQuery、REAPABLE 电平与有界 ProcessDrain 已接入；递归 JobKill 由用户态管理者经 JobSeal、分页枚举、JobDerive 与 ProcessKill 组合（公共实现在 `libprocess::job_kill`）。D64 profile 在调度域 eligibility 接线前明确返回 NotSupported。
+ProcessControl 已发布 CLOSED 可等待终态，关闭 control 不杀进程；异步幂等 ProcessKill、固定宽 ProcessQuery、REAPABLE 电平与有界 ProcessDrain 已接入；递归 JobKill 由用户态管理者经 JobSeal、分页枚举、JobDerive 与 ProcessKill 组合（公共实现在 `libprocess::job_kill`）。执行需求经调度域 eligibility 路由（无兼容 hart 返回 NotSupported），D64 已开放。
 
 ## 用户态公共 loader
 

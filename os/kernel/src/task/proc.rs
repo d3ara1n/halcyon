@@ -1,7 +1,7 @@
 //! 进程与线程：资源容器 / 执行容器（见 notes/impls/task.md）。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::{sync::Arc, vec::Vec};
 use erhino_shared::{call::SystemCallError, proc::{Pid, ProcessMapFlags, ProcessState, Tid}};
@@ -911,6 +911,9 @@ pub struct Process {
     pub(crate) drain_gate: crate::sync::Spinlock<()>,
     /// HandleTable 收束游标（drain_gate + 本锁下推进）。
     drain_cursor: crate::sync::Spinlock<usize>,
+    /// 兼容调度域绑定（ProcessStart 提交点冻结，见 notes/impls/task.md；
+    /// Building 期未绑定，线程经进程间接持有域归属）。
+    domain: core::sync::atomic::AtomicPtr<crate::sched::SchedDomain>,
 }
 
 impl Drop for Process {
@@ -946,7 +949,21 @@ impl Process {
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
             drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
             drain_cursor: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_CURSOR, 1),
+            domain: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         })
+    }
+
+    /// 冻结域绑定（Start 提交点/bootstrap launch；不可重复）。
+    pub(crate) fn bind_domain(&self, domain: &'static crate::sched::SchedDomain) {
+        let previous = self.domain.swap(domain as *const _ as *mut _, Ordering::Release);
+        assert!(previous.is_null(), "domain bound twice");
+    }
+
+    /// 域归属（enqueue/pick 路径；未绑定即调用是接线错误）。
+    pub fn domain(&self) -> &'static crate::sched::SchedDomain {
+        // SAFETY: 绑定后终身有效；Start 提交与后续 enqueue 经同步可见。
+        unsafe { self.domain.load(Ordering::Acquire).as_ref() }
+            .expect("process domain not bound (must be past start commit)")
     }
 
     pub(crate) fn set_control(&self, control: alloc::sync::Weak<super::process::ProcessControl>) {
@@ -1159,6 +1176,12 @@ pub fn launch_bootstrap(
         entry,
         requirement,
     } = spawned;
+
+    // eligibility：init 无兼容 hart 属 boot fatal（RuntimeGate 整体失败
+    // 不降级）；域表在初始任务装载前已由 bring_up_runtime 构造。
+    let domain = crate::sched::resolve_domain(requirement)
+        .expect("initial process has no compatible hart");
+    process.bind_domain(domain);
 
     // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
     // 显式自杀/查询可用；无结构特例）。
