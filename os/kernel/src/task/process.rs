@@ -812,6 +812,7 @@ pub fn drain(
     };
     let budget = (max_work as usize).min(PROCESS_DRAIN_MAX as usize);
     let (work, complete) = process.drain_batch(budget);
+    debug_assert!(work <= budget, "drain over budget: {} > {}", work, budget);
     if complete {
         // 发布序（外部真值先行）：shell 先冻结终态快照并置 CLOSED
         // （原子清 REAPABLE，外部观察不到 Dead+REAPABLE 混合）；随后

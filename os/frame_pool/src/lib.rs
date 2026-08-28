@@ -230,6 +230,14 @@ impl<M: PoolMemory> FramePool<M> {
             cur = node.next_frame();
             steps += 1;
         }
+        // 预算恰好用在最后一跳：完成插入步无预算，持久化游标（已位于
+        // 插入前位置）重入——否则完成返回 steps+1 超预算（work_done 违约
+        // 超 max，用户侧校验拒绝）。
+        if steps >= budget {
+            scan.prev = prev;
+            scan.cur = cur;
+            return (steps, false);
+        }
         self.insert_at(base, count, prev, cur);
         self.free_frames += count;
         (steps + 1, true)

@@ -700,6 +700,18 @@ impl AddressSpace {
     /// 上界（单次 drain 调用绝不超过 budget 个基本步 + O(1) 收尾）。
     /// 仅在 REAPABLE 后（drain_gate 持有下）调用；返回 (work_done, complete)。
     pub fn drain(&mut self, budget: usize) -> (usize, bool) {
+        let (work, complete) = self.drain_inner(budget);
+        debug_assert!(
+            work <= budget,
+            "space drain over budget: {} > {} complete={}",
+            work,
+            budget,
+            complete
+        );
+        (work, complete)
+    }
+
+    fn drain_inner(&mut self, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
         if self.drain_stage == DrainStage::Idle {
             // Handle 阶段已先行：外部映射必须已由对象 close 回调清空。

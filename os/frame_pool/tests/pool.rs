@@ -313,3 +313,36 @@ fn bounded_dealloc_cursor_invalidated_by_concurrent_free() {
         assert!(pool.alloc_contiguous(1).is_some());
     }
 }
+
+#[test]
+fn bounded_dealloc_never_exceeds_budget_on_completion() {
+    let mut pool = pool();
+    pool.add_region(frame(100), frame(200));
+    // 交错释放单帧（分配自区间尾部，allocated 降序），链为
+    // 100 → 193 → 195 → 197 → 199。
+    let mut allocated = Vec::new();
+    for _ in 0..8 {
+        allocated.push(pool.alloc_contiguous(1).unwrap());
+    }
+    for base in allocated.iter().skip(1).step_by(2) {
+        pool.dealloc(*base, 1);
+    }
+    // 归还 target=197（未释放位）：插入点在 196 与 198 之间，定位需
+    // 先扫过链上 100（192 已并入）、194、196 三个节点。预算恰为 3 时
+    // 最后一跳用满——完成插入步无预算，必须持久化游标返回 (3, false)，
+    // 不得返回 (4, true) 使 work_done 超上界（drain ABI 违约，用户侧
+    // 校验拒绝）。
+    let target = allocated[2];
+    assert_eq!(target, frame(197));
+    let mut scan = frame_pool::FreeScan::default();
+    let (steps, done) = pool.dealloc_bounded(target, 1, &mut scan, 3);
+    assert_eq!(steps, 3);
+    assert!(!done);
+    // 重入：游标已在插入点，1 步完成。
+    let (steps, done) = pool.dealloc_bounded(target, 1, &mut scan, 3);
+    assert_eq!(steps, 1);
+    assert!(done);
+    assert_eq!(pool.free_frames(), 97);
+    // 链结构有序无重叠：最大连续块完整可取（交错碎片不拼连续）。
+    assert_eq!(pool.alloc_contiguous(93), Some(frame(100)));
+}
