@@ -27,7 +27,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart 期限表、MappingLease、公理层与文档自洽的复核轴 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
 | [`todo-2026-08-28-thread-teardown-review.md`](todo-2026-08-28-thread-teardown-review.md) | 生命周期 step 7（多线程 teardown barrier，提交 d741880）的未来审查计划：成员表不变量、游标取消锁序、汇编出口归一、写回复检即杀 |
-| [`todo-2026-08-28-domain-eligibility.md`](todo-2026-08-28-domain-eligibility.md) | 生命周期 step 8：调度域 eligibility 接线与 D64 开放——已实施收口（签名等价类域推导、F2 trait 上收、srv_fp 验证负载、多域 DTB 变体全绿） |
+| [`todo-2026-08-28-domain-eligibility.md`](todo-2026-08-28-domain-eligibility.md) | 生命周期 step 8：调度域 eligibility 接线与 D64 开放——已实施收口（签名等价类域推导、F2 trait 上收、srv_fp 验证负载、多域 DTB 变体全绿），review 计划见 [todo-2026-08-28-domain-eligibility-review.md](todo-2026-08-28-domain-eligibility-review.md) |
 
 常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
 
