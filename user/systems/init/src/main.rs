@@ -34,7 +34,7 @@ use rinlib::{
         object::{Handle, ObjectSignals, Rights},
         proc::{
             HandleGrant, JobMemberKind, JobState, ProcessDrainStatus, ProcessExitReason,
-            ProcessMapFlags, ProcessState, ProcessStartDescriptor, ExecutionProfile,
+            ProcessAttachDescriptor, ProcessMapFlags, ProcessState, ExecutionProfile,
             PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
         },
         wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
@@ -1003,18 +1003,21 @@ fn seal_before_start(job: Handle) {
         let _ = close(child);
         return;
     }
-    let sealed = process::seal_job(child);
-    let descriptor = ProcessStartDescriptor {
+    let attach = process::attach(created.builder, &ProcessAttachDescriptor {
         entry: 0x1000,
         stack_pointer: PROCESS_USER_TOP as u64,
-        payload_ptr: 0,
-        grants_ptr: 0,
-        payload_len: 0,
-        grant_count: 0,
-        profile: ExecutionProfile::Base64 as u32,
-        reserved: 0,
-    };
-    let started = process::start(created.builder, &descriptor);
+        arg1: 0,
+        arg2: 0,
+    });
+    if let Err(error) = attach {
+        debug!("seal gate (start) FAILED: attach {:?}", error);
+        let _ = close(created.builder);
+        let _ = close(created.control);
+        let _ = close(child);
+        return;
+    }
+    let sealed = process::seal_job(child);
+    let started = process::start(created.builder, ExecutionProfile::Base64 as u32);
     let gated = matches!(started, Err(SystemCallError::ObjectClosed));
     // 收束：kill → drain → sealed+空完成 → CLOSED。
     let _ = process::kill(created.control, 0x3D);

@@ -1,8 +1,10 @@
-//! 通用启动块（StartupBlock）：内核在进程首次运行前构造并只读映射。
+//! 出生块（BirthBlock）：组装者（libprocess / 内核 bootstrap）构造、
+//! 经外部写通道交付、由接收进程运行时（rinlib）解析的用户约定数据。
+//! 内核不为普通进程构造或映射出生块——唯一例外是 init 的内核内嵌组装。
 //!
-//! 块只承载内核生成的进程身份、已安装的 child-local Handle 数组，以及
-//! launcher 与接收进程自行解释的不透明 payload。内核不解释 payload，
-//! 也不为 Handle 赋予业务 tag；两者的关联由 payload 协议按数组索引表达。
+//! 块承载组装者写入的进程身份、安装到目标 HandleTable 的句柄值数组，
+//! 以及组装者与接收进程自行解释的不透明 payload；内核不解释 payload，
+//! 也不为 Handle 赋予业务 tag，两者的关联由 payload 协议按数组索引表达。
 
 use alloc::vec::Vec;
 

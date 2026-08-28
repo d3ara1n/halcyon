@@ -113,6 +113,32 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::ProcessAttach => {
+            respond_result(
+                frame,
+                task::process::attach(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|tid| tid as usize),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessGrant => {
+            respond_result(
+                frame,
+                task::process::grant(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                    frame.x[13] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::ProcessQuery => {
             respond_result(
                 frame,

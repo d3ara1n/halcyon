@@ -1,5 +1,6 @@
 //! Process 生命周期状态机：Building → Running → Terminating → Dead 的
-//! 唯一真值、线程成员表与终止待办（notes/ideas/task.md「进程」）。
+//! 唯一真值、线程成员表（含 Building 期预育条目）与终止待办
+//! （notes/ideas/task.md「进程」）。
 //!
 //! 锁序契约（顶级）：**Job 链锁（先父后子，≤32 把）→ lifecycle 锁 →
 //! 其他对象锁**。lifecycle 锁可整体嵌套于 Job 链锁内（ProcessStart
@@ -12,11 +13,17 @@
 //! WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁、Job 链
 //! 锁）；反向的单向嵌套（如 ProcessControl 快照在对象锁内进入
 //! lifecycle，或链锁内进入 lifecycle）因 lifecycle 不出游而安全，不
-//! 构成环。
+//! 构成环。例外：成员表 Vec 的 try_reserve/remove 会取 HEAP 锁
+//! （LIFECYCLE→HEAP 合法秩）；锁内不 drop 线程强引用（Thread 无
+//! Drop 副作用，但纪律上仍由锁外消费，见 take_first_staging）。
 //!
-//! 成员表是线程容器记录的真值，条目只在线程强引用真正消散后由持有方
+//! 成员表是线程容器记录的真值：条目只在线程强引用真正消散后由持有方
 //! 经 thread_departed 摘除：kill 不把仍在队列或等待竞争中的线程摘除，
-//! 只组装触达待办。唤醒到再调度之间存在过渡窗口：自然完成的等待线程
+//! 只组装触达待办。Staging 条目携带线程强引用（Building 期预育表：
+//! 线程经组装者附入但尚未入册可运行）——引用与 Thread.process 的
+//! 强回指构成环，环只存在于 Building 期且在 Terminating 后必被
+//! take_first_staging 游标打破（REAPABLE 合取含表空，Dead 前无残留）。
+//! 唤醒到再调度之间存在过渡窗口：自然完成的等待线程
 //! 在被再次 dispatch 前记录仍为 Waiting（指向已完成的 context），由
 //! enter_running 的覆盖写收编；终止路径对这类 stale 记录的取消 offer
 //! 必然落败（单 outcome 仲裁），线程由 pick gate 吸收后 reap 摘除。
@@ -25,9 +32,9 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use alloc::{sync::Weak, vec::Vec};
+use alloc::{sync::{Arc, Weak}, vec::Vec};
 
-use erhino_shared::proc::{ProcessExitReason, ProcessState, Tid};
+use erhino_shared::proc::{ProcessExitReason, ProcessState, Tid, PROCESS_MAX_THREADS};
 
 use super::wait::WaitContext;
 
@@ -36,9 +43,10 @@ use super::wait::WaitContext;
 pub(crate) enum ThreadState {
     /// 在某调度类就绪队列中；线程强引用由队列持有。
     Ready,
-    /// Start 已线性化（Building→Running）但线程尚未入队；
-    /// 线程强引用由 Start 调用方持有，收尾方负责摘除或转 Ready。
-    Staging,
+    /// 已附入但尚未入册（Building 预育表）：线程强引用由成员表持有，
+    /// Start 提交点整体转 Ready（强引用移交类队列）；终止路径经
+    /// take_first_staging 摘除释放。
+    Staging { thread: Arc<super::Thread> },
     /// 在某 hart 执行点上；线程强引用由调度循环持有，IPI 吸收。
     Running { slot: usize },
     /// 无容器等待中；线程强引用由 WaitContext 持有，经 weak 触达取消。
@@ -46,6 +54,27 @@ pub(crate) enum ThreadState {
     /// 已冻结终因、正在退出路径上（自杀线程或终止取消接管；reap /
     /// 完成方收尾摘除）。
     Exiting,
+}
+
+/// attach_member 失败分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachFault {
+    /// 已终止或已入册（非 Building）。
+    Closed,
+    /// 并发线程数已达 PROCESS_MAX_THREADS。
+    Limit,
+    /// 成员表容量预留失败。
+    Oom,
+}
+
+/// begin_running 失败分类（活体门与计数一致性在同一锁内判定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeginFault {
+    /// 已终止（或 seal 后 gate 拒绝）；无线程的空表也归此（从未活过）。
+    Closed,
+    /// 预留的入册数与成员表长度不符（并发 attach 插队）；调用方以新
+    /// 计数重试或报 ObjectBusy。
+    StaleCount,
 }
 
 struct MemberEntry {
@@ -84,16 +113,16 @@ struct LifecycleInner {
     reason: ProcessExitReason,
     code: i64,
     /// 线程成员表：按 tid 升序、二分定位；离场即摘除，表空即无线程。
-    /// 插入容量在可失败段预留（主线程随构建、后续线程随各自 syscall
-    /// 前奏），线性化点的插入因此不可失败。
+    /// 插入容量在锁内 try_reserve（原子可失败插入，失败无副作用）。
     members: Vec<MemberEntry>,
-    /// 进程内线程号：单调不复用；主线程恒 0（Start 构造）。
+    /// 进程内线程号：单调不复用，从 1 起（0 = 非身份值，与 pid/JobId
+    /// 哨兵纪律对齐）；首线程 tid 1。
     next_tid: Tid,
     /// 本进程线程所在 hart 的 slot 位图：dispatch 前（进入用户 satp 前）
     /// 置位，Switch 出口归一 satp 后清除；全零且表空方可 REAPABLE。
     active: u64,
-    /// 在途 Building 操作（builder 的 map/write/start）计数；
-    /// 终止后归零才能发布 REAPABLE（操作退出方负责触发）。
+    /// 在途 Building 操作（builder 的 map/write/attach/grant/start）
+    /// 计数；终止后归零才能发布 REAPABLE（操作退出方负责触发）。
     building_ops: usize,
 }
 
@@ -102,23 +131,20 @@ fn state_index(state: ProcessState) -> usize {
 }
 
 impl Lifecycle {
-    /// 构造 Building 状态；主线程成员容量在此预留（失败沿
-    /// Process::new → ProcessCreate 报 OutOfMemory），使 begin_running
-    /// 的提交区插入不可失败。
-    pub(crate) fn building() -> Result<Self, ()> {
-        let mut members = Vec::new();
-        members.try_reserve(1).map_err(|_| ())?;
-        Ok(Self {
+    /// 构造 Building 状态。成员表容量不在此预留——附线程经
+    /// attach_member 的锁内 try_reserve 原子插入（失败无副作用）。
+    pub(crate) fn building() -> Self {
+        Self {
             state: AtomicUsize::new(state_index(ProcessState::Building)),
             inner: crate::sync::Spinlock::new(crate::sync::ranks::LIFECYCLE, LifecycleInner {
                 reason: ProcessExitReason::None,
                 code: 0,
-                members,
-                next_tid: 0,
+                members: Vec::new(),
+                next_tid: 1,
                 active: 0,
                 building_ops: 0,
             }),
-        })
+        }
     }
 
     /// trap 入口 / 调度 gate 的快速谓词（原子读，无锁）。
@@ -148,33 +174,96 @@ impl Lifecycle {
             && inner.building_ops == 0
     }
 
-    /// ProcessStart 线性化：Building → Running，插入主线程 Staging
-    /// 条目（tid 0，线程所有权在调用方手里）；同时消费 Building 操作
-    /// 登记。失败表示已终止，调用方不得继续（退出操作登记并按
-    /// ObjectClosed 回滚）。
-    pub(crate) fn begin_running(&self) -> bool {
+    /// 附入线程（ProcessAttach / bootstrap 内嵌组装）：锁内分配 tid、
+    /// 经闭包构造线程（Arc 分配取 HEAP 锁，LIFECYCLE→HEAP 合法秩）并
+    /// 插入 Staging 条目（强引用由成员表持有）。原子可失败：
+    /// Closed/Limit/Oom 均无副作用（tid 未消耗）。仅 Building 态接受。
+    pub(crate) fn attach_member(
+        &self,
+        build: impl FnOnce(Tid) -> Result<Arc<super::Thread>, AttachFault>,
+    ) -> Result<Tid, AttachFault> {
         let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
-            return false;
+            return Err(AttachFault::Closed);
         }
-        debug_assert!(inner.members.is_empty());
-        debug_assert!(inner.next_tid == 0, "main thread must be the first member");
-        debug_assert!(inner.building_ops > 0, "start must hold a building op");
-        inner.building_ops -= 1;
-        // 容量随构建预留，插入不可失败。
-        inner.members.push(MemberEntry { tid: 0, state: ThreadState::Staging });
-        inner.next_tid = 1;
-        self.state.store(state_index(ProcessState::Running), Ordering::Release);
-        true
+        if inner.members.len() >= PROCESS_MAX_THREADS {
+            return Err(AttachFault::Limit);
+        }
+        let tid = inner.next_tid;
+        let thread = build(tid)?;
+        inner
+            .members
+            .try_reserve(1)
+            .map_err(|_| AttachFault::Oom)?;
+        inner.next_tid = tid
+            .checked_add(1)
+            .expect("thread id space exhausted");
+        inner.members.push(MemberEntry {
+            tid,
+            state: ThreadState::Staging { thread },
+        });
+        Ok(tid)
     }
 
-    /// Start 成功提交：线程入就绪队列后 Staging → Ready。
-    pub(crate) fn staging_ready(&self, tid: Tid) {
+    /// 成员表当前长度（Start 活体门与入册预留的计数输入；Building 期
+    /// 成员全部是 Staging 预育条目）。
+    pub(crate) fn member_count(&self) -> usize {
+        self.inner.lock().members.len()
+    }
+
+    /// ProcessStart 线性化（含预育提取）：Building → Running。同一
+    /// lifecycle 锁内完成：活体门（表非空）、计数一致性（members.len()
+    /// == expected，防御并发 attach 插队）、building_ops 消费、状态
+    /// 发布、全部 Staging 条目转 Ready 并把线程强引用交出到 `out`
+    /// （容量由调用方预预留；锁内零分配零 drop）。提取与转换原子
+    /// 合并消除了「gate 后、入队前」窗口内异 hart kill 游标摘走 Staging
+    /// 条目的竞态——begin_running 成功后表内不再有 Staging。
+    pub(crate) fn begin_running(
+        &self,
+        expected: usize,
+        out: &mut Vec<(Tid, Arc<super::Thread>)>,
+    ) -> Result<(), BeginFault> {
         let mut inner = self.inner.lock();
-        if let Ok(index) = position(&inner.members, tid) {
-            if matches!(inner.members[index].state, ThreadState::Staging) {
-                inner.members[index].state = ThreadState::Ready;
+        if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
+            return Err(BeginFault::Closed);
+        }
+        if inner.members.is_empty() {
+            // 活体门：无线程的进程从未活过，不允许入册。
+            return Err(BeginFault::Closed);
+        }
+        if inner.members.len() != expected {
+            return Err(BeginFault::StaleCount);
+        }
+        debug_assert!(inner.building_ops > 0, "start must hold a building op");
+        inner.building_ops -= 1;
+        for entry in inner.members.iter_mut() {
+            let state = core::mem::replace(&mut entry.state, ThreadState::Ready);
+            match state {
+                ThreadState::Staging { thread } => {
+                    let tid = entry.tid;
+                    out.push((tid, thread));
+                }
+                _ => unreachable!("Building member must be Staging before start commit"),
             }
+        }
+        self.state.store(state_index(ProcessState::Running), Ordering::Release);
+        Ok(())
+    }
+
+    /// 终止路径游标（锁外逐条驱动）：摘取首个 Staging 预育条目并交出
+    /// 线程强引用（调用方在锁外 drop）。预育线程从未进入容器，无需
+    /// 离场确认——条目摘除即完成。摘定后表空可触发 REAPABLE 判定
+    /// （run_termination_todo 尾部轮询 is_reapable）。
+    pub(crate) fn take_first_staging(&self) -> Option<Arc<super::Thread>> {
+        let mut inner = self.inner.lock();
+        let index = inner
+            .members
+            .iter()
+            .position(|entry| matches!(entry.state, ThreadState::Staging { .. }))?;
+        let entry = inner.members.remove(index);
+        match entry.state {
+            ThreadState::Staging { thread } => Some(thread),
+            _ => unreachable!("position matched a Staging entry"),
         }
     }
 
@@ -204,6 +293,9 @@ impl Lifecycle {
                 let slot = crate::hart::current().slot();
                 let index = position(&inner.members, tid)
                     .expect("self-exiting thread must be a member");
+                // 自杀线程必在执行点上（Staging 预育线程从未进入容器，
+                // 不可能发起 syscall；覆盖写丢弃的旧值不含强引用）。
+                debug_assert!(matches!(inner.members[index].state, ThreadState::Running { .. }));
                 inner.members[index].state = ThreadState::Exiting;
                 todo.ipi_slots = inner.active & !(1u64 << slot);
             }

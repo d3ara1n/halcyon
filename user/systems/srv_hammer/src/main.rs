@@ -27,7 +27,7 @@ use rinlib::{
     shared::{
         call::SystemCallError,
         object::{Handle, ObjectSignals},
-        proc::{ExecutionProfile, JobMemberKind, ProcessStartDescriptor},
+        proc::{ExecutionProfile, JobMemberKind},
         wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     },
     sys_exit, sys_sleep,
@@ -82,6 +82,7 @@ fn hammer_mode() {
             return;
         }
         await_gun(gun);
+        debug!("hammer: gun consumed, action {}", cmd.action);
         // 时序变体：aux > 0 时醒后先延迟再打，把窗口让给对侧先行
         // （线协议见 race::Cmd::aux）。延迟失败不判定——窗口密度本就是
         // 尽力而为，断言全在 init。
@@ -90,6 +91,7 @@ fn hammer_mode() {
             let _ = unsafe { sys_sleep(cmd.aux) };
         }
         let (report, tail) = execute(&cmd, &message.handles);
+        debug!("hammer: report ready status {}", report.status);
         let _ = send(report_box, MSG_REPORT, &race::encode_report(&report, &tail), &[]);
     }
 }
@@ -97,7 +99,9 @@ fn hammer_mode() {
 fn execute(cmd: &Cmd, handles: &[Handle]) -> (Report, alloc::vec::Vec<u64>) {
     let (report, tail) = match cmd.action {
         ACTION_KILL => {
+            debug!("hammer: killing");
             let result = process::kill(handles[0], cmd.code as i64);
+            debug!("hammer: kill returned {:?}", result);
             let _ = close(handles[0]);
             done(result)
         }
@@ -145,17 +149,8 @@ fn done<T>(result: Result<T, SystemCallError>) -> (Report, alloc::vec::Vec<u64>)
 }
 
 fn start_target(cmd: &Cmd, handles: &[Handle]) -> Result<(), SystemCallError> {
-    let descriptor = ProcessStartDescriptor {
-        entry: cmd.entry,
-        stack_pointer: cmd.sp,
-        payload_ptr: 0,
-        grants_ptr: 0,
-        payload_len: 0,
-        grant_count: 0,
-        profile: ExecutionProfile::Base64 as u32,
-        reserved: 0,
-    };
-    process::start(handles[0], &descriptor)
+    let _ = (cmd.entry, cmd.sp);
+    process::start(handles[0], ExecutionProfile::Base64 as u32)
 }
 
 fn create(handles: &[Handle], abandon: bool) -> (Report, alloc::vec::Vec<u64>) {

@@ -7,8 +7,8 @@ use erhino_shared::{
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
     proc::{
-        ExitCode, JobEnumerateResult, JobSnapshot, ProcessCreateResult, ProcessDrainResult,
-        ProcessMapFlags, ProcessSnapshot, ProcessStartDescriptor, Tid,
+        ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessAttachDescriptor,
+        ProcessCreateResult, ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, Tid,
     },
     wait::{WaitItem, WaitResult},
 };
@@ -260,16 +260,42 @@ pub unsafe fn sys_process_write(
     .map(|_| ())
 }
 
-pub unsafe fn sys_process_start(
-    builder: Handle,
-    descriptor: &ProcessStartDescriptor,
-) -> SystemCallResult<()> {
+pub unsafe fn sys_process_start(builder: Handle, profile: u32) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ProcessStart,
         builder.raw() as usize,
-        descriptor as *const ProcessStartDescriptor as usize,
+        profile as usize,
         0,
         0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_attach(
+    builder: Handle,
+    descriptor: &ProcessAttachDescriptor,
+) -> SystemCallResult<Tid> {
+    sys_call(
+        SystemCall::ProcessAttach,
+        builder.raw() as usize,
+        descriptor as *const ProcessAttachDescriptor as usize,
+        0,
+        0,
+    )
+    .map(|tid| tid as Tid)
+}
+
+pub unsafe fn sys_process_grant(
+    builder: Handle,
+    grants: &[HandleGrant],
+    out_values: &mut [Handle],
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessGrant,
+        builder.raw() as usize,
+        grants.as_ptr() as usize,
+        grants.len(),
+        out_values.as_mut_ptr() as usize,
     )
     .map(|_| ())
 }

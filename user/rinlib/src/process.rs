@@ -2,16 +2,18 @@
 
 use crate::call::{
     sys_job_create, sys_job_derive, sys_job_enumerate, sys_job_query, sys_job_seal,
-    sys_process_create, sys_process_drain, sys_process_kill, sys_process_map,
-    sys_process_query, sys_process_start, sys_process_write,
+    sys_process_attach, sys_process_create, sys_process_drain, sys_process_grant,
+    sys_process_kill, sys_process_map, sys_process_query, sys_process_start,
+    sys_process_write,
 };
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
-        JobEnumerateResult, JobMemberKind, JobSnapshot, JobState, ProcessCreateResult,
-        ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags, ProcessSnapshot,
-        ProcessStartDescriptor, JOB_ENUMERATE_MAX, PROCESS_DRAIN_MAX,
+        HandleGrant, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
+        ProcessAttachDescriptor, ProcessCreateResult, ProcessDrainResult,
+        ProcessDrainStatus, ProcessMapFlags, ProcessSnapshot, Tid,
+        JOB_ENUMERATE_MAX, PROCESS_DRAIN_MAX,
     },
 };
 
@@ -137,13 +139,31 @@ pub fn write(
     unsafe { sys_process_write(builder, target, source) }
 }
 
-/// ProcessStart：消费 builder 并首次发布进程；control 已在 Create 交付。
-pub fn start(
+/// ProcessAttach：组装者向 Building process 附入线程（外部通道；线程是
+/// 组装资源）。栈与出生参数由组装者经 Map/Write 预先供给。
+pub fn attach(
     builder: Handle,
-    descriptor: &ProcessStartDescriptor,
-) -> Result<(), SystemCallError> {
+    descriptor: &ProcessAttachDescriptor,
+) -> Result<Tid, SystemCallError> {
     // SAFETY: descriptor 在 syscall 期间保持有效。
-    unsafe { sys_process_start(builder, descriptor) }
+    unsafe { sys_process_attach(builder, descriptor) }
+}
+
+/// ProcessGrant：组装者把 grants 装入目标 Building process 的 HandleTable
+/// 并输出目标侧句柄值（写入出生块后经 Write 交付）。
+pub fn grant(
+    builder: Handle,
+    grants: &[HandleGrant],
+    out_values: &mut [Handle],
+) -> Result<(), SystemCallError> {
+    // SAFETY: grants/out_values 在 syscall 期间保持有效。
+    unsafe { sys_process_grant(builder, grants, out_values) }
+}
+
+/// ProcessStart：活体门（已附线程 ≥1）检查后首次发布进程；builder 消费。
+pub fn start(builder: Handle, profile: u32) -> Result<(), SystemCallError> {
+    // SAFETY: 值参数由内核完整校验。
+    unsafe { sys_process_start(builder, profile) }
 }
 
 /// ProcessQuery：固定宽生命周期快照。未知判别值与非法组合拒绝

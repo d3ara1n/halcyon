@@ -67,7 +67,10 @@ pub struct ProcessCreateResult {
     pub reserved: u64,
 }
 
-/// ProcessStart 直接 grant 项；目标 rights 只能收窄。
+/// 单进程并发线程数上界（成员表长度；tid 单调不复用，生灭循环不耗尽）。
+pub const PROCESS_MAX_THREADS: usize = 1024;
+
+/// ProcessGrant 的 grant 项；目标 rights 只能收窄。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct HandleGrant {
@@ -75,20 +78,22 @@ pub struct HandleGrant {
     pub rights: Rights,
 }
 
-/// ProcessStart 固定宽输入。所有地址都是调用进程用户 VA；
-/// Control 在 ProcessCreate 已交付，Start 只消费 Builder。
+/// ProcessAttach 固定宽输入。所有地址都是目标进程用户 VA；entry 必须
+/// 位于可执行页，sp 已映射且 16 字节对齐（内核做 translate 前置校验，
+/// 运行期 fault 走用户 fault 杀进程）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
-pub struct ProcessStartDescriptor {
+pub struct ProcessAttachDescriptor {
     pub entry: u64,
     pub stack_pointer: u64,
-    pub payload_ptr: u64,
-    pub grants_ptr: u64,
-    pub payload_len: u32,
-    pub grant_count: u32,
-    pub profile: u32,
-    pub reserved: u32,
+    /// 出生参数 a0/a1（首线程的出生块基址与长度由组装者约定传入）。
+    pub arg1: u64,
+    pub arg2: u64,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<ProcessAttachDescriptor>() == 32);
+};
 
 /// ProcessControl 固定宽状态快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +243,7 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessMapFlags>() == 4);
     assert!(core::mem::size_of::<ProcessCreateResult>() == 32);
     assert!(core::mem::size_of::<HandleGrant>() == 16);
-    assert!(core::mem::size_of::<ProcessStartDescriptor>() == 48);
+    assert!(core::mem::size_of::<ProcessAttachDescriptor>() == 32);
     assert!(core::mem::size_of::<ProcessSnapshot>() == 40);
     assert!(core::mem::size_of::<ProcessDrainResult>() == 16);
     assert!(core::mem::size_of::<ProcessState>() == 4);

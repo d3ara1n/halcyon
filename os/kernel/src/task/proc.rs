@@ -429,7 +429,9 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// 映射主线程栈：[USER_TOP - STACK_SIZE, USER_TOP)。
+    /// Bootstrap 专用 init 栈映射：[USER_TOP - STACK_SIZE, USER_TOP)。
+    /// 普通进程的栈由组装者（libprocess）经 ProcessMap 供给，内核不参与
+    /// （bootstrap 例外：进程未启动、无用户代码可分配）。
     pub fn map_stack(&mut self) -> Result<(), SpaceError> {
         self.alloc_map(
             USER_TOP - STACK_SIZE,
@@ -438,83 +440,7 @@ impl AddressSpace {
         )
     }
 
-    /// 只读映射启动块：块基取当前 brk（ELF 尾页对齐处），字节经直映射
-    /// 别名写入，brk 越过块尾——堆从块后扩展（sbrk 语义对块无感）。
-    /// 块帧记入 `frames`，生命周期随进程地址空间。
-    pub fn map_startup_block(&mut self, bytes: &[u8]) -> Result<usize, SpaceError> {
-        if bytes.is_empty() || self.brk == 0 {
-            return Err(SpaceError::BadSegment); // 空块或 ELF 未装载
-        }
-        let base = self.brk;
-        let pages = bytes.len().div_ceil(PAGE_SIZE);
-        let Some(span) = pages.checked_mul(PAGE_SIZE) else {
-            return Err(SpaceError::BadSegment);
-        };
-        let Some(end) = base.checked_add(span) else {
-            return Err(SpaceError::BadSegment);
-        };
-        if end > USER_TOP - STACK_SIZE {
-            return Err(SpaceError::BadSegment);
-        }
-        self.frames
-            .try_reserve(1)
-            .map_err(|_| SpaceError::NoFrame)?;
-        let tracker = frame::alloc_contiguous(pages).ok_or(SpaceError::NoFrame)?;
-        let base_vpn = base / PAGE_SIZE;
-        let base_ppn = tracker.base.addr() / PAGE_SIZE;
-        for index in 0..pages {
-            if let Err(error) = self.tt().map(
-                Vpn(base_vpn + index),
-                1,
-                Ppn(base_ppn + index),
-                flags::USER_RODATA,
-            ) {
-                for rollback in (0..index).rev() {
-                    self.tt()
-                        .unmap(Vpn(base_vpn + rollback), 1)
-                        .expect("single-page StartupBlock map rollback cannot fail");
-                }
-                return Err(error.into());
-            }
-        }
-        // SAFETY: 刚分配的独占帧经直映射别名写入；用户侧 PTE 只读，
-        // 进程对块内容也不可写。
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                mm::phys_to_virt(tracker.base.addr()) as *mut u8,
-                bytes.len(),
-            );
-        }
-        self.brk = end;
-        self.frames.push(tracker);
-        Ok(base)
-    }
-
-    /// 回滚尚未发布的普通 StartupBlock。调用者保证它是最后一次 owned
-    /// mapping，且尚无线程可运行。
-    pub fn rollback_startup_block(&mut self, base: usize, byte_len: usize) {
-        let pages = byte_len.div_ceil(PAGE_SIZE);
-        let span = pages * PAGE_SIZE;
-        assert_eq!(
-            self.brk,
-            base + span,
-            "startup rollback is not the latest mapping"
-        );
-        for index in 0..pages {
-            self.tt()
-                .unmap(Vpn(base / PAGE_SIZE + index), 1)
-                .expect("single-page StartupBlock rollback cannot fail");
-        }
-        let tracker = self.frames.pop().expect("startup mapping tracker missing");
-        assert_eq!(
-            tracker.count, pages,
-            "startup mapping tracker size mismatch"
-        );
-        self.brk = base;
-    }
-
-    /// Bootstrap 专用 StartupBlock：prefix 复制到地址空间自有只读页，
+    /// Bootstrap 专用出生块：prefix 复制到地址空间自有只读页，
     /// 紧随其后的 opaque payload 页在映入时即移交为本地址空间 owned
     /// backing（自帧池启动保留洞收编，Drop 时首次归还池）。该入口不由
     /// syscall 暴露；payload 生命周期随 init 地址空间，无 pid 特判。
@@ -1022,6 +948,11 @@ pub struct Process {
     /// 兼容调度域绑定（ProcessStart 提交点冻结，见 notes/impls/task.md；
     /// Building 期未绑定，线程经进程间接持有域归属）。
     domain: core::sync::atomic::AtomicPtr<crate::sched::SchedDomain>,
+    /// 执行需求（ELF 判定；进程级属性，Start 提交点冻结）。存
+    /// IsaRequirement 判别值；冻结前恒 Base64（无线程可运行，不被读取）。
+    /// Relaxed 读取足够：首次 dispatch 必经 commit_ready 的类队列锁，
+    /// 写入点先于入队，经锁链可见。
+    requirement: core::sync::atomic::AtomicUsize,
 }
 
 impl Drop for Process {
@@ -1061,7 +992,7 @@ impl Process {
                 pid,
                 super::handle::ProcessHandleTable::new(),
             ),
-            lifecycle: super::lifecycle::Lifecycle::building().map_err(|_| SpaceError::NoFrame)?,
+            lifecycle: super::lifecycle::Lifecycle::building(),
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
             drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
             drain_state: crate::sync::Spinlock::new(
@@ -1072,6 +1003,7 @@ impl Process {
                 },
             ),
             domain: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            requirement: core::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1081,6 +1013,22 @@ impl Process {
             .domain
             .swap(domain as *const _ as *mut _, Ordering::Release);
         assert!(previous.is_null(), "domain bound twice");
+    }
+
+    /// 冻结执行需求（Start 提交点/bootstrap launch；不可重复）。
+    pub(crate) fn freeze_requirement(&self, requirement: elf::IsaRequirement) {
+        let previous = self
+            .requirement
+            .swap(requirement as usize, Ordering::Relaxed);
+        assert_eq!(previous, 0, "requirement frozen twice");
+    }
+
+    /// 执行需求（trap FP 档位判定；冻结前恒 Base64——无线程可运行）。
+    pub fn requirement(&self) -> elf::IsaRequirement {
+        match self.requirement.load(Ordering::Relaxed) {
+            1 => elf::IsaRequirement::D64,
+            _ => elf::IsaRequirement::Base64,
+        }
     }
 
     /// 域归属（enqueue/pick 路径；未绑定即调用是接线错误）。
@@ -1192,17 +1140,17 @@ impl Process {
     }
 }
 
-/// 线程：执行容器（用户现场 + 调度观测计数）。
+/// 线程：执行容器（用户现场 + 调度观测计数）。执行需求是进程级属性
+/// （ELF 判定，Building 期冻结于 Process.requirement），线程经 process
+/// 间接持有——同一进程的线程共享同一执行需求。
 pub struct Thread {
-    /// 进程内线程号（成员表键；主线程恒 0）。
+    /// 进程内线程号（成员表键；tid 从 1 起，0 保留为非身份值）。
     pub tid: Tid,
     pub process: Arc<Process>,
     /// 创建时刻（mtime tick），退出统计用。
     pub created_tick: u64,
     /// 被调度次数（公平性观测，见 notes/impls/task.md）。
     pub switches: AtomicU64,
-    /// 用户执行需求（ELF 判定；eligibility 由 domain 能力另行核验）。
-    pub requirement: elf::IsaRequirement,
     frame: UnsafeCell<UserContext>,
 }
 
@@ -1213,28 +1161,29 @@ pub struct Thread {
 unsafe impl Sync for Thread {}
 
 impl Thread {
-    /// 创建主线程：a0 = 启动块基、a1 = 块字节数（rinlib 启动契约，见
-    /// shared::startup），sp = 半区顶。FP 状态创建即全零——不存在依赖
-    /// hart 残留的 valid 状态。
-    fn new_main(
-        process: Arc<Process>,
+    /// 创建线程执行基底：sepc = entry，sp = stack_pointer，a0/a1 = 出生
+    /// 参数（首线程为出生块地址与长度，见 rinlib 启动契约）。FP 状态
+    /// 创建即全零——不存在依赖 hart 残留的 valid 状态。tid 由
+    /// lifecycle 锁内的 attach_member 分配并注入（构造随闭包进入锁内，
+    /// Arc 分配取 HEAP 锁为 LIFECYCLE→HEAP 合法秩）。
+    pub(super) fn new_thread(
+        tid: Tid,
+        process: &Arc<Process>,
         entry: usize,
-        requirement: elf::IsaRequirement,
         stack_pointer: usize,
-        block_va: usize,
-        block_len: usize,
+        arg1: usize,
+        arg2: usize,
     ) -> Self {
         let mut ctx = UserContext::zeroed();
         ctx.sepc = entry as u64;
         ctx.x[2] = stack_pointer as u64;
-        ctx.x[10] = block_va as u64; // a0 = StartupBlock base
-        ctx.x[11] = block_len as u64; // a1 = StartupBlock length
+        ctx.x[10] = arg1 as u64; // a0
+        ctx.x[11] = arg2 as u64; // a1
         Self {
-            tid: 0,
-            process,
+            tid,
+            process: process.clone(),
             created_tick: sbi::read_time(),
             switches: AtomicU64::new(0),
-            requirement,
             frame: UnsafeCell::new(ctx),
         }
     }
@@ -1243,9 +1192,9 @@ impl Thread {
         self.frame.get()
     }
 
-    /// pre-sret FP 档位：D64 线程完整恢复，Base 恒 FS=Off。
+    /// pre-sret FP 档位：D64 进程完整恢复，Base 恒 FS=Off。
     pub fn uses_fp(&self) -> bool {
-        self.requirement == elf::IsaRequirement::D64
+        self.process.requirement() == elf::IsaRequirement::D64
     }
 
     /// 用户 satp（进程地址空间不变，直接读缓存）。
@@ -1254,11 +1203,11 @@ impl Thread {
     }
 }
 
-/// launch 前的进程骨架：ELF 已装载、栈已映射、尚未入表 runnable。
+/// launch 前的进程骨架：ELF 已装载、执行需求已冻结、栈已映射、
+/// 尚未入表 runnable。
 pub struct SpawnedProcess {
     process: Arc<Process>,
     entry: usize,
-    requirement: elf::IsaRequirement,
 }
 
 pub fn spawn_from_elf(
@@ -1281,30 +1230,11 @@ pub fn spawn_from_elf(
         space.load_elf(&image.segments, file)?;
         space.map_stack()?;
     }
+    process.freeze_requirement(requirement);
     Ok(SpawnedProcess {
         process,
         entry: image.entry as usize,
-        requirement,
     })
-}
-
-pub(crate) fn prepare_main_thread(
-    process: Arc<Process>,
-    entry: usize,
-    requirement: elf::IsaRequirement,
-    stack_pointer: usize,
-    block_va: usize,
-    block_len: usize,
-) -> Result<Arc<Thread>, SpaceError> {
-    Arc::try_new(Thread::new_main(
-        process,
-        entry,
-        requirement,
-        stack_pointer,
-        block_va,
-        block_len,
-    ))
-    .map_err(|_| SpaceError::NoFrame)
 }
 
 /// Bootstrap launch 事务：为 init 预留真实 Handle → 构造 prefix 并把
@@ -1320,17 +1250,7 @@ pub fn launch_bootstrap(
     payload: &[u8],
     handles: Vec<super::handle::ProcessHandleEntry>,
 ) -> Result<Arc<Thread>, SpaceError> {
-    let SpawnedProcess {
-        process,
-        entry,
-        requirement,
-    } = spawned;
-
-    // eligibility：init 无兼容 hart 属 boot fatal（RuntimeGate 整体失败
-    // 不降级）；域表在初始任务装载前已由 bring_up_runtime 构造。
-    let domain =
-        crate::sched::resolve_domain(requirement).expect("initial process has no compatible hart");
-    process.bind_domain(domain);
+    let SpawnedProcess { process, entry } = spawned;
 
     // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
     // 显式自杀/查询可用；无结构特例）。
@@ -1417,15 +1337,17 @@ pub fn launch_bootstrap(
         .commit(reservation, handles)
         .expect("launch reservation count matches entries");
 
-    let thread = prepare_main_thread(
-        process.clone(),
-        entry,
-        requirement,
-        USER_TOP,
-        block_va,
-        block_len,
-    )?;
-    // 成员表插入即启动提交（boot 路径失败不可恢复，直接提交不留 marker）。
+    // 内嵌 ProcessAttach：出生现场 = 出生块地址与长度（rinlib 启动契约）。
+    let _tid = process
+        .lifecycle
+        .attach_member(|tid| {
+            Arc::try_new(Thread::new_thread(tid, &process, entry, USER_TOP, block_va, block_len))
+                .map_err(|_| super::lifecycle::AttachFault::Oom)
+        })
+        .map_err(|_| SpaceError::NoFrame)?;
+    // 内嵌 ProcessStart（boot 路径失败不可恢复，直接提交不留 marker）：
+    // 成员表插入即启动提交；eligibility 无解属 boot fatal（域表在初始
+    // 任务装载前已由 bring_up_runtime 构造）。
     let job = process.job();
     let member = job
         .reserve_member(process.pid)
@@ -1435,10 +1357,22 @@ pub fn launch_bootstrap(
         process.lifecycle.enter_building_op(),
         "bootstrap process cannot be terminating"
     );
+    // Bootstrap 内嵌同构序列的提交段：冻结需求与域、活体门（1 条
+    // 预育线程）与预育提取在同一 gate 临界区内完成（普通 Start 的
+    // begin_running(expected, staged) 同构——boot 路径无并发，直接
+    // expect）。
+    let requirement = process.requirement();
+    let domain = crate::sched::resolve_domain(requirement)
+        .expect("initial process has no compatible hart");
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(1)
+        .map_err(|_| SpaceError::NoFrame)?;
     process
         .lifecycle
-        .begin_running()
-        .then_some(())
+        .begin_running(1, &mut staged)
         .expect("bootstrap process cannot be terminating");
+    process.bind_domain(domain);
+    let (_, thread) = staged.pop().expect("bootstrap staging thread missing");
     Ok(thread)
 }

@@ -240,13 +240,13 @@ impl<T, R> HandleTable<T, R> {
         self.extract_with(grants, Rights::GRANT)
     }
 
-    /// 事务 pin：单临界区内验证 builder（需 `builder_right`）与全部
-    /// grants（需 GRANT 且 rights 子集）后把槽位翻转为 Pinned——对
-    /// 其他线程的 get/close/extract/drain 不可见；失败零副作用。
-    /// 调用方不得持本表锁反向获取生命周期锁。
+    /// 事务 pin：单临界区内验证 builder（需 `builder_right`；None 表示
+    /// 本事务不含 builder）与全部 grants（需 GRANT 且 rights 子集）后把
+    /// 槽位翻转为 Pinned——对其他线程的 get/close/extract/drain 不可
+    /// 见；失败零副作用。调用方不得持本表锁反向获取生命周期锁。
     pub fn pin_for_start(
         &mut self,
-        builder: Handle,
+        builder: Option<Handle>,
         builder_right: Rights,
         grants: &[(Handle, Rights)],
         token: u64,
@@ -254,8 +254,13 @@ impl<T, R> HandleTable<T, R> {
         if token == 0 {
             return Err(TableError::BadReservation);
         }
+        if let Some(builder) = builder {
+            self.get(builder, builder_right)?;
+        }
         for (i, (handle, rights)) in grants.iter().copied().enumerate() {
-            if grants[..i].iter().any(|(prior, _)| *prior == handle) || handle == builder {
+            if grants[..i].iter().any(|(prior, _)| *prior == handle)
+                || builder == Some(handle)
+            {
                 return Err(TableError::DuplicateHandle);
             }
             if !rights.is_known() {
@@ -266,7 +271,6 @@ impl<T, R> HandleTable<T, R> {
                 return Err(TableError::RightsDenied);
             }
         }
-        self.get(builder, builder_right)?;
         // 验证全部通过：翻转（不可失败）。
         for (handle, _) in grants.iter().copied() {
             let index = self.occupied_index(handle)?;
@@ -276,30 +280,33 @@ impl<T, R> HandleTable<T, R> {
             };
             self.slots[index].state = SlotState::Pinned(token, entry);
         }
-        let index = self.occupied_index(builder)?;
-        let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
-        let SlotState::Occupied(entry) = state else {
-            unreachable!()
-        };
-        self.slots[index].state = SlotState::Pinned(token, entry);
+        if let Some(builder) = builder {
+            let index = self.occupied_index(builder)?;
+            let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
+            let SlotState::Occupied(entry) = state else {
+                unreachable!()
+            };
+            self.slots[index].state = SlotState::Pinned(token, entry);
+        }
         Ok(())
     }
 
-    /// Start 专用提交：按原始 grant 请求顺序定点取出 pinned entries，
-    /// builder 单独取得。`grants` 输出容量须已预留，因此整段不扫描、不
-    /// 分配、不可失败；任一不匹配均是调用方破坏 pin 事务的不变量。
+    /// pin 事务提交：按原始 grant 请求顺序定点取出 pinned entries，
+    /// builder（若在事务内）单独取得。`grants` 输出容量须已预留，因此
+    /// 整段不扫描、不分配、不可失败；任一不匹配均是调用方破坏 pin
+    /// 事务的不变量。
     pub fn commit_pinned_for_start(
         &mut self,
         token: u64,
-        builder: Handle,
+        builder: Option<Handle>,
         grant_pairs: &[(Handle, Rights)],
         grants: &mut Vec<Entry<T, R>>,
-    ) -> Entry<T, R> {
+    ) -> Option<Entry<T, R>> {
         debug_assert!(grants.capacity() - grants.len() >= grant_pairs.len());
         for (handle, rights) in grant_pairs {
             grants.push(self.take_pinned(token, *handle).with_rights(*rights));
         }
-        self.take_pinned(token, builder)
+        builder.map(|builder| self.take_pinned(token, builder))
     }
 
     fn take_pinned(&mut self, token: u64, handle: Handle) -> Entry<T, R> {
@@ -812,7 +819,7 @@ mod pin_tests {
     fn pin_hides_entries_until_commit() {
         let mut table = Table::new();
         let h1 = table.insert(entry(10)).unwrap();
-        assert!(table.pin_for_start(h1, Rights::READ, &[], 7).is_ok());
+        assert!(table.pin_for_start(Some(h1), Rights::READ, &[], 7).is_ok());
         // pin 后不可见：get / remove 均失效。
         assert!(matches!(
             table.get(h1, Rights::READ),
@@ -821,8 +828,8 @@ mod pin_tests {
         assert!(matches!(table.remove(h1), Err(TableError::StaleHandle)));
         // 提交：取出且代际前进（旧值复活被拒）。
         let mut grants = Vec::new();
-        let builder = table.commit_pinned_for_start(7, h1, &[], &mut grants);
-        assert_eq!(*builder.object(), 10);
+        let builder = table.commit_pinned_for_start(7, Some(h1), &[], &mut grants);
+        assert_eq!(*builder.expect("pin carried the builder").object(), 10);
         assert!(grants.is_empty());
         assert!(matches!(
             table.get(h1, Rights::READ),
@@ -837,7 +844,7 @@ mod pin_tests {
         let grant = table.insert(entry(21)).unwrap();
         assert!(
             table
-                .pin_for_start(builder, Rights::READ, &[(grant, Rights::READ)], 9)
+                .pin_for_start(Some(builder), Rights::READ, &[(grant, Rights::READ)], 9)
                 .is_ok()
         );
         table.unpin(9);
@@ -854,12 +861,13 @@ mod pin_tests {
 
         // 回滚后的同一请求可重试；只有本次成功提交的 grant 被裁剪。
         table
-            .pin_for_start(builder, Rights::READ, &[(grant, Rights::READ)], 10)
+            .pin_for_start(Some(builder), Rights::READ, &[(grant, Rights::READ)], 10)
             .unwrap();
         let mut moved = Vec::new();
         moved.try_reserve_exact(1).unwrap();
-        let builder_entry =
-            table.commit_pinned_for_start(10, builder, &[(grant, Rights::READ)], &mut moved);
+        let builder_entry = table
+            .commit_pinned_for_start(10, Some(builder), &[(grant, Rights::READ)], &mut moved)
+            .expect("pin carried the builder");
         assert_eq!(builder_entry.rights(), Rights::READ | Rights::GRANT);
         assert_eq!(moved[0].rights(), Rights::READ);
     }
@@ -872,14 +880,14 @@ mod pin_tests {
         let grants = [(h2, Rights::GRANT)];
         // h2 缺 GRANT：整体失败，零副作用。
         assert!(matches!(
-            table.pin_for_start(h1, Rights::READ, &grants, 5),
+            table.pin_for_start(Some(h1), Rights::READ, &grants, 5),
             Err(TableError::RightsDenied)
         ));
         assert!(table.get(h1, Rights::READ).is_ok());
         // builder alias 拒绝。
         let alias = [(h1, Rights::GRANT)];
         assert!(matches!(
-            table.pin_for_start(h1, Rights::READ, &alias, 5),
+            table.pin_for_start(Some(h1), Rights::READ, &alias, 5),
             Err(TableError::DuplicateHandle)
         ));
     }
@@ -893,11 +901,13 @@ mod pin_tests {
         // 请求顺序故意与 caller slot 顺序相反。
         let grants = [(second_slot, Rights::READ), (first_slot, Rights::READ)];
         table
-            .pin_for_start(builder, Rights::READ, &grants, 12)
+            .pin_for_start(Some(builder), Rights::READ, &grants, 12)
             .unwrap();
         let mut moved = Vec::new();
         moved.try_reserve_exact(grants.len()).unwrap();
-        let builder_entry = table.commit_pinned_for_start(12, builder, &grants, &mut moved);
+        let builder_entry = table
+            .commit_pinned_for_start(12, Some(builder), &grants, &mut moved)
+            .expect("pin carried the builder");
         assert_eq!(*builder_entry.object(), 1);
         assert_eq!(
             moved
@@ -907,6 +917,30 @@ mod pin_tests {
             [3, 2]
         );
         assert!(moved.iter().all(|entry| entry.rights() == Rights::READ));
+    }
+
+    #[test]
+    fn grant_only_transaction_carries_no_builder() {
+        let mut table = Table::new();
+        let grant = table.insert(entry(41)).unwrap();
+        // 无 builder 事务：只有 grants。
+        assert!(
+            table
+                .pin_for_start(None, Rights::NONE, &[(grant, Rights::READ)], 13)
+                .is_ok()
+        );
+        // pin 后 grant 不可见。
+        assert!(matches!(
+            table.get(grant, Rights::READ),
+            Err(TableError::StaleHandle)
+        ));
+        let mut moved = Vec::new();
+        moved.try_reserve_exact(1).unwrap();
+        let builder =
+            table.commit_pinned_for_start(13, None, &[(grant, Rights::READ)], &mut moved);
+        assert!(builder.is_none());
+        assert_eq!(*moved[0].object(), 41);
+        assert_eq!(moved[0].rights(), Rights::READ);
     }
 
     #[test]

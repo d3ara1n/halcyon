@@ -72,8 +72,12 @@ pub enum SystemCall {
     ProcessMap = 0x13,
     /// 向 Building process 已映射页写入有界数据。
     ProcessWrite = 0x14,
-    /// 消费 ProcessBuilder，安装 grants 并首次发布进程。
+    /// 消费 ProcessBuilder，入册进程（活体门：已附线程 ≥1）。
     ProcessStart = 0x15,
+    /// 为 Building process 附线程（线程是组装资源，无观察壳）。
+    ProcessAttach = 0x1d,
+    /// 为 Building process 安装 grants 并输出目标侧句柄值。
+    ProcessGrant = 0x1e,
     /// 读 ProcessControl 的固定宽生命周期快照。
     ProcessQuery = 0x16,
     /// 持 MANAGE authority 的异步幂等终止请求。

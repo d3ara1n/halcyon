@@ -12,13 +12,13 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, JobMemberKind, ProcessMapFlags,
-        ProcessStartDescriptor, PROCESS_MAIN_STACK_SIZE, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
+        ExecutionProfile, HandleGrant, JobMemberKind, ProcessAttachDescriptor,
+        ProcessMapFlags, PROCESS_MAIN_STACK_SIZE, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
         JOB_ENUMERATE_MAX,
     },
     wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
 };
-use rinlib::{ipc::object::close, ipc::wait::wait_many, process};
+use rinlib::{debug, ipc::object::close, ipc::wait::wait_many, process};
 
 const MAX_MAP_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
 const MAX_WRITE_BYTES: usize = 1 << 20;
@@ -55,7 +55,7 @@ pub struct Spawned {
 pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
     let image = elf::parse(request.image).map_err(SpawnError::Elf)?;
     let requirement = elf::isa_requirement(request.image).map_err(SpawnError::Requirement)?;
-    let plan = page_plan(&image, request.image.len())?;
+    let (plan, image_top) = page_plan(&image, request.image.len())?;
 
     let created = process::create(request.job, request.control_rights)?;
     let builder = created.builder;
@@ -69,17 +69,33 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
             elf::IsaRequirement::Base64 => ExecutionProfile::Base64,
             elf::IsaRequirement::D64 => ExecutionProfile::D64,
         };
-        let descriptor = ProcessStartDescriptor {
+        // 组装序列（线程是组装资源）：Grant 装句柄 → 组装者自构造出生块
+        // （shared::startup 线格式）→ Write 写入约定区 → Attach 首线程
+        // （arg1/arg2 = 块基/块长）→ Start 入册。
+        let grant_len = request.grants.len().min(MAX_START_GRANTS);
+        let mut granted = [Handle::INVALID; MAX_START_GRANTS];
+        if grant_len > 0 {
+            process::grant(
+                builder,
+                &request.grants[..grant_len],
+                &mut granted[..grant_len],
+            )?;
+        }
+        let block = build_birth_block(
+            created.pid,
+            rinlib::env::parent_pid(),
+            &granted[..grant_len],
+            request.payload,
+        )?;
+        let block_va = write_birth_block(builder, &block, image_top)?;
+        let descriptor = ProcessAttachDescriptor {
             entry: image.entry,
             stack_pointer: PROCESS_USER_TOP as u64,
-            payload_ptr: request.payload.as_ptr() as u64,
-            grants_ptr: request.grants.as_ptr() as u64,
-            payload_len: u32::try_from(request.payload.len()).map_err(|_| SpawnError::InvalidImage)?,
-            grant_count: u32::try_from(request.grants.len()).map_err(|_| SpawnError::InvalidImage)?,
-            profile: profile as u32,
-            reserved: 0,
+            arg1: block_va as u64,
+            arg2: block.len() as u64,
         };
-        process::start(builder, &descriptor)?;
+        process::attach(builder, &descriptor)?;
+        process::start(builder, profile as u32)?;
         Ok(Spawned { pid: created.pid, control: created.control })
     })();
 
@@ -186,7 +202,7 @@ pub fn enumerate_members(
 fn page_plan(
     image: &elf::Elf,
     file_len: usize,
-) -> Result<BTreeMap<usize, ProcessMapFlags>, SpawnError> {
+) -> Result<(BTreeMap<usize, ProcessMapFlags>, usize), SpawnError> {
     let mut plan: BTreeMap<usize, ProcessMapFlags> = BTreeMap::new();
     let image_limit = PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE;
     let entry = usize::try_from(image.entry).map_err(|_| SpawnError::InvalidImage)?;
@@ -242,7 +258,7 @@ fn page_plan(
     if plan.is_empty() || !entry_executable {
         return Err(SpawnError::InvalidImage);
     }
-    Ok(plan)
+    Ok((plan, previous_end))
 }
 
 fn map_plan(
@@ -289,6 +305,52 @@ fn write_segments(
         }
     }
     Ok(())
+}
+
+/// 单次 Grant 的句柄数上界（与内核 MAX_START_GRANTS 对齐；超出由
+/// 调用方分批，v1 组装面以单批为约）。
+const MAX_START_GRANTS: usize = 64;
+
+/// 组装者侧出生块构造（shared::startup 线格式：Header + 句柄数组 +
+/// payload）。内核不参与构造——出生块是组装者与接收进程的用户约定。
+fn build_birth_block(
+    pid: u64,
+    parent_pid: u64,
+    handles: &[Handle],
+    payload: &[u8],
+) -> Result<alloc::vec::Vec<u8>, SpawnError> {
+    erhino_shared::startup::build_startup_block(pid, parent_pid, handles, payload)
+        .map_err(|_| SpawnError::InvalidImage)
+}
+
+/// 出生块写入约定区：映像顶（page_plan 推导）之上页对齐放置——组装者
+/// 掌握映像布局（Map 由其驱动），无需查询目标 brk；块的只读性由接收方
+/// 运行时自行遵守（v1 约定，见计划篇 D6c）。逐页映射并单次回填，
+/// 返回块基址。
+fn write_birth_block(
+    builder: Handle,
+    block: &[u8],
+    image_top: usize,
+) -> Result<usize, SpawnError> {
+    let base = image_top.div_ceil(PROCESS_PAGE_SIZE) * PROCESS_PAGE_SIZE;
+    let end = base
+        .checked_add(block.len())
+        .ok_or(SpawnError::InvalidImage)?;
+    if end > PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE {
+        return Err(SpawnError::InvalidImage);
+    }
+    let span_pages = block.len().div_ceil(PROCESS_PAGE_SIZE);
+    let span = span_pages * PROCESS_PAGE_SIZE;
+    let permissions = ProcessMapFlags::READ | ProcessMapFlags::WRITE;
+    let mut mapped = 0usize;
+    while mapped < span {
+        let len = MAX_MAP_BYTES.min(span - mapped);
+        process::map(builder, base + mapped, len, permissions)
+            .map_err(SpawnError::System)?;
+        mapped += len;
+    }
+    process::write(builder, base, block).map_err(SpawnError::System)?;
+    Ok(base)
 }
 
 fn map_stack(builder: Handle) -> Result<(), SpawnError> {
@@ -367,7 +429,7 @@ mod tests {
                 segment(0x2000, 0, 0x1000, true, true, false),
             ],
         };
-        let plan = page_plan(&image, 0).unwrap();
+        let (plan, _) = page_plan(&image, 0).unwrap();
         assert_eq!(plan[&1], ProcessMapFlags::READ | ProcessMapFlags::EXECUTE);
         assert_eq!(plan[&2], ProcessMapFlags::READ | ProcessMapFlags::WRITE);
     }

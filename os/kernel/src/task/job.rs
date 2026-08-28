@@ -32,7 +32,7 @@ use core::any::Any;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
-    proc::{JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid, JOB_ENUMERATE_MAX},
+    proc::{JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid, Tid, JOB_ENUMERATE_MAX},
 };
 
 use super::{
@@ -544,17 +544,28 @@ impl Job {
     /// 临界区完成 lifecycle 的 Building → Running 线性化（lifecycle 锁
     /// 嵌套于链锁内，锁序规范允许方向）。失败（seal 先到或进程已
     /// 终止）返回 ObjectClosed，调用方整体回滚。
-    pub(crate) fn start_commit_gate(process: &Arc<Process>) -> Result<(), SystemCallError> {
+    /// ProcessStart 提交闸门：链锁内「上行检查祖先 seal + Building →
+    /// Running（含预育提取）」（活体门、计数一致性与 Staging 提取在
+    /// begin_running 锁内原子完成；lifecycle 锁嵌套于链锁内，锁序
+    /// Job 链锁 → lifecycle 锁）。expected 是调用方预留就绪容量的成员
+    /// 计数，out 容量同由调用方预预留；并发 attach 插队报 ObjectBusy
+    /// （调用方以新计数重试）。
+    pub(crate) fn start_commit_gate(
+        process: &Arc<Process>,
+        expected: usize,
+        out: &mut Vec<(Tid, Arc<crate::task::Thread>)>,
+    ) -> Result<(), SystemCallError> {
         let job = process.job();
         let chain = collect_chain(&job)?;
         let guards = lock_chain(&chain)?;
         if guards.iter().any(|state| state.sealed) {
             return Err(SystemCallError::ObjectClosed);
         }
-        if !process.lifecycle.begin_running() {
-            return Err(SystemCallError::ObjectClosed);
+        match process.lifecycle.begin_running(expected, out) {
+            Ok(()) => Ok(()),
+            Err(super::lifecycle::BeginFault::Closed) => Err(SystemCallError::ObjectClosed),
+            Err(super::lifecycle::BeginFault::StaleCount) => Err(SystemCallError::ObjectBusy),
         }
-        Ok(())
     }
 }
 

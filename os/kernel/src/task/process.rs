@@ -10,11 +10,13 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, PROCESS_DRAIN_MAX, Pid, ProcessCreateResult,
-        ProcessDrainResult, ProcessDrainStatus, ProcessExitReason, ProcessMapFlags,
-        ProcessSnapshot, ProcessStartDescriptor, ProcessState, Tid,
+        ExecutionProfile, HandleGrant, PROCESS_DRAIN_MAX, Pid, ProcessAttachDescriptor,
+        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessExitReason,
+        ProcessMapFlags, ProcessSnapshot, ProcessState, Tid,
     },
 };
+
+use super::lifecycle::AttachFault;
 
 use super::{
     Thread,
@@ -30,7 +32,6 @@ use super::{
 use wait_context::OfferResult;
 
 const MAX_MAP_PAGES: usize = 256;
-const MAX_START_PAYLOAD: usize = 64 << 10;
 const MAX_START_GRANTS: usize = 64;
 
 /// ProcessControl 最大 rights（control_rights 请求的校验基准）。
@@ -485,40 +486,83 @@ pub fn write(
     result
 }
 
-pub fn start(
+/// ProcessAttach(builder, descriptor)：组装者向 Building process 附入
+/// 线程（线程是组装资源）。内核零资源分配——栈与出生块由组装者经
+/// Map/Write 供给；本调用只创建执行基底并插入预育表（Staging）。
+/// 无观察壳：组装不是协作，组装者在 Start 之后不再观察内部状态。
+pub fn attach(
     thread: &Thread,
     builder_handle: Handle,
     descriptor_ptr: usize,
-) -> Result<(), SystemCallError> {
+) -> Result<Tid, SystemCallError> {
     let descriptor = unsafe {
-        crate::uaccess::read_user_value::<ProcessStartDescriptor>(
+        crate::uaccess::read_user_value::<ProcessAttachDescriptor>(
             &mut thread.process.space.lock(),
             descriptor_ptr,
         )?
     };
-    if descriptor.reserved != 0
-        || descriptor.payload_len as usize > MAX_START_PAYLOAD
-        || descriptor.grant_count as usize > MAX_START_GRANTS
-    {
+    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
+    let builder = &concrete_builder(&builder_object)?;
+    let process = builder.process()?;
+
+    // Building 操作准入：终止后拒绝附入（REAPABLE 屏障前提）。
+    if !process.lifecycle.enter_building_op() {
+        return Err(SystemCallError::ObjectClosed);
+    }
+    let result = (|| {
+        // 出生现场前置校验：entry 可执行、sp 可写且 16 字节对齐
+        // （与旧 Start 语义一致；运行期 fault 走用户 fault 杀进程）。
+        process
+            .space
+            .lock()
+            .validate_initial_context(
+                descriptor.entry as usize,
+                descriptor.stack_pointer as usize,
+            )
+            .map_err(map_space_error)?;
+        process
+            .lifecycle
+            .attach_member(|tid| {
+                Arc::try_new(super::proc::Thread::new_thread(
+                    tid,
+                    &process,
+                    descriptor.entry as usize,
+                    descriptor.stack_pointer as usize,
+                    descriptor.arg1 as usize,
+                    descriptor.arg2 as usize,
+                ))
+                .map_err(|_| AttachFault::Oom)
+            })
+            .map_err(|fault| match fault {
+                AttachFault::Closed => SystemCallError::ObjectClosed,
+                AttachFault::Limit => SystemCallError::ReachLimit,
+                AttachFault::Oom => SystemCallError::OutOfMemory,
+            })
+    })();
+    leave_building_op(&process);
+    result
+}
+
+/// ProcessGrant(builder, grants_ptr, count, out_values)：组装者把 grants
+/// 从本表移入目标 Building process 的 HandleTable 并输出目标侧句柄值
+/// （组装者将其写入出生块后经 ProcessWrite 交付）。pin 事务保证输出
+/// 失败无损还原；成功即目标表可见。
+pub fn grant(
+    thread: &Thread,
+    builder_handle: Handle,
+    grants_ptr: usize,
+    count: usize,
+    out_values: usize,
+) -> Result<(), SystemCallError> {
+    if count == 0 || count > MAX_START_GRANTS {
         return Err(SystemCallError::IllegalArgument);
     }
-    let requirement = match descriptor.profile {
-        value if value == ExecutionProfile::Base64 as u32 => elf::IsaRequirement::Base64,
-        value if value == ExecutionProfile::D64 as u32 => elf::IsaRequirement::D64,
-        _ => return Err(SystemCallError::IllegalArgument),
-    };
-
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(descriptor.payload_len as usize)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    payload.resize(descriptor.payload_len as usize, 0);
     let mut grants = Vec::new();
     grants
-        .try_reserve_exact(descriptor.grant_count as usize)
+        .try_reserve_exact(count)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     grants.resize(
-        descriptor.grant_count as usize,
+        count,
         HandleGrant {
             handle: Handle::INVALID,
             rights: Rights::NONE,
@@ -526,31 +570,103 @@ pub fn start(
     );
     {
         let mut caller_space = thread.process.space.lock();
-        crate::uaccess::copy_from_user(
-            &mut caller_space,
-            &mut payload,
-            descriptor.payload_ptr as usize,
-        )?;
         let grant_bytes = unsafe {
             core::slice::from_raw_parts_mut(
                 grants.as_mut_ptr().cast::<u8>(),
                 core::mem::size_of_val(grants.as_slice()),
             )
         };
-        crate::uaccess::copy_from_user(
-            &mut caller_space,
-            grant_bytes,
-            descriptor.grants_ptr as usize,
-        )?;
+        crate::uaccess::copy_from_user(&mut caller_space, grant_bytes, grants_ptr)?;
     }
-    if grants.iter().any(|grant| grant.handle == builder_handle) {
-        return Err(SystemCallError::IllegalArgument);
+    let grant_pairs: Vec<(Handle, Rights)> =
+        grants.iter().map(|grant| (grant.handle, grant.rights)).collect();
+
+    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
+    let builder = &concrete_builder(&builder_object)?;
+    let process = builder.process()?;
+    if !process.lifecycle.enter_building_op() {
+        return Err(SystemCallError::ObjectClosed);
     }
-    let mut grant_pairs = Vec::new();
-    grant_pairs
-        .try_reserve_exact(grants.len())
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    grant_pairs.extend(grants.iter().map(|grant| (grant.handle, grant.rights)));
+    let result = (|| {
+        // 调用者表 pin：原子验证并翻转（失败零副作用）。
+        let pin_token = super::handle::transaction_token();
+        {
+            let mut caller_table = thread.process.handles.lock();
+            caller_table
+                .pin_for_start(None, Rights::NONE, &grant_pairs, pin_token)
+                .map_err(super::handle::map_error)?;
+        }
+        // 提取前完成全部可失败步骤：目标预留 + 提交缓冲预留——此后
+        // 的失败路径（交付失败）只需无损还原 pin 与预留，不存在
+        // 「条目已离开调用者表」的中间态。
+        let target_token = super::handle::transaction_token();
+        let reservation = match process.handles.lock().reserve(grant_pairs.len(), target_token) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                thread.process.handles.lock().unpin(pin_token);
+                return Err(super::handle::map_error(error));
+            }
+        };
+        let mut moved = Vec::new();
+        if moved.try_reserve_exact(grant_pairs.len()).is_err() {
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("ProcessGrant reservation must remain owned");
+            thread.process.handles.lock().unpin(pin_token);
+            return Err(SystemCallError::OutOfMemory);
+        }
+        // 句柄值交付：复检失败即杀调用进程（deliver_output 已冻结终因
+        // 并组装 todo，分发出口终止检查收束），此处只做无损还原。
+        {
+            let mut caller_space = thread.process.space.lock();
+            for (index, value) in reservation.handles().iter().enumerate() {
+                let dst = out_values + index * core::mem::size_of::<Handle>();
+                // SAFETY: Handle 为无 padding 的 u64 newtype。
+                let deliver =
+                    unsafe { crate::uaccess::deliver_output(thread, &mut caller_space, dst, value) };
+                if let Err(error) = deliver {
+                    drop(caller_space);
+                    process
+                        .handles
+                        .lock()
+                        .rollback(reservation)
+                        .expect("ProcessGrant reservation must remain owned");
+                    thread.process.handles.lock().unpin(pin_token);
+                    return Err(error);
+                }
+            }
+        }
+        // 提交区：pinned 已验证、容量已预留、值已交付——以下不可失败。
+        {
+            let mut caller_table = thread.process.handles.lock();
+            caller_table.commit_pinned_for_start(pin_token, None, &grant_pairs, &mut moved);
+        }
+        process
+            .handles
+            .lock()
+            .commit(reservation, moved)
+            .expect("ProcessGrant reservation count matches entries");
+        Ok(())
+    })();
+    leave_building_op(&process);
+    result
+}
+
+/// ProcessStart(builder, profile)：活体门（已附线程 ≥1）→ Building →
+/// Running → 域绑定与执行需求冻结 → 预育线程整体入册（转 Ready）。
+/// 唯一首次发布 runnable 的提交点；builder 在此消费。
+pub fn start(
+    thread: &Thread,
+    builder_handle: Handle,
+    profile: usize,
+) -> Result<(), SystemCallError> {
+    let requirement = match profile {
+        value if value == ExecutionProfile::Base64 as usize => elf::IsaRequirement::Base64,
+        value if value == ExecutionProfile::D64 as usize => elf::IsaRequirement::D64,
+        _ => return Err(SystemCallError::IllegalArgument),
+    };
 
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let builder = &concrete_builder(&builder_object)?;
@@ -560,188 +676,93 @@ pub fn start(
     if !process.lifecycle.enter_building_op() {
         return Err(SystemCallError::ObjectClosed);
     }
-    let result = start_staged(
-        thread,
-        builder_handle,
-        builder,
-        &process,
-        &descriptor,
-        requirement,
-        &payload,
-        &grant_pairs,
-    );
-    if matches!(result, Err(StartFault::PreCommit(_))) {
+    let result = start_staged(thread, builder_handle, builder, &process, requirement);
+    if result.is_err() {
         leave_building_op(&process);
     }
-    match result {
-        Ok(()) => Ok(()),
-        Err(StartFault::PreCommit(error)) => Err(error),
-    }
+    result
 }
 
-/// Start 提交阶段失败分类：PreCommit 表示 Building 操作登记尚未消费
-/// （外层 leave 配平）；生命周期线性化成功后无失败路径。
-enum StartFault {
-    PreCommit(SystemCallError),
-}
-
-fn rollback_from_block(
-    process: &Arc<Process>,
-    child_reservation: handle_table::Reservation,
-    block_va: usize,
-    block_len: usize,
-) {
-    process
-        .space
-        .lock()
-        .rollback_startup_block(block_va, block_len);
-    process
-        .handles
-        .lock()
-        .rollback(child_reservation)
-        .expect("ProcessStart child reservation must remain owned");
-}
-
-#[allow(clippy::too_many_arguments)]
 fn start_staged(
     thread: &Thread,
     builder_handle: Handle,
     builder: &ProcessBuilder,
     process: &Arc<Process>,
-    descriptor: &ProcessStartDescriptor,
     requirement: elf::IsaRequirement,
-    payload: &[u8],
-    grant_pairs: &[(Handle, Rights)],
-) -> Result<(), StartFault> {
-    use StartFault::PreCommit as pre;
+) -> Result<(), SystemCallError> {
     // eligibility：执行需求 → 兼容域中最弱者（平台无兼容 hart 是
-    // NotSupported 的平台事实语义；域绑定在提交点冻结，见
-    // notes/impls/task.md）。
-    let domain =
-        crate::sched::resolve_domain(requirement).ok_or(pre(SystemCallError::NotSupported))?;
-    process
-        .space
-        .lock()
-        .validate_initial_context(descriptor.entry as usize, descriptor.stack_pointer as usize)
-        .map_err(map_space_error)
-        .map_err(pre)?;
+    // NotSupported 的平台事实语义；域绑定在提交点冻结）。
+    let domain = crate::sched::resolve_domain(requirement)
+        .ok_or(SystemCallError::NotSupported)?;
 
-    // 按请求顺序承载 grants 的提交 Vec 在目标进程产生任何副作用前
-    // 完整预留；线性化点之后只做定点取出与 push，不再分配。
-    let mut moved = Vec::new();
-    moved
-        .try_reserve_exact(grant_pairs.len())
-        .map_err(|_| pre(SystemCallError::OutOfMemory))?;
+    // 可失败段：按预育成员数预留就绪容量与提交缓冲。计数读点与 gate
+    // 判点之间存在并发 attach 窗口——begin_running 以 expected 拒绝
+    // 插队（ObjectBusy），组装者以新计数重试。
+    let count = process.lifecycle.member_count();
+    if count == 0 {
+        return Err(SystemCallError::ObjectNotAvailable); // 活体门：从未活过
+    }
+    let mut reservations = Vec::new();
+    reservations
+        .try_reserve_exact(count)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(count)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
 
-    let child_token = super::handle::transaction_token();
-    let child_reservation = process
-        .handles
-        .lock()
-        .reserve(grant_pairs.len(), child_token)
-        .map_err(super::handle::map_error)
-        .map_err(pre)?;
-    let block = match erhino_shared::startup::build_startup_block(
-        process.pid,
-        process.parent,
-        child_reservation.handles(),
-        payload,
-    ) {
-        Ok(block) => block,
-        Err(error) => {
-            process
-                .handles
-                .lock()
-                .rollback(child_reservation)
-                .expect("ProcessStart child reservation must remain owned");
-            return Err(pre(match error {
-                erhino_shared::startup::StartupBuildError::Overflow => {
-                    SystemCallError::IllegalArgument
-                }
-                erhino_shared::startup::StartupBuildError::AllocationFailed => {
-                    SystemCallError::OutOfMemory
-                }
-            }));
-        }
-    };
-    let block_va = match process.space.lock().map_startup_block(&block) {
-        Ok(base) => base,
-        Err(error) => {
-            // 映射失败：地址空间无已提交资源，只回滚 child 预留。
-            process
-                .handles
-                .lock()
-                .rollback(child_reservation)
-                .expect("ProcessStart child reservation must remain owned");
-            return Err(pre(map_space_error(error)));
-        }
-    };
-
-    let child_thread = match super::proc::prepare_main_thread(
-        process.clone(),
-        descriptor.entry as usize,
-        requirement,
-        descriptor.stack_pointer as usize,
-        block_va,
-        block.len(),
-    ) {
-        Ok(thread) => thread,
-        Err(error) => {
-            rollback_from_block(process, child_reservation, block_va, block.len());
-            return Err(pre(map_space_error(error)));
-        }
-    };
-    let ready_reservation = match crate::sched::reserve_ready(domain) {
-        Ok(reservation) => reservation,
-        Err(()) => {
-            rollback_from_block(process, child_reservation, block_va, block.len());
-            return Err(pre(SystemCallError::OutOfMemory));
-        }
-    };
-
-    // 提交前最后的可失败步骤：调用者表内原子验证并 pin builder 与
-    // grants。不持表锁触碰 lifecycle。
+    // 提交前最后的可失败步骤：调用者表内原子 pin builder。
     let pin_token = super::handle::transaction_token();
     {
         let mut caller_table = thread.process.handles.lock();
         if let Err(error) =
-            caller_table.pin_for_start(builder_handle, Rights::MANAGE, grant_pairs, pin_token)
+            caller_table.pin_for_start(Some(builder_handle), Rights::MANAGE, &[], pin_token)
         {
-            drop(caller_table);
-            crate::sched::rollback_ready(ready_reservation);
-            rollback_from_block(process, child_reservation, block_va, block.len());
-            return Err(pre(super::handle::map_error(error)));
+            return Err(super::handle::map_error(error));
+        }
+    }
+    // 就绪容量预留（失败：无损 unpin 后退出，调用方 leave 配平）。
+    for _ in 0..count {
+        match crate::sched::reserve_ready(domain) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(()) => {
+                thread.process.handles.lock().unpin(pin_token);
+                return Err(SystemCallError::OutOfMemory);
+            }
         }
     }
 
-    // 提交线性化点：链锁内「上行检查祖先 seal + Building → Running」
-    // （member=Staging，操作登记被消费；lifecycle 锁嵌套于链锁内，锁序
-    // Job 链锁 → lifecycle 锁）。失败则无损 unpin 后整体回滚。
-    if let Err(error) = super::job::Job::start_commit_gate(process) {
+    // 提交线性化点：链锁内「上行检查祖先 seal + Building → Running
+    // （含预育提取）」——活体门、计数一致性与 Staging 强引用交出在
+    // 同一 lifecycle 锁内原子完成，消除 gate 后、入队前的 kill 游标
+    // 窗口。失败则无损 unpin 后回滚就绪预留。
+    if let Err(error) = super::job::Job::start_commit_gate(process, count, &mut staged) {
         thread.process.handles.lock().unpin(pin_token);
-        crate::sched::rollback_ready(ready_reservation);
-        rollback_from_block(process, child_reservation, block_va, block.len());
-        return Err(pre(error));
+        for reservation in reservations {
+            crate::sched::rollback_ready(reservation);
+        }
+        return Err(error);
     }
 
-    // 提交区：容量已预留、槽位已 pin——以下全部不可失败。
-    // 域绑定在此冻结（Building→Running 线性化已完成，此后线程只经
-    // 所属域的类队列出现）。
+    // 提交区：容量已预留、槽位已 pin、线程已交出——以下全部不可失败。
+    // 域绑定与执行需求在此冻结（Building→Running 线性化已完成，此后
+    // 线程只经所属域的类队列出现）。
     process.bind_domain(domain);
-    let builder_entry = thread.process.handles.lock().commit_pinned_for_start(
-        pin_token,
-        builder_handle,
-        grant_pairs,
-        &mut moved,
-    );
-    process
-        .handles
-        .lock()
-        .commit(child_reservation, moved)
-        .expect("ProcessStart child reservation count matches grants");
+    process.freeze_requirement(requirement);
+    let builder_entry = {
+        let mut grants_out = Vec::new();
+        thread
+            .process
+            .handles
+            .lock()
+            .commit_pinned_for_start(pin_token, Some(builder_handle), &[], &mut grants_out)
+            .expect("start pin transaction must carry the builder")
+    };
     builder.consume();
     super::handle::close_entry(builder_entry, &thread.process, false);
-    process.lifecycle.staging_ready(child_thread.tid);
-    crate::sched::commit_ready(ready_reservation, child_thread);
+    for (reservation, (_, thread)) in reservations.into_iter().zip(staged.into_iter()) {
+        crate::sched::commit_ready(reservation, thread);
+    }
     Ok(())
 }
 
@@ -769,10 +790,16 @@ pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo
             }
         }
     }
+    // 预育成员游标：预育线程从未进入容器，摘除即完成（强引用锁外释放，
+    // 打破 Building 期的 Process↔Thread 引用环）。
+    while let Some(thread) = process.lifecycle.take_first_staging() {
+        drop(thread);
+    }
     if todo.ipi_slots != 0 {
         crate::registry::ipi_slots(todo.ipi_slots);
     }
-    if todo.reapable {
+    // Staging 摘除可能使 REAPABLE 条件达成（todo 组装时成员尚在）。
+    if todo.reapable || process.lifecycle.is_reapable() {
         control_publish_reapable(&process.control());
     }
 }

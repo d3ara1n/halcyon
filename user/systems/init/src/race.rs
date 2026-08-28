@@ -17,6 +17,7 @@ use rinlib::ipc::object::{close, duplicate};
 use rinlib::ipc::wait::wait_many;
 use rinlib::preclude::*;
 use rinlib::process;
+use rinlib::shared::proc::ProcessAttachDescriptor;
 use rinlib::shared::call::SystemCallError;
 use rinlib::shared::message::HandleMove;
 use rinlib::shared::object::{Handle, ObjectSignals, Rights};
@@ -176,11 +177,11 @@ fn spawn_race_target(
     Ok((spawned, gun_pair.peer))
 }
 
-/// 手工 Building：入口页（wfi）+ 栈顶页，供 kill-vs-Start/abandonment
-/// 的提交前窗口竞速。
-fn build_wfi_building(
-    job: Handle,
-) -> Result<(ProcessCreateResult, u64, u64), SystemCallError> {
+/// 手工 Building：入口页（wfi）+ 栈顶页 + 附入首线程，供
+/// kill-vs-Start/abandonment 的提交前窗口竞速。attach 由组装者完成
+/// （线程是组装资源）；锤只持 builder 在竞速时刻拉 Start——
+/// Building→Running 线性化仍是唯一竞速点。
+fn build_wfi_building(job: Handle) -> Result<ProcessCreateResult, SystemCallError> {
     let created = process::create(job, SUPERVISOR_RIGHTS)?;
     process::map(
         created.builder,
@@ -195,7 +196,14 @@ fn build_wfi_building(
         PROCESS_PAGE_SIZE,
         ProcessMapFlags::READ | ProcessMapFlags::WRITE,
     )?;
-    Ok((created, 0x1000, PROCESS_USER_TOP as u64))
+    let descriptor = ProcessAttachDescriptor {
+        entry: 0x1000,
+        stack_pointer: PROCESS_USER_TOP as u64,
+        arg1: 0,
+        arg2: 0,
+    };
+    process::attach(created.builder, &descriptor)?;
+    Ok(created)
 }
 
 /// 收束到 Dead 后断言终因在允许集合内；code 通配用 None。返回终因
@@ -356,6 +364,7 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     for round in 0..4u64 {
         let exit_code = 0x300 + round as i64;
         let kill_code = 0x400 + round as i64;
+        debug!("race kill-vs-exit: round {} spawning target", round);
         let (target, gun) =
             match spawn_race_target(job, image, race::TARGET_SUICIDE, exit_code as u64) {
                 Ok(pair) => pair,
@@ -364,6 +373,7 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                     return false;
                 }
             };
+        debug!("race kill-vs-exit: round {} target spawned", round);
         let moves = [HandleMove {
             handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
@@ -467,8 +477,8 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let (created, entry, sp) = match build_wfi_building(job) {
-            Ok(triple) => triple,
+        let created = match build_wfi_building(job) {
+            Ok(created) => created,
             Err(error) => {
                 debug!("race kill-vs-start: building failed: {:?}", error);
                 return false;
@@ -484,9 +494,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
             handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
-        let mut start_cmd = race_cmd(race::ACTION_START, 0);
-        start_cmd.entry = entry;
-        start_cmd.sp = sp;
+        let start_cmd = race_cmd(race::ACTION_START, 0);
         let kill_cmd = race_cmd(race::ACTION_KILL, kill_code as u64);
         let sent = h.send_cmd(0, &start_cmd, &start_moves) && h.send_cmd(1, &kill_cmd, &kill_moves);
         h.fire(&[0, 1]);
@@ -581,8 +589,8 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let (created, _, _) = match build_wfi_building(job) {
-            Ok(triple) => triple,
+        let created = match build_wfi_building(job) {
+            Ok(created) => created,
             Err(error) => {
                 debug!("race kill-vs-abandon: building failed: {:?}", error);
                 return false;
