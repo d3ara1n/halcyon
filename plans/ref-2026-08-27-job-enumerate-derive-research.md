@@ -1,6 +1,6 @@
 # Job 成员枚举与 capability 派生跨系统契约取证（Zircon / Windows / seL4 / Linux）
 
-> 取证日期：2026-08-27。来源限制：只记录官方文档/API 参考及官方源码载明的事实；未核实的点显式标注，不推断，不代行本项目的设计决策。本文件为 `ref-` 对照资料，只记录成熟系统的实际契约与立场。源码引用固定于 Fuchsia commit [`7dedc3f2bbbba618ff0f1cda6d9e67cbf3e6f98a`](https://fuchsia.googlesource.com/fuchsia/+/7dedc3f2bbbba618ff0f1cda6d9e67cbf3e6f98a/)（与 `ref-2026-08-task-termination-research.md` 同一快照）。设计决策见 [archived/todo-2026-08-27-job-management-design.md](archived/todo-2026-08-27-job-management-design.md)，已并入 [todo-2026-08-26-process-lifecycle.md](todo-2026-08-26-process-lifecycle.md)。
+> 取证日期：2026-08-27。来源限制：只记录官方文档/API 参考及官方源码载明的事实；未核实的点显式标注，不推断，不代行本项目的设计决策。本文件为 `ref-` 对照资料，只记录成熟系统的实际契约与立场。源码引用固定于 Fuchsia commit [`7dedc3f2bbbba618ff0f1cda6d9e67cbf3e6f98a`](https://fuchsia.googlesource.com/fuchsia/+/7dedc3f2bbbba618ff0f1cda6d9e67cbf3e6f98a/)（与 `ref-2026-08-task-termination-research.md` 同一快照）。设计决策见 [archived/todo-2026-08-27-job-management-design.md](archived/todo-2026-08-27-job-management-design.md)，已并入 [todo-2026-08-26-process-lifecycle.md](archived/todo-2026-08-26-process-lifecycle.md)。
 
 ---
 

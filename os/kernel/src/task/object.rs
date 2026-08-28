@@ -174,12 +174,20 @@ pub trait KernelObject: Any + Send + Sync {
     /// 此对象是否接受 role；接受时返回该 role 的最大 rights。
     fn allowed_rights(&self, role: HandleRole) -> Option<Rights>;
 
-    /// role 能观察的合法电平位。
+    /// role 能观察的合法电平位；None 表示对象不是可等待对象。
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals>;
 
-    fn signals(&self) -> ObjectSignals;
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult;
-    fn unsubscribe(&self, id: u64);
+    /// 非等待对象不维护电平或订阅；WaitMany 在调用此前已由 rights 与
+    /// allowed_signals 拒绝它们。
+    fn signals(&self) -> ObjectSignals {
+        ObjectSignals::NONE
+    }
+
+    fn subscribe(&self, _subscription: Subscription) -> SubscribeResult {
+        unreachable!("non-waitable object accepted a subscription")
+    }
+
+    fn unsubscribe(&self, _id: u64) {}
 
     /// Handle 从表中移除且表锁已释放后的 lifecycle 回调。
     fn close_handle(&self, role: HandleRole, owner: &Process, exiting: bool);

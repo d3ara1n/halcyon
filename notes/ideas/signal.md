@@ -1,32 +1,17 @@
-# 对象信号与 Notification
+# Notification
 
-事件面分为两层：[ObjectSignals](wait.md) 是附着在对象上的非消费式电平状态；**Notification** 是用于 OR 合并且必须显式消费的独立对象。两者都经 Handle、lifecycle role 与 rights 使用，等待统一由 `WaitMany` 完成。
+Notification 是按位 OR 合并、由消费者显式取走的独立对象。它适合无负载、允许合并的通知；需要身份、次数、顺序或数据时使用消息，需要高频共享状态时使用 Tunnel 协议。
 
-## ObjectSignals
+## 角色与待决位
 
-可等待对象把当前条件公开为位掩码。典型位义如下：
+创建者获得唯一 owner Handle。owner 不可 duplicate 或 TRANSIT，可通过 ProcessStart 直接 GRANT；owner 关闭使对象进入 CLOSED。获授权的 signaler 可按 rights duplicate、TRANSIT 或 GRANT，并提交位掩码。
 
-| 对象 | 状态 | 含义 |
-|------|------|------|
-| 邮箱 | `READABLE` | 至少有一条完整消息可 Receive（owner 观察） |
-| 邮箱 | `WRITABLE` | 占用低于容量，Send 可推进（sender 观察） |
-| 隧道端点 | `DATA` | 对端提交了状态改变提示 |
-| 隧道端点 | `PEER_CLOSED` | 对端已关闭，页内内容不再有对端保证 |
-| ProcessControl | `REAPABLE` | 线程与 active hart 已离场，管理者可推进有界资源收束 |
-| 任意对象 | `CLOSED` | 对象已进入不可复活的终态 |
+待决位按 OR 累积，重复提交同一位不会计数。存在任意待决位时对象的 READABLE 电平为真。
 
-状态是条件，不是等待者私有的交付记录：多个等待者可同时观察同一位，WaitMany 返回绝不清除它。拥有语义的一方显式置位或清除；每种对象都必须定义清除前提。`CLOSED` 和 `PEER_CLOSED` 是持续可见的终态位。
+## 消费
 
-WaitMany 以 `{ handle, signals, cookie }` 项观察组合对象，结果以 cookie、观察状态、输入项索引和原因辨认来源；它不接受 ObjectKind、对象 id 或「自身对象」等平行寻址，也没有按结果隐式清位规则。
+消费者先用 WaitMany 观察 READABLE，再调用 NotificationTake 原子取得并清除所选位；未选择的位继续保留。WaitMany 从不改变待决位，因此多个等待者可以同时被唤醒，最终由 Take 协调消费竞争。
 
-## Notification
+Notification 不是广播队列：一个消费者取走某位后，其他消费者不再看到该位。需要每订阅者可靠通知时，provider 必须为每个订阅关系持有独立 Notification signaler，或使用可重放日志。
 
-Notification 显式创建、可等待。创建者获得唯一 owner Handle：不可复制或 TRANSIT，可在 ProcessStart 中直接 GRANT；owner 关闭即对象关闭。持有 `SIGNAL` 的 signaler 可以按授权 duplicate、TRANSIT 或 GRANT，并向对象提交位掩码；待决位按 OR 累积，至少一位待决时 `READABLE` 为真。
-
-持有读取权者通过专门取走操作原子取得并清除所选位，未选择的位保留。这把「通知发生」和「由谁消费」分开：等待只负责唤醒，取走才改变 Notification 内容。Notification 无负载、无顺序、无计数；需要身份、次数或数据使用消息，需要高频共享状态使用隧道协议。
-
-## 终止请求与运行时分发
-
-ProcessKill 是具 MANAGE authority 的显式异步操作，不以可由目标忽略的状态位表达。内核只请求各线程在安全边界离场，不向任意线程注入 handler 或改写用户执行现场。线程与 active hart 全部离场后 ProcessControl 置 REAPABLE；管理者以有界收束操作推进 Handle 和地址空间回收，最后清 REAPABLE 并置 CLOSED。
-
-用户态运行时若需回调，可由专门线程 WaitMany 于相关 Handle，在该线程普通调用栈上分发；程序也可显式检查对象状态。
+ObjectSignals、WaitMany、Timeout 与取消的通用契约见 [`wait.md`](wait.md)，本篇不重复定义。

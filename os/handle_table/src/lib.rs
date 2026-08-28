@@ -255,9 +255,7 @@ impl<T, R> HandleTable<T, R> {
             return Err(TableError::BadReservation);
         }
         for (i, (handle, rights)) in grants.iter().copied().enumerate() {
-            if grants[..i].iter().any(|(prior, _)| *prior == handle)
-                || handle == builder
-            {
+            if grants[..i].iter().any(|(prior, _)| *prior == handle) || handle == builder {
                 return Err(TableError::DuplicateHandle);
             }
             if !rights.is_known() {
@@ -270,13 +268,12 @@ impl<T, R> HandleTable<T, R> {
         }
         self.get(builder, builder_right)?;
         // 验证全部通过：翻转（不可失败）。
-        for (handle, rights) in grants.iter().copied() {
+        for (handle, _) in grants.iter().copied() {
             let index = self.occupied_index(handle)?;
             let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
-            let SlotState::Occupied(mut entry) = state else {
+            let SlotState::Occupied(entry) = state else {
                 unreachable!()
             };
-            entry.rights = rights;
             self.slots[index].state = SlotState::Pinned(token, entry);
         }
         let index = self.occupied_index(builder)?;
@@ -288,28 +285,46 @@ impl<T, R> HandleTable<T, R> {
         Ok(())
     }
 
-    /// 提交 pin：按槽序把全部 Pinned(token) 追加进调用方**已预留容量**的
-    /// `out`（容量 ≥ pin 数量时不可失败——无分配），槽位归 Vacant。
-    /// 返回追加的 entry 数。
-    pub fn commit_pinned_into(&mut self, token: u64, out: &mut Vec<Entry<T, R>>) -> usize {
-        let mut advanced = Vec::new();
-        let mut count = 0;
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if matches!(&slot.state, SlotState::Pinned(t, _) if *t == token) {
-                let state = core::mem::replace(&mut slot.state, SlotState::Vacant);
-                let SlotState::Pinned(_, entry) = state else {
-                    unreachable!()
-                };
-                out.push(entry);
-                count += 1;
-                self.occupied -= 1;
-                advanced.push(index);
-            }
+    /// Start 专用提交：按原始 grant 请求顺序定点取出 pinned entries，
+    /// builder 单独取得。`grants` 输出容量须已预留，因此整段不扫描、不
+    /// 分配、不可失败；任一不匹配均是调用方破坏 pin 事务的不变量。
+    pub fn commit_pinned_for_start(
+        &mut self,
+        token: u64,
+        builder: Handle,
+        grant_pairs: &[(Handle, Rights)],
+        grants: &mut Vec<Entry<T, R>>,
+    ) -> Entry<T, R> {
+        debug_assert!(grants.capacity() - grants.len() >= grant_pairs.len());
+        for (handle, rights) in grant_pairs {
+            grants.push(self.take_pinned(token, *handle).with_rights(*rights));
         }
-        for index in advanced {
-            self.advance_generation(index);
-        }
-        count
+        self.take_pinned(token, builder)
+    }
+
+    fn take_pinned(&mut self, token: u64, handle: Handle) -> Entry<T, R> {
+        assert!(handle.is_valid(), "pinned handle must be valid");
+        let index = handle.slot() as usize;
+        let slot = self
+            .slots
+            .get_mut(index)
+            .expect("pinned handle slot must exist");
+        assert_eq!(
+            slot.generation,
+            handle.generation(),
+            "pinned handle generation changed"
+        );
+        let state = core::mem::replace(&mut slot.state, SlotState::Vacant);
+        let SlotState::Pinned(actual, entry) = state else {
+            unreachable!("pinned handle disappeared")
+        };
+        assert_eq!(
+            actual, token,
+            "pinned handle belongs to another transaction"
+        );
+        self.occupied -= 1;
+        self.advance_generation(index);
+        entry
     }
 
     /// 无损还原 Pinned(token) → Occupied（生命周期提交失败的事务回滚）。
@@ -648,7 +663,9 @@ mod tests {
                 0xfeed_beef,
             ))
             .unwrap();
-        let copy = table.duplicate(source, Rights::WRITE | Rights::TRANSIT).unwrap();
+        let copy = table
+            .duplicate(source, Rights::WRITE | Rights::TRANSIT)
+            .unwrap();
         assert_eq!(table.get(copy, Rights::WRITE).unwrap().badge(), 0xfeed_beef);
         let moved = table.extract_moves(&[(copy, Rights::WRITE)]).unwrap();
         assert_eq!(moved[0].badge(), 0xfeed_beef);
@@ -689,7 +706,9 @@ mod tests {
             .insert(entry(2, Role::Sender, Rights::WRITE | Rights::TRANSIT))
             .unwrap();
         assert_eq!(
-            table.extract_grants(&[(sender, Rights::WRITE)]).unwrap_err(),
+            table
+                .extract_grants(&[(sender, Rights::WRITE)])
+                .unwrap_err(),
             TableError::RightsDenied
         );
         assert!(table.get(sender, Rights::WRITE).is_ok());
@@ -795,28 +814,54 @@ mod pin_tests {
         let h1 = table.insert(entry(10)).unwrap();
         assert!(table.pin_for_start(h1, Rights::READ, &[], 7).is_ok());
         // pin 后不可见：get / remove 均失效。
-        assert!(matches!(table.get(h1, Rights::READ), Err(TableError::StaleHandle)));
+        assert!(matches!(
+            table.get(h1, Rights::READ),
+            Err(TableError::StaleHandle)
+        ));
         assert!(matches!(table.remove(h1), Err(TableError::StaleHandle)));
         // 提交：取出且代际前进（旧值复活被拒）。
-        let mut out = Vec::new();
-        out.reserve(1);
-        assert_eq!(table.commit_pinned_into(7, &mut out), 1);
-        assert_eq!(*out[0].object(), 10);
-        assert!(matches!(table.get(h1, Rights::READ), Err(TableError::StaleHandle)));
+        let mut grants = Vec::new();
+        let builder = table.commit_pinned_for_start(7, h1, &[], &mut grants);
+        assert_eq!(*builder.object(), 10);
+        assert!(grants.is_empty());
+        assert!(matches!(
+            table.get(h1, Rights::READ),
+            Err(TableError::StaleHandle)
+        ));
     }
 
     #[test]
     fn unpin_restores_entries_losslessly() {
         let mut table = Table::new();
-        let h1 = table.insert(entry(20)).unwrap();
-        assert!(table.pin_for_start(h1, Rights::READ, &[], 9).is_ok());
+        let builder = table.insert(entry(20)).unwrap();
+        let grant = table.insert(entry(21)).unwrap();
+        assert!(
+            table
+                .pin_for_start(builder, Rights::READ, &[(grant, Rights::READ)], 9)
+                .is_ok()
+        );
         table.unpin(9);
-        let entry = table.get(h1, Rights::READ).unwrap();
-        assert_eq!(*entry.object(), 20);
-        // 不同 token 的 commit/unpin 不触碰。
-        let mut out = Vec::new();
-        out.reserve(1);
-        assert_eq!(table.commit_pinned_into(8, &mut out), 0);
+        let restored = table.get(grant, Rights::READ | Rights::GRANT).unwrap();
+        assert_eq!(*restored.object(), 21);
+        assert_eq!(restored.rights(), Rights::READ | Rights::GRANT);
+        assert_eq!(
+            table
+                .get(builder, Rights::READ | Rights::GRANT)
+                .unwrap()
+                .rights(),
+            Rights::READ | Rights::GRANT
+        );
+
+        // 回滚后的同一请求可重试；只有本次成功提交的 grant 被裁剪。
+        table
+            .pin_for_start(builder, Rights::READ, &[(grant, Rights::READ)], 10)
+            .unwrap();
+        let mut moved = Vec::new();
+        moved.try_reserve_exact(1).unwrap();
+        let builder_entry =
+            table.commit_pinned_for_start(10, builder, &[(grant, Rights::READ)], &mut moved);
+        assert_eq!(builder_entry.rights(), Rights::READ | Rights::GRANT);
+        assert_eq!(moved[0].rights(), Rights::READ);
     }
 
     #[test]
@@ -837,6 +882,31 @@ mod pin_tests {
             table.pin_for_start(h1, Rights::READ, &alias, 5),
             Err(TableError::DuplicateHandle)
         ));
+    }
+
+    #[test]
+    fn start_commit_preserves_grant_request_order() {
+        let mut table = Table::new();
+        let builder = table.insert(entry(1)).unwrap();
+        let first_slot = table.insert(entry(2)).unwrap();
+        let second_slot = table.insert(entry(3)).unwrap();
+        // 请求顺序故意与 caller slot 顺序相反。
+        let grants = [(second_slot, Rights::READ), (first_slot, Rights::READ)];
+        table
+            .pin_for_start(builder, Rights::READ, &grants, 12)
+            .unwrap();
+        let mut moved = Vec::new();
+        moved.try_reserve_exact(grants.len()).unwrap();
+        let builder_entry = table.commit_pinned_for_start(12, builder, &grants, &mut moved);
+        assert_eq!(*builder_entry.object(), 1);
+        assert_eq!(
+            moved
+                .iter()
+                .map(|entry| *entry.object())
+                .collect::<Vec<_>>(),
+            [3, 2]
+        );
+        assert!(moved.iter().all(|entry| entry.rights() == Rights::READ));
     }
 
     #[test]

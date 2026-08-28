@@ -1,17 +1,31 @@
-# 设备授权
+# 设备资源
 
-设备管理分为内核短路径机制与用户态策略。内核不维护供任意进程按路径领取的 raw-device 列表，也不把中断注入用户 handler。
+设备接入分为平台资源机制、用户态资源管理和驱动协议。内核不维护按路径领取 raw device 的策略列表，也不把中断注入用户 handler。
 
-## 平台根
+## 平台资源根
 
-内核依据可信 Devicetree 与平台事实铸造 MMIO region、IRQ source、DMA window 等 primordial capabilities，并在初始 launch 中交给 init 或资源管理服务。内核负责对象边界、映射、等待、确认与回收；由哪个驱动取得哪些资源是用户态策略。
+内核依据可信 Devicetree 与平台事实铸造 MMIO region、IRQ source、DMA window 等 primordial resource capabilities，并在初始启动中交给 init 或资源管理服务。资源 capability 只表达对特定硬件范围或来源的 authority，不隐含驱动匹配、设备类别或服务发现政策。
 
-## 驱动租借
+MMIO 映射、IRQ 控制与 DMA 授权必须各自有明确对象边界和撤权路径。资源编号、物理地址和路径字符串都不是 authority；用户态只有取得相应 capability 才能操作资源。
 
-资源管理服务按设备节点与驱动需求派生最小 capability 集，通过 ProcessStart 的直接 GRANT 启动驱动。驱动崩溃或被终止时，Handle drain 解除映射、屏蔽或回收中断/DMA 资源，使设备可由管理服务重新初始化和租借。
+## 驱动授权与恢复
 
-中断以可等待对象表达，并定义 mask、ack、关闭与失主后的安全状态。高层设备请求经驱动发布的 badged service sender、消息和 Tunnel 传输，不让客户端直接持 raw MMIO。
+资源管理服务根据设备节点与驱动需求派生最小资源集合，并通过 ProcessStart 的直接 GRANT 启动驱动。高层客户端只取得驱动发布的协议 endpoint，不直接持 raw MMIO、IRQ 或 DMA authority。
 
-## 发现与投影
+驱动失效后的安全状态分层处理：内核资源对象撤销映射和后续访问；驱动或资源管理服务负责停止 DMA、屏蔽设备侧事件、复位硬件并判断能否重新授权。设备级 session 或 lease 是用户态资源服务协议，不预设为一个通用内核对象。
 
-`/System/Devices` 可以是设备管理服务向 FAL 提供的用户态投影，用于枚举、属性和服务发现；它不是设备 authority 的来源。客户端真正获得的是协议 endpoint 或设备 lease capability，路径字符串本身不授权访问。
+## IRQ 设计边界
+
+本篇不提前选择 IRQ source 是直接可等待对象、绑定 Notification，还是通过其他事件端口投递。该选择必须在设备/中断接入设计中同时闭合：
+
+- interrupt controller 的 mask/ack 与重入顺序；
+- 共享 IRQ 与 MSI/MSI-X；
+- 事件合并、溢出和背压；
+- capability 撤权、驱动退出与重新租借；
+- 设备 reset、DMA 停止与中断安全状态的责任边界。
+
+无论采用哪种传输，IRQ 到达只产生普通内核短路径事件，不执行用户 handler；用户态驱动在自己的线程和调用栈上处理。
+
+## 发现投影
+
+设备管理服务可以经 FAL 发布设备记录，用于枚举属性和发现驱动服务。目录布局由文件系统 namespace 政策拥有，FAL 只运输记录与 endpoint capability；路径名称不授予设备访问权。

@@ -1,7 +1,6 @@
 //! erhino 内核（重写版）。
 //!
-//! 架构与内部机制见 `notes/`；旧实现的设计考古见
-//! `plans/ref-2026-08-legacy-kernel-design.md`。
+//! 架构与内部机制见 `notes/`。
 
 #![no_std]
 #![feature(lang_items, alloc_error_handler, allocator_api)]

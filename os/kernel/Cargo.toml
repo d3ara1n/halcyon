@@ -14,5 +14,6 @@ elf = { path = "../elf" }
 sched_domain = { path = "../sched_domain" }
 handle_table = { path = "../handle_table" }
 wait_context = { path = "../wait_context" }
+timer_queue = { path = "../timer_queue" }
 stack_layout = { path = "../stack_layout" }
 num-traits = { version = "0.2", default-features = false }

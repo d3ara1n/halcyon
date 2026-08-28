@@ -24,7 +24,7 @@ use rinlib::shared::proc::{
     HandleGrant, JobMemberKind, JobState, ProcessCreateResult, ProcessExitReason,
     ProcessMapFlags, ProcessState, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
 };
-use rinlib::shared::wait::{WaitItem, WAIT_DEADLINE_INFINITE};
+use rinlib::shared::wait::{WaitItem, WAIT_TIMEOUT_INFINITE};
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
 /// 分箱，天然归属，无需锤标识）。
@@ -230,7 +230,7 @@ fn drain_expect_dead(control: Handle, allowed: &[(u32, Option<i64>)]) -> Option<
 /// 等 REAPABLE|CLOSED 电平。
 fn await_reapable(control: Handle) -> bool {
     let items = [WaitItem::new(control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, 0)];
-    match wait_many(&items, WAIT_DEADLINE_INFINITE) {
+    match wait_many(&items, WAIT_TIMEOUT_INFINITE) {
         Ok(_) => true,
         Err(error) => {
             debug!("race: reapable wait failed: {:?}", error);
@@ -886,12 +886,16 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 
 /// 竞态矩阵入口：双锤编队 → 10 场景 → 退场收束 → 汇总。失败场景逐个
 /// 点名，汇总行是全矩阵的 grep 锚点。
-pub(crate) fn race_matrix(acceptance: Handle, target_image: &[u8], hammer_image: &[u8]) {
+pub(crate) fn race_matrix(
+    acceptance: Handle,
+    target_image: &[u8],
+    hammer_image: &[u8],
+) -> Result<(), &'static str> {
     let h = match RaceHammers::spawn_pair(acceptance, hammer_image) {
         Ok(set) => set,
         Err(error) => {
-            debug!("race matrix FAILED: hammer spawn {:?}", error);
-            return;
+            debug!("race matrix acceptance failed: hammer spawn {:?}", error);
+            return Err("race matrix hammer spawn failed");
         }
     };
     let scenarios: [(&str, bool); 10] = [
@@ -911,14 +915,26 @@ pub(crate) fn race_matrix(acceptance: Handle, target_image: &[u8], hammer_image:
         Supervised { pid: h.pids[0], control: h.controls[0] },
         Supervised { pid: h.pids[1], control: h.controls[1] },
     ]));
-    if hammer_supervision.is_err() {
-        debug!("race matrix: hammer supervision degraded");
+    let supervision_ok = hammer_supervision.is_ok();
+    if !supervision_ok {
+        debug!("race matrix acceptance failed: hammer supervision degraded");
     }
     let passed = scenarios.iter().filter(|(_, passed)| *passed).count();
     for (name, passed) in &scenarios {
         if !passed {
-            debug!("race scenario FAILED: {}", name);
+            debug!("race matrix acceptance failed: scenario {}", name);
         }
     }
-    debug!("race matrix: {}/{} scenarios passed", passed, scenarios.len());
+    let accepted = supervision_ok && passed == scenarios.len();
+    debug!(
+        "race matrix acceptance {}: {}/{} scenarios passed",
+        if accepted { "passed" } else { "failed" },
+        passed,
+        scenarios.len()
+    );
+    if accepted {
+        Ok(())
+    } else {
+        Err("race matrix acceptance failed")
+    }
 }

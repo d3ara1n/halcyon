@@ -95,7 +95,7 @@ JobDerive(job_control, kind, id, rights, out: *Handle) -> ()
 
 ## 已拍板的结构决策（2026-08-27 第二批：Job 管理面，step 5 前置）
 
-取证与完整推导（含被否选项）见 [archived/todo-2026-08-27-job-management-design.md](archived/todo-2026-08-27-job-management-design.md) 与 [ref-2026-08-27-job-enumerate-derive-research.md](ref-2026-08-27-job-enumerate-derive-research.md)。
+取证与完整推导（含被否选项）见 [archived/todo-2026-08-27-job-management-design.md](todo-2026-08-27-job-management-design.md) 与 [ref-2026-08-27-job-enumerate-derive-research.md](../ref-2026-08-27-job-enumerate-derive-research.md)。
 
 9. **枚举 = 单调 ID 序游标分页**：`JobEnumerate` 以「上批最后返回条目的 ID」为游标——ID 单调不复用 ⇒ 免内核枚举状态、断点续扫、竞态良定义（`id > cursor` 的存活成员必然在后续批出现，ID ≤ cursor 未返回者必然已移除）；单批条目数内核常量封顶；遇未决事务占位即终止本批、游标停在其前（屏障闭合「跳过占位又越过它」的漏项窗口）。条目仅 8 字节 ID，状态经派生后 Query——观察不消费 authority、不占 HandleTable 槽。
 10. **派生 = JobDerive 按 ID 单目标**：kind 区分 child Job→JobControl 与 member process→ProcessControl；请求 rights ⊆ 源 handle rights ∩ 目标角色 allowed_rights，超集 RightsDenied（显式拒绝，不学 seL4 静默降级）；目标不在直接成员表 ObjectNotFound——ID 不复用保证 NotFound 只意味着「已完成」，永不错指。ID（Pid/JobId）不构成全局操作入口，唯一操作角色是 JobControl 直接成员域内的派生选择子。派生复用存活的 ProcessControl shell（单一 shell 身份，REAPABLE/CLOSED 电平不分叉）；shell 已消散时从 core 铸造新 shell，并在铸造点重放已达成的电平（如 REAPABLE），派生兜底由此接上 drain 入口。
@@ -111,12 +111,18 @@ JobDerive(job_control, kind, id, rights, out: *Handle) -> ()
 2. ~~将 ProcessControl 前移到 ProcessCreate，建立 Process lifecycle 锁、无强引用环的线程成员表（含跨 hart IPI 最小正确版与 WaitContext cancellation 契约，见上「已拍板的结构决策」）；~~ 已完成（含 C1-C5/H1-H3/M1-M2 集中修复：Building 操作准入、Gone 时点、Start pin 事务、root 帧有界释放、硬预算计费、零分配发布、快照一致性、创建事务序）；
 3. ~~实现 fixed-width ProcessQuery、Building/Running ProcessKill、ProcessControl rights 与 CLOSED 等待；~~ 已完成；
 4. ~~实现固定预算 Process 收束游标和管理电平，同批给持久 init 加最小监督闭环（保留 controls、WaitMany(REAPABLE|CLOSED)、Drain 至 Complete），证明最后线程、active-hart ack、Handle/page-table drain 与 Dead 发布的顺序；~~ 已完成（live kill 正路径：srv_target Waiting 取消 + Building kill + 自终止）；
-5. ~~实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill~~ 已完成（2026-08-27：JobSeal/Query/Enumerate/Derive 四 syscall、有序 fallible 成员表、链锁封口闸门、完成传播与 libprocess 递归 job_kill；验收线 1–4 全过，virt ×6 / sifive_u / host 全绿，实施档案见 [archived/todo-2026-08-27-job-management-impl.md](archived/todo-2026-08-27-job-management-impl.md)）；
+5. ~~实现 Job 直接成员记账、ancestor seal、JobSeal 和有界分页枚举，再由 `libprocess`/pm 组合递归 JobKill~~ 已完成（2026-08-27：JobSeal/Query/Enumerate/Derive 四 syscall、有序 fallible 成员表、链锁封口闸门、完成传播与 libprocess 递归 job_kill；验收线 1–4 全过，virt ×6 / sifive_u / host 全绿，实施档案见 [archived/todo-2026-08-27-job-management-impl.md](todo-2026-08-27-job-management-impl.md)）；
 6. ~~以当前 ustar 私有政策由持久 init 硬编码建立 services Job、启动并监督其中的 `srv_pm` 等服务；pm 只管理显式委托的子域，不提前设计 manifest；~~ 已完成（2026-08-28：root → services → pm_domain/acceptance 拓扑；pm 经 StartupBlock grants 持 MANAGE|READ|WAIT 委托域 JobControl，对域内 Running 靶走 枚举→派生（铸造）→kill→drain→seal 全链；init 保留复制件兜底、失败整树 job_kill(services)、全部收束后进稳态不自终止，终态交 quiescent 静默停机；设计公理入档 ideas/bootstrap.md，拓扑快照两处打印；验收 virt ×7 / sifive_u（5s 窗口）/ host 全绿）；
-7. ~~接入 ThreadSpawn 前完成多线程 teardown barrier；active hart 必须切回 kernel satp、执行本地全量 SFENCE.VMA 后才确认离场，不以 SBI 请求已发送代替完成；~~ 已完成（2026-08-28：线程成员表（tid 寻址有序 fallible Vec、离场即摘）取代单值 ThreadRecord，Gone 态删除；等待取消改锁外游标零分配；IPI 目标 = 冻结时刻 active 位图快照；归一收敛到 trap 汇编非 Resume 出口（execution-context.md 已知简化消解）；同批消解 KNOWN_ISSUES 写回 panic 面（deliver_output 复检即杀 + 分发出口终止检查）；实施计划见 [archived/todo-2026-08-28-thread-teardown-barrier.md](archived/todo-2026-08-28-thread-teardown-barrier.md)，review 计划见 [todo-2026-08-28-thread-teardown-review.md](todo-2026-08-28-thread-teardown-review.md)，验收 virt ×4 / sifive_u / host 全绿）；
+7. ~~接入 ThreadSpawn 前完成多线程 teardown barrier；active hart 必须切回 kernel satp、执行本地全量 SFENCE.VMA 后才确认离场，不以 SBI 请求已发送代替完成；~~ 已完成（2026-08-28：线程成员表（tid 寻址有序 fallible Vec、离场即摘）取代单值 ThreadRecord，Gone 态删除；等待取消改锁外游标零分配；IPI 目标 = 冻结时刻 active 位图快照；归一收敛到 trap 汇编非 Resume 出口（execution-context.md 已知简化消解）；同批消解 KNOWN_ISSUES 写回 panic 面（deliver_output 复检即杀 + 分发出口终止检查）；实施计划见 [archived/todo-2026-08-28-thread-teardown-barrier.md](todo-2026-08-28-thread-teardown-barrier.md)，review 计划见 [todo-2026-08-28-thread-teardown-review.md](../todo-2026-08-28-thread-teardown-review.md)，验收 virt ×4 / sifive_u / host 全绿）；
 8. ~~接入 capability-derived 调度域 eligibility，再开放 D64~~ 已完成（2026-08-28：签名等价类域推导、三处绑定冻结、最弱兼容域默认、F2 trait 上收、Q 谓词修正、srv_fp D64 验证负载与多域 DTB 变体验收线；设计决策与收口注记见 [todo-2026-08-28-domain-eligibility.md](todo-2026-08-28-domain-eligibility.md)）；
 9. ~~对 Building/Ready/Running/Waiting、自杀、重复 kill、并发 Exit/fault、pm 接管、Job 枚举/派生/seal/完成传播竞态（含多核 ID 乱序分配窗口）和最后 control 关闭做 host/virt 多核验证；~~ 已完成（2026-08-28：新增 `srv_hammer` 双锤负载与 `libprocess::race` 线协议（指令/回执经 Mailbox 运行时投递 handle，发令枪为 notification READABLE 电平、锤侧 take 清位转脉冲），init 剧本竞态矩阵段 10 场景——kill vs kill/Exit/fault/Start/park/abandonment、并发 Create+枚举乱序窗口、seal vs 并发 Create、双 Drain ObjectBusy 仲裁、最后 control 消散派生兑底；每轮强断言终因组合合法 + Dead 收束 + 枚举收敛无泄漏，终因胜负分布只作观察报告。验证中修复两处：内核 `dealloc_bounded` 完成路径 off-by-one（扫描最后一跳用满预算时完成插入使 work_done 超 max，drain ABI 违约被 rinlib 校验拦截；补 host 回归 `bounded_dealloc_never_exceeds_budget_on_completion` 与 syscall/space 层 debug 预算断言）；sifive_u BootPackage 装载窗口尾部 32MB→64MB（帧池仅按实际包长排除，扩窗零内存代价；debug 用户映像带 debuginfo 增长所致）。virt / virt-release / hetero / nofd / sifive_u 矩阵全部 10/10，host 全绿）；
-10. 同步 `notes/impls/{task,execution-context,ipc,startup}.md`，并与 carryover 的 notes 结构整改合并执行（2026-08-28 拍板）：ideas/device.md 重写、ecs.md 降级、idea 层补方向性结论唯一归属、施工状态表述迁移、wait/fs 术语统一（Deadline 漂移）、README RPC 索引修正。
+10. ~~完成 [`todo-2026-08-28-step10-correctness.md`](todo-2026-08-28-step10-correctness.md) 的正确性前置批次后，同步 `notes/impls/{task,execution-context,ipc,startup}.md`，并与 carryover 的 notes 结构整改合并执行：ideas/device.md 重写、ecs.md 降级、idea 层补方向性结论唯一归属、施工状态表述迁移、wait/fs 术语统一（相对 Timeout 与内部到期点严格区分）、README RPC 索引修正。~~ 已完成（2026-08-28）。
+
+## Step 10 收口注记
+
+- 正确性前置批次闭合 ProcessStart grant 顺序与零分配提交、WaitContext timeout token 注销、ProcessDrain `max_work=1` 进展、Invitation 非等待角色、rejected-park 离场竞态和 QEMU 验收假绿；
+- notes 新增 kernel/execution-context/mm 方向 owner 与 rpc 实现 owner，ECS 降为 applications 构想；task、IPC、startup、等待、FAL 和设备边界按唯一拥有篇重组；
+- `just check`、shared check、全部 host 纯逻辑测试、`virt`、`virt-release`、hetero、nofd、sifive_u 全绿；QEMU recipes 以 profile 锚点 fail-closed。
 
 ## 完成标准
 

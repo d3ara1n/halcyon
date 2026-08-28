@@ -10,7 +10,7 @@
 
 ## 映射、Connection 与关闭
 
-Connection 独占一段连续共享帧区间与两端参与方关系；区间长度是 Connection 的创建参数，当前实现恰好一页，是面向未来数据面吞吐的过渡形态而非终局——扩展多页时页内协议以自身版本字段演进，机制面不改变对象关系与关闭语义。每个端点绑定所在进程的 object-owned VM reservation；普通 VM 操作不能替换或占用该 reservation。端点 lease 关闭时立即撤销本端映射；一端关闭不突然拆除幸存端映射，幸存端以 `PEER_CLOSED` 得知页内对端数据已不可信并按协议进入 Broken。当且仅当两端参与方都已关闭，Connection 才归还帧。
+Connection 独占一段连续共享帧区间与两端参与方关系；区间长度由创建参数决定，多页扩展不改变对象关系与关闭语义，页内协议以自身版本字段演进。每个端点绑定所在进程的 object-owned VM reservation；普通 VM 操作不能替换或占用该 reservation。端点 lease 关闭时立即撤销本端映射；一端关闭不突然拆除幸存端映射，幸存端以 `PEER_CLOSED` 得知页内对端数据已不可信并按协议进入 Broken。当且仅当两端参与方都已关闭，Connection 才归还帧。
 
 关闭不可复活。attach 在 Connection 的单一线性化点竞争 invitation 与关闭：提交前的任何失败完全回滚，提交后不再有可失败步骤。进程退出 drain 与显式关闭使用同一语义。
 
@@ -22,6 +22,6 @@ Connection 独占一段连续共享帧区间与两端参与方关系；区间长
 
 ## 边界
 
-创建、attach、通知、等待和关闭都要求 Endpoint 或 invitation 的合法 role 与 rights。内核只验证对象关系、映射生命周期和状态发布；不验证 attach 者业务身份，也不解析共享页。隧道没有全局 id、按 PID 查找的端点或永久 registry。
+创建、attach、通知、等待和关闭都要求对应 role 与 rights。Endpoint 是可等待对象；Invitation 只承担一次性 MAP/TRANSIT/GRANT authority，不公开 WAIT 或 ObjectSignals。内核只验证对象关系、映射生命周期和状态发布；不验证 attach 者业务身份，也不解析共享页。隧道没有全局 id、按 PID 查找的端点或永久 registry。
 
 Invitation 是纯能力：持有即授权，内核不区分误投递与有意委托，投递责任在转移方。撤销粒度是整条隧道——创建者关闭自己端点使 invitation 终态、attach 失败，已 attach 的对端收 `PEER_CLOSED`；不存在撤回邀请但保留隧道的操作。由于每个 side 只有一个槽位，这个粒度与「换对端必须旧端退场」的参与方关系自洽。单次消费加 generation 退休使 invitation 不可重放：观察过旧值的人无法复用。

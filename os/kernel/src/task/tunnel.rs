@@ -244,7 +244,6 @@ pub struct Invitation {
     connection: Arc<Connection>,
     side: usize,
     closed: AtomicBool,
-    wait: Spinlock<ObjectWaitState>,
 }
 
 impl Invitation {
@@ -254,10 +253,6 @@ impl Invitation {
             connection,
             side,
             closed: AtomicBool::new(false),
-            wait: Spinlock::new(
-                crate::sync::ranks::OBJECT_WAIT,
-                ObjectWaitState::new(ObjectSignals::NONE),
-            ),
         })
     }
 
@@ -266,12 +261,7 @@ impl Invitation {
     }
 
     fn mark_closed(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.wait
-            .lock()
-            .update(ObjectSignals::NONE, ObjectSignals::CLOSED);
+        self.closed.store(true, Ordering::Release);
     }
 
     fn abandon(&self) {
@@ -293,9 +283,6 @@ impl Invitation {
                 }
             }
         };
-        self.wait
-            .lock()
-            .update(ObjectSignals::NONE, ObjectSignals::CLOSED);
         if let Some(endpoint) = creator.and_then(|endpoint| endpoint.upgrade()) {
             endpoint.set_signals(ObjectSignals::PEER_CLOSED);
         }
@@ -316,20 +303,8 @@ impl KernelObject for Invitation {
             .then_some(Rights::MAP | Rights::TRANSIT | Rights::GRANT)
     }
 
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::TunnelInvitation).then_some(ObjectSignals::CLOSED)
-    }
-
-    fn signals(&self) -> ObjectSignals {
-        self.wait.lock().signals()
-    }
-
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.wait.lock().subscribe(subscription)
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        self.wait.lock().unsubscribe(id);
+    fn allowed_signals(&self, _role: HandleRole) -> Option<ObjectSignals> {
+        None
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
@@ -381,7 +356,7 @@ pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCal
         handle::entry(
             Invitation::object_ref(&invitation),
             HandleRole::TunnelInvitation,
-            Rights::MAP | Rights::TRANSIT,
+            Rights::MAP | Rights::TRANSIT | Rights::GRANT,
         )
         .map_err(handle::map_error)?,
     );

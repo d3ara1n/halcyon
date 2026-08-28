@@ -41,8 +41,8 @@ use rinlib::{
     preclude::*,
 };
 
-/// 泵等待的期限（毫秒）：演示负载的诊断上限，正常往返毫秒级完成。
-const PUMP_DEADLINE_MS: u64 = 500;
+/// 泵等待的超时（毫秒）：演示负载的诊断上限，正常往返毫秒级完成。
+const PUMP_TIMEOUT_MS: u64 = 500;
 
 /// 应答承载：消息上限扣除 RpcPrefix 与 FalHeader——由协议常量推导。
 const REPLY_BODY_MAX: usize =
@@ -131,8 +131,8 @@ impl Fs {
                 WaitItem::new(self.owner, ObjectSignals::READABLE, 0),
                 WaitItem::new(self.reply.owner, ObjectSignals::READABLE, 1),
             ];
-            let result = wait_many(&items, PUMP_DEADLINE_MS).map_err(map_system)?;
-            if result.reason == WaitReason::Deadline as u32 {
+            let result = wait_many(&items, PUMP_TIMEOUT_MS).map_err(map_system)?;
+            if result.reason == WaitReason::Timeout as u32 {
                 return Err(Status::Internal);
             }
             if result.item_index == 1 {

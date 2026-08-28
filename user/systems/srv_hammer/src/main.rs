@@ -28,7 +28,7 @@ use rinlib::{
         call::SystemCallError,
         object::{Handle, ObjectSignals},
         proc::{ExecutionProfile, JobMemberKind, ProcessStartDescriptor},
-        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
+        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     },
     sys_exit, sys_sleep,
 };
@@ -48,7 +48,7 @@ fn main() {
 /// 等发令枪 READABLE（电平不丢令）并清位转脉冲，使多轮复用同一把枪。
 fn await_gun(gun: Handle) {
     let items = [WaitItem::new(gun, ObjectSignals::READABLE, 0)];
-    let _ = wait_many(&items, WAIT_DEADLINE_INFINITE);
+    let _ = wait_many(&items, WAIT_TIMEOUT_INFINITE);
     let _ = notification::take(gun, u64::MAX);
 }
 

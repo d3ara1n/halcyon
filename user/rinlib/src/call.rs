@@ -443,14 +443,14 @@ pub unsafe fn sys_mailbox_mint_sender(
 pub unsafe fn sys_wait_many(
     items: &[WaitItem],
     result: &mut WaitResult,
-    deadline_ms: u64,
+    timeout_ms: u64,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::WaitMany,
         items.as_ptr() as usize,
         items.len(),
         result as *mut WaitResult as usize,
-        deadline_ms as usize,
+        timeout_ms as usize,
     )
     .map(|_| ())
 }

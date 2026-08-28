@@ -18,9 +18,9 @@ ReplyPort sender 派生的 send-once 保持原 badge，并以 `WRITE | TRANSIT` 
 
 ## 超时、取消与重试
 
-等待 deadline 只表示调用方停止等待，不撤销已入服务队列或正在执行的请求。超时后业务结果是“是否执行未知”；通用库不得自动重试有副作用调用。
+相对 Timeout 只表示调用方停止等待，不撤销已入服务队列或正在执行的请求。超时后业务结果是“是否执行未知”；通用库不得自动重试有副作用调用。
 
-幂等、idempotency key、服务端去重和协作式 Cancel 由业务协议或 librpc 扩展定义，不下沉为内核强取消。服务 endpoint CLOSED 与 deadline 都必须纳入同步和异步调用的完成路径。
+幂等、idempotency key、服务端去重和协作式 Cancel 由业务协议或 librpc 扩展定义，不下沉为内核强取消。服务 endpoint CLOSED 与 Timeout 都必须纳入同步和异步调用的完成路径。
 
 ## 落点
 

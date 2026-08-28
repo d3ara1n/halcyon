@@ -1,12 +1,12 @@
 # 内存管理
 
-分四层：帧池（物理帧）、Sv39 纯逻辑（可 host 测试）、内核地址空间与启动协议、用户地址空间。地址空间布局见 `internals.md`。
+方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分四层：帧池、可 host 测试的 Sv39 页表、内核地址空间与启动协议、用户地址空间；本篇是内存实现事实的唯一拥有者。
 
 ## 帧池
 
 物理帧的唯一来源，自研 **in-band 有序空闲链**（os/frame_pool，纯逻辑 crate），包装进内核 `Spinlock`，经 `PoolMemory` trait 抽象内存访问——与 page_table 同一「host 可测」流水线。
 
-选型（2026-08，弃 buddy_system_allocator）：其 free list 元数据是堆上 BTreeSet，每次分配碰 talc+锁，帧池与堆形成运行时互依；且 alloc 按 2 的幂取整，与精确 count 记账不合。frame-alloc（TUM 2026-07）设计对路但 RISC-V/SMP 未测试。自研理由：算法需求收敛（任意 count 连续、精确记账、零堆依赖），in-band 结构比 buddy 更简单。
+帧池必须支持任意 count 连续分配、精确数量记账和零堆依赖；in-band 有序区间链直接满足这三个约束，并保持堆→帧池单向依赖。
 
 ### 结构
 
@@ -32,10 +32,10 @@ pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
 - `alloc_contiguous(count)`：first-fit 取首个足够区间，**从尾端切**——低地址区间先消耗，大区间主体保持完整；整取时重链，否则节点原地减 len；返回前整块清零（安全 + 上层拿来即用）。
 - `alloc_at(base, count)`：取指定区间（启动协议三件套、页表解映射回投）；区间内三向切割，左右残段各自成节点；不可用（未注册/已分配）返回 `Err`。
 - `dealloc(base, count)`：按地址序插入 + 相邻三向合并。debug 断言拒绝与现有空闲区间重叠（双重释放检测）。
-- 复杂度：分配/释放 O(空闲区间数)，教学规模无压力；分桶/命中提示等优化留待需要时在范式内逐点做。
+- 复杂度：分配/释放 O(空闲区间数)。常规 `dealloc` 的非 Drain 路径无界扫描登记在 `KNOWN_ISSUES.md`。
 
-- 区域来源：DTB `memory` 节点，剔除已占用区间——`[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）与 BootPackage envelope 声明的实际 `total_len`。DTS capacity 只用于 loader/validator 边界，不会整段退出帧池；窗口必须完整落在某个 DT memory region 内。**（已知简化）**占用剔除目前是启动期固定两洞 + bootstrap `free_range` 回投两条路径；接入新占用方时，应收敛为排序合并、重叠校验的 Boot Reservations 集合。
-- `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账（M3）。
+- 区域来源：DTB `memory` 节点，剔除 `[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）与 BootPackage envelope 的实际 `total_len`。DTS capacity 只用于 loader/validator 边界，不会整段退出帧池；窗口必须完整落在某个 DT memory region 内。启动占用当前固定为这两类区间，bootstrap 通过 `free_range` 回投可释放前缀。
+- `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账。
 - 内核堆由帧池供血：talc 内存源（FrameSource）耗尽时取 1MiB 连续帧块 claim 建新区，帧块所有权终身归堆（acquire 内不可碰堆与锁，无归还记账）；启动路径（DTB 解析/帧池注册）零堆依赖，引导序线性：帧池 → 堆首分配 → 一切堆消费者。
 
 ### 测试集（host）
@@ -46,7 +46,7 @@ pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
 
 单模式（全系统同一 satp 模式）是共享内核映射的结构性上限而非妥协：内存物理上同一份，异模式 hart 各持平行映射树，反而割裂调度域（进程不可跨模式迁移）——多模式无收益。模式是启动期从硬件自动识别，不依赖手工配置：dtb 各 cpu 节点的 `mmu-type` 给出每个 hart 的支持上限，取全体 Application hart 的**最小上限**（硬件允许集），与内核支持集取交集选最高模式；不支持交集（如仅 sv32）则拒绝启动。运行时选出的模式作为常量贯穿后续初始化（satp 组装、地址宽度断言）。
 
-内核支持集由编译期决定（当前 {sv39}），扩充到 sv48/sv57 只是打开配置，不是重写。
+内核支持集由编译期决定，当前只有 Sv39。
 
 ## 页表纯逻辑（os/page_table crate）
 
@@ -58,7 +58,7 @@ pub trait FrameMemory {
 }
 ```
 
-内核实现 = `phys_to_virt` + 转换；host 实现 = `Vec` 模拟。旧实现的 `&'static mut [E]` 别名与 `PageTableIter` 自引用问题在此结构下不存在。
+内核实现以 `phys_to_virt` 转换，host 实现以 `Vec` 模拟。
 
 ### 类型
 
@@ -66,7 +66,7 @@ pub trait FrameMemory {
 - `Pte(u64)`：编码/解码、标志位（V R W X U G A D）、`leaf()`/`branch()` 判别；组合常量（用户页、内核直映射页等）集中定义。
 - `TableTree<M: FrameMemory, const LEVELS: usize>`：root 帧（经 `M` 分配/释放）、`map / unmap / translate`；`type Sv39<M> = TableTree<M, 3>`。
 
-**Root 借用模型（已知简化）**：TableTree 名义拥有全部中间表，但用户 root 拷入内核共享子树（直映射/栈窗口槽，见「栈窗口」），靠 `AddressSpace::drop` 手工 `clear_slots` 配对剥离——所有权事实与类型声明不一致，配对纪律靠调用点自觉。扩展用户表共享分区（procfs/调试映射）或新增 teardown 路径时，应收敛为 root 槽所有权显式登记（Drop 只递归 owned 槽），消灭逐点配对并移除通用 `clear_slots` 逃生口。
+**Root 借用模型（当前简化）**：TableTree 名义拥有全部中间表，但用户 root 拷入内核共享子树（直映射/栈窗口槽），靠 `AddressSpace` 收束阶段手工清除共享 root slots 后再释放 owned 子树。所有权区分尚未进入 TableTree 类型系统，正确性依赖该唯一收束入口。
 
 ### 区域切段算法
 
@@ -76,15 +76,15 @@ pub trait FrameMemory {
 2. 段首与段长按整表（512 页）对齐 → 挂新中间表，下放继续；
 3. 其余 → 叶表内逐 PTE 建立。
 
-每步只做一次决策，段与段之间无共享状态——这是对旧三路递归（未对齐分支传参错位的温床）的结构性替代。
+每步只做一次决策，段与段之间无共享状态。
 
-- 冲突策略：目标位置已有有效映射时，**同 flags 幂等成功，异 flags 返回 `MapConflict`**——禁止静默改权限（旧 `ensure_managed_leaf_created` 的教训）。
+- 冲突策略：目标位置已有有效映射时，**同 flags 幂等成功，异 flags 返回 `MapConflict`**，禁止静默改权限。
 - 大页分裂：在已映射 2MiB 区间内需要 4KiB 粒度时，`split` 分配叶表、512 项继承原 flags 展开。level 0 禁止 non-leaf，debug_assert。
 - `unmap` 走同一套切段逻辑，对称解除；递归显式携带当前子表的实际覆盖基址，跨 512 页边界不会复用初始请求基址。mega 部分解除必须先成功分裂，表帧耗尽会返回 `FrameExhausted` 并保持原映射；空中间表当前保留到整棵 AddressSpace Drop。
 
 ### 测试集（host）
 
-切段算法数值用例：未对齐跨表大区间（mm-map-bug 原案 `vpn=65, count=8192`）、跨子表批量 unmap、整表/大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、split OOM 保持原映射、clear_slots 剥离不递归。
+切段算法数值用例：未对齐跨表大区间（`vpn=65, count=8192`）、跨子表批量 unmap、整表/大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、split OOM 保持原映射、clear_slots 剥离不递归。
 
 ## 内核地址空间与启动协议
 
@@ -97,7 +97,7 @@ pub fn phys_to_virt(pa: usize) -> usize { pa + KERNEL_VA_BASE }
 pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 ```
 
-直映射范围 `[0, max(DRAM 末, MMIO 窗口末))`，按 1GiB mega 项映射（virt 平台 MMIO 0x10000000 起，被首项覆盖）。比 Linux 的分区直映射（image/vmalloc/modules 分区）简化为两个分区：直映射单一区 + 栈窗口（见下）；不再增加分区的门槛是真实需求。
+直映射范围 `[0, max(DRAM 末, MMIO 窗口末))`，按 1GiB mega 项映射（virt 平台 MMIO 0x10000000 起，被首项覆盖）。当前内核虚拟空间只有直映射区与栈窗口两个分区。
 
 ### 栈窗口
 
@@ -107,7 +107,7 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 - **布局**：每槽 `[槽底 guard | formal (stack_size − emergency) | emergency guard | emergency]`，步长 `stack_size + 2×guard`。formal sp 从 emergency guard 洞下方起；emergency 占槽顶、fatal 路径专用，独立 guard 使其溢出不再踩入 formal。物理侧按槽连续打包 `stack_size` 字节（formal+emergency 相邻），guard 纯虚拟不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**；该禁律由 debug 断言兕底（`phys_to_virt` 拒绝栈物理打包区，release 构建无检查）。
 - **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）按 `layout.mappings` 逐页映射（RW、不可执行——`flags::KERNEL_STACK` 无 X）、guard 洞置 invalid；所有 hart 与全部用户表共享同一子树。
 - **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + `layout.translate` 互逆）；同一物理页有两个内核 VA，PA→VA 无唯一逆——`phys_to_virt` 恒给直映射别名。SBI ecall 传 PA 前必须经它（console 缓冲在栈上即依赖此）。
-- **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；进程 teardown 前 `AddressSpace::drop` 必须先剥离这些共享顶层项（`TableTree::clear_slots`），否则树回收会把内核子表当用户页表拆掉回投（双重释放 + 栈内存被复用）。
+- **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；正常 ProcessDrain 在有界 Root 阶段逐槽剥离共享顶层项后才归还 root，`AddressSpace::drop` 只作未完成构造/回滚的防御兜底。
 - **边界**：bootstrap 过渡环境的栈在过渡表的 mega 映射里，不受此防护管辖——bootstrap 期栈溢出不可观测，接受为已知边界（窗口短，audit_elf 兑底大帧）。
 
 ### 启动：PA 执行 → 高半区
@@ -131,14 +131,23 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 ## 用户地址空间
 
-- 低半区 `[0, 2^38)` 完全归用户，进程页表 root 创建时拷贝内核高半区顶层项（含栈窗口槽）；
-- 当前布局为 ELF/StartupBlock/堆/主线程栈，具体区间见 [`task.md`](task.md)；
+低半区 `[0, 2^38)` 完全归用户，进程 root 创建时拷贝内核高半区顶层项（含栈窗口槽）。当前区间：
+
+```text
+[0, brk')             ELF LOAD 段
+[brk', block_end)     只读 StartupBlock
+[block_end, stack)    Extend 向上扩展的堆
+[2^38 - 8MiB, 2^38)  主线程栈
+```
+
+brk 在 launch 时越过 StartupBlock；Extend 从 brk 逐页映射并返回新 brk。主线程 sp 为 `2^38`，16 字节对齐。ASID 恒 0，地址空间切换执行全量 `sfence.vma`。
+
+- 进程页表 root 共享内核高半区顶层项；
 - owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的 FrameTracker 持有；任何 PTE 安装前先 `try_reserve` 记账容量，批量安装逐页进行，失败按逆序 unmap 后才释放 backing；
 - bootstrap StartupBlock prefix 是 owned 页；opaque payload 页在映入 init 时即收编为该地址空间的 owned FrameTracker（启动保留洞的帧首次入账），地址空间销毁时随 owned 帧归还帧池；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap 只服务 Building process，创建 anonymous zero pages并使用最终权限，拒绝 W+X；ProcessWrite 经物理直映射写 backing，Running 发布后不再存在该写入口；
 - Tunnel 映射由 Endpoint lease 记入 `AddressSpace.external_mappings`，关闭时解除。
 
-## 异构 hart 与 rv32（纪律）
+## 架构边界
 
-- admitted hart、无 MMU hart 与 AMP 边界见 [`execution-context.md`](execution-context.md)；跨 hart 共享数据不假设全体核有 MMU。
-- rv32 无设备目标，park。纪律：地址运算一律 usize（不用 u64 写死）；64 位魔数仅限本 crate（rv64 家族专属）；shared ABI 的地址类字段用 usize——rv32 目标下内核与用户两侧同宽，天然成立；仅面向网络/外部交换的数据交换才需要定宽编码。
+admitted hart、无 MMU hart 与 AMP 边界见 [`execution-context.md`](execution-context.md)。当前内核与用户目标均为 RV64；地址运算使用 usize，外部线协议才使用固定宽编码。

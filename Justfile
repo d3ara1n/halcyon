@@ -116,7 +116,7 @@ run_qemu_dump_dtb:
     @dtc -O dts -o "{{TARGET_DIR}}/dump.dts" -I dtb "{{TARGET_DIR}}/dump.dtb"
 
 virt:
-    @just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
+    @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
 
 # 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
 # Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 服务
@@ -124,27 +124,27 @@ virt:
 virt-hetero:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
     @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
-    @ERHINO_DTB=artifacts/virt-hetero.dtb just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
+    @ERHINO_DTB=artifacts/virt-hetero.dtb QEMU_ACCEPTANCE_PROFILE=hetero just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
 
 # 无兼容域验证：全部 cpu 去掉 F/D，D64 profile 的 srv_fp 启动即拒绝
 # （NotSupported → init spawn 失败路径），Base64 负载照常收束。
 virt-nofd:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-nofd.dts all
     @dtc -O dtb -o artifacts/virt-nofd.dtb artifacts/virt-nofd.dts
-    @ERHINO_DTB=artifacts/virt-nofd.dtb just PLATFORM=qemu MODEL=virt MODE=debug run_qemu -smp cores=4
+    @ERHINO_DTB=artifacts/virt-nofd.dtb QEMU_ACCEPTANCE_PROFILE=nofd just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
 
 # release 验证线（阶段收尾必跑）：debug 代码生成不在 ecall 周边把活值留在
 # t 系寄存器，用户侧寄存器保持语义只有 release 能测出（2026-08-28 trap
 # 入口 x5 破坏事故，调查档案见 plans/archived/）。通过标准与 virt 同：
 # 全负载验收线 + 静默停机退出。
 virt-release:
-    @just PLATFORM=qemu MODEL=virt MODE=release run_qemu -smp cores=4
+    @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance -smp cores=4
 
 # sifive_u 无 shutdown 设备：负载完成后 QEMU 不自退出，运行阶段以 timeout
-# 收束（AGENTS.md：运行阶段硬上限 10s）；通过与否以日志关键行人工判定
-# （全员回收 / [Sched] system quiescent）。
+# 收束（AGENTS.md：运行阶段硬上限 10s）；只有验收锚点齐全且无失败锚点
+# 时，平台 timeout 才转换为成功。
 sifive_u:
-    @just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_timed -smp cores=5
+    @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_timed -smp cores=5
 
 # 清理泄漏的孤儿 qemu（PPID=1 残留；agent 裸跑 run_qemu 后易遗漏）。
 # 默认一键清理孤儿；传参透传脚本：-l 仅列出，-y 跳过确认，-f 连有父进程的一并杀。
@@ -152,13 +152,10 @@ clean-qemu *args:
     @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
 
 [private]
-run_qemu_timed +OPTIONS: make_dtb make_boot_package build_kernel
-    #!/usr/bin/env bash
-    set +e
-    timeout --foreground 5 {{QEMU_LAUNCH}} {{OPTIONS}}
-    code=$?
-    if [ "$code" -eq 124 ]; then
-        echo -e "\033[0;33msifive_u: run phase timed out (platform has no shutdown device); verify key log lines above\033[0m"
-        exit 0
-    fi
-    exit "$code"
+run_qemu_acceptance +OPTIONS: make_dtb make_boot_package build_kernel
+    @echo -e "\033[0;36mQEMU: Simulating acceptance (CPU throttled to {{THROTTLE}}%)\033[0m"
+    @tools/qemu-acceptance.sh -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+
+[private]
+run_qemu_acceptance_timed +OPTIONS: make_dtb make_boot_package build_kernel
+    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground 5 {{QEMU_LAUNCH}} {{OPTIONS}}

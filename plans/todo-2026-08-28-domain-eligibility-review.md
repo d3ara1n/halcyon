@@ -1,6 +1,6 @@
 # 调度域 eligibility 与 D64 开放 Review 计划
 
-> 【未来审查计划】对象是生命周期 step 8 的提交 `1d7dc92`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计决策（批次范围、签名等价类域推导、最弱兼容域默认、F2 trait 上收、Q 谓词修正）与完整推导见 [todo-2026-08-28-domain-eligibility.md](todo-2026-08-28-domain-eligibility.md)，方向公理见 `notes/ideas/task.md`「线程：执行单元」，实现现状见 `notes/impls/task.md`「调度」。
+> 【未来审查计划】对象是生命周期 step 8 的提交 `1d7dc92`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计决策（批次范围、签名等价类域推导、最弱兼容域默认、F2 trait 上收、Q 谓词修正）与完整推导见 [archived/todo-2026-08-28-domain-eligibility.md](archived/todo-2026-08-28-domain-eligibility.md)，方向公理见 `notes/ideas/execution-context.md`「调度域」，实现现状见 `notes/impls/execution-context.md`「身份、能力与域」。
 
 ## 提交对照
 
@@ -32,7 +32,7 @@
 
 - enqueue 的域路由（t.process.domain）与 pick 的域来源（me_domain）一致性：debug 断言只覆盖 dispatch 点，wake 路径（wait::wake → sched::enqueue）与 Requeue 路径的域来源审查——是否所有容器转换都结构性地落在绑定域。
 - per-domain idle 位图的双重检查闭合：登记 idle 后查本域 has_ready 的窗口（他域 enqueue 打本域门铃、本域 enqueue 在登记前）——IPI 丢失不可能（门铃只发给已登记 idle 位，登记后必有重查）。
-- is_quiescent 的全域谓词：idle 位图并集 == active mask 的论证（hart 恰属一域、域内位即全局位）；期限表遍历仍全域（等待无域性）。
+- is_quiescent 的全域谓词：idle 位图并集 == active mask 的论证（hart 恰属一域、域内位即全局位）；per-hart TimerQueue 判空仍遍历全部 hart（等待无调度域归属）。
 - IPI 目标展开（ipi_slots）消费域内位图：slot→raw hartid 转换边界未变。
 
 ### D64 负载与验证线

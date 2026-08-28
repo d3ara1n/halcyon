@@ -2,21 +2,9 @@
 
 > 任务是什么、进程与线程的分工等概念层见 [`../ideas/task.md`](../ideas/task.md)；本篇记录其在内核中的落地。线程持有 UserContext（用户现场，每线程一份）与调度状态；进程持有资源和从 ELF 得出的执行能力需求。完整上下文契约见 [`execution-context.md`](execution-context.md)。
 
-## 用户地址空间布局
+## 进程执行环境
 
-低半区 `[0, 2^38)`，无 trampoline 与隧道区——共享内核映射后用户半区完整归用户：
-
-```
-[0, brk')             ELF 段（text/rodata/data/bss，LOAD 段原样映射）
-[brk', block_end)     StartupBlock（只读，launch 映射；见 startup.md）
-[block_end, 栈区底)   堆，Extend 向上扩展，逐页映射
-[栈区底, 2^38)        栈区：主线程栈 8MiB 钉在半区顶，未来线程栈向下生长
-```
-
-- 堆扩展（Extend）从当前 brk 起逐页映射，返回新 brk；brk 基点在 launch 时越过启动块，块与堆结构性互不重叠。物理连续性不做要求，虚拟连续性由「从 brk 起步映射」结构性保证。
-- 主线程初始 sp = `2^38`（栈顶，16 字节对齐）；a0 = StartupBlock 基址、a1 = 块字节数是入口参数（rinlib 启动契约，见 [startup.md](startup.md)）。
-- 用户 tp 置 0（rinlib 未用 TLS；引入 TLS 时再定义 ABI）。
-- ASID 恒 0，地址空间切换时 `sfence.vma` 全量冲刷；ASID 分配（sv39 仅 9 位，需复用策略）作为优化留待演进——启用时同步引入 remote call 的 TLB shootdown 消费者。
+进程持有 AddressSpace 与 HandleTable；用户半区布局、brk、StartupBlock、主栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。任务侧在创建主线程时设置 sp 为用户半区顶（16 字节对齐），a0/a1 为 StartupBlock 基址与长度；用户 tp 当前置零。
 
 ## 调度：域—类—执行点三层组合
 
@@ -31,32 +19,28 @@
 ```
 
 - **执行点**：hart 的运行现场（当前线程、trap 锚），见 `internals.md`「tp 寄存器」。调度循环与 idle 循环是执行点的行为。
-- **调度域**：一组能力兼容且策略相同的 hart 共享的调度类层次，按「需求满足签名」等价类划分（`os/sched_domain` 纯逻辑 crate，host 可测）：满足同一组执行需求的 hart 构成一个域，与需求无关的能力差异不产生调度边界；新需求档位加入时划分自动细化且只分裂不迁毁既有绑定。域对象 boot 构造（bring_up_runtime，全员 Online 后、初始任务装载前）后 `Box::leak` 终身冻结；hart→域归属经 per-slot 域表（sched 的 `DomainTable.by_slot`，访问模式与 registry 的 `SLOT_CAPS` 同型），process→域绑定在 Start 提交点冻结、线程经进程间接持有。多域兼容时无状态默认落最弱兼容域（稀缺能力容量留给必须用它的线程）；无兼容域是平台事实，`ProcessStart` 返回 `NotSupported`、init bootstrap 路径 boot fatal。跨域迁移是显式政策操作（未提供）。域内 idle 位图是 IPI 门铃目标集，wake 只打本域 idle hart；静默谓词遍历全部域。D64 兼容判定要求 FLEN 恰为 64（`d ∧ ¬q`，Q 属 Fp128 独立状态模型）。
-- **调度类**：一类线程的就绪容器 + 选择策略。实现整体可替换（轮转队列 / 无锁队列 / 窃取），加优先级类 = 向域的类数组插项——扩展是横向加项，不改结构。reserve/commit/rollback 是类契约的一部分（容量必须预留在线程将要进入的目标容器，域路由不替代）。
+- **调度域**：`SchedDomain` 持有优先级序的调度类数组与域内 `idle_mask`。线程经 `process.domain()` 只进入已绑定域的类队列，wake 只向该域 idle hart 发门铃，静默谓词遍历全部域。硬件能力、域划分、D64 eligibility 与绑定冻结由 [`execution-context.md`](execution-context.md) 唯一记录。
+- **调度类**：当前公平类以单锁 FIFO 保存 Ready 线程，并通过 `SchedClass` trait 实现 enqueue/pick/has_ready/reserve/commit/rollback；Ready 容量在目标容器提交前预留。
 
-时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart 期限表最早项与量子截止的较近者设置本 hart timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
+时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart TimerQueue 堆顶与量子截止的较近者设置 timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
-ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。当前没有代码代次与 active-hart 集合，因此调度循环在每次新 dispatch 前执行本 hart `fence.i`；首次执行和迁移都不会观察帧复用前的旧指令缓存。Running process 没有 Building 写入口，Resume 热路径无需重复同步。替换为代码代次检查的触发条件：dispatch 路径的 fence.i 开销实测可见，或 active-hart 集合随多线程终止屏障落地而建立（目标态见 execution-context.md）。
+ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。lifecycle 已维护 active-hart bitmap，当前用于终止屏障；尚未建立代码代次。调度循环在每次新 dispatch 前执行本 hart `fence.i`，首次执行和迁移都不会观察帧复用前的旧指令缓存。Running process 没有 Building 写入口，Resume 热路径无需重复同步。
 
 ### 单一归属不变量
 
-任意线程任意时刻恰处于一个归属：
+任意线程任意时刻恰处于一个稳定容器：
 
 ```
-某类队列（Ready） ｜ 某 hart 的 current（Running） ｜ 无容器（Waiting/Dead）
+调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-容器成员资格是状态真值，`Thread.state` 只是镜像；全部转换经调度器入口（`enqueue` / `pick` / `wake`）在锁内完成；期限表与类队列均为无嵌套边的叶子锁（Lock Ladder LEAF 段）。
-
-## 线程状态
-
-`Ready / Running / Waiting / Dead`。Waiting：线程不在任何容器，等待其登记的内核请求完成；请求完成时 `wake()` 直接回 Ready——结果已写入 TrapFrame，无中间态。
+lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Staging 表示 Start 已线性化但尚未提交 Ready，Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
 - **强引用随容器走**：线程的 Arc 恰由其所在容器持有——就绪队列、执行点调度循环、或等待条目。等待条目强持有等待中的线程；不存在从容器反向到线程的长期指针（进程不回指线程），退出回收的 Drop 链因此能真正释放帧。lifecycle 的 Waiting 记录只持 weak WaitContext（触达取消用），在 park 发布时于 lifecycle 锁内线性化。
 - **发布时序**：「可被唤醒」严格晚于「离开一切 hart 引用」——dispatcher 只把等待意图写入 HartLocal 私有槽，调度循环在 `clear_context` 之后的 Park 分支才向全局等待结构发布。完成方永远见不到仍在本 hart 执行的线程，双容器竞态在结构上不可能。
-- **代数仲裁**：每次阻塞创建独立 `WaitContext/WaitCore`，状态为 `Installing → Armed → Finishing → Done`。对象命中、deadline 与取消候选通过同一个 outcome 竞争；唯一赢家取得线程所有权并负责跨对象清理。终止取消（kill/abandonment）同样经 offer(Abandoned) 竞争；胜者负责线程消散与离场确认。期限表强持同一 WaitContext，过期扫描只 offer Deadline，不存在每线程 `wait_gen` 平行机制。
+- **完成仲裁**：对象命中、Timeout、错误与终止取消竞争唯一 outcome；任务层只依赖“赢家取得线程所有权并负责离场”这一结果。WaitCore、timer token、rejected-park 竞态与订阅清理由 [`ipc.md`](ipc.md) 唯一记录。
 
 ## Job、Building process 与发布
 
@@ -66,35 +50,27 @@ parent ─strong→ children，child ─weak→ parent；Job 直接成员表 ─
 ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable、affine
 ProcessBuilder 与从 Building 起即存在的 ProcessControl，并在事务提交点
 把 Building process 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/
-回滚不遗留成员）。全局进程表已退役：单调 PID 分配器保留，未 Dead
-core 的生命周期根是 Job 成员表；Start 的事务 marker 同样落在成员表。
+回滚不遗留成员）。内核没有全局进程表：单调 PID 分配器只分配身份，
+未 Dead core 的生命周期根是 Job 成员表。ProcessCreate 使用成员占位，ProcessStart 另在目标调度类使用 Ready reservation。
 每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
 释放，快照仍可应答）。
 
-ProcessStart 在提交前预构造主线程并在目标域（eligibility 解析）的公平类
-队列放入 reservation marker；
-marker 不参与查找、pick 或 `has_ready`。GRANT/StartupBlock/输出全部
-准备成功后，提交区先做链锁内封口检查与 lifecycle 线性化
-（Building→Running；kill/abandonment/seal 先行则完整回滚返回
-ObjectClosed），再替换预留项。PID 单调不复用，`parent_pid` 只供诊断，
-授权仅来自 Job/Process capabilities。
+ProcessStart 负责 `Building → Running` 首次发布，并与 Job seal/termination 在 lifecycle 提交点竞争；完整 pin、grant 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
 
 ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
 （HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
 authority。固定宽 ProcessQuery、异步幂等 ProcessKill、REAPABLE 电平
-已接入；Dead 后 shell 冻结终态快照持续可查。执行需求经
-`resolve_domain` 路由进兼容域（无兼容域 `NotSupported`），D64 已开放。
+已接入；Dead 后 shell 冻结终态快照持续可查。执行需求与域绑定见
+[`execution-context.md`](execution-context.md)。
 
 ## Job 管理面（`task/job.rs`）
 
-Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
- `todo-2026-08-26-process-lifecycle.md` 第二批决策 9–15）：
+Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 
 - **成员/子表**：按 ID 有序的 fallible 结构（首版有序 Vec + try_reserve +
   二分定位，键为 Pid/JobId，条目为事务占位或强持对象）。枚举自
   partition_point 连续取，单批 O(log n + N) 固定上界；插入/删除的
-  O(width) memmove 只在创建路径，不在完成标准的固定上界清单内；宽度
-  使 memmove 可观测时换 fallible 有序树（结构私有可换）。
+  O(width) memmove 只在创建路径，不在终止/完成短路径。
 - **JobId**：全局单调不复用分配器（root 恒 1，与 Pid 分立空间）；
   Pid/JobId 分配都在 owner Job 锁内与占位插入同临界区，表内 ID 序 =
   分配序（消除多核乱序分配窗口下的枚举漏项）。
@@ -121,8 +97,8 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
   allowed_rights，超集 RightsDenied；目标不在直接成员表（含已完成
   移表）ObjectNotFound。派生 ProcessControl 复用存活 shell（单一
   shell 身份，电平不分叉）；shell 已消散时从 core 铸造新 shell 并在
-  铸造点重放已达成的电平（REAPABLE）——control 消散的 REAPABLE
-  进程由此接回 drain 入口（派生兑底）。递归 JobKill 是用户态政策，
+  铸造点重放 REAPABLE 或 CLOSED——control 消散的进程由此接回管理
+  入口（派生兑底）。递归 JobKill 是用户态政策，
   公共实现 `libprocess::job_kill`（逐层 seal → 枚举 → 派生 kill →
   drain → 等 CLOSED）。
 
@@ -144,9 +120,8 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
   唤醒后未再调度的 stale Waiting 记录 offer 必然落败，由 pick gate
   吸收后 reap 摘除）；Running 由终止待办向冻结时刻的 active 位图
   快照发 IPI（冻结后 enter_running 拒绝，位只减不增），目标在任意
-  trap 入口吸收为 Killed；自杀路径排除本 hart。末线程自然离场冻结
-  Exited 的边是 ThreadSpawn 接入点（结构上即 thread_departed 摘除
-  后加「表空且未终止」判定）。
+  trap 入口吸收为 Killed；自杀路径排除本 hart。ThreadSpawn/ThreadExit
+  调用号当前返回 FunctionNotAvailable，现有 Exit 是进程级终止。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)
@@ -154,8 +129,10 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
   （thread_departed 摘成员 → REAPABLE 持续电平）。
   任何容器路径都只到达 REAPABLE；Dead 仅由 ProcessDrain 的 Complete
   分支发布：HandleTable 先逐槽扫描摘项（take_next_bounded 硬预算），
-  对象 close 回调锁外执行（仍可用地址空间解除外部映射），随后
-  AddressSpace 分阶段：数据帧 tracker 逐个经帧池有界归还（FreeScan
+  扫描与 close callback 各计一个 work unit；预算恰在摘项后耗尽时，
+  entry 存入 Process `pending_close`，下一批优先在表锁外关闭。因此任意
+  非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 分阶段：
+  数据帧 tracker 逐个经帧池有界归还（FreeScan
   游标可恢复、O(1) 校验重启），页表 L0/L1 表帧逐槽登记归还，root 帧
   经 leak_root 交出后单独走 RootFree 阶段有界归还（绕过 TableTree
   Drop 的递归扫描）。work unit 是真实执行步数（链扫描每步、槽位检查、
@@ -163,28 +140,17 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
   快照并置 CLOSED（原子清 REAPABLE，外部无 Dead+REAPABLE 混合视图）
   → core 内部置 Dead → Job 成员表摘除（core 仅剩空壳）。并发批次以
   drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存目标进程
-  （handle 游标 + 地址空间阶段游标 + 在途归还游标），同 authority 可
-  接管。init 持久保留全部服务 control：WaitMany(REAPABLE|CLOSED) →
+  （handle 游标/pending close + 地址空间阶段游标 + 在途归还游标），同
+  authority 可接管。init 持久保留全部服务 control：WaitMany(REAPABLE|CLOSED) →
   Drain 至 Complete → 终态快照；对象 close 回调（如隧道 PEER_CLOSED）
   发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
 - **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker，capability
   可见前完成不可失败的成员提交；JobCreate 同构（child marker →
   输出预留/写入（槽仍 Reserved，槽号对外不可用）→ 层级提交回调 →
-  table.commit，失败回滚 marker）。ProcessStart 提交前全部可失败
-  步骤完成（含 HandleTable pin：builder+grants 翻转 Pinned，多线程
-  调用方下其他线程不可见不可关），lifecycle 线性化失败则无损 unpin
-  后整体回滚；线性化后只余容量已预留的不可失败消费。
-- **close callback fanout 固定上界（约束）**：当前 role 集合下，唯一
-  级联关闭者是 MailboxOwner（close_owner 清空队列 ≤ MAILBOX_CAPACITY(16)
-  × MESSAGE_HANDLE_MAX(8) = 128 条 transit 条目），而全部可 transit
-  角色（MailboxSender/Once、NotificationSignaler、TunnelInvitation、
-  ProcessControl、JobControl、ProcessBuilder）的 close_transit 均为
-  叶子（no-op / O(1) abandon / O(1) 解除外部映射 + 对端信号），无同步
-  递归 drain 另一容器的路径——单次 close 的成本是 ≤ ~130 步的固定
-  常数，不随进程状态增长。上界的结构来源是收束分层公理（ideas/
-  object.md「收束分层」）：可 TRANSIT ⟹ close 恒叶子，需要级联收束的
-  容器角色只能作 owner 直接 GRANT 或改走有界 drain；新增 role 时按
-  公理分类，无需重审枚举。
+  table.commit，失败回滚 marker）。ProcessStart 事务见 [`startup.md`](startup.md)；任务层只拥有其 lifecycle 提交点与状态转换。
+- **对象 close callback**：Handle 摘出后才在表锁外执行；各 role 的
+  callback 与固定 fanout 上界由 [`ipc.md`](ipc.md)「Handle close
+  callbacks」唯一记录。任务层只依赖“单次 callback 有固定上界”这一契约。
 - **用户态页故障一律杀进程**：本内核无按需分配，所有区域创建时显式
   映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）
   后走终止路径，绝不 panic 内核。
@@ -202,20 +168,20 @@ Job 的创建域/管理域机制面（ABI 见 shared `proc.rs`，设计决策见
 | rank | 锁 | 链段 key |
 |---|---|---|
 | DRAIN_GATE | 收束批次仲裁，一次性覆盖最广，恒最先 | — |
-| DRAIN_CURSOR | HandleTable 收束游标 | — |
+| DRAIN_CURSOR | HandleTable 收束游标与 pending close | — |
 | HANDLE_TABLE | caller→child 嵌套 | pid 递增 |
-| LEAF | CONSOLE、REGISTRY、ROOT anchor、各域就绪队列、per-hart 期限表、WaitContext 两锁 | — |
+| LEAF | CONSOLE、REGISTRY、ROOT anchor、各域就绪队列、per-hart TimerQueue、WaitContext 两锁 | — |
 | JOB_INNER | Job 链锁（≤32 把同持） | jid 递增 |
 | MAILBOX / CONNECTION | 对象状态锁 | — |
 | ADDRESS_SPACE | 用户地址空间 | — |
 | NOTIFICATION | 唯一以 space 为外层的对象锁边 | — |
-| OBJECT_WAIT | Job.wait、ProcessControl、Endpoint/Invitation、ProcessBuilder、Process.control 回指槽 | — |
+| OBJECT_WAIT | Job.wait、ProcessControl、Endpoint、ProcessBuilder、Process.control 回指槽 | — |
 | LIFECYCLE | 生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入） | — |
 | HEAP | talc（RankedRawSpinlock 类型级注入；几乎被全部容器锁内获取，故置顶） | — |
 | POOL | 物理帧池（HEAP 与空间锁的内层） | — |
 
 三类锁的共同纪律「锁内不出游」不变：lifecycle 的出游动作经 TerminationTodo
-解锁后执行；对象电平发布在锁外 finish_waiters；close 回调在表锁释放
+解锁后执行；对象电平发布经 `take_completer` 在锁外 `finish_offered`；close 回调在表锁释放
 后执行；drain 完成分支显式先释放 drain_gate 再让 process 强引用
 消亡（close 回调链不进 gate 持有区）。新增锁在构造点声明 rank 即受
 断言保护；需要同秩多持的锁用 `Spinlock::chained` 声明单调 key
@@ -227,9 +193,9 @@ Job 成员表/子表、HandleTable 槽位与调度类就绪队列（`SchedClass`
 遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
 凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
 不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；
-④全部在容器锁内完成，无分配失败路径。第四处出现该模式时评估共享
-骨架；StartupBlock 的逆序 unmap 属线性撤销，是合理差异。
+④全部在容器锁内完成，无分配失败路径。StartupBlock 的逆序 unmap 属
+线性撤销，不使用 marker。
 
 ## sleep
 
-第一个异步系统调用（模型见 [`call.md`](call.md)），用于验证整条异步通路：ms > 0 时登记期限后线程转 Waiting；期限到达由 timer 唤醒 `wake()` 回 Ready，sret 后 a0 = NoError。期限表 per-hart（`sched::HART_TIMERS[slot]`）：登记、arm、到期扫描都只碰本 hart 表，发起 hart 即期限主人（唤醒所有权，见 `internals.md`）；唯一跨 hart 访问是静默谓词的只读遍历。
+Sleep 复用 WaitContext：ms > 0 时换算为单调 `expires_at`，线程转 Waiting；per-hart `TimerQueue` 到期弹出稳定 token并竞争 Timeout outcome，Sleep action 写回成功后 enqueue。发起 hart 是 timeout owner；对象/终止提前完成会按 token 从 owner queue 注销。跨 hart 注销只删除队列项，不远程重编程 timer。

@@ -1,6 +1,6 @@
 # 内核内部机制
 
-对外行为的设计（任务模型、IPC、FAL）见各专题篇；本篇记录内核内部的结构性决策。
+内核边界与协作式执行方向见 [`../ideas/kernel.md`](../ideas/kernel.md)；本篇记录全局状态、锁、中断、唤醒和停机的当前实现。
 
 ## 全局状态分层
 
@@ -8,19 +8,17 @@
 
 | 层 | 归属 | 访问方式 | 典型内容 |
 |---|---|---|---|
-| hart 私有 | 单个 hart | tp 指针，无锁 | 执行点（当前线程、域指针、trap 锚）、hart 状态、per-hart 期限表 |
+| hart 私有 | 单个 hart | tp 指针，无锁 | 执行点（当前线程、域指针、trap 锚）、hart 状态 |
 | 对象私有 | 进程/线程 | 所属对象的锁、Arc 引用计数 | 内存布局、邮箱、子进程列表 |
 | 全局 | 全系统 | `OnceLock` + Spinlock 粗锁 | 调度域、帧分配器、PID/JobId 分配器 |
 
-冷路径的一把大锁在本系统规模（4-5 hart）下争用可忽略；无锁结构（slot array、RCU 等）只在争用真实出现后才值得引入。锁优化判据：就绪队列 per-hart 化（+偷取）与 HandleTable 读路径无锁化的评估触发条件是实测 dispatch/IPC 争用可见或核数增长到两位数；期限表已 per-hart 化（唤醒所有权的结构化）。公平类全局单锁 FIFO 是「公平性靠结构性质」的最纯实现，不为理论争用放弃。
+当前冷路径使用粗粒度锁；调度域内公平类是共享单锁 FIFO。per-hart timeout queue 已按唤醒所有权拆分，HandleTable 与对象状态仍由各对象锁保护。
 
 就绪队列不在 hart 私有层——它是调度域的共享容器（结构见 `task.md`「调度」），同域 hart 经域容器锁竞争；队列结构与策略封装在调度类内可替换。
 
 ## 内核中断模型
 
-**协作式内核：内核态执行流不可被打断。** trap 进入 S 态的瞬间硬件清 SIE，内核代码一口气运行到 sret 回用户态——没有中断嵌套、没有内核抢占、没有跑了一半的内核函数。调度只发生在用户 trap 返回路径上。
-
-这不是与「抢占式内核」并列的选项，而是微内核的推论：长工作一律在用户态服务，内核只做短路径转发——内核路径恒短，协作式恒真。**若某需求看起来必须内核抢占或内核线程才能满足，说明工作被错误地留在了内核里，该修的是架构方向，不是中断模型。**
+trap 进入 S 态时硬件清 SIE；内核执行到用户返回或调度出口期间不接受嵌套中断、没有内核抢占或可挂起内核线程。调度只发生在用户 trap 返回路径上。该结构的方向理由见 [`../ideas/kernel.md`](../ideas/kernel.md)「协作式内核」。
 
 具体纪律：
 
@@ -39,25 +37,25 @@ DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只�
 
 **每个唤醒必须有主人，无主的周期性唤醒（保险 timer、心跳）不存在。** hart 敢睡，当且仅当「自己的期限已上闹钟，或别人的请求会按门铃」：
 
-- **timer = 自己的确定期限**：只有存在特定、确定的期限（时间片、sleep）时才 `set_timer` 后入睡，不会睡过头。期限表 per-hart：登记、arm、到期扫描都只碰本 hart 表，发起 hart 即期限主人；期限登记不跟随线程迁移。
+- **timer = 自己的确定到期点**：时间片或 WaitContext Timeout 登记在发起 hart 的索引最小堆；登记、arm 与到期弹出由 owner hart 完成，跨 hart 提前完成只按稳定 token 注销，不远程重编程 timer。
 - **IPI = 他方的请求**：门铃语义（SBI `send_ipi` 无载荷，仅置目标核 SSIP）。发请求的一方必然醒着——睡着的一方发不出请求，逻辑上排除全员睡死。
 - **设备中断 = 设备的请求**：主人是设备（中断接入后生效）。
 
-唤醒后的行为统一：清中断源 → 查自己管辖的待办（调度域就绪队列、期限表、跨核请求），有事做事，无事回睡。
+唤醒后的行为统一：清中断源 → 查自己管辖的待办（调度域就绪队列、TimerQueue、跨核请求），有事做事，无事回睡。
 
 ### 电源阶梯
 
-第一档 wfi：浅睡，局部使能（`sie`）的中断 pending 即唤醒 wfi 返回，全局 SIE 不 gate wfi——idle 期间 SIE=0 不 trap，醒来查待办继续跑。QEMU 与真硬件皆正确。真硬件深睡态若停 timer，届时引入 tick broadcast / 常开时钟源；更深档为 HSM suspend。全部由应用面驱动逐档引入，唤醒所有权模型不变。
+当前只有 wfi 浅睡：局部使能（`sie`）的中断 pending 使 wfi 返回，全局 SIE 不 gate wfi；idle 期间 SIE=0 不进入 trap，醒来后检查待办。
 
 ### 停机语义
 
-**静默 = 无唤醒主人 → 停机。** idle 入口检测：就绪队列空（无工作可做）且期限表空（无期限会触发）且无设备中断使能——此时系统永远不会再醒来，语义上已死，调 SBI SRST（System Reset 扩展，`RESET_SHUTDOWN`）关机；QEMU 下模拟器随之退出（集成测试变为自终止）。
+idle 入口的静默谓词检查所有调度域无 Ready、全部 admitted hart 已登记 idle、所有 per-hart TimerQueue 为空。满足时不存在内核内生唤醒主人，调用 SBI SRST `RESET_SHUTDOWN`；不支持 shutdown 的平台保持停放。
 
-约束：每种 Waiting 必须有可枚举的主人（sleep 的主人是期限表登记；未来的 IPC 等待的主人是发送能力集），新增等待源时静默谓词同步扩展，否则误停机。设备接入后，使能的设备中断即主人，生产系统因常驻设备（console 等）永不静默——静默停机是「无事可做」的诚实终态，不是超时退出。
+Sleep/有限 WaitMany 的主人是 TimerQueue entry。纯 IPC 等待者本身不阻止静默：全部 hart idle 时没有用户执行流能够投递消息或信号。当前没有设备中断等待源，静默谓词也不包含设备项。
 
 ### IPI 门铃与 remote call
 
-IPI 通路分两层：**门铃**（`send_ipi` + SSIP 处理 + 醒后查待办）与**参数帧**（跨核请求槽结构：tag / 载荷 / 完成通知）。门铃是唤醒机制的一部分，随调度落地；参数帧等第一个真实消费者出现再定形——无消费者不建框架。remote call 是这套「门铃 + 参数帧」的正式名字：跨核内核态通信的传输层，可预见消费者为 TLB shootdown（ASID 优化启用时）、负载均衡窃取通知、内核调试通道。
+当前 IPI 只实现门铃：`send_ipi` 置目标 SSIP，目标清源后检查调度与终止待办；没有共享参数帧或 remote-call queue。Remote Call 的方向见 [`../ideas/call.md`](../ideas/call.md)。
 
 ## tp 寄存器
 
@@ -73,15 +71,7 @@ IPI 通路分两层：**门铃**（`send_ipi` + SSIP 处理 + 醒后查待办）
 
 ## 地址空间
 
-Sv39，canonical 半区边界即用户/内核分界：
-
-- 用户：低半区 `[0, 2^38)`（256GiB），完全归用户。
-- 内核：高半区 `[0xFFFFFFC0_00000000, 2^39)`，含内核镜像与物理内存直映射（phys_to_virt 线性偏移）；vmalloc 等区域 M4+ 按需扩展。
-- 每个用户页表 root 复制内核高半区顶层项（创建时拷 8-16 字节）→ 任意时刻内核代码恒可执行：用户 trap 不切 satp，satp 更换只发生在进程地址空间更换。
-- 内核稳态 SUM=0；用户 VA 只在显式 user-copy guard 内直接访问，不回退到软件遍历页表 translate。
-- secondary hart 从 HSM Bare 状态经永久 identity/高半区别名过渡页表进入正式高半区环境。
-
-设计依据：共享高半区让用户 trap 直接进入共同内核入口，不需要 trampoline 页或双地址空间切换；SUM guard 则把用户访问权限收敛到显式边界。
+当前系统选择 Sv39；用户低半区、共享内核高半区、栈窗口、uaccess 与页表所有权由 [`mm.md`](mm.md) 唯一记录。调度侧非 Resume trap 出口切回正式内核 root 后才清 active，详见 [`execution-context.md`](execution-context.md)。
 
 ## 执行上下文与 hart 能力
 
@@ -89,7 +79,7 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 内核态运行期间 tp 指向当前 HartLocal；正式 sscratch 恒指同一 HartLocal；SPP 是 trap 来源的唯一真值。U 态忽略 sstatus.SIE，内核以 `sie` 精确选择 SSIP/STIP 等来源，S 态协作式执行期间 SIE 恒为 0。
 
-无 MMU hart 不能进入当前共享高半区内核，形态仍是 AMP 独立镜像、物理内存 carveout 与 IPI 通信；它不属于本执行环境的 admitted hart 集合。
+无 MMU hart 不进入当前共享高半区内核，也不属于 admitted hart 集合；当前没有 AMP runtime。
 
 ## 锁原语
 
@@ -112,4 +102,4 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 ## 进程容器与 PID
 
-全局进程表已退役：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 由 `AtomicU64` 单调分配器分配、不复用，只作 provenance 诊断与 JobDerive 的派生选择子，不再充当任何容器键。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。
+内核没有全局进程表：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 由 `AtomicU64` 单调分配器分配、不复用；它们不构成全局操作入口。PID 是所属 Job 直接进程成员表的键，JobId 是直接 child Job 表的键；两者也作为 JobDerive 选择子和 provenance 诊断值。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。

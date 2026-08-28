@@ -1,6 +1,6 @@
 # 机制层 Review：特例补丁与可泛化机制
 
-> 对象：`notes/ideas/` 全部 17 篇 + `notes/impls/` 全部 8 篇，代码佐证来自 os/kernel、os/handle_table、shared。视角：机制本身合不合理——有没有为特例打的补丁、不同结构的类似机制能否用一个更泛化机制通吃。按 [`REVIEW.md`](REVIEW.md) 设计 Review 轴执行；未闭合承接项收拢进 [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md)。
+> 对象：`notes/ideas/` 全部 17 篇 + `notes/impls/` 全部 8 篇，代码佐证来自 os/kernel、os/handle_table、shared。视角：机制本身合不合理——有没有为特例打的补丁、不同结构的类似机制能否用一个更泛化机制通吃。按 [`REVIEW.md`](../REVIEW.md) 设计 Review 轴执行；未闭合承接项收拢进 [`todo-2026-08-26-review-carryover.md`](../todo-2026-08-26-review-carryover.md)。
 
 ## 总评
 

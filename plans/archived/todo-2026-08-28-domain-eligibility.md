@@ -1,6 +1,6 @@
 # 调度域 eligibility 接线与 D64 开放计划
 
-> 生命周期主线 `todo-2026-08-26-process-lifecycle.md` 的 step 8。设计已拍板（2026-08-28），方向公理入档 `notes/ideas/task.md`「线程：执行单元」；本篇记录决策推导、机制清单与实施验收。
+> 生命周期主线 `todo-2026-08-26-process-lifecycle.md` 的 step 8。设计已拍板（2026-08-28），方向公理入档 `notes/ideas/execution-context.md`「调度域」；本篇记录决策推导、机制清单与实施验收。
 
 ## 目标
 

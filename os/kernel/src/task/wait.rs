@@ -1,13 +1,16 @@
 //! WaitContext：多对象等待的安装、完成仲裁、订阅清理与结果交付。
 
-use alloc::{sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use erhino_shared::{
     call::SystemCallError,
     object::ObjectSignals,
-    wait::{WAIT_DEADLINE_INFINITE, WAIT_MANY_MAX, WaitCookie, WaitItem, WaitReason, WaitResult},
+    wait::{WAIT_MANY_MAX, WAIT_TIMEOUT_INFINITE, WaitCookie, WaitItem, WaitReason, WaitResult},
 };
 use num_traits::ToPrimitive;
-use wait_context::{ArmResult, OfferResult, WaitCore};
+use wait_context::{ArmResult, OfferResult, TimeoutRegistration, WaitCore};
 
 use crate::{context::UserContext, sched, sync::Spinlock, uaccess};
 
@@ -28,7 +31,7 @@ pub struct ResolvedWaitItem {
 pub struct WaitPlan {
     pub items: Vec<ResolvedWaitItem>,
     pub action: WaitAction,
-    pub deadline: Option<u64>,
+    pub expires_at: Option<u64>,
 }
 
 /// 等待完成后如何写回用户现场。
@@ -38,13 +41,13 @@ pub enum WaitStart {
 }
 
 /// WaitMany syscall 入口：复制 ABI、解析 Handle/rights，并完成初始检查。
-/// `deadline_ms` 为相对毫秒期限，`0` 表示无限等待。
+/// `timeout_ms` 为相对毫秒超时，`0` 表示无限等待。
 pub fn prepare(
     thread: &Thread,
     items_ptr: usize,
     count: usize,
     result_ptr: usize,
-    deadline_ms: u64,
+    timeout_ms: u64,
 ) -> Result<WaitStart, SystemCallError> {
     if count == 0 || count > WAIT_MANY_MAX {
         return Err(SystemCallError::IllegalArgument);
@@ -53,7 +56,8 @@ pub fn prepare(
         .checked_mul(core::mem::size_of::<WaitItem>())
         .ok_or(SystemCallError::IllegalArgument)?;
     let mut raw = Vec::new();
-    raw.try_reserve_exact(raw_len).map_err(|_| SystemCallError::OutOfMemory)?;
+    raw.try_reserve_exact(raw_len)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     raw.resize(raw_len, 0);
     {
         let mut space = thread.process.space.lock();
@@ -62,18 +66,23 @@ pub fn prepare(
     }
 
     let mut abi_items = Vec::new();
-    abi_items.try_reserve_exact(count).map_err(|_| SystemCallError::OutOfMemory)?;
+    abi_items
+        .try_reserve_exact(count)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     for bytes in raw.chunks_exact(core::mem::size_of::<WaitItem>()) {
         // SAFETY: WaitItem 仅含整数 newtype；用户缓冲无需对齐。
         abi_items.push(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WaitItem>()) });
     }
 
     let mut items = Vec::new();
-    items.try_reserve_exact(count).map_err(|_| SystemCallError::OutOfMemory)?;
+    items
+        .try_reserve_exact(count)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     {
         let table = thread.process.handles.lock();
         for (index, item) in abi_items.iter().copied().enumerate() {
-            if item.reserved != 0 || item.signals == ObjectSignals::NONE || !item.signals.is_known() {
+            if item.reserved != 0 || item.signals == ObjectSignals::NONE || !item.signals.is_known()
+            {
                 return Err(SystemCallError::IllegalArgument);
             }
             let entry = table
@@ -100,12 +109,20 @@ pub fn prepare(
         if current.intersects(item.signals) || current.intersects(ObjectSignals::CLOSED) {
             let closed = current.intersects(ObjectSignals::CLOSED);
             let observed = (current & item.signals)
-                | if closed { ObjectSignals::CLOSED } else { ObjectSignals::NONE };
+                | if closed {
+                    ObjectSignals::CLOSED
+                } else {
+                    ObjectSignals::NONE
+                };
             let result = WaitResult::new(
                 item.cookie,
                 observed,
                 item.index,
-                if closed { WaitReason::Closed } else { WaitReason::Signaled },
+                if closed {
+                    WaitReason::Closed
+                } else {
+                    WaitReason::Signaled
+                },
             );
             let mut space = thread.process.space.lock();
             // SAFETY: WaitResult 字段和 reserved 全部初始化，结构无 padding。
@@ -114,24 +131,24 @@ pub fn prepare(
         }
     }
 
-    let deadline = if deadline_ms == WAIT_DEADLINE_INFINITE {
+    let expires_at = if timeout_ms == WAIT_TIMEOUT_INFINITE {
         None
     } else {
-        Some(sched::deadline_after_ms(deadline_ms))
+        Some(sched::expires_after_ms(timeout_ms))
     };
 
     Ok(WaitStart::Park(WaitPlan {
         items,
         action: WaitAction::WaitMany { result_ptr },
-        deadline,
+        expires_at,
     }))
 }
 
-pub fn sleep_plan(deadline: u64) -> WaitPlan {
+pub fn sleep_plan(expires_at: u64) -> WaitPlan {
     WaitPlan {
         items: Vec::new(),
         action: WaitAction::Sleep,
-        deadline: Some(deadline),
+        expires_at: Some(expires_at),
     }
 }
 
@@ -146,7 +163,7 @@ pub enum WaitAction {
 pub enum WaitOutcome {
     Object(WaitResult),
     Error(SystemCallError),
-    Deadline,
+    Timeout,
     #[expect(dead_code, reason = "显式取消 ABI 接入后使用")]
     Cancelled,
     /// 终止取消：线程不回用户态，随上下文消散（kill/abandonment 路径）。
@@ -165,12 +182,20 @@ impl Subscription {
     pub fn outcome(&self, current: ObjectSignals) -> WaitOutcome {
         let closed = current.intersects(ObjectSignals::CLOSED);
         let observed = (current & self.interest)
-            | if closed { ObjectSignals::CLOSED } else { ObjectSignals::NONE };
+            | if closed {
+                ObjectSignals::CLOSED
+            } else {
+                ObjectSignals::NONE
+            };
         WaitOutcome::Object(WaitResult::new(
             self.cookie,
             observed,
             self.item_index,
-            if closed { WaitReason::Closed } else { WaitReason::Signaled },
+            if closed {
+                WaitReason::Closed
+            } else {
+                WaitReason::Signaled
+            },
         ))
     }
 }
@@ -185,6 +210,8 @@ pub struct WaitContext {
     core: WaitCore<WaitOutcome>,
     thread: Spinlock<Option<Arc<Thread>>>,
     registrations: Spinlock<Vec<Registration>>,
+    /// 原子注册状态：未登记、稳定 token 或 Closed。
+    timeout_registration: TimeoutRegistration,
     action: WaitAction,
 }
 
@@ -202,24 +229,54 @@ impl WaitContext {
             core: WaitCore::new(),
             thread: Spinlock::new(crate::sync::ranks::LEAF, Some(thread)),
             registrations: Spinlock::new(crate::sync::ranks::LEAF, registrations),
+            timeout_registration: TimeoutRegistration::new(),
             action,
         }))
     }
 
     pub(crate) fn offer(&self, outcome: WaitOutcome) -> OfferResult {
-        self.core.offer(outcome)
+        let result = self.core.offer(outcome);
+        if result != OfferResult::Lost {
+            // 只退休原子状态；对象锁内的完成方不得在此获取 owner queue 锁。
+            self.timeout_registration.close();
+        }
+        result
     }
 
-    pub(crate) fn expire(self: Arc<Self>) {
-        if self.offer(WaitOutcome::Deadline) == OfferResult::Complete {
+    /// 在本 hart timer queue 弹出到期项后调用。只有仍发布该 token 的
+    /// context 能退休它并竞争 Timeout outcome。
+    pub(crate) fn expire(self: Arc<Self>, token: timer_queue::TimerToken) {
+        if self.timeout_registration.retire(token)
+            && self.offer(WaitOutcome::Timeout) == OfferResult::Complete
+        {
             finish_offered(self);
+        }
+    }
+
+    /// queue token 先产生，随后以 CAS 发布；若完成者已关闭 context，立即
+    /// 注销刚登记的项，不能留下强持 context 的期限项。
+    fn publish_timeout_registration(&self, token: timer_queue::TimerToken) {
+        if !self.timeout_registration.publish(token) {
+            sched::unregister_wait_timeout(token);
+        }
+    }
+
+    /// 任何完成路径在触碰对象订阅前关闭 token；跨 hart 仅删除 owner
+    /// queue 项，不远程重编程时钟。
+    fn close_timeout_registration(&self) {
+        self.timeout_registration.close();
+        if let Some(token) = self.timeout_registration.take_cancellation() {
+            sched::unregister_wait_timeout(token);
         }
     }
 
     fn remember(&self, object: &ObjectRef, id: u64) {
         let mut registrations = self.registrations.lock();
         debug_assert!(registrations.len() < registrations.capacity());
-        registrations.push(Registration { object: Arc::downgrade(object), id });
+        registrations.push(Registration {
+            object: Arc::downgrade(object),
+            id,
+        });
     }
 
     fn cleanup(&self) {
@@ -235,6 +292,7 @@ impl WaitContext {
     }
 
     fn finish(self: &Arc<Self>, outcome: WaitOutcome) {
+        self.close_timeout_registration();
         // 先切断 WaitContext → Thread，再触碰任一对象锁。
         let thread = self.thread.lock().take();
         self.cleanup();
@@ -261,12 +319,12 @@ impl WaitContext {
             (WaitAction::WaitMany { result_ptr }, WaitOutcome::Object(result)) => {
                 deliver_wait_result(thread, frame, result_ptr, result);
             }
-            (WaitAction::WaitMany { result_ptr }, WaitOutcome::Deadline) => {
+            (WaitAction::WaitMany { result_ptr }, WaitOutcome::Timeout) => {
                 deliver_wait_result(
                     thread,
                     frame,
                     result_ptr,
-                    WaitResult::new(0, ObjectSignals::NONE, u32::MAX, WaitReason::Deadline),
+                    WaitResult::new(0, ObjectSignals::NONE, u32::MAX, WaitReason::Timeout),
                 );
             }
             (WaitAction::WaitMany { .. }, WaitOutcome::Error(error)) => {
@@ -276,10 +334,12 @@ impl WaitContext {
             // 已知简化：占位语义——显式取消 ABI 接入前本分支不可达；
             // 接入时需给正式完成语义（notes/impls/ipc.md「等待与期限」）。
             (WaitAction::WaitMany { .. }, WaitOutcome::Cancelled) => {
-                frame.x[10] = SystemCallError::FunctionNotAvailable.to_usize().unwrap_or(1) as u64;
+                frame.x[10] = SystemCallError::FunctionNotAvailable
+                    .to_usize()
+                    .unwrap_or(1) as u64;
                 frame.sepc += 4;
             }
-            (WaitAction::Sleep, WaitOutcome::Deadline) => {
+            (WaitAction::Sleep, WaitOutcome::Timeout) => {
                 frame.x[10] = 0;
                 frame.x[11] = 0;
                 frame.sepc += 4;
@@ -311,16 +371,26 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
     {
         let (process, tid) = context_thread_identity(&context);
         if !process.lifecycle.park_waiting(tid, &context) {
-            if context.offer(WaitOutcome::Abandoned) == wait_context::OfferResult::Complete {
-                finish_offered(context);
-            }
+            // clear_active 与等待发布之间若被终止，context 仍处于
+            // Installing；Abandoned 只能 Deferred，由安装者取得完成权并
+            // 执行离场确认，否则 lifecycle 会永久保留该线程成员。
+            let offered = context.offer(WaitOutcome::Abandoned);
+            debug_assert_eq!(offered, wait_context::OfferResult::Deferred);
+            let outcome = context
+                .core
+                .finish_installing()
+                .expect("installing owner must finish rejected park");
+            context.finish(outcome);
             return;
         }
     }
 
-    if let Some(deadline) = plan.deadline {
-        if sched::register_wait_deadline(deadline, context.clone()).is_err() {
-            context.offer(WaitOutcome::Error(SystemCallError::OutOfMemory));
+    if let Some(expires_at) = plan.expires_at {
+        match sched::register_wait_timeout(expires_at, context.clone()) {
+            Ok(token) => context.publish_timeout_registration(token),
+            Err(()) => {
+                context.offer(WaitOutcome::Error(SystemCallError::OutOfMemory));
+            }
         }
     }
 
@@ -374,11 +444,12 @@ pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
 /// 安装中的上下文必持有发起线程；取其进程引用与 tid 做 lifecycle 线性化。
 fn context_thread_identity(
     context: &Arc<WaitContext>,
-) -> (alloc::sync::Arc<super::proc::Process>, erhino_shared::proc::Tid) {
+) -> (
+    alloc::sync::Arc<super::proc::Process>,
+    erhino_shared::proc::Tid,
+) {
     let guard = context.thread.lock();
-    let thread = guard
-        .as_ref()
-        .expect("installing context holds its thread");
+    let thread = guard.as_ref().expect("installing context holds its thread");
     (thread.process.clone(), thread.tid)
 }
 

@@ -94,10 +94,9 @@ _ENTRY_PA_CONSTS:
 # HSM secondary PA 前导（永久设施）：a0 = hartid，a1 = opaque = record PA。
 # Acquire 消费 record → 切过渡 satp（只读）→ 跳高半区。
 #
-# 并发纪律：多个 secondary 会同时在此执行，但过渡表只读——由 cold boot
-# 独占建成，此后任何 hart 不得再写（曾经并发先清后建，后来者清零拆掉
-# 先行者脚下翻译，致取指页错→_pa_fatal 静默停放）。可见性由 record 的
-# Release/Acquire 保证。
+# 并发纪律：多个 secondary 会同时在此执行，但过渡表由 cold boot 独占
+# 建成并在此后保持只读；任何 secondary 都不得清零或改写。可见性由
+# record 的 Release/Acquire 保证。
 _awaken:
     la      t0, _pa_fatal
     csrw    stvec, t0
@@ -207,8 +206,7 @@ _trap_entry:
     # 来源唯一真值：硬件 SPP。SPP=1 一律 fatal——返回用户尾部的同步异常
     # SPP 仍为 1，绝无把内核现场解释成 UserContext 的窗口。检查经已
     # 保存的 t5 中转：进入序列在 UserContext 保存前不得触碰任何未保存
-    # 的用户寄存器（曾用 t0 做 SPP 检查，导致每次用户 trap 把用户 x5
-    # 覆写为 SPP 位——release 用户代码把活值存在 t0 跨 ecall 时即触发）。
+    # 的用户寄存器。
     csrr    t5, sstatus
     srli    t5, t5, 8
     andi    t5, t5, 1

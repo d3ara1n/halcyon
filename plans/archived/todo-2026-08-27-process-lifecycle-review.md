@@ -3,7 +3,7 @@
 # 进程生命周期 step 2–4 统一代码 Review（挂账）
 
 > 验收已通过（设计拍板入档 + 实现完成 + 测试全绿并已提交）；按
-> [REVIEW.md](REVIEW.md) 纪律，本批次的代码 Review 回头补做。本文档是
+> [REVIEW.md](../REVIEW.md) 纪律，本批次的代码 Review 回头补做。本文档是
 > 唯一跟踪点；Review 完成后归档至 `archived/`。
 
 ## 基线
@@ -15,9 +15,9 @@
   - `840ccc2` refactor(task)：退役全局进程表（table.rs 删除），新增 srv_target kill 靶子；
   - `16b1382` docs(task)：ideas 方向入档、impls 收束现状、ref 取证归档。
 - 契约来源：
-  - [`notes/ideas/task.md`](../notes/ideas/task.md)、[`notes/ideas/bootstrap.md`](../notes/ideas/bootstrap.md)、[`notes/ideas/signal.md`](../notes/ideas/signal.md)；
+  - [`notes/ideas/task.md`](../../notes/ideas/task.md)、[`notes/ideas/bootstrap.md`](../../notes/ideas/bootstrap.md)、[`notes/ideas/signal.md`](../../notes/ideas/signal.md)；
   - [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md)「已确认的 Process ABI」节。
-- 实现现状记录：[`notes/impls/task.md`](../notes/impls/task.md)（生命周期、锁序契约、fanout 证明、有界收束）。
+- 实现现状记录：[`notes/impls/task.md`](../../notes/impls/task.md)（生命周期、锁序契约、fanout 证明、有界收束）。
 
 ## 已发生的审查轨迹（供复核者参考，不替代本次 Review）
 

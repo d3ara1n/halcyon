@@ -3,7 +3,7 @@
 - 状态：**已拍板并归档（2026-08-27）**——决策已并入 `todo-2026-08-26-process-lifecycle.md` 第二批结构决策与「已确认的 Job ABI」；本文保留完整推导、被否选项与竞态闭合论证，供实施与 step 9 验证对照。
 - 输入：
   - 计划基线：step 5 目标与已拍板决策 1–8（process-lifecycle 计划）；
-  - 取证：[`ref-2026-08-27-job-enumerate-derive-research.md`](ref-2026-08-27-job-enumerate-derive-research.md)（枚举/派生/ID 稳定性）+ [`ref-2026-08-task-termination-research.md`](ref-2026-08-task-termination-research.md)（kill/seal/完成传播）；
+  - 取证：[`ref-2026-08-27-job-enumerate-derive-research.md`](../ref-2026-08-27-job-enumerate-derive-research.md)（枚举/派生/ID 稳定性）+ [`ref-2026-08-task-termination-research.md`](../ref-2026-08-task-termination-research.md)（kill/seal/完成传播）；
   - 代码现状：`os/kernel/src/task/job.rs`——`sealed` 字段与 `ChildEntry::Job` 读取路径已预留；成员/子表为事务 marker + 强持条目（Reserved 对枚举不可见）；PID 分配器单调不复用；JobControl rights = CREATE|MANAGE|READ|WAIT|DUPLICATE|TRANSIT|GRANT；错误码 `BufferTooSmall` 已存在。
 
 ## 一、决策点

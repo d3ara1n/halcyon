@@ -4,7 +4,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::{sync::Arc, vec::Vec};
-use erhino_shared::{call::SystemCallError, proc::{Pid, ProcessMapFlags, ProcessState, Tid}};
+use erhino_shared::{
+    call::SystemCallError,
+    proc::{Pid, ProcessMapFlags, ProcessState, Tid},
+};
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
 use crate::{
@@ -64,7 +67,10 @@ impl FrameMemory for TableMem {
 
     fn free_frame(&mut self, frame: FrameNumber) {
         // SAFETY: frame 由 alloc_frame 的 forget 产生，构造 tracker 恰好归还一帧。
-        drop(FrameTracker { base: frame, count: 1 });
+        drop(FrameTracker {
+            base: frame,
+            count: 1,
+        });
     }
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [page_table::Pte; page_table::ENTRIES] {
@@ -99,8 +105,8 @@ struct PendingFree {
 
 /// 进程地址空间：页表树 + 数据帧所有权 + 布局记账。
 ///
-/// 访问纪律：所属对象私有层——持 `Process.space` 锁访问；当前 hart 之外
-/// 的 hart 仅经进程表取得引用后加锁访问（M3 无此路径，M4 IPC/procfs 需要）。
+/// 访问纪律：所属对象私有层——持 `Process.space` 锁访问；跨 hart 调用者
+/// 先经 capability 所达 Process core 取得引用，再加本锁。
 pub struct AddressSpace {
     /// REAPABLE 屏障后由 drain 最终阶段 take 释放 root；之后任何访问
     /// 都是编程错误（Building 操作准入与 active 位图已消除可达性）。
@@ -172,13 +178,16 @@ impl AddressSpace {
 
     /// 申请 `count` 页（整段物理连续，利于大页），登记映射与帧所有权。
     fn alloc_map(&mut self, vaddr: usize, count: usize, flags: u64) -> Result<(), SpaceError> {
-        self.frames.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
+        self.frames
+            .try_reserve(1)
+            .map_err(|_| SpaceError::NoFrame)?;
         let tracker = frame::alloc_contiguous(count).ok_or(SpaceError::NoFrame)?;
         let base_vpn = vaddr / PAGE_SIZE;
         let base_ppn = tracker.base.addr() / PAGE_SIZE;
         for index in 0..count {
-            if let Err(error) = self.tt()
-                .map(Vpn(base_vpn + index), 1, Ppn(base_ppn + index), flags)
+            if let Err(error) =
+                self.tt()
+                    .map(Vpn(base_vpn + index), 1, Ppn(base_ppn + index), flags)
             {
                 for rollback in (0..index).rev() {
                     self.tt()
@@ -205,7 +214,8 @@ impl AddressSpace {
             || len % PAGE_SIZE != 0
             || !permissions.is_known()
             || permissions.raw() == 0
-            || permissions.contains(ProcessMapFlags::WRITE) && !permissions.contains(ProcessMapFlags::READ)
+            || permissions.contains(ProcessMapFlags::WRITE)
+                && !permissions.contains(ProcessMapFlags::READ)
             || permissions.contains(ProcessMapFlags::WRITE | ProcessMapFlags::EXECUTE)
         {
             return Err(SpaceError::BadSegment);
@@ -248,7 +258,9 @@ impl AddressSpace {
     /// Building-only 回填；先验证完整目标区间已映射，再经物理直映射写入，
     /// 不要求目标最终 PTE 可写。
     pub fn write_building(&mut self, target: usize, source: &[u8]) -> Result<(), SpaceError> {
-        let end = target.checked_add(source.len()).ok_or(SpaceError::BadSegment)?;
+        let end = target
+            .checked_add(source.len())
+            .ok_or(SpaceError::BadSegment)?;
         if end > USER_TOP {
             return Err(SpaceError::BadSegment);
         }
@@ -268,7 +280,10 @@ impl AddressSpace {
             let va = target + copied;
             let in_page = va % PAGE_SIZE;
             let count = (PAGE_SIZE - in_page).min(source.len() - copied);
-            let mapping = self.tt().translate(Vpn(va / PAGE_SIZE)).expect("prevalidated mapping");
+            let mapping = self
+                .tt()
+                .translate(Vpn(va / PAGE_SIZE))
+                .expect("prevalidated mapping");
             let pa = mapping.ppn.0 * PAGE_SIZE + in_page;
             // SAFETY: Building process 尚不可运行；目标映射完整验证且其 backing
             // 由本地址空间拥有。
@@ -284,14 +299,20 @@ impl AddressSpace {
         Ok(())
     }
 
-    pub fn validate_initial_context(&mut self, entry: usize, stack_pointer: usize) -> Result<(), SpaceError> {
+    pub fn validate_initial_context(
+        &mut self,
+        entry: usize,
+        stack_pointer: usize,
+    ) -> Result<(), SpaceError> {
         if stack_pointer == 0 || stack_pointer % 16 != 0 || self.brk == 0 {
             return Err(SpaceError::BadSegment);
         }
-        let entry_mapping = self.tt()
+        let entry_mapping = self
+            .tt()
             .translate(Vpn(entry / PAGE_SIZE))
             .ok_or(SpaceError::BadSegment)?;
-        let stack_mapping = self.tt()
+        let stack_mapping = self
+            .tt()
             .translate(Vpn((stack_pointer - 1) / PAGE_SIZE))
             .ok_or(SpaceError::BadSegment)?;
         if entry_mapping.flags & (flags::U | flags::X) != (flags::U | flags::X)
@@ -304,7 +325,11 @@ impl AddressSpace {
 
     /// 装载 ELF：先按页规划权限并集（相邻段共享页取并集，每页恰映射
     /// 一次，杜绝静默改写），再逐页回填段内容（BSS 尾随帧池清零）。
-    pub fn load_elf(&mut self, segments: &[elf::LoadSegment], file: &[u8]) -> Result<(), SpaceError> {
+    pub fn load_elf(
+        &mut self,
+        segments: &[elf::LoadSegment],
+        file: &[u8],
+    ) -> Result<(), SpaceError> {
         use alloc::collections::BTreeMap;
 
         // 阶段一：页粒度权限规划。
@@ -343,21 +368,23 @@ impl AddressSpace {
         if plan.values().any(|fl| {
             fl & flags::W != 0 && fl & flags::R == 0
                 || fl & (flags::W | flags::X) == (flags::W | flags::X)
-        })
-        {
+        }) {
             return Err(SpaceError::BadSegment);
         }
 
         // 阶段二：逐页映射（记录 vpn → 物理帧，回填阶段查用）。
         // 两个 Vec 都在安装 PTE 前一次性预留，之后的记账不得因扩容 panic。
         let mut pages: Vec<(usize, usize)> = Vec::new();
-        pages.try_reserve(plan.len()).map_err(|_| SpaceError::NoFrame)?;
+        pages
+            .try_reserve(plan.len())
+            .map_err(|_| SpaceError::NoFrame)?;
         self.frames
             .try_reserve(plan.len())
             .map_err(|_| SpaceError::NoFrame)?;
         for (&vpn, &fl) in &plan {
             let tracker = frame::alloc_contiguous(1).ok_or(SpaceError::NoFrame)?;
-            self.tt().map(Vpn(vpn), 1, Ppn(tracker.base.addr() / PAGE_SIZE), fl)?;
+            self.tt()
+                .map(Vpn(vpn), 1, Ppn(tracker.base.addr() / PAGE_SIZE), fl)?;
             pages.push((vpn, tracker.base.addr()));
             self.frames.push(tracker);
         }
@@ -366,7 +393,12 @@ impl AddressSpace {
         for seg in segments {
             let start = seg.offset as usize;
             let src = file
-                .get(start..start.checked_add(seg.filesz as usize).ok_or(SpaceError::BadSegment)?)
+                .get(
+                    start
+                        ..start
+                            .checked_add(seg.filesz as usize)
+                            .ok_or(SpaceError::BadSegment)?,
+                )
                 .ok_or(SpaceError::BadSegment)?;
             let mut va = seg.vaddr as usize;
             let mut off = 0usize;
@@ -399,7 +431,11 @@ impl AddressSpace {
 
     /// 映射主线程栈：[USER_TOP - STACK_SIZE, USER_TOP)。
     pub fn map_stack(&mut self) -> Result<(), SpaceError> {
-        self.alloc_map(USER_TOP - STACK_SIZE, STACK_SIZE / PAGE_SIZE, flags::USER_DATA)
+        self.alloc_map(
+            USER_TOP - STACK_SIZE,
+            STACK_SIZE / PAGE_SIZE,
+            flags::USER_DATA,
+        )
     }
 
     /// 只读映射启动块：块基取当前 brk（ELF 尾页对齐处），字节经直映射
@@ -420,7 +456,9 @@ impl AddressSpace {
         if end > USER_TOP - STACK_SIZE {
             return Err(SpaceError::BadSegment);
         }
-        self.frames.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
+        self.frames
+            .try_reserve(1)
+            .map_err(|_| SpaceError::NoFrame)?;
         let tracker = frame::alloc_contiguous(pages).ok_or(SpaceError::NoFrame)?;
         let base_vpn = base / PAGE_SIZE;
         let base_ppn = tracker.base.addr() / PAGE_SIZE;
@@ -458,14 +496,21 @@ impl AddressSpace {
     pub fn rollback_startup_block(&mut self, base: usize, byte_len: usize) {
         let pages = byte_len.div_ceil(PAGE_SIZE);
         let span = pages * PAGE_SIZE;
-        assert_eq!(self.brk, base + span, "startup rollback is not the latest mapping");
+        assert_eq!(
+            self.brk,
+            base + span,
+            "startup rollback is not the latest mapping"
+        );
         for index in 0..pages {
-                    self.tt()
-                        .unmap(Vpn(base / PAGE_SIZE + index), 1)
+            self.tt()
+                .unmap(Vpn(base / PAGE_SIZE + index), 1)
                 .expect("single-page StartupBlock rollback cannot fail");
         }
         let tracker = self.frames.pop().expect("startup mapping tracker missing");
-        assert_eq!(tracker.count, pages, "startup mapping tracker size mismatch");
+        assert_eq!(
+            tracker.count, pages,
+            "startup mapping tracker size mismatch"
+        );
         self.brk = base;
     }
 
@@ -536,13 +581,13 @@ impl AddressSpace {
                     flags::USER_RODATA,
                 ) {
                     for rollback in (0..index).rev() {
-                    self.tt()
-                        .unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
+                        self.tt()
+                            .unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
                             .expect("single-page bootstrap payload rollback cannot fail");
                     }
                     for rollback in 0..prefix_pages {
-                    self.tt()
-                        .unmap(Vpn(base_vpn + rollback), 1)
+                        self.tt()
+                            .unmap(Vpn(base_vpn + rollback), 1)
                             .expect("single-page bootstrap prefix rollback cannot fail");
                     }
                     return Err(error.into());
@@ -602,7 +647,12 @@ impl AddressSpace {
     /// 校验用户区间 [ptr, ptr+len) 逐页可访问：不溢出、不出用户半区、
     /// 每页已映射且含 U 标志与所需方向权限（读 R / 写 W）。
     /// 供 [`crate::uaccess`] 前置校验；限长由调用方先行把关。
-    pub(crate) fn check_range(&mut self, ptr: usize, len: usize, writable: bool) -> Result<(), crate::uaccess::AccessError> {
+    pub(crate) fn check_range(
+        &mut self,
+        ptr: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<(), crate::uaccess::AccessError> {
         use crate::uaccess::AccessError;
         let Some(end) = ptr.checked_add(len) else {
             return Err(AccessError::BadRange);
@@ -651,8 +701,12 @@ impl AddressSpace {
         self.external_mappings
             .try_reserve(1)
             .map_err(|_| SpaceError::NoFrame)?;
-        self.tt()
-            .map(Vpn(va / PAGE_SIZE), 1, Ppn(pa / PAGE_SIZE), flags::USER_DATA)?;
+        self.tt().map(
+            Vpn(va / PAGE_SIZE),
+            1,
+            Ppn(pa / PAGE_SIZE),
+            flags::USER_DATA,
+        )?;
         self.external_mappings.push(va);
         // SAFETY: sfence 当前 ASID 冲刷 stale TLB 使新 PTE 生效。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
@@ -661,12 +715,16 @@ impl AddressSpace {
 
     /// 只有持有对象 lease 的关闭路径才能解除外部 reservation。
     pub fn unmap_external(&mut self, va: usize) {
-        let Some(index) = self.external_mappings.iter().position(|mapped| *mapped == va) else {
+        let Some(index) = self
+            .external_mappings
+            .iter()
+            .position(|mapped| *mapped == va)
+        else {
             return;
         };
         self.external_mappings.swap_remove(index);
-                    self.tt()
-                        .unmap(Vpn(va / PAGE_SIZE), 1)
+        self.tt()
+            .unmap(Vpn(va / PAGE_SIZE), 1)
             .expect("single-page external unmap cannot fail");
         // SAFETY: 同 map_external。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
@@ -687,7 +745,10 @@ impl AddressSpace {
 
     /// 登记一笔新的有界归还（当前无在途归还时调用）。
     fn enqueue_free(&mut self, base: page_table::FrameNumber, count: usize) {
-        debug_assert!(self.pending_free.is_none(), "pending free must be consumed before enqueuing");
+        debug_assert!(
+            self.pending_free.is_none(),
+            "pending free must be consumed before enqueuing"
+        );
         self.pending_free = Some(PendingFree {
             base,
             count,
@@ -715,7 +776,10 @@ impl AddressSpace {
         debug_assert!(budget > 0);
         if self.drain_stage == DrainStage::Idle {
             // Handle 阶段已先行：外部映射必须已由对象 close 回调清空。
-            debug_assert!(self.external_mappings.is_empty(), "external mapping outlives its object");
+            debug_assert!(
+                self.external_mappings.is_empty(),
+                "external mapping outlives its object"
+            );
             self.drain_stage = DrainStage::Frames;
         }
         let mut work = 0;
@@ -760,7 +824,10 @@ impl AddressSpace {
                     let mut l1_slot = l1;
                     while root_slot < kernel_start {
                         if work >= budget {
-                            self.drain_stage = DrainStage::Tables { root: root_slot, l1: l1_slot };
+                            self.drain_stage = DrainStage::Tables {
+                                root: root_slot,
+                                l1: l1_slot,
+                            };
                             return (work, false);
                         }
                         // 读一个 root 槽（独立作用域，不跨 pending 步进持借用）。
@@ -773,7 +840,10 @@ impl AddressSpace {
                             if !entry.is_valid() {
                                 None
                             } else {
-                                debug_assert!(entry.is_branch(), "user top-level entries are always branches");
+                                debug_assert!(
+                                    entry.is_branch(),
+                                    "user top-level entries are always branches"
+                                );
                                 Some(entry.next_frame())
                             }
                         };
@@ -785,7 +855,10 @@ impl AddressSpace {
                         };
                         while l1_slot < page_table::ENTRIES {
                             if work >= budget {
-                                self.drain_stage = DrainStage::Tables { root: root_slot, l1: l1_slot };
+                                self.drain_stage = DrainStage::Tables {
+                                    root: root_slot,
+                                    l1: l1_slot,
+                                };
                                 return (work, false);
                             }
                             let branch_frame = {
@@ -808,21 +881,24 @@ impl AddressSpace {
                                 let (used, done) = self.step_pending(budget - work);
                                 work += used;
                                 if !done {
-                                    self.drain_stage = DrainStage::Tables { root: root_slot, l1: l1_slot };
+                                    self.drain_stage = DrainStage::Tables {
+                                        root: root_slot,
+                                        l1: l1_slot,
+                                    };
                                     return (work, false);
                                 }
                                 self.pending_free = None;
                             }
                         }
-                        // L1 的全部 L0 已登记：清 root 槽 + 归还 L1 自身是
-                        // 额外 2 个计费步骤（槽清理 1 + L1 归还链扫描），
-                        // 预算不足则先持久化游标重入。
-                        if work + 2 > budget {
-                            // 预算不足：root 槽已清但 L1 未登记——回退重入点
-                            // 为 root 已清的哨兵：root 记为已处理会导致跳过
-                            // L1 归还。改为不动 root 槽（此分支位于清槽之前），
-                            // 直接以当前游标持久化。
-                            self.drain_stage = DrainStage::Tables { root: root_slot, l1: l1_slot };
+                        // L1 的全部 L0 已登记后，清 root 槽是独立 work
+                        // unit。随即把 L1 帧登记为 pending free；若预算恰在
+                        // 清槽后耗尽，下一批先推进该 pending，不会在这里
+                        // More + 0 停滞。
+                        if work >= budget {
+                            self.drain_stage = DrainStage::Tables {
+                                root: root_slot,
+                                l1: l1_slot,
+                            };
                             return (work, false);
                         }
                         {
@@ -838,8 +914,11 @@ impl AddressSpace {
                         self.enqueue_free(l1_frame, 1);
                         let (used, done) = self.step_pending(budget - work);
                         work += used;
+                        self.drain_stage = DrainStage::Tables {
+                            root: root_slot,
+                            l1: l1_slot,
+                        };
                         if !done {
-                            self.drain_stage = DrainStage::Tables { root: root_slot, l1: l1_slot };
                             return (work, false);
                         }
                         self.pending_free = None;
@@ -860,12 +939,16 @@ impl AddressSpace {
                             };
                             let top = tree.root_frame();
                             let table = tree.mem_mut().table_mut(top);
-                            let shared = slot >= kernel_start && slot < kernel_end || slot == window;
+                            let shared =
+                                slot >= kernel_start && slot < kernel_end || slot == window;
                             if shared {
                                 // 剥离内核共享顶层项（子树归内核；与新建时的拷入配对）。
                                 table[slot] = page_table::Pte::invalid();
                             } else {
-                                debug_assert!(!table[slot].is_valid(), "user subtree outlives Tables stage");
+                                debug_assert!(
+                                    !table[slot].is_valid(),
+                                    "user subtree outlives Tables stage"
+                                );
                             }
                         }
                         slot += 1;
@@ -879,7 +962,10 @@ impl AddressSpace {
                         self.drain_stage = DrainStage::Root { slot };
                         return (work, false);
                     }
-                    let tree = self.tree.take().expect("tree exists until Root stage completes");
+                    let tree = self
+                        .tree
+                        .take()
+                        .expect("tree exists until Root stage completes");
                     self.enqueue_free(tree.leak_root(), 1);
                     self.drain_stage = DrainStage::RootFree;
                     let (used, done) = self.step_pending(budget - work);
@@ -893,13 +979,23 @@ impl AddressSpace {
                 }
                 DrainStage::RootFree => {
                     // root 归还在途（顶部 pending 逻辑已完成或已提前返回）。
-                    debug_assert!(self.pending_free.is_none(), "pending root free must be stepped at entry");
+                    debug_assert!(
+                        self.pending_free.is_none(),
+                        "pending root free must be stepped at entry"
+                    );
                     self.drain_stage = DrainStage::Done;
                     return (work, true);
                 }
             }
         }
     }
+}
+
+/// 由 drain_gate 串行的 HandleTable 收束状态。pending entry 已推进表
+/// 游标、尚待锁外 close；下一批必须优先消费它。
+struct DrainState {
+    cursor: usize,
+    pending_close: Option<super::handle::ProcessHandleEntry>,
 }
 
 /// 进程资源容器：地址空间、父子身份与进程本地 HandleTable。
@@ -921,8 +1017,8 @@ pub struct Process {
     control: crate::sync::Spinlock<Option<alloc::sync::Weak<super::process::ProcessControl>>>,
     /// Drain 并发批次仲裁（try_lock；持锁期间推进有界收束）。
     pub(crate) drain_gate: crate::sync::Spinlock<()>,
-    /// HandleTable 收束游标（drain_gate + 本锁下推进）。
-    drain_cursor: crate::sync::Spinlock<usize>,
+    /// HandleTable 收束游标与待关闭项（均由 drain_gate 串行）。
+    drain_state: crate::sync::Spinlock<DrainState>,
     /// 兼容调度域绑定（ProcessStart 提交点冻结，见 notes/impls/task.md；
     /// Building 期未绑定，线程经进程间接持有域归属）。
     domain: core::sync::atomic::AtomicPtr<crate::sched::SchedDomain>,
@@ -930,6 +1026,11 @@ pub struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
+        // 防御性兜底：预算恰在摘项后耗尽时，entry 已不在表中，必须先
+        // 关闭它才能继续收束地址空间。
+        if let Some(entry) = self.drain_state.get_mut().pending_close.take() {
+            super::handle::close_entry(entry, self, true);
+        }
         // 进程已无外部引用，唯一借用下逐项摘除；对象回调发生在表项
         // 已移除之后，且不持 HandleTable 锁。
         let mut cursor = 1;
@@ -951,7 +1052,10 @@ impl Process {
             pid,
             parent,
             job,
-            space: crate::sync::Spinlock::new(crate::sync::ranks::ADDRESS_SPACE, AddressSpace::new()?),
+            space: crate::sync::Spinlock::new(
+                crate::sync::ranks::ADDRESS_SPACE,
+                AddressSpace::new()?,
+            ),
             handles: crate::sync::Spinlock::chained(
                 crate::sync::ranks::HANDLE_TABLE,
                 pid,
@@ -960,14 +1064,22 @@ impl Process {
             lifecycle: super::lifecycle::Lifecycle::building().map_err(|_| SpaceError::NoFrame)?,
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
             drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
-            drain_cursor: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_CURSOR, 1),
+            drain_state: crate::sync::Spinlock::new(
+                crate::sync::ranks::DRAIN_CURSOR,
+                DrainState {
+                    cursor: 1,
+                    pending_close: None,
+                },
+            ),
             domain: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         })
     }
 
     /// 冻结域绑定（Start 提交点/bootstrap launch；不可重复）。
     pub(crate) fn bind_domain(&self, domain: &'static crate::sched::SchedDomain) {
-        let previous = self.domain.swap(domain as *const _ as *mut _, Ordering::Release);
+        let previous = self
+            .domain
+            .swap(domain as *const _ as *mut _, Ordering::Release);
         assert!(previous.is_null(), "domain bound twice");
     }
 
@@ -984,7 +1096,10 @@ impl Process {
     }
 
     pub(crate) fn control(&self) -> Option<Arc<super::process::ProcessControl>> {
-        self.control.lock().as_ref().and_then(alloc::sync::Weak::upgrade)
+        self.control
+            .lock()
+            .as_ref()
+            .and_then(alloc::sync::Weak::upgrade)
     }
 
     /// 取存活 ProcessControl shell；已消散则从 core 铸造新 shell，并在
@@ -1004,8 +1119,8 @@ impl Process {
             if let Some(control) = slot.as_ref().and_then(alloc::sync::Weak::upgrade) {
                 return Ok(control);
             }
-            let control =
-                super::process::ProcessControl::new(self).map_err(|_| SystemCallError::OutOfMemory)?;
+            let control = super::process::ProcessControl::new(self)
+                .map_err(|_| SystemCallError::OutOfMemory)?;
             *slot = Some(Arc::downgrade(&control));
             control
         };
@@ -1029,26 +1144,44 @@ impl Process {
     /// 硬性限制本次扫描量）与每次 close 各 1；地址空间部分见
     /// [`AddressSpace::drain`]。返回 (work_done, complete)。
     pub(crate) fn drain_batch(&self, budget: usize) -> (usize, bool) {
+        debug_assert!(budget > 0);
         let mut work = 0;
+
+        // 先关闭上一批在预算边界摘出的项。该项的扫描已计入前一批，当前
+        // 只消耗一次 close callback work unit。
+        let pending = self.drain_state.lock().pending_close.take();
+        if let Some(entry) = pending {
+            super::handle::close_entry(entry, self, true);
+            work += 1;
+            if work == budget {
+                return (work, false);
+            }
+        }
+
         while work < budget {
-            // 预留 close callback 的 1 单位：扫描预算 = 剩余 - 1，
-            // 单项（扫描 + 摘除 + close）总成本不趣 budget。
+            // 本次扫描可用全部剩余预算；若恰好摘到 entry 而已无 close
+            // 预算，就把它持久化为 pending。游标已经推进，下一批必先 close。
             let (outcome, scanned) = {
-                let scan_budget = budget - work - 1;
-                let mut cursor = self.drain_cursor.lock();
-                let before = *cursor;
-                let mut table = self.handles.lock();
-                let outcome = table.take_next_bounded(&mut cursor, scan_budget);
-                drop(table);
-                (outcome, *cursor - before)
+                let mut state = self.drain_state.lock();
+                let before = state.cursor;
+                let outcome = self
+                    .handles
+                    .lock()
+                    .take_next_bounded(&mut state.cursor, budget - work);
+                (outcome, state.cursor - before)
             };
-            work += scanned; // 空槽扫描同计费（硬预算）
+            work += scanned;
             match outcome {
+                super::handle::TakeNext::Entry(entry) if work == budget => {
+                    self.drain_state.lock().pending_close = Some(entry);
+                    return (work, false);
+                }
                 super::handle::TakeNext::Entry(entry) => {
                     super::handle::close_entry(entry, self, true);
                     work += 1;
                 }
                 super::handle::TakeNext::Progress => return (work, false),
+                super::handle::TakeNext::Exhausted if work == budget => return (work, false),
                 super::handle::TakeNext::Exhausted => {
                     let (space_work, complete) = self.space.lock().drain(budget - work);
                     return (work + space_work, complete);
@@ -1138,7 +1271,11 @@ pub fn spawn_from_elf(
     // 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/
     // TSO/未建模状态扩展在 load 时明确拒绝，不降级为 Base。
     let requirement = elf::isa_requirement(file).expect("userspace execution requirement rejected");
-    let process = Arc::new(Process::new(pid, parent, alloc::sync::Arc::downgrade(&job))?);
+    let process = Arc::new(Process::new(
+        pid,
+        parent,
+        alloc::sync::Arc::downgrade(&job),
+    )?);
     {
         let mut space = process.space.lock();
         space.load_elf(&image.segments, file)?;
@@ -1172,10 +1309,10 @@ pub(crate) fn prepare_main_thread(
 
 /// Bootstrap launch 事务：为 init 预留真实 Handle → 构造 prefix 并把
 /// BootPackage payload 借入同一 StartupBlock VA → 原子安装 Handle → 创建
-/// 主线程并入进程表。普通 ProcessStart 走 `task::process` 的 copied payload。
+/// 主线程并加入 root Job 成员表。普通 ProcessStart 走 `task::process` 的 copied payload。
 ///
 /// 失败全量回滚：临时 Handle 数值随 reservation 作废，输入 entries 按目标
-/// 进程退出语义关闭，进程表不出现半初始化项。W^X 发布边界仍是后续
+/// 进程退出语义关闭，Job 成员表不出现半初始化项。W^X 发布边界是后续
 /// `sched::enqueue` 的 Release。
 pub fn launch_bootstrap(
     spawned: SpawnedProcess,
@@ -1191,14 +1328,13 @@ pub fn launch_bootstrap(
 
     // eligibility：init 无兼容 hart 属 boot fatal（RuntimeGate 整体失败
     // 不降级）；域表在初始任务装载前已由 bring_up_runtime 构造。
-    let domain = crate::sched::resolve_domain(requirement)
-        .expect("initial process has no compatible hart");
+    let domain =
+        crate::sched::resolve_domain(requirement).expect("initial process has no compatible hart");
     process.bind_domain(domain);
 
     // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
     // 显式自杀/查询可用；无结构特例）。
-    let control = super::process::ProcessControl::new(&process)
-        .map_err(|_| SpaceError::NoFrame)?;
+    let control = super::process::ProcessControl::new(&process).map_err(|_| SpaceError::NoFrame)?;
     process.set_control(alloc::sync::Arc::downgrade(&control));
     let control_handle = super::handle::entry(
         super::process::ProcessControl::object_ref(&control),
@@ -1291,7 +1427,9 @@ pub fn launch_bootstrap(
     )?;
     // 成员表插入即启动提交（boot 路径失败不可恢复，直接提交不留 marker）。
     let job = process.job();
-    let member = job.reserve_member(process.pid).map_err(|_| SpaceError::NoFrame)?;
+    let member = job
+        .reserve_member(process.pid)
+        .map_err(|_| SpaceError::NoFrame)?;
     job.commit_member(member, process.clone());
     debug_assert!(
         process.lifecycle.enter_building_op(),

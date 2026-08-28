@@ -103,7 +103,7 @@ static ROOT: crate::sync::Spinlock<Option<Arc<Job>>> =
 /// 下一个 JobId（单调不复用；root 恒 1 = 首次分配）。
 static NEXT_JID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
-/// 持久 PID 分配器（单调不复用；全局进程表已退役，生命周期根在 Job）。
+/// 持久 PID 分配器（单调不复用；生命周期根是 Job 直接成员表）。
 static NEXT_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// 下一个成员/子表事务 token。

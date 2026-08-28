@@ -8,6 +8,7 @@ members = [
     "elf",
     "handle_table",
     "wait_context",
+    "timer_queue",
     "stack_layout",
     "sched_domain",
 ]

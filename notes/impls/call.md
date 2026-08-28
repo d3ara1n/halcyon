@@ -1,36 +1,21 @@
-# 内核调用
+# 内核调用实现
 
-> 异步调用的构想（内核请求、不阻塞内核）与 Remote Call 的设计定位源自 [`../ideas/call.md`](../ideas/call.md)；本篇记录其在内核中的落地形态。
+方向见 [`../ideas/call.md`](../ideas/call.md)。系统调用 ABI 为 a7 调用号、a0–a5 参数，返回 a0 错误码与 a1 值。
 
-内核调用分两类：系统调用（用户进程 ↔ 内核）与 remote call（hart ↔ hart，内核态内部）。
+## 同步调用
 
-## System Call
+同步 handler 在一次 trap 内完成：结果写入 UserContext、sepc 前进 4，dispatcher 返回 Resume。输出地址先校验，副作用后的最终写回统一使用 `uaccess::deliver_output`；若同进程另一线程在两次 AddressSpace 临界区之间拆除输出映射，复检失败冻结调用进程 `(Fault, StoreAccess)`，不把已发生副作用与错误返回混合。
 
-系统调用。
-由进程调用内核，用 Ecall 实现。ABI：a7 调用号，a0–a5 参数（至多 6 参），返回 a0 = 错误码、a1 = 返回值。
+handler 返回 Completed 后，dispatcher 再检查 lifecycle。若 syscall 期间另一 hart 已冻结终止，或 deliver_output 触发 Fault，出口改为 Killed，不再返回用户态。
 
-### 同步调用
+## 异步调用
 
-处理即完成：结果写入 TrapFrame（a0/a1）、sepc+4、Resume 回用户态。绝大多数系统调用的形态。
+dispatcher 只登记 `WaitPlan` 到 HartLocal park 槽并返回 Wait。调度循环在当前线程离开执行点、清 active 后调用 `park_publish` 安装 `WaitContext`。
 
-### 异步调用
+WaitPlan、WaitContext、TimeoutRegistration、订阅清理与 rejected-park 竞态由 [`ipc.md`](ipc.md) 唯一记录。调用层只区分两种交付：WaitMany 把结果或 MemoryNotAccessible 写回保存现场，Sleep 在相对超时到达时写回成功。终止 Abandoned 不交付结果。
 
-处理即登记：内核接受请求、登记**内核请求**（KernelRequest：等待对象 + 期限 + 完成动作），线程转 Waiting（不回用户态），Switch 回调度循环。内核不等待——立即执行其他线程。KernelRequest 是概念名，落地结构是 `WaitContext`（`os/kernel/src/task/wait.rs`）：三要素分别对应 `registrations`（订阅集）、`WaitPlan.deadline`（期限表登记）与 `WaitAction`（完成动作，`deliver` 据此写回 TrapFrame）。
-
-请求完成时（对端投递、期限到达、跨核回调），`wake()` 将线程直接回 Ready；结果已写入其 TrapFrame，sret 回用户态即拿到结果，无中间状态、无重入重试。
-
-- 出口三值：`SyscallOutcome { Completed, Wait, Killed(code) }`——所有 syscall 处理函数的统一签名，同步/异步在函数内部选择，分发层无差别处理。
-- 分发出口终止检查：handler 返回 Completed 后若 lifecycle 已 Terminating（syscall 执行期间被异 hart kill 冻结、或输出写回复检失败自杀），出口改写为 Killed——收束确定性提前一个 syscall，不依赖 sret 边界的 IPI 吸收时序。Wait 出口不改写：park 意图由 park_publish 的终止分支消费。
-- 输出写回复检（多线程前提）：每次访问在当次 space 锁内重新校验（check 与拷贝同一临界区）；syscall 输出交付统一走 `uaccess::deliver_output`——复检失败唯一成因是同进程线程在两次 space 锁之间拆除了输出页（HandleClose → unmap_external），等价于由内核代为检出的 store access fault，冻结 (Fault, StoreAccess) 并杀调用进程，绝不 panic 内核；副作用已发生的歧义由进程死亡清理兑底。等待交付路径（deliver_wait_result）语义不同：尽力送达、失败以 MemoryNotAccessible 告知线程，维持错误通道。
-- 期限登记时由发起 hart 立即 arm 自己的 timer（唤醒所有权，见 `internals.md`），期限不跟随线程迁移。
-- sleep(ms) 是第一个异步消费者（通路验证用）：登记期限 → `Wait` → 期限到达 `wake()` → a0 = NoError。
+dispatcher 的 Wait 出口不提前改为 Killed，终止竞态由等待安装路径吸收。
 
 ## Remote Call
 
-跨核内核态通信的传输层：一个 hart 请求另一个 hart 在其核上执行内核态动作。当前无消费者，未建框架。
-
-设计定位（应用面出现后按此定形）：
-
-- **门铃**：SBI `send_ipi` 无载荷，仅置目标核 SSIP——只作唤醒/通知。
-- **参数帧**：请求槽结构（tag / 载荷 / 完成通知）放共享内存，目标核被门铃敲醒后取请求执行；是否需要返回值、载荷多大，由第一个消费者决定。
-- 可预见消费者：TLB shootdown（ASID 优化启用后）、负载均衡窃取通知、内核调试通道。
+当前没有参数帧或通用 remote-call queue。已落地的 IPI 只作门铃：调度唤醒和进程终止向目标 hart 置 SSIP，目标检查自身待办。

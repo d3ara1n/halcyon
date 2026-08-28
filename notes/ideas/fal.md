@@ -2,13 +2,11 @@
 
 FAL（Filesystem Abstract Layer）是用户态客户端库与目录提供者之间的固定宽协议。内核对路径、节点、挂载、属性和文件权限零感知，只提供对象、Mailbox、Tunnel 与等待。
 
-## DirectoryGrant 与命名空间
+## DirectoryGrant
 
 **DirectoryGrant** 是对 provider 内某个目录根及操作上限的用户态 capability，不是内核 Directory 对象。推荐由 badged Mailbox sender 承载：provider 以 sender_badge 查得根节点、FAL rights ceiling 与生命周期状态。
 
-路径只是 grant 内的名字，不携带 authority。进程命名空间是一张私有的 `名字前缀 → DirectoryGrant` 路由表，按最长前缀匹配。初始表由 launcher 在 StartupBlock 中组装；运行中的扩充只能来自显式 capability 交付。卸载即关闭本地 grant Handle。
-
-没有全局挂载表、权威根目录或必经中央 VFS。组合提供者可以在子树边界返回更具体的 DirectoryGrant；只交付单个 `/` grant 时，自然退化为集中式单根视图。
+请求路径只在 grant 根内命名对象，不携带 authority。进程如何用前缀表选择初始 grant、挂载和卸载由 [`fs.md`](fs.md) 唯一拥有。FAL 只规定 provider 可以在子树边界返回更具体的 DirectoryGrant，供客户端继续组合走路。
 
 ## 权限
 
@@ -51,14 +49,7 @@ boot-critical 依赖仍由 StartupBlock 直接 GRANT；首个目录 provider 由
 
 ## Watch
 
-Watch 使用显式 Subscribe RPC，而不是读取共享 signaler：
-
-1. 客户端创建 Notification，保留 owner/read 侧；
-2. 客户端把 signaler TRANSIT 给 provider；
-3. provider 为每个订阅者独立提交 create/delete/modify/rename 位；
-4. 客户端 WaitMany 后 Take；关闭 owner 即取消订阅。
-
-因此 watch 是每订阅者的合并通知，不把竞争消费误称为广播。需要可重放、高频或带负载事件时使用消息或共享内存日志。
+Watch 使用显式 Subscribe RPC。客户端为每个订阅创建独立 Notification，并把 signaler TRANSIT 给 provider；provider 只向该订阅提交 create/delete/modify/rename 位。客户端关闭 owner 即结束订阅。Notification 的等待、Take 与竞争消费语义由 [`signal.md`](signal.md) 拥有；FAL 只规定各位的业务含义。需要可重放、高频或带负载事件时使用消息或共享内存日志。
 
 ## 流
 
@@ -68,7 +59,7 @@ Open 由 provider 建立 Tunnel，并在应答中 TRANSIT peer invitation；客�
 
 ## 固定宽 RPC
 
-FAL header 以通用 RpcPrefix 起头，随后是 FAL 版本、kind、总长度与 reserved。期待回复的请求把 `WRITE | TRANSIT` send-once 放在 Handle slot 0。所有字段固定宽、little-endian、版本化，写者置零 reserved，读者验证长度和不变量。
+FAL payload 在通用 [`RpcPrefix`](rpc.md) 后追加 FAL 版本、kind、总长度与 reserved；slot 0 的 send-once 约定由通用 RPC 拥有。FAL 字段固定宽、little-endian、版本化，写者置零 reserved，读者验证长度和业务不变量。
 
 kind 覆盖 Lookup、Enumerate、属性 Read/Write、Create、Delete、Move、Copy、Link、Open、ReadAt、WriteAt。目录枚举使用不透明 cursor；并发修改可令 cursor 失效。
 

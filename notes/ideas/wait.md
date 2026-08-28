@@ -1,29 +1,34 @@
 # 等待
 
-等待是系统中唯一把线程转入 Waiting 的完成入口。`WaitMany` 同时观察任意数量的对象状态；消息接收、隧道门铃、进程终止和通知均先表现为对象状态，再由它统一等待。Sleep 等便利调用也接入同一 WaitContext 与期限源，不另造线程所有权或唤醒通路。
+等待是系统中唯一把线程转入 Waiting 的完成入口。消息接收、隧道门铃、进程终态和 Notification 都先表现为对象状态，再由 `WaitMany` 统一观察；Sleep 也复用同一等待所有权和定时来源。
 
-## ObjectSignals：对象的电平状态
+## ObjectSignals
 
-每个可等待对象公开一组 `ObjectSignals`。每一位表示当前为真的条件，而非可被某个等待者取走的事件：邮箱的 `READABLE` 表示至少有一条消息；隧道端点的 `DATA` 表示对端提交门铃提示，`PEER_CLOSED` 表示对端关闭；所有对象的 `CLOSED` 都是持续可见的终态。对象定义自己的其他条件位及置位、清除前提。
+可等待对象公开一组电平状态。每一位表示当前为真的条件，不是某个等待者私有的事件：Mailbox `READABLE` 表示至少有一条完整消息，Tunnel `DATA` 表示应重新检查共享控制块，ProcessControl `REAPABLE` 表示管理者可以开始有界收束，`CLOSED` 表示不可复活的终态。
 
-等待只观察状态，绝不清位或消费事件。状态拥有者以对象语义显式改变电平：邮箱取走最后一条消息清除 `READABLE`，隧道在协议达到无进展条件后确认 `DATA`，Notification 以取走待决位清除可读状态。醒来后调用者必须重新检查真实数据。
+WaitMany 只观察状态，不清位、不消费资源。对象语义拥有者显式改变电平：Receive 取走最后一条消息后清 READABLE，Tunnel 协议确认无进展后清 DATA，Notification 由专用 Take 消费待决位。醒来者必须重新执行真实操作，并接受并发消费者可能已先一步改变条件。
+
+不是每个 capability 都可等待。对象 role 必须同时公开合法 signals，Handle 还必须持有 WAIT；一次性 Tunnel Invitation 等纯授权角色不因内部存在关闭状态而自动成为可等待对象。
 
 ## WaitMany
 
-`WaitMany(items)` 的每项为 `{ handle, signals, cookie }`：handle 必须有 `WAIT` 权限，signals 是关心的状态位，cookie 是调用者不透明的关联值。结果为 `{ cookie, observed, item_index, reason }`，不回显 Handle；`reason` 为 `SIGNALED`、`CLOSED` 或 `CANCELLED`。内部可区分放弃和期限完成，但不把这些内部原因伪装成普通对象命中。
+每个输入项是 `{handle, signals, cookie}`，结果是 `{cookie, observed, item_index, reason}`，不回显可能已经失效的 Handle。完成原因包括：
 
-任一项关心位为真即可完成；对象关闭也必须以该项完成并报告持续可见的 `CLOSED`。同一 Handle 可以重复出现，以不同 signals 或 cookie 分流。初始检查已观察到多个命中，或同一对象的一次状态更新命中多个项时，输入中最小的 `item_index` 获胜；不同对象并发变化则由先完成的竞争者决定结果，不虚构跨对象的原子快照。
+- `Signaled`：关心的普通电平命中；
+- `Closed`：对象进入 CLOSED；
+- `Timeout`：相对超时到达且没有对象完成；
+- `Cancelled`：未来公开取消操作的独立结果。
 
-调用入口解析 Handle 并取得对象引用后，本次等待保留已经验证的授权；另一线程随后关闭或转移原 Handle 不撤销在途操作，结果也不回显可能已经失效的 Handle 数值。对象自身若因 owner 关闭进入终态，等待仍以 `CLOSED` 完成。
+公开 `timeout_ms` 是相对毫秒时长，零表示无限；它不是绝对时钟 Deadline。需要绝对时间的上层协议应先基于公开单调时钟计算剩余时长，或未来使用独立的绝对等待 ABI。超时与取消不能互相伪装。
 
-调用时已命中同步返回；未命中时只建立等待意图，线程离开执行点后才由调度侧装配等待。取消、线程退出和进程退出走相同完成通路。等待不持有线程、进程或地址空间的旁路引用：完成或取消先取走线程所有权，再逐个对象解除订阅，因此对象关闭和冷门对象都不能滞留已退出线程。
+同一 Handle 可用不同 signals/cookie 重复出现。一次初始检查或同一对象更新同时命中多个项时，输入中最小 `item_index` 获胜；不同对象并发变化由首先取得完成权者决定，不虚构跨对象原子快照。
 
-## Notification：可消费的独立对象
+调用入口解析 Handle 并保留对象引用后，本次等待持有已验证的授权；另一线程关闭或转移原 Handle 不撤销在途操作。对象 owner 关闭仍以 Closed 完成。
 
-Notification 不是 ObjectSignals 的别名，而是独立对象，适用于「按位 OR 累积，再由消费者显式取走」。它由唯一 owner 维持开放；owner 不可复制或 TRANSIT，只可直接 GRANT。获授权的 signaler 可提交位掩码，重复提交同一位合并；存在待决位时 `READABLE` 为真。
+## 安装、完成与取消
 
-消费者先以 WaitMany 等待 `READABLE`，再调用取走操作原子取得并清除所选位；未选位继续保持。WaitMany 不改变待决位，多个消费者以取走操作协调竞争。计数或带负载事件仍使用消息或共享内存协议。
+未立即命中时，dispatcher 只建立等待意图；线程离开 hart 执行点后，调度侧才发布订阅和 timeout registration。对象命中、Timeout、安装错误与终止取消竞争同一个 outcome，唯一赢家取走线程所有权、注销定时项并清理全部订阅。
 
-## 边界
+进程终止使用内部 `Abandoned` 完成，不回到用户态，也不冒充公开 Cancelled。完成后的 timeout registration 必须立即注销，不能继续持有 WaitContext 或阻止系统静默。
 
-等待只报告状态已经命中，不保证资源仍能被随后操作独占取得；并发消费者必须接受再次操作可能得到「不再可用」。内核不注入 handler、不改写用户执行现场；用户态运行时若需回调，应由自己的监听线程在普通调用栈上分发。
+Notification 的消费语义由 [`signal.md`](signal.md) 唯一拥有；具体 WaitContext 与 timer queue 实现见 [`../impls/ipc.md`](../impls/ipc.md)。

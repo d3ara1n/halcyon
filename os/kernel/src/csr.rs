@@ -120,9 +120,8 @@ _write_read_senvcfg:
 ///
 /// 调用约定要点：action 是普通 Rust ABI 函数，以 `ret`（经 ra）返回；
 /// 因此跳转前先把 ra 指向成功续段（3:），再无链接跳入 action。若把
-/// 返回地址链入 ra 以外的寄存器（如 `jalr t0`），action 会直接返回到
-/// 本函数的调用者：跳过 stvec/栈恢复、泄漏帧、且调用者把原始 CSR 值
-/// 误读为 `Option` 判别值（曾致 formal-entry 竞态）。
+/// 返回地址必须链入 ra；使用其他寄存器会跳过 stvec/栈恢复、泄漏帧，
+/// 并让调用者把原始 CSR 值误读为 `Option` 判别值。
 ///
 /// 恢复路径依赖 trap 不破坏 t1 与 sp；trap 的 SPIE/SPP 污染由调用方
 /// （formal entry）末尾重归零值。

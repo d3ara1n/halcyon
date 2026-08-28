@@ -213,8 +213,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             } else {
                 // 只登记本 hart 意图槽；全局发布由调度循环在线程离开
                 // 执行点后完成（sched::park_publish，唤醒所有权随迁）。
-                let deadline = sched::deadline_after_ms(ms);
-                sched::park_request_wait(wait::sleep_plan(deadline));
+                let expires_at = sched::expires_after_ms(ms);
+                sched::park_request_wait(wait::sleep_plan(expires_at));
                 return Outcome::Wait; // 不前进 sepc，完成唤醒后由帧携带结果
             }
             Outcome::Completed

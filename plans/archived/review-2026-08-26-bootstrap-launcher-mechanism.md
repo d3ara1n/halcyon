@@ -1,6 +1,6 @@
 # review：Bootstrap / 用户态 launcher 机制审查
 
-按用户裁定，本次为**机制层 review**：对象是 notes/ideas 与 notes/impls 的方向性文档，代码仅作参照验证文档声称的机制形状；不做逐行代码审查。原十切片代码审查计划见 [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md)，其结论边界不受本篇替代。
+按用户裁定，本次为**机制层 review**：对象是 notes/ideas 与 notes/impls 的方向性文档，代码仅作参照验证文档声称的机制形状；不做逐行代码审查。原十切片代码审查计划见 [`todo-2026-08-26-bootstrap-launcher-review.md`](../todo-2026-08-26-bootstrap-launcher-review.md)，其结论边界不受本篇替代。
 
 ## 审查输入
 

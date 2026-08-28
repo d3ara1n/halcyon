@@ -13,7 +13,7 @@
 
 ### 稳态终态公理的实现依赖
 
-- quiescent 相容性依赖两个既存实现事实：`WAIT_DEADLINE_INFINITE → deadline=None` 不注册期限表（`task/wait.rs`）、IPC/信号等待者刻意不阻止静默（`sched.rs is_quiescent`）。任一改动（新等待源、期限表语义变化）必须重审 internals.md 停机谓词的主人枚举约束——机制泛化 review 轴的同名条目互为对照。
+- quiescent 相容性依赖两个既存实现事实：`WAIT_TIMEOUT_INFINITE → expires_at=None` 不注册 TimerQueue entry（`task/wait.rs`）、IPC/信号等待者刻意不阻止静默（`sched.rs is_quiescent`）。任一改动（新等待源、Timeout queue 语义变化）必须重审 internals.md 停机谓词的主人枚举约束——机制泛化 review 轴的同名条目互为对照。
 - 稳态 endpoint 收到消息的 BUG 分支会走 `main` 返回 → init 退出 → 管理根失效。确认该路径只可能是内核违约或未来管理协议接入时遗留。
 
 ### GRANT 消费与 authority 留存

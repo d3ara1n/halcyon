@@ -8,8 +8,8 @@
 ## 权威文档（按优先序，冲突时以先者为准）
 
 1. [`todo-2026-08-26-process-lifecycle.md`](todo-2026-08-26-process-lifecycle.md)：「已拍板的结构决策（第二批：Job 管理面）」决策 9–15 +「已确认的 Job ABI」——**设计的最终形态**；
-2. [`archived/todo-2026-08-27-job-management-design.md`](archived/todo-2026-08-27-job-management-design.md)：完整推导、被否选项、实施约束（数据结构/锁序/游标闭合）、竞态闭合清单；
-3. [`ref-2026-08-27-job-enumerate-derive-research.md`](ref-2026-08-27-job-enumerate-derive-research.md)：Zircon/Windows/seL4/Linux 契约取证（引用外部先例时用）；
+2. [`archived/todo-2026-08-27-job-management-design.md`](todo-2026-08-27-job-management-design.md)：完整推导、被否选项、实施约束（数据结构/锁序/游标闭合）、竞态闭合清单；
+3. [`ref-2026-08-27-job-enumerate-derive-research.md`](../ref-2026-08-27-job-enumerate-derive-research.md)：Zircon/Windows/seL4/Linux 契约取证（引用外部先例时用）；
 4. `notes/ideas/task.md`「Job」节：概念层（含预算原则——**注意预算是远期方向，本次不实施**）。
 
 ## 实施边界

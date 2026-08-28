@@ -339,7 +339,7 @@ pub mod blocking {
     use super::*;
     use erhino_shared::{
         object::ObjectSignals,
-        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
+        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     };
     use rinlib::ipc::{object, tunnel, wait};
 
@@ -402,7 +402,7 @@ pub mod blocking {
                     0,
                 ),
             ],
-            WAIT_DEADLINE_INFINITE,
+            WAIT_TIMEOUT_INFINITE,
         )?;
         if result
             .observed

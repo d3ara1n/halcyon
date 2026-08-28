@@ -10,25 +10,27 @@
 
 ## 归属纪律
 
-impls 中每个机制恰有一篇拥有：拥有篇维护该机制的全部实现事实，其他篇只链接不重述。跨篇复述是失同步的土壤——修改机制时以拥有篇为准，并 grep 全部 impls 提及处。
+每个机制在 idea 与 impl 视角各有唯一拥有篇；其他篇只描述本主题如何使用该机制并链接拥有篇，不重复定义其不变量。idea 不记录当前施工状态，impl 不保存历史选型或未来实施方案。
 
 ## 索引
 
 | 主题 | idea | impl |
 |---|---|---|
+| 内核边界与协作式执行 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
 | 对象、Capability、Handle、运输与根授权 | [object](ideas/object.md) | [IPC 对象](impls/ipc.md) |
-| Bootstrap、init 与用户态 launcher | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
-| 普通进程启动与 StartupBlock | [object](ideas/object.md)、[service](ideas/service.md) | [startup](impls/startup.md) |
-| 任务、Job、进程、线程与调度 | [task](ideas/task.md) | [task](impls/task.md) |
-| 执行环境（boot / trap / hart capability） | [task](ideas/task.md) | [execution-context](impls/execution-context.md) |
-| 内存管理 | — | [mm](impls/mm.md) |
-| 内核内部机制（中断 / 锁 / 唤醒） | — | [internals](impls/internals.md) |
-| 内核调用（syscall / remote call） | [call](ideas/call.md) | [call](impls/call.md) |
+| Bootstrap、init、StartupBlock 与 launcher | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
+| Job、进程、线程、生命周期与调度类 | [task](ideas/task.md) | [task](impls/task.md) |
+| Hart、执行需求、调度域、用户上下文与 trap | [execution-context](ideas/execution-context.md) | [execution-context](impls/execution-context.md) |
+| 内存所有权、地址空间与映射 | [mm](ideas/mm.md) | [mm](impls/mm.md) |
+| 内核内部锁、中断、唤醒与停机 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
+| 系统调用与 remote call | [call](ideas/call.md) | [call](impls/call.md) |
 | IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象](impls/ipc.md) |
-| 等待、对象状态与 Notification | [wait](ideas/wait.md)、[signal](ideas/signal.md) | [IPC 对象](impls/ipc.md) |
+| WaitMany 与 ObjectSignals | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |
+| Notification | [signal](ideas/signal.md) | [IPC 对象](impls/ipc.md) |
 | Tunnel、共享内存与 Runnel | [tunnel](ideas/tunnel.md)、[shared-memory](ideas/shared-memory.md)、[runnel](ideas/runnel.md) | [IPC 对象](impls/ipc.md) |
-| 通用 RPC | [rpc](ideas/rpc.md) | [FAL/RPC 现状](impls/fal.md) |
-| 服务进程与用户态框架 | [service](ideas/service.md)、[framework](ideas/framework.md) | [startup](impls/startup.md)、[FAL/RPC 现状](impls/fal.md) |
-| 文件系统、FAL 与私有 namespace | [fs](ideas/fs.md)、[fal](ideas/fal.md) | [FAL/RPC 现状](impls/fal.md) |
-| 设备授权 | [device](ideas/device.md) | — |
-| ECS 应用构想 | [ecs](ideas/ecs.md) | — |
+| 通用 RPC | [rpc](ideas/rpc.md) | [rpc](impls/rpc.md) |
+| 服务进程与用户态框架 | [service](ideas/service.md)、[framework](ideas/framework.md) | [startup](impls/startup.md)、[rpc](impls/rpc.md)、[fal](impls/fal.md) |
+| 文件系统 namespace 与 FAL | [fs](ideas/fs.md)、[fal](ideas/fal.md) | [fal](impls/fal.md) |
+| 设备资源授权 | [device](ideas/device.md) | — |
+
+应用层构想不属于系统契约，单独位于 [`ideas/applications/`](ideas/applications/)；当前包含机器人 [ECS](ideas/applications/ecs.md)。

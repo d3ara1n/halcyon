@@ -2,7 +2,7 @@
 //!
 //! 单一归属不变量：线程任意时刻恰处于「类队列 | 本 hart current | 无容器」，
 //! 全部转换经本模块入口（enqueue / pick / wake）在锁内完成。
-//! 公平性由 FIFO 队列的结构性质保证，无记账字段（旧内核死因的免疫）。
+//! 公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 //!
 //! 调度域按「需求满足签名」推导（sched_domain crate）：域 = 一组能力
 //! 兼容且策略相同的 hart，boot 构造后终身冻结；线程经进程绑定到唯一
@@ -15,10 +15,13 @@ use core::{
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 
-use crate::sync::Spinlock;
-use crate::{hart, sbi, trap::{self, Outcome}};
 use crate::sbi::DISARM;
+use crate::sync::Spinlock;
 use crate::task::Thread;
+use crate::{
+    hart, sbi,
+    trap::{self, Outcome},
+};
 
 /// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/impls/task.md）。
 /// reserve/commit/rollback 是就绪容量的事务预留契约（协议四要素，见
@@ -235,7 +238,11 @@ pub fn build_domains() {
             members
         );
     }
-    let table = Box::leak(Box::new(DomainTable { plan, domains, by_slot }));
+    let table = Box::leak(Box::new(DomainTable {
+        plan,
+        domains,
+        by_slot,
+    }));
     DOMAINS.store(table as *const _ as *mut _, Ordering::Release);
 }
 
@@ -260,22 +267,18 @@ pub fn resolve_domain(requirement: elf::IsaRequirement) -> Option<&'static Sched
 // 等待模型（notes/impls/call.md「异步调用」）：等待条目 + 代数仲裁 + 发布时序
 // ---------------------------------------------------------------------------
 
-/// 期限表强持 WaitContext；到期只竞争其单一 outcome。
-struct DeadlineEntry {
-    at: u64,
-    context: Arc<crate::task::wait::WaitContext>,
-}
+/// per-hart 期限队列：期限主人是登记 hart（唤醒所有权），登记、arm、
+/// 到期弹出与 idle 装填只碰本 hart 队列。跨 hart 完成仅按 token 锁住
+/// owner queue 删除项，且不远程重编程 owner timer。
+static HART_TIMERS: [Spinlock<timer_queue::TimerQueue<Arc<crate::task::wait::WaitContext>>>;
+    hart::HART_NUM_LIMIT] =
+    [const { Spinlock::new(crate::sync::ranks::LEAF, timer_queue::TimerQueue::unbound()) };
+        hart::HART_NUM_LIMIT];
 
-/// per-hart 期限表：期限主人是登记 hart（唤醒所有权），登记、arm、
-/// 到期扫描与 idle 装填都只碰本 hart 表；唯一跨 hart 访问是静默谓词的
-/// 只读遍历。锁防跨核并行下与该遍历的交错，本 hart 内无争用。
-static HART_TIMERS: [Spinlock<Vec<DeadlineEntry>>; hart::HART_NUM_LIMIT] =
-    [const { Spinlock::new(crate::sync::ranks::LEAF, Vec::new()) }; hart::HART_NUM_LIMIT];
-
-/// 本 hart 的期限表（slot 由 formal entry 设置，调用点均在调度循环或
+/// 本 hart 的期限队列（slot 由 formal entry 设置，调用点均在调度循环或
 /// 其 Park 发布路径内）。
 #[inline]
-fn timers() -> &'static Spinlock<Vec<DeadlineEntry>> {
+fn timers() -> &'static Spinlock<timer_queue::TimerQueue<Arc<crate::task::wait::WaitContext>>> {
     &HART_TIMERS[hart::current().slot()]
 }
 
@@ -291,10 +294,8 @@ const PARK_WAIT: usize = 1;
 /// 新对象 ABI 的统一等待意图；计划已在 syscall 入口解析 Handle 并保留授权。
 pub fn park_request_wait(plan: crate::task::wait::WaitPlan) {
     let me = hart::current();
-    me.park_arg.store(
-        Box::into_raw(Box::new(plan)) as usize,
-        Ordering::Relaxed,
-    );
+    me.park_arg
+        .store(Box::into_raw(Box::new(plan)) as usize, Ordering::Relaxed);
     me.park_kind.store(PARK_WAIT, Ordering::Relaxed);
 }
 
@@ -314,20 +315,33 @@ fn park_publish(t: &Arc<Thread>) {
     }
 }
 
-pub fn deadline_after_ms(ms: u64) -> u64 {
-    sbi::read_time().saturating_add(ms.saturating_mul(ticks_per_ms()))
+pub fn expires_after_ms(timeout_ms: u64) -> u64 {
+    sbi::read_time().saturating_add(timeout_ms.saturating_mul(ticks_per_ms()))
 }
 
-pub(crate) fn register_wait_deadline(
-    at: u64,
+/// 在发起 hart 的期限队列登记等待，并立刻按新堆顶装填本地时钟。
+pub(crate) fn register_wait_timeout(
+    expires_at: u64,
     context: Arc<crate::task::wait::WaitContext>,
-) -> Result<(), ()> {
+) -> Result<timer_queue::TimerToken, ()> {
+    let owner_slot = hart::current().slot();
     let mut timers = timers().lock();
-    timers.try_reserve(1).map_err(|_| ())?;
-    timers.push(DeadlineEntry { at, context });
+    assert!(
+        timers.bind_owner(owner_slot),
+        "timer queue bound to the wrong hart"
+    );
+    let token = timers.try_register(expires_at, context).map_err(|_| ())?;
     drop(timers);
     arm_earliest();
-    Ok(())
+    Ok(token)
+}
+
+/// 由任意完成 hart 注销 timeout。只移除 owner queue 项，不重编程远端
+/// timer；最多引起一次提前中断，owner 会在下一装填点按堆顶恢复。
+pub(crate) fn unregister_wait_timeout(token: timer_queue::TimerToken) {
+    let removed = HART_TIMERS[token.owner_slot()].lock().cancel(token);
+    // WaitContext 的最后一个强引用不得在期限队列锁内析构。
+    drop(removed);
 }
 
 /// 每毫秒 tick 数（init 时按 timebase 换算）。
@@ -349,26 +363,22 @@ pub fn ticks_per_sec() -> u64 {
     ticks_per_ms() * 1000
 }
 
-/// 把本 hart 定时器设到期限表最早期限（表空则不动）。
+/// 把本 hart 定时器设到期限队列最早到期点（队列空则不动）。
 fn arm_earliest() {
     let timers = timers().lock();
-    if let Some(min) = timers.iter().map(|d| d.at).min() {
-        sbi::require(sbi::set_timer(min), "TIME.set_timer");
+    if let Some(expires_at) = timers.peek_expires_at() {
+        sbi::require(sbi::set_timer(expires_at), "TIME.set_timer");
     }
 }
 
-/// 唤醒本 hart 期限表中全部到期等待者（先收集后完成：锁序单向，
-/// 期限内不做长工作）。
+/// 弹出本 hart 全部已到期项后，在锁外以 token 通知 context。弹出与
+/// 注销竞争时只有成功退休 token 的路径参与 Timeout outcome 仲裁。
 fn wake_expired() {
     let now = sbi::read_time();
-    let due: Vec<DeadlineEntry> = {
-        let mut timers = timers().lock();
-        let (due, rest): (Vec<_>, Vec<_>) = timers.drain(..).partition(|d| d.at <= now);
-        *timers = rest;
-        due
-    };
-    for entry in due {
-        entry.context.expire();
+    loop {
+        let due = timers().lock().pop_expired(now);
+        let Some((token, context)) = due else { break };
+        context.expire(token);
     }
 }
 
@@ -429,9 +439,9 @@ pub fn run() -> ! {
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         t.switches.fetch_add(1, Ordering::Relaxed);
         arm_quantum();
-        // ProcessWrite 可经另一 hart 的直映射回填刚分配的可执行页。当前未
-        // 建代码代次/active-hart 集合，因此每次新 dispatch 在本 hart 执行
-        // fence.i，确保首次执行及迁移都不观察帧复用前的旧 I-cache 内容。
+        // ProcessWrite 可经另一 hart 的直映射回填刚分配的可执行页。active
+        // bitmap 当前只服务终止屏障，尚无代码代次，因此每次新 dispatch
+        // 执行 fence.i，确保首次执行及迁移不观察旧 I-cache 内容。
         // SAFETY: fence.i 是本 hart 指令流同步，不触碰内存。
         unsafe { asm!("fence.i", options(nostack, preserves_flags)) };
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
@@ -469,7 +479,7 @@ pub fn run() -> ! {
 /// 量子装填：时间片与本 hart 期限表最早期限取近（不睡过期）。
 fn arm_quantum() {
     let quantum = sbi::read_time() + QUANTUM_MS * ticks_per_ms();
-    let earliest = timers().lock().iter().map(|d| d.at).min();
+    let earliest = timers().lock().peek_expires_at();
     sbi::require(
         sbi::set_timer(earliest.unwrap_or(quantum).min(quantum)),
         "TIME.set_timer",
@@ -520,7 +530,7 @@ fn idle() {
         sbi::shutdown();
     }
 
-    let earliest = timers().lock().iter().map(|d| d.at).min();
+    let earliest = timers().lock().peek_expires_at();
     match earliest {
         Some(at) => sbi::require(sbi::set_timer(at), "TIME.set_timer"),
         None => sbi::require(sbi::set_timer(DISARM), "TIME.set_timer"),

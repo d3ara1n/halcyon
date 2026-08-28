@@ -1,6 +1,6 @@
 # 机制层泛化改造 Review 计划
 
-> 【未来审查计划】对象是本轮三笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。发起背景与发现清单见 [`review-2026-08-27-mechanism-generalization.md`](review-2026-08-27-mechanism-generalization.md)。
+> 【未来审查计划】对象是本轮三笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。发起背景与发现清单见 [`archived/review-2026-08-27-mechanism-generalization.md`](archived/review-2026-08-27-mechanism-generalization.md)。
 
 ## 提交对照
 
@@ -20,10 +20,12 @@
 - **同秩链段 key 的语义边界**：HandleTable 嵌套 key = pid 的前提是「child 表必为新建进程」（pid 单调）。未来若出现老进程间的 GRANT 类嵌套，此断言会正确报警——确认该前提成文于 task.md。
 - **debug/release 行为差**：release 下 ladder 为空桩；断言只在 debug 负载暴露。集成验证（virt/sifive_u）均以 MODE=debug 执行才算覆盖断言面。
 
-### per-hart 期限表
+### per-hart Timeout queue
 
-- **静默谓词遍历**：`is_quiescent` 遍历全部 `HART_TIMERS`；新增等待源时的主人枚举约束（internals.md「停机语义」）是否同步。
-- **不迁移前提**：期限登记跟发起 hart 的论证依赖「Waiting 线程不迁移」；ThreadSpawn/迁移特性接入时重审。
+- **稳定 token**：owner slot、arena slot 与 generation 是否闭合跨 hart cancel、到期弹出和槽位复用；错误 owner queue 必须结构性拒绝。
+- **完成即注销**：对象命中、Abandoned、Timeout 与注册发布竞态是否都使 queue live entry 消散，不滞留 WaitContext 或阻止静默。
+- **静默谓词遍历**：`is_quiescent` 遍历全部 `HART_TIMERS` 的判空；新增等待源时的主人枚举约束是否同步。
+- **不迁移前提**：注册 owner 是发起 hart，不随 Waiting 线程迁移；显式迁移接入时重审。
 
 ### MappingLease
 

@@ -16,7 +16,7 @@ use erhino_shared::{
         ProcessStartDescriptor, PROCESS_MAIN_STACK_SIZE, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
         JOB_ENUMERATE_MAX,
     },
-    wait::{WaitItem, WAIT_DEADLINE_INFINITE},
+    wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
 };
 use rinlib::{ipc::object::close, ipc::wait::wait_many, process};
 
@@ -115,7 +115,7 @@ pub fn job_kill(job: Handle, code: i64) -> Result<(), SystemCallError> {
     // 成员全部完成」，含子 Job 传播）。
     wait_many(
         &[WaitItem::new(job, ObjectSignals::CLOSED, 0)],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     )?;
     Ok(())
 }
@@ -137,7 +137,7 @@ fn kill_members(job: Handle, code: i64) -> Result<(), SystemCallError> {
         // kill 是异步请求：等 REAPABLE/CLOSED 后 drain 至 Complete。
         wait_many(
             &[WaitItem::new(control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, 0)],
-            WAIT_DEADLINE_INFINITE,
+            WAIT_TIMEOUT_INFINITE,
         )?;
         process::drain_to_completion(control)?;
         close(control)?;

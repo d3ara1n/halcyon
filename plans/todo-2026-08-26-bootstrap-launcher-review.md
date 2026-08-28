@@ -1,6 +1,6 @@
 # todo：BootPackage / 用户态 launcher 统一 review
 
-状态：**机会型任务（有空就做），不阻塞后续计划**。2026-08-26 机制层审查已完成（[archived/review-2026-08-26-bootstrap-launcher-mechanism.md](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)）：机制方向成立，launcher 基座可承接 process-lifecycle 工作；本计划的十切片代码审查保留，作为后续接入时发现问题的路线图，但不再是进入 `todo-2026-08-26-process-lifecycle.md` 的前置条件。本文件冻结提交边界、设计契约、审查切片与核证入口；切片清单在执行代码审查时直接充当检查表。
+状态：**机会型任务（有空就做），不阻塞后续计划**。2026-08-26 机制层审查已完成（[archived/review-2026-08-26-bootstrap-launcher-mechanism.md](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)）：机制方向成立，launcher 基座可承接 process-lifecycle 工作；本计划的十切片代码审查保留，作为后续接入时发现问题的路线图，但不再是进入 `archived/todo-2026-08-26-process-lifecycle.md` 的前置条件。本文件冻结提交边界、设计契约、审查切片与核证入口；切片清单在执行代码审查时直接充当检查表。
 
 ## 提交范围
 
@@ -250,7 +250,7 @@ Review 报告应附一张事务阶段表：资源、owner、reservation token、
 3. 每个 finding 的严重度、可达前提、直接证据、受影响不变量和建议修复方向；
 4. 已运行命令及关键输出，不以“构建通过”代替语义证明；
 5. 哪些结论进入 `notes/impls/`，哪些债务进入 `KNOWN_ISSUES.md` 或新 todo；
-6. 对 `plans/todo-2026-08-26-process-lifecycle.md` 的前置约束。
+6. 对 `plans/archived/todo-2026-08-26-process-lifecycle.md` 的前置约束。
 
 发现缺陷后不得在 review 档案内混写实施过程：修复另立 todo/提交；方向性结论进入 notes，暂时可达债务进入 KNOWN_ISSUES。
 

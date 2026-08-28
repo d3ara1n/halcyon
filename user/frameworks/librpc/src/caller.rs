@@ -25,9 +25,9 @@ use crate::{next_txid, RpcMessageKind, RpcPrefix};
 /// 同步调用错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallError {
-    /// 期限到达，ReplyPort 已废弃重建；请求可能已被服务端处理，
+    /// 超时，ReplyPort 已废弃重建；请求可能已被服务端处理，
     /// 重试语义（idempotency）由各协议自持。
-    Deadline,
+    Timeout,
     /// 服务邮箱关闭（观察 CLOSED）。
     ServiceClosed,
     /// 应答 framing 违约。
@@ -93,12 +93,12 @@ impl Caller {
 
     /// 发起一次同步调用。`body` 为协议层字节（不含 RpcPrefix）；
     /// `extra_moves` 追加在 slot 0 的 send-once 回复授权之后；
-    /// `deadline_ms` 为相对毫秒期限（0 = 无限）。
+    /// `timeout_ms` 为相对毫秒超时（0 = 无限）。
     pub fn call(
         &mut self,
         service: Handle,
         protocol_id: u64,
-        deadline_ms: u64,
+        timeout_ms: u64,
         body: &[u8],
         extra_moves: &[HandleMove],
     ) -> Result<Reply, CallError> {
@@ -136,15 +136,15 @@ impl Caller {
             WaitItem::new(port.owner, ObjectSignals::READABLE | ObjectSignals::CLOSED, 0),
             WaitItem::new(service, ObjectSignals::CLOSED, 1),
         ];
-        let result = wait_many(&items, deadline_ms).map_err(|error| {
+        let result = wait_many(&items, timeout_ms).map_err(|error| {
             // 等待失败：迟到回复可能落地，废弃端口隔离。
             self.discard_port();
             error
         })?;
         match WaitReason::from_u32(result.reason) {
-            Some(WaitReason::Deadline) => {
+            Some(WaitReason::Timeout) => {
                 self.discard_port();
-                Err(CallError::Deadline)
+                Err(CallError::Timeout)
             }
             // 观察到 CLOSED 必然以 Closed 收尾（终态独占电平）。
             Some(WaitReason::Closed) if result.item_index == 1 => Err(CallError::ServiceClosed),

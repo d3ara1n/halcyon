@@ -33,11 +33,11 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
-            HandleGrant, JobMemberKind, JobState, ProcessExitReason,
+            HandleGrant, JobMemberKind, JobState, ProcessDrainStatus, ProcessExitReason,
             ProcessMapFlags, ProcessState, ProcessStartDescriptor, ExecutionProfile,
             PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
         },
-        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
+        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     },
 };
 use libprocess::{
@@ -300,12 +300,13 @@ fn main() {
     };
     debug!("services job established");
     if let Err(stage) = run(services) {
-        debug!("init stage failed: {}", stage);
+        debug!("init acceptance failed: {}", stage);
         // 整树收束：seal + 逐成员 kill + 子域递归 + CLOSED 屏障，一次性
         // 覆盖 services 全部成员与委托/验收子域。
         if let Err(error) = job_kill(services, 0x1F) {
             debug!("failure-path teardown degraded: {:?}", error);
         }
+        panic!("init acceptance failed: {}", stage);
     }
     steady_state();
 }
@@ -395,7 +396,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
                             7,
                         ),
                     ],
-                    WAIT_DEADLINE_INFINITE,
+                    WAIT_TIMEOUT_INFINITE,
                 )
                 .expect("notification wait failed");
                 let bits = notification::take(event.owner, u64::MAX)
@@ -453,30 +454,32 @@ fn run(services: Handle) -> Result<(), &'static str> {
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image.as_deref() {
-        Some(image) => test_job_management(acceptance, image),
-        None => debug!("job management tests skipped: target image unavailable"),
+        Some(image) => test_job_management(acceptance, image)?,
+        None => return Err("job management acceptance image unavailable"),
     }
 
     // —— 生命周期多核竞态矩阵（step 9）：双锤同刻起跑打真跨核竞态，
     // 断言各场景终态合法、无泄漏、枚举收敛 ——
     match (target_image.as_deref(), hammer_image.as_deref()) {
-        (Some(target), Some(hammer)) => race_matrix(acceptance, target, hammer),
-        _ => debug!("race matrix skipped: images unavailable"),
+        (Some(target), Some(hammer)) => race_matrix(acceptance, target, hammer)?,
+        _ => return Err("race matrix acceptance images unavailable"),
     }
 
     // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
     // 稳态拓扑。
-    match job_kill(acceptance, 0x1E) {
-        Ok(()) => debug!("acceptance domain collected"),
-        Err(error) => debug!("acceptance collection degraded: {:?}", error),
+    if let Err(error) = job_kill(acceptance, 0x1E) {
+        debug!("acceptance domain collection failed: {:?}", error);
+        return Err("acceptance domain collection failed");
     }
+    debug!("acceptance domain collected");
     let _ = close(acceptance);
 
     // —— 监督闭环：等待全部服务 REAPABLE/CLOSED，Drain 至 Complete，
     // 查询稳定终态后释放 control。对象 close 回调（含 pm 隧道端点的
     // PEER_CLOSED 发布）发生在 Drain 期间——监督先于对端终态等待。 ——
     if let Err(error) = supervise_services(supervised) {
-        debug!("supervision degraded: {:?}", error);
+        debug!("service supervision failed: {:?}", error);
+        return Err("service supervision failed");
     }
     debug!("all services supervised to completion");
 
@@ -486,22 +489,35 @@ fn run(services: Handle) -> Result<(), &'static str> {
         ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
         0,
     )];
-    match wait_many(&items, WAIT_DEADLINE_INFINITE) {
-        Ok(result) => debug!("peer closed observed: bits={:#x}", result.observed.raw()),
-        Err(e) => debug!("peer-closed wait failed: {:?}", e),
-    }
+    let peer_closed = wait_many(&items, WAIT_TIMEOUT_INFINITE).map_err(|error| {
+        debug!("peer-closed wait failed: {:?}", error);
+        "peer-closed wait failed"
+    })?;
+    debug!(
+        "peer closed observed: bits={:#x}",
+        peer_closed.observed.raw()
+    );
     let _ = tunnel.close();
 
     // —— 委托域终局：pm 的管理段应已把 pm_domain 收束到 Dead；降级时
     // init 以保留的直接收束权兜底（job_kill = seal + 枚举派生 kill +
     // drain + CLOSED 屏障）。 ——
     let domain_state = process::query_job(pm_domain);
-    if matches!(&domain_state, Ok(s) if s.state == JobState::Dead as u32) {
-        debug!("pm delegated domain confirmed Dead");
-    } else {
+    if !matches!(&domain_state, Ok(s) if s.state == JobState::Dead as u32) {
         debug!("pm delegated domain not collected by pm; init collecting");
-        let _ = job_kill(pm_domain, 0x1F);
+        job_kill(pm_domain, 0x1F).map_err(|error| {
+            debug!("pm delegated domain collection failed: {:?}", error);
+            "pm delegated domain collection failed"
+        })?;
     }
+    let domain_state = process::query_job(pm_domain).map_err(|error| {
+        debug!("pm delegated domain final query failed: {:?}", error);
+        "pm delegated domain final query failed"
+    })?;
+    if domain_state.state != JobState::Dead as u32 {
+        return Err("pm delegated domain did not reach Dead");
+    }
+    debug!("pm delegated domain confirmed Dead");
 
     // 终态拓扑快照（调试参考）：预期 root 仅剩 init + services，services
     // 空（Dead 的 pm_domain/acceptance 已从成员表移除）——收束干净的不变量。
@@ -593,7 +609,7 @@ fn supervise_services(
                 WaitItem::new(s.control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, index as u64)
             })
             .collect();
-        let result = wait_many(&items, WAIT_DEADLINE_INFINITE)?;
+        let result = wait_many(&items, WAIT_TIMEOUT_INFINITE)?;
         let index = result.cookie as usize;
         let Some(target) = supervised.get(index) else { break };
         let pid = target.pid;
@@ -711,13 +727,87 @@ fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
 
 /// Job 管理面验收入口（step 5）。真跨核竞态矩阵（含并发 Create/枚举
 /// 乱序窗口）归 step 9 验证矩阵，此处只覆盖可确定性制造的场景。
-fn test_job_management(job: Handle, image: &[u8]) {
+fn test_job_management(job: Handle, image: &[u8]) -> Result<(), &'static str> {
     test_job_seal_completion(job);
     test_derive_fallback(job);
     test_job_kill_composition(job, image);
     seal_before_start(job);
     seal_before_create(job);
     enumerate_convergence(job);
+    test_drain_minimum_budget(job, image)
+}
+
+/// 含 child Handle 的 REAPABLE 进程以 `max_work=1` 收束。More 必须由
+/// rinlib 拒绝零进展；这里逐批推进至 Complete，覆盖 pending close 的
+/// 扫描/关闭分离边界。
+fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static str> {
+    let marker = notification::create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+        Rights::SIGNAL | Rights::TRANSIT,
+    )
+    .map_err(|error| {
+        debug!(
+            "drain minimum-budget acceptance failed: notification create {:?}",
+            error
+        );
+        "drain minimum-budget notification create failed"
+    })?;
+    let grants = [HandleGrant {
+        handle: marker.owner,
+        rights: Rights::READ | Rights::WAIT,
+    }];
+    let result = (|| {
+        let started = spawn(SpawnRequest {
+            job,
+            image,
+            payload: &[],
+            grants: &grants,
+            control_rights: SUPERVISOR_RIGHTS,
+        })
+        .map_err(|error| {
+            debug!("drain minimum-budget acceptance failed: spawn {:?}", error);
+            let _ = close(marker.owner);
+            "drain minimum-budget spawn failed"
+        })?;
+        if let Err(error) = process::kill(started.control, 0x5D) {
+            debug!("drain minimum-budget acceptance failed: kill {:?}", error);
+            let _ = close(started.control);
+            return Err("drain minimum-budget kill failed");
+        }
+        if let Err(error) = wait_many(
+            &[WaitItem::new(
+                started.control,
+                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                0,
+            )],
+            WAIT_TIMEOUT_INFINITE,
+        ) {
+            debug!("drain minimum-budget acceptance failed: wait {:?}", error);
+            let _ = close(started.control);
+            return Err("drain minimum-budget wait failed");
+        }
+        let mut batches = 0usize;
+        let drained = loop {
+            batches += 1;
+            if batches > 16_384 {
+                break Err(SystemCallError::InternalError);
+            }
+            match process::drain(started.control, 1) {
+                Ok(result) if result.status == ProcessDrainStatus::Complete as u32 => break Ok(()),
+                Ok(_) => continue,
+                Err(error) => break Err(error),
+            }
+        };
+        debug!(
+            "drain minimum-budget acceptance {}: {} batches",
+            if drained.is_ok() { "passed" } else { "failed" },
+            batches
+        );
+        let _ = close(started.control);
+        drained.map_err(|_| "drain minimum-budget did not complete")
+    })();
+    let _ = close(marker.peer);
+    result
 }
 
 /// 验收线 2：封口与完成传播——空 child Job seal 后 CLOSED 电平可等待、
@@ -730,7 +820,7 @@ fn test_job_seal_completion(job: Handle) {
     let sealed = process::seal_job(child);
     let waited = wait_many(
         &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     );
     let snapshot = process::query_job(child);
     // 幂管：Dead 上重复 seal 成功且不改变状态。
@@ -933,7 +1023,7 @@ fn seal_before_start(job: Handle) {
     let _ = close(created.builder);
     let waited = wait_many(
         &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     );
     let snapshot = process::query_job(child);
     let passed = sealed.is_ok()
@@ -959,7 +1049,7 @@ fn seal_before_create(job: Handle) {
     let sealed = process::seal_job(child);
     let waited = wait_many(
         &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     );
     let member = process::create(child, SUPERVISOR_RIGHTS);
     let subjob = process::create_job(child, JOB_FULL_RIGHTS);
@@ -1275,7 +1365,7 @@ fn test_writable_level() {
                 1,
             ),
         ],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     )
     .expect("empty mailbox must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
@@ -1292,7 +1382,7 @@ fn test_writable_level() {
                 2,
             ),
         ],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     )
     .expect("mailbox below capacity must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
@@ -1337,7 +1427,7 @@ fn test_writable_wake(pm_mailbox: Handle) {
         &[
             WaitItem::new(done.owner, ObjectSignals::READABLE, 0),
         ],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     )
     .expect("wake notification wait failed");
     notification::take(done.owner, u64::MAX).expect("wake notification take failed");
@@ -1423,6 +1513,13 @@ fn stress_control_plane() {
 fn test_tunnel_lifecycle() {
     for _ in 0..TUNNEL_STRESS {
         let abandoned = tunnel_sys::create(LIFECYCLE_VA).expect("lifecycle tunnel create failed");
+        assert!(matches!(
+            wait_many(
+                &[WaitItem::new(abandoned.peer, ObjectSignals::CLOSED, 0)],
+                WAIT_TIMEOUT_INFINITE,
+            ),
+            Err(SystemCallError::RightsDenied)
+        ));
         close(abandoned.peer).expect("invitation close failed");
         let result = wait_many(
             &[
@@ -1432,7 +1529,7 @@ fn test_tunnel_lifecycle() {
                     0,
                 ),
             ],
-            WAIT_DEADLINE_INFINITE,
+            WAIT_TIMEOUT_INFINITE,
         )
         .expect("abandoned invitation wait failed");
         assert!(result.observed.intersects(ObjectSignals::PEER_CLOSED));

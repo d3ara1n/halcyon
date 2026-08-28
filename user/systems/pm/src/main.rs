@@ -27,7 +27,7 @@ use rinlib::{
         message::MAILBOX_CAPACITY,
         object::{Handle, ObjectSignals},
         proc::{JobMemberKind, JobState, ProcessExitReason, ProcessState},
-        wait::{WaitItem, WAIT_DEADLINE_INFINITE},
+        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     },
     sys_sleep,
 };
@@ -136,7 +136,7 @@ fn main() {
                 if woke {
                     notification::signal(spin, 1).expect("spurious wake signal failed");
                 }
-                let result = wait_many(&items, WAIT_DEADLINE_INFINITE).expect("writable wait failed");
+                let result = wait_many(&items, WAIT_TIMEOUT_INFINITE).expect("writable wait failed");
                 assert!(result.observed.intersects(ObjectSignals::WRITABLE));
                 woke = true;
             }
@@ -191,7 +191,7 @@ fn manage_delegated_domain(domain: Handle) {
                 ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
                 0,
             )],
-            WAIT_DEADLINE_INFINITE,
+            WAIT_TIMEOUT_INFINITE,
         );
         let drained = process::drain_to_completion(control);
         let snapshot = process::query(control);
@@ -210,7 +210,7 @@ fn manage_delegated_domain(domain: Handle) {
     let sealed = process::seal_job(domain);
     let waited = wait_many(
         &[WaitItem::new(domain, ObjectSignals::CLOSED, 0)],
-        WAIT_DEADLINE_INFINITE,
+        WAIT_TIMEOUT_INFINITE,
     );
     let snapshot = process::query_job(domain);
     let passed = sealed.is_ok()
