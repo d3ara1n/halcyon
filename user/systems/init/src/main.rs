@@ -33,9 +33,9 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
-            HandleGrant, JobMemberKind, JobState, ProcessExitReason, ProcessMapFlags,
-            ProcessState, ProcessStartDescriptor, ExecutionProfile, PROCESS_PAGE_SIZE,
-            PROCESS_USER_TOP,
+            HandleGrant, JobMemberKind, JobState, ProcessExitReason,
+            ProcessMapFlags, ProcessState, ProcessStartDescriptor, ExecutionProfile,
+            PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
         },
         wait::{WaitItem, WAIT_DEADLINE_INFINITE},
     },
@@ -44,6 +44,9 @@ use libprocess::{
     DERIVED_CONTROL_RIGHTS, SpawnRequest, enumerate_members, job_kill, spawn,
 };
 use librunnel::blocking;
+
+mod race;
+use race::race_matrix;
 
 /// 受监督服务：init 保留的 control 与 pid。
 struct Supervised {
@@ -173,7 +176,12 @@ fn launch_test_services(
     acceptance: Handle,
     names: &mut TopologyNames,
 ) -> Result<
-    (Handle, alloc::vec::Vec<Supervised>, Option<alloc::vec::Vec<u8>>),
+    (
+        Handle,
+        alloc::vec::Vec<Supervised>,
+        Option<alloc::vec::Vec<u8>>,
+        Option<alloc::vec::Vec<u8>>,
+    ),
     &'static str,
 > {
     let pm_mailbox = create(
@@ -192,10 +200,16 @@ fn launch_test_services(
     let control_rights = SUPERVISOR_RIGHTS;
     let mut supervised = alloc::vec::Vec::new();
     let mut pm_started = false;
-    // srv_target 映像留存：Job 管理面验收的 scratch 成员复用（小体积）。
+    // srv_target/srv_hammer 映像留存：竞态矩阵与验收线的靶/锤复用。
     let mut target_image: Option<alloc::vec::Vec<u8>> = None;
+    let mut hammer_image: Option<alloc::vec::Vec<u8>> = None;
     let result = tar::walk(env::startup_payload(), |entry| {
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
+            return;
+        }
+        if entry.name == "bin/srv_hammer" {
+            // 竞态锤不是常驻服务：只留存映像，由剧本按需 spawn。
+            hammer_image = Some(alloc::vec::Vec::from(entry.data));
             return;
         }
         let pm_grants = [
@@ -270,7 +284,7 @@ fn launch_test_services(
         // 已启动的服务交回 main 的整树收束（job_kill(services)）兜底。
         return Err("pm service launch failed");
     }
-    Ok((pm_mailbox.peer, supervised, target_image))
+    Ok((pm_mailbox.peer, supervised, target_image, hammer_image))
 }
 
 fn main() {
@@ -339,7 +353,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     names.register_job(pm_domain, "pm_domain");
     names.register_job(acceptance, "acceptance");
     names.register_process(env::pid() as u64, "init");
-    let (pm_mailbox, supervised, target_image) =
+    let (pm_mailbox, supervised, target_image, hammer_image) =
         launch_test_services(services, pm_domain, acceptance, &mut names)?;
 
     // 运行时拓扑快照（调试参考）：此刻服务在域内运行，验收自测尚未
@@ -441,6 +455,13 @@ fn run(services: Handle) -> Result<(), &'static str> {
     match target_image.as_deref() {
         Some(image) => test_job_management(acceptance, image),
         None => debug!("job management tests skipped: target image unavailable"),
+    }
+
+    // —— 生命周期多核竞态矩阵（step 9）：双锤同刻起跑打真跨核竞态，
+    // 断言各场景终态合法、无泄漏、枚举收敛 ——
+    match (target_image.as_deref(), hammer_image.as_deref()) {
+        (Some(target), Some(hammer)) => race_matrix(acceptance, target, hammer),
+        _ => debug!("race matrix skipped: images unavailable"),
     }
 
     // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进

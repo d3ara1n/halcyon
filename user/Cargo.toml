@@ -13,6 +13,7 @@ members = [
     "frameworks/libprocess",
     "systems/srv_target_src",
     "systems/srv_fp",
+    "systems/srv_hammer",
     "drivers/spi_sifive"
 ]
 resolver = "2"
