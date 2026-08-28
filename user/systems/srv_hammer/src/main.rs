@@ -82,6 +82,13 @@ fn hammer_mode() {
             return;
         }
         await_gun(gun);
+        // 时序变体：aux > 0 时醒后先延迟再打，把窗口让给对侧先行
+        // （线协议见 race::Cmd::aux）。延迟失败不判定——窗口密度本就是
+        // 尽力而为，断言全在 init。
+        if cmd.aux != 0 {
+            // SAFETY: 值参数；纯延迟，无副作用依赖。
+            let _ = unsafe { sys_sleep(cmd.aux) };
+        }
         let (report, tail) = execute(&cmd, &message.handles);
         let _ = send(report_box, MSG_REPORT, &race::encode_report(&report, &tail), &[]);
     }

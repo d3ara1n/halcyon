@@ -63,7 +63,8 @@ pub struct Cmd {
     pub entry: u64,
     /// START 的栈顶。
     pub sp: u64,
-    /// 预留。
+    /// 执行前延迟（毫秒）：锤等枪后先 sys_sleep 再执行，时序变体用
+    /// （对侧先行窗口）；0 = 醒后即打。
     pub aux: u64,
 }
 

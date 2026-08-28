@@ -142,6 +142,12 @@ fn race_cmd(action: u64, code: u64) -> Cmd {
     Cmd { action, code, entry: 0, sp: 0, aux: 0 }
 }
 
+/// 延迟变体指令：锤醒后先 sleep `delay_ms` 再执行，把窗口让给对侧
+/// 先行（时序变体用，见 race::Cmd::aux）。
+fn race_cmd_delayed(action: u64, code: u64, delay_ms: u64) -> Cmd {
+    Cmd { action, code, entry: 0, sp: 0, aux: delay_ms }
+}
+
 /// 竞态靶（srv_hammer TARGET 模式）：等枪后按 subrole 自灭或高频 park。
 /// 返回 (spawned, 靶枪 signaler)。
 fn spawn_race_target(
@@ -342,7 +348,8 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 }
 
 /// kill vs Exit：靶自杀与锤 kill 同刻起跑，终因 Exited/Killed 二者
-/// 恰一，code 与胜者匹配。
+/// 恰一，code 与胜者匹配。奇数轮锤延迟 1ms 再 kill：靶的 Exit 先
+/// 线性化，观察 Exited 胜出侧（kill 后到幂等）。
 fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
@@ -361,7 +368,11 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
-        let kill = race_cmd(race::ACTION_KILL, kill_code as u64);
+        let kill = if round % 2 == 1 {
+            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+        } else {
+            race_cmd(race::ACTION_KILL, kill_code as u64)
+        };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
         let (rep, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
@@ -395,7 +406,8 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 }
 
 /// kill vs fault：靶解引用空指针与锤 kill 同刻起跑，终因 Fault(code=
-/// LoadAccess)/Killed 二者恰一。
+/// LoadAccess)/Killed 二者恰一。奇数轮锤延迟 1ms 再 kill：靶的 fault
+/// 先线性化，观察 Fault 胜出侧（kill 后到幂等）。
 fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
@@ -412,7 +424,11 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
-        let kill = race_cmd(race::ACTION_KILL, kill_code as u64);
+        let kill = if round % 2 == 1 {
+            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+        } else {
+            race_cmd(race::ACTION_KILL, kill_code as u64)
+        };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
         let (rep, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
@@ -559,11 +575,12 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 }
 
 /// kill vs abandonment：锤 kill 与锤 close builder 同刻——终因冻结的
-/// 先到者胜（Killed 或 Abandoned），不出现混合。
+/// 先到者胜（Killed 或 Abandoned），不出现混合。奇数轮 close 延迟
+/// 1ms：kill 先冻结终因，观察 Killed 胜出侧（close 后到只协助收束）。
 fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
-    for round in 0..2u64 {
+    for round in 0..4u64 {
         let (created, _, _) = match build_wfi_building(job) {
             Ok(triple) => triple,
             Err(error) => {
@@ -572,6 +589,11 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
             }
         };
         let kill_code = 0x800 + round as i64;
+        let close_cmd = if round % 2 == 1 {
+            race_cmd_delayed(race::ACTION_CLOSE, 0, 10)
+        } else {
+            race_cmd(race::ACTION_CLOSE, 0)
+        };
         let close_moves = [HandleMove {
             handle: created.builder,
             rights: Rights::MANAGE,
@@ -580,7 +602,7 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
             handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
-        let sent = h.send_cmd(0, &race_cmd(race::ACTION_CLOSE, 0), &close_moves)
+        let sent = h.send_cmd(0, &close_cmd, &close_moves)
             && h.send_cmd(1, &race_cmd(race::ACTION_KILL, kill_code as u64), &kill_moves);
         h.fire(&[0, 1]);
         let (rep_close, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
