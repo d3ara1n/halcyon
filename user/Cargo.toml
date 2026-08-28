@@ -12,6 +12,7 @@ members = [
     "frameworks/librunnel",
     "frameworks/libprocess",
     "systems/srv_target_src",
+    "systems/srv_fp",
     "drivers/spi_sifive"
 ]
 resolver = "2"
