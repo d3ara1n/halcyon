@@ -58,7 +58,7 @@ init 独占解释 initfs，并按配置：
 - 将 ProcessControl、JobControl、设备资源与 namespace grants 交给相应服务；
 - 完成授权图发布后进入持续监督循环。
 
-init 位于其受管 services Job 之外，直接持有该 JobControl 及系统服务的 ProcessControls，负责服务的创建、退出处理、重启和递归收束。系统服务与其受托管理子域同属 services 域，整树可一次封口收束；委托只转移子域的域内管理 authority，init 对受托域保留直接收束权。pm 是 services Job 内可被 init 监督的系统服务，可以管理 init 显式委托的子域或向其他进程提供进程管理协议，但不承担根监督链角色。委托的语义在 capability 转移本身：启动时经 StartupBlock grants 交付与运行时经管理协议授予是同一转移的两个时机，不构成第二种委托机制。重启是监督政策的维度：受管服务收束后是否重新创建由配置决定，重启域（Open Job）为此保持可用；不重启政策下收束完成即终态记录。
+init 位于其受管 services Job 之外，直接持有该 JobControl 及系统服务的 ProcessControls，负责服务的创建、退出处理、重启和递归收束。系统服务与其受托管理子域同属 services 域，整树可一次封口收束；委托只转移子域的域内管理 authority，init 对受托域保留直接收束权。pm 是 services Job 内可被 init 监督的系统服务，可以管理 init 显式委托的子域或向其他进程提供进程管理协议，但不承担根监督链角色。委托的语义在 capability 转移本身：启动时在 Building 阶段经直接 grant 交付与运行时经管理协议授予是同一转移的两个时机，不构成第二种委托机制。重启是监督政策的维度：受管服务收束后是否重新创建由配置决定，重启域（Open Job）为此保持可用；不重启政策下收束完成即终态记录。
 
 init 完成授权图发布后进入持续监督循环；全部受管服务收束完毕后转入稳态等待自身管理端点，不以自我终止结束生命周期。此时若系统不存在任何工作源——无就绪线程、无期限、无设备——静默停机即正确终态：无人能再投递的等待不构成工作，持久监督者的存在不改变停机判定。设备接入后设备中断即工作源，静默停机自然失效，终态改由显式关机路径决定。
 
@@ -74,9 +74,10 @@ init 的退出、panic、fault 或显式 kill 在内核中仍按普通进程处�
 Job capability
   → ProcessCreate
   → Building process + affine ProcessBuilder + ProcessControl
-  → map anonymous target pages
-  → copy bounded bytes into mapped target pages
-  → ProcessStart(entry, stack, execution profile, grants, payload)
+  → ProcessMap / ProcessWrite 组装映像与启动信息
+  → ProcessGrant 安装初始 capabilities
+  → ProcessAttach 附入一个或多个线程现场
+  → ProcessStart(execution profile)
   → consume ProcessBuilder and publish Running process
 ```
 
@@ -85,7 +86,7 @@ launcher 负责 ELF program-header、段重叠、BSS、最终页权限、栈布�
 这套逻辑不是由每个有 spawn 权的服务各写一遍，而是分层为公共用户态能力：
 
 - **libelf**：解析 ELF、校验 program headers 与执行需求；kernel bootstrap 与用户态 launcher 共用同一纯逻辑实现；
-- **libprocess**：规划页、驱动 ProcessBuilder，并组装参数、namespace、grants 与 ProcessStart 的高层 spawn 接口；
+- **libprocess**：规划页、驱动 ProcessBuilder，组装参数、namespace、grants 与初始线程现场，并以 ProcessStart 完成高层 spawn；
 - **ld-erhino**：未来处理 `PT_INTERP`、重定位和共享库解析，运行在新进程内，通过显式 loader service/DirectoryGrant 取得库；init/pm 不亲自链接每个动态库。
 
 只有持 Job/Process 构造 capability 的进程能使用这些机制；链接库提供实现复用，不产生 authority。多数服务不持 spawn 权，需要新进程时调用 pm 协议。
@@ -106,7 +107,7 @@ Building → Running → Terminating → Dead
 - **ProcessControl**：ProcessCreate 即产生的稳定管理/观察 capability，贯穿 Building、Running、Terminating 与 Dead；管理、等待、复制和运输由 rights 收窄；
 - **JobControl**：创建、封口、分页枚举与按 ID 派生直接成员、故障收束的 authority，不是进程权限等级。
 
-ProcessStart 成功时只消费 builder，原子安装 GRANT entries、映射通用 StartupBlock、设置首线程上下文并发布进程；ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。失败保持 builder、control、调用方 Handles 与目标不可运行状态；同一 builder 不得同时作为 ProcessStart target 与 grant 项。
+Building 阶段的 Map/Write、Grant 与 Attach 各自是可回滚的组装动作；ProcessStart 只检查至少存在一个已附线程，冻结进程级执行绑定，消费 builder 并一次发布全部预育线程。ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。Start 前失败保持目标不可运行，并由组装者决定重试或放弃后完整收束；已成功 Grant 的 capabilities 已归目标所有，不因后续 Attach/Start 失败自动退回。
 
 内核只提供 JobSeal、直接成员的有界分页枚举、按 ID 派生 capability 和单进程控制原语；递归 JobKill 由 pm 在用户态组合。Open Job 变空后仍可用于服务重启，Sealed Job 才在全部成员和 child Jobs 收束后进入 Dead。多数进程不持 JobControl，只通过 pm 协议请求创建或管理。
 
@@ -114,7 +115,7 @@ Dead 表示进程的地址空间和 HandleTable 已经完成释放；exit status
 
 ## 内核短路径
 
-进程构造和收束 syscall 都必须有明确上界：单次映射页数、写入字节、启动 Handle 数、普通 payload 长度，以及单次关闭的 Handle 和回收的页表节点都有限；launcher 与 pm 以用户态循环完成大映像和大资源环境。内核不在一个 syscall 中遍历 archive、Job 子树、完整 HandleTable、完整地址空间、对象图或不受限路径策略。
+进程构造和收束 syscall 都必须有明确上界：单次映射页数、写入字节、grant 数、线程附入数，以及单次关闭的 Handle 和回收的页表节点都有限；launcher 与 pm 以用户态循环完成大映像和大资源环境。内核不在一个 syscall 中遍历 archive、Job 子树、完整 HandleTable、完整地址空间、对象图或不受限路径策略。
 
 ## 外部参照的边界
 

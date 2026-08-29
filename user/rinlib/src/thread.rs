@@ -1,4 +1,4 @@
-use erhino_shared::{mem::Address, proc::{Tid, Pid}};
+use erhino_shared::proc::{ThreadStartContext, Tid};
 
 use crate::call::sys_thread_spawn;
 
@@ -15,18 +15,16 @@ impl Thread {
         Self { handle }
     }
 
-    pub fn id(&self) -> Tid{
+    pub fn id(&self) -> Tid {
         self.handle
     }
 }
 
-fn thread_wrapper(tid: Tid, pid: Pid, parent: Pid) {
-    let _ = (tid, pid, parent);
-}
-
-pub fn spawn(func: fn()) -> Result<Thread, ThreadSpawnError> {
-    let _ = func;
-    match unsafe { sys_thread_spawn(thread_wrapper as *const () as Address) } {
+/// Running 进程的内部线程出生通道。栈与现场均由调用进程提供，
+/// 与 Building 期 ProcessAttach 共用 ThreadStartContext。
+pub fn spawn(context: &ThreadStartContext) -> Result<Thread, ThreadSpawnError> {
+    // SAFETY: context 在 syscall 期间保持有效；地址语义由内核按当前进程校验。
+    match unsafe { sys_thread_spawn(context) } {
         Ok(tid) => Ok(Thread::new(tid)),
         Err(_) => Err(ThreadSpawnError::KernelError),
     }

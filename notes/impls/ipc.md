@@ -8,7 +8,7 @@
 
 - `extract_moves` 要求 TRANSIT，供 Mailbox message；
 - 普通 direct grant 要求 GRANT；
-- ProcessStart direct grant 复用同一 entry/rights 模型，完整 pin 与提交事务见 [`startup.md`](startup.md)。
+- ProcessGrant direct grant 复用同一 entry/rights 模型，受保护 builder 与 transfer entries 的 pin/提交事务见 [`startup.md`](startup.md)。
 
 `task/handle.rs` 校验对象最大 rights，并在表锁外执行 close callback。Mailbox/Notification owner 可直接 GRANT，不可 TRANSIT；sender、signaler、send-once 与 Tunnel Invitation 可按 role TRANSIT/GRANT；Tunnel Endpoint 与本地 VM lease 绑定，不可运输。
 
@@ -66,7 +66,7 @@ ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一
 
 ## 验证入口
 
-- handle_table host：generation、reservation、badge、运输、Start 请求顺序与 rights 回滚；
+- handle_table host：generation、reservation、badge、运输、consume/transfer pin 与 rights 回滚；
 - wait_context/timer_queue host：安装窗口、唯一赢家、token generation/owner、堆删除与 cancel/expiry 竞争；
 - init acceptance：badge、send-once、满箱/WRITABLE、Notification、Invitation 非等待拒绝、Tunnel/Runnel、ProcessDrain `max_work=1`；
 - QEMU：debug/release、hetero/nofd、sifive_u 的竞态矩阵 10/10、服务监督、资源回收与 quiescent 均由 fail-closed 锚点脚本验证。

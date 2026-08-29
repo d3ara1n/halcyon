@@ -10,7 +10,7 @@ MMIO 映射、IRQ 控制与 DMA 授权必须各自有明确对象边界和撤权
 
 ## 驱动授权与恢复
 
-资源管理服务根据设备节点与驱动需求派生最小资源集合，并通过 ProcessStart 的直接 GRANT 启动驱动。高层客户端只取得驱动发布的协议 endpoint，不直接持 raw MMIO、IRQ 或 DMA authority。
+资源管理服务根据设备节点与驱动需求派生最小资源集合，在驱动仍处于 Building 时直接 grant 给其 HandleTable，再由 ProcessStart 发布已经组装完成的驱动进程。高层客户端只取得驱动发布的协议 endpoint，不直接持 raw MMIO、IRQ 或 DMA authority。
 
 驱动失效后的安全状态分层处理：内核资源对象撤销映射和后续访问；驱动或资源管理服务负责停止 DMA、屏蔽设备侧事件、复位硬件并判断能否重新授权。设备级 session 或 lease 是用户态资源服务协议，不预设为一个通用内核对象。
 

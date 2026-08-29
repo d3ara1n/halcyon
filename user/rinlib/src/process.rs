@@ -6,14 +6,14 @@ use crate::call::{
     sys_process_kill, sys_process_map, sys_process_query, sys_process_start,
     sys_process_write,
 };
+use crate::ipc::object::close;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
         HandleGrant, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
-        ProcessAttachDescriptor, ProcessCreateResult, ProcessDrainResult,
-        ProcessDrainStatus, ProcessMapFlags, ProcessSnapshot, Tid,
-        JOB_ENUMERATE_MAX, PROCESS_DRAIN_MAX,
+        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags,
+        ProcessSnapshot, ThreadStartContext, Tid, JOB_ENUMERATE_MAX, PROCESS_DRAIN_MAX,
     },
 };
 
@@ -22,6 +22,17 @@ pub fn create_job(parent: Handle, rights: Rights) -> Result<Handle, SystemCallEr
     // SAFETY: output 在 syscall 期间有效且可写。
     unsafe { sys_job_create(parent, rights, &mut output)? };
     Ok(output)
+}
+
+/// 放弃尚未 Start 的完整 Create 结果并推进至资源收束完成。清理步骤全部
+/// 尝试执行，返回最先发生的错误；调用者无需重复维护 close/drain 顺序。
+pub fn abandon_to_completion(created: ProcessCreateResult) -> Result<(), SystemCallError> {
+    let builder_result = close(created.builder);
+    let drain_result = drain_to_completion(created.control);
+    let control_result = close(created.control);
+    builder_result?;
+    drain_result?;
+    control_result
 }
 
 /// JobSeal：MANAGE；幂等封口——该 Job 及全部后代的创建/启动口永久
@@ -143,20 +154,24 @@ pub fn write(
 /// 组装资源）。栈与出生参数由组装者经 Map/Write 预先供给。
 pub fn attach(
     builder: Handle,
-    descriptor: &ProcessAttachDescriptor,
+    descriptor: &ThreadStartContext,
 ) -> Result<Tid, SystemCallError> {
     // SAFETY: descriptor 在 syscall 期间保持有效。
     unsafe { sys_process_attach(builder, descriptor) }
 }
 
 /// ProcessGrant：组装者把 grants 装入目标 Building process 的 HandleTable
-/// 并输出目标侧句柄值（写入出生块后经 Write 交付）。
+/// 并输出目标侧句柄值（写入出生块后经 Write 交付）。输出切片必须与
+/// grants 等长，安全封装在进入裸 syscall 前拒绝不一致容量。
 pub fn grant(
     builder: Handle,
     grants: &[HandleGrant],
     out_values: &mut [Handle],
 ) -> Result<(), SystemCallError> {
-    // SAFETY: grants/out_values 在 syscall 期间保持有效。
+    if grants.len() != out_values.len() {
+        return Err(SystemCallError::IllegalArgument);
+    }
+    // SAFETY: 两个切片在 syscall 期间保持有效，且输出容量等于内核写入数量。
     unsafe { sys_process_grant(builder, grants, out_values) }
 }
 
@@ -254,5 +269,22 @@ pub fn drain_to_completion(control: Handle) -> Result<u32, SystemCallError> {
         if result.status == ProcessDrainStatus::Complete as u32 {
             return Ok(total);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grant_rejects_output_length_mismatch_before_syscall() {
+        let grants = [HandleGrant {
+            handle: Handle::INVALID,
+            rights: Rights::NONE,
+        }];
+        assert_eq!(
+            grant(Handle::INVALID, &grants, &mut []),
+            Err(SystemCallError::IllegalArgument)
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 ## 进程执行环境
 
-进程持有 AddressSpace 与 HandleTable；用户半区布局、brk、出生块约定区、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。执行需求（ELF 判定的 IsaRequirement）是进程级属性，Start 提交点冻结于 `Process.requirement`，线程经进程间接持有。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ProcessAttach 的 arg1/arg2 传入）；用户 tp 当前置零。
+进程持有 AddressSpace 与 HandleTable；用户半区布局、brk、出生块约定区、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。Start 提交点把 ELF 判定的 `IsaRequirement` 与兼容 `SchedDomain` 合成一次性的非零 execution binding ID；需求与域从同一个 `AtomicUsize` 解码，未绑定、部分冻结与 Base64/零哨兵重合均不可表示。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ProcessAttach 的 arg1/arg2 传入）；用户 tp 当前置零。
 
 ## 调度：域—类—执行点三层组合
 
@@ -20,7 +20,7 @@
 
 - **执行点**：hart 的运行现场（当前线程、trap 锚），见 `internals.md`「tp 寄存器」。调度循环与 idle 循环是执行点的行为。
 - **调度域**：`SchedDomain` 持有优先级序的调度类数组与域内 `idle_mask`。线程经 `process.domain()` 只进入已绑定域的类队列，wake 只向该域 idle hart 发门铃，静默谓词遍历全部域。硬件能力、域划分、D64 eligibility 与绑定冻结由 [`execution-context.md`](execution-context.md) 唯一记录。
-- **调度类**：当前公平类以单锁 FIFO 保存 Ready 线程，并通过 `SchedClass` trait 实现 enqueue/pick/has_ready/reserve/commit/rollback；Ready 容量在目标容器提交前预留。
+- **调度类**：当前公平类以单锁 FIFO 保存 Ready 线程，并通过 `SchedClass` trait 实现 enqueue/pick/has_ready 与批量 reserve/commit/rollback；Start 在一次队列锁内预留完整线程批次，无法形成前缀预留。
 
 时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart TimerQueue 堆顶与量子截止的较近者设置 timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
@@ -34,7 +34,7 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。life
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Staging 是成员表的 Building 期形态（预育表）——条目携带线程强引用，ProcessAttach 锁内原子插入（闭包式：tid 分配 + 构造 + 插入同临界区），Start 提交点在 begin_running 同一临界区整体转 Ready 并交出强引用，终止路径经 take_first_staging 游标摘除（打破 Staging↔Thread.process 引用环，环只在 Building 期存在）；Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 保留为非身份值（对齐 pid/JobId 哨兵纪律）。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Staging 是成员表的 Building 期形态（预育表）——条目携带线程强引用，`Process::attach_thread` 统一完成现场校验，并经 `attach_member` 锁内原子分配 tid、构造和插入（ProcessAttach 与 bootstrap 只作授权/输入 adapter）。Start 提交点由 `begin_running` 在同一临界区整体转 Ready 并直接提取全部强引用；终止路径经 `take_first_staging` 游标摘除，打破 Staging↔Thread.process 引用环（环只在 Building 期存在）。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 保留为非身份值（对齐 pid/JobId 哨兵纪律）。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
@@ -51,11 +51,11 @@ ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable、affine
 ProcessBuilder 与从 Building 起即存在的 ProcessControl，并在事务提交点
 把 Building process 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/
 回滚不遗留成员）。内核没有全局进程表：单调 PID 分配器只分配身份，
-未 Dead core 的生命周期根是 Job 成员表。ProcessCreate 使用成员占位；组装序列为 ProcessMap/Write → ProcessGrant → ProcessAttach → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类逐条 reserve Ready。
+未 Dead core 的生命周期根是 Job 成员表。ProcessCreate 使用成员占位；组装序列为 ProcessMap/Write → ProcessGrant → ProcessAttach → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类原子预留完整 Ready 批次。
 每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
 释放，快照仍可应答）。
 
-ProcessStart 负责 `Building → Running` 首次发布（活体门：预育表非空；含预育原子提取），并与 Job seal/termination 在 lifecycle 提交点竞争；完整 pin、grant 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
+ProcessStart 负责 `Building → Running` 首次发布（活体门：预育表非空；含预育原子提取），并与 Job seal/termination 在 lifecycle 提交点竞争；成功提交一次冻结 execution binding，完整 capability/Ready 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
 
 ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
 （HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
@@ -189,8 +189,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 
 ### reserve/commit/rollback 协议
 
-Job 成员表/子表、HandleTable 槽位与调度类就绪队列（`SchedClass` trait 的 reserve/commit/rollback 契约，域路由按 eligibility 选定目标类）三处的 marker 事务
-遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
+Job 成员表/子表、HandleTable 槽位与调度类就绪队列（Start 使用批量 reserve/commit/rollback，域路由按 eligibility 选定目标类）三处的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
 凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
 不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；
 ④全部在容器锁内完成，无分配失败路径（attach_member 的插入为锁内

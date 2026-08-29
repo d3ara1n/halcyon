@@ -4,7 +4,7 @@ Notification 是按位 OR 合并、由消费者显式取走的独立对象。它
 
 ## 角色与待决位
 
-创建者获得唯一 owner Handle。owner 不可 duplicate 或 TRANSIT，可通过 ProcessStart 直接 GRANT；owner 关闭使对象进入 CLOSED。获授权的 signaler 可按 rights duplicate、TRANSIT 或 GRANT，并提交位掩码。
+创建者获得唯一 owner Handle。owner 不可 duplicate 或 TRANSIT，可在目标进程 Building 期直接 GRANT；owner 关闭使对象进入 CLOSED。获授权的 signaler 可按 rights duplicate、TRANSIT 或 GRANT，并提交位掩码。
 
 待决位按 OR 累积，重复提交同一位不会计数。存在任意待决位时对象的 READABLE 电平为真。
 

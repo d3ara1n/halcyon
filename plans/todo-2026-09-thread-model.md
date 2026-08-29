@@ -63,7 +63,7 @@ Building/Running 的本质即外部写通道的开/关。组装者（init/pm 经
 | `ThreadYield` | 内部 | 自入队尾，复用公平 FIFO |
 | `ProcessAttach(builder, entry, sp, arg1, arg2) → tid` | 外部，Building 专属 | 组装者附线程；无观察壳；arg1/arg2 与内部 Spawn 同形（首线程传出生块地址与长度） |
 | `ProcessGrant(builder, grants_ptr, count, out_values) → ()` | 外部，Building 专属 | 从组装者表摘 grants 装入目标表，句柄值写回 out_values（pin/commit 机制自原 Start 事务原样搬运）；组装者将值写入出生块后经 ProcessWrite 落盘。out_values 为第四参（写回目标），签名与实现一致 |
-| `ProcessStart(builder, profile)` | 外部 | 活体检查门（已附线程 ≥1，唯一前置检查）→ Building→Running（含预育原子提取）→ 域绑定与执行需求冻结（profile 为判定输入，进程级属性）→ 预育线程逐条入册。参数为平铺 (builder, profile)，无描述符 |
+| `ProcessStart(builder, profile)` | 外部 | 活体检查门（已附线程 ≥1，唯一前置检查）→ Building→Running（含预育原子提取）→ 一次冻结 execution binding（profile 为判定输入，进程级属性）→ 预育线程整体入册。参数为平铺 (builder, profile)，无描述符 |
 
 - **join**：`WaitMany(壳 Handle, DONE)`，不设 ThreadJoin syscall（0x23 保留号留空）；结果值读用户槽。**内存序契约**：离场线程在 ThreadExit 前的全部用户态存储对 joiner 可见——release/acquire 经 lifecycle 锁（RV AMO aq/rl）与 finish_offered 完成链传递。
 - **出生块**：纯用户约定数据（Header + 句柄值 + payload），内核机制（Handle 数值预留连续绑定、map_startup_block、map_bootstrap_block 的前缀协议）删除；init bootstrap 改走内核内嵌的同构 op 序列（payload 收编 owned backing 的特例保留在内嵌 Write 里）。
@@ -89,42 +89,36 @@ Thread↔壳，与 Process↔ProcessControl、Job↔JobControl 同构：壳由 H
 
 ### Start 拆解
 
-start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随成员表持有）；grants 移入 ProcessGrant；Start 收缩为「链锁内上行检查 seal + 活体门 + Building→Running（含预育原子提取）+ 域绑定 + 逐条入册」。原子的价值不损失：Start 仍是唯一 Building→Running 线性化点，回滚面反而变小（各 op 独立回滚）。
+start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随成员表持有）；grants 移入 ProcessGrant；Start 收缩为“链锁内上行检查 seal + 活体门 + Building→Running（含预育原子提取）+ execution binding + Ready 完整批次发布”。原子的价值不损失：Start 仍是唯一 Building→Running 线性化点，回滚面反而变小（各 op 独立回滚）。
 
 ## 实施批次
 
-### 批一实施状态（2026-09-11 提交检查点）
+### 批一及事务复审状态（2026-08-29）
 
 **已落地（内核与用户态双侧，全链路编译绿）**：
 
-- shared ABI：`ProcessAttach = 0x1d`、`ProcessGrant = 0x1e` 调用号；Start 收缩为平铺参数 `(builder, profile)`；`ProcessAttachDescriptor`（entry/sp/arg1/arg2）；`PROCESS_MAX_THREADS = 1024`；startup.rs 注释改为 BirthBlock 语义（出生块 = 用户约定数据）。
+- shared ABI：`ProcessAttach = 0x1d`、`ProcessGrant = 0x1e` 调用号；Start 收缩为平铺参数 `(builder, profile)`；`ThreadStartContext`（entry/sp/arg1/arg2，Attach/Spawn 共用）；`PROCESS_MAX_THREADS = 1024`、`PROCESS_MAX_GRANTS = 64`；startup.rs 注释改为 BirthBlock 语义（出生块 = 用户约定数据）。
 - lifecycle.rs：`Staging { thread: Arc<Thread> }` 携带强引用；`attach_member(闭包)` 原子插入（Closed/Limit/Oom 零副作用，tid 从 1 起）；`begin_running(expected, out)` 合并预育提取；`take_first_staging` 终止游标；`building()` 不再预留容量。
-- proc.rs：`Process.requirement`（进程级执行需求，Start 冻结）；`Thread::new_thread` 泛化构造；`map_startup_block`/`rollback_startup_block` 已删；`launch_bootstrap` 内嵌同构序列。
-- process.rs：`attach()`/`grant()`/`start()` 三 op 落地（grant 事务序：pin → 目标预留 → 交付 deliver_output → 双侧 commit，失败路径全部无损还原）；`run_termination_todo` 增加 Staging 游标与 REAPABLE 复判。
+- proc.rs：requirement/domain 合成一次冻结的 execution binding；`Process::attach_thread` 统一 ProcessAttach/bootstrap 线程出生；`map_startup_block`/`rollback_startup_block` 已删；`launch_bootstrap` 内嵌同构序列。
+- process.rs：`attach()`/`grant()`/`start()` 三 op 落地；BuildingLease 统一操作登记，grant 采用受保护 builder + grants transfer，Start 采用 Ready 原子批量预留，失败路径无损还原；`run_termination_todo` 增加 Staging 游标与 REAPABLE 复判。
 - job.rs：`start_commit_gate(process, expected, out)` 携带提取缓冲。
-- handle_table：pin 事务泛化 grant-only；新增测试。
+- handle_table：pin 事务拆为 consume/transfer 两类，明确 builder 保护与 grants 所有权；新增测试。
 - syscall.rs：Attach/Grant/Start 分发接线。
 - rinlib：`sys_process_attach/grant`、`start(builder, profile)` 新封装。
-- libprocess `spawn()` 新组装序列：Map/Write 不变 → Grant（空批跳过）→ 组装者自构造出生块（shared::startup 线格式）→ 写入映像顶之上页对齐约定区（`write_birth_block`，整页映射）→ Attach（arg1/arg2 = 块基/块长）→ Start。
-- 负载适配：init seal_before_start、race.rs build_wfi_building（组装者 attach，锤只拉 Start）、hammer start_target 新签名。rinlib 启动契约（env/rt 的 a0/a1 解析）零改动。
+- libprocess `spawn()` 组装序列：Map/Write → Grant（空批跳过）→ 组装者构造并写入出生块 → Attach → Start；失败由 `SpawnFailure` 明示 grants 的 Retained/Consumed 所有权与 cleanup_error，并统一 abandon/drain/close。
+- 负载适配：init seal_before_start、race.rs build_spin_building（组装者 attach，锤只拉 Start）、hammer start_target 新签名。rinlib 启动契约（env/rt 的 a0/a1 解析）零改动。
 
 **验证状态**：
 
 | 线 | 结果 |
 |---|---|
-| `just check`（内核） | ✅ 零错误（1 条环境性链接器警告：`riscv64-elf-ld` RWX LOAD segment） |
-| host 单测（shared 7/7、handle_table 18/18） | ✅ |
-| `just virt`（debug，全速 11s / 节流 50% 90s） | ✅ 锚点全命中，矩阵 10/10，静默停机 |
-| `just virt-release` | ✅ 同上 |
-| `just virt-hetero` / `just virt-nofd` | ✅ |
-| `just sifive_u` | ✅ 验收面全命中（原记「确定性挂死」已证伪，见下） |
+| `just check`（内核） | ✅ |
+| host 单测（shared 7、os 纯逻辑 105、rinlib 1、libprocess 5） | ✅ |
+| `just virt` / `just virt-release` | ✅ 锚点全命中，矩阵 10/10，静默停机 |
+| `just virt-hetero` / `just virt-nofd` | ✅ 两域绑定与 D64 无兼容域清理通过 |
+| `just sifive_u` | ✅ 验收面全命中，由终态锚点收割 |
 
-**原记「sifive_u 确定性挂死」已证伪**（batch1 review 报告 §B，55+ 轮零真挂死）
-
-- 当时观察（推进至 kill-vs-kill 后卡在 kill-vs-exit）来自**开发中间态代码**：唯一确凿的真挂死现场（`artifacts/.qemu-acceptance-50536.log`，03:53）时点在 `794a4c0` 提交前 36 分钟，不对应任何已提交版本；同窗口 04:25/04:27 又有 10/10 全绿日志，「确定性」不成立。
-- 已提交代码上的可观测失败均有着落：① **负载缺陷**——kill-vs-start 靶入口页写 wfi，U-mode 执行必然 IllegalInstruction（riscv-isa machine.adoc），靶上核首条指令即 Fault 与 kill 争终因；② **验收基础设施**——`run_qemu_acceptance_timed` 5s 硬超时且未经 throttle，完整验收需 ~15s（全速），必然砍在矩阵中段，形态与挂死无法区分。两者已修（入口指令改 `j .`；timed 线接 throttle + 终态锚点主动收割 + `ACCEPTANCE_TIMEOUT` 60s 兜底）。
-- 复现装备留档（批一报告 §B4）：hang-hunt 判据（日志停增 + 无终态 + QEMU 存活）+ `qemu -s` gdbstub + `riscv64-elf-gdb thread apply all bt`；gdbstub 会改变时序，复现概率可能下降。若再次复现：优先 GDB 多采样（条件自旋的静态 PC 需多样本），次选在 `send_ipi` 与 `idle()` wfi 醒来处加计数探针。
-- 实验污染警示：`artifacts/` 下有手动实验残留（sifive-manual.log 等，使用过陈旧 boot-package，证据无效）；调查一律走 `just` recipe 管道保证产物新鲜。
+**原记“sifive_u 确定性挂死”这一具体判断已证伪**：旧报告调查的稳定失败分别来自 U-mode `wfi` fault 与验收脚本固定超时，均已修复。后续另捕获到一次负载存活时提前 quiescent 的低频现场；它在 `sifive_u` 上可能表现为永不退出，但证据既不能证明与旧现场同源，也不能判定由批一引入。该问题独立由 [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md) 跟踪，不作为已收口事务复审的隐藏结论。
 
 ### 实施批次总览
 
@@ -132,7 +126,7 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 2. **批二：ThreadSpawn/Exit/Yield + join 壳**——spawn 事务（预育结构已在批一落地）、末线程冻结边、tid 从 1、cap、rinlib thread.rs 桩重写（wrapper 栈从 Extend 堆分配）。验证：等价回归 + 多线程功能负载。
 3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步**——见下两节。
 
-每批独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。
+每个实现或修复批次独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。
 
 ## 竞态矩阵新增场景
 
@@ -155,12 +149,13 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 
 ## 文档同步清单
 
-- `notes/ideas/task.md`：归属判据、无角色平等、线程=资源双通道表、生杀闭环公理；「主线程」措辞全清（→ 首线程）；
-- `notes/impls/task.md`：预育表（成员表 Building 期形态）、spawn 事务、join 壳、末线程冻结边、tid/cap；
-- `notes/impls/mm.md`：栈区布局改述为 libprocess 放置约定（内核常量仅存 bootstrap init）；
-- `notes/impls/startup.md`：出生块转用户约定，内核机制面收缩为「init 内嵌组装 + payload 收编」；出生块 `parent_pid` 语义定死为「组装者自身 pid（= 目标的创建者）」，与内核 ProcessQuery 快照同一真值；
-- `notes/ideas/call.md`：新调用语义与保留号处置；
-- COMPASS：收口时更新位置与自然序。
+批一的方向与实现文档已随事务复审同步：普通 StartupBlock 属用户态约定，ProcessGrant/Attach 是 Building 期独立组装动作，ProcessStart 只负责首次发布；init bootstrap 仅保留内核内嵌同构序列。批二/批三仍须同步：
+
+- `notes/ideas/task.md`：ThreadSpawn、ThreadExit、join 壳完成后的稳定方向契约；
+- `notes/impls/{task,execution-context}.md`：spawn 事务、末线程终局边、join 壳与实际上下文入口；
+- `notes/impls/mm.md`：用户态线程栈与结果槽的最终布局约定；
+- `notes/ideas/call.md`：ThreadExit/Yield/Spawn 调用语义与保留号处置；
+- `COMPASS.md`：阶段收口后的自然序。
 
 ## 完成标准
 

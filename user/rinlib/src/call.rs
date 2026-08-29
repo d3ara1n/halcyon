@@ -7,8 +7,8 @@ use erhino_shared::{
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
     proc::{
-        ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessAttachDescriptor,
-        ProcessCreateResult, ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, Tid,
+        ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
+        ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadStartContext, Tid,
     },
     wait::{WaitItem, WaitResult},
 };
@@ -273,12 +273,12 @@ pub unsafe fn sys_process_start(builder: Handle, profile: u32) -> SystemCallResu
 
 pub unsafe fn sys_process_attach(
     builder: Handle,
-    descriptor: &ProcessAttachDescriptor,
+    descriptor: &ThreadStartContext,
 ) -> SystemCallResult<Tid> {
     sys_call(
         SystemCall::ProcessAttach,
         builder.raw() as usize,
-        descriptor as *const ProcessAttachDescriptor as usize,
+        descriptor as *const ThreadStartContext as usize,
         0,
         0,
     )
@@ -300,8 +300,15 @@ pub unsafe fn sys_process_grant(
     .map(|_| ())
 }
 
-pub unsafe fn sys_thread_spawn(func_point: Address) -> SystemCallResult<Tid> {
-    sys_call(SystemCall::ThreadSpawn, func_point, 0, 0, 0).map(|t| t as Tid)
+pub unsafe fn sys_thread_spawn(context: &ThreadStartContext) -> SystemCallResult<Tid> {
+    sys_call(
+        SystemCall::ThreadSpawn,
+        context as *const ThreadStartContext as usize,
+        0,
+        0,
+        0,
+    )
+    .map(|tid| tid as Tid)
 }
 
 pub unsafe fn sys_tunnel_create(addr: usize, output: &mut HandlePair) -> SystemCallResult<()> {

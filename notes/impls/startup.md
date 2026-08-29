@@ -36,18 +36,18 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload
 - ProcessCreate：一次事务交付 affine ProcessBuilder 与稳定 ProcessControl；
 - ProcessMap/Write：Building process 的匿名零页映射与 backing 回填；
 - **ProcessGrant**：把 grants 从组装者表移入目标表，输出目标侧句柄值数组（组装者写入出生块）；
-- **ProcessAttach**：向 Building process 附入线程（`ProcessAttachDescriptor`：entry/sp/arg1/arg2），返回 tid；内核零资源分配（栈与出生块由组装者供给），无观察壳；
-- **ProcessStart**：活体检查门（已附线程 ≥1）→ `Building → Running` → 域绑定与执行需求冻结 → 预育线程整体入册；消费 builder。profile 为平铺参数。
+- **ProcessAttach**：向 Building process 附入线程（`ThreadStartContext`：entry/sp/arg1/arg2），返回 tid；内核不分配用户栈与出生块，无观察壳；该现场类型也供 Running 期 ThreadSpawn 使用；
+- **ProcessStart**：活体检查门（已附线程 ≥1）→ `Building → Running` → 一次冻结 execution binding → 预育线程整体入册；消费 builder。profile 为平铺参数。
 
 ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building abandonment（预育线程与已装句柄随收束消解）。ProcessMap 最终权限拒绝 W+X；ProcessWrite 不要求最终 PTE 可写。
 
 ### 三 op 事务
 
-**ProcessGrant**：拷入 grants → 调用者表 pin（原子验证 GRANT/rights 子集/去重，失败零副作用）→ 目标表 reserve 槽位 → 输出句柄值（copy_to_user，失败先 rollback 目标预留再 unpin 无损还原，终止由分发出口收束）→ 锁外提取 moved → 目标表 commit。单批上界 64；组装侧超限由 libprocess 建进程前显式报错（`SpawnError::TooManyGrants`），不静默截断——静默丢句柄会让调用方误以为全部装入。
+**ProcessGrant**：BuildingLease 登记准入 → 调用者表 `pin_transfer`，把 builder 作为受保护 authority、grants 作为待搬移集合统一验证（MANAGE/GRANT、rights 子集、去重、拒绝 builder 自授予）→ 目标表 reserve 槽位与 moved 缓冲预留 → 输出目标句柄值（copy_to_user，失败 rollback + unpin）→ `commit_pinned_transfer` 只提取 grants 并原样恢复 builder → 目标表 commit。成功即一次独立完成的所有权转移；后续组装失败不会把 handles 还给调用者，libprocess 以 `SpawnFailure.grants = Consumed` 明示。单批上界由 shared `PROCESS_MAX_GRANTS` 唯一定义；组装侧超限在建进程前报 `TooManyGrants`。rinlib 安全封装要求 grants/output 等长，裸 syscall 不暴露第二个长度。
 
-**ProcessAttach**：拷入 descriptor → 出生现场前置校验（entry 可执行、sp 可写且 16 对齐）→ `lifecycle::attach_member(闭包)`：lifecycle 锁内检查 Terminating/表长上限（`PROCESS_MAX_THREADS` 1024）、try_reserve 容量、闭包构造 Thread（tid 在锁内分配，从 1 起）、插入 `(tid, Staging{thread})`；失败零副作用（Closed/Limit/Oom）。Staging 条目携带线程强引用（预育表即成员表形态）；引用与 `Thread.process` 构成环，环只在 Building 期存在，终止游标 `take_first_staging` 打破。
+**ProcessAttach**：拷入 `ThreadStartContext` → BuildingLease 登记准入 → `Process::attach_thread` 完成出生现场校验（entry 可执行、sp 可写且 16 对齐）并调用 `lifecycle::attach_member(闭包)`：lifecycle 锁内检查 Terminating/表长上限（`PROCESS_MAX_THREADS` 1024）、try_reserve 容量、分配 tid、构造 Thread、插入 Staging；失败零副作用（Context/Closed/Limit/Oom）。bootstrap 也复用该内部出生路径。Staging 强引用与 `Thread.process` 构成的环仅存在于 Building 期，终止游标 `take_first_staging` 打破。
 
-**ProcessStart**：解析 profile → 按预育数 reserve Ready 容量（计数读点与判点间的并发 attach 由 begin_running 的 expected 计数拒绝，ObjectBusy 重试）→ 调用者表 pin builder → Job 链锁内上行检查 seal + `begin_running(expected, out_staged)`（活体门 + `Building → Running` + Staging→Ready + 强引用交出**原子完成**，消除 gate 后被终止游标插队摘除的窗口）→ 提交区：绑定域、冻结 requirement、消费 builder、逐条 commit_ready。失败路径全部无损（unpin/rollback ready），Start 可重试。
+**ProcessStart**：BuildingLease 登记准入 → 解析 profile/解析兼容域 → 按预育数预留提取缓冲 → `pin_consume` 独占 builder → 在一次 Ready 队列锁内预留完整批次 → Job 链锁内上行检查 seal + `begin_running(expected, out_staged)`（活体门、`Building → Running`、Staging→Ready 与强引用交出原子完成）→ 提交区一次冻结 execution binding、消费 builder、批量 commit Ready。并发 Attach 使 expected 失配时返回 ObjectBusy；所有提交前失败均 unpin/rollback，Start 可重试。BuildingLease 的 Drop 统一配平 Building 操作计数，成功由 `commit_running` 消费登记，不存在手工 enter/leave 分支遗漏。
 
 ## 唯一 init bootstrap（内核内嵌同构序列）
 
@@ -56,13 +56,13 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 1. 解析 initial ELF，创建 pid 1 的 AddressSpace（含 init 栈映射——内核供栈仅此一处 bootstrap 例外）与 root Job 成员 core；
 2. 创建 root JobControl 与 init ProcessControl，预留 Handle 槽并安装；
 3. 以真实句柄值构造出生块 prefix（用户态线格式），payload 以 BootPackage 保留帧映射为只读，映入即收编为 init 地址空间 owned backing；
-4. 冻结 requirement、绑定兼容域、`begin_running` 入册首线程并发布 Ready。
+4. 经 `Process::attach_thread` 附入首线程，冻结 execution binding，`begin_running` 入册并发布 Ready。
 
 initial ELF 与 prefix 完成后，package 前缀页回投帧池；payload backing 随 init 地址空间回收。内核没有 pid 特判的保留洞。
 
 ## 用户态公共 loader
 
-`os/elf` 是 bootstrap 与用户态共用的纯逻辑 parser。`user/frameworks/libprocess` 验证 entry、segment overlap、文件边界和页级 W^X，合并连续同权限页，分块 ProcessMap/ProcessWrite；组装序列为 Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区（返回块基址）→ Attach（arg1/arg2 = 块基/块长）→ Start。它不产生 authority，调用者必须显式持 JobControl。
+`os/elf` 是 bootstrap 与用户态共用的纯逻辑 parser。`user/frameworks/libprocess` 验证 entry、segment overlap、文件边界和页级 W^X，合并连续同权限页，分块 ProcessMap/ProcessWrite；组装序列为 Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生 authority，调用者必须显式持 JobControl。
 
 ## init/pm 当前政策
 
@@ -83,6 +83,6 @@ acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整�
 ## 验证
 
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
-- handle_table host：pin 顺序（builder/grant 双形态）、rights 回滚、reservation 与 TRANSIT/GRANT；
+- handle_table host：consume/transfer 两类 pin、builder 保护、自授予/重复拒绝、rights 回滚、reservation 与 TRANSIT/GRANT；
 - libprocess host：entry、segment overlap 与页级 W^X；
 - QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态和 quiescent 锚点，全线常绿。`sifive_u` 无 shutdown 设备，由验收脚本在终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。

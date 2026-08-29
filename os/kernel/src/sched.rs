@@ -24,21 +24,21 @@ use crate::{
 };
 
 /// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/impls/task.md）。
-/// reserve/commit/rollback 是就绪容量的事务预留契约（协议四要素，见
-/// notes/impls/task.md「reserve/commit/rollback 协议」）：占位对 pick/
-/// has_ready 不可见，token 全局单调防错认，commit/rollback 凭 token 定位。
-/// 容量必须预留在线程将要进入的目标容器（具体类队列）里，域层路由
-/// 不替代本契约。
+/// reserve/commit/rollback 是就绪容量的批量事务契约（协议四要素，见
+/// notes/impls/task.md「reserve/commit/rollback 协议」）：整批占位对 pick/
+/// has_ready 不可见，token 全局单调防错认，commit/rollback 凭 token 消费
+/// 完整批次。容量必须预留在线程将要进入的目标容器（具体类队列）里，域层
+/// 路由不替代本契约。
 pub trait SchedClass: Sync {
     fn enqueue(&self, t: Arc<Thread>);
     fn pick(&self) -> Option<Arc<Thread>>;
     fn has_ready(&self) -> bool;
-    /// 预留一个就绪容量占位；失败表示容量不可用。
-    fn reserve(&self) -> Result<u64, ()>;
-    /// 凭 token 提交线程（不可失败：容量已预留）。
-    fn commit(&self, token: u64, t: Arc<Thread>);
-    /// 凭 token 回滚预留（不可失败：token 只被本事务消费）。
-    fn rollback(&self, token: u64);
+    /// 原子预留 count 个就绪容量占位；失败不留下部分预留。
+    fn reserve_batch(&self, count: usize) -> Result<u64, ()>;
+    /// 凭 token 提交完整线程批次（不可失败：容量已预留）。
+    fn commit_batch(&self, token: u64, threads: Vec<Arc<Thread>>);
+    /// 凭 token 回滚完整预留批次（不可失败：token 只被本事务消费）。
+    fn rollback_batch(&self, token: u64, count: usize);
 }
 
 /// 公平类：FIFO 轮转 + 固定量子。
@@ -83,33 +83,45 @@ impl SchedClass for FairClass {
             .any(|entry| matches!(entry, ReadyEntry::Thread(_)))
     }
 
-    fn reserve(&self) -> Result<u64, ()> {
+    fn reserve_batch(&self, count: usize) -> Result<u64, ()> {
+        if count == 0 {
+            return Err(());
+        }
         let token = NEXT_READY_RESERVATION.fetch_add(1, Ordering::Relaxed);
         if token == 0 {
             return Err(());
         }
         let mut ready = self.ready.lock();
-        ready.try_reserve(1).map_err(|_| ())?;
-        ready.push_back(ReadyEntry::Reserved(token));
+        ready.try_reserve(count).map_err(|_| ())?;
+        ready.extend((0..count).map(|_| ReadyEntry::Reserved(token)));
         Ok(token)
     }
 
-    fn commit(&self, token: u64, t: Arc<Thread>) {
+    fn commit_batch(&self, token: u64, threads: Vec<Arc<Thread>>) {
+        let expected = threads.len();
+        let mut threads = threads.into_iter();
+        let mut committed = 0;
         let mut ready = self.ready.lock();
-        let entry = ready
-            .iter_mut()
-            .find(|entry| matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token))
-            .expect("ready reservation disappeared");
-        *entry = ReadyEntry::Thread(t);
+        for entry in ready.iter_mut() {
+            if matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token) {
+                let thread = threads.next().expect("ready reservation batch is too large");
+                *entry = ReadyEntry::Thread(thread);
+                committed += 1;
+            }
+        }
+        assert_eq!(committed, expected, "ready reservation batch disappeared");
+        assert!(threads.next().is_none(), "ready reservation batch is too small");
     }
 
-    fn rollback(&self, token: u64) {
+    fn rollback_batch(&self, token: u64, count: usize) {
+        let mut removed = 0;
         let mut ready = self.ready.lock();
-        let index = ready
-            .iter()
-            .position(|entry| matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token))
-            .expect("ready reservation disappeared");
-        ready.remove(index);
+        ready.retain(|entry| {
+            let matches = matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token);
+            removed += usize::from(matches);
+            !matches
+        });
+        assert_eq!(removed, count, "ready reservation batch disappeared");
     }
 }
 
@@ -119,6 +131,7 @@ impl SchedClass for FairClass {
 /// IPI 门铃的目标集（slot 位图，经 registry 展开为 raw hartid，绝不把
 /// 内部位图直接解释为 SBI hart mask）。
 pub struct SchedDomain {
+    index: usize,
     classes: [&'static dyn SchedClass; 1],
     idle_mask: AtomicU64,
 }
@@ -130,6 +143,10 @@ impl SchedDomain {
 
     fn has_ready(&self) -> bool {
         self.classes.iter().any(|c| c.has_ready())
+    }
+
+    pub(crate) fn index(&self) -> usize {
+        self.index
     }
 
     /// 就绪入队（Requeue/wake 路径的公平类；今天单类，classes[0] 即公平类）。
@@ -148,26 +165,30 @@ impl SchedDomain {
 
 static NEXT_READY_RESERVATION: AtomicU64 = AtomicU64::new(1);
 
-/// Start 事务的域预留凭据（域 + token；Copy，token 全局单调）。
-#[derive(Clone, Copy)]
-pub struct ReadyReservation {
+/// Start 事务的域批量预留凭据（域 + token + 数量）。
+pub struct ReadyBatch {
     domain: &'static SchedDomain,
     token: u64,
+    count: usize,
 }
 
-/// 在目标域的公平类预留就绪容量（Start 事务用；域由 eligibility 解析）。
-pub fn reserve_ready(domain: &'static SchedDomain) -> Result<ReadyReservation, ()> {
-    let token = domain.classes[0].reserve()?;
-    Ok(ReadyReservation { domain, token })
+/// 在目标域的公平类原子预留完整就绪批次。
+pub fn reserve_ready_batch(
+    domain: &'static SchedDomain,
+    count: usize,
+) -> Result<ReadyBatch, ()> {
+    let token = domain.classes[0].reserve_batch(count)?;
+    Ok(ReadyBatch { domain, token, count })
 }
 
-pub fn commit_ready(reservation: ReadyReservation, thread: Arc<Thread>) {
-    reservation.domain.classes[0].commit(reservation.token, thread);
-    reservation.domain.wake_one();
+pub fn commit_ready_batch(batch: ReadyBatch, threads: Vec<Arc<Thread>>) {
+    assert_eq!(batch.count, threads.len(), "ready batch/thread count mismatch");
+    batch.domain.classes[0].commit_batch(batch.token, threads);
+    batch.domain.wake_one();
 }
 
-pub fn rollback_ready(reservation: ReadyReservation) {
-    reservation.domain.classes[0].rollback(reservation.token);
+pub fn rollback_ready_batch(batch: ReadyBatch) {
+    batch.domain.classes[0].rollback_batch(batch.token, batch.count);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +231,7 @@ pub fn build_domains() {
     for index in 0..plan.domain_count() {
         let fair: &'static FairClass = Box::leak(Box::new(FairClass::new()));
         domains[index] = Some(Box::leak(Box::new(SchedDomain {
+            index,
             classes: [fair],
             idle_mask: AtomicU64::new(0),
         })));
@@ -261,6 +283,14 @@ pub fn resolve_domain(requirement: elf::IsaRequirement) -> Option<&'static Sched
         .plan
         .resolve(requirement)
         .and_then(|index| table.domains[index])
+}
+
+pub(crate) fn domain_by_index(index: usize) -> &'static SchedDomain {
+    domains()
+        .domains
+        .get(index)
+        .and_then(|domain| *domain)
+        .expect("process execution binding names an unknown scheduler domain")
 }
 
 // ---------------------------------------------------------------------------

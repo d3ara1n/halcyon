@@ -14,8 +14,8 @@ IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信
 
 内核负责对象引用、rights、badge 保存、Handle 运输、消息事务、映射生命周期、状态发布与等待完成；它不解释 kind、badge 业务含义、RPC、路径或共享页。
 
-`TRANSIT` 允许 Handle 暂存于消息，`GRANT` 允许 ProcessStart 直接跨表安装。unique owner 只走直接 GRANT；sender、signaler 与 invitation 可按授权经消息委托；Endpoint 与 VM 绑定而不移动。
+`TRANSIT` 允许 Handle 暂存于消息，`GRANT` 允许 Building 期的直接跨表安装。unique owner 只走直接 GRANT；sender、signaler 与 invitation 可按授权经消息委托；Endpoint 与 VM 绑定而不移动。
 
 协议使用 badged sender 表达不可伪造的服务端授权上下文，`sender_pid` 只作 provenance。回复必须取得显式 send-once 或 sender capability，不能由 PID 或 badge 数值推导。
 
-启动根图由 ProcessStart 在进程 runnable 前通过通用 StartupBlock 和直接 GRANT 建立。Mailbox owner 只是可选启动资源，不占固定寄存器或固定 Handle 数值。
+启动根图由 launcher 在目标 runnable 前通过 ProcessGrant 与用户态 StartupBlock 建立，ProcessStart 只发布已经组装完成的线程。Mailbox owner 只是可选启动资源，不占固定寄存器或固定 Handle 数值。

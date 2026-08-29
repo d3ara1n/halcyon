@@ -18,9 +18,8 @@
 同样先排除**验证基础设施自身**：超时砍断、负载自身缺陷（如在 U-mode
 执行特权指令）会伪造出与挂死逐字同形的现象（无 panic、无终态、日志
 断在中段）。先看 recipe/脚本的收束条件与负载的终因允许集，再担心内核
-（案例：`plans/review-2026-08-29-thread-model-batch1.md` §A4/§B）。
+（案例：`plans/archived/review-2026-08-29-thread-model-batch1.md` §A4/§B）。
 
-### 1. 确定性复现优先
 ### 1. 确定性复现优先
 
 可复现是压倒一切的前提。QEMU `-icount shift=0` 固定客户机指令时序，

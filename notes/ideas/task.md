@@ -32,7 +32,7 @@ Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保�
 Building -> Running -> Terminating -> Dead
 ```
 
-Building 阶段完成 ELF/地址空间、StartupBlock 与 GRANT 安装；ProcessStart 是唯一首次发布 runnable 的提交点，也是执行需求对兼容调度域绑定的冻结点。Terminating 阶段禁止新线程和新等待，撤销 Ready、取消 Waiting，并等待各 hart 上的 Running 线程离场。随后管理者以有界操作先收束 HandleTable，再收束地址空间；只有全部资源完成收束，进程才进入 Dead。ProcessControl 的 CLOSED 只在该完成点发布并对外表示 Dead，因而等待 CLOSED 是资源收束完成屏障，而不只是终止请求已受理。
+Building 阶段经独立操作完成 ELF/地址空间、用户态启动信息、capability 安装与线程附入；ProcessStart 是唯一首次发布 runnable 的提交点，也是执行需求对兼容调度域绑定的冻结点。Terminating 阶段禁止新线程和新等待，撤销 Ready、取消 Waiting，并等待各 hart 上的 Running 线程离场。随后管理者以有界操作先收束 HandleTable，再收束地址空间；只有全部资源完成收束，进程才进入 Dead。ProcessControl 的 CLOSED 只在该完成点发布并对外表示 Dead，因而等待 CLOSED 是资源收束完成屏障，而不只是终止请求已受理。
 
 Exit、fault、ProcessKill 与 Building abandonment 在各自适用的 Building 或 Running 状态竞争进入 Terminating 的唯一线性化点；用户态 JobKill 最终也只对成员执行同一个 ProcessKill 原语。首个完成转换者冻结终因与退出码，后续事件只能协助收束，不得覆盖已经可观察的终态事实。Terminating 已可通过固定宽快照观察稳定的 state、reason 与完整 i64 code，但这不表示资源已经回收；非终止状态以显式 reason 表示 code 无语义，不借用退出码哨兵或保留编码。
 
@@ -66,7 +66,7 @@ ProcessKill 是持 MANAGE authority 对 Building 或 Running process 发出的�
 
 ## 权利派生
 
-创建子进程不隐式继承父进程权限。launcher 通过 ProcessStart 明确选择 opaque payload 与 GRANT entries；每项目标 rights 只能缩小。`parent_pid` 仅记录创建关系，与 capability 派生无关。
+创建子进程不隐式继承父进程权限。launcher 在 Building 期通过 ProcessGrant 明确选择 capability 与目标 rights，每项目标 rights 只能缩小；Grant 一旦成功就是独立完成的所有权转移，不因后续 Attach 或 Start 失败而回到组装者。opaque payload 同样由组装者在 Start 前写入目标地址空间，Start 只发布已组装完成的资源环境。`parent_pid` 仅记录创建关系，与 capability 派生无关。
 
 ## 多线程终止边界
 

@@ -32,7 +32,7 @@ role 不能由 rights 伪造；badge 不改变对象身份或生命周期。dupl
 - `MANAGE`：执行对象定义的管理操作；
 - `MAP`：建立对象允许的映射；
 - `TRANSIT`：允许 entry 暂存于有缓冲消息，随后由接收方安装；
-- `GRANT`：允许 ProcessStart 等事务把 entry 直接安装到另一 HandleTable。
+- `GRANT`：允许 Building 期的 ProcessGrant 等事务把 entry 直接安装到另一 HandleTable。
 
 `TRANSIT` 与 `GRANT` 分离，因为两条运输的存储拓扑不同：消息会把 capability 暂存在内核对象图中，直接 grant 不进入对象容器。操作同时要求对象类型、role、对象状态和 rights 全部合法。
 
@@ -69,7 +69,7 @@ Tunnel Endpoint 与进程 VM lease 绑定，既不能 TRANSIT，也不能 GRANT�
 
 ### 直接 grant
 
-ProcessStart 等事务从授权方表中原子摘除持 `GRANT` 的 entry，直接安装到尚未 runnable 的目标表。它不经过对象队列，适合 affine owner、启动内存与设备资源。目标 rights 仍只能收窄。
+ProcessGrant 从组装者表中原子摘除持 `GRANT` 的 entry，直接安装到尚未 runnable 的目标表。它不经过对象队列，适合 affine owner、启动内存与设备资源。目标 rights 仍只能收窄；一次 grant 成功后所有权即归目标，不与后续线程附入或首次发布组成跨调用回滚事务。
 
 两种运输都属于 capability move，但不能以一项 rights 冒充另一种存储拓扑。
 
@@ -83,7 +83,7 @@ PID 是内核分配的 provenance 与诊断身份，可用于审计、创建关�
 
 ## StartupBlock
 
-进程启动由内核构造一个只读的通用 StartupBlock：
+普通进程的 StartupBlock 是 launcher 与目标进程之间的用户态约定数据：
 
 ```text
 Header(pid, parent_pid, geometry)
@@ -91,9 +91,9 @@ actual child-local Handles[]
 opaque Payload[]
 ```
 
-内核理解 outer 几何和实际 Handle 数组，但不解释 Payload，也不为 Handle 赋予业务 tag。launcher 与 child 可把 Payload 约定为 LauncherParcel、InitParcel、initfs 或其他格式，并用数组索引关联 Handle 语义。
+launcher 先以 ProcessGrant 取得目标表中的实际 Handle 数值，再构造 outer 与 payload、写入 Building 地址空间，并把完整块的地址和长度作为首个附入线程的出生参数。内核不解释普通 StartupBlock 的几何、Handle 数组或 Payload，也不为 Handle 赋予业务 tag；入口 `a0/a1` 只由用户态约定界定该块。
 
-launch 在首次 runnable 前完成 Handle 预留、outer 构造、只读映射与原子安装；失败全部回滚。入口 `a0/a1` 只界定完整 StartupBlock，不依赖固定 Handle 数值、固定对象槽位或专用 mailbox 寄存器。
+init bootstrap 是唯一内核内嵌组装特例：内核为 initial process 构造同形 outer，并把 BootPackage opaque payload 收编进 init 地址空间。该特例不形成普通进程可调用的映射或装载入口。
 
 ## 边界
 

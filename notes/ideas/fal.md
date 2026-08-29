@@ -45,7 +45,7 @@ provider 把 FAL rights ceiling 绑定在 GrantState 中。持有者不能自行
 
 动态服务可以作为目录中的原子 service record 发布，record 同时包含 instance、protocol/version 与 endpoint capability。客户端读取 endpoint 属性即取得经 provider 鉴权和收窄的 badged sender。
 
-boot-critical 依赖仍由 StartupBlock 直接 GRANT；首个目录 provider 由 init 的显式启动拓扑建立。服务死亡由 endpoint `CLOSED` 表达，目录随后撤销旧 record；客户端是否重新发现和重试由业务协议决定。
+boot-critical 依赖仍在目标 Building 期直接 grant，并由用户态 StartupBlock 描述；首个目录 provider 由 init 的显式启动拓扑建立。服务死亡由 endpoint `CLOSED` 表达，目录随后撤销旧 record；客户端是否重新发现和重试由业务协议决定。
 
 ## Watch
 

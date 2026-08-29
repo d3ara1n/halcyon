@@ -69,6 +69,8 @@ pub struct ProcessCreateResult {
 
 /// 单进程并发线程数上界（成员表长度；tid 单调不复用，生灭循环不耗尽）。
 pub const PROCESS_MAX_THREADS: usize = 1024;
+/// 单次 ProcessGrant 的结构上界；约束内核短路径与用户态启动块容量。
+pub const PROCESS_MAX_GRANTS: usize = 64;
 
 /// ProcessGrant 的 grant 项；目标 rights 只能收窄。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,21 +80,22 @@ pub struct HandleGrant {
     pub rights: Rights,
 }
 
-/// ProcessAttach 固定宽输入。所有地址都是目标进程用户 VA；entry 必须
-/// 位于可执行页，sp 已映射且 16 字节对齐（内核做 translate 前置校验，
-/// 运行期 fault 走用户 fault 杀进程）。
+/// 线程出生现场，由 ProcessAttach（Building 外部通道）与 ThreadSpawn
+/// （Running 内部通道）共用。所有地址都是目标进程用户 VA；entry 必须位于
+/// 可执行页，sp 已映射且 16 字节对齐（内核做 translate 前置校验，运行期
+/// fault 走用户 fault 杀进程）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
-pub struct ProcessAttachDescriptor {
+pub struct ThreadStartContext {
     pub entry: u64,
     pub stack_pointer: u64,
-    /// 出生参数 a0/a1（首线程的出生块基址与长度由组装者约定传入）。
+    /// 出生参数 a0/a1；首线程通常承载用户态约定的出生信息。
     pub arg1: u64,
     pub arg2: u64,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<ProcessAttachDescriptor>() == 32);
+    assert!(core::mem::size_of::<ThreadStartContext>() == 32);
 };
 
 /// ProcessControl 固定宽状态快照。
@@ -243,7 +246,7 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessMapFlags>() == 4);
     assert!(core::mem::size_of::<ProcessCreateResult>() == 32);
     assert!(core::mem::size_of::<HandleGrant>() == 16);
-    assert!(core::mem::size_of::<ProcessAttachDescriptor>() == 32);
+    assert!(core::mem::size_of::<ThreadStartContext>() == 32);
     assert!(core::mem::size_of::<ProcessSnapshot>() == 40);
     assert!(core::mem::size_of::<ProcessDrainResult>() == 16);
     assert!(core::mem::size_of::<ProcessState>() == 4);

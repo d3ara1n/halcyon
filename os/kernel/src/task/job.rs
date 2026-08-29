@@ -32,7 +32,7 @@ use core::any::Any;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
-    proc::{JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid, Tid, JOB_ENUMERATE_MAX},
+    proc::{JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid, JOB_ENUMERATE_MAX},
 };
 
 use super::{
@@ -553,7 +553,7 @@ impl Job {
     pub(crate) fn start_commit_gate(
         process: &Arc<Process>,
         expected: usize,
-        out: &mut Vec<(Tid, Arc<crate::task::Thread>)>,
+        out: &mut Vec<Arc<crate::task::Thread>>,
     ) -> Result<(), SystemCallError> {
         let job = process.job();
         let chain = collect_chain(&job)?;

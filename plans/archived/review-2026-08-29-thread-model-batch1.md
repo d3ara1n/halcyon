@@ -1,8 +1,10 @@
 # 批一代码 Review 与 sifive_u 挂死调查报告
 
-> 对象：`794a4c0`（线程资源模型批一）+ `275e4f1`（文档入档）。按 [`REVIEW.md`](REVIEW.md) 代码 Review 三轴执行；sifive_u 挂死按调查任务并行推进。reviewer 子代理不可用，全部审查由主会话执行，explorer 仅提供唤醒链地图。
+> 对象：`794a4c0`（线程资源模型批一）+ `275e4f1`（文档入档）。按 [`REVIEW.md`](../REVIEW.md) 代码 Review 三轴执行；sifive_u 挂死按调查任务并行推进。reviewer 子代理不可用，全部审查由主会话执行，explorer 仅提供唤醒链地图。
 >
 > 状态：**已收口**——A1–A5 全部修复并验证（末尾「修复记录」节）；§B 挂死根因无法定性，按 §B4 挂起处置，装备留档。
+>
+> **后续结论**：本报告只记录首轮审查。对 `c1b2ac2..51f4184` 的事务复审随后发现 Ready 前缀预留、Building 操作配平、capability 所有权与 execution binding 等缺口；最终结论见 [`review-2026-08-29-thread-model-transaction-convergence.md`](review-2026-08-29-thread-model-transaction-convergence.md)。本报告“内核侧未发现正确性缺陷”的表述不得脱离该后续报告引用。
 
 ## 总评
 
@@ -113,7 +115,6 @@
 2. **修 A2/A3**（libprocess 两处，一行级改动）；
 3. 文档修订：A5 三处 + review 计划 B 节更新；
 4. 挂死：按 §B4 挂起处置，装备留档。
-4. 挂死：按 §B4 挂起处置，装备留档。
 
 ## 修复记录（收口）
 
@@ -138,4 +139,4 @@ A1–A5 已全部实施并验证，见下。
 
 - diff 全量逐文件审读（17 文件 +929/-501）；重点轴（事务、锁序、引用环、配平、原子性）逐项对照 review 计划核过；
 - 验证执行：内核 check（0 error，1 环境性 linker warning）、virt 4/5 核、sifive_u 多档位共 55+ 轮、`just sifive_u` 3 轮；
-- 未覆盖：release 档复验（时间预算）、host 单测复跑（批一已记录 7/7、18/18，本次构建通过佐证编译面）、GDB 现场采集（挂死未复现，无从采集）。
+- 初始审查未覆盖的 release 与 host 测试已在修复收口阶段补齐；挂死未复现，因此没有可采集的 GDB 现场。

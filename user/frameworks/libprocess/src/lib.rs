@@ -12,9 +12,9 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, JobMemberKind, ProcessAttachDescriptor,
-        ProcessMapFlags, PROCESS_MAIN_STACK_SIZE, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
-        JOB_ENUMERATE_MAX,
+        ExecutionProfile, HandleGrant, JobMemberKind, ProcessMapFlags, ThreadStartContext,
+        JOB_ENUMERATE_MAX, PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE,
+        PROCESS_USER_TOP,
     },
     wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
 };
@@ -28,7 +28,7 @@ pub enum SpawnError {
     Elf(elf::ElfError),
     Requirement(elf::IsaReqError),
     InvalidImage,
-    /// grants 数量超出内核单次 Grant 上界（MAX_START_GRANTS），不截断、
+    /// grants 数量超出 shared ABI 上界，不截断、不创建目标。
     /// 直接拒绝——静默丢句柄会让调用方误以为全部装入。
     TooManyGrants,
     System(SystemCallError),
@@ -40,11 +40,39 @@ impl From<SystemCallError> for SpawnError {
     }
 }
 
+/// spawn 返回失败时，输入 grants 在调用者表中的最终所有权。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantOutcome {
+    /// ProcessGrant 未提交，输入 handles 仍由调用者持有。
+    Retained,
+    /// ProcessGrant 已提交；目标随后收束，输入 handles 已被消费。
+    Consumed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnFailure {
+    pub error: SpawnError,
+    pub grants: GrantOutcome,
+    /// None 表示无需清理或 abandon/drain/close 已全部完成。
+    pub cleanup_error: Option<SystemCallError>,
+}
+
+impl SpawnFailure {
+    fn retained(error: SpawnError) -> Self {
+        Self {
+            error,
+            grants: GrantOutcome::Retained,
+            cleanup_error: None,
+        }
+    }
+}
+
 pub struct SpawnRequest<'a> {
     pub job: Handle,
     pub image: &'a [u8],
     pub payload: &'a [u8],
     pub grants: &'a [HandleGrant],
+    /// 必须含 MANAGE，保证任意组装失败都能完成目标资源收束。
     pub control_rights: Rights,
 }
 
@@ -55,19 +83,29 @@ pub struct Spawned {
 }
 
 /// 解析静态 ET_EXEC，构造地址空间并首次发布进程。
-pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
-    let image = elf::parse(request.image).map_err(SpawnError::Elf)?;
-    let requirement = elf::isa_requirement(request.image).map_err(SpawnError::Requirement)?;
-    let (plan, image_top) = page_plan(&image, request.image.len())?;
+pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
+    if !request.control_rights.contains(Rights::MANAGE) {
+        return Err(SpawnFailure::retained(SpawnError::System(
+            SystemCallError::RightsDenied,
+        )));
+    }
+    let image = elf::parse(request.image)
+        .map_err(|error| SpawnFailure::retained(SpawnError::Elf(error)))?;
+    let requirement = elf::isa_requirement(request.image)
+        .map_err(|error| SpawnFailure::retained(SpawnError::Requirement(error)))?;
+    let (plan, image_top) =
+        page_plan(&image, request.image.len()).map_err(SpawnFailure::retained)?;
     // 上界先筛：超限在建进程前拒绝，无需回滚任何已建资源。
-    if request.grants.len() > MAX_START_GRANTS {
-        return Err(SpawnError::TooManyGrants);
+    if request.grants.len() > PROCESS_MAX_GRANTS {
+        return Err(SpawnFailure::retained(SpawnError::TooManyGrants));
     }
 
-    let created = process::create(request.job, request.control_rights)?;
+    let created = process::create(request.job, request.control_rights)
+        .map_err(|error| SpawnFailure::retained(SpawnError::System(error)))?;
     let builder = created.builder;
 
-    let result = (|| {
+    let mut grants_consumed = false;
+    let result: Result<Spawned, SpawnError> = (|| {
         map_plan(builder, &plan)?;
         write_segments(builder, &image, request.image)?;
         map_stack(builder)?;
@@ -80,21 +118,14 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
         // （shared::startup 线格式）→ Write 写入约定区 → Attach 首线程
         // （arg1/arg2 = 块基/块长）→ Start 入册。
         let grant_len = request.grants.len();
-        let mut granted = [Handle::INVALID; MAX_START_GRANTS];
+        let mut granted = [Handle::INVALID; PROCESS_MAX_GRANTS];
         if grant_len > 0 {
-            process::grant(
-                builder,
-                request.grants,
-                &mut granted[..grant_len],
-            )?;
+            process::grant(builder, request.grants, &mut granted[..grant_len])?;
+            grants_consumed = true;
         }
-        let block = build_birth_block(
-            created.pid,
-            &granted[..grant_len],
-            request.payload,
-        )?;
+        let block = build_birth_block(created.pid, &granted[..grant_len], request.payload)?;
         let block_va = write_birth_block(builder, &block, image_top)?;
-        let descriptor = ProcessAttachDescriptor {
+        let descriptor = ThreadStartContext {
             entry: image.entry,
             stack_pointer: PROCESS_USER_TOP as u64,
             arg1: block_va as u64,
@@ -102,17 +133,26 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
         };
         process::attach(builder, &descriptor)?;
         process::start(builder, profile as u32)?;
-        Ok(Spawned { pid: created.pid, control: created.control })
+        Ok(Spawned {
+            pid: created.pid,
+            control: created.control,
+        })
     })();
 
-    if result.is_err() {
-        // Start/map/write 失败保持 builder；关闭它触发 Building abandonment
-        // → REAPABLE，随后持 control 把收束推进到 Complete 再关闭。
-        let _ = close(builder);
-        let _ = process::drain_to_completion(created.control);
-        let _ = close(created.control);
-    }
-    result
+    let cleanup_error = if result.is_err() {
+        process::abandon_to_completion(created).err()
+    } else {
+        None
+    };
+    result.map_err(|error| SpawnFailure {
+        error,
+        grants: if grants_consumed {
+            GrantOutcome::Consumed
+        } else {
+            GrantOutcome::Retained
+        },
+        cleanup_error,
+    })
 }
 
 /// 派生监督所需的成员/子域 control rights：kill+drain 需 MANAGE，等
@@ -313,10 +353,6 @@ fn write_segments(
     Ok(())
 }
 
-/// 单次 Grant 的句柄数上界（与内核 MAX_START_GRANTS 对齐）。超出即
-/// `SpawnError::TooManyGrants`；需更多句柄由调用方分批（v1 组装面
-/// 以单批为约）。
-const MAX_START_GRANTS: usize = 64;
 
 /// 组装者侧出生块构造（shared::startup 线格式：Header + 句柄数组 +
 /// payload）。内核不参与构造——出生块是组装者与接收进程的用户约定，
@@ -437,6 +473,24 @@ mod tests {
             ],
         };
         assert_eq!(page_plan(&image, 0x800), Err(SpawnError::InvalidImage));
+    }
+
+    #[test]
+    fn spawn_requires_cleanup_authority_before_parsing_or_syscalls() {
+        assert_eq!(
+            spawn(SpawnRequest {
+                job: Handle::INVALID,
+                image: &[],
+                payload: &[],
+                grants: &[],
+                control_rights: Rights::READ,
+            }),
+            Err(SpawnFailure {
+                error: SpawnError::System(SystemCallError::RightsDenied),
+                grants: GrantOutcome::Retained,
+                cleanup_error: None,
+            })
+        );
     }
 
     #[test]

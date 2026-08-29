@@ -98,7 +98,7 @@ pub enum SystemCall {
     ThreadExit = 0x20,
     /// Be nice
     ThreadYield = 0x21,
-    /// Create a thread for the process
+    /// 向当前 Running process 附入 ThreadStartContext 描述的线程。
     ThreadSpawn = 0x22,
     /// Wait another owned thread to exit
     ThreadJoin = 0x23,

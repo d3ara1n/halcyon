@@ -221,7 +221,7 @@ impl Lifecycle {
     pub(crate) fn begin_running(
         &self,
         expected: usize,
-        out: &mut Vec<(Tid, Arc<super::Thread>)>,
+        out: &mut Vec<Arc<super::Thread>>,
     ) -> Result<(), BeginFault> {
         let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
@@ -239,10 +239,7 @@ impl Lifecycle {
         for entry in inner.members.iter_mut() {
             let state = core::mem::replace(&mut entry.state, ThreadState::Ready);
             match state {
-                ThreadState::Staging { thread } => {
-                    let tid = entry.tid;
-                    out.push((tid, thread));
-                }
+                ThreadState::Staging { thread } => out.push(thread),
                 _ => unreachable!("Building member must be Staging before start commit"),
             }
         }

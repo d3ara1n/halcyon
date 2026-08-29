@@ -8,7 +8,7 @@ librpc 实现 RpcPrefix、txid 分配、ReplyPort、send-once 回复授权、同
 
 ## 服务框架（libsrv）
 
-libsrv 从 rinlib 取得 StartupBlock Handle 数组与 opaque payload，并按用户态 LauncherParcel 解释 args、服务 owner、namespace 和依赖。服务 owner 在 ProcessStart 前已直接 GRANT；libsrv 不靠尚不存在的邮箱接收“启动资源消息”。
+libsrv 从 rinlib 取得 StartupBlock Handle 数组与 opaque payload，并按用户态 LauncherParcel 解释 args、服务 owner、namespace 和依赖。服务 owner 在 ProcessStart 前已经由 ProcessGrant 安装；libsrv 不靠尚不存在的邮箱接收“启动资源消息”。
 
 若服务协议需要 runnable 后的 activate/drain/reload 控制，应定义独立版本化 control message，不与 launch 混称 STARTUP。
 

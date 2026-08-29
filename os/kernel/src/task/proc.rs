@@ -1,12 +1,12 @@
 //! 进程与线程：资源容器 / 执行容器（见 notes/impls/task.md）。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use alloc::{sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
-    proc::{Pid, ProcessMapFlags, ProcessState, Tid},
+    proc::{Pid, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
 use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
 
@@ -38,6 +38,14 @@ pub enum SpaceError {
     BadSegment,
     /// 映射冲突（重复装载同一区间）。
     Conflict,
+}
+
+#[derive(Debug)]
+pub(crate) enum ThreadAttachError {
+    Context(SpaceError),
+    Closed,
+    Limit,
+    Oom,
 }
 
 impl From<MapError> for SpaceError {
@@ -945,14 +953,9 @@ pub struct Process {
     pub(crate) drain_gate: crate::sync::Spinlock<()>,
     /// HandleTable 收束游标与待关闭项（均由 drain_gate 串行）。
     drain_state: crate::sync::Spinlock<DrainState>,
-    /// 兼容调度域绑定（ProcessStart 提交点冻结，见 notes/impls/task.md；
-    /// Building 期未绑定，线程经进程间接持有域归属）。
-    domain: core::sync::atomic::AtomicPtr<crate::sched::SchedDomain>,
-    /// 执行需求（ELF 判定；进程级属性，Start 提交点冻结）。存
-    /// IsaRequirement 判别值；冻结前恒 Base64（无线程可运行，不被读取）。
-    /// Relaxed 读取足够：首次 dispatch 必经 commit_ready 的类队列锁，
-    /// 写入点先于入队，经锁链可见。
-    requirement: core::sync::atomic::AtomicUsize,
+    /// ProcessStart 提交点一次性冻结的执行绑定：非零域编号与执行需求；
+    /// 0 唯一表示尚未绑定，避免 Base64 与哨兵重合。
+    execution: AtomicUsize,
 }
 
 impl Drop for Process {
@@ -1002,40 +1005,73 @@ impl Process {
                     pending_close: None,
                 },
             ),
-            domain: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            requirement: core::sync::atomic::AtomicUsize::new(0),
+            execution: AtomicUsize::new(0),
         })
     }
 
-    /// 冻结域绑定（Start 提交点/bootstrap launch；不可重复）。
-    pub(crate) fn bind_domain(&self, domain: &'static crate::sched::SchedDomain) {
-        let previous = self
-            .domain
-            .swap(domain as *const _ as *mut _, Ordering::Release);
-        assert!(previous.is_null(), "domain bound twice");
+    /// 显式附入一条 Building 线程。syscall 与 bootstrap 共用此出生路径；
+    /// 调用者负责持有 Building 操作登记，Start 只发布这里已存在的线程。
+    pub(crate) fn attach_thread(
+        self: &Arc<Self>,
+        context: ThreadStartContext,
+    ) -> Result<Tid, ThreadAttachError> {
+        self.space
+            .lock()
+            .validate_initial_context(context.entry as usize, context.stack_pointer as usize)
+            .map_err(ThreadAttachError::Context)?;
+        self.lifecycle
+            .attach_member(|tid| {
+                Arc::try_new(Thread::new_thread(tid, self, context))
+                    .map_err(|_| super::lifecycle::AttachFault::Oom)
+            })
+            .map_err(|fault| match fault {
+                super::lifecycle::AttachFault::Closed => ThreadAttachError::Closed,
+                super::lifecycle::AttachFault::Limit => ThreadAttachError::Limit,
+                super::lifecycle::AttachFault::Oom => ThreadAttachError::Oom,
+            })
     }
 
-    /// 冻结执行需求（Start 提交点/bootstrap launch；不可重复）。
-    pub(crate) fn freeze_requirement(&self, requirement: elf::IsaRequirement) {
-        let previous = self
-            .requirement
-            .swap(requirement as usize, Ordering::Relaxed);
-        assert_eq!(previous, 0, "requirement frozen twice");
+    /// 冻结进程级执行绑定（需求 + 兼容域），不可重复。
+    pub(crate) fn bind_execution(
+        &self,
+        requirement: elf::IsaRequirement,
+        domain: &'static crate::sched::SchedDomain,
+    ) {
+        const REQUIREMENT_BIT: usize = 1;
+        let requirement_bit = match requirement {
+            elf::IsaRequirement::Base64 => 0,
+            elf::IsaRequirement::D64 => REQUIREMENT_BIT,
+        };
+        let encoded = ((domain.index() + 1) << 1) | requirement_bit;
+        self.execution
+            .compare_exchange(0, encoded, Ordering::Release, Ordering::Relaxed)
+            .expect("execution binding frozen twice");
     }
 
-    /// 执行需求（trap FP 档位判定；冻结前恒 Base64——无线程可运行）。
+    fn execution(&self) -> usize {
+        let execution = self.execution.load(Ordering::Acquire);
+        assert_ne!(
+            execution, 0,
+            "process execution must be bound before dispatch"
+        );
+        execution
+    }
+
+    /// 执行需求（trap FP 档位判定）。
     pub fn requirement(&self) -> elf::IsaRequirement {
-        match self.requirement.load(Ordering::Relaxed) {
-            1 => elf::IsaRequirement::D64,
-            _ => elf::IsaRequirement::Base64,
+        if self.execution() & 1 == 0 {
+            elf::IsaRequirement::Base64
+        } else {
+            elf::IsaRequirement::D64
         }
     }
 
-    /// 域归属（enqueue/pick 路径；未绑定即调用是接线错误）。
+    /// 域归属（enqueue/pick 路径）。
     pub fn domain(&self) -> &'static crate::sched::SchedDomain {
-        // SAFETY: 绑定后终身有效；Start 提交与后续 enqueue 经同步可见。
-        unsafe { self.domain.load(Ordering::Acquire).as_ref() }
-            .expect("process domain not bound (must be past start commit)")
+        let index = (self.execution() >> 1)
+            .checked_sub(1)
+            .expect("execution binding lost its scheduler domain");
+        crate::sched::domain_by_index(index)
     }
 
     pub(crate) fn set_control(&self, control: alloc::sync::Weak<super::process::ProcessControl>) {
@@ -1169,16 +1205,13 @@ impl Thread {
     pub(super) fn new_thread(
         tid: Tid,
         process: &Arc<Process>,
-        entry: usize,
-        stack_pointer: usize,
-        arg1: usize,
-        arg2: usize,
+        context: ThreadStartContext,
     ) -> Self {
         let mut ctx = UserContext::zeroed();
-        ctx.sepc = entry as u64;
-        ctx.x[2] = stack_pointer as u64;
-        ctx.x[10] = arg1 as u64; // a0
-        ctx.x[11] = arg2 as u64; // a1
+        ctx.sepc = context.entry;
+        ctx.x[2] = context.stack_pointer;
+        ctx.x[10] = context.arg1; // a0
+        ctx.x[11] = context.arg2; // a1
         Self {
             tid,
             process: process.clone(),
@@ -1203,11 +1236,12 @@ impl Thread {
     }
 }
 
-/// launch 前的进程骨架：ELF 已装载、执行需求已冻结、栈已映射、
-/// 尚未入表 runnable。
+/// launch 前的进程骨架：ELF 已装载、执行需求已判定、栈已映射、
+/// 尚未附线程或入表 runnable。
 pub struct SpawnedProcess {
     process: Arc<Process>,
     entry: usize,
+    requirement: elf::IsaRequirement,
 }
 
 pub fn spawn_from_elf(
@@ -1230,10 +1264,10 @@ pub fn spawn_from_elf(
         space.load_elf(&image.segments, file)?;
         space.map_stack()?;
     }
-    process.freeze_requirement(requirement);
     Ok(SpawnedProcess {
         process,
         entry: image.entry as usize,
+        requirement,
     })
 }
 
@@ -1250,7 +1284,11 @@ pub fn launch_bootstrap(
     payload: &[u8],
     handles: Vec<super::handle::ProcessHandleEntry>,
 ) -> Result<Arc<Thread>, SpaceError> {
-    let SpawnedProcess { process, entry } = spawned;
+    let SpawnedProcess {
+        process,
+        entry,
+        requirement,
+    } = spawned;
 
     // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
     // 显式自杀/查询可用；无结构特例）。
@@ -1338,13 +1376,19 @@ pub fn launch_bootstrap(
         .expect("launch reservation count matches entries");
 
     // 内嵌 ProcessAttach：出生现场 = 出生块地址与长度（rinlib 启动契约）。
-    let _tid = process
-        .lifecycle
-        .attach_member(|tid| {
-            Arc::try_new(Thread::new_thread(tid, &process, entry, USER_TOP, block_va, block_len))
-                .map_err(|_| super::lifecycle::AttachFault::Oom)
-        })
-        .map_err(|_| SpaceError::NoFrame)?;
+    match process.attach_thread(ThreadStartContext {
+        entry: entry as u64,
+        stack_pointer: USER_TOP as u64,
+        arg1: block_va as u64,
+        arg2: block_len as u64,
+    }) {
+        Ok(_) => {}
+        Err(ThreadAttachError::Context(error)) => return Err(error),
+        Err(ThreadAttachError::Oom) => return Err(SpaceError::NoFrame),
+        Err(ThreadAttachError::Closed | ThreadAttachError::Limit) => {
+            unreachable!("bootstrap attach must target an empty Building process")
+        }
+    }
     // 内嵌 ProcessStart（boot 路径失败不可恢复，直接提交不留 marker）：
     // 成员表插入即启动提交；eligibility 无解属 boot fatal（域表在初始
     // 任务装载前已由 bring_up_runtime 构造）。
@@ -1361,9 +1405,8 @@ pub fn launch_bootstrap(
     // 预育线程）与预育提取在同一 gate 临界区内完成（普通 Start 的
     // begin_running(expected, staged) 同构——boot 路径无并发，直接
     // expect）。
-    let requirement = process.requirement();
-    let domain = crate::sched::resolve_domain(requirement)
-        .expect("initial process has no compatible hart");
+    let domain =
+        crate::sched::resolve_domain(requirement).expect("initial process has no compatible hart");
     let mut staged = Vec::new();
     staged
         .try_reserve_exact(1)
@@ -1372,7 +1415,7 @@ pub fn launch_bootstrap(
         .lifecycle
         .begin_running(1, &mut staged)
         .expect("bootstrap process cannot be terminating");
-    process.bind_domain(domain);
-    let (_, thread) = staged.pop().expect("bootstrap staging thread missing");
+    process.bind_execution(requirement, domain);
+    let thread = staged.pop().expect("bootstrap staging thread missing");
     Ok(thread)
 }

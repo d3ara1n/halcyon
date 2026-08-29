@@ -17,13 +17,12 @@ use rinlib::ipc::object::{close, duplicate};
 use rinlib::ipc::wait::wait_many;
 use rinlib::preclude::*;
 use rinlib::process;
-use rinlib::shared::proc::ProcessAttachDescriptor;
 use rinlib::shared::call::SystemCallError;
 use rinlib::shared::message::HandleMove;
 use rinlib::shared::object::{Handle, ObjectSignals, Rights};
 use rinlib::shared::proc::{
     HandleGrant, JobMemberKind, JobState, ProcessCreateResult, ProcessExitReason,
-    ProcessMapFlags, ProcessState, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
+    ProcessMapFlags, ProcessState, ThreadStartContext, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
 };
 use rinlib::shared::wait::{WaitItem, WAIT_TIMEOUT_INFINITE};
 
@@ -207,7 +206,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
         )?;
         process::attach(
             created.builder,
-            &ProcessAttachDescriptor {
+            &ThreadStartContext {
                 entry: 0x1000,
                 stack_pointer: PROCESS_USER_TOP as u64,
                 arg1: 0,
@@ -218,8 +217,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
     match built {
         Ok(_) => Ok(created),
         Err(error) => {
-            let _ = close(created.builder);
-            let _ = close(created.control);
+            process::abandon_to_completion(created)?;
             Err(error)
         }
     }

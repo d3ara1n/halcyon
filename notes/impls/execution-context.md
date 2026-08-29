@@ -14,7 +14,7 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 `os/kernel/src/board.rs` 逐 hart 读取现代 `riscv,isa-base`、`riscv,isa-extensions` 与 `mmu-type`。内核准入基线为 RV64IMAC、Zicsr、Zifencei、Zicntr 和系统选定页表模式；S 态 time 与 SBI TIME 共用 DT timebase。
 
-`os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结。hart→域映射在 `by_slot`；ProcessStart 解析并校验 descriptor execution profile，选择最弱兼容域并在 lifecycle 提交点绑定 Process。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问绑定域的调度类。
+`os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessStart 解析平铺的 execution profile，选择最弱兼容域，并在 lifecycle 提交后以单个 `AtomicUsize` 一次冻结 requirement 与域 index；零值只表示未绑定，不会与 Base64 混淆。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
 
 ## ABI 档位与 UserContext
 
