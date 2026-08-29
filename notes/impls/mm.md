@@ -1,6 +1,6 @@
 # 内存管理
 
-方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分四层：帧池、可 host 测试的 Sv39 页表、内核地址空间与启动协议、用户地址空间；本篇是内存实现事实的唯一拥有者。
+方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分五层：帧库存、用户地址空间纯逻辑规划器、可 host 测试的 Sv39 页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
 
 ## 帧库存
 
@@ -88,6 +88,18 @@ pub trait FrameMemory {
 ### 测试集（host）
 
 切段算法数值用例：未对齐跨表大区间（`vpn=65, count=8192`）、跨子表批量 unmap、整表/大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、split OOM 保持原映射、clear_slots 剥离不递归。
+
+## 用户地址空间纯逻辑规划器（os/memory_space crate）
+
+`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 且不依赖其它 crate 的内部规划模块。它只拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、物理帧、用户指针、hart 或内核对象。当前内核 `AddressSpace` 尚未接入该模块；真实 extent、页表 reservation、Remote Call 与 WaitContext 将由后续 adapter 组合。
+
+`MemorySpace` 在构造时一次性预留区域与在途事务的硬容量。有序 ledger 中每个 fragment 持唯一 `RegionKey`，同一次 Map 的 guard 与 mapping 共享 `AllocationKey`；fragment 另持 `AddressSpace`/lease owner、匿名 backing identity 或 `ObjectId + offset` view，以及当前/最大权限。`Anywhere` 在 ledger 与在途事务之间选 first-fit 完整空洞；`FixedEmpty` 不覆盖旧区域。Unmap 严格要求请求区间连续覆盖且 owner 一致，完整 reservation、usable-only、guard-only 与 mapping 中段都按精确交集切割；Protect 同样消费旧 key，只有 owner、种类、AllocationKey、连续 backing 与权限全部兼容的相邻 fragment 才合并。fault lookup 只返回 free、guard 或 eager mapping。
+
+变更由不可复制的类型状态表达：`ValidatedChange → PreparedChange → CommittedChange → PublishedChange → SynchronizedChange → RetiredChange`。Validate 可以分配规划元数据但不改 ledger；Reserve 复检 region snapshot、真实范围冲突、UserWriteLease pin 与 WritePermit multiset，并预留 Commit 所需的 fragment、retire permit 和事务容量。rollback 只存在于 Commit 前并归还全部 permit。Commit 是不可失败的 ledger 线性化点，不再分配；其后的 Publish、Synchronize、Retire 与 Complete 也不返回可恢复错误，错配 token 视为内核所有权不变量破坏。planner 只输出 install/remove/protect translation intent 和带 backing slice 的 retiring fragment；真实 PTE 与 backing 动作尚未接入。
+
+`UserWriteLease` 把非页对齐结果区间投影为固定上限的 writable backing segments，并以 RegionKey pin 到 Commit 或 rollback；与结果范围或变更 footprint 相交的其它在途事务返回 Busy。MemoryObject 状态独立实现 `Mutable → Sealing → Executable`：writable replacement 必须携带不可复制 `WritePermit`，permit 从 Reserve 覆盖到 retiring fragment 完成 Synchronize 后交给 Retire；最后一个 permit 退出计数时完成 seal，即使原 waiter 已消散也不回退状态。
+
+host debug/release 共 17 项测试，覆盖区间溢出与对齐、容量和 backing 边界、Anywhere/FixedEmpty、双 guard、四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同 allocation 合并与跨 allocation 拒绝、owner/权限上限、object offset、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、类型化阶段、seal/permit retire，以及 2000 步确定性 shadow model 的逐页覆盖与 fragment 不重叠。`cargo clippy -p memory_space --all-targets -- -D warnings` 与 `just check` 通过。
 
 ## 内核地址空间与启动协议
 

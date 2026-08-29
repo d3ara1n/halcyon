@@ -1,6 +1,6 @@
 # 用户内存映射机制完整化
 
-- 状态：实施中；帧库存树与 affine 帧发布已完成，待实施切片 3
+- 状态：实施中；切片 1–3 已完成，待实施切片 4（页表资源预留与所有权）
 - 方向真值：[`notes/ideas/mm.md`](../notes/ideas/mm.md)
 - 自然序：本计划收口后重审 ThreadSpawn 用户态资源契约，再实施线程批二/批三
 
@@ -8,7 +8,7 @@
 
 当前 Running 进程只有字节粒度 sbrk 语义的 `Extend`；`ProcessMap` 只服务 Building 组装。`AddressSpace.frames` 平坦持有全部 owned backing，`external_mappings` 只登记 Tunnel 借入 VA，页表、backing、区域和 lease 没有统一的可切割所有权真值。
 
-结构性有界帧库存和 affine 发布 seam 已完成：库存不再接触帧内容，内核在 POOL 锁外清零后才发布不可复制、可消费式切分的 `FrameTracker`。当前下一缺口是把这些 owned extents、区域几何、结果 lease、WritePermit 与事务状态收进可 host 验证的统一规划模块。
+结构性有界帧库存、affine 帧发布 seam 与纯逻辑 `MemorySpace` planner 已完成。当前下一缺口是让页表先预留并清零全部中间表帧，使 planner 的 translation intent 在 Commit 后能够无分配、不可失败地 Publish。
 
 现有 `page_table::map` 在落 PTE 期间临时申请中间表帧，无法保证 AddressSpace publish 段不再失败。Tunnel Endpoint close 又会撤销 object-owned mapping；同一地址空间多 hart 运行后，本地 `sfence.vma` 不能构成关闭完成边界。区域账本、页表资源预留、Handle close、Remote Call 与 ProcessDrain 必须作为同一所有权重构闭合，不能各自长出回滚规则。
 
@@ -115,6 +115,8 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 ### 3. MemorySpace 纯逻辑规划
 
+- 状态：已完成（2026-09）
+
 建立 host 可测的内部规划模块；它是 AddressSpace 的内部 seam，不是第二套公开地址空间。
 
 **Entry gate**：切片 2 的 FrameTracker seam 与数量守恒测试已完成；`notes/ideas/mm.md` 中 AllocationKey/RegionKey、精确 guard 切割、Commit/UserWriteLease 边界和 `Mutable → Sealing → Executable`/WritePermit 状态机保持无待决语义。未满足时不得为 ledger key、事务阶段、结果 pin 或 ObjectView permit 编码。
@@ -132,7 +134,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 - 规划结果描述 PTE install/remove/protect、OwnedExtents split/retire、ObjectView 偏移和所需资源上界，不执行硬件动作；
 - fault lookup 只区分 free hole、guard、eager mapping，不建立未实现 pager 状态。
 
-验证：表驱动、状态机和模型测试覆盖几何溢出、冲突、容量、四类 guard/reservation 精确切割、AllocationKey 保持与 RegionKey 消费、同组合法合并与跨组拒绝、UserWriteLease vs Unmap/Protect、object offset、lease 拒绝、权限上限、事务 Busy、Commit 前发起者消散和每个失败点零业务副作用；另覆盖 seal vs 新 writable Map/Protect、最后一个 permit 在 ack 前不得退出计数、seal 发起者消散及 Executable 不可回退。
+验证：host debug/release 共 17 项测试，覆盖区间溢出与对齐、区域/事务/lease 容量、backing 边界、Anywhere/FixedEmpty、双 guard 与四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同组合并与跨组拒绝、owner/权限上限、object offset、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、类型化阶段，以及 seal/permit 直到 Synchronize 后 Retire 才退出计数。2000 步确定性 shadow model 持续对照逐页覆盖并检查 fragment 不重叠；host clippy `-D warnings` 与 `just check` 通过。当前实现是未接入内核 AddressSpace 的纯逻辑 seam，页表 reservation、Remote Call 和真实 backing/PTE 组合仍属于后续切片。
 
 ### 4. 页表资源预留与所有权
 

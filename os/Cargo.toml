@@ -11,5 +11,6 @@ members = [
     "timer_queue",
     "stack_layout",
     "sched_domain",
+    "memory_space",
 ]
 resolver = "2"
