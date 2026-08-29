@@ -213,16 +213,13 @@ pub fn clear_ssip() {
     unsafe { asm!("csrc sip, {mask}", mask = in(reg) 2, options(nomem)) };
 }
 
-/// SRST 复位类型。
+/// SRST 平台协议值。只在内核映射层使用，不跨越 eRhino ABI。
 pub const RESET_SHUTDOWN: u32 = 0;
-/// SRST 复位类型（保留完整面；冷/热重启随重启需求启用）。
-#[allow(dead_code)]
 pub const RESET_COLD_REBOOT: u32 = 1;
-#[allow(dead_code)]
-pub const RESET_WARM_REBOOT: u32 = 2;
+pub const RESET_REASON_NONE: u32 = 0;
+pub const RESET_REASON_SYSTEM_FAILURE: u32 = 1;
 
-/// SRST：系统停机/重启（QEMU virt/sifive_u 的 OpenSBI 均支持，
-/// 开机日志 `SysReset: yes` 即本扩展）。
+/// SRST：系统停机/重启。成功按规范不返回，任何返回交由请求层映射。
 pub fn system_reset(reset_type: u32, reset_reason: u32) -> SbiResult {
     sbi_call(
         SbiExtension::SystemReset,
@@ -231,13 +228,4 @@ pub fn system_reset(reset_type: u32, reset_reason: u32) -> SbiResult {
         reset_reason as usize,
         0,
     )
-}
-
-/// 停机。SRST 成功后不返回；平台没有关机后端时记录具体错误并永久停放。
-pub fn shutdown() -> ! {
-    match system_reset(RESET_SHUTDOWN, 0) {
-        Ok(value) => warn!(SBI, "SRST returned unexpectedly after success: {}", value),
-        Err(err) => warn!(SBI, "SRST shutdown unavailable: {:?}", err),
-    }
-    crate::hart::park()
 }

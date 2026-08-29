@@ -49,6 +49,13 @@ pub fn load(address: usize, length: usize) {
             | Rights::GRANT,
     )
     .expect("root JobControl rights are invalid");
+    let system_reset = task::system_reset::SystemReset::new();
+    let reset_control = task::handle::entry(
+        task::system_reset::SystemReset::object_ref(&system_reset),
+        task::object::HandleRole::SystemResetControl,
+        Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+    )
+    .expect("SystemReset rights are invalid");
     let payload_pa = address
         .checked_add(package.header.payload_off as usize)
         .expect("BootPackage payload physical address overflow");
@@ -57,7 +64,7 @@ pub fn load(address: usize, length: usize) {
         spawned,
         payload_pa,
         package.payload,
-        alloc::vec![root_control],
+        alloc::vec![root_control, reset_control],
     )
     .expect("initial process cannot be launched");
 

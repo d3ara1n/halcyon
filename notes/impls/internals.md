@@ -29,7 +29,7 @@ trap 进入 S 态时硬件清 SIE；内核执行到用户返回或调度出口�
 
 ## SBI 平台基线
 
-内核要求 SBI 2.0 或更高版本，并把 TIME、IPI、HSM、DBCN 作为必需扩展；SRST 是可选终态能力，失败时系统永久停放。版本号和必需扩展在启动期通过 BASE 探测，不从机器型号推断。
+内核要求 SBI 2.0 或更高版本，并把 TIME、IPI、HSM、DBCN 作为必需扩展；SRST 是可选平台后端，不支持时不阻止启动，显式系统复位请求会向用户态返回 `NotSupported`。版本号和必需扩展在启动期通过 BASE 探测，不从机器型号推断。
 
 DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只承载内核日志和 Debug syscall 的观测输出，不是功能模块。输出为单次非阻塞 best-effort：部分写、零写或错误都允许丢失，任何日志失败均不得改变调度、IPC、内存管理等功能路径。legacy putchar 只在 DBCN 尚未就绪时提供早期 best-effort 诊断，不是运行期兼容层。
 
@@ -43,15 +43,13 @@ DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只�
 
 唤醒后的行为统一：清中断源 → 查自己管辖的待办（调度域就绪队列、TimerQueue、跨核请求），有事做事，无事回睡。
 
-### 电源阶梯
+### idle 与系统复位
 
-当前只有 wfi 浅睡：局部使能（`sie`）的中断 pending 使 wfi 返回，全局 SIE 不 gate wfi；idle 期间 SIE=0 不进入 trap，醒来后检查待办。
+idle 只表达「当前 hart 暂无可运行线程」：hart 在所属调度域登记 idle 位，双重检查 Ready 后进入 WFI；入队方据 idle 位选择 IPI 目标。idle 位是调度唤醒路由状态，不参与整机生命周期推断。Sleep 与有限 WaitMany 的唤醒主人仍是 per-hart TimerQueue entry。
 
-### 停机语义
+整机终局只能由 `SystemReset` 对象触发。该对象是无等待叶子对象；primordial capability 由 bootstrap 交给 init，成功操作要求 Handle 的 `MANAGE` right。syscall 解析 eRhino 自有 `ResetAction::{Shutdown, Reboot}` 与 `ResetReason::{Requested, SystemFailure}`，显式映射为 SBI SRST 的 shutdown/cold reboot 和 no reason/system failure，不暴露或透传 SBI 编码。
 
-idle 入口的静默谓词检查所有调度域无 Ready、全部 admitted hart 已登记 idle、所有 per-hart TimerQueue 为空。满足时不存在内核内生唤醒主人，调用 SBI SRST `RESET_SHUTDOWN`；不支持 shutdown 的平台保持停放。
-
-Sleep/有限 WaitMany 的主人是 TimerQueue entry。纯 IPC 等待者本身不阻止静默：全部 hart idle 时没有用户执行流能够投递消息或信号。当前没有设备中断等待源，静默谓词也不包含设备项。
+对象内 `in_flight` 原子门保证全系统同一时刻至多一个平台请求；竞争返回 `ObjectBusy`。SBI `NOT_SUPPORTED` 映射为 `NotSupported`，其余后端拒绝及规范所称成功调用的异常返回映射为 `InternalError`；失败会释放门，内核不以永久停放伪装 reset 成功。
 
 ### IPI 门铃与 remote call
 

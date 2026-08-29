@@ -12,8 +12,8 @@
 //! 5. 监督闭环：全部服务等 REAPABLE|CLOSED → Drain 至 Complete → 终态
 //!    快照 → close；pm_domain 由 pm 自行收束，未收束时 init 兜底；
 //! 6. 等 pm 退出后的 PEER_CLOSED 终态位，关闭本端（帧归还）；
-//! 7. 稳态：常驻管理端点等待。init 不自我终止——无人能再投递的等待
-//!    不构成工作，系统随静默停机判定收束。
+//! 7. 验证系统复位 capability 的负路径，由 init 显式提交 Shutdown；平台拒绝时
+//!    保持 root supervisor 稳态等待。
 
 #![no_std]
 
@@ -36,8 +36,11 @@ use rinlib::{
             HandleGrant, JobMemberKind, JobState, ProcessDrainStatus, ProcessExitReason,
             ProcessState, ExecutionProfile,
         },
+        reset::{ResetAction, ResetReason},
+        startup::initial,
         wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     },
+    system,
 };
 use libprocess::{
     DERIVED_CONTROL_RIGHTS, SpawnRequest, enumerate_members, job_kill, spawn,
@@ -288,13 +291,14 @@ fn launch_test_services(
 
 fn main() {
     debug!("Hello, init!");
-    let root_job = env::startup_handle(0).expect("init must hold root JobControl");
+    let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
+    let reset =
+        env::startup_handle(initial::SYSTEM_RESET).expect("init must hold SystemReset authority");
     let services = match process::create_job(root_job, JOB_FULL_RIGHTS) {
         Ok(job) => job,
         Err(error) => {
             debug!("services job create failed: {:?}", error);
             steady_state();
-            return;
         }
     };
     debug!("services job established");
@@ -307,25 +311,52 @@ fn main() {
         }
         panic!("init acceptance failed: {}", stage);
     }
-    steady_state();
+    submit_shutdown(root_job, reset);
 }
 
-/// 稳态：持久 root supervisor 的最终形态。受管服务全部收束后 init 常驻
-/// 等待管理端点——当前无客户端，无人能再投递，等待不构成工作，系统随
-/// 静默停机判定（quiescent）收束；设备接入后设备即工作源，终态改由
-/// 显式关机路径决定。init 不自我终止：退出是管理根失效，不是正常路径。
-fn steady_state() {
+/// 先验证 capability 负路径，再提交唯一的成功路径。
+fn submit_shutdown(root_job: Handle, reset: Handle) -> ! {
+    assert!(matches!(
+        system::reset(root_job, ResetAction::Shutdown, ResetReason::Requested),
+        Err(SystemCallError::WrongObjectType)
+    ));
+    let attenuated =
+        duplicate(reset, Rights::DUPLICATE).expect("SystemReset attenuation must succeed");
+    assert!(matches!(
+        system::reset(attenuated, ResetAction::Shutdown, ResetReason::Requested),
+        Err(SystemCallError::RightsDenied)
+    ));
+    close(attenuated).expect("attenuated SystemReset close must succeed");
+    debug!("system reset authority checks passed");
+    debug!("init: submitting explicit system shutdown");
+
+    match system::reset(reset, ResetAction::Shutdown, ResetReason::Requested) {
+        Err(error) => {
+            debug!("system reset failed: {:?}", error);
+            steady_state()
+        }
+        Ok(never) => match never {},
+    }
+}
+
+/// 平台拒绝系统复位后的稳定形态：init 保持 root supervisor 存活并等待。
+fn steady_state() -> ! {
     let endpoint = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT,
     )
     .expect("steady-state endpoint create failed");
     debug!("init: steady-state supervision (persistent root supervisor)");
-    match wait_message(endpoint.owner) {
-        Ok(message) => {
-            debug!("BUG: steady-state endpoint received kind {}", message.header.kind)
+    loop {
+        match wait_message(endpoint.owner) {
+            Ok(message) => {
+                debug!(
+                    "BUG: steady-state endpoint received kind {}",
+                    message.header.kind
+                )
+            }
+            Err(error) => debug!("steady-state wait ended: {:?}", error),
         }
-        Err(error) => debug!("steady-state wait ended: {:?}", error),
     }
 }
 
@@ -342,7 +373,7 @@ fn kill_and_supervise(supervised: alloc::vec::Vec<Supervised>) {
 
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
 fn run(services: Handle) -> Result<(), &'static str> {
-    let root_job = env::startup_handle(0).expect("init must hold root JobControl");
+    let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
     let pm_domain = process::create_job(services, JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
     let acceptance = process::create_job(services, JOB_FULL_RIGHTS)
@@ -520,7 +551,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
 
     // 终态拓扑快照（调试参考）：预期 root 仅剩 init + services，services
     // 空（Dead 的 pm_domain/acceptance 已从成员表移除）——收束干净的不变量。
-    debug!("topology: final snapshot before steady state");
+    debug!("topology: final snapshot before system reset");
     dump_topology(root_job, &names, 0);
     let _ = close(pm_domain);
     Ok(())

@@ -17,6 +17,14 @@ pub const STARTUP_VERSION: u16 = 2;
 /// 块基魔数（"STARTUPB"）。
 pub const STARTUP_BLOCK_MAGIC: u64 = u64::from_le_bytes(*b"STARTUPB");
 
+/// initial process 固定 capability 图中的 Handle 索引。
+pub mod initial {
+    pub const ROOT_JOB: usize = 0;
+    pub const SYSTEM_RESET: usize = 1;
+    pub const SELF_PROCESS: usize = 2;
+    pub const HANDLE_COUNT: usize = 3;
+}
+
 /// 启动块头。其后紧跟 `handle_count` 个实际 child-local Handle；允许以
 /// 零字节填充到 payload_off，再放置不透明 payload。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,11 +2,10 @@
 #
 # qemu-acceptance.sh — 跑一次 QEMU 验收并按锚点判定成败。
 #
-# 两种收束模式：
-#   默认         平台自停机（SRST 让 QEMU 退出），前台直跑到进程结束。
-#   --allow-timeout  无 shutdown 设备的平台（sifive_u）：QEMU 永不自退。
-#                日志出现终态锚点即主动收割（正常轮次不必空等硬上限），
-#                真挂死则由调用方的 timeout 兜底（status 124 视为可接受）。
+# 两种平台结果：
+#   默认             显式 reset 成功后 QEMU 退出；任何终态失败锚点立即收割并失败。
+#   --allow-timeout   无 shutdown 后端的平台（sifive_u）允许 reset 明确失败；
+#                     日志出现失败结果后主动收割，硬 timeout 只兜底真挂死。
 set -u -o pipefail
 
 allow_timeout=false
@@ -35,7 +34,8 @@ required=(
     "all services supervised to completion"
     "peer closed observed"
     "pm delegated domain confirmed Dead"
-    "system quiescent (no waker)"
+    "system reset authority checks passed"
+    "system reset accepted: action Shutdown, reason Requested"
 )
 case "$profile" in
     common) ;;
@@ -57,6 +57,9 @@ case "$profile" in
         exit 2
         ;;
 esac
+if $allow_timeout; then
+    required+=("system reset failed:")
+fi
 
 rejected=(
     "acceptance failed"
@@ -64,11 +67,14 @@ rejected=(
     "Panicking in "
     "Panicking: no information available."
 )
+if ! $allow_timeout; then
+    rejected+=("system reset failed:")
+fi
 
-# 终态锚点：出现任一即本轮不会再产生新信息（正常静默停机，或收束型
-# panic），可以收割 QEMU；判定仍走完整锚点集。
+# reset 成功不返回，由 QEMU 进程退出收束；只有明确失败或 panic 才是可提前
+# 收割的终态。判定仍在收割后检查完整 required/rejected 集合。
 terminal=(
-    "system quiescent (no waker)"
+    "system reset failed:"
     "acceptance failed"
     "Kernel panicking"
     "Panicking: no information available."
@@ -86,44 +92,35 @@ log_has_any() {
     return 1
 }
 
-if $allow_timeout; then
-    # 后台跑 + tail 回显：主循环轮询终态锚点，出现即收割。TERM 沿
-    # timeout → qemu-throttle → QEMU 链传播（各层自带清理）。
-    : > "$log"
-    "$@" > "$log" 2>&1 &
-    runner=$!
-    tail -n +1 -f "$log" &
-    tailer=$!
-    # 中途中断（Ctrl-C / 上层 kill）时两个子进程都要收，否则 QEMU 泄为孤儿。
-    trap 'kill "$runner" "$tailer" 2>/dev/null || true' EXIT INT TERM
-    status=0
-    while :; do
-        if ! kill -0 "$runner" 2>/dev/null; then
-            wait "$runner"
-            status=$?
-            break
-        fi
-        if log_has_any "${terminal[@]}"; then
-            kill "$runner" 2>/dev/null || true
-            wait "$runner" 2>/dev/null || true
-            status=124
-            break
-        fi
-        sleep 0.2
-    done
+# 后台跑 + tail 回显：失败锚点必须主动收割，否则 panic 或 reset 返回后的
+# 稳态 WFI 不会让 QEMU 自退。TERM 沿 timeout → qemu-throttle → QEMU 链传播。
+: > "$log"
+"$@" > "$log" 2>&1 &
+runner=$!
+tail -n +1 -f "$log" &
+tailer=$!
+trap 'kill "$runner" "$tailer" 2>/dev/null || true' EXIT INT TERM
+status=0
+while :; do
+    if ! kill -0 "$runner" 2>/dev/null; then
+        wait "$runner"
+        status=$?
+        break
+    fi
+    if log_has_any "${terminal[@]}"; then
+        kill "$runner" 2>/dev/null || true
+        wait "$runner" 2>/dev/null || true
+        status=124
+        break
+    fi
     sleep 0.2
-    kill "$tailer" 2>/dev/null || true
-    wait "$tailer" 2>/dev/null || true
-    trap - EXIT INT TERM
-else
-    set +e
-    "$@" 2>&1 | tee "$log"
-    status=${PIPESTATUS[0]}
-    set -e
-fi
+done
+sleep 0.2
+kill "$tailer" 2>/dev/null || true
+wait "$tailer" 2>/dev/null || true
+trap - EXIT INT TERM
 
-# 失败即保留现场：无法重现的非确定性失败（提前停机、锚点缺失、
-# 挂死）一旦删日志就只能重跑碍运气。成功才清理。
+# 失败即保留现场：无法重现的非确定性失败、锚点缺失或挂死一旦删日志就只能重跑。
 keep_log() {
     local reason="$1"
     local kept="artifacts/failed-acceptance-$(date +%Y%m%d-%H%M%S)-$$.log"
@@ -157,6 +154,6 @@ for anchor in "${rejected[@]}"; do
 done
 
 if [[ "$status" -eq 124 ]]; then
-    echo "QEMU acceptance passed (harvested at terminal anchor)."
+    echo "QEMU acceptance passed (harvested after explicit reset failure)."
 fi
 rm -f "$log"

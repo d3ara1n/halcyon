@@ -35,7 +35,7 @@
 
 ### 独立未决问题
 
-首轮报告中“sifive_u 确定性卡死”的判断已证伪；后续发现的低频提前 quiescent 有独立现场，但不能据现有证据判定与旧现场同源或由批一引入。调查、装备与完成标准统一由 [`todo-2026-08-29-early-quiescent-shutdown.md`](../todo-2026-08-29-early-quiescent-shutdown.md) 跟踪，不留在已完成 review 计划中。
+首轮报告中“sifive_u 确定性卡死”的判断已证伪；后续发现的低频提前 quiescent 有独立现场，但不能据现有证据判定与旧现场同源或由批一引入。该现场现已由显式复位从结构上收口，调查归档于 [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md)，不留在已完成 review 计划中。
 
 ### 既有回归面
 

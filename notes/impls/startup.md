@@ -25,7 +25,7 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload
 
 **`parent_pid` 语义（A2 修复定死）**：描述**目标进程**的创建关系，因此是**组装者自身的 pid**（= 目标的创建者，与内核 ProcessQuery 快照的 parent_pid 同一真值），不是组装者的父。组装者在构造出生块时必须传 `rinlib::env::pid()`——传 `env::parent_pid()` 会错位一代（init parent 0 spawn 服务时出生块里会是 0 而非 1）。当前无消费方（潜伏字段），但不能靠「没人读」放任语义错误。
 
-接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（rinlib `env::init` 沿用旧 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl，Handle[1] init ProcessControl。普通进程 Handle 数组完全来自组装者的 grants，slot 含义由具体启动协议定义，不属于通用线格式。
+接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（rinlib `env::init` 沿用旧 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl、Handle[1] primordial SystemReset、Handle[2] init ProcessControl；索引由 `shared::startup::initial` 定义。普通进程 Handle 数组完全来自组装者的 grants，slot 含义由具体启动协议定义，不属于通用线格式。
 
 ## 组装 ABI（Building 期外部通道）
 
@@ -54,7 +54,7 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 `os/kernel/src/boot.rs` 以与用户态组装者同构的 op 序列构造 init（bootstrap 特例：进程未启动、无用户代码可执行）：
 
 1. 解析 initial ELF，创建 pid 1 的 AddressSpace（含 init 栈映射——内核供栈仅此一处 bootstrap 例外）与 root Job 成员 core；
-2. 创建 root JobControl 与 init ProcessControl，预留 Handle 槽并安装；
+2. 创建 root JobControl、primordial SystemReset 与 init ProcessControl，预留 Handle 槽并安装；SystemReset 初始 rights 为 `MANAGE | DUPLICATE | TRANSIT | GRANT`；
 3. 以真实句柄值构造出生块 prefix（用户态线格式），payload 以 BootPackage 保留帧映射为只读，映入即收编为 init 地址空间 owned backing；
 4. 经 `Process::attach_thread` 附入首线程，冻结 execution binding，`begin_running` 入册并发布 Ready。
 
@@ -78,11 +78,11 @@ root
 
 所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，按 REAPABLE|CLOSED → ProcessDrain → Query 收束。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留 pm_domain control 作为兜底。pm 对委托域执行枚举→派生→kill→drain→seal。
 
-acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整域 job_kill。init 在全部服务完成后常驻管理端点，不自终止；无 runnable、无 timeout owner 时系统进入 quiescent shutdown。
+acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整域 job_kill。init 在全部服务监督与资源收束锚点成立后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并常驻管理端点，保持 root supervisor 存活；当前不经独立电源服务转发。
 
 ## 验证
 
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
 - handle_table host：consume/transfer 两类 pin、builder 保护、自授予/重复拒绝、rights 回滚、reservation 与 TRANSIT/GRANT；
 - libprocess host：entry、segment overlap 与页级 W^X；
-- QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态和 quiescent 锚点，全线常绿。`sifive_u` 无 shutdown 设备，由验收脚本在终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。
+- QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态、reset authority 负路径与内核接受 reset 锚点。virt 必须再由 QEMU 正常退出证明后端成功；`sifive_u` 无 shutdown 设备，内核返回失败后由验收脚本按明确终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。

@@ -60,6 +60,8 @@ pub enum SystemCallError {
 pub enum SystemCall {
     /// 写调试流（测试观测通道）：a0=msg_ptr a1=msg_len
     Debug = 0x01,
+    /// 以 `SystemReset` capability 提交系统终局。
+    SystemReset = 0x02,
 
     // -----Process control-----
     /// Finalized process notifies kernel to cleanup

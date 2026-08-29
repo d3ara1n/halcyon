@@ -8,6 +8,8 @@
 
 handler 返回 Completed 后，dispatcher 再检查 lifecycle。若 syscall 期间另一 hart 已冻结终止，或 deliver_output 触发 Fault，出口改为 Killed，不再返回用户态。
 
+`SystemReset` 是终局同步调用：dispatcher 完成固定宽参数与 capability 校验后进入单次平台调用；成功按契约不返回，后端拒绝或异常返回才写入 syscall 错误并恢复调用线程。对象、SBI 映射与错误语义见 [`internals.md`](internals.md)「idle 与系统复位」。
+
 ## 异步调用
 
 dispatcher 只登记 `WaitPlan` 到 HartLocal park 槽并返回 Wait。调度循环在当前线程离开执行点、清 active 后调用 `park_publish` 安装 `WaitContext`。

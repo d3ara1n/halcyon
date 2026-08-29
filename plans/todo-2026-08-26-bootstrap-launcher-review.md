@@ -168,12 +168,12 @@ Review 报告应附一张事务阶段表：资源、owner、reservation token、
 - marker 对普通 lookup/remove 不可见；
 - rollback/commit 恰好一次，marker 不泄漏；
 - ready `pick` 跳过 marker时保持普通线程之间的 FIFO；
-- `has_ready` 忽略 marker不会在仍有构造调用执行时误判 quiescent；
+- `has_ready` 忽略 marker 只影响调度可见性，不把 reservation 当作可运行线程；
 - commit_ready 替换 marker 后才发 IPI，idle 双重检查仍闭合；
 - 多 hart 同时 pick/commit/rollback 的锁序无环；
 - enqueue/requeue 的既有分配行为与 ProcessStart 的“提交区零分配”边界不要混为一谈。
 
-至少构造 marker 位于队首/队中/多个 marker、并行 pick 与系统静默的模型测试或等价证明。
+至少构造 marker 位于队首/队中/多个 marker、并行 pick 与 idle 唤醒的模型测试或等价证明。
 
 ### 8. ELF loader、入口和页级 W^X
 
@@ -223,7 +223,7 @@ Review 报告应附一张事务阶段表：资源、owner、reservation token、
 - ProcessStart grant 中重复 Handle、builder alias、rights 放大、失效 generation、输出不可写；
 - entry 落 X 页 padding、segment byte overlap、同页 W/X 并集、filesz 越界；
 - ProcessBuilder close、Start 失败与 target process frame/Handle 守恒；
-- ready queue 含 reservation marker 时多 hart pick、idle 与 quiescent；
+- ready queue 含 reservation marker 时多 hart pick、idle 与 IPI 唤醒闭包；
 - init fault/退出后 payload backing 不被误回收，普通 child 退出后 owned frames 全部回收。
 
 ## 已有回归证据
@@ -235,9 +235,9 @@ Review 报告应附一张事务阶段表：资源、owner、reservation token、
 - elf 13 项、HandleTable 12 项、tar 4 项 host 测试；
 - libprocess 4 项入口/overlap/页级 W^X host 测试；
 - `just check`、`just build_user`、用户 ELF audit 与 kernel ELF audit；
-- virt 四核：init 启动 driver/fs/pm，IPC/FAL/Runnel 验收完成，全员回收并自动关机；
-- sifive_u 四个 Application hart：同一负载完成并到达 quiescent，SRST 不可用后按平台约定 timeout 收束；
-- virt 最终日志中 BootPackage prefix 回投后静默时 256909 frames free，证明 DTS capacity 未整段浪费。
+- virt 四核：init 启动 driver/fs/pm，IPC/FAL/Runnel 验收完成，全员回收；当前回归线在全部锚点后显式提交 reset；
+- sifive_u 四个 Application hart：同一负载完成，显式 reset 返回 `NotSupported` 后由 wrapper 收割；
+- BootPackage prefix 回投与终态帧数仍用于证明 DTS capacity 未整段浪费，不作为停机意图判据。
 
 这些只定义回归基线，不证明锁序、失败原子性、规范符合性或不可达分支已经完成 review。
 

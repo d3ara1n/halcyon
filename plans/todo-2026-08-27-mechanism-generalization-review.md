@@ -23,8 +23,8 @@
 ### per-hart Timeout queue
 
 - **稳定 token**：owner slot、arena slot 与 generation 是否闭合跨 hart cancel、到期弹出和槽位复用；错误 owner queue 必须结构性拒绝。
-- **完成即注销**：对象命中、Abandoned、Timeout 与注册发布竞态是否都使 queue live entry 消散，不滞留 WaitContext 或阻止静默。
-- **静默谓词遍历**：`is_quiescent` 遍历全部 `HART_TIMERS` 的判空；新增等待源时的主人枚举约束是否同步。
+- **完成即注销**：对象命中、Abandoned、Timeout 与注册发布竞态是否都使 queue live entry 消散，不滞留 WaitContext。
+- **终局解耦**：`is_quiescent` 已由显式系统复位删除；确认 TimerQueue 只承担有限等待的唤醒所有权，不再参与任何整机生命周期谓词。
 - **不迁移前提**：注册 owner 是发起 hart，不随 Waiting 线程迁移；显式迁移接入时重审。
 
 ### MappingLease

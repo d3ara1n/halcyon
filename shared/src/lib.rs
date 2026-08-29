@@ -16,6 +16,8 @@ pub mod mem;
 pub mod proc;
 /// Service
 pub mod service;
+/// 系统复位语义
+pub mod reset;
 /// Locks
 pub mod sync;
 /// Time-related functions

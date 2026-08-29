@@ -40,7 +40,7 @@ Send 在 `HandleTable → Mailbox` 锁序下，以当前 pid 和目标 sender ba
 
 公开 ABI 参数 `timeout_ms` 是相对毫秒，零表示无限；完成原因 `WaitReason::Timeout` 的 wire 判别值为 3。内核安装时换算为单调时钟 `expires_at`。
 
-每 hart 的 `TimerQueue` 位于独立 `os/timer_queue` 纯逻辑 crate：arena + 索引最小堆，稳定 token 含 owner slot、arena slot 与 generation；注册、取消、到期弹出 O(log n)，peek O(1)。WaitContext 的原子 `TimeoutRegistration` 在 Unregistered/Token/Closed 间仲裁：对象命中、错误、终止 Abandoned 或 Timeout 只有完成赢家负责退休 token。对象提前完成会立即从 owner queue 注销，不再强持 Context，也不阻止 quiescent。
+每 hart 的 `TimerQueue` 位于独立 `os/timer_queue` 纯逻辑 crate：arena + 索引最小堆，稳定 token 含 owner slot、arena slot 与 generation；注册、取消、到期弹出 O(log n)，peek O(1)。WaitContext 的原子 `TimeoutRegistration` 在 Unregistered/Token/Closed 间仲裁：对象命中、错误、终止 Abandoned 或 Timeout 只有完成赢家负责退休 token。对象提前完成会立即从 owner queue 注销，不再强持 Context。
 
 跨 hart 完成可以锁 owner queue 删除 token，但不远程重编程 owner timer；至多产生一次提前中断，owner 在下一装填点按新堆顶恢复。timer queue 锁外才析构被移除的 Context Arc。
 
@@ -69,4 +69,4 @@ ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一
 - handle_table host：generation、reservation、badge、运输、consume/transfer pin 与 rights 回滚；
 - wait_context/timer_queue host：安装窗口、唯一赢家、token generation/owner、堆删除与 cancel/expiry 竞争；
 - init acceptance：badge、send-once、满箱/WRITABLE、Notification、Invitation 非等待拒绝、Tunnel/Runnel、ProcessDrain `max_work=1`；
-- QEMU：debug/release、hetero/nofd、sifive_u 的竞态矩阵 10/10、服务监督、资源回收与 quiescent 均由 fail-closed 锚点脚本验证。
+- QEMU：debug/release、hetero/nofd、sifive_u 的竞态矩阵 10/10、服务监督、资源回收与显式 reset 终态均由 fail-closed 锚点脚本验证。

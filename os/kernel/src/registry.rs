@@ -198,17 +198,6 @@ pub fn with_registry<R>(f: impl FnOnce(&HartRegistry) -> R) -> R {
     f(REGISTRY.lock().as_ref().expect("registry not initialized"))
 }
 
-/// admitted 集合的 slot 位图（静默判定与 IPI 目标展开用）。
-pub fn active_slot_mask() -> u64 {
-    with_registry(|reg| {
-        let mut mask = 0u64;
-        for (slot, _) in reg.records() {
-            mask |= 1u64 << slot.0;
-        }
-        mask
-    })
-}
-
 /// 把 slot 位图展开为 raw hartid 并逐个发送 IPI
 /// （绝不把内部 slot 位图直接解释为 SBI hart mask）。
 pub fn ipi_slots(mask: u64) {

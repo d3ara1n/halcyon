@@ -31,6 +31,7 @@ pub enum ObjectKind {
     Notification,
     TunnelEndpoint,
     TunnelInvitation,
+    SystemReset,
 }
 
 /// Handle 在对象生命周期中的角色。rights 决定操作，role 决定关系。
@@ -54,6 +55,7 @@ pub enum HandleRole {
     NotificationSignaler,
     TunnelEndpoint,
     TunnelInvitation,
+    SystemResetControl,
 }
 
 /// 只含稳定身份的共同头；对象状态和订阅必须与类型数据共用一把对象锁。

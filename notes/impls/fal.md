@@ -42,4 +42,4 @@
 
 ## 验证
 
-libfal/libfs host 测试覆盖 framing、路径、cursor、属性、符号链接与前缀走路；QEMU `srv_fs` 输出 `fs acceptance passed`，并由总体 acceptance 脚本与服务监督、quiescent 锚点共同判定。
+libfal/libfs host 测试覆盖 framing、路径、cursor、属性、符号链接与前缀走路；QEMU `srv_fs` 输出 `fs acceptance passed`，并由总体 acceptance 脚本与服务监督、显式 reset 终态共同判定。

@@ -17,6 +17,7 @@
 | 主题 | idea | impl |
 |---|---|---|
 | 内核边界与协作式执行 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
+| 系统复位 authority、语义与平台映射 | [system-reset](ideas/system-reset.md) | [internals](impls/internals.md) |
 | 对象、Capability、Handle、运输与根授权 | [object](ideas/object.md) | [IPC 对象](impls/ipc.md) |
 | Bootstrap、init、StartupBlock 与 launcher | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
 | Job、进程、线程、生命周期与调度类 | [task](ideas/task.md) | [task](impls/task.md) |

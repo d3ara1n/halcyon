@@ -76,11 +76,11 @@
 
 - **QEMU sifive_u 的 U54 模型 senvcfg 可读不可写**：csrr 成功、csrw 触发
   illegal instruction。「实现了读」不等于「可写」，WARL 核验序列每一步都要守卫。
-- sifive_u 无 shutdown device：负载完成后 QEMU 不自退出，`just sifive_u` 以
-  终态锚点（quiescent / panic 收束）主动收割，`ACCEPTANCE_TIMEOUT`（默认 60s）
-  只作真挂死兜底；判定只看日志锚点集。**超时值不得往小调到验收面
-  耗时以下**——砍在矩阵中段的形态（无 panic、无 quiescent、日志断在 spawn 附近）
-  与真挂死逐字同形，历史上因此把基础设施失败误读为内核挂死（批一报告 A4/§B）。
+- sifive_u 无 shutdown device：显式 reset 返回失败后 QEMU 不自退出，`just sifive_u` 以
+  reset 后端失败或 panic 终态锚点主动收割，`ACCEPTANCE_TIMEOUT`（默认 60s）只作真挂死
+  兜底；判定仍检查完整日志锚点集。**超时值不得往小调到验收面耗时以下**——砍在
+  矩阵中段的形态（无 panic、无 reset 结果、日志断在 spawn 附近）与真挂死逐字同形，
+  历史上因此把基础设施失败误读为内核挂死（批一报告 A4/§B）。
 - **裸跑 QEMU 后必须 `just clean-qemu`**：验收脚本自己会清（挂起模式 trap 同时
   收 runner 与 tailer），但 agent 手动拼命令行跑完容易漏下孤儿进程占满核。
-  已内置运行阶段超时收束，通过与否看日志关键行（全员回收 / `[Sched] 系统静默`）。
+  已内置运行阶段超时收束，通过与否看完整业务锚点与显式 reset 结果。

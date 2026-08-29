@@ -10,6 +10,7 @@ use erhino_shared::{
         ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
         ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadStartContext, Tid,
     },
+    reset::{ResetAction, ResetReason},
     wait::{WaitItem, WaitResult},
 };
 use num_traits::FromPrimitive;
@@ -89,6 +90,21 @@ fn sys_call6(
 // returns actual byte count sent to debug stream
 pub unsafe fn sys_debug(msg: &str) -> SystemCallResult<usize> {
     sys_call(SystemCall::Debug, msg.as_ptr() as usize, msg.len(), 0, 0)
+}
+
+pub unsafe fn sys_system_reset(
+    authority: Handle,
+    action: ResetAction,
+    reason: ResetReason,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::SystemReset,
+        authority.raw() as usize,
+        action as usize,
+        reason as usize,
+        0,
+    )
+    .map(|_| ())
 }
 
 // returns the new heap top address, or the current when size is 0

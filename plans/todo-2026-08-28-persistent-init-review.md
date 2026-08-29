@@ -1,6 +1,6 @@
 # 持久 init 监督政策 Review 计划
 
-> 【未来审查计划】对象是生命周期 step 6 的两笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计公理已入档 `notes/ideas/bootstrap.md`（委托语义、重启政策维度、init 稳态与静默停机），实现现状见 `notes/impls/startup.md`「当前 init 集成政策」。
+> 【未来审查计划】对象是生命周期 step 6 的两笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计公理已入档 `notes/ideas/bootstrap.md`（委托语义、重启政策维度、init supervisor），实现现状见 `notes/impls/startup.md`「当前 init 集成政策」与 `notes/ideas/system-reset.md`。
 
 ## 提交对照
 
@@ -11,10 +11,10 @@
 
 ## Review 轴（代码为主）
 
-### 稳态终态公理的实现依赖
+### 显式 reset 后的 supervisor 语义
 
-- quiescent 相容性依赖两个既存实现事实：`WAIT_TIMEOUT_INFINITE → expires_at=None` 不注册 TimerQueue entry（`task/wait.rs`）、IPC/信号等待者刻意不阻止静默（`sched.rs is_quiescent`）。任一改动（新等待源、Timeout queue 语义变化）必须重审 internals.md 停机谓词的主人枚举约束——机制泛化 review 轴的同名条目互为对照。
-- 稳态 endpoint 收到消息的 BUG 分支会走 `main` 返回 → init 退出 → 管理根失效。确认该路径只可能是内核违约或未来管理协议接入时遗留。
+- 正常终局不再依赖 TimerQueue 或 IPC 等待者枚举：init 只在业务与资源锚点成立后提交 `SystemReset`；review 需确认提交点严格位于监督闭环之后，且 authority 未被 pm 委托域意外持有。
+- 平台拒绝 reset 时，稳态 endpoint 的消息或等待错误都只能记录并继续循环，不能让 `main` 返回导致 init 退出、管理根失效。
 
 ### GRANT 消费与 authority 留存
 

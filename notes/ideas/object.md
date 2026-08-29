@@ -77,7 +77,7 @@ ProcessGrant 从组装者表中原子摘除持 `GRANT` 的 entry，直接安装�
 
 PID 是内核分配的 provenance 与诊断身份，可用于审计、创建关系和故障定位，但不是 IPC 地址或 authority。`parent_pid` 只表示谁创建了进程，不产生管理、继承或回收权；管理权来自显式 Process capability。
 
-普通对象的初始 capability 由创建者持有。MMIO、IRQ、DMA、物理资源和 root Job 不能由用户凭空创建：内核依据可信平台事实铸造这些 primordial capabilities，并在初始 launch 中交付 init。内核是技术铸造者，init/resource manager 才是策略授予者；后续权利沿 capability 图传播，而不是沿 PID 树或进程权限等级传播。
+普通对象的初始 capability 由创建者持有。MMIO、IRQ、DMA、物理资源、系统复位 authority 和 root Job 不能由用户凭空创建：内核依据可信平台事实铸造这些 primordial capabilities，并在 initial launch 中交付 init。内核是技术铸造者，init/resource manager 才是策略授予者；后续权利沿 capability 图传播，而不是沿 PID 树或进程权限等级传播。
 
 系统不要求 uid/gid 或进程权限级别。若未来增加多用户，认证和 ACL 位于用户态 grant 铸造阶段；最终对象操作仍以 capability 为必要授权。
 

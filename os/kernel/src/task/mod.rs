@@ -9,8 +9,9 @@ pub mod notification;
 pub mod object;
 pub mod proc;
 pub mod process;
+pub mod system_reset;
 pub mod tunnel;
 pub mod wait;
 
 pub use job::alloc_pid;
-pub use proc::{launch_bootstrap, spawn_from_elf, Thread};
+pub use proc::{Thread, launch_bootstrap, spawn_from_elf};

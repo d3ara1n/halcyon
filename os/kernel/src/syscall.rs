@@ -37,6 +37,19 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             debug_print(frame, thread);
             Outcome::Completed
         }
+        SystemCall::SystemReset => {
+            respond_result(
+                frame,
+                task::system_reset::request(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11],
+                    frame.x[12],
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::Exit => {
             let process = thread.process.clone();
             let todo = thread.process.lifecycle.request_termination(

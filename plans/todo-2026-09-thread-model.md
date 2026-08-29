@@ -115,11 +115,11 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 |---|---|
 | `just check`（内核） | ✅ |
 | host 单测（shared 7、os 纯逻辑 105、rinlib 1、libprocess 5） | ✅ |
-| `just virt` / `just virt-release` | ✅ 锚点全命中，矩阵 10/10，静默停机 |
+| `just virt` / `just virt-release` | ✅ 锚点全命中，矩阵 10/10；现行回归由显式 reset 收束 |
 | `just virt-hetero` / `just virt-nofd` | ✅ 两域绑定与 D64 无兼容域清理通过 |
 | `just sifive_u` | ✅ 验收面全命中，由终态锚点收割 |
 
-**原记“sifive_u 确定性挂死”这一具体判断已证伪**：旧报告调查的稳定失败分别来自 U-mode `wfi` fault 与验收脚本固定超时，均已修复。后续另捕获到一次负载存活时提前 quiescent 的低频现场；它在 `sifive_u` 上可能表现为永不退出，但证据既不能证明与旧现场同源，也不能判定由批一引入。该问题独立由 [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md) 跟踪，不作为已收口事务复审的隐藏结论。
+**原记“sifive_u 确定性挂死”这一具体判断已证伪**：旧报告调查的稳定失败分别来自 U-mode `wfi` fault 与验收脚本固定超时，均已修复。后续捕获的负载存活时提前 quiescent 现场无法判定引入批次；现已由显式系统复位从结构上删除错误终局，调查归档于 [`archived/todo-2026-08-29-early-quiescent-shutdown.md`](archived/todo-2026-08-29-early-quiescent-shutdown.md)，不作为批一事务复审的隐藏结论。
 
 ### 实施批次总览
 

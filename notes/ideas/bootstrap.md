@@ -48,7 +48,7 @@ StartupBlock outer 允许 Handle 数组结束与 payload 起点之间存在零�
 
 ## init 的职责与终止
 
-init 是系统配置选定的持久 root supervisor。它初始取得完整 root JobControl 与平台 primordial capabilities，在用户态维护系统进程拓扑、恢复政策和长期 authority，因此可以 spawn、kill、派生、授权和收束服务。该职责来自初始 capability 图与配置，不由内核按 PID 或名称授予隐藏权限。
+init 是系统配置选定的持久 root supervisor。它初始取得完整 root JobControl、系统复位 authority 与其他平台 primordial capabilities，在用户态维护系统进程拓扑、恢复政策和长期 authority，因此可以 spawn、kill、派生、授权、收束服务并显式提交系统终局。该职责来自初始 capability 图与配置，不由内核按 PID 或名称授予隐藏权限。
 
 init 独占解释 initfs，并按配置：
 
@@ -60,9 +60,9 @@ init 独占解释 initfs，并按配置：
 
 init 位于其受管 services Job 之外，直接持有该 JobControl 及系统服务的 ProcessControls，负责服务的创建、退出处理、重启和递归收束。系统服务与其受托管理子域同属 services 域，整树可一次封口收束；委托只转移子域的域内管理 authority，init 对受托域保留直接收束权。pm 是 services Job 内可被 init 监督的系统服务，可以管理 init 显式委托的子域或向其他进程提供进程管理协议，但不承担根监督链角色。委托的语义在 capability 转移本身：启动时在 Building 阶段经直接 grant 交付与运行时经管理协议授予是同一转移的两个时机，不构成第二种委托机制。重启是监督政策的维度：受管服务收束后是否重新创建由配置决定，重启域（Open Job）为此保持可用；不重启政策下收束完成即终态记录。
 
-init 完成授权图发布后进入持续监督循环；全部受管服务收束完毕后转入稳态等待自身管理端点，不以自我终止结束生命周期。此时若系统不存在任何工作源——无就绪线程、无期限、无设备——静默停机即正确终态：无人能再投递的等待不构成工作，持久监督者的存在不改变停机判定。设备接入后设备中断即工作源，静默停机自然失效，终态改由显式关机路径决定。
+init 完成授权图发布后进入持续监督循环；全部受管服务收束完毕后仍由用户态政策决定继续监督、关机或重启。无就绪线程、无期限或全部 hart 进入 WFI 只描述调度状态，不构成隐式停机；系统终局必须经 [`system-reset.md`](system-reset.md) 定义的 authority 显式提交。
 
-init 的退出、panic、fault 或显式 kill 在内核中仍按普通进程处理：已经交付的 capabilities 与服务可以继续运行，内核不级联终止服务、不自动重启 init，也不重新铸造丢失 authority。但系统会失去唯一的拓扑维护、恢复和资源收束保证，进入配置定义的 unmanaged/failed 状态；平台可选择继续、停机或重启。这里没有 init 专用内核回收路径，只有用户态政策上的管理根失效。
+init 的退出、panic、fault 或显式 kill 在内核中仍按普通进程处理：已经交付的 capabilities 与服务可以继续运行，内核不级联终止服务、不自动重启 init，也不重新铸造丢失 authority。但系统会失去唯一的拓扑维护、恢复、资源收束和系统复位保证，进入配置定义的 unmanaged/failed 状态。这里没有 init 专用内核回收或自动停机路径，只有用户态政策上的管理根失效。
 
 归档内路径只属于 initfs 协议。内核不提供按路径 spawn，也不因二进制名称授予 authority。
 

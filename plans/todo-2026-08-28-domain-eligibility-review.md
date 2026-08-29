@@ -28,11 +28,11 @@
 - FairClass::pick 的 Reserved 轮转（pop→push_back）在有界轮次内终止：marker 不被 pick 消费、不参与 has_ready，协议四要素逐点复核。
 - 域路由的唯一性：reserve_ready/commit_ready/rollback_ready 的 domain 参数全部来自同一 resolve 结果（start_staged 局部变量），无中途重解析导致域漂移。
 
-### scoping 与静默谓词
+### scoping 与 idle 路由
 
 - enqueue 的域路由（t.process.domain）与 pick 的域来源（me_domain）一致性：debug 断言只覆盖 dispatch 点，wake 路径（wait::wake → sched::enqueue）与 Requeue 路径的域来源审查——是否所有容器转换都结构性地落在绑定域。
 - per-domain idle 位图的双重检查闭合：登记 idle 后查本域 has_ready 的窗口（他域 enqueue 打本域门铃、本域 enqueue 在登记前）——IPI 丢失不可能（门铃只发给已登记 idle 位，登记后必有重查）。
-- is_quiescent 的全域谓词：idle 位图并集 == active mask 的论证（hart 恰属一域、域内位即全局位）；per-hart TimerQueue 判空仍遍历全部 hart（等待无调度域归属）。
+- `is_quiescent` 已由显式系统复位删除；确认 per-domain idle 位图只用于 IPI 目标选择，不再聚合成整机生命周期谓词。
 - IPI 目标展开（ipi_slots）消费域内位图：slot→raw hartid 转换边界未变。
 
 ### D64 负载与验证线
@@ -44,6 +44,6 @@
 
 ### 既有回归面
 
-- 单域拓扑（virt/sifive_u）行为等价：域数 1 时 idle/pick/quiescent 与改造前单域语义逐点等价（除日志行外无行为差异）。
+- 单域拓扑（virt/sifive_u）下域内 idle/pick/IPI 路由与多域使用同一机制；系统终局独立走 capability 授权的显式 reset。
 - init 的 ustar 字母序启动新增 srv_fp（pid 序移位）：init/pm 剧本对 pid 的硬编码引用（若有）不受影响——验收线通过已旁证，审查确认无 pid 字面量假设。
 - user workspace 裸 check（imac 默认 target）经 srv_fp 的位型接口保持绿：freg 操作数类已消除，确认无其他 target-feature 依赖面。

@@ -539,8 +539,8 @@ fn reap(t: Arc<Thread>) {
     drop(process);
 }
 
-/// idle：在本域登记空闲位 → 静默检测 → 按期限表 arm（无期限则卸载）→
-/// wfi。醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
+/// idle：在本域登记空闲位 → 双重检查就绪工作 → 按期限表 arm（无期限则卸载）
+/// → wfi。醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
 fn idle() {
     let domain = current_domain();
     let bit = 1u64 << hart::current().slot();
@@ -550,14 +550,6 @@ fn idle() {
     if domain.has_ready() {
         domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
         return;
-    }
-    if is_quiescent() {
-        log!(
-            Sched,
-            "system quiescent (no waker), powering off; {} frame(s) free",
-            crate::frame::free_frames()
-        );
-        sbi::shutdown();
     }
 
     let earliest = timers().lock().peek_expires_at();
@@ -583,26 +575,4 @@ fn sip_stip_pending() -> bool {
     // SAFETY: 只读 sip。
     unsafe { asm!("csrr {}, sip", out(reg) sip, options(nomem, preserves_flags)) };
     sip & (1 << 5) != 0
-}
-
-/// 终端静默：无任何唤醒主人——预期 hart 全部已进 idle（无人能再
-/// 产生工作：enqueue 只来自运行中的 hart）、所有域就绪队列空、各 hart
-/// 期限表皆空、无设备中断使能（当前无设备；接入后设备即主人，谓词自然
-/// 失效）。新增等待源时本谓词必须同步扩展：每种 Waiting 都要有可
-/// 枚举的主人，否则静默误判为停机。IPC 等待者（邮箱/信号）刻意**不**
-/// 阻止静默：hart 全 idle 时不存在能投递消息/信号的执行流，等待者
-/// 永无主人，停机即正确终态。
-fn is_quiescent() -> bool {
-    let table = domains();
-    // hart 恰属一域：各域 idle 位图的并集即全局空闲位图。
-    let mut idle_union = 0u64;
-    for domain in table.domains.iter().take(table.plan.domain_count()) {
-        let Some(domain) = domain else { continue };
-        if domain.has_ready() {
-            return false;
-        }
-        idle_union |= domain.idle_mask.load(Ordering::SeqCst);
-    }
-    idle_union == crate::registry::active_slot_mask()
-        && HART_TIMERS.iter().all(|t| t.lock().is_empty())
 }

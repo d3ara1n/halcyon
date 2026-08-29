@@ -1309,6 +1309,11 @@ pub fn launch_bootstrap(
     let mut handles = handles;
     handles.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
     handles.push(control_handle);
+    assert_eq!(
+        handles.len(),
+        erhino_shared::startup::initial::HANDLE_COUNT,
+        "initial capability graph has an unexpected handle count"
+    );
 
     let token = super::handle::transaction_token();
     let reservation = {

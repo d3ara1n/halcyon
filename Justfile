@@ -43,9 +43,9 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+
 # --set 均不穿透嵌套子进程，故不用它们传油门）。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 无 shutdown 设备平台（sifive_u）的运行阶段硬上限。它只是挂死兜底，
-# 不是期望耗时：完整验收实测到达 quiescent 约 15s（全速）/ 21s（节流
-# 50%；矩阵多为 timer 驱动，节流不线性放大），故取 60s 约 3x 余量——
-# 锁得太紧会把正常轮次砍在矩阵中段，形态与真挂死无法区分。
+# 不是期望耗时：完整验收实测约 15s（全速）/ 21s（节流 50%；矩阵多为
+# timer 驱动，节流不线性放大），随后显式 reset 返回失败并由 wrapper 收割。
+# 60s 约 3x 余量——不得调小到完整验收面以内。
 ACCEPTANCE_TIMEOUT := env_var_or_default("ACCEPTANCE_TIMEOUT", "60")
 
 # gdb
@@ -125,7 +125,7 @@ virt:
 
 # 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
 # Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 服务
-# 只在 FD 域运行（fp verification passed）、全负载静默停机。
+# 只在 FD 域运行（fp verification passed）、全负载收束后显式停机。
 virt-hetero:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
     @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
@@ -141,13 +141,13 @@ virt-nofd:
 # release 验证线（阶段收尾必跑）：debug 代码生成不在 ecall 周边把活值留在
 # t 系寄存器，用户侧寄存器保持语义只有 release 能测出（2026-08-28 trap
 # 入口 x5 破坏事故，调查档案见 plans/archived/）。通过标准与 virt 同：
-# 全负载验收线 + 静默停机退出。
+# 全负载验收线 + 显式 reset 后 QEMU 退出。
 virt-release:
     @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance -smp cores=4
 
-# sifive_u 无 shutdown 设备：负载完成后 QEMU 不自退出，运行阶段以 timeout
-# 收束（上限见 ACCEPTANCE_TIMEOUT）；只有验收锚点齐全且无失败锚点
-# 时，平台 timeout 才转换为成功。
+# sifive_u 无 shutdown 设备：显式 reset 返回失败后 QEMU 不自退出，wrapper
+# 在失败终态锚点出现时主动收割；ACCEPTANCE_TIMEOUT 只兜底真挂死。只有
+# 全部验收锚点齐全且无其他失败锚点时，该平台结果才转换为成功。
 sifive_u:
     @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_timed -smp cores=5
 
