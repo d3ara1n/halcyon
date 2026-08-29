@@ -1,15 +1,16 @@
 # 线程资源模型与用户态多线程（ThreadSpawn）
 
-> COMPASS 当前自然序主项。两批构成：① Start 拆解——线程升格为组装资源，
-> 外部组装通道补全；② ThreadSpawn——内部通道接入，用户态多线程落地。
-> 前置全部就绪（step 7 teardown barrier、step 8 域 eligibility、step 9 竞态
-> 矩阵；接入面清单见 archived/todo-2026-08-28-thread-teardown-barrier.md）。
+> 批一 Start 拆解及事务复审已收口；批二 ThreadSpawn 暂缓。多线程 teardown、
+> 域 eligibility 与竞态矩阵等内核前置已经就绪，但 Running 进程尚无完整
+> Map/Unmap、guard 与 remote TLB shootdown，无法兑现用户供栈的完整政策面。
+> 当前由 [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)
+> 阻塞；该计划收口后先重审本篇用户态资源契约，再实施批二。
 
 ## 决策记录
 
 | # | 决策 | 结论 |
 |---|---|---|
-| D1 | 次线程栈归属 | 用户供栈。内核 spawn 零资源分配；栈大小/guard/放置是应用政策。普通进程首栈本就由 libprocess 供（ProcessMap），本设计将其推广为「一切栈用户供」，`USER_TOP-8MiB` 降格为 libprocess 放置约定 |
+| D1 | 次线程栈归属 | 用户供栈。内核 spawn 不分配用户地址空间 backing；仍分配有固定结构上界的 Thread、观察壳与容器容量。栈大小/guard/放置/回收是应用政策。该方向不等于允许以 Extend 堆块作为永久降级实现：批二须等待完整 Map/Unmap 前置收口后再定用户态接口 |
 | D2 | join 形态 | 内核铸造 waitable 观察壳（第四对 core/shell）。离场是内核自有事实（成员表摘除），内核事实经内核对象观察，与 REAPABLE/CLOSED 同纪律；亦为未来 ThreadKill 预留（壳不依赖 wrapper 跑完） |
 | D3 | ThreadKill | 首版不实现，保留号维持不可用。延后不锁面：成员表 tid 寻址、泛化终止机器、join 壳三项前置均在本次落地；将来需加终止标志位 + pick gate/trap 入口检查扩展，是加检查不是改结构。壳携带离场方式字（v1 仅 Normal），未来 Killed 增判别值不改 ABI |
 | D4 | 线程数上界 | shared 常量 `PROCESS_MAX_THREADS = 1024`，约束**并发成员数**（表长），超限 `ReachLimit`；tid 单调不复用（生灭循环不耗尽）。附带红利：终止取消循环（线程数 × WAIT_MANY_MAX）获得结构上界 |
@@ -58,7 +59,7 @@ Building/Running 的本质即外部写通道的开/关。组装者（init/pm 经
 
 | op | 通道 | 语义 |
 |---|---|---|
-| `ThreadSpawn(entry, sp, arg1, arg2) → (tid, handle)` | 内部，Running 专属 | 零资源分配：只创建执行基底（UserContext + 调度链 + join 壳）；sp/entry 做 translate 前置校验，坏 sp 的 fault 走用户 fault 杀进程。arg1/arg2 为出生参数（rinlib 以 arg1 传 wrapper 上下文，TLS 延后期间的用户态替代） |
+| `ThreadSpawn(entry, sp, arg1, arg2) → (tid, handle)` | 内部，Running 专属 | 不分配用户 backing：创建内核执行基底（UserContext + 调度链 + join 壳）；内核元数据在可失败段完成有界预留。sp/entry 做 translate 前置校验，坏 sp 的 fault 走用户 fault 杀进程。arg1/arg2 为出生参数；安全用户态封装待 Map/Unmap 前置完成后重新设计 |
 | `ThreadExit(code)` | 内部 | 本线程离场；末线程冻结 `(Exited, code)`（code 仅在此刻成为进程终态字段——lifecycle 的进程终因，不是线程遗产）。非末线程 code 丢弃，结果值走用户通道（spawn 时用户分配 result 槽，wrapper 先写后 exit） |
 | `ThreadYield` | 内部 | 自入队尾，复用公平 FIFO |
 | `ProcessAttach(builder, entry, sp, arg1, arg2) → tid` | 外部，Building 专属 | 组装者附线程；无观察壳；arg1/arg2 与内部 Spawn 同形（首线程传出生块地址与长度） |
@@ -123,7 +124,7 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 ### 实施批次总览
 
 1. **批一：Start 拆解**——ProcessAttach/ProcessGrant/Start 纯化、ABI 两侧（shared + rinlib/libprocess + 全负载组装路径）、init bootstrap 内嵌同构序列、startup 机制删除、出生块转用户约定。验证：全负载等价回归（virt/virt-release/hetero/nofd/sifive_u/host）。
-2. **批二：ThreadSpawn/Exit/Yield + join 壳**——spawn 事务（预育结构已在批一落地）、末线程冻结边、tid 从 1、cap、rinlib thread.rs 桩重写（wrapper 栈从 Extend 堆分配）。验证：等价回归 + 多线程功能负载。
+2. **批二：ThreadSpawn/Exit/Yield + join 壳（受内存前置阻塞）**——spawn 事务（预育结构已在批一落地）、末线程冻结边、tid 从 1、cap；在完整 Map/Unmap、guard 与 TLB shootdown 收口后，先重审栈/wrapper/结果槽/join handle 的用户态所有权，再实现 rinlib。验证：等价回归 + 多线程功能负载。
 3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步**——见下两节。
 
 每个实现或修复批次独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。

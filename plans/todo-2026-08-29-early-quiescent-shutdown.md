@@ -1,8 +1,18 @@
 # 提前 quiescent 停机调查计划
 
-> 【待实施计划】发现于批一 review 收口验证（2026-08-29）。首份现场基于
-> `275e4f1`，该提交已包含线程模型改造，故现有证据不能判定引入批次。当前
-> 状态：现场已抓、根因未定性。
+> 【待实施计划，由显式复位计划承接】发现于批一 review 收口验证
+> （2026-08-29）。首份现场基于 `275e4f1`，该提交已包含线程模型改造，故
+> 现有证据不能判定引入批次。现场已抓，触发竞态未定性；架构收束方向已确认
+> 为删除 quiescent → SRST 路径，实施见
+> [`todo-2026-09-explicit-system-reset.md`](todo-2026-09-explicit-system-reset.md)。
+
+## 收束决策
+
+本问题暴露的不只是某个原子窗口，也包括政策归属错误：内核不能从「当前无
+可枚举 waker」推导用户态已经决定关机。后续不在原谓词上增加重试、保守
+进程计数或全局锁；显式复位计划将删除该正常路径，由 init 完成验收/监督收束
+后命令持 authority 的 power 服务提交 reset。下文调查方向作为现场解释与回归
+构造依据保留，不再驱动对 quiescent 谓词的局部修补。
 
 ## 现象
 
@@ -70,8 +80,12 @@ review 报告 §B3 已把「IPI 投递到入睡 secondary hart」标为头号嫌
 
 ## 完成标准
 
-- 根因定性并有机制级修复（不接受「加重试/放宽谓词」式补丁）；
-- virt 与 sifive_u 各 20+ 轮无复现，帧数恒为正常终态值；
-- 结论入档：方向进 `notes/ideas/task.md`（若涉及静默停机公理）或
-  `notes/impls/task.md`「调度」（若为实现层竞态）；
-- 若确认与 review §B 的 sifive_u 挂死同源，更新该报告 §B 的定性并归档。
+- 显式复位机制删除所有 idle/quiescent → SRST 正常路径，reset 只可由 capability
+  授权的用户态请求触发；
+- acceptance 用显式 reset 终态锚点替代 quiescent 锚点，并仍在收割后检查全部
+  业务/资源必需锚点；业务完成前 reset 必然 fail-closed；
+- virt 与 sifive_u 各连续压力验证，reset 提交点帧数恒为正常终态值，不再出现
+  负载存活帧数即停机；
+- 方向结论进入 power/kernel/bootstrap ideas，实际结构进入对应 impls；
+- 若后续证据能确认旧 sifive_u 挂死与本现场同源，更新原 review 定性；该确认
+  不再作为删除错误机制的前置。
