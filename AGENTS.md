@@ -22,7 +22,8 @@
 ```
 os/        内核 workspace：
              kernel/          erhino_kernel（no_std）
-             dtb/ frame_pool/ page_table/ tar/ elf/   纯逻辑 crate，host 可测
+             dtb/ frame_pool/ page_table/ tar/ elf/ handle_table/
+             wait_context/ timer_queue/ stack_layout/ sched_domain/   纯逻辑 crate，host 可测
 shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、同步原语）；FAL 是纯用户态线协议，落 user/frameworks/libfal，不在此处
 user/      用户态 workspace（rinlib、systems/、frameworks/、drivers/）
 notes/     设计文档：
@@ -40,9 +41,10 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 - 秒级检查：`just check`（内核 target 需要 build-std，等价于 `cd os && cargo check -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`）；`cd shared && cargo check`。
 - host 单测（纯逻辑 crate，毫秒级）：**必须显式指 host target**——os workspace 默认 target 是 riscv，`cargo test` 直接跑会拿 no_std 环境去链 std：
   ```sh
-  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb --target aarch64-apple-darwin
+  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain --target aarch64-apple-darwin
+  cd shared && cargo test --target aarch64-apple-darwin   # shared 也需显式 host target
   ```
-- 集成验证：`just virt`（4 核）——对照负载跑完后系统静默自停机（SBI SRST），QEMU 退出即通过；agent 环境仍需带超时防挂起，判定看启动日志关键行。`just virt` 默认经 `tools/qemu-throttle.sh` 节流到 50% CPU（guest 跑飞/panic 时 QEMU 满核空转的兜底，见 Justfile `THROTTLE`），墙钟耗时约翻倍、验证语义不变，全速调试用 `THROTTLE=100 just virt`（油门经环境变量穿透嵌套 recipe，recipe 参数写法无效）；**阶段收尾前必跑 `just virt-release`**——debug 代码生成不在 ecall 周边把活值留在 t 系寄存器，用户侧寄存器保持语义只有 release 能测出（trap 入口 x5 破坏事故，见 plans/archived 调查档案）；`sifive_u` 是老的 HiFive Unleashed 硬件模型：hart 0 无 MMU、可运行 hart 为 1–4、DRAM 仅 128MiB、timebase 为 1MHz，boot hart 不固定。当前 QEMU 使用 OpenSBI 现代 SBI（以启动日志和 BASE 探测为准），不得因机器模型历史包袱使用 SBI v0.1 核心 ABI。该模型没有平台 shutdown device，SRST 扩展可能存在但 shutdown 不保证让 QEMU 退出；验证时先单独完成构建，再对已编译的 QEMU 运行阶段使用 **`timeout 5s`**（硬上限 10 秒），只比较最后若干行输出，不得把冷编译耗时计作内核运行卡死。`sifive_u` 只覆盖上述板级差异，不为其引入专用内核机制；出现挂起先检查内核并发、IPI、timer、SMP 启动同步，再判断为平台限制。
+- 集成验证：`just virt`（4 核）——对照负载跑完后系统静默自停机（SBI SRST），QEMU 退出即通过；agent 环境仍需带超时防挂起，判定看启动日志关键行。`just virt` 默认经 `tools/qemu-throttle.sh` 节流到 50% CPU（guest 跑飞/panic 时 QEMU 满核空转的兜底，见 Justfile `THROTTLE`），墙钟耗时约翻倍、验证语义不变，全速调试用 `THROTTLE=100 just virt`（油门经环境变量穿透嵌套 recipe，recipe 参数写法无效）；**阶段收尾前必跑 `just virt-release`**——debug 代码生成不在 ecall 周边把活值留在 t 系寄存器，用户侧寄存器保持语义只有 release 能测出（trap 入口 x5 破坏事故，见 plans/archived 调查档案）；`sifive_u` 是老的 HiFive Unleashed 硬件模型：hart 0 无 MMU、可运行 hart 为 1–4、DRAM 仅 128MiB、timebase 为 1MHz，boot hart 不固定。当前 QEMU 使用 OpenSBI 现代 SBI（以启动日志和 BASE 探测为准），不得因机器模型历史包袱使用 SBI v0.1 核心 ABI。该模型没有平台 shutdown device，SRST 扩展可能存在但 shutdown 不保证让 QEMU 退出；运行阶段统一走 **`just sifive_u`**：经 throttle 包装，`tools/qemu-acceptance.sh` 在日志出现终态锚点（quiescent 或 panic 收束）时主动收割，正常轮次实测约 20s；`ACCEPTANCE_TIMEOUT`（默认 60s）只是真挂死的兜底，不是期望耗时，不得为“看着快”把它调小到验收面完成时长以下——砍在矩阵中段的形态与真挂死无法区分。判定只看锚点与最后若干行输出，不得把冷编译耗时计作内核运行卡死。`sifive_u` 只覆盖上述板级差异，不为其引入专用内核机制；出现挂起先检查内核并发、IPI、timer、SMP 启动同步，再判断为平台限制。
 - 开发机是 macOS：`just dtc qemu riscv64-elf-binutils riscv64-elf-gdb` 来自 Homebrew。打 tar 包时注意 bsdtar 的 `._` AppleDouble 文件会污染 initfs（历史上因此 panic 过）。
 - Rust nightly（`rust-toolchain` 钉住），edition 2024。
 - 在调查内核异常比如卡死的情况时，需要先编译后运行，编译会在十秒内完成，所以超时时间为 10 秒，运行会在 2 秒内完成，所以超时时间只能是 2 秒（`just virt` 默认节流 50% 时墙钟约翻倍，按 4 秒计）。两个同时进行那么超时时间就是 12 秒（节流档 14 秒）。任何高于这个时间的超时设定都没有任何能产生实质改变的意义，只会增加 qemu 进程的空跑，增加电脑发烫时间。

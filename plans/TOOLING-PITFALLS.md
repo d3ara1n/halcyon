@@ -39,10 +39,16 @@
 - 节流档下 QEMU 被后台化，终端 Ctrl-C 不再直达 guest（脚本捕获后清理退出）。
 - 脚本退出/被杀必先 SIGCONT 解冻再清理，仅 SIGKILL 才可能残留 STOP 态
   （进程活着但完全不动），`kill -CONT <pid>` 解冻。
+- **`THROTTLE=100` 不等于裸跑**：100 档虽然 exec 直接接管不再 STOP/CONT，
+  但验收管道自身仍有开销（实测 virt 4 核：50% ≈ 20s、100% ≈ 13s）；
+  计时对比要在同一档位内做，不要拿节流档数据推全速。
 
 ## 输出与日志
 
 - **stdout 经管道/文件是缓冲的**：SIGTERM 杀 QEMU 丢失未刷出的尾部输出。
+  「日志停在 X」可能只是缓冲假象——结论要靠 gdb/-d int 物理证据交叉验证。
+  `tools/qemu-acceptance.sh` 挂起模式在终态锚点出现后也会主动杀 QEMU，
+  收割前留 0.2s 等尾部刷出，判定仍以锚点集为准。
   「日志停在 X」可能只是缓冲假象——结论要靠 gdb/-d int 物理证据交叉验证。
 - `-d exec` 日志在部分场景看不到内核地址的 TB（与实际执行矛盾，原因未知），
   勿作为证据。
@@ -70,5 +76,11 @@
 
 - **QEMU sifive_u 的 U54 模型 senvcfg 可读不可写**：csrr 成功、csrw 触发
   illegal instruction。「实现了读」不等于「可写」，WARL 核验序列每一步都要守卫。
-- sifive_u 无 shutdown device：负载完成后 QEMU 不自退出，`just sifive_u`
+- sifive_u 无 shutdown device：负载完成后 QEMU 不自退出，`just sifive_u` 以
+  终态锚点（quiescent / panic 收束）主动收割，`ACCEPTANCE_TIMEOUT`（默认 60s）
+  只作真挂死兜底；判定只看日志锚点集。**超时值不得往小调到验收面
+  耗时以下**——砍在矩阵中段的形态（无 panic、无 quiescent、日志断在 spawn 附近）
+  与真挂死逐字同形，历史上因此把基础设施失败误读为内核挂死（批一报告 A4/§B）。
+- **裸跑 QEMU 后必须 `just clean-qemu`**：验收脚本自己会清（挂起模式 trap 同时
+  收 runner 与 tailer），但 agent 手动拼命令行跑完容易漏下孤儿进程占满核。
   已内置运行阶段超时收束，通过与否看日志关键行（全员回收 / `[Sched] 系统静默`）。

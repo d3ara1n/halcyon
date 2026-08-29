@@ -42,6 +42,11 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+
 # `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与
 # --set 均不穿透嵌套子进程，故不用它们传油门）。
 THROTTLE := env_var_or_default("THROTTLE", "50")
+# 无 shutdown 设备平台（sifive_u）的运行阶段硬上限。它只是挂死兜底，
+# 不是期望耗时：完整验收实测到达 quiescent 约 15s（全速）/ 21s（节流
+# 50%；矩阵多为 timer 驱动，节流不线性放大），故取 60s 约 3x 余量——
+# 锁得太紧会把正常轮次砍在矩阵中段，形态与真挂死无法区分。
+ACCEPTANCE_TIMEOUT := env_var_or_default("ACCEPTANCE_TIMEOUT", "60")
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -141,7 +146,7 @@ virt-release:
     @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance -smp cores=4
 
 # sifive_u 无 shutdown 设备：负载完成后 QEMU 不自退出，运行阶段以 timeout
-# 收束（AGENTS.md：运行阶段硬上限 10s）；只有验收锚点齐全且无失败锚点
+# 收束（上限见 ACCEPTANCE_TIMEOUT）；只有验收锚点齐全且无失败锚点
 # 时，平台 timeout 才转换为成功。
 sifive_u:
     @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_timed -smp cores=5
@@ -152,10 +157,12 @@ clean-qemu *args:
     @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
 
 [private]
+run_qemu_acceptance_timed +OPTIONS: make_dtb make_boot_package build_kernel
+    @echo -e "\033[0;36mQEMU: Simulating acceptance (CPU throttled to {{THROTTLE}}%, hard timeout {{ACCEPTANCE_TIMEOUT}}s)\033[0m"
+    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{ACCEPTANCE_TIMEOUT}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+
+[private]
 run_qemu_acceptance +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating acceptance (CPU throttled to {{THROTTLE}}%)\033[0m"
     @tools/qemu-acceptance.sh -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
 
-[private]
-run_qemu_acceptance_timed +OPTIONS: make_dtb make_boot_package build_kernel
-    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground 5 {{QEMU_LAUNCH}} {{OPTIONS}}

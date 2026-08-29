@@ -62,7 +62,7 @@ Building/Running 的本质即外部写通道的开/关。组装者（init/pm 经
 | `ThreadExit(code)` | 内部 | 本线程离场；末线程冻结 `(Exited, code)`（code 仅在此刻成为进程终态字段——lifecycle 的进程终因，不是线程遗产）。非末线程 code 丢弃，结果值走用户通道（spawn 时用户分配 result 槽，wrapper 先写后 exit） |
 | `ThreadYield` | 内部 | 自入队尾，复用公平 FIFO |
 | `ProcessAttach(builder, entry, sp, arg1, arg2) → tid` | 外部，Building 专属 | 组装者附线程；无观察壳；arg1/arg2 与内部 Spawn 同形（首线程传出生块地址与长度） |
-| `ProcessGrant(builder, grants_ptr, count) → 句柄值数组` | 外部，Building 专属 | 从组装者表摘 grants 装入目标表并输出句柄值（pin/commit 机制自原 Start 事务原样搬运）；组装者将值写入出生块后经 ProcessWrite 落盘 |
+| `ProcessGrant(builder, grants_ptr, count, out_values) → ()` | 外部，Building 专属 | 从组装者表摘 grants 装入目标表，句柄值写回 out_values（pin/commit 机制自原 Start 事务原样搬运）；组装者将值写入出生块后经 ProcessWrite 落盘。out_values 为第四参（写回目标），签名与实现一致 |
 | `ProcessStart(builder, profile)` | 外部 | 活体检查门（已附线程 ≥1，唯一前置检查）→ Building→Running（含预育原子提取）→ 域绑定与执行需求冻结（profile 为判定输入，进程级属性）→ 预育线程逐条入册。参数为平铺 (builder, profile)，无描述符 |
 
 - **join**：`WaitMany(壳 Handle, DONE)`，不设 ThreadJoin syscall（0x23 保留号留空）；结果值读用户槽。**内存序契约**：离场线程在 ThreadExit 前的全部用户态存储对 joiner 可见——release/acquire 经 lifecycle 锁（RV AMO aq/rl）与 finish_offered 完成链传递。
@@ -112,25 +112,18 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 
 | 线 | 结果 |
 |---|---|
-| `just check`（内核） | ✅ 零错误零警告 |
+| `just check`（内核） | ✅ 零错误（1 条环境性链接器警告：`riscv64-elf-ld` RWX LOAD segment） |
 | host 单测（shared 7/7、handle_table 18/18） | ✅ |
 | `just virt`（debug，全速 11s / 节流 50% 90s） | ✅ 锚点全命中，矩阵 10/10，静默停机 |
 | `just virt-release` | ✅ 同上 |
 | `just virt-hetero` / `just virt-nofd` | ✅ |
-| `just sifive_u` | ❌ **确定性挂死（未决，见下）** |
+| `just sifive_u` | ✅ 验收面全命中（原记「确定性挂死」已证伪，见下） |
 
-**未决问题：sifive_u 竞态矩阵 kill-vs-exit 确定性挂死**
+**原记「sifive_u 确定性挂死」已证伪**（batch1 review 报告 §B，55+ 轮零真挂死）
 
-- 现象：系统推进至 `race kill-vs-kill passed (code wins 4/0)` 后，kill-vs-exit round 0 中 init 侧卡在 `h.report(0)`（等锤回执）；锤（pid 18/19）与靶均无后续输出。virt（4 核）同场景 10/10 全绿，仅 sifive_u（5 核）挂死。约 25s 后 QEMU 被 timeout 收割，无 panic、无 quiescent（未观测到静默停机——非正常自停）。
-- 已排除：
-  - libprocess spawn 流程本身（步进探针显示 round 0 的 spawn 全部完成，包括 attach/start）；
-  - kill-vs-kill 场景（通过，锤侧探针大量打印，说明锤的 cmd/gun 通路在该场景正常）；
-  - 用户态组装语义错误（virt 全绿证明新 ABI 语义正确）。
-- 挂死时锤完全静默（探针无输出）——锤未收到 cmd 消息、或未等枪、或未被调度。候选方向（按优先级）：
-  1. **kill-vs-exit 是矩阵中第一个「spawn 带枪靶 + 立即 fire」的完整场景**——与 kill-vs-kill（靶是常驻 hammer target，复用通路）不同，它新建靶进程并立即 gun.signal。怀疑点：新靶（D64? 否，Base64）spawn 后 IPI 门铃丢失（idle 位图窗口）、或 5 核下 wake_one 静默谓词遍历域时 hart 状态机异常；
-  2. sifive_u 专属：timebase 1MHz（virt 10MHz）导致 timeout 换算差异？已确认 tick 换算按 timebase，风险低但未排除；
-  3. 调查路径建议：GDB 多核断点（`tools/` 下有 sifive 探针脚本旧档），或先在 virt 上以 5 核复现（`-smp cores=5`）判断是否核数相关而非平台相关——**这是第一条分岔实验，优先做**。
-- 调查探针（保留在提交中，收口时移除）：`user/systems/init/src/race.rs`（kill-vs-exit round/spawn/draining 三点）、`user/systems/srv_hammer/src/main.rs`（gun consumed / killing / report ready 三点）。
+- 当时观察（推进至 kill-vs-kill 后卡在 kill-vs-exit）来自**开发中间态代码**：唯一确凿的真挂死现场（`artifacts/.qemu-acceptance-50536.log`，03:53）时点在 `794a4c0` 提交前 36 分钟，不对应任何已提交版本；同窗口 04:25/04:27 又有 10/10 全绿日志，「确定性」不成立。
+- 已提交代码上的可观测失败均有着落：① **负载缺陷**——kill-vs-start 靶入口页写 wfi，U-mode 执行必然 IllegalInstruction（riscv-isa machine.adoc），靶上核首条指令即 Fault 与 kill 争终因；② **验收基础设施**——`run_qemu_acceptance_timed` 5s 硬超时且未经 throttle，完整验收需 ~15s（全速），必然砍在矩阵中段，形态与挂死无法区分。两者已修（入口指令改 `j .`；timed 线接 throttle + 终态锚点主动收割 + `ACCEPTANCE_TIMEOUT` 60s 兜底）。
+- 复现装备留档（批一报告 §B4）：hang-hunt 判据（日志停增 + 无终态 + QEMU 存活）+ `qemu -s` gdbstub + `riscv64-elf-gdb thread apply all bt`；gdbstub 会改变时序，复现概率可能下降。若再次复现：优先 GDB 多采样（条件自旋的静态 PC 需多样本），次选在 `send_ipi` 与 `idle()` wfi 醒来处加计数探针。
 - 实验污染警示：`artifacts/` 下有手动实验残留（sifive-manual.log 等，使用过陈旧 boot-package，证据无效）；调查一律走 `just` recipe 管道保证产物新鲜。
 
 ### 实施批次总览
@@ -165,7 +158,7 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 - `notes/ideas/task.md`：归属判据、无角色平等、线程=资源双通道表、生杀闭环公理；「主线程」措辞全清（→ 首线程）；
 - `notes/impls/task.md`：预育表（成员表 Building 期形态）、spawn 事务、join 壳、末线程冻结边、tid/cap；
 - `notes/impls/mm.md`：栈区布局改述为 libprocess 放置约定（内核常量仅存 bootstrap init）；
-- `notes/impls/startup.md`：出生块转用户约定，内核机制面收缩为「init 内嵌组装 + payload 收编」；
+- `notes/impls/startup.md`：出生块转用户约定，内核机制面收缩为「init 内嵌组装 + payload 收编」；出生块 `parent_pid` 语义定死为「组装者自身 pid（= 目标的创建者）」，与内核 ProcessQuery 快照同一真值；
 - `notes/ideas/call.md`：新调用语义与保留号处置；
 - COMPASS：收口时更新位置与自然序。
 

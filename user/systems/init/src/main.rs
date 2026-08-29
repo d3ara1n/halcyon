@@ -34,8 +34,7 @@ use rinlib::{
         object::{Handle, ObjectSignals, Rights},
         proc::{
             HandleGrant, JobMemberKind, JobState, ProcessDrainStatus, ProcessExitReason,
-            ProcessAttachDescriptor, ProcessMapFlags, ProcessState, ExecutionProfile,
-            PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
+            ProcessState, ExecutionProfile,
         },
         wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
     },
@@ -46,7 +45,7 @@ use libprocess::{
 use librunnel::blocking;
 
 mod race;
-use race::race_matrix;
+use race::{build_spin_building, race_matrix};
 
 /// 受监督服务：init 保留的 control 与 pid。
 struct Supervised {
@@ -973,49 +972,12 @@ fn seal_before_start(job: Handle) {
         debug!("seal gate (start) FAILED: job create failed");
         return;
     };
-    let Ok(created) = process::create(child, SUPERVISOR_RIGHTS) else {
-        debug!("seal gate (start) FAILED: process create failed");
+    // 手工构建可启动的 Building：入口页（自旋）+ 栈顶页（失败自清理）。
+    let Ok(created) = build_spin_building(child) else {
+        debug!("seal gate (start) FAILED: building");
         let _ = close(child);
         return;
     };
-    // 手工构建可启动的 Building：入口页（wfi）+ 栈顶页。
-    let mapped = process::map(
-        created.builder,
-        0x1000,
-        PROCESS_PAGE_SIZE,
-        ProcessMapFlags::READ | ProcessMapFlags::EXECUTE,
-    )
-    .and_then(|_| {
-        process::write(created.builder, 0x1000, &[0x73, 0x00, 0x50, 0x10])
-    })
-    .and_then(|_| {
-        process::map(
-            created.builder,
-            PROCESS_USER_TOP - PROCESS_PAGE_SIZE,
-            PROCESS_PAGE_SIZE,
-            ProcessMapFlags::READ | ProcessMapFlags::WRITE,
-        )
-    });
-    if let Err(error) = mapped {
-        debug!("seal gate (start) FAILED: building {:?}", error);
-        let _ = close(created.builder);
-        let _ = close(created.control);
-        let _ = close(child);
-        return;
-    }
-    let attach = process::attach(created.builder, &ProcessAttachDescriptor {
-        entry: 0x1000,
-        stack_pointer: PROCESS_USER_TOP as u64,
-        arg1: 0,
-        arg2: 0,
-    });
-    if let Err(error) = attach {
-        debug!("seal gate (start) FAILED: attach {:?}", error);
-        let _ = close(created.builder);
-        let _ = close(created.control);
-        let _ = close(child);
-        return;
-    }
     let sealed = process::seal_job(child);
     let started = process::start(created.builder, ExecutionProfile::Base64 as u32);
     let gated = matches!(started, Err(SystemCallError::ObjectClosed));

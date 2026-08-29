@@ -28,6 +28,9 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`todo-2026-08-28-thread-teardown-review.md`](todo-2026-08-28-thread-teardown-review.md) | 生命周期 step 7（多线程 teardown barrier，提交 d741880）的未来审查计划：成员表不变量、游标取消锁序、汇编出口归一、写回复检即杀 |
 | [`todo-2026-08-28-domain-eligibility-review.md`](todo-2026-08-28-domain-eligibility-review.md) | 生命周期 step 8（调度域 eligibility，提交 1d7dc92）的未来审查计划：域推导、绑定冻结、路由与多域停机 |
 | [`todo-2026-08-28-persistent-init-review.md`](todo-2026-08-28-persistent-init-review.md) | 生命周期 step 6（持久 init/pm 委托域）的未来审查计划：authority 边界、收束兜底与 quiescent 相容性 |
+| [`todo-2026-09-thread-model.md`](todo-2026-09-thread-model.md) | 线程资源模型三批计划：批一（Start 拆解）已落地并过代码 Review；批二 ThreadSpawn/Exit/Yield + join 壳待做 |
+| [`todo-2026-09-thread-model-review.md`](todo-2026-09-thread-model-review.md) | 批一（`794a4c0`）的 review 轴；报告已收口见 `review-2026-08-29-thread-model-batch1.md` |
+| [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md) | 负载存活时误判 quiescent 停机（virt 帧数 234158 vs 正常 248843）；可能是批一 review §B 那个无法定性的 sifive_u 「挂死」真身；低频竞态 |
 
 常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
 
@@ -52,7 +55,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 ## 位置
 
 - 已完成：boot/高半区启动协议、帧池（os/frame_pool）、堆、Sv39 页表（os/page_table）、板级解析（os/dtb）、任务模型（trap 路径与 trap 锚、域—类调度、进程/线程、BootPackage initial ELF bootstrap、syscall 面 Debug/Exit/Extend/Sleep、进程回收、timer/IPI 通路）与执行环境重构（a9a65cb）。IPC 前地基工程已完成（hart 身份统一、锁内存序、所有权单向化、uaccess 集中化、Extend 字节 sbrk 语义；见 `plans/archived/2026-09-pre-ipc-groundwork.md`）。IPC 对象 / Handle 重建也已完成：进程本地 HandleTable、WaitContext、显式 Mailbox/Notification、原子 Handle move、Endpoint/Invitation 与 Acquire/Release Runnel 已贯通，实施档案见 [已归档计划](archived/2026-08-ipc-object-foundation.md)，实现现状见 `notes/impls/ipc.md`。
-- 当前：**用户态多线程（ThreadSpawn）里程碑**——前置全部就绪（teardown barrier、线程成员表、active 位图、每线程 FP 状态与域绑定）；它是 IPC 压力验证线、signal 监听线程模式与 TLS 的共同前置。
+- 当前：**用户态多线程（ThreadSpawn）里程碑**——前置全部就绪（teardown barrier、线程成员表、active 位图、每线程 FP 状态与域绑定）；它是 IPC 压力验证线、signal 监听线程模式与 TLS 的共同前置。**线程资源模型批一（Start 拆解为 Attach/Grant/Start 三 op）已落地并过代码 Review 收口（`794a4c0`/`275e4f1` + 修复提交）**：报告 [`review-2026-08-29-thread-model-batch1.md`](review-2026-08-29-thread-model-batch1.md)——内核侧无正确性缺陷；A1–A5 已修（靶入口页 wfi → 自旋（U-mode 特权指令 fault 污染终因）、出生块 `parent_pid` 参数上收为组装者身份推导、grant 超限显式报错、验收线终态锚点主动收割 + 失败留日志）；原记「sifive_u 确定性挂死」已证伪（现场属未提交中间态代码）。下一步是批二（ThreadSpawn/Exit/Yield + join 壳）。
 - 已完成：**竞态矩阵覆盖增强已收口（2026-09）**——锤侧延迟变体（`Cmd.aux` 转正为执行前延迟，奇数轮锤延迟 10ms），kill-vs-exit/fault/abandon 双侧终因均有胜出记录，全验证线 10/10；实施档案见 [archived/todo-2026-08-28-race-matrix-coverage.md](archived/todo-2026-08-28-race-matrix-coverage.md)。
 - 已完成：**完整进程生命周期 step 1–10 已收口（2026-08-28）**——ProcessStart 请求顺序保持的零分配提交事务、per-hart 索引最小堆 Timeout queue、WaitContext 稳定 token 注销、任意非零预算 ProcessDrain、Invitation 非等待角色与 fail-closed QEMU acceptance 已落地；notes 按唯一主题 owner 重组，设备篇只固定授权边界而未提前决定 IRQ 投递。实施档案见 `archived/todo-2026-08-26-process-lifecycle.md` 与 `archived/todo-2026-08-28-step10-correctness.md`。
 - 已完成：**完整进程生命周期 step 2–6 已落地**——step 2–4（ProcessControl 前移、lifecycle 顶级锁状态机、全局进程表退役、跨 hart kill、硬上界 ProcessDrain、init 监督闭环）已过统一代码 Review（[archived/review-2026-08-27-process-lifecycle-code-review.md](archived/review-2026-08-27-process-lifecycle-code-review.md)）；step 5（Job 管理面）已实施收口：JobSeal/Query/Enumerate/Derive、有序成员表、链锁封口、完成传播与 libprocess 递归 job_kill；**step 6（持久 init 监督政策与 pm 委托域）已实施收口（2026-08-28）**：init 建 root → services → pm_domain/acceptance 拓扑，委托域 JobControl 经 StartupBlock grants 授 pm（MANAGE|READ|WAIT，无 CREATE）而 init 保留复制件作直接收束权；pm 对域内 Running 靶走 枚举→派生（铸造）→kill→drain→seal；失败路径整树 job_kill(services)；init 全部收束后常驻管理端点、不自终止，终态交 quiescent 静默停机（公理入档 ideas/bootstrap.md）；拓扑快照两处打印供调试。FAL 剩余面（DirectoryGrant、每订阅者 watch、跨进程 provider）仍排在其后。

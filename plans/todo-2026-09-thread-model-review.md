@@ -13,7 +13,7 @@
 ### 事务正确性（对照计划「内核机制」节）
 
 - **attach**：闭包内 `Arc::try_new` 取 HEAP 锁（LIFECYCLE→HEAP 合法秩）——验证失败路径零副作用（tid 未消费、表未插、强引用未构造）；validate_initial_context 在 enter_building_op 之后，leave 配平无遗漏。
-- **grant**：交付前置序（reserve → 输出写回校验 → commit）；失败路径 unpin + rollback 全还原，调用者句柄可重试；成功即目标表可见。MAX_START_GRANTS 上界与调用者侧 grants[..len] 截断的一致性。
+- **grant**：交付前置序（reserve → 输出写回校验 → commit）；失败路径 unpin + rollback 全还原，调用者句柄可重试；成功即目标表可见。MAX_START_GRANTS 上界与调用者侧超限报错（`SpawnError::TooManyGrants`，不截断）的一致性。
 - **start**：活体门（count==0 → ObjectNotAvailable）在 reserve 之后、gate 之前——空表与并发 attach 插队的 ObjectBusy/StaleCount 语义；pin builder（Some）/pin grants（None）两个泛化用法；提交区不可失败论证（reservations/staged 容量全部前置预留）。
 - **begin_running(expected, out)**：活体门 + 计数一致性 + Staging→Running 状态转换 + 强引用交出在同 lifecycle 临界区原子完成；并发 attach 在 gate 前插队 → StaleCount；kill 游标在 gate 后触达 → 表内已无 Staging（计划「实施决策」2 的竞态修复）。
 
@@ -33,18 +33,15 @@
 - launch_bootstrap 与 start_staged 的结构同构性（同 reserve/commit 序列、同 begin_running 原子语义）；boot fatal 断言的适用性（无并发、无回滚）。
 - map_bootstrap_block 的 payload 收编特例保留论证（计划 D6c：出生块用户化但 bootstrap payload 收编保留在内核内嵌 Write）。
 
-### 未决问题（review 会话继续调查）
+### 未决问题（已按批一报告 §B4 挂起）
 
-**sifive_u 竞态矩阵 kill-vs-exit 确定性卡死**（virt/virt-release/hetero/nofd 全过）：
-
-- 症状：round 0 spawn target 成功（探针至 started）、`fire_race` 后 `h.report(0)` 永不到达；QEMU CPU 采样 142%（50% 节流下）≈ 2.5 核自旋——内核自旋死锁特征，非等待丢失。
-- 已排除：spawn 全步骤（mapping/writing/stack/grant/birth block/attach/startarted 全打印）、锤 kill 路径（kill-vs-kill 4 轮全过）、锤 report 路径（探针 report ready status 0 反复出现）。
-- 疑点优先级：① sifive_u 5 核（vs virt 4 核）下 IPI 位图/门铃路径——`ipi_slots` 组装（u64 位图 slot ≤ 63 假设在 5 核下的行为）、`registry::ipi_slots` 展开、wake_one 的 idle_mask 载入序；② kill-vs-exit 双侧冻结竞争（target Exit syscall 与异 hart Kill 的 request_termination 竞争）在某时序下自旋；③ 142% 是否节流伪影（throttle 脚本 50% 下单核满转应显 ~50%，2.5 核说明真自旋）。
-- 装备：`just sifive_u-gdb`（GDB 宏 dump_harts 定位各 hart PC）；`tools/qemu-acceptance.sh --allow-timeout`；init race.rs 探针已移除（调查时重加）。
-- 注意：探针实验显示卡点会随后移（先卡 spawn 中段、后卡 report）——不是固定 PC 的死循环，更像**条件自旋**（锁自旋/IPI 等待循环），怀疑静态 PC 采样需多采样点或用 GDB break 在 sched.rs 调度循环。
+**sifive_u「确定性卡死」已证伪（batch1 review 报告 §B）**：55+ 轮（HEAD/节流档/gdbstub/多配置）零真挂死；唯一确凿现场属于未提交中间态代码。全部可观测失败由负载缺陷（wfi → U-mode IllegalInstruction，kill-vs-start 靶首条指令即 fault）与验收基础设施超时误杀（`run_qemu_acceptance_timed` 5s 硬超时）解释。挂死根因未定性（无现场），复现装备留档：
+  - 判据：hang-hunt 模式（日志停增 + 无终态 + QEMU 存活）+ `qemu -s` gdbstub + `riscv64-elf-gdb thread apply all bt`；
+  - gdbstub 会改变时序，挂死复现概率可能下降（记录在案）；
+  - 若再次复现：优先 GDB 多采样（条件自旋的静态 PC 需多样本），次选在 `send_ipi` 与 `idle()` wfi 醒来处加计数探针（探针已在批一提交移除，重加见 git log 794a4c0 前版本）。
 
 ### 既有回归面
 
-- kill-vs-start 场景新语义：attach 由 init 组装侧完成，锤只拉 Start——竞速点仍是 Building→Running 线性化（virt 已过，语义等价论证）。
-- seal gate (start) 场景：seal 后 Start 拒绝路径的 leave_building_op 配平。
-- 帧守恒：静默停机帧数对比（virt 248842 free / 释放前后差值应与改动前一致量级）。
+- kill-vs-start 场景新语义：attach 由 init 组装侧完成，锤只拉 Start——竞速点仍是 Building→Running 线性化（virt 已过，语义等价论证）。靶入口指令已由 wfi 改为自旋（`j .`），避开 U-mode 特权指令 fault 污染终因；处理记录见批一报告 A1。
+- seal gate (start) 场景：seal 后 Start 拒绝路径的 leave_building_op 配平；建 Building 已与 race.rs 共用 `build_spin_building`（失败自清理）。
+- 帧守恒：静默停机帧数对比（virt 基线 248842；探针移除后为 248839，差 3 帧已定因）。

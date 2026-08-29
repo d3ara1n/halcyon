@@ -23,6 +23,8 @@
 
 Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload offset/length 与 reserved。几何要求 `handles_end <= payload_off`，间隙全零。Handle 数组保存目标进程 HandleTable 的真实句柄值（由 ProcessGrant 输出），不从 index 推导 slot/generation。
 
+**`parent_pid` 语义（A2 修复定死）**：描述**目标进程**的创建关系，因此是**组装者自身的 pid**（= 目标的创建者，与内核 ProcessQuery 快照的 parent_pid 同一真值），不是组装者的父。组装者在构造出生块时必须传 `rinlib::env::pid()`——传 `env::parent_pid()` 会错位一代（init parent 0 spawn 服务时出生块里会是 0 而非 1）。当前无消费方（潜伏字段），但不能靠「没人读」放任语义错误。
+
 接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（rinlib `env::init` 沿用旧 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl，Handle[1] init ProcessControl。普通进程 Handle 数组完全来自组装者的 grants，slot 含义由具体启动协议定义，不属于通用线格式。
 
 ## 组装 ABI（Building 期外部通道）
@@ -41,7 +43,7 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 
 ### 三 op 事务
 
-**ProcessGrant**：拷入 grants → 调用者表 pin（原子验证 GRANT/rights 子集/去重，失败零副作用）→ 目标表 reserve 槽位 → 输出句柄值（copy_to_user，失败先 rollback 目标预留再 unpin 无损还原，终止由分发出口收束）→ 锁外提取 moved → 目标表 commit。单批上界 64。
+**ProcessGrant**：拷入 grants → 调用者表 pin（原子验证 GRANT/rights 子集/去重，失败零副作用）→ 目标表 reserve 槽位 → 输出句柄值（copy_to_user，失败先 rollback 目标预留再 unpin 无损还原，终止由分发出口收束）→ 锁外提取 moved → 目标表 commit。单批上界 64；组装侧超限由 libprocess 建进程前显式报错（`SpawnError::TooManyGrants`），不静默截断——静默丢句柄会让调用方误以为全部装入。
 
 **ProcessAttach**：拷入 descriptor → 出生现场前置校验（entry 可执行、sp 可写且 16 对齐）→ `lifecycle::attach_member(闭包)`：lifecycle 锁内检查 Terminating/表长上限（`PROCESS_MAX_THREADS` 1024）、try_reserve 容量、闭包构造 Thread（tid 在锁内分配，从 1 起）、插入 `(tid, Staging{thread})`；失败零副作用（Closed/Limit/Oom）。Staging 条目携带线程强引用（预育表即成员表形态）；引用与 `Thread.process` 构成环，环只在 Building 期存在，终止游标 `take_first_staging` 打破。
 
@@ -83,4 +85,4 @@ acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整�
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
 - handle_table host：pin 顺序（builder/grant 双形态）、rights 回滚、reservation 与 TRANSIT/GRANT；
 - libprocess host：entry、segment overlap 与页级 W^X；
-- QEMU acceptance：`virt`、`virt-release`、hetero、nofd 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态和 quiescent 锚点；`sifive_u` 同锚点集但存在未决卡死问题（见 `plans/todo-2026-09-thread-model.md`「批一未决问题」），修复后恢复常绿。
+- QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态和 quiescent 锚点，全线常绿。`sifive_u` 无 shutdown 设备，由验收脚本在终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。

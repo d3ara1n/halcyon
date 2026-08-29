@@ -18,7 +18,7 @@ use erhino_shared::{
     },
     wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
 };
-use rinlib::{debug, ipc::object::close, ipc::wait::wait_many, process};
+use rinlib::{ipc::object::close, ipc::wait::wait_many, process};
 
 const MAX_MAP_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
 const MAX_WRITE_BYTES: usize = 1 << 20;
@@ -28,6 +28,9 @@ pub enum SpawnError {
     Elf(elf::ElfError),
     Requirement(elf::IsaReqError),
     InvalidImage,
+    /// grants 数量超出内核单次 Grant 上界（MAX_START_GRANTS），不截断、
+    /// 直接拒绝——静默丢句柄会让调用方误以为全部装入。
+    TooManyGrants,
     System(SystemCallError),
 }
 
@@ -56,6 +59,10 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
     let image = elf::parse(request.image).map_err(SpawnError::Elf)?;
     let requirement = elf::isa_requirement(request.image).map_err(SpawnError::Requirement)?;
     let (plan, image_top) = page_plan(&image, request.image.len())?;
+    // 上界先筛：超限在建进程前拒绝，无需回滚任何已建资源。
+    if request.grants.len() > MAX_START_GRANTS {
+        return Err(SpawnError::TooManyGrants);
+    }
 
     let created = process::create(request.job, request.control_rights)?;
     let builder = created.builder;
@@ -72,18 +79,17 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnError> {
         // 组装序列（线程是组装资源）：Grant 装句柄 → 组装者自构造出生块
         // （shared::startup 线格式）→ Write 写入约定区 → Attach 首线程
         // （arg1/arg2 = 块基/块长）→ Start 入册。
-        let grant_len = request.grants.len().min(MAX_START_GRANTS);
+        let grant_len = request.grants.len();
         let mut granted = [Handle::INVALID; MAX_START_GRANTS];
         if grant_len > 0 {
             process::grant(
                 builder,
-                &request.grants[..grant_len],
+                request.grants,
                 &mut granted[..grant_len],
             )?;
         }
         let block = build_birth_block(
             created.pid,
-            rinlib::env::parent_pid(),
             &granted[..grant_len],
             request.payload,
         )?;
@@ -307,20 +313,33 @@ fn write_segments(
     Ok(())
 }
 
-/// 单次 Grant 的句柄数上界（与内核 MAX_START_GRANTS 对齐；超出由
-/// 调用方分批，v1 组装面以单批为约）。
+/// 单次 Grant 的句柄数上界（与内核 MAX_START_GRANTS 对齐）。超出即
+/// `SpawnError::TooManyGrants`；需更多句柄由调用方分批（v1 组装面
+/// 以单批为约）。
 const MAX_START_GRANTS: usize = 64;
 
 /// 组装者侧出生块构造（shared::startup 线格式：Header + 句柄数组 +
-/// payload）。内核不参与构造——出生块是组装者与接收进程的用户约定。
+/// payload）。内核不参与构造——出生块是组装者与接收进程的用户约定，
+/// 也是接收进程得知自身身份的途径（它未必持有自己的 ProcessControl，
+/// 不能靠 ProcessQuery 反查）。
+///
+/// **`parent_pid` 不作参数，由组装者身份内部推导**：它描述目标进程的
+/// 创建关系，而创建者恒为本进程——「谁创建了它」不是调用方可自由选择
+/// 的信息。参数化曾使误传 `env::parent_pid()`（目标的祖父）成为可能，
+/// 现在该错误在结构上不存在。`target_pid` 仍为参数：它来自
+/// ProcessCreate 的内核返回值，组装者无法推导。
 fn build_birth_block(
-    pid: u64,
-    parent_pid: u64,
+    target_pid: u64,
     handles: &[Handle],
     payload: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, SpawnError> {
-    erhino_shared::startup::build_startup_block(pid, parent_pid, handles, payload)
-        .map_err(|_| SpawnError::InvalidImage)
+    erhino_shared::startup::build_startup_block(
+        target_pid,
+        rinlib::env::pid(),
+        handles,
+        payload,
+    )
+    .map_err(|_| SpawnError::InvalidImage)
 }
 
 /// 出生块写入约定区：映像顶（page_plan 推导）之上页对齐放置——组装者

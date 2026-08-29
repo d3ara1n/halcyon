@@ -177,33 +177,52 @@ fn spawn_race_target(
     Ok((spawned, gun_pair.peer))
 }
 
-/// 手工 Building：入口页（wfi）+ 栈顶页 + 附入首线程，供
-/// kill-vs-Start/abandonment 的提交前窗口竞速。attach 由组装者完成
-/// （线程是组装资源）；锤只持 builder 在竞速时刻拉 Start——
-/// Building→Running 线性化仍是唯一竞速点。
-fn build_wfi_building(job: Handle) -> Result<ProcessCreateResult, SystemCallError> {
+/// 入口页指令：`j .`（`0x0000006f`，JAL x0,0 自我跳转）。不用 wfi——
+/// wfi 是特权指令，U-mode 执行触发 illegal instruction 异常
+/// （riscv-isa machine.adoc：executing WFI in U-mode causes an
+/// illegal-instruction exception），靶一旦上核首条指令即 Fault，会与
+/// kill 争抢终因冻结，污染「Running 后被 kill 收束」的场景语义。
+pub(crate) const SPIN_FOREVER: [u8; 4] = [0x6f, 0x00, 0x00, 0x00];
+
+/// 手工 Building：入口页（自旋）+ 栈顶页 + 附入首线程，供
+/// kill-vs-Start/abandonment 的提交前窗口竞速与 seal gate 验证。
+/// attach 由组装者完成（线程是组装资源）；锤只持 builder 在竞速时刻
+/// 拉 Start——Building→Running 线性化仍是唯一竞速点。失败路径自清理
+/// 两个句柄，调用者只需处理自己持有的资源。
+pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, SystemCallError> {
     let created = process::create(job, SUPERVISOR_RIGHTS)?;
-    process::map(
-        created.builder,
-        0x1000,
-        PROCESS_PAGE_SIZE,
-        ProcessMapFlags::READ | ProcessMapFlags::EXECUTE,
-    )?;
-    process::write(created.builder, 0x1000, &[0x73, 0x00, 0x50, 0x10])?;
-    process::map(
-        created.builder,
-        PROCESS_USER_TOP - PROCESS_PAGE_SIZE,
-        PROCESS_PAGE_SIZE,
-        ProcessMapFlags::READ | ProcessMapFlags::WRITE,
-    )?;
-    let descriptor = ProcessAttachDescriptor {
-        entry: 0x1000,
-        stack_pointer: PROCESS_USER_TOP as u64,
-        arg1: 0,
-        arg2: 0,
-    };
-    process::attach(created.builder, &descriptor)?;
-    Ok(created)
+    let built = (|| {
+        process::map(
+            created.builder,
+            0x1000,
+            PROCESS_PAGE_SIZE,
+            ProcessMapFlags::READ | ProcessMapFlags::EXECUTE,
+        )?;
+        process::write(created.builder, 0x1000, &SPIN_FOREVER)?;
+        process::map(
+            created.builder,
+            PROCESS_USER_TOP - PROCESS_PAGE_SIZE,
+            PROCESS_PAGE_SIZE,
+            ProcessMapFlags::READ | ProcessMapFlags::WRITE,
+        )?;
+        process::attach(
+            created.builder,
+            &ProcessAttachDescriptor {
+                entry: 0x1000,
+                stack_pointer: PROCESS_USER_TOP as u64,
+                arg1: 0,
+                arg2: 0,
+            },
+        )
+    })();
+    match built {
+        Ok(_) => Ok(created),
+        Err(error) => {
+            let _ = close(created.builder);
+            let _ = close(created.control);
+            Err(error)
+        }
+    }
 }
 
 /// 收束到 Dead 后断言终因在允许集合内；code 通配用 None。返回终因
@@ -364,7 +383,6 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     for round in 0..4u64 {
         let exit_code = 0x300 + round as i64;
         let kill_code = 0x400 + round as i64;
-        debug!("race kill-vs-exit: round {} spawning target", round);
         let (target, gun) =
             match spawn_race_target(job, image, race::TARGET_SUICIDE, exit_code as u64) {
                 Ok(pair) => pair,
@@ -373,7 +391,6 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                     return false;
                 }
             };
-        debug!("race kill-vs-exit: round {} target spawned", round);
         let moves = [HandleMove {
             handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
@@ -477,7 +494,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let created = match build_wfi_building(job) {
+        let created = match build_spin_building(job) {
             Ok(created) => created,
             Err(error) => {
                 debug!("race kill-vs-start: building failed: {:?}", error);
@@ -589,7 +606,7 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let created = match build_wfi_building(job) {
+        let created = match build_spin_building(job) {
             Ok(created) => created,
             Err(error) => {
                 debug!("race kill-vs-abandon: building failed: {:?}", error);
