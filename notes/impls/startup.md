@@ -66,7 +66,7 @@ initial ELF 与 prefix 完成后，package 前缀页回投帧池；payload backi
 
 ## init/pm 当前政策
 
-`user/systems/init` 把 opaque payload 当作私有 ustar，建立：
+`user/services/srv_init` 把 opaque payload 当作私有 ustar，建立：
 
 ```text
 root

@@ -1,8 +1,8 @@
 [package]
-name = "srv_fp"
+name = "test_target"
 version = "0.1.0"
 edition = "2024"
-description = "D64 eligibility verification workload (LP64D target only)"
+description = "Kill supervision target"
 
 [dependencies]
 rinlib = {path = "../../rinlib"}

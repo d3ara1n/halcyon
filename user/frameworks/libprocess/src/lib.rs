@@ -1,7 +1,7 @@
 #![no_std]
 
 //! 用户态 ELF process loader：解析映像并驱动 affine ProcessBuilder。
-//! `race` 模块是生命周期竞态矩阵验证负载（init ↔ srv_hammer）的线协议。
+//! `race` 模块是生命周期竞态矩阵验证负载（init ↔ test_hammer）的线协议。
 
 extern crate alloc;
 

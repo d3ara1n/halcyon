@@ -86,9 +86,9 @@ make_dtb: artifact_dir
     @dtc -O dtb -o "{{DTB_DEFAULT}}" "{{DTS}}"
 
 build_user: artifact_dir
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude srv_fp --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p srv_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    @python3 tools/audit-user-elf.py {{TARGET_DIR}}/build/srv_* {{TARGET_DIR}}/build/drv_*
+    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    @python3 tools/audit-user-elf.py {{TARGET_DIR}}/build/srv_* {{TARGET_DIR}}/build/drv_* {{TARGET_DIR}}/build/test_*
     @echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
 make_initfs: build_user
@@ -96,9 +96,9 @@ make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
-    @ditto "{{TARGET_DIR}}/build/srv_target" "{{TARGET_DIR}}/initfs/bin/srv_target"
-    @ditto "{{TARGET_DIR}}/build/srv_fp" "{{TARGET_DIR}}/initfs/bin/srv_fp"
-    @ditto "{{TARGET_DIR}}/build/srv_hammer" "{{TARGET_DIR}}/initfs/bin/srv_hammer"
+    @ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"
+    @ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"
+    @ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 
@@ -124,14 +124,14 @@ virt:
     @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
 
 # 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
-# Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 服务
-# 只在 FD 域运行（fp verification passed）、全负载收束后显式停机。
+# Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 验收
+# 进程只在 FD 域运行（fp verification passed）、全负载收束后显式停机。
 virt-hetero:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
     @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
     @ERHINO_DTB=artifacts/virt-hetero.dtb QEMU_ACCEPTANCE_PROFILE=hetero just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
 
-# 无兼容域验证：全部 cpu 去掉 F/D，D64 profile 的 srv_fp 启动即拒绝
+# 无兼容域验证：全部 cpu 去掉 F/D，D64 profile 的 test_fp 启动即拒绝
 # （NotSupported → init spawn 失败路径），Base64 负载照常收束。
 virt-nofd:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-nofd.dts all

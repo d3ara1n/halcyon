@@ -1,6 +1,6 @@
 //! fp：D64 eligibility 验证负载。内核只在 FLEN 恰为 64 的域上调度本
 //! profile；FP 状态（FPR/fcsr）跨 trap、时间片轮转与 hart 迁移的
-//! 存活性由本服务以位型校验（验收行 "fp verification passed"）。
+//! 存活性由本验收进程以位型校验（验收行 "fp verification passed"）。
 //!
 //! 三类校验：
 //! 1. 硬件 FP 计算位型（fsqrt/fmadd/fdiv）——证明运行于 D64 档位；
@@ -22,7 +22,7 @@ const PROBE_F30: u64 = 0x0000_0000_DEAD_BEEF;
 const PROBE_F31: u64 = 0x7FF8_0000_C0FF_EE01;
 
 fn main() {
-    debug!("fp service alive (D64 profile)");
+    debug!("FP verification test started (D64 profile)");
 
     for round in 1..=4u64 {
         check_compute(round);

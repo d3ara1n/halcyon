@@ -1,9 +1,13 @@
 [workspace]
 members = [
     "rinlib",
-    "systems/init",
-    "systems/fs",
-    "systems/pm",
+    "services/srv_init",
+    "services/srv_fs",
+    "services/srv_pm",
+    "drivers/drv_spi_sifive",
+    "tests/test_fp",
+    "tests/test_hammer",
+    "tests/test_target",
     "frameworks/libsrv",
     "frameworks/libdrv",
     "frameworks/libfal",
@@ -11,9 +15,5 @@ members = [
     "frameworks/librpc",
     "frameworks/librunnel",
     "frameworks/libprocess",
-    "systems/srv_target_src",
-    "systems/srv_fp",
-    "systems/srv_hammer",
-    "drivers/spi_sifive"
 ]
 resolver = "2"

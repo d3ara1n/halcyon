@@ -119,4 +119,4 @@ Dead 表示进程的地址空间和 HandleTable 已经完成释放；exit status
 
 ## 外部参照的边界
 
-Zircon 把 bootdata 作为显式 VMO 交给普通 userboot，由 userboot 解析 BOOTFS 和后续 ELF；seL4 把 BootInfo 与 root capabilities 交给 root task，由用户态构造后续 VSpace/TCB/CNode。eRhino 采用相同的责任边界，但不因此照搬 VMO、untyped 或某个具体启动协议；本系统的独立理由是让内核只保留不可替代的 bootstrap 机制，并让后续装载遵守同一 capability 模型。
+Zircon 把 bootdata 作为显式 VMO 交给普通 userboot，由 userboot 解析 BOOTFS 和后续 ELF；seL4 把 BootInfo 与 root capabilities 交给 root task，由用户态构造后续 VSpace/TCB/CNode。Halcyon 采用相同的责任边界，但不因此照搬 VMO、untyped 或某个具体启动协议；本系统的独立理由是让 eRhino 只保留不可替代的 bootstrap 机制，并让后续装载遵守同一 capability 模型。

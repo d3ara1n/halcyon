@@ -6,7 +6,7 @@
 
 | 提交 | 内容 |
 |---|---|
-| `1d7dc92` | feat(kernel)：step 8 主体——新纯逻辑 crate `os/sched_domain`（HartCapabilities 迁入 + flen 含 Q→128、签名等价类 plan、最弱兼容域 resolve、7 项 host 单测）；sched.rs 重写调度段（SchedDomain 运行期构造 + 域内 idle 位图、AtomicPtr\<DomainTable\> 发布、current_domain/resolve_domain、SchedClass trait 上收 reserve/commit/rollback、enqueue/requeue/wake/SSIP/quiescent 域化、dispatch 域 debug 断言）；Process 域绑定（AtomicPtr swap 单次断言）+ ProcessStart eligibility 接线（无兼容域 NotSupported）+ launch_bootstrap 同判定；srv_fp D64 验证负载（gc target）；tools/make-hetero-dts.py + virt-hetero/virt-nofd 验收线；notes 三篇与 plans 导航同步 |
+| `1d7dc92` | feat(kernel)：step 8 主体——新纯逻辑 crate `os/sched_domain`（HartCapabilities 迁入 + flen 含 Q→128、签名等价类 plan、最弱兼容域 resolve、7 项 host 单测）；sched.rs 重写调度段（SchedDomain 运行期构造 + 域内 idle 位图、AtomicPtr\<DomainTable\> 发布、current_domain/resolve_domain、SchedClass trait 上收 reserve/commit/rollback、enqueue/requeue/wake/SSIP/quiescent 域化、dispatch 域 debug 断言）；Process 域绑定（AtomicPtr swap 单次断言）+ ProcessStart eligibility 接线（无兼容域 NotSupported）+ launch_bootstrap 同判定；当时名为 `srv_fp`、现名为 `test_fp` 的 D64 验证负载（gc target）；tools/make-hetero-dts.py + virt-hetero/virt-nofd 验收线；notes 三篇与 plans 导航同步 |
 
 ## Review 轴（代码为主）
 
@@ -37,7 +37,7 @@
 
 ### D64 负载与验证线
 
-- srv_fp 的 FPR probe（f30/f31 硬名）对编译器 FP 使用的假设：rinlib/debug!/sys_sleep 路径当前无 FP 指令生成——依赖 gcc target 全量重编（build-std）下 rinlib 也无 FP；若未来 rinlib 引入 FP（如格式化浮点），probe 可能被调用点 clobber，验收线将以 FAILED 暴露——假设是否值得在服务内注释或 probe 加固（读写间无任何 Rust 调用）。
+- test_fp 的 FPR probe（f30/f31 硬名）对编译器 FP 使用的假设：rinlib/debug!/sys_sleep 路径当前无 FP 指令生成——依赖 gcc target 全量重编（build-std）下 rinlib 也无 FP；若未来 rinlib 引入 FP（如格式化浮点），probe 可能被调用点 clobber，验收线将以 FAILED 暴露——假设是否值得在验收进程内注释或 probe 加固（读写间无任何 Rust 调用）。
 - fcsr RTZ 测试的数学前提（5/7 尾数余数 ≈ 6/7 ulp > 1/2）：RNE 进位、RTZ 截断必不同——前提的正确性复核。
 - make-hetero-dts.py 的变换稳健性：初版块退出用 `}` 精确比较（DTS 块结束实为 `};`，死分支），靠后续 `cpu@N` 刷新碰巧正确——已在 `4280d3b` 改为花括号深度跟踪（嵌套子节点如 interrupt-controller 正确闭合）；审查修正版对单行多括号、cpu 块外 isa-extensions 等病态输入的行为与 hetero/all 两种变换的边界。
 - ERHINO_DTB 覆盖与 make_dtb 固定路径：变体 DTB 不再被官方构建覆写；DTB_DEFAULT/DTB 双变量的语义分界清晰。
@@ -45,5 +45,5 @@
 ### 既有回归面
 
 - 单域拓扑（virt/sifive_u）下域内 idle/pick/IPI 路由与多域使用同一机制；系统终局独立走 capability 授权的显式 reset。
-- init 的 ustar 字母序启动新增 srv_fp（pid 序移位）：init/pm 剧本对 pid 的硬编码引用（若有）不受影响——验收线通过已旁证，审查确认无 pid 字面量假设。
-- user workspace 裸 check（imac 默认 target）经 srv_fp 的位型接口保持绿：freg 操作数类已消除，确认无其他 target-feature 依赖面。
+- init 的 ustar 字母序启动新增 test_fp（pid 序移位）：init/pm 剧本对 pid 的硬编码引用（若有）不受影响——验收线通过已旁证，审查确认无 pid 字面量假设。
+- user workspace 裸 check（imac 默认 target）经 test_fp 的位型接口保持绿：freg 操作数类已消除，确认无其他 target-feature 依赖面。

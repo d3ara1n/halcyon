@@ -1,5 +1,5 @@
 [package]
-name = "srv_hammer"
+name = "test_hammer"
 version = "0.1.0"
 edition = "2024"
 description = "Lifecycle race matrix hammer and race target"

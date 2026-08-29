@@ -1,4 +1,4 @@
-//! 生命周期竞态矩阵线协议（init ↔ srv_hammer，step 9 验证负载）。
+//! 生命周期竞态矩阵线协议（init ↔ test_hammer，step 9 验证负载）。
 //!
 //! 单一二进制多角色：payload 字定模式，handle 经 startup grants 按槽位
 //! 交付。指令与 handle 经 Mailbox 运行时投递，发令枪是每锤一把的

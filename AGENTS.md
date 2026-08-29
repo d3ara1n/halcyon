@@ -1,6 +1,6 @@
 # Halcyon / eRhino
 
-个人兴趣项目，目标是成熟、可长期演进的 RV64 微内核系统。仓库叫 halcyon，操作系统叫 eRhino，内核二进制是 `erhino_kernel`，用户态标准库替代品是 `rinlib`——四个名字指同一个项目。`git tag pre-ai`（975c46f）之前为第一版手写实现；之后由 AI 协作重写，以成熟系统为标准（生产系统为主要参照，不做教学式简化）。
+个人兴趣项目，目标是成熟、可长期演进的 RV64 微内核系统。完整项目与仓库叫 Halcyon，包含 eRhino 微内核、用户态系统服务及跨组件契约；内核二进制是 `erhino_kernel`，用户态标准库替代品是 `rinlib`。`git tag pre-ai`（975c46f）之前为第一版手写实现；之后由 AI 协作重写，以成熟系统为标准（生产系统为主要参照，不做教学式简化）。
 
 ## 心智模型
 
@@ -25,7 +25,12 @@ os/        内核 workspace：
              dtb/ frame_pool/ page_table/ tar/ elf/ handle_table/
              wait_context/ timer_queue/ stack_layout/ sched_domain/   纯逻辑 crate，host 可测
 shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、同步原语）；FAL 是纯用户态线协议，落 user/frameworks/libfal，不在此处
-user/      用户态 workspace（rinlib、systems/、frameworks/、drivers/）
+user/      用户态 workspace：
+             rinlib/
+             services/    系统服务（srv_*）
+             drivers/     用户态驱动（drv_*）
+             tests/       验收进程（test_*）
+             frameworks/  用户态公共框架与正式库
 notes/     设计文档：
              根      导读、索引与跨专题通用内容
              ideas/  方向性设计——自顶向下的抽象视角
@@ -33,7 +38,7 @@ notes/     设计文档：
 plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（跨会话导航）
 ```
 
-对照负载：`user/systems/` + `user/drivers/` 的五个服务（fs/init/pm/drv_spi_sifive/srv_fp，其中 srv_fp 是 D64 验证负载，经 gc target 单独构建）是集成验证负载，其中 fs 依赖 FAL——fs「干净被杀」（用户态 panic → 退出回收，内核不崩）是其依赖面就绪前的达标线。
+对照负载由 `user/services/`、`user/drivers/` 与 `user/tests/` 共同组成：当前服务为 `srv_init`、`srv_fs`、`srv_pm`，驱动为 `drv_spi_sifive`，验收进程为 `test_fp`、`test_hammer`、`test_target`。它们服务于集成验证，不代表未来正式运行配置；其中 `test_fp` 使用 gc target 单独构建。
 
 ## 构建与验证
 
@@ -52,7 +57,7 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 ## 约定
 
 - 文档、注释、提交信息都用中文。格式上使用 Conventional Commits，以前的提交未使用标准格式，不当作参考。
-- 库与服务的命名跟随领域术语的正式名（FAL → `libfal`，Runnel → `librunnel`）；不为省字发明新缩写。
+- **Rust 组件身份唯一**：目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致，不设置只为补偿命名差异的别名。系统服务使用 `srv_<domain>`，用户态驱动使用 `drv_<domain>`，验收进程使用 `test_<domain>`；正式库跟随领域正式名（FAL → `libfal`，Runnel → `librunnel`）。禁止 `_src`、`_impl` 等实现痕迹后缀，不为省字发明新缩写。这里约束的是源码与 Rust 构建身份，不预设未来的 Display Name、服务发现名或运行时实例名。
 - **运行时输出统一正式英文**：内核与用户态日志、panic/assert/expect 消息、构建工具输出（如 Justfile 的 echo）一律用正式英文措辞，保证可 grep、可跨终端阅读；中文仅出现在文档、注释与提交信息中。
 - `git tag pre-ai` 之前的提交全部为人工编写，不含 AI 参与；之后的提交如由 AI 辅助，提交前按当前会话的实际模型与 provider 生成 `Co-Authored-By` trailer。格式为：
   ```

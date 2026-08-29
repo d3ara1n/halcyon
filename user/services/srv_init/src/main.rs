@@ -170,7 +170,7 @@ const TUNNEL_STRESS: usize = 64;
 
 /// 从 initfs 私有政策（ustar 字母序）启动服务拓扑：普通服务入 services
 /// Job；srv_pm 额外经 StartupBlock grants 取得 pm_domain 委托域的
-/// JobControl；srv_target 起两个实例——acceptance 域的派生 kill 靶
+/// JobControl；test_target 起两个实例——acceptance 域的派生 kill 靶
 /// （验收线 1）与 pm_domain 的委托靶（control 即弃，pm 派生走铸造路径）。
 fn launch_test_services(
     services: Handle,
@@ -202,14 +202,14 @@ fn launch_test_services(
     let control_rights = SUPERVISOR_RIGHTS;
     let mut supervised = alloc::vec::Vec::new();
     let mut pm_started = false;
-    // srv_target/srv_hammer 映像留存：竞态矩阵与验收线的靶/锤复用。
+    // test_target/test_hammer 映像留存：竞态矩阵与验收线的靶/锤复用。
     let mut target_image: Option<alloc::vec::Vec<u8>> = None;
     let mut hammer_image: Option<alloc::vec::Vec<u8>> = None;
     let result = tar::walk(env::startup_payload(), |entry| {
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
             return;
         }
-        if entry.name == "bin/srv_hammer" {
+        if entry.name == "bin/test_hammer" {
             // 竞态锤不是常驻服务：只留存映像，由剧本按需 spawn。
             hammer_image = Some(alloc::vec::Vec::from(entry.data));
             return;
@@ -224,8 +224,8 @@ fn launch_test_services(
                 rights: DELEGATED_DOMAIN_RIGHTS,
             },
         ];
-        // srv_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
-        let (job, grants): (Handle, &[HandleGrant]) = if entry.name == "bin/srv_target" {
+        // test_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
+        let (job, grants): (Handle, &[HandleGrant]) = if entry.name == "bin/test_target" {
             (acceptance, &[])
         } else if entry.name == "bin/srv_pm" {
             (services, pm_grants.as_slice())
@@ -243,10 +243,10 @@ fn launch_test_services(
                 debug!("started {} as pid {}", entry.name, process.pid);
                 names.register_process(process.pid, entry.name);
                 // 持久 init 保留 control：监督、等待与收束的 authority 源。
-                if entry.name == "bin/srv_target" {
+                if entry.name == "bin/test_target" {
                     target_image = Some(alloc::vec::Vec::from(entry.data));
                     // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
-                    // acceptance Job 枚举可见 srv_target 的 pid，派生 MANAGE
+                    // acceptance Job 枚举可见 test_target 的 pid，派生 MANAGE
                     // control 后 kill——保留 control 在派生接管后关闭。
                     test_derive_kill(acceptance, process.pid, process.control);
                     // 委托域靶：control 即弃（关闭 control 永不隐式终止），
@@ -260,7 +260,7 @@ fn launch_test_services(
                     }) {
                         Ok(second) => {
                             debug!("pm domain target started as pid {}", second.pid);
-                            names.register_process(second.pid, "bin/srv_target@pm_domain");
+                            names.register_process(second.pid, "bin/test_target@pm_domain");
                             let _ = close(second.control);
                         }
                         Err(error) => {
@@ -709,7 +709,7 @@ fn test_building_kill(job: Handle) {
     let _ = close(created.control);
 }
 
-/// 验收线 1：枚举→派生→kill 通路。srv_target 的 pid 经 acceptance Job
+/// 验收线 1：枚举→派生→kill 通路。test_target 的 pid 经 acceptance Job
 /// 枚举可见，JobDerive 派生 MANAGE control 后 kill 并监督收束；原保留
 /// control 在派生接管后关闭（关闭 control 永不隐式终止）。任一步失败
 /// 降级回保留 control 路径，不影响既有验收面。

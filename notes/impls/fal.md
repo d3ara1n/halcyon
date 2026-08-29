@@ -28,7 +28,7 @@
 
 ## 当前 fs 验收边界
 
-`user/systems/fs` 在同一进程内同时运行 memfs provider 与客户端泵。每次调用真实经过内核 Mailbox：send → provider receive/serve → send-once reply → client receive。它验证了 FAL 编解码、Mailbox、Handle move、send-once 与 WaitMany；覆盖创建、枚举、属性 Array、符号链接展开和 Stream 节点的 ReadAt/WriteAt。
+`user/services/srv_fs` 在同一进程内同时运行 memfs provider 与客户端泵。每次调用真实经过内核 Mailbox：send → provider receive/serve → send-once reply → client receive。它验证了 FAL 编解码、Mailbox、Handle move、send-once 与 WaitMany；覆盖创建、枚举、属性 Array、符号链接展开和 Stream 节点的 ReadAt/WriteAt。
 
 该路径仍有明确边界：
 

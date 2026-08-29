@@ -1,6 +1,6 @@
-# eRhino
+# Halcyon
 
-操作系统学习：RV64
+Halcyon 是以 eRhino RV64 微内核为核心、包含用户态系统服务与跨组件契约的完整系统项目。
 
 ## 设计
 

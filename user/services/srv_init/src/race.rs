@@ -1,6 +1,6 @@
 // —— 生命周期多核竞态矩阵（step 9）——
 //
-// 双锤（srv_hammer HAMMER 模式）常驻 acceptance 域：指令与 handle 经
+// 双锤（test_hammer HAMMER 模式）常驻 acceptance 域：指令与 handle 经
 // Mailbox 投递，发令枪（notification READABLE 电平）连发后双锤/靶在
 // 各自 hart 上同刻开打，锤真跨核竞态窗口。剧本与断言全在 init：每轮
 // 以「终因组合合法 + Dead 收束 + 无泄漏」为强断言，终因胜负分布只作
@@ -148,7 +148,7 @@ fn race_cmd_delayed(action: u64, code: u64, delay_ms: u64) -> Cmd {
     Cmd { action, code, entry: 0, sp: 0, aux: delay_ms }
 }
 
-/// 竞态靶（srv_hammer TARGET 模式）：等枪后按 subrole 自灭或高频 park。
+/// 竞态靶（test_hammer TARGET 模式）：等枪后按 subrole 自灭或高频 park。
 /// 返回 (spawned, 靶枪 signaler)。
 fn spawn_race_target(
     job: Handle,

@@ -25,7 +25,7 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 F-only、Q、V、TSO 与未建模扩展由 loader 拒绝。Q-capable hart 可运行 Base64，但不进入 D64 域。
 
-`os/kernel/src/context.rs::UserContext` 每线程保存 GPR、sepc 与完整 `FpState`；`FpState` 含 32 个 FPR 和 fcsr，创建时全零。D64 切入时完整恢复并置 FS=Clean，trap 只在 FS=Dirty 时回写，随后恢复内核 FS=Off。局部 F/D helper 位于独立代码 section；`srv_fp` 验证 FPR/fcsr 跨 ecall、Sleep 和调度轮转保持。
+`os/kernel/src/context.rs::UserContext` 每线程保存 GPR、sepc 与完整 `FpState`；`FpState` 含 32 个 FPR 和 fcsr，创建时全零。D64 切入时完整恢复并置 FS=Clean，trap 只在 FS=Dirty 时回写，随后恢复内核 FS=Off。局部 F/D helper 位于独立代码 section；`test_fp` 验证 FPR/fcsr 跨 ecall、Sleep 和调度轮转保持。
 
 ## Trap 与 CSR
 

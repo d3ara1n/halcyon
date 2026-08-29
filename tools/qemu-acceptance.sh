@@ -49,7 +49,7 @@ case "$profile" in
     nofd)
         required+=(
             "domain 0 [Base64] -> harts [0, 1, 2, 3]"
-            "failed to start bin/srv_fp: SpawnFailure { error: System(NotSupported), grants: Retained, cleanup_error: None }"
+            "failed to start bin/test_fp: SpawnFailure { error: System(NotSupported), grants: Retained, cleanup_error: None }"
         )
         ;;
     *)
