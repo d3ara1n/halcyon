@@ -1,9 +1,6 @@
 # IPC 数据面演进设计
 
-> 【未来设计计划】只登记问题与设计流程，不预写方向结论，不代表
-> MemoryObject、帧移交、描述符环或多页 Tunnel 已进入 ideas/impls。触发顺序：
-> 用户内存映射机制完整化 → ThreadSpawn 与 IPC 压力线收口 → 以真实负载启动
-> 本设计。
+> 【未来设计计划】MemoryObject 的 backing/mapping 分层、固定长度与硬容量上限、mapping 独立保活、`Mutable → Sealing → Executable`/WritePermit 单向 seal，以及统一 AddressSpace/MemoryChange seam 已由 `notes/ideas/{mm,object}.md` 拥有，本计划不重议。这里等待真实负载后设计公共对象 ABI、帧移交、描述符协议及 Tunnel/Runnel 的数据面组合。触发顺序：用户内存映射机制完整化 → ThreadSpawn 与 IPC 压力线收口 → 启动本设计。
 
 ## 驱动问题
 
@@ -26,28 +23,28 @@ ELF/文件缓存、驱动 I/O 或 IPC 压力结果明确负载和所需语义。
 
 ### 2. 机制分层
 
-重新证明而非预设以下模块的接口：
+在已确认的内存对象、AddressSpace 与映射事务契约下，重新证明以下模块的接口：
 
 - Mailbox 的控制消息与 capability move；
-- Tunnel 的映射关系、参与方、门铃和生命周期；
+- Tunnel 的参与方、门铃和生命周期如何消费 object-owned mapping lease；
 - Runnel 的 FIFO 字节流协议；
-- 可能的 MemoryObject 对 backing、视图和派生区间的持有；
-- 可能的描述符协议如何引用预注册区域，而不是把进程本地 Handle 数值写进
-  共享内存。
+- 固定长度 MemoryObject 如何按真实负载组织共享、只读发布和派生 view；
+- 描述符协议如何引用预注册区域，而不是把进程本地 Handle 数值写进共享内存。
 
 删除测试：若拿掉某一模块，其复杂度是否会散回多个调用者；若不会，该模块
 只是传递层，不应存在。
 
-### 3. MemoryObject 与帧移交
+### 3. MemoryObject 数据面用法与帧移交
 
-设计必须区分：
+MemoryObject 的稳定前提是：对象持 backing、mapping lease 借 view；capability move 只移动建立新 view 的 authority，不撤销旧 view；普通 close 的 backing 工作量受硬容量上限约束；`Mutable → Sealing → Executable` 与覆盖 reserved/published/retiring 的 WritePermit 遵守 backing 级 W^X。
 
-- 对象持帧、多个 mapping lease 借视图；
-- capability move 只移动 authority，不自动证明旧映射已经消失；
-- shareable/immutable backing 与 affine exclusive ownership；
-- 独占移交需要的 duplicate 禁止、lease 归零、撤销和回收线性化；
-- 可 TRANSIT 对象的 close 固定上界与多页 backing 有界 drain 如何相容；
-- W^X、代码发布、DMA/设备所有权和进程退出时的回收顺序。
+本计划仍须由负载决定：
+
+- 公共对象创建、seal、查询及映射 ABI 的最小 interface；
+- 多对象 scatter/gather 与容量上限如何呈现给协议；
+- shareable/immutable backing 与 affine exclusive ownership 是否需要不同对象或 role；
+- 独占帧移交所需的 duplicate 禁止、lease 归零、撤销和回收线性化；
+- DMA/设备 ownership 与 CPU mapping 的同步关系。
 
 未经上述完整设计，不增加“帧移交”第二机制或占位 syscall。
 
@@ -65,13 +62,13 @@ ELF/文件缓存、驱动 I/O 或 IPC 压力结果明确负载和所需语义。
 1. 固定开始 commit，收集 ThreadSpawn 后 IPC 压力线与目标负载数据；
 2. 从 `references/INDEX.md` 所列规范和补充的成熟系统官方资料建立事实表；
 3. 给出至少两种完整设计，比较接口深度、所有权、收束上界和验证成本；
-4. 将用户确认的方向写入 `notes/ideas/{mm,object,tunnel,runnel}.md` 或新增主题篇；
+4. 只把负载推出的新方向写入对应 ideas 拥有篇，不重复定义既有 MemoryObject/映射契约；
 5. 按确认后的模块归属拆出独立实施计划；
 6. 实现后才写 `notes/impls/`，不以计划或构想冒充现状。
 
 ## 前置依赖
 
-- `todo-2026-09-user-memory-mapping.md` 已收口，映射/lease/TLB seam 稳定；
+- `todo-2026-09-user-memory-mapping.md` 已收口，统一 AddressSpace/MemoryChange、lease 与跨 hart 完成 seam 稳定；
 - `todo-2026-09-thread-model.md` 批二、批三已收口；
 - carryover IPC 压力线给出并发和资源守恒证据；
 - 至少一个真实消费者证明现有 Tunnel/Runnel 不足，而非仅有构想。

@@ -40,24 +40,30 @@ role 不能由 rights 伪造；badge 不改变对象身份或生命周期。dupl
 
 对象在有效 Handle、消息 transit entry 或对象内部引用需要它时存活。关闭 Handle 只放弃该引用；对象的逻辑终态由 lifecycle role 决定，不等同于最后一个任意引用消失。
 
+MemoryObject 的 Handle 只授权建立新映射或管理 backing；映射本身作为对象内部引用独立保活 backing。关闭、转移或裁剪 Handle 不撤销已经建立的映射，地址空间只能按[内存模型](mm.md)的所有权规则解除自己的 view。`MAP` 与 `READ`、`WRITE` 正交：前者允许建立 view，后两者限制 view 可取得的内容权限。
+
+MemoryObject 的可执行发布状态、WritePermit 与 mapping retire 由[内存模型](mm.md)共同拥有。`SealExecutable` 要求对象定义的管理 authority，并与新 WritePermit 在对象锁上线性化；对象进入 Sealing 后拒绝新写入口，最后一个 retiring writable view 收到全部地址翻译确认后才释放 permit 并推进 Executable。Handle 关闭或 seal 发起线程消散都不能绕过该计数、撤销已发布 seal 或让 backing 在 stale writable translation 仍可能存在时析构。
+
 Mailbox 有唯一 receiver-owner。owner 不可复制，可持 `GRANT` 直接交付给 Building child，但不能持 `TRANSIT` 进入消息；sender 可复制、可按授权 TRANSIT/GRANT，并可携带 mailbox owner 铸造的 badge。owner 关闭或所在进程退出后 Mailbox 进入 `CLOSED`，清空队列及未接收 entry；残留 sender 只观察终态。
 
 Notification 同样有唯一 owner 和可委托 signaler。owner 只直接 grant，不进入消息；signaler 可按授权 TRANSIT/GRANT。owner 关闭使 Notification 终态。
 
 某些 role 是 affine 且消费式的：Mailbox send-once 在首次成功投递后消费，Tunnel invitation 在成功 attach 后消费。失败不消费。它们可以移动但不能复制。
 
-Tunnel Endpoint 与进程 VM lease 绑定，既不能 TRANSIT，也不能 GRANT；跨进程建立对端使用 invitation。
+Tunnel Endpoint 与进程地址空间 lease 绑定，既不能 TRANSIT，也不能 GRANT；跨进程建立对端使用 invitation。
 
 所有关闭都是单向迁移。终态信号持续可见，对象不可复活，也不把旧资源重新解释为另一对象。
 
 ## 收束分层
 
-关闭的收束工作量决定收束机制，只有两档：
+关闭的本地工作量决定对象采用两种收束机制；是否需要等待另一个 hart 的完成确认是正交维度：
 
-- **同步 close**：工作量不超过容量常数的对象，关闭在单次调用内同步完成。其上界由 role 结构保证：owner 不可 TRANSIT，消息内不含容器角色，可转移的 role 关闭恒为叶子操作，唯一的容器收束（owner 清空队列）受对象容量上限约束。新增可转移 role 时维持这条推导即可，不需要重审全局枚举。
-- **有界 drain**：收束工作量可能超过单次调用正常预算的对象（进程的 HandleTable 与地址空间），先发布可收束电平，由持管理 authority 的服务以硬预算分批驱动，进度保存在目标而非调用者。
+- **有界 close**：对象本地关闭工作不超过容量常数。owner 不可 TRANSIT，消息内不含容器 role，可转移 role 的关闭恒为叶子操作，唯一的容器收束受对象容量上限约束。若关闭同时撤销 object-owned mapping，Handle 层必须在消费 entry 前预留地址空间事务；提交后 mapping retire 可以通过 WaitContext 异步完成，但对象不在 close callback 中自旋或保存无界工作。
+- **有界 drain**：收束总量可能超过单次调用正常预算的对象（进程的 HandleTable 与地址空间），先发布可收束电平，由持管理 authority 的服务以硬预算分批驱动，进度保存在目标而非调用者。Drain 摘下的 entry 若触发尚不能提交的地址空间事务，作为可恢复 pending close 保留，不能丢弃 lease 或绕过完成确认。
 
-分类判据是收束工作量是否超出单次调用预算，不是对象类型。容量可参数化的容器（如邮箱扩容）或引入级联关闭时，必须跨入 drain 档而不是抬高同步档的常量。
+分类判据是本地收束总量是否超出单次预算，不是对象类型；异步确认不把固定容量对象变成无界容器。容量可参数化的容器或引入级联关闭时，必须跨入 drain 档，不能抬高有界 close 的常数。
+
+MemoryObject 只有在 backing 受硬容量上限约束时才属于有界 close；其普通可转移 Handle 的最终消散最多释放该容量内的固定工作。若对象容量不再有硬上限，它必须先进入有管理 authority、持续电平和可恢复进度的 drain 档，不能沿用普通引用计数析构。具体 backing、mapping retire 与完成边界由[内存模型](mm.md)拥有。
 
 ## 两种跨表交付
 

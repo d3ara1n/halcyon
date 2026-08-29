@@ -24,13 +24,14 @@
 
 | 概念 | 文件 |
 |---|---|
-| S 态 CSR、trap、interrupt、`sstatus`、`stvec`、`sscratch`、`sepc`、`scause`、`satp` | `supervisor.adoc` |
-| `SRET`、`WFI`、`SFENCE.VMA` 等特权指令 | `priv-insns.adoc` |
+| S 态 CSR、trap、interrupt、`sstatus`、`stvec`、`sscratch`、`sepc`、`scause`、`satp`、`SFENCE.VMA` | `supervisor.adoc`，地址翻译同步见「Supervisor Memory-Management Fence Instruction」与「ASID Usage」 |
+| `SRET`、`MRET`、`WFI` 等通用特权指令 | `priv-insns.adoc` |
 | 特权架构版本与模块状态 | `priv-preface.adoc`、`priv-history.adoc` |
 | RV64I 寄存器与基础指令 | `rv32.adoc`、`rv64.adoc` |
+| `FENCE.I` 与指令流同步 | `zifencei.adoc`「FENCE.I Instruction」 |
 | 扩展上下文的 FS/Initial/Clean/Dirty 状态 | `machine.adoc`「Extension Context Status」 |
 | 浮点指令、寄存器与 fcsr | `f-st-ext.adoc`、`d-st-ext.adoc` |
-| RISC-V 弱内存模型 | `rvwmo.adoc` |
+| RISC-V 弱内存模型、`FENCE` 与 acquire/release | `rvwmo.adoc`；解释见 `mm-eplan.adoc`「Fences」「Explicit Synchronization」 |
 | 原子指令与 LR/SC | `a-st-ext.adoc` |
 
 ## psABI、调用约定与 ELF

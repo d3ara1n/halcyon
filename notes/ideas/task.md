@@ -38,9 +38,11 @@ Exit、fault、ProcessKill 与 Building abandonment 在各自适用的 Building 
 
 ProcessKill 是持 MANAGE authority 对 Building 或 Running process 发出的异步、幂等终止请求。成功表示请求已被接受，或目标此前已经越过不可逆终止边界；不表示本次调用首次触发转换，也不表示 teardown 已完成。自杀式调用不返回用户态。调用者若需分辨目标阶段，应使用 ProcessQuery；等待 Dead 以具 WAIT authority 的 ProcessControl 观察 CLOSED，随后查询稳定终态。关闭 ProcessControl 仍只消散 authority，不隐式终止进程。
 
+Running→Terminating 的准入截止与 AddressSpace Commit 共享 Process execution gate。Commit 按 AddressSpace lock 在外、execution gate 在内的顺序取得两者；终止只在 gate 内发布截止，释放后才接管 AddressSpace，不反向取锁。终止先线性化时，尚未 Commit 的用户内存事务必须回滚且结果 cookie 保持零；事务 Commit 先线性化时，终止路径只能接管并等待其 synchronize/retire，不能把已承诺结果重新解释为失败。
+
 运行资源与终态观察壳分离。所属 Job 的直接成员表强持尚未 Dead 的 Process core，Process 只以非拥有关系回指 Job；ProcessControl shell 同样只以非拥有关系定位 core。线程全部离场后 Process 仍由 Job 保活到 Drain 完成，Dead 发布时才从 Job 成员表移除。此后地址空间和 HandleTable 不受观察者持有的 control 影响，终态 shell 由最后一个 control Handle 保活并持续提供 PID、状态与终因快照。
 
-线程与 active hart 全部离场后，ProcessControl 发布持续可见的 REAPABLE 电平。持 MANAGE authority 的管理服务以调用者给定、内核封顶的预算反复执行受保护收束；每批只处理有界数量的 Handle 和页表资源，进度保存在目标进程而非某个调用者中，同 authority 可在管理者重启后接管。最后一批完成时清除 REAPABLE 并发布 Dead/CLOSED，不把无界析构塞入单次内核路径。
+线程、active hart 与已提交的地址空间修改全部离开执行或完成不可逆撤销后，ProcessControl 发布持续可见的 REAPABLE 电平。持 MANAGE authority 的管理服务以调用者给定、内核封顶的预算反复执行受保护收束；每批只处理有界数量的 Handle 和页表资源，进度保存在目标进程而非某个调用者中，同 authority 可在管理者重启后接管。最后一批完成时清除 REAPABLE 并发布 Dead/CLOSED，不把无界析构塞入单次内核路径。地址空间事务的完成条件由[内存模型](mm.md)拥有。
 
 ## 线程：执行单元
 
@@ -62,7 +64,7 @@ ProcessKill 是持 MANAGE authority 对 Building 或 Running process 发出的�
 
 ## 组装双通道
 
-线程与内存、句柄同为进程资源，各有内外两个操作通道：外部通道（Building 期，组装者持 builder：Map/Write/Grant/Attach）与内部通道（Running 期，进程自己的 syscall：Extend/Spawn/Transit）。Building/Running 的本质即外部写通道的开与关；Start 是「资源齐备、入册调度」的纯状态转换，其唯一前置是活体门——至少已附入一条线程。组装不是协作：组装者在 Start 之后不再观察进程内部状态。
+线程与内存、句柄同为进程资源，各有内外两个操作通道：外部通道（Building 期，组装者持 builder：Map/Write/Grant/Attach）与内部通道（Running 期，进程自己的 syscall：Map/Unmap/Spawn/Transit）。两条内存通道只区分 authority 与可用阶段，共用[内存模型](mm.md)定义的账本、backing 和事务；连续堆顶不构成第三套内核映射机制。Building/Running 的本质即外部写通道的开与关；Start 是「资源齐备、入册调度」的纯状态转换，其唯一前置是活体门——至少已附入一条线程。组装不是协作：组装者在 Start 之后不再观察进程内部状态。
 
 ## 权利派生
 
@@ -70,4 +72,4 @@ ProcessKill 是持 MANAGE authority 对 Building 或 Running process 发出的�
 
 ## 多线程终止边界
 
-多线程进程必须维护成员关系与 active-hart 集合。进程回收要先阻止任何线程再次返回用户态，再取消 Ready/Waiting，并请求各 hart 上的 Running 线程在安全边界自行离场。active-hart 确认必须晚于目标 hart 切回 kernel satp 和本地全量 SFENCE.VMA；最后一个确认到达后，管理者才能开始分批回收页表和数据帧。任何 ThreadSpawn 接入都必须复用同一成员关系、active-hart barrier 与 WaitContext cancellation，不得另造单线程专用 kill/reap 路径。
+多线程进程必须维护成员关系与 active-hart 集合。进程回收要先阻止任何线程再次返回用户态，再取消 Ready/Waiting，并请求各 hart 上的 Running 线程在安全边界自行离场。active 身份既服务终止屏障，也为地址空间 translation epoch 提供执行点快照：hart 只有在完成已承诺的地址翻译同步并切回 kernel satp 后才能清除身份，快照后进入者必须在返回用户态前观察最新 epoch。最后一个终止确认到达且在途地址空间事务完成后，管理者才能分批回收页表和数据帧。ThreadSpawn 必须复用同一成员关系、active-hart barrier 与 WaitContext cancellation；线程消散可以放弃回复，但其 departed/join 完成不能越过仍挂接结果记录的 committed System Call。join 确认线程离场且该挂接已解除后，用户态才可接管结果并按[内存模型](mm.md)解除或复用其栈。

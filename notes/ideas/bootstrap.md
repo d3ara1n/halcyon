@@ -91,7 +91,7 @@ launcher 负责 ELF program-header、段重叠、BSS、最终页权限、栈布�
 
 只有持 Job/Process 构造 capability 的进程能使用这些机制；链接库提供实现复用，不产生 authority。多数服务不持 spawn 权，需要新进程时调用 pm 协议。
 
-匿名映射与 Building-only 写入是地址空间构造原语，不是 `SpawnElf`。将来增加显式 MemoryObject backing 时，它是另一种映射来源，不改变 Process 的生命周期和提交边界。
+匿名映射与 Building-only 写入是地址空间构造原语，不是 `SpawnElf`。显式 MemoryObject backing 是另一种映射来源，不改变 Process 的生命周期和提交边界；具体映射语义由[内存模型](mm.md)拥有。
 
 ## Job 与 Process capability
 

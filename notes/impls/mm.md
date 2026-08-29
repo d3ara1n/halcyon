@@ -2,45 +2,48 @@
 
 方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分四层：帧池、可 host 测试的 Sv39 页表、内核地址空间与启动协议、用户地址空间；本篇是内存实现事实的唯一拥有者。
 
-## 帧池
+## 帧库存
 
-物理帧的唯一来源，自研 **in-band 有序空闲链**（os/frame_pool，纯逻辑 crate），包装进内核 `Spinlock`，经 `PoolMemory` trait 抽象内存访问——与 page_table 同一「host 可测」流水线。
-
-帧池必须支持任意 count 连续分配、精确数量记账和零堆依赖；in-band 有序区间链直接满足这三个约束，并保持堆→帧池单向依赖。
+物理帧的唯一来源是 `os/frame_pool` 的**外置元数据分级 order 树**。纯逻辑 crate 不使用堆、不含 unsafe；内核只在 `os/kernel/src/frame.rs` 提供启动 reservation、真实帧清零、全局 POOL 锁与 `FrameTracker` RAII 适配。
 
 ### 结构
 
-空闲区间按地址排序成单链，节点 `{len, next}` 内嵌于区间首帧的前两个 usize——**空闲内存自身承载元数据**，零堆依赖、零外部存储。节点内容是帧号而非地址（`next` 为 usize，`usize::MAX` 哨兵表链尾，不依赖 Rust 对 Option 的内部表示），与地址转换解耦：内核从 bare 切到高半区直映射时，`FramePool::into_mem` 取回后端、换转换函数重建实例即可，链结构零迁移。
+每个 DT memory region 先按全局帧号作 canonical power-of-two 分解，形成物理对齐 arena。单个任意区间至多产生两倍地址位宽个 arena；板级最多 8 个 memory region，`MAX_ARENAS = 1024` 是结构上限。arena 不跨 DT 物理缺口，因此任何 order 块天然物理连续并按自身大小对齐。
+
+每个 arena 使用完全二叉树，节点一个 `u8`：`0..` 表示该子树当前可提供的最大 order，`u8::MAX` 表示没有空闲块。整块空闲由父节点直接代表；向下分配时才物化两个子节点，归还时沿祖先即时合并。分配和归还不维护运行期碎片链，也不读取被管理帧内容。
+
+树节点每个托管帧精确占 2 字节；固定 1024 项 `ArenaMetadata` 与树节点一起从启动期物理 reservation 取得。`FramePool` 自身只持两个外置切片和计数器，不把大数组压入内核栈。实测 virt 1 GiB 使用 134 个元数据帧，sifive_u 128 MiB 使用 22 个。
 
 ```rust
-pub struct RegionNode { pub len: usize, pub next: usize }
-
-pub trait PoolMemory {
-    fn read_meta(&mut self, frame: FrameNumber) -> RegionNode;
-    fn write_meta(&mut self, frame: FrameNumber, node: RegionNode);
-    fn clear_frames(&mut self, base: FrameNumber, count: usize);
+pub struct FramePool<'a> {
+    /* tree metadata slice, arena metadata slice, counters */
 }
 
-pub struct FramePool<M: PoolMemory> { /* mem, head, free_frames */ }
+pub struct FrameTracker {
+    geometry: Option<ExtentGeometry>,
+}
 ```
 
-- 内核实现：`phys_to_virt` 转换后裸访问（bare 期恒等），unsafe 边界收敛在此；host 实现：`BTreeMap` 模拟帧槽。
+`FramePool` 不再参数化帧内容后端，claim/return 路径只能读写外置树元数据。内核 adapter 取得 claimed geometry 后先释放 POOL 锁，再经 `phys_to_virt` 清零完整 extent；清零结束才构造 `FrameTracker`。`ExtentGeometry` 可复制但只表达几何，私有字段的 `FrameTracker` 才表达 affine 所有权。
 
 ### 操作与契约
 
-- `add_region(start, end)`：注册启动期空闲区间（DTB memory 剔除内核镜像/栈/实际 BootPackage 后），地址序入链。
-- `alloc_contiguous(count)`：first-fit 取首个足够区间，**从尾端切**——低地址区间先消耗，大区间主体保持完整；整取时重链，否则节点原地减 len；返回前整块清零（安全 + 上层拿来即用）。
-- `alloc_at(base, count)`：取指定区间（启动协议三件套、页表解映射回投）；区间内三向切割，左右残段各自成节点；不可用（未注册/已分配）返回 `Err`。
-- `dealloc(base, count)`：按地址序插入 + 相邻三向合并。debug 断言拒绝与现有空闲区间重叠（双重释放检测）。
-- 复杂度：分配/释放 O(空闲区间数)。常规 `dealloc` 的非 Drain 路径无界扫描登记在 `KNOWN_ISSUES.md`。
+- `add_managed_region(start, end)`：注册完整 DT memory，初态全部 unavailable；重叠、arena 超限或元数据不足在修改前失败。
+- `release_range(start, end)`：把启动 reservation 的补集或已结束 reservation 发布为空闲；bootstrap 与 BootPackage prefix 回投走此入口。
+- `alloc_order(order)`：库存分配 `2^order` 个连续且同阶对齐帧，沿固定 arena 集合选树、沿树下降；内核 adapter 在锁外清零后发布 tracker。
+- `alloc_largest(max_count)`：库存单次扫描固定 arena 集合，取得不超过上限的最大 power-of-two extent；普通匿名 backing 用多个 extent 表达任意页数，不要求整段 PA 连续；内核同样在锁外清零后发布。
+- `alloc_at(base, count)`：预验证完整指定区间空闲后，按 canonical blocks 精确取走；失败不改变库存。
+- `dealloc(base, count)`：任意区间 canonical 分解后沿祖先合并；重复归还或与现有空闲库存重叠立即触发断言。普通 `FrameTracker` 持 power-of-two extent，BootPackage payload 可持任意长度保留区间。
 
-- 区域来源：DTB `memory` 节点，剔除 `[0x80000000, _kernel_end_pa)`（SBI + 内核镜像 + 栈）与 BootPackage envelope 的实际 `total_len`。DTS capacity 只用于 loader/validator 边界，不会整段退出帧池；窗口必须完整落在某个 DT memory region 内。启动占用当前固定为这两类区间，bootstrap 通过 `free_range` 回投可释放前缀。
-- `FrameTracker { base, count }` RAII 归还，Drop 时整批 dealloc；进程持有的页帧以此为单位记账。
-- 内核堆由帧池供血：talc 内存源（FrameSource）耗尽时取 1MiB 连续帧块 claim 建新区，帧块所有权终身归堆（acquire 内不可碰堆与锁，无归还记账）；启动路径（DTB 解析/帧池注册）零堆依赖，引导序线性：帧池 → 堆首分配 → 一切堆消费者。
+`alloc_order`/`alloc_largest` 的库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
+
+启动流程先排序并验证 DT memory，再按总托管帧数计算元数据 reservation；SBI+内核、实际 BootPackage 和元数据页保持 unavailable，只发布其补集。内核堆明确申请 order 8（1 MiB）并终身持有；页表与 Tunnel 申请 order 0。Building 匿名区间由 `alloc_largest` 组合多个 extent。
+
+`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。页表帧通过 `into_table_frame`/`adopt_table_frame` 显式移交，BootPackage payload 通过独立 reservation adopt 收编，内核堆通过 permanent transfer 终身持有。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：tracker 从拥有结构摘下与下一 work unit 的实际归还分开计费，手工摘除的表帧经 table adopt 进入同一路径。
 
 ### 测试集（host）
 
-整取整还、尾端切地址递减、三向合并、双重释放、alloc_at 中切/边切/失败、多区域跨链、碎片化后总帧数守恒、空池与大请求拒绝、有界归还跨预算游标恢复、并发归还游标失效重启、有界归还完成预算边界（扫描最后一跳用满预算时持久化重入，完成返回不得超 max——drain work_done 违约的根源回归）。
+15 项 host 用例覆盖：整阶取还、逐层 split/coalesce、全局 order 对齐、碎片不伪造大阶、extent 几何边界与精确切割、最大 extent fallback、`alloc_at` 精确/失败原子/跨 arena、reservation 延后发布、多 DT region 不跨洞、元数据/arena/重叠准入失败、canonical arena 数上界、双重释放、零长度拒绝，以及 2000 轮随机分配归还的帧数守恒与最终整阶合并。纯逻辑库存类型没有帧内容后端，因此 host claim 路径结构上无法访问帧内容。内核启动自检覆盖 claim、锁外清零、affine split、分片归还计数与再次清零；virt debug/release/hetero/nofd 和 sifive_u 均通过。
 
 ## 页表模式选择
 
@@ -143,7 +146,7 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 brk 在 launch 时越过 init bootstrap 出生块；Extend 从 brk 逐页映射并返回新 brk。普通进程的出生块由组装者（libprocess）写入映像顶之上页对齐的约定区；首线程 sp 由组装者经 ProcessAttach 供给（libprocess 置于 `2^38`，16 字节对齐）。ASID 恒 0，地址空间切换执行全量 `sfence.vma`。
 
 - 进程页表 root 共享内核高半区顶层项；
-- owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的 FrameTracker 持有；任何 PTE 安装前先 `try_reserve` 记账容量，批量安装逐页进行，失败按逆序 unmap 后才释放 backing；
+- owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的一个或多个 FrameTracker extent 持有；任何 PTE 安装前先按最坏 extent 数 `try_reserve` 记账容量，批量安装失败按逆序 unmap 后才释放 backing；
 - bootstrap StartupBlock prefix 是 owned 页；opaque payload 页在映入 init 时即收编为该地址空间的 owned FrameTracker（启动保留洞的帧首次入账），地址空间销毁时随 owned 帧归还帧池；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap 只服务 Building process，创建 anonymous zero pages并使用最终权限，拒绝 W+X；ProcessWrite 经物理直映射写 backing，Running 发布后不再存在该写入口；
 - Tunnel 映射由 Endpoint lease 记入 `AddressSpace.external_mappings`，关闭时解除。

@@ -1,8 +1,14 @@
 //! Tunnel 对象：Connection 持帧，Endpoint 持本地映射 lease，Invitation
 //! 是一次性可转移授权。不存在全局 id 或 registry。
 
-use alloc::{sync::{Arc, Weak}, vec::Vec};
-use core::{any::Any, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use erhino_shared::{
     call::SystemCallError,
@@ -13,14 +19,13 @@ use crate::{
     frame::{self, FrameTracker},
     sync::Spinlock,
     task::{
-        handle,
+        Thread, handle,
         object::{
             HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
             SubscribeResult,
         },
         proc::Process,
-        wait::{finish_offered, Subscription},
-        Thread,
+        wait::{Subscription, finish_offered},
     },
 };
 
@@ -118,7 +123,9 @@ impl Endpoint {
     }
 
     fn acknowledge_data(&self) {
-        self.wait.lock().update(ObjectSignals::DATA, ObjectSignals::NONE);
+        self.wait
+            .lock()
+            .update(ObjectSignals::DATA, ObjectSignals::NONE);
     }
 
     fn finish_waiters(&self) {
@@ -207,9 +214,8 @@ impl KernelObject for Endpoint {
     }
 
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::TunnelEndpoint).then_some(
-            ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-        )
+        (role == HandleRole::TunnelEndpoint)
+            .then_some(ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -323,14 +329,17 @@ impl KernelObject for Invitation {
 }
 
 pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCallError> {
-    let tracker = frame::alloc_contiguous(1).ok_or(SystemCallError::OutOfMemory)?;
-    let pa = tracker.base.addr();
+    let tracker = frame::alloc_order(0).ok_or(SystemCallError::OutOfMemory)?;
+    let pa = tracker.base().addr();
     let connection = Arc::new(Connection {
-        state: Spinlock::new(crate::sync::ranks::CONNECTION, ConnectionState {
-            pa,
-            frame: tracker,
-            sides: [SideState::Closed, SideState::Closed],
-        }),
+        state: Spinlock::new(
+            crate::sync::ranks::CONNECTION,
+            ConnectionState {
+                pa,
+                frame: tracker,
+                sides: [SideState::Closed, SideState::Closed],
+            },
+        ),
     });
     let endpoint = Endpoint::new(connection.clone(), 0, &thread.process, va);
     let invitation = Invitation::new(connection.clone(), 1);
@@ -343,7 +352,9 @@ pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCal
     }
 
     let mut entries = Vec::new();
-    entries.try_reserve_exact(2).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve_exact(2)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
         handle::entry(
             Endpoint::object_ref(&endpoint),
@@ -367,11 +378,15 @@ pub fn create(thread: &Thread, va: usize, output: usize) -> Result<(), SystemCal
     let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
-        table.rollback(reservation).expect("TunnelCreate reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("TunnelCreate reservation must remain owned");
         return Err(error.into());
     }
     if let Err(error) = space.map_external(va, pa) {
-        table.rollback(reservation).expect("TunnelCreate reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("TunnelCreate reservation must remain owned");
         return Err(map_space_error(error));
     }
     // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
@@ -403,7 +418,12 @@ pub fn attach(
         entry.object().clone()
     };
     let invitation = concrete_invitation(&object)?;
-    let endpoint = Endpoint::new(invitation.connection.clone(), invitation.side, &thread.process, va);
+    let endpoint = Endpoint::new(
+        invitation.connection.clone(),
+        invitation.side,
+        &thread.process,
+        va,
+    );
     // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let endpoint_entry = handle::entry(
         Endpoint::object_ref(&endpoint),
@@ -412,7 +432,9 @@ pub fn attach(
     )
     .map_err(handle::map_error)?;
     let mut entries = Vec::new();
-    entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve_exact(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(endpoint_entry);
     let reservation = table.reserve(1, token).map_err(handle::map_error)?;
     let endpoint_handle = reservation.handles()[0];
@@ -425,16 +447,22 @@ pub fn attach(
         )
         || !matches!(connection.sides[1 - invitation.side], SideState::Alive(_))
     {
-        table.rollback(reservation).expect("TunnelAttach reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("TunnelAttach reservation must remain owned");
         return Err(SystemCallError::ObjectClosed);
     }
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
-        table.rollback(reservation).expect("TunnelAttach reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("TunnelAttach reservation must remain owned");
         return Err(error.into());
     }
     if let Err(error) = space.map_external(va, connection.pa) {
-        table.rollback(reservation).expect("TunnelAttach reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("TunnelAttach reservation must remain owned");
         return Err(map_space_error(error));
     }
 
@@ -443,7 +471,9 @@ pub fn attach(
     // invitation 的 abandon 自会将 side 置 Closed 并通知对端，本侧
     // 端点对象随回滚消散、外部映射经 lease Drop 解除。
     let Ok(consumed) = table.remove(invitation_handle) else {
-        table.rollback(reservation).expect("TunnelAttach reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("TunnelAttach reservation must remain owned");
         return Err(SystemCallError::ObjectClosed);
     };
     connection.sides[invitation.side] = SideState::Alive(Arc::downgrade(&endpoint));

@@ -58,27 +58,19 @@ impl From<MapError> for SpaceError {
     }
 }
 
-/// [`TableTree`] 的帧来源：表帧从帧池取、经 forget 交树持有，树 Drop 时归还。
+/// [`TableTree`] 的帧来源：表帧通过显式 transfer 交树持有，树 Drop 时归还。
 struct TableMem;
 
 impl FrameMemory for TableMem {
     fn alloc_frame(&mut self) -> Result<FrameNumber, page_table::FrameExhausted> {
-        // SAFETY: 分配帧并 forget——所有权移交树，free_frame 时归还。
-        frame::alloc_contiguous(1)
-            .map(|t| {
-                let base = t.base;
-                core::mem::forget(t);
-                base
-            })
+        frame::alloc_order(0)
+            .map(FrameTracker::into_table_frame)
             .ok_or(page_table::FrameExhausted)
     }
 
     fn free_frame(&mut self, frame: FrameNumber) {
-        // SAFETY: frame 由 alloc_frame 的 forget 产生，构造 tracker 恰好归还一帧。
-        drop(FrameTracker {
-            base: frame,
-            count: 1,
-        });
+        // SAFETY: FrameMemory 只回传此前由 alloc_frame 唯一移交给该树的表帧。
+        drop(unsafe { FrameTracker::adopt_table_frame(frame) });
     }
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [page_table::Pte; page_table::ENTRIES] {
@@ -104,13 +96,6 @@ enum DrainStage {
     Done,
 }
 
-/// 一笔进行中的有界帧归还：区间与帧池扫描游标跨 drain 调用持久化。
-struct PendingFree {
-    base: page_table::FrameNumber,
-    count: usize,
-    scan: frame_pool::FreeScan,
-}
-
 /// 进程地址空间：页表树 + 数据帧所有权 + 布局记账。
 ///
 /// 访问纪律：所属对象私有层——持 `Process.space` 锁访问；跨 hart 调用者
@@ -128,8 +113,8 @@ pub struct AddressSpace {
     external_mappings: Vec<usize>,
     /// 有界收束游标（drain_gate + space 锁双持下推进）。
     drain_stage: DrainStage,
-    /// 进行中的有界帧归还（数据帧/表帧/root 帧共用）。
-    pending_free: Option<PendingFree>,
+    /// 已从拥有结构摘下、等待下一 work unit 归还的帧 extent。
+    pending_free: Option<FrameTracker>,
 }
 
 impl Drop for AddressSpace {
@@ -184,28 +169,48 @@ impl AddressSpace {
         self.brk
     }
 
-    /// 申请 `count` 页（整段物理连续，利于大页），登记映射与帧所有权。
+    /// 申请 `count` 页，以若干 power-of-two extent 登记映射与帧所有权。
     fn alloc_map(&mut self, vaddr: usize, count: usize, flags: u64) -> Result<(), SpaceError> {
+        debug_assert!(count > 0);
+        let committed = self.frames.len();
+        // 最坏碎片形态每页一个 extent；提交后 push 不再失败。
         self.frames
-            .try_reserve(1)
+            .try_reserve(count)
             .map_err(|_| SpaceError::NoFrame)?;
-        let tracker = frame::alloc_contiguous(count).ok_or(SpaceError::NoFrame)?;
         let base_vpn = vaddr / PAGE_SIZE;
-        let base_ppn = tracker.base.addr() / PAGE_SIZE;
-        for index in 0..count {
-            if let Err(error) =
-                self.tt()
-                    .map(Vpn(base_vpn + index), 1, Ppn(base_ppn + index), flags)
-            {
-                for rollback in (0..index).rev() {
+        let mut mapped = 0usize;
+
+        while mapped < count {
+            let Some(tracker) = frame::alloc_largest(count - mapped) else {
+                for rollback in (0..mapped).rev() {
                     self.tt()
                         .unmap(Vpn(base_vpn + rollback), 1)
-                        .expect("single-page allocation rollback cannot fail");
+                        .expect("anonymous allocation rollback cannot fail");
                 }
-                return Err(error.into());
+                self.frames.truncate(committed);
+                return Err(SpaceError::NoFrame);
+            };
+            let extent_count = tracker.count();
+            let extent_ppn = tracker.base().addr() / PAGE_SIZE;
+            for index in 0..extent_count {
+                if let Err(error) = self.tt().map(
+                    Vpn(base_vpn + mapped + index),
+                    1,
+                    Ppn(extent_ppn + index),
+                    flags,
+                ) {
+                    for rollback in (0..mapped + index).rev() {
+                        self.tt()
+                            .unmap(Vpn(base_vpn + rollback), 1)
+                            .expect("anonymous allocation rollback cannot fail");
+                    }
+                    self.frames.truncate(committed);
+                    return Err(error.into());
+                }
             }
+            mapped += extent_count;
+            self.frames.push(tracker);
         }
-        self.frames.push(tracker);
         Ok(())
     }
 
@@ -245,18 +250,7 @@ impl AddressSpace {
         }
 
         let pages = len / PAGE_SIZE;
-        let committed = self.frames.len();
-        for index in 0..pages {
-            if let Err(error) = self.alloc_map(vaddr + index * PAGE_SIZE, 1, pte_flags) {
-                for rollback in (0..index).rev() {
-                    self.tt()
-                        .unmap(Vpn(vaddr / PAGE_SIZE + rollback), 1)
-                        .expect("single-page ProcessMap rollback cannot fail");
-                }
-                self.frames.truncate(committed);
-                return Err(error);
-            }
-        }
+        self.alloc_map(vaddr, pages, pte_flags)?;
         if end <= stack_base {
             self.brk = self.brk.max(end);
         }
@@ -390,10 +384,10 @@ impl AddressSpace {
             .try_reserve(plan.len())
             .map_err(|_| SpaceError::NoFrame)?;
         for (&vpn, &fl) in &plan {
-            let tracker = frame::alloc_contiguous(1).ok_or(SpaceError::NoFrame)?;
+            let tracker = frame::alloc_order(0).ok_or(SpaceError::NoFrame)?;
             self.tt()
-                .map(Vpn(vpn), 1, Ppn(tracker.base.addr() / PAGE_SIZE), fl)?;
-            pages.push((vpn, tracker.base.addr()));
+                .map(Vpn(vpn), 1, Ppn(tracker.base().addr() / PAGE_SIZE), fl)?;
+            pages.push((vpn, tracker.base().addr()));
             self.frames.push(tracker);
         }
 
@@ -477,35 +471,22 @@ impl AddressSpace {
             return Err(SpaceError::BadSegment);
         }
 
+        let committed = self.frames.len();
         self.frames
-            .try_reserve(1 + usize::from(payload_pages > 0))
+            .try_reserve(prefix_pages + usize::from(payload_pages > 0))
             .map_err(|_| SpaceError::NoFrame)?;
-        let tracker = frame::alloc_contiguous(prefix_pages).ok_or(SpaceError::NoFrame)?;
         let base_vpn = base / PAGE_SIZE;
-        let prefix_ppn = tracker.base.addr() / PAGE_SIZE;
-        for index in 0..prefix_pages {
-            if let Err(error) = self.tt().map(
-                Vpn(base_vpn + index),
-                1,
-                Ppn(prefix_ppn + index),
-                flags::USER_RODATA,
-            ) {
-                for rollback in (0..index).rev() {
-                    self.tt()
-                        .unmap(Vpn(base_vpn + rollback), 1)
-                        .expect("single-page bootstrap prefix rollback cannot fail");
-                }
-                return Err(error.into());
+        self.alloc_map(base, prefix_pages, flags::USER_RODATA)?;
+        if let Err(error) = self.write_building(base, prefix) {
+            for rollback in 0..prefix_pages {
+                self.tt()
+                    .unmap(Vpn(base_vpn + rollback), 1)
+                    .expect("bootstrap prefix rollback cannot fail");
             }
+            self.frames.truncate(committed);
+            return Err(error);
         }
-        // SAFETY: prefix tracker 为本地址空间独占，用户映射只读。
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                prefix.as_ptr(),
-                mm::phys_to_virt(tracker.base.addr()) as *mut u8,
-                prefix.len(),
-            );
-        }
+
         if payload_pages > 0 {
             for index in 0..payload_pages {
                 if let Err(error) = self.tt().map(
@@ -517,24 +498,24 @@ impl AddressSpace {
                     for rollback in (0..index).rev() {
                         self.tt()
                             .unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
-                            .expect("single-page bootstrap payload rollback cannot fail");
+                            .expect("bootstrap payload rollback cannot fail");
                     }
                     for rollback in 0..prefix_pages {
                         self.tt()
                             .unmap(Vpn(base_vpn + rollback), 1)
-                            .expect("single-page bootstrap prefix rollback cannot fail");
+                            .expect("bootstrap prefix rollback cannot fail");
                     }
+                    self.frames.truncate(committed);
                     return Err(error.into());
                 }
             }
-            // SAFETY: payload 帧来自帧池启动保留洞（从未入空闲链），
-            // 收编为 owned tracker 后由 Drop 在地址空间销毁时首次归还池。
-            self.frames.push(FrameTracker {
-                base: FrameNumber(payload_pa / PAGE_SIZE),
-                count: payload_pages,
+            // payload 帧来自启动 reservation，从未发布为空闲；此处把其完整
+            // 页范围唯一移交给地址空间 backing，Drop 时首次进入库存。
+            // SAFETY: payload reservation 在启动移交中只执行一次，且尚未发布到 POOL。
+            self.frames.push(unsafe {
+                FrameTracker::adopt_reserved(FrameNumber(payload_pa / PAGE_SIZE), payload_pages)
             });
         }
-        self.frames.push(tracker);
         self.brk = end;
         Ok(base)
     }
@@ -664,35 +645,37 @@ impl AddressSpace {
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
     }
 
-    /// 推进一笔进行中的有界归还；返回 (消耗步数, 是否完成)。
-    /// 预算耗尽时游标持久化在 `pending_free`，下次续扫；`budget == 0`
-    /// 表示本次调用的工作已被前序步骤用尽（登记本身即本次进展）。
+    /// 推进一笔已摘下的帧 extent 归还；分级库存归还具有地址位宽常数上界，
+    /// 因此每个 extent 计一个 work unit，不再保存碎片链扫描游标。
     fn step_pending(&mut self, budget: usize) -> (usize, bool) {
-        let Some(pending) = self.pending_free.as_mut() else {
+        if self.pending_free.is_none() {
             return (0, true);
-        };
+        }
         if budget == 0 {
             return (0, false);
         }
-        crate::frame::dealloc_step(pending.base, pending.count, &mut pending.scan, budget)
+        drop(self.pending_free.take());
+        (1, true)
     }
 
-    /// 登记一笔新的有界归还（当前无在途归还时调用）。
-    fn enqueue_free(&mut self, base: page_table::FrameNumber, count: usize) {
+    /// 登记一笔新的 extent 归还（当前无在途归还时调用）。
+    fn enqueue_free(&mut self, tracker: FrameTracker) {
         debug_assert!(
             self.pending_free.is_none(),
             "pending free must be consumed before enqueuing"
         );
-        self.pending_free = Some(PendingFree {
-            base,
-            count,
-            scan: frame_pool::FreeScan::default(),
-        });
+        self.pending_free = Some(tracker);
     }
 
-    /// 有界收束一批资源。work unit 是**真实执行步数**：帧池链扫描每步、
-    /// 完成插入、Handle/PTE 每个检查或摘除的槽位各 1——预算是硬执行
-    /// 上界（单次 drain 调用绝不超过 budget 个基本步 + O(1) 收尾）。
+    /// 从页表结构收回一帧并登记延后归还。
+    fn enqueue_table_frame(&mut self, frame: FrameNumber) {
+        // SAFETY: 调用点先从唯一所属的页表槽或 root 摘除该帧，之后不再访问。
+        self.enqueue_free(unsafe { FrameTracker::adopt_table_frame(frame) });
+    }
+
+    /// 有界收束一批资源。Handle/PTE 检查、所有权摘除与 extent 归还各计一个
+    /// work unit；每个 extent 的库存操作另有只依赖地址位宽和 DT region 上限的
+    /// 结构常数界，因此单次执行量受 `budget` 线性约束。
     /// 仅在 REAPABLE 后（drain_gate 持有下）调用；返回 (work_done, complete)。
     pub fn drain(&mut self, budget: usize) -> (usize, bool) {
         let (work, complete) = self.drain_inner(budget);
@@ -741,10 +724,8 @@ impl AddressSpace {
                         self.drain_stage = DrainStage::Tables { root: 0, l1: 0 };
                         continue;
                     };
-                    // 绕过 FrameTracker::Drop（无界链扫描）走有界路径。
-                    let tracker = core::mem::ManuallyDrop::new(tracker);
                     work += 1; // tracker 出栈 + 登记为 1 个计费步骤
-                    self.enqueue_free(tracker.base, tracker.count);
+                    self.pending_free = Some(tracker);
                     let (used, done) = self.step_pending(budget - work);
                     work += used;
                     if !done {
@@ -811,7 +792,7 @@ impl AddressSpace {
                             l1_slot += 1;
                             work += 1;
                             if let Some(frame) = branch_frame {
-                                self.enqueue_free(frame, 1);
+                                self.enqueue_table_frame(frame);
                                 let (used, done) = self.step_pending(budget - work);
                                 work += used;
                                 if !done {
@@ -845,7 +826,7 @@ impl AddressSpace {
                         root_slot += 1;
                         l1_slot = 0;
                         work += 1;
-                        self.enqueue_free(l1_frame, 1);
+                        self.enqueue_table_frame(l1_frame);
                         let (used, done) = self.step_pending(budget - work);
                         work += used;
                         self.drain_stage = DrainStage::Tables {
@@ -900,7 +881,7 @@ impl AddressSpace {
                         .tree
                         .take()
                         .expect("tree exists until Root stage completes");
-                    self.enqueue_free(tree.leak_root(), 1);
+                    self.enqueue_table_frame(tree.leak_root());
                     self.drain_stage = DrainStage::RootFree;
                     let (used, done) = self.step_pending(budget - work);
                     work += used;

@@ -2,20 +2,23 @@
 //!
 //! talc 经 [`FrameSource`] 按需供血：堆耗尽时从帧池取 1 MiB 连续帧块
 //! 建立新堆区（talc 支持多块不连续区域）。帧块所有权随 claim 转移给
-//! 堆——`Source::acquire` 内不得触碰堆与 TalcLock（talc 契约），故以
-//! `mem::forget` 终身持有，不设归还记账。初始化顺序错误（首次分配早于
-//! 帧池）会在帧池访问处以 panic 显式暴露。
+//! 堆——`Source::acquire` 内不得触碰堆与 TalcLock（talc 契约）；claim 成功后
+//! 通过显式 permanent transfer 终身持有，不设归还记账。初始化顺序错误（首次
+//! 分配早于帧库存）会在库存访问处以 panic 显式暴露。
 
 use core::alloc::Layout;
 
 use talc::{
-    base::{binning::Binning, Talc},
+    DefaultBinning,
+    base::{Talc, binning::Binning},
     source::Source,
     sync::TalcLock,
-    DefaultBinning,
 };
 
-use crate::{frame, mm, sync::{ranks, RankedRawSpinlock}};
+use crate::{
+    frame, mm,
+    sync::{RankedRawSpinlock, ranks},
+};
 
 /// 每次扩堆帧块：1 MiB（256 帧）。
 const CHUNK: usize = 1 << 20;
@@ -32,13 +35,14 @@ impl core::fmt::Debug for FrameSource {
 // 分配器）；claim 的区域独占、4KiB 对齐、容量远超 talc 元数据需求。
 unsafe impl Source for FrameSource {
     fn acquire<B: Binning>(talc: &mut Talc<Self, B>, _layout: Layout) -> Result<(), ()> {
-        let tracker = frame::alloc_contiguous(CHUNK / frame::FRAME_SIZE).ok_or(())?;
-        let base = mm::phys_to_virt(tracker.base.addr());
+        let tracker =
+            frame::alloc_order((CHUNK / frame::FRAME_SIZE).trailing_zeros() as usize).ok_or(())?;
+        let base = mm::phys_to_virt(tracker.base().addr());
         // SAFETY: 区域独占且已清零（分配即清零），claim 成功后帧所有权
         // 转移给堆；失败则 tracker Drop 归还帧池。
         match unsafe { talc.claim(base as *mut u8, CHUNK) } {
             Some(_) => {
-                core::mem::forget(tracker);
+                tracker.into_permanent();
                 Ok(())
             }
             None => Err(()),

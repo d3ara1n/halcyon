@@ -14,6 +14,7 @@
 - **ABI 演进两侧同步**：shared/ 不冻结，内核与 rinlib 一起改。
 - **纯 capability 授权**：无进程权限等级；平台根由内核按事实铸造、init 决定策略；Handle 以 TRANSIT/GRANT 区分消息暂存与直接跨表安装，badged sender 承载用户态 grant（`notes/ideas/object.md`）。
 - **框架先行、实现从简**：整体系统设计为先，搭框架再填充——结构一次到位，实现按需求渐进替换（如调度域/类）。
+- **AddressSpace 是内存所有权 seam**：区域账本是映射真值，匿名 mapping 自有 affine extents，共享字节使用固定长度、容量有界的 MemoryObject；所有变更走 validate/reserve/commit/publish/synchronize/retire，跨 hart 完成以 epoch + Remote Call 确认闭合（`notes/ideas/mm.md`）。
 
 ## 活跃计划
 
@@ -24,10 +25,10 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已完成收口，03–07 待做 |
 | [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md) | 未来设计项：独立用户态电源管理服务需要另行设计，当前不预设职责、拓扑、协议或 capability 分配 |
 | [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) | 未来设计项：闭合用户态从关机意图到最终 reset 的服务收束政策，不预设执行主体、拓扑或协议 |
-| [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md) | 当前主线：完整设计并实现 Running Map/Unmap、映射账本、guard、remote TLB shootdown 与有界回收；完成后解除 ThreadSpawn 阻塞 |
-| [`todo-2026-09-ipc-data-plane-design.md`](todo-2026-09-ipc-data-plane-design.md) | 未来设计项：内存映射与多线程压力线收口后，再以真实负载审视 MemoryObject、帧移交、Tunnel/Runnel 与描述符协议，不预写实现结论 |
+| [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md) | 当前主线：order 树已完成，Map 结果承诺、区域分组、shootdown 内存序与 MemoryObject seal entry gates 已闭合；下一步完善锁外清零与 affine extent，再按计划进入 MemoryChange 与统一 AddressSpace |
+| [`todo-2026-09-ipc-data-plane-design.md`](todo-2026-09-ipc-data-plane-design.md) | 未来设计项：内存映射与多线程压力线收口后，在既定 MemoryObject/映射契约上以真实负载设计公共对象 ABI、帧移交、Tunnel/Runnel 与描述符协议 |
 | [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备/中断接入重审与 ThreadSpawn 后 IPC 压力验证线 |
-| [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart Timeout queue、MappingLease、公理层与文档自洽的复核轴 |
+| [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart Timeout、MappingLease 与文档自洽；共享事务骨架触发条件已满足，由当前 AddressSpace/MemoryChange 主线承接 |
 | [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
 | [`todo-2026-08-28-thread-teardown-review.md`](todo-2026-08-28-thread-teardown-review.md) | 生命周期 step 7（多线程 teardown barrier，提交 d741880）的未来审查计划：成员表不变量、游标取消锁序、汇编出口归一、写回复检即杀 |
 | [`todo-2026-08-28-domain-eligibility-review.md`](todo-2026-08-28-domain-eligibility-review.md) | 生命周期 step 8（调度域 eligibility，提交 1d7dc92）的未来审查计划：域推导、绑定冻结、域内 idle 与 IPI 路由 |
@@ -55,7 +56,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 ## 位置
 
 - 已完成：boot/高半区启动协议、帧池（os/frame_pool）、堆、Sv39 页表（os/page_table）、板级解析（os/dtb）、任务模型（trap 路径与 trap 锚、域—类调度、进程/线程、BootPackage initial ELF bootstrap、syscall 面 Debug/Exit/Extend/Sleep、进程回收、timer/IPI 通路）与执行环境重构（a9a65cb）。IPC 前地基工程已完成（hart 身份统一、锁内存序、所有权单向化、uaccess 集中化、Extend 字节 sbrk 语义；见 `plans/archived/2026-09-pre-ipc-groundwork.md`）。IPC 对象 / Handle 重建也已完成：进程本地 HandleTable、WaitContext、显式 Mailbox/Notification、原子 Handle move、Endpoint/Invitation 与 Acquire/Release Runnel 已贯通，实施档案见 [已归档计划](archived/2026-08-ipc-object-foundation.md)，实现现状见 `notes/impls/ipc.md`。
-- 当前：**用户内存映射**——完整化 Running Map/Unmap、映射账本、guard、remote TLB shootdown 与有界回收；该项收口后重审 ThreadSpawn 的用户栈、结果槽与 join handle 契约。计划见 [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)。
+- 当前：**用户内存映射**——统一所有权重构、Map 提交前结果承诺、AllocationKey/RegionKey 精确切割、shootdown happens-before 与 MemoryObject sealing 已确认；order 树与 affine 帧发布 seam 已完成，库存不接触帧内容，内核在 POOL 锁外清零后才发布 tracker，页表/启动 reservation/堆均走显式 transfer/adopt。下一步按 MemoryChange planner → 页表资源预留 → Remote Call → AddressSpace 调用者迁移 → Running ABI/rinlib 的顺序实施。`AddressSpace.frames`、`external_mappings`、brk/Extend 与旁路 shootdown 最终删除；该项收口后重审 ThreadSpawn 的用户栈、结果槽与 join handle 契约。计划见 [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)。
 - 后续设计：用户态系统关机编排与独立电源管理服务分别立案，二者不互相预设执行主体、职责、拓扑、协议或 capability 分配。计划见 [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) 与 [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md)。
 - 已完成：**显式系统复位已收口（2026-09）**——eRhino 自有 reset ABI、primordial `SystemReset` capability、init 直接提交与 SBI 显式映射已落地；调度器不再从 quiescent 推断关机，idle 只负责 WFI 与唤醒路由；virt 五线与 sifive_u 平台失败返回均通过。实施档案见 [`archived/todo-2026-09-explicit-system-reset.md`](archived/todo-2026-09-explicit-system-reset.md)，旧竞态调查见 [`archived/todo-2026-08-29-early-quiescent-shutdown.md`](archived/todo-2026-08-29-early-quiescent-shutdown.md)。
 - 已完成：**竞态矩阵覆盖增强已收口（2026-09）**——锤侧延迟变体（`Cmd.aux` 转正为执行前延迟，奇数轮锤延迟 10ms），kill-vs-exit/fault/abandon 双侧终因均有胜出记录，全验证线 10/10；实施档案见 [archived/todo-2026-08-28-race-matrix-coverage.md](archived/todo-2026-08-28-race-matrix-coverage.md)。

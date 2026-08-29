@@ -6,7 +6,7 @@ IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信
 
 - **消息**（[message](message.md)）是控制面：有界、非阻塞的 Mailbox 投递，承载小 payload、内核生成的 `sender_pid/sender_badge` envelope 与原子 TRANSIT Handle；
 - **对象状态与 Notification**（[signal](signal.md)）是事件面：对象以非消费式电平表达可读、关闭等条件，Notification 提供显式消费的 OR 位集合；
-- **Tunnel**（[tunnel](tunnel.md)）是数据面：两个与本地 VM lease 绑定的 Endpoint 映射同一共享区间，页内协议遵守[共享内存公共契约](shared-memory.md)。
+- **Tunnel**（[tunnel](tunnel.md)）是数据面：两个与本地地址空间 lease 绑定的 Endpoint 映射同一共享区间，页内协议遵守[共享内存公共契约](shared-memory.md)。
 
 [Runnel](runnel.md) 是 Tunnel 页上的官方单工 FIFO 字节流协议。控制请求、流数据和状态提示可以组合，但不得让一个面伪造另一个面的 authority、生命周期或流控。
 

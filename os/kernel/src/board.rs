@@ -8,7 +8,10 @@
 //! 见 references/normative/riscv-dt-bindings-linux-818bebeb/cpus.yaml）；
 //! 已弃用的 `riscv,isa` 不解析。每个 hart 独立读取 status 与能力。
 
-use dtb::{cells_u64, topology::{self, TopoLevel}, Fdt};
+use dtb::{
+    Fdt, cells_u64,
+    topology::{self, TopoLevel},
+};
 pub use sched_domain::HartCapabilities;
 
 use crate::hart::HART_NUM_LIMIT;
@@ -41,7 +44,7 @@ pub struct MemoryRegion {
 }
 
 /// memory 节点数上限（DTB 多段内存场景余量）。
-const MAX_MEMORY_REGIONS: usize = 8;
+pub const MAX_MEMORY_REGIONS: usize = 8;
 
 pub struct BoardInfo {
     cpus: [Cpu; HART_NUM_LIMIT],
@@ -70,7 +73,10 @@ impl BoardInfo {
         let Some((address, capacity)) = self.boot_package else {
             panic!("BootPackage window unavailable");
         };
-        assert!(actual > 0 && actual <= capacity, "BootPackage length exceeds DT window");
+        assert!(
+            actual > 0 && actual <= capacity,
+            "BootPackage length exceeds DT window"
+        );
         self.boot_package = Some((address, actual));
     }
 
@@ -101,7 +107,9 @@ impl BoardInfo {
                         .iter()
                         .find(|(ph, _)| *ph == leaf.cpu)
                         .map(|(_, hid)| *hid as usize)
-                        .unwrap_or_else(|| panic!("cpu-map references unknown phandle {:#x}", leaf.cpu));
+                        .unwrap_or_else(|| {
+                            panic!("cpu-map references unknown phandle {:#x}", leaf.cpu)
+                        });
                     (hartid, leaf.path)
                 })
                 .collect(),
@@ -129,10 +137,13 @@ fn parse_cpu(node: &dtb::Node) -> Option<Cpu> {
     let hartid = cells_u64(reg, 1)? as usize;
 
     // 现代 ISA 属性是准入前提，缺失或基线不足属平台契约违约。
-    let base = node
-        .prop_str("riscv,isa-base")
-        .unwrap_or_else(|| panic!("cpu {hartid} missing riscv,isa-base (legacy riscv,isa unsupported)"));
-    assert!(base == "rv64i", "cpu {hartid} isa-base {base:?} is not rv64i");
+    let base = node.prop_str("riscv,isa-base").unwrap_or_else(|| {
+        panic!("cpu {hartid} missing riscv,isa-base (legacy riscv,isa unsupported)")
+    });
+    assert!(
+        base == "rv64i",
+        "cpu {hartid} isa-base {base:?} is not rv64i"
+    );
     assert!(
         node.prop_str_list("riscv,isa-extensions").is_some(),
         "cpu {hartid} missing riscv,isa-extensions"
@@ -160,7 +171,12 @@ fn parse_cpu(node: &dtb::Node) -> Option<Cpu> {
         Some("riscv,sv57") => MmuType::Sv57,
         _ => MmuType::Bare,
     };
-    Some(Cpu { hartid, freq: 0, mmu, caps })
+    Some(Cpu {
+        hartid,
+        freq: 0,
+        mmu,
+        caps,
+    })
 }
 
 /// 解析设备树。启动路径，遇到结构性缺失直接 panic（致命且不可恢复）。
@@ -187,10 +203,11 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
                 "unsupported boot-package compatible"
             );
             let reg = node.prop("reg").expect("boot-package node missing reg");
-            let addr = cells_u64(reg, ac)
-                .expect("unexpected boot-package reg address-cell width") as usize;
+            let addr = cells_u64(reg, ac).expect("unexpected boot-package reg address-cell width")
+                as usize;
             let len = cells_u64(&reg[ac * 4..], sc)
-                .expect("unexpected boot-package reg size-cell width") as usize;
+                .expect("unexpected boot-package reg size-cell width")
+                as usize;
             boot_package = Some((addr, len));
         }
     }
@@ -216,7 +233,10 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
             let Some(mut cpu) = parse_cpu(&cpu_node) else {
                 continue;
             };
-            cpu.freq = cpu_node.prop_u32("clock-frequency").map(|f| f as usize).unwrap_or(timebase);
+            cpu.freq = cpu_node
+                .prop_u32("clock-frequency")
+                .map(|f| f as usize)
+                .unwrap_or(timebase);
             assert!(cpu_len < HART_NUM_LIMIT, "cpu count exceeds HART_NUM_LIMIT");
             cpus[cpu_len] = cpu;
             cpu_len += 1;
@@ -234,10 +254,15 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
             continue;
         }
         let reg = node.prop("reg").expect("memory node missing reg");
-        assert!(memory_len < MAX_MEMORY_REGIONS, "memory node count exceeds limit");
+        assert!(
+            memory_len < MAX_MEMORY_REGIONS,
+            "memory node count exceeds limit"
+        );
         memories[memory_len] = MemoryRegion {
-            start: cells_u64(reg, root_ac).expect("unexpected memory reg address-cell width") as usize,
-            len: cells_u64(&reg[root_ac * 4..], root_sc).expect("unexpected memory reg size-cell width") as usize,
+            start: cells_u64(reg, root_ac).expect("unexpected memory reg address-cell width")
+                as usize,
+            len: cells_u64(&reg[root_ac * 4..], root_sc)
+                .expect("unexpected memory reg size-cell width") as usize,
         };
         memory_len += 1;
     }
@@ -248,8 +273,7 @@ pub fn parse(fdt: &Fdt) -> BoardInfo {
             .expect("boot-package physical window overflows");
         assert!(
             memories[..memory_len].iter().any(|memory| {
-                address >= memory.start
-                    && end <= memory.start.checked_add(memory.len).unwrap_or(0)
+                address >= memory.start && end <= memory.start.checked_add(memory.len).unwrap_or(0)
             }),
             "boot-package physical window lies outside DT memory"
         );

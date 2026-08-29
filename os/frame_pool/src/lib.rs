@@ -1,75 +1,141 @@
-//! 物理帧池：in-band 有序空闲链（见 notes/impls/mm.md「帧池」）。
+//! 物理帧库存：启动期外置元数据上的分级 order 树（见 notes/ideas/mm.md）。
 //!
-//! 空闲区间按地址排序成单链，节点内嵌于区间首帧——空闲内存自身承载
-//! 元数据，零堆依赖。本 crate 是纯逻辑，所有帧访问经 [`PoolMemory`]
-//! 抽象，host 与内核 target 复用同一份代码。
+//! 每个 DT memory region 被分解为全局对齐的 power-of-two arena。arena 用一棵
+//! 完全二叉树记录各子树可提供的最大 order；分配沿树下降，归还沿祖先合并，
+//! 操作步数只由地址位宽与 arena 数上限决定，不随运行期碎片数增长。
 //!
-//! 节点内容是帧号而非地址，与地址转换解耦：内核从 bare 切到高半区
-//! 直映射时，仅 `PoolMemory` 实现跟随转换函数，链结构零迁移。
+//! 元数据由调用方从启动 reservation 提供，不落在被管理帧内。库存只维护哪些帧
+//! 可用或已经 claim，不读取、写入或初始化被管理帧的内容。
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 use page_table::FrameNumber;
 
-/// 链尾哨兵（帧号不可能达到 `usize::MAX`）。
-const NONE: usize = usize::MAX;
-
-/// 空闲区间节点，内嵌于区间首帧的前两个 usize。
+/// 单个 FramePool 最多容纳的对齐 arena 数。
 ///
-/// 这是写进物理内存的数据布局：`next` 用 [`NONE`] 表链尾，不依赖
-/// Rust 对 `Option` 的内部表示。区间为 `[首帧, 首帧 + len)`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RegionNode {
-    /// 区间帧数（含首帧自身）。
-    pub len: usize,
-    /// 下一个空闲区间的首帧号，[`NONE`] 为链尾。
-    pub next: usize,
+/// 一个任意半开区间的 canonical power-of-two 分解不超过地址位宽的两倍；
+/// 1024 覆盖内核最多 8 个 DT memory region 的结构上界。
+pub const MAX_ARENAS: usize = 1024;
+
+/// 树节点没有可分配块。其余值直接编码该子树可提供的最大 order。
+const UNAVAILABLE: u8 = u8::MAX;
+
+/// 每个托管帧需要两个树节点字节（完全二叉树的精确上界）。
+pub const fn metadata_bytes(frame_count: usize) -> Option<usize> {
+    frame_count.checked_mul(2)
 }
 
-impl RegionNode {
-    fn next_frame(&self) -> Option<FrameNumber> {
-        if self.next == NONE {
-            None
-        } else {
-            Some(FrameNumber(self.next))
+/// 帧 extent 的纯几何；不表达或复制帧所有权。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtentGeometry {
+    base: FrameNumber,
+    count: usize,
+}
+
+impl ExtentGeometry {
+    pub fn new(base: FrameNumber, count: usize) -> Option<Self> {
+        (count > 0 && base.0.checked_add(count).is_some()).then_some(Self { base, count })
+    }
+
+    pub const fn base(self) -> FrameNumber {
+        self.base
+    }
+
+    pub const fn count(self) -> usize {
+        self.count
+    }
+
+    pub fn end(self) -> FrameNumber {
+        FrameNumber(self.base.0 + self.count)
+    }
+
+    pub fn split_at(self, offset: usize) -> Option<(Self, Self)> {
+        if offset == 0 || offset >= self.count {
+            return None;
         }
+        Some((
+            Self {
+                base: self.base,
+                count: offset,
+            },
+            Self {
+                base: FrameNumber(self.base.0 + offset),
+                count: self.count - offset,
+            },
+        ))
     }
 }
 
-/// 帧内存访问抽象：读写区间首帧的元数据槽、清零帧块。
-///
-/// 实现方保证：元数据槽（首帧前两个 usize）可读写；`clear_frames`
-/// 把整块帧写零（覆盖其中一切旧元数据）。host 实现为模拟内存，
-/// 内核实现为 `phys_to_virt` 后的裸访问。
-pub trait PoolMemory {
-    fn read_meta(&mut self, frame: FrameNumber) -> RegionNode;
-    fn write_meta(&mut self, frame: FrameNumber, node: RegionNode);
-    fn clear_frames(&mut self, base: FrameNumber, count: usize);
+/// 注册托管物理区间失败。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddRegionError {
+    InvalidRange,
+    Overlap,
+    ArenaLimit,
+    MetadataExhausted,
 }
 
 /// `alloc_at` 失败原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocAtError {
-    /// 请求区间未整体落在任何空闲区间内（未注册或已分配）。
+    /// 请求区间未完整落在托管范围，或其中至少一帧不可用。
     Unavailable,
 }
 
-/// in-band 有序空闲链帧池。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ArenaMetadata {
+    base: usize,
+    metadata_start: usize,
+    order: u8,
+}
+
+impl ArenaMetadata {
+    pub const EMPTY: Self = Self {
+        base: 0,
+        order: 0,
+        metadata_start: 0,
+    };
+
+    fn frames(self) -> usize {
+        1usize << self.order
+    }
+
+    fn end(self) -> usize {
+        self.base + self.frames()
+    }
+
+    fn metadata_len(self) -> usize {
+        self.frames() * 2
+    }
+}
+
+/// 外置元数据的分级物理帧库存。
 ///
-/// `head` 与 [`RegionNode::next`] 构成地址严格递增的链；`free_frames`
-/// 记账总空闲帧数。锁与全局容器由内核侧组合（`OnceLock<Spinlock<_>>`）。
-pub struct FramePool<M: PoolMemory> {
-    mem: M,
-    head: Option<FrameNumber>,
+/// `metadata` 与 `arenas` 必须在库存存活期间保持独占，并且不能来自随后加入
+/// 本库存的空闲帧。内核侧从 DT memory 中先保留两者，再构造本对象。
+pub struct FramePool<'a> {
+    metadata: &'a mut [u8],
+    metadata_used: usize,
+    arenas: &'a mut [ArenaMetadata],
+    arena_count: usize,
     free_frames: usize,
 }
 
-impl<M: PoolMemory> FramePool<M> {
-    pub fn new(mem: M) -> Self {
+impl<'a> FramePool<'a> {
+    pub fn new(metadata: &'a mut [u8], arenas: &'a mut [ArenaMetadata]) -> Self {
+        assert!(
+            !arenas.is_empty() && arenas.len() <= MAX_ARENAS,
+            "invalid arena metadata capacity"
+        );
+        metadata.fill(UNAVAILABLE);
+        arenas.fill(ArenaMetadata::EMPTY);
         Self {
-            mem,
-            head: None,
+            metadata,
+            metadata_used: 0,
+            arenas,
+            arena_count: 0,
             free_frames: 0,
         }
     }
@@ -79,344 +145,388 @@ impl<M: PoolMemory> FramePool<M> {
         self.free_frames
     }
 
-    /// 消耗 pool 取回内存后端。
-    ///
-    /// 链结构全部落在物理帧内，后端无状态——地址转换函数变更
-    /// （如内核 bare → 高半区切换）时用 `into_mem` + [`FramePool::new`]
-    /// 重建即可，链零迁移。
-    pub fn into_mem(self) -> M {
-        self.mem
+    /// 当前 canonical arena 数（诊断与结构上界测试用）。
+    pub fn arena_count(&self) -> usize {
+        self.arena_count
     }
 
-    /// 空闲区间数（诊断用；遍历整链）。
-    pub fn region_count(&mut self) -> usize {
-        let mut n = 0;
-        let mut cur = self.head;
-        while let Some(f) = cur {
-            n += 1;
-            cur = self.mem.read_meta(f).next_frame();
-        }
-        n
-    }
-
-    /// 注册一段空闲区间 `[start, end)`（帧号，半开）。
+    /// 注册一段托管区间，初始全部为 unavailable。
     ///
-    /// 启动期按 DTB 剔除后逐段调用；调用方保证区间互斥且不与已注册
-    /// 区间重叠，重叠属板级配置错误，不在此校验。
-    pub fn add_region(&mut self, start: FrameNumber, end: FrameNumber) {
-        debug_assert!(start.0 < end.0, "empty region");
-        self.insert_free(start, end.0 - start.0);
-        self.free_frames += end.0 - start.0;
-    }
-
-    /// 分配 `count` 个物理连续帧，返回首帧；无足够连续区间时返回
-    /// `None`。返回前整块清零。
-    ///
-    /// first-fit + 尾端切：取链上首个足够区间，从其尾部切出——
-    /// 低地址区间先消耗，大区间主体保持完整。
-    ///
-    /// 当前消费者（堆 arena、页表帧）均无对齐需求，接口不设对齐参数；
-    /// 如需对齐分配再在接口上扩展，勿在调用侧硬凑。
-    pub fn alloc_contiguous(&mut self, count: usize) -> Option<FrameNumber> {
-        debug_assert!(count > 0, "zero-frame allocation");
-        let mut prev: Option<FrameNumber> = None;
-        let mut cur = self.head?;
-        loop {
-            let node = self.mem.read_meta(cur);
-            if node.len >= count {
-                let base = FrameNumber(cur.0 + node.len - count);
-                self.carve(prev, cur, base, count);
-                self.mem.clear_frames(base, count);
-                self.free_frames -= count;
-                return Some(base);
-            }
-            match node.next_frame() {
-                Some(next) => {
-                    prev = Some(cur);
-                    cur = next;
-                }
-                None => return None,
-            }
-        }
-    }
-
-    /// 取指定区间 `[base, base + count)`；区间不可用（未注册或部分
-    /// 已分配）返回 [`AllocAtError::Unavailable`]。返回前整块清零。
-    ///
-    /// 供启动协议三件套与页表解映射回投等已知地址的分配。
-    pub fn alloc_at(&mut self, base: FrameNumber, count: usize) -> Result<(), AllocAtError> {
-        debug_assert!(count > 0, "zero-frame allocation");
-        let end = base.0 + count;
-        let mut prev: Option<FrameNumber> = None;
-        let mut cur = self.head.ok_or(AllocAtError::Unavailable)?;
-        loop {
-            let node = self.mem.read_meta(cur);
-            // 地址序保证：cur 起点已达或越过请求区间尾部 → 不可用
-            if cur.0 >= end {
-                return Err(AllocAtError::Unavailable);
-            }
-            if cur.0 <= base.0 && end <= cur.0 + node.len {
-                self.carve(prev, cur, base, count);
-                self.mem.clear_frames(base, count);
-                self.free_frames -= count;
-                return Ok(());
-            }
-            match node.next_frame() {
-                Some(next) => {
-                    prev = Some(cur);
-                    cur = next;
-                }
-                None => return Err(AllocAtError::Unavailable),
-            }
-        }
-    }
-
-    /// 归还 `[base, base + count)`，按地址序插入并与相邻空闲区间合并。
-    ///
-    /// debug 断言拒绝与现有空闲区间重叠——归还区域必须是已分配
-    /// 状态，重叠意味着双重释放或记账错误。
-    pub fn dealloc(&mut self, base: FrameNumber, count: usize) {
-        debug_assert!(count > 0, "zero-frame deallocation");
-        self.insert_free(base, count);
-        self.free_frames += count;
-    }
-
-    /// 有界归还：每调用至多消耗 `budget` 步链扫描定位插入位，找到后执行
-    /// O(1) 插入并返回 `(消耗步数, true)`；预算耗尽则持久化游标并返回
-    /// `(budget, false)`，下次续扫。游标恢复前 O(1) 校验邻接
-    /// （prev.next == cur / head == cur）；他方归还使其失效时从链头重启，
-    /// 本次仍受 budget 约束。完成插入计 1 步（保证每调用进展 ≥1）。
-    pub fn dealloc_bounded(
+    /// 用于先覆盖完整 DT memory，再按启动 reservation 的补集调用
+    /// [`Self::release_range`] 发布空闲帧。区间必须页对齐后换算为帧号，且与既有
+    /// 托管区间不重叠。
+    pub fn add_managed_region(
         &mut self,
-        base: FrameNumber,
-        count: usize,
-        scan: &mut FreeScan,
-        budget: usize,
-    ) -> (usize, bool) {
-        debug_assert!(count > 0 && budget > 0, "zero-budget bounded dealloc");
-        let (mut prev, mut cur) = if scan.started {
-            let valid = match (scan.prev, scan.cur) {
-                (Some(p), Some(c)) => self.mem.read_meta(p).next_frame() == Some(c),
-                (Some(p), None) => self.mem.read_meta(p).next_frame().is_none(),
-                (None, Some(c)) => self.head == Some(c),
-                (None, None) => self.head.is_none(),
+        start: FrameNumber,
+        end: FrameNumber,
+    ) -> Result<(), AddRegionError> {
+        if start.0 >= end.0 {
+            return Err(AddRegionError::InvalidRange);
+        }
+        if self.arenas[..self.arena_count]
+            .iter()
+            .any(|arena| start.0 < arena.end() && arena.base < end.0)
+        {
+            return Err(AddRegionError::Overlap);
+        }
+
+        let frames = end.0 - start.0;
+        let arena_need = block_count(start.0, end.0);
+        if self.arena_count + arena_need > self.arenas.len() {
+            return Err(AddRegionError::ArenaLimit);
+        }
+        let metadata_need = metadata_bytes(frames).ok_or(AddRegionError::MetadataExhausted)?;
+        if self.metadata_used + metadata_need > self.metadata.len() {
+            return Err(AddRegionError::MetadataExhausted);
+        }
+
+        for_each_block(start.0, end.0, |base, order| {
+            let arena = ArenaMetadata {
+                base,
+                order: order as u8,
+                metadata_start: self.metadata_used,
             };
-            if valid { (scan.prev, scan.cur) } else { (None, self.head) }
-        } else {
-            (None, self.head)
-        };
-        scan.started = true;
-        let end = base.0 + count;
-        let mut steps = 0;
-        while let Some(c) = cur {
-            if steps >= budget {
-                scan.prev = prev;
-                scan.cur = cur;
-                return (steps, false);
-            }
-            let node = self.mem.read_meta(c);
-            debug_assert!(
-                c.0 >= end || base.0 >= c.0 + node.len,
-                "region [{:#x}, {:#x}) overlaps free region [{:#x}, {:#x}): double free or accounting bug",
-                base.0,
-                end,
-                c.0,
-                c.0 + node.len,
-            );
-            if c.0 > base.0 {
-                break;
-            }
-            prev = Some(c);
-            cur = node.next_frame();
-            steps += 1;
-        }
-        // 预算恰好用在最后一跳：完成插入步无预算，持久化游标（已位于
-        // 插入前位置）重入——否则完成返回 steps+1 超预算（work_done 违约
-        // 超 max，用户侧校验拒绝）。
-        if steps >= budget {
-            scan.prev = prev;
-            scan.cur = cur;
-            return (steps, false);
-        }
-        self.insert_at(base, count, prev, cur);
-        self.free_frames += count;
-        (steps + 1, true)
+            let metadata_end = self.metadata_used + arena.metadata_len();
+            self.metadata[self.metadata_used..metadata_end].fill(UNAVAILABLE);
+            self.metadata_used = metadata_end;
+            self.arenas[self.arena_count] = arena;
+            self.arena_count += 1;
+        });
+        Ok(())
     }
 
-    /// 从区间 `cur`（前驱 `prev`）中切出 `[base, base + count)`，
-    /// 左右残段各自成节点。
+    /// 注册一段立即可用的托管区间。主要供 host 测试与无 reservation 的平台使用。
+    pub fn add_region(
+        &mut self,
+        start: FrameNumber,
+        end: FrameNumber,
+    ) -> Result<(), AddRegionError> {
+        self.add_managed_region(start, end)?;
+        self.release_range(start, end)
+            .expect("newly managed frame range must be releasable");
+        Ok(())
+    }
+
+    /// 分配 `2^order` 个物理连续且同阶对齐的帧。
+    pub fn alloc_order(&mut self, order: usize) -> Option<FrameNumber> {
+        let count = order_size(order)?;
+        let arena_index = (0..self.arena_count).find(|&index| {
+            let arena = self.arenas[index];
+            arena.order as usize >= order && state_available(self.state(arena, 1), order)
+        })?;
+        let arena = self.arenas[arena_index];
+        let base = self.take_any(arena, order);
+        self.free_frames -= count;
+        Some(FrameNumber(base))
+    }
+
+    /// 在不超过 `max_count` 的约束下分配当前可用的最大 power-of-two extent。
     ///
-    /// `s = cur.0`，`e = s + node.len`，四种情形：
-    /// - 中切（左残 + 右残）：cur 缩为左残，右残新建节点接在其后；
-    /// - 仅左残：cur 原地缩短，链不变；
-    /// - 仅右残：右残顶替 cur 的链位；
-    /// - 整取：前驱跨过 cur。
-    fn carve(
+    /// 只扫描固定上限 arena 一次，再沿选中树下降；不会按 order 重扫库存。
+    pub fn alloc_largest(&mut self, max_count: usize) -> Option<(FrameNumber, usize)> {
+        if max_count == 0 {
+            return None;
+        }
+        let requested_order = floor_order(max_count);
+        let mut choice: Option<(usize, usize)> = None;
+        for index in 0..self.arena_count {
+            let arena = self.arenas[index];
+            let state = self.state(arena, 1);
+            if state == UNAVAILABLE {
+                continue;
+            }
+            let order = (state as usize).min(requested_order);
+            if choice.is_none_or(|(_, best)| order > best) {
+                choice = Some((index, order));
+            }
+        }
+        let (arena_index, order) = choice?;
+        let arena = self.arenas[arena_index];
+        let base = self.take_any(arena, order);
+        let count = 1usize << order;
+        self.free_frames -= count;
+        Some((FrameNumber(base), count))
+    }
+
+    /// 精确取指定区间。请求可跨 arena，但必须完整托管且当前全部空闲。
+    /// 预验证先于修改，失败不改变库存。
+    pub fn alloc_at(&mut self, base: FrameNumber, count: usize) -> Result<(), AllocAtError> {
+        if count == 0 {
+            return Err(AllocAtError::Unavailable);
+        }
+        let end = base.0.checked_add(count).ok_or(AllocAtError::Unavailable)?;
+        if !self.range_is_free(base.0, end) {
+            return Err(AllocAtError::Unavailable);
+        }
+        self.take_range(base.0, end);
+        self.free_frames -= count;
+        Ok(())
+    }
+
+    /// 归还一段已分配或启动期保留的物理区间。
+    ///
+    /// 任意长度区间先做 canonical power-of-two 分解，每块归还沿树至多更新
+    /// `usize::BITS` 层。debug 构建拒绝与现有空闲块重叠。
+    pub fn dealloc(&mut self, base: FrameNumber, count: usize) {
+        assert!(count > 0, "zero-frame deallocation");
+        let end = base.0.checked_add(count).expect("frame range overflow");
+        assert!(self.range_is_managed(base.0, end), "unmanaged frame range");
+        assert!(
+            self.range_is_unavailable(base.0, end),
+            "frame range overlaps free inventory: double free or accounting bug"
+        );
+        self.release_blocks(base.0, end);
+        self.free_frames += count;
+    }
+
+    /// 发布一段启动期 reservation。语义与 dealloc 相同，但名称显式区分来源。
+    pub fn release_range(
         &mut self,
-        prev: Option<FrameNumber>,
-        cur: FrameNumber,
-        base: FrameNumber,
-        count: usize,
-    ) {
-        let node = self.mem.read_meta(cur);
-        let (s, e) = (cur.0, cur.0 + node.len);
-        let has_left = base.0 > s;
-        let has_right = base.0 + count < e;
+        start: FrameNumber,
+        end: FrameNumber,
+    ) -> Result<(), AllocAtError> {
+        if start.0 >= end.0 || !self.range_is_managed(start.0, end.0) {
+            return Err(AllocAtError::Unavailable);
+        }
+        if !self.range_is_unavailable(start.0, end.0) {
+            return Err(AllocAtError::Unavailable);
+        }
+        self.release_blocks(start.0, end.0);
+        self.free_frames += end.0 - start.0;
+        Ok(())
+    }
 
-        match (has_left, has_right) {
-            (true, true) => {
-                let right = base.0 + count;
-                self.mem.write_meta(
-                    cur,
-                    RegionNode {
-                        len: base.0 - s,
-                        next: right,
-                    },
-                );
-                self.mem.write_meta(
-                    FrameNumber(right),
-                    RegionNode {
-                        len: e - right,
-                        next: node.next,
-                    },
-                );
-            }
-            (true, false) => {
-                self.mem.write_meta(
-                    cur,
-                    RegionNode {
-                        len: base.0 - s,
-                        next: node.next,
-                    },
-                );
-            }
-            (false, true) => {
-                let right = base.0 + count;
-                self.link(prev, Some(FrameNumber(right)));
-                self.mem.write_meta(
-                    FrameNumber(right),
-                    RegionNode {
-                        len: e - right,
-                        next: node.next,
-                    },
-                );
-            }
-            (false, false) => {
-                self.link(prev, node.next_frame());
-            }
+    fn state(&self, arena: ArenaMetadata, node: usize) -> u8 {
+        self.metadata[arena.metadata_start + node]
+    }
+
+    fn set_state(&mut self, arena: ArenaMetadata, node: usize, state: u8) {
+        self.metadata[arena.metadata_start + node] = state;
+    }
+
+    fn order_at(arena: ArenaMetadata, node: usize) -> usize {
+        arena.order as usize - floor_order(node)
+    }
+
+    fn update_ancestors(&mut self, arena: ArenaMetadata, mut node: usize) {
+        while node > 1 {
+            node /= 2;
+            let child_order = Self::order_at(arena, node) - 1;
+            let left = self.state(arena, node * 2);
+            let right = self.state(arena, node * 2 + 1);
+            let state = if left as usize == child_order && right as usize == child_order {
+                (child_order + 1) as u8
+            } else {
+                max_available(left, right)
+            };
+            self.set_state(arena, node, state);
         }
     }
 
-    /// 把 `frame` 接到 `prev` 之后（`prev` 为 `None` 时设为链头）。
-    fn link(&mut self, prev: Option<FrameNumber>, frame: Option<FrameNumber>) {
-        match (prev, frame) {
-            (Some(p), Some(f)) => {
-                let mut pn = self.mem.read_meta(p);
-                pn.next = f.0;
-                self.mem.write_meta(p, pn);
+    fn split_whole(&mut self, arena: ArenaMetadata, node: usize, order: usize) {
+        debug_assert!(order > 0 && self.state(arena, node) as usize == order);
+        self.set_state(arena, node * 2, (order - 1) as u8);
+        self.set_state(arena, node * 2 + 1, (order - 1) as u8);
+    }
+
+    fn take_any(&mut self, arena: ArenaMetadata, target_order: usize) -> usize {
+        let mut node = 1usize;
+        let mut order = arena.order as usize;
+        let mut base = arena.base;
+        while order > target_order {
+            if self.state(arena, node) as usize == order {
+                self.split_whole(arena, node, order);
             }
-            (Some(p), None) => {
-                let mut pn = self.mem.read_meta(p);
-                pn.next = NONE;
-                self.mem.write_meta(p, pn);
+            let child_order = order - 1;
+            let left = node * 2;
+            if state_available(self.state(arena, left), target_order) {
+                node = left;
+            } else {
+                node = left + 1;
+                base += 1usize << child_order;
             }
-            (None, Some(f)) => self.head = Some(f),
-            (None, None) => self.head = None,
+            order = child_order;
+        }
+        debug_assert_eq!(self.state(arena, node) as usize, target_order);
+        self.set_state(arena, node, UNAVAILABLE);
+        self.update_ancestors(arena, node);
+        base
+    }
+
+    fn take_at_block(&mut self, arena: ArenaMetadata, base: usize, target_order: usize) {
+        let mut node = 1usize;
+        let mut order = arena.order as usize;
+        while order > target_order {
+            if self.state(arena, node) as usize == order {
+                self.split_whole(arena, node, order);
+            }
+            order -= 1;
+            let right = ((base - arena.base) & (1usize << order)) != 0;
+            node = node * 2 + usize::from(right);
+        }
+        debug_assert_eq!(self.state(arena, node) as usize, target_order);
+        self.set_state(arena, node, UNAVAILABLE);
+        self.update_ancestors(arena, node);
+    }
+
+    fn block_is_free(&self, arena: ArenaMetadata, base: usize, target_order: usize) -> bool {
+        let mut node = 1usize;
+        let mut order = arena.order as usize;
+        loop {
+            let state = self.state(arena, node);
+            if state as usize == order {
+                return true;
+            }
+            if state == UNAVAILABLE || order == target_order {
+                return false;
+            }
+            order -= 1;
+            let right = ((base - arena.base) & (1usize << order)) != 0;
+            node = node * 2 + usize::from(right);
         }
     }
 
-    /// 把 `[base, base + count)` 以空闲区间插入链（地址序），并与
-    /// 前后相邻区间合并。
-    fn insert_free(&mut self, base: FrameNumber, count: usize) {
-        let end = base.0 + count;
-        let mut prev: Option<FrameNumber> = None;
-        let mut cur = self.head;
-
-        // 找插入位：链上首个 start > base 的区间（cur）及其前驱（prev）
-        while let Some(c) = cur {
-            let node = self.mem.read_meta(c);
-            debug_assert!(
-                c.0 >= end || base.0 >= c.0 + node.len,
-                "region [{:#x}, {:#x}) overlaps free region [{:#x}, {:#x}): double free or accounting bug",
-                base.0,
-                end,
-                c.0,
-                c.0 + node.len,
-            );
-            if c.0 > base.0 {
-                break;
+    fn block_has_free(&self, arena: ArenaMetadata, base: usize, target_order: usize) -> bool {
+        let mut node = 1usize;
+        let mut order = arena.order as usize;
+        loop {
+            let state = self.state(arena, node);
+            if state as usize == order {
+                return true;
             }
-            prev = Some(c);
-            cur = node.next_frame();
+            if state == UNAVAILABLE {
+                return false;
+            }
+            if order == target_order {
+                return true;
+            }
+            order -= 1;
+            let right = ((base - arena.base) & (1usize << order)) != 0;
+            node = node * 2 + usize::from(right);
         }
-        self.insert_at(base, count, prev, cur);
     }
 
-    /// 在已定位的插入位（prev 前驱 / cur 后继）执行 O(1) 插入与合并。
-    fn insert_at(
-        &mut self,
-        base: FrameNumber,
-        count: usize,
-        prev: Option<FrameNumber>,
-        cur: Option<FrameNumber>,
-    ) {
-        let end = base.0 + count;
-        // 前合并条件：prev 区间尾部紧贴 base 起点
-        let merge_prev = match prev {
-            Some(p) => {
-                let pn = self.mem.read_meta(p);
-                p.0 + pn.len == base.0
-            }
-            None => false,
-        };
-        // 后合并条件：cur 区间起点紧贴 base 尾部
-        let cur_node = cur.map(|c| self.mem.read_meta(c));
-        let merge_next = matches!(cur, Some(c) if c.0 == end);
+    fn release_block(&mut self, arena: ArenaMetadata, base: usize, order: usize) {
+        debug_assert!(!self.block_has_free(arena, base, order));
+        let depth = arena.order as usize - order;
+        let node = (1usize << depth) + ((base - arena.base) >> order);
+        self.set_state(arena, node, order as u8);
+        self.update_ancestors(arena, node);
+    }
 
-        match (merge_prev, merge_next) {
-            (true, true) => {
-                // 三向：prev 吞并 base 与 cur
-                let p = prev.unwrap();
-                let mut pn = self.mem.read_meta(p);
-                pn.len += count + cur_node.unwrap().len;
-                pn.next = cur_node.unwrap().next;
-                self.mem.write_meta(p, pn);
+    fn find_arena(&self, frame: usize) -> Option<ArenaMetadata> {
+        self.arenas[..self.arena_count]
+            .iter()
+            .copied()
+            .find(|arena| frame >= arena.base && frame < arena.end())
+    }
+
+    fn range_is_managed(&self, mut start: usize, end: usize) -> bool {
+        while start < end {
+            let Some(arena) = self.find_arena(start) else {
+                return false;
+            };
+            start = end.min(arena.end());
+        }
+        true
+    }
+
+    fn range_is_free(&self, mut start: usize, end: usize) -> bool {
+        while start < end {
+            let Some(arena) = self.find_arena(start) else {
+                return false;
+            };
+            let segment_end = end.min(arena.end());
+            let mut available = true;
+            for_each_block(start, segment_end, |base, order| {
+                available &= self.block_is_free(arena, base, order);
+            });
+            if !available {
+                return false;
             }
-            (true, false) => {
-                let p = prev.unwrap();
-                let mut pn = self.mem.read_meta(p);
-                pn.len += count;
-                self.mem.write_meta(p, pn);
+            start = segment_end;
+        }
+        true
+    }
+
+    fn range_is_unavailable(&self, mut start: usize, end: usize) -> bool {
+        while start < end {
+            let Some(arena) = self.find_arena(start) else {
+                return false;
+            };
+            let segment_end = end.min(arena.end());
+            let mut unavailable = true;
+            for_each_block(start, segment_end, |base, order| {
+                unavailable &= !self.block_has_free(arena, base, order);
+            });
+            if !unavailable {
+                return false;
             }
-            (false, true) => {
-                // base 吞并 cur，顶替其链位
-                let node = RegionNode {
-                    len: count + cur_node.unwrap().len,
-                    next: cur_node.unwrap().next,
-                };
-                self.link(prev, Some(base));
-                self.mem.write_meta(base, node);
-            }
-            (false, false) => {
-                let node = RegionNode {
-                    len: count,
-                    next: match cur {
-                        Some(c) => c.0,
-                        None => NONE,
-                    },
-                };
-                self.link(prev, Some(base));
-                self.mem.write_meta(base, node);
-            }
+            start = segment_end;
+        }
+        true
+    }
+
+    fn take_range(&mut self, mut start: usize, end: usize) {
+        while start < end {
+            let arena = self.find_arena(start).expect("validated managed range");
+            let segment_end = end.min(arena.end());
+            for_each_block(start, segment_end, |base, order| {
+                self.take_at_block(arena, base, order);
+            });
+            start = segment_end;
+        }
+    }
+
+    fn release_blocks(&mut self, mut start: usize, end: usize) {
+        while start < end {
+            let arena = self.find_arena(start).expect("validated managed range");
+            let segment_end = end.min(arena.end());
+            for_each_block(start, segment_end, |base, order| {
+                self.release_block(arena, base, order);
+            });
+            start = segment_end;
         }
     }
 }
 
-/// 有界归还（`dealloc_bounded`）的扫描游标：记录插入位定位的
-/// (prev, cur)；`started == false` 表示尚未起步（首调用从链头开始）。
-#[derive(Clone, Copy, Default)]
-pub struct FreeScan {
-    prev: Option<FrameNumber>,
-    cur: Option<FrameNumber>,
-    started: bool,
+fn state_available(state: u8, order: usize) -> bool {
+    state != UNAVAILABLE && state as usize >= order
+}
+
+fn max_available(left: u8, right: u8) -> u8 {
+    match (left, right) {
+        (UNAVAILABLE, value) | (value, UNAVAILABLE) => value,
+        (a, b) => a.max(b),
+    }
+}
+
+fn order_size(order: usize) -> Option<usize> {
+    1usize.checked_shl(order as u32)
+}
+
+fn floor_order(value: usize) -> usize {
+    debug_assert!(value > 0);
+    (usize::BITS - 1 - value.leading_zeros()) as usize
+}
+
+fn block_count(start: usize, end: usize) -> usize {
+    let mut count = 0;
+    for_each_block(start, end, |_, _| count += 1);
+    count
+}
+
+fn for_each_block(mut start: usize, end: usize, mut emit: impl FnMut(usize, usize)) {
+    debug_assert!(start < end);
+    while start < end {
+        let align_order = if start == 0 {
+            usize::BITS as usize - 1
+        } else {
+            start.trailing_zeros() as usize
+        };
+        let length_order = floor_order(end - start);
+        let order = align_order.min(length_order);
+        emit(start, order);
+        start += 1usize << order;
+    }
 }

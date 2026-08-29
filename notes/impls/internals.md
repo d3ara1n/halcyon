@@ -93,7 +93,7 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 分层管理两种语义不同的资源：
 
-- 帧池（os/frame_pool，自研 in-band 空闲链）：管页粒度、物理连续、整批生死（进程退出整批归还）的物理帧；元数据内嵌空闲区间首帧，零堆依赖。DTB 内存段剔除启动占用后注册；FrameTracker RAII 归还。设计细节见 [`mm.md`](mm.md)「帧池」。
+- 帧池（os/frame_pool，外置元数据分级 order 树）：管理页粒度、指定 order 连续块和任意长度 reservation；DT memory 注册为初始 unavailable arena，启动占用与元数据 reservation 的补集才发布为空闲。claim、split、coalesce、指定区间和归还的库存步骤由固定 arena 数与地址位宽限定，纯库存不含帧内容后端；内核在 POOL 锁外清零后才发布不可复制的 `FrameTracker`，页表与启动 reservation 经显式 transfer/adopt 移交。设计细节见 [`mm.md`](mm.md)「帧库存」。
 - 堆（talc）：管任意尺寸小对象；内存源 FrameSource 从帧池按需取 1MiB 连续帧块建立堆区（talc 支持多块不连续区域），帧块所有权随 claim 终身归堆。设备树解析（os/dtb，就地游标）与启动路径零堆依赖，保证帧池先于堆就绪的线性引导序。
 
 理由：帧与小对象生命周期模式不同，分层使碎片域独立、锁独立；这也是 Linux（buddy+slab）的通行分层。堆→帧池单向依赖（不逆向），彻底消除帧池元数据碰堆的运行时环。

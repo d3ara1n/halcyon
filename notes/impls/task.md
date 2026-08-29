@@ -132,16 +132,17 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   扫描与 close callback 各计一个 work unit；预算恰在摘项后耗尽时，
   entry 存入 Process `pending_close`，下一批优先在表锁外关闭。因此任意
   非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 分阶段：
-  数据帧 tracker 逐个经帧池有界归还（FreeScan
-  游标可恢复、O(1) 校验重启），页表 L0/L1 表帧逐槽登记归还，root 帧
-  经 leak_root 交出后单独走 RootFree 阶段有界归还（绕过 TableTree
-  Drop 的递归扫描）。work unit 是真实执行步数（链扫描每步、槽位检查、
-  完成插入），预算是硬执行上界。完成时发布序固定：shell 先冻结终态
-  快照并置 CLOSED（原子清 REAPABLE，外部无 Dead+REAPABLE 混合视图）
-  → core 内部置 Dead → Job 成员表摘除（core 仅剩空壳）。并发批次以
-  drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存目标进程
-  （handle 游标/pending close + 地址空间阶段游标 + 在途归还游标），同
-  authority 可接管。init 持久保留全部服务 control：WaitMany(REAPABLE|CLOSED) →
+  数据帧 tracker 逐个从拥有列表摘下，存入 `pending_free`，下一 work unit 通过
+  `FrameTracker::Drop` 归还外置元数据 order 树；页表 L0/L1 表帧逐槽摘下后经
+  table adopt 收回 affine 所有权并走同一路径，root 帧经 leak_root 交出后单独走
+  RootFree 阶段（绕过 TableTree Drop 的递归扫描）。预算分别计费 tracker 出栈、页表槽检查/摘除与 extent 归还；
+  单次 order 树操作另有只依赖地址位宽与 DT memory region 上限的结构常数界，
+  因而批次执行量受 budget 线性约束，不再有随全局碎片数增长的帧池扫描。完成
+  时发布序固定：shell 先冻结终态快照并置 CLOSED（原子清 REAPABLE，外部无
+  Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
+  空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存
+  目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
+  同一 authority 可接管。init 持久保留全部服务 control：WaitMany(REAPABLE|CLOSED) →
   Drain 至 Complete → 终态快照；对象 close 回调（如隧道 PEER_CLOSED）
   发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
 - **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker，capability
