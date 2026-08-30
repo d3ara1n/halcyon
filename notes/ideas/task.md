@@ -2,13 +2,13 @@
 
 任务是对“受管理作业”的统称，内核中由 Job、进程和线程三种不同职责承载，不以一个万能 Task 结构混合资源、执行与政策。
 
-## Job：创建域与资源预算
+## Job：创建与收束域
 
-Job 是进程创建与资源预算的层级容器。root Job 由内核在初始 launch 中交给 init；持有相应 capability 的服务可以创建子 Job 并在该域内创建进程。
+Job 是进程创建、成员管理与故障收束的层级容器。root Job 由内核在初始 launch 中交给 init；持有相应 capability 的服务可以创建子 Job 并在该域内创建进程。
 
 Job 表达故障收束和管理域，不是用户身份或进程权限等级。设备、目录和服务访问仍由各自 capability 授权。
 
-资源预算以对象界定而非记账。库存资源（内存）以持有表达：对象拥有帧、映射借出视图、分配即派生切片。流量资源（CPU）以预约表达：budget/period 的预约对象是 capability，无预约或预算耗尽的线程不被调度，refill 状态即调度器真值。域的上限由域内可达的持有物与预约决定，内核不维护动态计数；上限的分配与超额政策归用户态资源服务。线程洪水由结构消化：spawn 不增 CPU 配额（共享预约），且消耗域 backing。配额过滤的边界在调度循环的 pick，eligibility 的判定在入队侧域路由，两者是线程的不同正交面（见「线程」节），接入预约不触碰域路由结构。
+资源预算不属于 Job。库存资源（内存）由显式 MemoryPool capability 持有并派生，流量资源（CPU）由 budget/period 的预约对象表达，MMIO、IRQ 与 DMA 各由自身资源 capability 授权。Job 不绑定默认资源包、不汇总成员持有物，也不在 capability 跨 Job 转移时改记费用归属；用户态资源管理服务可以按政策把 Job、MemoryPool、预约与设备资源组合交付，但该组合不形成第二份内核预算真值。线程洪水仍由结构消化：spawn 不增加 CPU 配额，成员表与每进程线程上限只界定内核工作量。
 
 Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保持可用，允许管理者按政策重新创建服务；JobSeal 是幂等的封口操作，使本 Job 及后代不再接受新 Job、Building process 或 ProcessStart。Job 层级深度最多为 32，创建和启动沿有界祖先链检查 effective seal，因而根封口无需递归遍历即可立即覆盖后代。封口只封创建、不向下传播终止；完成只看本 Job 自身的 sealed 与成员收束，递归封口与递归终止都是用户态政策（逐层 JobSeal 组合）。Sealed Job 在直接进程全部 Dead、child Jobs 全部 Dead 后进入 Dead，并以 JobControl 的 CLOSED 电平发布完成。关闭 JobControl 只消散 authority，不封口或终止成员。
 
@@ -21,7 +21,7 @@ Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保�
 - 用户地址空间与内存布局；
 - HandleTable；
 - 线程成员关系；
-- Job 归属与资源归属（预算以持有与预约表达，不记账）；
+- Job 归属，以及由显式 capability 取得或绑定的资源；
 - PID、`parent_pid` 与退出信息：以诊断为主；PID 另在 JobControl 枚举域内充当派生选择子（见「Job」节），不构成全局操作入口。
 
 进程不以“驱动级”“服务级”等 ambient 权限授权 syscall。ProcessCreate 同时产生 affine ProcessBuilder 与稳定的 ProcessControl：前者只授权构造，后者从 Building 起授权查询、终止、等待和受保护资源收束；观察者可持去除 MANAGE 的 READ/WAIT control。创建关系本身不产生管理权。
@@ -60,7 +60,7 @@ Running→Terminating 的准入截止与 AddressSpace Commit 共享 Process exec
 
 启动发布与终止离场可以有短暂过渡阶段，但不能同时属于两个稳定容器。线程离场后从成员关系中移除，不保留“Dead thread”容器。
 
-线程只进入其执行需求已经绑定的兼容调度域，调度类在域内表达选择策略；硬件能力、域划分与绑定冻结由 [`execution-context.md`](execution-context.md) 唯一拥有。线程对 CPU 的消耗从预约对象扣减：预约决定配额（能否跑），调度类决定次序（先后），两者作用于不同谓词，配额过滤在 pick 边界进行；预约、Job 归属与调度域 eligibility 是线程的正交面，预约对象桥接 capability 世界与调度器世界，不重复记账。
+线程只进入其执行需求已经绑定的兼容调度域，调度类在域内表达选择策略；硬件能力、域划分与绑定冻结由 [`execution-context.md`](execution-context.md) 唯一拥有。线程对 CPU 的消耗从预约对象扣减：预约决定配额（能否跑），调度类决定次序（先后），两者作用于不同谓词，配额过滤在 pick 边界进行；预约对象、Job 归属与调度域 eligibility 是正交面，预约对象桥接 capability 世界与调度器世界。
 
 ## 组装双通道
 

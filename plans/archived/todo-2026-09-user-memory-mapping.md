@@ -68,7 +68,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 - host 纯逻辑测试、锁持有验证与 RISC-V 双 hart 竞态验证；
 - 每个实现切片落地后才同步对应 `notes/impls/`。
 
-公共 MemoryObject 的 ObjectKind、HandleRole、创建/seal ABI、pager、COW、文件缓存与帧 capability 不在本计划公开；这些对象面由 [`todo-2026-09-ipc-data-plane-design.md`](../todo-2026-09-ipc-data-plane-design.md) 承接。本计划仍实现并验证 AddressSpace 所依赖的内部 ObjectView、WritePermit 与 `Mutable → Sealing → Executable` 状态 seam；Tunnel 的既有固定 backing 作为真实 ObjectView/lease 消费者，不能以“公共 ABI 延后”为由跳过 backing 级 W^X 所有权。
+公共 MemoryObject 的 ObjectKind、HandleRole、创建/seal ABI、pager、COW、文件缓存与帧 capability 不在本计划公开；这些对象面由 [`todo-2026-09-memory-object-data-plane.md`](../todo-2026-09-memory-object-data-plane.md) 承接。本计划仍实现并验证 AddressSpace 所依赖的内部 ObjectView、WritePermit 与 `Mutable → Sealing → Executable` 状态 seam；Tunnel 的既有固定 backing 作为真实 ObjectView/lease 消费者，不能以“公共 ABI 延后”为由跳过 backing 级 W^X 所有权。
 
 ## 迁移纪律
 

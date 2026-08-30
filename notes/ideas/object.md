@@ -44,6 +44,14 @@ MemoryObject 的 Handle 只授权建立新映射或管理 backing；映射本身
 
 MemoryObject 的可执行发布状态、WritePermit 与 mapping retire 由[内存模型](mm.md)共同拥有。`SealExecutable` 要求对象定义的管理 authority，并与新 WritePermit 在对象锁上线性化；对象进入 Sealing 后拒绝新写入口，最后一个 retiring writable view 收到全部地址翻译确认后才释放 permit 并推进 Executable。Handle 关闭或 seal 发起线程消散都不能绕过该计数、撤销已发布 seal 或让 backing 在 stale writable translation 仍可能存在时析构。
 
+## MemoryPool 与 MemoryObject interface
+
+MemoryPool 是库存预算 capability：它持有可消费的页额度，不持有进程、地址空间或活对象列表。root pool 由内核按可信物理内存事实铸造并交给 init；`Derive` 从父池原子转移固定额度形成子池，不能复制额度。普通 Handle 的 duplicate、TRANSIT 与 GRANT 只共享或移动对同一池的 authority，不增加容量。
+
+ProcessCreate 必须原子消费具 GRANT authority 的 MemoryPool Handle，先在目标进程中建立不可转移的资源绑定，再创建 AddressSpace 根。失败不消费 Handle；成功后进程的页表、匿名 backing 与内部数据面对象由该绑定支付。资源管理者若需隔离预算，必须先派生子池再创建进程；Job 不提供默认池或第二份配额。
+
+MemoryObject 的公共 interface 只包含固定长度创建、固定宽 Query、通过内存映射 interface 建立对象子范围 view，以及单向 `SealExecutable`。首版没有 resize、COW、pager、对象内分配器、原始 frame capability 或通用 revoke；更大的逻辑对象和受限子范围授权由多个对象及用户态协议组合。创建从当前进程绑定池取得 affine charge 和实际 backing，charge 随对象而不是创建进程或 Handle 位置存活。
+
 Mailbox 有唯一 receiver-owner。owner 不可复制，可持 `GRANT` 直接交付给 Building child，但不能持 `TRANSIT` 进入消息；sender 可复制、可按授权 TRANSIT/GRANT，并可携带 mailbox owner 铸造的 badge。owner 关闭或所在进程退出后 Mailbox 进入 `CLOSED`，清空队列及未接收 entry；残留 sender 只观察终态。
 
 Notification 同样有唯一 owner 和可委托 signaler。owner 只直接 grant，不进入消息；signaler 可按授权 TRANSIT/GRANT。owner 关闭使 Notification 终态。

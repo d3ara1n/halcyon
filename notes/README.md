@@ -28,7 +28,7 @@
 | IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象](impls/ipc.md) |
 | WaitMany 与 ObjectSignals | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |
 | Notification | [signal](ideas/signal.md) | [IPC 对象](impls/ipc.md) |
-| Tunnel、共享内存与 Runnel | [tunnel](ideas/tunnel.md)、[shared-memory](ideas/shared-memory.md)、[runnel](ideas/runnel.md) | [IPC 对象](impls/ipc.md) |
+| Tunnel、共享内存、Runnel 与 BufferQueue | [tunnel](ideas/tunnel.md)、[shared-memory](ideas/shared-memory.md)、[runnel](ideas/runnel.md)、[buffer-queue](ideas/buffer-queue.md) | [IPC 对象](impls/ipc.md) |
 | 通用 RPC | [rpc](ideas/rpc.md) | [rpc](impls/rpc.md) |
 | 服务进程与用户态框架 | [service](ideas/service.md)、[framework](ideas/framework.md) | [startup](impls/startup.md)、[rpc](impls/rpc.md)、[fal](impls/fal.md) |
 | 文件系统 namespace 与 FAL | [fs](ideas/fs.md)、[fal](ideas/fal.md) | [fal](impls/fal.md) |

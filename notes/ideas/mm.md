@@ -62,11 +62,21 @@ MemoryObject 是固定长度的共享 backing identity，不是地址空间、�
 
 可由普通 Handle close 触发最终析构的 MemoryObject 必须受硬容量上限约束，长度创建后不可改变。更大的逻辑对象由用户态协议组合多个 MemoryObject；未来若需要无界对象、resize、COW、文件缓存或 pager，必须先为对象建立有界 drain 与明确的缺页协议，不能改变既有 eager mapping 的成功语义。
 
+## MemoryPool 与 backing charge
+
+MemoryPool 把资源 authority 与物理库存分开：池持有固定页额度，唯一全局帧库存维护实际物理空闲 extent。分配先从池预留不可复制的 `MemoryCharge`，再从全局库存取得一个或多个初始化后的 `FrameTracker`；物理分配失败时 charge 完整回滚。backing 同时持 extents 与 charge，最终释放时 extents 回全局库存、charge 回来源池。池额度不能保证特定物理位置或连续性；连续 DMA 与设备内存由设备资源模型另行拥有。
+
+子池由父池的 affine charge 支撑。池不登记其派生出的 backing；Handle、进程绑定和未归还 charge 共同保活池 core。最后一个引用消失只可能发生在全部 charge 已归还时，此时子池总额度沿受硬深度上限约束的父链返回，不需要扫描对象或地址空间，也不形成 drain 容器。关闭或转移 Pool Handle 不撤销既有 backing。
+
+运行期可由用户请求放大的帧按唯一来源支付：AddressSpace 根与中间页表由目标进程绑定池支付；匿名 backing 由所在进程绑定池支付；Tunnel 与 MemoryObject 的数据 backing 由创建者绑定池支付，而每端映射所需页表仍由各自进程绑定池支付。bootstrap payload 的保留页以 primordial charge 计入 init 的 root pool，释放时首次进入全局库存并归还额度。内核静态页表、帧库存元数据、内核堆基础储备与启动过渡页属于系统基础设施，不从用户 Pool 伪造费用；可由用户放大的非帧元数据必须受现有结构上限约束，未来若开放不可信创建域则另行取得显式内核内存预算，不能回塞到 Job 计数。
+
+MemoryPool 约束消费上界，FramePool 决定实际可满足性。Pool 仍有额度但全局库存因系统储备或物理碎片无法满足时，分配以普通资源不足失败且额度回滚；不得借用其它 Pool 的额度或把失败解释为 authority。
+
 ## Map、Unmap 与 Protect
 
 Running 进程对自己的地址空间具有固有管理权；组装者只凭 ProcessBuilder 在 Building 期操作目标地址空间。两条 authority 通道经过校验后消费同一 MemoryChange，不各自维护布局、backing 或回滚规则。
 
-Map 以字节长度请求匿名或 MemoryObject backing，并同时声明权限、placement 与两端 guard。`Anywhere` 由账本选择完整空洞；`FixedEmpty` 只在指定范围完全空闲时成功。不存在隐式覆盖旧区域的 fixed 模式，替换必须显式 Unmap 后再 Map。成功结果包含可访问区间及含 guard 的完整 reservation 区间；AllocationKey 与 RegionKey 都是内核账本身份，不进入以地址区间为真值的用户 ABI。
+Map 以字节长度请求匿名或 MemoryObject backing，并同时声明权限、placement 与两端 guard。匿名来源由目标进程绑定池取得 backing；对象来源验证 Handle、对象内页对齐 offset、范围和 rights，不重新分配数据页。`Anywhere` 由账本选择完整空洞；`FixedEmpty` 只在指定范围完全空闲时成功。不存在隐式覆盖旧区域的 fixed 模式，替换必须显式 Unmap 后再 Map。成功结果包含可访问区间及含 guard 的完整 reservation 区间；AllocationKey 与 RegionKey 都是内核账本身份，不进入以地址区间为真值的用户 ABI。
 
 单次请求的页数、guard 数量、区域切分数、PTE 步数和元数据增长都有共享硬上限。超出上限由用户态运行时在安全 interface 后分段组合；rinlib 内部以 affine region 表达 allocator arena、线程栈等映射所有权。完整解除消费原 region；部分解除消费原 region，并按请求洞的左右两侧返回至多两个 compound fragment，每个 fragment 可以同时描述 usable mapping 与相邻 reservation-only guard。该所有权类型不是应用扩堆 interface；内核 ABI 仍以地址区间为真值。
 
