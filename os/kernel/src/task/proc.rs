@@ -3,14 +3,19 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
     proc::{Pid, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
+use memory_space::{
+    AnonymousClass, BackingId, ChangeError, Limits, MapBacking, MapPlacement, MapRequest,
+    MemorySpace, PageRange as LedgerPageRange, PreparedChange, Protection, PublishedChange,
+    RegionOwner, TranslationIntent,
+};
 use page_table::{
-    FrameMemory, FrameNumber, MapError, Ppn, ReservedTableFrame, RootSlotState, SlotState,
-    TableTree, Vpn, flags,
+    FrameMemory, FrameNumber, MapError, Ppn, PreparedTranslation, ReservedTableFrame,
+    RootSlotState, SlotState, TableTree, Vpn, flags,
 };
 
 use crate::{
@@ -99,13 +104,195 @@ impl FrameMemory for TableMem {
     }
 }
 
+const MEMORY_SPACE_LIMITS: Limits = Limits {
+    max_regions: 4096,
+    max_transactions: 4,
+    max_pages_per_change: (256 << 20) / PAGE_SIZE,
+    max_lease_bytes: 1 << 20,
+    max_lease_segments: 64,
+};
+
+struct BackingExtent {
+    offset_pages: usize,
+    tracker: FrameTracker,
+}
+
+struct OwnedBacking {
+    identity: BackingId,
+    pages: usize,
+    extents: Vec<BackingExtent>,
+}
+
+struct PreparedOwnedMapping {
+    backing: OwnedBacking,
+    change: PreparedChange,
+    translations: Vec<PreparedTranslation<TableFrameToken>>,
+}
+
+struct PreparedHeapExtension {
+    mapping: PreparedOwnedMapping,
+    base: usize,
+    new_brk: usize,
+    pages: usize,
+}
+
+struct HeapExtensionToken(Box<Option<PreparedHeapExtension>>);
+
+impl HeapExtensionToken {
+    fn allocate() -> Result<Self, SpaceError> {
+        Box::try_new(None)
+            .map(Self)
+            .map_err(|_| SpaceError::NoFrame)
+    }
+
+    fn install(&mut self, prepared: PreparedHeapExtension) {
+        let previous = self.0.replace(prepared);
+        assert!(previous.is_none(), "heap extension token filled twice");
+    }
+
+    fn get(&self) -> &PreparedHeapExtension {
+        self.0
+            .as_ref()
+            .as_ref()
+            .expect("heap extension token must be filled")
+    }
+
+    fn take(mut self) -> PreparedHeapExtension {
+        self.0.take().expect("heap extension token consumed twice")
+    }
+}
+
+impl OwnedBacking {
+    fn allocate(identity: BackingId, pages: usize) -> Result<Self, SpaceError> {
+        let mut extents = Vec::new();
+        extents
+            .try_reserve(pages)
+            .map_err(|_| SpaceError::NoFrame)?;
+        let mut allocated = 0;
+        while allocated < pages {
+            let tracker = frame::alloc_largest(pages - allocated).ok_or(SpaceError::NoFrame)?;
+            let count = tracker.count();
+            extents.push(BackingExtent {
+                offset_pages: allocated,
+                tracker,
+            });
+            allocated += count;
+        }
+        Ok(Self {
+            identity,
+            pages,
+            extents,
+        })
+    }
+
+    fn prepare_install(
+        &self,
+        tree: &mut TableTree<TableMem, LEVELS>,
+        range: LedgerPageRange,
+        backing_offset: usize,
+        protection: Protection,
+    ) -> Result<Vec<PreparedTranslation<TableFrameToken>>, SpaceError> {
+        if !backing_offset.is_multiple_of(PAGE_SIZE) {
+            return Err(SpaceError::BadSegment);
+        }
+        let first_page = backing_offset / PAGE_SIZE;
+        let end_page = first_page
+            .checked_add(range.pages())
+            .ok_or(SpaceError::BadSegment)?;
+        if end_page > self.pages {
+            return Err(SpaceError::BadSegment);
+        }
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve(self.extents.len())
+            .map_err(|_| SpaceError::NoFrame)?;
+        for extent in &self.extents {
+            let extent_start = extent.offset_pages;
+            let extent_end = extent_start + extent.tracker.count();
+            let start = extent_start.max(first_page);
+            let end = extent_end.min(end_page);
+            if start >= end {
+                continue;
+            }
+            let page_offset = start - first_page;
+            let physical_offset = start - extent_start;
+            prepared.push(tree.prepare_map(
+                Vpn(range.start() / PAGE_SIZE + page_offset),
+                end - start,
+                Ppn(extent.tracker.base().addr() / PAGE_SIZE + physical_offset),
+                protection_flags(protection),
+            )?);
+        }
+        let prepared_pages: usize = self
+            .extents
+            .iter()
+            .map(|extent| {
+                let start = extent.offset_pages.max(first_page);
+                let end = (extent.offset_pages + extent.tracker.count()).min(end_page);
+                end.saturating_sub(start)
+            })
+            .sum();
+        if prepared_pages != range.pages() {
+            return Err(SpaceError::BadSegment);
+        }
+        Ok(prepared)
+    }
+}
+
+fn protection_flags(protection: Protection) -> u64 {
+    match protection {
+        Protection::ReadOnly => flags::V | flags::U | flags::A | flags::R,
+        Protection::ReadWrite => flags::V | flags::U | flags::A | flags::R | flags::W | flags::D,
+        Protection::ReadExecute => flags::V | flags::U | flags::A | flags::R | flags::X,
+    }
+}
+
+fn map_change_error(error: ChangeError) -> SpaceError {
+    match error {
+        ChangeError::Conflict
+        | ChangeError::Busy
+        | ChangeError::NotCovered
+        | ChangeError::Guard => SpaceError::Conflict,
+        ChangeError::RegionLimit
+        | ChangeError::TransactionLimit
+        | ChangeError::KeyExhausted
+        | ChangeError::AllocationFailed => SpaceError::NoFrame,
+        ChangeError::BadLimits
+        | ChangeError::Range(_)
+        | ChangeError::OutOfBounds
+        | ChangeError::OwnerDenied
+        | ChangeError::PermissionDenied
+        | ChangeError::BackingOutOfRange
+        | ChangeError::ObjectAuthorization
+        | ChangeError::PageLimit
+        | ChangeError::LeaseInvalid
+        | ChangeError::LeaseTooLarge
+        | ChangeError::PermitMismatch
+        | ChangeError::Stale => SpaceError::BadSegment,
+    }
+}
+
+fn process_protection(flags_value: ProcessMapFlags) -> Result<Protection, SpaceError> {
+    let read = flags_value.contains(ProcessMapFlags::READ);
+    let write = flags_value.contains(ProcessMapFlags::WRITE);
+    let execute = flags_value.contains(ProcessMapFlags::EXECUTE);
+    match (read, write, execute) {
+        (true, false, false) => Ok(Protection::ReadOnly),
+        (true, true, false) => Ok(Protection::ReadWrite),
+        (true, false, true) => Ok(Protection::ReadExecute),
+        _ => Err(SpaceError::BadSegment),
+    }
+}
+
 /// 有界收束游标（REAPABLE 后由管理者分批驱动；见 lifecycle 模块）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStage {
     /// 未进入收束（进程尚活）。
     Idle,
-    /// 逐个归还 owned 数据帧 tracker。
-    Frames,
+    /// 丢弃已不可达的 VA/transaction 账本。
+    Ledger,
+    /// 逐个归还新 ledger backing 的 owned extent。
+    Backings,
     /// 逐批回收用户页表子树（L0/L1 表帧）。
     Tables { root: usize, l1: usize },
     /// 全部子表已空：逐项验证 root 512 槽后交出 root 帧。
@@ -145,6 +332,48 @@ impl crate::remote_call::Completion for ShootdownSelfTestCompletion {
             Memory,
             "epoch self-test passed: active snapshot and shootdown acknowledged"
         );
+    }
+}
+
+/// Remote ack 后收束一笔已经 Publish 的 AddressSpace 事务。槽在 Commit gate
+/// 内填充、Remote request 发布前可见；完成方先取槽再进入 AddressSpace 锁。
+struct MemoryChangeCompletion {
+    process: Arc<Process>,
+    waiter: Arc<super::wait::WaitContext>,
+    published: crate::sync::Spinlock<Option<PublishedChange>>,
+}
+
+impl MemoryChangeCompletion {
+    fn new(process: Arc<Process>, waiter: Arc<super::wait::WaitContext>) -> Self {
+        Self {
+            process,
+            waiter,
+            published: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+        }
+    }
+
+    fn install(&self, published: PublishedChange) {
+        let previous = self.published.lock().replace(published);
+        assert!(previous.is_none(), "memory completion installed twice");
+    }
+}
+
+impl crate::remote_call::Completion for MemoryChangeCompletion {
+    fn complete(&self) {
+        let published = self
+            .published
+            .lock()
+            .take()
+            .expect("memory completion ran before Commit publication");
+        {
+            self.process.space.lock().finish_published_change(published);
+        }
+        if self.process.lifecycle.complete_mandatory()
+            && let Some(control) = self.process.control()
+        {
+            control.publish_reapable();
+        }
+        self.waiter.clone().complete_kernel();
     }
 }
 
@@ -243,7 +472,7 @@ impl AddressSpace {
             .prepare_shootdown(lifecycle, completion)
             .expect("shootdown self-test reservation failed");
         let (_, synchronization) = self
-            .commit_shootdown(lifecycle, prepared, 0, 1, true, |_| ())
+            .commit_shootdown(lifecycle, prepared, 0, 1, true, false, |_| ())
             .expect("shootdown self-test execution snapshot changed");
         synchronization.start();
         crate::remote_call::drain_current();
@@ -293,6 +522,7 @@ impl AddressSpace {
         start_vpn: usize,
         page_count: usize,
         instruction: bool,
+        mandatory: bool,
         publish: impl FnOnce(&mut AddressSpaceState) -> R,
     ) -> Result<(R, ShootdownSynchronization), ShootdownChanged> {
         assert!(page_count != 0, "shootdown range must be nonempty");
@@ -303,7 +533,7 @@ impl AddressSpace {
         } = prepared;
         let mut state = self.state.lock();
         lifecycle
-            .commit_if_current(execution, |active| {
+            .commit_if_current(execution, mandatory, |active| {
                 debug_assert_eq!(active, execution.active());
                 let result = publish(&mut state);
                 let epochs = self.publish_epochs(instruction);
@@ -347,6 +577,117 @@ impl AddressSpace {
     }
 }
 
+pub(crate) enum HeapExtendStart {
+    Ready(usize),
+    Wait(super::wait::WaitPlan),
+}
+
+fn map_heap_space_error(error: SpaceError) -> SystemCallError {
+    match error {
+        SpaceError::NoFrame => SystemCallError::OutOfMemory,
+        SpaceError::BadSegment => SystemCallError::IllegalArgument,
+        SpaceError::Conflict => SystemCallError::ObjectBusy,
+    }
+}
+
+fn map_shootdown_error(error: PrepareShootdownError) -> SystemCallError {
+    match error {
+        PrepareShootdownError::NotRunning => SystemCallError::ObjectClosed,
+        PrepareShootdownError::Busy => SystemCallError::ObjectBusy,
+        PrepareShootdownError::InvalidTargets => SystemCallError::InternalError,
+        PrepareShootdownError::OutOfMemory => SystemCallError::OutOfMemory,
+    }
+}
+
+/// Running Extend 的完整 AddressSpace transaction。Commit 前任一步失败均回滚
+/// planner/PTE/backing/wait reservation；Commit 后只返回 Waiting，由 completion
+/// 在 Remote ack 后推进 Retire/Complete 并交付既定的新 brk。
+pub(crate) fn extend_heap(
+    thread: &Thread,
+    bytes: usize,
+) -> Result<HeapExtendStart, SystemCallError> {
+    let process = thread.process.clone();
+    if bytes == 0 {
+        return Ok(HeapExtendStart::Ready(process.space.lock().brk));
+    }
+
+    let mut extension = Some(
+        process
+            .space
+            .lock()
+            .prepare_heap_extension(bytes)
+            .map_err(map_heap_space_error)?,
+    );
+    let prepared = extension
+        .as_ref()
+        .expect("heap extension reservation exists")
+        .get();
+    let new_brk = prepared.new_brk;
+    let start_vpn = prepared.base / PAGE_SIZE;
+    let pages = prepared.pages;
+
+    let (waiter, plan) = match super::wait::prepare_kernel(new_brk) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            process
+                .space
+                .lock()
+                .rollback_heap_extension(extension.take().expect("extension must roll back"));
+            return Err(error);
+        }
+    };
+    let completion = match Arc::try_new(MemoryChangeCompletion::new(process.clone(), waiter)) {
+        Ok(completion) => completion,
+        Err(_) => {
+            process
+                .space
+                .lock()
+                .rollback_heap_extension(extension.take().expect("extension must roll back"));
+            return Err(SystemCallError::OutOfMemory);
+        }
+    };
+    let sink: Arc<dyn crate::remote_call::Completion> = completion.clone();
+    let shootdown = match process.space.prepare_shootdown(&process.lifecycle, sink) {
+        Ok(shootdown) => shootdown,
+        Err(error) => {
+            process
+                .space
+                .lock()
+                .rollback_heap_extension(extension.take().expect("extension must roll back"));
+            return Err(map_shootdown_error(error));
+        }
+    };
+
+    let committed = process.space.commit_shootdown(
+        &process.lifecycle,
+        shootdown,
+        start_vpn,
+        pages,
+        false,
+        true,
+        |state| {
+            let published = state.commit_heap_extension(
+                extension
+                    .take()
+                    .expect("heap extension commits exactly once"),
+            );
+            completion.install(published);
+        },
+    );
+    let (_, synchronization) = match committed {
+        Ok(committed) => committed,
+        Err(_) => {
+            process
+                .space
+                .lock()
+                .rollback_heap_extension(extension.take().expect("stale extension must roll back"));
+            return Err(SystemCallError::ObjectBusy);
+        }
+    };
+    synchronization.start();
+    Ok(HeapExtendStart::Wait(plan))
+}
+
 /// 地址空间可变状态：页表树 + 过渡 backing/布局记账。后续迁移由
 /// MemorySpace ledger/backing 逐项替换字段，稳定 identity/epoch 外壳不变。
 pub(crate) struct AddressSpaceState {
@@ -354,10 +695,13 @@ pub(crate) struct AddressSpaceState {
     /// 都是编程错误（Building 操作准入与 active 位图已消除可达性）。
     tree: Option<TableTree<TableMem, LEVELS>>,
     satp: usize,
+    /// 新路径的 VA 区域与事务真值；Drain 起点 take 后不再可访问。
+    ledger: Option<MemorySpace>,
+    /// 以 BackingId 关联 ledger logical offset 的 affine anonymous extents。
+    backings: Vec<OwnedBacking>,
+    next_backing: u64,
     /// 堆顶（页对齐）；[brk, USER_TOP - STACK_SIZE) 为可扩展区。
     brk: usize,
-    /// 全部用户数据帧（表帧归树）。
-    frames: Vec<FrameTracker>,
     /// 对象拥有的外部映射 reservation；普通地址空间操作不得接管。
     external_mappings: Vec<usize>,
     /// 有界收束游标（drain_gate + space 锁双持下推进）。
@@ -372,11 +716,15 @@ impl AddressSpaceState {
         let mut tree = TableTree::new(TableMem).map_err(|_| SpaceError::NoFrame)?;
         mm::install_kernel_top_level(&mut tree);
         let satp = (8usize << 60) | tree.satp_ppn();
+        let bounds = LedgerPageRange::new(0, USER_TOP).map_err(|_| SpaceError::BadSegment)?;
+        let ledger = MemorySpace::new(bounds, MEMORY_SPACE_LIMITS).map_err(map_change_error)?;
         Ok(Self {
             tree: Some(tree),
             satp,
+            ledger: Some(ledger),
+            backings: Vec::new(),
+            next_backing: 1,
             brk: 0,
-            frames: Vec::new(),
             external_mappings: Vec::new(),
             drain_stage: DrainStage::Idle,
             pending_free: None,
@@ -418,46 +766,150 @@ impl AddressSpaceState {
         self.brk
     }
 
-    /// 申请 `count` 页，以若干 power-of-two extent 登记映射与帧所有权。
-    fn alloc_map(&mut self, vaddr: usize, count: usize, flags: u64) -> Result<(), SpaceError> {
-        debug_assert!(count > 0);
-        let committed = self.frames.len();
-        // 最坏碎片形态每页一个 extent；提交后 push 不再失败。
-        self.frames
-            .try_reserve(count)
-            .map_err(|_| SpaceError::NoFrame)?;
-        let base_vpn = vaddr / PAGE_SIZE;
-        let mut mapped = 0usize;
+    fn ledger(&mut self) -> &mut MemorySpace {
+        self.ledger.as_mut().expect("address-space ledger is live")
+    }
 
-        while mapped < count {
-            let Some(tracker) = frame::alloc_largest(count - mapped) else {
-                for rollback in (0..mapped).rev() {
-                    self.publish_unmap(Vpn(base_vpn + rollback), 1)
-                        .expect("anonymous allocation rollback cannot fail");
-                }
-                self.frames.truncate(committed);
-                return Err(SpaceError::NoFrame);
-            };
-            let extent_count = tracker.count();
-            let extent_ppn = tracker.base().addr() / PAGE_SIZE;
-            for index in 0..extent_count {
-                if let Err(error) = self.publish_map(
-                    Vpn(base_vpn + mapped + index),
-                    1,
-                    Ppn(extent_ppn + index),
-                    flags,
-                ) {
-                    for rollback in (0..mapped + index).rev() {
-                        self.publish_unmap(Vpn(base_vpn + rollback), 1)
-                            .expect("anonymous allocation rollback cannot fail");
-                    }
-                    self.frames.truncate(committed);
-                    return Err(error);
-                }
-            }
-            mapped += extent_count;
-            self.frames.push(tracker);
+    fn mint_backing(&mut self) -> Result<BackingId, SpaceError> {
+        let identity = BackingId::new(self.next_backing).ok_or(SpaceError::NoFrame)?;
+        self.next_backing = self
+            .next_backing
+            .checked_add(1)
+            .ok_or(SpaceError::NoFrame)?;
+        Ok(identity)
+    }
+
+    fn map_owned_anonymous(
+        &mut self,
+        vaddr: usize,
+        len: usize,
+        protection: Protection,
+    ) -> Result<(), SpaceError> {
+        let identity = self.mint_backing()?;
+        let backing = OwnedBacking::allocate(identity, len / PAGE_SIZE)?;
+        let class = if protection == Protection::ReadExecute {
+            AnonymousClass::InitialExecutable
+        } else {
+            AnonymousClass::Data
+        };
+        self.map_owned_backing(vaddr, protection, class, backing)
+    }
+
+    fn prepare_owned_backing(
+        &mut self,
+        vaddr: usize,
+        protection: Protection,
+        class: AnonymousClass,
+        backing: OwnedBacking,
+    ) -> Result<PreparedOwnedMapping, SpaceError> {
+        let len = backing
+            .pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(SpaceError::BadSegment)?;
+        let validated = self
+            .ledger()
+            .validate_map(MapRequest {
+                bytes: len,
+                guard_before: 0,
+                guard_after: 0,
+                placement: MapPlacement::FixedEmpty {
+                    usable_start: vaddr,
+                },
+                current: protection,
+                maximum: protection,
+                owner: RegionOwner::AddressSpace,
+                backing: MapBacking::Anonymous {
+                    identity: backing.identity,
+                    class,
+                },
+                result: None,
+            })
+            .map_err(map_change_error)?;
+        let change = self
+            .ledger()
+            .reserve(validated, Vec::new())
+            .map_err(|failure| map_change_error(failure.error))?;
+        if self.backings.try_reserve(1).is_err() {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            return Err(SpaceError::NoFrame);
         }
+        let intent = match change.translation_intents() {
+            [
+                TranslationIntent::Install {
+                    range,
+                    backing:
+                        memory_space::BackingView::Anonymous {
+                            identity: intent_identity,
+                            offset,
+                            ..
+                        },
+                    protection,
+                },
+            ] if *intent_identity == backing.identity => (*range, *offset, *protection),
+            _ => panic!("anonymous map planner returned an invalid translation plan"),
+        };
+        let translations = match backing.prepare_install(self.tt(), intent.0, intent.1, intent.2) {
+            Ok(translations) => translations,
+            Err(error) => {
+                let permits = self.ledger().rollback(change);
+                debug_assert!(permits.is_empty());
+                return Err(error);
+            }
+        };
+        Ok(PreparedOwnedMapping {
+            backing,
+            change,
+            translations,
+        })
+    }
+
+    fn rollback_owned_mapping(&mut self, prepared: PreparedOwnedMapping) {
+        let PreparedOwnedMapping {
+            backing,
+            change,
+            translations,
+        } = prepared;
+        let permits = self.ledger().rollback(change);
+        debug_assert!(permits.is_empty());
+        drop(translations);
+        drop(backing);
+    }
+
+    fn commit_owned_mapping(&mut self, prepared: PreparedOwnedMapping) -> PublishedChange {
+        let PreparedOwnedMapping {
+            backing,
+            change,
+            translations,
+        } = prepared;
+        let committed = self.ledger().commit(change);
+        for translation in translations {
+            self.tt().publish(translation);
+        }
+        let published = self.ledger().publish(committed);
+        self.backings.push(backing);
+        published
+    }
+
+    fn finish_published_change(&mut self, published: PublishedChange) {
+        let synchronized = self.ledger().synchronize(published);
+        let (retired, batch) = self.ledger().retire(synchronized);
+        let (fragments, permits) = batch.into_parts();
+        debug_assert!(fragments.is_empty());
+        debug_assert!(permits.is_empty());
+        self.ledger().complete(retired);
+    }
+
+    fn map_owned_backing(
+        &mut self,
+        vaddr: usize,
+        protection: Protection,
+        class: AnonymousClass,
+        backing: OwnedBacking,
+    ) -> Result<(), SpaceError> {
+        let prepared = self.prepare_owned_backing(vaddr, protection, class, backing)?;
+        let published = self.commit_owned_mapping(prepared);
+        self.finish_published_change(published);
         Ok(())
     }
 
@@ -474,30 +926,16 @@ impl AddressSpaceState {
             || len % PAGE_SIZE != 0
             || !permissions.is_known()
             || permissions.raw() == 0
-            || permissions.contains(ProcessMapFlags::WRITE)
-                && !permissions.contains(ProcessMapFlags::READ)
-            || permissions.contains(ProcessMapFlags::WRITE | ProcessMapFlags::EXECUTE)
         {
             return Err(SpaceError::BadSegment);
         }
+        let protection = process_protection(permissions)?;
         let end = vaddr.checked_add(len).ok_or(SpaceError::BadSegment)?;
         let stack_base = USER_TOP - STACK_SIZE;
         if end > USER_TOP || vaddr < stack_base && end > stack_base {
             return Err(SpaceError::BadSegment);
         }
-        let mut pte_flags = flags::V | flags::U | flags::A;
-        if permissions.contains(ProcessMapFlags::READ) {
-            pte_flags |= flags::R;
-        }
-        if permissions.contains(ProcessMapFlags::WRITE) {
-            pte_flags |= flags::W | flags::D;
-        }
-        if permissions.contains(ProcessMapFlags::EXECUTE) {
-            pte_flags |= flags::X;
-        }
-
-        let pages = len / PAGE_SIZE;
-        self.alloc_map(vaddr, pages, pte_flags)?;
+        self.map_owned_anonymous(vaddr, len, protection)?;
         if end <= stack_base {
             self.brk = self.brk.max(end);
         }
@@ -615,29 +1053,37 @@ impl AddressSpaceState {
         }
 
         if plan.values().any(|fl| {
-            fl & flags::W != 0 && fl & flags::R == 0
+            fl & flags::R == 0 && fl & (flags::W | flags::X) != 0
                 || fl & (flags::W | flags::X) == (flags::W | flags::X)
         }) {
             return Err(SpaceError::BadSegment);
         }
 
-        // 阶段二：逐页映射（记录 vpn → 物理帧，回填阶段查用）。
-        // 两个 Vec 都在安装 PTE 前一次性预留，之后的记账不得因扩容 panic。
-        let mut pages: Vec<(usize, usize)> = Vec::new();
-        pages
-            .try_reserve(plan.len())
-            .map_err(|_| SpaceError::NoFrame)?;
-        self.frames
-            .try_reserve(plan.len())
+        // 阶段二：按相同权限的连续 VPN 建立 ledger backing 与页表投影。
+        let mut runs = Vec::new();
+        runs.try_reserve(plan.len())
             .map_err(|_| SpaceError::NoFrame)?;
         for (&vpn, &fl) in &plan {
-            let tracker = frame::alloc_order(0).ok_or(SpaceError::NoFrame)?;
-            self.publish_map(Vpn(vpn), 1, Ppn(tracker.base().addr() / PAGE_SIZE), fl)?;
-            pages.push((vpn, tracker.base().addr()));
-            self.frames.push(tracker);
+            let protection = if fl & flags::X != 0 {
+                Protection::ReadExecute
+            } else if fl & flags::W != 0 {
+                Protection::ReadWrite
+            } else {
+                Protection::ReadOnly
+            };
+            if let Some((_, end, previous)) = runs.last_mut() {
+                if *end == vpn && *previous == protection {
+                    *end += 1;
+                    continue;
+                }
+            }
+            runs.push((vpn, vpn + 1, protection));
+        }
+        for (start, end, protection) in runs {
+            self.map_owned_anonymous(start * PAGE_SIZE, (end - start) * PAGE_SIZE, protection)?;
         }
 
-        // 阶段三：回填段内容（跨页逐段拷，页内偏移生效）。
+        // 阶段三：Building 地址空间不可运行，按已发布 PTE 的物理投影回填内容。
         for seg in segments {
             let start = seg.offset as usize;
             let src = file
@@ -648,26 +1094,7 @@ impl AddressSpaceState {
                             .ok_or(SpaceError::BadSegment)?,
                 )
                 .ok_or(SpaceError::BadSegment)?;
-            let mut va = seg.vaddr as usize;
-            let mut off = 0usize;
-            while off < src.len() {
-                let in_page = va % PAGE_SIZE;
-                let n = (PAGE_SIZE - in_page).min(src.len() - off);
-                let page_index = pages
-                    .binary_search_by_key(&(va / PAGE_SIZE), |&(vpn, _)| vpn)
-                    .expect("ELF page plan must cover every segment byte");
-                let frame = pages[page_index].1;
-                // SAFETY: 目标页为本空间独占（刚映射），直映射可写。
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src[off..].as_ptr(),
-                        mm::phys_to_virt(frame + in_page) as *mut u8,
-                        n,
-                    );
-                }
-                va += n;
-                off += n;
-            }
+            self.write_building(seg.vaddr as usize, src)?;
         }
 
         let brk = top.div_ceil(PAGE_SIZE) * PAGE_SIZE;
@@ -681,11 +1108,7 @@ impl AddressSpaceState {
     /// 普通进程的栈由组装者（libprocess）经 ProcessMap 供给，内核不参与
     /// （bootstrap 例外：进程未启动、无用户代码可分配）。
     pub fn map_stack(&mut self) -> Result<(), SpaceError> {
-        self.alloc_map(
-            USER_TOP - STACK_SIZE,
-            STACK_SIZE / PAGE_SIZE,
-            flags::USER_DATA,
-        )
+        self.map_owned_anonymous(USER_TOP - STACK_SIZE, STACK_SIZE, Protection::ReadWrite)
     }
 
     /// Bootstrap 专用出生块：prefix 复制到地址空间自有只读页，
@@ -717,88 +1140,76 @@ impl AddressSpaceState {
             return Err(SpaceError::BadSegment);
         }
 
-        let committed = self.frames.len();
-        self.frames
-            .try_reserve(prefix_pages + usize::from(payload_pages > 0))
-            .map_err(|_| SpaceError::NoFrame)?;
-        let base_vpn = base / PAGE_SIZE;
-        self.alloc_map(base, prefix_pages, flags::USER_RODATA)?;
-        if let Err(error) = self.write_building(base, prefix) {
-            for rollback in 0..prefix_pages {
-                self.publish_unmap(Vpn(base_vpn + rollback), 1)
-                    .expect("bootstrap prefix rollback cannot fail");
-            }
-            self.frames.truncate(committed);
-            return Err(error);
-        }
-
+        let identity = self.mint_backing()?;
+        let mut backing = OwnedBacking::allocate(identity, prefix_pages)?;
         if payload_pages > 0 {
-            for index in 0..payload_pages {
-                if let Err(error) = self.publish_map(
-                    Vpn(base_vpn + prefix_pages + index),
-                    1,
-                    Ppn(payload_pa / PAGE_SIZE + index),
-                    flags::USER_RODATA,
-                ) {
-                    for rollback in (0..index).rev() {
-                        self.publish_unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
-                            .expect("bootstrap payload rollback cannot fail");
-                    }
-                    for rollback in 0..prefix_pages {
-                        self.publish_unmap(Vpn(base_vpn + rollback), 1)
-                            .expect("bootstrap prefix rollback cannot fail");
-                    }
-                    self.frames.truncate(committed);
-                    return Err(error.into());
-                }
-            }
+            backing
+                .extents
+                .try_reserve(1)
+                .map_err(|_| SpaceError::NoFrame)?;
             // payload 帧来自启动 reservation，从未发布为空闲；此处把其完整
             // 页范围唯一移交给地址空间 backing，Drop 时首次进入库存。
             // SAFETY: payload reservation 在启动移交中只执行一次，且尚未发布到 POOL。
-            self.frames.push(unsafe {
+            let tracker = unsafe {
                 FrameTracker::adopt_reserved(FrameNumber(payload_pa / PAGE_SIZE), payload_pages)
+            };
+            backing.extents.push(BackingExtent {
+                offset_pages: prefix_pages,
+                tracker,
             });
+            backing.pages = pages;
         }
+        self.map_owned_backing(base, Protection::ReadOnly, AnonymousClass::Data, backing)?;
+        self.write_building(base, prefix)?;
         self.brk = end;
         Ok(base)
     }
 
-    /// 堆扩展（sbrk 语义）：申请 `bytes` 字节，内核内部向上取整到页粒度，
-    /// 返回新堆顶（页对齐字节地址）。页大小是实现细节，不经 ABI 泄漏；
-    /// `bytes == 0` 为查询：返回当前堆顶。虚拟连续性由「从 brk 起步」
-    /// 结构性保证；新 PTE 对当前 satp 立即生效。
-    /// 映射事务要么全成要么全无：中途失败回滚本次已映页，brk 不前进。
-    pub fn extend_heap(&mut self, bytes: usize) -> Result<usize, SpaceError> {
+    /// Reserve 阶段准备一笔 Running heap 扩展：planner reservation、owned
+    /// backing 与全部页表 reservation 均已取得，尚未改变 brk/PTE/ledger。
+    #[inline(never)]
+    fn prepare_heap_extension(&mut self, bytes: usize) -> Result<HeapExtensionToken, SpaceError> {
         const MAX_EXTEND_BYTES: usize = 256 << 20;
-        if bytes == 0 {
-            return Ok(self.brk);
-        }
-        if bytes > MAX_EXTEND_BYTES {
+        if bytes == 0 || bytes > MAX_EXTEND_BYTES {
             return Err(SpaceError::BadSegment);
         }
         let pages = bytes.div_ceil(PAGE_SIZE);
         let delta = pages.checked_mul(PAGE_SIZE).ok_or(SpaceError::BadSegment)?;
-        let new_brk = self.brk.checked_add(delta).ok_or(SpaceError::BadSegment)?;
+        let base = self.brk;
+        let new_brk = base.checked_add(delta).ok_or(SpaceError::BadSegment)?;
         if new_brk > USER_TOP - STACK_SIZE {
             return Err(SpaceError::BadSegment);
         }
-        let base_vpn_v = self.brk / PAGE_SIZE;
-        let committed = self.frames.len();
-        for i in 0..pages {
-            if let Err(e) = self.alloc_map(self.brk + i * PAGE_SIZE, 1, flags::USER_DATA) {
-                // 回滚：撤销本次已映页（帧随 FrameTracker 归还帧池），brk 不动。
-                for j in (0..i).rev() {
-                    self.publish_unmap(Vpn(base_vpn_v + j), 1)
-                        .expect("single-page heap rollback cannot fail");
-                }
-                self.frames.truncate(committed);
-                return Err(e);
-            }
-        }
-        self.brk = new_brk;
-        // SAFETY: sfence.vma 对当前 ASID 冲刷 stale TLB，使新 PTE 可见。
-        unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
-        Ok(new_brk)
+        // 事务聚合容器必须先于 backing、planner 与 PTE reservation 分配；
+        // 之后任何失败都能持 token 走显式 rollback。
+        let mut token = HeapExtensionToken::allocate()?;
+        let identity = self.mint_backing()?;
+        let backing = OwnedBacking::allocate(identity, pages)?;
+        let mapping =
+            self.prepare_owned_backing(base, Protection::ReadWrite, AnonymousClass::Data, backing)?;
+        token.install(PreparedHeapExtension {
+            mapping,
+            base,
+            new_brk,
+            pages,
+        });
+        Ok(token)
+    }
+
+    fn rollback_heap_extension(&mut self, prepared: HeapExtensionToken) {
+        self.rollback_owned_mapping(prepared.take().mapping);
+    }
+
+    /// Commit gate 内不可失败发布；返回的 ledger token 由 Remote completion 持有。
+    fn commit_heap_extension(&mut self, prepared: HeapExtensionToken) -> PublishedChange {
+        let prepared = prepared.take();
+        assert_eq!(
+            self.brk, prepared.base,
+            "heap break changed after reservation"
+        );
+        let published = self.commit_owned_mapping(prepared.mapping);
+        self.brk = prepared.new_brk;
+        published
     }
 
     /// 校验用户区间 [ptr, ptr+len) 逐页可访问：不溢出、不出用户半区、
@@ -846,7 +1257,7 @@ impl AddressSpaceState {
 
     /// 将所有权归外部的物理页映射到指定用户 VA（共享内存机制专用，
     /// 如隧道）。帧生命周期归登记方：本空间的页表回收只清 PTE、不归还
-    /// 该帧——Drop 链只释放 `frames` 里登记的帧，外部映射天然安全。
+    /// 该帧——页表树从不拥有 leaf backing，外部映射 reservation 由对象关闭。
     /// 栈窗口与越界地址直接拒绝；冲突由 map 的 Conflict 报出。
     pub fn map_external(&mut self, va: usize, pa: usize) -> Result<(), SpaceError> {
         if va % PAGE_SIZE != 0 || va >= USER_TOP - STACK_SIZE {
@@ -938,7 +1349,7 @@ impl AddressSpaceState {
                 self.external_mappings.is_empty(),
                 "external mapping outlives its object"
             );
-            self.drain_stage = DrainStage::Frames;
+            self.drain_stage = DrainStage::Ledger;
         }
         let mut work = 0;
 
@@ -957,16 +1368,43 @@ impl AddressSpaceState {
                 DrainStage::Idle | DrainStage::Done => {
                     return (work, self.drain_stage == DrainStage::Done);
                 }
-                DrainStage::Frames => {
+                DrainStage::Ledger => {
                     if work + 1 > budget {
                         return (work, false);
                     }
-                    let Some(tracker) = self.frames.pop() else {
+                    if let Some((_fragment, permit)) = self.ledger().drain_one() {
+                        assert!(
+                            permit.is_none(),
+                            "object write permit reached anonymous-only drain batch"
+                        );
+                        work += 1;
+                        continue;
+                    }
+                    drop(
+                        self.ledger
+                            .take()
+                            .expect("address-space ledger must exist during drain"),
+                    );
+                    work += 1;
+                    self.drain_stage = DrainStage::Backings;
+                }
+                DrainStage::Backings => {
+                    if work + 1 > budget {
+                        return (work, false);
+                    }
+                    let Some(backing) = self.backings.last_mut() else {
                         self.drain_stage = DrainStage::Tables { root: 0, l1: 0 };
                         continue;
                     };
-                    work += 1; // tracker 出栈 + 登记为 1 个计费步骤
-                    self.pending_free = Some(tracker);
+                    let extent = backing
+                        .extents
+                        .pop()
+                        .expect("owned backing must contain an extent");
+                    if backing.extents.is_empty() {
+                        self.backings.pop();
+                    }
+                    work += 1;
+                    self.pending_free = Some(extent.tracker);
                     let (used, done) = self.step_pending(budget - work);
                     work += used;
                     if !done {

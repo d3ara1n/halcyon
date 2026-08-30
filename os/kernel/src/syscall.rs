@@ -241,10 +241,20 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::Extend => {
-            extend_heap(frame, thread, a0);
-            Outcome::Completed
-        }
+        SystemCall::Extend => match task::proc::extend_heap(thread, a0) {
+            Ok(task::proc::HeapExtendStart::Ready(brk)) => {
+                respond_ok(frame, brk);
+                Outcome::Completed
+            }
+            Ok(task::proc::HeapExtendStart::Wait(plan)) => {
+                sched::park_request_wait(plan);
+                Outcome::Wait
+            }
+            Err(error) => {
+                respond_error(frame, error);
+                Outcome::Completed
+            }
+        },
         SystemCall::Sleep => {
             let ms = a0 as u64;
             if ms == 0 {
@@ -492,15 +502,6 @@ fn debug_print(frame: &mut UserContext, thread: &Thread) {
         Err(_) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("non-UTF-8 message, {} bytes", len)),
     }
     respond_ok(frame, len);
-}
-
-/// Extend(bytes)：sbrk 语义——申请 bytes 字节，内核取整到页粒度，返回
-/// 新堆顶；bytes = 0 查询当前堆顶。页大小是实现细节，不经 ABI 泄漏。
-fn extend_heap(frame: &mut UserContext, thread: &Thread, bytes: usize) {
-    match thread.process.space.lock().extend_heap(bytes) {
-        Ok(brk) => respond_ok(frame, brk),
-        Err(_) => respond_error(frame, SystemCallError::OutOfMemory),
-    }
 }
 
 fn respond_result(frame: &mut UserContext, result: Result<usize, SystemCallError>) {

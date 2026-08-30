@@ -6,11 +6,11 @@
 
 ## 驱动问题
 
-当前 Running 进程只有字节粒度 sbrk 语义的 `Extend`；`ProcessMap` 只服务 Building 组装。`AddressSpace.frames` 平坦持有全部 owned backing，`external_mappings` 只登记 Tunnel 借入 VA，backing、区域和 lease 尚未统一到可切割所有权真值。
+Running 进程当前仍保留字节粒度 sbrk ABI，但非零 `Extend` 已迁入统一 MemoryChange transaction；`ProcessMap` 只服务 Building 组装。anonymous/ELF/bootstrap/Extend backing 已由 ledger + `OwnedBacking.extents` 统一拥有，旧 `AddressSpace.frames` 已删除；剩余旧路径是 Tunnel 借入帧的 `external_mappings` 与按 VA 解除。
 
 结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner 与 reservation-aware `TableTree` 已完成。页表已能在 Commit 前精确准备并清零中间表帧，Commit 后 Publish 不分配、不返回可恢复错误；owned/shared root 槽所有权也已进入树本身。
 
-当前下一缺口是把已落地的跨 hart 完成基础接入真实内存所有权事务。Remote Call 已提供固定槽、IPI 门铃、全量 fence、epoch ack 和 execution gate seam，但 Tunnel Endpoint close、MemoryChange 与 ProcessDrain 尚未拥有统一 ledger/backing transaction；在此之前不能把探针完成解释为 backing 可 Retire 或 Handle close 已完成。
+当前下一缺口是把 Tunnel Endpoint close 接入同一内存所有权事务。Remote Call 已提供固定槽、IPI 门铃、全量 fence、epoch ack 和 execution gate seam；Running Extend 已成为首个真实消费者，闭合预构造 WaitContext、发起线程消散、lifecycle mandatory obligation 与 ack 后 Retire。Tunnel/HandleClose 仍未拥有统一 ObjectView/lease transaction。
 
 ## 已确认决策
 
@@ -177,6 +177,8 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 阶段记录：`os/remote_call` 已落地固定 8 hart × 4 槽的纯逻辑状态机与 kernel adapter，具备批量 Reserve 精确回滚、Pending 电平、generation 退休、锁外 IPI、trap/idle 有界消费、全量 `SFENCE.VMA`/可选 `FENCE.I`、release-sequence 最后确认及每 hart epoch cache。Process lifecycle 已增加 execution sequence，dispatch/leave 以本地 epoch 为硬 gate；稳定 AddressSpace 外壳已实现 `prepare_shootdown → commit_shootdown → start` 并用 primordial active snapshot 真路径探针验证锁序和 ack。host debug/release、clippy、`just check`、virt debug/release 与 sifive_u 均通过，10/10 竞态矩阵不变。尚缺真实 MemoryChange/HandleClose completion 对 WaitContext、终止接管和 ack 后 Retire 的所有权闭包，随切片 6 ledger/backing 迁移完成。
 
+未来代码复审已按提交 `6199985` 单独建立 [`todo-2026-08-30-remote-call-review.md`](todo-2026-08-30-remote-call-review.md)；它不阻塞本计划继续迁移 AddressSpace。
+
 ### 6. AddressSpace 替换与现有调用者迁移
 
 组装最终 AddressSpace 深模块，并按调用者逐批切换；每批迁移同批删除对应旧路径。
@@ -192,6 +194,8 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 3. **稳定身份与 drain**：satp/root/epoch 身份从可变账本锁分离；AddressSpace drain 顺序收束 pending close、已发布事务、区域 backing 和拥有的页表资源，不认识调用来源。
 
 显式 close 返回前完成相关远端确认；进程 Terminating 在 active 集合归零后仍通过同一 retire 机制完成，不借“目标不再运行”绕过账本和 backing 所有权。迁移完成时 `AddressSpace.frames`、`external_mappings`、MappingLease 的 VA 所有权和本地-only unmap 路径全部删除。
+
+阶段记录（第一批）：`MemorySpace` ledger、`OwnedBacking(BackingId + logical offset + affine extents)` 与 PTE reservation 已组成 AddressSpace adapter；ProcessMap/Write、ELF 连续权限段、bootstrap 栈/出生块与 Running Extend 均已迁移。Extend 在 Commit 前准备 planner/backing/PTE/WaitContext/Remote slots，Commit 后由最后 ack 推进 Retire/Complete；预构造 Context 不提前持 Thread，early completion 只 Deferred。lifecycle 以 `mandatory_ops` 将 REAPABLE 延迟到所有必成事务收束。旧 `AddressSpace.frames`、`alloc_map`、`DrainStage::Frames` 与 Extend 本地 fence 已删除，ProcessDrain 现按 ledger→backings→tables 有界推进。host planner debug/release 18 项、WaitCore 8 项、clippy、`just check`、virt debug/release 与 10/10 竞态矩阵通过。剩余入口是 Tunnel/ObjectView/HandleClose，故切片 6 尚未完成。
 
 验证：Building failure、bootstrap payload 收编、Tunnel create/attach/close、HandleClose vs close、Drain 接管和帧计数全覆盖；现有 virt/release/hetero/nofd/sifive_u 行为等价。本切片尚不公开 Running 内存 ABI。
 

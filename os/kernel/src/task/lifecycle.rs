@@ -5,9 +5,9 @@
 //! 锁序契约（顶级）：**Job 链锁（先父后子，≤32 把）→ lifecycle 锁 →
 //! 其他对象锁**。lifecycle 锁可整体嵌套于 Job 链锁内（ProcessStart
 //! 提交闸门：链锁内上行检查祖先 seal 后同临界区调用 begin_running）；
-//! lifecycle 锁内只改状态、终因、成员表、active mask 与 Building
-//! 操作计数，锁内不调用 subscribe/offer/enqueue/IPI/对象 close/
-//! uaccess/页表操作——这些动作经 [`TerminationTodo`] 与
+//! lifecycle 锁内只改状态、终因、成员表、active mask、Building 操作计数与
+//! Commit 后必成事务计数，锁内不调用 subscribe/offer/enqueue/IPI/对象
+//! close/uaccess/页表操作——这些动作经 [`TerminationTodo`] 与
 //! [`Lifecycle::take_first_waiting`] 游标延迟到锁外执行。
 //! 方向约束：lifecycle 锁内不得出游获取任何其他锁（对象锁、
 //! WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁、Job 链
@@ -27,8 +27,8 @@
 //! 在被再次 dispatch 前记录仍为 Waiting（指向已完成的 context），由
 //! enter_running 的覆盖写收编；终止路径对这类 stale 记录的取消 offer
 //! 必然落败（单 outcome 仲裁），线程由 pick gate 吸收后 reap 摘除。
-//! REAPABLE 严格晚于最后一个成员摘除与最后一个 Building 操作退出
-//! （building_ops == 0）。
+//! REAPABLE 严格晚于最后一个成员摘除、最后一个 Building 操作退出与最后一笔
+//! Commit 后必成事务完成（building_ops == 0 && mandatory_ops == 0）。
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -153,6 +153,9 @@ struct LifecycleInner {
     /// 在途 Building 操作（builder 的 map/write/attach/grant/start）
     /// 计数；终止后归零才能发布 REAPABLE（操作退出方负责触发）。
     building_ops: usize,
+    /// Running 期已经 Commit、终止不可撤销的必成内核事务；事务完成方在
+    /// 业务资源 Complete 后递减。非零时禁止发布 REAPABLE。
+    mandatory_ops: usize,
 }
 
 fn advance_execution(inner: &mut LifecycleInner) {
@@ -182,6 +185,7 @@ impl Lifecycle {
                     active: 0,
                     execution_sequence: 1,
                     building_ops: 0,
+                    mandatory_ops: 0,
                 },
             ),
         }
@@ -208,16 +212,38 @@ impl Lifecycle {
     pub(crate) fn commit_if_current<R>(
         &self,
         snapshot: ExecutionSnapshot,
+        mandatory: bool,
         commit: impl FnOnce(u64) -> R,
     ) -> Result<R, ExecutionChanged> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running)
             || inner.execution_sequence != snapshot.sequence
             || inner.active != snapshot.active
         {
             return Err(ExecutionChanged);
         }
+        if mandatory {
+            inner.mandatory_ops = inner
+                .mandatory_ops
+                .checked_add(1)
+                .expect("process mandatory operation count exhausted");
+        }
         Ok(commit(inner.active))
+    }
+
+    /// Commit 后必成事务在业务 Complete 后解除终止屏障；true 表示本调用方
+    /// 同时成为 REAPABLE 电平发布者。
+    pub(crate) fn complete_mandatory(&self) -> bool {
+        let mut inner = self.inner.lock();
+        inner.mandatory_ops = inner
+            .mandatory_ops
+            .checked_sub(1)
+            .expect("mandatory operation completed without registration");
+        self.is_terminating()
+            && inner.members.is_empty()
+            && inner.active == 0
+            && inner.building_ops == 0
+            && inner.mandatory_ops == 0
     }
 
     /// Building 操作准入（builder 的 map/write/start 入口）：
@@ -240,6 +266,7 @@ impl Lifecycle {
             && inner.members.is_empty()
             && inner.active == 0
             && inner.building_ops == 0
+            && inner.mandatory_ops == 0
     }
 
     /// 附入线程（ProcessAttach / bootstrap 内嵌组装）：锁内分配 tid、
@@ -366,7 +393,10 @@ impl Lifecycle {
             }
             None => todo.ipi_slots = inner.active,
         }
-        todo.reapable = inner.members.is_empty() && inner.active == 0 && inner.building_ops == 0;
+        todo.reapable = inner.members.is_empty()
+            && inner.active == 0
+            && inner.building_ops == 0
+            && inner.mandatory_ops == 0;
         advance_execution(&mut inner);
         self.state
             .store(state_index(ProcessState::Terminating), Ordering::Release);
@@ -475,6 +505,7 @@ impl Lifecycle {
             && inner.members.is_empty()
             && inner.active == 0
             && inner.building_ops == 0
+            && inner.mandatory_ops == 0
     }
 
     /// 终止触达游标（锁外逐条驱动）：摘取首个 Waiting 成员的 weak
@@ -495,14 +526,15 @@ impl Lifecycle {
     }
 
     /// REAPABLE 条件谓词（派生铸造新 shell 的电平重放用）：已终止、
-    /// 表空、无在途 Building 操作、无 active hart——与
-    /// thread_departed/leave_building_op 的发布判定同一合取。
+    /// 表空、无在途 Building 操作、无 Commit 后必成事务、无 active hart——
+    /// 与各完成路径的发布判定同一合取。
     pub(crate) fn is_reapable(&self) -> bool {
         let inner = self.inner.lock();
         self.is_terminating()
             && inner.members.is_empty()
             && inner.active == 0
             && inner.building_ops == 0
+            && inner.mandatory_ops == 0
     }
 
     /// 固定宽快照（ProcessQuery）：state 与终因在同一临界区内取得，
@@ -521,6 +553,13 @@ impl Lifecycle {
     /// Dead 发布（收束完成后调用）：冻结终态并返回终因。
     pub(crate) fn mark_dead(&self) -> (ProcessExitReason, i64) {
         let inner = self.inner.lock();
+        assert!(
+            inner.members.is_empty()
+                && inner.active == 0
+                && inner.building_ops == 0
+                && inner.mandatory_ops == 0,
+            "process reached Dead with live lifecycle obligations"
+        );
         let frozen = (inner.reason, inner.code);
         self.state
             .store(state_index(ProcessState::Dead), Ordering::Release);

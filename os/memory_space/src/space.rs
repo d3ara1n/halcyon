@@ -458,6 +458,13 @@ struct PreparedPlan {
     retiring_permits: Vec<WritePermit>,
 }
 
+struct MaterializedReservation {
+    replacements: Vec<Region>,
+    retiring: Vec<RetiringFragment>,
+    retiring_permits: Vec<WritePermit>,
+    permits: Vec<WritePermit>,
+}
+
 #[derive(Debug)]
 #[must_use = "prepared changes must be committed or rolled back"]
 pub struct PreparedChange {
@@ -1028,71 +1035,137 @@ impl MemorySpace {
         validated: ValidatedChange,
         permits: Vec<WritePermit>,
     ) -> Result<PreparedChange, ReserveFailure> {
-        let fail = |error, validated, permits| ReserveFailure {
-            error,
-            validated,
-            permits,
+        if let Err(error) = self.check_reservation(&validated, &permits) {
+            return Err(ReserveFailure {
+                error,
+                validated,
+                permits,
+            });
+        }
+        let materialized = match self.materialize_reservation(&validated, permits) {
+            Ok(materialized) => materialized,
+            Err((error, permits)) => {
+                return Err(ReserveFailure {
+                    error,
+                    validated,
+                    permits,
+                });
+            }
         };
+        let ValidatedChange {
+            plan,
+            lease,
+            growth,
+            ..
+        } = validated;
+        let ValidatedPlan {
+            remove,
+            translations,
+            footprint,
+            result_layout,
+            ..
+        } = plan;
+        let key = self.mint_change_key();
+        let lease = lease.map(|(range, segments)| UserWriteLease {
+            range,
+            projection: UserWriteProjection { segments },
+        });
+        self.transactions.push(TransactionRecord {
+            key,
+            footprint,
+            lease: lease.as_ref().map(UserWriteLease::range),
+            stage: ChangeStage::Reserved,
+            reserved_growth: growth,
+        });
+        self.reserved_growth += growth;
+        Ok(PreparedChange {
+            key,
+            plan: PreparedPlan {
+                remove,
+                replacements: materialized.replacements,
+                retiring: materialized.retiring,
+                translations,
+                result_layout,
+                retiring_permits: materialized.retiring_permits,
+            },
+            permits: materialized.permits,
+            lease,
+        })
+    }
+
+    fn check_reservation(
+        &mut self,
+        validated: &ValidatedChange,
+        permits: &[WritePermit],
+    ) -> Result<(), ChangeError> {
         if self.transactions.len() >= self.limits.max_transactions {
-            return Err(fail(ChangeError::TransactionLimit, validated, permits));
+            return Err(ChangeError::TransactionLimit);
         }
-        if !self.snapshot_valid(&validated.snapshot) || !self.plan_still_valid(&validated) {
-            return Err(fail(ChangeError::Stale, validated, permits));
+        if !self.snapshot_valid(&validated.snapshot) || !self.plan_still_valid(validated) {
+            return Err(ChangeError::Stale);
         }
-        if let Err(error) = self.ensure_no_transaction_conflict(
+        self.ensure_no_transaction_conflict(
             validated.plan.footprint,
             validated.lease.as_ref().map(|lease| lease.0),
-        ) {
-            return Err(fail(error, validated, permits));
+        )?;
+        if !permits_match(&validated.permits, permits) {
+            return Err(ChangeError::PermitMismatch);
         }
-        if !permits_match(&validated.permits, &permits) {
-            return Err(fail(ChangeError::PermitMismatch, validated, permits));
-        }
-        if let Err(error) = self.check_projected_regions(validated.growth) {
-            return Err(fail(error, validated, permits));
-        }
-
-        let Some(required_region_keys) = validated
+        self.check_projected_regions(validated.growth)?;
+        let required_region_keys = validated
             .plan
             .replacements
             .len()
             .checked_add(validated.plan.retiring.len())
-        else {
-            return Err(fail(ChangeError::KeyExhausted, validated, permits));
-        };
-        let required_region_keys = match u64::try_from(required_region_keys) {
-            Ok(count) => count,
-            Err(_) => return Err(fail(ChangeError::KeyExhausted, validated, permits)),
-        };
+            .and_then(|count| u64::try_from(count).ok())
+            .ok_or(ChangeError::KeyExhausted)?;
         if self.next_region.checked_add(required_region_keys).is_none()
             || self.next_change.checked_add(1).is_none()
             || (validated.plan.result_layout.is_some()
                 && self.next_allocation.checked_add(1).is_none())
         {
-            return Err(fail(ChangeError::KeyExhausted, validated, permits));
+            return Err(ChangeError::KeyExhausted);
         }
+        let reserved_growth = self
+            .reserved_growth
+            .checked_add(validated.growth)
+            .ok_or(ChangeError::RegionLimit)?;
+        self.regions
+            .try_reserve(reserved_growth)
+            .map_err(|_| ChangeError::AllocationFailed)?;
+        self.transactions
+            .try_reserve(1)
+            .map_err(|_| ChangeError::AllocationFailed)?;
+        Ok(())
+    }
 
+    fn materialize_reservation(
+        &mut self,
+        validated: &ValidatedChange,
+        permits: Vec<WritePermit>,
+    ) -> Result<MaterializedReservation, (ChangeError, Vec<WritePermit>)> {
         let mut replacements = Vec::new();
         if replacements
             .try_reserve_exact(validated.plan.replacements.len())
             .is_err()
         {
-            return Err(fail(ChangeError::AllocationFailed, validated, permits));
+            return Err((ChangeError::AllocationFailed, permits));
         }
         let mut retiring = Vec::new();
         if retiring
             .try_reserve_exact(validated.plan.retiring.len())
             .is_err()
         {
-            return Err(fail(ChangeError::AllocationFailed, validated, permits));
+            return Err((ChangeError::AllocationFailed, permits));
         }
         let mut retiring_permits = Vec::new();
         if retiring_permits
             .try_reserve_exact(validated.snapshot.len())
             .is_err()
         {
-            return Err(fail(ChangeError::AllocationFailed, validated, permits));
+            return Err((ChangeError::AllocationFailed, permits));
         }
+
         let mut supplied = permits;
         let allocation = validated
             .plan
@@ -1137,32 +1210,11 @@ impl MemorySpace {
                 kind: template.kind,
             });
         }
-
-        let key = self.mint_change_key();
-        let lease = validated.lease.map(|(range, segments)| UserWriteLease {
-            range,
-            projection: UserWriteProjection { segments },
-        });
-        self.transactions.push(TransactionRecord {
-            key,
-            footprint: validated.plan.footprint,
-            lease: lease.as_ref().map(UserWriteLease::range),
-            stage: ChangeStage::Reserved,
-            reserved_growth: validated.growth,
-        });
-        self.reserved_growth += validated.growth;
-        Ok(PreparedChange {
-            key,
-            plan: PreparedPlan {
-                remove: validated.plan.remove,
-                replacements,
-                retiring,
-                translations: validated.plan.translations,
-                result_layout: validated.plan.result_layout,
-                retiring_permits,
-            },
+        Ok(MaterializedReservation {
+            replacements,
+            retiring,
+            retiring_permits,
             permits: supplied,
-            lease,
         })
     }
 
@@ -1248,6 +1300,27 @@ impl MemorySpace {
     pub fn complete(&mut self, retired: RetiredChange) {
         let index = self.transaction_index(retired.0.key, ChangeStage::Retired);
         self.transactions.remove(index);
+    }
+
+    /// REAPABLE 后的有界收束：无事务时每次从账本摘除一个 region，调用者据
+    /// 返回的 backing/permit 推进真实资源 Retire。顺序无契约。
+    pub fn drain_one(&mut self) -> Option<(RetiringFragment, Option<WritePermit>)> {
+        assert!(
+            self.transactions.is_empty(),
+            "memory-space regions cannot drain with live transactions"
+        );
+        let region = self.regions.pop()?;
+        let view = region.view();
+        Some((
+            RetiringFragment {
+                key: view.key,
+                allocation: view.allocation,
+                range: view.range,
+                owner: view.owner,
+                kind: view.kind,
+            },
+            region.permit,
+        ))
     }
 
     fn validate_change_range(&self, range: PageRange) -> Result<(), ChangeError> {

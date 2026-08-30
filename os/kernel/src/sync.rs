@@ -58,6 +58,9 @@ pub mod ranks {
     pub const OBJECT_WAIT: Rank = Rank(500);
     /// 进程生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入）。
     pub const LIFECYCLE: Rank = Rank(600);
+    /// Commit 后完成槽：只在 lifecycle gate 内填充一次，完成方锁外取走后
+    /// 才进入 AddressSpace 收束。
+    pub const MEMORY_COMPLETION: Rank = Rank(625);
     /// Remote Call 固定槽；Commit 可在 AddressSpace → lifecycle 内发布。
     /// 目标执行与完成回调均在锁外。
     pub const REMOTE_CALL: Rank = Rank(650);

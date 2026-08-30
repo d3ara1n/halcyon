@@ -12,9 +12,9 @@ handler 返回 Completed 后，dispatcher 再检查 lifecycle。若 syscall 期�
 
 ## 异步调用
 
-dispatcher 只登记 `WaitPlan` 到 HartLocal park 槽并返回 Wait。调度循环在当前线程离开执行点、清 active 后调用 `park_publish` 安装 `WaitContext`。
+dispatcher 把 `WaitPlan` 登记到 HartLocal park 槽并返回 Wait；调度循环在当前线程离开执行点、清 active 后调用 `park_publish` 安装 `WaitContext`。普通 WaitMany/Sleep 在安装时创建 Context；Commit 后必成的内核事务会在 Commit 前预构造不含 Thread 的 Installing Context，使 Remote completion 可安全早到并 Deferred，线程 Arc 仍只在离开执行点后移入 Context。
 
-WaitPlan、WaitContext、TimeoutRegistration、订阅清理与 rejected-park 竞态由 [`ipc.md`](ipc.md) 唯一记录。调用层只区分两种交付：WaitMany 把结果或 MemoryNotAccessible 写回保存现场，Sleep 在相对超时到达时写回成功。终止 Abandoned 不交付结果。
+WaitPlan、WaitContext、TimeoutRegistration、订阅清理与 rejected-park 竞态由 [`ipc.md`](ipc.md) 唯一记录。调用层当前有三种交付：WaitMany 写回观察结果或错误，Sleep 在相对超时到达时写回成功，内核事务 action 在业务 Complete 后写回已承诺的结果。终止 Abandoned 不交付结果；若业务结果先于 rejected park 到达，安装者仍以 Abandoned 放弃回复权，业务事务本身已经独立收束。
 
 dispatcher 的 Wait 出口不提前改为 Killed，终止竞态由等待安装路径吸收。
 
@@ -28,4 +28,4 @@ dispatcher 的 Wait 出口不提前改为 Killed，终止竞态由等待安装�
 
 Process lifecycle 的 active 位图仍是执行成员唯一真值，并以单调 execution sequence 拒绝 active 离开后恢复同值的 ABA。dispatch 在 gate 外同步 epoch、gate 内复检后才登记 active；Requeue/Park/Killed 先在锁外消费 Pending，再在 gate 内确认已达当前 epoch 后清 active。AddressSpace 稳定外壳已提供 `prepare_shootdown → commit_shootdown → ShootdownSynchronization::start`：Reserve 快照 active 并预留全部槽，Commit 以 `ADDRESS_SPACE → LIFECYCLE` 复检、发布 PTE 闭包与新 epoch，锁外才 ring；空目标集锁外直接完成。启动探针分别验证全部 admitted hart 的运输/fence/ack，以及 primordial process active snapshot 下的真实 epoch shootdown；virt debug/release 与 sifive_u 均出现完成锚点并通过 10/10 竞态矩阵。
 
-尚未接入的部分是具体 MemoryChange/HandleClose 对 `Completion` 的所有权、WaitContext park、发起线程消散、终止接管与 ack 后 Retire。它们需要统一 RegionLedger/backing 事务作为业务真值，将随 AddressSpace 调用者迁移闭合；当前基础设施不把空探针解释为公开 MemoryMap 完成语义。
+首个真实消费者是 Running `Extend`：Reserve 在 Commit 前取得 anonymous backing、planner/PTE reservation、预构造 WaitContext 与 Remote slots；Commit 同步发布 PTE/ledger/epoch 并登记 lifecycle mandatory operation；最后 ack 的 completion 推进 `PublishedChange → Synchronize → Retire → Complete`，再解除 mandatory 屏障并交付新 brk。发起线程若同时终止只放弃回复权，不撤销事务；REAPABLE 严格等待 mandatory operation 归零。HandleClose/Tunnel lease 尚未迁入该完成闭包。

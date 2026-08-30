@@ -1139,3 +1139,30 @@ fn deterministic_model_preserves_coverage_and_nonoverlap() {
         }
     }
 }
+
+#[test]
+fn drain_one_removes_exactly_one_region_without_allocation() {
+    let mut space = space();
+    commit_map(
+        &mut space,
+        anonymous_map(
+            90,
+            BASE + PAGE_SIZE,
+            2,
+            1,
+            1,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        ),
+    );
+    assert_eq!(space.region_count(), 3);
+    let allocation = region_allocation(&space);
+    for remaining in (0..3).rev() {
+        let (fragment, permit) = space.drain_one().unwrap();
+        assert_eq!(fragment.allocation, allocation);
+        assert!(permit.is_none());
+        assert_eq!(space.region_count(), remaining);
+    }
+    assert!(space.drain_one().is_none());
+}

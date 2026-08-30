@@ -32,6 +32,8 @@ pub struct WaitPlan {
     pub items: Vec<ResolvedWaitItem>,
     pub action: WaitAction,
     pub expires_at: Option<u64>,
+    /// Commit 前预构造的 context；普通对象等待由 install 阶段创建。
+    prepared: Option<Arc<WaitContext>>,
 }
 
 /// 等待完成后如何写回用户现场。
@@ -141,6 +143,7 @@ pub fn prepare(
         items,
         action: WaitAction::WaitMany { result_ptr },
         expires_at,
+        prepared: None,
     }))
 }
 
@@ -149,6 +152,7 @@ pub fn sleep_plan(expires_at: u64) -> WaitPlan {
         items: Vec::new(),
         action: WaitAction::Sleep,
         expires_at: Some(expires_at),
+        prepared: None,
     }
 }
 
@@ -157,12 +161,14 @@ pub fn sleep_plan(expires_at: u64) -> WaitPlan {
 pub enum WaitAction {
     WaitMany { result_ptr: usize },
     Sleep,
+    KernelResult { value: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum WaitOutcome {
     Object(WaitResult),
     Error(SystemCallError),
+    KernelComplete,
     Timeout,
     #[expect(dead_code, reason = "显式取消 ABI 接入后使用")]
     Cancelled,
@@ -216,22 +222,19 @@ pub struct WaitContext {
 }
 
 impl WaitContext {
-    fn new(
-        thread: Arc<Thread>,
-        action: WaitAction,
-        registration_capacity: usize,
-    ) -> Result<Arc<Self>, Arc<Thread>> {
+    fn new(action: WaitAction, registration_capacity: usize) -> Result<Arc<Self>, SystemCallError> {
         let mut registrations = Vec::new();
-        if registrations.try_reserve(registration_capacity).is_err() {
-            return Err(thread);
-        }
-        Ok(Arc::new(Self {
+        registrations
+            .try_reserve(registration_capacity)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        Arc::try_new(Self {
             core: WaitCore::new(),
-            thread: Spinlock::new(crate::sync::ranks::LEAF, Some(thread)),
+            thread: Spinlock::new(crate::sync::ranks::LEAF, None),
             registrations: Spinlock::new(crate::sync::ranks::LEAF, registrations),
             timeout_registration: TimeoutRegistration::new(),
             action,
-        }))
+        })
+        .map_err(|_| SystemCallError::OutOfMemory)
     }
 
     pub(crate) fn offer(&self, outcome: WaitOutcome) -> OfferResult {
@@ -241,6 +244,13 @@ impl WaitContext {
             self.timeout_registration.close();
         }
         result
+    }
+
+    /// 内核事务在完成其业务所有权收束后提交唯一成功结果。
+    pub(crate) fn complete_kernel(self: Arc<Self>) {
+        if self.offer(WaitOutcome::KernelComplete) == OfferResult::Complete {
+            finish_offered(self);
+        }
     }
 
     /// 在本 hart timer queue 弹出到期项后调用。只有仍发布该 token 的
@@ -348,8 +358,25 @@ impl WaitContext {
                 frame.x[10] = error.to_usize().unwrap_or(1) as u64;
                 frame.sepc += 4;
             }
+            (WaitAction::KernelResult { value }, WaitOutcome::KernelComplete) => {
+                frame.x[10] = SystemCallError::NoError as u64;
+                frame.x[11] = value as u64;
+                frame.sepc += 4;
+            }
+            (WaitAction::KernelResult { .. }, WaitOutcome::Error(error)) => {
+                frame.x[10] = error.to_usize().unwrap_or(1) as u64;
+                frame.sepc += 4;
+            }
             (_, WaitOutcome::Abandoned) => unreachable!("abandoned waits are never delivered"),
-            (WaitAction::Sleep, WaitOutcome::Object(_) | WaitOutcome::Cancelled) => {
+            (
+                WaitAction::Sleep,
+                WaitOutcome::Object(_) | WaitOutcome::Cancelled | WaitOutcome::KernelComplete,
+            )
+            | (WaitAction::WaitMany { .. }, WaitOutcome::KernelComplete)
+            | (
+                WaitAction::KernelResult { .. },
+                WaitOutcome::Object(_) | WaitOutcome::Timeout | WaitOutcome::Cancelled,
+            ) => {
                 frame.x[10] = SystemCallError::InternalError.to_usize().unwrap_or(1) as u64;
                 frame.sepc += 4;
             }
@@ -357,30 +384,50 @@ impl WaitContext {
     }
 }
 
+/// 为 Commit 后必成的内核事务预构造 Installing context。它不持线程；
+/// completion 与 park plan 各持一个强引用，线程所有权只在离开执行点后安装。
+pub fn prepare_kernel(value: usize) -> Result<(Arc<WaitContext>, WaitPlan), SystemCallError> {
+    let context = WaitContext::new(WaitAction::KernelResult { value }, 0)?;
+    let plan = WaitPlan {
+        items: Vec::new(),
+        action: WaitAction::KernelResult { value },
+        expires_at: None,
+        prepared: Some(context.clone()),
+    };
+    Ok((context, plan))
+}
+
 /// 调度循环在线程离开执行点后安装一次 WaitMany：Waiting 记录与
 /// 可取消性在 lifecycle 锁内线性化；已 Terminating 则不发布等待，
 /// 直接以 Abandoned 取消（线程不回用户态）。
-pub fn install(thread: Arc<Thread>, plan: WaitPlan) {
-    let context = match WaitContext::new(thread, plan.action, plan.items.len()) {
-        Ok(context) => context,
-        Err(thread) => {
-            deliver_install_error(thread, plan.action, SystemCallError::OutOfMemory);
-            return;
-        }
+pub fn install(thread: Arc<Thread>, mut plan: WaitPlan) {
+    let context = match plan.prepared.take() {
+        Some(context) => context,
+        None => match WaitContext::new(plan.action, plan.items.len()) {
+            Ok(context) => context,
+            Err(error) => {
+                deliver_install_error(thread, plan.action, error);
+                return;
+            }
+        },
     };
+    let previous = context.thread.lock().replace(thread);
+    assert!(
+        previous.is_none(),
+        "wait context received thread ownership twice"
+    );
     {
         let (process, tid) = context_thread_identity(&context);
         if !process.lifecycle.park_waiting(tid, &context) {
-            // clear_active 与等待发布之间若被终止，context 仍处于
-            // Installing；Abandoned 只能 Deferred，由安装者取得完成权并
-            // 执行离场确认，否则 lifecycle 会永久保留该线程成员。
-            let offered = context.offer(WaitOutcome::Abandoned);
-            debug_assert_eq!(offered, wait_context::OfferResult::Deferred);
-            let outcome = context
+            // 终止取得 park 线性化点后，业务 completion 即使已经到达也只
+            // 能代表事务完成，不能恢复已经放弃回复权的线程。安装者统一取得
+            // Installing 完成权并以 Abandoned 执行 departure confirmation。
+            let _ = context.offer(WaitOutcome::Abandoned);
+            context
                 .core
                 .finish_installing()
                 .expect("installing owner must finish rejected park");
-            context.finish(outcome);
+            context.finish(WaitOutcome::Abandoned);
             return;
         }
     }

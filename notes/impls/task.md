@@ -38,8 +38,8 @@ lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Stag
 
 ### 等待的所有权与仲裁
 
-- **强引用随容器走**：线程的 Arc 恰由其所在容器持有——就绪队列、执行点调度循环、或等待条目。等待条目强持有等待中的线程；不存在从容器反向到线程的长期指针（进程不回指线程），退出回收的 Drop 链因此能真正释放帧。lifecycle 的 Waiting 记录只持 weak WaitContext（触达取消用），在 park 发布时于 lifecycle 锁内线性化。
-- **发布时序**：「可被唤醒」严格晚于「离开一切 hart 引用」——dispatcher 只把等待意图写入 HartLocal 私有槽，调度循环在 `clear_context` 之后的 Park 分支才向全局等待结构发布。完成方永远见不到仍在本 hart 执行的线程，双容器竞态在结构上不可能。
+- **强引用随容器走**：线程的 Arc 恰由其所在容器持有——就绪队列、执行点调度循环、或等待条目。等待条目强持有等待中的线程；不存在从容器反向到线程的长期指针（进程不回指线程），退出回收的 Drop 链因此能真正释放帧。lifecycle 的 Waiting 记录只持 weak WaitContext（触达取消用），在 park 发布时于 lifecycle 锁内线性化。Commit 前预构造的内核事务 Context 不含 Thread，线程离开执行点后才移入。
+- **发布时序**：「可被唤醒」严格晚于「离开一切 hart 引用」——dispatcher 只把等待意图写入 HartLocal 私有槽，调度循环在 `clear_context` 之后的 Park 分支才安装线程所有权并发布 Waiting。预构造 Context 在此前可以接受 Deferred outcome，但不能取得完成权或触达线程，双容器竞态在结构上不可能。
 - **完成仲裁**：对象命中、Timeout、错误与终止取消竞争唯一 outcome；任务层只依赖“赢家取得线程所有权并负责离场”这一结果。WaitCore、timer token、rejected-park 竞态与订阅清理由 [`ipc.md`](ipc.md) 唯一记录。
 
 ## Job、Building process 与发布
@@ -121,30 +121,28 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   吸收后 reap 摘除）；Running 由终止待办向冻结时刻的 active 位图
   快照发 IPI（冻结后 enter_running 拒绝，位只减不增），目标在任意
   trap 入口吸收为 Killed。active 与 Running/Terminating 准入每次变化都推进
+  trap 入口吸收为 Killed。active 与 Running/Terminating 准入每次变化都推进
   execution sequence，地址空间事务 Reserve 快照 `(sequence, active)`，Commit 在
-  `ADDRESS_SPACE → LIFECYCLE` 锁序下拒绝同值 ABA；dispatch/leave 同样以本 hart
-  已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本
-  hart。ThreadSpawn/ThreadExit 调用号当前返回 FunctionNotAvailable，现有 Exit
-  是进程级终止。
+  `ADDRESS_SPACE → LIFECYCLE` 锁序下拒绝同值 ABA；已经 Commit、终止不可撤销的事务
+  同时增加 `mandatory_ops`，只有业务 Complete 后才递减。dispatch/leave 以本 hart
+  已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本 hart。
+  ThreadSpawn/ThreadExit 调用号当前返回 FunctionNotAvailable，现有 Exit 是进程级终止。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)
-  「地址空间归属纪律」）；reap 先 drop 线程强引用再做离场确认
-  （thread_departed 摘成员 → REAPABLE 持续电平）。
-  任何容器路径都只到达 REAPABLE；Dead 仅由 ProcessDrain 的 Complete
-  分支发布：HandleTable 先逐槽扫描摘项（take_next_bounded 硬预算），
-  扫描与 close callback 各计一个 work unit；预算恰在摘项后耗尽时，
-  entry 存入 Process `pending_close`，下一批优先在表锁外关闭。因此任意
-  非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 分阶段：
-  数据帧 tracker 逐个从拥有列表摘下，存入 `pending_free`，下一 work unit 通过
-  `FrameTracker::Drop` 归还外置元数据 order 树；页表 root 的 owned/shared 固定宽
-  位图是槽所有权真值，L0/L1 owned 表帧按槽状态逐项摘下，经 table adopt 收回
-  affine 所有权并走同一路径，shared 槽只验证不摘除；owned 位图归零后
-  `finish_drain` 交出 root，再由 RootFree 阶段单独归还。预算分别计费 tracker
-  出栈、页表槽检查/摘除与 extent 归还；最终位图检查只遍历 8 个机器字，单次
-  order 树操作另有只依赖地址位宽与 DT memory region 上限的结构常数界，
-  因而批次执行量受 budget 线性约束，不再有随全局碎片数增长的帧池扫描。完成
-  时发布序固定：shell 先冻结终态快照并置 CLOSED（原子清 REAPABLE，外部无
+  「地址空间归属纪律」）；reap 先 drop 线程强引用再做离场确认。REAPABLE 是
+  `members 为空 && active == 0 && building_ops == 0 && mandatory_ops == 0` 的持续电平：
+  线程全部离场但 Remote completion 尚未收束时不会提前发布。
+  任何容器路径都只到达 REAPABLE；Dead
+  仅由 ProcessDrain 的 Complete 分支发布。HandleTable 先逐槽扫描摘项
+  （take_next_bounded 硬预算），扫描与 close callback 各计一个 work unit；预算恰在
+  摘项后耗尽时，entry 存入 Process `pending_close`，下一批优先在表锁外关闭。因而
+  任意非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 先逐 fragment
+  丢弃不可达 ledger，再逐 extent 从 `OwnedBacking` 摘下并经 `pending_free` 归还
+  order 树；随后按 owned/shared 槽真值收束 L0/L1 与 root 表帧。预算分别计费
+  ledger fragment、extent 摘取/归还与页表槽检查/摘除；单次 order 树操作另有只
+  依赖地址位宽与 DT memory region 上限的结构常数界，批次执行量受 budget 线性约束。
+  完成时发布序固定：shell 先冻结终态快照并置 CLOSED（原子清 REAPABLE，外部无
   Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
   空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存
   目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
@@ -184,6 +182,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 | NOTIFICATION | 唯一以 space 为外层的对象锁边 | — |
 | OBJECT_WAIT | Job.wait、ProcessControl、Endpoint、ProcessBuilder、Process.control 回指槽 | — |
 | LIFECYCLE | 生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入） | — |
+| MEMORY_COMPLETION | Commit gate 内填充一次的 PublishedChange 槽 | — |
 | REMOTE_CALL | 固定 hart 请求槽；只在 AddressSpace/Lifecycle Commit 内短发布 | — |
 | HEAP | talc（RankedRawSpinlock 类型级注入；几乎被全部容器锁内获取，故置顶） | — |
 | POOL | 物理帧池（HEAP 与空间锁的内层） | — |
