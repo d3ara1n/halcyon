@@ -14,6 +14,7 @@ extern crate alloc;
 
 use core::{fmt, str};
 
+pub mod memory;
 pub mod topology;
 
 const FDT_MAGIC: u32 = 0xD00D_FEED;
@@ -35,6 +36,8 @@ pub enum FdtError {
     Truncated,
     /// token 序列不合法（如结构块不以 BEGIN_NODE 开头、END 后仍有内容）。
     UnexpectedToken,
+    /// memory reservation block 的偏移、终止项或区间非法。
+    InvalidReservationBlock,
     /// 字符串非法 UTF-8。
     InvalidUtf8,
 }
@@ -45,6 +48,7 @@ impl fmt::Display for FdtError {
             Self::BadMagic => write!(f, "device tree magic mismatch"),
             Self::Truncated => write!(f, "device tree data truncated"),
             Self::UnexpectedToken => write!(f, "invalid device tree token stream"),
+            Self::InvalidReservationBlock => write!(f, "invalid device tree reservation block"),
             Self::InvalidUtf8 => write!(f, "device tree string is not UTF-8"),
         }
     }
@@ -53,6 +57,12 @@ impl fmt::Display for FdtError {
 fn be32(data: &[u8], off: usize) -> Option<u32> {
     let b = data.get(off..off + 4)?;
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn be64(data: &[u8], off: usize) -> Option<u64> {
+    let hi = be32(data, off)?;
+    let lo = be32(data, off.checked_add(4)?)?;
+    Some((hi as u64) << 32 | lo as u64)
 }
 
 fn align4(n: usize) -> usize {
@@ -73,8 +83,52 @@ enum Item<'a> {
 #[derive(Debug)]
 pub struct Fdt<'a> {
     data: &'a [u8],
+    total_size: usize,
+    mem_rsvmap: core::ops::Range<usize>,
     dt_struct: core::ops::Range<usize>,
     dt_strings: core::ops::Range<usize>,
+}
+
+fn validate_reservation_block(
+    data: &[u8],
+    start: usize,
+    limit: usize,
+) -> Result<core::ops::Range<usize>, FdtError> {
+    if start < HEADER_LEN || start % 8 != 0 || start > limit {
+        return Err(FdtError::InvalidReservationBlock);
+    }
+
+    let mut pos = start;
+    loop {
+        let entry = pos;
+        let next = pos
+            .checked_add(16)
+            .filter(|end| *end <= limit)
+            .ok_or(FdtError::InvalidReservationBlock)?;
+        let address = be64(data, pos).ok_or(FdtError::InvalidReservationBlock)?;
+        let size = be64(data, pos + 8).ok_or(FdtError::InvalidReservationBlock)?;
+        pos = next;
+        if address == 0 && size == 0 {
+            return Ok(start..entry);
+        }
+        let end = address
+            .checked_add(size)
+            .filter(|_| size != 0)
+            .ok_or(FdtError::InvalidReservationBlock)?;
+
+        let mut prior = start;
+        while prior < entry {
+            let prior_address = be64(data, prior).ok_or(FdtError::InvalidReservationBlock)?;
+            let prior_size = be64(data, prior + 8).ok_or(FdtError::InvalidReservationBlock)?;
+            let prior_end = prior_address
+                .checked_add(prior_size)
+                .ok_or(FdtError::InvalidReservationBlock)?;
+            if address < prior_end && prior_address < end {
+                return Err(FdtError::InvalidReservationBlock);
+            }
+            prior += 16;
+        }
+    }
 }
 
 impl<'a> Fdt<'a> {
@@ -87,19 +141,30 @@ impl<'a> Fdt<'a> {
         if totalsize < HEADER_LEN || totalsize > data.len() {
             return Err(FdtError::Truncated);
         }
+        let data = &data[..totalsize];
         let off_struct = be32(data, 8).ok_or(FdtError::Truncated)? as usize;
         let off_strings = be32(data, 12).ok_or(FdtError::Truncated)? as usize;
+        let off_mem_rsvmap = be32(data, 16).ok_or(FdtError::Truncated)? as usize;
         let size_strings = be32(data, 32).ok_or(FdtError::Truncated)? as usize;
         let size_struct = be32(data, 36).ok_or(FdtError::Truncated)? as usize;
 
-        let dt_struct = off_struct..off_struct.checked_add(size_struct).ok_or(FdtError::Truncated)?;
-        let dt_strings = off_strings..off_strings.checked_add(size_strings).ok_or(FdtError::Truncated)?;
+        let dt_struct = off_struct
+            ..off_struct
+                .checked_add(size_struct)
+                .ok_or(FdtError::Truncated)?;
+        let dt_strings = off_strings
+            ..off_strings
+                .checked_add(size_strings)
+                .ok_or(FdtError::Truncated)?;
         if dt_struct.end > totalsize || dt_strings.end > totalsize || dt_struct.is_empty() {
             return Err(FdtError::Truncated);
         }
+        let mem_rsvmap = validate_reservation_block(data, off_mem_rsvmap, off_struct)?;
 
         let fdt = Self {
             data,
+            total_size: totalsize,
+            mem_rsvmap,
             dt_struct,
             dt_strings,
         };
@@ -130,6 +195,20 @@ impl<'a> Fdt<'a> {
         }
     }
 
+    /// 设备树 blob 的 `totalsize`。
+    pub const fn total_size(&self) -> usize {
+        self.total_size
+    }
+
+    /// FDT memory reservation block 中的全部非终止项。
+    pub fn memory_reservations(&self) -> MemoryReservations<'a> {
+        MemoryReservations {
+            data: self.data,
+            pos: self.mem_rsvmap.start,
+            end: self.mem_rsvmap.end,
+        }
+    }
+
     /// 读 `pos` 处的 token 并推进。所有偏移经 `get` 越界检查。
     fn item_at(&self, pos: &mut usize) -> Result<Item<'a>, FdtError> {
         let tok = be32(self.data, *pos).ok_or(FdtError::Truncated)?;
@@ -144,7 +223,8 @@ impl<'a> Fdt<'a> {
                 if end >= self.data.len() {
                     return Err(FdtError::Truncated);
                 }
-                let name = str::from_utf8(&self.data[start..end]).map_err(|_| FdtError::InvalidUtf8)?;
+                let name =
+                    str::from_utf8(&self.data[start..end]).map_err(|_| FdtError::InvalidUtf8)?;
                 *pos = align4(end + 1);
                 Ok(Item::BeginNode(name))
             }
@@ -205,6 +285,34 @@ impl<'a> Fdt<'a> {
             }
         }
         Ok(pos)
+    }
+}
+
+/// FDT memory reservation block 的一项。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryReservation {
+    pub address: u64,
+    pub size: u64,
+}
+
+/// 已由 [`Fdt::new`] 验证的 memory reservation 迭代器。
+pub struct MemoryReservations<'a> {
+    data: &'a [u8],
+    pos: usize,
+    end: usize,
+}
+
+impl Iterator for MemoryReservations<'_> {
+    type Item = MemoryReservation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.end {
+            return None;
+        }
+        let address = be64(self.data, self.pos)?;
+        let size = be64(self.data, self.pos + 8)?;
+        self.pos += 16;
+        Some(MemoryReservation { address, size })
     }
 }
 

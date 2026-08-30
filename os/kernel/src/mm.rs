@@ -15,11 +15,17 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use page_table::{ENTRIES, FrameMemory, FrameNumber, PAGE_BITS, Ppn, Pte, TableTree, flags};
+use page_table::{
+    ENTRIES, EagerMapper, FrameExhausted, FrameMemory, FrameNumber, PAGE_BITS, Ppn, Pte,
+    ReservedTableFrame, TableTree, Vpn, flags, pages_at,
+};
 use stack_layout::PAGE_SIZE;
 use stack_layout::StackWindowLayout;
 
-use crate::{board::BoardInfo, external};
+use crate::{
+    board::{BoardInfo, MAX_DIRECT_MAP_REGIONS, MAX_PLATFORM_RESERVATIONS, MemoryRegion},
+    external,
+};
 
 /// 内核高半区基址：VMA = PA + KERNEL_VA_BASE（与链接脚本常量一致）。
 pub const KERNEL_VA_BASE: usize = 0xFFFF_FFC0_0000_0000;
@@ -27,7 +33,7 @@ pub const KERNEL_VA_BASE: usize = 0xFFFF_FFC0_0000_0000;
 /// satp 模式：Sv39。
 const SV39: usize = 8;
 
-/// 直映射粒度：1GiB mega 项（sv39 顶层）。
+/// Sv39 顶层叶覆盖跨度。
 const GIB: usize = 1 << 30;
 
 /// 直映射 vpn2 起始槽（高半区首槽；由 KERNEL_VA_BASE 推得）。
@@ -45,12 +51,20 @@ const STACK_WINDOW_SLOT: usize = ENTRIES - 1;
 /// (0x40000 + 2×0x2000) * 8 ≈ 2.13MiB 跨两个单元，余量为扩展预留。
 const WINDOW_LEAF_MAX: usize = 4;
 
+/// 每个 `no-map` 区间的两个边界在 Sv39 下至多各需要两张下级表；末端
+/// 非 mega 对齐再保留一条路径。容量是平台 admission 契约，不从帧库存借用。
+const DIRECT_TABLE_MAX: usize = MAX_PLATFORM_RESERVATIONS * 4 + 2;
+
 /// 栈物理打包区 `[base, kernel_pa_end)`：debug 防护用，map_stack_window
 /// 发布。phys_to_virt 拒绝栈 PA——栈内存只经 sp/窗口 VA 引用，直映射
 /// 别名绕过 guard 防护（见 impls/mm.md「栈窗口」）。
 static STACK_PA_RANGE: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
 pub fn phys_to_virt(pa: usize) -> usize {
+    debug_assert!(
+        direct_map_contains(pa),
+        "phys_to_virt on a physical address excluded from the kernel direct map"
+    );
     debug_assert!(
         !in_stack_pa_range(pa),
         "phys_to_virt on kernel stack PA: stack memory must be accessed via the stack-window VA"
@@ -121,19 +135,188 @@ static WINDOW_TABLES: WindowTables = WindowTables(UnsafeCell::new(
     [[Pte::invalid(); ENTRIES]; 1 + WINDOW_LEAF_MAX],
 ));
 
+/// 直映射碎片所需的静态下级表，不入任何运行期帧库存。
+#[repr(align(4096))]
+struct DirectTables(UnsafeCell<[[Pte; ENTRIES]; DIRECT_TABLE_MAX]>);
+
+// SAFETY: boot 早期单 hart 经 EagerMapper 独占写入，此后只读。
+unsafe impl Sync for DirectTables {}
+
+static DIRECT_TABLES: DirectTables = DirectTables(UnsafeCell::new(
+    [[Pte::invalid(); ENTRIES]; DIRECT_TABLE_MAX],
+));
+static DIRECT_TABLE_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// `phys_to_virt` 的已发布定义域；count=0 表示正式页表尚未建立。
+struct DirectRanges(UnsafeCell<[MemoryRegion; MAX_DIRECT_MAP_REGIONS]>);
+
+// SAFETY: 与正式页表一起在 boot 单写发布，之后只读。
+unsafe impl Sync for DirectRanges {}
+
+static DIRECT_RANGES: DirectRanges = DirectRanges(UnsafeCell::new(
+    [MemoryRegion { start: 0, len: 0 }; MAX_DIRECT_MAP_REGIONS],
+));
+static DIRECT_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct DirectTableMemory;
+
+struct DirectReserved {
+    index: usize,
+    committed: bool,
+}
+
+impl ReservedTableFrame for DirectReserved {
+    fn number(&self) -> FrameNumber {
+        direct_table_frame(self.index)
+    }
+
+    fn commit(mut self) -> FrameNumber {
+        self.committed = true;
+        direct_table_frame(self.index)
+    }
+}
+
+impl Drop for DirectReserved {
+    fn drop(&mut self) {
+        if !self.committed {
+            DIRECT_TABLE_NEXT
+                .compare_exchange(
+                    self.index + 1,
+                    self.index,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .expect("direct table reservations must roll back in LIFO order");
+        }
+    }
+}
+
+impl FrameMemory for DirectTableMemory {
+    type ReservedFrame = DirectReserved;
+
+    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted> {
+        let index = DIRECT_TABLE_NEXT
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next < DIRECT_TABLE_MAX).then_some(next + 1)
+            })
+            .map_err(|_| FrameExhausted)?;
+        Ok(DirectReserved {
+            index,
+            committed: false,
+        })
+    }
+
+    fn free_frame(&mut self, _frame: FrameNumber) {
+        panic!("permanent direct-map tables cannot be freed")
+    }
+
+    fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES] {
+        let root = kernel_root_frame();
+        if frame == root {
+            // SAFETY: boot 早期 EagerMapper 独占 root。
+            return unsafe { &mut *KERNEL_PG_DIR.0.get() };
+        }
+        let base = direct_table_frame(0).0;
+        let index = frame
+            .0
+            .checked_sub(base)
+            .filter(|index| *index < DIRECT_TABLE_MAX)
+            .expect("direct mapper accessed a table outside its static arena");
+        // SAFETY: EagerMapper 持有唯一的 &mut DirectTableMemory，且 index 已验证。
+        unsafe { &mut (*DIRECT_TABLES.0.get())[index] }
+    }
+}
+
+fn kernel_root_frame() -> FrameNumber {
+    FrameNumber::from_addr(virt_to_phys(KERNEL_PG_DIR.0.get() as usize))
+}
+
+fn direct_table_frame(index: usize) -> FrameNumber {
+    debug_assert!(index < DIRECT_TABLE_MAX);
+    let base = DIRECT_TABLES.0.get() as usize;
+    FrameNumber::from_addr(virt_to_phys(base) + index * PAGE_SIZE)
+}
+
+fn direct_map_contains(pa: usize) -> bool {
+    let count = DIRECT_RANGE_COUNT.load(Ordering::Acquire);
+    if count == 0 {
+        return true;
+    }
+    // SAFETY: count 的 Release 发布晚于 ranges 初始化，之后数组只读。
+    let ranges = unsafe { &*DIRECT_RANGES.0.get() };
+    ranges[..count]
+        .iter()
+        .any(|range| range.start <= pa && pa < range.end())
+}
+
+/// 在物理页回投库存前撤销 cold-bootstrap transition 表中的临时叶。
+///
+/// 调用方必须位于没有 hart 使用 transition satp 的同步点；区间必须完整对应
+/// `_start` 建立的 4KiB identity/high-half 共用叶。中间表和 leaf arena 为永久
+/// entry 设施，只撤叶、不回收表。
+pub(crate) fn retire_transition_range(start_pa: usize, end_pa: usize) {
+    assert!(
+        start_pa < end_pa && start_pa % PAGE_SIZE == 0 && end_pa % PAGE_SIZE == 0,
+        "transition retirement range is not page aligned"
+    );
+    let root_pa = external::transition_root_pa();
+    // SAFETY: transition root 是页对齐的永久单页设施；调用同步点保证独占写。
+    let root =
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(root_pa) as *mut Pte, ENTRIES) };
+    for pa in (start_pa..end_pa).step_by(PAGE_SIZE) {
+        let root_index = pa >> 30;
+        assert!(
+            root_index < ENTRIES / 2,
+            "transition retirement address exceeds the identity domain"
+        );
+        let root_branch = root[root_index];
+        assert!(
+            root_branch.is_branch(),
+            "transition retirement encountered a missing middle table"
+        );
+        // SAFETY: branch 来自已验证的 transition 表，目标 middle/leaf table 永久存在；
+        // 当前同步点没有 hart 使用或改写该表。
+        let middle = unsafe {
+            core::slice::from_raw_parts_mut(
+                phys_to_virt(root_branch.next_frame().addr()) as *mut Pte,
+                ENTRIES,
+            )
+        };
+        let leaf_branch = middle[(pa >> 21) & (ENTRIES - 1)];
+        assert!(
+            leaf_branch.is_branch(),
+            "transition retirement encountered a missing leaf table"
+        );
+        let leaf = unsafe {
+            core::slice::from_raw_parts_mut(
+                phys_to_virt(leaf_branch.next_frame().addr()) as *mut Pte,
+                ENTRIES,
+            )
+        };
+        let entry = &mut leaf[(pa >> PAGE_BITS) & (ENTRIES - 1)];
+        assert!(
+            entry.is_leaf() && entry.ppn().addr() == pa,
+            "transition retirement encountered a missing page leaf"
+        );
+        *entry = Pte::invalid();
+    }
+    // SAFETY: 后续物理页发布和未来 secondary 的 record Release 都必须晚于 PTE 撤销。
+    unsafe { asm!("fence w, w", options(nostack, preserves_flags)) };
+}
+
 /// 正式内核 satp 值（init 发布、`kernel_satp()` 消费填 record；
 /// trap 汇编非 Resume 出口经 sym 符号直接装载切回）。
 pub(crate) static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 
-/// 构建并启用内核直映射：PA `[0, N GiB)` 以 1GiB mega 项映射到高半区，
-/// N 覆盖全部 DRAM 与首 GiB 内的 MMIO 窗口；随后切换 satp 并广播。
+/// 按板级 admitted ranges 构建并启用内核直映射；连续段由 eager mapper 自动
+/// 选择最大合法叶，`no-map` 保留为洞。
 ///
-/// 切换安全性：镜像/栈/跳板表都在 DRAM 槽内，切换前后 VMA 不变
-/// （跳板别名与直映射对同一物理段呈现相同 VMA），执行流无缝。
-/// 直映射 vpn2 槽位数（init 后恒定，用户表 root 拷贝用）。
+/// 切换安全性：镜像/栈/跳板表均由 admitted range 或专用栈窗口覆盖，切换前后
+/// VMA 不变（跳板别名与直映射对同一物理段呈现相同 VMA），执行流无缝。
+/// 直映射占用的顶层槽跨度（其中允许存在完整 `no-map` 空槽）。
 static DIRECT_SLOT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// 已建立的直映射顶层槽数（高半区 [256, 256+n)）。
+/// 直映射顶层槽跨度（高半区 [256, 256+n)）。
 pub fn direct_slots() -> usize {
     DIRECT_SLOT_COUNT.load(Ordering::Relaxed)
 }
@@ -145,12 +328,21 @@ pub fn install_kernel_top_level<M: FrameMemory, const LEVELS: usize>(
 ) {
     // SAFETY: 内核页表在 mm::init 后只读；进程只复制顶层 PTE 值。
     let source = unsafe { &*KERNEL_PG_DIR.0.get() };
-    let slots = direct_slots();
-    tree.attach_shared_root(
-        DIRECT_VPN2_BASE,
-        &source[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots],
-    )
-    .expect("kernel direct-map root slots must be empty");
+    let end = DIRECT_VPN2_BASE + direct_slots();
+    let mut slot = DIRECT_VPN2_BASE;
+    while slot < end {
+        while slot < end && !source[slot].is_valid() {
+            slot += 1;
+        }
+        let start = slot;
+        while slot < end && source[slot].is_valid() {
+            slot += 1;
+        }
+        if start < slot {
+            tree.attach_shared_root(start, &source[start..slot])
+                .expect("kernel direct-map root slots must be empty");
+        }
+    }
     tree.attach_shared_root(
         STACK_WINDOW_SLOT,
         &source[STACK_WINDOW_SLOT..STACK_WINDOW_SLOT + 1],
@@ -159,29 +351,55 @@ pub fn install_kernel_top_level<M: FrameMemory, const LEVELS: usize>(
 }
 
 pub fn init(board: &BoardInfo) {
-    let dram_end = board
-        .memories()
+    let direct_end = board
+        .direct_map_regions()
         .iter()
-        .map(|r| r.start + r.len)
+        .map(|range| range.end())
         .max()
-        .expect("DTB has no memory node");
-    let slots = (dram_end + GIB - 1) / GIB;
+        .expect("kernel direct map has no admitted range");
+    let slots = direct_end.div_ceil(GIB);
     assert!(
         (1..=DIRECT_VPN2_LIMIT).contains(&slots),
         "unexpected direct-map slot count: {slots}"
     );
+    let permanent_kernel = (external::awaken_pa(), external::kernel_pa_end());
+    assert!(
+        board
+            .direct_map_regions()
+            .iter()
+            .any(|range| range.start <= permanent_kernel.0 && permanent_kernel.1 <= range.end()),
+        "reserved-memory no-map overlaps the running kernel image"
+    );
+    assert_eq!(
+        DIRECT_TABLE_NEXT.load(Ordering::Relaxed),
+        0,
+        "kernel direct map initialized twice"
+    );
 
     // SAFETY: boot 早期单 hart 独占（UnsafeCell 隔离），此后只读。
     let dir: *mut [Pte; ENTRIES] = KERNEL_PG_DIR.0.get();
-    for slot in 0..slots {
-        // SAFETY: 同上，独占写静态表。
-        unsafe {
-            (*dir)[DIRECT_VPN2_BASE + slot] = Pte::leaf(Ppn(slot << 18), flags::KERNEL_DIRECT);
-        }
+    unsafe { (*dir).fill(Pte::invalid()) };
+    let root = kernel_root_frame();
+    let mut memory = DirectTableMemory;
+    let mut mapper = EagerMapper::<_, 3>::new(&mut memory, root);
+    let direct_vpn_base = DIRECT_VPN2_BASE * pages_at(2);
+    for range in board.direct_map_regions() {
+        assert!(
+            range.start % PAGE_SIZE == 0 && range.len % PAGE_SIZE == 0,
+            "kernel direct-map range is not page aligned"
+        );
+        mapper
+            .map_range(
+                Vpn(direct_vpn_base + (range.start >> PAGE_BITS)),
+                range.len >> PAGE_BITS,
+                Ppn(range.start >> PAGE_BITS),
+                flags::KERNEL_DIRECT,
+            )
+            .unwrap_or_else(|error| panic!("kernel direct-map construction failed: {error:?}"));
     }
+    drop(mapper);
 
-    let satp = (SV39 << 60) | (virt_to_phys(dir as usize) >> 12);
-
+    let satp = (SV39 << 60) | root.0;
     map_stack_window();
 
     let layout = stack_layout();
@@ -193,10 +411,16 @@ pub fn init(board: &BoardInfo) {
         Ordering::Relaxed,
     );
 
+    // SAFETY: 正式页表仍未发布，boot hart 独占写；Release count 同时发布范围内容。
+    unsafe {
+        let ranges = &mut *DIRECT_RANGES.0.get();
+        ranges[..board.direct_map_regions().len()].copy_from_slice(board.direct_map_regions());
+    }
+    DIRECT_RANGE_COUNT.store(board.direct_map_regions().len(), Ordering::Release);
     KERNEL_SATP.store(satp, Ordering::Release);
     DIRECT_SLOT_COUNT.store(slots, Ordering::Relaxed);
-    // SAFETY: satp 装载与全量 sfence 是 S 态特权指令；直映射已覆盖
-    // 当前执行流的全部后续访问（代码/数据/栈同 VMA 换底）。
+    // SAFETY: satp 装载与全量 sfence 是 S 态特权指令；当前执行流、静态数据与
+    // 栈物理区均已由 admitted direct-map range 或栈窗口覆盖。
     unsafe {
         asm!(
             "csrw  satp, {satp}",
@@ -207,8 +431,10 @@ pub fn init(board: &BoardInfo) {
 
     log!(
         MM,
-        "direct map [0, {:#x}), kernel @ {:#x}",
-        slots * GIB,
+        "direct map {} range(s) below {:#x}, {} static table(s), kernel @ {:#x}",
+        board.direct_map_regions().len(),
+        direct_end,
+        DIRECT_TABLE_NEXT.load(Ordering::Relaxed),
         KERNEL_VA_BASE
     );
 }

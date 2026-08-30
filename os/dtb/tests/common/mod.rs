@@ -1,8 +1,10 @@
 //! 测试共享：手工构造 DTB blob 的最小构建器（token 文法直出）。
+#![allow(dead_code)]
 
 pub struct BlobBuilder {
     pub struct_block: Vec<u8>,
     pub strings: Vec<u8>,
+    reservations: Vec<(u64, u64)>,
 }
 
 impl BlobBuilder {
@@ -10,6 +12,7 @@ impl BlobBuilder {
         Self {
             struct_block: Vec::new(),
             strings: Vec::new(),
+            reservations: Vec::new(),
         }
     }
 
@@ -68,25 +71,38 @@ impl BlobBuilder {
         self.prop(name, &v.to_be_bytes());
     }
 
+    pub fn reservation(&mut self, address: u64, size: u64) {
+        self.reservations.push((address, size));
+    }
+
     pub fn finish(mut self) -> Vec<u8> {
         self.push_u32(0x9); // FDT_END
 
         const HEADER: usize = 40;
-        let strings_off = HEADER + self.struct_block.len().max(8).next_power_of_two();
+        const RESERVATION_ENTRY: usize = 16;
+        let reservation_off = HEADER;
+        let struct_off = reservation_off + (self.reservations.len() + 1) * RESERVATION_ENTRY;
+        let strings_off = struct_off + self.struct_block.len().max(8).next_power_of_two();
         let totalsize = strings_off + self.strings.len();
         let mut out = Vec::with_capacity(totalsize);
         out.extend_from_slice(&0xD00D_FEEDu32.to_be_bytes());
         out.extend_from_slice(&(totalsize as u32).to_be_bytes());
-        out.extend_from_slice(&(HEADER as u32).to_be_bytes()); // off_struct
+        out.extend_from_slice(&(struct_off as u32).to_be_bytes());
         out.extend_from_slice(&(strings_off as u32).to_be_bytes());
-        out.extend_from_slice(&((HEADER + 8) as u32).to_be_bytes()); // off_mem_rsvmap（未用）
+        out.extend_from_slice(&(reservation_off as u32).to_be_bytes());
         out.extend_from_slice(&17u32.to_be_bytes()); // version
         out.extend_from_slice(&16u32.to_be_bytes()); // last_comp
         out.extend_from_slice(&0u32.to_be_bytes()); // boot_cpuid
         out.extend_from_slice(&(self.strings.len() as u32).to_be_bytes());
         out.extend_from_slice(&(self.struct_block.len() as u32).to_be_bytes());
         debug_assert_eq!(out.len(), HEADER);
-        out.resize(HEADER, 0);
+        for &(address, size) in &self.reservations {
+            out.extend_from_slice(&address.to_be_bytes());
+            out.extend_from_slice(&size.to_be_bytes());
+        }
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        debug_assert_eq!(out.len(), struct_off);
         out.extend_from_slice(&self.struct_block);
         out.resize(strings_off, 0);
         out.extend_from_slice(&self.strings);

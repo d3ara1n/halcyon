@@ -7,7 +7,7 @@
 // 跨空间常量表（布局契约见 assembly.asm `_ENTRY_CONSTS`）。
 unsafe extern "C" {
     #[link_name = "_ENTRY_CONSTS"]
-    static ENTRY_CONSTS: [usize; 13];
+    static ENTRY_CONSTS: [usize; 14];
 }
 
 /// SBI 段物理起点（帧池剔除区间用）。
@@ -60,6 +60,12 @@ pub fn stack_window_base() -> usize {
 pub fn kernel_pa_end() -> usize {
     // SAFETY: 链接期物化的只读常量。
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[10])) }
+}
+
+/// cold-bootstrap transition root 物理地址。
+pub fn transition_root_pa() -> usize {
+    // SAFETY: 链接期物化的只读常量。
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ENTRY_CONSTS[13])) }
 }
 
 /// 每 hart 栈大小。

@@ -4,9 +4,21 @@
 
 ## 物理内存
 
-物理帧是库存资源，以 affine extent 所有权表达。空闲库存不能依赖由自身供血的通用堆；启动内存先注册为不可用，再把统一 reservation 集合的补集发布为空闲。库存 claim、split、coalesce、指定区间和归还都必须具有由地址宽度与固定 arena 容量推导的结构上界，不能扫描随碎片数量增长的全局链。
+物理帧是库存资源，以 affine extent 所有权表达。平台交付的内存范围不是天然可用集合：固件与设备保留区、内核永久占用和仍被启动环境使用的区间必须先统一规范化并扣除，重叠、越界或来源矛盾应使启动失败。其余供给在任何普通分配发生前划为互不借用的系统储备与用户供给；系统储备用于内核堆、完成路径和恢复所需的固定资源，不能在压力下退化为用户池的隐式透支。
 
-库存只决定哪些帧已经从空闲集合原子取走，不在库存锁内完成与页数线性的内容初始化。claim 成功后，调用者独占 extent，先在库存锁外清零，再把“已初始化 backing”发布给页表或对象；初始化失败或事务放弃仍由该 affine 所有权自动归还。单次可清零页数受调用硬上限约束，因而库存锁持有时间与数据清零成本分别有界。
+平台保留内存不是同一种生命周期的区间集合。静态专用区永久排除普通供给；`no-map` 同时从内核标准直映射的 admitted ranges 中扣除，禁止无 owner 控制的虚拟映射与推测访问；动态保留请求必须在普通供给发布前按大小、对齐和允许范围整体放置；`reusable` 区始终属于平台 region owner，只能以可撤回 loan 暂借给可丢弃、可重建或可迁移的 backing。不能闭合动态放置或 reclaim 协议的平台描述必须明确拒绝，不能把未知语义降级为普通永久 reservation。
+
+内核直映射由规范化 admitted ranges 定义，不由固定大页清单定义。页表构造器对每段连续范围 eager 建表并自动选择硬件允许的最大叶，洞与边界才下沉到更小粒度；启动所需中间表来自与用户供给隔离的固定系统预算，预算不足是平台 admission 失败。平台名称、模拟器行为或自备 DTS 只提供输入事实，不改变该契约。
+
+用户供给中的空闲库存不能依赖由自身供血的通用堆。启动阶段尚未回投但未来属于用户供给的区间以 boot-held token 保留；运行期 claim、funded extent 与 returning extent 同样各有唯一 affine 所有者。任一时刻的物理状态集合互斥，静止点满足：
+
+```text
+user_supply = free_inventory + boot_held + funded_extents
+```
+
+事务窗口可以暂时出现 claimed-but-unfunded 与 returning 状态，但二者必须由同一 funding 事务拥有，不能同时出现在其它桶中；只有冻结新事务并排空已提交 retire 后才能作全局供给断言。root MemoryPool 的固定总额度恰等于 user supply，因而页数上不超配；系统储备、永久页和设备专用内存均不进入该额度。
+
+库存只决定哪些帧已经从空闲集合原子取走，不在库存锁内完成与页数线性的内容初始化。claim 成功后，调用者独占 extent，先在库存锁外清零，再把“已初始化 backing”发布给页表或对象；初始化失败或事务放弃仍由 affine funding 自动归还。单次可清零页数、extent 数、PTE 步数和其它不可中断工作各有独立硬上限，平台测量只用于选择常量，不替代静态工作边界。
 
 精确长度不要求物理连续。普通用户 backing 由若干 extent 组成；需要连续物理区间的页表、DMA 或其他消费者必须显式请求受 order 上限约束的连续块。extent token 不允许复制或任意构造；切割消费原 token 并返回互不重叠的剩余 token，合并只接受物理相邻且所有权语义相同的 token。失败回滚、延迟 retire 与正常归还遵守同一数量守恒。
 
@@ -20,25 +32,30 @@
 
 ## AddressSpace 深模块
 
-每个进程拥有一个 AddressSpace。它的外部 seam 只接受映射变更意图、调用 authority 与有界 drain，不向 Building 组装、Running syscall、bootstrap 或对象 lease 暴露区域容器、extent 排列、页表步骤、epoch 或 Remote Call 请求。
-
-模块内部共同拥有：
+每个进程从创建起拥有一个稳定 AddressSpace 身份，但 Building 空壳的地址空间最初可以不持有页额度、区域账本或页表。AddressSpace 以一次性状态转换表达资源附入：
 
 ```text
 AddressSpace
-├── RegionLedger       虚拟区域、权限、owner、AllocationKey 与 RegionKey
-├── Backing            OwnedExtents 或 ObjectView
-├── TranslationTree    PTE 与页表子树所有权
-├── MemoryChange       validate → reserve → commit → publish → synchronize → retire
-├── EpochState         translation/instruction epoch 与待确认义务
-└── DrainState         区域、事务与页表的可恢复收束进度
+├── Unbound
+└── Bound
+    ├── PoolBinding
+    ├── RegionLedger       虚拟区域、权限、owner、AllocationKey 与 RegionKey
+    ├── Backing            OwnedExtents 或 ObjectView
+    ├── TranslationTree    PTE 与页表子树所有权
+    ├── MemoryChange       validate → reserve → commit → publish → synchronize → retire
+    ├── EpochState         translation/instruction epoch 与待确认义务
+    └── DrainState         区域、事务与页表的可恢复收束进度
 ```
 
-Building 与 Running 只在 authority、允许的来源和生命周期阶段上不同，共用同一变更机制。bootstrap initial process 是内核持有 Building authority 的固定调用者；Tunnel 等对象以内部 lease authority 建立和撤销 view。新的映射来源或调用通道必须进入这个 seam，不能旁路建立 PTE 或另建地址占用表。
+`ProcessBindMemory` 是 Building authority 下唯一的 Unbound → Bound 操作：它消费具绑定 authority 的 MemoryPool Handle，先以 Building operation lease 冻结提交资格并 pin 源 entry，再在锁外准备不可转移的 PoolBinding 与根页表。发布时复检 lease 仍有效且 AddressSpace 仍为 Unbound；期间发生的终止截止不能撤销已经登记的资格，若目标已进入 Terminating，成功发布的 Bound 状态直接成为收束方接管的资源。Bound 发布同时把 pinned entry 标记为逻辑已消费，是唯一提交点；随后摘槽和释放 pin 只是不可失败尾段，不能向调用者恢复 Handle。提交前失败保持 Pool Handle 和空壳不变；提交后绑定不可替换、转移或重新计费。未绑定时 Map、Write、线程附入和 Start 均不成立，Handle grant 等不依赖地址空间的组装动作仍可独立完成。bootstrap 对 initial process 使用同一内部绑定语义，不形成第二种地址空间创建机制。
 
-地址空间具有独立于可变账本锁的稳定身份与 translation epoch。active-hart 成员关系的唯一真值仍属于进程执行模型；AddressSpace 通过固定内部 seam 取得发布时快照，并只拥有由该快照产生的 epoch 义务与完成确认，不维护第二份成员集合。Process 的短 execution gate 同时线性化 enter/leave、Running 事务 Commit 准入与 Running→Terminating 截止：终止先取得 gate 则未 Commit 事务回滚，Commit 先取得 gate 则终止路径接管该必成事务。短锁只保护账本、事务状态和有硬页数上限的 PTE 发布；帧清零、用户态工作和远端确认等待均不得持有地址空间 spinlock。一个地址空间只允许固定数量的变更事务在途；初始实现可以串行化修改，未来扩大固定槽数不改变外部 seam。
+AddressSpace 的外部 interface 只接受绑定、映射变更意图、调用 authority 与有界 drain，不向 Building 组装、Running syscall、bootstrap 或对象 lease 暴露区域容器、extent 排列、页表步骤、epoch 或 Remote Call 请求。Unbound drain 是空操作；Bound 地址空间的全部普通释放必须经可恢复 drain，最后析构只能验证树已清空并做常数工作，不能递归替代收束。
 
-Commit 的嵌套顺序固定为 AddressSpace commit lock 在外、Process execution gate 在内。终止路径只在 execution gate 内发布准入截止并生成接管义务，释放 gate 后才进入 AddressSpace，不能反向嵌套。MemoryObject state lock 与 AddressSpace lock 之间不嵌套：WritePermit 在对象锁内预留后以 affine token 转入 PreparedChange，rollback/retire 先从 AddressSpace 摘出 token，解锁后再回到对象推进计数。
+Building 与 Running 只在 authority、允许的来源和生命周期阶段上不同，共用 Bound 地址空间中的同一变更机制。Tunnel 等对象以内部 lease authority 建立和撤销 view。新的映射来源或调用通道必须进入这个 interface，不能旁路建立 PTE 或另建地址占用表。
+
+地址空间身份独立于可变账本锁；Bound 后拥有稳定 translation epoch。active-hart 成员关系的唯一真值仍属于进程执行模型；AddressSpace 通过固定内部 interface 取得发布时快照，并只拥有由该快照产生的 epoch 义务与完成确认，不维护第二份成员集合。Process 的短 execution gate 同时线性化 Building 组装准入、Start、enter/leave、Running 事务 Commit 与终止截止。Building operation 只可在精确 Building 状态登记，登记即冻结该操作的提交资格；Start 只能在除自身外没有组装操作在途时发布 Running，终止可以先发布截止但必须接管并等待已经登记的操作完成。Running 地址空间事务则以 Commit 为胜负点：终止先线性化时未 Commit 事务回滚，Commit 先线性化时终止路径接管该必成事务。
+
+Commit 的嵌套顺序固定为 AddressSpace commit lock 在外、Process execution gate 在内。终止路径只在 execution gate 内发布准入截止并生成接管义务，释放后才进入 AddressSpace，不能反向嵌套。MemoryPool、MemoryObject 与 AddressSpace 的状态锁之间不跨调用长期持有：额度、WritePermit 和其它 affine token 在各自 owner 锁内预留后转入 PreparedChange，rollback/retire 先从 AddressSpace 摘出 token，解锁后再回到来源对象推进计数。短锁只保护账本、状态和有硬上限的发布；帧清零、用户态工作和远端确认等待均不得持锁。
 
 ## 区域账本
 
@@ -56,21 +73,33 @@ ledger 只在 owner、区域种类、AllocationKey、backing identity/连续 off
 
 ## Backing
 
-匿名 mapping 是最常见路径，其私有 OwnedExtents 由 mapping 直接拥有，不为每次分配产生用户可见 Handle。区域切割只变换内核 affine 所有权；释放最后一段区域才释放对应 backing。需要共享或独立于某个地址空间存活的字节才使用 MemoryObject。
+匿名 mapping 是最常见路径，其私有 OwnedExtents 由 mapping 直接拥有，不为每次分配产生用户可见 Handle。区域切割消费原 affine backing，存活片段与 retiring 中段各自取得互不重叠的 extent 和同源 charge；retiring slice 在地址翻译确认前不得归还。需要共享或独立于某个地址空间存活的字节才使用 MemoryObject。
 
-MemoryObject 是固定长度的共享 backing identity，不是地址空间、虚拟区域或用户态分配器。Handle 的 `MAP` right 授权建立新 view，`READ`、`WRITE` 约束该 view 可请求的权限；mapping 建立后独立持有对象引用，关闭原 Handle 不隐式解除已有 view。同一对象可以按不同地址和更窄权限映入多个进程。
+MemoryObject 是固定长度的共享 backing identity，不是地址空间、虚拟区域或用户态分配器。Handle 的 `MAP` right 授权建立新 view，`READ`、`WRITE` 与 `EXECUTE` 分别约束 view 可请求的数据和执行权限；mapping 建立后以 ObjectView 强引用独立保活对象。对象 backing 始终唯一拥有完整 extents 与 charge，任一 view 的切割、降权或解除只变换 ObjectView 和 WritePermit，不切割或重复持有数据 backing。同一对象可以按不同地址和更窄权限映入多个进程。
 
-可由普通 Handle close 触发最终析构的 MemoryObject 必须受硬容量上限约束，长度创建后不可改变。更大的逻辑对象由用户态协议组合多个 MemoryObject；未来若需要无界对象、resize、COW、文件缓存或 pager，必须先为对象建立有界 drain 与明确的缺页协议，不能改变既有 eager mapping 的成功语义。
+可由普通 Handle close 触发最终析构的 MemoryObject 必须受硬容量上限约束，长度创建后不可改变。更大的逻辑对象由用户态协议组合多个 MemoryObject；未来若需要无界对象、resize、COW、文件缓存或 pager，必须先为对象建立有界 drain 与明确的缺页及 funding 协议，不能改变既有 eager mapping 的成功语义。
 
 ## MemoryPool 与 backing charge
 
-MemoryPool 把资源 authority 与物理库存分开：池持有固定页额度，唯一全局帧库存维护实际物理空闲 extent。分配先从池预留不可复制的 `MemoryCharge`，再从全局库存取得一个或多个初始化后的 `FrameTracker`；物理分配失败时 charge 完整回滚。backing 同时持 extents 与 charge，最终释放时 extents 回全局库存、charge 回来源池。池额度不能保证特定物理位置或连续性；连续 DMA 与设备内存由设备资源模型另行拥有。
+MemoryPool 是 page-backed storage 的 capability 账户，不是物理分区，也不代表全部内核内存。root pool 的固定总额度由可信 user supply 铸造；子池只转移额度，所有池继续从同一用户帧库存取得物理 extent。Pool Query 观察的是资源 authority 与当前占账，不承诺物理连续性、特定位置或某次请求能满足 extent 上限。连续 DMA、设备内存和未来 overcommit/pager 由各自契约拥有。
 
-子池由父池的 affine charge 支撑。池不登记其派生出的 backing；Handle、进程绑定和未归还 charge 共同保活池 core。最后一个引用消失只可能发生在全部 charge 已归还时，此时子池总额度沿受硬深度上限约束的父链返回，不需要扫描对象或地址空间，也不形成 drain 容器。关闭或转移 Pool Handle 不撤销既有 backing。
+每个 Pool core 维护固定容量的四项守恒：
 
-运行期可由用户请求放大的帧按唯一来源支付：AddressSpace 根与中间页表由目标进程绑定池支付；匿名 backing 由所在进程绑定池支付；Tunnel 与 MemoryObject 的数据 backing 由创建者绑定池支付，而每端映射所需页表仍由各自进程绑定池支付。bootstrap payload 的保留页以 primordial charge 计入 init 的 root pool，释放时首次进入全局库存并归还额度。内核静态页表、帧库存元数据、内核堆基础储备与启动过渡页属于系统基础设施，不从用户 Pool 伪造费用；可由用户放大的非帧元数据必须受现有结构上限约束，未来若开放不可信创建域则另行取得显式内核内存预算，不能回塞到 Job 计数。
+```text
+total = available + reserved + allocated + delegated
+```
 
-MemoryPool 约束消费上界，FramePool 决定实际可满足性。Pool 仍有额度但全局库存因系统储备或物理碎片无法满足时，分配以普通资源不足失败且额度回滚；不得借用其它 Pool 的额度或把失败解释为 authority。
+`ChargeReservation` 从 available 预留额度，放弃时原额回滚；物理 backing 全部取得后，reservation 不可失败地提交为与 extent 同寿命的 `MemoryCharge`，计入 allocated。`MemoryCharge` 不可复制，只能在同一 pool 内随 backing 做守恒 split/merge，最终归还 allocated。派生子池把 reservation 提交为 `ParentCredit` 并计入 delegated；普通 Handle duplicate、TRANSIT 或 GRANT 只改变同一 core 的 authority 可达性，不改变四项计数。额度不足与实际库存不足是不同失败：前者表示 quota 不足，后者表示物理或元数据资源暂不可满足。
+
+Pool 形成单向强引用图：Handle、进程绑定、MemoryCharge 与 child 的 ParentCredit 各自保活来源 core；child 只通过 ParentCredit 强持 parent，parent 不登记 child、backing、进程或地址空间。最后一个 child 引用消散时，只有其全部额度已回到 available 才沿有界深度父链自然归还；任何计数不一致都属于内核不变量失败，不能通过错误退款扩大父池。Pool 不提供 child 枚举、关闭状态、等待电平、reparent 或通用 revoke，因此普通 close 不扫描对象图。
+
+Derive 是不可撤销的资源 grant，不是可召回租借。父级在所有自然引用和 charge 消散前不能强制取回额度；MemoryObject 或 Pool capability 跨进程、跨 Job 转移也不重记来源。需要强制收回的未来场景必须从一开始使用具有显式成员、撤销准入和有界 drain 的 MemoryLease/资源域，不能改变普通 Pool 和既有 view 的单调授权语义。
+
+运行期 frame-backed 资源按唯一来源支付：AddressSpace 根与中间页表由目标进程固定绑定池支付；匿名 backing 由所在进程绑定池支付；Tunnel 与 MemoryObject 的数据 backing 由创建者绑定池支付，而每端映射所需页表仍由各自进程绑定池支付。bootstrap payload 在收编为 init backing 时取得 primordial charge，释放时首次进入用户库存并归还额度；已收编 payload 属于 funded extent，不再属于 boot-held。stale translation 确认前，frame 与 charge 都不得恢复可用。
+
+进程的 PoolBinding 只授予内部 backing 分配，不自动产生可查询、派生或运输的用户 Handle。资源管理者若需隔离预算，先派生子池，再通过 Building-only `ProcessBindMemory` 原子消费具 `GRANT` authority 的 Pool Handle；失败不消费，成功后绑定不可转移。Job 不提供默认池或第二份配额。
+
+内核堆 metadata、Handle 槽和对象壳不由页额度伪装计费。它们属于正交的 KernelMemoryBudget：长期系统中，ProcessResources 同时持页池绑定与内核内存预算绑定，用户态资源管理器按政策与 Job、CPU 预约和设备能力组合交付。该预算落地前，可信 ProcessCreate/bootstrap 从物理隔离系统储备支撑的全局 admission 中为进程附入固定内部 MetadataSponsor；Running 操作只能消费该 sponsor 的有界 permits，独立于进程存活的对象随 permit 保活 sponsor 到自身真实析构。该过渡 sponsor 不进入用户 ABI，也不能转授或扩容；它只与每容器硬上限和 Commit 后零分配共同保证失败安全，不代表 MemoryPool 提供完整 DoS 隔离。开放不可信创建域前必须以显式 KernelMemoryBudget binding 替换这一全局政策。
 
 ## Map、Unmap 与 Protect
 

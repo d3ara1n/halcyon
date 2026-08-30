@@ -1,20 +1,23 @@
-//! 物理帧库存内核适配：启动元数据 reservation、真实帧清零与 RAII 所有权。
+//! 物理帧库存内核适配：平台供给分类、启动元数据 reservation、真实帧清零与
+//! RAII 所有权。
 //!
-//! 分级库存算法位于 `os/frame_pool`。本模块在帧池建立前按全部 DT memory
-//! 计算树元数据大小，从 reservation 补集中保留连续页；随后注册完整托管范围，
-//! 只把 SBI、内核、BootPackage 与元数据以外的区间发布为空闲。
+//! 分级库存算法位于 `os/frame_pool`。本模块在帧池建立前合并平台永久排除、
+//! 内核永久占用与 boot-held 区间，再从补集中保留库存元数据；只有最终补集
+//! 发布为空闲。
 
 use frame_pool::{ArenaMetadata, ExtentGeometry, FramePool, MAX_ARENAS, metadata_bytes};
 use page_table::{FrameNumber, PAGE_BITS};
 
 use crate::{
-    board::{BoardInfo, MAX_MEMORY_REGIONS, MemoryRegion},
+    board::{BoardInfo, MAX_MEMORY_REGIONS, MAX_PLATFORM_RESERVATIONS, MemoryRegion},
     external, mm,
     sync::Spinlock,
 };
 
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
-const MAX_RESERVATIONS: usize = 3;
+const MAX_PERMANENT_RESERVATIONS: usize = MAX_PLATFORM_RESERVATIONS + 2;
+const MAX_BOOT_HOLDS: usize = 3;
+const MAX_RESERVATIONS: usize = MAX_PERMANENT_RESERVATIONS + MAX_BOOT_HOLDS + 1;
 
 /// 帧大小（字节）。堆供血等帧池消费方使用。
 pub const FRAME_SIZE: usize = PAGE_SIZE;
@@ -52,20 +55,55 @@ pub fn init(board: &BoardInfo) {
     let metadata_reserved_len =
         align_up(metadata_len, PAGE_SIZE).expect("frame metadata alignment overflow");
 
-    let mut reservations = [(0usize, 0usize); MAX_RESERVATIONS];
-    let mut reservation_count = 1usize;
-    reservations[0] = (external::sbi_start(), external::kernel_pa_end());
+    let mut permanent = [(0usize, 0usize); MAX_PERMANENT_RESERVATIONS];
+    let permanent_count = build_permanent_reservations(board, &mut permanent);
+
+    let mut boot_holds = [(0usize, 0usize); MAX_BOOT_HOLDS];
+    let mut boot_hold_count = 0usize;
+    let dtb = board.dtb_range();
+    push_reservation(&mut boot_holds, &mut boot_hold_count, dtb.start, dtb.end());
+    let bootstrap = external::bootstrap_range();
+    assert_no_overlap(
+        bootstrap,
+        &permanent[..permanent_count],
+        "bootstrap range overlaps permanent memory",
+    );
+    assert!(
+        !overlaps(bootstrap, (dtb.start, dtb.end())),
+        "bootstrap range overlaps the device tree"
+    );
+    push_reservation(
+        &mut boot_holds,
+        &mut boot_hold_count,
+        bootstrap.0,
+        bootstrap.1,
+    );
     if let Some((address, len)) = board.boot_package {
-        let end = address
-            .checked_add(len)
-            .expect("BootPackage range overflow");
-        reservations[reservation_count] = (
-            align_down(address, PAGE_SIZE),
-            align_up(end, PAGE_SIZE).expect("BootPackage alignment overflow"),
+        let package = page_cover(address, len, "BootPackage range");
+        assert_no_overlap(
+            package,
+            &permanent[..permanent_count],
+            "BootPackage range overlaps permanent memory",
         );
-        reservation_count += 1;
+        assert!(
+            !boot_holds[..boot_hold_count]
+                .iter()
+                .any(|range| overlaps(*range, package)),
+            "BootPackage range overlaps another boot-held range"
+        );
+        push_reservation(&mut boot_holds, &mut boot_hold_count, package.0, package.1);
     }
-    sort_and_validate_reservations(&mut reservations[..reservation_count]);
+    boot_hold_count = normalize_reservations(&mut boot_holds, boot_hold_count);
+
+    let mut reservations = [(0usize, 0usize); MAX_RESERVATIONS];
+    let mut reservation_count = 0usize;
+    for &(start, end) in &permanent[..permanent_count] {
+        push_reservation(&mut reservations, &mut reservation_count, start, end);
+    }
+    for &(start, end) in &boot_holds[..boot_hold_count] {
+        push_reservation(&mut reservations, &mut reservation_count, start, end);
+    }
+    reservation_count = normalize_reservations(&mut reservations, reservation_count);
 
     let metadata_pa = find_reservation(
         &memories[..memory_count],
@@ -73,9 +111,13 @@ pub fn init(board: &BoardInfo) {
         metadata_reserved_len,
     )
     .expect("no contiguous memory for frame metadata");
-    reservations[reservation_count] = (metadata_pa, metadata_pa + metadata_reserved_len);
-    reservation_count += 1;
-    sort_and_validate_reservations(&mut reservations[..reservation_count]);
+    push_reservation(
+        &mut reservations,
+        &mut reservation_count,
+        metadata_pa,
+        metadata_pa + metadata_reserved_len,
+    );
+    reservation_count = normalize_reservations(&mut reservations, reservation_count);
 
     // SAFETY: metadata reservation 已从即将发布的空闲补集中剔除；直映射覆盖全部
     // DT memory。两个不重叠切片随全局 FramePool 存活，没有其它可变引用。
@@ -116,13 +158,27 @@ pub fn init(board: &BoardInfo) {
     );
 
     let free = pool.free_frames();
+    let permanent_frames = covered_frames(&memories[..memory_count], &permanent[..permanent_count]);
+    let boot_held_frames = boot_held_frames(
+        &memories[..memory_count],
+        board,
+        &permanent[..permanent_count],
+    );
+    let metadata_frames = metadata_reserved_len / PAGE_SIZE;
+    assert_eq!(
+        total_frames,
+        permanent_frames + boot_held_frames + metadata_frames + free,
+        "physical supply classification does not close"
+    );
     log!(
         Frame,
-        "{} arena(s), {} frame(s) metadata, {} frame(s) free ({:#x} bytes)",
+        "{} arena(s), total {} frame(s): permanent {}, boot-held {}, metadata {}, free {}",
         pool.arena_count(),
-        metadata_reserved_len / PAGE_SIZE,
-        free,
-        free * PAGE_SIZE
+        total_frames,
+        permanent_frames,
+        boot_held_frames,
+        metadata_frames,
+        free
     );
     *POOL.lock() = Some(pool);
 }
@@ -149,21 +205,132 @@ fn validate_memories(memories: &[MemoryRegion]) {
     }
 }
 
-fn sort_and_validate_reservations(reservations: &mut [(usize, usize)]) {
-    reservations.sort_unstable_by_key(|range| range.0);
-    for index in 0..reservations.len() {
-        let (start, end) = reservations[index];
+fn push_reservation<const N: usize>(
+    reservations: &mut [(usize, usize); N],
+    count: &mut usize,
+    start: usize,
+    end: usize,
+) {
+    assert!(
+        start < end && start % PAGE_SIZE == 0 && end % PAGE_SIZE == 0,
+        "boot reservation is not page aligned"
+    );
+    let slot = reservations
+        .get_mut(*count)
+        .expect("boot reservation count exceeds fixed capacity");
+    *slot = (start, end);
+    *count += 1;
+}
+
+fn normalize_reservations<const N: usize>(
+    reservations: &mut [(usize, usize); N],
+    count: usize,
+) -> usize {
+    reservations[..count].sort_unstable_by_key(|range| range.0);
+    let mut output = 0usize;
+    for input in 0..count {
+        let range = reservations[input];
         assert!(
-            start < end && start % PAGE_SIZE == 0 && end % PAGE_SIZE == 0,
+            range.0 < range.1 && range.0 % PAGE_SIZE == 0 && range.1 % PAGE_SIZE == 0,
             "boot reservation is not page aligned"
         );
-        if index > 0 {
-            assert!(
-                reservations[index - 1].1 <= start,
-                "boot reservations overlap"
-            );
+        if output > 0 && range.0 <= reservations[output - 1].1 {
+            reservations[output - 1].1 = reservations[output - 1].1.max(range.1);
+        } else {
+            reservations[output] = range;
+            output += 1;
         }
     }
+    output
+}
+
+fn build_permanent_reservations(
+    board: &BoardInfo,
+    output: &mut [(usize, usize); MAX_PERMANENT_RESERVATIONS],
+) -> usize {
+    let mut count = 0usize;
+    for region in board.platform_reservations() {
+        push_reservation(output, &mut count, region.start, region.end());
+    }
+
+    let (bootstrap_start, bootstrap_end) = external::bootstrap_range();
+    let kernel_start = external::sbi_start();
+    let kernel_end = external::kernel_pa_end();
+    assert!(
+        kernel_start <= bootstrap_start
+            && bootstrap_start < bootstrap_end
+            && bootstrap_end <= kernel_end,
+        "bootstrap range lies outside kernel physical image"
+    );
+    if kernel_start < bootstrap_start {
+        push_reservation(output, &mut count, kernel_start, bootstrap_start);
+    }
+    if bootstrap_end < kernel_end {
+        push_reservation(output, &mut count, bootstrap_end, kernel_end);
+    }
+    normalize_reservations(output, count)
+}
+
+fn overlaps(left: (usize, usize), right: (usize, usize)) -> bool {
+    left.0 < right.1 && right.0 < left.1
+}
+
+fn assert_no_overlap(range: (usize, usize), reservations: &[(usize, usize)], message: &str) {
+    assert!(
+        !reservations
+            .iter()
+            .any(|reservation| overlaps(*reservation, range)),
+        "{message}"
+    );
+}
+
+fn page_cover(start: usize, len: usize, label: &str) -> (usize, usize) {
+    let end = start
+        .checked_add(len)
+        .unwrap_or_else(|| panic!("{label} overflows"));
+    (
+        align_down(start, PAGE_SIZE),
+        align_up(end, PAGE_SIZE).unwrap_or_else(|| panic!("{label} alignment overflows")),
+    )
+}
+
+fn covered_frames(memories: &[MemoryRegion], ranges: &[(usize, usize)]) -> usize {
+    memories
+        .iter()
+        .map(|memory| {
+            ranges
+                .iter()
+                .map(|&(start, end)| {
+                    end.min(memory.end())
+                        .saturating_sub(start.max(memory.start))
+                        / PAGE_SIZE
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+fn boot_held_frames(
+    memories: &[MemoryRegion],
+    board: &BoardInfo,
+    permanent: &[(usize, usize)],
+) -> usize {
+    let dtb = board.dtb_range();
+    let mut frames = 0usize;
+    subtract(dtb.start, dtb.end(), permanent, |start, end| {
+        frames += (end - start) / PAGE_SIZE;
+    });
+    let bootstrap = external::bootstrap_range();
+    frames += (bootstrap.1 - bootstrap.0) / PAGE_SIZE;
+    if let Some((address, len)) = board.boot_package {
+        let package = page_cover(address, len, "BootPackage range");
+        frames += (package.1 - package.0) / PAGE_SIZE;
+    }
+    assert!(
+        frames <= memories.iter().map(|memory| memory.len / PAGE_SIZE).sum(),
+        "boot-held frame count exceeds managed supply"
+    );
+    frames
 }
 
 fn find_reservation(
@@ -266,6 +433,24 @@ pub fn free_range(start_pa: usize, end_pa: usize) {
         )
         .expect("released boot range is not wholly reserved");
     });
+}
+
+/// DTB 消费完成后，先撤销 transition 临时叶，再回投未被永久 reservation
+/// 覆盖的 boot-held 片段。
+pub fn release_device_tree(board: &BoardInfo) {
+    let mut permanent = [(0usize, 0usize); MAX_PERMANENT_RESERVATIONS];
+    let permanent_count = build_permanent_reservations(board, &mut permanent);
+    let dtb = board.dtb_range();
+    subtract(
+        dtb.start,
+        dtb.end(),
+        &permanent[..permanent_count],
+        |start, end| {
+            mm::retire_transition_range(start, end);
+            free_range(start, end);
+            log!(Memory, "device tree reclaim [{:#x}, {:#x})", start, end);
+        },
+    );
 }
 
 /// 帧库存剩余空闲帧数。

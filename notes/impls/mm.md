@@ -112,7 +112,7 @@ pub fn phys_to_virt(pa: usize) -> usize { pa + KERNEL_VA_BASE }
 pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 ```
 
-直映射范围 `[0, max(DRAM 末, MMIO 窗口末))`，按 1GiB mega 项映射（virt 平台 MMIO 0x10000000 起，被首项覆盖）。当前内核虚拟空间只有直映射区与栈窗口两个分区。
+直映射的物理定义域由 `BoardInfo::direct_map_regions()` 给出：当前板级政策取 `[0, max(DRAM 末))`，再扣除 Devicetree 静态 `/reserved-memory/no-map` 区间，因此仍覆盖首段 MMIO，但允许任意页对齐洞。`page_table::EagerMapper` 对每个 admitted range 自动选取 1GiB、2MiB 或 4KiB 中最大的合法叶；中间表来自 `mm.rs` 的固定静态 arena（上限按平台 reservation 容量推导），不进入 FramePool、系统堆或用户供给。`phys_to_virt` 在 debug 构建同时检查地址属于已发布直映射定义域。当前内核虚拟空间仍只有直映射区与栈窗口两个分区。
 
 ### 栈窗口
 
@@ -121,24 +121,24 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 - **布局真值链**：`os/stack_layout` 纯逻辑 crate 是几何唯一真值（构造期整体校验，host 可测）；数字只写在链接脚本（`STACK_SIZE`/`STACK_GUARD`/`EMERGENCY_SIZE`/`HART_NUM_LIMIT`/窗口基址）→ 汇编 `_ENTRY_CONSTS` 物化 → 内核 `mm::stack_layout()` 构造消费；audit_elf.py 从 ELF 符号表读 `STACK_GUARD` 构建期强制「单函数最大帧 ≤ guard 洞跨度」——否则一次 sp 下调整体越过洞落入邻槽，即时可见失效。
 - **布局**：每槽 `[槽底 guard | formal (stack_size − emergency) | emergency guard | emergency]`，步长 `stack_size + 2×guard`。formal sp 从 emergency guard 洞下方起；emergency 占槽顶、fatal 路径专用，独立 guard 使其溢出不再踩入 formal。物理侧按槽连续打包 `stack_size` 字节（formal+emergency 相邻），guard 纯虚拟不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**；该禁律由 debug 断言兜底（`phys_to_virt` 拒绝栈物理打包区，release 构建无检查）。qemu/virt 每槽物理量为 `0x40000`；sifive_u 为 `0xA000`（`0x9000` formal + `0x1000` emergency），覆盖 debug `memmove` 与事务调用链约 `0x58c0` 的组合实测峰值，同时保留两个当前最大 `0x1620` 帧以上余量。
 - **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）按 `layout.mappings` 逐页映射（RW、不可执行——`flags::KERNEL_STACK` 无 X）、guard 洞置 invalid；所有 hart 与全部用户表共享同一子树。
-- **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + `layout.translate` 互逆）；同一物理页有两个内核 VA，PA→VA 无唯一逆——`phys_to_virt` 恒给直映射别名。SBI ecall 传 PA 前必须经它（console 缓冲在栈上即依赖此）。
+- **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + `layout.translate` 互逆）；`phys_to_virt` 只对 admitted direct-map range 成立，并在 debug 构建拒绝 `no-map`、范围外地址和栈物理打包区。同一栈物理页同时有直映射别名与窗口 VA，PA→VA 无唯一逆；SBI ecall 传 PA 前仍须经 `virt_to_phys`（console 缓冲在栈上即依赖此）。
 - **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；正常 ProcessDrain 在有界 Root 阶段逐槽剥离共享顶层项后才归还 root，`AddressSpace::drop` 只作未完成构造/回滚的防御兜底。
-- **边界**：bootstrap 过渡环境的栈在过渡表的 mega 映射里，不受此防护管辖——bootstrap 期栈溢出不可观测，接受为已知边界（窗口短，audit_elf 兑底大帧）。
+- **bootstrap 边界**：cold-bootstrap 使用链接脚本固定的 32KiB 临时栈；它没有 formal/emergency 双窗口与独立 guard，但过渡表只按 4KiB 映射启动实际需要的内核镜像与 DTB 页，不再用 1GiB 叶掩盖栈越界或 `no-map`。全员 Online 后先撤销 bootstrap 临时叶再整体回投该区，单函数帧仍受同一 ELF audit 上限约束。
 
 ### 启动：PA 执行 → 高半区
 
-QEMU 以 raw binary 引导（`-kernel` 加载 ELF 会按 VMA 估算内核末端，高半区 VMA 直接溢出 DRAM；raw bin 由 `riscv64-elf-objcopy -O binary` 按 LMA 生成，ELF 仅供 gdb/符号），`_start` 在 **bare satp、PC=PA** 下执行：
+QEMU 以 raw binary 引导（`-kernel` 加载 ELF 会按 VMA 估算内核末端，高半区 VMA 直接溢出 DRAM；raw bin 由 `riscv64-elf-objcopy -O binary` 按 LMA 生成，ELF 仅供 gdb/符号），并通过 `-dtb` 交付仓库自备 DTS；`-m` 必须与该 DTS 的 `/memory` 容量一致，否则 firmware 会按另一物理上界重定位运行时 DTB，破坏 boot-held RAM 契约。`_start` 在 **bare satp、PC=PA** 下执行：
 
 1. `_start` 及开 MMU 前的全部代码与位置无关纪律：`la` 取到的是 VMA，访问 PA 需减链接期常量 `_va_pa_delta`（镜像 VMA 基 - LMA 基）；
-2. cold-bootstrap 临时 root 表覆盖当前 PA 与同一物理段的高半区别名；
+2. cold-bootstrap 清零永久 transition root/middle/leaf arena，以 4KiB 叶精确建立内核物理镜像和 DTB 实际页面的 identity/高半区别名；leaf 数量由链接期内核跨度断言和 2MiB DTB 上限共同约束；
 3. 写入临时 satp、`sfence.vma` 后跳到高半区；
-4. 高半区继续段构建正式内核页表（直映射区全量），写正式 satp并再次 `sfence.vma`，此后内核恒在高半区执行。
+4. 高半区继续段把板级 admitted ranges 交给 eager mapper 构建正式内核页表，写正式 satp 并再次 `sfence.vma`，此后内核恒在高半区执行。
 
-**地址纪律**：raw 引导无 ELF 加载器清 bss，各空间 bss 由对应入口汇编清零；SBI ecall 的地址参数（DBCN base_addr、HSM start_addr）一律传 PA，内核指针必须先 `virt_to_phys`；正式内核表无低半区 identity 映射，切表后一切 PA 访问必须经 `phys_to_virt`。裸 PA 直访只存在于 bootstrap 与永久 secondary PA 前导。
+**地址纪律**：raw 引导无 ELF 加载器清 bss，各空间 bss 由对应入口汇编清零；SBI ecall 的地址参数（DBCN base_addr、HSM start_addr）一律传 PA，内核指针必须先 `virt_to_phys`；正式内核表无低半区 identity 映射，切表后一切受准入 PA 访问必须经 `phys_to_virt`，`no-map` 区只能由未来明确 owner 的专用映射机制访问。裸 PA 直访只存在于 bootstrap 与永久 secondary PA 前导。
 
 ### secondary hart
 
-HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按“过渡 satp→`sfence.vma`→高半区→正式 satp→`sfence.vma`”进入 formal entry。它不复用可回收的 cold-bootstrap 环境。完整生命周期见 [`execution-context.md`](execution-context.md)。
+HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 transition 表，按“过渡 satp→`sfence.vma`→高半区→正式 satp→`sfence.vma`”进入 formal entry。DTB 消费后、bootstrap 全员 Online 后分别先撤销相应临时叶再回投物理页；此后 transition 表只覆盖永久 entry 设施与正式内核页，不留宽 DRAM 映射或已回投页别名。完整生命周期见 [`execution-context.md`](execution-context.md)。
 
 ### trap
 

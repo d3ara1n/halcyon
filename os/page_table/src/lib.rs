@@ -289,6 +289,157 @@ impl<F: ReservedTableFrame> PreparedTranslation<F> {
 }
 
 // ---------------------------------------------------------------------------
+// 未发布树的 eager builder
+// ---------------------------------------------------------------------------
+
+/// 为尚未发布的页表树建立 eager range mapping。
+///
+/// 每段映射先完成范围与冲突验证，再自动选择尽可能大的叶级发布。中间表由
+/// [`FrameMemory`] 提供，因此调用方可以使用固定静态预算而不依赖堆。若表帧在发布
+/// 中耗尽，树可能已部分构造；该树仍未发布，调用方必须丢弃或终止启动。
+pub struct EagerMapper<'a, M: FrameMemory, const LEVELS: usize> {
+    mem: &'a mut M,
+    root: FrameNumber,
+}
+
+impl<'a, M: FrameMemory, const LEVELS: usize> EagerMapper<'a, M, LEVELS> {
+    pub fn new(mem: &'a mut M, root: FrameNumber) -> Self {
+        assert!(
+            LEVELS >= 2 && LEVELS <= 5,
+            "only sv39..sv57 supported (LEVELS 2..5)"
+        );
+        assert!(root.0 < MAX_PPN, "root frame exceeds PTE encoding");
+        Self { mem, root }
+    }
+
+    /// 建立物理连续的 eager mapping；`vpn` 与 `ppn` 均以 4 KiB 页计。
+    pub fn map_range(
+        &mut self,
+        vpn: Vpn,
+        count: usize,
+        ppn: Ppn,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        if !valid_leaf_flags(flags) {
+            return Err(MapError::InvalidFlags);
+        }
+        let end = vpn.0.checked_add(count).ok_or(MapError::OutOfRange)?;
+        if end > max_vpn(LEVELS) {
+            return Err(MapError::OutOfRange);
+        }
+        let ppn_end = ppn.0.checked_add(count).ok_or(MapError::OutOfRange)?;
+        if ppn_end > MAX_PPN {
+            return Err(MapError::OutOfRange);
+        }
+
+        let mut vpn_cur = vpn.0;
+        let mut ppn_cur = ppn.0;
+        while vpn_cur < end {
+            let level = largest_segment_level::<LEVELS>(vpn_cur, ppn_cur, end);
+            self.validate_segment(Vpn(vpn_cur), level, Ppn(ppn_cur), flags)?;
+            let pages = pages_at(level);
+            vpn_cur += pages;
+            ppn_cur += pages;
+        }
+
+        vpn_cur = vpn.0;
+        ppn_cur = ppn.0;
+        while vpn_cur < end {
+            let level = largest_segment_level::<LEVELS>(vpn_cur, ppn_cur, end);
+            self.publish_segment(Vpn(vpn_cur), level, Ppn(ppn_cur), flags)?;
+            let pages = pages_at(level);
+            vpn_cur += pages;
+            ppn_cur += pages;
+        }
+        Ok(())
+    }
+
+    fn validate_segment(
+        &mut self,
+        vpn: Vpn,
+        segment_level: usize,
+        ppn: Ppn,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        let mut frame = self.root;
+        let mut level = LEVELS - 1;
+        loop {
+            let entry = self.mem.table_mut(frame)[vpn.index_at(level)];
+            if level == segment_level {
+                return if !entry.is_valid() || self.leaf_matches(entry, ppn, flags) {
+                    Ok(())
+                } else {
+                    Err(MapError::Conflict { vpn })
+                };
+            }
+            if entry.is_branch() {
+                frame = entry.next_frame();
+                level -= 1;
+                continue;
+            }
+            if entry.is_leaf() && !self.leaf_matches_at(entry, level, vpn, ppn, flags) {
+                return Err(MapError::Conflict { vpn });
+            }
+            return Ok(());
+        }
+    }
+
+    fn publish_segment(
+        &mut self,
+        vpn: Vpn,
+        segment_level: usize,
+        ppn: Ppn,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        let mut frame = self.root;
+        let mut level = LEVELS - 1;
+        loop {
+            let index = vpn.index_at(level);
+            let entry = self.mem.table_mut(frame)[index];
+            if level == segment_level {
+                debug_assert!(!entry.is_valid() || self.leaf_matches(entry, ppn, flags));
+                self.mem.table_mut(frame)[index] = Pte::leaf(ppn, flags);
+                return Ok(());
+            }
+            if entry.is_branch() {
+                frame = entry.next_frame();
+                level -= 1;
+                continue;
+            }
+            if entry.is_leaf() {
+                debug_assert!(self.leaf_matches_at(entry, level, vpn, ppn, flags));
+                return Ok(());
+            }
+            let child = self.allocate_table()?;
+            self.mem.table_mut(frame)[index] = Pte::branch(child);
+            frame = child;
+            level -= 1;
+        }
+    }
+
+    fn allocate_table(&mut self) -> Result<FrameNumber, MapError> {
+        let reserved = self.mem.reserve_frame()?;
+        let frame = reserved.number();
+        assert!(
+            frame.0 < MAX_PPN,
+            "reserved table frame exceeds PTE encoding"
+        );
+        self.mem.table_mut(frame).fill(Pte::invalid());
+        Ok(reserved.commit())
+    }
+
+    fn leaf_matches(&self, entry: Pte, ppn: Ppn, flags: u64) -> bool {
+        entry.is_leaf() && entry.ppn() == ppn && entry.flags() == flags
+    }
+
+    fn leaf_matches_at(&self, entry: Pte, level: usize, vpn: Vpn, ppn: Ppn, flags: u64) -> bool {
+        entry.is_leaf()
+            && entry.flags() == flags
+            && entry.ppn().0 + vpn.0 % pages_at(level) == ppn.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TableTree
 // ---------------------------------------------------------------------------
 

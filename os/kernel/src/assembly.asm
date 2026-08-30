@@ -19,43 +19,133 @@
 .section .text.init
 .global _start
 # cold boot 入口：OpenSBI 跳到加载地址起点。a0 = boot hartid，a1 = dtb PA；
-# bare satp，PC = PA。职责：清零并填写共享过渡页表（DRAM 槽 identity +
-# 高半区别名），开 MMU，跳高半区 bootstrap 续段。a0/a1 原样带过。
+# bare satp，PC = PA。职责：建立只覆盖内核镜像与实际 DTB 页的共享过渡表，
+# 同时提供 identity 与高半区别名，开 MMU 后跳高半区。a0/a1 原样带过。
 _start:
     la      sp, __bootstrap_stack_top       # bootstrap 临时栈
     la      t0, __transition_root_pa
-    li      t1, 4096
-    add     t1, t0, t1
+    la      t1, __transition_leaf_end
     mv      t2, t0
-1:  sd      zero, 0(t2)                     # 清零过渡 root 一页
+0:  sd      zero, 0(t2)                     # 清零 root + middle + leaf arena
     addi    t2, t2, 8
-    bltu    t2, t1, 1b
-    la      t3, _BOOT_CONSTS
-    ld      t4, 8(t3)                       # DRAM 槽 vpn2 槽号
-    ld      t5, 16(t3)                      # _start_high 的 VMA 字面量
-    slli    t6, t4, 3
-    add     t6, t0, t6
-    ld      t3, 0(t3)                       # (DRAM 槽 PA>>2)|V|R|W|X|G|A|D
-    sd      t3, 0(t6)                       # identity（切换后旧 PC 有效）
-    addi    t6, t4, 256
-    slli    t6, t6, 3
-    add     t6, t0, t6
-    sd      t3, 0(t6)                       # 高半区别名（同一物理段）
+    bltu    t2, t1, 0b
+
+    # middle/leaf arena 由映射 helper 单调消费；每个物理 vpn2 槽同时建立
+    # identity 与高半区别名。
+    la      a4, __transition_middle_base
+    la      a3, __transition_leaf_base
+    la      t3, _start
+    li      t0, -4096
+    and     t3, t3, t0
+    la      t0, _BOOT_CONSTS
+    ld      a2, 8(t0)                       # __kernel_pa_end（已页对齐）
+1:  bgeu    t3, a2, 2f
+    call    _transition_map_page
+    li      t0, 4096
+    add     t3, t3, t0
+    j       1b
+
+    # DTB totalsize 是大端 u32；bare 模式可直接读 header，再精确映射其页面。
+2:  lbu     t0, 4(a1)
+    slli    t0, t0, 24
+    lbu     t1, 5(a1)
+    slli    t1, t1, 16
+    or      t0, t0, t1
+    lbu     t1, 6(a1)
+    slli    t1, t1, 8
+    or      t0, t0, t1
+    lbu     t1, 7(a1)
+    or      t0, t0, t1                     # t0 = totalsize
+    li      t1, 40
+    bltu    t0, t1, _transition_fail
+    li      t1, 0x200000                    # transition DTB 映射上限 2MiB
+    bltu    t1, t0, _transition_fail
+    add     a2, a1, t0
+    bltu    a2, a1, _transition_fail
+    li      t1, 4095
+    add     a2, a2, t1
+    bltu    a2, t1, _transition_fail
+    li      t1, -4096
+    and     a2, a2, t1
+    and     t3, a1, t1
+3:  bgeu    t3, a2, 4f
+    call    _transition_map_page
+    li      t0, 4096
+    add     t3, t3, t0
+    j       3b
+
+4:  la      t0, __transition_root_pa
     srli    t0, t0, 12                      # satp.ppn
     li      t1, 8 << 60                     # Sv39
     or      t0, t0, t1
     csrw    satp, t0
     sfence.vma                              # 过渡翻译同步
+    la      t0, _BOOT_CONSTS
+    ld      t5, 0(t0)                       # _start_high VMA
     jr      t5                              # → 高半区 _start_high
+
+# 映射一个 4KiB 物理页到共享 identity/high-half 子树。
+# 输入：t3 = page PA，a4/a3 = 下一张空闲 middle/leaf table；输出：arena 指针单调推进。
+_transition_map_page:
+    srli    t0, t3, 30                      # 物理 vpn2 槽
+    li      t1, 256
+    bgeu    t0, t1, _transition_fail        # identity/high-half root 槽必须结构性互斥
+    slli    t1, t0, 3
+    la      t2, __transition_root_pa
+    add     t1, t2, t1                     # identity root PTE 地址
+    ld      t4, 0(t1)
+    andi    t5, t4, 1
+    bnez    t5, 5f
+    la      t5, __transition_middle_end
+    bgeu    a4, t5, _transition_fail
+    srli    t4, a4, 2
+    ori     t4, t4, 1                       # 新 middle table branch PTE
+    sd      t4, 0(t1)
+    addi    t0, t0, 256
+    slli    t0, t0, 3
+    add     t0, t2, t0
+    sd      t4, 0(t0)                       # 高半区别名共享同一 middle table
+    li      t5, 4096
+    add     a4, a4, t5
+5:  srli    t4, t4, 10
+    slli    t4, t4, 12                      # root branch → middle table PA
+
+    srli    t0, t3, 21
+    andi    t0, t0, 0x1ff
+    slli    t0, t0, 3
+    add     t1, t4, t0                     # middle PTE 地址
+    ld      t2, 0(t1)
+    andi    t5, t2, 1
+    bnez    t5, 6f
+    la      t5, __transition_leaf_end
+    bgeu    a3, t5, _transition_fail
+    srli    t2, a3, 2
+    ori     t2, t2, 1                       # 新 leaf table branch PTE
+    sd      t2, 0(t1)
+    li      t5, 4096
+    add     a3, a3, t5
+6:  srli    t2, t2, 10
+    slli    t2, t2, 12                      # middle branch → leaf table PA
+    srli    t0, t3, 12
+    andi    t0, t0, 0x1ff
+    slli    t0, t0, 3
+    add     t2, t2, t0
+    srli    t0, t3, 2
+    ori     t0, t0, 0xef                    # level-0 RWX global leaf
+    sd      t0, 0(t2)
+    ret
+
+_transition_fail:
+    wfi
+    j       _transition_fail
 
 # 低段跨空间字面量：入口代码经此间接取高半区地址与 ABS 常量
 #（R_RISCV_64 无范围限制）。
 .section .data.init
 .global _BOOT_CONSTS
 _BOOT_CONSTS:
-    .quad _trampoline_pte       # [0] (DRAM 槽 PA >> 2) | 0xEF
-    .quad _trampoline_slot      # [1] DRAM 槽 vpn2 槽号
-    .quad _start_high           # [2] boot 高半区续段 VMA
+    .quad _start_high           # [0] boot 高半区续段 VMA
+    .quad __kernel_pa_end       # [1] 内核物理末端
 
 # 高半区跨空间字面量表：高地址代码（Rust）经 PCREL 读内存取值，
 # 杜绝对低段符号与 ABS 常量的跨空间寻址（.quad 绝对重定位无范围限制）。
@@ -75,6 +165,7 @@ _ENTRY_CONSTS:
     .quad __kernel_pa_end       # [10] 内核静态占用物理末端
     .quad STACK_GUARD           # [11] guard 洞跨度（≥ 审计最大单帧）
     .quad EMERGENCY_SIZE        # [12] emergency 栈大小（占槽顶）
+    .quad __transition_root_pa  # [13] transition root PA
 
 .section .text.entry
 .global _pa_fatal
@@ -92,11 +183,11 @@ _ENTRY_PA_CONSTS:
 .section .text.entry
 .global _awaken
 # HSM secondary PA 前导（永久设施）：a0 = hartid，a1 = opaque = record PA。
-# Acquire 消费 record → 切过渡 satp（只读）→ 跳高半区。
+# Acquire 消费 record → 切过渡 satp → 跳高半区。
 #
-# 并发纪律：多个 secondary 会同时在此执行，但过渡表由 cold boot 独占
-# 建成并在此后保持只读；任何 secondary 都不得清零或改写。可见性由
-# record 的 Release/Acquire 保证。
+# 并发纪律：cold boot 建表后，在 secondary 可能进入的阶段不改写 transition 表；
+# 全员 Online 的同步点只撤销 cold-bootstrap 临时叶，此后永久保持不变。DTB 叶在
+# 启动 secondary 前撤销。可见性由 PTE 写屏障及 record 的 Release/Acquire 保证。
 _awaken:
     la      t0, _pa_fatal
     csrw    stvec, t0

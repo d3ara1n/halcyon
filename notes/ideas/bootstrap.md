@@ -21,15 +21,17 @@ BootPackage envelope 是 eRhino boot ABI，只描述自身总长、initial ELF �
 
 内核启动路径只执行：
 
-1. 验证 BootPackage envelope；
-2. 解析并装载唯一的 initial ELF；
-3. 创建 root Job 与平台 primordial capabilities；
-4. 构造 init 的 StartupBlock；
-5. 首次发布 init runnable。
+1. 规范化平台物理供给，扣除永久保留与系统储备，并把 BootPackage 等仍在使用但将归入用户供给的页登记为 boot-held；
+2. 验证 BootPackage envelope，建立唯一 root MemoryPool 账户和初始 metadata admission；
+3. 创建 root Job 与 init 的 Building 空壳；
+4. 以普通 `ProcessBindMemory` 的内部同构语义把 init 绑定到 root pool；
+5. 解析并装载唯一的 initial ELF，构造 StartupBlock，收编 payload backing，并把不再使用的 BootPackage 页回投用户库存；
+6. 安装 root pool、root Job 与平台 primordial capabilities，附入首线程；
+7. 通过普通 readiness 检查首次发布 init runnable。
 
-BootPackage 缺失、损坏或 initial ELF 不可执行属于启动失败，不能退化为“没有服务也继续运行”。内核不遍历 `bin/`，不识别 pm/fs/driver，不组装服务间 mailbox，也不决定启动顺序。
+BootPackage 缺失、损坏或 initial ELF 不可执行属于启动失败，不能退化为“没有服务也继续运行”。任何步骤失败都必须保持系统储备与用户供给不重叠，且不能留下已计入 root pool 又可从库存取得的同一物理页；在 initial process 发布前无法恢复的失败是明确的 boot failure。内核不遍历 `bin/`，不识别 pm/fs/driver，不组装服务间 mailbox，也不决定启动顺序。
 
-initial process 通常自然取得 PID 1，但 PID 1 只作 provenance。其 authority 完全来自 StartupBlock 中显式安装的 root Job、设备资源等 capabilities。内核为 init 执行的特殊动作仅存在于 Building 阶段的 bootstrap launcher，不形成可由普通进程调用的物理映射或特权 syscall。
+initial process 通常自然取得 PID 1，但 PID 1 只作 provenance。其 authority 完全来自 StartupBlock 中显式安装的 root MemoryPool、root Job、设备资源等 capabilities。init 的不可转移 PoolBinding 与可派生、可授予的 root pool Handle 指向同一账户，前者支付 init 的内部 page-backed storage，后者授权用户态资源管理；共享 authority 不复制额度。内核为 init 执行的特殊动作仅存在于 Building 阶段的 bootstrap launcher，并复用普通绑定、映射和启动契约，不形成可由普通进程调用的物理映射或特权 syscall。
 
 ## initfs 作为 StartupBlock payload
 
@@ -42,9 +44,11 @@ init 虚拟地址空间中的 StartupBlock
 
 StartupBlock outer 允许 Handle 数组结束与 payload 起点之间存在零填充。普通进程的小 payload 可以紧凑复制；init 的大 payload 从 BootPackage 页直接映射到同一连续虚拟块，`startup_payload()` 对二者提供相同切片语义。
 
-映射必须为用户可读、不可写、不可执行。payload 页不进入普通进程可转授对象图：关闭 Handle 不能影响它，也没有任何运行时入口能重新映射或转授这些页；页所有权在映入 init 时即移交为该地址空间的 backing，随地址空间销毁自然归还物理池。BootPackage 物理占用按 envelope 的实际总长保留，而不是按 Devicetree 中的最大装载窗口保留。
+映射必须为用户可读、不可写、不可执行。payload 页不进入普通进程可转授对象图：关闭 Handle 不能影响它，也没有任何运行时入口能重新映射或转授这些页。映入 init 前，这些页从 boot-held 原子转换为由 init root pool 支付的 funded backing；页与 primordial charge 随地址空间销毁一起经正常 retire 返回库存和 pool，不允许只迁移物理所有权而遗漏计费。BootPackage 物理占用按 envelope 的实际总长保留，而不是按 Devicetree 中的最大装载窗口保留。
 
-这种映射不是进程特权口子：没有运行时入口能选择物理地址，也没有其他进程可请求同类映射。它与 initial ELF、主栈和 StartupBlock prefix 一样，是内核构造首地址空间的固定部分。
+BootPackage 的 boot-held token 在 envelope 验证后按最终用途切分：完整 payload 页直接收编，仍承载被映射尾页的部分页随 backing 保留；只用于 envelope、initial ELF 源数据或对齐填充且复制完成后不再被访问的页回投 free inventory。init 发布前必须完成该切分，boot-held 只允许保留仍有明确启动环境 owner 的区间；不能让 root pool 的可用额度长期对应既非 funded 也不可 claim 的遗失页。
+
+这种映射不是进程特权口子：没有运行时入口能选择物理地址，也没有其他进程可请求同类映射。它与 initial ELF、主栈和 StartupBlock prefix 一样，是 bootstrap 作为 Building 组装者经同一 AddressSpace interface 构造首地址空间的固定输入；不同之处只在 backing 来自已验证的 boot-held 页而非空闲库存。
 
 ## init 的职责与终止
 
@@ -71,9 +75,10 @@ init 的退出、panic、fault 或显式 kill 在内核中仍按普通进程处�
 内核只为 bootstrap initial process 解析 ELF。其余 ELF 由 launcher 在用户态解析，内核提供有界的 Building-process 构造机制：
 
 ```text
-Job capability
+Job capability + MemoryPool capability
   → ProcessCreate
   → Building process + affine ProcessBuilder + ProcessControl
+  → ProcessBindMemory
   → ProcessMap / ProcessWrite 组装映像与启动信息
   → ProcessGrant 安装初始 capabilities
   → ProcessAttach 附入一个或多个线程现场
@@ -81,7 +86,7 @@ Job capability
   → consume ProcessBuilder and publish Running process
 ```
 
-launcher 负责 ELF program-header、段重叠、BSS、最终页权限、栈布局和执行需求。内核只验证地址范围、页权限、W^X、Building 状态、入口可执行、栈可写与 ABI 对齐，不读取文件名或 ELF 结构。
+ProcessCreate 只建立空壳，MemoryPool authority 在 Bind 前仍由 launcher 持有；Bind 成功后目标取得不可转移内部 binding，不自动取得 Pool Handle。launcher 若要让目标继续 Query、Derive 或转授预算，必须另经 ProcessGrant 安装显式 Pool capability。launcher 负责 ELF program-header、段重叠、BSS、最终页权限、栈布局和执行需求；内核只验证地址范围、页权限、W^X、Building 状态、内存已绑定、入口可执行、栈可写与 ABI 对齐，不读取文件名或 ELF 结构。
 
 这套逻辑不是由每个有 spawn 权的服务各写一遍，而是分层为公共用户态能力：
 
@@ -95,7 +100,7 @@ launcher 负责 ELF program-header、段重叠、BSS、最终页权限、栈布�
 
 ## Job 与 Process capability
 
-root Job 由内核铸造并作为 init 的首批启动 Handle 交付。init 初始持完整 JobControl，按配置把长期管理权交给 pm 或其他服务；关闭最后一个 JobControl 不隐式杀死成员，终止必须是显式操作。ProcessCreate 必须持有 Job 创建权；创建关系记录为 `parent_pid`，但不产生管理权。
+root Job 与 root MemoryPool 由内核各自铸造并作为 init 的首批启动 Handles 交付。init 的 PoolBinding 已在 Handle 安装前指向同一 root pool core；两条引用共享账户而不复制供给。init 按配置从 root pool 派生 child pool、从 root Job 创建 child Job，再把两者与 CPU、设备等 capability 组合交给服务；关闭最后一个 JobControl 不隐式杀死成员，关闭最后一个 Pool Handle 也不撤销已绑定或已分配内存。ProcessCreate 必须持有 Job 创建权；创建关系记录为 `parent_pid`，但不产生管理权。
 
 Process 生命周期：
 
@@ -105,9 +110,10 @@ Building → Running → Terminating → Dead
 
 - **ProcessBuilder**：Building 阶段唯一、affine 的构造权；关闭即放弃构造并使目标进入终止收束；
 - **ProcessControl**：ProcessCreate 即产生的稳定管理/观察 capability，贯穿 Building、Running、Terminating 与 Dead；管理、等待、复制和运输由 rights 收窄；
-- **JobControl**：创建、封口、分页枚举与按 ID 派生直接成员、故障收束的 authority，不是进程权限等级。
+- **JobControl**：创建、封口、分页枚举与按 ID 派生直接成员、故障收束的 authority，不是进程权限等级；
+- **MemoryPool**：page-backed storage authority；可以共享、移动和派生 child，但成功附入进程的 PoolBinding 不再是 Handle，也不可转移。
 
-Building 阶段的 Map/Write、Grant 与 Attach 各自是可回滚的组装动作；ProcessStart 只检查至少存在一个已附线程，冻结进程级执行绑定，消费 builder 并一次发布全部预育线程。ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。Start 前失败保持目标不可运行，并由组装者决定重试或放弃后完整收束；已成功 Grant 的 capabilities 已归目标所有，不因后续 Attach/Start 失败自动退回。
+Building 阶段的 Bind、Map/Write、Grant 与 Attach 各自是边界明确的原子组装动作；ProcessStart 必须检查 AddressSpace 已 Bound、至少一条线程已附入、执行资源和 Job 门均满足，并在没有其它 Building 操作在途时冻结执行绑定、消费 builder、一次发布全部预育线程。ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。Start 前失败保持目标不可运行，并由组装者决定重试或放弃后完整收束；已成功 Bind 或 Grant 的资源已归目标所有，不因后续 Attach/Start 失败自动退回。
 
 内核只提供 JobSeal、直接成员的有界分页枚举、按 ID 派生 capability 和单进程控制原语；递归 JobKill 由 pm 在用户态组合。Open Job 变空后仍可用于服务重启，Sealed Job 才在全部成员和 child Jobs 收束后进入 Dead。多数进程不持 JobControl，只通过 pm 协议请求创建或管理。
 
@@ -115,7 +121,7 @@ Dead 表示进程的地址空间和 HandleTable 已经完成释放；exit status
 
 ## 内核短路径
 
-进程构造和收束 syscall 都必须有明确上界：单次映射页数、写入字节、grant 数、线程附入数，以及单次关闭的 Handle 和回收的页表节点都有限；launcher 与 pm 以用户态循环完成大映像和大资源环境。内核不在一个 syscall 中遍历 archive、Job 子树、完整 HandleTable、完整地址空间、对象图或不受限路径策略。
+进程构造和收束 syscall 都必须有明确上界：单次 pool derive、Bind 所需页表准备、映射页数、写入字节、grant 数、线程附入数，以及单次关闭的 Handle 和回收的页表节点都有限；launcher 与 pm 以用户态循环完成大映像和大资源环境。内核不在一个 syscall 中遍历 archive、Job 子树、Pool 后代、完整 HandleTable、完整地址空间、对象图或不受限路径策略。
 
 ## 外部参照的边界
 

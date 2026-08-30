@@ -34,9 +34,11 @@ BOOT_PACKAGE := TARGET_DIR/"boot-package.bin"
 # 取 dtb 声明的 0x84000000（与 dts 的 boot-package reg 保持一致；尾部 64MB 作装载区，
 # 帧池只按实际包长排除，扩窗零内存代价）。
 BOOT_PACKAGE_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x84000000" }
+# QEMU RAM 必须与平台 DTS 的 /memory 一致；它也决定 firmware 放置运行时 DTB 的上界。
+QEMU_MEMORY := if MODEL == "virt" { "1024M" } else { "128M" }
 # 与 virt DTS 声明的 Zkr 能力一致；sifive_u 不声明该扩展。
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m 1024M -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
 # CPU 节流百分比（tools/qemu-throttle.sh）：跑飞/panic 时 QEMU 满核空转的兜底。
 # 1-99 按比例节流；100 = 全速。默认 50；自定义经环境变量：
 # `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与

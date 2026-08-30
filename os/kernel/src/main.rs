@@ -112,8 +112,9 @@ unsafe fn fdt_from(pa: usize) -> Fdt<'static> {
 pub fn main() {
     println!("{}", BANNER);
 
-    let fdt = unsafe { fdt_from(rt::boot_dtb()) };
-    let mut board = board::parse(&fdt);
+    let dtb_pa = rt::boot_dtb();
+    let fdt = unsafe { fdt_from(dtb_pa) };
+    let mut board = board::parse(&fdt, dtb_pa);
 
     for region in board.memories() {
         log!(Memory, "@{:#x} ({:#x})", region.start, region.len);
@@ -138,6 +139,7 @@ pub fn main() {
     heap::selftest();
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
+    frame::release_device_tree(&board);
     sched::init(board.timebase);
     if let Some((addr, len)) = board.boot_package {
         rt::set_boot_package_region(addr, len);

@@ -5,12 +5,13 @@ SECTIONS
 {
     HART_NUM_LIMIT = 8;
 
-    /* 内核高半区偏移（VMA = PA + KERNEL_VA_BASE）与过渡页表几何（由加载基址推导，
-       boot 与 secondary 共用同一张过渡表，见 assembly.asm `_start`/`_awaken`） */
+    /* 内核高半区偏移与过渡页表几何。内核与 DTB 各最多跨两个 1GiB 槽，
+       boot 与 secondary 共用固定 arena（见 assembly.asm `_start`/`_awaken`）。 */
     KERNEL_VA_BASE = 0xFFFFFFC000000000;
-    TRAMPOLINE_PA_BASE = KERNEL_PA_START & 0xFFFFFFFFC0000000;
-    _trampoline_pte = (TRAMPOLINE_PA_BASE >> 2) | 0xEF;
-    _trampoline_slot = TRAMPOLINE_PA_BASE >> 30;
+    TRANSITION_MIDDLE_MAX = 4;
+    TRANSITION_KERNEL_LEAF_MAX = 16;
+    TRANSITION_DTB_LEAF_MAX = 2;
+    TRANSITION_LEAF_MAX = TRANSITION_KERNEL_LEAF_MAX + TRANSITION_DTB_LEAF_MAX;
 
     /* ---- cold-bootstrap 区间（VMA = LMA = PA；全员 Online 后
        [__bootstrap_start, __bootstrap_free_end) 整批回收帧池）----
@@ -23,16 +24,22 @@ SECTIONS
     .bootstrap.bss (NOLOAD) : {
         *(.bss.init)
         . = ALIGN(16);
-        . = . + 16384;
+        . = . + 32768;
         PROVIDE(__bootstrap_stack_top = .);   /* 栈向下生长：符号在保留区顶部 */
         . = ALIGN(8);
     }
 
     /* ---- 永久 hart-entry 设施（VMA = LMA = PA，不随 bootstrap 回收）----
-       共享过渡页表 root、secondary PA 前导与早期 fatal vector */
+       共享过渡 root、中间表、固定叶表 arena、secondary PA 前导与早期 fatal vector */
     .bss.entry (NOLOAD) : ALIGN(4096) {
         PROVIDE(__transition_root_pa = .);
-        . = . + 4096;               /* 过渡页表 root（Sv39 一页）*/
+        . = . + 4096;
+        PROVIDE(__transition_middle_base = .);
+        . = . + 4096 * TRANSITION_MIDDLE_MAX;
+        PROVIDE(__transition_middle_end = .);
+        PROVIDE(__transition_leaf_base = .);
+        . = . + 4096 * TRANSITION_LEAF_MAX;
+        PROVIDE(__transition_leaf_end = .);
     }
     .text.entry : {
         *(.text.entry)
@@ -95,6 +102,9 @@ SECTIONS
        页对齐保证栈打包基址与帧粒度一致。 */
     PROVIDE(__kernel_pa_end = ALIGN(ADDR(.bss) - KERNEL_VA_BASE + SIZEOF(.bss)
                                     + STACK_SIZE * HART_NUM_LIMIT, 4096));
+    ASSERT((((__kernel_pa_end - 1) >> 21) - (KERNEL_PA_START >> 21) + 1)
+           <= TRANSITION_KERNEL_LEAF_MAX,
+           "kernel physical span exceeds transition leaf-table budget")
 
     /DISCARD/ : {
         *(.eh_frame)

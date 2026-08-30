@@ -150,10 +150,11 @@ fn bring_up_runtime() -> ! {
         core::hint::spin_loop();
     }
 
-    // bootstrap 页回收：secondary 只依赖永久 entry 设施（过渡表/PA 前导），
-    // 全员 Online 后 cold-bootstrap 区间不再被引用。回收动作在正式栈上
-    // 执行，不可能从 bootstrap 栈返回。
+    // bootstrap 页回收：全员 Online 保证没有 hart 仍使用 transition satp；先撤销
+    // cold-bootstrap 临时叶，再发布物理页。回收动作在正式栈上执行，不可能从
+    // bootstrap 栈返回；future HSM 只依赖永久 entry 设施与正式内核页。
     let (start, end) = external::bootstrap_range();
+    mm::retire_transition_range(start, end);
     frame::free_range(start, end);
     log!(Memory, "bootstrap reclaim [{:#x}, {:#x})", start, end);
 

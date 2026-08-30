@@ -1,7 +1,7 @@
 //! DTB 就地游标测试（host）。fixture 为仓库两平台 dts 经 dtc 编译的
 //! 真实 blob；另手工构造 blob 覆盖 NOP、奇数长度属性填充与错误路径。
 
-use dtb::{cells_u64, Fdt, FdtError};
+use dtb::{Fdt, FdtError, cells_u64};
 
 const FDT_MAGIC: u32 = 0xD00D_FEED;
 const HEADER: usize = 40;
@@ -18,7 +18,10 @@ fn virt_layout() {
 
     let names: Vec<_> = root.children().filter_map(|n| n.name().ok()).collect();
     for expect in ["cpus", "chosen", "memory@80000000"] {
-        assert!(names.iter().any(|n| n.starts_with(expect)), "missing {expect}: {names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with(expect)),
+            "missing {expect}: {names:?}"
+        );
     }
 
     // /cpus：timebase、#address-cells=1、4 个 cpu 子节点
@@ -26,7 +29,10 @@ fn virt_layout() {
     assert_eq!(cpus.prop_u32("timebase-frequency"), Some(10_000_000));
     let hartids: Vec<_> = cpus
         .children()
-        .filter(|n| n.name().is_ok_and(|name| name.split('@').next() == Some("cpu")))
+        .filter(|n| {
+            n.name()
+                .is_ok_and(|name| name.split('@').next() == Some("cpu"))
+        })
         .map(|n| {
             let reg = n.prop("reg").unwrap();
             cells_u64(reg, 1).unwrap() as usize
@@ -63,7 +69,10 @@ fn sifive_layout() {
     let cpus = root.child("cpus").unwrap();
     let count = cpus
         .children()
-        .filter(|n| n.name().is_ok_and(|name| name.split('@').next() == Some("cpu")))
+        .filter(|n| {
+            n.name()
+                .is_ok_and(|name| name.split('@').next() == Some("cpu"))
+        })
         .count();
     assert_eq!(count, 5);
 
@@ -80,6 +89,7 @@ fn sifive_layout() {
 struct BlobBuilder {
     struct_block: Vec<u8>,
     strings: Vec<u8>,
+    reservations: Vec<(u64, u64)>,
 }
 
 impl BlobBuilder {
@@ -87,6 +97,7 @@ impl BlobBuilder {
         Self {
             struct_block: Vec::new(),
             strings: Vec::new(),
+            reservations: Vec::new(),
         }
     }
 
@@ -131,33 +142,42 @@ impl BlobBuilder {
         }
     }
 
+    fn reservation(&mut self, address: u64, size: u64) {
+        self.reservations.push((address, size));
+    }
+
     fn finish(mut self) -> Vec<u8> {
         self.push_u32(0x9); // FDT_END
 
-        let strings_off = HEADER + self.struct_block.len().max(8).next_power_of_two();
-        // 对齐无关紧要，取整只为可读
+        let reservation_off = HEADER;
+        let struct_off = reservation_off + (self.reservations.len() + 1) * 16;
+        let strings_off = struct_off + self.struct_block.len().max(8).next_power_of_two();
         let totalsize = strings_off + self.strings.len();
         let mut out = Vec::with_capacity(totalsize);
         out.extend_from_slice(&FDT_MAGIC.to_be_bytes());
         out.extend_from_slice(&(totalsize as u32).to_be_bytes());
-        out.extend_from_slice(&(HEADER as u32).to_be_bytes()); // off_struct
+        out.extend_from_slice(&(struct_off as u32).to_be_bytes());
         out.extend_from_slice(&(strings_off as u32).to_be_bytes());
-        out.extend_from_slice(&((HEADER + 8) as u32).to_be_bytes()); // off_mem_rsvmap（未用）
+        out.extend_from_slice(&(reservation_off as u32).to_be_bytes());
         out.extend_from_slice(&17u32.to_be_bytes()); // version
         out.extend_from_slice(&16u32.to_be_bytes()); // last_comp
         out.extend_from_slice(&0u32.to_be_bytes()); // boot_cpuid
         out.extend_from_slice(&(self.strings.len() as u32).to_be_bytes());
         out.extend_from_slice(&(self.struct_block.len() as u32).to_be_bytes());
         debug_assert_eq!(out.len(), HEADER);
-        out.resize(HEADER, 0);
+        for &(address, size) in &self.reservations {
+            out.extend_from_slice(&address.to_be_bytes());
+            out.extend_from_slice(&size.to_be_bytes());
+        }
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        debug_assert_eq!(out.len(), struct_off);
         out.extend_from_slice(&self.struct_block);
         out.resize(strings_off, 0);
         out.extend_from_slice(&self.strings);
         out
     }
 }
-
-
 
 /// NOP 混入、奇数长度属性、深层嵌套、名字查找。
 #[test]
@@ -199,6 +219,32 @@ fn crafted_tokens() {
     assert_eq!(names, ["outer", "sibling"]);
 }
 
+#[test]
+fn memory_reservation_block() {
+    let mut b = BlobBuilder::new();
+    b.reservation(0x8100_0000, 0x2000);
+    b.reservation(0x8200_0000, 0x1000);
+    b.begin("");
+    b.end();
+    let blob = b.finish();
+    let fdt = Fdt::new(&blob).unwrap();
+    let reservations: Vec<_> = fdt.memory_reservations().collect();
+    assert_eq!(
+        reservations,
+        [
+            dtb::MemoryReservation {
+                address: 0x8100_0000,
+                size: 0x2000,
+            },
+            dtb::MemoryReservation {
+                address: 0x8200_0000,
+                size: 0x1000,
+            },
+        ]
+    );
+    assert_eq!(fdt.total_size(), blob.len());
+}
+
 /// 同名属性取首个。
 #[test]
 fn duplicate_prop_takes_first() {
@@ -224,7 +270,10 @@ fn malformed_blobs() {
     bad_magic[0] ^= 0xFF;
     assert_eq!(Fdt::new(&bad_magic).unwrap_err(), FdtError::BadMagic);
 
-    assert_eq!(Fdt::new(&good[..good.len() - 1]).unwrap_err(), FdtError::Truncated);
+    assert_eq!(
+        Fdt::new(&good[..good.len() - 1]).unwrap_err(),
+        FdtError::Truncated
+    );
 
     // 根之前插入 PROP → UnexpectedToken
     let mut b2 = BlobBuilder::new();
@@ -240,4 +289,23 @@ fn malformed_blobs() {
     b3.begin("child");
     let unclosed = b3.finish();
     assert_eq!(Fdt::new(&unclosed).unwrap_err(), FdtError::UnexpectedToken);
+
+    let mut b4 = BlobBuilder::new();
+    b4.reservation(0x8000_0000, 0x2000);
+    b4.reservation(0x8000_1000, 0x1000);
+    b4.begin("");
+    b4.end();
+    assert_eq!(
+        Fdt::new(&b4.finish()).unwrap_err(),
+        FdtError::InvalidReservationBlock
+    );
+
+    let mut b5 = BlobBuilder::new();
+    b5.reservation(0x8000_0000, 0);
+    b5.begin("");
+    b5.end();
+    assert_eq!(
+        Fdt::new(&b5.finish()).unwrap_err(),
+        FdtError::InvalidReservationBlock
+    );
 }
