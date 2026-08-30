@@ -543,7 +543,8 @@ pub fn create(
         }
     };
 
-    let (completion, plan) = match prepare_memory_completion(thread.process.clone(), 0, None) {
+    let (completion, plan) = match prepare_memory_completion(thread.process.clone(), 0, None, None)
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let permits = {
@@ -743,7 +744,8 @@ pub fn attach(
         }
     };
 
-    let (completion, plan) = match prepare_memory_completion(thread.process.clone(), 0, None) {
+    let (completion, plan) = match prepare_memory_completion(thread.process.clone(), 0, None, None)
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let permits = {
@@ -903,7 +905,7 @@ pub(crate) fn close_handle(
     };
     let retire_sink: Arc<dyn MemoryRetireSink> = retire.clone();
     let (completion, plan) =
-        match prepare_memory_completion(thread.process.clone(), 0, Some(retire_sink)) {
+        match prepare_memory_completion(thread.process.clone(), 0, Some(retire_sink), None) {
             Ok(prepared) => prepared,
             Err(error) => {
                 thread

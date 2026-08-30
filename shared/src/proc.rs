@@ -98,6 +98,20 @@ const _: () = {
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
 };
 
+/// ThreadSpawn 同步输出；control 是等待 DONE 的 ThreadControl handle。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct ThreadSpawnResult {
+    pub tid: Tid,
+    pub reserved: u32,
+    pub control: Handle,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ThreadSpawnResult>() == 16);
+    assert!(core::mem::align_of::<ThreadSpawnResult>() == 8);
+};
+
 /// ProcessControl 固定宽状态快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
@@ -248,6 +262,7 @@ const _: () = {
     assert!(core::mem::size_of::<HandleGrant>() == 16);
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
     assert!(core::mem::size_of::<ProcessSnapshot>() == 40);
+    assert!(core::mem::size_of::<ThreadSpawnResult>() == 16);
     assert!(core::mem::size_of::<ProcessDrainResult>() == 16);
     assert!(core::mem::size_of::<ProcessState>() == 4);
     assert!(core::mem::size_of::<ProcessExitReason>() == 4);
@@ -271,11 +286,7 @@ impl Termination for () {
 
 impl Termination for bool {
     fn to_exit_code(self) -> ExitCode {
-        if self {
-            0
-        } else {
-            -1
-        }
+        if self { 0 } else { -1 }
     }
 }
 
@@ -284,10 +295,6 @@ pub type ProgramResult = Result<(), ExitCode>;
 
 impl Termination for ProgramResult {
     fn to_exit_code(self) -> ExitCode {
-        if let Err(code) = self {
-            code
-        } else {
-            0
-        }
+        if let Err(code) = self { code } else { 0 }
     }
 }

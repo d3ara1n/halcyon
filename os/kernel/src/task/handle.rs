@@ -1,11 +1,11 @@
 //! 内核对象 Handle 表包装：类型/role/rights 校验与关闭分流。
 
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
 };
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use handle_table::{Entry, HandleTable, TableError};
 
@@ -76,7 +76,10 @@ pub fn close_entry(
     exiting: bool,
 ) -> Result<(), ProcessHandleEntry> {
     if entry.object().kind() == super::object::ObjectKind::TunnelEndpoint {
-        assert!(exiting, "explicit Tunnel Endpoint close must use its transaction path");
+        assert!(
+            exiting,
+            "explicit Tunnel Endpoint close must use its transaction path"
+        );
         return super::tunnel::close_detached(entry, owner);
     }
     let (object, role, _, _) = entry.into_parts();
@@ -100,10 +103,7 @@ pub fn close_transit(entry: ProcessHandleEntry) {
     object.close_transit(role);
 }
 
-pub fn close(
-    thread: &super::Thread,
-    handle: Handle,
-) -> Result<HandleCloseStart, SystemCallError> {
+pub fn close(thread: &super::Thread, handle: Handle) -> Result<HandleCloseStart, SystemCallError> {
     let tunnel = {
         let table = thread.process.handles.lock();
         let entry = table.get(handle, Rights::NONE).map_err(map_error)?;
@@ -112,7 +112,12 @@ pub fn close(
     if tunnel {
         return super::tunnel::close_handle(thread, handle).map(HandleCloseStart::Wait);
     }
-    let entry = thread.process.handles.lock().remove(handle).map_err(map_error)?;
+    let entry = thread
+        .process
+        .handles
+        .lock()
+        .remove(handle)
+        .map_err(map_error)?;
     close_entry_infallible(entry, &thread.process, false);
     Ok(HandleCloseStart::Ready)
 }
@@ -124,7 +129,9 @@ pub fn duplicate(
     output: usize,
 ) -> Result<(), SystemCallError> {
     let mut entries = Vec::new();
-    entries.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     let token = transaction_token();
     let mut table = thread.process.handles.lock();
     entries.push(table.derive(source, rights).map_err(map_error)?);
@@ -133,14 +140,18 @@ pub fn duplicate(
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
         drop(space);
-        table.rollback(reservation).expect("duplicate reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("duplicate reservation must remain owned");
         return Err(error.into());
     }
     // SAFETY: Handle 是无 padding 的 u64 newtype；复检失败即杀本进程
     // （deliver_output），未提交的预留随进程消亡。
     unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &duplicated) }?;
     drop(space);
-    table.commit(reservation, entries).expect("duplicate reservation must remain owned");
+    table
+        .commit(reservation, entries)
+        .expect("duplicate reservation must remain owned");
     Ok(())
 }
 

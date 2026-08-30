@@ -27,6 +27,7 @@ pub enum ObjectKind {
     Job,
     ProcessBuilder,
     ProcessControl,
+    ThreadControl,
     Mailbox,
     Notification,
     TunnelEndpoint,
@@ -47,6 +48,7 @@ pub enum HandleRole {
     JobControl,
     ProcessBuilder,
     ProcessControl,
+    ThreadControl,
     MailboxOwner,
     MailboxSender,
     /// 一次性投递权：成功 Send 后由内核摘除，失败不消费。

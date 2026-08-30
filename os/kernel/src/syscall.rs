@@ -1,8 +1,8 @@
 //! syscall 分发（notes/impls/call.md）：a7 调用号、a0–a5 参数；
 //! 返回 a0 = 错误码（0 = NoError）、a1 = 返回值，sepc 前进 4。
 //!
-//! 出口三值 `Outcome`——同步调用 Completed；异步调用登记内核请求后 Wait
-//! （完成时 wake 回 Ready）；Killed 终止进程。未知调用号返回错误，绝不 panic。
+//! 出口四值 `Outcome`——同步调用 Completed；主动让出 Requeue；异步调用 Wait；
+//! 终局调用 Killed。未知调用号返回错误，绝不 panic。
 
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
@@ -14,7 +14,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use crate::{
     context::UserContext,
     sched,
-    task::{self, Thread, handle, mailbox, notification, wait},
+    task::{self, Thread, handle, mailbox, notification, thread as task_thread, wait},
     uaccess,
 };
 
@@ -23,6 +23,8 @@ use crate::{
 pub enum Outcome {
     /// 结果已写入 UserContext，Resume 回用户态。
     Completed,
+    /// 当前线程主动让出，Switch 后重新入队。
+    Requeue,
     /// 已登记内核请求，线程转 Waiting，Switch 回调度循环。
     Wait,
     /// 进程终止（终因已在 lifecycle 冻结），Switch 后回收。
@@ -64,6 +66,21 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             task::process::run_termination_todo(&process, todo);
             Outcome::Killed
+        }
+        SystemCall::ThreadExit => {
+            thread.mark_normal_exit(a0 as i64);
+            Outcome::Killed
+        }
+        SystemCall::ThreadYield => {
+            respond_ok(frame, 0);
+            Outcome::Requeue
+        }
+        SystemCall::ThreadSpawn => {
+            respond_result(
+                frame,
+                task_thread::spawn(thread, frame.x[10] as usize, frame.x[11] as usize).map(|_| 0),
+            );
+            Outcome::Completed
         }
         SystemCall::JobCreate => {
             respond_result(

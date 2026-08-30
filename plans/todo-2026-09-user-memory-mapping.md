@@ -1,14 +1,14 @@
 # 用户内存映射机制完整化
 
-- 状态：切片 1–7 已提交；8A 当前公开面与全平台矩阵已完成验证，待独立提交；8B 等待 ThreadSpawn 真实多线程路径
+- 状态：切片 1–7 与 8A 已提交；8B 已通过 ThreadSpawn 真实多线程路径及完整平台矩阵，待随线程批二独立提交
 - 方向真值：[`notes/ideas/mm.md`](../notes/ideas/mm.md)
-- 自然序：本计划收口后重审 ThreadSpawn 用户态资源契约，再实施线程批二/批三
+- 自然序：提交 ThreadSpawn 批二/8B 后完成线程批三，再按真实提交哈希创建联合 review 计划
 
 ## 驱动问题
 
 全部现有用户映射调用者已经统一到 AddressSpace ledger/backing/PTE/MemoryChange：ProcessMap 只服务 Building 组装，anonymous/ELF/bootstrap backing 由 `OwnedBacking.extents` 拥有，Tunnel 由 ObjectView lease + WritePermit 引用 Connection 的固定 backing。旧 `AddressSpace.frames`、`external_mappings`、按 VA 外部解除、本地-only shootdown 与 sbrk/Extend 已删除。
 
-结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner、reservation-aware `TableTree`、Remote Call、公开 `MemoryMap/MemoryUnmap/MemoryProtect` 与 rinlib affine `MappedRegion`/多 arena allocator 已贯通。8A 已用当前真实可达的单线程公开面闭合 guard fault、异 hart kill/termination、服务资源回收和五条平台线；剩余缺口只有依赖 ThreadSpawn 的同一 AddressSpace 双 hart、并发解除与次线程栈/join 组合所有权，明确归 8B。
+结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner、reservation-aware `TableTree`、Remote Call、公开 `MemoryMap/MemoryUnmap/MemoryProtect` 与 rinlib affine `MappedRegion`/多 arena allocator 已贯通。8A 闭合单线程公开面的 guard fault、异 hart kill/termination、服务资源回收和五条平台线；8B 已用真实 ThreadSpawn 闭合同一 AddressSpace 双 hart、并发解除与次线程栈/join 组合所有权。
 
 ## 已确认决策
 
@@ -259,7 +259,7 @@ sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈�
 
 ### 8B. ThreadSpawn 联合 integration gate
 
-以下场景依赖同一 Running process 至少两条线程，不能由内核测试后门或两个独立进程冒充；它们随 ThreadSpawn 批二/批三实现并作为 user-memory 全链最终 gate：
+以下场景依赖同一 Running process 至少两条线程，不能由内核测试后门或两个独立进程冒充；现已随 ThreadSpawn 批二实现并通过：
 
 - 双 hart 同 AddressSpace 的完成边界；调用进行期间不对未同步访问作瞬时可见断言；
 - 一 hart 缓存旧映射，另一 hart Unmap 完成后重映射不同 backing 不得读到旧页；
@@ -268,7 +268,7 @@ sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈�
 - 次线程 guard stack、wrapper/result 槽与 join handle 的建立、离场确认、解除和复用；
 - Map committed cookie 在发起线程 Commit 前/后消散时的返回权或 join 接管。
 
-ThreadSpawn integration 阶段再次执行完整 host 与全平台矩阵；`COMPASS.md` 只在 8B 全绿后把主线移出联合收口。
+阶段记录（2026-08-30）：真实负载完成旧 VA 精确复用、双 hart shootdown、8 轮 Endpoint/Tunnel lease close 与普通 Unmap 并发、guarded stack、结果交付、join 后解除和末线程 `Exited(0x8b)`；planner `ObjectBusy` 只在完整失败事务边界退避并保留 affine token。host、common debug/release、virt-hetero、virt-nofd 与 sifive_u 均全绿，竞态矩阵为 13/13。ProcessKill 路径由进程级 `mandatory_ops` 先挡住 committed Map，线程级 result obligation 不独立成为最终阻塞者；首版无 ThreadKill，不增设测试专用入口强造该观测。
 
 ### 联合复审归档
 

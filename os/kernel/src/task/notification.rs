@@ -11,12 +11,12 @@ use erhino_shared::{
 use crate::sync::Spinlock;
 
 use super::{
+    Thread,
     object::{
         HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
         SubscribeResult,
     },
     proc::Process,
-    Thread,
     wait::{Subscription, finish_offered},
 };
 
@@ -36,11 +36,14 @@ impl Notification {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             header: ObjectHeader::new(),
-            state: Spinlock::new(crate::sync::ranks::NOTIFICATION, NotificationState {
-                wait: ObjectWaitState::new(ObjectSignals::NONE),
-                pending: 0,
-                closed: false,
-            }),
+            state: Spinlock::new(
+                crate::sync::ranks::NOTIFICATION,
+                NotificationState {
+                    wait: ObjectWaitState::new(ObjectSignals::NONE),
+                    pending: 0,
+                    closed: false,
+                },
+            ),
         })
     }
 
@@ -58,7 +61,9 @@ impl Notification {
                 return Err(SystemCallError::ObjectClosed);
             }
             state.pending |= bits;
-            state.wait.update(ObjectSignals::NONE, ObjectSignals::READABLE);
+            state
+                .wait
+                .update(ObjectSignals::NONE, ObjectSignals::READABLE);
         }
         self.finish_waiters();
         Ok(())
@@ -78,7 +83,9 @@ impl Notification {
         }
         state.pending &= !taken;
         if state.pending == 0 {
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::NONE);
+            state
+                .wait
+                .update(ObjectSignals::READABLE, ObjectSignals::NONE);
         }
         Ok(taken)
     }
@@ -91,7 +98,9 @@ impl Notification {
             }
             state.closed = true;
             state.pending = 0;
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::CLOSED);
+            state
+                .wait
+                .update(ObjectSignals::READABLE, ObjectSignals::CLOSED);
         }
         self.finish_waiters();
     }
@@ -120,11 +129,7 @@ impl KernelObject for Notification {
                 Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
             }
             HandleRole::NotificationSignaler => Some(
-                Rights::SIGNAL
-                    | Rights::WAIT
-                    | Rights::TRANSIT
-                    | Rights::GRANT
-                    | Rights::DUPLICATE,
+                Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
             ),
             _ => None,
         }
@@ -174,7 +179,9 @@ pub fn create(
     let notification = Notification::new();
     let object = Notification::object_ref(&notification);
     let mut entries = alloc::vec::Vec::new();
-    entries.try_reserve(2).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve(2)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
         super::handle::entry(object.clone(), HandleRole::NotificationOwner, owner_rights)
             .map_err(super::handle::map_error)?,
@@ -191,19 +198,28 @@ pub fn create(
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
         drop(space);
-        table.rollback(reservation).expect("NotificationCreate reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("NotificationCreate reservation must remain owned");
         return Err(error.into());
     }
     // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
     // 未提交的预留随进程消亡。
     unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &pair) }?;
     drop(space);
-    table.commit(reservation, entries).expect("NotificationCreate reservation must remain owned");
+    table
+        .commit(reservation, entries)
+        .expect("NotificationCreate reservation must remain owned");
     Ok(())
 }
 
 pub fn signal(thread: &Thread, handle: Handle, bits: u64) -> Result<(), SystemCallError> {
-    let object = resolve(thread, handle, Rights::SIGNAL, HandleRole::NotificationSignaler)?;
+    let object = resolve(
+        thread,
+        handle,
+        Rights::SIGNAL,
+        HandleRole::NotificationSignaler,
+    )?;
     concrete(&object)?.signal(bits)
 }
 
@@ -230,7 +246,9 @@ fn resolve(
     role: HandleRole,
 ) -> Result<ObjectRef, SystemCallError> {
     let table = thread.process.handles.lock();
-    let entry = table.get(handle, rights).map_err(super::handle::map_error)?;
+    let entry = table
+        .get(handle, rights)
+        .map_err(super::handle::map_error)?;
     if *entry.role() != role || entry.object().kind() != ObjectKind::Notification {
         return Err(SystemCallError::WrongObjectType);
     }

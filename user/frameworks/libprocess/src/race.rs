@@ -25,6 +25,8 @@ pub const TARGET_PARK: u64 = 3;
 pub const TARGET_MEMORY_CHURN: u64 = 4;
 /// TARGET payload word[1]：建立 guarded mapping 后访问 guard，验证用户 fault。
 pub const TARGET_GUARD_FAULT: u64 = 5;
+/// TARGET payload word[1]：真实同 AddressSpace 多线程映射与 join 组合验收。
+pub const TARGET_THREAD_SUITE: u64 = 6;
 
 /// HAMMER grants 槽位。
 pub const HAMMER_CMD: usize = 0;

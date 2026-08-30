@@ -89,6 +89,7 @@ unsafe extern "C" fn handle_user_trap(
             };
             match syscall::dispatch(frame, t) {
                 syscall::Outcome::Completed => Outcome::Resume as usize,
+                syscall::Outcome::Requeue => Outcome::Requeue as usize,
                 syscall::Outcome::Wait => Outcome::Park as usize,
                 syscall::Outcome::Killed => Outcome::Killed as usize,
             }

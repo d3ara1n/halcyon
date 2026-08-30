@@ -780,10 +780,13 @@ fn control_publish_reapable(control: &Option<Arc<ProcessControl>>) {
     }
 }
 
-/// 线程离场确认（调用方已 drop 线程强引用：reap / WaitContext 完成
-/// 方 / Start 防御失败路径）：摘除成员；全部离场则发布 REAPABLE。
-pub fn confirm_departure(process: &Arc<Process>, tid: Tid) {
-    if process.lifecycle.thread_departed(tid) {
+/// 线程级结果义务归零后的离场确认。正常末线程在 lifecycle 线性化点铸造
+/// 进程终局；已有进程级终止则只协助 REAPABLE 发布。
+pub fn confirm_departure(process: &Arc<Process>, tid: Tid, normal_code: Option<i64>) {
+    let (termination, reapable) = process.lifecycle.thread_departed(tid, normal_code);
+    if let Some(todo) = termination {
+        run_termination_todo(process, todo);
+    } else if reapable {
         control_publish_reapable(&process.control());
     }
 }

@@ -15,13 +15,13 @@ use erhino_shared::{
 use crate::{sync::Spinlock, uaccess};
 
 use super::{
+    Thread,
     handle::{ProcessHandleEntry, ProcessHandleTable, close_transit},
     object::{
         HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
         SubscribeResult,
     },
     proc::Process,
-    Thread,
     wait::{Subscription, finish_offered},
 };
 
@@ -66,7 +66,8 @@ impl MailboxState {
         if occupied < MAILBOX_CAPACITY {
             level |= ObjectSignals::WRITABLE;
         }
-        self.wait.update(ObjectSignals::READABLE | ObjectSignals::WRITABLE, level);
+        self.wait
+            .update(ObjectSignals::READABLE | ObjectSignals::WRITABLE, level);
     }
 }
 
@@ -80,13 +81,16 @@ impl Mailbox {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             header: ObjectHeader::new(),
-            state: Spinlock::new(crate::sync::ranks::MAILBOX, MailboxState {
-                // 空箱对 sender 可写；WRITABLE 电平由容量变化维护。
-                wait: ObjectWaitState::new(ObjectSignals::WRITABLE),
-                queue: VecDeque::new(),
-                receiving: None,
-                closed: false,
-            }),
+            state: Spinlock::new(
+                crate::sync::ranks::MAILBOX,
+                MailboxState {
+                    // 空箱对 sender 可写；WRITABLE 电平由容量变化维护。
+                    wait: ObjectWaitState::new(ObjectSignals::WRITABLE),
+                    queue: VecDeque::new(),
+                    receiving: None,
+                    closed: false,
+                },
+            ),
         })
     }
 
@@ -110,9 +114,18 @@ impl Mailbox {
         if occupied >= MAILBOX_CAPACITY {
             return Err(SystemCallError::MailboxFull);
         }
-        state.queue.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
-        let handles = table.extract_moves(moves).map_err(super::handle::map_error)?;
-        state.queue.push_back(Message { header, payload, handles });
+        state
+            .queue
+            .try_reserve(1)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        let handles = table
+            .extract_moves(moves)
+            .map_err(super::handle::map_error)?;
+        state.queue.push_back(Message {
+            header,
+            payload,
+            handles,
+        });
         state.publish();
         Ok(())
     }
@@ -125,7 +138,11 @@ impl Mailbox {
         if state.receiving.is_some() {
             return Err(SystemCallError::ObjectBusy);
         }
-        state.queue.front().map(|message| message.header).ok_or(SystemCallError::ObjectNotAvailable)
+        state
+            .queue
+            .front()
+            .map(|message| message.header)
+            .ok_or(SystemCallError::ObjectNotAvailable)
     }
 
     /// 调用方已持 HandleTable 锁；本方法再取 Mailbox 锁并原子预留 slots/队头。
@@ -156,12 +173,18 @@ impl Mailbox {
             .reserve(front.handles.len(), token)
             .map_err(super::handle::map_error)?;
         state.receiving = Some(token);
-        Ok((reservation, state.queue.pop_front().expect("front was checked")))
+        Ok((
+            reservation,
+            state.queue.pop_front().expect("front was checked"),
+        ))
     }
 
     pub fn commit_receive(&self, token: u64) {
         let mut state = self.state.lock();
-        assert!(state.receiving == Some(token), "mailbox receive token mismatch");
+        assert!(
+            state.receiving == Some(token),
+            "mailbox receive token mismatch"
+        );
         state.receiving = None;
         // owner 关闭后终态冻结由 update 保证，此处无需防御。
         state.publish();
@@ -170,7 +193,10 @@ impl Mailbox {
     /// 返回 Some 表示 owner 已关闭，消息不得重新入队，调用方须关闭 transit。
     pub fn rollback_receive(&self, token: u64, message: Message) -> Option<Message> {
         let mut state = self.state.lock();
-        assert!(state.receiving == Some(token), "mailbox receive token mismatch");
+        assert!(
+            state.receiving == Some(token),
+            "mailbox receive token mismatch"
+        );
         state.receiving = None;
         if state.closed {
             return Some(message);
@@ -188,7 +214,10 @@ impl Mailbox {
         if state.receiving.is_some() {
             return Err(SystemCallError::ObjectBusy);
         }
-        let message = state.queue.pop_front().ok_or(SystemCallError::ObjectNotAvailable)?;
+        let message = state
+            .queue
+            .pop_front()
+            .ok_or(SystemCallError::ObjectNotAvailable)?;
         state.publish();
         Ok(message)
     }
@@ -235,11 +264,7 @@ impl KernelObject for Mailbox {
                 Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
             }
             HandleRole::MailboxSender => Some(
-                Rights::WRITE
-                    | Rights::WAIT
-                    | Rights::TRANSIT
-                    | Rights::GRANT
-                    | Rights::DUPLICATE,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
             ),
             HandleRole::MailboxSenderOnce => {
                 Some(Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT)
@@ -297,7 +322,9 @@ pub fn create(
     let mailbox = Mailbox::new();
     let object = Mailbox::object_ref(&mailbox);
     let mut entries = Vec::new();
-    entries.try_reserve(2).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve(2)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
         super::handle::entry(object.clone(), HandleRole::MailboxOwner, owner_rights)
             .map_err(super::handle::map_error)?,
@@ -314,14 +341,18 @@ pub fn create(
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
         drop(space);
-        table.rollback(reservation).expect("MailboxCreate reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("MailboxCreate reservation must remain owned");
         return Err(error.into());
     }
     // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
     // 未提交的预留随进程消亡。
     unsafe { uaccess::deliver_output(thread, &mut space, output, &pair) }?;
     drop(space);
-    table.commit(reservation, entries).expect("MailboxCreate reservation must remain owned");
+    table
+        .commit(reservation, entries)
+        .expect("MailboxCreate reservation must remain owned");
     Ok(())
 }
 
@@ -336,7 +367,9 @@ pub fn mint_sender(
 ) -> Result<(), SystemCallError> {
     let token = super::handle::transaction_token();
     let mut table = thread.process.handles.lock();
-    let owner_entry = table.get(owner, Rights::MANAGE).map_err(super::handle::map_error)?;
+    let owner_entry = table
+        .get(owner, Rights::MANAGE)
+        .map_err(super::handle::map_error)?;
     if *owner_entry.role() != HandleRole::MailboxOwner
         || owner_entry.object().kind() != ObjectKind::Mailbox
     {
@@ -344,7 +377,9 @@ pub fn mint_sender(
     }
     let object = owner_entry.object().clone();
     let mut entries = Vec::new();
-    entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve_exact(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
         super::handle::entry_with_badge(object, HandleRole::MailboxSender, rights, badge)
             .map_err(super::handle::map_error)?,
@@ -354,7 +389,9 @@ pub fn mint_sender(
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
         drop(space);
-        table.rollback(reservation).expect("mint-sender reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("mint-sender reservation must remain owned");
         return Err(error.into());
     }
     // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
@@ -378,7 +415,9 @@ pub fn make_send_once(
 ) -> Result<(), SystemCallError> {
     let token = super::handle::transaction_token();
     let mut table = thread.process.handles.lock();
-    let source_entry = table.get(source, Rights::DUPLICATE).map_err(super::handle::map_error)?;
+    let source_entry = table
+        .get(source, Rights::DUPLICATE)
+        .map_err(super::handle::map_error)?;
     if *source_entry.role() != HandleRole::MailboxSender
         || source_entry.object().kind() != ObjectKind::Mailbox
     {
@@ -391,7 +430,9 @@ pub fn make_send_once(
     let badge = source_entry.badge();
     // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let mut entries = Vec::new();
-    entries.try_reserve_exact(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve_exact(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
         super::handle::entry_with_badge(object, HandleRole::MailboxSenderOnce, rights, badge)
             .map_err(super::handle::map_error)?,
@@ -401,7 +442,9 @@ pub fn make_send_once(
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
         drop(space);
-        table.rollback(reservation).expect("make-send-once reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("make-send-once reservation must remain owned");
         return Err(error.into());
     }
     // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
@@ -427,13 +470,17 @@ pub fn send(
         return Err(SystemCallError::IllegalArgument);
     }
     let mut payload = Vec::new();
-    payload.try_reserve_exact(payload_len).map_err(|_| SystemCallError::OutOfMemory)?;
+    payload
+        .try_reserve_exact(payload_len)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     payload.resize(payload_len, 0);
     let move_bytes = move_count
         .checked_mul(core::mem::size_of::<HandleMove>())
         .ok_or(SystemCallError::IllegalArgument)?;
     let mut raw_moves = Vec::new();
-    raw_moves.try_reserve_exact(move_bytes).map_err(|_| SystemCallError::OutOfMemory)?;
+    raw_moves
+        .try_reserve_exact(move_bytes)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     raw_moves.resize(move_bytes, 0);
 
     let header: SendHeader = {
@@ -452,7 +499,9 @@ pub fn send(
     }
 
     let mut moves = Vec::new();
-    moves.try_reserve_exact(move_count).map_err(|_| SystemCallError::OutOfMemory)?;
+    moves
+        .try_reserve_exact(move_count)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     for bytes in raw_moves.chunks_exact(core::mem::size_of::<HandleMove>()) {
         // SAFETY: HandleMove 仅含整数 newtype；缓冲可能不对齐，故 unaligned 读。
         let item = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<HandleMove>()) };
@@ -463,7 +512,9 @@ pub fn send(
         let mut table = thread.process.handles.lock();
         // 解析与入队同临界区：MailboxSenderOnce 的消费与投递原子化，
         // 并发线程无法在解析后、入队前摘除一次性项。
-        let entry = table.get(mailbox_handle, Rights::WRITE).map_err(super::handle::map_error)?;
+        let entry = table
+            .get(mailbox_handle, Rights::WRITE)
+            .map_err(super::handle::map_error)?;
         let once = match *entry.role() {
             HandleRole::MailboxSender | HandleRole::MailboxSenderOnce => {
                 *entry.role() == HandleRole::MailboxSenderOnce
@@ -501,12 +552,13 @@ pub fn send(
     Ok(())
 }
 
-pub fn peek(
-    thread: &Thread,
-    mailbox_handle: Handle,
-    output: usize,
-) -> Result<(), SystemCallError> {
-    let object = resolve(thread, mailbox_handle, Rights::READ, HandleRole::MailboxOwner)?;
+pub fn peek(thread: &Thread, mailbox_handle: Handle, output: usize) -> Result<(), SystemCallError> {
+    let object = resolve(
+        thread,
+        mailbox_handle,
+        Rights::READ,
+        HandleRole::MailboxOwner,
+    )?;
     let header = concrete(&object)?.peek()?;
     let mut space = thread.process.space.lock();
     // SAFETY: MessageHeader 所有字段与 reserved 均已初始化且无 padding。
@@ -536,7 +588,12 @@ pub fn receive(
         space.check_range(handles_output, handle_output_bytes, true)?;
     }
 
-    let object = resolve(thread, mailbox_handle, Rights::READ, HandleRole::MailboxOwner)?;
+    let object = resolve(
+        thread,
+        mailbox_handle,
+        Rights::READ,
+        HandleRole::MailboxOwner,
+    )?;
     let mailbox = concrete(&object)?;
     let token = super::handle::transaction_token();
     let (reservation, message) = {
@@ -548,9 +605,8 @@ pub fn receive(
     let copied = {
         let mut space = thread.process.space.lock();
         // SAFETY: MessageHeader 无 padding，Handle 是 u64 newtype。
-        let header_result = unsafe {
-            uaccess::write_user_value(&mut space, header_output, &message.header)
-        };
+        let header_result =
+            unsafe { uaccess::write_user_value(&mut space, header_output, &message.header) };
         header_result
             .and_then(|_| uaccess::copy_to_user(&mut space, payload_output, &message.payload))
             .and_then(|_| {
@@ -567,7 +623,9 @@ pub fn receive(
     if let Err(error) = copied {
         let rejected = {
             let mut table = thread.process.handles.lock();
-            table.rollback(reservation).expect("Receive reservation must remain owned");
+            table
+                .rollback(reservation)
+                .expect("Receive reservation must remain owned");
             mailbox.rollback_receive(token, message)
         };
         if let Some(message) = rejected {
@@ -579,7 +637,9 @@ pub fn receive(
     let Message { handles, .. } = message;
     {
         let mut table = thread.process.handles.lock();
-        table.commit(reservation, handles).expect("Receive reservation must remain owned");
+        table
+            .commit(reservation, handles)
+            .expect("Receive reservation must remain owned");
         mailbox.commit_receive(token);
     }
     // 腾出容量后唤醒等待 WRITABLE 的发送者。
@@ -588,7 +648,12 @@ pub fn receive(
 }
 
 pub fn discard(thread: &Thread, mailbox_handle: Handle) -> Result<(), SystemCallError> {
-    let object = resolve(thread, mailbox_handle, Rights::READ, HandleRole::MailboxOwner)?;
+    let object = resolve(
+        thread,
+        mailbox_handle,
+        Rights::READ,
+        HandleRole::MailboxOwner,
+    )?;
     let mailbox = concrete(&object)?;
     mailbox.discard()?.close_transit_handles();
     // 腾出容量后唤醒等待 WRITABLE 的发送者。
@@ -603,7 +668,9 @@ fn resolve(
     role: HandleRole,
 ) -> Result<ObjectRef, SystemCallError> {
     let table = thread.process.handles.lock();
-    let entry = table.get(handle, rights).map_err(super::handle::map_error)?;
+    let entry = table
+        .get(handle, rights)
+        .map_err(super::handle::map_error)?;
     if *entry.role() != role || entry.object().kind() != ObjectKind::Mailbox {
         return Err(SystemCallError::WrongObjectType);
     }

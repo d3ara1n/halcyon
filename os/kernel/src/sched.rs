@@ -568,18 +568,19 @@ fn arm_quantum() {
     );
 }
 
-/// 回收终止线程：先 drop 线程强引用（REAPABLE 严格晚于最后一个容器
-/// 引用释放），再离场确认（全部离场则 REAPABLE 持续发布）。Dead 只由
-/// 管理者 ProcessDrain 的 Complete 分支发布（资源屏障语义）。
+/// 回收终止线程：先移除执行容器强引用，再向独立 departure state 请求离场。
+/// committed Map 结果义务可延后成员摘除与 DONE，但不保留 Thread/UserContext。
 fn reap(t: Arc<Thread>) {
     let process = t.process.clone();
     let pid = process.pid;
     let tid = t.tid;
+    let departure = t.departure();
+    let departure_kind = t.departure_kind();
     let switches = t.switches.load(Ordering::Relaxed);
     let now = sbi::read_time();
     let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
     drop(t);
-    crate::task::process::confirm_departure(&process, tid);
+    departure.request(departure_kind);
     log!(
         Task,
         "pid {} thread {} reaped: {} switches, lifespan {} ms",

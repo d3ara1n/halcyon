@@ -10,6 +10,7 @@ pub mod object;
 pub mod proc;
 pub mod process;
 pub mod system_reset;
+pub mod thread;
 pub mod tunnel;
 pub mod wait;
 

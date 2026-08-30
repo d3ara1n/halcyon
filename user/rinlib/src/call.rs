@@ -8,7 +8,8 @@ use erhino_shared::{
     object::{Handle, HandlePair, Rights},
     proc::{
         ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
-        ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadStartContext, Tid,
+        ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadSpawnResult,
+        ThreadStartContext, Tid,
     },
     reset::{ResetAction, ResetReason},
     wait::{WaitItem, WaitResult},
@@ -346,15 +347,37 @@ pub unsafe fn sys_process_grant(
     .map(|_| ())
 }
 
-pub unsafe fn sys_thread_spawn(context: &ThreadStartContext) -> SystemCallResult<Tid> {
+pub unsafe fn sys_thread_spawn(
+    context: &ThreadStartContext,
+    result: &mut ThreadSpawnResult,
+) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ThreadSpawn,
         context as *const ThreadStartContext as usize,
-        0,
+        result as *mut ThreadSpawnResult as usize,
         0,
         0,
     )
-    .map(|tid| tid as Tid)
+    .map(|_| ())
+}
+
+pub unsafe fn sys_thread_yield() -> SystemCallResult<()> {
+    sys_call(SystemCall::ThreadYield, 0, 0, 0, 0).map(|_| ())
+}
+
+pub unsafe fn sys_thread_exit(code: i64) -> ! {
+    let _ = unsafe {
+        raw_call(
+            SystemCall::ThreadExit as usize,
+            code as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    panic!("ThreadExit unexpectedly returned")
 }
 
 pub unsafe fn sys_tunnel_create(addr: usize, output: &mut HandlePair) -> SystemCallResult<()> {

@@ -100,15 +100,15 @@ pub enum SystemCall {
     JobDerive = 0x1c,
 
     // -----Thread-----
-    /// Finalized thread notifies kernel to cleanup
+    /// 正常结束当前线程；若为末线程则冻结进程 Exited 终态。
     ThreadExit = 0x20,
-    /// Be nice
+    /// 在完整事务边界把当前线程重新放入调度队列。
     ThreadYield = 0x21,
-    /// 向当前 Running process 附入 ThreadStartContext 描述的线程。
+    /// 由 ThreadStartContext 创建线程并写出 ThreadSpawnResult。
     ThreadSpawn = 0x22,
-    /// Wait another owned thread to exit
+    /// 保留：join 通过 ThreadControl + WaitMany 完成。
     ThreadJoin = 0x23,
-    /// Kill owned thread
+    /// 保留：首版不实现线程级终止。
     ThreadKill = 0x24,
     /// 当前线程睡眠指定毫秒（异步：登记期限后 Waiting，到期唤醒）
     Sleep = 0x25,

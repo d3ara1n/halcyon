@@ -1,6 +1,6 @@
 //! Process 生命周期状态机：Building → Running → Terminating → Dead 的
-//! 唯一真值、线程成员表（含 Building 期预育条目）与终止待办
-//! （notes/ideas/task.md「进程」）。
+//! 唯一真值、线程成员表（含 Building 预育与 Running spawn 提交态）与
+//! 终止待办（notes/ideas/task.md「进程」）。
 //!
 //! 锁序契约（顶级）：**Job 链锁（先父后子，≤32 把）→ lifecycle 锁 →
 //! 其他对象锁**。lifecycle 锁可整体嵌套于 Job 链锁内（ProcessStart
@@ -19,10 +19,10 @@
 //!
 //! 成员表是线程容器记录的真值：条目只在线程强引用真正消散后由持有方
 //! 经 thread_departed 摘除：kill 不把仍在队列或等待竞争中的线程摘除，
-//! 只组装触达待办。Staging 条目携带线程强引用（Building 期预育表：
-//! 线程经组装者附入但尚未入册可运行）——引用与 Thread.process 的
-//! 强回指构成环，环只存在于 Building 期且在 Terminating 后必被
-//! take_first_staging 游标打破（REAPABLE 合取含表空，Dead 前无残留）。
+//! 只组装触达待办。Staging 条目携带 Building 预育线程强引用，环由
+//! take_first_staging 游标打破；Spawning 条目只覆盖 Running spawn 的固定宽
+//! 输出与不可失败提交窗口，终止游标不能摘取，由发起方提交为 Ready 或在
+//! 输出 fault 后回滚。
 //! 唤醒到再调度之间存在过渡窗口：自然完成的等待线程
 //! 在被再次 dispatch 前记录仍为 Waiting（指向已完成的 context），由
 //! enter_running 的覆盖写收编；终止路径对这类 stale 记录的取消 offer
@@ -50,6 +50,9 @@ pub(crate) enum ThreadState {
     /// Start 提交点整体转 Ready（强引用移交类队列）；终止路径经
     /// take_first_staging 摘除释放。
     Staging { thread: Arc<super::Thread> },
+    /// Running ThreadSpawn 已分配 tid、尚未完成固定宽输出与 Ready 发布；
+    /// 强引用由成员表持有，termination 只能等待提交尾段。
+    Spawning { thread: Arc<super::Thread> },
     /// 在某 hart 执行点上；线程强引用由调度循环持有，IPI 吸收。
     Running { slot: usize },
     /// 无容器等待中；线程强引用由 WaitContext 持有，经 weak 触达取消。
@@ -68,6 +71,18 @@ pub(crate) enum AttachFault {
     Limit,
     /// 成员表容量预留失败。
     Oom,
+}
+
+/// Running ThreadSpawn 在线性化段得到的成员身份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpawnMember {
+    tid: Tid,
+}
+
+impl SpawnMember {
+    pub(crate) const fn tid(self) -> Tid {
+        self.tid
+    }
 }
 
 /// begin_running 失败分类（活体门与计数一致性在同一锁内判定）。
@@ -295,6 +310,68 @@ impl Lifecycle {
         Ok(tid)
     }
 
+    /// Running ThreadSpawn 线性化：检查准入与上界，锁内构造线程并插入
+    /// Spawning。返回的 Arc 与成员表引用同源，不分配额外 backing。Spawning
+    /// 阻止 REAPABLE，termination 不会摘取它。
+    pub(crate) fn begin_spawn(
+        &self,
+        build: impl FnOnce(Tid) -> Result<Arc<super::Thread>, AttachFault>,
+    ) -> Result<(SpawnMember, Arc<super::Thread>), AttachFault> {
+        let mut inner = self.inner.lock();
+        if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running) {
+            return Err(AttachFault::Closed);
+        }
+        if inner.members.len() >= PROCESS_MAX_THREADS {
+            return Err(AttachFault::Limit);
+        }
+        let tid = inner.next_tid;
+        let thread = build(tid)?;
+        inner.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
+        inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
+        inner.members.push(MemberEntry {
+            tid,
+            state: ThreadState::Spawning {
+                thread: thread.clone(),
+            },
+        });
+        advance_execution(&mut inner);
+        Ok((SpawnMember { tid }, thread))
+    }
+
+    /// 固定宽输出成功后的不可失败提交：Spawning → Ready，并把成员表强引用
+    /// 交给调用方提交到已经预留的调度槽。即使 termination 已冻结也必须完成。
+    pub(crate) fn commit_spawn(&self, member: SpawnMember) -> Arc<super::Thread> {
+        let mut inner = self.inner.lock();
+        let index = position(&inner.members, member.tid)
+            .expect("spawn member must remain present through commit");
+        let state = core::mem::replace(&mut inner.members[index].state, ThreadState::Ready);
+        advance_execution(&mut inner);
+        match state {
+            ThreadState::Spawning { thread } => thread,
+            _ => unreachable!("spawn member must remain Spawning through commit"),
+        }
+    }
+
+    /// 固定宽输出 fault 的防御回滚。线程从未进入调度容器；调用方锁外 drop
+    /// 返回的强引用，并在 true 时发布进程 REAPABLE。
+    pub(crate) fn rollback_spawn(&self, member: SpawnMember) -> (Arc<super::Thread>, bool) {
+        let mut inner = self.inner.lock();
+        let index = position(&inner.members, member.tid)
+            .expect("spawn member must remain present through rollback");
+        let entry = inner.members.remove(index);
+        advance_execution(&mut inner);
+        let thread = match entry.state {
+            ThreadState::Spawning { thread } => thread,
+            _ => unreachable!("only Spawning member can roll back"),
+        };
+        let reapable = self.is_terminating()
+            && inner.members.is_empty()
+            && inner.active == 0
+            && inner.building_ops == 0
+            && inner.mandatory_ops == 0;
+        (thread, reapable)
+    }
+
     /// 成员表当前长度（Start 活体门与入册预留的计数输入；Building 期
     /// 成员全部是 Staging 预育条目）。
     pub(crate) fn member_count(&self) -> usize {
@@ -494,18 +571,35 @@ impl Lifecycle {
         EnterRunning::Entered
     }
 
-    /// 线程离场完成（调用方已 drop 线程强引用：reap / WaitContext 完成
-    /// 方 / Start 防御失败路径）：摘除成员；返回是否可发布 REAPABLE
-    /// （末离场者发布）。
-    pub(crate) fn thread_departed(&self, tid: Tid) -> bool {
+    /// 线程离场完成：调用方已经移除执行容器强引用，且线程级结果义务归零。
+    /// 正常末线程在此冻结进程 Exited 终态；已有进程级终止则保持首达终因。
+    pub(crate) fn thread_departed(
+        &self,
+        tid: Tid,
+        normal_code: Option<i64>,
+    ) -> (Option<TerminationTodo>, bool) {
+        let mut todo = TerminationTodo::default();
         let mut inner = self.inner.lock();
         let index = position(&inner.members, tid).expect("departing thread must be a member");
         inner.members.remove(index);
-        self.is_terminating()
+        let started_termination = self.state.load(Ordering::Acquire)
+            == state_index(ProcessState::Running)
+            && inner.members.is_empty();
+        if started_termination {
+            inner.reason = ProcessExitReason::Exited;
+            inner.code = normal_code.expect("last Running thread must exit normally");
+            todo.ipi_slots = inner.active;
+            advance_execution(&mut inner);
+            self.state
+                .store(state_index(ProcessState::Terminating), Ordering::Release);
+        }
+        let reapable = self.is_terminating()
             && inner.members.is_empty()
             && inner.active == 0
             && inner.building_ops == 0
-            && inner.mandatory_ops == 0
+            && inner.mandatory_ops == 0;
+        todo.reapable = reapable;
+        (started_termination.then_some(todo), reapable)
     }
 
     /// 终止触达游标（锁外逐条驱动）：摘取首个 Waiting 成员的 weak

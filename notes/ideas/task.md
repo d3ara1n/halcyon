@@ -73,3 +73,9 @@ Running→Terminating 的准入截止与 AddressSpace Commit 共享 Process exec
 ## 多线程终止边界
 
 多线程进程必须维护成员关系与 active-hart 集合。进程回收要先阻止任何线程再次返回用户态，再取消 Ready/Waiting，并请求各 hart 上的 Running 线程在安全边界自行离场。active 身份既服务终止屏障，也为地址空间 translation epoch 提供执行点快照：hart 只有在完成已承诺的地址翻译同步并切回 kernel satp 后才能清除身份，快照后进入者必须在返回用户态前观察最新 epoch。最后一个终止确认到达且在途地址空间事务完成后，管理者才能分批回收页表和数据帧。ThreadSpawn 必须复用同一成员关系、active-hart barrier 与 WaitContext cancellation；线程消散可以放弃回复，但其 departed/join 完成不能越过仍挂接结果记录的 committed System Call。join 确认线程离场且该挂接已解除后，用户态才可接管结果并按[内存模型](mm.md)解除或复用其栈。
+
+## 用户态线程资源收束
+
+内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈。rinlib 以普通匿名 mapping 组成双 guard 的 UserStack，并把 stack mapping、用户结果记录与 ThreadControl 组合为 affine JoinHandle。首版采用结构化收束：显式 join 返回结果；未显式 join 时 handle 析构也等待内核 DONE 后解除完整 stack reservation 并丢弃结果，不以静默泄漏或内核代拆映射冒充 detach。未来若需要 detach，应由正式用户态 reaper 接管这组资源，而不是削弱 join 完成边界。
+
+ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 joiner 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。

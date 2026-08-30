@@ -1,22 +1,25 @@
 # 线程资源模型与用户态多线程（ThreadSpawn）
 
-> 批一 Start 拆解及事务复审已收口；用户内存 8A 的当前公开面与五条平台矩阵
-> 已完成验证，待其独立提交后立即重开批二契约审查。Map/Unmap、guard、Remote
-> Call、affine `MappedRegion` 与 allocator 多 arena 已落地；同 AddressSpace 双
-> hart、并发解除和次线程栈/join 组合所有权作为批二/批三必须通过的 user-memory
-> 8B integration gate。联合边界见
+> 批一 Start 拆解及事务复审已收口；用户内存 8A 已由 `9358963` 提交。
+> 批二契约与 shared/kernel/rinlib 实现已经完成，user-memory 8B 的同
+> AddressSpace 多 hart、并发解除、guarded stack 与 join 组合所有权已通过
+> host、common debug/release、virt-hetero、virt-nofd 与 sifive_u 验证，当前待
+> 独立提交；批三竞态扩面、carryover IPC 压力线与实现文档同步仍待完成。联合边界见
 > [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)。
 
 ## 决策记录
 
 | # | 决策 | 结论 |
 |---|---|---|
-| D1 | 次线程栈归属 | 用户供栈。内核 spawn 不分配用户地址空间 backing；仍分配有固定结构上界的 Thread、观察壳与容器容量。栈大小/guard/放置/回收是应用政策。该方向不等于允许以 Extend 堆块作为永久降级实现：批二须等待完整 Map/Unmap 前置收口后再定用户态接口 |
-| D2 | join 形态 | 内核铸造 waitable 观察壳（第四对 core/shell）。离场是内核自有事实（成员表摘除），内核事实经内核对象观察，与 REAPABLE/CLOSED 同纪律；亦为未来 ThreadKill 预留（壳不依赖 wrapper 跑完） |
-| D3 | ThreadKill | 首版不实现，保留号维持不可用。延后不锁面：成员表 tid 寻址、泛化终止机器、join 壳三项前置均在本次落地；将来需加终止标志位 + pick gate/trap 入口检查扩展，是加检查不是改结构。壳携带离场方式字（v1 仅 Normal），未来 Killed 增判别值不改 ABI |
+| D1 | 次线程栈归属 | 用户供栈。内核 spawn 不分配或接管用户地址空间 backing；rinlib `UserStack` 以普通 `MappedRegion` 建立双 guard 与可配置 usable 栈，join 后消费完整 reservation。首线程 Building 固定栈不复用为 Running 栈池 |
+| D2 | join 形态 | 内核铸造 waitable ThreadControl 壳（第四对 core/shell）。离场是内核自有事实（成员表摘除），DONE 在摘除后锁外发布；壳 close 只消散观察权，不杀线程 |
+| D3 | ThreadKill | 首版不实现，保留号维持不可用。成员表 tid 寻址、join 壳与 pick/trap gate 保持未来增量入口；v1 壳只公开 DONE，不预设尚不存在的离场方式查询 ABI |
 | D4 | 线程数上界 | shared 常量 `PROCESS_MAX_THREADS = 1024`，约束**并发成员数**（表长），超限 `ReachLimit`；tid 单调不复用（生灭循环不耗尽）。附带红利：终止取消循环（线程数 × WAIT_MANY_MAX）获得结构上界 |
 | D5 | 首线程观察壳 | 不发。等首线程死无消费者（等全灭有 CLOSED）；「首线程先走、进程仍活」无现实场景；将来加是纯增量（Start 描述符 reserved 扩展），不锁面 |
-| D6 | 线程=资源组装模型 | 采纳：ProcessAttach（外部附线程）+ ProcessGrant（外部装句柄）+ ProcessStart 纯化（入册）。无线程的进程停留在 Building——「没活过」；活体检查门（表非空）是 Start 唯一前置检查。已附线程数 N 不限（N 与门性质正交）；出生块为纯用户约定数据；外部附线程无观察壳（组装不是协作，组装者在 Start 之后不再观察内部状态）；Start 名字保留（开始调度/生命周期/Running） |
+| D6 | 线程=资源组装模型 | 采纳：ProcessAttach（外部附线程）+ ProcessGrant（外部装句柄）+ ProcessStart 纯化（入册）。无线程的进程停留在 Building；外部附线程无观察壳，Start 是唯一 Building→Running 发布点 |
+| D7 | JoinHandle 收束 | 采用结构化收束：`JoinHandle::join` 等 DONE、取得用户结果并解除完整 guarded stack；未显式 join 时 Drop 走同一等待与解除路径并丢弃结果。首版不提供 detach，不建立常驻 reaper，也不允许静默保留到进程退出 |
+| D8 | 线程结果义务 | 可能 park 的 MemoryMap 在调用线程登记 affine Map-result obligation；线程执行容器可先消散，但成员摘除、DONE 与栈接管必须晚于 obligation 完成。进程级 mandatory_ops 继续独立保护 AddressSpace Drain |
+| D9 | Spawn ABI 与提交 | `ThreadSpawn(context_ptr, result_ptr)` 同步输出固定宽 `ThreadSpawnResult { tid, reserved, control }`。全部可失败资源先预留；lifecycle 锁内分配 tid 并插入不可被终止游标摘取的 Spawning 成员，固定宽输出成功后依次提交 handle、Ready 成员和调度占位，提交尾段不可失败 |
 | tid | 编号起点 | tid 从 1 起，0 保留为非身份值——与 pid/JobId 的哨兵纪律（`parent=0`）对齐；pid 1 = init、jid 1 = root、tid 1 = 首线程，各 ID 空间的 1 号均为奠基者 |
 
 ### 已否决替代方案（防同题重议）
@@ -60,14 +63,14 @@ Building/Running 的本质即外部写通道的开/关。组装者（init/pm 经
 
 | op | 通道 | 语义 |
 |---|---|---|
-| `ThreadSpawn(entry, sp, arg1, arg2) → (tid, handle)` | 内部，Running 专属 | 不分配用户 backing：创建内核执行基底（UserContext + 调度链 + join 壳）；内核元数据在可失败段完成有界预留。sp/entry 做 translate 前置校验，坏 sp 的 fault 走用户 fault 杀进程。arg1/arg2 为出生参数；安全用户态封装待 Map/Unmap 前置完成后重新设计 |
+| `ThreadSpawn(context_ptr, result_ptr) → ()` | 内部，Running 专属 | context 沿用 `ThreadStartContext`；result 是 16 字节固定宽 `ThreadSpawnResult`，成功交付 tid 与 waitable ThreadControl handle。内核不分配用户 backing；entry/sp 做当前 AddressSpace translate 前置校验 |
 | `ThreadExit(code)` | 内部 | 本线程离场；末线程冻结 `(Exited, code)`（code 仅在此刻成为进程终态字段——lifecycle 的进程终因，不是线程遗产）。非末线程 code 丢弃，结果值走用户通道（spawn 时用户分配 result 槽，wrapper 先写后 exit） |
 | `ThreadYield` | 内部 | 自入队尾，复用公平 FIFO |
 | `ProcessAttach(builder, entry, sp, arg1, arg2) → tid` | 外部，Building 专属 | 组装者附线程；无观察壳；arg1/arg2 与内部 Spawn 同形（首线程传出生块地址与长度） |
 | `ProcessGrant(builder, grants_ptr, count, out_values) → ()` | 外部，Building 专属 | 从组装者表摘 grants 装入目标表，句柄值写回 out_values（pin/commit 机制自原 Start 事务原样搬运）；组装者将值写入出生块后经 ProcessWrite 落盘。out_values 为第四参（写回目标），签名与实现一致 |
 | `ProcessStart(builder, profile)` | 外部 | 活体检查门（已附线程 ≥1，唯一前置检查）→ Building→Running（含预育原子提取）→ 一次冻结 execution binding（profile 为判定输入，进程级属性）→ 预育线程整体入册。参数为平铺 (builder, profile)，无描述符 |
 
-- **join**：`WaitMany(壳 Handle, DONE)`，不设 ThreadJoin syscall（0x23 保留号留空）；结果值读用户槽。**内存序契约**：离场线程在 ThreadExit 前的全部用户态存储对 joiner 可见——release/acquire 经 lifecycle 锁（RV AMO aq/rl）与 finish_offered 完成链传递。
+- **join**：`WaitMany(ThreadControl, DONE)`，不设 ThreadJoin syscall（0x23 保留号留空）；结果值留在 rinlib 用户记录。离场线程在 ThreadExit 前的全部用户态存储对 joiner 可见，release/acquire 由 lifecycle 离场锁与 ThreadControl 电平发布链传递。rinlib 的 JoinHandle 结构化拥有记录、control 与 UserStack，join 或 Drop 都只在 DONE 后解除。
 - **出生块**：纯用户约定数据（Header + 句柄值 + payload），内核机制（Handle 数值预留连续绑定、map_startup_block、map_bootstrap_block 的前缀协议）删除；init bootstrap 改走内核内嵌的同构 op 序列（payload 收编 owned backing 的特例保留在内嵌 Write 里）。
 - **保留号处置**：ThreadExit 0x20 / ThreadYield 0x21 / ThreadSpawn 0x22 启用；ThreadJoin 0x23 不设；ThreadKill 0x24 维持不可用。
 
@@ -75,15 +78,15 @@ Building/Running 的本质即外部写通道的开/关。组装者（init/pm 经
 
 ### 预育容器（nursery）
 
-稳定所有权容器清单不变（类队列 | hart current | WaitContext）；预育表不是独立容器，而是**成员表的 Building 期形态**：`Staging { thread: Arc<Thread> }` 条目携带线程强引用，ProcessAttach 在 lifecycle 锁内原子插入（闭包式：tid 分配 + 线程构造 + 表插入同临界区，失败零副作用），Start 提交点在 begin_running 同一临界区内整体转 Ready 并交出强引用，Building abandonment 由终止游标 take_first_staging 逐条摘除释放（打破 Staging↔Thread.process 引用环）。内部 ThreadSpawn 的 Staging 瞬态同样由成员表携带（syscall 上下文构造，线性化点插入）。
+稳定所有权容器清单不变（类队列 | hart current | WaitContext）；预育表只是成员表的 Building 期形态：`Staging { thread: Arc<Thread> }` 条目携带线程强引用，ProcessAttach 锁内插入，Start 同临界区整体转 Ready 并交出引用，Building abandonment 由终止游标逐条摘除。Running ThreadSpawn 不复用可被 Building 终止游标摘取的 Staging；它使用独立 Spawning 成员覆盖固定宽输出与不可失败提交之间的短暂所有权。
 
 ### ThreadSpawn 事务（reserve/commit/rollback 四要素）
 
-可失败段：cap 检查（表长 < 1024）→ try_reserve（成员表容量 / Thread Arc / 壳槽位 / 目标类 Ready 位）→ sp/entry translate 前置校验。线性化段（lifecycle 锁内，不可失败）：分配 tid、插入 `(tid, Staging)`。提交段：壳铸造 → commit_ready → staging_ready。Terminating 冻结后拒绝（lifecycle 锁内检查）。
+可失败段：构造 ThreadControl/提交缓冲，预留 Handle 槽与目标域 Ready 槽，校验 entry/sp 与固定宽输出区间。lifecycle 线性化段检查 Running/线程上界，预留成员容量、分配 tid、构造 Thread 并插入 Spawning；从此成员阻止 REAPABLE，终止游标不摘取它。输出失败只会冻结调用进程并回滚 Spawning/Handle/Ready 预留；输出成功后依次提交 ThreadControl entry、Spawning→Ready 与调度占位，全部不可失败。Terminating 先到则在线性化段前拒绝；Spawning 先到则终止等待提交尾段自然收束。
 
 ### join 观察壳（第四对 core/shell）
 
-Thread↔壳，与 Process↔ProcessControl、Job↔JobControl 同构：壳由 HandleTable 条目强持，weak 回指线程；close 只消散观察权不杀线程；壳 close 后线程照常离场（weak 升级失败 = 观察者已走）。DONE 电平发布于 thread_departed 摘除后**锁外**（take_completer/finish_offered 模式，锁序无新边）。离场方式字 v1 仅 Normal。
+ThreadControl 与执行 Thread 解耦：壳由 HandleTable 条目强持，内部 departure state 只持壳 weak；close 只消散观察权不杀线程，关闭后线程照常离场。DONE 电平发布于成员摘除及全部线程级 Map-result obligation 完成之后，并在释放 lifecycle/departure 锁后以 `take_completer → finish_offered` 逐个交付，不新增反向锁边。
 
 ### 末线程被动终局边
 
@@ -92,6 +95,12 @@ Thread↔壳，与 Process↔ProcessControl、Job↔JobControl 同构：壳由 H
 ### Start 拆解
 
 start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随成员表持有）；grants 移入 ProcessGrant；Start 收缩为“链锁内上行检查 seal + 活体门 + Building→Running（含预育原子提取）+ execution binding + Ready 完整批次发布”。原子的价值不损失：Start 仍是唯一 Building→Running 线性化点，回滚面反而变小（各 op 独立回滚）。
+
+### 8A 后批二契约复审（2026-08-30）
+
+复审确认首线程固定 Building 栈、出生块与 Running 次线程资源不可混用；可复用面只有 `ThreadStartContext`、UserContext 构造、进程 execution domain、调度 Ready reservation、成员/active barrier 与 ObjectWaitState。rinlib 安全面采用 `Builder → UserStack + 用户结果记录 → ThreadSpawn → JoinHandle`，默认栈为普通匿名 RW mapping、前后各一页 guard、sp 取 usable 顶端 16 字节对齐。
+
+复审同时修正原计划两处不闭合：Running Staging 会被 termination 的 Building 游标摘走，改为独立 Spawning→Ready 不可失败提交；仅有进程 mandatory_ops 会允许被 kill 线程先发布 DONE，改由 Map-result obligation 把成员摘除与 join 完成延后到 result lease/transaction 完成之后。
 
 ## 实施批次
 
@@ -125,10 +134,17 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 ### 实施批次总览
 
 1. **批一：Start 拆解**——ProcessAttach/ProcessGrant/Start 纯化、ABI 两侧（shared + rinlib/libprocess + 全负载组装路径）、init bootstrap 内嵌同构序列、startup 机制删除、出生块转用户约定。验证：全负载等价回归（virt/virt-release/hetero/nofd/sifive_u/host）。
-2. **批二：ThreadSpawn/Exit/Yield + join 壳（8A 后重审并实施）**——spawn 事务（预育结构已在批一落地）；基于完整 Map/Unmap、guard、shootdown 与 affine `MappedRegion`，先重审 `UserStack`/wrapper/结果槽/join handle 的用户态组合所有权，再实现 shared/kernel/rinlib。验证：等价回归 + 多线程功能负载 + user-memory 8B integration gate。
+2. **批二：ThreadSpawn/Exit/Yield + join 壳（已完成，待提交）**——shared 固定宽 ABI、Running `Spawning→Ready` 事务、ThreadControl DONE、线程级 Map-result obligation 与 rinlib guarded `UserStack`/结构化 `JoinHandle` 已贯通；user-memory 8B 真实多线程 gate 已通过。
 3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步**——见下两节。
 
 每个实现或修复批次独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。
+
+### 批二与 8B 验证状态（2026-08-30）
+
+- common debug 与 release 均通过 13/13 场景；同 AddressSpace 旧 VA 精确复用观测到 2 个 active hart，8 轮普通 Unmap/Tunnel lease close 并发及 join/stack 回收完成；
+- `virt-hetero`、`virt-nofd` 与 `sifive_u` 通过同一 13/13 矩阵，sifive_u 按既定 reset 后端失败终态收割；host 逻辑 crate 与 shared ABI 全绿；
+- kill 与并发 ThreadSpawn 的 draining 失败路径命中并修正 `ADDRESS_SPACE → LEAF` ready rollback 反序；压力线程对 planner 的正式 `ObjectBusy` 背压只在完整失败事务边界退避，affine region token 不丢失；
+- 现有公开终止面只能执行 ProcessKill：进程级 `mandatory_ops` 会先挡住 committed Map，再允许线程 departure，因此线程级 result obligation 在该路径上不独立成为最终阻塞者。首版没有 ThreadKill，无法从用户态合法制造“仅调用线程消散而进程继续”的直接观测窗口；保留双层契约，不增加测试专用内核入口。
 
 ## 竞态矩阵新增场景
 

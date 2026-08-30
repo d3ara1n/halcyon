@@ -126,6 +126,7 @@ impl ObjectSignals {
     pub const WRITABLE: Self = Self(1 << 1);
     pub const DATA: Self = Self(1 << 2);
     pub const REAPABLE: Self = Self(1 << 3);
+    pub const DONE: Self = Self(1 << 4);
     pub const PEER_CLOSED: Self = Self(1 << 62);
     pub const CLOSED: Self = Self(1 << 63);
     pub const KNOWN: Self = Self(
@@ -133,6 +134,7 @@ impl ObjectSignals {
             | Self::WRITABLE.0
             | Self::DATA.0
             | Self::REAPABLE.0
+            | Self::DONE.0
             | Self::PEER_CLOSED.0
             | Self::CLOSED.0,
     );

@@ -312,12 +312,11 @@ impl WaitContext {
                 self.deliver(&thread, outcome);
                 sched::enqueue(thread);
             } else {
-                // 终止取消：线程永不回用户态，随本上下文消散；
-                // 离场确认与 REAPABLE 电平由 process 侧统一发布。
-                let process = thread.process.clone();
-                let tid = thread.tid;
+                // 终止取消：执行容器引用先消散；独立 departure state 在全部
+                // 线程级结果义务完成后摘除成员并发布 DONE/REAPABLE。
+                let departure = thread.departure();
                 drop(thread);
-                super::process::confirm_departure(&process, tid);
+                departure.request(super::thread::DepartureKind::Terminated);
             }
         }
         self.core.mark_done();

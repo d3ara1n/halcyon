@@ -1,7 +1,7 @@
 //! 进程与线程：资源容器 / 执行容器（见 notes/impls/task.md）。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use erhino_shared::{
@@ -560,6 +560,7 @@ pub struct AddressSpace {
 
 static SHOOTDOWN_SELFTEST_STARTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+static MULTI_HART_SHOOTDOWN_OBSERVED: AtomicBool = AtomicBool::new(false);
 
 struct ShootdownSelfTestCompletion;
 
@@ -583,6 +584,7 @@ pub(crate) struct MemoryChangeCompletion {
     waiter: Arc<super::wait::WaitContext>,
     retire: Option<Arc<dyn MemoryRetireSink>>,
     published: crate::sync::Spinlock<Option<PublishedChange>>,
+    result_obligation: crate::sync::Spinlock<Option<super::thread::ThreadResultObligation>>,
 }
 
 impl MemoryChangeCompletion {
@@ -590,12 +592,17 @@ impl MemoryChangeCompletion {
         process: Arc<Process>,
         waiter: Arc<super::wait::WaitContext>,
         retire: Option<Arc<dyn MemoryRetireSink>>,
+        result_obligation: Option<super::thread::ThreadResultObligation>,
     ) -> Self {
         Self {
             process,
             waiter,
             retire,
             published: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            result_obligation: crate::sync::Spinlock::new(
+                crate::sync::ranks::MEMORY_COMPLETION,
+                result_obligation,
+            ),
         }
     }
 
@@ -639,6 +646,13 @@ impl crate::remote_call::Completion for MemoryChangeCompletion {
         {
             control.publish_reapable();
         }
+        // ThreadControl DONE 必须晚于 result lease 与 AddressSpace Complete；
+        // 先释放 affine 线程义务，再完成仍存活调用者的 WaitContext。
+        let result_obligation = {
+            let mut slot = self.result_obligation.lock();
+            slot.take()
+        };
+        drop(result_obligation);
         self.waiter.clone().complete_kernel();
     }
 }
@@ -647,10 +661,16 @@ pub(crate) fn prepare_memory_completion(
     process: Arc<Process>,
     value: usize,
     retire: Option<Arc<dyn MemoryRetireSink>>,
+    result_obligation: Option<super::thread::ThreadResultObligation>,
 ) -> Result<(Arc<MemoryChangeCompletion>, super::wait::WaitPlan), SystemCallError> {
     let (waiter, plan) = super::wait::prepare_kernel(value)?;
-    let completion = Arc::try_new(MemoryChangeCompletion::new(process, waiter, retire))
-        .map_err(|_| SystemCallError::OutOfMemory)?;
+    let completion = Arc::try_new(MemoryChangeCompletion::new(
+        process,
+        waiter,
+        retire,
+        result_obligation,
+    ))
+    .map_err(|_| SystemCallError::OutOfMemory)?;
     Ok((completion, plan))
 }
 
@@ -765,6 +785,13 @@ impl AddressSpace {
             .snapshot_running()
             .ok_or(PrepareShootdownError::NotRunning)?;
         let active = execution.active();
+        if active.count_ones() >= 2 && !MULTI_HART_SHOOTDOWN_OBSERVED.swap(true, Ordering::AcqRel) {
+            log!(
+                Memory,
+                "same-address-space multi-hart shootdown observed: {} active harts",
+                active.count_ones()
+            );
+        }
         if active == 0 {
             return Ok(PreparedShootdown {
                 execution,
@@ -876,17 +903,19 @@ fn start_user_memory_change(
     instruction: bool,
     write_map_payload: bool,
     value: usize,
+    result_obligation: Option<super::thread::ThreadResultObligation>,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let (completion, plan) = match prepare_memory_completion(process.clone(), value, None) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            process
-                .space
-                .lock()
-                .rollback_user_memory(prepared.take().expect("memory change must roll back"));
-            return Err(error);
-        }
-    };
+    let (completion, plan) =
+        match prepare_memory_completion(process.clone(), value, None, result_obligation) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                process
+                    .space
+                    .lock()
+                    .rollback_user_memory(prepared.take().expect("memory change must roll back"));
+                return Err(error);
+            }
+        };
     let sink: Arc<dyn crate::remote_call::Completion> = completion.clone();
     let shootdown = match process.space.prepare_shootdown(&process.lifecycle, sink) {
         Ok(shootdown) => shootdown,
@@ -969,7 +998,15 @@ pub(crate) fn memory_map(
         .change
         .map_result()
         .expect("Map reservation must retain its layout");
-    start_user_memory_change(process, Some(prepared), layout.reservation, false, true, 0)
+    start_user_memory_change(
+        process,
+        Some(prepared),
+        layout.reservation,
+        false,
+        true,
+        0,
+        Some(thread.result_obligation()),
+    )
 }
 
 /// 精确解除当前 Running process 的普通 mapping/reservation。
@@ -981,7 +1018,7 @@ pub(crate) fn memory_unmap(
     let process = thread.process.clone();
     let range = public_page_range(address, bytes)?;
     let prepared = process.space.lock().prepare_user_unmap(range)?;
-    start_user_memory_change(process, Some(prepared), range, false, false, 0)
+    start_user_memory_change(process, Some(prepared), range, false, false, 0, None)
 }
 
 /// 在创建时冻结的最大权限内改变当前 mapping 权限。
@@ -1012,7 +1049,7 @@ pub(crate) fn memory_protect(
                     if *from == Protection::ReadExecute || *to == Protection::ReadExecute
             )
         });
-    start_user_memory_change(process, Some(prepared), range, instruction, false, 0)
+    start_user_memory_change(process, Some(prepared), range, instruction, false, 0, None)
 }
 
 /// 地址空间可变状态：MemorySpace ledger、anonymous backing、页表树与有界 drain
@@ -2460,8 +2497,9 @@ impl Process {
             .map_err(ThreadAttachError::Context)?;
         self.lifecycle
             .attach_member(|tid| {
-                Arc::try_new(Thread::new_thread(tid, self, context))
-                    .map_err(|_| super::lifecycle::AttachFault::Oom)
+                let thread = Thread::new_thread(tid, self, context)
+                    .map_err(|_| super::lifecycle::AttachFault::Oom)?;
+                Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
             })
             .map_err(|fault| match fault {
                 super::lifecycle::AttachFault::Closed => ThreadAttachError::Closed,
@@ -2635,6 +2673,9 @@ pub struct Thread {
     /// 被调度次数（公平性观测，见 notes/impls/task.md）。
     pub switches: AtomicU64,
     frame: UnsafeCell<UserContext>,
+    departure: Arc<super::thread::ThreadDeparture>,
+    normal_exit: AtomicBool,
+    exit_code: AtomicI64,
 }
 
 // SAFETY: UserContext 只在两种互斥状态下被访问：线程在本 hart 执行/
@@ -2653,23 +2694,62 @@ impl Thread {
         tid: Tid,
         process: &Arc<Process>,
         context: ThreadStartContext,
-    ) -> Self {
+    ) -> Result<Self, ()> {
+        Self::new_thread_with_control(tid, process, context, None)
+    }
+
+    pub(super) fn new_thread_with_control(
+        tid: Tid,
+        process: &Arc<Process>,
+        context: ThreadStartContext,
+        control: Option<&Arc<super::thread::ThreadControl>>,
+    ) -> Result<Self, ()> {
+        let departure = super::thread::ThreadDeparture::new(process, tid, control)?;
         let mut ctx = UserContext::zeroed();
         ctx.sepc = context.entry;
         ctx.x[2] = context.stack_pointer;
         ctx.x[10] = context.arg1; // a0
         ctx.x[11] = context.arg2; // a1
-        Self {
+        Ok(Self {
             tid,
             process: process.clone(),
             created_tick: sbi::read_time(),
             switches: AtomicU64::new(0),
             frame: UnsafeCell::new(ctx),
-        }
+            departure,
+            normal_exit: AtomicBool::new(false),
+            exit_code: AtomicI64::new(0),
+        })
     }
 
     pub fn frame_ptr(&self) -> *mut UserContext {
         self.frame.get()
+    }
+
+    pub(crate) fn mark_normal_exit(&self, code: i64) {
+        self.exit_code.store(code, Ordering::Relaxed);
+        assert!(
+            self.normal_exit
+                .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+                .is_ok(),
+            "thread normal exit recorded twice"
+        );
+    }
+
+    pub(crate) fn departure_kind(&self) -> super::thread::DepartureKind {
+        if self.normal_exit.load(Ordering::Acquire) {
+            super::thread::DepartureKind::Normal(self.exit_code.load(Ordering::Relaxed))
+        } else {
+            super::thread::DepartureKind::Terminated
+        }
+    }
+
+    pub(crate) fn departure(&self) -> Arc<super::thread::ThreadDeparture> {
+        self.departure.clone()
+    }
+
+    pub(crate) fn result_obligation(&self) -> super::thread::ThreadResultObligation {
+        self.departure.acquire_result()
     }
 
     /// pre-sret FP 档位：D64 进程完整恢复，Base 恒 FS=Off。

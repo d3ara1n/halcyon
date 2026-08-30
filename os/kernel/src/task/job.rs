@@ -26,18 +26,26 @@
 //! 不在完成标准的固定上界清单内；宽度使 memmove 可观测时换 fallible
 //! 有序树（结构私有可换，见 plans 决策 15）。
 
-use alloc::{sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::any::Any;
 
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
-    proc::{JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid, JOB_ENUMERATE_MAX},
+    proc::{
+        JOB_ENUMERATE_MAX, JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid,
+    },
 };
 
 use super::{
     Thread,
-    object::{HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState, SubscribeResult},
+    object::{
+        HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
+        SubscribeResult,
+    },
     proc::Process,
     wait::{Subscription, finish_offered},
 };
@@ -58,7 +66,9 @@ pub(crate) enum MemberEntry {
 #[derive(Clone)]
 enum ChildEntry {
     /// JobCreate 事务预留：对枚举与派生查找不可见（屏障条目）。
-    Reserved { token: u64 },
+    Reserved {
+        token: u64,
+    },
     Job(Arc<Job>),
 }
 
@@ -140,15 +150,13 @@ pub(crate) struct ChildReservation {
 }
 
 /// 按 ID 有序插入（键唯一：ID 单调不复用且锁内分配）。
-fn sorted_insert<T>(
-    table: &mut Vec<(u64, T)>,
-    id: u64,
-    entry: T,
-) -> Result<(), SystemCallError> {
+fn sorted_insert<T>(table: &mut Vec<(u64, T)>, id: u64, entry: T) -> Result<(), SystemCallError> {
     match table.binary_search_by_key(&id, |&(key, _)| key) {
         Ok(_) => unreachable!("monotonic in-lock IDs never collide"),
         Err(position) => {
-            table.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
+            table
+                .try_reserve(1)
+                .map_err(|_| SystemCallError::OutOfMemory)?;
             table.insert(position, (id, entry));
             Ok(())
         }
@@ -162,12 +170,16 @@ fn collect_chain(owner: &Arc<Job>) -> Result<Vec<Arc<Job>>, SystemCallError> {
     let mut upward = Vec::new();
     let mut current = owner.clone();
     loop {
-        upward.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
+        upward
+            .try_reserve(1)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
         upward.push(current.clone());
         if upward.len() > JOB_DEPTH_MAX {
             return Err(SystemCallError::IllegalArgument);
         }
-        let Some(parent) = current.parent.as_ref() else { break };
+        let Some(parent) = current.parent.as_ref() else {
+            break;
+        };
         match parent.upgrade() {
             Some(strong) => current = strong,
             None => return Err(SystemCallError::ObjectClosed),
@@ -283,7 +295,8 @@ impl Job {
     /// 从 Handle 表条目取具体 Job（trait upcasting 后 downcast）。
     pub(crate) fn concrete(object: &ObjectRef) -> Result<Arc<Self>, SystemCallError> {
         let any: Arc<dyn Any + Send + Sync> = object.clone();
-        any.downcast::<Self>().map_err(|_| SystemCallError::WrongObjectType)
+        any.downcast::<Self>()
+            .map_err(|_| SystemCallError::WrongObjectType)
     }
 
     /// ProcessCreate 创建口闸门：链锁内上行检查祖先 seal、锁内分配
@@ -299,9 +312,7 @@ impl Job {
         }
         let token = next_member_token()?;
         let pid = alloc_pid();
-        let owner = guards
-            .last_mut()
-            .expect("chain always contains the owner");
+        let owner = guards.last_mut().expect("chain always contains the owner");
         sorted_insert(&mut owner.members, pid, MemberEntry::Reserved { token })?;
         Ok((pid, MemberReservation { pid, token }))
     }
@@ -321,9 +332,7 @@ impl Job {
         }
         let token = next_member_token()?;
         let jid = alloc_jid();
-        let owner = guards
-            .last_mut()
-            .expect("chain always contains the owner");
+        let owner = guards.last_mut().expect("chain always contains the owner");
         sorted_insert(&mut owner.children, jid, ChildEntry::Reserved { token })?;
         Ok((jid, ChildReservation { jid, token }))
     }
@@ -628,7 +637,9 @@ fn resolve_job_control(
     rights: Rights,
 ) -> Result<(Arc<Job>, Rights), SystemCallError> {
     let table = thread.process.handles.lock();
-    let entry = table.get(handle, rights).map_err(super::handle::map_error)?;
+    let entry = table
+        .get(handle, rights)
+        .map_err(super::handle::map_error)?;
     if *entry.role() != HandleRole::JobControl || entry.object().kind() != ObjectKind::Job {
         return Err(SystemCallError::WrongObjectType);
     }
@@ -652,7 +663,9 @@ pub fn create(
 ) -> Result<(), SystemCallError> {
     let parent = {
         let table = thread.process.handles.lock();
-        let entry = table.get(parent, Rights::CREATE).map_err(super::handle::map_error)?;
+        let entry = table
+            .get(parent, Rights::CREATE)
+            .map_err(super::handle::map_error)?;
         if *entry.role() != HandleRole::JobControl || entry.object().kind() != ObjectKind::Job {
             return Err(SystemCallError::WrongObjectType);
         }
@@ -737,7 +750,12 @@ pub fn enumerate(
     };
     let mut space = thread.process.space.lock();
     // SAFETY: ids[..actual] 是已初始化的 u64 切片；区间已在前面校验。
-    let bytes = unsafe { core::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), actual * core::mem::size_of::<u64>()) };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            ids.as_ptr().cast::<u8>(),
+            actual * core::mem::size_of::<u64>(),
+        )
+    };
     crate::uaccess::copy_to_user(&mut space, buf, bytes)?;
     // SAFETY: JobEnumerateResult 字段全部初始化，无 padding；复检失败
     // 即杀本进程（deliver_output）。
@@ -794,7 +812,9 @@ fn install_one(
     publish: impl FnOnce(),
 ) -> Result<(), SystemCallError> {
     let mut entries = alloc::vec::Vec::new();
-    entries.try_reserve(1).map_err(|_| SystemCallError::OutOfMemory)?;
+    entries
+        .try_reserve(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(entry);
     let token = super::handle::transaction_token();
     let mut table = thread.process.handles.lock();
@@ -803,7 +823,9 @@ fn install_one(
     let mut space = thread.process.space.lock();
     if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
         drop(space);
-        table.rollback(reservation).expect("single-handle install reservation must remain owned");
+        table
+            .rollback(reservation)
+            .expect("single-handle install reservation must remain owned");
         return Err(error.into());
     }
     // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
@@ -814,7 +836,8 @@ fn install_one(
     // 线程不可用）；先完成不可失败的层级提交，再公开 capability——
     // 窗口内其他线程即使拿到槽号也无法关闭唯一 Handle。
     publish();
-    table.commit(reservation, entries)
+    table
+        .commit(reservation, entries)
         .expect("single-handle install count matches entry");
     Ok(())
 }

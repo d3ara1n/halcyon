@@ -29,7 +29,7 @@ log="artifacts/.qemu-acceptance-$$.log"
 
 required=(
     "drain minimum-budget acceptance passed"
-    "race matrix acceptance passed: 12/12 scenarios passed"
+    "race matrix acceptance passed: 13/13 scenarios passed"
     "acceptance domain collected"
     "all services supervised to completion"
     "peer closed observed"

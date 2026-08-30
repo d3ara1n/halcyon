@@ -8,7 +8,8 @@
 
 use crate::{JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, supervise_services};
 use libprocess::{
-    DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned, job_kill, race::{self, Cmd, Report},
+    DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned, job_kill,
+    race::{self, Cmd, Report},
     spawn,
 };
 use rinlib::ipc::message::{create, send, wait_message};
@@ -25,6 +26,7 @@ use rinlib::shared::proc::{
     ProcessExitReason, ProcessFaultCode, ProcessMapFlags, ProcessState, ThreadStartContext,
 };
 use rinlib::shared::wait::{WAIT_TIMEOUT_INFINITE, WaitItem};
+use rinlib::sys_sleep;
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
 /// 分箱，天然归属，无需锤标识）。
@@ -55,10 +57,8 @@ impl RaceHammers {
                 Rights::READ | Rights::WAIT,
                 Rights::WRITE | Rights::WAIT | Rights::GRANT | Rights::DUPLICATE,
             )?;
-            let gun_pair = notification::create(
-                Rights::READ | Rights::WAIT | Rights::GRANT,
-                Rights::SIGNAL,
-            )?;
+            let gun_pair =
+                notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
             let grants = [
                 HandleGrant {
                     handle: cmd_pair.owner,
@@ -93,7 +93,13 @@ impl RaceHammers {
     }
 
     fn send_cmd(&self, hammer: usize, cmd: &Cmd, moves: &[HandleMove]) -> bool {
-        send(self.cmd[hammer], race::MSG_CMD, &race::encode_cmd(cmd), moves).is_ok()
+        send(
+            self.cmd[hammer],
+            race::MSG_CMD,
+            &race::encode_cmd(cmd),
+            moves,
+        )
+        .is_ok()
     }
 
     fn fire(&self, hammers: &[usize]) {
@@ -127,7 +133,13 @@ impl RaceHammers {
     /// 退场指令 + 锤侧自有 handle 由进程退出收束；init 端点随后清理。
     fn shutdown(&self) {
         for i in 0..2 {
-            let exit = Cmd { action: race::ACTION_EXIT, code: 0, entry: 0, sp: 0, aux: 0 };
+            let exit = Cmd {
+                action: race::ACTION_EXIT,
+                code: 0,
+                entry: 0,
+                sp: 0,
+                aux: 0,
+            };
             let _ = self.send_cmd(i, &exit, &[]);
             self.fire(&[i]);
             let _ = self.report(i);
@@ -139,13 +151,25 @@ impl RaceHammers {
 }
 
 fn race_cmd(action: u64, code: u64) -> Cmd {
-    Cmd { action, code, entry: 0, sp: 0, aux: 0 }
+    Cmd {
+        action,
+        code,
+        entry: 0,
+        sp: 0,
+        aux: 0,
+    }
 }
 
 /// 延迟变体指令：锤醒后先 sleep `delay_ms` 再执行，把窗口让给对侧
 /// 先行（时序变体用，见 race::Cmd::aux）。
 fn race_cmd_delayed(action: u64, code: u64, delay_ms: u64) -> Cmd {
-    Cmd { action, code, entry: 0, sp: 0, aux: delay_ms }
+    Cmd {
+        action,
+        code,
+        entry: 0,
+        sp: 0,
+        aux: delay_ms,
+    }
 }
 
 /// 竞态靶（test_hammer TARGET 模式）：等枪后按 subrole 自灭或高频 park。
@@ -156,10 +180,8 @@ fn spawn_race_target(
     subrole: u64,
     code: u64,
 ) -> Result<(Spawned, Handle), SystemCallError> {
-    let gun_pair = notification::create(
-        Rights::READ | Rights::WAIT | Rights::GRANT,
-        Rights::SIGNAL,
-    )?;
+    let gun_pair =
+        notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
     let payload = race::encode_payload(&[race::MODE_TARGET, subrole, code]);
     let grants = [HandleGrant {
         handle: gun_pair.owner,
@@ -260,7 +282,11 @@ fn drain_expect_dead(control: Handle, allowed: &[(u32, Option<i64>)]) -> Option<
 
 /// 等 REAPABLE|CLOSED 电平。
 fn await_reapable(control: Handle) -> bool {
-    let items = [WaitItem::new(control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, 0)];
+    let items = [WaitItem::new(
+        control,
+        ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+        0,
+    )];
     match wait_many(&items, WAIT_TIMEOUT_INFINITE) {
         Ok(_) => true,
         Err(error) => {
@@ -314,11 +340,13 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         // control 双 dup，原件留 init 收束断言。
         let moves = [
             HandleMove {
-                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                    .unwrap_or(Handle::INVALID),
                 rights: Rights::MANAGE,
             },
             HandleMove {
-                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                    .unwrap_or(Handle::INVALID),
                 rights: Rights::MANAGE,
             },
         ];
@@ -390,7 +418,8 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 }
             };
         let moves = [HandleMove {
-            handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+            handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
         let kill = if round % 2 == 1 {
@@ -400,7 +429,14 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
-        let (rep, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep, _) = h.report(0).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         let allowed = [
             (ProcessExitReason::Exited as u32, Some(exit_code)),
             (ProcessExitReason::Killed as u32, Some(kill_code)),
@@ -446,7 +482,8 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             }
         };
         let moves = [HandleMove {
-            handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+            handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
         let kill = if round % 2 == 1 {
@@ -456,7 +493,14 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
-        let (rep, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep, _) = h.report(0).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         let allowed = [
             (ProcessExitReason::Fault as u32, Some(4)),
             (ProcessExitReason::Killed as u32, Some(kill_code)),
@@ -506,15 +550,30 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
             rights: Rights::MAP | Rights::WRITE | Rights::MANAGE,
         }];
         let kill_moves = [HandleMove {
-            handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+            handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
         let start_cmd = race_cmd(race::ACTION_START, 0);
         let kill_cmd = race_cmd(race::ACTION_KILL, kill_code as u64);
         let sent = h.send_cmd(0, &start_cmd, &start_moves) && h.send_cmd(1, &kill_cmd, &kill_moves);
         h.fire(&[0, 1]);
-        let (rep_start, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
-        let (rep_kill, _) = h.report(1).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep_start, _) = h.report(0).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
+        let (rep_kill, _) = h.report(1).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         let closed = SystemCallError::ObjectClosed as i64;
         let start_side_ok = rep_start.status == 0 || rep_start.status == closed;
         let kill_side_ok = rep_kill.status == 0;
@@ -611,11 +670,11 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 return false;
             }
         };
-        let kill = if round % 2 == 1 {
-            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
-        } else {
-            race_cmd(race::ACTION_KILL, kill_code as u64)
-        };
+        // 先让目标首线程完成两条工作线程的 spawn 并进入并发 churn。
+        // SAFETY: 纯相对延迟，不携带用户指针。
+        unsafe { sys_sleep(10).expect("memory race warmup sleep failed") };
+        // warmup 后以短延迟覆盖大 backing 清零期间的跨 hart ack 窗口。
+        let kill = race_cmd_delayed(race::ACTION_KILL, kill_code as u64, round);
         let sent = h.send_cmd(
             0,
             &kill,
@@ -675,6 +734,30 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
     ok
 }
 
+/// ThreadSpawn/user-memory 8B：目标进程内部建立真实多线程，完成同 AddressSpace
+/// stale translation、Endpoint close/普通 Unmap 并发及结构化 stack/join 收束；
+/// 末线程通过 ThreadExit 被动冻结进程 Exited 终态。
+fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
+    let (target, gun) = match spawn_race_target(job, image, race::TARGET_THREAD_SUITE, 0) {
+        Ok(pair) => pair,
+        Err(error) => {
+            debug!("thread memory suite: target spawn failed: {:?}", error);
+            return false;
+        }
+    };
+    let _ = notification::signal(gun, 1);
+    let allowed = [(ProcessExitReason::Exited as u32, Some(0x8b))];
+    let terminal = drain_expect_dead(target.control, &allowed);
+    let ok = terminal.is_some();
+    debug!(
+        "thread memory suite {}",
+        if ok { "passed" } else { "FAILED" }
+    );
+    let _ = close(target.control);
+    let _ = close(gun);
+    ok
+}
+
 /// kill vs abandonment：锤 kill 与锤 close builder 同刻——终因冻结的
 /// 先到者胜（Killed 或 Abandoned），不出现混合。奇数轮 close 延迟
 /// 1ms：kill 先冻结终因，观察 Killed 胜出侧（close 后到只协助收束）。
@@ -700,14 +783,33 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
             rights: Rights::MANAGE,
         }];
         let kill_moves = [HandleMove {
-            handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+            handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
         let sent = h.send_cmd(0, &close_cmd, &close_moves)
-            && h.send_cmd(1, &race_cmd(race::ACTION_KILL, kill_code as u64), &kill_moves);
+            && h.send_cmd(
+                1,
+                &race_cmd(race::ACTION_KILL, kill_code as u64),
+                &kill_moves,
+            );
         h.fire(&[0, 1]);
-        let (rep_close, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
-        let (rep_kill, _) = h.report(1).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep_close, _) = h.report(0).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
+        let (rep_kill, _) = h.report(1).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         let allowed = [
             (ProcessExitReason::Killed as u32, Some(kill_code)),
             (ProcessExitReason::Abandoned as u32, Some(0)),
@@ -750,11 +852,38 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
         let job_a = duplicate(job, Rights::CREATE | Rights::TRANSIT).unwrap_or(Handle::INVALID);
         let job_b = duplicate(job, Rights::CREATE | Rights::TRANSIT).unwrap_or(Handle::INVALID);
         let create = race_cmd(race::ACTION_CREATE_ABANDON, 0);
-        let sent = h.send_cmd(0, &create, &[HandleMove { handle: job_a, rights: Rights::CREATE }])
-            && h.send_cmd(1, &create, &[HandleMove { handle: job_b, rights: Rights::CREATE }]);
+        let sent = h.send_cmd(
+            0,
+            &create,
+            &[HandleMove {
+                handle: job_a,
+                rights: Rights::CREATE,
+            }],
+        ) && h.send_cmd(
+            1,
+            &create,
+            &[HandleMove {
+                handle: job_b,
+                rights: Rights::CREATE,
+            }],
+        );
         h.fire(&[0, 1]);
-        let (rep_a, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
-        let (rep_b, _) = h.report(1).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep_a, _) = h.report(0).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
+        let (rep_b, _) = h.report(1).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         if !sent || rep_a.status != 0 || rep_b.status != 0 {
             debug!(
                 "race create-vs-enumerate: round {} sent={} rep={:#x}/{:#x}",
@@ -767,14 +896,20 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
         pids.push(rep_b.aux0);
     }
     if pids.len() != 8 {
-        debug!("race create-vs-enumerate: only {} creates reported", pids.len());
+        debug!(
+            "race create-vs-enumerate: only {} creates reported",
+            pids.len()
+        );
         ok = false;
     }
     let job_read = duplicate(job, Rights::READ | Rights::TRANSIT).unwrap_or(Handle::INVALID);
     let (rep, ids) = match h.shoot(
         0,
         &race_cmd(race::ACTION_ENUMERATE, 0),
-        &[HandleMove { handle: job_read, rights: Rights::READ }],
+        &[HandleMove {
+            handle: job_read,
+            rights: Rights::READ,
+        }],
     ) {
         Some(pair) => pair,
         None => {
@@ -783,7 +918,10 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
         }
     };
     if rep.status != 0 {
-        debug!("race create-vs-enumerate: enumerate failed {:#x}", rep.status);
+        debug!(
+            "race create-vs-enumerate: enumerate failed {:#x}",
+            rep.status
+        );
         return false;
     }
     let sorted = ids.windows(2).all(|pair| pair[0] < pair[1]);
@@ -837,18 +975,46 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
     for round in 0..4u64 {
         let job_b = duplicate(child, Rights::CREATE | Rights::TRANSIT).unwrap_or(Handle::INVALID);
         let create = race_cmd(race::ACTION_CREATE, 0);
-        let sent = h.send_cmd(1, &create, &[HandleMove { handle: job_b, rights: Rights::CREATE }]);
+        let sent = h.send_cmd(
+            1,
+            &create,
+            &[HandleMove {
+                handle: job_b,
+                rights: Rights::CREATE,
+            }],
+        );
         if round == 0 {
             h.fire(&[0, 1]);
         } else {
             h.fire(&[1]);
         }
         let (rep_seal, _) = if round == 0 {
-            h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()))
+            h.report(0).unwrap_or((
+                Report {
+                    status: -1,
+                    aux0: 0,
+                    aux1: 0,
+                },
+                alloc::vec::Vec::new(),
+            ))
         } else {
-            (Report { status: 0, aux0: 0, aux1: 0 }, alloc::vec::Vec::new())
+            (
+                Report {
+                    status: 0,
+                    aux0: 0,
+                    aux1: 0,
+                },
+                alloc::vec::Vec::new(),
+            )
         };
-        let (rep_create, _) = h.report(1).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep_create, _) = h.report(1).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         let mut legal = rep_create.status == 0 || rep_create.status == closed;
         if round == 0 {
             first_gated = Some(rep_create.status == closed);
@@ -856,8 +1022,7 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
             legal = false;
             debug!(
                 "race seal-vs-create: round {} create {:#x} after seal",
-                round,
-                rep_create.status
+                round, rep_create.status
             );
         }
         if !sent || !legal || (round == 0 && rep_seal.status != 0) {
@@ -878,7 +1043,10 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
                 );
             }
             snapshot => {
-                debug!("race seal-vs-create: child state {:?}", snapshot.map(|s| s.state));
+                debug!(
+                    "race seal-vs-create: child state {:?}",
+                    snapshot.map(|s| s.state)
+                );
                 ok = false;
             }
         },
@@ -923,19 +1091,35 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         }
         let moves = [
             HandleMove {
-                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                    .unwrap_or(Handle::INVALID),
                 rights: Rights::MANAGE,
             },
             HandleMove {
-                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                    .unwrap_or(Handle::INVALID),
                 rights: Rights::MANAGE,
             },
         ];
         let drain = race_cmd(race::ACTION_DRAIN, 0);
         let sent = h.send_cmd(0, &drain, &[moves[0]]) && h.send_cmd(1, &drain, &[moves[1]]);
         h.fire(&[0, 1]);
-        let (rep_a, _) = h.report(0).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
-        let (rep_b, _) = h.report(1).unwrap_or((Report { status: -1, aux0: 0, aux1: 0 }, alloc::vec::Vec::new()));
+        let (rep_a, _) = h.report(0).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
+        let (rep_b, _) = h.report(1).unwrap_or((
+            Report {
+                status: -1,
+                aux0: 0,
+                aux1: 0,
+            },
+            alloc::vec::Vec::new(),
+        ));
         let legal = (rep_a.status == 0 || rep_a.status == busy)
             && (rep_b.status == 0 || rep_b.status == busy)
             && (rep_a.status == 0 || rep_b.status == 0);
@@ -954,7 +1138,10 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         }
         let _ = close(target.control);
     }
-    debug!("race drain-vs-drain {}", if ok { "passed" } else { "FAILED" });
+    debug!(
+        "race drain-vs-drain {}",
+        if ok { "passed" } else { "FAILED" }
+    );
     ok
 }
 
@@ -1021,7 +1208,7 @@ pub(crate) fn race_matrix(
             return Err("race matrix hammer spawn failed");
         }
     };
-    let scenarios: [(&str, bool); 12] = [
+    let scenarios: [(&str, bool); 13] = [
         ("kill-vs-kill", race_kill_kill(&h, acceptance, hammer_image)),
         ("kill-vs-exit", race_kill_exit(&h, acceptance, hammer_image)),
         (
@@ -1038,6 +1225,10 @@ pub(crate) fn race_matrix(
             "memory-guard-fault",
             guard_fault_is_process_local(acceptance, hammer_image),
         ),
+        (
+            "thread-memory-suite",
+            thread_memory_suite(acceptance, hammer_image),
+        ),
         ("kill-vs-abandon", race_kill_abandon(&h, acceptance)),
         ("create-vs-enumerate", race_create_enumerate(&h, acceptance)),
         ("seal-vs-create", race_seal_create(&h, acceptance)),
@@ -1052,8 +1243,14 @@ pub(crate) fn race_matrix(
     ];
     h.shutdown();
     let hammer_supervision = supervise_services(alloc::vec::Vec::from([
-        Supervised { pid: h.pids[0], control: h.controls[0] },
-        Supervised { pid: h.pids[1], control: h.controls[1] },
+        Supervised {
+            pid: h.pids[0],
+            control: h.controls[0],
+        },
+        Supervised {
+            pid: h.pids[1],
+            control: h.controls[1],
+        },
     ]));
     let supervision_ok = hammer_supervision.is_ok();
     if !supervision_ok {
