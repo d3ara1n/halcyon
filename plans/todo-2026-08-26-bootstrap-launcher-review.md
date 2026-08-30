@@ -54,7 +54,7 @@
 
 ## 外部契约取证
 
-凡结论由规范决定，必须从 `references/INDEX.md` 定位固定文本并在 review 报告中引用具体小节：
+凡结论由规范决定，必须从 `references/CONTRACTS.md` 定位固定文本并在 review 报告中引用具体小节：
 
 - Devicetree `/chosen`、`reg`、address/size cells：`normative/devicetree-v0.4/source/`；
 - ELF program header、RISC-V attributes 与 psABI 栈/入口：`normative/riscv-psabi-v1.0/`；

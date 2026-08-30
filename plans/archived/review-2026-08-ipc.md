@@ -2,7 +2,7 @@
 
 本次审查确认旧实现的对象模型、等待所有权、消息事务、隧道寻址与 Runnel 发布契约均不能作为后续基础；修复由 [IPC 对象 / Handle 重建](2026-08-ipc-object-foundation.md) 承接。本文是只读审查档案，记录风险与由风险推导出的验证要求，不作为待办状态载体。
 
-审查对象：`c21839e`（message/signal）、`4f70b5b`（tunnel/Runnel 契约）、`29b48b3`（tunnel/Runnel 数据面）。新契约基准为 `notes/ideas/{object,wait,message,signal,tunnel,runnel}.md`；RVWMO 取证入口为 `references/INDEX.md`。
+审查对象：`c21839e`（message/signal）、`4f70b5b`（tunnel/Runnel 契约）、`29b48b3`（tunnel/Runnel 数据面）。新契约基准为 `notes/ideas/{object,wait,message,signal,tunnel,runnel}.md`；RVWMO 取证入口为 `references/CONTRACTS.md`。
 
 ## 审查结论与承接
 

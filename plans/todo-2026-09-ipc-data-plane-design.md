@@ -60,7 +60,7 @@ MemoryObject 的稳定前提是：对象持 backing、mapping lease 借 view；c
 ## 工作流程
 
 1. 固定开始 commit，收集 ThreadSpawn 后 IPC 压力线与目标负载数据；
-2. 从 `references/INDEX.md` 所列规范和补充的成熟系统官方资料建立事实表；
+2. 从 `references/CONTRACTS.md` 所列规范和补充的成熟系统官方资料建立事实表；
 3. 给出至少两种完整设计，比较接口深度、所有权、收束上界和验证成本；
 4. 只把负载推出的新方向写入对应 ideas 拥有篇，不重复定义既有 MemoryObject/映射契约；
 5. 按确认后的模块归属拆出独立实施计划；

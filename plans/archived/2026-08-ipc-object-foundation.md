@@ -2,7 +2,7 @@
 
 状态：**已完成**。本计划承接已完成的旧 IPC 三面审查，整体替换旧 ABI、PID 消息寻址、ObjectKind/id 等平行寻址、全局 tunnel id、阻塞 Receive 与隐式信号消费；不保留兼容入口。旧实现审查结论见 [review-2026-08-ipc.md](review-2026-08-ipc.md)。本任务以实现完成和既定测试通过为结束，不另建新实现 review；统一 review 留待后续规划节点。
 
-契约基准：`notes/ideas/{object,wait,shared-memory,ipc,message,signal,tunnel,runnel,service}.md`。实现 RISC-V 内存序时须从 `references/INDEX.md` 的 `rvwmo.adoc` 引用对应条款。
+契约基准：`notes/ideas/{object,wait,shared-memory,ipc,message,signal,tunnel,runnel,service}.md`。实现 RISC-V 内存序时须从 `references/CONTRACTS.md` 的 `rvwmo.adoc` 引用对应条款。
 
 ## 目标与边界
 
