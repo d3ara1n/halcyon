@@ -27,6 +27,8 @@ F-only、Q、V、TSO 与未建模扩展由 loader 拒绝。Q-capable hart 可运
 
 `os/kernel/src/context.rs::UserContext` 每线程保存 GPR、sepc 与完整 `FpState`；`FpState` 含 32 个 FPR 和 fcsr，创建时全零。D64 切入时完整恢复并置 FS=Clean，trap 只在 FS=Dirty 时回写，随后恢复内核 FS=Off。局部 F/D helper 位于独立代码 section；`test_fp` 验证 FPR/fcsr 跨 ecall、Sleep 和调度轮转保持。
 
+Building 首线程与 Running 期 ThreadSpawn 共用 `ThreadStartContext` 到 `UserContext` 的编码：entry 写 sepc，sp 写 x2，arg1/arg2 写 a0/a1，其余 GPR、tp、FP 状态清零。ThreadSpawn 在新线程入队前完成现场构造和 execution binding 继承；线程只能进入进程已冻结的兼容调度域。ThreadExit 与被终止线程都走非 Resume trap 出口，先切回 kernel satp、清 active，再由调度侧释放执行容器并请求 `ThreadDeparture`，不会在仍使用用户 root 时发布 DONE。
+
 ## Trap 与 CSR
 
 formal stvec 指向共同 direct-mode 入口，sscratch 在正式环境中恒指 HartLocal。入口先经 sscratch 取得 hart 锚，并把原始用户 t5/t6 保存到 HartLocal scratch；恢复 sscratch 锚后才复用已保存的临时寄存器读取 SPP。SPP=0 保存 UserContext，SPP=1 进入 per-hart FatalFrame。UserContext 保存完成前不得覆盖任何尚未保存的用户寄存器；除 a0/a1 返回值外，全部用户 GPR 跨 ecall 保持。

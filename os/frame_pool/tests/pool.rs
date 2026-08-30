@@ -109,6 +109,29 @@ fn extent_geometry_split_is_exact_and_non_overlapping() {
 }
 
 #[test]
+fn partial_return_materializes_stale_descendants_as_unavailable() {
+    let mut pool = pool(4);
+    add(&mut pool, 0, 4);
+
+    let leaves: Vec<_> = (0..4).map(|_| pool.alloc_order(0).unwrap()).collect();
+    for leaf in leaves {
+        pool.dealloc(leaf, 1);
+    }
+    let whole = pool.alloc_order(2).unwrap();
+    assert_eq!(whole, frame(0));
+
+    pool.dealloc(frame(1), 1);
+    assert_eq!(pool.free_frames(), 1);
+    assert_eq!(pool.alloc_at(frame(0), 1), Err(AllocAtError::Unavailable));
+    assert_eq!(pool.alloc_at(frame(2), 2), Err(AllocAtError::Unavailable));
+
+    pool.dealloc(frame(0), 1);
+    pool.dealloc(frame(2), 2);
+    assert_eq!(pool.free_frames(), 4);
+    assert_eq!(pool.alloc_order(2), Some(frame(0)));
+}
+
+#[test]
 fn alloc_largest_falls_back_without_rescanning_orders() {
     let mut pool = pool(16);
     add(&mut pool, 0, 16);

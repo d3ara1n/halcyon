@@ -27,6 +27,12 @@ pub const TARGET_MEMORY_CHURN: u64 = 4;
 pub const TARGET_GUARD_FAULT: u64 = 5;
 /// TARGET payload word[1]：真实同 AddressSpace 多线程映射与 join 组合验收。
 pub const TARGET_THREAD_SUITE: u64 = 6;
+/// TARGET payload word[1]：Running 期 ThreadSpawn 与异 hart ProcessKill 竞速。
+pub const TARGET_THREAD_SPAWN_RACE: u64 = 7;
+/// TARGET payload word[1]：仅余次线程时 ThreadExit 与异 hart ProcessKill 竞速。
+pub const TARGET_LAST_THREAD_EXIT_RACE: u64 = 8;
+/// TARGET payload word[1]：attach Tunnel 后携存活 Endpoint 退出进程。
+pub const TARGET_TUNNEL_EXIT: u64 = 9;
 
 /// HAMMER grants 槽位。
 pub const HAMMER_CMD: usize = 0;
@@ -34,6 +40,8 @@ pub const HAMMER_REPORT: usize = 1;
 pub const HAMMER_GUN: usize = 2;
 /// TARGET grants 槽位。
 pub const TARGET_GUN: usize = 0;
+/// TARGET Tunnel Invitation grants 槽位。
+pub const TARGET_INVITATION: usize = 1;
 
 /// 消息 kind：指令（Mailbox → 锤）。
 pub const MSG_CMD: u64 = 1;

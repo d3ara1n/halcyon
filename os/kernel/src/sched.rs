@@ -492,7 +492,6 @@ pub fn run() -> ! {
             t.process.space.selftest_shootdown(&t.process.lifecycle);
         }
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
-        t.switches.fetch_add(1, Ordering::Relaxed);
         arm_quantum();
         // ProcessWrite 可经另一 hart 的直映射回填刚分配的可执行页。active
         // bitmap 当前只服务终止屏障，尚无代码代次，因此每次新 dispatch
@@ -571,24 +570,13 @@ fn arm_quantum() {
 /// 回收终止线程：先移除执行容器强引用，再向独立 departure state 请求离场。
 /// committed Map 结果义务可延后成员摘除与 DONE，但不保留 Thread/UserContext。
 fn reap(t: Arc<Thread>) {
+    // ThreadDeparture 只 weak 引用 Process；成员根可能已经摘除，必须把 core
+    // 强持到 departure 完成成员确认。
     let process = t.process.clone();
-    let pid = process.pid;
-    let tid = t.tid;
     let departure = t.departure();
     let departure_kind = t.departure_kind();
-    let switches = t.switches.load(Ordering::Relaxed);
-    let now = sbi::read_time();
-    let elapsed_ms = (now - t.created_tick) / ticks_per_ms();
     drop(t);
     departure.request(departure_kind);
-    log!(
-        Task,
-        "pid {} thread {} reaped: {} switches, lifespan {} ms",
-        pid,
-        tid,
-        switches,
-        elapsed_ms
-    );
     drop(process);
 }
 

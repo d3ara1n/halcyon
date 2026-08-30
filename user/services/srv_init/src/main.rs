@@ -17,6 +17,8 @@
 
 #![no_std]
 
+use libprocess::{DERIVED_CONTROL_RIGHTS, SpawnRequest, enumerate_members, job_kill, spawn};
+use librunnel::blocking;
 use rinlib::{
     env,
     ipc::{
@@ -35,19 +37,15 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
-            HandleGrant, JobMemberKind, JobState, ProcessDrainStatus, ProcessExitReason,
-            ProcessState, ExecutionProfile,
+            ExecutionProfile, HandleGrant, JobMemberKind, JobState, ProcessDrainStatus,
+            ProcessExitReason, ProcessState,
         },
         reset::{ResetAction, ResetReason},
         startup::initial,
-        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
+        wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
     },
     system,
 };
-use libprocess::{
-    DERIVED_CONTROL_RIGHTS, SpawnRequest, enumerate_members, job_kill, spawn,
-};
-use librunnel::blocking;
 
 mod race;
 use race::{build_spin_building, race_matrix};
@@ -157,9 +155,8 @@ const JOB_FULL_RIGHTS: Rights = Rights::from_raw(
 /// 委托域授出的 JobControl 权利：seal/派生 kill 需 MANAGE，枚举与查询
 /// 需 READ，等 CLOSED 需 WAIT。不含 CREATE——pm 只管理显式委托的域，
 /// 不在域内扩张拓扑。
-const DELEGATED_DOMAIN_RIGHTS: Rights = Rights::from_raw(
-    Rights::MANAGE.raw() | Rights::READ.raw() | Rights::WAIT.raw(),
-);
+const DELEGATED_DOMAIN_RIGHTS: Rights =
+    Rights::from_raw(Rights::MANAGE.raw() | Rights::READ.raw() | Rights::WAIT.raw());
 
 /// 隧道页在本进程的映射地址（VA 分配器落地前由调用方自报）。
 const TUNNEL_VA: usize = 0x4000_0000;
@@ -190,17 +187,13 @@ fn launch_test_services(
 > {
     let pm_mailbox = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-        Rights::WRITE
-            | Rights::WAIT
-            | Rights::TRANSIT
-            | Rights::GRANT
-            | Rights::DUPLICATE,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
     )
     .map_err(|_| "pm mailbox create failed")?;
     // GRANT 是直接跨表安装：授出的源 handle 被消费，先复制保留 init 对
     // 委托域的直接收束权（兜底 job_kill 的 authority 源）。
-    let delegated_domain = duplicate(pm_domain, JOB_FULL_RIGHTS)
-        .map_err(|_| "pm domain duplicate failed")?;
+    let delegated_domain =
+        duplicate(pm_domain, JOB_FULL_RIGHTS).map_err(|_| "pm domain duplicate failed")?;
     let control_rights = SUPERVISOR_RIGHTS;
     let mut supervised = alloc::vec::Vec::new();
     let mut pm_started = false;
@@ -270,7 +263,10 @@ fn launch_test_services(
                         }
                     }
                 } else {
-                    supervised.push(Supervised { pid: process.pid, control: process.control });
+                    supervised.push(Supervised {
+                        pid: process.pid,
+                        control: process.control,
+                    });
                 }
                 if entry.name == "bin/srv_pm" {
                     pm_started = true;
@@ -493,24 +489,17 @@ fn run(services: Handle) -> Result<(), &'static str> {
             Ok(message) => {
                 debug!(
                     "message: kind={}, payload={:?}",
-                    message.header.kind,
-                    message.payload
+                    message.header.kind, message.payload
                 );
                 let moved = message.handles[0];
                 notification::signal(moved, 0x5).expect("notification signal failed");
                 let result = wait_many(
-                    &[
-                        WaitItem::new(
-                            event.owner,
-                            ObjectSignals::READABLE,
-                            7,
-                        ),
-                    ],
+                    &[WaitItem::new(event.owner, ObjectSignals::READABLE, 7)],
                     WAIT_TIMEOUT_INFINITE,
                 )
                 .expect("notification wait failed");
-                let bits = notification::take(event.owner, u64::MAX)
-                    .expect("notification take failed");
+                let bits =
+                    notification::take(event.owner, u64::MAX).expect("notification take failed");
                 debug!("notification: cookie={}, bits={:#x}", result.cookie, bits);
                 let _ = close(moved);
             }
@@ -549,8 +538,15 @@ fn run(services: Handle) -> Result<(), &'static str> {
     let mut buf = [0u8; STREAM_LEN];
     match tunnel.read_exact_or_eof(&mut buf) {
         Ok(n) => {
-            let ok = buf.iter().enumerate().all(|(i, &b)| b == (i % 251 + 1) as u8);
-            debug!("stream received {} bytes, pattern {}", n, if ok { "ok" } else { "MISMATCH" });
+            let ok = buf
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i % 251 + 1) as u8);
+            debug!(
+                "stream received {} bytes, pattern {}",
+                n,
+                if ok { "ok" } else { "MISMATCH" }
+            );
         }
         Err(e) => debug!("stream read failed: {:?}", e),
     }
@@ -655,10 +651,8 @@ fn run(services: Handle) -> Result<(), &'static str> {
 fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
     let indent = "  ".repeat(depth);
     let job_snapshot = process::query_job(job).ok();
-    let members =
-        enumerate_members(job, JobMemberKind::MemberProcesses).unwrap_or_default();
-    let children =
-        enumerate_members(job, JobMemberKind::ChildJobs).unwrap_or_default();
+    let members = enumerate_members(job, JobMemberKind::MemberProcesses).unwrap_or_default();
+    let children = enumerate_members(job, JobMemberKind::ChildJobs).unwrap_or_default();
     match &job_snapshot {
         Some(snapshot) => debug!(
             "\x1b[36mtopology\x1b[0m: {indent}job {} (jid {}, {}, members {}, children {})",
@@ -710,8 +704,7 @@ fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
             }
             Err(error) => debug!(
                 "\x1b[36mtopology\x1b[0m: {indent}  child jid {} derive failed: {:?}",
-                jid,
-                error
+                jid, error
             ),
         }
     }
@@ -741,20 +734,24 @@ fn supervise_terminated_services(
 
 /// 监督循环：对保留的每个 control 等待 REAPABLE|CLOSED，Drain 至
 /// Complete，再以固定宽快照确认终态。逐项推进，全部完成后返回。
-fn supervise_services(
-    mut supervised: alloc::vec::Vec<Supervised>,
-) -> Result<(), SystemCallError> {
+fn supervise_services(mut supervised: alloc::vec::Vec<Supervised>) -> Result<(), SystemCallError> {
     while !supervised.is_empty() {
         let items: alloc::vec::Vec<WaitItem> = supervised
             .iter()
             .enumerate()
             .map(|(index, s)| {
-                WaitItem::new(s.control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, index as u64)
+                WaitItem::new(
+                    s.control,
+                    ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                    index as u64,
+                )
             })
             .collect();
         let result = wait_many(&items, WAIT_TIMEOUT_INFINITE)?;
         let index = result.cookie as usize;
-        let Some(target) = supervised.get(index) else { break };
+        let Some(target) = supervised.get(index) else {
+            break;
+        };
         let pid = target.pid;
         let control = target.control;
         let drained = process::drain_to_completion(control);
@@ -763,15 +760,14 @@ fn supervise_services(
             (Ok(work), Ok(snapshot)) => {
                 debug!(
                     "pid {} supervised: work={}, state={}, reason={}, code={}",
-                    pid,
-                    work,
-                    snapshot.state,
-                    snapshot.reason,
-                    snapshot.code
+                    pid, work, snapshot.state, snapshot.reason, snapshot.code
                 );
             }
             (work, query) => {
-                debug!("pid {} supervision degraded: drain={:?} query={:?}", pid, work, query);
+                debug!(
+                    "pid {} supervision degraded: drain={:?} query={:?}",
+                    pid, work, query
+                );
             }
         }
         let _ = close(control);
@@ -810,7 +806,10 @@ fn test_building_kill(job: Handle) {
                 && snapshot.reason == ProcessExitReason::Killed as u32
                 && snapshot.code == 0x123 =>
         {
-            debug!("building kill passed: pid {} Dead/Killed/{:#x}", created.pid, snapshot.code);
+            debug!(
+                "building kill passed: pid {} Dead/Killed/{:#x}",
+                created.pid, snapshot.code
+            );
         }
         (work, snapshot) => {
             debug!(
@@ -852,14 +851,12 @@ fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
     match derived {
         Ok(control) => {
             let _ = close(retained);
-            process::kill(control, 0x77)
-                .expect("derived-control kill must be accepted");
+            process::kill(control, 0x77).expect("derived-control kill must be accepted");
             kill_and_supervise(alloc::vec::Vec::from([Supervised { pid, control }]));
         }
         Err(error) => {
             debug!("derive kill degraded ({:?}); using retained control", error);
-            process::kill(retained, 0x77)
-                .expect("live kill of a fresh process must be accepted");
+            process::kill(retained, 0x77).expect("live kill of a fresh process must be accepted");
             kill_and_supervise(alloc::vec::Vec::from([Supervised {
                 pid,
                 control: retained,
@@ -986,8 +983,7 @@ fn test_job_seal_completion(job: Handle) {
         ),
         (snapshot, children) => debug!(
             "job seal completion FAILED: snapshot={:?} children={:?}",
-            snapshot,
-            children
+            snapshot, children
         ),
     }
     let _ = close(child);
@@ -1032,15 +1028,12 @@ fn test_derive_fallback(job: Handle) {
                 {
                     debug!(
                         "derive fallback passed: pid {} minted control drained to Dead/Killed/{:#x}",
-                        pid,
-                        snapshot.code
+                        pid, snapshot.code
                     );
                 }
                 (drained, snapshot) => debug!(
                     "derive fallback FAILED: visible={} drain={:?} snapshot={:?}",
-                    visible,
-                    drained,
-                    snapshot
+                    visible, drained, snapshot
                 ),
             }
             let _ = close(control);
@@ -1048,8 +1041,7 @@ fn test_derive_fallback(job: Handle) {
         Err(error) => {
             debug!(
                 "derive fallback FAILED: visible={} derive={:?}",
-                visible,
-                error
+                visible, error
             );
         }
     }
@@ -1083,13 +1075,11 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
                     match snapshot {
                         Ok(snapshot) if snapshot.state == JobState::Dead as u32 => debug!(
                             "job kill composition passed (member pid {}, child jid {} Dead)",
-                            running_pid,
-                            snapshot.jid
+                            running_pid, snapshot.jid
                         ),
-                        snapshot => debug!(
-                            "job kill composition FAILED: child snapshot={:?}",
-                            snapshot
-                        ),
+                        snapshot => {
+                            debug!("job kill composition FAILED: child snapshot={:?}", snapshot)
+                        }
                     }
                 }
                 Err(error) => {
@@ -1186,15 +1176,17 @@ fn enumerate_convergence(job: Handle) {
     for round in 0..4u64 {
         let Ok(created) = process::create(job, SUPERVISOR_RIGHTS) else {
             ok = false;
-            debug!("enumerate convergence FAILED: create failed at round {}", round);
+            debug!(
+                "enumerate convergence FAILED: create failed at round {}",
+                round
+            );
             break;
         };
         if created.pid <= previous {
             ok = false;
             debug!(
                 "enumerate convergence FAILED: pid {} not monotonic after {}",
-                created.pid,
-                previous
+                created.pid, previous
             );
         }
         previous = created.pid;
@@ -1280,14 +1272,13 @@ fn test_capability_badges_and_affine_owners() {
         assert_eq!(message.header.sender_pid, env::pid() as u64);
         assert_eq!(message.header.sender_badge, badge);
     }
-    let once = make_send_once(badged, Rights::WRITE)
-        .expect("badged send-once mint failed");
+    let once = make_send_once(badged, Rights::WRITE).expect("badged send-once mint failed");
     send(once, 887, &[], &[]).expect("badged send-once send failed");
     let message = receive(mailbox.owner).expect("badged send-once receive failed");
     assert_eq!(message.header.sender_badge, BADGE);
 
-    let transit = duplicate(badged, Rights::WRITE | Rights::TRANSIT)
-        .expect("badged transit copy failed");
+    let transit =
+        duplicate(badged, Rights::WRITE | Rights::TRANSIT).expect("badged transit copy failed");
     let moves = [HandleMove {
         handle: transit,
         rights: Rights::WRITE,
@@ -1365,23 +1356,20 @@ fn test_send_once() {
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once mailbox create failed");
-    let once = make_send_once(
-        mailbox.peer,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-    )
-    .expect("make send once failed");
+    let once = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+        .expect("make send once failed");
     send(once, 900, &[1], &[]).expect("send once failed");
     assert!(matches!(
         send(once, 901, &[], &[]),
         Err(SystemCallError::StaleHandle)
     ));
 
-    let once = make_send_once(
-        mailbox.peer,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-    )
-    .expect("transferred send-once mint failed");
-    let moves = [HandleMove { handle: once, rights: Rights::WRITE }];
+    let once = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+        .expect("transferred send-once mint failed");
+    let moves = [HandleMove {
+        handle: once,
+        rights: Rights::WRITE,
+    }];
     send(mailbox.peer, 902, &[], &moves).expect("send-once transit failed");
     let first = receive(mailbox.owner).expect("send-once receive failed");
     assert_eq!(first.header.kind, 900);
@@ -1440,7 +1428,10 @@ fn test_send_once() {
         make_send_once(once, Rights::WRITE),
         Err(SystemCallError::RightsDenied)
     ));
-    let moves = [HandleMove { handle: once, rights: Rights::WRITE }];
+    let moves = [HandleMove {
+        handle: once,
+        rights: Rights::WRITE,
+    }];
     assert!(matches!(
         send(once, 920, &[], &moves),
         Err(SystemCallError::IllegalArgument)
@@ -1467,13 +1458,7 @@ fn test_writable_level() {
     )
     .expect("writable mailbox create failed");
     let result = wait_many(
-        &[
-            WaitItem::new(
-                mailbox.peer,
-                ObjectSignals::WRITABLE,
-                1,
-            ),
-        ],
+        &[WaitItem::new(mailbox.peer, ObjectSignals::WRITABLE, 1)],
         WAIT_TIMEOUT_INFINITE,
     )
     .expect("empty mailbox must be writable");
@@ -1484,13 +1469,7 @@ fn test_writable_level() {
     }
     discard(mailbox.owner).expect("writable make-room failed");
     let result = wait_many(
-        &[
-            WaitItem::new(
-                mailbox.peer,
-                ObjectSignals::WRITABLE,
-                2,
-            ),
-        ],
+        &[WaitItem::new(mailbox.peer, ObjectSignals::WRITABLE, 2)],
         WAIT_TIMEOUT_INFINITE,
     )
     .expect("mailbox below capacity must be writable");
@@ -1524,18 +1503,24 @@ fn test_writable_wake(pm_mailbox: Handle) {
     )
     .expect("wake spin notification create failed");
     let moves = [
-        HandleMove { handle: target.peer, rights: Rights::WRITE | Rights::WAIT },
-        HandleMove { handle: done.peer, rights: Rights::SIGNAL },
-        HandleMove { handle: spin.peer, rights: Rights::SIGNAL },
+        HandleMove {
+            handle: target.peer,
+            rights: Rights::WRITE | Rights::WAIT,
+        },
+        HandleMove {
+            handle: done.peer,
+            rights: Rights::SIGNAL,
+        },
+        HandleMove {
+            handle: spin.peer,
+            rights: Rights::SIGNAL,
+        },
     ];
-    send(pm_mailbox, WRITABLE_WAKE_REQUEST, &[], &moves)
-        .expect("wake request send failed");
+    send(pm_mailbox, WRITABLE_WAKE_REQUEST, &[], &moves).expect("wake request send failed");
 
     // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
     wait_many(
-        &[
-            WaitItem::new(done.owner, ObjectSignals::READABLE, 0),
-        ],
+        &[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)],
         WAIT_TIMEOUT_INFINITE,
     )
     .expect("wake notification wait failed");
@@ -1575,15 +1560,23 @@ fn stress_control_plane() {
             Rights::SIGNAL | Rights::TRANSIT,
         )
         .expect("stress notification create failed");
-        let moves = [HandleMove { handle: event.peer, rights: Rights::SIGNAL }];
-        send(mailbox.peer, index as u64, &index.to_le_bytes(), &moves)
-            .expect("stress send failed");
-        assert!(matches!(close(event.peer), Err(SystemCallError::StaleHandle)));
+        let moves = [HandleMove {
+            handle: event.peer,
+            rights: Rights::SIGNAL,
+        }];
+        send(mailbox.peer, index as u64, &index.to_le_bytes(), &moves).expect("stress send failed");
+        assert!(matches!(
+            close(event.peer),
+            Err(SystemCallError::StaleHandle)
+        ));
         let message = receive(mailbox.owner).expect("stress receive failed");
         assert_eq!(message.header.kind, index as u64);
         assert_eq!(message.payload, index.to_le_bytes());
         notification::signal(message.handles[0], 1).expect("stress signal failed");
-        assert_eq!(notification::take(event.owner, 1).expect("stress take failed"), 1);
+        assert_eq!(
+            notification::take(event.owner, 1).expect("stress take failed"),
+            1
+        );
         close(message.handles[0]).expect("stress moved handle close failed");
         close(event.owner).expect("stress notification owner close failed");
         close(mailbox.peer).expect("stress mailbox sender close failed");
@@ -1603,7 +1596,10 @@ fn stress_control_plane() {
         Rights::SIGNAL | Rights::TRANSIT,
     )
     .expect("full mailbox notification create failed");
-    let moves = [HandleMove { handle: event.peer, rights: Rights::SIGNAL }];
+    let moves = [HandleMove {
+        handle: event.peer,
+        rights: Rights::SIGNAL,
+    }];
     assert!(matches!(
         send(mailbox.peer, 0, &[], &moves),
         Err(SystemCallError::MailboxFull)
@@ -1616,7 +1612,10 @@ fn stress_control_plane() {
     close(event.owner).expect("retained owner close failed");
     close(mailbox.peer).expect("full mailbox sender close failed");
     close(mailbox.owner).expect("full mailbox owner close failed");
-    debug!("control-plane stress passed: {} transactions", CONTROL_STRESS);
+    debug!(
+        "control-plane stress passed: {} transactions",
+        CONTROL_STRESS
+    );
 }
 
 fn test_tunnel_lifecycle() {
@@ -1631,13 +1630,11 @@ fn test_tunnel_lifecycle() {
         ));
         close(abandoned.peer).expect("invitation close failed");
         let result = wait_many(
-            &[
-                WaitItem::new(
-                    abandoned.owner,
-                    ObjectSignals::PEER_CLOSED,
-                    0,
-                ),
-            ],
+            &[WaitItem::new(
+                abandoned.owner,
+                ObjectSignals::PEER_CLOSED,
+                0,
+            )],
             WAIT_TIMEOUT_INFINITE,
         )
         .expect("abandoned invitation wait failed");

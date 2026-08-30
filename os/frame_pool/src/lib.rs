@@ -273,7 +273,9 @@ impl<'a> FramePool<'a> {
         assert!(self.range_is_managed(base.0, end), "unmanaged frame range");
         assert!(
             self.range_is_unavailable(base.0, end),
-            "frame range overlaps free inventory: double free or accounting bug"
+            "frame range [{:#x}, {:#x}) overlaps free inventory: double free or accounting bug",
+            base.addr(),
+            FrameNumber(end).addr()
         );
         self.release_blocks(base.0, end);
         self.free_frames += count;
@@ -408,8 +410,21 @@ impl<'a> FramePool<'a> {
 
     fn release_block(&mut self, arena: ArenaMetadata, base: usize, order: usize) {
         debug_assert!(!self.block_has_free(arena, base, order));
-        let depth = arena.order as usize - order;
-        let node = (1usize << depth) + ((base - arena.base) >> order);
+        let mut node = 1usize;
+        let mut current_order = arena.order as usize;
+        while current_order > order {
+            let left = node * 2;
+            if self.state(arena, node) == UNAVAILABLE {
+                // 整块分配只标记父节点；后代可能保留更早碎片化留下的状态。
+                // 部分归还前沿目标路径把占用事实向下物化，不能把陈旧兄弟当空闲。
+                self.set_state(arena, left, UNAVAILABLE);
+                self.set_state(arena, left + 1, UNAVAILABLE);
+            }
+            current_order -= 1;
+            let right = ((base - arena.base) & (1usize << current_order)) != 0;
+            node = left + usize::from(right);
+        }
+        debug_assert_eq!(self.state(arena, node), UNAVAILABLE);
         self.set_state(arena, node, order as u8);
         self.update_ancestors(arena, node);
     }

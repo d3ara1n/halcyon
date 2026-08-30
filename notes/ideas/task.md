@@ -76,6 +76,6 @@ Running→Terminating 的准入截止与 AddressSpace Commit 共享 Process exec
 
 ## 用户态线程资源收束
 
-内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈。rinlib 以普通匿名 mapping 组成双 guard 的 UserStack，并把 stack mapping、用户结果记录与 ThreadControl 组合为 affine JoinHandle。首版采用结构化收束：显式 join 返回结果；未显式 join 时 handle 析构也等待内核 DONE 后解除完整 stack reservation 并丢弃结果，不以静默泄漏或内核代拆映射冒充 detach。未来若需要 detach，应由正式用户态 reaper 接管这组资源，而不是削弱 join 完成边界。
+内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈。rinlib 以普通匿名 mapping 组成双 guard 的 UserStack，并把 stack mapping、用户结果记录与 ThreadControl 组合为 affine JoinHandle。join 是 ThreadControl DONE、统一等待与壳关闭之上的用户态资源策略，不另设系统调用。首版采用结构化收束：显式 join 返回结果；未显式 join 时 handle 析构也等待内核 DONE 后解除完整 stack reservation 并丢弃结果，不以静默泄漏或内核代拆映射冒充 detach。未来若需要 detach，应由正式用户态 reaper 接管这组资源，而不是削弱 join 完成边界。
 
 ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 joiner 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。

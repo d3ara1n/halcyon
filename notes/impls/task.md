@@ -34,7 +34,7 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。life
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Ready / Staging / Running / Waiting / Exiting`：Staging 是成员表的 Building 期形态（预育表）——条目携带线程强引用，`Process::attach_thread` 统一完成现场校验，并经 `attach_member` 锁内原子分配 tid、构造和插入（ProcessAttach 与 bootstrap 只作授权/输入 adapter）。Start 提交点由 `begin_running` 在同一临界区整体转 Ready 并直接提取全部强引用；终止路径经 `take_first_staging` 游标摘除，打破 Staging↔Thread.process 引用环（环只在 Building 期存在）。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 保留为非身份值（对齐 pid/JobId 哨兵纪律）。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，`Process::attach_thread` 校验现场，`attach_member` 锁内分配 tid、构造并插入；Start 由 `begin_running` 同一临界区整体转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域 Ready 槽，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度占位，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
@@ -121,12 +121,11 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   吸收后 reap 摘除）；Running 由终止待办向冻结时刻的 active 位图
   快照发 IPI（冻结后 enter_running 拒绝，位只减不增），目标在任意
   trap 入口吸收为 Killed。active 与 Running/Terminating 准入每次变化都推进
-  trap 入口吸收为 Killed。active 与 Running/Terminating 准入每次变化都推进
   execution sequence，地址空间事务 Reserve 快照 `(sequence, active)`，Commit 在
   `ADDRESS_SPACE → LIFECYCLE` 锁序下拒绝同值 ABA；已经 Commit、终止不可撤销的事务
   同时增加 `mandatory_ops`，只有业务 Complete 后才递减。dispatch/leave 以本 hart
   已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本 hart。
-  ThreadSpawn/ThreadExit 调用号当前返回 FunctionNotAvailable，现有 Exit 是进程级终止。
+  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Exited 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadSpawn 仅接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadSpawnResult`，内核铸造 waitable ThreadControl。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。ThreadControl close 只消散观察壳，不影响线程 core。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)

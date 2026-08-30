@@ -21,6 +21,20 @@ use crate::{
 
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
 
+/// 直接提交 ThreadSpawn 原语，不接管入口参数、用户栈或返回的 ThreadControl。
+///
+/// # Safety
+///
+/// 调用者必须保证入口及栈在新线程离场前有效，并为结果壳和全部用户资源建立
+/// 唯一收束路径。通常应使用 [`Builder::spawn`]。
+pub unsafe fn spawn_raw(
+    context: &ThreadStartContext,
+    result: &mut ThreadSpawnResult,
+) -> Result<(), SystemCallError> {
+    // SAFETY: 借用保证 syscall 期间的输入/输出地址有效；跨调用资源责任由调用者承担。
+    unsafe { sys_thread_spawn(context, result) }
+}
+
 struct UserStack {
     region: Option<MappedRegion>,
 }
@@ -147,7 +161,7 @@ impl Builder {
             control: Handle::INVALID,
         };
         // SAFETY: context/result 在同步 syscall 期间稳定；stack 与 packet 已先发布。
-        if let Err(error) = unsafe { sys_thread_spawn(&context, &mut result) } {
+        if let Err(error) = unsafe { spawn_raw(&context, &mut result) } {
             // SAFETY: 失败契约保证线程未入册运行，packet 仍由调用方独占。
             unsafe { drop(Box::from_raw(packet.cast::<Packet<F, T>>().as_ptr())) };
             stack.release();

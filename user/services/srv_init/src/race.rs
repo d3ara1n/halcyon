@@ -6,6 +6,8 @@
 // 以「终因组合合法 + Dead 收束 + 无泄漏」为强断言，终因胜负分布只作
 // 观察报告（证明锤进了窗口，不作通过条件）。
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, supervise_services};
 use libprocess::{
     DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned, job_kill,
@@ -15,6 +17,7 @@ use libprocess::{
 use rinlib::ipc::message::{create, send, wait_message};
 use rinlib::ipc::notification;
 use rinlib::ipc::object::{close, duplicate};
+use rinlib::ipc::tunnel as tunnel_sys;
 use rinlib::ipc::wait::wait_many;
 use rinlib::preclude::*;
 use rinlib::process;
@@ -196,6 +199,41 @@ fn spawn_race_target(
     })
     .map_err(|_| SystemCallError::Unknown)?;
     Ok((spawned, gun_pair.peer))
+}
+
+fn spawn_tunnel_exit_target(
+    job: Handle,
+    image: &[u8],
+    invitation: Handle,
+) -> Result<(Spawned, Handle), SystemCallError> {
+    let gun_pair =
+        notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
+    let grants = [
+        HandleGrant {
+            handle: gun_pair.owner,
+            rights: Rights::READ | Rights::WAIT,
+        },
+        HandleGrant {
+            handle: invitation,
+            rights: Rights::MAP,
+        },
+    ];
+    let payload = race::encode_payload(&[race::MODE_TARGET, race::TARGET_TUNNEL_EXIT]);
+    match spawn(SpawnRequest {
+        job,
+        image,
+        payload: &payload,
+        grants: &grants,
+        control_rights: SUPERVISOR_RIGHTS,
+    }) {
+        Ok(spawned) => Ok((spawned, gun_pair.peer)),
+        Err(_) => {
+            let _ = close(gun_pair.owner);
+            let _ = close(gun_pair.peer);
+            let _ = close(invitation);
+            Err(SystemCallError::Unknown)
+        }
+    }
 }
 
 /// 入口页指令：`j .`（`0x0000006f`，JAL x0,0 自我跳转）。不用 wfi——
@@ -459,6 +497,132 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     }
     debug!(
         "race kill-vs-exit {} (exited {}/{} killed)",
+        if ok { "passed" } else { "FAILED" },
+        dist[0],
+        dist[1]
+    );
+    ok
+}
+
+/// Running 期 ThreadSpawn 与异 hart ProcessKill 竞速。偶数轮 kill 同刻提交，
+/// 奇数轮延迟 kill 让 spawn 先入册；无论线性化次序，新增成员都必须被终止收束。
+fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
+    let mut ok = true;
+    for round in 0..4u64 {
+        let (target, gun) = match spawn_race_target(job, image, race::TARGET_THREAD_SPAWN_RACE, 0) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!("race spawn-vs-kill: target spawn failed: {:?}", error);
+                return false;
+            }
+        };
+        let kill_code = 0x480 + round as i64;
+        let moves = [HandleMove {
+            handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
+            rights: Rights::MANAGE,
+        }];
+        let kill = if round % 2 == 1 {
+            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+        } else {
+            race_cmd(race::ACTION_KILL, kill_code as u64)
+        };
+        let sent = h.send_cmd(0, &kill, &moves);
+        fire_race(h, gun, &[0]);
+        let report = h.report(0).map(|(report, _)| report);
+        let terminal = drain_expect_dead(
+            target.control,
+            &[(ProcessExitReason::Killed as u32, Some(kill_code))],
+        );
+        if !sent || !matches!(report, Some(report) if report.status == 0) || terminal.is_none() {
+            debug!(
+                "race spawn-vs-kill: round {} sent={} report={:?}",
+                round,
+                sent,
+                report.map(|report| report.status)
+            );
+            ok = false;
+        }
+        let _ = close(target.control);
+        let _ = close(gun);
+    }
+    debug!(
+        "race spawn-vs-kill {}",
+        if ok { "passed" } else { "FAILED" }
+    );
+    ok
+}
+
+/// 主线程先离场，只剩等待发令枪的次线程；其最后 ThreadExit 与 ProcessKill
+/// 竞争进程终因。两组确定性时序分别证明 Exited 与 Killed 首达都能完整收束。
+fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
+    let mut ok = true;
+    let mut dist = [0usize; 2];
+    for round in 0..4u64 {
+        let exit_code = 0x490 + round as i64;
+        let kill_code = 0x4a0 + round as i64;
+        let (target, gun) = match spawn_race_target(
+            job,
+            image,
+            race::TARGET_LAST_THREAD_EXIT_RACE,
+            exit_code as u64,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!(
+                    "race last-thread-exit-vs-kill: target spawn failed: {:?}",
+                    error
+                );
+                return false;
+            }
+        };
+        // 让目标主线程完成 raw spawn 并先行 ThreadExit，确保竞速者是末线程。
+        // SAFETY: 值参数；只用于建立目标角色的前置状态。
+        let _ = unsafe { sys_sleep(30) };
+        let moves = [HandleMove {
+            handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
+            rights: Rights::MANAGE,
+        }];
+        let kill = if round % 2 == 1 {
+            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+        } else {
+            race_cmd(race::ACTION_KILL, kill_code as u64)
+        };
+        let sent = h.send_cmd(0, &kill, &moves);
+        if round % 2 == 0 {
+            h.fire(&[0]);
+            // SAFETY: kill 先行窗口；signal 失败表示 owner 已随终止关闭，同样合法。
+            let _ = unsafe { sys_sleep(1) };
+            let _ = notification::signal(gun, 1);
+        } else {
+            fire_race(h, gun, &[0]);
+        }
+        let report = h.report(0).map(|(report, _)| report);
+        let allowed = [
+            (ProcessExitReason::Exited as u32, Some(exit_code)),
+            (ProcessExitReason::Killed as u32, Some(kill_code)),
+        ];
+        match drain_expect_dead(target.control, &allowed) {
+            Some(code) if code == exit_code => dist[0] += 1,
+            Some(_) => dist[1] += 1,
+            None => ok = false,
+        }
+        if !sent || !matches!(report, Some(report) if report.status == 0) {
+            debug!(
+                "race last-thread-exit-vs-kill: round {} sent={} report={:?}",
+                round,
+                sent,
+                report.map(|report| report.status)
+            );
+            ok = false;
+        }
+        let _ = close(target.control);
+        let _ = close(gun);
+    }
+    ok &= dist[0] != 0 && dist[1] != 0;
+    debug!(
+        "race last-thread-exit-vs-kill {} (exited {}/{} killed)",
         if ok { "passed" } else { "FAILED" },
         dist[0],
         dist[1]
@@ -755,6 +919,72 @@ fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
     );
     let _ = close(target.control);
     let _ = close(gun);
+    ok
+}
+
+const RACE_TUNNEL_VA: usize = 0x2200_0000;
+const RACE_TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
+const RACE_TUNNEL_ROUNDS: usize = 16;
+
+fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
+    let mut ok = true;
+    for round in 0..RACE_TUNNEL_ROUNDS {
+        let pair = match tunnel_sys::create(RACE_TUNNEL_VA) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!("Tunnel exit stress create failed: {:?}", error);
+                return false;
+            }
+        };
+        // SAFETY: TunnelCreate mapped one shared page at RACE_TUNNEL_VA.
+        let shared = unsafe { &*(RACE_TUNNEL_VA as *const AtomicU64) };
+        let request = 0x7475_6e6e_656c_0000 | round as u64 + 1;
+        shared.store(request, Ordering::Release);
+        let (target, gun) = match spawn_tunnel_exit_target(job, image, pair.peer) {
+            Ok(target) => target,
+            Err(error) => {
+                debug!("Tunnel exit stress target spawn failed: {:?}", error);
+                let _ = close(pair.owner);
+                return false;
+            }
+        };
+        let expected = request ^ RACE_TUNNEL_RESPONSE_MASK;
+        let mut published = false;
+        for _ in 0..100 {
+            if shared.load(Ordering::Acquire) == expected {
+                published = true;
+                break;
+            }
+            // SAFETY: 值参数；让目标进程完成 Attach 与共享页发布。
+            let _ = unsafe { sys_sleep(1) };
+        }
+        let _ = notification::signal(gun, 1);
+        let terminal = drain_expect_dead(
+            target.control,
+            &[(ProcessExitReason::Exited as u32, Some(0x8c))],
+        );
+        let peer_closed = wait_many(
+            &[WaitItem::new(pair.owner, ObjectSignals::PEER_CLOSED, 0)],
+            WAIT_TIMEOUT_INFINITE,
+        )
+        .map(|result| result.observed.intersects(ObjectSignals::PEER_CLOSED))
+        .unwrap_or(false);
+        if !published || terminal.is_none() || !peer_closed {
+            debug!(
+                "Tunnel exit stress round {} published={} peer_closed={}",
+                round, published, peer_closed
+            );
+            ok = false;
+        }
+        let _ = close(target.control);
+        let _ = close(gun);
+        let _ = close(pair.owner);
+    }
+    debug!(
+        "Tunnel exit stress {}: {} rounds",
+        if ok { "passed" } else { "FAILED" },
+        RACE_TUNNEL_ROUNDS
+    );
     ok
 }
 
@@ -1194,7 +1424,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
-/// 竞态矩阵入口：双锤编队 → 12 场景 → 退场收束 → 汇总。失败场景逐个
+/// 竞态矩阵入口：双锤编队 → 16 场景 → 退场收束 → 汇总。失败场景逐个
 /// 点名，汇总行是全矩阵的 grep 锚点。
 pub(crate) fn race_matrix(
     acceptance: Handle,
@@ -1208,9 +1438,17 @@ pub(crate) fn race_matrix(
             return Err("race matrix hammer spawn failed");
         }
     };
-    let scenarios: [(&str, bool); 13] = [
+    let scenarios: [(&str, bool); 16] = [
         ("kill-vs-kill", race_kill_kill(&h, acceptance, hammer_image)),
         ("kill-vs-exit", race_kill_exit(&h, acceptance, hammer_image)),
+        (
+            "spawn-vs-kill",
+            race_thread_spawn_kill(&h, acceptance, hammer_image),
+        ),
+        (
+            "last-thread-exit-vs-kill",
+            race_last_thread_exit_kill(&h, acceptance, hammer_image),
+        ),
         (
             "kill-vs-fault",
             race_kill_fault(&h, acceptance, hammer_image),
@@ -1228,6 +1466,10 @@ pub(crate) fn race_matrix(
         (
             "thread-memory-suite",
             thread_memory_suite(acceptance, hammer_image),
+        ),
+        (
+            "tunnel-exit-stress",
+            tunnel_exit_stress(acceptance, hammer_image),
         ),
         ("kill-vs-abandon", race_kill_abandon(&h, acceptance)),
         ("create-vs-enumerate", race_create_enumerate(&h, acceptance)),

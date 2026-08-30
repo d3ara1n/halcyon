@@ -508,11 +508,6 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        // 未实现面：一律返回错误（内核不可被用户调用 panic）。
-        _ => {
-            respond_error(frame, SystemCallError::FunctionNotAvailable);
-            Outcome::Completed
-        }
     };
     // 分发出口终止检查：syscall 执行期间冻结了终因（写回复检失败自杀、
     // 异 hart kill）则线程不回用户态——收束确定性提前一个 syscall，

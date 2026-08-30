@@ -106,10 +106,6 @@ pub enum SystemCall {
     ThreadYield = 0x21,
     /// 由 ThreadStartContext 创建线程并写出 ThreadSpawnResult。
     ThreadSpawn = 0x22,
-    /// 保留：join 通过 ThreadControl + WaitMany 完成。
-    ThreadJoin = 0x23,
-    /// 保留：首版不实现线程级终止。
-    ThreadKill = 0x24,
     /// 当前线程睡眠指定毫秒（异步：登记期限后 Waiting，到期唤醒）
     Sleep = 0x25,
     // -----对象与等待-----

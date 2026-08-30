@@ -8,14 +8,15 @@
 
 #![no_std]
 
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use libprocess::race::{
     self, ACTION_CLOSE, ACTION_CREATE, ACTION_CREATE_ABANDON, ACTION_DRAIN, ACTION_ENUMERATE,
     ACTION_EXIT, ACTION_KILL, ACTION_SEAL, ACTION_START, Cmd, HAMMER_CMD, HAMMER_CONTROL_RIGHTS,
     HAMMER_GUN, HAMMER_REPORT, MODE_HAMMER, MODE_TARGET, MSG_CMD, MSG_REPORT, Report, TARGET_FAULT,
-    TARGET_GUARD_FAULT, TARGET_GUN, TARGET_MEMORY_CHURN, TARGET_PARK, TARGET_SUICIDE,
-    TARGET_THREAD_SUITE,
+    TARGET_GUARD_FAULT, TARGET_GUN, TARGET_INVITATION, TARGET_LAST_THREAD_EXIT_RACE,
+    TARGET_MEMORY_CHURN, TARGET_PARK, TARGET_SUICIDE, TARGET_THREAD_SPAWN_RACE,
+    TARGET_THREAD_SUITE, TARGET_TUNNEL_EXIT,
 };
 use rinlib::{
     env,
@@ -23,6 +24,7 @@ use rinlib::{
         message::{send, wait_message},
         notification,
         object::close,
+        tunnel,
         wait::wait_many,
     },
     mm::{MappedRegion, Placement},
@@ -32,7 +34,10 @@ use rinlib::{
         call::SystemCallError,
         mem::MemoryProtection,
         object::{Handle, ObjectSignals},
-        proc::{ExecutionProfile, JobMemberKind, PROCESS_PAGE_SIZE},
+        proc::{
+            ExecutionProfile, JobMemberKind, PROCESS_MAX_THREADS, PROCESS_PAGE_SIZE,
+            ThreadSpawnResult, ThreadStartContext,
+        },
         wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
     },
     sys_exit, sys_sleep, thread,
@@ -281,6 +286,15 @@ fn target_mode(words: &[u64]) {
     if role == TARGET_MEMORY_CHURN {
         threaded_memory_churn(gun);
     }
+    if role == TARGET_THREAD_SPAWN_RACE {
+        thread_spawn_race(gun);
+    }
+    if role == TARGET_LAST_THREAD_EXIT_RACE {
+        last_thread_exit_target(gun, words.get(2).copied().unwrap_or(0) as i64);
+    }
+    if role == TARGET_TUNNEL_EXIT {
+        tunnel_exit_target(gun);
+    }
     await_gun(gun);
     match role {
         TARGET_SUICIDE => {
@@ -333,7 +347,239 @@ fn thread_suite() {
     debug!("hammer target: same-address-space thread suite started");
     stale_translation_reuse();
     concurrent_tunnel_close();
+    join_publication();
+    raw_thread_storm();
     debug!("hammer target: same-address-space thread suite passed");
+}
+
+const TARGET_TUNNEL_VA: usize = 0x2200_0000;
+const TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
+
+fn tunnel_exit_target(gun: Handle) -> ! {
+    let invitation =
+        env::startup_handle(TARGET_INVITATION).expect("Tunnel exit target missing invitation");
+    let _endpoint =
+        tunnel::attach(invitation, TARGET_TUNNEL_VA).expect("Tunnel exit target attach failed");
+    // SAFETY: successful TunnelAttach mapped one shared page at TARGET_TUNNEL_VA.
+    let shared = unsafe { &*(TARGET_TUNNEL_VA as *const AtomicU64) };
+    let request = shared.load(Ordering::Acquire);
+    assert_ne!(
+        request, 0,
+        "Tunnel exit target observed an unpublished request"
+    );
+    shared.store(request ^ TUNNEL_RESPONSE_MASK, Ordering::Release);
+    await_gun(gun);
+    // Endpoint remains live in the process table; ProcessDrain must close its mapping lease.
+    thread::exit(0x8c)
+}
+
+type RawThreadEntry = extern "C" fn(usize, usize) -> !;
+
+fn raw_spawn(
+    entry: RawThreadEntry,
+    stack_pointer: usize,
+    arg1: usize,
+    arg2: usize,
+) -> Result<ThreadSpawnResult, SystemCallError> {
+    let context = ThreadStartContext {
+        entry: entry as *const () as usize as u64,
+        stack_pointer: stack_pointer as u64,
+        arg1: arg1 as u64,
+        arg2: arg2 as u64,
+    };
+    let mut result = ThreadSpawnResult {
+        tid: 0,
+        reserved: 0,
+        control: Handle::INVALID,
+    };
+    // SAFETY: context/result live for the synchronous call; the caller owns a mapped stack.
+    unsafe { thread::spawn_raw(&context, &mut result) }?;
+    assert!(
+        result.tid != 0 && result.reserved == 0 && result.control.is_valid(),
+        "raw ThreadSpawn returned an invalid result"
+    );
+    Ok(result)
+}
+
+fn raw_stack(bytes: usize) -> MappedRegion {
+    MappedRegion::map_anonymous(
+        bytes,
+        PROCESS_PAGE_SIZE,
+        PROCESS_PAGE_SIZE,
+        MemoryProtection::ReadWrite,
+        Placement::Anywhere,
+    )
+    .expect("raw thread stack Map failed")
+}
+
+extern "C" fn parked_thread_entry(_arg1: usize, _arg2: usize) -> ! {
+    loop {
+        thread::yield_now().expect("parked raw thread yield failed");
+    }
+}
+
+fn thread_spawn_race(gun: Handle) -> ! {
+    let stack = raw_stack(PROCESS_PAGE_SIZE);
+    let stack_pointer = stack
+        .usable()
+        .expect("raw spawn stack has no usable page")
+        .end;
+    await_gun(gun);
+    if let Ok(result) = raw_spawn(parked_thread_entry, stack_pointer, 0, 0) {
+        close(result.control).expect("spawn-race ThreadControl close failed");
+    }
+    core::mem::forget(stack);
+    loop {
+        thread::yield_now().expect("spawn-race coordinator yield failed");
+    }
+}
+
+extern "C" fn last_thread_exit_entry(gun: usize, code: usize) -> ! {
+    // 让创建者主线程先完成 ThreadExit；随后再消费电平枪进入末线程竞速。
+    // SAFETY: 值参数；sleep 后仍由 Notification 电平保存发令。
+    unsafe { sys_sleep(20).expect("last secondary setup sleep failed") };
+    await_gun(Handle::from_raw(gun as u64));
+    thread::exit(code as i64)
+}
+
+fn last_thread_exit_target(gun: Handle, code: i64) -> ! {
+    let stack = raw_stack(PROCESS_PAGE_SIZE);
+    let stack_pointer = stack
+        .usable()
+        .expect("last-thread stack has no usable page")
+        .end;
+    let result = raw_spawn(
+        last_thread_exit_entry,
+        stack_pointer,
+        gun.raw() as usize,
+        code as usize,
+    )
+    .expect("last-thread raw spawn failed");
+    close(result.control).expect("last-thread ThreadControl close failed");
+    core::mem::forget(stack);
+    debug!("hammer target: last secondary thread ready");
+    thread::exit(0)
+}
+
+struct DropMarker(Arc<AtomicBool>);
+
+impl Drop for DropMarker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn join_publication() {
+    for sequence in 0..32usize {
+        let worker = thread::Builder::new()
+            .stack_size(16 * 1024)
+            .spawn(move || (sequence, sequence.rotate_left(7) ^ 0x5a5a_5a5a))
+            .expect("join publication spawn failed");
+        assert_eq!(
+            worker.join(),
+            (sequence, sequence.rotate_left(7) ^ 0x5a5a_5a5a),
+            "join observed an incompletely published result"
+        );
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let child_dropped = dropped.clone();
+    let worker = thread::Builder::new()
+        .stack_size(16 * 1024)
+        .spawn(move || DropMarker(child_dropped))
+        .expect("structured Drop worker spawn failed");
+    drop(worker);
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "JoinHandle Drop returned before destroying the published result"
+    );
+}
+
+struct StormGate {
+    release: AtomicBool,
+    started: AtomicUsize,
+    exiting: AtomicUsize,
+}
+
+extern "C" fn storm_thread_entry(gate: usize, _unused: usize) -> ! {
+    // SAFETY: gate is leaked for the target process lifetime and shared only through atomics.
+    let gate = unsafe { &*(gate as *const StormGate) };
+    gate.started.fetch_add(1, Ordering::Release);
+    while !gate.release.load(Ordering::Acquire) {
+        thread::yield_now().expect("storm worker yield failed");
+    }
+    gate.exiting.fetch_add(1, Ordering::Release);
+    thread::exit(0)
+}
+
+extern "C" fn probe_thread_entry(_arg1: usize, _arg2: usize) -> ! {
+    thread::exit(0)
+}
+
+fn raw_thread_storm() {
+    let child_count = PROCESS_MAX_THREADS - 1;
+    let stack = raw_stack((PROCESS_MAX_THREADS + 1) * PROCESS_PAGE_SIZE);
+    let usable = stack
+        .usable()
+        .expect("storm stack arena has no usable range");
+    let gate = Box::leak(Box::new(StormGate {
+        release: AtomicBool::new(false),
+        started: AtomicUsize::new(0),
+        exiting: AtomicUsize::new(0),
+    }));
+    let gate_pointer = gate as *mut StormGate as usize;
+    let mut last_tid = 0;
+
+    for index in 0..child_count {
+        let stack_pointer = usable.start + (index + 1) * PROCESS_PAGE_SIZE;
+        let result = raw_spawn(storm_thread_entry, stack_pointer, gate_pointer, 0)
+            .expect("thread storm failed before the member limit");
+        assert!(result.tid > last_tid, "thread ids are not monotonic");
+        last_tid = result.tid;
+        close(result.control).expect("storm ThreadControl close failed");
+    }
+
+    let probe_stack = usable.start + PROCESS_MAX_THREADS * PROCESS_PAGE_SIZE;
+    assert_eq!(
+        raw_spawn(storm_thread_entry, probe_stack, gate_pointer, 0).unwrap_err(),
+        SystemCallError::ReachLimit,
+        "ThreadSpawn did not enforce PROCESS_MAX_THREADS"
+    );
+
+    while gate.started.load(Ordering::Acquire) != child_count {
+        thread::yield_now().expect("storm coordinator start yield failed");
+    }
+    gate.release.store(true, Ordering::Release);
+    while gate.exiting.load(Ordering::Acquire) != child_count {
+        thread::yield_now().expect("storm coordinator exit yield failed");
+    }
+
+    let probe = loop {
+        match raw_spawn(probe_thread_entry, probe_stack, 0, 0) {
+            Ok(result) => break result,
+            Err(SystemCallError::ReachLimit) => {
+                thread::yield_now().expect("storm capacity recovery yield failed");
+            }
+            Err(error) => panic!("storm capacity recovery failed: {error:?}"),
+        }
+    };
+    assert!(
+        probe.tid > last_tid,
+        "thread id regressed after capacity recovery"
+    );
+    let item = WaitItem::new(probe.control, ObjectSignals::DONE, 1);
+    let observed = wait_many(core::slice::from_ref(&item), WAIT_TIMEOUT_INFINITE)
+        .expect("storm probe wait failed");
+    assert!(
+        observed.observed.contains(ObjectSignals::DONE),
+        "storm probe control closed before DONE"
+    );
+    close(probe.control).expect("storm probe ThreadControl close failed");
+    core::mem::forget(stack);
+    debug!(
+        "hammer target: thread storm passed: {} concurrent members",
+        PROCESS_MAX_THREADS
+    );
 }
 
 fn stale_translation_reuse() {
@@ -401,6 +647,19 @@ fn stale_translation_reuse() {
         .expect("thread suite replacement Unmap failed");
 }
 
+fn close_churn_handle(handle: Handle) -> Result<(), SystemCallError> {
+    loop {
+        match close(handle) {
+            Ok(()) => return Ok(()),
+            Err(SystemCallError::ObjectBusy) => {
+                // SAFETY: HandleClose 事务未提交，handle authority 仍由调用者持有。
+                unsafe { sys_sleep(1).expect("Tunnel close retry sleep failed") };
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn concurrent_tunnel_close() {
     for round in 0..8usize {
         let pair = rinlib::ipc::tunnel::create(THREAD_TUNNEL_VA)
@@ -425,14 +684,14 @@ fn concurrent_tunnel_close() {
                 while !child_release.load(Ordering::Acquire) {
                     core::hint::spin_loop();
                 }
-                close(endpoint)
+                close_churn_handle(endpoint)
             })
             .expect("Tunnel close worker spawn failed");
         while !ready.load(Ordering::Acquire) {
             thread::yield_now().expect("Tunnel close coordinator yield failed");
         }
         release.store(true, Ordering::Release);
-        region.unmap().expect("concurrent ordinary Unmap failed");
+        unmap_churn_region(region);
         closer.join().expect("concurrent Endpoint close failed");
         close(pair.peer).expect("Tunnel invitation close failed");
         debug!(

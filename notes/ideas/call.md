@@ -10,6 +10,8 @@
 
 同步输出与异步等待结果具有不同交付边界：会返回的同步调用成功意味着结果已经写回；普通异步等待在 park 后不得依赖可能失效的用户指针。会创建进程资源且可能 park 的 `MemoryMap` 使用内存模型定义的提交前结果承诺：全部可失败工作完成后，以固定宽 UserWriteLease 稳定结果槽，先写 payload、最后 release 发布 cookie 并 Commit 业务；完成阶段只修改保存的返回状态。终局同步调用必须定义成功不返回及所有异常返回的语义。三者都不得因用户地址或参数错误 panic 内核。
 
+系统调用表只命名内核独有且已经成立的原语，不为用户态策略、便利组合或未设计能力预占入口。线程 join 由可等待的 ThreadControl、DONE 电平、WaitMany 与 HandleClose 组成；结果记录、栈解除和 Drop 策略属于用户态库，因此不另设 ThreadJoin。ThreadKill 若未来出现，必须先确定终止 authority、终因和资源接管，再决定 ABI，不能只因调用号相邻而提前占位。
+
 ## Remote Call
 
 Remote Call 是 hart 间内核短动作的传输层，由 IPI 门铃、固定容量请求槽和可选完成通知组成。请求槽的 Pending 电平是工作真值，IPI 只提示目标 hart 检查槽，不携带业务载荷；门铃可以合并或重复，目标在每个 trap 安全出口都检查本 hart 固定槽。普通调度唤醒只需要门铃，不伪造 Remote Call 请求。

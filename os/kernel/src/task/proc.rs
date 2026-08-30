@@ -24,7 +24,7 @@ use page_table::{
 use crate::{
     context::UserContext,
     frame::{self, FrameTracker},
-    mm, sbi,
+    mm,
 };
 
 /// 页大小（字节）。
@@ -2668,10 +2668,6 @@ pub struct Thread {
     /// 进程内线程号（成员表键；tid 从 1 起，0 保留为非身份值）。
     pub tid: Tid,
     pub process: Arc<Process>,
-    /// 创建时刻（mtime tick），退出统计用。
-    pub created_tick: u64,
-    /// 被调度次数（公平性观测，见 notes/impls/task.md）。
-    pub switches: AtomicU64,
     frame: UnsafeCell<UserContext>,
     departure: Arc<super::thread::ThreadDeparture>,
     normal_exit: AtomicBool,
@@ -2713,8 +2709,6 @@ impl Thread {
         Ok(Self {
             tid,
             process: process.clone(),
-            created_tick: sbi::read_time(),
-            switches: AtomicU64::new(0),
             frame: UnsafeCell::new(ctx),
             departure,
             normal_exit: AtomicBool::new(false),
