@@ -26,10 +26,12 @@ use rinlib::{
         tunnel as tunnel_sys,
         wait::wait_many,
     },
+    mm::{MappedRegion, Placement},
     preclude::*,
     process,
     shared::{
         call::SystemCallError,
+        mem::MemoryProtection,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
@@ -371,9 +373,87 @@ fn kill_and_supervise(supervised: alloc::vec::Vec<Supervised>) {
     }
 }
 
+fn test_memory_mapping() -> Result<(), &'static str> {
+    let page = rinlib::shared::proc::PROCESS_PAGE_SIZE;
+    let region = MappedRegion::map_anonymous(
+        3 * page,
+        page,
+        page,
+        MemoryProtection::ReadWrite,
+        Placement::Anywhere,
+    )
+    .map_err(|_| "anonymous guarded Map failed")?;
+    let usable = region.usable().ok_or("Map returned no usable range")?;
+    // SAFETY: usable 是本线程刚取得的 RW anonymous mapping。
+    unsafe {
+        (usable.start as *mut u64).write_volatile(0x1122_3344_5566_7788);
+        ((usable.end - core::mem::size_of::<u64>()) as *mut u64)
+            .write_volatile(0x8877_6655_4433_2211);
+    }
+    region
+        .protect(
+            usable.start..usable.start + page,
+            MemoryProtection::ReadOnly,
+        )
+        .map_err(|_| "MemoryProtect RW to R failed")?;
+    region
+        .protect(
+            usable.start..usable.start + page,
+            MemoryProtection::ReadWrite,
+        )
+        .map_err(|_| "MemoryProtect R to RW failed")?;
+
+    let middle = usable.start + page..usable.start + 2 * page;
+    let remainder = region
+        .unmap_range(middle)
+        .map_err(|_| "partial MemoryUnmap failed")?;
+    remainder
+        .left
+        .ok_or("partial Unmap lost left fragment")?
+        .unmap()
+        .map_err(|_| "left fragment Unmap failed")?;
+    remainder
+        .right
+        .ok_or("partial Unmap lost right fragment")?
+        .unmap()
+        .map_err(|_| "right fragment Unmap failed")?;
+
+    let remapped = MappedRegion::map_anonymous(
+        3 * page,
+        page,
+        page,
+        MemoryProtection::ReadWrite,
+        Placement::FixedEmpty {
+            usable_start: usable.start,
+        },
+    )
+    .map_err(|_| "fixed remap after Unmap failed")?;
+    let remapped_usable = remapped
+        .usable()
+        .ok_or("fixed remap returned no usable range")?;
+    if remapped_usable != usable {
+        return Err("fixed remap geometry changed");
+    }
+    // SAFETY: remapped usable range 是新取得的 RW anonymous mapping。
+    let zeroed = unsafe {
+        (remapped_usable.start as *const u64).read_volatile() == 0
+            && ((remapped_usable.end - core::mem::size_of::<u64>()) as *const u64).read_volatile()
+                == 0
+    };
+    if !zeroed {
+        return Err("remapped anonymous backing was not zeroed");
+    }
+    remapped
+        .unmap()
+        .map_err(|_| "fixed remap final Unmap failed")?;
+    debug!("public memory mapping acceptance passed");
+    Ok(())
+}
+
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
 fn run(services: Handle) -> Result<(), &'static str> {
     let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
+    test_memory_mapping()?;
     let pm_domain = process::create_job(services, JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
     let acceptance = process::create_job(services, JOB_FULL_RIGHTS)

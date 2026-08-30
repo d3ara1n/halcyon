@@ -3,7 +3,7 @@ use core::arch::asm;
 
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
-    mem::Address,
+    mem::{Address, MemoryMapRequest, MemoryProtection},
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
     proc::{
@@ -72,13 +72,18 @@ fn sys_call(
     }
 }
 
-fn sys_call6(
-    call: SystemCall,
-    args: [usize; 6],
-) -> SystemCallResult<usize> {
+fn sys_call6(call: SystemCall, args: [usize; 6]) -> SystemCallResult<usize> {
     // SAFETY: ecall 是唯一内核入口，参数按 ABI 传寄存器。
     let (error, ret) = unsafe {
-        raw_call(call as usize, args[0], args[1], args[2], args[3], args[4], args[5])
+        raw_call(
+            call as usize,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        )
     };
     if error == 0 {
         Ok(ret)
@@ -107,9 +112,34 @@ pub unsafe fn sys_system_reset(
     .map(|_| ())
 }
 
-// returns the new heap top address, or the current when size is 0
-pub unsafe fn sys_extend(size: usize) -> SystemCallResult<Address> {
-    sys_call(SystemCall::Extend, size, 0, 0, 0)
+pub(crate) unsafe fn sys_memory_map(request: &MemoryMapRequest) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MemoryMap,
+        request as *const MemoryMapRequest as usize,
+        0,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_memory_unmap(address: Address, bytes: usize) -> SystemCallResult<()> {
+    sys_call(SystemCall::MemoryUnmap, address, bytes, 0, 0).map(|_| ())
+}
+
+pub(crate) unsafe fn sys_memory_protect(
+    address: Address,
+    bytes: usize,
+    protection: MemoryProtection,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MemoryProtect,
+        address,
+        bytes,
+        protection as usize,
+        0,
+    )
+    .map(|_| ())
 }
 
 // returns nothing

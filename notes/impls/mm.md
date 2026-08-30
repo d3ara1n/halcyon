@@ -83,7 +83,7 @@ Map 仍把连续 VPN/PPN 区间切成最大可行 mega 段。preflight 只读遍
 
 Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为目标区间部分覆盖的现有 mega 计数：完整覆盖直接改叶，部分覆盖逐级精确预留；普通 4 KiB Unmap 因而预留零帧。Unmap 对未映射洞保持宽松，Protect 则要求区间完整映射且当前 flags 全部匹配。split 后 512 个子项保持原物理连续性和 flags；空中间表仍保留到整树 Drop 或 ProcessDrain。
 
-当前 `AddressSpace` 的 Building/bootstrap 与 Running Extend 均经 `MemorySpace` planner 产生 translation intent，再由 `OwnedBacking` 和 reservation-aware `TableTree` 物化；旧 `TableTree::map/unmap` 分配路径、`FrameMemory::alloc_frame`、`mem_mut`、`clear_slots`、`leak_root` 和内核 root 区间配对均已删除。Tunnel 仍是唯一尚未迁入该组合的外部映射调用点。
+当前 `AddressSpace` 的 Building/bootstrap、Running `MemoryMap/MemoryUnmap/MemoryProtect` 与 Tunnel ObjectView 都经 `MemorySpace` planner 产生 translation intent，再由 `OwnedBacking` 或对象 backing 和 reservation-aware `TableTree` 物化；旧 `TableTree::map/unmap` 分配路径、`FrameMemory::alloc_frame`、`mem_mut`、`clear_slots`、`leak_root`、外部映射旁路和内核 root 区间配对均已删除。
 
 ### 测试集（host）
 
@@ -91,11 +91,11 @@ Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为�
 
 ## 用户地址空间纯逻辑规划器（os/memory_space crate）
 
-`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 且不依赖其它 crate 的内部规划模块。它只拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、物理帧、用户指针、hart 或内核对象。内核 `AddressSpaceState` 已把该 planner 与匿名 `OwnedBacking`、reservation-aware `TableTree` 组合为同一事务；Building/bootstrap 与 Running Extend 已共用该 seam，Tunnel 外部 lease 尚待迁移。
+`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 且不依赖其它 crate 的内部规划模块。它只拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、物理帧、用户指针、hart 或内核对象。内核 `AddressSpaceState` 已把该 planner 与匿名 `OwnedBacking`、MemoryObject view、reservation-aware `TableTree` 组合为同一事务；Building/bootstrap、Running 公开映射与 Tunnel lease 共用该 seam。
 
 `MemorySpace` 在构造时一次性预留区域与在途事务的硬容量。有序 ledger 中每个 fragment 持唯一 `RegionKey`，同一次 Map 的 guard 与 mapping 共享 `AllocationKey`；fragment 另持 `AddressSpace`/lease owner、匿名 backing identity 或 `ObjectId + offset` view，以及当前/最大权限。`Anywhere` 在 ledger 与在途事务之间选 first-fit 完整空洞；`FixedEmpty` 不覆盖旧区域。Unmap 严格要求请求区间连续覆盖且 owner 一致，完整 reservation、usable-only、guard-only 与 mapping 中段都按精确交集切割；Protect 同样消费旧 key，只有 owner、种类、AllocationKey、连续 backing 与权限全部兼容的相邻 fragment 才合并。fault lookup 只返回 free、guard 或 eager mapping。
 
-变更由不可复制的类型状态表达：`ValidatedChange → PreparedChange → CommittedChange → PublishedChange → SynchronizedChange → RetiredChange`。Validate 可以分配规划元数据但不改 ledger；Reserve 复检 region snapshot、真实范围冲突、UserWriteLease pin 与 WritePermit multiset，并预留 Commit 所需的 fragment、retire permit 和事务容量。rollback 只存在于 Commit 前并归还全部 permit。Commit 是不可失败的 ledger 线性化点，不再分配；其后的 Publish、Synchronize、Retire 与 Complete也不返回可恢复错误，错配 token 视为内核所有权不变量破坏。内核 adapter 按 translation intent 在 Commit 前准备真实表帧和 leaf 投影，Commit 后发布 PTE 与 ledger；Running Extend 的 `PublishedChange` 由 Remote ack completion 推进到 Complete。
+变更由不可复制的类型状态表达：`ValidatedChange → PreparedChange → CommittedChange → PublishedChange → SynchronizedChange → RetiredChange`。Validate 可以分配规划元数据但不改 ledger；Reserve 复检 region snapshot、真实范围冲突、UserWriteLease pin 与 WritePermit multiset，并预留 Commit 所需的 fragment、retire permit 和事务容量。rollback 只存在于 Commit 前并归还全部 permit。Commit 是不可失败的 ledger 线性化点，不再分配；其后的 Publish、Synchronize、Retire 与 Complete 也不返回可恢复错误，错配 token 视为内核所有权不变量破坏。内核 adapter 按 translation intent 在 Commit 前准备真实表帧和 leaf 投影，Commit 后发布 PTE 与 ledger；Running 公开映射和 Tunnel 变更的 `PublishedChange` 都由 Remote ack completion 推进到 Complete。
 
 `UserWriteLease` 把非页对齐结果区间投影为固定上限的 writable backing segments，并以 RegionKey pin 到 Commit 或 rollback；与结果范围或变更 footprint 相交的其它在途事务返回 Busy。MemoryObject 状态独立实现 `Mutable → Sealing → Executable`：writable replacement 必须携带不可复制 `WritePermit`，permit 从 Reserve 覆盖到 retiring fragment 完成 Synchronize 后交给 Retire；最后一个 permit 退出计数时完成 seal，即使原 waiter 已消散也不回退状态。
 
@@ -148,19 +148,13 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 `Process.space` 是稳定 `AddressSpace` 外壳：单调不复用的 identity、translation/instruction epoch 和内部 `AddressSpaceState` 锁分离。state 内的 `MemorySpace` ledger 是全部用户区域的 VA 真值；anonymous 区域由 `OwnedBacking(BackingId + logical page offset + affine FrameTracker extents)` 持有，Tunnel 区域由 `ObjectView(ObjectId + LeaseKey + RegionKey + PageRange)` 引用 Connection 的固定 backing，PTE 只是投影。Remote Call 只引用外壳身份与 epoch。Running 变更在 Commit 前快照 lifecycle execution gate，准备 planner/backing 或 WritePermit/PTE/WaitContext 和全部目标槽；Commit 在 `ADDRESS_SPACE → LIFECYCLE` 下复检 active sequence、发布 ledger/PTE/epoch 并登记 mandatory operation，锁外敲门铃；最后 ack 后才 Synchronize→Retire→Complete。
 
-低半区 `[0, 2^38)` 完全归用户；进程 root 创建时通过 `attach_shared_root` 挂入内核高半区顶层项（含栈窗口槽），PTE 安装与 shared 位登记同一调用完成。当前区间：
+低半区 `[0, 2^38)` 完全归用户；进程 root 创建时通过 `attach_shared_root` 挂入内核高半区顶层项（含栈窗口槽），PTE 安装与 shared 位登记同一调用完成。ELF、StartupBlock 和首线程栈由 Building 组装事务建立；`image_end` 只记录 Building 期映像/出生块放置终点，不是 Running 堆顶。首线程栈仍是 launcher 在 `2^38 - 8MiB` 建立的启动资源；内核只为 primordial init 执行同构 bootstrap 映射。ASID 恒 0，地址空间切换与 Remote Call 第一版均执行保守全量 `sfence.vma`。
 
-```text
-[0, brk')             ELF LOAD 段
-[brk', block_end)     只读 StartupBlock
-[block_end, stack)    Extend 向上扩展的堆
-[2^38 - 8MiB, 2^38)  首线程栈（libprocess 放置约定；内核仅映射 init bootstrap 栈）
-```
-
-brk 在 launch 时越过 init bootstrap 出生块；Extend 仍提供既有 sbrk ABI，但非零增长已经是异步 `MemoryChange`：Commit 前失败零副作用，Commit 后线程转 Waiting，Remote ack 后返回新 brk。普通进程的出生块由组装者（libprocess）写入映像顶之上页对齐的约定区；首线程 sp 由组装者经 ProcessAttach 供给（libprocess 置于 `2^38`，16 字节对齐）。ASID 恒 0，地址空间切换与 Remote Call 第一版均执行保守全量 `sfence.vma`。
-
-- 进程页表 root 的内核高半区由 `shared_root` 位图标记，用户树 Drop/Drain 不进入这些外部子树；
-- owned anonymous、ELF、bootstrap stack、StartupBlock 与 Running Extend 页均由 `OwnedBacking.extents` 持有；旧 `AddressSpace.frames`、`alloc_map` 与 `DrainStage::Frames` 已删除；PTE 调用先 prepare 精确表帧 reservation，再不可失败 publish；
+- `MemoryMap = 0x50` 接受 80 字节固定宽 request，只开放 anonymous Anywhere/FixedEmpty 和 R/RW；64 字节 result 含 usable/reservation 几何、三项零保留字段及偏移 56 的末字段 committed cookie。Reserve 以 `UserWriteLease` pin 已存在的 RW 结果槽并保存物理投影；所有资源准备完成后先写 payload，execution gate 内以 release store 发布调用者的非零 cookie，再不可失败提交 ledger/PTE。成功返回前 Remote ack 已完成，Commit 后不再 uaccess；cookie 为零时 payload 无语义。
+- `MemoryUnmap = 0x51` 对普通 AddressSpace owner 执行严格全覆盖与精确区间切割；空洞、guard/mapping 种类违约或 lease owner 拒绝整笔请求。匿名 `OwnedBacking` 在 Publish 后仍持旧 extent，Remote ack 后才依据 retiring fragment 切下并归还；Protect 的旧视图仍被新 ledger 完整覆盖时不释放 backing。
+- `MemoryProtect = 0x52` 只在创建时最大权限内改变 mapping；公开匿名 Map 不接受 RX，RW 区不能转 RX。涉及执行权限的已有映像变更推进 instruction epoch 并触发 `FENCE.I`。
+- rinlib `MappedRegion` 不可复制，记录 reservation 与可选 usable 子区间；完整 Unmap 消费 token，部分 Unmap 返回左右至多两个 mapping/reservation-only fragment。全局 talc allocator 持固定 64 槽 arena inventory，以 64KiB 起步并几何增长到 16MiB，不在 acquire 路径为 arena 元数据递归分配。`Extend`、sbrk wrapper 与 Running heap transaction 已删除。
+- owned anonymous、ELF、bootstrap stack、StartupBlock 与公开 Map 页均由 `OwnedBacking.extents` 持有；旧 `AddressSpace.frames`、`alloc_map` 与 `DrainStage::Frames` 已删除；PTE 调用先 prepare 精确表帧 reservation，再不可失败 publish；
 - bootstrap StartupBlock prefix 是 owned backing；opaque payload 页映入 init 时收编进同一个 backing（启动保留洞的帧首次入账），地址空间销毁时随 extent 归还帧池；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap 只服务 Building process，创建 anonymous zero pages 并使用最终权限，拒绝 write-only/W+X；ProcessWrite 经已发布 PTE 的物理直映射回填 backing，Running 发布后不再存在该写入口；
 - ProcessDrain 先逐区域清空 ledger，再逐 extent 归还 backings，最后收束页表。lifecycle 的 mandatory operation 屏障保证 REAPABLE 前无在途 `PublishedChange`；

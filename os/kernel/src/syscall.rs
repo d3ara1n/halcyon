@@ -11,7 +11,12 @@ use erhino_shared::{
 };
 use num_traits::{FromPrimitive, ToPrimitive};
 
-use crate::{context::UserContext, sched, task::{self, handle, mailbox, notification, wait, Thread}, uaccess};
+use crate::{
+    context::UserContext,
+    sched,
+    task::{self, Thread, handle, mailbox, notification, wait},
+    uaccess,
+};
 
 /// syscall 处理出口（见 notes/impls/call.md「异步调用」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,24 +122,16 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         SystemCall::ProcessStart => {
             respond_result(
                 frame,
-                task::process::start(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
-                )
-                .map(|_| 0),
+                task::process::start(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
             );
             Outcome::Completed
         }
         SystemCall::ProcessAttach => {
             respond_result(
                 frame,
-                task::process::attach(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
-                )
-                .map(|tid| tid as usize),
+                task::process::attach(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|tid| tid as usize),
             );
             Outcome::Completed
         }
@@ -155,12 +152,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         SystemCall::ProcessQuery => {
             respond_result(
                 frame,
-                task::process::query(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
-                )
-                .map(|_| 0),
+                task::process::query(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
             );
             Outcome::Completed
         }
@@ -201,12 +194,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         SystemCall::JobQuery => {
             respond_result(
                 frame,
-                task::job::query(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
-                )
-                .map(|_| 0),
+                task::job::query(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
             );
             Outcome::Completed
         }
@@ -241,12 +230,35 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::Extend => match task::proc::extend_heap(thread, a0) {
-            Ok(task::proc::HeapExtendStart::Ready(brk)) => {
-                respond_ok(frame, brk);
+        SystemCall::MemoryMap => match task::proc::memory_map(thread, a0) {
+            Ok(plan) => {
+                sched::park_request_wait(plan);
+                Outcome::Wait
+            }
+            Err(error) => {
+                respond_error(frame, error);
                 Outcome::Completed
             }
-            Ok(task::proc::HeapExtendStart::Wait(plan)) => {
+        },
+        SystemCall::MemoryUnmap => {
+            match task::proc::memory_unmap(thread, frame.x[10] as u64, frame.x[11] as u64) {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
+        }
+        SystemCall::MemoryProtect => match task::proc::memory_protect(
+            thread,
+            frame.x[10] as u64,
+            frame.x[11] as u64,
+            frame.x[12] as usize,
+        ) {
+            Ok(plan) => {
                 sched::park_request_wait(plan);
                 Outcome::Wait
             }
@@ -517,8 +529,14 @@ fn debug_print(frame: &mut UserContext, thread: &Thread) {
     drop(space);
     let tag = alloc::format!("pid {}", thread.process.pid);
     match core::str::from_utf8(&buf) {
-        Ok(msg) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("{}", msg)),
-        Err(_) => crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("non-UTF-8 message, {} bytes", len)),
+        Ok(msg) => {
+            crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("{}", msg))
+        }
+        Err(_) => crate::console::log_tagged(
+            &tag,
+            crate::console::COLOR_DEBUG,
+            format_args!("non-UTF-8 message, {} bytes", len),
+        ),
     }
     respond_ok(frame, len);
 }

@@ -69,7 +69,7 @@ IPI 仍只有门铃语义：`send_ipi` 置目标 SSIP，不携带载荷。Remote
 
 ## 地址空间
 
-当前系统选择 Sv39；用户低半区、共享内核高半区、栈窗口、uaccess 与页表所有权由 [`mm.md`](mm.md) 唯一记录。调度侧非 Resume trap 出口切回正式内核 root 后才清 active，详见 [`execution-context.md`](execution-context.md)。
+当前系统选择 Sv39；用户低半区、共享内核高半区、栈窗口、uaccess 与页表所有权由 [`mm.md`](mm.md) 唯一记录。uaccess 对用户 VA 的直接 copy 只存在于持 AddressSpace 锁的 `SumGuard` 临界区；guard 的 `csrs/csrc sstatus.SUM` inline asm 刻意保留编译器内存 clobber（只声明 `nostack`，不得声明 `nomem`），保证 release 优化后用户内存访问仍严格位于 SUM 开启与关闭之间。调度侧非 Resume trap 出口切回正式内核 root 后才清 active，详见 [`execution-context.md`](execution-context.md)。
 
 ## 执行上下文与 hart 能力
 

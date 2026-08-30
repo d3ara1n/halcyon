@@ -25,6 +25,10 @@ pub enum SystemCallError {
     InvalidAddress = 0x21,
     /// The region accessed is not available
     MemoryNotAccessible = 0x22,
+    /// 请求范围与既有地址空间所有权冲突。
+    AddressConflict = 0x23,
+    /// 请求范围未被普通 mapping/reservation 完整覆盖。
+    NotMapped = 0x24,
     // Special operations
     /// Specific operation cannot be applied due to bad reference
     ObjectNotFound = 0x30,
@@ -139,8 +143,12 @@ pub enum SystemCall {
     MailboxMintSender = 0x46,
 
     // -----Process memory-----
-    /// 字节粒度 sbrk：按请求量扩展/收缩堆，返回新堆顶。
-    Extend = 0x50,
+    /// 为当前 Running process 建立 anonymous mapping。
+    MemoryMap = 0x50,
+    /// 精确解除当前 Running process 的普通 mapping/reservation。
+    MemoryUnmap = 0x51,
+    /// 改变当前 Running process 已映射范围的页权限。
+    MemoryProtect = 0x52,
 
     // -----Tunnel-----
     /// 创建共享页、Endpoint 和一次性 Invitation。

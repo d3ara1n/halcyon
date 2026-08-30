@@ -203,7 +203,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 验证：Building failure、bootstrap payload 收编、Tunnel create/attach/close、HandleClose、Drain 接管与帧计数由现有 host/QEMU 负载覆盖；本切片不公开 Running 内存 ABI。hetero/nofd/sifive_u 与公开 ABI 的多 hart 竞态负载在切片 8 统一收尾。
 
-### 7. Running ABI、rinlib 与 Extend 退役
+### 7. Running ABI、rinlib 与 Extend 退役（已完成）
 
 在 `shared/`、内核和 rinlib 同步加入固定宽、保留字段清零的 `MemoryMapRequest`、`MemoryMapResult`、`MemoryProtection` 与 `MemoryPlacement`：
 
@@ -223,6 +223,8 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 - 可能 park 的 Map 使用随线程保留到 join 的结果记录；线程消散后由 join 接管者以 acquire 读取 committed cookie，且 departed 不早于该 transaction 完成；
 - allocator 改持多个匿名 arena，线程模块用通用 mapping 建立带 guard 的 UserStack；应用不接触堆 mapping；
 - 最后一个消费者迁移后，同批删除 shared `Extend`、rinlib wrapper、内核 brk/extend 和固定预映射栈心智模型。
+
+阶段记录：shared 固定宽 ABI 已落地（request 80 字节，result 64 字节，末字段 cookie 偏移 56），调用号 `0x50..0x52` 分别为 MemoryMap/MemoryUnmap/MemoryProtect；Map 结果槽由 UserWriteLease pin 后转成固定物理投影，payload 先写、cookie 以 release store 在 execution gate 内提交。三个调用共用 boxed `PreparedUserMemory`、prepared WaitContext、Remote slots 与 mandatory completion；Unmap 的 anonymous extent 只在 ack 后按 retiring fragment 精确切下，Protect 仍有 live ledger 覆盖时不误释放。rinlib `MappedRegion` 以消费式完整/部分 Unmap 表达 affine 责任，talc 使用固定 64 槽多 arena inventory（64KiB 起步，几何增长到 16MiB）。shared Extend、rinlib wrapper 和内核 Running heap transaction 已删除；内核仅保留 Building `image_end` 布局游标。首线程栈仍是 launcher 建立的 Building 启动资源；次线程 `UserStack`、join 后解除和结果记录接管不在本切片假装实现，按本计划解除条件在 ThreadSpawn 重审中闭合。host shared/rinlib/planner/page_table/WaitContext、`just check`、用户 workspace/ELF audit、virt debug 与 virt release 已通过；公开负载覆盖双 guard Map、RW→R→RW Protect、中段 Unmap、左右 fragment 收束、同 VA 不同 backing FixedEmpty 重映射及清零。release 首轮另暴露旧 `SumGuard` 将 CSR asm 声明为 `nomem`，导致优化器把 user memcpy 移到 SUM 临界区外；已改为保留编译器 memory clobber，反汇编确认 `csrs SUM → memcpy → csrc SUM` 后全负载通过。hetero/nofd/sifive_u 与多 hart 竞态专项留在切片 8 统一收尾。
 
 ### 8. 验证与文档收口
 

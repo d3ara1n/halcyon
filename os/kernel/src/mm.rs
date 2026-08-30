@@ -279,15 +279,16 @@ impl SumGuard {
     /// # Safety
     /// 调用方须已完成用户区间验证并持有所需锁，guard 存活期不重入调度。
     pub unsafe fn open() -> Self {
-        // SAFETY: 仅置 sstatus.SUM 位。
-        unsafe { asm!("csrs sstatus, {bit}", bit = in(reg) 1 << 18, options(nomem)) };
+        // SAFETY: 仅置 sstatus.SUM 位。不得声明 nomem：guard 必须在优化后仍
+        // 包围全部用户内存访问。
+        unsafe { asm!("csrs sstatus, {bit}", bit = in(reg) 1 << 18, options(nostack)) };
         SumGuard
     }
 }
 
 impl Drop for SumGuard {
     fn drop(&mut self) {
-        // SAFETY: 仅清 sstatus.SUM 位。
-        unsafe { asm!("csrc sstatus, {bit}", bit = in(reg) 1 << 18, options(nomem)) };
+        // SAFETY: 仅清 sstatus.SUM 位；与 open 对称地保留编译器内存屏障。
+        unsafe { asm!("csrc sstatus, {bit}", bit = in(reg) 1 << 18, options(nostack)) };
     }
 }

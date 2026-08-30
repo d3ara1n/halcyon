@@ -6,14 +6,15 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
+    mem::{MemoryMapRequest, MemoryMapResult, MemoryPlacement, MemoryProtection},
     proc::{Pid, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
 use memory_space::{
-    AnonymousClass, BackingId, BackingView, ChangeError, LeaseKey, Limits, MapBacking,
-    MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
-    PageRange as LedgerPageRange, PreparedChange, Protection, PublishedChange, RegionKey,
-    RegionKindView, RegionOwner, RetireBatch, RetiredChange, TranslationIntent, UnmapRequest,
-    WritePermit,
+    AddressRange, AnonymousClass, BackingId, BackingView, ChangeError, LeaseKey, Limits,
+    MapBacking, MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
+    PageRange as LedgerPageRange, PreparedChange, ProtectRequest, Protection, PublishedChange,
+    RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiredChange, TranslationIntent,
+    UnmapRequest, WritePermit,
 };
 use page_table::{
     FrameMemory, FrameNumber, MapError, Ppn, PreparedTranslation, ReservedTableFrame,
@@ -133,12 +134,26 @@ struct PreparedOwnedMapping {
     translations: Vec<PreparedTranslation<TableFrameToken>>,
 }
 
-struct PreparedHeapExtension {
-    mapping: PreparedOwnedMapping,
-    base: usize,
-    new_brk: usize,
-    pages: usize,
+struct PinnedWriteChunk {
+    physical: usize,
+    result_offset: usize,
+    bytes: usize,
 }
+
+struct PinnedMapResult {
+    chunks: Vec<PinnedWriteChunk>,
+    value: MemoryMapResult,
+    cookie: u64,
+}
+
+struct UserMemoryReservation {
+    change: PreparedChange,
+    backing: Option<OwnedBacking>,
+    translations: Vec<PreparedTranslation<TableFrameToken>>,
+    result: Option<PinnedMapResult>,
+}
+
+struct PreparedUserMemory(Box<Option<UserMemoryReservation>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObjectMappingLease {
@@ -202,29 +217,34 @@ impl PreparedObjectUnmap {
     }
 }
 
-struct HeapExtensionToken(Box<Option<PreparedHeapExtension>>);
-
-impl HeapExtensionToken {
-    fn allocate() -> Result<Self, SpaceError> {
+impl PreparedUserMemory {
+    fn allocate() -> Result<Self, SystemCallError> {
         Box::try_new(None)
             .map(Self)
-            .map_err(|_| SpaceError::NoFrame)
+            .map_err(|_| SystemCallError::OutOfMemory)
     }
 
-    fn install(&mut self, prepared: PreparedHeapExtension) {
-        let previous = self.0.replace(prepared);
-        assert!(previous.is_none(), "heap extension token filled twice");
+    fn install(&mut self, reservation: UserMemoryReservation) {
+        let previous = self.0.replace(reservation);
+        assert!(previous.is_none(), "user memory token filled twice");
     }
 
-    fn get(&self) -> &PreparedHeapExtension {
+    fn get(&self) -> &UserMemoryReservation {
         self.0
             .as_ref()
             .as_ref()
-            .expect("heap extension token must be filled")
+            .expect("user memory token must be filled")
     }
 
-    fn take(mut self) -> PreparedHeapExtension {
-        self.0.take().expect("heap extension token consumed twice")
+    fn get_mut(&mut self) -> &mut UserMemoryReservation {
+        self.0
+            .as_mut()
+            .as_mut()
+            .expect("user memory token must be filled")
+    }
+
+    fn take(mut self) -> UserMemoryReservation {
+        self.0.take().expect("user memory token consumed twice")
     }
 }
 
@@ -303,6 +323,118 @@ impl OwnedBacking {
         }
         Ok(prepared)
     }
+
+    /// Remote ack 后精确归还 backing 的逻辑页区间。`extents` 在创建时按
+    /// backing 总页数预留容量，因此这里的最多双切分不再分配。
+    fn release_range(&mut self, offset: usize, bytes: usize) {
+        assert!(
+            offset.is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE) && bytes != 0,
+            "backing retire range must be nonempty and page aligned"
+        );
+        let release_start = offset / PAGE_SIZE;
+        let release_end = release_start
+            .checked_add(bytes / PAGE_SIZE)
+            .expect("backing retire range overflowed");
+        assert!(release_end <= self.pages, "backing retire escaped object");
+
+        let mut released = 0;
+        let mut index = 0;
+        while index < self.extents.len() {
+            let extent_start = self.extents[index].offset_pages;
+            let extent_end = extent_start + self.extents[index].tracker.count();
+            let cut_start = extent_start.max(release_start);
+            let cut_end = extent_end.min(release_end);
+            if cut_start >= cut_end {
+                index += 1;
+                continue;
+            }
+
+            let extent = self.extents.remove(index);
+            let left_pages = cut_start - extent_start;
+            let retired_pages = cut_end - cut_start;
+            let right_pages = extent_end - cut_end;
+            let mut retired = extent.tracker;
+
+            if left_pages != 0 {
+                let (left, tail) = retired.split_at(left_pages);
+                self.extents.insert(
+                    index,
+                    BackingExtent {
+                        offset_pages: extent_start,
+                        tracker: left,
+                    },
+                );
+                index += 1;
+                retired = tail;
+            }
+            if right_pages != 0 {
+                let (middle, right) = retired.split_at(retired_pages);
+                retired = middle;
+                self.extents.insert(
+                    index,
+                    BackingExtent {
+                        offset_pages: cut_end,
+                        tracker: right,
+                    },
+                );
+                index += 1;
+            }
+            released += retired.count();
+            drop(retired);
+        }
+        assert_eq!(
+            released,
+            release_end - release_start,
+            "backing retire range was not owned exactly once"
+        );
+    }
+}
+
+impl PinnedMapResult {
+    const COMMITTED_OFFSET: usize = core::mem::offset_of!(MemoryMapResult, committed);
+
+    fn write_payload(&self) {
+        let source = core::ptr::addr_of!(self.value).cast::<u8>();
+        for chunk in &self.chunks {
+            if chunk.result_offset >= Self::COMMITTED_OFFSET {
+                break;
+            }
+            let bytes = chunk
+                .bytes
+                .min(Self::COMMITTED_OFFSET - chunk.result_offset);
+            // SAFETY: projection 在 AddressSpace reservation 下由有效可写 PTE 固定；
+            // result_offset/bytes 是 MemoryMapResult 已初始化对象表示的子区间。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.add(chunk.result_offset),
+                    mm::phys_to_virt(chunk.physical) as *mut u8,
+                    bytes,
+                );
+            }
+        }
+    }
+
+    fn commit_cookie(&self) {
+        let chunk = self
+            .chunks
+            .iter()
+            .find(|chunk| {
+                chunk.result_offset <= Self::COMMITTED_OFFSET
+                    && Self::COMMITTED_OFFSET + core::mem::size_of::<u64>()
+                        <= chunk.result_offset + chunk.bytes
+            })
+            .expect("committed cookie must fit one pinned page");
+        let physical = chunk.physical + Self::COMMITTED_OFFSET - chunk.result_offset;
+        let pointer = mm::phys_to_virt(physical) as *mut AtomicU64;
+        assert_eq!(
+            pointer.addr() % core::mem::align_of::<AtomicU64>(),
+            0,
+            "committed cookie lost natural alignment"
+        );
+        // SAFETY: result ABI 与调用地址共同保证 AtomicU64 对齐；UserWriteLease
+        // 独占映射变更，调用者在 syscall 期间不得并发非原子访问 committed。
+        unsafe { AtomicU64::from_ptr(pointer.cast()).store(self.cookie, Ordering::Release) };
+    }
 }
 
 fn protection_flags(protection: Protection) -> u64 {
@@ -338,6 +470,37 @@ fn map_change_error(error: ChangeError) -> SpaceError {
     }
 }
 
+fn map_public_change_error(error: ChangeError) -> SystemCallError {
+    match error {
+        ChangeError::Conflict => SystemCallError::AddressConflict,
+        ChangeError::NotCovered | ChangeError::Guard => SystemCallError::NotMapped,
+        ChangeError::Busy | ChangeError::Stale => SystemCallError::ObjectBusy,
+        ChangeError::PermissionDenied | ChangeError::OwnerDenied => SystemCallError::RightsDenied,
+        ChangeError::PageLimit
+        | ChangeError::RegionLimit
+        | ChangeError::TransactionLimit
+        | ChangeError::KeyExhausted => SystemCallError::ReachLimit,
+        ChangeError::AllocationFailed => SystemCallError::OutOfMemory,
+        ChangeError::BadLimits
+        | ChangeError::Range(_)
+        | ChangeError::OutOfBounds
+        | ChangeError::BackingOutOfRange
+        | ChangeError::ObjectAuthorization
+        | ChangeError::LeaseInvalid
+        | ChangeError::LeaseTooLarge
+        | ChangeError::PermitMismatch => SystemCallError::IllegalArgument,
+    }
+}
+
+fn map_public_space_error(error: SpaceError) -> SystemCallError {
+    match error {
+        SpaceError::NoFrame => SystemCallError::OutOfMemory,
+        SpaceError::BadSegment => SystemCallError::InternalError,
+        SpaceError::Conflict => SystemCallError::AddressConflict,
+        SpaceError::Busy => SystemCallError::ObjectBusy,
+    }
+}
+
 fn process_protection(flags_value: ProcessMapFlags) -> Result<Protection, SpaceError> {
     let read = flags_value.contains(ProcessMapFlags::READ);
     let write = flags_value.contains(ProcessMapFlags::WRITE);
@@ -347,6 +510,14 @@ fn process_protection(flags_value: ProcessMapFlags) -> Result<Protection, SpaceE
         (true, true, false) => Ok(Protection::ReadWrite),
         (true, false, true) => Ok(Protection::ReadExecute),
         _ => Err(SpaceError::BadSegment),
+    }
+}
+
+fn public_protection(value: MemoryProtection) -> Protection {
+    match value {
+        MemoryProtection::ReadOnly => Protection::ReadOnly,
+        MemoryProtection::ReadWrite => Protection::ReadWrite,
+        MemoryProtection::ReadExecute => Protection::ReadExecute,
     }
 }
 
@@ -447,8 +618,19 @@ impl crate::remote_call::Completion for MemoryChangeCompletion {
         } else {
             let (fragments, permits) = batch.into_parts();
             assert!(
-                fragments.is_empty() && permits.is_empty(),
-                "memory change discarded retire resources without a sink"
+                permits.is_empty()
+                    && fragments.iter().all(|fragment| {
+                        fragment.owner == RegionOwner::AddressSpace
+                            && matches!(
+                                fragment.kind,
+                                RegionKindView::Guard
+                                    | RegionKindView::Mapping {
+                                        backing: BackingView::Anonymous { .. },
+                                        ..
+                                    }
+                            )
+                    }),
+                "public memory change retired non-address-space resources without a sink"
             );
         }
         self.process.space.lock().complete_retired_change(retired);
@@ -672,20 +854,6 @@ impl AddressSpace {
     }
 }
 
-pub(crate) enum HeapExtendStart {
-    Ready(usize),
-    Wait(super::wait::WaitPlan),
-}
-
-fn map_heap_space_error(error: SpaceError) -> SystemCallError {
-    match error {
-        SpaceError::NoFrame => SystemCallError::OutOfMemory,
-        SpaceError::BadSegment => SystemCallError::IllegalArgument,
-        SpaceError::Conflict => SystemCallError::ObjectBusy,
-        SpaceError::Busy => SystemCallError::ObjectBusy,
-    }
-}
-
 fn map_shootdown_error(error: PrepareShootdownError) -> SystemCallError {
     match error {
         PrepareShootdownError::NotRunning => SystemCallError::ObjectClosed,
@@ -695,40 +863,27 @@ fn map_shootdown_error(error: PrepareShootdownError) -> SystemCallError {
     }
 }
 
-/// Running Extend 的完整 AddressSpace transaction。Commit 前任一步失败均回滚
-/// planner/PTE/backing/wait reservation；Commit 后只返回 Waiting，由 completion
-/// 在 Remote ack 后推进 Retire/Complete 并交付既定的新 brk。
-pub(crate) fn extend_heap(
-    thread: &Thread,
-    bytes: usize,
-) -> Result<HeapExtendStart, SystemCallError> {
-    let process = thread.process.clone();
-    if bytes == 0 {
-        return Ok(HeapExtendStart::Ready(process.space.lock().brk));
-    }
+fn public_page_range(address: u64, bytes: u64) -> Result<LedgerPageRange, SystemCallError> {
+    let address = usize::try_from(address).map_err(|_| SystemCallError::IllegalArgument)?;
+    let bytes = usize::try_from(bytes).map_err(|_| SystemCallError::IllegalArgument)?;
+    LedgerPageRange::new(address, bytes).map_err(|_| SystemCallError::IllegalArgument)
+}
 
-    let mut extension = Some(
-        process
-            .space
-            .lock()
-            .prepare_heap_extension(bytes)
-            .map_err(map_heap_space_error)?,
-    );
-    let prepared = extension
-        .as_ref()
-        .expect("heap extension reservation exists")
-        .get();
-    let new_brk = prepared.new_brk;
-    let start_vpn = prepared.base / PAGE_SIZE;
-    let pages = prepared.pages;
-
-    let (completion, plan) = match prepare_memory_completion(process.clone(), new_brk, None) {
+fn start_user_memory_change(
+    process: Arc<Process>,
+    mut prepared: Option<PreparedUserMemory>,
+    shootdown_range: LedgerPageRange,
+    instruction: bool,
+    write_map_payload: bool,
+    value: usize,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let (completion, plan) = match prepare_memory_completion(process.clone(), value, None) {
         Ok(prepared) => prepared,
         Err(error) => {
             process
                 .space
                 .lock()
-                .rollback_heap_extension(extension.take().expect("extension must roll back"));
+                .rollback_user_memory(prepared.take().expect("memory change must roll back"));
             return Err(error);
         }
     };
@@ -739,23 +894,29 @@ pub(crate) fn extend_heap(
             process
                 .space
                 .lock()
-                .rollback_heap_extension(extension.take().expect("extension must roll back"));
+                .rollback_user_memory(prepared.take().expect("memory change must roll back"));
             return Err(map_shootdown_error(error));
         }
     };
+    if write_map_payload {
+        process
+            .space
+            .lock()
+            .write_user_map_payload(prepared.as_ref().expect("Map reservation must exist"));
+    }
 
     let committed = process.space.commit_shootdown(
         &process.lifecycle,
         shootdown,
-        start_vpn,
-        pages,
-        false,
+        shootdown_range.start() / PAGE_SIZE,
+        shootdown_range.pages(),
+        instruction,
         true,
         |state| {
-            let published = state.commit_heap_extension(
-                extension
+            let published = state.commit_user_memory(
+                prepared
                     .take()
-                    .expect("heap extension commits exactly once"),
+                    .expect("user memory change commits exactly once"),
             );
             completion.install(published);
         },
@@ -766,12 +927,92 @@ pub(crate) fn extend_heap(
             process
                 .space
                 .lock()
-                .rollback_heap_extension(extension.take().expect("stale extension must roll back"));
+                .rollback_user_memory(prepared.take().expect("stale change must roll back"));
             return Err(SystemCallError::ObjectBusy);
         }
     };
     synchronization.start();
-    Ok(HeapExtendStart::Wait(plan))
+    Ok(plan)
+}
+
+/// 为当前 Running process 建立 anonymous mapping。
+pub(crate) fn memory_map(
+    thread: &Thread,
+    request_ptr: usize,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let process = thread.process.clone();
+    let prepared = {
+        let mut space = process.space.lock();
+        // SAFETY: MemoryMapRequest 只含整数且无 padding，任意位型均有效。
+        let request: MemoryMapRequest =
+            unsafe { crate::uaccess::read_user_value(&mut space, request_ptr) }?;
+        if request.cookie == 0
+            || request.reserved != [0; 3]
+            || request.result_address
+                % u64::try_from(core::mem::align_of::<MemoryMapResult>()).unwrap()
+                != 0
+        {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let result_address = usize::try_from(request.result_address)
+            .map_err(|_| SystemCallError::IllegalArgument)?;
+        // SAFETY: MemoryMapResult 只含整数且无 padding，任意位型均有效。
+        let initial: MemoryMapResult =
+            unsafe { crate::uaccess::read_user_value(&mut space, result_address) }?;
+        if initial.reserved != [0; 3] || initial.committed != 0 {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        space.prepare_user_map(request)?
+    };
+    let layout = prepared
+        .get()
+        .change
+        .map_result()
+        .expect("Map reservation must retain its layout");
+    start_user_memory_change(process, Some(prepared), layout.reservation, false, true, 0)
+}
+
+/// 精确解除当前 Running process 的普通 mapping/reservation。
+pub(crate) fn memory_unmap(
+    thread: &Thread,
+    address: u64,
+    bytes: u64,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let process = thread.process.clone();
+    let range = public_page_range(address, bytes)?;
+    let prepared = process.space.lock().prepare_user_unmap(range)?;
+    start_user_memory_change(process, Some(prepared), range, false, false, 0)
+}
+
+/// 在创建时冻结的最大权限内改变当前 mapping 权限。
+pub(crate) fn memory_protect(
+    thread: &Thread,
+    address: u64,
+    bytes: u64,
+    protection: usize,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let process = thread.process.clone();
+    let range = public_page_range(address, bytes)?;
+    let raw = u32::try_from(protection).map_err(|_| SystemCallError::IllegalArgument)?;
+    let protection = MemoryProtection::from_raw(raw).ok_or(SystemCallError::IllegalArgument)?;
+    let protection = public_protection(protection);
+    let prepared = process
+        .space
+        .lock()
+        .prepare_user_protect(range, protection)?;
+    let instruction = prepared
+        .get()
+        .change
+        .translation_intents()
+        .iter()
+        .any(|intent| {
+            matches!(
+                intent,
+                TranslationIntent::Protect { from, to, .. }
+                    if *from == Protection::ReadExecute || *to == Protection::ReadExecute
+            )
+        });
+    start_user_memory_change(process, Some(prepared), range, instruction, false, 0)
 }
 
 /// 地址空间可变状态：MemorySpace ledger、anonymous backing、页表树与有界 drain
@@ -788,8 +1029,8 @@ pub(crate) struct AddressSpaceState {
     next_backing: u64,
     /// Object-owned mapping authority；单调不复用。
     next_lease: u64,
-    /// 堆顶（页对齐）；[brk, USER_TOP - STACK_SIZE) 为可扩展区。
-    brk: usize,
+    /// Building 期映像与 StartupBlock 的页对齐布局终点。
+    image_end: usize,
     /// 有界收束游标（drain_gate + space 锁双持下推进）。
     drain_stage: DrainStage,
     /// 已从拥有结构摘下、等待下一 work unit 归还的帧 extent。
@@ -811,7 +1052,7 @@ impl AddressSpaceState {
             backings: Vec::new(),
             next_backing: 1,
             next_lease: 1,
-            brk: 0,
+            image_end: 0,
             drain_stage: DrainStage::Idle,
             pending_free: None,
         })
@@ -827,11 +1068,6 @@ impl AddressSpaceState {
     /// 可达性）。
     fn tt(&mut self) -> &mut TableTree<TableMem, LEVELS> {
         self.tree.as_mut().expect("address space tree is live")
-    }
-
-    #[expect(dead_code, reason = "多线程/procfs 里程碑使用")]
-    pub fn brk(&self) -> usize {
-        self.brk
     }
 
     fn ledger(&mut self) -> &mut MemorySpace {
@@ -851,6 +1087,309 @@ impl AddressSpaceState {
         let identity = LeaseKey::new(self.next_lease).ok_or(SpaceError::NoFrame)?;
         self.next_lease = self.next_lease.checked_add(1).ok_or(SpaceError::NoFrame)?;
         Ok(identity)
+    }
+
+    fn pin_map_result(
+        &mut self,
+        change: &PreparedChange,
+        value: MemoryMapResult,
+        cookie: u64,
+    ) -> Result<PinnedMapResult, SystemCallError> {
+        let lease = change
+            .user_write_lease()
+            .expect("public Map must reserve a result lease");
+        let range = lease.range();
+        assert_eq!(
+            range.bytes(),
+            core::mem::size_of::<MemoryMapResult>(),
+            "public Map result lease has wrong width"
+        );
+        let mut cursor = range.start();
+        for segment in lease.projection().segments() {
+            assert_eq!(segment.user.start(), cursor, "result projection has a gap");
+            cursor = segment.user.end();
+        }
+        assert_eq!(cursor, range.end(), "result projection is incomplete");
+
+        let first_offset = range.start() % PAGE_SIZE;
+        let page_count = (first_offset + range.bytes()).div_ceil(PAGE_SIZE);
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(page_count)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        let mut result_offset = 0;
+        while result_offset < range.bytes() {
+            let user = range.start() + result_offset;
+            let in_page = user % PAGE_SIZE;
+            let bytes = (PAGE_SIZE - in_page).min(range.bytes() - result_offset);
+            let physical = self.page_pa(user).ok_or(SystemCallError::InternalError)? + in_page;
+            chunks.push(PinnedWriteChunk {
+                physical,
+                result_offset,
+                bytes,
+            });
+            result_offset += bytes;
+        }
+        Ok(PinnedMapResult {
+            chunks,
+            value,
+            cookie,
+        })
+    }
+
+    fn prepare_user_map(
+        &mut self,
+        request: MemoryMapRequest,
+    ) -> Result<PreparedUserMemory, SystemCallError> {
+        let mut token = PreparedUserMemory::allocate()?;
+        let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
+        let guard_before =
+            usize::try_from(request.guard_before).map_err(|_| SystemCallError::IllegalArgument)?;
+        let guard_after =
+            usize::try_from(request.guard_after).map_err(|_| SystemCallError::IllegalArgument)?;
+        let result_address = usize::try_from(request.result_address)
+            .map_err(|_| SystemCallError::IllegalArgument)?;
+        let protection = MemoryProtection::from_raw(request.protection)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        if protection == MemoryProtection::ReadExecute {
+            return Err(SystemCallError::RightsDenied);
+        }
+        let placement = match MemoryPlacement::from_raw(request.placement)
+            .ok_or(SystemCallError::IllegalArgument)?
+        {
+            MemoryPlacement::Anywhere if request.address == 0 => MapPlacement::Anywhere,
+            MemoryPlacement::FixedEmpty => MapPlacement::FixedEmpty {
+                usable_start: usize::try_from(request.address)
+                    .map_err(|_| SystemCallError::IllegalArgument)?,
+            },
+            MemoryPlacement::Anywhere => return Err(SystemCallError::IllegalArgument),
+        };
+        let result_range =
+            AddressRange::new(result_address, core::mem::size_of::<MemoryMapResult>())
+                .map_err(|_| SystemCallError::IllegalArgument)?;
+
+        let identity = self.mint_backing().map_err(map_public_space_error)?;
+        let protection = public_protection(protection);
+        let validated = self
+            .ledger()
+            .validate_map(MapRequest {
+                bytes,
+                guard_before,
+                guard_after,
+                placement,
+                current: protection,
+                maximum: protection,
+                owner: RegionOwner::AddressSpace,
+                backing: MapBacking::Anonymous {
+                    identity,
+                    class: AnonymousClass::Data,
+                },
+                result: Some(memory_space::UserWriteLeaseRequest {
+                    range: result_range,
+                }),
+            })
+            .map_err(map_public_change_error)?;
+        let layout = validated
+            .map_result()
+            .expect("public Map validation must produce a layout");
+        let backing = OwnedBacking::allocate(identity, layout.usable.pages())
+            .map_err(map_public_space_error)?;
+        self.backings
+            .try_reserve(1)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        let change = self
+            .ledger()
+            .reserve(validated, Vec::new())
+            .map_err(|failure| map_public_change_error(failure.error))?;
+        token.install(UserMemoryReservation {
+            change,
+            backing: Some(backing),
+            translations: Vec::new(),
+            result: None,
+        });
+        self.finish_user_map(token, layout, request.cookie, identity)
+    }
+
+    #[inline(never)]
+    fn finish_user_map(
+        &mut self,
+        mut token: PreparedUserMemory,
+        layout: memory_space::MapResultLayout,
+        cookie: u64,
+        identity: BackingId,
+    ) -> Result<PreparedUserMemory, SystemCallError> {
+        let value = MemoryMapResult {
+            usable_base: layout.usable.start() as u64,
+            usable_bytes: layout.usable.bytes() as u64,
+            reservation_base: layout.reservation.start() as u64,
+            reservation_bytes: layout.reservation.bytes() as u64,
+            reserved: [0; 3],
+            committed: 0,
+        };
+        let result = match self.pin_map_result(&token.get().change, value, cookie) {
+            Ok(result) => result,
+            Err(error) => {
+                self.rollback_user_memory(token);
+                return Err(error);
+            }
+        };
+        let (range, offset, intent_protection) = match token.get().change.translation_intents() {
+            [
+                TranslationIntent::Install {
+                    range,
+                    backing:
+                        BackingView::Anonymous {
+                            identity: intent_identity,
+                            offset,
+                            class: AnonymousClass::Data,
+                        },
+                    protection,
+                },
+            ] if *intent_identity == identity => (*range, *offset, *protection),
+            _ => panic!("public anonymous Map planner returned an invalid translation plan"),
+        };
+        let translations = match token
+            .get()
+            .backing
+            .as_ref()
+            .expect("Map reservation lost its backing")
+            .prepare_install(self.tt(), range, offset, intent_protection)
+        {
+            Ok(translations) => translations,
+            Err(error) => {
+                self.rollback_user_memory(token);
+                return Err(map_public_space_error(error));
+            }
+        };
+        let reservation = token.get_mut();
+        reservation.result = Some(result);
+        reservation.translations = translations;
+        Ok(token)
+    }
+
+    fn prepare_user_existing_change(
+        &mut self,
+        validated: memory_space::ValidatedChange,
+    ) -> Result<PreparedUserMemory, SystemCallError> {
+        let mut token = PreparedUserMemory::allocate()?;
+        let mut translations = Vec::new();
+        let change = self
+            .ledger()
+            .reserve(validated, Vec::new())
+            .map_err(|failure| map_public_change_error(failure.error))?;
+        if translations
+            .try_reserve_exact(change.translation_intents().len())
+            .is_err()
+        {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            return Err(SystemCallError::OutOfMemory);
+        }
+        for intent in change.translation_intents().iter().copied() {
+            let prepared = match intent {
+                TranslationIntent::Remove { range } => self
+                    .tt()
+                    .prepare_unmap(Vpn(range.start() / PAGE_SIZE), range.pages()),
+                TranslationIntent::Protect { range, from, to } => self.tt().prepare_protect(
+                    Vpn(range.start() / PAGE_SIZE),
+                    range.pages(),
+                    protection_flags(from),
+                    protection_flags(to),
+                ),
+                TranslationIntent::Install { .. } => {
+                    panic!("existing mapping change unexpectedly installs a PTE")
+                }
+            };
+            match prepared {
+                Ok(prepared) => translations.push(prepared),
+                Err(error) => {
+                    let permits = self.ledger().rollback(change);
+                    debug_assert!(permits.is_empty());
+                    drop(translations);
+                    return Err(map_public_space_error(error.into()));
+                }
+            }
+        }
+        token.install(UserMemoryReservation {
+            change,
+            backing: None,
+            translations,
+            result: None,
+        });
+        Ok(token)
+    }
+
+    fn prepare_user_unmap(
+        &mut self,
+        range: LedgerPageRange,
+    ) -> Result<PreparedUserMemory, SystemCallError> {
+        let validated = self
+            .ledger()
+            .validate_unmap(UnmapRequest {
+                range,
+                authority: RegionOwner::AddressSpace,
+            })
+            .map_err(map_public_change_error)?;
+        self.prepare_user_existing_change(validated)
+    }
+
+    fn prepare_user_protect(
+        &mut self,
+        range: LedgerPageRange,
+        protection: Protection,
+    ) -> Result<PreparedUserMemory, SystemCallError> {
+        let validated = self
+            .ledger()
+            .validate_protect(ProtectRequest {
+                range,
+                protection,
+                authority: RegionOwner::AddressSpace,
+            })
+            .map_err(map_public_change_error)?;
+        self.prepare_user_existing_change(validated)
+    }
+
+    fn write_user_map_payload(&self, prepared: &PreparedUserMemory) {
+        prepared
+            .get()
+            .result
+            .as_ref()
+            .expect("Map reservation lost its result")
+            .write_payload();
+    }
+
+    fn rollback_user_memory(&mut self, prepared: PreparedUserMemory) {
+        let UserMemoryReservation {
+            change,
+            translations,
+            backing,
+            result: _,
+        } = prepared.take();
+        let permits = self.ledger().rollback(change);
+        debug_assert!(permits.is_empty());
+        drop(translations);
+        drop(backing);
+    }
+
+    fn commit_user_memory(&mut self, prepared: PreparedUserMemory) -> PublishedChange {
+        let UserMemoryReservation {
+            change,
+            backing,
+            translations,
+            result,
+        } = prepared.take();
+        if let Some(result) = &result {
+            result.commit_cookie();
+        }
+        let committed = self.ledger().commit(change);
+        for translation in translations {
+            self.tt().publish(translation);
+        }
+        let published = self.ledger().publish(committed);
+        if let Some(backing) = backing {
+            self.backings.push(backing);
+        }
+        published
     }
 
     fn map_owned_anonymous(
@@ -938,18 +1477,6 @@ impl AddressSpaceState {
         })
     }
 
-    fn rollback_owned_mapping(&mut self, prepared: PreparedOwnedMapping) {
-        let PreparedOwnedMapping {
-            backing,
-            change,
-            translations,
-        } = prepared;
-        let permits = self.ledger().rollback(change);
-        debug_assert!(permits.is_empty());
-        drop(translations);
-        drop(backing);
-    }
-
     fn commit_owned_mapping(&mut self, prepared: PreparedOwnedMapping) -> PublishedChange {
         let PreparedOwnedMapping {
             backing,
@@ -965,12 +1492,76 @@ impl AddressSpaceState {
         published
     }
 
+    fn anonymous_range_still_live(
+        &mut self,
+        identity: BackingId,
+        offset: usize,
+        bytes: usize,
+    ) -> bool {
+        let end = offset
+            .checked_add(bytes)
+            .expect("retiring anonymous view overflowed");
+        let covered: usize = self
+            .ledger()
+            .regions()
+            .filter_map(|region| match region.kind {
+                RegionKindView::Mapping {
+                    backing:
+                        BackingView::Anonymous {
+                            identity: region_identity,
+                            offset: region_offset,
+                            ..
+                        },
+                    ..
+                } if region_identity == identity => {
+                    let region_end = region_offset
+                        .checked_add(region.range.bytes())
+                        .expect("live anonymous view overflowed");
+                    let start = offset.max(region_offset);
+                    let end = end.min(region_end);
+                    Some(end.saturating_sub(start))
+                }
+                _ => None,
+            })
+            .sum();
+        assert!(
+            covered == 0 || covered == bytes,
+            "retiring anonymous view is only partially represented in the live ledger"
+        );
+        covered == bytes
+    }
+
     pub(crate) fn retire_published_change(
         &mut self,
         published: PublishedChange,
     ) -> (RetiredChange, RetireBatch) {
         let synchronized = self.ledger().synchronize(published);
-        self.ledger().retire(synchronized)
+        let (retired, batch) = self.ledger().retire(synchronized);
+        for fragment in batch.fragments().iter().copied() {
+            let RegionKindView::Mapping {
+                backing:
+                    BackingView::Anonymous {
+                        identity, offset, ..
+                    },
+                ..
+            } = fragment.kind
+            else {
+                continue;
+            };
+            if self.anonymous_range_still_live(identity, offset, fragment.range.bytes()) {
+                continue;
+            }
+            let index = self
+                .backings
+                .iter()
+                .position(|backing| backing.identity == identity)
+                .expect("retiring anonymous fragment lost its owned backing");
+            self.backings[index].release_range(offset, fragment.range.bytes());
+            if self.backings[index].extents.is_empty() {
+                self.backings.remove(index);
+            }
+        }
+        (retired, batch)
     }
 
     pub(crate) fn complete_retired_change(&mut self, retired: RetiredChange) {
@@ -1233,7 +1824,7 @@ impl AddressSpaceState {
         }
         self.map_owned_anonymous(vaddr, len, protection)?;
         if end <= stack_base {
-            self.brk = self.brk.max(end);
+            self.image_end = self.image_end.max(end);
         }
         Ok(())
     }
@@ -1287,7 +1878,7 @@ impl AddressSpaceState {
         entry: usize,
         stack_pointer: usize,
     ) -> Result<(), SpaceError> {
-        if stack_pointer == 0 || stack_pointer % 16 != 0 || self.brk == 0 {
+        if stack_pointer == 0 || stack_pointer % 16 != 0 || self.image_end == 0 {
             return Err(SpaceError::BadSegment);
         }
         let entry_mapping = self
@@ -1393,9 +1984,9 @@ impl AddressSpaceState {
             self.write_building(seg.vaddr as usize, src)?;
         }
 
-        let brk = top.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        if brk > self.brk {
-            self.brk = brk;
+        let image_end = top.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        if image_end > self.image_end {
+            self.image_end = image_end;
         }
         Ok(())
     }
@@ -1420,11 +2011,11 @@ impl AddressSpaceState {
         if prefix.is_empty()
             || prefix.len() % PAGE_SIZE != 0
             || payload_pa % PAGE_SIZE != 0
-            || self.brk == 0
+            || self.image_end == 0
         {
             return Err(SpaceError::BadSegment);
         }
-        let base = self.brk;
+        let base = self.image_end;
         let prefix_pages = prefix.len() / PAGE_SIZE;
         let payload_pages = payload_len.div_ceil(PAGE_SIZE);
         let pages = prefix_pages
@@ -1457,55 +2048,8 @@ impl AddressSpaceState {
         }
         self.map_owned_backing(base, Protection::ReadOnly, AnonymousClass::Data, backing)?;
         self.write_building(base, prefix)?;
-        self.brk = end;
+        self.image_end = end;
         Ok(base)
-    }
-
-    /// Reserve 阶段准备一笔 Running heap 扩展：planner reservation、owned
-    /// backing 与全部页表 reservation 均已取得，尚未改变 brk/PTE/ledger。
-    #[inline(never)]
-    fn prepare_heap_extension(&mut self, bytes: usize) -> Result<HeapExtensionToken, SpaceError> {
-        const MAX_EXTEND_BYTES: usize = 256 << 20;
-        if bytes == 0 || bytes > MAX_EXTEND_BYTES {
-            return Err(SpaceError::BadSegment);
-        }
-        let pages = bytes.div_ceil(PAGE_SIZE);
-        let delta = pages.checked_mul(PAGE_SIZE).ok_or(SpaceError::BadSegment)?;
-        let base = self.brk;
-        let new_brk = base.checked_add(delta).ok_or(SpaceError::BadSegment)?;
-        if new_brk > USER_TOP - STACK_SIZE {
-            return Err(SpaceError::BadSegment);
-        }
-        // 事务聚合容器必须先于 backing、planner 与 PTE reservation 分配；
-        // 之后任何失败都能持 token 走显式 rollback。
-        let mut token = HeapExtensionToken::allocate()?;
-        let identity = self.mint_backing()?;
-        let backing = OwnedBacking::allocate(identity, pages)?;
-        let mapping =
-            self.prepare_owned_backing(base, Protection::ReadWrite, AnonymousClass::Data, backing)?;
-        token.install(PreparedHeapExtension {
-            mapping,
-            base,
-            new_brk,
-            pages,
-        });
-        Ok(token)
-    }
-
-    fn rollback_heap_extension(&mut self, prepared: HeapExtensionToken) {
-        self.rollback_owned_mapping(prepared.take().mapping);
-    }
-
-    /// Commit gate 内不可失败发布；返回的 ledger token 由 Remote completion 持有。
-    fn commit_heap_extension(&mut self, prepared: HeapExtensionToken) -> PublishedChange {
-        let prepared = prepared.take();
-        assert_eq!(
-            self.brk, prepared.base,
-            "heap break changed after reservation"
-        );
-        let published = self.commit_owned_mapping(prepared.mapping);
-        self.brk = prepared.new_brk;
-        published
     }
 
     /// 校验用户区间 [ptr, ptr+len) 逐页可访问：不溢出、不出用户半区、
