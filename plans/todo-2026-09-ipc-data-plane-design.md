@@ -68,7 +68,7 @@ MemoryObject 的稳定前提是：对象持 backing、mapping lease 借 view；c
 
 ## 前置依赖
 
-- `todo-2026-09-user-memory-mapping.md` 已收口，统一 AddressSpace/MemoryChange、lease 与跨 hart 完成 seam 稳定；
+- `archived/todo-2026-09-user-memory-mapping.md` 已收口，统一 AddressSpace/MemoryChange、lease 与跨 hart 完成 seam 稳定；
 - `todo-2026-09-thread-model.md` 批二、批三已收口；
 - carryover IPC 压力线给出并发和资源守恒证据；
 - 至少一个真实消费者证明现有 Tunnel/Runnel 不足，而非仅有构想。

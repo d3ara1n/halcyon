@@ -1,8 +1,8 @@
 # 用户内存映射机制完整化
 
-- 状态：切片 1–7 与 8A 已提交；8B 已通过 ThreadSpawn 真实多线程路径及完整平台矩阵，待随线程批二独立提交
-- 方向真值：[`notes/ideas/mm.md`](../notes/ideas/mm.md)
-- 自然序：提交 ThreadSpawn 批二/8B 后完成线程批三，再按真实提交哈希创建联合 review 计划
+- 状态：切片 1–8B 已由 `1cd6ab2` 至 `bdc83ef` 八笔提交收口；本实施计划归档，后续审查见 [`todo-2026-08-30-user-memory-mapping-review.md`](../todo-2026-08-30-user-memory-mapping-review.md)
+- 方向真值：[`notes/ideas/mm.md`](../../notes/ideas/mm.md)
+- 自然序：完成线程批三，再进入 IPC 数据面设计；未来 review 不阻塞当前主线
 
 ## 驱动问题
 
@@ -68,7 +68,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 - host 纯逻辑测试、锁持有验证与 RISC-V 双 hart 竞态验证；
 - 每个实现切片落地后才同步对应 `notes/impls/`。
 
-公共 MemoryObject 的 ObjectKind、HandleRole、创建/seal ABI、pager、COW、文件缓存与帧 capability 不在本计划公开；这些对象面由 [`todo-2026-09-ipc-data-plane-design.md`](todo-2026-09-ipc-data-plane-design.md) 承接。本计划仍实现并验证 AddressSpace 所依赖的内部 ObjectView、WritePermit 与 `Mutable → Sealing → Executable` 状态 seam；Tunnel 的既有固定 backing 作为真实 ObjectView/lease 消费者，不能以“公共 ABI 延后”为由跳过 backing 级 W^X 所有权。
+公共 MemoryObject 的 ObjectKind、HandleRole、创建/seal ABI、pager、COW、文件缓存与帧 capability 不在本计划公开；这些对象面由 [`todo-2026-09-ipc-data-plane-design.md`](../todo-2026-09-ipc-data-plane-design.md) 承接。本计划仍实现并验证 AddressSpace 所依赖的内部 ObjectView、WritePermit 与 `Mutable → Sealing → Executable` 状态 seam；Tunnel 的既有固定 backing 作为真实 ObjectView/lease 消费者，不能以“公共 ABI 延后”为由跳过 backing 级 W^X 所有权。
 
 ## 迁移纪律
 
@@ -175,7 +175,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 阶段记录：`os/remote_call` 已落地固定 8 hart × 4 槽的纯逻辑状态机与 kernel adapter，具备批量 Reserve 精确回滚、Pending 电平、generation 退休、锁外 IPI、trap/idle 有界消费、全量 `SFENCE.VMA`/可选 `FENCE.I`、release-sequence 最后确认及每 hart epoch cache。Process lifecycle 以 execution sequence/mandatory operation 闭合 active gate 与终止接管；稳定 AddressSpace 外壳提供 `prepare_shootdown → commit_shootdown → start`。真实 consumer 已覆盖 Running Extend、Tunnel Create/Attach/HandleClose；prepared WaitContext、发起线程消散和 ack 后 Retire/Complete 均已闭合。admitted mask 由 registry 安装时原子发布，Remote Reserve 不再把 registry LEAF 锁带入业务事务。host debug/release、clippy、`just check`、virt debug/release 与 sifive_u 已通过，10/10 竞态矩阵不变。
 
-未来代码复审已按提交 `6199985` 单独建立 [`todo-2026-08-30-remote-call-review.md`](todo-2026-08-30-remote-call-review.md)；它不阻塞本计划继续迁移 AddressSpace。
+未来代码复审已按提交 `6199985` 单独建立 [`todo-2026-08-30-remote-call-review.md`](../todo-2026-08-30-remote-call-review.md)；它不阻塞本计划继续迁移 AddressSpace。
 
 ### 6. AddressSpace 替换与现有调用者迁移
 
@@ -226,7 +226,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 ### 8A. 当前公开面的验证与文档收口
 
-- 状态：实现与验证已完成，待提交（2026-08-30）
+- 状态：实现与验证已由 `9358963` 提交（2026-08-30）
 
 | 本切片不变量 | 进入所有权 | 退出所有权 |
 |---|---|---|
@@ -272,7 +272,7 @@ sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈�
 
 ### 联合复审归档
 
-切片 1–7、8A 与 ThreadSpawn integration 形成真实提交后，创建 `todo-<日期>-user-memory-mapping-review.md` 并加入 COMPASS 活跃计划：逐批记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险；统一复审 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整。该 review 计划只在联合 gate 哈希齐全后生成，不以占位哈希预建。
+切片 1–7、8A 与 ThreadSpawn integration 已形成 `1cd6ab2` 至 `bdc83ef` 八笔真实提交；未来审查计划已建立为 [`todo-2026-08-30-user-memory-mapping-review.md`](../todo-2026-08-30-user-memory-mapping-review.md)，逐批记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险。Review 统一复核 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整，不阻塞当前验收与自然序。
 
 ## 对 ThreadSpawn 契约重审的解除条件
 
@@ -296,6 +296,6 @@ sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈�
 - 帧库存、单次请求、事务、Remote Call、seal 完成槽和最终 drain 均有可证明硬上界；
 - 正常、冲突、OOM、部分解除、并发和终止路径保持区域/PTE/backing/permit/Handle/slot 守恒；
 - guard fault 和所有用户参数错误只产生规定错误或用户 fault，不 panic 内核；
-- 8A 的 debug/release、virt/hetero/nofd/sifive_u 与 host 验证全绿；8B 在 ThreadSpawn 落地后重跑同一矩阵；
+- 8A 与 8B 的 debug/release、virt/hetero/nofd/sifive_u 与 host 验证全绿；
 - impls 只记录实际结构，方向与计划不冒充实现；
 - ThreadSpawn 契约重审解除阻塞，且 8B 的同 AddressSpace 多 hart、并发解除与次线程资源所有权全部通过后，user-memory 全链才完成。

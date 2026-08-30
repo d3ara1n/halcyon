@@ -36,7 +36,7 @@
 ### 公理层
 
 - 新增 role/对象时按 `ideas/object.md`「收束分层」公理分类（有界 close vs REAPABLE+drain）；跨 hart 等完成确认是正交维度，不把异步误判为无界容器。
-- reserve/publish/retire 的共享骨架触发条件已经满足，由 `todo-2026-09-user-memory-mapping.md` 的 AddressSpace/MemoryChange 重构承接；本 Review 应核对新 seam 是否真正删除调用点协议，而不再重议是否抽象。
+- reserve/publish/retire 的共享骨架触发条件已经满足，由 `archived/todo-2026-09-user-memory-mapping.md` 的 AddressSpace/MemoryChange 重构承接；本 Review 应核对新 seam 是否真正删除调用点协议，而不再重议是否抽象。
 
 ### 文档自洽
 

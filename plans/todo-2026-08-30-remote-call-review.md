@@ -1,6 +1,6 @@
 # Remote Call 与地址空间 epoch Review 计划
 
-> 【未来审查计划】对象是用户内存映射切片 4–5 的提交 `619998517f5293d13e48d91f3980d4f4d389b90a`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/call.md`](../notes/ideas/call.md) 与 [`notes/ideas/mm.md`](../notes/ideas/mm.md)，实现现状见 [`notes/impls/call.md`](../notes/impls/call.md)「Remote Call」、[`notes/impls/mm.md`](../notes/impls/mm.md)「用户地址空间」，实施上下文见 [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)。
+> 【未来审查计划】对象是用户内存映射切片 4–5 的提交 `619998517f5293d13e48d91f3980d4f4d389b90a`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/call.md`](../notes/ideas/call.md) 与 [`notes/ideas/mm.md`](../notes/ideas/mm.md)，实现现状见 [`notes/impls/call.md`](../notes/impls/call.md)「Remote Call」、[`notes/impls/mm.md`](../notes/impls/mm.md)「用户地址空间」，实施上下文见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md)。
 
 ## 提交对照
 

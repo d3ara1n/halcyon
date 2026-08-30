@@ -3,9 +3,9 @@
 > 批一 Start 拆解及事务复审已收口；用户内存 8A 已由 `9358963` 提交。
 > 批二契约与 shared/kernel/rinlib 实现已经完成，user-memory 8B 的同
 > AddressSpace 多 hart、并发解除、guarded stack 与 join 组合所有权已通过
-> host、common debug/release、virt-hetero、virt-nofd 与 sifive_u 验证，当前待
-> 独立提交；批三竞态扩面、carryover IPC 压力线与实现文档同步仍待完成。联合边界见
-> [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)。
+> host、common debug/release、virt-hetero、virt-nofd 与 sifive_u 验证，并由
+> `bdc83ef` 提交。批三竞态扩面、carryover IPC 压力线与实现文档同步仍待完成。
+> 联合实施档案见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md)。
 
 ## 决策记录
 
@@ -134,7 +134,7 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 ### 实施批次总览
 
 1. **批一：Start 拆解**——ProcessAttach/ProcessGrant/Start 纯化、ABI 两侧（shared + rinlib/libprocess + 全负载组装路径）、init bootstrap 内嵌同构序列、startup 机制删除、出生块转用户约定。验证：全负载等价回归（virt/virt-release/hetero/nofd/sifive_u/host）。
-2. **批二：ThreadSpawn/Exit/Yield + join 壳（已完成，待提交）**——shared 固定宽 ABI、Running `Spawning→Ready` 事务、ThreadControl DONE、线程级 Map-result obligation 与 rinlib guarded `UserStack`/结构化 `JoinHandle` 已贯通；user-memory 8B 真实多线程 gate 已通过。
+2. **批二：ThreadSpawn/Exit/Yield + join 壳（已完成，`bdc83ef`）**——shared 固定宽 ABI、Running `Spawning→Ready` 事务、ThreadControl DONE、线程级 Map-result obligation 与 rinlib guarded `UserStack`/结构化 `JoinHandle` 已贯通；user-memory 8B 真实多线程 gate 已通过。
 3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步**——见下两节。
 
 每个实现或修复批次独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。
