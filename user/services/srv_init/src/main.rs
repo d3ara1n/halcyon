@@ -464,7 +464,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     names.register_job(pm_domain, "pm_domain");
     names.register_job(acceptance, "acceptance");
     names.register_process(env::pid() as u64, "init");
-    let (pm_mailbox, supervised, target_image, hammer_image) =
+    let (pm_mailbox, mut supervised, target_image, hammer_image) =
         launch_test_services(services, pm_domain, acceptance, &mut names)?;
 
     // 运行时拓扑快照（调试参考）：此刻服务在域内运行，验收自测尚未
@@ -567,6 +567,17 @@ fn run(services: Handle) -> Result<(), &'static str> {
         Some(image) => test_job_management(acceptance, image)?,
         None => return Err("job management acceptance image unavailable"),
     }
+
+    // 短寿命服务的线程已退出并不释放 AddressSpace；在高峰矩阵前收束已进入
+    // Terminating/Dead 的成员，仍 Running 的服务继续由末尾监督闭环持有。
+    let reclaimed = supervise_terminated_services(&mut supervised).map_err(|error| {
+        debug!("pre-race service supervision failed: {:?}", error);
+        "pre-race service supervision failed"
+    })?;
+    debug!(
+        "pre-race service supervision reclaimed {} process(es)",
+        reclaimed
+    );
 
     // —— 生命周期多核竞态矩阵（step 9）：双锤同刻起跑打真跨核竞态，
     // 断言各场景终态合法、无泄漏、枚举收敛 ——
@@ -704,6 +715,28 @@ fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
             ),
         }
     }
+}
+
+/// 只收束已经离开 Building/Running 的服务，避免已 reaped 线程的地址空间在
+/// 后续高峰负载中继续占帧；状态仍活跃的成员原样留给最终监督闭环。
+fn supervise_terminated_services(
+    supervised: &mut alloc::vec::Vec<Supervised>,
+) -> Result<usize, SystemCallError> {
+    let mut reclaimed = 0;
+    let mut index = 0;
+    while index < supervised.len() {
+        let state = process::query(supervised[index].control)?.state;
+        if state == ProcessState::Building as u32 || state == ProcessState::Running as u32 {
+            index += 1;
+            continue;
+        }
+        let target = supervised.swap_remove(index);
+        let mut ready = alloc::vec::Vec::with_capacity(1);
+        ready.push(target);
+        supervise_services(ready)?;
+        reclaimed += 1;
+    }
+    Ok(reclaimed)
 }
 
 /// 监督循环：对保留的每个 control 等待 REAPABLE|CLOSED，Drain 至

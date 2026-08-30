@@ -21,6 +21,10 @@ pub const TARGET_SUICIDE: u64 = 1;
 pub const TARGET_FAULT: u64 = 2;
 /// TARGET payload word[1]：等枪后高频 sys_sleep(1) 循环。
 pub const TARGET_PARK: u64 = 3;
+/// TARGET payload word[1]：持续执行公开 Map/Protect/Unmap，供异 hart kill 竞速。
+pub const TARGET_MEMORY_CHURN: u64 = 4;
+/// TARGET payload word[1]：建立 guarded mapping 后访问 guard，验证用户 fault。
+pub const TARGET_GUARD_FAULT: u64 = 5;
 
 /// HAMMER grants 槽位。
 pub const HAMMER_CMD: usize = 0;

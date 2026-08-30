@@ -1,10 +1,11 @@
 # 线程资源模型与用户态多线程（ThreadSpawn）
 
-> 批一 Start 拆解及事务复审已收口；批二 ThreadSpawn 暂缓。多线程 teardown、
-> 域 eligibility 与竞态矩阵等内核前置已经就绪，但 Running 进程尚无完整
-> Map/Unmap、guard 与 remote TLB shootdown，无法兑现用户供栈的完整政策面。
-> 当前由 [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)
-> 阻塞；该计划收口后先重审本篇用户态资源契约，再实施批二。
+> 批一 Start 拆解及事务复审已收口；用户内存 8A 的当前公开面与五条平台矩阵
+> 已完成验证，待其独立提交后立即重开批二契约审查。Map/Unmap、guard、Remote
+> Call、affine `MappedRegion` 与 allocator 多 arena 已落地；同 AddressSpace 双
+> hart、并发解除和次线程栈/join 组合所有权作为批二/批三必须通过的 user-memory
+> 8B integration gate。联合边界见
+> [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)。
 
 ## 决策记录
 
@@ -44,7 +45,7 @@
 
 | 资源 | 外部通道（Building 期，组装者持 builder） | 内部通道（Running 期，进程自己的 syscall） |
 |---|---|---|
-| 内存 | ProcessMap | Extend |
+| 内存 | ProcessMap | MemoryMap/MemoryUnmap/MemoryProtect |
 | 代码/数据 | ProcessWrite | ——（无） |
 | 句柄 | ProcessGrant（新） | Transit/Grant |
 | 线程 | ProcessAttach（新） | ThreadSpawn |
@@ -124,7 +125,7 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 ### 实施批次总览
 
 1. **批一：Start 拆解**——ProcessAttach/ProcessGrant/Start 纯化、ABI 两侧（shared + rinlib/libprocess + 全负载组装路径）、init bootstrap 内嵌同构序列、startup 机制删除、出生块转用户约定。验证：全负载等价回归（virt/virt-release/hetero/nofd/sifive_u/host）。
-2. **批二：ThreadSpawn/Exit/Yield + join 壳（受内存前置阻塞）**——spawn 事务（预育结构已在批一落地）、末线程冻结边、tid 从 1、cap；在完整 Map/Unmap、guard 与 TLB shootdown 收口后，先重审栈/wrapper/结果槽/join handle 的用户态所有权，再实现 rinlib。验证：等价回归 + 多线程功能负载。
+2. **批二：ThreadSpawn/Exit/Yield + join 壳（8A 后重审并实施）**——spawn 事务（预育结构已在批一落地）；基于完整 Map/Unmap、guard、shootdown 与 affine `MappedRegion`，先重审 `UserStack`/wrapper/结果槽/join handle 的用户态组合所有权，再实现 shared/kernel/rinlib。验证：等价回归 + 多线程功能负载 + user-memory 8B integration gate。
 3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步**——见下两节。
 
 每个实现或修复批次独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。
@@ -135,11 +136,15 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 2. 末线程 ThreadExit vs 异 hart ProcessKill（双冻结竞争，首达者胜，双侧终因均有胜出记录）；
 3. join 唤醒 vs 离场时序（DONE 发布恰在成员摘除后；joiner 结果槽可见性——内存序轴断言）；
 4. 并发 spawn/exit 风暴（tid 单调、表长守恒、cap 触发 ReachLimit 后恢复）；
-5. 双 hart 同进程并行（同 satp、space 锁 Extend 串行化、fence.i 代次正确）；
+5. 双 hart 同进程并行（同 satp、AddressSpace 事务串行化、epoch/fence.i 代次正确）；
 6. Building 交错：attach/grant vs seal/kill（上行检查、abandonment 收编 nursery 与已装句柄）；
 7. Start 活体门：零线程拒绝、1 与 N 线程入册各一例；
 8. ProcessGrant 回滚（目标表满/失败路径句柄守恒）;
 9. join 壳 close vs 线程离场（壳消散后离场照常，无泄漏无双重处置）。
+10. 一 hart 缓存旧 mapping，另一 hart Unmap 完成后以不同 backing 重映射同 VA，前者不得读到旧页；
+11. Unmap vs ThreadExit/ProcessKill 与 shootdown ack vs termination；
+12. Endpoint HandleClose/Tunnel lease close vs 同进程普通 Unmap；
+13. 次线程 guard stack、wrapper/result 槽与 join handle 的建立、离场确认、解除和复用；Map committed cookie 的发起线程消散由 join 接管。
 
 ## carryover IPC 压力线接入（触发条件 = 本里程碑落地）
 
@@ -160,7 +165,7 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 
 ## 完成标准
 
-- 全负载等价回归 + 新增 9 场景 + carryover 四项全绿（debug 与 release）；
+- 全负载等价回归 + 新增 13 场景 + carryover 四项全绿（debug 与 release），其中 5、10–13 同时作为 user-memory 8B integration gate；
 - lifecycle 无主线程特例、无单线程假设（既有）；
 - join 契约（DONE 电平 + 内存序）有验证负载背书；
 - 出生块为用户约定，startup 内核机制删除，文档同步完成；

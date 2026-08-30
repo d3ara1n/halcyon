@@ -9,10 +9,10 @@
 #![no_std]
 
 use libprocess::race::{
-    self, Cmd, Report, HAMMER_CMD, HAMMER_CONTROL_RIGHTS, HAMMER_GUN, HAMMER_REPORT, MODE_HAMMER,
-    MODE_TARGET, MSG_CMD, MSG_REPORT, TARGET_FAULT, TARGET_GUN, TARGET_PARK, TARGET_SUICIDE,
-    ACTION_CLOSE, ACTION_CREATE, ACTION_CREATE_ABANDON, ACTION_DRAIN, ACTION_EXIT, ACTION_KILL,
-    ACTION_SEAL, ACTION_START, ACTION_ENUMERATE,
+    self, ACTION_CLOSE, ACTION_CREATE, ACTION_CREATE_ABANDON, ACTION_DRAIN, ACTION_ENUMERATE,
+    ACTION_EXIT, ACTION_KILL, ACTION_SEAL, ACTION_START, Cmd, HAMMER_CMD, HAMMER_CONTROL_RIGHTS,
+    HAMMER_GUN, HAMMER_REPORT, MODE_HAMMER, MODE_TARGET, MSG_CMD, MSG_REPORT, Report, TARGET_FAULT,
+    TARGET_GUARD_FAULT, TARGET_GUN, TARGET_MEMORY_CHURN, TARGET_PARK, TARGET_SUICIDE,
 };
 use rinlib::{
     env,
@@ -22,13 +22,15 @@ use rinlib::{
         object::close,
         wait::wait_many,
     },
+    mm::{MappedRegion, Placement},
     preclude::*,
     process,
     shared::{
         call::SystemCallError,
+        mem::MemoryProtection,
         object::{Handle, ObjectSignals},
-        proc::{ExecutionProfile, JobMemberKind},
-        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
+        proc::{ExecutionProfile, JobMemberKind, PROCESS_PAGE_SIZE},
+        wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
     },
     sys_exit, sys_sleep,
 };
@@ -230,10 +232,58 @@ fn target_mode(words: &[u64]) {
             // SAFETY: 故意解引用未映射地址。
             let _ = unsafe { core::ptr::read_volatile(0x6000_0000usize as *const u64) };
         }
+        TARGET_MEMORY_CHURN => memory_churn(),
+        TARGET_GUARD_FAULT => guard_fault(),
         TARGET_PARK => loop {
             // SAFETY: 值参数；高频 park 供 kill 取消线竞速。
             unsafe { sys_sleep(1).expect("hammer target park sleep") };
         },
         other => debug!("hammer target: unknown subrole {}", other),
     }
+}
+
+fn memory_churn() -> ! {
+    debug!("hammer target: public memory churn started");
+    loop {
+        let region = MappedRegion::map_anonymous(
+            2 * PROCESS_PAGE_SIZE,
+            PROCESS_PAGE_SIZE,
+            PROCESS_PAGE_SIZE,
+            MemoryProtection::ReadWrite,
+            Placement::Anywhere,
+        )
+        .expect("memory churn Map failed");
+        let usable = region
+            .usable()
+            .expect("memory churn Map has no usable range");
+        // SAFETY: usable 是本轮持有的 RW anonymous mapping。
+        unsafe { (usable.start as *mut u64).write_volatile(0x6d65_6d6f_7279_2d38) };
+        region
+            .protect(usable.clone(), MemoryProtection::ReadOnly)
+            .expect("memory churn Protect R failed");
+        region
+            .protect(usable, MemoryProtection::ReadWrite)
+            .expect("memory churn Protect RW failed");
+        region.unmap().expect("memory churn Unmap failed");
+        // 单 hart Base64 域也必须给编排 hammer 公平执行机会；多 hart common
+        // 配置中的 kill 仍可与上面的异步 MemoryChange 真并行。
+        // SAFETY: 值参数；只在完整事务边界让出。
+        unsafe { sys_sleep(1).expect("memory churn yield sleep failed") };
+    }
+}
+
+fn guard_fault() {
+    let region = MappedRegion::map_anonymous(
+        PROCESS_PAGE_SIZE,
+        PROCESS_PAGE_SIZE,
+        PROCESS_PAGE_SIZE,
+        MemoryProtection::ReadWrite,
+        Placement::Anywhere,
+    )
+    .expect("guard fault Map failed");
+    let guard = region.reservation().start;
+    debug!("hammer target: touching memory guard");
+    // SAFETY: 故意访问本次 reservation 的前 guard 页，必须产生用户 load fault。
+    let _ = unsafe { core::ptr::read_volatile(guard as *const u64) };
+    core::hint::black_box(region);
 }

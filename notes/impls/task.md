@@ -148,9 +148,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
   空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存
   目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
-  同一 authority 可接管。init 持久保留全部服务 control：WaitMany(REAPABLE|CLOSED) →
-  Drain 至 Complete → 终态快照；对象 close 回调（如隧道 PEER_CLOSED）
-  发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
+  同一 authority 可接管。init 持久保留服务 control，并按负载阶段监督：高峰竞态矩阵前先查询并收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace；仍处于 Building/Running 的成员留在集合，末尾再统一 WaitMany(REAPABLE|CLOSED) → Drain 至 Complete → 终态快照。对象 close 回调（如隧道 PEER_CLOSED）发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
 - **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker，capability
   可见前完成不可失败的成员提交；JobCreate 同构（child marker →
   输出预留/写入（槽仍 Reserved，槽号对外不可用）→ 层级提交回调 →

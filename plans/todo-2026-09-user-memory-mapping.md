@@ -1,16 +1,14 @@
 # 用户内存映射机制完整化
 
-- 状态：实施中；切片 1–6 已完成，下一步实施切片 7 的 Running ABI、rinlib affine region/arena/guard 与 Extend 退役
+- 状态：切片 1–7 已提交；8A 当前公开面与全平台矩阵已完成验证，待独立提交；8B 等待 ThreadSpawn 真实多线程路径
 - 方向真值：[`notes/ideas/mm.md`](../notes/ideas/mm.md)
 - 自然序：本计划收口后重审 ThreadSpawn 用户态资源契约，再实施线程批二/批三
 
 ## 驱动问题
 
-全部现有用户映射调用者已经统一到 AddressSpace ledger/backing/PTE/MemoryChange：ProcessMap 只服务 Building 组装，anonymous/ELF/bootstrap/Extend backing 由 `OwnedBacking.extents` 拥有，Tunnel 由 ObjectView lease + WritePermit 引用 Connection 的固定 backing。旧 `AddressSpace.frames`、`external_mappings`、按 VA 外部解除与本地-only shootdown 已删除。当前保留的旧用户语义只有字节粒度 sbrk/Extend ABI。
+全部现有用户映射调用者已经统一到 AddressSpace ledger/backing/PTE/MemoryChange：ProcessMap 只服务 Building 组装，anonymous/ELF/bootstrap backing 由 `OwnedBacking.extents` 拥有，Tunnel 由 ObjectView lease + WritePermit 引用 Connection 的固定 backing。旧 `AddressSpace.frames`、`external_mappings`、按 VA 外部解除、本地-only shootdown 与 sbrk/Extend 已删除。
 
-结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner 与 reservation-aware `TableTree` 已完成。页表已能在 Commit 前精确准备并清零中间表帧，Commit 后 Publish 不分配、不返回可恢复错误；owned/shared root 槽所有权也已进入树本身。
-
-当前下一缺口是公开 `MemoryMap/MemoryUnmap/MemoryProtect`，让 rinlib 以 affine region 管理 allocator arena 与 guard reservation，并退役 Extend。Remote Call、prepared WaitContext、lifecycle mandatory obligation、Tunnel Create/Attach/HandleClose 和 ProcessDrain 接管均已闭合到 ack 后 Retire/Complete。
+结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner、reservation-aware `TableTree`、Remote Call、公开 `MemoryMap/MemoryUnmap/MemoryProtect` 与 rinlib affine `MappedRegion`/多 arena allocator 已贯通。8A 已用当前真实可达的单线程公开面闭合 guard fault、异 hart kill/termination、服务资源回收和五条平台线；剩余缺口只有依赖 ThreadSpawn 的同一 AddressSpace 双 hart、并发解除与次线程栈/join 组合所有权，明确归 8B。
 
 ## 已确认决策
 
@@ -226,12 +224,13 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 阶段记录：shared 固定宽 ABI 已落地（request 80 字节，result 64 字节，末字段 cookie 偏移 56），调用号 `0x50..0x52` 分别为 MemoryMap/MemoryUnmap/MemoryProtect；Map 结果槽由 UserWriteLease pin 后转成固定物理投影，payload 先写、cookie 以 release store 在 execution gate 内提交。三个调用共用 boxed `PreparedUserMemory`、prepared WaitContext、Remote slots 与 mandatory completion；Unmap 的 anonymous extent 只在 ack 后按 retiring fragment 精确切下，Protect 仍有 live ledger 覆盖时不误释放。rinlib `MappedRegion` 以消费式完整/部分 Unmap 表达 affine 责任，talc 使用固定 64 槽多 arena inventory（64KiB 起步，几何增长到 16MiB）。shared Extend、rinlib wrapper 和内核 Running heap transaction 已删除；内核仅保留 Building `image_end` 布局游标。首线程栈仍是 launcher 建立的 Building 启动资源；次线程 `UserStack`、join 后解除和结果记录接管不在本切片假装实现，按本计划解除条件在 ThreadSpawn 重审中闭合。host shared/rinlib/planner/page_table/WaitContext、`just check`、用户 workspace/ELF audit、virt debug 与 virt release 已通过；公开负载覆盖双 guard Map、RW→R→RW Protect、中段 Unmap、左右 fragment 收束、同 VA 不同 backing FixedEmpty 重映射及清零。release 首轮另暴露旧 `SumGuard` 将 CSR asm 声明为 `nomem`，导致优化器把 user memcpy 移到 SUM 临界区外；已改为保留编译器 memory clobber，反汇编确认 `csrs SUM → memcpy → csrc SUM` 后全负载通过。hetero/nofd/sifive_u 与多 hart 竞态专项留在切片 8 统一收尾。
 
-### 8. 验证与文档收口
+### 8A. 当前公开面的验证与文档收口
 
+- 状态：实现与验证已完成，待提交（2026-08-30）
 
 | 本切片不变量 | 进入所有权 | 退出所有权 |
 |---|---|---|
-| 每项完成判据都有 host 模型或 RISC-V 负载；文档事实不领先代码；失败后库存、ledger、PTE、permit、Handle 与 slot 总量守恒 | 全部切片产物与平台矩阵 | 可归档计划、已同步 impls 与解除阻塞的 ThreadSpawn 前置 |
+| 当前可达完成判据都有 host 模型或 RISC-V 负载；文档事实不领先代码；失败后库存、ledger、PTE、permit、Handle 与 slot 总量守恒 | 切片 1–7 产物与单线程公开 ABI | 已同步实现文档、可提交的内存机制基线，以及可重开 ThreadSpawn 契约重审的资源原语 |
 host 必须覆盖：
 
 - 库存锁外清零、affine extent 与数量守恒；
@@ -239,33 +238,53 @@ host 必须覆盖：
 - MemoryObject seal vs writable permit 的 reserve/publish/retire 竞态，确认前计数不下降，Executable 不回退；
 - 页表资源预留、Publish 不失败、共享子树与 drain；
 - Remote Call 门铃、epoch、逐边 release/acquire、成员序列/生命周期准入复检、Commit vs Terminating、Lock Ladder、乱序确认、终止接管、slot ABA 与事务 Busy；
-- Map 结果 payload/cookie 次序、Commit 前消散、Commit 后消散、departed/join 接管；
-- Map/Unmap/Protect/HandleClose 所有失败点的账本、PTE、backing、permit、Handle 与请求槽守恒。
+- Map 结果 payload/cookie 次序、Commit 前失败、Commit 后 mandatory completion 与发起线程放弃回复权；
+- Map/Unmap/Protect/HandleClose 的可达失败点以及账本、PTE、backing、permit、Handle 与请求槽守恒。
 
-RISC-V 负载必须覆盖：
+当前单线程公开面上的 RISC-V 负载必须覆盖：
 
-- 双 hart 同地址空间的完成边界；调用进行期间不对未同步访问作瞬时可见断言；
+- 双 guard anonymous Map、权限收窄/恢复、精确中段 Unmap、fragment 收束、同 VA 不同 backing 重映射与清零；
+- guard fault 只终止触发进程，不 panic 内核；
+- MemoryMap/Unmap/Protect 与异 hart ProcessKill/termination 的交错，shootdown ack 后 REAPABLE/Drain 才能完成；
+- Endpoint HandleClose、Tunnel lease close 与进程退出的交错；
+- allocator 多 arena 建立与进程退出后的统一回收。
+
+阶段收尾执行全部 host 测试、`just check`、`just virt`、`just virt-release`、`just virt-hetero`、`just virt-nofd`、`just sifive_u`。实现事实只在相应切片落地后写入 `notes/impls/{mm,call,internals,task,ipc}.md`。8A 提交后重开 ThreadSpawn 用户态资源契约复审，但主线保持“两阶段联合收口”，直到下述 integration gate 全部通过。
+
+阶段记录：竞态矩阵从 10 场景扩为 12 场景。`test_hammer` 新增持续走正式 rinlib `MappedRegion` 的 Map→Protect(R)→Protect(RW)→Unmap 靶，以及双 guard 后故意读取前 guard 的 fault 靶；init 分别用异 hart ProcessKill 与 Fault/LoadAccess 终态验证 mandatory completion/termination 接管和 guard 的进程局部性。单 hart Base64 域在完整内存事务边界 sleep 1ms，让协作式 hammer 获得公平执行机会；多 hart common 仍可在事务内部真并行 kill。矩阵前按 ProcessState 收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace，仍活跃成员留给最终监督闭环。
+
+sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈溢出：debug `memmove` 的 `0x1620` 帧叠加事务调用链达到约 `0x58c0`，超过原 `0x5000` formal。平台栈调整为每槽 `0xA000`（`0x9000` formal + `0x1000` emergency），纯逻辑布局测试同步；最终既保留超过两个最大帧的余量，也未越过 128 MiB 平台的竞态负载内存峰值。
+
+最终验证：os 全部纯逻辑 host 测试、shared 10 项、rinlib 2 项、libprocess 5 项、planner clippy `-D warnings`、`just check`、`just build_user` 与全部用户 ELF audit 通过；`THROTTLE=100 just virt`、`virt-release`、`virt-hetero`、`virt-nofd` 和 `sifive_u` 全部命中 12/12、服务监督与 reset 终态锚点。debug/release 内核最大帧分别为 `0x1620`/`0x1050`。
+
+### 8B. ThreadSpawn 联合 integration gate
+
+以下场景依赖同一 Running process 至少两条线程，不能由内核测试后门或两个独立进程冒充；它们随 ThreadSpawn 批二/批三实现并作为 user-memory 全链最终 gate：
+
+- 双 hart 同 AddressSpace 的完成边界；调用进行期间不对未同步访问作瞬时可见断言；
 - 一 hart 缓存旧映射，另一 hart Unmap 完成后重映射不同 backing 不得读到旧页；
-- 权限收窄、instruction epoch 与 guard fault；
 - Unmap vs ThreadExit/ProcessKill、shootdown ack vs termination；
-- Endpoint HandleClose、Tunnel lease close 与普通 Unmap 竞争；
-- allocator 多 arena 与次线程栈建立/释放。
+- Endpoint HandleClose、Tunnel lease close 与同进程普通 Unmap 竞争；
+- 次线程 guard stack、wrapper/result 槽与 join handle 的建立、离场确认、解除和复用；
+- Map committed cookie 在发起线程 Commit 前/后消散时的返回权或 join 接管。
 
-阶段收尾执行全部 host 测试、`just check`、`just virt`、`just virt-release`、`just virt-hetero`、`just virt-nofd`、`just sifive_u`。实现事实只在相应切片落地后写入 `notes/impls/{mm,call,internals,task,ipc}.md`；COMPASS 在全链收口时把主线移到 ThreadSpawn 契约重审。
+ThreadSpawn integration 阶段再次执行完整 host 与全平台矩阵；`COMPASS.md` 只在 8B 全绿后把主线移出联合收口。
 
-全部切片形成真实提交后，创建 `todo-<日期>-user-memory-mapping-review.md` 并加入 COMPASS 活跃计划：逐批记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险；统一复审 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整。该 review 计划只在哈希齐全后生成，不以占位哈希预建。
+### 联合复审归档
 
-## 对 ThreadSpawn 的解除条件
+切片 1–7、8A 与 ThreadSpawn integration 形成真实提交后，创建 `todo-<日期>-user-memory-mapping-review.md` 并加入 COMPASS 活跃计划：逐批记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险；统一复审 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整。该 review 计划只在联合 gate 哈希齐全后生成，不以占位哈希预建。
 
-以下条件全部成立后，`todo-2026-09-thread-model.md` 批二才能重开：
+## 对 ThreadSpawn 契约重审的解除条件
 
-- 用户态可建立带未映射 guard 的次线程栈；
-- join 后可在内核确认线程离场之后安全解除并复用完整 reservation；
-- 同地址空间多 hart 下解除映射不会留下 stale translation；
-- 栈、wrapper 上下文、结果槽、MappedRegion 与 join handle 的所有权由安全 rinlib interface 完整表达；
+以下条件全部成立后，`todo-2026-09-thread-model.md` 批二可重开；它们只证明资源原语已具备，8B 仍负责在真实多线程路径验证组合契约：
+
+- rinlib `MappedRegion` 已能表达完整 reservation、usable 子区间与双侧未映射 guard，并以 affine token 精确解除；
+- MemoryUnmap 成功返回前已完成 Remote ack，调用者可在未来 join 确认线程离场后安全消费完整 stack reservation；
+- shootdown 已有 active-hart snapshot/revalidate、全目标槽预留和 ack 后 Retire 机制；真实同 AddressSpace 多 hart stale-translation 验证列为 8B gate；
+- `UserStack`、wrapper 上下文、结果槽、MappedRegion 与 join handle 的组合所有权在 ThreadSpawn 重审中设计并实现，不由内存计划预设不完整接口；
 - Extend 已退役，ThreadSpawn 不依赖临时堆块或固定预映射栈池。
 
-## 完成标准
+## 联合完成标准
 
 - AddressSpace 对所有调用者呈现同一个深 seam，删除旧字段、旧 brk 和旁路 PTE 操作；
 - frame inventory 锁不覆盖 extent 清零，地址空间锁不覆盖远端等待；
@@ -277,6 +296,6 @@ RISC-V 负载必须覆盖：
 - 帧库存、单次请求、事务、Remote Call、seal 完成槽和最终 drain 均有可证明硬上界；
 - 正常、冲突、OOM、部分解除、并发和终止路径保持区域/PTE/backing/permit/Handle/slot 守恒；
 - guard fault 和所有用户参数错误只产生规定错误或用户 fault，不 panic 内核；
-- debug/release、virt/hetero/nofd/sifive_u 与 host 验证全绿；
+- 8A 的 debug/release、virt/hetero/nofd/sifive_u 与 host 验证全绿；8B 在 ThreadSpawn 落地后重跑同一矩阵；
 - impls 只记录实际结构，方向与计划不冒充实现；
-- ThreadSpawn 阻塞解除并重新审定用户态资源契约。
+- ThreadSpawn 契约重审解除阻塞，且 8B 的同 AddressSpace 多 hart、并发解除与次线程资源所有权全部通过后，user-memory 全链才完成。

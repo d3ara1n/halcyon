@@ -3,6 +3,6 @@
 
 SBI_START = 0x80000000;        /* OpenSBI 段起点 */
 KERNEL_PA_START = 0x80200000;  /* 内核镜像 PA 加载基址 */
-/* 每 hart 栈物理量：formal(0x5000) + emergency(0x1000)；两个 guard 洞
- * 纯虚拟不占帧。formal 较旧布局的 0x3000 增加。 */
-STACK_SIZE = 0x6000;
+/* 每 hart 栈物理量：formal(0x9000) + emergency(0x1000)；两个 guard 洞
+ * 纯虚拟不占帧。容量覆盖 debug compiler-builtins 与深层事务调用链的组合峰值。 */
+STACK_SIZE = 0xA000;

@@ -85,4 +85,4 @@ acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整�
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
 - handle_table host：consume/transfer 两类 pin、builder 保护、自授予/重复拒绝、rights 回滚、reservation 与 TRANSIT/GRANT；
 - libprocess host：entry、segment overlap 与页级 W^X；
-- QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 10/10、服务监督、委托域终态、reset authority 负路径与内核接受 reset 锚点。virt 必须再由 QEMU 正常退出证明后端成功；`sifive_u` 无 shutdown 设备，内核返回失败后由验收脚本按明确终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。
+- QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 12/12、分阶段服务监督、委托域终态、reset authority 负路径与内核接受 reset 锚点。virt 必须再由 QEMU 正常退出证明后端成功；`sifive_u` 无 shutdown 设备，内核返回失败后由验收脚本按明确终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。

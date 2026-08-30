@@ -288,9 +288,9 @@ mod tests {
             .expect("virt layout must be valid")
     }
 
-    /// qemu sifive_u 向量：8 槽 × 0x6000（物理打包 5 槽可运行 hart 仍按上限建表）。
+    /// qemu sifive_u 向量：8 槽 × 0xA000。
     fn sifive_board() -> StackWindowLayout {
-        StackWindowLayout::new(WINDOW, 8, 0x6000, GUARD, EMERGENCY, 0x802B3000, TOP_SLOT)
+        StackWindowLayout::new(WINDOW, 8, 0xA000, GUARD, EMERGENCY, 0x802B3000, TOP_SLOT)
             .expect("sifive_u layout must be valid")
     }
 
@@ -305,8 +305,8 @@ mod tests {
     #[test]
     fn sifive_span_fits_single_leaf() {
         let layout = sifive_board();
-        assert_eq!(layout.stride(), 0x6000 + 2 * GUARD);
-        assert_eq!(layout.span(), 0xA000 * 8);
+        assert_eq!(layout.stride(), 0xA000 + 2 * GUARD);
+        assert_eq!(layout.span(), 0xE000 * 8);
         assert!(layout.span() <= 1 << 21);
     }
 

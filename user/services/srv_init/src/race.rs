@@ -21,10 +21,10 @@ use rinlib::shared::call::SystemCallError;
 use rinlib::shared::message::HandleMove;
 use rinlib::shared::object::{Handle, ObjectSignals, Rights};
 use rinlib::shared::proc::{
-    HandleGrant, JobMemberKind, JobState, ProcessCreateResult, ProcessExitReason,
-    ProcessMapFlags, ProcessState, ThreadStartContext, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
+    HandleGrant, JobMemberKind, JobState, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult,
+    ProcessExitReason, ProcessFaultCode, ProcessMapFlags, ProcessState, ThreadStartContext,
 };
-use rinlib::shared::wait::{WaitItem, WAIT_TIMEOUT_INFINITE};
+use rinlib::shared::wait::{WAIT_TIMEOUT_INFINITE, WaitItem};
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
 /// 分箱，天然归属，无需锤标识）。
@@ -597,6 +597,84 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
+/// 公开内存事务 vs 异 hart ProcessKill：目标持续 Map/Protect/Unmap，锤与
+/// 目标同刻起跑；延迟轮保证目标先进入 churn，使 kill 覆盖已发布 MemoryChange
+/// 的 mandatory completion/termination 接管，而不只覆盖 syscall 前冻结。
+fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
+    let mut ok = true;
+    for round in 0..4u64 {
+        let kill_code = 0xb00 + round as i64;
+        let (target, gun) = match spawn_race_target(job, image, race::TARGET_MEMORY_CHURN, 0) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!("race memory-vs-kill: target spawn failed: {:?}", error);
+                return false;
+            }
+        };
+        let kill = if round % 2 == 1 {
+            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+        } else {
+            race_cmd(race::ACTION_KILL, kill_code as u64)
+        };
+        let sent = h.send_cmd(
+            0,
+            &kill,
+            &[HandleMove {
+                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                    .unwrap_or(Handle::INVALID),
+                rights: Rights::MANAGE,
+            }],
+        );
+        fire_race(h, gun, &[0]);
+        let report = h.report(0).map(|(report, _)| report);
+        let allowed = [(ProcessExitReason::Killed as u32, Some(kill_code))];
+        let terminal = drain_expect_dead(target.control, &allowed);
+        if !sent || report.is_none_or(|report| report.status != 0) || terminal.is_none() {
+            debug!(
+                "race memory-vs-kill: round {} sent={} report={:?} terminal={}",
+                round,
+                sent,
+                report.map(|report| report.status),
+                terminal.is_some()
+            );
+            ok = false;
+        }
+        let _ = close(target.control);
+        let _ = close(gun);
+    }
+    debug!(
+        "race memory-vs-kill {}",
+        if ok { "passed" } else { "FAILED" }
+    );
+    ok
+}
+
+/// guard fault 必须只冻结目标进程为 Fault/LoadAccess；其 guarded mapping 由
+/// ProcessDrain 收束，init 与内核继续运行。
+fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
+    let (target, gun) = match spawn_race_target(job, image, race::TARGET_GUARD_FAULT, 0) {
+        Ok(pair) => pair,
+        Err(error) => {
+            debug!("memory guard fault: target spawn failed: {:?}", error);
+            return false;
+        }
+    };
+    let _ = notification::signal(gun, 1);
+    let allowed = [(
+        ProcessExitReason::Fault as u32,
+        Some(ProcessFaultCode::LoadAccess as i64),
+    )];
+    let terminal = drain_expect_dead(target.control, &allowed);
+    let ok = terminal.is_some();
+    debug!(
+        "memory guard fault {}",
+        if ok { "passed" } else { "FAILED" }
+    );
+    let _ = close(target.control);
+    let _ = close(gun);
+    ok
+}
+
 /// kill vs abandonment：锤 kill 与锤 close builder 同刻——终因冻结的
 /// 先到者胜（Killed 或 Abandoned），不出现混合。奇数轮 close 延迟
 /// 1ms：kill 先冻结终因，观察 Killed 胜出侧（close 后到只协助收束）。
@@ -929,7 +1007,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
-/// 竞态矩阵入口：双锤编队 → 10 场景 → 退场收束 → 汇总。失败场景逐个
+/// 竞态矩阵入口：双锤编队 → 12 场景 → 退场收束 → 汇总。失败场景逐个
 /// 点名，汇总行是全矩阵的 grep 锚点。
 pub(crate) fn race_matrix(
     acceptance: Handle,
@@ -943,17 +1021,34 @@ pub(crate) fn race_matrix(
             return Err("race matrix hammer spawn failed");
         }
     };
-    let scenarios: [(&str, bool); 10] = [
+    let scenarios: [(&str, bool); 12] = [
         ("kill-vs-kill", race_kill_kill(&h, acceptance, hammer_image)),
         ("kill-vs-exit", race_kill_exit(&h, acceptance, hammer_image)),
-        ("kill-vs-fault", race_kill_fault(&h, acceptance, hammer_image)),
+        (
+            "kill-vs-fault",
+            race_kill_fault(&h, acceptance, hammer_image),
+        ),
         ("kill-vs-start", race_kill_start(&h, acceptance)),
         ("kill-vs-park", race_kill_park(&h, acceptance, hammer_image)),
+        (
+            "memory-vs-kill",
+            race_memory_kill(&h, acceptance, hammer_image),
+        ),
+        (
+            "memory-guard-fault",
+            guard_fault_is_process_local(acceptance, hammer_image),
+        ),
         ("kill-vs-abandon", race_kill_abandon(&h, acceptance)),
         ("create-vs-enumerate", race_create_enumerate(&h, acceptance)),
         ("seal-vs-create", race_seal_create(&h, acceptance)),
-        ("drain-vs-drain", race_drain_drain(&h, acceptance, target_image)),
-        ("last-control", race_last_control(&h, acceptance, target_image)),
+        (
+            "drain-vs-drain",
+            race_drain_drain(&h, acceptance, target_image),
+        ),
+        (
+            "last-control",
+            race_last_control(&h, acceptance, target_image),
+        ),
     ];
     h.shutdown();
     let hammer_supervision = supervise_services(alloc::vec::Vec::from([
