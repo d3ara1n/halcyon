@@ -1,6 +1,6 @@
 # 线程资源模型批一 Review 计划
 
-> 状态：**已执行并收口**。对象覆盖批一提交 `794a4c0`、文档提交 `275e4f1` 与首轮修复 `51f4184`；首轮报告见 [`review-2026-08-29-thread-model-batch1.md`](review-2026-08-29-thread-model-batch1.md)，后续事务复审见 [`review-2026-08-29-thread-model-transaction-convergence.md`](review-2026-08-29-thread-model-transaction-convergence.md)。Review 纪律见 [`REVIEW.md`](../REVIEW.md)，设计决策见 [`todo-2026-09-thread-model.md`](../todo-2026-09-thread-model.md)。
+> 状态：**已执行并收口**。对象覆盖批一提交 `794a4c0`、文档提交 `275e4f1` 与首轮修复 `51f4184`；首轮报告见 [`review-2026-08-29-thread-model-batch1.md`](review-2026-08-29-thread-model-batch1.md)，后续事务复审见 [`review-2026-08-29-thread-model-transaction-convergence.md`](review-2026-08-29-thread-model-transaction-convergence.md)。Review 纪律见 [`REVIEW.md`](../REVIEW.md)，设计决策见 [`todo-2026-09-thread-model.md`](todo-2026-09-thread-model.md)。
 
 ## 提交对照
 

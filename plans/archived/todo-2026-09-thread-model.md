@@ -1,11 +1,12 @@
 # 线程资源模型与用户态多线程（ThreadSpawn）
 
-> 批一 Start 拆解及事务复审已收口；用户内存 8A 已由 `9358963` 提交。
-> 批二契约与 shared/kernel/rinlib 实现已经完成，user-memory 8B 的同
-> AddressSpace 多 hart、并发解除、guarded stack 与 join 组合所有权已通过
-> host、common debug/release、virt-hetero、virt-nofd 与 sifive_u 验证，并由
-> `bdc83ef` 提交。批三竞态扩面、carryover IPC 压力线与实现文档同步仍待完成。
-> 联合实施档案见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md)。
+> 状态：**三批均已完成并收口**。批二 ThreadSpawn/Exit/Yield、ThreadControl、
+> guarded stack/join 与 user-memory 8B 由 `bdc83ef` 提交；批三竞态扩面、
+> carryover IPC 压力线、FramePool 部分 extent 归还修复与文档同步由 `004cae5`
+> 提交。host 148/148、common debug/release、virt-hetero、virt-nofd 的 16/16
+> 矩阵及 `sifive_u` 连续十轮均通过。联合内存实施档案见
+> [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)，
+> 后续统一审查见 [`../todo-2026-08-30-user-memory-mapping-review.md`](../todo-2026-08-30-user-memory-mapping-review.md)。
 
 ## 决策记录
 
@@ -13,7 +14,7 @@
 |---|---|---|
 | D1 | 次线程栈归属 | 用户供栈。内核 spawn 不分配或接管用户地址空间 backing；rinlib `UserStack` 以普通 `MappedRegion` 建立双 guard 与可配置 usable 栈，join 后消费完整 reservation。首线程 Building 固定栈不复用为 Running 栈池 |
 | D2 | join 形态 | 内核铸造 waitable ThreadControl 壳（第四对 core/shell）。离场是内核自有事实（成员表摘除），DONE 在摘除后锁外发布；壳 close 只消散观察权，不杀线程 |
-| D3 | ThreadKill | 首版不实现，保留号维持不可用。成员表 tid 寻址、join 壳与 pick/trap gate 保持未来增量入口；v1 壳只公开 DONE，不预设尚不存在的离场方式查询 ABI |
+| D3 | ThreadKill | 首版不实现，也不预留调用号。成员表 tid 寻址、join 壳与 pick/trap gate 保持未来增量入口；若出现线程局部终止需求，再以独立设计确定 authority、终因、结果与 ABI |
 | D4 | 线程数上界 | shared 常量 `PROCESS_MAX_THREADS = 1024`，约束**并发成员数**（表长），超限 `ReachLimit`；tid 单调不复用（生灭循环不耗尽）。附带红利：终止取消循环（线程数 × WAIT_MANY_MAX）获得结构上界 |
 | D5 | 首线程观察壳 | 不发。等首线程死无消费者（等全灭有 CLOSED）；「首线程先走、进程仍活」无现实场景；将来加是纯增量（Start 描述符 reserved 扩展），不锁面 |
 | D6 | 线程=资源组装模型 | 采纳：ProcessAttach（外部附线程）+ ProcessGrant（外部装句柄）+ ProcessStart 纯化（入册）。无线程的进程停留在 Building；外部附线程无观察壳，Start 是唯一 Building→Running 发布点 |
@@ -70,9 +71,9 @@ Building/Running 的本质即外部写通道的开/关。组装者（init/pm 经
 | `ProcessGrant(builder, grants_ptr, count, out_values) → ()` | 外部，Building 专属 | 从组装者表摘 grants 装入目标表，句柄值写回 out_values（pin/commit 机制自原 Start 事务原样搬运）；组装者将值写入出生块后经 ProcessWrite 落盘。out_values 为第四参（写回目标），签名与实现一致 |
 | `ProcessStart(builder, profile)` | 外部 | 活体检查门（已附线程 ≥1，唯一前置检查）→ Building→Running（含预育原子提取）→ 一次冻结 execution binding（profile 为判定输入，进程级属性）→ 预育线程整体入册。参数为平铺 (builder, profile)，无描述符 |
 
-- **join**：`WaitMany(ThreadControl, DONE)`，不设 ThreadJoin syscall（0x23 保留号留空）；结果值留在 rinlib 用户记录。离场线程在 ThreadExit 前的全部用户态存储对 joiner 可见，release/acquire 由 lifecycle 离场锁与 ThreadControl 电平发布链传递。rinlib 的 JoinHandle 结构化拥有记录、control 与 UserStack，join 或 Drop 都只在 DONE 后解除。
+- **join**：`WaitMany(ThreadControl, DONE)`，不设 ThreadJoin syscall，也不预留调用号；结果值留在 rinlib 用户记录。离场线程在 ThreadExit 前的全部用户态存储对 joiner 可见，release/acquire 由 lifecycle 离场锁与 ThreadControl 电平发布链传递。rinlib 的 JoinHandle 结构化拥有记录、control 与 UserStack，join 或 Drop 都只在 DONE 后解除。
 - **出生块**：纯用户约定数据（Header + 句柄值 + payload），内核机制（Handle 数值预留连续绑定、map_startup_block、map_bootstrap_block 的前缀协议）删除；init bootstrap 改走内核内嵌的同构 op 序列（payload 收编 owned backing 的特例保留在内嵌 Write 里）。
-- **保留号处置**：ThreadExit 0x20 / ThreadYield 0x21 / ThreadSpawn 0x22 启用；ThreadJoin 0x23 不设；ThreadKill 0x24 维持不可用。
+- **调用号处置**：ThreadExit 0x20 / ThreadYield 0x21 / ThreadSpawn 0x22 启用；join 是用户态组合，不进入 syscall ABI；首版 ThreadKill 未设计、未实现、未占号。
 
 ## 内核机制
 
@@ -129,22 +130,30 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 | `just virt-hetero` / `just virt-nofd` | ✅ 两域绑定与 D64 无兼容域清理通过 |
 | `just sifive_u` | ✅ 验收面全命中，由终态锚点收割 |
 
-**原记“sifive_u 确定性挂死”这一具体判断已证伪**：旧报告调查的稳定失败分别来自 U-mode `wfi` fault 与验收脚本固定超时，均已修复。后续捕获的负载存活时提前 quiescent 现场无法判定引入批次；现已由显式系统复位从结构上删除错误终局，调查归档于 [`archived/todo-2026-08-29-early-quiescent-shutdown.md`](archived/todo-2026-08-29-early-quiescent-shutdown.md)，不作为批一事务复审的隐藏结论。
+**原记“sifive_u 确定性挂死”这一具体判断已证伪**：旧报告调查的稳定失败分别来自 U-mode `wfi` fault 与验收脚本固定超时，均已修复。后续捕获的负载存活时提前 quiescent 现场无法判定引入批次；现已由显式系统复位从结构上删除错误终局，调查归档于 [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md)，不作为批一事务复审的隐藏结论。
 
 ### 实施批次总览
 
 1. **批一：Start 拆解**——ProcessAttach/ProcessGrant/Start 纯化、ABI 两侧（shared + rinlib/libprocess + 全负载组装路径）、init bootstrap 内嵌同构序列、startup 机制删除、出生块转用户约定。验证：全负载等价回归（virt/virt-release/hetero/nofd/sifive_u/host）。
 2. **批二：ThreadSpawn/Exit/Yield + join 壳（已完成，`bdc83ef`）**——shared 固定宽 ABI、Running `Spawning→Ready` 事务、ThreadControl DONE、线程级 Map-result obligation 与 rinlib guarded `UserStack`/结构化 `JoinHandle` 已贯通；user-memory 8B 真实多线程 gate 已通过。
-3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步**——见下两节。
+3. **批三：竞态矩阵扩展 + carryover IPC 压力线 + 文档同步（已完成，`004cae5`）**——ThreadSpawn/末线程终局/join/容量竞态与 IPC 生命周期压力已进入 16/16 矩阵；非原语线程调用号删除，实现事实同步至 notes。
 
-每个实现或修复批次独立提交、独立验证；批三是阶段收尾（`just virt-release` 必跑）。
+三个实现批次均独立提交、独立验证；批三以 common debug/release、hetero、nofd、十轮 `sifive_u` 与 host 全矩阵完成阶段收尾。
 
 ### 批二与 8B 验证状态（2026-08-30）
 
 - common debug 与 release 均通过 13/13 场景；同 AddressSpace 旧 VA 精确复用观测到 2 个 active hart，8 轮普通 Unmap/Tunnel lease close 并发及 join/stack 回收完成；
 - `virt-hetero`、`virt-nofd` 与 `sifive_u` 通过同一 13/13 矩阵，sifive_u 按既定 reset 后端失败终态收割；host 逻辑 crate 与 shared ABI 全绿；
 - kill 与并发 ThreadSpawn 的 draining 失败路径命中并修正 `ADDRESS_SPACE → LEAF` ready rollback 反序；压力线程对 planner 的正式 `ObjectBusy` 背压只在完整失败事务边界退避，affine region token 不丢失；
-- 现有公开终止面只能执行 ProcessKill：进程级 `mandatory_ops` 会先挡住 committed Map，再允许线程 departure，因此线程级 result obligation 在该路径上不独立成为最终阻塞者。首版没有 ThreadKill，无法从用户态合法制造“仅调用线程消散而进程继续”的直接观测窗口；保留双层契约，不增加测试专用内核入口。
+- 批二验证时，ProcessKill 的进程级 `mandatory_ops` 常先挡住 committed Map，线程级 result obligation 未独立成为最终阻塞者；批三扩大真实 ThreadSpawn/Map/kill 时序后，nofd 负载已观测到 committed Map 直接延迟 ThreadDeparture。该证据来自公开 ABI，未增加 ThreadKill 或测试专用内核入口。
+
+### 批三最终验证状态（2026-08-30）
+
+- common debug 与 release、`virt-hetero`、`virt-nofd` 均通过 16/16；覆盖 spawn-vs-kill、末线程 exit-vs-kill、join 发布与 Drop、1024 并发成员上界和容量恢复、同 AddressSpace stale translation、Endpoint close/Unmap 竞争及 guarded stack 回收；
+- carryover IPC 线通过 Mailbox 128 轮回滚压力、Tunnel 64 轮生命周期与 16 轮携存活 Endpoint 退出、跨进程共享页 Acquire/Release、ProcessDrain lease/backing 接管及固定 VA 复用；HandleClose 与内存事务竞争的 `ObjectBusy` 只在完整失败事务后退避；
+- `sifive_u` 连续十轮均命中 16/16、`system reset failed: NotSupported` 与 acceptance watcher harvest，未触发 60 秒挂死兜底；
+- os 纯逻辑 138 项与 shared ABI 10 项共 148/148；FramePool debug/release 各 16/16。release 暴露的部分 extent 归还缺陷已由沿目标路径惰性物化 occupied descendants 修复，归还复杂度保持 O(tree depth)；
+- `just check`、`just build_user`、shared check、用户/内核 ELF audit 与 scoped rustfmt 全绿；正常 thread departure 不再写每线程统计，Process 强引用仍覆盖 `drop(Thread) → departure.request`。
 
 ## 竞态矩阵新增场景
 
@@ -164,25 +173,19 @@ start_staged 事务改造：线程出生移入 ProcessAttach（预育条目随�
 
 ## carryover IPC 压力线接入（触发条件 = 本里程碑落地）
 
-- 消息风暴：MailboxFull/ObjectBusy/回滚与资源守恒；
-- Tunnel create/attach/write/close 与进程退出风暴验证帧守恒；
-- host 双线程与 RISC-V 双 hart Acquire/Release 压测；
-- sifive_u 既有集成负载连续至少十轮。
+- [x] 消息风暴：MailboxFull/ObjectBusy/回滚与资源守恒；
+- [x] Tunnel create/attach/write/close 与进程退出风暴验证帧守恒；
+- [x] host 双线程与 RISC-V 双 hart Acquire/Release 压测；
+- [x] `sifive_u` 既有集成负载连续十轮。
 
 ## 文档同步清单
 
-批一的方向与实现文档已随事务复审同步：普通 StartupBlock 属用户态约定，ProcessGrant/Attach 是 Building 期独立组装动作，ProcessStart 只负责首次发布；init bootstrap 仅保留内核内嵌同构序列。批二/批三仍须同步：
-
-- `notes/ideas/task.md`：ThreadSpawn、ThreadExit、join 壳完成后的稳定方向契约；
-- `notes/impls/{task,execution-context}.md`：spawn 事务、末线程终局边、join 壳与实际上下文入口；
-- `notes/impls/mm.md`：用户态线程栈与结果槽的最终布局约定；
-- `notes/ideas/call.md`：ThreadExit/Yield/Spawn 调用语义与保留号处置；
-- `COMPASS.md`：阶段收口后的自然序。
+批一至批三的方向与实现文档均已同步：普通 StartupBlock 属用户态约定，ProcessGrant/Attach 是 Building 期独立组装动作，ProcessStart 只负责首次发布；ThreadSpawn/Exit/Yield、ThreadControl DONE、用户态 join/guarded stack 与双层结果义务分别由对应 ideas/impls 拥有篇记录。`COMPASS.md` 已转向下一自然序。
 
 ## 完成标准
 
-- 全负载等价回归 + 新增 13 场景 + carryover 四项全绿（debug 与 release），其中 5、10–13 同时作为 user-memory 8B integration gate；
-- lifecycle 无主线程特例、无单线程假设（既有）；
-- join 契约（DONE 电平 + 内存序）有验证负载背书；
-- 出生块为用户约定，startup 内核机制删除，文档同步完成；
-- 决策入档（本篇 + notes）、代码全绿已提交、COMPASS 更新。
+- [x] 全负载等价回归、16/16 竞态矩阵与 carryover 四项全绿（debug 与 release），其中同 AddressSpace 多 hart、stale translation、Tunnel/Unmap 与 guarded stack 同时闭合 user-memory 8B；
+- [x] lifecycle 无主线程特例、无单线程假设；
+- [x] join 契约（DONE 电平 + 内存序）有显式 join、Drop 与结果可见性负载背书；
+- [x] 出生块为用户约定，startup 内核机制删除，方向/实现文档同步完成；
+- [x] 决策入档、代码由 `004cae5` 提交、COMPASS 自然序更新。

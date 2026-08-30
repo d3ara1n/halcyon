@@ -1,6 +1,6 @@
 # IPC 数据面演进设计
 
-> 【未来设计计划】MemoryObject 的 backing/mapping 分层、固定长度与硬容量上限、mapping 独立保活、`Mutable → Sealing → Executable`/WritePermit 单向 seal，以及统一 AddressSpace/MemoryChange seam 已由 `notes/ideas/{mm,object}.md` 拥有，本计划不重议。这里等待真实负载后设计公共对象 ABI、帧移交、描述符协议及 Tunnel/Runnel 的数据面组合。触发顺序：用户内存映射机制完整化 → ThreadSpawn 与 IPC 压力线收口 → 启动本设计。
+> 【当前设计计划】MemoryObject 的 backing/mapping 分层、固定长度与硬容量上限、mapping 独立保活、`Mutable → Sealing → Executable`/WritePermit 单向 seal，以及统一 AddressSpace/MemoryChange seam 已由 `notes/ideas/{mm,object}.md` 拥有，本计划不重议。用户内存、ThreadSpawn 与 IPC 压力前置已由 `004cae5` 收口；当前从真实消费者需求出发设计公共对象 ABI、帧移交、描述符协议及 Tunnel/Runnel 的数据面组合。
 
 ## 驱动问题
 
@@ -69,8 +69,8 @@ MemoryObject 的稳定前提是：对象持 backing、mapping lease 借 view；c
 ## 前置依赖
 
 - `archived/todo-2026-09-user-memory-mapping.md` 已收口，统一 AddressSpace/MemoryChange、lease 与跨 hart 完成 seam 稳定；
-- `todo-2026-09-thread-model.md` 批二、批三已收口；
-- carryover IPC 压力线给出并发和资源守恒证据；
+- `archived/todo-2026-09-thread-model.md` 三批已收口；
+- `004cae5` 已给出 carryover IPC 并发和资源守恒证据；
 - 至少一个真实消费者证明现有 Tunnel/Runnel 不足，而非仅有构想。
 
 ## 本计划完成标准

@@ -1,6 +1,6 @@
 # 用户内存映射与 ThreadSpawn 8B Review 计划
 
-> 【未来审查计划】对象是用户内存切片 1–8B 的八笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/mm.md`](../notes/ideas/mm.md) 与 [`notes/ideas/task.md`](../notes/ideas/task.md)，实现现状见 `notes/impls/{mm,call,internals,task,ipc}.md`，实施档案见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md) 与 [`todo-2026-09-thread-model.md`](todo-2026-09-thread-model.md)。
+> 【未来审查计划】对象是用户内存切片 1–8B 的八笔提交及批三压力收口 `004cae5`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/mm.md`](../notes/ideas/mm.md) 与 [`notes/ideas/task.md`](../notes/ideas/task.md)，实现现状见 `notes/impls/{mm,call,internals,task,ipc}.md`，实施档案见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md) 与 [`archived/todo-2026-09-thread-model.md`](archived/todo-2026-09-thread-model.md)。
 
 ## 提交对照
 
@@ -14,13 +14,14 @@
 | `6825e19` | 公开 MemoryMap/Unmap/Protect ABI、UserWriteLease 与 rinlib `MappedRegion` |
 | `9358963` | 8A 单线程公开面、guard/termination 与完整平台矩阵 |
 | `bdc83ef` | ThreadSpawn/Exit/Yield、ThreadControl DONE、guarded stack/join 与 8B 多线程矩阵 |
+| `004cae5` | ThreadSpawn/末线程/join/容量竞态扩面、carryover IPC 压力线、非原语调用号删除与 FramePool 部分 extent 归还修复 |
 
 ## Review 轴
 
 ### 单一地址空间与 affine 所有权
 
 - AddressSpace 是否真正成为 Building、Running、bootstrap、Tunnel 与 Drain 的唯一 ledger/backing/PTE seam，旧字段、brk/Extend、按 VA 解除与旁路页表操作是否删除干净。
-- frame inventory、OwnedExtents/ObjectView、WritePermit、UserWriteLease、MappedRegion、Handle pin 与 Remote slot 的每次进入和退出是否都有唯一结构所有者；失败、取消与进程消散时是否守恒。
+- frame inventory、OwnedExtents/ObjectView、WritePermit、UserWriteLease、MappedRegion、Handle pin 与 Remote slot 的每次进入和退出是否都有唯一结构所有者；整块重分配后部分 extent 归还是否正确物化陈旧后代状态；失败、取消与进程消散时是否守恒。
 - planner 与 kernel adapter 是否只在边界转换类型，不复制区间、owner、permit 或事务阶段真值。
 
 ### 事务、结果交付与失败原子
@@ -38,7 +39,7 @@
 ### 生命周期与双层义务
 
 - 进程级 `mandatory_ops` 是否只保护 AddressSpace Drain，线程级 Map-result obligation 是否只保护成员摘除、ThreadControl DONE 与 JoinHandle 栈接管，两者是否存在错误替代或重复终局。
-- ProcessKill 当前先由 mandatory completion 挡住 committed Map，因此线程级 obligation 不独立成为最终阻塞者；Review 应评估此防线在未来 ThreadKill/线程局部终止接入前是否有足够的模型或单元证据，不为制造日志添加测试专用 ABI。
+- ProcessKill 常先由 mandatory completion 挡住 committed Map；批三 nofd 已实际观测 committed Map 延迟 ThreadDeparture。Review 应分别重建该观测与未来 ThreadKill/线程局部终止尚未设计时的契约边界，不为制造更多日志添加测试专用 ABI。
 - Memory completion、ThreadDeparture、Process REAPABLE 与 WaitContext completion 的发布顺序是否避免提前 DONE、提前栈解除、丢 wake 或反向 Lock Ladder。
 
 ### 用户态线程组合所有权
@@ -49,6 +50,6 @@
 
 ## 验证复核
 
-- 重跑全部 host 逻辑测试与 shared ABI；覆盖 planner、page_table、remote_call、wait_context、handle_table、frame_pool 与 sched_domain。
-- common debug/release、virt-hetero、virt-nofd、sifive_u 均复核 13/13、同 AddressSpace stale translation、Tunnel lease 并发、join/stack 回收、末线程终局与 reset 锚点。
-- 批三完成后把 spawn/kill、末线程 exit/kill、join 发布、线程风暴、壳 close 与 carryover IPC 压力结果纳入同一 Review，不以现有 8B 子集替代完整线程模型验收。
+- 重跑全部 host 逻辑测试与 shared ABI；当前基线为 os 纯逻辑 138 项、shared 10 项，覆盖 planner、page_table、remote_call、wait_context、handle_table、frame_pool 与 sched_domain；FramePool stale-descendant 回归需同时跑 debug/release。
+- common debug/release、virt-hetero、virt-nofd 均复核 16/16；`sifive_u` 连续至少十轮，并核对每轮 16/16、reset `NotSupported` 与 watcher harvest。
+- 同一矩阵复核 spawn/kill、末线程 exit/kill、join 发布与 Drop、1024 线程容量恢复、同 AddressSpace stale translation、Tunnel lease/Endpoint close 并发、ProcessDrain backing 接管及共享页 Acquire/Release；不以原 8B 的 13/13 子集替代完整线程模型验收。

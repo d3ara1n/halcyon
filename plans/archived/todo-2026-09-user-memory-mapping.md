@@ -2,7 +2,7 @@
 
 - 状态：切片 1–8B 已由 `1cd6ab2` 至 `bdc83ef` 八笔提交收口；本实施计划归档，后续审查见 [`todo-2026-08-30-user-memory-mapping-review.md`](../todo-2026-08-30-user-memory-mapping-review.md)
 - 方向真值：[`notes/ideas/mm.md`](../../notes/ideas/mm.md)
-- 自然序：完成线程批三，再进入 IPC 数据面设计；未来 review 不阻塞当前主线
+- 自然序：线程批三已由 `004cae5` 收口，当前进入 IPC 数据面设计；未来 review 不阻塞主线
 
 ## 驱动问题
 

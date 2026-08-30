@@ -1,12 +1,13 @@
 # Remote Call 与地址空间 epoch Review 计划
 
-> 【未来审查计划】对象是用户内存映射切片 4–5 的提交 `619998517f5293d13e48d91f3980d4f4d389b90a`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/call.md`](../notes/ideas/call.md) 与 [`notes/ideas/mm.md`](../notes/ideas/mm.md)，实现现状见 [`notes/impls/call.md`](../notes/impls/call.md)「Remote Call」、[`notes/impls/mm.md`](../notes/impls/mm.md)「用户地址空间」，实施上下文见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md)。
+> 【未来审查计划】核心对象是用户内存切片 4–5 的提交 `619998517f5293d13e48d91f3980d4f4d389b90a`，并以批三压力收口 `004cae5` 复核后续真实组合；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/call.md`](../notes/ideas/call.md) 与 [`notes/ideas/mm.md`](../notes/ideas/mm.md)，实现现状见 [`notes/impls/call.md`](../notes/impls/call.md)「Remote Call」、[`notes/impls/mm.md`](../notes/impls/mm.md)「用户地址空间」，实施上下文见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md) 与 [`archived/todo-2026-09-thread-model.md`](archived/todo-2026-09-thread-model.md)。
 
 ## 提交对照
 
 | 提交 | 内容 |
 |---|---|
 | `6199985` | reservation-aware TableTree 与不可失败 Publish；固定容量 `os/remote_call`；kernel Remote Call adapter、SBI IPI mask/base、SSIP/调度安全点；AddressSpace 稳定 identity/epoch；lifecycle execution sequence 与 enter/leave gate；运输及 active snapshot epoch 启动探针；实现文档与主计划同步 |
+| `004cae5` | 同 AddressSpace 多 hart stale-translation、Unmap/HandleClose/ThreadDeparture 交错与 16/16 平台压力收口 |
 
 ## Review 轴（代码为主）
 
@@ -40,12 +41,12 @@
 
 ### 与后续 MemoryChange 的组合
 
-- 本提交只提供 completion seam，不含真实 waiter/Retire。待主计划切片 6–7 落地后，对照检查发起线程在 Commit 前/后消散、WaitContext 单 outcome、Handle close park、ProcessDrain 接管与最后 ack 回调是否共同只拥有一份业务事务。
+- MemoryChange 已落地真实 waiter/Retire：复核发起线程在 Commit 前/后消散、WaitContext 单 outcome、Handle close park、ProcessDrain 接管与最后 ack 回调是否共同只拥有一份业务事务。
 - completion sink 是否只做固定上界的 Retire/offer，较长 frame/object/drain 工作是否转入既有 Waiting/管理者驱动状态机；任何路径都不得在 Remote Call 安全点等待另一 hart。
-- OwnedExtents、ObjectView、WritePermit 与 retiring backing 是否在全部 acquire ack 前持续计数和持有；Executable seal、Unmap 后物理帧复用及 Tunnel lease close 分别补真实多 hart 竞态验证。
+- OwnedExtents、ObjectView、WritePermit 与 retiring backing 是否在全部 acquire ack 前持续计数和持有；以 `004cae5` 的同 AddressSpace stale translation、Tunnel/ordinary Unmap、进程携存活 Endpoint 退出和固定 VA backing 复用重建实证链。
 
 ## 验证复核
 
 - host debug/release 重跑 Remote Call 5 项状态机测试及 page_table 25 项 tree + 1 项 Drop ledger；补充跨表 token、槽退休边界和 completion 立即再 Reserve 的 adapter 级测试。
-- RISC-V 负载加入至少两个 hart 同一 AddressSpace 的真实 Unmap/Protect、乱序确认、IPI 失败后安全点补消费、instruction epoch 与 backing 复用 litmus；不得只依赖启动空 Publish 探针。
-- `virt`、`virt-release`、`virt-hetero`、`virt-nofd`、`sifive_u` 检查 Remote/epoch 完成锚、10/10 竞态矩阵、正常 reset 或既定平台失败终态，并核对无 Lock Ladder 违规与槽泄漏。
+- RISC-V 复核至少两个 hart 同一 AddressSpace 的真实 Unmap/backing 复用与 stale-translation；乱序确认、IPI 失败后安全点补消费和 instruction epoch 仍是需要单独核对的边，不以现有负载默认为已覆盖。
+- `virt`、`virt-release`、`virt-hetero`、`virt-nofd` 检查 16/16、Remote/epoch 与 reset 锚点；`sifive_u` 连续至少十轮核对平台失败 harvest，并检查无 Lock Ladder 违规与槽泄漏。

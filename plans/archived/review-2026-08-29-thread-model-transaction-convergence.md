@@ -73,4 +73,4 @@ ThreadSpawn/Exit/Yield 与 join 壳属于批二，未在本报告范围实现。
 
 ## 文档归属
 
-方向真值见 `notes/ideas/{task,bootstrap,object}.md`；实现真值见 `notes/impls/{task,startup,execution-context,ipc}.md`；后续批二/批三由 [`../todo-2026-09-thread-model.md`](../todo-2026-09-thread-model.md) 跟踪；提前 quiescent 调查现已由显式复位收口并归档于 [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md)。
+方向真值见 `notes/ideas/{task,bootstrap,object}.md`；实现真值见 `notes/impls/{task,startup,execution-context,ipc}.md`；后续批二/批三实施档案见 [`todo-2026-09-thread-model.md`](todo-2026-09-thread-model.md)；提前 quiescent 调查现已由显式复位收口并归档于 [`todo-2026-08-29-early-quiescent-shutdown.md`](todo-2026-08-29-early-quiescent-shutdown.md)。

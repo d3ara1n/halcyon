@@ -9,14 +9,3 @@
 - [ ] 设备与中断设计前重审静默谓词、IRQ 唤醒主人和对象订阅所有权；新等待源不得让对象订阅旁路保有已退出线程。
 
 触发：设备/中断接入设计开始。
-
-## IPC 压力验证线
-
-来源：[`archived/review-2026-08-ipc.md`](archived/review-2026-08-ipc.md)。
-
-- [ ] 消息风暴覆盖 MailboxFull/ObjectBusy/回滚与资源守恒；
-- [ ] Tunnel create/attach/write/close 与进程退出风暴验证帧守恒；
-- [ ] host 双线程与 RISC-V 双 hart Acquire/Release 压测；
-- [ ] `sifive_u` 既有集成负载连续至少十轮。
-
-触发：ThreadSpawn 落地后、正式服务编排接入前。

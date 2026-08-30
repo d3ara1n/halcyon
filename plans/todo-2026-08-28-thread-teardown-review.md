@@ -1,18 +1,20 @@
 # 多线程 teardown barrier Review 计划
 
-> 【未来审查计划】对象是生命周期 step 7 的提交 `d741880`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计决策（四项拍板：成员表离场即摘、锁外惰性游标、归一本批收敛到汇编出口、写回失败杀调用进程）与完整推导见 [archived/todo-2026-08-28-thread-teardown-barrier.md](archived/todo-2026-08-28-thread-teardown-barrier.md)，实现现状见 `notes/impls/{task,call,execution-context}.md`。
+> 【未来审查计划】核心对象是生命周期 step 7 的提交 `d741880`，并结合 ThreadSpawn 批二 `bdc83ef` 与压力收口 `004cae5` 复核屏障被真实多线程消费后的终态；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计决策见 [archived/todo-2026-08-28-thread-teardown-barrier.md](archived/todo-2026-08-28-thread-teardown-barrier.md) 与 [archived/todo-2026-09-thread-model.md](archived/todo-2026-09-thread-model.md)，实现现状见 `notes/impls/{task,call,execution-context}.md`。
 
 ## 提交对照
 
 | 提交 | 内容 |
 |---|---|
 | `d741880` | feat(task)：step 7 主体——线程成员表（tid 寻址有序 fallible Vec、离场即摘、Gone 删除）、TerminationTodo 纯量化 + run_termination_todo 游标取消循环、IPI 目标 = 冻结时刻 active 位图快照（自杀排除本 hart）、trap 汇编非 Resume 出口归一（KERNEL_SATP sym 注入、调度循环两处 Rust 归一删除）、deliver_output 复检即杀 + 分发出口终止检查、15 处写回 expect 清零、TunnelAttach invitation 移除并发 close 重排、notes 三篇同步、KNOWN_ISSUES 写回条目消解 + release 不收束新条目 |
+| `bdc83ef` | Running `Spawning→Ready`、ThreadDeparture、末线程终局、线程级 Map-result obligation 与 ThreadControl DONE 实际接入 |
+| `004cae5` | spawn/kill、末线程 exit/kill、join/Drop、1024 成员容量恢复和多平台 16/16 压力收口；删除普通离场热路径统计但保留 Process 生命周期 guard |
 
 ## Review 轴（代码为主）
 
 ### 成员表不变量
 
-- 单一归属与条目生命周期：条目只在 `begin_running`（Staging）、`staging_ready`（→Ready）、`enter_running`（覆盖写收编 stale Waiting）、`park_waiting`（→Waiting）、`thread_departed`（摘除）、`take_first_waiting`（→Exiting）间转换；审查每条路径的调用方确持线程容器所有权，无「无主写条目」。
+- 单一归属与条目生命周期：Building 使用 Staging，Running spawn 提交窗使用 Spawning，执行路径在 Ready / Running / Waiting 间转换，终止所有者写 Exiting，`thread_departed` 最终摘除；审查每条转换的调用方确持线程容器或提交 reservation，无「无主写条目」。
 - 唤醒过渡窗口的 stale Waiting 记录（自然完成后、再调度前）：确认 offer(Abandoned) 落败路径（单 outcome 仲裁）与 pick gate 吸收 → reap 摘除的完整链，以及该窗口内 is_reapable 不误真（条目未摘即不空表）。
 - `enter_running` 的 position expect 与 `thread_departed` 的摘除 expect：论证「dispatched/departing thread must be a member」在多 hart 竞态下无例外（尤其 requeue 与游标取消交错时）。
 
@@ -38,3 +40,6 @@
 
 - 自杀路径（Exit/fault/kill-self）新增 run_termination_todo 执行：单线程下为空转，多线程下 IPI 排除本 hart 的正确性（本 hart bit 尚置位时）。
 - `Lifecycle::building()` 预留主线程容量使 ProcessCreate 失败面 +1（OutOfMemory）：确认无调用方假设 building 构造不可失败。
+- Running ThreadSpawn 与异 hart ProcessKill、末线程 ThreadExit 与 ProcessKill 的冻结竞争均有双方胜出记录；ThreadControl DONE、JoinHandle Drop 与结果 Acquire 在成员摘除后发布。
+- 1024 并发成员命中硬上界，额外 spawn 返回 ReachLimit，join 后容量恢复且 tid 单调；common debug/release、hetero、nofd 均为 16/16，`sifive_u` 连续十轮。
+- `sched::reap` 不再维护 switch/lifespan 统计；复核 `ThreadDeparture` 只 weak 引用 Process 时，局部强引用必须覆盖 `drop(Thread) → departure.request`，避免最后成员摘除后 core 提前消散。
