@@ -53,45 +53,45 @@ pub struct FrameTracker {
 
 ## 页表纯逻辑（os/page_table crate）
 
-no_std + alloc 的独立 crate，`cargo test` 在 host 直接跑，内核 target 复用同一份代码。**页表树 const 泛型于 `LEVELS`**（3=sv39、4=sv48、5=sv57——三者的 PTE 编码相同，仅级数与 VA 宽度不同，均可由 LEVELS 推导）——不写死 sv39 是硬约束。**页表逻辑不得直接解引用物理地址**——所有表访问经 trait 抽象：
+`os/page_table` 是 `no_std + alloc`、禁止 unsafe 的独立 crate，host 与内核 target 复用同一份代码。页表树 const 泛型于 `LEVELS`（3=Sv39、4=Sv48、5=Sv57），PTE 编码、VA 宽度与各层覆盖页数都由级数推导。页表逻辑不直接解引用物理地址；表帧 reservation、已发布帧回收与表内容访问全部经 trait 适配：
 
 ```rust
+pub trait ReservedTableFrame {
+    fn number(&self) -> FrameNumber;
+    fn commit(self) -> FrameNumber;
+}
+
 pub trait FrameMemory {
-    fn table(&mut self, frame: FrameNumber) -> &mut [Pte; 512];
+    type ReservedFrame: ReservedTableFrame;
+    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted>;
+    fn free_frame(&mut self, frame: FrameNumber);
+    fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; 512];
 }
 ```
 
-内核实现以 `phys_to_virt` 转换，host 实现以 `Vec` 模拟。
+内核以 `TableFrameToken(FrameTracker)` 实现 affine reservation：token 被丢弃即归还帧池，Commit 才通过 `into_table_frame` 把帧交给树；已发布分支帧回收时经 `adopt_table_frame` 重新收编。host backend 用同一 token 生命周期核对 reserved/committed/free 计数。root 和全部 reservation 都在发布前清零。
 
-### 类型
+### 类型与事务边界
 
-- `FrameNumber(usize)`、`Vpn(usize)`（4KiB 页号）、`Ppn(usize)`——newtype，禁止裸 usize 传递。
-- `Pte(u64)`：编码/解码、标志位（V R W X U G A D）、`leaf()`/`branch()` 判别；组合常量（用户页、内核直映射页等）集中定义。
-- `TableTree<M: FrameMemory, const LEVELS: usize>`：root 帧（经 `M` 分配/释放）、`map / unmap / translate`；`type Sv39<M> = TableTree<M, 3>`。
+- `FrameNumber`、`Vpn`、`Ppn` 是页号 newtype；`Pte` 集中编码 V/R/W/X/U/G/A/D 与 leaf/branch 判别。Map/Protect 在 preflight 拒绝超出 PTE 编码、V=0、无 RWX 以及 W 且非 R 的非法叶标志。
+- `TableTree<M, LEVELS>` 拥有 root 和全部 owned 中间表帧，不拥有叶数据 backing。root 另有固定宽 `owned_root`/`shared_root` 位图；创建或摘除用户项与位图同步，`attach_shared_root` 原子安装外部 PTE 并登记 shared 所有权。普通 Drop 只递归 owned 槽；ProcessDrain 经槽状态 API 逐项摘除 owned 分支，`finish_drain` 只在 owned 位图归零后交出 root。
+- `PreparedTranslation<M::ReservedFrame>` 是 Commit 前 affine token。`prepare_map/unmap/protect` 完成参数与冲突验证、精确表帧需求计算、申请和清零；`publish` 只消费 reservation 并写完整 PTE，不分配且不返回可恢复错误。预留不足在任何 PTE 修改前失败并自动归还已取得 token；其它非重叠变更先建立共享路径时，多余 token 在 Publish 结束自动归还。
 
-**Root 借用模型（当前简化）**：TableTree 名义拥有全部中间表，但用户 root 拷入内核共享子树（直映射/栈窗口槽），靠 `AddressSpace` 收束阶段手工清除共享 root slots 后再释放 owned 子树。所有权区分尚未进入 TableTree 类型系统，正确性依赖该唯一收束入口。
+### Preflight 与发布
 
-### 区域切段算法
+Map 仍把连续 VPN/PPN 区间切成最大可行 mega 段。preflight 只读遍历现树：缺失路径以“表层级 + 覆盖区编号”去重；兼容 mega 的细化同样登记将要 split 的路径；已有异 PPN、异 flags 或更细子树冲突在 reservation 前返回。Publish 按同一切段重放，只能写叶、链接 reservation 帧或展开已验证的兼容 mega。
 
-`map(vpn 区间, 连续 ppn, flags)` 把区间按**当前级别的对齐边界**切为若干段（匿名整备＝先取帧再映射，由内核 mm 层组合，本 crate 只管表结构）；每段取最大可行 mega 级（对齐且整段覆盖 512^l 页：2MiB/1GiB/…），走单一路径，无递归分叉：
+Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为目标区间部分覆盖的现有 mega 计数：完整覆盖直接改叶，部分覆盖逐级精确预留；普通 4 KiB Unmap 因而预留零帧。Unmap 对未映射洞保持宽松，Protect 则要求区间完整映射且当前 flags 全部匹配。split 后 512 个子项保持原物理连续性和 flags；空中间表仍保留到整树 Drop 或 ProcessDrain。
 
-1. 段首与段长均按 2MiB 对齐（且 ppn 对齐）→ L1 大页；
-2. 段首与段长按整表（512 页）对齐 → 挂新中间表，下放继续；
-3. 其余 → 叶表内逐 PTE 建立。
-
-每步只做一次决策，段与段之间无共享状态。
-
-- 冲突策略：目标位置已有有效映射时，**同 flags 幂等成功，异 flags 返回 `MapConflict`**，禁止静默改权限。
-- 大页分裂：在已映射 2MiB 区间内需要 4KiB 粒度时，`split` 分配叶表、512 项继承原 flags 展开。level 0 禁止 non-leaf，debug_assert。
-- `unmap` 走同一套切段逻辑，对称解除；递归显式携带当前子表的实际覆盖基址，跨 512 页边界不会复用初始请求基址。mega 部分解除必须先成功分裂，表帧耗尽会返回 `FrameExhausted` 并保持原映射；空中间表当前保留到整棵 AddressSpace Drop。
+当前过渡 `AddressSpace` 的 Building、bootstrap、heap 与 Tunnel 调用点已改为 prepare 后立即 publish，旧 `TableTree::map/unmap` 分配路径、`FrameMemory::alloc_frame`、`mem_mut`、`clear_slots`、`leak_root` 和内核 root 区间配对均已删除。`MemorySpace` planner 与页表 batch/真实 backing 的统一组合仍待 AddressSpace 迁移切片。
 
 ### 测试集（host）
 
-切段算法数值用例：未对齐跨表大区间（`vpn=65, count=8192`）、跨子表批量 unmap、整表/大页对齐、未对齐首尾混合、同 flags 幂等、异 flags 冲突、unmap 后重映射、大页分裂后部分 unmap、split OOM 保持原映射、clear_slots 剥离不递归。
+25 项 tree 用例与独立 Drop ledger 用例覆盖：未对齐 8192 页跨表映射的精确 18 帧需求、mega 选择与细化、跨子表 Unmap、Protect、幂等与冲突、非法叶 flags、资源不足零修改、部分 reservation 自动归还、未发布 reservation Drop、非重叠并行准备后的多余帧归还、owned/shared root 槽转换、共享子树不回收、整树 Drop 数量守恒。debug/release host 测试、clippy `-D warnings`、`just check`、virt debug 与 virt-release 全部通过。
 
 ## 用户地址空间纯逻辑规划器（os/memory_space crate）
 
-`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 且不依赖其它 crate 的内部规划模块。它只拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、物理帧、用户指针、hart 或内核对象。当前内核 `AddressSpace` 尚未接入该模块；真实 extent、页表 reservation、Remote Call 与 WaitContext 将由后续 adapter 组合。
+`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 且不依赖其它 crate 的内部规划模块。它只拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、物理帧、用户指针、hart 或内核对象。当前内核 `AddressSpace` 已具备稳定 identity/epoch 和 Remote Call execution seam，尚未接入该 planner；页表 reservation 已在独立 `TableTree` seam 落地，planner intent 与真实 extent/PTE/WaitContext 的事务组合仍由后续 adapter 完成。
 
 `MemorySpace` 在构造时一次性预留区域与在途事务的硬容量。有序 ledger 中每个 fragment 持唯一 `RegionKey`，同一次 Map 的 guard 与 mapping 共享 `AllocationKey`；fragment 另持 `AddressSpace`/lease owner、匿名 backing identity 或 `ObjectId + offset` view，以及当前/最大权限。`Anywhere` 在 ledger 与在途事务之间选 first-fit 完整空洞；`FixedEmpty` 不覆盖旧区域。Unmap 严格要求请求区间连续覆盖且 owner 一致，完整 reservation、usable-only、guard-only 与 mapping 中段都按精确交集切割；Protect 同样消费旧 key，只有 owner、种类、AllocationKey、连续 backing 与权限全部兼容的相邻 fragment 才合并。fault lookup 只返回 free、guard 或 eager mapping。
 
@@ -146,7 +146,9 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 ## 用户地址空间
 
-低半区 `[0, 2^38)` 完全归用户，进程 root 创建时拷贝内核高半区顶层项（含栈窗口槽）。当前区间：
+`Process.space` 已是稳定 `AddressSpace` 外壳：单调不复用的 identity、translation/instruction epoch 和内部 `AddressSpaceState` 锁分离。页表、过渡 frames/external mapping/brk 仍在 state 内，待 RegionLedger/backing 迁移替换；Remote Call 只引用外壳身份与 epoch，不借用或复制可变状态。地址翻译事务可在 Commit 前快照 lifecycle execution gate 并预留全部目标槽，Commit 在 space 锁内复检 active sequence、发布页表闭包和新 epoch，锁外再敲门铃；各 hart 的 ack 是 Retire 前同步依据。
+
+低半区 `[0, 2^38)` 完全归用户；进程 root 创建时通过 `attach_shared_root` 挂入内核高半区顶层项（含栈窗口槽），PTE 安装与 shared 位登记同一调用完成。当前区间：
 
 ```text
 [0, brk')             ELF LOAD 段
@@ -157,8 +159,8 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 brk 在 launch 时越过 init bootstrap 出生块；Extend 从 brk 逐页映射并返回新 brk。普通进程的出生块由组装者（libprocess）写入映像顶之上页对齐的约定区；首线程 sp 由组装者经 ProcessAttach 供给（libprocess 置于 `2^38`，16 字节对齐）。ASID 恒 0，地址空间切换执行全量 `sfence.vma`。
 
-- 进程页表 root 共享内核高半区顶层项；
-- owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的一个或多个 FrameTracker extent 持有；任何 PTE 安装前先按最坏 extent 数 `try_reserve` 记账容量，批量安装失败按逆序 unmap 后才释放 backing；
+- 进程页表 root 的内核高半区由 `shared_root` 位图标记，用户树 Drop/Drain 不进入这些外部子树；
+- owned anonymous/ELF/stack/普通 StartupBlock 页由 `AddressSpace.frames` 的一个或多个 FrameTracker extent 持有；PTE 调用先 prepare 精确表帧 reservation，再不可失败 publish。现有 Building 批量组装仍在调用者预留 backing 记账容量，后续 backing 失败按逆序 prepare→publish Unmap 后才释放 extent；
 - bootstrap StartupBlock prefix 是 owned 页；opaque payload 页在映入 init 时即收编为该地址空间的 owned FrameTracker（启动保留洞的帧首次入账），地址空间销毁时随 owned 帧归还帧池；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap 只服务 Building process，创建 anonymous zero pages并使用最终权限，拒绝 W+X；ProcessWrite 经物理直映射写 backing，Running 发布后不再存在该写入口；
 - Tunnel 映射由 Endpoint lease 记入 `AddressSpace.external_mappings`，关闭时解除。

@@ -97,7 +97,8 @@ impl HartBootRecord {
 
     /// 发布进入 Starting（boot hart 发出 hart_start 前调用）。
     pub fn publish_starting(&self) {
-        self.state.store(BootState::Starting as u8, Ordering::Release);
+        self.state
+            .store(BootState::Starting as u8, Ordering::Release);
     }
 
     /// 发布 Online（formal entry 尾部调用）。
@@ -143,7 +144,10 @@ impl HartRegistry {
     /// 登记一个 admitted hart（按升序遍历 DT CPU 的顺序即 slot 序）。
     /// 返回分配的 slot。
     pub fn admit(&mut self, id: HartId) -> HartSlot {
-        assert!(self.len < HART_NUM_LIMIT, "admitted hart count exceeds limit");
+        assert!(
+            self.len < HART_NUM_LIMIT,
+            "admitted hart count exceeds limit"
+        );
         let slot = HartSlot(self.len);
         self.ids[self.len] = id;
         let record = &mut self.records[self.len];
@@ -155,7 +159,10 @@ impl HartRegistry {
 
     /// raw → 稠密。未 admitted 的 hartid 返回 None。
     pub fn slot_of(&self, id: HartId) -> Option<HartSlot> {
-        self.ids[..self.len].iter().position(|&x| x == id).map(HartSlot)
+        self.ids[..self.len]
+            .iter()
+            .position(|&x| x == id)
+            .map(HartSlot)
     }
 
     /// 按 slot 访问启动记录。
@@ -169,12 +176,24 @@ impl HartRegistry {
 
     /// 全部 record（slot 升序）。
     pub fn records(&self) -> impl Iterator<Item = (HartSlot, &HartBootRecord)> {
-        self.records[..self.len].iter().enumerate().map(|(i, r)| (HartSlot(i), r))
+        self.records[..self.len]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (HartSlot(i), r))
     }
 
     /// 全部 record 的可变访问（仅 boot 构造期使用）。
     pub fn records_mut(&mut self) -> impl Iterator<Item = (HartSlot, &mut HartBootRecord)> {
-        self.records[..self.len].iter_mut().enumerate().map(|(i, r)| (HartSlot(i), r))
+        self.records[..self.len]
+            .iter_mut()
+            .enumerate()
+            .map(|(i, r)| (HartSlot(i), r))
+    }
+
+    /// 全部 admitted 稠密 slot 的固定宽位图。
+    pub fn admitted_mask(&self) -> u64 {
+        debug_assert!(self.len <= u64::BITS as usize);
+        (1u64 << self.len) - 1
     }
 }
 
@@ -198,6 +217,10 @@ pub fn with_registry<R>(f: impl FnOnce(&HartRegistry) -> R) -> R {
     f(REGISTRY.lock().as_ref().expect("registry not initialized"))
 }
 
+pub fn admitted_mask() -> u64 {
+    with_registry(HartRegistry::admitted_mask)
+}
+
 /// 把 slot 位图展开为 raw hartid 并逐个发送 IPI
 /// （绝不把内部 slot 位图直接解释为 SBI hart mask）。
 pub fn ipi_slots(mask: u64) {
@@ -205,10 +228,25 @@ pub fn ipi_slots(mask: u64) {
         for (slot, record) in reg.records() {
             if mask & (1u64 << slot.0) != 0 {
                 let raw = record.hartid;
-                crate::sbi::require(crate::sbi::send_ipi(1u64 << raw), "IPI.send");
+                crate::sbi::require(crate::sbi::send_ipi(1, raw), "IPI.send");
             }
         }
     });
+}
+
+/// Remote Call 门铃：逐个发送并返回失败的稠密 slot 位图。请求 Pending 电平
+/// 已在调用前发布，门铃失败不得撤销业务或伪造完成。
+pub fn try_ipi_slots(mask: u64) -> u64 {
+    with_registry(|reg| {
+        let mut failed = 0;
+        for (slot, record) in reg.records() {
+            let bit = 1u64 << slot.0;
+            if mask & bit != 0 && crate::sbi::send_ipi(1, record.hartid).is_err() {
+                failed |= bit;
+            }
+        }
+        failed
+    })
 }
 
 // ---------------------------------------------------------------------------

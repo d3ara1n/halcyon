@@ -25,15 +25,16 @@ mod board;
 #[expect(dead_code)]
 mod fp;
 // 执行环境准备态模块：原子切换接线后 dead_code 预期消除。
+mod boot;
 mod context;
 mod csr;
-mod registry;
 mod external;
 mod frame;
 mod hart;
 mod heap;
-mod boot;
 mod mm;
+mod registry;
+mod remote_call;
 mod rt;
 mod sbi;
 mod sched;
@@ -198,7 +199,8 @@ fn construct_registry(board: &BoardInfo) {
         record.emergency_sp = layout.emergency_top(slot.0);
         record.stack_top = layout.formal_top(slot.0);
     }
-    reg.record_mut(reg.slot_of(rt::boot_hartid()).unwrap()).role_boot = 1;
+    reg.record_mut(reg.slot_of(rt::boot_hartid()).unwrap())
+        .role_boot = 1;
 
     registry::install(reg);
 }

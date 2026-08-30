@@ -1,16 +1,16 @@
 # 用户内存映射机制完整化
 
-- 状态：实施中；切片 1–3 已完成，待实施切片 4（页表资源预留与所有权）
+- 状态：实施中；切片 1–4 已完成，切片 5 的 Remote Call/epoch 基础已落地，待与统一 AddressSpace 事务闭合完成与 Retire
 - 方向真值：[`notes/ideas/mm.md`](../notes/ideas/mm.md)
 - 自然序：本计划收口后重审 ThreadSpawn 用户态资源契约，再实施线程批二/批三
 
 ## 驱动问题
 
-当前 Running 进程只有字节粒度 sbrk 语义的 `Extend`；`ProcessMap` 只服务 Building 组装。`AddressSpace.frames` 平坦持有全部 owned backing，`external_mappings` 只登记 Tunnel 借入 VA，页表、backing、区域和 lease 没有统一的可切割所有权真值。
+当前 Running 进程只有字节粒度 sbrk 语义的 `Extend`；`ProcessMap` 只服务 Building 组装。`AddressSpace.frames` 平坦持有全部 owned backing，`external_mappings` 只登记 Tunnel 借入 VA，backing、区域和 lease 尚未统一到可切割所有权真值。
 
-结构性有界帧库存、affine 帧发布 seam 与纯逻辑 `MemorySpace` planner 已完成。当前下一缺口是让页表先预留并清零全部中间表帧，使 planner 的 translation intent 在 Commit 后能够无分配、不可失败地 Publish。
+结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner 与 reservation-aware `TableTree` 已完成。页表已能在 Commit 前精确准备并清零中间表帧，Commit 后 Publish 不分配、不返回可恢复错误；owned/shared root 槽所有权也已进入树本身。
 
-现有 `page_table::map` 在落 PTE 期间临时申请中间表帧，无法保证 AddressSpace publish 段不再失败。Tunnel Endpoint close 又会撤销 object-owned mapping；同一地址空间多 hart 运行后，本地 `sfence.vma` 不能构成关闭完成边界。区域账本、页表资源预留、Handle close、Remote Call 与 ProcessDrain 必须作为同一所有权重构闭合，不能各自长出回滚规则。
+当前下一缺口是把已落地的跨 hart 完成基础接入真实内存所有权事务。Remote Call 已提供固定槽、IPI 门铃、全量 fence、epoch ack 和 execution gate seam，但 Tunnel Endpoint close、MemoryChange 与 ProcessDrain 尚未拥有统一 ledger/backing transaction；在此之前不能把探针完成解释为 backing 可 Retire 或 Handle close 已完成。
 
 ## 已确认决策
 
@@ -134,7 +134,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 - 规划结果描述 PTE install/remove/protect、OwnedExtents split/retire、ObjectView 偏移和所需资源上界，不执行硬件动作；
 - fault lookup 只区分 free hole、guard、eager mapping，不建立未实现 pager 状态。
 
-验证：host debug/release 共 17 项测试，覆盖区间溢出与对齐、区域/事务/lease 容量、backing 边界、Anywhere/FixedEmpty、双 guard 与四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同组合并与跨组拒绝、owner/权限上限、object offset、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、类型化阶段，以及 seal/permit 直到 Synchronize 后 Retire 才退出计数。2000 步确定性 shadow model 持续对照逐页覆盖并检查 fragment 不重叠；host clippy `-D warnings` 与 `just check` 通过。当前实现是未接入内核 AddressSpace 的纯逻辑 seam，页表 reservation、Remote Call 和真实 backing/PTE 组合仍属于后续切片。
+验证：host debug/release 共 17 项测试，覆盖区间溢出与对齐、区域/事务/lease 容量、backing 边界、Anywhere/FixedEmpty、双 guard 与四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同组合并与跨组拒绝、owner/权限上限、object offset、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、类型化阶段，以及 seal/permit 直到 Synchronize 后 Retire 才退出计数。2000 步确定性 shadow model 持续对照逐页覆盖并检查 fragment 不重叠；host clippy `-D warnings` 与 `just check` 通过。该实现仍是未接入内核 AddressSpace 的纯逻辑 seam；切片 4 已补齐独立页表 reservation，planner 与真实 backing/PTE 的批量组合及 Remote Call 属于后续切片。
 
 ### 4. 页表资源预留与所有权
 
@@ -151,9 +151,13 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 验证：host 覆盖最坏表帧数、mega split、资源不足零修改、publish 不失败、共享子树不回收、未消费 reservation 归还与整树 drain 数量守恒。
 
+完成记录：`os/page_table` 已实现状态感知精确 preflight、affine `ReservedTableFrame`/`PreparedTranslation`、Map/Unmap/Protect 与不可失败 Publish；其它非重叠变更先建立共享路径时，未消费 reservation 自动归还。root 以固定宽 owned/shared 位图登记用户子树与内核直映射/栈窗口，普通 Drop 和 ProcessDrain 共用同一所有权真值，旧 `clear_slots`、`leak_root`、`mem_mut` 与内核区间配对已删除。host debug/release 各 25 项 tree 测试及独立 Drop ledger、clippy `-D warnings`、`just check`、virt debug/virt-release 均通过。当前内核调用点已迁入 prepare→publish seam；planner 与真实 backing/PTE 的批量组合留给切片 6。
+
 ### 5. Remote Call 与完成闭包
 
 由地址空间 epoch 这一真实消费者建立独立 Remote Call 模块。
+
+实施顺序调整：Remote Call 运输层完成后，现有内核 `AddressSpace` 仍缺少稳定 identity 与 EpochState，无法在不制造临时双真值的前提下承载 shootdown。经确认，先从切片 6 前移统一 AddressSpace 的稳定身份、translation/instruction epoch 与 execution gate adapter；完成该基础设施后返回本切片闭合请求确认与 Retire，再继续切片 6 的 ledger/backing 调用者迁移。总体事务顺序和完成标准不变。
 
 **Entry gate**：切片 4 已提供不失败的 PTE Publish；RISC-V 规范依据、逐边 release/acquire 表、IPI 前 data fence、instruction epoch、execution gate 的 snapshot/revalidate/enter/leave 线性化，以及 `ADDRESS_SPACE → LIFECYCLE/execution gate` 锁序已在 `notes/ideas/mm.md` 固定。任何一条若只能靠“通常会按序执行”或反向取锁解释，禁止进入实现。
 
@@ -171,9 +175,13 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 验证：host adapter 确定性覆盖容量不足、成员序列/生命周期准入复检失败、Commit vs Running→Terminating、Lock Ladder 正序与反向拒绝、本地发起 hart 确认、门铃合并/丢失后由 pending level 补消费、乱序确认、重复门铃、slot ABA/identity 误配、快照前后 enter/leave、发起者终止和最后确认接管；RISC-V 双 hart litmus 证明 cookie/PTE/request 发布顺序、Unmap 后 backing 复用屏障及 instruction epoch。目标 hart 每项工作保持固定上界。
 
+阶段记录：`os/remote_call` 已落地固定 8 hart × 4 槽的纯逻辑状态机与 kernel adapter，具备批量 Reserve 精确回滚、Pending 电平、generation 退休、锁外 IPI、trap/idle 有界消费、全量 `SFENCE.VMA`/可选 `FENCE.I`、release-sequence 最后确认及每 hart epoch cache。Process lifecycle 已增加 execution sequence，dispatch/leave 以本地 epoch 为硬 gate；稳定 AddressSpace 外壳已实现 `prepare_shootdown → commit_shootdown → start` 并用 primordial active snapshot 真路径探针验证锁序和 ack。host debug/release、clippy、`just check`、virt debug/release 与 sifive_u 均通过，10/10 竞态矩阵不变。尚缺真实 MemoryChange/HandleClose completion 对 WaitContext、终止接管和 ack 后 Retire 的所有权闭包，随切片 6 ledger/backing 迁移完成。
+
 ### 6. AddressSpace 替换与现有调用者迁移
 
 组装最终 AddressSpace 深模块，并按调用者逐批切换；每批迁移同批删除对应旧路径。
+
+其中稳定 identity、EpochState 与 execution gate adapter 已作为切片 5 的语义前置先行，不单独建立旧 AddressSpace 兼容字段；本切片剩余工作只把 ledger、backing、TranslationTree、MemoryChange 与调用者迁入同一所有权外壳。
 
 | 本切片不变量 | 进入所有权 | 退出所有权 |
 |---|---|---|

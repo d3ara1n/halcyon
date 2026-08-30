@@ -17,9 +17,9 @@ use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 
 use crate::sbi::DISARM;
 use crate::sync::Spinlock;
-use crate::task::Thread;
+use crate::task::{Thread, lifecycle::EnterRunning};
 use crate::{
-    hart, sbi,
+    hart, remote_call, sbi,
     trap::{self, Outcome},
 };
 
@@ -104,13 +104,18 @@ impl SchedClass for FairClass {
         let mut ready = self.ready.lock();
         for entry in ready.iter_mut() {
             if matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token) {
-                let thread = threads.next().expect("ready reservation batch is too large");
+                let thread = threads
+                    .next()
+                    .expect("ready reservation batch is too large");
                 *entry = ReadyEntry::Thread(thread);
                 committed += 1;
             }
         }
         assert_eq!(committed, expected, "ready reservation batch disappeared");
-        assert!(threads.next().is_none(), "ready reservation batch is too small");
+        assert!(
+            threads.next().is_none(),
+            "ready reservation batch is too small"
+        );
     }
 
     fn rollback_batch(&self, token: u64, count: usize) {
@@ -173,16 +178,21 @@ pub struct ReadyBatch {
 }
 
 /// 在目标域的公平类原子预留完整就绪批次。
-pub fn reserve_ready_batch(
-    domain: &'static SchedDomain,
-    count: usize,
-) -> Result<ReadyBatch, ()> {
+pub fn reserve_ready_batch(domain: &'static SchedDomain, count: usize) -> Result<ReadyBatch, ()> {
     let token = domain.classes[0].reserve_batch(count)?;
-    Ok(ReadyBatch { domain, token, count })
+    Ok(ReadyBatch {
+        domain,
+        token,
+        count,
+    })
 }
 
 pub fn commit_ready_batch(batch: ReadyBatch, threads: Vec<Arc<Thread>>) {
-    assert_eq!(batch.count, threads.len(), "ready batch/thread count mismatch");
+    assert_eq!(
+        batch.count,
+        threads.len(),
+        "ready batch/thread count mismatch"
+    );
     batch.domain.classes[0].commit_batch(batch.token, threads);
     batch.domain.wake_one();
 }
@@ -449,6 +459,8 @@ pub fn run() -> ! {
     let me = hart::current();
     let me_domain = current_domain();
     loop {
+        // idle 唤醒、门铃合并或先前 IPI 失败后，Pending 槽仍由安全点补消费。
+        remote_call::drain_current();
         // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
         // SFENCE.VMA）：循环体结构性只运行于内核页表下。
         let Some(t) = me_domain.pick() else {
@@ -462,9 +474,22 @@ pub fn run() -> ! {
             "thread must run in its bound domain"
         );
         // lifecycle gate：Terminating 线程不进用户态（惰性撤销）。
-        if !t.process.lifecycle.enter_running(t.tid, me.slot()) {
+        let entered = loop {
+            let epochs = t.process.space.synchronize_local();
+            match t.process.lifecycle.enter_running_if(t.tid, me.slot(), || {
+                t.process.space.local_is_current(epochs)
+            }) {
+                EnterRunning::Entered => break true,
+                EnterRunning::Retry => continue,
+                EnterRunning::Closed => break false,
+            }
+        };
+        if !entered {
             reap(t);
             continue;
+        }
+        if t.process.pid == 1 {
+            t.process.space.selftest_shootdown(&t.process.lifecycle);
         }
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         t.switches.fetch_add(1, Ordering::Relaxed);
@@ -483,7 +508,16 @@ pub fn run() -> ! {
         let slot = me.slot();
         match outcome {
             Outcome::Requeue => {
-                t.process.lifecycle.on_requeue(t.tid, slot);
+                loop {
+                    remote_call::drain_current();
+                    let epochs = t.process.space.epochs();
+                    if t.process
+                        .lifecycle
+                        .on_requeue_if(t.tid, slot, || t.process.space.local_is_current(epochs))
+                    {
+                        break;
+                    }
+                }
                 if t.process.lifecycle.is_terminating() {
                     reap(t);
                 } else {
@@ -493,12 +527,30 @@ pub fn run() -> ! {
                 }
             }
             Outcome::Killed => {
-                t.process.lifecycle.clear_active(slot);
+                loop {
+                    remote_call::drain_current();
+                    let epochs = t.process.space.epochs();
+                    if t.process
+                        .lifecycle
+                        .clear_active_if(slot, || t.process.space.local_is_current(epochs))
+                    {
+                        break;
+                    }
+                }
                 reap(t);
             }
             // 已离开执行点，此刻发布等待：完成方可安全触达该线程。
             Outcome::Park => {
-                t.process.lifecycle.clear_active(slot);
+                loop {
+                    remote_call::drain_current();
+                    let epochs = t.process.space.epochs();
+                    if t.process
+                        .lifecycle
+                        .clear_active_if(slot, || t.process.space.local_is_current(epochs))
+                    {
+                        break;
+                    }
+                }
                 park_publish(&t);
             }
             Outcome::Resume => unreachable!("Resume never passes through the scheduling loop"),

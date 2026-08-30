@@ -16,4 +16,5 @@ handle_table = { path = "../handle_table" }
 wait_context = { path = "../wait_context" }
 timer_queue = { path = "../timer_queue" }
 stack_layout = { path = "../stack_layout" }
+remote_call = { path = "../remote_call" }
 num-traits = { version = "0.2", default-features = false }

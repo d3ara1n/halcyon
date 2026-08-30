@@ -32,9 +32,12 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use alloc::{sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
-use erhino_shared::proc::{ProcessExitReason, ProcessState, Tid, PROCESS_MAX_THREADS};
+use erhino_shared::proc::{PROCESS_MAX_THREADS, ProcessExitReason, ProcessState, Tid};
 
 use super::wait::WaitContext;
 
@@ -100,6 +103,30 @@ pub(crate) struct TerminationTodo {
     pub reapable: bool,
 }
 
+/// Running 事务在 Commit 前复检的 execution gate 快照。sequence 使 active
+/// 位图离开后又恢复相同值的 ABA 仍可见。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionSnapshot {
+    sequence: u64,
+    active: u64,
+}
+
+impl ExecutionSnapshot {
+    pub(crate) const fn active(self) -> u64 {
+        self.active
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionChanged;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnterRunning {
+    Entered,
+    Retry,
+    Closed,
+}
+
 /// 生命周期内核侧状态（内嵌于 Process，不是独立对象）。
 pub(crate) struct Lifecycle {
     /// 原子快速路径：trap 入口与调度 gate 只读，不走锁。
@@ -121,9 +148,18 @@ struct LifecycleInner {
     /// 本进程线程所在 hart 的 slot 位图：dispatch 前（进入用户 satp 前）
     /// 置位，Switch 出口归一 satp 后清除；全零且表空方可 REAPABLE。
     active: u64,
+    /// active、Running 准入或终止截止每次变化都单调前进；零值不使用。
+    execution_sequence: u64,
     /// 在途 Building 操作（builder 的 map/write/attach/grant/start）
     /// 计数；终止后归零才能发布 REAPABLE（操作退出方负责触发）。
     building_ops: usize,
+}
+
+fn advance_execution(inner: &mut LifecycleInner) {
+    inner.execution_sequence = inner
+        .execution_sequence
+        .checked_add(1)
+        .expect("process execution sequence exhausted");
 }
 
 fn state_index(state: ProcessState) -> usize {
@@ -136,20 +172,52 @@ impl Lifecycle {
     pub(crate) fn building() -> Self {
         Self {
             state: AtomicUsize::new(state_index(ProcessState::Building)),
-            inner: crate::sync::Spinlock::new(crate::sync::ranks::LIFECYCLE, LifecycleInner {
-                reason: ProcessExitReason::None,
-                code: 0,
-                members: Vec::new(),
-                next_tid: 1,
-                active: 0,
-                building_ops: 0,
-            }),
+            inner: crate::sync::Spinlock::new(
+                crate::sync::ranks::LIFECYCLE,
+                LifecycleInner {
+                    reason: ProcessExitReason::None,
+                    code: 0,
+                    members: Vec::new(),
+                    next_tid: 1,
+                    active: 0,
+                    execution_sequence: 1,
+                    building_ops: 0,
+                },
+            ),
         }
     }
 
     /// trap 入口 / 调度 gate 的快速谓词（原子读，无锁）。
     pub fn is_terminating(&self) -> bool {
         self.state.load(Ordering::Acquire) >= state_index(ProcessState::Terminating)
+    }
+
+    /// Reserve 阶段取得 Running active 集合与 ABA 序列。
+    pub(crate) fn snapshot_running(&self) -> Option<ExecutionSnapshot> {
+        let inner = self.inner.lock();
+        (self.state.load(Ordering::Acquire) == state_index(ProcessState::Running)).then_some(
+            ExecutionSnapshot {
+                sequence: inner.execution_sequence,
+                active: inner.active,
+            },
+        )
+    }
+
+    /// Commit 在 AddressSpace 锁内重进 execution gate；闭包只允许执行已经
+    /// Reserve 完成、不可失败的短发布，锁外工作由返回 token 承接。
+    pub(crate) fn commit_if_current<R>(
+        &self,
+        snapshot: ExecutionSnapshot,
+        commit: impl FnOnce(u64) -> R,
+    ) -> Result<R, ExecutionChanged> {
+        let inner = self.inner.lock();
+        if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running)
+            || inner.execution_sequence != snapshot.sequence
+            || inner.active != snapshot.active
+        {
+            return Err(ExecutionChanged);
+        }
+        Ok(commit(inner.active))
     }
 
     /// Building 操作准入（builder 的 map/write/start 入口）：
@@ -191,13 +259,8 @@ impl Lifecycle {
         }
         let tid = inner.next_tid;
         let thread = build(tid)?;
-        inner
-            .members
-            .try_reserve(1)
-            .map_err(|_| AttachFault::Oom)?;
-        inner.next_tid = tid
-            .checked_add(1)
-            .expect("thread id space exhausted");
+        inner.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
+        inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
         inner.members.push(MemberEntry {
             tid,
             state: ThreadState::Staging { thread },
@@ -243,7 +306,9 @@ impl Lifecycle {
                 _ => unreachable!("Building member must be Staging before start commit"),
             }
         }
-        self.state.store(state_index(ProcessState::Running), Ordering::Release);
+        advance_execution(&mut inner);
+        self.state
+            .store(state_index(ProcessState::Running), Ordering::Release);
         Ok(())
     }
 
@@ -288,35 +353,34 @@ impl Lifecycle {
         match exiting {
             Some(tid) => {
                 let slot = crate::hart::current().slot();
-                let index = position(&inner.members, tid)
-                    .expect("self-exiting thread must be a member");
+                let index =
+                    position(&inner.members, tid).expect("self-exiting thread must be a member");
                 // 自杀线程必在执行点上（Staging 预育线程从未进入容器，
                 // 不可能发起 syscall；覆盖写丢弃的旧值不含强引用）。
-                debug_assert!(matches!(inner.members[index].state, ThreadState::Running { .. }));
+                debug_assert!(matches!(
+                    inner.members[index].state,
+                    ThreadState::Running { .. }
+                ));
                 inner.members[index].state = ThreadState::Exiting;
                 todo.ipi_slots = inner.active & !(1u64 << slot);
             }
             None => todo.ipi_slots = inner.active,
         }
-        todo.reapable =
-            inner.members.is_empty() && inner.active == 0 && inner.building_ops == 0;
-        self.state.store(state_index(ProcessState::Terminating), Ordering::Release);
+        todo.reapable = inner.members.is_empty() && inner.active == 0 && inner.building_ops == 0;
+        advance_execution(&mut inner);
+        self.state
+            .store(state_index(ProcessState::Terminating), Ordering::Release);
         todo
     }
 
     /// park 发布线性化：Running → Waiting；已 Terminating 返回 false，
     /// 调用方不得发布等待，改走 Abandoned 取消。
-    pub(crate) fn park_waiting(
-        &self,
-        tid: Tid,
-        context: &alloc::sync::Arc<WaitContext>,
-    ) -> bool {
+    pub(crate) fn park_waiting(&self, tid: Tid, context: &alloc::sync::Arc<WaitContext>) -> bool {
         let mut inner = self.inner.lock();
         if self.is_terminating() {
             return false;
         }
-        let index = position(&inner.members, tid)
-            .expect("parking thread must be a member");
+        let index = position(&inner.members, tid).expect("parking thread must be a member");
         if let ThreadState::Running { slot } = inner.members[index].state {
             // park 发布由调度循环在刚离开执行点的 hart 上完成：记录的
             // slot 必然就是本 hart（单一归属，dispatch 后不迁移）。
@@ -330,10 +394,24 @@ impl Lifecycle {
         true
     }
 
-    /// Switch 出口（Requeue 分支）：清 active，Running → Ready。
-    pub(crate) fn on_requeue(&self, tid: Tid, slot: usize) {
+    /// Switch 出口（Requeue 分支）：只有本 hart 已确认当前 epoch 才清 active，
+    /// 随后 Running → Ready。false 要求调用者锁外消费 Pending 后重试。
+    pub(crate) fn on_requeue_if(
+        &self,
+        tid: Tid,
+        slot: usize,
+        synchronized: impl FnOnce() -> bool,
+    ) -> bool {
         let mut inner = self.inner.lock();
+        if !synchronized() {
+            return false;
+        }
+        assert!(
+            inner.active & (1u64 << slot) != 0,
+            "requeued hart must be active for process"
+        );
         inner.active &= !(1u64 << slot);
+        advance_execution(&mut inner);
         if !self.is_terminating() {
             if let Ok(index) = position(&inner.members, tid) {
                 if matches!(inner.members[index].state, ThreadState::Running { .. }) {
@@ -341,27 +419,49 @@ impl Lifecycle {
                 }
             }
         }
+        true
     }
 
-    /// 非-Resume 出口（Killed/Park）只清 active 位：线程已离开用户
-    /// 执行点，成员记录由各自后续路径（reap/park 发布）接管。
-    pub(crate) fn clear_active(&self, slot: usize) {
-        self.inner.lock().active &= !(1u64 << slot);
-    }
-
-    /// 调度循环 dispatch 前：Running 记录 + active 置位（覆盖写收编
-    /// 唤醒过渡窗口的 stale Waiting 记录）。Terminating 返回 false
-    /// （惰性收束，不进入用户态）。
-    pub(crate) fn enter_running(&self, tid: Tid, slot: usize) -> bool {
+    /// 非-Resume 出口（Killed/Park）：确认当前 epoch 后清 active。false 要求
+    /// 调用者锁外消费 Pending 后重试。
+    pub(crate) fn clear_active_if(&self, slot: usize, synchronized: impl FnOnce() -> bool) -> bool {
         let mut inner = self.inner.lock();
-        if self.is_terminating() {
+        if !synchronized() {
             return false;
         }
-        let index = position(&inner.members, tid)
-            .expect("dispatched thread must be a member");
-        inner.members[index].state = ThreadState::Running { slot };
-        inner.active |= 1u64 << slot;
+        assert!(
+            inner.active & (1u64 << slot) != 0,
+            "departing hart must be active for process"
+        );
+        inner.active &= !(1u64 << slot);
+        advance_execution(&mut inner);
         true
+    }
+
+    /// 调度循环 dispatch 前：调用者先在锁外同步当前 epoch，再在 gate 内复检；
+    /// epoch 变化返回 Retry，Terminating 返回 Closed，只有 Entered 才登记 active。
+    pub(crate) fn enter_running_if(
+        &self,
+        tid: Tid,
+        slot: usize,
+        synchronized: impl FnOnce() -> bool,
+    ) -> EnterRunning {
+        let mut inner = self.inner.lock();
+        if self.is_terminating() {
+            return EnterRunning::Closed;
+        }
+        if !synchronized() {
+            return EnterRunning::Retry;
+        }
+        let index = position(&inner.members, tid).expect("dispatched thread must be a member");
+        inner.members[index].state = ThreadState::Running { slot };
+        assert!(
+            inner.active & (1u64 << slot) == 0,
+            "hart cannot enter one process twice"
+        );
+        inner.active |= 1u64 << slot;
+        advance_execution(&mut inner);
+        EnterRunning::Entered
     }
 
     /// 线程离场完成（调用方已 drop 线程强引用：reap / WaitContext 完成
@@ -369,8 +469,7 @@ impl Lifecycle {
     /// （末离场者发布）。
     pub(crate) fn thread_departed(&self, tid: Tid) -> bool {
         let mut inner = self.inner.lock();
-        let index = position(&inner.members, tid)
-            .expect("departing thread must be a member");
+        let index = position(&inner.members, tid).expect("departing thread must be a member");
         inner.members.remove(index);
         self.is_terminating()
             && inner.members.is_empty()
@@ -423,7 +522,8 @@ impl Lifecycle {
     pub(crate) fn mark_dead(&self) -> (ProcessExitReason, i64) {
         let inner = self.inner.lock();
         let frozen = (inner.reason, inner.code);
-        self.state.store(state_index(ProcessState::Dead), Ordering::Release);
+        self.state
+            .store(state_index(ProcessState::Dead), Ordering::Release);
         frozen
     }
 }

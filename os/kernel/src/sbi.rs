@@ -202,9 +202,9 @@ pub fn set_timer(stime: u64) -> SbiResult {
     sbi_call(SbiExtension::Timer, 0, stime as usize, 0, 0)
 }
 
-/// IPI：现代 SBI ABI 的 `hart_mask` 是值而非指针，base 固定为 0。
-pub fn send_ipi(mask: u64) -> SbiResult {
-    sbi_call(SbiExtension::Ipi, 0, mask as usize, 0, 0)
+/// IPI：现代 SBI ABI 的 hart mask 从显式 raw hartid base 起算。
+pub fn send_ipi(mask: usize, base: usize) -> SbiResult {
+    sbi_call(SbiExtension::Ipi, 0, mask, base, 0)
 }
 
 /// 清除本 hart 的软件中断 pending（SSIP 位可由 S 态写）。

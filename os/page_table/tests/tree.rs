@@ -4,7 +4,10 @@
 //! 是 mm-map-bug 的数值原案。
 
 use core::cell::Cell;
-use page_table::{flags, FrameExhausted, FrameMemory, FrameNumber, MapError, Pte, TableTree, ENTRIES, Vpn, Ppn};
+use page_table::{
+    ENTRIES, FrameExhausted, FrameMemory, FrameNumber, MapError, Ppn, Pte, ReservedTableFrame,
+    RootSlotState, TableTree, Vpn, flags,
+};
 use std::rc::Rc;
 
 /// 共享计数器：树销毁后仍可读，验证帧收支平衡。
@@ -12,11 +15,11 @@ use std::rc::Rc;
 struct Counters {
     live: Cell<usize>,
     deny_alloc: Cell<bool>,
+    alloc_budget: Cell<Option<usize>>,
 }
 
 struct MockFrames {
     tables: Vec<[Pte; ENTRIES]>,
-    free: Vec<usize>,
     counters: Rc<Counters>,
 }
 
@@ -24,29 +27,60 @@ impl MockFrames {
     fn new(counters: Rc<Counters>) -> Self {
         Self {
             tables: Vec::new(),
-            free: Vec::new(),
             counters,
         }
     }
 }
 
+struct ReservedFrame {
+    frame: FrameNumber,
+    counters: Rc<Counters>,
+    committed: bool,
+}
+
+impl ReservedTableFrame for ReservedFrame {
+    fn number(&self) -> FrameNumber {
+        self.frame
+    }
+
+    fn commit(mut self) -> FrameNumber {
+        self.committed = true;
+        self.frame
+    }
+}
+
+impl Drop for ReservedFrame {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.counters.live.set(self.counters.live.get() - 1);
+        }
+    }
+}
+
 impl FrameMemory for MockFrames {
-    fn alloc_frame(&mut self) -> Result<FrameNumber, FrameExhausted> {
+    type ReservedFrame = ReservedFrame;
+
+    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted> {
         if self.counters.deny_alloc.get() {
             return Err(FrameExhausted);
         }
-        self.counters.live.set(self.counters.live.get() + 1);
-        if let Some(f) = self.free.pop() {
-            Ok(FrameNumber(f))
-        } else {
-            self.tables.push([Pte::invalid(); ENTRIES]);
-            Ok(FrameNumber(self.tables.len() - 1))
+        if let Some(remaining) = self.counters.alloc_budget.get() {
+            if remaining == 0 {
+                return Err(FrameExhausted);
+            }
+            self.counters.alloc_budget.set(Some(remaining - 1));
         }
+        self.counters.live.set(self.counters.live.get() + 1);
+        self.tables.push([Pte::invalid(); ENTRIES]);
+        Ok(ReservedFrame {
+            frame: FrameNumber(self.tables.len() - 1),
+            counters: self.counters.clone(),
+            committed: false,
+        })
     }
 
-    fn free_frame(&mut self, frame: FrameNumber) {
+    fn free_frame(&mut self, _frame: FrameNumber) {
         self.counters.live.set(self.counters.live.get() - 1);
-        self.free.push(frame.0);
     }
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES] {
@@ -60,13 +94,35 @@ fn tree(counters: &Rc<Counters>) -> Tree {
     Tree::new(MockFrames::new(counters.clone())).expect("failed to build tree")
 }
 
+fn map(tree: &mut Tree, vpn: Vpn, count: usize, ppn: Ppn, flags: u64) -> Result<(), MapError> {
+    let prepared = tree.prepare_map(vpn, count, ppn, flags)?;
+    tree.publish(prepared);
+    Ok(())
+}
+
+fn unmap(tree: &mut Tree, vpn: Vpn, count: usize) -> Result<(), MapError> {
+    let prepared = tree.prepare_unmap(vpn, count)?;
+    tree.publish(prepared);
+    Ok(())
+}
+
+fn protect(tree: &mut Tree, vpn: Vpn, count: usize, from: u64, to: u64) -> Result<(), MapError> {
+    let prepared = tree.prepare_protect(vpn, count, from, to)?;
+    tree.publish(prepared);
+    Ok(())
+}
+
 /// mm-map-bug 数值原案：未对齐起点跨多张表的 32MB 区间（8192 页）。
 #[test]
 fn big_unaligned_cross_table() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     let (start, count, ppn) = (65usize, 8192usize, 33usize);
-    t.map(Vpn(start), count, Ppn(ppn), flags::USER_DATA).unwrap();
+    let prepared = t
+        .prepare_map(Vpn(start), count, Ppn(ppn), flags::USER_DATA)
+        .unwrap();
+    assert_eq!(prepared.reserved_frames(), 18);
+    t.publish(prepared);
 
     // 抽查边界与中段：物理连续、全部可译
     for vpn in [65, 66, 511, 512, 513, 4096, 8256, 8257 - 1] {
@@ -84,7 +140,14 @@ fn big_unaligned_cross_table() {
 fn table_aligned_creates_mega() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(512 * 3), 512, Ppn(512 * 7), flags::KERNEL_DIRECT).unwrap();
+    map(
+        &mut t,
+        Vpn(512 * 3),
+        512,
+        Ppn(512 * 7),
+        flags::KERNEL_DIRECT,
+    )
+    .unwrap();
     let m = t.translate(Vpn(512 * 3 + 123)).unwrap();
     assert_eq!(m.level, 1, "expected 2MiB mega level");
     assert_eq!(m.ppn.0, 512 * 7 + 123);
@@ -95,7 +158,14 @@ fn table_aligned_creates_mega() {
 fn one_g_mega() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(512 * 512 * 2), 512 * 512, Ppn(512 * 512 * 5), flags::KERNEL_DIRECT).unwrap();
+    map(
+        &mut t,
+        Vpn(512 * 512 * 2),
+        512 * 512,
+        Ppn(512 * 512 * 5),
+        flags::KERNEL_DIRECT,
+    )
+    .unwrap();
     let m = t.translate(Vpn(512 * 512 * 2 + 9999)).unwrap();
     assert_eq!(m.level, 2);
     assert_eq!(m.ppn.0, 512 * 512 * 5 + 9999);
@@ -106,7 +176,7 @@ fn one_g_mega() {
 fn mixed_head_tail() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(5), 517, Ppn(9), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(5), 517, Ppn(9), flags::USER_DATA).unwrap();
     for vpn in 5..5 + 517 {
         assert_eq!(t.translate(Vpn(vpn)).unwrap().ppn.0, 9 + vpn - 5);
     }
@@ -117,10 +187,10 @@ fn mixed_head_tail() {
 fn idempotent_same_mapping() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(512), 512, Ppn(512), flags::USER_DATA).unwrap();
-    t.map(Vpn(512), 512, Ppn(512), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(512), 512, Ppn(512), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(512), 512, Ppn(512), flags::USER_DATA).unwrap();
     // 部分重叠幂等
-    t.map(Vpn(512 + 100), 10, Ppn(512 + 100), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(512 + 100), 10, Ppn(512 + 100), flags::USER_DATA).unwrap();
 }
 
 /// 异 flags 冲突。
@@ -128,9 +198,9 @@ fn idempotent_same_mapping() {
 fn conflict_different_flags() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(0), 16, Ppn(0), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(0), 16, Ppn(0), flags::USER_DATA).unwrap();
     assert_eq!(
-        t.map(Vpn(4), 4, Ppn(4), flags::USER_RODATA),
+        map(&mut t, Vpn(4), 4, Ppn(4), flags::USER_RODATA),
         Err(MapError::Conflict { vpn: Vpn(4) })
     );
 }
@@ -140,9 +210,9 @@ fn conflict_different_flags() {
 fn conflict_different_ppn() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(0), 16, Ppn(0), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(0), 16, Ppn(0), flags::USER_DATA).unwrap();
     assert_eq!(
-        t.map(Vpn(4), 4, Ppn(100), flags::USER_DATA),
+        map(&mut t, Vpn(4), 4, Ppn(100), flags::USER_DATA),
         Err(MapError::Conflict { vpn: Vpn(4) })
     );
 }
@@ -153,11 +223,11 @@ fn conflict_mega_over_subtree() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     // 物理不对齐 → 只能建 4KiB 叶，留下分支链
-    t.map(Vpn(512), 512, Ppn(5), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(512), 512, Ppn(5), flags::USER_DATA).unwrap();
     assert_eq!(t.translate(Vpn(512)).unwrap().level, 0);
     // 再以对齐 ppn 映射同区 → mega 撞上子树
     assert_eq!(
-        t.map(Vpn(512), 512, Ppn(512), flags::USER_DATA),
+        map(&mut t, Vpn(512), 512, Ppn(512), flags::USER_DATA),
         Err(MapError::Conflict { vpn: Vpn(512) })
     );
 }
@@ -167,10 +237,10 @@ fn conflict_mega_over_subtree() {
 fn unmap_then_remap() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(100), 100, Ppn(200), flags::USER_DATA).unwrap();
-    t.unmap(Vpn(100), 100).unwrap();
+    map(&mut t, Vpn(100), 100, Ppn(200), flags::USER_DATA).unwrap();
+    unmap(&mut t, Vpn(100), 100).unwrap();
     assert!(t.translate(Vpn(150)).is_none());
-    t.map(Vpn(100), 100, Ppn(900), flags::USER_CODE).unwrap();
+    map(&mut t, Vpn(100), 100, Ppn(900), flags::USER_CODE).unwrap();
     assert_eq!(t.translate(Vpn(150)).unwrap().ppn.0, 950);
 }
 
@@ -179,8 +249,8 @@ fn unmap_then_remap() {
 fn unmap_crosses_child_table_boundary() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(480), 80, Ppn(1000), flags::USER_DATA).unwrap();
-    t.unmap(Vpn(500), 40).unwrap();
+    map(&mut t, Vpn(480), 80, Ppn(1000), flags::USER_DATA).unwrap();
+    unmap(&mut t, Vpn(500), 40).unwrap();
     for vpn in 480..500 {
         assert!(t.translate(Vpn(vpn)).is_some(), "left neighbor {vpn}");
     }
@@ -198,10 +268,10 @@ fn partial_unmap_splits_mega() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     let base = 512 * 10;
-    t.map(Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
     assert_eq!(t.translate(Vpn(base + 5)).unwrap().level, 1);
 
-    t.unmap(Vpn(base + 100), 1).unwrap();
+    unmap(&mut t, Vpn(base + 100), 1).unwrap();
     assert!(t.translate(Vpn(base + 100)).is_none());
     // 分裂后邻居变 4KiB 叶但映射保持
     for off in [0, 99, 101, 511] {
@@ -216,9 +286,12 @@ fn partial_unmap_split_oom_preserves_mapping() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     let base = 512 * 10;
-    t.map(Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
     counters.deny_alloc.set(true);
-    assert_eq!(t.unmap(Vpn(base + 123), 1), Err(MapError::FrameExhausted));
+    assert_eq!(
+        unmap(&mut t, Vpn(base + 123), 1),
+        Err(MapError::FrameExhausted)
+    );
     for off in [0, 122, 123, 124, 511] {
         assert_eq!(t.translate(Vpn(base + off)).unwrap().ppn.0, base + off);
     }
@@ -230,12 +303,12 @@ fn partial_unmap_split_oom_preserves_mapping() {
 fn finer_map_over_mega() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(512), 512, Ppn(512), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(512), 512, Ppn(512), flags::USER_DATA).unwrap();
     // 兼容的细粒度重映射（同物理连续性）
-    t.map(Vpn(512 + 7), 1, Ppn(512 + 7), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(512 + 7), 1, Ppn(512 + 7), flags::USER_DATA).unwrap();
     // 异物理的细粒度重映射
     assert_eq!(
-        t.map(Vpn(512 + 8), 1, Ppn(999_999), flags::USER_DATA),
+        map(&mut t, Vpn(512 + 8), 1, Ppn(999_999), flags::USER_DATA),
         Err(MapError::Conflict { vpn: Vpn(512 + 8) })
     );
 }
@@ -245,9 +318,25 @@ fn finer_map_over_mega() {
 fn out_of_range() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    assert_eq!(t.map(Vpn(1 << 27), 1, Ppn(0), flags::USER_DATA), Err(MapError::OutOfRange));
+    assert_eq!(
+        map(&mut t, Vpn(1 << 27), 1, Ppn(0), flags::USER_DATA),
+        Err(MapError::OutOfRange)
+    );
     // 溢出
-    assert_eq!(t.map(Vpn(usize::MAX), 2, Ppn(0), flags::USER_DATA), Err(MapError::OutOfRange));
+    assert_eq!(
+        map(&mut t, Vpn(usize::MAX), 2, Ppn(0), flags::USER_DATA),
+        Err(MapError::OutOfRange)
+    );
+    assert_eq!(
+        map(
+            &mut t,
+            Vpn(0),
+            1,
+            Ppn(page_table::MAX_PPN),
+            flags::USER_DATA
+        ),
+        Err(MapError::OutOfRange)
+    );
 }
 
 /// 空区间为 no-op。
@@ -255,7 +344,7 @@ fn out_of_range() {
 fn zero_count_noop() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    t.map(Vpn(0), 0, Ppn(0), flags::USER_DATA).unwrap();
+    map(&mut t, Vpn(0), 0, Ppn(0), flags::USER_DATA).unwrap();
     assert!(t.translate(Vpn(0)).is_none());
 }
 
@@ -265,40 +354,160 @@ fn drop_frees_all_frames() {
     let counters = Rc::new(Counters::default());
     {
         let mut t = tree(&counters);
-        t.map(Vpn(65), 8192, Ppn(33), flags::USER_DATA).unwrap();
-        t.map(Vpn(512 * 100), 512, Ppn(512 * 100), flags::USER_CODE).unwrap();
-        t.map(Vpn(0), 1, Ppn(1), flags::USER_RODATA).unwrap();
+        map(&mut t, Vpn(65), 8192, Ppn(33), flags::USER_DATA).unwrap();
+        map(
+            &mut t,
+            Vpn(512 * 100),
+            512,
+            Ppn(512 * 100),
+            flags::USER_CODE,
+        )
+        .unwrap();
+        map(&mut t, Vpn(0), 1, Ppn(1), flags::USER_RODATA).unwrap();
         assert!(counters.live.get() > 1);
     }
     assert_eq!(counters.live.get(), 0, "table frames not fully returned");
 }
 
-/// clear_slots 只清槽位、不递归回收：被剥离分支的子树帧仍记账为存活，
-/// 随后 Drop 也不得触碰它们（内核共享顶层项剥离的数值契约）。
+/// shared root 槽由树内所有权位图标记，Drop 不递归进入外部子树。
 #[test]
-fn clear_slots_detaches_without_recursion() {
+fn shared_root_is_not_reclaimed() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    // 用户侧一页 + 模拟共享进来的顶层分支项（指向手工构造的外部表）。
-    t.map(Vpn(0), 1, Ppn(1), flags::USER_DATA).unwrap();
-
-    // 在 root 空槽挂一个分支项，其下再挂一层叶表与一个叶子映射。
-    let sub = t.mem_mut().alloc_frame().unwrap();
-    let leaf = t.mem_mut().alloc_frame().unwrap();
-    {
-        let tables = &mut *t.mem_mut();
-        tables.tables[sub.0][7] = Pte::branch(leaf);
-        tables.tables[leaf.0][9] = Pte::leaf(Ppn(0x999), flags::KERNEL_DIRECT);
-        tables.tables[0][500] = Pte::branch(sub); // root 是 0 号帧
-    }
-
-    // 剥离槽位：不归还任何帧，翻译随之消失。
-    // 记账：root(1) + 用户映射的中间表/叶表(2) + 手工 sub/leaf(2) = 5。
-    t.clear_slots(FrameNumber(0), 500, 501);
-    assert_eq!(counters.live.get(), 5, "detach must not return subtree frames");
-    assert!(t.translate(Vpn(500 * 512 + 7)).is_none(), "detached slot must not translate");
-
-    // Drop 后只回收用户侧帧；外部子树的 2 帧归调用方所有，仍存活。
+    map(&mut t, Vpn(0), 1, Ppn(1), flags::USER_DATA).unwrap();
+    t.attach_shared_root(500, &[Pte::branch(FrameNumber(0xdead))])
+        .unwrap();
+    assert_eq!(t.root_slot_state(500), RootSlotState::Shared);
     drop(t);
-    assert_eq!(counters.live.get(), 2, "Drop must not reclaim detached kernel subtree");
+    assert_eq!(
+        counters.live.get(),
+        0,
+        "shared subtree must not be reclaimed"
+    );
+}
+
+#[test]
+fn dropped_reservation_returns_all_frames() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let prepared = t.prepare_map(Vpn(1), 1, Ppn(2), flags::USER_DATA).unwrap();
+    assert_eq!(prepared.reserved_frames(), 2);
+    assert_eq!(counters.live.get(), 3);
+    drop(prepared);
+    assert_eq!(counters.live.get(), 1);
+    assert!(t.translate(Vpn(1)).is_none());
+}
+
+#[test]
+fn existing_page_unmap_reserves_no_frames() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    map(&mut t, Vpn(1), 1, Ppn(2), flags::USER_DATA).unwrap();
+    counters.deny_alloc.set(true);
+    let prepared = t.prepare_unmap(Vpn(1), 1).unwrap();
+    assert_eq!(prepared.reserved_frames(), 0);
+    t.publish(prepared);
+    assert!(t.translate(Vpn(1)).is_none());
+}
+
+#[test]
+fn partial_protect_splits_mega() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let base = 512 * 10;
+    map(&mut t, Vpn(base), 512, Ppn(base), flags::USER_DATA).unwrap();
+    let prepared = t
+        .prepare_protect(Vpn(base + 9), 1, flags::USER_DATA, flags::USER_RODATA)
+        .unwrap();
+    assert_eq!(prepared.reserved_frames(), 1);
+    t.publish(prepared);
+    assert_eq!(
+        t.translate(Vpn(base + 9)).unwrap().flags,
+        flags::USER_RODATA
+    );
+    assert_eq!(t.translate(Vpn(base + 8)).unwrap().flags, flags::USER_DATA);
+}
+
+#[test]
+fn protect_validation_has_zero_side_effects() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    map(&mut t, Vpn(10), 2, Ppn(20), flags::USER_DATA).unwrap();
+    let live = counters.live.get();
+    assert_eq!(
+        protect(&mut t, Vpn(10), 2, flags::USER_RODATA, flags::USER_CODE,),
+        Err(MapError::ProtectionMismatch { vpn: Vpn(10) })
+    );
+    assert_eq!(counters.live.get(), live);
+    assert_eq!(t.translate(Vpn(10)).unwrap().flags, flags::USER_DATA);
+}
+
+#[test]
+fn partial_reservation_failure_returns_frames_and_preserves_tree() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let base = 512 * 512 * 2;
+    map(&mut t, Vpn(base), 512 * 512, Ppn(base), flags::USER_DATA).unwrap();
+    assert_eq!(counters.live.get(), 1);
+    counters.alloc_budget.set(Some(1));
+    let result = t.prepare_unmap(Vpn(base + 1), 1);
+    assert!(matches!(result, Err(MapError::FrameExhausted)));
+    assert_eq!(counters.live.get(), 1);
+    for offset in [0, 1, 2, 512, 512 * 512 - 1] {
+        let mapped = t.translate(Vpn(base + offset)).unwrap();
+        assert_eq!(mapped.level, 2);
+        assert_eq!(mapped.ppn.0, base + offset);
+    }
+}
+
+#[test]
+fn invalid_leaf_flags_are_rejected_before_reservation() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    assert!(matches!(
+        t.prepare_map(Vpn(0), 1, Ppn(0), flags::V),
+        Err(MapError::InvalidFlags)
+    ));
+    map(&mut t, Vpn(0), 1, Ppn(0), flags::USER_DATA).unwrap();
+    assert!(matches!(
+        t.prepare_protect(Vpn(0), 1, flags::USER_DATA, flags::V),
+        Err(MapError::InvalidFlags)
+    ));
+    assert_eq!(counters.live.get(), 3);
+}
+
+#[test]
+fn detached_root_slot_can_be_reused_as_shared() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let base = 512 * 512 * 2;
+    map(&mut t, Vpn(base), 512 * 512, Ppn(base), flags::USER_DATA).unwrap();
+    assert_eq!(t.root_slot_state(2), RootSlotState::Leaf);
+    unmap(&mut t, Vpn(base), 512 * 512).unwrap();
+    assert_eq!(t.root_slot_state(2), RootSlotState::Empty);
+    t.attach_shared_root(2, &[Pte::branch(FrameNumber(0xbeef))])
+        .unwrap();
+    assert_eq!(t.root_slot_state(2), RootSlotState::Shared);
+}
+
+#[test]
+fn later_nonoverlapping_publish_returns_now_unused_frames() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let first = t
+        .prepare_map(Vpn(1), 1, Ppn(101), flags::USER_DATA)
+        .unwrap();
+    let second = t
+        .prepare_map(Vpn(2), 1, Ppn(102), flags::USER_DATA)
+        .unwrap();
+    assert_eq!(first.reserved_frames(), 2);
+    assert_eq!(second.reserved_frames(), 2);
+    assert_eq!(counters.live.get(), 5);
+
+    t.publish(first);
+    assert_eq!(counters.live.get(), 5);
+    t.publish(second);
+    assert_eq!(counters.live.get(), 3);
+    assert_eq!(t.translate(Vpn(1)).unwrap().ppn, Ppn(101));
+    assert_eq!(t.translate(Vpn(2)).unwrap().ppn, Ppn(102));
 }

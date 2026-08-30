@@ -50,8 +50,6 @@ impl fmt::Write for RawWriter {
     }
 }
 
-
-
 #[lang = "start"]
 fn rust_start<T: Termination + 'static>(
     main: fn() -> T,
@@ -81,7 +79,9 @@ extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
     if let Err(reject) = csr::formal_entry_baseline() {
         match reject {
             csr::CsrReject::Uxl(readback) => {
-                fatal_msg(&format_args!("CSR baseline check failed: UXL readback {readback:#x} != 64"));
+                fatal_msg(&format_args!(
+                    "CSR baseline check failed: UXL readback {readback:#x} != 64"
+                ));
             }
             other => fatal_msg(&format_args!("CSR baseline check failed: {other:?}")),
         }
@@ -135,14 +135,17 @@ fn bring_up_runtime() -> ! {
     // 等待全员 Online（Acquire 观察）；超时或状态矛盾即整体失败。
     loop {
         let all_online = registry::with_registry(|reg| {
-            reg.records().all(|(_, r)| r.state() == crate::registry::BootState::Online)
+            reg.records()
+                .all(|(_, r)| r.state() == crate::registry::BootState::Online)
         });
         if all_online {
             break;
         }
         if sbi::read_time() > deadline {
             registry::publish_failed();
-            fatal_msg(&format_args!("secondary hart bring-up timed out; boot aborted"));
+            fatal_msg(&format_args!(
+                "secondary hart bring-up timed out; boot aborted"
+            ));
         }
         core::hint::spin_loop();
     }
@@ -161,6 +164,7 @@ fn bring_up_runtime() -> ! {
         .expect("BootPackage unavailable; initial process cannot start");
     boot::load(addr, len);
     registry::publish_ready();
+    crate::remote_call::selftest();
     crate::sched::run()
 }
 
@@ -188,10 +192,9 @@ pub fn boot_package_region() -> Option<(usize, usize)> {
 #[unsafe(no_mangle)]
 extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
     // guard 页命中是内核栈溢出的第一现场特征，单独点出便于定位。
-    let hint =
-        if matches!(frame.scause, LOAD_PAGE_FAULT | STORE_PAGE_FAULT)
-            && mm::is_guard_fault(frame.stval as usize)
-        {
+    let hint = if matches!(frame.scause, LOAD_PAGE_FAULT | STORE_PAGE_FAULT)
+        && mm::is_guard_fault(frame.stval as usize)
+    {
         " (kernel stack overflow: guard page hit)"
     } else {
         ""
@@ -199,18 +202,21 @@ extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
     let _ = write!(
         RawWriter,
         "\x1b[0;31mfatal trap\x1b[0m: unexpected trap in S-mode{}\n  cause={:#x} val={:#x} pc={:#x}\n  satp={:#x} sstatus={:#x}\n",
-        hint,
-        frame.scause, frame.stval, frame.sepc, frame.satp, frame.sstatus,
+        hint, frame.scause, frame.stval, frame.sepc, frame.satp, frame.sstatus,
     );
     let _ = write!(RawWriter, "  gpr:");
     for i in (1..32).step_by(4) {
         let _ = write!(
             RawWriter,
             " x{}={:#x} x{}={:#x} x{}={:#x} x{}={:#x}",
-            i, frame.x[i],
-            i + 1, frame.x[i + 1],
-            i + 2, frame.x[i + 2],
-            (i + 3).min(31), frame.x[(i + 3).min(31)],
+            i,
+            frame.x[i],
+            i + 1,
+            frame.x[i + 1],
+            i + 2,
+            frame.x[i + 2],
+            (i + 3).min(31),
+            frame.x[(i + 3).min(31)],
         );
     }
     let _ = writeln!(RawWriter);

@@ -12,5 +12,6 @@ members = [
     "stack_layout",
     "sched_domain",
     "memory_space",
+    "remote_call",
 ]
 resolver = "2"

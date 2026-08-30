@@ -91,7 +91,11 @@ pub struct ObjectWaitState {
 
 impl ObjectWaitState {
     pub const fn new(initial: ObjectSignals) -> Self {
-        Self { signals: initial, next_id: 1, waiters: alloc::vec::Vec::new() }
+        Self {
+            signals: initial,
+            next_id: 1,
+            waiters: alloc::vec::Vec::new(),
+        }
     }
 
     pub const fn signals(&self) -> ObjectSignals {
@@ -122,7 +126,8 @@ impl ObjectWaitState {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.waiters.push(RegisteredSubscription { id, subscription });
+        self.waiters
+            .push(RegisteredSubscription { id, subscription });
         SubscribeResult::Registered(id)
     }
 

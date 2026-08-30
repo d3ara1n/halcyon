@@ -53,7 +53,7 @@ idle 只表达「当前 hart 暂无可运行线程」：hart 在所属调度域�
 
 ### IPI 门铃与 remote call
 
-当前 IPI 只实现门铃：`send_ipi` 置目标 SSIP，目标清源后检查调度与终止待办；没有共享参数帧或 remote-call queue。Remote Call 的方向见 [`../ideas/call.md`](../ideas/call.md)。
+IPI 仍只有门铃语义：`send_ipi` 置目标 SSIP，不携带载荷。Remote Call 参数位于每 hart 固定全局槽，Pending 电平才是工作真值；目标在 trap 与调度安全点有界消费，普通调度/终止门铃与 Remote Call 共用 SSIP 但互不伪造待办。当前首个动作是 AddressSpace epoch fence，详见 [`call.md`](call.md)「Remote Call」。
 
 ## tp 寄存器
 

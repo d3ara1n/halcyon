@@ -11,7 +11,7 @@
 //! scause 按 `(is_interrupt, code)` 分发（TRAP-004 收口）：只有中断 1/5
 //! 进入 SSIP/STIP，只有异常 8 是 U ecall；其余用户同步异常一律终止进程。
 
-use crate::{context::UserContext, hart, sched, sbi, syscall};
+use crate::{context::UserContext, hart, remote_call, sbi, sched, syscall};
 
 /// trap 处理出口，汇编经 a0 返回给调度循环（0 保留给 Resume）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,10 +60,16 @@ const U_ECALL: usize = 8;
 /// # Safety
 /// 仅由 `_trap_entry` 汇编按锚契约调用；frame 指向当前线程的 UserContext。
 #[unsafe(no_mangle)]
-unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut UserContext) -> usize {
+unsafe extern "C" fn handle_user_trap(
+    scause: usize,
+    stval: usize,
+    frame: *mut UserContext,
+) -> usize {
     // SAFETY: 锚指向当前线程现场，本 hart 独占（模块契约）。
     let frame = unsafe { &mut *frame };
     let thread = hart::current().current_thread();
+    // Pending 电平是 Remote Call 真值；任意用户 trap 都是有界消费安全点。
+    remote_call::drain_current();
 
     // 终止吸收：kill 先行冻结终因后，目标线程在任何 trap 入口都不再
     // 返回用户态（IPI 到达、量子耗尽、异常均在此汇合）。
@@ -76,9 +82,11 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
     let is_interrupt = scause >> 63 == 1;
     let code = scause & !(1 << 63);
 
-    match (is_interrupt, code) {
+    let outcome = match (is_interrupt, code) {
         (false, U_ECALL) => {
-            let Some(t) = thread else { unreachable!("no current thread on ecall") };
+            let Some(t) = thread else {
+                unreachable!("no current thread on ecall")
+            };
             match syscall::dispatch(frame, t) {
                 syscall::Outcome::Completed => Outcome::Resume as usize,
                 syscall::Outcome::Wait => Outcome::Park as usize,
@@ -127,5 +135,12 @@ unsafe extern "C" fn handle_user_trap(scause: usize, stval: usize, frame: *mut U
             // 未接入的中断来源进入用户 trap 路径属内核 bug，致命。
             panic!("unexpected interrupt in user trap: code={other:#x} stval={stval:#x}");
         }
+    };
+    // ecall 可能在本次 trap 内向当前 hart 发布请求；返回用户态前再消费一次。
+    remote_call::drain_current();
+    if thread.is_some_and(|t| t.process.lifecycle.is_terminating()) {
+        Outcome::Killed as usize
+    } else {
+        outcome
     }
 }

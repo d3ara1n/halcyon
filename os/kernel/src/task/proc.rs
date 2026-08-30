@@ -8,7 +8,10 @@ use erhino_shared::{
     call::SystemCallError,
     proc::{Pid, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
-use page_table::{FrameMemory, FrameNumber, MapError, Ppn, TableTree, Vpn, flags};
+use page_table::{
+    FrameMemory, FrameNumber, MapError, Ppn, ReservedTableFrame, RootSlotState, SlotState,
+    TableTree, Vpn, flags,
+};
 
 use crate::{
     context::UserContext,
@@ -52,9 +55,24 @@ impl From<MapError> for SpaceError {
     fn from(e: MapError) -> Self {
         match e {
             MapError::Conflict { .. } => SpaceError::Conflict,
-            MapError::FrameExhausted => SpaceError::NoFrame,
-            MapError::OutOfRange => SpaceError::BadSegment,
+            MapError::FrameExhausted | MapError::AllocationFailed => SpaceError::NoFrame,
+            MapError::OutOfRange
+            | MapError::InvalidFlags
+            | MapError::NotMapped { .. }
+            | MapError::ProtectionMismatch { .. } => SpaceError::BadSegment,
         }
+    }
+}
+
+struct TableFrameToken(FrameTracker);
+
+impl ReservedTableFrame for TableFrameToken {
+    fn number(&self) -> FrameNumber {
+        FrameNumber(self.0.base().addr() / PAGE_SIZE)
+    }
+
+    fn commit(self) -> FrameNumber {
+        self.0.into_table_frame()
     }
 }
 
@@ -62,9 +80,11 @@ impl From<MapError> for SpaceError {
 struct TableMem;
 
 impl FrameMemory for TableMem {
-    fn alloc_frame(&mut self) -> Result<FrameNumber, page_table::FrameExhausted> {
+    type ReservedFrame = TableFrameToken;
+
+    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, page_table::FrameExhausted> {
         frame::alloc_order(0)
-            .map(FrameTracker::into_table_frame)
+            .map(TableFrameToken)
             .ok_or(page_table::FrameExhausted)
     }
 
@@ -96,11 +116,240 @@ enum DrainStage {
     Done,
 }
 
-/// 进程地址空间：页表树 + 数据帧所有权 + 布局记账。
-///
-/// 访问纪律：所属对象私有层——持 `Process.space` 锁访问；跨 hart 调用者
-/// 先经 capability 所达 Process core 取得引用，再加本锁。
+/// 地址空间稳定 epoch 快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EpochSnapshot {
+    pub translation: u64,
+    pub instruction: u64,
+}
+
+static NEXT_ADDRESS_SPACE_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// 进程地址空间的稳定外壳。identity 与 epoch 不随 ledger/页表状态锁借用而移动，
+/// Remote Call 和 execution gate 可在不复制 active 集合的前提下引用它们。
 pub struct AddressSpace {
+    identity: usize,
+    translation_epoch: AtomicU64,
+    instruction_epoch: AtomicU64,
+    state: crate::sync::Spinlock<AddressSpaceState>,
+}
+
+static SHOOTDOWN_SELFTEST_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+struct ShootdownSelfTestCompletion;
+
+impl crate::remote_call::Completion for ShootdownSelfTestCompletion {
+    fn complete(&self) {
+        log!(
+            Memory,
+            "epoch self-test passed: active snapshot and shootdown acknowledged"
+        );
+    }
+}
+
+/// Commit 前持有 execution snapshot、全部目标槽与完成引用。
+pub(crate) struct PreparedShootdown {
+    execution: super::lifecycle::ExecutionSnapshot,
+    remote: Option<crate::remote_call::ReservedBatch>,
+    immediate: Option<Arc<dyn crate::remote_call::Completion>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareShootdownError {
+    NotRunning,
+    Busy,
+    InvalidTargets,
+    OutOfMemory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShootdownChanged;
+
+/// Commit 后唯一允许的推进：锁外敲门铃，或在目标集为空时直接完成。
+#[must_use = "committed shootdown must start synchronization after releasing business locks"]
+pub(crate) enum ShootdownSynchronization {
+    Remote(crate::remote_call::Doorbell),
+    Immediate(Arc<dyn crate::remote_call::Completion>),
+}
+
+impl ShootdownSynchronization {
+    pub(crate) fn start(self) {
+        match self {
+            Self::Remote(doorbell) => doorbell.ring(),
+            Self::Immediate(completion) => completion.complete(),
+        }
+    }
+}
+
+impl AddressSpace {
+    pub fn new() -> Result<Self, SpaceError> {
+        let identity = NEXT_ADDRESS_SPACE_ID.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            identity != 0 && identity != usize::MAX,
+            "address-space identity exhausted"
+        );
+        Ok(Self {
+            identity,
+            translation_epoch: AtomicU64::new(1),
+            instruction_epoch: AtomicU64::new(1),
+            state: crate::sync::Spinlock::new(
+                crate::sync::ranks::ADDRESS_SPACE,
+                AddressSpaceState::new()?,
+            ),
+        })
+    }
+
+    pub fn lock(&self) -> crate::sync::SpinlockGuard<'_, AddressSpaceState> {
+        self.state.lock()
+    }
+
+    pub(crate) fn epochs(&self) -> EpochSnapshot {
+        EpochSnapshot {
+            translation: self.translation_epoch.load(Ordering::Acquire),
+            instruction: self.instruction_epoch.load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn synchronize_local(&self) -> EpochSnapshot {
+        let epochs = self.epochs();
+        crate::remote_call::synchronize_local(
+            self.identity,
+            epochs.translation,
+            epochs.instruction,
+        );
+        epochs
+    }
+
+    pub(crate) fn local_is_current(&self, expected: EpochSnapshot) -> bool {
+        self.epochs() == expected
+            && crate::remote_call::local_observes(
+                self.identity,
+                expected.translation,
+                expected.instruction,
+            )
+    }
+
+    /// primordial process 首次 dispatch 的真实锁序/epoch 探针。调用点已登记 active；
+    /// 本方法不等待，当前 hart 在返回用户态前有界消费自身请求。
+    pub(crate) fn selftest_shootdown(&self, lifecycle: &super::lifecycle::Lifecycle) {
+        if SHOOTDOWN_SELFTEST_STARTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let completion: Arc<dyn crate::remote_call::Completion> =
+            Arc::try_new(ShootdownSelfTestCompletion)
+                .expect("shootdown self-test completion allocation failed");
+        let prepared = self
+            .prepare_shootdown(lifecycle, completion)
+            .expect("shootdown self-test reservation failed");
+        let (_, synchronization) = self
+            .commit_shootdown(lifecycle, prepared, 0, 1, true, |_| ())
+            .expect("shootdown self-test execution snapshot changed");
+        synchronization.start();
+        crate::remote_call::drain_current();
+    }
+
+    /// Reserve 阶段快照 active 集合并预留全部 Remote Call 槽。
+    pub(crate) fn prepare_shootdown(
+        &self,
+        lifecycle: &super::lifecycle::Lifecycle,
+        completion: Arc<dyn crate::remote_call::Completion>,
+    ) -> Result<PreparedShootdown, PrepareShootdownError> {
+        let execution = lifecycle
+            .snapshot_running()
+            .ok_or(PrepareShootdownError::NotRunning)?;
+        let active = execution.active();
+        if active == 0 {
+            return Ok(PreparedShootdown {
+                execution,
+                remote: None,
+                immediate: Some(completion),
+            });
+        }
+        let remote =
+            crate::remote_call::reserve(active, completion).map_err(|error| match error {
+                crate::remote_call::ReserveError::Busy => PrepareShootdownError::Busy,
+                crate::remote_call::ReserveError::InvalidTargets
+                | crate::remote_call::ReserveError::EmptyTargets => {
+                    PrepareShootdownError::InvalidTargets
+                }
+                crate::remote_call::ReserveError::AllocationFailed => {
+                    PrepareShootdownError::OutOfMemory
+                }
+            })?;
+        Ok(PreparedShootdown {
+            execution,
+            remote: Some(remote),
+            immediate: None,
+        })
+    }
+
+    /// 在 `ADDRESS_SPACE → LIFECYCLE → REMOTE_CALL` 锁序内完成不可失败 Publish。
+    /// stale execution snapshot 在调用 publish 前失败，Prepared 资源自动回滚。
+    pub(crate) fn commit_shootdown<R>(
+        &self,
+        lifecycle: &super::lifecycle::Lifecycle,
+        prepared: PreparedShootdown,
+        start_vpn: usize,
+        page_count: usize,
+        instruction: bool,
+        publish: impl FnOnce(&mut AddressSpaceState) -> R,
+    ) -> Result<(R, ShootdownSynchronization), ShootdownChanged> {
+        assert!(page_count != 0, "shootdown range must be nonempty");
+        let PreparedShootdown {
+            execution,
+            remote,
+            immediate,
+        } = prepared;
+        let mut state = self.state.lock();
+        lifecycle
+            .commit_if_current(execution, |active| {
+                debug_assert_eq!(active, execution.active());
+                let result = publish(&mut state);
+                let epochs = self.publish_epochs(instruction);
+                let synchronization = if let Some(remote) = remote {
+                    let request = crate::remote_call::FenceRequest::new(
+                        self.identity,
+                        epochs.translation,
+                        if instruction { epochs.instruction } else { 0 },
+                        start_vpn,
+                        page_count,
+                    );
+                    ShootdownSynchronization::Remote(remote.publish(request))
+                } else {
+                    ShootdownSynchronization::Immediate(
+                        immediate.expect("empty target shootdown must retain completion"),
+                    )
+                };
+                (result, synchronization)
+            })
+            .map_err(|_| ShootdownChanged)
+    }
+
+    fn publish_epochs(&self, instruction: bool) -> EpochSnapshot {
+        let translation = self
+            .translation_epoch
+            .fetch_add(1, Ordering::Release)
+            .checked_add(1)
+            .expect("address-space translation epoch exhausted");
+        let instruction = if instruction {
+            self.instruction_epoch
+                .fetch_add(1, Ordering::Release)
+                .checked_add(1)
+                .expect("address-space instruction epoch exhausted")
+        } else {
+            self.instruction_epoch.load(Ordering::Acquire)
+        };
+        EpochSnapshot {
+            translation,
+            instruction,
+        }
+    }
+}
+
+/// 地址空间可变状态：页表树 + 过渡 backing/布局记账。后续迁移由
+/// MemorySpace ledger/backing 逐项替换字段，稳定 identity/epoch 外壳不变。
+pub(crate) struct AddressSpaceState {
     /// REAPABLE 屏障后由 drain 最终阶段 take 释放 root；之后任何访问
     /// 都是编程错误（Building 操作准入与 active 位图已消除可达性）。
     tree: Option<TableTree<TableMem, LEVELS>>,
@@ -117,29 +366,11 @@ pub struct AddressSpace {
     pending_free: Option<FrameTracker>,
 }
 
-impl Drop for AddressSpace {
-    fn drop(&mut self) {
-        let Some(tree) = self.tree.as_mut() else {
-            return; // drain 已完成（root 已释放）：无内核顶可剥。
-        };
-        // 先剥离共享的内核顶层项（直映射 + 栈窗口）：这些子树归内核，
-        // 随后的树回收（free_subtree）只许触及用户部分。
-        // 已知简化：配对纪律靠本调用点自觉；扩展共享分区或新增 teardown
-        // 路径时收敛为 root 槽所有权登记（见 notes/impls/mm.md「Root 借用模型」）。
-        let root = tree.root_frame();
-        let (start, end, window) = mm::kernel_top_level_range();
-        tree.clear_slots(root, start, end);
-        tree.clear_slots(root, window, window + 1);
-    }
-}
-
-impl AddressSpace {
-    /// 新地址空间：建树 + 拷内核高半区顶层项（共享映射）。与 Drop
-    /// 的剥离配对：拷入什么，teardown 前必须剥掉什么。
+impl AddressSpaceState {
+    /// 新地址空间：建树后把内核高半区作为显式 shared root 槽挂接。
     pub fn new() -> Result<Self, SpaceError> {
-        let tree = TableTree::new(TableMem).map_err(|_| SpaceError::NoFrame)?;
-        // SAFETY: root 刚分配、尚未映射任何用户页。
-        unsafe { mm::install_kernel_top_level(tree.root_frame()) };
+        let mut tree = TableTree::new(TableMem).map_err(|_| SpaceError::NoFrame)?;
+        mm::install_kernel_top_level(&mut tree);
         let satp = (8usize << 60) | tree.satp_ppn();
         Ok(Self {
             tree: Some(tree),
@@ -164,6 +395,24 @@ impl AddressSpace {
         self.tree.as_mut().expect("address space tree is live")
     }
 
+    fn publish_map(
+        &mut self,
+        vpn: Vpn,
+        count: usize,
+        ppn: Ppn,
+        flags: u64,
+    ) -> Result<(), SpaceError> {
+        let prepared = self.tt().prepare_map(vpn, count, ppn, flags)?;
+        self.tt().publish(prepared);
+        Ok(())
+    }
+
+    fn publish_unmap(&mut self, vpn: Vpn, count: usize) -> Result<(), SpaceError> {
+        let prepared = self.tt().prepare_unmap(vpn, count)?;
+        self.tt().publish(prepared);
+        Ok(())
+    }
+
     #[expect(dead_code, reason = "多线程/procfs 里程碑使用")]
     pub fn brk(&self) -> usize {
         self.brk
@@ -183,8 +432,7 @@ impl AddressSpace {
         while mapped < count {
             let Some(tracker) = frame::alloc_largest(count - mapped) else {
                 for rollback in (0..mapped).rev() {
-                    self.tt()
-                        .unmap(Vpn(base_vpn + rollback), 1)
+                    self.publish_unmap(Vpn(base_vpn + rollback), 1)
                         .expect("anonymous allocation rollback cannot fail");
                 }
                 self.frames.truncate(committed);
@@ -193,19 +441,18 @@ impl AddressSpace {
             let extent_count = tracker.count();
             let extent_ppn = tracker.base().addr() / PAGE_SIZE;
             for index in 0..extent_count {
-                if let Err(error) = self.tt().map(
+                if let Err(error) = self.publish_map(
                     Vpn(base_vpn + mapped + index),
                     1,
                     Ppn(extent_ppn + index),
                     flags,
                 ) {
                     for rollback in (0..mapped + index).rev() {
-                        self.tt()
-                            .unmap(Vpn(base_vpn + rollback), 1)
+                        self.publish_unmap(Vpn(base_vpn + rollback), 1)
                             .expect("anonymous allocation rollback cannot fail");
                     }
                     self.frames.truncate(committed);
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
             mapped += extent_count;
@@ -385,8 +632,7 @@ impl AddressSpace {
             .map_err(|_| SpaceError::NoFrame)?;
         for (&vpn, &fl) in &plan {
             let tracker = frame::alloc_order(0).ok_or(SpaceError::NoFrame)?;
-            self.tt()
-                .map(Vpn(vpn), 1, Ppn(tracker.base().addr() / PAGE_SIZE), fl)?;
+            self.publish_map(Vpn(vpn), 1, Ppn(tracker.base().addr() / PAGE_SIZE), fl)?;
             pages.push((vpn, tracker.base().addr()));
             self.frames.push(tracker);
         }
@@ -479,8 +725,7 @@ impl AddressSpace {
         self.alloc_map(base, prefix_pages, flags::USER_RODATA)?;
         if let Err(error) = self.write_building(base, prefix) {
             for rollback in 0..prefix_pages {
-                self.tt()
-                    .unmap(Vpn(base_vpn + rollback), 1)
+                self.publish_unmap(Vpn(base_vpn + rollback), 1)
                     .expect("bootstrap prefix rollback cannot fail");
             }
             self.frames.truncate(committed);
@@ -489,20 +734,18 @@ impl AddressSpace {
 
         if payload_pages > 0 {
             for index in 0..payload_pages {
-                if let Err(error) = self.tt().map(
+                if let Err(error) = self.publish_map(
                     Vpn(base_vpn + prefix_pages + index),
                     1,
                     Ppn(payload_pa / PAGE_SIZE + index),
                     flags::USER_RODATA,
                 ) {
                     for rollback in (0..index).rev() {
-                        self.tt()
-                            .unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
+                        self.publish_unmap(Vpn(base_vpn + prefix_pages + rollback), 1)
                             .expect("bootstrap payload rollback cannot fail");
                     }
                     for rollback in 0..prefix_pages {
-                        self.tt()
-                            .unmap(Vpn(base_vpn + rollback), 1)
+                        self.publish_unmap(Vpn(base_vpn + rollback), 1)
                             .expect("bootstrap prefix rollback cannot fail");
                     }
                     self.frames.truncate(committed);
@@ -545,8 +788,7 @@ impl AddressSpace {
             if let Err(e) = self.alloc_map(self.brk + i * PAGE_SIZE, 1, flags::USER_DATA) {
                 // 回滚：撤销本次已映页（帧随 FrameTracker 归还帧池），brk 不动。
                 for j in (0..i).rev() {
-                    self.tt()
-                        .unmap(Vpn(base_vpn_v + j), 1)
+                    self.publish_unmap(Vpn(base_vpn_v + j), 1)
                         .expect("single-page heap rollback cannot fail");
                 }
                 self.frames.truncate(committed);
@@ -593,7 +835,7 @@ impl AddressSpace {
     }
 }
 
-impl AddressSpace {
+impl AddressSpaceState {
     /// 查询单页物理地址（跨地址空间完成路径用，见 [`crate::uaccess`]）；
     /// 页必须已映射。仅取地址，权限校验仍由 check_range 承担。
     pub(crate) fn page_pa(&mut self, va: usize) -> Option<usize> {
@@ -616,7 +858,7 @@ impl AddressSpace {
         self.external_mappings
             .try_reserve(1)
             .map_err(|_| SpaceError::NoFrame)?;
-        self.tt().map(
+        self.publish_map(
             Vpn(va / PAGE_SIZE),
             1,
             Ppn(pa / PAGE_SIZE),
@@ -638,8 +880,7 @@ impl AddressSpace {
             return;
         };
         self.external_mappings.swap_remove(index);
-        self.tt()
-            .unmap(Vpn(va / PAGE_SIZE), 1)
+        self.publish_unmap(Vpn(va / PAGE_SIZE), 1)
             .expect("single-page external unmap cannot fail");
         // SAFETY: 同 map_external。
         unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
@@ -734,10 +975,9 @@ impl AddressSpace {
                     self.pending_free = None;
                 }
                 DrainStage::Tables { root, l1 } => {
-                    let (kernel_start, _kernel_end, _window) = mm::kernel_top_level_range();
                     let mut root_slot = root;
                     let mut l1_slot = l1;
-                    while root_slot < kernel_start {
+                    while root_slot < page_table::ENTRIES {
                         if work >= budget {
                             self.drain_stage = DrainStage::Tables {
                                 root: root_slot,
@@ -745,29 +985,32 @@ impl AddressSpace {
                             };
                             return (work, false);
                         }
-                        // 读一个 root 槽（独立作用域，不跨 pending 步进持借用）。
-                        let slot_frame = {
-                            let Some(tree) = self.tree.as_mut() else {
-                                unreachable!("tree exists until Root stage completes")
-                            };
-                            let top = tree.root_frame();
-                            let entry = tree.mem_mut().table_mut(top)[root_slot];
-                            if !entry.is_valid() {
-                                None
-                            } else {
-                                debug_assert!(
-                                    entry.is_branch(),
-                                    "user top-level entries are always branches"
-                                );
-                                Some(entry.next_frame())
+
+                        let root_state = self
+                            .tree
+                            .as_mut()
+                            .expect("tree exists until Root stage completes")
+                            .root_slot_state(root_slot);
+                        let l1_frame = match root_state {
+                            RootSlotState::Shared | RootSlotState::Empty => {
+                                root_slot += 1;
+                                l1_slot = 0;
+                                work += 1;
+                                continue;
                             }
+                            RootSlotState::Leaf => {
+                                self.tree
+                                    .as_mut()
+                                    .expect("tree exists until Root stage completes")
+                                    .detach_root_slot(root_slot);
+                                root_slot += 1;
+                                l1_slot = 0;
+                                work += 1;
+                                continue;
+                            }
+                            RootSlotState::Branch(frame) => frame,
                         };
-                        let Some(l1_frame) = slot_frame else {
-                            root_slot += 1;
-                            l1_slot = 0;
-                            work += 1;
-                            continue;
-                        };
+
                         while l1_slot < page_table::ENTRIES {
                             if work >= budget {
                                 self.drain_stage = DrainStage::Tables {
@@ -776,18 +1019,18 @@ impl AddressSpace {
                                 };
                                 return (work, false);
                             }
-                            let branch_frame = {
-                                let Some(tree) = self.tree.as_mut() else {
-                                    unreachable!("tree exists until Root stage completes")
-                                };
-                                let entry = tree.mem_mut().table_mut(l1_frame)[l1_slot];
-                                if entry.is_branch() {
-                                    tree.mem_mut().table_mut(l1_frame)[l1_slot] =
-                                        page_table::Pte::invalid();
-                                    Some(entry.next_frame())
-                                } else {
-                                    None
-                                }
+                            let state = self
+                                .tree
+                                .as_mut()
+                                .expect("tree exists until Root stage completes")
+                                .slot_state(l1_frame, l1_slot);
+                            let branch_frame = match state {
+                                SlotState::Branch(_) => self
+                                    .tree
+                                    .as_mut()
+                                    .expect("tree exists until Root stage completes")
+                                    .detach_branch(l1_frame, l1_slot),
+                                SlotState::Empty | SlotState::Leaf => None,
                             };
                             l1_slot += 1;
                             work += 1;
@@ -805,10 +1048,7 @@ impl AddressSpace {
                                 self.pending_free = None;
                             }
                         }
-                        // L1 的全部 L0 已登记后，清 root 槽是独立 work
-                        // unit。随即把 L1 帧登记为 pending free；若预算恰在
-                        // 清槽后耗尽，下一批先推进该 pending，不会在这里
-                        // More + 0 停滞。
+
                         if work >= budget {
                             self.drain_stage = DrainStage::Tables {
                                 root: root_slot,
@@ -816,13 +1056,16 @@ impl AddressSpace {
                             };
                             return (work, false);
                         }
-                        {
-                            let Some(tree) = self.tree.as_mut() else {
-                                unreachable!("tree exists until Root stage completes")
-                            };
-                            let top = tree.root_frame();
-                            tree.mem_mut().table_mut(top)[root_slot] = page_table::Pte::invalid();
-                        }
+                        let detached = self
+                            .tree
+                            .as_mut()
+                            .expect("tree exists until Root stage completes")
+                            .detach_root_slot(root_slot);
+                        assert_eq!(
+                            detached,
+                            Some(l1_frame),
+                            "root branch changed during address-space drain"
+                        );
                         root_slot += 1;
                         l1_slot = 0;
                         work += 1;
@@ -841,38 +1084,24 @@ impl AddressSpace {
                     self.drain_stage = DrainStage::Root { slot: 0 };
                 }
                 DrainStage::Root { slot } => {
-                    let (kernel_start, kernel_end, window) = mm::kernel_top_level_range();
                     let mut slot = slot;
                     while slot < page_table::ENTRIES {
                         if work >= budget {
                             self.drain_stage = DrainStage::Root { slot };
                             return (work, false);
                         }
-                        {
-                            let Some(tree) = self.tree.as_mut() else {
-                                unreachable!("tree exists until Root stage completes")
-                            };
-                            let top = tree.root_frame();
-                            let table = tree.mem_mut().table_mut(top);
-                            let shared =
-                                slot >= kernel_start && slot < kernel_end || slot == window;
-                            if shared {
-                                // 剥离内核共享顶层项（子树归内核；与新建时的拷入配对）。
-                                table[slot] = page_table::Pte::invalid();
-                            } else {
-                                debug_assert!(
-                                    !table[slot].is_valid(),
-                                    "user subtree outlives Tables stage"
-                                );
-                            }
-                        }
+                        let state = self
+                            .tree
+                            .as_mut()
+                            .expect("tree exists until Root stage completes")
+                            .root_slot_state(slot);
+                        assert!(
+                            matches!(state, RootSlotState::Empty | RootSlotState::Shared),
+                            "owned subtree outlives Tables stage"
+                        );
                         slot += 1;
                         work += 1;
                     }
-                    // 全部 512 槽已验证/剥离：交出 root 帧并转 RootFree
-                    // （TableTree::Drop 的递归扫描被绕过——子表已全部释放；
-                    // 预算中断后重入不再触碰 tree）。leak + 首次归还步
-                    // 预先检查预算。
                     if work + 1 > budget {
                         self.drain_stage = DrainStage::Root { slot };
                         return (work, false);
@@ -881,7 +1110,7 @@ impl AddressSpace {
                         .tree
                         .take()
                         .expect("tree exists until Root stage completes");
-                    self.enqueue_table_frame(tree.leak_root());
+                    self.enqueue_table_frame(tree.finish_drain());
                     self.drain_stage = DrainStage::RootFree;
                     let (used, done) = self.step_pending(budget - work);
                     work += used;
@@ -923,7 +1152,7 @@ pub struct Process {
     pub parent: Pid,
     /// 创建域仅维持归属（weak；生命周期根是 Job 直接成员表）。
     job: alloc::sync::Weak<super::job::Job>,
-    pub space: crate::sync::Spinlock<AddressSpace>,
+    pub space: AddressSpace,
     /// 新对象 ABI 的进程本地 Handle 表。
     pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
     /// 生命周期状态机（顶级锁，见 lifecycle 模块锁序契约）。
@@ -967,10 +1196,7 @@ impl Process {
             pid,
             parent,
             job,
-            space: crate::sync::Spinlock::new(
-                crate::sync::ranks::ADDRESS_SPACE,
-                AddressSpace::new()?,
-            ),
+            space: AddressSpace::new()?,
             handles: crate::sync::Spinlock::chained(
                 crate::sync::ranks::HANDLE_TABLE,
                 pid,
@@ -1107,7 +1333,7 @@ impl Process {
     /// 回调锁外执行，仍可用地址空间解除外部映射），后 AddressSpace。
     /// work unit 诚实计费：Handle 表每个扫描槽位（含空槽，take_next_bounded
     /// 硬性限制本次扫描量）与每次 close 各 1；地址空间部分见
-    /// [`AddressSpace::drain`]。返回 (work_done, complete)。
+    /// [`AddressSpaceState::drain`]。返回 (work_done, complete)。
     pub(crate) fn drain_batch(&self, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
         let mut work = 0;

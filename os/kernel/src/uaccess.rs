@@ -12,7 +12,7 @@
 //! 统一走 [`deliver_output`]（冻结 store-access 终因并杀调用进程）。
 
 use crate::mm::SumGuard;
-use crate::task::proc::{AddressSpace, PAGE_SIZE};
+use crate::task::proc::{AddressSpaceState, PAGE_SIZE};
 use crate::task::Thread;
 
 /// 单次访问上限（防恶意长度；Debug 消息与初期 IPC 载荷远小于此）。
@@ -42,7 +42,7 @@ impl From<AccessError> for erhino_shared::call::SystemCallError {
 
 /// 从用户内存拷入内核（src 为用户 VA，dst 为内核缓冲）。
 pub fn copy_from_user(
-    space: &mut AddressSpace,
+    space: &mut AddressSpaceState,
     dst: &mut [u8],
     src: usize,
 ) -> Result<(), AccessError> {
@@ -65,7 +65,7 @@ pub fn copy_from_user(
 /// # Safety
 /// `T` 必须是纯整数/整数 newtype 组成的 ABI 类型；任何字节组合都必须有效。
 pub unsafe fn read_user_value<T: Copy>(
-    space: &mut AddressSpace,
+    space: &mut AddressSpaceState,
     src: usize,
 ) -> Result<T, AccessError> {
     let mut value = core::mem::MaybeUninit::<T>::uninit();
@@ -83,7 +83,7 @@ pub unsafe fn read_user_value<T: Copy>(
 /// # Safety
 /// `T` 的对象表示不得包含 padding 或其它未初始化字节。
 pub unsafe fn write_user_value<T: Copy>(
-    space: &mut AddressSpace,
+    space: &mut AddressSpaceState,
     dst: usize,
     value: &T,
 ) -> Result<(), AccessError> {
@@ -109,7 +109,7 @@ pub unsafe fn write_user_value<T: Copy>(
 /// [`write_user_value`]）。
 pub unsafe fn deliver_output<T: Copy>(
     thread: &Thread,
-    space: &mut AddressSpace,
+    space: &mut AddressSpaceState,
     dst: usize,
     value: &T,
 ) -> Result<(), erhino_shared::call::SystemCallError> {
@@ -128,7 +128,7 @@ pub unsafe fn deliver_output<T: Copy>(
 
 /// 从内核拷入用户内存（dst 为用户 VA，src 为内核缓冲）。
 pub fn copy_to_user(
-    space: &mut AddressSpace,
+    space: &mut AddressSpaceState,
     dst: usize,
     src: &[u8],
 ) -> Result<(), AccessError> {
@@ -149,7 +149,7 @@ pub fn copy_to_user(
 /// 异核唤醒路径，SUM 直访不可用），逐页 translate 后经直映射写入。
 /// 校验与拷贝同持 `space` 锁，无 TOCTOU；页间边界由逐页循环消除。
 pub fn put_user_indirect(
-    space: &mut AddressSpace,
+    space: &mut AddressSpaceState,
     dst: usize,
     src: &[u8],
 ) -> Result<(), AccessError> {

@@ -15,9 +15,9 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use page_table::{FrameNumber, PAGE_BITS, Ppn, Pte, flags, ENTRIES};
-use stack_layout::StackWindowLayout;
+use page_table::{ENTRIES, FrameMemory, FrameNumber, PAGE_BITS, Ppn, Pte, TableTree, flags};
 use stack_layout::PAGE_SIZE;
+use stack_layout::StackWindowLayout;
 
 use crate::{board::BoardInfo, external};
 
@@ -117,7 +117,9 @@ struct WindowTables(UnsafeCell<[[Pte; ENTRIES]; 1 + WINDOW_LEAF_MAX]>);
 // SAFETY: 同 KERNEL_PG_DIR。
 unsafe impl Sync for WindowTables {}
 
-static WINDOW_TABLES: WindowTables = WindowTables(UnsafeCell::new([[Pte::invalid(); ENTRIES]; 1 + WINDOW_LEAF_MAX]));
+static WINDOW_TABLES: WindowTables = WindowTables(UnsafeCell::new(
+    [[Pte::invalid(); ENTRIES]; 1 + WINDOW_LEAF_MAX],
+));
 
 /// 正式内核 satp 值（init 发布、`kernel_satp()` 消费填 record；
 /// trap 汇编非 Resume 出口经 sym 符号直接装载切回）。
@@ -136,33 +138,24 @@ pub fn direct_slots() -> usize {
     DIRECT_SLOT_COUNT.load(Ordering::Relaxed)
 }
 
-/// 用户 root 中归内核所有的顶层槽区间（直映射区 + 栈窗口），
-/// 与拷贝范围严格对应；剥离用。
-pub fn kernel_top_level_range() -> (usize, usize, usize) {
-    // (direct_start, direct_end, window_slot)
+/// 把内核高半区顶层项作为 shared 槽挂入用户表 root。共享所有权登记与
+/// PTE 安装由 `TableTree` 同时完成，teardown 不再依赖地址区间配对。
+pub fn install_kernel_top_level<M: FrameMemory, const LEVELS: usize>(
+    tree: &mut TableTree<M, LEVELS>,
+) {
+    // SAFETY: 内核页表在 mm::init 后只读；进程只复制顶层 PTE 值。
+    let source = unsafe { &*KERNEL_PG_DIR.0.get() };
     let slots = direct_slots();
-    (DIRECT_VPN2_BASE, DIRECT_VPN2_BASE + slots, STACK_WINDOW_SLOT)
-}
-
-/// 把内核高半区顶层项拷进用户表 root：用户表创建后立即调用，
-/// 此后任意用户 satp 下内核代码恒可执行（共享映射，见 notes/impls/internals.md）。
-/// 配对纪律：进程 teardown 前必须先 `detach_kernel_top_level` 剥离，
-/// 否则树回收会把内核共享子表当用户页表拆掉。
-///
-/// # Safety
-/// `root` 必须是刚分配、尚未映射任何用户页的页表 root 帧。
-pub unsafe fn install_kernel_top_level(root: page_table::FrameNumber) {
-    // SAFETY: 静态表 init 后只读；目标 root 帧刚分配归调用方。
-    let src = unsafe { &*KERNEL_PG_DIR.0.get() };
-    let dst = unsafe {
-        &mut *(phys_to_virt(root.addr()) as *mut [Pte; ENTRIES])
-    };
-    let slots = direct_slots();
-    dst[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots]
-        .copy_from_slice(&src[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots]);
-    // 栈窗口槽同样共享：trap 在用户 satp 下即取调度栈指针（无 U 位，
-    // 用户态不可访问）。子表 init 后只读，跨地址空间共享安全。
-    dst[STACK_WINDOW_SLOT] = src[STACK_WINDOW_SLOT];
+    tree.attach_shared_root(
+        DIRECT_VPN2_BASE,
+        &source[DIRECT_VPN2_BASE..DIRECT_VPN2_BASE + slots],
+    )
+    .expect("kernel direct-map root slots must be empty");
+    tree.attach_shared_root(
+        STACK_WINDOW_SLOT,
+        &source[STACK_WINDOW_SLOT..STACK_WINDOW_SLOT + 1],
+    )
+    .expect("kernel stack-window root slot must be empty");
 }
 
 pub fn init(board: &BoardInfo) {
@@ -183,8 +176,7 @@ pub fn init(board: &BoardInfo) {
     for slot in 0..slots {
         // SAFETY: 同上，独占写静态表。
         unsafe {
-            (*dir)[DIRECT_VPN2_BASE + slot] =
-                Pte::leaf(Ppn(slot << 18), flags::KERNEL_DIRECT);
+            (*dir)[DIRECT_VPN2_BASE + slot] = Pte::leaf(Ppn(slot << 18), flags::KERNEL_DIRECT);
         }
     }
 
@@ -193,7 +185,9 @@ pub fn init(board: &BoardInfo) {
     map_stack_window();
 
     let layout = stack_layout();
-    STACK_PA_RANGE.0.store(layout.phys_base(), Ordering::Relaxed);
+    STACK_PA_RANGE
+        .0
+        .store(layout.phys_base(), Ordering::Relaxed);
     STACK_PA_RANGE.1.store(
         layout.phys_base() + layout.stack_size() * layout.slots(),
         Ordering::Relaxed,
@@ -244,7 +238,7 @@ fn map_stack_window() {
 
         for unit in 0..layout.span().div_ceil(MIDDLE_SPAN) {
             middle[unit] = Pte::branch(FrameNumber::from_addr(virt_to_phys(
-                leaves[unit].as_ptr() as usize,
+                leaves[unit].as_ptr() as usize
             )));
         }
         for slot in 0..layout.slots() {
@@ -255,8 +249,9 @@ fn map_stack_window() {
                 leaves[unit][idx] = Pte::leaf(Ppn(pa >> PAGE_BITS), flags::KERNEL_STACK);
             }
         }
-        (*KERNEL_PG_DIR.0.get())[STACK_WINDOW_SLOT] =
-            Pte::branch(FrameNumber::from_addr(virt_to_phys(middle.as_ptr() as usize)));
+        (*KERNEL_PG_DIR.0.get())[STACK_WINDOW_SLOT] = Pte::branch(FrameNumber::from_addr(
+            virt_to_phys(middle.as_ptr() as usize),
+        ));
     }
 
     log!(
