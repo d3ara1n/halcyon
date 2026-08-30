@@ -739,7 +739,7 @@ fn start_staged(
         .lock()
         .commit_pinned_consume(pin_token, builder_handle);
     builder.consume();
-    super::handle::close_entry(builder_entry, &thread.process, false);
+    super::handle::close_entry_infallible(builder_entry, &thread.process, false);
     crate::sched::commit_ready_batch(ready_batch, staged);
     Ok(())
 }
@@ -962,5 +962,6 @@ fn map_space_error(error: SpaceError) -> SystemCallError {
         SpaceError::NoFrame => SystemCallError::OutOfMemory,
         SpaceError::BadSegment => SystemCallError::IllegalArgument,
         SpaceError::Conflict => SystemCallError::InvalidAddress,
+        SpaceError::Busy => SystemCallError::ObjectBusy,
     }
 }

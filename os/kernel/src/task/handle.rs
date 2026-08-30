@@ -63,10 +63,36 @@ pub fn entry_with_badge(
     Ok(Entry::new_with_badge(object, role, rights, badge))
 }
 
+pub enum HandleCloseStart {
+    Ready,
+    Wait(super::wait::WaitPlan),
+}
+
 /// 表项已从 HandleTable 摘除且表锁已释放；现在执行对象生命周期动作。
-pub fn close_entry(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
+/// Tunnel Endpoint 的 lease close 可在 Commit 前失败，此时原样返还 detached entry。
+pub fn close_entry(
+    entry: ProcessHandleEntry,
+    owner: &Process,
+    exiting: bool,
+) -> Result<(), ProcessHandleEntry> {
+    if entry.object().kind() == super::object::ObjectKind::TunnelEndpoint {
+        assert!(exiting, "explicit Tunnel Endpoint close must use its transaction path");
+        return super::tunnel::close_detached(entry, owner);
+    }
     let (object, role, _, _) = entry.into_parts();
     object.close_handle(role, owner, exiting);
+    Ok(())
+}
+
+pub fn close_entry_infallible(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
+    assert!(
+        entry.object().kind() != super::object::ObjectKind::TunnelEndpoint,
+        "Tunnel Endpoint must close through its lease transaction"
+    );
+    assert!(
+        close_entry(entry, owner, exiting).is_ok(),
+        "non-Tunnel close cannot require retry"
+    );
 }
 
 pub fn close_transit(entry: ProcessHandleEntry) {
@@ -74,10 +100,21 @@ pub fn close_transit(entry: ProcessHandleEntry) {
     object.close_transit(role);
 }
 
-pub fn close(thread: &super::Thread, handle: Handle) -> Result<(), SystemCallError> {
+pub fn close(
+    thread: &super::Thread,
+    handle: Handle,
+) -> Result<HandleCloseStart, SystemCallError> {
+    let tunnel = {
+        let table = thread.process.handles.lock();
+        let entry = table.get(handle, Rights::NONE).map_err(map_error)?;
+        entry.object().kind() == super::object::ObjectKind::TunnelEndpoint
+    };
+    if tunnel {
+        return super::tunnel::close_handle(thread, handle).map(HandleCloseStart::Wait);
+    }
     let entry = thread.process.handles.lock().remove(handle).map_err(map_error)?;
-    close_entry(entry, &thread.process, false);
-    Ok(())
+    close_entry_infallible(entry, &thread.process, false);
+    Ok(HandleCloseStart::Ready)
 }
 
 pub fn duplicate(

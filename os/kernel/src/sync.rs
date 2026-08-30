@@ -49,6 +49,8 @@ pub mod ranks {
     pub const MAILBOX: Rank = Rank(210);
     /// Tunnel Connection 状态锁。
     pub const CONNECTION: Rank = Rank(220);
+    /// MemoryObject 可执行状态与 affine WritePermit 账目。
+    pub const MEMORY_OBJECT: Rank = Rank(250);
     /// 用户地址空间（页表树/帧/外部映射/drain 阶段）。
     pub const ADDRESS_SPACE: Rank = Rank(300);
     /// Notification 状态锁（唯一以 space 为外层的对象锁边）。
@@ -148,7 +150,7 @@ pub(crate) mod ladder {
 
     /// 压栈并断言：新秩须大于栈顶，或同秩且双方链段 key 非零并严格
     /// 递增（链式锁沿创建序向下获取）。
-    pub fn push(rank: Rank, key: u64) {
+    pub fn push(rank: Rank, key: u64, caller: Option<&core::panic::Location<'_>>) {
         let f = frame();
         let depth = f.depth.get();
         assert!(depth < DEPTH, "lock ladder overflow");
@@ -159,8 +161,7 @@ pub(crate) mod ladder {
             let chained = key != 0 && top_key != 0 && key > top_key;
             assert!(
                 rank > top || (rank == top && chained),
-                "lock-order violation: acquiring rank {rank:?} (key {key}) \
-                 under rank {top:?} (key {top_key})",
+                "lock-order violation: acquiring rank {rank:?} (key {key}) under rank {top:?} (key {top_key}); requested at {caller:?}",
             );
         }
         ranks[depth] = rank;
@@ -185,7 +186,7 @@ pub(crate) mod ladder {
     pub fn mark_tp_ready() {}
 
     #[inline(always)]
-    pub fn push(_rank: Rank, _key: u64) {}
+    pub fn push(_rank: Rank, _key: u64, _caller: Option<&core::panic::Location<'_>>) {}
 
     #[inline(always)]
     pub fn pop() {}
@@ -289,13 +290,13 @@ unsafe impl<const RANK: u32> lock_api::RawMutex for RankedRawSpinlock<RANK> {
     #[inline]
     fn lock(&self) {
         self.raw.acquire();
-        ladder::push(Rank(RANK), 0);
+        ladder::push(Rank(RANK), 0, None);
     }
 
     #[inline]
     fn try_lock(&self) -> bool {
         if self.raw.try_lock() {
-            ladder::push(Rank(RANK), 0);
+            ladder::push(Rank(RANK), 0, None);
             true
         } else {
             false
@@ -357,18 +358,28 @@ impl<T> Spinlock<T> {
     }
 
     /// 获取锁：关本地中断后自旋等待，成功即压入 ladder。
+    #[track_caller]
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
         let state = disable_interrupts();
         self.raw.acquire();
-        ladder::push(self.rank, self.chain_key);
+        ladder::push(
+            self.rank,
+            self.chain_key,
+            Some(core::panic::Location::caller()),
+        );
         SpinlockGuard { lock: self, state }
     }
 
     /// 尝试获取锁，失败返回 `None`（同样关中断，drop 时恢复）。
+    #[track_caller]
     pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
         let state = disable_interrupts();
         if self.raw.try_lock() {
-            ladder::push(self.rank, self.chain_key);
+            ladder::push(
+                self.rank,
+                self.chain_key,
+                Some(core::panic::Location::caller()),
+            );
             Some(SpinlockGuard { lock: self, state })
         } else {
             restore_interrupts(state);

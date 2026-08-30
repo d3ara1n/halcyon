@@ -483,6 +483,16 @@ impl PreparedChange {
         self.plan.result_layout
     }
 
+    /// Map reservation 中 usable mapping 的稳定 fragment 身份。guard 不计入；
+    /// 非 Map 事务返回 None。
+    pub fn mapped_region_key(&self) -> Option<RegionKey> {
+        let usable = self.plan.result_layout?.usable;
+        self.plan.replacements.iter().find_map(|region| {
+            (region.range == usable && matches!(region.kind, RegionKind::Mapping { .. }))
+                .then_some(region.key)
+        })
+    }
+
     pub fn translation_intents(&self) -> &[TranslationIntent] {
         &self.plan.translations
     }

@@ -146,7 +146,7 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得过渡表，按�
 
 ## 用户地址空间
 
-`Process.space` 是稳定 `AddressSpace` 外壳：单调不复用的 identity、translation/instruction epoch 和内部 `AddressSpaceState` 锁分离。state 内的 `MemorySpace` ledger 是已迁移区域的 VA 真值；`OwnedBacking` 以 `BackingId + logical page offset` 持有一个或多个 affine `FrameTracker` extent，PTE 只是投影。Remote Call 只引用外壳身份与 epoch。Running 变更在 Commit 前快照 lifecycle execution gate，准备 planner/backing/PTE/WaitContext 和全部目标槽；Commit 在 `ADDRESS_SPACE → LIFECYCLE` 下复检 active sequence、发布 ledger/PTE/epoch 并登记 mandatory operation，锁外敲门铃；最后 ack 后才 Synchronize→Retire→Complete。
+`Process.space` 是稳定 `AddressSpace` 外壳：单调不复用的 identity、translation/instruction epoch 和内部 `AddressSpaceState` 锁分离。state 内的 `MemorySpace` ledger 是全部用户区域的 VA 真值；anonymous 区域由 `OwnedBacking(BackingId + logical page offset + affine FrameTracker extents)` 持有，Tunnel 区域由 `ObjectView(ObjectId + LeaseKey + RegionKey + PageRange)` 引用 Connection 的固定 backing，PTE 只是投影。Remote Call 只引用外壳身份与 epoch。Running 变更在 Commit 前快照 lifecycle execution gate，准备 planner/backing 或 WritePermit/PTE/WaitContext 和全部目标槽；Commit 在 `ADDRESS_SPACE → LIFECYCLE` 下复检 active sequence、发布 ledger/PTE/epoch 并登记 mandatory operation，锁外敲门铃；最后 ack 后才 Synchronize→Retire→Complete。
 
 低半区 `[0, 2^38)` 完全归用户；进程 root 创建时通过 `attach_shared_root` 挂入内核高半区顶层项（含栈窗口槽），PTE 安装与 shared 位登记同一调用完成。当前区间：
 
@@ -164,7 +164,7 @@ brk 在 launch 时越过 init bootstrap 出生块；Extend 仍提供既有 sbrk 
 - bootstrap StartupBlock prefix 是 owned backing；opaque payload 页映入 init 时收编进同一个 backing（启动保留洞的帧首次入账），地址空间销毁时随 extent 归还帧池；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap 只服务 Building process，创建 anonymous zero pages 并使用最终权限，拒绝 write-only/W+X；ProcessWrite 经已发布 PTE 的物理直映射回填 backing，Running 发布后不再存在该写入口；
 - ProcessDrain 先逐区域清空 ledger，再逐 extent 归还 backings，最后收束页表。lifecycle 的 mandatory operation 屏障保证 REAPABLE 前无在途 `PublishedChange`；
-- Tunnel 当前仍由 Endpoint lease 记入 `AddressSpace.external_mappings` 并按 VA 解除，是统一 ObjectView/lease 迁移前唯一保留的旧映射路径。
+- TunnelCreate/Attach 使用内部 MemoryObject view 建立 lease-owned RW mapping；每个 reserved/published/retiring writable view 持一个 affine WritePermit。MemoryObject state 与 Connection side state 分锁，permit 在进入 AddressSpace 前移出对象锁，Retire 也在 AddressSpace 锁外归还。Create/Attach 与显式 Endpoint HandleClose 都使用预构造 WaitContext 和 mandatory Remote completion；Close 先提交 ledger/PTE Unmap，远端确认后才 Retire permit、发布 CLOSED/PEER_CLOSED 并完成 syscall。Terminating 进程 active 已归零，ProcessDrain 仍走同一 planner→PTE→Retire 顺序；若 detached close 与在途 transaction 冲突，entry 原样留在 `pending_close` 供下一批重试。旧 `external_mappings`、按 VA 搜索、本地 `sfence.vma` 与 Drop 隐式解除已删除。
 
 ## 架构边界
 

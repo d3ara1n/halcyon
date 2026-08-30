@@ -268,10 +268,20 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
             Outcome::Completed
         }
-        SystemCall::HandleClose => {
-            respond_result(frame, handle::close(thread, Handle::from_raw(frame.x[10])).map(|_| 0));
-            Outcome::Completed
-        }
+        SystemCall::HandleClose => match handle::close(thread, Handle::from_raw(frame.x[10])) {
+            Ok(handle::HandleCloseStart::Ready) => {
+                respond_ok(frame, 0);
+                Outcome::Completed
+            }
+            Ok(handle::HandleCloseStart::Wait(plan)) => {
+                sched::park_request_wait(plan);
+                Outcome::Wait
+            }
+            Err(error) => {
+                respond_error(frame, error);
+                Outcome::Completed
+            }
+        },
         SystemCall::HandleDuplicate => {
             respond_result(
                 frame,
@@ -426,24 +436,33 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::TunnelCreate => {
-            respond_result(
-                frame,
-                crate::task::tunnel::create(thread, a0, frame.x[11] as usize).map(|_| 0),
-            );
-            Outcome::Completed
+            match crate::task::tunnel::create(thread, a0, frame.x[11] as usize) {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
         }
         SystemCall::TunnelAttach => {
-            respond_result(
-                frame,
-                crate::task::tunnel::attach(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
-                    frame.x[12] as usize,
-                )
-                .map(|_| 0),
-            );
-            Outcome::Completed
+            match crate::task::tunnel::attach(
+                thread,
+                Handle::from_raw(frame.x[10]),
+                frame.x[11] as usize,
+                frame.x[12] as usize,
+            ) {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
         }
         SystemCall::TunnelNotify => {
             respond_result(

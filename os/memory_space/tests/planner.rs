@@ -688,8 +688,15 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
         .unwrap();
     let permits = object.reserve_writes(1).unwrap();
     let prepared = space.reserve(validated, permits).unwrap();
+    let region_key = prepared
+        .mapped_region_key()
+        .expect("object Map must publish one usable region identity");
     complete_prepared(&mut space, prepared);
     assert_eq!(object.permit_count(), 1);
+    assert!(
+        space.regions().any(|region| region.key == region_key),
+        "prepared region identity must survive Commit"
+    );
     assert_eq!(object.seal(Some(77)).unwrap(), SealOutcome::Waiting);
     assert_eq!(object.state(), ExecutableState::Sealing);
     assert_eq!(object.reserve_writes(1), Err(ObjectError::PermitDenied));

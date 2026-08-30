@@ -6,7 +6,7 @@
 //! 栈与内部位图均按 slot 索引；拓扑（cpu-map）只服务 affinity/电源策略，
 //! 不推断能力、不参与 slot 分配。SBI 边界显式转换回 raw hartid。
 
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::board::HartCapabilities;
 
@@ -204,12 +204,20 @@ impl HartRegistry {
 use crate::sync::Spinlock;
 
 static REGISTRY: Spinlock<Option<HartRegistry>> = Spinlock::new(crate::sync::ranks::LEAF, None);
+/// 安装后不可变的 admitted slot 位图，供业务事务无锁验证 Remote Call 目标。
+static ADMITTED_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// boot 构造完成后安装（只能发生一次）。
 pub fn install(registry: HartRegistry) {
+    let admitted = registry.admitted_mask();
     let mut guard = REGISTRY.lock();
     assert!(guard.is_none(), "registry already installed");
     *guard = Some(registry);
+    assert_eq!(
+        ADMITTED_MASK.swap(admitted, Ordering::Release),
+        0,
+        "admitted mask already published"
+    );
 }
 
 /// 访问注册表（未安装即 panic——调用时序违约）。
@@ -218,7 +226,9 @@ pub fn with_registry<R>(f: impl FnOnce(&HartRegistry) -> R) -> R {
 }
 
 pub fn admitted_mask() -> u64 {
-    with_registry(HartRegistry::admitted_mask)
+    let admitted = ADMITTED_MASK.load(Ordering::Acquire);
+    assert!(admitted != 0, "registry not initialized");
+    admitted
 }
 
 /// 把 slot 位图展开为 raw hartid 并逐个发送 IPI

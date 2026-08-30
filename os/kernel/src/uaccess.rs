@@ -97,8 +97,8 @@ pub unsafe fn write_user_value<T: Copy>(
 /// 交付 syscall 输出：写回当次复检，失败即冻结 (Fault, StoreAccess)
 /// 终止调用进程。
 ///
-/// 复检失败唯一成因是同进程线程在两次 space 锁之间拆除了输出页
-/// （HandleClose → unmap_external）——等价于一次由内核代为检出的
+/// 复检失败唯一成因是同进程线程在两次 space 锁之间经另一笔地址空间
+/// 事务拆除了输出页——等价于一次由内核代为检出的
 /// store access fault：用户可触发的 fault 杀进程，绝不 panic 内核；
 /// 副作用已发生的歧义由进程死亡清理兑底。调用方把 Err 向上传播
 /// 即可，分发出口的终止检查会把 Completed 改写为 Killed，线程不

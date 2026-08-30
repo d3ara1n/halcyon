@@ -135,13 +135,15 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   线程全部离场但 Remote completion 尚未收束时不会提前发布。
   任何容器路径都只到达 REAPABLE；Dead
   仅由 ProcessDrain 的 Complete 分支发布。HandleTable 先逐槽扫描摘项
-  （take_next_bounded 硬预算），扫描与 close callback 各计一个 work unit；预算恰在
-  摘项后耗尽时，entry 存入 Process `pending_close`，下一批优先在表锁外关闭。因而
-  任意非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 先逐 fragment
+  （take_next_bounded 硬预算），扫描与 close 各计一个 work unit；预算恰在
+  摘项后耗尽，或 Tunnel detached close 因在途 MemoryChange 暂时 Busy 时，entry
+  存入 Process `pending_close`，下一批优先在表锁外重试；除 Busy 重试外，任意
+  非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 先逐 fragment
   丢弃不可达 ledger，再逐 extent 从 `OwnedBacking` 摘下并经 `pending_free` 归还
   order 树；随后按 owned/shared 槽真值收束 L0/L1 与 root 表帧。预算分别计费
-  ledger fragment、extent 摘取/归还与页表槽检查/摘除；单次 order 树操作另有只
-  依赖地址位宽与 DT memory region 上限的结构常数界，批次执行量受 budget 线性约束。
+  close 尝试、ledger fragment、extent 摘取/归还与页表槽检查/摘除；单次 order
+  树操作另有只依赖地址位宽与 DT memory region 上限的结构常数界，批次执行量
+  受 budget 线性约束。
   完成时发布序固定：shell 先冻结终态快照并置 CLOSED（原子清 REAPABLE，外部无
   Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
   空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存
@@ -164,9 +166,10 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 
 锁序由 Lock Ladder 运行时断言强制（`os/kernel/src/sync.rs` 的 `ranks`
 表，debug 构建）：每把锁在构造点声明 rank，获取时断言 per-hart 秩栈
-单调——新秩须大于栈顶，或同秩且链段 key 严格递增；违规即 panic
-（经 RawWriter，不依赖堆与锁）。release 构建零开销。bootstrap 期
-（tp 未建立，单核）使用专用帧，formal entry 汇合点切换至 per-hart 帧。
+单调——新秩须大于栈顶，或同秩且链段 key 严格递增；违规 panic 同时报告
+请求锁的源码位置（经 RawWriter，不依赖堆与锁）。release 构建零开销。
+bootstrap 期（tp 未建立，单核）使用专用帧，formal entry 汇合点切换至
+per-hart 帧。
 
 秩分配（数字唯一真值在 `sync::ranks`，此处列序即序）：
 
@@ -175,9 +178,10 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 | DRAIN_GATE | 收束批次仲裁，一次性覆盖最广，恒最先 | — |
 | DRAIN_CURSOR | HandleTable 收束游标与 pending close | — |
 | HANDLE_TABLE | caller→child 嵌套 | pid 递增 |
-| LEAF | CONSOLE、REGISTRY、ROOT anchor、各域就绪队列、per-hart TimerQueue、WaitContext 两锁 | — |
+| LEAF | CONSOLE、REGISTRY、ROOT anchor、各域就绪队列、per-hart TimerQueue、WaitContext 两锁；Remote Reserve 所需 admitted mask 已是安装后不可变的原子快照，不进入该锁 | — |
 | JOB_INNER | Job 链锁（≤32 把同持） | jid 递增 |
-| MAILBOX / CONNECTION | 对象状态锁 | — |
+| MAILBOX / CONNECTION | IPC 对象状态锁 | — |
+| MEMORY_OBJECT | MemoryObject 可执行状态与 affine WritePermit 账目；permit 在进入 AddressSpace 前移出此锁，Retire 也在 AddressSpace 锁外归还 | — |
 | ADDRESS_SPACE | 用户地址空间 | — |
 | NOTIFICATION | 唯一以 space 为外层的对象锁边 | — |
 | OBJECT_WAIT | Job.wait、ProcessControl、Endpoint、ProcessBuilder、Process.control 回指槽 | — |

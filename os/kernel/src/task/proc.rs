@@ -9,9 +9,11 @@ use erhino_shared::{
     proc::{Pid, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
 use memory_space::{
-    AnonymousClass, BackingId, ChangeError, Limits, MapBacking, MapPlacement, MapRequest,
-    MemorySpace, PageRange as LedgerPageRange, PreparedChange, Protection, PublishedChange,
-    RegionOwner, TranslationIntent,
+    AnonymousClass, BackingId, BackingView, ChangeError, LeaseKey, Limits, MapBacking,
+    MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
+    PageRange as LedgerPageRange, PreparedChange, Protection, PublishedChange, RegionKey,
+    RegionKindView, RegionOwner, RetireBatch, RetiredChange, TranslationIntent, UnmapRequest,
+    WritePermit,
 };
 use page_table::{
     FrameMemory, FrameNumber, MapError, Ppn, PreparedTranslation, ReservedTableFrame,
@@ -46,6 +48,8 @@ pub enum SpaceError {
     BadSegment,
     /// 映射冲突（重复装载同一区间）。
     Conflict,
+    /// 与其它在途 MemoryChange footprint 冲突。
+    Busy,
 }
 
 #[derive(Debug)]
@@ -134,6 +138,68 @@ struct PreparedHeapExtension {
     base: usize,
     new_brk: usize,
     pages: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectMappingLease {
+    pub(crate) lease: LeaseKey,
+    pub(crate) region: RegionKey,
+    pub(crate) range: LedgerPageRange,
+    pub(crate) object: ObjectId,
+}
+
+struct ObjectMappingReservation {
+    change: PreparedChange,
+    translation: PreparedTranslation<TableFrameToken>,
+    lease: ObjectMappingLease,
+}
+
+pub(crate) struct PreparedObjectMapping(Box<Option<ObjectMappingReservation>>);
+
+impl PreparedObjectMapping {
+    fn allocate() -> Result<Self, SpaceError> {
+        Box::try_new(None)
+            .map(Self)
+            .map_err(|_| SpaceError::NoFrame)
+    }
+
+    fn install(&mut self, reservation: ObjectMappingReservation) {
+        let previous = self.0.replace(reservation);
+        assert!(previous.is_none(), "object mapping token filled twice");
+    }
+
+    fn take(mut self) -> ObjectMappingReservation {
+        self.0.take().expect("object mapping token consumed twice")
+    }
+}
+
+pub(crate) struct ObjectMapFailure {
+    pub(crate) error: SpaceError,
+    pub(crate) permits: Vec<WritePermit>,
+}
+
+struct ObjectUnmapReservation {
+    change: PreparedChange,
+    translation: PreparedTranslation<TableFrameToken>,
+}
+
+pub(crate) struct PreparedObjectUnmap(Box<Option<ObjectUnmapReservation>>);
+
+impl PreparedObjectUnmap {
+    fn allocate() -> Result<Self, SpaceError> {
+        Box::try_new(None)
+            .map(Self)
+            .map_err(|_| SpaceError::NoFrame)
+    }
+
+    fn install(&mut self, reservation: ObjectUnmapReservation) {
+        let previous = self.0.replace(reservation);
+        assert!(previous.is_none(), "object unmap token filled twice");
+    }
+
+    fn take(mut self) -> ObjectUnmapReservation {
+        self.0.take().expect("object unmap token consumed twice")
+    }
 }
 
 struct HeapExtensionToken(Box<Option<PreparedHeapExtension>>);
@@ -249,10 +315,10 @@ fn protection_flags(protection: Protection) -> u64 {
 
 fn map_change_error(error: ChangeError) -> SpaceError {
     match error {
-        ChangeError::Conflict
-        | ChangeError::Busy
-        | ChangeError::NotCovered
-        | ChangeError::Guard => SpaceError::Conflict,
+        ChangeError::Conflict | ChangeError::NotCovered | ChangeError::Guard => {
+            SpaceError::Conflict
+        }
+        ChangeError::Busy => SpaceError::Busy,
         ChangeError::RegionLimit
         | ChangeError::TransactionLimit
         | ChangeError::KeyExhausted
@@ -335,24 +401,34 @@ impl crate::remote_call::Completion for ShootdownSelfTestCompletion {
     }
 }
 
+pub(crate) trait MemoryRetireSink: Send + Sync {
+    fn retire(&self, batch: RetireBatch);
+}
+
 /// Remote ack 后收束一笔已经 Publish 的 AddressSpace 事务。槽在 Commit gate
 /// 内填充、Remote request 发布前可见；完成方先取槽再进入 AddressSpace 锁。
-struct MemoryChangeCompletion {
+pub(crate) struct MemoryChangeCompletion {
     process: Arc<Process>,
     waiter: Arc<super::wait::WaitContext>,
+    retire: Option<Arc<dyn MemoryRetireSink>>,
     published: crate::sync::Spinlock<Option<PublishedChange>>,
 }
 
 impl MemoryChangeCompletion {
-    fn new(process: Arc<Process>, waiter: Arc<super::wait::WaitContext>) -> Self {
+    fn new(
+        process: Arc<Process>,
+        waiter: Arc<super::wait::WaitContext>,
+        retire: Option<Arc<dyn MemoryRetireSink>>,
+    ) -> Self {
         Self {
             process,
             waiter,
+            retire,
             published: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
         }
     }
 
-    fn install(&self, published: PublishedChange) {
+    pub(crate) fn install(&self, published: PublishedChange) {
         let previous = self.published.lock().replace(published);
         assert!(previous.is_none(), "memory completion installed twice");
     }
@@ -365,9 +441,17 @@ impl crate::remote_call::Completion for MemoryChangeCompletion {
             .lock()
             .take()
             .expect("memory completion ran before Commit publication");
-        {
-            self.process.space.lock().finish_published_change(published);
+        let (retired, batch) = self.process.space.lock().retire_published_change(published);
+        if let Some(retire) = &self.retire {
+            retire.retire(batch);
+        } else {
+            let (fragments, permits) = batch.into_parts();
+            assert!(
+                fragments.is_empty() && permits.is_empty(),
+                "memory change discarded retire resources without a sink"
+            );
         }
+        self.process.space.lock().complete_retired_change(retired);
         if self.process.lifecycle.complete_mandatory()
             && let Some(control) = self.process.control()
         {
@@ -375,6 +459,17 @@ impl crate::remote_call::Completion for MemoryChangeCompletion {
         }
         self.waiter.clone().complete_kernel();
     }
+}
+
+pub(crate) fn prepare_memory_completion(
+    process: Arc<Process>,
+    value: usize,
+    retire: Option<Arc<dyn MemoryRetireSink>>,
+) -> Result<(Arc<MemoryChangeCompletion>, super::wait::WaitPlan), SystemCallError> {
+    let (waiter, plan) = super::wait::prepare_kernel(value)?;
+    let completion = Arc::try_new(MemoryChangeCompletion::new(process, waiter, retire))
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    Ok((completion, plan))
 }
 
 /// Commit 前持有 execution snapshot、全部目标槽与完成引用。
@@ -587,6 +682,7 @@ fn map_heap_space_error(error: SpaceError) -> SystemCallError {
         SpaceError::NoFrame => SystemCallError::OutOfMemory,
         SpaceError::BadSegment => SystemCallError::IllegalArgument,
         SpaceError::Conflict => SystemCallError::ObjectBusy,
+        SpaceError::Busy => SystemCallError::ObjectBusy,
     }
 }
 
@@ -626,7 +722,7 @@ pub(crate) fn extend_heap(
     let start_vpn = prepared.base / PAGE_SIZE;
     let pages = prepared.pages;
 
-    let (waiter, plan) = match super::wait::prepare_kernel(new_brk) {
+    let (completion, plan) = match prepare_memory_completion(process.clone(), new_brk, None) {
         Ok(prepared) => prepared,
         Err(error) => {
             process
@@ -634,16 +730,6 @@ pub(crate) fn extend_heap(
                 .lock()
                 .rollback_heap_extension(extension.take().expect("extension must roll back"));
             return Err(error);
-        }
-    };
-    let completion = match Arc::try_new(MemoryChangeCompletion::new(process.clone(), waiter)) {
-        Ok(completion) => completion,
-        Err(_) => {
-            process
-                .space
-                .lock()
-                .rollback_heap_extension(extension.take().expect("extension must roll back"));
-            return Err(SystemCallError::OutOfMemory);
         }
     };
     let sink: Arc<dyn crate::remote_call::Completion> = completion.clone();
@@ -688,22 +774,22 @@ pub(crate) fn extend_heap(
     Ok(HeapExtendStart::Wait(plan))
 }
 
-/// 地址空间可变状态：页表树 + 过渡 backing/布局记账。后续迁移由
-/// MemorySpace ledger/backing 逐项替换字段，稳定 identity/epoch 外壳不变。
+/// 地址空间可变状态：MemorySpace ledger、anonymous backing、页表树与有界 drain
+/// 共同组成 VA 所有权真值；稳定 identity/epoch 位于外层 AddressSpace。
 pub(crate) struct AddressSpaceState {
     /// REAPABLE 屏障后由 drain 最终阶段 take 释放 root；之后任何访问
     /// 都是编程错误（Building 操作准入与 active 位图已消除可达性）。
     tree: Option<TableTree<TableMem, LEVELS>>,
     satp: usize,
-    /// 新路径的 VA 区域与事务真值；Drain 起点 take 后不再可访问。
+    /// VA 区域与事务真值；Drain 起点 take 后不再可访问。
     ledger: Option<MemorySpace>,
     /// 以 BackingId 关联 ledger logical offset 的 affine anonymous extents。
     backings: Vec<OwnedBacking>,
     next_backing: u64,
+    /// Object-owned mapping authority；单调不复用。
+    next_lease: u64,
     /// 堆顶（页对齐）；[brk, USER_TOP - STACK_SIZE) 为可扩展区。
     brk: usize,
-    /// 对象拥有的外部映射 reservation；普通地址空间操作不得接管。
-    external_mappings: Vec<usize>,
     /// 有界收束游标（drain_gate + space 锁双持下推进）。
     drain_stage: DrainStage,
     /// 已从拥有结构摘下、等待下一 work unit 归还的帧 extent。
@@ -724,8 +810,8 @@ impl AddressSpaceState {
             ledger: Some(ledger),
             backings: Vec::new(),
             next_backing: 1,
+            next_lease: 1,
             brk: 0,
-            external_mappings: Vec::new(),
             drain_stage: DrainStage::Idle,
             pending_free: None,
         })
@@ -743,24 +829,6 @@ impl AddressSpaceState {
         self.tree.as_mut().expect("address space tree is live")
     }
 
-    fn publish_map(
-        &mut self,
-        vpn: Vpn,
-        count: usize,
-        ppn: Ppn,
-        flags: u64,
-    ) -> Result<(), SpaceError> {
-        let prepared = self.tt().prepare_map(vpn, count, ppn, flags)?;
-        self.tt().publish(prepared);
-        Ok(())
-    }
-
-    fn publish_unmap(&mut self, vpn: Vpn, count: usize) -> Result<(), SpaceError> {
-        let prepared = self.tt().prepare_unmap(vpn, count)?;
-        self.tt().publish(prepared);
-        Ok(())
-    }
-
     #[expect(dead_code, reason = "多线程/procfs 里程碑使用")]
     pub fn brk(&self) -> usize {
         self.brk
@@ -776,6 +844,12 @@ impl AddressSpaceState {
             .next_backing
             .checked_add(1)
             .ok_or(SpaceError::NoFrame)?;
+        Ok(identity)
+    }
+
+    fn mint_lease(&mut self) -> Result<LeaseKey, SpaceError> {
+        let identity = LeaseKey::new(self.next_lease).ok_or(SpaceError::NoFrame)?;
+        self.next_lease = self.next_lease.checked_add(1).ok_or(SpaceError::NoFrame)?;
         Ok(identity)
     }
 
@@ -891,13 +965,235 @@ impl AddressSpaceState {
         published
     }
 
-    fn finish_published_change(&mut self, published: PublishedChange) {
+    pub(crate) fn retire_published_change(
+        &mut self,
+        published: PublishedChange,
+    ) -> (RetiredChange, RetireBatch) {
         let synchronized = self.ledger().synchronize(published);
-        let (retired, batch) = self.ledger().retire(synchronized);
+        self.ledger().retire(synchronized)
+    }
+
+    pub(crate) fn complete_retired_change(&mut self, retired: RetiredChange) {
+        self.ledger().complete(retired);
+    }
+
+    fn finish_empty_published_change(&mut self, published: PublishedChange) {
+        let (retired, batch) = self.retire_published_change(published);
         let (fragments, permits) = batch.into_parts();
         debug_assert!(fragments.is_empty());
         debug_assert!(permits.is_empty());
-        self.ledger().complete(retired);
+        self.complete_retired_change(retired);
+    }
+
+    #[inline(never)]
+    pub(crate) fn prepare_object_mapping(
+        &mut self,
+        va: usize,
+        pa: usize,
+        authorization: ObjectViewAuthorization,
+        permits: Vec<WritePermit>,
+    ) -> Result<PreparedObjectMapping, ObjectMapFailure> {
+        assert_eq!(permits.len(), 1, "Tunnel object Map requires one permit");
+        let mut token = match PreparedObjectMapping::allocate() {
+            Ok(token) => token,
+            Err(error) => return Err(ObjectMapFailure { error, permits }),
+        };
+        if !va.is_multiple_of(PAGE_SIZE)
+            || !pa.is_multiple_of(PAGE_SIZE)
+            || va >= USER_TOP - STACK_SIZE
+        {
+            return Err(ObjectMapFailure {
+                error: SpaceError::BadSegment,
+                permits,
+            });
+        }
+        let lease_key = match self.mint_lease() {
+            Ok(lease) => lease,
+            Err(error) => return Err(ObjectMapFailure { error, permits }),
+        };
+        let object = authorization.object();
+        let range = LedgerPageRange::new(va, PAGE_SIZE).expect("single page is aligned");
+        let validated = match self.ledger().validate_map(MapRequest {
+            bytes: PAGE_SIZE,
+            guard_before: 0,
+            guard_after: 0,
+            placement: MapPlacement::FixedEmpty { usable_start: va },
+            current: Protection::ReadWrite,
+            maximum: Protection::ReadWrite,
+            owner: RegionOwner::Lease(lease_key),
+            backing: MapBacking::Object {
+                authorization,
+                offset: 0,
+                object_bytes: PAGE_SIZE,
+            },
+            result: None,
+        }) {
+            Ok(validated) => validated,
+            Err(error) => {
+                return Err(ObjectMapFailure {
+                    error: map_change_error(error),
+                    permits,
+                });
+            }
+        };
+        let change = match self.ledger().reserve(validated, permits) {
+            Ok(change) => change,
+            Err(failure) => {
+                let error = map_change_error(failure.error);
+                let (_, _, permits) = failure.into_parts();
+                assert_eq!(permits.len(), 1, "object Map must return one permit");
+                return Err(ObjectMapFailure { error, permits });
+            }
+        };
+        let region = change
+            .mapped_region_key()
+            .expect("object Map must reserve one usable region");
+        match change.translation_intents() {
+            [
+                TranslationIntent::Install {
+                    range: intent_range,
+                    backing:
+                        BackingView::Object {
+                            object: intent_object,
+                            offset: 0,
+                        },
+                    protection: Protection::ReadWrite,
+                },
+            ] if *intent_range == range && *intent_object == object => {}
+            _ => panic!("object Map planner returned an invalid translation plan"),
+        }
+        let translation = match self.tt().prepare_map(
+            Vpn(va / PAGE_SIZE),
+            1,
+            Ppn(pa / PAGE_SIZE),
+            protection_flags(Protection::ReadWrite),
+        ) {
+            Ok(translation) => translation,
+            Err(error) => {
+                let permits = self.ledger().rollback(change);
+                assert_eq!(permits.len(), 1, "object Map rollback lost its permit");
+                return Err(ObjectMapFailure {
+                    error: error.into(),
+                    permits,
+                });
+            }
+        };
+        token.install(ObjectMappingReservation {
+            change,
+            translation,
+            lease: ObjectMappingLease {
+                lease: lease_key,
+                region,
+                range,
+                object,
+            },
+        });
+        Ok(token)
+    }
+
+    pub(crate) fn rollback_object_mapping(
+        &mut self,
+        prepared: PreparedObjectMapping,
+    ) -> Vec<WritePermit> {
+        let ObjectMappingReservation {
+            change,
+            translation,
+            ..
+        } = prepared.take();
+        drop(translation);
+        let permits = self.ledger().rollback(change);
+        assert_eq!(permits.len(), 1, "object Map rollback lost its permit");
+        permits
+    }
+
+    pub(crate) fn commit_object_mapping(
+        &mut self,
+        prepared: PreparedObjectMapping,
+    ) -> (PublishedChange, ObjectMappingLease) {
+        let ObjectMappingReservation {
+            change,
+            translation,
+            lease,
+        } = prepared.take();
+        let committed = self.ledger().commit(change);
+        self.tt().publish(translation);
+        (self.ledger().publish(committed), lease)
+    }
+
+    #[inline(never)]
+    pub(crate) fn prepare_object_unmap(
+        &mut self,
+        lease: ObjectMappingLease,
+    ) -> Result<PreparedObjectUnmap, SpaceError> {
+        let mut token = PreparedObjectUnmap::allocate()?;
+        let matches_lease = self.ledger().regions().any(|region| {
+            region.key == lease.region
+                && region.range == lease.range
+                && region.owner == RegionOwner::Lease(lease.lease)
+                && matches!(
+                    region.kind,
+                    RegionKindView::Mapping {
+                        backing: BackingView::Object { object, offset: 0 },
+                        current: Protection::ReadWrite,
+                        maximum: Protection::ReadWrite,
+                        ..
+                    } if object == lease.object
+                )
+        });
+        if !matches_lease {
+            return Err(SpaceError::BadSegment);
+        }
+        let validated = self
+            .ledger()
+            .validate_unmap(UnmapRequest {
+                range: lease.range,
+                authority: RegionOwner::Lease(lease.lease),
+            })
+            .map_err(map_change_error)?;
+        let change = self
+            .ledger()
+            .reserve(validated, Vec::new())
+            .map_err(|failure| map_change_error(failure.error))?;
+        match change.translation_intents() {
+            [TranslationIntent::Remove { range }] if *range == lease.range => {}
+            _ => panic!("object Unmap planner returned an invalid translation plan"),
+        }
+        let translation = match self
+            .tt()
+            .prepare_unmap(Vpn(lease.range.start() / PAGE_SIZE), lease.range.pages())
+        {
+            Ok(translation) => translation,
+            Err(error) => {
+                let permits = self.ledger().rollback(change);
+                debug_assert!(permits.is_empty());
+                return Err(error.into());
+            }
+        };
+        token.install(ObjectUnmapReservation {
+            change,
+            translation,
+        });
+        Ok(token)
+    }
+
+    pub(crate) fn rollback_object_unmap(&mut self, prepared: PreparedObjectUnmap) {
+        let ObjectUnmapReservation {
+            change,
+            translation,
+        } = prepared.take();
+        drop(translation);
+        let permits = self.ledger().rollback(change);
+        debug_assert!(permits.is_empty());
+    }
+
+    pub(crate) fn commit_object_unmap(&mut self, prepared: PreparedObjectUnmap) -> PublishedChange {
+        let ObjectUnmapReservation {
+            change,
+            translation,
+        } = prepared.take();
+        let committed = self.ledger().commit(change);
+        self.tt().publish(translation);
+        self.ledger().publish(committed)
     }
 
     fn map_owned_backing(
@@ -909,7 +1205,7 @@ impl AddressSpaceState {
     ) -> Result<(), SpaceError> {
         let prepared = self.prepare_owned_backing(vaddr, protection, class, backing)?;
         let published = self.commit_owned_mapping(prepared);
-        self.finish_published_change(published);
+        self.finish_empty_published_change(published);
         Ok(())
     }
 
@@ -1255,48 +1551,6 @@ impl AddressSpaceState {
             .map(|m| m.ppn.0 * PAGE_SIZE)
     }
 
-    /// 将所有权归外部的物理页映射到指定用户 VA（共享内存机制专用，
-    /// 如隧道）。帧生命周期归登记方：本空间的页表回收只清 PTE、不归还
-    /// 该帧——页表树从不拥有 leaf backing，外部映射 reservation 由对象关闭。
-    /// 栈窗口与越界地址直接拒绝；冲突由 map 的 Conflict 报出。
-    pub fn map_external(&mut self, va: usize, pa: usize) -> Result<(), SpaceError> {
-        if va % PAGE_SIZE != 0 || va >= USER_TOP - STACK_SIZE {
-            return Err(SpaceError::BadSegment);
-        }
-        if self.external_mappings.contains(&va) {
-            return Err(SpaceError::Conflict);
-        }
-        self.external_mappings
-            .try_reserve(1)
-            .map_err(|_| SpaceError::NoFrame)?;
-        self.publish_map(
-            Vpn(va / PAGE_SIZE),
-            1,
-            Ppn(pa / PAGE_SIZE),
-            flags::USER_DATA,
-        )?;
-        self.external_mappings.push(va);
-        // SAFETY: sfence 当前 ASID 冲刷 stale TLB 使新 PTE 生效。
-        unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
-        Ok(())
-    }
-
-    /// 只有持有对象 lease 的关闭路径才能解除外部 reservation。
-    pub fn unmap_external(&mut self, va: usize) {
-        let Some(index) = self
-            .external_mappings
-            .iter()
-            .position(|mapped| *mapped == va)
-        else {
-            return;
-        };
-        self.external_mappings.swap_remove(index);
-        self.publish_unmap(Vpn(va / PAGE_SIZE), 1)
-            .expect("single-page external unmap cannot fail");
-        // SAFETY: 同 map_external。
-        unsafe { core::arch::asm!("sfence.vma", options(preserves_flags)) };
-    }
-
     /// 推进一笔已摘下的帧 extent 归还；分级库存归还具有地址位宽常数上界，
     /// 因此每个 extent 计一个 work unit，不再保存碎片链扫描游标。
     fn step_pending(&mut self, budget: usize) -> (usize, bool) {
@@ -1344,11 +1598,7 @@ impl AddressSpaceState {
     fn drain_inner(&mut self, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
         if self.drain_stage == DrainStage::Idle {
-            // Handle 阶段已先行：外部映射必须已由对象 close 回调清空。
-            debug_assert!(
-                self.external_mappings.is_empty(),
-                "external mapping outlives its object"
-            );
+            // Handle 阶段先以 lease transaction 清除全部 object-owned region。
             self.drain_stage = DrainStage::Ledger;
         }
         let mut work = 0;
@@ -1611,7 +1861,7 @@ impl Drop for Process {
         // 防御性兜底：预算恰在摘项后耗尽时，entry 已不在表中，必须先
         // 关闭它才能继续收束地址空间。
         if let Some(entry) = self.drain_state.get_mut().pending_close.take() {
-            super::handle::close_entry(entry, self, true);
+            super::handle::close_entry_infallible(entry, self, true);
         }
         // 进程已无外部引用，唯一借用下逐项摘除；对象回调发生在表项
         // 已移除之后，且不持 HandleTable 锁。
@@ -1619,7 +1869,7 @@ impl Drop for Process {
         loop {
             let entry = self.handles.get_mut().take_next(&mut cursor);
             let Some(entry) = entry else { break };
-            super::handle::close_entry(entry, self, true);
+            super::handle::close_entry_infallible(entry, self, true);
         }
     }
 }
@@ -1780,8 +2030,12 @@ impl Process {
         // 只消耗一次 close callback work unit。
         let pending = self.drain_state.lock().pending_close.take();
         if let Some(entry) = pending {
-            super::handle::close_entry(entry, self, true);
+            let result = super::handle::close_entry(entry, self, true);
             work += 1;
+            if let Err(entry) = result {
+                self.drain_state.lock().pending_close = Some(entry);
+                return (work, false);
+            }
             if work == budget {
                 return (work, false);
             }
@@ -1806,8 +2060,12 @@ impl Process {
                     return (work, false);
                 }
                 super::handle::TakeNext::Entry(entry) => {
-                    super::handle::close_entry(entry, self, true);
+                    let result = super::handle::close_entry(entry, self, true);
                     work += 1;
+                    if let Err(entry) = result {
+                        self.drain_state.lock().pending_close = Some(entry);
+                        return (work, false);
+                    }
                 }
                 super::handle::TakeNext::Progress => return (work, false),
                 super::handle::TakeNext::Exhausted if work == budget => return (work, false),
@@ -1968,7 +2226,7 @@ pub fn launch_bootstrap(
             Err(_) => {
                 drop(table);
                 for handle in handles {
-                    super::handle::close_entry(handle, &process, true);
+                    super::handle::close_entry_infallible(handle, &process, true);
                 }
                 return Err(SpaceError::NoFrame);
             }
@@ -1990,7 +2248,7 @@ pub fn launch_bootstrap(
                 .rollback(reservation)
                 .expect("launch reservation must remain owned");
             for handle in handles {
-                super::handle::close_entry(handle, &process, true);
+                super::handle::close_entry_infallible(handle, &process, true);
             }
             return Err(match error {
                 erhino_shared::startup::StartupBuildError::Overflow => SpaceError::BadSegment,
@@ -2013,7 +2271,7 @@ pub fn launch_bootstrap(
                 .rollback(reservation)
                 .expect("launch reservation must remain owned");
             for handle in handles {
-                super::handle::close_entry(handle, &process, true);
+                super::handle::close_entry_infallible(handle, &process, true);
             }
             return Err(error);
         }

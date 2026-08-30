@@ -1,16 +1,16 @@
 # 用户内存映射机制完整化
 
-- 状态：实施中；切片 1–4 已完成，切片 5 的 Remote Call/epoch 基础已落地，待与统一 AddressSpace 事务闭合完成与 Retire
+- 状态：实施中；切片 1–6 已完成，下一步实施切片 7 的 Running ABI、rinlib affine region/arena/guard 与 Extend 退役
 - 方向真值：[`notes/ideas/mm.md`](../notes/ideas/mm.md)
 - 自然序：本计划收口后重审 ThreadSpawn 用户态资源契约，再实施线程批二/批三
 
 ## 驱动问题
 
-Running 进程当前仍保留字节粒度 sbrk ABI，但非零 `Extend` 已迁入统一 MemoryChange transaction；`ProcessMap` 只服务 Building 组装。anonymous/ELF/bootstrap/Extend backing 已由 ledger + `OwnedBacking.extents` 统一拥有，旧 `AddressSpace.frames` 已删除；剩余旧路径是 Tunnel 借入帧的 `external_mappings` 与按 VA 解除。
+全部现有用户映射调用者已经统一到 AddressSpace ledger/backing/PTE/MemoryChange：ProcessMap 只服务 Building 组装，anonymous/ELF/bootstrap/Extend backing 由 `OwnedBacking.extents` 拥有，Tunnel 由 ObjectView lease + WritePermit 引用 Connection 的固定 backing。旧 `AddressSpace.frames`、`external_mappings`、按 VA 外部解除与本地-only shootdown 已删除。当前保留的旧用户语义只有字节粒度 sbrk/Extend ABI。
 
 结构性有界帧库存、affine 帧发布 seam、纯逻辑 `MemorySpace` planner 与 reservation-aware `TableTree` 已完成。页表已能在 Commit 前精确准备并清零中间表帧，Commit 后 Publish 不分配、不返回可恢复错误；owned/shared root 槽所有权也已进入树本身。
 
-当前下一缺口是把 Tunnel Endpoint close 接入同一内存所有权事务。Remote Call 已提供固定槽、IPI 门铃、全量 fence、epoch ack 和 execution gate seam；Running Extend 已成为首个真实消费者，闭合预构造 WaitContext、发起线程消散、lifecycle mandatory obligation 与 ack 后 Retire。Tunnel/HandleClose 仍未拥有统一 ObjectView/lease transaction。
+当前下一缺口是公开 `MemoryMap/MemoryUnmap/MemoryProtect`，让 rinlib 以 affine region 管理 allocator arena 与 guard reservation，并退役 Extend。Remote Call、prepared WaitContext、lifecycle mandatory obligation、Tunnel Create/Attach/HandleClose 和 ProcessDrain 接管均已闭合到 ack 后 Retire/Complete。
 
 ## 已确认决策
 
@@ -134,7 +134,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 - 规划结果描述 PTE install/remove/protect、OwnedExtents split/retire、ObjectView 偏移和所需资源上界，不执行硬件动作；
 - fault lookup 只区分 free hole、guard、eager mapping，不建立未实现 pager 状态。
 
-验证：host debug/release 共 17 项测试，覆盖区间溢出与对齐、区域/事务/lease 容量、backing 边界、Anywhere/FixedEmpty、双 guard 与四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同组合并与跨组拒绝、owner/权限上限、object offset、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、类型化阶段，以及 seal/permit 直到 Synchronize 后 Retire 才退出计数。2000 步确定性 shadow model 持续对照逐页覆盖并检查 fragment 不重叠；host clippy `-D warnings` 与 `just check` 通过。该实现仍是未接入内核 AddressSpace 的纯逻辑 seam；切片 4 已补齐独立页表 reservation，planner 与真实 backing/PTE 的批量组合及 Remote Call 属于后续切片。
+验证：host debug/release 共 18 项测试，覆盖区间溢出与对齐、区域/事务/lease 容量、backing 边界、Anywhere/FixedEmpty、双 guard 与四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同组合并与跨组拒绝、owner/权限上限、object offset、稳定 mapped RegionKey、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、类型化阶段，以及 seal/permit 直到 Synchronize 后 Retire 才退出计数。2000 步确定性 shadow model 持续对照逐页覆盖并检查 fragment 不重叠；host clippy `-D warnings` 与 `just check` 通过。planner 已经由切片 6 的 AddressSpace adapter 统一驱动 owned 与 object-backed 映射。
 
 ### 4. 页表资源预留与所有权
 
@@ -175,7 +175,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 验证：host adapter 确定性覆盖容量不足、成员序列/生命周期准入复检失败、Commit vs Running→Terminating、Lock Ladder 正序与反向拒绝、本地发起 hart 确认、门铃合并/丢失后由 pending level 补消费、乱序确认、重复门铃、slot ABA/identity 误配、快照前后 enter/leave、发起者终止和最后确认接管；RISC-V 双 hart litmus 证明 cookie/PTE/request 发布顺序、Unmap 后 backing 复用屏障及 instruction epoch。目标 hart 每项工作保持固定上界。
 
-阶段记录：`os/remote_call` 已落地固定 8 hart × 4 槽的纯逻辑状态机与 kernel adapter，具备批量 Reserve 精确回滚、Pending 电平、generation 退休、锁外 IPI、trap/idle 有界消费、全量 `SFENCE.VMA`/可选 `FENCE.I`、release-sequence 最后确认及每 hart epoch cache。Process lifecycle 已增加 execution sequence，dispatch/leave 以本地 epoch 为硬 gate；稳定 AddressSpace 外壳已实现 `prepare_shootdown → commit_shootdown → start` 并用 primordial active snapshot 真路径探针验证锁序和 ack。host debug/release、clippy、`just check`、virt debug/release 与 sifive_u 均通过，10/10 竞态矩阵不变。尚缺真实 MemoryChange/HandleClose completion 对 WaitContext、终止接管和 ack 后 Retire 的所有权闭包，随切片 6 ledger/backing 迁移完成。
+阶段记录：`os/remote_call` 已落地固定 8 hart × 4 槽的纯逻辑状态机与 kernel adapter，具备批量 Reserve 精确回滚、Pending 电平、generation 退休、锁外 IPI、trap/idle 有界消费、全量 `SFENCE.VMA`/可选 `FENCE.I`、release-sequence 最后确认及每 hart epoch cache。Process lifecycle 以 execution sequence/mandatory operation 闭合 active gate 与终止接管；稳定 AddressSpace 外壳提供 `prepare_shootdown → commit_shootdown → start`。真实 consumer 已覆盖 Running Extend、Tunnel Create/Attach/HandleClose；prepared WaitContext、发起线程消散和 ack 后 Retire/Complete 均已闭合。admitted mask 由 registry 安装时原子发布，Remote Reserve 不再把 registry LEAF 锁带入业务事务。host debug/release、clippy、`just check`、virt debug/release 与 sifive_u 已通过，10/10 竞态矩阵不变。
 
 未来代码复审已按提交 `6199985` 单独建立 [`todo-2026-08-30-remote-call-review.md`](todo-2026-08-30-remote-call-review.md)；它不阻塞本计划继续迁移 AddressSpace。
 
@@ -183,7 +183,9 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 组装最终 AddressSpace 深模块，并按调用者逐批切换；每批迁移同批删除对应旧路径。
 
-其中稳定 identity、EpochState 与 execution gate adapter 已作为切片 5 的语义前置先行，不单独建立旧 AddressSpace 兼容字段；本切片剩余工作只把 ledger、backing、TranslationTree、MemoryChange 与调用者迁入同一所有权外壳。
+- 状态：已完成（2026-09）
+
+稳定 identity、EpochState 与 execution gate adapter 作为切片 5 的语义前置先行；本切片随后把 ledger、backing、TranslationTree、MemoryChange 与全部现有调用者收束到同一所有权外壳，未建立旧 AddressSpace 兼容字段。
 
 | 本切片不变量 | 进入所有权 | 退出所有权 |
 |---|---|---|
@@ -197,7 +199,9 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 阶段记录（第一批）：`MemorySpace` ledger、`OwnedBacking(BackingId + logical offset + affine extents)` 与 PTE reservation 已组成 AddressSpace adapter；ProcessMap/Write、ELF 连续权限段、bootstrap 栈/出生块与 Running Extend 均已迁移。Extend 在 Commit 前准备 planner/backing/PTE/WaitContext/Remote slots，Commit 后由最后 ack 推进 Retire/Complete；预构造 Context 不提前持 Thread，early completion 只 Deferred。lifecycle 以 `mandatory_ops` 将 REAPABLE 延迟到所有必成事务收束。旧 `AddressSpace.frames`、`alloc_map`、`DrainStage::Frames` 与 Extend 本地 fence 已删除，ProcessDrain 现按 ledger→backings→tables 有界推进。host planner debug/release 18 项、WaitCore 8 项、clippy、`just check`、virt debug/release 与 10/10 竞态矩阵通过。剩余入口是 Tunnel/ObjectView/HandleClose，故切片 6 尚未完成。
 
-验证：Building failure、bootstrap payload 收编、Tunnel create/attach/close、HandleClose vs close、Drain 接管和帧计数全覆盖；现有 virt/release/hetero/nofd/sifive_u 行为等价。本切片尚不公开 Running 内存 ABI。
+阶段记录（第二批）：Tunnel Connection 的固定 backing 通过内部 `MemoryObjectState` 授权两个 RW ObjectView；每个 reserved/published/retiring view 持一个 affine WritePermit，Endpoint lease 保存不可伪造的 LeaseKey/RegionKey/PageRange/ObjectId。TunnelCreate/Attach 在 Commit 前准备 handle reservation、permit、ledger/PTE、threadless WaitContext 与 Remote slots，Attach 失败不消费 Invitation；显式 Endpoint HandleClose 在摘表前准备 Unmap，Commit 后等待远端确认，Retire permit 后才发布 CLOSED/PEER_CLOSED 并完成。ProcessDrain 对 active 已归零的地址空间走同一 planner/PTE/Retire 顺序，Busy 时原样保存 detached entry 重试。MemoryObject 锁与 AddressSpace 锁不嵌套：permit 以 affine token 跨锁移交；Lock Ladder 增加调用点诊断，并以安装后原子 admitted mask 消除 Remote Reserve 对 registry LEAF 的反向边。旧 `external_mappings`、`MappingLease::Drop`、按 VA unmap 和本地 fence 已删除。host planner debug/release 18 项、clippy、`just check`、virt debug/release、Tunnel 64 轮、最小预算 drain 与 race matrix 10/10 通过。
+
+验证：Building failure、bootstrap payload 收编、Tunnel create/attach/close、HandleClose、Drain 接管与帧计数由现有 host/QEMU 负载覆盖；本切片不公开 Running 内存 ABI。hetero/nofd/sifive_u 与公开 ABI 的多 hart 竞态负载在切片 8 统一收尾。
 
 ### 7. Running ABI、rinlib 与 Extend 退役
 
@@ -246,6 +250,8 @@ RISC-V 负载必须覆盖：
 - allocator 多 arena 与次线程栈建立/释放。
 
 阶段收尾执行全部 host 测试、`just check`、`just virt`、`just virt-release`、`just virt-hetero`、`just virt-nofd`、`just sifive_u`。实现事实只在相应切片落地后写入 `notes/impls/{mm,call,internals,task,ipc}.md`；COMPASS 在全链收口时把主线移到 ThreadSpawn 契约重审。
+
+全部切片形成真实提交后，创建 `todo-<日期>-user-memory-mapping-review.md` 并加入 COMPASS 活跃计划：逐批记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险；统一复审 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整。该 review 计划只在哈希齐全后生成，不以占位哈希预建。
 
 ## 对 ThreadSpawn 的解除条件
 

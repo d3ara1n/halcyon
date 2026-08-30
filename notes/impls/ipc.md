@@ -50,19 +50,19 @@ Send 在 `HandleTable → Mailbox` 锁序下，以当前 pid 和目标 sender ba
 
 ## Handle close callbacks
 
-ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一记录。本篇只拥有 Handle 摘出后各 IPC role 的 callback。Mailbox 队列上限为 16 条、每条最多 8 个 transit entries，因此 owner close 的运输 fanout 至多 128；对象订阅上限为 1024，每个 WaitContext 最多 64 项，完成方在对象锁外清理。具体 callback：
+ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一记录。本篇只拥有 Handle 摘出后的 IPC 对象收束语义。Mailbox 队列上限为 16 条、每条最多 8 个 transit entries，因此 owner close 的运输 fanout 至多 128；对象订阅上限为 1024，每个 WaitContext 最多 64 项，完成方在对象锁外清理。具体语义：
 
 - Mailbox owner：关闭邮箱、完成等待者并关闭有界队列中的 transit entries；
 - sender/signaler、ProcessControl、JobControl：叶子消散；
-- Tunnel Endpoint：释放 MappingLease 并通知对端；
+- Tunnel Endpoint：显式 HandleClose 在摘表前预留 lease Unmap/PTE/WaitContext/Remote slots，Commit 后异步 Retire；ProcessDrain 的 detached entry 在冲突时保留并重试；
 - Tunnel Invitation：放弃未 attach 一侧并通知创建端；
 - WaitContext 不在 HandleTable，由终止路径单独取消。
 
 ## Tunnel 与 Runnel
 
-`task/tunnel.rs` 的 Connection 持共享帧与两侧状态。Endpoint 持本地 `MappingLease`，是可等待对象；Invitation 是一次性 `MAP | TRANSIT | GRANT` authority，不持 WAIT、不公开 ObjectSignals。创建端关闭会使 Invitation attach 失败；丢弃 Invitation 向创建端 Endpoint 发布 PEER_CLOSED。
+`task/tunnel.rs` 的 Connection 持一页共享帧、独立锁保护的内部 `MemoryObjectState`、两侧 ObjectView lease 与端点状态。Endpoint 是可等待对象；Invitation 是一次性 `MAP | TRANSIT | GRANT` authority，不持 WAIT、不公开 ObjectSignals。创建端关闭会使 Invitation attach 失败；丢弃 Invitation 向创建端 Endpoint 发布 PEER_CLOSED。
 
-当前 Connection 固定一页。Attach 在 HandleTable→Connection→AddressSpace 锁序下原子消费 Invitation并安装 Endpoint；失败不消费。`user/frameworks/librunnel` 使用对齐 AtomicU32、Release/Acquire、shadow 游标验证与“检查→确认门铃→重查→WaitMany”闭环。
+Create/Attach 在 `HandleTable → Connection → AddressSpace → Lifecycle → RemoteCall` 锁序下把 handle reservation、WritePermit、ledger/PTE reservation 和 execution snapshot 合成一次 Commit；失败不消费 Invitation、handle 或 permit。调用通过 prepared WaitContext 等待 shootdown，成功返回时映射已全局同步。Endpoint 显式关闭同样等待 Unmap 确认，最后 permit Retire 早于共享帧生命周期结束。`user/frameworks/librunnel` 使用对齐 AtomicU32、Release/Acquire、shadow 游标验证与“检查→确认门铃→重查→WaitMany”闭环。
 
 ## 验证入口
 
