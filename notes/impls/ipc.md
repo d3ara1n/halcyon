@@ -46,7 +46,7 @@ Send 在 `HandleTable → Mailbox` 锁序下，以当前 pid 和目标 sender ba
 
 `clear_active` 与 `park_waiting` 之间若进程已 Terminating，安装者以 Abandoned 完成仍处于 Installing 的 Context，并确认线程离场；不会遗留 lifecycle 成员。用户显式 Cancelled ABI尚未接入，终止 Abandoned 不回用户态。
 
-异步 WaitMany 写回与同步 syscall 输出不同：结果页复检失败经 MemoryNotAccessible 返回等待线程，不杀进程。公开 ThreadSpawn 尚未接入，因此同进程并发拆除结果页的路径当前不可达。
+异步 WaitMany 写回与同步 syscall 输出不同：结果页复检失败经 MemoryNotAccessible 返回等待线程，不杀进程。ThreadSpawn 已接入，同进程另一线程可在等待在途时解除结果页映射，复检失败经该错误通道交付。
 
 ## Handle close callbacks
 

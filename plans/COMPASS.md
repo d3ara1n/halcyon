@@ -53,14 +53,16 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | 事项 | 触发 | 详情 |
 |---|---|---|
 | CPU 预约对象（budget/period、pick 边界配额过滤） | 不可信执行域接入 | `ideas/task.md`「线程」 |
-| fence.i 代码代次优化 | **已满足**（step 7 active 集合）；另一半条件「开销实测可见」未验 | `impls/task.md`「调度」 |
-| 显式 affinity / 跨域迁移 ABI | 多线程（ThreadSpawn）/迁移纪元 | `archived/todo-2026-08-28-domain-eligibility.md` 决策 3–4 |
+| fence.i 代码代次优化 | active 集合条件已满足；另一半「开销实测可见」需先具备 dispatch 计时手段（Zicntr）且占比可见 | `impls/task.md`「调度」 |
+| 显式 affinity / 跨域迁移 ABI | 真实多域硬件成为运行环境或出现多域放置需求（ThreadSpawn 前置已落地）；接入边界公理见详情 | `ideas/execution-context.md`「调度域」、`archived/todo-2026-08-28-domain-eligibility.md` 决策 3–4 |
 | initfs manifest / 服务编排 | 需要正式服务编排 | `ideas/bootstrap.md` |
 | ld-erhino 动态链接（PT_INTERP、共享库） | 无明确触发，构想态 | `ideas/bootstrap.md` |
 | F-only/Q/V/TSO 档位建模 | 真实需求出现 | `impls/execution-context.md` |
 | TLS ABI（用户 tp 置零中） | 需要 TLS 时 | `impls/task.md` |
 | 多用户 / ACL | 多用户需求 | `ideas/object.md` |
 | ASID 分配 + 定向 shootdown 优化 | 地址空间切换开销实测 | `impls/task.md` |
+| 过渡 admission/Remote 槽高水位可观测性 | KernelMemoryBudget 立案或容量重校需求出现 | `ideas/mm.md`「MemoryPool 与 backing charge」 |
+| Unmap 调用者唤醒点前移（Synchronize 即返回、retire 后台化） | 内存操作延迟实测成为瓶颈（需先具备测量面） | `ideas/mm.md`「MemoryChange 事务」 |
 
 ## 位置
 

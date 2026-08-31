@@ -177,7 +177,7 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 让 TranslationTree 的 root、中间表、mega split 与未来 replacement 全部持有来源 Pool 的单页 funded owner。Bind 在 AddressSpace 发布前锁外准备 root；Map/Unmap/Protect 依 6B seam 锁外取得完整表页集合。PoolBinding 只表达绑定 authority 与资源来源，不保留与树重复的 root 所有权。错误保持 `QuotaExceeded`、`OutOfMemory`、`ReachLimit` 与 `ObjectBusy` 的既有区分。
 
-验证：Bind 与全部 mapping 路径的 root/table 页数守恒、quota/库存/extent/metadata 故障零发布、mega split、Unmap 后表页延迟退款、AddressSpace drain 中断接管；重复 map/unmap 后除 live root 外 Pool 与 FramePool 回到对应基线。
+验证：Bind 与全部 mapping 路径的 root/table 页数守恒、quota/库存/extent/metadata 故障零发布、mega split、Unmap 后表页延迟退款、AddressSpace drain 中断接管；重复 map/unmap 后除 live root 外 Pool 与 FramePool 回到对应基线。随批补入 ThreadSpawn 后才可达的确定性场景：并发线程解除 park 在途 WaitMany 的结果页映射，断言写回复检失败以 MemoryNotAccessible 错误返回等待线程且进程存活。
 
 ### 批次 6E：匿名 backing 全面资金化
 
@@ -193,7 +193,7 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 扩展 Running `MemoryMap` 与 Building `ProcessMap` 的来源意图，使 Anonymous 与 MemoryObject 只在 authority/backing reserve 上不同，共用 placement、guard、结果承诺、PTE 和 shootdown。对象 offset/length 必须页对齐且在范围内；R/RW/RX 由 MAP/READ/WRITE/EXECUTE 与对象状态共同限制。公开 mapping 归 Process owner，可精确 Unmap/Protect；Tunnel lease owner 仍不可被普通调用解除。
 
-把单 PA、单 translation 的 adapter 改为按 ObjectBacking extent 投影生成有界 translation 集；ledger 只保存强 `ObjectView { object, offset, length, permit }`，不增加第二张对象映射表。Seal 在对象锁内与 WritePermit 预留线性化，retiring writable view 收到全部远端确认后才减计数；MANAGE authority 不蕴含 MAP/WRITE。
+把单 PA、单 translation 的 adapter 改为按 ObjectBacking extent 投影生成有界 translation 集；ledger 只保存强 `ObjectView { object, offset, length, permit }`，不增加第二张对象映射表。Seal 在对象锁内与 WritePermit 预留线性化，retiring writable view 收到全部远端确认后才减计数；MANAGE authority 不蕴含 MAP/WRITE。seal 完成不设专用完成槽：对象公开 ObjectSignals 的 `EXECUTABLE` 电平位，等待复用 WaitMany 通用面与 WAIT right，语义由 `notes/ideas/mm.md` 可执行发布段拥有。
 
 验证：多 extent object 在不同 VA/权限映入多个进程、Handle 先关仍可访问、部分 object Unmap offset 保持且 backing 不切分、rights 拒绝、seal 与 writable permit/remote retire 竞态、对象最终 frame/charge 守恒。
 

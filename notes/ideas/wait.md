@@ -4,7 +4,7 @@
 
 ## ObjectSignals
 
-可等待对象公开一组电平状态。每一位表示当前为真的条件，不是某个等待者私有的事件：Mailbox `READABLE` 表示至少有一条完整消息，Tunnel `DATA` 表示应重新检查共享控制块，ProcessControl `REAPABLE` 表示管理者可以开始有界收束，`CLOSED` 表示不可复活的终态。
+可等待对象公开一组电平状态。每一位表示当前为真的条件，不是某个等待者私有的事件：Mailbox `READABLE` 表示至少有一条完整消息，Tunnel `DATA` 表示应重新检查共享控制块，ProcessControl `REAPABLE` 表示管理者可以开始有界收束，`CLOSED` 表示不可复活的终态，MemoryObject `EXECUTABLE` 表示可执行发布已进入终态。
 
 WaitMany 只观察状态，不清位、不消费资源。对象语义拥有者显式改变电平：Receive 取走最后一条消息后清 READABLE，Tunnel 协议确认无进展后清 DATA，Notification 由专用 Take 消费待决位。醒来者必须重新执行真实操作，并接受并发消费者可能已先一步改变条件。
 

@@ -147,7 +147,7 @@ Map 的 Reserve 已经唯一确定 usable 与 reservation 范围。`MemoryMapRes
 结果槽必须位于调用前已经存在且可写的 eager mapping；UserWriteLease 只 pin 固定宽 ledger/backing 与写权限，不把用户指针变成可长期解引用的内核引用。与 lease 冲突的 Unmap/Protect 在各自 Commit 前返回 Busy。rinlib 为可能 park 的 Map 把结果槽放进随线程保留到 join 的运行时记录，而不是可提前回收的临时缓冲。若调用线程在 Commit 前消散，事务释放 lease 并回滚；若在 Commit 后消散，结果承诺已经属于进程，事务继续完成。线程的 departed/join 完成边界不得越过仍挂接于该线程结果记录的 committed transaction，因而接管者在 join 后观察 cookie 时也已经越过 mapping 完成边界。
 
 Unmap/Protect 的旧 backing、旧权限或 writable-view permit 在 Synchronize 期间由事务隔离持有，不能归还库存、映射到其它地址、退出 seal 计数或被另一对象重新解释。Retire 只在全部确认后释放旧 OwnedExtents、旧 ObjectView、写 permit 与过期元数据。一般事务状态属于地址空间而非发起线程；等待远端确认的 System Call 通过 WaitContext park，发起线程终止只消散最终返回权。进程终止冻结后拒绝新事务并接管已 Commit 的事务；只有线程、active hart、事务与对象 lease 全部完成或进入可恢复收束后，地址空间才可进入最终 drain。
-最后一个地址翻译确认只把事务推进到 Retiring，不授予在 Remote Call 完成回调中执行任意宽度收束的许可。若 backing slice、表页或元数据的退役超过单次固定预算，事务成为显式的内核 work debt：由安全出口按游标逐批推进，未完成时由明确的 hart 唤醒所有者再次敲门，全部 owner 已在容器锁外释放后才进入 Complete、兑销 mandatory operation 并唤醒调用者。该机制没有后台内核线程，不绑定原发起线程，也不允许终止路径另建同步扫描旁路；进程终止只接管同一事务与同一游标。
+最后一个地址翻译确认只把事务推进到 Retiring，不授予在 Remote Call 完成回调中执行任意宽度收束的许可。若 backing slice、表页或元数据的退役超过单次固定预算，事务成为显式的内核 work debt：由安全出口按游标逐批推进，未完成时由明确的 hart 唤醒所有者再次敲门，全部 owner 已在容器锁外释放后才进入 Complete、兑销 mandatory operation 并唤醒调用者。该机制没有后台内核线程，不绑定原发起线程，也不允许终止路径另建同步扫描旁路；进程终止只接管同一事务与同一游标。唤醒点取 Complete 而非 Synchronize 是刻意取舍：单管线单完成点让结果义务、mandatory operation 与 join 边界共用一个定义，代价是调用者返回延迟包含全部 retire 批次、随 extent 数线性增长。若实测成为瓶颈，合法的范式内优化是把调用者返回提前到 Synchronize（对外完成边界不变），retire 纯后台推进；两者都不改变 Commit 与 Synchronize 的既有语义。
 
 ## 跨 Hart 地址翻译同步
 
@@ -189,9 +189,9 @@ Mutable --SealExecutable--> Sealing --last WritePermit retired--> Executable
 
 Mutable 允许只读 view，并允许在对象锁内取得 `WritePermit` 后建立或重新启用 writable view；不允许 executable view。`SealExecutable` 要求对象定义的管理 authority，并与 WritePermit 预留在同一对象锁上线性化：先取得 permit 的变更计入 seal 等待，先进入 Sealing 的对象拒绝新 writable view、重新加写权限和直接写入口。Sealing 允许既有 writable view 继续存在直至其 owner 显式撤销，但状态不可回退；Executable 永久拒绝全部写入口与 writable permit，只允许只读或读执行 view。普通 Protect 不能把读写 mapping 转成读执行，也不能重新打开已发布对象。
 
-WritePermit 的计数覆盖 reserved、published 和 retiring 三个阶段。Map/Protect 在 Commit 前放弃 permit 可以直接回滚；Commit 后移除 W 权限或 Unmap 时，permit 随旧 view 进入 retire，只有 active-hart 快照全部完成 `SFENCE.VMA` 并以 acquire 收齐确认后才退出计数。最后一个 permit 的 retire 负责把 Sealing 单向推进到 Executable，并完成仍存活的 seal waiter；seal 发起线程消散不撤销已发布状态转换。RX view 只能在观察 Executable 后建立，并为可能执行该代码代次的 hart 推进 instruction epoch 与 `FENCE.I`。
+WritePermit 的计数覆盖 reserved、published 和 retiring 三个阶段。Map/Protect 在 Commit 前放弃 permit 可以直接回滚；Commit 后移除 W 权限或 Unmap 时，permit 随旧 view 进入 retire，只有 active-hart 快照全部完成 `SFENCE.VMA` 并以 acquire 收齐确认后才退出计数。最后一个 permit 的 retire 负责把 Sealing 单向推进到 Executable 并发布对象的 `EXECUTABLE` 电平（见下）；seal 发起线程消散不撤销已发布状态转换。RX view 只能在观察 Executable 后建立，并为可能执行该代码代次的 hart 推进 instruction epoch 与 `FENCE.I`。
 
-状态机不遍历 view。对象只维护带溢出检查的 permit 计数和固定容量 seal 完成槽；首个调用发布 Sealing 后可以通过 WaitContext 等待，重复调用在 Executable 上幂等成功。Sealing 期间，空闲完成槽可挂接一个新 waiter，槽已占用则返回 Busy。精确公共 ABI 延后决定，但不得改变“seal 状态属于对象、发起者消散后继续、最后一个 permit retire 自动完成”的契约。受控直接写同样取得临时 WritePermit，数据写入结束并完成必要的 release 后才归还。
+状态机不遍历 view。对象只维护带溢出检查的 permit 计数；seal 完成不设专用等待槽，而是以 ObjectSignals 的 `EXECUTABLE` 电平位表达：进入 Executable 后持续为真，持 WAIT 的 Handle 经 WaitMany 观察该位，任意数量等待者复用通用等待面，无容量上限、无排队政策，重复 SealExecutable 在 Executable 上幂等成功。该形态以等待面的结构性容量取代按对象记账的完成槽，不改变「seal 状态属于对象、发起者消散后继续、最后一个 permit retire 自动完成」的契约。受控直接写同样取得临时 WritePermit，数据写入结束并完成必要的 release 后才归还。
 
 只读 view 不阻塞 seal，已有 writable 最大权限但当前不含 W 的 view也不持 permit；它日后尝试重新加 W 时必须重新取得 permit，因此在 Sealing/Executable 下失败。新代码版本通过新对象、新代次和用户态引用切换表达，不原地修改已发布代码。Handle 消散不撤销 view 或 seal；view 与 pending seal 都强持对象，最终 close 仍遵守固定 backing 容量上限。
 

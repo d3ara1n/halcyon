@@ -56,7 +56,7 @@ ProcessCreate 只创建 Building 空壳，不消费 MemoryPool，也不创建页
 
 Derive 是不可撤销 grant：parent 只以 ParentCredit 为 child 容量提供来源，不保留 child 列表或撤销入口；child、进程绑定和 backing 自然消散后额度才沿有界父链归还。强制回收需要另一种从创建时就带成员登记、撤销准入和有界 drain 的资源对象，不能给普通 Pool 补一个会追踪全系统 view 的 revoke。关闭或转移 Pool Handle 不撤销既有 binding、backing 或 descendant authority。
 
-MemoryObject 的公共 interface 只包含固定长度创建、固定宽 Query、通过内存映射 interface 建立对象子范围 view，以及单向 `SealExecutable`。首版没有 resize、COW、pager、对象内分配器、原始 frame capability 或通用 revoke；更大的逻辑对象和受限子范围授权由多个对象及用户态协议组合。创建从当前进程绑定池取得 affine charge 和实际 backing，charge 随对象而不是创建进程、Job 或 Handle 位置存活。对象 backing 唯一持有 charge；ObjectView 只强持对象与自己的 permit，不复制 backing 所有权。
+MemoryObject 的公共 interface 只包含固定长度创建、固定宽 Query、通过内存映射 interface 建立对象子范围 view，以及单向 `SealExecutable`；作为可等待对象公开 `EXECUTABLE` 电平位，等待复用 WaitMany 通用面与 WAIT right，语义由[内存模型](mm.md)拥有。首版没有 resize、COW、pager、对象内分配器、原始 frame capability 或通用 revoke；更大的逻辑对象和受限子范围授权由多个对象及用户态协议组合。创建从当前进程绑定池取得 affine charge 和实际 backing，charge 随对象而不是创建进程、Job 或 Handle 位置存活。对象 backing 唯一持有 charge；ObjectView 只强持对象与自己的 permit，不复制 backing 所有权。
 
 KernelMemoryBudget 与 MemoryPool 是两种正交 capability：前者支付内核 metadata 与对象壳，后者支付页后备资源。ProcessResources 可以同时持两种不可转移 binding，用户态资源管理器按政策组合交付；Job 不因此变成资源套餐或统计真值。在 KernelMemoryBudget 公开前，进程的内部 MetadataSponsor 只提供固定 permits；MemoryObject 等可脱离创建进程存活的对象取得 permit 后强持 sponsor 到自身析构，不能在进程 Dead 时提前退款或转嫁到持有 Handle 的进程。
 
