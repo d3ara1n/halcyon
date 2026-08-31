@@ -692,7 +692,7 @@ pub fn create(
             return Err(super::handle::map_error(error));
         }
     };
-    install_one(thread, entry, output, || {
+    super::handle::install_one(thread, entry, output, || {
         parent.commit_child(reservation, child);
     })
     .inspect_err(|_| {
@@ -802,42 +802,5 @@ pub fn derive(
             .map_err(super::handle::map_error)?
         }
     };
-    install_one(thread, entry, output, || {})
-}
-
-fn install_one(
-    thread: &Thread,
-    entry: super::handle::ProcessHandleEntry,
-    output: usize,
-    publish: impl FnOnce(),
-) -> Result<(), SystemCallError> {
-    let mut entries = alloc::vec::Vec::new();
-    entries
-        .try_reserve(1)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    entries.push(entry);
-    let token = super::handle::transaction_token();
-    let mut table = thread.process.handles.lock();
-    let reservation = table.reserve(1, token).map_err(super::handle::map_error)?;
-    let handle = reservation.handles()[0];
-    let mut space = thread.process.space.lock();
-    if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
-        drop(space);
-        table
-            .rollback(reservation)
-            .expect("single-handle install reservation must remain owned");
-        return Err(error.into());
-    }
-    // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
-    // 未提交的预留随进程消亡。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &handle) }?;
-    drop(space);
-    // 发布序（同 ProcessCreate）：输出值此刻仍是 Reserved 槽号（其他
-    // 线程不可用）；先完成不可失败的层级提交，再公开 capability——
-    // 窗口内其他线程即使拿到槽号也无法关闭唯一 Handle。
-    publish();
-    table
-        .commit(reservation, entries)
-        .expect("single-handle install count matches entry");
-    Ok(())
+    super::handle::install_one(thread, entry, output, || {})
 }

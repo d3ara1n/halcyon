@@ -2422,6 +2422,8 @@ pub struct Process {
     pub parent: Pid,
     /// 创建域仅维持归属（weak；生命周期根是 Job 直接成员表）。
     job: alloc::sync::Weak<super::job::Job>,
+    /// 页额度、metadata 与未来 CPU/设备预算的正交绑定容器。
+    pub(crate) resources: super::resources::ProcessResources,
     pub space: AddressSpace,
     /// 新对象 ABI 的进程本地 Handle 表。
     pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
@@ -2461,11 +2463,13 @@ impl Process {
         pid: Pid,
         parent: Pid,
         job: alloc::sync::Weak<super::job::Job>,
+        resources: super::resources::ProcessResources,
     ) -> Result<Self, SpaceError> {
         Ok(Self {
             pid,
             parent,
             job,
+            resources,
             space: AddressSpace::new()?,
             handles: crate::sync::Spinlock::chained(
                 crate::sync::ranks::HANDLE_TABLE,
@@ -2780,6 +2784,7 @@ pub fn spawn_from_elf(
         pid,
         parent,
         alloc::sync::Arc::downgrade(&job),
+        super::resources::ProcessResources::bootstrap(),
     )?);
     {
         let mut space = process.space.lock();

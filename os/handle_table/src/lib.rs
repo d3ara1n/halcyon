@@ -18,6 +18,7 @@ pub const DEFAULT_HANDLE_LIMIT: usize = 65_536;
 pub enum TableError {
     InvalidHandle,
     StaleHandle,
+    ObjectBusy,
     RightsDenied,
     DuplicateHandle,
     ReachLimit,
@@ -573,10 +574,16 @@ impl<T, R> HandleTable<T, R> {
         let Some(slot) = self.slots.get(index) else {
             return Err(TableError::StaleHandle);
         };
-        if slot.generation != handle.generation() || !matches!(slot.state, SlotState::Occupied(_)) {
+        if slot.generation != handle.generation() {
             return Err(TableError::StaleHandle);
         }
-        Ok(index)
+        match slot.state {
+            SlotState::Occupied(_) => Ok(index),
+            SlotState::Pinned(_, _) => Err(TableError::ObjectBusy),
+            SlotState::Vacant | SlotState::Reserved(_) | SlotState::Retired => {
+                Err(TableError::StaleHandle)
+            }
+        }
     }
 
     /// 空槽线性扫描（已知简化）：满表前每次 insert/reserve O(n)，
@@ -867,11 +874,11 @@ mod pin_tests {
         table.pin_consume(handle, Rights::READ, 7).unwrap();
         assert!(matches!(
             table.get(handle, Rights::READ),
-            Err(TableError::StaleHandle)
+            Err(TableError::ObjectBusy)
         ));
         assert!(matches!(
             table.remove(handle),
-            Err(TableError::StaleHandle)
+            Err(TableError::ObjectBusy)
         ));
         let consumed = table.commit_pinned_consume(7, handle);
         assert_eq!(*consumed.object(), 10);

@@ -40,6 +40,20 @@ type KernelSupplyPlanner = Planner<MAX_CLASSIFIED_RANGES, HEAP_CHUNK_LIMIT, RECO
 static SUPPLY_PLANNER: Spinlock<KernelSupplyPlanner> =
     Spinlock::new(crate::sync::ranks::LEAF, KernelSupplyPlanner::new());
 
+/// 平台 user supply 的一次性额度凭证；只冻结页数，不代表物理连续库存。
+pub(crate) struct RootPoolSeed {
+    pages: u64,
+}
+
+impl RootPoolSeed {
+    pub(crate) const fn into_pages(self) -> u64 {
+        self.pages
+    }
+}
+
+static ROOT_POOL_SEED: Spinlock<Option<RootPoolSeed>> =
+    Spinlock::new(crate::sync::ranks::LEAF, None);
+
 struct SupplyInputs {
     managed: [SupplyRange; MAX_MEMORY_REGIONS],
     permanent_raw: [(usize, usize); MAX_PERMANENT_RESERVATIONS],
@@ -62,6 +76,14 @@ impl SupplyInputs {
 
 static SUPPLY_INPUTS: Spinlock<SupplyInputs> =
     Spinlock::new(crate::sync::ranks::DRAIN_GATE, SupplyInputs::new());
+
+/// 消费启动供给账本冻结的唯一 root Pool 凭证。
+pub(crate) fn take_root_pool_seed() -> RootPoolSeed {
+    ROOT_POOL_SEED
+        .lock()
+        .take()
+        .expect("root Pool seed unavailable or already consumed")
+}
 
 /// 持锁访问帧库存（初始化前访问为致命错误）。
 fn with_pool<R>(f: impl FnOnce(&mut KernelFramePool) -> R) -> R {
@@ -224,9 +246,19 @@ pub fn init(board: &BoardInfo) {
         inventory.user_free_bytes() / PAGE_SIZE,
         "FramePool published supply differs from the plan"
     );
+    let root_pool_pages = free
+        .checked_add(boot_held_frames)
+        .and_then(|pages| u64::try_from(pages).ok())
+        .expect("root Pool page count overflow");
     drop(inventory);
     drop(planner);
     drop(inputs);
+    let mut seed = ROOT_POOL_SEED.lock();
+    assert!(seed.is_none(), "root Pool seed initialized twice");
+    *seed = Some(RootPoolSeed {
+        pages: root_pool_pages,
+    });
+    drop(seed);
     log!(
         Frame,
         "{} arena(s), total {} frame(s): permanent {}, boot-held {}, system {}, user-free {}",

@@ -65,7 +65,7 @@
 
 KernelMemoryBudget 公共能力不在本计划实现，但每个新增或改造对象在进入对应切片前必须登记并实现过渡 admission：sponsor、最大存量、permit 的唯一 owner、Commit 后是否分配、退款终点和终态壳的真实寿命。至少覆盖 Process core/Builder/Control、Pool core、charge reservation、AddressSpace/Region/ObjectView、MemoryObject/Connection、Handle reservation、MemoryChange、WaitContext 与 Remote Call slots。
 
-过渡 permit 来自物理隔离系统储备支撑的固定全局 slots。可信 ProcessCreate/bootstrap 取得一个不可转授、不可扩容的内部 `MetadataSponsor` 并附入 ProcessResources；Running Map、MemoryObject/Tunnel Create 等路径只从当前进程 sponsor 的类型化子额度预留 permits，不需要再次持资源管理 capability。独立于进程存活的对象把 permit 与 sponsor 强引用一起带到自身真实析构，不能在 creator Dead 或 capability 转移时提前退款。容器硬上限限制单对象宽度，sponsor/global slots 限制进程及全系统总量，三者不能互相替代。Process core 到 Dead 才退 core permit，Builder 随最后引用退自己的 permit，Control shell permit 随最后一个观察 capability 消散；Publish/Commit 后不得再取得新 permit。该表、实现和 metadata exhaustion-before-Commit 测试是每片准入门；自然顺序是在该片新增首个可放大对象之前完成，而不是等切片 10 补账。公共完成标准是所有用户可触达分配均可失败、permit 唯一退款且 Commit 后零分配；在此之前不得开放对应创建面，也不得把固定 heap 容量描述为 KernelMemoryBudget 或完整多租户 DoS 隔离。
+过渡 permit 来自物理隔离系统储备支撑的固定全局 slots。切片 2 先建立长期结构的最小骨架：可信 ProcessCreate/bootstrap 取得一个不可转授、不可扩容的内部 `MetadataSponsor` 并附入 `ProcessResources`，当前只开放 Pool core 类型化子额度；切片 4 在同一 `ProcessResources` 中增加 PoolBinding，并按后续对象逐类扩充 sponsor，不另建临时全局准入旁路。Running Map、MemoryObject/Tunnel Create 等路径只从当前进程 sponsor 的类型化子额度预留 permits，不需要再次持资源管理 capability。独立于进程存活的对象把 permit 与 sponsor 强引用一起带到自身真实析构，不能在 creator Dead 或 capability 转移时提前退款。容器硬上限限制单对象宽度，sponsor/global slots 限制进程及全系统总量，三者不能互相替代。Process core 到 Dead 才退 core permit，Builder 随最后引用退自己的 permit，Control shell permit 随最后一个观察 capability 消散；Publish/Commit 后不得再取得新 permit。该表、实现和 metadata exhaustion-before-Commit 测试是每片准入门；自然顺序是在该片新增首个可放大对象之前完成，而不是等切片 10 补账。公共完成标准是所有用户可触达分配均可失败、permit 唯一退款且 Commit 后零分配；在此之前不得开放对应创建面，也不得把固定 heap 容量描述为 KernelMemoryBudget 或完整多租户 DoS 隔离。
 
 ## 切片 1：平台供给账本与系统储备
 
@@ -92,11 +92,17 @@ Talc 5.0.4 的 `Source::acquire` 在 allocator 正忙时执行；内核 heap sou
 
 ## 切片 2：MemoryPool 状态机与 capability 对象
 
-新增 host 可测的 `memory_pool` 纯逻辑 crate，唯一拥有四项计数、深度、reserve/commit/rollback/return、derive 和 ParentCredit 自然归还。所有算术 checked，额度非零、depth、单次 derive、root total 与 parent identity 在构造边界冻结；纯逻辑层不分配帧、不访问 HandleTable。
+先冻结运行期供给与 metadata 前置。平台账本发布时生成只含 `user-free + boot-held` 页数的一次性 `RootPoolSeed`；后续动态 `free_frames()` 不得充当 root 总额度真值。启动链在 heap 可用后消费 seed 铸造唯一 root core，内核 anchor 持有至本次启动结束；本片不提前把 root Handle 交给 init，正式 bootstrap 交付仍属于切片 5。建立 host 可测的 `metadata_admission` 计数/permit 基座，并把只含 `MetadataSponsor` 的最小 `ProcessResources` 前移；Pool core 同时受全局与创建进程 sponsor 的类型化硬上限约束，permit 随 core 和 sponsor 强引用到真实析构，root 使用 boot-lifetime primordial permit。
 
-增加 MemoryPool kernel object、metadata permit、Handle kind/role、rights/固定宽 ABI 与 rinlib affine wrapper：`Query` 要求 READ，`Derive` 要求 CREATE，Building binding 要求 GRANT；duplicate/TRANSIT/GRANT 只传播同一 core authority。Query 返回 identity、parent identity、depth、total/available/reserved/allocated/delegated，不暴露对象列表。root core 只能由 boot supply ledger 铸造一次。
+新增 host 可测的 `memory_pool` 纯逻辑 crate，唯一拥有四项计数、深度与线性 token 状态转换。`ChargeReservation` 与 `DelegationReservation` 分型；reserve/commit/rollback/return、charge split/merge 和 delegated credit 全部 checked。token 以 crate 内不可伪造 owner key 绑定状态实例，外部 Pool identity 只作稳定对象身份；child state 与 parent credit 不可拆分，只有消费 fully-available child 才能取回额度。纯逻辑层不分配帧、不访问 HandleTable，也不持 `Arc` 或内核锁；内核适配层以 parent 强引用和 RAII owner 把 reservation、charge 与退款连接到具体 core。所有额度非零，root total、identity、parent identity 与 depth 在构造边界冻结；仅深度和 ABI 表示域构成结构上限，不为 O(1) Derive 另设无依据的单次页数上限。parent 不登记 child，父子退款逐锁完成，不嵌套 Pool 锁。
 
-验证：host debug/release 覆盖零/溢出、父子守恒、并发 reserve、失败 rollback、Handle 先关/charge 后归、child 多引用、深度上限、自然归父、伪造/重复退款失败；shared ABI 布局、unknown flags、rights 裁剪、object-kind 拒绝和 Pool core metadata exhaustion 有固定测试。
+增加 MemoryPool kernel object、metadata permit、Handle kind/role、rights、固定宽 Query ABI 与 rinlib typed owner wrapper：`Query` 要求 READ，`Derive` 要求 CREATE，Building binding 要求 GRANT；child 初始 rights 必须是来源 Handle rights 与目标最大 rights 的子集。duplicate/TRANSIT/GRANT 只传播同一 core authority。Query 返回 identity、parent identity、depth、total/available/reserved/allocated/delegated，不暴露对象列表；root 的 parent identity 为 0，全部计数使用 `u64` 页数。增加独立 `QuotaExceeded` 错误；未知 rights 位与非零 reserved 拒绝，不为当前无语义的 flags 制造 ABI 字段。HandleTable 同 generation 的 pinned 槽返回 `ObjectBusy`，generation 不匹配才返回 `StaleHandle`。
+
+Derive 遵循单一发布事务：先解析并强持 parent，预留 sponsor/global permit、parent delegated reservation、child core、输出 Handle 槽与用户结果承诺；parent `reserved → delegated` 是不可逆线性化点，随后把内嵌 parent credit 的 child state 与 parent 强引用共同激活并公开 Handle，Commit 后不分配、不执行可恢复失败。单 Handle 结果发布骨架从 Job 私有实现上收为 Handle 层共用机制。
+
+验证：host debug/release 覆盖零/溢出、父子守恒、并发 reserve、失败 rollback、charge split/merge、child 多引用、深度上限、自然归父、wrong-owner token、forget 只泄漏不扩容；metadata admission 覆盖全局/每 sponsor 耗尽、失败退款和独立对象延长 sponsor 寿命；shared ABI 覆盖布局、reserved、错误码与 rights；kernel/HandleTable 覆盖错误 kind/role/rights、输出 reservation 与 metadata exhaustion-before-Commit、同代 pin 冲突及 child 发布前后的计数快照。切片 2 可落 dormant syscall 与对象实现，但在切片 5 正式交付 root Handle 前不宣称用户态资源闭包已经开放。
+
+切片 2 已实现收口：root seed 启动账本闭合、Pool 四项状态机、双层 metadata sponsor、capability/ABI/rinlib affine owner 与 dormant syscall 均已落地。host debug/release、shared ABI、完整 `just acceptance` 均通过；启动自测实际穿过 kind/role/rights、sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit 与最后引用退款，并证明失败前后 root 快照不变。下一自然序进入切片 3 funded frame broker。
 
 ## 切片 3：funded frame broker
 

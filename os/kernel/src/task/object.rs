@@ -25,6 +25,7 @@ pub const OBJECT_WAIT_LIMIT: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Job,
+    MemoryPool,
     ProcessBuilder,
     ProcessControl,
     ThreadControl,
@@ -46,6 +47,7 @@ pub enum ObjectKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleRole {
     JobControl,
+    MemoryPool,
     ProcessBuilder,
     ProcessControl,
     ThreadControl,
@@ -62,18 +64,24 @@ pub enum HandleRole {
 
 /// 只含稳定身份的共同头；对象状态和订阅必须与类型数据共用一把对象锁。
 pub struct ObjectHeader {
-    #[expect(dead_code, reason = "对象诊断接口落地前只建立稳定身份框架")]
     koid: Koid,
 }
 
 impl ObjectHeader {
-    pub fn new() -> Self {
-        let koid = NEXT_KOID.fetch_add(1, Ordering::Relaxed);
-        assert!(koid != 0, "kernel object identity exhausted");
-        Self { koid }
+    /// 用户可触达对象使用的 fallible identity 铸造口。
+    pub fn try_new() -> Option<Self> {
+        NEXT_KOID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != 0).then(|| current.wrapping_add(1))
+            })
+            .ok()
+            .map(|koid| Self { koid })
     }
 
-    #[expect(dead_code, reason = "对象诊断接口使用")]
+    pub fn new() -> Self {
+        Self::try_new().expect("kernel object identity exhausted")
+    }
+
     pub const fn koid(&self) -> Koid {
         self.koid
     }

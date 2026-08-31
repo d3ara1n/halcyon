@@ -284,6 +284,32 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 Outcome::Completed
             }
         },
+        SystemCall::MemoryPoolQuery => {
+            respond_result(
+                frame,
+                task::memory_pool::query(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::MemoryPoolDerive => {
+            respond_result(
+                frame,
+                task::memory_pool::derive(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11],
+                    Rights::from_raw(frame.x[12]),
+                    frame.x[13] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::Sleep => {
             let ms = a0 as u64;
             if ms == 0 {

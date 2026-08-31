@@ -155,10 +155,48 @@ pub fn duplicate(
     Ok(())
 }
 
+/// 向调用者原子发布一个 Handle：先预留不可见槽并写回槽值，再执行不可失败
+/// 的对象提交，最后公开表项。publish 在 HandleTable 锁内执行，不得反向取低秩锁
+/// 或分配；失败返回时 publish 尚未发生。
+pub(crate) fn install_one(
+    thread: &super::Thread,
+    entry: ProcessHandleEntry,
+    output: usize,
+    publish: impl FnOnce(),
+) -> Result<(), SystemCallError> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    entries.push(entry);
+    let token = transaction_token();
+    let mut table = thread.process.handles.lock();
+    let reservation = table.reserve(1, token).map_err(map_error)?;
+    let handle = reservation.handles()[0];
+    let mut space = thread.process.space.lock();
+    if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
+        drop(space);
+        table
+            .rollback(reservation)
+            .expect("single-handle install reservation must remain owned");
+        return Err(error.into());
+    }
+    // SAFETY: Handle 无 padding；复检失败即杀本进程，未提交的预留随进程消亡。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &handle) }?;
+    drop(space);
+    // 输出中的槽此刻仍为 Reserved；先完成对象提交，再公开 capability。
+    publish();
+    table
+        .commit(reservation, entries)
+        .expect("single-handle install count matches entry");
+    Ok(())
+}
+
 pub fn map_error(error: TableError) -> SystemCallError {
     match error {
         TableError::InvalidHandle => SystemCallError::IllegalArgument,
         TableError::StaleHandle => SystemCallError::StaleHandle,
+        TableError::ObjectBusy => SystemCallError::ObjectBusy,
         TableError::RightsDenied => SystemCallError::RightsDenied,
         TableError::DuplicateHandle => SystemCallError::IllegalArgument,
         TableError::ReachLimit => SystemCallError::ReachLimit,

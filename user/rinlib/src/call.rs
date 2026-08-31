@@ -4,6 +4,7 @@ use core::arch::asm;
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
     mem::{Address, MemoryMapRequest, MemoryProtection},
+    memory_pool::MemoryPoolSnapshot,
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandlePair, Rights},
     proc::{
@@ -139,6 +140,36 @@ pub(crate) unsafe fn sys_memory_protect(
         bytes,
         protection as usize,
         0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_memory_pool_query(
+    pool: Handle,
+    output: &mut MemoryPoolSnapshot,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MemoryPoolQuery,
+        pool.raw() as usize,
+        output as *mut MemoryPoolSnapshot as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_memory_pool_derive(
+    parent: Handle,
+    pages: u64,
+    rights: Rights,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MemoryPoolDerive,
+        parent.raw() as usize,
+        pages as usize,
+        rights.raw() as usize,
+        output as *mut Handle as usize,
     )
     .map(|_| ())
 }

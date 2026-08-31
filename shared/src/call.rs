@@ -29,6 +29,8 @@ pub enum SystemCallError {
     AddressConflict = 0x23,
     /// 请求范围未被普通 mapping/reservation 完整覆盖。
     NotMapped = 0x24,
+    /// Pool 额度不足；不表示物理库存或 metadata 耗尽。
+    QuotaExceeded = 0x25,
     // Special operations
     /// Specific operation cannot be applied due to bad reference
     ObjectNotFound = 0x30,
@@ -145,6 +147,10 @@ pub enum SystemCall {
     MemoryUnmap = 0x51,
     /// 改变当前 Running process 已映射范围的页权限。
     MemoryProtect = 0x52,
+    /// 读取 MemoryPool 的固定宽账户快照。
+    MemoryPoolQuery = 0x53,
+    /// 从 parent Pool 不可撤销地派生 child Pool。
+    MemoryPoolDerive = 0x54,
 
     // -----Tunnel-----
     /// 创建共享页、Endpoint 和一次性 Invitation。
@@ -155,4 +161,16 @@ pub enum SystemCall {
     TunnelNotify = 0x62,
     /// 在协议无进展点确认本端 DATA 提示。
     TunnelAcknowledgeData = 0x63,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SystemCall, SystemCallError};
+
+    #[test]
+    fn memory_pool_numbers_are_stable() {
+        assert_eq!(SystemCallError::QuotaExceeded as usize, 0x25);
+        assert_eq!(SystemCall::MemoryPoolQuery as usize, 0x53);
+        assert_eq!(SystemCall::MemoryPoolDerive as usize, 0x54);
+    }
 }

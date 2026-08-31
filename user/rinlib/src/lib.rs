@@ -14,6 +14,7 @@ pub mod dbg;
 pub mod env;
 pub mod ipc;
 pub mod mm;
+pub mod memory_pool;
 pub mod preclude;
 pub mod process;
 #[cfg(target_arch = "riscv64")]

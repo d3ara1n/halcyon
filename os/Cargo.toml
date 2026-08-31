@@ -14,5 +14,7 @@ members = [
     "memory_space",
     "remote_call",
     "memory_supply",
+    "memory_pool",
+    "metadata_admission",
 ]
 resolver = "2"

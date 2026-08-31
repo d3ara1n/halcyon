@@ -12,6 +12,8 @@ pub mod boot;
 pub mod call;
 /// Memory related
 pub mod mem;
+/// MemoryPool capability 账户
+pub mod memory_pool;
 /// Process types
 pub mod proc;
 /// Service

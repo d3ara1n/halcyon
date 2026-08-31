@@ -49,6 +49,8 @@ pub mod ranks {
     pub const MAILBOX: Rank = Rank(210);
     /// Tunnel Connection 状态锁。
     pub const CONNECTION: Rank = Rank(220);
+    /// MemoryPool 四项额度状态；父子归还逐锁完成，不嵌套两把 Pool 锁。
+    pub const MEMORY_POOL: Rank = Rank(230);
     /// MemoryObject 可执行状态与 affine WritePermit 账目。
     pub const MEMORY_OBJECT: Rank = Rank(250);
     /// 用户地址空间（页表树/帧/外部映射/drain 阶段）。

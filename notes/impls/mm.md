@@ -1,6 +1,6 @@
 # 内存管理
 
-方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分六层：启动物理供给规划、帧库存、用户地址空间纯逻辑规划器、可 host 测试的 Sv39 页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
+方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分七层：启动物理供给规划、帧库存、MemoryPool 额度与准入、用户地址空间纯逻辑规划器、可 host 测试的页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
 
 ## 启动物理供给与系统储备
 
@@ -60,6 +60,24 @@ pub struct FrameTracker {
 ## 物理供给验证
 
 16 项 FramePool host 用例覆盖库存结构、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero 和 system heap ticket 首次消费。系统储备批次收口时（验收拆档前的 full workload）virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前阶段收尾由 `just acceptance` 分别执行 debug stress、release core 与 sifive_u core。
+
+## MemoryPool 额度与 metadata 准入
+
+`os/kernel/src/frame.rs` 在平台账本首次发布完成时冻结一次性 `RootPoolSeed`，其页数严格等于当时 `user-free + boot-held`；后续 boot-held 回投只改变物理库存，不改变 root 总额度。heap 可用后，`task/memory_pool.rs` 消费 seed 铸造唯一 root core，并由内核全局 anchor 持有到本次启动结束。启动日志同时打印帧分类和 root 页数，可直接核对这一闭包。
+
+`os/memory_pool` 是 `no_std`、禁止 unsafe 的四项额度状态机，恒保持：
+
+```text
+total = available + reserved + allocated + delegated
+```
+
+charge 与 delegation 使用不同的线性 reservation/credit 类型，所有转换均作 checked arithmetic。每个状态实例另有 crate 内原子铸造、外部不可伪造的 `OwnerKey`；ABI Pool identity 只作稳定诊断身份，即使调用者重复提供相同 identity，token 也不能跨实例提交。child 在 Prepared 阶段消费唯一 delegation reservation；Commit 将 parent `reserved → delegated`，并把 delegated credit 内嵌进 child state。只有消费 fully-available child 才能取出 parent credit，因此不存在 child 仍可继续派生而额度已提前归父的安全 API。深度上限唯一来自 shared ABI 常量，当前为 32。
+
+`os/metadata_admission` 提供固定容量 `Counter/Permit/SponsoredPermit`。`task/resources.rs` 在 `ProcessResources` 中持不可转授的 `MetadataSponsor`：Pool core 同时取得全局 slot 与 creator sponsor 的本地 slot，permit 强持 sponsor 并随 core 真实析构；creator 进程或 Handle 提前消散不会退款。root 使用只占全局 slot 的 primordial permit。当前硬上限为全局 4096 个 sponsor、全局 4096 个 Pool core、每 sponsor 1024 个 Pool core。
+
+内核 `MemoryPool` 对象以 `Prepared → Committing → Active` 表达 Handle 发布事务。Prepared owner 在任何发布前失败时析构并回滚 parent reservation；Commit 后 child state 内嵌 credit、同时强持 parent，最后一个 core 引用消散时消费 child state、逐把锁把额度归父。`MemoryPoolQuery` 要求 READ，`MemoryPoolDerive` 要求 CREATE；child rights 必须是来源 rights 与 Pool 最大 rights 的子集，GRANT 为后续 Building binding 保留。root Handle 尚未交给 init，当前 syscall 对普通用户态保持 dormant，正式 bootstrap 交付属于后续切片。rinlib `MemoryPool` 是带 Drop close 的 affine owner，显式 `into_handle` 才把 authority 移回通用传输面。
+
+14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；6 项 admission 用例覆盖全局/本地耗尽、部分失败退款和 sponsor 强保活。启动自检另穿过错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用与最后引用退款；debug stress、release core 与 sifive_u core 的完整 acceptance 均通过。
 
 ## 页表模式选择
 

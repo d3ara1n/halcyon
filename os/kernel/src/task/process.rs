@@ -367,8 +367,10 @@ fn create_staged(
     output: usize,
     member_reservation: super::job::MemberReservation,
 ) -> Result<(), SystemCallError> {
+    let resources = super::resources::ProcessResources::try_new()?;
     let process = Arc::try_new(
-        Process::new(pid, thread.process.pid, Arc::downgrade(&job)).map_err(map_space_error)?,
+        Process::new(pid, thread.process.pid, Arc::downgrade(&job), resources)
+            .map_err(map_space_error)?,
     )
     .map_err(|_| SystemCallError::OutOfMemory)?;
     let builder = ProcessBuilder::new(process.clone())?;

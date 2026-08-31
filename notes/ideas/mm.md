@@ -95,9 +95,9 @@ MemoryPool 是 page-backed storage 的 capability 账户，不是物理分区，
 total = available + reserved + allocated + delegated
 ```
 
-`ChargeReservation` 从 available 预留额度，放弃时原额回滚；物理 backing 全部取得后，reservation 不可失败地提交为与 extent 同寿命的 `MemoryCharge`，计入 allocated。`MemoryCharge` 不可复制，只能在同一 pool 内随 backing 做守恒 split/merge，最终归还 allocated。派生子池把 reservation 提交为 `ParentCredit` 并计入 delegated；普通 Handle duplicate、TRANSIT 或 GRANT 只改变同一 core 的 authority 可达性，不改变四项计数。额度不足与实际库存不足是不同失败：前者表示 quota 不足，后者表示物理或元数据资源暂不可满足。
+`ChargeReservation` 从 available 预留额度，放弃时原额回滚；物理 backing 全部取得后，reservation 不可失败地提交为与 extent 同寿命的 `MemoryCharge`，计入 allocated。`MemoryCharge` 不可复制，只能在同一 pool 内随 backing 做守恒 split/merge，最终归还 allocated。派生子池把 reservation 提交为与 child core 不可分离的 `ParentCredit` 并计入 delegated；只有销毁全部额度已回到 available 的 child，才能兑回这笔 credit，任何仍可继续使用的 child 都不能与退款同时存在。普通 Handle duplicate、TRANSIT 或 GRANT 只改变同一 core 的 authority 可达性，不改变四项计数。额度不足与实际库存不足是不同失败：前者表示 quota 不足，后者表示物理或元数据资源暂不可满足。
 
-Pool 形成单向强引用图：Handle、进程绑定、MemoryCharge 与 child 的 ParentCredit 各自保活来源 core；child 只通过 ParentCredit 强持 parent，parent 不登记 child、backing、进程或地址空间。最后一个 child 引用消散时，只有其全部额度已回到 available 才沿有界深度父链自然归还；任何计数不一致都属于内核不变量失败，不能通过错误退款扩大父池。Pool 不提供 child 枚举、关闭状态、等待电平、reparent 或通用 revoke，因此普通 close 不扫描对象图。
+Pool 形成单向强引用图：Handle、进程绑定与 MemoryCharge 各自保活来源 core；child 以不可分离的 ParentCredit 义务强持 parent，parent 不登记 child、backing、进程或地址空间。最后一个 child 引用消散时，只有其全部额度已回到 available 且 child 身份同步终结，才沿有界深度父链自然归还；任何计数不一致或“退款后仍可操作 child”的状态都属于内核不变量失败，不能通过错误退款扩大父池。Pool 不提供 child 枚举、关闭状态、等待电平、reparent 或通用 revoke，因此普通 close 不扫描对象图。
 
 Derive 是不可撤销的资源 grant，不是可召回租借。父级在所有自然引用和 charge 消散前不能强制取回额度；MemoryObject 或 Pool capability 跨进程、跨 Job 转移也不重记来源。需要强制收回的未来场景必须从一开始使用具有显式成员、撤销准入和有界 drain 的 MemoryLease/资源域，不能改变普通 Pool 和既有 view 的单调授权语义。
 
