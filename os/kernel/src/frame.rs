@@ -8,7 +8,9 @@
 use alloc::sync::Arc;
 
 use frame_pool::{ArenaMetadata, ExtentGeometry, FramePool, MAX_ARENAS, metadata_bytes};
-use funded_frame::{Limits as FundingLimits, PhysicalClaim, PhysicalSource, QuotaSource};
+use funded_frame::{
+    Limits as FundingLimits, PhysicalClaim, PhysicalSource, QuotaReservation, QuotaSource,
+};
 use memory_supply::{HeapChunkTicket, Planner, Range as SupplyRange, Requirements, SystemSupply};
 use page_table::{FrameNumber, PAGE_BITS};
 
@@ -546,6 +548,125 @@ pub(crate) fn fund_user_frames(
         })
 }
 
+type UserFundedRootInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
+
+/// AddressSpace root 的单 extent 资金化 owner。专用一槽存储避免把通用 64-extents
+/// backing 内联进每个 Unbound shell 与 Bind 调用栈。
+pub(crate) struct FundedRootFrame {
+    inner: UserFundedRootInner,
+}
+
+impl FundedRootFrame {
+    pub(crate) fn frame(&self) -> FrameNumber {
+        let mut claims = self.inner.claims();
+        let claim = claims.next().expect("funded root lost its physical claim");
+        assert!(claims.next().is_none(), "funded root must have one extent");
+        assert_eq!(claim.geometry().count(), 1, "funded root must own one page");
+        claim.geometry().base()
+    }
+}
+
+pub(crate) fn fund_user_root(
+    pool: &Arc<MemoryPool>,
+) -> Result<FundedRootFrame, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
+    funded_frame::fund::<_, _, 1>(
+        &PoolQuota(pool),
+        &UserInventory,
+        1,
+        FundingLimits {
+            max_pages: 1,
+            max_extents: 1,
+        },
+    )
+    .map(|inner| FundedRootFrame { inner })
+}
+
+/// 从未发布到 user inventory 的启动期 extent。构造只存在于验证后的 bootstrap
+/// owner 移交点；类型本身负责防止普通 funded path 伪造保留内容。
+#[must_use = "boot-held extent must be released or adopted into funded backing"]
+pub(crate) struct BootHeldExtent {
+    tracker: FrameTracker,
+}
+
+impl BootHeldExtent {
+    /// # Safety
+    ///
+    /// `[base, base + pages)` 必须属于平台账本中的 boot-held 分类，尚未发布到
+    /// FramePool，且本次启动中只允许构造一次 owner。
+    pub(crate) unsafe fn adopt(base: FrameNumber, pages: usize) -> Self {
+        Self {
+            tracker: FrameTracker::from_claimed(base, pages),
+        }
+    }
+
+    pub(crate) fn base(&self) -> FrameNumber {
+        self.tracker.base()
+    }
+
+    pub(crate) fn pages(&self) -> usize {
+        self.tracker.count()
+    }
+
+    pub(crate) fn split_at(self, pages: usize) -> (Self, Self) {
+        let (left, right) = self.tracker.split_at(pages);
+        (Self { tracker: left }, Self { tracker: right })
+    }
+}
+
+/// 保留启动内容的 primordial funded extent。字段顺序保证析构先把物理页发布回
+/// user inventory，再归还 root Pool charge；split 同步切割两侧 affine owner。
+#[must_use = "funded boot extent must remain owned until its mapping retires"]
+pub(crate) struct BootFundedExtent {
+    physical: BootHeldExtent,
+    charge: MemoryCharge,
+}
+
+impl BootFundedExtent {
+    pub(crate) fn base(&self) -> FrameNumber {
+        self.physical.base()
+    }
+
+    pub(crate) fn pages(&self) -> usize {
+        self.physical.pages()
+    }
+
+    pub(crate) fn split_at(mut self, pages: usize) -> (Self, Self) {
+        assert!(
+            pages > 0 && pages < self.pages(),
+            "boot-funded split must be internal"
+        );
+        let right_pages = self.pages() - pages;
+        let right_charge = self
+            .charge
+            .split(right_pages)
+            .expect("boot-funded charge split must preserve its owner");
+        let (left_physical, right_physical) = self.physical.split_at(pages);
+        (
+            Self {
+                physical: left_physical,
+                charge: self.charge,
+            },
+            Self {
+                physical: right_physical,
+                charge: right_charge,
+            },
+        )
+    }
+}
+
+pub(crate) fn fund_boot_held(
+    pool: &Arc<MemoryPool>,
+    extent: BootHeldExtent,
+) -> Result<BootFundedExtent, memory_pool::PoolError> {
+    let pages = extent.pages();
+    let reservation = MemoryPool::reserve_charge(pool, pages)?;
+    let charge = reservation.commit();
+    Ok(BootFundedExtent {
+        physical: extent,
+        charge,
+    })
+}
+
 /// 启动自检：真实穿过 quota、库存、清零、commit、extent 上限回滚与自然退款。
 pub(crate) fn funded_selftest(root: &Arc<MemoryPool>) {
     const PAGES: usize = 3;
@@ -739,15 +860,6 @@ impl FrameTracker {
     /// `frame` 必须是此前由 [`Self::into_table_frame`] 唯一移交、且尚未收回的帧。
     pub(crate) unsafe fn adopt_table_frame(frame: FrameNumber) -> Self {
         Self::from_claimed(frame, 1)
-    }
-
-    /// 收编从未发布到空闲库存的启动 reservation。
-    ///
-    /// # Safety
-    ///
-    /// `[base, base + count)` 必须完整托管、尚未进入库存，且所有权只移交一次。
-    pub(crate) unsafe fn adopt_reserved(base: FrameNumber, count: usize) -> Self {
-        Self::from_claimed(base, count)
     }
 }
 

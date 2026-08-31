@@ -49,6 +49,7 @@ struct BuilderState {
 
 pub struct ProcessBuilder {
     header: ObjectHeader,
+    _metadata: super::resources::BuilderPermit,
     state: crate::sync::Spinlock<BuilderState>,
     wait: crate::sync::Spinlock<ObjectWaitState>,
 }
@@ -56,6 +57,9 @@ pub struct ProcessBuilder {
 impl ProcessBuilder {
     fn new(process: Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
+            _metadata: super::resources::MetadataSponsor::reserve_builder(
+                process.resources.metadata(),
+            )?,
             header: ObjectHeader::new(),
             state: crate::sync::Spinlock::new(
                 crate::sync::ranks::OBJECT_WAIT,
@@ -174,12 +178,16 @@ struct ControlState {
 
 pub struct ProcessControl {
     header: ObjectHeader,
+    _metadata: super::resources::ControlPermit,
     state: crate::sync::Spinlock<ControlState>,
 }
 
 impl ProcessControl {
     pub(crate) fn new(core: &Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
+            _metadata: super::resources::MetadataSponsor::reserve_control(
+                core.resources.metadata(),
+            )?,
             header: ObjectHeader::new(),
             state: crate::sync::Spinlock::new(
                 crate::sync::ranks::OBJECT_WAIT,
@@ -428,6 +436,116 @@ fn create_staged(
     Ok(())
 }
 
+/// 为 Unbound shell 准备完整 BoundAddressSpace。全部可失败工作发生在发布前；
+/// owner 析构同时回滚 metadata permit、root frame 与 Pool charge。
+fn prepare_memory_binding(
+    process: &Arc<Process>,
+    pool: Arc<super::memory_pool::MemoryPool>,
+) -> Result<super::proc::BoundAddressSpace, SystemCallError> {
+    let binding = super::resources::PoolBinding::prepare(pool, process.resources.metadata())?;
+    super::proc::BoundAddressSpace::new(binding).map_err(map_space_error)
+}
+
+/// Bootstrap 复用普通 Bind 的资源准备与 Unbound→Bound 提交语义；唯一差异是 root
+/// Pool authority 来自 primordial owner，不经过用户 Handle pin。
+pub(crate) fn bind_memory_internal(
+    process: &Arc<Process>,
+    pool: Arc<super::memory_pool::MemoryPool>,
+) -> Result<(), SystemCallError> {
+    let bound = prepare_memory_binding(process, pool)?;
+    process
+        .space
+        .lock()
+        .bind(bound)
+        .map_err(|_| SystemCallError::ObjectNotAvailable)
+}
+
+/// ProcessBindMemory(builder, pool)：登记获胜的 Building operation。builder 只作受保护
+/// authority，pool entry 成功时被消费；Bound 发布与逻辑消费在同一双锁提交段完成。
+pub fn bind_memory(
+    thread: &Thread,
+    builder_handle: Handle,
+    pool_handle: Handle,
+) -> Result<(), SystemCallError> {
+    if builder_handle == pool_handle {
+        return Err(SystemCallError::IllegalArgument);
+    }
+    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
+    let process = concrete_builder(&builder_object)?.process()?;
+    let _lease = BuildingLease::begin(process.clone())?;
+    if process.space.lock().is_bound() {
+        return Err(SystemCallError::ObjectNotAvailable);
+    }
+    let _bind_reservation = process.resources.try_reserve_binding()?;
+    // 与前一竞争者释放 reservation 后再判一次，保证串行重复 Bind 不消耗额度。
+    if process.space.lock().is_bound() {
+        return Err(SystemCallError::ObjectNotAvailable);
+    }
+
+    let pin_token = super::handle::transaction_token();
+    let (pool, pool_rights) = {
+        let mut table = thread.process.handles.lock();
+        let entry = table
+            .get(pool_handle, Rights::GRANT)
+            .map_err(super::handle::map_error)?;
+        if *entry.role() != HandleRole::MemoryPool
+            || entry.object().kind() != ObjectKind::MemoryPool
+        {
+            return Err(SystemCallError::WrongObjectType);
+        }
+        let pool = super::memory_pool::MemoryPool::concrete(entry.object())?;
+        let rights = entry.rights();
+        table
+            .pin_transfer(
+                builder_handle,
+                Rights::MANAGE,
+                &[(pool_handle, rights)],
+                pin_token,
+            )
+            .map_err(super::handle::map_error)?;
+        (pool, rights)
+    };
+
+    let mut moved = Vec::new();
+    if moved.try_reserve_exact(1).is_err() {
+        thread.process.handles.lock().unpin(pin_token);
+        return Err(SystemCallError::OutOfMemory);
+    }
+    let bound = match prepare_memory_binding(&process, pool) {
+        Ok(bound) => bound,
+        Err(error) => {
+            thread.process.handles.lock().unpin(pin_token);
+            return Err(error);
+        }
+    };
+
+    {
+        // HANDLE_TABLE → ADDRESS_SPACE 符合 Lock Ladder。两 entry 均处于 Pinned，
+        // 因而其它线程只能观察 ObjectBusy，不能越过提交点消费或关闭。
+        let mut table = thread.process.handles.lock();
+        let mut space = process.space.lock();
+        if space.is_bound() {
+            drop(space);
+            table.unpin(pin_token);
+            return Err(SystemCallError::ObjectNotAvailable);
+        }
+        space
+            .bind(bound)
+            .unwrap_or_else(|_| unreachable!("Unbound bind precheck changed under one lock"));
+        table.commit_pinned_transfer(
+            pin_token,
+            builder_handle,
+            &[(pool_handle, pool_rights)],
+            &mut moved,
+        );
+    }
+    let pool_entry = moved
+        .pop()
+        .expect("BindMemory committed Pool entry missing");
+    super::handle::close_entry_infallible(pool_entry, &thread.process, false);
+    Ok(())
+}
+
 struct BuildingLease {
     process: Arc<Process>,
     active: bool,
@@ -442,6 +560,11 @@ impl BuildingLease {
             process,
             active: true,
         })
+    }
+
+    /// 只有持有已登记 lease 才能调用终止截止后仍具提交资格的 Attach seam。
+    fn attach_thread(&self, context: ThreadStartContext) -> Result<Tid, ThreadAttachError> {
+        self.process.attach_thread_registered(context)
     }
 
     /// begin_running 已在 lifecycle 线性化点消费 Building 操作登记。
@@ -524,8 +647,8 @@ pub fn attach(
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let builder = &concrete_builder(&builder_object)?;
     let process = builder.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    process
+    let lease = BuildingLease::begin(process)?;
+    lease
         .attach_thread(descriptor)
         .map_err(|error| match error {
             ThreadAttachError::Context(error) => map_space_error(error),
@@ -672,6 +795,9 @@ pub fn start(
     let builder = &concrete_builder(&builder_object)?;
     let process = builder.process()?;
     let lease = BuildingLease::begin(process.clone())?;
+    if !process.space.lock().is_bound() {
+        return Err(SystemCallError::ObjectNotAvailable);
+    }
     match start_staged(thread, builder_handle, builder, &process, requirement) {
         Ok(()) => {
             lease.commit_running();
@@ -968,5 +1094,6 @@ fn map_space_error(error: SpaceError) -> SystemCallError {
         SpaceError::BadSegment => SystemCallError::IllegalArgument,
         SpaceError::Conflict => SystemCallError::InvalidAddress,
         SpaceError::Busy => SystemCallError::ObjectBusy,
+        SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
     }
 }

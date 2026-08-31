@@ -7,7 +7,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
     mem::{MemoryMapRequest, MemoryMapResult, MemoryPlacement, MemoryProtection},
-    proc::{Pid, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
+    proc::{Pid, ProcessExitReason, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
 use memory_space::{
     AddressRange, AnonymousClass, BackingId, BackingView, ChangeError, LeaseKey, Limits,
@@ -51,6 +51,8 @@ pub enum SpaceError {
     Conflict,
     /// 与其它在途 MemoryChange footprint 冲突。
     Busy,
+    /// Building 空壳尚未附入 MemoryPool/TranslationTree。
+    Unbound,
 }
 
 #[derive(Debug)]
@@ -74,37 +76,67 @@ impl From<MapError> for SpaceError {
     }
 }
 
-struct TableFrameToken(FrameTracker);
+enum TableFrameToken {
+    /// root 物理页由 BoundAddressSpace 的 PoolBinding 保活；TableTree 只借用几何。
+    BorrowedRoot(FrameNumber),
+    /// 切片 6 前的过渡中间表帧，仍由 TableTree 直接拥有。
+    Owned(FrameTracker),
+}
 
 impl ReservedTableFrame for TableFrameToken {
     fn number(&self) -> FrameNumber {
-        FrameNumber(self.0.base().addr() / PAGE_SIZE)
+        match self {
+            Self::BorrowedRoot(frame) => *frame,
+            Self::Owned(tracker) => FrameNumber(tracker.base().addr() / PAGE_SIZE),
+        }
     }
 
     fn commit(self) -> FrameNumber {
-        self.0.into_table_frame()
+        match self {
+            Self::BorrowedRoot(frame) => frame,
+            Self::Owned(tracker) => tracker.into_table_frame(),
+        }
     }
 }
 
-/// [`TableTree`] 的帧来源：表帧通过显式 transfer 交树持有，树 Drop 时归还。
-struct TableMem;
+/// [`TableTree`] 的帧来源。root 只借用 PoolBinding 的 funded frame；中间表在
+/// 切片 6 全面资金化前继续走登记过的 transitional raw adapter。
+struct TableMem {
+    borrowed_root: FrameNumber,
+    initial_root: Option<FrameNumber>,
+}
+
+impl TableMem {
+    fn new(root: FrameNumber) -> Self {
+        Self {
+            borrowed_root: root,
+            initial_root: Some(root),
+        }
+    }
+}
 
 impl FrameMemory for TableMem {
     type ReservedFrame = TableFrameToken;
 
     fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, page_table::FrameExhausted> {
+        if let Some(root) = self.initial_root.take() {
+            return Ok(TableFrameToken::BorrowedRoot(root));
+        }
         frame::alloc_user_order(0)
-            .map(TableFrameToken)
+            .map(TableFrameToken::Owned)
             .ok_or(page_table::FrameExhausted)
     }
 
     fn free_frame(&mut self, frame: FrameNumber) {
-        // SAFETY: FrameMemory 只回传此前由 alloc_frame 唯一移交给该树的表帧。
+        if frame == self.borrowed_root {
+            return;
+        }
+        // SAFETY: FrameMemory 只回传此前由 Owned token 唯一移交给该树的表帧。
         drop(unsafe { FrameTracker::adopt_table_frame(frame) });
     }
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [page_table::Pte; page_table::ENTRIES] {
-        // SAFETY: 表帧来自帧池（页对齐、已清零），经直映射访问。
+        // SAFETY: 表帧来自 funded root 或帧池（页对齐、已清零），经直映射访问。
         unsafe { &mut *(mm::phys_to_virt(frame.addr()) as *mut _) }
     }
 }
@@ -117,9 +149,68 @@ const MEMORY_SPACE_LIMITS: Limits = Limits {
     max_lease_segments: 64,
 };
 
+enum BackingExtentOwner {
+    Raw(FrameTracker),
+    Boot(frame::BootFundedExtent),
+    /// Bootstrap Prepare 期间由外层 `BootFundedExtent` 强持的只读几何；进程发布前
+    /// 必须由 `install_bootstrap_funding` 替换为 Boot。
+    BootBorrowed {
+        base: FrameNumber,
+        pages: usize,
+    },
+}
+
+impl BackingExtentOwner {
+    fn base(&self) -> FrameNumber {
+        match self {
+            Self::Raw(tracker) => tracker.base(),
+            Self::Boot(extent) => extent.base(),
+            Self::BootBorrowed { base, .. } => *base,
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Self::Raw(tracker) => tracker.count(),
+            Self::Boot(extent) => extent.pages(),
+            Self::BootBorrowed { pages, .. } => *pages,
+        }
+    }
+
+    fn split_at(self, pages: usize) -> (Self, Self) {
+        match self {
+            Self::Raw(tracker) => {
+                let (left, right) = tracker.split_at(pages);
+                (Self::Raw(left), Self::Raw(right))
+            }
+            Self::Boot(extent) => {
+                let (left, right) = extent.split_at(pages);
+                (Self::Boot(left), Self::Boot(right))
+            }
+            Self::BootBorrowed { .. } => {
+                panic!("bootstrap borrowed extent cannot be split before owner installation")
+            }
+        }
+    }
+}
+
 struct BackingExtent {
     offset_pages: usize,
-    tracker: FrameTracker,
+    owner: BackingExtentOwner,
+}
+
+enum RetiredSpaceResource {
+    Backing(BackingExtentOwner),
+    Binding(super::resources::PoolBinding),
+}
+
+impl RetiredSpaceResource {
+    fn release(self) {
+        match self {
+            Self::Backing(owner) => drop(owner),
+            Self::Binding(binding) => drop(binding),
+        }
+    }
 }
 
 struct OwnedBacking {
@@ -261,7 +352,7 @@ impl OwnedBacking {
             let count = tracker.count();
             extents.push(BackingExtent {
                 offset_pages: allocated,
-                tracker,
+                owner: BackingExtentOwner::Raw(tracker),
             });
             allocated += count;
         }
@@ -270,6 +361,33 @@ impl OwnedBacking {
             pages,
             extents,
         })
+    }
+
+    /// 在 backing 尚未发布时从起点回填；调用方保证 source 不越过逻辑长度。
+    fn write_from_start(&mut self, source: &[u8]) {
+        assert!(
+            source.len() <= self.pages * PAGE_SIZE,
+            "backing initialization exceeds its logical length"
+        );
+        let mut copied = 0;
+        for extent in &self.extents {
+            let extent_start = extent.offset_pages * PAGE_SIZE;
+            if extent_start >= source.len() {
+                break;
+            }
+            let count = (extent.owner.count() * PAGE_SIZE).min(source.len() - extent_start);
+            // SAFETY: backing owner 独占对应物理 extent，且尚未发布到任何地址空间；
+            // source/count 已由逻辑长度与 extent 几何共同约束。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source[extent_start..].as_ptr(),
+                    mm::phys_to_virt(extent.owner.base().addr()) as *mut u8,
+                    count,
+                );
+            }
+            copied += count;
+        }
+        assert_eq!(copied, source.len(), "backing geometry is not contiguous");
     }
 
     fn prepare_install(
@@ -295,7 +413,7 @@ impl OwnedBacking {
             .map_err(|_| SpaceError::NoFrame)?;
         for extent in &self.extents {
             let extent_start = extent.offset_pages;
-            let extent_end = extent_start + extent.tracker.count();
+            let extent_end = extent_start + extent.owner.count();
             let start = extent_start.max(first_page);
             let end = extent_end.min(end_page);
             if start >= end {
@@ -306,7 +424,7 @@ impl OwnedBacking {
             prepared.push(tree.prepare_map(
                 Vpn(range.start() / PAGE_SIZE + page_offset),
                 end - start,
-                Ppn(extent.tracker.base().addr() / PAGE_SIZE + physical_offset),
+                Ppn(extent.owner.base().addr() / PAGE_SIZE + physical_offset),
                 protection_flags(protection),
             )?);
         }
@@ -315,7 +433,7 @@ impl OwnedBacking {
             .iter()
             .map(|extent| {
                 let start = extent.offset_pages.max(first_page);
-                let end = (extent.offset_pages + extent.tracker.count()).min(end_page);
+                let end = (extent.offset_pages + extent.owner.count()).min(end_page);
                 end.saturating_sub(start)
             })
             .sum();
@@ -342,7 +460,7 @@ impl OwnedBacking {
         let mut index = 0;
         while index < self.extents.len() {
             let extent_start = self.extents[index].offset_pages;
-            let extent_end = extent_start + self.extents[index].tracker.count();
+            let extent_end = extent_start + self.extents[index].owner.count();
             let cut_start = extent_start.max(release_start);
             let cut_end = extent_end.min(release_end);
             if cut_start >= cut_end {
@@ -354,7 +472,7 @@ impl OwnedBacking {
             let left_pages = cut_start - extent_start;
             let retired_pages = cut_end - cut_start;
             let right_pages = extent_end - cut_end;
-            let mut retired = extent.tracker;
+            let mut retired = extent.owner;
 
             if left_pages != 0 {
                 let (left, tail) = retired.split_at(left_pages);
@@ -362,7 +480,7 @@ impl OwnedBacking {
                     index,
                     BackingExtent {
                         offset_pages: extent_start,
-                        tracker: left,
+                        owner: left,
                     },
                 );
                 index += 1;
@@ -375,7 +493,7 @@ impl OwnedBacking {
                     index,
                     BackingExtent {
                         offset_pages: cut_end,
-                        tracker: right,
+                        owner: right,
                     },
                 );
                 index += 1;
@@ -499,6 +617,7 @@ fn map_public_space_error(error: SpaceError) -> SystemCallError {
         SpaceError::BadSegment => SystemCallError::InternalError,
         SpaceError::Conflict => SystemCallError::AddressConflict,
         SpaceError::Busy => SystemCallError::ObjectBusy,
+        SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
     }
 }
 
@@ -535,8 +654,6 @@ enum DrainStage {
     Tables { root: usize, l1: usize },
     /// 全部子表已空：逐项验证 root 512 槽后交出 root 帧。
     Root { slot: usize },
-    /// root 帧已交出、有界归还在途（tree 已 None）。
-    RootFree,
     /// 资源全空（root 已释放）；仅剩空壳。
     Done,
 }
@@ -557,6 +674,93 @@ pub struct AddressSpace {
     translation_epoch: AtomicU64,
     instruction_epoch: AtomicU64,
     state: crate::sync::Spinlock<AddressSpaceState>,
+}
+
+/// 稳定 AddressSpace 身份下的一次性资源状态。Unbound 不持页额度、ledger 或页表；
+/// Bound 的全部资源由同一个 PoolBinding 与可恢复 drain 生命周期拥有。
+pub(crate) enum AddressSpaceState {
+    Unbound,
+    Bound(BoundAddressSpace),
+}
+
+impl AddressSpaceState {
+    pub(crate) fn is_bound(&self) -> bool {
+        matches!(self, Self::Bound(_))
+    }
+
+    pub(crate) fn bind(&mut self, bound: BoundAddressSpace) -> Result<(), BoundAddressSpace> {
+        if !matches!(self, Self::Unbound) {
+            return Err(bound);
+        }
+        *self = Self::Bound(bound);
+        Ok(())
+    }
+
+    pub fn map_anonymous(
+        &mut self,
+        vaddr: usize,
+        len: usize,
+        permissions: ProcessMapFlags,
+    ) -> Result<(), SpaceError> {
+        self.bound_mut()?.map_anonymous(vaddr, len, permissions)
+    }
+
+    pub fn write_building(&mut self, target: usize, source: &[u8]) -> Result<(), SpaceError> {
+        self.bound_mut()?.write_building(target, source)
+    }
+
+    pub fn validate_initial_context(
+        &mut self,
+        entry: usize,
+        stack_pointer: usize,
+    ) -> Result<(), SpaceError> {
+        self.bound_mut()?
+            .validate_initial_context(entry, stack_pointer)
+    }
+
+    pub fn drain(&mut self, budget: usize) -> (usize, bool) {
+        match self {
+            Self::Unbound => (0, true),
+            Self::Bound(bound) => bound.drain(budget),
+        }
+    }
+
+    fn take_retired(&mut self) -> Option<RetiredSpaceResource> {
+        match self {
+            Self::Unbound => None,
+            Self::Bound(bound) => bound.retired.take(),
+        }
+    }
+
+    fn bound(&self) -> Result<&BoundAddressSpace, SpaceError> {
+        match self {
+            Self::Unbound => Err(SpaceError::Unbound),
+            Self::Bound(bound) => Ok(bound),
+        }
+    }
+
+    fn bound_mut(&mut self) -> Result<&mut BoundAddressSpace, SpaceError> {
+        match self {
+            Self::Unbound => Err(SpaceError::Unbound),
+            Self::Bound(bound) => Ok(bound),
+        }
+    }
+}
+
+impl core::ops::Deref for AddressSpaceState {
+    type Target = BoundAddressSpace;
+
+    fn deref(&self) -> &Self::Target {
+        self.bound()
+            .expect("Unbound AddressSpace reached a Bound-only internal path")
+    }
+}
+
+impl core::ops::DerefMut for AddressSpaceState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.bound_mut()
+            .expect("Unbound AddressSpace reached a Bound-only internal path")
+    }
 }
 
 static SHOOTDOWN_SELFTEST_STARTED: core::sync::atomic::AtomicBool =
@@ -710,21 +914,21 @@ impl ShootdownSynchronization {
 }
 
 impl AddressSpace {
-    pub fn new() -> Result<Self, SpaceError> {
+    pub fn unbound() -> Self {
         let identity = NEXT_ADDRESS_SPACE_ID.fetch_add(1, Ordering::Relaxed);
         assert!(
             identity != 0 && identity != usize::MAX,
             "address-space identity exhausted"
         );
-        Ok(Self {
+        Self {
             identity,
             translation_epoch: AtomicU64::new(1),
             instruction_epoch: AtomicU64::new(1),
             state: crate::sync::Spinlock::new(
                 crate::sync::ranks::ADDRESS_SPACE,
-                AddressSpaceState::new()?,
+                AddressSpaceState::Unbound,
             ),
-        })
+        }
     }
 
     pub fn lock(&self) -> crate::sync::SpinlockGuard<'_, AddressSpaceState> {
@@ -1055,10 +1259,12 @@ pub(crate) fn memory_protect(
 
 /// 地址空间可变状态：MemorySpace ledger、anonymous backing、页表树与有界 drain
 /// 共同组成 VA 所有权真值；稳定 identity/epoch 位于外层 AddressSpace。
-pub(crate) struct AddressSpaceState {
+pub(crate) struct BoundAddressSpace {
     /// REAPABLE 屏障后由 drain 最终阶段 take 释放 root；之后任何访问
     /// 都是编程错误（Building 操作准入与 active 位图已消除可达性）。
     tree: Option<TableTree<TableMem, LEVELS>>,
+    /// root 物理 owner、charge 与进程后续 page-backed storage 的唯一来源。
+    binding: Option<super::resources::PoolBinding>,
     satp: usize,
     /// VA 区域与事务真值；Drain 起点 take 后不再可访问。
     ledger: Option<MemorySpace>,
@@ -1072,19 +1278,23 @@ pub(crate) struct AddressSpaceState {
     /// 有界收束游标（drain_gate + space 锁双持下推进）。
     drain_stage: DrainStage,
     /// 已从拥有结构摘下、等待下一 work unit 归还的帧 extent。
-    pending_free: Option<FrameTracker>,
+    pending_free: Option<BackingExtentOwner>,
+    /// 已计入本批 work、必须在释放 AddressSpace 锁后析构的 Pool-backed owner。
+    retired: Option<RetiredSpaceResource>,
 }
 
-impl AddressSpaceState {
-    /// 新地址空间：建树后把内核高半区作为显式 shared root 槽挂接。
-    pub fn new() -> Result<Self, SpaceError> {
-        let mut tree = TableTree::new(TableMem).map_err(|_| SpaceError::NoFrame)?;
+impl BoundAddressSpace {
+    /// 从完整 PoolBinding 构造 Bound 状态；root tree 只借用 binding 的 funded frame。
+    pub fn new(binding: super::resources::PoolBinding) -> Result<Self, SpaceError> {
+        let root = binding.root_frame();
+        let mut tree = TableTree::new(TableMem::new(root)).map_err(|_| SpaceError::NoFrame)?;
         mm::install_kernel_top_level(&mut tree);
         let satp = (8usize << 60) | tree.satp_ppn();
         let bounds = LedgerPageRange::new(0, USER_TOP).map_err(|_| SpaceError::BadSegment)?;
         let ledger = MemorySpace::new(bounds, MEMORY_SPACE_LIMITS).map_err(map_change_error)?;
         Ok(Self {
             tree: Some(tree),
+            binding: Some(binding),
             satp,
             ledger: Some(ledger),
             backings: Vec::new(),
@@ -1093,7 +1303,15 @@ impl AddressSpaceState {
             image_end: 0,
             drain_stage: DrainStage::Idle,
             pending_free: None,
+            retired: None,
         })
+    }
+
+    fn pool(&self) -> &Arc<super::memory_pool::MemoryPool> {
+        self.binding
+            .as_ref()
+            .expect("address-space PoolBinding already retired")
+            .pool()
     }
 
     /// 本地址空间的 satp 组装值（含模式位）。
@@ -1430,6 +1648,20 @@ impl AddressSpaceState {
         published
     }
 
+    fn map_owned_backing_with_owner(
+        &mut self,
+        vaddr: usize,
+        protection: Protection,
+        class: AnonymousClass,
+        owner: RegionOwner,
+        backing: OwnedBacking,
+    ) -> Result<(), SpaceError> {
+        let prepared = self.prepare_owned_backing(vaddr, protection, class, owner, backing)?;
+        let published = self.commit_owned_mapping(prepared);
+        self.finish_empty_published_change(published);
+        Ok(())
+    }
+
     fn map_owned_anonymous(
         &mut self,
         vaddr: usize,
@@ -1451,6 +1683,7 @@ impl AddressSpaceState {
         vaddr: usize,
         protection: Protection,
         class: AnonymousClass,
+        owner: RegionOwner,
         backing: OwnedBacking,
     ) -> Result<PreparedOwnedMapping, SpaceError> {
         let len = backing
@@ -1468,7 +1701,7 @@ impl AddressSpaceState {
                 },
                 current: protection,
                 maximum: protection,
-                owner: RegionOwner::AddressSpace,
+                owner,
                 backing: MapBacking::Anonymous {
                     identity: backing.identity,
                     class,
@@ -1832,10 +2065,13 @@ impl AddressSpaceState {
         class: AnonymousClass,
         backing: OwnedBacking,
     ) -> Result<(), SpaceError> {
-        let prepared = self.prepare_owned_backing(vaddr, protection, class, backing)?;
-        let published = self.commit_owned_mapping(prepared);
-        self.finish_empty_published_change(published);
-        Ok(())
+        self.map_owned_backing_with_owner(
+            vaddr,
+            protection,
+            class,
+            RegionOwner::AddressSpace,
+            backing,
+        )
     }
 
     /// 为 Building process 映射 anonymous zero pages。映像区与固定主栈
@@ -2036,26 +2272,24 @@ impl AddressSpaceState {
         self.map_owned_anonymous(USER_TOP - STACK_SIZE, STACK_SIZE, Protection::ReadWrite)
     }
 
-    /// Bootstrap 专用出生块：prefix 复制到地址空间自有只读页，
-    /// 紧随其后的 opaque payload 页在映入时即移交为本地址空间 owned
-    /// backing（自帧池启动保留洞收编，Drop 时首次归还池）。该入口不由
-    /// syscall 暴露；payload 生命周期随 init 地址空间，无 pid 特判。
+    /// Bootstrap 专用出生块：prefix 使用普通 root-funded anonymous backing；紧随其后的
+    /// opaque payload 由外层强持已资金化 owner，本函数只在可失败映射期建立借用投影。
+    /// 该入口不由 syscall 暴露，payload frame 与 root Pool charge 随同一个 owner 退休。
     pub fn map_bootstrap_block(
         &mut self,
         prefix: &[u8],
-        payload_pa: usize,
+        payload: Option<&frame::BootFundedExtent>,
         payload_len: usize,
     ) -> Result<usize, SpaceError> {
-        if prefix.is_empty()
-            || prefix.len() % PAGE_SIZE != 0
-            || payload_pa % PAGE_SIZE != 0
-            || self.image_end == 0
-        {
+        if prefix.is_empty() || prefix.len() % PAGE_SIZE != 0 || self.image_end == 0 {
+            return Err(SpaceError::BadSegment);
+        }
+        let payload_pages = payload_len.div_ceil(PAGE_SIZE);
+        if payload.as_ref().map_or(0, |extent| extent.pages()) != payload_pages {
             return Err(SpaceError::BadSegment);
         }
         let base = self.image_end;
         let prefix_pages = prefix.len() / PAGE_SIZE;
-        let payload_pages = payload_len.div_ceil(PAGE_SIZE);
         let pages = prefix_pages
             .checked_add(payload_pages)
             .ok_or(SpaceError::BadSegment)?;
@@ -2067,27 +2301,61 @@ impl AddressSpaceState {
 
         let identity = self.mint_backing()?;
         let mut backing = OwnedBacking::allocate(identity, prefix_pages)?;
-        if payload_pages > 0 {
+        if let Some(payload) = payload {
             backing
                 .extents
                 .try_reserve(1)
                 .map_err(|_| SpaceError::NoFrame)?;
-            // payload 帧来自启动 reservation，从未发布为空闲；此处把其完整
-            // 页范围唯一移交给地址空间 backing，Drop 时首次进入库存。
-            // SAFETY: payload reservation 在启动移交中只执行一次，且尚未发布到 POOL。
-            let tracker = unsafe {
-                FrameTracker::adopt_reserved(FrameNumber(payload_pa / PAGE_SIZE), payload_pages)
-            };
             backing.extents.push(BackingExtent {
                 offset_pages: prefix_pages,
-                tracker,
+                owner: BackingExtentOwner::BootBorrowed {
+                    base: payload.base(),
+                    pages: payload.pages(),
+                },
             });
             backing.pages = pages;
         }
-        self.map_owned_backing(base, Protection::ReadOnly, AnonymousClass::Data, backing)?;
-        self.write_building(base, prefix)?;
+        // 在任何 ledger/PTE 发布前完成 prefix 回填，使成功映射之后只剩不可失败 owner 移交。
+        backing.write_from_start(prefix);
+        let lease = self.mint_lease()?;
+        self.map_owned_backing_with_owner(
+            base,
+            Protection::ReadOnly,
+            AnonymousClass::Data,
+            RegionOwner::Lease(lease),
+            backing,
+        )?;
         self.image_end = end;
         Ok(base)
+    }
+
+    /// Bootstrap map 完成全部可失败工作后，把对外层 funded owner 的临时投影替换为
+    /// owner 本体。init 尚未发布且本操作无分配，错配属于启动所有权不变量破坏。
+    pub fn install_bootstrap_funding(&mut self, funded: frame::BootFundedExtent) {
+        let backing = self
+            .backings
+            .last_mut()
+            .expect("bootstrap backing disappeared before owner installation");
+        let extent = backing
+            .extents
+            .iter_mut()
+            .find(|extent| matches!(extent.owner, BackingExtentOwner::BootBorrowed { .. }))
+            .expect("bootstrap borrowed extent disappeared before owner installation");
+        let (expected_base, expected_pages) = match &extent.owner {
+            BackingExtentOwner::BootBorrowed { base, pages } => (*base, *pages),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            funded.base(),
+            expected_base,
+            "bootstrap funded base changed"
+        );
+        assert_eq!(
+            funded.pages(),
+            expected_pages,
+            "bootstrap funded length changed"
+        );
+        extent.owner = BackingExtentOwner::Boot(funded);
     }
 
     /// 校验用户区间 [ptr, ptr+len) 逐页可访问：不溢出、不出用户半区、
@@ -2124,7 +2392,7 @@ impl AddressSpaceState {
     }
 }
 
-impl AddressSpaceState {
+impl BoundAddressSpace {
     /// 查询单页物理地址（跨地址空间完成路径用，见 [`crate::uaccess`]）；
     /// 页必须已映射。仅取地址，权限校验仍由 check_range 承担。
     pub(crate) fn page_pa(&mut self, va: usize) -> Option<usize> {
@@ -2142,8 +2410,11 @@ impl AddressSpaceState {
         if budget == 0 {
             return (0, false);
         }
-        drop(self.pending_free.take());
-        (1, true)
+        let owner = self.pending_free.take().expect("pending owner disappeared");
+        debug_assert!(self.retired.is_none(), "retired owner was not collected");
+        self.retired = Some(RetiredSpaceResource::Backing(owner));
+        // caller 必须先释放 AddressSpace 锁并析构 retired owner，才能继续本批。
+        (1, false)
     }
 
     /// 登记一笔新的 extent 归还（当前无在途归还时调用）。
@@ -2152,7 +2423,7 @@ impl AddressSpaceState {
             self.pending_free.is_none(),
             "pending free must be consumed before enqueuing"
         );
-        self.pending_free = Some(tracker);
+        self.pending_free = Some(BackingExtentOwner::Raw(tracker));
     }
 
     /// 从页表结构收回一帧并登记延后归还。
@@ -2236,7 +2507,7 @@ impl AddressSpaceState {
                         self.backings.pop();
                     }
                     work += 1;
-                    self.pending_free = Some(extent.tracker);
+                    self.pending_free = Some(extent.owner);
                     let (used, done) = self.step_pending(budget - work);
                     work += used;
                     if !done {
@@ -2380,23 +2651,21 @@ impl AddressSpaceState {
                         .tree
                         .take()
                         .expect("tree exists until Root stage completes");
-                    self.enqueue_table_frame(tree.finish_drain());
-                    self.drain_stage = DrainStage::RootFree;
-                    let (used, done) = self.step_pending(budget - work);
-                    work += used;
-                    if !done {
-                        return (work, false);
-                    }
-                    self.pending_free = None;
-                    self.drain_stage = DrainStage::Done;
-                    return (work, true);
-                }
-                DrainStage::RootFree => {
-                    // root 归还在途（顶部 pending 逻辑已完成或已提前返回）。
-                    debug_assert!(
-                        self.pending_free.is_none(),
-                        "pending root free must be stepped at entry"
+                    let root = tree.finish_drain();
+                    let binding = self
+                        .binding
+                        .take()
+                        .expect("Bound address space lost its PoolBinding");
+                    assert_eq!(
+                        root,
+                        binding.root_frame(),
+                        "TableTree root differs from PoolBinding owner"
                     );
+                    // Pool-backed owner 必须在 AddressSpace 锁外退款；本次摘除计一个
+                    // work unit，调用层在返回前完成不可失败析构。
+                    debug_assert!(self.retired.is_none(), "retired owner was not collected");
+                    self.retired = Some(RetiredSpaceResource::Binding(binding));
+                    work += 1;
                     self.drain_stage = DrainStage::Done;
                     return (work, true);
                 }
@@ -2470,7 +2739,7 @@ impl Process {
             parent,
             job,
             resources,
-            space: AddressSpace::new()?,
+            space: AddressSpace::unbound(),
             handles: crate::sync::Spinlock::chained(
                 crate::sync::ranks::HANDLE_TABLE,
                 pid,
@@ -2511,6 +2780,32 @@ impl Process {
                 super::lifecycle::AttachFault::Limit => ThreadAttachError::Limit,
                 super::lifecycle::AttachFault::Oom => ThreadAttachError::Oom,
             })
+    }
+
+    /// 已登记 Building lease 的 Attach 提交；后到终止由 lifecycle 接管新线程。
+    pub(crate) fn attach_thread_registered(
+        self: &Arc<Self>,
+        context: ThreadStartContext,
+    ) -> Result<Tid, ThreadAttachError> {
+        self.space
+            .lock()
+            .validate_initial_context(context.entry as usize, context.stack_pointer as usize)
+            .map_err(ThreadAttachError::Context)?;
+        let (tid, retired) = self
+            .lifecycle
+            .attach_registered_member(|tid| {
+                let thread = Thread::new_thread(tid, self, context)
+                    .map_err(|_| super::lifecycle::AttachFault::Oom)?;
+                Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
+            })
+            .map_err(|fault| match fault {
+                super::lifecycle::AttachFault::Closed => ThreadAttachError::Closed,
+                super::lifecycle::AttachFault::Limit => ThreadAttachError::Limit,
+                super::lifecycle::AttachFault::Oom => ThreadAttachError::Oom,
+            })?;
+        // 终止已截止时，线程从未进入容器；在 lifecycle 锁外消费接管资源。
+        drop(retired);
+        Ok(tid)
     }
 
     /// 冻结进程级执行绑定（需求 + 兼容域），不可重复。
@@ -2585,8 +2880,7 @@ impl Process {
             if let Some(control) = slot.as_ref().and_then(alloc::sync::Weak::upgrade) {
                 return Ok(control);
             }
-            let control = super::process::ProcessControl::new(self)
-                .map_err(|_| SystemCallError::OutOfMemory)?;
+            let control = super::process::ProcessControl::new(self)?;
             *slot = Some(Arc::downgrade(&control));
             control
         };
@@ -2657,7 +2951,16 @@ impl Process {
                 super::handle::TakeNext::Progress => return (work, false),
                 super::handle::TakeNext::Exhausted if work == budget => return (work, false),
                 super::handle::TakeNext::Exhausted => {
-                    let (space_work, complete) = self.space.lock().drain(budget - work);
+                    let ((space_work, complete), retired) = {
+                        let mut space = self.space.lock();
+                        let result = space.drain(budget - work);
+                        let retired = space.take_retired();
+                        (result, retired)
+                    };
+                    // MemoryPool rank precedes AddressSpace；funded owner 必须在锁外退款。
+                    if let Some(retired) = retired {
+                        retired.release();
+                    }
                     return (work + space_work, complete);
                 }
             }
@@ -2762,12 +3065,72 @@ impl Thread {
     }
 }
 
+/// 启动期覆盖「Attach 先登记、终止后截止、提交资源由终止接管」的确定性 seam。
+pub(crate) fn building_cutoff_selftest() {
+    let process = Arc::new(
+        Process::new(
+            0,
+            0,
+            alloc::sync::Weak::new(),
+            super::resources::ProcessResources::try_new()
+                .expect("Building cutoff self-test sponsor failed"),
+        )
+        .expect("Building cutoff self-test process failed"),
+    );
+    assert!(
+        process.lifecycle.enter_building_op(),
+        "Building cutoff self-test lease failed"
+    );
+    let todo = process
+        .lifecycle
+        .request_termination(ProcessExitReason::Killed, 0, None);
+    assert!(
+        !todo.reapable,
+        "registered Building operation must delay termination"
+    );
+    let (tid, retired) = process
+        .lifecycle
+        .attach_registered_member(|tid| {
+            Arc::try_new(
+                Thread::new_thread(
+                    tid,
+                    &process,
+                    ThreadStartContext {
+                        entry: 0,
+                        stack_pointer: 0,
+                        arg1: 0,
+                        arg2: 0,
+                    },
+                )
+                .map_err(|_| super::lifecycle::AttachFault::Oom)?,
+            )
+            .map_err(|_| super::lifecycle::AttachFault::Oom)
+        })
+        .expect("registered Attach must retain commit eligibility after cutoff");
+    assert_eq!(tid, 1, "registered Attach must consume one thread identity");
+    assert!(
+        retired.is_some(),
+        "termination must take over a post-cutoff Attach resource"
+    );
+    assert_eq!(
+        process.lifecycle.member_count(),
+        0,
+        "post-cutoff Attach must not leave a Staging member"
+    );
+    drop(retired);
+    assert!(
+        process.lifecycle.leave_building_op(),
+        "post-cutoff Attach completion must make the empty process reapable"
+    );
+}
+
 /// launch 前的进程骨架：ELF 已装载、执行需求已判定、栈已映射、
 /// 尚未附线程或入表 runnable。
 pub struct SpawnedProcess {
     process: Arc<Process>,
     entry: usize,
     requirement: elf::IsaRequirement,
+    root_pool: Arc<super::memory_pool::MemoryPool>,
 }
 
 pub fn spawn_from_elf(
@@ -2776,6 +3139,7 @@ pub fn spawn_from_elf(
     job: alloc::sync::Arc<super::job::Job>,
     image: &elf::Elf,
     file: &[u8],
+    root_pool: Arc<super::memory_pool::MemoryPool>,
 ) -> Result<SpawnedProcess, SpaceError> {
     // 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/
     // TSO/未建模状态扩展在 load 时明确拒绝，不降级为 Base。
@@ -2786,6 +3150,12 @@ pub fn spawn_from_elf(
         alloc::sync::Arc::downgrade(&job),
         super::resources::ProcessResources::bootstrap(),
     )?);
+    super::process::bind_memory_internal(&process, Arc::clone(&root_pool)).map_err(|error| {
+        match error {
+            SystemCallError::ReachLimit => SpaceError::Conflict,
+            _ => SpaceError::NoFrame,
+        }
+    })?;
     {
         let mut space = process.space.lock();
         space.load_elf(&image.segments, file)?;
@@ -2795,6 +3165,7 @@ pub fn spawn_from_elf(
         process,
         entry: image.entry as usize,
         requirement,
+        root_pool,
     })
 }
 
@@ -2807,7 +3178,7 @@ pub fn spawn_from_elf(
 /// `sched::enqueue` 的 Release。
 pub fn launch_bootstrap(
     spawned: SpawnedProcess,
-    payload_pa: usize,
+    payload_extent: Option<frame::BootHeldExtent>,
     payload: &[u8],
     handles: Vec<super::handle::ProcessHandleEntry>,
 ) -> Result<Arc<Thread>, SpaceError> {
@@ -2815,6 +3186,7 @@ pub fn launch_bootstrap(
         process,
         entry,
         requirement,
+        root_pool,
     } = spawned;
 
     // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
@@ -2833,9 +3205,21 @@ pub fn launch_bootstrap(
     )
     .map_err(|_| SpaceError::NoFrame)?;
 
+    let root_pool_handle = super::handle::entry(
+        super::memory_pool::MemoryPool::object_ref(&root_pool),
+        super::object::HandleRole::MemoryPool,
+        erhino_shared::object::Rights::CREATE
+            | erhino_shared::object::Rights::READ
+            | erhino_shared::object::Rights::DUPLICATE
+            | erhino_shared::object::Rights::TRANSIT
+            | erhino_shared::object::Rights::GRANT,
+    )
+    .map_err(|_| SpaceError::NoFrame)?;
+
     let mut handles = handles;
-    handles.try_reserve(1).map_err(|_| SpaceError::NoFrame)?;
+    handles.try_reserve(2).map_err(|_| SpaceError::NoFrame)?;
     handles.push(control_handle);
+    handles.push(root_pool_handle);
     assert_eq!(
         handles.len(),
         erhino_shared::startup::initial::HANDLE_COUNT,
@@ -2881,12 +3265,51 @@ pub fn launch_bootstrap(
         }
     };
 
+    let binding_pool = {
+        let space = process.space.lock();
+        Arc::clone(space.pool())
+    };
+    debug_assert!(
+        Arc::ptr_eq(&binding_pool, &root_pool),
+        "bootstrap binding and delivered root Pool diverged"
+    );
+    // 先建立同时持物理 owner 与 Pool charge 的 prepared owner。后续映射可失败，
+    // 但始终只借用该 owner；映射成功后的安装是无分配、不可失败的 owner 移交。
+    let payload_funded = match payload_extent {
+        Some(extent) => match frame::fund_boot_held(&binding_pool, extent) {
+            Ok(funded) => Some(funded),
+            Err(_) => {
+                process
+                    .handles
+                    .lock()
+                    .rollback(reservation)
+                    .expect("launch reservation must remain owned");
+                for handle in handles {
+                    super::handle::close_entry_infallible(handle, &process, true);
+                }
+                return Err(SpaceError::NoFrame);
+            }
+        },
+        None if payload.is_empty() => None,
+        None => {
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry_infallible(handle, &process, true);
+            }
+            return Err(SpaceError::BadSegment);
+        }
+    };
+
     let block_len = block.len() + payload.len();
-    let block_va = match process
-        .space
-        .lock()
-        .map_bootstrap_block(&block, payload_pa, payload.len())
-    {
+    let block_va = match process.space.lock().map_bootstrap_block(
+        &block,
+        payload_funded.as_ref(),
+        payload.len(),
+    ) {
         Ok(va) => va,
         Err(error) => {
             process
@@ -2900,6 +3323,9 @@ pub fn launch_bootstrap(
             return Err(error);
         }
     };
+    if let Some(funded) = payload_funded {
+        process.space.lock().install_bootstrap_funding(funded);
+    }
 
     process
         .handles
@@ -2929,7 +3355,7 @@ pub fn launch_bootstrap(
         .reserve_member(process.pid)
         .map_err(|_| SpaceError::NoFrame)?;
     job.commit_member(member, process.clone());
-    debug_assert!(
+    assert!(
         process.lifecycle.enter_building_op(),
         "bootstrap process cannot be terminating"
     );

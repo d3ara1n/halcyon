@@ -34,7 +34,7 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。life
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，`Process::attach_thread` 校验现场，`attach_member` 锁内分配 tid、构造并插入；Start 由 `begin_running` 同一临界区整体转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域 Ready 槽，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度占位，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，内嵌 bootstrap Attach 在无并发条件下由 `attach_member` 锁内分配 tid、构造并插入；syscall Attach 则凭已登记 lease 进入 `attach_registered_member`，若终止已在登记后截止，提交仍成功但新线程不再入容器，而是作为终止接管资源在 lifecycle 锁外直接析构。Start 由 `begin_running` 同一临界区整体把现存 Staging 转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域 Ready 槽，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度占位，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
@@ -47,15 +47,11 @@ lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exit
 root Job 由内核 static anchor 强持（所有权图：anchor ─strong→ root Job，
 parent ─strong→ children，child ─weak→ parent；Job 直接成员表 ─strong→
 未 Dead 的 Process cores，Process ─weak→ Job）。JobCreate 派生层级；
-ProcessCreate 必须持 CREATE，生成空 AddressSpace、HandleTable、affine
-ProcessBuilder 与从 Building 起即存在的 ProcessControl，并在事务提交点
-把 Building process 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/
-回滚不遗留成员）。内核没有全局进程表：单调 PID 分配器只分配身份，
-未 Dead core 的生命周期根是 Job 成员表。ProcessCreate 使用成员占位；组装序列为 ProcessMap/Write → ProcessGrant → ProcessAttach → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类原子预留完整 Ready 批次。
+ProcessCreate 必须持 CREATE，只生成稳定身份、空 HandleTable、`AddressSpaceState::Unbound`、affine ProcessBuilder 与从 Building 起即存在的 ProcessControl；它不创建 ledger/root page table，也不取得 MemoryPool charge。Process core 的 sponsor slot 与 `ProcessResources` 同寿命，Builder/Control 各自持有 sponsor+global 类型化 permit：Builder 随最后 authority 消散退款，Control permit 随最后终态观察壳消散，core Dead 不会替仍存壳提前退款。创建事务在提交点把 Building shell 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/回滚不遗留成员）。`ProcessBindMemory(builder, pool)` 以 Builder MANAGE 与 Pool GRANT 为 authority，在 Building operation lease 下 pin 两项、串行化同一 shell 的竞争 Bind，并在锁外准备 AddressSpace metadata permit、单页 funded root 与完整页表；`Unbound → Bound` 发布和 Pool entry 逻辑消费在同一 HandleTable→AddressSpace 提交段完成，失败保留 Pool Handle 并自然回滚全部 owner。内核没有全局进程表：单调 PID 分配器只分配身份，未 Dead core 的生命周期根是 Job 成员表。用户态组装序列为 ProcessBindMemory → ProcessMap/Write → ProcessGrant → ProcessAttach → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类原子预留完整 Ready 批次。
 每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
 释放，快照仍可应答）。
 
-ProcessStart 负责 `Building → Running` 首次发布（活体门：预育表非空；含预育原子提取），并与 Job seal/termination 在 lifecycle 提交点竞争；成功提交一次冻结 execution binding，完整 capability/Ready 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
+ProcessStart 负责 `Building → Running` 首次发布（readiness 要求 AddressSpace 已 Bound，活体门要求预育表非空；含预育原子提取），并与 Job seal/termination 在 lifecycle 提交点竞争；成功提交一次冻结 execution binding，完整 capability/Ready 顺序与回滚事务由 [`startup.md`](startup.md) 唯一记录。所有 Building 操作只在精确 Building 登记 lease；登记即冻结其提交资格，终止等待已有 lease，Attach 在截止后把已登记提交直接交给终止接管，Start 自身只有在 `building_ops == 1` 时才能越过截止，不能跨过并发 Bind/Map/Write/Grant/Attach。PID 单调不复用，`parent_pid` 只供诊断，授权仅来自 Job/Process capabilities。
 
 ProcessControl 贯穿 Building/Running/Terminating/Dead 保持同一对象身份
 （HandleTable 条目强持 shell，shell ─weak→ core）；关闭 control 只消散
@@ -139,10 +135,10 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   存入 Process `pending_close`，下一批优先在表锁外重试；除 Busy 重试外，任意
   非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 先逐 fragment
   丢弃不可达 ledger，再逐 extent 从 `OwnedBacking` 摘下并经 `pending_free` 归还
-  order 树；随后按 owned/shared 槽真值收束 L0/L1 与 root 表帧。预算分别计费
-  close 尝试、ledger fragment、extent 摘取/归还与页表槽检查/摘除；单次 order
-  树操作另有只依赖地址位宽与 DT memory region 上限的结构常数界，批次执行量
-  受 budget 线性约束。
+  order 树；随后按 owned/shared 槽真值收束 L0/L1 与 root 表帧。Pool-backed
+  bootstrap extent 与最终 PoolBinding 只在 AddressSpace 锁内摘除并计费，实际
+  physical/charge owner 析构由调用层在锁外完成，遵守 MEMORY_POOL → ADDRESS_SPACE
+  的 Lock Ladder。预算分别计费 close 尝试、ledger fragment、extent 摘取/归还与页表槽检查/摘除；单次 order 树操作另有只依赖地址位宽与 DT memory region 上限的结构常数界，批次执行量受 budget 线性约束。
   完成时发布序固定：shell 先冻结终态快照并置 CLOSED（原子清 REAPABLE，外部无
   Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
   空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存

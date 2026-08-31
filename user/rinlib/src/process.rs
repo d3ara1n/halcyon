@@ -2,8 +2,8 @@
 
 use crate::call::{
     sys_job_create, sys_job_derive, sys_job_enumerate, sys_job_query, sys_job_seal,
-    sys_process_attach, sys_process_create, sys_process_drain, sys_process_grant,
-    sys_process_kill, sys_process_map, sys_process_query, sys_process_start,
+    sys_process_attach, sys_process_bind_memory, sys_process_create, sys_process_drain,
+    sys_process_grant, sys_process_kill, sys_process_map, sys_process_query, sys_process_start,
     sys_process_write,
 };
 use crate::ipc::object::close;
@@ -11,9 +11,9 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
-        HandleGrant, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
-        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags,
-        ProcessSnapshot, ThreadStartContext, Tid, JOB_ENUMERATE_MAX, PROCESS_DRAIN_MAX,
+        HandleGrant, JOB_ENUMERATE_MAX, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
+        PROCESS_DRAIN_MAX, ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus,
+        ProcessMapFlags, ProcessSnapshot, ThreadStartContext, Tid,
     },
 };
 
@@ -56,10 +56,7 @@ pub fn query_job(control: Handle) -> Result<JobSnapshot, SystemCallError> {
     };
     // SAFETY: snapshot 在 syscall 期间有效且可写。
     unsafe { sys_job_query(control, &mut snapshot)? };
-    if snapshot.reserved != 0
-        || snapshot.reserved2 != 0
-        || snapshot.state > JobState::Dead as u32
-    {
+    if snapshot.reserved != 0 || snapshot.reserved2 != 0 || snapshot.state > JobState::Dead as u32 {
         return Err(SystemCallError::InternalError);
     }
     Ok(snapshot)
@@ -76,7 +73,11 @@ pub fn enumerate_job(
     cursor: u64,
     buf: &mut [u64],
 ) -> Result<JobEnumerateResult, SystemCallError> {
-    let mut result = JobEnumerateResult { next_cursor: 0, actual: 0, more: 0 };
+    let mut result = JobEnumerateResult {
+        next_cursor: 0,
+        actual: 0,
+        more: 0,
+    };
     // SAFETY: buf/result 在 syscall 期间有效且可写。
     unsafe {
         sys_job_enumerate(
@@ -116,10 +117,7 @@ pub fn derive_job(
 
 /// ProcessCreate：Building process + affine ProcessBuilder + ProcessControl
 /// 同一事务交付；control_rights 显式请求并被校验为最大 rights 子集。
-pub fn create(
-    job: Handle,
-    control_rights: Rights,
-) -> Result<ProcessCreateResult, SystemCallError> {
+pub fn create(job: Handle, control_rights: Rights) -> Result<ProcessCreateResult, SystemCallError> {
     let mut output = ProcessCreateResult {
         builder: Handle::INVALID,
         control: Handle::INVALID,
@@ -129,6 +127,13 @@ pub fn create(
     // SAFETY: output 在 syscall 期间有效且可写。
     unsafe { sys_process_create(job, control_rights, &mut output)? };
     Ok(output)
+}
+
+/// 一次性把 MemoryPool authority 移交给 Building process。成功消费 pool Handle；
+/// 失败保留 pool Handle，调用方仍负责其关闭或重试。
+pub fn bind_memory(builder: Handle, pool: Handle) -> Result<(), SystemCallError> {
+    // SAFETY: 两个 Handle 值由内核按 role/rights 与 affine 状态完整校验。
+    unsafe { sys_process_bind_memory(builder, pool) }
 }
 
 pub fn map(
@@ -141,21 +146,14 @@ pub fn map(
     unsafe { sys_process_map(builder, target, len, permissions) }
 }
 
-pub fn write(
-    builder: Handle,
-    target: usize,
-    source: &[u8],
-) -> Result<(), SystemCallError> {
+pub fn write(builder: Handle, target: usize, source: &[u8]) -> Result<(), SystemCallError> {
     // SAFETY: source 在 syscall 期间保持有效。
     unsafe { sys_process_write(builder, target, source) }
 }
 
 /// ProcessAttach：组装者向 Building process 附入线程（外部通道；线程是
 /// 组装资源）。栈与出生参数由组装者经 Map/Write 预先供给。
-pub fn attach(
-    builder: Handle,
-    descriptor: &ThreadStartContext,
-) -> Result<Tid, SystemCallError> {
+pub fn attach(builder: Handle, descriptor: &ThreadStartContext) -> Result<Tid, SystemCallError> {
     // SAFETY: descriptor 在 syscall 期间保持有效。
     unsafe { sys_process_attach(builder, descriptor) }
 }
@@ -225,9 +223,7 @@ fn validate_snapshot(snapshot: &ProcessSnapshot) -> Result<(), SystemCallError> 
     if reason == ProcessExitReason::Abandoned as u32 && snapshot.code != 0 {
         return Err(SystemCallError::InternalError);
     }
-    if reason == ProcessExitReason::Fault as u32
-        && !(0..=8).contains(&snapshot.code)
-    {
+    if reason == ProcessExitReason::Fault as u32 && !(0..=8).contains(&snapshot.code) {
         return Err(SystemCallError::InternalError);
     }
     Ok(())
@@ -244,7 +240,11 @@ pub fn kill(control: Handle, code: i64) -> Result<(), SystemCallError> {
 /// 未知 status 判别值拒绝（不当作 More 无限循环）；More + 0 work
 /// （无进展，内核违约）与超预算 work_done 同样拒绝。
 pub fn drain(control: Handle, max_work: u32) -> Result<ProcessDrainResult, SystemCallError> {
-    let mut result = ProcessDrainResult { work_done: 0, status: 0, reserved: 0 };
+    let mut result = ProcessDrainResult {
+        work_done: 0,
+        status: 0,
+        reserved: 0,
+    };
     // SAFETY: result 在 syscall 期间有效且可写。
     unsafe { sys_process_drain(control, max_work, &mut result)? };
     if result.reserved != 0 || result.status > ProcessDrainStatus::Complete as u32 {

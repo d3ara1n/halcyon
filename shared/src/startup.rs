@@ -22,7 +22,8 @@ pub mod initial {
     pub const ROOT_JOB: usize = 0;
     pub const SYSTEM_RESET: usize = 1;
     pub const SELF_PROCESS: usize = 2;
-    pub const HANDLE_COUNT: usize = 3;
+    pub const ROOT_MEMORY_POOL: usize = 3;
+    pub const HANDLE_COUNT: usize = 4;
 }
 
 /// 启动块头。其后紧跟 `handle_count` 个实际 child-local Handle；允许以
@@ -109,16 +110,18 @@ pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, Startu
     if payload_end != block.len() {
         return Err(StartupParseError::LengthMismatch);
     }
-    if block[handles_end..payload_off].iter().any(|byte| *byte != 0) {
+    if block[handles_end..payload_off]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
         return Err(StartupParseError::NonzeroPadding);
     }
     for index in 0..header.handle_count as usize {
-        let offset = core::mem::size_of::<StartupBlockHeader>()
-            + index * core::mem::size_of::<Handle>();
+        let offset =
+            core::mem::size_of::<StartupBlockHeader>() + index * core::mem::size_of::<Handle>();
         // SAFETY: 规范几何已证明本项完整位于 block 内；输入无需对齐。
-        let handle = unsafe {
-            core::ptr::read_unaligned(block.as_ptr().byte_add(offset).cast::<Handle>())
-        };
+        let handle =
+            unsafe { core::ptr::read_unaligned(block.as_ptr().byte_add(offset).cast::<Handle>()) };
         if !handle.is_valid() {
             return Err(StartupParseError::InvalidHandle);
         }
@@ -232,7 +235,10 @@ mod tests {
         assert_eq!(header.version, STARTUP_VERSION);
         assert_eq!((header.pid, header.parent_pid), (11, 4));
         assert_eq!(header.handle_count, 2);
-        assert_eq!(header.payload_off as usize, core::mem::size_of::<StartupBlockHeader>() + 2 * core::mem::size_of::<Handle>());
+        assert_eq!(
+            header.payload_off as usize,
+            core::mem::size_of::<StartupBlockHeader>() + 2 * core::mem::size_of::<Handle>()
+        );
         assert_eq!(header.payload_len as usize, payload.len());
         assert_eq!(header.block_len as usize, block.len());
         assert_eq!(header.reserved0, 0);
@@ -240,8 +246,8 @@ mod tests {
 
         let mut actual = [Handle::INVALID; 2];
         for (index, output) in actual.iter_mut().enumerate() {
-            let offset = core::mem::size_of::<StartupBlockHeader>()
-                + index * core::mem::size_of::<Handle>();
+            let offset =
+                core::mem::size_of::<StartupBlockHeader>() + index * core::mem::size_of::<Handle>();
             // SAFETY: builder 已输出完整 Handle 字节；测试 Vec 基址无需对齐。
             *output = unsafe {
                 core::ptr::read_unaligned(block.as_ptr().byte_add(offset).cast::<Handle>())
@@ -254,12 +260,15 @@ mod tests {
 
     #[test]
     fn empty_handles_and_payload_are_valid() {
-        let block = build_startup_block(1, 0, &[], &[])
-            .expect("empty startup resources must be valid");
+        let block =
+            build_startup_block(1, 0, &[], &[]).expect("empty startup resources must be valid");
         let header = validate_startup_block(&block).expect("empty block must validate");
         assert_eq!(header.handle_count, 0);
         assert_eq!(header.payload_len, 0);
-        assert_eq!(header.payload_off as usize, core::mem::size_of::<StartupBlockHeader>());
+        assert_eq!(
+            header.payload_off as usize,
+            core::mem::size_of::<StartupBlockHeader>()
+        );
         assert_eq!(block.len(), core::mem::size_of::<StartupBlockHeader>());
     }
 

@@ -93,6 +93,8 @@ pub(crate) enum BeginFault {
     /// 预留的入册数与成员表长度不符（并发 attach 插队）；调用方以新
     /// 计数重试或报 ObjectBusy。
     StaleCount,
+    /// Start 之外仍有已登记的 Building operation；不得越过其提交资格。
+    Busy,
 }
 
 struct MemberEntry {
@@ -261,14 +263,17 @@ impl Lifecycle {
             && inner.mandatory_ops == 0
     }
 
-    /// Building 操作准入（builder 的 map/write/start 入口）：
-    /// 未终止则登记在途并放行；终止则拒绝。
+    /// Building 操作准入：只在精确 Building 状态登记。登记先于终止/Start
+    /// 截止即冻结提交资格；Running 与 Terminating 均拒绝新组装。
     pub(crate) fn enter_building_op(&self) -> bool {
         let mut inner = self.inner.lock();
-        if self.is_terminating() {
+        if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
             return false;
         }
-        inner.building_ops += 1;
+        inner.building_ops = inner
+            .building_ops
+            .checked_add(1)
+            .expect("process Building operation count exhausted");
         true
     }
 
@@ -308,6 +313,39 @@ impl Lifecycle {
             state: ThreadState::Staging { thread },
         });
         Ok(tid)
+    }
+
+    /// 已取得 Building operation lease 的 Attach 提交。登记早于终止截止时，
+    /// 后到的 Terminating 不得撤销提交资格：若截止仍未发生则插入 Staging；
+    /// 若已发生则消费 tid 并把新线程作为终止接管资源交回调用方锁外析构。
+    /// Start 无法越过该 lease，因此这里不可能观察到 Running；Dead 必须等待
+    /// building_ops 归零，也不可能先于本提交。
+    pub(crate) fn attach_registered_member(
+        &self,
+        build: impl FnOnce(Tid) -> Result<Arc<super::Thread>, AttachFault>,
+    ) -> Result<(Tid, Option<Arc<super::Thread>>), AttachFault> {
+        let mut inner = self.inner.lock();
+        if inner.members.len() >= PROCESS_MAX_THREADS {
+            return Err(AttachFault::Limit);
+        }
+        let tid = inner.next_tid;
+        let thread = build(tid)?;
+        match self.state.load(Ordering::Acquire) {
+            state if state == state_index(ProcessState::Building) => {
+                inner.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
+                inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
+                inner.members.push(MemberEntry {
+                    tid,
+                    state: ThreadState::Staging { thread },
+                });
+                Ok((tid, None))
+            }
+            state if state == state_index(ProcessState::Terminating) => {
+                inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
+                Ok((tid, Some(thread)))
+            }
+            _ => unreachable!("registered Building attach crossed an impossible lifecycle state"),
+        }
     }
 
     /// Running ThreadSpawn 线性化：检查准入与上界，锁内构造线程并插入
@@ -400,6 +438,9 @@ impl Lifecycle {
         }
         if inner.members.len() != expected {
             return Err(BeginFault::StaleCount);
+        }
+        if inner.building_ops != 1 {
+            return Err(BeginFault::Busy);
         }
         debug_assert!(inner.building_ops > 0, "start must hold a building op");
         inner.building_ops -= 1;

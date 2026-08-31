@@ -1060,5 +1060,6 @@ fn map_space_error(error: super::proc::SpaceError) -> SystemCallError {
         super::proc::SpaceError::NoFrame => SystemCallError::OutOfMemory,
         super::proc::SpaceError::Conflict => SystemCallError::InvalidAddress,
         super::proc::SpaceError::Busy => SystemCallError::ObjectBusy,
+        super::proc::SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
     }
 }

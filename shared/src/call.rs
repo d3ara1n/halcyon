@@ -86,6 +86,8 @@ pub enum SystemCall {
     ProcessAttach = 0x1d,
     /// 为 Building process 安装 grants 并输出目标侧句柄值。
     ProcessGrant = 0x1e,
+    /// 以具 GRANT authority 的 MemoryPool 一次性绑定 Building process。
+    ProcessBindMemory = 0x1f,
     /// 读 ProcessControl 的固定宽生命周期快照。
     ProcessQuery = 0x16,
     /// 持 MANAGE authority 的异步幂等终止请求。

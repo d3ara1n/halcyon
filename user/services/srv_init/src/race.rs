@@ -81,6 +81,7 @@ impl RaceHammers {
             let payload = race::encode_payload(&[race::MODE_HAMMER]);
             let spawned = spawn(SpawnRequest {
                 job,
+                memory_pool: crate::root_memory_pool(),
                 image,
                 payload: &payload,
                 grants: &grants,
@@ -194,6 +195,7 @@ fn spawn_race_target(
     }];
     let spawned = spawn(SpawnRequest {
         job,
+        memory_pool: crate::root_memory_pool(),
         image,
         payload: &payload,
         grants: &grants,
@@ -223,6 +225,7 @@ fn spawn_tunnel_exit_target(
     let payload = race::encode_payload(&[race::MODE_TARGET, race::TARGET_TUNNEL_EXIT]);
     match spawn(SpawnRequest {
         job,
+        memory_pool: crate::root_memory_pool(),
         image,
         payload: &payload,
         grants: &grants,
@@ -1253,6 +1256,7 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let kill_code = 0x900 + round as i64;
         let target = match spawn(SpawnRequest {
             job,
+            memory_pool: crate::root_memory_pool(),
             image,
             payload: &[],
             grants: &[],
@@ -1339,6 +1343,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let kill_code = 0xA00 + round as i64;
         let target = match spawn(SpawnRequest {
             job,
+            memory_pool: crate::root_memory_pool(),
             image,
             payload: &[],
             grants: &[],

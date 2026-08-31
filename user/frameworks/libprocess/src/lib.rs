@@ -12,13 +12,17 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, JobMemberKind, ProcessMapFlags, ThreadStartContext,
-        JOB_ENUMERATE_MAX, PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE,
-        PROCESS_USER_TOP,
+        ExecutionProfile, HandleGrant, JOB_ENUMERATE_MAX, JobMemberKind, PROCESS_MAIN_STACK_SIZE,
+        PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessMapFlags,
+        ThreadStartContext,
     },
-    wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
+    wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
 };
-use rinlib::{ipc::object::close, ipc::wait::wait_many, process};
+use rinlib::{
+    ipc::object::{close, duplicate},
+    ipc::wait::wait_many,
+    process,
+};
 
 const MAX_MAP_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
 const MAX_WRITE_BYTES: usize = 1 << 20;
@@ -69,6 +73,8 @@ impl SpawnFailure {
 
 pub struct SpawnRequest<'a> {
     pub job: Handle,
+    /// 本次 spawn 的 backing Pool；库复制 GRANT-only authority 并由 Bind 消费。
+    pub memory_pool: Handle,
     pub image: &'a [u8],
     pub payload: &'a [u8],
     pub grants: &'a [HandleGrant],
@@ -106,6 +112,12 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
 
     let mut grants_consumed = false;
     let result: Result<Spawned, SpawnError> = (|| {
+        let binding_pool = duplicate(request.memory_pool, Rights::GRANT)?;
+        if let Err(error) = process::bind_memory(builder, binding_pool) {
+            // Bind 失败契约保留 pool Handle。
+            let _ = close(binding_pool);
+            return Err(error.into());
+        }
         map_plan(builder, &plan)?;
         write_segments(builder, &image, request.image)?;
         map_stack(builder)?;
@@ -158,9 +170,8 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
 /// 派生监督所需的成员/子域 control rights：kill+drain 需 MANAGE，等
 /// REAPABLE/CLOSED 需 WAIT，终态查询需 READ。调用者的 JobControl 必须
 /// 持其超集，否则派生返回 RightsDenied。
-pub const DERIVED_CONTROL_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw() | Rights::WAIT.raw() | Rights::MANAGE.raw(),
-);
+pub const DERIVED_CONTROL_RIGHTS: Rights =
+    Rights::from_raw(Rights::READ.raw() | Rights::WAIT.raw() | Rights::MANAGE.raw());
 
 /// 递归 JobKill（用户态政策，内核不递归）：逐层 `JobSeal → 枚举 members
 /// → 派生 kill → 等 REAPABLE → drain 至 Complete → 枚举 children 递归 →
@@ -198,7 +209,11 @@ fn kill_members(job: Handle, code: i64) -> Result<(), SystemCallError> {
         process::kill(control, code)?;
         // kill 是异步请求：等 REAPABLE/CLOSED 后 drain 至 Complete。
         wait_many(
-            &[WaitItem::new(control, ObjectSignals::REAPABLE | ObjectSignals::CLOSED, 0)],
+            &[WaitItem::new(
+                control,
+                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                0,
+            )],
             WAIT_TIMEOUT_INFINITE,
         )?;
         process::drain_to_completion(control)?;
@@ -209,17 +224,13 @@ fn kill_members(job: Handle, code: i64) -> Result<(), SystemCallError> {
 
 fn kill_children(job: Handle, code: i64) -> Result<(), SystemCallError> {
     for jid in enumerate_members(job, JobMemberKind::ChildJobs)? {
-        let child = match process::derive_job(
-            job,
-            JobMemberKind::ChildJobs,
-            jid,
-            DERIVED_CONTROL_RIGHTS,
-        ) {
-            Ok(child) => child,
-            // child 已完成移表：跳过。
-            Err(SystemCallError::ObjectNotFound) => continue,
-            Err(error) => return Err(error),
-        };
+        let child =
+            match process::derive_job(job, JobMemberKind::ChildJobs, jid, DERIVED_CONTROL_RIGHTS) {
+                Ok(child) => child,
+                // child 已完成移表：跳过。
+                Err(SystemCallError::ObjectNotFound) => continue,
+                Err(error) => return Err(error),
+            };
         job_kill(child, code)?;
         close(child)?;
     }
@@ -307,10 +318,7 @@ fn page_plan(
     Ok((plan, previous_end))
 }
 
-fn map_plan(
-    builder: Handle,
-    plan: &BTreeMap<usize, ProcessMapFlags>,
-) -> Result<(), SpawnError> {
+fn map_plan(builder: Handle, plan: &BTreeMap<usize, ProcessMapFlags>) -> Result<(), SpawnError> {
     let mut entries = plan.iter().peekable();
     while let Some((&start_vpn, &permissions)) = entries.next() {
         let mut pages = 1usize;
@@ -334,11 +342,7 @@ fn map_plan(
     Ok(())
 }
 
-fn write_segments(
-    builder: Handle,
-    image: &elf::Elf,
-    file: &[u8],
-) -> Result<(), SpawnError> {
+fn write_segments(builder: Handle, image: &elf::Elf, file: &[u8]) -> Result<(), SpawnError> {
     for segment in &image.segments {
         let offset = usize::try_from(segment.offset).map_err(|_| SpawnError::InvalidImage)?;
         let filesz = usize::try_from(segment.filesz).map_err(|_| SpawnError::InvalidImage)?;
@@ -352,7 +356,6 @@ fn write_segments(
     }
     Ok(())
 }
-
 
 /// 组装者侧出生块构造（shared::startup 线格式：Header + 句柄数组 +
 /// payload）。内核不参与构造——出生块是组装者与接收进程的用户约定，
@@ -369,24 +372,15 @@ fn build_birth_block(
     handles: &[Handle],
     payload: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, SpawnError> {
-    erhino_shared::startup::build_startup_block(
-        target_pid,
-        rinlib::env::pid(),
-        handles,
-        payload,
-    )
-    .map_err(|_| SpawnError::InvalidImage)
+    erhino_shared::startup::build_startup_block(target_pid, rinlib::env::pid(), handles, payload)
+        .map_err(|_| SpawnError::InvalidImage)
 }
 
 /// 出生块写入约定区：映像顶（page_plan 推导）之上页对齐放置——组装者
 /// 掌握映像布局（Map 由其驱动），无需查询目标布局游标；块的只读性由接收方
 /// 运行时自行遵守（v1 约定，见计划篇 D6c）。逐页映射并单次回填，
 /// 返回块基址。
-fn write_birth_block(
-    builder: Handle,
-    block: &[u8],
-    image_top: usize,
-) -> Result<usize, SpawnError> {
+fn write_birth_block(builder: Handle, block: &[u8], image_top: usize) -> Result<usize, SpawnError> {
     let base = image_top.div_ceil(PROCESS_PAGE_SIZE) * PROCESS_PAGE_SIZE;
     let end = base
         .checked_add(block.len())
@@ -400,8 +394,7 @@ fn write_birth_block(
     let mut mapped = 0usize;
     while mapped < span {
         let len = MAX_MAP_BYTES.min(span - mapped);
-        process::map(builder, base + mapped, len, permissions)
-            .map_err(SpawnError::System)?;
+        process::map(builder, base + mapped, len, permissions).map_err(SpawnError::System)?;
         mapped += len;
     }
     process::write(builder, base, block).map_err(SpawnError::System)?;
@@ -480,6 +473,7 @@ mod tests {
         assert_eq!(
             spawn(SpawnRequest {
                 job: Handle::INVALID,
+                memory_pool: Handle::INVALID,
                 image: &[],
                 payload: &[],
                 grants: &[],

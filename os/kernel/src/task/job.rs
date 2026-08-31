@@ -573,7 +573,9 @@ impl Job {
         match process.lifecycle.begin_running(expected, out) {
             Ok(()) => Ok(()),
             Err(super::lifecycle::BeginFault::Closed) => Err(SystemCallError::ObjectClosed),
-            Err(super::lifecycle::BeginFault::StaleCount) => Err(SystemCallError::ObjectBusy),
+            Err(super::lifecycle::BeginFault::StaleCount | super::lifecycle::BeginFault::Busy) => {
+                Err(SystemCallError::ObjectBusy)
+            }
         }
     }
 }

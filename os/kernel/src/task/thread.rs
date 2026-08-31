@@ -247,6 +247,7 @@ fn map_context_fault(error: super::proc::SpaceError) -> SystemCallError {
         super::proc::SpaceError::BadSegment => SystemCallError::IllegalArgument,
         super::proc::SpaceError::Conflict => SystemCallError::InvalidAddress,
         super::proc::SpaceError::Busy => SystemCallError::ObjectBusy,
+        super::proc::SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
     }
 }
 

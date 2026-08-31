@@ -292,11 +292,11 @@ impl MemoryPool {
         .map_err(|_| SystemCallError::OutOfMemory)
     }
 
-    fn object_ref(pool: &Arc<Self>) -> ObjectRef {
+    pub(crate) fn object_ref(pool: &Arc<Self>) -> ObjectRef {
         Arc::clone(pool) as ObjectRef
     }
 
-    fn concrete(object: &ObjectRef) -> Result<Arc<Self>, SystemCallError> {
+    pub(crate) fn concrete(object: &ObjectRef) -> Result<Arc<Self>, SystemCallError> {
         let any: Arc<dyn Any + Send + Sync> = object.clone();
         any.downcast::<Self>()
             .map_err(|_| SystemCallError::WrongObjectType)
@@ -482,6 +482,19 @@ impl MemoryCharge {
         )
         .expect("MemoryPool charge does not fit the architecture")
     }
+
+    pub(crate) fn split(&mut self, pages: usize) -> Result<Self, PoolError> {
+        let pages = u64::try_from(pages).map_err(|_| PoolError::ArithmeticOverflow)?;
+        let credit = self
+            .credit
+            .as_mut()
+            .expect("MemoryPool charge ownership already transferred")
+            .split(pages)?;
+        Ok(Self {
+            pool: Arc::clone(&self.pool),
+            credit: Some(credit),
+        })
+    }
 }
 
 impl Drop for MemoryCharge {
@@ -623,7 +636,7 @@ pub fn derive(
     })
 }
 
-fn map_pool_error(error: PoolError) -> SystemCallError {
+pub(crate) fn map_pool_error(error: PoolError) -> SystemCallError {
     match error {
         PoolError::ZeroAmount | PoolError::InvalidSplit | PoolError::InvalidTopology => {
             SystemCallError::IllegalArgument

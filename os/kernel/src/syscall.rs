@@ -108,6 +108,18 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::ProcessBindMemory => {
+            respond_result(
+                frame,
+                task::process::bind_memory(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    Handle::from_raw(frame.x[11]),
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::ProcessMap => {
             respond_result(
                 frame,

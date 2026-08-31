@@ -267,6 +267,17 @@ pub unsafe fn sys_process_create(
     .map(|_| ())
 }
 
+pub unsafe fn sys_process_bind_memory(builder: Handle, pool: Handle) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessBindMemory,
+        builder.raw() as usize,
+        pool.raw() as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
 pub unsafe fn sys_process_query(
     control: Handle,
     output: &mut ProcessSnapshot,

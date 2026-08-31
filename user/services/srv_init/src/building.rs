@@ -1,12 +1,15 @@
 use crate::SUPERVISOR_RIGHTS;
-use rinlib::process;
 use rinlib::shared::{
     call::SystemCallError,
-    object::Handle,
+    object::{Handle, Rights},
     proc::{
         PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult, ProcessMapFlags,
         ThreadStartContext,
     },
+};
+use rinlib::{
+    ipc::object::{close, duplicate},
+    process,
 };
 
 /// 入口页指令：`j .`（`0x0000006f`，JAL x0,0 自我跳转）。不用 wfi——
@@ -18,6 +21,11 @@ const SPIN_FOREVER: [u8; 4] = [0x6f, 0x00, 0x00, 0x00];
 pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, SystemCallError> {
     let created = process::create(job, SUPERVISOR_RIGHTS)?;
     let built = (|| {
+        let pool = duplicate(crate::root_memory_pool(), Rights::GRANT)?;
+        if let Err(error) = process::bind_memory(created.builder, pool) {
+            let _ = close(pool);
+            return Err(error);
+        }
         process::map(
             created.builder,
             0x1000,

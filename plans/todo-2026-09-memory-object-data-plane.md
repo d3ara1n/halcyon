@@ -132,6 +132,8 @@ Derive 遵循单一发布事务：先解析并强持 parent，预留 sponsor/glo
 
 验证：init 首次映射前 Pool/frame 总量闭合；payload adopt 前后页只出现一次；init 发布后 boot-held 仅含仍有明确 owner 的区间，其余 BootPackage 页均已回投；任一 bootstrap 故障点无双重库存或遗失页；init 可从 root 派生 child 并创建、绑定、启动第一个服务。
 
+切片 4 与 5 已合并实现收口：ProcessCreate 只发布 Unbound shell，ProcessBindMemory 以 Building lease、双 Handle pin、竞争串行化和 HandleTable→AddressSpace 单提交段安装唯一 PoolBinding；Start 统一受 `building_ops == 1` 截止约束，已登记 Attach 在后到终止下仍提交并由终止路径接管。Process core/Builder/Control、Pool core 与 AddressSpace 均有按真实寿命退款的类型化 metadata permit。bootstrap 复用同一 Bind/AddressSpace seam，向 init 交付与内部 binding 同源的 root MemoryPool capability；payload 在映射前形成同时持物理与 charge 的 `BootFundedExtent`，prefix 在发布前回填，可失败映射期仅借用 owner，成功后无分配安装本体，drain 时 owner 在 AddressSpace 锁外退休。验证覆盖 shared ABI、全部相关 host debug 测试、启动期 metadata/Attach 截止确定性自检、core 顺序错误矩阵与 Pool 退款、debug stress 16/16、release core 和 sifive_u core；`just check` 与完整 `just acceptance` 通过。下一自然序进入切片 6。
+
 ## 切片 6：页表与匿名 backing 全面资金化
 
 让 TranslationTree 的 root、中间表、mega split 与未来 replacement 全部持有来源 Pool 的单页 funded frame；页表 Reserve 在 Commit 前准备完整资源，Publish 不分配。进程终止和 Unmap 通过可恢复游标分批 retire；`TableTree::Drop` 只接受已经 drained 的树并释放根。

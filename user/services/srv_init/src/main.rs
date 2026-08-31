@@ -24,6 +24,8 @@ use libprocess::{DERIVED_CONTROL_RIGHTS, SpawnRequest, enumerate_members, job_ki
 use librunnel::blocking;
 #[cfg(feature = "acceptance-stress")]
 use rinlib::ipc::tunnel as tunnel_sys;
+#[cfg(not(feature = "acceptance-stress"))]
+use rinlib::memory_pool::MemoryPool;
 #[cfg(feature = "acceptance-stress")]
 use rinlib::shared::proc::ProcessDrainStatus;
 use rinlib::{
@@ -245,6 +247,7 @@ fn launch_test_services(
             (services, &[])
         };
         match spawn(SpawnRequest {
+            memory_pool: root_memory_pool(),
             job,
             image: entry.data,
             payload: &[],
@@ -264,6 +267,7 @@ fn launch_test_services(
                     // 委托域靶：control 即弃（关闭 control 永不隐式终止），
                     // pm 的派生因此走铸造路径，域内收束权归 pm。
                     match spawn(SpawnRequest {
+                        memory_pool: root_memory_pool(),
                         job: pm_domain,
                         image: entry.data,
                         payload: &[],
@@ -302,6 +306,80 @@ fn launch_test_services(
         return Err("pm service launch failed");
     }
     Ok((pm_mailbox.peer, supervised, target_image, hammer_image))
+}
+
+fn root_memory_pool() -> Handle {
+    env::startup_handle(initial::ROOT_MEMORY_POOL)
+        .expect("init must hold root MemoryPool authority")
+}
+
+#[cfg(not(feature = "acceptance-stress"))]
+fn root_pool_allocated() -> Result<u64, SystemCallError> {
+    let handle = duplicate(root_memory_pool(), Rights::READ)?;
+    // SAFETY: duplicate 新建唯一 raw owner，本作用域不保留 alias，Drop 负责关闭。
+    let pool = unsafe { MemoryPool::from_handle(handle) };
+    Ok(pool.query()?.allocated)
+}
+
+#[cfg(not(feature = "acceptance-stress"))]
+fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
+    let baseline = root_pool_allocated().map_err(|_| "root Pool query failed")?;
+    let created = process::create(job, SUPERVISOR_RIGHTS).map_err(|_| "shell create failed")?;
+    let result = (|| {
+        if root_pool_allocated()? != baseline {
+            return Err(SystemCallError::InternalError);
+        }
+        if process::map(
+            created.builder,
+            0x1000,
+            rinlib::shared::proc::PROCESS_PAGE_SIZE,
+            rinlib::shared::proc::ProcessMapFlags::READ,
+        ) != Err(SystemCallError::ObjectNotAvailable)
+        {
+            return Err(SystemCallError::InternalError);
+        }
+        if process::bind_memory(created.builder, created.builder)
+            != Err(SystemCallError::IllegalArgument)
+        {
+            return Err(SystemCallError::InternalError);
+        }
+
+        let wrong_kind = duplicate(job, Rights::GRANT)?;
+        let wrong_result = process::bind_memory(created.builder, wrong_kind);
+        let _ = close(wrong_kind);
+        if wrong_result != Err(SystemCallError::WrongObjectType) {
+            return Err(SystemCallError::InternalError);
+        }
+        let no_grant = duplicate(root_memory_pool(), Rights::READ)?;
+        let rights_result = process::bind_memory(created.builder, no_grant);
+        let _ = close(no_grant);
+        if rights_result != Err(SystemCallError::RightsDenied) {
+            return Err(SystemCallError::InternalError);
+        }
+
+        let binding = duplicate(root_memory_pool(), Rights::GRANT)?;
+        process::bind_memory(created.builder, binding)?;
+        if root_pool_allocated()? != baseline + 1 {
+            return Err(SystemCallError::InternalError);
+        }
+        let repeat = duplicate(root_memory_pool(), Rights::GRANT)?;
+        let repeat_result = process::bind_memory(created.builder, repeat);
+        let _ = close(repeat);
+        if repeat_result != Err(SystemCallError::ObjectNotAvailable) {
+            return Err(SystemCallError::InternalError);
+        }
+        Ok(())
+    })();
+
+    let cleanup = process::abandon_to_completion(created);
+    if result.is_err() || cleanup.is_err() {
+        return Err("BindMemory contract or cleanup failed");
+    }
+    if root_pool_allocated().map_err(|_| "root Pool final query failed")? != baseline {
+        return Err("BindMemory Pool charge did not refund");
+    }
+    debug!("process shell and memory binding acceptance passed");
+    Ok(())
 }
 
 fn main() {
@@ -468,6 +546,8 @@ fn run(services: Handle) -> Result<(), &'static str> {
     debug!("acceptance workload: {}", ACCEPTANCE_WORKLOAD);
     let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
     test_memory_mapping()?;
+    #[cfg(not(feature = "acceptance-stress"))]
+    test_process_memory_binding(services)?;
     let pm_domain = process::create_job(services, JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
     let acceptance = process::create_job(services, JOB_FULL_RIGHTS)
@@ -929,6 +1009,7 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
     }];
     let result = (|| {
         let started = spawn(SpawnRequest {
+            memory_pool: root_memory_pool(),
             job,
             image,
             payload: &[],
@@ -1088,6 +1169,7 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
         return;
     };
     let running = spawn(SpawnRequest {
+        memory_pool: root_memory_pool(),
         job: child,
         image,
         payload: &[],
