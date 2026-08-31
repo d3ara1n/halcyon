@@ -86,7 +86,7 @@ Talc 5.0.4 的 `Source::acquire` 在 allocator 正忙时执行；内核 heap sou
 5. 把现有 raw API 收窄为 transitional `alloc_user_order`/`alloc_user_largest`，登记唯一调用点：进程页表、匿名 backing、Tunnel backing 和 user-inventory selftest；heap 不再出现在该表。
 6. host debug/release 覆盖碎片布局、对齐、子预算不足、容量耗尽、用途不可互换、planner 失败零发布和 heap ticket 单调消费；`just check`、virt debug/release 与 sifive_u 复核分类闭包、heap 扩展及完整 acceptance。
 
-批次 1B 已完成：planner workspace 的 1169 段容量由 16 memory、34 permanent、3 boot-held 与 16 heap chunks 的最坏切割推导；FramePool 的 2048 arenas 由 16 memory × 2 × `usize::BITS` 推导。planner/ticket 与 FramePool host debug/release、`just check`、virt debug/release、`sifive_u` 均通过；三条平台线都完成 16/16 acceptance，且启动日志证明全局分类与 system 子账户分别闭合。下一自然序进入切片 2。
+批次 1B 已由提交 `0a944c7` 收口，未来复审对象固定在 [`todo-2026-09-system-supply-reserve-review.md`](todo-2026-09-system-supply-reserve-review.md)。planner workspace 的 1169 段容量由 16 memory、34 permanent、3 boot-held 与 16 heap chunks 的最坏切割推导；FramePool 的 2048 arenas 由 16 memory × 2 × `usize::BITS` 推导。planner/ticket 与 FramePool host debug/release、`just check`、virt debug/release、`sifive_u` 均通过；三条平台线都完成 16/16 acceptance，且启动日志证明全局分类与 system 子账户分别闭合。下一自然序进入切片 2。
 
 批次 1A 验证基线：区间纯逻辑 host debug/release 覆盖多 memory nodes、多 tuple、空洞、相邻/重叠 reservation、溢出、页边界、DTB 自保护、BootPackage 实际范围、reserved-memory static/dynamic/no-map/reusable；页表 host 测试覆盖 1GiB/2MiB/4KiB 最大叶选择、洞、冲突预检与静态预算耗尽；平台启动日志给出 admitted range/静态表数量和各物理分类总量且总和闭合。
 
