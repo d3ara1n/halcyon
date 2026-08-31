@@ -28,6 +28,7 @@ mod fp;
 mod boot;
 mod context;
 mod csr;
+mod deferred_work;
 mod external;
 mod frame;
 mod hart;

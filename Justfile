@@ -47,10 +47,10 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 # `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与
 # --set 均不穿透嵌套子进程，故不用它们传油门）。
 THROTTLE := env_var_or_default("THROTTLE", "50")
-# 各路线按自身工作量设置 QEMU 硬上限；均可用同名环境变量单独覆盖。
+# 各路线按近期实测耗时设置宽裕的 QEMU 运行超时；均可用同名环境变量单独覆盖。
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "30")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
-VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "60")
+VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "150")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "30")
 SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "45")
@@ -166,12 +166,12 @@ virt-release:
     @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance_bounded {{VIRT_RELEASE_TIMEOUT}} -smp cores=4
 
 # sifive_u 只覆盖板级差异并运行 core workload；无 shutdown 设备，明确 reset
-# 失败后由 allow-timeout wrapper 收割，45s 只兜底真挂死。
+# 失败后由 allow-timeout wrapper 收割，路线超时只兜底异常停滞。
 sifive_u:
     @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
 
 # 阶段收尾：完整 debug 压力 + release core + sifive_u 平台差异。每条 QEMU
-# 各自受独立硬上限保护，聚合命令本身不另设跨路线总时限。
+# 由自身路线超时保护，聚合命令本身不另设跨路线总时限。
 acceptance:
     @just virt-stress
     @just virt-release

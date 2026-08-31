@@ -10,11 +10,11 @@ use erhino_shared::{
     proc::{Pid, ProcessExitReason, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
 };
 use memory_space::{
-    AddressRange, AnonymousClass, BackingId, BackingView, ChangeError, LeaseKey, Limits,
-    MapBacking, MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
+    AddressRange, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError, LeaseKey,
+    Limits, MapBacking, MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
     PageRange as LedgerPageRange, PreparedChange, ProtectRequest, Protection, PublishedChange,
-    RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiredChange, TranslationIntent,
-    UnmapRequest, WritePermit,
+    RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiringChange, RetiringFragment,
+    TranslationIntent, UnmapRequest, WritePermit,
 };
 use page_table::{
     DrainCursor as TableDrainCursor, DrainStep as TableDrainStep, FrameNumber, MapError, Ppn,
@@ -247,20 +247,48 @@ enum PublishedTableChanges {
     Many(Vec<TablePublishOutcome<TableFrameToken>>),
 }
 
-pub(crate) struct RetiredTableOwners {
-    _owners: PublishedTableChanges,
+enum TableRetireStep {
+    Owner(TableFrameToken),
+    Progress,
+    Complete,
 }
 
 impl PublishedTableChanges {
-    fn release_unused(&mut self) {
-        let release = |outcome: &mut TablePublishOutcome<TableFrameToken>| {
-            drop(core::mem::take(&mut outcome.unused));
+    fn retire_step(&mut self) -> TableRetireStep {
+        let take_owner = |outcome: &mut TablePublishOutcome<TableFrameToken>| {
+            outcome.retired.pop().or_else(|| outcome.unused.pop())
         };
         match self {
-            Self::One(outcome) => release(outcome),
-            Self::Many(outcomes) => outcomes.iter_mut().for_each(release),
+            Self::One(outcome) => take_owner(outcome)
+                .map(TableRetireStep::Owner)
+                .unwrap_or(TableRetireStep::Complete),
+            Self::Many(outcomes) => {
+                let Some(outcome) = outcomes.last_mut() else {
+                    return TableRetireStep::Complete;
+                };
+                if let Some(owner) = take_owner(outcome) {
+                    TableRetireStep::Owner(owner)
+                } else {
+                    outcomes.pop();
+                    TableRetireStep::Progress
+                }
+            }
         }
     }
+}
+
+struct BackingRetireCursor {
+    identity: BackingId,
+    next_offset: usize,
+    remaining: usize,
+}
+
+pub(crate) struct RetiringSpaceChange {
+    ledger: Option<RetiringChange>,
+    batch: RetireBatch,
+    tables: PublishedTableChanges,
+    backing: Option<BackingRetireCursor>,
+    tables_complete: bool,
 }
 
 pub(crate) struct PublishedSpaceChange {
@@ -495,9 +523,9 @@ impl OwnedBacking {
         Ok(prepared)
     }
 
-    /// Remote ack 后精确归还 backing 的逻辑页区间。`extents` 在创建时按
-    /// backing 总页数预留容量，因此这里的最多双切分不再分配。
-    fn release_range(&mut self, offset: usize, bytes: usize) {
+    /// Remote ack 后至多切出一个物理 extent owner。调用者在 AddressSpace 锁外
+    /// 析构返回 owner，并以返回页数推进稳定游标。创建期已为最多双切分预留容量。
+    fn release_one(&mut self, offset: usize, bytes: usize) -> (BackingExtentOwner, usize) {
         assert!(
             offset.is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE) && bytes != 0,
             "backing retire range must be nonempty and page aligned"
@@ -508,56 +536,53 @@ impl OwnedBacking {
             .expect("backing retire range overflowed");
         assert!(release_end <= self.pages, "backing retire escaped object");
 
-        let mut released = 0;
-        let mut index = 0;
-        while index < self.extents.len() {
-            let extent_start = self.extents[index].offset_pages;
-            let extent_end = extent_start + self.extents[index].owner.count();
-            let cut_start = extent_start.max(release_start);
-            let cut_end = extent_end.min(release_end);
-            if cut_start >= cut_end {
-                index += 1;
-                continue;
-            }
-
-            let extent = self.extents.remove(index);
-            let left_pages = cut_start - extent_start;
-            let retired_pages = cut_end - cut_start;
-            let right_pages = extent_end - cut_end;
-            let mut retired = extent.owner;
-
-            if left_pages != 0 {
-                let (left, tail) = retired.split_at(left_pages);
-                self.extents.insert(
-                    index,
-                    BackingExtent {
-                        offset_pages: extent_start,
-                        owner: left,
-                    },
-                );
-                index += 1;
-                retired = tail;
-            }
-            if right_pages != 0 {
-                let (middle, right) = retired.split_at(retired_pages);
-                retired = middle;
-                self.extents.insert(
-                    index,
-                    BackingExtent {
-                        offset_pages: cut_end,
-                        owner: right,
-                    },
-                );
-                index += 1;
-            }
-            released += retired.count();
-            drop(retired);
-        }
+        let index = self
+            .extents
+            .iter()
+            .position(|extent| {
+                let start = extent.offset_pages;
+                let end = start + extent.owner.count();
+                start < release_end && release_start < end
+            })
+            .expect("backing retire cursor lost its next owned extent");
+        let extent = self.extents.remove(index);
+        let extent_start = extent.offset_pages;
+        let extent_end = extent_start + extent.owner.count();
+        let cut_start = extent_start.max(release_start);
+        let cut_end = extent_end.min(release_end);
         assert_eq!(
-            released,
-            release_end - release_start,
-            "backing retire range was not owned exactly once"
+            cut_start, release_start,
+            "backing retire cursor encountered an ownership gap"
         );
+        let left_pages = cut_start - extent_start;
+        let retired_pages = cut_end - cut_start;
+        let right_pages = extent_end - cut_end;
+        let mut retired = extent.owner;
+
+        if left_pages != 0 {
+            let (left, tail) = retired.split_at(left_pages);
+            self.extents.insert(
+                index,
+                BackingExtent {
+                    offset_pages: extent_start,
+                    owner: left,
+                },
+            );
+            retired = tail;
+        }
+        if right_pages != 0 {
+            let (middle, right) = retired.split_at(retired_pages);
+            retired = middle;
+            self.extents.insert(
+                index + usize::from(left_pages != 0),
+                BackingExtent {
+                    offset_pages: cut_end,
+                    owner: right,
+                },
+            );
+        }
+        assert_eq!(retired.count(), retired_pages);
+        (retired, retired_pages)
     }
 }
 
@@ -825,7 +850,7 @@ static MULTI_HART_SHOOTDOWN_OBSERVED: AtomicBool = AtomicBool::new(false);
 struct ShootdownSelfTestCompletion;
 
 impl crate::remote_call::Completion for ShootdownSelfTestCompletion {
-    fn complete(&self) {
+    fn complete(self: Arc<Self>) {
         log!(
             Memory,
             "epoch self-test passed: active snapshot and shootdown acknowledged"
@@ -834,17 +859,118 @@ impl crate::remote_call::Completion for ShootdownSelfTestCompletion {
 }
 
 pub(crate) trait MemoryRetireSink: Send + Sync {
-    fn retire(&self, batch: RetireBatch);
+    fn retire_fragment(&self, fragment: RetiringFragment);
+    fn retire_permit(&self, permit: WritePermit);
+    fn finish(&self);
 }
 
-/// Remote ack 后收束一笔已经 Publish 的 AddressSpace 事务。槽在 Commit gate
-/// 内填充、Remote request 发布前可见；完成方先取槽再进入 AddressSpace 锁。
+impl RetiringSpaceChange {
+    /// 推进恰一个固定粒度：一个 table owner/outcome、一个 fragment、一个 backing
+    /// extent、一个 WritePermit，或最终 Complete。返回 true 表示资源与 ledger 已收口。
+    pub(crate) fn advance(
+        &mut self,
+        space: &AddressSpace,
+        retire: Option<&dyn MemoryRetireSink>,
+    ) -> bool {
+        if !self.tables_complete {
+            match self.tables.retire_step() {
+                TableRetireStep::Owner(owner) => {
+                    drop(owner);
+                    return false;
+                }
+                TableRetireStep::Progress => return false,
+                TableRetireStep::Complete => self.tables_complete = true,
+            }
+        }
+
+        if let Some(mut cursor) = self.backing.take() {
+            let (owner, pages) = space.lock().retire_backing_one(
+                cursor.identity,
+                cursor.next_offset,
+                cursor.remaining,
+            );
+            let bytes = pages
+                .checked_mul(PAGE_SIZE)
+                .expect("retired backing progress overflowed");
+            cursor.next_offset += bytes;
+            cursor.remaining -= bytes;
+            if cursor.remaining != 0 {
+                self.backing = Some(cursor);
+            }
+            drop(owner);
+            return false;
+        }
+
+        if let Some(fragment) = self.batch.pop_fragment() {
+            match fragment.kind {
+                RegionKindView::Mapping {
+                    backing:
+                        BackingView::Anonymous {
+                            identity, offset, ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(
+                        fragment.owner,
+                        RegionOwner::AddressSpace,
+                        "anonymous retire escaped AddressSpace authority"
+                    );
+                    if fragment.backing_retire == BackingRetire::Release {
+                        self.backing = Some(BackingRetireCursor {
+                            identity,
+                            next_offset: offset,
+                            remaining: fragment.range.bytes(),
+                        });
+                    }
+                }
+                RegionKindView::Mapping {
+                    backing: BackingView::Object { .. },
+                    ..
+                } => retire
+                    .expect("object retire lost its sink")
+                    .retire_fragment(fragment),
+                RegionKindView::Guard => {
+                    assert!(
+                        retire.is_none() && fragment.owner == RegionOwner::AddressSpace,
+                        "guard retire reached an object sink"
+                    );
+                }
+            }
+            return false;
+        }
+
+        if let Some(permit) = self.batch.pop_permit() {
+            retire
+                .expect("WritePermit retire lost its sink")
+                .retire_permit(permit);
+            return false;
+        }
+
+        assert!(self.batch.is_empty());
+        let ledger = self
+            .ledger
+            .take()
+            .expect("Retiring memory change completed twice");
+        space.lock().complete_retiring_change(ledger, &self.batch);
+        if let Some(retire) = retire {
+            retire.finish();
+        }
+        true
+    }
+}
+
+/// Remote ack 后只把事务推进到 Retiring 并发布 work debt。队列 owner 在安全点
+/// 逐批释放 table/backing/object owner，最后才 Complete ledger 与外部义务。
 pub(crate) struct MemoryChangeCompletion {
     process: Arc<Process>,
     waiter: Arc<super::wait::WaitContext>,
     retire: Option<Arc<dyn MemoryRetireSink>>,
     published: crate::sync::Spinlock<Option<PublishedSpaceChange>>,
+    retiring: crate::sync::Spinlock<Option<RetiringSpaceChange>>,
+    work: crate::sync::Spinlock<Option<crate::deferred_work::Reservation>>,
     result_obligation: crate::sync::Spinlock<Option<super::thread::ThreadResultObligation>>,
+    _change_metadata: super::resources::MemoryChangePermit,
+    _remote_metadata: super::resources::RemoteCompletionPermit,
 }
 
 impl MemoryChangeCompletion {
@@ -853,69 +979,84 @@ impl MemoryChangeCompletion {
         waiter: Arc<super::wait::WaitContext>,
         retire: Option<Arc<dyn MemoryRetireSink>>,
         result_obligation: Option<super::thread::ThreadResultObligation>,
+        change_metadata: super::resources::MemoryChangePermit,
+        remote_metadata: super::resources::RemoteCompletionPermit,
+        work: crate::deferred_work::Reservation,
     ) -> Self {
         Self {
             process,
             waiter,
             retire,
             published: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            retiring: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            work: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, Some(work)),
             result_obligation: crate::sync::Spinlock::new(
                 crate::sync::ranks::MEMORY_COMPLETION,
                 result_obligation,
             ),
+            _change_metadata: change_metadata,
+            _remote_metadata: remote_metadata,
         }
     }
 
-    pub(crate) fn install(&self, mut published: PublishedSpaceChange) {
-        published.tables.release_unused();
+    pub(crate) fn install(&self, published: PublishedSpaceChange) {
         let previous = self.published.lock().replace(published);
         assert!(previous.is_none(), "memory completion installed twice");
+    }
+
+    /// 由 work-debt owner hart 推进不超过 `budget` 个固定粒度；最终批次再兑销
+    /// 进程与线程义务。返回 `(实际步骤, 已完成)`。
+    pub(crate) fn advance_retire(&self, budget: usize) -> (usize, bool) {
+        debug_assert!(budget > 0);
+        let mut change = self
+            .retiring
+            .lock()
+            .take()
+            .expect("work debt ran without a Retiring memory change");
+        for used in 1..=budget {
+            if !change.advance(&self.process.space, self.retire.as_deref()) {
+                continue;
+            }
+            if self.process.lifecycle.complete_mandatory()
+                && let Some(control) = self.process.control()
+            {
+                control.publish_reapable();
+            }
+            // ThreadControl DONE 必须晚于 result lease 与 AddressSpace Complete；
+            // 先释放 affine 线程义务，再完成仍存活调用者的 WaitContext。
+            let result_obligation = self.result_obligation.lock().take();
+            drop(result_obligation);
+            self.waiter.clone().complete_kernel();
+            return (used, true);
+        }
+        self.retiring.lock().replace(change);
+        (budget, false)
     }
 }
 
 impl crate::remote_call::Completion for MemoryChangeCompletion {
-    fn complete(&self) {
+    fn complete(self: Arc<Self>) {
         let published = self
             .published
             .lock()
             .take()
             .expect("memory completion ran before Commit publication");
-        let (retired, batch, tables) = self.process.space.lock().retire_published_change(published);
-        drop(tables);
-        if let Some(retire) = &self.retire {
-            retire.retire(batch);
-        } else {
-            let (fragments, permits) = batch.into_parts();
-            assert!(
-                permits.is_empty()
-                    && fragments.iter().all(|fragment| {
-                        fragment.owner == RegionOwner::AddressSpace
-                            && matches!(
-                                fragment.kind,
-                                RegionKindView::Guard
-                                    | RegionKindView::Mapping {
-                                        backing: BackingView::Anonymous { .. },
-                                        ..
-                                    }
-                            )
-                    }),
-                "public memory change retired non-address-space resources without a sink"
-            );
-        }
-        self.process.space.lock().complete_retired_change(retired);
-        if self.process.lifecycle.complete_mandatory()
-            && let Some(control) = self.process.control()
-        {
-            control.publish_reapable();
-        }
-        // ThreadControl DONE 必须晚于 result lease 与 AddressSpace Complete；
-        // 先释放 affine 线程义务，再完成仍存活调用者的 WaitContext。
-        let result_obligation = {
-            let mut slot = self.result_obligation.lock();
-            slot.take()
-        };
-        drop(result_obligation);
-        self.waiter.clone().complete_kernel();
+        let retiring = self
+            .process
+            .space
+            .lock()
+            .begin_retire_published_change(published);
+        let previous = self.retiring.lock().replace(retiring);
+        assert!(
+            previous.is_none(),
+            "memory completion entered Retiring twice"
+        );
+        let work = self
+            .work
+            .lock()
+            .take()
+            .expect("memory completion lost its work debt reservation");
+        work.publish(self);
     }
 }
 
@@ -925,12 +1066,19 @@ pub(crate) fn prepare_memory_completion(
     retire: Option<Arc<dyn MemoryRetireSink>>,
     result_obligation: Option<super::thread::ThreadResultObligation>,
 ) -> Result<(Arc<MemoryChangeCompletion>, super::wait::WaitPlan), SystemCallError> {
-    let (waiter, plan) = super::wait::prepare_kernel(value)?;
+    let metadata =
+        super::resources::MetadataSponsor::reserve_memory_operation(process.resources.metadata())?;
+    let (change_metadata, wait_metadata, remote_metadata) = metadata.into_parts();
+    let work = crate::deferred_work::reserve().map_err(|_| SystemCallError::ReachLimit)?;
+    let (waiter, plan) = super::wait::prepare_memory(value, wait_metadata)?;
     let completion = Arc::try_new(MemoryChangeCompletion::new(
         process,
         waiter,
         retire,
         result_obligation,
+        change_metadata,
+        remote_metadata,
+        work,
     ))
     .map_err(|_| SystemCallError::OutOfMemory)?;
     Ok((completion, plan))
@@ -1897,91 +2045,70 @@ impl BoundAddressSpace {
         }
     }
 
-    fn anonymous_range_still_live(
+    pub(crate) fn begin_retire_published_change(
+        &mut self,
+        published: PublishedSpaceChange,
+    ) -> RetiringSpaceChange {
+        let PublishedSpaceChange { ledger, tables } = published;
+        let synchronized = self.ledger().synchronize(ledger);
+        let (retiring, batch) = self.ledger().begin_retire(synchronized);
+        RetiringSpaceChange {
+            ledger: Some(retiring),
+            batch,
+            tables,
+            backing: None,
+            tables_complete: false,
+        }
+    }
+
+    fn retire_backing_one(
         &mut self,
         identity: BackingId,
         offset: usize,
         bytes: usize,
-    ) -> bool {
-        let end = offset
-            .checked_add(bytes)
-            .expect("retiring anonymous view overflowed");
-        let covered: usize = self
-            .ledger()
-            .regions()
-            .filter_map(|region| match region.kind {
-                RegionKindView::Mapping {
-                    backing:
-                        BackingView::Anonymous {
-                            identity: region_identity,
-                            offset: region_offset,
-                            ..
-                        },
-                    ..
-                } if region_identity == identity => {
-                    let region_end = region_offset
-                        .checked_add(region.range.bytes())
-                        .expect("live anonymous view overflowed");
-                    let start = offset.max(region_offset);
-                    let end = end.min(region_end);
-                    Some(end.saturating_sub(start))
-                }
-                _ => None,
-            })
-            .sum();
-        assert!(
-            covered == 0 || covered == bytes,
-            "retiring anonymous view is only partially represented in the live ledger"
-        );
-        covered == bytes
-    }
-
-    pub(crate) fn retire_published_change(
-        &mut self,
-        published: PublishedSpaceChange,
-    ) -> (RetiredChange, RetireBatch, RetiredTableOwners) {
-        let PublishedSpaceChange { ledger, tables } = published;
-        let synchronized = self.ledger().synchronize(ledger);
-        let (retired, batch) = self.ledger().retire(synchronized);
-        for fragment in batch.fragments().iter().copied() {
-            let RegionKindView::Mapping {
-                backing:
-                    BackingView::Anonymous {
-                        identity, offset, ..
-                    },
-                ..
-            } = fragment.kind
-            else {
-                continue;
-            };
-            if self.anonymous_range_still_live(identity, offset, fragment.range.bytes()) {
-                continue;
-            }
-            let index = self
-                .backings
-                .iter()
-                .position(|backing| backing.identity == identity)
-                .expect("retiring anonymous fragment lost its owned backing");
-            self.backings[index].release_range(offset, fragment.range.bytes());
-            if self.backings[index].extents.is_empty() {
-                self.backings.remove(index);
-            }
+    ) -> (BackingExtentOwner, usize) {
+        // 当前 table_transaction_active 覆盖 backing mint→Commit，故 push 顺序与
+        // 单调 BackingId 一致。6D/6E 若拆除该闸门，必须改为有序插入或显式索引，
+        // 不得让逆序 Commit 破坏这里的对数查找。
+        let index = self
+            .backings
+            .binary_search_by_key(&identity, |backing| backing.identity)
+            .expect("retiring anonymous fragment lost its owned backing");
+        let (owner, pages) = self.backings[index].release_one(offset, bytes);
+        if self.backings[index].extents.is_empty() {
+            self.backings.remove(index);
         }
-        (retired, batch, RetiredTableOwners { _owners: tables })
+        (owner, pages)
     }
 
-    pub(crate) fn complete_retired_change(&mut self, retired: RetiredChange) {
+    pub(crate) fn complete_retiring_change(
+        &mut self,
+        retiring: RetiringChange,
+        batch: &RetireBatch,
+    ) {
+        let retired = self.ledger().finish_retire(retiring, batch);
         self.ledger().complete(retired);
     }
 
-    fn finish_empty_published_change(&mut self, mut published: PublishedSpaceChange) {
-        published.tables.release_unused();
-        let (retired, batch, tables) = self.retire_published_change(published);
-        let (fragments, permits) = batch.into_parts();
-        debug_assert!(fragments.is_empty());
-        debug_assert!(permits.is_empty());
-        drop(tables);
-        self.complete_retired_change(retired);
+    /// Building/bootstrap 的空 retire 批次仍在 6D 前同步收口；它不持 stale
+    /// translation/backing。Running 与 Tunnel 一律经过 work debt。
+    fn finish_empty_published_change(&mut self, published: PublishedSpaceChange) {
+        let mut change = self.begin_retire_published_change(published);
+        assert!(change.batch.is_empty());
+        loop {
+            match change.tables.retire_step() {
+                TableRetireStep::Owner(owner) => drop(owner),
+                TableRetireStep::Progress => {}
+                TableRetireStep::Complete => break,
+            }
+        }
+        self.complete_retiring_change(
+            change
+                .ledger
+                .take()
+                .expect("empty memory change completed twice"),
+            &change.batch,
+        );
     }
 
     #[inline(never)]

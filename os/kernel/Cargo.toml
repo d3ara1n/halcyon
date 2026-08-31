@@ -22,4 +22,5 @@ memory_supply = { path = "../memory_supply" }
 memory_pool = { path = "../memory_pool" }
 funded_frame = { path = "../funded_frame" }
 metadata_admission = { path = "../metadata_admission" }
+work_debt = { path = "../work_debt" }
 num-traits = { version = "0.2", default-features = false }

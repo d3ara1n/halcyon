@@ -11,7 +11,7 @@
 //! scause 按 `(is_interrupt, code)` 分发（TRAP-004 收口）：只有中断 1/5
 //! 进入 SSIP/STIP，只有异常 8 是 U ecall；其余用户同步异常一律终止进程。
 
-use crate::{context::UserContext, hart, remote_call, sbi, sched, syscall};
+use crate::{context::UserContext, deferred_work, hart, sbi, sched, syscall};
 
 /// trap 处理出口，汇编经 a0 返回给调度循环（0 保留给 Resume）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ unsafe extern "C" fn handle_user_trap(
     let frame = unsafe { &mut *frame };
     let thread = hart::current().current_thread();
     // Pending 电平是 Remote Call 真值；任意用户 trap 都是有界消费安全点。
-    remote_call::drain_current();
+    deferred_work::drain_current();
 
     // 终止吸收：kill 先行冻结终因后，目标线程在任何 trap 入口都不再
     // 返回用户态（IPI 到达、量子耗尽、异常均在此汇合）。
@@ -138,7 +138,7 @@ unsafe extern "C" fn handle_user_trap(
         }
     };
     // ecall 可能在本次 trap 内向当前 hart 发布请求；返回用户态前再消费一次。
-    remote_call::drain_current();
+    deferred_work::drain_current();
     if thread.is_some_and(|t| t.process.lifecycle.is_terminating()) {
         Outcome::Killed as usize
     } else {

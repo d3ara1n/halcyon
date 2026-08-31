@@ -50,11 +50,11 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
   cd shared && cargo test --target aarch64-apple-darwin   # shared 也需显式 host target
   ```
 - 集成验证分档由用户态 `srv_init` 编译期 workload 控制，内核不感知测试政策：`just virt` 是日常 core 快线（确定性内存/IPC/Tunnel/Job/监督/reset）；`just virt-stress` 追加 control/Tunnel 重复压力、`max_work=1` Drain 与完整 16/16 竞态矩阵；`just virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持；`just acceptance` 是阶段收尾聚合，依次执行 debug stress、release core 与 `sifive_u` core。涉及调度域契约时另跑 `virt-hetero`/`virt-nofd`。
-- 所有 QEMU recipe 都经 `tools/qemu-throttle.sh`（默认 50% CPU）和 `tools/qemu-acceptance.sh`，并按路线使用独立硬上限：virt 30s、release 35s、stress 60s、hetero 40s、nofd 30s、sifive_u 45s；同名 `*_TIMEOUT` 环境变量可单独覆盖。超时从 QEMU 运行阶段计，不含冷编译。判定以 workload 身份、业务收束与 reset 锚点为准，不能把矩阵中途超时当成内核挂死。全速调试用 `THROTTLE=100`。
+- 所有 QEMU recipe 都经 `tools/qemu-throttle.sh`（默认节流运行）和 `tools/qemu-acceptance.sh`，并按路线使用独立、可由同名 `*_TIMEOUT` 环境变量覆盖的运行超时。超时从 QEMU 运行阶段计，不含冷编译。默认值依据对应 workload 的近期实测耗时留出宽裕余量，验收面或运行成本变化时应直接重校，不把旧数值当架构约束。判定以 workload 身份、业务收束与 reset 锚点为准，不能把矩阵中途超时当成内核挂死。全速调试用 `THROTTLE=100`。
 - `sifive_u` 是老的 HiFive Unleashed 模型：hart 0 无 MMU、可运行 hart 为 1–4、DRAM 128MiB、timebase 1MHz、boot hart 不固定。内核仍使用运行时探测到的现代 SBI，不因平台历史包袱调用 v0.1 核心 ABI。该模型无可用 shutdown 后端；`just sifive_u` 在日志出现明确 reset 失败或 panic 终态时主动收割，仍检查完整 core 锚点。它只覆盖板级差异，不为平台引入专用内核机制。
 - 开发机是 macOS：`just dtc qemu riscv64-elf-binutils riscv64-elf-gdb` 来自 Homebrew。打 tar 包时注意 bsdtar 的 `._` AppleDouble 文件会污染 initfs（历史上因此 panic 过）。
 - Rust nightly（`rust-toolchain` 钉住），edition 2024。
-- QEMU 超时用于防止 guest 跑飞和 CPU 长时间空转，不要求贴住正常路径的最短时间；默认值按各路线实测留余量，单轮上限保持在 60 秒内。调查已定位的早期卡死时可按最后锚点收紧；任何退出或超时后确认无残留进程。
+- QEMU 超时只负责收割异常停滞的 guest，不是性能目标或固定上限；CPU 节流负责限制跑飞时的宿主资源占用。各路线默认值通常取近期正常耗时的宽裕倍数，若正常验收经常逼近或超过现值，应同步调大 recipe 并更新相关文档，而不是把基础设施截断误判为内核故障。调查已定位的早期卡死时可临时按最后锚点收紧；任何退出或超时后确认无残留进程。
 
 ## 约定
 

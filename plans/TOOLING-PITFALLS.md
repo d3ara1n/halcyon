@@ -31,11 +31,11 @@
 
 ## CPU 节流（tools/qemu-throttle.sh）
 
-- QEMU recipes 默认节流到 50% CPU（Justfile `THROTTLE`）：guest 跑飞/panic 时 QEMU 满核空转的兜底——QEMU 无内置 CPU 限制参数（`-icount` 对死循环无效），靠 OS 层 SIGSTOP/SIGCONT 冻结进程实现，对 guest 透明（感知为时间暂停）。
-- 验收已经分档：`just virt`/`virt-release`/hetero/nofd/`sifive_u` 跑确定性 core，`just virt-stress` 才运行重复压力、最小预算 Drain 与完整竞态矩阵；阶段收尾用 `just acceptance` 聚合。2026-09 缓存构建实测 50% 档 core virt 约 10s、stress 约 57s，二者不可用同一超时。
+- QEMU recipes 默认经 `THROTTLE` 节流：guest 跑飞/panic 时 QEMU 满核空转的兜底——QEMU 无内置 CPU 限制参数（`-icount` 对死循环无效），靠 OS 层 SIGSTOP/SIGCONT 冻结进程实现，对 guest 透明（感知为时间暂停）。
+- 验收已经分档：`just virt`/`virt-release`/hetero/nofd/`sifive_u` 跑确定性 core，`just virt-stress` 才运行重复压力、最小预算 Drain 与完整竞态矩阵；阶段收尾用 `just acceptance` 聚合。各路线 workload 不同，超时必须分别按近期实测耗时留出宽裕余量，验收面变化后随即重校。
 - **调试（gdb -s）务必 `THROTTLE=100` 全速**：节流会周期性冻结整个 QEMU，使 gdb 交互卡顿并改变 `-icount` 复现时序。
 - 节流档下 QEMU 被后台化，终端 Ctrl-C 不再直达 guest；脚本捕获后会先 SIGCONT，再终止并清理 QEMU。仅 SIGKILL 可能遗留 STOP 态进程，此时先 `kill -CONT <pid>`。
-- `THROTTLE=100` 不等于绕过验收管道：100 档只是不执行 STOP/CONT，日志收割、锚点判定与路线硬超时仍然生效。计时对比必须使用同一 workload 与 throttle。
+- `THROTTLE=100` 不等于绕过验收管道：全速档只是不执行 STOP/CONT，日志收割、锚点判定与路线超时仍然生效。计时对比必须使用同一 workload 与 throttle。
 
 ## 输出与日志
 
@@ -70,7 +70,7 @@
 
 - **QEMU sifive_u 的 U54 模型 senvcfg 可读不可写**：csrr 成功、csrw 触发
   illegal instruction。「实现了读」不等于「可写」，WARL 核验序列每一步都要守卫。
-- sifive_u 无 shutdown device：显式 reset 返回失败后 QEMU 不自退出，`just sifive_u` 以 reset 后端失败或 panic 终态锚点主动收割，同时检查完整 core 锚点。该路线使用独立 `SIFIVE_U_TIMEOUT`（默认 45s）兜底真挂死；超时不得低于当前 core 验收面实测并应保留宿主抖动余量。
+- sifive_u 无 shutdown device：显式 reset 返回失败后 QEMU 不自退出，`just sifive_u` 以 reset 后端失败或 panic 终态锚点主动收割，同时检查完整 core 锚点。该路线使用独立 `SIFIVE_U_TIMEOUT` 兜底异常停滞；默认值不得低于当前 core 验收面实测并应保留宿主抖动余量。
 - **裸跑 QEMU 后必须 `just clean-qemu`**：验收脚本自己会清（挂起模式 trap 同时
   收 runner 与 tailer），但 agent 手动拼命令行跑完容易漏下孤儿进程占满核。
   已内置运行阶段超时收束，通过与否看完整业务锚点与显式 reset 结果。

@@ -219,10 +219,15 @@ pub struct WaitContext {
     /// 原子注册状态：未登记、稳定 token 或 Closed。
     timeout_registration: TimeoutRegistration,
     action: WaitAction,
+    _memory_metadata: Option<super::resources::MemoryWaitPermit>,
 }
 
 impl WaitContext {
-    fn new(action: WaitAction, registration_capacity: usize) -> Result<Arc<Self>, SystemCallError> {
+    fn new(
+        action: WaitAction,
+        registration_capacity: usize,
+        memory_metadata: Option<super::resources::MemoryWaitPermit>,
+    ) -> Result<Arc<Self>, SystemCallError> {
         let mut registrations = Vec::new();
         registrations
             .try_reserve(registration_capacity)
@@ -233,6 +238,7 @@ impl WaitContext {
             registrations: Spinlock::new(crate::sync::ranks::LEAF, registrations),
             timeout_registration: TimeoutRegistration::new(),
             action,
+            _memory_metadata: memory_metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -383,10 +389,13 @@ impl WaitContext {
     }
 }
 
-/// 为 Commit 后必成的内核事务预构造 Installing context。它不持线程；
-/// completion 与 park plan 各持一个强引用，线程所有权只在离开执行点后安装。
-pub fn prepare_kernel(value: usize) -> Result<(Arc<WaitContext>, WaitPlan), SystemCallError> {
-    let context = WaitContext::new(WaitAction::KernelResult { value }, 0)?;
+/// 为 Commit 后必成的内存事务预构造 Installing context。metadata permit 随
+/// WaitContext 的真实析构退款，不随 creator 或 completion 提前消散。
+pub fn prepare_memory(
+    value: usize,
+    metadata: super::resources::MemoryWaitPermit,
+) -> Result<(Arc<WaitContext>, WaitPlan), SystemCallError> {
+    let context = WaitContext::new(WaitAction::KernelResult { value }, 0, Some(metadata))?;
     let plan = WaitPlan {
         items: Vec::new(),
         action: WaitAction::KernelResult { value },
@@ -402,7 +411,7 @@ pub fn prepare_kernel(value: usize) -> Result<(Arc<WaitContext>, WaitPlan), Syst
 pub fn install(thread: Arc<Thread>, mut plan: WaitPlan) {
     let context = match plan.prepared.take() {
         Some(context) => context,
-        None => match WaitContext::new(plan.action, plan.items.len()) {
+        None => match WaitContext::new(plan.action, plan.items.len(), None) {
             Ok(context) => context,
             Err(error) => {
                 deliver_install_error(thread, plan.action, error);

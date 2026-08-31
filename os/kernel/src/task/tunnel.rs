@@ -16,7 +16,7 @@ use erhino_shared::{
 };
 use memory_space::{
     BackingView, MemoryObjectState, ObjectError, ObjectId, Protection, RegionKindView, RegionOwner,
-    RetireBatch,
+    RetiringFragment, WritePermit,
 };
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
         },
         proc::{
             AddressSpaceState, MemoryRetireSink, ObjectMappingLease, PrepareShootdownError,
-            PreparedObjectMapping, Process, prepare_memory_completion,
+            PreparedObjectMapping, Process, RetiringSpaceChange, prepare_memory_completion,
         },
         wait::{Subscription, finish_offered},
     },
@@ -74,6 +74,10 @@ pub struct Endpoint {
     side: usize,
     closed: AtomicBool,
     wait: Spinlock<ObjectWaitState>,
+    // 在途时形成 Endpoint → LeaseRetire → Endpoint 的临时强环；pending_close
+    // 持 entry 并逐批重入，完成分支先 take 本字段再 drop entry，从而打破环。
+    // 任何新增的放弃 entry 路径都必须先显式拆除此状态。
+    detached_retire: Spinlock<Option<DetachedLeaseRetire>>,
 }
 
 impl Endpoint {
@@ -87,6 +91,7 @@ impl Endpoint {
                 crate::sync::ranks::OBJECT_WAIT,
                 ObjectWaitState::new(ObjectSignals::NONE),
             ),
+            detached_retire: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -383,10 +388,7 @@ fn commit_side_close(endpoint: &Endpoint, connection: &mut ConnectionState) -> O
     }
 }
 
-fn retire_lease(connection: &Connection, lease: ObjectMappingLease, batch: RetireBatch) {
-    let (fragments, permits) = batch.into_parts();
-    assert_eq!(fragments.len(), 1, "Tunnel Unmap must retire one fragment");
-    let fragment = fragments[0];
+fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: RetiringFragment) {
     assert!(
         fragment.range == lease.range
             && fragment.owner == RegionOwner::Lease(lease.lease)
@@ -399,25 +401,26 @@ fn retire_lease(connection: &Connection, lease: ObjectMappingLease, batch: Retir
                     ..
                 } if object == lease.object
             ),
-        "Tunnel retire batch does not match its lease"
+        "Tunnel retire fragment does not match its lease"
     );
-    assert_eq!(
-        permits.len(),
-        1,
-        "Tunnel Unmap must retire one write permit"
-    );
-    let waiter = connection.memory.lock().retire_writes(permits);
-    assert!(
-        waiter.is_none(),
-        "Tunnel MemoryObject cannot have a seal waiter"
-    );
+}
+
+struct LeaseRetireState {
+    notice: Option<Option<PeerNotice>>,
+    fragment_retired: bool,
+    permit_retired: bool,
 }
 
 struct LeaseRetire {
     connection: Arc<Connection>,
     endpoint: Arc<Endpoint>,
     lease: ObjectMappingLease,
-    notice: Spinlock<Option<Option<PeerNotice>>>,
+    state: Spinlock<LeaseRetireState>,
+}
+
+struct DetachedLeaseRetire {
+    change: RetiringSpaceChange,
+    sink: Arc<LeaseRetire>,
 }
 
 impl LeaseRetire {
@@ -430,24 +433,56 @@ impl LeaseRetire {
             connection,
             endpoint,
             lease,
-            notice: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            state: Spinlock::new(
+                crate::sync::ranks::MEMORY_COMPLETION,
+                LeaseRetireState {
+                    notice: None,
+                    fragment_retired: false,
+                    permit_retired: false,
+                },
+            ),
         }
     }
 
     fn install_notice(&self, notice: Option<PeerNotice>) {
-        let previous = self.notice.lock().replace(notice);
+        let previous = self.state.lock().notice.replace(notice);
         assert!(previous.is_none(), "Tunnel close notice installed twice");
     }
 }
 
 impl MemoryRetireSink for LeaseRetire {
-    fn retire(&self, batch: RetireBatch) {
-        retire_lease(&self.connection, self.lease, batch);
-        let notice = self
+    fn retire_fragment(&self, fragment: RetiringFragment) {
+        validate_retired_lease_fragment(self.lease, fragment);
+        let mut state = self.state.lock();
+        assert!(
+            !state.fragment_retired,
+            "Tunnel lease fragment retired twice"
+        );
+        state.fragment_retired = true;
+    }
+
+    fn retire_permit(&self, permit: WritePermit) {
+        let waiter = self.connection.memory.lock().retire_write(permit);
+        assert!(
+            waiter.is_none(),
+            "Tunnel MemoryObject cannot have a seal waiter"
+        );
+        let mut state = self.state.lock();
+        assert!(!state.permit_retired, "Tunnel lease permit retired twice");
+        state.permit_retired = true;
+    }
+
+    fn finish(&self) {
+        let mut state = self.state.lock();
+        assert!(
+            state.fragment_retired && state.permit_retired,
+            "Tunnel lease completed before all retire owners"
+        );
+        let notice = state
             .notice
-            .lock()
             .take()
             .expect("Tunnel close retired before notice Commit");
+        drop(state);
         self.endpoint.finish_close(notice);
     }
 }
@@ -984,9 +1019,40 @@ pub(crate) fn close_detached(
     debug_assert!(owner.lifecycle.is_reapable());
     let endpoint = concrete_endpoint_arc(entry.object())
         .expect("Tunnel Endpoint entry must downcast to Endpoint");
-    let mut connection_state = endpoint.connection.state.lock();
-    let lease = connection_state.leases[endpoint.side]
+
+    // 先结束 guard 临时量再进入分支；未完成分支会重取同一锁以回存状态，
+    // 不得让 if-let scrutinee 把 guard 生命周期延长到分支体。
+    let pending = { endpoint.detached_retire.lock().take() };
+    if let Some(mut pending) = pending {
+        if pending
+            .change
+            .advance(&owner.space, Some(pending.sink.as_ref()))
+        {
+            drop(entry.into_parts());
+            return Ok(());
+        }
+        let previous = endpoint.detached_retire.lock().replace(pending);
+        assert!(previous.is_none(), "detached Tunnel retire state raced");
+        return Err(entry);
+    }
+
+    let lease = endpoint.connection.state.lock().leases[endpoint.side]
         .expect("detached Tunnel Endpoint must retain its mapping lease");
+    let sink = match Arc::try_new(LeaseRetire::new(
+        endpoint.connection.clone(),
+        endpoint.clone(),
+        lease,
+    )) {
+        Ok(sink) => sink,
+        Err(_) => return Err(entry),
+    };
+
+    let mut connection_state = endpoint.connection.state.lock();
+    assert_eq!(
+        connection_state.leases[endpoint.side],
+        Some(lease),
+        "detached Tunnel close lease changed before Commit"
+    );
     let mut space = owner.space.lock();
     let prepared = match space.prepare_object_unmap(lease) {
         Ok(prepared) => prepared,
@@ -999,15 +1065,26 @@ pub(crate) fn close_detached(
     assert_eq!(installed, lease, "detached Tunnel close lease changed");
     let published = space.commit_object_unmap(prepared);
     let notice = commit_side_close(&endpoint, &mut connection_state);
-    let (retired, batch, table_owners) = space.retire_published_change(published);
+    sink.install_notice(notice);
+    let change = space.begin_retire_published_change(published);
     drop(space);
-    drop(table_owners);
-    retire_lease(&endpoint.connection, lease, batch);
-    owner.space.lock().complete_retired_change(retired);
     drop(connection_state);
-    drop(entry.into_parts());
-    endpoint.finish_close(notice);
-    Ok(())
+
+    let mut pending = DetachedLeaseRetire { change, sink };
+    if pending
+        .change
+        .advance(&owner.space, Some(pending.sink.as_ref()))
+    {
+        drop(entry.into_parts());
+        Ok(())
+    } else {
+        let previous = endpoint.detached_retire.lock().replace(pending);
+        assert!(
+            previous.is_none(),
+            "detached Tunnel retire state installed twice"
+        );
+        Err(entry)
+    }
 }
 
 pub fn notify(thread: &Thread, handle: Handle) -> Result<(), SystemCallError> {

@@ -19,10 +19,11 @@ pub use object::{
 };
 pub use range::{AddressRange, PAGE_SIZE, PageRange, RangeError};
 pub use space::{
-    AllocationKey, AnonymousClass, BackingId, BackingView, ChangeError, CommittedChange,
-    FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest, MapResultLayout,
-    MemorySpace, PermitRequirement, PreparedChange, ProtectRequest, Protection, PublishedChange,
-    RegionKey, RegionKindView, RegionOwner, RegionView, ReserveFailure, RetireBatch, RetiredChange,
-    RetiringFragment, SynchronizedChange, TranslationIntent, UnmapRequest, UserWriteLease,
-    UserWriteLeaseRequest, UserWriteProjection, UserWriteSegment, ValidatedChange,
+    AllocationKey, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError,
+    CommittedChange, FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest,
+    MapResultLayout, MemorySpace, PermitRequirement, PreparedChange, ProtectRequest, Protection,
+    PublishedChange, RegionKey, RegionKindView, RegionOwner, RegionView, ReserveFailure,
+    RetireBatch, RetiredChange, RetiringChange, RetiringFragment, SynchronizedChange,
+    TranslationIntent, UnmapRequest, UserWriteLease, UserWriteLeaseRequest, UserWriteProjection,
+    UserWriteSegment, ValidatedChange,
 };

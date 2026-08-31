@@ -17,5 +17,6 @@ members = [
     "memory_pool",
     "funded_frame",
     "metadata_admission",
+    "work_debt",
 ]
 resolver = "2"

@@ -170,6 +170,21 @@ impl MemoryObjectState {
         self.release_writes(permits)
     }
 
+    pub fn retire_write(&mut self, permit: WritePermit) -> Option<u64> {
+        assert_eq!(
+            permit.object, self.object,
+            "write permit belongs to another memory object"
+        );
+        assert!(self.permits != 0, "write permit accounting underflow");
+        self.permits -= 1;
+        if self.state == ExecutableState::Sealing && self.permits == 0 {
+            self.state = ExecutableState::Executable;
+            self.seal_waiter.take()
+        } else {
+            None
+        }
+    }
+
     pub fn seal(&mut self, waiter: Option<u64>) -> Result<SealOutcome, ObjectError> {
         if waiter == Some(0) {
             return Err(ObjectError::InvalidWaiter);

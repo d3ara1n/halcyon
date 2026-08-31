@@ -44,7 +44,7 @@ static LOCAL_EPOCHS: [LocalEpoch; HARTS] = [const { LocalEpoch::new() }; HARTS];
 /// 全部目标确认后由最后一个目标调用。实现必须保持有界，并自行把较长工作转入
 /// 已有异步状态机；调用发生时不持 Remote Call 锁。
 pub(crate) trait Completion: Send + Sync {
-    fn complete(&self);
+    fn complete(self: Arc<Self>);
 }
 
 /// 地址翻译失效请求。当前 ASID 恒 0，第一版执行全量本地 fence；范围与稳定
@@ -139,7 +139,7 @@ struct SelfTestCompletion {
 }
 
 impl Completion for SelfTestCompletion {
-    fn complete(&self) {
+    fn complete(self: Arc<Self>) {
         log!(
             Remote,
             "self-test passed: {} hart fence request(s) acknowledged",
@@ -325,7 +325,7 @@ pub(crate) fn drain_current() -> usize {
             "taken remote-call slot must finish"
         );
         if completes_batch {
-            call.completion.sink.complete();
+            call.completion.sink.clone().complete();
         }
         completed += 1;
     }

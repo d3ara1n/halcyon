@@ -65,6 +65,8 @@ pub mod ranks {
     /// Commit 后完成槽：只在 lifecycle gate 内填充一次，完成方锁外取走后
     /// 才进入 AddressSpace 收束。
     pub const MEMORY_COMPLETION: Rank = Rank(625);
+    /// Commit 后特权 work debt 的固定槽；取出后才进入业务容器锁。
+    pub const WORK_DEBT: Rank = Rank(640);
     /// Remote Call 固定槽；Commit 可在 AddressSpace → lifecycle 内发布。
     /// 目标执行与完成回调均在锁外。
     pub const REMOTE_CALL: Rank = Rank(650);

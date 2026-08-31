@@ -349,12 +349,19 @@ impl UserWriteLease {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackingRetire {
+    Retain,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetiringFragment {
     pub key: RegionKey,
     pub allocation: AllocationKey,
     pub range: PageRange,
     pub owner: RegionOwner,
     pub kind: RegionKindView,
+    pub backing_retire: BackingRetire,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +378,7 @@ enum ChangeStage {
     Published,
     Synchronized,
     Retired,
+    Retiring,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -416,6 +424,7 @@ struct RetireTemplate {
     range: PageRange,
     owner: RegionOwner,
     kind: RegionKindView,
+    backing_retire: BackingRetire,
 }
 
 #[derive(Debug)]
@@ -541,6 +550,7 @@ macro_rules! change_token {
 change_token!(CommittedChange);
 change_token!(PublishedChange);
 change_token!(SynchronizedChange);
+change_token!(RetiringChange);
 change_token!(RetiredChange);
 
 #[derive(Debug)]
@@ -552,6 +562,18 @@ pub struct RetireBatch {
 impl RetireBatch {
     pub fn fragments(&self) -> &[RetiringFragment] {
         &self.fragments
+    }
+
+    pub fn pop_fragment(&mut self) -> Option<RetiringFragment> {
+        self.fragments.pop()
+    }
+
+    pub fn pop_permit(&mut self) -> Option<WritePermit> {
+        self.permits.pop()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fragments.is_empty() && self.permits.is_empty()
     }
 
     pub fn into_parts(self) -> (Vec<RetiringFragment>, Vec<WritePermit>) {
@@ -844,7 +866,7 @@ impl MemorySpace {
                     None,
                 )?);
             }
-            retiring.push(retire_template(region, cut)?);
+            retiring.push(retire_template(region, cut, BackingRetire::Release)?);
             if matches!(region.kind, RegionKind::Mapping { .. }) {
                 translations.push(TranslationIntent::Remove { range: cut });
             }
@@ -964,7 +986,7 @@ impl MemorySpace {
                     None,
                 )?);
             }
-            retiring.push(retire_template(region, cut)?);
+            retiring.push(retire_template(region, cut, BackingRetire::Retain)?);
             let RegionKind::Mapping { current, .. } = region.kind else {
                 unreachable!()
             };
@@ -1218,6 +1240,7 @@ impl MemorySpace {
                 range: template.range,
                 owner: template.owner,
                 kind: template.kind,
+                backing_retire: template.backing_retire,
             });
         }
         Ok(MaterializedReservation {
@@ -1293,18 +1316,34 @@ impl MemorySpace {
         SynchronizedChange(published.0)
     }
 
-    pub fn retire(&mut self, synchronized: SynchronizedChange) -> (RetiredChange, RetireBatch) {
+    pub fn begin_retire(
+        &mut self,
+        synchronized: SynchronizedChange,
+    ) -> (RetiringChange, RetireBatch) {
         self.advance(
             synchronized.0.key,
             ChangeStage::Synchronized,
-            ChangeStage::Retired,
+            ChangeStage::Retiring,
         );
         let mut payload = synchronized.0;
         let batch = RetireBatch {
             fragments: core::mem::take(&mut payload.retiring),
             permits: core::mem::take(&mut payload.retiring_permits),
         };
-        (RetiredChange(payload), batch)
+        (RetiringChange(payload), batch)
+    }
+
+    pub fn finish_retire(
+        &mut self,
+        retiring: RetiringChange,
+        batch: &RetireBatch,
+    ) -> RetiredChange {
+        assert!(
+            batch.is_empty(),
+            "memory change cannot leave Retiring with live retire owners"
+        );
+        self.advance(retiring.0.key, ChangeStage::Retiring, ChangeStage::Retired);
+        RetiredChange(retiring.0)
     }
 
     pub fn complete(&mut self, retired: RetiredChange) {
@@ -1328,6 +1367,7 @@ impl MemorySpace {
                 range: view.range,
                 owner: view.owner,
                 kind: view.kind,
+                backing_retire: BackingRetire::Release,
             },
             region.permit,
         ))
@@ -1628,7 +1668,11 @@ fn template_from_region(
     })
 }
 
-fn retire_template(region: &Region, range: PageRange) -> Result<RetireTemplate, ChangeError> {
+fn retire_template(
+    region: &Region,
+    range: PageRange,
+    backing_retire: BackingRetire,
+) -> Result<RetireTemplate, ChangeError> {
     let kind = match region.kind {
         RegionKind::Guard => RegionKindView::Guard,
         RegionKind::Mapping {
@@ -1649,6 +1693,7 @@ fn retire_template(region: &Region, range: PageRange) -> Result<RetireTemplate, 
         range,
         owner: region.owner,
         kind,
+        backing_retire,
     })
 }
 

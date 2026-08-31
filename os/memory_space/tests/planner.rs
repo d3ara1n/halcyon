@@ -4,8 +4,8 @@ use memory_space::{
     AddressRange, AllocationKey, AnonymousClass, BackingId, BackingView, ChangeError,
     ExecutableState, FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest,
     MemoryObjectState, MemorySpace, ObjectError, ObjectId, PAGE_SIZE, PageRange, ProtectRequest,
-    Protection, RangeError, RegionKindView, RegionOwner, RetireBatch, SealOutcome,
-    TranslationIntent, UnmapRequest, UserWriteLeaseRequest, ValidatedChange,
+    Protection, RangeError, RegionKindView, RegionOwner, SealOutcome, TranslationIntent,
+    UnmapRequest, UserWriteLeaseRequest, ValidatedChange,
 };
 
 const BASE: usize = 0x1000_0000;
@@ -71,13 +71,17 @@ fn reserve_no_permits(
 fn complete_prepared(
     space: &mut MemorySpace,
     prepared: memory_space::PreparedChange,
-) -> RetireBatch {
+) -> Vec<memory_space::RetiringFragment> {
     let committed = space.commit(prepared);
     let published = space.publish(committed);
     let synchronized = space.synchronize(published);
-    let (retired, batch) = space.retire(synchronized);
+    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let fragments = batch.fragments().to_vec();
+    while batch.pop_fragment().is_some() {}
+    while batch.pop_permit().is_some() {}
+    let retired = space.finish_retire(retiring, &batch);
     space.complete(retired);
-    batch
+    fragments
 }
 
 fn commit_map(space: &mut MemorySpace, request: MapRequest) -> memory_space::MapResultLayout {
@@ -85,7 +89,7 @@ fn commit_map(space: &mut MemorySpace, request: MapRequest) -> memory_space::Map
     let layout = validated.map_result().unwrap();
     let prepared = reserve_no_permits(space, validated);
     let batch = complete_prepared(space, prepared);
-    assert!(batch.fragments().is_empty());
+    assert!(batch.is_empty());
     layout
 }
 
@@ -222,7 +226,7 @@ fn exact_unmap_covers_full_usable_guard_and_middle_cases() {
     let prepared = reserve_no_permits(&mut full, validated);
     let batch = complete_prepared(&mut full, prepared);
     assert_eq!(full.region_count(), 0);
-    assert_eq!(batch.fragments().len(), 3);
+    assert_eq!(batch.len(), 3);
 
     // Usable only leaves both guards with the original AllocationKey.
     let mut usable = space();
@@ -322,9 +326,9 @@ fn exact_unmap_covers_full_usable_guard_and_middle_cases() {
     let regions: Vec<_> = middle.regions().collect();
     assert_eq!(regions.len(), 4);
     assert!(regions.iter().all(|region| region.key != old_mapping_key));
-    assert_eq!(batch.fragments().len(), 1);
-    assert_ne!(batch.fragments()[0].key, old_mapping_key);
-    assert_eq!(batch.fragments()[0].range, cut);
+    assert_eq!(batch.len(), 1);
+    assert_ne!(batch[0].key, old_mapping_key);
+    assert_eq!(batch[0].range, cut);
 }
 
 #[test]
@@ -353,7 +357,12 @@ fn protect_splits_then_recoalesces_only_within_allocation() {
         })
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    complete_prepared(&mut space, prepared);
+    let retired = complete_prepared(&mut space, prepared);
+    assert_eq!(retired.len(), 1);
+    assert_eq!(
+        retired[0].backing_retire,
+        memory_space::BackingRetire::Retain
+    );
     assert_eq!(space.region_count(), 3);
 
     let validated = space
@@ -364,7 +373,12 @@ fn protect_splits_then_recoalesces_only_within_allocation() {
         })
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    complete_prepared(&mut space, prepared);
+    let retired = complete_prepared(&mut space, prepared);
+    assert_eq!(retired.len(), 1);
+    assert_eq!(
+        retired[0].backing_retire,
+        memory_space::BackingRetire::Retain
+    );
     let regions: Vec<_> = space.regions().collect();
     assert_eq!(regions.len(), 1);
     assert_eq!(regions[0].allocation, allocation);
@@ -548,7 +562,10 @@ fn user_write_lease_pins_exact_projection_until_commit_or_rollback() {
     );
     let published = space.publish(committed);
     let synchronized = space.synchronize(published);
-    let (retired, _) = space.retire(synchronized);
+    let (retiring, mut batch) = space.begin_retire(synchronized);
+    while batch.pop_fragment().is_some() {}
+    while batch.pop_permit().is_some() {}
+    let retired = space.finish_retire(retiring, &batch);
     space.complete(retired);
 }
 
@@ -714,10 +731,16 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
     assert_eq!(object.permit_count(), 1);
     let synchronized = space.synchronize(published);
     assert_eq!(object.permit_count(), 1);
-    let (retired, batch) = space.retire(synchronized);
-    let (_, permits) = batch.into_parts();
-    assert_eq!(permits.len(), 1);
-    assert_eq!(object.retire_writes(permits), Some(77));
+    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let fragment = batch.pop_fragment().expect("object fragment must retire");
+    assert_eq!(
+        fragment.backing_retire,
+        memory_space::BackingRetire::Release
+    );
+    let permit = batch.pop_permit().expect("write permit must retire");
+    assert_eq!(object.retire_write(permit), Some(77));
+    assert!(batch.is_empty());
+    let retired = space.finish_retire(retiring, &batch);
     assert_eq!(object.state(), ExecutableState::Executable);
     assert_eq!(object.permit_count(), 0);
     space.complete(retired);
@@ -853,7 +876,7 @@ fn object_view_offsets_follow_exact_middle_split() {
         .collect();
     assert_eq!(offsets, [PAGE_SIZE, 3 * PAGE_SIZE]);
     assert!(matches!(
-        batch.fragments()[0].kind,
+        batch[0].kind,
         RegionKindView::Mapping {
             backing: BackingView::Object { offset, .. },
             ..
@@ -954,8 +977,9 @@ fn translation_intents_follow_typed_change_stages() {
     assert_eq!(space.transaction_count(), 1);
     let published = space.publish(committed);
     let synchronized = space.synchronize(published);
-    let (retired, batch) = space.retire(synchronized);
-    assert!(batch.fragments().is_empty());
+    let (retiring, batch) = space.begin_retire(synchronized);
+    assert!(batch.is_empty());
+    let retired = space.finish_retire(retiring, &batch);
     space.complete(retired);
     assert_eq!(space.transaction_count(), 0);
 }
@@ -1172,4 +1196,36 @@ fn drain_one_removes_exactly_one_region_without_allocation() {
         assert_eq!(space.region_count(), remaining);
     }
     assert!(space.drain_one().is_none());
+}
+
+#[test]
+#[should_panic(expected = "memory change cannot leave Retiring with live retire owners")]
+fn retiring_stage_cannot_complete_with_live_owners() {
+    let mut space = space();
+    let layout = commit_map(
+        &mut space,
+        anonymous_map(
+            99,
+            BASE,
+            1,
+            0,
+            0,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        ),
+    );
+    let validated = space
+        .validate_unmap(UnmapRequest {
+            range: layout.usable,
+            authority: RegionOwner::AddressSpace,
+        })
+        .unwrap();
+    let prepared = reserve_no_permits(&mut space, validated);
+    let committed = space.commit(prepared);
+    let published = space.publish(committed);
+    let synchronized = space.synchronize(published);
+    let (retiring, batch) = space.begin_retire(synchronized);
+    assert!(!batch.is_empty());
+    let _ = space.finish_retire(retiring, &batch);
 }

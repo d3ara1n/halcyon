@@ -19,7 +19,7 @@ use crate::sbi::DISARM;
 use crate::sync::Spinlock;
 use crate::task::{Thread, lifecycle::EnterRunning};
 use crate::{
-    hart, remote_call, sbi,
+    deferred_work, hart, sbi,
     trap::{self, Outcome},
 };
 
@@ -460,7 +460,7 @@ pub fn run() -> ! {
     let me_domain = current_domain();
     loop {
         // idle 唤醒、门铃合并或先前 IPI 失败后，Pending 槽仍由安全点补消费。
-        remote_call::drain_current();
+        deferred_work::drain_current();
         // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
         // SFENCE.VMA）：循环体结构性只运行于内核页表下。
         let Some(t) = me_domain.pick() else {
@@ -508,7 +508,7 @@ pub fn run() -> ! {
         match outcome {
             Outcome::Requeue => {
                 loop {
-                    remote_call::drain_current();
+                    deferred_work::drain_current();
                     let epochs = t.process.space.epochs();
                     if t.process
                         .lifecycle
@@ -527,7 +527,7 @@ pub fn run() -> ! {
             }
             Outcome::Killed => {
                 loop {
-                    remote_call::drain_current();
+                    deferred_work::drain_current();
                     let epochs = t.process.space.epochs();
                     if t.process
                         .lifecycle
@@ -541,7 +541,7 @@ pub fn run() -> ! {
             // 已离开执行点，此刻发布等待：完成方可安全触达该线程。
             Outcome::Park => {
                 loop {
-                    remote_call::drain_current();
+                    deferred_work::drain_current();
                     let epochs = t.process.space.epochs();
                     if t.process
                         .lifecycle
@@ -586,9 +586,9 @@ fn idle() {
     let domain = current_domain();
     let bit = 1u64 << hart::current().slot();
     domain.idle_mask.fetch_or(bit, Ordering::SeqCst);
-    // 入队与登记 idle 的交错由双重检查闭合：登记后若本域已有工作，
-    // 说明入队发生在第一次 pick 之后，立即撤销 idle 身份并重试。
-    if domain.has_ready() {
+    // 入队与登记 idle 的交错由双重检查闭合；work debt 的 Pending 电平同样
+    // 禁止 owner 带债入睡，即使对应门铃曾失败或被合并。
+    if domain.has_ready() || deferred_work::has_current() {
         domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
         return;
     }

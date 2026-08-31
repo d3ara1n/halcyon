@@ -151,7 +151,7 @@ Derive 遵循单一发布事务：先解析并强持 parent，预留 sponsor/glo
 | memory WaitContext | 128 | 4 | `MemoryWaitPermit`；WaitContext 真实析构 |
 | Remote completion | 128 | 4 | `RemoteCompletionPermit`；completion 真实析构 |
 
-Region/transaction 的实际 storage 已由 `MemorySpace::new` 在 Bind 时按完整上限 eager 预留，因此两类 permit 同样由 AddressSpace 一次批量预付，而不是为每个纯逻辑节点另挂 kernel owner；全局 Region 容量据此把同时 Bound 且预留完整 planner 容量的地址空间限制为 32。backing 与 operation 类按实际对象逐项取得，接口在 6A 建立，分别到 6C/6E 才接入公开 mapping 的真实 owner。
+Region/transaction 的实际 storage 已由 `MemorySpace::new` 在 Bind 时按完整上限 eager 预留，因此两类 permit 同样由 AddressSpace 一次批量预付，而不是为每个纯逻辑节点另挂 kernel owner；全局 Region 容量据此把同时 Bound 且预留完整 planner 容量的地址空间限制为 32。operation 类已在 6C 按实际对象接入公开 mapping 与 Tunnel，backing permit 到 6E 才接入真实 funded slice owner。
 
 验证：funded owner 跨 extent split/merge、wrong-owner、边界与析构顺序；global/sponsor exhaustion、部分取得 rollback、creator/调用线程消散后的 permit 寿命；host debug/release 与 clippy。
 
@@ -161,13 +161,17 @@ Region/transaction 的实际 storage 已由 `MemorySpace::new` 在 Bind 时按�
 
 验证：精确 preflight、资源不足零 PTE、并行 prepare 多余 owner、mega split、完整 Unmap 剪枝、确认前 owner 保活、`max_work=1` drain、未 drain Drop 拒绝与 drained Drop 常数终态；host debug/release 与 `just check`。
 
-批次 6A/6B 已完成实现闭包：资金化 owner 支持物理与额度同步 split/merge，metadata admission 覆盖本片六类真实 owner；页表运行时 seam 已改为 affine owner、精确 preflight/复检、显式 unused/retired 结果、Unmap 空表剪枝和层级无关 drain。单项发布严格绑定当前代次，同事务多项发布仅接受同代次 Map 批次；Running/Tunnel 以独占 Prepared gate 排除跨事务 stale，shared root 拒绝 Map/Protect。内核以最窄 raw token 接通 Publish→Remote ack→Retire；结果 owner 跨事务保活并在 AddressSpace 锁外析构，Building 即时发布仍使用过渡 adapter。Bound 状态改为独立堆对象以维持内核栈审计。host debug/release、page_table clippy、`just check` 与 virt core 通过。下一自然序进入 6C；全部 funded 表页的锁外供给、Building 编排和 root owner 移交仍严格留在 6D。
+批次 6A/6B 已完成实现闭包：资金化 owner 支持物理与额度同步 split/merge，metadata admission 覆盖本片六类真实 owner；页表运行时 seam 已改为 affine owner、精确 preflight/复检、显式 unused/retired 结果、Unmap 空表剪枝和层级无关 drain。单项发布严格绑定当前代次，同事务多项发布仅接受同代次 Map 批次；Running/Tunnel 以独占 Prepared gate 排除跨事务 stale，shared root 拒绝 Map/Protect。内核以最窄 raw token 接通 Publish→Remote ack→Retire；结果 owner 跨事务保活并在 AddressSpace 锁外析构，Building 即时发布仍使用过渡 adapter。Bound 状态改为独立堆对象以维持内核栈审计。host debug/release、page_table clippy、`just check` 与 virt core 通过。批次 6C 的实现与压力验证状态见下；全部 funded 表页的锁外供给、Building 编排和 root owner 移交仍严格留在 6D。
 
 ### 批次 6C：分批 deferred retire
 
 Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 work-debt seam，由明确 owner hart 的 trap 安全出口按固定预算推进 backing/table/metadata retire；一批未完成即保持稳定游标并重新敲门，最后一批在容器锁外释放 owner 后才 Complete ledger token、兑销 mandatory operation、释放结果义务并唤醒 WaitContext。终止和 ProcessDrain 接管同一状态机，不建立同步扫描旁路；Commit 后不得取得 heap、Pool、WaitContext 或 Remote 槽。
 
 验证：单批与多批、原发起线程消散、终止接管、重复门铃、暂时无 runnable 工作、最后完成唯一发布、最小预算及 metadata exhaustion-before-Commit；host 纯逻辑模型、`just virt` 与 `just virt-stress`。
+
+实现状态：6C 机制已接通。新增 `os/work_debt` 固定槽/owner FIFO/代次模型；planner 增加显式 Retiring 与 live owner 禁止 Finish；Remote final ack 只发布 debt，owner hart 安全点以 16 步总预算、4 步单债务轮转推进 table/backing/object/metadata，常态以每 owner 原子 Pending 避免空队列锁竞争；最终顺序为 ledger Complete → sink finish → mandatory → result obligation → WaitContext。公开 Memory 与 Tunnel 在 Commit 前预留三类 metadata、work slot、WaitContext 与 Remote 槽。ProcessDrain detached Tunnel close 将同一 `RetiringSpaceChange + LeaseRetire` 固定保存在 Endpoint 中逐批推进，无同步旁路。
+
+验证闭包：planner 19 项与 work-debt 5 项 host debug/release、两 crate clippy `-D warnings`、`just check`、默认 `just virt` 与默认节流的 `just virt-stress` 均通过；stress 完成 Tunnel exit stress、最小预算与 16/16 竞态矩阵。原有 stress 超时值已随验收面实测重新校准；超时仅作异常停滞收割，不再作为固定性能上限。6C 已完成，下一自然序进入 6D。
 
 ### 批次 6D：root 与全部用户页表资金化
 
@@ -211,7 +215,7 @@ FAL acceptance 至少用一条大于单页的数据流验证跨进程 Open 基�
 
 同步 `notes/impls/{mm,ipc,call,startup,task}.md` 与 FAL 实现现状；任何未落地的 KernelMemoryBudget、BufferQueue、pager、文件缓存、MemoryLease 和设备能力只留在 ideas/后续计划，不写成 impl 事实。审核代码中所有 frame 取得、Pool charge、ObjectView、metadata permit 与 Building operation 入口，删除 transitional raw runtime frame API，确保没有旁路。
 
-每片先跑对应 host debug/release 与 `just check`；涉及启动后跑 `just virt` core 快线，涉及寄存器/调用边界后补 `just virt-release`。阶段收尾统一跑 `just acceptance`（debug stress + release core + sifive_u core）；涉及调度域契约再补 `just virt-hetero`/`just virt-nofd`。每条 QEMU 由路线独立硬上限和 workload/业务/reset 锚点判断。最后更新 COMPASS，并在提交完成后生成带实际提交哈希的未来 review 计划。
+每片先跑对应 host debug/release 与 `just check`；涉及启动后跑 `just virt` core 快线，涉及寄存器/调用边界后补 `just virt-release`。阶段收尾统一跑 `just acceptance`（debug stress + release core + sifive_u core）；涉及调度域契约再补 `just virt-hetero`/`virt-nofd`。每条 QEMU 由路线独立、可调且按实测留余量的运行超时与 workload/业务/reset 锚点共同判断。最后更新 COMPASS，并在提交完成后生成带实际提交哈希的未来 review 计划。
 
 ## 完成标准
 
