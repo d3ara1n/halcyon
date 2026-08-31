@@ -29,6 +29,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`todo-2026-08-30-user-memory-mapping-review.md`](todo-2026-08-30-user-memory-mapping-review.md) | 未来审查：用户内存切片 1–8B（`1cd6ab2` 至 `bdc83ef`）及压力收口 `004cae5` 的统一 AddressSpace、失败原子、Remote shootdown、lease/backing 与 ThreadSpawn/join 组合所有权 |
 | [`todo-2026-08-30-remote-call-review.md`](todo-2026-08-30-remote-call-review.md) | 未来审查：`6199985` 的固定槽/RVWMO/epoch 基座及 `004cae5` 的真实同 AddressSpace stale-translation 与后续 Retire 组合 |
 | [`todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) | 当前主线：平台供给账本、系统储备、strict MemoryPool 与 funded frame broker 已完成；下一步为空壳 ProcessBindMemory → 公共 MemoryObject/多页 Tunnel/Runnel v2 |
+| [`todo-2026-09-funded-frame-broker-review.md`](todo-2026-09-funded-frame-broker-review.md) | 未来审查：提交 `48227c8` 的双账本事务顺序、仿射回滚、清零发布边界、固定 extent storage、栈 guard 与 raw/adopt 类型隔离 |
 | [`todo-2026-09-memory-pool-review.md`](todo-2026-09-memory-pool-review.md) | 未来审查：提交 `4715f3a` 的 root 额度闭包、Pool 线性 token/自然退款、metadata sponsor、Handle 发布原子、rights/ABI 与 rinlib affine owner |
 | [`todo-2026-09-platform-memory-ledger-review.md`](todo-2026-09-platform-memory-ledger-review.md) | 未来审查：提交 `198e665` 的 Devicetree admission、物理分类守恒、no-map 双重排除、transition/direct-map 静态预算与双平台启动闭包 |
 | [`todo-2026-09-system-supply-reserve-review.md`](todo-2026-09-system-supply-reserve-review.md) | 未来审查：提交 `0a944c7` 的固定 workspace planner、system typed tickets、FramePool/heap 物理隔离、静态容量证明与三平台分类闭包 |

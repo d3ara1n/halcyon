@@ -112,7 +112,7 @@ Derive 遵循单一发布事务：先解析并强持 parent，预留 sponsor/glo
 
 验证：broker host debug/release 覆盖 quota 失败、物理中途失败、extent 上限、非法 inventory claim、清零前放弃、commit、析构顺序与双方程恢复；MemoryPool 自身继续覆盖 charge split/merge。内核启动自检穿过真实 Pool/FramePool 的 commit、extent-limit rollback 与自然退款。boot-held adopt 在切片 5 以真实 typed token 验证；backing split/retire 在切片 6 与 AddressSpace 锁外收束一起验证。
 
-切片 3 已实现收口：`funded_frame` 共用事务、内核 quota/inventory adapters、私有 `FundedFrames` owner、真实启动自检与 64-extents 固定结构均已落地；host debug/release、clippy `-D warnings`、`just check` 与完整 `just acceptance` 通过。固定数组使 debug 最大单帧为 `0x2390`，按已确认的栈政策把纯虚拟 guard 扩至 `0x3000`、ELF audit 上限扩至 `0x2800`，virt debug stress/release core 与 sifive_u debug core 均验证通过。下一自然序进入切片 4。
+切片 3 已由提交 `48227c8` 实现收口：`funded_frame` 共用事务、内核 quota/inventory adapters、私有 `FundedFrames` owner、真实启动自检与 64-extents 固定结构均已落地；host debug/release、clippy `-D warnings`、`just check` 与完整 `just acceptance` 通过。固定数组使 debug 最大单帧为 `0x2390`，按已确认的栈政策把纯虚拟 guard 扩至 `0x3000`、ELF audit 上限扩至 `0x2800`，virt debug stress/release core 与 sifive_u debug core 均验证通过。未来复审对象固定在 [`todo-2026-09-funded-frame-broker-review.md`](todo-2026-09-funded-frame-broker-review.md)；下一自然序进入切片 4。
 
 ## 切片 4：空壳进程与 Building 截止
 
