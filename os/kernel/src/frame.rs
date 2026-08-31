@@ -6,10 +6,11 @@
 //! 发布为空闲。
 
 use frame_pool::{ArenaMetadata, ExtentGeometry, FramePool, MAX_ARENAS, metadata_bytes};
+use memory_supply::{HeapChunkTicket, Planner, Range as SupplyRange, Requirements, SystemSupply};
 use page_table::{FrameNumber, PAGE_BITS};
 
 use crate::{
-    board::{BoardInfo, MAX_MEMORY_REGIONS, MAX_PLATFORM_RESERVATIONS, MemoryRegion},
+    board::{BoardInfo, MAX_MEMORY_REGIONS, MAX_PLATFORM_RESERVATIONS},
     external, mm,
     sync::Spinlock,
 };
@@ -17,14 +18,50 @@ use crate::{
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
 const MAX_PERMANENT_RESERVATIONS: usize = MAX_PLATFORM_RESERVATIONS + 2;
 const MAX_BOOT_HOLDS: usize = 3;
-const MAX_RESERVATIONS: usize = MAX_PERMANENT_RESERVATIONS + MAX_BOOT_HOLDS + 1;
-
-/// 帧大小（字节）。堆供血等帧池消费方使用。
-pub const FRAME_SIZE: usize = PAGE_SIZE;
+// permanent 裁剪最多 M×P；boot 扣除 permanent 最多 M×P+M×B；
+// unavailable 合并两者和 system ranges，user-free 补集再增加最多 M 段。
+const MAX_CLASSIFIED_RANGES: usize = MAX_MEMORY_REGIONS
+    + 2 * MAX_MEMORY_REGIONS * MAX_PERMANENT_RESERVATIONS
+    + MAX_MEMORY_REGIONS * MAX_BOOT_HOLDS
+    + 1
+    + HEAP_CHUNK_LIMIT
+    + RECOVERY_TICKET_LIMIT;
+const HEAP_CHUNK_SIZE: usize = 1 << 20;
+const HEAP_CHUNK_LIMIT: usize = 16;
+const RECOVERY_TICKET_LIMIT: usize = 0;
 
 type KernelFramePool = FramePool<'static>;
 
 static POOL: Spinlock<Option<KernelFramePool>> = Spinlock::new(crate::sync::ranks::POOL, None);
+type KernelSystemSupply = SystemSupply<HEAP_CHUNK_LIMIT, RECOVERY_TICKET_LIMIT>;
+static SYSTEM_SUPPLY: Spinlock<Option<KernelSystemSupply>> =
+    Spinlock::new(crate::sync::ranks::SYSTEM_SUPPLY, None);
+type KernelSupplyPlanner = Planner<MAX_CLASSIFIED_RANGES, HEAP_CHUNK_LIMIT, RECOVERY_TICKET_LIMIT>;
+static SUPPLY_PLANNER: Spinlock<KernelSupplyPlanner> =
+    Spinlock::new(crate::sync::ranks::LEAF, KernelSupplyPlanner::new());
+
+struct SupplyInputs {
+    managed: [SupplyRange; MAX_MEMORY_REGIONS],
+    permanent_raw: [(usize, usize); MAX_PERMANENT_RESERVATIONS],
+    boot_raw: [(usize, usize); MAX_BOOT_HOLDS],
+    permanent: [SupplyRange; MAX_PERMANENT_RESERVATIONS],
+    boot_held: [SupplyRange; MAX_BOOT_HOLDS],
+}
+
+impl SupplyInputs {
+    const fn new() -> Self {
+        Self {
+            managed: [SupplyRange::EMPTY; MAX_MEMORY_REGIONS],
+            permanent_raw: [(0, 0); MAX_PERMANENT_RESERVATIONS],
+            boot_raw: [(0, 0); MAX_BOOT_HOLDS],
+            permanent: [SupplyRange::EMPTY; MAX_PERMANENT_RESERVATIONS],
+            boot_held: [SupplyRange::EMPTY; MAX_BOOT_HOLDS],
+        }
+    }
+}
+
+static SUPPLY_INPUTS: Spinlock<SupplyInputs> =
+    Spinlock::new(crate::sync::ranks::DRAIN_GATE, SupplyInputs::new());
 
 /// 持锁访问帧库存（初始化前访问为致命错误）。
 fn with_pool<R>(f: impl FnOnce(&mut KernelFramePool) -> R) -> R {
@@ -33,16 +70,18 @@ fn with_pool<R>(f: impl FnOnce(&mut KernelFramePool) -> R) -> R {
 
 /// 解析板级信息并初始化帧库存。
 pub fn init(board: &BoardInfo) {
-    let mut memories = [MemoryRegion { start: 0, len: 0 }; MAX_MEMORY_REGIONS];
-    memories[..board.memories().len()].copy_from_slice(board.memories());
+    let mut inputs = SUPPLY_INPUTS.lock();
     let memory_count = board.memories().len();
-    memories[..memory_count].sort_unstable_by_key(|region| region.start);
-    validate_memories(&memories[..memory_count]);
+    for (output, region) in inputs.managed.iter_mut().zip(board.memories()) {
+        *output = SupplyRange::new(region.start, region.end()).expect("invalid managed range");
+    }
+    inputs.managed[..memory_count].sort_unstable_by_key(|region| region.start());
+    validate_memories(&inputs.managed[..memory_count]);
 
-    let total_frames = memories[..memory_count]
+    let total_frames = inputs.managed[..memory_count]
         .iter()
         .try_fold(0usize, |total, region| {
-            total.checked_add(region.len / PAGE_SIZE)
+            total.checked_add(region.len() / PAGE_SIZE)
         })
         .expect("managed frame count overflow");
     let tree_metadata_len = metadata_bytes(total_frames).expect("frame metadata size overflow");
@@ -52,20 +91,21 @@ pub fn init(board: &BoardInfo) {
     let metadata_len = arena_metadata_len
         .checked_add(tree_metadata_len)
         .expect("frame metadata size overflow");
-    let metadata_reserved_len =
-        align_up(metadata_len, PAGE_SIZE).expect("frame metadata alignment overflow");
 
-    let mut permanent = [(0usize, 0usize); MAX_PERMANENT_RESERVATIONS];
-    let permanent_count = build_permanent_reservations(board, &mut permanent);
+    let permanent_count = build_permanent_reservations(board, &mut inputs.permanent_raw);
 
-    let mut boot_holds = [(0usize, 0usize); MAX_BOOT_HOLDS];
     let mut boot_hold_count = 0usize;
     let dtb = board.dtb_range();
-    push_reservation(&mut boot_holds, &mut boot_hold_count, dtb.start, dtb.end());
+    push_reservation(
+        &mut inputs.boot_raw,
+        &mut boot_hold_count,
+        dtb.start,
+        dtb.end(),
+    );
     let bootstrap = external::bootstrap_range();
     assert_no_overlap(
         bootstrap,
-        &permanent[..permanent_count],
+        &inputs.permanent_raw[..permanent_count],
         "bootstrap range overlaps permanent memory",
     );
     assert!(
@@ -73,7 +113,7 @@ pub fn init(board: &BoardInfo) {
         "bootstrap range overlaps the device tree"
     );
     push_reservation(
-        &mut boot_holds,
+        &mut inputs.boot_raw,
         &mut boot_hold_count,
         bootstrap.0,
         bootstrap.1,
@@ -82,48 +122,64 @@ pub fn init(board: &BoardInfo) {
         let package = page_cover(address, len, "BootPackage range");
         assert_no_overlap(
             package,
-            &permanent[..permanent_count],
+            &inputs.permanent_raw[..permanent_count],
             "BootPackage range overlaps permanent memory",
         );
         assert!(
-            !boot_holds[..boot_hold_count]
+            !inputs.boot_raw[..boot_hold_count]
                 .iter()
                 .any(|range| overlaps(*range, package)),
             "BootPackage range overlaps another boot-held range"
         );
-        push_reservation(&mut boot_holds, &mut boot_hold_count, package.0, package.1);
+        push_reservation(
+            &mut inputs.boot_raw,
+            &mut boot_hold_count,
+            package.0,
+            package.1,
+        );
     }
-    boot_hold_count = normalize_reservations(&mut boot_holds, boot_hold_count);
+    boot_hold_count = normalize_reservations(&mut inputs.boot_raw, boot_hold_count);
 
-    let mut reservations = [(0usize, 0usize); MAX_RESERVATIONS];
-    let mut reservation_count = 0usize;
-    for &(start, end) in &permanent[..permanent_count] {
-        push_reservation(&mut reservations, &mut reservation_count, start, end);
+    for index in 0..permanent_count {
+        let (start, end) = inputs.permanent_raw[index];
+        inputs.permanent[index] = SupplyRange::new(start, end).expect("invalid permanent range");
     }
-    for &(start, end) in &boot_holds[..boot_hold_count] {
-        push_reservation(&mut reservations, &mut reservation_count, start, end);
+    for index in 0..boot_hold_count {
+        let (start, end) = inputs.boot_raw[index];
+        inputs.boot_held[index] = SupplyRange::new(start, end).expect("invalid boot-held range");
     }
-    reservation_count = normalize_reservations(&mut reservations, reservation_count);
 
-    let metadata_pa = find_reservation(
-        &memories[..memory_count],
-        &reservations[..reservation_count],
-        metadata_reserved_len,
-    )
-    .expect("no contiguous memory for frame metadata");
-    push_reservation(
-        &mut reservations,
-        &mut reservation_count,
-        metadata_pa,
-        metadata_pa + metadata_reserved_len,
-    );
-    reservation_count = normalize_reservations(&mut reservations, reservation_count);
+    let mut planner = SUPPLY_PLANNER.lock();
+    let plan = planner
+        .plan(
+            &inputs.managed[..memory_count],
+            &inputs.permanent[..permanent_count],
+            &inputs.boot_held[..boot_hold_count],
+            Requirements {
+                page_size: PAGE_SIZE,
+                metadata_bytes: metadata_len,
+                heap_chunk_size: HEAP_CHUNK_SIZE,
+                heap_chunk_count: HEAP_CHUNK_LIMIT,
+                recovery_ticket_size: PAGE_SIZE,
+                recovery_ticket_count: RECOVERY_TICKET_LIMIT,
+            },
+        )
+        .expect("system memory supply cannot satisfy the configured budgets");
+    let (inventory, system_supply) = plan.into_parts();
 
-    // SAFETY: metadata reservation 已从即将发布的空闲补集中剔除；直映射覆盖全部
-    // DT memory。两个不重叠切片随全局 FramePool 存活，没有其它可变引用。
+    let metadata = system_supply.metadata().range();
+    clear_system_range(metadata);
+    for range in system_supply.heap_ranges() {
+        clear_system_range(range);
+    }
+    for range in system_supply.recovery_ranges() {
+        clear_system_range(range);
+    }
+
+    // SAFETY: metadata ticket 从 user inventory 永久剔除；两个不重叠切片随全局
+    // FramePool 存活，没有其它可变引用。
     let (arenas, tree_metadata) = unsafe {
-        let ptr = mm::phys_to_virt(metadata_pa) as *mut u8;
-        core::ptr::write_bytes(ptr, 0, metadata_reserved_len);
+        let ptr = mm::phys_to_virt(metadata.start()) as *mut u8;
         let arenas = core::slice::from_raw_parts_mut(ptr.cast::<ArenaMetadata>(), MAX_ARENAS);
         let tree_metadata =
             core::slice::from_raw_parts_mut(ptr.add(arena_metadata_len), tree_metadata_len);
@@ -131,77 +187,80 @@ pub fn init(board: &BoardInfo) {
     };
     let mut pool = FramePool::new(tree_metadata, arenas);
 
-    for region in &memories[..memory_count] {
+    for region in &inputs.managed[..memory_count] {
         pool.add_managed_region(
-            FrameNumber::from_addr(region.start),
-            FrameNumber::from_addr(region.start + region.len),
+            FrameNumber::from_addr(region.start()),
+            FrameNumber::from_addr(region.end()),
         )
         .expect("DT memory exceeds frame inventory metadata");
     }
-
-    let mut free_regions = 0usize;
-    for region in &memories[..memory_count] {
-        subtract(
-            region.start,
-            region.start + region.len,
-            &reservations[..reservation_count],
-            |start, end| {
-                pool.release_range(FrameNumber::from_addr(start), FrameNumber::from_addr(end))
-                    .expect("free range must be a reserved managed interval");
-                free_regions += 1;
-            },
-        );
+    for range in inventory.user_free() {
+        pool.release_range(
+            FrameNumber::from_addr(range.start()),
+            FrameNumber::from_addr(range.end()),
+        )
+        .expect("planned user-free range must be a reserved managed interval");
     }
-    assert!(
-        free_regions > 0,
-        "no free memory regions after boot reservations"
-    );
 
     let free = pool.free_frames();
-    let permanent_frames = covered_frames(&memories[..memory_count], &permanent[..permanent_count]);
-    let boot_held_frames = boot_held_frames(
-        &memories[..memory_count],
-        board,
-        &permanent[..permanent_count],
+    let permanent_frames = inventory.permanent_bytes() / PAGE_SIZE;
+    let boot_held_frames = inventory.boot_held_bytes() / PAGE_SIZE;
+    let system_frames = inventory.system_bytes() / PAGE_SIZE;
+    let metadata_frames = metadata.len() / PAGE_SIZE;
+    let heap_frames = HEAP_CHUNK_LIMIT * (HEAP_CHUNK_SIZE / PAGE_SIZE);
+    let recovery_frames = RECOVERY_TICKET_LIMIT;
+    assert_eq!(
+        system_frames,
+        metadata_frames + heap_frames + recovery_frames,
+        "system supply subaccounts do not close"
     );
-    let metadata_frames = metadata_reserved_len / PAGE_SIZE;
     assert_eq!(
         total_frames,
-        permanent_frames + boot_held_frames + metadata_frames + free,
+        permanent_frames + boot_held_frames + system_frames + free,
         "physical supply classification does not close"
     );
+    assert_eq!(
+        free,
+        inventory.user_free_bytes() / PAGE_SIZE,
+        "FramePool published supply differs from the plan"
+    );
+    drop(inventory);
+    drop(planner);
+    drop(inputs);
     log!(
         Frame,
-        "{} arena(s), total {} frame(s): permanent {}, boot-held {}, metadata {}, free {}",
+        "{} arena(s), total {} frame(s): permanent {}, boot-held {}, system {}, user-free {}",
         pool.arena_count(),
         total_frames,
         permanent_frames,
         boot_held_frames,
-        metadata_frames,
+        system_frames,
         free
     );
+    log!(
+        Frame,
+        "system {} frame(s): metadata {}, heap {}, recovery {}",
+        system_frames,
+        metadata_frames,
+        heap_frames,
+        recovery_frames
+    );
     *POOL.lock() = Some(pool);
+    *SYSTEM_SUPPLY.lock() = Some(system_supply);
 }
 
-fn validate_memories(memories: &[MemoryRegion]) {
+fn validate_memories(memories: &[SupplyRange]) {
     for (index, region) in memories.iter().enumerate() {
         assert!(
-            region.start % PAGE_SIZE == 0 && region.len > 0 && region.len % PAGE_SIZE == 0,
+            region.start() % PAGE_SIZE == 0 && region.end() % PAGE_SIZE == 0,
             "DT memory region is not page aligned"
         );
-        let end = region
-            .start
-            .checked_add(region.len)
-            .expect("DT memory range overflow");
         if index > 0 {
-            let previous = memories[index - 1];
-            let previous_end = previous
-                .start
-                .checked_add(previous.len)
-                .expect("DT memory range overflow");
-            assert!(previous_end <= region.start, "DT memory regions overlap");
+            assert!(
+                memories[index - 1].end() <= region.start(),
+                "DT memory regions overlap"
+            );
         }
-        let _ = end;
     }
 }
 
@@ -294,69 +353,6 @@ fn page_cover(start: usize, len: usize, label: &str) -> (usize, usize) {
     )
 }
 
-fn covered_frames(memories: &[MemoryRegion], ranges: &[(usize, usize)]) -> usize {
-    memories
-        .iter()
-        .map(|memory| {
-            ranges
-                .iter()
-                .map(|&(start, end)| {
-                    end.min(memory.end())
-                        .saturating_sub(start.max(memory.start))
-                        / PAGE_SIZE
-                })
-                .sum::<usize>()
-        })
-        .sum()
-}
-
-fn boot_held_frames(
-    memories: &[MemoryRegion],
-    board: &BoardInfo,
-    permanent: &[(usize, usize)],
-) -> usize {
-    let dtb = board.dtb_range();
-    let mut frames = 0usize;
-    subtract(dtb.start, dtb.end(), permanent, |start, end| {
-        frames += (end - start) / PAGE_SIZE;
-    });
-    let bootstrap = external::bootstrap_range();
-    frames += (bootstrap.1 - bootstrap.0) / PAGE_SIZE;
-    if let Some((address, len)) = board.boot_package {
-        let package = page_cover(address, len, "BootPackage range");
-        frames += (package.1 - package.0) / PAGE_SIZE;
-    }
-    assert!(
-        frames <= memories.iter().map(|memory| memory.len / PAGE_SIZE).sum(),
-        "boot-held frame count exceeds managed supply"
-    );
-    frames
-}
-
-fn find_reservation(
-    memories: &[MemoryRegion],
-    reservations: &[(usize, usize)],
-    len: usize,
-) -> Option<usize> {
-    for region in memories {
-        let mut candidate = None;
-        subtract(
-            region.start,
-            region.start + region.len,
-            reservations,
-            |start, end| {
-                if candidate.is_none() && end - start >= len {
-                    candidate = Some(start);
-                }
-            },
-        );
-        if candidate.is_some() {
-            return candidate;
-        }
-    }
-    None
-}
-
 /// 从 `[start, end)` 减去地址有序、互不重叠的 reservations。
 fn subtract(
     start: usize,
@@ -393,6 +389,13 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|end| end & !(alignment - 1))
 }
 
+fn clear_system_range(range: SupplyRange) {
+    // SAFETY: planner 已从 user inventory 剔除该 system range，启动线程持有唯一准备权。
+    unsafe {
+        core::ptr::write_bytes(mm::phys_to_virt(range.start()) as *mut u8, 0, range.len());
+    }
+}
+
 fn clear_claimed(base: FrameNumber, count: usize) {
     let bytes = count
         .checked_mul(PAGE_SIZE)
@@ -408,8 +411,8 @@ fn publish_claimed(base: FrameNumber, count: usize) -> FrameTracker {
     FrameTracker::from_claimed(base, count)
 }
 
-/// 分配 `2^order` 个物理连续帧；库存解锁后清零，再发布 RAII 所有权。
-pub fn alloc_order(order: usize) -> Option<FrameTracker> {
+/// 从 user inventory 分配 `2^order` 个物理连续帧；解锁后清零，再发布所有权。
+pub fn alloc_user_order(order: usize) -> Option<FrameTracker> {
     let base = with_pool(|pool| pool.alloc_order(order))?;
     let count = 1usize
         .checked_shl(order as u32)
@@ -417,8 +420,8 @@ pub fn alloc_order(order: usize) -> Option<FrameTracker> {
     Some(publish_claimed(base, count))
 }
 
-/// 在 `max_count` 内分配当前可用的最大连续 extent。
-pub fn alloc_largest(max_count: usize) -> Option<FrameTracker> {
+/// 从 user inventory 在 `max_count` 内分配当前可用的最大连续 extent。
+pub fn alloc_user_largest(max_count: usize) -> Option<FrameTracker> {
     let (base, count) = with_pool(|pool| pool.alloc_largest(max_count))?;
     Some(publish_claimed(base, count))
 }
@@ -456,6 +459,24 @@ pub fn release_device_tree(board: &BoardInfo) {
 /// 帧库存剩余空闲帧数。
 pub fn free_frames() -> usize {
     with_pool(|pool| pool.free_frames())
+}
+
+/// Talc Source 在 heap 锁内 O(1) 消费一个预清零 system ticket。
+pub fn take_heap_chunk() -> Option<HeapChunkTicket> {
+    SYSTEM_SUPPLY
+        .lock()
+        .as_mut()
+        .expect("system supply not initialized")
+        .take_heap_chunk()
+}
+
+/// 尚未交给内核 heap 的 system chunk 数。
+pub fn remaining_heap_chunks() -> usize {
+    SYSTEM_SUPPLY
+        .lock()
+        .as_ref()
+        .expect("system supply not initialized")
+        .remaining_heap_chunks()
 }
 
 /// RAII 帧 extent 所有权：Drop 时按 canonical blocks 有界归还。
@@ -515,11 +536,6 @@ impl FrameTracker {
         geometry.base()
     }
 
-    /// 消费 tracker，把该 extent 永久移交给不支持归还的内核子系统。
-    pub fn into_permanent(mut self) {
-        let _geometry = self.take_geometry();
-    }
-
     /// 从 `page_table::FrameMemory` 契约收回一帧所有权。
     ///
     /// # Safety
@@ -549,7 +565,7 @@ impl Drop for FrameTracker {
 
 /// 自检：分配→切割→写入→归还→重取验证清零，全程真硬件访问。
 pub fn selftest() {
-    let tracker = alloc_order(3).expect("self-test allocation failed");
+    let tracker = alloc_user_order(3).expect("self-test allocation failed");
     let slots = mm::phys_to_virt(tracker.base().addr()) as *mut usize;
     // SAFETY: 自检持有 8 帧，写首 8 槽不越界；高半区直映射下访问。
     unsafe {
@@ -578,7 +594,7 @@ pub fn selftest() {
         before + 8,
         "frame return accounting mismatch"
     );
-    let tracker = alloc_order(3).expect("reallocation failed");
+    let tracker = alloc_user_order(3).expect("reallocation failed");
     // SAFETY: 同上；首帧首槽读回验证锁外初始化已完成。
     let first = unsafe { *(mm::phys_to_virt(tracker.base().addr()) as *const usize) };
     assert!(first == 0, "allocation not zeroed");

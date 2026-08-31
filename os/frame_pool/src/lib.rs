@@ -15,8 +15,8 @@ use page_table::FrameNumber;
 /// 单个 FramePool 最多容纳的对齐 arena 数。
 ///
 /// 一个任意半开区间的 canonical power-of-two 分解不超过地址位宽的两倍；
-/// 1024 覆盖内核最多 8 个 DT memory region 的结构上界。
-pub const MAX_ARENAS: usize = 1024;
+/// 2048 覆盖内核最多 16 个 DT memory region 的结构上界。
+pub const MAX_ARENAS: usize = 2048;
 
 /// 树节点没有可分配块。其余值直接编码该子树可提供的最大 order。
 const UNAVAILABLE: u8 = u8::MAX;

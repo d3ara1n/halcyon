@@ -1,18 +1,37 @@
 # 内存管理
 
-方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分五层：帧库存、用户地址空间纯逻辑规划器、可 host 测试的 Sv39 页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
+方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分六层：启动物理供给规划、帧库存、用户地址空间纯逻辑规划器、可 host 测试的 Sv39 页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
 
-## 帧库存
+## 启动物理供给与系统储备
 
-物理帧的唯一来源是 `os/frame_pool` 的**外置元数据分级 order 树**。纯逻辑 crate 不使用堆、不含 unsafe；内核只在 `os/kernel/src/frame.rs` 提供启动 reservation、真实帧清零、全局 POOL 锁与 `FrameTracker` RAII 适配。
+`os/memory_supply` 是 `no_std`、禁止 unsafe、零堆分配的纯逻辑规划器；`os/kernel/src/frame.rs` 在 BSS 中提供固定 workspace。输入只接受板级层已经接纳并页对齐的 managed、permanent 与 boot-held 区间，输出是借用的 `InventoryPlan` 与拥有 typed tickets 的 `SystemSupply`。workspace 在失败后可以被下一次规划覆盖；只有完整 `Ok(Plan)` 才能拆出可发布对象，因此失败不会把部分分类写入全局 FramePool 或 system ticket store。
+
+分类顺序固定为：permanent 先裁进 managed 并归一化；boot-held 同样裁剪后再扣除 permanent；metadata、heap chunks、recovery tickets 依次从剩余 gap 低地址确定性放置；最后的补集才是 user-free。metadata 只要求页对齐且自身连续；每个 heap chunk 独立要求 1 MiB 连续与同尺寸对齐，不要求整个 system reserve 连续。任一输入非法、算术溢出、workspace 容量不足或任一子预算无法完整放置都使启动 fail closed。
+
+固定 range 容量不是平台实测值。令 `M=MAX_MEMORY_REGIONS=16`、`P=MAX_PERMANENT_RESERVATIONS=34`、`B=MAX_BOOT_HOLDS=3`、system ranges 为一段 metadata 加 `H=16` 段 heap 与 `R=0` 段 recovery：permanent 裁剪后最多 `M×P` 段，boot-held 扣除 permanent 后最多 `M×P+M×B` 段，归一化前 unavailable 最多 `2MP+MB+1+H+R` 段，最终 user-free 补集再增加至多 `M` 段。因此 `MAX_CLASSIFIED_RANGES = M+2MP+MB+1+H+R = 1169`；全部数组常驻 BSS，不进入冷启动栈。
+
+当前 system 子预算分别为：FramePool 树 metadata 每个 managed frame 精确 2 字节，再加固定 2048 项 `ArenaMetadata` 后整页上取整；内核 heap 为 16 个各 1 MiB 的 tickets；现有 Commit 后 completion、rollback、drain 与 remote-call 路径不分配物理页，故 recovery 为 0。后者不是永久假设：任何新增 recovery 页消费者必须先给出并发上界、提高独立 ticket 数并补 exhaustion 测试，不能从普通 heap 或 user inventory 借页。
+
+`FramePoolMetadata` 的区间清零后直接成为 FramePool 两个外置 metadata 切片，并随库存永久保留。全部 `HeapChunkTicket` 在全局 allocator 首次使用前由启动线程预清零；Talc `SystemSource::acquire` 在 HEAP 锁内只从 `SYSTEM_SUPPLY` O(1) pop 一个 ticket 并 claim，不进入 FramePool、不扫描区间、不执行 memset。heap ticket 一经消费便永久归堆，耗尽只导致普通 metadata OOM；固定物理容量不替代后续 MetadataSponsor/KernelMemoryBudget 的对象级 admission。`RecoveryTicket` 与 heap 没有公共消费类型，当前数组容量为零。
+
+FramePool 先把完整 managed RAM 注册为 unavailable，只发布 planner 给出的 user-free。DTB、cold bootstrap 与 BootPackage 等 boot-held 页在 owner 生命周期结束且 transition 映射退休后经 `release_range` 回投同一 user inventory；permanent 与 system 页从不经过该入口。启动日志分别断言：
+
+```text
+managed = permanent + boot_held + system + user_free
+system  = metadata + heap + recovery
+```
+
+## 用户帧库存
+
+物理帧的用户库存由 `os/frame_pool` 的**外置元数据分级 order 树**管理。`frame_pool` 不使用堆且不含 unsafe；内核 adapter 负责真实帧清零、全局 POOL 锁与 `FrameTracker` RAII 所有权。
 
 ### 结构
 
-每个 DT memory region 先按全局帧号作 canonical power-of-two 分解，形成物理对齐 arena。单个任意区间至多产生两倍地址位宽个 arena；板级最多 8 个 memory region，`MAX_ARENAS = 1024` 是结构上限。arena 不跨 DT 物理缺口，因此任何 order 块天然物理连续并按自身大小对齐。
+每个 DT memory region 先按全局帧号作 canonical power-of-two 分解，形成物理对齐 arena。单个任意区间至多产生两倍地址位宽个 arena；板级最多 16 个 memory region，`MAX_ARENAS = 2048` 由 `16 × 2 × usize::BITS` 推导。arena 不跨 DT 物理缺口，因此任何 order 块天然物理连续并按自身大小对齐。
 
 每个 arena 使用完全二叉树，节点一个 `u8`：`0..` 表示该子树当前可提供的最大 order，`u8::MAX` 表示没有空闲块。整块空闲由父节点直接代表；向下分配时才物化两个子节点，归还时沿祖先即时合并。分配和归还不维护运行期碎片链，也不读取被管理帧内容。
 
-树节点每个托管帧精确占 2 字节；固定 1024 项 `ArenaMetadata` 与树节点一起从启动期物理 reservation 取得。`FramePool` 自身只持两个外置切片和计数器，不把大数组压入内核栈。实测 virt 1 GiB 使用 134 个元数据帧，sifive_u 128 MiB 使用 22 个。
+树节点每个托管帧精确占 2 字节；固定 2048 项 `ArenaMetadata` 与树节点同处 planner 交付的 metadata 区间。`FramePool` 自身只持两个外置切片和计数器，不把大数组压入内核栈，也不从自己管理的 user-free 页反向供血。
 
 ```rust
 pub struct FramePool<'a> {
@@ -29,21 +48,18 @@ pub struct FrameTracker {
 ### 操作与契约
 
 - `add_managed_region(start, end)`：注册完整 DT memory，初态全部 unavailable；重叠、arena 超限或元数据不足在修改前失败。
-- `release_range(start, end)`：把启动 reservation 的补集或已结束 reservation 发布为空闲；bootstrap 与 BootPackage prefix 回投走此入口。
-- `alloc_order(order)`：库存分配 `2^order` 个连续且同阶对齐帧，沿固定 arena 集合选树、沿树下降；内核 adapter 在锁外清零后发布 tracker。
-- `alloc_largest(max_count)`：库存单次扫描固定 arena 集合，取得不超过上限的最大 power-of-two extent；普通匿名 backing 用多个 extent 表达任意页数，不要求整段 PA 连续；内核同样在锁外清零后发布。
+- `release_range(start, end)`：只把 planner 的 user-free 或生命周期结束的 user boot-held 区间发布为空闲；bootstrap、DTB 与 BootPackage prefix 回投走此入口。
+- `alloc_order(order)` / `alloc_largest(max_count)`：纯库存 crate 的 order 与最大 extent 原语；内核仅以 transitional `alloc_user_order` / `alloc_user_largest` 暴露给页表、匿名 backing、Tunnel backing 和库存自检，锁外清零后才发布 tracker。
 - `alloc_at(base, count)`：预验证完整指定区间空闲后，按 canonical blocks 精确取走；失败不改变库存。
 - `dealloc(base, count)`：任意区间 canonical 分解后沿祖先合并；重复归还或与现有空闲库存重叠立即触发断言。普通 `FrameTracker` 持 power-of-two extent，BootPackage payload 可持任意长度保留区间。
 
-`alloc_order`/`alloc_largest` 的库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
+库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
 
-启动流程先排序并验证 DT memory，再按总托管帧数计算元数据 reservation；SBI+内核、实际 BootPackage 和元数据页保持 unavailable，只发布其补集。内核堆明确申请 order 8（1 MiB）并终身持有；页表与 Tunnel 申请 order 0。Building 匿名区间由 `alloc_largest` 组合多个 extent。
+`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。页表帧通过 `into_table_frame`/`adopt_table_frame` 显式移交，BootPackage payload 通过独立 reservation adopt 收编。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：tracker 从拥有结构摘下与下一 work unit 的实际归还分开计费，手工摘除的表帧经 table adopt 进入同一路径。
 
-`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。页表帧通过 `into_table_frame`/`adopt_table_frame` 显式移交，BootPackage payload 通过独立 reservation adopt 收编，内核堆通过 permanent transfer 终身持有。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：tracker 从拥有结构摘下与下一 work unit 的实际归还分开计费，手工摘除的表帧经 table adopt 进入同一路径。
+## 物理供给验证
 
-### 测试集（host）
-
-15 项 host 用例覆盖：整阶取还、逐层 split/coalesce、全局 order 对齐、碎片不伪造大阶、extent 几何边界与精确切割、最大 extent fallback、`alloc_at` 精确/失败原子/跨 arena、reservation 延后发布、多 DT region 不跨洞、元数据/arena/重叠准入失败、canonical arena 数上界、双重释放、零长度拒绝，以及 2000 轮随机分配归还的帧数守恒与最终整阶合并。纯逻辑库存类型没有帧内容后端，因此 host claim 路径结构上无法访问帧内容。内核启动自检覆盖 claim、锁外清零、affine split、分片归还计数与再次清零；virt debug/release/hetero/nofd 和 sifive_u 均通过。
+16 项 FramePool host 用例覆盖库存结构、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero 和 system heap ticket 首次消费。virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；最终实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。
 
 ## 页表模式选择
 

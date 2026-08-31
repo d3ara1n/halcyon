@@ -457,7 +457,7 @@ pub fn create(
     va: usize,
     output: usize,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let tracker = frame::alloc_order(0).ok_or(SystemCallError::OutOfMemory)?;
+    let tracker = frame::alloc_user_order(0).ok_or(SystemCallError::OutOfMemory)?;
     let pa = tracker.base().addr();
     let connection = Arc::try_new(Connection {
         memory: Spinlock::new(

@@ -93,7 +93,7 @@ impl FrameMemory for TableMem {
     type ReservedFrame = TableFrameToken;
 
     fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, page_table::FrameExhausted> {
-        frame::alloc_order(0)
+        frame::alloc_user_order(0)
             .map(TableFrameToken)
             .ok_or(page_table::FrameExhausted)
     }
@@ -256,7 +256,8 @@ impl OwnedBacking {
             .map_err(|_| SpaceError::NoFrame)?;
         let mut allocated = 0;
         while allocated < pages {
-            let tracker = frame::alloc_largest(pages - allocated).ok_or(SpaceError::NoFrame)?;
+            let tracker =
+                frame::alloc_user_largest(pages - allocated).ok_or(SpaceError::NoFrame)?;
             let count = tracker.count();
             extents.push(BackingExtent {
                 offset_pages: allocated,

@@ -91,12 +91,13 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 ## 堆与物理帧
 
-分层管理两种语义不同的资源：
+分层管理三种语义不同的资源：
 
-- 帧池（os/frame_pool，外置元数据分级 order 树）：管理页粒度、指定 order 连续块和任意长度 reservation；DT memory 注册为初始 unavailable arena，启动占用与元数据 reservation 的补集才发布为空闲。claim、split、coalesce、指定区间和归还的库存步骤由固定 arena 数与地址位宽限定，纯库存不含帧内容后端；内核在 POOL 锁外清零后才发布不可复制的 `FrameTracker`，页表与启动 reservation 经显式 transfer/adopt 移交。设计细节见 [`mm.md`](mm.md)「帧库存」。
-- 堆（talc）：管任意尺寸小对象；内存源 FrameSource 从帧池按需取 1MiB 连续帧块建立堆区（talc 支持多块不连续区域），帧块所有权随 claim 终身归堆。设备树解析（os/dtb，就地游标）与启动路径零堆依赖，保证帧池先于堆就绪的线性引导序。
+- 物理供给（os/memory_supply，固定 workspace planner）：启动期按 permanent、boot-held、system、user-free 分类；FramePool metadata、16×1 MiB heap chunks 与当前为零的 recovery 子预算以不同 ticket 类型隔离，失败不发布部分计划。
+- 用户帧库存（os/frame_pool，外置元数据分级 order 树）：只发布 planner 的 user-free 与生命周期结束的 user boot-held；claim、split、coalesce、指定区间和归还的库存步骤由固定 arena 数与地址位宽限定。内核在 POOL 锁外清零后才发布不可复制的 `FrameTracker`，页表与启动 reservation 经显式 transfer/adopt 移交。设计细节见 [`mm.md`](mm.md)「帧库存」。
+- 内核堆（talc）：管任意尺寸小对象；`SystemSource` 在 allocator 忙碌时只从独立 `SYSTEM_SUPPLY` O(1) 消费一个启动期预清零的 heap ticket，不进入用户 FramePool，也不借 recovery。ticket 用尽后普通 metadata 分配 OOM；对象级 admission 是独立机制。
 
-理由：帧与小对象生命周期模式不同，分层使碎片域独立、锁独立；这也是 Linux（buddy+slab）的通行分层。堆→帧池单向依赖（不逆向），彻底消除帧池元数据碰堆的运行时环。
+三层的碎片域、锁与失败边界彼此独立。planner 使 FramePool metadata 和堆供血都不再反向依赖用户库存，从物理所有权上消除“库存元数据由自身供血”及 HEAP→POOL 的运行时环。
 
 ## 进程容器与 PID
 

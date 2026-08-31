@@ -65,15 +65,30 @@
 
 KernelMemoryBudget 公共能力不在本计划实现，但每个新增或改造对象在进入对应切片前必须登记并实现过渡 admission：sponsor、最大存量、permit 的唯一 owner、Commit 后是否分配、退款终点和终态壳的真实寿命。至少覆盖 Process core/Builder/Control、Pool core、charge reservation、AddressSpace/Region/ObjectView、MemoryObject/Connection、Handle reservation、MemoryChange、WaitContext 与 Remote Call slots。
 
-过渡 permit 来自物理隔离系统储备支撑的固定全局 slots。可信 ProcessCreate/bootstrap 取得一个不可转授、不可扩容的内部 `MetadataSponsor` 并附入 ProcessResources；Running Map、MemoryObject/Tunnel Create 等路径只从当前进程 sponsor 的类型化子额度预留 permits，不需要再次持资源管理 capability。独立于进程存活的对象把 permit 与 sponsor 强引用一起带到自身真实析构，不能在 creator Dead 或 capability 转移时提前退款。容器硬上限限制单对象宽度，sponsor/global slots 限制进程及全系统总量，三者不能互相替代。Process core 到 Dead 才退 core permit，Builder 随最后引用退自己的 permit，Control shell permit 随最后一个观察 capability 消散；Publish/Commit 后不得再取得新 permit。该表、实现和 metadata exhaustion 测试是每片准入门，不是 KernelMemoryBudget 已完成的替代声明。
+过渡 permit 来自物理隔离系统储备支撑的固定全局 slots。可信 ProcessCreate/bootstrap 取得一个不可转授、不可扩容的内部 `MetadataSponsor` 并附入 ProcessResources；Running Map、MemoryObject/Tunnel Create 等路径只从当前进程 sponsor 的类型化子额度预留 permits，不需要再次持资源管理 capability。独立于进程存活的对象把 permit 与 sponsor 强引用一起带到自身真实析构，不能在 creator Dead 或 capability 转移时提前退款。容器硬上限限制单对象宽度，sponsor/global slots 限制进程及全系统总量，三者不能互相替代。Process core 到 Dead 才退 core permit，Builder 随最后引用退自己的 permit，Control shell permit 随最后一个观察 capability 消散；Publish/Commit 后不得再取得新 permit。该表、实现和 metadata exhaustion-before-Commit 测试是每片准入门；自然顺序是在该片新增首个可放大对象之前完成，而不是等切片 10 补账。公共完成标准是所有用户可触达分配均可失败、permit 唯一退款且 Commit 后零分配；在此之前不得开放对应创建面，也不得把固定 heap 容量描述为 KernelMemoryBudget 或完整多租户 DoS 隔离。
 
 ## 切片 1：平台供给账本与系统储备
 
 扩展纯逻辑 DT/区间层，接纳全部 `/memory` ranges，解析 FDT reservation block 与 `/reserved-memory`，对任意来源执行 checked end、页边界规范化、排序、合并与区间相减。永久保留、系统储备、boot-held 与 user-free 使用不同 affine 类型；重叠或矛盾只能在显式优先级规则下归一，否则启动失败。`no-map` 进入独立政策子集，板级层生成带洞的标准直映射 admitted ranges，页表组件以 eager range mapper 自动选择最大合法叶，静态中间表预算不从物理供给借用。动态 reserved-memory 与 `reusable` 在独立生命周期机制落地前由平台 admission 明确拒绝。
 
-在任何 root pool 铸造前，从可用物理范围划出固定系统储备。内核 heap 扩展改为消费预留 system tickets 或独立 system allocator，不再在 heap allocator 锁路径中调用普通 FramePool；完成/恢复路径所需 slot 同样来自该储备。FramePool 自身的 arena 元数据不能由其管理的 user-free 页供血。
+平台供给账本批次已由提交 `198e665` 收口，未来复审对象固定在 [`todo-2026-09-platform-memory-ledger-review.md`](todo-2026-09-platform-memory-ledger-review.md)。
 
-验证：区间纯逻辑 host debug/release 覆盖多 memory nodes、多 tuple、空洞、相邻/重叠 reservation、溢出、页边界、DTB 自保护、BootPackage 实际范围、reserved-memory static/dynamic/no-map/reusable；页表 host 测试覆盖 1GiB/2MiB/4KiB 最大叶选择、洞、冲突预检与静态预算耗尽；平台启动日志给出 admitted range/静态表数量和各物理分类总量且总和闭合。
+系统储备采用已确认的“用户 FramePool + typed system tickets”，不建立双 FramePool，也不在共享池上增加可误传的 class 参数。启动 planner 在发布 user-free 前把 FramePool metadata、预清零 heap chunks 与 recovery tickets 交给 `SystemSupply`；这些用途不可互换，均不进入未来 root pool。metadata 依实际 RAM 几何精确计算；heap chunk 数是独立的编译期物理容量政策，规定内核 heap 最多可占多少系统页，不根据尚无全局存量上限的对象数伪造“永不耗尽”证明。普通 metadata 分配必须可失败，后续 sponsor/global slots 决定对象级 admission；平台无法完整提供配置容量时 fail closed。现有 Commit 后完成、rollback、drain 和 remote-call 路径不分配物理页，因此本批 recovery ticket 数为零；未来路径若需要 recovery 页，必须先给出并发上界、提高独立子预算并通过 exhaustion 测试，才能进入 Commit。
+
+Talc 5.0.4 的 `Source::acquire` 在 allocator 正忙时执行；内核 heap source 因而只能 O(1) 消费启动期预留且已清零的连续 chunk，不在 heap 锁内进入用户 FramePool、做区间查找或清零 1MiB。用户 FramePool 继续服务页表、匿名 backing 与 Tunnel 的 transitional raw 路径，但 API 显式标成 user inventory；它们在 funded broker 与所属后续切片落地时逐一取得 charge。进程自己的 malloc allocator 位于用户态 funded mapping 之上，与内核 heap 和物理库存分别优化。
+
+### 批次 1B：系统储备物理隔离
+
+1. 审计现有内核 heap 分配面和 Commit 后完成/恢复路径。区分物理 heap 容量与对象 metadata admission：前者由编译期 chunk limit 封顶并在耗尽时明确 OOM，后者按“过渡期 metadata admission 门”在每个后续切片新增可放大对象前完成；现有零分配完成路径导出 recovery ticket 数为零。
+2. 把 `frame.rs` 的区间分类/放置抽成 host 可测的纯逻辑 `memory_supply` planner：固定容量输入输出、确定性放置、整体失败原子，输出 permanent、boot-held、system 子账户与 user-free 的互斥区间。metadata 只要求自身连续；heap chunk 逐块满足 1MiB 连续与对齐，不强迫全部 system reserve 物理连续。
+3. 让单一 FramePool 只发布 user-free 与后续 user boot-held 回投；其 metadata 物理页由 `SystemSupply` 中的 `FramePoolMetadata` owner 持有，库存只能把这些地址看作永久 unavailable。启动日志同时证明 `managed = permanent + boot-held + system + user-free` 与 system 子账户求和。
+4. 建立不可复制的 `HeapChunkTicket`/`RecoveryTicket`，启动期锁外清零 heap chunks；Talc `SystemSource` 改为单向 O(1) ticket pop。普通 heap 耗尽不得解锁 recovery，失败保持明确。
+5. 把现有 raw API 收窄为 transitional `alloc_user_order`/`alloc_user_largest`，登记唯一调用点：进程页表、匿名 backing、Tunnel backing 和 user-inventory selftest；heap 不再出现在该表。
+6. host debug/release 覆盖碎片布局、对齐、子预算不足、容量耗尽、用途不可互换、planner 失败零发布和 heap ticket 单调消费；`just check`、virt debug/release 与 sifive_u 复核分类闭包、heap 扩展及完整 acceptance。
+
+批次 1B 已完成：planner workspace 的 1169 段容量由 16 memory、34 permanent、3 boot-held 与 16 heap chunks 的最坏切割推导；FramePool 的 2048 arenas 由 16 memory × 2 × `usize::BITS` 推导。planner/ticket 与 FramePool host debug/release、`just check`、virt debug/release、`sifive_u` 均通过；三条平台线都完成 16/16 acceptance，且启动日志证明全局分类与 system 子账户分别闭合。下一自然序进入切片 2。
+
+批次 1A 验证基线：区间纯逻辑 host debug/release 覆盖多 memory nodes、多 tuple、空洞、相邻/重叠 reservation、溢出、页边界、DTB 自保护、BootPackage 实际范围、reserved-memory static/dynamic/no-map/reusable；页表 host 测试覆盖 1GiB/2MiB/4KiB 最大叶选择、洞、冲突预检与静态预算耗尽；平台启动日志给出 admitted range/静态表数量和各物理分类总量且总和闭合。
 
 ## 切片 2：MemoryPool 状态机与 capability 对象
 

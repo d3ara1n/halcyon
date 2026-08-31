@@ -69,6 +69,8 @@ pub mod ranks {
     /// talc 堆锁（RankedRawSpinlock 类型级注入；几乎被全部容器锁内
     /// 获取，故置顶）。
     pub const HEAP: Rank = Rank(900);
+    /// 物理隔离的系统票据；talc Source 在 HEAP 锁内只做 O(1) 消费。
+    pub const SYSTEM_SUPPLY: Rank = Rank(925);
     /// 物理帧池（HEAP 与空间锁的内层）。
     pub const POOL: Rank = Rank(950);
 }

@@ -13,5 +13,6 @@ members = [
     "sched_domain",
     "memory_space",
     "remote_call",
+    "memory_supply",
 ]
 resolver = "2"

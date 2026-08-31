@@ -6,6 +6,10 @@
 
 物理帧是库存资源，以 affine extent 所有权表达。平台交付的内存范围不是天然可用集合：固件与设备保留区、内核永久占用和仍被启动环境使用的区间必须先统一规范化并扣除，重叠、越界或来源矛盾应使启动失败。其余供给在任何普通分配发生前划为互不借用的系统储备与用户供给；系统储备用于内核堆、完成路径和恢复所需的固定资源，不能在压力下退化为用户池的隐式透支。
 
+系统储备不是与用户库存共享同一分配器后附加的额度标签。用户 FramePool 只发布 user supply；系统页在发布前由 `SystemSupply` 以用途类型接管，FramePool metadata、内核 heap chunk 与 recovery ticket 不能互相伪造或转成用户 extent。库存 metadata 按实际 RAM 几何精确计算；heap ticket 数是编译期物理容量政策，耗尽时普通 metadata admission 失败，不能借 user supply，也不冒充按对象精确计费。recovery ticket 数必须由 Commit 后路径的静态并发上界导出；没有这类消费者时可以为零，新增消费者必须先扩充预算。平台供给无法满足完整子预算时 fail closed，不按内存比例缩减正确性承诺。
+
+内核堆、用户物理库存和进程用户堆是三个独立层次。内核堆只承载 metadata 与对象壳，由预清零的固定连续 heap tickets 单向扩展，可以针对小对象、固定物理容量与失败可预测性优化；对象级存量与多租户隔离由正交的 metadata admission 负责，不能从 heap 容量反推。用户 FramePool 只做 MemoryPool-backed extent 的物理取得，可以针对 order、碎片、锁外清零与 funding 事务优化；进程在取得 funded anonymous mapping 后由用户态 allocator 自行细分虚拟区间，可以按服务 workload 选择 arena、slab 或其它策略。三者不共享配额、回退路径或 allocator 政策，只在物理页唯一所有权上闭合。
+
 平台保留内存不是同一种生命周期的区间集合。静态专用区永久排除普通供给；`no-map` 同时从内核标准直映射的 admitted ranges 中扣除，禁止无 owner 控制的虚拟映射与推测访问；动态保留请求必须在普通供给发布前按大小、对齐和允许范围整体放置；`reusable` 区始终属于平台 region owner，只能以可撤回 loan 暂借给可丢弃、可重建或可迁移的 backing。不能闭合动态放置或 reclaim 协议的平台描述必须明确拒绝，不能把未知语义降级为普通永久 reservation。
 
 内核直映射由规范化 admitted ranges 定义，不由固定大页清单定义。页表构造器对每段连续范围 eager 建表并自动选择硬件允许的最大叶，洞与边界才下沉到更小粒度；启动所需中间表来自与用户供给隔离的固定系统预算，预算不足是平台 admission 失败。平台名称、模拟器行为或自备 DTS 只提供输入事实，不改变该契约。
@@ -19,6 +23,8 @@ user_supply = free_inventory + boot_held + funded_extents
 事务窗口可以暂时出现 claimed-but-unfunded 与 returning 状态，但二者必须由同一 funding 事务拥有，不能同时出现在其它桶中；只有冻结新事务并排空已提交 retire 后才能作全局供给断言。root MemoryPool 的固定总额度恰等于 user supply，因而页数上不超配；系统储备、永久页和设备专用内存均不进入该额度。
 
 库存只决定哪些帧已经从空闲集合原子取走，不在库存锁内完成与页数线性的内容初始化。claim 成功后，调用者独占 extent，先在库存锁外清零，再把“已初始化 backing”发布给页表或对象；初始化失败或事务放弃仍由 affine funding 自动归还。单次可清零页数、extent 数、PTE 步数和其它不可中断工作各有独立硬上限，平台测量只用于选择常量，不替代静态工作边界。
+
+内核 heap source 不在 allocator 忙碌期间进入用户 FramePool 或执行大块清零。启动期 planner 预留并清零固定粒度 heap chunks；运行期扩堆只从专用 ticket 序列做 O(1) 单向消费。recovery tickets 独立保留，不能因普通 heap 压力自动解锁；具体完成路径只有在取得对应 typed permit 后才能消费。
 
 精确长度不要求物理连续。普通用户 backing 由若干 extent 组成；需要连续物理区间的页表、DMA 或其他消费者必须显式请求受 order 上限约束的连续块。extent token 不允许复制或任意构造；切割消费原 token 并返回互不重叠的剩余 token，合并只接受物理相邻且所有权语义相同的 token。失败回滚、延迟 retire 与正常归还遵守同一数量守恒。
 
