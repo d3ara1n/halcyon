@@ -8,7 +8,10 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, supervise_services};
+use crate::{
+    JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
+    supervise_services,
+};
 use libprocess::{
     DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned, job_kill,
     race::{self, Cmd, Report},
@@ -25,8 +28,7 @@ use rinlib::shared::call::SystemCallError;
 use rinlib::shared::message::HandleMove;
 use rinlib::shared::object::{Handle, ObjectSignals, Rights};
 use rinlib::shared::proc::{
-    HandleGrant, JobMemberKind, JobState, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult,
-    ProcessExitReason, ProcessFaultCode, ProcessMapFlags, ProcessState, ThreadStartContext,
+    HandleGrant, JobMemberKind, JobState, ProcessExitReason, ProcessFaultCode, ProcessState,
 };
 use rinlib::shared::wait::{WAIT_TIMEOUT_INFINITE, WaitItem};
 use rinlib::sys_sleep;
@@ -232,53 +234,6 @@ fn spawn_tunnel_exit_target(
             let _ = close(gun_pair.peer);
             let _ = close(invitation);
             Err(SystemCallError::Unknown)
-        }
-    }
-}
-
-/// 入口页指令：`j .`（`0x0000006f`，JAL x0,0 自我跳转）。不用 wfi——
-/// wfi 是特权指令，U-mode 执行触发 illegal instruction 异常
-/// （riscv-isa machine.adoc：executing WFI in U-mode causes an
-/// illegal-instruction exception），靶一旦上核首条指令即 Fault，会与
-/// kill 争抢终因冻结，污染「Running 后被 kill 收束」的场景语义。
-pub(crate) const SPIN_FOREVER: [u8; 4] = [0x6f, 0x00, 0x00, 0x00];
-
-/// 手工 Building：入口页（自旋）+ 栈顶页 + 附入首线程，供
-/// kill-vs-Start/abandonment 的提交前窗口竞速与 seal gate 验证。
-/// attach 由组装者完成（线程是组装资源）；锤只持 builder 在竞速时刻
-/// 拉 Start——Building→Running 线性化仍是唯一竞速点。失败路径自清理
-/// 两个句柄，调用者只需处理自己持有的资源。
-pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, SystemCallError> {
-    let created = process::create(job, SUPERVISOR_RIGHTS)?;
-    let built = (|| {
-        process::map(
-            created.builder,
-            0x1000,
-            PROCESS_PAGE_SIZE,
-            ProcessMapFlags::READ | ProcessMapFlags::EXECUTE,
-        )?;
-        process::write(created.builder, 0x1000, &SPIN_FOREVER)?;
-        process::map(
-            created.builder,
-            PROCESS_USER_TOP - PROCESS_PAGE_SIZE,
-            PROCESS_PAGE_SIZE,
-            ProcessMapFlags::READ | ProcessMapFlags::WRITE,
-        )?;
-        process::attach(
-            created.builder,
-            &ThreadStartContext {
-                entry: 0x1000,
-                stack_pointer: PROCESS_USER_TOP as u64,
-                arg1: 0,
-                arg2: 0,
-            },
-        )
-    })();
-    match built {
-        Ok(_) => Ok(created),
-        Err(error) => {
-            process::abandon_to_completion(created)?;
-            Err(error)
         }
     }
 }

@@ -14,6 +14,9 @@ MEMORY_SCRIPT := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"memory.x"
 # compile
 RUSTFLAGS_OS := "-Clinker=riscv64-elf-ld"
 RUSTFLAGS_USER := ""
+# 用户态验收负载只允许 core/stress；profile 选择停留在 srv_init，不进入内核 ABI。
+ACCEPTANCE_WORKLOAD := env_var_or_default("ERHINO_ACCEPTANCE_WORKLOAD", "core")
+INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else { "" }
 
 TARGET_DIR := invocation_directory()/"artifacts"
 KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
@@ -44,11 +47,13 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 # `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与
 # --set 均不穿透嵌套子进程，故不用它们传油门）。
 THROTTLE := env_var_or_default("THROTTLE", "50")
-# 无 shutdown 设备平台（sifive_u）的运行阶段硬上限。它只是挂死兜底，
-# 不是期望耗时：完整验收实测约 15s（全速）/ 21s（节流 50%；矩阵多为
-# timer 驱动，节流不线性放大），随后显式 reset 返回失败并由 wrapper 收割。
-# 60s 约 3x 余量——不得调小到完整验收面以内。
-ACCEPTANCE_TIMEOUT := env_var_or_default("ACCEPTANCE_TIMEOUT", "60")
+# 各路线按自身工作量设置 QEMU 硬上限；均可用同名环境变量单独覆盖。
+VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "30")
+VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
+VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "60")
+VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
+VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "30")
+SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "45")
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -88,10 +93,20 @@ make_dtb: artifact_dir
     @dtc -O dtb -o "{{DTB_DEFAULT}}" "{{DTS}}"
 
 build_user: artifact_dir
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    @cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    @python3 tools/audit-user-elf.py {{TARGET_DIR}}/build/srv_* {{TARGET_DIR}}/build/drv_* {{TARGET_DIR}}/build/test_*
-    @echo -e "\033[0;32mUser space programs build successfully!\033[0m"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ACCEPTANCE_WORKLOAD}}" in
+        core|stress) ;;
+        *) echo "Unknown acceptance workload: {{ACCEPTANCE_WORKLOAD}}" >&2; exit 2 ;;
+    esac
+    cd user
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --exclude test_hammer --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    if [ "{{ACCEPTANCE_WORKLOAD}}" = stress ]; then
+        RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    fi
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
+    echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
 make_initfs: build_user
     @rm -rf "{{TARGET_DIR}}/initfs"
@@ -100,7 +115,7 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"
     @ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"
-    @ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" = stress ]; then ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"; fi
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 
@@ -122,8 +137,13 @@ run_qemu_dump_dtb:
     @{{QEMU_LAUNCH}} -machine dumpdtb="{{TARGET_DIR}}/dump.dtb"
     @dtc -O dts -o "{{TARGET_DIR}}/dump.dts" -I dtb "{{TARGET_DIR}}/dump.dtb"
 
+# 快速开发线：确定性 core workload。
 virt:
-    @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
+    @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_TIMEOUT}} -smp cores=4
+
+# 完整 debug 压力线：core 的全部语义再加重复压力、最小预算 Drain 与 16/16 竞态矩阵。
+virt-stress:
+    @ERHINO_ACCEPTANCE_WORKLOAD=stress QEMU_ACCEPTANCE_PROFILE=stress just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_STRESS_TIMEOUT}} -smp cores=4
 
 # 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
 # Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 验收
@@ -131,27 +151,31 @@ virt:
 virt-hetero:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
     @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
-    @ERHINO_DTB=artifacts/virt-hetero.dtb QEMU_ACCEPTANCE_PROFILE=hetero just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
+    @ERHINO_ACCEPTANCE_WORKLOAD=core ERHINO_DTB=artifacts/virt-hetero.dtb QEMU_ACCEPTANCE_PROFILE=hetero just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_HETERO_TIMEOUT}} -smp cores=4
 
 # 无兼容域验证：全部 cpu 去掉 F/D，D64 profile 的 test_fp 启动即拒绝
 # （NotSupported → init spawn 失败路径），Base64 负载照常收束。
 virt-nofd:
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-nofd.dts all
     @dtc -O dtb -o artifacts/virt-nofd.dtb artifacts/virt-nofd.dts
-    @ERHINO_DTB=artifacts/virt-nofd.dtb QEMU_ACCEPTANCE_PROFILE=nofd just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance -smp cores=4
+    @ERHINO_ACCEPTANCE_WORKLOAD=core ERHINO_DTB=artifacts/virt-nofd.dtb QEMU_ACCEPTANCE_PROFILE=nofd just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_NOFD_TIMEOUT}} -smp cores=4
 
-# release 验证线（阶段收尾必跑）：debug 代码生成不在 ecall 周边把活值留在
-# t 系寄存器，用户侧寄存器保持语义只有 release 能测出（2026-08-28 trap
-# 入口 x5 破坏事故，调查档案见 plans/archived/）。通过标准与 virt 同：
-# 全负载验收线 + 显式 reset 后 QEMU 退出。
+# release 快速线：覆盖优化代码生成、trap 寄存器保持与完整 core syscall 往返；
+# 重复压力由 virt-stress 承担，阶段收尾统一走 acceptance 聚合。
 virt-release:
-    @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance -smp cores=4
+    @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance_bounded {{VIRT_RELEASE_TIMEOUT}} -smp cores=4
 
-# sifive_u 无 shutdown 设备：显式 reset 返回失败后 QEMU 不自退出，wrapper
-# 在失败终态锚点出现时主动收割；ACCEPTANCE_TIMEOUT 只兜底真挂死。只有
-# 全部验收锚点齐全且无其他失败锚点时，该平台结果才转换为成功。
+# sifive_u 只覆盖板级差异并运行 core workload；无 shutdown 设备，明确 reset
+# 失败后由 allow-timeout wrapper 收割，45s 只兜底真挂死。
 sifive_u:
-    @QEMU_ACCEPTANCE_PROFILE=common just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_timed -smp cores=5
+    @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
+
+# 阶段收尾：完整 debug 压力 + release core + sifive_u 平台差异。每条 QEMU
+# 各自受独立硬上限保护，聚合命令本身不另设跨路线总时限。
+acceptance:
+    @just virt-stress
+    @just virt-release
+    @just sifive_u
 
 # 清理泄漏的孤儿 qemu（PPID=1 残留；agent 裸跑 run_qemu 后易遗漏）。
 # 默认一键清理孤儿；传参透传脚本：-l 仅列出，-y 跳过确认，-f 连有父进程的一并杀。
@@ -159,12 +183,12 @@ clean-qemu *args:
     @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
 
 [private]
-run_qemu_acceptance_timed +OPTIONS: make_dtb make_boot_package build_kernel
-    @echo -e "\033[0;36mQEMU: Simulating acceptance (CPU throttled to {{THROTTLE}}%, hard timeout {{ACCEPTANCE_TIMEOUT}}s)\033[0m"
-    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{ACCEPTANCE_TIMEOUT}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+run_qemu_acceptance_platform timeout +OPTIONS: make_dtb make_boot_package build_kernel
+    @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
+    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
 
 [private]
-run_qemu_acceptance +OPTIONS: make_dtb make_boot_package build_kernel
-    @echo -e "\033[0;36mQEMU: Simulating acceptance (CPU throttled to {{THROTTLE}}%)\033[0m"
-    @tools/qemu-acceptance.sh -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+run_qemu_acceptance_bounded timeout +OPTIONS: make_dtb make_boot_package build_kernel
+    @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
+    @tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
 

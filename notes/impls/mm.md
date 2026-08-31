@@ -59,7 +59,7 @@ pub struct FrameTracker {
 
 ## 物理供给验证
 
-16 项 FramePool host 用例覆盖库存结构、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero 和 system heap ticket 首次消费。virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；最终实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。
+16 项 FramePool host 用例覆盖库存结构、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero 和 system heap ticket 首次消费。系统储备批次收口时（验收拆档前的 full workload）virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前阶段收尾由 `just acceptance` 分别执行 debug stress、release core 与 sifive_u core。
 
 ## 页表模式选择
 

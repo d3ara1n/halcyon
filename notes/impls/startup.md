@@ -78,11 +78,11 @@ root
 
 所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，按 REAPABLE|CLOSED → ProcessDrain → Query 收束。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留 pm_domain control 作为兜底。pm 对委托域执行枚举→派生→kill→drain→seal。
 
-acceptance 收容一次性 IPC、FAL、Job 与竞态验证负载，结束后整域 job_kill。init 在全部服务监督与资源收束锚点成立后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并常驻管理端点，保持 root supervisor 存活；当前不经独立电源服务转发。
+acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域 job_kill。`srv_init` 默认编译为 core workload，只运行确定性内存、IPC、Tunnel、Job 与监督契约；`acceptance-stress` feature 在同一用户态编排器中追加 control/Tunnel 重复压力、`max_work=1` Drain 和完整 16/16 竞态矩阵。profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。init 在全部服务监督与资源收束锚点成立后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并常驻管理端点，保持 root supervisor 存活；当前不经独立电源服务转发。
 
 ## 验证
 
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
 - handle_table host：consume/transfer 两类 pin、builder 保护、自授予/重复拒绝、rights 回滚、reservation 与 TRANSIT/GRANT；
 - libprocess host：entry、segment overlap 与页级 W^X；
-- QEMU acceptance：`virt`、`virt-release`、hetero、nofd、`sifive_u` 均要求最小预算 Drain、竞态矩阵 12/12、分阶段服务监督、委托域终态、reset authority 负路径与内核接受 reset 锚点。virt 必须再由 QEMU 正常退出证明后端成功；`sifive_u` 无 shutdown 设备，内核返回失败后由验收脚本按明确终态锚点主动收割（`ACCEPTANCE_TIMEOUT` 仅作挂死兜底）。
+- QEMU acceptance：`virt` 是 debug core 快线，`virt-stress` 承担最小预算 Drain、重复压力与 16/16 竞态矩阵，`virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持，hetero/nofd 与 `sifive_u` 只叠加各自平台/调度域差异；`acceptance` 聚合阶段收尾所需的 stress、release 与 sifive_u。每种 wrapper 都校验 `acceptance workload: core|stress`，避免构建 feature 与所需锚点错配。virt 必须由 QEMU 正常退出证明 shutdown 后端成功；`sifive_u` 在内核明确返回 reset 失败后主动收割。

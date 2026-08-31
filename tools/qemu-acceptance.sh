@@ -28,8 +28,6 @@ mkdir -p artifacts
 log="artifacts/.qemu-acceptance-$$.log"
 
 required=(
-    "drain minimum-budget acceptance passed"
-    "race matrix acceptance passed: 16/16 scenarios passed"
     "acceptance domain collected"
     "all services supervised to completion"
     "peer closed observed"
@@ -38,9 +36,19 @@ required=(
     "system reset accepted: action Shutdown, reason Requested"
 )
 case "$profile" in
-    common) ;;
+    core)
+        required+=("acceptance workload: core")
+        ;;
+    stress)
+        required+=(
+            "acceptance workload: stress"
+            "drain minimum-budget acceptance passed"
+            "race matrix acceptance passed: 16/16 scenarios passed"
+        )
+        ;;
     hetero)
         required+=(
+            "acceptance workload: core"
             "domain 0 [Base64] -> harts [0]"
             "domain 1 [Base64+D64] -> harts [1, 2, 3]"
             "fp verification passed"
@@ -48,6 +56,7 @@ case "$profile" in
         ;;
     nofd)
         required+=(
+            "acceptance workload: core"
             "domain 0 [Base64] -> harts [0, 1, 2, 3]"
             "failed to start bin/test_fp: SpawnFailure { error: System(NotSupported), grants: Retained, cleanup_error: None }"
         )

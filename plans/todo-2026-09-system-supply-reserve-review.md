@@ -22,11 +22,9 @@
 - `cd os && cargo test -p memory_supply -p frame_pool --target aarch64-apple-darwin`
 - `cd os && cargo test -p memory_supply -p frame_pool --release --target aarch64-apple-darwin`
 - `just check`
-- `THROTTLE=100 just virt`
-- `THROTTLE=100 just virt-release`
-- `THROTTLE=100 just sifive_u`
+- `THROTTLE=100 just acceptance`
 
-该提交内容在上述验证中均通过：memory_supply 7 项与 FramePool 16 项 host 测试的 debug/release 全绿；三条平台线均到 `race matrix acceptance passed: 16/16`。最终闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`；system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。virt 正常 shutdown，sifive_u 按明确 `NotSupported` reset 后端结果收割。
+该提交收口时（验收拆档前的 full workload）上述内容均通过：memory_supply 7 项与 FramePool 16 项 host 测试的 debug/release 全绿；virt debug/release 与 sifive_u 均到 `race matrix acceptance passed: 16/16`。最终闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`；system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前复审基线由 `acceptance` 以 debug stress、release core 与 sifive_u core 分档重放；virt 正常 shutdown，sifive_u 按明确 `NotSupported` reset 后端结果收割。
 
 ## 完成标准
 

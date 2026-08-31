@@ -14,18 +14,24 @@
 //! 6. 等 pm 退出后的 PEER_CLOSED 终态位，关闭本端（帧归还）；
 //! 7. 验证系统复位 capability 的负路径，由 init 显式提交 Shutdown；平台拒绝时
 //!    保持 root supervisor 稳态等待。
+//!
+//! 默认构建运行确定性的 core 验收；`acceptance-stress` feature 在同一用户态
+//! 编排器中追加重复压力、最小预算 Drain 与完整竞态矩阵。内核不感知该档位。
 
 #![no_std]
 
 use libprocess::{DERIVED_CONTROL_RIGHTS, SpawnRequest, enumerate_members, job_kill, spawn};
 use librunnel::blocking;
+#[cfg(feature = "acceptance-stress")]
+use rinlib::ipc::tunnel as tunnel_sys;
+#[cfg(feature = "acceptance-stress")]
+use rinlib::shared::proc::ProcessDrainStatus;
 use rinlib::{
     env,
     ipc::{
         message::{create, discard, make_send_once, mint_sender, receive, send, wait_message},
         notification,
         object::{close, duplicate},
-        tunnel as tunnel_sys,
         wait::wait_many,
     },
     mm::{MappedRegion, Placement},
@@ -37,8 +43,7 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
-            ExecutionProfile, HandleGrant, JobMemberKind, JobState, ProcessDrainStatus,
-            ProcessExitReason, ProcessState,
+            ExecutionProfile, HandleGrant, JobMemberKind, JobState, ProcessExitReason, ProcessState,
         },
         reset::{ResetAction, ResetReason},
         startup::initial,
@@ -47,8 +52,12 @@ use rinlib::{
     system,
 };
 
+mod building;
+#[cfg(feature = "acceptance-stress")]
 mod race;
-use race::{build_spin_building, race_matrix};
+use building::build_spin_building;
+#[cfg(feature = "acceptance-stress")]
+use race::race_matrix;
 
 /// 受监督服务：init 保留的 control 与 pid。
 struct Supervised {
@@ -160,12 +169,20 @@ const DELEGATED_DOMAIN_RIGHTS: Rights =
 
 /// 隧道页在本进程的映射地址（VA 分配器落地前由调用方自报）。
 const TUNNEL_VA: usize = 0x4000_0000;
+#[cfg(feature = "acceptance-stress")]
 const LIFECYCLE_VA: usize = TUNNEL_VA + 0x1000;
+#[cfg(feature = "acceptance-stress")]
 const FAILED_ATTACH_VA: usize = TUNNEL_VA + 0x2000;
 /// 验证数据量：超过环形容量（3968），强制写端分批与回绕。
 const STREAM_LEN: usize = 8192;
+#[cfg(feature = "acceptance-stress")]
 const CONTROL_STRESS: usize = 128;
+#[cfg(feature = "acceptance-stress")]
 const TUNNEL_STRESS: usize = 64;
+#[cfg(feature = "acceptance-stress")]
+const ACCEPTANCE_WORKLOAD: &str = "stress";
+#[cfg(not(feature = "acceptance-stress"))]
+const ACCEPTANCE_WORKLOAD: &str = "core";
 
 /// 从 initfs 私有政策（ustar 字母序）启动服务拓扑：普通服务入 services
 /// Job；srv_pm 额外经 StartupBlock grants 取得 pm_domain 委托域的
@@ -448,6 +465,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
 
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
 fn run(services: Handle) -> Result<(), &'static str> {
+    debug!("acceptance workload: {}", ACCEPTANCE_WORKLOAD);
     let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
     test_memory_mapping()?;
     let pm_domain = process::create_job(services, JOB_FULL_RIGHTS)
@@ -512,7 +530,9 @@ fn run(services: Handle) -> Result<(), &'static str> {
     let _ = close(pair.owner);
 
     test_capability_badges_and_affine_owners();
+    #[cfg(feature = "acceptance-stress")]
     stress_control_plane();
+    #[cfg(feature = "acceptance-stress")]
     test_tunnel_lifecycle();
     test_send_once();
     test_writable_level();
@@ -575,12 +595,15 @@ fn run(services: Handle) -> Result<(), &'static str> {
         reclaimed
     );
 
-    // —— 生命周期多核竞态矩阵（step 9）：双锤同刻起跑打真跨核竞态，
-    // 断言各场景终态合法、无泄漏、枚举收敛 ——
+    // 完整生命周期多核竞态矩阵属于 stress workload；core 仍覆盖确定性的
+    // Building kill、Job 管理与服务监督收束。
+    #[cfg(feature = "acceptance-stress")]
     match (target_image.as_deref(), hammer_image.as_deref()) {
         (Some(target), Some(hammer)) => race_matrix(acceptance, target, hammer)?,
         _ => return Err("race matrix acceptance images unavailable"),
     }
+    #[cfg(not(feature = "acceptance-stress"))]
+    let _ = hammer_image;
 
     // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
     // 稳态拓扑。
@@ -874,12 +897,20 @@ fn test_job_management(job: Handle, image: &[u8]) -> Result<(), &'static str> {
     seal_before_start(job);
     seal_before_create(job);
     enumerate_convergence(job);
-    test_drain_minimum_budget(job, image)
+    #[cfg(feature = "acceptance-stress")]
+    {
+        test_drain_minimum_budget(job, image)
+    }
+    #[cfg(not(feature = "acceptance-stress"))]
+    {
+        Ok(())
+    }
 }
 
 /// 含 child Handle 的 REAPABLE 进程以 `max_work=1` 收束。More 必须由
 /// rinlib 拒绝零进展；这里逐批推进至 Complete，覆盖 pending close 的
 /// 扫描/关闭分离边界。
+#[cfg(feature = "acceptance-stress")]
 fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static str> {
     let marker = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
@@ -1548,6 +1579,7 @@ fn test_writable_wake(pm_mailbox: Handle) {
     debug!("writable wake passed");
 }
 
+#[cfg(feature = "acceptance-stress")]
 fn stress_control_plane() {
     for index in 0..CONTROL_STRESS {
         let mailbox = create(
@@ -1618,6 +1650,7 @@ fn stress_control_plane() {
     );
 }
 
+#[cfg(feature = "acceptance-stress")]
 fn test_tunnel_lifecycle() {
     for _ in 0..TUNNEL_STRESS {
         let abandoned = tunnel_sys::create(LIFECYCLE_VA).expect("lifecycle tunnel create failed");

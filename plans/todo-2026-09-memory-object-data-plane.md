@@ -160,7 +160,7 @@ FAL acceptance 至少用一条大于单页的数据流验证跨进程 Open 基�
 
 同步 `notes/impls/{mm,ipc,call,startup,task}.md` 与 FAL 实现现状；任何未落地的 KernelMemoryBudget、BufferQueue、pager、文件缓存、MemoryLease 和设备能力只留在 ideas/后续计划，不写成 impl 事实。审核代码中所有 frame 取得、Pool charge、ObjectView、metadata permit 与 Building operation 入口，删除 transitional raw runtime frame API，确保没有旁路。
 
-每片先跑对应 host debug/release 与 `just check`。涉及启动后跑 `just virt`，涉及寄存器/调用边界后跑 `just virt-release`；阶段收尾跑 `just virt`、`just virt-release`、`just virt-hetero`、`just virt-nofd`、`just sifive_u`，均按项目规定的编译/运行分离超时与日志锚点判断。最后更新 COMPASS 并在提交完成后生成带实际提交哈希的未来 review 计划。
+每片先跑对应 host debug/release 与 `just check`；涉及启动后跑 `just virt` core 快线，涉及寄存器/调用边界后补 `just virt-release`。阶段收尾统一跑 `just acceptance`（debug stress + release core + sifive_u core）；涉及调度域契约再补 `just virt-hetero`/`just virt-nofd`。每条 QEMU 由路线独立硬上限和 workload/业务/reset 锚点判断。最后更新 COMPASS，并在提交完成后生成带实际提交哈希的未来 review 计划。
 
 ## 完成标准
 

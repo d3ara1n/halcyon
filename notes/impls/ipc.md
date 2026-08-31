@@ -68,5 +68,5 @@ Create/Attach 在 `HandleTable → Connection → AddressSpace → Lifecycle →
 
 - handle_table host：generation、reservation、badge、运输、consume/transfer pin 与 rights 回滚；
 - wait_context/timer_queue host：安装窗口、唯一赢家、token generation/owner、堆删除与 cancel/expiry 竞争；
-- init acceptance：badge、send-once、满箱/WRITABLE、Notification、Invitation 非等待拒绝、Tunnel/Runnel、ProcessDrain `max_work=1`；
-- QEMU：debug/release、hetero/nofd、sifive_u 的竞态矩阵 12/12、服务分阶段监督、资源回收与显式 reset 终态均由 fail-closed 锚点脚本验证；新增场景覆盖公开 MemoryMap/Protect/Unmap 与异 hart kill，以及 guard fault 的进程局部收束。
+- init core acceptance：badge、send-once、满箱/WRITABLE、Notification、Invitation 非等待拒绝与 Tunnel/Runnel 确定性通路；stress workload 追加重复 control/Tunnel 生命周期、ProcessDrain `max_work=1` 和完整竞态矩阵；
+- QEMU：`virt`/release/hetero/nofd/sifive_u 分别验证 core 与平台差异，`virt-stress` 验证 16/16 竞态、公开 MemoryMap/Protect/Unmap、异 hart kill、guard fault 局部收束及压力回收；全部路线由 workload、服务监督、资源收束与 reset 终态的 fail-closed 锚点判定。

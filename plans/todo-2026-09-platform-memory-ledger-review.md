@@ -21,11 +21,9 @@
 - `cd os && cargo test -p dtb -p page_table --release --target aarch64-apple-darwin`
 - `cd shared && cargo test --target aarch64-apple-darwin`
 - `just check`
-- `THROTTLE=100 just virt`
-- `THROTTLE=100 just virt-release`
-- `THROTTLE=100 just sifive_u`
+- `THROTTLE=100 just acceptance`
 
-该提交内容在上述验证中均通过；virt debug/release 均到 `race matrix acceptance passed: 16/16` 与 SBI shutdown，sifive_u 到同一矩阵终态并按明确 `NotSupported` reset 后端结果收割。
+该提交收口时（验收拆档前的 full workload）virt debug/release 均到 `race matrix acceptance passed: 16/16` 与 SBI shutdown，sifive_u 到同一矩阵终态并按明确 `NotSupported` reset 后端结果收割。当前复审以 `acceptance` 分档重放 debug stress、release core 与 sifive_u core。
 
 ## 完成标准
 

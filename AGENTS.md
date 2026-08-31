@@ -49,10 +49,12 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
   cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain --target aarch64-apple-darwin
   cd shared && cargo test --target aarch64-apple-darwin   # shared 也需显式 host target
   ```
-- 集成验证：`just virt`（4 核）——对照负载与资源收束完成后，init 以 `SystemReset` capability 显式提交 shutdown；内核接受请求且 QEMU 退出才通过。agent 环境仍需带超时防挂起，判定看启动日志关键行。`just virt` 默认经 `tools/qemu-throttle.sh` 节流到 50% CPU（guest 跑飞/panic 时 QEMU 满核空转的兜底，见 Justfile `THROTTLE`），墙钟耗时约翻倍、验证语义不变，全速调试用 `THROTTLE=100 just virt`（油门经环境变量穿透嵌套 recipe，recipe 参数写法无效）；**阶段收尾前必跑 `just virt-release`**——debug 代码生成不在 ecall 周边把活值留在 t 系寄存器，用户侧寄存器保持语义只有 release 能测出（trap 入口 x5 破坏事故，见 plans/archived 调查档案）；`sifive_u` 是老的 HiFive Unleashed 硬件模型：hart 0 无 MMU、可运行 hart 为 1–4、DRAM 仅 128MiB、timebase 为 1MHz，boot hart 不固定。当前 QEMU 使用 OpenSBI 现代 SBI（以启动日志和 BASE 探测为准），不得因机器模型历史包袱使用 SBI v0.1 核心 ABI。该模型没有平台 shutdown device，SRST 扩展可能存在但 shutdown 不保证让 QEMU 退出；运行阶段统一走 **`just sifive_u`**：经 throttle 包装，`tools/qemu-acceptance.sh` 在日志出现明确 reset 后端失败或 panic 终态时主动收割，正常轮次实测约 20s；`ACCEPTANCE_TIMEOUT`（默认 60s）只是真挂死的兜底，不是期望耗时，不得为“看着快”把它调小到验收面完成时长以下——砍在矩阵中段的形态与真挂死无法区分。判定只看锚点与最后若干行输出，不得把冷编译耗时计作内核运行卡死。`sifive_u` 只覆盖上述板级差异，不为其引入专用内核机制；出现挂起先检查内核并发、IPI、timer、SMP 启动同步，再判断为平台限制。
+- 集成验证分档由用户态 `srv_init` 编译期 workload 控制，内核不感知测试政策：`just virt` 是日常 core 快线（确定性内存/IPC/Tunnel/Job/监督/reset）；`just virt-stress` 追加 control/Tunnel 重复压力、`max_work=1` Drain 与完整 16/16 竞态矩阵；`just virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持；`just acceptance` 是阶段收尾聚合，依次执行 debug stress、release core 与 `sifive_u` core。涉及调度域契约时另跑 `virt-hetero`/`virt-nofd`。
+- 所有 QEMU recipe 都经 `tools/qemu-throttle.sh`（默认 50% CPU）和 `tools/qemu-acceptance.sh`，并按路线使用独立硬上限：virt 30s、release 35s、stress 60s、hetero 40s、nofd 30s、sifive_u 45s；同名 `*_TIMEOUT` 环境变量可单独覆盖。超时从 QEMU 运行阶段计，不含冷编译。判定以 workload 身份、业务收束与 reset 锚点为准，不能把矩阵中途超时当成内核挂死。全速调试用 `THROTTLE=100`。
+- `sifive_u` 是老的 HiFive Unleashed 模型：hart 0 无 MMU、可运行 hart 为 1–4、DRAM 128MiB、timebase 1MHz、boot hart 不固定。内核仍使用运行时探测到的现代 SBI，不因平台历史包袱调用 v0.1 核心 ABI。该模型无可用 shutdown 后端；`just sifive_u` 在日志出现明确 reset 失败或 panic 终态时主动收割，仍检查完整 core 锚点。它只覆盖板级差异，不为平台引入专用内核机制。
 - 开发机是 macOS：`just dtc qemu riscv64-elf-binutils riscv64-elf-gdb` 来自 Homebrew。打 tar 包时注意 bsdtar 的 `._` AppleDouble 文件会污染 initfs（历史上因此 panic 过）。
 - Rust nightly（`rust-toolchain` 钉住），edition 2024。
-- QEMU 超时是防止 guest 跑飞和 CPU 长时间空转的保护，不要求紧贴正常路径的最短实测时间。冷编译与运行分开判断；完整 acceptance 应留足调度和宿主抖动余量，virt/virt-release 通常可给约 30 秒，`sifive_u` 可放宽到 60 秒。调查已定位的早期卡死时再按最后锚点收紧。agent 启动的单轮 QEMU 一般不超过 60 秒；确需更长先说明理由，并在任何退出或超时后确认无残留进程。
+- QEMU 超时用于防止 guest 跑飞和 CPU 长时间空转，不要求贴住正常路径的最短时间；默认值按各路线实测留余量，单轮上限保持在 60 秒内。调查已定位的早期卡死时可按最后锚点收紧；任何退出或超时后确认无残留进程。
 
 ## 约定
 

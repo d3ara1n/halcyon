@@ -64,8 +64,11 @@ Halcyon 是以 eRhino RV64 微内核为核心、包含用户态系统服务与�
 运行（自动编译内核与 initfs 并启动 QEMU）：
 
 ```sh
-just virt       # qemu virt: 4 核
-just sifive_u   # qemu sifive_u: 5 核（#0 禁用）
+just virt          # qemu virt：日常 core 快速验收
+just virt-stress   # qemu virt：完整压力与 16/16 竞态矩阵
+just virt-release  # release core 验收
+just sifive_u      # qemu sifive_u：板级 core 验收（hart 0 禁用）
+just acceptance    # 阶段收尾聚合：stress + release + sifive_u
 ```
 
 仅编译内核：
