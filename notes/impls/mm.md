@@ -55,7 +55,7 @@ pub struct FrameTracker {
 
 库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
 
-`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。页表帧通过 `into_table_frame`/`adopt_table_frame` 显式移交，BootPackage payload 通过独立 reservation adopt 收编。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：tracker 从拥有结构摘下与下一 work unit 的实际归还分开计费，手工摘除的表帧经 table adopt 进入同一路径。
+`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。过渡期用户页表以 `TableFrameToken::Owned(FrameTracker)` 直接保存 affine owner，不再把 tracker 拆成裸帧号后通过 unsafe 重建。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
 
 ## 物理供给验证
 
@@ -73,19 +73,20 @@ total = available + reserved + allocated + delegated
 
 charge 与 delegation 使用不同的线性 reservation/credit 类型，所有转换均作 checked arithmetic。每个状态实例另有 crate 内原子铸造、外部不可伪造的 `OwnerKey`；ABI Pool identity 只作稳定诊断身份，即使调用者重复提供相同 identity，token 也不能跨实例提交。child 在 Prepared 阶段消费唯一 delegation reservation；Commit 将 parent `reserved → delegated`，并把 delegated credit 内嵌进 child state。只有消费 fully-available child 才能取出 parent credit，因此不存在 child 仍可继续派生而额度已提前归父的安全 API。深度上限唯一来自 shared ABI 常量，当前为 32。
 
-`os/metadata_admission` 提供固定容量 `Counter/Permit/SponsoredPermit`。`task/resources.rs` 在 `ProcessResources` 中持不可转授的 `MetadataSponsor`，其全局 slot 同时是 Process core permit，随 core 真实析构退款；ProcessBuilder、ProcessControl、Pool core 与 Bound AddressSpace 各自持按真实对象寿命退款的 sponsor+global permit，终态 Control 壳或已转移 Pool core 不因 creator Dead 提前退款。root Pool core 使用只占全局 slot 的 primordial permit。当前全局 sponsor、Builder、Control、Pool core 与 Bound AddressSpace 上限均为 4096；每 sponsor 最多一个 Builder、一个 Control、1024 个 Pool core 与一个 Bound AddressSpace。ProcessResources 另以原子 reservation 串行化同一 shell 的竞争 Bind，不形成资源第二真值。
+`os/metadata_admission` 提供固定容量 `Counter/Permit/SponsoredPermit`，单个 permit 可以原子预付多个 slots，失败和析构精确退款。`task/resources.rs` 在 `ProcessResources` 中持不可转授的 `MetadataSponsor`，其全局 slot 同时是 Process core permit，随 core 真实析构退款；ProcessBuilder、ProcessControl、Pool core 与 Bound AddressSpace 各自持按真实对象寿命退款的 sponsor+global permit，终态 Control 壳或已转移 Pool core 不因 creator Dead 提前退款。root Pool core 使用只占全局 slot 的 primordial permit。当前全局 sponsor、Builder、Control、Pool core 与 AddressSpace 壳上限均为 4096；每 sponsor 最多一个 Builder、一个 Control、1024 个 Pool core 与一个 Bound AddressSpace。Bound AddressSpace 另以 `AddressSpacePermit` 一次预付 4096 个 Region slots 和 4 个 planner transaction slots；全局分别为 131072 与 128，故过渡政策最多同时接纳 32 个预留完整 planner 容量的 Bound AddressSpace。ProcessResources 另以原子 reservation 串行化同一 shell 的竞争 Bind，不形成资源第二真值。
+切片 6A 已建立后续资金化 mapping 的其余类型化准入：backing slice 为全局 32768 / 每 sponsor 4096，MemoryChange、内存 WaitContext 与 Remote completion 各为全局 128 / 每 sponsor 4。`MemoryOperationPermits` 在提交前按 change → wait → remote 顺序取得三类 owner，任一中途失败由 RAII 回滚；三者可拆回并随未来真实对象分别延寿。当前这些 backing/operation permit 只由启动自检穿过，正式 mapping owner 的接线分别属于切片 6C/6E，不能据此描述为已经覆盖现有公开 MemoryMap。
 
 内核 `MemoryPool` 对象以 `Prepared → Committing → Active` 表达 Handle 发布事务。Prepared owner 在任何发布前失败时析构并回滚 parent reservation；Commit 后 child state 内嵌 credit、同时强持 parent，最后一个 core 引用消散时消费 child state、逐把锁把额度归父。`MemoryPoolQuery` 要求 READ，`MemoryPoolDerive` 要求 CREATE；child rights 必须是来源 rights 与 Pool 最大 rights 的子集，GRANT 同时用于 ProcessBindMemory 的 consume-on-success authority。init 的出生块固定安装同一 root core 的完整管理 Handle；内部 PoolBinding 与用户 Handle 共享 core，不复制额度。rinlib `MemoryPool` 是带 Drop close 的 affine owner，显式 `into_handle` 才把 authority 移回通用传输面。
 
-14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；6 项 admission 用例覆盖全局/本地耗尽、部分失败退款和 sponsor 强保活。启动自检另穿过 ProcessBuilder/ProcessControl 本地额度耗尽与最后 owner 退款、Pool 的错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用与最后引用退款；debug stress、release core 与 sifive_u core 的完整 acceptance 均通过。
+14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；8 项 admission 用例覆盖单槽/批量全局与本地耗尽、部分失败退款、精确批量退款和 sponsor 强保活。启动自检另穿过 ProcessBuilder/ProcessControl、MemoryChange/Wait/Remote 组合准入与 backing slice 的本地耗尽或退款，以及 Pool 的错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用与最后引用退款；debug `virt` core 已通过，既有阶段基线的 stress/release/sifive_u 完整 acceptance 结论不因本批改写。
 
 ## 资金化帧取得 broker
 
-`os/funded_frame` 是 `no_std`、禁止 unsafe、零堆分配的事务编排 crate。它不认识 capability、锁或物理地址，只以 `QuotaSource/QuotaReservation` 与 `PhysicalSource/PhysicalClaim` 两组仿射端口执行同一条 `reserve quota → bounded claim → clear → commit` 路径。页数与 extent 数是调用方分别给出的工作边界；当前内核实例以栈上固定数组容纳最多 64 extents，其 debug 帧成本由栈 guard 与 ELF audit 共同约束。全部 extent 取得前不清零，因而库存中途失败、extent 超限或非法 claim 会先析构已取物理 owner，再析构 reservation 回滚额度；全部清零后 quota commit 由类型变为不可失败。
+`os/funded_frame` 是 `no_std`、禁止 unsafe、零堆分配的事务编排 crate。它不认识 capability、锁或物理地址，只以 `QuotaSource/QuotaReservation` 与 `PhysicalSource/PhysicalClaim` 两组仿射端口执行同一条 `reserve quota → bounded claim → clear → commit` 路径。页数与 extent 数是调用方分别给出的工作边界；当前内核实例以栈上固定数组容纳最多 64 extents，其 debug 帧成本由栈 guard 与 ELF audit 共同约束。全部 extent 取得前不清零，因而库存中途失败、extent 超限或非法 claim 会先析构已取物理 owner，再析构 reservation 回滚额度；全部清零后 quota commit 由类型变为不可失败。切片 6A 增加 `QuotaCredit` 与 `PhysicalClaim::split_at`：`Funded::split_off(&mut self, boundary)` 只在栈上建立后缀 storage，同步切出跨 extent 的物理 owner 与同源 credit，失败保持原 owner；`merge_from(&mut self, &mut donor)` 先验证固定 extent 容量，再合并 credit 并转移几何，成功后 donor 成为空 owner，wrong-owner 或容量失败保持双方不变。两种接口都避免按值回传原 owner，不公开两侧拆包，也不为错误恢复额外内联一份最大 extent 数组。
 
 内核 `task/memory_pool.rs` 的 `PreparedMemoryCharge` 与 `MemoryCharge` 把纯逻辑 `ChargeReservation/AllocatedCredit` 接回来源 Pool core：前者析构回滚 reserved，后者强持 Pool 并在最后析构时退 allocated。`frame.rs` 的 `ClaimedUserExtent` 只在 POOL 锁内摘取 geometry，锁外清零；通用 `FundedFrames` 内部不可见的 `funded_frame::Funded` 按 extents 在前、charge 在后的字段顺序析构，且不提供可提前拆散两侧 owner 的公共入口。AddressSpace root 使用单页/单 extent 的专用 `FundedRootFrame`，避免把 64-extents 通用存储内联进空壳与 Bind 调用栈。BootPackage 则由不可伪造的 `BootHeldExtent` 表达未入库存的启动 owner，payload 经 root charge 转成可同步 split 的 `BootFundedExtent`；普通 broker 仍无绕过清零的 generic adopt。system tickets 继续由 `SystemSupply` 的独立类型拥有。
 
-AddressSpace root 与 bootstrap payload 已接入 Pool charge；中间页表、普通 anonymous backing、Tunnel 与库存自检仍使用登记在 `frame.rs` 的 transitional raw adapter，分别在后续所属切片迁移。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 的全面资金化与同一锁外 retire seam 属切片 6，不向 generic broker 增加任意拆包。6 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、析构顺序与双方程恢复；内核启动自检验证真实锁与 RAII 接线。
+AddressSpace root 与 bootstrap payload 已接入 Pool charge；中间页表、普通 anonymous backing、Tunnel 与库存自检仍使用登记在 `frame.rs` 的 transitional raw adapter，分别在后续所属切片迁移。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 的全面资金化与同一锁外 retire seam 属切片 6，不向 generic broker 增加任意拆包。11 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、跨 extent split/merge、wrong-owner、失败 owner 保全、析构顺序与双方程恢复；内核启动自检继续验证真实锁与 RAII 接线。
 
 ## 页表模式选择
 
@@ -95,41 +96,27 @@ AddressSpace root 与 bootstrap payload 已接入 Pool charge；中间页表、�
 
 ## 页表纯逻辑（os/page_table crate）
 
-`os/page_table` 是 `no_std + alloc`、禁止 unsafe 的独立 crate，host 与内核 target 复用同一份代码。页表树 const 泛型于 `LEVELS`（3=Sv39、4=Sv48、5=Sv57），PTE 编码、VA 宽度与各层覆盖页数都由级数推导。页表逻辑不直接解引用物理地址；表帧 reservation、已发布帧回收与表内容访问全部经 trait 适配：
+`os/page_table` 是 `no_std + alloc`、禁止 unsafe 的独立 crate，host 与内核 target 复用同一份代码。页表树 const 泛型于 `LEVELS`（3=Sv39、4=Sv48、5=Sv57），PTE 编码、VA 宽度与各层覆盖页数都由级数推导。页表逻辑不直接解引用物理地址；启动期未发布树与运行期 owner-aware 树使用两条明确 seam：`EagerFrameMemory` 可在构造中即时取得裸表号，`TableFrameMemory` 只投影调用方已取得的 `TableFrameOwner` 并访问表内容，不认识 Pool 或分配器。
 
-```rust
-pub trait ReservedTableFrame {
-    fn number(&self) -> FrameNumber;
-    fn commit(self) -> FrameNumber;
-}
-
-pub trait FrameMemory {
-    type ReservedFrame: ReservedTableFrame;
-    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted>;
-    fn free_frame(&mut self, frame: FrameNumber);
-    fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; 512];
-}
-```
-
-内核以 `TableFrameToken(FrameTracker)` 实现 affine reservation：token 被丢弃即归还帧池，Commit 才通过 `into_table_frame` 把帧交给树；已发布分支帧回收时经 `adopt_table_frame` 重新收编。host backend 用同一 token 生命周期核对 reserved/committed/free 计数。root 和全部 reservation 都在发布前清零。
+运行期 `TableTree` 同时保存 root owner、每张 owned 分支表的 affine owner ledger 及 shared/owned root 位图；硬件 PTE 只是几何投影。内核当前以 `BorrowedRoot(FrameNumber)` 和 `Owned(FrameTracker)` 组成最窄过渡 token：root 在切片 6D 前仍由 `PoolBinding` 保活，中间表 owner 已不再拆成裸帧号，也不存在 unsafe adopt 回收路径。所有新表页在成为 owner token 前已清零。
 
 ### 类型与事务边界
 
 - `FrameNumber`、`Vpn`、`Ppn` 是页号 newtype；`Pte` 集中编码 V/R/W/X/U/G/A/D 与 leaf/branch 判别。Map/Protect 在 preflight 拒绝超出 PTE 编码、V=0、无 RWX 以及 W 且非 R 的非法叶标志。
-- `TableTree<M, LEVELS>` 拥有 root 和全部 owned 中间表帧，不拥有叶数据 backing。root 另有固定宽 `owned_root`/`shared_root` 位图；创建或摘除用户项与位图同步，`attach_shared_root` 原子安装外部 PTE 并登记 shared 所有权。普通 Drop 只递归 owned 槽；ProcessDrain 经槽状态 API 逐项摘除 owned 分支，`finish_drain` 只在 owned 位图归零后交出 root。
-- `PreparedTranslation<M::ReservedFrame>` 是 Commit 前 affine token。`prepare_map/unmap/protect` 完成参数与冲突验证、精确表帧需求计算、申请和清零；`publish` 只消费 reservation 并写完整 PTE，不分配且不返回可恢复错误。预留不足在任何 PTE 修改前失败并自动归还已取得 token；其它非重叠变更先建立共享路径时，多余 token 在 Publish 结束自动归还。
+- `TableTree<M, LEVELS>` 拥有 root token 和全部 owned 中间表 token，不拥有叶数据 backing。root 的固定宽 `owned_root`/`shared_root` 位图与 owner ledger 同步；`attach_shared_root` 只登记外部子树，不把外部 owner 纳入本树。
+- `TranslationPreflight` 是锁内只读结构快照，记录树代次、发布计划与精确表页需求；调用方在树外供给 owner 后，`prepare` 重检代次与结构，资源不足保持零 PTE 修改并把全部 owner 交还给失败值。`PreparedTranslation` 是 Commit 前 affine token；单项 Publish 要求仍是当前代次，同一事务的多项 Publish 只接受同代次 Map 批次。两者均不分配、不进入帧来源，并显式返回未消费 owner 与 Unmap 摘除的 owner。
 
 ### Preflight 与发布
 
-Map 仍把连续 VPN/PPN 区间切成最大可行 mega 段。preflight 只读遍历现树：缺失路径以“表层级 + 覆盖区编号”去重；兼容 mega 的细化同样登记将要 split 的路径；已有异 PPN、异 flags 或更细子树冲突在 reservation 前返回。Publish 按同一切段重放，只能写叶、链接 reservation 帧或展开已验证的兼容 mega。
+Map 仍把连续 VPN/PPN 区间切成最大可行 mega 段。preflight 只读遍历现树：缺失路径以“表层级 + 覆盖区编号”去重；兼容 mega 的细化同样登记将要 split 的路径；已有异 PPN、异 flags、更细子树或 shared root 槽冲突在 owner 供给前返回。Publish 按同一切段重放，只能写叶、链接已供给表页或展开已验证的兼容 mega；同代次 Map 批次中较早项建立共享路径时，多余 owner 由结果显式退给调用方。
 
-Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为目标区间部分覆盖的现有 mega 计数：完整覆盖直接改叶，部分覆盖逐级精确预留；普通 4 KiB Unmap 因而预留零帧。Unmap 对未映射洞保持宽松，Protect 则要求区间完整映射且当前 flags 全部匹配。split 后 512 个子项保持原物理连续性和 flags；空中间表仍保留到整树 Drop 或 ProcessDrain。
+Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为目标区间部分覆盖的现有 mega 计数：完整覆盖直接改叶，部分覆盖逐级精确预留；普通 4 KiB Unmap 因而预留零帧。Unmap 对未映射洞保持宽松，Protect 则要求区间完整映射且当前 flags 全部匹配。split 后 512 个子项保持原物理连续性和 flags；Unmap Publish 自底向上剪除新空的 owned 分支并返回 owner，内核把它们随 `PublishedChange` 保活到 Remote ack 后，确认前不归还。
 
-当前 `AddressSpace` 的 Building/bootstrap、Running `MemoryMap/MemoryUnmap/MemoryProtect` 与 Tunnel ObjectView 都经 `MemorySpace` planner 产生 translation intent，再由 `OwnedBacking` 或对象 backing 和 reservation-aware `TableTree` 物化；旧 `TableTree::map/unmap` 分配路径、`FrameMemory::alloc_frame`、`mem_mut`、`clear_slots`、`leak_root`、外部映射旁路和内核 root 区间配对均已删除。
+页表 drain 使用 `DrainCursor<LEVELS>` 保存层级无关的固定宽遍历状态；每个 `step_drain` 至多摘一个 owned 分支 owner，调用方锁外析构后再推进。owned 槽与分支 ledger 清空后，`finish_drain` 才交出 root owner。`TableTree::Drop` 不遍历 PTE，只接受已 drain 的常数终态；未 drain 树析构立即拒绝。当前 AddressSpace 的 Building/bootstrap、Running 公开映射与 Tunnel ObjectView 均已接入 owner-aware API，但仍通过集中 raw adapter 在 AddressSpace 锁内供给过渡 token；Running/Tunnel 以 `table_transaction_active` 独占 Prepared 到 Commit/rollback 的树代次，避免两个非重叠 ledger 事务因共享页表路径而形成 stale Prepared。切片 6D 将依此 seam 把锁外 funded 供给接入全部 Map/Unmap/Protect 路径。
 
 ### 测试集（host）
 
-25 项 tree 用例与独立 Drop ledger 用例覆盖：未对齐 8192 页跨表映射的精确 18 帧需求、mega 选择与细化、跨子表 Unmap、Protect、幂等与冲突、非法叶 flags、资源不足零修改、部分 reservation 自动归还、未发布 reservation Drop、非重叠并行准备后的多余帧归还、owned/shared root 槽转换、共享子树不回收、整树 Drop 数量守恒。debug/release host 测试、clippy `-D warnings`、`just check`、virt debug 与 virt-release 全部通过。
+30 项 tree 用例与独立 drain 用例覆盖：未对齐 8192 页跨表映射的精确 18 帧需求、mega 选择与细化、跨子表 Unmap、Protect、幂等与冲突、非法叶 flags、资源不足零修改、preflight 重检、同代次 Map 批次的多余 owner 显式归还、Map-vs-pruning-Unmap 与双 Unmap stale 检出、shared root Map/Protect 拒绝、完整 Unmap 剪枝与确认前保活、owned/shared root 槽转换、共享子树不回收、`max_work=1` drain、未 drain Drop 拒绝及 drained Drop 常数终态。debug/release host 测试与 clippy `-D warnings`、`just check`、virt core 均通过。
 
 ## 用户地址空间纯逻辑规划器（os/memory_space crate）
 

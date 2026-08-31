@@ -16,8 +16,8 @@ use core::{
 };
 
 use page_table::{
-    ENTRIES, EagerMapper, FrameExhausted, FrameMemory, FrameNumber, PAGE_BITS, Ppn, Pte,
-    ReservedTableFrame, TableTree, Vpn, flags, pages_at,
+    ENTRIES, EagerFrameMemory, EagerMapper, FrameExhausted, FrameNumber, PAGE_BITS, Ppn, Pte,
+    ReservedTableFrame, TableFrameMemory, TableTree, Vpn, flags, pages_at,
 };
 use stack_layout::PAGE_SIZE;
 use stack_layout::StackWindowLayout;
@@ -191,7 +191,7 @@ impl Drop for DirectReserved {
     }
 }
 
-impl FrameMemory for DirectTableMemory {
+impl EagerFrameMemory for DirectTableMemory {
     type ReservedFrame = DirectReserved;
 
     fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted> {
@@ -204,10 +204,6 @@ impl FrameMemory for DirectTableMemory {
             index,
             committed: false,
         })
-    }
-
-    fn free_frame(&mut self, _frame: FrameNumber) {
-        panic!("permanent direct-map tables cannot be freed")
     }
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES] {
@@ -323,7 +319,7 @@ pub fn direct_slots() -> usize {
 
 /// 把内核高半区顶层项作为 shared 槽挂入用户表 root。共享所有权登记与
 /// PTE 安装由 `TableTree` 同时完成，teardown 不再依赖地址区间配对。
-pub fn install_kernel_top_level<M: FrameMemory, const LEVELS: usize>(
+pub fn install_kernel_top_level<M: TableFrameMemory, const LEVELS: usize>(
     tree: &mut TableTree<M, LEVELS>,
 ) {
     // SAFETY: 内核页表在 mm::init 后只读；进程只复制顶层 PTE 值。

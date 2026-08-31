@@ -1,6 +1,6 @@
 //! Sv39/48/57 页表纯逻辑（见 notes/impls/mm.md「页表纯逻辑」）。
 //!
-//! 本 crate 只管表结构：`TableTree` 经 `FrameMemory` 抽象访问表帧，
+//! 本 crate 只管表结构：`TableTree` 经 `TableFrameMemory` 抽象访问表帧，
 //! 不直接解引用物理地址，host 与内核 target 复用同一份代码。
 //! 匿名内存整备（先取帧再映射）不属于本 crate，由内核 mm 层组合。
 
@@ -173,21 +173,29 @@ impl fmt::Debug for Pte {
 // 帧访问抽象
 // ---------------------------------------------------------------------------
 
-/// Commit 前唯一持有一张已清零表帧的 affine token。
+/// Eager builder 在发布前持有一张已清零表帧的 affine reservation。
 pub trait ReservedTableFrame {
     fn number(&self) -> FrameNumber;
     fn commit(self) -> FrameNumber;
 }
 
-/// 表帧访问与 reservation 来源。树只拥有已 Commit 到分支 PTE 的表帧。
-pub trait FrameMemory {
+/// 未发布 eager tree 的表帧来源；提交后的表帧具有平台级永久寿命。
+pub trait EagerFrameMemory {
     type ReservedFrame: ReservedTableFrame;
 
-    /// 取得一张尚未发布的表帧；token 丢弃时必须自动归还。
     fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted>;
-    /// 释放已从树中摘除的表帧。
-    fn free_frame(&mut self, frame: FrameNumber);
-    /// 访问指定表帧。
+    fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES];
+}
+
+/// 与 branch PTE 同生灭的 affine 表帧 owner。
+pub trait TableFrameOwner {
+    fn number(&self) -> FrameNumber;
+}
+
+/// 可回收页表树的帧访问与 owner 类型。owner 由调用方在树锁外取得后显式供给。
+pub trait TableFrameMemory {
+    type FrameOwner: TableFrameOwner;
+
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES];
 }
 
@@ -233,19 +241,25 @@ pub enum SharedRootError {
     Conflict,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RootSlotState {
-    Empty,
-    Shared,
-    Leaf,
-    Branch(FrameNumber),
+/// 一次 translation 结构 preflight。对象只冻结意图与当时精确需求；供给 owner 后
+/// 必须由树按当前代次与结构重新验证。
+#[derive(Clone, Copy, Debug)]
+#[must_use = "translation preflight must be supplied or abandoned"]
+pub struct TranslationPreflight {
+    plan: TranslationPlan,
+    generation: u64,
+    required_frames: usize,
+    retired_frames: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SlotState {
-    Empty,
-    Leaf,
-    Branch(FrameNumber),
+impl TranslationPreflight {
+    pub const fn required_frames(&self) -> usize {
+        self.required_frames
+    }
+
+    pub const fn observed_generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -270,22 +284,51 @@ enum TranslationPlan {
 
 #[derive(Debug)]
 #[must_use = "prepared translations must be published or rolled back by dropping them"]
-pub struct PreparedTranslation<F: ReservedTableFrame> {
+pub struct PreparedTranslation<O: TableFrameOwner> {
     plan: TranslationPlan,
-    frames: Vec<F>,
+    generation: u64,
+    frames: Vec<O>,
+    retired: Vec<O>,
 }
 
-impl<F: ReservedTableFrame> PreparedTranslation<F> {
-    pub fn reserved_frames(&self) -> usize {
+impl<O: TableFrameOwner> PreparedTranslation<O> {
+    pub fn supplied_frames(&self) -> usize {
         self.frames.len()
     }
 
-    fn take_frame(&mut self) -> FrameNumber {
+    fn take_owner(&mut self) -> O {
         self.frames
             .pop()
             .expect("translation preflight undercounted table frames")
-            .commit()
     }
+}
+
+#[derive(Debug)]
+pub struct PrepareFailure<O> {
+    pub error: MapError,
+    pub owners: Vec<O>,
+}
+
+#[derive(Debug)]
+#[must_use = "unused and retired table owners must leave the tree lock"]
+pub struct PublishOutcome<O> {
+    pub unused: Vec<O>,
+    pub retired: Vec<O>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainCursor<const LEVELS: usize> {
+    frames: [Option<FrameNumber>; LEVELS],
+    indices: [usize; LEVELS],
+    level: usize,
+    complete: bool,
+}
+
+#[derive(Debug)]
+pub enum DrainStep<O> {
+    Progress,
+    Retired(O),
+    Complete,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,14 +338,14 @@ impl<F: ReservedTableFrame> PreparedTranslation<F> {
 /// 为尚未发布的页表树建立 eager range mapping。
 ///
 /// 每段映射先完成范围与冲突验证，再自动选择尽可能大的叶级发布。中间表由
-/// [`FrameMemory`] 提供，因此调用方可以使用固定静态预算而不依赖堆。若表帧在发布
+/// [`EagerFrameMemory`] 提供，因此调用方可以使用固定静态预算而不依赖堆。若表帧在发布
 /// 中耗尽，树可能已部分构造；该树仍未发布，调用方必须丢弃或终止启动。
-pub struct EagerMapper<'a, M: FrameMemory, const LEVELS: usize> {
+pub struct EagerMapper<'a, M: EagerFrameMemory, const LEVELS: usize> {
     mem: &'a mut M,
     root: FrameNumber,
 }
 
-impl<'a, M: FrameMemory, const LEVELS: usize> EagerMapper<'a, M, LEVELS> {
+impl<'a, M: EagerFrameMemory, const LEVELS: usize> EagerMapper<'a, M, LEVELS> {
     pub fn new(mem: &'a mut M, root: FrameNumber) -> Self {
         assert!(
             LEVELS >= 2 && LEVELS <= 5,
@@ -445,35 +488,37 @@ impl<'a, M: FrameMemory, const LEVELS: usize> EagerMapper<'a, M, LEVELS> {
 
 /// 一棵页表树，const 泛型于级数：`TableTree<M, 3>` 即 sv39。
 ///
-/// 树拥有 root 和全部非 shared 分支表帧；叶数据帧永不属于树。shared root
-/// 槽由显式位图标记，Drop 与有界 drain 都不会递归进入这些外部子树。
-pub struct TableTree<M: FrameMemory, const LEVELS: usize> {
+/// root 与每张非 shared 分支表都保留 affine owner；硬件 PTE 只保存其几何投影。
+/// shared root 槽由显式位图标记，owner ledger 与有界 drain 不进入外部子树。
+pub struct TableTree<M: TableFrameMemory, const LEVELS: usize> {
     mem: M,
     root: FrameNumber,
+    root_owner: Option<M::FrameOwner>,
+    owners: Vec<M::FrameOwner>,
     shared_root: [u64; ENTRIES / 64],
     owned_root: [u64; ENTRIES / 64],
-    root_owned: bool,
+    generation: u64,
 }
 
-impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
-    /// 建树：root 在构造期经 reservation 取得并清零。
-    pub fn new(mut mem: M) -> Result<Self, FrameExhausted> {
+impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
+    /// 以调用方已取得的 root owner 建树；构造不访问帧来源。
+    pub fn new(mut mem: M, root_owner: M::FrameOwner) -> Self {
         assert!(
             LEVELS >= 2 && LEVELS <= 5,
             "only sv39..sv57 supported (LEVELS 2..5)"
         );
-        let reserved = mem.reserve_frame()?;
-        let root = reserved.number();
+        let root = root_owner.number();
         assert!(root.0 < MAX_PPN, "root frame exceeds PTE encoding");
         mem.table_mut(root).fill(Pte::invalid());
-        let root = reserved.commit();
-        Ok(Self {
+        Self {
             mem,
             root,
+            root_owner: Some(root_owner),
+            owners: Vec::new(),
             shared_root: [0; ENTRIES / 64],
             owned_root: [0; ENTRIES / 64],
-            root_owned: true,
-        })
+            generation: 0,
+        }
     }
 
     pub fn root_frame(&self) -> FrameNumber {
@@ -485,94 +530,152 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         self.root.0
     }
 
-    /// Validate 映射意图并精确预留 Publish 所需的全部中间表帧。
-    pub fn prepare_map(
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 锁内只读结构 preflight：精确计算当前树所需的新表页与退休表页。
+    pub fn preflight_map(
         &mut self,
         vpn: Vpn,
         count: usize,
         ppn: Ppn,
         flags: u64,
-    ) -> Result<PreparedTranslation<M::ReservedFrame>, MapError> {
-        if !valid_leaf_flags(flags) {
-            return Err(MapError::InvalidFlags);
-        }
-        let end = self.validate_range(vpn, count)?;
-        let ppn_end = ppn.0.checked_add(count).ok_or(MapError::OutOfRange)?;
-        if ppn_end > MAX_PPN {
-            return Err(MapError::OutOfRange);
-        }
-
-        let max_missing = count
-            .checked_mul(LEVELS - 1)
-            .ok_or(MapError::AllocationFailed)?;
-        let mut missing = Vec::new();
-        missing
-            .try_reserve_exact(max_missing)
-            .map_err(|_| MapError::AllocationFailed)?;
-
-        let mut vpn_cur = vpn.0;
-        let mut ppn_cur = ppn.0;
-        while vpn_cur < end {
-            let seg_level = largest_segment_level::<LEVELS>(vpn_cur, ppn_cur, end);
-            self.validate_map_segment(Vpn(vpn_cur), seg_level, Ppn(ppn_cur), flags, &mut missing)?;
-            let pages = pages_at(seg_level);
-            vpn_cur += pages;
-            ppn_cur += pages;
-        }
-        missing.sort_unstable();
-        missing.dedup();
-
-        Ok(PreparedTranslation {
-            plan: TranslationPlan::Map {
-                vpn,
-                count,
-                ppn,
-                flags,
-            },
-            frames: self.reserve_frames(missing.len())?,
+    ) -> Result<TranslationPreflight, MapError> {
+        self.preflight_plan(TranslationPlan::Map {
+            vpn,
+            count,
+            ppn,
+            flags,
         })
     }
 
-    /// Validate 宽松 Unmap，并只为实际发生的部分 mega split 预留表帧。
-    pub fn prepare_unmap(
+    pub fn preflight_unmap(
         &mut self,
         vpn: Vpn,
         count: usize,
-    ) -> Result<PreparedTranslation<M::ReservedFrame>, MapError> {
-        let end = self.validate_range(vpn, count)?;
-        let required = self.preflight_range(self.root, LEVELS - 1, 0, vpn.0, end, None)?;
-        Ok(PreparedTranslation {
-            plan: TranslationPlan::Unmap { vpn, count },
-            frames: self.reserve_frames(required)?,
-        })
+    ) -> Result<TranslationPreflight, MapError> {
+        self.preflight_plan(TranslationPlan::Unmap { vpn, count })
     }
 
-    /// Validate Protect：目标必须完整映射且当前 flags 全部等于 `from`。
-    pub fn prepare_protect(
+    pub fn preflight_protect(
         &mut self,
         vpn: Vpn,
         count: usize,
         from: u64,
         to: u64,
-    ) -> Result<PreparedTranslation<M::ReservedFrame>, MapError> {
-        if !valid_leaf_flags(from) || !valid_leaf_flags(to) {
-            return Err(MapError::InvalidFlags);
-        }
-        let end = self.validate_range(vpn, count)?;
-        let required = self.preflight_range(self.root, LEVELS - 1, 0, vpn.0, end, Some(from))?;
-        Ok(PreparedTranslation {
-            plan: TranslationPlan::Protect {
-                vpn,
-                count,
-                from,
-                to,
-            },
-            frames: self.reserve_frames(required)?,
+    ) -> Result<TranslationPreflight, MapError> {
+        self.preflight_plan(TranslationPlan::Protect {
+            vpn,
+            count,
+            from,
+            to,
         })
     }
 
-    /// Commit 后 Publish：只消费已清零 reservation 并写 PTE，不分配且不可失败。
-    pub fn publish(&mut self, mut prepared: PreparedTranslation<M::ReservedFrame>) {
+    /// 供给锁外取得且已清零的 owner，并按当前代次和结构重新验证。
+    /// 并行发布若减少需求，多余 owner 保留到 PublishOutcome 显式返回。
+    pub fn prepare(
+        &mut self,
+        preflight: TranslationPreflight,
+        owners: Vec<M::FrameOwner>,
+    ) -> Result<PreparedTranslation<M::FrameOwner>, PrepareFailure<M::FrameOwner>> {
+        let current = match self.preflight_plan(preflight.plan) {
+            Ok(current) => current,
+            Err(error) => return Err(PrepareFailure { error, owners }),
+        };
+        if owners.len() < current.required_frames {
+            return Err(PrepareFailure {
+                error: MapError::FrameExhausted,
+                owners,
+            });
+        }
+        if self.owners.try_reserve(current.required_frames).is_err() {
+            return Err(PrepareFailure {
+                error: MapError::AllocationFailed,
+                owners,
+            });
+        }
+        let mut retired = Vec::new();
+        if retired.try_reserve_exact(current.retired_frames).is_err() {
+            return Err(PrepareFailure {
+                error: MapError::AllocationFailed,
+                owners,
+            });
+        }
+        for owner in &owners {
+            assert!(
+                owner.number().0 < MAX_PPN,
+                "supplied table frame exceeds PTE encoding"
+            );
+        }
+        Ok(PreparedTranslation {
+            plan: current.plan,
+            generation: current.generation,
+            frames: owners,
+            retired,
+        })
+    }
+
+    /// 判断 Prepared 是否仍对应当前树代次；调用方必须在 Commit 前于同一树锁内复检。
+    pub fn prepared_is_current(&self, prepared: &PreparedTranslation<M::FrameOwner>) -> bool {
+        prepared.generation == self.generation
+    }
+
+    /// 同一事务内发布一组 Prepared。多项批次只接受同代次 Map：前项只会减少后项
+    /// 的表页需求，调用方须在 Commit 前持树锁确认该代次仍为当前代次。
+    pub fn publish_batch(
+        &mut self,
+        prepared: Vec<PreparedTranslation<M::FrameOwner>>,
+        mut outcomes: Vec<PublishOutcome<M::FrameOwner>>,
+    ) -> Vec<PublishOutcome<M::FrameOwner>> {
+        assert!(!prepared.is_empty(), "translation batch must be nonempty");
+        assert!(
+            outcomes.is_empty(),
+            "translation outcome buffer must be empty"
+        );
+        assert!(
+            outcomes.capacity() >= prepared.len(),
+            "translation outcome buffer was not preallocated"
+        );
+        assert!(
+            prepared
+                .iter()
+                .all(|translation| translation.generation == self.generation),
+            "prepared translation batch is stale"
+        );
+        assert!(
+            prepared.len() == 1
+                || prepared
+                    .iter()
+                    .all(|translation| matches!(translation.plan, TranslationPlan::Map { .. })),
+            "multi-translation batch must contain only Maps"
+        );
+        for translation in prepared {
+            outcomes.push(self.publish_inner(translation));
+        }
+        self.advance_generation();
+        outcomes
+    }
+
+    /// Publish 只消费 Prepared owner、改写 PTE 与移动 owner，不分配且不可失败。
+    pub fn publish(
+        &mut self,
+        prepared: PreparedTranslation<M::FrameOwner>,
+    ) -> PublishOutcome<M::FrameOwner> {
+        assert_eq!(
+            prepared.generation, self.generation,
+            "prepared translation is stale"
+        );
+        let outcome = self.publish_inner(prepared);
+        self.advance_generation();
+        outcome
+    }
+
+    fn publish_inner(
+        &mut self,
+        mut prepared: PreparedTranslation<M::FrameOwner>,
+    ) -> PublishOutcome<M::FrameOwner> {
         match prepared.plan {
             TranslationPlan::Map {
                 vpn,
@@ -582,7 +685,8 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             } => self.publish_map(vpn, count, ppn, flags, &mut prepared),
             TranslationPlan::Unmap { vpn, count } => {
                 let end = vpn.0 + count;
-                self.unmap_range(self.root, LEVELS - 1, 0, vpn.0, end, &mut prepared);
+                let _root_empty =
+                    self.unmap_range(self.root, LEVELS - 1, 0, vpn.0, end, &mut prepared);
             }
             TranslationPlan::Protect {
                 vpn,
@@ -603,8 +707,17 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
                 );
             }
         }
-        // 其它先发布的非重叠变更可能已建立共享路径；剩余 token 随
-        // prepared 在此处 Drop 并自动归还。
+        PublishOutcome {
+            unused: prepared.frames,
+            retired: prepared.retired,
+        }
+    }
+
+    fn advance_generation(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("page-table generation exhausted");
     }
 
     /// 把外部所有的顶层项挂入 root；失败时不修改任何槽。
@@ -633,60 +746,99 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             self.mem.table_mut(self.root)[slot] = entry;
             self.set_shared_root(slot);
         }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("page-table generation exhausted");
         Ok(())
     }
 
-    pub fn root_slot_state(&mut self, slot: usize) -> RootSlotState {
-        assert!(slot < ENTRIES, "root slot out of range");
-        if self.is_shared_root(slot) {
-            return RootSlotState::Shared;
-        }
-        if !self.is_owned_root(slot) {
-            assert!(
-                !self.mem.table_mut(self.root)[slot].is_valid(),
-                "unowned root slot contains a valid PTE"
-            );
-            return RootSlotState::Empty;
-        }
-        match slot_state(self.mem.table_mut(self.root)[slot]) {
-            SlotState::Empty => panic!("owned root slot contains an invalid PTE"),
-            SlotState::Leaf => RootSlotState::Leaf,
-            SlotState::Branch(frame) => RootSlotState::Branch(frame),
+    /// 建立层级无关的固定宽 drain 游标；不改动树。
+    pub fn begin_drain(&self) -> DrainCursor<LEVELS> {
+        let mut frames = [None; LEVELS];
+        frames[LEVELS - 1] = Some(self.root);
+        DrainCursor {
+            frames,
+            indices: [0; LEVELS],
+            level: LEVELS - 1,
+            complete: false,
         }
     }
 
-    pub fn slot_state(&mut self, frame: FrameNumber, slot: usize) -> SlotState {
-        assert!(slot < ENTRIES, "table slot out of range");
-        slot_state(self.mem.table_mut(frame)[slot])
-    }
-
-    /// 摘除非 root 表中的 branch；叶与空槽保持不动。
-    pub fn detach_branch(&mut self, frame: FrameNumber, slot: usize) -> Option<FrameNumber> {
-        let entry = self.mem.table_mut(frame)[slot];
-        if !entry.is_branch() {
-            return None;
+    /// 推进一个固定 work unit：扫描/清除一个槽，下降一级，或交出一张已摘除表帧。
+    pub fn drain_step(&mut self, cursor: &mut DrainCursor<LEVELS>) -> DrainStep<M::FrameOwner> {
+        if cursor.complete {
+            return DrainStep::Complete;
         }
-        self.mem.table_mut(frame)[slot] = Pte::invalid();
-        Some(entry.next_frame())
+        let level = cursor.level;
+        let frame = cursor.frames[level].expect("drain cursor lost its current frame");
+        let index = cursor.indices[level];
+        if index < ENTRIES {
+            if level == LEVELS - 1 && self.is_shared_root(index) {
+                cursor.indices[level] += 1;
+                return DrainStep::Progress;
+            }
+            let entry = self.mem.table_mut(frame)[index];
+            cursor.indices[level] += 1;
+            if entry.is_branch() {
+                assert!(level > 0, "level-0 PTE cannot be a branch");
+                let child_level = level - 1;
+                cursor.frames[child_level] = Some(entry.next_frame());
+                cursor.indices[child_level] = 0;
+                cursor.level = child_level;
+                return DrainStep::Progress;
+            }
+            if entry.is_valid() {
+                self.mem.table_mut(frame)[index] = Pte::invalid();
+                if level == LEVELS - 1 {
+                    self.clear_owned_root(index);
+                }
+            } else if level == LEVELS - 1 {
+                assert!(
+                    !self.is_owned_root(index),
+                    "owned root slot contains an invalid PTE"
+                );
+            }
+            return DrainStep::Progress;
+        }
+
+        if level == LEVELS - 1 {
+            cursor.complete = true;
+            return DrainStep::Complete;
+        }
+        let parent_level = level + 1;
+        let parent = cursor.frames[parent_level].expect("drain cursor lost its parent frame");
+        let parent_index = cursor.indices[parent_level]
+            .checked_sub(1)
+            .expect("drain cursor parent index underflow");
+        let parent_entry = self.mem.table_mut(parent)[parent_index];
+        assert!(
+            parent_entry.is_branch() && parent_entry.next_frame() == frame,
+            "drain cursor parent branch changed"
+        );
+        self.mem.table_mut(parent)[parent_index] = Pte::invalid();
+        if parent_level == LEVELS - 1 {
+            self.clear_owned_root(parent_index);
+        }
+        cursor.frames[level] = None;
+        cursor.indices[level] = 0;
+        cursor.level = parent_level;
+        DrainStep::Retired(self.take_owner(frame))
     }
 
-    /// 摘除一个 owned root 槽；shared 槽不可经此入口处理。
-    pub fn detach_root_slot(&mut self, slot: usize) -> Option<FrameNumber> {
-        assert!(!self.is_shared_root(slot), "cannot detach shared root slot");
-        let entry = self.mem.table_mut(self.root)[slot];
-        self.mem.table_mut(self.root)[slot] = Pte::invalid();
-        self.clear_owned_root(slot);
-        entry.is_branch().then(|| entry.next_frame())
-    }
-
-    /// 有界 drain 已摘除全部 owned root 槽后，交出 root 帧。
-    pub fn finish_drain(mut self) -> FrameNumber {
+    /// drain 完成后交出 root owner；调用方可在树锁外归还。
+    pub fn finish_drain(mut self) -> M::FrameOwner {
         assert!(
             self.owned_root.iter().all(|word| *word == 0),
             "owned root slot remains at drain completion"
         );
-        self.root_owned = false;
-        self.root
+        assert!(
+            self.owners.is_empty(),
+            "branch owner remains at drain completion"
+        );
+        self.root_owner
+            .take()
+            .expect("page-table root owner already removed")
     }
 
     pub fn translate(&mut self, vpn: Vpn) -> Option<Mapped> {
@@ -725,22 +877,78 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         Ok(end)
     }
 
-    fn reserve_frames(&mut self, count: usize) -> Result<Vec<M::ReservedFrame>, MapError> {
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(count)
-            .map_err(|_| MapError::AllocationFailed)?;
-        for _ in 0..count {
-            let reserved = self.mem.reserve_frame()?;
-            let frame = reserved.number();
-            assert!(
-                frame.0 < MAX_PPN,
-                "reserved table frame exceeds PTE encoding"
-            );
-            self.mem.table_mut(frame).fill(Pte::invalid());
-            frames.push(reserved);
+    fn preflight_plan(&mut self, plan: TranslationPlan) -> Result<TranslationPreflight, MapError> {
+        let (required_frames, retired_frames) = match plan {
+            TranslationPlan::Map {
+                vpn,
+                count,
+                ppn,
+                flags,
+            } => (self.preflight_map_requirements(vpn, count, ppn, flags)?, 0),
+            TranslationPlan::Unmap { vpn, count } => {
+                let end = self.validate_range(vpn, count)?;
+                let (required, retired, _) =
+                    self.preflight_unmap_range(self.root, LEVELS - 1, 0, vpn.0, end)?;
+                (required, retired)
+            }
+            TranslationPlan::Protect {
+                vpn,
+                count,
+                from,
+                to,
+            } => {
+                if !valid_leaf_flags(from) || !valid_leaf_flags(to) {
+                    return Err(MapError::InvalidFlags);
+                }
+                let end = self.validate_range(vpn, count)?;
+                (
+                    self.preflight_range(self.root, LEVELS - 1, 0, vpn.0, end, Some(from))?,
+                    0,
+                )
+            }
+        };
+        Ok(TranslationPreflight {
+            plan,
+            generation: self.generation,
+            required_frames,
+            retired_frames,
+        })
+    }
+
+    fn preflight_map_requirements(
+        &mut self,
+        vpn: Vpn,
+        count: usize,
+        ppn: Ppn,
+        flags: u64,
+    ) -> Result<usize, MapError> {
+        if !valid_leaf_flags(flags) {
+            return Err(MapError::InvalidFlags);
         }
-        Ok(frames)
+        let end = self.validate_range(vpn, count)?;
+        let ppn_end = ppn.0.checked_add(count).ok_or(MapError::OutOfRange)?;
+        if ppn_end > MAX_PPN {
+            return Err(MapError::OutOfRange);
+        }
+        let max_missing = count
+            .checked_mul(LEVELS - 1)
+            .ok_or(MapError::AllocationFailed)?;
+        let mut missing = Vec::new();
+        missing
+            .try_reserve_exact(max_missing)
+            .map_err(|_| MapError::AllocationFailed)?;
+        let mut vpn_cur = vpn.0;
+        let mut ppn_cur = ppn.0;
+        while vpn_cur < end {
+            let seg_level = largest_segment_level::<LEVELS>(vpn_cur, ppn_cur, end);
+            self.validate_map_segment(Vpn(vpn_cur), seg_level, Ppn(ppn_cur), flags, &mut missing)?;
+            let pages = pages_at(seg_level);
+            vpn_cur += pages;
+            ppn_cur += pages;
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        Ok(missing.len())
     }
 
     fn validate_map_segment(
@@ -754,7 +962,11 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         let mut frame = self.root;
         let mut level = LEVELS - 1;
         loop {
-            let entry = self.mem.table_mut(frame)[vpn.index_at(level)];
+            let index = vpn.index_at(level);
+            if level == LEVELS - 1 && self.is_shared_root(index) {
+                return Err(MapError::Conflict { vpn });
+            }
+            let entry = self.mem.table_mut(frame)[index];
             if level == seg_level {
                 return if !entry.is_valid() || self.leaf_matches(entry, ppn, flags) {
                     Ok(())
@@ -789,7 +1001,7 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         count: usize,
         ppn: Ppn,
         flags: u64,
-        prepared: &mut PreparedTranslation<M::ReservedFrame>,
+        prepared: &mut PreparedTranslation<M::FrameOwner>,
     ) {
         let end = vpn.0 + count;
         let mut vpn_cur = vpn.0;
@@ -809,12 +1021,16 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         seg_level: usize,
         ppn: Ppn,
         flags: u64,
-        prepared: &mut PreparedTranslation<M::ReservedFrame>,
+        prepared: &mut PreparedTranslation<M::FrameOwner>,
     ) {
         let mut frame = self.root;
         let mut level = LEVELS - 1;
         loop {
             let idx = vpn.index_at(level);
+            assert!(
+                level != LEVELS - 1 || !self.is_shared_root(idx),
+                "prepared Map entered a shared root slot"
+            );
             let entry = self.mem.table_mut(frame)[idx];
             if level == seg_level {
                 assert!(
@@ -844,11 +1060,27 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             if frame == self.root {
                 self.set_owned_root(idx);
             }
-            let new_frame = prepared.take_frame();
+            let owner = prepared.take_owner();
+            let new_frame = self.install_owner(owner);
             self.mem.table_mut(frame)[idx] = Pte::branch(new_frame);
             frame = new_frame;
             level -= 1;
         }
+    }
+
+    fn install_owner(&mut self, owner: M::FrameOwner) -> FrameNumber {
+        let frame = owner.number();
+        self.owners.push(owner);
+        frame
+    }
+
+    fn take_owner(&mut self, frame: FrameNumber) -> M::FrameOwner {
+        let index = self
+            .owners
+            .iter()
+            .position(|owner| owner.number() == frame)
+            .expect("branch PTE has no committed table owner");
+        self.owners.swap_remove(index)
     }
 
     fn leaf_matches(&self, entry: Pte, ppn: Ppn, flags: u64) -> bool {
@@ -868,7 +1100,7 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         frame: FrameNumber,
         idx: usize,
         level: usize,
-        prepared: &mut PreparedTranslation<M::ReservedFrame>,
+        prepared: &mut PreparedTranslation<M::FrameOwner>,
     ) -> FrameNumber {
         assert!(level >= 1, "level-0 leaf cannot split further");
         let entry = self.mem.table_mut(frame)[idx];
@@ -876,7 +1108,8 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         let mega_pages = pages_at(level);
         let base_ppn = entry.ppn().0 - entry.ppn().0 % mega_pages;
         let flags = entry.flags();
-        let new_frame = prepared.take_frame();
+        let owner = prepared.take_owner();
+        let new_frame = self.install_owner(owner);
         let table = self.mem.table_mut(new_frame);
         let sub_pages = pages_at(level - 1);
         for (index, slot) in table.iter_mut().enumerate() {
@@ -902,6 +1135,11 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             let slot_end = slot_base + slot_pages;
             if slot_base >= vpn_end || slot_end <= vpn_start {
                 continue;
+            }
+            if level == LEVELS - 1 && self.is_shared_root(index) {
+                return Err(MapError::Conflict {
+                    vpn: Vpn(slot_base.max(vpn_start)),
+                });
             }
             let entry = self.mem.table_mut(frame)[index];
             if !entry.is_valid() {
@@ -939,6 +1177,62 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         Ok(required)
     }
 
+    fn preflight_unmap_range(
+        &mut self,
+        frame: FrameNumber,
+        level: usize,
+        table_base: usize,
+        vpn_start: usize,
+        vpn_end: usize,
+    ) -> Result<(usize, usize, bool), MapError> {
+        let mut required = 0usize;
+        let mut retired = 0usize;
+        let mut live = false;
+        let slot_pages = pages_at(level);
+        for index in 0..ENTRIES {
+            if level == LEVELS - 1 && self.is_shared_root(index) {
+                live = true;
+                continue;
+            }
+            let slot_base = table_base + index * slot_pages;
+            let slot_end = slot_base + slot_pages;
+            let entry = self.mem.table_mut(frame)[index];
+            if slot_base >= vpn_end || slot_end <= vpn_start {
+                live |= entry.is_valid();
+                continue;
+            }
+            if !entry.is_valid() {
+                continue;
+            }
+            if entry.is_leaf() {
+                if slot_base >= vpn_start && slot_end <= vpn_end {
+                    continue;
+                }
+                required = required
+                    .checked_add(split_count_for_leaf(level, slot_base, vpn_start, vpn_end))
+                    .ok_or(MapError::AllocationFailed)?;
+                live = true;
+                continue;
+            }
+            let (child_required, child_retired, child_empty) = self.preflight_unmap_range(
+                entry.next_frame(),
+                level - 1,
+                slot_base,
+                vpn_start,
+                vpn_end,
+            )?;
+            required = required
+                .checked_add(child_required)
+                .ok_or(MapError::AllocationFailed)?;
+            retired = retired
+                .checked_add(child_retired)
+                .and_then(|value| value.checked_add(usize::from(child_empty)))
+                .ok_or(MapError::AllocationFailed)?;
+            live |= !child_empty;
+        }
+        Ok((required, retired, !live))
+    }
+
     fn unmap_range(
         &mut self,
         frame: FrameNumber,
@@ -946,16 +1240,22 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         table_base: usize,
         vpn_start: usize,
         vpn_end: usize,
-        prepared: &mut PreparedTranslation<M::ReservedFrame>,
-    ) {
+        prepared: &mut PreparedTranslation<M::FrameOwner>,
+    ) -> bool {
+        let mut live = false;
         let slot_pages = pages_at(level);
         for index in 0..ENTRIES {
-            let slot_base = table_base + index * slot_pages;
-            let slot_end = slot_base + slot_pages;
-            if slot_base >= vpn_end || slot_end <= vpn_start {
+            if level == LEVELS - 1 && self.is_shared_root(index) {
+                live = true;
                 continue;
             }
+            let slot_base = table_base + index * slot_pages;
+            let slot_end = slot_base + slot_pages;
             let entry = self.mem.table_mut(frame)[index];
+            if slot_base >= vpn_end || slot_end <= vpn_start {
+                live |= entry.is_valid();
+                continue;
+            }
             if !entry.is_valid() {
                 continue;
             }
@@ -967,19 +1267,25 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
                     }
                 } else {
                     let sub = self.split_mega(frame, index, level, prepared);
-                    self.unmap_range(sub, level - 1, slot_base, vpn_start, vpn_end, prepared);
+                    let empty =
+                        self.unmap_range(sub, level - 1, slot_base, vpn_start, vpn_end, prepared);
+                    assert!(!empty, "partial mega unmap removed the complete leaf");
+                    live = true;
                 }
+                continue;
+            }
+            let child = entry.next_frame();
+            if self.unmap_range(child, level - 1, slot_base, vpn_start, vpn_end, prepared) {
+                self.mem.table_mut(frame)[index] = Pte::invalid();
+                if frame == self.root {
+                    self.clear_owned_root(index);
+                }
+                prepared.retired.push(self.take_owner(child));
             } else {
-                self.unmap_range(
-                    entry.next_frame(),
-                    level - 1,
-                    slot_base,
-                    vpn_start,
-                    vpn_end,
-                    prepared,
-                );
+                live = true;
             }
         }
+        !live
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -992,7 +1298,7 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         vpn_end: usize,
         from: u64,
         to: u64,
-        prepared: &mut PreparedTranslation<M::ReservedFrame>,
+        prepared: &mut PreparedTranslation<M::FrameOwner>,
     ) {
         let slot_pages = pages_at(level);
         for index in 0..ENTRIES {
@@ -1001,6 +1307,10 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             if slot_base >= vpn_end || slot_end <= vpn_start {
                 continue;
             }
+            assert!(
+                level != LEVELS - 1 || !self.is_shared_root(index),
+                "prepared Protect entered a shared root slot"
+            );
             let entry = self.mem.table_mut(frame)[index];
             assert!(entry.is_valid(), "prepared protect lost its mapping");
             if entry.is_leaf() {
@@ -1058,42 +1368,17 @@ impl<M: FrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
     fn set_shared_root(&mut self, slot: usize) {
         self.shared_root[slot / 64] |= 1u64 << (slot % 64);
     }
-
-    /// 递归释放 `frame` 子树中全部分支表帧（不含 `frame` 自身）。
-    fn free_subtree(&mut self, frame: FrameNumber, level: usize) {
-        if level == 0 {
-            return;
-        }
-        // 按索引逐项读取：整表按值拷贝会在栈上生成 4KiB 数组，debug 构建
-        // 下函数栈帧超过每 hart 栈预算，内核栈溢出踩踏相邻 hart 栈。
-        for i in 0..ENTRIES {
-            let entry = self.mem.table_mut(frame)[i];
-            if entry.is_branch() {
-                let sub = entry.next_frame();
-                self.free_subtree(sub, level - 1);
-                self.mem.free_frame(sub);
-            }
-        }
-    }
 }
 
-impl<M: FrameMemory, const LEVELS: usize> Drop for TableTree<M, LEVELS> {
+impl<M: TableFrameMemory, const LEVELS: usize> Drop for TableTree<M, LEVELS> {
     fn drop(&mut self) {
-        if !self.root_owned {
+        if self.root_owner.is_none() {
             return;
         }
-        for slot in 0..ENTRIES {
-            if !self.is_owned_root(slot) {
-                continue;
-            }
-            let entry = self.mem.table_mut(self.root)[slot];
-            if entry.is_branch() {
-                let sub = entry.next_frame();
-                self.free_subtree(sub, LEVELS - 2);
-                self.mem.free_frame(sub);
-            }
-        }
-        self.mem.free_frame(self.root);
+        assert!(
+            self.owned_root.iter().all(|word| *word == 0) && self.owners.is_empty(),
+            "page-table tree dropped before explicit drain"
+        );
     }
 }
 
@@ -1128,16 +1413,6 @@ fn split_count_for_leaf(level: usize, slot_base: usize, vpn_start: usize, vpn_en
         count += split_count_for_leaf(child_level, child_base, vpn_start, vpn_end);
     }
     count
-}
-
-fn slot_state(entry: Pte) -> SlotState {
-    if entry.is_branch() {
-        SlotState::Branch(entry.next_frame())
-    } else if entry.is_leaf() {
-        SlotState::Leaf
-    } else {
-        SlotState::Empty
-    }
 }
 
 fn valid_leaf_flags(value: u64) -> bool {

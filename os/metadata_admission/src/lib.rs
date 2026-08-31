@@ -37,20 +37,31 @@ impl Counter {
     }
 
     pub fn try_acquire(counter: &Arc<Self>) -> Result<Permit, ReachLimit> {
+        Self::try_acquire_many(counter, 1)
+    }
+
+    pub fn try_acquire_many(counter: &Arc<Self>, slots: usize) -> Result<Permit, ReachLimit> {
+        if slots == 0 || slots > counter.limit {
+            return Err(ReachLimit);
+        }
         let mut current = counter.used.load(Ordering::Relaxed);
         loop {
-            if current >= counter.limit {
+            let Some(next) = current.checked_add(slots) else {
+                return Err(ReachLimit);
+            };
+            if next > counter.limit {
                 return Err(ReachLimit);
             }
             match counter.used.compare_exchange_weak(
                 current,
-                current + 1,
+                next,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     return Ok(Permit {
                         counter: Arc::clone(counter),
+                        slots,
                     });
                 }
                 Err(observed) => current = observed,
@@ -62,18 +73,26 @@ impl Counter {
 #[must_use = "dropping the permit releases its admission slot"]
 pub struct Permit {
     counter: Arc<Counter>,
+    slots: usize,
 }
 
 impl Permit {
     pub fn counter(&self) -> &Arc<Counter> {
         &self.counter
     }
+
+    pub const fn slots(&self) -> usize {
+        self.slots
+    }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let previous = self.counter.used.fetch_sub(1, Ordering::Relaxed);
-        assert!(previous != 0, "metadata admission permit underflow");
+        let previous = self.counter.used.fetch_sub(self.slots, Ordering::Relaxed);
+        assert!(
+            previous >= self.slots,
+            "metadata admission permit underflow"
+        );
     }
 }
 
@@ -94,6 +113,21 @@ impl<S> SponsoredPermit<S> {
     ) -> Result<Self, ReachLimit> {
         let local = Counter::try_acquire(local)?;
         let global = Counter::try_acquire(global)?;
+        Ok(Self {
+            _global: global,
+            _local: local,
+            _sponsor: Arc::clone(sponsor),
+        })
+    }
+
+    pub fn try_acquire_many(
+        sponsor: &Arc<S>,
+        global: &Arc<Counter>,
+        local: &Arc<Counter>,
+        slots: usize,
+    ) -> Result<Self, ReachLimit> {
+        let local = Counter::try_acquire_many(local, slots)?;
+        let global = Counter::try_acquire_many(global, slots)?;
         Ok(Self {
             _global: global,
             _local: local,

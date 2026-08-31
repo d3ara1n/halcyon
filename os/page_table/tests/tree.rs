@@ -3,112 +3,231 @@
 //! 用例清单见 notes/impls/mm.md「测试集」；`big_unaligned_cross_table`
 //! 是 mm-map-bug 的数值原案。
 
-use core::cell::Cell;
+use core::{
+    cell::Cell,
+    ops::{Deref, DerefMut},
+};
 use page_table::{
-    ENTRIES, FrameExhausted, FrameMemory, FrameNumber, MapError, Ppn, Pte, ReservedTableFrame,
-    RootSlotState, TableTree, Vpn, flags,
+    DrainStep, ENTRIES, FrameExhausted, FrameNumber, MapError, Ppn, PreparedTranslation, Pte,
+    PublishOutcome, TableFrameMemory, TableFrameOwner, TableTree, Vpn, flags,
 };
 use std::rc::Rc;
 
-/// 共享计数器：树销毁后仍可读，验证帧收支平衡。
+const TABLE_CAPACITY: usize = 128;
+
+/// 共享计数器：owner 析构后仍可读，验证帧收支平衡。
 #[derive(Default)]
 struct Counters {
     live: Cell<usize>,
+    next: Cell<usize>,
     deny_alloc: Cell<bool>,
     alloc_budget: Cell<Option<usize>>,
 }
 
 struct MockFrames {
     tables: Vec<[Pte; ENTRIES]>,
-    counters: Rc<Counters>,
 }
 
 impl MockFrames {
-    fn new(counters: Rc<Counters>) -> Self {
+    fn new() -> Self {
         Self {
-            tables: Vec::new(),
-            counters,
+            tables: vec![[Pte::invalid(); ENTRIES]; TABLE_CAPACITY],
         }
     }
 }
 
-struct ReservedFrame {
+struct TableOwner {
     frame: FrameNumber,
     counters: Rc<Counters>,
-    committed: bool,
 }
 
-impl ReservedTableFrame for ReservedFrame {
+impl TableFrameOwner for TableOwner {
     fn number(&self) -> FrameNumber {
         self.frame
     }
-
-    fn commit(mut self) -> FrameNumber {
-        self.committed = true;
-        self.frame
-    }
 }
 
-impl Drop for ReservedFrame {
+impl Drop for TableOwner {
     fn drop(&mut self) {
-        if !self.committed {
-            self.counters.live.set(self.counters.live.get() - 1);
-        }
-    }
-}
-
-impl FrameMemory for MockFrames {
-    type ReservedFrame = ReservedFrame;
-
-    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted> {
-        if self.counters.deny_alloc.get() {
-            return Err(FrameExhausted);
-        }
-        if let Some(remaining) = self.counters.alloc_budget.get() {
-            if remaining == 0 {
-                return Err(FrameExhausted);
-            }
-            self.counters.alloc_budget.set(Some(remaining - 1));
-        }
-        self.counters.live.set(self.counters.live.get() + 1);
-        self.tables.push([Pte::invalid(); ENTRIES]);
-        Ok(ReservedFrame {
-            frame: FrameNumber(self.tables.len() - 1),
-            counters: self.counters.clone(),
-            committed: false,
-        })
-    }
-
-    fn free_frame(&mut self, _frame: FrameNumber) {
         self.counters.live.set(self.counters.live.get() - 1);
     }
+}
+
+fn allocate_owner(counters: &Rc<Counters>) -> Result<TableOwner, FrameExhausted> {
+    if counters.deny_alloc.get() {
+        return Err(FrameExhausted);
+    }
+    if let Some(remaining) = counters.alloc_budget.get() {
+        if remaining == 0 {
+            return Err(FrameExhausted);
+        }
+        counters.alloc_budget.set(Some(remaining - 1));
+    }
+    let frame = counters.next.get();
+    if frame == TABLE_CAPACITY {
+        return Err(FrameExhausted);
+    }
+    counters.next.set(frame + 1);
+    counters.live.set(counters.live.get() + 1);
+    Ok(TableOwner {
+        frame: FrameNumber(frame),
+        counters: counters.clone(),
+    })
+}
+
+fn supply(counters: &Rc<Counters>, count: usize) -> Result<Vec<TableOwner>, FrameExhausted> {
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(count)
+        .map_err(|_| FrameExhausted)?;
+    for _ in 0..count {
+        owners.push(allocate_owner(counters)?);
+    }
+    Ok(owners)
+}
+
+impl TableFrameMemory for MockFrames {
+    type FrameOwner = TableOwner;
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES] {
         &mut self.tables[frame.0]
     }
 }
 
-type Tree = TableTree<MockFrames, 3>;
+type RawTree = TableTree<MockFrames, 3>;
+
+struct Tree {
+    inner: Option<RawTree>,
+    counters: Rc<Counters>,
+}
+
+impl Tree {
+    fn prepare_map(
+        &mut self,
+        vpn: Vpn,
+        count: usize,
+        ppn: Ppn,
+        flags: u64,
+    ) -> Result<PreparedTranslation<TableOwner>, MapError> {
+        let preflight = self
+            .inner
+            .as_mut()
+            .unwrap()
+            .preflight_map(vpn, count, ppn, flags)?;
+        let owners = supply(&self.counters, preflight.required_frames())
+            .map_err(|_| MapError::FrameExhausted)?;
+        self.inner
+            .as_mut()
+            .unwrap()
+            .prepare(preflight, owners)
+            .map_err(|failure| failure.error)
+    }
+
+    fn prepare_unmap(
+        &mut self,
+        vpn: Vpn,
+        count: usize,
+    ) -> Result<PreparedTranslation<TableOwner>, MapError> {
+        let preflight = self.inner.as_mut().unwrap().preflight_unmap(vpn, count)?;
+        let owners = supply(&self.counters, preflight.required_frames())
+            .map_err(|_| MapError::FrameExhausted)?;
+        self.inner
+            .as_mut()
+            .unwrap()
+            .prepare(preflight, owners)
+            .map_err(|failure| failure.error)
+    }
+
+    fn prepare_protect(
+        &mut self,
+        vpn: Vpn,
+        count: usize,
+        from: u64,
+        to: u64,
+    ) -> Result<PreparedTranslation<TableOwner>, MapError> {
+        let preflight = self
+            .inner
+            .as_mut()
+            .unwrap()
+            .preflight_protect(vpn, count, from, to)?;
+        let owners = supply(&self.counters, preflight.required_frames())
+            .map_err(|_| MapError::FrameExhausted)?;
+        self.inner
+            .as_mut()
+            .unwrap()
+            .prepare(preflight, owners)
+            .map_err(|failure| failure.error)
+    }
+
+    fn publish(&mut self, prepared: PreparedTranslation<TableOwner>) -> PublishOutcome<TableOwner> {
+        self.inner.as_mut().unwrap().publish(prepared)
+    }
+
+    fn publish_batch(
+        &mut self,
+        prepared: Vec<PreparedTranslation<TableOwner>>,
+    ) -> Vec<PublishOutcome<TableOwner>> {
+        let mut outcomes = Vec::new();
+        outcomes.reserve_exact(prepared.len());
+        self.inner
+            .as_mut()
+            .unwrap()
+            .publish_batch(prepared, outcomes)
+    }
+}
+
+impl Deref for Tree {
+    type Target = RawTree;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for Tree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().unwrap()
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let mut tree = self.inner.take().unwrap();
+        let mut cursor = tree.begin_drain();
+        loop {
+            match tree.drain_step(&mut cursor) {
+                DrainStep::Progress => {}
+                DrainStep::Retired(owner) => drop(owner),
+                DrainStep::Complete => break,
+            }
+        }
+        drop(tree.finish_drain());
+    }
+}
 
 fn tree(counters: &Rc<Counters>) -> Tree {
-    Tree::new(MockFrames::new(counters.clone())).expect("failed to build tree")
+    let root = allocate_owner(counters).expect("failed to reserve root");
+    Tree {
+        inner: Some(RawTree::new(MockFrames::new(), root)),
+        counters: counters.clone(),
+    }
 }
 
 fn map(tree: &mut Tree, vpn: Vpn, count: usize, ppn: Ppn, flags: u64) -> Result<(), MapError> {
     let prepared = tree.prepare_map(vpn, count, ppn, flags)?;
-    tree.publish(prepared);
+    drop(tree.publish(prepared));
     Ok(())
 }
 
 fn unmap(tree: &mut Tree, vpn: Vpn, count: usize) -> Result<(), MapError> {
     let prepared = tree.prepare_unmap(vpn, count)?;
-    tree.publish(prepared);
+    drop(tree.publish(prepared));
     Ok(())
 }
 
 fn protect(tree: &mut Tree, vpn: Vpn, count: usize, from: u64, to: u64) -> Result<(), MapError> {
     let prepared = tree.prepare_protect(vpn, count, from, to)?;
-    tree.publish(prepared);
+    drop(tree.publish(prepared));
     Ok(())
 }
 
@@ -121,8 +240,8 @@ fn big_unaligned_cross_table() {
     let prepared = t
         .prepare_map(Vpn(start), count, Ppn(ppn), flags::USER_DATA)
         .unwrap();
-    assert_eq!(prepared.reserved_frames(), 18);
-    t.publish(prepared);
+    assert_eq!(prepared.supplied_frames(), 18);
+    drop(t.publish(prepared));
 
     // 抽查边界与中段：物理连续、全部可译
     for vpn in [65, 66, 511, 512, 513, 4096, 8256, 8257 - 1] {
@@ -369,6 +488,26 @@ fn drop_frees_all_frames() {
     assert_eq!(counters.live.get(), 0, "table frames not fully returned");
 }
 
+#[test]
+fn undrained_tree_drop_is_rejected() {
+    let counters = Rc::new(Counters::default());
+    let root = allocate_owner(&counters).unwrap();
+    let mut tree = RawTree::new(MockFrames::new(), root);
+    let preflight = tree
+        .preflight_map(Vpn(1), 1, Ppn(2), flags::USER_DATA)
+        .unwrap();
+    let prepared = tree
+        .prepare(
+            preflight,
+            supply(&counters, preflight.required_frames()).unwrap(),
+        )
+        .unwrap_or_else(|failure| panic!("prepare failed: {:?}", failure.error));
+    drop(tree.publish(prepared));
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(tree)));
+    assert!(rejected.is_err());
+    assert_eq!(counters.live.get(), 0);
+}
+
 /// shared root 槽由树内所有权位图标记，Drop 不递归进入外部子树。
 #[test]
 fn shared_root_is_not_reclaimed() {
@@ -377,7 +516,6 @@ fn shared_root_is_not_reclaimed() {
     map(&mut t, Vpn(0), 1, Ppn(1), flags::USER_DATA).unwrap();
     t.attach_shared_root(500, &[Pte::branch(FrameNumber(0xdead))])
         .unwrap();
-    assert_eq!(t.root_slot_state(500), RootSlotState::Shared);
     drop(t);
     assert_eq!(
         counters.live.get(),
@@ -391,7 +529,7 @@ fn dropped_reservation_returns_all_frames() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     let prepared = t.prepare_map(Vpn(1), 1, Ppn(2), flags::USER_DATA).unwrap();
-    assert_eq!(prepared.reserved_frames(), 2);
+    assert_eq!(prepared.supplied_frames(), 2);
     assert_eq!(counters.live.get(), 3);
     drop(prepared);
     assert_eq!(counters.live.get(), 1);
@@ -405,8 +543,17 @@ fn existing_page_unmap_reserves_no_frames() {
     map(&mut t, Vpn(1), 1, Ppn(2), flags::USER_DATA).unwrap();
     counters.deny_alloc.set(true);
     let prepared = t.prepare_unmap(Vpn(1), 1).unwrap();
-    assert_eq!(prepared.reserved_frames(), 0);
-    t.publish(prepared);
+    assert_eq!(prepared.supplied_frames(), 0);
+    let outcome = t.publish(prepared);
+    assert!(outcome.unused.is_empty());
+    assert_eq!(outcome.retired.len(), 2);
+    assert_eq!(
+        counters.live.get(),
+        3,
+        "retired owners released before confirmation"
+    );
+    drop(outcome);
+    assert_eq!(counters.live.get(), 1);
     assert!(t.translate(Vpn(1)).is_none());
 }
 
@@ -419,8 +566,8 @@ fn partial_protect_splits_mega() {
     let prepared = t
         .prepare_protect(Vpn(base + 9), 1, flags::USER_DATA, flags::USER_RODATA)
         .unwrap();
-    assert_eq!(prepared.reserved_frames(), 1);
-    t.publish(prepared);
+    assert_eq!(prepared.supplied_frames(), 1);
+    drop(t.publish(prepared));
     assert_eq!(
         t.translate(Vpn(base + 9)).unwrap().flags,
         flags::USER_RODATA
@@ -482,32 +629,126 @@ fn detached_root_slot_can_be_reused_as_shared() {
     let mut t = tree(&counters);
     let base = 512 * 512 * 2;
     map(&mut t, Vpn(base), 512 * 512, Ppn(base), flags::USER_DATA).unwrap();
-    assert_eq!(t.root_slot_state(2), RootSlotState::Leaf);
+    assert_eq!(t.translate(Vpn(base)).unwrap().level, 2);
     unmap(&mut t, Vpn(base), 512 * 512).unwrap();
-    assert_eq!(t.root_slot_state(2), RootSlotState::Empty);
+    assert!(t.translate(Vpn(base)).is_none());
     t.attach_shared_root(2, &[Pte::branch(FrameNumber(0xbeef))])
         .unwrap();
-    assert_eq!(t.root_slot_state(2), RootSlotState::Shared);
 }
 
 #[test]
 fn later_nonoverlapping_publish_returns_now_unused_frames() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    let first = t
-        .prepare_map(Vpn(1), 1, Ppn(101), flags::USER_DATA)
+    let first_preflight = t
+        .preflight_map(Vpn(1), 1, Ppn(101), flags::USER_DATA)
         .unwrap();
-    let second = t
-        .prepare_map(Vpn(2), 1, Ppn(102), flags::USER_DATA)
+    let second_preflight = t
+        .preflight_map(Vpn(2), 1, Ppn(102), flags::USER_DATA)
         .unwrap();
-    assert_eq!(first.reserved_frames(), 2);
-    assert_eq!(second.reserved_frames(), 2);
+    let first_owners = supply(&counters, first_preflight.required_frames()).unwrap();
+    let second_owners = supply(&counters, second_preflight.required_frames()).unwrap();
+    assert_eq!(first_owners.len(), 2);
+    assert_eq!(second_owners.len(), 2);
     assert_eq!(counters.live.get(), 5);
 
-    t.publish(first);
+    let first = t
+        .prepare(first_preflight, first_owners)
+        .unwrap_or_else(|failure| panic!("first prepare failed: {:?}", failure.error));
+    let second = t
+        .prepare(second_preflight, second_owners)
+        .unwrap_or_else(|failure| panic!("second prepare failed: {:?}", failure.error));
+    let mut outcomes = t.publish_batch(vec![first, second]);
+    let second_outcome = outcomes.pop().unwrap();
+    let first_outcome = outcomes.pop().unwrap();
+    assert!(outcomes.is_empty());
+    assert!(first_outcome.unused.is_empty());
+    assert!(first_outcome.retired.is_empty());
+    drop(first_outcome);
     assert_eq!(counters.live.get(), 5);
-    t.publish(second);
+    assert_eq!(second_outcome.unused.len(), 2);
+    assert!(second_outcome.retired.is_empty());
+    assert_eq!(counters.live.get(), 5);
+    drop(second_outcome);
     assert_eq!(counters.live.get(), 3);
     assert_eq!(t.translate(Vpn(1)).unwrap().ppn, Ppn(101));
     assert_eq!(t.translate(Vpn(2)).unwrap().ppn, Ppn(102));
+}
+
+#[test]
+fn stale_preflight_is_rechecked_before_prepare() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let stale = t
+        .preflight_map(Vpn(2), 1, Ppn(102), flags::USER_DATA)
+        .unwrap();
+    assert_eq!(stale.required_frames(), 2);
+
+    let first = t
+        .prepare_map(Vpn(1), 1, Ppn(101), flags::USER_DATA)
+        .unwrap();
+    drop(t.publish(first));
+
+    let owners = supply(&t.counters, stale.required_frames()).unwrap();
+    let prepared = t
+        .prepare(stale, owners)
+        .unwrap_or_else(|failure| panic!("stale preflight prepare failed: {:?}", failure.error));
+    assert_eq!(prepared.supplied_frames(), 2);
+    let outcome = t.publish(prepared);
+    assert_eq!(outcome.unused.len(), 2);
+    assert!(outcome.retired.is_empty());
+    drop(outcome);
+
+    assert_eq!(t.counters.live.get(), 3);
+    assert_eq!(t.translate(Vpn(1)).unwrap().ppn, Ppn(101));
+    assert_eq!(t.translate(Vpn(2)).unwrap().ppn, Ppn(102));
+}
+
+#[test]
+fn map_and_protect_reject_shared_root_slots() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    let root_slot_pages = ENTRIES * ENTRIES;
+    let vpn = Vpn(500 * root_slot_pages);
+    t.attach_shared_root(500, &[Pte::branch(FrameNumber(0xdead))])
+        .unwrap();
+
+    assert!(matches!(
+        t.preflight_map(vpn, 1, Ppn(1), flags::USER_DATA),
+        Err(MapError::Conflict { vpn: conflict }) if conflict == vpn
+    ));
+    assert!(matches!(
+        t.preflight_protect(vpn, 1, flags::USER_DATA, flags::USER_CODE),
+        Err(MapError::Conflict { vpn: conflict }) if conflict == vpn
+    ));
+}
+
+#[test]
+fn map_after_pruning_unmap_is_detected_as_stale() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    map(&mut t, Vpn(0), 1, Ppn(10), flags::USER_DATA).unwrap();
+
+    let map_next = t.prepare_map(Vpn(1), 1, Ppn(11), flags::USER_DATA).unwrap();
+    let unmap_first = t.prepare_unmap(Vpn(0), 1).unwrap();
+    let retired = t.publish(unmap_first);
+    assert_eq!(retired.retired.len(), 2);
+    assert!(!t.prepared_is_current(&map_next));
+    drop(map_next);
+    drop(retired);
+}
+
+#[test]
+fn second_unmap_after_first_publish_is_detected_as_stale() {
+    let counters = Rc::new(Counters::default());
+    let mut t = tree(&counters);
+    map(&mut t, Vpn(0), 2, Ppn(10), flags::USER_DATA).unwrap();
+
+    let first = t.prepare_unmap(Vpn(0), 1).unwrap();
+    let second = t.prepare_unmap(Vpn(1), 1).unwrap();
+    let first_outcome = t.publish(first);
+    assert!(first_outcome.retired.is_empty());
+    assert!(!t.prepared_is_current(&second));
+    drop(second);
+    drop(first_outcome);
 }

@@ -17,8 +17,9 @@ use memory_space::{
     UnmapRequest, WritePermit,
 };
 use page_table::{
-    FrameMemory, FrameNumber, MapError, Ppn, PreparedTranslation, ReservedTableFrame,
-    RootSlotState, SlotState, TableTree, Vpn, flags,
+    DrainCursor as TableDrainCursor, DrainStep as TableDrainStep, FrameNumber, MapError, Ppn,
+    PreparedTranslation, PublishOutcome as TablePublishOutcome, TableFrameMemory, TableFrameOwner,
+    TableTree, TranslationPreflight, Vpn, flags,
 };
 
 use crate::{
@@ -77,73 +78,87 @@ impl From<MapError> for SpaceError {
 }
 
 enum TableFrameToken {
-    /// root 物理页由 BoundAddressSpace 的 PoolBinding 保活；TableTree 只借用几何。
+    /// 切片 6D 前 root 物理页仍由 PoolBinding 保活；token 只维持统一 owner 协议。
     BorrowedRoot(FrameNumber),
-    /// 切片 6 前的过渡中间表帧，仍由 TableTree 直接拥有。
+    /// 切片 6D 前的过渡中间表帧，仍走登记过的 raw adapter。
     Owned(FrameTracker),
 }
 
-impl ReservedTableFrame for TableFrameToken {
+impl TableFrameOwner for TableFrameToken {
     fn number(&self) -> FrameNumber {
         match self {
             Self::BorrowedRoot(frame) => *frame,
             Self::Owned(tracker) => FrameNumber(tracker.base().addr() / PAGE_SIZE),
         }
     }
-
-    fn commit(self) -> FrameNumber {
-        match self {
-            Self::BorrowedRoot(frame) => frame,
-            Self::Owned(tracker) => tracker.into_table_frame(),
-        }
-    }
 }
 
-/// [`TableTree`] 的帧来源。root 只借用 PoolBinding 的 funded frame；中间表在
-/// 切片 6 全面资金化前继续走登记过的 transitional raw adapter。
-struct TableMem {
-    borrowed_root: FrameNumber,
-    initial_root: Option<FrameNumber>,
-}
+struct TableMem;
 
-impl TableMem {
-    fn new(root: FrameNumber) -> Self {
-        Self {
-            borrowed_root: root,
-            initial_root: Some(root),
-        }
-    }
-}
-
-impl FrameMemory for TableMem {
-    type ReservedFrame = TableFrameToken;
-
-    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, page_table::FrameExhausted> {
-        if let Some(root) = self.initial_root.take() {
-            return Ok(TableFrameToken::BorrowedRoot(root));
-        }
-        frame::alloc_user_order(0)
-            .map(TableFrameToken::Owned)
-            .ok_or(page_table::FrameExhausted)
-    }
-
-    fn free_frame(&mut self, frame: FrameNumber) {
-        if frame == self.borrowed_root {
-            return;
-        }
-        // SAFETY: FrameMemory 只回传此前由 Owned token 唯一移交给该树的表帧。
-        drop(unsafe { FrameTracker::adopt_table_frame(frame) });
-    }
+impl TableFrameMemory for TableMem {
+    type FrameOwner = TableFrameToken;
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [page_table::Pte; page_table::ENTRIES] {
-        // SAFETY: 表帧来自 funded root 或帧池（页对齐、已清零），经直映射访问。
+        // SAFETY: owner ledger 强持每张表帧；页对齐且经直映射独占访问。
         unsafe { &mut *(mm::phys_to_virt(frame.addr()) as *mut _) }
     }
 }
 
+fn supply_raw_table_frames(count: usize) -> Result<Vec<TableFrameToken>, MapError> {
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(count)
+        .map_err(|_| MapError::AllocationFailed)?;
+    for _ in 0..count {
+        let tracker = frame::alloc_user_order(0).ok_or(MapError::FrameExhausted)?;
+        owners.push(TableFrameToken::Owned(tracker));
+    }
+    Ok(owners)
+}
+
+fn prepare_raw_translation(
+    tree: &mut TableTree<TableMem, LEVELS>,
+    preflight: TranslationPreflight,
+) -> Result<PreparedTranslation<TableFrameToken>, MapError> {
+    let owners = supply_raw_table_frames(preflight.required_frames())?;
+    tree.prepare(preflight, owners)
+        .map_err(|failure| failure.error)
+}
+
+fn prepare_raw_map(
+    tree: &mut TableTree<TableMem, LEVELS>,
+    vpn: Vpn,
+    count: usize,
+    ppn: Ppn,
+    flags: u64,
+) -> Result<PreparedTranslation<TableFrameToken>, MapError> {
+    let preflight = tree.preflight_map(vpn, count, ppn, flags)?;
+    prepare_raw_translation(tree, preflight)
+}
+
+fn prepare_raw_unmap(
+    tree: &mut TableTree<TableMem, LEVELS>,
+    vpn: Vpn,
+    count: usize,
+) -> Result<PreparedTranslation<TableFrameToken>, MapError> {
+    let preflight = tree.preflight_unmap(vpn, count)?;
+    prepare_raw_translation(tree, preflight)
+}
+
+fn prepare_raw_protect(
+    tree: &mut TableTree<TableMem, LEVELS>,
+    vpn: Vpn,
+    count: usize,
+    from: u64,
+    to: u64,
+) -> Result<PreparedTranslation<TableFrameToken>, MapError> {
+    let preflight = tree.preflight_protect(vpn, count, from, to)?;
+    prepare_raw_translation(tree, preflight)
+}
+
 const MEMORY_SPACE_LIMITS: Limits = Limits {
-    max_regions: 4096,
-    max_transactions: 4,
+    max_regions: super::resources::REGION_SLOTS_PER_ADDRESS_SPACE,
+    max_transactions: super::resources::MEMORY_CHANGES_PER_ADDRESS_SPACE,
     max_pages_per_change: (256 << 20) / PAGE_SIZE,
     max_lease_bytes: 1 << 20,
     max_lease_segments: 64,
@@ -201,14 +216,22 @@ struct BackingExtent {
 
 enum RetiredSpaceResource {
     Backing(BackingExtentOwner),
-    Binding(super::resources::PoolBinding),
+    Table(TableFrameToken),
+    Root {
+        owner: TableFrameToken,
+        binding: super::resources::PoolBinding,
+    },
 }
 
 impl RetiredSpaceResource {
     fn release(self) {
         match self {
             Self::Backing(owner) => drop(owner),
-            Self::Binding(binding) => drop(binding),
+            Self::Table(owner) => drop(owner),
+            Self::Root { owner, binding } => {
+                drop(owner);
+                drop(binding);
+            }
         }
     }
 }
@@ -219,10 +242,37 @@ struct OwnedBacking {
     extents: Vec<BackingExtent>,
 }
 
+enum PublishedTableChanges {
+    One(TablePublishOutcome<TableFrameToken>),
+    Many(Vec<TablePublishOutcome<TableFrameToken>>),
+}
+
+pub(crate) struct RetiredTableOwners {
+    _owners: PublishedTableChanges,
+}
+
+impl PublishedTableChanges {
+    fn release_unused(&mut self) {
+        let release = |outcome: &mut TablePublishOutcome<TableFrameToken>| {
+            drop(core::mem::take(&mut outcome.unused));
+        };
+        match self {
+            Self::One(outcome) => release(outcome),
+            Self::Many(outcomes) => outcomes.iter_mut().for_each(release),
+        }
+    }
+}
+
+pub(crate) struct PublishedSpaceChange {
+    ledger: PublishedChange,
+    tables: PublishedTableChanges,
+}
+
 struct PreparedOwnedMapping {
     backing: OwnedBacking,
     change: PreparedChange,
     translations: Vec<PreparedTranslation<TableFrameToken>>,
+    table_outcomes: Vec<TablePublishOutcome<TableFrameToken>>,
 }
 
 struct PinnedWriteChunk {
@@ -241,6 +291,7 @@ struct UserMemoryReservation {
     change: PreparedChange,
     backing: Option<OwnedBacking>,
     translations: Vec<PreparedTranslation<TableFrameToken>>,
+    table_outcomes: Vec<TablePublishOutcome<TableFrameToken>>,
     result: Option<PinnedMapResult>,
 }
 
@@ -421,7 +472,8 @@ impl OwnedBacking {
             }
             let page_offset = start - first_page;
             let physical_offset = start - extent_start;
-            prepared.push(tree.prepare_map(
+            prepared.push(prepare_raw_map(
+                tree,
                 Vpn(range.start() / PAGE_SIZE + page_offset),
                 end - start,
                 Ppn(extent.owner.base().addr() / PAGE_SIZE + physical_offset),
@@ -650,10 +702,10 @@ enum DrainStage {
     Ledger,
     /// 逐个归还新 ledger backing 的 owned extent。
     Backings,
-    /// 逐批回收用户页表子树（L0/L1 表帧）。
-    Tables { root: usize, l1: usize },
-    /// 全部子表已空：逐项验证 root 512 槽后交出 root 帧。
-    Root { slot: usize },
+    /// page_table 内部层级无关游标逐批交出中间表 owner。
+    Tables { cursor: TableDrainCursor<LEVELS> },
+    /// 全部 owned 槽与分支 owner 已空，交出 root owner 与 PoolBinding。
+    Root,
     /// 资源全空（root 已释放）；仅剩空壳。
     Done,
 }
@@ -680,7 +732,7 @@ pub struct AddressSpace {
 /// Bound 的全部资源由同一个 PoolBinding 与可恢复 drain 生命周期拥有。
 pub(crate) enum AddressSpaceState {
     Unbound,
-    Bound(BoundAddressSpace),
+    Bound(Box<BoundAddressSpace>),
 }
 
 impl AddressSpaceState {
@@ -688,7 +740,10 @@ impl AddressSpaceState {
         matches!(self, Self::Bound(_))
     }
 
-    pub(crate) fn bind(&mut self, bound: BoundAddressSpace) -> Result<(), BoundAddressSpace> {
+    pub(crate) fn bind(
+        &mut self,
+        bound: Box<BoundAddressSpace>,
+    ) -> Result<(), Box<BoundAddressSpace>> {
         if !matches!(self, Self::Unbound) {
             return Err(bound);
         }
@@ -788,7 +843,7 @@ pub(crate) struct MemoryChangeCompletion {
     process: Arc<Process>,
     waiter: Arc<super::wait::WaitContext>,
     retire: Option<Arc<dyn MemoryRetireSink>>,
-    published: crate::sync::Spinlock<Option<PublishedChange>>,
+    published: crate::sync::Spinlock<Option<PublishedSpaceChange>>,
     result_obligation: crate::sync::Spinlock<Option<super::thread::ThreadResultObligation>>,
 }
 
@@ -811,7 +866,8 @@ impl MemoryChangeCompletion {
         }
     }
 
-    pub(crate) fn install(&self, published: PublishedChange) {
+    pub(crate) fn install(&self, mut published: PublishedSpaceChange) {
+        published.tables.release_unused();
         let previous = self.published.lock().replace(published);
         assert!(previous.is_none(), "memory completion installed twice");
     }
@@ -824,7 +880,8 @@ impl crate::remote_call::Completion for MemoryChangeCompletion {
             .lock()
             .take()
             .expect("memory completion ran before Commit publication");
-        let (retired, batch) = self.process.space.lock().retire_published_change(published);
+        let (retired, batch, tables) = self.process.space.lock().retire_published_change(published);
+        drop(tables);
         if let Some(retire) = &self.retire {
             retire.retire(batch);
         } else {
@@ -1147,15 +1204,14 @@ fn start_user_memory_change(
         instruction,
         true,
         |state| {
-            let published = state.commit_user_memory(
+            state.commit_user_memory(
                 prepared
                     .take()
                     .expect("user memory change commits exactly once"),
-            );
-            completion.install(published);
+            )
         },
     );
-    let (_, synchronization) = match committed {
+    let (published, synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
             process
@@ -1165,6 +1221,7 @@ fn start_user_memory_change(
             return Err(SystemCallError::ObjectBusy);
         }
     };
+    completion.install(published);
     synchronization.start();
     Ok(plan)
 }
@@ -1268,6 +1325,8 @@ pub(crate) struct BoundAddressSpace {
     satp: usize,
     /// VA 区域与事务真值；Drain 起点 take 后不再可访问。
     ledger: Option<MemorySpace>,
+    /// Running/Tunnel Prepared change 的唯一页表发布权；避免旧代次跨事务提交。
+    table_transaction_active: bool,
     /// 以 BackingId 关联 ledger logical offset 的 affine anonymous extents。
     backings: Vec<OwnedBacking>,
     next_backing: u64,
@@ -1277,26 +1336,27 @@ pub(crate) struct BoundAddressSpace {
     image_end: usize,
     /// 有界收束游标（drain_gate + space 锁双持下推进）。
     drain_stage: DrainStage,
-    /// 已从拥有结构摘下、等待下一 work unit 归还的帧 extent。
-    pending_free: Option<BackingExtentOwner>,
+    /// 已从拥有结构摘下、等待下一 work unit 移出 AddressSpace 锁的 owner。
+    pending_free: Option<RetiredSpaceResource>,
     /// 已计入本批 work、必须在释放 AddressSpace 锁后析构的 Pool-backed owner。
     retired: Option<RetiredSpaceResource>,
 }
 
 impl BoundAddressSpace {
     /// 从完整 PoolBinding 构造 Bound 状态；root tree 只借用 binding 的 funded frame。
-    pub fn new(binding: super::resources::PoolBinding) -> Result<Self, SpaceError> {
+    pub fn new(binding: super::resources::PoolBinding) -> Result<Box<Self>, SpaceError> {
         let root = binding.root_frame();
-        let mut tree = TableTree::new(TableMem::new(root)).map_err(|_| SpaceError::NoFrame)?;
+        let mut tree = TableTree::new(TableMem, TableFrameToken::BorrowedRoot(root));
         mm::install_kernel_top_level(&mut tree);
         let satp = (8usize << 60) | tree.satp_ppn();
         let bounds = LedgerPageRange::new(0, USER_TOP).map_err(|_| SpaceError::BadSegment)?;
         let ledger = MemorySpace::new(bounds, MEMORY_SPACE_LIMITS).map_err(map_change_error)?;
-        Ok(Self {
+        Box::try_new(Self {
             tree: Some(tree),
             binding: Some(binding),
             satp,
             ledger: Some(ledger),
+            table_transaction_active: false,
             backings: Vec::new(),
             next_backing: 1,
             next_lease: 1,
@@ -1305,6 +1365,7 @@ impl BoundAddressSpace {
             pending_free: None,
             retired: None,
         })
+        .map_err(|_| SpaceError::NoFrame)
     }
 
     fn pool(&self) -> &Arc<super::memory_pool::MemoryPool> {
@@ -1328,6 +1389,25 @@ impl BoundAddressSpace {
 
     fn ledger(&mut self) -> &mut MemorySpace {
         self.ledger.as_mut().expect("address-space ledger is live")
+    }
+
+    fn ensure_table_transaction_available(&self) -> Result<(), SpaceError> {
+        if self.table_transaction_active {
+            Err(SpaceError::Busy)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mark_table_transaction(&mut self) {
+        assert!(
+            !core::mem::replace(&mut self.table_transaction_active, true),
+            "page-table transaction installed twice"
+        );
+    }
+
+    fn clear_table_transaction(&mut self) {
+        self.table_transaction_active = false;
     }
 
     fn mint_backing(&mut self) -> Result<BackingId, SpaceError> {
@@ -1397,6 +1477,8 @@ impl BoundAddressSpace {
         &mut self,
         request: MemoryMapRequest,
     ) -> Result<PreparedUserMemory, SystemCallError> {
+        self.ensure_table_transaction_available()
+            .map_err(map_public_space_error)?;
         let mut token = PreparedUserMemory::allocate()?;
         let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
         let guard_before =
@@ -1461,9 +1543,12 @@ impl BoundAddressSpace {
             change,
             backing: Some(backing),
             translations: Vec::new(),
+            table_outcomes: Vec::new(),
             result: None,
         });
-        self.finish_user_map(token, layout, request.cookie, identity)
+        let prepared = self.finish_user_map(token, layout, request.cookie, identity)?;
+        self.mark_table_transaction();
+        Ok(prepared)
     }
 
     #[inline(never)]
@@ -1517,9 +1602,18 @@ impl BoundAddressSpace {
                 return Err(map_public_space_error(error));
             }
         };
+        let mut table_outcomes = Vec::new();
+        if table_outcomes
+            .try_reserve_exact(translations.len())
+            .is_err()
+        {
+            self.rollback_user_memory(token);
+            return Err(SystemCallError::OutOfMemory);
+        }
         let reservation = token.get_mut();
         reservation.result = Some(result);
         reservation.translations = translations;
+        reservation.table_outcomes = table_outcomes;
         Ok(token)
     }
 
@@ -1527,8 +1621,11 @@ impl BoundAddressSpace {
         &mut self,
         validated: memory_space::ValidatedChange,
     ) -> Result<PreparedUserMemory, SystemCallError> {
+        self.ensure_table_transaction_available()
+            .map_err(map_public_space_error)?;
         let mut token = PreparedUserMemory::allocate()?;
         let mut translations = Vec::new();
+        let mut table_outcomes = Vec::new();
         let change = self
             .ledger()
             .reserve(validated, Vec::new())
@@ -1541,12 +1638,21 @@ impl BoundAddressSpace {
             debug_assert!(permits.is_empty());
             return Err(SystemCallError::OutOfMemory);
         }
+        if table_outcomes
+            .try_reserve_exact(change.translation_intents().len())
+            .is_err()
+        {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            return Err(SystemCallError::OutOfMemory);
+        }
         for intent in change.translation_intents().iter().copied() {
             let prepared = match intent {
-                TranslationIntent::Remove { range } => self
-                    .tt()
-                    .prepare_unmap(Vpn(range.start() / PAGE_SIZE), range.pages()),
-                TranslationIntent::Protect { range, from, to } => self.tt().prepare_protect(
+                TranslationIntent::Remove { range } => {
+                    prepare_raw_unmap(self.tt(), Vpn(range.start() / PAGE_SIZE), range.pages())
+                }
+                TranslationIntent::Protect { range, from, to } => prepare_raw_protect(
+                    self.tt(),
                     Vpn(range.start() / PAGE_SIZE),
                     range.pages(),
                     protection_flags(from),
@@ -1570,8 +1676,10 @@ impl BoundAddressSpace {
             change,
             backing: None,
             translations,
+            table_outcomes,
             result: None,
         });
+        self.mark_table_transaction();
         Ok(token)
     }
 
@@ -1615,37 +1723,50 @@ impl BoundAddressSpace {
     }
 
     fn rollback_user_memory(&mut self, prepared: PreparedUserMemory) {
+        self.clear_table_transaction();
         let UserMemoryReservation {
             change,
             translations,
+            table_outcomes,
             backing,
             result: _,
         } = prepared.take();
         let permits = self.ledger().rollback(change);
         debug_assert!(permits.is_empty());
         drop(translations);
+        drop(table_outcomes);
         drop(backing);
     }
 
-    fn commit_user_memory(&mut self, prepared: PreparedUserMemory) -> PublishedChange {
+    fn commit_user_memory(&mut self, prepared: PreparedUserMemory) -> PublishedSpaceChange {
         let UserMemoryReservation {
             change,
             backing,
             translations,
+            table_outcomes,
             result,
         } = prepared.take();
+        assert!(
+            self.table_transaction_active
+                && translations
+                    .iter()
+                    .all(|translation| self.tt().prepared_is_current(translation)),
+            "page-table transaction lost exclusive generation"
+        );
+        self.clear_table_transaction();
         if let Some(result) = &result {
             result.commit_cookie();
         }
         let committed = self.ledger().commit(change);
-        for translation in translations {
-            self.tt().publish(translation);
-        }
+        let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
         let published = self.ledger().publish(committed);
         if let Some(backing) = backing {
             self.backings.push(backing);
         }
-        published
+        PublishedSpaceChange {
+            ledger: published,
+            tables: PublishedTableChanges::Many(table_outcomes),
+        }
     }
 
     fn map_owned_backing_with_owner(
@@ -1656,6 +1777,7 @@ impl BoundAddressSpace {
         owner: RegionOwner,
         backing: OwnedBacking,
     ) -> Result<(), SpaceError> {
+        self.ensure_table_transaction_available()?;
         let prepared = self.prepare_owned_backing(vaddr, protection, class, owner, backing)?;
         let published = self.commit_owned_mapping(prepared);
         self.finish_empty_published_change(published);
@@ -1741,26 +1863,38 @@ impl BoundAddressSpace {
                 return Err(error);
             }
         };
+        let mut table_outcomes = Vec::new();
+        if table_outcomes
+            .try_reserve_exact(translations.len())
+            .is_err()
+        {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            return Err(SpaceError::NoFrame);
+        }
         Ok(PreparedOwnedMapping {
             backing,
             change,
             translations,
+            table_outcomes,
         })
     }
 
-    fn commit_owned_mapping(&mut self, prepared: PreparedOwnedMapping) -> PublishedChange {
+    fn commit_owned_mapping(&mut self, prepared: PreparedOwnedMapping) -> PublishedSpaceChange {
         let PreparedOwnedMapping {
             backing,
             change,
             translations,
+            table_outcomes,
         } = prepared;
         let committed = self.ledger().commit(change);
-        for translation in translations {
-            self.tt().publish(translation);
-        }
+        let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
         let published = self.ledger().publish(committed);
         self.backings.push(backing);
-        published
+        PublishedSpaceChange {
+            ledger: published,
+            tables: PublishedTableChanges::Many(table_outcomes),
+        }
     }
 
     fn anonymous_range_still_live(
@@ -1804,9 +1938,10 @@ impl BoundAddressSpace {
 
     pub(crate) fn retire_published_change(
         &mut self,
-        published: PublishedChange,
-    ) -> (RetiredChange, RetireBatch) {
-        let synchronized = self.ledger().synchronize(published);
+        published: PublishedSpaceChange,
+    ) -> (RetiredChange, RetireBatch, RetiredTableOwners) {
+        let PublishedSpaceChange { ledger, tables } = published;
+        let synchronized = self.ledger().synchronize(ledger);
         let (retired, batch) = self.ledger().retire(synchronized);
         for fragment in batch.fragments().iter().copied() {
             let RegionKindView::Mapping {
@@ -1832,18 +1967,20 @@ impl BoundAddressSpace {
                 self.backings.remove(index);
             }
         }
-        (retired, batch)
+        (retired, batch, RetiredTableOwners { _owners: tables })
     }
 
     pub(crate) fn complete_retired_change(&mut self, retired: RetiredChange) {
         self.ledger().complete(retired);
     }
 
-    fn finish_empty_published_change(&mut self, published: PublishedChange) {
-        let (retired, batch) = self.retire_published_change(published);
+    fn finish_empty_published_change(&mut self, mut published: PublishedSpaceChange) {
+        published.tables.release_unused();
+        let (retired, batch, tables) = self.retire_published_change(published);
         let (fragments, permits) = batch.into_parts();
         debug_assert!(fragments.is_empty());
         debug_assert!(permits.is_empty());
+        drop(tables);
         self.complete_retired_change(retired);
     }
 
@@ -1856,6 +1993,9 @@ impl BoundAddressSpace {
         permits: Vec<WritePermit>,
     ) -> Result<PreparedObjectMapping, ObjectMapFailure> {
         assert_eq!(permits.len(), 1, "Tunnel object Map requires one permit");
+        if let Err(error) = self.ensure_table_transaction_available() {
+            return Err(ObjectMapFailure { error, permits });
+        }
         let mut token = match PreparedObjectMapping::allocate() {
             Ok(token) => token,
             Err(error) => return Err(ObjectMapFailure { error, permits }),
@@ -1924,7 +2064,8 @@ impl BoundAddressSpace {
             ] if *intent_range == range && *intent_object == object => {}
             _ => panic!("object Map planner returned an invalid translation plan"),
         }
-        let translation = match self.tt().prepare_map(
+        let translation = match prepare_raw_map(
+            self.tt(),
             Vpn(va / PAGE_SIZE),
             1,
             Ppn(pa / PAGE_SIZE),
@@ -1950,6 +2091,7 @@ impl BoundAddressSpace {
                 object,
             },
         });
+        self.mark_table_transaction();
         Ok(token)
     }
 
@@ -1957,6 +2099,7 @@ impl BoundAddressSpace {
         &mut self,
         prepared: PreparedObjectMapping,
     ) -> Vec<WritePermit> {
+        self.clear_table_transaction();
         let ObjectMappingReservation {
             change,
             translation,
@@ -1971,15 +2114,26 @@ impl BoundAddressSpace {
     pub(crate) fn commit_object_mapping(
         &mut self,
         prepared: PreparedObjectMapping,
-    ) -> (PublishedChange, ObjectMappingLease) {
+    ) -> (PublishedSpaceChange, ObjectMappingLease) {
         let ObjectMappingReservation {
             change,
             translation,
             lease,
         } = prepared.take();
+        assert!(
+            self.table_transaction_active && self.tt().prepared_is_current(&translation),
+            "page-table transaction lost exclusive generation"
+        );
+        self.clear_table_transaction();
         let committed = self.ledger().commit(change);
-        self.tt().publish(translation);
-        (self.ledger().publish(committed), lease)
+        let tables = PublishedTableChanges::One(self.tt().publish(translation));
+        (
+            PublishedSpaceChange {
+                ledger: self.ledger().publish(committed),
+                tables,
+            },
+            lease,
+        )
     }
 
     #[inline(never)]
@@ -1987,6 +2141,7 @@ impl BoundAddressSpace {
         &mut self,
         lease: ObjectMappingLease,
     ) -> Result<PreparedObjectUnmap, SpaceError> {
+        self.ensure_table_transaction_available()?;
         let mut token = PreparedObjectUnmap::allocate()?;
         let matches_lease = self.ledger().regions().any(|region| {
             region.key == lease.region
@@ -2020,10 +2175,11 @@ impl BoundAddressSpace {
             [TranslationIntent::Remove { range }] if *range == lease.range => {}
             _ => panic!("object Unmap planner returned an invalid translation plan"),
         }
-        let translation = match self
-            .tt()
-            .prepare_unmap(Vpn(lease.range.start() / PAGE_SIZE), lease.range.pages())
-        {
+        let translation = match prepare_raw_unmap(
+            self.tt(),
+            Vpn(lease.range.start() / PAGE_SIZE),
+            lease.range.pages(),
+        ) {
             Ok(translation) => translation,
             Err(error) => {
                 let permits = self.ledger().rollback(change);
@@ -2035,10 +2191,12 @@ impl BoundAddressSpace {
             change,
             translation,
         });
+        self.mark_table_transaction();
         Ok(token)
     }
 
     pub(crate) fn rollback_object_unmap(&mut self, prepared: PreparedObjectUnmap) {
+        self.clear_table_transaction();
         let ObjectUnmapReservation {
             change,
             translation,
@@ -2048,14 +2206,25 @@ impl BoundAddressSpace {
         debug_assert!(permits.is_empty());
     }
 
-    pub(crate) fn commit_object_unmap(&mut self, prepared: PreparedObjectUnmap) -> PublishedChange {
+    pub(crate) fn commit_object_unmap(
+        &mut self,
+        prepared: PreparedObjectUnmap,
+    ) -> PublishedSpaceChange {
         let ObjectUnmapReservation {
             change,
             translation,
         } = prepared.take();
+        assert!(
+            self.table_transaction_active && self.tt().prepared_is_current(&translation),
+            "page-table transaction lost exclusive generation"
+        );
+        self.clear_table_transaction();
         let committed = self.ledger().commit(change);
-        self.tt().publish(translation);
-        self.ledger().publish(committed)
+        let tables = PublishedTableChanges::One(self.tt().publish(translation));
+        PublishedSpaceChange {
+            ledger: self.ledger().publish(committed),
+            tables,
+        }
     }
 
     fn map_owned_backing(
@@ -2412,24 +2581,18 @@ impl BoundAddressSpace {
         }
         let owner = self.pending_free.take().expect("pending owner disappeared");
         debug_assert!(self.retired.is_none(), "retired owner was not collected");
-        self.retired = Some(RetiredSpaceResource::Backing(owner));
+        self.retired = Some(owner);
         // caller 必须先释放 AddressSpace 锁并析构 retired owner，才能继续本批。
         (1, false)
     }
 
-    /// 登记一笔新的 extent 归还（当前无在途归还时调用）。
-    fn enqueue_free(&mut self, tracker: FrameTracker) {
+    /// 登记 page_table 已摘除的 affine owner，等待锁外归还。
+    fn enqueue_table_owner(&mut self, owner: TableFrameToken) {
         debug_assert!(
             self.pending_free.is_none(),
             "pending free must be consumed before enqueuing"
         );
-        self.pending_free = Some(BackingExtentOwner::Raw(tracker));
-    }
-
-    /// 从页表结构收回一帧并登记延后归还。
-    fn enqueue_table_frame(&mut self, frame: FrameNumber) {
-        // SAFETY: 调用点先从唯一所属的页表槽或 root 摘除该帧，之后不再访问。
-        self.enqueue_free(unsafe { FrameTracker::adopt_table_frame(frame) });
+        self.pending_free = Some(RetiredSpaceResource::Table(owner));
     }
 
     /// 有界收束一批资源。Handle/PTE 检查、所有权摘除与 extent 归还各计一个
@@ -2496,7 +2659,12 @@ impl BoundAddressSpace {
                         return (work, false);
                     }
                     let Some(backing) = self.backings.last_mut() else {
-                        self.drain_stage = DrainStage::Tables { root: 0, l1: 0 };
+                        let cursor = self
+                            .tree
+                            .as_ref()
+                            .expect("tree exists until Root stage completes")
+                            .begin_drain();
+                        self.drain_stage = DrainStage::Tables { cursor };
                         continue;
                     };
                     let extent = backing
@@ -2507,7 +2675,7 @@ impl BoundAddressSpace {
                         self.backings.pop();
                     }
                     work += 1;
-                    self.pending_free = Some(extent.owner);
+                    self.pending_free = Some(RetiredSpaceResource::Backing(extent.owner));
                     let (used, done) = self.step_pending(budget - work);
                     work += used;
                     if !done {
@@ -2515,156 +2683,56 @@ impl BoundAddressSpace {
                     }
                     self.pending_free = None;
                 }
-                DrainStage::Tables { root, l1 } => {
-                    let mut root_slot = root;
-                    let mut l1_slot = l1;
-                    while root_slot < page_table::ENTRIES {
-                        if work >= budget {
-                            self.drain_stage = DrainStage::Tables {
-                                root: root_slot,
-                                l1: l1_slot,
-                            };
-                            return (work, false);
+                DrainStage::Tables { mut cursor } => {
+                    if work >= budget {
+                        self.drain_stage = DrainStage::Tables { cursor };
+                        return (work, false);
+                    }
+                    let step = self
+                        .tree
+                        .as_mut()
+                        .expect("tree exists until Root stage completes")
+                        .drain_step(&mut cursor);
+                    work += 1;
+                    match step {
+                        TableDrainStep::Progress => {
+                            self.drain_stage = DrainStage::Tables { cursor };
                         }
-
-                        let root_state = self
-                            .tree
-                            .as_mut()
-                            .expect("tree exists until Root stage completes")
-                            .root_slot_state(root_slot);
-                        let l1_frame = match root_state {
-                            RootSlotState::Shared | RootSlotState::Empty => {
-                                root_slot += 1;
-                                l1_slot = 0;
-                                work += 1;
-                                continue;
-                            }
-                            RootSlotState::Leaf => {
-                                self.tree
-                                    .as_mut()
-                                    .expect("tree exists until Root stage completes")
-                                    .detach_root_slot(root_slot);
-                                root_slot += 1;
-                                l1_slot = 0;
-                                work += 1;
-                                continue;
-                            }
-                            RootSlotState::Branch(frame) => frame,
-                        };
-
-                        while l1_slot < page_table::ENTRIES {
-                            if work >= budget {
-                                self.drain_stage = DrainStage::Tables {
-                                    root: root_slot,
-                                    l1: l1_slot,
-                                };
+                        TableDrainStep::Retired(owner) => {
+                            self.drain_stage = DrainStage::Tables { cursor };
+                            self.enqueue_table_owner(owner);
+                            let (used, done) = self.step_pending(budget - work);
+                            work += used;
+                            if !done {
                                 return (work, false);
                             }
-                            let state = self
-                                .tree
-                                .as_mut()
-                                .expect("tree exists until Root stage completes")
-                                .slot_state(l1_frame, l1_slot);
-                            let branch_frame = match state {
-                                SlotState::Branch(_) => self
-                                    .tree
-                                    .as_mut()
-                                    .expect("tree exists until Root stage completes")
-                                    .detach_branch(l1_frame, l1_slot),
-                                SlotState::Empty | SlotState::Leaf => None,
-                            };
-                            l1_slot += 1;
-                            work += 1;
-                            if let Some(frame) = branch_frame {
-                                self.enqueue_table_frame(frame);
-                                let (used, done) = self.step_pending(budget - work);
-                                work += used;
-                                if !done {
-                                    self.drain_stage = DrainStage::Tables {
-                                        root: root_slot,
-                                        l1: l1_slot,
-                                    };
-                                    return (work, false);
-                                }
-                                self.pending_free = None;
-                            }
+                            self.pending_free = None;
                         }
-
-                        if work >= budget {
-                            self.drain_stage = DrainStage::Tables {
-                                root: root_slot,
-                                l1: l1_slot,
-                            };
-                            return (work, false);
+                        TableDrainStep::Complete => {
+                            self.drain_stage = DrainStage::Root;
                         }
-                        let detached = self
-                            .tree
-                            .as_mut()
-                            .expect("tree exists until Root stage completes")
-                            .detach_root_slot(root_slot);
-                        assert_eq!(
-                            detached,
-                            Some(l1_frame),
-                            "root branch changed during address-space drain"
-                        );
-                        root_slot += 1;
-                        l1_slot = 0;
-                        work += 1;
-                        self.enqueue_table_frame(l1_frame);
-                        let (used, done) = self.step_pending(budget - work);
-                        work += used;
-                        self.drain_stage = DrainStage::Tables {
-                            root: root_slot,
-                            l1: l1_slot,
-                        };
-                        if !done {
-                            return (work, false);
-                        }
-                        self.pending_free = None;
                     }
-                    self.drain_stage = DrainStage::Root { slot: 0 };
                 }
-                DrainStage::Root { slot } => {
-                    let mut slot = slot;
-                    while slot < page_table::ENTRIES {
-                        if work >= budget {
-                            self.drain_stage = DrainStage::Root { slot };
-                            return (work, false);
-                        }
-                        let state = self
-                            .tree
-                            .as_mut()
-                            .expect("tree exists until Root stage completes")
-                            .root_slot_state(slot);
-                        assert!(
-                            matches!(state, RootSlotState::Empty | RootSlotState::Shared),
-                            "owned subtree outlives Tables stage"
-                        );
-                        slot += 1;
-                        work += 1;
-                    }
+                DrainStage::Root => {
                     if work + 1 > budget {
-                        self.drain_stage = DrainStage::Root { slot };
                         return (work, false);
                     }
                     let tree = self
                         .tree
                         .take()
                         .expect("tree exists until Root stage completes");
-                    let root = tree.finish_drain();
+                    let owner = tree.finish_drain();
                     let binding = self
                         .binding
                         .take()
                         .expect("Bound address space lost its PoolBinding");
                     assert_eq!(
-                        root,
+                        owner.number(),
                         binding.root_frame(),
                         "TableTree root differs from PoolBinding owner"
                     );
-                    // Pool-backed owner 必须在 AddressSpace 锁外退款；本次摘除计一个
-                    // work unit，调用层在返回前完成不可失败析构。
                     debug_assert!(self.retired.is_none(), "retired owner was not collected");
-                    self.retired = Some(RetiredSpaceResource::Binding(binding));
+                    self.retired = Some(RetiredSpaceResource::Root { owner, binding });
                     work += 1;
                     self.drain_stage = DrainStage::Done;
                     return (work, true);

@@ -466,6 +466,26 @@ impl PhysicalClaim for ClaimedUserExtent {
         self.geometry().count()
     }
 
+    fn split_at(mut self, left_pages: usize) -> (Self, Self) {
+        let geometry = self
+            .geometry
+            .take()
+            .expect("claimed user extent ownership already transferred");
+        let (left, right) = geometry
+            .split_at(left_pages)
+            .expect("funded extent split must be strictly internal");
+        (
+            Self {
+                geometry: Some(left),
+                cleared: self.cleared,
+            },
+            Self {
+                geometry: Some(right),
+                cleared: self.cleared,
+            },
+        )
+    }
+
     fn clear(&mut self) {
         assert!(!self.cleared, "claimed user extent cleared twice");
         let geometry = self.geometry();
@@ -844,22 +864,6 @@ impl FrameTracker {
                 geometry: Some(right),
             },
         )
-    }
-
-    /// 消费单帧 tracker，把所有权移交给 `page_table::FrameMemory` 契约。
-    pub fn into_table_frame(mut self) -> FrameNumber {
-        let geometry = self.take_geometry();
-        assert_eq!(geometry.count(), 1, "table transfer requires one frame");
-        geometry.base()
-    }
-
-    /// 从 `page_table::FrameMemory` 契约收回一帧所有权。
-    ///
-    /// # Safety
-    ///
-    /// `frame` 必须是此前由 [`Self::into_table_frame`] 唯一移交、且尚未收回的帧。
-    pub(crate) unsafe fn adopt_table_frame(frame: FrameNumber) -> Self {
-        Self::from_claimed(frame, 1)
     }
 }
 

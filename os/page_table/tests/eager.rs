@@ -1,7 +1,7 @@
 //! 未发布页表 eager range builder 测试。
 
 use page_table::{
-    ENTRIES, EagerMapper, FrameExhausted, FrameMemory, FrameNumber, MapError, Ppn, Pte,
+    ENTRIES, EagerFrameMemory, EagerMapper, FrameExhausted, FrameNumber, MapError, Ppn, Pte,
     ReservedTableFrame, Vpn, flags, pages_at,
 };
 
@@ -46,7 +46,7 @@ impl Tables {
     }
 }
 
-impl FrameMemory for Tables {
+impl EagerFrameMemory for Tables {
     type ReservedFrame = ReservedFrame;
 
     fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, FrameExhausted> {
@@ -56,10 +56,6 @@ impl FrameMemory for Tables {
         let frame = FrameNumber(self.tables.len());
         self.tables.push([Pte::invalid(); ENTRIES]);
         Ok(ReservedFrame(frame))
-    }
-
-    fn free_frame(&mut self, _frame: FrameNumber) {
-        panic!("eager test tables are never reclaimed")
     }
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES] {

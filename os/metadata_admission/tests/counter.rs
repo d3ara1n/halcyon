@@ -22,6 +22,22 @@ fn exhaustion_and_drop_restore_capacity() {
 }
 
 #[test]
+fn bulk_permit_reserves_and_refunds_exact_capacity() {
+    let counter = Arc::new(Counter::new(8));
+    let bulk = Counter::try_acquire_many(&counter, 6).unwrap();
+    assert_eq!(bulk.slots(), 6);
+    assert_eq!(counter.used(), 6);
+    assert!(Counter::try_acquire_many(&counter, 3).is_err());
+    let tail = Counter::try_acquire_many(&counter, 2).unwrap();
+    assert_eq!(counter.used(), 8);
+    drop(bulk);
+    assert_eq!(counter.used(), 2);
+    drop(tail);
+    assert_eq!(counter.used(), 0);
+    assert!(Counter::try_acquire_many(&counter, 0).is_err());
+}
+
+#[test]
 fn permit_keeps_counter_alive() {
     let counter = Arc::new(Counter::new(1));
     let permit = Counter::try_acquire(&counter).unwrap();
@@ -88,6 +104,24 @@ fn sponsored_acquisition_rolls_back_partial_failure() {
     drop(first);
     assert_eq!(global.used(), 0);
     assert_eq!(first_local.used(), 0);
+}
+
+#[test]
+fn sponsored_bulk_failure_refunds_local_capacity() {
+    let global = Arc::new(Counter::new(3));
+    let local = Arc::new(Counter::new(4));
+    let sponsor = Arc::new(());
+    let failure = SponsoredPermit::try_acquire_many(&sponsor, &global, &local, 4);
+    assert!(failure.is_err());
+    assert_eq!(global.used(), 0);
+    assert_eq!(local.used(), 0);
+
+    let permit = SponsoredPermit::try_acquire_many(&sponsor, &global, &local, 3).unwrap();
+    assert_eq!(global.used(), 3);
+    assert_eq!(local.used(), 3);
+    drop(permit);
+    assert_eq!(global.used(), 0);
+    assert_eq!(local.used(), 0);
 }
 
 struct DropSponsor(Arc<AtomicBool>);

@@ -1,11 +1,10 @@
-//! Drop 链记账完整性：建树 → 映射（含 mega 分裂）→ 销毁，
-//! 断言每个分配帧恰好归还一次、无泄漏、无重复。
+//! 显式 drain 链记账完整性：建树 → 映射（含 mega 分裂）→ max_work=1 拆卸，
+//! 断言每个 owner 恰好归还一次、无泄漏、无重复。
 
 use page_table::{
-    FrameMemory, FrameNumber, MapError, Ppn, PreparedTranslation, Pte, ReservedTableFrame,
-    TableTree, Vpn,
+    DrainStep, FrameNumber, MapError, Ppn, Pte, TableFrameMemory, TableFrameOwner, TableTree, Vpn,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -16,102 +15,97 @@ struct Ledger {
 static LEDGER: Mutex<Option<Ledger>> = Mutex::new(None);
 
 fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
-    let mut g = LEDGER.lock().unwrap();
-    f(g.as_mut().unwrap())
+    let mut guard = LEDGER.lock().unwrap();
+    f(guard.as_mut().unwrap())
 }
 
 #[derive(Default)]
-struct Tables(std::collections::HashMap<u64, *mut [page_table::Pte; 512]>);
+struct Tables(HashMap<u64, *mut [page_table::Pte; 512]>);
+
 unsafe impl Send for Tables {}
-static LEDGER2: Mutex<Option<Tables>> = Mutex::new(None);
+
+static TABLES: Mutex<Option<Tables>> = Mutex::new(None);
 
 struct Mem;
 
-struct ReservedFrame {
-    frame: FrameNumber,
-    committed: bool,
-}
+struct Owner(FrameNumber);
 
-impl ReservedTableFrame for ReservedFrame {
+impl TableFrameOwner for Owner {
     fn number(&self) -> FrameNumber {
-        self.frame
-    }
-
-    fn commit(mut self) -> FrameNumber {
-        self.committed = true;
-        self.frame
+        self.0
     }
 }
 
-impl Drop for ReservedFrame {
+impl Drop for Owner {
     fn drop(&mut self) {
-        if !self.committed {
-            Mem.free_frame(self.frame);
-        }
-    }
-}
-
-impl FrameMemory for Mem {
-    type ReservedFrame = ReservedFrame;
-
-    fn reserve_frame(&mut self) -> Result<Self::ReservedFrame, page_table::FrameExhausted> {
-        let frame = with_ledger(|ledger| {
-            let mut number = 1u64;
-            while ledger.live.contains(&number) {
-                number += 1;
-            }
-            ledger.live.insert(number);
-            number
-        });
-        LEDGER2
-            .lock()
-            .unwrap()
-            .get_or_insert_with(Tables::default)
-            .0
-            .insert(
-                frame,
-                Box::into_raw(Box::new(std::array::from_fn(|_| Pte::invalid()))),
-            );
-        Ok(ReservedFrame {
-            frame: FrameNumber(frame as usize),
-            committed: false,
-        })
-    }
-    fn free_frame(&mut self, frame: FrameNumber) {
-        let in_live = with_ledger(|l| l.live.take(&(frame.0 as u64))).is_some();
+        let frame = self.0;
+        let in_live = with_ledger(|ledger| ledger.live.take(&(frame.0 as u64))).is_some();
         assert!(
             in_live,
-            "freed unheld frame {:#x} (absent from live set)",
+            "returned unheld frame {:#x} (absent from live set)",
             frame.0
         );
-        let p = LEDGER2
+        let storage = TABLES
             .lock()
             .unwrap()
             .as_mut()
             .unwrap()
             .0
             .remove(&(frame.0 as u64));
-        assert!(p.is_some(), "freed frame without storage {:#x}", frame.0);
-        unsafe { drop(Box::from_raw(p.unwrap())) };
+        assert!(
+            storage.is_some(),
+            "returned frame without storage {:#x}",
+            frame.0
+        );
+        // SAFETY: allocation was created by Box::into_raw for this unique owner and removed once.
+        unsafe { drop(Box::from_raw(storage.unwrap())) };
     }
+}
+
+fn allocate_owner() -> Owner {
+    let frame = with_ledger(|ledger| {
+        let mut number = 1u64;
+        while ledger.live.contains(&number) {
+            number += 1;
+        }
+        assert!(ledger.live.insert(number));
+        number
+    });
+    let previous = TABLES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Tables::default)
+        .0
+        .insert(
+            frame,
+            Box::into_raw(Box::new(std::array::from_fn(|_| Pte::invalid()))),
+        );
+    assert!(previous.is_none());
+    Owner(FrameNumber(frame as usize))
+}
+
+fn supply(count: usize) -> Vec<Owner> {
+    (0..count).map(|_| allocate_owner()).collect()
+}
+
+impl TableFrameMemory for Mem {
+    type FrameOwner = Owner;
+
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [page_table::Pte; 512] {
-        let mut g = LEDGER2.lock().unwrap();
-        let t = g
+        let mut guard = TABLES.lock().unwrap();
+        let table = guard
             .as_mut()
             .unwrap()
             .0
             .get_mut(&(frame.0 as u64))
             .expect("accessed unheld table");
-        unsafe { &mut **t }
+        // SAFETY: tests serialize through TABLES; TableTree is the only accessor while alive.
+        unsafe { &mut **table }
     }
 }
 
 fn flags() -> u64 {
     page_table::flags::V | page_table::flags::R | page_table::flags::W | page_table::flags::U
-}
-
-fn publish(tree: &mut TableTree<Mem, 3>, prepared: PreparedTranslation<ReservedFrame>) {
-    tree.publish(prepared);
 }
 
 fn map(
@@ -121,46 +115,70 @@ fn map(
     ppn: Ppn,
     flags: u64,
 ) -> Result<(), MapError> {
-    let prepared = tree.prepare_map(vpn, count, ppn, flags)?;
-    publish(tree, prepared);
+    let preflight = tree.preflight_map(vpn, count, ppn, flags)?;
+    let prepared = tree
+        .prepare(preflight, supply(preflight.required_frames()))
+        .map_err(|failure| failure.error)?;
+    let outcome = tree.publish(prepared);
+    assert!(outcome.unused.is_empty());
+    assert!(outcome.retired.is_empty());
     Ok(())
 }
 
 #[test]
-fn drop_chain_accounting() {
+fn max_work_one_drain_returns_every_owner_once() {
     *LEDGER.lock().unwrap() = Some(Ledger::default());
-    let data_frames: Vec<u64> = (0x1000..0x1100).collect(); // 模拟数据帧（不经 Mem 分配）
+    *TABLES.lock().unwrap() = Some(Tables::default());
+    let data_frames: Vec<u64> = (0x1000..0x1100).collect();
 
-    {
-        let mut tree = TableTree::<Mem, 3>::new(Mem).unwrap();
-        // ELF 式逐页映射（低地址区）
-        for vpn in 0x10..0x50 {
-            map(
-                &mut tree,
-                Vpn(vpn),
-                1,
-                Ppn(data_frames[vpn - 0x10] as usize),
-                flags(),
-            )
-            .unwrap();
-        }
-        // 大跨度映射触发多级分支与 mega 分裂
-        for i in 0..4 {
-            map(
-                &mut tree,
-                Vpn(0x200 + i * 0x150),
-                0x40,
-                Ppn(0x5000 + i * 0x400),
-                flags(),
-            )
-            .unwrap();
-        }
-        // mega 区域部分覆盖 → 分裂路径
-        map(&mut tree, Vpn(0x300 + 0x11), 1, Ppn(0x9000), flags()).unwrap();
-        let _ = &mut tree;
-    } // Drop：递归释放全部表帧
+    let root = allocate_owner();
+    let mut tree = TableTree::<Mem, 3>::new(Mem, root);
+    for vpn in 0x10..0x50 {
+        map(
+            &mut tree,
+            Vpn(vpn),
+            1,
+            Ppn(data_frames[vpn - 0x10] as usize),
+            flags(),
+        )
+        .unwrap();
+    }
+    for i in 0..4 {
+        map(
+            &mut tree,
+            Vpn(0x200 + i * 0x150),
+            0x40,
+            Ppn(0x5000 + i * 0x400),
+            flags(),
+        )
+        .unwrap();
+    }
+    map(&mut tree, Vpn(0x300 + 0x11), 1, Ppn(0x9000), flags()).unwrap();
 
-    with_ledger(|l| {
-        assert!(l.live.is_empty(), "leaked table frames: {:?}", l.live);
+    let mut cursor = tree.begin_drain();
+    let mut work = 0usize;
+    loop {
+        match tree.drain_step(&mut cursor) {
+            DrainStep::Progress => work += 1,
+            DrainStep::Retired(owner) => {
+                work += 1;
+                drop(owner);
+            }
+            DrainStep::Complete => break,
+        }
+    }
+    assert!(
+        work > page_table::ENTRIES,
+        "drain did not advance incrementally"
+    );
+    drop(tree.finish_drain());
+
+    with_ledger(|ledger| {
+        assert!(
+            ledger.live.is_empty(),
+            "leaked table frames: {:?}",
+            ledger.live
+        );
     });
+    assert!(TABLES.lock().unwrap().as_ref().unwrap().0.is_empty());
 }

@@ -497,6 +497,37 @@ impl MemoryCharge {
     }
 }
 
+impl funded_frame::QuotaCredit for MemoryCharge {
+    type Error = PoolError;
+
+    fn split(&mut self, pages: usize) -> Result<Self, Self::Error> {
+        MemoryCharge::split(self, pages)
+    }
+
+    fn merge(
+        &mut self,
+        mut other: Self,
+    ) -> Result<(), funded_frame::MergeFailure<Self, Self::Error>> {
+        let credit = other
+            .credit
+            .take()
+            .expect("MemoryPool charge ownership already transferred");
+        match self
+            .credit
+            .as_mut()
+            .expect("MemoryPool charge ownership already transferred")
+            .merge(credit)
+        {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let error = failure.error();
+                other.credit = Some(failure.into_token());
+                Err(funded_frame::MergeFailure::new(error, other))
+            }
+        }
+    }
+}
+
 impl Drop for MemoryCharge {
     fn drop(&mut self) {
         let Some(credit) = self.credit.take() else {

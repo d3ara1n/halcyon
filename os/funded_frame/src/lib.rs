@@ -30,9 +30,42 @@ pub trait QuotaSource {
     fn reserve(&self, pages: usize) -> Result<Self::Reservation, Self::Error>;
 }
 
+/// 已提交页额度 credit 的守恒变换。split 失败必须保持 `self` 不变；merge
+/// 失败必须同时保持 `self` 不变并归还传入 owner。
+pub trait QuotaCredit: Sized {
+    type Error;
+
+    /// 从 `self` 切出恰好 `pages` 的 credit，成功后 `self` 保留其余页。
+    fn split(&mut self, pages: usize) -> Result<Self, Self::Error>;
+    fn merge(&mut self, other: Self) -> Result<(), MergeFailure<Self, Self::Error>>;
+}
+
+#[derive(Debug)]
+pub struct MergeFailure<T, E> {
+    error: E,
+    owner: T,
+}
+
+impl<T, E> MergeFailure<T, E> {
+    pub const fn new(error: E, owner: T) -> Self {
+        Self { error, owner }
+    }
+
+    pub const fn error(&self) -> &E {
+        &self.error
+    }
+
+    pub fn into_parts(self) -> (E, T) {
+        (self.error, self.owner)
+    }
+}
+
 /// 尚未发布的物理 extent。析构必须把 extent 归还库存。
-pub trait PhysicalClaim {
+pub trait PhysicalClaim: Sized {
     fn pages(&self) -> usize;
+
+    /// 在严格内部页边界消费 owner 并切成相邻的左右 owner。
+    fn split_at(self, left_pages: usize) -> (Self, Self);
 
     /// 在不持库存锁时把完整 extent 清零。实现必须不可失败。
     fn clear(&mut self);
@@ -57,6 +90,19 @@ pub enum FundError<Q, P> {
     Physical(P),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecomposeError<E> {
+    InvalidSplit,
+    Credit(E),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombineError<E> {
+    PageOverflow,
+    ExtentLimit,
+    Credit(E),
+}
+
 /// 与一组物理 extent 同寿命的页额度 credit。
 ///
 /// 字段顺序保证自然析构先归还物理 extent，再归还额度；跨两类账本的瞬时交接始终
@@ -66,7 +112,7 @@ pub struct Funded<C, P, const N: usize> {
     claims: [Option<P>; N],
     claim_count: usize,
     pages: usize,
-    credit: C,
+    credit: Option<C>,
 }
 
 impl<C, P, const N: usize> Funded<C, P, N> {
@@ -85,7 +131,103 @@ impl<C, P, const N: usize> Funded<C, P, N> {
     }
 
     pub fn credit(&self) -> &C {
-        &self.credit
+        self.credit
+            .as_ref()
+            .expect("merged funded donor has no credit")
+    }
+}
+
+impl<C, P, const N: usize> Funded<C, P, N>
+where
+    C: QuotaCredit,
+    P: PhysicalClaim,
+{
+    /// 保留逻辑前缀，并同步切出 extent 集与同源 credit 的后缀；不分配。
+    /// 失败保持 `self` 不变。
+    pub fn split_off(&mut self, left_pages: usize) -> Result<Self, DecomposeError<C::Error>> {
+        if left_pages == 0 || left_pages >= self.pages {
+            return Err(DecomposeError::InvalidSplit);
+        }
+        let original_pages = self.pages;
+        let right_pages = original_pages - left_pages;
+        let right_credit = self
+            .credit
+            .as_mut()
+            .expect("merged funded donor cannot be split")
+            .split(right_pages)
+            .map_err(DecomposeError::Credit)?;
+
+        let original_count = self.claim_count;
+        let mut right_claims: [Option<P>; N] = core::array::from_fn(|_| None);
+        let mut left_count = 0usize;
+        let mut right_count = 0usize;
+        let mut cursor = 0usize;
+        for index in 0..original_count {
+            let claim = self.claims[index]
+                .take()
+                .expect("funded extent slot is empty");
+            let claim_pages = claim.pages();
+            let end = cursor + claim_pages;
+            if end <= left_pages {
+                self.claims[left_count] = Some(claim);
+                left_count += 1;
+            } else if cursor >= left_pages {
+                right_claims[right_count] = Some(claim);
+                right_count += 1;
+            } else {
+                let (left, right) = claim.split_at(left_pages - cursor);
+                self.claims[left_count] = Some(left);
+                left_count += 1;
+                right_claims[right_count] = Some(right);
+                right_count += 1;
+            }
+            cursor = end;
+        }
+        assert_eq!(
+            cursor, original_pages,
+            "funded extent geometry is incomplete"
+        );
+        self.claim_count = left_count;
+        self.pages = left_pages;
+        Ok(Self {
+            claims: right_claims,
+            claim_count: right_count,
+            pages: right_pages,
+            credit: Some(right_credit),
+        })
+    }
+
+    /// 把另一完整 funded owner 追加为逻辑后缀；失败保持双方不变。
+    /// 成功后 donor 变为空 owner，只能查询或析构。
+    pub fn merge_from(&mut self, donor: &mut Self) -> Result<(), CombineError<C::Error>> {
+        let Some(pages) = self.pages.checked_add(donor.pages) else {
+            return Err(CombineError::PageOverflow);
+        };
+        if self.claim_count + donor.claim_count > N {
+            return Err(CombineError::ExtentLimit);
+        }
+        let donor_credit = donor
+            .credit
+            .take()
+            .expect("merged funded donor cannot be merged again");
+        if let Err(failure) = self
+            .credit
+            .as_mut()
+            .expect("merged funded receiver has no credit")
+            .merge(donor_credit)
+        {
+            let (error, credit) = failure.into_parts();
+            donor.credit = Some(credit);
+            return Err(CombineError::Credit(error));
+        }
+        for slot in &mut donor.claims[..donor.claim_count] {
+            self.claims[self.claim_count] = slot.take();
+            self.claim_count += 1;
+        }
+        self.pages = pages;
+        donor.claim_count = 0;
+        donor.pages = 0;
+        Ok(())
     }
 }
 
@@ -149,7 +291,7 @@ where
         claims,
         claim_count,
         pages,
-        credit,
+        credit: Some(credit),
     })
 }
 

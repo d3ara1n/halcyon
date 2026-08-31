@@ -628,10 +628,10 @@ pub fn create(
                     core::mem::take(&mut entries),
                 )
                 .expect("TunnelCreate reservation must remain owned");
-            completion.install(published);
+            published
         },
     );
-    let (_, synchronization) = match committed {
+    let (published, synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
             let permits = {
@@ -652,6 +652,7 @@ pub fn create(
     };
     drop(connection_state);
     drop(table);
+    completion.install(published);
     synchronization.start();
     Ok(plan)
 }
@@ -829,11 +830,10 @@ pub fn attach(
                     core::mem::take(&mut entries),
                 )
                 .expect("TunnelAttach reservation must remain owned");
-            completion.install(published);
-            consumed
+            (consumed, published)
         },
     );
-    let (consumed, synchronization) = match committed {
+    let ((consumed, published), synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
             let permits = {
@@ -855,6 +855,7 @@ pub fn attach(
     drop(connection_state);
     drop(table);
     drop(consumed); // invitation 被消费而非关闭，不执行 lifecycle callback。
+    completion.install(published);
     synchronization.start();
     Ok(plan)
 }
@@ -955,11 +956,10 @@ pub(crate) fn close_handle(
             );
             let notice = commit_side_close(&endpoint, &mut connection_state);
             retire.install_notice(notice);
-            completion.install(published);
-            entry
+            (entry, published)
         },
     );
-    let (entry, synchronization) =
+    let ((entry, published), synchronization) =
         match committed {
             Ok(committed) => committed,
             Err(_) => {
@@ -972,6 +972,7 @@ pub(crate) fn close_handle(
     drop(connection_state);
     drop(table);
     drop(entry.into_parts()); // lifecycle 已由本事务提交，不重复调用对象 callback。
+    completion.install(published);
     synchronization.start();
     Ok(plan)
 }
@@ -998,8 +999,9 @@ pub(crate) fn close_detached(
     assert_eq!(installed, lease, "detached Tunnel close lease changed");
     let published = space.commit_object_unmap(prepared);
     let notice = commit_side_close(&endpoint, &mut connection_state);
-    let (retired, batch) = space.retire_published_change(published);
+    let (retired, batch, table_owners) = space.retire_published_change(published);
     drop(space);
+    drop(table_owners);
     retire_lease(&endpoint.connection, lease, batch);
     owner.space.lock().complete_retired_change(retired);
     drop(connection_state);

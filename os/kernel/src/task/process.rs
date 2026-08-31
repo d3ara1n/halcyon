@@ -441,7 +441,7 @@ fn create_staged(
 fn prepare_memory_binding(
     process: &Arc<Process>,
     pool: Arc<super::memory_pool::MemoryPool>,
-) -> Result<super::proc::BoundAddressSpace, SystemCallError> {
+) -> Result<alloc::boxed::Box<super::proc::BoundAddressSpace>, SystemCallError> {
     let binding = super::resources::PoolBinding::prepare(pool, process.resources.metadata())?;
     super::proc::BoundAddressSpace::new(binding).map_err(map_space_error)
 }

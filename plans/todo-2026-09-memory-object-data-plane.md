@@ -136,11 +136,52 @@ Derive 遵循单一发布事务：先解析并强持 parent，预留 sponsor/glo
 
 ## 切片 6：页表与匿名 backing 全面资金化
 
-让 TranslationTree 的 root、中间表、mega split 与未来 replacement 全部持有来源 Pool 的单页 funded frame；页表 Reserve 在 Commit 前准备完整资源，Publish 不分配。进程终止和 Unmap 通过可恢复游标分批 retire；`TableTree::Drop` 只接受已经 drained 的树并释放根。
+本片先闭合事务与退役机制，再迁移资源来源；禁止在 AddressSpace 锁内把 raw allocation 逐点替换成 funded broker。`MEMORY_POOL < ADDRESS_SPACE` 的 Lock Ladder 要求结构 preflight 与资源取得分离，页表和 backing owner 也必须跨 Publish、Synchronize、Retire 保持可追踪，不能提交为裸物理地址后重建。
 
-匿名 `OwnedBacking` 先预留整笔 charge，再由 broker 取得不超过 extent 上限的零态 backing。部分 Unmap 在页边界守恒切分 extents 与 charge；摘出的 slice 随 epoch retire，最后确认后同时退款。Running Map 与 Building ProcessMap 共用 planner、result promise、PTE reservation 与 shootdown。
+### 批次 6A：资金化 owner 与 metadata admission
 
-验证：root/table/backing 页数守恒、页表分配故障零发布、mega split、匿名多 extent、部分 Unmap/Protect、跨 hart stale translation、AddressSpace drain 中断接管、Drop 不递归兜底；重复 map/unmap 后 root Pool 与 FramePool 回到基线。
+为普通 funded backing 建立不暴露任意拆包的守恒 decomposition：物理 extent 与同源 `MemoryCharge` 同步 split/merge，任一产物仍是完整 affine owner；跨 extent 切分不分配，错误保留双方 owner。冻结并实现本片 metadata admission 表，至少覆盖 Region/backing slice、Prepared/Published/Retiring MemoryChange、内存调用 WaitContext 与 Remote completion：逐项给出 global/sponsor 上限、permit owner、退款终点和 Commit 后零分配证明。
+
+| metadata class | 全局 slots | 每 sponsor slots | 真实 owner / 退款终点 |
+|---|---:|---:|---|
+| Region capacity | 131072 | 4096 | `AddressSpacePermit`；Bound AddressSpace 析构 |
+| planner transaction capacity | 128 | 4 | `AddressSpacePermit`；Bound AddressSpace 析构 |
+| backing slice | 32768 | 4096 | `BackingSlicePermit`；对应 funded slice 析构 |
+| MemoryChange | 128 | 4 | `MemoryChangePermit`；Complete 后事务壳析构 |
+| memory WaitContext | 128 | 4 | `MemoryWaitPermit`；WaitContext 真实析构 |
+| Remote completion | 128 | 4 | `RemoteCompletionPermit`；completion 真实析构 |
+
+Region/transaction 的实际 storage 已由 `MemorySpace::new` 在 Bind 时按完整上限 eager 预留，因此两类 permit 同样由 AddressSpace 一次批量预付，而不是为每个纯逻辑节点另挂 kernel owner；全局 Region 容量据此把同时 Bound 且预留完整 planner 容量的地址空间限制为 32。backing 与 operation 类按实际对象逐项取得，接口在 6A 建立，分别到 6C/6E 才接入公开 mapping 的真实 owner。
+
+验证：funded owner 跨 extent split/merge、wrong-owner、边界与析构顺序；global/sponsor exhaustion、部分取得 rollback、creator/调用线程消散后的 permit 寿命；host debug/release 与 clippy。
+
+### 批次 6B：页表 owner 生命周期协议
+
+重构 `page_table` 的 FrameMemory seam：AddressSpace 锁内 preflight 只计算精确表页需求，锁外供给已清零 owner，重入后按树代次与结构复检并形成 PreparedTranslation。Publish 不分配、不进入 Pool，显式返回并行准备后未消费的 owner；分支 PTE 与 committed owner 同生灭，detach 返回 owner 而非裸 FrameNumber。Unmap Publish 剪除新空的中间表，但被摘表页随旧翻译进入 retire，不在确认前退款。页表 drain 由层级无关的可恢复游标逐批交出 owner；`TableTree::Drop` 只接受 owned 分支已排空的树并作常数终态检查，不递归兜底。该批先允许最窄 transitional owner 接线，用 host 模型证明协议后再迁移资金来源。
+
+验证：精确 preflight、资源不足零 PTE、并行 prepare 多余 owner、mega split、完整 Unmap 剪枝、确认前 owner 保活、`max_work=1` drain、未 drain Drop 拒绝与 drained Drop 常数终态；host debug/release 与 `just check`。
+
+批次 6A/6B 已完成实现闭包：资金化 owner 支持物理与额度同步 split/merge，metadata admission 覆盖本片六类真实 owner；页表运行时 seam 已改为 affine owner、精确 preflight/复检、显式 unused/retired 结果、Unmap 空表剪枝和层级无关 drain。单项发布严格绑定当前代次，同事务多项发布仅接受同代次 Map 批次；Running/Tunnel 以独占 Prepared gate 排除跨事务 stale，shared root 拒绝 Map/Protect。内核以最窄 raw token 接通 Publish→Remote ack→Retire；结果 owner 跨事务保活并在 AddressSpace 锁外析构，Building 即时发布仍使用过渡 adapter。Bound 状态改为独立堆对象以维持内核栈审计。host debug/release、page_table clippy、`just check` 与 virt core 通过。下一自然序进入 6C；全部 funded 表页的锁外供给、Building 编排和 root owner 移交仍严格留在 6D。
+
+### 批次 6C：分批 deferred retire
+
+Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 work-debt seam，由明确 owner hart 的 trap 安全出口按固定预算推进 backing/table/metadata retire；一批未完成即保持稳定游标并重新敲门，最后一批在容器锁外释放 owner 后才 Complete ledger token、兑销 mandatory operation、释放结果义务并唤醒 WaitContext。终止和 ProcessDrain 接管同一状态机，不建立同步扫描旁路；Commit 后不得取得 heap、Pool、WaitContext 或 Remote 槽。
+
+验证：单批与多批、原发起线程消散、终止接管、重复门铃、暂时无 runnable 工作、最后完成唯一发布、最小预算及 metadata exhaustion-before-Commit；host 纯逻辑模型、`just virt` 与 `just virt-stress`。
+
+### 批次 6D：root 与全部用户页表资金化
+
+让 TranslationTree 的 root、中间表、mega split 与未来 replacement 全部持有来源 Pool 的单页 funded owner。Bind 在 AddressSpace 发布前锁外准备 root；Map/Unmap/Protect 依 6B seam 锁外取得完整表页集合。PoolBinding 只表达绑定 authority 与资源来源，不保留与树重复的 root 所有权。错误保持 `QuotaExceeded`、`OutOfMemory`、`ReachLimit` 与 `ObjectBusy` 的既有区分。
+
+验证：Bind 与全部 mapping 路径的 root/table 页数守恒、quota/库存/extent/metadata 故障零发布、mega split、Unmap 后表页延迟退款、AddressSpace drain 中断接管；重复 map/unmap 后除 live root 外 Pool 与 FramePool 回到对应基线。
+
+### 批次 6E：匿名 backing 全面资金化
+
+匿名 `OwnedBacking` 由目标绑定 Pool 一次取得不超过 extent 上限的零态 funded backing。Running Map 与 Building ProcessMap 共用“锁内 Validate → 锁外 backing/table funding → 锁内复检并组装 Prepared change”的深层 planner；外层只保留各自 authority、Building lease、结果承诺与是否需要 shootdown 的差异。部分 Unmap 在 Commit 前预留全部切分 metadata，Publish 切出同时持 extents 与 charge 的 retiring slice，最后确认后交给 6C 在 AddressSpace 锁外退款；Protect 不释放仍被 live ledger 覆盖的 backing。
+
+验证：匿名多 extent、跨 extent 部分 Unmap、左右 live slice 与 retiring middle 守恒、Protect、跨 hart stale translation、乱序完成、调用线程消散、ProcessDrain 接管；ack 前 Pool/FramePool 均不退款，最终 Unmap/Drain 后恢复基线。完成后删除 `proc.rs` 中页表与匿名 backing 的 raw 调用点；Tunnel 与库存 selftest 的过渡 raw 路径分别留待切片 8 与切片 10。
+
+每批先跑对应 host debug/release、clippy 与 `just check`；6C 起运行 `just virt`，涉及 Remote/drain 的批次补 `just virt-stress`，本片收尾运行 `just virt-release` 与完整 `just acceptance`。外部同步继续遵守 RISC-V Privileged Architecture「Supervisor Memory-Management Fence Instruction」给出的 data fence → IPI → remote `SFENCE.VMA` → ack 边界；本片不做 ASID/range fence 优化。
 
 ## 切片 7：公共 MemoryObject 与统一 ObjectView
 

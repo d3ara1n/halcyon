@@ -5,7 +5,8 @@ use std::{
 };
 
 use funded_frame::{
-    FundError, Limits, PhysicalClaim, PhysicalSource, QuotaReservation, QuotaSource, fund,
+    CombineError, DecomposeError, FundError, Limits, MergeFailure, PhysicalClaim, PhysicalSource,
+    QuotaCredit, QuotaReservation, QuotaSource, fund,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -37,6 +38,7 @@ struct Credit {
     state: Rc<RefCell<QuotaState>>,
     events: Rc<RefCell<Vec<&'static str>>>,
     pages: usize,
+    active: bool,
 }
 
 impl QuotaSource for Quota {
@@ -74,6 +76,7 @@ impl QuotaReservation for Reservation {
             state: Rc::clone(&self.state),
             events: Rc::clone(&self.events),
             pages: self.pages,
+            active: true,
         }
     }
 }
@@ -91,10 +94,38 @@ impl Drop for Reservation {
 
 impl Drop for Credit {
     fn drop(&mut self) {
-        self.events.borrow_mut().push("quota");
-        let mut state = self.state.borrow_mut();
-        state.allocated -= self.pages;
-        state.available += self.pages;
+        if self.active {
+            self.events.borrow_mut().push("quota");
+            let mut state = self.state.borrow_mut();
+            state.allocated -= self.pages;
+            state.available += self.pages;
+        }
+    }
+}
+
+impl QuotaCredit for Credit {
+    type Error = QuotaError;
+
+    fn split(&mut self, pages: usize) -> Result<Self, Self::Error> {
+        if pages == 0 || pages >= self.pages {
+            return Err(QuotaError::Exhausted);
+        }
+        self.pages -= pages;
+        Ok(Self {
+            state: Rc::clone(&self.state),
+            events: Rc::clone(&self.events),
+            pages,
+            active: true,
+        })
+    }
+
+    fn merge(&mut self, mut other: Self) -> Result<(), MergeFailure<Self, Self::Error>> {
+        if !Rc::ptr_eq(&self.state, &other.state) {
+            return Err(MergeFailure::new(QuotaError::Exhausted, other));
+        }
+        self.pages += other.pages;
+        other.active = false;
+        Ok(())
     }
 }
 
@@ -161,6 +192,18 @@ impl PhysicalSource for Inventory {
 impl PhysicalClaim for Claim {
     fn pages(&self) -> usize {
         self.pages
+    }
+
+    fn split_at(mut self, left_pages: usize) -> (Self, Self) {
+        assert!(left_pages > 0 && left_pages < self.pages);
+        let right_pages = self.pages - left_pages;
+        self.pages = left_pages;
+        let right = Self {
+            state: Rc::clone(&self.state),
+            events: Rc::clone(&self.events),
+            pages: right_pages,
+        };
+        (self, right)
     }
 
     fn clear(&mut self) {
@@ -362,4 +405,130 @@ fn request_limits_fail_before_reserving_either_resource() {
     ));
     assert_eq!(quota.state.borrow().available, 16);
     assert_eq!(inventory.state.borrow().free, 16);
+}
+
+#[test]
+fn decomposition_splits_crossing_extent_and_restores_both_accounts() {
+    let (quota, inventory) = fixtures(32, &[4, 4]);
+    let mut left = fund::<_, _, 4>(&quota, &inventory, 8, LIMITS).unwrap();
+    let right = left
+        .split_off(6)
+        .unwrap_or_else(|error| panic!("decomposition failed: {error:?}"));
+
+    assert_eq!(left.pages(), 6);
+    assert_eq!(left.extent_count(), 2);
+    assert_eq!(
+        left.claims().map(PhysicalClaim::pages).collect::<Vec<_>>(),
+        [4, 2]
+    );
+    assert_eq!(right.pages(), 2);
+    assert_eq!(
+        right.claims().map(PhysicalClaim::pages).collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(quota.state.borrow().allocated, 8);
+    assert_eq!(inventory.state.borrow().claimed, 8);
+
+    drop(left);
+    assert_eq!(quota.state.borrow().allocated, 2);
+    assert_eq!(inventory.state.borrow().claimed, 2);
+    drop(right);
+    assert_eq!(quota.state.borrow().available, 32);
+    assert_eq!(inventory.state.borrow().free, 32);
+}
+
+#[test]
+fn invalid_decomposition_returns_the_original_owner() {
+    for split in [0, 6] {
+        let (quota, inventory) = fixtures(16, &[3, 3]);
+        let mut funded = fund::<_, _, 4>(&quota, &inventory, 6, LIMITS).unwrap();
+        let failure = match funded.split_off(split) {
+            Ok(_) => panic!("invalid decomposition succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(failure, DecomposeError::InvalidSplit);
+        assert_eq!(funded.pages(), 6);
+        assert_eq!(funded.extent_count(), 2);
+        drop(funded);
+        assert_eq!(quota.state.borrow().available, 16);
+        assert_eq!(inventory.state.borrow().free, 16);
+    }
+}
+
+#[test]
+fn merge_appends_geometry_and_preserves_credit() {
+    let (quota, inventory) = fixtures(32, &[4, 4]);
+    let mut left = fund::<_, _, 4>(&quota, &inventory, 8, LIMITS).unwrap();
+    let mut right = left
+        .split_off(6)
+        .unwrap_or_else(|error| panic!("decomposition failed: {error:?}"));
+    if let Err(error) = left.merge_from(&mut right) {
+        panic!("merge failed: {error:?}");
+    }
+
+    assert_eq!(left.pages(), 8);
+    assert_eq!(
+        left.claims().map(PhysicalClaim::pages).collect::<Vec<_>>(),
+        [4, 2, 2]
+    );
+    assert_eq!(quota.state.borrow().allocated, 8);
+    assert_eq!(inventory.state.borrow().claimed, 8);
+    assert_eq!(right.pages(), 0);
+    assert_eq!(right.extent_count(), 0);
+    drop(right);
+    drop(left);
+    assert_eq!(quota.state.borrow().available, 32);
+    assert_eq!(inventory.state.borrow().free, 32);
+}
+
+#[test]
+fn extent_limit_merge_returns_the_other_owner() {
+    let (quota, inventory) = fixtures(32, &[1, 1, 1, 1]);
+    let mut left = fund::<_, _, 2>(
+        &quota,
+        &inventory,
+        2,
+        Limits {
+            max_pages: 8,
+            max_extents: 2,
+        },
+    )
+    .unwrap();
+    let mut right = fund::<_, _, 2>(
+        &quota,
+        &inventory,
+        2,
+        Limits {
+            max_pages: 8,
+            max_extents: 2,
+        },
+    )
+    .unwrap();
+    let failure = left.merge_from(&mut right).unwrap_err();
+    assert_eq!(failure, CombineError::ExtentLimit);
+    assert_eq!(left.pages(), 2);
+    assert_eq!(right.pages(), 2);
+    drop(left);
+    drop(right);
+    assert_eq!(quota.state.borrow().available, 32);
+    assert_eq!(inventory.state.borrow().free, 32);
+}
+
+#[test]
+fn wrong_owner_merge_preserves_both_funded_owners() {
+    let (left_quota, left_inventory) = fixtures(8, &[2]);
+    let (right_quota, right_inventory) = fixtures(8, &[2]);
+    let mut left = fund::<_, _, 4>(&left_quota, &left_inventory, 2, LIMITS).unwrap();
+    let mut right = fund::<_, _, 4>(&right_quota, &right_inventory, 2, LIMITS).unwrap();
+
+    let failure = left.merge_from(&mut right).unwrap_err();
+    assert_eq!(failure, CombineError::Credit(QuotaError::Exhausted));
+    assert_eq!(left.pages(), 2);
+    assert_eq!(right.pages(), 2);
+    drop(left);
+    drop(right);
+    assert_eq!(left_quota.state.borrow().available, 8);
+    assert_eq!(left_inventory.state.borrow().free, 8);
+    assert_eq!(right_quota.state.borrow().available, 8);
+    assert_eq!(right_inventory.state.borrow().free, 8);
 }
