@@ -5,7 +5,10 @@
 //! 内核永久占用与 boot-held 区间，再从补集中保留库存元数据；只有最终补集
 //! 发布为空闲。
 
+use alloc::sync::Arc;
+
 use frame_pool::{ArenaMetadata, ExtentGeometry, FramePool, MAX_ARENAS, metadata_bytes};
+use funded_frame::{Limits as FundingLimits, PhysicalClaim, PhysicalSource, QuotaSource};
 use memory_supply::{HeapChunkTicket, Planner, Range as SupplyRange, Requirements, SystemSupply};
 use page_table::{FrameNumber, PAGE_BITS};
 
@@ -13,6 +16,7 @@ use crate::{
     board::{BoardInfo, MAX_MEMORY_REGIONS, MAX_PLATFORM_RESERVATIONS},
     external, mm,
     sync::Spinlock,
+    task::memory_pool::{MemoryCharge, MemoryPool, PreparedMemoryCharge},
 };
 
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
@@ -29,6 +33,8 @@ const MAX_CLASSIFIED_RANGES: usize = MAX_MEMORY_REGIONS
 const HEAP_CHUNK_SIZE: usize = 1 << 20;
 const HEAP_CHUNK_LIMIT: usize = 16;
 const RECOVERY_TICKET_LIMIT: usize = 0;
+/// 单事务 extent storage 的独立硬上限。
+const MAX_FUNDED_EXTENTS: usize = 64;
 
 type KernelFramePool = FramePool<'static>;
 
@@ -426,6 +432,164 @@ fn clear_system_range(range: SupplyRange) {
     unsafe {
         core::ptr::write_bytes(mm::phys_to_virt(range.start()) as *mut u8, 0, range.len());
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserClaimError {
+    OutOfMemory,
+}
+
+/// 已从 user inventory 摘出、尚未发布给 backing 的 extent。
+struct ClaimedUserExtent {
+    geometry: Option<ExtentGeometry>,
+    cleared: bool,
+}
+
+impl ClaimedUserExtent {
+    fn new(geometry: ExtentGeometry) -> Self {
+        Self {
+            geometry: Some(geometry),
+            cleared: false,
+        }
+    }
+
+    fn geometry(&self) -> ExtentGeometry {
+        self.geometry
+            .expect("claimed user extent ownership already transferred")
+    }
+}
+
+impl PhysicalClaim for ClaimedUserExtent {
+    fn pages(&self) -> usize {
+        self.geometry().count()
+    }
+
+    fn clear(&mut self) {
+        assert!(!self.cleared, "claimed user extent cleared twice");
+        let geometry = self.geometry();
+        clear_claimed(geometry.base(), geometry.count());
+        self.cleared = true;
+    }
+}
+
+impl Drop for ClaimedUserExtent {
+    fn drop(&mut self) {
+        if let Some(geometry) = self.geometry.take() {
+            with_pool(|pool| pool.dealloc(geometry.base(), geometry.count()));
+        }
+    }
+}
+
+struct UserInventory;
+
+impl PhysicalSource for UserInventory {
+    type Claim = ClaimedUserExtent;
+    type Error = UserClaimError;
+
+    fn claim_largest(&self, max_pages: usize) -> Result<Self::Claim, Self::Error> {
+        let (base, count) =
+            with_pool(|pool| pool.alloc_largest(max_pages)).ok_or(UserClaimError::OutOfMemory)?;
+        let geometry =
+            ExtentGeometry::new(base, count).expect("FramePool returned invalid geometry");
+        Ok(ClaimedUserExtent::new(geometry))
+    }
+}
+
+struct PoolQuota<'a>(&'a Arc<MemoryPool>);
+
+impl QuotaSource for PoolQuota<'_> {
+    type Reservation = PreparedMemoryCharge;
+    type Error = memory_pool::PoolError;
+
+    fn reserve(&self, pages: usize) -> Result<Self::Reservation, Self::Error> {
+        MemoryPool::reserve_charge(self.0, pages)
+    }
+}
+
+type UserFundedInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, MAX_FUNDED_EXTENTS>;
+
+/// 普通 user supply 的资金化 backing；自然析构先归还物理 extent，再退 Pool charge。
+pub(crate) struct FundedFrames {
+    inner: UserFundedInner,
+}
+
+impl FundedFrames {
+    pub(crate) fn pages(&self) -> usize {
+        self.inner.pages()
+    }
+
+    pub(crate) fn extent_count(&self) -> usize {
+        self.inner.extent_count()
+    }
+
+    pub(crate) fn extents(&self) -> impl ExactSizeIterator<Item = (FrameNumber, usize)> {
+        self.inner
+            .claims()
+            .map(|claim| (claim.geometry().base(), claim.geometry().count()))
+    }
+}
+
+/// 取得普通 user-funded backing。页数与 extent 上限由具体消费方的工作边界决定。
+pub(crate) fn fund_user_frames(
+    pool: &Arc<MemoryPool>,
+    pages: usize,
+    limits: FundingLimits,
+) -> Result<FundedFrames, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
+    funded_frame::fund::<_, _, MAX_FUNDED_EXTENTS>(&PoolQuota(pool), &UserInventory, pages, limits)
+        .map(|inner| {
+            assert_eq!(
+                inner.credit().pages(),
+                inner.pages(),
+                "funded backing charge differs from physical geometry"
+            );
+            FundedFrames { inner }
+        })
+}
+
+/// 启动自检：真实穿过 quota、库存、清零、commit、extent 上限回滚与自然退款。
+pub(crate) fn funded_selftest(root: &Arc<MemoryPool>) {
+    const PAGES: usize = 3;
+
+    let pool_baseline = root.snapshot();
+    let frames_baseline = free_frames();
+    let funded = fund_user_frames(
+        root,
+        PAGES,
+        FundingLimits {
+            max_pages: PAGES,
+            max_extents: PAGES,
+        },
+    )
+    .expect("funded frame self-test failed");
+    assert_eq!(funded.pages(), PAGES);
+    assert!((1..=PAGES).contains(&funded.extent_count()));
+    assert_eq!(
+        funded.extents().map(|(_, pages)| pages).sum::<usize>(),
+        PAGES
+    );
+    let committed = root.snapshot();
+    assert_eq!(committed.available, pool_baseline.available - PAGES as u64);
+    assert_eq!(committed.allocated, pool_baseline.allocated + PAGES as u64);
+    assert_eq!(free_frames(), frames_baseline - PAGES);
+    drop(funded);
+    assert_eq!(root.snapshot(), pool_baseline);
+    assert_eq!(free_frames(), frames_baseline);
+
+    let limited = fund_user_frames(
+        root,
+        PAGES,
+        FundingLimits {
+            max_pages: PAGES,
+            max_extents: 1,
+        },
+    );
+    assert!(matches!(limited, Err(funded_frame::FundError::ExtentLimit)));
+    assert_eq!(root.snapshot(), pool_baseline);
+    assert_eq!(free_frames(), frames_baseline);
+    log!(
+        Memory,
+        "funded frame self-test passed: commit, rollback, and dual-ledger refund ok"
+    );
 }
 
 fn clear_claimed(base: FrameNumber, count: usize) {

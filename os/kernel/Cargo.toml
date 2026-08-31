@@ -20,5 +20,6 @@ remote_call = { path = "../remote_call" }
 memory_space = { path = "../memory_space" }
 memory_supply = { path = "../memory_supply" }
 memory_pool = { path = "../memory_pool" }
+funded_frame = { path = "../funded_frame" }
 metadata_admission = { path = "../metadata_admission" }
 num-traits = { version = "0.2", default-features = false }

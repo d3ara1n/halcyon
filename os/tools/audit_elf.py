@@ -6,7 +6,7 @@
 2. FP 指令与浮点 CSR（fcsr/fflags/frm）访问只允许出现在 .text.ctx_fp
    （capability-guarded 的用户 FP helper）；其余任何 section 不得出现。
 
-3. 单函数最大栈帧不超过 --max-frame（默认 0x1800）：扫描 sp 减量
+3. 单函数最大栈帧不超过 --max-frame（默认 0x2800）：扫描 sp 减量
    （含 lui+addi 装载立即数后 sub sp,sp,reg 的模式），防止巨型栈帧
    跳过 guard 洞落入邻槽（notes/impls/mm.md「栈窗口」的构建期兑底）；
    max-frame 必须不大于链接脚本 STACK_GUARD（本脚本从 ELF 符号表读取
@@ -23,11 +23,11 @@ import sys
 READELF = "riscv64-elf-readelf"
 OBJDUMP = "riscv64-elf-objdump"
 
-# 默认帧上限：guard 洞跨度的安全余量（必须 ≤ 链接脚本 STACK_GUARD，
-# 本脚本从 ELF 符号表读取并强制）。当前最大合法函数为 compiler_builtins
-# memmove（debug 构建 0x1620）；release 帧更小，同一阈值对两 MODE 都成立。
+# 默认帧上限：guard 洞跨度保留 0x800 安全余量（必须 ≤ 链接脚本
+# STACK_GUARD，本脚本从 ELF 符号表读取并强制）。当前 debug 最大合法函数
+# 来自固定容量 funded-frame broker；release 帧更小，同一阈值对两 MODE 都成立。
 # 更深的调用链总和超限由 guard 洞兑底（notes/impls/mm.md「栈窗口」）。
-DEFAULT_MAX_FRAME = 0x1800
+DEFAULT_MAX_FRAME = 0x2800
 
 # objdump 反汇编行：地址: 字节 助记符 操作数。字节列为若干组 4 位
 # 十六进制（RVC 为一组，32 位指令为两组连写），后随助记符；'#' 后为

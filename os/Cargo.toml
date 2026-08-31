@@ -15,6 +15,7 @@ members = [
     "remote_call",
     "memory_supply",
     "memory_pool",
+    "funded_frame",
     "metadata_admission",
 ]
 resolver = "2"

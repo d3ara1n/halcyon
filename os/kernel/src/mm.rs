@@ -48,7 +48,7 @@ const DIRECT_VPN2_LIMIT: usize = 255;
 const STACK_WINDOW_SLOT: usize = ENTRIES - 1;
 
 /// 栈窗口叶表预留数（2MiB 单元数）：当前平台最大跨度
-/// (0x40000 + 2×0x2000) * 8 ≈ 2.13MiB 跨两个单元，余量为扩展预留。
+/// (0x40000 + 2×0x3000) * 8 = 2.19MiB，跨两个单元，余量为扩展预留。
 const WINDOW_LEAF_MAX: usize = 4;
 
 /// 每个 `no-map` 区间的两个边界在 Sv39 下至多各需要两张下级表；末端

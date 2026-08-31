@@ -28,6 +28,7 @@ pub fn load(address: usize, length: usize) {
     task::resources::init();
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
+    frame::funded_selftest(&root_pool);
     let pid = task::alloc_pid();
     assert_eq!(pid, 1, "initial process must receive PID 1");
     let root_job = task::job::Job::root();

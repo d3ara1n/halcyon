@@ -106,11 +106,13 @@ Derive 遵循单一发布事务：先解析并强持 parent，预留 sponsor/glo
 
 ## 切片 3：funded frame broker
 
-在 frame inventory 之上建立唯一资金化取得事务：先从 Pool 预留页额度，释放 Pool lock；再从 user FramePool claim 有界 extents，释放 inventory lock；锁外清零；最后把 reservation 不可失败地提交为与 extents 同寿命的 `MemoryCharge`。任一提交前失败按反向 affine owner 自动回滚，不嵌套 Pool、FramePool、AddressSpace 或 heap 锁。
+在 frame inventory 之上建立唯一资金化取得事务。事务编排由 host 与内核共用的 `os/funded_frame` 纯逻辑 crate 拥有，以 quota/inventory 两个仿射端口表达：先从 Pool 预留页额度，释放 Pool lock；再以固定容量、调用方给定的页数与 extent 工作边界从 user FramePool 逐段 claim；全部取得后锁外清零；最后把 reservation 不可失败地提交为与 extents 同寿命的 `MemoryCharge`。任一提交前失败按反向 owner 顺序先归物理、后退额度，不嵌套 Pool、FramePool、AddressSpace 或 heap 锁。broker 的最终 owner 不公开任意拆包；backing 的守恒 split/merge 与锁外 retire 在实际消费该 owner 的切片 6 建立，避免先制造脱离生命周期宿主的转换 API。
 
-broker 分开提供普通 user-funded claim、从 boot-held 收编为 primordial funded backing、固定 system ticket 三类输入，输出类型不可互换。本片建立新 API 并禁止新增 raw user path；现有调用点先逐一登记迁移归属，在其所属后续切片完成前保留最窄 transitional adapter。selftest、静态内核页表和启动过渡若继续走系统路径，必须由物理分类而非注释宣称其归属；raw runtime API 的最终删除属于切片 10。
+普通 user-funded claim 在本片建立并禁止新增 raw user path；现有调用点先逐一登记迁移归属，在其所属后续切片完成前保留最窄 transitional adapter。boot-held payload 必须保留内容，不能复用普通 claim 的清零端口；其不可伪造 token 与 primordial funded adopt 由切片 5 随 bootstrap owner 一起建立，不在通用 broker 暴露可绕过清零的 generic adopt。固定 system ticket 已由 `SystemSupply` 分型，始终不进入 broker。selftest、静态内核页表和启动过渡若继续走系统路径，必须由物理分类而非注释宣称其归属；raw runtime API 的最终删除属于切片 10。
 
-验证：host 测试覆盖 quota 失败、物理失败、extent 上限、清零前放弃、commit、split/merge、retire、boot-held adopt 与 system/user 不可混用；故障注入后 Pool 方程与物理供给方程同时恢复。
+验证：broker host debug/release 覆盖 quota 失败、物理中途失败、extent 上限、非法 inventory claim、清零前放弃、commit、析构顺序与双方程恢复；MemoryPool 自身继续覆盖 charge split/merge。内核启动自检穿过真实 Pool/FramePool 的 commit、extent-limit rollback 与自然退款。boot-held adopt 在切片 5 以真实 typed token 验证；backing split/retire 在切片 6 与 AddressSpace 锁外收束一起验证。
+
+切片 3 已实现收口：`funded_frame` 共用事务、内核 quota/inventory adapters、私有 `FundedFrames` owner、真实启动自检与 64-extents 固定结构均已落地；host debug/release、clippy `-D warnings`、`just check` 与完整 `just acceptance` 通过。固定数组使 debug 最大单帧为 `0x2390`，按已确认的栈政策把纯虚拟 guard 扩至 `0x3000`、ELF audit 上限扩至 `0x2800`，virt debug stress/release core 与 sifive_u debug core 均验证通过。下一自然序进入切片 4。
 
 ## 切片 4：空壳进程与 Building 截止
 

@@ -277,7 +277,7 @@ mod tests {
     use super::*;
 
     /// 链接脚本同名常量的镜像（仅测试向量用；真值在 linker.ld）。
-    const GUARD: usize = 0x2000;
+    const GUARD: usize = 0x3000;
     const EMERGENCY: usize = 0x1000;
     const TOP_SLOT: usize = 511;
     const WINDOW: usize = 0xFFFF_FFFF_C000_0000;
@@ -298,15 +298,15 @@ mod tests {
     fn virt_span_fits_two_leaf_units() {
         let layout = virt_board();
         assert_eq!(layout.stride(), 0x40000 + 2 * GUARD);
-        assert_eq!(layout.span(), 0x44000 * 8);
-        assert_eq!(layout.span(), 0x220000); // 跨两个 2MiB 叶表单元
+        assert_eq!(layout.span(), 0x46000 * 8);
+        assert_eq!(layout.span(), 0x230000); // 跨两个 2MiB 叶表单元
     }
 
     #[test]
     fn sifive_span_fits_single_leaf() {
         let layout = sifive_board();
         assert_eq!(layout.stride(), 0xA000 + 2 * GUARD);
-        assert_eq!(layout.span(), 0xE000 * 8);
+        assert_eq!(layout.span(), 0x10000 * 8);
         assert!(layout.span() <= 1 << 21);
     }
 
@@ -381,7 +381,7 @@ mod tests {
     /// 要么仍落在槽内映射段、要么落入 guard 洞——永不进入相邻槽。
     #[test]
     fn max_frame_jump_cannot_cross_guard() {
-        let max_frame = 0x1800; // audit_elf.py DEFAULT_MAX_FRAME
+        let max_frame = 0x2800; // audit_elf.py DEFAULT_MAX_FRAME
         for layout in [virt_board(), sifive_board()] {
             assert!(layout.guard() >= max_frame);
             for slot in 0..layout.slots() {

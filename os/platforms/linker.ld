@@ -89,7 +89,7 @@ SECTIONS
        每槽 VA 布局（stride = STACK_SIZE + 2*STACK_GUARD）：
          [ 槽底 guard | formal | emergency guard | emergency ]
        物理侧每槽连续打包 STACK_SIZE（formal+emergency 相邻），guard 纯虚拟。 */
-    STACK_GUARD = 0x2000;
+    STACK_GUARD = 0x3000;
     EMERGENCY_SIZE = 0x1000;
     STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000;
     .stack_window STACK_WINDOW_VA_BASE (NOLOAD) : ALIGN(4096) {

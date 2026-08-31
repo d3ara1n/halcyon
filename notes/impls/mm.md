@@ -1,6 +1,6 @@
 # 内存管理
 
-方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分七层：启动物理供给规划、帧库存、MemoryPool 额度与准入、用户地址空间纯逻辑规划器、可 host 测试的页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
+方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分八层：启动物理供给规划、帧库存、MemoryPool 额度与准入、资金化帧取得 broker、用户地址空间纯逻辑规划器、可 host 测试的页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
 
 ## 启动物理供给与系统储备
 
@@ -59,7 +59,7 @@ pub struct FrameTracker {
 
 ## 物理供给验证
 
-16 项 FramePool host 用例覆盖库存结构、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero 和 system heap ticket 首次消费。系统储备批次收口时（验收拆档前的 full workload）virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前阶段收尾由 `just acceptance` 分别执行 debug stress、release core 与 sifive_u core。
+16 项 FramePool host 用例覆盖库存结构、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero、system heap ticket 首次消费，以及 funded broker 的真实 Pool/FramePool commit、extent-limit rollback 与双账本自然退款。系统储备批次收口时（验收拆档前的 full workload）virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前阶段收尾由 `just acceptance` 分别执行 debug stress、release core 与 sifive_u core。
 
 ## MemoryPool 额度与 metadata 准入
 
@@ -78,6 +78,14 @@ charge 与 delegation 使用不同的线性 reservation/credit 类型，所有�
 内核 `MemoryPool` 对象以 `Prepared → Committing → Active` 表达 Handle 发布事务。Prepared owner 在任何发布前失败时析构并回滚 parent reservation；Commit 后 child state 内嵌 credit、同时强持 parent，最后一个 core 引用消散时消费 child state、逐把锁把额度归父。`MemoryPoolQuery` 要求 READ，`MemoryPoolDerive` 要求 CREATE；child rights 必须是来源 rights 与 Pool 最大 rights 的子集，GRANT 为后续 Building binding 保留。root Handle 尚未交给 init，当前 syscall 对普通用户态保持 dormant，正式 bootstrap 交付属于后续切片。rinlib `MemoryPool` 是带 Drop close 的 affine owner，显式 `into_handle` 才把 authority 移回通用传输面。
 
 14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；6 项 admission 用例覆盖全局/本地耗尽、部分失败退款和 sponsor 强保活。启动自检另穿过错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用与最后引用退款；debug stress、release core 与 sifive_u core 的完整 acceptance 均通过。
+
+## 资金化帧取得 broker
+
+`os/funded_frame` 是 `no_std`、禁止 unsafe、零堆分配的事务编排 crate。它不认识 capability、锁或物理地址，只以 `QuotaSource/QuotaReservation` 与 `PhysicalSource/PhysicalClaim` 两组仿射端口执行同一条 `reserve quota → bounded claim → clear → commit` 路径。页数与 extent 数是调用方分别给出的工作边界；当前内核实例以栈上固定数组容纳最多 64 extents，其 debug 帧成本由栈 guard 与 ELF audit 共同约束。全部 extent 取得前不清零，因而库存中途失败、extent 超限或非法 claim 会先析构已取物理 owner，再析构 reservation 回滚额度；全部清零后 quota commit 由类型变为不可失败。
+
+内核 `task/memory_pool.rs` 的 `PreparedMemoryCharge` 与 `MemoryCharge` 把纯逻辑 `ChargeReservation/AllocatedCredit` 接回来源 Pool core：前者析构回滚 reserved，后者强持 Pool 并在最后析构时退 allocated。`frame.rs` 的 `ClaimedUserExtent` 只在 POOL 锁内摘取 geometry，锁外清零；`FundedFrames` 内部不可见的 `funded_frame::Funded` 按 extents 在前、charge 在后的字段顺序析构，且不提供可提前拆散两侧 owner 的公共入口。当前 broker 只开放普通 user-funded claim；保留内容的 boot-held adopt 等切片 5 建立不可伪造的启动 owner 后接入，system tickets 继续由 `SystemSupply` 的独立类型拥有。
+
+现有页表、匿名 backing、Tunnel 与库存自检仍使用登记在 `frame.rs` 的 transitional raw adapter，分别在后续所属切片迁移；因此当前 `FundedFrames` 只由启动自检消费，不进入 AddressSpace。后续 backing split/retire 必须在真实 backing owner 中同步切割 extent 与 charge，并遵守“AddressSpace 锁内只摘 owner、锁外先归物理后退额度”，不会向 generic broker 增加任意拆包。6 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、析构顺序与双方程恢复；内核启动自检验证真实锁与 RAII 接线。
 
 ## 页表模式选择
 
@@ -153,7 +161,7 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 正式内核栈的专用虚拟分区：高半区顶 vpn2 槽（链接脚本 `STACK_WINDOW_VA_BASE = 0xFFFFFFFFC0000000`，与直映射解耦——直映射槽数上限 255，满配也只到 510，与顶槽结构性互斥）。目的：栈向下溢出立即 store page fault，溢出即时可见（对照 `plans/DEBUG-PLAYBOOK.md` 的静默踩踏事故；构建期兑底见 os/tools/audit_elf.py）。
 
 - **布局真值链**：`os/stack_layout` 纯逻辑 crate 是几何唯一真值（构造期整体校验，host 可测）；数字只写在链接脚本（`STACK_SIZE`/`STACK_GUARD`/`EMERGENCY_SIZE`/`HART_NUM_LIMIT`/窗口基址）→ 汇编 `_ENTRY_CONSTS` 物化 → 内核 `mm::stack_layout()` 构造消费；audit_elf.py 从 ELF 符号表读 `STACK_GUARD` 构建期强制「单函数最大帧 ≤ guard 洞跨度」——否则一次 sp 下调整体越过洞落入邻槽，即时可见失效。
-- **布局**：每槽 `[槽底 guard | formal (stack_size − emergency) | emergency guard | emergency]`，步长 `stack_size + 2×guard`。formal sp 从 emergency guard 洞下方起；emergency 占槽顶、fatal 路径专用，独立 guard 使其溢出不再踩入 formal。物理侧按槽连续打包 `stack_size` 字节（formal+emergency 相邻），guard 纯虚拟不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**；该禁律由 debug 断言兜底（`phys_to_virt` 拒绝栈物理打包区，release 构建无检查）。qemu/virt 每槽物理量为 `0x40000`；sifive_u 为 `0xA000`（`0x9000` formal + `0x1000` emergency），覆盖 debug `memmove` 与事务调用链约 `0x58c0` 的组合实测峰值，同时保留两个当前最大 `0x1620` 帧以上余量。
+- **布局**：每槽 `[槽底 guard | formal (stack_size − emergency) | emergency guard | emergency]`，步长 `stack_size + 2×guard`。formal sp 从 emergency guard 洞下方起；emergency 占槽顶、fatal 路径专用，独立 guard 使其溢出不再踩入 formal。物理侧按槽连续打包 `stack_size` 字节（formal+emergency 相邻），guard 纯虚拟不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**；该禁律由 debug 断言兜底（`phys_to_virt` 拒绝栈物理打包区，release 构建无检查）。qemu/virt 每槽物理量为 `0x40000`；sifive_u 为 `0xA000`（`0x9000` formal + `0x1000` emergency）。固定容量 funded-frame broker 使当前 debug 最大单帧为 `0x2390`，因此 guard 洞为 `0x3000`，ELF audit 上限为保留 `0x800` 余量的 `0x2800`；两平台运行栈仍由 guard fault 与 acceptance 共同验证。
 - **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）按 `layout.mappings` 逐页映射（RW、不可执行——`flags::KERNEL_STACK` 无 X）、guard 洞置 invalid；所有 hart 与全部用户表共享同一子树。
 - **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + `layout.translate` 互逆）；`phys_to_virt` 只对 admitted direct-map range 成立，并在 debug 构建拒绝 `no-map`、范围外地址和栈物理打包区。同一栈物理页同时有直映射别名与窗口 VA，PA→VA 无唯一逆；SBI ecall 传 PA 前仍须经 `virt_to_phys`（console 缓冲在栈上即依赖此）。
 - **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；正常 ProcessDrain 在有界 Root 阶段逐槽剥离共享顶层项后才归还 root，`AddressSpace::drop` 只作未完成构造/回滚的防御兜底。

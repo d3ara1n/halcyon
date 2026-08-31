@@ -11,7 +11,10 @@ use erhino_shared::{
     memory_pool::MemoryPoolSnapshot,
     object::{Handle, Rights},
 };
-use memory_pool::{DelegationReservation, PoolError, PoolId, PoolState, PreparedChild};
+use memory_pool::{
+    AllocatedCredit, ChargeReservation, DelegationReservation, PoolError, PoolId, PoolState,
+    PreparedChild,
+};
 
 use super::{
     Thread,
@@ -42,6 +45,18 @@ enum PoolInner {
 enum Funding {
     Root,
     Child(Arc<MemoryPool>),
+}
+
+/// Pool 内已预留但尚未与物理 backing 配对的额度；析构自动回滚。
+pub(crate) struct PreparedMemoryCharge {
+    pool: Arc<MemoryPool>,
+    reservation: Option<ChargeReservation>,
+}
+
+/// 与 page-backed storage 同寿命的额度 owner；析构把 allocated 额度退回来源 Pool。
+pub(crate) struct MemoryCharge {
+    pool: Arc<MemoryPool>,
+    credit: Option<AllocatedCredit>,
 }
 
 impl MemoryPool {
@@ -309,7 +324,7 @@ impl MemoryPool {
         }
     }
 
-    fn snapshot(&self) -> MemoryPoolSnapshot {
+    pub(crate) fn snapshot(&self) -> MemoryPoolSnapshot {
         let inner = self.inner.lock();
         let snapshot = Self::active_state(&inner).snapshot();
         MemoryPoolSnapshot {
@@ -332,6 +347,18 @@ impl MemoryPool {
         Self::active_state_mut(&mut parent.inner.lock())
             .reserve_delegation(pages)
             .map_err(map_pool_error)
+    }
+
+    pub(crate) fn reserve_charge(
+        pool: &Arc<Self>,
+        pages: usize,
+    ) -> Result<PreparedMemoryCharge, PoolError> {
+        let pages = u64::try_from(pages).map_err(|_| PoolError::ArithmeticOverflow)?;
+        let reservation = Self::active_state_mut(&mut pool.inner.lock()).reserve_charge(pages)?;
+        Ok(PreparedMemoryCharge {
+            pool: Arc::clone(pool),
+            reservation: Some(reservation),
+        })
     }
 
     /// parent reserved→delegated 后把 child 从不可见 Prepared 转为 Active。
@@ -406,6 +433,65 @@ impl Drop for MemoryPool {
             PoolInner::Prepared(_) => {}
             PoolInner::Committing => panic!("MemoryPool dropped during its commit handoff"),
         }
+    }
+}
+
+impl funded_frame::QuotaReservation for PreparedMemoryCharge {
+    type Credit = MemoryCharge;
+
+    fn commit(mut self) -> Self::Credit {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("MemoryPool charge reservation completed twice");
+        let credit = MemoryPool::active_state_mut(&mut self.pool.inner.lock())
+            .commit_charge(reservation)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "reserved MemoryPool charge commit failed: {:?}",
+                    error.error()
+                )
+            });
+        MemoryCharge {
+            pool: Arc::clone(&self.pool),
+            credit: Some(credit),
+        }
+    }
+}
+
+impl Drop for PreparedMemoryCharge {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        MemoryPool::active_state_mut(&mut self.pool.inner.lock())
+            .rollback_charge(reservation)
+            .unwrap_or_else(|error| {
+                panic!("MemoryPool charge rollback failed: {:?}", error.error())
+            });
+    }
+}
+
+impl MemoryCharge {
+    pub(crate) fn pages(&self) -> usize {
+        usize::try_from(
+            self.credit
+                .as_ref()
+                .expect("MemoryPool charge ownership already transferred")
+                .pages(),
+        )
+        .expect("MemoryPool charge does not fit the architecture")
+    }
+}
+
+impl Drop for MemoryCharge {
+    fn drop(&mut self) {
+        let Some(credit) = self.credit.take() else {
+            return;
+        };
+        MemoryPool::active_state_mut(&mut self.pool.inner.lock())
+            .return_charge(credit)
+            .unwrap_or_else(|error| panic!("MemoryPool charge return failed: {:?}", error.error()));
     }
 }
 
