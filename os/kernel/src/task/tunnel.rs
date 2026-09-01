@@ -348,7 +348,7 @@ fn prepare_mapping(
     va: usize,
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
-) -> Result<PreparedObjectMapping, super::proc::ObjectMapFailure> {
+) -> Result<super::proc::ObjectMappingPlan, super::proc::ObjectMapFailure> {
     space.prepare_object_mapping(va, connection.pa, authorization, permits)
 }
 
@@ -564,8 +564,37 @@ pub fn create(
         }
     };
     let mut mapping = {
+        let (plan, pool) = {
+            let mut space = thread.process.space.lock();
+            match prepare_mapping(&connection_state, &mut space, va, authorization, permits) {
+                Ok(plan) => (plan, Arc::clone(space.pool())),
+                Err(failure) => {
+                    drop(space);
+                    cancel_writes(&connection, failure.permits);
+                    table
+                        .rollback(reservation.take().expect("TunnelCreate reservation exists"))
+                        .expect("TunnelCreate reservation must remain owned");
+                    return Err(map_space_error(failure.error));
+                }
+            }
+        };
+        let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+            Ok(owners) => owners,
+            Err(_) => {
+                let permits = thread
+                    .process
+                    .space
+                    .lock()
+                    .rollback_object_mapping_plan(plan);
+                cancel_writes(&connection, permits);
+                table
+                    .rollback(reservation.take().expect("TunnelCreate reservation exists"))
+                    .expect("TunnelCreate reservation must remain owned");
+                return Err(SystemCallError::OutOfMemory);
+            }
+        };
         let mut space = thread.process.space.lock();
-        match prepare_mapping(&connection_state, &mut space, va, authorization, permits) {
+        match space.complete_object_mapping(plan, owners) {
             Ok(prepared) => Some(prepared),
             Err(failure) => {
                 drop(space);
@@ -766,8 +795,37 @@ pub fn attach(
         }
     };
     let mut mapping = {
+        let (plan, pool) = {
+            let mut space = thread.process.space.lock();
+            match prepare_mapping(&connection_state, &mut space, va, authorization, permits) {
+                Ok(plan) => (plan, Arc::clone(space.pool())),
+                Err(failure) => {
+                    drop(space);
+                    cancel_writes(&invitation.connection, failure.permits);
+                    table
+                        .rollback(reservation.take().expect("TunnelAttach reservation exists"))
+                        .expect("TunnelAttach reservation must remain owned");
+                    return Err(map_space_error(failure.error));
+                }
+            }
+        };
+        let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+            Ok(owners) => owners,
+            Err(_) => {
+                let permits = thread
+                    .process
+                    .space
+                    .lock()
+                    .rollback_object_mapping_plan(plan);
+                cancel_writes(&invitation.connection, permits);
+                table
+                    .rollback(reservation.take().expect("TunnelAttach reservation exists"))
+                    .expect("TunnelAttach reservation must remain owned");
+                return Err(SystemCallError::OutOfMemory);
+            }
+        };
         let mut space = thread.process.space.lock();
-        match prepare_mapping(&connection_state, &mut space, va, authorization, permits) {
+        match space.complete_object_mapping(plan, owners) {
             Ok(prepared) => Some(prepared),
             Err(failure) => {
                 drop(space);
@@ -921,8 +979,27 @@ pub(crate) fn close_handle(
     }
     let lease = connection_state.leases[endpoint.side].ok_or(SystemCallError::ObjectClosed)?;
     let mut unmap = {
-        let mut space = thread.process.space.lock();
-        Some(space.prepare_object_unmap(lease).map_err(map_space_error)?)
+        let (plan, pool) = {
+            let mut space = thread.process.space.lock();
+            let plan = space.prepare_object_unmap(lease).map_err(map_space_error)?;
+            let pool = Arc::clone(space.pool());
+            (plan, pool)
+        };
+        let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+            Ok(owners) => owners,
+            Err(_) => {
+                thread.process.space.lock().rollback_object_unmap_plan(plan);
+                return Err(SystemCallError::OutOfMemory);
+            }
+        };
+        Some(
+            thread
+                .process
+                .space
+                .lock()
+                .complete_object_unmap(plan, owners)
+                .map_err(map_space_error)?,
+        )
     };
     let retire = match Arc::try_new(LeaseRetire::new(
         endpoint.connection.clone(),
@@ -1053,11 +1130,27 @@ pub(crate) fn close_detached(
         Some(lease),
         "detached Tunnel close lease changed before Commit"
     );
+    let (plan, pool) = {
+        let mut space = owner.space.lock();
+        let plan = match space.prepare_object_unmap(lease) {
+            Ok(plan) => plan,
+            Err(super::proc::SpaceError::Busy) => return Err(entry),
+            Err(error) => panic!("detached Tunnel close invariant failed: {error:?}"),
+        };
+        let pool = Arc::clone(space.pool());
+        (plan, pool)
+    };
+    let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+        Ok(owners) => owners,
+        Err(_) => {
+            owner.space.lock().rollback_object_unmap_plan(plan);
+            return Err(entry);
+        }
+    };
     let mut space = owner.space.lock();
-    let prepared = match space.prepare_object_unmap(lease) {
+    let prepared = match space.complete_object_unmap(plan, owners) {
         Ok(prepared) => prepared,
-        Err(super::proc::SpaceError::Busy) => return Err(entry),
-        Err(error) => panic!("detached Tunnel close invariant failed: {error:?}"),
+        Err(error) => panic!("detached Tunnel close funding invariant failed: {error:?}"),
     };
     let installed = connection_state.leases[endpoint.side]
         .take()

@@ -8,9 +8,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use erhino_shared::call::SystemCallError;
 use metadata_admission::{Counter, Permit, SponsoredPermit};
-use page_table::FrameNumber;
-
-use super::memory_pool::{MemoryPool, map_pool_error};
+use super::memory_pool::MemoryPool;
 
 const SPONSOR_GLOBAL_LIMIT: usize = 4_096;
 const POOL_CORE_GLOBAL_LIMIT: usize = 4_096;
@@ -408,10 +406,9 @@ impl MemoryOperationPermits {
     }
 }
 
-/// 进程 page-backed storage 的不可转移内部 binding。root 页表物理 owner 与
-/// MemoryPool charge 保持同寿命；后续页表/backing 只从同一 pool getter 取得额度。
+/// 进程 page-backed storage 的不可转移内部 binding。root owner 与中间表 owner
+/// 均由 AddressSpace 树持有；binding 只表达后续资金化所需的来源 Pool。
 pub(crate) struct PoolBinding {
-    root: crate::frame::FundedRootFrame,
     pool: Arc<MemoryPool>,
     _metadata: AddressSpacePermit,
 }
@@ -422,23 +419,10 @@ impl PoolBinding {
         sponsor: &Arc<MetadataSponsor>,
     ) -> Result<Self, SystemCallError> {
         let metadata = MetadataSponsor::reserve_address_space(sponsor)?;
-        let root = crate::frame::fund_user_root(&pool).map_err(|error| match error {
-            funded_frame::FundError::Quota(error) => map_pool_error(error),
-            funded_frame::FundError::Physical(_) => SystemCallError::OutOfMemory,
-            funded_frame::FundError::ZeroPages
-            | funded_frame::FundError::PageLimit
-            | funded_frame::FundError::ExtentLimit
-            | funded_frame::FundError::InvalidClaim => SystemCallError::InternalError,
-        })?;
         Ok(Self {
-            root,
             pool,
             _metadata: metadata,
         })
-    }
-
-    pub(crate) fn root_frame(&self) -> FrameNumber {
-        self.root.frame()
     }
 
     pub(crate) fn pool(&self) -> &Arc<MemoryPool> {

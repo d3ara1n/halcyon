@@ -594,11 +594,28 @@ pub fn map(
     let builder_object = resolve_builder(thread, builder_handle, Rights::MAP)?;
     let process = concrete_builder(&builder_object)?.process()?;
     let _lease = BuildingLease::begin(process.clone())?;
-    process
+    let (plan, pool) = {
+        let mut space = process.space.lock();
+        let plan = space
+            .plan_anonymous_mapping(target, len, permissions)
+            .map_err(map_space_error)?;
+        let pool = Arc::clone(space.pool());
+        (plan, pool)
+    };
+    let funded = match super::proc::fund_owned_mapping(&pool, &plan) {
+        Ok(funded) => funded,
+        Err(_) => {
+            process.space.lock().rollback_owned_mapping_plan(plan);
+            return Err(SystemCallError::OutOfMemory);
+        }
+    };
+    let released = process
         .space
         .lock()
-        .map_anonymous(target, len, permissions)
-        .map_err(map_space_error)
+        .complete_anonymous_mapping(plan, funded)
+        .map_err(map_space_error)?;
+    drop(released);
+    Ok(())
 }
 
 pub fn write(
