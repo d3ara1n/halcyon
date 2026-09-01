@@ -1,6 +1,6 @@
 # 用户态服务框架
 
-rinlib 只提供 StartupBlock outer、对象、消息、等待和 Tunnel 的基础封装。用户态框架在其上实现通用协议流程，不能绕过 capability 或把 PID 当地址。
+rinlib 只提供 StartupBlock outer、对象、消息、等待和 Tunnel 的基础封装。用户态框架在其上实现通用协议流程，不能绕过 capability 或把 PID 当地址。装载链库（libelf、libprocess、ld-erhino）的定位由 [bootstrap](bootstrap.md) 拥有；本篇拥有运行期协议与服务框架库。
 
 ## RPC 框架（librpc）
 

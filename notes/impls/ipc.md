@@ -54,13 +54,13 @@ ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一
 
 - Mailbox owner：关闭邮箱、完成等待者并关闭有界队列中的 transit entries；
 - sender/signaler、ProcessControl、JobControl：叶子消散；
-- Tunnel Endpoint：显式 HandleClose 在摘表前预留 lease Unmap/PTE/WaitContext/Remote slots，Commit 后异步 Retire；ProcessDrain 的 detached entry 在冲突时保留并重试；
+- Tunnel Endpoint：显式 HandleClose 在摘表前预留 lease 撤销事务，Commit 后异步 Retire；detached close 的接管与逐批推进细节由 [`mm.md`](mm.md) 唯一记录；
 - Tunnel Invitation：放弃未 attach 一侧并通知创建端；
 - WaitContext 不在 HandleTable，由终止路径单独取消。
 
 ## Tunnel 与 Runnel
 
-`task/tunnel.rs` 的 Connection 持一页共享帧、独立锁保护的内部 `MemoryObjectState`、两侧 ObjectView lease 与端点状态。Endpoint 是可等待对象；Invitation 是一次性 `MAP | TRANSIT | GRANT` authority，不持 WAIT、不公开 ObjectSignals。创建端关闭会使 Invitation attach 失败；丢弃 Invitation 向创建端 Endpoint 发布 PEER_CLOSED。
+`task/tunnel.rs` 的 Connection 持单页共享帧（多页 backing 属切片 8）、独立锁保护的内部 `MemoryObjectState`、两侧 ObjectView lease 与端点状态。Endpoint 是可等待对象；Invitation 是一次性 `MAP | TRANSIT | GRANT` authority，不持 WAIT、不公开 ObjectSignals。创建端关闭会使 Invitation attach 失败；丢弃 Invitation 向创建端 Endpoint 发布 PEER_CLOSED。
 
 Create/Attach 在 `HandleTable → Connection → AddressSpace → Lifecycle → RemoteCall` 锁序下把 handle reservation、WritePermit、ledger/PTE reservation 和 execution snapshot 合成一次 Commit；失败不消费 Invitation、handle 或 permit。调用通过 prepared WaitContext 等待 shootdown，成功返回时映射已全局同步。Endpoint 显式关闭同样等待 Unmap 确认，最后 permit Retire 早于共享帧生命周期结束。`user/frameworks/librunnel` 使用对齐 AtomicU32、Release/Acquire、shadow 游标验证与“检查→确认门铃→重查→WaitMany”闭环。
 

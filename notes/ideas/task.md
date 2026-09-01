@@ -35,7 +35,7 @@ Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保�
 Building -> Running -> Terminating -> Dead
 ```
 
-Building 不是一笔必须整体回滚的大事务，而是若干各自原子的资源附入：内存绑定、Map/Write、capability Grant、线程 Attach 以及未来其它资源绑定分别完成，成功项立即属于目标；后续失败不把已经交付的 capability 或资源倒流回组装者。`ProcessBindMemory` 是唯一页资源绑定操作，消费 Pool Handle 并把 AddressSpace 从 Unbound 转为 Bound；绑定成功后不可替换、运输或按映射重新选择费用来源。未绑定进程仍是合法 Building 壳，可以接收不依赖地址空间的 grants，也可以被放弃或终止。
+Building 不是一笔必须整体回滚的大事务，而是若干各自原子的资源附入：内存绑定、Map/Write、capability Grant、线程 Attach 以及未来其它资源绑定分别完成，成功项立即属于目标；后续失败不把已经交付的 capability 或资源倒流回组装者。`ProcessBindMemory` 是唯一页资源绑定操作，消费 Pool Handle 并把 AddressSpace 从 Unbound 转为 Bound；绑定事务语义由[内存模型](mm.md)唯一拥有。未绑定进程仍是合法 Building 壳，可以接收不依赖地址空间的 grants，也可以被放弃或终止。
 
 ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止和执行需求对兼容调度域绑定的冻结点。Start 必须同时确认内存已绑定、至少一条线程已附入、所需执行资源已满足、Job 启动门开放，并且除 Start 自身外没有 Building 操作在途。Building 操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、Attach 或 Bind。
 

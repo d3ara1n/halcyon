@@ -16,14 +16,13 @@
 
 | 主题 | idea | impl |
 |---|---|---|
-| 内核边界与协作式执行 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
+| 内核边界、协作式执行与内部机制 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
 | 系统复位 authority、语义与平台映射 | [system-reset](ideas/system-reset.md) | [internals](impls/internals.md) |
 | 对象、Capability、Handle、运输与根授权 | [object](ideas/object.md) | [IPC 对象](impls/ipc.md) |
 | Bootstrap、init、StartupBlock 与 launcher | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
 | Job、进程、线程、生命周期与调度类 | [task](ideas/task.md) | [task](impls/task.md) |
 | Hart、执行需求、调度域、用户上下文与 trap | [execution-context](ideas/execution-context.md) | [execution-context](impls/execution-context.md) |
 | 内存所有权、地址空间与映射 | [mm](ideas/mm.md) | [mm](impls/mm.md) |
-| 内核内部锁、中断、唤醒与停机 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
 | 系统调用与 remote call | [call](ideas/call.md) | [call](impls/call.md) |
 | IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象](impls/ipc.md) |
 | WaitMany 与 ObjectSignals | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |

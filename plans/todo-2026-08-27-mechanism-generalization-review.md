@@ -33,11 +33,10 @@
 - **锁序**：release 内 `owner.space.lock()` 发生在 connection 锁外、无表锁上下文；drain 的 close 回调链中调用点核实。
 - **失败回滚守恒**：create/attach 在 map_external 之后的失败路径，映射随 Endpoint Drop 自动解除——压力验证线（carryover 既有条目）覆盖此面。
 
-### 公理层
+### 公理层（已吸收）
 
-- 新增 role/对象时按 `ideas/object.md`「收束分层」公理分类（有界 close vs REAPABLE+drain）；跨 hart 等完成确认是正交维度，不把异步误判为无界容器。
-- reserve/publish/retire 的共享骨架触发条件已经满足，由 `archived/todo-2026-09-user-memory-mapping.md` 的 AddressSpace/MemoryChange 重构承接；本 Review 应核对新 seam 是否真正删除调用点协议，而不再重议是否抽象。
+- 已由 [`todo-2026-09-midterm-design-review.md`](todo-2026-09-midterm-design-review.md) 的「公理层一致性」轴吸收，真值点转移；本计划不再重复审查。
 
-### 文档自洽
+### 文档自洽（已吸收）
 
-- 三篇 impls 对同一机制无重复描述（README 归属纪律）；下一轮改动后 grep 涉及面复检。
+- 已由 [`todo-2026-09-midterm-design-review.md`](todo-2026-09-midterm-design-review.md) 的「文档纪律与自洽」轴吸收，真值点转移；本计划不再重复审查。

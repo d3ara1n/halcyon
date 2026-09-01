@@ -61,7 +61,7 @@ Building 与 Running 只在 authority、允许的来源和生命周期阶段上�
 
 地址空间身份独立于可变账本锁；Bound 后拥有稳定 translation epoch。active-hart 成员关系的唯一真值仍属于进程执行模型；AddressSpace 通过固定内部 interface 取得发布时快照，并只拥有由该快照产生的 epoch 义务与完成确认，不维护第二份成员集合。Process 的短 execution gate 同时线性化 Building 组装准入、Start、enter/leave、Running 事务 Commit 与终止截止。Building operation 只可在精确 Building 状态登记，登记即冻结该操作的提交资格；Start 只能在除自身外没有组装操作在途时发布 Running，终止可以先发布截止但必须接管并等待已经登记的操作完成。Running 地址空间事务则以 Commit 为胜负点：终止先线性化时未 Commit 事务回滚，Commit 先线性化时终止路径接管该必成事务。
 
-Commit 的嵌套顺序固定为 AddressSpace commit lock 在外、Process execution gate 在内。终止路径只在 execution gate 内发布准入截止并生成接管义务，释放后才进入 AddressSpace，不能反向嵌套。MemoryPool、MemoryObject 与 AddressSpace 的状态锁之间不跨调用长期持有：额度、WritePermit 和其它 affine token 在各自 owner 锁内预留后转入 PreparedChange，rollback/retire 先从 AddressSpace 摘出 token，解锁后再回到来源对象推进计数。短锁只保护账本、状态和有硬上限的发布；帧清零、用户态工作和远端确认等待均不得持锁。
+Commit 与终止竞争共享的 execution gate，其嵌套顺序（AddressSpace commit lock 在外、gate 在内，终止不反向嵌套）由[任务模型](task.md)唯一拥有。MemoryPool、MemoryObject 与 AddressSpace 的状态锁之间不跨调用长期持有：额度、WritePermit 和其它 affine token 在各自 owner 锁内预留后转入 PreparedChange，rollback/retire 先从 AddressSpace 摘出 token，解锁后再回到来源对象推进计数。短锁只保护账本、状态和有硬上限的发布；帧清零、用户态工作和远端确认等待均不得持锁。
 
 ## 区域账本
 

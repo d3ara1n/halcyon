@@ -48,11 +48,11 @@ MemoryObject 的可执行发布状态、WritePermit 与 mapping retire 由[内�
 
 ## MemoryPool 与 MemoryObject interface
 
-MemoryPool 是 page-backed storage 的预算 capability：core 持有固定页额度及其守恒状态，不持有进程、地址空间、child 或活对象列表。root pool 由内核按可信用户物理供给铸造并交给 init；`Derive` 从父池原子转移非零固定额度形成 child core，不能复制额度。普通 Handle 的 duplicate、TRANSIT 与 GRANT 只共享或移动对同一 core 的 authority，不改变容量；Pool 本身没有 owner role、关闭状态、等待电平或按 ID 操作入口。
+MemoryPool 是 page-backed storage 的预算 capability：core 持有固定页额度及其守恒状态，不持有进程、地址空间、child 或活对象列表。root pool 由内核按可信用户物理供给铸造并交给 init；`Derive` 从父池原子转移非零固定额度形成 child core，不能复制额度。普通 Handle 的 duplicate、TRANSIT 与 GRANT 只共享或移动对同一 core 的 authority，不改变容量；Pool capability 没有 owner role，关闭状态、等待电平与枚举的缺失由[内存模型](mm.md)统一规定。
 
 Pool authority 按操作正交：`READ` 允许固定宽 Query，`CREATE` 允许 Derive，`GRANT` 允许 Building 期消费为目标进程的内部 PoolBinding；`DUPLICATE`、`TRANSIT` 与 `GRANT` 仍分别控制对应传播路径。Derive 产生新对象，但其初始 rights 不得突破来源 entry 的派生上限；资源管理者由此可以交付只能绑定的 leaf pool、允许继续分池的管理 pool，或只读观察 capability，而不产生 ambient 资源权。Pool identity 与 parent identity 只作诊断，不能枚举、寻址或授权。
 
-ProcessCreate 只创建 Building 空壳，不消费 MemoryPool，也不创建页表根。持 ProcessBuilder 的组装者通过 `ProcessBindMemory` 原子消费具 GRANT authority 的 Pool Handle，建立不可转移的 PoolBinding，并把稳定 AddressSpace 从 Unbound 一次转为 Bound。失败保持 Handle 与空壳不变；成功后绑定只授予目标内部 frame-backed 分配，不自动给目标安装 Pool Handle。目标若还需 Query、Derive 或转授，必须另经普通 capability grant 明确取得 authority。
+ProcessCreate 只创建 Building 空壳，不消费 MemoryPool，也不创建页表根。持 ProcessBuilder 的组装者通过 `ProcessBindMemory` 原子消费具 GRANT authority 的 Pool Handle，把稳定 AddressSpace 从 Unbound 一次转为 Bound；绑定事务的失败原子性与发布语义由[内存模型](mm.md)唯一拥有。绑定只授予目标内部 frame-backed 分配，不自动安装 Pool Handle；目标若还需 Query、Derive 或转授，必须另经普通 capability grant 明确取得 authority。
 
 Derive 是不可撤销 grant：parent 只以 ParentCredit 为 child 容量提供来源，不保留 child 列表或撤销入口；child、进程绑定和 backing 自然消散后额度才沿有界父链归还。强制回收需要另一种从创建时就带成员登记、撤销准入和有界 drain 的资源对象，不能给普通 Pool 补一个会追踪全系统 view 的 revoke。关闭或转移 Pool Handle 不撤销既有 binding、backing 或 descendant authority。
 
