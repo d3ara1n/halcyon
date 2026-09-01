@@ -191,6 +191,8 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 ## 切片 7：公共 MemoryObject 与统一 ObjectView
 
+开工前置：先决定 MemoryObject 的 impls 归属与 `impls/ipc.md` 拆分（候选：Tunnel/MemoryObject 对象面独立成篇，或 backing 面并入 `mm.md`；WaitContext/TimerQueue 归属维持），更新 notes/README 索引后再进入实现。
+
 增加 MemoryObject kind/role、固定宽 Create/Query/Seal ABI 和 rinlib affine wrapper。创建先从当前进程 MetadataSponsor 预留对象壳/backing/view 所需的固定 permits，再从进程绑定池取得固定长度、多 extent、零态 ObjectBacking；对象保存 permits 与 sponsor 强引用，跨进程运输或 creator Dead 不改 sponsor，直到对象真实析构才退款。Query 报告规范化长度与 Mutable/Sealing/Executable。普通 Handle 按 rights duplicate、TRANSIT、GRANT；view 以强引用独立保活对象。
 
 扩展 Running `MemoryMap` 与 Building `ProcessMap` 的来源意图，使 Anonymous 与 MemoryObject 只在 authority/backing reserve 上不同，共用 placement、guard、结果承诺、PTE 和 shootdown。对象 offset/length 必须页对齐且在范围内；R/RW/RX 由 MAP/READ/WRITE/EXECUTE 与对象状态共同限制。公开 mapping 归 Process owner，可精确 Unmap/Protect；Tunnel lease owner 仍不可被普通调用解除。
