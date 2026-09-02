@@ -351,17 +351,6 @@ pub(crate) struct ReclaimedTableFrames {
     backing: Option<OwnedBacking>,
 }
 
-impl ReclaimedTableFrames {
-    fn empty() -> Self {
-        Self {
-            funded: Vec::new(),
-            translations: Vec::new(),
-            failed_owners: None,
-            backing: None,
-        }
-    }
-}
-
 struct UserMemoryReservation {
     change: PreparedChange,
     backing: Option<OwnedBacking>,
@@ -858,9 +847,22 @@ impl AddressSpaceState {
         plan: OwnedMappingPlan,
         funded: Vec<Vec<TableFrameToken>>,
     ) -> Result<PublishedTableChanges, (SpaceError, ReclaimedTableFrames)> {
-        let bound = self
-            .bound_mut()
-            .map_err(|error| (error, ReclaimedTableFrames::empty()))?;
+        let bound = match self.bound_mut() {
+            Ok(bound) => bound,
+            Err(error) => {
+                log!(Memory, "unexpected anonymous mapping completion in an unbound address space");
+                let OwnedMappingPlan { backing, .. } = plan;
+                return Err((
+                    error,
+                    ReclaimedTableFrames {
+                        funded,
+                        translations: Vec::new(),
+                        failed_owners: None,
+                        backing: Some(backing),
+                    },
+                ));
+            }
+        };
         bound.complete_anonymous_mapping(plan, funded)
     }
 

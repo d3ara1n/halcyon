@@ -49,13 +49,13 @@ pub struct FrameTracker {
 
 - `add_managed_region(start, end)`：注册完整 DT memory，初态全部 unavailable；重叠、arena 超限或元数据不足在修改前失败。
 - `release_range(start, end)`：只把 planner 的 user-free 或生命周期结束的 user boot-held 区间发布为空闲；bootstrap、DTB 与 BootPackage prefix 回投走此入口。
-- `alloc_order(order)` / `alloc_largest(max_count)`：纯库存 crate 的 order 与最大 extent 原语；内核仅以 transitional `alloc_user_order` / `alloc_user_largest` 暴露给页表、匿名 backing、Tunnel backing 和库存自检，锁外清零后才发布 tracker。
+- `alloc_order(order)` / `alloc_largest(max_count)`：纯库存 crate 的 order 与最大 extent 原语；内核仍以 `alloc_user_order` / `alloc_user_largest` 暴露给匿名 backing、Tunnel backing 和库存自检，锁外清零后才发布 tracker；用户页表表帧已由来源 Pool 的 funded owner 统一供给。
 - `alloc_at(base, count)`：预验证完整指定区间空闲后，按 canonical blocks 精确取走；失败不改变库存。
 - `dealloc(base, count)`：任意区间 canonical 分解后沿祖先合并；重复归还或与现有空闲库存重叠立即触发断言。普通 `FrameTracker` 持 power-of-two extent，BootPackage payload 可持任意长度保留区间。
 
 库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
 
-`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。过渡期用户页表以 `TableFrameToken::Owned(FrameTracker)` 直接保存 affine owner，不再把 tracker 拆成裸帧号后通过 unsafe 重建。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
+`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。用户页表以来源 Pool 的 funded owner 直接保存 affine owner，不再把 owner 拆成裸帧号后通过 unsafe 重建。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
 
 ## 物理供给验证
 
@@ -86,7 +86,7 @@ charge 与 delegation 使用不同的线性 reservation/credit 类型，所有�
 
 内核 `task/memory_pool.rs` 的 `PreparedMemoryCharge` 与 `MemoryCharge` 把纯逻辑 `ChargeReservation/AllocatedCredit` 接回来源 Pool core：前者析构回滚 reserved，后者强持 Pool 并在最后析构时退 allocated。`frame.rs` 的 `ClaimedUserExtent` 只在 POOL 锁内摘取 geometry，锁外清零；通用 `FundedFrames` 内部不可见的 `funded_frame::Funded` 按 extents 在前、charge 在后的字段顺序析构，且不提供可提前拆散两侧 owner 的公共入口。AddressSpace root 使用单页/单 extent 的专用 `FundedRootFrame`，避免把 64-extents 通用存储内联进空壳与 Bind 调用栈。BootPackage 则由不可伪造的 `BootHeldExtent` 表达未入库存的启动 owner，payload 经 root charge 转成可同步 split 的 `BootFundedExtent`；普通 broker 仍无绕过清零的 generic adopt。system tickets 继续由 `SystemSupply` 的独立类型拥有。
 
-AddressSpace root 与 bootstrap payload 已接入 Pool charge；中间页表、普通 anonymous backing、Tunnel 与库存自检仍使用登记在 `frame.rs` 的 transitional raw adapter，分别在后续所属切片迁移。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 的全面资金化与同一锁外 retire seam 属切片 6，不向 generic broker 增加任意拆包。11 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、跨 extent split/merge、wrong-owner、失败 owner 保全、析构顺序与双方程恢复；内核启动自检继续验证真实锁与 RAII 接线。
+AddressSpace root、中间页表与 bootstrap payload 已接入 Pool charge；普通 anonymous backing、Tunnel 与库存自检仍使用登记在 `frame.rs` 的 raw adapter，分别在后续所属切片迁移。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 的全面资金化与同一锁外 retire seam 属切片 6，不向 generic broker 增加任意拆包。11 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、跨 extent split/merge、wrong-owner、失败 owner 保全、析构顺序与双方程恢复；内核启动自检继续验证真实锁与 RAII 接线。
 
 ## 页表模式选择
 
@@ -112,7 +112,7 @@ Map 仍把连续 VPN/PPN 区间切成最大可行 mega 段。preflight 只读遍
 
 Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为目标区间部分覆盖的现有 mega 计数：完整覆盖直接改叶，部分覆盖逐级精确预留；普通 4 KiB Unmap 因而预留零帧。Unmap 对未映射洞保持宽松，Protect 则要求区间完整映射且当前 flags 全部匹配。split 后 512 个子项保持原物理连续性和 flags；Unmap Publish 自底向上剪除新空的 owned 分支并返回 owner，内核把它们随 `PublishedChange` 保活到 Remote ack 后，确认前不归还。
 
-页表 drain 使用 `DrainCursor<LEVELS>` 保存层级无关的固定宽遍历状态；每个 `step_drain` 至多摘一个 owned 分支 owner，调用方锁外析构后再推进。owned 槽与分支 ledger 清空后，`finish_drain` 才交出 root owner。`TableTree::Drop` 不遍历 PTE，只接受已 drain 的常数终态；未 drain 树析构立即拒绝。当前 AddressSpace 的 Building/bootstrap、Running 公开映射与 Tunnel ObjectView 均已接入 owner-aware API，但仍通过集中 raw adapter 在 AddressSpace 锁内供给过渡 token；Running/Tunnel 以 `table_transaction_active` 独占 Prepared 到 Commit/rollback 的树代次，避免两个非重叠 ledger 事务因共享页表路径而形成 stale Prepared。切片 6D 将依此 seam 把锁外 funded 供给接入全部 Map/Unmap/Protect 路径。
+页表 drain 使用 `DrainCursor<LEVELS>` 保存层级无关的固定宽遍历状态；每个 `step_drain` 至多摘一个 owned 分支 owner，调用方锁外析构后再推进。owned 槽与分支 ledger 清空后，`finish_drain` 才交出 root owner。`TableTree::Drop` 不遍历 PTE，只接受已 drain 的常数终态；未 drain 树析构立即拒绝。当前 AddressSpace 的 Building/bootstrap、Running 公开映射与 Tunnel ObjectView 均已接入 owner-aware API，并通过来源 Pool 在 AddressSpace 锁外供给 funded table owner；Running/Tunnel 以 `table_transaction_active` 独占 Prepared 到 Commit/rollback 的树代次，避免两个非重叠 ledger 事务因共享页表路径而形成 stale Prepared。
 
 ### 测试集（host）
 
@@ -186,7 +186,7 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 
 - `MemoryProtect = 0x52` 只在创建时最大权限内改变 mapping；公开匿名 Map 不接受 RX，RW 区不能转 RX。涉及执行权限的已有映像变更推进 instruction epoch 并触发 `FENCE.I`。
 - rinlib `MappedRegion` 不可复制，记录 reservation 与可选 usable 子区间；完整 Unmap 消费 token，部分 Unmap 返回左右至多两个 mapping/reservation-only fragment。全局 talc allocator 持固定 64 槽 arena inventory，以 64KiB 起步并几何增长到 16MiB，不在 acquire 路径为 arena 元数据递归分配。`Extend`、sbrk wrapper 与 Running heap transaction 已删除。
 - rinlib `UserStack` 用一次 anonymous `MappedRegion` 建立 `[低 guard | usable | 高 guard]`，usable 大小按页上取整，sp 取 usable.end。`Builder::spawn` 在提交前建立栈和 heap packet，失败仍由调用者完整解除；成功后 `JoinHandle` affine 持有 ThreadControl、完整 reservation 与 packet。显式 join 和 Drop 都先 WaitMany(DONE)、执行 Acquire、关闭壳，再以同一个 `MappedRegion` token 解除包含双 guard 的 reservation；前者取走结果，后者析构结果。`thread::spawn_raw` 只包装 ThreadSpawn 原语，不接管这些资源，调用者必须自行建立唯一收束路径。
-- owned anonymous、ELF、bootstrap stack、StartupBlock 与公开 Map 页均由 `OwnedBacking.extents` 持有。Running anonymous、Tunnel object 与 Building `ProcessMap` 的新事务路径先进行精确 preflight，锁外取得 funded table owners，再在锁内复检并不可失败 publish；root owner 已归 `TableTree` 持有。Building ELF/bootstrap 的剩余调用点仍保留最窄 transitional raw 页表 adapter，待 6D 完整收口时删除。
+- owned anonymous、ELF、bootstrap stack、StartupBlock 与公开 Map 页均由 `OwnedBacking.extents` 持有。Running anonymous、Tunnel object 与 Building `ProcessMap` 的新事务路径先进行精确 preflight，锁外取得 funded table owners，再在锁内复检并不可失败 publish；root owner 已归 `TableTree` 持有。Building ELF/bootstrap 的映射已统一走锁内规划、锁外 funded table 供给与锁内 complete/commit；固定主栈映射不推进 `image_end`。
 - bootstrap StartupBlock prefix 是 owned backing；opaque payload 页由 boot-held token 直接转为 root-funded immutable lease backing，不经历“先回库存再取出”的窗口，地址空间销毁时在锁外同时归还物理 extent 与 charge；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap/Write 只服务精确 Building 且已 Bound 的 process；Map 创建 anonymous zero pages并使用最终权限，拒绝 write-only/W+X。Building Map 同样采用 plan → 锁外 table funding → complete/commit；成功提交后才推进 `image_end`，固定主栈映射不改变该游标。Write 经已发布 PTE 的物理直映射回填 backing；Unbound 返回 ObjectNotAvailable，Running 发布后不再存在该写入口；
 - ProcessDrain 对 Unbound shell 直接完成；Bound 先逐区域清空 ledger，再逐 extent 归还 backings，最后收束页表与 PoolBinding。lifecycle 的 Building/mandatory operation 屏障分别保证截止前组装提交资格与 REAPABLE 前无公开在途 `PublishedChange/RetiringChange`；已进入终止的 committed 事务仍由原 work debt 完成，发起线程消散不改变所有权。
