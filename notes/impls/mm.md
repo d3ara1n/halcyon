@@ -190,7 +190,7 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 
 - bootstrap StartupBlock prefix 是 owned backing；opaque payload 页由 boot-held token 直接转为 root-funded immutable lease backing，不经历“先回库存再取出”的窗口，地址空间销毁时在锁外同时归还物理 extent 与 charge；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap/Write 只服务精确 Building 且已 Bound 的 process；Map 创建 anonymous zero pages并使用最终权限，拒绝 write-only/W+X。Building Map 同样采用 plan → 锁外 table funding → complete/commit；成功提交后才推进 `image_end`，固定主栈映射不改变该游标。Write 经已发布 PTE 的物理直映射回填 backing；Unbound 返回 ObjectNotAvailable，Running 发布后不再存在该写入口；
 - ProcessDrain 对 Unbound shell 直接完成；Bound 先逐区域清空 ledger，再逐 extent 归还 backings，最后收束页表与 PoolBinding。lifecycle 的 Building/mandatory operation 屏障分别保证截止前组装提交资格与 REAPABLE 前无公开在途 `PublishedChange/RetiringChange`；已进入终止的 committed 事务仍由原 work debt 完成，发起线程消散不改变所有权。
-- TunnelCreate/Attach 使用内部 MemoryObject view 建立 lease-owned RW mapping；每个 reserved/published/retiring writable view 持一个 affine WritePermit。MemoryObject state 与 Connection side state 分锁，permit 在进入 AddressSpace 前移出对象锁，Retire 也在 AddressSpace 锁外逐项归还。Create/Attach 与显式 Endpoint HandleClose 都使用预构造 WaitContext、metadata/work-debt 准入和 mandatory Remote completion；Close 先提交 ledger/PTE Unmap，远端确认后只发布 Retiring，最终批才发布 CLOSED/PEER_CLOSED 并完成 syscall。Terminating 进程 active 已归零，ProcessDrain 的 detached close 把 `RetiringSpaceChange + LeaseRetire` 固定保存在 Endpoint 中，每个 drain close work unit 推进同一状态机一步；若与在途 transaction 冲突或尚未完成，entry 原样留在 `pending_close` 供下一批重试，不存在同步 retire 旁路。
+- MemoryObject 与 Tunnel 的 object-backed mapping 都通过同一 `ObjectView`/`WritePermit`/`MemoryChange` seam；本篇拥有 backing、AddressSpace ledger、远端确认和锁外 retire 的通用机制。MemoryObject 公共对象接入见 [`memory-object.md`](memory-object.md)，Tunnel 的 Connection、Endpoint、Invitation 和 detached close 编排见 [`tunnel.md`](tunnel.md)。
 
 ## 架构边界
 

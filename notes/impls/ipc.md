@@ -1,6 +1,6 @@
 # IPC 对象实现
 
-当前 IPC 由进程本地 HandleTable、内核对象、统一等待、Mailbox 控制面和 Tunnel/Runnel 数据面组成。共享 ABI 位于 `shared/src/{object,message,wait,startup,call}.rs`，用户封装位于 `user/rinlib/src/ipc/`。
+当前 IPC 控制面由进程本地 HandleTable、内核对象、统一等待、Mailbox 与 Notification 组成。共享 ABI 位于 `shared/src/{object,message,wait,startup,call}.rs`，用户封装位于 `user/rinlib/src/ipc/`；Tunnel 与 Runnel 的实现分别见 [`tunnel.md`](tunnel.md) 与 [`runnel.md`](runnel.md)。
 
 ## Handle entry 与运输
 
@@ -50,23 +50,21 @@ Send 在 `HandleTable → Mailbox` 锁序下，以当前 pid 和目标 sender ba
 
 ## Handle close callbacks
 
-ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一记录。本篇只拥有 Handle 摘出后的 IPC 对象收束语义。Mailbox 队列上限为 16 条、每条最多 8 个 transit entries，因此 owner close 的运输 fanout 至多 128；对象订阅上限为 1024，每个 WaitContext 最多 64 项，完成方在对象锁外清理。具体语义：
+ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一记录。本篇只拥有 Handle 摘出后的控制面对象收束语义。Mailbox 队列上限为 16 条、每条最多 8 个 transit entries，因此 owner close 的运输 fanout 至多 128；对象订阅上限为 1024，每个 WaitContext 最多 64 项，完成方在对象锁外清理。具体语义：
 
 - Mailbox owner：关闭邮箱、完成等待者并关闭有界队列中的 transit entries；
 - sender/signaler、ProcessControl、JobControl：叶子消散；
-- Tunnel Endpoint：显式 HandleClose 在摘表前预留 lease 撤销事务，Commit 后异步 Retire；detached close 的接管与逐批推进细节由 [`mm.md`](mm.md) 唯一记录；
-- Tunnel Invitation：放弃未 attach 一侧并通知创建端；
+- Tunnel Endpoint：关闭事务与 detached retire 见 [`tunnel.md`](tunnel.md) 和 [`mm.md`](mm.md)，本篇只负责 Handle close 的分派边界；
+- Tunnel Invitation：放弃未 attach 一侧并通知创建端，具体连接状态见 [`tunnel.md`](tunnel.md)；
 - WaitContext 不在 HandleTable，由终止路径单独取消。
 
-## Tunnel 与 Runnel
+## 数据面索引
 
-`task/tunnel.rs` 的 Connection 持单页共享帧（多页 backing 属切片 8）、独立锁保护的内部 `MemoryObjectState`、两侧 ObjectView lease 与端点状态。Endpoint 是可等待对象；Invitation 是一次性 `MAP | TRANSIT | GRANT` authority，不持 WAIT、不公开 ObjectSignals。创建端关闭会使 Invitation attach 失败；丢弃 Invitation 向创建端 Endpoint 发布 PEER_CLOSED。
-
-Create/Attach 在 `HandleTable → Connection → AddressSpace → Lifecycle → RemoteCall` 锁序下把 handle reservation、WritePermit、ledger/PTE reservation 和 execution snapshot 合成一次 Commit；失败不消费 Invitation、handle 或 permit。调用通过 prepared WaitContext 等待 shootdown，成功返回时映射已全局同步。Endpoint 显式关闭同样等待 Unmap 确认，最后 permit Retire 早于共享帧生命周期结束。`user/frameworks/librunnel` 使用对齐 AtomicU32、Release/Acquire、shadow 游标验证与“检查→确认门铃→重查→WaitMany”闭环。
+Tunnel 的 Connection、Endpoint、Invitation、映射与关闭见 [`tunnel.md`](tunnel.md)。Runnel 的页内布局、角色视图、游标、内存序与门铃封装见 [`runnel.md`](runnel.md)。本篇不重复定义数据面对象的 backing、view 或协议不变量。
 
 ## 验证入口
 
 - handle_table host：generation、reservation、badge、运输、consume/transfer pin 与 rights 回滚；
 - wait_context/timer_queue host：安装窗口、唯一赢家、token generation/owner、堆删除与 cancel/expiry 竞争；
-- init core acceptance：badge、send-once、满箱/WRITABLE、Notification、Invitation 非等待拒绝与 Tunnel/Runnel 确定性通路；stress workload 追加重复 control/Tunnel 生命周期、ProcessDrain `max_work=1` 和完整竞态矩阵；
+- init core acceptance：badge、send-once、满箱/WRITABLE、Notification 与 WaitMany 确定性通路；Tunnel/Runnel 相关验收分别由 [`tunnel.md`](tunnel.md) 与 [`runnel.md`](runnel.md) 记录；stress workload 追加重复 control/Tunnel 生命周期、ProcessDrain `max_work=1` 和完整竞态矩阵；
 - QEMU：`virt`/release/hetero/nofd/sifive_u 分别验证 core 与平台差异，`virt-stress` 验证 16/16 竞态、公开 MemoryMap/Protect/Unmap、异 hart kill、guard fault 局部收束及压力回收；全部路线由 workload、服务监督、资源收束与 reset 终态的 fail-closed 锚点判定。
