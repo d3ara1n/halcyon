@@ -46,6 +46,10 @@ const LEVELS: usize = 3;
 pub enum SpaceError {
     /// 帧或表帧耗尽。
     NoFrame,
+    /// Pool 额度不足。
+    QuotaExceeded,
+    /// 结构容量或 funded transaction 硬上限耗尽。
+    ReachLimit,
     /// 段未页对齐 / 参数非法。
     BadSegment,
     /// 映射冲突（重复装载同一区间）。
@@ -78,17 +82,14 @@ impl From<MapError> for SpaceError {
 }
 
 pub(crate) enum TableFrameToken {
-    /// AddressSpace root 的来源 Pool 单页 funded owner。
+    /// AddressSpace root 或中间表的来源 Pool 单页 funded owner。
     Root(crate::frame::FundedRootFrame),
-    /// 中间表仍暂由切片 6D 后续迁移到 funded owner。
-    Raw(FrameTracker),
 }
 
 impl TableFrameOwner for TableFrameToken {
     fn number(&self) -> FrameNumber {
         match self {
             Self::Root(owner) => owner.frame(),
-            Self::Raw(tracker) => FrameNumber(tracker.base().addr() / PAGE_SIZE),
         }
     }
 }
@@ -104,28 +105,16 @@ impl TableFrameMemory for TableMem {
     }
 }
 
-fn supply_raw_table_frames(count: usize) -> Result<Vec<TableFrameToken>, MapError> {
-    let mut owners = Vec::new();
-    owners
-        .try_reserve_exact(count)
-        .map_err(|_| MapError::AllocationFailed)?;
-    for _ in 0..count {
-        let tracker = frame::alloc_user_order(0).ok_or(MapError::FrameExhausted)?;
-        owners.push(TableFrameToken::Raw(tracker));
-    }
-    Ok(owners)
-}
-
 pub(crate) fn supply_funded_table_frames(
     pool: &Arc<super::memory_pool::MemoryPool>,
     count: usize,
-) -> Result<Vec<TableFrameToken>, MapError> {
+) -> Result<Vec<TableFrameToken>, SpaceError> {
     let mut owners = Vec::new();
     owners
         .try_reserve_exact(count)
-        .map_err(|_| MapError::AllocationFailed)?;
+        .map_err(|_| SpaceError::NoFrame)?;
     for _ in 0..count {
-        let owner = frame::fund_user_root(pool).map_err(|_| MapError::FrameExhausted)?;
+        let owner = frame::fund_user_root(pool).map_err(map_funded_error)?;
         // SAFETY: newly claimed table frame is exclusively owned and page aligned.
         unsafe {
             core::ptr::write_bytes(
@@ -142,11 +131,11 @@ pub(crate) fn supply_funded_table_frames(
 fn fund_table_preflights(
     pool: &Arc<super::memory_pool::MemoryPool>,
     preflights: &[TranslationPreflight],
-) -> Result<Vec<Vec<TableFrameToken>>, MapError> {
+) -> Result<Vec<Vec<TableFrameToken>>, SpaceError> {
     let mut funded = Vec::new();
     funded
         .try_reserve_exact(preflights.len())
-        .map_err(|_| MapError::AllocationFailed)?;
+        .map_err(|_| SpaceError::NoFrame)?;
     for preflight in preflights {
         funded.push(supply_funded_table_frames(
             pool,
@@ -154,6 +143,23 @@ fn fund_table_preflights(
         )?);
     }
     Ok(funded)
+}
+
+fn map_funded_error(
+    error: funded_frame::FundError<memory_pool::PoolError, crate::frame::UserClaimError>,
+) -> SpaceError {
+    match error {
+        funded_frame::FundError::ZeroPages
+        | funded_frame::FundError::InvalidClaim
+        | funded_frame::FundError::Physical(_) => SpaceError::NoFrame,
+        funded_frame::FundError::PageLimit | funded_frame::FundError::ExtentLimit => {
+            SpaceError::ReachLimit
+        }
+        funded_frame::FundError::Quota(memory_pool::PoolError::QuotaExceeded) => {
+            SpaceError::QuotaExceeded
+        }
+        funded_frame::FundError::Quota(_) => SpaceError::NoFrame,
+    }
 }
 
 const MEMORY_SPACE_LIMITS: Limits = Limits {
@@ -242,7 +248,7 @@ struct OwnedBacking {
     extents: Vec<BackingExtent>,
 }
 
-enum PublishedTableChanges {
+pub(crate) enum PublishedTableChanges {
     One(TablePublishOutcome<TableFrameToken>),
     Many(Vec<TablePublishOutcome<TableFrameToken>>),
 }
@@ -311,19 +317,10 @@ pub(crate) struct OwnedMappingPlan {
     building_image_end: Option<usize>,
 }
 
-impl OwnedMappingPlan {
-    pub(crate) fn table_budget(&self) -> usize {
-        self.preflights
-            .iter()
-            .map(TranslationPreflight::required_frames)
-            .sum()
-    }
-}
-
 pub(crate) fn fund_owned_mapping(
     pool: &Arc<super::memory_pool::MemoryPool>,
     plan: &OwnedMappingPlan,
-) -> Result<Vec<Vec<TableFrameToken>>, MapError> {
+) -> Result<Vec<Vec<TableFrameToken>>, SpaceError> {
     fund_table_preflights(pool, &plan.preflights)
 }
 
@@ -344,6 +341,25 @@ struct UserMemoryPlan {
     backing: Option<OwnedBacking>,
     preflights: Vec<TranslationPreflight>,
     result: Option<PinnedMapResult>,
+}
+
+/// AddressSpace 锁内失败时摘出的 funded table owner。调用者必须在锁外析构。
+pub(crate) struct ReclaimedTableFrames {
+    funded: Vec<Vec<TableFrameToken>>,
+    translations: Vec<PreparedTranslation<TableFrameToken>>,
+    failed_owners: Option<Vec<TableFrameToken>>,
+    backing: Option<OwnedBacking>,
+}
+
+impl ReclaimedTableFrames {
+    fn empty() -> Self {
+        Self {
+            funded: Vec::new(),
+            translations: Vec::new(),
+            failed_owners: None,
+            backing: None,
+        }
+    }
 }
 
 struct UserMemoryReservation {
@@ -572,29 +588,6 @@ impl OwnedBacking {
         Ok(preflights)
     }
 
-    fn prepare_install(
-        &self,
-        tree: &mut TableTree<TableMem, LEVELS>,
-        range: LedgerPageRange,
-        backing_offset: usize,
-        protection: Protection,
-    ) -> Result<Vec<PreparedTranslation<TableFrameToken>>, SpaceError> {
-        let preflights = self.preflight_install(tree, range, backing_offset, protection)?;
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(preflights.len())
-            .map_err(|_| SpaceError::NoFrame)?;
-        for preflight in preflights {
-            let owners = supply_raw_table_frames(preflight.required_frames())
-                .map_err(|_| SpaceError::NoFrame)?;
-            prepared.push(
-                tree.prepare(preflight, owners)
-                    .map_err(|failure| SpaceError::from(failure.error))?,
-            );
-        }
-        Ok(prepared)
-    }
-
     /// Remote ack 后至多切出一个物理 extent owner。调用者在 AddressSpace 锁外
     /// 析构返回 owner，并以返回页数推进稳定游标。创建期已为最多双切分预留容量。
     fn release_one(&mut self, offset: usize, bytes: usize) -> (BackingExtentOwner, usize) {
@@ -722,7 +715,8 @@ fn map_change_error(error: ChangeError) -> SpaceError {
         ChangeError::RegionLimit
         | ChangeError::TransactionLimit
         | ChangeError::KeyExhausted
-        | ChangeError::AllocationFailed => SpaceError::NoFrame,
+        | ChangeError::PageLimit => SpaceError::ReachLimit,
+        ChangeError::AllocationFailed => SpaceError::NoFrame,
         ChangeError::BadLimits
         | ChangeError::Range(_)
         | ChangeError::OutOfBounds
@@ -730,7 +724,6 @@ fn map_change_error(error: ChangeError) -> SpaceError {
         | ChangeError::PermissionDenied
         | ChangeError::BackingOutOfRange
         | ChangeError::ObjectAuthorization
-        | ChangeError::PageLimit
         | ChangeError::LeaseInvalid
         | ChangeError::LeaseTooLarge
         | ChangeError::PermitMismatch
@@ -763,6 +756,8 @@ fn map_public_change_error(error: ChangeError) -> SystemCallError {
 fn map_public_space_error(error: SpaceError) -> SystemCallError {
     match error {
         SpaceError::NoFrame => SystemCallError::OutOfMemory,
+        SpaceError::QuotaExceeded => SystemCallError::QuotaExceeded,
+        SpaceError::ReachLimit => SystemCallError::ReachLimit,
         SpaceError::BadSegment => SystemCallError::InternalError,
         SpaceError::Conflict => SystemCallError::AddressConflict,
         SpaceError::Busy => SystemCallError::ObjectBusy,
@@ -848,15 +843,6 @@ impl AddressSpaceState {
         Ok(())
     }
 
-    pub fn map_anonymous(
-        &mut self,
-        vaddr: usize,
-        len: usize,
-        permissions: ProcessMapFlags,
-    ) -> Result<(), SpaceError> {
-        self.bound_mut()?.map_anonymous(vaddr, len, permissions)
-    }
-
     pub(crate) fn plan_anonymous_mapping(
         &mut self,
         vaddr: usize,
@@ -871,26 +857,11 @@ impl AddressSpaceState {
         &mut self,
         plan: OwnedMappingPlan,
         funded: Vec<Vec<TableFrameToken>>,
-    ) -> Result<Vec<TableFrameToken>, SpaceError> {
-        self.bound_mut()?.complete_anonymous_mapping(plan, funded)
-    }
-
-    pub(crate) fn advance_building_image_end(&mut self, end: usize) {
-        self.bound_mut()
-            .expect("Building mapping reached an unbound address space")
-            .advance_building_image_end(end);
-    }
-
-    pub fn load_elf(
-        &mut self,
-        segments: &[elf::LoadSegment],
-        file: &[u8],
-    ) -> Result<(), SpaceError> {
-        self.bound_mut()?.load_elf(segments, file)
-    }
-
-    pub fn map_stack(&mut self) -> Result<(), SpaceError> {
-        self.bound_mut()?.map_stack()
+    ) -> Result<PublishedTableChanges, (SpaceError, ReclaimedTableFrames)> {
+        let bound = self
+            .bound_mut()
+            .map_err(|error| (error, ReclaimedTableFrames::empty()))?;
+        bound.complete_anonymous_mapping(plan, funded)
     }
 
     pub fn write_building(&mut self, target: usize, source: &[u8]) -> Result<(), SpaceError> {
@@ -1248,6 +1219,168 @@ impl AddressSpace {
         self.state.lock()
     }
 
+    fn complete_building_plan(
+        &self,
+        plan: OwnedMappingPlan,
+        pool: Arc<super::memory_pool::MemoryPool>,
+    ) -> Result<(), SpaceError> {
+        let funded = match fund_owned_mapping(&pool, &plan) {
+            Ok(funded) => funded,
+            Err(error) => {
+                let reclaimed = self.lock().rollback_owned_mapping_plan(plan);
+                drop(reclaimed);
+                return Err(error);
+            }
+        };
+        let completed = {
+            let result = self.lock().complete_anonymous_mapping(plan, funded);
+            match result {
+                Ok(released) => Ok(released),
+                Err((error, reclaimed)) => Err((error, reclaimed)),
+            }
+        };
+        match completed {
+            Ok(released) => {
+                drop(released);
+                Ok(())
+            }
+            Err((error, reclaimed)) => {
+                drop(reclaimed);
+                Err(error)
+            }
+        }
+    }
+
+    fn map_building_protection(
+        &self,
+        vaddr: usize,
+        len: usize,
+        protection: Protection,
+        image_end: Option<usize>,
+    ) -> Result<(), SpaceError> {
+        let (plan, pool) = {
+            let mut state = self.lock();
+            let bound = state.bound_mut()?;
+            let mut plan = bound.plan_owned_anonymous_mapping(vaddr, len, protection)?;
+            plan.building_image_end = image_end;
+            let pool = Arc::clone(bound.pool());
+            (plan, pool)
+        };
+        self.complete_building_plan(plan, pool)
+    }
+
+    pub fn load_elf(&self, segments: &[elf::LoadSegment], file: &[u8]) -> Result<(), SpaceError> {
+        let (runs, image_end) = {
+            let mut state = self.lock();
+            state.bound_mut()?.plan_elf_mappings(segments)?
+        };
+        for (vaddr, len, protection) in runs {
+            self.map_building_protection(vaddr, len, protection, Some(vaddr + len))?;
+        }
+        let mut state = self.lock();
+        state
+            .bound_mut()?
+            .write_elf_mappings(segments, file, image_end)
+    }
+
+    pub fn map_stack(&self) -> Result<(), SpaceError> {
+        self.map_building_protection(
+            USER_TOP - STACK_SIZE,
+            STACK_SIZE,
+            Protection::ReadWrite,
+            None,
+        )
+    }
+
+    pub fn map_bootstrap_block(
+        &self,
+        prefix: &[u8],
+        payload: Option<&frame::BootFundedExtent>,
+        payload_len: usize,
+    ) -> Result<usize, SpaceError> {
+        let (plan, pool, base, end) = {
+            let mut state = self.lock();
+            let bound = state.bound_mut()?;
+            if prefix.is_empty() || prefix.len() % PAGE_SIZE != 0 || bound.image_end == 0 {
+                return Err(SpaceError::BadSegment);
+            }
+            let payload_pages = payload_len.div_ceil(PAGE_SIZE);
+            if payload.map_or(0, frame::BootFundedExtent::pages) != payload_pages {
+                return Err(SpaceError::BadSegment);
+            }
+            let base = bound.image_end;
+            let prefix_pages = prefix.len() / PAGE_SIZE;
+            let pages = prefix_pages
+                .checked_add(payload_pages)
+                .ok_or(SpaceError::BadSegment)?;
+            let span = pages.checked_mul(PAGE_SIZE).ok_or(SpaceError::BadSegment)?;
+            let end = base.checked_add(span).ok_or(SpaceError::BadSegment)?;
+            if end > USER_TOP - STACK_SIZE {
+                return Err(SpaceError::BadSegment);
+            }
+            let identity = bound.mint_backing()?;
+            let mut backing = OwnedBacking::allocate(identity, prefix_pages)?;
+            if let Some(payload) = payload {
+                backing
+                    .extents
+                    .try_reserve(1)
+                    .map_err(|_| SpaceError::NoFrame)?;
+                backing.extents.push(BackingExtent {
+                    offset_pages: prefix_pages,
+                    owner: BackingExtentOwner::BootBorrowed {
+                        base: payload.base(),
+                        pages: payload.pages(),
+                    },
+                });
+                backing.pages = pages;
+            }
+            backing.write_from_start(prefix);
+            let lease = bound.mint_lease()?;
+            let plan = bound.plan_owned_mapping(
+                base,
+                Protection::ReadOnly,
+                AnonymousClass::Data,
+                RegionOwner::Lease(lease),
+                backing,
+            )?;
+            let pool = Arc::clone(bound.pool());
+            (plan, pool, base, end)
+        };
+        let funded = match fund_owned_mapping(&pool, &plan) {
+            Ok(funded) => funded,
+            Err(error) => {
+                let reclaimed = self.lock().rollback_owned_mapping_plan(plan);
+                drop(reclaimed);
+                return Err(error);
+            }
+        };
+        let completed = {
+            let mut state = self.lock();
+            let bound = match state.bound_mut() {
+                Ok(bound) => bound,
+                Err(error) => return Err(error),
+            };
+            match bound.complete_owned_mapping(plan, funded) {
+                Ok(prepared) => {
+                    let published = bound.commit_owned_mapping(prepared);
+                    bound.image_end = end;
+                    Ok(bound.finish_empty_published_change(published))
+                }
+                Err((error, reclaimed)) => Err((error, reclaimed)),
+            }
+        };
+        match completed {
+            Ok(released) => {
+                drop(released);
+                Ok(base)
+            }
+            Err((error, reclaimed)) => {
+                drop(reclaimed);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn epochs(&self) -> EpochSnapshot {
         EpochSnapshot {
             translation: self.translation_epoch.load(Ordering::Acquire),
@@ -1427,10 +1560,11 @@ fn start_user_memory_change(
         match prepare_memory_completion(process.clone(), value, None, result_obligation) {
             Ok(prepared) => prepared,
             Err(error) => {
-                process
+                let reclaimed = process
                     .space
                     .lock()
                     .rollback_user_memory(prepared.take().expect("memory change must roll back"));
+                drop(reclaimed);
                 return Err(error);
             }
         };
@@ -1438,10 +1572,11 @@ fn start_user_memory_change(
     let shootdown = match process.space.prepare_shootdown(&process.lifecycle, sink) {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            process
+            let reclaimed = process
                 .space
                 .lock()
                 .rollback_user_memory(prepared.take().expect("memory change must roll back"));
+            drop(reclaimed);
             return Err(map_shootdown_error(error));
         }
     };
@@ -1470,10 +1605,11 @@ fn start_user_memory_change(
     let (published, synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            process
+            let reclaimed = process
                 .space
                 .lock()
                 .rollback_user_memory(prepared.take().expect("stale change must roll back"));
+            drop(reclaimed);
             return Err(SystemCallError::ObjectBusy);
         }
     };
@@ -1516,11 +1652,21 @@ pub(crate) fn memory_map(
     let funded = match fund_table_preflights(&pool, &plan.preflights) {
         Ok(funded) => funded,
         Err(error) => {
-            process.space.lock().rollback_user_memory_plan(plan);
-            return Err(map_public_space_error(error.into()));
+            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
+            drop(reclaimed);
+            return Err(map_public_space_error(error));
         }
     };
-    let prepared = process.space.lock().complete_user_memory(plan, funded)?;
+    let prepared = {
+        let result = process.space.lock().complete_user_memory(plan, funded);
+        match result {
+            Ok(prepared) => prepared,
+            Err((error, reclaimed)) => {
+                drop(reclaimed);
+                return Err(error);
+            }
+        }
+    };
     let layout = prepared
         .get()
         .change
@@ -1554,11 +1700,21 @@ pub(crate) fn memory_unmap(
     let funded = match fund_table_preflights(&pool, &plan.preflights) {
         Ok(funded) => funded,
         Err(error) => {
-            process.space.lock().rollback_user_memory_plan(plan);
-            return Err(map_public_space_error(error.into()));
+            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
+            drop(reclaimed);
+            return Err(map_public_space_error(error));
         }
     };
-    let prepared = process.space.lock().complete_user_memory(plan, funded)?;
+    let prepared = {
+        let result = process.space.lock().complete_user_memory(plan, funded);
+        match result {
+            Ok(prepared) => prepared,
+            Err((error, reclaimed)) => {
+                drop(reclaimed);
+                return Err(error);
+            }
+        }
+    };
     start_user_memory_change(process, Some(prepared), range, false, false, 0, None)
 }
 
@@ -1590,11 +1746,21 @@ pub(crate) fn memory_protect(
     let funded = match fund_table_preflights(&pool, &plan.preflights) {
         Ok(funded) => funded,
         Err(error) => {
-            process.space.lock().rollback_user_memory_plan(plan);
-            return Err(map_public_space_error(error.into()));
+            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
+            drop(reclaimed);
+            return Err(map_public_space_error(error));
         }
     };
-    let prepared = process.space.lock().complete_user_memory(plan, funded)?;
+    let prepared = {
+        let result = process.space.lock().complete_user_memory(plan, funded);
+        match result {
+            Ok(prepared) => prepared,
+            Err((error, reclaimed)) => {
+                drop(reclaimed);
+                return Err(error);
+            }
+        }
+    };
     start_user_memory_change(process, Some(prepared), range, instruction, false, 0, None)
 }
 
@@ -1629,7 +1795,7 @@ pub(crate) struct BoundAddressSpace {
 impl BoundAddressSpace {
     /// 从 PoolBinding 构造 Bound 状态；root tree 持有 funded owner。
     pub fn new(binding: super::resources::PoolBinding) -> Result<Box<Self>, SpaceError> {
-        let root = frame::fund_user_root(binding.pool()).map_err(|_| SpaceError::NoFrame)?;
+        let root = frame::fund_user_root(binding.pool()).map_err(map_funded_error)?;
         let mut tree = TableTree::new(TableMem, TableFrameToken::Root(root));
         mm::install_kernel_top_level(&mut tree);
         let satp = (8usize << 60) | tree.satp_ppn();
@@ -1876,51 +2042,57 @@ impl BoundAddressSpace {
         &mut self,
         plan: UserMemoryPlan,
         funded: Vec<Vec<TableFrameToken>>,
-    ) -> Result<PreparedUserMemory, SystemCallError> {
+    ) -> Result<PreparedUserMemory, (SystemCallError, ReclaimedTableFrames)> {
         let UserMemoryPlan {
             change,
             backing,
             preflights,
             result,
         } = plan;
-        if funded.len() != preflights.len() {
+        let mut reclaimed = ReclaimedTableFrames {
+            funded,
+            translations: Vec::new(),
+            failed_owners: None,
+            backing,
+        };
+        if reclaimed.funded.len() != preflights.len() {
             let permits = self.ledger().rollback(change);
             debug_assert!(permits.is_empty());
             self.clear_table_transaction();
-            drop(backing);
-            return Err(SystemCallError::OutOfMemory);
+            return Err((SystemCallError::OutOfMemory, reclaimed));
         }
-        let mut translations = Vec::new();
-        if translations.try_reserve_exact(preflights.len()).is_err() {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            drop(backing);
-            return Err(SystemCallError::OutOfMemory);
-        }
-        for (preflight, owners) in preflights.into_iter().zip(funded) {
-            match self.tt().prepare(preflight, owners) {
-                Ok(translation) => translations.push(translation),
-                Err(failure) => {
-                    let permits = self.ledger().rollback(change);
-                    debug_assert!(permits.is_empty());
-                    self.clear_table_transaction();
-                    drop(backing);
-                    return Err(map_public_space_error(failure.error.into()));
-                }
-            }
-        }
-        let mut table_outcomes = Vec::new();
-        if table_outcomes
-            .try_reserve_exact(translations.len())
+        if reclaimed
+            .translations
+            .try_reserve_exact(preflights.len())
             .is_err()
         {
             let permits = self.ledger().rollback(change);
             debug_assert!(permits.is_empty());
             self.clear_table_transaction();
-            drop(translations);
-            drop(backing);
-            return Err(SystemCallError::OutOfMemory);
+            return Err((SystemCallError::OutOfMemory, reclaimed));
+        }
+        for index in 0..preflights.len() {
+            let owners = core::mem::take(&mut reclaimed.funded[index]);
+            match self.tt().prepare(preflights[index], owners) {
+                Ok(translation) => reclaimed.translations.push(translation),
+                Err(failure) => {
+                    let permits = self.ledger().rollback(change);
+                    debug_assert!(permits.is_empty());
+                    self.clear_table_transaction();
+                    reclaimed.failed_owners = Some(failure.owners);
+                    return Err((map_public_space_error(failure.error.into()), reclaimed));
+                }
+            }
+        }
+        let mut table_outcomes = Vec::new();
+        if table_outcomes
+            .try_reserve_exact(reclaimed.translations.len())
+            .is_err()
+        {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            self.clear_table_transaction();
+            return Err((SystemCallError::OutOfMemory, reclaimed));
         }
         let mut token = match PreparedUserMemory::allocate() {
             Ok(token) => token,
@@ -1928,15 +2100,13 @@ impl BoundAddressSpace {
                 let permits = self.ledger().rollback(change);
                 debug_assert!(permits.is_empty());
                 self.clear_table_transaction();
-                drop(translations);
-                drop(backing);
-                return Err(error);
+                return Err((error, reclaimed));
             }
         };
         token.install(UserMemoryReservation {
             change,
-            backing,
-            translations,
+            backing: reclaimed.backing.take(),
+            translations: core::mem::take(&mut reclaimed.translations),
             table_outcomes,
             result,
         });
@@ -2034,7 +2204,7 @@ impl BoundAddressSpace {
             .write_payload();
     }
 
-    fn rollback_user_memory(&mut self, prepared: PreparedUserMemory) {
+    fn rollback_user_memory(&mut self, prepared: PreparedUserMemory) -> ReclaimedTableFrames {
         self.clear_table_transaction();
         let UserMemoryReservation {
             change,
@@ -2045,12 +2215,16 @@ impl BoundAddressSpace {
         } = prepared.take();
         let permits = self.ledger().rollback(change);
         debug_assert!(permits.is_empty());
-        drop(translations);
         drop(table_outcomes);
-        drop(backing);
+        ReclaimedTableFrames {
+            funded: Vec::new(),
+            translations,
+            failed_owners: None,
+            backing,
+        }
     }
 
-    fn rollback_user_memory_plan(&mut self, plan: UserMemoryPlan) {
+    fn rollback_user_memory_plan(&mut self, plan: UserMemoryPlan) -> ReclaimedTableFrames {
         self.clear_table_transaction();
         let UserMemoryPlan {
             change,
@@ -2060,7 +2234,12 @@ impl BoundAddressSpace {
         } = plan;
         let permits = self.ledger().rollback(change);
         debug_assert!(permits.is_empty());
-        drop(backing);
+        ReclaimedTableFrames {
+            funded: Vec::new(),
+            translations: Vec::new(),
+            failed_owners: None,
+            backing,
+        }
     }
 
     fn commit_user_memory(&mut self, prepared: PreparedUserMemory) -> PublishedSpaceChange {
@@ -2094,119 +2273,7 @@ impl BoundAddressSpace {
         }
     }
 
-    fn map_owned_backing_with_owner(
-        &mut self,
-        vaddr: usize,
-        protection: Protection,
-        class: AnonymousClass,
-        owner: RegionOwner,
-        backing: OwnedBacking,
-    ) -> Result<(), SpaceError> {
-        self.ensure_table_transaction_available()?;
-        let prepared = self.prepare_owned_backing(vaddr, protection, class, owner, backing)?;
-        let published = self.commit_owned_mapping(prepared);
-        self.finish_empty_published_change(published);
-        Ok(())
-    }
-
-    fn map_owned_anonymous(
-        &mut self,
-        vaddr: usize,
-        len: usize,
-        protection: Protection,
-    ) -> Result<(), SpaceError> {
-        let identity = self.mint_backing()?;
-        let backing = OwnedBacking::allocate(identity, len / PAGE_SIZE)?;
-        let class = if protection == Protection::ReadExecute {
-            AnonymousClass::InitialExecutable
-        } else {
-            AnonymousClass::Data
-        };
-        self.map_owned_backing(vaddr, protection, class, backing)
-    }
-
-    fn prepare_owned_backing(
-        &mut self,
-        vaddr: usize,
-        protection: Protection,
-        class: AnonymousClass,
-        owner: RegionOwner,
-        backing: OwnedBacking,
-    ) -> Result<PreparedOwnedMapping, SpaceError> {
-        let len = backing
-            .pages
-            .checked_mul(PAGE_SIZE)
-            .ok_or(SpaceError::BadSegment)?;
-        let validated = self
-            .ledger()
-            .validate_map(MapRequest {
-                bytes: len,
-                guard_before: 0,
-                guard_after: 0,
-                placement: MapPlacement::FixedEmpty {
-                    usable_start: vaddr,
-                },
-                current: protection,
-                maximum: protection,
-                owner,
-                backing: MapBacking::Anonymous {
-                    identity: backing.identity,
-                    class,
-                },
-                result: None,
-            })
-            .map_err(map_change_error)?;
-        let change = self
-            .ledger()
-            .reserve(validated, Vec::new())
-            .map_err(|failure| map_change_error(failure.error))?;
-        if self.backings.try_reserve(1).is_err() {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            return Err(SpaceError::NoFrame);
-        }
-        let intent = match change.translation_intents() {
-            [
-                TranslationIntent::Install {
-                    range,
-                    backing:
-                        memory_space::BackingView::Anonymous {
-                            identity: intent_identity,
-                            offset,
-                            ..
-                        },
-                    protection,
-                },
-            ] if *intent_identity == backing.identity => (*range, *offset, *protection),
-            _ => panic!("anonymous map planner returned an invalid translation plan"),
-        };
-        let translations = match backing.prepare_install(self.tt(), intent.0, intent.1, intent.2) {
-            Ok(translations) => translations,
-            Err(error) => {
-                let permits = self.ledger().rollback(change);
-                debug_assert!(permits.is_empty());
-                return Err(error);
-            }
-        };
-        let mut table_outcomes = Vec::new();
-        if table_outcomes
-            .try_reserve_exact(translations.len())
-            .is_err()
-        {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            return Err(SpaceError::NoFrame);
-        }
-        Ok(PreparedOwnedMapping {
-            backing,
-            change,
-            translations,
-            table_outcomes,
-            building_image_end: None,
-        })
-    }
-
-    pub(crate) fn plan_owned_mapping(
+    fn plan_owned_mapping(
         &mut self,
         vaddr: usize,
         protection: Protection,
@@ -2300,75 +2367,93 @@ impl BoundAddressSpace {
         &mut self,
         plan: OwnedMappingPlan,
         funded: Vec<Vec<TableFrameToken>>,
-    ) -> Result<Vec<TableFrameToken>, SpaceError> {
+    ) -> Result<PublishedTableChanges, (SpaceError, ReclaimedTableFrames)> {
         let prepared = self.complete_owned_mapping(plan, funded)?;
         let published = self.commit_owned_mapping(prepared);
         Ok(self.finish_empty_published_change(published))
     }
 
-    pub(crate) fn complete_owned_mapping(
+    fn complete_owned_mapping(
         &mut self,
         plan: OwnedMappingPlan,
         funded: Vec<Vec<TableFrameToken>>,
-    ) -> Result<PreparedOwnedMapping, SpaceError> {
+    ) -> Result<PreparedOwnedMapping, (SpaceError, ReclaimedTableFrames)> {
         let OwnedMappingPlan {
             backing,
             change,
             preflights,
             building_image_end,
         } = plan;
-        if funded.len() != preflights.len() {
+        let mut reclaimed = ReclaimedTableFrames {
+            funded,
+            translations: Vec::new(),
+            failed_owners: None,
+            backing: Some(backing),
+        };
+        if reclaimed.funded.len() != preflights.len() {
             let permits = self.ledger().rollback(change);
             debug_assert!(permits.is_empty());
             self.clear_table_transaction();
-            drop(backing);
-            return Err(SpaceError::NoFrame);
+            return Err((SpaceError::NoFrame, reclaimed));
         }
-        let mut translations = Vec::new();
-        if translations.try_reserve_exact(preflights.len()).is_err() {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            drop(backing);
-            return Err(SpaceError::NoFrame);
-        }
-        for (preflight, owners) in preflights.into_iter().zip(funded) {
-            match self.tt().prepare(preflight, owners) {
-                Ok(translation) => translations.push(translation),
-                Err(failure) => {
-                    let permits = self.ledger().rollback(change);
-                    debug_assert!(permits.is_empty());
-                    self.clear_table_transaction();
-                    drop(backing);
-                    return Err(failure.error.into());
-                }
-            }
-        }
-        let mut table_outcomes = Vec::new();
-        if table_outcomes
-            .try_reserve_exact(translations.len())
+        if reclaimed
+            .translations
+            .try_reserve_exact(preflights.len())
             .is_err()
         {
             let permits = self.ledger().rollback(change);
             debug_assert!(permits.is_empty());
             self.clear_table_transaction();
-            drop(backing);
-            return Err(SpaceError::NoFrame);
+            return Err((SpaceError::NoFrame, reclaimed));
+        }
+        for index in 0..preflights.len() {
+            let owners = core::mem::take(&mut reclaimed.funded[index]);
+            match self.tt().prepare(preflights[index], owners) {
+                Ok(translation) => reclaimed.translations.push(translation),
+                Err(failure) => {
+                    let permits = self.ledger().rollback(change);
+                    debug_assert!(permits.is_empty());
+                    self.clear_table_transaction();
+                    reclaimed.failed_owners = Some(failure.owners);
+                    return Err((failure.error.into(), reclaimed));
+                }
+            }
+        }
+        let mut table_outcomes = Vec::new();
+        if table_outcomes
+            .try_reserve_exact(reclaimed.translations.len())
+            .is_err()
+        {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            self.clear_table_transaction();
+            return Err((SpaceError::NoFrame, reclaimed));
         }
         Ok(PreparedOwnedMapping {
-            backing,
+            backing: reclaimed
+                .backing
+                .take()
+                .expect("owned mapping backing exists"),
             change,
-            translations,
+            translations: core::mem::take(&mut reclaimed.translations),
             table_outcomes,
             building_image_end,
         })
     }
 
-    pub(crate) fn rollback_owned_mapping_plan(&mut self, plan: OwnedMappingPlan) {
+    pub(crate) fn rollback_owned_mapping_plan(
+        &mut self,
+        plan: OwnedMappingPlan,
+    ) -> ReclaimedTableFrames {
         self.clear_table_transaction();
         let permits = self.ledger().rollback(plan.change);
         debug_assert!(permits.is_empty());
-        drop(plan.backing);
+        ReclaimedTableFrames {
+            funded: Vec::new(),
+            translations: Vec::new(),
+            failed_owners: None,
+            backing: Some(plan.backing),
+        }
     }
 
     fn commit_owned_mapping(&mut self, prepared: PreparedOwnedMapping) -> PublishedSpaceChange {
@@ -2445,25 +2530,20 @@ impl BoundAddressSpace {
     fn finish_empty_published_change(
         &mut self,
         published: PublishedSpaceChange,
-    ) -> Vec<TableFrameToken> {
-        let mut change = self.begin_retire_published_change(published);
+    ) -> PublishedTableChanges {
+        let change = self.begin_retire_published_change(published);
         assert!(change.batch.is_empty());
-        let mut released = Vec::new();
-        loop {
-            match change.tables.retire_step() {
-                TableRetireStep::Owner(owner) => released.push(owner),
-                TableRetireStep::Progress => {}
-                TableRetireStep::Complete => break,
-            }
-        }
-        self.complete_retiring_change(
-            change
-                .ledger
-                .take()
-                .expect("empty memory change completed twice"),
-            &change.batch,
-        );
-        released
+        let RetiringSpaceChange {
+            ledger,
+            batch,
+            tables,
+            backing,
+            tables_complete,
+        } = change;
+        debug_assert!(backing.is_none());
+        debug_assert!(!tables_complete);
+        self.complete_retiring_change(ledger.expect("empty memory change completed twice"), &batch);
+        tables
     }
 
     #[inline(never)]
@@ -2559,29 +2639,40 @@ impl BoundAddressSpace {
         &mut self,
         plan: ObjectMappingPlan,
         owners: Vec<TableFrameToken>,
-    ) -> Result<PreparedObjectMapping, ObjectMapFailure> {
+    ) -> Result<PreparedObjectMapping, (ObjectMapFailure, ReclaimedTableFrames)> {
         let ObjectMappingPlan {
             change,
             preflight,
             lease,
         } = plan;
+        let mut reclaimed = ReclaimedTableFrames {
+            funded: Vec::new(),
+            translations: Vec::new(),
+            failed_owners: Some(owners),
+            backing: None,
+        };
         let mut token = match PreparedObjectMapping::allocate() {
             Ok(token) => token,
             Err(error) => {
                 let permits = self.ledger().rollback(change);
                 self.clear_table_transaction();
-                return Err(ObjectMapFailure { error, permits });
+                return Err((ObjectMapFailure { error, permits }, reclaimed));
             }
         };
+        let owners = reclaimed.failed_owners.take().expect("object owners exist");
         let translation = match self.tt().prepare(preflight, owners) {
             Ok(translation) => translation,
             Err(failure) => {
                 let permits = self.ledger().rollback(change);
                 self.clear_table_transaction();
-                return Err(ObjectMapFailure {
-                    error: failure.error.into(),
-                    permits,
-                });
+                reclaimed.failed_owners = Some(failure.owners);
+                return Err((
+                    ObjectMapFailure {
+                        error: failure.error.into(),
+                        permits,
+                    },
+                    reclaimed,
+                ));
             }
         };
         token.install(ObjectMappingReservation {
@@ -2605,17 +2696,16 @@ impl BoundAddressSpace {
     pub(crate) fn rollback_object_mapping(
         &mut self,
         prepared: PreparedObjectMapping,
-    ) -> Vec<WritePermit> {
+    ) -> (Vec<WritePermit>, PreparedTranslation<TableFrameToken>) {
         self.clear_table_transaction();
         let ObjectMappingReservation {
             change,
             translation,
             ..
         } = prepared.take();
-        drop(translation);
         let permits = self.ledger().rollback(change);
         assert_eq!(permits.len(), 1, "object Map rollback lost its permit");
-        permits
+        (permits, translation)
     }
 
     pub(crate) fn commit_object_mapping(
@@ -2696,7 +2786,7 @@ impl BoundAddressSpace {
         &mut self,
         plan: ObjectUnmapPlan,
         owners: Vec<TableFrameToken>,
-    ) -> Result<PreparedObjectUnmap, SpaceError> {
+    ) -> Result<PreparedObjectUnmap, (SpaceError, Vec<TableFrameToken>)> {
         let ObjectUnmapPlan { change, preflight } = plan;
         let mut token = match PreparedObjectUnmap::allocate() {
             Ok(token) => token,
@@ -2704,7 +2794,8 @@ impl BoundAddressSpace {
                 let permits = self.ledger().rollback(change);
                 debug_assert!(permits.is_empty());
                 self.clear_table_transaction();
-                return Err(error);
+                drop(permits);
+                return Err((error, owners));
             }
         };
         let translation = match self.tt().prepare(preflight, owners) {
@@ -2713,7 +2804,8 @@ impl BoundAddressSpace {
                 let permits = self.ledger().rollback(change);
                 debug_assert!(permits.is_empty());
                 self.clear_table_transaction();
-                return Err(failure.error.into());
+                drop(permits);
+                return Err((failure.error.into(), failure.owners));
             }
         };
         token.install(ObjectUnmapReservation {
@@ -2723,15 +2815,18 @@ impl BoundAddressSpace {
         Ok(token)
     }
 
-    pub(crate) fn rollback_object_unmap(&mut self, prepared: PreparedObjectUnmap) {
+    pub(crate) fn rollback_object_unmap(
+        &mut self,
+        prepared: PreparedObjectUnmap,
+    ) -> PreparedTranslation<TableFrameToken> {
         self.clear_table_transaction();
         let ObjectUnmapReservation {
             change,
             translation,
         } = prepared.take();
-        drop(translation);
         let permits = self.ledger().rollback(change);
         debug_assert!(permits.is_empty());
+        translation
     }
 
     pub(crate) fn rollback_object_unmap_plan(&mut self, plan: ObjectUnmapPlan) {
@@ -2761,22 +2856,6 @@ impl BoundAddressSpace {
         }
     }
 
-    fn map_owned_backing(
-        &mut self,
-        vaddr: usize,
-        protection: Protection,
-        class: AnonymousClass,
-        backing: OwnedBacking,
-    ) -> Result<(), SpaceError> {
-        self.map_owned_backing_with_owner(
-            vaddr,
-            protection,
-            class,
-            RegionOwner::AddressSpace,
-            backing,
-        )
-    }
-
     pub(crate) fn plan_building_anonymous(
         &mut self,
         vaddr: usize,
@@ -2801,39 +2880,7 @@ impl BoundAddressSpace {
         plan.building_image_end = (end <= stack_base).then_some(end);
         Ok(plan)
     }
-    pub(crate) fn advance_building_image_end(&mut self, end: usize) {
-        if end <= USER_TOP - STACK_SIZE {
-            self.image_end = self.image_end.max(end);
-        }
-    }
-    /// 为 Building process 映射 anonymous zero pages。映像区与固定主栈
     /// 窗口不能由一次调用跨越；只有映像区推进 StartupBlock/heap 基准。
-    pub fn map_anonymous(
-        &mut self,
-        vaddr: usize,
-        len: usize,
-        permissions: ProcessMapFlags,
-    ) -> Result<(), SpaceError> {
-        if len == 0
-            || vaddr % PAGE_SIZE != 0
-            || len % PAGE_SIZE != 0
-            || !permissions.is_known()
-            || permissions.raw() == 0
-        {
-            return Err(SpaceError::BadSegment);
-        }
-        let protection = process_protection(permissions)?;
-        let end = vaddr.checked_add(len).ok_or(SpaceError::BadSegment)?;
-        let stack_base = USER_TOP - STACK_SIZE;
-        if end > USER_TOP || vaddr < stack_base && end > stack_base {
-            return Err(SpaceError::BadSegment);
-        }
-        self.map_owned_anonymous(vaddr, len, protection)?;
-        if end <= stack_base {
-            self.image_end = self.image_end.max(end);
-        }
-        Ok(())
-    }
 
     /// Building-only 回填；先验证完整目标区间已映射，再经物理直映射写入，
     /// 不要求目标最终 PTE 可写。
@@ -2974,18 +3021,6 @@ impl BoundAddressSpace {
         ))
     }
 
-    pub fn load_elf(
-        &mut self,
-        segments: &[elf::LoadSegment],
-        file: &[u8],
-    ) -> Result<(), SpaceError> {
-        let (runs, image_end) = self.plan_elf_layout(segments)?;
-        for (vaddr, len, protection) in runs {
-            self.map_owned_anonymous(vaddr, len, protection)?;
-        }
-        self.write_elf_segments(segments, file, image_end)
-    }
-
     pub(crate) fn plan_elf_mappings(
         &mut self,
         segments: &[elf::LoadSegment],
@@ -3022,70 +3057,6 @@ impl BoundAddressSpace {
         image_end: usize,
     ) -> Result<(), SpaceError> {
         self.write_elf_segments(segments, file, image_end)
-    }
-
-    /// Bootstrap 专用 init 栈映射：[USER_TOP - STACK_SIZE, USER_TOP)。
-    /// 普通进程的栈由组装者（libprocess）经 ProcessMap 供给，内核不参与
-    /// （bootstrap 例外：进程未启动、无用户代码可分配）。
-    pub fn map_stack(&mut self) -> Result<(), SpaceError> {
-        self.map_owned_anonymous(USER_TOP - STACK_SIZE, STACK_SIZE, Protection::ReadWrite)
-    }
-
-    /// Bootstrap 专用出生块：prefix 使用普通 root-funded anonymous backing；紧随其后的
-    /// opaque payload 由外层强持已资金化 owner，本函数只在可失败映射期建立借用投影。
-    /// 该入口不由 syscall 暴露，payload frame 与 root Pool charge 随同一个 owner 退休。
-    pub fn map_bootstrap_block(
-        &mut self,
-        prefix: &[u8],
-        payload: Option<&frame::BootFundedExtent>,
-        payload_len: usize,
-    ) -> Result<usize, SpaceError> {
-        if prefix.is_empty() || prefix.len() % PAGE_SIZE != 0 || self.image_end == 0 {
-            return Err(SpaceError::BadSegment);
-        }
-        let payload_pages = payload_len.div_ceil(PAGE_SIZE);
-        if payload.as_ref().map_or(0, |extent| extent.pages()) != payload_pages {
-            return Err(SpaceError::BadSegment);
-        }
-        let base = self.image_end;
-        let prefix_pages = prefix.len() / PAGE_SIZE;
-        let pages = prefix_pages
-            .checked_add(payload_pages)
-            .ok_or(SpaceError::BadSegment)?;
-        let span = pages.checked_mul(PAGE_SIZE).ok_or(SpaceError::BadSegment)?;
-        let end = base.checked_add(span).ok_or(SpaceError::BadSegment)?;
-        if end > USER_TOP - STACK_SIZE {
-            return Err(SpaceError::BadSegment);
-        }
-
-        let identity = self.mint_backing()?;
-        let mut backing = OwnedBacking::allocate(identity, prefix_pages)?;
-        if let Some(payload) = payload {
-            backing
-                .extents
-                .try_reserve(1)
-                .map_err(|_| SpaceError::NoFrame)?;
-            backing.extents.push(BackingExtent {
-                offset_pages: prefix_pages,
-                owner: BackingExtentOwner::BootBorrowed {
-                    base: payload.base(),
-                    pages: payload.pages(),
-                },
-            });
-            backing.pages = pages;
-        }
-        // 在任何 ledger/PTE 发布前完成 prefix 回填，使成功映射之后只剩不可失败 owner 移交。
-        backing.write_from_start(prefix);
-        let lease = self.mint_lease()?;
-        self.map_owned_backing_with_owner(
-            base,
-            Protection::ReadOnly,
-            AnonymousClass::Data,
-            RegionOwner::Lease(lease),
-            backing,
-        )?;
-        self.image_end = end;
-        Ok(base)
     }
 
     /// Bootstrap map 完成全部可失败工作后，把对外层 funded owner 的临时投影替换为
@@ -3805,15 +3776,13 @@ pub fn spawn_from_elf(
     )?);
     super::process::bind_memory_internal(&process, Arc::clone(&root_pool)).map_err(|error| {
         match error {
-            SystemCallError::ReachLimit => SpaceError::Conflict,
+            SystemCallError::QuotaExceeded => SpaceError::QuotaExceeded,
+            SystemCallError::ReachLimit => SpaceError::ReachLimit,
             _ => SpaceError::NoFrame,
         }
     })?;
-    {
-        let mut space = process.space.lock();
-        space.load_elf(&image.segments, file)?;
-        space.map_stack()?;
-    }
+    process.space.load_elf(&image.segments, file)?;
+    process.space.map_stack()?;
     Ok(SpawnedProcess {
         process,
         entry: image.entry as usize,
@@ -3958,24 +3927,24 @@ pub fn launch_bootstrap(
     };
 
     let block_len = block.len() + payload.len();
-    let block_va = match process.space.lock().map_bootstrap_block(
-        &block,
-        payload_funded.as_ref(),
-        payload.len(),
-    ) {
-        Ok(va) => va,
-        Err(error) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
+    let block_va =
+        match process
+            .space
+            .map_bootstrap_block(&block, payload_funded.as_ref(), payload.len())
+        {
+            Ok(va) => va,
+            Err(error) => {
+                process
+                    .handles
+                    .lock()
+                    .rollback(reservation)
+                    .expect("launch reservation must remain owned");
+                for handle in handles {
+                    super::handle::close_entry_infallible(handle, &process, true);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     if let Some(funded) = payload_funded {
         process.space.lock().install_bootstrap_funding(funded);
     }

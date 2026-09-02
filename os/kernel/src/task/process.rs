@@ -604,16 +604,25 @@ pub fn map(
     };
     let funded = match super::proc::fund_owned_mapping(&pool, &plan) {
         Ok(funded) => funded,
-        Err(_) => {
-            process.space.lock().rollback_owned_mapping_plan(plan);
-            return Err(SystemCallError::OutOfMemory);
+        Err(error) => {
+            let reclaimed = process.space.lock().rollback_owned_mapping_plan(plan);
+            drop(reclaimed);
+            return Err(map_space_error(error));
         }
     };
-    let released = process
-        .space
-        .lock()
-        .complete_anonymous_mapping(plan, funded)
-        .map_err(map_space_error)?;
+    let released = {
+        let result = process
+            .space
+            .lock()
+            .complete_anonymous_mapping(plan, funded);
+        match result {
+            Ok(released) => released,
+            Err((error, reclaimed)) => {
+                drop(reclaimed);
+                return Err(map_space_error(error));
+            }
+        }
+    };
     drop(released);
     Ok(())
 }
@@ -1108,6 +1117,8 @@ fn concrete_control(object: &ObjectRef) -> Result<Arc<ProcessControl>, SystemCal
 fn map_space_error(error: SpaceError) -> SystemCallError {
     match error {
         SpaceError::NoFrame => SystemCallError::OutOfMemory,
+        SpaceError::QuotaExceeded => SystemCallError::QuotaExceeded,
+        SpaceError::ReachLimit => SystemCallError::ReachLimit,
         SpaceError::BadSegment => SystemCallError::IllegalArgument,
         SpaceError::Conflict => SystemCallError::InvalidAddress,
         SpaceError::Busy => SystemCallError::ObjectBusy,

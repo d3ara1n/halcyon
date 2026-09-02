@@ -132,6 +132,40 @@ impl MemoryPool {
             baseline,
             "committed Pool credit did not return to its parent"
         );
+
+        let frames_baseline = crate::frame::free_frames();
+        let permit = PoolCorePermit::primordial().expect("Pool self-test admission failed");
+        let header = ObjectHeader::try_new().expect("Pool self-test identity exhausted");
+        let reservation =
+            Self::reserve_delegation(root, 1).expect("Pool self-test reservation failed");
+        let child = Self::prepared_child(Arc::clone(root), reservation, permit, header)
+            .expect("Pool self-test child preparation failed");
+        child.commit_prepared();
+        let child_baseline = child.snapshot();
+        let error = match super::proc::supply_funded_table_frames(&child, 2) {
+            Ok(_) => panic!("quota-limited table funding unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, super::proc::SpaceError::QuotaExceeded),
+            "quota-limited table funding lost its public error class: {error:?}"
+        );
+        assert_eq!(
+            child.snapshot(),
+            child_baseline,
+            "failed table funding changed child Pool accounting"
+        );
+        assert_eq!(
+            crate::frame::free_frames(),
+            frames_baseline,
+            "failed table funding leaked user inventory"
+        );
+        drop(child);
+        assert_eq!(
+            root.snapshot(),
+            baseline,
+            "quota failure child did not return delegated credit"
+        );
         log!(
             Memory,
             "Pool self-test passed: rollback, commit, and last-reference refund ok"

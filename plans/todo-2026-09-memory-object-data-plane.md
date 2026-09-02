@@ -177,7 +177,7 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 让 TranslationTree 的 root、中间表、mega split 与未来 replacement 全部持有来源 Pool 的单页 funded owner。Bind 在 AddressSpace 发布前锁外准备 root；Map/Unmap/Protect 依 6B seam 锁外取得完整表页集合。PoolBinding 只表达绑定 authority 与资源来源，不保留与树重复的 root 所有权。Building `ProcessMap` 也采用相同的 plan → 锁外 funding → complete/commit 事务；`image_end` 作为 Building plan 的提交后状态，仅由映像区映射推进，固定主栈映射不改变它。错误路径必须保持 `QuotaExceeded`、`OutOfMemory`、`ReachLimit` 与 `ObjectBusy` 的既有区分。
 
-本批当前实现已完成 root owner 移交、Running anonymous mapping、Tunnel object mapping/unmapping 以及 Building `ProcessMap` 的 funded table transaction；transaction gate 跨锁保持，funding 或 complete 失败回滚 ledger、backing 与 gate，object unmap 的 prepared allocation 失败也已补齐回滚。尚未收口的部分是 Building/ELF/bootstrap 其余调用点的 transitional raw 页表 API 删除，以及 funded error 到公开错误的完整分类保持。
+本批已完成：root owner、Running anonymous mapping、Tunnel object mapping/unmapping、Building `ProcessMap`、ELF、bootstrap 与 init stack 全部统一为 plan → 锁外 funded table → complete/commit；`TableFrameToken::Raw`、`supply_raw_table_frames` 与旧同步 `prepare_install` 已删除。funded frame 的 quota、结构上限、物理库存错误保持为 `QuotaExceeded`、`ReachLimit`、`OutOfMemory`，并补入额度不足时 Pool/FramePool 基线不变的启动自检。
 
 验证：Bind 与全部 mapping 路径的 root/table 页数守恒、quota/库存/extent/metadata 故障零发布、mega split、Unmap 后表页延迟退款、AddressSpace drain 中断接管；重复 map/unmap 后除 live root 外 Pool 与 FramePool 回到对应基线。随批补入 ThreadSpawn 后才可达的确定性场景：并发线程解除 park 在途 WaitMany 的结果页映射，断言写回复检失败以 MemoryNotAccessible 错误返回等待线程且进程存活。
 

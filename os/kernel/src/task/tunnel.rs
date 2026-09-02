@@ -355,7 +355,10 @@ fn prepare_mapping(
 fn rollback_mapping(
     space: &mut AddressSpaceState,
     prepared: PreparedObjectMapping,
-) -> Vec<memory_space::WritePermit> {
+) -> (
+    Vec<memory_space::WritePermit>,
+    page_table::PreparedTranslation<super::proc::TableFrameToken>,
+) {
     space.rollback_object_mapping(prepared)
 }
 
@@ -580,7 +583,7 @@ pub fn create(
         };
         let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
             Ok(owners) => owners,
-            Err(_) => {
+            Err(error) => {
                 let permits = thread
                     .process
                     .space
@@ -590,15 +593,16 @@ pub fn create(
                 table
                     .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                     .expect("TunnelCreate reservation must remain owned");
-                return Err(SystemCallError::OutOfMemory);
+                return Err(map_space_error(error));
             }
         };
         let mut space = thread.process.space.lock();
         match space.complete_object_mapping(plan, owners) {
             Ok(prepared) => Some(prepared),
-            Err(failure) => {
+            Err((failure, reclaimed)) => {
                 drop(space);
                 cancel_writes(&connection, failure.permits);
+                drop(reclaimed);
                 table
                     .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                     .expect("TunnelCreate reservation must remain owned");
@@ -611,13 +615,14 @@ pub fn create(
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            let permits = {
+            let (permits, translation) = {
                 let mut space = thread.process.space.lock();
                 rollback_mapping(
                     &mut space,
                     mapping.take().expect("TunnelCreate mapping exists"),
                 )
             };
+            drop(translation);
             cancel_writes(&connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
@@ -633,13 +638,14 @@ pub fn create(
     {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            let permits = {
+            let (permits, translation) = {
                 let mut space = thread.process.space.lock();
                 rollback_mapping(
                     &mut space,
                     mapping.take().expect("TunnelCreate mapping exists"),
                 )
             };
+            drop(translation);
             cancel_writes(&connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
@@ -655,11 +661,12 @@ pub fn create(
         if let Err(error) =
             unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &pair) }
         {
-            let permits = rollback_mapping(
+            let (permits, translation) = rollback_mapping(
                 &mut space,
                 mapping.take().expect("TunnelCreate mapping exists"),
             );
             drop(space);
+            drop(translation);
             cancel_writes(&connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
@@ -698,7 +705,7 @@ pub fn create(
     let (published, synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            let permits = {
+            let (permits, translation) = {
                 let mut space = thread.process.space.lock();
                 rollback_mapping(
                     &mut space,
@@ -707,6 +714,7 @@ pub fn create(
                         .expect("stale TunnelCreate mapping must roll back"),
                 )
             };
+            drop(translation);
             cancel_writes(&connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
@@ -811,7 +819,7 @@ pub fn attach(
         };
         let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
             Ok(owners) => owners,
-            Err(_) => {
+            Err(error) => {
                 let permits = thread
                     .process
                     .space
@@ -821,15 +829,16 @@ pub fn attach(
                 table
                     .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                     .expect("TunnelAttach reservation must remain owned");
-                return Err(SystemCallError::OutOfMemory);
+                return Err(map_space_error(error));
             }
         };
         let mut space = thread.process.space.lock();
         match space.complete_object_mapping(plan, owners) {
             Ok(prepared) => Some(prepared),
-            Err(failure) => {
+            Err((failure, reclaimed)) => {
                 drop(space);
                 cancel_writes(&invitation.connection, failure.permits);
+                drop(reclaimed);
                 table
                     .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                     .expect("TunnelAttach reservation must remain owned");
@@ -842,13 +851,14 @@ pub fn attach(
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            let permits = {
+            let (permits, translation) = {
                 let mut space = thread.process.space.lock();
                 rollback_mapping(
                     &mut space,
                     mapping.take().expect("TunnelAttach mapping exists"),
                 )
             };
+            drop(translation);
             cancel_writes(&invitation.connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
@@ -864,13 +874,14 @@ pub fn attach(
     {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            let permits = {
+            let (permits, translation) = {
                 let mut space = thread.process.space.lock();
                 rollback_mapping(
                     &mut space,
                     mapping.take().expect("TunnelAttach mapping exists"),
                 )
             };
+            drop(translation);
             cancel_writes(&invitation.connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
@@ -885,11 +896,12 @@ pub fn attach(
         if let Err(error) =
             unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &endpoint_handle) }
         {
-            let permits = rollback_mapping(
+            let (permits, translation) = rollback_mapping(
                 &mut space,
                 mapping.take().expect("TunnelAttach mapping exists"),
             );
             drop(space);
+            drop(translation);
             cancel_writes(&invitation.connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
@@ -929,7 +941,7 @@ pub fn attach(
     let ((consumed, published), synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            let permits = {
+            let (permits, translation) = {
                 let mut space = thread.process.space.lock();
                 rollback_mapping(
                     &mut space,
@@ -938,6 +950,7 @@ pub fn attach(
                         .expect("stale TunnelAttach mapping must roll back"),
                 )
             };
+            drop(translation);
             cancel_writes(&invitation.connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
@@ -987,19 +1000,26 @@ pub(crate) fn close_handle(
         };
         let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
             Ok(owners) => owners,
-            Err(_) => {
+            Err(error) => {
                 thread.process.space.lock().rollback_object_unmap_plan(plan);
-                return Err(SystemCallError::OutOfMemory);
+                return Err(map_space_error(error));
             }
         };
-        Some(
-            thread
+        let prepared = {
+            let result = thread
                 .process
                 .space
                 .lock()
-                .complete_object_unmap(plan, owners)
-                .map_err(map_space_error)?,
-        )
+                .complete_object_unmap(plan, owners);
+            match result {
+                Ok(prepared) => prepared,
+                Err((error, owners)) => {
+                    drop(owners);
+                    return Err(map_space_error(error));
+                }
+            }
+        };
+        Some(prepared)
     };
     let retire = match Arc::try_new(LeaseRetire::new(
         endpoint.connection.clone(),
@@ -1008,11 +1028,12 @@ pub(crate) fn close_handle(
     )) {
         Ok(retire) => retire,
         Err(_) => {
-            thread
+            let translation = thread
                 .process
                 .space
                 .lock()
                 .rollback_object_unmap(unmap.take().expect("Tunnel close Unmap exists"));
+            drop(translation);
             return Err(SystemCallError::OutOfMemory);
         }
     };
@@ -1021,11 +1042,12 @@ pub(crate) fn close_handle(
         match prepare_memory_completion(thread.process.clone(), 0, Some(retire_sink), None) {
             Ok(prepared) => prepared,
             Err(error) => {
-                thread
+                let translation = thread
                     .process
                     .space
                     .lock()
                     .rollback_object_unmap(unmap.take().expect("Tunnel close Unmap exists"));
+                drop(translation);
                 return Err(error);
             }
         };
@@ -1037,11 +1059,12 @@ pub(crate) fn close_handle(
     {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            thread
+            let translation = thread
                 .process
                 .space
                 .lock()
                 .rollback_object_unmap(unmap.take().expect("Tunnel close Unmap exists"));
+            drop(translation);
             return Err(map_shootdown_error(error));
         }
     };
@@ -1071,16 +1094,17 @@ pub(crate) fn close_handle(
             (entry, published)
         },
     );
-    let ((entry, published), synchronization) =
-        match committed {
-            Ok(committed) => committed,
-            Err(_) => {
+    let ((entry, published), synchronization) = match committed {
+        Ok(committed) => committed,
+        Err(_) => {
+            let translation =
                 thread.process.space.lock().rollback_object_unmap(
                     unmap.take().expect("stale Tunnel close must roll back"),
                 );
-                return Err(SystemCallError::ObjectBusy);
-            }
-        };
+            drop(translation);
+            return Err(SystemCallError::ObjectBusy);
+        }
+    };
     drop(connection_state);
     drop(table);
     drop(entry.into_parts()); // lifecycle 已由本事务提交，不重复调用对象 callback。
@@ -1147,10 +1171,16 @@ pub(crate) fn close_detached(
             return Err(entry);
         }
     };
-    let mut space = owner.space.lock();
-    let prepared = match space.complete_object_unmap(plan, owners) {
-        Ok(prepared) => prepared,
-        Err(error) => panic!("detached Tunnel close funding invariant failed: {error:?}"),
+    let (prepared, mut space) = {
+        let mut space = owner.space.lock();
+        match space.complete_object_unmap(plan, owners) {
+            Ok(prepared) => (prepared, space),
+            Err((error, owners)) => {
+                drop(space);
+                drop(owners);
+                panic!("detached Tunnel close funding invariant failed: {error:?}");
+            }
+        }
     };
     let installed = connection_state.leases[endpoint.side]
         .take()
@@ -1230,6 +1260,8 @@ fn map_space_error(error: super::proc::SpaceError) -> SystemCallError {
     match error {
         super::proc::SpaceError::BadSegment => SystemCallError::IllegalArgument,
         super::proc::SpaceError::NoFrame => SystemCallError::OutOfMemory,
+        super::proc::SpaceError::QuotaExceeded => SystemCallError::QuotaExceeded,
+        super::proc::SpaceError::ReachLimit => SystemCallError::ReachLimit,
         super::proc::SpaceError::Conflict => SystemCallError::InvalidAddress,
         super::proc::SpaceError::Busy => SystemCallError::ObjectBusy,
         super::proc::SpaceError::Unbound => SystemCallError::ObjectNotAvailable,

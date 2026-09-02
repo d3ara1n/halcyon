@@ -583,7 +583,7 @@ fn raw_thread_storm() {
 }
 
 fn stale_translation_reuse() {
-    let region = MappedRegion::map_anonymous(
+    let mut region = MappedRegion::map_anonymous(
         PROCESS_PAGE_SIZE,
         PROCESS_PAGE_SIZE,
         PROCESS_PAGE_SIZE,
@@ -620,9 +620,16 @@ fn stale_translation_reuse() {
         thread::yield_now().expect("translation coordinator yield failed");
     }
 
-    region
-        .unmap()
-        .expect("thread suite old mapping Unmap failed");
+    loop {
+        match region.unmap() {
+            Ok(()) => break,
+            Err((returned, SystemCallError::ObjectBusy)) => {
+                region = returned;
+                thread::yield_now().expect("thread suite Unmap retry yield failed");
+            }
+            Err((_, error)) => panic!("thread suite old mapping Unmap failed: {error:?}"),
+        }
+    };
     let replacement = MappedRegion::map_anonymous(
         PROCESS_PAGE_SIZE,
         PROCESS_PAGE_SIZE,
