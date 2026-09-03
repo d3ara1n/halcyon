@@ -420,13 +420,7 @@ pub(crate) struct ObjectMappingPlan {
 }
 
 impl ObjectMappingPlan {
-    pub(crate) fn table_budget(&self) -> usize {
-        self.preflights
-            .iter()
-            .map(TranslationPreflight::required_frames)
-            .sum()
-    }
-
+    /// 表页供给按段进行：每个 preflight 各自预算，与匿名多 extent 映射同形。
     pub(crate) fn preflights(&self) -> &[TranslationPreflight] {
         &self.preflights
     }

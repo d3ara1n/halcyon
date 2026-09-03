@@ -107,23 +107,24 @@ MEMORY_POOL (230) < MEMORY_OBJECT (250) < ADDRESS_SPACE (300)
 - 启动 selftest 已扩到穿过五类的 acquire → 本地耗尽 → drop 重取退款。
 - 剩余：`ObjectViewPermit` 尚无消费者。原计划待 C2 引入强 `ObjectView` owner 时接入，C2 已降为可延后项——改由步骤 8 公共对象 view 建立时接入（每个独立 view 一枚 permit），这是它的正当消费者。
 
-**A2. 引入 `FundedBackingStorage` 与 `ObjectBacking`**（`os/kernel/src/frame.rs`）—— ✅ 已完成（`6e18b8f`）
-- `FundedBackingStorage` 已建：多 extent `Funded` 的唯一持有者，提供 `project(offset, length)` 输出有界物理 span 序列、`split_off`/`merge_from` 守恒变换。
-- `ObjectBacking` 已建：包装同一 storage 但不暂露 split/merge，落实三分中缺失的一分。
-- 已删：`fund_user_extent`（Tunnel 迁移后失去唯一调用者）。
-- **未删（已重新归类）**：`FundedFrames::into_extents` 仍服务 `OwnedBacking` 的堆化转换——它**不是**过渡物，而是匿名侧从定长 funding 结果转成堆化常驻 owner 的正当机制；`BackingExtentOwner::BootBorrowed` 与 `install_bootstrap_funding` 随匿名 backing 重构一并延后。
+**A2. 引入 `ObjectBacking`**（`os/kernel/src/frame.rs`）—— ✅ 已完成（`6e18b8f`，形态于 `51b3742` 修正）
+- `ObjectBacking` 已建：固定长度、不可分解的对象数据 backing，不暴露 split/merge，落实三分中缺失的一分。
+- `project(offset, length, &mut spans)` 输出有界物理 span 序列到调用方缓冲，是对象 view 组装 translation 的唯一几何入口。
+- **形态修正**（`51b3742`）：中途引入的 `FundedBackingStorage`（内联定长 `MAX_FUNDED_EXTENTS` 槽）已删除——它把定长事务容器嵌进常驻对象，直接导致构造路径单帧 0x3540。`ObjectBacking` 改为堆化持 `Vec<FundedExtent>`，与匿名侧同构；`split_off`/`merge_from` 随之失去消费者一并删除。
+- 已删：`fund_user_extent`（Tunnel 迁移后失去唯一调用者）、`FundedBackingStorage`。
+- **保留（已重新归类）**：`FundedFrames::into_extents` 服务匿名与对象**两侧**的堆化转换——它**不是**过渡物，而是从定长 funding 结果转成堆化常驻 owner 的正当机制；`BackingExtentOwner::BootBorrowed` 与 `install_bootstrap_funding` 随匿名 backing 重构一并延后。
 
 **A3. 建立 `MemoryObjectCore`**（`os/kernel/src/task/memory_object.rs`）—— ✅ 已完成（`6e18b8f` + `16dd3b4`）
 - core 统一持：ObjectId（全局单调铸造）、`ObjectBacking`、`MemoryObjectState`、sponsor 强引用 + `ObjectBackingPermit`。
 - Tunnel `Connection` 已改持 `Arc<MemoryObjectCore>`；Endpoint/Invitation 各持自己的 permit，attach 端由附着进程支付。
 - 已删：tunnel.rs 的 `NEXT_MEMORY_OBJECT`/`mint_memory_object`、`fund_tunnel_backing`。
 - **设计修正**：等待面（`ObjectWaitState`）**不入 core**——Tunnel 的等待面在 Endpoint、公共 MemoryObject 的在其公共 shell，二者各自拥有。因此 `MemoryObjectState::seal_waiter` 的删除与 `EXECUTABLE` 电平位接入属于 E（公共 ABI），不属于 A3。
-- **栈窗口代价已付**：构造 core 的路径单帧 0x3540（`MAX_FUNDED_EXTENTS` 槽按值经事务返回，栈上展开一份）。STACK_GUARD 0x3000→0x4000、审计上限 0x2800→0x3800、sifive_u formal 栈 0x9000→0xF000。盒化 storage 实测反而抬到 0x3a00（按值返回的事务结果仍先落栈再拷入堆），已放弃并将结论记入类型文档。
+- ~~栈窗口代价已付~~ **已收回**（`0fad27f`）：把定长 `MAX_FUNDED_EXTENTS` 容器嵌进常驻对象 core 才导致单帧 0x3540；改为堆化持 extent 列表后回落到 0x2390，STACK_GUARD 与审计上限随之退回 0x3000/0x2800。盒化整份 storage 曾实测更差（0x3a00，按值返回的事务结果先落栈再拷堆），正确解法是**不把定长容器放进常驻对象**而非盒化它。sifive_u formal 栈保持 0xF000——它约束调用链总和而非单帧，实测降回会 guard hit。
 
 ### B. 投影统一
 
-**B1. 上收 extent → bounded translations 投影为匿名/对象共用**（`os/kernel/src/task/proc.rs`）
-当前匿名侧 `OwnedBacking::preflight_install`（proc.rs:641）自己按 `Vec<BackingExtent>` 迭代生成 preflight；对象侧 `prepare_object_mapping`（proc.rs:2908）硬编码单页单 PA：`permits.len() == 1`、`object_bytes: PAGE_SIZE`、`offset: 0`、单个 `TranslationPreflight`。Tunnel 侧已改调 `core.backing.project(0, 1)`，但仍断言长度为一后只取 base 塑回单 PA（tunnel.rs `prepare_mapping`）。
+**B1. 上收对象侧投影**（`os/kernel/src/task/proc.rs`）—— ✅ 已完成（`51b3742`），详见「步骤 4 已完成」节
+原始现状记录：当前匿名侧 `OwnedBacking::preflight_install`（proc.rs:641）自己按 `Vec<BackingExtent>` 迭代生成 preflight；对象侧 `prepare_object_mapping`（proc.rs:2908）硬编码单页单 PA：`permits.len() == 1`、`object_bytes: PAGE_SIZE`、`offset: 0`、单个 `TranslationPreflight`。Tunnel 侧已改调 `core.backing.project(0, 1)`，但仍断言长度为一后只取 base 塑回单 PA（tunnel.rs `prepare_mapping`）。
 
 目标是对象侧经 `project()` 得到有界 preflight 序列，单页退化为长度为一。匿名侧的 `preflight_install` 保持现状（其 `Vec<BackingExtent>` 遍历是堆化常驻表示的正当形态，见「已推翻的方案与推导」）。
 
@@ -165,9 +166,9 @@ MEMORY_POOL (230) < MEMORY_OBJECT (250) < ADDRESS_SPACE (300)
 ## 实施顺序（8 步）
 
 1. **补 metadata admission 五类**（resources.rs）—— ✅ `6e18b8f`
-2. **建立 `FundedBackingStorage` 与 `ObjectBacking`**（frame.rs）—— ✅ `6e18b8f`
+2. **建立 `ObjectBacking`**（frame.rs）—— ✅ `6e18b8f`（`FundedBackingStorage` 已于 `51b3742` 删除，对象 backing 改堆化持 extent 列表）
 3. **建立 `MemoryObjectCore` 并迁移 Tunnel**（memory_object.rs、tunnel.rs）—— ✅ `6e18b8f` + `16dd3b4`
-4. **对象侧投影上收**（proc.rs、frame.rs）—— ⏸ 当前任务，见下节（地基 `project()` 已改造）
+4. **对象侧投影上收**（proc.rs、frame.rs）—— ✅ `51b3742` + `0fad27f`，见下节
 5. ~~owner-aware ledger / 匿名 backing 重构~~ —— **已降为可延后项**（不服务切片 7，推导见下节「已推翻的方案与推导」）
 6. **统一事务核**（proc.rs）→ 删四套 plan/complete 类型与函数。
 7. **迁移 Running/Building/Tunnel 调用点** → 全走统一事务核。
@@ -177,63 +178,55 @@ MEMORY_POOL (230) < MEMORY_OBJECT (250) < ADDRESS_SPACE (300)
 
 ### 已完成
 
-- **步骤 1–3 ✅**（见下方「已完成提交索引」）
-- 步骤 4 的地基（`project()` 输出到调用方 Vec）已落地。
+- **步骤 1–4 ✅**（见下方「已完成提交索引」与「步骤 4 已完成」节）
+- 步骤 5 已降为可延后项；**下一步是步骤 6–8**，其中步骤 8 可独立先行。
 
-## 下一任务：对象侧投影上收（主线已修正）
+## 步骤 4 已完成：对象侧投影上收（`51b3742` + `0fad27f`）
 
 **本节替换了上一版冻结的「匿名 backing 迁 FundedBackingStorage + 消灭 offset 查找」方案。**
 该方案在实施前的可行性验证中被自身推翻，推导与结论见下方「已推翻的方案与推导」。
 方案不是真理，计划与文档中的结论同样允许推翻——记录推导过程比保留错误结论更有价值。
 
-### 真前置只有两件
+### 已交付
 
-切片 7（公共 MemoryObject）的语义闭包只依赖：
+- `prepare_object_mapping` 接收 view 的对象内偏移与投影出的物理 span 序列，逐段
+  `preflight_map`；`ObjectMappingPlan` 持 `Vec<TranslationPreflight>`，
+  `complete_object_mapping` 循环 `prepare` 并经 `publish_batch` 发布，与匿名侧
+  `complete_owned_mapping` 同形。表页改走 `fund_table_preflights`（每段独立预算）。
+- 删 `MapBacking::Object` 的 `object_bytes`：长度真值随 `ObjectViewAuthorization`
+  从对象状态机流出（`MemoryObjectState` 持 `object_bytes`），调用方不再另传一份。
+- 删 `assert_eq!(permits.len(), 1)`（prepare/rollback 三处）与 `PAGE_SIZE` 硬编码；
+  `ObjectMappingLease` 记 `object_offset`，`prepare_object_unmap` 据此复核而非假定 0。
+- `ObjectBacking` 改为堆化持 `Vec<FundedExtent>`；删只服务对象的 `FundedBackingStorage`
+  （`project` 逻辑内联进 `ObjectBacking`，`split_off`/`merge_from` 无消费者）。
+- `MemoryObjectCore` 不再另存 `identity`——身份与长度同归 `MemoryObjectState`，单一真值点。
+- 栈窗口回落：STACK_GUARD 0x4000→0x3000、审计上限 0x3800→0x2800、虚拟跨度 2.25→2.19MiB。
+  sifive_u `STACK_SIZE` 保持 0x10000（约束调用链总和，非单帧，实测降回 0x9000 会 guard hit）。
 
-1. **对象映射脱离单页单 PA**（本节）——公共对象是多页的，`prepare_object_mapping` 当前硬编码
-   单 PA、单 `TranslationPreflight`、`object_bytes: PAGE_SIZE`、`assert_eq!(permits.len(), 1)`。
-2. **公共 ABI 与 Handle**（步骤 8，不变）。
+### 删除条件核对（全部满足）
 
-匿名 backing 的内部表示**不在**这条链上：对象 view 的切割不切物理 backing（`ideas/mm.md` L84
-已冻结），对象物理 owner 在 `MemoryObjectCore` 里，匿名 `backings` 表完全不参与对象映射路径。
+1. ✅ `prepare_object_mapping` 及四个 wrapper 不含 `PAGE_SIZE`/单 PA/单 permit 假设。
+2. ✅ `MapBacking::Object` 无 `object_bytes`（全仓 grep 只剩 object.rs/space.rs 的正当处）。
+3. ✅ Tunnel 单页作为长度为一的普通消费者，无专用断言。
+4. ✅ 公共多页对象可在不改 `prepare_object_mapping` 的前提下映入——步骤 8 只加 ABI 与 Handle。
 
-### 实施内容
-
-- `AddressSpaceState::prepare_object_mapping` 接收对象几何（`&ObjectBacking` 或已投影的 span
-  序列）+ view 的 offset/length，内部经 `FundedBackingStorage::project` 得到有界物理 span 序列，
-  逐段 `preflight_map`；`ObjectMappingPlan.preflight` 从单个改为 `Vec<TranslationPreflight>`,
-  `complete_object_mapping` 循环 `prepare`（匿名侧 `complete_owned_mapping` 已是此形状，照抄其
-  失败回收结构）。
-- 删 `MapBacking::Object` 的 `object_bytes` 字段：长度真值是经认证的 view 几何，不由调用方另传
-  一份（reviewer B3）。
-- 删 `prepare_object_mapping` 的 `assert_eq!(permits.len(), 1)` 与 `PAGE_SIZE` 硬编码；
-  `rollback_object_mapping*` 的 `assert_eq!(permits.len(), 1)` 同步放开。
-- `tunnel.rs::prepare_mapping` 去掉单页断言，作为「长度为一」的普通消费者。
-- ⚠️ **表页预算**：多段 preflight 的表页需求随 span 数增长，`table_budget()` 与
-  `fund_table_preflights` 已是 per-preflight 结构（匿名侧同形），确认对象侧走同一预算路径。
-
-### 删除条件
-
-1. `prepare_object_mapping` 及其四个 wrapper 不含 `PAGE_SIZE`/单 PA/单 permit 假设。
-2. `MapBacking::Object` 无 `object_bytes`。
-3. Tunnel 单页作为长度为一的普通消费者，无专用断言。
-4. 公共多页对象能在不改 `prepare_object_mapping` 的前提下映入（步骤 8 只加 ABI 与 Handle）。
+零 `warning`、零 `error`；host 全绿；virt core / virt-release / sifive_u / virt-stress 16/16 通过。
 
 ### 已推翻的方案与推导
 
 上一版冻结了「`OwnedBacking` 从 `Vec<BackingExtent>` 迁到 `FundedBackingStorage`，并把 backing
-切分移到 Commit 以消灭退役期查找」。实施前逐条验证代码，两处前提均不成立：
+切分移到 Commit 以消灭退役期查找」。实施前逐条验证代码，三处前提均不成立：
 
-**（一）定长 64 槽不适合作匿名常驻表示。**
-`FundedBackingStorage` 内联 `[Option<ClaimedUserExtent>; MAX_FUNDED_EXTENTS=64]`（约 1.5KB），
-它是为**对象**设计的：对象常驻 core、长度创建后不变、一次付清，定长槽合理。匿名 backing 的现状
-是 `Vec<BackingExtent>`，每个物理 extent 是堆上的单槽 `Funded<...,1>` owner，切分在**预留容量**的
-Vec 里零分配重排——**匿名侧已经是堆化形态**。换成定长数组会让每个匿名映射无论实际几个 extent 都
-内联 64 槽，且 `split_off` 按值返回 `Self` 使切分路径每层压 1.5KB 栈（`new_tunnel_connection` 的
-0x3540 即此成因，而切分是反复发生的）。`into_extents` 存在的理由正是这个堆化转换，不是历史包袱。
+**（一）定长 64 槽不适合作常驻表示——对匿名与对象都不适合。**
+`FundedBackingStorage` 内联 `[Option<ClaimedUserExtent>; MAX_FUNDED_EXTENTS=64]`（约 1.5KB）。
+匿名侧现状 `Vec<BackingExtent>` 每个物理 extent 是堆上单槽 `Funded<...,1>` owner，切分在预留
+容量的 Vec 里零分配重排——**已经是堆化形态**，`into_extents` 正是这个转换的机制，不是历史包袱。
+更强的证据来自本次实测：把定长容器嵌进**对象** core（步骤 2 的做法）直接导致构造路径单帧
+0x3540、上一提交不得不抬高 guard 与审计上限；改回堆化后最大帧回落到 0x2390，容量随之收回。
+定长容器只适合做一次性事务结果（栈上短暂存在），常驻对象一律堆化。
 
 **（二）「一 backing 一 storage」与中段 unmap 留洞矛盾。**
-中段 unmap 后同一 `BackingId` 下 live 的是左右两段、中间是洞，而 `Funded` 是逻辑连续的，表达不了
+中段 unmap 后同一 `BackingId` 下 live 的是左右两段、中间是洞，而 `Funded` 逻辑连续、表达不了
 洞。要消灭 `identity` 二分 + offset 线性查找，物理 owner 必须绑到 **ledger fragment**（洞由「无
 fragment」天然表达），这需要 `reserve` 出口报告每个 replacement 新铸的 `RegionKey`（当前只暴露
 map 的 `mapped_region_key()`），即改造纯 planner 的事务出口语义。
@@ -250,13 +243,10 @@ crate），**不服务任何已确认的外部语义**，也不解锁切片 7。
 延后项，触发条件是：匿名 backing 出现新的能力需求（如 COW、部分 discard、pager），或 reviewer
 在结构收口 review 中判定该重复真值已实际造成缺陷。
 
-### 保留有效的既有结论
+### 下一步：步骤 6–8
 
-- `project()` 已改为输出到调用方 `&mut Vec<(FrameNumber, usize)>`（不再返回借用迭代器），使
-  「先投影再切分/移动」成立；`projection_capacity()` 给出容量上限供 Reserve 阶段预留。这是对象侧
-  多段投影的地基，已落地。
-- `ObjectBacking` 不暴露 split/merge 是对的：对象 backing 一次付清、view 切割不切数据。
-- 五类 metadata admission、`MemoryObjectCore`、Tunnel 迁移（步骤 1–3）不受本次纠正影响。
+对象侧真前置已就位，剩余为原定的统一事务核（步骤 6–7）与公共 ABI（步骤 8）。步骤 8 可独立于
+6–7 进行——公共对象只需 Handle/ABI 与已有的多段投影路径，不依赖事务核统一。
 
 ## ABI 与用户态改动
 

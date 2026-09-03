@@ -1,8 +1,11 @@
 //! 公共 MemoryObject 与 Tunnel 的统一对象 core。
 //!
-//! `MemoryObjectCore` 同时持：ObjectId（全局单调铸造）、ObjectBacking（固定长度多 extent
-//! funded storage）、MemoryObjectState（Mutable → Sealing → Executable 状态机）与
-//! metadata owner（sponsor 强引用 + backing permit）。
+//! `MemoryObjectCore` 同时持：ObjectBacking（固定长度、堆化多 extent 的资金化
+//! backing）、MemoryObjectState（Mutable → Sealing → Executable 状态机，内含对象身份
+//! 与固定长度）与 metadata owner（sponsor 强引用 + backing permit）。
+//!
+//! 对象身份由本模块全局单调铸造后交给状态机保管，不在 core 上另存一份——身份、长度
+//! 与可执行状态同属对象的逻辑状态，单一真值点避免二者失步。
 //!
 //! 等待面不属于 core：Tunnel 的等待面在 Endpoint 上，公共 MemoryObject 的等待面在其
 //! 公共 shell 上，二者各自拥有独立的 ObjectWaitState。
@@ -54,7 +57,6 @@ fn map_fund_error(
 /// 持有对象身份、backing、状态机与 metadata 生命周期 owner。状态机经 `MEMORY_OBJECT`
 /// 锁秩包裹。
 pub(crate) struct MemoryObjectCore {
-    pub(crate) identity: ObjectId,
     pub(crate) backing: ObjectBacking,
     pub(crate) state: Spinlock<MemoryObjectState>,
     _sponsor: Arc<MetadataSponsor>,
@@ -92,7 +94,6 @@ impl MemoryObjectCore {
         );
 
         let core = Self {
-            identity,
             backing,
             state,
             _sponsor: Arc::clone(sponsor),

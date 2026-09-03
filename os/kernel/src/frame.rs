@@ -552,10 +552,6 @@ impl ObjectBacking {
         self.pages
     }
 
-    pub(crate) fn extent_count(&self) -> usize {
-        self.extents.len()
-    }
-
     /// 对象内页区间到物理 span 的投影，追加写入 `spans`。
     ///
     /// 单页 view 退化为长度为一的序列，因此单页 Tunnel 与多页对象共用同一条

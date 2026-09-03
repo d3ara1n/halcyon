@@ -6,7 +6,7 @@ Tunnel 是内核提供的共享内存连接对象：`Connection` 持有共享 ba
 
 当前实现位于 `os/kernel/src/task/tunnel.rs`。`ConnectionState` 保存两侧 lease 与 `Alive`、`Invited`、`Closed` 状态；`Connection` 持 `Arc<MemoryObjectCore>`（对象身份、单页 `ObjectBacking`、可执行发布状态机与 backing metadata owner 的统一 core，见 [`memory-object.md`](memory-object.md)），复用 `memory_space` 的对象授权和 `WritePermit` 基元，但不向用户公开独立 MemoryObject Handle。
 
-当前 Tunnel 对外仍是单页，backing 由 `MemoryObjectCore` 持有——创建进程绑定的 MemoryPool 经 funded broker 支付，随对象持物理 extent 与 Pool charge。`Endpoint` 与 `Invitation` 各持 `EndpointPermit` / `InvitationPermit`，attach 端由附着进程支付，与创建端分账。单页容量和释放事实由本篇记录，底层帧与地址空间所有权见 [`mm.md`](mm.md)；多页几何属于后续切片 8。单页连接的 close 与 detached drain 通过内存事务在 Commit 前预留 bounded work debt；共享 backing 的 slice permit 随 live/retiring owner 持有，Unmap 事务按切分预算取得新 permit。
+当前 Tunnel 对外仍是单页，但内核侧已走多段对象投影路径——单页只是长度为一的退化情形，多页几何只需改变投影区间。backing 由 `MemoryObjectCore` 持有——创建进程绑定的 MemoryPool 经 funded broker 支付，随对象持物理 extent 与 Pool charge。`Endpoint` 与 `Invitation` 各持 `EndpointPermit` / `InvitationPermit`，attach 端由附着进程支付，与创建端分账。单页容量和释放事实由本篇记录，底层帧与地址空间所有权见 [`mm.md`](mm.md)；多页几何属于后续切片 8。单页连接的 close 与 detached drain 通过内存事务在 Commit 前预留 bounded work debt；共享 backing 的 slice permit 随 live/retiring owner 持有，Unmap 事务按切分预算取得新 permit。
 
 `Endpoint` 是可等待对象，允许 `WAIT | SIGNAL | MANAGE`，可观察 `DATA | PEER_CLOSED | CLOSED`，不可进入 TRANSIT/GRANT。`Invitation` 允许 `MAP | TRANSIT | GRANT`，不可等待；它不可复制，成功 attach 后消费，失败不消费。Endpoint 与本进程地址空间 lease 绑定，不能通过 Handle 运输。
 
