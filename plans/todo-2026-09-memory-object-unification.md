@@ -101,30 +101,33 @@ MEMORY_POOL (230) < MEMORY_OBJECT (250) < ADDRESS_SPACE (300)
 ### A. 冻结对象基础设施
 
 **A1. metadata admission 补五类**（`os/kernel/src/task/resources.rs`）
-- 当前缺：ObjectBacking、ObjectView、Connection、Endpoint、Invitation。
-- 新增：`ObjectBackingPermit`、`ObjectViewPermit`、`ConnectionPermit`、`EndpointPermit`、`InvitationPermit`，各有全局/sponsor 上限、唯一 owner、退款终点。
-- Object core/backing permit 随 creator 消散后继续存活；view permit 随独立 view 存活；Tunnel 三类随各自对象存活。
-- 删除条件：公共 Create/TunnelCreate 进入 Commit 前全部预留成功，Commit 后零分配。
+**A1. metadata admission 补五类**（`os/kernel/src/task/resources.rs`）—— ✅ 已完成（`6e18b8f`）
+- 新增 `ObjectBackingPermit`、`ObjectViewPermit`、`ConnectionPermit`、`EndpointPermit`、`InvitationPermit`，各有全局/sponsor 上限、唯一 owner、退款终点。
+- 实际上限：ObjectBacking 2048/64、ObjectView 8192/256、Connection 512/16、Endpoint 1024/32、Invitation 512/16。
+- 启动 selftest 已扩到穿过五类的 acquire → 本地耗尽 → drop 重取退款。
+- 剩余：`ObjectViewPermit` 尚无消费者，待 C2 引入强 `ObjectView` owner 时接入。
 
-**A2. 引入 `FundedBackingStorage` 与 `ObjectBacking`**（`os/kernel/src/frame.rs`、新 `os/kernel/src/task/memory_object.rs`）
-- 当前：`FundedFrames::into_extents` 立即拆包，`OwnedBacking` 持 `Vec<BackingExtent>`，Tunnel 持单 `FundedExtent`。
-- 新增：`FundedBackingStorage` 包住多 extent `Funded`，提供 `project(range)`；`ObjectBacking` 包装它且不可分解。
-- 删除：`into_extents` 路径；`BackingExtentOwner` 的 `BootBorrowed` variant（非真正 owner）；`install_bootstrap_funding` 提交后补 owner 路径。
-- 删除条件：`OwnedBackingSlice` 与 `ObjectBacking` 成为 storage 的唯一消费者。
+**A2. 引入 `FundedBackingStorage` 与 `ObjectBacking`**（`os/kernel/src/frame.rs`）—— ✅ 已完成（`6e18b8f`）
+- `FundedBackingStorage` 已建：多 extent `Funded` 的唯一持有者，提供 `project(offset, length)` 输出有界物理 span 序列、`split_off`/`merge_from` 守恒变换。
+- `ObjectBacking` 已建：包装同一 storage 但不暂露 split/merge，落实三分中缺失的一分。
+- 已删：`fund_user_extent`（Tunnel 迁移后失去唯一调用者）。
+- **未删（转入 C1）**：`FundedFrames::into_extents` 仍服务 `OwnedBacking`；`BackingExtentOwner::BootBorrowed` 与 `install_bootstrap_funding` 仍在。它们的删除条件是 `OwnedBacking` 迁到 `FundedBackingStorage`，属于 C1。
 
-**A3. 建立 `MemoryObjectCore`**（新 `os/kernel/src/task/memory_object.rs`）
-- 统一：ObjectId 铸造、ObjectBacking、`MemoryObjectState` 改接 `ObjectWaitState`（删除 `seal_waiter: Option<u64>`）、metadata permits + sponsor 强引用。
-- Tunnel Connection 改持 `Arc<MemoryObjectCore>`；公共 shell 复用同一 core。
-- 删除：`os/kernel/src/task/tunnel.rs:97` 的 `NEXT_MEMORY_OBJECT` 私有铸造。
-- 删除条件：Tunnel 与公共对象走同一 core 构造路径，object identity 无双来源。
+**A3. 建立 `MemoryObjectCore`**（`os/kernel/src/task/memory_object.rs`）—— ✅ 已完成（`6e18b8f` + `16dd3b4`）
+- core 统一持：ObjectId（全局单调铸造）、`ObjectBacking`、`MemoryObjectState`、sponsor 强引用 + `ObjectBackingPermit`。
+- Tunnel `Connection` 已改持 `Arc<MemoryObjectCore>`；Endpoint/Invitation 各持自己的 permit，attach 端由附着进程支付。
+- 已删：tunnel.rs 的 `NEXT_MEMORY_OBJECT`/`mint_memory_object`、`fund_tunnel_backing`。
+- **设计修正**：等待面（`ObjectWaitState`）**不入 core**——Tunnel 的等待面在 Endpoint、公共 MemoryObject 的在其公共 shell，二者各自拥有。因此 `MemoryObjectState::seal_waiter` 的删除与 `EXECUTABLE` 电平位接入属于 E（公共 ABI），不属于 A3。
+- **栈窗口代价已付**：构造 core 的路径单帧 0x3540（`MAX_FUNDED_EXTENTS` 槽按值经事务返回，栈上展开一份）。STACK_GUARD 0x3000→0x4000、审计上限 0x2800→0x3800、sifive_u formal 栈 0x9000→0xF000。盒化 storage 实测反而抬到 0x3a00（按值返回的事务结果仍先落栈再拷入堆），已放弃并将结论记入类型文档。
 
 ### B. 投影统一
 
 **B1. 上收 extent → bounded translations 投影为匿名/对象共用**（`os/kernel/src/task/proc.rs`）
-- 当前：匿名侧 `OwnedBacking::preflight_install`（proc.rs:641）按 extent 迭代；对象侧 `prepare_object_mapping`（proc.rs:2908）硬编码单页单 PA。
-- 目标：`FundedBackingStorage::project(range)` 输出有界 PA spans；匿名与对象都调它。
-- 删除：`prepare_object_mapping` 的单 PA adapter、`MapBacking::Object` 的 `object_bytes` 参数、Tunnel 的单页 `PAGE_SIZE` 硬编码。
-- 删除条件：单页 Tunnel 作为「集合长度为一」走共用投影，`prepare_object_mapping` 四个类型全删。
+当前匿名侧 `OwnedBacking::preflight_install`（proc.rs:641）自己按 `Vec<BackingExtent>` 迭代生成 preflight；对象侧 `prepare_object_mapping`（proc.rs:2908）硬编码单页单 PA：`permits.len() == 1`、`object_bytes: PAGE_SIZE`、`offset: 0`、单个 `TranslationPreflight`。Tunnel 侧已改调 `core.backing.project(0, 1)`，但仍断言长度为一后只取 base 塑回单 PA（tunnel.rs `prepare_mapping`）。
+
+目标是两侧都经同一投影得到有界 preflight 序列，单页退化为长度为一。具体到哪一层取决于与 C1 的合并程度，见下方「下一任务」。
+
+待删：`prepare_object_mapping`/`complete_object_mapping`/`rollback_object_mapping*`/`commit_object_mapping` 的单 PA 假设与 `assert_eq!(permits.len(), 1)`；`MapBacking::Object` 的 `object_bytes` 参数（长度应从经认证的 view 取，而非调用方独立传入，reviewer B3）；tunnel.rs `prepare_mapping` 的单页断言。
 
 ### C. owner-aware ledger 事务
 
@@ -160,16 +163,54 @@ MEMORY_POOL (230) < MEMORY_OBJECT (250) < ADDRESS_SPACE (300)
 
 ## 实施顺序（8 步）
 
-1. **补 metadata admission 五类**（resources.rs）→ 启动 selftest 穿过全局/sponsor exhaustion、Commit 后零分配。
-2. **建立 `FundedBackingStorage` 与 `ObjectBacking`**（frame.rs、新 memory_object.rs）→ 删 `into_extents`、`BootBorrowed`。
-3. **建立 `MemoryObjectCore`**（memory_object.rs、tunnel.rs）→ Tunnel 改持 core、删私有 ObjectId 铸造。
-4. **上收 bounded projection**（proc.rs）→ 删单 PA adapter、对象/Tunnel 走共用投影。
-5. **owner-aware ledger**（proc.rs、memory_space/space.rs 泛型化）→ Publish 切 live/retiring slice、object region 持强 owner。
+1. **补 metadata admission 五类**（resources.rs）—— ✅ `6e18b8f`
+2. **建立 `FundedBackingStorage` 与 `ObjectBacking`**（frame.rs）—— ✅ `6e18b8f`
+3. **建立 `MemoryObjectCore` 并迁移 Tunnel**（memory_object.rs、tunnel.rs）—— ✅ `6e18b8f` + `16dd3b4`
+4. **上收 bounded projection**（proc.rs）—— ⏸ 下一任务，见下节
+5. **owner-aware ledger**（proc.rs、memory_space/space.rs 泛型化）
 6. **统一事务核**（proc.rs）→ 删四套 plan/complete 类型与函数。
-7. **迁移 Running/Building/Tunnel 调用点**→ 全走统一事务核。
+7. **迁移 Running/Building/Tunnel 调用点** → 全走统一事务核。
 8. **开放公共 MemoryObject ABI**（shared、syscall、rinlib）→ Create/Query/Seal、`EXECUTABLE` 信号、用户态 affine owner。
-
 每步先跑对应 host debug/release、`just check`；涉及启动后跑 `just virt`；涉及 Remote/drain 补 `just virt-stress`；收尾跑 `just acceptance`。
+
+### 已完成
+
+- **步骤 1–3 ✅**（见下方「已完成提交索引」）
+- 步骤 4 起的推进方式与分叉点在「下一任务」节。
+
+## 下一任务（从 B1/C1 分叉点重启）
+
+步骤 4（投影上收）与步骤 5（owner-aware ledger）都牵动同一批 backing 代码，深浅做法在「是否现在把 `OwnedBacking` 从 `Vec<BackingExtent>` 迁到 `FundedBackingStorage`」分叉。上一会话探察到三种深度，下次开工前先拍板：
+
+### 选项 A：对象侧改多 extent（浅）
+- 让 `prepare_object_mapping` 接收 `&ObjectBacking` 而非单 PA，内部用 `project()` 生成有界 preflight 序列；`ObjectMappingPlan.preflight` 从单个改 `Vec<TranslationPreflight>`。
+- 不动匿名侧 `Vec<BackingExtent>` 结构；`OwnedBacking` 迁移仍属 C1 延后。
+- 效果：对象侧脱离单 PA 硬编码，公共 MemoryObject 多页 view 可直接接；改动集中在 proc.rs 对象四条路径 + tunnel.rs。
+
+### 选项 B：共用投影 helper（中）
+- 匿名 `preflight_install` 与对象侧收敛到同一投影 helper：输入 offset/length + 多 extent 几何，输出 bounded preflight 序列。
+- `OwnedBacking` 继续持 `Vec<BackingExtent>`（暂不迁 `FundedBackingStorage`），但几何遍历逻辑只剩一处。
+- 删 `MapBacking::Object` 的 `object_bytes` 参数（长度从经认证 view 取，reviewer B3）。
+
+### 选项 C：全面重构（深，= 步骤 4 + 5 合并）
+- `OwnedBacking` 彻底迁到 `FundedBackingStorage`，删 `BackingExtentOwner::{Funded,BootBorrowed}` 手工切分与 `into_extents` 残余，Boot 路径收 `BootFundedExtent`。
+- 与 C1（Publish 切 live/retiring slice owner）合并为一次大重构，是 reviewer 阻断项 A2/C1/C2 的完整落地。
+- 改动面最大：`OwnedBacking` 定义、`write_from_start`、`preflight_install`、split、retire、`install_bootstrap_funding` 全重写。
+
+### 推荐
+
+选项 C 一劳永逸符合「合并 6E+7 一次设计到位」的本意，但单次改动面最大、风险最高。选项 B 是中间态：先让匿名/对象共用投影 helper（满足 B1 的删除条件），`OwnedBacking` 迁移作为独立小步随后做（满足 C1 的删除条件）——两步各有独立可验证闭包，不把「删单 PA」和「迁 backing 表示」绑在一次提交里。推荐 B 先行、C1 紧随。
+
+### 已完成提交索引
+
+- `6e18b8f`：admission 五类 + `FundedBackingStorage`/`ObjectBacking`/`MemoryObjectCore` 基座 + AGENTS.md 残留纪律
+- `16dd3b4`：Tunnel Connection 迁 `MemoryObjectCore`、Endpoint/Invitation permit、栈窗口扩容
+
+### 当前风险登记
+
+- `ObjectViewPermit` 无消费者（待 C2 接）；`funded_selftest` 走旧 `fund_user_frames`（生产 backing 已改 `fund_backing_storage`，selftest 仍验证旧入口，切片 10 收口）。
+- `new_tunnel_connection` 单帧 0x3540 是审计上限 0x3800 下的最大合法帧，后续新增大 backing 构造函数前先重估。
+- sifive_u STACK_SIZE 已扩到 0x10000，若继续引入接近上限的单帧，需再评估。
 
 ## ABI 与用户态改动
 

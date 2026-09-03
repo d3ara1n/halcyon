@@ -6,7 +6,13 @@
 
 公共 MemoryObject 尚未接入独立 Handle、系统调用 ABI 或 rinlib owner。当前已实现的是 `os/memory_space/src/object.rs` 中的纯逻辑对象状态与授权基元，以及 Tunnel 对这些基元的内部复用；这不构成公共 MemoryObject 接口。
 
-`memory_space` crate 提供 `ObjectId`、`ObjectViewAuthorization`、`WritePermit`、`MemoryObjectState`、`ExecutableState` 与 `SealOutcome`。它不访问页表、物理帧、HandleTable、hart 或用户指针。当前 Tunnel 的 `Connection` 以内部 `MemoryObjectState` 管理两侧 RW view 的写许可，backing 由创建进程绑定的 MemoryPool 通过 funded owner 支付并持有单页 extent；尚无公共 `ObjectBacking` 对象壳。
+`memory_space` crate 提供 `ObjectId`、`ObjectViewAuthorization`、`WritePermit`、`MemoryObjectState`、`ExecutableState` 与 `SealOutcome`。它不访问页表、物理帧、HandleTable、hart 或用户指针。
+
+内核侧的对象 core 是 `os/kernel/src/task/memory_object.rs` 的 `MemoryObjectCore`，它同时持对象身份（全局单调铸造的 `ObjectId`）、固定长度多 extent `ObjectBacking`、`MemoryObjectState` 与 metadata owner（sponsor 强引用 + `ObjectBackingPermit`）。等待面不属于 core：各使用方自己拥有 `ObjectWaitState`（Tunnel 在 `Endpoint` 上）。
+
+`ObjectBacking`（`os/kernel/src/frame.rs`）包装多 extent `FundedBackingStorage`，不暴露 split/merge——对象 backing 由创建者绑定池一次付清，view 的切割、降权与解除不切数据 backing。`FundedBackingStorage::project(offset, length)` 把逻辑页区间投影为有界物理 span 序列，单页退化为长度为一。
+
+当前 Tunnel 的 `Connection` 持 `Arc<MemoryObjectCore>`，经其 `MemoryObjectState` 管理两侧 RW view 的写许可；对象 backing 由创建进程绑定的 MemoryPool 支付。公共 MemoryObject 将复用同一 core，因此对象身份与状态机不存在双来源。
 
 ## 对象状态与授权基元
 
