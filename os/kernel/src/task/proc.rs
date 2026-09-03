@@ -131,7 +131,7 @@ pub(crate) fn supply_funded_table_frames(
     Ok(owners)
 }
 
-fn fund_table_preflights(
+pub(crate) fn fund_table_preflights(
     pool: &Arc<super::memory_pool::MemoryPool>,
     preflights: &[TranslationPreflight],
 ) -> Result<Vec<Vec<TableFrameToken>>, SpaceError> {
@@ -403,23 +403,32 @@ pub(crate) struct ObjectMappingLease {
     pub(crate) region: RegionKey,
     pub(crate) range: LedgerPageRange,
     pub(crate) object: ObjectId,
+    pub(crate) object_offset: usize,
 }
 
 struct ObjectMappingReservation {
     change: PreparedChange,
-    translation: PreparedTranslation<TableFrameToken>,
+    translations: Vec<PreparedTranslation<TableFrameToken>>,
+    table_outcomes: Vec<TablePublishOutcome<TableFrameToken>>,
     lease: ObjectMappingLease,
 }
 
 pub(crate) struct ObjectMappingPlan {
     change: PreparedChange,
-    preflight: TranslationPreflight,
+    preflights: Vec<TranslationPreflight>,
     lease: ObjectMappingLease,
 }
 
 impl ObjectMappingPlan {
     pub(crate) fn table_budget(&self) -> usize {
-        self.preflight.required_frames()
+        self.preflights
+            .iter()
+            .map(TranslationPreflight::required_frames)
+            .sum()
+    }
+
+    pub(crate) fn preflights(&self) -> &[TranslationPreflight] {
+        &self.preflights
     }
 }
 
@@ -2904,21 +2913,37 @@ impl BoundAddressSpace {
         tables
     }
 
+    /// 从对象 backing 投影出的物理 span 序列建立 view 映射。
+    ///
+    /// `spans` 是 `ObjectBacking::project` 的输出（调用方在锁外取得，因为对象 backing
+    /// 属于 MEMORY_OBJECT 锁阶）；单页 view 退化为长度为一。`object_offset` 是 view
+    /// 在对象内的起始字节偏移，ledger 据此跟踪切割后的 view 位置。
     #[inline(never)]
     pub(crate) fn prepare_object_mapping(
         &mut self,
         va: usize,
-        pa: usize,
+        object_offset: usize,
+        spans: &[(FrameNumber, usize)],
         authorization: ObjectViewAuthorization,
         permits: Vec<WritePermit>,
     ) -> Result<ObjectMappingPlan, ObjectMapFailure> {
-        assert_eq!(permits.len(), 1, "Tunnel object Map requires one permit");
         if let Err(error) = self.ensure_table_transaction_available() {
             return Err(ObjectMapFailure { error, permits });
         }
+        let pages: usize = spans.iter().map(|(_, pages)| *pages).sum();
+        let bytes = match pages.checked_mul(PAGE_SIZE) {
+            Some(bytes) if bytes != 0 => bytes,
+            _ => {
+                return Err(ObjectMapFailure {
+                    error: SpaceError::BadSegment,
+                    permits,
+                });
+            }
+        };
         if !va.is_multiple_of(PAGE_SIZE)
-            || !pa.is_multiple_of(PAGE_SIZE)
+            || !object_offset.is_multiple_of(PAGE_SIZE)
             || va >= USER_TOP - STACK_SIZE
+            || bytes > USER_TOP - STACK_SIZE - va
         {
             return Err(ObjectMapFailure {
                 error: SpaceError::BadSegment,
@@ -2930,9 +2955,9 @@ impl BoundAddressSpace {
             Err(error) => return Err(ObjectMapFailure { error, permits }),
         };
         let object = authorization.object();
-        let range = LedgerPageRange::new(va, PAGE_SIZE).expect("single page is aligned");
+        let range = LedgerPageRange::new(va, bytes).expect("object view range is page aligned");
         let validated = match self.ledger().validate_map(MapRequest {
-            bytes: PAGE_SIZE,
+            bytes,
             guard_before: 0,
             guard_after: 0,
             placement: MapPlacement::FixedEmpty { usable_start: va },
@@ -2941,8 +2966,7 @@ impl BoundAddressSpace {
             owner: RegionOwner::Lease(lease_key),
             backing: MapBacking::Object {
                 authorization,
-                offset: 0,
-                object_bytes: PAGE_SIZE,
+                offset: object_offset,
             },
             result: None,
         }) {
@@ -2965,30 +2989,43 @@ impl BoundAddressSpace {
         let region = change
             .mapped_region_key()
             .expect("object Map must reserve one usable region");
-        let preflight = match self.tt().preflight_map(
-            Vpn(va / PAGE_SIZE),
-            1,
-            Ppn(pa / PAGE_SIZE),
-            protection_flags(Protection::ReadWrite),
-        ) {
-            Ok(preflight) => preflight,
-            Err(error) => {
-                let permits = self.ledger().rollback(change);
-                return Err(ObjectMapFailure {
-                    error: error.into(),
-                    permits,
-                });
+        let mut preflights = Vec::new();
+        if preflights.try_reserve_exact(spans.len()).is_err() {
+            let permits = self.ledger().rollback(change);
+            return Err(ObjectMapFailure {
+                error: SpaceError::NoFrame,
+                permits,
+            });
+        }
+        let mut cursor = va / PAGE_SIZE;
+        for (base, span_pages) in spans.iter().copied() {
+            match self.tt().preflight_map(
+                Vpn(cursor),
+                span_pages,
+                Ppn(base.0),
+                protection_flags(Protection::ReadWrite),
+            ) {
+                Ok(preflight) => preflights.push(preflight),
+                Err(error) => {
+                    let permits = self.ledger().rollback(change);
+                    return Err(ObjectMapFailure {
+                        error: error.into(),
+                        permits,
+                    });
+                }
             }
-        };
+            cursor += span_pages;
+        }
         self.mark_table_transaction();
         Ok(ObjectMappingPlan {
             change,
-            preflight,
+            preflights,
             lease: ObjectMappingLease {
                 lease: lease_key,
                 region,
                 range,
                 object,
+                object_offset,
             },
         })
     }
@@ -2996,46 +3033,72 @@ impl BoundAddressSpace {
     pub(crate) fn complete_object_mapping(
         &mut self,
         plan: ObjectMappingPlan,
-        owners: Vec<TableFrameToken>,
+        funded: Vec<Vec<TableFrameToken>>,
     ) -> Result<PreparedObjectMapping, (ObjectMapFailure, ReclaimedTableFrames)> {
         let ObjectMappingPlan {
             change,
-            preflight,
+            preflights,
             lease,
         } = plan;
         let mut reclaimed = ReclaimedTableFrames {
-            funded: Vec::new(),
+            funded,
             translations: Vec::new(),
-            failed_owners: Some(owners),
+            failed_owners: None,
             backing: None,
         };
-        let mut token = match PreparedObjectMapping::allocate() {
-            Ok(token) => token,
-            Err(error) => {
+        macro_rules! fail {
+            ($error:expr) => {{
                 let permits = self.ledger().rollback(change);
                 self.clear_table_transaction();
-                return Err((ObjectMapFailure { error, permits }, reclaimed));
-            }
-        };
-        let owners = reclaimed.failed_owners.take().expect("object owners exist");
-        let translation = match self.tt().prepare(preflight, owners) {
-            Ok(translation) => translation,
-            Err(failure) => {
-                let permits = self.ledger().rollback(change);
-                self.clear_table_transaction();
-                reclaimed.failed_owners = Some(failure.owners);
                 return Err((
                     ObjectMapFailure {
-                        error: failure.error.into(),
+                        error: $error,
                         permits,
                     },
                     reclaimed,
                 ));
-            }
+            }};
+        }
+        if reclaimed.funded.len() != preflights.len() {
+            fail!(SpaceError::NoFrame);
+        }
+        let mut token = match PreparedObjectMapping::allocate() {
+            Ok(token) => token,
+            Err(error) => fail!(error),
         };
+        if reclaimed
+            .translations
+            .try_reserve_exact(preflights.len())
+            .is_err()
+        {
+            fail!(SpaceError::NoFrame);
+        }
+        let mut table_outcomes = Vec::new();
+        if table_outcomes.try_reserve_exact(preflights.len()).is_err() {
+            fail!(SpaceError::NoFrame);
+        }
+        for index in 0..preflights.len() {
+            let owners = core::mem::take(&mut reclaimed.funded[index]);
+            match self.tt().prepare(preflights[index], owners) {
+                Ok(translation) => reclaimed.translations.push(translation),
+                Err(failure) => {
+                    let permits = self.ledger().rollback(change);
+                    self.clear_table_transaction();
+                    reclaimed.failed_owners = Some(failure.owners);
+                    return Err((
+                        ObjectMapFailure {
+                            error: failure.error.into(),
+                            permits,
+                        },
+                        reclaimed,
+                    ));
+                }
+            }
+        }
         token.install(ObjectMappingReservation {
             change,
-            translation,
+            translations: core::mem::take(&mut reclaimed.translations),
+            table_outcomes,
             lease,
         });
         Ok(token)
@@ -3046,24 +3109,21 @@ impl BoundAddressSpace {
         plan: ObjectMappingPlan,
     ) -> Vec<WritePermit> {
         self.clear_table_transaction();
-        let permits = self.ledger().rollback(plan.change);
-        assert_eq!(permits.len(), 1, "object Map rollback lost its permit");
-        permits
+        self.ledger().rollback(plan.change)
     }
 
     pub(crate) fn rollback_object_mapping(
         &mut self,
         prepared: PreparedObjectMapping,
-    ) -> (Vec<WritePermit>, PreparedTranslation<TableFrameToken>) {
+    ) -> (Vec<WritePermit>, Vec<PreparedTranslation<TableFrameToken>>) {
         self.clear_table_transaction();
         let ObjectMappingReservation {
             change,
-            translation,
+            translations,
             ..
         } = prepared.take();
         let permits = self.ledger().rollback(change);
-        assert_eq!(permits.len(), 1, "object Map rollback lost its permit");
-        (permits, translation)
+        (permits, translations)
     }
 
     pub(crate) fn commit_object_mapping(
@@ -3072,20 +3132,24 @@ impl BoundAddressSpace {
     ) -> (PublishedSpaceChange, ObjectMappingLease) {
         let ObjectMappingReservation {
             change,
-            translation,
+            translations,
+            table_outcomes,
             lease,
         } = prepared.take();
         assert!(
-            self.table_transaction_active && self.tt().prepared_is_current(&translation),
+            self.table_transaction_active
+                && translations
+                    .iter()
+                    .all(|translation| self.tt().prepared_is_current(translation)),
             "page-table transaction lost exclusive generation"
         );
         self.clear_table_transaction();
         let committed = self.ledger().commit(change);
-        let tables = PublishedTableChanges::One(self.tt().publish(translation));
+        let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
         (
             PublishedSpaceChange {
                 ledger: self.ledger().publish(committed),
-                tables,
+                tables: PublishedTableChanges::Many(table_outcomes),
                 backing_permits: Vec::new(),
             },
             lease,
@@ -3105,11 +3169,14 @@ impl BoundAddressSpace {
                 && matches!(
                     region.kind,
                     RegionKindView::Mapping {
-                        backing: BackingView::Object { object, offset: 0 },
+                        backing: BackingView::Object {
+                            object,
+                            offset: region_offset,
+                        },
                         current: Protection::ReadWrite,
                         maximum: Protection::ReadWrite,
                         ..
-                    } if object == lease.object
+                    } if object == lease.object && region_offset == lease.object_offset
                 )
         });
         if !matches_lease {

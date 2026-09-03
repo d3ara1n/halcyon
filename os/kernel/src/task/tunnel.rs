@@ -354,13 +354,22 @@ fn prepare_mapping(
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
 ) -> Result<super::proc::ObjectMappingPlan, super::proc::ObjectMapFailure> {
-    // 暂时保留单 PA 路径：Tunnel 单页 backing 只有一个 extent，取其 base。
-    // 步骤 4 改用 core.backing.project(0, 1) 输出 bounded translations。
-    let mut spans = connection.core.backing.project(0, 1);
-    let (base, pages) = spans.next().expect("Tunnel backing has no extent");
-    assert_eq!(pages, 1, "Tunnel backing must be single page");
-    assert!(spans.next().is_none(), "Tunnel backing must have one extent");
-    space.prepare_object_mapping(va, base.addr(), authorization, permits)
+    // Tunnel 当前对外是单页，因而投影退化为长度为一的 span 序列；多页几何
+    // 只需改变投影区间，不涉及本函数形状。对象 backing 属 MEMORY_OBJECT 锁阶，
+    // 投影在进入 AddressSpace 前完成。
+    let object_pages = connection.core.backing.pages();
+    let mut spans = Vec::new();
+    if spans
+        .try_reserve_exact(connection.core.backing.projection_capacity())
+        .is_err()
+    {
+        return Err(super::proc::ObjectMapFailure {
+            error: super::proc::SpaceError::NoFrame,
+            permits,
+        });
+    }
+    connection.core.backing.project(0, object_pages, &mut spans);
+    space.prepare_object_mapping(va, 0, &spans, authorization, permits)
 }
 
 fn rollback_mapping(
@@ -368,7 +377,7 @@ fn rollback_mapping(
     prepared: PreparedObjectMapping,
 ) -> (
     Vec<memory_space::WritePermit>,
-    page_table::PreparedTranslation<super::proc::TableFrameToken>,
+    Vec<page_table::PreparedTranslation<super::proc::TableFrameToken>>,
 ) {
     space.rollback_object_mapping(prepared)
 }
@@ -609,7 +618,7 @@ pub fn create(
                 }
             }
         };
-        let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+        let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
                 let permits = thread
@@ -855,7 +864,7 @@ pub fn attach(
                 }
             }
         };
-        let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+        let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
                 let permits = thread

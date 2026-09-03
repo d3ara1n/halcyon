@@ -88,7 +88,6 @@ pub enum MapBacking {
     Object {
         authorization: ObjectViewAuthorization,
         offset: usize,
-        object_bytes: usize,
     },
 }
 
@@ -732,7 +731,6 @@ impl MemorySpace {
             MapBacking::Object {
                 authorization,
                 offset,
-                object_bytes,
             } => {
                 if authorization.maximum() != request.maximum {
                     return Err(ChangeError::ObjectAuthorization);
@@ -740,7 +738,7 @@ impl MemorySpace {
                 let end = offset
                     .checked_add(usable_bytes)
                     .ok_or(ChangeError::BackingOutOfRange)?;
-                if end > object_bytes {
+                if end > authorization.object_bytes() {
                     return Err(ChangeError::BackingOutOfRange);
                 }
                 BackingView::Object {

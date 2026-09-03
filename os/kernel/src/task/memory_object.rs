@@ -85,9 +85,10 @@ impl MemoryObjectCore {
         .map_err(map_fund_error)?;
 
         let identity = mint_object_id();
+        let object_bytes = backing.pages() * super::proc::PAGE_SIZE;
         let state = Spinlock::new(
             crate::sync::ranks::MEMORY_OBJECT,
-            MemoryObjectState::new(identity, 2),
+            MemoryObjectState::new(identity, object_bytes, 2),
         );
 
         let core = Self {

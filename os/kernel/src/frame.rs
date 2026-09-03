@@ -531,132 +531,88 @@ impl QuotaSource for PoolQuota<'_> {
 type UserFundedInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, MAX_FUNDED_EXTENTS>;
 type UserFundedExtentInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
 
-/// 多 extent 资金化 backing storage：唯一持有物理 claims 与同源 charge。
-///
-/// 它是匿名 slice、对象 backing 与 boot adopt 的共同底座；`project` 把逻辑页区间
-/// 投影为有界物理 span 序列，使匿名与对象映射共用同一条 translation 组装路径，
-/// 不再按 backing 种类各写一遍几何展开。
-///
-/// 固定 `MAX_FUNDED_EXTENTS` 槽使本体较大，构造路径的栈帧相应抬高；栈窗口
-/// guard 与审计阈值已按此取值（见 `os/platforms/linker.ld` 与
-/// `os/tools/audit_elf.py`）。不为降帧而把 storage 盒化：按值返回的事务结果
-/// 仍会先落栈，堆上安置只会多一次拷贝与分配。
-#[must_use = "funded backing storage must remain owned until its mapping retires"]
-pub(crate) struct FundedBackingStorage {
-    inner: UserFundedInner,
-}
-
-impl FundedBackingStorage {
-    pub(crate) fn pages(&self) -> usize {
-        self.inner.pages()
-    }
-
-    pub(crate) fn extent_count(&self) -> usize {
-        self.inner.extent_count()
-    }
-
-    /// 物理 extent 序列，按逻辑顺序给出 `(base, pages)`。
-    pub(crate) fn extents(&self) -> impl ExactSizeIterator<Item = (FrameNumber, usize)> {
-        self.inner
-            .claims()
-            .map(|claim| (claim.geometry().base(), claim.geometry().count()))
-    }
-
-    /// 把逻辑页区间 `[offset_pages, offset_pages + length_pages)` 投影为物理 span 序列。
-    ///
-    /// 单页请求退化为长度为一的序列，因此单页 Tunnel 与多页对象走同一路径。
-    /// 越界由调用方在 Validate 阶段排除，此处只做结构断言。
-    pub(crate) fn project(
-        &self,
-        offset_pages: usize,
-        length_pages: usize,
-    ) -> impl Iterator<Item = (FrameNumber, usize)> {
-        let end = offset_pages
-            .checked_add(length_pages)
-            .expect("backing projection range overflows");
-        assert!(
-            end <= self.inner.pages(),
-            "backing projection exceeds funded geometry"
-        );
-        let mut cursor = 0usize;
-        self.extents().filter_map(move |(base, extent_pages)| {
-            let extent_start = cursor;
-            cursor += extent_pages;
-            if length_pages == 0 || extent_start >= end || cursor <= offset_pages {
-                return None;
-            }
-            let skip = offset_pages.saturating_sub(extent_start);
-            let take = cursor.min(end) - (extent_start + skip);
-            Some((base + skip, take))
-        })
-    }
-
-    /// 保留逻辑前缀并切出后缀；物理 extent 与 charge 同步分解，失败保持 `self` 不变。
-    pub(crate) fn split_off(&mut self, left_pages: usize) -> Result<Self, ()> {
-        self.inner
-            .split_off(left_pages)
-            .map(|inner| Self { inner })
-            .map_err(|_| ())
-    }
-
-    /// 把物理相邻的后继 storage 并回本体；失败保持双方 owner。
-    pub(crate) fn merge_from(&mut self, donor: &mut Self) -> Result<(), ()> {
-        self.inner.merge_from(&mut donor.inner).map_err(|_| ())
-    }
-}
-
 /// 固定长度、不可分解的对象数据 backing。
 ///
 /// 与匿名 backing 的区别只在生命周期语义：对象 backing 由创建者绑定池一次付清，
 /// view 的切割、降权与解除都不切数据 backing，因此这里不暴露 split/merge。
+///
+/// **堆化常驻形态**：对象 core 是常驻对象，因此这里持堆上的单 extent owner
+/// 序列，而不内联固定 `MAX_FUNDED_EXTENTS` 槽的定长 funding 结果。定长容器
+/// 只适合做一次性的 funding 事务结果（栈上短暂存在）；把它嵌进常驻对象会使
+/// 每个对象无论实际几个 extent 都占满整份槽位，且构造路径逐层复制整个
+/// 本体——这是栈帧审计的直接成因。funding 结果在获取后立即堆化。
 #[must_use = "object backing must remain owned until the memory object is destroyed"]
 pub(crate) struct ObjectBacking {
-    storage: FundedBackingStorage,
+    extents: Vec<FundedExtent>,
+    pages: usize,
 }
 
 impl ObjectBacking {
     pub(crate) fn pages(&self) -> usize {
-        self.storage.pages()
+        self.pages
     }
 
     pub(crate) fn extent_count(&self) -> usize {
-        self.storage.extent_count()
+        self.extents.len()
     }
 
-    /// 对象内页区间到物理 span 的投影，供 view 组装 translation。
+    /// 对象内页区间到物理 span 的投影，追加写入 `spans`。
+    ///
+    /// 单页 view 退化为长度为一的序列，因此单页 Tunnel 与多页对象共用同一条
+    /// translation 组装路径。越界由调用方在 Validate 阶段排除。
     pub(crate) fn project(
         &self,
         offset_pages: usize,
         length_pages: usize,
-    ) -> impl Iterator<Item = (FrameNumber, usize)> {
-        self.storage.project(offset_pages, length_pages)
+        spans: &mut Vec<(FrameNumber, usize)>,
+    ) {
+        let end = offset_pages
+            .checked_add(length_pages)
+            .expect("object projection range overflows");
+        assert!(
+            end <= self.pages,
+            "object projection exceeds funded geometry"
+        );
+        if length_pages == 0 {
+            return;
+        }
+        let mut cursor = 0usize;
+        for extent in &self.extents {
+            let extent_start = cursor;
+            let extent_pages = extent.pages();
+            cursor += extent_pages;
+            if extent_start >= end || cursor <= offset_pages {
+                continue;
+            }
+            let skip = offset_pages.saturating_sub(extent_start);
+            let take = cursor.min(end) - (extent_start + skip);
+            spans.push((extent.base() + skip, take));
+        }
+    }
+
+    /// 投影所需的 span 上限。
+    pub(crate) fn projection_capacity(&self) -> usize {
+        self.extents.len()
     }
 }
 
 /// 取得固定长度、零态的对象 backing；由创建进程绑定池支付。
+///
+/// 与匿名 backing 走同一条 funding 路径：定长事务结果在返回前立即堆化为常驻
+/// extent 列表，定长容器不进入常驻对象（见 `ObjectBacking` 的形态说明）。
+#[inline(never)]
 pub(crate) fn fund_object_backing(
     pool: &Arc<MemoryPool>,
     pages: usize,
     limits: FundingLimits,
 ) -> Result<ObjectBacking, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
-    fund_backing_storage(pool, pages, limits).map(|storage| ObjectBacking { storage })
-}
-
-/// 取得普通多 extent 资金化 backing storage。
-pub(crate) fn fund_backing_storage(
-    pool: &Arc<MemoryPool>,
-    pages: usize,
-    limits: FundingLimits,
-) -> Result<FundedBackingStorage, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
-    funded_frame::fund::<_, _, MAX_FUNDED_EXTENTS>(&PoolQuota(pool), &UserInventory, pages, limits)
-        .map(|inner| {
-            assert_eq!(
-                inner.credit().pages(),
-                inner.pages(),
-                "funded backing charge differs from physical geometry"
-            );
-            FundedBackingStorage { inner }
-        })
+    let funded = fund_user_frames(pool, pages, limits)?;
+    let pages = funded.pages();
+    let mut extents = Vec::new();
+    funded
+        .into_extents(&mut extents)
+        .map_err(|()| funded_frame::FundError::Physical(UserClaimError::OutOfMemory))?;
+    Ok(ObjectBacking { extents, pages })
 }
 
 /// 单一物理 extent 的资金化 owner；自然析构先归还物理 extent，再退 Pool charge。

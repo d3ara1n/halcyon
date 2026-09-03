@@ -45,6 +45,7 @@ pub enum SealOutcome {
 pub struct ObjectViewAuthorization {
     object: ObjectId,
     maximum: Protection,
+    object_bytes: usize,
 }
 
 impl ObjectViewAuthorization {
@@ -54,6 +55,11 @@ impl ObjectViewAuthorization {
 
     pub const fn maximum(&self) -> Protection {
         self.maximum
+    }
+
+    /// 对象的固定长度。view 越界以此为准，调用方不另传一份长度。
+    pub const fn object_bytes(&self) -> usize {
+        self.object_bytes
     }
 }
 
@@ -79,6 +85,7 @@ impl WritePermit {
 #[derive(Debug)]
 pub struct MemoryObjectState {
     object: ObjectId,
+    object_bytes: usize,
     state: ExecutableState,
     permits: usize,
     permit_limit: usize,
@@ -87,9 +94,10 @@ pub struct MemoryObjectState {
 }
 
 impl MemoryObjectState {
-    pub const fn new(object: ObjectId, permit_limit: usize) -> Self {
+    pub const fn new(object: ObjectId, object_bytes: usize, permit_limit: usize) -> Self {
         Self {
             object,
+            object_bytes,
             state: ExecutableState::Mutable,
             permits: 0,
             permit_limit,
@@ -100,6 +108,11 @@ impl MemoryObjectState {
 
     pub const fn object(&self) -> ObjectId {
         self.object
+    }
+
+    /// 对象固定长度；创建后不可改变。
+    pub const fn object_bytes(&self) -> usize {
+        self.object_bytes
     }
 
     pub const fn state(&self) -> ExecutableState {
@@ -125,6 +138,7 @@ impl MemoryObjectState {
         Ok(ObjectViewAuthorization {
             object: self.object,
             maximum,
+            object_bytes: self.object_bytes,
         })
     }
 

@@ -654,7 +654,7 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
     assert_eq!(space.transaction_count(), 0);
 
     let object_id = ObjectId::new(9).unwrap();
-    let object = MemoryObjectState::new(object_id, 4);
+    let object = MemoryObjectState::new(object_id, PAGE_SIZE, 4);
     let validated = space
         .validate_map(MapRequest {
             bytes: PAGE_SIZE,
@@ -669,7 +669,6 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
             backing: MapBacking::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
-                object_bytes: PAGE_SIZE,
             },
             result: None,
         })
@@ -685,7 +684,7 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
 fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
     let mut space = space();
     let object_id = ObjectId::new(1).unwrap();
-    let mut object = MemoryObjectState::new(object_id, 8);
+    let mut object = MemoryObjectState::new(object_id, 4 * PAGE_SIZE, 8);
     let validated = space
         .validate_map(MapRequest {
             bytes: 2 * PAGE_SIZE,
@@ -698,7 +697,6 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
             backing: MapBacking::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: PAGE_SIZE,
-                object_bytes: 4 * PAGE_SIZE,
             },
             result: None,
         })
@@ -755,7 +753,7 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
 fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write() {
     let mut first_space = space();
     let object_id = ObjectId::new(12).unwrap();
-    let mut object = MemoryObjectState::new(object_id, 4);
+    let mut object = MemoryObjectState::new(object_id, PAGE_SIZE, 4);
     let validated = first_space
         .validate_map(MapRequest {
             bytes: PAGE_SIZE,
@@ -768,7 +766,6 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
             backing: MapBacking::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
-                object_bytes: PAGE_SIZE,
             },
             result: None,
         })
@@ -784,7 +781,7 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
 
     let mut second_space = space();
     let mutable_id = ObjectId::new(13).unwrap();
-    let mut executable = MemoryObjectState::new(mutable_id, 4);
+    let mut executable = MemoryObjectState::new(mutable_id, PAGE_SIZE, 4);
     let validated = second_space
         .validate_map(MapRequest {
             bytes: PAGE_SIZE,
@@ -797,7 +794,6 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
             backing: MapBacking::Object {
                 authorization: executable.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
-                object_bytes: PAGE_SIZE,
             },
             result: None,
         })
@@ -819,7 +815,7 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
 #[test]
 fn abandoned_seal_waiter_does_not_revert_state() {
     let object_id = ObjectId::new(2).unwrap();
-    let mut object = MemoryObjectState::new(object_id, 2);
+    let mut object = MemoryObjectState::new(object_id, PAGE_SIZE, 2);
     let permits = object.reserve_writes(1).unwrap();
     assert_eq!(object.seal(Some(11)).unwrap(), SealOutcome::Waiting);
     assert!(object.abandon_waiter(11));
@@ -833,7 +829,7 @@ fn abandoned_seal_waiter_does_not_revert_state() {
 fn object_view_offsets_follow_exact_middle_split() {
     let mut space = space();
     let object_id = ObjectId::new(3).unwrap();
-    let object = MemoryObjectState::new(object_id, 2);
+    let object = MemoryObjectState::new(object_id, 8 * PAGE_SIZE, 2);
     let validated = space
         .validate_map(MapRequest {
             bytes: 3 * PAGE_SIZE,
@@ -846,7 +842,6 @@ fn object_view_offsets_follow_exact_middle_split() {
             backing: MapBacking::Object {
                 authorization: object.authorize_view(Protection::ReadOnly).unwrap(),
                 offset: PAGE_SIZE,
-                object_bytes: 8 * PAGE_SIZE,
             },
             result: None,
         })
@@ -929,7 +924,7 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
 
     let normal = space();
     let object_id = ObjectId::new(4).unwrap();
-    let object = MemoryObjectState::new(object_id, 2);
+    let object = MemoryObjectState::new(object_id, 2 * PAGE_SIZE, 2);
     assert_eq!(
         normal
             .validate_map(MapRequest {
@@ -943,7 +938,6 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
                 backing: MapBacking::Object {
                     authorization: object.authorize_view(Protection::ReadOnly).unwrap(),
                     offset: PAGE_SIZE,
-                    object_bytes: 2 * PAGE_SIZE,
                 },
                 result: None,
             })
