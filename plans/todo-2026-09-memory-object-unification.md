@@ -166,51 +166,116 @@ MEMORY_POOL (230) < MEMORY_OBJECT (250) < ADDRESS_SPACE (300)
 1. **补 metadata admission 五类**（resources.rs）—— ✅ `6e18b8f`
 2. **建立 `FundedBackingStorage` 与 `ObjectBacking`**（frame.rs）—— ✅ `6e18b8f`
 3. **建立 `MemoryObjectCore` 并迁移 Tunnel**（memory_object.rs、tunnel.rs）—— ✅ `6e18b8f` + `16dd3b4`
-4. **上收 bounded projection**（proc.rs）—— ⏸ 下一任务，见下节
-5. **owner-aware ledger**（proc.rs、memory_space/space.rs 泛型化）
+4. **上收 bounded projection + owner-aware backing**（proc.rs、frame.rs）—— ⏸ 下一任务，**与步骤 5 合并为一次最终形态重构**，见下节
+5. ~~owner-aware ledger~~ —— 已并入步骤 4（同一批 backing 代码，不拆中间态）
 6. **统一事务核**（proc.rs）→ 删四套 plan/complete 类型与函数。
 7. **迁移 Running/Building/Tunnel 调用点** → 全走统一事务核。
 8. **开放公共 MemoryObject ABI**（shared、syscall、rinlib）→ Create/Query/Seal、`EXECUTABLE` 信号、用户态 affine owner。
+
 每步先跑对应 host debug/release、`just check`；涉及启动后跑 `just virt`；涉及 Remote/drain 补 `just virt-stress`；收尾跑 `just acceptance`。
 
 ### 已完成
 
 - **步骤 1–3 ✅**（见下方「已完成提交索引」）
-- 步骤 4 起的推进方式与分叉点在「下一任务」节。
+- 步骤 4+5 合并为一次最终形态重构，见「下一任务」节。
 
-## 下一任务（从 B1/C1 分叉点重启）
+## 下一任务：最终形态设计（已按用户指示改为一次到位）
 
-步骤 4（投影上收）与步骤 5（owner-aware ledger）都牵动同一批 backing 代码，深浅做法在「是否现在把 `OwnedBacking` 从 `Vec<BackingExtent>` 迁到 `FundedBackingStorage`」分叉。上一会话探察到三种深度，下次开工前先拍板：
+用户指示：操作同一批代码的，按最终视图一次实施，不做「先 A 再 B」的中间态。本计划据此从上一会话的 A/B/C 三选项收敛为单一最终视图，一次重构到位。
 
-### 选项 A：对象侧改多 extent（浅）
-- 让 `prepare_object_mapping` 接收 `&ObjectBacking` 而非单 PA，内部用 `project()` 生成有界 preflight 序列；`ObjectMappingPlan.preflight` 从单个改 `Vec<TranslationPreflight>`。
-- 不动匿名侧 `Vec<BackingExtent>` 结构；`OwnedBacking` 迁移仍属 C1 延后。
-- 效果：对象侧脱离单 PA 硬编码，公共 MemoryObject 多页 view 可直接接；改动集中在 proc.rs 对象四条路径 + tunnel.rs。
+### 最终视图：匿名 backing 与对象 backing 同构
 
-### 选项 B：共用投影 helper（中）
-- 匿名 `preflight_install` 与对象侧收敛到同一投影 helper：输入 offset/length + 多 extent 几何，输出 bounded preflight 序列。
-- `OwnedBacking` 继续持 `Vec<BackingExtent>`（暂不迁 `FundedBackingStorage`），但几何遍历逻辑只剩一处。
-- 删 `MapBacking::Object` 的 `object_bytes` 参数（长度从经认证 view 取，reviewer B3）。
+**（一）匿名 backing 直接持 `FundedBackingStorage`（不再持 `Vec<BackingExtent>`）**
 
-### 选项 C：全面重构（深，= 步骤 4 + 5 合并）
-- `OwnedBacking` 彻底迁到 `FundedBackingStorage`，删 `BackingExtentOwner::{Funded,BootBorrowed}` 手工切分与 `into_extents` 残余，Boot 路径收 `BootFundedExtent`。
-- 与 C1（Publish 切 live/retiring slice owner）合并为一次大重构，是 reviewer 阻断项 A2/C1/C2 的完整落地。
-- 改动面最大：`OwnedBacking` 定义、`write_from_start`、`preflight_install`、split、retire、`install_bootstrap_funding` 全重写。
+- `OwnedBacking` 从 `{ identity, pages, extents: Vec<BackingExtent> }` 改为 `{ identity: BackingId, storage: FundedBackingStorage }`。
+- 消灭：`BackingExtentOwner`、`BackingExtent`、`PreparedBacking`（退化为 funding 结果）、`OwnedBacking::extents`、`preflight_install` 的手工遍历、`write_from_start` 的手工遍历、`release_one` 的手工 split+Vec 重排、`install_bootstrap_funding` 的 `BootBorrowed` 替换。
+- `FundedBackingStorage` 已有能力：`pages()`、`extents()`、`project(offset,length)`（输出有界 span 序列）、`split_off`（逻辑前缀/后缀切分，物理+charge 同步）。
+- **结构约束（关键设计决定）**：一个 `OwnedBacking` = 一个 ledger fragment 的 backing。切分时用 `storage.split_off(left_pages)` 一次切出「左 live 半 + 右（retiring/live）半」两个 storage，不再保留中间状态。
+- **为什么这就满足 C1 的删除条件**：ledger 的每个 `RetiringFragment` 现在在 Reserve/Publish 阶段携带它对应的那个 storage（连同物理 owner 与 charge），retire 路径直接析构它，不再靠 `BackingId + offset` 在 `backings` 里运行时查找（`retire_backing_one` 的 `binary_search_by_key` + `release_one` 的线性 `position` 全部消失）。
 
-### 推荐
+**（二）对象 backing 复用同一 storage，view 只持授权快照不持物理 owner**
 
-选项 C 一劳永逸符合「合并 6E+7 一次设计到位」的本意，但单次改动面最大、风险最高。选项 B 是中间态：先让匿名/对象共用投影 helper（满足 B1 的删除条件），`OwnedBacking` 迁移作为独立小步随后做（满足 C1 的删除条件）——两步各有独立可验证闭包，不把「删单 PA」和「迁 backing 表示」绑在一次提交里。推荐 B 先行、C1 紧随。
+- `ObjectBacking` 已存在（frame.rs），持 `FundedBackingStorage`、不暴露 split/merge，对象自身唯一拥有 backing。
+- 对象 region 在 ledger 里继续只存 `ObjectId + offset`（现状不变，view 的切割不切数据 backing——ideas/mm.md L84 已冻结）。
+- 与 (一) 的对称性：匿名用 `OwnedBacking{identity, storage}`，对象把 storage 收在 `MemoryObjectCore` 的 `ObjectBacking` 里。两种来源都经 `FundedBackingStorage`，但投影（`project`）只发生在 map 的 preflight 阶段（对象 view 建立时从对象 backing 投影、匿名从匿名 backing 投影），切分只发生在匿名（对象 backing 从不切）。
 
-### 已完成提交索引
+**（三）projection 上收：单一有界 preflight 组装路径**
 
-- `6e18b8f`：admission 五类 + `FundedBackingStorage`/`ObjectBacking`/`MemoryObjectCore` 基座 + AGENTS.md 残留纪律
-- `16dd3b4`：Tunnel Connection 迁 `MemoryObjectCore`、Endpoint/Invitation permit、栈窗口扩容
+- `FundedBackingStorage::project(offset, length)` 是**唯一**的几何→物理展开入口（已存在）。匿名 `preflight_install` 与对象 map 的 preflight 组装都调用它。
+- 删除：`MapBacking::Object` 的 `object_bytes` 字段（view 越界在 validate 由 authorized 快照与对象几何核对，不靠调用方独立传入）；对象 map 的 `PAGE_SIZE` 硬编码（多页 view 直接经 authorized 长度投影）；`prepare_object_mapping` 的单 PA 假设与 `assert_eq!(permits.len(), 1)`。
 
-### 当前风险登记
+**（四）匿名/对象在 ledger 中的切分差异只体现在 fragment 携带物上**
 
-- `ObjectViewPermit` 无消费者（待 C2 接）；`funded_selftest` 走旧 `fund_user_frames`（生产 backing 已改 `fund_backing_storage`，selftest 仍验证旧入口，切片 10 收口）。
-- `new_tunnel_connection` 单帧 0x3540 是审计上限 0x3800 下的最大合法帧，后续新增大 backing 构造函数前先重估。
-- sifive_u STACK_SIZE 已扩到 0x10000，若继续引入接近上限的单帧，需再评估。
+- **匿名**：切割消费原 storage 的一个子段 → 产出一个 retiring `FundedBackingStorage` 交给 retire 路径析构（物理+charge 守恒由 `split_off` 保证）。
+- **对象**：切割只改 `BackingView::offset` 与 RegionKey，不产生物理 owner（数据 backing 留在对象）。
+- 两者共享同一 region 切割 / `RegionKey` 铸造 / `WritePermit` 流转 / commit-publish-synchronize-retire 阶段机；差异只在「retiring fragment 是否携带一个待析构的 storage」。
+
+**（五）Boot 路径**
+
+- 去掉 `BootBorrowed` 投影后，`map_bootstrap_block` 在 Planning/Commit 前把 payload 物理并入 backing 的 storage：prefix 用匿名 funding 路径出资，payload 借外层 `BootFundedExtent` 几何先做可失败 map，成功后在无分配点上把 payload 并入同 storage（**合并而非替换**，因为此时 backing 已经是完整 storage 而不是 Vec 了）。
+- 删除：`install_bootstrap_funding`（其职责并入 map_bootstrap_block 的收尾——不需要在 `backings.last_mut()` 里找 extent 替换了，因为 backing 在 map 时就已带着完整 storage）。
+- 若要保留 BootBorrowed 的「投影后安装」模式则 storage 需能表示「只读借用子段」，而 `FundedBackingStorage` 内固定数组装不下借用视图——所以改为把 payload 在 map 时就并入 backing storage 的合并式，boot 物理在 `launch_bootstrap` 外层继续持 `BootFundedExtent` 直到并入。
+
+**（六）消灭 `FundedExtent` / `FundedFrames` / `into_extents` / `fund_user_frames` 中间层**
+
+- 现状：`fund_owned_backing` 拿 `FundedFrames` 后 `into_extents` 摊平成 `Vec<FundedExtent>`，每个再包 `BackingExtentOwner::Funded`。
+- 最终：`fund_owned_backing` 直接返回 `FundedBackingStorage`（funding 结果不用拆散）；`FundedExtent`、`FundedFrames`、`into_extents`、`fund_user_frames` 全部删除（funded_selftest 改走 `fund_backing_storage`）。
+
+### 删除条件（完成后全绿才是收口）
+
+1. `BackingExtentOwner`、`BackingExtent`、`FundedFrames`、`FundedExtent`、`into_extents`、`fund_user_frames`、`BackingRetireCursor`、`install_bootstrap_funding`、`preflight_install`、`release_one`、`BackingPlanFailure::Owned` 不再存在。
+2. 匿名 retire 不再按 `BackingId+offset` 运行时查找；retiring storage 随 fragment 结构性携带。
+3. `preflight` 组装只有一条经 `project()` 的路径。
+4. 单一 `OwnedBacking{identity, storage}`，ledger 每 fragment 与 storage 一一对应。
+
+### 风险与待验证
+
+- `project()` 目前返回惰性迭代器（借 self）；切分后多段投影需要收集成 Vec 或其它形式——preflight 路径本来就是 Vec，问题不大；但**惰性迭代器持有 storage 借用**会阻碍「切出 retiring storage 后立即析构」的移动语义，可能要先把投影收集成 owned Vec 或让 `project` 输出 owned `(base,pages)` 序列。
+- `merge_from` 用于 boot payload 并入，但失败会保持双方——并入点需要可失败处理。
+- `split_off` 失败（非法切分）——release_one 的切分总是内部合法（范围已由 ledger 保证），用 expect 即可。
+- **帧预算**：把 `FundedBackingStorage`（64 槽）直接放进 `BoundAddressSpace.backings` 的 `OwnedBacking`，每个 active 匿名映射都内联一份 64 槽数组——已确认单 mapping 只持一份 storage（commit 时把整份放进去），不放大。但地址空间固定预算：`REGION_SLOTS_PER_ADDRESS_SPACE = 4096`，每 backing 上限 64 物理 extent；若每 fragment 持一份 storage，则「fragment 数 × 每 fragment 物理 extent 数」需要受同一 region_slot 预算约束——匿名映射每 fragment 一个 backing，这个不变式必须守住。
+- **sifive_u 栈**：`map_bootstrap_block` 现在要把 payload 并入 backing storage（多一步 split/merge 在栈上），单帧可能逼近 `new_tunnel_connection` 的 0x3540，需重估 sifive_u formal 栈（现 0x10000 有 36KB→60KB 余量，够）。
+
+### 本次会话的探察结论（已并入上述最终视图）
+
+1. **`OwnedBacking` 的 release_one 是「物理+charge 守恒切分」的唯一真值**：一次 unmap 中段切出「左 live / 中 retiring / 右 live」三段，左右留在 `backings` 的 Vec 里、中间返回给 retire 路径。
+2. **匿名与对象在 backing 上的差异已收敛为「切不切」**：匿名切物理（unmap 中段归库存），对象永不切（backing 在对象）。
+3. **ledger 已为「fragment 携带 retiring storage」铺好路**：`PreparedPlan.retiring: Vec<RetiringFragment>`、`PreparedChange`、`CommittedChange/Published/Synchronized/RetiringChange` 全程持 `RetiringFragment`；`RetireBatch` 在 `begin_retire` 从 Synchronized payload `mem::take` 出来给调用方逐批 pop。匿名 retire 只要把 fragment 关联的物理 owner（storage）放进 `RetiringFragment` 即可——当前匿名 fragment 不带物理 owner，是因为物理 owner 在 `backings` 里按 id 查。
+4. **boot 的 `BootBorrowed` 是非真 owner 的临时投影**：物理所有权由 `launch_bootstrap` 外层 `payload_funded: BootFundedExtent` 覆盖，map 后由 `install_bootstrap_funding` 原位替换成真 `Boot` owner。改成「并入 backing storage」是合并式，物理在 `launch_bootstrap` 外层直到并入。
+5. **对象侧不用泛型**：对象 view 的授权（ObjectViewAuthorization）在 `MapBacking::Object` 里、`Region.permit: Option<WritePermit>` 是可写对象映射的 affine 凭据；region 只存 id+offset 不存物理。要让匿名/对象共用一套 backing 切分，对象侧不需要 ledger 泛型——差异在「匿名 fragment 多携带一个 storage，对象不」。
+
+### 设计验证（收口时全绿）
+
+- host：`memory_space` 19 项 + `funded_frame` 12 项 + 新增的匿名 backing 切分 host 用例（如果 storage 切分逻辑抽到可 host 测的 crate）。
+- 内核启动自检：funded/Pool/AddressSpace 守恒断言。
+- `just check` + `just virt`（core 锚点）+ `just virt-stress`（Remote/drain/竞态）+ `just virt-release`（优化代码生成）+ `just acceptance`（含 sifive_u，验证新栈帧）。
+
+### 已定决策：retiring storage 走内核事务 token，**不**泛型化 ledger
+
+原计划 C2 写的「ledger 带泛型 owner 参数」本次**不做**。理由从需求独立推导：
+
+- `memory_space` 是 `no_std` + `forbid(unsafe_code)` 的纯 planner（space.rs 1819 行、无任何现有泛型），`RegionTemplate`/`BackingView` 是 `Copy` 并按值穿过 `templates_compatible`/`normalize_templates`；引入非-Copy owner 会迫使整条模板合并链改写。付这个代价应该换来真实收益，而它换不来——见下条。
+- 真正要消灭的不是「ledger 不持 owner」，而是「**退役时才去找** owner」：`retire_backing_one` 的 `binary_search_by_key(identity)` + `release_one` 的线性 offset 重叠查找。只要 owner 在**切分发生的那一刻**就跟事务走，查找就不存在了——而事务 token 是内核侧的（`PublishedSpaceChange`/`RetiringSpaceChange`），它本就能持内核类型。
+- `ideas/mm.md` L72 的原文是「解除的中段**转入事务 retire 所有权**」——归事务，不是归 planner。本方案正面满足该句；C2 的泛型化反而是过度读解。
+
+**切分时机：Commit**。Commit 是不可逆线化点、零分配、无可恢复失败——`FundedBackingStorage::split_off` 正好零分配（定长数组内重排），且在边界已由 ledger 预先验证、slice permit 已在 Commit 前预留的前提下不可失败。因此：
+
+- **Commit 前**：storage 完整留在 `backings`，rollback 零接触——不需要「把切过的合回去」的逆操作（若在 Reserve 阶段切，rollback 就得调 `merge_from`，而它可失败，会把不可失败的回滚路径污染成可失败）。
+- **Commit 时**：一次原子切出三段——`let mut rest = storage.split_off(mid_start)`（self 成 live 左），`let right = rest.split_off(mid_len)`（rest 成 retiring 中段）。边界退化（mid_start==0 或 mid 到尾）则相应跳过一次 split。live 左/右各自成为一个新 ledger fragment 的 backing（回 `backings`），retiring 中段进 `PublishedSpaceChange`。
+- **Commit 后**：`RetiringSpaceChange` 直接析构手上的 retiring storage，没有任何查找；`BackingRetireCursor` 整个删除。
+
+**附带的预算简化**：当前 `MAX_BACKING_SPLITS_PER_CHANGE = MAX_FUNDED_EXTENTS * 4`（按每 extent 可能被切估）。改为 storage 级切分后，每个被覆盖 fragment 最多两次 `split_off`、每次最多把一个跨界 extent 切成两个，故预算为 `2 × 被覆盖匿名 fragment 数`，与物理 extent 数无关。预算常量应同步重推并写成可读公式，不照搬旧值。
+
+### 实施顺序（自底向上，每步产物都是最终形态的一部分，不产生待拆的中间物）
+
+1. **frame.rs 补齐 storage 能力**：`project()` 的惰性迭代器改为可在不持借用下消费的形式（写入调用方提供的 `&mut Vec<(FrameNumber, usize)>`，或返回定长 `ArrayVec` 风格的 owned 序列），使「先投影再切分/移动」成立；`split_off` 保持现状。
+2. **`OwnedBacking` 换表示**：`{ identity, storage: FundedBackingStorage }`，`write_from_start` 与 preflight 组装全部改走 `project()`。`fund_owned_backing` 直返 storage；同步删 `FundedExtent`/`FundedFrames`/`into_extents`/`fund_user_frames`（`funded_selftest` 改走 `fund_backing_storage`，顺手消灭风险登记的旧入口项）。
+3. **Commit 切分**：`commit_*` 路径原子产出 live 左/右 storage 与 retiring storage；`PublishedSpaceChange`/`RetiringSpaceChange` 持 retiring storage；删 `retire_backing_one`、`release_one`、`BackingRetireCursor`。同步重推 split permit 预算常量。
+4. **对象侧上收**：`prepare_object_mapping` 接 `&ObjectBacking` + view 几何，内部 `project()` 出多段 preflight；`ObjectMappingPlan.preflight` 改 `Vec`；删 `object_bytes` 参数、`PAGE_SIZE` 硬编码、`assert_eq!(permits.len(), 1)`；tunnel.rs 去掉单页断言。
+5. **Boot 路径**：`map_bootstrap_block` 改为「prefix storage + payload 并入」；删 `BootBorrowed` 与 `install_bootstrap_funding`。
+6. **残留审计**：全仓搜 `BackingExtent`、`BootBorrowed`、`into_extents`、`FundedExtent`、`retire_backing_one`、`object_bytes`；确认删除条件四条全部满足。
+
+每步跑 `just check` + host 单测；步 3–5 各自跑 `just virt`；步 6 后跑全量验收。允许分多次提交（中间态不完整可接受），但最终成品必须干净完整。
 
 ## ABI 与用户态改动
 
