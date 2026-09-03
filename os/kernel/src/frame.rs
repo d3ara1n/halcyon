@@ -536,6 +536,11 @@ type UserFundedExtentInner = funded_frame::Funded<MemoryCharge, ClaimedUserExten
 /// 它是匿名 slice、对象 backing 与 boot adopt 的共同底座；`project` 把逻辑页区间
 /// 投影为有界物理 span 序列，使匿名与对象映射共用同一条 translation 组装路径，
 /// 不再按 backing 种类各写一遍几何展开。
+///
+/// 固定 `MAX_FUNDED_EXTENTS` 槽使本体较大，构造路径的栈帧相应抬高；栈窗口
+/// guard 与审计阈值已按此取值（见 `os/platforms/linker.ld` 与
+/// `os/tools/audit_elf.py`）。不为降帧而把 storage 盒化：按值返回的事务结果
+/// 仍会先落栈，堆上安置只会多一次拷贝与分配。
 #[must_use = "funded backing storage must remain owned until its mapping retires"]
 pub(crate) struct FundedBackingStorage {
     inner: UserFundedInner,
@@ -717,24 +722,6 @@ impl FundedFrames {
     }
 }
 
-/// 取得单一普通 user-funded extent。调用方必须提供恰好能容纳一个 extent 的边界。
-pub(crate) fn fund_user_extent(
-    pool: &Arc<MemoryPool>,
-    pages: usize,
-    limits: FundingLimits,
-) -> Result<FundedExtent, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
-    let funded = fund_user_frames(pool, pages, limits)?;
-    let mut extents = Vec::new();
-    funded
-        .into_extents(&mut extents)
-        .map_err(|_| funded_frame::FundError::Physical(UserClaimError::OutOfMemory))?;
-    assert_eq!(
-        extents.len(),
-        1,
-        "single funded extent geometry was fragmented"
-    );
-    Ok(extents.pop().expect("single funded extent missing"))
-}
 
 /// 取得普通 user-funded backing。页数与 extent 上限由具体消费方的工作边界决定。
 pub(crate) fn fund_user_frames(

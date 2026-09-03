@@ -1,11 +1,11 @@
 //! 公共 MemoryObject 与 Tunnel 的统一对象 core。
 //!
 //! `MemoryObjectCore` 同时持：ObjectId（全局单调铸造）、ObjectBacking（固定长度多 extent
-//! funded storage）、MemoryObjectState（Mutable → Sealing → Executable 状态机）、
-//! ObjectWaitState（EXECUTABLE 电平位 + 订阅队列）、metadata permits + sponsor 强引用。
+//! funded storage）、MemoryObjectState（Mutable → Sealing → Executable 状态机）与
+//! metadata owner（sponsor 强引用 + backing permit）。
 //!
-//! 公共 MemoryObject shell 与 Tunnel Connection 都复用同一 core，不存在双来源 ObjectId
-//! 或重复状态机。
+//! 等待面不属于 core：Tunnel 的等待面在 Endpoint 上，公共 MemoryObject 的等待面在其
+//! 公共 shell 上，二者各自拥有独立的 ObjectWaitState。
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -17,12 +17,11 @@ use crate::{
     sync::Spinlock,
     task::{
         memory_pool::MemoryPool,
-        object::ObjectWaitState,
-        resources::{ConnectionPermit, EndpointPermit, InvitationPermit, MetadataSponsor, ObjectBackingPermit},
+        resources::{ConnectionPermit, MetadataSponsor, ObjectBackingPermit},
     },
 };
 
-use erhino_shared::{call::SystemCallError, object::ObjectSignals};
+use erhino_shared::call::SystemCallError;
 
 static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -31,21 +30,39 @@ fn mint_object_id() -> ObjectId {
     ObjectId::new(identity).expect("MemoryObject identity exhausted")
 }
 
+/// 把资金化失败分类为系统调用错误：额度不足与物理/metadata 不足不同，
+/// 结构硬上限也单独区分，不得统一折成 `OutOfMemory`。
+fn map_fund_error(
+    error: funded_frame::FundError<memory_pool::PoolError, frame::UserClaimError>,
+) -> SystemCallError {
+    match error {
+        funded_frame::FundError::Quota(memory_pool::PoolError::QuotaExceeded) => {
+            SystemCallError::QuotaExceeded
+        }
+        funded_frame::FundError::Quota(_) => SystemCallError::OutOfMemory,
+        funded_frame::FundError::PageLimit | funded_frame::FundError::ExtentLimit => {
+            SystemCallError::ReachLimit
+        }
+        funded_frame::FundError::ZeroPages
+        | funded_frame::FundError::InvalidClaim
+        | funded_frame::FundError::Physical(_) => SystemCallError::OutOfMemory,
+    }
+}
+
 /// 公共 MemoryObject 与 Tunnel Connection 的统一 core。
 ///
-/// 持有对象身份、backing、状态机、等待面与 metadata 生命周期 owner。Connection 的
-/// MemoryObjectState 与 ObjectWaitState 分别经 `CONNECTION` 与 `OBJECT_WAIT` 锁秩包裹。
+/// 持有对象身份、backing、状态机与 metadata 生命周期 owner。状态机经 `MEMORY_OBJECT`
+/// 锁秩包裹。
 pub(crate) struct MemoryObjectCore {
     pub(crate) identity: ObjectId,
     pub(crate) backing: ObjectBacking,
     pub(crate) state: Spinlock<MemoryObjectState>,
-    pub(crate) wait: Spinlock<ObjectWaitState>,
     _sponsor: Arc<MetadataSponsor>,
     _backing_permit: ObjectBackingPermit,
 }
 
 impl MemoryObjectCore {
-    /// 为 Tunnel Connection 创建内部对象 core（单页，可变，无初始等待）。
+    /// 为 Tunnel Connection 创建内部对象 core（单页，可变）。
     ///
     /// 除了 backing 长度固定为单页外，其余与公共 MemoryObject 完全相同——同一套
     /// ObjectId 铸造、状态机与 metadata admission。Connection 两端 Endpoint 共享
@@ -53,21 +70,9 @@ impl MemoryObjectCore {
     pub(crate) fn new_tunnel_connection(
         pool: &Arc<MemoryPool>,
         sponsor: &Arc<MetadataSponsor>,
-    ) -> Result<
-        (
-            Self,
-            ConnectionPermit,
-            EndpointPermit,
-            EndpointPermit,
-            InvitationPermit,
-        ),
-        SystemCallError,
-    > {
+    ) -> Result<(Self, ConnectionPermit), SystemCallError> {
         let backing_permit = MetadataSponsor::reserve_object_backing(sponsor)?;
         let connection_permit = MetadataSponsor::reserve_connection(sponsor)?;
-        let endpoint_0_permit = MetadataSponsor::reserve_endpoint(sponsor)?;
-        let endpoint_1_permit = MetadataSponsor::reserve_endpoint(sponsor)?;
-        let invitation_permit = MetadataSponsor::reserve_invitation(sponsor)?;
 
         let backing = frame::fund_object_backing(
             pool,
@@ -77,33 +82,23 @@ impl MemoryObjectCore {
                 max_extents: 1,
             },
         )
-        .map_err(|_| SystemCallError::OutOfMemory)?;
+        .map_err(map_fund_error)?;
 
         let identity = mint_object_id();
         let state = Spinlock::new(
             crate::sync::ranks::MEMORY_OBJECT,
             MemoryObjectState::new(identity, 2),
         );
-        let wait = Spinlock::new(
-            crate::sync::ranks::OBJECT_WAIT,
-            ObjectWaitState::new(ObjectSignals::NONE),
-        );
 
         let core = Self {
             identity,
             backing,
             state,
-            wait,
             _sponsor: Arc::clone(sponsor),
             _backing_permit: backing_permit,
         };
 
-        Ok((
-            core,
-            connection_permit,
-            endpoint_0_permit,
-            endpoint_1_permit,
-            invitation_permit,
-        ))
+        Ok((core, connection_permit))
     }
 }
+

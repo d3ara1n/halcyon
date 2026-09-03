@@ -7,7 +7,7 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use erhino_shared::{
@@ -15,12 +15,11 @@ use erhino_shared::{
     object::{Handle, HandlePair, ObjectSignals, Rights},
 };
 use memory_space::{
-    BackingView, MemoryObjectState, ObjectError, ObjectId, Protection, RegionKindView, RegionOwner,
+    BackingView, ObjectError, Protection, RegionKindView, RegionOwner,
     RetiringFragment, WritePermit,
 };
 
 use crate::{
-    frame::{self},
     sync::Spinlock,
     task::{
         Thread, handle,
@@ -43,23 +42,18 @@ enum SideState {
 }
 
 struct ConnectionState {
-    funded: frame::FundedExtent,
-    _metadata: super::resources::BackingSlicePermit,
     leases: [Option<ObjectMappingLease>; 2],
     sides: [SideState; 2],
 }
 
 struct Connection {
-    memory: Spinlock<MemoryObjectState>,
+    /// 统一对象 core：identity、backing、可执行发布状态机与 metadata owner。
+    /// 与公共 MemoryObject 共用同一类型，Tunnel 不再自己铸造对象身份。
+    core: Arc<super::memory_object::MemoryObjectCore>,
     state: Spinlock<ConnectionState>,
+    _metadata: super::resources::ConnectionPermit,
 }
 
-static NEXT_MEMORY_OBJECT: AtomicU64 = AtomicU64::new(1);
-
-fn mint_memory_object() -> ObjectId {
-    let identity = NEXT_MEMORY_OBJECT.fetch_add(1, Ordering::Relaxed);
-    ObjectId::new(identity).expect("Tunnel MemoryObject identity exhausted")
-}
 
 enum PeerNotice {
     Endpoint(Weak<Endpoint>),
@@ -77,10 +71,15 @@ pub struct Endpoint {
     // 持 entry 并逐批重入，完成分支先 take 本字段再 drop entry，从而打破环。
     // 任何新增的放弃 entry 路径都必须先显式拆除此状态。
     detached_retire: Spinlock<Option<DetachedLeaseRetire>>,
+    _metadata: super::resources::EndpointPermit,
 }
 
 impl Endpoint {
-    fn new(connection: Arc<Connection>, side: usize) -> Result<Arc<Self>, SystemCallError> {
+    fn new(
+        connection: Arc<Connection>,
+        side: usize,
+        metadata: super::resources::EndpointPermit,
+    ) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
             header: ObjectHeader::new(),
             connection,
@@ -91,6 +90,7 @@ impl Endpoint {
                 ObjectWaitState::new(ObjectSignals::NONE),
             ),
             detached_retire: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -217,15 +217,21 @@ pub struct Invitation {
     connection: Arc<Connection>,
     side: usize,
     closed: AtomicBool,
+    _metadata: super::resources::InvitationPermit,
 }
 
 impl Invitation {
-    fn new(connection: Arc<Connection>, side: usize) -> Result<Arc<Self>, SystemCallError> {
+    fn new(
+        connection: Arc<Connection>,
+        side: usize,
+        metadata: super::resources::InvitationPermit,
+    ) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
             header: ObjectHeader::new(),
             connection,
             side,
             closed: AtomicBool::new(false),
+            _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -296,32 +302,6 @@ impl KernelObject for Invitation {
     }
 }
 
-#[inline(never)]
-fn fund_tunnel_backing(
-    pool: &Arc<super::memory_pool::MemoryPool>,
-) -> Result<frame::FundedExtent, SystemCallError> {
-    frame::fund_user_extent(
-        pool,
-        1,
-        funded_frame::Limits {
-            max_pages: 1,
-            max_extents: 1,
-        },
-    )
-    .map_err(|error| match error {
-        funded_frame::FundError::Quota(memory_pool::PoolError::QuotaExceeded) => {
-            SystemCallError::QuotaExceeded
-        }
-        funded_frame::FundError::Quota(_) => SystemCallError::OutOfMemory,
-        funded_frame::FundError::PageLimit | funded_frame::FundError::ExtentLimit => {
-            SystemCallError::ReachLimit
-        }
-        funded_frame::FundError::ZeroPages
-        | funded_frame::FundError::InvalidClaim
-        | funded_frame::FundError::Physical(_) => SystemCallError::OutOfMemory,
-    })
-}
-
 fn map_object_error(error: ObjectError) -> SystemCallError {
     match error {
         ObjectError::AllocationFailed => SystemCallError::OutOfMemory,
@@ -351,7 +331,7 @@ fn reserve_mapping(
     ),
     SystemCallError,
 > {
-    let mut memory = connection.memory.lock();
+    let mut memory = connection.core.state.lock();
     let authorization = memory
         .authorize_view(Protection::ReadWrite)
         .map_err(map_object_error)?;
@@ -360,7 +340,7 @@ fn reserve_mapping(
 }
 
 fn cancel_writes(connection: &Connection, permits: Vec<memory_space::WritePermit>) {
-    let waiter = connection.memory.lock().cancel_writes(permits);
+    let waiter = connection.core.state.lock().cancel_writes(permits);
     assert!(
         waiter.is_none(),
         "Tunnel MemoryObject cannot have a seal waiter"
@@ -368,13 +348,19 @@ fn cancel_writes(connection: &Connection, permits: Vec<memory_space::WritePermit
 }
 
 fn prepare_mapping(
-    connection: &ConnectionState,
+    connection: &Connection,
     space: &mut AddressSpaceState,
     va: usize,
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
 ) -> Result<super::proc::ObjectMappingPlan, super::proc::ObjectMapFailure> {
-    space.prepare_object_mapping(va, connection.funded.base().addr(), authorization, permits)
+    // 暂时保留单 PA 路径：Tunnel 单页 backing 只有一个 extent，取其 base。
+    // 步骤 4 改用 core.backing.project(0, 1) 输出 bounded translations。
+    let mut spans = connection.core.backing.project(0, 1);
+    let (base, pages) = spans.next().expect("Tunnel backing has no extent");
+    assert_eq!(pages, 1, "Tunnel backing must be single page");
+    assert!(spans.next().is_none(), "Tunnel backing must have one extent");
+    space.prepare_object_mapping(va, base.addr(), authorization, permits)
 }
 
 fn rollback_mapping(
@@ -490,7 +476,7 @@ impl MemoryRetireSink for LeaseRetire {
     }
 
     fn retire_permit(&self, permit: WritePermit) {
-        let waiter = self.connection.memory.lock().retire_write(permit);
+        let waiter = self.connection.core.state.lock().retire_write(permit);
         assert!(
             waiter.is_none(),
             "Tunnel MemoryObject cannot have a seal waiter"
@@ -521,24 +507,21 @@ fn new_connection(thread: &Thread) -> Result<Arc<Connection>, SystemCallError> {
         let space = thread.process.space.lock();
         Arc::clone(space.pool())
     };
-    let funded = fund_tunnel_backing(&pool)?;
-    let metadata = super::resources::MetadataSponsor::reserve_backing_slice(
+    let (core, connection_permit) = super::memory_object::MemoryObjectCore::new_tunnel_connection(
+        &pool,
         thread.process.resources.metadata(),
     )?;
+    let core = Arc::try_new(core).map_err(|_| SystemCallError::OutOfMemory)?;
     Arc::try_new(Connection {
-        memory: Spinlock::new(
-            crate::sync::ranks::MEMORY_OBJECT,
-            MemoryObjectState::new(mint_memory_object(), 2),
-        ),
+        core,
         state: Spinlock::new(
             crate::sync::ranks::CONNECTION,
             ConnectionState {
-                funded,
-                _metadata: metadata,
                 leases: [None, None],
                 sides: [SideState::Closed, SideState::Closed],
             },
         ),
+        _metadata: connection_permit,
     })
     .map_err(|_| SystemCallError::OutOfMemory)
 }
@@ -549,8 +532,17 @@ pub fn create(
     output: usize,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
     let connection = new_connection(thread)?;
-    let endpoint = Endpoint::new(connection.clone(), 0)?;
-    let invitation = Invitation::new(connection.clone(), 1)?;
+    let sponsor = thread.process.resources.metadata();
+    let endpoint = Endpoint::new(
+        connection.clone(),
+        0,
+        super::resources::MetadataSponsor::reserve_endpoint(sponsor)?,
+    )?;
+    let invitation = Invitation::new(
+        connection.clone(),
+        1,
+        super::resources::MetadataSponsor::reserve_invitation(sponsor)?,
+    )?;
 
     let mut entries = Vec::new();
     entries
@@ -605,7 +597,7 @@ pub fn create(
     let mut mapping = {
         let (plan, pool) = {
             let mut space = thread.process.space.lock();
-            match prepare_mapping(&connection_state, &mut space, va, authorization, permits) {
+            match prepare_mapping(&connection, &mut space, va, authorization, permits) {
                 Ok(plan) => (plan, Arc::clone(space.pool())),
                 Err(failure) => {
                     drop(space);
@@ -785,7 +777,11 @@ pub fn attach(
         entry.object().clone()
     };
     let invitation = concrete_invitation(&object)?;
-    let endpoint = Endpoint::new(invitation.connection.clone(), invitation.side)?;
+    let endpoint = Endpoint::new(
+        invitation.connection.clone(),
+        invitation.side,
+        super::resources::MetadataSponsor::reserve_endpoint(thread.process.resources.metadata())?,
+    )?;
     let endpoint_entry = handle::entry(
         Endpoint::object_ref(&endpoint),
         HandleRole::TunnelEndpoint,
@@ -841,7 +837,13 @@ pub fn attach(
     let mut mapping = {
         let (plan, pool) = {
             let mut space = thread.process.space.lock();
-            match prepare_mapping(&connection_state, &mut space, va, authorization, permits) {
+            match prepare_mapping(
+                &invitation.connection,
+                &mut space,
+                va,
+                authorization,
+                permits,
+            ) {
                 Ok(plan) => (plan, Arc::clone(space.pool())),
                 Err(failure) => {
                     drop(space);
