@@ -5,6 +5,7 @@ pub mod handle;
 pub mod job;
 pub mod lifecycle;
 pub mod mailbox;
+pub mod memory_object;
 pub mod memory_pool;
 pub mod notification;
 pub mod object;

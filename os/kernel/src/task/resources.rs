@@ -26,6 +26,11 @@ const BACKING_SLICE_GLOBAL_LIMIT: usize = 32_768;
 pub(crate) const MEMORY_CHANGE_GLOBAL_LIMIT: usize = 128;
 const MEMORY_WAIT_GLOBAL_LIMIT: usize = 128;
 const REMOTE_COMPLETION_GLOBAL_LIMIT: usize = 128;
+const OBJECT_BACKING_GLOBAL_LIMIT: usize = 2_048;
+const OBJECT_VIEW_GLOBAL_LIMIT: usize = 8_192;
+const CONNECTION_GLOBAL_LIMIT: usize = 512;
+const ENDPOINT_GLOBAL_LIMIT: usize = 1_024;
+const INVITATION_GLOBAL_LIMIT: usize = 512;
 pub(crate) const POOL_CORES_PER_SPONSOR: usize = 1_024;
 const ADDRESS_SPACES_PER_SPONSOR: usize = 1;
 const BUILDERS_PER_SPONSOR: usize = 1;
@@ -33,6 +38,11 @@ const CONTROLS_PER_SPONSOR: usize = 1;
 const BACKING_SLICES_PER_SPONSOR: usize = REGION_SLOTS_PER_ADDRESS_SPACE;
 const MEMORY_WAITS_PER_SPONSOR: usize = MEMORY_CHANGES_PER_ADDRESS_SPACE;
 const REMOTE_COMPLETIONS_PER_SPONSOR: usize = MEMORY_CHANGES_PER_ADDRESS_SPACE;
+const OBJECT_BACKINGS_PER_SPONSOR: usize = 64;
+const OBJECT_VIEWS_PER_SPONSOR: usize = 256;
+const CONNECTIONS_PER_SPONSOR: usize = 16;
+const ENDPOINTS_PER_SPONSOR: usize = 32;
+const INVITATIONS_PER_SPONSOR: usize = 16;
 
 #[derive(Clone)]
 struct MetadataAdmission {
@@ -47,6 +57,11 @@ struct MetadataAdmission {
     memory_changes: Arc<Counter>,
     memory_waits: Arc<Counter>,
     remote_completions: Arc<Counter>,
+    object_backings: Arc<Counter>,
+    object_views: Arc<Counter>,
+    connections: Arc<Counter>,
+    endpoints: Arc<Counter>,
+    invitations: Arc<Counter>,
 }
 
 static ADMISSION: crate::sync::Spinlock<Option<MetadataAdmission>> =
@@ -99,6 +114,26 @@ pub(crate) fn init() {
         remote_completions: new_counter(
             REMOTE_COMPLETION_GLOBAL_LIMIT,
             "remote completion admission allocation failed",
+        ),
+        object_backings: new_counter(
+            OBJECT_BACKING_GLOBAL_LIMIT,
+            "ObjectBacking admission allocation failed",
+        ),
+        object_views: new_counter(
+            OBJECT_VIEW_GLOBAL_LIMIT,
+            "ObjectView admission allocation failed",
+        ),
+        connections: new_counter(
+            CONNECTION_GLOBAL_LIMIT,
+            "Tunnel Connection admission allocation failed",
+        ),
+        endpoints: new_counter(
+            ENDPOINT_GLOBAL_LIMIT,
+            "Tunnel Endpoint admission allocation failed",
+        ),
+        invitations: new_counter(
+            INVITATION_GLOBAL_LIMIT,
+            "Tunnel Invitation admission allocation failed",
         ),
     };
     let mut admission = ADMISSION.lock();
@@ -158,6 +193,46 @@ pub(crate) fn self_test() {
         MetadataSponsor::reserve_backing_slice(resources.metadata())
             .expect("backing slice metadata self-test refund failed"),
     );
+
+    let object_backing = MetadataSponsor::reserve_object_backing(resources.metadata())
+        .expect("ObjectBacking metadata self-test acquire failed");
+    drop(object_backing);
+    drop(
+        MetadataSponsor::reserve_object_backing(resources.metadata())
+            .expect("ObjectBacking metadata self-test refund failed"),
+    );
+
+    let object_view = MetadataSponsor::reserve_object_view(resources.metadata())
+        .expect("ObjectView metadata self-test acquire failed");
+    drop(object_view);
+    drop(
+        MetadataSponsor::reserve_object_view(resources.metadata())
+            .expect("ObjectView metadata self-test refund failed"),
+    );
+
+    let connection = MetadataSponsor::reserve_connection(resources.metadata())
+        .expect("Tunnel Connection metadata self-test acquire failed");
+    drop(connection);
+    drop(
+        MetadataSponsor::reserve_connection(resources.metadata())
+            .expect("Tunnel Connection metadata self-test refund failed"),
+    );
+
+    let endpoint = MetadataSponsor::reserve_endpoint(resources.metadata())
+        .expect("Tunnel Endpoint metadata self-test acquire failed");
+    drop(endpoint);
+    drop(
+        MetadataSponsor::reserve_endpoint(resources.metadata())
+            .expect("Tunnel Endpoint metadata self-test refund failed"),
+    );
+
+    let invitation = MetadataSponsor::reserve_invitation(resources.metadata())
+        .expect("Tunnel Invitation metadata self-test acquire failed");
+    drop(invitation);
+    drop(
+        MetadataSponsor::reserve_invitation(resources.metadata())
+            .expect("Tunnel Invitation metadata self-test refund failed"),
+    );
 }
 
 fn counters() -> MetadataAdmission {
@@ -191,6 +266,16 @@ pub(crate) struct MetadataSponsor {
     memory_wait_local: Arc<Counter>,
     remote_completion_global: Arc<Counter>,
     remote_completion_local: Arc<Counter>,
+    object_backing_global: Arc<Counter>,
+    object_backing_local: Arc<Counter>,
+    object_view_global: Arc<Counter>,
+    object_view_local: Arc<Counter>,
+    connection_global: Arc<Counter>,
+    connection_local: Arc<Counter>,
+    endpoint_global: Arc<Counter>,
+    endpoint_local: Arc<Counter>,
+    invitation_global: Arc<Counter>,
+    invitation_local: Arc<Counter>,
 }
 
 impl MetadataSponsor {
@@ -210,6 +295,11 @@ impl MetadataSponsor {
         let memory_change_local = new_local(MEMORY_CHANGES_PER_ADDRESS_SPACE)?;
         let memory_wait_local = new_local(MEMORY_WAITS_PER_SPONSOR)?;
         let remote_completion_local = new_local(REMOTE_COMPLETIONS_PER_SPONSOR)?;
+        let object_backing_local = new_local(OBJECT_BACKINGS_PER_SPONSOR)?;
+        let object_view_local = new_local(OBJECT_VIEWS_PER_SPONSOR)?;
+        let connection_local = new_local(CONNECTIONS_PER_SPONSOR)?;
+        let endpoint_local = new_local(ENDPOINTS_PER_SPONSOR)?;
+        let invitation_local = new_local(INVITATIONS_PER_SPONSOR)?;
         Arc::try_new(Self {
             _global_slot: global_slot,
             pool_global: counters.pool_cores,
@@ -232,6 +322,16 @@ impl MetadataSponsor {
             memory_wait_local,
             remote_completion_global: counters.remote_completions,
             remote_completion_local,
+            object_backing_global: counters.object_backings,
+            object_backing_local,
+            object_view_global: counters.object_views,
+            object_view_local,
+            connection_global: counters.connections,
+            connection_local,
+            endpoint_global: counters.endpoints,
+            endpoint_local,
+            invitation_global: counters.invitations,
+            invitation_local,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -330,6 +430,66 @@ impl MetadataSponsor {
             remote: RemoteCompletionPermit { _permit: remote },
         })
     }
+
+    pub(crate) fn reserve_object_backing(
+        sponsor: &Arc<Self>,
+    ) -> Result<ObjectBackingPermit, SystemCallError> {
+        let permit = SponsoredPermit::try_acquire(
+            sponsor,
+            &sponsor.object_backing_global,
+            &sponsor.object_backing_local,
+        )
+        .map_err(|_| SystemCallError::ReachLimit)?;
+        Ok(ObjectBackingPermit { _permit: permit })
+    }
+
+    pub(crate) fn reserve_object_view(
+        sponsor: &Arc<Self>,
+    ) -> Result<ObjectViewPermit, SystemCallError> {
+        let permit = SponsoredPermit::try_acquire(
+            sponsor,
+            &sponsor.object_view_global,
+            &sponsor.object_view_local,
+        )
+        .map_err(|_| SystemCallError::ReachLimit)?;
+        Ok(ObjectViewPermit { _permit: permit })
+    }
+
+    pub(crate) fn reserve_connection(
+        sponsor: &Arc<Self>,
+    ) -> Result<ConnectionPermit, SystemCallError> {
+        let permit = SponsoredPermit::try_acquire(
+            sponsor,
+            &sponsor.connection_global,
+            &sponsor.connection_local,
+        )
+        .map_err(|_| SystemCallError::ReachLimit)?;
+        Ok(ConnectionPermit { _permit: permit })
+    }
+
+    pub(crate) fn reserve_endpoint(
+        sponsor: &Arc<Self>,
+    ) -> Result<EndpointPermit, SystemCallError> {
+        let permit = SponsoredPermit::try_acquire(
+            sponsor,
+            &sponsor.endpoint_global,
+            &sponsor.endpoint_local,
+        )
+        .map_err(|_| SystemCallError::ReachLimit)?;
+        Ok(EndpointPermit { _permit: permit })
+    }
+
+    pub(crate) fn reserve_invitation(
+        sponsor: &Arc<Self>,
+    ) -> Result<InvitationPermit, SystemCallError> {
+        let permit = SponsoredPermit::try_acquire(
+            sponsor,
+            &sponsor.invitation_global,
+            &sponsor.invitation_local,
+        )
+        .map_err(|_| SystemCallError::ReachLimit)?;
+        Ok(InvitationPermit { _permit: permit })
+    }
 }
 
 /// Pool core 的唯一 metadata owner。对象跨进程移动或 creator Dead 时继续强持
@@ -404,6 +564,26 @@ impl MemoryOperationPermits {
     ) -> (MemoryChangePermit, MemoryWaitPermit, RemoteCompletionPermit) {
         (self.change, self.wait, self.remote)
     }
+}
+
+pub(crate) struct ObjectBackingPermit {
+    _permit: SponsoredPermit<MetadataSponsor>,
+}
+
+pub(crate) struct ObjectViewPermit {
+    _permit: SponsoredPermit<MetadataSponsor>,
+}
+
+pub(crate) struct ConnectionPermit {
+    _permit: SponsoredPermit<MetadataSponsor>,
+}
+
+pub(crate) struct EndpointPermit {
+    _permit: SponsoredPermit<MetadataSponsor>,
+}
+
+pub(crate) struct InvitationPermit {
+    _permit: SponsoredPermit<MetadataSponsor>,
 }
 
 /// 进程 page-backed storage 的不可转移内部 binding。root owner 与中间表 owner

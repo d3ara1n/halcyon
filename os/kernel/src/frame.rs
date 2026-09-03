@@ -531,6 +531,129 @@ impl QuotaSource for PoolQuota<'_> {
 type UserFundedInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, MAX_FUNDED_EXTENTS>;
 type UserFundedExtentInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
 
+/// 多 extent 资金化 backing storage：唯一持有物理 claims 与同源 charge。
+///
+/// 它是匿名 slice、对象 backing 与 boot adopt 的共同底座；`project` 把逻辑页区间
+/// 投影为有界物理 span 序列，使匿名与对象映射共用同一条 translation 组装路径，
+/// 不再按 backing 种类各写一遍几何展开。
+#[must_use = "funded backing storage must remain owned until its mapping retires"]
+pub(crate) struct FundedBackingStorage {
+    inner: UserFundedInner,
+}
+
+impl FundedBackingStorage {
+    pub(crate) fn pages(&self) -> usize {
+        self.inner.pages()
+    }
+
+    pub(crate) fn extent_count(&self) -> usize {
+        self.inner.extent_count()
+    }
+
+    /// 物理 extent 序列，按逻辑顺序给出 `(base, pages)`。
+    pub(crate) fn extents(&self) -> impl ExactSizeIterator<Item = (FrameNumber, usize)> {
+        self.inner
+            .claims()
+            .map(|claim| (claim.geometry().base(), claim.geometry().count()))
+    }
+
+    /// 把逻辑页区间 `[offset_pages, offset_pages + length_pages)` 投影为物理 span 序列。
+    ///
+    /// 单页请求退化为长度为一的序列，因此单页 Tunnel 与多页对象走同一路径。
+    /// 越界由调用方在 Validate 阶段排除，此处只做结构断言。
+    pub(crate) fn project(
+        &self,
+        offset_pages: usize,
+        length_pages: usize,
+    ) -> impl Iterator<Item = (FrameNumber, usize)> {
+        let end = offset_pages
+            .checked_add(length_pages)
+            .expect("backing projection range overflows");
+        assert!(
+            end <= self.inner.pages(),
+            "backing projection exceeds funded geometry"
+        );
+        let mut cursor = 0usize;
+        self.extents().filter_map(move |(base, extent_pages)| {
+            let extent_start = cursor;
+            cursor += extent_pages;
+            if length_pages == 0 || extent_start >= end || cursor <= offset_pages {
+                return None;
+            }
+            let skip = offset_pages.saturating_sub(extent_start);
+            let take = cursor.min(end) - (extent_start + skip);
+            Some((base + skip, take))
+        })
+    }
+
+    /// 保留逻辑前缀并切出后缀；物理 extent 与 charge 同步分解，失败保持 `self` 不变。
+    pub(crate) fn split_off(&mut self, left_pages: usize) -> Result<Self, ()> {
+        self.inner
+            .split_off(left_pages)
+            .map(|inner| Self { inner })
+            .map_err(|_| ())
+    }
+
+    /// 把物理相邻的后继 storage 并回本体；失败保持双方 owner。
+    pub(crate) fn merge_from(&mut self, donor: &mut Self) -> Result<(), ()> {
+        self.inner.merge_from(&mut donor.inner).map_err(|_| ())
+    }
+}
+
+/// 固定长度、不可分解的对象数据 backing。
+///
+/// 与匿名 backing 的区别只在生命周期语义：对象 backing 由创建者绑定池一次付清，
+/// view 的切割、降权与解除都不切数据 backing，因此这里不暴露 split/merge。
+#[must_use = "object backing must remain owned until the memory object is destroyed"]
+pub(crate) struct ObjectBacking {
+    storage: FundedBackingStorage,
+}
+
+impl ObjectBacking {
+    pub(crate) fn pages(&self) -> usize {
+        self.storage.pages()
+    }
+
+    pub(crate) fn extent_count(&self) -> usize {
+        self.storage.extent_count()
+    }
+
+    /// 对象内页区间到物理 span 的投影，供 view 组装 translation。
+    pub(crate) fn project(
+        &self,
+        offset_pages: usize,
+        length_pages: usize,
+    ) -> impl Iterator<Item = (FrameNumber, usize)> {
+        self.storage.project(offset_pages, length_pages)
+    }
+}
+
+/// 取得固定长度、零态的对象 backing；由创建进程绑定池支付。
+pub(crate) fn fund_object_backing(
+    pool: &Arc<MemoryPool>,
+    pages: usize,
+    limits: FundingLimits,
+) -> Result<ObjectBacking, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
+    fund_backing_storage(pool, pages, limits).map(|storage| ObjectBacking { storage })
+}
+
+/// 取得普通多 extent 资金化 backing storage。
+pub(crate) fn fund_backing_storage(
+    pool: &Arc<MemoryPool>,
+    pages: usize,
+    limits: FundingLimits,
+) -> Result<FundedBackingStorage, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
+    funded_frame::fund::<_, _, MAX_FUNDED_EXTENTS>(&PoolQuota(pool), &UserInventory, pages, limits)
+        .map(|inner| {
+            assert_eq!(
+                inner.credit().pages(),
+                inner.pages(),
+                "funded backing charge differs from physical geometry"
+            );
+            FundedBackingStorage { inner }
+        })
+}
+
 /// 单一物理 extent 的资金化 owner；自然析构先归还物理 extent，再退 Pool charge。
 pub(crate) struct FundedExtent {
     inner: UserFundedExtentInner,
