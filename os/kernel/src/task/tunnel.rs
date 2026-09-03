@@ -20,7 +20,7 @@ use memory_space::{
 };
 
 use crate::{
-    frame::{self, FrameTracker},
+    frame::{self},
     sync::Spinlock,
     task::{
         Thread, handle,
@@ -43,9 +43,8 @@ enum SideState {
 }
 
 struct ConnectionState {
-    pa: usize,
-    #[expect(dead_code, reason = "Connection 的所有权字段，Drop 即归还共享帧")]
-    frame: FrameTracker,
+    funded: frame::FundedExtent,
+    _metadata: super::resources::BackingSlicePermit,
     leases: [Option<ObjectMappingLease>; 2],
     sides: [SideState; 2],
 }
@@ -297,6 +296,32 @@ impl KernelObject for Invitation {
     }
 }
 
+#[inline(never)]
+fn fund_tunnel_backing(
+    pool: &Arc<super::memory_pool::MemoryPool>,
+) -> Result<frame::FundedExtent, SystemCallError> {
+    frame::fund_user_extent(
+        pool,
+        1,
+        funded_frame::Limits {
+            max_pages: 1,
+            max_extents: 1,
+        },
+    )
+    .map_err(|error| match error {
+        funded_frame::FundError::Quota(memory_pool::PoolError::QuotaExceeded) => {
+            SystemCallError::QuotaExceeded
+        }
+        funded_frame::FundError::Quota(_) => SystemCallError::OutOfMemory,
+        funded_frame::FundError::PageLimit | funded_frame::FundError::ExtentLimit => {
+            SystemCallError::ReachLimit
+        }
+        funded_frame::FundError::ZeroPages
+        | funded_frame::FundError::InvalidClaim
+        | funded_frame::FundError::Physical(_) => SystemCallError::OutOfMemory,
+    })
+}
+
 fn map_object_error(error: ObjectError) -> SystemCallError {
     match error {
         ObjectError::AllocationFailed => SystemCallError::OutOfMemory,
@@ -349,7 +374,7 @@ fn prepare_mapping(
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
 ) -> Result<super::proc::ObjectMappingPlan, super::proc::ObjectMapFailure> {
-    space.prepare_object_mapping(va, connection.pa, authorization, permits)
+    space.prepare_object_mapping(va, connection.funded.base().addr(), authorization, permits)
 }
 
 fn rollback_mapping(
@@ -490,14 +515,17 @@ impl MemoryRetireSink for LeaseRetire {
     }
 }
 
-pub fn create(
-    thread: &Thread,
-    va: usize,
-    output: usize,
-) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let tracker = frame::alloc_user_order(0).ok_or(SystemCallError::OutOfMemory)?;
-    let pa = tracker.base().addr();
-    let connection = Arc::try_new(Connection {
+#[inline(never)]
+fn new_connection(thread: &Thread) -> Result<Arc<Connection>, SystemCallError> {
+    let pool = {
+        let space = thread.process.space.lock();
+        Arc::clone(space.pool())
+    };
+    let funded = fund_tunnel_backing(&pool)?;
+    let metadata = super::resources::MetadataSponsor::reserve_backing_slice(
+        thread.process.resources.metadata(),
+    )?;
+    Arc::try_new(Connection {
         memory: Spinlock::new(
             crate::sync::ranks::MEMORY_OBJECT,
             MemoryObjectState::new(mint_memory_object(), 2),
@@ -505,14 +533,22 @@ pub fn create(
         state: Spinlock::new(
             crate::sync::ranks::CONNECTION,
             ConnectionState {
-                pa,
-                frame: tracker,
+                funded,
+                _metadata: metadata,
                 leases: [None, None],
                 sides: [SideState::Closed, SideState::Closed],
             },
         ),
     })
-    .map_err(|_| SystemCallError::OutOfMemory)?;
+    .map_err(|_| SystemCallError::OutOfMemory)
+}
+
+pub fn create(
+    thread: &Thread,
+    va: usize,
+    output: usize,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let connection = new_connection(thread)?;
     let endpoint = Endpoint::new(connection.clone(), 0)?;
     let invitation = Invitation::new(connection.clone(), 1)?;
 

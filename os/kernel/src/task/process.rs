@@ -594,14 +594,34 @@ pub fn map(
     let builder_object = resolve_builder(thread, builder_handle, Rights::MAP)?;
     let process = concrete_builder(&builder_object)?.process()?;
     let _lease = BuildingLease::begin(process.clone())?;
-    let (plan, pool) = {
+    let (pool, sponsor) = {
         let mut space = process.space.lock();
-        let plan = space
-            .plan_anonymous_mapping(target, len, permissions)
+        space.bound().map_err(map_space_error)?;
+        space
+            .validate_building_anonymous(target, len, permissions)
             .map_err(map_space_error)?;
-        let pool = Arc::clone(space.pool());
-        (plan, pool)
+        let bound = space.bound().map_err(map_space_error)?;
+        (Arc::clone(bound.pool()), Arc::clone(bound.sponsor()))
     };
+    let prepared =
+        super::proc::PreparedBacking::allocate(len / super::proc::PAGE_SIZE, &pool, &sponsor)
+            .map_err(map_space_error)?;
+    let plan_result = {
+        let mut space = process.space.lock();
+        space.plan_anonymous_mapping(target, len, permissions, prepared)
+    };
+    let plan = match plan_result {
+        Ok(plan) => plan,
+        Err(super::proc::BackingPlanFailure::Prepared(error, backing)) => {
+            drop(backing);
+            return Err(map_space_error(error));
+        }
+        Err(super::proc::BackingPlanFailure::Owned(error, backing)) => {
+            drop(backing);
+            return Err(map_space_error(error));
+        }
+    };
+    let pool = pool;
     let funded = match super::proc::fund_owned_mapping(&pool, &plan) {
         Ok(funded) => funded,
         Err(error) => {

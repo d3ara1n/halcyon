@@ -465,6 +465,8 @@ fn kill_and_supervise(supervised: alloc::vec::Vec<Supervised>) {
 }
 
 fn test_memory_mapping() -> Result<(), &'static str> {
+    #[cfg(not(feature = "acceptance-stress"))]
+    let pool_baseline = root_pool_allocated().map_err(|_| "memory Pool baseline query failed")?;
     let page = rinlib::shared::proc::PROCESS_PAGE_SIZE;
     let region = MappedRegion::map_anonymous(
         3 * page,
@@ -537,6 +539,10 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     remapped
         .unmap()
         .map_err(|_| "fixed remap final Unmap failed")?;
+    #[cfg(not(feature = "acceptance-stress"))]
+    if root_pool_allocated().map_err(|_| "memory Pool final query failed")? != pool_baseline {
+        return Err("anonymous backing Pool charge did not refund");
+    }
     debug!("public memory mapping acceptance passed");
     Ok(())
 }
@@ -717,7 +723,29 @@ fn run(services: Handle) -> Result<(), &'static str> {
         "peer closed observed: bits={:#x}",
         peer_closed.observed.raw()
     );
-    let _ = tunnel.close();
+    #[cfg(not(feature = "acceptance-stress"))]
+    let tunnel_pool_before_close =
+        root_pool_allocated().map_err(|_| "tunnel Pool pre-close query failed")?;
+    tunnel.close().map_err(|_| "tunnel close failed")?;
+
+    #[cfg(not(feature = "acceptance-stress"))]
+    let tunnel_pool_after_close =
+        root_pool_allocated().map_err(|_| "tunnel Pool post-close query failed")?;
+    #[cfg(not(feature = "acceptance-stress"))]
+    {
+        let refunded = tunnel_pool_before_close.saturating_sub(tunnel_pool_after_close);
+        if refunded == 0 {
+            debug!(
+                "tunnel Pool charge did not decrease after close: before={}, after={}",
+                tunnel_pool_before_close, tunnel_pool_after_close
+            );
+            return Err("tunnel Pool charge did not refund after close");
+        }
+        debug!(
+            "tunnel Pool conservation after close passed: before={}, after={}, refunded={}",
+            tunnel_pool_before_close, tunnel_pool_after_close, refunded
+        );
+    }
 
     // —— 委托域终局：pm 的管理段应已把 pm_domain 收束到 Dead；降级时
     // init 以保留的直接收束权兜底（job_kill = seal + 枚举派生 kill +

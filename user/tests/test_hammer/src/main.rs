@@ -629,17 +629,24 @@ fn stale_translation_reuse() {
             }
             Err((_, error)) => panic!("thread suite old mapping Unmap failed: {error:?}"),
         }
+    }
+    let replacement = loop {
+        match MappedRegion::map_anonymous(
+            PROCESS_PAGE_SIZE,
+            PROCESS_PAGE_SIZE,
+            PROCESS_PAGE_SIZE,
+            MemoryProtection::ReadWrite,
+            Placement::FixedEmpty {
+                usable_start: address,
+            },
+        ) {
+            Ok(region) => break region,
+            Err(SystemCallError::ObjectBusy) => {
+                thread::yield_now().expect("thread suite remap retry yield failed");
+            }
+            Err(error) => panic!("thread suite FixedEmpty remap failed: {error:?}"),
+        }
     };
-    let replacement = MappedRegion::map_anonymous(
-        PROCESS_PAGE_SIZE,
-        PROCESS_PAGE_SIZE,
-        PROCESS_PAGE_SIZE,
-        MemoryProtection::ReadWrite,
-        Placement::FixedEmpty {
-            usable_start: address,
-        },
-    )
-    .expect("thread suite FixedEmpty remap failed");
     // SAFETY: replacement 恰好重新取得 address 的 RW usable 页。
     unsafe { (address as *mut u64).write_volatile(NEW_TRANSLATION_VALUE) };
     release.store(true, Ordering::Release);

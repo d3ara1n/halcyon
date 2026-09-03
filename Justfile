@@ -67,7 +67,7 @@ ZFLAGS := "-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # 秒级检查：与 build_kernel 同参
 check:
-    @cd os && cargo check {{ZFLAGS}}
+    @cd os && cargo check --quiet {{ZFLAGS}}
 
 clean:
     #!/usr/bin/env bash
@@ -100,11 +100,11 @@ build_user: artifact_dir
         *) echo "Unknown acceptance workload: {{ACCEPTANCE_WORKLOAD}}" >&2; exit 2 ;;
     esac
     cd user
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --exclude test_hammer --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet --workspace --exclude test_fp --exclude test_hammer --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     if [ "{{ACCEPTANCE_WORKLOAD}}" = stress ]; then
-        RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+        RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     fi
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
     echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
@@ -124,7 +124,7 @@ make_boot_package: make_initfs
 
 build_kernel: artifact_dir
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}/{{MODEL}}\033[0m"
-    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin erhino_kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
+    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --quiet --bin erhino_kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
     @riscv64-elf-objcopy {{KERNEL_ELF}} -O binary {{KERNEL_BIN}}
     @python3 os/tools/audit_elf.py {{KERNEL_ELF}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
@@ -176,6 +176,9 @@ acceptance:
     @just virt-stress
     @just virt-release
     @just sifive_u
+
+# 验收脚本将完整 QEMU 输出写入临时日志，仅在结束时显示末尾摘要；失败时保留
+# 完整日志并同时打印摘要。可用 QEMU_SUMMARY_LINES 覆盖摘要行数。
 
 # 清理泄漏的孤儿 qemu（PPID=1 残留；agent 裸跑 run_qemu 后易遗漏）。
 # 默认一键清理孤儿；传参透传脚本：-l 仅列出，-y 跳过确认，-f 连有父进程的一并杀。

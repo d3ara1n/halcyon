@@ -438,6 +438,26 @@ fn decomposition_splits_crossing_extent_and_restores_both_accounts() {
 }
 
 #[test]
+fn split_first_and_single_preserve_extent_ownership() {
+    let (quota, inventory) = fixtures(32, &[4, 4]);
+    let mut funded = fund::<_, _, 4>(&quota, &inventory, 8, LIMITS).unwrap();
+    let first = funded.split_first().unwrap();
+    assert_eq!(first.pages(), 4);
+    assert_eq!(funded.pages(), 4);
+    assert_eq!(funded.extent_count(), 1);
+    let (left, right) = first.split_single(1).unwrap();
+    assert_eq!(left.pages(), 1);
+    assert_eq!(right.pages(), 3);
+    assert_eq!(quota.state.borrow().allocated, 8);
+    assert_eq!(inventory.state.borrow().claimed, 8);
+    drop(left);
+    drop(right);
+    drop(funded);
+    assert_eq!(quota.state.borrow().available, 32);
+    assert_eq!(inventory.state.borrow().free, 32);
+}
+
+#[test]
 fn invalid_decomposition_returns_the_original_owner() {
     for split in [0, 6] {
         let (quota, inventory) = fixtures(16, &[3, 3]);

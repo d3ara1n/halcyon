@@ -197,6 +197,46 @@ where
         })
     }
 
+    /// 取出逻辑上的第一个物理 extent，返回单 extent owner；不分配。
+    pub fn split_first(&mut self) -> Result<Funded<C, P, 1>, DecomposeError<C::Error>> {
+        if self.claim_count == 0 {
+            return Err(DecomposeError::InvalidSplit);
+        }
+        let claim_pages = self.claims[0]
+            .as_ref()
+            .expect("funded extent slot is empty")
+            .pages();
+        let (claim, credit) = if self.claim_count == 1 {
+            let claim = self.claims[0].take().expect("funded extent slot is empty");
+            let credit = self.credit.take().expect("funded owner has no credit");
+            self.claim_count = 0;
+            self.pages = 0;
+            (claim, credit)
+        } else {
+            let credit = self
+                .credit
+                .as_mut()
+                .expect("merged funded donor cannot be split")
+                .split(claim_pages)
+                .map_err(DecomposeError::Credit)?;
+            let claim = self.claims[0].take().expect("funded extent slot is empty");
+            for index in 1..self.claim_count {
+                self.claims[index - 1] = self.claims[index].take();
+            }
+            self.claim_count -= 1;
+            self.pages -= claim_pages;
+            (claim, credit)
+        };
+        let mut claims = [None];
+        claims[0] = Some(claim);
+        Ok(Funded {
+            claims,
+            claim_count: 1,
+            pages: claim_pages,
+            credit: Some(credit),
+        })
+    }
+
     /// 把另一完整 funded owner 追加为逻辑后缀；失败保持双方不变。
     /// 成功后 donor 变为空 owner，只能查询或析构。
     pub fn merge_from(&mut self, donor: &mut Self) -> Result<(), CombineError<C::Error>> {
@@ -228,6 +268,24 @@ where
         donor.claim_count = 0;
         donor.pages = 0;
         Ok(())
+    }
+}
+
+impl<C, P> Funded<C, P, 1>
+where
+    C: QuotaCredit,
+    P: PhysicalClaim,
+{
+    /// 将单一物理 extent 切成左右两个单 extent owner；失败保持原 owner 不变。
+    pub fn split_single(
+        mut self,
+        left_pages: usize,
+    ) -> Result<(Self, Self), DecomposeError<C::Error>> {
+        if left_pages == 0 || left_pages >= self.pages {
+            return Err(DecomposeError::InvalidSplit);
+        }
+        let right = self.split_off(left_pages)?;
+        Ok((self, right))
     }
 }
 

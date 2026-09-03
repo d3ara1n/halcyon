@@ -37,7 +37,9 @@ required=(
 )
 case "$profile" in
     core)
-        required+=("acceptance workload: core")
+        required+=(
+            "acceptance workload: core"
+        )
         ;;
     stress)
         required+=(
@@ -101,14 +103,13 @@ log_has_any() {
     return 1
 }
 
-# 后台跑 + tail 回显：失败锚点必须主动收割，否则 panic 或 reset 返回后的
-# 稳态 WFI 不会让 QEMU 自退。TERM 沿 timeout → qemu-throttle → QEMU 链传播。
+# 后台跑并写入完整日志：失败锚点必须主动收割，否则 panic 或 reset 返回后的
+# 稳态 WFI 不会让 QEMU 自退。终端只在收束后显示摘要，避免长日志冲击会话；
+# 完整现场始终保留在失败日志中。TERM 沿 timeout → qemu-throttle → QEMU 链传播。
 : > "$log"
 "$@" > "$log" 2>&1 &
 runner=$!
-tail -n +1 -f "$log" &
-tailer=$!
-trap 'kill "$runner" "$tailer" 2>/dev/null || true' EXIT INT TERM
+trap 'kill "$runner" 2>/dev/null || true' EXIT INT TERM
 status=0
 while :; do
     if ! kill -0 "$runner" 2>/dev/null; then
@@ -125,9 +126,14 @@ while :; do
     sleep 0.2
 done
 sleep 0.2
-kill "$tailer" 2>/dev/null || true
-wait "$tailer" 2>/dev/null || true
 trap - EXIT INT TERM
+
+summary_lines="${QEMU_SUMMARY_LINES:-25}"
+show_summary() {
+    local source="$1"
+    echo "QEMU acceptance log summary (last ${summary_lines} lines):"
+    tail -n "$summary_lines" "$source" || true
+}
 
 # 失败即保留现场：无法重现的非确定性失败、锚点缺失或挂死一旦删日志就只能重跑。
 keep_log() {
@@ -135,6 +141,7 @@ keep_log() {
     local kept="artifacts/failed-acceptance-$(date +%Y%m%d-%H%M%S)-$$.log"
     if mv "$log" "$kept" 2>/dev/null; then
         echo "QEMU acceptance failure log kept: $kept ($reason)" >&2
+        show_summary "$kept" >&2
     fi
 }
 
@@ -165,4 +172,5 @@ done
 if [[ "$status" -eq 124 ]]; then
     echo "QEMU acceptance passed (harvested after explicit reset failure)."
 fi
+show_summary "$log"
 rm -f "$log"

@@ -6,7 +6,7 @@
 
 公共 MemoryObject 尚未接入独立 Handle、系统调用 ABI 或 rinlib owner。当前已实现的是 `os/memory_space/src/object.rs` 中的纯逻辑对象状态与授权基元，以及 Tunnel 对这些基元的内部复用；这不构成公共 MemoryObject 接口。
 
-`memory_space` crate 提供 `ObjectId`、`ObjectViewAuthorization`、`WritePermit`、`MemoryObjectState`、`ExecutableState` 与 `SealOutcome`。它不访问页表、物理帧、HandleTable、hart 或用户指针。当前 Tunnel 的 `Connection` 以内部 `MemoryObjectState` 管理两侧 RW view 的写许可，但 backing 仍是 Connection 直接持有的单页 `FrameTracker`，尚无公共 `ObjectBacking` 对象壳。
+`memory_space` crate 提供 `ObjectId`、`ObjectViewAuthorization`、`WritePermit`、`MemoryObjectState`、`ExecutableState` 与 `SealOutcome`。它不访问页表、物理帧、HandleTable、hart 或用户指针。当前 Tunnel 的 `Connection` 以内部 `MemoryObjectState` 管理两侧 RW view 的写许可，backing 由创建进程绑定的 MemoryPool 通过 funded owner 支付并持有单页 extent；尚无公共 `ObjectBacking` 对象壳。
 
 ## 对象状态与授权基元
 

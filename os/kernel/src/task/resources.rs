@@ -4,11 +4,11 @@
 //! AddressSpace 预付 planner 固定容量，资金化 backing 与内存事务使用独立类型化 slots。
 //! 显式 KernelMemoryBudget 继续在同一 ProcessResources 中增量接入。
 
+use super::memory_pool::MemoryPool;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use erhino_shared::call::SystemCallError;
 use metadata_admission::{Counter, Permit, SponsoredPermit};
-use super::memory_pool::MemoryPool;
 
 const SPONSOR_GLOBAL_LIMIT: usize = 4_096;
 const POOL_CORE_GLOBAL_LIMIT: usize = 4_096;
@@ -410,6 +410,7 @@ impl MemoryOperationPermits {
 /// 均由 AddressSpace 树持有；binding 只表达后续资金化所需的来源 Pool。
 pub(crate) struct PoolBinding {
     pool: Arc<MemoryPool>,
+    sponsor: Arc<MetadataSponsor>,
     _metadata: AddressSpacePermit,
 }
 
@@ -421,12 +422,17 @@ impl PoolBinding {
         let metadata = MetadataSponsor::reserve_address_space(sponsor)?;
         Ok(Self {
             pool,
+            sponsor: Arc::clone(sponsor),
             _metadata: metadata,
         })
     }
 
     pub(crate) fn pool(&self) -> &Arc<MemoryPool> {
         &self.pool
+    }
+
+    pub(crate) fn sponsor(&self) -> &Arc<MetadataSponsor> {
+        &self.sponsor
     }
 }
 

@@ -5,7 +5,7 @@
 //! 内核永久占用与 boot-held 区间，再从补集中保留库存元数据；只有最终补集
 //! 发布为空闲。
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use frame_pool::{ArenaMetadata, ExtentGeometry, FramePool, MAX_ARENAS, metadata_bytes};
 use funded_frame::{
@@ -36,7 +36,7 @@ const HEAP_CHUNK_SIZE: usize = 1 << 20;
 const HEAP_CHUNK_LIMIT: usize = 16;
 const RECOVERY_TICKET_LIMIT: usize = 0;
 /// 单事务 extent storage 的独立硬上限。
-const MAX_FUNDED_EXTENTS: usize = 64;
+pub(crate) const MAX_FUNDED_EXTENTS: usize = 64;
 
 type KernelFramePool = FramePool<'static>;
 
@@ -529,8 +529,37 @@ impl QuotaSource for PoolQuota<'_> {
 }
 
 type UserFundedInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, MAX_FUNDED_EXTENTS>;
+type UserFundedExtentInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
 
-/// 普通 user supply 的资金化 backing；自然析构先归还物理 extent，再退 Pool charge。
+/// 单一物理 extent 的资金化 owner；自然析构先归还物理 extent，再退 Pool charge。
+pub(crate) struct FundedExtent {
+    inner: UserFundedExtentInner,
+}
+
+impl FundedExtent {
+    pub(crate) fn pages(&self) -> usize {
+        self.inner.pages()
+    }
+
+    pub(crate) fn base(&self) -> FrameNumber {
+        self.inner
+            .claims()
+            .next()
+            .expect("funded extent has no physical claim")
+            .geometry()
+            .base()
+    }
+
+    pub(crate) fn split_at(self, left_pages: usize) -> (Self, Self) {
+        let (left, right) = self
+            .inner
+            .split_single(left_pages)
+            .expect("funded extent split must be prevalidated");
+        (Self { inner: left }, Self { inner: right })
+    }
+}
+
+/// 普通 user supply 的资金化 backing；仅在 funding 事务中暂存多 extent owner。
 pub(crate) struct FundedFrames {
     inner: UserFundedInner,
 }
@@ -549,6 +578,39 @@ impl FundedFrames {
             .claims()
             .map(|claim| (claim.geometry().base(), claim.geometry().count()))
     }
+
+    pub(crate) fn into_extents(self, extents: &mut Vec<FundedExtent>) -> Result<(), ()> {
+        let mut inner = self.inner;
+        extents
+            .try_reserve_exact(inner.extent_count())
+            .map_err(|_| ())?;
+        while inner.extent_count() != 0 {
+            let extent = inner
+                .split_first()
+                .expect("funded extent extraction failed");
+            extents.push(FundedExtent { inner: extent });
+        }
+        Ok(())
+    }
+}
+
+/// 取得单一普通 user-funded extent。调用方必须提供恰好能容纳一个 extent 的边界。
+pub(crate) fn fund_user_extent(
+    pool: &Arc<MemoryPool>,
+    pages: usize,
+    limits: FundingLimits,
+) -> Result<FundedExtent, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
+    let funded = fund_user_frames(pool, pages, limits)?;
+    let mut extents = Vec::new();
+    funded
+        .into_extents(&mut extents)
+        .map_err(|_| funded_frame::FundError::Physical(UserClaimError::OutOfMemory))?;
+    assert_eq!(
+        extents.len(),
+        1,
+        "single funded extent geometry was fragmented"
+    );
+    Ok(extents.pop().expect("single funded extent missing"))
 }
 
 /// 取得普通 user-funded backing。页数与 extent 上限由具体消费方的工作边界决定。
@@ -754,12 +816,6 @@ pub fn alloc_user_order(order: usize) -> Option<FrameTracker> {
     let count = 1usize
         .checked_shl(order as u32)
         .expect("frame pool returned an invalid order");
-    Some(publish_claimed(base, count))
-}
-
-/// 从 user inventory 在 `max_count` 内分配当前可用的最大连续 extent。
-pub fn alloc_user_largest(max_count: usize) -> Option<FrameTracker> {
-    let (base, count) = with_pool(|pool| pool.alloc_largest(max_count))?;
     Some(publish_claimed(base, count))
 }
 

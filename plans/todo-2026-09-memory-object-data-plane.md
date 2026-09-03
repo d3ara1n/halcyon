@@ -181,11 +181,15 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 验证：Bind 与全部 mapping 路径的 root/table 页数守恒、quota/库存/extent/metadata 故障零发布、mega split、Unmap 后表页延迟退款、AddressSpace drain 中断接管；重复 map/unmap 后除 live root 外 Pool 与 FramePool 回到对应基线。随批补入 ThreadSpawn 后才可达的确定性场景：并发线程解除 park 在途 WaitMany 的结果页映射，断言写回复检失败以 MemoryNotAccessible 错误返回等待线程且进程存活。
 
-### 批次 6E：匿名 backing 全面资金化
+### 批次 6E：资金化 backing 与多 extent 数据面基础
 
-匿名 `OwnedBacking` 由目标绑定 Pool 一次取得不超过 extent 上限的零态 funded backing。Running Map 与 Building ProcessMap 共用“锁内 Validate → 锁外 backing/table funding → 锁内复检并组装 Prepared change”的深层 planner；外层只保留各自 authority、Building lease、结果承诺与是否需要 shootdown 的差异。部分 Unmap 在 Commit 前预留全部切分 metadata，Publish 切出同时持 extents 与 charge 的 retiring slice，最后确认后交给 6C 在 AddressSpace 锁外退款；Protect 不释放仍被 live ledger 覆盖的 backing。
+本批不制造 anonymous-only 的短命事务层，而一次建立后续 MemoryObject 与多页 Tunnel 直接复用的最终内部骨架。底层 funded extent storage 同时持物理 claims 与同源 charge，并提供固定容量、失败保留 owner 的 split/merge 与范围投影；上层仍以强类型区分可分解的匿名 `OwnedBacking`、不可分解的 ObjectBacking 与 boot-held adopt，禁止因共享存储而混淆生命周期语义。
 
-验证：匿名多 extent、跨 extent 部分 Unmap、左右 live slice 与 retiring middle 守恒、Protect、跨 hart stale translation、乱序完成、调用线程消散、ProcessDrain 接管；ack 前 Pool/FramePool 均不退款，最终 Unmap/Drain 后恢复基线。完成后删除 `proc.rs` 中页表与匿名 backing 的 raw 调用点；Tunnel 与库存 selftest 的过渡 raw 路径分别留待切片 8 与切片 10。
+匿名 `OwnedBacking` 由目标绑定 Pool 一次取得不超过 extent 上限的零态 funded backing，`BackingSlicePermit` 从取得起随每个真实 slice owner 保活。Running Map 与 Building ProcessMap 共用“锁内 Validate → 锁外 backing/table funding → 锁内复检并组装 Prepared change”的深层 planner；外层只保留各自 authority、Building lease、结果承诺与是否需要 shootdown 的差异。部分 Unmap 在 Commit 前预留全部切分 metadata，Publish 切出同时持 extents、charge 与 permit 的 retiring slice，最后确认后交给 6C 在 AddressSpace 锁外退款；Protect 不释放仍被 live ledger 覆盖的 backing。
+
+同一批把 extent → bounded translations 投影上收为 anonymous/object 共用机制，并让现有单页 Tunnel 作为集合长度为一的真实消费者。Tunnel 外部 ABI 本批不变，但 Connection backing 改由创建进程绑定 Pool 支付并持最终形态的内部 ObjectBacking，删除单独的 raw `FrameTracker` 所有权；两端页表仍分别由各自进程 Pool 支付。匿名 slice、ObjectBacking、ObjectView、Connection/Endpoint/Invitation 与 prepared transaction 的 sponsor、全局/局部上限、唯一 permit owner、退款终点及 Commit 后零分配证明必须在接线前冻结；公共 MemoryObject shell 的准入随切片 7 的对象 ABI 一起开放。
+
+验证分为两个可独立归因的闭包：第一闭包覆盖匿名多 extent、跨 extent 部分 Unmap、左右 live slice 与 retiring middle 的 frame/charge/permit 守恒、Protect、跨 hart stale translation、乱序完成、调用线程消散与 ProcessDrain 接管；第二闭包覆盖 Tunnel 创建池付费、Attach 失败零消费、双端 close/detached drain、ack 前 backing 不退款以及 Connection 最后引用消散后 Pool/FramePool 恢复基线。完成后除 FramePool 自身库存 selftest 外，删除全部生产路径 `alloc_user_*`；selftest 的 raw 路径留待切片 10 收口。
 
 每批先跑对应 host debug/release、clippy 与 `just check`；6C 起运行 `just virt`，涉及 Remote/drain 的批次补 `just virt-stress`，本片收尾运行 `just virt-release` 与完整 `just acceptance`。外部同步继续遵守 RISC-V Privileged Architecture「Supervisor Memory-Management Fence Instruction」给出的 data fence → IPI → remote `SFENCE.VMA` → ack 边界；本片不做 ASID/range fence 优化。
 
@@ -195,15 +199,15 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 增加 MemoryObject kind/role、固定宽 Create/Query/Seal ABI 和 rinlib affine wrapper。创建先从当前进程 MetadataSponsor 预留对象壳/backing/view 所需的固定 permits，再从进程绑定池取得固定长度、多 extent、零态 ObjectBacking；对象保存 permits 与 sponsor 强引用，跨进程运输或 creator Dead 不改 sponsor，直到对象真实析构才退款。Query 报告规范化长度与 Mutable/Sealing/Executable。普通 Handle 按 rights duplicate、TRANSIT、GRANT；view 以强引用独立保活对象。
 
-扩展 Running `MemoryMap` 与 Building `ProcessMap` 的来源意图，使 Anonymous 与 MemoryObject 只在 authority/backing reserve 上不同，共用 placement、guard、结果承诺、PTE 和 shootdown。对象 offset/length 必须页对齐且在范围内；R/RW/RX 由 MAP/READ/WRITE/EXECUTE 与对象状态共同限制。公开 mapping 归 Process owner，可精确 Unmap/Protect；Tunnel lease owner 仍不可被普通调用解除。
+扩展 Running `MemoryMap` 与 Building `ProcessMap` 的来源意图，使 Anonymous 与 MemoryObject 只在 authority/backing reserve 上不同，复用 6E 已建立的 placement、guard、结果承诺、bounded translations、PTE 和 shootdown 骨架。对象 offset/length 必须页对齐且在范围内；R/RW/RX 由 MAP/READ/WRITE/EXECUTE 与对象状态共同限制。公开 mapping 归 Process owner，可精确 Unmap/Protect；Tunnel lease owner 仍不可被普通调用解除。
 
-把单 PA、单 translation 的 adapter 改为按 ObjectBacking extent 投影生成有界 translation 集；ledger 只保存强 `ObjectView { object, offset, length, permit }`，不增加第二张对象映射表。Seal 在对象锁内与 WritePermit 预留线性化，retiring writable view 收到全部远端确认后才减计数；MANAGE authority 不蕴含 MAP/WRITE。seal 完成不设专用完成槽：对象公开 ObjectSignals 的 `EXECUTABLE` 电平位，等待复用 WaitMany 通用面与 WAIT right，语义由 `notes/ideas/mm.md` 可执行发布段拥有。
+ledger 只保存强 `ObjectView { object, offset, length, permit }`，不增加第二张对象映射表；对象映射直接复用 6E 建立的 extent 到 bounded translation 投影，不保留单 PA、单 translation 的长期 adapter。Seal 在对象锁内与 WritePermit 预留线性化，retiring writable view 收到全部远端确认后才减计数；MANAGE authority 不蕴含 MAP/WRITE。seal 完成不设专用完成槽：对象公开 ObjectSignals 的 `EXECUTABLE` 电平位，等待复用 WaitMany 通用面与 WAIT right，语义由 `notes/ideas/mm.md` 可执行发布段拥有。
 
 验证：多 extent object 在不同 VA/权限映入多个进程、Handle 先关仍可访问、部分 object Unmap offset 保持且 backing 不切分、rights 拒绝、seal 与 writable permit/remote retire 竞态、对象最终 frame/charge 守恒。
 
 ## 切片 8：多页 Tunnel
 
-Connection 改持与 MemoryObject 共用的 ObjectBacking core 和创建池 charge，删除单 `pa/frame` 字段。TunnelCreate 接受长度并返回 Endpoint、Invitation 与规范化映射几何；Attach 从 Connection 读取长度，完整预留多页 ObjectView，成功才消费 Invitation。两端页表成本各由所在进程绑定池支付。
+Connection 在 6E 已持最终形态的内部 ObjectBacking；本片将其从一页扩展为调用方指定长度，并与公共 MemoryObject 共用 backing core。TunnelCreate 接受长度并返回 Endpoint、Invitation 与规范化映射几何；Attach 从 Connection 读取长度，完整预留多页 ObjectView，成功才消费 Invitation。两端页表成本各由所在进程绑定池支付。
 
 create/attach/close 的 prepared transaction 对全部 translations、write permits、handle reservations、WaitContext 与 Remote Call slots 先 Reserve；Commit 后无普通失败。close retire 验证完整 lease range 和连续对象 offset，不再假设单 fragment/单 permit。Endpoint 不可 TRANSIT/GRANT，Invitation 保持 affine consume-on-success。
 

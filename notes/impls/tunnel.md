@@ -4,9 +4,9 @@ Tunnel 是内核提供的共享内存连接对象：`Connection` 持有共享 ba
 
 ## Connection、Endpoint 与 Invitation
 
-当前实现位于 `os/kernel/src/task/tunnel.rs`。`ConnectionState` 保存共享帧、两侧 lease 与 `Alive`、`Invited`、`Closed` 状态；`Connection` 另持内部 `MemoryObjectState`，复用 `memory_space` 的对象授权和 `WritePermit` 基元，但不向用户公开独立 MemoryObject Handle。
+当前实现位于 `os/kernel/src/task/tunnel.rs`。`ConnectionState` 保存资金化共享 backing、两侧 lease 与 `Alive`、`Invited`、`Closed` 状态；`Connection` 另持内部 `MemoryObjectState`，复用 `memory_space` 的对象授权和 `WritePermit` 基元，但不向用户公开独立 MemoryObject Handle。
 
-当前 Tunnel backing 是单页 `FrameTracker`。该实现的容量、extent 和释放事实由本篇记录，底层帧与地址空间所有权见 [`mm.md`](mm.md)。
+当前 Tunnel 对外仍是单页，但 backing 已由创建进程绑定的 MemoryPool 通过 funded frame broker 支付，并随 Connection 持有物理 extent 与 Pool charge。单页容量和释放事实由本篇记录，底层帧与地址空间所有权见 [`mm.md`](mm.md)；多页几何属于后续切片 8。单页连接的 close 与 detached drain 通过内存事务在 Commit 前预留 bounded work debt；共享 backing 的 slice permit 随 live/retiring owner 持有，Unmap 事务按切分预算取得新 permit。
 
 `Endpoint` 是可等待对象，允许 `WAIT | SIGNAL | MANAGE`，可观察 `DATA | PEER_CLOSED | CLOSED`，不可进入 TRANSIT/GRANT。`Invitation` 允许 `MAP | TRANSIT | GRANT`，不可等待；它不可复制，成功 attach 后消费，失败不消费。Endpoint 与本进程地址空间 lease 绑定，不能通过 Handle 运输。
 
