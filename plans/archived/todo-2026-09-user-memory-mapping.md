@@ -1,6 +1,6 @@
 # 用户内存映射机制完整化
 
-- 状态：切片 1–8B 已由 `1cd6ab2` 至 `bdc83ef` 八笔提交收口；本实施计划归档，后续审查见 [`todo-2026-08-30-user-memory-mapping-review.md`](../todo-2026-08-30-user-memory-mapping-review.md)
+- 状态：切片 1–8B 已由 `1cd6ab2` 至 `bdc83ef` 八笔提交收口；本实施计划归档，后续审查由 [`../todo-2026-09-review-program.md`](../todo-2026-09-review-program.md) 批次 C 统一承接。
 - 方向真值：[`notes/ideas/mm.md`](../../notes/ideas/mm.md)
 - 自然序：线程批三已由 `004cae5` 收口，当前进入 IPC 数据面设计；未来 review 不阻塞主线
 
@@ -272,7 +272,7 @@ sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈�
 
 ### 联合复审归档
 
-切片 1–7、8A 与 ThreadSpawn integration 已形成 `1cd6ab2` 至 `bdc83ef` 八笔真实提交；未来审查计划已建立为 [`todo-2026-08-30-user-memory-mapping-review.md`](../todo-2026-08-30-user-memory-mapping-review.md)，逐批记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险。Review 统一复核 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整，不阻塞当前验收与自然序。
+切片 1–7、8A 与 ThreadSpawn integration 已形成 `1cd6ab2` 至 `bdc83ef` 八笔真实提交；未来审查由 [`../todo-2026-09-review-program.md`](../todo-2026-09-review-program.md) 批次 C 统一承接，记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险。Review 统一复核 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整，不阻塞当前验收与自然序。
 
 ## 对 ThreadSpawn 契约重审的解除条件
 

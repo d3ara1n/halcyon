@@ -1,4 +1,6 @@
-# 资金化帧取得事务未来审查
+# 历史审查清单：资金化帧取得事务
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `48227c87e9e3488fca259073ddafec75dbf79d60`（`feat(mm): 建立资金化帧取得事务`）。只审该提交形成的 generic broker、MemoryPool charge 接线、user inventory claim/清零/退款、固定 extent storage 与栈 guard 契约；ProcessBindMemory、boot-held primordial adopt、页表/匿名 backing 全面资金化及公共 MemoryObject 不混入本结论。
 

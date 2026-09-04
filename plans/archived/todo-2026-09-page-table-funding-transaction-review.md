@@ -1,4 +1,6 @@
-# 页表资金化事务重构未来审查
+# 历史审查清单：页表资金化事务重构
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `cfad6cf4a8b86b250ea515a34e90e9492deff173`（`feat(mm): 完成页表资金化事务重构`）。只审该提交形成的 root owner 归属、Running/Tunnel/Building 映射跨锁 funded table transaction、`image_end` 提交语义、transaction gate 与失败回滚；匿名 backing 全面资金化、公共 MemoryObject、多页 Tunnel 协议和 Runnel v2 不混入本结论。
 

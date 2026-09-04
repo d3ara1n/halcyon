@@ -1,4 +1,6 @@
-# MemoryPool 状态机与能力对象未来审查
+# 历史审查清单：MemoryPool 状态机与能力对象
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `4715f3a3c08bad358c23b0188d3b3514e4ffcc79`（`feat(mm): 建立 MemoryPool 额度与能力对象`）。只审该提交形成的 root 额度、Pool 状态机、metadata admission、capability/ABI、Handle 发布事务与用户态 affine owner；后续 funded frame broker、ProcessBindMemory、bootstrap root Handle 交付与 MemoryObject 不混入本结论。
 

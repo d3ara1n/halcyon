@@ -195,7 +195,7 @@ Remote 最后确认只把 MemoryChange 推进到 Retiring。建立固定容量 w
 
 6E 部分实现已由提交 `2e18c6e` 落地：匿名 `OwnedBacking` 全面资金化（多 extent、`BackingSlicePermit` 随 slice owner 保活、部分 Unmap 切分 metadata 前置预留）、Tunnel Connection 改由创建进程绑定 Pool 支付并删除 raw `FrameTracker`、生产路径 `alloc_user_*` 清理至只剩库存 selftest。**但本批余下承诺未闭合**：强类型 `ObjectBacking` 不存在（Connection 直接持 `FundedExtent`）、extent → bounded translations 投影未上收为匿名/对象共用（对象侧仍是单 PA 单 translation adapter）、ObjectBacking/ObjectView/Connection/Endpoint/Invitation 五类 metadata admission 未冻结、两个验证闭包有缺口。
 
-这些余项恰是切片 7 的地基，拆开实施会为 6E 造只服务匿名的临时投影层再于 7 拆除，因此**已与切片 7 合并**，由 [`todo-2026-09-memory-object-unification.md`](todo-2026-09-memory-object-unification.md) 唯一拥有，本节与下方切片 7 节不再是实施真值点。
+这些余项恰是切片 7 的地基，拆开实施会为 6E 造只服务匿名的临时投影层再于 7 拆除，因此**已与切片 7 合并**，由 [`archived/todo-2026-09-memory-object-unification.md`](archived/todo-2026-09-memory-object-unification.md) 归档记录，本节与下方切片 7 节不再是实施真值点。
 
 ## 切片 7：公共 MemoryObject 与统一 ObjectView
 

@@ -1,4 +1,6 @@
-# 机制层泛化改造 Review 计划
+# 历史审查清单：机制层泛化改造
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 D 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-mechanism-and-launcher.md` 为准。
 
 > 【未来审查计划】对象是本轮三笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。发起背景与发现清单见 [`archived/review-2026-08-27-mechanism-generalization.md`](archived/review-2026-08-27-mechanism-generalization.md)。
 

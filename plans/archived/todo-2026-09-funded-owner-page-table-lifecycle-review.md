@@ -1,4 +1,6 @@
-# 资金化 owner 与页表生命周期未来审查
+# 历史审查清单：资金化 owner 与页表生命周期
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `c522e50afb02feafaba4070effce4279397bbc6a`（`feat(mm): 建立资金化 owner 与页表生命周期协议`）。只审该提交形成的资金化 owner 守恒分解、切片 6 metadata admission、owner-aware 页表事务、空表剪枝、表 owner 跨 Remote ack 保活与可恢复 drain；分批 deferred retire、root/中间表真实 funded 来源、匿名 backing 全面资金化、公共 MemoryObject 与多页 Tunnel 不混入本结论。
 

@@ -1,4 +1,6 @@
-# Remote Call 与地址空间 epoch Review 计划
+# 历史审查清单：Remote Call 与地址空间 epoch
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 C 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-lifecycle-and-user-memory.md` 为准。
 
 > 【未来审查计划】核心对象是用户内存切片 4–5 的提交 `619998517f5293d13e48d91f3980d4f4d389b90a`，并以批三压力收口 `004cae5` 复核后续真实组合；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/call.md`](../notes/ideas/call.md) 与 [`notes/ideas/mm.md`](../notes/ideas/mm.md)，实现现状见 [`notes/impls/call.md`](../notes/impls/call.md)「Remote Call」、[`notes/impls/mm.md`](../notes/impls/mm.md)「用户地址空间」，实施上下文见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md) 与 [`archived/todo-2026-09-thread-model.md`](archived/todo-2026-09-thread-model.md)。
 

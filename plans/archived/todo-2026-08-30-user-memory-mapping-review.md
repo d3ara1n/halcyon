@@ -1,4 +1,6 @@
-# 用户内存映射与 ThreadSpawn 8B Review 计划
+# 历史审查清单：用户内存映射与 ThreadSpawn 8B
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 C 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-lifecycle-and-user-memory.md` 为准。
 
 > 【未来审查计划】对象是用户内存切片 1–8B 的八笔提交及批三压力收口 `004cae5`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。方向契约见 [`notes/ideas/mm.md`](../notes/ideas/mm.md) 与 [`notes/ideas/task.md`](../notes/ideas/task.md)，实现现状见 `notes/impls/{mm,call,internals,task,ipc}.md`，实施档案见 [`archived/todo-2026-09-user-memory-mapping.md`](archived/todo-2026-09-user-memory-mapping.md) 与 [`archived/todo-2026-09-thread-model.md`](archived/todo-2026-09-thread-model.md)。
 

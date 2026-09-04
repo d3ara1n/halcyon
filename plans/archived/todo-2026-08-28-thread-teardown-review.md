@@ -1,4 +1,6 @@
-# 多线程 teardown barrier Review 计划
+# 历史审查清单：多线程 teardown barrier
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 C 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-lifecycle-and-user-memory.md` 为准。
 
 > 【未来审查计划】核心对象是生命周期 step 7 的提交 `d741880`，并结合 ThreadSpawn 批二 `bdc83ef` 与压力收口 `004cae5` 复核屏障被真实多线程消费后的终态；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计决策见 [archived/todo-2026-08-28-thread-teardown-barrier.md](archived/todo-2026-08-28-thread-teardown-barrier.md) 与 [archived/todo-2026-09-thread-model.md](archived/todo-2026-09-thread-model.md)，实现现状见 `notes/impls/{task,call,execution-context}.md`。
 

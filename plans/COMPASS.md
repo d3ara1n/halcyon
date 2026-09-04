@@ -24,30 +24,17 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 
 | 文件 | 概要 |
 |---|---|
-| [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已完成收口，03–07 待做 |
-| [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md) | 未来设计项：独立用户态电源管理服务需要另行设计，当前不预设职责、拓扑、协议或 capability 分配 |
-| [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) | 未来设计项：闭合用户态从关机意图到最终 reset 的服务收束政策，不预设执行主体、拓扑或协议 |
-| [`todo-2026-08-30-user-memory-mapping-review.md`](todo-2026-08-30-user-memory-mapping-review.md) | 未来审查：用户内存切片 1–8B（`1cd6ab2` 至 `bdc83ef`）及压力收口 `004cae5` 的统一 AddressSpace、失败原子、Remote shootdown、lease/backing 与 ThreadSpawn/join 组合所有权 |
-| [`todo-2026-08-30-remote-call-review.md`](todo-2026-08-30-remote-call-review.md) | 未来审查：`6199985` 的固定槽/RVWMO/epoch 基座及 `004cae5` 的真实同 AddressSpace stale-translation 与后续 Retire 组合 |
-| [`todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) | 原切片 6E–10 计划：切片 1–6D 已完成；6E 部分完成（提交 `2e18c6e`），剩余项已并入切片 7 并随之收口。**剩余活跃项：切片 8（多页 Tunnel ABI 与 Runnel v2）、切片 9（RNL2 动态 ring）、切片 10（raw FramePool selftest adapter 走内部 seam）** |
-| [`todo-2026-09-memory-transaction-unification-review.md`](todo-2026-09-memory-transaction-unification-review.md) | 未来审查：提交 `d2ff81e`/`5c0bbb0`/`d6a162c` 的统一事务核与公共 MemoryObject。**本轮 reviewer 因 provider 限额中断，正确性未经独立复核**——permit 守恒、view owner 析构顺序、锁阶与 Commit 零分配四项待审；seal/EXECUTABLE 电平已实现但无验收负载 |
-| [`todo-2026-09-kernel-final-architecture-review.md`](todo-2026-09-kernel-final-architecture-review.md) | 内核主线完成后的全局架构收口：统一最终类型/所有权/事务 seam，识别并删除 1–6E 及后续 A→B 迁移遗留的 C/D/E/F；触发前只登记观察点，不提前局部重构 |
-| [`todo-2026-09-deferred-retire-review.md`](todo-2026-09-deferred-retire-review.md) | 未来审查：提交 `7225673` 的显式 Retiring、固定容量 work debt、owner hart/Pending 电平、table/backing/metadata 分批退休、Tunnel/ProcessDrain 统一接管与最终完成顺序 |
-| [`todo-2026-09-process-memory-binding-bootstrap-review.md`](todo-2026-09-process-memory-binding-bootstrap-review.md) | 未来审查：提交 `7c76097` 的 Unbound Process、一次性 Bind、Building 截止、metadata 壳寿命、funded root、root Pool capability 与 bootstrap payload owner 闭包 |
-| [`todo-2026-09-funded-owner-page-table-lifecycle-review.md`](todo-2026-09-funded-owner-page-table-lifecycle-review.md) | 未来审查：提交 `c522e50` 的 funded owner 守恒分解、切片 6 metadata admission、owner-aware 页表事务、空表剪枝、Remote ack owner 保活、可恢复 drain 与栈边界 |
-| [`todo-2026-09-page-table-funding-transaction-review.md`](todo-2026-09-page-table-funding-transaction-review.md) | 未来审查：提交 `cfad6cf` 的 root owner 归属、Running/Tunnel/Building funded table transaction、`image_end` 提交语义、transaction gate、失败回滚与错误分类 |
-| [`todo-2026-09-02-memory-page-table-6d-review.md`](todo-2026-09-02-memory-page-table-6d-review.md) | 未来审查：提交 `addb4a5`、`b4bfb20` 的切片 6D 页表资金化收口、锁外 owner 生命周期、失败回滚、异常可观测性与实现文档一致性 |
-| [`todo-2026-09-funded-frame-broker-review.md`](todo-2026-09-funded-frame-broker-review.md) | 未来审查：提交 `48227c8` 的双账本事务顺序、仿射回滚、清零发布边界、固定 extent storage、栈 guard 与 raw/adopt 类型隔离 |
-| [`todo-2026-09-memory-pool-review.md`](todo-2026-09-memory-pool-review.md) | 未来审查：提交 `4715f3a` 的 root 额度闭包、Pool 线性 token/自然退款、metadata sponsor、Handle 发布原子、rights/ABI 与 rinlib affine owner |
-| [`todo-2026-09-platform-memory-ledger-review.md`](todo-2026-09-platform-memory-ledger-review.md) | 未来审查：提交 `198e665` 的 Devicetree admission、物理分类守恒、no-map 双重排除、transition/direct-map 静态预算与双平台启动闭包 |
-| [`todo-2026-09-system-supply-reserve-review.md`](todo-2026-09-system-supply-reserve-review.md) | 未来审查：提交 `0a944c7` 的固定 workspace planner、system typed tickets、FramePool/heap 物理隔离、静态容量证明与三平台分类闭包 |
+| [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md) | 当前 Review 唯一统筹入口：A 统一内存事务核 → B 内存供给/页表生命周期 → C 线程与用户内存 → D 机制泛化/launcher → E 系统审计；指定模型 `moeflux-openai-responses/gpt-5.6-sol`，只读不改代码 |
+| [`review-2026-09-memory-transaction-unification.md`](review-2026-09-memory-transaction-unification.md) | 批次 A 已完成审查但未通过；四项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |
+| [`review-2026-09-memory-supply-and-pool.md`](review-2026-09-memory-supply-and-pool.md) | 批次 B-1 已完成审查但未通过；一项 P1、三项 P2 finding 未闭合，报告同时作为唯一修复与复核计划 |
+| [`review-2026-09-process-bind-page-table-retire.md`](review-2026-09-process-bind-page-table-retire.md) | 批次 B-2 已完成审查但未通过；一项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |
+| [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已有归档报告，03–07 待做 |
+| [`todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) | 当前实施计划：切片 8 多页 Tunnel/Runnel v2、切片 9 RNL2 动态 ring、切片 10 raw FramePool selftest adapter |
 | [`todo-2026-09-platform-reserved-memory-lifecycle.md`](todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |
-| [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 归档 review 中未闭合承接项的唯一跟踪点：设备/中断接入重审 |
-| [`todo-2026-08-27-mechanism-generalization-review.md`](todo-2026-08-27-mechanism-generalization-review.md) | 机制层泛化改造（15c7811/9c03251/95deea6）的未来审查计划：Lock Ladder、per-hart Timeout、MappingLease 与文档自洽；共享事务骨架触发条件已满足，由当前 AddressSpace/MemoryChange 主线承接 |
-| [`todo-2026-08-26-bootstrap-launcher-review.md`](todo-2026-08-26-bootstrap-launcher-review.md) | 机会型任务：BootPackage / launcher 十切片代码审查，有空就做，不阻塞主线 |
-| [`todo-2026-08-28-thread-teardown-review.md`](todo-2026-08-28-thread-teardown-review.md) | 未来审查：step 7 `d741880` 与 ThreadSpawn `bdc83ef`/`004cae5` 的成员表、离场屏障、ThreadDeparture、join 发布和锁序 |
-| [`todo-2026-08-28-domain-eligibility-review.md`](todo-2026-08-28-domain-eligibility-review.md) | 生命周期 step 8（调度域 eligibility，提交 1d7dc92）的未来审查计划：域推导、绑定冻结、域内 idle 与 IPI 路由 |
-| [`todo-2026-08-28-persistent-init-review.md`](todo-2026-08-28-persistent-init-review.md) | 生命周期 step 6（持久 init/pm 委托域）的未来审查计划：authority 边界、收束兜底与显式 reset 后的 supervisor 语义 |
+| [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md) | 未来设计项：独立用户态电源管理服务需重新设计职责、拓扑、协议与 capability 分配 |
+| [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) | 未来设计项：闭合用户态从关机意图到最终 reset 的服务收束政策，不预设执行主体、拓扑或协议 |
+| [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 等设备/中断/DMA 接入触发的唯一 review 承接项 |
+| [`todo-2026-09-kernel-final-architecture-review.md`](todo-2026-09-kernel-final-architecture-review.md) | 等 MemoryObject 主线、多页 Tunnel、Runnel v2 与主要用户态消费者完成，并在统筹批次 A–E 收口后执行的最终架构 review |
 
 常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
 
@@ -72,7 +59,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 ## 位置
 
 - 已完成：boot/高半区启动协议、帧池（os/frame_pool）、堆、Sv39 页表（os/page_table）、板级解析（os/dtb）、任务模型（trap 路径与 trap 锚、域—类调度、进程/线程、BootPackage initial ELF bootstrap、syscall 面 Debug/Exit/MemoryMap/MemoryUnmap/MemoryProtect/Sleep、进程回收、timer/IPI 通路）与执行环境重构（a9a65cb）。IPC 前地基工程已完成（hart 身份统一、锁内存序、所有权单向化、uaccess 集中化；见 `plans/archived/2026-09-pre-ipc-groundwork.md`）。IPC 对象 / Handle 重建也已完成：进程本地 HandleTable、WaitContext、显式 Mailbox/Notification、原子 Handle move、Endpoint/Invitation 与 Acquire/Release Runnel 已贯通，实施档案见 [已归档计划](archived/2026-08-ipc-object-foundation.md)，实现现状见 `notes/impls/ipc.md`。
-- 已完成：**统一内存事务核与公共 MemoryObject 已收口（2026-09）**——切片 1–6D 与切片 7 全部完成。Running/Building/bootstrap/object view 四条路径收敛为单一 `MemoryChangePlan`/`PreparedMemoryChange`（source/authority/output/image_end/view 五个字段维度），四套平行 plan/complete/commit 类型与 Tunnel 两份回滚矩阵已删除，proc.rs 净减约 700 行。对象 view 的权限真值从 `ObjectViewAuthorization` 流出（原 `ReadWrite` 硬编码已清），公共 MemoryObject 经 `MemoryObjectCreate/Query/Seal(0x55-0x57)`、`ObjectSignals::EXECUTABLE` 与 `MemoryMapRequest.source` 接入，AddressSpace 持 per-object view owner 使对象独立于 Handle 存活。实施途中修正一个真实前置缺口：含 W 的 object view 被部分 Unmap/降权时存活片段是新铸造区域、各需一枚新 permit，因此 Unmap/Protect 改为两段式（Validate 报告 permit 多重集 → 锁外向对象取得 → 重入 Reserve）。实施档案见 [`todo-2026-09-memory-object-unification.md`](todo-2026-09-memory-object-unification.md)，未来审查见 [`todo-2026-09-memory-transaction-unification-review.md`](todo-2026-09-memory-transaction-unification-review.md)，实现现状见 `notes/impls/{mm,memory-object,tunnel}.md`。
+- 已完成：**统一内存事务核与公共 MemoryObject 已收口（2026-09）**——切片 1–6D 与切片 7 全部完成。Running/Building/bootstrap/object view 四条路径收敛为单一 `MemoryChangePlan`/`PreparedMemoryChange`（source/authority/output/image_end/view 五个字段维度），四套平行 plan/complete/commit 类型与 Tunnel 两份回滚矩阵已删除，proc.rs 净减约 700 行。对象 view 的权限真值从 `ObjectViewAuthorization` 流出（原 `ReadWrite` 硬编码已清），公共 MemoryObject 经 `MemoryObjectCreate/Query/Seal(0x55-0x57)`、`ObjectSignals::EXECUTABLE` 与 `MemoryMapRequest.source` 接入，AddressSpace 持 per-object view owner 使对象独立于 Handle 存活。实施途中修正一个真实前置缺口：含 W 的 object view 被部分 Unmap/降权时存活片段是新铸造区域、各需一枚新 permit，因此 Unmap/Protect 改为两段式（Validate 报告 permit 多重集 → 锁外向对象取得 → 重入 Reserve）。实施档案见 [`archived/todo-2026-09-memory-object-unification.md`](archived/todo-2026-09-memory-object-unification.md)，未来审查由 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md) 的批次 A 统筹，实现现状见 `notes/impls/{mm,memory-object,tunnel}.md`。
 - 后续设计：用户态系统关机编排与独立电源管理服务分别立案，二者不互相预设执行主体、职责、拓扑、协议或 capability 分配。计划见 [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) 与 [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md)。
 - 已完成：**显式系统复位已收口（2026-09）**——eRhino 自有 reset ABI、primordial `SystemReset` capability、init 直接提交与 SBI 显式映射已落地；调度器不再从 quiescent 推断关机，idle 只负责 WFI 与唤醒路由；virt 五线与 sifive_u 平台失败返回均通过。实施档案见 [`archived/todo-2026-09-explicit-system-reset.md`](archived/todo-2026-09-explicit-system-reset.md)，旧竞态调查见 [`archived/todo-2026-08-29-early-quiescent-shutdown.md`](archived/todo-2026-08-29-early-quiescent-shutdown.md)。
 - 已完成：**竞态矩阵覆盖增强已收口（2026-09）**——锤侧延迟变体（`Cmd.aux` 转正为执行前延迟，奇数轮锤延迟 10ms），kill-vs-exit/fault/abandon 双侧终因均有胜出记录，全验证线 10/10；实施档案见 [archived/todo-2026-08-28-race-matrix-coverage.md](archived/todo-2026-08-28-race-matrix-coverage.md)。

@@ -1,4 +1,6 @@
-# 分批 deferred retire 未来审查
+# 历史审查清单：分批 deferred retire
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `722567344b636c149a61324bab63af95b17c0db1`（`feat(mm): 实现分批 deferred retire`）。只审该提交形成的显式 Retiring 阶段、固定容量 work debt、Remote final ack 后分批退休、metadata owner 接线、Tunnel/ProcessDrain 统一接管与 QEMU 超时校准；切片 6D 的 root/中间页表真实 funded 来源、切片 6E 的匿名 backing 全面资金化、公共 MemoryObject 与多页 Tunnel 不混入本结论。
 

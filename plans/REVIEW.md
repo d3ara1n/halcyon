@@ -31,4 +31,5 @@
 - 每条 finding 必须有证据：位置、可达性、违反的契约（ideas / impls / 语言层）；无证据的猜测不写，风格偏好不收。
 - findings 集中修复，不修一条审一条；修复暴露架构选择时回到设计讨论。
 - reviewer 用全新上下文（避免确认偏见），只报告不修改。
-- 产物归属不变：方向进 ideas，实现事实进 impls，未完成行动进 todo，报告为 `review-<日期>-<主题>.md` 收口后归档。
+- `review-<日期>-<主题>.md` 同时承载审查证据与其 findings 的修复/复核计划：有未闭合 finding 时留在 `plans/` 根目录，全部修复并复核后移入 `plans/archived/`；不得为同一 findings 再建重复 todo。
+- 产物归属：方向进 ideas，实现事实进 impls；只有 Review 范围之外的独立能力缺口才另建 todo。

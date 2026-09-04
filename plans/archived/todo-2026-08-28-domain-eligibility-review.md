@@ -1,4 +1,6 @@
-# 调度域 eligibility 与 D64 开放 Review 计划
+# 历史审查清单：调度域 eligibility 与 D64 开放
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 C 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-lifecycle-and-user-memory.md` 为准。
 
 > 【未来审查计划】对象是生命周期 step 8 的提交 `1d7dc92`；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计决策（批次范围、签名等价类域推导、最弱兼容域默认、F2 trait 上收、Q 谓词修正）与完整推导见 [archived/todo-2026-08-28-domain-eligibility.md](archived/todo-2026-08-28-domain-eligibility.md)，方向公理见 `notes/ideas/execution-context.md`「调度域」，实现现状见 `notes/impls/execution-context.md`「身份、能力与域」。
 

@@ -1,4 +1,6 @@
-# 系统物理储备未来审查
+# 历史审查清单：系统物理储备
+
+> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `0a944c7ae86b141207b737afcab240c8e2a9f5c7`（`feat(mm): 隔离系统物理储备`）。只审该提交形成的 system/user 物理隔离、静态容量证明与内核 heap 供血路径；平台供给账本仍归 `todo-2026-09-platform-memory-ledger-review.md`，后续 MemoryPool、funded broker 与 KernelMemoryBudget 不混入本结论。
 
