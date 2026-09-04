@@ -68,16 +68,11 @@ impl ObjectViewAuthorization {
 #[must_use = "write permits must be cancelled before commit or retired after synchronization"]
 pub struct WritePermit {
     object: ObjectId,
-    serial: u64,
 }
 
 impl WritePermit {
     pub const fn object(&self) -> ObjectId {
         self.object
-    }
-
-    pub const fn serial(&self) -> u64 {
-        self.serial
     }
 }
 
@@ -89,7 +84,6 @@ pub struct MemoryObjectState {
     state: ExecutableState,
     permits: usize,
     permit_limit: usize,
-    next_serial: u64,
     seal_waiter: Option<u64>,
 }
 
@@ -101,7 +95,6 @@ impl MemoryObjectState {
             state: ExecutableState::Mutable,
             permits: 0,
             permit_limit,
-            next_serial: 1,
             seal_waiter: None,
         }
     }
@@ -156,10 +149,6 @@ impl MemoryObjectState {
         if new_count > self.permit_limit {
             return Err(ObjectError::PermitLimit);
         }
-        let count_u64 = u64::try_from(count).map_err(|_| ObjectError::PermitOverflow)?;
-        self.next_serial
-            .checked_add(count_u64)
-            .ok_or(ObjectError::PermitOverflow)?;
 
         let mut permits = Vec::new();
         permits
@@ -168,9 +157,7 @@ impl MemoryObjectState {
         for _ in 0..count {
             permits.push(WritePermit {
                 object: self.object,
-                serial: self.next_serial,
             });
-            self.next_serial += 1;
         }
         self.permits = new_count;
         Ok(permits)

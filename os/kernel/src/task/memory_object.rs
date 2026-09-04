@@ -4,14 +4,14 @@
 //! backing）、MemoryObjectState（Mutable → Sealing → Executable 状态机，内含对象身份
 //! 与固定长度）与 metadata owner（sponsor 强引用 + backing permit）。
 //!
-//! 对象身份由本模块全局单调铸造后交给状态机保管，不在 core 上另存一份——身份、长度
-//! 与可执行状态同属对象的逻辑状态，单一真值点避免二者失步。
+//! 对象身份从内核对象身份序列（`object::try_mint_koid`）铸造后交给状态机保管，不在
+//! core 上另存一份——身份、长度与可执行状态同属对象的逻辑状态，单一真值点避免二者
+//! 失步。
 //!
 //! 等待面不属于 core：Tunnel 的等待面在 Endpoint 上，公共 MemoryObject 的等待面在其
 //! 公共 shell 上，二者各自拥有独立的 ObjectWaitState。
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use memory_space::{MemoryObjectState, ObjectId};
 
@@ -20,17 +20,16 @@ use crate::{
     sync::Spinlock,
     task::{
         memory_pool::MemoryPool,
+        object,
         resources::{ConnectionPermit, MetadataSponsor, ObjectBackingPermit},
     },
 };
 
 use erhino_shared::call::SystemCallError;
 
-static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn mint_object_id() -> ObjectId {
-    let identity = NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
-    ObjectId::new(identity).expect("MemoryObject identity exhausted")
+fn mint_object_id() -> Result<ObjectId, SystemCallError> {
+    let koid = object::try_mint_koid().ok_or(SystemCallError::ReachLimit)?;
+    ObjectId::new(koid).ok_or(SystemCallError::InternalError)
 }
 
 /// 把资金化失败分类为系统调用错误：额度不足与物理/metadata 不足不同，
@@ -75,6 +74,7 @@ impl MemoryObjectCore {
     ) -> Result<(Self, ConnectionPermit), SystemCallError> {
         let backing_permit = MetadataSponsor::reserve_object_backing(sponsor)?;
         let connection_permit = MetadataSponsor::reserve_connection(sponsor)?;
+        let identity = mint_object_id()?;
 
         let backing = frame::fund_object_backing(
             pool,
@@ -86,7 +86,6 @@ impl MemoryObjectCore {
         )
         .map_err(map_fund_error)?;
 
-        let identity = mint_object_id();
         let object_bytes = backing.pages() * super::proc::PAGE_SIZE;
         let state = Spinlock::new(
             crate::sync::ranks::MEMORY_OBJECT,

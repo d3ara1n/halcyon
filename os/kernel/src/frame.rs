@@ -692,27 +692,27 @@ pub(crate) fn fund_user_frames(
         })
 }
 
-type UserFundedRootInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
+type UserFundedTableInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
 
-/// AddressSpace root 的单 extent 资金化 owner。专用一槽存储避免把通用 64-extents
-/// backing 内联进每个 Unbound shell 与 Bind 调用栈。
-pub(crate) struct FundedRootFrame {
-    inner: UserFundedRootInner,
+/// 页表帧（root 与中间表同形）的单 extent 资金化 owner。专用一槽存储避免把通用
+/// 64-extents backing 内联进每个 Unbound shell 与 Bind 调用栈。
+pub(crate) struct FundedTableFrame {
+    inner: UserFundedTableInner,
 }
 
-impl FundedRootFrame {
+impl FundedTableFrame {
     pub(crate) fn frame(&self) -> FrameNumber {
         let mut claims = self.inner.claims();
-        let claim = claims.next().expect("funded root lost its physical claim");
-        assert!(claims.next().is_none(), "funded root must have one extent");
-        assert_eq!(claim.geometry().count(), 1, "funded root must own one page");
+        let claim = claims.next().expect("funded table lost its physical claim");
+        assert!(claims.next().is_none(), "funded table must have one extent");
+        assert_eq!(claim.geometry().count(), 1, "funded table must own one page");
         claim.geometry().base()
     }
 }
 
-pub(crate) fn fund_user_root(
+pub(crate) fn fund_user_table_frame(
     pool: &Arc<MemoryPool>,
-) -> Result<FundedRootFrame, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
+) -> Result<FundedTableFrame, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
     funded_frame::fund::<_, _, 1>(
         &PoolQuota(pool),
         &UserInventory,
@@ -722,7 +722,7 @@ pub(crate) fn fund_user_root(
             max_extents: 1,
         },
     )
-    .map(|inner| FundedRootFrame { inner })
+    .map(|inner| FundedTableFrame { inner })
 }
 
 /// 从未发布到 user inventory 的启动期 extent。构造只存在于验证后的 bootstrap

@@ -4,7 +4,6 @@
 #![allow(internal_features)]
 
 pub use erhino_shared as shared;
-pub use flagset;
 
 pub extern crate alloc;
 

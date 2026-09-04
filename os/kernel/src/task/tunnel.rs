@@ -28,7 +28,7 @@ use crate::{
             SubscribeResult,
         },
         proc::{
-            AddressSpaceState, MemoryRetireSink, ObjectMappingLease, PrepareShootdownError,
+            AddressSpaceState, MemoryRetireSink, ObjectMappingLease, map_shootdown_error,
             PreparedObjectMapping, Process, RetiringSpaceChange, prepare_memory_completion,
         },
         wait::{Subscription, finish_offered},
@@ -313,15 +313,6 @@ fn map_object_error(error: ObjectError) -> SystemCallError {
     }
 }
 
-fn map_shootdown_error(error: PrepareShootdownError) -> SystemCallError {
-    match error {
-        PrepareShootdownError::NotRunning => SystemCallError::ObjectClosed,
-        PrepareShootdownError::Busy => SystemCallError::ObjectBusy,
-        PrepareShootdownError::InvalidTargets => SystemCallError::InternalError,
-        PrepareShootdownError::OutOfMemory => SystemCallError::OutOfMemory,
-    }
-}
-
 fn reserve_mapping(
     connection: &Connection,
 ) -> Result<
@@ -377,7 +368,7 @@ fn rollback_mapping(
     prepared: PreparedObjectMapping,
 ) -> (
     Vec<memory_space::WritePermit>,
-    Vec<page_table::PreparedTranslation<super::proc::TableFrameToken>>,
+    Vec<page_table::PreparedTranslation<crate::frame::FundedTableFrame>>,
 ) {
     space.rollback_object_mapping(prepared)
 }
@@ -614,7 +605,7 @@ pub fn create(
                     table
                         .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                         .expect("TunnelCreate reservation must remain owned");
-                    return Err(map_space_error(failure.error));
+                    return Err(SystemCallError::from(failure.error));
                 }
             }
         };
@@ -630,7 +621,7 @@ pub fn create(
                 table
                     .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                     .expect("TunnelCreate reservation must remain owned");
-                return Err(map_space_error(error));
+                return Err(SystemCallError::from(error));
             }
         };
         let mut space = thread.process.space.lock();
@@ -643,7 +634,7 @@ pub fn create(
                 table
                     .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                     .expect("TunnelCreate reservation must remain owned");
-                return Err(map_space_error(failure.error));
+                return Err(SystemCallError::from(failure.error));
             }
         }
     };
@@ -860,7 +851,7 @@ pub fn attach(
                     table
                         .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                         .expect("TunnelAttach reservation must remain owned");
-                    return Err(map_space_error(failure.error));
+                    return Err(SystemCallError::from(failure.error));
                 }
             }
         };
@@ -876,7 +867,7 @@ pub fn attach(
                 table
                     .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                     .expect("TunnelAttach reservation must remain owned");
-                return Err(map_space_error(error));
+                return Err(SystemCallError::from(error));
             }
         };
         let mut space = thread.process.space.lock();
@@ -889,7 +880,7 @@ pub fn attach(
                 table
                     .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                     .expect("TunnelAttach reservation must remain owned");
-                return Err(map_space_error(failure.error));
+                return Err(SystemCallError::from(failure.error));
             }
         }
     };
@@ -1041,7 +1032,7 @@ pub(crate) fn close_handle(
     let mut unmap = {
         let (plan, pool) = {
             let mut space = thread.process.space.lock();
-            let plan = space.prepare_object_unmap(lease).map_err(map_space_error)?;
+            let plan = space.prepare_object_unmap(lease).map_err(SystemCallError::from)?;
             let pool = Arc::clone(space.pool());
             (plan, pool)
         };
@@ -1049,7 +1040,7 @@ pub(crate) fn close_handle(
             Ok(owners) => owners,
             Err(error) => {
                 thread.process.space.lock().rollback_object_unmap_plan(plan);
-                return Err(map_space_error(error));
+                return Err(SystemCallError::from(error));
             }
         };
         let prepared = {
@@ -1062,7 +1053,7 @@ pub(crate) fn close_handle(
                 Ok(prepared) => prepared,
                 Err((error, owners)) => {
                     drop(owners);
-                    return Err(map_space_error(error));
+                    return Err(SystemCallError::from(error));
                 }
             }
         };
@@ -1301,16 +1292,4 @@ fn concrete_invitation(object: &ObjectRef) -> Result<&Invitation, SystemCallErro
         .as_any()
         .downcast_ref::<Invitation>()
         .ok_or(SystemCallError::WrongObjectType)
-}
-
-fn map_space_error(error: super::proc::SpaceError) -> SystemCallError {
-    match error {
-        super::proc::SpaceError::BadSegment => SystemCallError::IllegalArgument,
-        super::proc::SpaceError::NoFrame => SystemCallError::OutOfMemory,
-        super::proc::SpaceError::QuotaExceeded => SystemCallError::QuotaExceeded,
-        super::proc::SpaceError::ReachLimit => SystemCallError::ReachLimit,
-        super::proc::SpaceError::Conflict => SystemCallError::InvalidAddress,
-        super::proc::SpaceError::Busy => SystemCallError::ObjectBusy,
-        super::proc::SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
-    }
 }

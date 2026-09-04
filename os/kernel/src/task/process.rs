@@ -24,7 +24,7 @@ use super::{
         HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
         SubscribeResult,
     },
-    proc::{Process, SpaceError, ThreadAttachError},
+    proc::{Process, ThreadAttachError},
     wait::{Subscription, WaitOutcome, finish_offered},
 };
 use wait_context::OfferResult;
@@ -378,7 +378,7 @@ fn create_staged(
     let resources = super::resources::ProcessResources::try_new()?;
     let process = Arc::try_new(
         Process::new(pid, thread.process.pid, Arc::downgrade(&job), resources)
-            .map_err(map_space_error)?,
+            .map_err(SystemCallError::from)?,
     )
     .map_err(|_| SystemCallError::OutOfMemory)?;
     let builder = ProcessBuilder::new(process.clone())?;
@@ -443,7 +443,7 @@ fn prepare_memory_binding(
     pool: Arc<super::memory_pool::MemoryPool>,
 ) -> Result<alloc::boxed::Box<super::proc::BoundAddressSpace>, SystemCallError> {
     let binding = super::resources::PoolBinding::prepare(pool, process.resources.metadata())?;
-    super::proc::BoundAddressSpace::new(binding).map_err(map_space_error)
+    super::proc::BoundAddressSpace::new(binding).map_err(SystemCallError::from)
 }
 
 /// Bootstrap 复用普通 Bind 的资源准备与 Unbound→Bound 提交语义；唯一差异是 root
@@ -596,16 +596,16 @@ pub fn map(
     let _lease = BuildingLease::begin(process.clone())?;
     let (pool, sponsor) = {
         let mut space = process.space.lock();
-        space.bound().map_err(map_space_error)?;
+        space.bound().map_err(SystemCallError::from)?;
         space
             .validate_building_anonymous(target, len, permissions)
-            .map_err(map_space_error)?;
-        let bound = space.bound().map_err(map_space_error)?;
+            .map_err(SystemCallError::from)?;
+        let bound = space.bound().map_err(SystemCallError::from)?;
         (Arc::clone(bound.pool()), Arc::clone(bound.sponsor()))
     };
     let prepared =
         super::proc::PreparedBacking::allocate(len / super::proc::PAGE_SIZE, &pool, &sponsor)
-            .map_err(map_space_error)?;
+            .map_err(SystemCallError::from)?;
     let plan_result = {
         let mut space = process.space.lock();
         space.plan_anonymous_mapping(target, len, permissions, prepared)
@@ -614,11 +614,11 @@ pub fn map(
         Ok(plan) => plan,
         Err(super::proc::BackingPlanFailure::Prepared(error, backing)) => {
             drop(backing);
-            return Err(map_space_error(error));
+            return Err(SystemCallError::from(error));
         }
         Err(super::proc::BackingPlanFailure::Owned(error, backing)) => {
             drop(backing);
-            return Err(map_space_error(error));
+            return Err(SystemCallError::from(error));
         }
     };
     let pool = pool;
@@ -627,7 +627,7 @@ pub fn map(
         Err(error) => {
             let reclaimed = process.space.lock().rollback_owned_mapping_plan(plan);
             drop(reclaimed);
-            return Err(map_space_error(error));
+            return Err(SystemCallError::from(error));
         }
     };
     let released = {
@@ -639,7 +639,7 @@ pub fn map(
             Ok(released) => released,
             Err((error, reclaimed)) => {
                 drop(reclaimed);
-                return Err(map_space_error(error));
+                return Err(SystemCallError::from(error));
             }
         }
     };
@@ -671,7 +671,7 @@ pub fn write(
             .space
             .lock()
             .write_building(target, &bytes)
-            .map_err(map_space_error)
+            .map_err(SystemCallError::from)
     })()
 }
 
@@ -697,7 +697,7 @@ pub fn attach(
     lease
         .attach_thread(descriptor)
         .map_err(|error| match error {
-            ThreadAttachError::Context(error) => map_space_error(error),
+            ThreadAttachError::Context(error) => SystemCallError::from(error),
             ThreadAttachError::Closed => SystemCallError::ObjectClosed,
             ThreadAttachError::Limit => SystemCallError::ReachLimit,
             ThreadAttachError::Oom => SystemCallError::OutOfMemory,
@@ -1132,16 +1132,4 @@ fn concrete_control(object: &ObjectRef) -> Result<Arc<ProcessControl>, SystemCal
     let any: Arc<dyn Any + Send + Sync> = object.clone();
     any.downcast::<ProcessControl>()
         .map_err(|_| SystemCallError::WrongObjectType)
-}
-
-fn map_space_error(error: SpaceError) -> SystemCallError {
-    match error {
-        SpaceError::NoFrame => SystemCallError::OutOfMemory,
-        SpaceError::QuotaExceeded => SystemCallError::QuotaExceeded,
-        SpaceError::ReachLimit => SystemCallError::ReachLimit,
-        SpaceError::BadSegment => SystemCallError::IllegalArgument,
-        SpaceError::Conflict => SystemCallError::InvalidAddress,
-        SpaceError::Busy => SystemCallError::ObjectBusy,
-        SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
-    }
 }

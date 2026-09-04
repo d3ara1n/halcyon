@@ -18,6 +18,17 @@ pub type Koid = u64;
 
 static NEXT_KOID: AtomicU64 = AtomicU64::new(1);
 
+/// 内核对象身份的唯一铸造口。KernelObject 经 [`ObjectHeader`] 取得；需要类型化
+/// 身份的对象核心（Pool 的 `PoolId`、MemoryObject 的 `ObjectId`）直接从这里取，
+/// 因此全系统只有一个对象身份序列。
+pub fn try_mint_koid() -> Option<Koid> {
+    NEXT_KOID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then(|| current.wrapping_add(1))
+        })
+        .ok()
+}
+
 /// 单对象订阅额度；使协作式信号发布路径有明确工作上界。
 pub const OBJECT_WAIT_LIMIT: usize = 1024;
 
@@ -70,12 +81,7 @@ pub struct ObjectHeader {
 impl ObjectHeader {
     /// 用户可触达对象使用的 fallible identity 铸造口。
     pub fn try_new() -> Option<Self> {
-        NEXT_KOID
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current != 0).then(|| current.wrapping_add(1))
-            })
-            .ok()
-            .map(|koid| Self { koid })
+        try_mint_koid().map(|koid| Self { koid })
     }
 
     pub fn new() -> Self {

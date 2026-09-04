@@ -254,7 +254,6 @@ pub enum RegionKindView {
         backing: BackingView,
         current: Protection,
         maximum: Protection,
-        holds_write_permit: bool,
     },
 }
 
@@ -304,7 +303,6 @@ impl Region {
                     backing,
                     current,
                     maximum,
-                    holds_write_permit: self.permit.is_some(),
                 },
             },
         }
@@ -1683,7 +1681,6 @@ fn retire_template(
                 .ok_or(ChangeError::BackingOutOfRange)?,
             current,
             maximum,
-            holds_write_permit: region.permit.is_some(),
         },
     };
     Ok(RetireTemplate {

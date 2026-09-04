@@ -1,7 +1,8 @@
-//! 进程资源绑定的长期结构 seam 与过渡期 metadata admission。
+//! 进程资源绑定的结构 seam 与 metadata admission。
 //!
 //! Process core/Builder/Control、Pool core 与 AddressSpace 按真实寿命持 permit；
 //! AddressSpace 预付 planner 固定容量，资金化 backing 与内存事务使用独立类型化 slots。
+//! 全局 admission 上限是 KernelMemoryBudget 公开前的政策归属点（见 ideas/mm.md）；
 //! 显式 KernelMemoryBudget 继续在同一 ProcessResources 中增量接入。
 
 use super::memory_pool::MemoryPool;

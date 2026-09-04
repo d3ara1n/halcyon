@@ -242,15 +242,7 @@ fn map_attach_fault(error: super::lifecycle::AttachFault) -> SystemCallError {
 }
 
 fn map_context_fault(error: super::proc::SpaceError) -> SystemCallError {
-    match error {
-        super::proc::SpaceError::NoFrame => SystemCallError::OutOfMemory,
-        super::proc::SpaceError::QuotaExceeded => SystemCallError::QuotaExceeded,
-        super::proc::SpaceError::ReachLimit => SystemCallError::ReachLimit,
-        super::proc::SpaceError::BadSegment => SystemCallError::IllegalArgument,
-        super::proc::SpaceError::Conflict => SystemCallError::InvalidAddress,
-        super::proc::SpaceError::Busy => SystemCallError::ObjectBusy,
-        super::proc::SpaceError::Unbound => SystemCallError::ObjectNotAvailable,
-    }
+    SystemCallError::from(error)
 }
 
 /// Running 期同步创建线程。固定宽结果写出成功后，handle/member/Ready
