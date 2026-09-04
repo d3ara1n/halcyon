@@ -28,8 +28,8 @@ use crate::{
             SubscribeResult,
         },
         proc::{
-            AddressSpaceState, MemoryRetireSink, ObjectMappingLease, map_shootdown_error,
-            PreparedObjectMapping, Process, RetiringSpaceChange, prepare_memory_completion,
+            AddressSpaceState, MemoryRetireSink, ObjectMappingLease, PreparedMemoryChange,
+            Process, RetiringSpaceChange, map_shootdown_error, prepare_memory_completion,
         },
         wait::{Subscription, finish_offered},
     },
@@ -344,7 +344,7 @@ fn prepare_mapping(
     va: usize,
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
-) -> Result<super::proc::ObjectMappingPlan, super::proc::ObjectMapFailure> {
+) -> Result<super::proc::MemoryChangePlan, super::proc::ObjectMapFailure> {
     // Tunnel 当前对外是单页，因而投影退化为长度为一的 span 序列；多页几何
     // 只需改变投影区间，不涉及本函数形状。对象 backing 属 MEMORY_OBJECT 锁阶，
     // 投影在进入 AddressSpace 前完成。
@@ -360,17 +360,33 @@ fn prepare_mapping(
         });
     }
     connection.core.backing.project(0, object_pages, &mut spans);
-    space.prepare_object_mapping(va, 0, &spans, authorization, permits)
+    space.plan_object_map(va, 0, &spans, authorization, permits)
 }
 
-fn rollback_mapping(
-    space: &mut AddressSpaceState,
-    prepared: PreparedObjectMapping,
-) -> (
-    Vec<memory_space::WritePermit>,
-    Vec<page_table::PreparedTranslation<crate::frame::FundedTableFrame>>,
+/// Commit 前放弃一份已 prepare 的 view 映射：摘出全部 owner，WritePermit 归还对象
+/// 状态机，已准备的 translation 与表页 owner 在 AddressSpace 锁外析构。Create/Attach
+/// 的每个提交前失败点都走这一条路径，不各自展开一份回滚序列。
+#[inline(never)]
+fn abandon_mapping(
+    space: &super::proc::AddressSpace,
+    connection: &Connection,
+    prepared: PreparedMemoryChange,
 ) {
-    space.rollback_object_mapping(prepared)
+    let (permits, reclaimed) = {
+        let mut guard = space.lock();
+        let mut reclaimed = guard.rollback_memory_change(prepared);
+        (reclaimed.take_permits(), reclaimed)
+    };
+    drop(reclaimed);
+    cancel_writes(connection, permits);
+}
+
+/// Commit 前放弃一份已 prepare 的 view 撤销事务。撤销不预留 WritePermit（旧 permit
+/// 随 retire 批次交回），因此只需归还 ledger reservation 与表页 owner。
+#[inline(never)]
+fn abandon_unmap(space: &super::proc::AddressSpace, prepared: PreparedMemoryChange) {
+    let reclaimed = space.lock().rollback_memory_change(prepared);
+    drop(reclaimed);
 }
 
 fn install_mapping(connection: &mut ConnectionState, side: usize, lease: ObjectMappingLease) {
@@ -402,6 +418,8 @@ fn commit_side_close(endpoint: &Endpoint, connection: &mut ConnectionState) -> O
     }
 }
 
+/// 退役 fragment 必须与 lease 记录的位置、对象内偏移与权限逐项一致；lease 本身
+/// 只是复核凭据，真值在账本。
 fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: RetiringFragment) {
     assert!(
         fragment.range == lease.range
@@ -409,11 +427,13 @@ fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: Retiring
             && matches!(
                 fragment.kind,
                 RegionKindView::Mapping {
-                    backing: BackingView::Object { object, offset: 0 },
-                    current: Protection::ReadWrite,
-                    maximum: Protection::ReadWrite,
-                    ..
+                    backing: BackingView::Object { object, offset },
+                    current,
+                    maximum,
                 } if object == lease.object
+                    && offset == lease.object_offset
+                    && current == lease.protection
+                    && maximum == lease.protection
             ),
         "Tunnel retire fragment does not match its lease"
     );
@@ -616,7 +636,8 @@ pub fn create(
                     .process
                     .space
                     .lock()
-                    .rollback_object_mapping_plan(plan);
+                    .rollback_memory_change_plan(plan)
+                    .take_permits();
                 cancel_writes(&connection, permits);
                 table
                     .rollback(reservation.take().expect("TunnelCreate reservation exists"))
@@ -625,7 +646,7 @@ pub fn create(
             }
         };
         let mut space = thread.process.space.lock();
-        match space.complete_object_mapping(plan, owners) {
+        match space.complete_object_change(plan, owners) {
             Ok(prepared) => Some(prepared),
             Err((failure, reclaimed)) => {
                 drop(space);
@@ -643,15 +664,11 @@ pub fn create(
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            let (permits, translation) = {
-                let mut space = thread.process.space.lock();
-                rollback_mapping(
-                    &mut space,
-                    mapping.take().expect("TunnelCreate mapping exists"),
-                )
-            };
-            drop(translation);
-            cancel_writes(&connection, permits);
+            abandon_mapping(
+                &thread.process.space,
+                &connection,
+                mapping.take().expect("TunnelCreate mapping exists"),
+            );
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                 .expect("TunnelCreate reservation must remain owned");
@@ -666,15 +683,11 @@ pub fn create(
     {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            let (permits, translation) = {
-                let mut space = thread.process.space.lock();
-                rollback_mapping(
-                    &mut space,
-                    mapping.take().expect("TunnelCreate mapping exists"),
-                )
-            };
-            drop(translation);
-            cancel_writes(&connection, permits);
+            abandon_mapping(
+                &thread.process.space,
+                &connection,
+                mapping.take().expect("TunnelCreate mapping exists"),
+            );
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                 .expect("TunnelCreate reservation must remain owned");
@@ -689,13 +702,12 @@ pub fn create(
         if let Err(error) =
             unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &pair) }
         {
-            let (permits, translation) = rollback_mapping(
-                &mut space,
+            drop(space);
+            abandon_mapping(
+                &thread.process.space,
+                &connection,
                 mapping.take().expect("TunnelCreate mapping exists"),
             );
-            drop(space);
-            drop(translation);
-            cancel_writes(&connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                 .expect("TunnelCreate reservation must remain owned");
@@ -711,7 +723,7 @@ pub fn create(
         false,
         true,
         |space| {
-            let (published, lease) = space.commit_object_mapping(
+            let (published, lease) = space.commit_view_map(
                 mapping
                     .take()
                     .expect("TunnelCreate mapping commits exactly once"),
@@ -733,17 +745,13 @@ pub fn create(
     let (published, synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            let (permits, translation) = {
-                let mut space = thread.process.space.lock();
-                rollback_mapping(
-                    &mut space,
-                    mapping
-                        .take()
-                        .expect("stale TunnelCreate mapping must roll back"),
-                )
-            };
-            drop(translation);
-            cancel_writes(&connection, permits);
+            abandon_mapping(
+                &thread.process.space,
+                &connection,
+                mapping
+                    .take()
+                    .expect("stale TunnelCreate mapping must roll back"),
+            );
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                 .expect("TunnelCreate reservation must remain owned");
@@ -862,7 +870,8 @@ pub fn attach(
                     .process
                     .space
                     .lock()
-                    .rollback_object_mapping_plan(plan);
+                    .rollback_memory_change_plan(plan)
+                    .take_permits();
                 cancel_writes(&invitation.connection, permits);
                 table
                     .rollback(reservation.take().expect("TunnelAttach reservation exists"))
@@ -871,7 +880,7 @@ pub fn attach(
             }
         };
         let mut space = thread.process.space.lock();
-        match space.complete_object_mapping(plan, owners) {
+        match space.complete_object_change(plan, owners) {
             Ok(prepared) => Some(prepared),
             Err((failure, reclaimed)) => {
                 drop(space);
@@ -889,15 +898,11 @@ pub fn attach(
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            let (permits, translation) = {
-                let mut space = thread.process.space.lock();
-                rollback_mapping(
-                    &mut space,
-                    mapping.take().expect("TunnelAttach mapping exists"),
-                )
-            };
-            drop(translation);
-            cancel_writes(&invitation.connection, permits);
+            abandon_mapping(
+                &thread.process.space,
+                &invitation.connection,
+                mapping.take().expect("TunnelAttach mapping exists"),
+            );
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                 .expect("TunnelAttach reservation must remain owned");
@@ -912,15 +917,11 @@ pub fn attach(
     {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            let (permits, translation) = {
-                let mut space = thread.process.space.lock();
-                rollback_mapping(
-                    &mut space,
-                    mapping.take().expect("TunnelAttach mapping exists"),
-                )
-            };
-            drop(translation);
-            cancel_writes(&invitation.connection, permits);
+            abandon_mapping(
+                &thread.process.space,
+                &invitation.connection,
+                mapping.take().expect("TunnelAttach mapping exists"),
+            );
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                 .expect("TunnelAttach reservation must remain owned");
@@ -934,13 +935,12 @@ pub fn attach(
         if let Err(error) =
             unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &endpoint_handle) }
         {
-            let (permits, translation) = rollback_mapping(
-                &mut space,
+            drop(space);
+            abandon_mapping(
+                &thread.process.space,
+                &invitation.connection,
                 mapping.take().expect("TunnelAttach mapping exists"),
             );
-            drop(space);
-            drop(translation);
-            cancel_writes(&invitation.connection, permits);
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                 .expect("TunnelAttach reservation must remain owned");
@@ -959,7 +959,7 @@ pub fn attach(
             let consumed = table
                 .remove(invitation_handle)
                 .expect("TunnelAttach invitation is pinned by the table lock");
-            let (published, lease) = space.commit_object_mapping(
+            let (published, lease) = space.commit_view_map(
                 mapping
                     .take()
                     .expect("TunnelAttach mapping commits exactly once"),
@@ -979,17 +979,13 @@ pub fn attach(
     let ((consumed, published), synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            let (permits, translation) = {
-                let mut space = thread.process.space.lock();
-                rollback_mapping(
-                    &mut space,
-                    mapping
-                        .take()
-                        .expect("stale TunnelAttach mapping must roll back"),
-                )
-            };
-            drop(translation);
-            cancel_writes(&invitation.connection, permits);
+            abandon_mapping(
+                &thread.process.space,
+                &invitation.connection,
+                mapping
+                    .take()
+                    .expect("stale TunnelAttach mapping must roll back"),
+            );
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                 .expect("TunnelAttach reservation must remain owned");
@@ -1032,14 +1028,14 @@ pub(crate) fn close_handle(
     let mut unmap = {
         let (plan, pool) = {
             let mut space = thread.process.space.lock();
-            let plan = space.prepare_object_unmap(lease).map_err(SystemCallError::from)?;
+            let plan = space.plan_object_unmap(lease).map_err(SystemCallError::from)?;
             let pool = Arc::clone(space.pool());
             (plan, pool)
         };
-        let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+        let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
-                thread.process.space.lock().rollback_object_unmap_plan(plan);
+                thread.process.space.lock().rollback_memory_change_plan(plan);
                 return Err(SystemCallError::from(error));
             }
         };
@@ -1048,7 +1044,7 @@ pub(crate) fn close_handle(
                 .process
                 .space
                 .lock()
-                .complete_object_unmap(plan, owners);
+                .complete_memory_change(plan, owners);
             match result {
                 Ok(prepared) => prepared,
                 Err((error, owners)) => {
@@ -1066,12 +1062,10 @@ pub(crate) fn close_handle(
     )) {
         Ok(retire) => retire,
         Err(_) => {
-            let translation = thread
-                .process
-                .space
-                .lock()
-                .rollback_object_unmap(unmap.take().expect("Tunnel close Unmap exists"));
-            drop(translation);
+            abandon_unmap(
+                &thread.process.space,
+                unmap.take().expect("Tunnel close Unmap exists"),
+            );
             return Err(SystemCallError::OutOfMemory);
         }
     };
@@ -1080,12 +1074,10 @@ pub(crate) fn close_handle(
         match prepare_memory_completion(thread.process.clone(), 0, Some(retire_sink), None) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let translation = thread
-                    .process
-                    .space
-                    .lock()
-                    .rollback_object_unmap(unmap.take().expect("Tunnel close Unmap exists"));
-                drop(translation);
+                abandon_unmap(
+                    &thread.process.space,
+                    unmap.take().expect("Tunnel close Unmap exists"),
+                );
                 return Err(error);
             }
         };
@@ -1097,12 +1089,10 @@ pub(crate) fn close_handle(
     {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            let translation = thread
-                .process
-                .space
-                .lock()
-                .rollback_object_unmap(unmap.take().expect("Tunnel close Unmap exists"));
-            drop(translation);
+            abandon_unmap(
+                &thread.process.space,
+                unmap.take().expect("Tunnel close Unmap exists"),
+            );
             return Err(map_shootdown_error(error));
         }
     };
@@ -1122,7 +1112,7 @@ pub(crate) fn close_handle(
                 .take()
                 .expect("Tunnel close lost its mapping lease");
             assert_eq!(installed, lease, "Tunnel close lease changed before Commit");
-            let published = space.commit_object_unmap(
+            let published = space.commit_change(
                 unmap
                     .take()
                     .expect("Tunnel close Unmap commits exactly once"),
@@ -1135,11 +1125,10 @@ pub(crate) fn close_handle(
     let ((entry, published), synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            let translation =
-                thread.process.space.lock().rollback_object_unmap(
-                    unmap.take().expect("stale Tunnel close must roll back"),
-                );
-            drop(translation);
+            abandon_unmap(
+                &thread.process.space,
+                unmap.take().expect("stale Tunnel close must roll back"),
+            );
             return Err(SystemCallError::ObjectBusy);
         }
     };
@@ -1194,7 +1183,7 @@ pub(crate) fn close_detached(
     );
     let (plan, pool) = {
         let mut space = owner.space.lock();
-        let plan = match space.prepare_object_unmap(lease) {
+        let plan = match space.plan_object_unmap(lease) {
             Ok(plan) => plan,
             Err(super::proc::SpaceError::Busy) => return Err(entry),
             Err(error) => panic!("detached Tunnel close invariant failed: {error:?}"),
@@ -1202,16 +1191,16 @@ pub(crate) fn close_detached(
         let pool = Arc::clone(space.pool());
         (plan, pool)
     };
-    let owners = match super::proc::supply_funded_table_frames(&pool, plan.table_budget()) {
+    let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
         Ok(owners) => owners,
         Err(_) => {
-            owner.space.lock().rollback_object_unmap_plan(plan);
+            owner.space.lock().rollback_memory_change_plan(plan);
             return Err(entry);
         }
     };
     let (prepared, mut space) = {
         let mut space = owner.space.lock();
-        match space.complete_object_unmap(plan, owners) {
+        match space.complete_memory_change(plan, owners) {
             Ok(prepared) => (prepared, space),
             Err((error, owners)) => {
                 drop(space);
@@ -1224,7 +1213,7 @@ pub(crate) fn close_detached(
         .take()
         .expect("detached Tunnel close lost its mapping lease");
     assert_eq!(installed, lease, "detached Tunnel close lease changed");
-    let published = space.commit_object_unmap(prepared);
+    let published = space.commit_change(prepared);
     let notice = commit_side_close(&endpoint, &mut connection_state);
     sink.install_notice(notice);
     let change = space.begin_retire_published_change(published);

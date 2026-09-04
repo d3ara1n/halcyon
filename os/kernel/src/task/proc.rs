@@ -44,7 +44,9 @@ pub const STACK_SIZE: usize = erhino_shared::proc::PROCESS_MAIN_STACK_SIZE;
 /// sv39 三级页表。
 const LEVELS: usize = 3;
 
-/// 进程地址空间构建/操作错误。
+/// 进程地址空间构建/操作错误。它是内核内部的唯一内存错误分类；公开 ABI 错误由
+/// [`SystemCallError::from`] 一次投影得到，纯逻辑规划器的 [`ChangeError`] 也先归到
+/// 这里，因此全系统只有一张分类表。
 #[derive(Debug)]
 pub enum SpaceError {
     /// 帧或表帧耗尽。
@@ -57,6 +59,10 @@ pub enum SpaceError {
     BadSegment,
     /// 映射冲突（重复装载同一区间）。
     Conflict,
+    /// 请求范围未被调用者可操作的 mapping/reservation 完整覆盖。
+    NotMapped,
+    /// authority 或权限上限不允许该操作。
+    PermissionDenied,
     /// 与其它在途 MemoryChange footprint 冲突。
     Busy,
     /// Building 空壳尚未附入 MemoryPool/TranslationTree。
@@ -73,8 +79,34 @@ impl From<SpaceError> for SystemCallError {
             SpaceError::ReachLimit => Self::ReachLimit,
             SpaceError::BadSegment => Self::IllegalArgument,
             SpaceError::Conflict => Self::AddressConflict,
+            SpaceError::NotMapped => Self::NotMapped,
+            SpaceError::PermissionDenied => Self::RightsDenied,
             SpaceError::Busy => Self::ObjectBusy,
             SpaceError::Unbound => Self::ObjectNotAvailable,
+        }
+    }
+}
+
+impl From<ChangeError> for SpaceError {
+    fn from(error: ChangeError) -> Self {
+        match error {
+            ChangeError::Conflict => Self::Conflict,
+            ChangeError::NotCovered | ChangeError::Guard => Self::NotMapped,
+            ChangeError::OwnerDenied | ChangeError::PermissionDenied => Self::PermissionDenied,
+            ChangeError::Busy | ChangeError::Stale => Self::Busy,
+            ChangeError::PageLimit
+            | ChangeError::RegionLimit
+            | ChangeError::TransactionLimit
+            | ChangeError::KeyExhausted => Self::ReachLimit,
+            ChangeError::AllocationFailed => Self::NoFrame,
+            ChangeError::BadLimits
+            | ChangeError::Range(_)
+            | ChangeError::OutOfBounds
+            | ChangeError::BackingOutOfRange
+            | ChangeError::ObjectAuthorization
+            | ChangeError::LeaseInvalid
+            | ChangeError::LeaseTooLarge
+            | ChangeError::PermitMismatch => Self::BadSegment,
         }
     }
 }
@@ -333,28 +365,6 @@ pub(crate) struct PublishedSpaceChange {
     backing_permits: Vec<super::resources::BackingSlicePermit>,
 }
 
-struct PreparedOwnedMapping {
-    backing: OwnedBacking,
-    change: PreparedChange,
-    translations: Vec<PreparedTranslation<frame::FundedTableFrame>>,
-    table_outcomes: Vec<TablePublishOutcome<frame::FundedTableFrame>>,
-    building_image_end: Option<usize>,
-}
-
-pub(crate) struct OwnedMappingPlan {
-    backing: OwnedBacking,
-    change: PreparedChange,
-    preflights: Vec<TranslationPreflight>,
-    building_image_end: Option<usize>,
-}
-
-pub(crate) fn fund_owned_mapping(
-    pool: &Arc<super::memory_pool::MemoryPool>,
-    plan: &OwnedMappingPlan,
-) -> Result<Vec<Vec<frame::FundedTableFrame>>, SpaceError> {
-    fund_table_preflights(pool, &plan.preflights)
-}
-
 struct PinnedWriteChunk {
     physical: usize,
     result_offset: usize,
@@ -367,33 +377,61 @@ struct PinnedMapResult {
     cookie: u64,
 }
 
-struct UserMemoryPlan {
+/// 统一地址空间事务的 plan 阶段：Validate 之后、表页供给之前的账本 reservation
+/// 与 PTE preflight。四个维度由字段存在性表达，不再每种组合各自成型：
+/// source（`backing` 有无）、output（`result` cookie 有无）、Unmap 切分预算
+/// （`backing_permits`）与 Building 的映像推进（`image_end`）。
+pub(crate) struct MemoryChangePlan {
     change: PreparedChange,
-    backing: Option<OwnedBacking>,
     preflights: Vec<TranslationPreflight>,
+    backing: Option<OwnedBacking>,
     result: Option<PinnedMapResult>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
+    image_end: Option<usize>,
+    /// 本事务在 Commit 时发布的新 object view 身份；撤销既有 view 不产生它。
+    published_view: Option<ObjectMappingLease>,
 }
 
-/// AddressSpace 锁内失败时摘出的 funded table owner。调用者必须在锁外析构。
+impl MemoryChangePlan {
+    /// 表页供给按段进行：每个 preflight 各自预算，多 extent 与多段投影同形。
+    pub(crate) fn preflights(&self) -> &[TranslationPreflight] {
+        &self.preflights
+    }
+}
+
+struct MemoryChangeReservation {
+    change: PreparedChange,
+    translations: Vec<PreparedTranslation<frame::FundedTableFrame>>,
+    table_outcomes: Vec<TablePublishOutcome<frame::FundedTableFrame>>,
+    backing: Option<OwnedBacking>,
+    result: Option<PinnedMapResult>,
+    backing_permits: Vec<super::resources::BackingSlicePermit>,
+    image_end: Option<usize>,
+    published_view: Option<ObjectMappingLease>,
+}
+
+/// Commit 前的唯一发布权。盒化使深层事务不把整份 reservation 留在调用栈上。
+pub(crate) struct PreparedMemoryChange(Box<Option<MemoryChangeReservation>>);
+
+/// AddressSpace 锁内失败时摘出、必须由调用者在锁外归还的 affine owner。
+/// 每种事务输入各有一格：表页 owner、已准备的 translation、backing、WritePermit。
 pub(crate) struct ReclaimedTableFrames {
     funded: Vec<Vec<frame::FundedTableFrame>>,
     translations: Vec<PreparedTranslation<frame::FundedTableFrame>>,
     failed_owners: Option<Vec<frame::FundedTableFrame>>,
     backing: Option<OwnedBacking>,
+    permits: Vec<WritePermit>,
 }
 
-struct UserMemoryReservation {
-    change: PreparedChange,
-    backing: Option<OwnedBacking>,
-    translations: Vec<PreparedTranslation<frame::FundedTableFrame>>,
-    table_outcomes: Vec<TablePublishOutcome<frame::FundedTableFrame>>,
-    result: Option<PinnedMapResult>,
-    backing_permits: Vec<super::resources::BackingSlicePermit>,
+impl ReclaimedTableFrames {
+    /// 摘出 WritePermit 交回来源对象。permits 必须在 AddressSpace 锁外归还，
+    /// 因为对象状态锁的秩低于 AddressSpace。
+    pub(crate) fn take_permits(&mut self) -> Vec<WritePermit> {
+        core::mem::take(&mut self.permits)
+    }
 }
 
-struct PreparedUserMemory(Box<Option<UserMemoryReservation>>);
-
+/// 一个已发布 object view 在本地址空间的位置与身份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObjectMappingLease {
     pub(crate) lease: LeaseKey,
@@ -401,109 +439,38 @@ pub(crate) struct ObjectMappingLease {
     pub(crate) range: LedgerPageRange,
     pub(crate) object: ObjectId,
     pub(crate) object_offset: usize,
+    /// view 的当前权限，与 ledger 中的 current/maximum 一致。
+    pub(crate) protection: Protection,
 }
 
-struct ObjectMappingReservation {
-    change: PreparedChange,
-    translations: Vec<PreparedTranslation<frame::FundedTableFrame>>,
-    table_outcomes: Vec<TablePublishOutcome<frame::FundedTableFrame>>,
-    lease: ObjectMappingLease,
-}
-
-pub(crate) struct ObjectMappingPlan {
-    change: PreparedChange,
-    preflights: Vec<TranslationPreflight>,
-    lease: ObjectMappingLease,
-}
-
-impl ObjectMappingPlan {
-    /// 表页供给按段进行：每个 preflight 各自预算，与匿名多 extent 映射同形。
-    pub(crate) fn preflights(&self) -> &[TranslationPreflight] {
-        &self.preflights
-    }
-}
-
-pub(crate) struct PreparedObjectMapping(Box<Option<ObjectMappingReservation>>);
-
-impl PreparedObjectMapping {
-    fn allocate() -> Result<Self, SpaceError> {
-        Box::try_new(None)
-            .map(Self)
-            .map_err(|_| SpaceError::NoFrame)
-    }
-
-    fn install(&mut self, reservation: ObjectMappingReservation) {
-        let previous = self.0.replace(reservation);
-        assert!(previous.is_none(), "object mapping token filled twice");
-    }
-
-    fn take(mut self) -> ObjectMappingReservation {
-        self.0.take().expect("object mapping token consumed twice")
-    }
-}
-
+/// 对象事务失败：错误与原样退回的 WritePermit 一同交回调用者，由它在
+/// AddressSpace 锁外归还给对象状态机。
 pub(crate) struct ObjectMapFailure {
     pub(crate) error: SpaceError,
     pub(crate) permits: Vec<WritePermit>,
 }
 
-struct ObjectUnmapReservation {
-    change: PreparedChange,
-    translations: Vec<PreparedTranslation<frame::FundedTableFrame>>,
-    table_outcomes: Vec<TablePublishOutcome<frame::FundedTableFrame>>,
-}
-
-pub(crate) struct PreparedObjectUnmap(Box<Option<ObjectUnmapReservation>>);
-
-impl PreparedObjectUnmap {
+impl PreparedMemoryChange {
     fn allocate() -> Result<Self, SpaceError> {
         Box::try_new(None)
             .map(Self)
             .map_err(|_| SpaceError::NoFrame)
     }
 
-    fn install(&mut self, reservation: ObjectUnmapReservation) {
+    fn install(&mut self, reservation: MemoryChangeReservation) {
         let previous = self.0.replace(reservation);
-        assert!(previous.is_none(), "object unmap token filled twice");
+        assert!(previous.is_none(), "memory change token filled twice");
     }
 
-    fn take(mut self) -> ObjectUnmapReservation {
-        self.0.take().expect("object unmap token consumed twice")
-    }
-}
-
-pub(crate) struct ObjectUnmapPlan {
-    change: PreparedChange,
-    preflight: TranslationPreflight,
-}
-
-impl ObjectUnmapPlan {
-    pub(crate) fn table_budget(&self) -> usize {
-        self.preflight.required_frames()
-    }
-}
-
-impl PreparedUserMemory {
-    fn allocate() -> Result<Self, SystemCallError> {
-        Box::try_new(None)
-            .map(Self)
-            .map_err(|_| SystemCallError::OutOfMemory)
-    }
-
-    fn install(&mut self, reservation: UserMemoryReservation) {
-        let previous = self.0.replace(reservation);
-        assert!(previous.is_none(), "user memory token filled twice");
-    }
-
-    fn get(&self) -> &UserMemoryReservation {
+    fn get(&self) -> &MemoryChangeReservation {
         self.0
             .as_ref()
             .as_ref()
-            .expect("user memory token must be filled")
+            .expect("memory change token must be filled")
     }
 
-    fn take(mut self) -> UserMemoryReservation {
-        self.0.take().expect("user memory token consumed twice")
+    fn take(mut self) -> MemoryChangeReservation {
+        self.0.take().expect("memory change token consumed twice")
     }
 }
 
@@ -826,56 +793,14 @@ fn protection_flags(protection: Protection) -> u64 {
     }
 }
 
-fn map_change_error(error: ChangeError) -> SpaceError {
-    match error {
-        ChangeError::Conflict | ChangeError::NotCovered | ChangeError::Guard => {
-            SpaceError::Conflict
-        }
-        ChangeError::Busy => SpaceError::Busy,
-        ChangeError::RegionLimit
-        | ChangeError::TransactionLimit
-        | ChangeError::KeyExhausted
-        | ChangeError::PageLimit => SpaceError::ReachLimit,
-        ChangeError::AllocationFailed => SpaceError::NoFrame,
-        ChangeError::BadLimits
-        | ChangeError::Range(_)
-        | ChangeError::OutOfBounds
-        | ChangeError::OwnerDenied
-        | ChangeError::PermissionDenied
-        | ChangeError::BackingOutOfRange
-        | ChangeError::ObjectAuthorization
-        | ChangeError::LeaseInvalid
-        | ChangeError::LeaseTooLarge
-        | ChangeError::PermitMismatch
-        | ChangeError::Stale => SpaceError::BadSegment,
-    }
-}
-
-fn map_public_change_error(error: ChangeError) -> SystemCallError {
-    match error {
-        ChangeError::Conflict => SystemCallError::AddressConflict,
-        ChangeError::NotCovered | ChangeError::Guard => SystemCallError::NotMapped,
-        ChangeError::Busy | ChangeError::Stale => SystemCallError::ObjectBusy,
-        ChangeError::PermissionDenied | ChangeError::OwnerDenied => SystemCallError::RightsDenied,
-        ChangeError::PageLimit
-        | ChangeError::RegionLimit
-        | ChangeError::TransactionLimit
-        | ChangeError::KeyExhausted => SystemCallError::ReachLimit,
-        ChangeError::AllocationFailed => SystemCallError::OutOfMemory,
-        ChangeError::BadLimits
-        | ChangeError::Range(_)
-        | ChangeError::OutOfBounds
-        | ChangeError::BackingOutOfRange
-        | ChangeError::ObjectAuthorization
-        | ChangeError::LeaseInvalid
-        | ChangeError::LeaseTooLarge
-        | ChangeError::PermitMismatch => SystemCallError::IllegalArgument,
-    }
+/// 纯逻辑规划器错误的公开投影：经 `SpaceError` 的单一分类表推导，不另建一张表。
+fn public_change_error(error: ChangeError) -> SystemCallError {
+    SpaceError::from(error).into()
 }
 
 /// Validate 之后的内部边界：公开 Map/Unmap/Protect 已在 Validate 阶段拒绝非法
 /// 参数，此后出现的 `BadSegment` 是内核不变量失败而不是调用者过错。
-fn map_public_space_error(error: SpaceError) -> SystemCallError {
+fn post_validate_error(error: SpaceError) -> SystemCallError {
     match error {
         SpaceError::BadSegment => SystemCallError::InternalError,
         other => other.into(),
@@ -960,13 +885,13 @@ impl AddressSpaceState {
         Ok(())
     }
 
-    pub(crate) fn plan_anonymous_mapping(
+    pub(crate) fn plan_building_mapping(
         &mut self,
         vaddr: usize,
         len: usize,
         permissions: ProcessMapFlags,
         prepared: PreparedBacking,
-    ) -> Result<OwnedMappingPlan, BackingPlanFailure<SpaceError>> {
+    ) -> Result<MemoryChangePlan, BackingPlanFailure<SpaceError>> {
         let bound = match self.bound_mut() {
             Ok(bound) => bound,
             Err(error) => return Err(BackingPlanFailure::Prepared(error, prepared)),
@@ -974,9 +899,9 @@ impl AddressSpaceState {
         bound.plan_building_anonymous(vaddr, len, permissions, prepared)
     }
 
-    pub(crate) fn complete_anonymous_mapping(
+    pub(crate) fn complete_bound_mapping(
         &mut self,
-        plan: OwnedMappingPlan,
+        plan: MemoryChangePlan,
         funded: Vec<Vec<frame::FundedTableFrame>>,
     ) -> Result<PublishedTableChanges, (SpaceError, ReclaimedTableFrames)> {
         let bound = match self.bound_mut() {
@@ -986,19 +911,20 @@ impl AddressSpaceState {
                     Memory,
                     "unexpected anonymous mapping completion in an unbound address space"
                 );
-                let OwnedMappingPlan { backing, .. } = plan;
+                let MemoryChangePlan { backing, .. } = plan;
                 return Err((
                     error,
                     ReclaimedTableFrames {
                         funded,
                         translations: Vec::new(),
                         failed_owners: None,
-                        backing: Some(backing),
+                        backing,
+            permits: Vec::new(),
                     },
                 ));
             }
         };
-        bound.complete_anonymous_mapping(plan, funded)
+        bound.complete_bound_mapping(plan, funded)
     }
 
     pub fn write_building(&mut self, target: usize, source: &[u8]) -> Result<(), SpaceError> {
@@ -1357,26 +1283,21 @@ impl AddressSpace {
         self.state.lock()
     }
 
+    /// Building/bootstrap 共用的后半段：锁外供给表页后同步完成事务。
     fn complete_building_plan(
         &self,
-        plan: OwnedMappingPlan,
+        plan: MemoryChangePlan,
         pool: Arc<super::memory_pool::MemoryPool>,
     ) -> Result<(), SpaceError> {
-        let funded = match fund_owned_mapping(&pool, &plan) {
+        let funded = match fund_table_preflights(&pool, plan.preflights()) {
             Ok(funded) => funded,
             Err(error) => {
-                let reclaimed = self.lock().rollback_owned_mapping_plan(plan);
+                let reclaimed = self.lock().rollback_memory_change_plan(plan);
                 drop(reclaimed);
                 return Err(error);
             }
         };
-        let completed = {
-            let result = self.lock().complete_anonymous_mapping(plan, funded);
-            match result {
-                Ok(released) => Ok(released),
-                Err((error, reclaimed)) => Err((error, reclaimed)),
-            }
-        };
+        let completed = self.lock().complete_bound_mapping(plan, funded);
         match completed {
             Ok(released) => {
                 drop(released);
@@ -1407,9 +1328,9 @@ impl AddressSpace {
             let bound = state
                 .bound_mut()
                 .expect("building backing validation lost its bound address space");
-            bound.plan_owned_anonymous_mapping(vaddr, len, protection, prepared)
+            bound.plan_bound_anonymous_mapping(vaddr, len, protection, image_end, prepared)
         };
-        let mut plan = match plan_result {
+        let plan = match plan_result {
             Ok(plan) => plan,
             Err(BackingPlanFailure::Prepared(error, backing)) => {
                 drop(backing);
@@ -1420,7 +1341,6 @@ impl AddressSpace {
                 return Err(error);
             }
         };
-        plan.building_image_end = image_end;
         self.complete_building_plan(plan, pool)
     }
 
@@ -1487,7 +1407,7 @@ impl AddressSpace {
             )
         };
         let prepared_prefix = PreparedBacking::allocate(prefix_pages, &pool, &sponsor)?;
-        let plan_result: Result<OwnedMappingPlan, BackingPlanFailure<SpaceError>> = (|| {
+        let plan_result: Result<MemoryChangePlan, BackingPlanFailure<SpaceError>> = (|| {
             let mut state = self.lock();
             let bound = state
                 .bound_mut()
@@ -1507,11 +1427,12 @@ impl AddressSpace {
                 backing.pages = pages;
             }
             backing.write_from_start(prefix);
-            bound.plan_owned_mapping(
+            bound.plan_bound_anonymous(
                 base,
                 Protection::ReadOnly,
                 AnonymousClass::Data,
                 RegionOwner::Lease(lease),
+                Some(end),
                 backing,
             )
         })();
@@ -1526,37 +1447,9 @@ impl AddressSpace {
                 return Err(error);
             }
         };
-        let funded = match fund_owned_mapping(&pool, &plan) {
-            Ok(funded) => funded,
-            Err(error) => {
-                let reclaimed = self.lock().rollback_owned_mapping_plan(plan);
-                drop(reclaimed);
-                return Err(error);
-            }
-        };
-        let completed = {
-            let mut state = self.lock();
-            let bound = state
-                .bound_mut()
-                .expect("bootstrap mapping completion lost its bound address space");
-            match bound.complete_owned_mapping(plan, funded) {
-                Ok(prepared) => {
-                    let published = bound.commit_owned_mapping(prepared);
-                    bound.image_end = end;
-                    Ok(bound.finish_empty_published_change(published))
-                }
-                Err((error, reclaimed)) => Err((error, reclaimed)),
-            }
-        };
-        match completed {
-            Ok(released) => {
-                drop(released);
-                Ok(base)
-            }
-            Err((error, reclaimed)) => {
-                drop(reclaimed);
-                Err(error)
-            }
+        match self.complete_building_plan(plan, pool) {
+            Ok(()) => Ok(base),
+            Err(error) => Err(error),
         }
     }
 
@@ -1726,24 +1619,106 @@ fn public_page_range(address: u64, bytes: u64) -> Result<LedgerPageRange, System
     LedgerPageRange::new(address, bytes).map_err(|_| SystemCallError::IllegalArgument)
 }
 
-fn start_user_memory_change(
+/// 公开 `MemoryMap` 请求的一次性解析结果。ABI 整数 → 内部类型的转换只在进入
+/// AddressSpace 前做一次；Validate 预检与 Reserve 复检都消费同一份 intent，不各自
+/// 重建一套参数规则。
+pub(crate) struct AnonymousMapIntent {
+    bytes: usize,
+    guard_before: usize,
+    guard_after: usize,
+    placement: MapPlacement,
+    protection: Protection,
+    result_range: AddressRange,
+    cookie: u64,
+}
+
+impl AnonymousMapIntent {
+    fn parse(request: MemoryMapRequest) -> Result<Self, SystemCallError> {
+        let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
+        if bytes == 0 {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let guard_before =
+            usize::try_from(request.guard_before).map_err(|_| SystemCallError::IllegalArgument)?;
+        let guard_after =
+            usize::try_from(request.guard_after).map_err(|_| SystemCallError::IllegalArgument)?;
+        let result_address = usize::try_from(request.result_address)
+            .map_err(|_| SystemCallError::IllegalArgument)?;
+        let protection = MemoryProtection::from_raw(request.protection)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        // 运行期匿名映射只产生数据权限；可执行字节必须经 MemoryObject 发布。
+        if protection == MemoryProtection::ReadExecute {
+            return Err(SystemCallError::RightsDenied);
+        }
+        let placement = match MemoryPlacement::from_raw(request.placement)
+            .ok_or(SystemCallError::IllegalArgument)?
+        {
+            MemoryPlacement::Anywhere if request.address == 0 => MapPlacement::Anywhere,
+            MemoryPlacement::FixedEmpty => MapPlacement::FixedEmpty {
+                usable_start: usize::try_from(request.address)
+                    .map_err(|_| SystemCallError::IllegalArgument)?,
+            },
+            MemoryPlacement::Anywhere => return Err(SystemCallError::IllegalArgument),
+        };
+        let result_range =
+            AddressRange::new(result_address, core::mem::size_of::<MemoryMapResult>())
+                .map_err(|_| SystemCallError::IllegalArgument)?;
+        Ok(Self {
+            bytes,
+            guard_before,
+            guard_after,
+            placement,
+            protection: public_protection(protection),
+            result_range,
+            cookie: request.cookie,
+        })
+    }
+
+    fn pages(&self) -> usize {
+        self.bytes.div_ceil(PAGE_SIZE)
+    }
+}
+
+/// 事务完成后向调用者交付的东西。Map 的结果槽在 Commit 内发布；其余变更
+/// 只有完成语义，无输出。
+enum ChangeOutput {
+    /// Map：Commit 内先写 payload 再以 release 发布 cookie；结果义务随线程。
+    MapResult(super::thread::ThreadResultObligation),
+    /// Unmap/Protect：只有完成边界，无结果槽。
+    None,
+}
+
+/// 启动 Running 进程自有地址空间变更的后半段：预留 completion 与全部 Remote 槽，
+/// 在 execution gate 内 Commit，锁外敲门铃。
+///
+/// `instruction` 是真实的物理维度（是否需要推进 instruction epoch 与 `FENCE.I`），
+/// 不是调用点区分开关；output 区分 Map 结果槽与纯完成语义。
+fn start_running_memory_change(
     process: Arc<Process>,
-    mut prepared: Option<PreparedUserMemory>,
+    mut prepared: Option<PreparedMemoryChange>,
     shootdown_range: LedgerPageRange,
     instruction: bool,
-    write_map_payload: bool,
-    value: usize,
-    result_obligation: Option<super::thread::ThreadResultObligation>,
+    output: ChangeOutput,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let writes_map_payload = matches!(output, ChangeOutput::MapResult(_));
+    let result_obligation = match output {
+        ChangeOutput::MapResult(obligation) => Some(obligation),
+        ChangeOutput::None => None,
+    };
+    macro_rules! rollback {
+        ($reason:literal) => {{
+            let reclaimed = process
+                .space
+                .lock()
+                .rollback_memory_change(prepared.take().expect($reason));
+            drop(reclaimed);
+        }};
+    }
     let (completion, plan) =
-        match prepare_memory_completion(process.clone(), value, None, result_obligation) {
+        match prepare_memory_completion(process.clone(), 0, None, result_obligation) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let reclaimed = process
-                    .space
-                    .lock()
-                    .rollback_user_memory(prepared.take().expect("memory change must roll back"));
-                drop(reclaimed);
+                rollback!("memory change must roll back");
                 return Err(error);
             }
         };
@@ -1751,19 +1726,15 @@ fn start_user_memory_change(
     let shootdown = match process.space.prepare_shootdown(&process.lifecycle, sink) {
         Ok(shootdown) => shootdown,
         Err(error) => {
-            let reclaimed = process
-                .space
-                .lock()
-                .rollback_user_memory(prepared.take().expect("memory change must roll back"));
-            drop(reclaimed);
+            rollback!("memory change must roll back");
             return Err(map_shootdown_error(error));
         }
     };
-    if write_map_payload {
+    if writes_map_payload {
         process
             .space
             .lock()
-            .write_user_map_payload(prepared.as_ref().expect("Map reservation must exist"));
+            .write_map_payload(prepared.as_ref().expect("Map reservation must exist"));
     }
 
     let committed = process.space.commit_shootdown(
@@ -1774,7 +1745,7 @@ fn start_user_memory_change(
         instruction,
         true,
         |state| {
-            state.commit_user_memory(
+            state.commit_change(
                 prepared
                     .take()
                     .expect("user memory change commits exactly once"),
@@ -1784,11 +1755,7 @@ fn start_user_memory_change(
     let (published, synchronization) = match committed {
         Ok(committed) => committed,
         Err(_) => {
-            let reclaimed = process
-                .space
-                .lock()
-                .rollback_user_memory(prepared.take().expect("stale change must roll back"));
-            drop(reclaimed);
+            rollback!("stale change must roll back");
             return Err(SystemCallError::ObjectBusy);
         }
     };
@@ -1803,7 +1770,7 @@ pub(crate) fn memory_map(
     request_ptr: usize,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
     let process = thread.process.clone();
-    let (request, pool, sponsor) = {
+    let (intent, pool, sponsor) = {
         let mut space = process.space.lock();
         // SAFETY: MemoryMapRequest 只含整数且无 padding，任意位型均有效。
         let request: MemoryMapRequest =
@@ -1824,25 +1791,19 @@ pub(crate) fn memory_map(
         if initial.reserved != [0; 3] || initial.committed != 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
-        if bytes == 0 {
-            return Err(SystemCallError::IllegalArgument);
-        }
-        space.validate_user_map_request(request)?;
+        let intent = AnonymousMapIntent::parse(request)?;
+        space.validate_user_map(&intent)?;
         (
-            request,
+            intent,
             Arc::clone(space.pool()),
             Arc::clone(space.sponsor()),
         )
     };
-    let pages = usize::try_from(request.bytes)
-        .map_err(|_| SystemCallError::IllegalArgument)?
-        .div_ceil(PAGE_SIZE);
-    let backing =
-        PreparedBacking::allocate(pages, &pool, &sponsor).map_err(map_public_space_error)?;
+    let backing = PreparedBacking::allocate(intent.pages(), &pool, &sponsor)
+        .map_err(post_validate_error)?;
     let plan_result = {
         let mut space = process.space.lock();
-        space.plan_user_map(request, backing)
+        space.plan_user_map(&intent, backing)
     };
     let plan = match plan_result {
         Ok(plan) => plan,
@@ -1855,102 +1816,64 @@ pub(crate) fn memory_map(
             return Err(error);
         }
     };
-    let funded = match fund_table_preflights(&pool, &plan.preflights) {
-        Ok(funded) => funded,
-        Err(error) => {
-            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
-            drop(reclaimed);
-            return Err(map_public_space_error(error));
-        }
-    };
-    let prepared = {
-        let result = process.space.lock().complete_user_memory(plan, funded);
-        match result {
-            Ok(prepared) => prepared,
-            Err((error, reclaimed)) => {
-                drop(reclaimed);
-                return Err(error);
-            }
-        }
-    };
+    let prepared = fund_and_complete_running(&process, plan)?;
     let layout = prepared
         .get()
         .change
         .map_result()
         .expect("Map reservation must retain its layout");
-    start_user_memory_change(
+    start_running_memory_change(
         process,
         Some(prepared),
         layout.reservation,
         false,
-        true,
-        0,
-        Some(thread.result_obligation()),
+        ChangeOutput::MapResult(thread.result_obligation()),
     )
 }
 
 /// 精确解除当前 Running process 的普通 mapping/reservation。
 pub(crate) fn memory_unmap(
-    thread: &Thread,
+    _thread: &Thread,
     address: u64,
     bytes: u64,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let process = thread.process.clone();
+    let process = _thread.process.clone();
     let range = public_page_range(address, bytes)?;
-    let (mut plan, pool, sponsor) = {
+    let (mut plan, sponsor) = {
         let mut space = process.space.lock();
         let plan = space.prepare_user_unmap(range)?;
-        let pool = Arc::clone(space.pool());
         let sponsor = Arc::clone(space.sponsor());
-        (plan, pool, sponsor)
+        (plan, sponsor)
     };
     plan.backing_permits = match reserve_backing_split_metadata(&sponsor) {
         Ok(permits) => permits,
         Err(error) => {
-            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
+            let reclaimed = process.space.lock().rollback_memory_change_plan(plan);
             drop(reclaimed);
-            return Err(map_public_space_error(error));
+            return Err(post_validate_error(error));
         }
     };
-    let funded = match fund_table_preflights(&pool, &plan.preflights) {
-        Ok(funded) => funded,
-        Err(error) => {
-            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
-            drop(reclaimed);
-            return Err(map_public_space_error(error));
-        }
-    };
-    let prepared = {
-        let result = process.space.lock().complete_user_memory(plan, funded);
-        match result {
-            Ok(prepared) => prepared,
-            Err((error, reclaimed)) => {
-                drop(reclaimed);
-                return Err(error);
-            }
-        }
-    };
-    start_user_memory_change(process, Some(prepared), range, false, false, 0, None)
+    let prepared = fund_and_complete_running(&process, plan)?;
+    start_running_memory_change(process, Some(prepared), range, false, ChangeOutput::None)
 }
 
 /// 在创建时冻结的最大权限内改变当前 mapping 权限。
 pub(crate) fn memory_protect(
-    thread: &Thread,
+    _thread: &Thread,
     address: u64,
     bytes: u64,
     protection: usize,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let process = thread.process.clone();
+    let process = _thread.process.clone();
     let range = public_page_range(address, bytes)?;
     let raw = u32::try_from(protection).map_err(|_| SystemCallError::IllegalArgument)?;
     let protection = MemoryProtection::from_raw(raw).ok_or(SystemCallError::IllegalArgument)?;
     let protection = public_protection(protection);
-    let (plan, pool) = {
+    let plan = {
         let mut space = process.space.lock();
-        let plan = space.prepare_user_protect(range, protection)?;
-        let pool = Arc::clone(space.pool());
-        (plan, pool)
+        space.prepare_user_protect(range, protection)?
     };
+    // 只有进出可执行权限的变更需要 instruction epoch 与 `FENCE.I`。
     let instruction = plan.change.translation_intents().iter().any(|intent| {
         matches!(
             intent,
@@ -1958,25 +1881,33 @@ pub(crate) fn memory_protect(
                 if *from == Protection::ReadExecute || *to == Protection::ReadExecute
         )
     });
-    let funded = match fund_table_preflights(&pool, &plan.preflights) {
+    let prepared = fund_and_complete_running(&process, plan)?;
+    start_running_memory_change(process, Some(prepared), range, instruction, ChangeOutput::None)
+}
+
+/// 锁外取得表页后重入 AddressSpace 完成 reservation。三个公开入口共用同一段：
+/// 表页供给与完成失败都在 Commit 前，因而只需锁外析构摘出的 owner。
+fn fund_and_complete_running(
+    process: &Arc<Process>,
+    plan: MemoryChangePlan,
+) -> Result<PreparedMemoryChange, SystemCallError> {
+    let pool = Arc::clone(process.space.lock().pool());
+    let funded = match fund_table_preflights(&pool, plan.preflights()) {
         Ok(funded) => funded,
         Err(error) => {
-            let reclaimed = process.space.lock().rollback_user_memory_plan(plan);
+            let reclaimed = process.space.lock().rollback_memory_change_plan(plan);
             drop(reclaimed);
-            return Err(map_public_space_error(error));
+            return Err(post_validate_error(error));
         }
     };
-    let prepared = {
-        let result = process.space.lock().complete_user_memory(plan, funded);
-        match result {
-            Ok(prepared) => prepared,
-            Err((error, reclaimed)) => {
-                drop(reclaimed);
-                return Err(error);
-            }
+    let result = process.space.lock().complete_memory_change(plan, funded);
+    match result {
+        Ok(prepared) => Ok(prepared),
+        Err((error, reclaimed)) => {
+            drop(reclaimed);
+            Err(post_validate_error(error))
         }
-    };
-    start_user_memory_change(process, Some(prepared), range, instruction, false, 0, None)
+    }
 }
 
 /// 地址空间可变状态：MemorySpace ledger、anonymous backing、页表树与有界 drain
@@ -2015,7 +1946,7 @@ impl BoundAddressSpace {
         mm::install_kernel_top_level(&mut tree);
         let satp = (8usize << 60) | tree.satp_ppn();
         let bounds = LedgerPageRange::new(0, USER_TOP).map_err(|_| SpaceError::BadSegment)?;
-        let ledger = MemorySpace::new(bounds, MEMORY_SPACE_LIMITS).map_err(map_change_error)?;
+        let ledger = MemorySpace::new(bounds, MEMORY_SPACE_LIMITS).map_err(SpaceError::from)?;
         Box::try_new(Self {
             tree: Some(tree),
             binding: Some(binding),
@@ -2145,66 +2076,49 @@ impl BoundAddressSpace {
         })
     }
 
-    fn validate_user_map_request(
-        &mut self,
-        request: MemoryMapRequest,
-    ) -> Result<(), SystemCallError> {
-        self.ensure_table_transaction_available()
-            .map_err(map_public_space_error)?;
-        let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
-        let guard_before =
-            usize::try_from(request.guard_before).map_err(|_| SystemCallError::IllegalArgument)?;
-        let guard_after =
-            usize::try_from(request.guard_after).map_err(|_| SystemCallError::IllegalArgument)?;
-        let result_address = usize::try_from(request.result_address)
-            .map_err(|_| SystemCallError::IllegalArgument)?;
-        let protection = MemoryProtection::from_raw(request.protection)
-            .ok_or(SystemCallError::IllegalArgument)?;
-        if protection == MemoryProtection::ReadExecute {
-            return Err(SystemCallError::RightsDenied);
-        }
-        let placement = match MemoryPlacement::from_raw(request.placement)
-            .ok_or(SystemCallError::IllegalArgument)?
-        {
-            MemoryPlacement::Anywhere if request.address == 0 => MapPlacement::Anywhere,
-            MemoryPlacement::FixedEmpty => MapPlacement::FixedEmpty {
-                usable_start: usize::try_from(request.address)
-                    .map_err(|_| SystemCallError::IllegalArgument)?,
+    /// 建立与 `intent` 一致的 ledger 请求。Validate 预检与 Reserve 复检共用它，
+    /// 因此两次道口不会因各自组装而失步。
+    fn anonymous_map_request(
+        intent: &AnonymousMapIntent,
+        identity: BackingId,
+    ) -> MapRequest {
+        MapRequest {
+            bytes: intent.bytes,
+            guard_before: intent.guard_before,
+            guard_after: intent.guard_after,
+            placement: intent.placement,
+            current: intent.protection,
+            maximum: intent.protection,
+            owner: RegionOwner::AddressSpace,
+            backing: MapBacking::Anonymous {
+                identity,
+                class: AnonymousClass::Data,
             },
-            MemoryPlacement::Anywhere => return Err(SystemCallError::IllegalArgument),
-        };
-        let result_range =
-            AddressRange::new(result_address, core::mem::size_of::<MemoryMapResult>())
-                .map_err(|_| SystemCallError::IllegalArgument)?;
-        let identity = BackingId::new(self.next_backing).ok_or(SystemCallError::OutOfMemory)?;
-        let protection = public_protection(protection);
-        let _ = self
-            .ledger()
-            .validate_map(MapRequest {
-                bytes,
-                guard_before,
-                guard_after,
-                placement,
-                current: protection,
-                maximum: protection,
-                owner: RegionOwner::AddressSpace,
-                backing: MapBacking::Anonymous {
-                    identity,
-                    class: AnonymousClass::Data,
-                },
-                result: Some(memory_space::UserWriteLeaseRequest {
-                    range: result_range,
-                }),
-            })
-            .map_err(map_public_change_error)?;
-        Ok(())
+            result: Some(memory_space::UserWriteLeaseRequest {
+                range: intent.result_range,
+            }),
+        }
     }
 
+    /// 取得 backing 前的预检：确认几何、authority 与结果槽合法，不预留任何
+    /// 资源。真正的事务在锁外取得 Pool/metadata 后由 `plan_user_map` 复检。
+    fn validate_user_map(&mut self, intent: &AnonymousMapIntent) -> Result<(), SystemCallError> {
+        self.ensure_table_transaction_available()
+            .map_err(post_validate_error)?;
+        let identity = BackingId::new(self.next_backing).ok_or(SystemCallError::OutOfMemory)?;
+        self.ledger()
+            .validate_map(Self::anonymous_map_request(intent, identity))
+            .map_err(public_change_error)
+            .map(|_| ())
+    }
+
+    /// 从已解析 intent 建立公开 anonymous Map 事务。参数解析已在锁外完成（
+    /// [`AnonymousMapIntent::parse`]），本函数只做锁内复检与资源组装。
     fn plan_user_map(
         &mut self,
-        request: MemoryMapRequest,
+        intent: &AnonymousMapIntent,
         prepared_backing: PreparedBacking,
-    ) -> Result<UserMemoryPlan, BackingPlanFailure<SystemCallError>> {
+    ) -> Result<MemoryChangePlan, BackingPlanFailure<SystemCallError>> {
         macro_rules! fail_prepared {
             ($error:expr) => {{
                 return Err(BackingPlanFailure::Prepared($error, prepared_backing));
@@ -2217,75 +2131,20 @@ impl BoundAddressSpace {
         }
         if let Err(error) = self
             .ensure_table_transaction_available()
-            .map_err(map_public_space_error)
+            .map_err(post_validate_error)
         {
             fail_prepared!(error);
         }
-        let bytes = match usize::try_from(request.bytes) {
-            Ok(bytes) => bytes,
-            Err(_) => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        let guard_before = match usize::try_from(request.guard_before) {
-            Ok(value) => value,
-            Err(_) => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        let guard_after = match usize::try_from(request.guard_after) {
-            Ok(value) => value,
-            Err(_) => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        let result_address = match usize::try_from(request.result_address) {
-            Ok(value) => value,
-            Err(_) => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        let protection = match MemoryProtection::from_raw(request.protection) {
-            Some(value) => value,
-            None => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        if protection == MemoryProtection::ReadExecute {
-            fail_prepared!(SystemCallError::RightsDenied);
-        }
-        let placement = match MemoryPlacement::from_raw(request.placement) {
-            Some(value) => value,
-            None => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        let placement = match placement {
-            MemoryPlacement::Anywhere if request.address == 0 => MapPlacement::Anywhere,
-            MemoryPlacement::FixedEmpty => MapPlacement::FixedEmpty {
-                usable_start: match usize::try_from(request.address) {
-                    Ok(value) => value,
-                    Err(_) => fail_prepared!(SystemCallError::IllegalArgument),
-                },
-            },
-            MemoryPlacement::Anywhere => fail_prepared!(SystemCallError::IllegalArgument),
-        };
-        let result_range =
-            match AddressRange::new(result_address, core::mem::size_of::<MemoryMapResult>()) {
-                Ok(value) => value,
-                Err(_) => fail_prepared!(SystemCallError::IllegalArgument),
-            };
-        let identity = match self.mint_backing().map_err(map_public_space_error) {
+        let identity = match self.mint_backing().map_err(post_validate_error) {
             Ok(value) => value,
             Err(error) => fail_prepared!(error),
         };
-        let protection = public_protection(protection);
-        let validated = match self.ledger().validate_map(MapRequest {
-            bytes,
-            guard_before,
-            guard_after,
-            placement,
-            current: protection,
-            maximum: protection,
-            owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Anonymous {
-                identity,
-                class: AnonymousClass::Data,
-            },
-            result: Some(memory_space::UserWriteLeaseRequest {
-                range: result_range,
-            }),
-        }) {
+        let validated = match self
+            .ledger()
+            .validate_map(Self::anonymous_map_request(intent, identity))
+        {
             Ok(value) => value,
-            Err(error) => fail_prepared!(map_public_change_error(error)),
+            Err(error) => fail_prepared!(public_change_error(error)),
         };
         let layout = validated
             .map_result()
@@ -2299,7 +2158,7 @@ impl BoundAddressSpace {
         let change = match self
             .ledger()
             .reserve(validated, Vec::new())
-            .map_err(|failure| map_public_change_error(failure.error))
+            .map_err(|failure| public_change_error(failure.error))
         {
             Ok(change) => change,
             Err(error) => fail_prepared!(error),
@@ -2313,7 +2172,7 @@ impl BoundAddressSpace {
             reserved: [0; 3],
             committed: 0,
         };
-        let result = match self.pin_map_result(&change, value, request.cookie) {
+        let result = match self.pin_map_result(&change, value, intent.cookie) {
             Ok(result) => result,
             Err(error) => {
                 let permits = self.ledger().rollback(change);
@@ -2321,7 +2180,38 @@ impl BoundAddressSpace {
                 fail_owned!(error, backing);
             }
         };
-        let (range, offset, intent_protection) = match change.translation_intents() {
+        let preflights = match Self::preflight_anonymous_install(
+            self.tree.as_mut().expect("address space tree is live"),
+            &change,
+            &backing,
+        ) {
+            Ok(preflights) => preflights,
+            Err(error) => {
+                let permits = self.ledger().rollback(change);
+                debug_assert!(permits.is_empty());
+                fail_owned!(post_validate_error(error), backing);
+            }
+        };
+        self.mark_table_transaction();
+        Ok(MemoryChangePlan {
+            change,
+            preflights,
+            backing: Some(backing),
+            result: Some(result),
+            backing_permits: Vec::new(),
+            image_end: None,
+            published_view: None,
+        })
+    }
+
+    /// 从已 reserve 的 change 取唯一 anonymous Install intent 并展开成逐 extent 的
+    /// preflight。Running 与 Building 共用：两边的 backing 几何与 intent 形状相同。
+    fn preflight_anonymous_install(
+        tree: &mut TableTree<TableMem, LEVELS>,
+        change: &PreparedChange,
+        backing: &OwnedBacking,
+    ) -> Result<Vec<TranslationPreflight>, SpaceError> {
+        let (range, offset, protection) = match change.translation_intents() {
             [
                 TranslationIntent::Install {
                     range,
@@ -2329,105 +2219,84 @@ impl BoundAddressSpace {
                         BackingView::Anonymous {
                             identity: intent_identity,
                             offset,
-                            class: AnonymousClass::Data,
+                            ..
                         },
                     protection,
                 },
-            ] if *intent_identity == identity => (*range, *offset, *protection),
-            _ => panic!("public anonymous Map planner returned an invalid translation plan"),
+            ] if *intent_identity == backing.identity => (*range, *offset, *protection),
+            _ => panic!("anonymous Map planner returned an invalid translation plan"),
         };
-        let preflights =
-            match backing.preflight_install(self.tt(), range, offset, intent_protection) {
-                Ok(preflights) => preflights,
-                Err(error) => {
-                    let permits = self.ledger().rollback(change);
-                    debug_assert!(permits.is_empty());
-                    fail_owned!(map_public_space_error(error), backing);
-                }
-            };
-        self.mark_table_transaction();
-        Ok(UserMemoryPlan {
-            change,
-            backing: Some(backing),
-            preflights,
-            result: Some(result),
-            backing_permits: Vec::new(),
-        })
+        backing.preflight_install(tree, range, offset, protection)
     }
 
-    fn complete_user_memory(
+    /// 锁外取得的表页 owner 进入 PTE reservation。Running、Building 与 bootstrap
+    /// 共用本函数：三者的差异已在 plan 阶段表达为字段，发布前的步骤完全相同。
+    /// 任何失败都回滚账本并把摘出的 owner 交回调用者在 AddressSpace 锁外析构。
+    pub(crate) fn complete_memory_change(
         &mut self,
-        plan: UserMemoryPlan,
+        plan: MemoryChangePlan,
         funded: Vec<Vec<frame::FundedTableFrame>>,
-    ) -> Result<PreparedUserMemory, (SystemCallError, ReclaimedTableFrames)> {
-        let UserMemoryPlan {
+    ) -> Result<PreparedMemoryChange, (SpaceError, ReclaimedTableFrames)> {
+        let MemoryChangePlan {
             change,
-            backing,
             preflights,
+            backing,
             result,
             backing_permits,
+            image_end,
+            published_view,
         } = plan;
         let mut reclaimed = ReclaimedTableFrames {
             funded,
             translations: Vec::new(),
             failed_owners: None,
             backing,
+            permits: Vec::new(),
         };
+        macro_rules! fail {
+            ($error:expr) => {{
+                reclaimed.permits = self.ledger().rollback(change);
+                self.clear_table_transaction();
+                return Err(($error, reclaimed));
+            }};
+        }
         if reclaimed.funded.len() != preflights.len() {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            return Err((SystemCallError::OutOfMemory, reclaimed));
+            fail!(SpaceError::NoFrame);
         }
         if reclaimed
             .translations
             .try_reserve_exact(preflights.len())
             .is_err()
         {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            return Err((SystemCallError::OutOfMemory, reclaimed));
+            fail!(SpaceError::NoFrame);
         }
+        let mut table_outcomes = Vec::new();
+        if table_outcomes.try_reserve_exact(preflights.len()).is_err() {
+            fail!(SpaceError::NoFrame);
+        }
+        let mut token = match PreparedMemoryChange::allocate() {
+            Ok(token) => token,
+            Err(error) => fail!(error),
+        };
         for index in 0..preflights.len() {
             let owners = core::mem::take(&mut reclaimed.funded[index]);
             match self.tt().prepare(preflights[index], owners) {
                 Ok(translation) => reclaimed.translations.push(translation),
                 Err(failure) => {
-                    let permits = self.ledger().rollback(change);
-                    debug_assert!(permits.is_empty());
-                    self.clear_table_transaction();
                     reclaimed.failed_owners = Some(failure.owners);
-                    return Err((map_public_space_error(failure.error.into()), reclaimed));
+                    fail!(failure.error.into());
                 }
             }
         }
-        let mut table_outcomes = Vec::new();
-        if table_outcomes
-            .try_reserve_exact(reclaimed.translations.len())
-            .is_err()
-        {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            return Err((SystemCallError::OutOfMemory, reclaimed));
-        }
-        let mut token = match PreparedUserMemory::allocate() {
-            Ok(token) => token,
-            Err(error) => {
-                let permits = self.ledger().rollback(change);
-                debug_assert!(permits.is_empty());
-                self.clear_table_transaction();
-                return Err((error, reclaimed));
-            }
-        };
-        token.install(UserMemoryReservation {
+        token.install(MemoryChangeReservation {
             change,
-            backing: reclaimed.backing.take(),
             translations: core::mem::take(&mut reclaimed.translations),
             table_outcomes,
+            backing: reclaimed.backing.take(),
             result,
             backing_permits,
+            image_end,
+            published_view,
         });
         Ok(token)
     }
@@ -2435,13 +2304,13 @@ impl BoundAddressSpace {
     fn prepare_user_existing_change(
         &mut self,
         validated: memory_space::ValidatedChange,
-    ) -> Result<UserMemoryPlan, SystemCallError> {
+    ) -> Result<MemoryChangePlan, SystemCallError> {
         self.ensure_table_transaction_available()
-            .map_err(map_public_space_error)?;
+            .map_err(post_validate_error)?;
         let change = self
             .ledger()
             .reserve(validated, Vec::new())
-            .map_err(|failure| map_public_change_error(failure.error))?;
+            .map_err(|failure| public_change_error(failure.error))?;
         let mut preflights = Vec::new();
         if preflights
             .try_reserve_exact(change.translation_intents().len())
@@ -2471,31 +2340,33 @@ impl BoundAddressSpace {
                 Err(error) => {
                     let permits = self.ledger().rollback(change);
                     debug_assert!(permits.is_empty());
-                    return Err(map_public_space_error(error.into()));
+                    return Err(post_validate_error(error.into()));
                 }
             }
         }
         self.mark_table_transaction();
-        Ok(UserMemoryPlan {
+        Ok(MemoryChangePlan {
             change,
-            backing: None,
             preflights,
+            backing: None,
             result: None,
             backing_permits: Vec::new(),
+            image_end: None,
+            published_view: None,
         })
     }
 
     fn prepare_user_unmap(
         &mut self,
         range: LedgerPageRange,
-    ) -> Result<UserMemoryPlan, SystemCallError> {
+    ) -> Result<MemoryChangePlan, SystemCallError> {
         let validated = self
             .ledger()
             .validate_unmap(UnmapRequest {
                 range,
                 authority: RegionOwner::AddressSpace,
             })
-            .map_err(map_public_change_error)?;
+            .map_err(public_change_error)?;
         self.prepare_user_existing_change(validated)
     }
 
@@ -2503,7 +2374,7 @@ impl BoundAddressSpace {
         &mut self,
         range: LedgerPageRange,
         protection: Protection,
-    ) -> Result<UserMemoryPlan, SystemCallError> {
+    ) -> Result<MemoryChangePlan, SystemCallError> {
         let validated = self
             .ledger()
             .validate_protect(ProtectRequest {
@@ -2511,11 +2382,11 @@ impl BoundAddressSpace {
                 protection,
                 authority: RegionOwner::AddressSpace,
             })
-            .map_err(map_public_change_error)?;
+            .map_err(public_change_error)?;
         self.prepare_user_existing_change(validated)
     }
 
-    fn write_user_map_payload(&self, prepared: &PreparedUserMemory) {
+    fn write_map_payload(&self, prepared: &PreparedMemoryChange) {
         prepared
             .get()
             .result
@@ -2524,54 +2395,63 @@ impl BoundAddressSpace {
             .write_payload();
     }
 
-    fn rollback_user_memory(&mut self, prepared: PreparedUserMemory) -> ReclaimedTableFrames {
+    pub(crate) fn rollback_memory_change(
+        &mut self,
+        prepared: PreparedMemoryChange,
+    ) -> ReclaimedTableFrames {
         self.clear_table_transaction();
-        let UserMemoryReservation {
+        let MemoryChangeReservation {
             change,
             translations,
             table_outcomes,
             backing,
-            result: _,
-            backing_permits: _,
+            ..
         } = prepared.take();
         let permits = self.ledger().rollback(change);
-        debug_assert!(permits.is_empty());
         drop(table_outcomes);
         ReclaimedTableFrames {
             funded: Vec::new(),
             translations,
             failed_owners: None,
             backing,
+            permits,
         }
     }
 
-    fn rollback_user_memory_plan(&mut self, plan: UserMemoryPlan) -> ReclaimedTableFrames {
+    pub(crate) fn rollback_memory_change_plan(
+        &mut self,
+        plan: MemoryChangePlan,
+    ) -> ReclaimedTableFrames {
         self.clear_table_transaction();
-        let UserMemoryPlan {
-            change,
-            backing,
-            preflights: _,
-            result: _,
-            backing_permits: _,
+        let MemoryChangePlan {
+            change, backing, ..
         } = plan;
         let permits = self.ledger().rollback(change);
-        debug_assert!(permits.is_empty());
         ReclaimedTableFrames {
             funded: Vec::new(),
             translations: Vec::new(),
             failed_owners: None,
             backing,
+            permits,
         }
     }
 
-    fn commit_user_memory(&mut self, prepared: PreparedUserMemory) -> PublishedSpaceChange {
-        let UserMemoryReservation {
+    /// 不可逆线性化点。所有输出维度在这里汇合：结果 cookie（如有）先以 release
+    /// 发布，ledger 与 PTE 批量发布，anonymous backing 入册，Building 映像终点
+    /// 推进，object view 的 lease 交给调用者安装。本函数不得失败也不得分配。
+    fn commit_inner(
+        &mut self,
+        prepared: PreparedMemoryChange,
+    ) -> (PublishedSpaceChange, Option<ObjectMappingLease>) {
+        let MemoryChangeReservation {
             change,
-            backing,
             translations,
             table_outcomes,
+            backing,
             result,
             backing_permits,
+            image_end,
+            published_view,
         } = prepared.take();
         assert!(
             self.table_transaction_active
@@ -2590,21 +2470,73 @@ impl BoundAddressSpace {
         if let Some(backing) = backing {
             self.backings.push(backing);
         }
-        PublishedSpaceChange {
-            ledger: published,
-            tables: PublishedTableChanges(table_outcomes),
-            backing_permits,
+        if let Some(end) = image_end {
+            self.image_end = self.image_end.max(end);
+        }
+        (
+            PublishedSpaceChange {
+                ledger: published,
+                tables: PublishedTableChanges(table_outcomes),
+                backing_permits,
+            },
+            published_view,
+        )
+    }
+
+    /// 对象 view 的 complete：失败时把 WritePermit 从 reclaimed 里摘出，随错误一起
+    /// 交回调用者，由它在 AddressSpace 锁外归还对象状态机。
+    pub(crate) fn complete_object_change(
+        &mut self,
+        plan: MemoryChangePlan,
+        funded: Vec<Vec<frame::FundedTableFrame>>,
+    ) -> Result<PreparedMemoryChange, (ObjectMapFailure, ReclaimedTableFrames)> {
+        match self.complete_memory_change(plan, funded) {
+            Ok(prepared) => Ok(prepared),
+            Err((error, mut reclaimed)) => {
+                let permits = reclaimed.take_permits();
+                Err((ObjectMapFailure { error, permits }, reclaimed))
+            }
         }
     }
 
-    fn plan_owned_mapping(
+    /// 不发布新 view 的事务（匿名 Map/Unmap/Protect、object view 撤销）在此收敛：
+    /// 断言事务确实没有待安装的 view 身份，避免调用点各自忽略输出。
+    pub(crate) fn commit_change(
+        &mut self,
+        prepared: PreparedMemoryChange,
+    ) -> PublishedSpaceChange {
+        let (published, view) = self.commit_inner(prepared);
+        assert!(
+            view.is_none(),
+            "memory change unexpectedly published a view lease"
+        );
+        published
+    }
+
+    /// 发布新 object view 的事务：Commit 同时交出 view 身份，由调用者安装到对象侧。
+    pub(crate) fn commit_view_map(
+        &mut self,
+        prepared: PreparedMemoryChange,
+    ) -> (PublishedSpaceChange, ObjectMappingLease) {
+        let (published, view) = self.commit_inner(prepared);
+        (
+            published,
+            view.expect("object view Map must publish its view lease"),
+        )
+    }
+
+    /// Building/bootstrap 的固定 placement 匿名映射：backing 已绑定身份，image_end
+    /// 只在映像区推进。与公开 Map 的差异只在 authority、结果槽与 placement，
+    /// 发布之后的路径完全共用。
+    fn plan_bound_anonymous(
         &mut self,
         vaddr: usize,
         protection: Protection,
         class: AnonymousClass,
         owner: RegionOwner,
+        image_end: Option<usize>,
         backing: OwnedBacking,
-    ) -> Result<OwnedMappingPlan, BackingPlanFailure<SpaceError>> {
+    ) -> Result<MemoryChangePlan, BackingPlanFailure<SpaceError>> {
         macro_rules! fail {
             ($error:expr) => {{
                 return Err(BackingPlanFailure::Owned($error, backing));
@@ -2634,12 +2566,12 @@ impl BoundAddressSpace {
             result: None,
         }) {
             Ok(value) => value,
-            Err(error) => fail!(map_change_error(error)),
+            Err(error) => fail!(SpaceError::from(error)),
         };
         let change = match self
             .ledger()
             .reserve(validated, Vec::new())
-            .map_err(|failure| map_change_error(failure.error))
+            .map_err(|failure| SpaceError::from(failure.error))
         {
             Ok(change) => change,
             Err(error) => fail!(error),
@@ -2649,43 +2581,39 @@ impl BoundAddressSpace {
             debug_assert!(permits.is_empty());
             fail!(SpaceError::NoFrame);
         }
-        let intent = match change.translation_intents() {
-            [
-                TranslationIntent::Install {
-                    range,
-                    backing:
-                        BackingView::Anonymous {
-                            identity, offset, ..
-                        },
-                    protection,
-                },
-            ] if *identity == backing.identity => (*range, *offset, *protection),
-            _ => panic!("anonymous map planner returned an invalid translation plan"),
-        };
-        let preflights = match backing.preflight_install(self.tt(), intent.0, intent.1, intent.2) {
+        let preflights = match Self::preflight_anonymous_install(
+            self.tree.as_mut().expect("address space tree is live"),
+            &change,
+            &backing,
+        ) {
             Ok(preflights) => preflights,
             Err(error) => {
                 let permits = self.ledger().rollback(change);
                 debug_assert!(permits.is_empty());
-                fail!(error.into());
+                fail!(error);
             }
         };
         self.mark_table_transaction();
-        Ok(OwnedMappingPlan {
-            backing,
+        Ok(MemoryChangePlan {
             change,
             preflights,
-            building_image_end: None,
+            backing: Some(backing),
+            result: None,
+            backing_permits: Vec::new(),
+            image_end,
+            published_view: None,
         })
     }
 
-    pub(crate) fn plan_owned_anonymous_mapping(
+    /// Building 与 ELF 装载的匿名映射：在锁内铸造身份并绑定锁外取得的 backing。
+    pub(crate) fn plan_bound_anonymous_mapping(
         &mut self,
         vaddr: usize,
         len: usize,
         protection: Protection,
+        image_end: Option<usize>,
         prepared: PreparedBacking,
-    ) -> Result<OwnedMappingPlan, BackingPlanFailure<SpaceError>> {
+    ) -> Result<MemoryChangePlan, BackingPlanFailure<SpaceError>> {
         macro_rules! fail_prepared {
             ($error:expr) => {{
                 return Err(BackingPlanFailure::Prepared($error, prepared));
@@ -2694,138 +2622,40 @@ impl BoundAddressSpace {
         if len == 0 || !vaddr.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE) {
             fail_prepared!(SpaceError::BadSegment);
         }
+        if prepared.pages != len / PAGE_SIZE {
+            fail_prepared!(SpaceError::BadSegment);
+        }
         let identity = match self.mint_backing() {
             Ok(value) => value,
             Err(error) => fail_prepared!(error),
         };
-        if prepared.pages != len / PAGE_SIZE {
-            fail_prepared!(SpaceError::BadSegment);
-        }
         let backing = prepared.bind(identity);
+        // Building 可以建立最终可执行的初始映像；Running 匿名映射不能。
         let class = if protection == Protection::ReadExecute {
             AnonymousClass::InitialExecutable
         } else {
             AnonymousClass::Data
         };
-        self.plan_owned_mapping(vaddr, protection, class, RegionOwner::AddressSpace, backing)
+        self.plan_bound_anonymous(
+            vaddr,
+            protection,
+            class,
+            RegionOwner::AddressSpace,
+            image_end,
+            backing,
+        )
     }
 
-    pub(crate) fn complete_anonymous_mapping(
+    /// Building/bootstrap 的同步完成：目标尚不可运行，无 active hart 需要确认，
+    /// 因而 reservation 立即 Commit 并空批收口，funded table owner 交给调用者锁外析构。
+    pub(crate) fn complete_bound_mapping(
         &mut self,
-        plan: OwnedMappingPlan,
+        plan: MemoryChangePlan,
         funded: Vec<Vec<frame::FundedTableFrame>>,
     ) -> Result<PublishedTableChanges, (SpaceError, ReclaimedTableFrames)> {
-        let prepared = self.complete_owned_mapping(plan, funded)?;
-        let published = self.commit_owned_mapping(prepared);
+        let prepared = self.complete_memory_change(plan, funded)?;
+        let published = self.commit_change(prepared);
         Ok(self.finish_empty_published_change(published))
-    }
-
-    fn complete_owned_mapping(
-        &mut self,
-        plan: OwnedMappingPlan,
-        funded: Vec<Vec<frame::FundedTableFrame>>,
-    ) -> Result<PreparedOwnedMapping, (SpaceError, ReclaimedTableFrames)> {
-        let OwnedMappingPlan {
-            backing,
-            change,
-            preflights,
-            building_image_end,
-        } = plan;
-        let mut reclaimed = ReclaimedTableFrames {
-            funded,
-            translations: Vec::new(),
-            failed_owners: None,
-            backing: Some(backing),
-        };
-        if reclaimed.funded.len() != preflights.len() {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            return Err((SpaceError::NoFrame, reclaimed));
-        }
-        if reclaimed
-            .translations
-            .try_reserve_exact(preflights.len())
-            .is_err()
-        {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            return Err((SpaceError::NoFrame, reclaimed));
-        }
-        for index in 0..preflights.len() {
-            let owners = core::mem::take(&mut reclaimed.funded[index]);
-            match self.tt().prepare(preflights[index], owners) {
-                Ok(translation) => reclaimed.translations.push(translation),
-                Err(failure) => {
-                    let permits = self.ledger().rollback(change);
-                    debug_assert!(permits.is_empty());
-                    self.clear_table_transaction();
-                    reclaimed.failed_owners = Some(failure.owners);
-                    return Err((failure.error.into(), reclaimed));
-                }
-            }
-        }
-        let mut table_outcomes = Vec::new();
-        if table_outcomes
-            .try_reserve_exact(reclaimed.translations.len())
-            .is_err()
-        {
-            let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            self.clear_table_transaction();
-            return Err((SpaceError::NoFrame, reclaimed));
-        }
-        Ok(PreparedOwnedMapping {
-            backing: reclaimed
-                .backing
-                .take()
-                .expect("owned mapping backing exists"),
-            change,
-            translations: core::mem::take(&mut reclaimed.translations),
-            table_outcomes,
-            building_image_end,
-        })
-    }
-
-    pub(crate) fn rollback_owned_mapping_plan(
-        &mut self,
-        plan: OwnedMappingPlan,
-    ) -> ReclaimedTableFrames {
-        self.clear_table_transaction();
-        let permits = self.ledger().rollback(plan.change);
-        debug_assert!(permits.is_empty());
-        ReclaimedTableFrames {
-            funded: Vec::new(),
-            translations: Vec::new(),
-            failed_owners: None,
-            backing: Some(plan.backing),
-        }
-    }
-
-    fn commit_owned_mapping(&mut self, prepared: PreparedOwnedMapping) -> PublishedSpaceChange {
-        let PreparedOwnedMapping {
-            backing,
-            change,
-            translations,
-            table_outcomes,
-            building_image_end,
-        } = prepared;
-        if self.table_transaction_active {
-            self.clear_table_transaction();
-        }
-        let committed = self.ledger().commit(change);
-        let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
-        let published = self.ledger().publish(committed);
-        self.backings.push(backing);
-        if let Some(end) = building_image_end {
-            self.image_end = self.image_end.max(end);
-        }
-        PublishedSpaceChange {
-            ledger: published,
-            tables: PublishedTableChanges(table_outcomes),
-            backing_permits: Vec::new(),
-        }
     }
 
     pub(crate) fn begin_retire_published_change(
@@ -2906,42 +2736,45 @@ impl BoundAddressSpace {
     ///
     /// `spans` 是 `ObjectBacking::project` 的输出（调用方在锁外取得，因为对象 backing
     /// 属于 MEMORY_OBJECT 锁阶）；单页 view 退化为长度为一。`object_offset` 是 view
-    /// 在对象内的起始字节偏移，ledger 据此跟踪切割后的 view 位置。
+    /// 在对象内的起始字节偏移，ledger 据此跟踪切割后的 view 位置。权限真值随
+    /// `authorization` 从对象状态机流出：含 W 的 view 必须同时交出等量 WritePermit，
+    /// 只读或读执行 view 的 permits 为空。
     #[inline(never)]
-    pub(crate) fn prepare_object_mapping(
+    pub(crate) fn plan_object_map(
         &mut self,
         va: usize,
         object_offset: usize,
         spans: &[(FrameNumber, usize)],
         authorization: ObjectViewAuthorization,
         permits: Vec<WritePermit>,
-    ) -> Result<ObjectMappingPlan, ObjectMapFailure> {
-        if let Err(error) = self.ensure_table_transaction_available() {
-            return Err(ObjectMapFailure { error, permits });
+    ) -> Result<MemoryChangePlan, ObjectMapFailure> {
+        macro_rules! fail {
+            ($error:expr, $permits:expr) => {{
+                return Err(ObjectMapFailure {
+                    error: $error,
+                    permits: $permits,
+                });
+            }};
         }
+        if let Err(error) = self.ensure_table_transaction_available() {
+            fail!(error, permits);
+        }
+        let protection = authorization.maximum();
         let pages: usize = spans.iter().map(|(_, pages)| *pages).sum();
         let bytes = match pages.checked_mul(PAGE_SIZE) {
             Some(bytes) if bytes != 0 => bytes,
-            _ => {
-                return Err(ObjectMapFailure {
-                    error: SpaceError::BadSegment,
-                    permits,
-                });
-            }
+            _ => fail!(SpaceError::BadSegment, permits),
         };
         if !va.is_multiple_of(PAGE_SIZE)
             || !object_offset.is_multiple_of(PAGE_SIZE)
             || va >= USER_TOP - STACK_SIZE
             || bytes > USER_TOP - STACK_SIZE - va
         {
-            return Err(ObjectMapFailure {
-                error: SpaceError::BadSegment,
-                permits,
-            });
+            fail!(SpaceError::BadSegment, permits);
         }
         let lease_key = match self.mint_lease() {
             Ok(lease) => lease,
-            Err(error) => return Err(ObjectMapFailure { error, permits }),
+            Err(error) => fail!(error, permits),
         };
         let object = authorization.object();
         let range = LedgerPageRange::new(va, bytes).expect("object view range is page aligned");
@@ -2950,8 +2783,8 @@ impl BoundAddressSpace {
             guard_before: 0,
             guard_after: 0,
             placement: MapPlacement::FixedEmpty { usable_start: va },
-            current: Protection::ReadWrite,
-            maximum: Protection::ReadWrite,
+            current: protection,
+            maximum: protection,
             owner: RegionOwner::Lease(lease_key),
             backing: MapBacking::Object {
                 authorization,
@@ -2960,19 +2793,14 @@ impl BoundAddressSpace {
             result: None,
         }) {
             Ok(validated) => validated,
-            Err(error) => {
-                return Err(ObjectMapFailure {
-                    error: map_change_error(error),
-                    permits,
-                });
-            }
+            Err(error) => fail!(SpaceError::from(error), permits),
         };
         let change = match self.ledger().reserve(validated, permits) {
             Ok(change) => change,
             Err(failure) => {
-                let error = map_change_error(failure.error);
+                let error = SpaceError::from(failure.error);
                 let (_, _, permits) = failure.into_parts();
-                return Err(ObjectMapFailure { error, permits });
+                fail!(error, permits);
             }
         };
         let region = change
@@ -2981,10 +2809,7 @@ impl BoundAddressSpace {
         let mut preflights = Vec::new();
         if preflights.try_reserve_exact(spans.len()).is_err() {
             let permits = self.ledger().rollback(change);
-            return Err(ObjectMapFailure {
-                error: SpaceError::NoFrame,
-                permits,
-            });
+            fail!(SpaceError::NoFrame, permits);
         }
         let mut cursor = va / PAGE_SIZE;
         for (base, span_pages) in spans.iter().copied() {
@@ -2992,164 +2817,42 @@ impl BoundAddressSpace {
                 Vpn(cursor),
                 span_pages,
                 Ppn(base.0),
-                protection_flags(Protection::ReadWrite),
+                protection_flags(protection),
             ) {
                 Ok(preflight) => preflights.push(preflight),
                 Err(error) => {
                     let permits = self.ledger().rollback(change);
-                    return Err(ObjectMapFailure {
-                        error: error.into(),
-                        permits,
-                    });
+                    fail!(error.into(), permits);
                 }
             }
             cursor += span_pages;
         }
         self.mark_table_transaction();
-        Ok(ObjectMappingPlan {
+        Ok(MemoryChangePlan {
             change,
             preflights,
-            lease: ObjectMappingLease {
+            backing: None,
+            result: None,
+            backing_permits: Vec::new(),
+            image_end: None,
+            published_view: Some(ObjectMappingLease {
                 lease: lease_key,
                 region,
                 range,
                 object,
                 object_offset,
-            },
+                protection,
+            }),
         })
     }
 
-    pub(crate) fn complete_object_mapping(
-        &mut self,
-        plan: ObjectMappingPlan,
-        funded: Vec<Vec<frame::FundedTableFrame>>,
-    ) -> Result<PreparedObjectMapping, (ObjectMapFailure, ReclaimedTableFrames)> {
-        let ObjectMappingPlan {
-            change,
-            preflights,
-            lease,
-        } = plan;
-        let mut reclaimed = ReclaimedTableFrames {
-            funded,
-            translations: Vec::new(),
-            failed_owners: None,
-            backing: None,
-        };
-        macro_rules! fail {
-            ($error:expr) => {{
-                let permits = self.ledger().rollback(change);
-                self.clear_table_transaction();
-                return Err((
-                    ObjectMapFailure {
-                        error: $error,
-                        permits,
-                    },
-                    reclaimed,
-                ));
-            }};
-        }
-        if reclaimed.funded.len() != preflights.len() {
-            fail!(SpaceError::NoFrame);
-        }
-        let mut token = match PreparedObjectMapping::allocate() {
-            Ok(token) => token,
-            Err(error) => fail!(error),
-        };
-        if reclaimed
-            .translations
-            .try_reserve_exact(preflights.len())
-            .is_err()
-        {
-            fail!(SpaceError::NoFrame);
-        }
-        let mut table_outcomes = Vec::new();
-        if table_outcomes.try_reserve_exact(preflights.len()).is_err() {
-            fail!(SpaceError::NoFrame);
-        }
-        for index in 0..preflights.len() {
-            let owners = core::mem::take(&mut reclaimed.funded[index]);
-            match self.tt().prepare(preflights[index], owners) {
-                Ok(translation) => reclaimed.translations.push(translation),
-                Err(failure) => {
-                    let permits = self.ledger().rollback(change);
-                    self.clear_table_transaction();
-                    reclaimed.failed_owners = Some(failure.owners);
-                    return Err((
-                        ObjectMapFailure {
-                            error: failure.error.into(),
-                            permits,
-                        },
-                        reclaimed,
-                    ));
-                }
-            }
-        }
-        token.install(ObjectMappingReservation {
-            change,
-            translations: core::mem::take(&mut reclaimed.translations),
-            table_outcomes,
-            lease,
-        });
-        Ok(token)
-    }
-
-    pub(crate) fn rollback_object_mapping_plan(
-        &mut self,
-        plan: ObjectMappingPlan,
-    ) -> Vec<WritePermit> {
-        self.clear_table_transaction();
-        self.ledger().rollback(plan.change)
-    }
-
-    pub(crate) fn rollback_object_mapping(
-        &mut self,
-        prepared: PreparedObjectMapping,
-    ) -> (Vec<WritePermit>, Vec<PreparedTranslation<frame::FundedTableFrame>>) {
-        self.clear_table_transaction();
-        let ObjectMappingReservation {
-            change,
-            translations,
-            ..
-        } = prepared.take();
-        let permits = self.ledger().rollback(change);
-        (permits, translations)
-    }
-
-    pub(crate) fn commit_object_mapping(
-        &mut self,
-        prepared: PreparedObjectMapping,
-    ) -> (PublishedSpaceChange, ObjectMappingLease) {
-        let ObjectMappingReservation {
-            change,
-            translations,
-            table_outcomes,
-            lease,
-        } = prepared.take();
-        assert!(
-            self.table_transaction_active
-                && translations
-                    .iter()
-                    .all(|translation| self.tt().prepared_is_current(translation)),
-            "page-table transaction lost exclusive generation"
-        );
-        self.clear_table_transaction();
-        let committed = self.ledger().commit(change);
-        let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
-        (
-            PublishedSpaceChange {
-                ledger: self.ledger().publish(committed),
-                tables: PublishedTableChanges(table_outcomes),
-                backing_permits: Vec::new(),
-            },
-            lease,
-        )
-    }
-
+    /// 撤销一个已发布 object view。lease 是 ledger 真值的复核凭据，不是第二份真值：
+    /// 位置、身份与权限都要与账本当前状态一致，否则整笔请求在 Commit 前失败。
     #[inline(never)]
-    pub(crate) fn prepare_object_unmap(
+    pub(crate) fn plan_object_unmap(
         &mut self,
         lease: ObjectMappingLease,
-    ) -> Result<ObjectUnmapPlan, SpaceError> {
+    ) -> Result<MemoryChangePlan, SpaceError> {
         self.ensure_table_transaction_available()?;
         let matches_lease = self.ledger().regions().any(|region| {
             region.key == lease.region
@@ -3162,10 +2865,12 @@ impl BoundAddressSpace {
                             object,
                             offset: region_offset,
                         },
-                        current: Protection::ReadWrite,
-                        maximum: Protection::ReadWrite,
-                        ..
-                    } if object == lease.object && region_offset == lease.object_offset
+                        current,
+                        maximum,
+                    } if object == lease.object
+                        && region_offset == lease.object_offset
+                        && current == lease.protection
+                        && maximum == lease.protection
                 )
         });
         if !matches_lease {
@@ -3177,113 +2882,47 @@ impl BoundAddressSpace {
                 range: lease.range,
                 authority: RegionOwner::Lease(lease.lease),
             })
-            .map_err(map_change_error)?;
+            .map_err(SpaceError::from)?;
         let change = self
             .ledger()
             .reserve(validated, Vec::new())
-            .map_err(|failure| map_change_error(failure.error))?;
-        let preflight = match self
+            .map_err(|failure| SpaceError::from(failure.error))?;
+        let mut preflights = Vec::new();
+        if preflights.try_reserve_exact(1).is_err() {
+            let permits = self.ledger().rollback(change);
+            debug_assert!(permits.is_empty());
+            return Err(SpaceError::NoFrame);
+        }
+        match self
             .tt()
             .preflight_unmap(Vpn(lease.range.start() / PAGE_SIZE), lease.range.pages())
         {
-            Ok(preflight) => preflight,
+            Ok(preflight) => preflights.push(preflight),
             Err(error) => {
                 let permits = self.ledger().rollback(change);
                 debug_assert!(permits.is_empty());
                 return Err(error.into());
             }
-        };
+        }
         self.mark_table_transaction();
-        Ok(ObjectUnmapPlan { change, preflight })
-    }
-
-    pub(crate) fn complete_object_unmap(
-        &mut self,
-        plan: ObjectUnmapPlan,
-        owners: Vec<frame::FundedTableFrame>,
-    ) -> Result<PreparedObjectUnmap, (SpaceError, Vec<frame::FundedTableFrame>)> {
-        let ObjectUnmapPlan { change, preflight } = plan;
-        macro_rules! fail {
-            ($error:expr, $owners:expr) => {{
-                let permits = self.ledger().rollback(change);
-                debug_assert!(permits.is_empty());
-                self.clear_table_transaction();
-                return Err(($error, $owners));
-            }};
-        }
-        let mut token = match PreparedObjectUnmap::allocate() {
-            Ok(token) => token,
-            Err(error) => fail!(error, owners),
-        };
-        let mut translations = Vec::new();
-        if translations.try_reserve_exact(1).is_err() {
-            fail!(SpaceError::NoFrame, owners);
-        }
-        let mut table_outcomes = Vec::new();
-        if table_outcomes.try_reserve_exact(1).is_err() {
-            fail!(SpaceError::NoFrame, owners);
-        }
-        match self.tt().prepare(preflight, owners) {
-            Ok(translation) => translations.push(translation),
-            Err(failure) => fail!(failure.error.into(), failure.owners),
-        }
-        token.install(ObjectUnmapReservation {
+        Ok(MemoryChangePlan {
             change,
-            translations,
-            table_outcomes,
-        });
-        Ok(token)
-    }
-
-    pub(crate) fn rollback_object_unmap(
-        &mut self,
-        prepared: PreparedObjectUnmap,
-    ) -> Vec<PreparedTranslation<frame::FundedTableFrame>> {
-        self.clear_table_transaction();
-        let ObjectUnmapReservation { change, translations, .. } = prepared.take();
-        let permits = self.ledger().rollback(change);
-        debug_assert!(permits.is_empty());
-        translations
-    }
-
-    pub(crate) fn rollback_object_unmap_plan(&mut self, plan: ObjectUnmapPlan) {
-        self.clear_table_transaction();
-        let permits = self.ledger().rollback(plan.change);
-        debug_assert!(permits.is_empty());
-    }
-
-    pub(crate) fn commit_object_unmap(
-        &mut self,
-        prepared: PreparedObjectUnmap,
-    ) -> PublishedSpaceChange {
-        let ObjectUnmapReservation {
-            change,
-            translations,
-            table_outcomes,
-        } = prepared.take();
-        assert!(
-            self.table_transaction_active
-                && translations
-                    .iter()
-                    .all(|translation| self.tt().prepared_is_current(translation)),
-            "page-table transaction lost exclusive generation"
-        );
-        self.clear_table_transaction();
-        let committed = self.ledger().commit(change);
-        let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
-        PublishedSpaceChange {
-            ledger: self.ledger().publish(committed),
-            tables: PublishedTableChanges(table_outcomes),
+            preflights,
+            backing: None,
+            result: None,
             backing_permits: Vec::new(),
-        }
+            image_end: None,
+            published_view: None,
+        })
     }
 
-    pub(crate) fn validate_building_anonymous(
-        &mut self,
+    /// Building `ProcessMap` 的几何与权限解析。窗口不能由一次调用跨越；只有映像区
+    /// 推进 StartupBlock/heap 基准，因此 image_end 由本函数一并判定。
+    fn building_intent(
         vaddr: usize,
         len: usize,
         permissions: ProcessMapFlags,
-    ) -> Result<(), SpaceError> {
+    ) -> Result<(Protection, Option<usize>), SpaceError> {
         if len == 0
             || !vaddr.is_multiple_of(PAGE_SIZE)
             || !len.is_multiple_of(PAGE_SIZE)
@@ -3298,6 +2937,17 @@ impl BoundAddressSpace {
         if end > USER_TOP || vaddr < stack_base && end > stack_base {
             return Err(SpaceError::BadSegment);
         }
+        Ok((protection, (end <= stack_base).then_some(end)))
+    }
+
+    /// 取得 backing 前的预检；与 `plan_building_anonymous` 共用同一份 intent 判定。
+    pub(crate) fn validate_building_anonymous(
+        &mut self,
+        vaddr: usize,
+        len: usize,
+        permissions: ProcessMapFlags,
+    ) -> Result<(), SpaceError> {
+        let (protection, _) = Self::building_intent(vaddr, len, permissions)?;
         self.ensure_table_transaction_available()?;
         let identity = BackingId::new(self.next_backing).ok_or(SpaceError::NoFrame)?;
         self.ledger()
@@ -3321,7 +2971,7 @@ impl BoundAddressSpace {
                 },
                 result: None,
             })
-            .map_err(map_change_error)
+            .map_err(SpaceError::from)
             .map(|_| ())
     }
 
@@ -3331,39 +2981,14 @@ impl BoundAddressSpace {
         len: usize,
         permissions: ProcessMapFlags,
         prepared: PreparedBacking,
-    ) -> Result<OwnedMappingPlan, BackingPlanFailure<SpaceError>> {
-        macro_rules! fail_prepared {
-            ($error:expr) => {{
-                return Err(BackingPlanFailure::Prepared($error, prepared));
-            }};
-        }
-        if len == 0
-            || !vaddr.is_multiple_of(PAGE_SIZE)
-            || !len.is_multiple_of(PAGE_SIZE)
-            || !permissions.is_known()
-            || permissions.raw() == 0
-        {
-            fail_prepared!(SpaceError::BadSegment);
-        }
-        let protection = match process_protection(permissions) {
-            Ok(value) => value,
-            Err(error) => fail_prepared!(error),
+    ) -> Result<MemoryChangePlan, BackingPlanFailure<SpaceError>> {
+        let (protection, image_end) = match Self::building_intent(vaddr, len, permissions) {
+            Ok(intent) => intent,
+            Err(error) => return Err(BackingPlanFailure::Prepared(error, prepared)),
         };
-        let end = match vaddr.checked_add(len) {
-            Some(value) => value,
-            None => fail_prepared!(SpaceError::BadSegment),
-        };
-        let stack_base = USER_TOP - STACK_SIZE;
-        if end > USER_TOP || vaddr < stack_base && end > stack_base {
-            fail_prepared!(SpaceError::BadSegment);
-        }
-        let mut plan = match self.plan_owned_anonymous_mapping(vaddr, len, protection, prepared) {
-            Ok(plan) => plan,
-            Err(failure) => return Err(failure),
-        };
-        plan.building_image_end = (end <= stack_base).then_some(end);
-        Ok(plan)
+        self.plan_bound_anonymous_mapping(vaddr, len, protection, image_end, prepared)
     }
+
     /// 窗口不能由一次调用跨越；只有映像区推进 StartupBlock/heap 基准。
 
     /// Building-only 回填；先验证完整目标区间已映射，再经物理直映射写入，

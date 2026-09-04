@@ -608,7 +608,7 @@ pub fn map(
             .map_err(SystemCallError::from)?;
     let plan_result = {
         let mut space = process.space.lock();
-        space.plan_anonymous_mapping(target, len, permissions, prepared)
+        space.plan_building_mapping(target, len, permissions, prepared)
     };
     let plan = match plan_result {
         Ok(plan) => plan,
@@ -621,20 +621,16 @@ pub fn map(
             return Err(SystemCallError::from(error));
         }
     };
-    let pool = pool;
-    let funded = match super::proc::fund_owned_mapping(&pool, &plan) {
+    let funded = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
         Ok(funded) => funded,
         Err(error) => {
-            let reclaimed = process.space.lock().rollback_owned_mapping_plan(plan);
+            let reclaimed = process.space.lock().rollback_memory_change_plan(plan);
             drop(reclaimed);
             return Err(SystemCallError::from(error));
         }
     };
     let released = {
-        let result = process
-            .space
-            .lock()
-            .complete_anonymous_mapping(plan, funded);
+        let result = process.space.lock().complete_bound_mapping(plan, funded);
         match result {
             Ok(released) => released,
             Err((error, reclaimed)) => {
