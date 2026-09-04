@@ -3063,8 +3063,6 @@ impl BoundAddressSpace {
         }
     }
 
-    /// Commit 内安装 view 所有权：对象已被本空间引用时只增计数，预留的 permit
-    /// 随之自然退款。容量已在 plan 阶段预留，本函数不分配。
     /// Commit 内安装 view 所有权：对象已被本空间引用时丢弃预留（自然退款）。
     /// 容量已在 plan 阶段预留，本函数不分配。
     fn install_view_owner(&mut self, prepared: PreparedObjectView) {

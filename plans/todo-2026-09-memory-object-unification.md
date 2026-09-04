@@ -1,6 +1,9 @@
 # 公共 MemoryObject 与数据面统一（6E 剩余 + 切片 7）
 
-> 【当前实施计划】合并 6E 剩余项（ObjectBacking、投影统一、对象侧 metadata admission）与切片 7（公共 MemoryObject ABI/Handle/用户面），用最终形态一次设计到位，避免为单独闭合 6E 而造临时层。方向契约由 `notes/ideas/mm.md` 拥有；前序 6E 部分完成状态见 `plans/todo-2026-09-memory-object-data-plane.md` 切片 6E 段落与提交 `2e18c6e`。
+> 【已收口】步骤 1–8 全部完成，见文末「收口记录」。未来审查见
+> [`todo-2026-09-memory-transaction-unification-review.md`](todo-2026-09-memory-transaction-unification-review.md)。
+>
+> 【原实施计划】合并 6E 剩余项（ObjectBacking、投影统一、对象侧 metadata admission）与切片 7（公共 MemoryObject ABI/Handle/用户面），用最终形态一次设计到位，避免为单独闭合 6E 而造临时层。方向契约由 `notes/ideas/mm.md` 拥有；前序 6E 部分完成状态见 `plans/todo-2026-09-memory-object-data-plane.md` 切片 6E 段落与提交 `2e18c6e`。
 
 ## 背景与目标
 
@@ -299,3 +302,25 @@ crate），**不服务任何已确认的外部语义**，也不解锁切片 7。
 - host debug/release、`just check`、`just virt`、`just virt-stress`、`just acceptance` 全绿；
 - impls/mm.md、impls/memory-object.md、impls/tunnel.md 同步更新为实际状态（删除提前描述统一 seam 的不实叙述）；
 - COMPASS 更新位置段、活跃计划表删除本项、生成带实际提交哈希的未来 review 计划。
+
+## 收口记录（2026-09）
+
+步骤 1–8 全部完成。步骤 5（owner-aware ledger / 匿名 backing 重构）在可行性验证中被推翻并降为可延后项，推导见上方「已推翻的方案与推导」。
+
+| 步骤 | 提交 | 结果 |
+|---|---|---|
+| 1–4 | `6e18b8f`、`16dd3b4`、`51b3742`、`0fad27f`、`310d089` | admission 五类、ObjectBacking、MemoryObjectCore + Tunnel 迁移、对象映射多段投影 |
+| 清场 | `d2ff81e` | 死类型/重复真值/身份铸造/错误边界 |
+| 6–7 | `5c0bbb0` | 统一事务核，四套 plan/complete 与两份 Tunnel 回滚矩阵删除 |
+| 8 | `d6a162c` | 公共 MemoryObject ABI、EXECUTABLE 电平、view owner、两段式 Unmap/Protect |
+
+**与原计划的偏离**：
+
+1. **步骤 8 不能独立先行**（原文档判断有误）。`prepare_object_mapping` 当时把 `current`/`maximum`/PTE flags 硬编码为 `ReadWrite`，且只支持 `FixedEmpty`、无结果槽；而公共对象 Map 需要 result cookie + placement + 对象来源三者同时成立，这三样分散在两条平行事务里。先做步骤 8 必然要在两套即将合并的事务上各补一遍对象来源，等 6–7 合并时全部返工。因此实际顺序是清场 → 6–7 → 8。
+2. **D1 的五维参数化落地为字段而非类型参数**。source/authority/output/image_end/view 都是 `MemoryChangePlan` 的字段（`Option` 或小 enum），不是泛型维度——组合数少、失败路径需要统一处理，泛型只会把同一段回滚逻辑复制到每个实例。
+3. **C2「object region 持强 ObjectView owner」以另一种形态成立**：owner 不进纯逻辑 planner（该方向已推翻），而是 AddressSpace 持 per-object view owner 表，「是否仍有区域引用」查账本。planner 保持无泛型 owner。
+4. **新发现并修正一个真实前置缺口**（原计划未列）：含 W 的 object view 被部分 Unmap 或降权时，存活片段是新铸造区域、各需一枚新 `WritePermit`，而 permit 只能在 AddressSpace 锁外向对象取得。Unmap/Protect 因此改为两段式。这是公共对象接入后才可达的路径——Tunnel view 是整段撤销，从不切割。
+
+**删除条件核对**：`UserMemoryPlan`/`PreparedUserMemory`、`OwnedMappingPlan`/`PreparedOwnedMapping`、`ObjectMappingPlan`/`PreparedObjectMapping`、`ObjectUnmapPlan`/`PreparedObjectUnmap` 八个类型与对应 plan/complete/rollback/commit 全部删除；全仓无 `prepare_object_mapping` 单 PA 假设、无 `ReadWrite` 硬编码、无 `seal_waiter` 单槽 waiter、无 `MemoryRetireSink::retire_permit`。`ObjectViewPermit` 的空缺消费者已由 view owner 补上。
+
+**可延后项现状**：匿名 backing 内部重构仍未触发（触发条件不变：COW / 部分 discard / pager，或结构收口 review 判定重复真值已致缺陷）。切片 8（多页 Tunnel ABI）、9（RNL2）、10（raw FramePool selftest adapter）仍在 `todo-2026-09-memory-object-data-plane.md` 名下。
