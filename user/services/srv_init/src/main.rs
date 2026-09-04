@@ -36,12 +36,14 @@ use rinlib::{
         object::{close, duplicate},
         wait::wait_many,
     },
+    memory_object::MemoryObject,
     mm::{MappedRegion, Placement},
     preclude::*,
     process,
     shared::{
         call::SystemCallError,
         mem::MemoryProtection,
+        memory_object::MemoryObjectState,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
@@ -539,9 +541,77 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     remapped
         .unmap()
         .map_err(|_| "fixed remap final Unmap failed")?;
+
+    // 公共 MemoryObject：创建 → 快照 → 两个 view → Handle 先关仍可访问 → 撤销 → 守恒。
+    let object = MemoryObject::create(4 * page).map_err(|_| "MemoryObject create failed")?;
+    let snapshot = object.query().map_err(|_| "MemoryObject query failed")?;
+    if snapshot.bytes != 4 * page as u64
+        || snapshot.state() != Some(MemoryObjectState::Mutable)
+        || snapshot.write_views != 0
+        || !snapshot.closes()
+    {
+        return Err("MemoryObject snapshot geometry or state invalid");
+    }
+    // 同一对象按不同 offset 与权限映入两个区间：对象 backing 只付一次。
+    let writable = MappedRegion::map_object(
+        &object,
+        page,
+        2 * page,
+        0,
+        0,
+        MemoryProtection::ReadWrite,
+        Placement::Anywhere,
+    )
+    .map_err(|_| "MemoryObject writable view Map failed")?;
+    let readable = MappedRegion::map_object(
+        &object,
+        0,
+        page,
+        0,
+        0,
+        MemoryProtection::ReadOnly,
+        Placement::Anywhere,
+    )
+    .map_err(|_| "MemoryObject read-only view Map failed")?;
+    if object
+        .query()
+        .map_err(|_| "MemoryObject query after Map failed")?
+        .write_views
+        != 1
+    {
+        return Err("MemoryObject did not account its writable view");
+    }
+    let writable_usable = writable
+        .usable()
+        .ok_or("MemoryObject writable view returned no usable range")?;
+    // SAFETY: 刚取得的 RW object view；backing 由对象拥有。
+    unsafe {
+        (writable_usable.start as *mut u64).write_volatile(0x1357_9bdf);
+    }
+    // Handle 关闭不撤销既有 view，也不释放 backing：view 强引用独立保活对象。
+    object
+        .close()
+        .map_err(|_| "MemoryObject Handle close failed")?;
+    // SAFETY: Handle 已关闭，但 view 仍然有效。
+    let survived = unsafe { (writable_usable.start as *const u64).read_volatile() };
+    if survived != 0x1357_9bdf {
+        return Err("MemoryObject view lost its data after Handle close");
+    }
+    readable
+        .unmap()
+        .map_err(|_| "MemoryObject read-only view Unmap failed")?;
+    // 部分撤销只消费本 view 的区域，不切分对象数据 backing。
+    let remainder = writable
+        .unmap_range(writable_usable.start..writable_usable.start + page)
+        .map_err(|_| "MemoryObject partial view Unmap failed")?;
+    remainder
+        .right
+        .ok_or("MemoryObject partial Unmap lost its right fragment")?
+        .unmap()
+        .map_err(|_| "MemoryObject last view Unmap failed")?;
     #[cfg(not(feature = "acceptance-stress"))]
     if root_pool_allocated().map_err(|_| "memory Pool final query failed")? != pool_baseline {
-        return Err("anonymous backing Pool charge did not refund");
+        return Err("MemoryObject backing Pool charge did not refund");
     }
     debug!("public memory mapping acceptance passed");
     Ok(())

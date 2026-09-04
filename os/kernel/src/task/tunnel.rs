@@ -14,10 +14,7 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, HandlePair, ObjectSignals, Rights},
 };
-use memory_space::{
-    BackingView, ObjectError, Protection, RegionKindView, RegionOwner,
-    RetiringFragment, WritePermit,
-};
+use memory_space::{BackingView, Protection, RegionKindView, RegionOwner, RetiringFragment};
 
 use crate::{
     sync::Spinlock,
@@ -28,7 +25,7 @@ use crate::{
             SubscribeResult,
         },
         proc::{
-            AddressSpaceState, MemoryRetireSink, ObjectMappingLease, PreparedMemoryChange,
+            MemoryRetireSink, ObjectMappingLease, PreparedMemoryChange,
             Process, RetiringSpaceChange, map_shootdown_error, prepare_memory_completion,
         },
         wait::{Subscription, finish_offered},
@@ -302,17 +299,6 @@ impl KernelObject for Invitation {
     }
 }
 
-fn map_object_error(error: ObjectError) -> SystemCallError {
-    match error {
-        ObjectError::AllocationFailed => SystemCallError::OutOfMemory,
-        ObjectError::PermitLimit => SystemCallError::ReachLimit,
-        ObjectError::ViewDenied | ObjectError::PermitDenied | ObjectError::Busy => {
-            SystemCallError::ObjectBusy
-        }
-        ObjectError::PermitOverflow | ObjectError::InvalidWaiter => SystemCallError::InternalError,
-    }
-}
-
 fn reserve_mapping(
     connection: &Connection,
 ) -> Result<
@@ -322,45 +308,77 @@ fn reserve_mapping(
     ),
     SystemCallError,
 > {
-    let mut memory = connection.core.state.lock();
-    let authorization = memory
-        .authorize_view(Protection::ReadWrite)
-        .map_err(map_object_error)?;
-    let permits = memory.reserve_writes(1).map_err(map_object_error)?;
-    Ok((authorization, permits))
+    connection
+        .core
+        .authorize_write_view(Protection::ReadWrite)
+        .map_err(super::memory_object::map_object_error)
 }
 
 fn cancel_writes(connection: &Connection, permits: Vec<memory_space::WritePermit>) {
-    let waiter = connection.core.state.lock().cancel_writes(permits);
-    assert!(
-        waiter.is_none(),
-        "Tunnel MemoryObject cannot have a seal waiter"
-    );
+    connection.core.cancel_writes(permits);
 }
 
-fn prepare_mapping(
+/// 建立本端 view 映射：锁外取得投影与 view 所有权，重入 AddressSpace 组装事务。
+///
+/// Create 与 Attach 共用它——两者只在对象来源与失败时的 Handle 回滚上不同，映射
+/// 本身完全同形。整段独立成帧，避免两个调用点各自留下投影缓冲与预留元组。
+#[inline(never)]
+fn plan_side_mapping(
     connection: &Connection,
-    space: &mut AddressSpaceState,
+    thread: &Thread,
     va: usize,
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
-) -> Result<super::proc::MemoryChangePlan, super::proc::ObjectMapFailure> {
+) -> Result<
+    (super::proc::MemoryChangePlan, Arc<super::memory_pool::MemoryPool>),
+    super::proc::ObjectMapFailure,
+> {
+    let (intent, spans, view_owner) =
+        match reserve_mapping_resources(connection, thread.process.resources.metadata(), va) {
+            Ok(reserved) => reserved,
+            Err(error) => return Err(super::proc::ObjectMapFailure { error, permits }),
+        };
+    let mut space = thread.process.space.lock();
+    let pool = Arc::clone(space.pool());
+    space
+        .plan_object_map(&intent, 0, &spans, authorization, permits, view_owner)
+        .map(|plan| (plan, pool))
+}
+
+/// 锁外预留 view 映射所需的全部 affine 资源：物理 span 投影（对象 backing 属
+/// MEMORY_OBJECT 锁阶）与 view 所有权。进入 AddressSpace 后只做复检与组装。
+fn reserve_mapping_resources(
+    connection: &Connection,
+    sponsor: &Arc<super::resources::MetadataSponsor>,
+    va: usize,
+) -> Result<
+    (
+        super::proc::MapIntent,
+        Vec<(page_table::FrameNumber, usize)>,
+        super::proc::PreparedObjectView,
+    ),
+    super::proc::SpaceError,
+> {
     // Tunnel 当前对外是单页，因而投影退化为长度为一的 span 序列；多页几何
-    // 只需改变投影区间，不涉及本函数形状。对象 backing 属 MEMORY_OBJECT 锁阶，
-    // 投影在进入 AddressSpace 前完成。
+    // 只需改变投影区间，不涉及本函数形状。
     let object_pages = connection.core.backing.pages();
     let mut spans = Vec::new();
     if spans
         .try_reserve_exact(connection.core.backing.projection_capacity())
         .is_err()
     {
-        return Err(super::proc::ObjectMapFailure {
-            error: super::proc::SpaceError::NoFrame,
-            permits,
-        });
+        return Err(super::proc::SpaceError::NoFrame);
     }
     connection.core.backing.project(0, object_pages, &mut spans);
-    space.plan_object_map(va, 0, &spans, authorization, permits)
+    let intent = super::proc::MapIntent::object_lease(
+        va,
+        object_pages * super::proc::PAGE_SIZE,
+        Protection::ReadWrite,
+    );
+    // view 所有权（对象强引用 + admission）在 Commit 前预留；使对象独立于 Handle
+    // 与 Endpoint 存活，并与公共 MemoryObject 走同一条 view owner 路径。
+    let view_owner = super::proc::PreparedObjectView::new(Arc::clone(&connection.core), sponsor)?;
+    Ok((intent, spans, view_owner))
 }
 
 /// Commit 前放弃一份已 prepare 的 view 映射：摘出全部 owner，WritePermit 归还对象
@@ -442,11 +460,9 @@ fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: Retiring
 struct LeaseRetireState {
     notice: Option<Option<PeerNotice>>,
     fragment_retired: bool,
-    permit_retired: bool,
 }
 
 struct LeaseRetire {
-    connection: Arc<Connection>,
     endpoint: Arc<Endpoint>,
     lease: ObjectMappingLease,
     state: Spinlock<LeaseRetireState>,
@@ -458,13 +474,8 @@ struct DetachedLeaseRetire {
 }
 
 impl LeaseRetire {
-    fn new(
-        connection: Arc<Connection>,
-        endpoint: Arc<Endpoint>,
-        lease: ObjectMappingLease,
-    ) -> Self {
+    fn new(endpoint: Arc<Endpoint>, lease: ObjectMappingLease) -> Self {
         Self {
-            connection,
             endpoint,
             lease,
             state: Spinlock::new(
@@ -472,7 +483,6 @@ impl LeaseRetire {
                 LeaseRetireState {
                     notice: None,
                     fragment_retired: false,
-                    permit_retired: false,
                 },
             ),
         }
@@ -495,22 +505,11 @@ impl MemoryRetireSink for LeaseRetire {
         state.fragment_retired = true;
     }
 
-    fn retire_permit(&self, permit: WritePermit) {
-        let waiter = self.connection.core.state.lock().retire_write(permit);
-        assert!(
-            waiter.is_none(),
-            "Tunnel MemoryObject cannot have a seal waiter"
-        );
-        let mut state = self.state.lock();
-        assert!(!state.permit_retired, "Tunnel lease permit retired twice");
-        state.permit_retired = true;
-    }
-
     fn finish(&self) {
         let mut state = self.state.lock();
         assert!(
-            state.fragment_retired && state.permit_retired,
-            "Tunnel lease completed before all retire owners"
+            state.fragment_retired,
+            "Tunnel lease completed before its view fragment retired"
         );
         let notice = state
             .notice
@@ -615,20 +614,17 @@ pub fn create(
         }
     };
     let mut mapping = {
-        let (plan, pool) = {
-            let mut space = thread.process.space.lock();
-            match prepare_mapping(&connection, &mut space, va, authorization, permits) {
-                Ok(plan) => (plan, Arc::clone(space.pool())),
+        let (plan, pool) =
+            match plan_side_mapping(&connection, thread, va, authorization, permits) {
+                Ok(prepared) => prepared,
                 Err(failure) => {
-                    drop(space);
                     cancel_writes(&connection, failure.permits);
                     table
                         .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                         .expect("TunnelCreate reservation must remain owned");
                     return Err(SystemCallError::from(failure.error));
                 }
-            }
-        };
+            };
         let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
@@ -843,26 +839,17 @@ pub fn attach(
         }
     };
     let mut mapping = {
-        let (plan, pool) = {
-            let mut space = thread.process.space.lock();
-            match prepare_mapping(
-                &invitation.connection,
-                &mut space,
-                va,
-                authorization,
-                permits,
-            ) {
-                Ok(plan) => (plan, Arc::clone(space.pool())),
+        let (plan, pool) =
+            match plan_side_mapping(&invitation.connection, thread, va, authorization, permits) {
+                Ok(prepared) => prepared,
                 Err(failure) => {
-                    drop(space);
                     cancel_writes(&invitation.connection, failure.permits);
                     table
                         .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                         .expect("TunnelAttach reservation must remain owned");
                     return Err(SystemCallError::from(failure.error));
                 }
-            }
-        };
+            };
         let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
@@ -1055,11 +1042,7 @@ pub(crate) fn close_handle(
         };
         Some(prepared)
     };
-    let retire = match Arc::try_new(LeaseRetire::new(
-        endpoint.connection.clone(),
-        endpoint.clone(),
-        lease,
-    )) {
+    let retire = match Arc::try_new(LeaseRetire::new(endpoint.clone(), lease)) {
         Ok(retire) => retire,
         Err(_) => {
             abandon_unmap(
@@ -1166,11 +1149,7 @@ pub(crate) fn close_detached(
 
     let lease = endpoint.connection.state.lock().leases[endpoint.side]
         .expect("detached Tunnel Endpoint must retain its mapping lease");
-    let sink = match Arc::try_new(LeaseRetire::new(
-        endpoint.connection.clone(),
-        endpoint.clone(),
-        lease,
-    )) {
+    let sink = match Arc::try_new(LeaseRetire::new(endpoint.clone(), lease)) {
         Ok(sink) => sink,
         Err(_) => return Err(entry),
     };

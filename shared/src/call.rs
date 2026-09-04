@@ -153,6 +153,12 @@ pub enum SystemCall {
     MemoryPoolQuery = 0x53,
     /// 从 parent Pool 不可撤销地派生 child Pool。
     MemoryPoolDerive = 0x54,
+    /// 从当前进程绑定池创建固定长度 MemoryObject。
+    MemoryObjectCreate = 0x55,
+    /// 读取 MemoryObject 的固定宽快照。
+    MemoryObjectQuery = 0x56,
+    /// 单向发布 MemoryObject 为可执行（幂等）。
+    MemoryObjectSeal = 0x57,
 
     // -----Tunnel-----
     /// 创建共享页、Endpoint 和一次性 Invitation。
@@ -174,5 +180,12 @@ mod tests {
         assert_eq!(SystemCallError::QuotaExceeded as usize, 0x25);
         assert_eq!(SystemCall::MemoryPoolQuery as usize, 0x53);
         assert_eq!(SystemCall::MemoryPoolDerive as usize, 0x54);
+    }
+
+    #[test]
+    fn memory_object_numbers_are_stable() {
+        assert_eq!(SystemCall::MemoryObjectCreate as usize, 0x55);
+        assert_eq!(SystemCall::MemoryObjectQuery as usize, 0x56);
+        assert_eq!(SystemCall::MemoryObjectSeal as usize, 0x57);
     }
 }

@@ -14,6 +14,8 @@ pub mod call;
 pub mod mem;
 /// MemoryPool capability 账户
 pub mod memory_pool;
+/// MemoryObject capability
+pub mod memory_object;
 /// Process types
 pub mod proc;
 /// Service

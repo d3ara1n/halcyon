@@ -12,7 +12,8 @@ use erhino_shared::{
 use memory_space::{
     AddressRange, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError, LeaseKey,
     Limits, MapBacking, MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
-    PageRange as LedgerPageRange, PreparedChange, ProtectRequest, Protection, PublishedChange,
+    PageRange as LedgerPageRange, PermitRequirement, PreparedChange, ProtectRequest, Protection,
+    PublishedChange,
     RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiringChange, RetiringFragment,
     TranslationIntent, UnmapRequest, WritePermit,
 };
@@ -286,6 +287,12 @@ struct BackingExtent {
 enum RetiredSpaceResource {
     Backing(BackingExtentOwner),
     Table(frame::FundedTableFrame),
+    /// object view 的锁外收束：先把 WritePermit 归还对象状态机（对象锁秩低于
+    /// AddressSpace），再释放强引用——最后一个引用消散会归还 backing 与 Pool charge。
+    View {
+        core: Arc<super::memory_object::MemoryObjectCore>,
+        permit: Option<WritePermit>,
+    },
     Root {
         owner: frame::FundedTableFrame,
         binding: super::resources::PoolBinding,
@@ -297,6 +304,12 @@ impl RetiredSpaceResource {
         match self {
             Self::Backing(owner) => drop(owner),
             Self::Table(owner) => drop(owner),
+            Self::View { core, permit } => {
+                if let Some(permit) = permit {
+                    core.retire_write(permit);
+                }
+                drop(core);
+            }
             Self::Root { owner, binding } => {
                 drop(owner);
                 drop(binding);
@@ -319,6 +332,50 @@ pub(crate) struct OwnedBacking {
 pub(crate) enum BackingPlanFailure<E> {
     Prepared(E, PreparedBacking),
     Owned(E, OwnedBacking),
+}
+
+/// 本地址空间对一个 MemoryObject 的 view 所有权：强引用使对象独立于 Handle 存活。
+///
+/// 每地址空间每对象一枚，与引用它的区域数无关——区域切割、降权与合并都由账本表达，
+/// 这里不重复计数。「是否仍有区域引用该对象」的真值只在账本里，退役时现场查询。
+struct ObjectViewOwner {
+    object: ObjectId,
+    core: Arc<super::memory_object::MemoryObjectCore>,
+    _permit: super::resources::ObjectViewPermit,
+}
+
+/// Commit 前预留、Commit 时安装的 view 所有权。对象已有 view 时它在 Commit 中被
+/// 丢弃并自然退款——预留是悲观的，不构成第二份真值。
+///
+/// 身份在构造时（AddressSpace 锁外）取得：Commit 运行在 `ADDRESS_SPACE → LIFECYCLE`
+/// 之下，而对象状态锁秩低于两者，因此发布路径不得回取对象锁。
+pub(crate) struct PreparedObjectView {
+    object: ObjectId,
+    core: Arc<super::memory_object::MemoryObjectCore>,
+    permit: super::resources::ObjectViewPermit,
+}
+
+impl PreparedObjectView {
+    pub(crate) fn new(
+        core: Arc<super::memory_object::MemoryObjectCore>,
+        sponsor: &Arc<super::resources::MetadataSponsor>,
+    ) -> Result<Self, SpaceError> {
+        let permit = super::resources::MetadataSponsor::reserve_object_view(sponsor)
+            .map_err(|_| SpaceError::ReachLimit)?;
+        Ok(Self {
+            object: core.identity(),
+            core,
+            permit,
+        })
+    }
+}
+
+/// 一个退役区域对其来源对象的引用。`core` 是本批 WritePermit 的归还目标；`_owner`
+/// 只在账本已无该对象区域时交出，它必须活到本批 permit 全部回到对象状态机之后才能
+/// 析构，否则最后一个引用可能先消散、permit 失去归还目标。
+struct RetiringObjectView {
+    core: Arc<super::memory_object::MemoryObjectCore>,
+    _owner: Option<ObjectViewOwner>,
 }
 
 /// 已发布事务的表页 outcome 批次；单项发布是长度为一的退化情形。
@@ -356,6 +413,8 @@ pub(crate) struct RetiringSpaceChange {
     tables: PublishedTableChanges,
     backing: Option<BackingRetireCursor>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
+    /// 已摘出但仍需接收本批 WritePermit 的 view 所有权。
+    retiring_views: Vec<RetiringObjectView>,
     tables_complete: bool,
 }
 
@@ -390,6 +449,8 @@ pub(crate) struct MemoryChangePlan {
     image_end: Option<usize>,
     /// 本事务在 Commit 时发布的新 object view 身份；撤销既有 view 不产生它。
     published_view: Option<ObjectMappingLease>,
+    /// Commit 时装入地址空间的 view 所有权（强引用 + admission）。
+    view_owner: Option<PreparedObjectView>,
 }
 
 impl MemoryChangePlan {
@@ -408,6 +469,7 @@ struct MemoryChangeReservation {
     backing_permits: Vec<super::resources::BackingSlicePermit>,
     image_end: Option<usize>,
     published_view: Option<ObjectMappingLease>,
+    view_owner: Option<PreparedObjectView>,
 }
 
 /// Commit 前的唯一发布权。盒化使深层事务不把整份 reservation 留在调用栈上。
@@ -421,6 +483,9 @@ pub(crate) struct ReclaimedTableFrames {
     failed_owners: Option<Vec<frame::FundedTableFrame>>,
     backing: Option<OwnedBacking>,
     permits: Vec<WritePermit>,
+    /// 未发布的 view 所有权。它持对象强引用，析构可能归还 backing 与 Pool charge，
+    /// 因此必须随本结构一起在 AddressSpace 锁外释放。
+    view_owner: Option<PreparedObjectView>,
 }
 
 impl ReclaimedTableFrames {
@@ -911,7 +976,11 @@ impl AddressSpaceState {
                     Memory,
                     "unexpected anonymous mapping completion in an unbound address space"
                 );
-                let MemoryChangePlan { backing, .. } = plan;
+                let MemoryChangePlan {
+                    backing,
+                    view_owner,
+                    ..
+                } = plan;
                 return Err((
                     error,
                     ReclaimedTableFrames {
@@ -919,7 +988,8 @@ impl AddressSpaceState {
                         translations: Vec::new(),
                         failed_owners: None,
                         backing,
-            permits: Vec::new(),
+                        permits: Vec::new(),
+                        view_owner,
                     },
                 ));
             }
@@ -1000,9 +1070,10 @@ impl crate::remote_call::Completion for ShootdownSelfTestCompletion {
     }
 }
 
+/// object-owned lease 的收束通知面。资源所有权（view 强引用与 WritePermit）由
+/// AddressSpace 统一持有与归还，sink 只在自己的 lease 完成时推进对象侧生命周期。
 pub(crate) trait MemoryRetireSink: Send + Sync {
     fn retire_fragment(&self, fragment: RetiringFragment);
-    fn retire_permit(&self, permit: WritePermit);
     fn finish(&self);
 }
 
@@ -1067,15 +1138,24 @@ impl RetiringSpaceChange {
                     }
                 }
                 RegionKindView::Mapping {
-                    backing: BackingView::Object { .. },
+                    backing: BackingView::Object { object, .. },
                     ..
-                } => retire
-                    .expect("object retire lost its sink")
-                    .retire_fragment(fragment),
+                } => {
+                    // view 所有权归 AddressSpace：账本再无该对象区域时摘出 owner，
+                    // 但要活到本批 WritePermit 全部归还，否则 permit 失去归还目标。
+                    if fragment.backing_retire == BackingRetire::Release {
+                        self.retiring_views.push(space.lock().release_view_region(object));
+                    }
+                    // object-owned lease 还要推进对象侧生命周期；进程自有 view 无 sink。
+                    if let Some(retire) = retire {
+                        retire.retire_fragment(fragment);
+                    }
+                }
                 RegionKindView::Guard => {
-                    assert!(
-                        retire.is_none() && fragment.owner == RegionOwner::AddressSpace,
-                        "guard retire reached an object sink"
+                    assert_eq!(
+                        fragment.owner,
+                        RegionOwner::AddressSpace,
+                        "guard retire escaped AddressSpace authority"
                     );
                 }
             }
@@ -1083,9 +1163,17 @@ impl RetiringSpaceChange {
         }
 
         if let Some(permit) = self.batch.pop_permit() {
-            retire
-                .expect("WritePermit retire lost its sink")
-                .retire_permit(permit);
+            // 对象状态锁秩低于 AddressSpace：先取得强引用，解锁后再归还 permit。
+            let object = permit.object();
+            let core = match self
+                .retiring_views
+                .iter()
+                .find(|view| view.core.identity() == object)
+            {
+                Some(view) => Arc::clone(&view.core),
+                None => space.lock().view_core(object),
+            };
+            core.retire_write(permit);
             return false;
         }
 
@@ -1095,6 +1183,9 @@ impl RetiringSpaceChange {
             .take()
             .expect("Retiring memory change completed twice");
         space.lock().complete_retiring_change(ledger, &self.batch);
+        // 全部 permit 已归还，交出的 owner 此刻可以析构（可能归还对象 backing 与
+        // charge，因此必须已在 AddressSpace 锁外）。
+        self.retiring_views.clear();
         if let Some(retire) = retire {
             retire.finish();
         }
@@ -1619,20 +1710,41 @@ fn public_page_range(address: u64, bytes: u64) -> Result<LedgerPageRange, System
     LedgerPageRange::new(address, bytes).map_err(|_| SystemCallError::IllegalArgument)
 }
 
+/// Map 事务的 backing 来源意图。匿名来源由目标进程绑定池取得 backing；对象来源
+/// 只验证 Handle、对象内页对齐 offset、范围与 rights，不重新分配数据页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapSource {
+    Anonymous,
+    Object {
+        handle: erhino_shared::object::Handle,
+        offset: usize,
+    },
+}
+
+/// 区域的撤销 authority。进程自有区域可由普通 Unmap/Protect 操作；object-owned
+/// lease 只能由持 lease 的对象撤销，普通 Unmap 在 Commit 前失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapAuthority {
+    AddressSpace,
+    ObjectLease,
+}
+
 /// 公开 `MemoryMap` 请求的一次性解析结果。ABI 整数 → 内部类型的转换只在进入
 /// AddressSpace 前做一次；Validate 预检与 Reserve 复检都消费同一份 intent，不各自
 /// 重建一套参数规则。
-pub(crate) struct AnonymousMapIntent {
+pub(crate) struct MapIntent {
     bytes: usize,
     guard_before: usize,
     guard_after: usize,
     placement: MapPlacement,
     protection: Protection,
-    result_range: AddressRange,
-    cookie: u64,
+    /// 固定宽结果槽与提交 cookie；内部映射（Tunnel/Building）无结果槽。
+    result: Option<(AddressRange, u64)>,
+    source: MapSource,
+    authority: MapAuthority,
 }
 
-impl AnonymousMapIntent {
+impl MapIntent {
     fn parse(request: MemoryMapRequest) -> Result<Self, SystemCallError> {
         let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
         if bytes == 0 {
@@ -1646,10 +1758,29 @@ impl AnonymousMapIntent {
             .map_err(|_| SystemCallError::IllegalArgument)?;
         let protection = MemoryProtection::from_raw(request.protection)
             .ok_or(SystemCallError::IllegalArgument)?;
-        // 运行期匿名映射只产生数据权限；可执行字节必须经 MemoryObject 发布。
-        if protection == MemoryProtection::ReadExecute {
-            return Err(SystemCallError::RightsDenied);
+        if request.reserved != [0; 1] {
+            return Err(SystemCallError::IllegalArgument);
         }
+        let source = if request.source == 0 {
+            if request.source_offset != 0 {
+                return Err(SystemCallError::IllegalArgument);
+            }
+            // 运行期匿名映射只产生数据权限；可执行字节必须经 MemoryObject 发布。
+            if protection == MemoryProtection::ReadExecute {
+                return Err(SystemCallError::RightsDenied);
+            }
+            MapSource::Anonymous
+        } else {
+            let offset = usize::try_from(request.source_offset)
+                .map_err(|_| SystemCallError::IllegalArgument)?;
+            if !offset.is_multiple_of(PAGE_SIZE) {
+                return Err(SystemCallError::IllegalArgument);
+            }
+            MapSource::Object {
+                handle: erhino_shared::object::Handle::from_raw(request.source),
+                offset,
+            }
+        };
         let placement = match MemoryPlacement::from_raw(request.placement)
             .ok_or(SystemCallError::IllegalArgument)?
         {
@@ -1669,9 +1800,39 @@ impl AnonymousMapIntent {
             guard_after,
             placement,
             protection: public_protection(protection),
-            result_range,
-            cookie: request.cookie,
+            result: Some((result_range, request.cookie)),
+            source,
+            authority: MapAuthority::AddressSpace,
         })
+    }
+
+    /// 内部固定 placement 映射（Tunnel view）：无 guard、无结果槽，authority 归对象。
+    pub(crate) fn object_lease(va: usize, bytes: usize, protection: Protection) -> Self {
+        Self {
+            bytes,
+            guard_before: 0,
+            guard_after: 0,
+            placement: MapPlacement::FixedEmpty { usable_start: va },
+            protection,
+            result: None,
+            source: MapSource::Object {
+                handle: erhino_shared::object::Handle::INVALID,
+                offset: 0,
+            },
+            authority: MapAuthority::ObjectLease,
+        }
+    }
+
+    pub(crate) fn source(&self) -> MapSource {
+        self.source
+    }
+
+    pub(crate) fn protection(&self) -> Protection {
+        self.protection
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     fn pages(&self) -> usize {
@@ -1764,7 +1925,8 @@ fn start_running_memory_change(
     Ok(plan)
 }
 
-/// 为当前 Running process 建立 anonymous mapping。
+/// 为当前 Running process 建立 mapping。backing 来源由请求的 `source` 声明：
+/// 匿名页由本进程绑定池取得，MemoryObject view 只验证 rights 与几何。
 pub(crate) fn memory_map(
     thread: &Thread,
     request_ptr: usize,
@@ -1776,7 +1938,6 @@ pub(crate) fn memory_map(
         let request: MemoryMapRequest =
             unsafe { crate::uaccess::read_user_value(&mut space, request_ptr) }?;
         if request.cookie == 0
-            || request.reserved != [0; 3]
             || request.result_address
                 % u64::try_from(core::mem::align_of::<MemoryMapResult>()).unwrap()
                 != 0
@@ -1791,16 +1952,39 @@ pub(crate) fn memory_map(
         if initial.reserved != [0; 3] || initial.committed != 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let intent = AnonymousMapIntent::parse(request)?;
-        space.validate_user_map(&intent)?;
+        let intent = MapIntent::parse(request)?;
         (
             intent,
             Arc::clone(space.pool()),
             Arc::clone(space.sponsor()),
         )
     };
-    let backing = PreparedBacking::allocate(intent.pages(), &pool, &sponsor)
-        .map_err(post_validate_error)?;
+    match intent.source() {
+        MapSource::Anonymous => map_anonymous_source(thread, process, intent, &pool, &sponsor),
+        MapSource::Object { handle, offset } => super::memory_object::map_view(
+            thread,
+            process,
+            intent,
+            handle,
+            offset,
+            &sponsor,
+        ),
+    }
+}
+
+fn map_anonymous_source(
+    thread: &Thread,
+    process: Arc<Process>,
+    intent: MapIntent,
+    pool: &Arc<super::memory_pool::MemoryPool>,
+    sponsor: &Arc<super::resources::MetadataSponsor>,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    {
+        let mut space = process.space.lock();
+        space.validate_user_map(&intent)?;
+    }
+    let backing =
+        PreparedBacking::allocate(intent.pages(), pool, sponsor).map_err(post_validate_error)?;
     let plan_result = {
         let mut space = process.space.lock();
         space.plan_user_map(&intent, backing)
@@ -1816,7 +2000,19 @@ pub(crate) fn memory_map(
             return Err(error);
         }
     };
-    let prepared = fund_and_complete_running(&process, plan)?;
+    finish_running_map(thread, process, plan)
+}
+
+/// Map 的公共尾段：锁外供表页、完成 reservation，再以结果槽输出启动事务。
+pub(crate) fn finish_running_map(
+    thread: &Thread,
+    process: Arc<Process>,
+    plan: MemoryChangePlan,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let prepared = fund_and_complete_running(&process, plan).map_err(|(error, permits)| {
+        debug_assert!(permits.is_empty(), "anonymous Map cannot hold write permits");
+        error
+    })?;
     let layout = prepared
         .get()
         .change
@@ -1833,56 +2029,167 @@ pub(crate) fn memory_map(
 
 /// 精确解除当前 Running process 的普通 mapping/reservation。
 pub(crate) fn memory_unmap(
-    _thread: &Thread,
+    thread: &Thread,
     address: u64,
     bytes: u64,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let process = _thread.process.clone();
+    let process = thread.process.clone();
     let range = public_page_range(address, bytes)?;
-    let (mut plan, sponsor) = {
+    let (validated, requirements, sponsor) = {
         let mut space = process.space.lock();
-        let plan = space.prepare_user_unmap(range)?;
+        let (validated, requirements) = space.validate_user_unmap(range)?;
         let sponsor = Arc::clone(space.sponsor());
-        (plan, sponsor)
+        (validated, requirements, sponsor)
     };
-    plan.backing_permits = match reserve_backing_split_metadata(&sponsor) {
-        Ok(permits) => permits,
-        Err(error) => {
-            let reclaimed = process.space.lock().rollback_memory_change_plan(plan);
-            drop(reclaimed);
-            return Err(post_validate_error(error));
-        }
-    };
-    let prepared = fund_and_complete_running(&process, plan)?;
-    start_running_memory_change(process, Some(prepared), range, false, ChangeOutput::None)
+    let backing_permits = reserve_backing_split_metadata(&sponsor).map_err(post_validate_error)?;
+    start_existing_change(
+        thread,
+        process,
+        validated,
+        requirements,
+        backing_permits,
+        range,
+        false,
+    )
 }
 
 /// 在创建时冻结的最大权限内改变当前 mapping 权限。
 pub(crate) fn memory_protect(
-    _thread: &Thread,
+    thread: &Thread,
     address: u64,
     bytes: u64,
     protection: usize,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let process = _thread.process.clone();
+    let process = thread.process.clone();
     let range = public_page_range(address, bytes)?;
     let raw = u32::try_from(protection).map_err(|_| SystemCallError::IllegalArgument)?;
     let protection = MemoryProtection::from_raw(raw).ok_or(SystemCallError::IllegalArgument)?;
     let protection = public_protection(protection);
-    let plan = {
+    let (validated, requirements) = {
         let mut space = process.space.lock();
-        space.prepare_user_protect(range, protection)?
+        space.validate_user_protect(range, protection)?
     };
     // 只有进出可执行权限的变更需要 instruction epoch 与 `FENCE.I`。
-    let instruction = plan.change.translation_intents().iter().any(|intent| {
+    let instruction = validated.translation_intents().iter().any(|intent| {
         matches!(
             intent,
             TranslationIntent::Protect { from, to, .. }
                 if *from == Protection::ReadExecute || *to == Protection::ReadExecute
         )
     });
-    let prepared = fund_and_complete_running(&process, plan)?;
+    start_existing_change(
+        thread,
+        process,
+        validated,
+        requirements,
+        Vec::new(),
+        range,
+        instruction,
+    )
+}
+
+/// Unmap/Protect 的公共后半段：先在 AddressSpace 锁外按 Validate 报告的多重集向各
+/// 来源对象取得 WritePermit（对象锁秩低于 AddressSpace），再重入完成 reservation。
+///
+/// 含 W 的 object view 被部分撤销或降权时，存活片段是新铸造的区域，各自需要一枚新
+/// permit；纯匿名变更的多重集为空，这条路径退化为原来的零 permit 形态。
+fn start_existing_change(
+    thread: &Thread,
+    process: Arc<Process>,
+    validated: memory_space::ValidatedChange,
+    requirements: Vec<PermitRequirement>,
+    backing_permits: Vec<super::resources::BackingSlicePermit>,
+    range: LedgerPageRange,
+    instruction: bool,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let (permits, sources) = match acquire_view_permits(&process, &requirements) {
+        Ok(acquired) => acquired,
+        Err(error) => {
+            // Validate 未预留任何资源，放弃计划无需回滚账本。
+            drop(validated);
+            return Err(error);
+        }
+    };
+    let plan_result = {
+        let mut space = process.space.lock();
+        space.prepare_user_existing_change(validated, permits)
+    };
+    let mut plan = match plan_result {
+        Ok(plan) => plan,
+        Err(failure) => {
+            release_view_permits(&sources, failure.permits);
+            return Err(post_validate_error(failure.error));
+        }
+    };
+    plan.backing_permits = backing_permits;
+    let prepared = match fund_and_complete_running(&process, plan) {
+        Ok(prepared) => prepared,
+        Err((error, permits)) => {
+            release_view_permits(&sources, permits);
+            return Err(error);
+        }
+    };
+    let _ = thread;
     start_running_memory_change(process, Some(prepared), range, instruction, ChangeOutput::None)
+}
+
+/// 按 Validate 报告的多重集向每个来源对象取得 WritePermit。任何一项失败时，已取得
+/// 的 permit 立即原样归还，账本零副作用。
+fn acquire_view_permits(
+    process: &Arc<Process>,
+    requirements: &[PermitRequirement],
+) -> Result<
+    (
+        Vec<WritePermit>,
+        Vec<Arc<super::memory_object::MemoryObjectCore>>,
+    ),
+    SystemCallError,
+> {
+    let mut permits = Vec::new();
+    let mut sources = Vec::new();
+    if requirements.is_empty() {
+        return Ok((permits, sources));
+    }
+    let total = requirements
+        .iter()
+        .try_fold(0usize, |sum, requirement| sum.checked_add(requirement.count))
+        .ok_or(SystemCallError::InternalError)?;
+    permits
+        .try_reserve_exact(total)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    sources
+        .try_reserve_exact(requirements.len())
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    for requirement in requirements {
+        let core = process.space.lock().view_core(requirement.object);
+        match core.reserve_writes(requirement.count) {
+            Ok(mut acquired) => {
+                permits.append(&mut acquired);
+                sources.push(core);
+            }
+            Err(error) => {
+                let failure = super::memory_object::map_object_error(error);
+                release_view_permits(&sources, permits);
+                return Err(failure);
+            }
+        }
+    }
+    Ok((permits, sources))
+}
+
+/// 把未提交的 permit 原样归还来源对象。permit 自带来源身份，因此按对象分派。
+fn release_view_permits(
+    sources: &[Arc<super::memory_object::MemoryObjectCore>],
+    permits: Vec<WritePermit>,
+) {
+    for permit in permits {
+        let object = permit.object();
+        let core = sources
+            .iter()
+            .find(|core| core.identity() == object)
+            .expect("reserved write permit lost its source object");
+        core.cancel_write(permit);
+    }
 }
 
 /// 锁外取得表页后重入 AddressSpace 完成 reservation。三个公开入口共用同一段：
@@ -1890,22 +2197,24 @@ pub(crate) fn memory_protect(
 fn fund_and_complete_running(
     process: &Arc<Process>,
     plan: MemoryChangePlan,
-) -> Result<PreparedMemoryChange, SystemCallError> {
+) -> Result<PreparedMemoryChange, (SystemCallError, Vec<WritePermit>)> {
     let pool = Arc::clone(process.space.lock().pool());
     let funded = match fund_table_preflights(&pool, plan.preflights()) {
         Ok(funded) => funded,
         Err(error) => {
-            let reclaimed = process.space.lock().rollback_memory_change_plan(plan);
+            let mut reclaimed = process.space.lock().rollback_memory_change_plan(plan);
+            let permits = reclaimed.take_permits();
             drop(reclaimed);
-            return Err(post_validate_error(error));
+            return Err((post_validate_error(error), permits));
         }
     };
     let result = process.space.lock().complete_memory_change(plan, funded);
     match result {
         Ok(prepared) => Ok(prepared),
-        Err((error, reclaimed)) => {
+        Err((error, mut reclaimed)) => {
+            let permits = reclaimed.take_permits();
             drop(reclaimed);
-            Err(post_validate_error(error))
+            Err((post_validate_error(error), permits))
         }
     }
 }
@@ -1925,6 +2234,9 @@ pub(crate) struct BoundAddressSpace {
     table_transaction_active: bool,
     /// 以 BackingId 关联 ledger logical offset 的 affine anonymous extents。
     backings: Vec<OwnedBacking>,
+    /// 本地址空间引用的 MemoryObject view 所有权，按 ObjectId 有序。它使对象
+    /// 独立于 Handle 存活：Handle 先关闭不影响已建立的 view。
+    views: Vec<ObjectViewOwner>,
     next_backing: u64,
     /// Object-owned mapping authority；单调不复用。
     next_lease: u64,
@@ -1954,6 +2266,7 @@ impl BoundAddressSpace {
             ledger: Some(ledger),
             table_transaction_active: false,
             backings: Vec::new(),
+            views: Vec::new(),
             next_backing: 1,
             next_lease: 1,
             image_end: 0,
@@ -2077,10 +2390,12 @@ impl BoundAddressSpace {
     }
 
     /// 建立与 `intent` 一致的 ledger 请求。Validate 预检与 Reserve 复检共用它，
-    /// 因此两次道口不会因各自组装而失步。
-    fn anonymous_map_request(
-        intent: &AnonymousMapIntent,
-        identity: BackingId,
+    /// 因此两次道口不会因各自组装而失步。`backing` 由来源侧提供：匿名给出待铸造的
+    /// 身份，对象给出经状态机认证的 view 授权。
+    fn map_request(
+        intent: &MapIntent,
+        owner: RegionOwner,
+        backing: MapBacking,
     ) -> MapRequest {
         MapRequest {
             bytes: intent.bytes,
@@ -2089,25 +2404,33 @@ impl BoundAddressSpace {
             placement: intent.placement,
             current: intent.protection,
             maximum: intent.protection,
-            owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Anonymous {
-                identity,
-                class: AnonymousClass::Data,
-            },
-            result: Some(memory_space::UserWriteLeaseRequest {
-                range: intent.result_range,
-            }),
+            owner,
+            backing,
+            result: intent
+                .result
+                .map(|(range, _)| memory_space::UserWriteLeaseRequest { range }),
+        }
+    }
+
+    fn anonymous_backing(identity: BackingId) -> MapBacking {
+        MapBacking::Anonymous {
+            identity,
+            class: AnonymousClass::Data,
         }
     }
 
     /// 取得 backing 前的预检：确认几何、authority 与结果槽合法，不预留任何
     /// 资源。真正的事务在锁外取得 Pool/metadata 后由 `plan_user_map` 复检。
-    fn validate_user_map(&mut self, intent: &AnonymousMapIntent) -> Result<(), SystemCallError> {
+    fn validate_user_map(&mut self, intent: &MapIntent) -> Result<(), SystemCallError> {
         self.ensure_table_transaction_available()
             .map_err(post_validate_error)?;
         let identity = BackingId::new(self.next_backing).ok_or(SystemCallError::OutOfMemory)?;
         self.ledger()
-            .validate_map(Self::anonymous_map_request(intent, identity))
+            .validate_map(Self::map_request(
+                intent,
+                RegionOwner::AddressSpace,
+                Self::anonymous_backing(identity),
+            ))
             .map_err(public_change_error)
             .map(|_| ())
     }
@@ -2116,7 +2439,7 @@ impl BoundAddressSpace {
     /// [`AnonymousMapIntent::parse`]），本函数只做锁内复检与资源组装。
     fn plan_user_map(
         &mut self,
-        intent: &AnonymousMapIntent,
+        intent: &MapIntent,
         prepared_backing: PreparedBacking,
     ) -> Result<MemoryChangePlan, BackingPlanFailure<SystemCallError>> {
         macro_rules! fail_prepared {
@@ -2139,10 +2462,11 @@ impl BoundAddressSpace {
             Ok(value) => value,
             Err(error) => fail_prepared!(error),
         };
-        let validated = match self
-            .ledger()
-            .validate_map(Self::anonymous_map_request(intent, identity))
-        {
+        let validated = match self.ledger().validate_map(Self::map_request(
+            intent,
+            RegionOwner::AddressSpace,
+            Self::anonymous_backing(identity),
+        )) {
             Ok(value) => value,
             Err(error) => fail_prepared!(public_change_error(error)),
         };
@@ -2172,7 +2496,11 @@ impl BoundAddressSpace {
             reserved: [0; 3],
             committed: 0,
         };
-        let result = match self.pin_map_result(&change, value, intent.cookie) {
+        let cookie = intent
+            .result
+            .expect("public Map intent must carry a result slot")
+            .1;
+        let result = match self.pin_map_result(&change, value, cookie) {
             Ok(result) => result,
             Err(error) => {
                 let permits = self.ledger().rollback(change);
@@ -2201,6 +2529,7 @@ impl BoundAddressSpace {
             backing_permits: Vec::new(),
             image_end: None,
             published_view: None,
+            view_owner: None,
         })
     }
 
@@ -2245,6 +2574,7 @@ impl BoundAddressSpace {
             backing_permits,
             image_end,
             published_view,
+            view_owner,
         } = plan;
         let mut reclaimed = ReclaimedTableFrames {
             funded,
@@ -2252,10 +2582,12 @@ impl BoundAddressSpace {
             failed_owners: None,
             backing,
             permits: Vec::new(),
+            view_owner: None,
         };
         macro_rules! fail {
             ($error:expr) => {{
                 reclaimed.permits = self.ledger().rollback(change);
+                reclaimed.view_owner = view_owner;
                 self.clear_table_transaction();
                 return Err(($error, reclaimed));
             }};
@@ -2297,6 +2629,7 @@ impl BoundAddressSpace {
             backing_permits,
             image_end,
             published_view,
+            view_owner,
         });
         Ok(token)
     }
@@ -2304,21 +2637,34 @@ impl BoundAddressSpace {
     fn prepare_user_existing_change(
         &mut self,
         validated: memory_space::ValidatedChange,
-    ) -> Result<MemoryChangePlan, SystemCallError> {
-        self.ensure_table_transaction_available()
-            .map_err(post_validate_error)?;
-        let change = self
-            .ledger()
-            .reserve(validated, Vec::new())
-            .map_err(|failure| public_change_error(failure.error))?;
+        permits: Vec<WritePermit>,
+    ) -> Result<MemoryChangePlan, ObjectMapFailure> {
+        macro_rules! fail {
+            ($error:expr, $permits:expr) => {{
+                return Err(ObjectMapFailure {
+                    error: $error,
+                    permits: $permits,
+                });
+            }};
+        }
+        if let Err(error) = self.ensure_table_transaction_available() {
+            fail!(error, permits);
+        }
+        let change = match self.ledger().reserve(validated, permits) {
+            Ok(change) => change,
+            Err(failure) => {
+                let error = SpaceError::from(failure.error);
+                let (_, _, permits) = failure.into_parts();
+                fail!(error, permits);
+            }
+        };
         let mut preflights = Vec::new();
         if preflights
             .try_reserve_exact(change.translation_intents().len())
             .is_err()
         {
             let permits = self.ledger().rollback(change);
-            debug_assert!(permits.is_empty());
-            return Err(SystemCallError::OutOfMemory);
+            fail!(SpaceError::NoFrame, permits);
         }
         for intent in change.translation_intents().iter().copied() {
             let preflight = match intent {
@@ -2339,8 +2685,7 @@ impl BoundAddressSpace {
                 Ok(preflight) => preflights.push(preflight),
                 Err(error) => {
                     let permits = self.ledger().rollback(change);
-                    debug_assert!(permits.is_empty());
-                    return Err(post_validate_error(error.into()));
+                    fail!(error.into(), permits);
                 }
             }
         }
@@ -2353,13 +2698,19 @@ impl BoundAddressSpace {
             backing_permits: Vec::new(),
             image_end: None,
             published_view: None,
+            view_owner: None,
         })
     }
 
-    fn prepare_user_unmap(
+    /// Unmap 的 Validate：返回计划与它要求的 WritePermit 多重集。含 W 的 object view
+    /// 被部分撤销时，存活片段是新铸造的区域，各自需要一枚新 permit——permit 只能在
+    /// AddressSpace 锁外向对象取得，因此几何在这里定案、permit 在锁外补齐。
+    fn validate_user_unmap(
         &mut self,
         range: LedgerPageRange,
-    ) -> Result<MemoryChangePlan, SystemCallError> {
+    ) -> Result<(memory_space::ValidatedChange, Vec<PermitRequirement>), SystemCallError> {
+        self.ensure_table_transaction_available()
+            .map_err(post_validate_error)?;
         let validated = self
             .ledger()
             .validate_unmap(UnmapRequest {
@@ -2367,14 +2718,23 @@ impl BoundAddressSpace {
                 authority: RegionOwner::AddressSpace,
             })
             .map_err(public_change_error)?;
-        self.prepare_user_existing_change(validated)
+        let mut requirements = Vec::new();
+        requirements
+            .try_reserve_exact(validated.permit_requirements().len())
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        requirements.extend_from_slice(validated.permit_requirements());
+        Ok((validated, requirements))
     }
 
-    fn prepare_user_protect(
+    /// Protect 的 Validate：语义同 `validate_user_unmap`——降权/升权同样重铸区域，
+    /// 结果含 W 的片段各自需要一枚新 permit。
+    fn validate_user_protect(
         &mut self,
         range: LedgerPageRange,
         protection: Protection,
-    ) -> Result<MemoryChangePlan, SystemCallError> {
+    ) -> Result<(memory_space::ValidatedChange, Vec<PermitRequirement>), SystemCallError> {
+        self.ensure_table_transaction_available()
+            .map_err(post_validate_error)?;
         let validated = self
             .ledger()
             .validate_protect(ProtectRequest {
@@ -2383,7 +2743,12 @@ impl BoundAddressSpace {
                 authority: RegionOwner::AddressSpace,
             })
             .map_err(public_change_error)?;
-        self.prepare_user_existing_change(validated)
+        let mut requirements = Vec::new();
+        requirements
+            .try_reserve_exact(validated.permit_requirements().len())
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        requirements.extend_from_slice(validated.permit_requirements());
+        Ok((validated, requirements))
     }
 
     fn write_map_payload(&self, prepared: &PreparedMemoryChange) {
@@ -2405,7 +2770,11 @@ impl BoundAddressSpace {
             translations,
             table_outcomes,
             backing,
-            ..
+            view_owner,
+            result: _,
+            backing_permits: _,
+            image_end: _,
+            published_view: _,
         } = prepared.take();
         let permits = self.ledger().rollback(change);
         drop(table_outcomes);
@@ -2415,6 +2784,7 @@ impl BoundAddressSpace {
             failed_owners: None,
             backing,
             permits,
+            view_owner,
         }
     }
 
@@ -2424,7 +2794,14 @@ impl BoundAddressSpace {
     ) -> ReclaimedTableFrames {
         self.clear_table_transaction();
         let MemoryChangePlan {
-            change, backing, ..
+            change,
+            backing,
+            view_owner,
+            preflights: _,
+            result: _,
+            backing_permits: _,
+            image_end: _,
+            published_view: _,
         } = plan;
         let permits = self.ledger().rollback(change);
         ReclaimedTableFrames {
@@ -2433,6 +2810,7 @@ impl BoundAddressSpace {
             failed_owners: None,
             backing,
             permits,
+            view_owner,
         }
     }
 
@@ -2452,6 +2830,7 @@ impl BoundAddressSpace {
             backing_permits,
             image_end,
             published_view,
+            view_owner,
         } = prepared.take();
         assert!(
             self.table_transaction_active
@@ -2469,6 +2848,9 @@ impl BoundAddressSpace {
         let published = self.ledger().publish(committed);
         if let Some(backing) = backing {
             self.backings.push(backing);
+        }
+        if let Some(view) = view_owner {
+            self.install_view_owner(view);
         }
         if let Some(end) = image_end {
             self.image_end = self.image_end.max(end);
@@ -2602,6 +2984,7 @@ impl BoundAddressSpace {
             backing_permits: Vec::new(),
             image_end,
             published_view: None,
+            view_owner: None,
         })
     }
 
@@ -2675,8 +3058,77 @@ impl BoundAddressSpace {
             tables,
             backing: None,
             backing_permits,
+            retiring_views: Vec::new(),
             tables_complete: false,
         }
+    }
+
+    /// Commit 内安装 view 所有权：对象已被本空间引用时只增计数，预留的 permit
+    /// 随之自然退款。容量已在 plan 阶段预留，本函数不分配。
+    /// Commit 内安装 view 所有权：对象已被本空间引用时丢弃预留（自然退款）。
+    /// 容量已在 plan 阶段预留，本函数不分配。
+    fn install_view_owner(&mut self, prepared: PreparedObjectView) {
+        let PreparedObjectView {
+            object,
+            core,
+            permit,
+        } = prepared;
+        match self.views.binary_search_by_key(&object, |view| view.object) {
+            Ok(_) => {
+                drop(permit);
+                drop(core);
+            }
+            Err(index) => self.views.insert(
+                index,
+                ObjectViewOwner {
+                    object,
+                    core,
+                    _permit: permit,
+                },
+            ),
+        }
+    }
+
+    /// 一个引用该对象的区域已退役。账本中不再有引用该对象的区域时交出 owner，
+    /// 由调用者在锁外与本批 WritePermit 一并收束。
+    ///
+    /// 「是否仍有引用」直接问账本：区域切割与合并都只改变账本，owner 不另记计数。
+    fn release_view_region(&mut self, object: ObjectId) -> RetiringObjectView {
+        let index = self
+            .views
+            .binary_search_by_key(&object, |view| view.object)
+            .expect("retiring object fragment lost its view owner");
+        let referenced = self.ledger.as_ref().is_some_and(|ledger| {
+            ledger.regions().any(|region| {
+                matches!(
+                    region.kind,
+                    RegionKindView::Mapping {
+                        backing: BackingView::Object { object: live, .. },
+                        ..
+                    } if live == object
+                )
+            })
+        });
+        if referenced {
+            return RetiringObjectView {
+                core: Arc::clone(&self.views[index].core),
+                _owner: None,
+            };
+        }
+        let owner = self.views.remove(index);
+        RetiringObjectView {
+            core: Arc::clone(&owner.core),
+            _owner: Some(owner),
+        }
+    }
+
+    /// 供退役路径在锁外把 WritePermit 归还来源对象。
+    fn view_core(&self, object: ObjectId) -> Arc<super::memory_object::MemoryObjectCore> {
+        let index = self
+            .views
+            .binary_search_by_key(&object, |view| view.object)
+            .expect("write permit lost its view owner");
+        Arc::clone(&self.views[index].core)
     }
 
     fn retire_backing_one(
@@ -2723,10 +3175,12 @@ impl BoundAddressSpace {
             tables,
             backing,
             backing_permits,
+            retiring_views,
             tables_complete,
         } = change;
         debug_assert!(backing.is_none());
         debug_assert!(backing_permits.is_empty());
+        debug_assert!(retiring_views.is_empty());
         debug_assert!(!tables_complete);
         self.complete_retiring_change(ledger.expect("empty memory change completed twice"), &batch);
         tables
@@ -2735,18 +3189,19 @@ impl BoundAddressSpace {
     /// 从对象 backing 投影出的物理 span 序列建立 view 映射。
     ///
     /// `spans` 是 `ObjectBacking::project` 的输出（调用方在锁外取得，因为对象 backing
-    /// 属于 MEMORY_OBJECT 锁阶）；单页 view 退化为长度为一。`object_offset` 是 view
-    /// 在对象内的起始字节偏移，ledger 据此跟踪切割后的 view 位置。权限真值随
-    /// `authorization` 从对象状态机流出：含 W 的 view 必须同时交出等量 WritePermit，
-    /// 只读或读执行 view 的 permits 为空。
+    /// 属于 MEMORY_OBJECT 锁阶）；单页 view 退化为长度为一。intent 携带 placement、
+    /// guard、结果槽与 authority：进程自有 view 归 AddressSpace（可由普通 Unmap 撤销），
+    /// object-owned lease 归对象（只能经对象关闭撤销）。权限真值随 `authorization` 从
+    /// 对象状态机流出：含 W 的 view 必须同时交出等量 WritePermit。
     #[inline(never)]
     pub(crate) fn plan_object_map(
         &mut self,
-        va: usize,
+        intent: &MapIntent,
         object_offset: usize,
         spans: &[(FrameNumber, usize)],
         authorization: ObjectViewAuthorization,
         permits: Vec<WritePermit>,
+        view_owner: PreparedObjectView,
     ) -> Result<MemoryChangePlan, ObjectMapFailure> {
         macro_rules! fail {
             ($error:expr, $permits:expr) => {{
@@ -2765,10 +3220,7 @@ impl BoundAddressSpace {
             Some(bytes) if bytes != 0 => bytes,
             _ => fail!(SpaceError::BadSegment, permits),
         };
-        if !va.is_multiple_of(PAGE_SIZE)
-            || !object_offset.is_multiple_of(PAGE_SIZE)
-            || va >= USER_TOP - STACK_SIZE
-            || bytes > USER_TOP - STACK_SIZE - va
+        if bytes != intent.bytes.next_multiple_of(PAGE_SIZE) || !object_offset.is_multiple_of(PAGE_SIZE)
         {
             fail!(SpaceError::BadSegment, permits);
         }
@@ -2776,25 +3228,26 @@ impl BoundAddressSpace {
             Ok(lease) => lease,
             Err(error) => fail!(error, permits),
         };
+        let owner = match intent.authority {
+            MapAuthority::AddressSpace => RegionOwner::AddressSpace,
+            MapAuthority::ObjectLease => RegionOwner::Lease(lease_key),
+        };
         let object = authorization.object();
-        let range = LedgerPageRange::new(va, bytes).expect("object view range is page aligned");
-        let validated = match self.ledger().validate_map(MapRequest {
-            bytes,
-            guard_before: 0,
-            guard_after: 0,
-            placement: MapPlacement::FixedEmpty { usable_start: va },
-            current: protection,
-            maximum: protection,
-            owner: RegionOwner::Lease(lease_key),
-            backing: MapBacking::Object {
+        let validated = match self.ledger().validate_map(Self::map_request(
+            intent,
+            owner,
+            MapBacking::Object {
                 authorization,
                 offset: object_offset,
             },
-            result: None,
-        }) {
+        )) {
             Ok(validated) => validated,
             Err(error) => fail!(SpaceError::from(error), permits),
         };
+        let layout = validated
+            .map_result()
+            .expect("object view validation must produce a layout");
+        let range = layout.usable;
         let change = match self.ledger().reserve(validated, permits) {
             Ok(change) => change,
             Err(failure) => {
@@ -2806,12 +3259,37 @@ impl BoundAddressSpace {
         let region = change
             .mapped_region_key()
             .expect("object Map must reserve one usable region");
+        // Commit 不得分配：view owner 表的容量在这里预留。
+        if self.views.try_reserve(1).is_err() {
+            let permits = self.ledger().rollback(change);
+            fail!(SpaceError::NoFrame, permits);
+        }
         let mut preflights = Vec::new();
         if preflights.try_reserve_exact(spans.len()).is_err() {
             let permits = self.ledger().rollback(change);
             fail!(SpaceError::NoFrame, permits);
         }
-        let mut cursor = va / PAGE_SIZE;
+        let result = match intent.result {
+            Some((_, cookie)) => {
+                let value = MemoryMapResult {
+                    usable_base: layout.usable.start() as u64,
+                    usable_bytes: layout.usable.bytes() as u64,
+                    reservation_base: layout.reservation.start() as u64,
+                    reservation_bytes: layout.reservation.bytes() as u64,
+                    reserved: [0; 3],
+                    committed: 0,
+                };
+                match self.pin_map_result(&change, value, cookie) {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        let permits = self.ledger().rollback(change);
+                        fail!(SpaceError::NoFrame, permits);
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut cursor = range.start() / PAGE_SIZE;
         for (base, span_pages) in spans.iter().copied() {
             match self.tt().preflight_map(
                 Vpn(cursor),
@@ -2832,17 +3310,23 @@ impl BoundAddressSpace {
             change,
             preflights,
             backing: None,
-            result: None,
+            result,
             backing_permits: Vec::new(),
             image_end: None,
-            published_view: Some(ObjectMappingLease {
-                lease: lease_key,
-                region,
-                range,
-                object,
-                object_offset,
-                protection,
-            }),
+            // lease 是地址空间之外的 owner 用来撤销该 view 的凭据。进程自有 view
+            // 由账本区间与 AddressSpace authority 直接表达，不需要第二份身份。
+            published_view: match intent.authority {
+                MapAuthority::ObjectLease => Some(ObjectMappingLease {
+                    lease: lease_key,
+                    region,
+                    range,
+                    object,
+                    object_offset,
+                    protection,
+                }),
+                MapAuthority::AddressSpace => None,
+            },
+            view_owner: Some(view_owner),
         })
     }
 
@@ -2913,6 +3397,7 @@ impl BoundAddressSpace {
             backing_permits: Vec::new(),
             image_end: None,
             published_view: None,
+            view_owner: None,
         })
     }
 
@@ -3308,14 +3793,36 @@ impl BoundAddressSpace {
                     if work + 1 > budget {
                         return (work, false);
                     }
-                    if let Some((_fragment, permit)) = self.ledger().drain_one() {
-                        assert!(
-                            permit.is_none(),
-                            "object write permit reached anonymous-only drain batch"
-                        );
+                    if let Some((fragment, permit)) = self.ledger().drain_one() {
                         work += 1;
+                        // object view 区域在丢弃账本时同步释放对象引用与写许可；
+                        // 两者都必须在 AddressSpace 锁外收束，因此走 pending 通道。
+                        if let RegionKindView::Mapping {
+                            backing: BackingView::Object { object, .. },
+                            ..
+                        } = fragment.kind
+                        {
+                            let core = self.release_view_region(object).core;
+                            self.pending_free =
+                                Some(RetiredSpaceResource::View { core, permit });
+                            let (used, done) = self.step_pending(budget - work);
+                            work += used;
+                            if !done {
+                                return (work, false);
+                            }
+                            self.pending_free = None;
+                        } else {
+                            assert!(
+                                permit.is_none(),
+                                "anonymous region carried an object write permit"
+                            );
+                        }
                         continue;
                     }
+                    assert!(
+                        self.views.is_empty(),
+                        "object view owners outlived their ledger regions"
+                    );
                     drop(
                         self.ledger
                             .take()

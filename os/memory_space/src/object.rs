@@ -29,14 +29,16 @@ pub enum ObjectError {
     PermitLimit,
     PermitOverflow,
     AllocationFailed,
-    Busy,
-    InvalidWaiter,
 }
 
+/// `seal` 的结果。状态机不保存等待者：完成事实以 `Published` 报告一次，
+/// 调用方据此发布对象的 `EXECUTABLE` 电平，等待复用通用等待面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealOutcome {
-    Complete,
-    Waiting,
+    /// 本次调用把对象推进到 Executable（含已在终态的幂等成功）。
+    Published,
+    /// 仍有在途可写 view；最后一个 permit 退役时由 `retire_*` 报告完成。
+    Pending,
 }
 
 /// 在对象状态锁内取得的 view 准入快照。它不持写许可；实际含 W 的 view
@@ -61,6 +63,18 @@ impl ObjectViewAuthorization {
     pub const fn object_bytes(&self) -> usize {
         self.object_bytes
     }
+
+    /// 校验 view 区间落在对象几何内并返回其页数。offset 与 length 都必须页对齐；
+    /// 越界以对象自身长度为准，不接受调用方另传的长度。
+    pub const fn view_pages(&self, offset: usize, bytes: usize, page_size: usize) -> Option<usize> {
+        if bytes == 0 || offset % page_size != 0 || bytes % page_size != 0 {
+            return None;
+        }
+        match offset.checked_add(bytes) {
+            Some(end) if end <= self.object_bytes => Some(bytes / page_size),
+            _ => None,
+        }
+    }
 }
 
 /// 一个 reserved/published/retiring writable view 的 affine 计数凭据。
@@ -84,7 +98,6 @@ pub struct MemoryObjectState {
     state: ExecutableState,
     permits: usize,
     permit_limit: usize,
-    seal_waiter: Option<u64>,
 }
 
 impl MemoryObjectState {
@@ -95,7 +108,6 @@ impl MemoryObjectState {
             state: ExecutableState::Mutable,
             permits: 0,
             permit_limit,
-            seal_waiter: None,
         }
     }
 
@@ -163,80 +175,50 @@ impl MemoryObjectState {
         Ok(permits)
     }
 
-    pub fn cancel_writes(&mut self, permits: Vec<WritePermit>) -> Option<u64> {
-        self.release_writes(permits)
+    /// 放弃尚未提交的写许可。返回 true 表示本次释放使 Sealing 完成。
+    pub fn cancel_write(&mut self, permit: WritePermit) -> bool {
+        self.release_one(permit)
     }
 
-    pub fn retire_writes(&mut self, permits: Vec<WritePermit>) -> Option<u64> {
-        self.release_writes(permits)
+    /// 同步确认后退役写许可。返回 true 表示本次退役使 Sealing 完成。
+    pub fn retire_write(&mut self, permit: WritePermit) -> bool {
+        self.release_one(permit)
     }
 
-    pub fn retire_write(&mut self, permit: WritePermit) -> Option<u64> {
+    /// 单向请求可执行发布。permit 为零时同点进入 Executable；否则转 Sealing 并
+    /// 拒绝新写入口，由最后一个 permit 的退役完成推进。已在终态时幂等成功。
+    pub fn seal(&mut self) -> SealOutcome {
+        match self.state {
+            ExecutableState::Mutable => {
+                if self.permits == 0 {
+                    self.state = ExecutableState::Executable;
+                    return SealOutcome::Published;
+                }
+                self.state = ExecutableState::Sealing;
+                SealOutcome::Pending
+            }
+            ExecutableState::Sealing => SealOutcome::Pending,
+            ExecutableState::Executable => SealOutcome::Published,
+        }
+    }
+
+    fn release_one(&mut self, permit: WritePermit) -> bool {
         assert_eq!(
             permit.object, self.object,
             "write permit belongs to another memory object"
         );
         assert!(self.permits != 0, "write permit accounting underflow");
         self.permits -= 1;
+        self.publish_if_quiescent()
+    }
+
+    /// Sealing 下最后一个 permit 消失即单向推进到 Executable。
+    fn publish_if_quiescent(&mut self) -> bool {
         if self.state == ExecutableState::Sealing && self.permits == 0 {
             self.state = ExecutableState::Executable;
-            self.seal_waiter.take()
-        } else {
-            None
-        }
-    }
-
-    pub fn seal(&mut self, waiter: Option<u64>) -> Result<SealOutcome, ObjectError> {
-        if waiter == Some(0) {
-            return Err(ObjectError::InvalidWaiter);
-        }
-        match self.state {
-            ExecutableState::Mutable => {
-                if self.permits == 0 {
-                    self.state = ExecutableState::Executable;
-                    return Ok(SealOutcome::Complete);
-                }
-                self.state = ExecutableState::Sealing;
-                self.seal_waiter = waiter;
-                Ok(SealOutcome::Waiting)
-            }
-            ExecutableState::Sealing => {
-                if let Some(waiter) = waiter {
-                    if self.seal_waiter.is_some() {
-                        return Err(ObjectError::Busy);
-                    }
-                    self.seal_waiter = Some(waiter);
-                }
-                Ok(SealOutcome::Waiting)
-            }
-            ExecutableState::Executable => Ok(SealOutcome::Complete),
-        }
-    }
-
-    pub fn abandon_waiter(&mut self, waiter: u64) -> bool {
-        if self.seal_waiter == Some(waiter) {
-            self.seal_waiter = None;
             true
         } else {
             false
-        }
-    }
-
-    fn release_writes(&mut self, permits: Vec<WritePermit>) -> Option<u64> {
-        assert!(
-            permits.iter().all(|permit| permit.object == self.object),
-            "write permits belong to another memory object"
-        );
-        assert!(
-            permits.len() <= self.permits,
-            "write permit accounting underflow"
-        );
-        self.permits -= permits.len();
-        if self.state == ExecutableState::Sealing && self.permits == 0 {
-            self.state = ExecutableState::Executable;
-            self.seal_waiter.take()
-        } else {
-            None
         }
     }
 }

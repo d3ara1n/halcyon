@@ -449,6 +449,11 @@ impl ValidatedChange {
         &self.permits
     }
 
+    /// 计划中的 PTE 变更意图。调用方据此判断是否需要指令代次同步。
+    pub fn translation_intents(&self) -> &[TranslationIntent] {
+        &self.plan.translations
+    }
+
     pub const fn map_result(&self) -> Option<MapResultLayout> {
         self.plan.result_layout
     }

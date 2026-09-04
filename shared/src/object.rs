@@ -127,6 +127,8 @@ impl ObjectSignals {
     pub const DATA: Self = Self(1 << 2);
     pub const REAPABLE: Self = Self(1 << 3);
     pub const DONE: Self = Self(1 << 4);
+    /// MemoryObject 已进入 Executable 终态：可建立读执行 view。置位后永不清除。
+    pub const EXECUTABLE: Self = Self(1 << 5);
     pub const PEER_CLOSED: Self = Self(1 << 62);
     pub const CLOSED: Self = Self(1 << 63);
     pub const KNOWN: Self = Self(
@@ -135,6 +137,7 @@ impl ObjectSignals {
             | Self::DATA.0
             | Self::REAPABLE.0
             | Self::DONE.0
+            | Self::EXECUTABLE.0
             | Self::PEER_CLOSED.0
             | Self::CLOSED.0,
     );

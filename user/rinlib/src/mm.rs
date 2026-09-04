@@ -40,23 +40,72 @@ impl MappedRegion {
         protection: MemoryProtection,
         placement: Placement,
     ) -> Result<Self, SystemCallError> {
+        Self::map(
+            |result_address, cookie, address, placement_raw| {
+                Ok(MemoryMapRequest::new(
+                    u64::try_from(bytes).map_err(|_| SystemCallError::IllegalArgument)?,
+                    u64::try_from(guard_before).map_err(|_| SystemCallError::IllegalArgument)?,
+                    u64::try_from(guard_after).map_err(|_| SystemCallError::IllegalArgument)?,
+                    address,
+                    result_address,
+                    cookie,
+                    protection,
+                    placement_raw,
+                ))
+            },
+            placement,
+        )
+    }
+
+    /// 映入一个 MemoryObject 的子范围。数据来自对象，不取得新的页额度；对象由
+    /// view 强引用独立保活，因此建立后可以立即关闭对象 Handle。
+    pub fn map_object(
+        object: &crate::memory_object::MemoryObject,
+        object_offset: usize,
+        bytes: usize,
+        guard_before: usize,
+        guard_after: usize,
+        protection: MemoryProtection,
+        placement: Placement,
+    ) -> Result<Self, SystemCallError> {
+        let source = object.handle().raw();
+        Self::map(
+            |result_address, cookie, address, placement_raw| {
+                Ok(MemoryMapRequest::new_object_view(
+                    source,
+                    u64::try_from(object_offset).map_err(|_| SystemCallError::IllegalArgument)?,
+                    u64::try_from(bytes).map_err(|_| SystemCallError::IllegalArgument)?,
+                    u64::try_from(guard_before).map_err(|_| SystemCallError::IllegalArgument)?,
+                    u64::try_from(guard_after).map_err(|_| SystemCallError::IllegalArgument)?,
+                    address,
+                    result_address,
+                    cookie,
+                    protection,
+                    placement_raw,
+                ))
+            },
+            placement,
+        )
+    }
+
+    /// Map 的公共提交路径：结果槽与 cookie 的生命周期、提交观察与几何校验只有一处。
+    fn map(
+        build: impl FnOnce(u64, u64, u64, MemoryPlacement) -> Result<MemoryMapRequest, SystemCallError>,
+        placement: Placement,
+    ) -> Result<Self, SystemCallError> {
         let cookie = next_cookie();
         let mut result = MemoryMapResult::empty();
-        let (placement, address) = match placement {
+        let (placement_raw, address) = match placement {
             Placement::Anywhere => (MemoryPlacement::Anywhere, 0),
             Placement::FixedEmpty { usable_start } => (MemoryPlacement::FixedEmpty, usable_start),
         };
-        let request = MemoryMapRequest::new(
-            u64::try_from(bytes).map_err(|_| SystemCallError::IllegalArgument)?,
-            u64::try_from(guard_before).map_err(|_| SystemCallError::IllegalArgument)?,
-            u64::try_from(guard_after).map_err(|_| SystemCallError::IllegalArgument)?,
-            u64::try_from(address).map_err(|_| SystemCallError::IllegalArgument)?,
+        let request = build(
             u64::try_from(core::ptr::addr_of_mut!(result) as usize)
                 .map_err(|_| SystemCallError::IllegalArgument)?,
             cookie,
-            protection,
-            placement,
-        );
+            u64::try_from(address).map_err(|_| SystemCallError::IllegalArgument)?,
+            placement_raw,
+        )?;
         // SAFETY: request/result 在整个 syscall（含 Waiting）期间位于当前线程栈上；
         // result 已清零且 committed 只经 release/acquire 原子访问。
         unsafe { sys_memory_map(&request) }?;

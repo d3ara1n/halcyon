@@ -37,6 +37,7 @@ pub const OBJECT_WAIT_LIMIT: usize = 1024;
 pub enum ObjectKind {
     Job,
     MemoryPool,
+    MemoryObject,
     ProcessBuilder,
     ProcessControl,
     ThreadControl,
@@ -59,6 +60,8 @@ pub enum ObjectKind {
 pub enum HandleRole {
     JobControl,
     MemoryPool,
+    /// MemoryObject 没有 owner role：全部 Handle 是同一 capability，只以 rights 分权。
+    MemoryObject,
     ProcessBuilder,
     ProcessControl,
     ThreadControl,

@@ -712,7 +712,7 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
         space.regions().any(|region| region.key == region_key),
         "prepared region identity must survive Commit"
     );
-    assert_eq!(object.seal(Some(77)).unwrap(), SealOutcome::Waiting);
+    assert_eq!(object.seal(), SealOutcome::Pending);
     assert_eq!(object.state(), ExecutableState::Sealing);
     assert_eq!(object.reserve_writes(1), Err(ObjectError::PermitDenied));
 
@@ -736,7 +736,7 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
         memory_space::BackingRetire::Release
     );
     let permit = batch.pop_permit().expect("write permit must retire");
-    assert_eq!(object.retire_write(permit), Some(77));
+    assert!(object.retire_write(permit), "last permit retire must publish the seal");
     assert!(batch.is_empty());
     let retired = space.finish_retire(retiring, &batch);
     assert_eq!(object.state(), ExecutableState::Executable);
@@ -772,9 +772,16 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
         .unwrap();
     let permits = object.reserve_writes(1).unwrap();
     let prepared = first_space.reserve(validated, permits).unwrap();
-    assert_eq!(object.seal(Some(91)).unwrap(), SealOutcome::Waiting);
+    assert_eq!(object.seal(), SealOutcome::Pending);
     let permits = first_space.rollback(prepared);
-    assert_eq!(object.cancel_writes(permits), Some(91));
+    let permit = permits
+        .into_iter()
+        .next()
+        .expect("rollback must return the reserved permit");
+    assert!(
+        object.cancel_write(permit),
+        "cancelling the last permit must publish the seal"
+    );
     assert_eq!(object.state(), ExecutableState::Executable);
     assert_eq!(first_space.region_count(), 0);
     assert_eq!(first_space.transaction_count(), 0);
@@ -800,7 +807,7 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
         .unwrap();
     let prepared = reserve_no_permits(&mut second_space, validated);
     complete_prepared(&mut second_space, prepared);
-    assert_eq!(executable.seal(None).unwrap(), SealOutcome::Complete);
+    assert_eq!(executable.seal(), SealOutcome::Published);
     let validated = second_space
         .validate_protect(ProtectRequest {
             range: PageRange::new(BASE, PAGE_SIZE).unwrap(),
@@ -812,17 +819,25 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
     assert_eq!(executable.reserve_writes(1), Err(ObjectError::PermitDenied));
 }
 
+/// seal 不保存等待者：发起者消散不撤销状态转换，重复 seal 在任一阶段都幂等。
 #[test]
-fn abandoned_seal_waiter_does_not_revert_state() {
+fn seal_progresses_without_a_waiter_and_is_idempotent() {
     let object_id = ObjectId::new(2).unwrap();
     let mut object = MemoryObjectState::new(object_id, PAGE_SIZE, 2);
     let permits = object.reserve_writes(1).unwrap();
-    assert_eq!(object.seal(Some(11)).unwrap(), SealOutcome::Waiting);
-    assert!(object.abandon_waiter(11));
+    assert_eq!(object.seal(), SealOutcome::Pending);
+    assert_eq!(object.seal(), SealOutcome::Pending);
     assert_eq!(object.state(), ExecutableState::Sealing);
-    assert_eq!(object.retire_writes(permits), None);
+    let permit = permits
+        .into_iter()
+        .next()
+        .expect("reserved permit must exist");
+    assert!(
+        object.retire_write(permit),
+        "last permit retire must publish the seal"
+    );
     assert_eq!(object.state(), ExecutableState::Executable);
-    assert_eq!(object.seal(Some(12)).unwrap(), SealOutcome::Complete);
+    assert_eq!(object.seal(), SealOutcome::Published);
 }
 
 #[test]

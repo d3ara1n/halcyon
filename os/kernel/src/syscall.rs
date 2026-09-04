@@ -308,6 +308,32 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::MemoryObjectCreate => {
+            respond_result(
+                frame,
+                task::memory_object::create(thread, frame.x[10] as usize).map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::MemoryObjectQuery => {
+            respond_result(
+                frame,
+                task::memory_object::query(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::MemoryObjectSeal => {
+            respond_result(
+                frame,
+                task::memory_object::seal(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::MemoryPoolDerive => {
             respond_result(
                 frame,
