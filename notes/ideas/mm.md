@@ -134,10 +134,13 @@ Guard 是占据虚拟区间但不持有 backing、也不安装 PTE 的 reservati
 Map、Unmap、Protect 以及 object-owned lease 的建立与撤销都由 AddressSpace 内部事务完成：
 
 ```text
-Validate → Reserve → Commit → Publish → Synchronize → Retire → Complete
+Validated → Reserved → Prepared → Committed → Published
+          → Synchronized → Retiring → Completed
 ```
 
-Validate 检查完整范围、authority、生命周期、权限与固定宽输出槽，并在 AddressSpace 锁内形成不占有外部资源的精确计划。Reserve 不是一段跨锁调用：先离开 AddressSpace，从绑定 Pool、物理库存、metadata admission 与 Remote Call 容量分别取得全部 affine reservation，再重入 AddressSpace 复检计划所依赖的代次、区域与 execution snapshot，最终组装为 Prepared change。任何锁秩低于 AddressSpace 的资源源都不得在 AddressSpace 锁内进入；复检失败只析构尚未发布的 owner，保持账本与 PTE 零变化。与页数线性的 backing 清零在独占 extent 后、Commit 前完成。
+每个阶段都是不可互换的仿射 owner，转换消费旧状态并产出新状态；只有 Validate、Reserve、Prepare 与 Commit 前最终复检可以返回业务错误。Commit 后接口只能推进固定进度或进入下一个状态，不得分配普通 metadata、返回可恢复错误或让调用点自行猜测尚未归还的 owner。
+
+Validate 检查完整范围、authority、生命周期、权限与固定宽输出槽，并在 AddressSpace 锁内形成不占有外部资源的精确计划。Reserve 不是一段跨锁调用：先离开 AddressSpace，从绑定 Pool、物理库存、metadata admission 与 Remote Call 容量分别取得全部 affine reservation，再重入 AddressSpace 复检计划所依赖的代次、区域与 execution snapshot，最终组装为 Prepared change。任何锁秩低于 AddressSpace 的资源源都不得在 AddressSpace 锁内进入；复检失败必须由专用 rollback owner 收集页表 funding、backing、WritePermit、view owner 与结果义务，并在锁外统一归还，普通 Drop 不得隐含“视为成功”。与页数线性的 backing 清零在独占 extent 后、Commit 前完成。
 页表模块必须把结构 preflight、资源供给与 owner 发布分离：preflight 只计算精确需求，调用方锁外提供已经资金化的表页，Publish 只把 owner 与 PTE 同时纳入 TranslationTree，不分配、不进入 Pool，也不发生普通可恢复失败。并行准备后未消费的表页以及从树中摘除的表页必须以 affine owner 显式返回，由 AddressSpace 锁外的 rollback 或 retire 路径收束；不能提交为裸帧号后再靠物理地址重建资源所有权。
 
 Commit 是不可逆线性化点。此前任何失败都保持账本、PTE、backing 和请求槽零副作用；一旦 Commit 成功，事务归 AddressSpace 且必然完成。区域与 PTE 可以在有硬上限的 Publish 段逐项更新，未同步的其它线程在调用进行期间可能观察到旧状态或正在发布的新状态；内核不承诺任意多页在所有 hart 上瞬时切换。Synchronize 完成并向仍存活的调用者返回后，所有目标 hart 必须已经达到新 epoch，这才是对外完成边界。
@@ -146,7 +149,7 @@ Map 的 Reserve 已经唯一确定 usable 与 reservation 范围。`MemoryMapRes
 
 结果槽必须位于调用前已经存在且可写的 eager mapping；UserWriteLease 只 pin 固定宽 ledger/backing 与写权限，不把用户指针变成可长期解引用的内核引用。与 lease 冲突的 Unmap/Protect 在各自 Commit 前返回 Busy。rinlib 为可能 park 的 Map 把结果槽放进随线程保留到 join 的运行时记录，而不是可提前回收的临时缓冲。若调用线程在 Commit 前消散，事务释放 lease 并回滚；若在 Commit 后消散，结果承诺已经属于进程，事务继续完成。线程的 departed/join 完成边界不得越过仍挂接于该线程结果记录的 committed transaction，因而接管者在 join 后观察 cookie 时也已经越过 mapping 完成边界。
 
-Unmap/Protect 的旧 backing、旧权限或 writable-view permit 在 Synchronize 期间由事务隔离持有，不能归还库存、映射到其它地址、退出 seal 计数或被另一对象重新解释。Retire 只在全部确认后释放旧 OwnedExtents、旧 ObjectView、写 permit 与过期元数据。一般事务状态属于地址空间而非发起线程；等待远端确认的 System Call 通过 WaitContext park，发起线程终止只消散最终返回权。进程终止冻结后拒绝新事务并接管已 Commit 的事务；只有线程、active hart、事务与对象 lease 全部完成或进入可恢复收束后，地址空间才可进入最终 drain。
+Unmap/Protect 的旧 backing、旧权限或 writable-view permit 在 Synchronize 期间由事务隔离持有，不能归还库存、映射到其它地址、退出 seal 计数或被另一对象重新解释。Retire 只在全部确认后释放旧 OwnedExtents、旧 ObjectView、写 permit 与过期元数据。Retire 批次的对象 owner 集与容器容量必须在 Commit 前从 validated fragments 推导并去重；同一 `AddressSpace × ObjectId` 在一笔批次中至多持一个 retiring owner，Commit 后只移动既有槽位或推进有界游标，不允许 `Vec::push`、`try_reserve` 或回到账本猜测 owner 来源。一般事务状态属于地址空间而非发起线程；等待远端确认的 System Call 通过 WaitContext park，发起线程终止只消散最终返回权。进程终止冻结后拒绝新事务并接管已 Commit 的事务；只有线程、active hart、事务与对象 lease 全部完成或进入可恢复收束后，地址空间才可进入最终 drain。
 最后一个地址翻译确认只把事务推进到 Retiring，不授予在 Remote Call 完成回调中执行任意宽度收束的许可。若 backing slice、表页或元数据的退役超过单次固定预算，事务成为显式的内核 work debt：由安全出口按游标逐批推进，未完成时由明确的 hart 唤醒所有者再次敲门，全部 owner 已在容器锁外释放后才进入 Complete、兑销 mandatory operation 并唤醒调用者。该机制没有后台内核线程，不绑定原发起线程，也不允许终止路径另建同步扫描旁路；进程终止只接管同一事务与同一游标。唤醒点取 Complete 而非 Synchronize 是刻意取舍：单管线单完成点让结果义务、mandatory operation 与 join 边界共用一个定义，代价是调用者返回延迟包含全部 retire 批次、随 extent 数线性增长。若实测成为瓶颈，合法的范式内优化是把调用者返回提前到 Synchronize（对外完成边界不变），retire 纯后台推进；两者都不改变 Commit 与 Synchronize 的既有语义。
 
 ## 跨 Hart 地址翻译同步

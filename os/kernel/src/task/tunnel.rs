@@ -644,10 +644,12 @@ pub fn create(
         let mut space = thread.process.space.lock();
         match space.complete_object_change(plan, owners) {
             Ok(prepared) => Some(prepared),
-            Err((failure, reclaimed)) => {
+            Err((failure, mut reclaimed)) => {
                 drop(space);
                 cancel_writes(&connection, failure.permits);
+                let permits = reclaimed.take_permits();
                 drop(reclaimed);
+                cancel_writes(&connection, permits);
                 table
                     .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                     .expect("TunnelCreate reservation must remain owned");
@@ -869,10 +871,12 @@ pub fn attach(
         let mut space = thread.process.space.lock();
         match space.complete_object_change(plan, owners) {
             Ok(prepared) => Some(prepared),
-            Err((failure, reclaimed)) => {
+            Err((failure, mut reclaimed)) => {
                 drop(space);
                 cancel_writes(&invitation.connection, failure.permits);
+                let permits = reclaimed.take_permits();
                 drop(reclaimed);
+                cancel_writes(&invitation.connection, permits);
                 table
                     .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                     .expect("TunnelAttach reservation must remain owned");

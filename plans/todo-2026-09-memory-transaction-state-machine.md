@@ -1,6 +1,6 @@
 # 内存事务状态机与失败闭包重构计划
 
-> 延后实施的结构性重构。当前主线不引入半成品兼容层；在最终类型图、所有权图与锁阶冻结前，不修改现有事务代码。
+> 当前实施的结构性重构。按全局类型图、所有权图与锁阶一次性迁移，不按局部编译反馈逐点打补丁，也不引入半成品兼容层。
 
 ## 目标
 
@@ -114,13 +114,15 @@ Bootstrap 和普通 launcher 使用同一组状态转换，不保留第二套后
 - 全仓删除旧阶段 API、单用途 adapter、重复 owner 真值和过渡注释；
 - 原 Review 报告中的事务失败闭包 findings 全部标记为“机制重构闭合”并完成复核。
 
-## 触发条件
+## 实施状态
 
-满足以下条件后才实施：
+本计划已由 Review 修复交接提升为当前主线。切片 8/9 暂不推进，先完成本计划的纵向迁移与完整复核；期间不得以“先让单个 crate 编译”为目标拆出局部兼容层。每个阶段只在整体类型/所有权/锁阶模型保持闭合的前提下推进，代码验证用于确认整体设计而非驱动设计漂移。
 
-- 当前用户态数据面主线（多页 Tunnel/Runnel v2 及主要消费者）不再需要继续改变 MemoryChange 外部语义；
-- 设备/中断/DMA 接入前，页表/内存事务最终类型图已可冻结；
-- 能一次性安排内核事务、Bootstrap、Tunnel、MemoryObject 与对应 notes/tests 的纵向迁移；
-- 有足够验证预算执行完整 host/QEMU/故障注入收口。
+当前已接入的第一批结构性收口包括：
 
-在触发前，当前代码维持现状，不新增局部兼容修复；若出现新的直接安全/正确性阻断，必须单独重新评估是否提前拆出完整前置设计。
+- `ReclaimedTableFrames` 的提交前失败路径统一显式消费 `WritePermit`，不再依赖调用点记忆或普通 Drop；
+- 账本在 Reserve 阶段记录 retiring object owner 的去重容量，内核在 Commit 前预留 owner 容器，Retire 阶段只消费既有槽位；
+- `spawn_from_elf` 以 `UnpublishedBound` 持有 Bind 后、启动发布前的地址空间，失败经有界 drain 收束，不再由 `TableTree::Drop` 旁路；
+- Bootstrap 的 domain、staged 容量、Attach、Job member 与 Building operation 前移到 Handle commit 之前，提交后仅保留固定发布序列。
+
+这些接入仍需与完整状态类型、Bootstrap/ProcessStart 共用提交协议、故障注入和全验证矩阵一起收口，未完成前不得将本计划标记为完成。

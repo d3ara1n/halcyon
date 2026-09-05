@@ -464,6 +464,7 @@ struct PreparedPlan {
     remove: Vec<RegionKey>,
     replacements: Vec<Region>,
     retiring: Vec<RetiringFragment>,
+    retiring_object_capacity: usize,
     translations: Vec<TranslationIntent>,
     result_layout: Option<MapResultLayout>,
     retiring_permits: Vec<WritePermit>,
@@ -472,6 +473,7 @@ struct PreparedPlan {
 struct MaterializedReservation {
     replacements: Vec<Region>,
     retiring: Vec<RetiringFragment>,
+    retiring_object_capacity: usize,
     retiring_permits: Vec<WritePermit>,
     permits: Vec<WritePermit>,
 }
@@ -488,6 +490,12 @@ pub struct PreparedChange {
 impl PreparedChange {
     pub const fn user_write_lease(&self) -> Option<&UserWriteLease> {
         self.lease.as_ref()
+    }
+
+    /// Commit 前可确定的对象退役 owner 上限。该值用于在 Commit 前
+    /// 预留 Retire 批次的固定容器容量，Commit 后不再扩容。
+    pub const fn retiring_object_capacity(&self) -> usize {
+        self.plan.retiring_object_capacity
     }
 
     pub const fn map_result(&self) -> Option<MapResultLayout> {
@@ -527,6 +535,7 @@ struct ChangePayload {
     key: ChangeKey,
     translations: Vec<TranslationIntent>,
     retiring: Vec<RetiringFragment>,
+    retiring_object_capacity: usize,
     retiring_permits: Vec<WritePermit>,
     result_layout: Option<MapResultLayout>,
 }
@@ -544,6 +553,10 @@ macro_rules! change_token {
 
             pub const fn map_result(&self) -> Option<MapResultLayout> {
                 self.0.result_layout
+            }
+
+            pub const fn retiring_object_capacity(&self) -> usize {
+                self.0.retiring_object_capacity
             }
         }
     };
@@ -1117,6 +1130,7 @@ impl MemorySpace {
                 remove,
                 replacements: materialized.replacements,
                 retiring: materialized.retiring,
+                retiring_object_capacity: materialized.retiring_object_capacity,
                 translations,
                 result_layout,
                 retiring_permits: materialized.retiring_permits,
@@ -1198,6 +1212,13 @@ impl MemorySpace {
         {
             return Err((ChangeError::AllocationFailed, permits));
         }
+        let mut retiring_objects = Vec::new();
+        if retiring_objects
+            .try_reserve_exact(validated.plan.retiring.len())
+            .is_err()
+        {
+            return Err((ChangeError::AllocationFailed, permits));
+        }
 
         let mut supplied = permits;
         let allocation = validated
@@ -1235,6 +1256,14 @@ impl MemorySpace {
         }
         debug_assert!(supplied.is_empty());
         for template in &validated.plan.retiring {
+            if let RegionKindView::Mapping {
+                backing: BackingView::Object { object, .. },
+                ..
+            } = template.kind
+                && !retiring_objects.contains(&object)
+            {
+                retiring_objects.push(object);
+            }
             retiring.push(RetiringFragment {
                 key: self.mint_region_key(),
                 allocation: template.allocation,
@@ -1247,6 +1276,7 @@ impl MemorySpace {
         Ok(MaterializedReservation {
             replacements,
             retiring,
+            retiring_object_capacity: retiring_objects.len(),
             retiring_permits,
             permits: supplied,
         })
@@ -1294,6 +1324,7 @@ impl MemorySpace {
             key: prepared.key,
             translations: prepared.plan.translations,
             retiring: prepared.plan.retiring,
+            retiring_object_capacity: prepared.plan.retiring_object_capacity,
             retiring_permits,
             result_layout: prepared.plan.result_layout,
         })

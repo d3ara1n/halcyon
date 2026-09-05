@@ -57,10 +57,10 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 `os/kernel/src/boot.rs` 以与用户态组装者同构的 op 序列构造 init（bootstrap 特例：进程未启动、无用户代码可执行）：
 
 1. 验证 BootPackage 并以不可伪造的 `BootHeldExtent` 按 payload_off 切分物理 owner，消费 supply seed 铸造唯一 root Pool；
-2. 创建 pid 1 的 Unbound shell，调用与 syscall 共用的 Bind helper 安装 root-funded PoolBinding，再装载 initial ELF 与 init 栈；
+2. 创建 pid 1 的 Unbound shell，调用与 syscall 共用的 Bind helper 安装 root-funded PoolBinding，并由 `UnpublishedBound` 持有 Bind 后但尚未发布的地址空间，再装载 initial ELF 与 init 栈；失败经有界 ProcessDrain 收束，不触发 `TableTree::Drop` 旁路；
 3. 创建 root JobControl、primordial SystemReset、init ProcessControl 与指向同一 root core 的 MemoryPool 管理 Handle，预留四个 Handle 槽并安装；
 4. 以真实句柄值构造出生块 prefix；payload owner 先与 root charge 合成 `BootFundedExtent`，prefix 在发布前直接回填，随后以 owner 借用投影完成可失败映射并无分配地安装本体，形成不可公开 Unmap 的只读 lease backing，不经历回库存再取得或无 owner 映射窗口；
-5. 经 `Process::attach_thread` 附入首线程，冻结 execution binding，`begin_running` 以唯一 bootstrap Building lease 入册并发布 Ready。
+5. 在 Handle commit 前完成 execution domain、staged 容量、首线程 Attach、Job member 与 Building operation 的所有可失败准备；唯一提交段之后以 `begin_running` 入册并发布 Ready，成功时转移 `UnpublishedBound`，失败由其负责完整回滚。
 
 initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；payload backing 与 root PoolBinding 在 init AddressSpace 有界收束时于锁外同步归还物理 extent 与 charge。内核没有 pid 特判的保留洞。
 

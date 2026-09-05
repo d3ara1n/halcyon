@@ -25,11 +25,11 @@ BootPackage envelope 是 eRhino boot ABI，只描述自身总长、initial ELF �
 2. 验证 BootPackage envelope，建立唯一 root MemoryPool 账户和初始 metadata admission；
 3. 创建 root Job 与 init 的 Building 空壳；
 4. 以普通 `ProcessBindMemory` 的内部同构语义把 init 绑定到 root pool；
-5. 解析并装载唯一的 initial ELF，构造 StartupBlock，收编 payload backing，并把不再使用的 BootPackage 页回投用户库存；
-6. 安装 root pool、root Job 与平台 primordial capabilities，附入首线程；
-7. 通过普通 readiness 检查首次发布 init runnable。
+5. 以未发布 Bound owner 解析并装载唯一的 initial ELF，构造 StartupBlock，收编 payload backing，并把不再使用的 BootPackage 页回投用户库存；
+6. 在提交前准备 root pool、root Job 与平台 primordial capabilities、首线程、Job member、执行域和 Ready 容量；
+7. 以与普通 ProcessStart 相同的提交协议一次发布全部状态并首次发布 init runnable。
 
-BootPackage 缺失、损坏或 initial ELF 不可执行属于启动失败，不能退化为“没有服务也继续运行”。任何步骤失败都必须保持系统储备与用户供给不重叠，且不能留下已计入 root pool 又可从库存取得的同一物理页；在 initial process 发布前无法恢复的失败是明确的 boot failure。内核不遍历 `bin/`，不识别 pm/fs/driver，不组装服务间 mailbox，也不决定启动顺序。
+BootPackage 缺失、损坏或 initial ELF 不可执行属于启动失败，不能退化为“没有服务也继续运行”。任何步骤失败都必须保持系统储备与用户供给不重叠，且不能留下已计入 root pool 又可从库存取得的同一物理页；Bind 成功但尚未发布的进程由专用未发布 Bound owner 持有，失败必须经有界 drain 收束，不能依赖页表或地址空间普通 Drop。Handle、Job member、线程、执行域和 Ready 容量的全部可失败准备均位于唯一提交点之前；提交后只允许固定、不可失败的发布序列。在 initial process 发布前无法恢复的失败是明确的 boot failure。内核不遍历 `bin/`，不识别 pm/fs/driver，不组装服务间 mailbox，也不决定启动顺序。
 
 initial process 通常自然取得 PID 1，但 PID 1 只作 provenance。其 authority 完全来自 StartupBlock 中显式安装的 root MemoryPool、root Job、设备资源等 capabilities。init 的不可转移 PoolBinding 与可派生、可授予的 root pool Handle 指向同一账户，前者支付 init 的内部 page-backed storage，后者授权用户态资源管理；共享 authority 不复制额度。内核为 init 执行的特殊动作仅存在于 Building 阶段的 bootstrap launcher，并复用普通绑定、映射和启动契约，不形成可由普通进程调用的物理映射或特权 syscall。
 
