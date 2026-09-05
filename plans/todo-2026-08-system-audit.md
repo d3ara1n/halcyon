@@ -1,5 +1,7 @@
 # 重写版系统审查
 
+> 当前状态：分片 1–2 已归档；分片 3–4、5–7 已完成首审并分别形成 [`review-2026-09-system-audit-03-04.md`](review-2026-09-system-audit-03-04.md) 与 [`review-2026-09-system-audit-05-07.md`](review-2026-09-system-audit-05-07.md)。两份报告均未通过最终收口， findings 由报告本身承载；后续需独立核验与修复后复审。
+
 本审查面向当前整棵代码树，不以 diff 或旧实现为边界。目标是证明外部契约、内部设计和实现相互一致，并显式暴露尚无法证明的假设。
 
 ## 证据
@@ -14,11 +16,11 @@
 
 1. SBI 边界与地址纪律（已完成，[分片报告](archived/review-2026-08-audit-01-sbi.md)）；
 2. trapframe、上下文切换与 CSR（已完成，[分片报告](archived/review-2026-08-audit-02-trap-context.md)）；
-3. 启动、页表与 TLB；
-4. SMP、调度与对象生命周期；
-5. syscall 与 `shared/` ABI；
-6. IPC、FAL 与用户态服务；
-7. 工程化收口。
+3. 启动、页表与 TLB（首审完成，见 `review-2026-09-system-audit-03-04.md`）；
+4. SMP、调度与对象生命周期（首审完成，见 `review-2026-09-system-audit-03-04.md`）；
+5. syscall 与 `shared/` ABI（首审完成，见 `review-2026-09-system-audit-05-07.md`）；
+6. IPC、FAL 与用户态服务（首审完成，见 `review-2026-09-system-audit-05-07.md`）；
+7. 工程化收口（首审完成，见 `review-2026-09-system-audit-05-07.md`）。
 
 后片可以使用前片已经确认的结论；前片未决时，后片不得把它当作前提。
 
