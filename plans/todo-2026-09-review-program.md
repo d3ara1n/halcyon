@@ -95,7 +95,7 @@
 
 ### 批次 D：机制泛化与 BootPackage/launcher
 
-**状态：待执行；不阻塞主线。**
+**状态：已完成，不通过。** D-1 报告发现 2 项 P1、1 项 P2；D-2 报告发现 6 项 P1、1 项 P2。两份报告本身承载 findings 的修复与复核计划；D-1 由 `PaleBear`、D-2 由 `StormyPine` 通过 mesh 独立只读完成。
 
 - 机制泛化：`15c7811`、`9c03251`、`95deea6`，只审 Lock Ladder、per-hart Timeout、MappingLease 三个尚未被吸收的代码轴；公理层和文档自洽不重复审查。
 - BootPackage/launcher：`29c6519..1bc83ac`，机制层既有报告不重复，补十切片代码审查。
@@ -105,7 +105,10 @@
 - `archived/todo-2026-08-27-mechanism-generalization-review.md`
 - `archived/todo-2026-08-26-bootstrap-launcher-review.md`
 
-报告：`plans/review-2026-09-mechanism-and-launcher.md`。
+报告：
+
+- D-1：`plans/review-2026-09-mechanism-generalization.md`
+- D-2：`plans/review-2026-09-bootstrap-launcher.md`
 
 ### 批次 E：系统审计分片 3–7
 
@@ -129,11 +132,10 @@
 
 ## 下一轮全体 Review 任务
 
-1. 批次 D：机制泛化与 BootPackage/launcher；
-2. 批次 E：系统审计分片 3–7；
-3. 批次 F 继续等待触发，不计入当前可执行轮次。
+1. 批次 E：系统审计分片 3–7；
+2. 批次 F 继续等待触发，不计入当前可执行轮次。
 
-批次 A–C 的未闭合 findings 分别由五份根目录 `review-*` 报告承接，不重复进入下一轮“待执行 Review”列表；修复完成后按报告复核。
+批次 A–D 的未闭合 findings 分别由七份根目录 `review-*` 报告承接，不重复进入下一轮“待执行 Review”列表；修复完成后按报告复核。
 
 ## 收口规则
 

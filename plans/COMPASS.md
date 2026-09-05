@@ -30,6 +30,8 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`review-2026-09-process-bind-page-table-retire.md`](review-2026-09-process-bind-page-table-retire.md) | 批次 B-2 已完成审查但未通过；一项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-lifecycle-and-scheduling.md`](review-2026-09-lifecycle-and-scheduling.md) | 批次 C-1 已完成审查但未通过；3 项当前有效 P1、3 项 P2，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-remote-call-user-memory.md`](review-2026-09-remote-call-user-memory.md) | 批次 C-2 已完成有条件审查；1 项 P2、2 项 P3，报告同时作为唯一修复与复核计划 |
+| [`review-2026-09-mechanism-generalization.md`](review-2026-09-mechanism-generalization.md) | 批次 D-1 已完成审查但未通过；2 项 P1、1 项 P2，报告同时作为唯一修复与复核计划 |
+| [`review-2026-09-bootstrap-launcher.md`](review-2026-09-bootstrap-launcher.md) | 批次 D-2 已完成审查但未通过；6 项 P1、1 项 P2，报告同时作为唯一修复与复核计划 |
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已有归档报告，03–07 待做 |
 | [`todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) | 当前实施计划：切片 8 多页 Tunnel/Runnel v2、切片 9 RNL2 动态 ring、切片 10 raw FramePool selftest adapter |
 | [`todo-2026-09-platform-reserved-memory-lifecycle.md`](todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |
