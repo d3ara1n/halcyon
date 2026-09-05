@@ -67,16 +67,15 @@ AddressSpace identity + epoch
 
 Commit 前使用不污染状态的最大值门禁：只有确认旧 epoch 小于最大可发布值时才写入新 epoch。若任一 epoch 耗尽，事务在 Commit 前返回明确错误或使 AddressSpace 进入永久不可变/退休状态；不得继续发布 PTE、Remote 请求或复用旧 epoch。
 
-## 自然实施顺序
+## 依赖驱动的纵向单元
 
-1. 盘点所有 token/generation/epoch 的产生点、承载结构与生命周期 owner；
-2. 冻结 identity domain 与统一 wrap/exhaustion policy；
-3. 先改纯逻辑 `os/remote_call` 和 `os/work_debt`，补跨实例与代次边界测试；
-4. 迁移内核 Handle/Job/Ready/member/work token 的耗尽检查，删除零值特例；
-5. 修正 AddressSpace epoch 发布门禁；
-6. 与 admission 计划联测 raw HartId/HartSlot，确保 slot mask 只在内部解释、SBI 边界只接收 canonical raw identity；
-7. 补 host debug/release、最大值模型、槽永久退休、错误实例/阶段/owner 误用和多 hart QEMU 验证；
-8. 删除重复 token helper、裸三元组校验和不再拥有真值的 fallback。
+先盘点身份产生点、验证点与 owner，冻结不可回绕和错误域拒绝策略，再按凭据的完整消费链实施：
+
+1. **MemoryChange 凭据链**：Remote/work token、AddressSpace epoch、内核 reserve/commit/abort/finish 与 host/真实接线测试一起迁移。与内存事务计划单元一共用交付边界，不先改纯逻辑 crate 再 adapter 接回旧调用者，也不把 epoch 留到事务完成后补。
+2. **进程发布凭据链**：Handle pin/consume、Job member、Ready reservation 及 Start/Bootstrap 使用点一起闭合，与构造单元二同步。各身份仍由自己的容器验证，不建立跨领域全局 token 真值。
+3. **其它独立消费者**：按各自完整 reserve→consume/abort 生命周期迁移，测试跨实例、错误 owner/phase、最大值和槽退休；当单元完成时删除旧 helper 和 fallback。
+
+raw HartId/HartSlot 由 admission 计划提供 canonical 输入，本计划只验证运行期凭据没有混淆身份。每个单元自带 host debug/release 和所需多 hart 验证，不把测试与删除推迟到所有容器改完之后。
 
 ## 完成标准
 
@@ -90,6 +89,6 @@ Commit 前使用不污染状态的最大值门禁：只有确认旧 epoch 小于
 
 ## 依赖与边界
 
-- MemoryChange 阶段类型与 Commit 后 owner 由 `todo-2026-09-memory-transaction-state-machine.md` 负责；本计划只定义其 token identity/exhaustion，不重造事务状态机。
+- MemoryChange 阶段类型与 Commit 后 owner 由 `todo-2026-09-memory-transaction-state-machine.md` 负责；本计划拥有 token identity/exhaustion 契约。直接依赖的门禁必须随该纵向单元接入，不能在其宣称 Commit 后必成之后再修；不重复建立阶段状态机。
 - DT/hart admission 与 canonical raw identity 由 `todo-2026-09-admission-fail-closed.md` 负责；本计划不重复 duplicate/sort admission。
 - Capability rights 与 Handle generation 的 ABI 语义若发生 shared 变化，必须与 `todo-2026-09-capability-owner-error-boundary.md` 同步，但 token 本身不成为用户授权凭据。

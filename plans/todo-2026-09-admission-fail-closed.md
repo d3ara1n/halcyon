@@ -1,6 +1,6 @@
 # 启动与平台 Admission Fail-Closed 收口计划
 
-> 当前代码审查后形成的统一修复批次。先完成方案内的整体收口，再实施；不把同一 admission 原则拆成互不协调的逐点补丁。
+> 当前 Review findings 的输入契约归属计划，导航见 [`Review 统筹`](todo-2026-09-review-program.md)。平台 admission 与 ELF admission 是独立纵向子单元，共享 fail-closed 原则但不共用无意义的总状态机。具体接受/忽略/拒绝集合必须先依 `references/CONTRACTS.md` 核验；下文候选规则与历史 finding 描述不替代规范裁定。
 
 ## 目标
 
@@ -43,10 +43,9 @@ raw input
 - entry 仍按 `vaddr .. vaddr + memsz` 判断，允许落入 BSS；应按 executable segment 的实际 file-byte interval 判断。
 - bootstrap、libprocess planner、静态 audit 必须共用同一 ELF admission 语义，而非各自复制判断。
 
-### reservation / generation 边界
+### 运行期身份的交接
 
-- reservation token、Remote Call token、AddressSpace epoch 等 generation 只在局部检查零值或溢出，缺少统一身份域与耗尽政策。
-- 该项与事务状态机计划存在交叉，但 admission 批次只负责输入/启动身份发布；MemoryChange 内部阶段 token 仍由 `todo-2026-09-memory-transaction-state-machine.md` 负责。
+reservation token、Remote Call token 与 AddressSpace epoch 的身份域/耗尽策略由 [`identity-generation-boundaries`](todo-2026-09-identity-generation-boundaries.md) 唯一拥有。本计划只发布 canonical 平台/镜像事实，不另排一轮 token 重构；内存与启动事务直接消费其所需的凭据前置。
 
 ## 最终形态
 
@@ -78,16 +77,13 @@ raw input
 - 普通 IPI 发送只返回/记录失败，不在已发布业务 Pending 后伪造完成；终止/唤醒路径使用固定失败政策；
 - Gate 的 Preparing/Ready/Failed 必须对所有 admitted hart 可观察，失败状态不允许永久停留 Preparing。
 
-## 自然实施顺序
+## 纵向子单元与依赖
 
-1. 先冻结平台 admission 错误分类与 raw-id/slot canonical 记录；
-2. 收口 DT status、CPU capability、duplicate/sort；
-3. 统一 FramePool/平台 reservation 的 checked arithmetic；
-4. 收口 RuntimeGate/HSM/IPI 失败传播；
-5. 抽出 libelf validated image/entry/flags 语义，迁移 audit、libprocess、bootstrap；
-6. 统一 token/epoch 的身份域与耗尽策略（与事务计划交叉处只保留一个 owner）；
-7. 补 malformed DTB、duplicate/unsorted hart、HSM failure、frame arithmetic、PT_INTERP/unknown flags/entry-in-BSS 的 host 与启动负向测试；
-8. 运行 `just check`、host debug/release、virt/release/hetero/nofd/sifive_u/acceptance，确认失败态广播和无半发布资源。
+1. **规范与契约冻结**：从固定规范确认 status、CPU、ELF header/flags 的接受、合法忽略与明确拒绝集合，形成 canonical 数据与错误接口。不得把已知合法但不可用的节点一概视为 malformed，也不机械拒绝所有非 PT_LOAD header。
+2. **ELF admission**：纯逻辑 validated image、audit、libprocess 与 Bootstrap 入口一起迁移并补负向测试。它是构造与启动纵向单元的直接前置，可独立于无关 DT 改动先完成；旧 parser 解释分支与重复工具规则同单元删除。
+3. **平台 admission**：DT/区间 checked normalize、FramePool 接入、raw-id/slot、RuntimeGate/HSM/IPI 的生产者到发布者整体收口，补 malformed、duplicate/unsorted、边界算术与平台失败广播测试。
+
+每个子单元自带 `just check`、host debug/release 与相关 QEMU 负向证据；组合阶段运行 virt/release/hetero/nofd/sifive_u/acceptance。身份耗尽的实现不在本计划重复安排，按 identity 计划与事务的直接依赖完成。
 
 ## 完成标准
 

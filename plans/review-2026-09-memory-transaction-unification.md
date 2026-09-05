@@ -1,6 +1,6 @@
 # 统一内存事务核与公共 MemoryObject Review
 
-> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围与基线
 
@@ -176,7 +176,7 @@ just virt
 
 ## 后续行动与复核条件
 
-本报告在 findings 未闭合期间即为行动计划，不另建重复 todo：
+以下为首审建议与复核条件；当前前三项事务问题由内存事务计划统一实施，EXECUTE 由 capability 计划实施，归属见统筹导航：
 
 1. 先修复统一 rollback 的 WritePermit 归还、retire batch 的 object owner 去重和 post-Commit 容量预留；
 2. 再补齐独立 `EXECUTE` capability、RX rights 矩阵及 shared/kernel/rinlib 纵向 ABI；

@@ -1,204 +1,119 @@
-# Review 统筹计划：已完成主线的只读审查
+# Review findings 统筹导航
 
-> 当前首审阶段已结束。本计划保留为 Review findings 的状态导航与修复交接入口；后续修复 agent 应以各 `plans/review-*.md` 的未闭合 findings 为唯一行动真值点，不再重复发起首审。
->
-> 本计划是当前这轮代码 Review 的统筹入口。本次将现有重叠的 `todo-*-review.md` 整理并合并到批次 A–E；这只是当前积压任务的归并，不废止 `todo-*-review.md` 作为未来提交后的审查计划类型。归档不表示对应审查已完成。每个批次必须先生成正式 `review-<日期>-<主题>.md`，再将本批次标记为已收口。
->
-> 审查模型：`moeflux-openai-responses/gpt-5.6-sol`。审查只读，不修改代码；发现问题只写 finding、notes 归属或新的修复 todo。
->
-> 当前配额约束：本轮 `reviewer` 子代理账户已耗尽，不再继续委派 reviewer。后续 Review 优先使用用户直接开启的 mesh 主代理会话；`explorer` 仅做代码测绘和事实收集，`researcher` 仅做外部资料取证，二者不能替代 reviewer 或主代理进行 Review 判定和设计决策。该约束是当前工具状态，不改变未来角色定义。
+> A–E 首审已结束，不重复发起首审。当前工作是按系统机制收口 findings，而不是逐篇报告顺序打补丁。事务与启动主线处于设计冻结前，入口为 [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md)。
 
-## 当前基线
+## 文档职责
 
-- 当前状态复核基线：`11fde56`（2026-09-05，系统审计首审文档收口）。各历史 Review 报告仍以各自目标提交为证据，不以本基线替代历史范围。
-- Review 纪律：[`REVIEW.md`](REVIEW.md)。
-- 代码、测试和实现文档均以提交范围为准，不以当前工作树的后续状态替代目标提交证据。
-- Review 报告写入 `plans/review-<日期>-<主题>.md`；报告完成后才将本计划对应批次标为已收口。当前 A–E 均已有首审报告并保留在根目录承载未闭合 findings；系统审计规范详见 `todo-2026-08-system-audit.md`。
+| 文档 | 唯一职责 |
+|---|---|
+| 本文 | findings → 契约 owner / 实施计划的导航与跨专题依赖，不重复定义方案 |
+| `review-*.md` | 固定目标提交的历史证据、发现与复核条件；正文中的建议不是当前实施顺序 |
+| 专题 `todo-*.md` | 当前目标、方案、实施单元、未决前置与完成门；同一缺口只在所属专题安排实施 |
+| `notes/ideas/` | 可脱离当前代码成立的系统方向与契约 |
+| `notes/impls/` | 可由当前代码取证的实现现状，不把计划目标写成已实现 |
+| `COMPASS.md` | 当前方向、位置与各入口，不另排一套任务 |
 
-## 统筹原则
+报告与专题计划可以并存，但不得同时声称拥有该 finding 的当前行动真值。报告保留历史结论，修复后追加复核证据；不改写目标提交曾经存在的缺陷。所有有效条目完成复核后才归档该报告，不能因为其中一个机制子集完成就整篇归档。
 
-1. 先审会影响后续主线的基础机制，再审可独立收口的历史批次。
-2. 同一提交或同一 owner/事务 seam 只保留一个审查真值点，重叠计划不重复全量审查。
-3. 设计结论进入 `notes/ideas/`，实现事实进入 `notes/impls/`，可执行修复进入唯一的新 todo；Review 报告不直接改代码。
-4. 发现高风险 finding 时暂停依赖该机制的后续 Review，先形成修复计划；普通 finding 可集中到后续修复批次。
-5. `kernel-final-architecture-review` 与设备/中断 carryover 仍受触发条件约束，不提前伪造完成。
-6. Reviewer 失败、超时或额度中断均记为“未完成”，不得据部分输出生成正式报告；失败批次进入下轮待审集合并保留原优先级。
-7. 每次 reviewer 委派必须自包含：明确项目架构、审查纪律、提交边界、历史清单、目标输出、禁止事项和验证权限；不得依赖会话继承。
+## 系统机制与交付边界
 
-## 审查批次与顺序
+### 地址空间事务与进程启动
 
-### 批次 A：统一内存事务核与公共 MemoryObject（P0）
+由 [`memory-transaction-state-machine`](todo-2026-09-memory-transaction-state-machine.md) 拥有两个纵向单元：
 
-**状态：已完成，不通过。** 报告：[`review-2026-09-memory-transaction-unification.md`](review-2026-09-memory-transaction-unification.md)。报告本身承载四项 P1 的修复与复核计划。批次 B–E 需避开这些共享事务/对象 seam 的修复依赖，或在 findings 修复后重新取证。
+1. 地址空间：ledger / funding / 来源保活 / abort / PTE publish / Remote / retire，连同匿名、MemoryObject、Building、Tunnel 调用者一次迁移。
+2. 进程：私有 Bound 构造失败 / 普通 Start / Bootstrap / Job-lifecycle gate / 首次 Ready 发布一次迁移。
 
-目标提交：`d2ff81e`、`5c0bbb0`、`d6a162c`；前置对象投影提交 `51b3742`、`0fad27f`、`310d089`、`0a4eacb`、`81b5b3e` 只在相关 seam 被引用时取证。
+二者共享失败与提交原则，不合并成万能事务框架。基础机制继续保留：ledger 真值、funded owner、PoolBinding、MemoryObject permit、execution gate、Remote 确认链、有界 work debt 与 ProcessDrain。
 
-合并来源：
+### 其它专题
 
-- `archived/todo-2026-09-memory-transaction-unification-review.md`
-- `archived/todo-2026-09-object-projection-review.md`
+- [`admission-fail-closed`](todo-2026-09-admission-fail-closed.md)：平台/ELF 输入的规范化、checked validation 与 immutable admission。
+- [`identity-generation-boundaries`](todo-2026-09-identity-generation-boundaries.md)：实例身份、代次、不可回绕与耗尽策略。
+- [`capability-owner-error-boundary`](todo-2026-09-capability-owner-error-boundary.md)：rights/signal、用户态 affine owner、已接收 capability 与 ReplyPort 的消费边界。
+- [`supervision-authority-policy`](todo-2026-09-supervision-authority-policy.md)：用户态 authority 保留、有限等待与失败升级。
+- 工程 lint 门由 E-2 的 E2-7-01 独立承接；尚无其它专题重复拥有它。
 
-重点：WritePermit 守恒、view owner/permit 析构顺序、锁阶、Commit 零分配、AddressSpace-owned 与 object-owned view 撤销闭包、容量自洽、seal/EXECUTABLE 与跨进程 view 的验证缺口。
+以上是职责域，不是要求“一个专题全做完才开始下一个”的队列，也不是一套共用状态机。关联子单元按前置关系衔接；独立问题不强塞进当前内存重构。
 
-报告：`plans/review-2026-09-memory-transaction-unification.md`。
+## Findings 实施归属
 
-### 批次 B：内存供给、Pool、funded owner 与页表生命周期
-
-**状态：已完成，不通过。** B-1 报告 [`review-2026-09-memory-supply-and-pool.md`](review-2026-09-memory-supply-and-pool.md) 发现 1 项 P1、3 项 P2；B-2 报告 [`review-2026-09-process-bind-page-table-retire.md`](review-2026-09-process-bind-page-table-retire.md) 发现 1 项 P1。两份报告本身承载后续修复与复核计划。B-1 由 `SlowJuniper`、B-2 由 `CosmicPussy` 通过 mesh 独立只读完成。
-
-按提交依赖顺序分为同一统筹批次下的窄报告，避免把九份重叠清单重复审查：
-
-1. B-1（`SlowJuniper`）：平台供给与系统储备 `198e665`、`0a944c7`；MemoryPool 与 funded frame broker `4715f3a`、`48227c8`；
-2. B-2（`CosmicPussy`）：ProcessBind/bootstrap 与 funded owner 页表生命周期 `7c76097`、`c522e50`；deferred retire 与页表资金化事务 `7225673`、`cfad6cf`、`addb4a5`、`b4bfb20`。
-
-合并来源：
-
-- `archived/todo-2026-09-platform-memory-ledger-review.md`
-- `archived/todo-2026-09-system-supply-reserve-review.md`
-- `archived/todo-2026-09-memory-pool-review.md`
-- `archived/todo-2026-09-funded-frame-broker-review.md`
-- `archived/todo-2026-09-process-memory-binding-bootstrap-review.md`
-- `archived/todo-2026-09-funded-owner-page-table-lifecycle-review.md`
-- `archived/todo-2026-09-deferred-retire-review.md`
-- `archived/todo-2026-09-page-table-funding-transaction-review.md`
-- `archived/todo-2026-09-02-memory-page-table-6d-review.md`
-
-报告：
-
-- `plans/review-2026-09-memory-supply-and-pool.md`
-- `plans/review-2026-09-process-bind-page-table-retire.md`
-
-### 批次 C：线程生命周期、Remote Call 与用户内存联合审查
-
-**状态：已完成，不通过。** C-1 报告发现 3 项当前有效 P1、3 项 P2；两项历史 P1 已由后续 `98d2449` 修复。C-2 报告发现 1 项 P2、2 项 P3。报告本身承载 findings 的修复与复核计划；交叉范围和已知 A/B findings 已去重。
-
-合并以下重叠范围：
-
-- `d741880`、`bdc83ef`、`004cae5`：线程成员表、teardown barrier、ThreadSpawn/join、末线程终局；
-- `6199985`、`004cae5`：Remote Call 固定槽、RVWMO、epoch、stale translation 与 retire；
-- 用户内存切片 `1cd6ab2` 至 `9358963`、`bdc83ef`、`004cae5`；
-- `fcbd5b6`、`b161163`：持久 init/pm 委托域；
-- `1d7dc92`：调度域 eligibility 与 D64。
-
-合并来源：
-
-- `archived/todo-2026-08-28-thread-teardown-review.md`
-- `archived/todo-2026-08-30-remote-call-review.md`
-- `archived/todo-2026-08-30-user-memory-mapping-review.md`
-- `archived/todo-2026-08-28-persistent-init-review.md`
-- `archived/todo-2026-08-28-domain-eligibility-review.md`
-
-报告：
-
-- C-1：`plans/review-2026-09-lifecycle-and-scheduling.md`
-- C-2：`plans/review-2026-09-remote-call-user-memory.md`
-
-同一提交 `004cae5` 的线程、地址空间和 Remote Call 交错已由统筹会话去重；两个主代理无需直接沟通。
-
-### 批次 D：机制泛化与 BootPackage/launcher
-
-**状态：已完成，不通过。** D-1 报告发现 2 项 P1、1 项 P2；D-2 报告发现 6 项 P1、1 项 P2。两份报告本身承载 findings 的修复与复核计划；D-1 由 `PaleBear`、D-2 由 `StormyPine` 通过 mesh 独立只读完成。
-
-- 机制泛化：`15c7811`、`9c03251`、`95deea6`，只审 Lock Ladder、per-hart Timeout、MappingLease 三个尚未被吸收的代码轴；公理层和文档自洽不重复审查。
-- BootPackage/launcher：`29c6519..1bc83ac`，机制层既有报告不重复，补十切片代码审查。
-
-合并来源：
-
-- `archived/todo-2026-08-27-mechanism-generalization-review.md`
-- `archived/todo-2026-08-26-bootstrap-launcher-review.md`
-
-报告：
-
-- D-1：`plans/review-2026-09-mechanism-generalization.md`
-- D-2：`plans/review-2026-09-bootstrap-launcher.md`
-
-### 批次 E：系统审计分片 3–7
-
-**状态：已完成首审，不通过。** E-1 报告发现 3 项 P1、1 项 P2；E-2 报告发现 1 项 P1、1 项 P2。两份报告本身承载 findings 的修复与复核计划；E-1 由 `BrightDick`、E-2 由 `IndigoMagpie` 通过 mesh 独立只读完成，交叉 findings 与 A–D 已知问题已去重。
-
-`todo-2026-08-system-audit.md` 保留为详细审查规范。分片 1、2 已有归档报告；分片 3–4 与 5–7 分别由 `review-2026-09-system-audit-03-04.md`、`review-2026-09-system-audit-05-07.md` 承载首审结论与后续复核。本批次不重复已经完成的分片 1、2。
-
-### 批次 F：触发条件审查
-
-**状态：暂缓。**
-
-- 设备/中断 carryover：设备、中断、DMA 接入设计开始时，按 `todo-2026-08-26-review-carryover.md` 的唯一条目执行。
-- 内核最终架构：MemoryObject 主线、多页 Tunnel、Runnel v2、主要用户态消费者全部完成，且 A–E 基础审查收口后执行。对应计划的观察点在触发前只登记，不提前重构。
-
-## 未完成委派记录
-
-| 日期 | 批次 | 模型 | 结果 | 后续 |
-|---|---|---|---|---|
-| 2026-09-05 | A：统一内存事务核与公共 MemoryObject | `yanproxy-vip/openai/gpt-5.6-sol` | provider `openai_error`，无可用报告 | 已以新模型重试 |
-| 2026-09-05 | A：统一内存事务核与公共 MemoryObject | `moeflux-openai-responses/gpt-5.6-sol` | 完成，报告判定不通过，四项 P1 | 后续由该 review 报告承接 |
-
-## 当前 HEAD findings 状态复核（基线 `11fde56`）
-
-本轮先尝试委托两个 explorer 做只读状态测绘，但均因账户周配额耗尽失败；没有可采纳的子代理输出。以下状态由统筹主代理依据当前代码、git history 和现有报告手工核对，属于修复前的整理，不修改代码。
-
-| 报告/ finding | 当前状态 | 依据与后续归属 |
+| 报告 / 条目 | 契约与实施 owner | 当前处置边界 |
 |---|---|---|
-| A：WritePermit rollback 泄漏 | 仍存在 | `proc.rs` rollback 仍未统一 `take_permits/cancel_write`；留在 A 报告 |
-| A：同对象 retiring owner 重复移除 | 仍存在 | `release_view_region`/batch 去重未见收口；留在 A 报告 |
-| A：post-Commit retire `Vec::push` | 仍存在 | retire 容器仍需核对前置容量；留在 A 报告 |
-| A：MemoryObject 缺 EXECUTE | 仍存在 | shared Rights 与 RX required rights 仍缺独立位；留在 A 报告 |
-| B-1 F-1：DT status unknown | 仍存在 | `dtb/memory.rs` 仍同时接受 `ok/okay`；留在 B-1 报告 |
-| B-1 F-2：FramePool checked arithmetic | 仍存在 | metadata 加法边界仍待 checked hardening；留在 B-1 报告 |
-| B-1 F-3/F-4：Drop/query panic | 仍存在 | MemoryPool Drop 与 SystemSupply ticket query 仍需统一错误边界；留在 B-1 报告 |
-| B-2 F-1：bootstrap post-commit 可失败窗口 | 仍存在 | 当前 `launch_bootstrap` 在 `handles.commit` 后仍 `attach_thread`；留在 B-2 报告 |
-| C-1 P1-01/P1-02：监督 authority/静默降级 | 仍存在 | `srv_init` 仍在失败时移除 control/继续启动缺失服务；留在 C-1 报告 |
-| C-1 P1-03：一次性 steady_state | 已修复 | 后续 `98d2449` 永久循环；仅保留历史证据 |
-| C-1 P1-04：隐式 quiescent shutdown | 已修复 | 后续 `98d2449` 显式 SystemReset；仅保留历史证据 |
-| C-1 P1-05：旧 raw-hart shift | 已修复/合并 | 当前 `send_ipi(1, raw)` 已取代旧 shift；不再作为独立当前债务 |
-| C-1 P2：q-only DT、ThreadControl CLOSED、无限监督等待 | 仍存在 | 当前 parser/signal/supervisor 仍需修复；留在 C-1 报告 |
-| C-2 F1/F2/F3：Remote token/epoch/UserStack | 仍存在/待核验 | 当前接口仍缺 table identity、epoch 边界和统一 Drop 策略；留在 C-2 报告 |
-| D-1 P1-01/P1-02：旧 WaitContext/期限注销 | 已修复 | 当前 `TimeoutRegistration`、`finish_installing`、TimerQueue cancel 已接入；留历史证据 |
-| D-1 P2：MappingLease 验证边界 | 仍为验证缺口 | 未发现已证实新死锁/泄漏；留在 D-1 报告 |
-| D-2 F-01：payload owner | 已修复 | 当前 `BootFundedExtent/BootBorrowed/install_bootstrap_funding` 已接入 |
-| D-2 F-02：reservation holes/overlap | 仍存在/待核验 | `frame.rs` reservation normalize 仍需独立修复核对；留在 D-2 报告 |
-| D-2 F-03：sifive_u memory 参数 | 已修复 | 当前 Justfile 按 MODEL 选择 128M/1024M |
-| D-2 F-04：ProcessCreate Control/Job membership | 已修复 | 当前 `process::create` 已预构造 Control 并写入结果；旧 finding 需标历史修复 |
-| D-2 F-05/F-06：ELF entry/PT_INTERP/flags | 仍存在/待核验 | 当前 audit/parser 仍需补 byte-range 与 unsupported header 核对；留在 D-2 报告 |
-| D-2 F-07：reservation token wrap | 仍存在/待核验 | 当前 token 耗尽/代数策略仍需独立确认；留在 D-2 报告 |
-| E-1 M3-1：Bound image 失败未 drain | 仍存在 | 当前 `spawn_from_elf` Bind 后 `?` 仍无显式失败收束；留在 E-1 报告 |
-| E-1 M3-2/M3-3/M3-4：raw admission/Gate/slot order | 仍存在 | registry/rt/board 当前仍需 duplicate、Failed 广播和排序闭包；留在 E-1 报告 |
-| E-2 E2-5-01：librpc reject Handle/ReplyPort | 仍存在 | 当前 framing reject 仍未 close handles/discard port；留在 E-2 报告 |
-| E-2 E2-7-01：clippy/lint gate | 仍存在 | clippy 仍非 Justfile 静态门；留在 E-2 报告 |
+| A：WritePermit rollback、同对象 owner、post-Commit 容量 | 内存事务计划，纵向单元一 | `4e62979` 有局部修复；统一来源 owner、跨批次与存储预算尚未闭合 |
+| A：EXECUTE capability、RX rights | Capability 计划，rights 纵向子单元 | 完整 RX authority/验收的前置；不能由 MemoryChange 重造权限规则 |
+| B-1 F-1/F-2：DT status、FramePool arithmetic | Admission 计划，平台输入子单元 | 编码前回到固定规范核对接受/拒绝集合；不凭历史建议猜标准 |
+| B-1 F-3/F-4：MemoryPool Drop、SystemSupply query | Capability/owner 计划，相应消费边界子单元 | 用户态错误政策与纯 ticket 查询独立实现，不套内核事务类型 |
+| B-2 F-1：Bootstrap post-commit | 内存事务计划，纵向单元二 | 审查必须延伸至 `boot.rs` / Ready 发布，不能只前移 Attach |
+| C-1 P1-01/P1-02/P2-08：监督 authority、服务缺失、无限等待 | Supervision 计划 | 保留控制权直至可靠收束或明确接管；不由内核代做政策 |
+| C-1 P2-06：q-only CPU capability | Admission 计划 | 与 canonical CPU admission 同单元 |
+| C-1 P2-07：ThreadControl CLOSED | Capability 计划，signal 子单元 | allowed signal 与真实可达状态一致 |
+| C-2 F1/F2：Remote token identity、AddressSpace epoch | Identity 计划 | 策略唯一；事务依赖的凭据与 epoch 门禁随单元一接入 |
+| C-2 F3：UserStack cleanup | Capability/owner 计划 | 与 Join/reaper、监督政策确定交接，不在 Drop 无限重试 |
+| D-1 P2-D1-03：MappingLease 失败/析构验证 | 内存事务计划，纵向单元一 | 对当前 Tunnel lease 结构复核，不复活历史 MappingLease 类型 |
+| D-2 F-02：启动 reservation 区间 | Admission 计划 | 先核对当前规范化供给机制，已被覆盖的历史路径不重复修复 |
+| D-2 F-05/F-06：ELF entry、PT_INTERP/flags | Admission 计划，ELF 纵向子单元 | runtime parser、audit、launcher 共用 validated image；构造单元二消费它 |
+| D-2 F-07：reservation token | Identity 计划 | Handle/Job/Ready 各容器凭据绑定身份；相关 Start 接线随单元二完成 |
+| E-1 M3-1：Bound 镜像失败 | 内存事务计划，纵向单元二 | 私有失败驱动与正式 Drain 同源，不隐藏在 Drop 中 |
+| E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | Admission 计划 | canonical admitted 集合与失败广播 |
+| E-2 E2-5-01：RPC reject capability/port | Capability/owner 计划，RPC 接收子单元 | 消费拒绝消息及旧端口，不复用污染状态 |
+| E-2 E2-7-01：clippy / lint 门 | E-2 报告 | 独立工程项，不阻塞内存结构设计；不能宣称全仓 lint-clean |
 
-该表是当前修复排序真值点；报告正文保留历史目标提交证据，不在本轮伪造“原提交已被当前代码修复”。
+### 已有后续修复证据的历史条目
 
-## 首审阶段收口与修复交接
+以下不是当前重复实施队列；改到对应 seam 时只做回归核验：
 
-- A–E 首审已完成；本轮不再启动新的首审 reviewer。
-- 当前复核确认：历史 findings 不逐条打补丁。事务失败闭包相关 findings 统一延期至 [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md)，按最终类型状态机整体重构；在触发条件满足前不引入半成品兼容修复。
-- 启动/平台 admission 相关 findings 统一由 [`todo-2026-09-admission-fail-closed.md`](todo-2026-09-admission-fail-closed.md) 承接，按 canonical admission 与 fail-closed 机制整体收口，不拆成孤立修复。
-- 生命周期监督相关 findings 统一由 [`todo-2026-09-supervision-authority-policy.md`](todo-2026-09-supervision-authority-policy.md) 承接，按 authority 保留、有限等待和失败升级状态机整体重构，不拆成孤立超时/日志修复。
-- Capability/affine owner/error boundary findings 统一由 [`todo-2026-09-capability-owner-error-boundary.md`](todo-2026-09-capability-owner-error-boundary.md) 承接，按 ABI、消费式 owner 与 reject/discard 机制整体收口，不拆成零散 Drop 或权限补丁。
-- Token/generation/epoch findings 统一由 [`todo-2026-09-identity-generation-boundaries.md`](todo-2026-09-identity-generation-boundaries.md) 承接，按身份域与统一耗尽策略整体收口；与事务、admission、capability 计划交叉处只保留各自 owner，不重复造凭据机制。
-- 所有未闭合 findings 继续留在九份根目录 `review-*.md`，报告同时作为修复计划、验证清单和后续 diff review 规范。
-- 后续修复 agent 应先以当前 HEAD 重新核对报告中的 findings 状态，再按依赖顺序修复；已被后续提交修复的历史 finding 只保留证据，不重复实施。
-- 修复后必须回到原报告逐条复核，完成 host/debug/release/QEMU/故障注入等对应验证；全部闭合后才将报告移入 `plans/archived/`。
-- 批次 F（设备/中断/DMA carryover、内核最终架构 review）继续等待各自触发条件，不属于当前修复交接范围。
+- C-1 P1-03/P1-04：`98d2449` 已以持久 supervisor 与显式 SystemReset 收口；旧 raw-hart shift（P1-05）由 `send_ipi(1, raw)` 替换，当前 hart admission 剩余由 E-1 承接。
+- D-1 P1-D1-01/P1-D1-02：已有 `TimeoutRegistration`、`finish_installing` 与 TimerQueue cancel。
+- D-2 F-01/F-03/F-04：已有 funded payload owner、按模型选择 QEMU memory、ProcessCreate 稳定 Control 与 Job member。
 
-### 建议修复顺序
+历史报告的最终判定按目标提交保留；上述状态不意味着本轮已重新运行其完整验证。
 
-1. 内核失败闭包：M3-1、B-2 bootstrap post-commit、A 的 WritePermit rollback/retire owner/capacity；
-2. 启动与 SMP 准入：M3-2、M3-3、M3-4；
-3. 用户态 authority 与协议：C-1 监督 findings、E2-5-01、A 的 EXECUTE capability；
-4. 供给/错误边界/工程化：B-1 findings、C-2/D-1/D-2 仍有效 findings、E2-7-01 及专项验证缺口。
+## 前置与自然顺序
 
-### 委派失败记录
+```text
+整体设计：owner / 提交资格 / 失败边界 / 预算 / 验证模型
+    ├─ Identity 策略及所需凭据 ──→ 地址空间纵向单元一
+    ├─ EXECUTE/authority ───────→ 对象 RX 联合验收
+    ├─ ELF validated image ────→ 构造与启动纵向单元二
+    └─ 平台 admission ─────────→ 完整启动失败/SMP 联合验收
 
-本轮 explorer 状态复核委派因账户周配额耗尽失败，无可采纳输出；状态矩阵由主代理依据当前代码和 git history 手工核对。该失败不影响首审完成状态，也不构成新的 Review 结论。
+单元一 → 单元二 → 跨机制验收与原报告复核 → 多页 Tunnel / Runnel
 
-批次 A–E 的未闭合 findings 分别由九份根目录 `review-*` 报告承接，不重复进入下一轮首审列表；修复完成后按报告复核。
+用户态消费边界 ↔ 监督错误接管：独立设计交接，同步其公共契约
+```
 
-## 收口规则
+- Commit 后不可失败的承诺依赖 epoch/Ready/Remote 等凭据在修改前处理耗尽；不能先宣称事务闭合，再把这些门禁留给以后补。
+- 不把“先改纯逻辑 crate → adapter 接回旧内核 → 最后清理调用者”当作阶段顺序。一个纵向单元跨所有必要模块，采用最终接口并在同单元删除旧路径。
+- 可以先编辑某个模块、用编译器定位未迁移调用点；中间工作树能否编译不是架构决策依据，不为它引入临时机制。
+- 设计确认、完整纵向单元验收、提交后的 Review 是不同边界；不能把“分阶段确认”解释为每个 crate 独立交付。
+- 多页 Tunnel/RNL2 只在直接依赖的事务/启动及 authority 闭合后恢复。其他独立 findings 继续按专题推进；最终架构 Review 仍要求 A–E 基础问题与既定数据面触发条件满足。
 
-每个批次完成时：
+## 首审报告索引
 
-1. 报告逐项给出证据、可达前提、违反的不变量和后续归属；
-2. 把设计/实现结论同步到相应 notes；只有 Review 范围之外的独立能力缺口才另建 todo；
-3. 在本计划中更新批次状态、报告链接和未决项；
-4. findings 未闭合的 `review-*` 留在 `plans/` 根目录并作为唯一行动真值点；全部修复并复核后移入 `plans/archived/`；
-5. 不因 Review 通过而修改代码，不把“测试全绿”当作语义审查完成证明。
+每份报告保留其目标提交、执行命令和验证限制。当前代码准备基线为 `4e62979`，本批只交付文档；不能以当前实现替代历史快照，也不能把干净工作树视为 findings 已闭合。
+
+| 批次 | 报告 | 历史目标范围 |
+|---|---|---|
+| A | [`memory-transaction-unification`](review-2026-09-memory-transaction-unification.md) | `d2ff81e`、`5c0bbb0`、`d6a162c`，相关对象投影前置按 seam 引用 |
+| B-1 | [`memory-supply-and-pool`](review-2026-09-memory-supply-and-pool.md) | `198e665`、`0a944c7`、`4715f3a`、`48227c8` |
+| B-2 | [`process-bind-page-table-retire`](review-2026-09-process-bind-page-table-retire.md) | `7c76097`、`c522e50`、`7225673`、`cfad6cf`、`addb4a5`、`b4bfb20` |
+| C-1 | [`lifecycle-and-scheduling`](review-2026-09-lifecycle-and-scheduling.md) | `d741880`、`bdc83ef`、`004cae5`、`fcbd5b6`、`b161163`、`1d7dc92` |
+| C-2 | [`remote-call-user-memory`](review-2026-09-remote-call-user-memory.md) | 用户内存 `1cd6ab2` 至 `9358963`、`6199985`、`bdc83ef`、`004cae5` |
+| D-1 | [`mechanism-generalization`](review-2026-09-mechanism-generalization.md) | `15c7811`、`9c03251`、`95deea6` |
+| D-2 | [`bootstrap-launcher`](review-2026-09-bootstrap-launcher.md) | `29c6519..1bc83ac` |
+| E-1 | [`system-audit-03-04`](review-2026-09-system-audit-03-04.md) | `e5db4f3`，审计分片 3–4 |
+| E-2 | [`system-audit-05-07`](review-2026-09-system-audit-05-07.md) | `e5db4f3`，审计分片 5–7 |
+
+历史首审清单位于 `archived/todo-*-review.md`；归档这些清单不表示 findings 已解决。系统审计规范仍见 [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md)。
+
+## 执行与复核纪律
+
+1. 先核对当前代码与目标契约，区分有效缺陷、历史已修、验证缺口和待证假设；不能把历史建议机械转成实现。
+2. 在所属专题冻结方案与依赖，再按完整纵向单元实施。发现前提冲突暂停该单元，修订计划后继续。
+3. 每单元覆盖正常/失败/并发路径、真实锁阶、最后 owner 析构、容量及 work 计费，并同步删除旧入口和文档残留。
+4. 使用仓库 Just/host 验证规则；完整日志保留，已知 flake 按 KNOWN_ISSUES 判读。只读分析不能冒充新增测试结果。
+5. 修复提交之后按原报告逐项复核，记录修复提交、执行证据和剩余条目；报告全部闭合后归档。
+6. 设备/中断 carryover 和最终架构 Review 保持既定触发条件，不提前伪造完成。
+
+首审过程中曾有 provider 错误与 reviewer/explorer 配额失败，没有完成的委派不构成证据。今后是否委派以当前工具状态为准，不把历史账户限制作为永久项目约束。

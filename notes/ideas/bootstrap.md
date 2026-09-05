@@ -29,7 +29,9 @@ BootPackage envelope 是 eRhino boot ABI，只描述自身总长、initial ELF �
 6. 在提交前准备 root pool、root Job 与平台 primordial capabilities、首线程、Job member、执行域和 Ready 容量；
 7. 以与普通 ProcessStart 相同的提交协议一次发布全部状态并首次发布 init runnable。
 
-BootPackage 缺失、损坏或 initial ELF 不可执行属于启动失败，不能退化为“没有服务也继续运行”。任何步骤失败都必须保持系统储备与用户供给不重叠，且不能留下已计入 root pool 又可从库存取得的同一物理页；Bind 成功但尚未发布的进程由专用未发布 Bound owner 持有，失败必须经有界 drain 收束，不能依赖页表或地址空间普通 Drop。Handle、Job member、线程、执行域和 Ready 容量的全部可失败准备均位于唯一提交点之前；提交后只允许固定、不可失败的发布序列。在 initial process 发布前无法恢复的失败是明确的 boot failure。内核不遍历 `bin/`，不识别 pm/fs/driver，不组装服务间 mailbox，也不决定启动顺序。
+BootPackage 缺失、损坏或 initial ELF 不可执行属于启动失败，不能退化为“没有服务也继续运行”。任何步骤失败都必须保持系统储备与用户供给不重叠，且不能留下已计入 root pool 又可从库存取得的同一物理页；Bind 成功但尚未发布的进程由专用未发布 Bound owner 持有，失败必须经有界 drain 收束，不能依赖页表或地址空间普通 Drop。Handle、Job member、线程、执行域和 Ready 容量的全部可失败准备均位于唯一启动提交点之前；提交后只允许固定、不可失败的发布序列，首次 runnable 交付也属于该责任，不能留给外层普通入队重新分配容量。在 initial process 发布前无法恢复的失败是明确的 boot failure。内核不遍历 `bin/`，不识别 pm/fs/driver，不组装服务间 mailbox，也不决定启动顺序。
+
+未发布构造的失败责任由显式构造 owner 持有，成功时转交启动协议，失败时交给收束驱动。构造 owner 表示唯一处置权，不要求进程只有一个强引用；未运行线程对进程的引用必须经生命周期动作明确解除。资源摘取与正式进程 Drain 使用同源机制，启动驱动可以在启动环境显式逐批推进，但普通 Drop 不能隐藏遍历完整地址空间的循环；若构造入口用于运行期，则必须具备对应的有界完成驱动。
 
 initial process 通常自然取得 PID 1，但 PID 1 只作 provenance。其 authority 完全来自 StartupBlock 中显式安装的 root MemoryPool、root Job、设备资源等 capabilities。init 的不可转移 PoolBinding 与可派生、可授予的 root pool Handle 指向同一账户，前者支付 init 的内部 page-backed storage，后者授权用户态资源管理；共享 authority 不复制额度。内核为 init 执行的特殊动作仅存在于 Building 阶段的 bootstrap launcher，并复用普通绑定、映射和启动契约，不形成可由普通进程调用的物理映射或特权 syscall。
 
@@ -113,7 +115,9 @@ Building → Running → Terminating → Dead
 - **JobControl**：创建、封口、分页枚举与按 ID 派生直接成员、故障收束的 authority，不是进程权限等级；
 - **MemoryPool**：page-backed storage authority；可以共享、移动和派生 child，但成功附入进程的 PoolBinding 不再是 Handle，也不可转移。
 
-Building 阶段的 Bind、Map/Write、Grant 与 Attach 各自是边界明确的原子组装动作；ProcessStart 必须检查 AddressSpace 已 Bound、至少一条线程已附入、执行资源和 Job 门均满足，并在没有其它 Building 操作在途时冻结执行绑定、消费 builder、一次发布全部预育线程。ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。Start 前失败保持目标不可运行，并由组装者决定重试或放弃后完整收束；已成功 Bind 或 Grant 的资源已归目标所有，不因后续 Attach/Start 失败自动退回。
+Building 阶段的 Bind、Map/Write、Grant 与 Attach 各自是边界明确的原子组装动作；ProcessStart 必须检查 AddressSpace 已 Bound、至少一条线程已附入、执行资源和 Job 门均满足，并在没有其它 Building 操作在途时冻结执行绑定、消费 builder、一次发布全部预育线程。地址空间变更与启动发布是两个职责明确的协议，不把整个 ELF 装载包装为一笔巨型内存事务。
+
+Bootstrap 与普通 Start 共用同一启动协议：提交前准备完整线程交接容量、目标执行域、调度队列容量及启动 authority；同一闸门复检 Job、生命周期和线程集合，提交后由明确 owner 完成不可失败的 Ready 交接。初始成员和 capabilities 尚私有、普通进程已经处于可观察的 Building，是输入所有权的差别，不产生第二套提交尾段。终止早于提交时拒绝启动并保留失败处置权；晚于提交时由已提交启动责任与正常终止机制接管全部线程，不因尚未实际入队而丢失它们。ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。Start 前失败保持目标不可运行，并由组装者决定重试或放弃后完整收束；已成功 Bind 或 Grant 的资源已归目标所有，不因后续 Attach/Start 失败自动退回。
 
 内核只提供 JobSeal、直接成员的有界分页枚举、按 ID 派生 capability 和单进程控制原语；递归 JobKill 由 pm 在用户态组合。Open Job 变空后仍可用于服务重启，Sealed Job 才在全部成员和 child Jobs 收束后进入 Dead。多数进程不持 JobControl，只通过 pm 协议请求创建或管理。
 

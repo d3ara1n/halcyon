@@ -52,15 +52,18 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 
 **ProcessStart**：精确 BuildingLease 登记与 Bound readiness → 解析 profile/解析兼容域 → 按预育数预留提取缓冲 → `pin_consume` 独占 builder → 在一次 Ready 队列锁内预留完整批次 → Job 链锁内上行检查 seal + `begin_running(expected, out_staged)`（要求 `building_ops == 1`，活体门、`Building → Running`、Staging→Ready 与强引用交出原子完成）→ 提交区一次冻结 execution binding、消费 builder、批量 commit Ready。并发 Bind/Map/Write/Grant/Attach 仍持登记时返回 ObjectBusy，不会被 Start 越过；并发 Attach 使 expected 失配同样返回 ObjectBusy。所有提交前失败均 unpin/rollback，Start 可重试。BuildingLease 的 Drop 统一配平 Building 操作计数，成功由 `commit_running` 消费登记，不存在手工 enter/leave 分支遗漏。
 
-## 唯一 init bootstrap（内核内嵌同构序列）
+## 唯一 init bootstrap
 
-`os/kernel/src/boot.rs` 以与用户态组装者同构的 op 序列构造 init（bootstrap 特例：进程未启动、无用户代码可执行）：
+`os/kernel/src/boot.rs` 复用 Building 的绑定与映射基元构造 init。当前启动提交尚未与普通 ProcessStart 共用同一完整协议，不能把“复用基元”视为“提交闭包同构”：
 
 1. 验证 BootPackage 并以不可伪造的 `BootHeldExtent` 按 payload_off 切分物理 owner，消费 supply seed 铸造唯一 root Pool；
-2. 创建 pid 1 的 Unbound shell，调用与 syscall 共用的 Bind helper 安装 root-funded PoolBinding，并由 `UnpublishedBound` 持有 Bind 后但尚未发布的地址空间，再装载 initial ELF 与 init 栈；失败经有界 ProcessDrain 收束，不触发 `TableTree::Drop` 旁路；
-3. 创建 root JobControl、primordial SystemReset、init ProcessControl 与指向同一 root core 的 MemoryPool 管理 Handle，预留四个 Handle 槽并安装；
+2. 创建 pid 1 的 Unbound shell，调用与 syscall 共用的 Bind helper 安装 root-funded PoolBinding，`UnpublishedBound` 保留 Bind 后构造失败的处置责任，再装载 initial ELF 与 init 栈；显式 rollback 与 Drop 均执行终止、摘 Staging 和反复 `drain_batch(16)`，复用 drain 基元但外层循环并非一次有界操作；
+3. 创建 root JobControl、primordial SystemReset、init ProcessControl 与指向同一 root core 的 MemoryPool 管理 Handle，预留四个 Handle 槽，实际安装在后面的提交段；
 4. 以真实句柄值构造出生块 prefix；payload owner 先与 root charge 合成 `BootFundedExtent`，prefix 在发布前直接回填，随后以 owner 借用投影完成可失败映射并无分配地安装本体，形成不可公开 Unmap 的只读 lease backing，不经历回库存再取得或无 owner 映射窗口；
-5. 在 Handle commit 前完成 execution domain、staged 容量、首线程 Attach、Job member 与 Building operation 的所有可失败准备；唯一提交段之后以 `begin_running` 入册并发布 Ready，成功时转移 `UnpublishedBound`，失败由其负责完整回滚。
+5. 在 Handle commit 前准备 execution domain、单线程 staged 缓冲、首线程 Attach、Job member reservation 与 Building operation；随后分别执行 Handle commit、Job member commit、`begin_running(...).expect` 和 execution binding，转移 `UnpublishedBound` 并返回线程。
+6. `boot.rs` 执行内存池 syscall 自检、回投 package prefix，最后通过普通 `sched::enqueue` 首次发布线程；这条队列路径没有取得普通 Start 使用的 Ready reservation。
+
+结构收口由 [`地址空间事务与启动纵向计划`](../../plans/todo-2026-09-memory-transaction-state-machine.md) 的构造单元负责：包括 `proc.rs`、`process.rs`、`job.rs`、`lifecycle.rs`、`boot.rs` 与 `sched.rs`，不能仅把局部可失败动作前移就宣称 Bootstrap 完成。目标是完整准备后共用 Start gate 与 Ready 交接；私有 Bound 失败显式驱动收束，删除重复 rollback/Drop 全树循环。
 
 initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；payload backing 与 root PoolBinding 在 init AddressSpace 有界收束时于锁外同步归还物理 extent 与 charge。内核没有 pid 特判的保留洞。
 

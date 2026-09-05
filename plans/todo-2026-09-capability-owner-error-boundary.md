@@ -1,6 +1,6 @@
 # Capability 与 Affine Owner 错误边界收口计划
 
-> 当前 Review findings 的机制归并计划。目标是统一 capability 语义、消费式 owner 的生命周期和错误处理边界；不把 EXECUTE、Drop、RPC reject、ticket query 拆成孤立补丁。
+> 当前 Review findings 的契约归属计划，导航见 [`Review 统筹`](todo-2026-09-review-program.md)。rights、用户态 owner、RPC 接收与 ticket 查询是不同消费边界，分别按完整调用链收口；共享错误原则不意味着共用一个事务类型或要求所有子单元同时实施。
 
 ## 目标
 
@@ -84,7 +84,9 @@ reject_reply:
 
 以下路径必须统一进入 helper：ServiceClosed、所有 framing/kind/txid mismatch、Receive 后 payload decode/size 错误以及 future response validation。Helper 只做固定上界的 Handle close 与 port discard，不阻塞、不重试、不依赖服务端。
 
-## 自然实施顺序
+## 纵向子单元与依赖
+
+以下按消费边界组织；每个子单元同时迁移生产者、消费者、失败路径、测试和旧入口。精确 owner 错误政策需在对应子单元开始前确认，不把本计划的候选建议当成已经批准的 ABI 改动。
 
 1. 冻结 Rights/signal ABI 变更与 capability 矩阵；
 2. 增加 `EXECUTE` 并迁移 shared/kernel/rinlib 调用链；
@@ -107,6 +109,6 @@ reject_reply:
 
 ## 依赖与边界
 
-- MemoryChange/retire 的最终 owner 类型由 `todo-2026-09-memory-transaction-state-machine.md` 冻结；本计划不得提前引入另一套 mapping owner。
+- MemoryChange/retire 的最终 owner 类型由 `todo-2026-09-memory-transaction-state-machine.md` 冻结；本计划不得提前引入另一套 mapping owner。EXECUTE 的 shared/kernel/rinlib 纵向子单元是完整 RX authority 验收的前置，按接口需要先行，不必等待本计划的 RPC/Drop 等无关子单元。
 - Admission 的未知输入拒绝由 `todo-2026-09-admission-fail-closed.md` 负责；本计划只处理对象 capability 与消费路径。
 - 监督失败接管由 `todo-2026-09-supervision-authority-policy.md` 负责；owner 错误只提供可接管的显式状态，不自行实现 supervisor。

@@ -124,7 +124,7 @@ Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为�
 
 `MemorySpace` 在构造时一次性预留区域与在途事务的硬容量。有序 ledger 中每个 fragment 持唯一 `RegionKey`，同一次 Map 的 guard 与 mapping 共享 `AllocationKey`；fragment 另持 `AddressSpace`/lease owner、匿名 backing identity 或 `ObjectId + offset` view，以及当前/最大权限。`Anywhere` 在 ledger 与在途事务之间选 first-fit 完整空洞；`FixedEmpty` 不覆盖旧区域。Unmap 严格要求请求区间连续覆盖且 owner 一致，完整 reservation、usable-only、guard-only 与 mapping 中段都按精确交集切割；Protect 同样消费旧 key，只有 owner、种类、AllocationKey、连续 backing 与权限全部兼容的相邻 fragment 才合并。fault lookup 只返回 free、guard 或 eager mapping。
 
-变更由不可复制的类型状态表达：`ValidatedChange → PreparedChange → CommittedChange → PublishedChange → SynchronizedChange → RetiringChange → RetiredChange`。Validate 可以分配规划元数据但不改 ledger；Reserve 复检 region snapshot、真实范围冲突、UserWriteLease pin 与 WritePermit multiset，并预留 Commit 所需的 fragment、retire permit 和事务容量。rollback 只存在于 Commit 前并归还全部 permit。Commit 是不可失败的 ledger 线性化点，不再分配；其后的 Publish、Synchronize、BeginRetire、FinishRetire 与 Complete 也不返回可恢复错误，错配 token 视为内核所有权不变量破坏。Reserve 另从 retiring fragments 推导去重后的对象 owner 容量并随状态 token 传递；内核 adapter 在 Commit 前按该容量预留批次容器，Retire 不再扩容。同一对象的多个 fragment 共用一个 batch-local owner，全部 permit 归还后才析构。`begin_retire` 只把 retire owner 移入显式 `RetireBatch` 并进入 Retiring；`finish_retire` 拒绝仍含 fragment 或 permit 的 batch，故 ledger 只有在全部真实 owner 已逐项退休后才能进入 Retired。内核 adapter 按 translation intent 在 Commit 前准备真实表帧和 leaf 投影，Commit 后发布 PTE 与 ledger。
+变更由不可复制的类型状态表达：`ValidatedChange → PreparedChange → CommittedChange → PublishedChange → SynchronizedChange → RetiringChange → RetiredChange`。Validate 可以分配规划元数据但不改 ledger；Reserve 复检 region snapshot、真实范围冲突、UserWriteLease pin 与 WritePermit multiset，并预留 Commit 所需的 fragment、retire permit 和事务容量。rollback 只存在于 Commit 前并归还全部 permit。Commit 是不可失败的 ledger 线性化点，不再分配；其后的 Publish、Synchronize、BeginRetire、FinishRetire 与 Complete 也不返回可恢复错误，错配 token 视为内核所有权不变量破坏。Reserve 另从 retiring fragments 推导去重后的对象数并随状态 token 传递；内核按该数量预留 `retiring_views` 容量。该容器仍在 `RetiringSpaceChange::advance` 中以普通 Vec 操作填充，同一批次按对象查重；来源强引用尚未在完整准备阶段冻结，跨批次及最后 live view 消散的闭包不能由容量预留推出。`begin_retire` 只把 retire owner 移入显式 `RetireBatch` 并进入 Retiring；`finish_retire` 拒绝仍含 fragment 或 permit 的 batch，故 ledger 只有在全部真实 owner 已逐项退休后才能进入 Retired。内核 AddressSpace 层按 translation intent 在 Commit 前准备真实表帧和 leaf 投影，Commit 后发布 PTE 与 ledger。
 
 `UserWriteLease` 把非页对齐结果区间投影为固定上限的 writable backing segments，并以 RegionKey pin 到 Commit 或 rollback；与结果范围或变更 footprint 相交的其它在途事务返回 Busy。MemoryObject 状态独立实现 `Mutable → Sealing → Executable`：writable replacement 必须携带不可复制 `WritePermit`，permit 从 Reserve 覆盖到 retiring fragment 完成 Synchronize 后交给 Retire；最后一个 permit 退出计数时完成 seal，无人在等待也不回退状态。公共对象的 `EXECUTABLE` 电平与 WaitMany 等待面属于切片 7 的对象层，planner 只保证状态单向推进。
 
@@ -190,7 +190,19 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 
 - bootstrap StartupBlock prefix 是 owned backing；opaque payload 页由 boot-held token 直接转为 root-funded immutable lease backing，不经历“先回库存再取出”的窗口，地址空间销毁时在锁外同时归还物理 extent 与 charge；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
 - ProcessMap/Write 只服务精确 Building 且已 Bound 的 process；Map 创建 anonymous zero pages并使用最终权限，拒绝 write-only/W+X。Building Map 同样采用 plan → 锁外 table funding → complete/commit；成功提交后才推进 `image_end`，固定主栈映射不改变该游标。Write 经已发布 PTE 的物理直映射回填 backing；Unbound 返回 ObjectNotAvailable，Running 发布后不再存在该写入口；
 - ProcessDrain 对 Unbound shell 直接完成；Bound 先逐区域清空 ledger，再逐 extent 归还 backings，最后收束页表与 PoolBinding。lifecycle 的 Building/mandatory operation 屏障分别保证截止前组装提交资格与 REAPABLE 前无公开在途 `PublishedChange/RetiringChange`；已进入终止的 committed 事务仍由原 work debt 完成，发起线程消散不改变所有权。
-- MemoryObject 与 Tunnel 的 object-backed mapping 共用同一组 `ObjectViewAuthorization`/`WritePermit`/`MemoryChange` 基元；本篇拥有 backing、AddressSpace ledger、远端确认和锁外 retire 的通用机制。匿名与对象来源、Running 与 Building authority、结果 cookie 与 view 发布都由单一事务核以字段维度表达，不再是平行编排。提交前失败统一从状态 owner 摘出表页、backing、WritePermit 与 view owner 后在 AddressSpace 锁外归还，不再由各调用点假定 permit 为空；完整阶段类型迁移仍由当前状态机计划继续收口。MemoryObject 公共对象接入见 [`memory-object.md`](memory-object.md)，Tunnel 的 Connection、Endpoint、Invitation 和 detached close 编排见 [`tunnel.md`](tunnel.md)。
+- MemoryObject 与 Tunnel 的 object-backed mapping 共用 `ObjectViewAuthorization`/`WritePermit` 和 AddressSpace 事务核；本篇拥有 backing、ledger、远端确认和锁外 retire 的通用机制。匿名与对象来源、Running 与 Building authority、结果 cookie 与 view 发布已在内核 reservation 字段中汇合，但调用点仍分别编排准备、失败与提交，不能据此宣称整个深模块接口已收口。MemoryObject 公共对象接入见 [`memory-object.md`](memory-object.md)，Tunnel 的 Connection、Endpoint、Invitation 和 detached close 编排见 [`tunnel.md`](tunnel.md)。
+
+### 事务结构的未闭合边界
+
+当前 `proc.rs` 的完整事务仍由 `MemoryChangePlan` / `MemoryChangeReservation` / `PreparedMemoryChange` / `PublishedSpaceChange` / `RetiringSpaceChange` 组合，ledger 阶段类型不直接证明这些内核 owner 的所有路径都已闭合。实施归属见 [`地址空间事务与启动纵向计划`](../../plans/todo-2026-09-memory-transaction-state-machine.md)。
+
+- `ReclaimedTableFrames` 暴露 `take_permits`，`ObjectMapFailure` 另携裸 permits；Running helper 与 Tunnel 的 abandon/cancel 仍分别负责归还。Building 的部分调用点仍依赖输入不带 permit 的事实。
+- `acquire_view_permits` 在 Validate 解锁后重新查 `view_core`；rollback/Retire 也可能回查 live view。对象来源保活不是完整计划的一部分，需由纵向重构消除该时序依赖。
+- `OwnedBacking::release_one` 在 Retire 切分并插回 extent。BackingSlicePermit 与 Vec 实际容量是两种责任；创建时预留初始 extent 或增加一个单次 split 上限，都不能证明整个 backing 寿命的累计增长与在途容量守恒。
+- `commit_shootdown` 向调用者开放发布闭包；`publish_epochs` 使用先 `fetch_add` 后检查的实现。当前尚未有涵盖输出 cookie、epoch、资源容量和全部领域发布动作的统一 Commit 资格。
+- 有界退役已由 work debt 推进，但 object lookup、最后 Arc 析构及 `retire_write` 引出的 seal/waiter 完成仍需计入实际工作上界。`UnpublishedBound` 的失败全树循环属于构造边界，见 [`startup.md`](startup.md)。
+
+以上是结构收口范围，不代表这些位置均已独立复现运行时故障；既有正常路径和 host/QEMU 基线不能替代对应故障注入。
 
 ## 架构边界
 

@@ -1,6 +1,6 @@
 # 系统审计批次 E-2：syscall/shared ABI、IPC/FAL/服务与工程化
 
-> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；RPC reject 归 capability/owner 计划，E2-7-01 lint 门仍由本报告独立承接。
 
 ## 范围、基线与证据边界
 
@@ -90,7 +90,7 @@ HandleTable 的 generation/rights/role/badge、Mailbox send/receive rollback、N
 - 未运行 `virt-hetero`/`virt-nofd`；D64/无 F/D 路线未现场证明。
 - 未做恶意 RPC response 携带 Handle、Caller timeout/ServiceClosed/txid mismatch 后 port 重建、跨进程 FAL、跨进程 MemoryObject Seal/EXECUTE/RX、多页 Tunnel/RNL2、OOM/地址 fault 注入。
 - 当前 RNL1/单页/u32、raw selftest adapter 继续由 `todo-2026-09-memory-object-data-plane.md` 承接。
-- E2-5-01 与 E2-7-01 由本报告承载修复与复核计划，不另建重复 todo；实现事实可在修复后同步 `notes/impls/rpc.md`、`ipc.md`、`internals.md`，方向契约同步 `notes/ideas/rpc.md`。
+- E2-5-01 的实施归 capability/owner 计划，E2-7-01 lint 门由本报告独立承接；本报告保留两项复核条件。实现事实同步 `notes/impls/rpc.md`、`ipc.md`、`internals.md`，方向契约同步 `notes/ideas/rpc.md`。
 - 所有 findings 修复并复核后，本报告才移入 `plans/archived/`。
 
 ## 最终判定

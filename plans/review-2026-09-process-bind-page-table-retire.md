@@ -1,6 +1,6 @@
 # 批次 B-2：ProcessBind、页表 owner 与 deferred retire Review
 
-> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围与方法
 
@@ -102,7 +102,7 @@ ProcessCreate 已收窄为 Unbound shell，Job member reservation 与两项输�
 
 ## 后续行动与文档归属
 
-本报告在 finding 未闭合期间即为行动计划，不另建重复 todo：
+以下为首审文档归属与复核条件；F-1 当前由内存事务计划的构造与启动纵向单元统一实施：
 
 - 机制/事务边界修订进入 `notes/ideas/bootstrap.md` 与 `notes/ideas/mm.md`；
 - 实现机制同步 `notes/impls/mm.md`、`notes/impls/task.md`；

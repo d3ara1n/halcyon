@@ -1,6 +1,6 @@
 # 批次 C-2：Remote Call、AddressSpace epoch/TLB 与用户内存 Review
 
-> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围与基线
 
@@ -98,7 +98,7 @@ cd shared && cargo test   # 隔离快照
 
 ## 后续行动与复核条件
 
-本报告在 findings 未闭合期间同时作为行动计划，不另建重复 todo：
+以下为首审建议与复核条件；当前 F1/F2 由 identity 计划拥有策略并与事务接线同步，F3 由 capability/owner 计划实施：
 
 1. 为 Remote Call token 补实例身份，或在实现文档中冻结并证明单实例 API 边界；
 2. 修正 epoch 溢出检查，统一 arithmetic hardening；

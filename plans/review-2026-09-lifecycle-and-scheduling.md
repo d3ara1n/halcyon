@@ -1,6 +1,6 @@
 # 批次 C-1：线程生命周期、持久 init/pm 监督与调度域 Review
 
-> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围、基线与方法
 
@@ -164,7 +164,7 @@ Running ThreadSpawn 使用 `Spawning → Ready`，失败走 rollback_spawn；Thr
 
 ## 后续行动与复核条件
 
-本报告在未闭合 findings 期间同时作为行动计划，不另建重复 todo：
+以下为首审建议与复核条件；当前有效条目分别由 supervision、admission 与 capability 计划实施，历史已修条目只做回归核验：
 
 1. 处理当前仍有效的 P1-C1-01、P1-C1-02、P1-C1-05；
 2. 处理 P2-C1-06、P2-C1-07、P2-C1-08，并与 B-1/B-2/C-2 的 arithmetic、Drop 和平台边界 finding 统一修复策略；

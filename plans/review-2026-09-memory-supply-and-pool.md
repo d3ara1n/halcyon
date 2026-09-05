@@ -1,6 +1,6 @@
 # 批次 B-1：平台供给、系统储备、MemoryPool 与 funded frame Review
 
-> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；下文第 7 节为首审归属记录，当前 F-1/F-2 归 admission、F-3/F-4 归 capability/owner 计划，不按报告逐项另排实施。
 
 ## 1. 审查范围与基线
 
