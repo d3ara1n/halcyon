@@ -3,6 +3,8 @@
 > 本计划是当前这轮代码 Review 的统筹入口。本次将现有重叠的 `todo-*-review.md` 整理并合并到批次 A–E；这只是当前积压任务的归并，不废止 `todo-*-review.md` 作为未来提交后的审查计划类型。归档不表示对应审查已完成。每个批次必须先生成正式 `review-<日期>-<主题>.md`，再将本批次标记为已收口。
 >
 > 审查模型：`moeflux-openai-responses/gpt-5.6-sol`。审查只读，不修改代码；发现问题只写 finding、notes 归属或新的修复 todo。
+>
+> 当前配额约束：本轮 `reviewer` 子代理账户已耗尽，不再继续委派 reviewer。后续 Review 优先使用用户直接开启的 mesh 主代理会话；`explorer` 仅做代码测绘和事实收集，`researcher` 仅做外部资料取证，二者不能替代 reviewer 或主代理进行 Review 判定和设计决策。该约束是当前工具状态，不改变未来角色定义。
 
 ## 当前基线
 
@@ -66,7 +68,7 @@
 
 ### 批次 C：线程生命周期、Remote Call 与用户内存联合审查
 
-**状态：执行中。** C-1 由 `OnyxFinch` 审查线程生命周期、持久 init/pm 与调度域；C-2 由 `BoldReed` 审查 Remote Call、AddressSpace epoch/TLB 与用户内存。两者均为新主代理会话，通过 mesh 接收自包含上下文并只读回传；交叉范围与重复 findings 由本统筹会话统一去重。
+**状态：已完成，不通过。** C-1 报告发现 3 项当前有效 P1、3 项 P2；两项历史 P1 已由后续 `98d2449` 修复。C-2 报告发现 1 项 P2、2 项 P3。报告本身承载 findings 的修复与复核计划；交叉范围和已知 A/B findings 已去重。
 
 合并以下重叠范围：
 
@@ -89,7 +91,7 @@
 - C-1：`plans/review-2026-09-lifecycle-and-scheduling.md`
 - C-2：`plans/review-2026-09-remote-call-user-memory.md`
 
-同一提交 `004cae5` 的线程、地址空间和 Remote Call 交错由两份报告分别从自身边界取证，最终由统筹会话合并同根因 findings，不要求两个 reviewer 直接沟通。
+同一提交 `004cae5` 的线程、地址空间和 Remote Call 交错已由统筹会话去重；两个主代理无需直接沟通。
 
 ### 批次 D：机制泛化与 BootPackage/launcher
 
@@ -127,12 +129,11 @@
 
 ## 下一轮全体 Review 任务
 
-1. 批次 C：线程生命周期、Remote Call 与用户内存；
-2. 批次 D：机制泛化与 BootPackage/launcher；
-3. 批次 E：系统审计分片 3–7；
-4. 批次 F 继续等待触发，不计入当前可执行轮次。
+1. 批次 D：机制泛化与 BootPackage/launcher；
+2. 批次 E：系统审计分片 3–7；
+3. 批次 F 继续等待触发，不计入当前可执行轮次。
 
-批次 A、B 的未闭合 findings 分别由三份根目录 `review-*` 报告承接，不重复进入下一轮“待执行 Review”列表；修复完成后按报告复核。
+批次 A–C 的未闭合 findings 分别由五份根目录 `review-*` 报告承接，不重复进入下一轮“待执行 Review”列表；修复完成后按报告复核。
 
 ## 收口规则
 

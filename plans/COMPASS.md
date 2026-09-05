@@ -24,10 +24,12 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 
 | 文件 | 概要 |
 |---|---|
-| [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md) | 当前 Review 唯一统筹入口：A 统一内存事务核 → B 内存供给/页表生命周期 → C 线程与用户内存 → D 机制泛化/launcher → E 系统审计；指定模型 `moeflux-openai-responses/gpt-5.6-sol`，只读不改代码 |
+| [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md) | 当前 Review 唯一统筹入口：A 统一内存事务核 → B 内存供给/页表生命周期 → C 线程与用户内存 → D 机制泛化/launcher → E 系统审计；指定模型 `moeflux-openai-responses/gpt-5.6-sol`，当前 reviewer 子代理额度耗尽，后续由 mesh 主代理协作；explorer/researcher 仅收集证据 |
 | [`review-2026-09-memory-transaction-unification.md`](review-2026-09-memory-transaction-unification.md) | 批次 A 已完成审查但未通过；四项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-memory-supply-and-pool.md`](review-2026-09-memory-supply-and-pool.md) | 批次 B-1 已完成审查但未通过；一项 P1、三项 P2 finding 未闭合，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-process-bind-page-table-retire.md`](review-2026-09-process-bind-page-table-retire.md) | 批次 B-2 已完成审查但未通过；一项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |
+| [`review-2026-09-lifecycle-and-scheduling.md`](review-2026-09-lifecycle-and-scheduling.md) | 批次 C-1 已完成审查但未通过；3 项当前有效 P1、3 项 P2，报告同时作为唯一修复与复核计划 |
+| [`review-2026-09-remote-call-user-memory.md`](review-2026-09-remote-call-user-memory.md) | 批次 C-2 已完成有条件审查；1 项 P2、2 项 P3，报告同时作为唯一修复与复核计划 |
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 重写版系统审查 7 分片：01 SBI 与 02 trap/上下文已有归档报告，03–07 待做 |
 | [`todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) | 当前实施计划：切片 8 多页 Tunnel/Runnel v2、切片 9 RNL2 动态 ring、切片 10 raw FramePool selftest adapter |
 | [`todo-2026-09-platform-reserved-memory-lifecycle.md`](todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |
