@@ -24,7 +24,7 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 
 | 文件 | 概要 |
 |---|---|
-| [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md) | 当前 Review 唯一统筹入口：A 统一内存事务核 → B 内存供给/页表生命周期 → C 线程与用户内存 → D 机制泛化/launcher → E 系统审计；A–E 已完成首审，未闭合 findings 由根目录 `review-*` 承载；当前 reviewer 子代理额度耗尽，后续由 mesh 主代理协作 |
+| [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md) | Review 首审已结束；作为 findings 状态导航与修复交接入口，A–E 未闭合 findings 由根目录 `review-*` 承载，后续修复 agent 不再重复首审 |
 | [`review-2026-09-memory-transaction-unification.md`](review-2026-09-memory-transaction-unification.md) | 批次 A 已完成审查但未通过；四项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-memory-supply-and-pool.md`](review-2026-09-memory-supply-and-pool.md) | 批次 B-1 已完成审查但未通过；一项 P1、三项 P2 finding 未闭合，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-process-bind-page-table-retire.md`](review-2026-09-process-bind-page-table-retire.md) | 批次 B-2 已完成审查但未通过；一项 P1 finding 未闭合，报告同时作为唯一修复与复核计划 |

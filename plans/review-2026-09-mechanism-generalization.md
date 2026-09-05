@@ -1,5 +1,7 @@
 # 批次 D-1：机制泛化改造 Review（代码轴）
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 范围与基线
 
 目标提交：`15c7811`（契约/命名归属）、`9c03251`（Lock Ladder、per-hart 期限表、MappingLease 等）、`95deea6`（release ladder `mark_tp_ready` 空桩）。当前工作树基线为 `61490ae`；代码证据来自目标提交快照或隔离读取，不以当前树后续实现替代历史事实。全程只读，未修改或提交代码。
@@ -34,7 +36,7 @@
 
 ## Findings
 
-### P1-D1-01：Terminating 竞态下 INSTALLING WaitContext 永不 finish
+### P1-D1-01（历史 finding，已由后续主线修复）：Terminating 竞态下 INSTALLING WaitContext 永不 finish
 
 位置：目标 `9c03251`，`os/kernel/src/task/wait.rs:302-317`；`WaitCore::offer` 的 INSTALLING 行为见 `os/wait_context/src/lib.rs:84-86`。
 
@@ -48,7 +50,7 @@
 
 建议：安装拒绝也必须完成 INSTALLING→FINISHING→DONE 交接，并进入统一 `context.finish`；补 park-vs-kill 竞态测试，断言 thread=Gone、REAPABLE 发布和 WaitContext DONE。
 
-### P1-D1-02：提前完成的 deadline 条目不注销，累积无效 timer 并污染静默判定
+### P1-D1-02（历史 finding，已由后续主线修复）：提前完成的 deadline 条目不注销，累积无效 timer 并污染静默判定
 
 位置：目标 `9c03251`，注册 `os/kernel/src/sched.rs:180-190`，完成 `os/kernel/src/task/wait.rs:237-255,355-367`，到期清理 `sched.rs:223-234`，静默谓词 `sched.rs:403-414`。
 
@@ -62,7 +64,7 @@
 
 建议：引入稳定 TimeoutRegistration（owner slot、arena slot、generation/token），所有 Complete/Abandoned/Timeout 路径注销；设置结构化容量和明确 OOM 边界；补提前完成、Abandoned、到期和槽位复用测试。后续 `5fbd67b` 已引入 `TimeoutRegistration`/TimerQueue，但不能替代目标提交本身的缺口证明。
 
-### P2-D1-03：MappingLease 失败回滚与 owner 消散仅有静态/间接证据，锁序依赖局部声明顺序
+### P2-D1-03（当前仍为验证缺口）：MappingLease 失败回滚与 owner 消散仅有静态/间接证据，锁序依赖局部声明顺序
 
 位置：目标 `9c03251`，`os/kernel/src/task/tunnel.rs:350-409,411-478`，`os/kernel/src/task/proc.rs:640-672,702-706`。
 
@@ -100,6 +102,10 @@
 4. 更新 `notes/impls/{task,mm,tunnel}.md`；
 5. 修复后按本报告逐项复核，全部闭合后移入 `plans/archived/`。
 
+## 当前 HEAD 状态复核
+
+当前 HEAD `11fde56` 已接入 `TimeoutRegistration`、`finish_installing` 和 TimerQueue cancel，P1-D1-01/P1-D1-02 作为目标提交历史缺口保留，不再作为当前债务。P2-D1-03 仍是当前验证缺口，尚无独立泄漏/死锁证据。
+
 ## 最终判定
 
-**不通过。** Lock Ladder 在目标范围内通过；per-hart Timeout 存在两个独立 P1；MappingLease 还有一个 P2 验证/维护风险。
+**目标批次首审不通过；当前 HEAD 仅保留 P2 验证/维护风险。** Lock Ladder 在目标范围内通过；per-hart Timeout 的两个 P1 已由后续机制收口；MappingLease 仍需失败注入与析构顺序验证。

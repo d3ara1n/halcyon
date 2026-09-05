@@ -1,5 +1,7 @@
 # 批次 B-1：平台供给、系统储备、MemoryPool 与 funded frame Review
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 1. 审查范围与基线
 
 审查对象固定为：

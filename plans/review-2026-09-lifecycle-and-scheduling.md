@@ -1,5 +1,7 @@
 # 批次 C-1：线程生命周期、持久 init/pm 监督与调度域 Review
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 审查范围、基线与方法
 
 目标提交：`d741880`、`bdc83ef`、`004cae5`、`fcbd5b6`、`b161163`、`1d7dc92`。工作树在审查时为 `f9b3bda` 之后的文档整理状态；代码结论均来自 `git show <commit>:<path>` 或该提交隔离快照，不将当前工作树后续内容替代历史提交证据。全程只读，无代码修改、无提交。
@@ -89,13 +91,13 @@ Running ThreadSpawn 使用 `Spawning → Ready`，失败走 rollback_spawn；Thr
 
 后续证据：`98d2449` 删除 `sbi::shutdown`、`is_quiescent` 和 idle 内停机分支，加入 capability 授权 `SystemReset`，init 在终态事实成立后显式提交 reset，平台拒绝后进入永久 supervisor。该历史缺口已闭合，不重复列为当前债务。
 
-### P1-C1-05：稀疏 raw hartid 的 IPI 编码边界不闭合
+### P1-C1-05（历史旧位置已修复，当前 admission 仍需 E-1 复核）：稀疏 raw hartid 的 IPI 编码边界不闭合
 
 位置：`1d7dc92:os/kernel/src/registry.rs:212-220`；`os/kernel/src/sbi.rs:205-208`。
 
 可达前提：平台 DT 提供 raw hartid 稀疏且存在不适合 base=0 单 bit 表达的 ID，终止屏障、域唤醒或 Remote Call 需要触达该 hart。代码只限制 admitted slot 数量，没有对 raw ID 的 SBI mask 可表达范围建模。
 
-直接证据：目标代码将 `1u64 << raw` 作为 mask 并以 base=0 发送；内部 slot 与 raw hartid 明确分离。debug 下超宽移位可能 panic，release 下不能表达任意有效 raw hartid。后续 HEAD 的 `registry.rs:241` 虽传入 `send_ipi(1, raw)`，但仍要求 SBI mask 从 base 起的 XLEN 位范围；未见连续段分组或超范围 admission 拒绝。
+直接证据（目标提交）：目标代码将 `1u64 << raw` 作为 mask 并以 base=0 发送；内部 slot 与 raw hartid 明确分离。当前 HEAD 的 `registry.rs:241` 已改为 `send_ipi(1, raw)`，因此旧 shift 位置已修复；当前重复 raw admission、HSM failure gate 和 slot order 的剩余问题由 E-1 报告 M3-2/M3-3/M3-4 承接，不在本条重复。
 
 违反契约：`notes/impls/execution-context.md` 的 raw hartid 可稀疏、slot 仅内部身份；SBI mask/base 契约要求显式表达 raw hart 范围；IPI 错误应可诊断处理。
 
@@ -115,7 +117,7 @@ Running ThreadSpawn 使用 `Spawning → Ready`，失败走 rollback_spawn；Thr
 
 建议：board admission 显式拒绝 `q && !d`、`d && !f`，补 q-only/d-only/malformed host tests。属于 P2 平台输入硬化。
 
-### P2-C1-07：ThreadControl allowed_signals 暴露 CLOSED，但目标代码只发布 DONE
+### P2-C1-07（当前仍存在）：ThreadControl allowed_signals 暴露 CLOSED，但目标代码只发布 DONE
 
 位置：目标 `bdc83ef:os/kernel/src/task/thread.rs:203-229`，`publish_done` 在 `:54-65`；当前主线仍为 `os/kernel/src/task/thread.rs:208`。
 
@@ -129,7 +131,7 @@ Running ThreadSpawn 使用 `Spawning → Ready`，失败走 rollback_spawn；Thr
 
 建议：若唯一终态是 DONE，移除 ThreadControl 的 CLOSED allowed signal 并补 ABI/host test；若需要 CLOSED，定义独立关闭状态及 DONE/CLOSED 顺序。
 
-### P2-C1-08：pm/init 关键监督等待无期限，无失败升级政策
+### P2-C1-08（当前仍存在）：pm/init 关键监督等待无期限，无失败升级政策
 
 位置：`fcbd5b6:user/systems/pm/src/main.rs:188-197`、`user/frameworks/libprocess/src/lib.rs:133-140,158-161`、init `:562-600`；当前主线 `user/services/srv_init/src/main.rs:951` 使用 `WAIT_TIMEOUT_INFINITE`。
 

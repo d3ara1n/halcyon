@@ -1,5 +1,7 @@
 # 统一内存事务核与公共 MemoryObject Review
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 审查范围与基线
 
 - 项目：Halcyon / eRhino RV64 微内核系统

@@ -1,5 +1,7 @@
 # 系统审计批次 E-2：syscall/shared ABI、IPC/FAL/服务与工程化
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 范围、基线与证据边界
 
 审计分片 5（syscall/shared ABI）、分片 6（IPC/FAL/服务）和分片 7（工程化与全仓收口）。代码基线：`e5db4f32a507ca5bc26849b53e64c0a3b73fa82d`（`e5db4f3`）。工作树仅有预先存在的 plans 文档修改；本审计未修改文件、未提交代码。目标为系统审计首审，未经过独立 reviewer 核验；本报告 findings 状态为待核验/待修复。

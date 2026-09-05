@@ -1,5 +1,7 @@
 # 批次 D-2：BootPackage / 用户态 launcher 代码 Review
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 范围与基线
 
 目标范围固定为 `29c6519..1bc83ac`，目标实现提交 `1bc83ac4596d548f47798e053a8104a14a429d97`。当前工作树 HEAD 为 `61490ae`，代码证据全部来自 `git archive 1bc83ac` 隔离快照及目标提交内容，不以当前树后续实现替代历史事实。全程只读，未修改或提交代码。
@@ -37,13 +39,13 @@ shared 7/7、elf 13、page_table 18、frame_pool 11、dtb 11、handle_table 12 �
 
 ## Findings
 
-### F-01 / P1：bootstrap payload 映射没有 AddressSpace owner，退出/失败不回收
+### F-01 / P1（历史 finding，已由后续主线修复）：bootstrap payload 映射没有 AddressSpace owner，退出/失败不回收
 
 位置：`os/kernel/src/task/proc.rs:437-513`，尤其 `489-512`；`os/kernel/src/boot.rs:57-67`；`os/kernel/src/frame.rs:61-66`。
 
 可达前提：bootstrap 成功后 init 退出/fault 或进入 teardown，且 `payload_len > 0`。
 
-直接证据：`map_bootstrap_block` 只为 prefix 分配并将 tracker 放入 `frames`；payload PTE 直接指向 `payload_pa/page`，没有保存 payload tracker/extent。AddressSpace Drop 只释放 `frames`；payload 物理页已被 frame init 的 boot-package hole 永久剔除，既不归还也无 owner。
+直接证据（目标提交）：`map_bootstrap_block` 只为 prefix 分配并将 tracker 放入 `frames`；payload PTE 直接指向 `payload_pa/page`，没有保存 payload tracker/extent。AddressSpace Drop 只释放 `frames`；payload 物理页已被 frame init 的 boot-package hole 永久剔除，既不归还也无 owner。当前 HEAD 已由 `BootFundedExtent`/`BootBorrowed`/`install_bootstrap_funding` 接入 payload owner；本条保留目标提交缺口和后续修复证据，不作为当前债务。
 
 违反契约：bootstrap payload backing 应与 init 地址空间生命周期闭合；实现文档声明 payload 在地址空间收束时物理 extent/charge 一并归还；MemoryPool/FramePool 守恒。
 
@@ -61,25 +63,25 @@ shared 7/7、elf 13、page_table 18、frame_pool 11、dtb 11、handle_table 12 �
 
 建议：所有 permanent/boot-held interval 先 checked normalize、排序、合并并显式拒绝或裁剪重叠；FramePool 注册前只消费该 reservation plan 的 token。
 
-### F-03 / P1：sifive_u QEMU 内存参数与 DTS 不一致
+### F-03 / P1（历史 finding，已由后续主线修复）：sifive_u QEMU 内存参数与 DTS 不一致
 
 位置：目标 `Justfile:35` 的 QEMU launch 参数；`os/platforms/qemu/sifive_u/device.dts:29-32`；BootPackage window `0x86000000..0x88000000`。
 
 可达前提：执行目标快照的 sifive_u recipe，QEMU/firmware 按 `-m` 生成或重定位 DTB。
 
-直接证据：目标 recipe 硬编码 `-m 1024M`，而 sifive_u DTS memory 为 128MiB。启动代码又按运行时 DTB 初始化 FramePool/BootPackage，平台契约要求 QEMU memory、DTS memory 和 package window 一致。
+直接证据（目标提交）：目标 recipe 硬编码 `-m 1024M`，而 sifive_u DTS memory 为 128MiB。当前 HEAD 的 Justfile 已按 MODEL 选择 virt=1024M、sifive_u=128M；本条保留历史目标缺口，不作为当前债务。
 
 违反契约：项目平台启动边界和 bootstrap reservation 假设。
 
 建议：按模型选择 QEMU memory（virt 1024M、sifive_u 128M），recipe 打印并校验三者一致；启动时拒绝运行时 memory 与静态平台契约不一致。
 
-### F-04 / P1：ProcessCreate 不产生稳定 ProcessControl，Job 无成员/lifecycle 记账
+### F-04 / P1（历史 finding，已由后续主线修复/重构）：ProcessCreate 不产生稳定 ProcessControl，Job 无成员/lifecycle 记账
 
 位置：目标 `os/kernel/src/task/process.rs:209-248`；`os/kernel/src/task/proc.rs:659-683`；`os/kernel/src/task/job.rs:18-23,100-120`；`shared/src/proc.rs:61-68`。
 
 可达前提：用户执行 JobCreate → ProcessCreate 后，在 Start 前 builder 失败/丢失，或管理者需要观察、封口、收束 Building 目标。
 
-直接证据：ProcessCreate 只创建 Process（`control=None`）、ProcessBuilder，输出仅 builder/pid/reservation；ProcessControl 在 ProcessStart 才创建并 attach。Job 结构没有 members/children/sealed/dead/counters，ProcessCreate 也未插入 Job。
+直接证据（目标提交）：ProcessCreate 只创建 Process（`control=None`）、ProcessBuilder，输出仅 builder/pid/reservation；ProcessControl 在 ProcessStart 才创建并 attach。当前 HEAD 的 `process::create` 已预构造 ProcessControl 并写入 `ProcessCreateResult`；本条保留历史目标缺口，不作为当前债务。
 
 违反契约：ProcessCreate 应产生稳定 ProcessControl；Job 是创建/收束域，成员关系强持至 Dead；Building shell/Control 生命周期应闭合。
 

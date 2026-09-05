@@ -1,6 +1,8 @@
 # Review 纪律
 
 > Review 只回过头看已经完成的任务，不在任务进行中插入；Review 不阻碍验收（设计确认 + 代码完成即验收通过）。本文只定义两类 Review 各自看什么。
+>
+> 当前 A–E 首审阶段已结束；未闭合 findings 由对应 `review-*.md` 继续承载修复与复核，不另建重复 todo。后续修复 agent 不重复首审，直接以报告 findings 为行动真值点。
 
 ## 设计 Review
 

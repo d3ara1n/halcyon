@@ -1,5 +1,7 @@
 # 批次 C-2：Remote Call、AddressSpace epoch/TLB 与用户内存 Review
 
+> 首审已完成；当前 findings 未闭合。本报告同时作为后续修复与逐条复核计划，修复 agent 不重复首审。
+
 ## 审查范围与基线
 
 本报告对应 Review 统筹计划批次 C-2，范围为 Remote Call 固定槽/token/ABA/IPI/RVWMO/AddressSpace epoch/execution gate/SFENCE/retire；用户 `MemoryMap/Unmap/Protect` 与 Pool、permit、ledger、PTE、HandleClose 守恒；ThreadSpawn 双 guard 栈、JoinHandle、result obligation 及 spawn/kill/末线程/join/Drop 竞态。
