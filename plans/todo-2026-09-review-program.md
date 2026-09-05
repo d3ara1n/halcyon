@@ -170,6 +170,11 @@
 ## 首审阶段收口与修复交接
 
 - A–E 首审已完成；本轮不再启动新的首审 reviewer。
+- 当前复核确认：历史 findings 不逐条打补丁。事务失败闭包相关 findings 统一延期至 [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md)，按最终类型状态机整体重构；在触发条件满足前不引入半成品兼容修复。
+- 启动/平台 admission 相关 findings 统一由 [`todo-2026-09-admission-fail-closed.md`](todo-2026-09-admission-fail-closed.md) 承接，按 canonical admission 与 fail-closed 机制整体收口，不拆成孤立修复。
+- 生命周期监督相关 findings 统一由 [`todo-2026-09-supervision-authority-policy.md`](todo-2026-09-supervision-authority-policy.md) 承接，按 authority 保留、有限等待和失败升级状态机整体重构，不拆成孤立超时/日志修复。
+- Capability/affine owner/error boundary findings 统一由 [`todo-2026-09-capability-owner-error-boundary.md`](todo-2026-09-capability-owner-error-boundary.md) 承接，按 ABI、消费式 owner 与 reject/discard 机制整体收口，不拆成零散 Drop 或权限补丁。
+- Token/generation/epoch findings 统一由 [`todo-2026-09-identity-generation-boundaries.md`](todo-2026-09-identity-generation-boundaries.md) 承接，按身份域与统一耗尽策略整体收口；与事务、admission、capability 计划交叉处只保留各自 owner，不重复造凭据机制。
 - 所有未闭合 findings 继续留在九份根目录 `review-*.md`，报告同时作为修复计划、验证清单和后续 diff review 规范。
 - 后续修复 agent 应先以当前 HEAD 重新核对报告中的 findings 状态，再按依赖顺序修复；已被后续提交修复的历史 finding 只保留证据，不重复实施。
 - 修复后必须回到原报告逐条复核，完成 host/debug/release/QEMU/故障注入等对应验证；全部闭合后才将报告移入 `plans/archived/`。

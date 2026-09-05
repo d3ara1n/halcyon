@@ -34,6 +34,11 @@ plans/ 根目录只放活跃计划（todo 与含未闭合承接项的 review 同
 | [`review-2026-09-bootstrap-launcher.md`](review-2026-09-bootstrap-launcher.md) | 批次 D-2 已完成审查但未通过；6 项 P1、1 项 P2，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-system-audit-03-04.md`](review-2026-09-system-audit-03-04.md) | 批次 E-1 首审已完成但不通过；3 项 P1、1 项 P2，报告同时作为唯一修复与复核计划 |
 | [`review-2026-09-system-audit-05-07.md`](review-2026-09-system-audit-05-07.md) | 批次 E-2 首审已完成但不通过；1 项 P1、1 项 P2，报告同时作为唯一修复与复核计划 |
+| [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md) | 延后结构性重构：以类型状态机彻底收口 MemoryChange/Bootstrap 失败闭包；触发条件满足后整体实施，不做局部兼容修复 |
+| [`todo-2026-09-admission-fail-closed.md`](todo-2026-09-admission-fail-closed.md) | 启动与平台输入统一 fail-closed：DT/ELF、checked arithmetic、hart identity、RuntimeGate/IPI 与 generation 边界整体收口 |
+| [`todo-2026-09-supervision-authority-policy.md`](todo-2026-09-supervision-authority-policy.md) | 生命周期监督政策重构：authority 保留、有限等待、重试预算、失败升级与 supervisor 接管 |
+| [`todo-2026-09-capability-owner-error-boundary.md`](todo-2026-09-capability-owner-error-boundary.md) | Capability 与 affine owner 错误边界：EXECUTE ABI、signal、Drop/discard、ticket 查询与 RPC reject 统一收口 |
+| [`todo-2026-09-identity-generation-boundaries.md`](todo-2026-09-identity-generation-boundaries.md) | Token/generation/epoch 身份域与耗尽策略：Remote、Handle、Job、Ready、Work-debt、AddressSpace 统一边界 |
 | [`todo-2026-08-system-audit.md`](todo-2026-08-system-audit.md) | 系统审计规范与历史分片入口；分片 1–2 已归档，3–7 首审报告已生成并承载后续复核 |
 | [`todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) | 当前实施计划：切片 8 多页 Tunnel/Runnel v2、切片 9 RNL2 动态 ring、切片 10 raw FramePool selftest adapter |
 | [`todo-2026-09-platform-reserved-memory-lifecycle.md`](todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |
