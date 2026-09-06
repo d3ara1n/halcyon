@@ -51,7 +51,6 @@ pub struct ProcessBuilder {
     header: ObjectHeader,
     _metadata: super::resources::BuilderPermit,
     state: crate::sync::Spinlock<BuilderState>,
-    wait: crate::sync::Spinlock<ObjectWaitState>,
 }
 
 impl ProcessBuilder {
@@ -66,10 +65,6 @@ impl ProcessBuilder {
                 BuilderState {
                     process: Some(Arc::downgrade(&process)),
                 },
-            ),
-            wait: crate::sync::Spinlock::new(
-                crate::sync::ranks::OBJECT_WAIT,
-                ObjectWaitState::new(ObjectSignals::NONE),
             ),
         })
         .map_err(|_| SystemCallError::OutOfMemory)
@@ -131,20 +126,8 @@ impl KernelObject for ProcessBuilder {
         )
     }
 
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::ProcessBuilder).then_some(ObjectSignals::CLOSED)
-    }
-
-    fn signals(&self) -> ObjectSignals {
-        self.wait.lock().signals()
-    }
-
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.wait.lock().subscribe(subscription)
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        self.wait.lock().unsubscribe(id);
+    fn allowed_signals(&self, _role: HandleRole) -> Option<ObjectSignals> {
+        None
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
@@ -242,42 +225,46 @@ impl ProcessControl {
     /// 持续电平——直至最终批次 publish_dead 清除。完成者逐个经
     /// 「锁内 take 一个 → 锁外 finish」循环交付，不分配（OOM 安全）。
     pub fn publish_reapable(&self) {
-        loop {
-            let context = {
-                let mut state = self.state.lock();
-                if state.dead.is_none() {
-                    state
-                        .wait
-                        .update(ObjectSignals::NONE, ObjectSignals::REAPABLE);
-                }
-                state.wait.take_completer()
-            };
-            let Some(context) = context else { break };
-            finish_offered(context);
+        {
+            let mut state = self.state.lock();
+            if state.dead.is_none() {
+                state
+                    .wait
+                    .update(ObjectSignals::NONE, ObjectSignals::REAPABLE);
+            }
+        }
+        let pending = {
+            let mut state = self.state.lock();
+            state.wait.take_notification()
+        };
+        if let Some((reservation, target)) = pending {
+            reservation.publish(target);
         }
     }
 
     /// Dead 发布：冻结终态快照、清 REAPABLE、置 CLOSED（收束完成点调用）。
     /// 同样不分配。
     pub fn publish_dead(&self, pid: u64, parent_pid: u64, reason: ProcessExitReason, code: i64) {
-        loop {
-            let context = {
-                let mut state = self.state.lock();
-                if state.dead.is_none() {
-                    state.dead = Some(DeadSnapshot {
-                        pid,
-                        parent_pid,
-                        reason,
-                        code,
-                    });
-                    state
-                        .wait
-                        .update(ObjectSignals::REAPABLE, ObjectSignals::CLOSED);
-                }
-                state.wait.take_completer()
-            };
-            let Some(context) = context else { break };
-            finish_offered(context);
+        {
+            let mut state = self.state.lock();
+            if state.dead.is_none() {
+                state.dead = Some(DeadSnapshot {
+                    pid,
+                    parent_pid,
+                    reason,
+                    code,
+                });
+                state
+                    .wait
+                    .update(ObjectSignals::REAPABLE, ObjectSignals::CLOSED);
+            }
+        }
+        let pending = {
+            let mut state = self.state.lock();
+            state.wait.take_notification()
+        };
+        if let Some((reservation, target)) = pending {
+            reservation.publish(target);
         }
     }
 
@@ -288,6 +275,24 @@ impl ProcessControl {
 }
 
 impl KernelObject for ProcessControl {
+    fn complete_waiter_drain(&self) {
+        self.state.lock().wait.complete_notification();
+    }
+
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        let mut used = 0;
+        while used < budget {
+            let context = { self.state.lock().wait.take_completer() };
+            let Some(context) = context else {
+                return (used, true);
+            };
+            super::wait::finish_offered(context);
+            used += 1;
+        }
+        let pending = self.state.lock().wait.has_pending();
+        (used, !pending)
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }

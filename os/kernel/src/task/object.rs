@@ -9,6 +9,7 @@ use core::{
 use erhino_shared::object::{ObjectSignals, Rights};
 
 use super::{
+    notify_work,
     proc::Process,
     wait::{Subscription, WaitContext, WaitOutcome},
 };
@@ -99,12 +100,20 @@ impl ObjectHeader {
 struct RegisteredSubscription {
     id: u64,
     subscription: Subscription,
+    /// 发布者在同一对象锁内冻结的命中结果；后续清位不得抹掉已登记候选。
+    pending: Option<WaitOutcome>,
+    /// 该订阅未来一次命中的 work-debt 槽；发布时移交给对象 owner。
+    notification: Option<notify_work::Reservation>,
 }
 
 /// 嵌入具体对象状态锁中的电平与订阅队列。所有方法都由对象锁保护。
 pub struct ObjectWaitState {
     signals: ObjectSignals,
     next_id: u64,
+    /// 游标只用于从上次 Deferred 候选继续；插入顺序仍是 item_index 的稳定次序。
+    notify_cursor: usize,
+    /// 已有一个 work-debt 任务在途；防止同一对象重复发布多个排水任务。
+    scheduled: bool,
     waiters: alloc::vec::Vec<RegisteredSubscription>,
 }
 
@@ -113,6 +122,8 @@ impl ObjectWaitState {
         Self {
             signals: initial,
             next_id: 1,
+            notify_cursor: 0,
+            scheduled: false,
             waiters: alloc::vec::Vec::new(),
         }
     }
@@ -130,7 +141,15 @@ impl ObjectWaitState {
         }
         self.signals &= !clear;
         self.signals |= set;
-        self.signals
+        let current = self.signals;
+        // 命中候选与电平更新在同一对象锁内冻结。publish 后即使消费者
+        // 清除 DATA/READABLE，候选仍由 pending 持有，不会被下一次重读抹掉。
+        for waiter in &mut self.waiters {
+            if waiter.pending.is_none() && Self::matches(current, waiter.subscription.interest) {
+                waiter.pending = Some(waiter.subscription.outcome(current));
+            }
+        }
+        current
     }
 
     pub fn subscribe(&mut self, subscription: Subscription) -> SubscribeResult {
@@ -143,36 +162,127 @@ impl ObjectWaitState {
         if self.waiters.try_reserve(1).is_err() {
             return SubscribeResult::OutOfMemory;
         }
+        let notification = match notify_work::reserve() {
+            Ok(reservation) => reservation,
+            Err(()) => return SubscribeResult::OutOfMemory,
+        };
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.waiters
-            .push(RegisteredSubscription { id, subscription });
+        self.waiters.push(RegisteredSubscription {
+            id,
+            subscription,
+            pending: None,
+            notification: Some(notification),
+        });
         SubscribeResult::Registered(id)
     }
 
     pub fn unsubscribe(&mut self, id: u64) {
         if let Some(index) = self.waiters.iter().position(|waiter| waiter.id == id) {
             self.waiters.remove(index);
+            if self.notify_cursor > index {
+                self.notify_cursor -= 1;
+            } else if self.notify_cursor >= self.waiters.len() {
+                self.notify_cursor = 0;
+            }
         }
     }
 
-    /// 在当前电平上寻找取得完成权的 Context。调用者移除源订阅后释放
-    /// 对象锁，再执行跨对象清理；Deferred 保留给 Installing 安装者。
+    /// 取出一个已在 update 同锁段冻结的命中候选。Deferred 保留候选，
+    /// 直到 Installing owner 完成 arm；不重新读取当前 signals。
+    pub(crate) fn take_notification(&mut self) -> Option<(notify_work::Reservation, ObjectRef)> {
+        if self.scheduled {
+            return None;
+        }
+        if self.notify_cursor >= self.waiters.len() {
+            self.notify_cursor = 0;
+        }
+        let count = self.waiters.len();
+        for _ in 0..count {
+            if self.notify_cursor >= self.waiters.len() {
+                self.notify_cursor = 0;
+            }
+            let index = self.notify_cursor;
+            self.notify_cursor = (index + 1) % self.waiters.len().max(1);
+            if self.waiters[index].pending.is_some()
+                && let Some(reservation) = self.waiters[index].notification.take()
+            {
+                self.scheduled = true;
+                return Some((reservation, self.waiters[index].subscription.object.clone()));
+            }
+        }
+        None
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.waiters.iter().any(|waiter| waiter.pending.is_some())
+    }
+
+    pub(crate) fn complete_notification(&mut self) {
+        assert!(
+            self.scheduled,
+            "notification debt completed without a scheduled task"
+        );
+        self.scheduled = false;
+        // Deferred offer 在本轮债务后仍保留注册；回收刚释放的槽，
+        // 使后续信号仍能再次调度该订阅。
+        if let Some(waiter) = self
+            .waiters
+            .iter_mut()
+            .find(|waiter| waiter.pending.is_some() && waiter.notification.is_none())
+        {
+            waiter.notification = Some(
+                notify_work::reserve()
+                    .expect("completed notification debt must rearm its reservation"),
+            );
+        }
+    }
+
     pub fn take_completer(&mut self) -> Option<Arc<WaitContext>> {
-        let mut index = 0;
-        while index < self.waiters.len() {
-            if !Self::matches(self.signals, self.waiters[index].subscription.interest) {
-                index += 1;
+        if self.waiters.is_empty() {
+            self.notify_cursor = 0;
+            return None;
+        }
+        let count = self.waiters.len();
+        for _ in 0..count {
+            if self.notify_cursor >= self.waiters.len() {
+                self.notify_cursor = 0;
+            }
+            let index = self.notify_cursor;
+            self.notify_cursor = (index + 1) % self.waiters.len();
+            let Some(outcome) = self.waiters[index].pending else {
+                continue;
+            };
+            // 同一 WaitMany 可重复观察一个对象；其输入顺序决定最小
+            // item_index 获胜。跨 Context 仍由游标提供公平轮转。
+            if self.waiters.iter().any(|candidate| {
+                candidate.pending.is_some()
+                    && candidate.subscription.item_index
+                        < self.waiters[index].subscription.item_index
+                    && Arc::ptr_eq(
+                        &candidate.subscription.context,
+                        &self.waiters[index].subscription.context,
+                    )
+            }) {
                 continue;
             }
-            let outcome = self.waiters[index].subscription.outcome(self.signals);
             match self.waiters[index].subscription.context.offer(outcome) {
-                wait_context::OfferResult::Deferred => index += 1,
+                wait_context::OfferResult::Deferred => {}
                 wait_context::OfferResult::Lost => {
                     self.waiters.remove(index);
+                    if self.notify_cursor > index {
+                        self.notify_cursor -= 1;
+                    }
+                    if self.notify_cursor >= self.waiters.len() {
+                        self.notify_cursor = 0;
+                    }
                 }
                 wait_context::OfferResult::Complete => {
-                    return Some(self.waiters.remove(index).subscription.context);
+                    let context = self.waiters.remove(index).subscription.context;
+                    if self.notify_cursor >= self.waiters.len() {
+                        self.notify_cursor = 0;
+                    }
+                    return Some(context);
                 }
             }
         }
@@ -220,6 +330,15 @@ pub trait KernelObject: Any + Send + Sync {
 
     /// 消息中的 transit Handle 被丢弃；只有持 TRANSIT 的 entry 可进入。
     fn close_transit(&self, role: HandleRole);
+
+    /// 从已发布的对象候选中推进至多 `budget` 个 waiter；返回
+    /// `(实际步骤, 是否已完成本次通知债务)`。
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        let _ = budget;
+        (0, true)
+    }
+
+    fn complete_waiter_drain(&self) {}
 
     fn as_any(&self) -> &dyn Any;
 }

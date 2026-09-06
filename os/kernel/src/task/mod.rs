@@ -8,6 +8,7 @@ pub mod mailbox;
 pub mod memory_object;
 pub mod memory_pool;
 pub mod notification;
+pub(crate) mod notify_work;
 pub mod object;
 pub mod proc;
 pub mod process;

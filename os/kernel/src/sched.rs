@@ -399,6 +399,7 @@ pub fn run() -> ! {
     loop {
         // idle 唤醒、门铃合并或先前 IPI 失败后，Pending 槽仍由安全点补消费。
         deferred_work::drain_current();
+        crate::task::notify_work::drain_current();
         // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
         // SFENCE.VMA）：循环体结构性只运行于内核页表下。
         let Some(t) = me_domain.pick() else {
@@ -450,6 +451,7 @@ pub fn run() -> ! {
                 assert!(wait_plan.is_none(), "Requeue outcome carries a wait intent");
                 loop {
                     deferred_work::drain_current();
+                    crate::task::notify_work::drain_current();
                     let epochs = t.process.space.epochs();
                     if t.process
                         .lifecycle
@@ -469,6 +471,7 @@ pub fn run() -> ! {
             Outcome::Killed => {
                 loop {
                     deferred_work::drain_current();
+                    crate::task::notify_work::drain_current();
                     let epochs = t.process.space.epochs();
                     if t.process
                         .lifecycle
@@ -484,6 +487,7 @@ pub fn run() -> ! {
             Outcome::Park => {
                 loop {
                     deferred_work::drain_current();
+                    crate::task::notify_work::drain_current();
                     let epochs = t.process.space.epochs();
                     if t.process
                         .lifecycle
@@ -531,7 +535,8 @@ fn idle() {
     domain.idle_mask.fetch_or(bit, Ordering::SeqCst);
     // 入队与登记 idle 的交错由双重检查闭合；work debt 的 Pending 电平同样
     // 禁止 owner 带债入睡，即使对应门铃曾失败或被合并。
-    if domain.has_ready() || deferred_work::has_current() {
+    if domain.has_ready() || deferred_work::has_current() || crate::task::notify_work::has_current()
+    {
         domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
         return;
     }

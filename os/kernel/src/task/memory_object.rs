@@ -26,7 +26,7 @@ use crate::{
         memory_pool::MemoryPool,
         object::{self, ObjectWaitState, SubscribeResult},
         resources::{ConnectionPermit, MetadataSponsor, ObjectBackingPermit},
-        wait::{Subscription, finish_offered},
+        wait::Subscription,
     },
 };
 
@@ -180,10 +180,7 @@ impl MemoryObjectCore {
     }
 
     /// 在对象锁内预留一批写许可（view 准入与 seal 线性化共用同一把锁）。
-    pub(crate) fn reserve_writes(
-        &self,
-        count: usize,
-    ) -> Result<Vec<WritePermit>, ObjectError> {
+    pub(crate) fn reserve_writes(&self, count: usize) -> Result<Vec<WritePermit>, ObjectError> {
         self.state.lock().machine.reserve_writes(count)
     }
 
@@ -241,10 +238,12 @@ impl MemoryObjectCore {
             .lock()
             .wait
             .update(ObjectSignals::NONE, ObjectSignals::EXECUTABLE);
-        loop {
-            let context = self.state.lock().wait.take_completer();
-            let Some(context) = context else { break };
-            finish_offered(context);
+        let pending = {
+            let mut state = self.state.lock();
+            state.wait.take_notification()
+        };
+        if let Some((reservation, target)) = pending {
+            reservation.publish(target);
         }
     }
 }
@@ -296,6 +295,27 @@ const MEMORY_OBJECT_RIGHTS: erhino_shared::object::Rights = {
 };
 
 impl object::KernelObject for MemoryObject {
+    fn complete_waiter_drain(&self) {
+        self.core.state.lock().wait.complete_notification();
+    }
+
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        let mut state = self.core.state.lock();
+        let mut used = 0;
+        while used < budget {
+            let context = state.wait.take_completer();
+            let Some(context) = context else {
+                return (used, true);
+            };
+            drop(state);
+            super::wait::finish_offered(context);
+            used += 1;
+            state = self.core.state.lock();
+        }
+        let pending = state.wait.has_pending();
+        (used, !pending)
+    }
+
     fn header(&self) -> &object::ObjectHeader {
         &self.header
     }
@@ -304,10 +324,7 @@ impl object::KernelObject for MemoryObject {
         object::ObjectKind::MemoryObject
     }
 
-    fn allowed_rights(
-        &self,
-        role: object::HandleRole,
-    ) -> Option<erhino_shared::object::Rights> {
+    fn allowed_rights(&self, role: object::HandleRole) -> Option<erhino_shared::object::Rights> {
         (role == object::HandleRole::MemoryObject).then_some(MEMORY_OBJECT_RIGHTS)
     }
 
@@ -327,7 +344,12 @@ impl object::KernelObject for MemoryObject {
         self.core.unsubscribe(id);
     }
 
-    fn close_handle(&self, role: object::HandleRole, _owner: &super::proc::Process, _exiting: bool) {
+    fn close_handle(
+        &self,
+        role: object::HandleRole,
+        _owner: &super::proc::Process,
+        _exiting: bool,
+    ) {
         debug_assert!(role == object::HandleRole::MemoryObject);
     }
 
@@ -384,8 +406,7 @@ pub fn create(thread: &super::Thread, request_ptr: usize) -> Result<(), SystemCa
     }
     let pages = bytes.div_ceil(super::proc::PAGE_SIZE);
     // 可由普通 Handle close 触发最终析构的对象必须受硬容量上限约束。
-    if u64::try_from(pages).map_err(|_| SystemCallError::IllegalArgument)?
-        > MEMORY_OBJECT_MAX_PAGES
+    if u64::try_from(pages).map_err(|_| SystemCallError::IllegalArgument)? > MEMORY_OBJECT_MAX_PAGES
     {
         return Err(SystemCallError::ReachLimit);
     }

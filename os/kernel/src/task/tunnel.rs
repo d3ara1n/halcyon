@@ -25,10 +25,10 @@ use crate::{
             SubscribeResult,
         },
         proc::{
-            MemoryRetireSink, ObjectMappingLease, PreparedMemoryChange,
-            Process, RetiringSpaceChange, map_shootdown_error, prepare_memory_completion,
+            MemoryRetireSink, ObjectMappingLease, PreparedMemoryChange, Process,
+            RetiringSpaceChange, map_shootdown_error, prepare_memory_completion,
         },
-        wait::{Subscription, finish_offered},
+        wait::{Subscription, schedule_waiters},
     },
 };
 
@@ -50,7 +50,6 @@ struct Connection {
     state: Spinlock<ConnectionState>,
     _metadata: super::resources::ConnectionPermit,
 }
-
 
 enum PeerNotice {
     Endpoint(Weak<Endpoint>),
@@ -108,11 +107,7 @@ impl Endpoint {
     }
 
     fn finish_waiters(&self) {
-        loop {
-            let context = self.wait.lock().take_completer();
-            let Some(context) = context else { break };
-            finish_offered(context);
-        }
+        schedule_waiters(&self.wait);
     }
 
     fn finish_close(&self, notice: Option<PeerNotice>) {
@@ -164,6 +159,14 @@ fn publish_peer_notice(notice: Option<PeerNotice>) {
 }
 
 impl KernelObject for Endpoint {
+    fn complete_waiter_drain(&self) {
+        self.wait.lock().complete_notification();
+    }
+
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        super::wait::drain_waiters(&self.wait, budget)
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -330,7 +333,10 @@ fn plan_side_mapping(
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
 ) -> Result<
-    (super::proc::MemoryChangePlan, Arc<super::memory_pool::MemoryPool>),
+    (
+        super::proc::MemoryChangePlan,
+        Arc<super::memory_pool::MemoryPool>,
+    ),
     super::proc::ObjectMapFailure,
 > {
     let (intent, spans, view_owner) =
@@ -614,17 +620,17 @@ pub fn create(
         }
     };
     let mut mapping = {
-        let (plan, pool) =
-            match plan_side_mapping(&connection, thread, va, authorization, permits) {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    cancel_writes(&connection, failure.permits);
-                    table
-                        .rollback(reservation.take().expect("TunnelCreate reservation exists"))
-                        .expect("TunnelCreate reservation must remain owned");
-                    return Err(SystemCallError::from(failure.error));
-                }
-            };
+        let (plan, pool) = match plan_side_mapping(&connection, thread, va, authorization, permits)
+        {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                cancel_writes(&connection, failure.permits);
+                table
+                    .rollback(reservation.take().expect("TunnelCreate reservation exists"))
+                    .expect("TunnelCreate reservation must remain owned");
+                return Err(SystemCallError::from(failure.error));
+            }
+        };
         let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
@@ -1019,14 +1025,20 @@ pub(crate) fn close_handle(
     let mut unmap = {
         let (plan, pool) = {
             let mut space = thread.process.space.lock();
-            let plan = space.plan_object_unmap(lease).map_err(SystemCallError::from)?;
+            let plan = space
+                .plan_object_unmap(lease)
+                .map_err(SystemCallError::from)?;
             let pool = Arc::clone(space.pool());
             (plan, pool)
         };
         let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
             Ok(owners) => owners,
             Err(error) => {
-                thread.process.space.lock().rollback_memory_change_plan(plan);
+                thread
+                    .process
+                    .space
+                    .lock()
+                    .rollback_memory_change_plan(plan);
                 return Err(SystemCallError::from(error));
             }
         };

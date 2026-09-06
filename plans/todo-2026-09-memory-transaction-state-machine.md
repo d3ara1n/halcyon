@@ -65,6 +65,12 @@
 
 验证：8 项 host 测试 debug/release、`just check`、`just acceptance`（stress 16/16、release core、sifive_u core）、`virt-hetero`、`virt-nofd` 通过。提交、唤醒、轮转和退款由 allocator 计数探针验证不分配。最终集成日志 `.git/validation/acceptance-ready-final.log`；首次已知 15/16 flake 与意图接管修复前的失败日志均保留，不混作最终通过结果。
 
+### 已完成：等待来源保活、命中快照与有界通知排水
+
+当前工作树已实现并验证等待闭包的三项前置：`WaitContext::Registration` 强持对象来源；`ObjectWaitState::update` 在对象锁内冻结 `WaitOutcome` 候选，后续清位不抹除命中；`take_completer` 不重读 live signals，并保留同一 WaitMany 的最小 `item_index`。每个 RegisteredSubscription 预付一个固定通知槽；对象发布交出 one-shot `notify_work::WorkDebts` 任务，安全点按 16/4 预算推进，剩余债务重排。所有 waitable object 已接入同一 drain trait，ProcessBuilder 的不可达 WAIT/CLOSED 面已删除。
+
+验证：`just check`、`ready_queue`/`wait_context` host tests、`virt` 与 `virt-stress` 通过（16/16）。本切片的预算覆盖 offer、候选移交和注册槽；尚未覆盖 ThreadDeparture/ProcessDrain 成员摘除、对象 backing 析构及 detached Tunnel close 的完整后置责任。
+
 ### 尚待冻结：所有完成责任的诚实预算与不可失败来源
 
 以下仍在本计划的同一闭包内，不能只修 MemoryChange 的局部尾段；自然序是通用通知/离场交付责任 → MemoryChange 与 Tunnel 退役 → ProcessDrain 完整终段。不是先改纯逻辑 crate 再接 adapter，各前置须与全部实际发布者和消费者一起交付。
@@ -75,7 +81,7 @@
 | 同一 retire unit 含来源扫描、最多 4096 region 扫描及 `retiring_views.clear()` | 每个扫描、owner 摘除/析构都有计费单位或可续进游标；若接受固定结构上限，必须给出完整单步 WCET，不只引用 batch budget | 边界容量、反序批次、最重析构时实际工作与声明预算一致 |
 | `Notification::signal`、`Endpoint::set_signals` 在 update 后解锁，finish_waiters 重取锁；消费者可在间隙清位 | 对象发布与候选快照捕获在同一临界段，不把“同一把锁”误当“同一临界段”；后续清位不抹掉候选，也不合并不同更新的 observed | 所有可清除电平的 set→clear；尤其 Notification signal/take 与 Tunnel notify/ack |
 | `WaitContext::Registration` 弱持观察对象，Waiting 成员也仅弱持 Context；对象队列是部分等待的唯一强根 | Waiting 执行责任由调用方生命周期持有，注册强持观察授权，对象订阅弱指 Context；完成/取消显式切断各边，不能由最后 Handle 消散暗中丢掉线程 | 无限等待时关闭最后一个目标 control Handle，随后目标完成及调用方 kill，均无孤儿 Waiting/Exiting |
-| `ObjectWaitState::take_completer` 重复从头扫描；MemoryObject/Tunnel/ThreadControl/ProcessControl/Job 同步循环交付 waiter | 所有 waitable object 共用预付、有界的通知交付责任；电平发布与剩余 waiter 责任同时成立；不能为内存对象另造通知尾段 | 混合兴趣、Installing/Deferred、取消竞态、CLOSED 全兴趣匹配；最多 1024 waiter 和每等待最多 64 订阅的真实成本 |
+| `ObjectWaitState::take_completer` 原先由每个对象同步循环；现已接入 `notify_work::WorkDebts`，每订阅预付槽并按 16/4 推进 | 所有 waitable object 共用候选快照、固定槽与 drain trait；剩余 offer/注销责任可重排，不为内存对象另造通知尾段 | 混合兴趣、Installing/Deferred、取消竞态、CLOSED 全兴趣匹配；槽耗尽 fail closed；最多 1024 waiter 和每等待最多 64 订阅的完整成本 |
 | `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | 以稳定成员凭据和固定成本通知消除隐式动态工作；仍需异步的离场责任由出生时预付 owner 接管。最终选择须服从完整 primitive 上界，不机械增加状态机 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
 | `Tunnel::close_detached` 在 REAPABLE 后才分配 sink、规划页表并资金化 | Endpoint/lease 的准入必须支付未来不可避免的退役，或消费已有可复用退役工作区；显式 close 与 detached close 共用最终事务，不以 OOM 重试掩盖收束缺口 | 准入后持续 allocator failure 仍可完成关闭与 CLOSED，无新增 sink 或 funding 来源 |
 | `ProcessDrain` 在返回资源 complete 后于预算外 publish_dead、Job unlink、最多 32 层祖先完成 | Process/Job 收尾进入持久终段，稳定成员凭据与通用通知责任保证进度；Complete 只在责任已完成或不可丢失地交出后返回 | 最小预算、深 Job 链、大量 waiter、管理者交替推进与终态观察 |
@@ -86,7 +92,7 @@
 
 ### 通用通知的设计候选：命中批次与稳定等待根
 
-**状态：候选已收敛，容量参数、注册容器与 primitive 工作上界尚未冻结，不开始核心编码。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)；不能从 Zircon 的同步 observer、seL4 单目标 signal 或 managarm WorkQueue 推出本系统已满足预算。
+**状态：第一版固定槽与 primitive 预算已实现；仍需把对象析构、ThreadDeparture、ProcessDrain 与 detached Tunnel 的后置责任接入同一预算表。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)；不能从 Zircon 的同步 observer、seL4 单目标 signal 或 managarm WorkQueue 推出本系统已满足预算。
 
 #### 语义与所有权
 
@@ -126,7 +132,7 @@ Open ──最后注册取消──→ Retiring → Done
 
 #### 准入、预算与离场
 
-- 等待 Context、开放批次及其完成队列位置，在接受对应责任前取得真实存储与 metadata charge；不能在 signal、最后 permit 退役或 outcome 获胜之后首次分配。
+- 等待 Context、注册通知槽及其完成队列位置，在接受对应责任前取得真实存储与固定槽；不能在 signal、最后 permit 退役或 outcome 获胜之后首次分配。当前 `notify_work` 以 8192 个注册槽作为全局硬界，耗尽在 subscribe 阶段 fail closed；metadata sponsor 的长期归属和跨进程预算仍需与 resources 纵向接线。
 - 完成队列只调度各责任 owner，不合并它们的事务状态机，也不以任意闭包掩盖工作上界。每次取出 owner 后释放队列锁，再执行一个已量化的 primitive；所有 work 类型共享安全点预算。
 - 容量证明必须覆盖开放、已发布、Taken、等待清理和已交付但尚有真实引用的 owner。不能只按当前 Waiting 线程数定额，因为已交付线程可以开始下一次等待，而旧 Context/批次仍可能在退役。
 - 锁顺序须冻结为对象状态 → 批次注册状态 → completion/work slot；生命周期锁只接管 Context，不在持有时进入低秩对象或队列。游标状态锁取出工作后释放，再触碰业务锁；来源 Arc 和真实 owner 在业务锁外消散。

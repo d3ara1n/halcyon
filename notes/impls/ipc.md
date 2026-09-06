@@ -38,7 +38,11 @@ Send 在 `HandleTable → Mailbox` 锁序下，以当前 pid 和目标 sender ba
 
 `os/wait_context` 提供 `Installing → Armed → Finishing → Done` 和单 outcome 仲裁。`task/wait.rs` 解析 Handle/WAIT/allowed signals，在安装前暂持对象引用，在线程离开执行点后安装订阅，并负责结果交付和取消清理。
 
-当前注册记录弱持观察对象、Lifecycle Waiting 记录弱持 Context，而对象队列强持 Context；这尚未闭合最后一个观察 Handle 关闭时的保活契约。电平发布仍同步循环取等待者，Notification/Tunnel 的 update 与 take_completer 之间会释放锁，不能视为同一临界段。来源保活、命中快照与通用预算的实施真值见 [`完成闭包计划`](../../plans/todo-2026-09-memory-transaction-state-machine.md)；本节不将方向性契约冒充已实现的保障。
+Waiting 注册现强持已验证的观察对象，Lifecycle Waiting 仍以弱 Context 做终止游标；对象队列强持 Context。完成/取消时先取出线程 owner，再注销强注册，最后断开对象→Context 的边，避免最后一个观察 Handle 关闭时静默丢掉无限等待。`ObjectWaitState` 在 update 同锁段冻结每项命中候选，take_completer 不再重读可能已经清除的 live signals，并以游标和同一 WaitMany 的最小 item_index 规则选择候选。
+
+通知排水已改为固定槽 `notify_work::WorkDebts`：每个 RegisteredSubscription 在注册时取得一个 future-hit 槽；对象更新锁内冻结候选；同一对象以 `scheduled` 位保证至多一个在途债务，发布者只交出其中一个槽与对象来源，owner hart 每次安全点最多推进 16 步、单 debt turn 最多 4 步，剩余债务重排。Deferred 或继续存活的候选在 debt 完成后回收并重装槽，避免短暂命中后失去后续通知能力。槽耗尽在订阅安装前返回 OutOfMemory，不把失败拖到 signal 或事务提交后。已消费/取消的注册精确归还槽，WaitContext 强持来源直到注销。
+
+真实 primitive 的完整收束仍在后续审计：当前对象 drain 只把 offer 与注册移交纳入预算，成员摘除、对象 backing 析构、ThreadDeparture/ProcessDrain 和 detached Tunnel close 尚未完全接入同一预算表。ProcessBuilder 不公开 WAIT/CLOSED 残留，已删除其无发布者等待面。
 
 公开 ABI 参数 `timeout_ms` 是相对毫秒，零表示无限；完成原因 `WaitReason::Timeout` 的 wire 判别值为 3。内核安装时换算为单调时钟 `expires_at`。
 

@@ -1,9 +1,6 @@
 //! WaitContext：多对象等待的安装、完成仲裁、订阅清理与结果交付。
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
     object::ObjectSignals,
@@ -16,7 +13,7 @@ use crate::{context::UserContext, sched, sync::Spinlock, uaccess};
 
 use super::{
     Thread,
-    object::{KernelObject, ObjectRef},
+    object::{ObjectRef, ObjectWaitState},
 };
 
 /// syscall 阶段已解析并保留授权的观察项。
@@ -179,6 +176,8 @@ pub enum WaitOutcome {
 #[derive(Clone)]
 pub(crate) struct Subscription {
     pub context: Arc<WaitContext>,
+    /// 订阅所属对象；通知债务通过它交给目标 drain owner。
+    pub object: ObjectRef,
     pub interest: ObjectSignals,
     pub cookie: WaitCookie,
     pub item_index: u32,
@@ -207,7 +206,9 @@ impl Subscription {
 }
 
 struct Registration {
-    object: Weak<dyn KernelObject>,
+    /// 保留已验证观察来源直到注销/完成；Waiting 不依赖最后一个 Handle
+    /// 或对象外部 owner 维持这条引用。
+    object: ObjectRef,
     id: u64,
 }
 
@@ -286,13 +287,10 @@ impl WaitContext {
         }
     }
 
-    fn remember(&self, object: &ObjectRef, id: u64) {
+    fn remember(&self, object: ObjectRef, id: u64) {
         let mut registrations = self.registrations.lock();
         debug_assert!(registrations.len() < registrations.capacity());
-        registrations.push(Registration {
-            object: Arc::downgrade(object),
-            id,
-        });
+        registrations.push(Registration { object, id });
     }
 
     fn cleanup(&self) {
@@ -301,9 +299,7 @@ impl WaitContext {
             core::mem::take(&mut *held)
         };
         for registration in registrations {
-            if let Some(object) = registration.object.upgrade() {
-                object.unsubscribe(registration.id);
-            }
+            registration.object.unsubscribe(registration.id);
         }
     }
 
@@ -455,6 +451,7 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
         }
         let subscription = Subscription {
             context: context.clone(),
+            object: item.object.clone(),
             interest: item.signals,
             cookie: item.cookie,
             item_index: item.index,
@@ -464,7 +461,7 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
                 context.offer(outcome);
             }
             super::object::SubscribeResult::Registered(id) => {
-                context.remember(&item.object, id);
+                context.remember(item.object.clone(), id);
             }
             super::object::SubscribeResult::ReachLimit => {
                 context.offer(WaitOutcome::Error(SystemCallError::ReachLimit));
@@ -549,6 +546,30 @@ fn deliver_install_error(
     frame.x[10] = error.to_usize().unwrap_or(1) as u64;
     frame.sepc += 4;
     sched::enqueue(thread);
+}
+
+/// 更新对象电平后交出一次已支付通知债务；不在发布者栈上排水全部等待者。
+pub(crate) fn schedule_waiters(wait: &Spinlock<ObjectWaitState>) {
+    let Some((reservation, target)) = wait.lock().take_notification() else {
+        return;
+    };
+    reservation.publish(target);
+}
+
+/// 通知 owner 在固定预算内推进候选；未完成的对象债务由 work queue 重排。
+pub(crate) fn drain_waiters(wait: &Spinlock<ObjectWaitState>, budget: usize) -> (usize, bool) {
+    debug_assert!(budget > 0);
+    let mut used = 0;
+    while used < budget {
+        let context = wait.lock().take_completer();
+        let Some(context) = context else {
+            return (used, true);
+        };
+        finish_offered(context);
+        used += 1;
+    }
+    let pending = wait.lock().has_pending();
+    (used, !pending)
 }
 
 /// 对象信号更新在释放对象锁后调用；只有 Complete 方可进入。

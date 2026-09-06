@@ -21,7 +21,7 @@ use super::{
         SubscribeResult,
     },
     proc::Process,
-    wait::{Subscription, finish_offered},
+    wait::{Subscription, schedule_waiters},
 };
 
 const CONTROL_MAX_RIGHTS: Rights = Rights::from_raw(
@@ -53,15 +53,10 @@ impl ThreadControl {
 
     /// 成员摘除及线程级结果义务完成后发布持续 DONE 电平。
     pub(crate) fn publish_done(&self) {
-        loop {
-            let context = {
-                let mut wait = self.wait.lock();
-                wait.update(ObjectSignals::NONE, ObjectSignals::DONE);
-                wait.take_completer()
-            };
-            let Some(context) = context else { break };
-            finish_offered(context);
-        }
+        self.wait
+            .lock()
+            .update(ObjectSignals::NONE, ObjectSignals::DONE);
+        schedule_waiters(&self.wait);
     }
 }
 
@@ -192,6 +187,14 @@ impl Drop for ThreadResultObligation {
 }
 
 impl KernelObject for ThreadControl {
+    fn complete_waiter_drain(&self) {
+        self.wait.lock().complete_notification();
+    }
+
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        super::wait::drain_waiters(&self.wait, budget)
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }

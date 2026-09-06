@@ -22,7 +22,7 @@ use super::{
         SubscribeResult,
     },
     proc::Process,
-    wait::{Subscription, finish_offered},
+    wait::Subscription,
 };
 
 pub struct Message {
@@ -241,15 +241,35 @@ impl Mailbox {
     }
 
     pub(crate) fn finish_waiters(&self) {
-        loop {
-            let context = self.state.lock().wait.take_completer();
-            let Some(context) = context else { break };
-            finish_offered(context);
+        let pending = {
+            let mut state = self.state.lock();
+            state.wait.take_notification()
+        };
+        if let Some((reservation, target)) = pending {
+            reservation.publish(target);
         }
     }
 }
 
 impl KernelObject for Mailbox {
+    fn complete_waiter_drain(&self) {
+        self.state.lock().wait.complete_notification();
+    }
+
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        let mut used = 0;
+        while used < budget {
+            let context = { self.state.lock().wait.take_completer() };
+            let Some(context) = context else {
+                return (used, true);
+            };
+            super::wait::finish_offered(context);
+            used += 1;
+        }
+        let pending = self.state.lock().wait.has_pending();
+        (used, !pending)
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }

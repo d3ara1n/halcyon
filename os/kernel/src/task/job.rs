@@ -47,7 +47,7 @@ use super::{
         SubscribeResult,
     },
     proc::Process,
-    wait::{Subscription, finish_offered},
+    wait::{Subscription, schedule_waiters},
 };
 
 /// Job 层级深度硬上限（含 root）。
@@ -509,15 +509,10 @@ impl Job {
 
     /// CLOSED 发布（对象 wait 锁，不与 JobInner 锁嵌套；零分配完成交付）。
     fn publish_closed(&self) {
-        loop {
-            let context = {
-                let mut wait = self.wait.lock();
-                wait.update(ObjectSignals::NONE, ObjectSignals::CLOSED);
-                wait.take_completer()
-            };
-            let Some(context) = context else { break };
-            finish_offered(context);
-        }
+        self.wait
+            .lock()
+            .update(ObjectSignals::NONE, ObjectSignals::CLOSED);
+        schedule_waiters(&self.wait);
     }
 
     /// 完成收尾（JobInner 锁外）：发布自身 CLOSED，再沿父链传播——逐级
@@ -581,6 +576,14 @@ impl Job {
 }
 
 impl KernelObject for Job {
+    fn complete_waiter_drain(&self) {
+        self.wait.lock().complete_notification();
+    }
+
+    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
+        super::wait::drain_waiters(&self.wait, budget)
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
