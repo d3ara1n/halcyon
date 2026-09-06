@@ -919,6 +919,17 @@ pub(crate) struct EpochSnapshot {
     pub instruction: u64,
 }
 
+fn advance_epoch(epoch: &AtomicU64) -> Option<u64> {
+    let mut current = epoch.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match epoch.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 static NEXT_ADDRESS_SPACE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// 进程地址空间的稳定外壳。identity 与 epoch 不随 ledger/页表状态锁借用而移动，
@@ -1667,6 +1678,11 @@ impl AddressSpace {
             immediate,
         } = prepared;
         let mut state = self.state.lock();
+        if self.translation_epoch.load(Ordering::Acquire) == u64::MAX
+            || (instruction && self.instruction_epoch.load(Ordering::Acquire) == u64::MAX)
+        {
+            return Err(ShootdownChanged);
+        }
         lifecycle
             .commit_if_current(execution, mandatory, |active| {
                 debug_assert_eq!(active, execution.active());
@@ -1692,16 +1708,11 @@ impl AddressSpace {
     }
 
     fn publish_epochs(&self, instruction: bool) -> EpochSnapshot {
-        let translation = self
-            .translation_epoch
-            .fetch_add(1, Ordering::Release)
-            .checked_add(1)
-            .expect("address-space translation epoch exhausted");
+        let translation = advance_epoch(&self.translation_epoch)
+            .expect("address-space translation epoch exhausted before publish");
         let instruction = if instruction {
-            self.instruction_epoch
-                .fetch_add(1, Ordering::Release)
-                .checked_add(1)
-                .expect("address-space instruction epoch exhausted")
+            advance_epoch(&self.instruction_epoch)
+                .expect("address-space instruction epoch exhausted before publish")
         } else {
             self.instruction_epoch.load(Ordering::Acquire)
         };

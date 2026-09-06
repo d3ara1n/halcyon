@@ -87,9 +87,6 @@ impl MemberKey {
         self.tid
     }
 
-    pub(crate) const fn slot(self) -> usize {
-        self.slot
-    }
 }
 
 /// Running ThreadSpawn 在线性化段得到的成员身份。
