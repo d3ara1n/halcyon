@@ -67,6 +67,9 @@ pub struct Endpoint {
     // 持 entry 并逐批重入，完成分支先 take 本字段再 drop entry，从而打破环。
     // 任何新增的放弃 entry 路径都必须先显式拆除此状态。
     detached_retire: Spinlock<Option<DetachedLeaseRetire>>,
+    /// Endpoint 发布前预付的 detached-close sink；关闭阶段只配置 lease，
+    /// 不再首次申请 Arc/事务工作区。
+    detached_sink: Spinlock<Option<Arc<LeaseRetire>>>,
     _metadata: super::resources::EndpointPermit,
 }
 
@@ -76,7 +79,7 @@ impl Endpoint {
         side: usize,
         metadata: super::resources::EndpointPermit,
     ) -> Result<Arc<Self>, SystemCallError> {
-        Arc::try_new(Self {
+        let endpoint = Arc::try_new(Self {
             header: ObjectHeader::new(),
             connection,
             side,
@@ -86,9 +89,14 @@ impl Endpoint {
                 ObjectWaitState::new(ObjectSignals::NONE),
             ),
             detached_retire: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            detached_sink: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             _metadata: metadata,
         })
-        .map_err(|_| SystemCallError::OutOfMemory)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+        let sink = Arc::try_new(LeaseRetire::new(Arc::downgrade(&endpoint)))
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        *endpoint.detached_sink.lock() = Some(sink);
+        Ok(endpoint)
     }
 
     fn object_ref(this: &Arc<Self>) -> ObjectRef {
@@ -472,8 +480,9 @@ struct LeaseRetireState {
 }
 
 struct LeaseRetire {
-    endpoint: Arc<Endpoint>,
-    lease: ObjectMappingLease,
+    endpoint: alloc::sync::Weak<Endpoint>,
+    holder: Spinlock<Option<Arc<Endpoint>>>,
+    lease: Spinlock<Option<ObjectMappingLease>>,
     state: Spinlock<LeaseRetireState>,
 }
 
@@ -483,10 +492,11 @@ struct DetachedLeaseRetire {
 }
 
 impl LeaseRetire {
-    fn new(endpoint: Arc<Endpoint>, lease: ObjectMappingLease) -> Self {
+    fn new(endpoint: alloc::sync::Weak<Endpoint>) -> Self {
         Self {
             endpoint,
-            lease,
+            holder: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            lease: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             state: Spinlock::new(
                 crate::sync::ranks::MEMORY_COMPLETION,
                 LeaseRetireState {
@@ -497,6 +507,11 @@ impl LeaseRetire {
         }
     }
 
+    fn configure_lease(&self, endpoint: Arc<Endpoint>, lease: ObjectMappingLease) {
+        self.holder.lock().replace(endpoint);
+        self.lease.lock().replace(lease);
+    }
+
     fn install_notice(&self, notice: Option<PeerNotice>) {
         let previous = self.state.lock().notice.replace(notice);
         assert!(previous.is_none(), "Tunnel close notice installed twice");
@@ -505,7 +520,13 @@ impl LeaseRetire {
 
 impl MemoryRetireSink for LeaseRetire {
     fn retire_fragment(&self, fragment: RetiringFragment) {
-        validate_retired_lease_fragment(self.lease, fragment);
+        let lease = self
+            .lease
+            .lock()
+            .as_ref()
+            .copied()
+            .expect("Tunnel retire fragment arrived before lease configuration");
+        validate_retired_lease_fragment(lease, fragment);
         let mut state = self.state.lock();
         assert!(
             !state.fragment_retired,
@@ -525,7 +546,13 @@ impl MemoryRetireSink for LeaseRetire {
             .take()
             .expect("Tunnel close retired before notice Commit");
         drop(state);
-        self.endpoint.finish_close(notice);
+        let endpoint = self
+            .holder
+            .lock()
+            .take()
+            .or_else(|| self.endpoint.upgrade())
+            .expect("Tunnel retire endpoint dropped before completion");
+        endpoint.finish_close(notice);
     }
 }
 
@@ -1061,16 +1088,13 @@ pub(crate) fn close_handle(
         };
         Some(prepared)
     };
-    let retire = match Arc::try_new(LeaseRetire::new(endpoint.clone(), lease)) {
-        Ok(retire) => retire,
-        Err(_) => {
-            abandon_unmap(
-                &thread.process.space,
-                unmap.take().expect("Tunnel close Unmap exists"),
-            );
-            return Err(SystemCallError::OutOfMemory);
-        }
-    };
+    let retire = endpoint
+        .detached_sink
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("Tunnel endpoint close sink was not preallocated");
+    retire.configure_lease(endpoint.clone(), lease);
     let retire_sink: Arc<dyn MemoryRetireSink> = retire.clone();
     let (completion, plan) =
         match prepare_memory_completion(thread.process.clone(), 0, Some(retire_sink), None) {
@@ -1168,10 +1192,13 @@ pub(crate) fn close_detached(
 
     let lease = endpoint.connection.state.lock().leases[endpoint.side]
         .expect("detached Tunnel Endpoint must retain its mapping lease");
-    let sink = match Arc::try_new(LeaseRetire::new(endpoint.clone(), lease)) {
-        Ok(sink) => sink,
-        Err(_) => return Err(entry),
-    };
+    let sink = endpoint
+        .detached_sink
+        .lock()
+        .as_ref()
+        .cloned()
+        .expect("detached Tunnel close sink was not preallocated");
+    sink.configure_lease(endpoint.clone(), lease);
 
     let mut connection_state = endpoint.connection.state.lock();
     assert_eq!(
