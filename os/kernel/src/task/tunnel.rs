@@ -70,6 +70,7 @@ pub struct Endpoint {
     /// Endpoint 发布前预付的 detached-close sink；关闭阶段只配置 lease，
     /// 不再首次申请 Arc/事务工作区。
     detached_sink: Spinlock<Option<Arc<LeaseRetire>>>,
+    close_sink: Spinlock<Option<Arc<LeaseRetire>>>,
     _metadata: super::resources::EndpointPermit,
 }
 
@@ -90,12 +91,16 @@ impl Endpoint {
             ),
             detached_retire: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             detached_sink: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
+            close_sink: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        let sink = Arc::try_new(LeaseRetire::new(Arc::downgrade(&endpoint)))
+        let detached_sink = Arc::try_new(LeaseRetire::new(Arc::downgrade(&endpoint)))
             .map_err(|_| SystemCallError::OutOfMemory)?;
-        *endpoint.detached_sink.lock() = Some(sink);
+        let close_sink = Arc::try_new(LeaseRetire::new(Arc::downgrade(&endpoint)))
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        *endpoint.detached_sink.lock() = Some(detached_sink);
+        *endpoint.close_sink.lock() = Some(close_sink);
         Ok(endpoint)
     }
 
@@ -1089,7 +1094,7 @@ pub(crate) fn close_handle(
         Some(prepared)
     };
     let retire = endpoint
-        .detached_sink
+        .close_sink
         .lock()
         .as_ref()
         .cloned()
@@ -1195,8 +1200,7 @@ pub(crate) fn close_detached(
     let sink = endpoint
         .detached_sink
         .lock()
-        .as_ref()
-        .cloned()
+        .take()
         .expect("detached Tunnel close sink was not preallocated");
     sink.configure_lease(endpoint.clone(), lease);
 
