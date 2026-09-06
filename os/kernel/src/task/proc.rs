@@ -4329,7 +4329,7 @@ pub struct Thread {
 // SAFETY: UserContext 只在两种互斥状态下被访问：线程在本 hart 执行/
 // 挂起期间（trap 路径与 dispatcher 经执行点独占写）；或线程已无容器
 // （Waiting：发布时序保证完成方只见已离开一切 hart 引用的线程，见
-// sched::run 的 Park 分支）。其余字段原子或只读。
+// sched::run 的 Park 发布分支）。其余字段原子或只读。
 unsafe impl Sync for Thread {}
 
 impl Thread {
