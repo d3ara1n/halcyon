@@ -125,7 +125,7 @@ unsafe extern "C" fn handle_user_trap(
                 let todo = t.process.lifecycle.request_termination(
                     erhino_shared::proc::ProcessExitReason::Fault,
                     fault as i64,
-                    Some(t.tid),
+                    Some(t.member()),
                 );
                 let process = t.process.clone();
                 crate::task::process::run_termination_todo(&process, todo);

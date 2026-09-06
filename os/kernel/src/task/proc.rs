@@ -4048,8 +4048,8 @@ impl Process {
             .validate_initial_context(context.entry as usize, context.stack_pointer as usize)
             .map_err(ThreadAttachError::Context)?;
         self.lifecycle
-            .attach_member(|tid| {
-                let thread = Thread::new_thread(tid, self, context)
+            .attach_member(|tid, member| {
+                let thread = Thread::new_thread(tid, member, self, context)
                     .map_err(|_| super::lifecycle::AttachFault::Oom)?;
                 Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
             })
@@ -4071,8 +4071,8 @@ impl Process {
             .map_err(ThreadAttachError::Context)?;
         let (tid, retired) = self
             .lifecycle
-            .attach_registered_member(|tid| {
-                let thread = Thread::new_thread(tid, self, context)
+            .attach_registered_member(|tid, member| {
+                let thread = Thread::new_thread(tid, member, self, context)
                     .map_err(|_| super::lifecycle::AttachFault::Oom)?;
                 Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
             })
@@ -4290,8 +4290,9 @@ impl Process {
 /// （ELF 判定，Building 期冻结于 Process.requirement），线程经 process
 /// 间接持有——同一进程的线程共享同一执行需求。
 pub struct Thread {
-    /// 进程内线程号（成员表键；tid 从 1 起，0 保留为非身份值）。
+    /// 进程内线程号（ABI 身份；tid 从 1 起，0 保留为非身份值）。
     pub tid: Tid,
+    member: super::lifecycle::MemberKey,
     pub process: Arc<Process>,
     frame: UnsafeCell<UserContext>,
     departure: Arc<super::thread::ThreadDeparture>,
@@ -4313,19 +4314,21 @@ impl Thread {
     /// Arc 分配取 HEAP 锁为 LIFECYCLE→HEAP 合法秩）。
     pub(super) fn new_thread(
         tid: Tid,
+        member: super::lifecycle::MemberKey,
         process: &Arc<Process>,
         context: ThreadStartContext,
     ) -> Result<Self, ()> {
-        Self::new_thread_with_control(tid, process, context, None)
+        Self::new_thread_with_control(tid, member, process, context, None)
     }
 
     pub(super) fn new_thread_with_control(
         tid: Tid,
+        member: super::lifecycle::MemberKey,
         process: &Arc<Process>,
         context: ThreadStartContext,
         control: Option<&Arc<super::thread::ThreadControl>>,
     ) -> Result<Self, ()> {
-        let departure = super::thread::ThreadDeparture::new(process, tid, control)?;
+        let departure = super::thread::ThreadDeparture::new(process, member, control)?;
         let mut ctx = UserContext::zeroed();
         ctx.sepc = context.entry;
         ctx.x[2] = context.stack_pointer;
@@ -4333,6 +4336,7 @@ impl Thread {
         ctx.x[11] = context.arg2; // a1
         Ok(Self {
             tid,
+            member,
             process: process.clone(),
             frame: UnsafeCell::new(ctx),
             departure,
@@ -4361,6 +4365,10 @@ impl Thread {
         } else {
             super::thread::DepartureKind::Terminated
         }
+    }
+
+    pub(crate) const fn member(&self) -> super::lifecycle::MemberKey {
+        self.member
     }
 
     pub(crate) fn departure(&self) -> Arc<super::thread::ThreadDeparture> {
@@ -4407,10 +4415,11 @@ pub(crate) fn building_cutoff_selftest() {
     );
     let (tid, retired) = process
         .lifecycle
-        .attach_registered_member(|tid| {
+        .attach_registered_member(|tid, member| {
             Arc::try_new(
                 Thread::new_thread(
                     tid,
+                    member,
                     &process,
                     ThreadStartContext {
                         entry: 0,

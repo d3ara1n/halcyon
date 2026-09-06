@@ -960,8 +960,12 @@ fn control_publish_reapable(control: &Option<Arc<ProcessControl>>) {
 
 /// 线程级结果义务归零后的离场确认。正常末线程在 lifecycle 线性化点铸造
 /// 进程终局；已有进程级终止则只协助 REAPABLE 发布。
-pub fn confirm_departure(process: &Arc<Process>, tid: Tid, normal_code: Option<i64>) {
-    let (termination, reapable) = process.lifecycle.thread_departed(tid, normal_code);
+pub fn confirm_departure(
+    process: &Arc<Process>,
+    member: super::lifecycle::MemberKey,
+    normal_code: Option<i64>,
+) {
+    let (termination, reapable) = process.lifecycle.thread_departed(member, normal_code);
     if let Some(todo) = termination {
         run_termination_todo(process, todo);
     } else if reapable {
@@ -998,7 +1002,7 @@ pub fn kill(thread: &Thread, control: Handle, code: i64) -> Result<KillOutcome, 
         let todo = process.lifecycle.request_termination(
             ProcessExitReason::Killed,
             code,
-            Some(thread.tid),
+            Some(thread.member()),
         );
         run_termination_todo(&process, todo);
         return Ok(KillOutcome::TerminatedCaller);

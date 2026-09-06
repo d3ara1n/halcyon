@@ -415,9 +415,12 @@ pub fn run() -> ! {
         // lifecycle gate：Terminating 线程不进用户态（惰性撤销）。
         let entered = loop {
             let epochs = t.process.space.synchronize_local();
-            match t.process.lifecycle.enter_running_if(t.tid, me.slot(), || {
-                t.process.space.local_is_current(epochs)
-            }) {
+            match t
+                .process
+                .lifecycle
+                .enter_running_if(t.member(), me.slot(), || {
+                    t.process.space.local_is_current(epochs)
+                }) {
                 EnterRunning::Entered => break true,
                 EnterRunning::Retry => continue,
                 EnterRunning::Closed => break false,
@@ -453,10 +456,9 @@ pub fn run() -> ! {
                     deferred_work::drain_current();
                     crate::task::notify_work::drain_current();
                     let epochs = t.process.space.epochs();
-                    if t.process
-                        .lifecycle
-                        .on_requeue_if(t.tid, slot, || t.process.space.local_is_current(epochs))
-                    {
+                    if t.process.lifecycle.on_requeue_if(t.member(), slot, || {
+                        t.process.space.local_is_current(epochs)
+                    }) {
                         break;
                     }
                 }

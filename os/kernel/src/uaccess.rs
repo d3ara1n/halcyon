@@ -12,8 +12,8 @@
 //! 统一走 [`deliver_output`]（冻结 store-access 终因并杀调用进程）。
 
 use crate::mm::SumGuard;
-use crate::task::proc::{AddressSpaceState, PAGE_SIZE};
 use crate::task::Thread;
+use crate::task::proc::{AddressSpaceState, PAGE_SIZE};
 
 /// 单次访问上限（防恶意长度；Debug 消息与初期 IPC 载荷远小于此）。
 pub const MAX_USER_ACCESS: usize = 1 << 20;
@@ -119,7 +119,7 @@ pub unsafe fn deliver_output<T: Copy>(
         let todo = process.lifecycle.request_termination(
             erhino_shared::proc::ProcessExitReason::Fault,
             erhino_shared::proc::ProcessFaultCode::StoreAccess as i64,
-            Some(thread.tid),
+            Some(thread.member()),
         );
         crate::task::process::run_termination_todo(&process, todo);
         error.into()

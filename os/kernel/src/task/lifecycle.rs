@@ -73,17 +73,27 @@ pub(crate) enum AttachFault {
     Oom,
 }
 
-/// Running ThreadSpawn 在线性化段得到的成员身份。
+/// 线程成员表的稳定身份。slot 在 Process 生命周期内复用，generation
+/// 防止离场凭据误命中新成员；tid 只作诊断和 ABI 身份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SpawnMember {
+pub(crate) struct MemberKey {
+    slot: usize,
+    generation: u64,
     tid: Tid,
 }
 
-impl SpawnMember {
+impl MemberKey {
     pub(crate) const fn tid(self) -> Tid {
         self.tid
     }
+
+    pub(crate) const fn slot(self) -> usize {
+        self.slot
+    }
 }
+
+/// Running ThreadSpawn 在线性化段得到的成员身份。
+pub(crate) type SpawnMember = MemberKey;
 
 /// begin_running 失败分类（活体门与计数一致性在同一锁内判定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,9 +112,20 @@ struct MemberEntry {
     state: ThreadState,
 }
 
-/// 按 tid 升序表内定位（Ok = 命中，Err = 插入点）。
-fn position(members: &[MemberEntry], tid: Tid) -> Result<usize, usize> {
-    members.binary_search_by(|entry| entry.tid.cmp(&tid))
+struct MemberSlot {
+    generation: u64,
+    retired: bool,
+    entry: Option<MemberEntry>,
+}
+
+impl MemberSlot {
+    fn new(entry: MemberEntry) -> Self {
+        Self {
+            generation: 1,
+            retired: false,
+            entry: Some(entry),
+        }
+    }
 }
 
 /// 一次终止请求在锁内线性化后需要锁外执行的纯量副作用（零分配）：
@@ -156,9 +177,10 @@ pub(crate) struct Lifecycle {
 struct LifecycleInner {
     reason: ProcessExitReason,
     code: i64,
-    /// 线程成员表：按 tid 升序、二分定位；离场即摘除，表空即无线程。
-    /// 插入容量在锁内 try_reserve（原子可失败插入，失败无副作用）。
-    members: Vec<MemberEntry>,
+    /// 固定上界成员槽：离场按 MemberKey O(1) 摘除，空槽可在新 ThreadSpawn
+    /// 复用；generation 耗尽的槽永久退休，不发生 ABA。
+    members: Vec<MemberSlot>,
+    member_count: usize,
     /// 进程内线程号：单调不复用，从 1 起（0 = 非身份值，与 pid/JobId
     /// 哨兵纪律对齐）；首线程 tid 1。
     next_tid: Tid,
@@ -173,6 +195,91 @@ struct LifecycleInner {
     /// Running 期已经 Commit、终止不可撤销的必成内核事务；事务完成方在
     /// 业务资源 Complete 后递减。非零时禁止发布 REAPABLE。
     mandatory_ops: usize,
+}
+
+impl LifecycleInner {
+    fn prepare_member(&mut self) -> Result<(Tid, MemberKey, bool), AttachFault> {
+        if self.member_count >= PROCESS_MAX_THREADS {
+            return Err(AttachFault::Limit);
+        }
+        let tid = self.next_tid;
+        tid.checked_add(1).ok_or(AttachFault::Limit)?;
+        let slot = self
+            .members
+            .iter()
+            .position(|slot| slot.entry.is_none() && !slot.retired)
+            .unwrap_or(self.members.len());
+        let append = slot == self.members.len();
+        if append {
+            self.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
+        }
+        let generation = if append {
+            1
+        } else {
+            self.members[slot].generation
+        };
+        Ok((
+            tid,
+            MemberKey {
+                slot,
+                generation,
+                tid,
+            },
+            append,
+        ))
+    }
+
+    fn consume_tid(&mut self, tid: Tid) {
+        assert_eq!(self.next_tid, tid, "thread identity committed out of order");
+        self.next_tid = tid
+            .checked_add(1)
+            .expect("validated thread identity overflowed");
+    }
+
+    fn install_member(&mut self, key: MemberKey, append: bool, state: ThreadState) {
+        self.consume_tid(key.tid);
+        let entry = MemberEntry {
+            tid: key.tid,
+            state,
+        };
+        if append {
+            debug_assert_eq!(key.slot, self.members.len());
+            self.members.push(MemberSlot::new(entry));
+        } else {
+            let slot = &mut self.members[key.slot];
+            assert_eq!(slot.generation, key.generation);
+            assert!(slot.entry.replace(entry).is_none());
+        }
+        self.member_count += 1;
+    }
+
+    fn member_mut(&mut self, key: MemberKey) -> &mut MemberEntry {
+        let slot = self
+            .members
+            .get_mut(key.slot)
+            .expect("thread member slot escaped its process");
+        assert_eq!(slot.generation, key.generation, "stale thread member key");
+        let entry = slot.entry.as_mut().expect("thread member key was retired");
+        assert_eq!(entry.tid, key.tid, "thread member key changed identity");
+        entry
+    }
+
+    fn remove_member(&mut self, key: MemberKey) -> MemberEntry {
+        let slot = self
+            .members
+            .get_mut(key.slot)
+            .expect("thread member slot escaped its process");
+        assert_eq!(slot.generation, key.generation, "stale thread member key");
+        let entry = slot.entry.take().expect("thread member removed twice");
+        assert_eq!(entry.tid, key.tid, "thread member key changed identity");
+        if slot.generation == u64::MAX {
+            slot.retired = true;
+        } else {
+            slot.generation += 1;
+        }
+        self.member_count -= 1;
+        entry
+    }
 }
 
 fn advance_execution(inner: &mut LifecycleInner) {
@@ -198,6 +305,7 @@ impl Lifecycle {
                     reason: ProcessExitReason::None,
                     code: 0,
                     members: Vec::new(),
+                    member_count: 0,
                     next_tid: 1,
                     active: 0,
                     execution_sequence: 1,
@@ -257,7 +365,7 @@ impl Lifecycle {
             .checked_sub(1)
             .expect("mandatory operation completed without registration");
         self.is_terminating()
-            && inner.members.is_empty()
+            && inner.member_count == 0
             && inner.active == 0
             && inner.building_ops == 0
             && inner.mandatory_ops == 0
@@ -283,7 +391,7 @@ impl Lifecycle {
         let mut inner = self.inner.lock();
         inner.building_ops -= 1;
         self.is_terminating()
-            && inner.members.is_empty()
+            && inner.member_count == 0
             && inner.active == 0
             && inner.building_ops == 0
             && inner.mandatory_ops == 0
@@ -295,23 +403,15 @@ impl Lifecycle {
     /// Closed/Limit/Oom 均无副作用（tid 未消耗）。仅 Building 态接受。
     pub(crate) fn attach_member(
         &self,
-        build: impl FnOnce(Tid) -> Result<Arc<super::Thread>, AttachFault>,
+        build: impl FnOnce(Tid, MemberKey) -> Result<Arc<super::Thread>, AttachFault>,
     ) -> Result<Tid, AttachFault> {
         let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
             return Err(AttachFault::Closed);
         }
-        if inner.members.len() >= PROCESS_MAX_THREADS {
-            return Err(AttachFault::Limit);
-        }
-        let tid = inner.next_tid;
-        let thread = build(tid)?;
-        inner.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
-        inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
-        inner.members.push(MemberEntry {
-            tid,
-            state: ThreadState::Staging { thread },
-        });
+        let (tid, key, append) = inner.prepare_member()?;
+        let thread = build(tid, key)?;
+        inner.install_member(key, append, ThreadState::Staging { thread });
         Ok(tid)
     }
 
@@ -322,26 +422,18 @@ impl Lifecycle {
     /// building_ops 归零，也不可能先于本提交。
     pub(crate) fn attach_registered_member(
         &self,
-        build: impl FnOnce(Tid) -> Result<Arc<super::Thread>, AttachFault>,
+        build: impl FnOnce(Tid, MemberKey) -> Result<Arc<super::Thread>, AttachFault>,
     ) -> Result<(Tid, Option<Arc<super::Thread>>), AttachFault> {
         let mut inner = self.inner.lock();
-        if inner.members.len() >= PROCESS_MAX_THREADS {
-            return Err(AttachFault::Limit);
-        }
-        let tid = inner.next_tid;
-        let thread = build(tid)?;
+        let (tid, key, append) = inner.prepare_member()?;
+        let thread = build(tid, key)?;
         match self.state.load(Ordering::Acquire) {
             state if state == state_index(ProcessState::Building) => {
-                inner.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
-                inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
-                inner.members.push(MemberEntry {
-                    tid,
-                    state: ThreadState::Staging { thread },
-                });
+                inner.install_member(key, append, ThreadState::Staging { thread });
                 Ok((tid, None))
             }
             state if state == state_index(ProcessState::Terminating) => {
-                inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
+                inner.consume_tid(tid);
                 Ok((tid, Some(thread)))
             }
             _ => unreachable!("registered Building attach crossed an impossible lifecycle state"),
@@ -353,36 +445,30 @@ impl Lifecycle {
     /// 阻止 REAPABLE，termination 不会摘取它。
     pub(crate) fn begin_spawn(
         &self,
-        build: impl FnOnce(Tid) -> Result<Arc<super::Thread>, AttachFault>,
+        build: impl FnOnce(Tid, MemberKey) -> Result<Arc<super::Thread>, AttachFault>,
     ) -> Result<(SpawnMember, Arc<super::Thread>), AttachFault> {
         let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running) {
             return Err(AttachFault::Closed);
         }
-        if inner.members.len() >= PROCESS_MAX_THREADS {
-            return Err(AttachFault::Limit);
-        }
-        let tid = inner.next_tid;
-        let thread = build(tid)?;
-        inner.members.try_reserve(1).map_err(|_| AttachFault::Oom)?;
-        inner.next_tid = tid.checked_add(1).expect("thread id space exhausted");
-        inner.members.push(MemberEntry {
-            tid,
-            state: ThreadState::Spawning {
+        let (tid, key, append) = inner.prepare_member()?;
+        let thread = build(tid, key)?;
+        inner.install_member(
+            key,
+            append,
+            ThreadState::Spawning {
                 thread: thread.clone(),
             },
-        });
+        );
         advance_execution(&mut inner);
-        Ok((SpawnMember { tid }, thread))
+        Ok((key, thread))
     }
 
     /// 固定宽输出成功后的不可失败提交：Spawning → Ready，并把成员表强引用
     /// 交给调用方提交到已经预留的调度槽。即使 termination 已冻结也必须完成。
     pub(crate) fn commit_spawn(&self, member: SpawnMember) -> Arc<super::Thread> {
         let mut inner = self.inner.lock();
-        let index = position(&inner.members, member.tid)
-            .expect("spawn member must remain present through commit");
-        let state = core::mem::replace(&mut inner.members[index].state, ThreadState::Ready);
+        let state = core::mem::replace(&mut inner.member_mut(member).state, ThreadState::Ready);
         advance_execution(&mut inner);
         match state {
             ThreadState::Spawning { thread } => thread,
@@ -394,16 +480,14 @@ impl Lifecycle {
     /// 返回的强引用，并在 true 时发布进程 REAPABLE。
     pub(crate) fn rollback_spawn(&self, member: SpawnMember) -> (Arc<super::Thread>, bool) {
         let mut inner = self.inner.lock();
-        let index = position(&inner.members, member.tid)
-            .expect("spawn member must remain present through rollback");
-        let entry = inner.members.remove(index);
+        let entry = inner.remove_member(member);
         advance_execution(&mut inner);
         let thread = match entry.state {
             ThreadState::Spawning { thread } => thread,
             _ => unreachable!("only Spawning member can roll back"),
         };
         let reapable = self.is_terminating()
-            && inner.members.is_empty()
+            && inner.member_count == 0
             && inner.active == 0
             && inner.building_ops == 0
             && inner.mandatory_ops == 0;
@@ -413,7 +497,7 @@ impl Lifecycle {
     /// 成员表当前长度（Start 活体门与入册预留的计数输入；Building 期
     /// 成员全部是 Staging 预育条目）。
     pub(crate) fn member_count(&self) -> usize {
-        self.inner.lock().members.len()
+        self.inner.lock().member_count
     }
 
     /// ProcessStart 线性化（含预育提取）：Building → Running。同一
@@ -432,11 +516,11 @@ impl Lifecycle {
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
             return Err(BeginFault::Closed);
         }
-        if inner.members.is_empty() {
+        if inner.member_count == 0 {
             // 活体门：无线程的进程从未活过，不允许入册。
             return Err(BeginFault::Closed);
         }
-        if inner.members.len() != expected {
+        if inner.member_count != expected {
             return Err(BeginFault::StaleCount);
         }
         if inner.building_ops != 1 {
@@ -444,7 +528,10 @@ impl Lifecycle {
         }
         debug_assert!(inner.building_ops > 0, "start must hold a building op");
         inner.building_ops -= 1;
-        for entry in inner.members.iter_mut() {
+        for slot in inner.members.iter_mut() {
+            let Some(entry) = slot.entry.as_mut() else {
+                continue;
+            };
             let state = core::mem::replace(&mut entry.state, ThreadState::Ready);
             match state {
                 ThreadState::Staging { thread } => out.push(thread),
@@ -463,11 +550,22 @@ impl Lifecycle {
     /// （run_termination_todo 尾部轮询 is_reapable）。
     pub(crate) fn take_first_staging(&self) -> Option<Arc<super::Thread>> {
         let mut inner = self.inner.lock();
-        let index = inner
-            .members
-            .iter()
-            .position(|entry| matches!(entry.state, ThreadState::Staging { .. }))?;
-        let entry = inner.members.remove(index);
+        let index = inner.members.iter().position(|slot| {
+            slot.entry
+                .as_ref()
+                .is_some_and(|entry| matches!(entry.state, ThreadState::Staging { .. }))
+        })?;
+        let generation = inner.members[index].generation;
+        let tid = inner.members[index]
+            .entry
+            .as_ref()
+            .expect("matched staging slot disappeared")
+            .tid;
+        let entry = inner.remove_member(MemberKey {
+            slot: index,
+            generation,
+            tid,
+        });
         match entry.state {
             ThreadState::Staging { thread } => Some(thread),
             _ => unreachable!("position matched a Staging entry"),
@@ -486,7 +584,7 @@ impl Lifecycle {
         &self,
         reason: ProcessExitReason,
         code: i64,
-        exiting: Option<Tid>,
+        exiting: Option<MemberKey>,
     ) -> TerminationTodo {
         let mut todo = TerminationTodo::default();
         let mut inner = self.inner.lock();
@@ -496,22 +594,18 @@ impl Lifecycle {
         inner.reason = reason;
         inner.code = code;
         match exiting {
-            Some(tid) => {
+            Some(member) => {
                 let slot = crate::hart::current().slot();
-                let index =
-                    position(&inner.members, tid).expect("self-exiting thread must be a member");
                 // 自杀线程必在执行点上（Staging 预育线程从未进入容器，
                 // 不可能发起 syscall；覆盖写丢弃的旧值不含强引用）。
-                debug_assert!(matches!(
-                    inner.members[index].state,
-                    ThreadState::Running { .. }
-                ));
-                inner.members[index].state = ThreadState::Exiting;
+                let entry = inner.member_mut(member);
+                debug_assert!(matches!(entry.state, ThreadState::Running { .. }));
+                entry.state = ThreadState::Exiting;
                 todo.ipi_slots = inner.active & !(1u64 << slot);
             }
             None => todo.ipi_slots = inner.active,
         }
-        todo.reapable = inner.members.is_empty()
+        todo.reapable = inner.member_count == 0
             && inner.active == 0
             && inner.building_ops == 0
             && inner.mandatory_ops == 0;
@@ -523,20 +617,24 @@ impl Lifecycle {
 
     /// park 发布线性化：Running → Waiting；已 Terminating 返回 false，
     /// 调用方不得发布等待，改走 Abandoned 取消。
-    pub(crate) fn park_waiting(&self, tid: Tid, context: &alloc::sync::Arc<WaitContext>) -> bool {
+    pub(crate) fn park_waiting(
+        &self,
+        member: MemberKey,
+        context: &alloc::sync::Arc<WaitContext>,
+    ) -> bool {
         let mut inner = self.inner.lock();
         if self.is_terminating() {
             return false;
         }
-        let index = position(&inner.members, tid).expect("parking thread must be a member");
-        if let ThreadState::Running { slot } = inner.members[index].state {
+        let entry = inner.member_mut(member);
+        if let ThreadState::Running { slot } = entry.state {
             // park 发布由调度循环在刚离开执行点的 hart 上完成：记录的
             // slot 必然就是本 hart（单一归属，dispatch 后不迁移）。
             debug_assert_eq!(slot, crate::hart::current().slot());
         } else {
             debug_assert!(false, "parking thread must be Running");
         }
-        inner.members[index].state = ThreadState::Waiting {
+        entry.state = ThreadState::Waiting {
             context: alloc::sync::Arc::downgrade(context),
         };
         true
@@ -546,7 +644,7 @@ impl Lifecycle {
     /// 随后 Running → Ready。false 要求调用者锁外消费 Pending 后重试。
     pub(crate) fn on_requeue_if(
         &self,
-        tid: Tid,
+        member: MemberKey,
         slot: usize,
         synchronized: impl FnOnce() -> bool,
     ) -> bool {
@@ -561,10 +659,9 @@ impl Lifecycle {
         inner.active &= !(1u64 << slot);
         advance_execution(&mut inner);
         if !self.is_terminating() {
-            if let Ok(index) = position(&inner.members, tid) {
-                if matches!(inner.members[index].state, ThreadState::Running { .. }) {
-                    inner.members[index].state = ThreadState::Ready;
-                }
+            let entry = inner.member_mut(member);
+            if matches!(entry.state, ThreadState::Running { .. }) {
+                entry.state = ThreadState::Ready;
             }
         }
         true
@@ -590,7 +687,7 @@ impl Lifecycle {
     /// epoch 变化返回 Retry，Terminating 返回 Closed，只有 Entered 才登记 active。
     pub(crate) fn enter_running_if(
         &self,
-        tid: Tid,
+        member: MemberKey,
         slot: usize,
         synchronized: impl FnOnce() -> bool,
     ) -> EnterRunning {
@@ -601,8 +698,7 @@ impl Lifecycle {
         if !synchronized() {
             return EnterRunning::Retry;
         }
-        let index = position(&inner.members, tid).expect("dispatched thread must be a member");
-        inner.members[index].state = ThreadState::Running { slot };
+        inner.member_mut(member).state = ThreadState::Running { slot };
         assert!(
             inner.active & (1u64 << slot) == 0,
             "hart cannot enter one process twice"
@@ -616,16 +712,15 @@ impl Lifecycle {
     /// 正常末线程在此冻结进程 Exited 终态；已有进程级终止则保持首达终因。
     pub(crate) fn thread_departed(
         &self,
-        tid: Tid,
+        member: MemberKey,
         normal_code: Option<i64>,
     ) -> (Option<TerminationTodo>, bool) {
         let mut todo = TerminationTodo::default();
         let mut inner = self.inner.lock();
-        let index = position(&inner.members, tid).expect("departing thread must be a member");
-        inner.members.remove(index);
+        inner.remove_member(member);
         let started_termination = self.state.load(Ordering::Acquire)
             == state_index(ProcessState::Running)
-            && inner.members.is_empty();
+            && inner.member_count == 0;
         if started_termination {
             inner.reason = ProcessExitReason::Exited;
             inner.code = normal_code.expect("last Running thread must exit normally");
@@ -635,7 +730,7 @@ impl Lifecycle {
                 .store(state_index(ProcessState::Terminating), Ordering::Release);
         }
         let reapable = self.is_terminating()
-            && inner.members.is_empty()
+            && inner.member_count == 0
             && inner.active == 0
             && inner.building_ops == 0
             && inner.mandatory_ops == 0;
@@ -650,11 +745,12 @@ impl Lifecycle {
     /// 游标必然收敛。
     pub(crate) fn take_first_waiting(&self) -> Option<Weak<WaitContext>> {
         let mut inner = self.inner.lock();
-        let index = inner
+        let entry = inner
             .members
-            .iter()
-            .position(|entry| matches!(entry.state, ThreadState::Waiting { .. }))?;
-        match core::mem::replace(&mut inner.members[index].state, ThreadState::Exiting) {
+            .iter_mut()
+            .filter_map(|slot| slot.entry.as_mut())
+            .find(|entry| matches!(entry.state, ThreadState::Waiting { .. }))?;
+        match core::mem::replace(&mut entry.state, ThreadState::Exiting) {
             ThreadState::Waiting { context } => Some(context),
             _ => unreachable!("position matched a Waiting entry"),
         }
@@ -666,7 +762,7 @@ impl Lifecycle {
     pub(crate) fn is_reapable(&self) -> bool {
         let inner = self.inner.lock();
         self.is_terminating()
-            && inner.members.is_empty()
+            && inner.member_count == 0
             && inner.active == 0
             && inner.building_ops == 0
             && inner.mandatory_ops == 0
@@ -689,7 +785,7 @@ impl Lifecycle {
     pub(crate) fn mark_dead(&self) -> (ProcessExitReason, i64) {
         let inner = self.inner.lock();
         assert!(
-            inner.members.is_empty()
+            inner.member_count == 0
                 && inner.active == 0
                 && inner.building_ops == 0
                 && inner.mandatory_ops == 0,

@@ -445,8 +445,8 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
         "wait context received thread ownership twice"
     );
     {
-        let (process, tid) = context_thread_identity(&context);
-        if !process.lifecycle.park_waiting(tid, &context) {
+        let (process, member) = context_thread_identity(&context);
+        if !process.lifecycle.park_waiting(member, &context) {
             // 终止取得 park 线性化点后，业务 completion 即使已经到达也只
             // 能代表事务完成，不能恢复已经放弃回复权的线程。安装者统一取得
             // Installing 完成权并以 Abandoned 执行 departure confirmation。
@@ -521,11 +521,11 @@ fn context_thread_identity(
     context: &Arc<WaitContext>,
 ) -> (
     alloc::sync::Arc<super::proc::Process>,
-    erhino_shared::proc::Tid,
+    super::lifecycle::MemberKey,
 ) {
     let guard = context.thread.lock();
     let thread = guard.as_ref().expect("installing context holds its thread");
-    (thread.process.clone(), thread.tid)
+    (thread.process.clone(), thread.member())
 }
 
 /// 将 WaitResult 写回用户现场并推进 sepc；写回失败则携带错误返回。

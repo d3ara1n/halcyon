@@ -62,7 +62,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             let todo = thread.process.lifecycle.request_termination(
                 erhino_shared::proc::ProcessExitReason::Exited,
                 a0 as i64,
-                Some(thread.tid),
+                Some(thread.member()),
             );
             task::process::run_termination_todo(&process, todo);
             Outcome::Killed

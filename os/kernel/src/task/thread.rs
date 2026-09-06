@@ -75,7 +75,7 @@ struct DepartureState {
 /// 执行 Thread 强引用消散后仍可由 committed Map 结果义务持有的离场状态。
 pub(crate) struct ThreadDeparture {
     process: Weak<Process>,
-    tid: erhino_shared::proc::Tid,
+    member: super::lifecycle::MemberKey,
     control: Option<Weak<ThreadControl>>,
     state: crate::sync::Spinlock<DepartureState>,
 }
@@ -83,12 +83,12 @@ pub(crate) struct ThreadDeparture {
 impl ThreadDeparture {
     pub(crate) fn new(
         process: &Arc<Process>,
-        tid: erhino_shared::proc::Tid,
+        member: super::lifecycle::MemberKey,
         control: Option<&Arc<ThreadControl>>,
     ) -> Result<Arc<Self>, ()> {
         Arc::try_new(Self {
             process: Arc::downgrade(process),
-            tid,
+            member,
             control: control.map(Arc::downgrade),
             state: crate::sync::Spinlock::new(
                 crate::sync::ranks::LEAF,
@@ -168,7 +168,7 @@ impl ThreadDeparture {
             DepartureKind::Normal(code) => Some(code),
             DepartureKind::Terminated => None,
         };
-        super::process::confirm_departure(&process, self.tid, normal_code);
+        super::process::confirm_departure(&process, self.member, normal_code);
         if let Some(control) = self.control.as_ref().and_then(Weak::upgrade) {
             control.publish_done();
         }
@@ -319,10 +319,15 @@ pub(crate) fn spawn(
         return Err(map_context_fault(error));
     }
 
-    let (member, thread) = match caller.process.lifecycle.begin_spawn(|tid| {
-        let thread =
-            super::Thread::new_thread_with_control(tid, &caller.process, context, Some(&control))
-                .map_err(|_| super::lifecycle::AttachFault::Oom)?;
+    let (member, thread) = match caller.process.lifecycle.begin_spawn(|tid, member| {
+        let thread = super::Thread::new_thread_with_control(
+            tid,
+            member,
+            &caller.process,
+            context,
+            Some(&control),
+        )
+        .map_err(|_| super::lifecycle::AttachFault::Oom)?;
         Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
     }) {
         Ok(staged) => staged,
@@ -353,7 +358,7 @@ pub(crate) fn spawn(
         let todo = caller.process.lifecycle.request_termination(
             ProcessExitReason::Fault,
             ProcessFaultCode::StoreAccess as i64,
-            Some(caller.tid),
+            Some(caller.member()),
         );
         super::process::run_termination_todo(&caller.process, todo);
         return Err(error.into());
