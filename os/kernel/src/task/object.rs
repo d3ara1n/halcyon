@@ -185,6 +185,9 @@ impl ObjectWaitState {
         self.signals |= set;
         let mut activated = self.signals & !previous;
         if activated == ObjectSignals::NONE {
+            if self.scheduled && self.signals != previous {
+                self.dirty = true;
+            }
             return self.signals;
         }
         let Some(serial) = self.serial.checked_add(1) else {
@@ -258,6 +261,9 @@ impl ObjectWaitState {
             seen: core::array::from_fn(|index| self.epochs[index].generation),
         });
         self.active_waiters += 1;
+        if self.scheduled {
+            self.dirty = true;
+        }
         SubscribeResult::Registered(id)
     }
 
