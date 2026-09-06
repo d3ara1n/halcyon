@@ -2882,6 +2882,30 @@ impl BoundAddressSpace {
             result.commit_cookie();
         }
         let committed = self.ledger().commit(change);
+        let mut retiring_views = retiring_views;
+        for fragment in committed.retiring_fragments() {
+            let RegionKindView::Mapping {
+                backing: BackingView::Object { object, .. },
+                ..
+            } = fragment.kind
+            else {
+                continue;
+            };
+            if retiring_views
+                .iter()
+                .any(|view| view.core.identity() == object)
+            {
+                continue;
+            }
+            let index = self
+                .views
+                .binary_search_by_key(&object, |view| view.object)
+                .expect("committed retiring fragment lost its view source");
+            retiring_views.push(RetiringObjectView {
+                core: Arc::clone(&self.views[index].core),
+                _owner: None,
+            });
+        }
         let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
         let published = self.ledger().publish(committed);
         if let Some(backing) = backing {
@@ -3085,34 +3109,9 @@ impl BoundAddressSpace {
             ledger,
             tables,
             backing_permits,
-            mut retiring_views,
+            retiring_views,
         } = published;
         let synchronized = self.ledger().synchronize(ledger);
-        // 来源 core 在 begin_retire 移走片段/permit 前一次性冻结。之后只按这张
-        // 批次表归还，禁止跨批次重新查询 live view。
-        for fragment in synchronized.retiring_fragments() {
-            let RegionKindView::Mapping {
-                backing: BackingView::Object { object, .. },
-                ..
-            } = fragment.kind
-            else {
-                continue;
-            };
-            if retiring_views
-                .iter()
-                .any(|view| view.core.identity() == object)
-            {
-                continue;
-            }
-            let index = self
-                .views
-                .binary_search_by_key(&object, |view| view.object)
-                .expect("retiring fragment lost its view source");
-            retiring_views.push(RetiringObjectView {
-                core: Arc::clone(&self.views[index].core),
-                _owner: None,
-            });
-        }
         let (retiring, batch) = self.ledger().begin_retire(synchronized);
         RetiringSpaceChange {
             ledger: Some(retiring),
