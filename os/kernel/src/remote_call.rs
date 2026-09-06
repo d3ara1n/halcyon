@@ -19,7 +19,10 @@ const MAX_DRAIN_PER_SAFE_POINT: usize = SLOTS_PER_HART;
 
 type Table = remote_call::RemoteCalls<Call, HARTS, SLOTS_PER_HART>;
 
-static CALLS: Spinlock<Table> = Spinlock::new(crate::sync::ranks::REMOTE_CALL, Table::new());
+static CALLS: Spinlock<Table> = Spinlock::new(
+    crate::sync::ranks::REMOTE_CALL,
+    Table::new_with_id(remote_call::TableId::new(1)),
+);
 
 struct LocalEpoch {
     identity: AtomicUsize,
