@@ -13,9 +13,8 @@ use memory_space::{
     AddressRange, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError, LeaseKey,
     Limits, MapBacking, MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
     PageRange as LedgerPageRange, PermitRequirement, PreparedChange, ProtectRequest, Protection,
-    PublishedChange,
-    RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiringChange, RetiringFragment,
-    TranslationIntent, UnmapRequest, WritePermit,
+    PublishedChange, RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiringChange,
+    RetiringFragment, TranslationIntent, UnmapRequest, WritePermit,
 };
 use page_table::{
     DrainCursor as TableDrainCursor, DrainStep as TableDrainStep, FrameNumber, MapError, Ppn,
@@ -498,7 +497,6 @@ impl ReclaimedTableFrames {
     pub(crate) fn take_permits(&mut self) -> Vec<WritePermit> {
         core::mem::take(&mut self.permits)
     }
-
 }
 
 /// 一个已发布 object view 在本地址空间的位置与身份。
@@ -1981,14 +1979,9 @@ pub(crate) fn memory_map(
     };
     match intent.source() {
         MapSource::Anonymous => map_anonymous_source(thread, process, intent, &pool, &sponsor),
-        MapSource::Object { handle, offset } => super::memory_object::map_view(
-            thread,
-            process,
-            intent,
-            handle,
-            offset,
-            &sponsor,
-        ),
+        MapSource::Object { handle, offset } => {
+            super::memory_object::map_view(thread, process, intent, handle, offset, &sponsor)
+        }
     }
 }
 
@@ -2141,7 +2134,13 @@ fn start_existing_change(
     plan.backing_permits = backing_permits;
     let prepared = fund_and_complete_running(&process, plan)?;
     let _ = thread;
-    start_running_memory_change(process, Some(prepared), range, instruction, ChangeOutput::None)
+    start_running_memory_change(
+        process,
+        Some(prepared),
+        range,
+        instruction,
+        ChangeOutput::None,
+    )
 }
 
 /// 按 Validate 报告的多重集向每个来源对象取得 WritePermit。任何一项失败时，已取得
@@ -2163,7 +2162,9 @@ fn acquire_view_permits(
     }
     let total = requirements
         .iter()
-        .try_fold(0usize, |sum, requirement| sum.checked_add(requirement.count))
+        .try_fold(0usize, |sum, requirement| {
+            sum.checked_add(requirement.count)
+        })
         .ok_or(SystemCallError::InternalError)?;
     permits
         .try_reserve_exact(total)
@@ -2217,7 +2218,6 @@ fn release_reclaimed_permits(process: &Arc<Process>, reclaimed: &mut ReclaimedTa
         core.cancel_write(permit);
     }
 }
-
 
 /// 锁外取得表页后重入 AddressSpace 完成 reservation。三个公开入口共用同一段：
 /// 表页供给与完成失败都在 Commit 前，因而只需锁外析构摘出的 owner。
@@ -2419,11 +2419,7 @@ impl BoundAddressSpace {
     /// 建立与 `intent` 一致的 ledger 请求。Validate 预检与 Reserve 复检共用它，
     /// 因此两次道口不会因各自组装而失步。`backing` 由来源侧提供：匿名给出待铸造的
     /// 身份，对象给出经状态机认证的 view 授权。
-    fn map_request(
-        intent: &MapIntent,
-        owner: RegionOwner,
-        backing: MapBacking,
-    ) -> MapRequest {
+    fn map_request(intent: &MapIntent, owner: RegionOwner, backing: MapBacking) -> MapRequest {
         MapRequest {
             bytes: intent.bytes,
             guard_before: intent.guard_before,
@@ -2921,10 +2917,7 @@ impl BoundAddressSpace {
 
     /// 不发布新 view 的事务（匿名 Map/Unmap/Protect、object view 撤销）在此收敛：
     /// 断言事务确实没有待安装的 view 身份，避免调用点各自忽略输出。
-    pub(crate) fn commit_change(
-        &mut self,
-        prepared: PreparedMemoryChange,
-    ) -> PublishedSpaceChange {
+    pub(crate) fn commit_change(&mut self, prepared: PreparedMemoryChange) -> PublishedSpaceChange {
         let (published, view) = self.commit_inner(prepared);
         assert!(
             view.is_none(),
@@ -3257,7 +3250,8 @@ impl BoundAddressSpace {
             Some(bytes) if bytes != 0 => bytes,
             _ => fail!(SpaceError::BadSegment, permits),
         };
-        if bytes != intent.bytes.next_multiple_of(PAGE_SIZE) || !object_offset.is_multiple_of(PAGE_SIZE)
+        if bytes != intent.bytes.next_multiple_of(PAGE_SIZE)
+            || !object_offset.is_multiple_of(PAGE_SIZE)
         {
             fail!(SpaceError::BadSegment, permits);
         }
@@ -3840,8 +3834,7 @@ impl BoundAddressSpace {
                         } = fragment.kind
                         {
                             let core = self.release_view_region(object).core;
-                            self.pending_free =
-                                Some(RetiredSpaceResource::View { core, permit });
+                            self.pending_free = Some(RetiredSpaceResource::View { core, permit });
                             let (used, done) = self.step_pending(budget - work);
                             work += used;
                             if !done {
@@ -3953,9 +3946,16 @@ impl BoundAddressSpace {
 
 /// 由 drain_gate 串行的 HandleTable 收束状态。pending entry 已推进表
 /// 游标、尚待锁外 close；下一批必须优先消费它。
+enum DrainFinalization {
+    PublishDead,
+    PropagateJob(super::job::CompletionCursor),
+    Done,
+}
+
 struct DrainState {
     cursor: usize,
     pending_close: Option<super::handle::ProcessHandleEntry>,
+    finalization: Option<DrainFinalization>,
 }
 
 /// 进程资源容器：地址空间、父子身份与进程本地 HandleTable。
@@ -4030,6 +4030,7 @@ impl Process {
                 DrainState {
                     cursor: 1,
                     pending_close: None,
+                    finalization: None,
                 },
             ),
             execution: AtomicUsize::new(0),
@@ -4176,10 +4177,9 @@ impl Process {
     }
 
     /// 有界收束一批（drain_gate 持有下调用）：先 HandleTable（对象 close
-    /// 回调锁外执行，仍可用地址空间解除外部映射），后 AddressSpace。
-    /// work unit 诚实计费：Handle 表每个扫描槽位（含空槽，take_next_bounded
-    /// 硬性限制本次扫描量）与每次 close 各 1；地址空间部分见
-    /// [`AddressSpaceState::drain`]。返回 (work_done, complete)。
+    /// 回调锁外执行，仍可用地址空间解除外部映射），后 AddressSpace，再推进
+    /// 持久化终段。终段把 `publish_dead`、Job 成员摘除和祖先 CLOSED 传播
+    /// 纳入同一预算；返回 Complete 前这些责任必须全部交付。
     pub(crate) fn drain_batch(&self, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
         let mut work = 0;
@@ -4200,6 +4200,40 @@ impl Process {
         }
 
         while work < budget {
+            let finalization = self.drain_state.lock().finalization.take();
+            if let Some(finalization) = finalization {
+                match finalization {
+                    DrainFinalization::PublishDead => {
+                        let control = self
+                            .control()
+                            .expect("reapable process must retain a control shell");
+                        let (_state, reason, code) = self.lifecycle.snapshot();
+                        control.publish_dead(self.pid, self.parent, reason, code);
+                        self.lifecycle.mark_dead();
+                        let next = self
+                            .job()
+                            .remove_member(self.pid)
+                            .map(DrainFinalization::PropagateJob)
+                            .unwrap_or(DrainFinalization::Done);
+                        self.drain_state.lock().finalization = Some(next);
+                    }
+                    DrainFinalization::PropagateJob(mut cursor) => {
+                        if !cursor.advance() {
+                            self.drain_state.lock().finalization =
+                                Some(DrainFinalization::PropagateJob(cursor));
+                        } else {
+                            self.drain_state.lock().finalization = Some(DrainFinalization::Done);
+                        }
+                    }
+                    DrainFinalization::Done => {
+                        self.drain_state.lock().finalization = Some(DrainFinalization::Done);
+                        return (work, true);
+                    }
+                }
+                work += 1;
+                continue;
+            }
+
             // 本次扫描可用全部剩余预算；若恰好摘到 entry 而已无 close
             // 预算，就把它持久化为 pending。游标已经推进，下一批必先 close。
             let (outcome, scanned) = {
@@ -4234,11 +4268,17 @@ impl Process {
                         let retired = space.take_retired();
                         (result, retired)
                     };
-                    // MemoryPool rank precedes AddressSpace；funded owner 必须在锁外退款。
                     if let Some(retired) = retired {
                         retired.release();
                     }
-                    return (work + space_work, complete);
+                    if complete {
+                        self.drain_state.lock().finalization = Some(DrainFinalization::PublishDead);
+                    }
+                    work += space_work;
+                    if work == budget {
+                        return (work, false);
+                    }
+                    continue;
                 }
             }
         }
@@ -4706,7 +4746,11 @@ pub fn launch_bootstrap(
     let mut ready_batch = match domain.reserve_ready(1) {
         Ok(batch) => batch,
         Err(()) => {
-            process.handles.lock().rollback(reservation).expect("launch reservation must remain owned");
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
             for handle in handles {
                 super::handle::close_entry_infallible(handle, &process, true);
             }
@@ -4733,33 +4777,63 @@ pub fn launch_bootstrap(
     }) {
         Ok(_) => {}
         Err(ThreadAttachError::Context(error)) => {
-            process.handles.lock().rollback(reservation).expect("launch reservation must remain owned");
-            for handle in handles { super::handle::close_entry_infallible(handle, &process, true); }
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry_infallible(handle, &process, true);
+            }
             return Err(error);
         }
         Err(ThreadAttachError::Oom) => {
-            process.handles.lock().rollback(reservation).expect("launch reservation must remain owned");
-            for handle in handles { super::handle::close_entry_infallible(handle, &process, true); }
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry_infallible(handle, &process, true);
+            }
             return Err(SpaceError::NoFrame);
         }
-        Err(ThreadAttachError::Closed | ThreadAttachError::Limit) => unreachable!("bootstrap attach must target an empty Building process"),
+        Err(ThreadAttachError::Closed | ThreadAttachError::Limit) => {
+            unreachable!("bootstrap attach must target an empty Building process")
+        }
     }
     let job = process.job();
     let member = match job.reserve_member(process.pid) {
         Ok(member) => member,
         Err(_) => {
-            process.handles.lock().rollback(reservation).expect("launch reservation must remain owned");
-            for handle in handles { super::handle::close_entry_infallible(handle, &process, true); }
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry_infallible(handle, &process, true);
+            }
             return Err(SpaceError::NoFrame);
         }
     };
-    assert!(process.lifecycle.enter_building_op(), "bootstrap process cannot be terminating");
+    assert!(
+        process.lifecycle.enter_building_op(),
+        "bootstrap process cannot be terminating"
+    );
 
     // 唯一不可逆提交段：Handle、Job member、Building→Running 和 execution
     // binding 均在此后只调用无失败尾段。
-    process.handles.lock().commit(reservation, handles).expect("launch reservation count matches entries");
+    process
+        .handles
+        .lock()
+        .commit(reservation, handles)
+        .expect("launch reservation count matches entries");
     job.commit_member(member, process.clone());
-    process.lifecycle.begin_running(1, &mut staged).expect("bootstrap process cannot be terminating");
+    process
+        .lifecycle
+        .begin_running(1, &mut staged)
+        .expect("bootstrap process cannot be terminating");
     process.bind_execution(requirement, domain);
     let thread = staged.pop().expect("bootstrap staging thread missing");
     drop(unpublished.publish());

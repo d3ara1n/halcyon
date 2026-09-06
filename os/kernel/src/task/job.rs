@@ -95,6 +95,57 @@ impl JobInner {
     }
 }
 
+/// Job 完成传播的持久游标。
+///
+/// 一个游标只保留当前待发布/待摘除的 Job 强引用；每次 `advance` 最多
+/// 完成一次发布或一次父成员摘除，ProcessDrain 可在预算边界安全暂停。
+pub(crate) struct CompletionCursor {
+    child: Arc<Job>,
+    published: bool,
+}
+
+impl CompletionCursor {
+    fn new(child: Arc<Job>) -> Self {
+        Self {
+            child,
+            published: false,
+        }
+    }
+
+    /// 推进一步，返回本条祖先链是否已完全收束。
+    pub(crate) fn advance(&mut self) -> bool {
+        if !self.published {
+            self.child.publish_closed();
+            self.published = true;
+            return false;
+        }
+
+        let Some(parent) = self
+            .child
+            .parent
+            .as_ref()
+            .map(|weak| weak.upgrade().expect("ancestor jobs outlive their members"))
+        else {
+            return true;
+        };
+        let parent_completed = {
+            let mut state = parent.state.lock();
+            if let Some(index) = state.children.iter().position(
+                |(jid, entry)| matches!(entry, ChildEntry::Job(_) if *jid == self.child.jid),
+            ) {
+                state.children.remove(index);
+            }
+            state.complete_if_ready()
+        };
+        if !parent_completed {
+            return true;
+        }
+        self.child = parent;
+        self.published = false;
+        false
+    }
+}
+
 pub struct Job {
     header: ObjectHeader,
     /// 全局单调不复用；root 是首个分配者，恒为 1。
@@ -395,7 +446,7 @@ impl Job {
         state.children.remove(index);
     }
 
-    /// JobSeal：O(1) 置位（幂等，不扫表）；已空则完成并在锁外收尾。
+    /// JobSeal：O(1) 置位（幂等，不扫表）；已空则完成并返回传播游标。
     /// 已 Dead 的 Job 上是幂等无操作。
     fn seal(self: &Arc<Self>) {
         let completed = {
@@ -411,9 +462,10 @@ impl Job {
         }
     }
 
-    /// 摘除成员（Dead 发布点调用）；Job 因此完成（sealed && 空）时在
-    /// 锁外发布 CLOSED 并沿父链传播。
-    pub(crate) fn remove_member(self: &Arc<Self>, pid: Pid) {
+    /// 摘除成员（Dead 发布点调用）。完成判定与 JobInner 锁内线性化；若
+    /// Job 因此满足 sealed && 空，返回持有祖先传播责任的游标，交由
+    /// ProcessDrain 按统一预算推进。
+    pub(crate) fn remove_member(self: &Arc<Self>, pid: Pid) -> Option<CompletionCursor> {
         let completed = {
             let mut state = self.state.lock();
             if let Some(index) = state
@@ -425,9 +477,7 @@ impl Job {
             }
             state.complete_if_ready()
         };
-        if completed {
-            self.finish_completion();
-        }
+        completed.then(|| CompletionCursor::new(self.clone()))
     }
 
     /// 按 Pid 查直接成员（仅可见 Process 条目；占位对派生不可见）。
@@ -520,28 +570,8 @@ impl Job {
     /// 父必先于子存活（子在其 children 表内直到本调用移除），升级失败
     /// 即所有权图违约。
     fn finish_completion(self: &Arc<Self>) {
-        self.publish_closed();
-        let mut child = self.clone();
-        while let Some(parent) = child
-            .parent
-            .as_ref()
-            .map(|weak| weak.upgrade().expect("ancestor jobs outlive their members"))
-        {
-            let parent_completed = {
-                let mut state = parent.state.lock();
-                if let Some(index) = state.children.iter().position(
-                    |(jid, entry)| matches!(entry, ChildEntry::Job(_) if *jid == child.jid),
-                ) {
-                    state.children.remove(index);
-                }
-                state.complete_if_ready()
-            };
-            if !parent_completed {
-                break;
-            }
-            parent.publish_closed();
-            child = parent;
-        }
+        let mut cursor = CompletionCursor::new(self.clone());
+        while !cursor.advance() {}
     }
 
     /// ProcessStart 提交闸门：链锁内上行检查祖先未 sealed，并在同一

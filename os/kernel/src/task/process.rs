@@ -1047,15 +1047,8 @@ pub fn drain(
     let budget = (max_work as usize).min(PROCESS_DRAIN_MAX as usize);
     let (work, complete) = process.drain_batch(budget);
     debug_assert!(work <= budget, "drain over budget: {} > {}", work, budget);
-    if complete {
-        // 发布序（外部真值先行）：shell 先冻结终态快照并置 CLOSED
-        // （原子清 REAPABLE，外部观察不到 Dead+REAPABLE 混合）；随后
-        // core 内部置 Dead；最后从 Job 成员表摘除（此后 core 仅剩空壳）。
-        let (_state, reason, code) = process.lifecycle.snapshot();
-        control.publish_dead(process.pid, process.parent, reason, code);
-        process.lifecycle.mark_dead();
-        process.job().remove_member(process.pid);
-    }
+    // drain_batch 持有终段游标；只有 publish_dead、Job 摘除与祖先传播
+    // 全部完成后才返回 Complete。
     // drain_gate 必须先于 process 强引用释放：complete 分支后 core 可能
     // 只剩本局部强引用，Process::Drop 的 close 回调链不得发生在 gate
     // 持有之下（显式 drop，不依赖声明顺序的逆序巧合）。
