@@ -187,8 +187,11 @@ impl Drop for ThreadResultObligation {
 }
 
 impl KernelObject for ThreadControl {
-    fn complete_waiter_drain(&self) {
-        self.wait.lock().complete_notification();
+    fn complete_waiter_drain(
+        &self,
+        reservation: super::notify_work::Reservation,
+    ) -> super::notify_work::Completion {
+        self.wait.lock().complete_notification(reservation)
     }
 
     fn drain_waiters(&self, budget: usize) -> (usize, bool) {

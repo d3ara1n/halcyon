@@ -234,6 +234,23 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         true
     }
 
+    /// Taken 债务完成一次交付后继续保留同一容量 owner，重新回到 Reserved。
+    /// token 与 reservation 均为 affine，代次无需变化：该槽从未释放给其它准入者。
+    pub fn rearm(&mut self, token: FinishToken) -> Result<Reservation, FinishToken> {
+        let Some(entry) = self.entry_mut(token.slot, token.generation) else {
+            return Err(token);
+        };
+        if entry.phase != Phase::Taken || entry.owner != token.owner {
+            return Err(token);
+        }
+        assert!(entry.value.is_none(), "taken slot retained work at Rearm");
+        entry.phase = Phase::Reserved;
+        Ok(Reservation {
+            slot: token.slot,
+            generation: token.generation,
+        })
+    }
+
     pub fn has_pending(&self, owner: usize) -> bool {
         self.heads.get(owner).is_some_and(Option::is_some)
     }

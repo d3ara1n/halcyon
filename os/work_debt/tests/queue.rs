@@ -78,6 +78,25 @@ fn pending_level_survives_missing_and_duplicate_doorbells() {
 }
 
 #[test]
+fn rearm_preserves_the_affine_capacity_owner() {
+    let mut debts = Debts::new();
+    let reservation = debts.reserve().unwrap();
+    let generation = reservation.generation();
+    debts.publish(reservation, 0, 1).unwrap();
+    let (token, value) = debts.take(0).unwrap().into_parts();
+    assert_eq!(value, 1);
+
+    let reservation = debts.rearm(token).unwrap();
+    assert_eq!(reservation.generation(), generation);
+    assert_eq!(debts.available(), 3);
+    debts.publish(reservation, 1, 2).unwrap();
+    let (token, value) = debts.take(1).unwrap().into_parts();
+    assert_eq!(value, 2);
+    assert!(debts.finish(token));
+    assert_eq!(debts.available(), 4);
+}
+
+#[test]
 fn generation_advances_before_slot_reuse() {
     let mut debts = Debts::new();
     let reservation = debts.reserve().unwrap();

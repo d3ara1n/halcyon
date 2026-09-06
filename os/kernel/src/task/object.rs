@@ -97,24 +97,59 @@ impl ObjectHeader {
     }
 }
 
+const SIGNAL_BITS: [ObjectSignals; 8] = [
+    ObjectSignals::READABLE,
+    ObjectSignals::WRITABLE,
+    ObjectSignals::DATA,
+    ObjectSignals::REAPABLE,
+    ObjectSignals::DONE,
+    ObjectSignals::EXECUTABLE,
+    ObjectSignals::PEER_CLOSED,
+    ObjectSignals::CLOSED,
+];
+
+#[derive(Clone, Copy)]
+struct SignalEpoch {
+    generation: u64,
+    serial: u64,
+    snapshot: ObjectSignals,
+}
+
+impl SignalEpoch {
+    const EMPTY: Self = Self {
+        generation: 0,
+        serial: 0,
+        snapshot: ObjectSignals::NONE,
+    };
+}
+
 struct RegisteredSubscription {
     id: u64,
     subscription: Subscription,
-    /// 发布者在同一对象锁内冻结的命中结果；后续清位不得抹掉已登记候选。
-    pending: Option<WaitOutcome>,
-    /// 该订阅未来一次命中的 work-debt 槽；发布时移交给对象 owner。
-    notification: Option<notify_work::Reservation>,
+    seen: [u64; SIGNAL_BITS.len()],
 }
 
-/// 嵌入具体对象状态锁中的电平与订阅队列。所有方法都由对象锁保护。
+pub(crate) enum WaitAdvance {
+    Progress,
+    Complete(Arc<WaitContext>),
+    Done,
+}
+
+/// 嵌入具体对象状态锁中的电平、发布代次与订阅槽。发布者只更新固定八个
+/// signal epoch；逐订阅匹配、offer 与注销由通知债务按游标推进。
 pub struct ObjectWaitState {
     signals: ObjectSignals,
     next_id: u64,
-    /// 游标只用于从上次 Deferred 候选继续；插入顺序仍是 item_index 的稳定次序。
-    notify_cursor: usize,
-    /// 已有一个 work-debt 任务在途；防止同一对象重复发布多个排水任务。
+    serial: u64,
+    epochs: [SignalEpoch; SIGNAL_BITS.len()],
+    waiters: alloc::vec::Vec<Option<RegisteredSubscription>>,
+    active_waiters: usize,
+    scan_cursor: usize,
+    scan_remaining: usize,
+    scan_serial: u64,
+    dirty: bool,
     scheduled: bool,
-    waiters: alloc::vec::Vec<RegisteredSubscription>,
+    notification: Option<notify_work::Reservation>,
 }
 
 impl ObjectWaitState {
@@ -122,9 +157,16 @@ impl ObjectWaitState {
         Self {
             signals: initial,
             next_id: 1,
-            notify_cursor: 0,
-            scheduled: false,
+            serial: 0,
+            epochs: [SignalEpoch::EMPTY; SIGNAL_BITS.len()],
             waiters: alloc::vec::Vec::new(),
+            active_waiters: 0,
+            scan_cursor: 0,
+            scan_remaining: 0,
+            scan_serial: 0,
+            dirty: false,
+            scheduled: false,
+            notification: None,
         }
     }
 
@@ -132,165 +174,219 @@ impl ObjectWaitState {
         self.signals
     }
 
-    /// 电平更新。终态冻结：CLOSED 置位后任何更新不再生效——
-    /// 「单向迁移、终态不可复活」由所有对象共用的这一结构保证，
-    /// 跨关闭窗口的事务收尾无需逐点防御。
+    /// 电平更新。终态冻结；普通发布成本恒为已知 signal 位数，不随 waiter
+    /// 数增长。inactive→active 的完整快照保存在对应 epoch，后续清位不修改它。
     pub fn update(&mut self, clear: ObjectSignals, set: ObjectSignals) -> ObjectSignals {
         if self.signals.contains(ObjectSignals::CLOSED) {
             return self.signals;
         }
+        let previous = self.signals;
         self.signals &= !clear;
         self.signals |= set;
-        let current = self.signals;
-        // 命中候选与电平更新在同一对象锁内冻结。publish 后即使消费者
-        // 清除 DATA/READABLE，候选仍由 pending 持有，不会被下一次重读抹掉。
-        for waiter in &mut self.waiters {
-            if waiter.pending.is_none() && Self::matches(current, waiter.subscription.interest) {
-                waiter.pending = Some(waiter.subscription.outcome(current));
-            }
+        let mut activated = self.signals & !previous;
+        if activated == ObjectSignals::NONE {
+            return self.signals;
         }
-        current
+        let Some(serial) = self.serial.checked_add(1) else {
+            // 内部发布代次耗尽时永久关闭对象，不回绕解释旧订阅。
+            self.signals = ObjectSignals::CLOSED;
+            activated = ObjectSignals::CLOSED;
+            self.serial = u64::MAX;
+            self.record_activated(activated, u64::MAX);
+            self.dirty = true;
+            return self.signals;
+        };
+        self.serial = serial;
+        self.record_activated(activated, serial);
+        self.dirty = true;
+        self.signals
+    }
+
+    fn record_activated(&mut self, activated: ObjectSignals, serial: u64) {
+        for (index, bit) in SIGNAL_BITS.iter().copied().enumerate() {
+            if !activated.intersects(bit) {
+                continue;
+            }
+            let epoch = &mut self.epochs[index];
+            let Some(generation) = epoch.generation.checked_add(1) else {
+                self.signals = ObjectSignals::CLOSED;
+                let closed = SIGNAL_BITS.len() - 1;
+                self.epochs[closed].generation = self.epochs[closed].generation.saturating_add(1);
+                self.epochs[closed].serial = serial;
+                self.epochs[closed].snapshot = ObjectSignals::CLOSED;
+                return;
+            };
+            *epoch = SignalEpoch {
+                generation,
+                serial,
+                snapshot: self.signals,
+            };
+        }
     }
 
     pub fn subscribe(&mut self, subscription: Subscription) -> SubscribeResult {
-        if Self::matches(self.signals, subscription.interest) {
-            return SubscribeResult::Ready(subscription.outcome(self.signals));
+        if let Some(outcome) = subscription.outcome(self.signals) {
+            return SubscribeResult::Ready(outcome);
         }
-        if self.waiters.len() >= OBJECT_WAIT_LIMIT || self.next_id == 0 {
+        if self.active_waiters >= OBJECT_WAIT_LIMIT || self.next_id == 0 {
             return SubscribeResult::ReachLimit;
         }
-        if self.waiters.try_reserve(1).is_err() {
-            return SubscribeResult::OutOfMemory;
+        if self.active_waiters == 0 && !self.scheduled && self.notification.is_none() {
+            self.notification = match notify_work::reserve() {
+                Ok(reservation) => Some(reservation),
+                Err(()) => return SubscribeResult::OutOfMemory,
+            };
         }
-        let notification = match notify_work::reserve() {
-            Ok(reservation) => reservation,
-            Err(()) => return SubscribeResult::OutOfMemory,
+        let slot = match self.waiters.iter().position(Option::is_none) {
+            Some(slot) => slot,
+            None => {
+                if self.waiters.try_reserve(1).is_err() {
+                    if self.active_waiters == 0 {
+                        self.notification.take();
+                    }
+                    return SubscribeResult::OutOfMemory;
+                }
+                self.waiters.push(None);
+                self.waiters.len() - 1
+            }
         };
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.waiters.push(RegisteredSubscription {
+        self.waiters[slot] = Some(RegisteredSubscription {
             id,
             subscription,
-            pending: None,
-            notification: Some(notification),
+            seen: core::array::from_fn(|index| self.epochs[index].generation),
         });
+        self.active_waiters += 1;
         SubscribeResult::Registered(id)
     }
 
     pub fn unsubscribe(&mut self, id: u64) {
-        if let Some(index) = self.waiters.iter().position(|waiter| waiter.id == id) {
-            self.waiters.remove(index);
-            if self.notify_cursor > index {
-                self.notify_cursor -= 1;
-            } else if self.notify_cursor >= self.waiters.len() {
-                self.notify_cursor = 0;
+        if let Some(slot) = self
+            .waiters
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|waiter| waiter.id == id))
+        {
+            slot.take();
+            self.active_waiters -= 1;
+            if self.active_waiters == 0 && !self.scheduled {
+                self.notification.take();
             }
         }
     }
 
-    /// 取出一个已在 update 同锁段冻结的命中候选。Deferred 保留候选，
-    /// 直到 Installing owner 完成 arm；不重新读取当前 signals。
     pub(crate) fn take_notification(&mut self) -> Option<(notify_work::Reservation, ObjectRef)> {
-        if self.scheduled {
+        if self.scheduled || !self.dirty || self.active_waiters == 0 {
             return None;
         }
-        if self.notify_cursor >= self.waiters.len() {
-            self.notify_cursor = 0;
+        let target = self
+            .waiters
+            .iter()
+            .flatten()
+            .next()
+            .expect("active waiter count lost its subscription")
+            .subscription
+            .object
+            .clone();
+        let reservation = self
+            .notification
+            .take()
+            .expect("active waiter set lost its notification slot");
+        self.scheduled = true;
+        self.scan_serial = self.serial;
+        self.scan_remaining = self.waiters.len();
+        self.dirty = false;
+        Some((reservation, target))
+    }
+
+    pub(crate) fn advance_waiter(&mut self) -> WaitAdvance {
+        if !self.scheduled {
+            return WaitAdvance::Done;
         }
-        let count = self.waiters.len();
-        for _ in 0..count {
-            if self.notify_cursor >= self.waiters.len() {
-                self.notify_cursor = 0;
+        if self.active_waiters == 0 {
+            return WaitAdvance::Done;
+        }
+        if self.scan_remaining == 0 {
+            if self.dirty || self.scan_serial != self.serial {
+                self.scan_serial = self.serial;
+                self.scan_remaining = self.waiters.len();
+                self.dirty = false;
+            } else {
+                return WaitAdvance::Done;
             }
-            let index = self.notify_cursor;
-            self.notify_cursor = (index + 1) % self.waiters.len().max(1);
-            if self.waiters[index].pending.is_some()
-                && let Some(reservation) = self.waiters[index].notification.take()
+        }
+        if self.waiters.is_empty() {
+            return WaitAdvance::Done;
+        }
+        let index = self.scan_cursor % self.waiters.len();
+        self.scan_cursor = (index + 1) % self.waiters.len();
+        self.scan_remaining -= 1;
+        let Some(waiter) = self.waiters[index].as_mut() else {
+            return WaitAdvance::Progress;
+        };
+
+        let interest = waiter.subscription.interest();
+        let mut selected: Option<(u64, ObjectSignals)> = None;
+        for (signal_index, bit) in SIGNAL_BITS.iter().copied().enumerate() {
+            let epoch = self.epochs[signal_index];
+            if epoch.generation == waiter.seen[signal_index]
+                || (!interest.intersects(bit) && bit != ObjectSignals::CLOSED)
             {
-                self.scheduled = true;
-                return Some((reservation, self.waiters[index].subscription.object.clone()));
+                continue;
+            }
+            if selected.is_none_or(|(serial, _)| epoch.serial < serial) {
+                selected = Some((epoch.serial, epoch.snapshot));
             }
         }
-        None
+        waiter.seen = core::array::from_fn(|signal_index| self.epochs[signal_index].generation);
+        let Some((_, snapshot)) = selected else {
+            return WaitAdvance::Progress;
+        };
+        let outcome = waiter
+            .subscription
+            .outcome(snapshot)
+            .expect("selected signal epoch must match its subscription");
+        match waiter.subscription.context.offer(outcome) {
+            wait_context::OfferResult::Deferred => WaitAdvance::Progress,
+            wait_context::OfferResult::Lost => {
+                self.waiters[index].take();
+                self.active_waiters -= 1;
+                WaitAdvance::Progress
+            }
+            wait_context::OfferResult::Complete => {
+                let context = self.waiters[index]
+                    .take()
+                    .expect("completed waiter disappeared")
+                    .subscription
+                    .context;
+                self.active_waiters -= 1;
+                WaitAdvance::Complete(context)
+            }
+        }
     }
 
-    pub fn has_pending(&self) -> bool {
-        self.waiters.iter().any(|waiter| waiter.pending.is_some())
-    }
-
-    pub(crate) fn complete_notification(&mut self) {
+    pub(crate) fn complete_notification(
+        &mut self,
+        reservation: notify_work::Reservation,
+    ) -> notify_work::Completion {
         assert!(
             self.scheduled,
             "notification debt completed without a scheduled task"
         );
-        self.scheduled = false;
-        // Deferred offer 在本轮债务后仍保留注册；回收刚释放的槽，
-        // 使后续信号仍能再次调度该订阅。
-        if let Some(waiter) = self
-            .waiters
-            .iter_mut()
-            .find(|waiter| waiter.pending.is_some() && waiter.notification.is_none())
-        {
-            waiter.notification = Some(
-                notify_work::reserve()
-                    .expect("completed notification debt must rearm its reservation"),
-            );
+        self.scan_remaining = 0;
+        if self.active_waiters == 0 {
+            self.scheduled = false;
+            notify_work::Completion::Release(reservation)
+        } else if self.dirty {
+            self.scan_serial = self.serial;
+            self.scan_remaining = self.waiters.len();
+            self.dirty = false;
+            notify_work::Completion::Reschedule(reservation)
+        } else {
+            self.scheduled = false;
+            assert!(self.notification.replace(reservation).is_none());
+            notify_work::Completion::Held
         }
-    }
-
-    pub fn take_completer(&mut self) -> Option<Arc<WaitContext>> {
-        if self.waiters.is_empty() {
-            self.notify_cursor = 0;
-            return None;
-        }
-        let count = self.waiters.len();
-        for _ in 0..count {
-            if self.notify_cursor >= self.waiters.len() {
-                self.notify_cursor = 0;
-            }
-            let index = self.notify_cursor;
-            self.notify_cursor = (index + 1) % self.waiters.len();
-            let Some(outcome) = self.waiters[index].pending else {
-                continue;
-            };
-            // 同一 WaitMany 可重复观察一个对象；其输入顺序决定最小
-            // item_index 获胜。跨 Context 仍由游标提供公平轮转。
-            if self.waiters.iter().any(|candidate| {
-                candidate.pending.is_some()
-                    && candidate.subscription.item_index
-                        < self.waiters[index].subscription.item_index
-                    && Arc::ptr_eq(
-                        &candidate.subscription.context,
-                        &self.waiters[index].subscription.context,
-                    )
-            }) {
-                continue;
-            }
-            match self.waiters[index].subscription.context.offer(outcome) {
-                wait_context::OfferResult::Deferred => {}
-                wait_context::OfferResult::Lost => {
-                    self.waiters.remove(index);
-                    if self.notify_cursor > index {
-                        self.notify_cursor -= 1;
-                    }
-                    if self.notify_cursor >= self.waiters.len() {
-                        self.notify_cursor = 0;
-                    }
-                }
-                wait_context::OfferResult::Complete => {
-                    let context = self.waiters.remove(index).subscription.context;
-                    if self.notify_cursor >= self.waiters.len() {
-                        self.notify_cursor = 0;
-                    }
-                    return Some(context);
-                }
-            }
-        }
-        None
-    }
-
-    fn matches(current: ObjectSignals, interest: ObjectSignals) -> bool {
-        current.intersects(interest) || current.intersects(ObjectSignals::CLOSED)
     }
 }
 
@@ -338,7 +434,12 @@ pub trait KernelObject: Any + Send + Sync {
         (0, true)
     }
 
-    fn complete_waiter_drain(&self) {}
+    fn complete_waiter_drain(
+        &self,
+        reservation: notify_work::Reservation,
+    ) -> notify_work::Completion {
+        notify_work::Completion::Release(reservation)
+    }
 
     fn as_any(&self) -> &dyn Any;
 }

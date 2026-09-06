@@ -117,22 +117,26 @@ impl Notification {
 }
 
 impl KernelObject for Notification {
-    fn complete_waiter_drain(&self) {
-        self.state.lock().wait.complete_notification();
+    fn complete_waiter_drain(
+        &self,
+        reservation: super::notify_work::Reservation,
+    ) -> super::notify_work::Completion {
+        self.state.lock().wait.complete_notification(reservation)
     }
 
     fn drain_waiters(&self, budget: usize) -> (usize, bool) {
         let mut used = 0;
         while used < budget {
-            let context = { self.state.lock().wait.take_completer() };
-            let Some(context) = context else {
-                return (used, true);
-            };
-            super::wait::finish_offered(context);
-            used += 1;
+            match self.state.lock().wait.advance_waiter() {
+                super::object::WaitAdvance::Progress => used += 1,
+                super::object::WaitAdvance::Complete(context) => {
+                    super::wait::finish_offered(context);
+                    used += 1;
+                }
+                super::object::WaitAdvance::Done => return (used, true),
+            }
         }
-        let pending = self.state.lock().wait.has_pending();
-        (used, !pending)
+        (used, false)
     }
 
     fn header(&self) -> &ObjectHeader {

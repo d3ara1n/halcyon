@@ -13,20 +13,27 @@ use crate::{context::UserContext, sched, sync::Spinlock, uaccess};
 
 use super::{
     Thread,
-    object::{ObjectRef, ObjectWaitState},
+    object::{ObjectRef, ObjectWaitState, WaitAdvance},
 };
 
-/// syscall 阶段已解析并保留授权的观察项。
-pub struct ResolvedWaitItem {
-    pub object: ObjectRef,
+/// 同一对象上的一个已解析等待输入。
+#[derive(Clone)]
+pub(crate) struct WaitInterest {
     pub signals: ObjectSignals,
     pub cookie: WaitCookie,
     pub index: u32,
 }
 
+/// syscall 阶段按对象归并并保留授权的观察组。同一对象只登记一次，
+/// 从而在一个对象更新快照内确定最小 item_index。
+pub struct ResolvedWaitGroup {
+    pub object: ObjectRef,
+    items: Vec<WaitInterest>,
+}
+
 /// 线程离开执行点前登记的等待意图。
 pub struct WaitPlan {
-    pub items: Vec<ResolvedWaitItem>,
+    pub groups: Vec<ResolvedWaitGroup>,
     pub action: WaitAction,
     pub expires_at: Option<u64>,
     /// Commit 前预构造的 context；普通对象等待由 install 阶段创建。
@@ -73,8 +80,8 @@ pub fn prepare(
         abi_items.push(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WaitItem>()) });
     }
 
-    let mut items = Vec::new();
-    items
+    let mut groups: Vec<ResolvedWaitGroup> = Vec::new();
+    groups
         .try_reserve_exact(count)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     {
@@ -94,35 +101,35 @@ pub fn prepare(
             if item.signals.raw() & !allowed.raw() != 0 {
                 return Err(SystemCallError::IllegalArgument);
             }
-            items.push(ResolvedWaitItem {
-                object: entry.object().clone(),
+            let object = entry.object().clone();
+            let interest = WaitInterest {
                 signals: item.signals,
                 cookie: item.cookie,
                 index: index as u32,
-            });
+            };
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| Arc::ptr_eq(&group.object, &object))
+            {
+                group
+                    .items
+                    .try_reserve(1)
+                    .map_err(|_| SystemCallError::OutOfMemory)?;
+                group.items.push(interest);
+            } else {
+                let mut items = Vec::new();
+                items
+                    .try_reserve_exact(1)
+                    .map_err(|_| SystemCallError::OutOfMemory)?;
+                items.push(interest);
+                groups.push(ResolvedWaitGroup { object, items });
+            }
         }
     }
 
-    for item in &items {
-        let current = item.object.signals();
-        if current.intersects(item.signals) || current.intersects(ObjectSignals::CLOSED) {
-            let closed = current.intersects(ObjectSignals::CLOSED);
-            let observed = (current & item.signals)
-                | if closed {
-                    ObjectSignals::CLOSED
-                } else {
-                    ObjectSignals::NONE
-                };
-            let result = WaitResult::new(
-                item.cookie,
-                observed,
-                item.index,
-                if closed {
-                    WaitReason::Closed
-                } else {
-                    WaitReason::Signaled
-                },
-            );
+    for group in &groups {
+        let current = group.object.signals();
+        if let Some(result) = Subscription::outcome_for(&group.items, current) {
             let mut space = thread.process.space.lock();
             // SAFETY: WaitResult 字段和 reserved 全部初始化，结构无 padding。
             unsafe { uaccess::write_user_value(&mut space, result_ptr, &result) }?;
@@ -137,7 +144,7 @@ pub fn prepare(
     };
 
     Ok(WaitStart::Park(WaitPlan {
-        items,
+        groups,
         action: WaitAction::WaitMany { result_ptr },
         expires_at,
         prepared: None,
@@ -146,7 +153,7 @@ pub fn prepare(
 
 pub fn sleep_plan(expires_at: u64) -> WaitPlan {
     WaitPlan {
-        items: Vec::new(),
+        groups: Vec::new(),
         action: WaitAction::Sleep,
         expires_at: Some(expires_at),
         prepared: None,
@@ -178,30 +185,47 @@ pub(crate) struct Subscription {
     pub context: Arc<WaitContext>,
     /// 订阅所属对象；通知债务通过它交给目标 drain owner。
     pub object: ObjectRef,
-    pub interest: ObjectSignals,
-    pub cookie: WaitCookie,
-    pub item_index: u32,
+    items: Vec<WaitInterest>,
 }
 
 impl Subscription {
-    pub fn outcome(&self, current: ObjectSignals) -> WaitOutcome {
+    pub(crate) fn interest(&self) -> ObjectSignals {
+        self.items
+            .iter()
+            .fold(ObjectSignals::NONE, |all, item| all | item.signals)
+    }
+
+    pub(crate) fn outcome_for(
+        items: &[WaitInterest],
+        current: ObjectSignals,
+    ) -> Option<WaitResult> {
         let closed = current.intersects(ObjectSignals::CLOSED);
-        let observed = (current & self.interest)
-            | if closed {
-                ObjectSignals::CLOSED
-            } else {
-                ObjectSignals::NONE
-            };
-        WaitOutcome::Object(WaitResult::new(
-            self.cookie,
-            observed,
-            self.item_index,
-            if closed {
-                WaitReason::Closed
-            } else {
-                WaitReason::Signaled
-            },
-        ))
+        items
+            .iter()
+            .filter(|item| closed || current.intersects(item.signals))
+            .min_by_key(|item| item.index)
+            .map(|item| {
+                let observed = (current & item.signals)
+                    | if closed {
+                        ObjectSignals::CLOSED
+                    } else {
+                        ObjectSignals::NONE
+                    };
+                WaitResult::new(
+                    item.cookie,
+                    observed,
+                    item.index,
+                    if closed {
+                        WaitReason::Closed
+                    } else {
+                        WaitReason::Signaled
+                    },
+                )
+            })
+    }
+
+    pub fn outcome(&self, current: ObjectSignals) -> Option<WaitOutcome> {
+        Self::outcome_for(&self.items, current).map(WaitOutcome::Object)
     }
 }
 
@@ -393,7 +417,7 @@ pub fn prepare_memory(
 ) -> Result<(Arc<WaitContext>, WaitPlan), SystemCallError> {
     let context = WaitContext::new(WaitAction::KernelResult { value }, 0, Some(metadata))?;
     let plan = WaitPlan {
-        items: Vec::new(),
+        groups: Vec::new(),
         action: WaitAction::KernelResult { value },
         expires_at: None,
         prepared: Some(context.clone()),
@@ -407,7 +431,7 @@ pub fn prepare_memory(
 pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
     let context = match plan.prepared.take() {
         Some(context) => context,
-        None => match WaitContext::new(plan.action, plan.items.len(), None) {
+        None => match WaitContext::new(plan.action, plan.groups.len(), None) {
             Ok(context) => context,
             Err(error) => {
                 deliver_install_error(thread, plan.action, error);
@@ -445,23 +469,22 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
         }
     }
 
-    for item in plan.items {
+    for group in plan.groups {
         if context.core.has_outcome() {
             break;
         }
+        let object = group.object;
         let subscription = Subscription {
             context: context.clone(),
-            object: item.object.clone(),
-            interest: item.signals,
-            cookie: item.cookie,
-            item_index: item.index,
+            object: object.clone(),
+            items: group.items,
         };
-        match item.object.subscribe(subscription) {
+        match object.subscribe(subscription) {
             super::object::SubscribeResult::Ready(outcome) => {
                 context.offer(outcome);
             }
             super::object::SubscribeResult::Registered(id) => {
-                context.remember(item.object.clone(), id);
+                context.remember(object, id);
             }
             super::object::SubscribeResult::ReachLimit => {
                 context.offer(WaitOutcome::Error(SystemCallError::ReachLimit));
@@ -561,15 +584,16 @@ pub(crate) fn drain_waiters(wait: &Spinlock<ObjectWaitState>, budget: usize) -> 
     debug_assert!(budget > 0);
     let mut used = 0;
     while used < budget {
-        let context = wait.lock().take_completer();
-        let Some(context) = context else {
-            return (used, true);
-        };
-        finish_offered(context);
-        used += 1;
+        match wait.lock().advance_waiter() {
+            WaitAdvance::Progress => used += 1,
+            WaitAdvance::Complete(context) => {
+                finish_offered(context);
+                used += 1;
+            }
+            WaitAdvance::Done => return (used, true),
+        }
     }
-    let pending = wait.lock().has_pending();
-    (used, !pending)
+    (used, false)
 }
 
 /// 对象信号更新在释放对象锁后调用；只有 Complete 方可进入。

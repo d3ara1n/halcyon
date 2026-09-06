@@ -23,6 +23,15 @@ static PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 /// 一个已登记订阅未来命中的固定槽；未发布时 Drop 精确取消。
 pub(crate) struct Reservation(Option<work_debt::Reservation>);
 
+pub(crate) enum Completion {
+    /// 对象仍有注册项，槽继续由对象持有。
+    Held,
+    /// 对象已无注册项，归还槽。
+    Release(Reservation),
+    /// 排水完成与新发布并发；同一槽立即重新发布。
+    Reschedule(Reservation),
+}
+
 pub(crate) fn reserve() -> Result<Reservation, ()> {
     DEBTS
         .lock()
@@ -80,13 +89,18 @@ pub(crate) fn drain_current() -> usize {
         let (used, complete) = target.drain_waiters(turn);
         steps += used;
         if complete {
-            assert!(
-                DEBTS.lock().finish(token),
-                "taken notification slot must finish"
-            );
-            target.complete_waiter_drain();
+            let reservation = DEBTS
+                .lock()
+                .rearm(token)
+                .unwrap_or_else(|_| panic!("taken notification slot must rearm"));
+            let completion = target.complete_waiter_drain(Reservation(Some(reservation)));
             let previous = PENDING[owner].fetch_sub(1, Ordering::AcqRel);
             assert!(previous > 0, "finished notification slot must be pending");
+            match completion {
+                Completion::Held => {}
+                Completion::Release(reservation) => drop(reservation),
+                Completion::Reschedule(reservation) => reservation.publish(target),
+            }
         } else {
             DEBTS
                 .lock()
