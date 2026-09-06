@@ -34,7 +34,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`review-2026-09-bootstrap-launcher.md`](review-2026-09-bootstrap-launcher.md) | D-2 首审证据与复核清单；有效输入/ELF 与 token 分属 admission/identity，历史已修条目只复核 |
 | [`review-2026-09-system-audit-03-04.md`](review-2026-09-system-audit-03-04.md) | E-1 首审证据与复核清单；Bound 失败归构造纵向单元，hart/Gate/order 归 admission |
 | [`review-2026-09-system-audit-05-07.md`](review-2026-09-system-audit-05-07.md) | E-2 首审证据与复核清单；RPC reject 归 capability/owner 计划，lint 门由报告独立承接 |
-| [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md) | 全寿命调度准入与等待意图全出口已迁移并验收；下一直接前置为通用通知/离场交付，继而冻结地址空间与 Drain 完成闭包及构造/Start；切片 8/9 暂停 |
+| [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md) | `d453368` 已闭合调度准入；通用通知收敛到命中快照批次与稳定等待根候选，注册/队列容量和真实 primitive 预算待冻结；随后完成地址空间、Drain、构造/Start，切片 8/9 暂停 |
 | [`todo-2026-09-admission-fail-closed.md`](todo-2026-09-admission-fail-closed.md) | 启动与平台输入统一 fail-closed：DT/ELF、checked arithmetic、hart identity、RuntimeGate/IPI 与 generation 边界整体收口 |
 | [`todo-2026-09-supervision-authority-policy.md`](todo-2026-09-supervision-authority-policy.md) | 生命周期监督政策重构：authority 保留、有限等待、重试预算、失败升级与 supervisor 接管 |
 | [`todo-2026-09-capability-owner-error-boundary.md`](todo-2026-09-capability-owner-error-boundary.md) | Capability 与 affine owner 错误边界：EXECUTE ABI、signal、Drop/discard、ticket 查询与 RPC reject 统一收口 |

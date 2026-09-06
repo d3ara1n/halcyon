@@ -61,7 +61,7 @@
 
 ### 已完成：线程全寿命调度准入
 
-`ready_queue`、Start/Bootstrap/ThreadSpawn、Ready/Running/Waiting 与终止交付已按同一不可复制的执行 owner 迁移。固定 per-hart WaitPlan 槽覆盖全部 Switch 出口；不会因 trap 尾段把 Park 吸收为 Killed 而留下意图。契约由 [`ideas/task.md`](../notes/ideas/task.md) 拥有，实现、容量证明和 API 由 [`impls/task.md`](../notes/impls/task.md) 拥有，完整 Bootstrap gate 仍属单元二。
+已提交 `d453368`：`ready_queue`、Start/Bootstrap/ThreadSpawn、Ready/Running/Waiting 与终止交付按同一不可复制的执行 owner 迁移。固定 per-hart WaitPlan 槽覆盖全部 Switch 出口；不会因 trap 尾段把 Park 吸收为 Killed 而留下意图。契约由 [`ideas/task.md`](../notes/ideas/task.md) 拥有，实现、容量证明和 API 由 [`impls/task.md`](../notes/impls/task.md) 拥有，完整 Bootstrap gate 仍属单元二。
 
 验证：8 项 host 测试 debug/release、`just check`、`just acceptance`（stress 16/16、release core、sifive_u core）、`virt-hetero`、`virt-nofd` 通过。提交、唤醒、轮转和退款由 allocator 计数探针验证不分配。最终集成日志 `.git/validation/acceptance-ready-final.log`；首次已知 15/16 flake 与意图接管修复前的失败日志均保留，不混作最终通过结果。
 
@@ -73,14 +73,71 @@
 |---|---|---|
 | `RetiringSpaceChange::advance` 在退役中填充来源表，permit 仍可能回查 `view_core`；`release_view_region` 查询 live regions | Prepare 为全部 retiring fragment/permit 捕获稳定来源与索引；最后 view owner 的交接独立于后续 live ledger；删除退役时补找来源 | Protect→Unmap、两个 Release 批次反序退役；不出现 view 消散后的查询/析构错误 |
 | 同一 retire unit 含来源扫描、最多 4096 region 扫描及 `retiring_views.clear()` | 每个扫描、owner 摘除/析构都有计费单位或可续进游标；若接受固定结构上限，必须给出完整单步 WCET，不只引用 batch budget | 边界容量、反序批次、最重析构时实际工作与声明预算一致 |
+| `Notification::signal`、`Endpoint::set_signals` 在 update 后解锁，finish_waiters 重取锁；消费者可在间隙清位 | 对象发布与候选快照捕获在同一临界段，不把“同一把锁”误当“同一临界段”；后续清位不抹掉候选，也不合并不同更新的 observed | 所有可清除电平的 set→clear；尤其 Notification signal/take 与 Tunnel notify/ack |
+| `WaitContext::Registration` 弱持观察对象，Waiting 成员也仅弱持 Context；对象队列是部分等待的唯一强根 | Waiting 执行责任由调用方生命周期持有，注册强持观察授权，对象订阅弱指 Context；完成/取消显式切断各边，不能由最后 Handle 消散暗中丢掉线程 | 无限等待时关闭最后一个目标 control Handle，随后目标完成及调用方 kill，均无孤儿 Waiting/Exiting |
 | `ObjectWaitState::take_completer` 重复从头扫描；MemoryObject/Tunnel/ThreadControl/ProcessControl/Job 同步循环交付 waiter | 所有 waitable object 共用预付、有界的通知交付责任；电平发布与剩余 waiter 责任同时成立；不能为内存对象另造通知尾段 | 混合兴趣、Installing/Deferred、取消竞态、CLOSED 全兴趣匹配；最多 1024 waiter 和每等待最多 64 订阅的真实成本 |
-| `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | 线程出生支付通用 departure completion；结果义务解除只移交已预备责任，成员摘除与通知按预算推进 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
+| `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | 以稳定成员凭据和固定成本通知消除隐式动态工作；仍需异步的离场责任由出生时预付 owner 接管。最终选择须服从完整 primitive 上界，不机械增加状态机 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
 | `Tunnel::close_detached` 在 REAPABLE 后才分配 sink、规划页表并资金化 | Endpoint/lease 的准入必须支付未来不可避免的退役，或消费已有可复用退役工作区；显式 close 与 detached close 共用最终事务，不以 OOM 重试掩盖收束缺口 | 准入后持续 allocator failure 仍可完成关闭与 CLOSED，无新增 sink 或 funding 来源 |
 | `ProcessDrain` 在返回资源 complete 后于预算外 publish_dead、Job unlink、最多 32 层祖先完成 | Process/Job 收尾进入持久终段，稳定成员凭据与通用通知责任保证进度；Complete 只在责任已完成或不可丢失地交出后返回 | 最小预算、深 Job 链、大量 waiter、管理者交替推进与终态观察 |
 | `sched::run` 在 epoch execution gate 之外仍有每次 dispatch 的无条件 `fence.i` | 冻结 Building 写、首次进入、跨 hart dispatch 和 Running 变更的 instruction epoch 证明；由统一同步协议承担责任后删除附加路径 | 多 hart RX/首次执行/迁移及 release 验证，不以重复 fence 掩盖 epoch 缺口 |
 | `write_drain_result` 的最终 `check_range` 可在业务副作用后绕过 `deliver_output` 的失败政策 | 最终交付统一经过受保护输出边界；初始无副作用验证和提交后交付不能混成同一拒绝出口 | 最终 Drain 批次与输出页 Unmap 竞态，保持统一故障终因与已提交目标状态 |
 
 本表是上述缺口的唯一实施真值；完成一项即删除对应待办并转入长期 notes，不口头延期。
+
+### 通用通知的设计候选：命中批次与稳定等待根
+
+**状态：候选已收敛，容量参数、注册容器与 primitive 工作上界尚未冻结，不开始核心编码。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)；不能从 Zircon 的同步 observer、seL4 单目标 signal 或 managarm WorkQueue 推出本系统已满足预算。
+
+#### 语义与所有权
+
+保留 WaitCore 的单 outcome 仲裁。命中候选保留、仲裁获胜、注册清理与执行交付分别承担责任：候选不能被后续清位抹去，但也不等同于已经取得完成权。初始检查与同一对象更新的最小 item_index 契约不变；不新增跨对象真实事件时间排序。
+
+```text
+Job 的活体根 → Process 生命周期 Waiting 成员 → Arc<WaitContext>
+WaitContext → AdmittedThread → Process
+WaitContext → 注册凭据 → 强持观察对象 / 命中批次
+观察对象 → 开放命中批次 → 弱 WaitContext + 同对象输入项组
+已冻结批次 → 预付 work debt → 有界 offer / 清理
+WaitContext 完成 owner → 解除注册与 Waiting 挂接 → Ready 或 departure
+```
+
+执行责任以 Process 的活体根为依托；订阅不是线程的唯一保活根。Waiting→完成/终止必须显式提取或解除生命周期中的 Context 强引用，不能只是把 Weak 改成 Arc 后保留隐式循环。注册持有观察来源直至注销，保留已验证授权的寿命；对象侧弱引用只用于投递，不决定线程是否存活。
+
+`ProcessControl` 是关键反例：其 core 回指和 core 中的 control 回指均 weak。无超时的 WaitMany 安装完成后，最后一个 control Handle 关闭可以消散唯一对象队列强根；现有 `take_first_waiting` 又会把失效 weak Context 对应成员转 Exiting。该静态引用图已取证，需补真实验收，不能把它误判为 Ready 容量回归。
+
+#### 命中批次，不延后重读 live signals
+
+推荐按对象自己的合法普通电平集合建立兴趣掩码分组。设普通电平数为 `b`，CLOSED 独立作为全部分组的终态命中，则分组数 `B = 2^b`；当前真实可等待对象至多两种普通电平，故至多四组。对外仍逐输入项验证 role、rights、signals，不把不同角色权限合并成额外授权。
+
+同一 Context 对同一对象的多个输入项形成一个 `WaitGroup`，记录原始 item_index/cookie/mask 与按信号位预计算的输入项集合。对象更新以同一完整快照计算命中集合，组内用最低输入位选最小 item_index；不让兴趣桶的遍历顺序决定 ABI 结果。
+
+每个开放分组持有已预付的 `SignalEpoch`：
+
+```text
+Open ──同锁冻结完整 signals 快照并摘出整个分组──→ Frozen → Draining → Done
+Open ──最后注册取消──→ Retiring → Done
+```
+
+发布只捕获有限分组并交出已有 owner，不逐等待者调用回调。新注册不加入已冻结批次；旧批次不被下一次更新覆写。注册时若 live signals 已命中则仍立即形成候选，无需创建开放批次。
+
+所有与成员数成正比的工作留给批次游标：逐个弱引用升级、offer、注销、空槽/容器 backing 收束。不能在最后一步 clear 整个成员表或让最后一个 Arc 隐式排空批次。开放批次的空槽复用与冻结后禁止新增的纪律，必须连同 affine 注册凭据证明不发生 ABA。
+
+按单信号位建立多链也可降低分组数量，但会给同一 WaitGroup 引入多份成员、重复候选和更多取消责任。当前少量对象条件位下优先采用精确兴趣分组；`SignalSchema` 必须显式验证 B 的容量与发布成本，不能对未来新增位静默接受指数增长。分组索引可作实现替换，候选快照与 owner 契约不变。
+
+#### 准入、预算与离场
+
+- 等待 Context、开放批次及其完成队列位置，在接受对应责任前取得真实存储与 metadata charge；不能在 signal、最后 permit 退役或 outcome 获胜之后首次分配。
+- 完成队列只调度各责任 owner，不合并它们的事务状态机，也不以任意闭包掩盖工作上界。每次取出 owner 后释放队列锁，再执行一个已量化的 primitive；所有 work 类型共享安全点预算。
+- 容量证明必须覆盖开放、已发布、Taken、等待清理和已交付但尚有真实引用的 owner。不能只按当前 Waiting 线程数定额，因为已交付线程可以开始下一次等待，而旧 Context/批次仍可能在退役。
+- 锁顺序须冻结为对象状态 → 批次注册状态 → completion/work slot；生命周期锁只接管 Context，不在持有时进入低秩对象或队列。游标状态锁取出工作后释放，再触碰业务锁；来源 Arc 和真实 owner 在业务锁外消散。
+- `ThreadDeparture` 先改为持稳定成员凭据，消除完成时线性查找/移位；结果义务解除不直接 fanout。通用通知变成固定成本发布后，重新量化“成员摘除 + DONE/REAPABLE 发布”的总成本：确为固定短 primitive 时无需机械增设离场状态机；若仍有动态责任，必须由出生时预付的 owner/游标接管，不藏在 Drop。
+
+#### 编码前仍须完成的冻结门
+
+1. 给出 `SignalSchema`、`SignalEpoch`、注册凭据和完成队列的实际字段/方法、存量与在途容量公式、metadata sponsor 归属及耗尽出口；不使用任意大数组代替证明。
+2. 对候选冻结/清位、重复输入最小索引、Installing/Deferred、timeout/kill 与后台投递的交错建立 host 模型；同时证明原 Handle 关闭时的稳定根、取消时断环与每项注册精确归还。
+3. 用真实 primitive 计费：发布 B 组、逐注册 offer/cancel、timer 注销、成员摘除、来源与存储析构分别列出上界。然后确定是否需要独立 departure debt，并保证最小 work turn 能推进最重合法 primitive。
+4. 一次迁移所有真实 waitable object、WaitContext、Lifecycle、ThreadDeparture、定时来源和既有 MemoryChange work 接线。ProcessBuilder 的 allowed_rights 不含 WAIT，其 CLOSED 等待实现属于不可达残留，应删除，而不是增加一个虚构的用户等待用例。
 
 ## 目标结构：供设计冻结审阅
 
