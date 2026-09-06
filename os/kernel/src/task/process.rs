@@ -1082,9 +1082,9 @@ fn write_drain_result(
     result: ProcessDrainResult,
 ) -> Result<(), SystemCallError> {
     let mut space = thread.process.space.lock();
-    space.check_range(output, core::mem::size_of::<ProcessDrainResult>(), true)?;
-    // SAFETY: ProcessDrainResult 字段与 reserved 全部初始化，无 padding；
-    // 复检失败即杀本进程（deliver_output）。
+    // deliver_output 在同一锁内完成最终 StoreAccess 复检与失败收束；不在此处
+    // 做一次会绕过统一交付策略的旁路检查。
+    // SAFETY: ProcessDrainResult 字段与 reserved 全部初始化，无 padding。
     unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
 }
 
