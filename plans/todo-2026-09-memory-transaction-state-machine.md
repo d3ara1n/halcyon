@@ -1,6 +1,6 @@
 # 地址空间事务与进程启动发布的纵向重构
 
-> 当前主线先闭合完整完成链的直接前置，再冻结地址空间事务与启动提交；调度全寿命准入已完成代码迁移及集成验证，其余核心迁移尚未开始。多页 Tunnel / Runnel 切片 8/9 不推进。本计划拥有事务失败闭包与启动发布的实施责任；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
+> 当前主线按最终方案施工完整完成链：调度全寿命准入已交付，等待命中快照与通知债务已有施工基线，正在连接离场、Drain、对象退役与地址空间事务；构造/Start 在其后接入同一闭包。多页 Tunnel / Runnel 切片 8/9 不推进。本计划拥有事务失败闭包与启动发布的实施责任；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
 
 ## 目标与边界
 
@@ -65,11 +65,11 @@
 
 验证：8 项 host 测试 debug/release、`just check`、`just acceptance`（stress 16/16、release core、sifive_u core）、`virt-hetero`、`virt-nofd` 通过。提交、唤醒、轮转和退款由 allocator 计数探针验证不分配。最终集成日志 `.git/validation/acceptance-ready-final.log`；首次已知 15/16 flake 与意图接管修复前的失败日志均保留，不混作最终通过结果。
 
-### 已完成：等待来源保活、命中快照与有界通知排水
+### 施工中：等待来源、命中快照与通知排水
 
-当前工作树已实现并验证等待闭包的三项前置：`WaitContext::Registration` 强持对象来源；`ObjectWaitState::update` 在对象锁内冻结 `WaitOutcome` 候选，后续清位不抹除命中；`take_completer` 不重读 live signals，并保留同一 WaitMany 的最小 `item_index`。每个 RegisteredSubscription 预付一个固定通知槽；对象发布交出 one-shot `notify_work::WorkDebts` 任务，安全点按 16/4 预算推进，剩余债务重排。所有 waitable object 已接入同一 drain trait，ProcessBuilder 的不可达 WAIT/CLOSED 面已删除。
+施工提交 `2884682` 已实现并验证当前完成责任链的底层部分：`WaitContext::Registration` 强持对象来源；`ObjectWaitState::update` 在对象锁内冻结 `WaitOutcome` 候选，后续清位不抹除命中；`take_completer` 不重读 live signals，并保留同一 WaitMany 的最小 `item_index`。RegisteredSubscription 已接入固定通知槽与按 hart 分流的 `notify_work::WorkDebts`，所有 waitable object 已接入 drain 接口，ProcessBuilder 的不可达 WAIT/CLOSED 面已删除。
 
-验证：`just check`、`ready_queue`/`wait_context` host tests、`virt` 与 `virt-stress` 通过（16/16）。本切片的预算覆盖 offer、候选移交和注册槽；尚未覆盖 ThreadDeparture/ProcessDrain 成员摘除、对象 backing 析构及 detached Tunnel close 的完整后置责任。
+该提交是整体施工基线，不是独立交付：当前槽重装、Context 清理、ThreadDeparture、ProcessDrain、对象 backing 析构和 detached Tunnel close 尚未接入最终完成责任 owner 与统一容量公式。已有 `just check`、`ready_queue`/`wait_context` host tests、`virt` 与 `virt-stress`（16/16）只证明现有施工段没有破坏基线，不把等待专题标记为完成。
 
 ### 尚待冻结：所有完成责任的诚实预算与不可失败来源
 
@@ -90,9 +90,9 @@
 
 本表是上述缺口的唯一实施真值；完成一项即删除对应待办并转入长期 notes，不口头延期。
 
-### 通用通知的设计候选：命中批次与稳定等待根
+### 通用通知与稳定等待根的最终连接
 
-**状态：第一版固定槽与 primitive 预算已实现；仍需把对象析构、ThreadDeparture、ProcessDrain 与 detached Tunnel 的后置责任接入同一预算表。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)；不能从 Zircon 的同步 observer、seL4 单目标 signal 或 managarm WorkQueue 推出本系统已满足预算。
+**状态：底层命中快照和通知债务已进入施工；完成责任 owner、容量来源和离场/退役连接尚未交付。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)；不能从 Zircon 的同步 observer、seL4 单目标 signal 或 managarm WorkQueue 推出本系统已满足预算。
 
 #### 语义与所有权
 
@@ -138,7 +138,7 @@ Open ──最后注册取消──→ Retiring → Done
 - 锁顺序须冻结为对象状态 → 批次注册状态 → completion/work slot；生命周期锁只接管 Context，不在持有时进入低秩对象或队列。游标状态锁取出工作后释放，再触碰业务锁；来源 Arc 和真实 owner 在业务锁外消散。
 - `ThreadDeparture` 先改为持稳定成员凭据，消除完成时线性查找/移位；结果义务解除不直接 fanout。通用通知变成固定成本发布后，重新量化“成员摘除 + DONE/REAPABLE 发布”的总成本：确为固定短 primitive 时无需机械增设离场状态机；若仍有动态责任，必须由出生时预付的 owner/游标接管，不藏在 Drop。
 
-#### 编码前仍须完成的冻结门
+#### 继续施工前须完成的连接冻结门
 
 1. 给出 `SignalSchema`、`SignalEpoch`、注册凭据和完成队列的实际字段/方法、存量与在途容量公式、metadata sponsor 归属及耗尽出口；不使用任意大数组代替证明。
 2. 对候选冻结/清位、重复输入最小索引、Installing/Deferred、timeout/kill 与后台投递的交错建立 host 模型；同时证明原 Handle 关闭时的稳定根、取消时断环与每项注册精确归还。
