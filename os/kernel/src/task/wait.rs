@@ -214,7 +214,7 @@ struct Registration {
 /// 一次 Waiting 的唯一线程所有者和完成仲裁点。
 pub struct WaitContext {
     core: WaitCore<WaitOutcome>,
-    thread: Spinlock<Option<Arc<Thread>>>,
+    thread: Spinlock<Option<sched::AdmittedThread>>,
     registrations: Spinlock<Vec<Registration>>,
     /// 原子注册状态：未登记、稳定 token 或 Closed。
     timeout_registration: TimeoutRegistration,
@@ -408,7 +408,7 @@ pub fn prepare_memory(
 /// 调度循环在线程离开执行点后安装一次 WaitMany：Waiting 记录与
 /// 可取消性在 lifecycle 锁内线性化；已 Terminating 则不发布等待，
 /// 直接以 Abandoned 取消（线程不回用户态）。
-pub fn install(thread: Arc<Thread>, mut plan: WaitPlan) {
+pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
     let context = match plan.prepared.take() {
         Some(context) => context,
         None => match WaitContext::new(plan.action, plan.items.len(), None) {
@@ -539,7 +539,11 @@ fn deliver_wait_result(
     frame.sepc += 4;
 }
 
-fn deliver_install_error(thread: Arc<Thread>, _action: WaitAction, error: SystemCallError) {
+fn deliver_install_error(
+    thread: sched::AdmittedThread,
+    _action: WaitAction,
+    error: SystemCallError,
+) {
     // SAFETY: install 只在线程离开执行点后调用，本 hart 独占尚未发布的现场。
     let frame = unsafe { &mut *thread.frame_ptr() };
     frame.x[10] = error.to_usize().unwrap_or(1) as u64;

@@ -354,7 +354,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 respond_ok(frame, 0);
             } else {
                 // 只登记本 hart 意图槽；全局发布由调度循环在线程离开
-                // 执行点后完成（sched::park_publish，唤醒所有权随迁）。
+                // 执行点后由 sched::run 的 Park 分支完成，唤醒所有权随迁。
                 let expires_at = sched::expires_after_ms(ms);
                 sched::park_request_wait(wait::sleep_plan(expires_at));
                 return Outcome::Wait; // 不前进 sepc，完成唤醒后由帧携带结果
@@ -575,8 +575,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
     };
     // 分发出口终止检查：syscall 执行期间冻结了终因（写回复检失败自杀、
     // 异 hart kill）则线程不回用户态——收束确定性提前一个 syscall，
-    // 不依赖 sret 边界的 IPI 吸收时序。Wait 出口不改写：其 park 意图
-    // 由 park_publish 的终止分支消费（Abandoned），不产生泄漏。
+    // 不依赖 sret 边界的 IPI 吸收时序。Wait 在此保留；trap 尾段仍可将
+    // 它吸收为 Killed。调度循环统一取走意图，Park 安装或 Killed 放弃。
     if outcome == Outcome::Completed && thread.process.lifecycle.is_terminating() {
         return Outcome::Killed;
     }

@@ -12,7 +12,7 @@ handler 返回 Completed 后，dispatcher 再检查 lifecycle。若 syscall 期�
 
 ## 异步调用
 
-dispatcher 把 `WaitPlan` 登记到 HartLocal park 槽并返回 Wait；调度循环在当前线程离开执行点、清 active 后调用 `park_publish` 安装 `WaitContext`。普通 WaitMany/Sleep 在安装时创建 Context；Commit 后必成的内核事务会在 Commit 前预构造不含 Thread 的 Installing Context，使 Remote completion 可安全早到并 Deferred，线程 Arc 仍只在离开执行点后移入 Context。
+dispatcher 把 `WaitPlan` 移入 `sched::HART_WAIT_PLANS` 的固定 per-hart 内联槽并返回 Wait，意图交接不分配。调度循环在 `clear_context` 后对所有 Switch 出口统一取走意图：Park 在清 active 后把 `AdmittedThread` 整体交给 `WaitContext`；Killed 在清 active 后放弃未安装计划；Requeue 必须无意图。普通 WaitMany/Sleep 在安装时创建 Context；Commit 后必成的内核事务在 Commit 前预构造不含线程的 Installing Context，使 Remote completion 可安全早到并 Deferred。线程与全寿命调度准入只在离开执行点后移入 Context。
 
 WaitPlan、WaitContext、TimeoutRegistration、订阅清理与 rejected-park 竞态由 [`ipc.md`](ipc.md) 唯一记录。调用层当前有三种交付：WaitMany 写回观察结果或错误，Sleep 在相对超时到达时写回成功，内核事务 action 在业务 Complete 后写回已承诺的结果。终止 Abandoned 不交付结果；若业务结果先于 rejected park 到达，安装者仍以 Abandoned 放弃回复权，业务事务本身已经独立收束。
 

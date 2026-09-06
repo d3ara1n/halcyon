@@ -18,9 +18,11 @@
 
 `os/remote_call` 的 `Reservation`/`FinishToken` 只携带 `(target, slot, generation)`；`RemoteCalls::new` 为 public，`entry_mut` 不校验 token 所属表实例。当前内核只有一个全局表，实际跨表误用暂不可达，但纯逻辑 API 没有结构性防误用。
 
-### Handle/Job/Ready reservation token
+### Handle/Job/work reservation token
 
-内核多个容器各自使用全局 `AtomicU64`：Handle transaction、Job member、Ready batch、deferred work。多数只拒绝零值，回绕后可能重新使用仍存 token。容器内部当前依靠锁内短事务和 `expect` 证明错配不可达，但没有统一耗尽策略。
+内核多个容器各自使用全局 `AtomicU64`：Handle transaction、Job member、deferred work。多数只拒绝零值，回绕后可能重新使用仍存 token。容器内部当前依靠锁内短事务和 `expect` 证明错配不可达，但没有统一耗尽策略。
+
+Ready 的来源校验由 `ready_queue::Admission` 保活的容量 core 和不可 Clone 的 `Admitted<T>` 承担，enqueue 以 core identity 拒绝跨队列 owner；该面不存在单调 token/回绕待办。实际容量与存量加法在准入前检查，随调度全寿命纵向机制验证，不增加一个平行 identity 真值。
 
 ### AddressSpace epoch
 
@@ -40,7 +42,6 @@ raw HartId 与内部 HartSlot 已基本分离，旧 IPI shift 已修复；剩余
 RemoteTableId
 HandleTable/transaction domain
 Job member/child domain
-Ready queue/domain
 Work-debt table
 AddressSpace identity + epoch
 ```
@@ -72,7 +73,7 @@ Commit 前使用不污染状态的最大值门禁：只有确认旧 epoch 小于
 先盘点身份产生点、验证点与 owner，冻结不可回绕和错误域拒绝策略，再按凭据的完整消费链实施：
 
 1. **MemoryChange 凭据链**：Remote/work token、AddressSpace epoch、内核 reserve/commit/abort/finish 与 host/真实接线测试一起迁移。与内存事务计划单元一共用交付边界，不先改纯逻辑 crate 再 adapter 接回旧调用者，也不把 epoch 留到事务完成后补。
-2. **进程发布凭据链**：Handle pin/consume、Job member、Ready reservation 及 Start/Bootstrap 使用点一起闭合，与构造单元二同步。各身份仍由自己的容器验证，不建立跨领域全局 token 真值。
+2. **进程发布凭据链**：Handle pin/consume、Job member 及 Start/Bootstrap 使用点一起闭合，与构造单元二同步。各身份仍由自己的容器验证，不建立跨领域全局 token 真值。
 3. **其它独立消费者**：按各自完整 reserve→consume/abort 生命周期迁移，测试跨实例、错误 owner/phase、最大值和槽退休；当单元完成时删除旧 helper 和 fallback。
 
 raw HartId/HartSlot 由 admission 计划提供 canonical 输入，本计划只验证运行期凭据没有混淆身份。每个单元自带 host debug/release 和所需多 hart 验证，不把测试与删除推迟到所有容器改完之后。
@@ -82,7 +83,7 @@ raw HartId/HartSlot 由 admission 计划提供 canonical 输入，本计划只�
 - 跨 RemoteCalls 实例 token、跨表 reservation、错误 phase/owner 的提交均确定性失败且不改变状态；
 - 所有 generation/token/epoch 在耗尽前拒绝，或将槽永久退休，不发生 ABA 回绕；
 - epoch 发布失败不会先污染原子状态；
-- Handle/Job/Ready/Work-debt 的凭据共享同一耗尽语义和错误分类；
+- Handle/Job/Work-debt 的整数凭据共享同一耗尽语义和错误分类；
 - raw HartId、HartSlot、AddressSpace identity、epoch 各自只在所属边界解释；
 - host debug/release、完整启动路线和压力/故障注入证明 stale token、代次复用和 IPI/Remote 乱序不误命中；
 - 更新 `notes/impls/{call,mm,task,execution-context,internals}.md`，回到 C-2/D-2/E-1 报告逐项复核。

@@ -50,15 +50,9 @@ pub mod off {
     pub const FATAL_SP: usize = 96;
     /// per-hart LR/SC reservation 清除槽（dummy SC 目标）。
     pub const RESERVATION: usize = 104;
-    /// 等待意图槽：dispatcher 写入（syscall::dispatch），调度循环在
-    /// clear_context 后的 Park 分支消费发布（sched::park_publish）。
-    /// 发布严格晚于线程离开一切 hart 引用，闭合双容器竞态窗口。
-    pub const PARK_KIND: usize = 112;
-    /// 等待意图参数（如 sleep 的毫秒数）。
-    pub const PARK_ARG: usize = 120;
 }
 
-/// 单个 hart 的私有状态（trap 锚 + 执行点），占一个 cache line。
+/// 单个 hart 的 trap 锚与执行点，占两个 cache line；Rust 调度状态由 sched 按 slot 保存。
 ///
 /// 字段用原子类型以保持 `Sync`——访问纪律由 tp 不变量保证，
 /// 原子性只是让类型系统不阻拦静态声明。
@@ -94,10 +88,6 @@ pub struct HartLocal {
     fatal_sp: AtomicUsize,
     /// dummy SC 目标（reservation 清除）。
     reservation: AtomicUsize,
-    /// 等待意图类别（0 = 无；语义见 sched::PARK_*）。
-    pub(crate) park_kind: AtomicUsize,
-    /// 等待意图参数。
-    pub(crate) park_arg: AtomicUsize,
 }
 
 impl HartLocal {
@@ -116,8 +106,6 @@ impl HartLocal {
         fp_enabled: ATOMIC_ZERO,
         fatal_sp: ATOMIC_ZERO,
         reservation: ATOMIC_ZERO,
-        park_kind: ATOMIC_ZERO,
-        park_arg: ATOMIC_ZERO,
     };
 
     /// hart 编号。

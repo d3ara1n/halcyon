@@ -11,6 +11,7 @@ members = [
     "timer_queue",
     "stack_layout",
     "sched_domain",
+    "ready_queue",
     "memory_space",
     "remote_call",
     "memory_supply",

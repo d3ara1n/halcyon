@@ -23,7 +23,7 @@
 os/        内核 workspace：
              kernel/          erhino_kernel（no_std）
              dtb/ frame_pool/ page_table/ tar/ elf/ handle_table/
-             wait_context/ timer_queue/ stack_layout/ sched_domain/   纯逻辑 crate，host 可测
+             wait_context/ timer_queue/ stack_layout/ sched_domain/ ready_queue/   纯逻辑 crate，host 可测
 shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、同步原语）；FAL 是纯用户态线协议，落 user/frameworks/libfal，不在此处
 user/      用户态 workspace：
              rinlib/
@@ -46,7 +46,7 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 - 秒级检查：`just check`（内核 target 需要 build-std，等价于 `cd os && cargo check -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`）；`cd shared && cargo check`。
 - host 单测（纯逻辑 crate，毫秒级）：**必须显式指 host target**——os workspace 默认 target 是 riscv，`cargo test` 直接跑会拿 no_std 环境去链 std：
   ```sh
-  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain --target aarch64-apple-darwin
+  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain -p ready_queue --target aarch64-apple-darwin
   cd shared && cargo test --target aarch64-apple-darwin   # shared 也需显式 host target
   ```
 - 集成验证分档由用户态 `srv_init` 编译期 workload 控制，内核不感知测试政策：`just virt` 是日常 core 快线（确定性内存/IPC/Tunnel/Job/监督/reset）；`just virt-stress` 追加 control/Tunnel 重复压力、`max_work=1` Drain 与完整 16/16 竞态矩阵；`just virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持；`just acceptance` 是阶段收尾聚合，依次执行 debug stress、release core 与 `sifive_u` core。涉及调度域契约时另跑 `virt-hetero`/`virt-nofd`。

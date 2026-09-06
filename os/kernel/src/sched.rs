@@ -1,7 +1,7 @@
 //! 调度：域—类—执行点三层（notes/impls/task.md「调度」）+ 调度循环 + 期限表。
 //!
-//! 单一归属不变量：线程任意时刻恰处于「类队列 | 本 hart current | 无容器」，
-//! 全部转换经本模块入口（enqueue / pick / wake）在锁内完成。
+//! 单一归属不变量：可调度 owner 恰处于「类队列 | 本 hart current | WaitContext」，
+//! 全寿命容量随不可复制的 AdmittedThread 在容器间移动，离场才归还。
 //! 公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 //!
 //! 调度域按「需求满足签名」推导（sched_domain crate）：域 = 一组能力
@@ -13,7 +13,8 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
 };
 
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use ready_queue::{Admission, ReadyQueue};
 
 use crate::sbi::DISARM;
 use crate::sync::Spinlock;
@@ -23,110 +24,62 @@ use crate::{
     trap::{self, Outcome},
 };
 
-/// 调度类：一类线程的就绪容器 + 选择策略（可整体替换，见 notes/impls/task.md）。
-/// reserve/commit/rollback 是就绪容量的批量事务契约（协议四要素，见
-/// notes/impls/task.md「reserve/commit/rollback 协议」）：整批占位对 pick/
-/// has_ready 不可见，token 全局单调防错认，commit/rollback 凭 token 消费
-/// 完整批次。容量必须预留在线程将要进入的目标容器（具体类队列）里，域层
-/// 路由不替代本契约。
+/// 执行容器唯一拥有的线程与全寿命容量；借用底层 Arc 不复制调度资格。
+pub type AdmittedThread = ready_queue::Admitted<Arc<Thread>>;
+
+/// 调度类负责自己的实际存储；首次批次和后续唤醒共享同一准入来源。
 pub trait SchedClass: Sync {
-    fn enqueue(&self, t: Arc<Thread>);
-    fn pick(&self) -> Option<Arc<Thread>>;
+    fn enqueue(&self, t: AdmittedThread);
+    fn pick(&self) -> Option<AdmittedThread>;
     fn has_ready(&self) -> bool;
-    /// 原子预留 count 个就绪容量占位；失败不留下部分预留。
-    fn reserve_batch(&self, count: usize) -> Result<u64, ()>;
-    /// 凭 token 提交完整线程批次（不可失败：容量已预留）。
-    fn commit_batch(&self, token: u64, threads: Vec<Arc<Thread>>);
-    /// 凭 token 回滚完整预留批次（不可失败：token 只被本事务消费）。
-    fn rollback_batch(&self, token: u64, count: usize);
+    fn reserve_batch(&self, count: usize) -> Result<Admission, ()>;
+    /// 整批在一次类锁内交付；没有 marker、token 或存量扫描。
+    fn publish_batch(&self, admission: Admission, threads: Vec<Arc<Thread>>);
 }
 
 /// 公平类：FIFO 轮转 + 固定量子。
-enum ReadyEntry {
-    Reserved(u64),
-    Thread(Arc<Thread>),
-}
-
 pub struct FairClass {
-    ready: Spinlock<VecDeque<ReadyEntry>>,
+    ready: Spinlock<ReadyQueue<Arc<Thread>>>,
 }
 
 impl FairClass {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            ready: Spinlock::new(crate::sync::ranks::LEAF, VecDeque::new()),
+            ready: Spinlock::new(
+                crate::sync::ranks::LEAF,
+                ReadyQueue::try_new().expect("scheduler capacity metadata allocation failed"),
+            ),
         }
     }
 }
 
 impl SchedClass for FairClass {
-    fn enqueue(&self, t: Arc<Thread>) {
-        self.ready.lock().push_back(ReadyEntry::Thread(t));
+    fn enqueue(&self, t: AdmittedThread) {
+        self.ready.lock().enqueue(t);
     }
 
-    fn pick(&self) -> Option<Arc<Thread>> {
-        let mut ready = self.ready.lock();
-        let count = ready.len();
-        for _ in 0..count {
-            match ready.pop_front()? {
-                ReadyEntry::Thread(thread) => return Some(thread),
-                reserved @ ReadyEntry::Reserved(_) => ready.push_back(reserved),
-            }
-        }
-        None
+    fn pick(&self) -> Option<AdmittedThread> {
+        self.ready.lock().pick()
     }
 
     fn has_ready(&self) -> bool {
-        self.ready
-            .lock()
-            .iter()
-            .any(|entry| matches!(entry, ReadyEntry::Thread(_)))
+        !self.ready.lock().is_empty()
     }
 
-    fn reserve_batch(&self, count: usize) -> Result<u64, ()> {
-        if count == 0 {
-            return Err(());
-        }
-        let token = NEXT_READY_RESERVATION.fetch_add(1, Ordering::Relaxed);
-        if token == 0 {
-            return Err(());
-        }
-        let mut ready = self.ready.lock();
-        ready.try_reserve(count).map_err(|_| ())?;
-        ready.extend((0..count).map(|_| ReadyEntry::Reserved(token)));
-        Ok(token)
+    fn reserve_batch(&self, count: usize) -> Result<Admission, ()> {
+        self.ready.lock().reserve(count).map_err(|_| ())
     }
 
-    fn commit_batch(&self, token: u64, threads: Vec<Arc<Thread>>) {
-        let expected = threads.len();
-        let mut threads = threads.into_iter();
-        let mut committed = 0;
-        let mut ready = self.ready.lock();
-        for entry in ready.iter_mut() {
-            if matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token) {
-                let thread = threads
-                    .next()
-                    .expect("ready reservation batch is too large");
-                *entry = ReadyEntry::Thread(thread);
-                committed += 1;
-            }
-        }
-        assert_eq!(committed, expected, "ready reservation batch disappeared");
-        assert!(
-            threads.next().is_none(),
-            "ready reservation batch is too small"
+    fn publish_batch(&self, mut admission: Admission, threads: Vec<Arc<Thread>>) {
+        assert_eq!(
+            admission.remaining(),
+            threads.len(),
+            "ready batch/thread count mismatch"
         );
-    }
-
-    fn rollback_batch(&self, token: u64, count: usize) {
-        let mut removed = 0;
         let mut ready = self.ready.lock();
-        ready.retain(|entry| {
-            let matches = matches!(entry, ReadyEntry::Reserved(reserved) if *reserved == token);
-            removed += usize::from(matches);
-            !matches
-        });
-        assert_eq!(removed, count, "ready reservation batch disappeared");
+        for thread in threads {
+            ready.enqueue(admission.admit(thread));
+        }
     }
 }
 
@@ -142,7 +95,7 @@ pub struct SchedDomain {
 }
 
 impl SchedDomain {
-    fn pick(&self) -> Option<Arc<Thread>> {
+    fn pick(&self) -> Option<AdmittedThread> {
         self.classes.iter().find_map(|c| c.pick())
     }
 
@@ -155,8 +108,16 @@ impl SchedDomain {
     }
 
     /// 就绪入队（Requeue/wake 路径的公平类；今天单类，classes[0] 即公平类）。
-    fn enqueue_fair(&self, t: Arc<Thread>) {
+    fn enqueue_fair(&self, t: AdmittedThread) {
         self.classes[0].enqueue(t);
+    }
+
+    /// 为目标公平类支付完整出生批次的全寿命存储；取消仅做原子退款。
+    pub fn reserve_ready(&'static self, count: usize) -> Result<ReadyBatch, ()> {
+        Ok(ReadyBatch {
+            domain: self,
+            admission: self.classes[0].reserve_batch(count)?,
+        })
     }
 
     /// 唤醒本域一个空闲 hart（门铃只达本域 idle hart）。
@@ -168,37 +129,32 @@ impl SchedDomain {
     }
 }
 
-static NEXT_READY_RESERVATION: AtomicU64 = AtomicU64::new(1);
-
-/// Start 事务的域批量预留凭据（域 + token + 数量）。
+/// 目标域和实际类存储的出生准入，未交付部分随 owner 析构取消。
 pub struct ReadyBatch {
     domain: &'static SchedDomain,
-    token: u64,
-    count: usize,
+    admission: Admission,
 }
 
-/// 在目标域的公平类原子预留完整就绪批次。
-pub fn reserve_ready_batch(domain: &'static SchedDomain, count: usize) -> Result<ReadyBatch, ()> {
-    let token = domain.classes[0].reserve_batch(count)?;
-    Ok(ReadyBatch {
-        domain,
-        token,
-        count,
-    })
-}
+impl ReadyBatch {
+    pub fn publish(self, threads: Vec<Arc<Thread>>) {
+        assert!(
+            threads
+                .iter()
+                .all(|thread| core::ptr::eq(thread.process.domain(), self.domain)),
+            "ready batch belongs to another execution domain"
+        );
+        self.domain.classes[0].publish_batch(self.admission, threads);
+        self.domain.wake_one();
+    }
 
-pub fn commit_ready_batch(batch: ReadyBatch, threads: Vec<Arc<Thread>>) {
-    assert_eq!(
-        batch.count,
-        threads.len(),
-        "ready batch/thread count mismatch"
-    );
-    batch.domain.classes[0].commit_batch(batch.token, threads);
-    batch.domain.wake_one();
-}
-
-pub fn rollback_ready_batch(batch: ReadyBatch) {
-    batch.domain.classes[0].rollback_batch(batch.token, batch.count);
+    /// 将跨调用层交付的线程与同一准入责任绑定；发布入口只接受该 owner。
+    pub fn admit(&mut self, thread: Arc<Thread>) -> AdmittedThread {
+        assert!(
+            core::ptr::eq(thread.process.domain(), self.domain),
+            "thread belongs to another execution domain"
+        );
+        self.admission.admit(thread)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,37 +278,19 @@ fn timers() -> &'static Spinlock<timer_queue::TimerQueue<Arc<crate::task::wait::
     &HART_TIMERS[hart::current().slot()]
 }
 
-/// 等待意图槽取值（HartLocal.park_kind；hart 私有槽无并发）。IPC 两类
-/// 的参数是装箱的内核对象指针（park_arg 携带，发布时回收）。
-const PARK_NONE: usize = 0;
-const PARK_WAIT: usize = 1;
+/// 每 hart 固定的内联等待意图；与期限表同属 Rust 调度状态，不进入 trap 锚布局。
+static HART_WAIT_PLANS: [Spinlock<Option<crate::task::wait::WaitPlan>>; hart::HART_NUM_LIMIT] =
+    [const { Spinlock::new(crate::sync::ranks::LEAF, None) }; hart::HART_NUM_LIMIT];
 
 /// dispatcher 侧登记：把等待意图写入本 hart 槽。此刻**不碰任何全局
-/// 结构**——发布由调度循环在线程离开执行点之后完成（park_publish），
+/// 结构**——发布由调度循环在线程离开执行点之后完成，
 /// 保证「可被唤醒」严格晚于「无容器」，完成方永远见不到仍在本 hart
 /// 执行的线程。
 /// 新对象 ABI 的统一等待意图；计划已在 syscall 入口解析 Handle 并保留授权。
 pub fn park_request_wait(plan: crate::task::wait::WaitPlan) {
-    let me = hart::current();
-    me.park_arg
-        .store(Box::into_raw(Box::new(plan)) as usize, Ordering::Relaxed);
-    me.park_kind.store(PARK_WAIT, Ordering::Relaxed);
-}
-
-/// 调度循环 Park 分支调用：消费意图槽，向本 hart 期限表发布等待并 arm。
-/// 发起 hart 即期限主人（唤醒所有权：立即 arm 自己的 timer）。
-fn park_publish(t: &Arc<Thread>) {
-    let me = hart::current();
-    let kind = me.park_kind.swap(PARK_NONE, Ordering::Relaxed);
-    match kind {
-        PARK_WAIT => {
-            let p = me.park_arg.load(Ordering::Relaxed) as *mut crate::task::wait::WaitPlan;
-            // SAFETY: 指针由 park_request_wait 装箱产生，仅此处回收一次。
-            let plan = unsafe { *Box::from_raw(p) };
-            crate::task::wait::install(t.clone(), plan);
-        }
-        _ => unreachable!("Park outcome must carry a wait intent"),
-    }
+    let mut slot = HART_WAIT_PLANS[hart::current().slot()].lock();
+    assert!(slot.is_none(), "hart wait intent is already occupied");
+    *slot = Some(plan);
 }
 
 pub fn expires_after_ms(timeout_ms: u64) -> u64 {
@@ -428,7 +366,7 @@ fn wake_expired() {
 
 /// 线程入队并按门铃唤醒其所属域的空闲 hart（IPI = 他方请求，见
 /// notes/impls/internals.md）。线程只在所属域的类队列出现。
-pub fn enqueue(t: Arc<Thread>) {
+pub fn enqueue(t: AdmittedThread) {
     let domain = t.process.domain();
     domain.enqueue_fair(t);
     domain.wake_one();
@@ -493,20 +431,23 @@ pub fn run() -> ! {
         }
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         arm_quantum();
-        // ProcessWrite 可经另一 hart 的直映射回填刚分配的可执行页。active
-        // bitmap 当前只服务终止屏障，尚无代码代次，因此每次新 dispatch
-        // 执行 fence.i，确保首次执行及迁移不观察旧 I-cache 内容。
+        // ProcessWrite 可经另一 hart 的直映射回填可执行页；除上面的
+        // execution gate epoch 同步外，每次新 dispatch 还执行本地 fence.i。
         // SAFETY: fence.i 是本 hart 指令流同步，不触碰内存。
         unsafe { asm!("fence.i", options(nostack, preserves_flags)) };
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
         let outcome = unsafe { trap::ret_to_user() };
         me.clear_context();
+        // trap 的终止吸收可能把已登记等待的 Park 改判为 Killed。每个
+        // Switch 出口都先取走意图；Killed 放弃未安装计划，不遗留给下一线程。
+        let wait_plan = HART_WAIT_PLANS[me.slot()].lock().take();
         // 非-Resume 出口的归一（内核 satp + 全量 SFENCE.VMA）已由汇编
         // 出口边界完成：active 位图与后续 teardown 不得在目标地址空间
         // 上进行。
         let slot = me.slot();
         match outcome {
             Outcome::Requeue => {
+                assert!(wait_plan.is_none(), "Requeue outcome carries a wait intent");
                 loop {
                     deferred_work::drain_current();
                     let epochs = t.process.space.epochs();
@@ -536,6 +477,7 @@ pub fn run() -> ! {
                         break;
                     }
                 }
+                drop(wait_plan);
                 reap(t);
             }
             // 已离开执行点，此刻发布等待：完成方可安全触达该线程。
@@ -550,7 +492,8 @@ pub fn run() -> ! {
                         break;
                     }
                 }
-                park_publish(&t);
+                let plan = wait_plan.expect("Park outcome must carry a wait intent");
+                crate::task::wait::install(t, plan);
             }
             Outcome::Resume => unreachable!("Resume never passes through the scheduling loop"),
         }
@@ -569,7 +512,7 @@ fn arm_quantum() {
 
 /// 回收终止线程：先移除执行容器强引用，再向独立 departure state 请求离场。
 /// committed Map 结果义务可延后成员摘除与 DONE，但不保留 Thread/UserContext。
-fn reap(t: Arc<Thread>) {
+fn reap(t: AdmittedThread) {
     // ThreadDeparture 只 weak 引用 Process；成员根可能已经摘除，必须把 core
     // 强持到 departure 完成成员确认。
     let process = t.process.clone();

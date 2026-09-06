@@ -1,6 +1,6 @@
 # 地址空间事务与进程启动发布的纵向重构
 
-> 当前主线处于设计收口阶段；代码实施暂停，多页 Tunnel / Runnel 切片 8/9 不推进。本计划拥有事务失败闭包与启动发布的实施责任；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
+> 当前主线先闭合完整完成链的直接前置，再冻结地址空间事务与启动提交；调度全寿命准入已完成代码迁移及集成验证，其余核心迁移尚未开始。多页 Tunnel / Runnel 切片 8/9 不推进。本计划拥有事务失败闭包与启动发布的实施责任；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
 
 ## 目标与边界
 
@@ -37,7 +37,7 @@
 
 ## 当前实现取证边界
 
-代码准备基线为 `4e62979`；本批仅交付设计与计划文档，不叠加试探性代码修补。本节记录设计输入，不代替原 Review 的目标提交证据；完整故障注入与重构验收仍属后续实施。
+本节记录尚待闭合的设计输入，不代替原 Review 的目标提交证据。已完成前置的实现与测试记录见下节；不得将前置验证当成地址空间事务整体完成。
 
 - ledger 已有消费式阶段类型；内核仍以 `MemoryChangePlan`、`MemoryChangeReservation`、`PreparedMemoryChange`、`PublishedSpaceChange`、`RetiringSpaceChange` 跨调用点编排。问题不是名称层数，而是调用者仍能拆开发布和归还责任。
 - `ReclaimedTableFrames` / `ObjectMapFailure` 携带裸 permits，Running 与 Tunnel 仍分别执行提取、cancel 与 rollback。Tunnel complete 失败的第二次 `take_permits` 当前取得空集合，不能据两次调用就判为实际双 cancel。
@@ -45,16 +45,42 @@
 - retiring object 容量已有去重预留，但 batch-local owner 仍在 Retire 时构造；重复对象、并行批次与最后 live view 消散须一起证明。
 - `OwnedBacking::release_one` 会 remove/insert extents。只在 backing 创建时预留“初始 extent 上限 + 单次 split 上限”，不能覆盖多次部分 Unmap 的累计碎片，也不能表达在途事务已占的增长责任。
 - `commit_shootdown` 接受任意发布闭包；epoch 检查发生在原子增量之后。预算、身份门禁和发布动作尚未成为完整提交包。
+- `TableTree::prepare` 每次仅为单个 translation 的需求预留 `owners` 容量，而 `publish_batch` 顺序发布多个已准备项；前置逐项 reserve 不能证明批次累计增长。该函数还断言批次非空且多项只能是 Map，与 ledger 可产生的 guard-only Unmap（零项）和多 region Unmap/Protect（多项）不匹配。内核 `commit_inner` 在 ledger Commit 后直接调用它；必须整体冻结账本与页表的批次契约，不能按用户场景追加绕过分支。
 - `UnpublishedBound` 显式 rollback 与 Drop 重复终止/摘 Staging/drain 循环；每次 `drain_batch(16)` 有界不意味着外层循环或 Drop 有界。
-- Bootstrap 在 Handle commit 后仍以单独 Job/lifecycle 调用推进，且 `boot.rs` 在 `launch_bootstrap` 返回后调用普通 `sched::enqueue`，没有消费普通 Start 的 Ready reservation。审查边界必须包含 `boot.rs` 与 `sched.rs`。
+- Bootstrap 已在提交前取得统一调度准入，并向 boot 交付带 credit 的线程；Handle/Job/lifecycle 仍分段推进，提交与首次 Ready 之间仍有 syscall 自检。完整 Start 协议的审查边界继续包含 `boot.rs` 与 `sched.rs`。
 
 ### 基线保留与重构约束
 
-代码以已提交的机制为准备基线，后续按完整纵向单元替换，不独立叠加局部容量或析构修补：
+按完整纵向单元替换，不独立叠加局部容量或析构修补：
 
 - `RetiredSpaceResource::View` 携带完整 view owner 的方向保留，纳入统一锁外释放出口。原表达式提取出的 `core` 仍保活对象，因此尚不能把原位置认定为已证实的 Pool/FramePool 锁内退款。
 - `assemble_prepared_backing` 的一次性固定大容量预留不作为最终方案；由每次事务的存量/在途增长证明替换。
 - 已提交的资金化、同步、去重和失败处理机制不整体回退；迁移时直接吸收正确行为并删除被替代的编排。
+
+## 完成交付的直接前置
+
+### 已完成：线程全寿命调度准入
+
+`ready_queue`、Start/Bootstrap/ThreadSpawn、Ready/Running/Waiting 与终止交付已按同一不可复制的执行 owner 迁移。固定 per-hart WaitPlan 槽覆盖全部 Switch 出口；不会因 trap 尾段把 Park 吸收为 Killed 而留下意图。契约由 [`ideas/task.md`](../notes/ideas/task.md) 拥有，实现、容量证明和 API 由 [`impls/task.md`](../notes/impls/task.md) 拥有，完整 Bootstrap gate 仍属单元二。
+
+验证：8 项 host 测试 debug/release、`just check`、`just acceptance`（stress 16/16、release core、sifive_u core）、`virt-hetero`、`virt-nofd` 通过。提交、唤醒、轮转和退款由 allocator 计数探针验证不分配。最终集成日志 `.git/validation/acceptance-ready-final.log`；首次已知 15/16 flake 与意图接管修复前的失败日志均保留，不混作最终通过结果。
+
+### 尚待冻结：所有完成责任的诚实预算与不可失败来源
+
+以下仍在本计划的同一闭包内，不能只修 MemoryChange 的局部尾段；自然序是通用通知/离场交付责任 → MemoryChange 与 Tunnel 退役 → ProcessDrain 完整终段。不是先改纯逻辑 crate 再接 adapter，各前置须与全部实际发布者和消费者一起交付。
+
+| 现状与位置 | 最终责任与收口门 | 验证 |
+|---|---|---|
+| `RetiringSpaceChange::advance` 在退役中填充来源表，permit 仍可能回查 `view_core`；`release_view_region` 查询 live regions | Prepare 为全部 retiring fragment/permit 捕获稳定来源与索引；最后 view owner 的交接独立于后续 live ledger；删除退役时补找来源 | Protect→Unmap、两个 Release 批次反序退役；不出现 view 消散后的查询/析构错误 |
+| 同一 retire unit 含来源扫描、最多 4096 region 扫描及 `retiring_views.clear()` | 每个扫描、owner 摘除/析构都有计费单位或可续进游标；若接受固定结构上限，必须给出完整单步 WCET，不只引用 batch budget | 边界容量、反序批次、最重析构时实际工作与声明预算一致 |
+| `ObjectWaitState::take_completer` 重复从头扫描；MemoryObject/Tunnel/ThreadControl/ProcessControl/Job 同步循环交付 waiter | 所有 waitable object 共用预付、有界的通知交付责任；电平发布与剩余 waiter 责任同时成立；不能为内存对象另造通知尾段 | 混合兴趣、Installing/Deferred、取消竞态、CLOSED 全兴趣匹配；最多 1024 waiter 和每等待最多 64 订阅的真实成本 |
+| `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | 线程出生支付通用 departure completion；结果义务解除只移交已预备责任，成员摘除与通知按预算推进 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
+| `Tunnel::close_detached` 在 REAPABLE 后才分配 sink、规划页表并资金化 | Endpoint/lease 的准入必须支付未来不可避免的退役，或消费已有可复用退役工作区；显式 close 与 detached close 共用最终事务，不以 OOM 重试掩盖收束缺口 | 准入后持续 allocator failure 仍可完成关闭与 CLOSED，无新增 sink 或 funding 来源 |
+| `ProcessDrain` 在返回资源 complete 后于预算外 publish_dead、Job unlink、最多 32 层祖先完成 | Process/Job 收尾进入持久终段，稳定成员凭据与通用通知责任保证进度；Complete 只在责任已完成或不可丢失地交出后返回 | 最小预算、深 Job 链、大量 waiter、管理者交替推进与终态观察 |
+| `sched::run` 在 epoch execution gate 之外仍有每次 dispatch 的无条件 `fence.i` | 冻结 Building 写、首次进入、跨 hart dispatch 和 Running 变更的 instruction epoch 证明；由统一同步协议承担责任后删除附加路径 | 多 hart RX/首次执行/迁移及 release 验证，不以重复 fence 掩盖 epoch 缺口 |
+| `write_drain_result` 的最终 `check_range` 可在业务副作用后绕过 `deliver_output` 的失败政策 | 最终交付统一经过受保护输出边界；初始无副作用验证和提交后交付不能混成同一拒绝出口 | 最终 Drain 批次与输出页 Unmap 竞态，保持统一故障终因与已提交目标状态 |
+
+本表是上述缺口的唯一实施真值；完成一项即删除对应待办并转入长期 notes，不口头延期。
 
 ## 目标结构：供设计冻结审阅
 
@@ -139,7 +165,7 @@ AddressSpace 事务入口
 
 ### 纵向单元一：地址空间事务
 
-一次迁移 `memory_space` 的必要接口、内核 AddressSpace、funding/abort/retire、匿名/object/Building/Tunnel 的全部相关调用点及测试。使用最终接口直接迁移，不先保留旧入口完成独立 crate 里程碑。
+一次迁移 `memory_space` 的必要接口、内核 AddressSpace、funding/abort/retire、匿名/object/Building/Tunnel 的全部相关调用点及测试。设计冻结须先处理上节 Ready 容量前置，证明完成链实际达到不可失败的调用者交付，而不只停在 ledger Complete。使用最终接口直接迁移，不先保留旧入口完成独立 crate 里程碑。
 
 完成门：来源保活、存储预算、epoch/同步、abort 和 Complete 闭合；原 `ReclaimedTableFrames::take_permits`、平行 abandon/complete helpers、任意发布闭包及被替代阶段入口同单元删除。私有 Bound 整体构造与 Start 尚未完成不能被写成这个单元的成果。
 
@@ -163,6 +189,7 @@ AddressSpace 事务入口
 | stale | Validate 后移除来源 view、execution snapshot 改变、Start 并发 Attach/kill/seal | 明确 pre-Commit 错误，不 panic；来源强引用保持到 abort 完成 |
 | 对象退役 | 同对象多 RO/RW/混合 fragment、多对象；不同批次交错；最后 Handle/view 消散 | 每笔 permit 恰一次归还、owner 不重复摘、Seal 不提前也不永久卡住 |
 | 碎片存储 | 同一 backing 连续多次打洞至容量边界，穿过初始预留数量；多个在途变更 | Commit 后 allocator 禁用仍完成；增长额度不重复使用 |
+| 页表批次 | 多项 Map 需要互不相同的新增表页；guard-only 零项；跨不同 region 的 Unmap/Protect | 批次总容量在 Prepare 兑现；所有合法 ledger 计划都有对应可发布形态，Commit 后不因批次形状断言失败 |
 | 构造失败 | 多段 ELF 后段失败、stack/payload/table/Attach/Job/Ready 失败 | staging 环断开；bound tree 正常 drain；无孤立成员/Handle/boot-held charge |
 | 已提交接管 | cookie/Start gate 后杀调用者或目标、Remote ack 延迟/重排、重复门铃 | 责任不丢；ack 前不复用；Complete 前不越过 mandatory/join 屏障 |
 | 有界进展 | drain/retire `budget=1`、最终对象析构、Seal/close 通知 fanout | 每步 work 诚实计费，无隐藏无界循环或普通分配 |

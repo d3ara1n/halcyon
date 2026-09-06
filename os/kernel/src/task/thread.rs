@@ -278,7 +278,10 @@ pub(crate) fn spawn(
     ready
         .try_reserve_exact(1)
         .map_err(|_| SystemCallError::OutOfMemory)?;
-    let ready_batch = crate::sched::reserve_ready_batch(caller.process.domain(), 1)
+    let ready_batch = caller
+        .process
+        .domain()
+        .reserve_ready(1)
         .map_err(|_| SystemCallError::OutOfMemory)?;
 
     let token = super::handle::transaction_token();
@@ -286,7 +289,6 @@ pub(crate) fn spawn(
     let reservation = match table.reserve(1, token) {
         Ok(reservation) => reservation,
         Err(error) => {
-            crate::sched::rollback_ready_batch(ready_batch);
             return Err(super::handle::map_error(error));
         }
     };
@@ -301,7 +303,6 @@ pub(crate) fn spawn(
             .rollback(reservation)
             .expect("spawn reservation must remain owned");
         drop(space);
-        crate::sched::rollback_ready_batch(ready_batch);
         return Err(error.into());
     }
     if let Err(error) = space.validate_initial_context(entry_address, stack_pointer) {
@@ -309,7 +310,6 @@ pub(crate) fn spawn(
             .rollback(reservation)
             .expect("spawn reservation must remain owned");
         drop(space);
-        crate::sched::rollback_ready_batch(ready_batch);
         return Err(map_context_fault(error));
     }
 
@@ -325,7 +325,6 @@ pub(crate) fn spawn(
                 .rollback(reservation)
                 .expect("spawn reservation must remain owned");
             drop(space);
-            crate::sched::rollback_ready_batch(ready_batch);
             return Err(map_attach_fault(error));
         }
     };
@@ -345,7 +344,6 @@ pub(crate) fn spawn(
         drop(table);
         drop(thread);
         drop(staged);
-        crate::sched::rollback_ready_batch(ready_batch);
         let todo = caller.process.lifecycle.request_termination(
             ProcessExitReason::Fault,
             ProcessFaultCode::StoreAccess as i64,
@@ -364,6 +362,6 @@ pub(crate) fn spawn(
     debug_assert!(Arc::ptr_eq(&thread, &staged));
     drop(thread);
     ready.push(staged);
-    crate::sched::commit_ready_batch(ready_batch, ready);
+    ready_batch.publish(ready);
     Ok(())
 }

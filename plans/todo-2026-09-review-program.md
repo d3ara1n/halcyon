@@ -26,6 +26,8 @@
 
 二者共享失败与提交原则，不合并成万能事务框架。基础机制继续保留：ledger 真值、funded owner、PoolBinding、MemoryObject permit、execution gate、Remote 确认链、有界 work debt 与 ProcessDrain。
 
+完成闭包须包含真实交付，不止于 ledger Complete。线程全寿命调度准入及全部等待意图出口已纵向迁移并通过集成验证；通用通知、departure、Tunnel 不可失败退役与 Process/Job 终段预算仍待冻结。现状、验证与自然序只登记在内存事务计划，不新增平行修复计划，也不把单个前置通过视为整体完成。
+
 ### 其它专题
 
 - [`admission-fail-closed`](todo-2026-09-admission-fail-closed.md)：平台/ELF 输入的规范化、checked validation 与 immutable admission。
@@ -53,7 +55,7 @@
 | D-1 P2-D1-03：MappingLease 失败/析构验证 | 内存事务计划，纵向单元一 | 对当前 Tunnel lease 结构复核，不复活历史 MappingLease 类型 |
 | D-2 F-02：启动 reservation 区间 | Admission 计划 | 先核对当前规范化供给机制，已被覆盖的历史路径不重复修复 |
 | D-2 F-05/F-06：ELF entry、PT_INTERP/flags | Admission 计划，ELF 纵向子单元 | runtime parser、audit、launcher 共用 validated image；构造单元二消费它 |
-| D-2 F-07：reservation token | Identity 计划 | Handle/Job/Ready 各容器凭据绑定身份；相关 Start 接线随单元二完成 |
+| D-2 F-07：reservation token | Identity 计划 | Handle/Job 各容器凭据绑定身份；Ready 已由保活容量 core + affine owner 校验来源，无整数 token 待办 |
 | E-1 M3-1：Bound 镜像失败 | 内存事务计划，纵向单元二 | 私有失败驱动与正式 Drain 同源，不隐藏在 Drop 中 |
 | E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | Admission 计划 | canonical admitted 集合与失败广播 |
 | E-2 E2-5-01：RPC reject capability/port | Capability/owner 计划，RPC 接收子单元 | 消费拒绝消息及旧端口，不复用污染状态 |
@@ -73,6 +75,7 @@
 
 ```text
 整体设计：owner / 提交资格 / 失败边界 / 预算 / 验证模型
+    ├─ Ready 全寿命容量（已完成）→ 通用通知/离场交付 → 地址空间与 Drain 完成闭包
     ├─ Identity 策略及所需凭据 ──→ 地址空间纵向单元一
     ├─ EXECUTE/authority ───────→ 对象 RX 联合验收
     ├─ ELF validated image ────→ 构造与启动纵向单元二

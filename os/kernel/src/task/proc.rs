@@ -4262,7 +4262,7 @@ pub struct Thread {
 // SAFETY: UserContext 只在两种互斥状态下被访问：线程在本 hart 执行/
 // 挂起期间（trap 路径与 dispatcher 经执行点独占写）；或线程已无容器
 // （Waiting：发布时序保证完成方只见已离开一切 hart 引用的线程，见
-// sched::park_publish）。其余字段原子或只读。
+// sched::run 的 Park 分支）。其余字段原子或只读。
 unsafe impl Sync for Thread {}
 
 impl Thread {
@@ -4536,7 +4536,7 @@ pub fn launch_bootstrap(
     payload_extent: Option<frame::BootHeldExtent>,
     payload: &[u8],
     handles: Vec<super::handle::ProcessHandleEntry>,
-) -> Result<Arc<Thread>, SpaceError> {
+) -> Result<crate::sched::AdmittedThread, SpaceError> {
     let SpawnedProcess {
         process,
         mut bound,
@@ -4703,6 +4703,16 @@ pub fn launch_bootstrap(
             return Err(SpaceError::BadSegment);
         }
     };
+    let mut ready_batch = match domain.reserve_ready(1) {
+        Ok(batch) => batch,
+        Err(()) => {
+            process.handles.lock().rollback(reservation).expect("launch reservation must remain owned");
+            for handle in handles {
+                super::handle::close_entry_infallible(handle, &process, true);
+            }
+            return Err(SpaceError::NoFrame);
+        }
+    };
     let mut staged = Vec::new();
     if staged.try_reserve_exact(1).is_err() {
         process
@@ -4753,5 +4763,5 @@ pub fn launch_bootstrap(
     process.bind_execution(requirement, domain);
     let thread = staged.pop().expect("bootstrap staging thread missing");
     drop(unpublished.publish());
-    Ok(thread)
+    Ok(ready_batch.admit(thread))
 }

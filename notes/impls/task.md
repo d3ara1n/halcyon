@@ -11,20 +11,26 @@
 ```
 执行点（每 hart 一份，HartLocal）  调度域（共享，boot 冻结）      调度类（策略容器）
 ┌─────────────────────────┐  ┌──────────────────────┐  ┌─────────────────────────┐
-│ current: Option<Thread> │  │ SchedDomain           │◀─│ trait SchedClass         │
+│ owner: AdmittedThread   │  │ SchedDomain           │◀─│ trait SchedClass         │
 │ （调度循环 + idle 循环）  │  │  classes: 优先级序数组 │  │ enqueue / pick /         │
 │ 域归属经 per-slot 域表   │─▶│  idle_mask: 域空闲位图 │  │ has_ready / reserve /    │
-└─────────────────────────┘  └──────────────────────┘  │ commit / rollback        │
+└─────────────────────────┘  └──────────────────────┘  │ publish_batch            │
                                                        └─────────────────────────┘
 ```
 
 - **执行点**：hart 的运行现场（当前线程、trap 锚），见 `internals.md`「tp 寄存器」。调度循环与 idle 循环是执行点的行为。
 - **调度域**：`SchedDomain` 持有优先级序的调度类数组与域内 `idle_mask`。线程经 `process.domain()` 只进入已绑定域的类队列，wake 只向该域 idle hart 发门铃，静默谓词遍历全部域。硬件能力、域划分、D64 eligibility 与绑定冻结由 [`execution-context.md`](execution-context.md) 唯一记录。
-- **调度类**：当前公平类以单锁 FIFO 保存 Ready 线程，并通过 `SchedClass` trait 实现 enqueue/pick/has_ready 与批量 reserve/commit/rollback；Start 在一次队列锁内预留完整线程批次，无法形成前缀预留。
+- **调度类**：公平类以 LEAF 锁保护 `os/ready_queue::ReadyQueue<Arc<Thread>>`，通过 `SchedClass` 实现 enqueue/pick/has_ready 与 reserve_batch/publish_batch。`SchedDomain::reserve_ready` 返回绑定实际类存储的 `ReadyBatch`；Start、Bootstrap、ThreadSpawn 都在不可逆点前取得整批准入，失败不产生前缀发布。
+
+`ready_queue::Admission` 支付整个可调度寿命的存储，未交付 credit 随 Drop 原子退还。`AdmittedThread = Admitted<Arc<Thread>>` 不可 Clone，由值与一个同源 credit 组成；队列只接受该 owner。Running/Waiting 保留 credit，进入 Ready 不重新分配；取消或最终离场才归还。纯逻辑队列以保活的容量 core 校验来源，不使用整数 token 或 marker，取消不反取队列锁，pick 不扫描出生预留。
+
+容量不变量为 `storage.capacity ≥ outstanding ≥ ready.len`，outstanding 含所有已准入线程与尚未交付的出生 credit。独占 reserve 先按全部 outstanding 与本次数量检查溢出并预留实际 VecDeque，成功才增加计数；并发方只能原子退款，快照至多保守多留。队列存储由调度类长期持有并复用高水位，credit 只表示可调度位置责任，不是 CPU 配额或独立 metadata 预算。整批 publish 的工作量随本次线程数变化，不扫描其它 Ready 存量。
+
+`os/ready_queue/tests/admission.rs` 覆盖 OOM、部分取消、错误队列、等待者与新出生并存、FIFO 模型及持 Ready 锁时的远端退款；allocator 计数探针要求发布、轮转、唤醒和退款不发生分配。
 
 时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart TimerQueue 堆顶与量子截止的较近者设置 timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
-ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。lifecycle 已维护 active-hart bitmap，当前用于终止屏障；尚未建立代码代次。调度循环在每次新 dispatch 前执行本 hart `fence.i`，首次执行和迁移都不会观察帧复用前的旧指令缓存。Running process 没有 Building 写入口，Resume 热路径无需重复同步。
+ProcessWrite 可由其它 hart 通过物理直映射填充可执行帧。调度循环先经 `synchronize_local` 和 lifecycle execution gate 复检 AddressSpace 的 translation/instruction epoch，再进入用户态；当前每次新 dispatch 还无条件执行本 hart `fence.i`。epoch 与 active 确认协议见 [`mm.md`](mm.md)，附加 fence 的删除条件由地址空间事务计划统一审计。
 
 ### 单一归属不变量
 
@@ -34,12 +40,12 @@ ProcessWrite 可由其他 hart 通过物理直映射填充新可执行帧。life
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，内嵌 bootstrap Attach 在无并发条件下由 `attach_member` 锁内分配 tid、构造并插入；syscall Attach 则凭已登记 lease 进入 `attach_registered_member`，若终止已在登记后截止，提交仍成功但新线程不再入容器，而是作为终止接管资源在 lifecycle 锁外直接析构。Start 由 `begin_running` 同一临界区整体把现存 Staging 转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域 Ready 槽，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度占位，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，内嵌 bootstrap Attach 在无并发条件下由 `attach_member` 锁内分配 tid、构造并插入；syscall Attach 则凭已登记 lease 进入 `attach_registered_member`，若终止已在登记后截止，提交仍成功但新线程不再入容器，而是作为终止接管资源在 lifecycle 锁外直接析构。Start 由 `begin_running` 同一临界区整体把现存 Staging 转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域全寿命调度准入，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度 owner，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
-- **强引用随容器走**：线程的 Arc 恰由其所在容器持有——就绪队列、执行点调度循环、或等待条目。等待条目强持有等待中的线程；不存在从容器反向到线程的长期指针（进程不回指线程），退出回收的 Drop 链因此能真正释放帧。lifecycle 的 Waiting 记录只持 weak WaitContext（触达取消用），在 park 发布时于 lifecycle 锁内线性化。Commit 前预构造的内核事务 Context 不含 Thread，线程离开执行点后才移入。
-- **发布时序**：「可被唤醒」严格晚于「离开一切 hart 引用」——dispatcher 只把等待意图写入 HartLocal 私有槽，调度循环在 `clear_context` 之后的 Park 分支才安装线程所有权并发布 Waiting。预构造 Context 在此前可以接受 Deferred outcome，但不能取得完成权或触达线程，双容器竞态在结构上不可能。
+- **执行 owner 随容器走**：`AdmittedThread` 由就绪队列、执行点调度循环或等待条目唯一拥有；临时底层 Arc 借用/保活不复制调度准入。等待安装整体移交 owner，不克隆可运行责任。lifecycle 的 Waiting 记录只持 weak WaitContext（触达取消用），在 park 发布时于 lifecycle 锁内线性化。Commit 前预构造的内核事务 Context 不含 Thread，线程离开执行点后才移入。
+- **发布时序**：「可被唤醒」严格晚于「离开 hart 执行点」——dispatcher 把 WaitPlan 移入 `sched::HART_WAIT_PLANS` 的固定内联槽，无装箱；槽按 hart slot 寻址，以 LEAF 锁保护，不进入 HartLocal 的 trap ABI。调度循环在 `clear_context` 后的每个 Switch 出口统一取走意图：Park 在 active 确认后交给 WaitContext；Killed 在 active 确认后放弃未安装计划，再推进 departure；Requeue 要求无意图。这样终止在 trap 尾段吸收 Park 时也不会遗留责任。预构造 Context 在安装前可以接受 Deferred outcome，但不能取得完成权或触达线程。
 - **完成仲裁**：对象命中、Timeout、错误与终止取消竞争唯一 outcome；任务层只依赖“赢家取得线程所有权并负责离场”这一结果。WaitCore、timer token、rejected-park 竞态与订阅清理由 [`ipc.md`](ipc.md) 唯一记录。
 
 ## Job、Building process 与发布
@@ -193,7 +199,7 @@ per-hart 帧。
 
 ### reserve/commit/rollback 协议
 
-Job 成员表/子表、HandleTable 槽位与调度类就绪队列（Start 使用批量 reserve/commit/rollback，域路由按 eligibility 选定目标类）三处的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举/pick 不可见；②单调 token
+Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举不可见；②单调 token
 凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
 不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；
 ④全部在容器锁内完成，无分配失败路径（attach_member 的插入为锁内

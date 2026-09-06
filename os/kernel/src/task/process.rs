@@ -880,8 +880,8 @@ fn start_staged(
             return Err(super::handle::map_error(error));
         }
     }
-    // 就绪容量整批原子预留，失败不留下部分 marker。
-    let ready_batch = match crate::sched::reserve_ready_batch(domain, count) {
+    // 为整个可调度寿命支付存储，失败不增加部分准入责任。
+    let ready_batch = match domain.reserve_ready(count) {
         Ok(batch) => batch,
         Err(()) => {
             thread.process.handles.lock().unpin(pin_token);
@@ -895,7 +895,6 @@ fn start_staged(
     // 窗口。失败则无损 unpin 后回滚就绪预留。
     if let Err(error) = super::job::Job::start_commit_gate(process, count, &mut staged) {
         thread.process.handles.lock().unpin(pin_token);
-        crate::sched::rollback_ready_batch(ready_batch);
         return Err(error);
     }
 
@@ -910,7 +909,7 @@ fn start_staged(
         .commit_pinned_consume(pin_token, builder_handle);
     builder.consume();
     super::handle::close_entry_infallible(builder_entry, &thread.process, false);
-    crate::sched::commit_ready_batch(ready_batch, staged);
+    ready_batch.publish(staged);
     Ok(())
 }
 
