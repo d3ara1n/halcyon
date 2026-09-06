@@ -1152,22 +1152,14 @@ impl RetiringSpaceChange {
                     }
                 }
                 RegionKindView::Mapping {
-                    backing: BackingView::Object { object, .. },
+                    backing: BackingView::Object { object: _, .. },
                     ..
                 } => {
                     // 一个事务可能产生同一对象的多个 retiring fragment；owner 只由
                     // batch-local 槽位保存一次，避免第二片重复摘除并触发 panic。
-                    if fragment.backing_retire == BackingRetire::Release {
-                        let index = self
-                            .retiring_views
-                            .iter()
-                            .position(|view| view.core.identity() == object)
-                            .expect("retiring object source was not frozen");
-                        if self.retiring_views[index]._owner.is_none() {
-                            let owner = space.lock().release_view_region(object);
-                            self.retiring_views[index]._owner = owner;
-                        }
-                    }
+                    // owner 交接延迟到本批 ledger Complete 后统一决定。多个已发布
+                    // 批次可逆序退役；在 fragment 步骤中摘 owner 会让后续批次失去
+                    // 唯一交接点。core 来源已在 Commit 冻结，因而这里无需回查 live 表。
                     // object-owned lease 还要推进对象侧生命周期；进程自有 view 无 sink。
                     if let Some(retire) = retire {
                         retire.retire_fragment(fragment);
@@ -1204,7 +1196,15 @@ impl RetiringSpaceChange {
             .ledger
             .take()
             .expect("Retiring memory change completed twice");
-        space.lock().complete_retiring_change(ledger, &self.batch);
+        {
+            let mut space = space.lock();
+            space.complete_retiring_change(ledger, &self.batch);
+            for view in &mut self.retiring_views {
+                if view._owner.is_none() {
+                    view._owner = space.release_view_region(view.core.identity());
+                }
+            }
+        }
         // 全部 permit 已归还，交出的 owner 此刻可以析构（可能归还对象 backing 与
         // charge，因此必须已在 AddressSpace 锁外）。
         self.retiring_views.clear();
