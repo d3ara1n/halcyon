@@ -1165,7 +1165,7 @@ impl RetiringSpaceChange {
                             .expect("retiring object source was not frozen");
                         if self.retiring_views[index]._owner.is_none() {
                             let owner = space.lock().release_view_region(object);
-                            self.retiring_views[index]._owner = owner._owner;
+                            self.retiring_views[index]._owner = owner;
                         }
                     }
                     // object-owned lease 还要推进对象侧生命周期；进程自有 view 无 sink。
@@ -3152,11 +3152,12 @@ impl BoundAddressSpace {
     /// 由调用者在锁外与本批 WritePermit 一并收束。
     ///
     /// 「是否仍有引用」直接问账本：区域切割与合并都只改变账本，owner 不另记计数。
-    fn release_view_region(&mut self, object: ObjectId) -> RetiringObjectView {
-        let index = self
-            .views
-            .binary_search_by_key(&object, |view| view.object)
-            .expect("retiring object fragment lost its view owner");
+    fn release_view_region(&mut self, object: ObjectId) -> Option<ObjectViewOwner> {
+        let Ok(index) = self.views.binary_search_by_key(&object, |view| view.object) else {
+            // 另一个已发布退役批次可能已经交出最后一个 owner；本批次持有的
+            // RetiringObjectView::core 足以归还自己的 permit，不得跨批次回查或 panic。
+            return None;
+        };
         let referenced = self.ledger.as_ref().is_some_and(|ledger| {
             ledger.regions().any(|region| {
                 matches!(
@@ -3169,16 +3170,9 @@ impl BoundAddressSpace {
             })
         });
         if referenced {
-            return RetiringObjectView {
-                core: Arc::clone(&self.views[index].core),
-                _owner: None,
-            };
+            return None;
         }
-        let owner = self.views.remove(index);
-        RetiringObjectView {
-            core: Arc::clone(&owner.core),
-            _owner: Some(owner),
-        }
+        Some(self.views.remove(index))
     }
 
     /// 供退役路径在锁外把 WritePermit 归还来源对象。
@@ -3862,7 +3856,10 @@ impl BoundAddressSpace {
                             ..
                         } = fragment.kind
                         {
-                            let core = self.release_view_region(object).core;
+                            let core = self
+                                .release_view_region(object)
+                                .expect("draining object view lost its owner")
+                                .core;
                             self.pending_free = Some(RetiredSpaceResource::View { core, permit });
                             let (used, done) = self.step_pending(budget - work);
                             work += used;
