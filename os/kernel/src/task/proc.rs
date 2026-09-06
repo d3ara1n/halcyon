@@ -1158,20 +1158,14 @@ impl RetiringSpaceChange {
                     // 一个事务可能产生同一对象的多个 retiring fragment；owner 只由
                     // batch-local 槽位保存一次，避免第二片重复摘除并触发 panic。
                     if fragment.backing_retire == BackingRetire::Release {
-                        let existing_index = self
+                        let index = self
                             .retiring_views
                             .iter()
-                            .position(|view| view.core.identity() == object);
-                        if let Some(index) = existing_index {
-                            if self.retiring_views[index]._owner.is_none() {
-                                let RetiringObjectView { core, _owner } =
-                                    space.lock().release_view_region(object);
-                                self.retiring_views[index]._owner = _owner;
-                                drop(core);
-                            }
-                        } else {
-                            self.retiring_views
-                                .push(space.lock().release_view_region(object));
+                            .position(|view| view.core.identity() == object)
+                            .expect("retiring object source was not frozen");
+                        if self.retiring_views[index]._owner.is_none() {
+                            let owner = space.lock().release_view_region(object);
+                            self.retiring_views[index]._owner = owner._owner;
                         }
                     }
                     // object-owned lease 还要推进对象侧生命周期；进程自有 view 无 sink。
@@ -1193,14 +1187,14 @@ impl RetiringSpaceChange {
         if let Some(permit) = self.batch.pop_permit() {
             // 对象状态锁秩低于 AddressSpace：先取得强引用，解锁后再归还 permit。
             let object = permit.object();
-            let core = match self
-                .retiring_views
-                .iter()
-                .find(|view| view.core.identity() == object)
-            {
-                Some(view) => Arc::clone(&view.core),
-                None => space.lock().view_core(object),
-            };
+            let core = Arc::clone(
+                &self
+                    .retiring_views
+                    .iter()
+                    .find(|view| view.core.identity() == object)
+                    .expect("retiring permit source was not frozen")
+                    .core,
+            );
             core.retire_write(permit);
             return false;
         }
@@ -3091,9 +3085,34 @@ impl BoundAddressSpace {
             ledger,
             tables,
             backing_permits,
-            retiring_views,
+            mut retiring_views,
         } = published;
         let synchronized = self.ledger().synchronize(ledger);
+        // 来源 core 在 begin_retire 移走片段/permit 前一次性冻结。之后只按这张
+        // 批次表归还，禁止跨批次重新查询 live view。
+        for fragment in synchronized.retiring_fragments() {
+            let RegionKindView::Mapping {
+                backing: BackingView::Object { object, .. },
+                ..
+            } = fragment.kind
+            else {
+                continue;
+            };
+            if retiring_views
+                .iter()
+                .any(|view| view.core.identity() == object)
+            {
+                continue;
+            }
+            let index = self
+                .views
+                .binary_search_by_key(&object, |view| view.object)
+                .expect("retiring fragment lost its view source");
+            retiring_views.push(RetiringObjectView {
+                core: Arc::clone(&self.views[index].core),
+                _owner: None,
+            });
+        }
         let (retiring, batch) = self.ledger().begin_retire(synchronized);
         RetiringSpaceChange {
             ledger: Some(retiring),

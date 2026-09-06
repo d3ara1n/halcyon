@@ -551,6 +551,10 @@ macro_rules! change_token {
                 &self.0.translations
             }
 
+            pub fn retiring_fragments(&self) -> &[RetiringFragment] {
+                &self.0.retiring
+            }
+
             pub const fn map_result(&self) -> Option<MapResultLayout> {
                 self.0.result_layout
             }
@@ -585,6 +589,10 @@ impl RetireBatch {
 
     pub fn pop_permit(&mut self) -> Option<WritePermit> {
         self.permits.pop()
+    }
+
+    pub fn permits(&self) -> &[WritePermit] {
+        &self.permits
     }
 
     pub fn is_empty(&self) -> bool {
