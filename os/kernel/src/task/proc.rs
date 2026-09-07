@@ -416,6 +416,7 @@ pub(crate) struct RetiringSpaceChange {
     /// Commit 前已按对象去重并预留容量；Commit 后只消费既有槽位。
     retiring_views: Vec<RetiringObjectView>,
     tables_complete: bool,
+    ledger_complete: bool,
 }
 
 pub(crate) struct PublishedSpaceChange {
@@ -1193,22 +1194,29 @@ impl RetiringSpaceChange {
         }
 
         assert!(self.batch.is_empty());
-        let ledger = self
-            .ledger
-            .take()
-            .expect("Retiring memory change completed twice");
-        {
-            let mut space = space.lock();
-            space.complete_retiring_change(ledger, &self.batch);
-            for view in &mut self.retiring_views {
-                if view._owner.is_none() {
-                    view._owner = space.release_view_region(view.object);
+        if !self.ledger_complete {
+            let ledger = self
+                .ledger
+                .take()
+                .expect("Retiring memory change completed twice");
+            {
+                let mut space = space.lock();
+                space.complete_retiring_change(ledger, &self.batch);
+                for view in &mut self.retiring_views {
+                    if view._owner.is_none() {
+                        view._owner = space.release_view_region(view.object);
+                    }
                 }
             }
+            self.ledger_complete = true;
+            return false;
         }
-        // 全部 permit 已归还，交出的 owner 此刻可以析构（可能归还对象 backing 与
-        // charge，因此必须已在 AddressSpace 锁外）。
-        self.retiring_views.clear();
+        // 每次只析构一个交出的 view owner；其强引用可能归还对象 backing
+        // 与 charge，不能把整批析构隐藏在一个 retire step 内。
+        if let Some(view) = self.retiring_views.pop() {
+            drop(view);
+            return false;
+        }
         if let Some(retire) = retire {
             retire.finish();
         }
@@ -3120,6 +3128,7 @@ impl BoundAddressSpace {
             backing_permits,
             retiring_views,
             tables_complete: false,
+            ledger_complete: false,
         }
     }
 
@@ -3229,11 +3238,13 @@ impl BoundAddressSpace {
             backing_permits,
             retiring_views,
             tables_complete,
+            ledger_complete,
         } = change;
         debug_assert!(backing.is_none());
         debug_assert!(backing_permits.is_empty());
         debug_assert!(retiring_views.is_empty());
         debug_assert!(!tables_complete);
+        debug_assert!(!ledger_complete);
         self.complete_retiring_change(ledger.expect("empty memory change completed twice"), &batch);
         tables
     }
