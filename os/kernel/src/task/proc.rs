@@ -4065,6 +4065,8 @@ pub struct Process {
     /// ProcessStart 提交点一次性冻结的执行绑定：非零域编号与执行需求；
     /// 0 唯一表示尚未绑定，避免 Base64 与哨兵重合。
     execution: AtomicUsize,
+    /// Job 成员提交后置位；未发布 Bound 的失败收束不得尝试摘除不存在的成员。
+    job_member_committed: AtomicBool,
 }
 
 impl Drop for Process {
@@ -4115,6 +4117,7 @@ impl Process {
                 },
             ),
             execution: AtomicUsize::new(0),
+            job_member_committed: AtomicBool::new(false),
         })
     }
 
@@ -4222,6 +4225,13 @@ impl Process {
             .and_then(alloc::sync::Weak::upgrade)
     }
 
+    pub(crate) fn mark_job_member_committed(&self) {
+        assert!(
+            !self.job_member_committed.swap(true, Ordering::AcqRel),
+            "process Job membership committed twice"
+        );
+    }
+
     /// 取存活 ProcessControl shell；已消散则从 core 铸造新 shell，并在
     /// 铸造点重放已达成的电平——派生兑底由此接上 drain 入口。单一 shell
     /// 身份：铸造在 control 槽锁内完成，并发派生只会得到同一对象
@@ -4290,7 +4300,7 @@ impl Process {
                             control.publish_dead(self.pid, self.parent, reason, code);
                         }
                         self.lifecycle.mark_dead();
-                        let next = if self.control().is_some() {
+                        let next = if self.job_member_committed.load(Ordering::Acquire) {
                             self.job()
                                 .remove_member(self.pid)
                                 .map(DrainFinalization::PropagateJob)
@@ -4924,6 +4934,7 @@ pub fn launch_bootstrap(
         .lock()
         .commit(reservation, handles)
         .expect("launch reservation count matches entries");
+    process.mark_job_member_committed();
     job.commit_member(member, process.clone());
     process
         .lifecycle
