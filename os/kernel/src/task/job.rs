@@ -130,11 +130,14 @@ impl CompletionCursor {
         };
         let parent_completed = {
             let mut state = parent.state.lock();
-            if let Some(index) = state.children.iter().position(
-                |(jid, entry)| matches!(entry, ChildEntry::Job(_) if *jid == self.child.jid),
-            ) {
-                state.children.remove(index);
-            }
+            let index = state
+                .children
+                .iter()
+                .position(
+                    |(jid, entry)| matches!(entry, ChildEntry::Job(_) if *jid == self.child.jid),
+                )
+                .expect("job child disappeared before ancestor removal");
+            state.children.remove(index);
             state.complete_if_ready()
         };
         if !parent_completed {
@@ -468,13 +471,12 @@ impl Job {
     pub(crate) fn remove_member(self: &Arc<Self>, pid: Pid) -> Option<CompletionCursor> {
         let completed = {
             let mut state = self.state.lock();
-            if let Some(index) = state
+            let index = state
                 .members
                 .iter()
                 .position(|(id, entry)| matches!(entry, MemberEntry::Process(_) if *id == pid))
-            {
-                state.members.remove(index);
-            }
+                .expect("job process member disappeared before removal");
+            state.members.remove(index);
             state.complete_if_ready()
         };
         completed.then(|| CompletionCursor::new(self.clone()))
