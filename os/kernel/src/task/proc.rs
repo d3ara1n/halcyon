@@ -4240,17 +4240,19 @@ impl Process {
             if let Some(finalization) = finalization {
                 match finalization {
                     DrainFinalization::PublishDead => {
-                        let control = self
-                            .control()
-                            .expect("reapable process must retain a control shell");
                         let (_state, reason, code) = self.lifecycle.snapshot();
-                        control.publish_dead(self.pid, self.parent, reason, code);
+                        if let Some(control) = self.control() {
+                            control.publish_dead(self.pid, self.parent, reason, code);
+                        }
                         self.lifecycle.mark_dead();
-                        let next = self
-                            .job()
-                            .remove_member(self.pid)
-                            .map(DrainFinalization::PropagateJob)
-                            .unwrap_or(DrainFinalization::Done);
+                        let next = if self.control().is_some() {
+                            self.job()
+                                .remove_member(self.pid)
+                                .map(DrainFinalization::PropagateJob)
+                                .unwrap_or(DrainFinalization::Done)
+                        } else {
+                            DrainFinalization::Done
+                        };
                         self.drain_state.lock().finalization = Some(next);
                     }
                     DrainFinalization::PropagateJob(mut cursor) => {
@@ -4263,6 +4265,9 @@ impl Process {
                     }
                     DrainFinalization::Done => {
                         self.drain_state.lock().finalization = Some(DrainFinalization::Done);
+                        if let Some(control) = self.control() {
+                            control.release_drain_owner();
+                        }
                         return (work, true);
                     }
                 }

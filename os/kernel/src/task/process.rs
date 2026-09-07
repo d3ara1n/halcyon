@@ -156,6 +156,8 @@ struct DeadSnapshot {
 struct ControlState {
     wait: ObjectWaitState,
     core: Weak<Process>,
+    /// REAPABLE 后保活 ProcessDrain 的终段游标；在最终 Done 才释放。
+    drain_owner: Option<Arc<Process>>,
     dead: Option<DeadSnapshot>,
 }
 
@@ -177,6 +179,7 @@ impl ProcessControl {
                 ControlState {
                     wait: ObjectWaitState::new(ObjectSignals::NONE),
                     core: Arc::downgrade(core),
+                    drain_owner: None,
                     dead: None,
                 },
             ),
@@ -228,6 +231,14 @@ impl ProcessControl {
         {
             let mut state = self.state.lock();
             if state.dead.is_none() {
+                if state.drain_owner.is_none() {
+                    state.drain_owner = Some(
+                        state
+                            .core
+                            .upgrade()
+                            .expect("REAPABLE control must retain its process core"),
+                    );
+                }
                 state
                     .wait
                     .update(ObjectSignals::NONE, ObjectSignals::REAPABLE);
@@ -271,6 +282,10 @@ impl ProcessControl {
     /// shell 终态是否已冻结。
     pub fn is_dead(&self) -> bool {
         self.state.lock().dead.is_some()
+    }
+
+    pub(crate) fn release_drain_owner(&self) {
+        self.state.lock().drain_owner.take();
     }
 }
 
@@ -1047,10 +1062,7 @@ pub fn drain(
     let Some(process) = control.core().upgrade() else {
         return write_drain_result(thread, output, dead_result());
     };
-    if control.is_dead() {
-        return write_drain_result(thread, output, dead_result());
-    }
-    if !control.signals().contains(ObjectSignals::REAPABLE) {
+    if !control.is_dead() && !control.signals().contains(ObjectSignals::REAPABLE) {
         return Err(SystemCallError::ObjectNotAvailable);
     }
     let Some(_gate) = process.drain_gate.try_lock() else {
