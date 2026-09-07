@@ -588,7 +588,11 @@ pub(crate) fn drain_waiters(wait: &Spinlock<ObjectWaitState>, budget: usize) -> 
     debug_assert!(budget > 0);
     let mut used = 0;
     while used < budget {
-        match wait.lock().advance_waiter() {
+        let advance = {
+            let mut held = wait.lock();
+            held.advance_waiter()
+        };
+        match advance {
             WaitAdvance::Progress => used += 1,
             WaitAdvance::Complete(context) => {
                 finish_offered(context);
