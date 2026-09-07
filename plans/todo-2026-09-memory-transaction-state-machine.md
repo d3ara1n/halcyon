@@ -77,14 +77,14 @@
 
 | 现状与位置 | 最终责任与收口门 | 验证 |
 |---|---|---|
-| `RetiringSpaceChange::advance` 在退役中填充来源表，permit 仍可能回查 `view_core`；`release_view_region` 查询 live regions | Prepare 为全部 retiring fragment/permit 捕获稳定来源与索引；最后 view owner 的交接独立于后续 live ledger；删除退役时补找来源 | Protect→Unmap、两个 Release 批次反序退役；不出现 view 消散后的查询/析构错误 |
-| 同一 retire unit 含来源扫描、最多 4096 region 扫描及 `retiring_views.clear()` | 每个扫描、owner 摘除/析构都有计费单位或可续进游标；若接受固定结构上限，必须给出完整单步 WCET，不只引用 batch budget | 边界容量、反序批次、最重析构时实际工作与声明预算一致 |
+| `RetiringSpaceChange::advance` 在退役中填充来源表，permit 仍可能回查 `view_core` | Commit 已为 retiring fragments 冻结 ObjectId/core 来源；permit 只使用批次表，owner 交接延后到 ledger 完成，逆序批次不再依赖跨批次 live 查询 | Protect→Unmap、两个 Release 批次反序退役；QEMU core/stress 已通过；仍需补 host 级反序模型测试 |
+| 同一 retire unit 含来源扫描、最多 4096 region 扫描及 `retiring_views.clear()` | ledger Complete 与每个 view owner 析构已拆成独立推进步骤；来源扫描在 Commit 冻结。剩余 live-region 判定仍是结构化有界扫描，需继续建立明确容量/游标证明 | 边界容量、反序批次、最重析构时实际工作与声明预算一致 |
 | `Notification::signal`、`Endpoint::set_signals` 在 update 后解锁，finish_waiters 重取锁；消费者可在间隙清位 | 对象发布与候选快照捕获在同一临界段，不把“同一把锁”误当“同一临界段”；后续清位不抹掉候选，也不合并不同更新的 observed | 所有可清除电平的 set→clear；尤其 Notification signal/take 与 Tunnel notify/ack |
 | `WaitContext::Registration` 弱持观察对象，Waiting 成员也仅弱持 Context；对象队列是部分等待的唯一强根 | Waiting 执行责任由调用方生命周期持有，注册强持观察授权，对象订阅弱指 Context；完成/取消显式切断各边，不能由最后 Handle 消散暗中丢掉线程 | 无限等待时关闭最后一个目标 control Handle，随后目标完成及调用方 kill，均无孤儿 Waiting/Exiting |
 | `ObjectWaitState::take_completer` 原先由每个对象同步循环；现已接入 `notify_work::WorkDebts`，每订阅预付槽并按 16/4 推进 | 所有 waitable object 共用候选快照、固定槽与 drain trait；剩余 offer/注销责任可重排，不为内存对象另造通知尾段 | 混合兴趣、Installing/Deferred、取消竞态、CLOSED 全兴趣匹配；槽耗尽 fail closed；最多 1024 waiter 和每等待最多 64 订阅的完整成本 |
-| `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | 以稳定成员凭据和固定成本通知消除隐式动态工作；仍需异步的离场责任由出生时预付 owner 接管。最终选择须服从完整 primitive 上界，不机械增加状态机 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
-| `Tunnel::close_detached` 在 REAPABLE 后才分配 sink、规划页表并资金化 | Endpoint/lease 的准入必须支付未来不可避免的退役，或消费已有可复用退役工作区；显式 close 与 detached close 共用最终事务，不以 OOM 重试掩盖收束缺口 | 准入后持续 allocator failure 仍可完成关闭与 CLOSED，无新增 sink 或 funding 来源 |
-| `ProcessDrain` 在返回资源 complete 后于预算外 publish_dead、Job unlink、最多 32 层祖先完成 | Process/Job 收尾进入持久终段，稳定成员凭据与通用通知责任保证进度；Complete 只在责任已完成或不可丢失地交出后返回 | 最小预算、深 Job 链、大量 waiter、管理者交替推进与终态观察 |
+| `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | MemoryChange 完成后已拆为 mandatory、result obligation、WaitContext 三个有界终段步骤；ThreadDeparture 仍通过 affine Drop 触发成员离场，需继续将 Job/Departure 宽度成本纳入正式责任链 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
+| `Tunnel::close_detached` 在 REAPABLE 后才分配 sink、规划页表并资金化 | Endpoint 创建时预付显式 close 与 detached close sink；close 路径消费既有 sink，显式/ detached 共用 MemoryChange retire。事务工作区与页表 funding 仍需进一步证明为 REAPABLE 后不可失败 | 准入后持续 allocator failure 仍可完成关闭与 CLOSED，无新增 sink 或 funding 来源 |
+| `ProcessDrain` 在返回资源 complete 后于预算外 publish_dead、Job unlink、最多 32 层祖先完成 | ProcessDrain 已持久化 PublishDead/PropagateJob/Done；REAPABLE 终段 owner 保活 Process 跨批次，Dead 快径仍受 drain_gate；Job 摘除缺失条目改为显式失败。Job 宽度 memmove 与稳定子项凭据仍未完成 | 最小预算、深 Job 链、大量 waiter、管理者交替推进与终态观察 |
 | `sched::run` 在 epoch execution gate 之外仍有每次 dispatch 的无条件 `fence.i` | 冻结 Building 写、首次进入、跨 hart dispatch 和 Running 变更的 instruction epoch 证明；由统一同步协议承担责任后删除附加路径 | 多 hart RX/首次执行/迁移及 release 验证，不以重复 fence 掩盖 epoch 缺口 |
 | `write_drain_result` 的最终 `check_range` 可在业务副作用后绕过 `deliver_output` 的失败政策 | 最终交付统一经过受保护输出边界；初始无副作用验证和提交后交付不能混成同一拒绝出口 | 最终 Drain 批次与输出页 Unmap 竞态，保持统一故障终因与已提交目标状态 |
 
