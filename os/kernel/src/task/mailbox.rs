@@ -262,7 +262,11 @@ impl KernelObject for Mailbox {
     fn drain_waiters(&self, budget: usize) -> (usize, bool) {
         let mut used = 0;
         while used < budget {
-            match self.state.lock().wait.advance_waiter() {
+            let advance = {
+                let mut state = self.state.lock();
+                state.wait.advance_waiter()
+            };
+            match advance {
                 super::object::WaitAdvance::Progress => used += 1,
                 super::object::WaitAdvance::Complete(context) => {
                     super::wait::finish_offered(context);
