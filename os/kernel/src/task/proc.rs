@@ -373,6 +373,7 @@ impl PreparedObjectView {
 /// 只在账本已无该对象区域时交出，它必须活到本批 permit 全部回到对象状态机之后才能
 /// 析构，否则最后一个引用可能先消散、permit 失去归还目标。
 struct RetiringObjectView {
+    object: ObjectId,
     core: Arc<super::memory_object::MemoryObjectCore>,
     _owner: Option<ObjectViewOwner>,
 }
@@ -1183,7 +1184,7 @@ impl RetiringSpaceChange {
                 &self
                     .retiring_views
                     .iter()
-                    .find(|view| view.core.identity() == object)
+                    .find(|view| view.object == object)
                     .expect("retiring permit source was not frozen")
                     .core,
             );
@@ -1201,7 +1202,7 @@ impl RetiringSpaceChange {
             space.complete_retiring_change(ledger, &self.batch);
             for view in &mut self.retiring_views {
                 if view._owner.is_none() {
-                    view._owner = space.release_view_region(view.core.identity());
+                    view._owner = space.release_view_region(view.object);
                 }
             }
         }
@@ -2891,10 +2892,7 @@ impl BoundAddressSpace {
             else {
                 continue;
             };
-            if retiring_views
-                .iter()
-                .any(|view| view.core.identity() == object)
-            {
+            if retiring_views.iter().any(|view| view.object == object) {
                 continue;
             }
             let index = self
@@ -2902,6 +2900,7 @@ impl BoundAddressSpace {
                 .binary_search_by_key(&object, |view| view.object)
                 .expect("committed retiring fragment lost its view source");
             retiring_views.push(RetiringObjectView {
+                object,
                 core: Arc::clone(&self.views[index].core),
                 _owner: None,
             });
