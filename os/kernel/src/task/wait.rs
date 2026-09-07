@@ -329,8 +329,12 @@ impl WaitContext {
 
     fn finish(self: &Arc<Self>, outcome: WaitOutcome) {
         self.close_timeout_registration();
-        // 先切断 WaitContext → Thread，再触碰任一对象锁。
-        let thread = self.thread.lock().take();
+        // 先切断 WaitContext → Thread，再触碰任一对象锁；显式结束 guard
+        // 生命周期，避免把 WAIT_CONTEXT 锁带入对象取消路径。
+        let thread = {
+            let mut held = self.thread.lock();
+            held.take()
+        };
         self.cleanup();
 
         if let Some(thread) = thread {
