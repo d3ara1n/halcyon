@@ -1285,7 +1285,11 @@ impl MemoryChangeCompletion {
         let mut change = self.retiring.lock().take();
         let mut used = 0;
         while used < budget {
-            if let Some(stage) = self.finalization.lock().take() {
+            let stage = {
+                let mut finalization = self.finalization.lock();
+                finalization.take()
+            };
+            if let Some(stage) = stage {
                 used += 1;
                 match stage {
                     CompletionFinalization::PublishMandatory => {
@@ -1294,22 +1298,25 @@ impl MemoryChangeCompletion {
                         {
                             control.publish_reapable();
                         }
-                        self.finalization
-                            .lock()
-                            .replace(CompletionFinalization::ReleaseResult);
+                        {
+                            let mut finalization = self.finalization.lock();
+                            finalization.replace(CompletionFinalization::ReleaseResult);
+                        }
                     }
                     CompletionFinalization::ReleaseResult => {
                         let result_obligation = self.result_obligation.lock().take();
                         drop(result_obligation);
-                        self.finalization
-                            .lock()
-                            .replace(CompletionFinalization::FinishWaiter);
+                        {
+                            let mut finalization = self.finalization.lock();
+                            finalization.replace(CompletionFinalization::FinishWaiter);
+                        }
                     }
                     CompletionFinalization::FinishWaiter => {
                         self.waiter.clone().complete_kernel();
-                        self.finalization
-                            .lock()
-                            .replace(CompletionFinalization::Done);
+                        {
+                            let mut finalization = self.finalization.lock();
+                            finalization.replace(CompletionFinalization::Done);
+                        }
                     }
                     CompletionFinalization::Done => return (used, true),
                 }
@@ -1323,9 +1330,10 @@ impl MemoryChangeCompletion {
             };
             used += 1;
             if completed {
-                self.finalization
-                    .lock()
-                    .replace(CompletionFinalization::PublishMandatory);
+                {
+                    let mut finalization = self.finalization.lock();
+                    finalization.replace(CompletionFinalization::PublishMandatory);
+                }
                 change = None;
             }
         }
