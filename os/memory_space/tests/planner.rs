@@ -3,9 +3,9 @@
 use memory_space::{
     AddressRange, AllocationKey, AnonymousClass, BackingId, BackingView, ChangeError,
     ExecutableState, FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest,
-    MemoryObjectState, MemorySpace, ObjectError, ObjectId, PAGE_SIZE, PageRange, ProtectRequest,
-    Protection, RangeError, RegionKindView, RegionOwner, SealOutcome, TranslationIntent,
-    UnmapRequest, UserWriteLeaseRequest, ValidatedChange,
+    MemoryObjectState, MemorySpace, ObjectError, ObjectId, ObjectRegionDelta, PAGE_SIZE, PageRange,
+    ProtectRequest, Protection, RangeError, RegionKindView, RegionOwner, SealOutcome,
+    TranslationIntent, UnmapRequest, UserWriteLeaseRequest, ValidatedChange,
 };
 
 const BASE: usize = 0x1000_0000;
@@ -736,7 +736,10 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
         memory_space::BackingRetire::Release
     );
     let permit = batch.pop_permit().expect("write permit must retire");
-    assert!(object.retire_write(permit), "last permit retire must publish the seal");
+    assert!(
+        object.retire_write(permit),
+        "last permit retire must publish the seal"
+    );
     assert!(batch.is_empty());
     let retired = space.finish_retire(retiring, &batch);
     assert_eq!(object.state(), ExecutableState::Executable);
@@ -862,6 +865,14 @@ fn object_view_offsets_follow_exact_middle_split() {
         })
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
+    assert_eq!(
+        prepared.object_region_deltas(),
+        &[ObjectRegionDelta {
+            object: object_id,
+            retiring: 0,
+            replacement: 1,
+        }]
+    );
     complete_prepared(&mut space, prepared);
     let cut = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
     let validated = space
@@ -871,6 +882,14 @@ fn object_view_offsets_follow_exact_middle_split() {
         })
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
+    assert_eq!(
+        prepared.object_region_deltas(),
+        &[ObjectRegionDelta {
+            object: object_id,
+            retiring: 1,
+            replacement: 2,
+        }]
+    );
     let batch = complete_prepared(&mut space, prepared);
     let regions: Vec<_> = space.regions().collect();
     assert_eq!(regions.len(), 2);

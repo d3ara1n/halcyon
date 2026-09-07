@@ -236,6 +236,11 @@ struct Registration {
     id: u64,
 }
 
+struct FinishState {
+    outcome: WaitOutcome,
+    delivered: bool,
+}
+
 /// 一次 Waiting 的唯一线程所有者和完成仲裁点。
 pub struct WaitContext {
     core: WaitCore<WaitOutcome>,
@@ -244,6 +249,8 @@ pub struct WaitContext {
     /// 原子注册状态：未登记、稳定 token 或 Closed。
     timeout_registration: TimeoutRegistration,
     action: WaitAction,
+    finish_reservation: Spinlock<Option<super::notify_work::FinishReservation>>,
+    finish_state: Spinlock<Option<FinishState>>,
     _memory_metadata: Option<super::resources::MemoryWaitPermit>,
 }
 
@@ -257,12 +264,16 @@ impl WaitContext {
         registrations
             .try_reserve(registration_capacity)
             .map_err(|_| SystemCallError::OutOfMemory)?;
+        let finish_reservation =
+            super::notify_work::reserve_finish().map_err(|_| SystemCallError::OutOfMemory)?;
         Arc::try_new(Self {
             core: WaitCore::new(),
             thread: Spinlock::new(crate::sync::ranks::LEAF, None),
             registrations: Spinlock::new(crate::sync::ranks::LEAF, registrations),
             timeout_registration: TimeoutRegistration::new(),
             action,
+            finish_reservation: Spinlock::new(crate::sync::ranks::LEAF, Some(finish_reservation)),
+            finish_state: Spinlock::new(crate::sync::ranks::LEAF, None),
             _memory_metadata: memory_metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
@@ -317,39 +328,56 @@ impl WaitContext {
         registrations.push(Registration { object, id });
     }
 
-    fn cleanup(&self) {
-        let registrations = {
-            let mut held = self.registrations.lock();
-            core::mem::take(&mut *held)
-        };
-        for registration in registrations {
-            registration.object.unsubscribe(registration.id);
-        }
+    pub(crate) fn begin_finish(&self, outcome: WaitOutcome) {
+        self.close_timeout_registration();
+        let previous = self.finish_state.lock().replace(FinishState {
+            outcome,
+            delivered: false,
+        });
+        assert!(
+            previous.is_none(),
+            "wait context completion installed twice"
+        );
     }
 
-    fn finish(self: &Arc<Self>, outcome: WaitOutcome) {
-        self.close_timeout_registration();
-        // 先切断 WaitContext → Thread，再触碰任一对象锁；显式结束 guard
-        // 生命周期，避免把 WAIT_CONTEXT 锁带入对象取消路径。
-        let thread = {
-            let mut held = self.thread.lock();
-            held.take()
-        };
-        self.cleanup();
-
-        if let Some(thread) = thread {
-            if !matches!(outcome, WaitOutcome::Abandoned) {
-                self.deliver(&thread, outcome);
-                sched::enqueue(thread);
-            } else {
-                // 终止取消：执行容器引用先消散；独立 departure state 在全部
-                // 线程级结果义务完成后摘除成员并发布 DONE/REAPABLE。
-                let departure = thread.departure();
-                drop(thread);
-                departure.request(super::thread::DepartureKind::Terminated);
+    /// 推进一个已获完成权的上下文；每次只注销一个 registration 或执行一次
+    /// 最终线程交付，完成责任由预付 finish slot 持续承载。
+    pub(crate) fn finish_step(&self, budget: usize) -> (usize, bool) {
+        debug_assert!(budget > 0);
+        let mut used = 0;
+        while used < budget {
+            let registration = self.registrations.lock().pop();
+            if let Some(registration) = registration {
+                registration.object.unsubscribe(registration.id);
+                used += 1;
+                continue;
             }
+            let mut state = self.finish_state.lock();
+            let finish = state
+                .as_mut()
+                .expect("wait completion step without finish state");
+            if finish.delivered {
+                return (used.max(1), true);
+            }
+            let outcome = finish.outcome;
+            finish.delivered = true;
+            drop(state);
+            let thread = self.thread.lock().take();
+            if let Some(thread) = thread {
+                if !matches!(outcome, WaitOutcome::Abandoned) {
+                    self.deliver(&thread, outcome);
+                    sched::enqueue(thread);
+                } else {
+                    let departure = thread.departure();
+                    drop(thread);
+                    departure.request(super::thread::DepartureKind::Terminated);
+                }
+            }
+            self.core.mark_done();
+            used += 1;
+            return (used, true);
         }
-        self.core.mark_done();
+        (used, false)
     }
 
     fn deliver(&self, thread: &Thread, outcome: WaitOutcome) {
@@ -459,7 +487,13 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
                 .core
                 .finish_installing()
                 .expect("installing owner must finish rejected park");
-            context.finish(WaitOutcome::Abandoned);
+            context.begin_finish(WaitOutcome::Abandoned);
+            let reservation = context
+                .finish_reservation
+                .lock()
+                .take()
+                .expect("abandoned wait lost finish reservation");
+            super::notify_work::publish_finish(reservation, context.clone());
             return;
         }
     }
@@ -507,13 +541,27 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
             .core
             .finish_installing()
             .expect("Installing owner must finish an existing outcome");
-        context.finish(outcome);
+        context.begin_finish(outcome);
+        let reservation = context
+            .finish_reservation
+            .lock()
+            .take()
+            .expect("installing wait lost finish reservation");
+        super::notify_work::publish_finish(reservation, context.clone());
         return;
     }
 
     match context.core.arm() {
         ArmResult::Armed => {}
-        ArmResult::Complete(outcome) => context.finish(outcome),
+        ArmResult::Complete(outcome) => {
+            context.begin_finish(outcome);
+            let reservation = context
+                .finish_reservation
+                .lock()
+                .take()
+                .expect("armed wait lost finish reservation");
+            super::notify_work::publish_finish(reservation, context.clone());
+        }
         ArmResult::ExternalCompleter => {
             // offer 方已取得完成权并负责清理/交付。
         }
@@ -607,5 +655,11 @@ pub(crate) fn drain_waiters(wait: &Spinlock<ObjectWaitState>, budget: usize) -> 
 /// 对象信号更新在释放对象锁后调用；只有 Complete 方可进入。
 pub(crate) fn finish_offered(context: Arc<WaitContext>) {
     let outcome = context.core.outcome();
-    context.finish(outcome);
+    context.begin_finish(outcome);
+    let reservation = context
+        .finish_reservation
+        .lock()
+        .take()
+        .expect("offered wait lost finish reservation");
+    super::notify_work::publish_finish(reservation, context);
 }

@@ -18,6 +18,91 @@ pub type ProcessHandleTable = HandleTable<ObjectRef, HandleRole>;
 pub type ProcessHandleEntry = Entry<ObjectRef, HandleRole>;
 pub use handle_table::TakeNext;
 
+pub(crate) struct PendingEntries {
+    entries: Option<Vec<ProcessHandleEntry>>,
+}
+
+impl PendingEntries {
+    pub(crate) fn try_new(capacity: usize) -> Result<Self, SystemCallError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        Ok(Self {
+            entries: Some(entries),
+        })
+    }
+
+    pub(crate) fn from_vec(entries: Vec<ProcessHandleEntry>) -> Self {
+        Self {
+            entries: Some(entries),
+        }
+    }
+
+    pub(crate) fn try_reserve(&mut self, additional: usize) -> Result<(), SystemCallError> {
+        self.entries
+            .as_mut()
+            .expect("pending entries already consumed")
+            .try_reserve(additional)
+            .map_err(|_| SystemCallError::OutOfMemory)
+    }
+
+    pub(crate) fn push(&mut self, entry: ProcessHandleEntry) {
+        let entries = self
+            .entries
+            .as_mut()
+            .expect("pending entries already consumed");
+        assert!(
+            entries.len() < entries.capacity(),
+            "pending entry capacity was not reserved"
+        );
+        entries.push(entry);
+    }
+
+    pub(crate) fn entries(&self) -> &[ProcessHandleEntry] {
+        self.entries
+            .as_ref()
+            .expect("pending entries already consumed")
+    }
+
+    pub(crate) fn close(mut self, owner: &Process, exiting: bool) {
+        for entry in self
+            .entries
+            .take()
+            .expect("pending entries already consumed")
+        {
+            close_entry(entry, owner, exiting);
+        }
+    }
+
+    pub(crate) fn take(mut self) -> Vec<ProcessHandleEntry> {
+        self.entries
+            .take()
+            .expect("pending entries already consumed")
+    }
+}
+
+impl IntoIterator for PendingEntries {
+    type Item = ProcessHandleEntry;
+    type IntoIter = alloc::vec::IntoIter<ProcessHandleEntry>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        self.entries
+            .take()
+            .expect("pending entries already consumed")
+            .into_iter()
+    }
+}
+
+impl Drop for PendingEntries {
+    fn drop(&mut self) {
+        assert!(
+            self.entries.is_none(),
+            "pending handle entries must be explicitly closed or committed"
+        );
+    }
+}
+
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn transaction_token() -> u64 {
@@ -69,33 +154,25 @@ pub enum HandleCloseStart {
 }
 
 /// 表项已从 HandleTable 摘除且表锁已释放；现在执行对象生命周期动作。
-/// Tunnel Endpoint 的 lease close 可在 Commit 前失败，此时原样返还 detached entry。
-pub fn close_entry(
-    entry: ProcessHandleEntry,
-    owner: &Process,
-    exiting: bool,
-) -> Result<(), ProcessHandleEntry> {
+pub fn close_entry(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
     if entry.object().kind() == super::object::ObjectKind::TunnelEndpoint {
         assert!(
             exiting,
             "explicit Tunnel Endpoint close must use its transaction path"
         );
-        return super::tunnel::close_detached(entry, owner);
+        super::tunnel::close_detached(entry, owner);
+        return;
     }
     let (object, role, _, _) = entry.into_parts();
     object.close_handle(role, owner, exiting);
-    Ok(())
 }
 
 pub fn close_entry_infallible(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
     assert!(
         entry.object().kind() != super::object::ObjectKind::TunnelEndpoint,
-        "Tunnel Endpoint must close through its lease transaction"
+        "Tunnel Endpoint must close through its detached path"
     );
-    assert!(
-        close_entry(entry, owner, exiting).is_ok(),
-        "non-Tunnel close cannot require retry"
-    );
+    close_entry(entry, owner, exiting);
 }
 
 pub fn close_transit(entry: ProcessHandleEntry) {

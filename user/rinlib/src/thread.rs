@@ -49,13 +49,23 @@ impl UserStack {
         if bytes == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let region = MappedRegion::map_anonymous(
-            bytes,
-            PROCESS_PAGE_SIZE,
-            PROCESS_PAGE_SIZE,
-            MemoryProtection::ReadWrite,
-            Placement::Anywhere,
-        )?;
+        let region = loop {
+            match MappedRegion::map_anonymous(
+                bytes,
+                PROCESS_PAGE_SIZE,
+                PROCESS_PAGE_SIZE,
+                MemoryProtection::ReadWrite,
+                Placement::Anywhere,
+            ) {
+                Ok(region) => break region,
+                Err(SystemCallError::ObjectBusy) => {
+                    // 同地址空间的另一笔映射正持页表发布代次；Builder 仍独占
+                    // 尚未发布的线程构造责任，等待后原样重试即可。
+                    unsafe { sys_sleep(1) }?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         Ok(Self {
             region: Some(region),
         })

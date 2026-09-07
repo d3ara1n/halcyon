@@ -97,6 +97,28 @@ fn rearm_preserves_the_affine_capacity_owner() {
 }
 
 #[test]
+fn cancellation_storm_preserves_capacity_and_fifo_progress() {
+    let mut debts = Debts::new();
+    let long = debts.reserve().unwrap();
+    debts.publish(long, 0, 64).unwrap();
+
+    for _ in 0..1_024 {
+        let cancelled = debts.reserve().unwrap();
+        assert!(debts.cancel(cancelled));
+    }
+    for _ in 0..64 {
+        let (token, remaining) = debts.take(0).unwrap().into_parts();
+        if remaining == 1 {
+            assert!(debts.finish(token));
+        } else {
+            debts.requeue(token, remaining - 1).unwrap();
+        }
+    }
+    assert!(!debts.has_pending(0));
+    assert_eq!(debts.available(), 4);
+}
+
+#[test]
 fn generation_advances_before_slot_reuse() {
     let mut debts = Debts::new();
     let reservation = debts.reserve().unwrap();

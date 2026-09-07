@@ -26,7 +26,7 @@ use crate::{
         },
         proc::{
             MemoryRetireSink, ObjectMappingLease, PreparedMemoryChange, Process,
-            RetiringSpaceChange, map_shootdown_error, prepare_memory_completion,
+            map_shootdown_error, prepare_memory_completion,
         },
         wait::{Subscription, schedule_waiters},
     },
@@ -63,13 +63,8 @@ pub struct Endpoint {
     side: usize,
     closed: AtomicBool,
     wait: Spinlock<ObjectWaitState>,
-    // 在途时形成 Endpoint → LeaseRetire → Endpoint 的临时强环；pending_close
-    // 持 entry 并逐批重入，完成分支先 take 本字段再 drop entry，从而打破环。
-    // 任何新增的放弃 entry 路径都必须先显式拆除此状态。
-    detached_retire: Spinlock<Option<DetachedLeaseRetire>>,
-    /// Endpoint 发布前预付的 detached-close sink；关闭阶段只配置 lease，
-    /// 不再首次申请 Arc/事务工作区。
-    detached_sink: Spinlock<Option<Arc<LeaseRetire>>>,
+    // 显式 close 在途时形成 Endpoint → LeaseRetire → Endpoint 的临时强环；
+    // completion 完成分支先 take holder，再释放 handle entry，从而打破环。
     close_sink: Spinlock<Option<Arc<LeaseRetire>>>,
     _metadata: super::resources::EndpointPermit,
 }
@@ -89,17 +84,12 @@ impl Endpoint {
                 crate::sync::ranks::OBJECT_WAIT,
                 ObjectWaitState::new(ObjectSignals::NONE),
             ),
-            detached_retire: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
-            detached_sink: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             close_sink: Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        let detached_sink = Arc::try_new(LeaseRetire::new(Arc::downgrade(&endpoint)))
-            .map_err(|_| SystemCallError::OutOfMemory)?;
         let close_sink = Arc::try_new(LeaseRetire::new(Arc::downgrade(&endpoint)))
             .map_err(|_| SystemCallError::OutOfMemory)?;
-        *endpoint.detached_sink.lock() = Some(detached_sink);
         *endpoint.close_sink.lock() = Some(close_sink);
         Ok(endpoint)
     }
@@ -489,11 +479,6 @@ struct LeaseRetire {
     holder: Spinlock<Option<Arc<Endpoint>>>,
     lease: Spinlock<Option<ObjectMappingLease>>,
     state: Spinlock<LeaseRetireState>,
-}
-
-struct DetachedLeaseRetire {
-    change: RetiringSpaceChange,
-    sink: Arc<LeaseRetire>,
 }
 
 impl LeaseRetire {
@@ -1171,99 +1156,26 @@ pub(crate) fn close_handle(
     Ok(plan)
 }
 
-pub(crate) fn close_detached(
-    entry: handle::ProcessHandleEntry,
-    owner: &Process,
-) -> Result<(), handle::ProcessHandleEntry> {
+pub(crate) fn close_detached(entry: handle::ProcessHandleEntry, owner: &Process) {
     debug_assert!(owner.lifecycle.is_reapable());
     let endpoint = concrete_endpoint_arc(entry.object())
         .expect("Tunnel Endpoint entry must downcast to Endpoint");
-
-    // 先结束 guard 临时量再进入分支；未完成分支会重取同一锁以回存状态，
-    // 不得让 if-let scrutinee 把 guard 生命周期延长到分支体。
-    let pending = { endpoint.detached_retire.lock().take() };
-    if let Some(mut pending) = pending {
-        if pending
-            .change
-            .advance(&owner.space, Some(pending.sink.as_ref()))
-        {
-            drop(entry.into_parts());
-            return Ok(());
-        }
-        let previous = endpoint.detached_retire.lock().replace(pending);
-        assert!(previous.is_none(), "detached Tunnel retire state raced");
-        return Err(entry);
-    }
-
-    let lease = endpoint.connection.state.lock().leases[endpoint.side]
-        .expect("detached Tunnel Endpoint must retain its mapping lease");
-    let sink = endpoint
-        .detached_sink
-        .lock()
-        .take()
-        .expect("detached Tunnel close sink was not preallocated");
-    sink.configure_lease(endpoint.clone(), lease);
-
-    let mut connection_state = endpoint.connection.state.lock();
-    assert_eq!(
-        connection_state.leases[endpoint.side],
-        Some(lease),
-        "detached Tunnel close lease changed before Commit"
-    );
-    let (plan, pool) = {
-        let mut space = owner.space.lock();
-        let plan = match space.plan_object_unmap(lease) {
-            Ok(plan) => plan,
-            Err(super::proc::SpaceError::Busy) => return Err(entry),
-            Err(error) => panic!("detached Tunnel close invariant failed: {error:?}"),
-        };
-        let pool = Arc::clone(space.pool());
-        (plan, pool)
-    };
-    let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
-        Ok(owners) => owners,
-        Err(_) => {
-            owner.space.lock().rollback_memory_change_plan(plan);
-            return Err(entry);
-        }
-    };
-    let (prepared, mut space) = {
-        let mut space = owner.space.lock();
-        match space.complete_memory_change(plan, owners) {
-            Ok(prepared) => (prepared, space),
-            Err((error, owners)) => {
-                drop(space);
-                drop(owners);
-                panic!("detached Tunnel close funding invariant failed: {error:?}");
-            }
-        }
-    };
-    let installed = connection_state.leases[endpoint.side]
-        .take()
-        .expect("detached Tunnel close lost its mapping lease");
-    assert_eq!(installed, lease, "detached Tunnel close lease changed");
-    let published = space.commit_change(prepared);
-    let notice = commit_side_close(&endpoint, &mut connection_state);
-    sink.install_notice(notice);
-    let change = space.begin_retire_published_change(published);
-    drop(space);
-    drop(connection_state);
-
-    let mut pending = DetachedLeaseRetire { change, sink };
-    if pending
-        .change
-        .advance(&owner.space, Some(pending.sink.as_ref()))
-    {
-        drop(entry.into_parts());
-        Ok(())
-    } else {
-        let previous = endpoint.detached_retire.lock().replace(pending);
-        assert!(
-            previous.is_none(),
-            "detached Tunnel retire state installed twice"
+    let notice = {
+        let mut connection = endpoint.connection.state.lock();
+        let lease = connection.leases[endpoint.side]
+            .take()
+            .expect("detached Tunnel close lost its mapping lease");
+        assert_eq!(
+            lease.object,
+            endpoint.connection.core.identity(),
+            "detached Tunnel close lease changed"
         );
-        Err(entry)
-    }
+        commit_side_close(&endpoint, &mut connection)
+    };
+    // REAPABLE 的执行门已排除用户页访问；handle 阶段之后的全地址空间 drain
+    // 负责逐 region 归还 view owner 与 WritePermit，无需再建立单独 Unmap 事务。
+    endpoint.finish_close(notice);
+    drop(entry.into_parts());
 }
 
 pub fn notify(thread: &Thread, handle: Handle) -> Result<(), SystemCallError> {

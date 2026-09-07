@@ -211,7 +211,7 @@ impl KernelObject for ThreadControl {
     }
 
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::ThreadControl).then_some(ObjectSignals::DONE | ObjectSignals::CLOSED)
+        (role == HandleRole::ThreadControl).then_some(ObjectSignals::DONE)
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -319,9 +319,8 @@ pub(crate) fn spawn(
         return Err(map_context_fault(error));
     }
 
-    let (member, thread) = match caller.process.lifecycle.begin_spawn(|tid, member| {
+    let (member, thread) = match caller.process.lifecycle.begin_spawn(|_, member| {
         let thread = super::Thread::new_thread_with_control(
-            tid,
             member,
             &caller.process,
             context,

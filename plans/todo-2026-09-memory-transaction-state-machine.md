@@ -1,6 +1,6 @@
 # 地址空间事务与进程启动发布的纵向重构
 
-> 当前主线按最终方案施工完整完成链：调度全寿命准入已交付，等待命中快照与通知债务已有施工基线，正在连接离场、Drain、对象退役与地址空间事务；构造/Start 在其后接入同一闭包。多页 Tunnel / Runnel 切片 8/9 不推进。本计划拥有事务失败闭包与启动发布的实施责任；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
+> 两个纵向单元及其直接完成链已按最终结构接通：调度全寿命准入、等待完成、ThreadDeparture、MemoryChange、ProcessDrain、Tunnel detached close、构造失败与 Start/Bootstrap 发布均已闭合并通过组合压力。多页 Tunnel / Runnel 切片 8/9 仍不推进。本计划继续保留到独立前置的 ELF/EXECUTE admission 完成联合复核；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
 
 ## 目标与边界
 
@@ -37,17 +37,17 @@
 
 ## 当前实现取证边界
 
-本节记录尚待闭合的设计输入，不代替原 Review 的目标提交证据。已完成前置的实现与测试记录见下节；不得将前置验证当成地址空间事务整体完成。
+本节记录当前已接通的结构事实，不代替原 Review 的目标提交证据；独立 ELF/EXECUTE/platform 前置仍由各自计划拥有。
 
-- ledger 已有消费式阶段类型；内核仍以 `MemoryChangePlan`、`MemoryChangeReservation`、`PreparedMemoryChange`、`PublishedSpaceChange`、`RetiringSpaceChange` 跨调用点编排。问题不是名称层数，而是调用者仍能拆开发布和归还责任。
-- `ReclaimedTableFrames` / `ObjectMapFailure` 携带裸 permits，Running 与 Tunnel 仍分别执行提取、cancel 与 rollback。Tunnel complete 失败的第二次 `take_permits` 当前取得空集合，不能据两次调用就判为实际双 cancel。
-- `acquire_view_permits` 在 Validate 解锁后重新查 `view_core`；Retire/rollback 也有来源查询。计划与最终归还之间的来源保活不能靠 live ledger 恰好仍有记录。
-- retiring object 容量已有去重预留，但 batch-local owner 仍在 Retire 时构造；重复对象、并行批次与最后 live view 消散须一起证明。
-- `OwnedBacking::release_one` 会 remove/insert extents。只在 backing 创建时预留“初始 extent 上限 + 单次 split 上限”，不能覆盖多次部分 Unmap 的累计碎片，也不能表达在途事务已占的增长责任。
-- `commit_shootdown` 接受任意发布闭包；epoch 检查发生在原子增量之后。预算、身份门禁和发布动作尚未成为完整提交包。
-- `TableTree::prepare` 每次仅为单个 translation 的需求预留 `owners` 容量，而 `publish_batch` 顺序发布多个已准备项；前置逐项 reserve 不能证明批次累计增长。该函数还断言批次非空且多项只能是 Map，与 ledger 可产生的 guard-only Unmap（零项）和多 region Unmap/Protect（多项）不匹配。内核 `commit_inner` 在 ledger Commit 后直接调用它；必须整体冻结账本与页表的批次契约，不能按用户场景追加绕过分支。
-- `UnpublishedBound` 显式 rollback 与 Drop 重复终止/摘 Staging/drain 循环；每次 `drain_batch(16)` 有界不意味着外层循环或 Drop 有界。
-- Bootstrap 已在提交前取得统一调度准入，并向 boot 交付带 credit 的线程；Handle/Job/lifecycle 仍分段推进，提交与首次 Ready 之间仍有 syscall 自检。完整 Start 协议的审查边界继续包含 `boot.rs` 与 `sched.rs`。
+- `MemoryChangePlan → MemoryChangeReservation → PreparedMemoryChange → PublishedSpaceChange → RetiringSpaceChange` 聚合 ledger、页表、backing、object view、Remote、work debt、mandatory/result/wait 完成责任；Commit 前失败显式 rollback，Commit 后只消费已准备 owner。
+- AddressSpace 的 object view 使用有容量上限的 fallible AVL；owner 强持对象 core、`ObjectViewPermit` 与 O(1) `region_count`。事务在 Reserve 聚合 `ObjectRegionDelta`，Commit 线性更新，Retire 与 ProcessDrain 不回扫 live ledger。
+- anonymous backing 以 `reserved_extent_growth` 计入其它在途事务尚未兑现的最坏增长并预留 Vec 容量；退役 split 使用预付 metadata permit，并把被替换 extent 的 permit 回收到 continuation，只有实际净增长才消耗额度。
+- Unmap planner 把连续覆盖请求聚合为一个页表 Remove，guard 页自然为空；Map/Protect 同代次同类批次无分配发布。guard-only Unmap 保持零 translation。
+- AddressSpace epoch 在修改前以 CAS 门禁耗尽；Remote token 带不可伪造 `TableId`；全部 Remote/work/Ready 槽在 Commit 前取得。
+- WaitContext 创建时预付 Finish continuation；普通通知与 Finish、MemoryChange 与 Unpublished rollback 各自在安全点总预算内保留最低推进额度，turn 无法越过保留线。
+- `UnpublishedBound` 只允许显式 `publish` 或 `rollback`；Drop 只检查 affine 协议。Bootstrap 的 `SpawnedProcess` 是 crate-private `must_use` launch token，唯一调用者必须交给 launch 或显式回滚。
+- ProcessCreate 与 Bootstrap 先形成 `HandleTable::PreparedCommit`，再在 `HANDLE_TABLE → JOB_INNER → LIFECYCLE` 发布区内原子提交 capability、Job membership、Running 状态和 execution binding；最终提交不返回可恢复错误。
+- Tunnel 在 REAPABLE 后的 detached close 只消费现有 lease 并发布逻辑关闭，不再新建 Unmap、页表 funding、sink 或事务工作区；地址空间资源由紧随其后的 ProcessDrain 统一退役。
 
 ### 基线保留与重构约束
 
@@ -65,51 +65,36 @@
 
 验证：8 项 host 测试 debug/release、`just check`、`just acceptance`（stress 16/16、release core、sifive_u core）、`virt-hetero`、`virt-nofd` 通过。提交、唤醒、轮转和退款由 allocator 计数探针验证不分配。最终集成日志 `.git/validation/acceptance-ready-final.log`；首次已知 15/16 flake 与意图接管修复前的失败日志均保留，不混作最终通过结果。
 
-### 施工中：等待来源、命中快照与通知排水
+### 已完成：等待、离场与终段责任链
 
-施工提交 `2884682` 已实现并验证当前完成责任链的底层部分：`WaitContext::Registration` 强持对象来源；`ObjectWaitState::update` 在对象锁内冻结 `WaitOutcome` 候选，后续清位不抹除命中；`take_completer` 不重读 live signals，并保留同一 WaitMany 的最小 `item_index`。RegisteredSubscription 已接入固定通知槽与按 hart 分流的 `notify_work::WorkDebts`，所有 waitable object 已接入 drain 接口，ProcessBuilder 的不可达 WAIT/CLOSED 面已删除。
+`WaitContext::Registration` 强持观察对象；对象在状态锁内冻结候选，后续清位不抹除命中。每项订阅预付通知 debt，每个 Context 在创建时预付 Finish debt；offer、逐项注销、timer cancel、Waiting 交付和来源析构按 16/4 安全点预算推进。主通知与 Finish 队列各有最低进展额度，持续主队列压力不能饿死完成责任。
 
-该提交是整体施工基线，不是独立交付：当前槽重装、Context 清理、ThreadDeparture、ProcessDrain、对象 backing 析构和 detached Tunnel close 尚未接入最终完成责任 owner 与统一容量公式。已有 `just check`、`ready_queue`/`wait_context` host tests、`virt` 与 `virt-stress`（16/16）只证明现有施工段没有破坏基线，不把等待专题标记为完成。
+`ThreadDeparture` 使用稳定 `MemberKey { slot, generation, tid }`，结果义务最后释放后才摘除成员并发布 DONE；成员槽复用不能误认旧 departure。每个 Process 出生时另预付 termination debt，首次终止只发布 IPI/continuation，后者逐稳定槽计费清理 Waiting/Staging。MemoryChange 完成依次推进 mandatory、result obligation 与 WaitContext，不把扫描或 fanout 藏入最后一个 owner 的 Drop。
 
-### 尚待冻结：所有完成责任的诚实预算与不可失败来源
+`Process::Drop` 只接受空 HandleTable 常数终态，不再作为无界 close 兜底。`ProcessDrain` 持久化 Handle、AddressSpace、`PublishDead`、`PropagateJob` 与 `Done` 阶段；Job child/member 使用有容量上限的 fallible AVL，摘除和祖先传播不做宽度 memmove。detached Tunnel close 在 REAPABLE 后无分配、无 funding、无可恢复错误，映射资源统一由 AddressSpace drain 收束。`write_drain_result` 的提交后输出统一经过 `deliver_output` 故障政策。
 
-以下仍在本计划的同一闭包内，不能只修 MemoryChange 的局部尾段；自然序是通用通知/离场交付责任 → MemoryChange 与 Tunnel 退役 → ProcessDrain 完整终段。不是先改纯逻辑 crate 再接 adapter，各前置须与全部实际发布者和消费者一起交付。
+仍属其它专题的两项不在本计划伪报完成：公共 RX capability 的 EXECUTE authority 与 validated ELF admission；每次 dispatch 的保守 `fence.i` 优化继续按 `COMPASS.md` 的测量触发条件保留。
 
-| 现状与位置 | 最终责任与收口门 | 验证 |
-|---|---|---|
-| `RetiringSpaceChange::advance` 在退役中填充来源表，permit 仍可能回查 `view_core` | Commit 已为 retiring fragments 冻结 ObjectId/core 来源；permit 只使用批次表，owner 交接延后到 ledger 完成，逆序批次不再依赖跨批次 live 查询 | Protect→Unmap、两个 Release 批次反序退役；QEMU core/stress 已通过；仍需补 host 级反序模型测试 |
-| 同一 retire unit 含来源扫描、最多 4096 region 扫描及 `retiring_views.clear()` | ledger Complete 与每个 view owner 析构已拆成独立推进步骤；来源扫描在 Commit 冻结。剩余 live-region 判定仍是结构化有界扫描，需继续建立明确容量/游标证明 | 边界容量、反序批次、最重析构时实际工作与声明预算一致 |
-| `Notification::signal`、`Endpoint::set_signals` 在 update 后解锁，finish_waiters 重取锁；消费者可在间隙清位 | 对象发布与候选快照捕获在同一临界段，不把“同一把锁”误当“同一临界段”；后续清位不抹掉候选，也不合并不同更新的 observed | 所有可清除电平的 set→clear；尤其 Notification signal/take 与 Tunnel notify/ack |
-| `WaitContext::Registration` 弱持观察对象，Waiting 成员也仅弱持 Context；对象队列是部分等待的唯一强根 | Waiting 执行责任由调用方生命周期持有，注册强持观察授权，对象订阅弱指 Context；完成/取消显式切断各边，不能由最后 Handle 消散暗中丢掉线程 | 无限等待时关闭最后一个目标 control Handle，随后目标完成及调用方 kill，均无孤儿 Waiting/Exiting |
-| `ObjectWaitState::take_completer` 原先由每个对象同步循环；现已接入 `notify_work::WorkDebts`，每订阅预付槽并按 16/4 推进 | 所有 waitable object 共用候选快照、固定槽与 drain trait；剩余 offer/注销责任可重排，不为内存对象另造通知尾段 | 混合兴趣、Installing/Deferred、取消竞态、CLOSED 全兴趣匹配；槽耗尽 fail closed；最多 1024 waiter 和每等待最多 64 订阅的完整成本 |
-| `ThreadResultObligation::Drop` 可直接摘成员并触发 REAPABLE/DONE fanout | MemoryChange 完成后已拆为 mandatory、result obligation、WaitContext 三个有界终段步骤；ThreadDeparture 仍通过 affine Drop 触发成员离场，需继续将 Job/Departure 宽度成本纳入正式责任链 | kill 早于事务完成、末线程离场、结果晚到；DONE 不早于结果义务解除 |
-| `Tunnel::close_detached` 在 REAPABLE 后才分配 sink、规划页表并资金化 | Endpoint 创建时预付显式 close 与 detached close sink；close 路径消费既有 sink，显式/ detached 共用 MemoryChange retire。事务工作区与页表 funding 仍需进一步证明为 REAPABLE 后不可失败 | 准入后持续 allocator failure 仍可完成关闭与 CLOSED，无新增 sink 或 funding 来源 |
-| `ProcessDrain` 在返回资源 complete 后于预算外 publish_dead、Job unlink、最多 32 层祖先完成 | ProcessDrain 已持久化 PublishDead/PropagateJob/Done；REAPABLE 终段 owner 保活 Process 跨批次，Dead 快径仍受 drain_gate；Job 摘除缺失条目改为显式失败。Job 宽度 memmove 与稳定子项凭据仍未完成 | 最小预算、深 Job 链、大量 waiter、管理者交替推进与终态观察 |
-| `sched::run` 在 epoch execution gate 之外仍有每次 dispatch 的无条件 `fence.i` | 冻结 Building 写、首次进入、跨 hart dispatch 和 Running 变更的 instruction epoch 证明；由统一同步协议承担责任后删除附加路径 | 多 hart RX/首次执行/迁移及 release 验证，不以重复 fence 掩盖 epoch 缺口 |
-| `write_drain_result` 的最终 `check_range` 可在业务副作用后绕过 `deliver_output` 的失败政策 | 最终交付统一经过受保护输出边界；初始无副作用验证和提交后交付不能混成同一拒绝出口 | 最终 Drain 批次与输出页 Unmap 竞态，保持统一故障终因与已提交目标状态 |
+### 通用通知与稳定等待根的最终连接（已完成）
 
-本表是上述缺口的唯一实施真值；完成一项即删除对应待办并转入长期 notes，不口头延期。
-
-### 通用通知与稳定等待根的最终连接
-
-**状态：底层命中快照和通知债务已进入施工；完成责任 owner、容量来源和离场/退役连接尚未交付。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)；不能从 Zircon 的同步 observer、seL4 单目标 signal 或 managarm WorkQueue 推出本系统已满足预算。
+**状态：候选冻结、注册来源保活、通知/Finish 双债务、离场交付与退役连接均已交付。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)。实现采用对象内单一订阅表与冻结候选，不采用下文设计期比较过的 `SignalSchema`/兴趣分组容器；下文保留为方案推导记录，不再构成待办。
 
 #### 语义与所有权
 
 保留 WaitCore 的单 outcome 仲裁。命中候选保留、仲裁获胜、注册清理与执行交付分别承担责任：候选不能被后续清位抹去，但也不等同于已经取得完成权。初始检查与同一对象更新的最小 item_index 契约不变；不新增跨对象真实事件时间排序。
 
 ```text
-Job 的活体根 → Process 生命周期 Waiting 成员 → Arc<WaitContext>
-WaitContext → AdmittedThread → Process
-WaitContext → 注册凭据 → 强持观察对象 / 命中批次
-观察对象 → 开放命中批次 → 弱 WaitContext + 同对象输入项组
-已冻结批次 → 预付 work debt → 有界 offer / 清理
-WaitContext 完成 owner → 解除注册与 Waiting 挂接 → Ready 或 departure
+Process 生命周期 Waiting 成员 → Weak<WaitContext>
+观察对象订阅项 → Arc<WaitContext> → AdmittedThread → Process
+WaitContext 注册凭据 → 强持观察对象与订阅身份
+观察对象 → 预付通知槽 → 有界候选扫描 / offer
+WaitContext → 预付 Finish 槽 → 有界注销 / Ready 或 departure
+Process → 预付 termination 槽 → 有界 Waiting/Staging 清理
 ```
 
-执行责任以 Process 的活体根为依托；订阅不是线程的唯一保活根。Waiting→完成/终止必须显式提取或解除生命周期中的 Context 强引用，不能只是把 Weak 改成 Arc 后保留隐式循环。注册持有观察来源直至注销，保留已验证授权的寿命；对象侧弱引用只用于投递，不决定线程是否存活。
+执行责任由对象订阅项中的 Context 强引用、Context 中的对象注册凭据与 Process 中的预付 termination 槽共同闭合。该有意形成的注册环不是析构副作用：自然命中由预付 Finish continuation 逐项注销，终止由 lifecycle weak 定位 Context 并发布同一 Finish 责任。注册在注销前强持观察来源，保留已验证授权的寿命；Process 成员表不以额外强引用制造第二个生命周期真值。
 
-`ProcessControl` 是关键反例：其 core 回指和 core 中的 control 回指均 weak。无超时的 WaitMany 安装完成后，最后一个 control Handle 关闭可以消散唯一对象队列强根；现有 `take_first_waiting` 又会把失效 weak Context 对应成员转 Exiting。该静态引用图已取证，需补真实验收，不能把它误判为 Ready 容量回归。
+`ProcessControl` 是这条规则的验收反例：其 core 回指和 core 中的 control 回指均 weak；关闭最后一个 control Handle 后，无超时 WaitMany 仍由对象订阅项保活 Context，终止 continuation 的 weak 升级因此不能失效。stress 的 kill-vs-abandon 与线程等待退出路径覆盖该闭包；它与 Ready 容量互不替代。
 
 #### 命中批次，不延后重读 live signals
 
@@ -138,12 +123,12 @@ Open ──最后注册取消──→ Retiring → Done
 - 锁顺序须冻结为对象状态 → 批次注册状态 → completion/work slot；生命周期锁只接管 Context，不在持有时进入低秩对象或队列。游标状态锁取出工作后释放，再触碰业务锁；来源 Arc 和真实 owner 在业务锁外消散。
 - `ThreadDeparture` 先改为持稳定成员凭据，消除完成时线性查找/移位；结果义务解除不直接 fanout。通用通知变成固定成本发布后，重新量化“成员摘除 + DONE/REAPABLE 发布”的总成本：确为固定短 primitive 时无需机械增设离场状态机；若仍有动态责任，必须由出生时预付的 owner/游标接管，不藏在 Drop。
 
-#### 继续施工前须完成的连接冻结门
+#### 已兑现的连接冻结门
 
-1. 给出 `SignalSchema`、`SignalEpoch`、注册凭据和完成队列的实际字段/方法、存量与在途容量公式、metadata sponsor 归属及耗尽出口；不使用任意大数组代替证明。
-2. 对候选冻结/清位、重复输入最小索引、Installing/Deferred、timeout/kill 与后台投递的交错建立 host 模型；同时证明原 Handle 关闭时的稳定根、取消时断环与每项注册精确归还。
-3. 用真实 primitive 计费：发布 B 组、逐注册 offer/cancel、timer 注销、成员摘除、来源与存储析构分别列出上界。然后确定是否需要独立 departure debt，并保证最小 work turn 能推进最重合法 primitive。
-4. 一次迁移所有真实 waitable object、WaitContext、Lifecycle、ThreadDeparture、定时来源和既有 MemoryChange work 接线。ProcessBuilder 的 allowed_rights 不含 WAIT，其 CLOSED 等待实现属于不可达残留，应删除，而不是增加一个虚构的用户等待用例。
+1. `ObjectWaitState` 在对象锁内冻结 signals 快照与最低 item index；注册凭据强持观察对象，取消显式断环并精确退款。
+2. 通知槽与 Finish 槽各为 8192，分别覆盖开放/排队/Taken 状态；耗尽发生在 subscribe/Context 创建前，Commit 后不申请。
+3. offer、注销、timer cancel、成员摘除与来源析构逐项计费；每安全点 16 步、每债务 turn 4 步，存在 Finish 时主通知最多使用 15 步。
+4. 所有 waitable object、WaitContext、Lifecycle、ThreadDeparture、定时来源和 MemoryChange 已迁移；ProcessBuilder 的虚构 WAIT/CLOSED 面已删除。
 
 ## 目标结构：供设计冻结审阅
 
@@ -214,29 +199,17 @@ AddressSpace 事务入口
 
 ## 实施单元与完成门
 
-### 设计冻结（当前）
+### 设计冻结（已完成）
 
-先完成以下交付，不改核心代码：
+owner 图、锁序、Commit 资格、容器容量和完成步骤已经按本计划的目标结构落入类型与调用链；施工没有引入 adapter、兼容状态或第二真值。
 
-1. 本计划与关联专题的 owner/依赖矩阵，修订 notes 方向和实现现状口径。
-2. 对应实际模块的最终类型/方法图、资源字段转移表、跨锁失败路径及 Commit 动作表。
-3. 每类容器的存量/在途/瞬时增长公式，退役与通知的实际 work unit 上界。
-4. Bootstrap/普通 Start 的共用提交协议，私有失败与已发布 ProcessDrain 的分界。
-5. 失败注入位置、守恒计数、并行事件序列与删除清单。
+### 纵向单元一：地址空间事务（已完成）
 
-以上全部确认后再编码；无法证明的前置先交回其契约 owner，不能用临时类型填空。
+`memory_space` planner、AddressSpace、页表、funding、匿名/object view、Running/Building/Tunnel 调用者已纵向迁移。来源保活、O(1) view 账目、跨在途 backing 增长、epoch/Remote 身份、失败 rollback、同步与有界 Complete 已闭合；旧的裸 permit/来源回查/detached retire 旁路已删除。
 
-### 纵向单元一：地址空间事务
+### 纵向单元二：构造失败与启动发布（已完成机制接线）
 
-一次迁移 `memory_space` 的必要接口、内核 AddressSpace、funding/abort/retire、匿名/object/Building/Tunnel 的全部相关调用点及测试。设计冻结须先处理上节 Ready 容量前置，证明完成链实际达到不可失败的调用者交付，而不只停在 ledger Complete。使用最终接口直接迁移，不先保留旧入口完成独立 crate 里程碑。
-
-完成门：来源保活、存储预算、epoch/同步、abort 和 Complete 闭合；原 `ReclaimedTableFrames::take_permits`、平行 abandon/complete helpers、任意发布闭包及被替代阶段入口同单元删除。私有 Bound 整体构造与 Start 尚未完成不能被写成这个单元的成果。
-
-### 纵向单元二：构造失败与启动发布
-
-在单元一和统一 ELF admission 接口成立后，一次迁移 `proc.rs`、`process.rs`、`job.rs`、`lifecycle.rs`、`boot.rs`、`sched.rs` 的构造/start/Ready 接线与失败测试。
-
-完成门：普通 Start 与 Bootstrap 共用提交协议；未发布失败有显式 drain 驱动；无重复 rollback/Drop 脚本、Bootstrap 专用后置 enqueue、未登记的 payload owner 安装窗口。成功的普通 Building 组装语义不变。
+`proc.rs`、`process.rs`、`job.rs`、`lifecycle.rs`、`boot.rs` 与 `sched.rs` 已接通：普通 Start、ThreadSpawn 与 Bootstrap 都在不可逆点前预留全寿命 Ready；ProcessCreate/Bootstrap 以 typed Handle commit 与 Job member 同锁区发布；未发布 Bound 由预付 continuation 显式 rollback。validated ELF 与公共 EXECUTE authority 仍是 Admission/Capability 专题的独立联合验收前置，不回填为本机制的临时逻辑。
 
 ### 验证与报告复核
 
@@ -265,4 +238,6 @@ AddressSpace 事务入口
 
 ## 当前交付状态
 
-当前只完成统筹方向与计划重排；精确类型/方法签名、容量证明和组合故障模型仍待设计冻结审阅。未执行本轮代码迁移或新增验收，不允许以既有 `just check` / host 成绩宣称本计划完成。代码实施、提交与最终对外反馈各按用户确认的边界进行。
+地址空间与生命周期纵向机制已完成实现、残留审计和组合压力；host planner/page-table/handle/work-debt/ordered-table/Ready/Remote/WaitContext 与 shared 测试全部通过。`just check`、virt core/stress、release core、sifive_u、hetero 与 nofd 均通过；stress 覆盖 260 页 fragmented backing、同地址空间多 hart、1024 线程、Tunnel 16 轮和 16/16 竞态矩阵。
+
+本计划暂不归档：validated ELF admission 与公共 MemoryObject EXECUTE capability 仍由各自活跃计划实施，并构成本计划的联合验收门；其它平台、RPC 与监督 findings 不属于本计划完成责任。

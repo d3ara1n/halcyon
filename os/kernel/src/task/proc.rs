@@ -16,6 +16,7 @@ use memory_space::{
     PublishedChange, RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiringChange,
     RetiringFragment, TranslationIntent, UnmapRequest, WritePermit,
 };
+use ordered_table::{InsertError, OrderedTable, PreparedEntry};
 use page_table::{
     DrainCursor as TableDrainCursor, DrainStep as TableDrainStep, FrameNumber, MapError, Ppn,
     PreparedTranslation, PublishOutcome as TablePublishOutcome, TableFrameMemory, TableFrameOwner,
@@ -285,11 +286,14 @@ struct BackingExtent {
 
 enum RetiredSpaceResource {
     Backing(BackingExtentOwner),
+    /// backing split 已复用旧 metadata permit；这里只在锁外归还物理页。
+    FundedFrames(frame::FundedExtent),
     Table(frame::FundedTableFrame),
     /// object view 的锁外收束：先把 WritePermit 归还对象状态机（对象锁秩低于
     /// AddressSpace），再释放强引用——最后一个引用消散会归还 backing 与 Pool charge。
     View {
         core: Arc<super::memory_object::MemoryObjectCore>,
+        owner: Option<ObjectViewOwner>,
         permit: Option<WritePermit>,
     },
     Root {
@@ -302,11 +306,17 @@ impl RetiredSpaceResource {
     fn release(self) {
         match self {
             Self::Backing(owner) => drop(owner),
+            Self::FundedFrames(owner) => drop(owner),
             Self::Table(owner) => drop(owner),
-            Self::View { core, permit } => {
+            Self::View {
+                core,
+                owner,
+                permit,
+            } => {
                 if let Some(permit) = permit {
                     core.retire_write(permit);
                 }
+                drop(owner);
                 drop(core);
             }
             Self::Root { owner, binding } => {
@@ -326,6 +336,13 @@ pub(crate) struct OwnedBacking {
     identity: BackingId,
     pages: usize,
     extents: Vec<BackingExtent>,
+    reserved_extent_growth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BackingGrowthReservation {
+    identity: BackingId,
+    growth: usize,
 }
 
 pub(crate) enum BackingPlanFailure<E> {
@@ -335,12 +352,24 @@ pub(crate) enum BackingPlanFailure<E> {
 
 /// 本地址空间对一个 MemoryObject 的 view 所有权：强引用使对象独立于 Handle 存活。
 ///
-/// 每地址空间每对象一枚，与引用它的区域数无关——区域切割、降权与合并都由账本表达，
-/// 这里不重复计数。「是否仍有区域引用该对象」的真值只在账本里，退役时现场查询。
+/// 每地址空间每对象一枚；`region_count` 由每笔 ledger Commit 按 replacement / retire
+/// fragment 差量更新。退役只在同步完成后检查该计数，不重新扫描 live ledger。
 struct ObjectViewOwner {
     object: ObjectId,
     core: Arc<super::memory_object::MemoryObjectCore>,
-    _permit: super::resources::ObjectViewPermit,
+    region_count: usize,
+    permit: super::resources::ObjectViewPermit,
+}
+
+impl ObjectViewOwner {
+    fn into_prepared(self) -> PreparedObjectView {
+        assert_eq!(self.region_count, 0, "uncommitted view owner count changed");
+        PreparedObjectView {
+            object: self.object,
+            core: self.core,
+            permit: self.permit,
+        }
+    }
 }
 
 /// Commit 前预留、Commit 时安装的 view 所有权。对象已有 view 时它在 Commit 中被
@@ -366,6 +395,15 @@ impl PreparedObjectView {
             core,
             permit,
         })
+    }
+
+    fn into_owner(self) -> ObjectViewOwner {
+        ObjectViewOwner {
+            object: self.object,
+            core: self.core,
+            region_count: 0,
+            permit: self.permit,
+        }
     }
 }
 
@@ -413,6 +451,7 @@ pub(crate) struct RetiringSpaceChange {
     tables: PublishedTableChanges,
     backing: Option<BackingRetireCursor>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
+    backing_growth: Vec<BackingGrowthReservation>,
     /// Commit 前已按对象去重并预留容量；Commit 后只消费既有槽位。
     retiring_views: Vec<RetiringObjectView>,
     tables_complete: bool,
@@ -423,6 +462,7 @@ pub(crate) struct PublishedSpaceChange {
     ledger: PublishedChange,
     tables: PublishedTableChanges,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
+    backing_growth: Vec<BackingGrowthReservation>,
     /// Commit 前已预留的对象退役 owner 容器；Commit 后不得扩容。
     retiring_views: Vec<RetiringObjectView>,
 }
@@ -449,6 +489,7 @@ pub(crate) struct MemoryChangePlan {
     backing: Option<OwnedBacking>,
     result: Option<PinnedMapResult>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
+    backing_growth: Vec<BackingGrowthReservation>,
     image_end: Option<usize>,
     /// 本事务在 Commit 时发布的新 object view 身份；撤销既有 view 不产生它。
     published_view: Option<ObjectMappingLease>,
@@ -470,9 +511,10 @@ struct MemoryChangeReservation {
     backing: Option<OwnedBacking>,
     result: Option<PinnedMapResult>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
+    backing_growth: Vec<BackingGrowthReservation>,
     image_end: Option<usize>,
     published_view: Option<ObjectMappingLease>,
-    view_owner: Option<PreparedObjectView>,
+    view_owner: Option<PreparedEntry<ObjectViewOwner>>,
     /// 退役 owner 槽位由 Validate 结果确定，并在 Commit 前完成分配。
     retiring_views: Vec<RetiringObjectView>,
 }
@@ -644,6 +686,7 @@ impl PreparedBacking {
             identity,
             pages: self.pages,
             extents: self.extents,
+            reserved_extent_growth: 0,
         }
     }
 }
@@ -741,7 +784,7 @@ impl OwnedBacking {
         offset: usize,
         bytes: usize,
         permits: &mut Vec<super::resources::BackingSlicePermit>,
-    ) -> (BackingExtentOwner, usize) {
+    ) -> (RetiredSpaceResource, usize) {
         assert!(
             offset.is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE) && bytes != 0,
             "backing retire range must be nonempty and page aligned"
@@ -774,12 +817,17 @@ impl OwnedBacking {
         let retired_pages = cut_end - cut_start;
         let right_pages = extent_end - cut_end;
         let mut retired = extent.owner;
+        let permits_before = permits.len();
 
         if left_pages != 0 {
             let permit = permits
                 .pop()
                 .expect("backing split metadata permit missing");
             let (left, tail) = retired.split_at(left_pages, Some(permit));
+            assert!(
+                self.extents.len() < self.extents.capacity(),
+                "backing split exceeded prepared extent capacity"
+            );
             self.extents.insert(
                 index,
                 BackingExtent {
@@ -795,6 +843,10 @@ impl OwnedBacking {
                 .expect("backing split metadata permit missing");
             let (middle, right) = retired.split_at(retired_pages, Some(permit));
             retired = middle;
+            assert!(
+                self.extents.len() < self.extents.capacity(),
+                "backing split exceeded prepared extent capacity"
+            );
             self.extents.insert(
                 index + usize::from(left_pages != 0),
                 BackingExtent {
@@ -804,6 +856,17 @@ impl OwnedBacking {
             );
         }
         assert_eq!(retired.count(), retired_pages);
+        let retired = match retired {
+            BackingExtentOwner::Funded { extent, permit } if permits.len() != permits_before => {
+                assert!(
+                    permits.len() < permits.capacity(),
+                    "recycled backing permit exceeded prepared capacity"
+                );
+                permits.push(permit);
+                RetiredSpaceResource::FundedFrames(extent)
+            }
+            owner => RetiredSpaceResource::Backing(owner),
+        };
         (retired, retired_pages)
     }
 }
@@ -1209,6 +1272,10 @@ impl RetiringSpaceChange {
                 }
             }
             self.ledger_complete = true;
+            return false;
+        }
+        if let Some(reservation) = self.backing_growth.pop() {
+            space.lock().release_backing_growth(reservation);
             return false;
         }
         // 每次只析构一个交出的 view owner；其强引用可能归还对象 backing
@@ -2322,7 +2389,7 @@ pub(crate) struct BoundAddressSpace {
     backings: Vec<OwnedBacking>,
     /// 本地址空间引用的 MemoryObject view 所有权，按 ObjectId 有序。它使对象
     /// 独立于 Handle 存活：Handle 先关闭不影响已建立的 view。
-    views: Vec<ObjectViewOwner>,
+    views: OrderedTable<ObjectViewOwner>,
     next_backing: u64,
     /// Object-owned mapping authority；单调不复用。
     next_lease: u64,
@@ -2352,7 +2419,7 @@ impl BoundAddressSpace {
             ledger: Some(ledger),
             table_transaction_active: false,
             backings: Vec::new(),
-            views: Vec::new(),
+            views: OrderedTable::new(super::resources::REGION_SLOTS_PER_ADDRESS_SPACE),
             next_backing: 1,
             next_lease: 1,
             image_end: 0,
@@ -2609,6 +2676,7 @@ impl BoundAddressSpace {
             backing: Some(backing),
             result: Some(result),
             backing_permits: Vec::new(),
+            backing_growth: Vec::new(),
             image_end: None,
             published_view: None,
             view_owner: None,
@@ -2654,9 +2722,10 @@ impl BoundAddressSpace {
             backing,
             result,
             backing_permits,
+            backing_growth,
             image_end,
             published_view,
-            view_owner,
+            mut view_owner,
         } = plan;
         let mut reclaimed = ReclaimedTableFrames {
             funded,
@@ -2668,6 +2737,7 @@ impl BoundAddressSpace {
         };
         macro_rules! fail {
             ($error:expr) => {{
+                self.release_backing_growth_all(&backing_growth);
                 reclaimed.permits = self.ledger().rollback(change);
                 reclaimed.view_owner = view_owner;
                 self.clear_table_transaction();
@@ -2709,6 +2779,26 @@ impl BoundAddressSpace {
                 }
             }
         }
+        let view_owner = match view_owner.take() {
+            Some(view) => {
+                let object = view.object;
+                match self
+                    .views
+                    .prepare_insert_candidate(object.get(), view.into_owner())
+                {
+                    Ok(entry) => Some(entry),
+                    Err(InsertError::Limit(owner)) => {
+                        view_owner = Some(owner.into_prepared());
+                        fail!(SpaceError::ReachLimit);
+                    }
+                    Err(InsertError::Allocation(owner)) => {
+                        view_owner = Some(owner.into_prepared());
+                        fail!(SpaceError::NoFrame);
+                    }
+                }
+            }
+            None => None,
+        };
         token.install(MemoryChangeReservation {
             change,
             translations: core::mem::take(&mut reclaimed.translations),
@@ -2716,6 +2806,7 @@ impl BoundAddressSpace {
             backing: reclaimed.backing.take(),
             result,
             backing_permits,
+            backing_growth,
             image_end,
             published_view,
             view_owner,
@@ -2748,11 +2839,19 @@ impl BoundAddressSpace {
                 fail!(error, permits);
             }
         };
+        let backing_growth = match self.reserve_backing_growth(&change) {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                let permits = self.ledger().rollback(change);
+                fail!(error, permits);
+            }
+        };
         let mut preflights = Vec::new();
         if preflights
             .try_reserve_exact(change.translation_intents().len())
             .is_err()
         {
+            self.release_backing_growth_all(&backing_growth);
             let permits = self.ledger().rollback(change);
             fail!(SpaceError::NoFrame, permits);
         }
@@ -2774,6 +2873,7 @@ impl BoundAddressSpace {
             match preflight {
                 Ok(preflight) => preflights.push(preflight),
                 Err(error) => {
+                    self.release_backing_growth_all(&backing_growth);
                     let permits = self.ledger().rollback(change);
                     fail!(error.into(), permits);
                 }
@@ -2786,6 +2886,7 @@ impl BoundAddressSpace {
             backing: None,
             result: None,
             backing_permits: Vec::new(),
+            backing_growth,
             image_end: None,
             published_view: None,
             view_owner: None,
@@ -2863,12 +2964,15 @@ impl BoundAddressSpace {
             view_owner,
             result: _,
             backing_permits: _,
+            backing_growth,
             image_end: _,
             published_view: _,
             retiring_views: _retiring_views,
         } = prepared.take();
+        self.release_backing_growth_all(&backing_growth);
         let permits = self.ledger().rollback(change);
         drop(table_outcomes);
+        let view_owner = view_owner.map(|entry| entry.into_value().into_prepared());
         ReclaimedTableFrames {
             funded: Vec::new(),
             translations,
@@ -2891,9 +2995,11 @@ impl BoundAddressSpace {
             preflights: _,
             result: _,
             backing_permits: _,
+            backing_growth,
             image_end: _,
             published_view: _,
         } = plan;
+        self.release_backing_growth_all(&backing_growth);
         let permits = self.ledger().rollback(change);
         ReclaimedTableFrames {
             funded: Vec::new(),
@@ -2919,6 +3025,7 @@ impl BoundAddressSpace {
             backing,
             result,
             backing_permits,
+            backing_growth,
             image_end,
             published_view,
             view_owner,
@@ -2935,36 +3042,33 @@ impl BoundAddressSpace {
         if let Some(result) = &result {
             result.commit_cookie();
         }
-        let committed = self.ledger().commit(change);
-        let mut retiring_views = retiring_views;
-        for fragment in committed.retiring_fragments() {
-            let RegionKindView::Mapping {
-                backing: BackingView::Object { object, .. },
-                ..
-            } = fragment.kind
-            else {
-                continue;
-            };
-            if retiring_views.iter().any(|view| view.object == object) {
-                continue;
-            }
-            let index = self
-                .views
-                .binary_search_by_key(&object, |view| view.object)
-                .expect("committed retiring fragment lost its view source");
-            retiring_views.push(RetiringObjectView {
-                object,
-                core: Arc::clone(&self.views[index].core),
-                _owner: None,
-            });
+        if let Some(view) = view_owner {
+            self.install_view_owner(view);
         }
+        let mut retiring_views = retiring_views;
+        for delta in change.object_region_deltas() {
+            let owner = self
+                .views
+                .get_mut(delta.object.get())
+                .expect("committed object delta lost its view owner");
+            if delta.retiring != 0 {
+                retiring_views.push(RetiringObjectView {
+                    object: delta.object,
+                    core: Arc::clone(&owner.core),
+                    _owner: None,
+                });
+            }
+            owner.region_count = owner
+                .region_count
+                .checked_sub(delta.retiring)
+                .and_then(|count| count.checked_add(delta.replacement))
+                .expect("object view region count diverged from ledger");
+        }
+        let committed = self.ledger().commit(change);
         let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
         let published = self.ledger().publish(committed);
         if let Some(backing) = backing {
             self.backings.push(backing);
-        }
-        if let Some(view) = view_owner {
-            self.install_view_owner(view);
         }
         if let Some(end) = image_end {
             self.image_end = self.image_end.max(end);
@@ -2974,6 +3078,7 @@ impl BoundAddressSpace {
                 ledger: published,
                 tables: PublishedTableChanges(table_outcomes),
                 backing_permits,
+                backing_growth,
                 retiring_views,
             },
             published_view,
@@ -3094,6 +3199,7 @@ impl BoundAddressSpace {
             backing: Some(backing),
             result: None,
             backing_permits: Vec::new(),
+            backing_growth: Vec::new(),
             image_end,
             published_view: None,
             view_owner: None,
@@ -3161,6 +3267,7 @@ impl BoundAddressSpace {
             ledger,
             tables,
             backing_permits,
+            backing_growth,
             retiring_views,
         } = published;
         let synchronized = self.ledger().synchronize(ledger);
@@ -3171,70 +3278,166 @@ impl BoundAddressSpace {
             tables,
             backing: None,
             backing_permits,
+            backing_growth,
             retiring_views,
             tables_complete: false,
             ledger_complete: false,
         }
     }
 
-    /// Commit 内安装 view 所有权：对象已被本空间引用时丢弃预留（自然退款）。
-    /// 容量已在 plan 阶段预留，本函数不分配。
-    fn install_view_owner(&mut self, prepared: PreparedObjectView) {
-        let PreparedObjectView {
-            object,
-            core,
-            permit,
-        } = prepared;
-        match self.views.binary_search_by_key(&object, |view| view.object) {
-            Ok(_) => {
-                drop(permit);
-                drop(core);
-            }
-            Err(index) => self.views.insert(
-                index,
-                ObjectViewOwner {
-                    object,
-                    core,
-                    _permit: permit,
-                },
-            ),
+    /// Commit 内按当时 owner 真值复用或安装候选。节点已在 Prepare 分配；
+    /// 并发 retire 若摘除了旧 owner，空出的容量由同一候选无分配补回。
+    fn install_view_owner(&mut self, prepared: PreparedEntry<ObjectViewOwner>) {
+        let object = prepared.key();
+        if self.views.contains_key(object) {
+            drop(prepared);
+        } else {
+            self.views.insert_prepared(prepared);
         }
     }
 
-    /// 一个引用该对象的区域已退役。账本中不再有引用该对象的区域时交出 owner，
-    /// 由调用者在锁外与本批 WritePermit 一并收束。
-    ///
-    /// 「是否仍有引用」直接问账本：区域切割与合并都只改变账本，owner 不另记计数。
+    /// 已提交事务在同步后交出 region_count 为零的 view owner。计数在 Commit
+    /// 按 retiring/replacement 差量维护；这里不重新扫描 ledger。
     fn release_view_region(&mut self, object: ObjectId) -> Option<ObjectViewOwner> {
-        let Ok(index) = self.views.binary_search_by_key(&object, |view| view.object) else {
-            // 另一个已发布退役批次可能已经交出最后一个 owner；本批次持有的
-            // RetiringObjectView::core 足以归还自己的 permit，不得跨批次回查或 panic。
-            return None;
-        };
-        let referenced = self.ledger.as_ref().is_some_and(|ledger| {
-            ledger.regions().any(|region| {
-                matches!(
-                    region.kind,
-                    RegionKindView::Mapping {
-                        backing: BackingView::Object { object: live, .. },
-                        ..
-                    } if live == object
-                )
-            })
-        });
-        if referenced {
+        let owner = self.views.get(object.get())?;
+        if owner.region_count != 0 {
             return None;
         }
-        Some(self.views.remove(index))
+        self.views.remove(object.get())
+    }
+
+    /// ProcessDrain 逐 region 摘除账本时同步递减引用；最后一个 owner 与本
+    /// region 的 core 一并交给锁外 pending resource。
+    fn drain_view_region(
+        &mut self,
+        object: ObjectId,
+    ) -> (
+        Arc<super::memory_object::MemoryObjectCore>,
+        Option<ObjectViewOwner>,
+    ) {
+        let (core, last) = {
+            let owner = self
+                .views
+                .get_mut(object.get())
+                .expect("draining object region lost its view owner");
+            owner.region_count = owner
+                .region_count
+                .checked_sub(1)
+                .expect("object view region count underflowed");
+            (Arc::clone(&owner.core), owner.region_count == 0)
+        };
+        let retired = last.then(|| {
+            self.views
+                .remove(object.get())
+                .expect("zero-count view owner disappeared")
+        });
+        (core, retired)
     }
 
     /// 供退役路径在锁外把 WritePermit 归还来源对象。
     fn view_core(&self, object: ObjectId) -> Arc<super::memory_object::MemoryObjectCore> {
-        let index = self
-            .views
-            .binary_search_by_key(&object, |view| view.object)
-            .expect("write permit lost its view owner");
-        Arc::clone(&self.views[index].core)
+        Arc::clone(
+            &self
+                .views
+                .get(object.get())
+                .expect("write permit lost its view owner")
+                .core,
+        )
+    }
+
+    fn reserve_backing_growth(
+        &mut self,
+        change: &PreparedChange,
+    ) -> Result<Vec<BackingGrowthReservation>, SpaceError> {
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(change.retiring_fragments().len())
+            .map_err(|_| SpaceError::NoFrame)?;
+        for fragment in change.retiring_fragments() {
+            let RegionKindView::Mapping {
+                backing: BackingView::Anonymous { identity, .. },
+                ..
+            } = fragment.kind
+            else {
+                continue;
+            };
+            if fragment.backing_retire == BackingRetire::Release {
+                reservations.push(BackingGrowthReservation {
+                    identity,
+                    growth: 1,
+                });
+            }
+        }
+        reservations.sort_unstable_by_key(|reservation| reservation.identity);
+        let mut output = 0;
+        for input in 0..reservations.len() {
+            let reservation = reservations[input];
+            if output > 0 && reservations[output - 1].identity == reservation.identity {
+                reservations[output - 1].growth = reservations[output - 1]
+                    .growth
+                    .checked_add(reservation.growth)
+                    .expect("backing growth reservation overflowed");
+            } else {
+                reservations[output] = reservation;
+                output += 1;
+            }
+        }
+        reservations.truncate(output);
+
+        let mut admitted = 0;
+        for reservation in &reservations {
+            let index = self
+                .backings
+                .binary_search_by_key(&reservation.identity, |backing| backing.identity)
+                .expect("retiring anonymous fragment lost its backing");
+            let backing = &mut self.backings[index];
+            let Some(total) = backing
+                .reserved_extent_growth
+                .checked_add(reservation.growth)
+            else {
+                for rollback in &reservations[..admitted] {
+                    let index = self
+                        .backings
+                        .binary_search_by_key(&rollback.identity, |backing| backing.identity)
+                        .expect("reserved backing disappeared during rollback");
+                    self.backings[index].reserved_extent_growth -= rollback.growth;
+                }
+                return Err(SpaceError::ReachLimit);
+            };
+            if backing.extents.try_reserve(total).is_err() {
+                for rollback in &reservations[..admitted] {
+                    let index = self
+                        .backings
+                        .binary_search_by_key(&rollback.identity, |backing| backing.identity)
+                        .expect("reserved backing disappeared during rollback");
+                    self.backings[index].reserved_extent_growth -= rollback.growth;
+                }
+                return Err(SpaceError::NoFrame);
+            }
+            backing.reserved_extent_growth = total;
+            admitted += 1;
+        }
+        Ok(reservations)
+    }
+
+    fn release_backing_growth_all(&mut self, reservations: &[BackingGrowthReservation]) {
+        for reservation in reservations {
+            self.release_backing_growth(*reservation);
+        }
+    }
+
+    fn release_backing_growth(&mut self, reservation: BackingGrowthReservation) {
+        let Ok(index) = self
+            .backings
+            .binary_search_by_key(&reservation.identity, |backing| backing.identity)
+        else {
+            // backing 已被本事务完整退役，计数随空容器一并消失。
+            return;
+        };
+        self.backings[index].reserved_extent_growth = self.backings[index]
+            .reserved_extent_growth
+            .checked_sub(reservation.growth)
+            .expect("backing growth reservation underflowed");
     }
 
     fn retire_backing_one(
@@ -3243,7 +3446,7 @@ impl BoundAddressSpace {
         offset: usize,
         bytes: usize,
         permits: &mut Vec<super::resources::BackingSlicePermit>,
-    ) -> (BackingExtentOwner, usize) {
+    ) -> (RetiredSpaceResource, usize) {
         // `table_transaction_active` 覆盖 backing mint→Commit，因此 push 顺序与单调
         // BackingId 一致，这里的对数查找成立。任何允许并发 Commit 的改动都必须先把
         // 本表改为有序插入或显式索引。
@@ -3281,12 +3484,14 @@ impl BoundAddressSpace {
             tables,
             backing,
             backing_permits,
+            backing_growth,
             retiring_views,
             tables_complete,
             ledger_complete,
         } = change;
         debug_assert!(backing.is_none());
         debug_assert!(backing_permits.is_empty());
+        debug_assert!(backing_growth.is_empty());
         debug_assert!(retiring_views.is_empty());
         debug_assert!(!tables_complete);
         debug_assert!(!ledger_complete);
@@ -3368,11 +3573,6 @@ impl BoundAddressSpace {
         let region = change
             .mapped_region_key()
             .expect("object Map must reserve one usable region");
-        // Commit 不得分配：view owner 表的容量在这里预留。
-        if self.views.try_reserve(1).is_err() {
-            let permits = self.ledger().rollback(change);
-            fail!(SpaceError::NoFrame, permits);
-        }
         let mut preflights = Vec::new();
         if preflights.try_reserve_exact(spans.len()).is_err() {
             let permits = self.ledger().rollback(change);
@@ -3421,6 +3621,7 @@ impl BoundAddressSpace {
             backing: None,
             result,
             backing_permits: Vec::new(),
+            backing_growth: Vec::new(),
             image_end: None,
             // lease 是地址空间之外的 owner 用来撤销该 view 的凭据。进程自有 view
             // 由账本区间与 AddressSpace authority 直接表达，不需要第二份身份。
@@ -3504,6 +3705,7 @@ impl BoundAddressSpace {
             backing: None,
             result: None,
             backing_permits: Vec::new(),
+            backing_growth: Vec::new(),
             image_end: None,
             published_view: None,
             view_owner: None,
@@ -3911,11 +4113,12 @@ impl BoundAddressSpace {
                             ..
                         } = fragment.kind
                         {
-                            let core = self
-                                .release_view_region(object)
-                                .expect("draining object view lost its owner")
-                                .core;
-                            self.pending_free = Some(RetiredSpaceResource::View { core, permit });
+                            let (core, owner) = self.drain_view_region(object);
+                            self.pending_free = Some(RetiredSpaceResource::View {
+                                core,
+                                owner,
+                                permit,
+                            });
                             let (used, done) = self.step_pending(budget - work);
                             work += used;
                             if !done {
@@ -4067,23 +4270,20 @@ pub struct Process {
     execution: AtomicUsize,
     /// Job 成员提交后置位；未发布 Bound 的失败收束不得尝试摘除不存在的成员。
     job_member_committed: AtomicBool,
+    /// 出生时预付的首次终止 cleanup 槽；未终止构造失败时自然取消。
+    termination: crate::sync::Spinlock<Option<crate::deferred_work::TerminationReservation>>,
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
-        // 防御性兜底：预算恰在摘项后耗尽时，entry 已不在表中，必须先
-        // 关闭它才能继续收束地址空间。
-        if let Some(entry) = self.drain_state.get_mut().pending_close.take() {
-            super::handle::close_entry_infallible(entry, self, true);
-        }
-        // 进程已无外部引用，唯一借用下逐项摘除；对象回调发生在表项
-        // 已移除之后，且不持 HandleTable 锁。
-        let mut cursor = 1;
-        loop {
-            let entry = self.handles.get_mut().take_next(&mut cursor);
-            let Some(entry) = entry else { break };
-            super::handle::close_entry_infallible(entry, self, true);
-        }
+        assert!(
+            self.drain_state.get_mut().pending_close.is_none(),
+            "Process dropped with a detached handle close still pending"
+        );
+        assert!(
+            self.handles.get_mut().is_empty(),
+            "Process dropped before HandleTable drain completed"
+        );
     }
 }
 
@@ -4094,6 +4294,8 @@ impl Process {
         job: alloc::sync::Weak<super::job::Job>,
         resources: super::resources::ProcessResources,
     ) -> Result<Self, SpaceError> {
+        let termination =
+            crate::deferred_work::reserve_termination().map_err(|_| SpaceError::NoFrame)?;
         Ok(Self {
             pid,
             parent,
@@ -4118,6 +4320,7 @@ impl Process {
             ),
             execution: AtomicUsize::new(0),
             job_member_committed: AtomicBool::new(false),
+            termination: crate::sync::Spinlock::new(crate::sync::ranks::LEAF, Some(termination)),
         })
     }
 
@@ -4132,8 +4335,8 @@ impl Process {
             .validate_initial_context(context.entry as usize, context.stack_pointer as usize)
             .map_err(ThreadAttachError::Context)?;
         self.lifecycle
-            .attach_member(|tid, member| {
-                let thread = Thread::new_thread(tid, member, self, context)
+            .attach_member(|_, member| {
+                let thread = Thread::new_thread(member, self, context)
                     .map_err(|_| super::lifecycle::AttachFault::Oom)?;
                 Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
             })
@@ -4155,8 +4358,8 @@ impl Process {
             .map_err(ThreadAttachError::Context)?;
         let (tid, retired) = self
             .lifecycle
-            .attach_registered_member(|tid, member| {
-                let thread = Thread::new_thread(tid, member, self, context)
+            .attach_registered_member(|_, member| {
+                let thread = Thread::new_thread(member, self, context)
                     .map_err(|_| super::lifecycle::AttachFault::Oom)?;
                 Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
             })
@@ -4225,6 +4428,15 @@ impl Process {
             .and_then(alloc::sync::Weak::upgrade)
     }
 
+    pub(crate) fn take_termination_reservation(
+        &self,
+    ) -> crate::deferred_work::TerminationReservation {
+        self.termination
+            .lock()
+            .take()
+            .expect("Process termination reservation consumed twice")
+    }
+
     pub(crate) fn mark_job_member_committed(&self) {
         assert!(
             !self.job_member_committed.swap(true, Ordering::AcqRel),
@@ -4279,12 +4491,8 @@ impl Process {
         // 只消耗一次 close callback work unit。
         let pending = self.drain_state.lock().pending_close.take();
         if let Some(entry) = pending {
-            let result = super::handle::close_entry(entry, self, true);
+            super::handle::close_entry(entry, self, true);
             work += 1;
-            if let Err(entry) = result {
-                self.drain_state.lock().pending_close = Some(entry);
-                return (work, false);
-            }
             if work == budget {
                 return (work, false);
             }
@@ -4320,9 +4528,11 @@ impl Process {
                     }
                     DrainFinalization::Done => {
                         self.drain_state.lock().finalization = Some(DrainFinalization::Done);
-                        if let Some(control) = self.control() {
-                            control.release_drain_owner();
-                        }
+                        let drain_owner = self
+                            .control()
+                            .and_then(|control| control.take_drain_owner());
+                        drop(drain_owner);
+                        work += 1;
                         return (work, true);
                     }
                 }
@@ -4348,12 +4558,8 @@ impl Process {
                     return (work, false);
                 }
                 super::handle::TakeNext::Entry(entry) => {
-                    let result = super::handle::close_entry(entry, self, true);
+                    super::handle::close_entry(entry, self, true);
                     work += 1;
-                    if let Err(entry) = result {
-                        self.drain_state.lock().pending_close = Some(entry);
-                        return (work, false);
-                    }
                 }
                 super::handle::TakeNext::Progress => return (work, false),
                 super::handle::TakeNext::Exhausted if work == budget => return (work, false),
@@ -4386,8 +4592,7 @@ impl Process {
 /// （ELF 判定，Building 期冻结于 Process.requirement），线程经 process
 /// 间接持有——同一进程的线程共享同一执行需求。
 pub struct Thread {
-    /// 进程内线程号（ABI 身份；tid 从 1 起，0 保留为非身份值）。
-    pub tid: Tid,
+    /// 稳定成员凭据同时承载容器位置、代次与 ABI tid，不在 Thread 重复身份。
     member: super::lifecycle::MemberKey,
     pub process: Arc<Process>,
     frame: UnsafeCell<UserContext>,
@@ -4405,20 +4610,18 @@ unsafe impl Sync for Thread {}
 impl Thread {
     /// 创建线程执行基底：sepc = entry，sp = stack_pointer，a0/a1 = 出生
     /// 参数（首线程为出生块地址与长度，见 rinlib 启动契约）。FP 状态
-    /// 创建即全零——不存在依赖 hart 残留的 valid 状态。tid 由
+    /// 创建即全零——不存在依赖 hart 残留的 valid 状态。MemberKey 由
     /// lifecycle 锁内的 attach_member 分配并注入（构造随闭包进入锁内，
     /// Arc 分配取 HEAP 锁为 LIFECYCLE→HEAP 合法秩）。
     pub(super) fn new_thread(
-        tid: Tid,
         member: super::lifecycle::MemberKey,
         process: &Arc<Process>,
         context: ThreadStartContext,
     ) -> Result<Self, ()> {
-        Self::new_thread_with_control(tid, member, process, context, None)
+        Self::new_thread_with_control(member, process, context, None)
     }
 
     pub(super) fn new_thread_with_control(
-        tid: Tid,
         member: super::lifecycle::MemberKey,
         process: &Arc<Process>,
         context: ThreadStartContext,
@@ -4431,7 +4634,6 @@ impl Thread {
         ctx.x[10] = context.arg1; // a0
         ctx.x[11] = context.arg2; // a1
         Ok(Self {
-            tid,
             member,
             process: process.clone(),
             frame: UnsafeCell::new(ctx),
@@ -4511,10 +4713,9 @@ pub(crate) fn building_cutoff_selftest() {
     );
     let (tid, retired) = process
         .lifecycle
-        .attach_registered_member(|tid, member| {
+        .attach_registered_member(|_, member| {
             Arc::try_new(
                 Thread::new_thread(
-                    tid,
                     member,
                     &process,
                     ThreadStartContext {
@@ -4551,19 +4752,26 @@ pub(crate) fn building_cutoff_selftest() {
 /// ledger、backing 与 PoolBinding。
 pub struct UnpublishedBound {
     process: Option<Arc<Process>>,
+    drain: Option<crate::deferred_work::UnpublishedReservation>,
 }
 
 impl UnpublishedBound {
-    fn new(process: Arc<Process>) -> Self {
+    fn new(process: Arc<Process>, drain: crate::deferred_work::UnpublishedReservation) -> Self {
         Self {
             process: Some(process),
+            drain: Some(drain),
         }
     }
 
     fn publish(mut self) -> Arc<Process> {
-        self.process
+        let process = self
+            .process
             .take()
-            .expect("unpublished bound owner already consumed")
+            .expect("unpublished bound owner already consumed");
+        self.drain
+            .take()
+            .expect("unpublished bound drain reservation missing");
+        process
     }
 
     fn rollback(mut self) {
@@ -4571,55 +4779,33 @@ impl UnpublishedBound {
             .process
             .take()
             .expect("unpublished bound owner already consumed");
-        // 先冻结 Building，摘除仍处于 Staging 的线程强引用；否则
-        // Thread → Process 的环会使地址空间无法进入最终 drain。
-        process
+        let drain = self
+            .drain
+            .take()
+            .expect("unpublished bound drain reservation missing");
+        // 先冻结 Building，并把 Waiting/Staging 清理发布到出生时预付的
+        // termination debt；unpublished drain 在 REAPABLE 前只保留责任。
+        let todo = process
             .lifecycle
             .request_termination(ProcessExitReason::Killed, 0, None);
-        while let Some(thread) = process.lifecycle.take_first_staging() {
-            drop(thread);
-        }
-        // Bootstrap 构造期没有 Running 线程和 mandatory operation；地址空间
-        // 收束可由同一有界 drain 机制完成，不能把 TableTree::Drop 当 rollback。
-        let _gate = process.drain_gate.lock();
-        loop {
-            let (_, complete) = process.drain_batch(16);
-            if complete {
-                break;
-            }
-        }
-        drop(_gate);
-        drop(process);
+        super::process::run_termination_todo(&process, todo);
+        drain.publish(process);
     }
 }
 
 impl Drop for UnpublishedBound {
     fn drop(&mut self) {
-        let Some(process) = self.process.take() else {
-            return;
-        };
-        // 未发布 owner 的 Drop 只表示失败收束，不表示成功析构；它执行
-        // 与显式 rollback 相同的有界 drain，避免 TableTree::Drop 旁路。
-        process
-            .lifecycle
-            .request_termination(ProcessExitReason::Killed, 0, None);
-        while let Some(thread) = process.lifecycle.take_first_staging() {
-            drop(thread);
-        }
-        let _gate = process.drain_gate.lock();
-        loop {
-            let (_, complete) = process.drain_batch(16);
-            if complete {
-                break;
-            }
-        }
-        drop(_gate);
+        assert!(
+            self.process.is_none() && self.drain.is_none(),
+            "unpublished bound must be explicitly rolled back or published"
+        );
     }
 }
 
 /// launch 前的进程骨架：ELF 已装载、执行需求已判定、栈已映射、
 /// 尚未附线程或入表 runnable。
-pub struct SpawnedProcess {
+#[must_use = "prepared bootstrap processes must be launched or explicitly rolled back"]
+pub(crate) struct SpawnedProcess {
     process: Arc<Process>,
     bound: Option<UnpublishedBound>,
     entry: usize,
@@ -4627,7 +4813,7 @@ pub struct SpawnedProcess {
     root_pool: Arc<super::memory_pool::MemoryPool>,
 }
 
-pub fn spawn_from_elf(
+pub(crate) fn spawn_from_elf(
     pid: Pid,
     parent: Pid,
     job: alloc::sync::Arc<super::job::Job>,
@@ -4644,6 +4830,7 @@ pub fn spawn_from_elf(
         alloc::sync::Arc::downgrade(&job),
         super::resources::ProcessResources::bootstrap(),
     )?);
+    let drain = crate::deferred_work::reserve_unpublished().map_err(|_| SpaceError::NoFrame)?;
     super::process::bind_memory_internal(&process, Arc::clone(&root_pool)).map_err(|error| {
         match error {
             SystemCallError::QuotaExceeded => SpaceError::QuotaExceeded,
@@ -4651,7 +4838,7 @@ pub fn spawn_from_elf(
             _ => SpaceError::NoFrame,
         }
     })?;
-    let bound = UnpublishedBound::new(Arc::clone(&process));
+    let bound = UnpublishedBound::new(Arc::clone(&process), drain);
     if let Err(error) = process.space.load_elf(&image.segments, file) {
         bound.rollback();
         return Err(error);
@@ -4676,7 +4863,7 @@ pub fn spawn_from_elf(
 /// 失败全量回滚：临时 Handle 数值随 reservation 作废，输入 entries 按目标
 /// 进程退出语义关闭，Job 成员表不出现半初始化项。W^X 发布边界是后续
 /// `sched::enqueue` 的 Release。
-pub fn launch_bootstrap(
+pub(crate) fn launch_bootstrap(
     spawned: SpawnedProcess,
     payload_extent: Option<frame::BootHeldExtent>,
     payload: &[u8],
@@ -4689,100 +4876,182 @@ pub fn launch_bootstrap(
         requirement,
         root_pool,
     } = spawned;
-    let unpublished = bound
-        .take()
-        .expect("spawned bootstrap process lost unpublished bound owner");
-
-    // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
-    // 显式自杀/查询可用；无结构特例）。
-    let control = super::process::ProcessControl::new(&process).map_err(|_| SpaceError::NoFrame)?;
-    process.set_control(alloc::sync::Arc::downgrade(&control));
-    let control_handle = super::handle::entry(
-        super::process::ProcessControl::object_ref(&control),
-        super::object::HandleRole::ProcessControl,
-        erhino_shared::object::Rights::READ
-            | erhino_shared::object::Rights::WAIT
-            | erhino_shared::object::Rights::MANAGE
-            | erhino_shared::object::Rights::DUPLICATE
-            | erhino_shared::object::Rights::TRANSIT
-            | erhino_shared::object::Rights::GRANT,
-    )
-    .map_err(|_| SpaceError::NoFrame)?;
-
-    let root_pool_handle = super::handle::entry(
-        super::memory_pool::MemoryPool::object_ref(&root_pool),
-        super::object::HandleRole::MemoryPool,
-        erhino_shared::object::Rights::CREATE
-            | erhino_shared::object::Rights::READ
-            | erhino_shared::object::Rights::DUPLICATE
-            | erhino_shared::object::Rights::TRANSIT
-            | erhino_shared::object::Rights::GRANT,
-    )
-    .map_err(|_| SpaceError::NoFrame)?;
-
-    let mut handles = handles;
-    handles.try_reserve(2).map_err(|_| SpaceError::NoFrame)?;
-    handles.push(control_handle);
-    handles.push(root_pool_handle);
-    assert_eq!(
-        handles.len(),
-        erhino_shared::startup::initial::HANDLE_COUNT,
-        "initial capability graph has an unexpected handle count"
+    let mut unpublished = Some(
+        bound
+            .take()
+            .expect("spawned bootstrap process lost unpublished bound owner"),
     );
-
-    let token = super::handle::transaction_token();
-    let reservation = {
-        let mut table = process.handles.lock();
-        match table.reserve(handles.len(), token) {
-            Ok(reservation) => reservation,
+    let result = (|| -> Result<crate::sched::AdmittedThread, SpaceError> {
+        let mut handles = super::handle::PendingEntries::from_vec(handles);
+        if handles.try_reserve(2).is_err() {
+            handles.close(&process, true);
+            return Err(SpaceError::NoFrame);
+        }
+        // init 同样获得 Building 起即存在的 ProcessControl（完整 rights，
+        // 显式自杀/查询可用；无结构特例）。
+        let control = match super::process::ProcessControl::new(&process) {
+            Ok(control) => control,
             Err(_) => {
-                drop(table);
+                handles.close(&process, true);
+                return Err(SpaceError::NoFrame);
+            }
+        };
+        process.set_control(alloc::sync::Arc::downgrade(&control));
+        handles.push(
+            super::handle::entry(
+                super::process::ProcessControl::object_ref(&control),
+                super::object::HandleRole::ProcessControl,
+                erhino_shared::object::Rights::READ
+                    | erhino_shared::object::Rights::WAIT
+                    | erhino_shared::object::Rights::MANAGE
+                    | erhino_shared::object::Rights::DUPLICATE
+                    | erhino_shared::object::Rights::TRANSIT
+                    | erhino_shared::object::Rights::GRANT,
+            )
+            .expect("bootstrap ProcessControl rights are static"),
+        );
+
+        handles.push(
+            super::handle::entry(
+                super::memory_pool::MemoryPool::object_ref(&root_pool),
+                super::object::HandleRole::MemoryPool,
+                erhino_shared::object::Rights::CREATE
+                    | erhino_shared::object::Rights::READ
+                    | erhino_shared::object::Rights::DUPLICATE
+                    | erhino_shared::object::Rights::TRANSIT
+                    | erhino_shared::object::Rights::GRANT,
+            )
+            .expect("bootstrap root Pool rights are static"),
+        );
+        assert_eq!(
+            handles.entries().len(),
+            erhino_shared::startup::initial::HANDLE_COUNT,
+            "initial capability graph has an unexpected handle count"
+        );
+
+        let token = super::handle::transaction_token();
+        let reservation = {
+            let mut table = process.handles.lock();
+            match table.reserve(handles.entries().len(), token) {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    drop(table);
+                    for handle in handles {
+                        super::handle::close_entry_infallible(handle, &process, true);
+                    }
+                    return Err(SpaceError::NoFrame);
+                }
+            }
+        };
+
+        let block = match erhino_shared::startup::build_startup_prefix(
+            process.pid,
+            process.parent,
+            reservation.handles(),
+            PAGE_SIZE,
+            payload.len(),
+        ) {
+            Ok(block) => block,
+            Err(error) => {
+                process
+                    .handles
+                    .lock()
+                    .rollback(reservation)
+                    .expect("launch reservation must remain owned");
                 for handle in handles {
                     super::handle::close_entry_infallible(handle, &process, true);
                 }
-                return Err(SpaceError::NoFrame);
+                return Err(match error {
+                    erhino_shared::startup::StartupBuildError::Overflow => SpaceError::BadSegment,
+                    erhino_shared::startup::StartupBuildError::AllocationFailed => {
+                        SpaceError::NoFrame
+                    }
+                });
             }
-        }
-    };
+        };
 
-    let block = match erhino_shared::startup::build_startup_prefix(
-        process.pid,
-        process.parent,
-        reservation.handles(),
-        PAGE_SIZE,
-        payload.len(),
-    ) {
-        Ok(block) => block,
-        Err(error) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
+        let binding_pool = {
+            let space = process.space.lock();
+            Arc::clone(space.pool())
+        };
+        debug_assert!(
+            Arc::ptr_eq(&binding_pool, &root_pool),
+            "bootstrap binding and delivered root Pool diverged"
+        );
+        // 先建立同时持物理 owner 与 Pool charge 的 prepared owner。后续映射可失败，
+        // 但始终只借用该 owner；映射成功后的安装是无分配、不可失败的 owner 移交。
+        let payload_funded = match payload_extent {
+            Some(extent) => match frame::fund_boot_held(&binding_pool, extent) {
+                Ok(funded) => Some(funded),
+                Err(_) => {
+                    process
+                        .handles
+                        .lock()
+                        .rollback(reservation)
+                        .expect("launch reservation must remain owned");
+                    for handle in handles {
+                        super::handle::close_entry_infallible(handle, &process, true);
+                    }
+                    return Err(SpaceError::NoFrame);
+                }
+            },
+            None if payload.is_empty() => None,
+            None => {
+                process
+                    .handles
+                    .lock()
+                    .rollback(reservation)
+                    .expect("launch reservation must remain owned");
+                for handle in handles {
+                    super::handle::close_entry_infallible(handle, &process, true);
+                }
+                return Err(SpaceError::BadSegment);
             }
-            return Err(match error {
-                erhino_shared::startup::StartupBuildError::Overflow => SpaceError::BadSegment,
-                erhino_shared::startup::StartupBuildError::AllocationFailed => SpaceError::NoFrame,
-            });
-        }
-    };
+        };
 
-    let binding_pool = {
-        let space = process.space.lock();
-        Arc::clone(space.pool())
-    };
-    debug_assert!(
-        Arc::ptr_eq(&binding_pool, &root_pool),
-        "bootstrap binding and delivered root Pool diverged"
-    );
-    // 先建立同时持物理 owner 与 Pool charge 的 prepared owner。后续映射可失败，
-    // 但始终只借用该 owner；映射成功后的安装是无分配、不可失败的 owner 移交。
-    let payload_funded = match payload_extent {
-        Some(extent) => match frame::fund_boot_held(&binding_pool, extent) {
-            Ok(funded) => Some(funded),
-            Err(_) => {
+        let block_len = block.len() + payload.len();
+        let block_va =
+            match process
+                .space
+                .map_bootstrap_block(&block, payload_funded.as_ref(), payload.len())
+            {
+                Ok(va) => va,
+                Err(error) => {
+                    process
+                        .handles
+                        .lock()
+                        .rollback(reservation)
+                        .expect("launch reservation must remain owned");
+                    for handle in handles {
+                        super::handle::close_entry_infallible(handle, &process, true);
+                    }
+                    return Err(error);
+                }
+            };
+        if let Some(funded) = payload_funded {
+            process.space.lock().install_bootstrap_funding(funded);
+        }
+
+        // Commit 前把 Bootstrap 的所有可失败工作收拢：execution domain、Ready
+        // 批次容量、Attach、Job member 与 Building operation 都在 Handle commit
+        // 之前完成。Handle commit 之后只保留固定容量的不可失败发布序列。
+        let domain = match crate::sched::resolve_domain(requirement) {
+            Some(domain) => domain,
+            None => {
+                process
+                    .handles
+                    .lock()
+                    .rollback(reservation)
+                    .expect("launch reservation must remain owned");
+                for handle in handles {
+                    super::handle::close_entry_infallible(handle, &process, true);
+                }
+                return Err(SpaceError::BadSegment);
+            }
+        };
+        let mut ready_batch = match domain.reserve_ready(1) {
+            Ok(batch) => batch,
+            Err(()) => {
                 process
                     .handles
                     .lock()
@@ -4793,9 +5062,9 @@ pub fn launch_bootstrap(
                 }
                 return Err(SpaceError::NoFrame);
             }
-        },
-        None if payload.is_empty() => None,
-        None => {
+        };
+        let mut staged = Vec::new();
+        if staged.try_reserve_exact(1).is_err() {
             process
                 .handles
                 .lock()
@@ -4804,18 +5073,16 @@ pub fn launch_bootstrap(
             for handle in handles {
                 super::handle::close_entry_infallible(handle, &process, true);
             }
-            return Err(SpaceError::BadSegment);
+            return Err(SpaceError::NoFrame);
         }
-    };
-
-    let block_len = block.len() + payload.len();
-    let block_va =
-        match process
-            .space
-            .map_bootstrap_block(&block, payload_funded.as_ref(), payload.len())
-        {
-            Ok(va) => va,
-            Err(error) => {
+        match process.attach_thread(ThreadStartContext {
+            entry: entry as u64,
+            stack_pointer: USER_TOP as u64,
+            arg1: block_va as u64,
+            arg2: block_len as u64,
+        }) {
+            Ok(_) => {}
+            Err(ThreadAttachError::Context(error)) => {
                 process
                     .handles
                     .lock()
@@ -4826,122 +5093,78 @@ pub fn launch_bootstrap(
                 }
                 return Err(error);
             }
+            Err(ThreadAttachError::Oom) => {
+                process
+                    .handles
+                    .lock()
+                    .rollback(reservation)
+                    .expect("launch reservation must remain owned");
+                for handle in handles {
+                    super::handle::close_entry_infallible(handle, &process, true);
+                }
+                return Err(SpaceError::NoFrame);
+            }
+            Err(ThreadAttachError::Closed | ThreadAttachError::Limit) => {
+                unreachable!("bootstrap attach must target an empty Building process")
+            }
+        }
+        let mut table = process.handles.lock();
+        let prepared = match table.prepare_commit(reservation, handles.take()) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let entries = failure.into_entries();
+                drop(table);
+                super::handle::PendingEntries::from_vec(entries).close(&process, true);
+                return Err(SpaceError::NoFrame);
+            }
         };
-    if let Some(funded) = payload_funded {
-        process.space.lock().install_bootstrap_funding(funded);
-    }
+        let job = process.job();
+        let member = match job.reserve_member(process.pid) {
+            Ok(member) => member,
+            Err(error) => {
+                let entries = table.rollback_prepared(prepared);
+                drop(table);
+                super::handle::PendingEntries::from_vec(entries).close(&process, true);
+                return Err(match error {
+                    SystemCallError::ReachLimit => SpaceError::ReachLimit,
+                    _ => SpaceError::NoFrame,
+                });
+            }
+        };
+        assert!(
+            process.lifecycle.enter_building_op(),
+            "bootstrap process cannot be terminating"
+        );
 
-    // Commit 前把 Bootstrap 的所有可失败工作收拢：execution domain、Ready
-    // 批次容量、Attach、Job member 与 Building operation 都在 Handle commit
-    // 之前完成。Handle commit 之后只保留固定容量的不可失败发布序列。
-    let domain = match crate::sched::resolve_domain(requirement) {
-        Some(domain) => domain,
-        None => {
+        // 唯一不可逆提交段：HandleTable → Job owner → lifecycle 顺序取锁，
+        // capability、成员身份、Running 状态和 execution binding 在释放任一
+        // 发布锁前全部完成；之后只剩 Ready admission 与未发布 drain 槽取消。
+        process.mark_job_member_committed();
+        job.commit_member_with(member, process.clone(), || {
+            table.commit_prepared(prepared);
             process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
+                .lifecycle
+                .begin_running(1, &mut staged)
+                .expect("bootstrap process cannot be terminating");
+            process.bind_execution(requirement, domain);
+        });
+        drop(table);
+        let thread = staged.pop().expect("bootstrap staging thread missing");
+        drop(
+            unpublished
+                .take()
+                .expect("bootstrap publish lost unpublished bound owner")
+                .publish(),
+        );
+        Ok(ready_batch.admit(thread))
+    })();
+    match result {
+        Ok(thread) => Ok(thread),
+        Err(error) => {
+            if let Some(unpublished) = unpublished.take() {
+                unpublished.rollback();
             }
-            return Err(SpaceError::BadSegment);
-        }
-    };
-    let mut ready_batch = match domain.reserve_ready(1) {
-        Ok(batch) => batch,
-        Err(()) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
-            }
-            return Err(SpaceError::NoFrame);
-        }
-    };
-    let mut staged = Vec::new();
-    if staged.try_reserve_exact(1).is_err() {
-        process
-            .handles
-            .lock()
-            .rollback(reservation)
-            .expect("launch reservation must remain owned");
-        for handle in handles {
-            super::handle::close_entry_infallible(handle, &process, true);
-        }
-        return Err(SpaceError::NoFrame);
-    }
-    match process.attach_thread(ThreadStartContext {
-        entry: entry as u64,
-        stack_pointer: USER_TOP as u64,
-        arg1: block_va as u64,
-        arg2: block_len as u64,
-    }) {
-        Ok(_) => {}
-        Err(ThreadAttachError::Context(error)) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
-            }
-            return Err(error);
-        }
-        Err(ThreadAttachError::Oom) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
-            }
-            return Err(SpaceError::NoFrame);
-        }
-        Err(ThreadAttachError::Closed | ThreadAttachError::Limit) => {
-            unreachable!("bootstrap attach must target an empty Building process")
+            Err(error)
         }
     }
-    let job = process.job();
-    let member = match job.reserve_member(process.pid) {
-        Ok(member) => member,
-        Err(_) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
-            }
-            return Err(SpaceError::NoFrame);
-        }
-    };
-    assert!(
-        process.lifecycle.enter_building_op(),
-        "bootstrap process cannot be terminating"
-    );
-
-    // 唯一不可逆提交段：Handle、Job member、Building→Running 和 execution
-    // binding 均在此后只调用无失败尾段。
-    process
-        .handles
-        .lock()
-        .commit(reservation, handles)
-        .expect("launch reservation count matches entries");
-    process.mark_job_member_committed();
-    job.commit_member(member, process.clone());
-    process
-        .lifecycle
-        .begin_running(1, &mut staged)
-        .expect("bootstrap process cannot be terminating");
-    process.bind_execution(requirement, domain);
-    let thread = staged.pop().expect("bootstrap staging thread missing");
-    drop(unpublished.publish());
-    Ok(ready_batch.admit(thread))
 }

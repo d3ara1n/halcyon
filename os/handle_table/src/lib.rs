@@ -120,6 +120,22 @@ pub struct Reservation {
     handles: Vec<Handle>,
 }
 
+pub struct PreparedCommit<T, R> {
+    reservation: Reservation,
+    entries: Vec<Entry<T, R>>,
+}
+
+pub struct PrepareCommitFailure<T, R> {
+    pub error: TableError,
+    entries: Vec<Entry<T, R>>,
+}
+
+impl<T, R> PrepareCommitFailure<T, R> {
+    pub fn into_entries(self) -> Vec<Entry<T, R>> {
+        self.entries
+    }
+}
+
 impl Reservation {
     pub fn handles(&self) -> &[Handle] {
         &self.handles
@@ -448,12 +464,13 @@ impl<T, R> HandleTable<T, R> {
         Ok(Reservation { token, handles })
     }
 
-    /// 把预留槽位一次性提交为可见 entries。
-    pub fn commit(
+    /// 验证 reservation/entries 并形成不可失败提交 token。调用方在最终
+    /// `commit_prepared` 前必须持续独占本表。
+    pub fn prepare_commit(
         &mut self,
         reservation: Reservation,
         entries: Vec<Entry<T, R>>,
-    ) -> Result<Vec<Handle>, TableError> {
+    ) -> Result<PreparedCommit<T, R>, PrepareCommitFailure<T, R>> {
         if reservation.handles.len() != entries.len()
             || !reservation
                 .handles
@@ -461,13 +478,65 @@ impl<T, R> HandleTable<T, R> {
                 .all(|handle| self.is_reserved(*handle, reservation.token))
         {
             self.rollback_handles(&reservation.handles, reservation.token);
-            return Err(TableError::BadReservation);
+            return Err(PrepareCommitFailure {
+                error: TableError::BadReservation,
+                entries,
+            });
         }
+        Ok(PreparedCommit {
+            reservation,
+            entries,
+        })
+    }
+
+    /// 消费已验证 token；从验证到本调用期间表必须保持独占，因此这里只含
+    /// 固定宽状态替换，不再返回可恢复错误。
+    pub fn commit_prepared(&mut self, prepared: PreparedCommit<T, R>) -> Vec<Handle> {
+        let PreparedCommit {
+            reservation,
+            entries,
+        } = prepared;
+        assert!(
+            reservation
+                .handles
+                .iter()
+                .all(|handle| self.is_reserved(*handle, reservation.token)),
+            "prepared handle reservation changed before commit"
+        );
         for (handle, entry) in reservation.handles.iter().copied().zip(entries) {
             self.slots[handle.slot() as usize].state = SlotState::Occupied(entry);
             self.occupied += 1;
         }
-        Ok(reservation.handles)
+        reservation.handles
+    }
+
+    /// 放弃已验证 token，回收 entries 并使暂存 handle 代次前进。
+    pub fn rollback_prepared(&mut self, prepared: PreparedCommit<T, R>) -> Vec<Entry<T, R>> {
+        let PreparedCommit {
+            reservation,
+            entries,
+        } = prepared;
+        assert!(
+            reservation
+                .handles
+                .iter()
+                .all(|handle| self.is_reserved(*handle, reservation.token)),
+            "prepared handle reservation changed before rollback"
+        );
+        self.rollback_handles(&reservation.handles, reservation.token);
+        entries
+    }
+
+    /// 兼容普通单表事务的组合入口；跨 owner 原子发布应显式使用 typed token。
+    pub fn commit(
+        &mut self,
+        reservation: Reservation,
+        entries: Vec<Entry<T, R>>,
+    ) -> Result<Vec<Handle>, TableError> {
+        match self.prepare_commit(reservation, entries) {
+            Ok(prepared) => Ok(self.commit_prepared(prepared)),
+            Err(failure) => Err(failure.error),
+        }
     }
 
     /// 撤销预留；generation 同步前进，使失败输出中的暂存数值永不复活。
@@ -793,18 +862,35 @@ mod tests {
         let reservation = table.reserve(2, 9).unwrap();
         let handles = reservation.handles().to_vec();
         assert_eq!(table.len(), 0);
-        table
-            .commit(
+        let prepared = table
+            .prepare_commit(
                 reservation,
                 vec![
                     entry(3, Role::Sender, Rights::WRITE),
                     entry(4, Role::Sender, Rights::WRITE),
                 ],
             )
-            .unwrap();
+            .unwrap_or_else(|_| panic!());
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.commit_prepared(prepared), handles);
         assert_eq!(table.len(), 2);
         assert_eq!(*table.get(handles[0], Rights::WRITE).unwrap().object(), 3);
         assert_eq!(*table.get(handles[1], Rights::WRITE).unwrap().object(), 4);
+    }
+
+    #[test]
+    fn prepared_commit_can_return_entries_before_publication() {
+        let mut table = HandleTable::new();
+        let reservation = table.reserve(1, 10).unwrap();
+        let temporary = reservation.handles()[0];
+        let prepared = table
+            .prepare_commit(reservation, vec![entry(9, Role::Owner, Rights::READ)])
+            .unwrap_or_else(|_| panic!());
+        let entries = table.rollback_prepared(prepared);
+        assert_eq!(*entries[0].object(), 9);
+        let real = table.insert(entry(10, Role::Owner, Rights::READ)).unwrap();
+        assert_eq!(temporary.slot(), real.slot());
+        assert_ne!(temporary.generation(), real.generation());
     }
 
     #[test]
@@ -876,10 +962,7 @@ mod pin_tests {
             table.get(handle, Rights::READ),
             Err(TableError::ObjectBusy)
         ));
-        assert!(matches!(
-            table.remove(handle),
-            Err(TableError::ObjectBusy)
-        ));
+        assert!(matches!(table.remove(handle), Err(TableError::ObjectBusy)));
         let consumed = table.commit_pinned_consume(7, handle);
         assert_eq!(*consumed.object(), 10);
         assert!(matches!(
@@ -913,12 +996,7 @@ mod pin_tests {
             .unwrap();
         let mut moved = Vec::new();
         moved.try_reserve_exact(1).unwrap();
-        table.commit_pinned_transfer(
-            10,
-            protected,
-            &[(grant, Rights::READ)],
-            &mut moved,
-        );
+        table.commit_pinned_transfer(10, protected, &[(grant, Rights::READ)], &mut moved);
         assert_eq!(moved[0].rights(), Rights::READ);
         assert!(table.get(protected, Rights::READ).is_ok());
     }
@@ -929,23 +1007,13 @@ mod pin_tests {
         let protected = table.insert(entry(30)).unwrap();
         let no_grant = table.insert(Entry::new(31, 1, Rights::READ)).unwrap();
         assert!(matches!(
-            table.pin_transfer(
-                protected,
-                Rights::READ,
-                &[(no_grant, Rights::GRANT)],
-                5
-            ),
+            table.pin_transfer(protected, Rights::READ, &[(no_grant, Rights::GRANT)], 5),
             Err(TableError::RightsDenied)
         ));
         assert!(table.get(protected, Rights::READ).is_ok());
 
         assert!(matches!(
-            table.pin_transfer(
-                protected,
-                Rights::READ,
-                &[(protected, Rights::READ)],
-                5
-            ),
+            table.pin_transfer(protected, Rights::READ, &[(protected, Rights::READ)], 5),
             Err(TableError::DuplicateHandle)
         ));
         assert!(table.get(protected, Rights::READ).is_ok());

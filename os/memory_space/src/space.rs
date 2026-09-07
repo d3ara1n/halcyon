@@ -464,6 +464,7 @@ struct PreparedPlan {
     remove: Vec<RegionKey>,
     replacements: Vec<Region>,
     retiring: Vec<RetiringFragment>,
+    object_region_deltas: Vec<ObjectRegionDelta>,
     retiring_object_capacity: usize,
     translations: Vec<TranslationIntent>,
     result_layout: Option<MapResultLayout>,
@@ -473,6 +474,7 @@ struct PreparedPlan {
 struct MaterializedReservation {
     replacements: Vec<Region>,
     retiring: Vec<RetiringFragment>,
+    object_region_deltas: Vec<ObjectRegionDelta>,
     retiring_object_capacity: usize,
     retiring_permits: Vec<WritePermit>,
     permits: Vec<WritePermit>,
@@ -515,6 +517,21 @@ impl PreparedChange {
     pub fn translation_intents(&self) -> &[TranslationIntent] {
         &self.plan.translations
     }
+
+    pub fn retiring_fragments(&self) -> &[RetiringFragment] {
+        &self.plan.retiring
+    }
+
+    pub fn object_region_deltas(&self) -> &[ObjectRegionDelta] {
+        &self.plan.object_region_deltas
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectRegionDelta {
+    pub object: ObjectId,
+    pub retiring: usize,
+    pub replacement: usize,
 }
 
 #[derive(Debug)]
@@ -864,8 +881,9 @@ impl MemorySpace {
             .try_reserve_exact(indices.len())
             .map_err(|_| ChangeError::AllocationFailed)?;
         translations
-            .try_reserve_exact(indices.len())
+            .try_reserve_exact(1)
             .map_err(|_| ChangeError::AllocationFailed)?;
+        let mut removes_translation = false;
 
         for index in indices {
             let region = &self.regions[index];
@@ -890,8 +908,15 @@ impl MemorySpace {
             }
             retiring.push(retire_template(region, cut, BackingRetire::Release)?);
             if matches!(region.kind, RegionKind::Mapping { .. }) {
-                translations.push(TranslationIntent::Remove { range: cut });
+                removes_translation = true;
             }
+        }
+        if removes_translation {
+            // Unmap authority 已保证 region 连续覆盖；Guard 本就没有 PTE，因此
+            // 请求级 Remove 与逐 mapping fragment 等价，并让页表精确计算整体退役。
+            translations.push(TranslationIntent::Remove {
+                range: request.range,
+            });
         }
 
         replacements.sort_unstable_by_key(|region| region.range.start());
@@ -1138,6 +1163,7 @@ impl MemorySpace {
                 remove,
                 replacements: materialized.replacements,
                 retiring: materialized.retiring,
+                object_region_deltas: materialized.object_region_deltas,
                 retiring_object_capacity: materialized.retiring_object_capacity,
                 translations,
                 result_layout,
@@ -1220,9 +1246,18 @@ impl MemorySpace {
         {
             return Err((ChangeError::AllocationFailed, permits));
         }
-        let mut retiring_objects = Vec::new();
-        if retiring_objects
-            .try_reserve_exact(validated.plan.retiring.len())
+        let mut object_region_deltas = Vec::new();
+        let object_delta_capacity = match validated
+            .plan
+            .retiring
+            .len()
+            .checked_add(validated.plan.replacements.len())
+        {
+            Some(capacity) => capacity,
+            None => return Err((ChangeError::AllocationFailed, permits)),
+        };
+        if object_region_deltas
+            .try_reserve_exact(object_delta_capacity)
             .is_err()
         {
             return Err((ChangeError::AllocationFailed, permits));
@@ -1234,6 +1269,17 @@ impl MemorySpace {
             .result_layout
             .map(|_| self.mint_allocation_key());
         for template in &validated.plan.replacements {
+            if let TemplateKind::Mapping {
+                backing: BackingView::Object { object, .. },
+                ..
+            } = template.kind
+            {
+                object_region_deltas.push(ObjectRegionDelta {
+                    object,
+                    retiring: 0,
+                    replacement: 1,
+                });
+            }
             let permit = template
                 .writable_object()
                 .map(|object| take_permit(&mut supplied, object))
@@ -1268,9 +1314,12 @@ impl MemorySpace {
                 backing: BackingView::Object { object, .. },
                 ..
             } = template.kind
-                && !retiring_objects.contains(&object)
             {
-                retiring_objects.push(object);
+                object_region_deltas.push(ObjectRegionDelta {
+                    object,
+                    retiring: 1,
+                    replacement: 0,
+                });
             }
             retiring.push(RetiringFragment {
                 key: self.mint_region_key(),
@@ -1281,10 +1330,28 @@ impl MemorySpace {
                 backing_retire: template.backing_retire,
             });
         }
+        object_region_deltas.sort_unstable_by_key(|delta| delta.object);
+        let mut output = 0;
+        for input in 0..object_region_deltas.len() {
+            let delta = object_region_deltas[input];
+            if output > 0 && object_region_deltas[output - 1].object == delta.object {
+                object_region_deltas[output - 1].retiring += delta.retiring;
+                object_region_deltas[output - 1].replacement += delta.replacement;
+            } else {
+                object_region_deltas[output] = delta;
+                output += 1;
+            }
+        }
+        object_region_deltas.truncate(output);
+        let retiring_object_capacity = object_region_deltas
+            .iter()
+            .filter(|delta| delta.retiring != 0)
+            .count();
         Ok(MaterializedReservation {
             replacements,
             retiring,
-            retiring_object_capacity: retiring_objects.len(),
+            object_region_deltas,
+            retiring_object_capacity,
             retiring_permits,
             permits: supplied,
         })

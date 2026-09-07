@@ -19,4 +19,5 @@ pub mod tunnel;
 pub mod wait;
 
 pub use job::alloc_pid;
-pub use proc::{Thread, launch_bootstrap, spawn_from_elf};
+pub use proc::Thread;
+pub(crate) use proc::{launch_bootstrap, spawn_from_elf};

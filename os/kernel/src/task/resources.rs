@@ -11,7 +11,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use erhino_shared::call::SystemCallError;
 use metadata_admission::{Counter, Permit, SponsoredPermit};
 
-const SPONSOR_GLOBAL_LIMIT: usize = 4_096;
+pub(crate) const PROCESS_GLOBAL_LIMIT: usize = 4_096;
+const SPONSOR_GLOBAL_LIMIT: usize = PROCESS_GLOBAL_LIMIT;
 const POOL_CORE_GLOBAL_LIMIT: usize = 4_096;
 const ADDRESS_SPACE_GLOBAL_LIMIT: usize = 4_096;
 const BUILDER_GLOBAL_LIMIT: usize = 4_096;

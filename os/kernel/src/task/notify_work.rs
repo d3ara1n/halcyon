@@ -4,9 +4,10 @@
 //! WaitContext offer 与订阅排水在安全点按固定预算推进。对象更新与候选
 //! 快照仍由 ObjectWaitState 锁内完成，队列不重新读取 live signals。
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use super::object::ObjectRef;
+use super::{object::ObjectRef, wait::WaitContext};
 use crate::{hart, registry, sync::Spinlock};
 
 const HARTS: usize = hart::HART_NUM_LIMIT;
@@ -16,9 +17,13 @@ const MAX_STEPS_PER_SAFE_POINT: usize = 16;
 const MAX_STEPS_PER_DEBT_TURN: usize = 4;
 
 type Debts = work_debt::WorkDebts<ObjectRef, HARTS, SLOTS>;
+type FinishDebts = work_debt::WorkDebts<Arc<WaitContext>, HARTS, SLOTS>;
 
 static DEBTS: Spinlock<Debts> = Spinlock::new(crate::sync::ranks::WORK_DEBT, Debts::new());
+static FINISH_DEBTS: Spinlock<FinishDebts> =
+    Spinlock::new(crate::sync::ranks::WORK_DEBT, FinishDebts::new());
 static PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
+static FINISH_PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 
 /// 一个已登记订阅未来命中的固定槽；未发布时 Drop 精确取消。
 pub(crate) struct Reservation(Option<work_debt::Reservation>);
@@ -73,21 +78,69 @@ impl Drop for Reservation {
     }
 }
 
+/// 完成责任槽在 WaitContext 创建时预付，保证 outcome 获胜后不再申请存储。
+pub(crate) struct FinishReservation(Option<work_debt::Reservation>);
+
+pub(crate) fn reserve_finish() -> Result<FinishReservation, ()> {
+    FINISH_DEBTS
+        .lock()
+        .reserve()
+        .map(|reservation| FinishReservation(Some(reservation)))
+        .map_err(|_| ())
+}
+
+pub(crate) fn publish_finish(mut reservation: FinishReservation, context: Arc<WaitContext>) {
+    let owner = hart::current().slot();
+    let reservation = reservation
+        .0
+        .take()
+        .expect("finish reservation published twice");
+    FINISH_DEBTS
+        .lock()
+        .publish(reservation, owner, context)
+        .unwrap_or_else(|_| panic!("reserved finish slot must publish"));
+    FINISH_PENDING[owner].fetch_add(1, Ordering::Release);
+    let failed = registry::try_ipi_slots(1u64 << owner);
+    if failed != 0 {
+        warn!(
+            Task,
+            "Notification completion doorbell failed for hart slot {owner}; work remains pending"
+        );
+    }
+}
+
+impl Drop for FinishReservation {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.0.take() {
+            assert!(
+                FINISH_DEBTS.lock().cancel(reservation),
+                "reserved finish slot must roll back"
+            );
+        }
+    }
+}
+
 /// 由调度安全点消费；每个对象一次最多推进固定数量的 waiter。
 pub(crate) fn drain_current() -> usize {
     let owner = hart::current().slot();
-    if PENDING[owner].load(Ordering::Acquire) == 0 {
-        return 0;
-    }
     let mut steps = 0;
-    while steps < MAX_STEPS_PER_SAFE_POINT {
+    let reserve_finish = usize::from(FINISH_PENDING[owner].load(Ordering::Acquire) != 0);
+    let notification_budget = MAX_STEPS_PER_SAFE_POINT - reserve_finish;
+    while steps < notification_budget {
         let Some(taken) = DEBTS.lock().take(owner) else {
             break;
         };
         let (token, target) = taken.into_parts();
-        let turn = (MAX_STEPS_PER_SAFE_POINT - steps).min(MAX_STEPS_PER_DEBT_TURN);
+        let turn = (notification_budget - steps).min(MAX_STEPS_PER_DEBT_TURN);
         let (used, complete) = target.drain_waiters(turn);
-        steps += used;
+        assert!(used <= turn, "notification drain exceeded its debt turn");
+        assert!(
+            complete || used > 0,
+            "incomplete notification drain made no progress"
+        );
+        // 完成一个已排队但已被清空的对象仍是一个真实工作单位，
+        // 否则取消风暴可在单个安全点内连续消费全部槽位。
+        steps += used.max(1);
         if complete {
             let reservation = DEBTS
                 .lock()
@@ -108,7 +161,33 @@ pub(crate) fn drain_current() -> usize {
                 .unwrap_or_else(|_| panic!("taken notification slot must requeue"));
         }
     }
-    if DEBTS.lock().has_pending(owner) {
+    while steps < MAX_STEPS_PER_SAFE_POINT {
+        let Some(taken) = FINISH_DEBTS.lock().take(owner) else {
+            break;
+        };
+        let (token, context) = taken.into_parts();
+        let turn = (MAX_STEPS_PER_SAFE_POINT - steps).min(MAX_STEPS_PER_DEBT_TURN);
+        let (used, complete) = context.finish_step(turn);
+        assert!(
+            used > 0 && used <= turn,
+            "wait completion exceeded its debt turn"
+        );
+        steps += used;
+        if complete {
+            assert!(
+                FINISH_DEBTS.lock().finish(token),
+                "taken finish slot must finish"
+            );
+            let previous = FINISH_PENDING[owner].fetch_sub(1, Ordering::AcqRel);
+            assert!(previous > 0, "finished completion slot must be pending");
+        } else {
+            FINISH_DEBTS
+                .lock()
+                .requeue(token, context)
+                .unwrap_or_else(|_| panic!("taken finish slot must requeue"));
+        }
+    }
+    if DEBTS.lock().has_pending(owner) || FINISH_DEBTS.lock().has_pending(owner) {
         let failed = registry::try_ipi_slots(1u64 << owner);
         if failed != 0 {
             warn!(
@@ -121,5 +200,7 @@ pub(crate) fn drain_current() -> usize {
 }
 
 pub(crate) fn has_current() -> bool {
-    PENDING[hart::current().slot()].load(Ordering::Acquire) != 0
+    let owner = hart::current().slot();
+    PENDING[owner].load(Ordering::Acquire) != 0
+        || FINISH_PENDING[owner].load(Ordering::Acquire) != 0
 }

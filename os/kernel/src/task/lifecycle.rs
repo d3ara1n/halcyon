@@ -7,20 +7,20 @@
 //! 提交闸门：链锁内上行检查祖先 seal 后同临界区调用 begin_running）；
 //! lifecycle 锁内只改状态、终因、成员表、active mask、Building 操作计数与
 //! Commit 后必成事务计数，锁内不调用 subscribe/offer/enqueue/IPI/对象
-//! close/uaccess/页表操作——这些动作经 [`TerminationTodo`] 与
-//! [`Lifecycle::take_first_waiting`] 游标延迟到锁外执行。
+//! close/uaccess/页表操作——这些动作经 [`TerminationTodo`] 与预付的
+//! termination debt 逐稳定成员槽延迟到锁外执行。
 //! 方向约束：lifecycle 锁内不得出游获取任何其他锁（对象锁、
 //! WaitContext/期限表锁、调度类锁、地址空间/HandleTable 锁、Job 链
 //! 锁）；反向的单向嵌套（如 ProcessControl 快照在对象锁内进入
 //! lifecycle，或链锁内进入 lifecycle）因 lifecycle 不出游而安全，不
 //! 构成环。例外：成员表 Vec 的 try_reserve/remove 会取 HEAP 锁
 //! （LIFECYCLE→HEAP 合法秩）；锁内不 drop 线程强引用（Thread 无
-//! Drop 副作用，但纪律上仍由锁外消费，见 take_first_staging）。
+//! Drop 副作用，但纪律上仍由 termination continuation 锁外消费）。
 //!
 //! 成员表是线程容器记录的真值：条目只在线程强引用真正消散后由持有方
 //! 经 thread_departed 摘除：kill 不把仍在队列或等待竞争中的线程摘除，
-//! 只组装触达待办。Staging 条目携带 Building 预育线程强引用，环由
-//! take_first_staging 游标打破；Spawning 条目只覆盖 Running spawn 的固定宽
+//! 只组装触达待办。Staging 条目携带 Building 预育线程强引用，环由预付的
+//! termination continuation 逐稳定槽打破；Spawning 条目只覆盖 Running spawn 的固定宽
 //! 输出与不可失败提交窗口，终止游标不能摘取，由发起方提交为 Ready 或在
 //! 输出 fault 后回滚。
 //! 唤醒到再调度之间存在过渡窗口：自然完成的等待线程
@@ -47,8 +47,8 @@ pub(crate) enum ThreadState {
     /// 在某调度类就绪队列中；线程强引用由队列持有。
     Ready,
     /// 已附入但尚未入册（Building 预育表）：线程强引用由成员表持有，
-    /// Start 提交点整体转 Ready（强引用移交类队列）；终止路径经
-    /// take_first_staging 摘除释放。
+    /// Start 提交点整体转 Ready（强引用移交类队列）；终止 continuation
+    /// 经稳定成员槽摘除并在锁外释放。
     Staging { thread: Arc<super::Thread> },
     /// Running ThreadSpawn 已分配 tid、尚未完成固定宽输出与 Ready 发布；
     /// 强引用由成员表持有，termination 只能等待提交尾段。
@@ -86,7 +86,6 @@ impl MemberKey {
     pub(crate) const fn tid(self) -> Tid {
         self.tid
     }
-
 }
 
 /// Running ThreadSpawn 在线性化段得到的成员身份。
@@ -126,10 +125,18 @@ impl MemberSlot {
 }
 
 /// 一次终止请求在锁内线性化后需要锁外执行的纯量副作用（零分配）：
-/// 等待取消不随 todo 携带——由 [`Lifecycle::take_first_waiting`] 游标
-/// 在锁外逐条驱动。
+/// 等待取消不随 todo 携带——由进程出生时预付的 termination debt
+/// 在锁外逐稳定槽驱动。
+pub(crate) enum TerminationSlot {
+    Vacant,
+    Waiting(Weak<WaitContext>),
+    Staging(Arc<super::Thread>),
+}
+
 #[derive(Default)]
 pub(crate) struct TerminationTodo {
+    /// 本次调用取得唯一终止线性化权；false 表示幂等旁观者，无权发布 cleanup。
+    pub started: bool,
     /// 需要 IPI 请求离开用户态的 hart slot 位图（冻结时刻的 active
     /// 快照；自杀路径排除本 hart）。
     pub ipi_slots: u64,
@@ -541,42 +548,13 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// 终止路径游标（锁外逐条驱动）：摘取首个 Staging 预育条目并交出
-    /// 线程强引用（调用方在锁外 drop）。预育线程从未进入容器，无需
-    /// 离场确认——条目摘除即完成。摘定后表空可触发 REAPABLE 判定
-    /// （run_termination_todo 尾部轮询 is_reapable）。
-    pub(crate) fn take_first_staging(&self) -> Option<Arc<super::Thread>> {
-        let mut inner = self.inner.lock();
-        let index = inner.members.iter().position(|slot| {
-            slot.entry
-                .as_ref()
-                .is_some_and(|entry| matches!(entry.state, ThreadState::Staging { .. }))
-        })?;
-        let generation = inner.members[index].generation;
-        let tid = inner.members[index]
-            .entry
-            .as_ref()
-            .expect("matched staging slot disappeared")
-            .tid;
-        let entry = inner.remove_member(MemberKey {
-            slot: index,
-            generation,
-            tid,
-        });
-        match entry.state {
-            ThreadState::Staging { thread } => Some(thread),
-            _ => unreachable!("position matched a Staging entry"),
-        }
-    }
-
     /// 请求终止：首次到达者冻结终因并组装锁外待办；后续请求幂等返回空。
     /// `exiting = Some(tid)`：调用线程即目标（Exit/fault/自杀 kill，条目
     /// 转 Exiting，IPI 排除本 hart——本 hart 已在内核且即将走 Killed
     /// 出口）；`None`：外部触达（kill/abandonment，IPI 目标 = 冻结时刻
     /// active 位图：覆盖仍在用户态与 Resume 热路径循环中的全部 hart，
-    /// 冻结后 enter_running 拒绝、位只减不增）。Ready/Staging 成员无需
-    /// 触达（pick gate / Start 收尾方吸收）；Waiting 成员由锁外游标逐条
-    /// 取消。
+    /// 冻结后 enter_running 拒绝、位只减不增）。Ready 成员无需主动触达
+    /// （pick gate 吸收）；Waiting/Staging 由预付 continuation 逐稳定槽取消或摘除。
     pub(crate) fn request_termination(
         &self,
         reason: ProcessExitReason,
@@ -590,6 +568,7 @@ impl Lifecycle {
         }
         inner.reason = reason;
         inner.code = code;
+        todo.started = true;
         match exiting {
             Some(member) => {
                 let slot = crate::hart::current().slot();
@@ -719,6 +698,7 @@ impl Lifecycle {
             == state_index(ProcessState::Running)
             && inner.member_count == 0;
         if started_termination {
+            todo.started = true;
             inner.reason = ProcessExitReason::Exited;
             inner.code = normal_code.expect("last Running thread must exit normally");
             todo.ipi_slots = inner.active;
@@ -735,21 +715,41 @@ impl Lifecycle {
         (started_termination.then_some(todo), reapable)
     }
 
-    /// 终止触达游标（锁外逐条驱动）：摘取首个 Waiting 成员的 weak
-    /// context 并转 Exiting——offer 胜者的 finish 负责 thread_departed
-    /// 摘除；败者说明自然完成方已接管，线程经 enqueue → pick gate 吸收
-    /// 后由 reap 摘除。冻结后 park_waiting 拒绝、Waiting 集合单调不增，
-    /// 游标必然收敛。
-    pub(crate) fn take_first_waiting(&self) -> Option<Weak<WaitContext>> {
+    pub(crate) fn termination_slot_count(&self) -> usize {
+        self.inner.lock().members.len()
+    }
+
+    /// 终止 continuation 每个 work unit 只检查一个稳定槽。Terminating 后
+    /// 不再新增成员槽；Waiting 不再增加，Staging 只可能被本游标摘除。
+    pub(crate) fn take_termination_slot(&self, index: usize) -> TerminationSlot {
         let mut inner = self.inner.lock();
-        let entry = inner
-            .members
-            .iter_mut()
-            .filter_map(|slot| slot.entry.as_mut())
-            .find(|entry| matches!(entry.state, ThreadState::Waiting { .. }))?;
-        match core::mem::replace(&mut entry.state, ThreadState::Exiting) {
-            ThreadState::Waiting { context } => Some(context),
-            _ => unreachable!("position matched a Waiting entry"),
+        let Some(slot) = inner.members.get_mut(index) else {
+            return TerminationSlot::Vacant;
+        };
+        let Some(entry) = slot.entry.as_mut() else {
+            return TerminationSlot::Vacant;
+        };
+        match &entry.state {
+            ThreadState::Waiting { .. } => {
+                match core::mem::replace(&mut entry.state, ThreadState::Exiting) {
+                    ThreadState::Waiting { context } => TerminationSlot::Waiting(context),
+                    _ => unreachable!("matched Waiting member changed state"),
+                }
+            }
+            ThreadState::Staging { .. } => {
+                let generation = slot.generation;
+                let tid = entry.tid;
+                let entry = inner.remove_member(MemberKey {
+                    slot: index,
+                    generation,
+                    tid,
+                });
+                match entry.state {
+                    ThreadState::Staging { thread } => TerminationSlot::Staging(thread),
+                    _ => unreachable!("matched Staging member changed state"),
+                }
+            }
+            _ => TerminationSlot::Vacant,
         }
     }
 

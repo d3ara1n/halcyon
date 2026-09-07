@@ -622,8 +622,9 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         prepared.generation == self.generation
     }
 
-    /// 同一事务内发布一组 Prepared。多项批次只接受同代次 Map：前项只会减少后项
-    /// 的表页需求，调用方须在 Commit 前持树锁确认该代次仍为当前代次。
+    /// 同一事务内发布一组 Prepared。多项批次只接受同代次且同类的 Map 或
+    /// Protect；Unmap 由上层聚合为一项，保证表页退役容量按整体精确准备。
+    /// 调用方须在 Commit 前持树锁确认该代次仍为当前代次。
     pub fn publish_batch(
         &mut self,
         prepared: Vec<PreparedTranslation<M::FrameOwner>>,
@@ -644,12 +645,18 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
                 .all(|translation| translation.generation == self.generation),
             "prepared translation batch is stale"
         );
+        let homogeneous_batch = match prepared[0].plan {
+            TranslationPlan::Map { .. } => prepared
+                .iter()
+                .all(|translation| matches!(translation.plan, TranslationPlan::Map { .. })),
+            TranslationPlan::Protect { .. } => prepared
+                .iter()
+                .all(|translation| matches!(translation.plan, TranslationPlan::Protect { .. })),
+            TranslationPlan::Unmap { .. } => prepared.len() == 1,
+        };
         assert!(
-            prepared.len() == 1
-                || prepared
-                    .iter()
-                    .all(|translation| matches!(translation.plan, TranslationPlan::Map { .. })),
-            "multi-translation batch must contain only Maps"
+            homogeneous_batch,
+            "translation batch must be homogeneous and contain at most one Unmap"
         );
         for translation in prepared {
             outcomes.push(self.publish_inner(translation));

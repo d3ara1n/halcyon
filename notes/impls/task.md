@@ -40,7 +40,7 @@ ProcessWrite 可由其它 hart 通过物理直映射填充可执行帧。调度�
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，内嵌 bootstrap Attach 在无并发条件下由 `attach_member` 锁内分配 tid、构造并插入；syscall Attach 则凭已登记 lease 进入 `attach_registered_member`，若终止已在登记后截止，提交仍成功但新线程不再入容器，而是作为终止接管资源在 lifecycle 锁外直接析构。Start 由 `begin_running` 同一临界区整体把现存 Staging 转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域全寿命调度准入，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度 owner，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，内嵌 bootstrap Attach 在无并发条件下由 `attach_member` 锁内分配 tid、构造并插入；syscall Attach 则凭已登记 lease 进入 `attach_registered_member`，若终止已在登记后截止，提交仍成功但新线程不再入容器，而是作为终止接管资源在 lifecycle 锁外直接析构。Start 由 `begin_running` 同一临界区整体把现存 Staging 转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域全寿命调度准入，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度 owner，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；稳定 `MemberKey { slot, generation, tid }` 是内核唯一线程身份，`Thread` 不重复保存 tid。slot 可以复用，generation 防止旧 departure 或等待凭据错指新成员，tid 负责 ABI 输出与诊断。并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
@@ -69,10 +69,7 @@ authority。固定宽 ProcessQuery、异步幂等 ProcessKill、REAPABLE 电平
 
 Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
 
-- **成员/子表**：按 ID 有序的 fallible 结构（首版有序 Vec + try_reserve +
-  二分定位，键为 Pid/JobId，条目为事务占位或强持对象）。枚举自
-  partition_point 连续取，单批 O(log n + N) 固定上界；插入/删除的
-  O(width) memmove 只在创建路径，不在终止/完成短路径。
+- **成员/子表**：`os/ordered_table` 提供有容量上限的 fallible AVL（键为 Pid/JobId，条目为事务占位或强持对象）。创建期以 `PreparedEntry` 在锁外预分配节点，提交/删除不分配；查找、插入、摘除为 O(log n)，不在终止或完成路径做宽度 memmove。枚举按事务屏障分页扫描，单批至多 `JOB_ENUMERATE_MAX` 项。
 - **JobId**：全局单调不复用分配器（root 恒 1，与 Pid 分立空间）；
   Pid/JobId 分配都在 owner Job 锁内与占位插入同临界区，表内 ID 序 =
   分配序（消除多核乱序分配窗口下的枚举漏项）。
@@ -114,20 +111,21 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   表/active 位图）。Exit、fault、ProcessKill 与 Building abandonment 在
   各自适用状态竞争首次终止线性化点冻结终因（reason + i64 code），
   后续事件幂等不覆盖；fault 经稳定 ProcessFaultCode 编码，不固化裸
-  scause。线程成员表（按 tid 升序的有序 fallible Vec，离场即摘除、
-  表空即无线程）是线程容器唯一真值：pick 后 trap 入口统一检查
-  Terminating（惰性撤销），enqueue 无条件入队不反向触碰 lifecycle
-  锁；Waiting 由终止路径经锁外游标逐条 offer(Abandoned)（每次只持
-  一个 weak、零分配，单 outcome 仲裁与自然完成方无双重处置；对
+  scause。线程成员表使用稳定 slot/generation 身份（离场即摘除、表空即无线程），
+  是线程容器唯一真值：pick 后 trap 入口统一检查 Terminating（惰性撤销），
+  enqueue 无条件入队不反向触碰 lifecycle 锁。每个 Process 出生时预付一枚
+  termination debt；首次终止固定成本发布 IPI 与 continuation，后者每个 work
+  unit 只检查一个稳定成员槽，Waiting 逐项 offer(Abandoned)、Staging 逐项锁外
+  释放，空槽扫描同样计费。单 outcome 仲裁与自然完成方无双重处置；对
   唤醒后未再调度的 stale Waiting 记录 offer 必然落败，由 pick gate
-  吸收后 reap 摘除）；Running 由终止待办向冻结时刻的 active 位图
+  吸收后 reap 摘除。Running 由终止待办向冻结时刻的 active 位图
   快照发 IPI（冻结后 enter_running 拒绝，位只减不增），目标在任意
   trap 入口吸收为 Killed。active 与 Running/Terminating 准入每次变化都推进
   execution sequence，地址空间事务 Reserve 快照 `(sequence, active)`，Commit 在
   `ADDRESS_SPACE → LIFECYCLE` 锁序下拒绝同值 ABA；已经 Commit、终止不可撤销的事务
   同时增加 `mandatory_ops`，只有业务 Complete 后才递减。dispatch/leave 以本 hart
   已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本 hart。
-  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Exited 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadSpawn 仅接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadSpawnResult`，内核铸造 waitable ThreadControl。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。ThreadControl close 只消散观察壳，不影响线程 core。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
+  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Exited 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadSpawn 仅接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadSpawnResult`，内核铸造 waitable ThreadControl。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。ThreadControl close 只消散观察壳，不影响线程 core；等待面只允许真实可达的 DONE，不暴露从不发布的 CLOSED。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)
@@ -137,9 +135,10 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   任何容器路径都只到达 REAPABLE；Dead
   仅由 ProcessDrain 的 Complete 分支发布。HandleTable 先逐槽扫描摘项
   （take_next_bounded 硬预算），扫描与 close 各计一个 work unit；预算恰在
-  摘项后耗尽，或 Tunnel detached close 因在途 MemoryChange 暂时 Busy 时，entry
-  存入 Process `pending_close`，下一批优先在表锁外重试；除 Busy 重试外，任意
-  非零预算返回 More 时都有正进展。Handle 完成后 AddressSpace 先逐 fragment
+  摘项后耗尽时 entry 存入 Process `pending_close`，下一批优先在表锁外消费。
+  REAPABLE 后 Tunnel detached close 只提交无失败逻辑关闭，不再创建 MemoryChange
+  或取得 funding，因此没有 callback retry 分支。任意非零预算返回 More 时都有
+  正进展。Handle 完成后 AddressSpace 先逐 fragment
   丢弃不可达 ledger，再逐 extent 从 `OwnedBacking` 摘下并经 `pending_free` 归还
   order 树；随后按 owned/shared 槽真值收束 L0/L1 与 root 表帧。Pool-backed
   bootstrap extent 与最终 PoolBinding 只在 AddressSpace 锁内摘除并计费，实际
@@ -150,10 +149,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存
   目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
   同一 authority 可接管。init 持久保留服务 control，并按负载阶段监督：高峰竞态矩阵前先查询并收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace；仍处于 Building/Running 的成员留在集合，末尾再统一 WaitMany(REAPABLE|CLOSED) → Drain 至 Complete → 终态快照。对象 close 回调（如隧道 PEER_CLOSED）发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
-- **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker，capability
-  可见前完成不可失败的成员提交；JobCreate 同构（child marker →
-  输出预留/写入（槽仍 Reserved，槽号对外不可用）→ 层级提交回调 →
-  table.commit，失败回滚 marker）。ProcessStart 事务见 [`startup.md`](startup.md)；任务层只拥有其 lifecycle 提交点与状态转换。
+- **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker并预留 caller Handle 槽；输出写入后先形成 `HandleTable::PreparedCommit`，再在 `HANDLE_TABLE → JOB_INNER` 临界区把 capability 与成员同时发布。Bootstrap 采用同一 typed commit，并在锁区内继续提交 lifecycle Running 与 execution binding；所有可恢复失败都在此之前。JobCreate 同构保留 child marker 与预留槽协议。ProcessStart 事务见 [`startup.md`](startup.md)。
 - **对象 close callback**：Handle 摘出后才在表锁外执行；各 role 的
   callback 与固定 fanout 上界由 [`ipc.md`](ipc.md)「Handle close
   callbacks」唯一记录。任务层只依赖“单次 callback 有固定上界”这一契约。
@@ -200,8 +196,8 @@ per-hart 帧。
 ### reserve/commit/rollback 协议
 
 Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举不可见；②单调 token
-凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性
-不可消失（`expect` 论证：在途 syscall 的预留只能由本事务消费）；
+凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性不可消失；HandleTable 跨 owner 发布先经
+`prepare_commit` 形成私有字段的 affine token，最终 `commit_prepared` 不返回可恢复错误；
 ④全部在容器锁内完成，无分配失败路径（attach_member 的插入为锁内
 try_reserve 原子可失败，失败无副作用——协议三要素成立，第四要素由
 「失败时条目不可见」替代）。出生块由组装者经 Write 交付，无内核

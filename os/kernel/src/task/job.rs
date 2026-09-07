@@ -18,19 +18,18 @@
 //! 「放子锁、取父锁」，单步有界（延迟触发安全：sealed ⇒ 无新成员，
 //! 判定幂等）。
 //!
-//! 成员/子表是按 ID 有序的 fallible 结构（首版有序 Vec + try_reserve +
-//! 二分定位）：ID 在 owner 锁内分配并与占位插入同临界区，表内 ID 序 =
-//! 分配序；枚举自 partition_point 连续取，O(log n + N) 固定上界；遇
-//! 未决占位即终止本批（屏障语义：占位窗口在创建方单个 syscall 内，
-//! 枚举方重试不活锁）。插入/删除的 O(width) memmove 只在创建路径，
-//! 不在完成标准的固定上界清单内；宽度使 memmove 可观测时换 fallible
-//! 有序树（结构私有可换，见 plans 决策 15）。
+//! 成员/子表是按 ID 有序的 fallible AVL：ID 在 owner 锁内分配并与占位
+//! 插入同临界区，查找、提交、回滚和完成摘除均不分配且受树高硬界约束；
+//! 枚举按 ID 单调分页，遇未决占位即终止本批（屏障窗口只存在于创建方的
+//! 单个 syscall 内，枚举方重试不活锁）。
 
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::any::Any;
+
+use ordered_table::{InsertError, OrderedTable};
 
 use erhino_shared::{
     call::SystemCallError,
@@ -52,6 +51,16 @@ use super::{
 
 /// Job 层级深度硬上限（含 root）。
 pub(crate) const JOB_DEPTH_MAX: usize = 32;
+/// 单个 Job 的直接成员或直接 child 数上限。它同时把 AVL 高度与完成路径
+/// 的比较次数封成常量；容量耗尽在创建口返回 ReachLimit。
+const JOB_DIRECT_ENTRY_LIMIT: usize = 65_536;
+
+fn table_insert_error<V>(error: InsertError<V>) -> SystemCallError {
+    match error {
+        InsertError::Limit(_) => SystemCallError::ReachLimit,
+        InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+    }
+}
 
 /// 内核侧成员表条目：事务 marker 或强持的 Process core。
 #[derive(Clone)]
@@ -74,9 +83,9 @@ enum ChildEntry {
 
 pub(crate) struct JobInner {
     /// 直接 child Jobs（按 JobId 升序；含事务占位）。
-    children: Vec<(JobId, ChildEntry)>,
+    children: OrderedTable<ChildEntry>,
     /// 直接成员（按 Pid 升序；含事务占位）。
-    members: Vec<(Pid, MemberEntry)>,
+    members: OrderedTable<MemberEntry>,
     /// 封口位：创建/启动提交点沿父链上行检查。
     sealed: bool,
     /// 完成位：sealed && 两表空时一次置位；此后两表恒空。
@@ -128,18 +137,20 @@ impl CompletionCursor {
         else {
             return true;
         };
-        let parent_completed = {
+        let (removed, parent_completed) = {
             let mut state = parent.state.lock();
-            let index = state
+            let removed = state
                 .children
-                .iter()
-                .position(
-                    |(jid, entry)| matches!(entry, ChildEntry::Job(_) if *jid == self.child.jid),
-                )
+                .remove(self.child.jid)
                 .expect("job child disappeared before ancestor removal");
-            state.children.remove(index);
-            state.complete_if_ready()
+            let completed = state.complete_if_ready();
+            (removed, completed)
         };
+        assert!(
+            matches!(removed, ChildEntry::Job(_)),
+            "job child entry kind changed"
+        );
+        drop(removed);
         if !parent_completed {
             return true;
         }
@@ -203,20 +214,6 @@ pub(crate) struct ChildReservation {
     token: u64,
 }
 
-/// 按 ID 有序插入（键唯一：ID 单调不复用且锁内分配）。
-fn sorted_insert<T>(table: &mut Vec<(u64, T)>, id: u64, entry: T) -> Result<(), SystemCallError> {
-    match table.binary_search_by_key(&id, |&(key, _)| key) {
-        Ok(_) => unreachable!("monotonic in-lock IDs never collide"),
-        Err(position) => {
-            table
-                .try_reserve(1)
-                .map_err(|_| SystemCallError::OutOfMemory)?;
-            table.insert(position, (id, entry));
-            Ok(())
-        }
-    }
-}
-
 /// 自 owner 向上收集祖先链并反转为 root-first（锁按此序获取）。
 /// 祖先 weak 升级失败意味着该祖先已完成释放——完成的 Job 必然
 /// sealed，创建/启动按 ObjectClosed 拒绝（永不错指新对象）。
@@ -257,28 +254,6 @@ fn lock_chain(
     Ok(guards)
 }
 
-/// 游标分页扫描：自 cursor 之后按 ID 升序收集可见条目到 out；遇占位
-/// （屏障）或容量尽即止。返回 (actual, more)：more=1 ⟺ 存在 ID 大于
-/// 本批 next_cursor 的（可见或占位）条目——含终止扫描的占位自身与
-/// 容量截断处的可见条目；more=0 ⟺ 表内无任何越界残留。
-fn scan_visible<T>(
-    table: &[(u64, T)],
-    visible: impl Fn(&T) -> bool,
-    cursor: u64,
-    out: &mut [u64],
-) -> (usize, bool) {
-    let start = table.partition_point(|&(id, _)| id <= cursor);
-    let mut actual = 0;
-    for (id, entry) in &table[start..] {
-        if actual == out.len() || !visible(entry) {
-            return (actual, true);
-        }
-        out[actual] = *id;
-        actual += 1;
-    }
-    (actual, false)
-}
-
 impl Job {
     /// root Job：内核 static anchor 强持至本次启动结束；boot 交给 init 的
     /// Handle 只是 authority，不是生命周期根。完成发 CLOSED 但不移除
@@ -297,8 +272,8 @@ impl Job {
                         crate::sync::ranks::JOB_INNER,
                         jid,
                         JobInner {
-                            children: Vec::new(),
-                            members: Vec::new(),
+                            children: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
+                            members: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
                             sealed: false,
                             dead: false,
                         },
@@ -328,8 +303,8 @@ impl Job {
                 crate::sync::ranks::JOB_INNER,
                 jid,
                 JobInner {
-                    children: Vec::new(),
-                    members: Vec::new(),
+                    children: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
+                    members: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
                     sealed: false,
                     dead: false,
                 },
@@ -367,7 +342,10 @@ impl Job {
         let token = next_member_token()?;
         let pid = alloc_pid();
         let owner = guards.last_mut().expect("chain always contains the owner");
-        sorted_insert(&mut owner.members, pid, MemberEntry::Reserved { token })?;
+        owner
+            .members
+            .try_insert(pid, MemberEntry::Reserved { token })
+            .map_err(table_insert_error)?;
         Ok((pid, MemberReservation { pid, token }))
     }
 
@@ -387,7 +365,10 @@ impl Job {
         let token = next_member_token()?;
         let jid = alloc_jid();
         let owner = guards.last_mut().expect("chain always contains the owner");
-        sorted_insert(&mut owner.children, jid, ChildEntry::Reserved { token })?;
+        owner
+            .children
+            .try_insert(jid, ChildEntry::Reserved { token })
+            .map_err(table_insert_error)?;
         Ok((jid, ChildReservation { jid, token }))
     }
 
@@ -397,56 +378,71 @@ impl Job {
     pub(crate) fn reserve_member(&self, pid: Pid) -> Result<MemberReservation, SystemCallError> {
         let token = next_member_token()?;
         let mut state = self.state.lock();
-        sorted_insert(&mut state.members, pid, MemberEntry::Reserved { token })?;
+        state
+            .members
+            .try_insert(pid, MemberEntry::Reserved { token })
+            .map_err(table_insert_error)?;
         Ok(MemberReservation { pid, token })
     }
 
-    pub(crate) fn commit_member(&self, reservation: MemberReservation, process: Arc<Process>) {
+    /// 在 Job owner 锁内发布成员并执行调用方的不可失败外部提交。调用方可先持
+    /// 更外层的 HandleTable 锁，使 capability 与 Job 枚举在释放任一锁前同时可见。
+    pub(crate) fn commit_member_with<R>(
+        &self,
+        reservation: MemberReservation,
+        process: Arc<Process>,
+        commit: impl FnOnce() -> R,
+    ) -> R {
         let mut state = self.state.lock();
-        let index = state
+        let entry = state
             .members
-            .iter()
-            .position(|(pid, entry)| {
-                matches!(entry, MemberEntry::Reserved { token } if *pid == reservation.pid && *token == reservation.token)
-            })
+            .get_mut(reservation.pid)
             .expect("job member reservation disappeared");
-        state.members[index].1 = MemberEntry::Process(process);
+        assert!(
+            matches!(entry, MemberEntry::Reserved { token } if *token == reservation.token),
+            "job member reservation token changed"
+        );
+        *entry = MemberEntry::Process(process);
+        commit()
     }
 
     pub(crate) fn rollback_member(&self, reservation: MemberReservation) {
-        let mut state = self.state.lock();
-        let index = state
+        let removed = self
+            .state
+            .lock()
             .members
-            .iter()
-            .position(|(pid, entry)| {
-                matches!(entry, MemberEntry::Reserved { token } if *pid == reservation.pid && *token == reservation.token)
-            })
+            .remove(reservation.pid)
             .expect("job member reservation disappeared");
-        state.members.remove(index);
+        assert!(
+            matches!(removed, MemberEntry::Reserved { token } if token == reservation.token),
+            "job member reservation token changed"
+        );
     }
 
     fn commit_child(&self, reservation: ChildReservation, job: Arc<Job>) {
         let mut state = self.state.lock();
-        let index = state
+        let entry = state
             .children
-            .iter()
-            .position(|(jid, entry)| {
-                matches!(entry, ChildEntry::Reserved { token } if *jid == reservation.jid && *token == reservation.token)
-            })
+            .get_mut(reservation.jid)
             .expect("job child reservation disappeared");
-        state.children[index].1 = ChildEntry::Job(job);
+        assert!(
+            matches!(entry, ChildEntry::Reserved { token } if *token == reservation.token),
+            "job child reservation token changed"
+        );
+        *entry = ChildEntry::Job(job);
     }
 
     fn rollback_child(&self, reservation: ChildReservation) {
-        let mut state = self.state.lock();
-        let index = state
+        let removed = self
+            .state
+            .lock()
             .children
-            .iter()
-            .position(|(jid, entry)| {
-                matches!(entry, ChildEntry::Reserved { token } if *jid == reservation.jid && *token == reservation.token)
-            })
+            .remove(reservation.jid)
             .expect("job child reservation disappeared");
-        state.children.remove(index);
+        assert!(
+            matches!(removed, ChildEntry::Reserved { token } if token == reservation.token),
+            "job child reservation token changed"
+        );
     }
 
     /// JobSeal：O(1) 置位（幂等，不扫表）；已空则完成并返回传播游标。
@@ -469,57 +465,51 @@ impl Job {
     /// Job 因此满足 sealed && 空，返回持有祖先传播责任的游标，交由
     /// ProcessDrain 按统一预算推进。
     pub(crate) fn remove_member(self: &Arc<Self>, pid: Pid) -> Option<CompletionCursor> {
-        let completed = {
+        let (removed, completed) = {
             let mut state = self.state.lock();
-            let index = state
+            let removed = state
                 .members
-                .iter()
-                .position(|(id, entry)| matches!(entry, MemberEntry::Process(_) if *id == pid))
+                .remove(pid)
                 .expect("job process member disappeared before removal");
-            state.members.remove(index);
-            state.complete_if_ready()
+            let completed = state.complete_if_ready();
+            (removed, completed)
         };
+        assert!(
+            matches!(removed, MemberEntry::Process(_)),
+            "job process entry kind changed"
+        );
+        drop(removed);
         completed.then(|| CompletionCursor::new(self.clone()))
     }
 
     /// 按 Pid 查直接成员（仅可见 Process 条目；占位对派生不可见）。
     pub(crate) fn member_process(&self, pid: Pid) -> Option<Arc<Process>> {
         let state = self.state.lock();
-        state
-            .members
-            .iter()
-            .find(|(id, _)| *id == pid)
-            .and_then(|(_, entry)| match entry {
-                MemberEntry::Process(process) => Some(process.clone()),
-                MemberEntry::Reserved { .. } => None,
-            })
+        state.members.get(pid).and_then(|entry| match entry {
+            MemberEntry::Process(process) => Some(process.clone()),
+            MemberEntry::Reserved { .. } => None,
+        })
     }
 
     /// 按 JobId 查直接 child（仅可见 Job 条目；占位对派生不可见）。
     pub(crate) fn child_job(&self, jid: JobId) -> Option<Arc<Job>> {
         let state = self.state.lock();
-        state
-            .children
-            .iter()
-            .find(|(id, _)| *id == jid)
-            .and_then(|(_, entry)| match entry {
-                ChildEntry::Job(job) => Some(job.clone()),
-                ChildEntry::Reserved { .. } => None,
-            })
+        state.children.get(jid).and_then(|entry| match entry {
+            ChildEntry::Job(job) => Some(job.clone()),
+            ChildEntry::Reserved { .. } => None,
+        })
     }
 
     /// 游标分页枚举（锁内收集；ids 长度即单批容量上限，非零）。
     fn enumerate(&self, kind: JobMemberKind, cursor: u64, ids: &mut [u64]) -> (usize, bool) {
         let state = self.state.lock();
         match kind {
-            JobMemberKind::ChildJobs => scan_visible(
-                &state.children,
+            JobMemberKind::ChildJobs => state.children.scan_visible(
                 |entry| matches!(entry, ChildEntry::Job(_)),
                 cursor,
                 ids,
             ),
-            JobMemberKind::MemberProcesses => scan_visible(
-                &state.members,
+            JobMemberKind::MemberProcesses => state.members.scan_visible(
                 |entry| matches!(entry, MemberEntry::Process(_)),
                 cursor,
                 ids,
@@ -540,14 +530,10 @@ impl Job {
         };
         let live_processes = state
             .members
-            .iter()
-            .filter(|(_, entry)| matches!(entry, MemberEntry::Process(_)))
-            .count();
+            .count_matching(|entry| matches!(entry, MemberEntry::Process(_)));
         let live_children = state
             .children
-            .iter()
-            .filter(|(_, entry)| matches!(entry, ChildEntry::Job(_)))
-            .count();
+            .count_matching(|entry| matches!(entry, ChildEntry::Job(_)));
         JobSnapshot {
             jid: self.jid,
             parent_jid: self.parent_jid,

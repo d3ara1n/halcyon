@@ -1,6 +1,6 @@
 # Review findings 统筹导航
 
-> A–E 首审已结束，不重复发起首审。当前工作是按系统机制收口 findings，而不是逐篇报告顺序打补丁。事务与启动主线处于设计冻结前，入口为 [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md)。
+> A–E 首审已结束，不重复发起首审。地址空间、等待、调度、生命周期终段与启动发布主线已经实现并完成组合压力；当前剩余项按 Admission、Capability/owner、Supervision 与工程 lint 各专题继续收口，不按报告顺序打补丁。事务证据入口为 [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md)。
 
 ## 文档职责
 
@@ -26,7 +26,7 @@
 
 二者共享失败与提交原则，不合并成万能事务框架。基础机制继续保留：ledger 真值、funded owner、PoolBinding、MemoryObject permit、execution gate、Remote 确认链、有界 work debt 与 ProcessDrain。
 
-完成闭包须包含真实交付，不止于 ledger Complete。线程全寿命调度准入及全部等待意图出口已纵向迁移并通过集成验证；通用通知已有施工提交，departure、Tunnel 不可失败退役与 Process/Job 终段仍须接成同一完成责任链。现状、连接点、验证与自然序只登记在内存事务计划，不新增平行修复计划，也不把局部通过或中间提交视为专题完成。
+完成闭包包含真实调用者交付，不止于 ledger Complete。线程全寿命调度准入、全部等待意图出口、通用通知、ThreadDeparture、Tunnel 不可失败 detached close、ProcessDrain/Job 终段、地址空间来源与容量、Bootstrap/普通创建发布均已接成同一完成责任链并通过 core/stress。validated ELF 与公共 EXECUTE authority 仍是独立联合验收门，现状与证据只登记在内存事务计划，不新增平行修复计划。
 
 ### 其它专题
 
@@ -42,24 +42,28 @@
 
 | 报告 / 条目 | 契约与实施 owner | 当前处置边界 |
 |---|---|---|
-| A：WritePermit rollback、同对象 owner、post-Commit 容量 | 内存事务计划，纵向单元一 | `4e62979` 有局部修复；统一来源 owner、跨批次与存储预算尚未闭合 |
+| A：WritePermit rollback、同对象 owner、post-Commit 容量 | 内存事务计划，纵向单元一 | 已以事务来源、AVL view owner、region delta、backing growth 与预付 completion 闭合；终段复核发现并修复 Existing owner 竞态，未留高严重度 finding |
 | A：EXECUTE capability、RX rights | Capability 计划，rights 纵向子单元 | 完整 RX authority/验收的前置；不能由 MemoryChange 重造权限规则 |
 | B-1 F-1/F-2：DT status、FramePool arithmetic | Admission 计划，平台输入子单元 | 编码前回到固定规范核对接受/拒绝集合；不凭历史建议猜标准 |
 | B-1 F-3/F-4：MemoryPool Drop、SystemSupply query | Capability/owner 计划，相应消费边界子单元 | 用户态错误政策与纯 ticket 查询独立实现，不套内核事务类型 |
-| B-2 F-1：Bootstrap post-commit | 内存事务计划，纵向单元二 | 审查必须延伸至 `boot.rs` / Ready 发布，不能只前移 Attach |
+| B-2 F-1：Bootstrap post-commit | 内存事务计划，纵向单元二 | typed Handle commit、Job/lifecycle/execution 同锁区发布与首次 Ready 预付已闭合；终段复核未见 Commit 后可恢复失败 |
 | C-1 P1-01/P1-02/P2-08：监督 authority、服务缺失、无限等待 | Supervision 计划 | 保留控制权直至可靠收束或明确接管；不由内核代做政策 |
 | C-1 P2-06：q-only CPU capability | Admission 计划 | 与 canonical CPU admission 同单元 |
-| C-1 P2-07：ThreadControl CLOSED | Capability 计划，signal 子单元 | allowed signal 与真实可达状态一致 |
-| C-2 F1/F2：Remote token identity、AddressSpace epoch | Identity 计划 | 策略唯一；事务依赖的凭据与 epoch 门禁随单元一接入 |
-| C-2 F3：UserStack cleanup | Capability/owner 计划 | 与 Join/reaper、监督政策确定交接，不在 Drop 无限重试 |
-| D-1 P2-D1-03：MappingLease 失败/析构验证 | 内存事务计划，纵向单元一 | 对当前 Tunnel lease 结构复核，不复活历史 MappingLease 类型 |
+| C-1 P2-07：ThreadControl CLOSED | Capability 计划，signal 子单元 | 已收窄为仅允许真实持续电平 DONE，并加入 stress 负向断言；待报告复核 |
+| C-2 F1/F2：Remote token identity、AddressSpace epoch | Identity 计划 | Remote `TableId` 与 epoch CAS 耗尽门已随事务接入；其它容器 identity 仍由专题复核 |
+| C-2 F3：UserStack cleanup | Capability/owner 计划 | release 与构造 map 均对事务 `ObjectBusy` 有界退避；Drop/监督的一般错误政策仍归 owner 专题 |
+| D-1 P2-D1-03：MappingLease 失败/析构验证 | 内存事务计划，纵向单元一 | 显式 close 走完整 MemoryChange；REAPABLE detached close 并入 ProcessDrain，无后置 funding |
 | D-2 F-02：启动 reservation 区间 | Admission 计划 | 先核对当前规范化供给机制，已被覆盖的历史路径不重复修复 |
 | D-2 F-05/F-06：ELF entry、PT_INTERP/flags | Admission 计划，ELF 纵向子单元 | runtime parser、audit、launcher 共用 validated image；构造单元二消费它 |
-| D-2 F-07：reservation token | Identity 计划 | Handle/Job 各容器凭据绑定身份；Ready 已由保活容量 core + affine owner 校验来源，无整数 token 待办 |
-| E-1 M3-1：Bound 镜像失败 | 内存事务计划，纵向单元二 | 私有失败驱动与正式 Drain 同源，不隐藏在 Drop 中 |
+| D-2 F-07：reservation token | Identity 计划 | Ready 由保活 core 校验；Handle 最终发布新增 typed prepared token，Job/Work-debt 仍由 identity 专题统一复核耗尽 |
+| E-1 M3-1：Bound 镜像失败 | 内存事务计划，纵向单元二 | 预付 `UnpublishedReservation` 与显式 rollback 已闭合；Drop 只作未消费 token 断言 |
 | E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | Admission 计划 | canonical admitted 集合与失败广播 |
 | E-2 E2-5-01：RPC reject capability/port | Capability/owner 计划，RPC 接收子单元 | 消费拒绝消息及旧端口，不复用污染状态 |
 | E-2 E2-7-01：clippy / lint 门 | E-2 报告 | 独立工程项，不阻塞内存结构设计；不能宣称全仓 lint-clean |
+
+### 本轮终段复核
+
+最终只读高严重度审查发现一项可达回归：object Map 在 Complete 阶段冻结 `Existing` owner，而并发最后 region retire 可在 Commit 前摘除它。修复后每次 object Map 都预付一个可插入 AVL 候选节点，Commit 按当时表状态复用或安装；满表 existing→remove→insert 由 `ordered_table` 回归测试覆盖。审查同时复核 Commit 后分配/错误、Handle/Job/lifecycle/Ready 原子发布、backing/permit 退役、三队列 fairness 与 Tunnel detached close，未发现其它高严重度 finding。
 
 ### 已有后续修复证据的历史条目
 
@@ -94,7 +98,7 @@
 
 ## 首审报告索引
 
-每份报告保留其目标提交、执行命令和验证限制。当前代码准备基线为 `4e62979`；其后施工提交已增加等待/离场、epoch、Remote 身份、退役来源冻结、Tunnel detached-close owner 与锁阶修复。它们仍属于整体施工，不代表 findings 已闭合；不能把局部验证或干净工作树视为专题完成。
+每份报告保留其目标提交、执行命令和验证限制。当前未提交实现建立在 `ef0cbe2` 之上；此前施工提交与本轮工作树共同完成等待/离场、epoch、Remote 身份、退役来源冻结、Tunnel detached close、稳定 Job/view 容器、backing 累计容量与启动原子发布。该机制单元已通过组合压力，但其它专题 findings 仍未闭合；不能据此归档整个 A–E Review program。
 
 | 批次 | 报告 | 历史目标范围 |
 |---|---|---|

@@ -284,8 +284,8 @@ impl ProcessControl {
         self.state.lock().dead.is_some()
     }
 
-    pub(crate) fn release_drain_owner(&self) {
-        self.state.lock().drain_owner.take();
+    pub(crate) fn take_drain_owner(&self) -> Option<Arc<Process>> {
+        self.state.lock().drain_owner.take()
     }
 }
 
@@ -412,28 +412,33 @@ fn create_staged(
     let builder = ProcessBuilder::new(process.clone())?;
     let control = ProcessControl::new(&process)?;
     process.set_control(Arc::downgrade(&control));
-    let builder_entry = super::handle::entry(
-        ProcessBuilder::object_ref(&builder),
-        HandleRole::ProcessBuilder,
-        Rights::MAP | Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
-    )
-    .map_err(super::handle::map_error)?;
-    let control_entry = super::handle::entry(
-        ProcessControl::object_ref(&control),
-        HandleRole::ProcessControl,
-        control_rights,
-    )
-    .map_err(super::handle::map_error)?;
-
-    let mut entries = Vec::new();
-    entries
-        .try_reserve(2)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    entries.push(builder_entry);
-    entries.push(control_entry);
+    let mut entries = super::handle::PendingEntries::try_new(2)?;
+    entries.push(
+        super::handle::entry(
+            ProcessBuilder::object_ref(&builder),
+            HandleRole::ProcessBuilder,
+            Rights::MAP | Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
+        )
+        .expect("ProcessBuilder rights were validated statically"),
+    );
+    entries.push(
+        super::handle::entry(
+            ProcessControl::object_ref(&control),
+            HandleRole::ProcessControl,
+            control_rights,
+        )
+        .expect("ProcessControl rights were validated before construction"),
+    );
     let token = super::handle::transaction_token();
     let mut table = thread.process.handles.lock();
-    let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
+    let reservation = match table.reserve(2, token) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            drop(table);
+            entries.close(&thread.process, false);
+            return Err(super::handle::map_error(error));
+        }
+    };
     let result = ProcessCreateResult {
         builder: reservation.handles()[0],
         control: reservation.handles()[1],
@@ -447,20 +452,41 @@ fn create_staged(
         table
             .rollback(reservation)
             .expect("ProcessCreate reservation must remain owned");
+        drop(table);
+        entries.close(&thread.process, false);
         return Err(error.into());
     }
     // SAFETY: ProcessCreateResult 无 padding；复检失败即杀本进程
     // （deliver_output），未提交的预留随进程消亡。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }?;
+    if let Err(error) =
+        unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
+    {
+        drop(space);
+        table
+            .rollback(reservation)
+            .expect("ProcessCreate reservation must remain owned");
+        drop(table);
+        entries.close(&thread.process, false);
+        return Err(error);
+    }
     drop(space);
-    // 提交序（F4）：capability 对其他线程可见前先完成不可失败的成员
-    // 提交——早干活（kill/drain）必命中已提交成员，不会把 Dead core
-    // 提交成永久成员。输出值此刻仍是 Reserved 槽号（不可用），
-    // table.commit 后才成为有效 Handle。
-    job.commit_member(member_reservation, process);
-    table
-        .commit(reservation, entries)
-        .expect("ProcessCreate reservation count matches entry");
+    let prepared = match table.prepare_commit(reservation, entries.take()) {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let error = failure.error;
+            drop(table);
+            super::handle::PendingEntries::from_vec(failure.into_entries())
+                .close(&thread.process, false);
+            return Err(super::handle::map_error(error));
+        }
+    };
+    // 提交序（F4）：caller HandleTable 已在外层持有，再取 Job owner 锁；成员
+    // 替换与 capability commit 在释放任一锁前同时完成。枚举派生与新 handle
+    // 因而都不可能观察到另一侧尚未提交的 child。
+    process.mark_job_member_committed();
+    job.commit_member_with(member_reservation, process, || {
+        table.commit_prepared(prepared);
+    });
     Ok(())
 }
 
@@ -946,29 +972,56 @@ fn start_staged(
 /// 等待取消走锁外游标：每次只持一个 weak context，零分配——摘取与
 /// 自然完成的竞争由单 outcome 仲裁，胜者负责线程消散与离场确认。
 pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo) {
-    loop {
-        let Some(weak) = process.lifecycle.take_first_waiting() else {
-            break;
-        };
-        if let Some(context) = weak.upgrade() {
-            if context.offer(WaitOutcome::Abandoned) == OfferResult::Complete {
-                // 完成方负责收尾：线程 drop 与离场确认在 finish 内完成。
-                finish_offered(context);
-            }
-        }
-    }
-    // 预育成员游标：预育线程从未进入容器，摘除即完成（强引用锁外释放，
-    // 打破 Building 期的 Process↔Thread 引用环）。
-    while let Some(thread) = process.lifecycle.take_first_staging() {
-        drop(thread);
+    if !todo.started {
+        return;
     }
     if todo.ipi_slots != 0 {
         crate::registry::ipi_slots(todo.ipi_slots);
     }
-    // Staging 摘除可能使 REAPABLE 条件达成（todo 组装时成员尚在）。
-    if todo.reapable || process.lifecycle.is_reapable() {
+    let reservation = process.take_termination_reservation();
+    if todo.reapable {
+        drop(reservation);
+        control_publish_reapable(&process.control());
+        return;
+    }
+    let slots = process.lifecycle.termination_slot_count();
+    if slots == 0 {
+        // 仅有 active 执行点时由其 trap departure 发布 REAPABLE，无需空债务。
+        drop(reservation);
+        return;
+    }
+    reservation.publish(process.clone(), slots);
+}
+
+/// termination debt 每步只检查一个稳定成员槽；空槽同样诚实计费。
+pub(crate) fn advance_termination_cleanup(
+    process: &Arc<Process>,
+    cursor: &mut usize,
+    slots: usize,
+    budget: usize,
+) -> (usize, bool) {
+    let mut used = 0;
+    while used < budget && *cursor < slots {
+        let index = *cursor;
+        *cursor += 1;
+        used += 1;
+        match process.lifecycle.take_termination_slot(index) {
+            super::lifecycle::TerminationSlot::Vacant => {}
+            super::lifecycle::TerminationSlot::Waiting(weak) => {
+                if let Some(context) = weak.upgrade()
+                    && context.offer(WaitOutcome::Abandoned) == OfferResult::Complete
+                {
+                    finish_offered(context);
+                }
+            }
+            super::lifecycle::TerminationSlot::Staging(thread) => drop(thread),
+        }
+    }
+    let complete = *cursor == slots;
+    if complete && process.lifecycle.is_reapable() {
         control_publish_reapable(&process.control());
     }
+    (used, complete)
 }
 
 fn control_publish_reapable(control: &Option<Arc<ProcessControl>>) {

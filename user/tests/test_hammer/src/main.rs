@@ -346,6 +346,7 @@ fn threaded_memory_churn(gun: Handle) -> ! {
 fn thread_suite() {
     debug!("hammer target: same-address-space thread suite started");
     stale_translation_reuse();
+    fragmented_backing_retire();
     concurrent_tunnel_close();
     join_publication();
     raw_thread_storm();
@@ -567,6 +568,11 @@ fn raw_thread_storm() {
         probe.tid > last_tid,
         "thread id regressed after capacity recovery"
     );
+    assert_eq!(
+        wait_many(&[WaitItem::new(probe.control, ObjectSignals::CLOSED, 0)], 1,),
+        Err(SystemCallError::IllegalArgument),
+        "ThreadControl accepted unreachable CLOSED interest"
+    );
     let item = WaitItem::new(probe.control, ObjectSignals::DONE, 1);
     let observed = wait_many(core::slice::from_ref(&item), WAIT_TIMEOUT_INFINITE)
         .expect("storm probe wait failed");
@@ -763,6 +769,28 @@ fn unmap_churn_region(mut region: MappedRegion) {
             Err((_returned, error)) => panic!("memory churn Unmap failed: {error:?}"),
         }
     }
+}
+
+fn fragmented_backing_retire() {
+    const PAGES: usize = 260;
+
+    let region = map_churn_region(PAGES * PROCESS_PAGE_SIZE);
+    let usable = region
+        .usable()
+        .expect("fragmented backing Map has no usable range");
+    for page in (0..PAGES).step_by(2) {
+        let start = usable.start + page * PROCESS_PAGE_SIZE;
+        protect_churn_region(
+            &region,
+            start..start + PROCESS_PAGE_SIZE,
+            MemoryProtection::ReadOnly,
+        );
+    }
+    unmap_churn_region(region);
+    debug!(
+        "hammer target: fragmented backing retire passed: {} pages",
+        PAGES
+    );
 }
 
 fn memory_churn() -> ! {
