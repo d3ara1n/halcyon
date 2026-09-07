@@ -1226,10 +1226,18 @@ impl RetiringSpaceChange {
 
 /// Remote ack 后只把事务推进到 Retiring 并发布 work debt。队列 owner 在安全点
 /// 逐批释放 table/backing/object owner，最后才 Complete ledger 与外部义务。
+enum CompletionFinalization {
+    PublishMandatory,
+    ReleaseResult,
+    FinishWaiter,
+    Done,
+}
+
 pub(crate) struct MemoryChangeCompletion {
     process: Arc<Process>,
     waiter: Arc<super::wait::WaitContext>,
     retire: Option<Arc<dyn MemoryRetireSink>>,
+    finalization: crate::sync::Spinlock<Option<CompletionFinalization>>,
     published: crate::sync::Spinlock<Option<PublishedSpaceChange>>,
     retiring: crate::sync::Spinlock<Option<RetiringSpaceChange>>,
     work: crate::sync::Spinlock<Option<crate::deferred_work::Reservation>>,
@@ -1252,6 +1260,7 @@ impl MemoryChangeCompletion {
             process,
             waiter,
             retire,
+            finalization: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             published: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             retiring: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, None),
             work: crate::sync::Spinlock::new(crate::sync::ranks::MEMORY_COMPLETION, Some(work)),
@@ -1273,29 +1282,57 @@ impl MemoryChangeCompletion {
     /// 进程与线程义务。返回 `(实际步骤, 已完成)`。
     pub(crate) fn advance_retire(&self, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
-        let mut change = self
-            .retiring
-            .lock()
-            .take()
-            .expect("work debt ran without a Retiring memory change");
-        for used in 1..=budget {
-            if !change.advance(&self.process.space, self.retire.as_deref()) {
+        let mut change = self.retiring.lock().take();
+        let mut used = 0;
+        while used < budget {
+            if let Some(stage) = self.finalization.lock().take() {
+                used += 1;
+                match stage {
+                    CompletionFinalization::PublishMandatory => {
+                        if self.process.lifecycle.complete_mandatory()
+                            && let Some(control) = self.process.control()
+                        {
+                            control.publish_reapable();
+                        }
+                        self.finalization
+                            .lock()
+                            .replace(CompletionFinalization::ReleaseResult);
+                    }
+                    CompletionFinalization::ReleaseResult => {
+                        let result_obligation = self.result_obligation.lock().take();
+                        drop(result_obligation);
+                        self.finalization
+                            .lock()
+                            .replace(CompletionFinalization::FinishWaiter);
+                    }
+                    CompletionFinalization::FinishWaiter => {
+                        self.waiter.clone().complete_kernel();
+                        self.finalization
+                            .lock()
+                            .replace(CompletionFinalization::Done);
+                    }
+                    CompletionFinalization::Done => return (used, true),
+                }
                 continue;
             }
-            if self.process.lifecycle.complete_mandatory()
-                && let Some(control) = self.process.control()
-            {
-                control.publish_reapable();
+            let completed = {
+                let change = change
+                    .as_mut()
+                    .expect("retire completion lost its finalization state");
+                change.advance(&self.process.space, self.retire.as_deref())
+            };
+            used += 1;
+            if completed {
+                self.finalization
+                    .lock()
+                    .replace(CompletionFinalization::PublishMandatory);
+                change = None;
             }
-            // ThreadControl DONE 必须晚于 result lease 与 AddressSpace Complete；
-            // 先释放 affine 线程义务，再完成仍存活调用者的 WaitContext。
-            let result_obligation = self.result_obligation.lock().take();
-            drop(result_obligation);
-            self.waiter.clone().complete_kernel();
-            return (used, true);
         }
-        self.retiring.lock().replace(change);
-        (budget, false)
+        if let Some(change) = change {
+            self.retiring.lock().replace(change);
+        }
+        (used, false)
     }
 }
 
