@@ -30,7 +30,7 @@
 
 时间片为固定量子，tickless：调度循环每次新 dispatch 前调用 `arm_quantum`，Resume 热路径不重置量子；同时取本 hart TimerQueue 堆顶与量子截止的较近者设置 timer。公平性由 FIFO 队列的结构性质保证，不依赖额外记账字段。
 
-ProcessWrite 可由其它 hart 通过物理直映射填充可执行帧。调度循环先经 `synchronize_local` 和 lifecycle execution gate 复检 AddressSpace 的 translation/instruction epoch，再进入用户态；当前每次新 dispatch 还无条件执行本 hart `fence.i`。epoch 与 active 确认协议见 [`mm.md`](mm.md)，附加 fence 的删除条件由地址空间事务计划统一审计。
+ProcessWrite 可由其它 hart 通过物理直映射填充可执行帧。调度循环先经 `synchronize_local` 和 lifecycle execution gate 复检 AddressSpace 的 translation/instruction epoch，再进入用户态；指令流同步由 AddressSpace 事务从真实 Install/Protect 意图派生，并由远端请求或 `_ret_to_user` 的统一地址空间切换出口执行，调度器不再重复发出 `fence.i`。epoch 与 active 确认协议见 [`mm.md`](mm.md)。
 
 ### 单一归属不变量
 

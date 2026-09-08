@@ -55,4 +55,4 @@ UserContext、FpState、HartLocal、FatalFrame 与 SchedulerFrame 的布局由 R
 
 内核稳态 SUM=0；uaccess 在持 AddressSpace 锁并完成范围验证后临时开启 SUM。同步 syscall 输出使用 `deliver_output`，复检失败冻结调用进程 Fault；异步 WaitMany 结果尽力写回，失败经错误通道交付。
 
-ProcessWrite 只在 Building 阶段经物理直映射写 backing。调度器 Acquire 取得发布线程后，在每次新 dispatch 前执行本 hart `fence.i`；Resume 不重复执行。已发布 executable page 没有普通写入口。
+ProcessWrite 只在 Building 阶段经物理直映射写 backing。调度器 Acquire 取得发布线程后，由 AddressSpace 事务根据真实 Install/Protect 意图推进 instruction epoch；远端同步或 `_ret_to_user` 的统一地址空间切换出口执行本地 `fence.i`，Resume 不再依赖调度器重复补发。已发布 executable page 没有普通写入口。

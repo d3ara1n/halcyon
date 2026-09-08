@@ -441,10 +441,8 @@ pub fn run() -> ! {
         }
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         arm_quantum();
-        // ProcessWrite 可经另一 hart 的直映射回填可执行页；除上面的
-        // execution gate epoch 同步外，每次新 dispatch 还执行本地 fence.i。
-        // SAFETY: fence.i 是本 hart 指令流同步，不触碰内存。
-        unsafe { asm!("fence.i", options(nostack, preserves_flags)) };
+        // 指令流同步由 AddressSpace instruction epoch 的远端请求，或
+        // `_ret_to_user` 的统一地址空间切换出口负责；调度器不再重复执行 fence.i。
         // SAFETY: 执行点已装好（帧/satp/线程），tp 不变量成立。
         let outcome = unsafe { trap::ret_to_user() };
         me.clear_context();

@@ -159,15 +159,9 @@ pub(crate) fn supply_funded_table_frames(
         .try_reserve_exact(count)
         .map_err(|_| SpaceError::NoFrame)?;
     for _ in 0..count {
+        // `fund_user_table_frame` 交付前已经通过 funded broker 清零；表页 owner
+        // 的初始化责任集中在 funding seam，避免每个调用点重复清零。
         let owner = frame::fund_user_table_frame(pool).map_err(map_funded_error)?;
-        // SAFETY: newly claimed table frame is exclusively owned and page aligned.
-        unsafe {
-            core::ptr::write_bytes(
-                mm::phys_to_virt(owner.frame().addr()) as *mut u8,
-                0,
-                PAGE_SIZE,
-            );
-        }
         owners.push(owner);
     }
     Ok(owners)
@@ -563,6 +557,25 @@ pub(crate) struct ObjectMapFailure {
 }
 
 impl PreparedMemoryChange {
+    /// 指令流同步需求由已准备事务中的真实翻译意图推导，避免调用点遗漏 RX Map。
+    pub(crate) fn requires_instruction_sync(&self) -> bool {
+        self.get().change.translation_intents().iter().any(|intent| {
+            matches!(
+                intent,
+                TranslationIntent::Install {
+                    protection: Protection::ReadExecute,
+                    ..
+                } | TranslationIntent::Protect {
+                    from: Protection::ReadExecute,
+                    ..
+                } | TranslationIntent::Protect {
+                    to: Protection::ReadExecute,
+                    ..
+                }
+            )
+        })
+    }
+
     fn allocate() -> Result<Self, SpaceError> {
         Box::try_new(None)
             .map(Self)
@@ -2015,9 +2028,12 @@ fn start_running_memory_change(
     process: Arc<Process>,
     mut prepared: Option<PreparedMemoryChange>,
     shootdown_range: LedgerPageRange,
-    instruction: bool,
     output: ChangeOutput,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let instruction = prepared
+        .as_ref()
+        .expect("running memory change must retain its prepared owner")
+        .requires_instruction_sync();
     let writes_map_payload = matches!(output, ChangeOutput::MapResult(_));
     let result_obligation = match output {
         ChangeOutput::MapResult(obligation) => Some(obligation),
@@ -2172,7 +2188,6 @@ pub(crate) fn finish_running_map(
         process,
         Some(prepared),
         layout.reservation,
-        false,
         ChangeOutput::MapResult(thread.result_obligation()),
     )
 }
@@ -2199,7 +2214,6 @@ pub(crate) fn memory_unmap(
         requirements,
         backing_permits,
         range,
-        false,
     )
 }
 
@@ -2219,14 +2233,6 @@ pub(crate) fn memory_protect(
         let mut space = process.space.lock();
         space.validate_user_protect(range, protection)?
     };
-    // 只有进出可执行权限的变更需要 instruction epoch 与 `FENCE.I`。
-    let instruction = validated.translation_intents().iter().any(|intent| {
-        matches!(
-            intent,
-            TranslationIntent::Protect { from, to, .. }
-                if *from == Protection::ReadExecute || *to == Protection::ReadExecute
-        )
-    });
     start_existing_change(
         thread,
         process,
@@ -2234,7 +2240,6 @@ pub(crate) fn memory_protect(
         requirements,
         Vec::new(),
         range,
-        instruction,
     )
 }
 
@@ -2250,7 +2255,6 @@ fn start_existing_change(
     requirements: Vec<PermitRequirement>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
     range: LedgerPageRange,
-    instruction: bool,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
     let (permits, sources) = match acquire_view_permits(&process, &requirements) {
         Ok(acquired) => acquired,
@@ -2274,13 +2278,7 @@ fn start_existing_change(
     plan.backing_permits = backing_permits;
     let prepared = fund_and_complete_running(&process, plan)?;
     let _ = thread;
-    start_running_memory_change(
-        process,
-        Some(prepared),
-        range,
-        instruction,
-        ChangeOutput::None,
-    )
+    start_running_memory_change(process, Some(prepared), range, ChangeOutput::None)
 }
 
 /// 按 Validate 报告的多重集向每个来源对象取得 WritePermit。任何一项失败时，已取得
