@@ -348,6 +348,7 @@ fn thread_suite() {
     stale_translation_reuse();
     fragmented_backing_retire();
     concurrent_tunnel_close();
+    tunnel_close_attach();
     join_publication();
     raw_thread_storm();
     debug!("hammer target: same-address-space thread suite passed");
@@ -719,6 +720,92 @@ fn concurrent_tunnel_close() {
             round
         );
     }
+}
+
+/// 两个有序结果与真实跨执行点竞争共用同一套断言；不靠某轮恰好命中时序。
+fn tunnel_close_attach() {
+    use core::sync::atomic::AtomicUsize;
+    const PEER_VA: usize = THREAD_TUNNEL_VA + 0x20_0000;
+    for round in 0..24 {
+        let pair = rinlib::ipc::tunnel::create(THREAD_TUNNEL_VA)
+            .expect("close/Attach TunnelCreate failed");
+        let phase = Arc::new(AtomicUsize::new(0));
+        let child_phase = phase.clone();
+        let policy = round / 8;
+        let worker = thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                while child_phase.load(Ordering::Acquire) == 0 {
+                    thread::yield_now().expect("Attach gate yield failed");
+                }
+                let result = loop {
+                    match rinlib::ipc::tunnel::attach(pair.peer, PEER_VA) {
+                        Err(SystemCallError::ObjectBusy) => {
+                            thread::yield_now().expect("Attach retry yield failed")
+                        }
+                        other => break other,
+                    }
+                };
+                match result {
+                    Ok(endpoint) => {
+                        assert_ne!(policy, 1, "Attach succeeded after creator close completed");
+                        assert_eq!(
+                            close(pair.peer),
+                            Err(SystemCallError::StaleHandle),
+                            "Attach did not consume Invitation"
+                        );
+                        child_phase.store(2, Ordering::Release);
+                        while child_phase.load(Ordering::Acquire) != 3 {
+                            thread::yield_now().expect("peer close gate yield failed");
+                        }
+                        close_churn_handle(endpoint).expect("attached Endpoint close failed");
+                        assert_eq!(close(endpoint), Err(SystemCallError::StaleHandle));
+                    }
+                    Err(error) => {
+                        assert_eq!(error, SystemCallError::ObjectClosed);
+                        assert_ne!(policy, 0, "ordered Attach unexpectedly lost to close");
+                        close(pair.peer).expect("failed Attach consumed Invitation");
+                        assert_eq!(close(pair.peer), Err(SystemCallError::StaleHandle));
+                        child_phase.store(2, Ordering::Release);
+                    }
+                }
+            })
+            .expect("close/Attach worker spawn failed");
+        if policy == 1 {
+            close_churn_handle(pair.owner).expect("ordered creator close failed");
+            phase.store(1, Ordering::Release);
+        } else {
+            phase.store(1, Ordering::Release);
+            if policy == 0 {
+                while phase.load(Ordering::Acquire) != 2 {
+                    thread::yield_now().expect("ordered Attach gate yield failed");
+                }
+            }
+            close_churn_handle(pair.owner).expect("racing creator close failed");
+        }
+        assert_eq!(close(pair.owner), Err(SystemCallError::StaleHandle));
+        // worker 的状态 2 不能在主线程状态 3 后覆盖，先确认 Attach 已结束。
+        while phase.load(Ordering::Acquire) != 2 {
+            thread::yield_now().expect("Attach completion gate yield failed");
+        }
+        phase.store(3, Ordering::Release);
+        worker.join();
+        // 每一轮都用普通映射复用两端 VA，直接确认两笔 lease/PTE 已撤销。
+        for address in [THREAD_TUNNEL_VA, PEER_VA] {
+            let region = MappedRegion::map_anonymous(
+                PROCESS_PAGE_SIZE,
+                0,
+                0,
+                MemoryProtection::ReadWrite,
+                Placement::FixedEmpty {
+                    usable_start: address,
+                },
+            )
+            .expect("closed Tunnel left a mapping behind");
+            unmap_churn_region(region);
+        }
+    }
+    debug!("hammer target: Tunnel close/Attach failure matrix passed: 24 rounds");
 }
 
 fn map_churn_region(bytes: usize) -> MappedRegion {

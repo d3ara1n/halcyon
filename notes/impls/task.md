@@ -184,7 +184,7 @@ per-hart 帧。
 | NOTIFICATION | 唯一以 space 为外层的对象锁边 | — |
 | OBJECT_WAIT | Job.wait、ProcessControl、Endpoint、ProcessBuilder、Process.control 回指槽 | — |
 | LIFECYCLE | 生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入） | — |
-| MEMORY_COMPLETION | Commit gate 内填充一次的 PublishedChange 槽 | — |
+| MEMORY_COMPLETION | Commit gate 内填充一次的 PublishedChange 槽、Thread 输出失败终止待办槽 | — |
 | REMOTE_CALL | 固定 hart 请求槽；只在 AddressSpace/Lifecycle Commit 内短发布 | — |
 | HEAP | talc（RankedRawSpinlock 类型级注入；几乎被全部容器锁内获取，故置顶） | — |
 | POOL | 物理帧池（HEAP 与空间锁的内层） | — |

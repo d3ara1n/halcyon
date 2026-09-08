@@ -36,4 +36,8 @@ Endpoint 的等待订阅复用通用 ObjectWaitState/WaitContext；WaitContext�
 
 `test_hammer::concurrent_tunnel_close` 覆盖 Endpoint close 与同地址空间普通 Unmap 的 8 轮并发；`tunnel_exit_target` 留存 Endpoint，由 stress 的 16 轮进程退出验证 ProcessDrain 接管。core 检查正常 Create/Attach/close、peer 状态及 Pool charge 退款。
 
-精确 Conflict/NoFrame、输出写回失败、close-vs-Attach 交错，以及失败前后 permit/backing/table/Pool 守恒的直接内核注入证据仍不足，由 [`D-1 P2-D1-03`](../../plans/review-2026-09-mechanism-generalization.md) 唯一承接；已有压力通过不替代这些失败验证。用户态页内协议见 [`runnel.md`](runnel.md)。
+`os/kernel/src/task/tunnel/selftest.rs` 在调度开始前建立隔离 Building fixture，调用真实 Create/Attach 验证 VA Conflict、无效输出和完整 Prepare 后无 Running 提交资格的回滚。创建端持真实已提交 view，Attach 失败后核对 Invitation 保留、无目标 PTE 和 write_views 不变。表页 funding 以暂存全部可用额度触发 QuotaExceeded；测试 owner 真实占满堆，投影准备返回 NoFrame，Attach 返回 OutOfMemory，结束后释放全部压力分配，无生产故障开关。
+
+输出竞态用确定性顺序固定：输出初检成功→真实 MemoryUnmap 撤销输出页→Tunnel Prepare→正式 deliver_output 复检失败→abandon_mapping。fixture 经 lifecycle 的 Running/active 与离场接口模拟调用者，检查 Fault 终因、Invitation 未消费、permit/PTE 回滚；最终以一 work unit 的 ProcessDrain 归还全部 owner，比较 Pool/frame 和 16 类 metadata admission 库存。该用例验证真实内核事务与写回失败 seam，不依赖概率窗口。
+
+`test_hammer::tunnel_close_attach` 在用户态执行三组各 8 轮：Attach 先完成、creator close 先完成、并发竞争。成功必须消费 Invitation；失败必须保留可关闭的 Invitation；两端关闭后重复 close 必须拒绝，每轮以普通映射重用两端 VA 验证 lease/PTE 已撤销。所有新用例由 acceptance 强制锚点检查，原 [`D-1 P2-D1-03`](../../plans/review-2026-09-mechanism-generalization.md) 保留提交后复核记录。用户态页内协议见 [`runnel.md`](runnel.md)。

@@ -277,10 +277,11 @@ pub fn publish_ready() {
         .expect("runtime gate left Preparing before Ready publication");
 }
 
-/// 任何启动错误使本次启动整体失败；并发失败发布幂等，不做部分降级。
+/// 启动失败的无锁终段：Preparing 转 Failed，已发布的终态保持不变。
+/// 公共 panic/fatal 也可调用；Ready 表示启动已经结束，不能回退或再次 panic。
+/// GATE 位于普通内核 BSS，高半区 Rust 入口之前已清零；不依赖 registry 安装或 tp。
 pub fn publish_failed() {
-    GATE.publish_failed()
-        .expect("runtime gate cannot fail after Ready publication");
+    let _ = GATE.publish_failed();
 }
 
 /// 在线 hart 在此处自旋等待 Ready/Failed 判定（Acquire 观察发布）。

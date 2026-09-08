@@ -49,9 +49,7 @@ impl RuntimeGate {
             Ordering::Acquire,
         ) {
             Ok(_) => Ok(()),
-            Err(value) if value == GateState::Failed as u8 => {
-                Err(TransitionError::AlreadyFailed)
-            }
+            Err(value) if value == GateState::Failed as u8 => Err(TransitionError::AlreadyFailed),
             Err(_) => Err(TransitionError::AlreadyReady),
         }
     }
@@ -97,10 +95,47 @@ mod tests {
         failed.publish_failed().unwrap();
         failed.publish_failed().unwrap();
         assert_eq!(failed.state(), GateState::Failed);
-        assert_eq!(
-            failed.publish_ready(),
-            Err(TransitionError::AlreadyFailed)
-        );
+        assert_eq!(failed.publish_ready(), Err(TransitionError::AlreadyFailed));
+    }
+
+    #[test]
+    fn ready_racing_failure_has_one_terminal_outcome() {
+        for _ in 0..32 {
+            let gate = Arc::new(RuntimeGate::new());
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let ready = {
+                let gate = gate.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate.publish_ready()
+                })
+            };
+            let failure = {
+                let gate = gate.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate.publish_failed()
+                })
+            };
+            barrier.wait();
+            let ready = ready.join().unwrap();
+            let failure = failure.join().unwrap();
+            match gate.state() {
+                GateState::Ready => {
+                    assert_eq!(ready, Ok(()));
+                    assert_eq!(failure, Err(TransitionError::AlreadyReady));
+                    assert_eq!(gate.publish_failed(), Err(TransitionError::AlreadyReady));
+                }
+                GateState::Failed => {
+                    assert_eq!(ready, Err(TransitionError::AlreadyFailed));
+                    assert_eq!(failure, Ok(()));
+                    assert_eq!(gate.publish_failed(), Ok(()));
+                }
+                GateState::Preparing => panic!("competing publishers left the gate preparing"),
+            }
+        }
     }
 
     #[test]

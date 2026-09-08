@@ -101,8 +101,8 @@ pub unsafe fn write_user_value<T: Copy>(
 /// 事务拆除了输出页——等价于一次由内核代为检出的
 /// store access fault：用户可触发的 fault 杀进程，绝不 panic 内核；
 /// 副作用已发生的歧义由进程死亡清理兑底。调用方把 Err 向上传播
-/// 即可，分发出口的终止检查会把 Completed 改写为 Killed，线程不
-/// 回用户态。
+/// 即可；当前线程持有预付的待办交接槽，trap 在业务锁释放后交付终止，
+/// 再将出口改写为 Killed，线程不回用户态。
 ///
 /// # Safety
 /// `T` 的对象表示不得包含 padding 或其它未初始化字节（同
@@ -121,7 +121,9 @@ pub unsafe fn deliver_output<T: Copy>(
             erhino_shared::proc::ProcessFaultCode::StoreAccess as i64,
             Some(thread.member()),
         );
-        crate::task::process::run_termination_todo(&process, todo);
+        // 调用方仍可能持 Handle/Connection/AddressSpace 锁；IPI、debt 与通知
+        // 必须等这些 guard 全部释放，由当前 trap 统一交付，不能在这里出游。
+        thread.defer_output_termination(todo);
         error.into()
     })
 }

@@ -1,5 +1,11 @@
 # 系统审计批次 E-1：启动/页表/TLB 与 SMP/调度/对象生命周期
 
+## N-1 修复实现与验证（待固定提交复核）
+
+公共 panic/fatal/fatal_msg/bootstrap_fatal_report 在诊断前调用 `registry::publish_failed`，Preparing 单向转 Failed；Ready/Failed 不回退，也不会因再次失败递归 panic。普通 BSS 清零后的 Rust 环境不依赖 registry/tp；Bare PA 阶段保持独立停驻/Online 超时边界。
+
+`just virt-boot-failure` 以外部 GDB 在全员 Online、Ready 前分别注入坏 envelope 长度、分配失败和真实非法指令；三例均证实四个不同 hart 在 Gate Failed 后到达 park。日志在 `artifacts/boot-failure/`。runtime_gate 的 Ready-vs-Failed 竞争模型 debug/release 各 3 项通过。该路线已接入 `just acceptance`，完整 `THROTTLE=100 just acceptance` 退出 0（`artifacts/review-fixes/acceptance.log`）。实现完成，最终关闭由固定提交复核确认。
+
 ## 2026-09-08 提交后复核（E-1，新增 P1，仍开放）
 
 对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；WiseHare 独立只读审查，统筹者直接核对 rt/registry/boot。正式 send_to 报告包含下述 N-1，此前 peek 摘要漏报，不能作为“无新 P1”的依据。

@@ -4554,12 +4554,23 @@ pub struct Thread {
     departure: Arc<super::thread::ThreadDeparture>,
     normal_exit: AtomicBool,
     exit_code: AtomicI64,
+    /// 输出复检在业务锁内冻结终因，待办由当前 trap 在释放全部业务锁后交付。
+    output_termination: crate::sync::Spinlock<Option<super::lifecycle::TerminationTodo>>,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        assert!(
+            self.output_termination.get_mut().is_none(),
+            "thread dropped with undelivered output termination"
+        );
+    }
 }
 
 // SAFETY: UserContext 只在两种互斥状态下被访问：线程在本 hart 执行/
 // 挂起期间（trap 路径与 dispatcher 经执行点独占写）；或线程已无容器
 // （Waiting：发布时序保证完成方只见已离开一切 hart 引用的线程，见
-// sched::run 的 Park 发布分支）。其余字段原子或只读。
+// sched::run 的 Park 发布分支）。其余字段为原子、锁保护或只读。
 unsafe impl Sync for Thread {}
 
 impl Thread {
@@ -4595,7 +4606,26 @@ impl Thread {
             departure,
             normal_exit: AtomicBool::new(false),
             exit_code: AtomicI64::new(0),
+            output_termination: crate::sync::Spinlock::new(
+                crate::sync::ranks::MEMORY_COMPLETION,
+                None,
+            ),
         })
+    }
+
+    pub(crate) fn defer_output_termination(&self, todo: super::lifecycle::TerminationTodo) {
+        if todo.started {
+            let old = self.output_termination.lock().replace(todo);
+            assert!(old.is_none(), "output termination handed off twice");
+        }
+    }
+
+    /// 只在 syscall/业务 guard 全部释放后调用；当前执行容器保证 Thread 在交付前存活。
+    pub(crate) fn finish_output_termination(&self) {
+        let todo = self.output_termination.lock().take();
+        if let Some(todo) = todo {
+            super::process::run_termination_todo(&self.process, todo);
+        }
     }
 
     pub fn frame_ptr(&self) -> *mut UserContext {

@@ -56,6 +56,7 @@ pub fn load(address: usize, length: usize) {
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
     frame::funded_selftest(&root_pool);
+    task::tunnel::selftest::run(&root_pool);
     let pid = task::alloc_pid().expect("initial process identity exhausted");
     assert_eq!(pid, 1, "initial process must receive PID 1");
     let root_job = task::job::Job::root();

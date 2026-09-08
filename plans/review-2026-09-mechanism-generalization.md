@@ -1,5 +1,13 @@
 # 批次 D-1：机制泛化改造 Review（代码轴）
 
+## P2-D1-03 补证与同批修复（待固定提交复核）
+
+`task/tunnel/selftest.rs` 已加入隔离 Building fixture，生产 Create/Attach 直接覆盖 Conflict、无效输出、完整 Prepare 后缺失 Running 提交资格；真实表页额度耗尽与堆耗尽分别触发 QuotaExceeded/NoFrame/OutOfMemory。失败后检查 Invitation、PTE、write_views 与库存不变。输出页在初检后由真实 MemoryUnmap 撤销，随后 Tunnel Prepare/输出复检失败/显式 rollback；fixture 经同一 Fault/离场/一 work unit ProcessDrain 收束，最终比较完整 Pool/frame 与 16 类 metadata admission 库存。
+
+`test_hammer::tunnel_close_attach` 覆盖 Attach 先完成、close 先完成和并发竞争共 24 轮，每轮检查 Invitation 成功消费/失败保留、重复 close 为 StaleHandle、两端 VA 可以重新映射。已存在的 8 轮 close-vs-Unmap 和 16 轮退出压力继续保留。
+
+直接验证暴露的输出终止锁序缺陷已按下节结构修复；新 kernel 失败锚点和用户态 24 轮矩阵均被 acceptance 强制检查。完整 `THROTTLE=100 just acceptance` 退出 0，日志 `artifacts/review-fixes/acceptance.log`，debug/release 内核 ELF frame audit 均通过原上限。实现与补证完成，最终关闭等待固定提交复核。
+
 ## 2026-09-08 提交后复核（D-1，仍开放）
 
 对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；OliveWillow 独立只读审查，WiseHare 交叉核对，统筹者复查现有 guest 负载。正式结论取自两位 reviewer 的 send_to 回报，不采用此前 peek 摘要。
@@ -9,6 +17,12 @@
 | P1-D1-01 / INSTALLING 悬挂 | 闭合。`os/kernel/src/task/wait.rs:481` rejected park 走 Abandoned→finish_installing→begin_finish→完成责任交接。 |
 | P1-D1-02 / deadline 不注销 | 闭合。`wait.rs:282` TimeoutRegistration 在 outcome/finish 及注册竞态中取消 token；`sched.rs:307`、`:358` 进入 owner timer queue。timer_queue 的取消、owner、generation 与堆修复 host 测试通过。 |
 | P2-D1-03 / 失败回滚与析构验证 | **保持 P2 开放**。旧 MappingLease Drop 回取锁路径已由显式 MemoryChange/rollback 替换；`tunnel.rs:397` abandon_mapping 在空间锁外取消 writes，REAPABLE close_detached 在 `:1156` 只逻辑关闭并交给 ProcessDrain。结构改善不足以替代下述直接失败证据。 |
+
+### 实施中直接验证发现的输出终止锁序缺陷
+
+新隔离 fixture 在完整 Tunnel Prepare 后撤销输出页，直接命中 `uaccess::deliver_output` 的失败分支。该分支持 AddressSpace 锁（rank 300）调用 `run_termination_todo`，后者获取 Thread/Process 终止 reservation 的 LEAF 锁（rank 150）；debug Lock Ladder 报错，证明该用户可触发失败路径存在内核 panic。日志：`artifacts/failed-acceptance-20260908-095956-55506.log`。该 P1 作为本条验证暴露的同批修复责任，不另建计划。
+
+冻结的交付结构：`deliver_output` 在业务锁内只冻结 lifecycle 终因，并把唯一 TerminationTodo 移入当前 Thread 的固定 `output_termination` 槽（MEMORY_COMPLETION 秩）；syscall handler 返回、全部业务 guard 释放后，trap 尾段取走待办并执行 IPI/termination debt/通知，然后按生命周期返回 Killed。执行容器在交付前强持 Thread，Drop 断言无未交付待办；不在每个 syscall 上添加锁序补丁，也不引入堆分配。后续固定提交须同时复核此交付路径与原失败验证。
 
 ### P2-D1-03 唯一后续行动
 

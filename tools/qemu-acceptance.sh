@@ -37,6 +37,7 @@ required=(
     "required service topology complete:"
     "supervision budget exhaustion retained authority:"
     "thread stack cleanup passed"
+    "Tunnel failure rollback and inventory checks passed"
     "system reset accepted: action Shutdown, reason Requested"
 )
 case "$profile" in
@@ -49,6 +50,7 @@ case "$profile" in
         required+=(
             "acceptance workload: stress"
             "drain minimum-budget acceptance passed"
+            "Tunnel close/Attach failure matrix passed: 24 rounds"
             "race matrix acceptance passed: 16/16 scenarios passed"
         )
         ;;
@@ -64,7 +66,7 @@ case "$profile" in
         required+=(
             "acceptance workload: core"
             "domain 0 [Base64] -> harts [0, 1, 2, 3]"
-            "failed to start bin/test_fp: SpawnFailure { error: System(NotSupported), grants: Retained, cleanup_error: None }"
+            "optional service bin/test_fp degraded: SpawnFailure { error: System(NotSupported), grants: Retained, cleanup_error: None }"
         )
         ;;
     *)

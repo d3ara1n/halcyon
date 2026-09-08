@@ -137,6 +137,10 @@ unsafe extern "C" fn handle_user_trap(
             panic!("unexpected interrupt in user trap: code={other:#x} stval={stval:#x}");
         }
     };
+    // handler 的业务 guard 已全部释放；统一交付输出复检失败的终止待办。
+    if let Some(t) = thread {
+        t.finish_output_termination();
+    }
     // ecall 可能在本次 trap 内向当前 hart 发布请求；返回用户态前再消费一次。
     deferred_work::drain_current();
     if thread.is_some_and(|t| t.process.lifecycle.is_terminating()) {

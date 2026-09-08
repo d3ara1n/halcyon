@@ -6,7 +6,7 @@
 
 同步 handler 在一次 trap 内完成：结果写入 UserContext、sepc 前进 4，dispatcher 返回 Resume。输出地址先校验，副作用后的最终写回统一使用 `uaccess::deliver_output`；若同进程另一线程在两次 AddressSpace 临界区之间拆除输出映射，复检失败冻结调用进程 `(Fault, StoreAccess)`，不把已发生副作用与错误返回混合。
 
-handler 返回 Completed 后，dispatcher 再检查 lifecycle。若 syscall 期间另一 hart 已冻结终止，或 deliver_output 触发 Fault，出口改为 Killed，不再返回用户态。
+`deliver_output` 失败时在持业务锁的范围内只冻结 Fault 终因，唯一 TerminationTodo 移入当前 Thread 的固定 `output_termination` 槽（MEMORY_COMPLETION 秩）。handler 返回后全部业务 guard 已释放，trap 尾段经 `finish_output_termination` 执行 IPI、termination debt 与通知；执行容器保持 Thread 存活，未交付待办禁止随 Thread 析构。随后生命周期检查将出口改为 Killed，不再返回用户态。其它 hart 的并发终止同样由最终出口检查吸收。
 
 `SystemReset` 是终局同步调用：dispatcher 完成固定宽参数与 capability 校验后进入单次平台调用；成功按契约不返回，后端拒绝或异常返回才写入 syscall 错误并恢复调用线程。对象、SBI 映射与错误语义见 [`internals.md`](internals.md)「idle 与系统复位」。
 

@@ -69,6 +69,32 @@ struct MetadataAdmission {
 static ADMISSION: crate::sync::Spinlock<Option<MetadataAdmission>> =
     crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
 
+/// 固定容量元数据库存的只读观测；不复制 permit 或资源所有权。
+pub(crate) fn admission_usage() -> [usize; 16] {
+    let admission = ADMISSION.lock();
+    let a = admission
+        .as_ref()
+        .expect("metadata admission is not initialized");
+    [
+        a.sponsors.used(),
+        a.pool_cores.used(),
+        a.address_spaces.used(),
+        a.builders.used(),
+        a.controls.used(),
+        a.region_slots.used(),
+        a.planner_transactions.used(),
+        a.backing_slices.used(),
+        a.memory_changes.used(),
+        a.memory_waits.used(),
+        a.remote_completions.used(),
+        a.object_backings.used(),
+        a.object_views.used(),
+        a.connections.used(),
+        a.endpoints.used(),
+        a.invitations.used(),
+    ]
+}
+
 /// heap 就绪后、首个 Process/Pool core 构造前初始化固定全局 slots。
 pub(crate) fn init() {
     let new_counter = |limit, message| Arc::try_new(Counter::new(limit)).expect(message);
@@ -469,9 +495,7 @@ impl MetadataSponsor {
         Ok(ConnectionPermit { _permit: permit })
     }
 
-    pub(crate) fn reserve_endpoint(
-        sponsor: &Arc<Self>,
-    ) -> Result<EndpointPermit, SystemCallError> {
+    pub(crate) fn reserve_endpoint(sponsor: &Arc<Self>) -> Result<EndpointPermit, SystemCallError> {
         let permit = SponsoredPermit::try_acquire(
             sponsor,
             &sponsor.endpoint_global,

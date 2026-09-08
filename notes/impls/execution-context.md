@@ -8,7 +8,9 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 两条路径在 formal entry 汇合，统一建立 gp、tp、sscratch、正式 stack、satp、CSR 和 stvec。过渡表在 cold boot 建成后只读；全体启动记录以 Release 发布后才发 HSM start。`os/runtime_gate` 将全局状态限制为 `Preparing -> Ready | Failed`：HSM 错误、formal CSR 拒绝或 Online 超时先以 Release 广播 Failed，晚到 secondary 以 Acquire 观察后停驻；只有全体 admitted hart Online、调度域和初始任务就绪后才发布 Ready 并进入调度循环。
 
-当前启动失败广播只接入上述显式分支。`rt.rs` 的 panic、fatal trap 与 `fatal_msg` 公共终段直接 park；若在全员 Online 后、Ready 前失败，secondary 可能持续等待 Preparing。此缺口由 [`E-1 N-1`](../../plans/review-2026-09-system-audit-03-04.md) 承接，不能把现有 RuntimeGate 单元测试当作公共 fatal 接线已经闭合的证据。
+`rt.rs` 的 panic、fatal trap、`fatal_msg` 和高半区 bootstrap fatal 在任何诊断前统一调用 `registry::publish_failed`。它只对 Preparing 执行 Release CAS；Failed 幂等，Ready 保持不变，错误终段不再次 panic，不取 registry 锁、不分配、不读取 tp。分配失败经 panic handler 进入同一终段。GATE 位于 `_start_high` 清零的普通 BSS；高半区 Rust 入口可访问，Bare PA fatal 不访问该状态，未 Online 的 secondary 由 boot 的 Online 超时收束。
+
+`tools/check-boot-failure.py` 在正式 debug binary 的 `boot::load` 入口用 GDB 注入坏 envelope 长度、分配失败 handler 和真实非法指令 trap；断言注入时 Preparing，并在四个不同 hart 的 park 入口确认 Failed。`just virt-boot-failure` 提供单独路线，`just acceptance` 聚合执行；正常内核没有故障注入开关。原子发布的外部依据见固定 ISA `a-st-ext.adoc`「Specifying Ordering of Atomic Instructions」。
 
 ## 身份、能力与域
 

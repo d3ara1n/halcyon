@@ -1,5 +1,11 @@
 # 系统审计批次 E-2：syscall/shared ABI、IPC/FAL/服务与工程化
 
+## E2-7-02 修复实现与验证（待固定提交复核）
+
+nofd 锚点已与 `optional service bin/test_fp degraded` 对齐，保持完整 NotSupported/Retained/cleanup_error None 检查及 Base64 domain、Requested reset。`virt-nofd` 已纳入 acceptance，修复后完整 `THROTTLE=100 just acceptance` 退出 0，日志 `artifacts/review-fixes/acceptance.log`。
+
+独立 oracle 输入检查：完整有效日志接受；删除 D64 拒绝、删除 reset、把拒绝原因改为 OOM、把 cleanup_error 改为失败四例全部拒绝（`artifacts/review-fixes/nofd-oracle.log`）。未靠删除锚点或放宽失败策略使测试通过。实现完成，最终关闭等待固定提交复核。
+
 ## 2026-09-08 提交后复核（E-2，新增 P2，仍开放）
 
 固定对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`。OliveWillow 独立只读复核；统筹者运行平台路线发现 E2-7-02，OliveWillow 再以目标代码交叉确认。

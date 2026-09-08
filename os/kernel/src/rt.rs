@@ -209,6 +209,7 @@ pub fn boot_package_region() -> Option<(usize, usize)> {
 /// fatal 诊断（无锁 RawWriter）：打印 FatalFrame 完整证据后永久停放。
 #[unsafe(no_mangle)]
 extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
+    registry::publish_failed();
     // guard 页命中是内核栈溢出的第一现场特征，单独点出便于定位。
     let hint = if matches!(frame.scause, LOAD_PAGE_FAULT | STORE_PAGE_FAULT)
         && mm::is_guard_fault(frame.stval as usize)
@@ -244,6 +245,8 @@ extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
 /// bootstrap 阶段 fatal 的最小诊断（汇编调用，仅读 CSR，无栈依赖）。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_fatal_report(cause: usize, val: usize, pc: usize) -> ! {
+    // 此 Rust 入口只在高半区 BSS 已清零后安装；Bare PA fatal 不访问高半区状态。
+    registry::publish_failed();
     let _ = writeln!(
         RawWriter,
         "\x1b[0;31mbootstrap fatal\x1b[0m: cause={cause:#x} val={val:#x} pc={pc:#x}"
@@ -253,12 +256,14 @@ extern "C" fn bootstrap_fatal_report(cause: usize, val: usize, pc: usize) -> ! {
 
 /// 无 FatalFrame 的致命错误报告（启动期 CSR 拒绝等）。
 pub fn fatal_msg(args: &fmt::Arguments<'_>) -> ! {
+    registry::publish_failed();
     let _ = writeln!(RawWriter, "\x1b[0;31mfatal\x1b[0m: {args}");
     hart::park()
 }
 
 #[panic_handler]
 fn handle_panic(info: &PanicInfo) -> ! {
+    registry::publish_failed();
     // panic 路径绕过 console 锁与堆（见模块说明）
     if let Some(location) = info.location() {
         let _ = write!(

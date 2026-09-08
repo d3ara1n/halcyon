@@ -204,13 +204,24 @@ virt-release:
 sifive_u:
     @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE=debug run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
 
-# 阶段收尾：完整 debug 压力 + release core + sifive_u 平台差异。每条 QEMU
-# 由自身路线超时保护，聚合命令本身不另设跨路线总时限。
+# 外部调试器在全员 Online / Ready 前注入失败，核验 Gate 与每个 hart 停驻。
+# 无内核 feature 或运行时测试政策；使用正式 debug binary 的符号与 ABI。
+virt-boot-failure:
+    @ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_boot_failure
+
+[private]
+run_boot_failure: make_dtb make_boot_package build_kernel
+    @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 阶段收尾：静态门、完整 debug 压力、release core、平台差异及启动失败注入。
+# 每条 QEMU 由自身路线超时保护，聚合命令本身不另设跨路线总时限。
 acceptance:
     @just clippy
     @just virt-stress
     @just virt-release
     @just sifive_u
+    @just virt-nofd
+    @just virt-boot-failure
 
 # 验收脚本将完整 QEMU 输出写入临时日志，仅在结束时显示末尾摘要；失败时保留
 # 完整日志并同时打印摘要。可用 QEMU_SUMMARY_LINES 覆盖摘要行数。

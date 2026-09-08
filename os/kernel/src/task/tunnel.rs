@@ -32,6 +32,8 @@ use crate::{
     },
 };
 
+pub(crate) mod selftest;
+
 enum SideState {
     Alive(Weak<Endpoint>),
     Invited(Weak<Invitation>),
