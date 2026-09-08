@@ -56,7 +56,9 @@ impl Rights {
     pub const GRANT: Self = Self(1 << 8);
     /// 允许在 Job 等创建域内构造新对象。
     pub const CREATE: Self = Self(1 << 9);
-    pub const KNOWN: Self = Self((1 << 10) - 1);
+    /// 允许把对象内容映射为可执行页；与 READ/WRITE/MAP 正交。
+    pub const EXECUTE: Self = Self(1 << 10);
+    pub const KNOWN: Self = Self((1 << 11) - 1);
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -223,3 +225,17 @@ const _: () = {
     assert!(core::mem::size_of::<HandlePair>() == 16);
     assert!(core::mem::align_of::<HandlePair>() == 8);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::Rights;
+
+    #[test]
+    fn rights_wire_bits_are_stable_and_known() {
+        assert_eq!(Rights::CREATE.raw(), 1 << 9);
+        assert_eq!(Rights::EXECUTE.raw(), 1 << 10);
+        assert_eq!(Rights::KNOWN.raw(), (1 << 11) - 1);
+        assert!(Rights::EXECUTE.is_known());
+        assert!(!Rights::from_raw(1 << 11).is_known());
+    }
+}

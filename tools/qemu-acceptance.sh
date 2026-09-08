@@ -33,6 +33,10 @@ required=(
     "peer closed observed"
     "pm delegated domain confirmed Dead"
     "system reset authority checks passed"
+    "RPC rejected reply cleanup passed"
+    "required service topology complete:"
+    "supervision budget exhaustion retained authority:"
+    "thread stack cleanup passed"
     "system reset accepted: action Shutdown, reason Requested"
 )
 case "$profile" in

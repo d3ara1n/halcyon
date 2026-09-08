@@ -59,7 +59,7 @@ impl ProcessBuilder {
             _metadata: super::resources::MetadataSponsor::reserve_builder(
                 process.resources.metadata(),
             )?,
-            header: ObjectHeader::new(),
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: crate::sync::Spinlock::new(
                 crate::sync::ranks::OBJECT_WAIT,
                 BuilderState {
@@ -173,7 +173,7 @@ impl ProcessControl {
             _metadata: super::resources::MetadataSponsor::reserve_control(
                 core.resources.metadata(),
             )?,
-            header: ObjectHeader::new(),
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: crate::sync::Spinlock::new(
                 crate::sync::ranks::OBJECT_WAIT,
                 ControlState {
@@ -405,13 +405,14 @@ fn create_staged(
 ) -> Result<(), SystemCallError> {
     let resources = super::resources::ProcessResources::try_new()?;
     let process = Arc::try_new(
-        Process::new(pid, thread.process.pid, Arc::downgrade(&job), resources)
+        Process::new(pid, thread.process.pid, Arc::downgrade(job), resources)
             .map_err(SystemCallError::from)?,
     )
     .map_err(|_| SystemCallError::OutOfMemory)?;
     let builder = ProcessBuilder::new(process.clone())?;
     let control = ProcessControl::new(&process)?;
     process.set_control(Arc::downgrade(&control));
+    let token = super::handle::transaction_token()?;
     let mut entries = super::handle::PendingEntries::try_new(2)?;
     entries.push(
         super::handle::entry(
@@ -429,7 +430,6 @@ fn create_staged(
         )
         .expect("ProcessControl rights were validated before construction"),
     );
-    let token = super::handle::transaction_token();
     let mut table = thread.process.handles.lock();
     let reservation = match table.reserve(2, token) {
         Ok(reservation) => reservation,
@@ -536,7 +536,7 @@ pub fn bind_memory(
         return Err(SystemCallError::ObjectNotAvailable);
     }
 
-    let pin_token = super::handle::transaction_token();
+    let pin_token = super::handle::transaction_token()?;
     let (pool, pool_rights) = {
         let mut table = thread.process.handles.lock();
         let entry = table
@@ -800,7 +800,8 @@ pub fn grant(
     let _lease = BuildingLease::begin(process.clone())?;
     (|| {
         // 调用者表 pin：原子验证并翻转（失败零副作用）。
-        let pin_token = super::handle::transaction_token();
+        let pin_token = super::handle::transaction_token()?;
+        let target_token = super::handle::transaction_token()?;
         {
             let mut caller_table = thread.process.handles.lock();
             caller_table
@@ -810,7 +811,6 @@ pub fn grant(
         // 提取前完成全部可失败步骤：目标预留 + 提交缓冲预留——此后
         // 的失败路径（交付失败）只需无损还原 pin 与预留，不存在
         // 「条目已离开调用者表」的中间态。
-        let target_token = super::handle::transaction_token();
         let reservation = match process
             .handles
             .lock()
@@ -927,7 +927,7 @@ fn start_staged(
         .map_err(|_| SystemCallError::OutOfMemory)?;
 
     // 提交前最后的可失败步骤：调用者表内原子 pin builder。
-    let pin_token = super::handle::transaction_token();
+    let pin_token = super::handle::transaction_token()?;
     {
         let mut caller_table = thread.process.handles.lock();
         if let Err(error) = caller_table.pin_consume(builder_handle, Rights::MANAGE, pin_token) {
@@ -976,7 +976,13 @@ pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo
         return;
     }
     if todo.ipi_slots != 0 {
-        crate::registry::ipi_slots(todo.ipi_slots);
+        let failed = crate::registry::try_ipi_slots(todo.ipi_slots);
+        if failed != 0 {
+            warn!(
+                Task,
+                "Termination doorbell failed for hart slot mask {failed:#x}; termination remains published"
+            );
+        }
     }
     let reservation = process.take_termination_reservation();
     if todo.reapable {

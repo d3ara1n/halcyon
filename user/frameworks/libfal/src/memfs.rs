@@ -10,14 +10,25 @@ use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, vec::Vec};
 
 use crate::header::Status;
 use crate::lookup::ResolvePolicy;
-use crate::node::{validate_path, NodeAttributes, NodeKind};
+use crate::node::{NodeAttributes, NodeKind, validate_path};
 
 #[derive(Debug, Clone)]
 pub enum Node {
-    Directory { attributes: NodeAttributes, children: BTreeMap<String, Node> },
-    Property { attributes: NodeAttributes, value: Vec<u8> },
-    Stream { attributes: NodeAttributes, data: Vec<u8> },
-    SymbolicLink { target: String },
+    Directory {
+        attributes: NodeAttributes,
+        children: BTreeMap<String, Node>,
+    },
+    Property {
+        attributes: NodeAttributes,
+        value: Vec<u8>,
+    },
+    Stream {
+        attributes: NodeAttributes,
+        data: Vec<u8>,
+    },
+    SymbolicLink {
+        target: String,
+    },
 }
 
 impl Node {
@@ -53,7 +64,12 @@ impl Node {
             (Self::SymbolicLink { target }, true) => Some(target.clone()),
             _ => None,
         };
-        MemLookup::Found { kind: self.kind(), attributes: self.attributes(), size: self.size(), target }
+        MemLookup::Found {
+            kind: self.kind(),
+            attributes: self.attributes(),
+            size: self.size(),
+            target,
+        }
     }
 }
 
@@ -88,14 +104,29 @@ pub struct MemFs {
 /// Lookup 的提供者侧结果（单提供者：Delegate 不出现）。
 /// Found 携带节点元数据；SymbolicLink 终段（NoFollowFinal）含 target。
 pub enum MemLookup {
-    Found { kind: NodeKind, attributes: NodeAttributes, size: u64, target: Option<String> },
-    Link { parent_rel: String, target: String, remaining: String },
+    Found {
+        kind: NodeKind,
+        attributes: NodeAttributes,
+        size: u64,
+        target: Option<String>,
+    },
+    Link {
+        parent_rel: String,
+        target: String,
+        remaining: String,
+    },
 }
 
 /// 枚举页：项 + 续游标（0 = 完毕）。
 pub struct MemPage {
     pub entries: Vec<(String, NodeKind)>,
     pub next_cursor: u64,
+}
+
+impl Default for MemFs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemFs {
@@ -119,7 +150,10 @@ impl MemFs {
             let child = children_of(current)?.get(segment).ok_or(Status::NotFound)?;
             let final_component = index + 1 == segments.len();
             if let Node::SymbolicLink { .. } = child {
-                return Ok(Walked::HitLink { node: child, at: index });
+                return Ok(Walked::HitLink {
+                    node: child,
+                    at: index,
+                });
             }
             if final_component {
                 return Ok(Walked::Reached(child));
@@ -137,7 +171,9 @@ impl MemFs {
         let segments = split_rel(rel)?;
         let mut current = &mut self.root;
         for segment in &segments[..segments.len().saturating_sub(1)] {
-            let child = children_of_mut(current)?.get_mut(segment).ok_or(Status::NotFound)?;
+            let child = children_of_mut(current)?
+                .get_mut(segment)
+                .ok_or(Status::NotFound)?;
             if matches!(child, Node::SymbolicLink { .. }) {
                 return Err(Status::SymbolicLinkEncountered);
             }
@@ -148,9 +184,9 @@ impl MemFs {
         }
         match segments.last() {
             None => Ok(&mut self.root),
-            Some(name) => {
-                children_of_mut(current)?.get_mut(name).ok_or(Status::NotFound)
-            }
+            Some(name) => children_of_mut(current)?
+                .get_mut(name)
+                .ok_or(Status::NotFound),
         }
     }
 
@@ -211,9 +247,18 @@ impl MemFs {
             return Err(Status::Exists);
         }
         let node = match kind {
-            NodeKind::Directory => Node::Directory { attributes, children: BTreeMap::new() },
-            NodeKind::Property => Node::Property { attributes, value: Vec::new() },
-            NodeKind::Stream => Node::Stream { attributes, data: Vec::new() },
+            NodeKind::Directory => Node::Directory {
+                attributes,
+                children: BTreeMap::new(),
+            },
+            NodeKind::Property => Node::Property {
+                attributes,
+                value: Vec::new(),
+            },
+            NodeKind::Stream => Node::Stream {
+                attributes,
+                data: Vec::new(),
+            },
             // 符号链接经 create_symlink 创建。
             NodeKind::SymbolicLink => return Err(Status::IllegalArgument),
         };
@@ -236,7 +281,12 @@ impl MemFs {
         if children.contains_key(name) {
             return Err(Status::Exists);
         }
-        children.insert(name.to_owned(), Node::SymbolicLink { target: target.to_owned() });
+        children.insert(
+            name.to_owned(),
+            Node::SymbolicLink {
+                target: target.to_owned(),
+            },
+        );
         self.generation += 1;
         Ok(())
     }
@@ -253,9 +303,9 @@ impl MemFs {
         }
         match children.get(name) {
             None => Err(Status::NotFound),
-            Some(Node::Directory { children: inner, .. }) if !inner.is_empty() => {
-                Err(Status::IllegalArgument)
-            }
+            Some(Node::Directory {
+                children: inner, ..
+            }) if !inner.is_empty() => Err(Status::IllegalArgument),
             Some(_) => {
                 children.remove(name);
                 self.generation += 1;
@@ -291,7 +341,10 @@ impl MemFs {
             return Err(Status::IllegalArgument);
         }
         match self.walk_mut(rel)? {
-            Node::Property { attributes, value: stored } => {
+            Node::Property {
+                attributes,
+                value: stored,
+            } => {
                 if !attributes.contains(NodeAttributes::WRITEABLE) {
                     return Err(Status::NotAccessible);
                 }
@@ -362,7 +415,10 @@ impl MemFs {
     /// 代数不匹配即 CursorInvalid。
     pub fn enumerate(&self, rel: &[u8], cursor: u64, max_bytes: u32) -> Result<MemPage, Status> {
         let directory = match self.node_at(ResolvePolicy::FollowAll, rel)? {
-            Node::Directory { attributes, children } => {
+            Node::Directory {
+                attributes,
+                children,
+            } => {
                 if !attributes.contains(NodeAttributes::READABLE) {
                     return Err(Status::NotAccessible);
                 }
@@ -395,7 +451,10 @@ impl MemFs {
             entries.push((name.clone(), child.kind()));
             position += 1;
         }
-        Ok(MemPage { entries, next_cursor: next })
+        Ok(MemPage {
+            entries,
+            next_cursor: next,
+        })
     }
 }
 
@@ -447,10 +506,16 @@ mod tests {
         let found = fs.lookup(ResolvePolicy::FollowAll, b"hello/world").unwrap();
         assert!(matches!(&found, MemLookup::Found { kind, .. } if *kind == NodeKind::Property));
 
-        assert!(matches!(fs.create(b"hello", NodeKind::Directory, rw()), Err(Status::Exists)));
+        assert!(matches!(
+            fs.create(b"hello", NodeKind::Directory, rw()),
+            Err(Status::Exists)
+        ));
         fs.delete(b"hello/world").unwrap();
         fs.delete(b"hello").unwrap();
-        assert!(matches!(fs.lookup(ResolvePolicy::FollowAll, b"hello"), Err(Status::NotFound)));
+        assert!(matches!(
+            fs.lookup(ResolvePolicy::FollowAll, b"hello"),
+            Err(Status::NotFound)
+        ));
     }
 
     #[test]
@@ -467,8 +532,15 @@ mod tests {
         fs.link(b"lnk", b"target").unwrap();
 
         match fs.lookup(ResolvePolicy::FollowAll, b"lnk").unwrap() {
-            MemLookup::Link { parent_rel, target, remaining } => {
-                assert_eq!((parent_rel.as_str(), target.as_str(), remaining.as_str()), ("", "target", ""));
+            MemLookup::Link {
+                parent_rel,
+                target,
+                remaining,
+            } => {
+                assert_eq!(
+                    (parent_rel.as_str(), target.as_str(), remaining.as_str()),
+                    ("", "target", "")
+                );
             }
             _ => panic!("expected link boundary"),
         }
@@ -480,7 +552,9 @@ mod tests {
         // 中途链接 + NoFollowFinal：策略只对终段生效，仍返边界。
         fs.create(b"dir", NodeKind::Directory, rw()).unwrap();
         fs.link(b"dir/inner", b"x").unwrap();
-        let outcome = fs.lookup(ResolvePolicy::NoFollowFinal, b"dir/inner/tail").unwrap();
+        let outcome = fs
+            .lookup(ResolvePolicy::NoFollowFinal, b"dir/inner/tail")
+            .unwrap();
         assert!(matches!(outcome, MemLookup::Link { .. }));
         assert!(matches!(
             fs.property_read(ResolvePolicy::FollowAll, b"lnk"),
@@ -492,7 +566,11 @@ mod tests {
     fn read_at_and_write_at() {
         let mut fs = MemFs::new();
         fs.create(b"bin", NodeKind::Stream, rw()).unwrap();
-        assert_eq!(fs.write_at(ResolvePolicy::FollowAll, b"bin", 4, &[1, 2, 3]).unwrap(), 3);
+        assert_eq!(
+            fs.write_at(ResolvePolicy::FollowAll, b"bin", 4, &[1, 2, 3])
+                .unwrap(),
+            3
+        );
         assert_eq!(
             fs.read_at(ResolvePolicy::FollowAll, b"bin", 0, 7).unwrap(),
             &[0, 0, 0, 0, 1, 2, 3]
@@ -508,11 +586,12 @@ mod tests {
         let mut fs = MemFs::new();
         fs.create(b"answer", NodeKind::Property, rw()).unwrap();
         let mut buffer = [0u8; 16];
-        let used = crate::property::PropertyValue::Integer(42)
-            .encode(&mut buffer);
-        fs.property_write(ResolvePolicy::FollowAll, b"answer", &buffer[..used]).unwrap();
+        let used = crate::property::PropertyValue::Integer(42).encode(&mut buffer);
+        fs.property_write(ResolvePolicy::FollowAll, b"answer", &buffer[..used])
+            .unwrap();
         assert_eq!(
-            fs.property_read(ResolvePolicy::FollowAll, b"answer").unwrap(),
+            fs.property_read(ResolvePolicy::FollowAll, b"answer")
+                .unwrap(),
             &buffer[..used]
         );
     }
@@ -528,9 +607,9 @@ mod tests {
         ));
         // 合法 Integer 编码：接受。
         let mut buffer = [0u8; 16];
-        let used = crate::property::PropertyValue::Integer(7)
-            .encode(&mut buffer);
-        fs.property_write(ResolvePolicy::FollowAll, b"p", &buffer[..used]).unwrap();
+        let used = crate::property::PropertyValue::Integer(7).encode(&mut buffer);
+        fs.property_write(ResolvePolicy::FollowAll, b"p", &buffer[..used])
+            .unwrap();
     }
 
     #[test]
@@ -547,12 +626,16 @@ mod tests {
     fn enumerate_pages_with_generation_cursor() {
         let mut fs = MemFs::new();
         for name in ["a", "b", "c", "d"] {
-            fs.create(name.as_bytes(), NodeKind::Property, rw()).unwrap();
+            fs.create(name.as_bytes(), NodeKind::Property, rw())
+                .unwrap();
         }
         let first = fs.enumerate(b"", 0, 30).unwrap();
         assert_eq!(first.entries.len(), 2);
         fs.create(b"e", NodeKind::Property, rw()).unwrap();
-        assert!(matches!(fs.enumerate(b"", first.next_cursor, 30), Err(Status::CursorInvalid)));
+        assert!(matches!(
+            fs.enumerate(b"", first.next_cursor, 30),
+            Err(Status::CursorInvalid)
+        ));
     }
 
     #[test]
@@ -564,7 +647,8 @@ mod tests {
             NodeAttributes::READABLE | NodeAttributes::WRITEABLE,
         )
         .unwrap();
-        fs.create(b"closed/inner", NodeKind::Property, rw()).unwrap();
+        fs.create(b"closed/inner", NodeKind::Property, rw())
+            .unwrap();
         assert!(matches!(
             fs.lookup(ResolvePolicy::FollowAll, b"closed/inner"),
             Err(Status::NotAccessible)

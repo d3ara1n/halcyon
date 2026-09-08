@@ -160,12 +160,11 @@ impl<T, R> HandleTable<T, R> {
     }
 
     pub fn with_limit(limit: usize) -> Self {
-        let mut slots = Vec::new();
         // slot 0 永远无效，结构上直接退休。
-        slots.push(Slot {
+        let slots = alloc::vec![Slot {
             generation: 0,
             state: SlotState::Retired,
-        });
+        }];
         Self {
             slots,
             limit: limit.min(u32::MAX as usize),

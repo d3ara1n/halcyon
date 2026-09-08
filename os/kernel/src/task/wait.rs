@@ -75,7 +75,7 @@ pub fn prepare(
     abi_items
         .try_reserve_exact(count)
         .map_err(|_| SystemCallError::OutOfMemory)?;
-    for bytes in raw.chunks_exact(core::mem::size_of::<WaitItem>()) {
+    for bytes in raw.as_chunks::<{ core::mem::size_of::<WaitItem>() }>().0 {
         // SAFETY: WaitItem 仅含整数 newtype；用户缓冲无需对齐。
         abi_items.push(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WaitItem>()) });
     }

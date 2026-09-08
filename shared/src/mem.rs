@@ -68,6 +68,10 @@ pub struct MemoryMapRequest {
 
 impl MemoryMapRequest {
     /// 匿名映射请求。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fixed-width ABI constructor lists every validated field explicitly"
+    )]
     pub const fn new(
         bytes: u64,
         guard_before: u64,
@@ -94,6 +98,10 @@ impl MemoryMapRequest {
     }
 
     /// MemoryObject view 请求：数据来自已存在的对象，不取得新的页额度。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fixed-width ABI constructor lists every validated field explicitly"
+    )]
     pub const fn new_object_view(
         object: u64,
         source_offset: u64,

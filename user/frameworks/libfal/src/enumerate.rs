@@ -80,7 +80,11 @@ impl EnumerateResponse<'_> {
     /// 线长：固定头 + 逐目录项（sized name + kind u32 + reserved u32）。
     pub fn encoded_len(&self) -> usize {
         RESPONSE_FIXED_LEN
-            + self.entries.iter().map(|e| ENTRY_OVERHEAD + e.name.len()).sum::<usize>()
+            + self
+                .entries
+                .iter()
+                .map(|e| ENTRY_OVERHEAD + e.name.len())
+                .sum::<usize>()
     }
 
     /// 编码不可失败：页预算（含应答承载折算）由提供者前置保证。
@@ -112,11 +116,14 @@ pub fn decode_entries(
         probe.u32()?;
     }
     probe.finish()?;
-    Ok(EntryIter { reader: Reader::new(bytes), remaining: count })
+    Ok(EntryIter {
+        reader: Reader::new(bytes),
+        remaining: count,
+    })
 }
 
 /// 应答头部（next_cursor + 计数 + 保留区）解码，返回项字节段。
-pub fn decode_response_header<'a>(bytes: &'a [u8]) -> DecodeResult<(u64, usize, &'a [u8])> {
+pub fn decode_response_header(bytes: &[u8]) -> DecodeResult<(u64, usize, &[u8])> {
     let mut reader = Reader::new(bytes);
     let next_cursor = reader.u64()?;
     let count = reader.u32()? as usize;
@@ -160,25 +167,43 @@ mod tests {
     #[test]
     fn request_roundtrip() {
         let mut buffer = [0u8; 64];
-        let request = EnumerateRequest { rel: b"a/b", cursor: 0x1234, max_bytes: 512 };
+        let request = EnumerateRequest {
+            rel: b"a/b",
+            cursor: 0x1234,
+            max_bytes: 512,
+        };
         let used = request.encode(&mut buffer);
-        assert_eq!(EnumerateRequest::decode(&buffer[..used]).unwrap(), (b"a/b".as_slice(), 0x1234, 512));
+        assert_eq!(
+            EnumerateRequest::decode(&buffer[..used]).unwrap(),
+            (b"a/b".as_slice(), 0x1234, 512)
+        );
     }
 
     #[test]
     fn response_roundtrip() {
         let mut buffer = [0u8; 96];
         let entries = [
-            DirectoryEntry { kind: NodeKind::Directory, name: b"boot" },
-            DirectoryEntry { kind: NodeKind::Stream, name: b"readme" },
-            DirectoryEntry { kind: NodeKind::Property, name: b"version" },
+            DirectoryEntry {
+                kind: NodeKind::Directory,
+                name: b"boot",
+            },
+            DirectoryEntry {
+                kind: NodeKind::Stream,
+                name: b"readme",
+            },
+            DirectoryEntry {
+                kind: NodeKind::Property,
+                name: b"version",
+            },
         ];
-        let response = EnumerateResponse { next_cursor: 7, entries: &entries };
+        let response = EnumerateResponse {
+            next_cursor: 7,
+            entries: &entries,
+        };
         let used = response.encode(&mut buffer);
 
         // 应答头（cursor + 计数）解码，随后逐项解码。
-        let (next_cursor, count, entry_bytes) =
-            decode_response_header(&buffer[..used]).unwrap();
+        let (next_cursor, count, entry_bytes) = decode_response_header(&buffer[..used]).unwrap();
         assert_eq!(next_cursor, 7);
         assert_eq!(count, 3);
         let items: Vec<_> = decode_entries(entry_bytes, count)

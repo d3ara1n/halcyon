@@ -47,7 +47,12 @@ impl ExtentGeometry {
     }
 
     pub fn end(self) -> FrameNumber {
-        FrameNumber(self.base.0 + self.count)
+        FrameNumber(
+            self.base
+                .0
+                .checked_add(self.count)
+                .expect("validated extent geometry overflowed"),
+        )
     }
 
     pub fn split_at(self, offset: usize) -> Option<(Self, Self)> {
@@ -60,7 +65,12 @@ impl ExtentGeometry {
                 count: offset,
             },
             Self {
-                base: FrameNumber(self.base.0 + offset),
+                base: FrameNumber(
+                    self.base
+                        .0
+                        .checked_add(offset)
+                        .expect("validated extent split overflowed"),
+                ),
                 count: self.count - offset,
             },
         ))
@@ -98,16 +108,16 @@ impl ArenaMetadata {
         metadata_start: 0,
     };
 
-    fn frames(self) -> usize {
-        1usize << self.order
+    fn frames(self) -> Option<usize> {
+        1usize.checked_shl(self.order as u32)
     }
 
-    fn end(self) -> usize {
-        self.base + self.frames()
+    fn end(self) -> Option<usize> {
+        self.base.checked_add(self.frames()?)
     }
 
-    fn metadata_len(self) -> usize {
-        self.frames() * 2
+    fn metadata_len(self) -> Option<usize> {
+        metadata_bytes(self.frames()?)
     }
 }
 
@@ -163,22 +173,28 @@ impl<'a> FramePool<'a> {
         if start.0 >= end.0 {
             return Err(AddRegionError::InvalidRange);
         }
-        if self.arenas[..self.arena_count]
-            .iter()
-            .any(|arena| start.0 < arena.end() && arena.base < end.0)
-        {
+        if self.arenas[..self.arena_count].iter().any(|arena| {
+            start.0 < arena.end().expect("admitted arena range overflowed") && arena.base < end.0
+        }) {
             return Err(AddRegionError::Overlap);
         }
 
-        let frames = end.0 - start.0;
-        let arena_need = block_count(start.0, end.0);
-        if self.arena_count + arena_need > self.arenas.len() {
-            return Err(AddRegionError::ArenaLimit);
-        }
+        let frames = end
+            .0
+            .checked_sub(start.0)
+            .ok_or(AddRegionError::InvalidRange)?;
+        let arena_need = block_count(start.0, end.0).ok_or(AddRegionError::ArenaLimit)?;
+        let final_arena_count = self
+            .arena_count
+            .checked_add(arena_need)
+            .filter(|count| *count <= self.arenas.len())
+            .ok_or(AddRegionError::ArenaLimit)?;
         let metadata_need = metadata_bytes(frames).ok_or(AddRegionError::MetadataExhausted)?;
-        if self.metadata_used + metadata_need > self.metadata.len() {
-            return Err(AddRegionError::MetadataExhausted);
-        }
+        let final_metadata_used = self
+            .metadata_used
+            .checked_add(metadata_need)
+            .filter(|used| *used <= self.metadata.len())
+            .ok_or(AddRegionError::MetadataExhausted)?;
 
         for_each_block(start.0, end.0, |base, order| {
             let arena = ArenaMetadata {
@@ -186,12 +202,21 @@ impl<'a> FramePool<'a> {
                 order: order as u8,
                 metadata_start: self.metadata_used,
             };
-            let metadata_end = self.metadata_used + arena.metadata_len();
+            let metadata_end = self
+                .metadata_used
+                .checked_add(
+                    arena
+                        .metadata_len()
+                        .expect("admitted arena metadata length overflowed"),
+                )
+                .expect("admitted metadata cursor overflowed");
             self.metadata[self.metadata_used..metadata_end].fill(UNAVAILABLE);
             self.metadata_used = metadata_end;
             self.arenas[self.arena_count] = arena;
             self.arena_count += 1;
         });
+        debug_assert_eq!(self.arena_count, final_arena_count);
+        debug_assert_eq!(self.metadata_used, final_metadata_used);
         Ok(())
     }
 
@@ -215,8 +240,12 @@ impl<'a> FramePool<'a> {
             arena.order as usize >= order && state_available(self.state(arena, 1), order)
         })?;
         let arena = self.arenas[arena_index];
+        let free_frames = self
+            .free_frames
+            .checked_sub(count)
+            .expect("free frame accounting underflow");
         let base = self.take_any(arena, order);
-        self.free_frames -= count;
+        self.free_frames = free_frames;
         Some(FrameNumber(base))
     }
 
@@ -242,9 +271,13 @@ impl<'a> FramePool<'a> {
         }
         let (arena_index, order) = choice?;
         let arena = self.arenas[arena_index];
+        let count = order_size(order).expect("admitted arena order overflowed");
+        let free_frames = self
+            .free_frames
+            .checked_sub(count)
+            .expect("free frame accounting underflow");
         let base = self.take_any(arena, order);
-        let count = 1usize << order;
-        self.free_frames -= count;
+        self.free_frames = free_frames;
         Some((FrameNumber(base), count))
     }
 
@@ -258,8 +291,12 @@ impl<'a> FramePool<'a> {
         if !self.range_is_free(base.0, end) {
             return Err(AllocAtError::Unavailable);
         }
+        let free_frames = self
+            .free_frames
+            .checked_sub(count)
+            .ok_or(AllocAtError::Unavailable)?;
         self.take_range(base.0, end);
-        self.free_frames -= count;
+        self.free_frames = free_frames;
         Ok(())
     }
 
@@ -277,8 +314,12 @@ impl<'a> FramePool<'a> {
             base.addr(),
             FrameNumber(end).addr()
         );
+        let free_frames = self
+            .free_frames
+            .checked_add(count)
+            .expect("free frame accounting overflow");
         self.release_blocks(base.0, end);
-        self.free_frames += count;
+        self.free_frames = free_frames;
     }
 
     /// 发布一段启动期 reservation。语义与 dealloc 相同，但名称显式区分来源。
@@ -293,8 +334,16 @@ impl<'a> FramePool<'a> {
         if !self.range_is_unavailable(start.0, end.0) {
             return Err(AllocAtError::Unavailable);
         }
+        let count = end
+            .0
+            .checked_sub(start.0)
+            .ok_or(AllocAtError::Unavailable)?;
+        let free_frames = self
+            .free_frames
+            .checked_add(count)
+            .ok_or(AllocAtError::Unavailable)?;
         self.release_blocks(start.0, end.0);
-        self.free_frames += end.0 - start.0;
+        self.free_frames = free_frames;
         Ok(())
     }
 
@@ -345,7 +394,9 @@ impl<'a> FramePool<'a> {
                 node = left;
             } else {
                 node = left + 1;
-                base += 1usize << child_order;
+                base = base
+                    .checked_add(1usize << child_order)
+                    .expect("admitted arena traversal overflowed");
             }
             order = child_order;
         }
@@ -433,7 +484,9 @@ impl<'a> FramePool<'a> {
         self.arenas[..self.arena_count]
             .iter()
             .copied()
-            .find(|arena| frame >= arena.base && frame < arena.end())
+            .find(|arena| {
+                frame >= arena.base && frame < arena.end().expect("admitted arena range overflowed")
+            })
     }
 
     fn range_is_managed(&self, mut start: usize, end: usize) -> bool {
@@ -441,7 +494,7 @@ impl<'a> FramePool<'a> {
             let Some(arena) = self.find_arena(start) else {
                 return false;
             };
-            start = end.min(arena.end());
+            start = end.min(arena.end().expect("admitted arena range overflowed"));
         }
         true
     }
@@ -451,7 +504,7 @@ impl<'a> FramePool<'a> {
             let Some(arena) = self.find_arena(start) else {
                 return false;
             };
-            let segment_end = end.min(arena.end());
+            let segment_end = end.min(arena.end().expect("admitted arena range overflowed"));
             let mut available = true;
             for_each_block(start, segment_end, |base, order| {
                 available &= self.block_is_free(arena, base, order);
@@ -469,7 +522,7 @@ impl<'a> FramePool<'a> {
             let Some(arena) = self.find_arena(start) else {
                 return false;
             };
-            let segment_end = end.min(arena.end());
+            let segment_end = end.min(arena.end().expect("admitted arena range overflowed"));
             let mut unavailable = true;
             for_each_block(start, segment_end, |base, order| {
                 unavailable &= !self.block_has_free(arena, base, order);
@@ -485,7 +538,7 @@ impl<'a> FramePool<'a> {
     fn take_range(&mut self, mut start: usize, end: usize) {
         while start < end {
             let arena = self.find_arena(start).expect("validated managed range");
-            let segment_end = end.min(arena.end());
+            let segment_end = end.min(arena.end().expect("admitted arena range overflowed"));
             for_each_block(start, segment_end, |base, order| {
                 self.take_at_block(arena, base, order);
             });
@@ -496,7 +549,7 @@ impl<'a> FramePool<'a> {
     fn release_blocks(&mut self, mut start: usize, end: usize) {
         while start < end {
             let arena = self.find_arena(start).expect("validated managed range");
-            let segment_end = end.min(arena.end());
+            let segment_end = end.min(arena.end().expect("admitted arena range overflowed"));
             for_each_block(start, segment_end, |base, order| {
                 self.release_block(arena, base, order);
             });
@@ -525,9 +578,11 @@ fn floor_order(value: usize) -> usize {
     (usize::BITS - 1 - value.leading_zeros()) as usize
 }
 
-fn block_count(start: usize, end: usize) -> usize {
-    let mut count = 0;
-    for_each_block(start, end, |_, _| count += 1);
+fn block_count(start: usize, end: usize) -> Option<usize> {
+    let mut count = Some(0usize);
+    for_each_block(start, end, |_, _| {
+        count = count.and_then(|value| value.checked_add(1));
+    });
     count
 }
 
@@ -542,6 +597,8 @@ fn for_each_block(mut start: usize, end: usize, mut emit: impl FnMut(usize, usiz
         let length_order = floor_order(end - start);
         let order = align_order.min(length_order);
         emit(start, order);
-        start += 1usize << order;
+        start = start
+            .checked_add(1usize << order)
+            .expect("canonical block exceeds validated range");
     }
 }

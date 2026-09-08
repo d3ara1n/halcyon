@@ -3,4 +3,13 @@ name = "elf"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+host-audit = ["dep:erhino_shared"]
+
+[[bin]]
+name = "audit_user_elf"
+path = "src/bin/audit_user_elf.rs"
+required-features = ["host-audit"]
+
 [dependencies]
+erhino_shared = { path = "../../shared", optional = true }

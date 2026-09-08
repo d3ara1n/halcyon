@@ -124,7 +124,13 @@ impl SchedDomain {
     fn wake_one(&self) {
         let mask = self.idle_mask.load(Ordering::SeqCst);
         if mask != 0 {
-            crate::registry::ipi_slots(mask);
+            let failed = crate::registry::try_ipi_slots(mask);
+            if failed != 0 {
+                warn!(
+                    Hart,
+                    "Ready-queue doorbell failed for hart slot mask {failed:#x}; work remains queued"
+                );
+            }
         }
     }
 }
@@ -194,9 +200,9 @@ pub fn build_domains() {
     });
     let plan = sched_domain::plan(&caps);
     let mut domains: [Option<&'static SchedDomain>; MAX_DOMAINS] = [const { None }; MAX_DOMAINS];
-    for index in 0..plan.domain_count() {
+    for (index, domain) in domains.iter_mut().enumerate().take(plan.domain_count()) {
         let fair: &'static FairClass = Box::leak(Box::new(FairClass::new()));
-        domains[index] = Some(Box::leak(Box::new(SchedDomain {
+        *domain = Some(Box::leak(Box::new(SchedDomain {
             index,
             classes: [fair],
             idle_mask: AtomicU64::new(0),

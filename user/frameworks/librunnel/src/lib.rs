@@ -59,13 +59,21 @@ unsafe impl Send for RawEndpoint {}
 
 impl RawEndpoint {
     unsafe fn creator(base: *mut u8, handle: Handle) -> Self {
-        let mut endpoint = Self { base, handle, broken: false };
+        let mut endpoint = Self {
+            base,
+            handle,
+            broken: false,
+        };
         endpoint.initialize();
         endpoint
     }
 
     unsafe fn attached(base: *mut u8, handle: Handle) -> Result<Self, RunnelError> {
-        let endpoint = Self { base, handle, broken: false };
+        let endpoint = Self {
+            base,
+            handle,
+            broken: false,
+        };
         if endpoint.atomic(OFF_MAGIC).load(Ordering::Acquire).to_le() != MAGIC
             || endpoint.atomic(OFF_VERSION).load(Ordering::Relaxed).to_le() != VERSION
         {
@@ -78,15 +86,20 @@ impl RawEndpoint {
         // 创建方独占尚未发布的零态页；控制区全部清零后用 release magic
         // 发布。attach 的 acquire magic 取得此前全部初始化写。
         unsafe { ptr::write_bytes(self.base, 0, CTRL_SIZE) };
-        self.atomic(OFF_VERSION).store(VERSION.to_le(), Ordering::Relaxed);
+        self.atomic(OFF_VERSION)
+            .store(VERSION.to_le(), Ordering::Relaxed);
         self.atomic(OFF_HEAD).store(0, Ordering::Relaxed);
         self.atomic(OFF_TAIL).store(0, Ordering::Relaxed);
         self.atomic(OFF_EOF).store(0, Ordering::Relaxed);
-        self.atomic(OFF_MAGIC).store(MAGIC.to_le(), Ordering::Release);
+        self.atomic(OFF_MAGIC)
+            .store(MAGIC.to_le(), Ordering::Release);
     }
 
     fn atomic(&self, offset: usize) -> &AtomicU32 {
-        debug_assert_eq!((self.base as usize + offset) % core::mem::align_of::<AtomicU32>(), 0);
+        debug_assert_eq!(
+            (self.base as usize + offset) % core::mem::align_of::<AtomicU32>(),
+            0
+        );
         // SAFETY: Tunnel 映射覆盖整页，控制字段天然对齐且其全部并发访问
         // 都通过 AtomicU32；对象生命周期保证映射在视图存活期有效。
         unsafe { &*self.base.add(offset).cast::<AtomicU32>() }
@@ -172,7 +185,12 @@ impl Producer {
         if used(head, tail) as usize > CAP || eof > 1 {
             return raw.fail();
         }
-        Ok(Self { raw, head, tail_shadow: tail, eof: eof == 1 })
+        Ok(Self {
+            raw,
+            head,
+            tail_shadow: tail,
+            eof: eof == 1,
+        })
     }
 
     pub fn handle(&self) -> Handle {
@@ -227,7 +245,9 @@ impl Producer {
         }
         self.refresh_tail()?;
         self.eof = true;
-        self.raw.atomic(OFF_EOF).store(1u32.to_le(), Ordering::Release);
+        self.raw
+            .atomic(OFF_EOF)
+            .store(1u32.to_le(), Ordering::Release);
         Ok(())
     }
 }
@@ -339,7 +359,7 @@ pub mod blocking {
     use super::*;
     use erhino_shared::{
         object::ObjectSignals,
-        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
+        wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
     };
     use rinlib::ipc::{object, tunnel, wait};
 
@@ -395,13 +415,11 @@ pub mod blocking {
 
     fn wait_event(handle: Handle) -> Result<(), RunnelError> {
         let result = wait::wait_many(
-            &[
-                WaitItem::new(
-                    handle,
-                    ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-                    0,
-                ),
-            ],
+            &[WaitItem::new(
+                handle,
+                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                0,
+            )],
             WAIT_TIMEOUT_INFINITE,
         )?;
         if result
@@ -473,11 +491,11 @@ pub mod blocking {
 const _: () = {
     assert!(CTRL_SIZE >= OFF_EOF + core::mem::size_of::<u32>());
     assert!(CAP > 0);
-    assert!(OFF_MAGIC % core::mem::align_of::<AtomicU32>() == 0);
-    assert!(OFF_VERSION % core::mem::align_of::<AtomicU32>() == 0);
-    assert!(OFF_HEAD % core::mem::align_of::<AtomicU32>() == 0);
-    assert!(OFF_TAIL % core::mem::align_of::<AtomicU32>() == 0);
-    assert!(OFF_EOF % core::mem::align_of::<AtomicU32>() == 0);
+    assert!(OFF_MAGIC.is_multiple_of(core::mem::align_of::<AtomicU32>()));
+    assert!(OFF_VERSION.is_multiple_of(core::mem::align_of::<AtomicU32>()));
+    assert!(OFF_HEAD.is_multiple_of(core::mem::align_of::<AtomicU32>()));
+    assert!(OFF_TAIL.is_multiple_of(core::mem::align_of::<AtomicU32>()));
+    assert!(OFF_EOF.is_multiple_of(core::mem::align_of::<AtomicU32>()));
 };
 
 #[cfg(test)]
@@ -502,7 +520,11 @@ mod tests {
             let consumer = unsafe { Consumer::from_creator(base, Handle::from_raw(1)) };
             let producer = unsafe { Producer::from_attached(base, Handle::from_raw(2)) }.unwrap();
             assert_eq!(&page.0[..4], b"RNL1");
-            Self { _page: page, producer, consumer }
+            Self {
+                _page: page,
+                producer,
+                consumer,
+            }
         }
     }
 

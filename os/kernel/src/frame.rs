@@ -258,7 +258,6 @@ pub fn init(board: &BoardInfo) {
         .checked_add(boot_held_frames)
         .and_then(|pages| u64::try_from(pages).ok())
         .expect("root Pool page count overflow");
-    drop(inventory);
     drop(planner);
     drop(inputs);
     let mut seed = ROOT_POOL_SEED.lock();
@@ -292,7 +291,7 @@ pub fn init(board: &BoardInfo) {
 fn validate_memories(memories: &[SupplyRange]) {
     for (index, region) in memories.iter().enumerate() {
         assert!(
-            region.start() % PAGE_SIZE == 0 && region.end() % PAGE_SIZE == 0,
+            region.start().is_multiple_of(PAGE_SIZE) && region.end().is_multiple_of(PAGE_SIZE),
             "DT memory region is not page aligned"
         );
         if index > 0 {
@@ -311,7 +310,7 @@ fn push_reservation<const N: usize>(
     end: usize,
 ) {
     assert!(
-        start < end && start % PAGE_SIZE == 0 && end % PAGE_SIZE == 0,
+        start < end && start.is_multiple_of(PAGE_SIZE) && end.is_multiple_of(PAGE_SIZE),
         "boot reservation is not page aligned"
     );
     let slot = reservations
@@ -330,7 +329,9 @@ fn normalize_reservations<const N: usize>(
     for input in 0..count {
         let range = reservations[input];
         assert!(
-            range.0 < range.1 && range.0 % PAGE_SIZE == 0 && range.1 % PAGE_SIZE == 0,
+            range.0 < range.1
+                && range.0.is_multiple_of(PAGE_SIZE)
+                && range.1.is_multiple_of(PAGE_SIZE),
             "boot reservation is not page aligned"
         );
         if output > 0 && range.0 <= reservations[output - 1].1 {
@@ -674,7 +675,6 @@ impl FundedFrames {
     }
 }
 
-
 /// 取得普通 user-funded backing。页数与 extent 上限由具体消费方的工作边界决定。
 pub(crate) fn fund_user_frames(
     pool: &Arc<MemoryPool>,
@@ -705,7 +705,11 @@ impl FundedTableFrame {
         let mut claims = self.inner.claims();
         let claim = claims.next().expect("funded table lost its physical claim");
         assert!(claims.next().is_none(), "funded table must have one extent");
-        assert_eq!(claim.geometry().count(), 1, "funded table must own one page");
+        assert_eq!(
+            claim.geometry().count(),
+            1,
+            "funded table must own one page"
+        );
         claim.geometry().base()
     }
 }
@@ -883,7 +887,9 @@ pub fn alloc_user_order(order: usize) -> Option<FrameTracker> {
 
 /// 归还一段启动期保留物理区间。
 pub fn free_range(start_pa: usize, end_pa: usize) {
-    assert!(start_pa % PAGE_SIZE == 0 && end_pa % PAGE_SIZE == 0 && start_pa < end_pa);
+    assert!(
+        start_pa.is_multiple_of(PAGE_SIZE) && end_pa.is_multiple_of(PAGE_SIZE) && start_pa < end_pa
+    );
     with_pool(|pool| {
         pool.release_range(
             FrameNumber::from_addr(start_pa),

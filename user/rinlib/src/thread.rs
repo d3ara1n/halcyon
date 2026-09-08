@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::{
     mem::MaybeUninit,
     ptr::NonNull,
-    sync::atomic::{Ordering, fence},
+    sync::atomic::{AtomicUsize, Ordering, fence},
 };
 
 use erhino_shared::{
@@ -20,6 +20,31 @@ use crate::{
 };
 
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
+
+static ABANDONED_STACKS: AtomicUsize = AtomicUsize::new(0);
+static LAST_STACK_CLEANUP_ERROR: AtomicUsize = AtomicUsize::new(SystemCallError::NoError as usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackCleanupSnapshot {
+    pub abandoned: usize,
+    pub last_error: SystemCallError,
+}
+
+/// 当前进程中无法同步撤销、已交回 AddressSpace 最终 drain 的线程栈诊断。
+pub fn stack_cleanup_snapshot() -> StackCleanupSnapshot {
+    let raw = LAST_STACK_CLEANUP_ERROR.load(Ordering::Acquire);
+    StackCleanupSnapshot {
+        abandoned: ABANDONED_STACKS.load(Ordering::Acquire),
+        last_error: num_traits::FromPrimitive::from_usize(raw).unwrap_or(SystemCallError::Unknown),
+    }
+}
+
+fn record_abandoned_stack(error: SystemCallError) {
+    LAST_STACK_CLEANUP_ERROR.store(error as usize, Ordering::Release);
+    let _ = ABANDONED_STACKS.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(1))
+    });
+}
 
 /// 直接提交 ThreadSpawn 原语，不接管入口参数、用户栈或返回的 ThreadControl。
 ///
@@ -86,10 +111,19 @@ impl UserStack {
                 Ok(()) => return,
                 Err((returned, SystemCallError::ObjectBusy)) => {
                     region = returned;
-                    // SAFETY: sleep carries no borrowed user pointer.
-                    unsafe { sys_sleep(1) }.expect("UserStack cleanup sleep failed");
+                    // SAFETY: sleep carries no borrowed user pointer。若调度服务自身失败，
+                    // mapping 保持由进程 AddressSpace 拥有，终局由 ProcessDrain 收束。
+                    if let Err(error) = unsafe { sys_sleep(1) } {
+                        record_abandoned_stack(error);
+                        return;
+                    }
                 }
-                Err((_returned, error)) => panic!("UserStack cleanup failed: {error:?}"),
+                Err((_returned, error)) => {
+                    // 线程已 DONE，栈不再被执行；同步清理失败时不 panic 或无限重试，
+                    // mapping 留在进程账本并记录诊断，最终由 ProcessDrain 退役。
+                    record_abandoned_stack(error);
+                    return;
+                }
             }
         }
     }

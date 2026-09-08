@@ -41,14 +41,22 @@ pub fn load(address: usize, length: usize) {
         let (prefix, payload) = held.split_at(payload_offset_pages);
         (prefix, Some(payload))
     };
-    let image = elf::parse(package.initial_elf).expect("BootPackage initial ELF is invalid");
+    let image = elf::validate(
+        package.initial_elf,
+        elf::LoadLimits {
+            page_size: erhino_shared::proc::PROCESS_PAGE_SIZE as u64,
+            image_limit: (erhino_shared::proc::PROCESS_USER_TOP
+                - erhino_shared::proc::PROCESS_MAIN_STACK_SIZE) as u64,
+        },
+    )
+    .expect("BootPackage initial ELF admission failed");
     task::resources::init();
     task::resources::self_test();
     task::proc::building_cutoff_selftest();
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
     frame::funded_selftest(&root_pool);
-    let pid = task::alloc_pid();
+    let pid = task::alloc_pid().expect("initial process identity exhausted");
     assert_eq!(pid, 1, "initial process must receive PID 1");
     let root_job = task::job::Job::root();
     let spawned = task::spawn_from_elf(
@@ -113,7 +121,7 @@ pub fn load(address: usize, length: usize) {
 
 fn view(address: usize, length: usize) -> BootPackage<'static> {
     assert!(
-        address % PAGE_SIZE == 0,
+        address.is_multiple_of(PAGE_SIZE),
         "BootPackage physical base is not page-aligned"
     );
     // SAFETY: DT/QEMU loader contract supplies the physical window; the formal direct map

@@ -1,6 +1,6 @@
 # 地址空间事务与进程启动发布的纵向重构
 
-> 两个纵向单元及其直接完成链已按最终结构接通：调度全寿命准入、等待完成、ThreadDeparture、MemoryChange、ProcessDrain、Tunnel detached close、构造失败与 Start/Bootstrap 发布均已闭合并通过组合压力。多页 Tunnel / Runnel 切片 8/9 仍不推进。本计划继续保留到独立前置的 ELF/EXECUTE admission 完成联合复核；历史证据、其它 findings 归属及复核入口见 [`todo-2026-09-review-program.md`](todo-2026-09-review-program.md)。
+> 状态：两个纵向单元及其直接完成链已按最终结构接通并通过组合压力，validated ELF 与 EXECUTE authority 联合代码门也已闭合；本实施计划现已归档。多页 Tunnel / Runnel 切片 8/9 仍暂停，历史证据、其它 findings 归属及提交后复核入口见 [`Review program`](../todo-2026-09-review-program.md)。
 
 ## 目标与边界
 
@@ -37,7 +37,7 @@
 
 ## 当前实现取证边界
 
-本节记录当前已接通的结构事实，不代替原 Review 的目标提交证据；独立 ELF/EXECUTE/platform 前置仍由各自计划拥有。
+本节记录当前已接通的结构事实，不代替原 Review 的目标提交证据；ELF/EXECUTE 代码前置已完成，platform 前置仍由 admission 计划拥有。
 
 - `MemoryChangePlan → MemoryChangeReservation → PreparedMemoryChange → PublishedSpaceChange → RetiringSpaceChange` 聚合 ledger、页表、backing、object view、Remote、work debt、mandatory/result/wait 完成责任；Commit 前失败显式 rollback，Commit 后只消费已准备 owner。
 - AddressSpace 的 object view 使用有容量上限的 fallible AVL；owner 强持对象 core、`ObjectViewPermit` 与 O(1) `region_count`。事务在 Reserve 聚合 `ObjectRegionDelta`，Commit 线性更新，Retire 与 ProcessDrain 不回扫 live ledger。
@@ -61,7 +61,7 @@
 
 ### 已完成：线程全寿命调度准入
 
-已提交 `d453368`：`ready_queue`、Start/Bootstrap/ThreadSpawn、Ready/Running/Waiting 与终止交付按同一不可复制的执行 owner 迁移。固定 per-hart WaitPlan 槽覆盖全部 Switch 出口；不会因 trap 尾段把 Park 吸收为 Killed 而留下意图。契约由 [`ideas/task.md`](../notes/ideas/task.md) 拥有，实现、容量证明和 API 由 [`impls/task.md`](../notes/impls/task.md) 拥有，完整 Bootstrap gate 仍属单元二。
+已提交 `d453368`：`ready_queue`、Start/Bootstrap/ThreadSpawn、Ready/Running/Waiting 与终止交付按同一不可复制的执行 owner 迁移。固定 per-hart WaitPlan 槽覆盖全部 Switch 出口；不会因 trap 尾段把 Park 吸收为 Killed 而留下意图。契约由 [`ideas/task.md`](../../notes/ideas/task.md) 拥有，实现、容量证明和 API 由 [`impls/task.md`](../../notes/impls/task.md) 拥有，完整 Bootstrap gate 仍属单元二。
 
 验证：8 项 host 测试 debug/release、`just check`、`just acceptance`（stress 16/16、release core、sifive_u core）、`virt-hetero`、`virt-nofd` 通过。提交、唤醒、轮转和退款由 allocator 计数探针验证不分配。最终集成日志 `.git/validation/acceptance-ready-final.log`；首次已知 15/16 flake 与意图接管修复前的失败日志均保留，不混作最终通过结果。
 
@@ -73,11 +73,11 @@
 
 `Process::Drop` 只接受空 HandleTable 常数终态，不再作为无界 close 兜底。`ProcessDrain` 持久化 Handle、AddressSpace、`PublishDead`、`PropagateJob` 与 `Done` 阶段；Job child/member 使用有容量上限的 fallible AVL，摘除和祖先传播不做宽度 memmove。detached Tunnel close 在 REAPABLE 后无分配、无 funding、无可恢复错误，映射资源统一由 AddressSpace drain 收束。`write_drain_result` 的提交后输出统一经过 `deliver_output` 故障政策。
 
-仍属其它专题的两项不在本计划伪报完成：公共 RX capability 的 EXECUTE authority 与 validated ELF admission；每次 dispatch 的保守 `fence.i` 优化继续按 `COMPASS.md` 的测量触发条件保留。
+validated ELF 与公共 RX capability 已分别在 admission/capability 专题闭合并由本事务消费；每次 dispatch 的保守 `fence.i` 优化继续按 `COMPASS.md` 的测量触发条件保留。
 
 ### 通用通知与稳定等待根的最终连接（已完成）
 
-**状态：候选冻结、注册来源保活、通知/Finish 双债务、离场交付与退役连接均已交付。** 固定版本外部取证见 [`等待通知参照`](ref-2026-09-wait-notification-research.md)。实现采用对象内单一订阅表与冻结候选，不采用下文设计期比较过的 `SignalSchema`/兴趣分组容器；下文保留为方案推导记录，不再构成待办。
+**状态：候选冻结、注册来源保活、通知/Finish 双债务、离场交付与退役连接均已交付。** 固定版本外部取证见 [`等待通知参照`](../ref-2026-09-wait-notification-research.md)。实现采用对象内单一订阅表与冻结候选，不采用下文设计期比较过的 `SignalSchema`/兴趣分组容器；下文保留为方案推导记录，不再构成待办。
 
 #### 语义与所有权
 
@@ -209,7 +209,7 @@ owner 图、锁序、Commit 资格、容器容量和完成步骤已经按本计�
 
 ### 纵向单元二：构造失败与启动发布（已完成机制接线）
 
-`proc.rs`、`process.rs`、`job.rs`、`lifecycle.rs`、`boot.rs` 与 `sched.rs` 已接通：普通 Start、ThreadSpawn 与 Bootstrap 都在不可逆点前预留全寿命 Ready；ProcessCreate/Bootstrap 以 typed Handle commit 与 Job member 同锁区发布；未发布 Bound 由预付 continuation 显式 rollback。validated ELF 与公共 EXECUTE authority 仍是 Admission/Capability 专题的独立联合验收前置，不回填为本机制的临时逻辑。
+`proc.rs`、`process.rs`、`job.rs`、`lifecycle.rs`、`boot.rs` 与 `sched.rs` 已接通：普通 Start、ThreadSpawn 与 Bootstrap 都在不可逆点前预留全寿命 Ready；ProcessCreate/Bootstrap 以 typed Handle commit 与 Job member 同锁区发布；未发布 Bound 由预付 continuation 显式 rollback。构造端消费私有 validated ELF，公共对象 RX 只接受 `MAP|READ|EXECUTE`，两条独立 authority 已在本机制之外完成并接入。
 
 ### 验证与报告复核
 
@@ -240,4 +240,4 @@ owner 图、锁序、Commit 资格、容器容量和完成步骤已经按本计�
 
 地址空间与生命周期纵向机制已完成实现、残留审计和组合压力；host planner/page-table/handle/work-debt/ordered-table/Ready/Remote/WaitContext 与 shared 测试全部通过。`just check`、virt core/stress、release core、sifive_u、hetero 与 nofd 均通过；stress 覆盖 260 页 fragmented backing、同地址空间多 hart、1024 线程、Tunnel 16 轮和 16/16 竞态矩阵。
 
-本计划暂不归档：validated ELF admission 与公共 MemoryObject EXECUTE capability 仍由各自活跃计划实施，并构成本计划的联合验收门；其它平台、RPC 与监督 findings 不属于本计划完成责任。
+validated ELF admission 与公共 MemoryObject EXECUTE capability 均已完成并接入，地址空间事务的联合代码门闭合。本计划已归档；提交后 Review 按 Review program 另行执行，platform、RPC 与监督 findings 的实现记录分别归入同批其它专题档案。

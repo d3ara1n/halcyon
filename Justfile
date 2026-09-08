@@ -69,6 +69,40 @@ ZFLAGS := "-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 check:
     @cd os && cargo check --quiet {{ZFLAGS}}
 
+# 全仓静态 lint：host 纯逻辑 targets 与两套 RISC-V runtime targets 分开，
+# 避免把只在目标架构开放的服务接口误编进 host。完整输出保留在 artifacts/lint。
+clippy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p artifacts/lint
+    run_lint() {
+        local label="$1"
+        local log="$2"
+        shift 2
+        if "$@" >"$log" 2>&1; then
+            echo "Clippy passed: $label"
+        else
+            status=$?
+            echo "Clippy failed: $label (full log: $log)" >&2
+            tail -n "${CLIPPY_SUMMARY_LINES:-120}" "$log" >&2 || true
+            return "$status"
+        fi
+    }
+    run_lint shared-host artifacts/lint/shared.log \
+        bash -c 'cd shared && cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings'
+    run_lint os-host artifacts/lint/os-host.log \
+        bash -c 'cd os && cargo clippy --workspace --exclude erhino_kernel --all-targets --target aarch64-apple-darwin -- -D warnings'
+    run_lint kernel-target artifacts/lint/kernel.log \
+        bash -c 'cd os && cargo clippy -p erhino_kernel --bin erhino_kernel {{ZFLAGS}} -- -D warnings'
+    run_lint user-host artifacts/lint/user-host.log \
+        bash -c 'cd user && cargo clippy -p rinlib -p librpc -p librunnel -p libfal -p libprocess -p libdrv -p libfs -p libsrv --all-targets --target aarch64-apple-darwin -- -D warnings'
+    run_lint user-target artifacts/lint/user-target.log \
+        bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
+    run_lint user-stress artifacts/lint/user-stress.log \
+        bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features acceptance-stress {{ZFLAGS_USER}} -- -D warnings'
+    run_lint user-fp artifacts/lint/user-fp.log \
+        bash -c 'cd user && cargo clippy -p test_fp --bin test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{ZFLAGS_USER}} -- -D warnings'
+
 clean:
     #!/usr/bin/env bash
     if [ -d "artifacts" ]; then
@@ -173,6 +207,7 @@ sifive_u:
 # 阶段收尾：完整 debug 压力 + release core + sifive_u 平台差异。每条 QEMU
 # 由自身路线超时保护，聚合命令本身不另设跨路线总时限。
 acceptance:
+    @just clippy
     @just virt-stress
     @just virt-release
     @just sifive_u

@@ -33,6 +33,10 @@ impl Range {
     pub const fn len(self) -> usize {
         self.end - self.start
     }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
 }
 
 /// 系统储备的编译期容量政策。
@@ -107,9 +111,11 @@ impl RecoveryTicket {
 /// 物理隔离的系统供给。不同用途没有公共的可消费 ticket 类型。
 pub struct SystemSupply<const HEAP: usize, const RECOVERY: usize> {
     metadata: FramePoolMetadata,
+    heap_ranges: [Range; HEAP],
     heap: [Option<HeapChunkTicket>; HEAP],
     heap_next: usize,
     heap_count: usize,
+    recovery_ranges: [Range; RECOVERY],
     recovery: [Option<RecoveryTicket>; RECOVERY],
     recovery_next: usize,
     recovery_count: usize,
@@ -136,11 +142,13 @@ impl<const HEAP: usize, const RECOVERY: usize> SystemSupply<HEAP, RECOVERY> {
         self.heap_count - self.heap_next
     }
 
-    /// 启动期预清零使用的只读几何，不转移 ticket 所有权。
+    pub const fn consumed_heap_chunks(&self) -> usize {
+        self.heap_next
+    }
+
+    /// 完整规划的不可变几何快照，不转移或复活已消费 ticket。
     pub fn heap_ranges(&self) -> impl Iterator<Item = Range> + '_ {
-        self.heap[..self.heap_count]
-            .iter()
-            .map(|ticket| ticket.as_ref().expect("heap ticket missing").range())
+        self.heap_ranges[..self.heap_count].iter().copied()
     }
 
     /// 按物理地址顺序单向消费一个 recovery ticket。
@@ -159,11 +167,13 @@ impl<const HEAP: usize, const RECOVERY: usize> SystemSupply<HEAP, RECOVERY> {
         self.recovery_count - self.recovery_next
     }
 
-    /// 启动期准备恢复资源使用的只读几何，不转移 ticket 所有权。
+    pub const fn consumed_recovery_tickets(&self) -> usize {
+        self.recovery_next
+    }
+
+    /// 完整规划的不可变几何快照，不转移或复活已消费 ticket。
     pub fn recovery_ranges(&self) -> impl Iterator<Item = Range> + '_ {
-        self.recovery[..self.recovery_count]
-            .iter()
-            .map(|ticket| ticket.as_ref().expect("recovery ticket missing").range())
+        self.recovery_ranges[..self.recovery_count].iter().copied()
     }
 }
 
@@ -430,9 +440,11 @@ impl<const RANGES: usize, const HEAP: usize, const RECOVERY: usize>
                 metadata: FramePoolMetadata {
                     range: metadata_range,
                 },
+                heap_ranges: self.heap_ranges,
                 heap,
                 heap_next: 0,
                 heap_count: requirements.heap_chunk_count,
+                recovery_ranges: self.recovery_ranges,
                 recovery,
                 recovery_next: 0,
                 recovery_count: requirements.recovery_ticket_count,
@@ -462,7 +474,7 @@ fn validate_requirements<const HEAP: usize, const RECOVERY: usize>(
                 || requirements.heap_chunk_size < page))
         || (requirements.recovery_ticket_count > 0
             && (requirements.recovery_ticket_size == 0
-                || requirements.recovery_ticket_size % page != 0))
+                || !requirements.recovery_ticket_size.is_multiple_of(page)))
     {
         return Err(PlanError::InvalidRequirements);
     }
@@ -510,7 +522,10 @@ fn clip_and_normalize_into<const N: usize>(
 }
 
 fn validate_range(range: Range, page_size: usize) -> Result<(), PlanError> {
-    if range.start >= range.end || range.start % page_size != 0 || range.end % page_size != 0 {
+    if range.start >= range.end
+        || !range.start.is_multiple_of(page_size)
+        || !range.end.is_multiple_of(page_size)
+    {
         return Err(PlanError::InvalidRange);
     }
     Ok(())

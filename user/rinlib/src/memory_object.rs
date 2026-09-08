@@ -19,8 +19,8 @@ impl MemoryObject {
     /// 从调用者唯一拥有的 raw Handle 建立 typed owner。
     ///
     /// # Safety
-    /// 调用者把该值的唯一使用权移入 owner；调用后不得再使用任何 raw alias，
-    /// 也不得存在其它 typed owner。
+    /// `handle` 必须是当前进程中已安装的 MemoryObject role，调用者把唯一使用权移入
+    /// owner；调用后不得再使用任何 raw alias，也不得存在其它 typed owner。
     pub const unsafe fn from_handle(handle: Handle) -> Self {
         Self { handle }
     }
@@ -72,19 +72,14 @@ impl MemoryObject {
         unsafe { crate::call::sys_memory_object_seal(self.handle) }
     }
 
-    /// 关闭 Handle；若内核拒绝，返回仍可重试的 owner。
-    pub fn close(self) -> Result<(), (Self, SystemCallError)> {
-        let handle = self.into_handle();
-        match crate::ipc::object::close(handle) {
-            Ok(()) => Ok(()),
-            Err(error) => Err((Self { handle }, error)),
-        }
+    /// 关闭唯一持有的 MemoryObject leaf Handle；合法 typed owner 不存在可恢复失败。
+    pub fn close(self) {
+        crate::ipc::object::close_leaf_owner(self.into_handle());
     }
 }
 
 impl Drop for MemoryObject {
     fn drop(&mut self) {
-        crate::ipc::object::close(self.handle)
-            .expect("MemoryObject owner failed to close its kernel Handle");
+        crate::ipc::object::close_leaf_owner(self.handle);
     }
 }

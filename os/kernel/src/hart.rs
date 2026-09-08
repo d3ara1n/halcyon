@@ -9,11 +9,6 @@
 
 use core::{arch::asm, sync::atomic::AtomicUsize};
 
-#[allow(clippy::declare_interior_mutable_const)]
-const ATOMIC_ZERO: AtomicUsize = AtomicUsize::new(0);
-#[allow(clippy::declare_interior_mutable_const)]
-const ATOMIC_MAX: AtomicUsize = AtomicUsize::new(usize::MAX);
-
 /// 与链接脚本 `HART_NUM_LIMIT` 一致（rust_start 启动时校验）。
 pub const HART_NUM_LIMIT: usize = 8;
 
@@ -91,22 +86,24 @@ pub struct HartLocal {
 }
 
 impl HartLocal {
-    const ZERO: Self = Self {
-        hartid: AtomicUsize::new(usize::MAX),
-        kernel_sp: AtomicUsize::new(0),
-        sched_sp: AtomicUsize::new(0),
-        frame_ptr: AtomicUsize::new(0),
-        user_satp: AtomicUsize::new(0),
-        trap_scratch: AtomicUsize::new(0),
-        current_thread: AtomicUsize::new(0),
-        slot: ATOMIC_MAX,
-        emergency_sp: ATOMIC_ZERO,
-        fatal_guard: ATOMIC_MAX,
-        trap_scratch2: ATOMIC_ZERO,
-        fp_enabled: ATOMIC_ZERO,
-        fatal_sp: ATOMIC_ZERO,
-        reservation: ATOMIC_ZERO,
-    };
+    const fn zeroed() -> Self {
+        Self {
+            hartid: AtomicUsize::new(usize::MAX),
+            kernel_sp: AtomicUsize::new(0),
+            sched_sp: AtomicUsize::new(0),
+            frame_ptr: AtomicUsize::new(0),
+            user_satp: AtomicUsize::new(0),
+            trap_scratch: AtomicUsize::new(0),
+            current_thread: AtomicUsize::new(0),
+            slot: AtomicUsize::new(usize::MAX),
+            emergency_sp: AtomicUsize::new(0),
+            fatal_guard: AtomicUsize::new(usize::MAX),
+            trap_scratch2: AtomicUsize::new(0),
+            fp_enabled: AtomicUsize::new(0),
+            fatal_sp: AtomicUsize::new(0),
+            reservation: AtomicUsize::new(0),
+        }
+    }
 
     /// hart 编号。
     pub fn hartid(&self) -> usize {
@@ -132,7 +129,10 @@ impl HartLocal {
 
     /// 当前线程；调度循环运行期间非空（循环持有 Arc 保证存活）。
     pub fn current_thread(&self) -> Option<&'static crate::task::Thread> {
-        let p = self.current_thread.load(core::sync::atomic::Ordering::Relaxed) as *const crate::task::Thread;
+        let p = self
+            .current_thread
+            .load(core::sync::atomic::Ordering::Relaxed)
+            as *const crate::task::Thread;
         if p.is_null() {
             None
         } else {
@@ -167,15 +167,17 @@ impl HartLocal {
             .store(0, core::sync::atomic::Ordering::Relaxed);
         self.user_satp
             .store(0, core::sync::atomic::Ordering::Relaxed);
-        self.current_thread.store(0, core::sync::atomic::Ordering::Relaxed);
-        self.fp_enabled.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.current_thread
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+        self.fp_enabled
+            .store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// tp 指向的数组，`HART_SETUP` 按 hartid 索引。每个元素只被所属 hart 经 tp 访问
 /// （访问纪律见 notes/impls/internals.md）；字段为原子类型，静态声明无需 unsafe。
 #[unsafe(no_mangle)]
-static HART_LOCALS: [HartLocal; HART_NUM_LIMIT] = [HartLocal::ZERO; HART_NUM_LIMIT];
+static HART_LOCALS: [HartLocal; HART_NUM_LIMIT] = [const { HartLocal::zeroed() }; HART_NUM_LIMIT];
 
 /// 按 slot 取 HartLocal 静态槽地址（registry 构造 record 用；运行期定位
 /// 一律经 tp 不变量）。

@@ -1,6 +1,6 @@
 # 系统审计批次 E-2：syscall/shared ABI、IPC/FAL/服务与工程化
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；RPC reject 归 capability/owner 计划，E2-7-01 lint 门仍由本报告独立承接。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；RPC reject 归 capability/owner 计划，E2-7-01 lint 门由本报告保留复核证据，当前实现已闭合。
 
 ## 范围、基线与证据边界
 
@@ -62,15 +62,15 @@ HandleTable 的 generation/rights/role/badge、Mailbox send/receive rollback、N
 
 已登记的 RNL1→RNL2、多页 Tunnel、raw `alloc_user_order` selftest adapter 属计划中的未来能力/过渡项，不是未登记残留。当前代码不再出现隐式系统 shutdown 主路径。
 
-### E2-7-01 / P2：全域 clippy -D warnings 未闭合，Justfile 无静态 lint 门
+### E2-7-01 / P2：全域 clippy -D warnings 未闭合，Justfile 无静态 lint 门（已闭合）
 
-证据：`cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings` 在 shared、dtb/memory_space、librunnel/libfal 等 crate 失败，涉及 `too_many_arguments`、`new_without_default`、`manual_is_multiple_of`、`needless_lifetimes`、`dead_code` 等；`just check` 仅编译，不运行 clippy，不能推出 lint-clean。
+首审证据：`cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings` 在 shared、dtb/memory_space、librunnel/libfal 等 crate 失败，涉及 `too_many_arguments`、`new_without_default`、`manual_is_multiple_of`、`needless_lifetimes`、`dead_code` 等；`just check` 仅编译，不运行 clippy，不能推出 lint-clean。
 
-影响：不是已证实运行时内核缺陷，但工程门无法持续发现 lint debt、真实 dead_code 和接口复杂度问题；当前报告不能写“clippy clean”。
+影响：不是已证实运行时内核缺陷，但工程门无法持续发现 lint debt、真实 dead_code 和接口复杂度问题；首审时不能写“clippy clean”。
 
-建议：增加显式 `just clippy`，按 os/shared/user host target 与内核 target 分组；逐项修复，确需保留的公共 ABI 构造器用局部且有理由的 `#[expect]`，不要全局放宽；将 lint 结果纳入阶段收口或明确为独立非阻断验证项。
+复核证据：`just clippy` 现以 `-D warnings` 顺序覆盖 shared host、排除内核的 os host、RISC-V kernel、仅库的 user host、Base64 user bins、`srv_init` stress feature，以及独立 `riscv64gc` `test_fp` 七个编译面，完整输出分别保存在 `artifacts/lint/`。接口、迭代器、算术与测试 lint 已逐项修复；必须保持 affine owner 完整错误返回或一次提交全部发布维度的接口，仅使用带结构理由的局部 `#[expect]`，未增加 crate 级 blanket allow。`just acceptance` 在三条 QEMU 路线前先运行该静态门，后续改动不能绕开。
 
-**分片 7 结论：构建/QEMU 路线首审证据成立，但工程化最终收口不通过；E2-7-01 为新增 P2。**
+**分片 7 复核：E2-7-01 已闭合；构建、静态 lint 与 QEMU 聚合现由同一阶段收口入口持续执行。**
 
 ## 已证实闭包
 
@@ -90,9 +90,9 @@ HandleTable 的 generation/rights/role/badge、Mailbox send/receive rollback、N
 - 未运行 `virt-hetero`/`virt-nofd`；D64/无 F/D 路线未现场证明。
 - 未做恶意 RPC response 携带 Handle、Caller timeout/ServiceClosed/txid mismatch 后 port 重建、跨进程 FAL、跨进程 MemoryObject Seal/EXECUTE/RX、多页 Tunnel/RNL2、OOM/地址 fault 注入。
 - 当前 RNL1/单页/u32、raw selftest adapter 继续由 `todo-2026-09-memory-object-data-plane.md` 承接。
-- E2-5-01 的实施归 capability/owner 计划，E2-7-01 lint 门由本报告独立承接；本报告保留两项复核条件。实现事实同步 `notes/impls/rpc.md`、`ipc.md`、`internals.md`，方向契约同步 `notes/ideas/rpc.md`。
+- E2-5-01 已由 capability/owner 计划闭合，E2-7-01 lint 门也已按本报告条件复核闭合；本报告保留目标提交的首审事实，等待固定修复提交后的整批 Review。实现事实同步 `notes/impls/rpc.md`、`ipc.md`、`internals.md`，方向契约同步 `notes/ideas/rpc.md`。
 - 所有 findings 修复并复核后，本报告才移入 `plans/archived/`。
 
 ## 最终判定
 
-**E-2 分片 5–7 首审不通过最终收口。** 新增 1 项 P1（librpc capability/ReplyPort 隔离）和 1 项 P2（clippy/工程 lint 门），另有 A–D findings 继续阻断整体收口。
+**E-2 分片 5–7 首审不通过最终收口。** 首审新增 1 项 P1（librpc capability/ReplyPort 隔离）和 1 项 P2（clippy/工程 lint 门）；二者当前实现与验证均已闭合，但该历史判定只在形成固定修复提交并完成整批 Review 后更新为最终复核结论。

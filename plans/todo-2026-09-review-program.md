@@ -1,6 +1,6 @@
 # Review findings 统筹导航
 
-> A–E 首审已结束，不重复发起首审。地址空间、等待、调度、生命周期终段与启动发布主线已经实现并完成组合压力；当前剩余项按 Admission、Capability/owner、Supervision 与工程 lint 各专题继续收口，不按报告顺序打补丁。事务证据入口为 [`todo-2026-09-memory-transaction-state-machine.md`](todo-2026-09-memory-transaction-state-machine.md)。
+> A–E 首审已结束，不重复发起首审。地址空间、等待、调度、生命周期终段、启动发布、Admission、Capability/owner、Supervision 与工程 lint 的实现均已完成，专题实施计划已经归档；当前等待形成固定修复提交后再恢复整批 Review。事务证据入口为 [`memory-transaction-state-machine` 档案](archived/todo-2026-09-memory-transaction-state-machine.md)。
 
 ## 文档职责
 
@@ -19,22 +19,22 @@
 
 ### 地址空间事务与进程启动
 
-由 [`memory-transaction-state-machine`](todo-2026-09-memory-transaction-state-machine.md) 拥有两个纵向单元：
+[`memory-transaction-state-machine` 实施档案](archived/todo-2026-09-memory-transaction-state-machine.md)记录两个已完成的纵向单元：
 
 1. 地址空间：ledger / funding / 来源保活 / abort / PTE publish / Remote / retire，连同匿名、MemoryObject、Building、Tunnel 调用者一次迁移。
 2. 进程：私有 Bound 构造失败 / 普通 Start / Bootstrap / Job-lifecycle gate / 首次 Ready 发布一次迁移。
 
 二者共享失败与提交原则，不合并成万能事务框架。基础机制继续保留：ledger 真值、funded owner、PoolBinding、MemoryObject permit、execution gate、Remote 确认链、有界 work debt 与 ProcessDrain。
 
-完成闭包包含真实调用者交付，不止于 ledger Complete。线程全寿命调度准入、全部等待意图出口、通用通知、ThreadDeparture、Tunnel 不可失败 detached close、ProcessDrain/Job 终段、地址空间来源与容量、Bootstrap/普通创建发布均已接成同一完成责任链并通过 core/stress。validated ELF 与公共 EXECUTE authority 仍是独立联合验收门，现状与证据只登记在内存事务计划，不新增平行修复计划。
+完成闭包包含真实调用者交付，不止于 ledger Complete。线程全寿命调度准入、全部等待意图出口、通用通知、ThreadDeparture、Tunnel 不可失败 detached close、ProcessDrain/Job 终段、地址空间来源与容量、Bootstrap/普通创建发布均已接成同一完成责任链并通过 core/stress。validated ELF 已作为独立 admission 子单元接入 Bootstrap/libprocess/audit；公共 EXECUTE authority 也已接入 shared/kernel/rinlib 与真实 RX capability 矩阵；事务联合代码门已闭合，现状由 `notes/impls/` 记录，实施证据保留在各专题档案，不新增平行修复计划。
 
 ### 其它专题
 
-- [`admission-fail-closed`](todo-2026-09-admission-fail-closed.md)：平台/ELF 输入的规范化、checked validation 与 immutable admission。
-- [`identity-generation-boundaries`](todo-2026-09-identity-generation-boundaries.md)：实例身份、代次、不可回绕与耗尽策略。
-- [`capability-owner-error-boundary`](todo-2026-09-capability-owner-error-boundary.md)：rights/signal、用户态 affine owner、已接收 capability 与 ReplyPort 的消费边界。
-- [`supervision-authority-policy`](todo-2026-09-supervision-authority-policy.md)：用户态 authority 保留、有限等待与失败升级。
-- 工程 lint 门由 E-2 的 E2-7-01 独立承接；尚无其它专题重复拥有它。
+- [`admission-fail-closed` 档案](archived/todo-2026-09-admission-fail-closed.md)：平台/ELF 输入的规范化、checked validation 与 immutable admission。
+- [`identity-generation-boundaries` 档案](archived/todo-2026-09-identity-generation-boundaries.md)：实例身份、代次、不可回绕与耗尽策略。
+- [`capability-owner-error-boundary` 档案](archived/todo-2026-09-capability-owner-error-boundary.md)：rights/signal、用户态 affine owner、已接收 capability 与 ReplyPort 的消费边界。
+- [`supervision-authority-policy` 档案](archived/todo-2026-09-supervision-authority-policy.md)：用户态 authority 保留、有限等待与失败升级。
+- 工程 lint 门已由 E-2 的 E2-7-01 闭合：`just clippy` 覆盖七个编译面，并作为 `just acceptance` 的前置门；报告保留首审与复核证据。
 
 以上是职责域，不是要求“一个专题全做完才开始下一个”的队列，也不是一套共用状态机。关联子单元按前置关系衔接；独立问题不强塞进当前内存重构。
 
@@ -43,23 +43,23 @@
 | 报告 / 条目 | 契约与实施 owner | 当前处置边界 |
 |---|---|---|
 | A：WritePermit rollback、同对象 owner、post-Commit 容量 | 内存事务计划，纵向单元一 | 已以事务来源、AVL view owner、region delta、backing growth 与预付 completion 闭合；终段复核发现并修复 Existing owner 竞态，未留高严重度 finding |
-| A：EXECUTE capability、RX rights | Capability 计划，rights 纵向子单元 | 完整 RX authority/验收的前置；不能由 MemoryChange 重造权限规则 |
-| B-1 F-1/F-2：DT status、FramePool arithmetic | Admission 计划，平台输入子单元 | 编码前回到固定规范核对接受/拒绝集合；不凭历史建议猜标准 |
-| B-1 F-3/F-4：MemoryPool Drop、SystemSupply query | Capability/owner 计划，相应消费边界子单元 | 用户态错误政策与纯 ticket 查询独立实现，不套内核事务类型 |
+| A：EXECUTE capability、RX rights | Capability 计划，rights 纵向子单元 | 已增加独立 EXECUTE 位并接入 RX required rights、派生裁剪与 Seal/Map/Unmap 矩阵；MemoryChange 未重造权限规则 |
+| B-1 F-1/F-2：DT status、FramePool arithmetic | Admission 计划，平台输入子单元 | 已按 DTSpec 固定 status 接受集；CPU/memory canonical admission、FramePool checked preflight 与失败原子性测试已闭合 |
+| B-1 F-3/F-4：MemoryPool Drop、SystemSupply query | Capability/owner 计划，相应消费边界子单元 | typed leaf owner 已统一不可失败 close；SystemSupply 几何快照与 ticket owner 分离，消费后查询/计数测试通过 |
 | B-2 F-1：Bootstrap post-commit | 内存事务计划，纵向单元二 | typed Handle commit、Job/lifecycle/execution 同锁区发布与首次 Ready 预付已闭合；终段复核未见 Commit 后可恢复失败 |
-| C-1 P1-01/P1-02/P2-08：监督 authority、服务缺失、无限等待 | Supervision 计划 | 保留控制权直至可靠收束或明确接管；不由内核代做政策 |
-| C-1 P2-06：q-only CPU capability | Admission 计划 | 与 canonical CPU admission 同单元 |
+| C-1 P1-01/P1-02/P2-08：监督 authority、服务缺失、无限等待 | Supervision 计划 | RequiredLaunchSet、有限 collect/job_kill policy、失败 authority/progress 返还与 pm→init/root escalation 已闭合；一 work-unit 耗尽续接及 acceptance 通过 |
+| C-1 P2-06：q-only CPU capability | Admission 计划 | canonical CPU admission 已强制 `q => d => f`，host 负向与 hetero/nofd QEMU 路线通过 |
 | C-1 P2-07：ThreadControl CLOSED | Capability 计划，signal 子单元 | 已收窄为仅允许真实持续电平 DONE，并加入 stress 负向断言；待报告复核 |
-| C-2 F1/F2：Remote token identity、AddressSpace epoch | Identity 计划 | Remote `TableId` 与 epoch CAS 耗尽门已随事务接入；其它容器 identity 仍由专题复核 |
-| C-2 F3：UserStack cleanup | Capability/owner 计划 | release 与构造 map 均对事务 `ObjectBusy` 有界退避；Drop/监督的一般错误政策仍归 owner 专题 |
+| C-2 F1/F2：Remote token identity、AddressSpace epoch | Identity 计划 | Remote/work `TableId`、epoch CAS、全局单调 ID/token 与用户态 cookie/txid 已统一为不可回绕耗尽；跨表 owner 返还和最大代次退休测试通过 |
+| C-2 F3：UserStack cleanup | Capability/owner 计划 | Map/Unmap 对 ObjectBusy 按 tick 重试；终端 cleanup 错误记录并留给 AddressSpace drain，不再 panic/无限等待；core 验证零 abandoned |
 | D-1 P2-D1-03：MappingLease 失败/析构验证 | 内存事务计划，纵向单元一 | 显式 close 走完整 MemoryChange；REAPABLE detached close 并入 ProcessDrain，无后置 funding |
-| D-2 F-02：启动 reservation 区间 | Admission 计划 | 先核对当前规范化供给机制，已被覆盖的历史路径不重复修复 |
-| D-2 F-05/F-06：ELF entry、PT_INTERP/flags | Admission 计划，ELF 纵向子单元 | runtime parser、audit、launcher 共用 validated image；构造单元二消费它 |
-| D-2 F-07：reservation token | Identity 计划 | Ready 由保活 core 校验；Handle 最终发布新增 typed prepared token，Job/Work-debt 仍由 identity 专题统一复核耗尽 |
+| D-2 F-02：启动 reservation 区间 | Admission 计划 | 已由 canonical memory/reservation admission 的 checked 对齐、排序、合并与重叠拒绝覆盖；不保留独立修复路径 |
+| D-2 F-05/F-06：ELF entry、PT_INTERP/flags | Admission 计划，ELF 纵向子单元 | 已由 `os/elf::validate` 统一 runtime、audit、launcher 与 Bootstrap；entry file-byte、header/flags 和页权限负向测试通过 |
+| D-2 F-07：reservation token | Identity 计划 | Handle/Job token 已使用永久耗尽的独立 domain；work-debt token 携 TableId；Ready 继续由保活 core 校验 |
 | E-1 M3-1：Bound 镜像失败 | 内存事务计划，纵向单元二 | 预付 `UnpublishedReservation` 与显式 rollback 已闭合；Drop 只作未消费 token 断言 |
-| E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | Admission 计划 | canonical admitted 集合与失败广播 |
-| E-2 E2-5-01：RPC reject capability/port | Capability/owner 计划，RPC 接收子单元 | 消费拒绝消息及旧端口，不复用污染状态 |
-| E-2 E2-7-01：clippy / lint 门 | E-2 报告 | 独立工程项，不阻塞内存结构设计；不能宣称全仓 lint-clean |
+| E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | Admission 计划 | raw hart 排序去重、strict registry、RuntimeGate 单向终态和 HSM/CSR/超时失败广播已闭合；普通 IPI 保留业务真值并返回失败 mask |
+| E-2 E2-5-01：RPC reject capability/port | Capability/owner 计划，RPC 接收子单元 | 所有 reject 关闭已收 Handle 并 discard ReplyPort；QEMU 双调用验证 Handle stale 与新端口成功 |
+| E-2 E2-7-01：clippy / lint 门 | E-2 报告 | 已以七面 `-D warnings` recipe 和 acceptance 前置门闭合；完整日志按面保存在 `artifacts/lint/` |
 
 ### 本轮终段复核
 
@@ -94,11 +94,11 @@
 - 任务分片只服务整体完成门：总体设计自顶向下约束 owner、容量、失败与发布边界；实施按依赖自下向上推进。分片代码可以暂未接通后续阶段，但必须直接采用最终接口，并在总计划登记连接点和剩余责任。
 - 不把“先改纯逻辑 crate → adapter 接回旧内核 → 最后清理调用者”当作阶段顺序。一个纵向单元跨所有必要模块；中间施工可先编辑底层、用编译器定位未迁移调用点，但不为短暂可编译引入兼容层或平行真值。
 - 设计确认、中间施工提交、完整纵向单元验收、提交后的 Review 是不同边界。中间提交只提供可回溯基线；局部编译或测试通过不构成专题完成。
-- 多页 Tunnel/RNL2 只在直接依赖的事务/启动及 authority 闭合后恢复。其他独立 findings 继续按专题推进；最终架构 Review 仍要求 A–E 基础问题与既定数据面触发条件满足。
+- 多页 Tunnel/RNL2 的直接实现前置已经闭合，但仍等待本次固定提交后的 A–E 复核；最终架构 Review 继续要求数据面既定触发条件满足。
 
 ## 首审报告索引
 
-每份报告保留其目标提交、执行命令和验证限制。当前未提交实现建立在 `ef0cbe2` 之上；此前施工提交与本轮工作树共同完成等待/离场、epoch、Remote 身份、退役来源冻结、Tunnel detached close、稳定 Job/view 容器、backing 累计容量与启动原子发布。该机制单元已通过组合压力，但其它专题 findings 仍未闭合；不能据此归档整个 A–E Review program。
+每份报告保留其目标提交、执行命令和验证限制。此前施工提交与当前待提交工作树共同完成 A–E 所有已登记实现项，并通过 host、七面 lint 与完整 acceptance；五份专题实施计划因此归档。Review program 仍不能归档：当前工作树必须先形成固定修复提交，再以该提交为对象按九份原报告逐项复核，并把剩余验证缺口或新 finding 写回唯一真值点。
 
 | 批次 | 报告 | 历史目标范围 |
 |---|---|---|

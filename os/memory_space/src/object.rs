@@ -67,7 +67,7 @@ impl ObjectViewAuthorization {
     /// 校验 view 区间落在对象几何内并返回其页数。offset 与 length 都必须页对齐；
     /// 越界以对象自身长度为准，不接受调用方另传的长度。
     pub const fn view_pages(&self, offset: usize, bytes: usize, page_size: usize) -> Option<usize> {
-        if bytes == 0 || offset % page_size != 0 || bytes % page_size != 0 {
+        if bytes == 0 || !offset.is_multiple_of(page_size) || !bytes.is_multiple_of(page_size) {
             return None;
         }
         match offset.checked_add(bytes) {

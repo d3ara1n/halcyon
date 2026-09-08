@@ -12,6 +12,11 @@
 
 #![no_std]
 
+use libprocess::{
+    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, SupervisionTarget, collect_process,
+    enumerate_members, job_kill,
+};
+use librunnel::blocking;
 use rinlib::{
     env,
     ipc::{
@@ -26,13 +31,11 @@ use rinlib::{
         call::SystemCallError,
         message::MAILBOX_CAPACITY,
         object::{Handle, ObjectSignals},
-        proc::{JobMemberKind, JobState, ProcessExitReason, ProcessState},
-        wait::{WaitItem, WAIT_TIMEOUT_INFINITE},
+        proc::{JobMemberKind, ProcessExitReason},
+        wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
     },
     sys_sleep,
 };
-use libprocess::{DERIVED_CONTROL_RIGHTS, enumerate_members};
-use librunnel::blocking;
 
 /// 隧道页映射地址：与 init 约定的一致（各自进程空间内的同一常量）。
 const TUNNEL_VA: usize = 0x4000_0000;
@@ -136,7 +139,8 @@ fn main() {
                 if woke {
                     notification::signal(spin, 1).expect("spurious wake signal failed");
                 }
-                let result = wait_many(&items, WAIT_TIMEOUT_INFINITE).expect("writable wait failed");
+                let result =
+                    wait_many(&items, WAIT_TIMEOUT_INFINITE).expect("writable wait failed");
                 assert!(result.observed.intersects(ObjectSignals::WRITABLE));
                 woke = true;
             }
@@ -152,20 +156,18 @@ fn main() {
     debug!("pm: delegated domain managed");
 }
 
-/// 委托域管理：域内 Running 成员逐一收束（派生 → kill → 等 REAPABLE →
-/// drain 至 Complete → 终态查询），最后封口本域——sealed 且空即完成，
-/// CLOSED 电平可等待。pm 不持域外任何 authority；失败只降级日志，
-/// 域的终局由 init 以保留的直接收束权兜底。
+/// 委托域管理：成员使用有限 wait/drain/query policy；任何局部失败保留派生
+/// control 并升级到域级 JobKill。域级仍失败时不关闭 authority，明确交回持有独立
+/// control 的 init 接管。
 fn manage_delegated_domain(domain: Handle) {
     let members = match enumerate_members(domain, JobMemberKind::MemberProcesses) {
         Ok(members) => members,
         Err(error) => {
-            debug!("pm: domain enumerate failed: {:?}", error);
-            return;
+            debug!("pm: domain enumerate failed, escalating: {:?}", error);
+            return escalate_domain(domain, None);
         }
     };
     for pid in members {
-        // init 已弃置域内成员的 control，派生走铸造路径。
         let control = match process::derive_job(
             domain,
             JobMemberKind::MemberProcesses,
@@ -173,53 +175,77 @@ fn manage_delegated_domain(domain: Handle) {
             DERIVED_CONTROL_RIGHTS,
         ) {
             Ok(control) => control,
-            // 成员已完成移表（ID 不复用，永不错指）：收敛方向，跳过。
             Err(SystemCallError::ObjectNotFound) => continue,
             Err(error) => {
-                debug!("pm: domain derive pid {} failed: {:?}", pid, error);
-                return;
+                debug!(
+                    "pm: domain derive pid {} failed, escalating: {:?}",
+                    pid, error
+                );
+                return escalate_domain(domain, None);
             }
         };
         if let Err(error) = process::kill(control, 0x66) {
-            debug!("pm: domain kill pid {} failed: {:?}", pid, error);
-            let _ = close(control);
-            continue;
+            debug!(
+                "pm: domain kill pid {} failed, escalating: {:?}",
+                pid, error
+            );
+            return escalate_domain(domain, Some(control));
         }
-        let waited = wait_many(
-            &[WaitItem::new(
-                control,
-                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-                0,
-            )],
-            WAIT_TIMEOUT_INFINITE,
-        );
-        let drained = process::drain_to_completion(control);
-        let snapshot = process::query(control);
-        let collected = waited.is_ok()
-            && drained.is_ok()
-            && matches!(&snapshot, Ok(s) if s.state == ProcessState::Dead as u32
-                && s.reason == ProcessExitReason::Killed as u32
-                && s.code == 0x66);
-        debug!(
-            "pm: delegated member pid {} collected: {}",
-            pid,
-            if collected { "Dead/Killed/0x66" } else { "degraded" }
-        );
-        let _ = close(control);
+        match collect_process(
+            SupervisionTarget::new(pid, control),
+            DEFAULT_SUPERVISION_POLICY,
+        ) {
+            Ok(collected)
+                if collected.snapshot.reason == ProcessExitReason::Killed as u32
+                    && collected.snapshot.code == 0x66 =>
+            {
+                debug!(
+                    "pm: delegated member pid {} collected: Dead/Killed/0x66",
+                    pid
+                );
+            }
+            Ok(collected) => {
+                debug!(
+                    "pm: delegated member pid {} inconsistent terminal reason={}, code={}",
+                    pid, collected.snapshot.reason, collected.snapshot.code
+                );
+                return escalate_domain(domain, None);
+            }
+            Err(failure) => {
+                debug!(
+                    "pm: delegated member pid {} supervision failed at {:?}: {:?}, progress {:?}",
+                    pid, failure.stage, failure.cause, failure.progress
+                );
+                return escalate_domain(domain, Some(failure.target.into_control()));
+            }
+        }
     }
-    let sealed = process::seal_job(domain);
-    let waited = wait_many(
-        &[WaitItem::new(domain, ObjectSignals::CLOSED, 0)],
-        WAIT_TIMEOUT_INFINITE,
-    );
-    let snapshot = process::query_job(domain);
-    let passed = sealed.is_ok()
-        && waited.is_ok()
-        && matches!(&snapshot, Ok(s) if s.state == JobState::Dead as u32);
-    debug!(
-        "pm: delegated domain seal {} (state {:?})",
-        if passed { "passed" } else { "FAILED" },
-        snapshot.as_ref().map(|s| s.state)
-    );
-    let _ = close(domain);
+    escalate_domain(domain, None);
+}
+
+fn escalate_domain(domain: Handle, retained_process: Option<Handle>) {
+    match job_kill(domain, 0x66) {
+        Ok(()) => {
+            if let Some(control) = retained_process {
+                let _ = close(control);
+            }
+            let snapshot = process::query_job(domain);
+            debug!(
+                "pm: delegated domain seal passed (state {:?})",
+                snapshot.as_ref().map(|state| state.state)
+            );
+            let _ = close(domain);
+        }
+        Err(failure) => {
+            debug!(
+                "pm: delegated domain unmanaged; init handoff required: stage={:?}, cause={:?}, progress={:?}, retained_process={}",
+                failure.stage,
+                failure.cause,
+                failure.progress,
+                retained_process.is_some() || failure.process.is_some()
+            );
+            // retained_process、failure.process 与 domain entry 都留在本进程表中；
+            // pm 退出后 ProcessDrain 关闭它们，init 的独立 domain control 不受影响。
+        }
+    }
 }

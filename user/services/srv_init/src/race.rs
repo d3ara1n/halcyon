@@ -629,7 +629,7 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         ];
         let terminal = drain_expect_dead(target.control, &allowed);
         match terminal {
-            Some(code) if code == 4 => dist[0] += 1,
+            Some(4) => dist[0] += 1,
             Some(_) => dist[1] += 1,
             _ => ok = false,
         }
@@ -896,7 +896,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
         };
         // SAFETY: TunnelCreate mapped one shared page at RACE_TUNNEL_VA.
         let shared = unsafe { &*(RACE_TUNNEL_VA as *const AtomicU64) };
-        let request = 0x7475_6e6e_656c_0000 | round as u64 + 1;
+        let request = 0x7475_6e6e_656c_0000 | (round as u64 + 1);
         shared.store(request, Ordering::Release);
         let (target, gun) = match spawn_tunnel_exit_target(job, image, pair.peer) {
             Ok(target) => target,
@@ -1444,7 +1444,7 @@ pub(crate) fn race_matrix(
         ),
     ];
     h.shutdown();
-    let hammer_supervision = supervise_services(alloc::vec::Vec::from([
+    let mut hammer_targets = alloc::vec::Vec::from([
         Supervised {
             pid: h.pids[0],
             control: h.controls[0],
@@ -1453,7 +1453,8 @@ pub(crate) fn race_matrix(
             pid: h.pids[1],
             control: h.controls[1],
         },
-    ]));
+    ]);
+    let hammer_supervision = supervise_services(&mut hammer_targets);
     let supervision_ok = hammer_supervision.is_ok();
     if !supervision_ok {
         debug!("race matrix acceptance failed: hammer supervision degraded");

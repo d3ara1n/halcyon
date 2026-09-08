@@ -995,7 +995,7 @@ fn advance_epoch(epoch: &AtomicU64) -> Option<u64> {
     }
 }
 
-static NEXT_ADDRESS_SPACE_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_ADDRESS_SPACE_ID: monotonic_id::AtomicIdUsize = monotonic_id::AtomicIdUsize::new(1);
 
 /// 进程地址空间的稳定外壳。identity 与 epoch 不随 ledger/页表状态锁借用而移动，
 /// Remote Call 和 execution gate 可在不复制 active 集合的前提下引用它们。
@@ -1043,6 +1043,10 @@ impl AddressSpaceState {
         bound.plan_building_anonymous(vaddr, len, permissions, prepared)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "failure returns all preallocated affine table and backing owners without allocation"
+    )]
     pub(crate) fn complete_bound_mapping(
         &mut self,
         plan: MemoryChangePlan,
@@ -1217,7 +1221,7 @@ impl RetiringSpaceChange {
                     }
                 }
                 RegionKindView::Mapping {
-                    backing: BackingView::Object { object: _, .. },
+                    backing: BackingView::Object { .. },
                     ..
                 } => {
                     // 一个事务可能产生同一对象的多个 retiring fragment；owner 只由
@@ -1496,13 +1500,11 @@ impl ShootdownSynchronization {
 }
 
 impl AddressSpace {
-    pub fn unbound() -> Self {
-        let identity = NEXT_ADDRESS_SPACE_ID.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            identity != 0 && identity != usize::MAX,
-            "address-space identity exhausted"
-        );
-        Self {
+    pub fn unbound() -> Result<Self, SpaceError> {
+        let identity = NEXT_ADDRESS_SPACE_ID
+            .allocate()
+            .ok_or(SpaceError::ReachLimit)?;
+        Ok(Self {
             identity,
             translation_epoch: AtomicU64::new(1),
             instruction_epoch: AtomicU64::new(1),
@@ -1510,7 +1512,7 @@ impl AddressSpace {
                 crate::sync::ranks::ADDRESS_SPACE,
                 AddressSpaceState::Unbound,
             ),
-        }
+        })
     }
 
     pub fn lock(&self) -> crate::sync::SpinlockGuard<'_, AddressSpaceState> {
@@ -1578,18 +1580,25 @@ impl AddressSpace {
         self.complete_building_plan(plan, pool)
     }
 
-    pub fn load_elf(&self, segments: &[elf::LoadSegment], file: &[u8]) -> Result<(), SpaceError> {
-        let (runs, image_end) = {
-            let mut state = self.lock();
-            state.bound_mut()?.plan_elf_mappings(segments)?
-        };
-        for (vaddr, len, protection) in runs {
-            self.map_building_protection(vaddr, len, protection, Some(vaddr + len))?;
+    pub fn load_elf(&self, image: &elf::Elf, file: &[u8]) -> Result<(), SpaceError> {
+        for run in image.runs() {
+            let vaddr = usize::try_from(run.vaddr).map_err(|_| SpaceError::BadSegment)?;
+            let len = usize::try_from(run.memsz).map_err(|_| SpaceError::BadSegment)?;
+            let protection = if run.executable {
+                Protection::ReadExecute
+            } else if run.writable {
+                Protection::ReadWrite
+            } else {
+                Protection::ReadOnly
+            };
+            let end = vaddr.checked_add(len).ok_or(SpaceError::BadSegment)?;
+            self.map_building_protection(vaddr, len, protection, Some(end))?;
         }
+        let image_end = usize::try_from(image.image_end()).map_err(|_| SpaceError::BadSegment)?;
         let mut state = self.lock();
         state
             .bound_mut()?
-            .write_elf_mappings(segments, file, image_end)
+            .write_elf_mappings(image.segments(), file, image_end)
     }
 
     pub fn map_stack(&self) -> Result<(), SpaceError> {
@@ -1610,7 +1619,8 @@ impl AddressSpace {
         let (pool, sponsor, base, prefix_pages, pages, end, identity, lease) = {
             let mut state = self.lock();
             let bound = state.bound_mut()?;
-            if prefix.is_empty() || prefix.len() % PAGE_SIZE != 0 || bound.image_end == 0 {
+            if prefix.is_empty() || !prefix.len().is_multiple_of(PAGE_SIZE) || bound.image_end == 0
+            {
                 return Err(SpaceError::BadSegment);
             }
             let payload_pages = payload_len.div_ceil(PAGE_SIZE);
@@ -1776,6 +1786,10 @@ impl AddressSpace {
 
     /// 在 `ADDRESS_SPACE → LIFECYCLE → REMOTE_CALL` 锁序内完成不可失败 Publish。
     /// stale execution snapshot 在调用 publish 前失败，Prepared 资源自动回滚。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "commit lists every frozen publication dimension and callback explicitly"
+    )]
     pub(crate) fn commit_shootdown<R>(
         &self,
         lifecycle: &super::lifecycle::Lifecycle,
@@ -2082,9 +2096,9 @@ pub(crate) fn memory_map(
         let request: MemoryMapRequest =
             unsafe { crate::uaccess::read_user_value(&mut space, request_ptr) }?;
         if request.cookie == 0
-            || request.result_address
-                % u64::try_from(core::mem::align_of::<MemoryMapResult>()).unwrap()
-                != 0
+            || !request
+                .result_address
+                .is_multiple_of(u64::try_from(core::mem::align_of::<MemoryMapResult>()).unwrap())
         {
             return Err(SystemCallError::IllegalArgument);
         }
@@ -2480,17 +2494,20 @@ impl BoundAddressSpace {
     }
 
     fn mint_backing(&mut self) -> Result<BackingId, SpaceError> {
-        let identity = BackingId::new(self.next_backing).ok_or(SpaceError::NoFrame)?;
+        let identity = BackingId::new(self.next_backing).ok_or(SpaceError::ReachLimit)?;
         self.next_backing = self
             .next_backing
             .checked_add(1)
-            .ok_or(SpaceError::NoFrame)?;
+            .ok_or(SpaceError::ReachLimit)?;
         Ok(identity)
     }
 
     fn mint_lease(&mut self) -> Result<LeaseKey, SpaceError> {
-        let identity = LeaseKey::new(self.next_lease).ok_or(SpaceError::NoFrame)?;
-        self.next_lease = self.next_lease.checked_add(1).ok_or(SpaceError::NoFrame)?;
+        let identity = LeaseKey::new(self.next_lease).ok_or(SpaceError::ReachLimit)?;
+        self.next_lease = self
+            .next_lease
+            .checked_add(1)
+            .ok_or(SpaceError::ReachLimit)?;
         Ok(identity)
     }
 
@@ -2573,7 +2590,10 @@ impl BoundAddressSpace {
     fn validate_user_map(&mut self, intent: &MapIntent) -> Result<(), SystemCallError> {
         self.ensure_table_transaction_available()
             .map_err(post_validate_error)?;
-        let identity = BackingId::new(self.next_backing).ok_or(SystemCallError::OutOfMemory)?;
+        self.next_backing
+            .checked_add(1)
+            .ok_or(SystemCallError::ReachLimit)?;
+        let identity = BackingId::new(self.next_backing).ok_or(SystemCallError::ReachLimit)?;
         self.ledger()
             .validate_map(Self::map_request(
                 intent,
@@ -2711,6 +2731,10 @@ impl BoundAddressSpace {
     /// 锁外取得的表页 owner 进入 PTE reservation。Running、Building 与 bootstrap
     /// 共用本函数：三者的差异已在 plan 阶段表达为字段，发布前的步骤完全相同。
     /// 任何失败都回滚账本并把摘出的 owner 交回调用者在 AddressSpace 锁外析构。
+    #[expect(
+        clippy::result_large_err,
+        reason = "failure returns all preallocated affine table and backing owners without allocation"
+    )]
     pub(crate) fn complete_memory_change(
         &mut self,
         plan: MemoryChangePlan,
@@ -2769,9 +2793,9 @@ impl BoundAddressSpace {
             Ok(token) => token,
             Err(error) => fail!(error),
         };
-        for index in 0..preflights.len() {
-            let owners = core::mem::take(&mut reclaimed.funded[index]);
-            match self.tt().prepare(preflights[index], owners) {
+        for (preflight, funded) in preflights.into_iter().zip(&mut reclaimed.funded) {
+            let owners = core::mem::take(funded);
+            match self.tt().prepare(preflight, owners) {
                 Ok(translation) => reclaimed.translations.push(translation),
                 Err(failure) => {
                     reclaimed.failed_owners = Some(failure.owners);
@@ -3087,6 +3111,10 @@ impl BoundAddressSpace {
 
     /// 对象 view 的 complete：失败时把 WritePermit 从 reclaimed 里摘出，随错误一起
     /// 交回调用者，由它在 AddressSpace 锁外归还对象状态机。
+    #[expect(
+        clippy::result_large_err,
+        reason = "failure returns all affine table, backing, and object permit owners without allocation"
+    )]
     pub(crate) fn complete_object_change(
         &mut self,
         plan: MemoryChangePlan,
@@ -3249,6 +3277,10 @@ impl BoundAddressSpace {
 
     /// Building/bootstrap 的同步完成：目标尚不可运行，无 active hart 需要确认，
     /// 因而 reservation 立即 Commit 并空批收口，funded table owner 交给调用者锁外析构。
+    #[expect(
+        clippy::result_large_err,
+        reason = "failure returns all preallocated affine table and backing owners without allocation"
+    )]
     pub(crate) fn complete_bound_mapping(
         &mut self,
         plan: MemoryChangePlan,
@@ -3384,8 +3416,7 @@ impl BoundAddressSpace {
         }
         reservations.truncate(output);
 
-        let mut admitted = 0;
-        for reservation in &reservations {
+        for (admitted, reservation) in reservations.iter().enumerate() {
             let index = self
                 .backings
                 .binary_search_by_key(&reservation.identity, |backing| backing.identity)
@@ -3415,7 +3446,6 @@ impl BoundAddressSpace {
                 return Err(SpaceError::NoFrame);
             }
             backing.reserved_extent_growth = total;
-            admitted += 1;
         }
         Ok(reservations)
     }
@@ -3745,7 +3775,10 @@ impl BoundAddressSpace {
     ) -> Result<(), SpaceError> {
         let (protection, _) = Self::building_intent(vaddr, len, permissions)?;
         self.ensure_table_transaction_available()?;
-        let identity = BackingId::new(self.next_backing).ok_or(SpaceError::NoFrame)?;
+        self.next_backing
+            .checked_add(1)
+            .ok_or(SpaceError::ReachLimit)?;
+        let identity = BackingId::new(self.next_backing).ok_or(SpaceError::ReachLimit)?;
         self.ledger()
             .validate_map(MapRequest {
                 bytes: len,
@@ -3786,7 +3819,7 @@ impl BoundAddressSpace {
     }
 
     /// 窗口不能由一次调用跨越；只有映像区推进 StartupBlock/heap 基准。
-
+    ///
     /// Building-only 回填；先验证完整目标区间已映射，再经物理直映射写入，
     /// 不要求目标最终 PTE 可写。
     pub fn write_building(&mut self, target: usize, source: &[u8]) -> Result<(), SpaceError> {
@@ -3836,7 +3869,7 @@ impl BoundAddressSpace {
         entry: usize,
         stack_pointer: usize,
     ) -> Result<(), SpaceError> {
-        if stack_pointer == 0 || stack_pointer % 16 != 0 || self.image_end == 0 {
+        if stack_pointer == 0 || !stack_pointer.is_multiple_of(16) || self.image_end == 0 {
             return Err(SpaceError::BadSegment);
         }
         let entry_mapping = self
@@ -3853,84 +3886,6 @@ impl BoundAddressSpace {
             return Err(SpaceError::BadSegment);
         }
         Ok(())
-    }
-
-    fn plan_elf_layout(
-        &self,
-        segments: &[elf::LoadSegment],
-    ) -> Result<(Vec<(usize, usize, Protection)>, usize), SpaceError> {
-        use alloc::collections::BTreeMap;
-        let mut plan: BTreeMap<usize, u64> = BTreeMap::new();
-        let mut top = 0usize;
-        for seg in segments {
-            if seg.filesz > seg.memsz {
-                return Err(SpaceError::BadSegment);
-            }
-            let start = seg.vaddr as usize;
-            if start % PAGE_SIZE != seg.offset as usize % PAGE_SIZE {
-                return Err(SpaceError::BadSegment);
-            }
-            let end = start
-                .checked_add(seg.memsz as usize)
-                .ok_or(SpaceError::BadSegment)?;
-            if end > USER_TOP {
-                return Err(SpaceError::BadSegment);
-            }
-            let mut fl = flags::V | flags::U | flags::A;
-            if seg.readable {
-                fl |= flags::R;
-            }
-            if seg.writable {
-                fl |= flags::W | flags::D;
-            }
-            if seg.executable {
-                fl |= flags::X;
-            }
-            for vpn in start / PAGE_SIZE..end.div_ceil(PAGE_SIZE) {
-                *plan.entry(vpn).or_insert(0) |= fl;
-            }
-            top = top.max(end);
-        }
-        if plan.values().any(|fl| {
-            fl & flags::R == 0 && fl & (flags::W | flags::X) != 0
-                || fl & (flags::W | flags::X) == (flags::W | flags::X)
-        }) {
-            return Err(SpaceError::BadSegment);
-        }
-        let mut runs = Vec::new();
-        runs.try_reserve(plan.len())
-            .map_err(|_| SpaceError::NoFrame)?;
-        for (&vpn, &fl) in &plan {
-            let protection = if fl & flags::X != 0 {
-                Protection::ReadExecute
-            } else if fl & flags::W != 0 {
-                Protection::ReadWrite
-            } else {
-                Protection::ReadOnly
-            };
-            if let Some((_, end, previous)) = runs.last_mut() {
-                if *end == vpn && *previous == protection {
-                    *end += 1;
-                    continue;
-                }
-            }
-            runs.push((vpn, vpn + 1, protection));
-        }
-        Ok((
-            runs.into_iter()
-                .map(|(start, end, protection)| {
-                    (start * PAGE_SIZE, (end - start) * PAGE_SIZE, protection)
-                })
-                .collect(),
-            top.div_ceil(PAGE_SIZE) * PAGE_SIZE,
-        ))
-    }
-
-    pub(crate) fn plan_elf_mappings(
-        &mut self,
-        segments: &[elf::LoadSegment],
-    ) -> Result<(Vec<(usize, usize, Protection)>, usize), SpaceError> {
-        self.plan_elf_layout(segments)
     }
 
     fn write_elf_segments(
@@ -4301,7 +4256,7 @@ impl Process {
             parent,
             job,
             resources,
-            space: AddressSpace::unbound(),
+            space: AddressSpace::unbound()?,
             handles: crate::sync::Spinlock::chained(
                 crate::sync::ranks::HANDLE_TABLE,
                 pid,
@@ -4821,9 +4776,8 @@ pub(crate) fn spawn_from_elf(
     file: &[u8],
     root_pool: Arc<super::memory_pool::MemoryPool>,
 ) -> Result<SpawnedProcess, SpaceError> {
-    // 执行需求由 ELF `e_flags` 与 `.riscv.attributes` 判定；F-only/Q/V/
-    // TSO/未建模状态扩展在 load 时明确拒绝，不降级为 Base。
-    let requirement = elf::isa_requirement(file).expect("userspace execution requirement rejected");
+    // entry、页权限与执行需求已由唯一 ELF admission 一次冻结。
+    let requirement = image.requirement();
     let process = Arc::new(Process::new(
         pid,
         parent,
@@ -4839,7 +4793,7 @@ pub(crate) fn spawn_from_elf(
         }
     })?;
     let bound = UnpublishedBound::new(Arc::clone(&process), drain);
-    if let Err(error) = process.space.load_elf(&image.segments, file) {
+    if let Err(error) = process.space.load_elf(image, file) {
         bound.rollback();
         return Err(error);
     }
@@ -4850,7 +4804,7 @@ pub(crate) fn spawn_from_elf(
     Ok(SpawnedProcess {
         process,
         bound: Some(bound),
-        entry: image.entry as usize,
+        entry: image.entry() as usize,
         requirement,
         root_pool,
     })
@@ -4883,6 +4837,13 @@ pub(crate) fn launch_bootstrap(
     );
     let result = (|| -> Result<crate::sched::AdmittedThread, SpaceError> {
         let mut handles = super::handle::PendingEntries::from_vec(handles);
+        let token = match super::handle::transaction_token() {
+            Ok(token) => token,
+            Err(_) => {
+                handles.close(&process, true);
+                return Err(SpaceError::ReachLimit);
+            }
+        };
         if handles.try_reserve(2).is_err() {
             handles.close(&process, true);
             return Err(SpaceError::NoFrame);
@@ -4929,7 +4890,6 @@ pub(crate) fn launch_bootstrap(
             "initial capability graph has an unexpected handle count"
         );
 
-        let token = super::handle::transaction_token();
         let reservation = {
             let mut table = process.handles.lock();
             match table.reserve(handles.entries().len(), token) {

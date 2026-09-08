@@ -1,4 +1,7 @@
-use core::{hint::spin_loop, sync::atomic::{AtomicBool, Ordering}};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use lock_api::{GuardSend, RawMutex};
 
@@ -11,6 +14,12 @@ impl SimpleLock {
         Self {
             lock: AtomicBool::new(false),
         }
+    }
+}
+
+impl Default for SimpleLock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -35,12 +44,8 @@ unsafe impl RawMutex for SimpleLock {
     }
 
     fn try_lock(&self) -> bool {
-        match self
-            .lock
+        self.lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+            .is_ok()
     }
 }

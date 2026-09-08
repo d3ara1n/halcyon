@@ -20,8 +20,8 @@ pub type HartId = usize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HartSlot(pub usize);
 
-/// [`crate::hart::HartLocal`] 的静态数组容量校验由该模块的断言承担
-/// （见 hart_local_slots）。
+// [`crate::hart::HartLocal`] 的静态数组容量校验由该模块的断言承担
+// （见 hart_local_slots）。
 
 // ---------------------------------------------------------------------------
 // HartBootRecord：每 admitted hart 的启动记录
@@ -141,13 +141,19 @@ impl HartRegistry {
         }
     }
 
-    /// 登记一个 admitted hart（按升序遍历 DT CPU 的顺序即 slot 序）。
+    /// 登记一个 canonical admitted hart；调用者必须按严格 raw hartid 升序交付。
     /// 返回分配的 slot。
     pub fn admit(&mut self, id: HartId) -> HartSlot {
         assert!(
             self.len < HART_NUM_LIMIT,
             "admitted hart count exceeds limit"
         );
+        if self.len != 0 {
+            assert!(
+                self.ids[self.len - 1] < id,
+                "admitted hartids are duplicate or unsorted"
+            );
+        }
         let slot = HartSlot(self.len);
         self.ids[self.len] = id;
         let record = &mut self.records[self.len];
@@ -231,20 +237,11 @@ pub fn admitted_mask() -> u64 {
     admitted
 }
 
-/// 把 slot 位图展开为 raw hartid 并逐个发送 IPI
-/// （绝不把内部 slot 位图直接解释为 SBI hart mask）。
-pub fn ipi_slots(mask: u64) {
-    with_registry(|reg| {
-        for (slot, record) in reg.records() {
-            if mask & (1u64 << slot.0) != 0 {
-                let raw = record.hartid;
-                crate::sbi::require(crate::sbi::send_ipi(1, raw), "IPI.send");
-            }
-        }
-    });
-}
-
-/// Remote Call 门铃：逐个发送并返回失败的稠密 slot 位图。请求 Pending 电平
+/// 把 slot 位图展开为 raw hartid 后逐个发送，返回失败的稠密 slot 位图。
+/// Pending/Ready 等业务真值必须已在调用前发布；IPI 只作门铃，失败不撤销业务。
+/// 内部 slot 位图绝不直接解释为 SBI hart mask。
+///
+/// Remote Call 门铃：请求 Pending 电平
 /// 已在调用前发布，门铃失败不得撤销业务或伪造完成。
 pub fn try_ipi_slots(mask: u64) -> u64 {
     with_registry(|reg| {
@@ -263,35 +260,27 @@ pub fn try_ipi_slots(mask: u64) -> u64 {
 // RuntimeGate：全局启动闸门
 // ---------------------------------------------------------------------------
 
-/// 全局运行时闸门。全体 admitted hart Online 后 boot 冻结 active 集合、
-/// 完成调度域与初始任务装载，再以 Release 置 Ready；任何启动矛盾置 Failed。
-/// 只有观察到 Ready 的 hart 可以进入调度器（防止 secondary 抢先触发静默判定）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum GateState {
-    Preparing = 0,
-    Ready = 1,
-    Failed = 2,
-}
+/// 全体 admitted hart Online 后 boot 冻结 active 集合、完成调度域与初始任务装载，
+/// 再发布 Ready；任何启动矛盾发布 Failed。只有 Ready 可进入调度器。
+pub use runtime_gate::GateState;
+use runtime_gate::RuntimeGate;
 
-static GATE: AtomicU8 = AtomicU8::new(GateState::Preparing as u8);
+static GATE: RuntimeGate = RuntimeGate::new();
 
 pub fn gate_state() -> GateState {
-    match GATE.load(Ordering::Acquire) {
-        1 => GateState::Ready,
-        2 => GateState::Failed,
-        _ => GateState::Preparing,
-    }
+    GATE.state()
 }
 
 /// boot hart 冻结完成后发布 Ready。
 pub fn publish_ready() {
-    GATE.store(GateState::Ready as u8, Ordering::Release);
+    GATE.publish_ready()
+        .expect("runtime gate left Preparing before Ready publication");
 }
 
-/// 任何启动错误使本次启动整体失败；不做部分降级。
+/// 任何启动错误使本次启动整体失败；并发失败发布幂等，不做部分降级。
 pub fn publish_failed() {
-    GATE.store(GateState::Failed as u8, Ordering::Release);
+    GATE.publish_failed()
+        .expect("runtime gate cannot fail after Ready publication");
 }
 
 /// 在线 hart 在此处自旋等待 Ready/Failed 判定（Acquire 观察发布）。

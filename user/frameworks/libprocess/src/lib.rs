@@ -7,16 +7,16 @@ extern crate alloc;
 
 pub mod race;
 
-use alloc::collections::BTreeMap;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{
-        ExecutionProfile, HandleGrant, JOB_ENUMERATE_MAX, JobMemberKind, PROCESS_MAIN_STACK_SIZE,
-        PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessMapFlags,
+        ExecutionProfile, HandleGrant, JOB_ENUMERATE_MAX, JobMemberKind, JobState,
+        PROCESS_DRAIN_MAX, PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE,
+        PROCESS_USER_TOP, ProcessDrainStatus, ProcessMapFlags, ProcessSnapshot, ProcessState,
         ThreadStartContext,
     },
-    wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
+    wait::{WaitItem, WaitReason},
 };
 use rinlib::{
     ipc::object::{close, duplicate},
@@ -30,7 +30,6 @@ const MAX_WRITE_BYTES: usize = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnError {
     Elf(elf::ElfError),
-    Requirement(elf::IsaReqError),
     InvalidImage,
     /// grants 数量超出 shared ABI 上界，不截断、不创建目标。
     /// 直接拒绝——静默丢句柄会让调用方误以为全部装入。
@@ -88,6 +87,53 @@ pub struct Spawned {
     pub control: Handle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredLaunchSet {
+    required_present: u64,
+    required_started: u64,
+    present: u64,
+    started: u64,
+}
+
+impl RequiredLaunchSet {
+    pub const fn new(required_present: u64, required_started: u64) -> Self {
+        Self {
+            required_present,
+            required_started,
+            present: 0,
+            started: 0,
+        }
+    }
+
+    pub fn mark_present(&mut self, item: u64) {
+        self.present |= item;
+    }
+
+    pub fn mark_started(&mut self, item: u64) {
+        self.started |= item;
+    }
+
+    pub const fn missing_present(&self) -> u64 {
+        self.required_present & !self.present
+    }
+
+    pub const fn missing_started(&self) -> u64 {
+        self.required_started & !self.started
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.missing_present() == 0 && self.missing_started() == 0
+    }
+
+    pub const fn present(&self) -> u64 {
+        self.present
+    }
+
+    pub const fn started(&self) -> u64 {
+        self.started
+    }
+}
+
 /// 解析静态 ET_EXEC，构造地址空间并首次发布进程。
 pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
     if !request.control_rights.contains(Rights::MANAGE) {
@@ -95,12 +141,14 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             SystemCallError::RightsDenied,
         )));
     }
-    let image = elf::parse(request.image)
-        .map_err(|error| SpawnFailure::retained(SpawnError::Elf(error)))?;
-    let requirement = elf::isa_requirement(request.image)
-        .map_err(|error| SpawnFailure::retained(SpawnError::Requirement(error)))?;
-    let (plan, image_top) =
-        page_plan(&image, request.image.len()).map_err(SpawnFailure::retained)?;
+    let image = elf::validate(
+        request.image,
+        elf::LoadLimits {
+            page_size: PROCESS_PAGE_SIZE as u64,
+            image_limit: (PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE) as u64,
+        },
+    )
+    .map_err(|error| SpawnFailure::retained(SpawnError::Elf(error)))?;
     // 上界先筛：超限在建进程前拒绝，无需回滚任何已建资源。
     if request.grants.len() > PROCESS_MAX_GRANTS {
         return Err(SpawnFailure::retained(SpawnError::TooManyGrants));
@@ -118,11 +166,11 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             let _ = close(binding_pool);
             return Err(error.into());
         }
-        map_plan(builder, &plan)?;
+        map_plan(builder, &image)?;
         write_segments(builder, &image, request.image)?;
         map_stack(builder)?;
 
-        let profile = match requirement {
+        let profile = match image.requirement() {
             elf::IsaRequirement::Base64 => ExecutionProfile::Base64,
             elf::IsaRequirement::D64 => ExecutionProfile::D64,
         };
@@ -136,9 +184,10 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             grants_consumed = true;
         }
         let block = build_birth_block(created.pid, &granted[..grant_len], request.payload)?;
+        let image_top = usize::try_from(image.image_end()).map_err(|_| SpawnError::InvalidImage)?;
         let block_va = write_birth_block(builder, &block, image_top)?;
         let descriptor = ThreadStartContext {
-            entry: image.entry,
+            entry: image.entry(),
             stack_pointer: PROCESS_USER_TOP as u64,
             arg1: block_va as u64,
             arg2: block.len() as u64,
@@ -173,28 +222,318 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
 pub const DERIVED_CONTROL_RIGHTS: Rights =
     Rights::from_raw(Rights::READ.raw() | Rights::WAIT.raw() | Rights::MANAGE.raw());
 
-/// 递归 JobKill（用户态政策，内核不递归）：逐层 `JobSeal → 枚举 members
-/// → 派生 kill → 等 REAPABLE → drain 至 Complete → 枚举 children 递归 →
-/// 等本层 CLOSED`。先 seal 后枚举：封口后成员集单调收缩，收敛性由
-/// 「枚举至空 + 派生 NotFound 即已完成」表达。派生 NotFound（目标已
-/// 完成移表，ID 不复用永不错指）跳过不报错。返回时本 Job 及全部后代
-/// 均已达 Dead/CLOSED（root 亦发 CLOSED 但不移除）。
-/// 要求：JobControl 持 MANAGE（seal/派生）与 READ（枚举）。
-pub fn job_kill(job: Handle, code: i64) -> Result<(), SystemCallError> {
-    process::seal_job(job)?;
-    kill_members(job, code)?;
-    kill_children(job, code)?;
-    // 完成屏障：直接成员全部完成后 CLOSED 置位（等待 CLOSED 即「直接
-    // 成员全部完成」，含子 Job 传播）。
-    wait_many(
-        &[WaitItem::new(job, ObjectSignals::CLOSED, 0)],
-        WAIT_TIMEOUT_INFINITE,
-    )?;
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisionPolicy {
+    pub wait_timeout_ms: u64,
+    pub wait_attempts: u32,
+    pub drain_work: u32,
+    pub drain_attempts: u32,
+    pub query_attempts: u32,
+    pub enumerate_stalls: u32,
 }
 
-fn kill_members(job: Handle, code: i64) -> Result<(), SystemCallError> {
-    for pid in enumerate_members(job, JobMemberKind::MemberProcesses)? {
+pub const DEFAULT_SUPERVISION_POLICY: SupervisionPolicy = SupervisionPolicy {
+    wait_timeout_ms: 100,
+    wait_attempts: 100,
+    drain_work: PROCESS_DRAIN_MAX,
+    drain_attempts: 64,
+    query_attempts: 4,
+    enumerate_stalls: 32,
+};
+
+#[must_use = "supervision authority must be collected or handed to another supervisor"]
+#[derive(Debug)]
+pub struct SupervisionTarget {
+    pid: u64,
+    control: Handle,
+}
+
+impl SupervisionTarget {
+    pub const fn new(pid: u64, control: Handle) -> Self {
+        Self { pid, control }
+    }
+
+    pub const fn pid(&self) -> u64 {
+        self.pid
+    }
+
+    pub const fn control(&self) -> Handle {
+        self.control
+    }
+
+    pub fn into_control(self) -> Handle {
+        self.control
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisionStage {
+    WaitReapable,
+    Drain,
+    VerifyDead,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisionCause {
+    InvalidPolicy,
+    Timeout,
+    System(SystemCallError),
+    InconsistentSnapshot { pid: u64, state: u32 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SupervisionProgress {
+    pub wait_attempts: u32,
+    pub drain_attempts: u32,
+    pub work_done: u32,
+    pub query_attempts: u32,
+}
+
+#[must_use = "failed supervision retains live authority"]
+#[derive(Debug)]
+pub struct SupervisionFailure {
+    pub target: SupervisionTarget,
+    pub stage: SupervisionStage,
+    pub cause: SupervisionCause,
+    pub progress: SupervisionProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectedProcess {
+    pub pid: u64,
+    pub snapshot: ProcessSnapshot,
+    pub progress: SupervisionProgress,
+}
+
+/// 有限预算地等待、Drain 并核验一个 Process；成功后关闭 control，失败原样返还
+/// authority 与进度，调用者可重试、handoff 或升级到所属 Job。
+pub fn collect_process(
+    target: SupervisionTarget,
+    policy: SupervisionPolicy,
+) -> Result<CollectedProcess, SupervisionFailure> {
+    let mut progress = SupervisionProgress::default();
+    if !valid_policy(policy) {
+        return Err(SupervisionFailure {
+            target,
+            stage: SupervisionStage::WaitReapable,
+            cause: SupervisionCause::InvalidPolicy,
+            progress,
+        });
+    }
+
+    let mut reapable = false;
+    for attempt in 1..=policy.wait_attempts {
+        progress.wait_attempts = attempt;
+        match wait_many(
+            &[WaitItem::new(
+                target.control,
+                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                0,
+            )],
+            policy.wait_timeout_ms,
+        ) {
+            Ok(result)
+                if result
+                    .observed
+                    .intersects(ObjectSignals::REAPABLE | ObjectSignals::CLOSED) =>
+            {
+                reapable = true;
+                break;
+            }
+            Ok(result) if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) => {}
+            Ok(_) => {
+                return Err(SupervisionFailure {
+                    target,
+                    stage: SupervisionStage::WaitReapable,
+                    cause: SupervisionCause::System(SystemCallError::InternalError),
+                    progress,
+                });
+            }
+            Err(SystemCallError::ObjectBusy) => {}
+            Err(error) => {
+                return Err(SupervisionFailure {
+                    target,
+                    stage: SupervisionStage::WaitReapable,
+                    cause: SupervisionCause::System(error),
+                    progress,
+                });
+            }
+        }
+    }
+    if !reapable {
+        return Err(SupervisionFailure {
+            target,
+            stage: SupervisionStage::WaitReapable,
+            cause: SupervisionCause::Timeout,
+            progress,
+        });
+    }
+
+    let mut complete = false;
+    for attempt in 1..=policy.drain_attempts {
+        progress.drain_attempts = attempt;
+        match process::drain(target.control, policy.drain_work) {
+            Ok(result) => {
+                progress.work_done = progress.work_done.saturating_add(result.work_done);
+                if result.status == ProcessDrainStatus::Complete as u32 {
+                    complete = true;
+                    break;
+                }
+            }
+            Err(SystemCallError::ObjectBusy) => {}
+            Err(error) => {
+                return Err(SupervisionFailure {
+                    target,
+                    stage: SupervisionStage::Drain,
+                    cause: SupervisionCause::System(error),
+                    progress,
+                });
+            }
+        }
+    }
+    if !complete {
+        return Err(SupervisionFailure {
+            target,
+            stage: SupervisionStage::Drain,
+            cause: SupervisionCause::Timeout,
+            progress,
+        });
+    }
+
+    let mut snapshot = None;
+    for attempt in 1..=policy.query_attempts {
+        progress.query_attempts = attempt;
+        match process::query(target.control) {
+            Ok(value) => {
+                snapshot = Some(value);
+                break;
+            }
+            Err(SystemCallError::ObjectBusy) => {}
+            Err(error) => {
+                return Err(SupervisionFailure {
+                    target,
+                    stage: SupervisionStage::VerifyDead,
+                    cause: SupervisionCause::System(error),
+                    progress,
+                });
+            }
+        }
+    }
+    let Some(snapshot) = snapshot else {
+        return Err(SupervisionFailure {
+            target,
+            stage: SupervisionStage::VerifyDead,
+            cause: SupervisionCause::Timeout,
+            progress,
+        });
+    };
+    if snapshot.pid != target.pid || snapshot.state != ProcessState::Dead as u32 {
+        return Err(SupervisionFailure {
+            target,
+            stage: SupervisionStage::VerifyDead,
+            cause: SupervisionCause::InconsistentSnapshot {
+                pid: snapshot.pid,
+                state: snapshot.state,
+            },
+            progress,
+        });
+    }
+    if let Err(error) = close(target.control) {
+        return Err(SupervisionFailure {
+            target,
+            stage: SupervisionStage::Close,
+            cause: SupervisionCause::System(error),
+            progress,
+        });
+    }
+    Ok(CollectedProcess {
+        pid: snapshot.pid,
+        snapshot,
+        progress,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKillStage {
+    Seal,
+    EnumerateMembers,
+    DeriveMember,
+    KillMember,
+    CollectMember(SupervisionStage),
+    EnumerateChildren,
+    DeriveChild,
+    WaitClosed,
+    VerifyDead,
+    CloseChild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKillCause {
+    Timeout,
+    System(SystemCallError),
+    Process(SupervisionCause),
+    InconsistentState(u32),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobKillProgress {
+    pub members_collected: u32,
+    pub children_collected: u32,
+    pub process_work: u32,
+}
+
+#[must_use = "failed JobKill retains the reported child/process authority"]
+#[derive(Debug)]
+pub struct JobKillFailure {
+    pub job: Handle,
+    pub process: Option<SupervisionTarget>,
+    pub stage: JobKillStage,
+    pub cause: JobKillCause,
+    pub progress: JobKillProgress,
+}
+
+pub fn job_kill(job: Handle, code: i64) -> Result<(), JobKillFailure> {
+    job_kill_with_policy(job, code, DEFAULT_SUPERVISION_POLICY)
+}
+
+/// 递归 JobKill（用户态政策，内核不递归）。每个 wait、enumeration 与 drain
+/// 都受 policy 约束；失败保留当前 JobControl，并在派生 ProcessControl 尚未收束时
+/// 随错误返还，不以无限等待或默认 close 掩盖残留。
+pub fn job_kill_with_policy(
+    job: Handle,
+    code: i64,
+    policy: SupervisionPolicy,
+) -> Result<(), JobKillFailure> {
+    let mut progress = JobKillProgress::default();
+    if !valid_policy(policy) {
+        return Err(job_failure(
+            job,
+            JobKillStage::Seal,
+            JobKillCause::System(SystemCallError::IllegalArgument),
+            progress,
+        ));
+    }
+    process::seal_job(job).map_err(|error| {
+        job_failure(
+            job,
+            JobKillStage::Seal,
+            JobKillCause::System(error),
+            progress,
+        )
+    })?;
+
+    let members =
+        enumerate_members_with_limit(job, JobMemberKind::MemberProcesses, policy.enumerate_stalls)
+            .map_err(|error| {
+                job_failure(
+                    job,
+                    JobKillStage::EnumerateMembers,
+                    JobKillCause::System(error),
+                    progress,
+                )
+            })?;
+    for pid in members {
         let control = match process::derive_job(
             job,
             JobMemberKind::MemberProcesses,
@@ -202,148 +541,229 @@ fn kill_members(job: Handle, code: i64) -> Result<(), SystemCallError> {
             DERIVED_CONTROL_RIGHTS,
         ) {
             Ok(control) => control,
-            // 成员已完成移表：收敛方向，跳过。
             Err(SystemCallError::ObjectNotFound) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(job_failure(
+                    job,
+                    JobKillStage::DeriveMember,
+                    JobKillCause::System(error),
+                    progress,
+                ));
+            }
         };
-        process::kill(control, code)?;
-        // kill 是异步请求：等 REAPABLE/CLOSED 后 drain 至 Complete。
-        wait_many(
-            &[WaitItem::new(
-                control,
-                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-                0,
-            )],
-            WAIT_TIMEOUT_INFINITE,
-        )?;
-        process::drain_to_completion(control)?;
-        close(control)?;
+        let target = SupervisionTarget::new(pid, control);
+        if let Err(error) = process::kill(control, code) {
+            return Err(JobKillFailure {
+                job,
+                process: Some(target),
+                stage: JobKillStage::KillMember,
+                cause: JobKillCause::System(error),
+                progress,
+            });
+        }
+        match collect_process(target, policy) {
+            Ok(collected) => {
+                progress.members_collected = progress.members_collected.saturating_add(1);
+                progress.process_work = progress
+                    .process_work
+                    .saturating_add(collected.progress.work_done);
+            }
+            Err(failure) => {
+                progress.process_work = progress
+                    .process_work
+                    .saturating_add(failure.progress.work_done);
+                return Err(JobKillFailure {
+                    job,
+                    process: Some(failure.target),
+                    stage: JobKillStage::CollectMember(failure.stage),
+                    cause: JobKillCause::Process(failure.cause),
+                    progress,
+                });
+            }
+        }
     }
-    Ok(())
-}
 
-fn kill_children(job: Handle, code: i64) -> Result<(), SystemCallError> {
-    for jid in enumerate_members(job, JobMemberKind::ChildJobs)? {
+    let children =
+        enumerate_members_with_limit(job, JobMemberKind::ChildJobs, policy.enumerate_stalls)
+            .map_err(|error| {
+                job_failure(
+                    job,
+                    JobKillStage::EnumerateChildren,
+                    JobKillCause::System(error),
+                    progress,
+                )
+            })?;
+    for jid in children {
         let child =
             match process::derive_job(job, JobMemberKind::ChildJobs, jid, DERIVED_CONTROL_RIGHTS) {
                 Ok(child) => child,
-                // child 已完成移表：跳过。
                 Err(SystemCallError::ObjectNotFound) => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(job_failure(
+                        job,
+                        JobKillStage::DeriveChild,
+                        JobKillCause::System(error),
+                        progress,
+                    ));
+                }
             };
-        job_kill(child, code)?;
-        close(child)?;
+        job_kill_with_policy(child, code, policy)?;
+        if let Err(error) = close(child) {
+            return Err(job_failure(
+                child,
+                JobKillStage::CloseChild,
+                JobKillCause::System(error),
+                progress,
+            ));
+        }
+        progress.children_collected = progress.children_collected.saturating_add(1);
+    }
+
+    let mut closed = false;
+    for _ in 0..policy.wait_attempts {
+        match wait_many(
+            &[WaitItem::new(job, ObjectSignals::CLOSED, 0)],
+            policy.wait_timeout_ms,
+        ) {
+            Ok(result) if result.observed.intersects(ObjectSignals::CLOSED) => {
+                closed = true;
+                break;
+            }
+            Ok(result) if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) => {}
+            Ok(_) => {
+                return Err(job_failure(
+                    job,
+                    JobKillStage::WaitClosed,
+                    JobKillCause::System(SystemCallError::InternalError),
+                    progress,
+                ));
+            }
+            Err(SystemCallError::ObjectBusy) => {}
+            Err(error) => {
+                return Err(job_failure(
+                    job,
+                    JobKillStage::WaitClosed,
+                    JobKillCause::System(error),
+                    progress,
+                ));
+            }
+        }
+    }
+    if !closed {
+        return Err(job_failure(
+            job,
+            JobKillStage::WaitClosed,
+            JobKillCause::Timeout,
+            progress,
+        ));
+    }
+    let snapshot = process::query_job(job).map_err(|error| {
+        job_failure(
+            job,
+            JobKillStage::VerifyDead,
+            JobKillCause::System(error),
+            progress,
+        )
+    })?;
+    if snapshot.state != JobState::Dead as u32 {
+        return Err(job_failure(
+            job,
+            JobKillStage::VerifyDead,
+            JobKillCause::InconsistentState(snapshot.state),
+            progress,
+        ));
     }
     Ok(())
 }
 
-/// 枚举至耗尽。占位屏障的零进展批（more=1 ∧ actual=0）以原 cursor
-/// 重试——占位窗口在创建方单个 syscall 内，重试不活锁。
+fn valid_policy(policy: SupervisionPolicy) -> bool {
+    policy.wait_timeout_ms != 0
+        && policy.wait_attempts != 0
+        && policy.drain_work != 0
+        && policy.drain_work <= PROCESS_DRAIN_MAX
+        && policy.drain_attempts != 0
+        && policy.query_attempts != 0
+        && policy.enumerate_stalls != 0
+}
+
+fn job_failure(
+    job: Handle,
+    stage: JobKillStage,
+    cause: JobKillCause,
+    progress: JobKillProgress,
+) -> JobKillFailure {
+    JobKillFailure {
+        job,
+        process: None,
+        stage,
+        cause,
+        progress,
+    }
+}
+
+/// 枚举至耗尽；占位屏障的零进展批以有限 stall budget 重试。
 pub fn enumerate_members(
     job: Handle,
     kind: JobMemberKind,
 ) -> Result<alloc::vec::Vec<u64>, SystemCallError> {
+    enumerate_members_with_limit(job, kind, DEFAULT_SUPERVISION_POLICY.enumerate_stalls)
+}
+
+pub fn enumerate_members_with_limit(
+    job: Handle,
+    kind: JobMemberKind,
+    max_stalls: u32,
+) -> Result<alloc::vec::Vec<u64>, SystemCallError> {
+    if max_stalls == 0 {
+        return Err(SystemCallError::IllegalArgument);
+    }
     let mut ids = alloc::vec::Vec::new();
     let mut buf = [0u64; JOB_ENUMERATE_MAX];
     let mut cursor = 0u64;
+    let mut stalls = 0u32;
     loop {
         let result = process::enumerate_job(job, kind, cursor, &mut buf)?;
         ids.extend_from_slice(&buf[..result.actual as usize]);
         if result.more == 0 {
             return Ok(ids);
         }
-        cursor = result.next_cursor;
+        if result.actual == 0 {
+            stalls = stalls.saturating_add(1);
+            if stalls >= max_stalls {
+                return Err(SystemCallError::ObjectBusy);
+            }
+        } else {
+            stalls = 0;
+            cursor = result.next_cursor;
+        }
     }
 }
 
-fn page_plan(
-    image: &elf::Elf,
-    file_len: usize,
-) -> Result<(BTreeMap<usize, ProcessMapFlags>, usize), SpawnError> {
-    let mut plan: BTreeMap<usize, ProcessMapFlags> = BTreeMap::new();
-    let image_limit = PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE;
-    let entry = usize::try_from(image.entry).map_err(|_| SpawnError::InvalidImage)?;
-    let mut entry_executable = false;
-    let mut previous_end = 0usize;
-    for segment in &image.segments {
-        if segment.filesz > segment.memsz {
-            return Err(SpawnError::InvalidImage);
-        }
-        let start = usize::try_from(segment.vaddr).map_err(|_| SpawnError::InvalidImage)?;
-        let offset = usize::try_from(segment.offset).map_err(|_| SpawnError::InvalidImage)?;
-        if start % PROCESS_PAGE_SIZE != offset % PROCESS_PAGE_SIZE
-            || segment.writable && !segment.readable
-        {
-            return Err(SpawnError::InvalidImage);
-        }
-        let memsz = usize::try_from(segment.memsz).map_err(|_| SpawnError::InvalidImage)?;
-        let filesz = usize::try_from(segment.filesz).map_err(|_| SpawnError::InvalidImage)?;
-        let end = start.checked_add(memsz).ok_or(SpawnError::InvalidImage)?;
-        let file_end = offset.checked_add(filesz).ok_or(SpawnError::InvalidImage)?;
-        if memsz == 0 || end > image_limit || file_end > file_len || start < previous_end {
-            return Err(SpawnError::InvalidImage);
-        }
-        previous_end = end;
-        if segment.executable && start <= entry && entry < end {
-            entry_executable = true;
-        }
-        let mut permissions = ProcessMapFlags::from_raw(0);
-        if segment.readable {
-            permissions = permissions | ProcessMapFlags::READ;
-        }
-        if segment.writable {
+fn map_plan(builder: Handle, image: &elf::Elf) -> Result<(), SpawnError> {
+    for run in image.runs() {
+        let start = usize::try_from(run.vaddr).map_err(|_| SpawnError::InvalidImage)?;
+        let bytes = usize::try_from(run.memsz).map_err(|_| SpawnError::InvalidImage)?;
+        let mut permissions = ProcessMapFlags::READ;
+        if run.writable {
             permissions = permissions | ProcessMapFlags::WRITE;
         }
-        if segment.executable {
+        if run.executable {
             permissions = permissions | ProcessMapFlags::EXECUTE;
         }
-        if permissions.raw() == 0 {
-            return Err(SpawnError::InvalidImage);
+        for offset in (0..bytes).step_by(MAX_MAP_BYTES) {
+            process::map(
+                builder,
+                start + offset,
+                MAX_MAP_BYTES.min(bytes - offset),
+                permissions,
+            )?;
         }
-        for vpn in start / PROCESS_PAGE_SIZE..end.div_ceil(PROCESS_PAGE_SIZE) {
-            let previous = plan
-                .get(&vpn)
-                .copied()
-                .unwrap_or(ProcessMapFlags::from_raw(0));
-            let combined = previous | permissions;
-            if combined.contains(ProcessMapFlags::WRITE | ProcessMapFlags::EXECUTE) {
-                return Err(SpawnError::InvalidImage);
-            }
-            plan.insert(vpn, combined);
-        }
-    }
-    if plan.is_empty() || !entry_executable {
-        return Err(SpawnError::InvalidImage);
-    }
-    Ok((plan, previous_end))
-}
-
-fn map_plan(builder: Handle, plan: &BTreeMap<usize, ProcessMapFlags>) -> Result<(), SpawnError> {
-    let mut entries = plan.iter().peekable();
-    while let Some((&start_vpn, &permissions)) = entries.next() {
-        let mut pages = 1usize;
-        while let Some(&(&next_vpn, &next_permissions)) = entries.peek() {
-            if next_vpn != start_vpn + pages
-                || next_permissions != permissions
-                || (pages + 1) * PROCESS_PAGE_SIZE > MAX_MAP_BYTES
-            {
-                break;
-            }
-            entries.next();
-            pages += 1;
-        }
-        process::map(
-            builder,
-            start_vpn * PROCESS_PAGE_SIZE,
-            pages * PROCESS_PAGE_SIZE,
-            permissions,
-        )?;
     }
     Ok(())
 }
 
 fn write_segments(builder: Handle, image: &elf::Elf, file: &[u8]) -> Result<(), SpawnError> {
-    for segment in &image.segments {
+    for segment in image.segments() {
         let offset = usize::try_from(segment.offset).map_err(|_| SpawnError::InvalidImage)?;
         let filesz = usize::try_from(segment.filesz).map_err(|_| SpawnError::InvalidImage)?;
         let source = file
@@ -376,7 +796,7 @@ fn build_birth_block(
         .map_err(|_| SpawnError::InvalidImage)
 }
 
-/// 出生块写入约定区：映像顶（page_plan 推导）之上页对齐放置——组装者
+/// 出生块写入约定区：validated ELF 的映像顶之上页对齐放置——组装者
 /// 掌握映像布局（Map 由其驱动），无需查询目标布局游标；块的只读性由接收方
 /// 运行时自行遵守（v1 约定，见计划篇 D6c）。逐页映射并单次回填，
 /// 返回块基址。
@@ -414,59 +834,6 @@ fn map_stack(builder: Handle) -> Result<(), SpawnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
-
-    fn segment(
-        vaddr: u64,
-        offset: u64,
-        memsz: u64,
-        readable: bool,
-        writable: bool,
-        executable: bool,
-    ) -> elf::LoadSegment {
-        elf::LoadSegment {
-            vaddr,
-            offset,
-            filesz: 0,
-            memsz,
-            readable,
-            writable,
-            executable,
-        }
-    }
-
-    #[test]
-    fn entry_must_lie_in_executable_segment() {
-        let image = elf::Elf {
-            entry: 0x3000,
-            segments: vec![segment(0x1000, 0, 0x1000, true, false, true)],
-        };
-        assert_eq!(page_plan(&image, 0), Err(SpawnError::InvalidImage));
-    }
-
-    #[test]
-    fn overlapping_segment_bytes_are_rejected() {
-        let image = elf::Elf {
-            entry: 0x1000,
-            segments: vec![
-                segment(0x1000, 0, 0x1800, true, false, true),
-                segment(0x2000, 0, 0x1000, true, false, false),
-            ],
-        };
-        assert_eq!(page_plan(&image, 0), Err(SpawnError::InvalidImage));
-    }
-
-    #[test]
-    fn page_level_write_execute_union_is_rejected() {
-        let image = elf::Elf {
-            entry: 0x1000,
-            segments: vec![
-                segment(0x1000, 0, 0x800, true, false, true),
-                segment(0x1800, 0x800, 0x800, true, true, false),
-            ],
-        };
-        assert_eq!(page_plan(&image, 0x800), Err(SpawnError::InvalidImage));
-    }
 
     #[test]
     fn spawn_requires_cleanup_authority_before_parsing_or_syscalls() {
@@ -488,16 +855,38 @@ mod tests {
     }
 
     #[test]
-    fn valid_split_permissions_produce_page_plan() {
-        let image = elf::Elf {
-            entry: 0x1000,
-            segments: vec![
-                segment(0x1000, 0, 0x1000, true, false, true),
-                segment(0x2000, 0, 0x1000, true, true, false),
-            ],
-        };
-        let (plan, _) = page_plan(&image, 0).unwrap();
-        assert_eq!(plan[&1], ProcessMapFlags::READ | ProcessMapFlags::EXECUTE);
-        assert_eq!(plan[&2], ProcessMapFlags::READ | ProcessMapFlags::WRITE);
+    fn required_launch_set_rejects_missing_or_failed_items() {
+        let mut set = RequiredLaunchSet::new(0b11, 0b111);
+        set.mark_present(0b01);
+        set.mark_started(0b001);
+        assert_eq!(set.missing_present(), 0b10);
+        assert_eq!(set.missing_started(), 0b110);
+        assert!(!set.is_complete());
+
+        set.mark_present(0b10);
+        set.mark_started(0b010);
+        assert!(!set.is_complete());
+        set.mark_started(0b100);
+        assert!(set.is_complete());
+    }
+
+    #[test]
+    fn invalid_supervision_policy_returns_authority_before_syscalls() {
+        let mut policy = DEFAULT_SUPERVISION_POLICY;
+        policy.wait_timeout_ms = 0;
+        let failure = collect_process(
+            SupervisionTarget::new(7, Handle::from_raw(0x1_0000_0001)),
+            policy,
+        )
+        .unwrap_err();
+        assert_eq!(failure.target.pid(), 7);
+        assert_eq!(failure.target.control().raw(), 0x1_0000_0001);
+        assert_eq!(failure.stage, SupervisionStage::WaitReapable);
+        assert_eq!(failure.cause, SupervisionCause::InvalidPolicy);
+
+        let failure = job_kill_with_policy(Handle::from_raw(0x2_0000_0001), 1, policy).unwrap_err();
+        assert_eq!(failure.job.raw(), 0x2_0000_0001);
+        assert_eq!(failure.stage, JobKillStage::Seal);
+        assert!(failure.process.is_none());
     }
 }

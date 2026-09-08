@@ -33,9 +33,9 @@ pub struct Notification {
 }
 
 impl Notification {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            header: ObjectHeader::new(),
+    pub fn new() -> Result<Arc<Self>, SystemCallError> {
+        Arc::try_new(Self {
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: Spinlock::new(
                 crate::sync::ranks::NOTIFICATION,
                 NotificationState {
@@ -45,6 +45,7 @@ impl Notification {
                 },
             ),
         })
+        .map_err(|_| SystemCallError::OutOfMemory)
     }
 
     pub fn object_ref(this: &Arc<Self>) -> ObjectRef {
@@ -204,7 +205,7 @@ pub fn create(
     signaler_rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let notification = Notification::new();
+    let notification = Notification::new()?;
     let object = Notification::object_ref(&notification);
     let mut entries = alloc::vec::Vec::new();
     entries
@@ -219,7 +220,7 @@ pub fn create(
             .map_err(super::handle::map_error)?,
     );
 
-    let token = super::handle::transaction_token();
+    let token = super::handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
     let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);

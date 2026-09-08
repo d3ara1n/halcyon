@@ -1,6 +1,6 @@
 # Capability 与 Affine Owner 错误边界收口计划
 
-> 当前 Review findings 的契约归属计划，导航见 [`Review 统筹`](todo-2026-09-review-program.md)。rights、用户态 owner、RPC 接收与 ticket 查询是不同消费边界，分别按完整调用链收口；共享错误原则不意味着共用一个事务类型或要求所有子单元同时实施。
+> 状态：rights、用户态 owner、RPC 接收与 ticket 查询均已按各自完整调用链收口，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。它们共享错误原则，但不共用一个事务类型。
 
 ## 目标
 
@@ -14,28 +14,21 @@
 
 ## 当前问题簇
 
-### Capability / ABI
+### Capability / ABI（已完成）
 
-- `shared::object::Rights` 缺少独立 `EXECUTE` 位；MemoryObject allowed rights 与 RX map required rights 也缺少该位。
-- `ThreadControl::allowed_signals` 暴露 `CLOSED`，但 ThreadControl 只发布持续 `DONE`；允许等待集合与可达状态不闭合。
-- MemoryObject Seal/EXECUTABLE、RX view、跨进程 rights 裁剪、Transit/Grant 组合尚未有完整纵向矩阵。
+`Rights::EXECUTE = 1 << 10` 已进入 shared KNOWN mask，MemoryObject 完整 rights 与 RX required rights 统一为独立授权；ThreadControl 只公开真实可达的 DONE。通用 Duplicate/Transit/Grant 继续使用 role allowed-rights 与源 rights 双重子集校验，不为 EXECUTE 建旁路。shared 固定位测试与 QEMU capability 矩阵覆盖 Mutable 拒绝 RX、Seal 后缺 EXECUTE 的派生副本 `RightsDenied`、具 `MAP|READ|EXECUTE` 的副本在原 Handle 关闭后成功 Map/Unmap。
 
-### Affine owner Drop
+### Affine owner Drop（已完成）
 
-- `user/rinlib::{memory_pool,memory_object}.rs` 的 Drop 对 close 失败直接 `expect`；显式 `close(self)` 却返回可重试 owner，错误边界矛盾。
-- `user/rinlib/thread.rs::UserStack::release` 对非 `ObjectBusy` 错误直接 panic；没有统一的用户态终止/泄漏报告政策。
-- owner close、HandleTable close callback、AddressSpace retire、对象 backing 归还之间没有统一“显式 close / Drop / abandoned”策略表。
+MemoryPool/MemoryObject typed owner 的 unsafe 构造契约现要求当前进程已安装的对应 leaf role 与唯一 raw owner；安全创建/派生保持该不变量。它们的显式 close 和 Drop 共用不可失败 leaf-close，不再暴露虚假的可重试分支。UserStack 仍按异步 mapping 分类：Busy 按 tick 重试，终端错误把仍由 AddressSpace 账本拥有的 mapping 留给 ProcessDrain，并以饱和 count/last-error 快照记录，不在 Drop 中 panic 或无限等待。
 
-### 消费式 ticket / query
+### 消费式 ticket / query（已完成）
 
-- `SystemSupply::take_heap_chunk` 与 `take_recovery_ticket` 消费 slot 后，`heap_ranges`/`recovery_ranges` 仍对已消费 slot `expect`。
-- affine ticket 的只读几何、剩余状态和已消费状态没有独立快照，公共 accessor 对合法生命周期顺序不安全。
+`SystemSupply` 已分离不可变 Range 快照与 `Option<Ticket>` owner；`heap_ranges`/`recovery_ranges` 在任意合法消费顺序后仍返回原规划，`consumed_*`/`remaining_*` 分别观察状态，查询不能重新取得或伪造 affine ticket。
 
-### RPC reject / ReplyPort
+### RPC reject / ReplyPort（已完成）
 
-- `librpc::Caller::call` 对 ServiceClosed、ProtocolMismatch、UnknownVersion、NotResponse、TxidMismatch 直接返回。
-- 已收到但未接受的 Handle 没有逐项 close；当前 ReplyPort 没有统一 discard，迟到响应可能污染下一次 call。
-- 正常 timeout/wait/receive error 已有 discard，但 framing reject 没有复用同一策略。
+`validate_response` 是 host 可测的 framing 分类入口；Caller 对 ServiceClosed、wait/receive error、timeout 和所有 framing reject 均废弃当前 ReplyPort。已接收但未接受的 response 先逐项关闭 Handle 再 discard；可 TRANSIT role 不含 Tunnel Endpoint，cleanup 是固定上界叶 close。`srv_init` 双调用验证 malformed response 携带 Handle 被关闭，下一调用在新端口正常成功。
 
 ## 最终形态
 
@@ -47,29 +40,29 @@
 4. ThreadControl 只暴露真实可达的终态 signal（首选移除 CLOSED，保留 DONE）；若未来需要 CLOSED，必须先定义独立状态机和发布顺序；
 5. 以 capability 矩阵测试覆盖 Create/Derive/Grant/Transit/Map/Protect/Seal/Wait/Unmap。
 
-### Affine owner 错误策略
+### Affine owner 错误策略（已实现）
 
-先按 owner 类型冻结策略，不以统一 `Drop` 掩盖不同语义：
+按 owner 类型冻结策略，不以统一 `Drop` 掩盖不同语义：
 
 | owner 类别 | 显式 close | Drop | 失败后策略 |
 |---|---|---|---|
-| 固定容量、内核 close 可证明无错的叶 owner | 可返回错误但应建立不变量证明 | 允许断言式 close，证明写入 API 契约 | 仅内部不变量破坏 |
-| 用户可达、close 可能 Busy/Closed 的 owner | 返回 `(owner,error)` | 不执行可能失败 syscall；记录/泄漏政策由上层接管 | 显式 retry 或 supervisor 接管 |
+| 固定容量、内核 close 可证明无错的叶 owner | 不可失败 close | 同一 leaf-close | 仅 unsafe 构造或内核不变量破坏 |
+| 用户可达、close 可能 Busy/Closed 的 owner | 返回 `(owner,error)` | 不执行可能失败 syscall；记录/留给上层 owner | 显式 retry 或 supervisor 接管 |
 | 已接收但尚未接受的 capability | 不进入业务 owner | 必须 discard/close | reject helper 统一收束 |
 | 需要异步确认的 mapping/stack owner | 显式 wait/retry | 不在 Drop 中无限等待 | Join/reaper policy |
 
-首版建议：MemoryPool/MemoryObject 的 typed owner 不再在 Drop 中调用可失败 close；引入显式 `close`/`discard` 责任转移或可证明的 infallible kernel close primitive，二者必须择一并贯穿所有调用点。UserStack 与其它 affine region 遵守同一策略，不允许按错误类型散落 panic。
+最终选择：MemoryPool/MemoryObject role 在内核中是非 Tunnel 叶 close，typed owner 的 unsafe 构造契约保证表项有效且唯一；显式 close 与 Drop 统一走不可失败 leaf primitive。UserStack 属异步 mapping owner，Busy 重试，终端清理失败记录后留给进程 AddressSpace drain，不沿用 leaf 策略。
 
-### SystemSupply consumed-state
+### SystemSupply consumed-state（已实现）
 
 - ticket 的不可变几何与消费状态分离：保留 `Range` snapshot，查询只读快照不访问已消费 owner；
 - `remaining_*`、`*_ranges` 对任意合法消费顺序均不 panic；
 - ticket owner 仍只能单向消费，不能通过 query 重新取得或伪造资源；
 - recovery/heap 的容量与用途隔离继续由类型保证。
 
-### RPC reject guard
+### RPC reject guard（已实现）
 
-引入统一 `RejectedReply`/`reject_reply` 机制：
+统一 `reject_reply` 机制：
 
 ```text
 receive
@@ -88,14 +81,14 @@ reject_reply:
 
 以下按消费边界组织；每个子单元同时迁移生产者、消费者、失败路径、测试和旧入口。精确 owner 错误政策需在对应子单元开始前确认，不把本计划的候选建议当成已经批准的 ABI 改动。
 
-1. 冻结 Rights/signal ABI 变更与 capability 矩阵；
-2. 增加 `EXECUTE` 并迁移 shared/kernel/rinlib 调用链；
-3. 收口 ThreadControl signal 集合；
-4. 冻结 affine owner 错误策略，迁移 MemoryPool/MemoryObject/UserStack；
-5. 重构 SystemSupply 几何查询与 consumed-state；
-6. 引入 librpc reject helper，统一 Handle/ReplyPort discard；
-7. 补 host、shared ABI、跨进程 rights、Seal/RX、reject 携带 Handle、ServiceClosed/timeout/迟到响应和 owner failure 测试；
-8. 与事务状态机完成后的 Mapping/retire/Join 语义联测。
+1. **已完成**：冻结 Rights/signal ABI 变更与 capability 矩阵；
+2. **已完成**：增加 `EXECUTE` 并迁移 shared/kernel/rinlib 调用链；
+3. **已完成**：收口 ThreadControl signal 集合；
+4. **已完成**：冻结 affine owner 错误策略，迁移 MemoryPool/MemoryObject/UserStack；
+5. **已完成**：重构 SystemSupply 几何查询与 consumed-state；
+6. **已完成**：引入 librpc reject helper，统一 Handle/ReplyPort discard；
+7. **已完成**：补 host、shared ABI、跨进程 rights、Seal/RX、reject 携带 Handle、迟到响应隔离和 owner 正常收束测试；
+8. **已完成**：与 Mapping/retire/Join 语义联测，core guest 强制检查 RPC cleanup 与零 abandoned stack 锚点。
 
 ## 完成标准
 

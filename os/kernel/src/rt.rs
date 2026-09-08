@@ -77,6 +77,7 @@ extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
     // tp 已由汇编装配为 HartLocal；ladder 自此切换至 per-hart 帧。
     crate::sync::ladder::mark_tp_ready();
     if let Err(reject) = csr::formal_entry_baseline() {
+        registry::publish_failed();
         match reject {
             csr::CsrReject::Uxl(readback) => {
                 fatal_msg(&format_args!(
@@ -109,31 +110,47 @@ extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
 /// 进入调度循环。任何矛盾使本次启动整体失败（不做部分降级）。
 fn bring_up_runtime() -> ! {
     let timebase = crate::sched::ticks_per_sec();
-    let deadline = sbi::read_time() + 10 * timebase;
+    let Some(deadline) = timebase
+        .checked_mul(10)
+        .and_then(|window| sbi::read_time().checked_add(window))
+    else {
+        registry::publish_failed();
+        fatal_msg(&format_args!("secondary hart bring-up deadline overflows"));
+    };
 
     // 先完整发布预期集合，再发出任何 HSM start（SBI-003 收口：
-    // 异步启动前 expected 集合必须闭合）。
-    let mut pending: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-    registry::with_registry(|reg| {
-        for (slot, record) in reg.records() {
+    // 异步启动前 expected 集合必须闭合）。失败在 registry 锁外广播和报告。
+    let hsm_failure = registry::with_registry(|reg| {
+        for (_, record) in reg.records() {
+            if record.role_boot != 1 {
+                record.publish_starting();
+            }
+        }
+        for (_, record) in reg.records() {
             if record.role_boot == 1 {
                 continue;
             }
-            record.publish_starting();
-            pending.push(slot.0);
-        }
-        for &slot in &pending {
-            let record = reg.record(crate::registry::HartSlot(slot));
             let record_pa = crate::mm::virt_to_phys(record as *const _ as usize);
-            sbi::require(
-                sbi::hart_start(record.hartid, external::awaken_pa(), record_pa),
-                "HSM.hart_start",
-            );
+            if let Err(error) = sbi::hart_start(record.hartid, external::awaken_pa(), record_pa) {
+                return Some((record.hartid, error));
+            }
         }
+        None
     });
+    if let Some((hartid, error)) = hsm_failure {
+        registry::publish_failed();
+        fatal_msg(&format_args!(
+            "HSM.hart_start failed for hart {hartid}: {error:?}; boot aborted"
+        ));
+    }
 
     // 等待全员 Online（Acquire 观察）；超时或状态矛盾即整体失败。
     loop {
+        if registry::gate_state() == registry::GateState::Failed {
+            fatal_msg(&format_args!(
+                "secondary hart bring-up failed; boot aborted"
+            ));
+        }
         let all_online = registry::with_registry(|reg| {
             reg.records()
                 .all(|(_, r)| r.state() == crate::registry::BootState::Online)
@@ -227,16 +244,16 @@ extern "C" fn handle_fatal(frame: &FatalFrame) -> ! {
 /// bootstrap 阶段 fatal 的最小诊断（汇编调用，仅读 CSR，无栈依赖）。
 #[unsafe(no_mangle)]
 extern "C" fn bootstrap_fatal_report(cause: usize, val: usize, pc: usize) -> ! {
-    let _ = write!(
+    let _ = writeln!(
         RawWriter,
-        "\x1b[0;31mbootstrap fatal\x1b[0m: cause={cause:#x} val={val:#x} pc={pc:#x}\n"
+        "\x1b[0;31mbootstrap fatal\x1b[0m: cause={cause:#x} val={val:#x} pc={pc:#x}"
     );
     hart::park()
 }
 
 /// 无 FatalFrame 的致命错误报告（启动期 CSR 拒绝等）。
 pub fn fatal_msg(args: &fmt::Arguments<'_>) -> ! {
-    let _ = write!(RawWriter, "\x1b[0;31mfatal\x1b[0m: {args}\n");
+    let _ = writeln!(RawWriter, "\x1b[0;31mfatal\x1b[0m: {args}");
     hart::park()
 }
 
@@ -253,9 +270,9 @@ fn handle_panic(info: &PanicInfo) -> ! {
             info.message(),
         );
     } else {
-        let _ = write!(
+        let _ = writeln!(
             RawWriter,
-            "\x1b[0;31mKernel panicking\x1b[0m: no information available.\n"
+            "\x1b[0;31mKernel panicking\x1b[0m: no information available."
         );
     }
     hart::park()

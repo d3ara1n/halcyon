@@ -27,11 +27,18 @@ struct TerminationWork {
 
 type TerminationDebts = work_debt::WorkDebts<TerminationWork, HARTS, TERMINATION_SLOTS>;
 
-static DEBTS: Spinlock<Debts> = Spinlock::new(crate::sync::ranks::WORK_DEBT, Debts::new());
-static UNPUBLISHED_DEBTS: Spinlock<UnpublishedDebts> =
-    Spinlock::new(crate::sync::ranks::WORK_DEBT, UnpublishedDebts::new());
-static TERMINATION_DEBTS: Spinlock<TerminationDebts> =
-    Spinlock::new(crate::sync::ranks::WORK_DEBT, TerminationDebts::new());
+static DEBTS: Spinlock<Debts> = Spinlock::new(
+    crate::sync::ranks::WORK_DEBT,
+    Debts::new_with_id(work_debt::TableId::new(1)),
+);
+static UNPUBLISHED_DEBTS: Spinlock<UnpublishedDebts> = Spinlock::new(
+    crate::sync::ranks::WORK_DEBT,
+    UnpublishedDebts::new_with_id(work_debt::TableId::new(2)),
+);
+static TERMINATION_DEBTS: Spinlock<TerminationDebts> = Spinlock::new(
+    crate::sync::ranks::WORK_DEBT,
+    TerminationDebts::new_with_id(work_debt::TableId::new(3)),
+);
 /// 每 owner 的已发布债务数是无锁 Pending 电平；常态安全点不争全局队列锁。
 static PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 static UNPUBLISHED_PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
@@ -69,7 +76,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(reservation) = self.0.take() {
             assert!(
-                DEBTS.lock().cancel(reservation),
+                DEBTS.lock().cancel(reservation).is_ok(),
                 "reserved work debt slot must roll back"
             );
         }
@@ -112,7 +119,7 @@ impl Drop for UnpublishedReservation {
     fn drop(&mut self) {
         if let Some(reservation) = self.0.take() {
             assert!(
-                UNPUBLISHED_DEBTS.lock().cancel(reservation),
+                UNPUBLISHED_DEBTS.lock().cancel(reservation).is_ok(),
                 "reserved unpublished slot must roll back"
             );
         }
@@ -161,7 +168,7 @@ impl Drop for TerminationReservation {
     fn drop(&mut self) {
         if let Some(reservation) = self.0.take() {
             assert!(
-                TERMINATION_DEBTS.lock().cancel(reservation),
+                TERMINATION_DEBTS.lock().cancel(reservation).is_ok(),
                 "reserved termination slot must roll back"
             );
         }
@@ -186,7 +193,10 @@ pub(crate) fn drain_current() -> usize {
         debug_assert!(used > 0 && used <= turn);
         steps += used;
         if complete {
-            assert!(DEBTS.lock().finish(token), "taken work debt must finish");
+            assert!(
+                DEBTS.lock().finish(token).is_ok(),
+                "taken work debt must finish"
+            );
             let previous = PENDING[owner].fetch_sub(1, Ordering::AcqRel);
             assert!(previous > 0, "finished work debt must be pending");
         } else {
@@ -219,7 +229,7 @@ pub(crate) fn drain_current() -> usize {
         steps += used;
         if complete {
             assert!(
-                UNPUBLISHED_DEBTS.lock().finish(token),
+                UNPUBLISHED_DEBTS.lock().finish(token).is_ok(),
                 "taken unpublished slot must finish"
             );
             let previous = UNPUBLISHED_PENDING[owner].fetch_sub(1, Ordering::AcqRel);
@@ -254,7 +264,7 @@ pub(crate) fn drain_current() -> usize {
         steps += used;
         if complete {
             assert!(
-                TERMINATION_DEBTS.lock().finish(token),
+                TERMINATION_DEBTS.lock().finish(token).is_ok(),
                 "taken termination slot must finish"
             );
             let previous = TERMINATION_PENDING[owner].fetch_sub(1, Ordering::AcqRel);

@@ -8,27 +8,17 @@
 //! 见 references/normative/riscv-dt-bindings-linux-818bebeb/cpus.yaml）；
 //! 已弃用的 `riscv,isa` 不解析。每个 hart 独立读取 status 与能力。
 
+pub use dtb::cpu::MmuType;
 use dtb::{
-    Fdt, cells_u64,
+    Fdt, NodeStatus, cells_u64,
+    cpu::parse as parse_platform_cpus,
     memory::{PhysicalRange, parse as parse_platform_memory},
+    node_status, property_string,
     topology::{self, TopoLevel},
 };
 pub use sched_domain::HartCapabilities;
 
 use crate::hart::HART_NUM_LIMIT;
-
-/// 内核基线要求的扩展集合（`i` 由 isa-base rv64i 隐含）：
-/// RV64IMAC + Zicsr + Zifencei + Zicntr。
-const BASELINE_EXTENSIONS: [&str; 6] = ["m", "a", "c", "zicsr", "zifencei", "zicntr"];
-
-/// CPU 的 MMU 类型，`Bare` 表示不可运行本内核（无分页）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MmuType {
-    Bare,
-    Sv39,
-    Sv48,
-    Sv57,
-}
 
 #[derive(Clone, Copy)]
 pub struct Cpu {
@@ -182,7 +172,24 @@ impl BoardInfo {
 
 /// 父节点声明的 cells 宽度，缺省用 `default`。
 fn cells(node: &dtb::Node, prop: &str, default: usize) -> usize {
-    node.prop_u32(prop).map(|v| v as usize).unwrap_or(default)
+    let width = match node.prop(prop) {
+        None => default,
+        Some(data) => usize::try_from(u32::from_be_bytes(
+            data.try_into()
+                .unwrap_or_else(|_| panic!("{prop} must contain exactly one cell")),
+        ))
+        .expect("cell width exceeds usize"),
+    };
+    assert!((1..=2).contains(&width), "{prop} has unsupported width");
+    width
+}
+
+fn node_available(node: &dtb::Node<'_, '_>, label: &str) -> bool {
+    match node_status(node) {
+        Ok(NodeStatus::Okay) => true,
+        Ok(NodeStatus::Disabled | NodeStatus::Reserved | NodeStatus::Failed) => false,
+        Err(error) => panic!("{label} has invalid status: {error:?}"),
+    }
 }
 
 fn from_physical(range: PhysicalRange) -> MemoryRegion {
@@ -243,63 +250,6 @@ fn build_direct_map_regions(
         len += 1;
     }
     len
-}
-
-/// 就地查询现代 ISA 扩展列表是否含某项（零堆：不收集中间容器）。
-fn has_extension(node: &dtb::Node, name: &str) -> bool {
-    node.prop_str_list("riscv,isa-extensions")
-        .is_some_and(|list| list.clone().any(|e| e == name))
-}
-
-/// 解析单个 cpu 节点为 [`Cpu`]；显式 disabled 返回 None（不准入）。
-fn parse_cpu(node: &dtb::Node) -> Option<Cpu> {
-    if node.prop_str("status").is_some_and(|s| s != "okay") {
-        return None;
-    }
-    let reg = node.prop("reg")?;
-    let hartid = cells_u64(reg, 1)? as usize;
-
-    // 现代 ISA 属性是准入前提，缺失或基线不足属平台契约违约。
-    let base = node.prop_str("riscv,isa-base").unwrap_or_else(|| {
-        panic!("cpu {hartid} missing riscv,isa-base (legacy riscv,isa unsupported)")
-    });
-    assert!(
-        base == "rv64i",
-        "cpu {hartid} isa-base {base:?} is not rv64i"
-    );
-    assert!(
-        node.prop_str_list("riscv,isa-extensions").is_some(),
-        "cpu {hartid} missing riscv,isa-extensions"
-    );
-    for required in BASELINE_EXTENSIONS {
-        assert!(
-            has_extension(node, required),
-            "cpu {hartid} missing required baseline extension {required}"
-        );
-    }
-    let caps = HartCapabilities {
-        f: has_extension(node, "f"),
-        d: has_extension(node, "d"),
-        q: has_extension(node, "q"),
-        v: has_extension(node, "v"),
-    };
-    assert!(
-        !(caps.d && !caps.f),
-        "cpu {hartid} declares d but lacks f (binding constraint violated)"
-    );
-
-    let mmu = match node.prop_str("mmu-type") {
-        Some("riscv,sv39") => MmuType::Sv39,
-        Some("riscv,sv48") => MmuType::Sv48,
-        Some("riscv,sv57") => MmuType::Sv57,
-        _ => MmuType::Bare,
-    };
-    Some(Cpu {
-        hartid,
-        freq: 0,
-        mmu,
-        caps,
-    })
 }
 
 #[inline(never)]
@@ -386,57 +336,70 @@ pub fn parse(fdt: &Fdt, dtb_pa: usize) -> BoardInfo {
             cells(&chosen, "#address-cells", root_ac),
             cells(&chosen, "#size-cells", root_sc),
         );
-        if let Some(node) = chosen.children().find(|node| {
+        for node in chosen.children().filter(|node| {
             node.name()
                 .is_ok_and(|name| name.split('@').next() == Some("boot-package"))
         }) {
+            if !node_available(&node, "boot-package node") {
+                continue;
+            }
             assert!(
-                node.prop_str("compatible") == Some("erhino,boot-package-v1"),
+                boot_package.is_none(),
+                "multiple available boot-package nodes"
+            );
+            assert!(
+                node.prop("compatible").and_then(property_string) == Some("erhino,boot-package-v1"),
                 "unsupported boot-package compatible"
             );
             let reg = node.prop("reg").expect("boot-package node missing reg");
-            let addr = cells_u64(reg, ac).expect("unexpected boot-package reg address-cell width")
-                as usize;
-            let len = cells_u64(&reg[ac * 4..], sc)
-                .expect("unexpected boot-package reg size-cell width")
-                as usize;
+            let address_bytes = ac.checked_mul(4).expect("boot-package reg width overflow");
+            let total_bytes = ac
+                .checked_add(sc)
+                .and_then(|cells| cells.checked_mul(4))
+                .expect("boot-package reg width overflow");
+            assert_eq!(reg.len(), total_bytes, "malformed boot-package reg");
+            let addr = usize::try_from(
+                cells_u64(&reg[..address_bytes], ac)
+                    .expect("unexpected boot-package reg address-cell width"),
+            )
+            .expect("boot-package address exceeds usize");
+            let len = usize::try_from(
+                cells_u64(&reg[address_bytes..], sc)
+                    .expect("unexpected boot-package reg size-cell width"),
+            )
+            .expect("boot-package length exceeds usize");
+            assert!(len != 0, "boot-package window is empty");
             boot_package = Some((addr, len));
         }
     }
 
-    // /cpus：timebase + 每个 cpu@ 节点 + 可选 cpu-map
-    let mut timebase = 0;
+    // /cpus：零分配 admission 一次冻结 status、能力、raw hartid、时钟与升序。
+    let admitted_cpus = parse_platform_cpus::<HART_NUM_LIMIT>(fdt)
+        .unwrap_or_else(|error| panic!("platform cpu description rejected: {error}"));
+    let timebase = admitted_cpus.timebase_frequency() as usize;
     let mut cpus = [Cpu {
         hartid: 0,
         freq: 0,
         mmu: MmuType::Bare,
         caps: HartCapabilities::default(),
     }; HART_NUM_LIMIT];
-    let mut cpu_len = 0;
-    if let Some(cpus_node) = root.child("cpus") {
-        timebase = cpus_node
-            .prop_u32("timebase-frequency")
-            .expect("cpus node missing timebase-frequency") as usize;
-        for cpu_node in cpus_node.children() {
-            let name = cpu_node.name().expect("cpu node name unavailable");
-            if name.split('@').next() != Some("cpu") {
-                continue;
-            }
-            let Some(mut cpu) = parse_cpu(&cpu_node) else {
-                continue;
-            };
-            cpu.freq = cpu_node
-                .prop_u32("clock-frequency")
-                .map(|f| f as usize)
-                .unwrap_or(timebase);
-            assert!(cpu_len < HART_NUM_LIMIT, "cpu count exceeds HART_NUM_LIMIT");
-            cpus[cpu_len] = cpu;
-            cpu_len += 1;
-        }
-        assert!(cpu_len > 0, "device tree has no usable cpu nodes");
-        // cpu-map 拓扑不在此解析：启动路径零堆，由 load_topology 在
-        // 帧池/堆就绪后填充。
+    for (output, admitted) in cpus.iter_mut().zip(admitted_cpus.cpus()) {
+        *output = Cpu {
+            hartid: usize::try_from(admitted.hartid)
+                .expect("admitted hartid exceeds runtime address width"),
+            freq: admitted.frequency as usize,
+            mmu: admitted.mmu,
+            caps: HartCapabilities {
+                f: admitted.capabilities.f,
+                d: admitted.capabilities.d,
+                q: admitted.capabilities.q,
+                v: admitted.capabilities.v,
+            },
+        };
     }
+    let cpu_len = admitted_cpus.cpus().len();
+    // cpu-map 拓扑不在此解析：启动路径零堆，由 load_topology 在
+    // 帧池/堆就绪后填充。
 
     // 平台 RAM、FDT reservation block、静态 /reserved-memory 与直映射 admission
     // 由独立零堆阶段完成；dynamic/reusable 在对应生命周期机制落地前 fail closed。

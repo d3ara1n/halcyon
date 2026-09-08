@@ -1,37 +1,47 @@
 //! ISA 需求判定测试（host）：e_flags 契约面与 .riscv.attributes 解析。
 
-use elf::{isa_requirement, IsaReqError, IsaRequirement};
+use elf::{ElfError, IsaReqError, IsaRequirement, LoadLimits, validate};
 
 /// 构造最小 ELF64 镜像：可选携带一个 SHT_RISCV_ATTRIBUTES 节。
 fn build_elf(e_flags: u32, attributes: Option<&[u8]>) -> Vec<u8> {
-    let shoff;
-    let mut v = vec![0u8; 64];
+    const PHOFF: usize = 64;
+    const DATA_OFFSET: usize = 64 + 56;
+    let mut v = vec![0u8; DATA_OFFSET];
     v[..4].copy_from_slice(b"\x7fELF");
     v[4] = 2; // ELF64
     v[5] = 1; // little-endian
+    v[6] = 1; // EV_CURRENT
     v[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
     v[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
+    v[20..24].copy_from_slice(&1u32.to_le_bytes());
+    v[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes());
     v[48..52].copy_from_slice(&e_flags.to_le_bytes());
+    v[52..54].copy_from_slice(&64u16.to_le_bytes());
+    v[54..56].copy_from_slice(&56u16.to_le_bytes());
+    v[56..58].copy_from_slice(&1u16.to_le_bytes());
 
     if let Some(attr) = attributes {
         let content_len = attr.len();
-        // section header 表紧随 64 字节头 + 节数据
-        shoff = 64 + content_len;
+        let shoff = DATA_OFFSET + content_len;
         v.resize(shoff + 64, 0);
-        v[64..shoff].copy_from_slice(attr);
+        v[DATA_OFFSET..shoff].copy_from_slice(attr);
         let sh = &mut v[shoff..shoff + 64];
-        sh[4..8].copy_from_slice(&0x7000_0003u32.to_le_bytes()); // SHT_RISCV_ATTRIBUTES
-        sh[24..32].copy_from_slice(&64u64.to_le_bytes()); // sh_offset
+        sh[4..8].copy_from_slice(&0x7000_0003u32.to_le_bytes());
+        sh[24..32].copy_from_slice(&(DATA_OFFSET as u64).to_le_bytes());
         sh[32..40].copy_from_slice(&(content_len as u64).to_le_bytes());
         v[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
-        v[58..60].copy_from_slice(&64u16.to_le_bytes()); // shentsize
-        v[60..62].copy_from_slice(&1u16.to_le_bytes()); // shnum
+        v[58..60].copy_from_slice(&64u16.to_le_bytes());
+        v[60..62].copy_from_slice(&1u16.to_le_bytes());
     } else {
-        shoff = 0;
-        v[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
-        v[58..60].copy_from_slice(&64u16.to_le_bytes()); // shentsize
-        v[60..62].copy_from_slice(&0u16.to_le_bytes()); // 无节 → MissingArch
+        v[58..60].copy_from_slice(&64u16.to_le_bytes());
     }
+    let file_len = v.len() as u64;
+    let program = &mut v[PHOFF..PHOFF + 56];
+    program[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    program[4..8].copy_from_slice(&5u32.to_le_bytes()); // R|X
+    program[32..40].copy_from_slice(&file_len.to_le_bytes());
+    program[40..48].copy_from_slice(&file_len.to_le_bytes());
+    program[48..56].copy_from_slice(&4096u64.to_le_bytes());
     v
 }
 
@@ -75,19 +85,33 @@ fn attributes(arch: &str) -> Vec<u8> {
 
 const RV64I: &str = "rv64i2p1_m2p0_a2p1_c2p0_zicsr2p0_zifencei2p0_zicntr2p0";
 const RV64IMAFDC: &str = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zifencei2p0_zicntr2p0";
-const LP64_SOFT: u32 = 0x0000 | 0x0001; // RVC
+const LP64_SOFT: u32 = 0x0001; // RVC
 const LP64D: u32 = 0x0004 | 0x0001;
+
+fn requirement(image: &[u8]) -> Result<IsaRequirement, IsaReqError> {
+    match validate(
+        image,
+        LoadLimits {
+            page_size: 4096,
+            image_limit: 1 << 30,
+        },
+    ) {
+        Ok(image) => Ok(image.requirement()),
+        Err(ElfError::Isa(error)) => Err(error),
+        Err(error) => panic!("ISA fixture failed ELF admission: {error:?}"),
+    }
+}
 
 #[test]
 fn base64_profile() {
     let elf = build_elf(LP64_SOFT, Some(&attributes(RV64I)));
-    assert_eq!(isa_requirement(&elf), Ok(IsaRequirement::Base64));
+    assert_eq!(requirement(&elf), Ok(IsaRequirement::Base64));
 }
 
 #[test]
 fn d64_profile() {
     let elf = build_elf(LP64D, Some(&attributes(RV64IMAFDC)));
-    assert_eq!(isa_requirement(&elf), Ok(IsaRequirement::D64));
+    assert_eq!(requirement(&elf), Ok(IsaRequirement::D64));
 }
 
 #[test]
@@ -97,13 +121,13 @@ fn packed_base_letters_accepted() {
         LP64_SOFT,
         Some(&attributes("rv64imac2p1_zicsr2p0_zifencei2p0")),
     );
-    assert_eq!(isa_requirement(&elf), Ok(IsaRequirement::Base64));
+    assert_eq!(requirement(&elf), Ok(IsaRequirement::Base64));
 }
 
 #[test]
 fn missing_attributes_rejected() {
     let elf = build_elf(LP64_SOFT, None);
-    assert_eq!(isa_requirement(&elf), Err(IsaReqError::MissingArch));
+    assert_eq!(requirement(&elf), Err(IsaReqError::MissingArch));
 }
 
 #[test]
@@ -113,9 +137,10 @@ fn tso_rve_reserved_rejected() {
         (LP64_SOFT | 0x0010, IsaReqError::Tso),
         (LP64_SOFT | 0x0008, IsaReqError::Rve),
         (LP64_SOFT | 0x0020, IsaReqError::BadFlags),
+        (LP64_SOFT | 0x0100_0000, IsaReqError::BadFlags),
     ] {
         let elf = build_elf(flags, Some(&arch));
-        assert_eq!(isa_requirement(&elf), Err(err));
+        assert_eq!(requirement(&elf), Err(err));
     }
 }
 
@@ -125,16 +150,16 @@ fn float_abi_gates() {
     let arch_fd = attributes(RV64IMAFDC);
     // Quad ABI 拒绝
     let quad = build_elf(0x0006, Some(&attributes("rv64i2p1_q2p0_zicsr2p0")));
-    assert_eq!(isa_requirement(&quad), Err(IsaReqError::QuadAbi));
+    assert_eq!(requirement(&quad), Err(IsaReqError::QuadAbi));
     // Single ABI（F-only）拒绝
     let single = build_elf(0x0002, Some(&attributes("rv64i2p1_f2p2_c2p0_zicsr2p0")));
-    assert_eq!(isa_requirement(&single), Err(IsaReqError::FOnly));
+    assert_eq!(requirement(&single), Err(IsaReqError::FOnly));
     // 双精度 ABI 却缺 f/d 声明：ABI 与 arch 不一致
     let mismatch = build_elf(LP64D & !0x0001, Some(&arch_soft));
-    assert_eq!(isa_requirement(&mismatch), Err(IsaReqError::AbiArchMismatch));
+    assert_eq!(requirement(&mismatch), Err(IsaReqError::AbiArchMismatch));
     // soft ABI 却声明 f/d：拒绝而非降级
     let leaky = build_elf(LP64_SOFT, Some(&arch_fd));
-    assert_eq!(isa_requirement(&leaky), Err(IsaReqError::AbiArchMismatch));
+    assert_eq!(requirement(&leaky), Err(IsaReqError::AbiArchMismatch));
 }
 
 #[test]
@@ -148,7 +173,7 @@ fn unmodeled_extensions_rejected() {
     ] {
         let elf = build_elf(LP64_SOFT, Some(&attributes(arch)));
         assert_eq!(
-            isa_requirement(&elf),
+            requirement(&elf),
             Err(IsaReqError::UnsupportedExtension),
             "{arch}"
         );
@@ -157,18 +182,18 @@ fn unmodeled_extensions_rejected() {
 
 #[test]
 fn non_rv64_base_rejected() {
-    let elf = build_elf(LP64_SOFT, Some(&attributes("rv32i2p1_m2p0_a2p1_c2p0_zicsr2p0")));
-    assert_eq!(isa_requirement(&elf), Err(IsaReqError::BadBase));
+    let elf = build_elf(
+        LP64_SOFT,
+        Some(&attributes("rv32i2p1_m2p0_a2p1_c2p0_zicsr2p0")),
+    );
+    assert_eq!(requirement(&elf), Err(IsaReqError::BadBase));
 }
 
 #[test]
 fn bad_base_and_shorthand_rejected() {
     // g 缩写未展开：非规范形式
     let g = build_elf(LP64_SOFT, Some(&attributes("rv64i2p1_g2p0")));
-    assert_eq!(
-        isa_requirement(&g),
-        Err(IsaReqError::UnsupportedExtension)
-    );
+    assert_eq!(requirement(&g), Err(IsaReqError::UnsupportedExtension));
 }
 
 #[test]

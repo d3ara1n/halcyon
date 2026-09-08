@@ -5,13 +5,13 @@
 //! （传输层消费），slot 1 为帧锚目录 Handle（传输层解析后不再进入本层）；
 //! v1 分发面无出站 Handle（委托与 Handle 属性随相应 kind 接入）。
 
-use alloc::vec::Vec;
+use crate::FAL_HEADER_LEN;
 use crate::bytes::{DecodeError, Writer};
 use crate::enumerate::{EnumerateResponse, RESPONSE_FIXED_LEN};
 use crate::header::{FalHeader, Kind, Status};
 use crate::memfs::{MemFs, MemLookup};
 use crate::op::OpAddress;
-use crate::FAL_HEADER_LEN;
+use alloc::vec::Vec;
 
 /// 分发结果：应答 kind 与 body 字节数（写入 `out`）。
 pub struct Served {
@@ -39,14 +39,22 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
         writer.reserve(8);
         writer.u32(status as u32);
         writer.u32(0);
-        Served { kind: header.kind, len: writer.written() }
+        Served {
+            kind: header.kind,
+            len: writer.written(),
+        }
     };
 
     match header.kind {
         Kind::Lookup => {
             let (policy, rel) = crate::lookup::LookupRequest::decode(body)?;
             match fs.lookup(policy, rel) {
-                Ok(MemLookup::Found { kind, attributes, size, target }) => {
+                Ok(MemLookup::Found {
+                    kind,
+                    attributes,
+                    size,
+                    target,
+                }) => {
                     let mut writer = Writer::new(out);
                     writer.reserve(8);
                     writer.u32(Status::Ok as u32);
@@ -59,9 +67,16 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                         value: target.as_deref().map(str::as_bytes).unwrap_or_default(),
                     };
                     let len = info.encode(&mut out[used..]);
-                    Ok(Served { kind: header.kind, len: used + len })
+                    Ok(Served {
+                        kind: header.kind,
+                        len: used + len,
+                    })
                 }
-                Ok(MemLookup::Link { parent_rel, target, remaining }) => {
+                Ok(MemLookup::Link {
+                    parent_rel,
+                    target,
+                    remaining,
+                }) => {
                     let mut writer = Writer::new(out);
                     writer.reserve(8);
                     writer.u32(Status::Ok as u32);
@@ -73,7 +88,10 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                         remaining: remaining.as_bytes(),
                     };
                     let len = link.encode(&mut out[used..]);
-                    Ok(Served { kind: header.kind, len: used + len })
+                    Ok(Served {
+                        kind: header.kind,
+                        len: used + len,
+                    })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
@@ -101,7 +119,10 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                     };
                     let used = writer.written();
                     let len = response.encode(&mut out[used..]);
-                    Ok(Served { kind: header.kind, len: used + len })
+                    Ok(Served {
+                        kind: header.kind,
+                        len: used + len,
+                    })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
@@ -117,7 +138,10 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                     let mut inner = Writer::new(&mut out[used..]);
                     inner.reserve(2 + value.len());
                     inner.sized_bytes(value);
-                    Ok(Served { kind: header.kind, len: used + inner.written() })
+                    Ok(Served {
+                        kind: header.kind,
+                        len: used + inner.written(),
+                    })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
@@ -163,7 +187,10 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                     let mut inner = Writer::new(&mut out[used..]);
                     inner.reserve(2 + bytes.len());
                     inner.sized_bytes(bytes);
-                    Ok(Served { kind: header.kind, len: used + inner.written() })
+                    Ok(Served {
+                        kind: header.kind,
+                        len: used + inner.written(),
+                    })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
@@ -176,7 +203,10 @@ pub fn serve(fs: &mut MemFs, request: &[u8], out: &mut [u8]) -> Result<Served, D
                     writer.reserve(8);
                     writer.u32(Status::Ok as u32);
                     writer.u32(written);
-                    Ok(Served { kind: header.kind, len: writer.written() })
+                    Ok(Served {
+                        kind: header.kind,
+                        len: writer.written(),
+                    })
                 }
                 Err(status) => Ok(status_only(out, status)),
             }
@@ -202,11 +232,11 @@ pub fn encode_reply(out: &mut [u8], kind: Kind, body: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lookup::ResolvePolicy;
-    use alloc::vec::Vec;
     use crate::bytes::Reader;
     use crate::lookup::LookupRequest;
+    use crate::lookup::ResolvePolicy;
     use crate::node::{NodeAttributes, NodeKind};
+    use alloc::vec::Vec;
 
     /// 构造完整请求 payload（FalHeader + body）。
     fn build_request(kind: Kind, body: &[u8]) -> Vec<u8> {
@@ -214,12 +244,6 @@ mod tests {
         let header = FalHeader::new(kind, (FAL_HEADER_LEN + body.len()) as u32);
         header.encode(&mut buffer);
         buffer[FAL_HEADER_LEN..].copy_from_slice(body);
-        buffer
-    }
-
-    fn address(rel: &[u8]) -> Vec<u8> {
-        let mut buffer = vec![0u8; 10 + rel.len()];
-        OpAddress { policy: ResolvePolicy::FollowAll, rel }.encode(&mut buffer);
         buffer
     }
 
@@ -247,11 +271,17 @@ mod tests {
         let mut out = [0u8; 256];
         let served = serve(&mut fs, &request, &mut out).unwrap();
         assert_eq!(served.kind, Kind::Create);
-        assert_eq!(u32::from_le_bytes([out[0], out[1], out[2], out[3]]), Status::Ok as u32);
+        assert_eq!(
+            u32::from_le_bytes([out[0], out[1], out[2], out[3]]),
+            Status::Ok as u32
+        );
 
         let mut buffer = vec![0u8; 64];
-        let used = LookupRequest { policy: ResolvePolicy::FollowAll, path: b"hello" }
-            .encode(&mut buffer);
+        let used = LookupRequest {
+            policy: ResolvePolicy::FollowAll,
+            path: b"hello",
+        }
+        .encode(&mut buffer);
         let request = build_request(Kind::Lookup, &buffer[..used]);
         let served = serve(&mut fs, &request, &mut out).unwrap();
         assert_eq!(served.kind, Kind::Lookup);
@@ -286,8 +316,11 @@ mod tests {
         serve(&mut fs, &request, &mut out).unwrap();
 
         let mut buffer = vec![0u8; 64];
-        let used =
-            LookupRequest { policy: ResolvePolicy::FollowAll, path: b"lnk" }.encode(&mut buffer);
+        let used = LookupRequest {
+            policy: ResolvePolicy::FollowAll,
+            path: b"lnk",
+        }
+        .encode(&mut buffer);
         let request = build_request(Kind::Lookup, &buffer[..used]);
         let served = serve(&mut fs, &request, &mut out).unwrap();
         let mut reader = Reader::new(&out[..served.len]);

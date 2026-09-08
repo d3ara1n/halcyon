@@ -19,9 +19,14 @@ const MAX_STEPS_PER_DEBT_TURN: usize = 4;
 type Debts = work_debt::WorkDebts<ObjectRef, HARTS, SLOTS>;
 type FinishDebts = work_debt::WorkDebts<Arc<WaitContext>, HARTS, SLOTS>;
 
-static DEBTS: Spinlock<Debts> = Spinlock::new(crate::sync::ranks::WORK_DEBT, Debts::new());
-static FINISH_DEBTS: Spinlock<FinishDebts> =
-    Spinlock::new(crate::sync::ranks::WORK_DEBT, FinishDebts::new());
+static DEBTS: Spinlock<Debts> = Spinlock::new(
+    crate::sync::ranks::WORK_DEBT,
+    Debts::new_with_id(work_debt::TableId::new(4)),
+);
+static FINISH_DEBTS: Spinlock<FinishDebts> = Spinlock::new(
+    crate::sync::ranks::WORK_DEBT,
+    FinishDebts::new_with_id(work_debt::TableId::new(5)),
+);
 static PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 static FINISH_PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
 
@@ -71,7 +76,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(reservation) = self.0.take() {
             assert!(
-                DEBTS.lock().cancel(reservation),
+                DEBTS.lock().cancel(reservation).is_ok(),
                 "reserved notification slot must roll back"
             );
         }
@@ -113,7 +118,7 @@ impl Drop for FinishReservation {
     fn drop(&mut self) {
         if let Some(reservation) = self.0.take() {
             assert!(
-                FINISH_DEBTS.lock().cancel(reservation),
+                FINISH_DEBTS.lock().cancel(reservation).is_ok(),
                 "reserved finish slot must roll back"
             );
         }
@@ -175,7 +180,7 @@ pub(crate) fn drain_current() -> usize {
         steps += used;
         if complete {
             assert!(
-                FINISH_DEBTS.lock().finish(token),
+                FINISH_DEBTS.lock().finish(token).is_ok(),
                 "taken finish slot must finish"
             );
             let previous = FINISH_PENDING[owner].fetch_sub(1, Ordering::AcqRel);

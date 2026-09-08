@@ -1,7 +1,4 @@
-use core::{
-    ops::Range,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::ops::Range;
 
 use erhino_shared::{
     call::SystemCallError,
@@ -11,7 +8,7 @@ use erhino_shared::{
 
 use crate::call::{sys_memory_map, sys_memory_protect, sys_memory_unmap};
 
-static NEXT_MAP_COOKIE: AtomicU64 = AtomicU64::new(1);
+static NEXT_MAP_COOKIE: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
@@ -93,7 +90,7 @@ impl MappedRegion {
         build: impl FnOnce(u64, u64, u64, MemoryPlacement) -> Result<MemoryMapRequest, SystemCallError>,
         placement: Placement,
     ) -> Result<Self, SystemCallError> {
-        let cookie = next_cookie();
+        let cookie = next_cookie()?;
         let mut result = MemoryMapResult::empty();
         let (placement_raw, address) = match placement {
             Placement::Anywhere => (MemoryPlacement::Anywhere, 0),
@@ -204,13 +201,10 @@ impl MappedRegion {
     }
 }
 
-fn next_cookie() -> u64 {
-    loop {
-        let cookie = NEXT_MAP_COOKIE.fetch_add(1, Ordering::Relaxed);
-        if cookie != 0 {
-            return cookie;
-        }
-    }
+fn next_cookie() -> Result<u64, SystemCallError> {
+    NEXT_MAP_COOKIE
+        .allocate()
+        .ok_or(SystemCallError::ReachLimit)
 }
 
 fn valid_page_range(range: &Range<usize>) -> bool {

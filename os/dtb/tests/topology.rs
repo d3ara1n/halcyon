@@ -3,7 +3,7 @@
 mod common;
 
 use common::BlobBuilder;
-use dtb::{topology, Fdt};
+use dtb::{Fdt, topology};
 
 /// 构造一个含 2 个 cpu 节点 + socket/cluster/core 三层 cpu-map 的 blob。
 fn topo_blob() -> Vec<u8> {
@@ -28,7 +28,10 @@ fn topo_blob() -> Vec<u8> {
     b.prop_u32("phandle", 0x11);
     b.prop_str("device_type", "cpu");
     b.prop_str("riscv,isa-base", "rv64i");
-    b.prop_str_list("riscv,isa-extensions", &["i", "m", "a", "f", "d", "c", "zicsr"]);
+    b.prop_str_list(
+        "riscv,isa-extensions",
+        &["i", "m", "a", "f", "d", "c", "zicsr"],
+    );
     b.end();
 
     b.begin("cpu-map");
@@ -78,7 +81,7 @@ fn string_list_rejects_bad_utf8_and_missing_nul() {
     let mut b = BlobBuilder::new();
     b.begin("");
     b.prop("bad", &[b'a', 0xFF, 0]);
-    b.prop("no_term", &[b'x', b'y']); // 末段缺 NUL：非法
+    b.prop("no_term", b"xy"); // 末段缺 NUL：非法
     b.end();
     let blob = b.finish();
     let fdt = Fdt::new(&blob).unwrap();
@@ -139,13 +142,19 @@ fn cpu_map_rejects_duplicate_leaf() {
     let blob = b.finish();
     let fdt = Fdt::new(&blob).unwrap();
     let map = fdt.root().child("cpus").unwrap().child("cpu-map").unwrap();
-    assert_eq!(topology::parse(&map), Err(topology::TopoError::DuplicateCpu));
+    assert_eq!(
+        topology::parse(&map),
+        Err(topology::TopoError::DuplicateCpu)
+    );
 }
 
 #[test]
 fn level_names_parse() {
     use topology::TopoLevel;
-    assert_eq!(TopoLevel::from_name("socket12"), Some(TopoLevel::Socket(12)));
+    assert_eq!(
+        TopoLevel::from_name("socket12"),
+        Some(TopoLevel::Socket(12))
+    );
     assert_eq!(TopoLevel::from_name("thread0"), Some(TopoLevel::Thread(0)));
     assert_eq!(TopoLevel::from_name("cores0"), None);
     assert_eq!(TopoLevel::from_name("socket"), None);

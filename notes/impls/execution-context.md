@@ -6,13 +6,15 @@
 
 cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期 fatal vector，不占用正式 `HartSlot(0)`。boot hart 以固件 raw hartid 查找正式 slot；secondary 通过 HSM opaque 取得 `HartBootRecord` PA，从 Bare 经永久 PA 前导与 identity/高半区别名过渡页表进入高半区。
 
-两条路径在 formal entry 汇合，统一建立 gp、tp、sscratch、正式 stack、satp、CSR 和 stvec。过渡表在 cold boot 建成后只读；全体启动记录以 Release 发布后才发 HSM start，RuntimeGate 以 Release/Acquire 发布 Online/Ready。全体 admitted hart Online、调度域和初始任务就绪后才进入调度循环。
+两条路径在 formal entry 汇合，统一建立 gp、tp、sscratch、正式 stack、satp、CSR 和 stvec。过渡表在 cold boot 建成后只读；全体启动记录以 Release 发布后才发 HSM start。`os/runtime_gate` 将全局状态限制为 `Preparing -> Ready | Failed`：HSM 错误、formal CSR 拒绝或 Online 超时先以 Release 广播 Failed，晚到 secondary 以 Acquire 观察后停驻；只有全体 admitted hart Online、调度域和初始任务就绪后才发布 Ready 并进入调度循环。
 
 ## 身份、能力与域
 
-`HartId` 保存 DT/SBI raw hartid，`HartSlot` 是按 admitted hartid 升序分配的稠密索引，`HartTopology` 保存可选 cpu-map。HartLocal、内核栈、active set 与 per-hart timer queue 都按 slot 索引；SBI 调用边界转换回 raw hartid。
+`HartId` 保存 DT/SBI raw hartid，`HartSlot` 是按 admitted hartid 升序分配的稠密索引，`HartTopology` 保存可选 cpu-map。HartLocal、内核栈、active set 与 per-hart timer queue 都按 slot 索引；SBI 调用边界才转换回 raw hartid，IPI 的 `(mask, base)` 不接收内部 slot bitmap。
 
-`os/kernel/src/board.rs` 逐 hart 读取现代 `riscv,isa-base`、`riscv,isa-extensions` 与 `mmu-type`。内核准入基线为 RV64IMAC、Zicsr、Zifencei、Zicntr 和系统选定页表模式；S 态 time 与 SBI TIME 共用 DT timebase。
+`os/dtb::cpu` 在零分配 admission 中一次读取现代 `riscv,isa-base`、`riscv,isa-extensions`、`mmu-type`、status、时钟与 raw hartid，固定容量内排序并拒绝重复。status 缺省或严格 `okay` 才准入，其余 DTSpec 合法不可用状态跳过，未知/畸形值拒绝整份平台输入；能力同时强制 `q => d => f`。内核基线为 RV64IMAC、Zicsr、Zifencei、Zicntr 和系统选定页表模式；S 态 time 与 SBI TIME 共用已验证的非零 DT timebase。
+
+普通 Ready、termination、Remote 与 deferred-work IPI 都只作已发布业务真值的门铃，发送 API 返回失败 slot mask；失败不撤销 Pending/Ready、不伪造完成，也不在发送者上 panic。
 
 `os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessStart 解析平铺的 execution profile，选择最弱兼容域，并在 lifecycle 提交后以单个 `AtomicUsize` 一次冻结 requirement 与域 index；零值只表示未绑定，不会与 Base64 混淆。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
 

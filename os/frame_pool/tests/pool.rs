@@ -234,6 +234,21 @@ fn metadata_and_arena_limits_fail_before_mutation() {
 }
 
 #[test]
+fn extreme_geometry_fails_before_inventory_mutation() {
+    let mut pool = pool(1);
+    assert_eq!(
+        pool.add_managed_region(frame(0), frame(usize::MAX)),
+        Err(AddRegionError::MetadataExhausted)
+    );
+    assert_eq!(pool.arena_count(), 0);
+    assert_eq!(pool.free_frames(), 0);
+
+    pool.add_managed_region(frame(8), frame(9)).unwrap();
+    assert_eq!(pool.arena_count(), 1);
+    assert_eq!(pool.free_frames(), 0);
+}
+
+#[test]
 fn canonical_arena_count_has_address_width_bound() {
     let mut pool = pool(10_000);
     pool.add_managed_region(frame(3), frame(10_003)).unwrap();

@@ -193,7 +193,7 @@ pub(crate) fn reserve(
             Err(_) => {
                 for reservation in slots.iter_mut().filter_map(Option::take) {
                     assert!(
-                        calls.cancel(reservation),
+                        calls.cancel(reservation).is_ok(),
                         "reserved remote-call slot must cancel"
                     );
                 }
@@ -261,7 +261,7 @@ impl Drop for ReservedBatch {
         let mut calls = CALLS.lock();
         for reservation in self.slots.iter_mut().filter_map(Option::take) {
             assert!(
-                calls.cancel(reservation),
+                calls.cancel(reservation).is_ok(),
                 "reserved remote-call slot must roll back"
             );
         }
@@ -324,7 +324,7 @@ pub(crate) fn drain_current() -> usize {
         execute_fence(call.request);
         let completes_batch = call.completion.acknowledge(target);
         assert!(
-            CALLS.lock().finish(token),
+            CALLS.lock().finish(token).is_ok(),
             "taken remote-call slot must finish"
         );
         if completes_batch {

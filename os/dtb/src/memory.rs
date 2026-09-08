@@ -5,7 +5,7 @@
 
 use core::fmt;
 
-use crate::{Fdt, Node, cells_u64};
+use crate::{Fdt, Node, NodeStatus, StatusError, cells_u64, node_status};
 
 /// 已按页边界规范化的半开物理区间。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,6 +21,10 @@ impl PhysicalRange {
         self.end - self.start
     }
 
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
     pub const fn contains(self, other: Self) -> bool {
         self.start <= other.start && other.end <= self.end
     }
@@ -32,6 +36,7 @@ pub enum MemoryMapError {
     InvalidPageSize,
     InvalidCellWidth,
     MalformedReg,
+    MalformedMemoryNode,
     EmptyRange,
     RangeOverflow,
     MemoryOverlap,
@@ -39,6 +44,8 @@ pub enum MemoryMapError {
     MalformedReservedMemory,
     UnsupportedDynamicReservation,
     UnsupportedReusable,
+    MalformedStatus,
+    UnknownStatus,
 }
 
 impl fmt::Display for MemoryMapError {
@@ -47,6 +54,7 @@ impl fmt::Display for MemoryMapError {
             Self::InvalidPageSize => "invalid physical page size",
             Self::InvalidCellWidth => "unsupported device tree address or size cell width",
             Self::MalformedReg => "malformed device tree reg property",
+            Self::MalformedMemoryNode => "malformed device tree memory node",
             Self::EmptyRange => "physical memory range contains no complete page",
             Self::RangeOverflow => "physical memory range overflows",
             Self::MemoryOverlap => "device tree memory ranges overlap",
@@ -54,6 +62,8 @@ impl fmt::Display for MemoryMapError {
             Self::MalformedReservedMemory => "malformed reserved-memory description",
             Self::UnsupportedDynamicReservation => "dynamic reserved-memory is unsupported",
             Self::UnsupportedReusable => "reserved-memory reusable is unsupported",
+            Self::MalformedStatus => "malformed device tree status property",
+            Self::UnknownStatus => "unknown device tree status value",
         };
         f.write_str(message)
     }
@@ -109,7 +119,16 @@ pub fn parse<const MEMORIES: usize, const RESERVATIONS: usize>(
     };
 
     for node in root.children() {
-        if node.prop_str("device_type") != Some("memory") || !is_available(&node) {
+        let name = node
+            .name()
+            .map_err(|_| MemoryMapError::MalformedMemoryNode)?;
+        if name.split('@').next() != Some("memory") {
+            continue;
+        }
+        if node.prop("device_type").and_then(crate::property_string) != Some("memory") {
+            return Err(MemoryMapError::MalformedMemoryNode);
+        }
+        if !is_available(&node)? {
             continue;
         }
         let reg = node.prop("reg").ok_or(MemoryMapError::MalformedReg)?;
@@ -128,16 +147,20 @@ pub fn parse<const MEMORIES: usize, const RESERVATIONS: usize>(
         push(&mut map.reservations, &mut map.reservation_len, range)?;
     }
 
-    if let Some(reserved) = root.child("reserved-memory") {
+    if let Some(reserved) = root.child("reserved-memory")
+        && is_available(&reserved)?
+    {
         parse_reserved_memory(
             &reserved,
             address_cells,
             size_cells,
             page_size,
-            &mut map.reservations,
-            &mut map.reservation_len,
-            &mut map.no_map,
-            &mut map.no_map_len,
+            &mut ReservationOutput {
+                reservations: &mut map.reservations,
+                reservation_len: &mut map.reservation_len,
+                no_map: &mut map.no_map,
+                no_map_len: &mut map.no_map_len,
+            },
         )?;
     }
     normalize_reservations(&mut map.reservations, &mut map.reservation_len);
@@ -146,15 +169,19 @@ pub fn parse<const MEMORIES: usize, const RESERVATIONS: usize>(
     Ok(map)
 }
 
+struct ReservationOutput<'a, const N: usize> {
+    reservations: &'a mut [PhysicalRange; N],
+    reservation_len: &'a mut usize,
+    no_map: &'a mut [PhysicalRange; N],
+    no_map_len: &'a mut usize,
+}
+
 fn parse_reserved_memory<const N: usize>(
     node: &Node<'_, '_>,
     root_address_cells: usize,
     root_size_cells: usize,
     page_size: u64,
-    output: &mut [PhysicalRange; N],
-    len: &mut usize,
-    no_map_output: &mut [PhysicalRange; N],
-    no_map_len: &mut usize,
+    output: &mut ReservationOutput<'_, N>,
 ) -> Result<(), MemoryMapError> {
     let address_cells = cell_width(node, "#address-cells", root_address_cells)?;
     let size_cells = cell_width(node, "#size-cells", root_size_cells)?;
@@ -165,14 +192,17 @@ fn parse_reserved_memory<const N: usize>(
         return Err(MemoryMapError::MalformedReservedMemory);
     }
 
-    for child in node.children().filter(is_available) {
+    for child in node.children() {
+        if !is_available(&child)? {
+            continue;
+        }
         let no_map = match child.prop("no-map") {
-            Some(value) if value.is_empty() => true,
+            Some([]) => true,
             Some(_) => return Err(MemoryMapError::MalformedReservedMemory),
             None => false,
         };
         let reusable = match child.prop("reusable") {
-            Some(value) if value.is_empty() => true,
+            Some([]) => true,
             Some(_) => return Err(MemoryMapError::MalformedReservedMemory),
             None => false,
         };
@@ -186,9 +216,9 @@ fn parse_reserved_memory<const N: usize>(
         if let Some(reg) = child.prop("reg") {
             each_reg(reg, address_cells, size_cells, |address, size| {
                 let range = normalize_reservation(address, size, page_size)?;
-                push(output, len, range)?;
+                push(output.reservations, output.reservation_len, range)?;
                 if no_map {
-                    push(no_map_output, no_map_len, range)?;
+                    push(output.no_map, output.no_map_len, range)?;
                 }
                 Ok(())
             })?;
@@ -201,8 +231,13 @@ fn parse_reserved_memory<const N: usize>(
     Ok(())
 }
 
-fn is_available(node: &Node<'_, '_>) -> bool {
-    node.prop("status").is_none() || matches!(node.prop_str("status"), Some("ok") | Some("okay"))
+fn is_available(node: &Node<'_, '_>) -> Result<bool, MemoryMapError> {
+    match node_status(node) {
+        Ok(NodeStatus::Okay) => Ok(true),
+        Ok(NodeStatus::Disabled | NodeStatus::Reserved | NodeStatus::Failed) => Ok(false),
+        Err(StatusError::Malformed) => Err(MemoryMapError::MalformedStatus),
+        Err(StatusError::Unknown) => Err(MemoryMapError::UnknownStatus),
+    }
 }
 
 fn cell_width(
@@ -233,7 +268,7 @@ fn each_reg(
     let tuple_bytes = tuple_cells
         .checked_mul(4)
         .ok_or(MemoryMapError::MalformedReg)?;
-    if data.is_empty() || data.len() % tuple_bytes != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(tuple_bytes) {
         return Err(MemoryMapError::MalformedReg);
     }
 

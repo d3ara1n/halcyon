@@ -76,7 +76,7 @@ impl Endpoint {
         metadata: super::resources::EndpointPermit,
     ) -> Result<Arc<Self>, SystemCallError> {
         let endpoint = Arc::try_new(Self {
-            header: ObjectHeader::new(),
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             connection,
             side,
             closed: AtomicBool::new(false),
@@ -129,7 +129,7 @@ impl Endpoint {
             let connection = self.connection.state.lock();
             if !matches!(
                 &connection.sides[self.side],
-                SideState::Alive(endpoint) if endpoint.as_ptr() == self as *const Endpoint
+                SideState::Alive(endpoint) if core::ptr::eq(endpoint.as_ptr(), self)
             ) {
                 return Err(SystemCallError::ObjectClosed);
             }
@@ -233,7 +233,7 @@ impl Invitation {
         metadata: super::resources::InvitationPermit,
     ) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
-            header: ObjectHeader::new(),
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             connection,
             side,
             closed: AtomicBool::new(false),
@@ -258,7 +258,7 @@ impl Invitation {
             let mut connection = self.connection.state.lock();
             if !matches!(
                 &connection.sides[self.side],
-                SideState::Invited(invitation) if invitation.as_ptr() == self as *const Invitation
+                SideState::Invited(invitation) if core::ptr::eq(invitation.as_ptr(), self)
             ) {
                 None
             } else {
@@ -357,20 +357,19 @@ fn plan_side_mapping(
         .map(|plan| (plan, pool))
 }
 
+type ReservedMappingResources = (
+    super::proc::MapIntent,
+    Vec<(page_table::FrameNumber, usize)>,
+    super::proc::PreparedObjectView,
+);
+
 /// 锁外预留 view 映射所需的全部 affine 资源：物理 span 投影（对象 backing 属
 /// MEMORY_OBJECT 锁阶）与 view 所有权。进入 AddressSpace 后只做复检与组装。
 fn reserve_mapping_resources(
     connection: &Connection,
     sponsor: &Arc<super::resources::MetadataSponsor>,
     va: usize,
-) -> Result<
-    (
-        super::proc::MapIntent,
-        Vec<(page_table::FrameNumber, usize)>,
-        super::proc::PreparedObjectView,
-    ),
-    super::proc::SpaceError,
-> {
+) -> Result<ReservedMappingResources, super::proc::SpaceError> {
     // Tunnel 当前对外是单页，因而投影退化为长度为一的 span 序列；多页几何
     // 只需改变投影区间，不涉及本函数形状。
     let object_pages = connection.core.backing.pages();
@@ -431,7 +430,7 @@ fn commit_side_close(endpoint: &Endpoint, connection: &mut ConnectionState) -> O
     assert!(
         matches!(
             &connection.sides[endpoint.side],
-            SideState::Alive(candidate) if candidate.as_ptr() == endpoint as *const Endpoint
+            SideState::Alive(candidate) if core::ptr::eq(candidate.as_ptr(), endpoint)
         ),
         "Tunnel close lost its live side"
     );
@@ -610,7 +609,7 @@ pub fn create(
         .map_err(handle::map_error)?,
     );
 
-    let token = handle::transaction_token();
+    let token = handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let mut reservation = Some(table.reserve(2, token).map_err(handle::map_error)?);
     let pair = {
@@ -795,7 +794,7 @@ pub fn attach(
     va: usize,
     output: usize,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let token = handle::transaction_token();
+    let token = handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let object = {
         let entry = table
@@ -844,7 +843,7 @@ pub fn attach(
     if invitation.closed.load(Ordering::Acquire)
         || !matches!(
             &connection_state.sides[invitation.side],
-            SideState::Invited(candidate) if candidate.as_ptr() == invitation as *const Invitation
+            SideState::Invited(candidate) if core::ptr::eq(candidate.as_ptr(), invitation)
         )
         || !matches!(
             connection_state.sides[1 - invitation.side],

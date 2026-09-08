@@ -32,7 +32,7 @@ impl BlobBuilder {
         self.push_u32(0x1);
         let mut b = name.as_bytes().to_vec();
         b.push(0);
-        while b.len() % 4 != 0 {
+        while !b.len().is_multiple_of(4) {
             b.push(0);
         }
         self.struct_block.extend_from_slice(&b);
@@ -52,7 +52,7 @@ impl BlobBuilder {
         self.push_u32(data.len() as u32);
         self.push_u32(nameoff);
         self.struct_block.extend_from_slice(data);
-        while self.struct_block.len() % 4 != 0 {
+        while !self.struct_block.len().is_multiple_of(4) {
             self.struct_block.push(0xAA); // 填充字节任意，读取方必须跳过
         }
     }

@@ -17,12 +17,13 @@ pub enum ReserveError {
 /// Publish 时 token 已不再指向原 reservation。
 #[derive(Debug, PartialEq, Eq)]
 pub struct PublishError<T> {
+    reservation: Reservation,
     value: T,
 }
 
 impl<T> PublishError<T> {
-    pub fn into_value(self) -> T {
-        self.value
+    pub fn into_parts(self) -> (Reservation, T) {
+        (self.reservation, self.value)
     }
 }
 
@@ -112,7 +113,8 @@ impl TableId {
     }
 }
 
-static NEXT_TABLE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// 1 由内核全局静态表占用；运行时构造从 2 起。
+static NEXT_TABLE_ID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(2);
 
 pub struct RemoteCalls<T, const HARTS: usize, const SLOTS: usize> {
     table_id: TableId,
@@ -133,11 +135,15 @@ impl<T, const HARTS: usize, const SLOTS: usize> RemoteCalls<T, HARTS, SLOTS> {
         }
     }
 
+    pub fn try_new() -> Option<Self> {
+        NEXT_TABLE_ID
+            .allocate()
+            .map(TableId::new)
+            .map(Self::new_with_id)
+    }
+
     pub fn new() -> Self {
-        let table_id =
-            TableId::new(NEXT_TABLE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
-        assert!(table_id.0 != 0, "remote-call table identity exhausted");
-        Self::new_with_id(table_id)
+        Self::try_new().expect("remote-call table identity exhausted")
     }
 
     /// 预留目标 hart 的一个槽。失败不改变任何槽。
@@ -164,35 +170,36 @@ impl<T, const HARTS: usize, const SLOTS: usize> RemoteCalls<T, HARTS, SLOTS> {
         })
     }
 
-    /// Commit 前取消 reservation。陈旧或错配 token 返回 false。
-    pub fn cancel(&mut self, reservation: Reservation) -> bool {
+    /// Commit 前取消 reservation。陈旧或错配 token 原样返还。
+    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), Reservation> {
         if reservation.table_id != self.table_id {
-            return false;
+            return Err(reservation);
         }
         let Some(entry) =
             self.entry_mut(reservation.target, reservation.slot, reservation.generation)
         else {
-            return false;
+            return Err(reservation);
         };
         if entry.phase != Phase::Reserved {
-            return false;
+            return Err(reservation);
         }
         entry.phase = Phase::Empty;
-        true
+        Ok(())
     }
 
     /// 发布请求。成功后请求只能由目标 hart 取得，不能取消。
     pub fn publish(&mut self, reservation: Reservation, value: T) -> Result<(), PublishError<T>> {
         if reservation.table_id != self.table_id {
-            return Err(PublishError { value });
+            return Err(PublishError { reservation, value });
         }
-        let Some(entry) =
-            self.entry_mut(reservation.target, reservation.slot, reservation.generation)
-        else {
-            return Err(PublishError { value });
+        let target = reservation.target;
+        let slot = reservation.slot;
+        let generation = reservation.generation;
+        let Some(entry) = self.entry_mut(target, slot, generation) else {
+            return Err(PublishError { reservation, value });
         };
         if entry.phase != Phase::Reserved {
-            return Err(PublishError { value });
+            return Err(PublishError { reservation, value });
         }
         debug_assert!(entry.value.is_none());
         entry.value = Some(value);
@@ -225,15 +232,15 @@ impl<T, const HARTS: usize, const SLOTS: usize> RemoteCalls<T, HARTS, SLOTS> {
     }
 
     /// 发布动作完成并回收槽。generation 耗尽时槽永久 Retired，避免 ABA。
-    pub fn finish(&mut self, token: FinishToken) -> bool {
+    pub fn finish(&mut self, token: FinishToken) -> Result<(), FinishToken> {
         if token.table_id != self.table_id {
-            return false;
+            return Err(token);
         }
         let Some(entry) = self.entry_mut(token.target, token.slot, token.generation) else {
-            return false;
+            return Err(token);
         };
         if entry.phase != Phase::Taken {
-            return false;
+            return Err(token);
         }
         debug_assert!(entry.value.is_none());
         if entry.generation == u32::MAX {
@@ -242,7 +249,7 @@ impl<T, const HARTS: usize, const SLOTS: usize> RemoteCalls<T, HARTS, SLOTS> {
             entry.generation += 1;
             entry.phase = Phase::Empty;
         }
-        true
+        Ok(())
     }
 
     pub fn has_pending(&self, target: usize) -> bool {
@@ -268,5 +275,22 @@ impl<T, const HARTS: usize, const SLOTS: usize> RemoteCalls<T, HARTS, SLOTS> {
 impl<T, const HARTS: usize, const SLOTS: usize> Default for RemoteCalls<T, HARTS, SLOTS> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Phase, RemoteCalls, ReserveError, TableId};
+
+    #[test]
+    fn maximum_generation_retires_slot_permanently() {
+        let mut calls: RemoteCalls<(), 1, 1> = RemoteCalls::new_with_id(TableId::new(99));
+        calls.slots[0][0].generation = u32::MAX;
+        let reservation = calls.reserve(0).unwrap();
+        calls.publish(reservation, ()).unwrap();
+        let (token, ()) = calls.take(0).unwrap().into_parts();
+        assert!(calls.finish(token).is_ok());
+        assert_eq!(calls.slots[0][0].phase, Phase::Retired);
+        assert_eq!(calls.reserve(0), Err(ReserveError::Full));
     }
 }

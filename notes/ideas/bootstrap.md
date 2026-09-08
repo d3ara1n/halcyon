@@ -62,7 +62,8 @@ init 独占解释 initfs，并按配置：
 - 通过公共 loader 能力创建服务进程；
 - 创建 endpoint、Job 和管理 capability；
 - 将 ProcessControl、JobControl、设备资源与 namespace grants 交给相应服务；
-- 完成授权图发布后进入持续监督循环。
+- 按配置声明必选/可选服务集合，只有必选映像、构造和初始授权全部成功才发布完整拓扑；可选失败形成显式 Degraded；
+- 完成授权图发布后进入带 deadline、工作预算与 authority handoff 的持续监督循环。
 
 init 位于其受管 services Job 之外，直接持有该 JobControl 及系统服务的 ProcessControls，负责服务的创建、退出处理、重启和递归收束。系统服务与其受托管理子域同属 services 域，整树可一次封口收束；委托只转移子域的域内管理 authority，init 对受托域保留直接收束权。pm 是 services Job 内可被 init 监督的系统服务，可以管理 init 显式委托的子域或向其他进程提供进程管理协议，但不承担根监督链角色。委托的语义在 capability 转移本身：启动时在 Building 阶段经直接 grant 交付与运行时经管理协议授予是同一转移的两个时机，不构成第二种委托机制。重启是监督政策的维度：受管服务收束后是否重新创建由配置决定，重启域（Open Job）为此保持可用；不重启政策下收束完成即终态记录。
 

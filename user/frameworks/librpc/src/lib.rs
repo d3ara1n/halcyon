@@ -10,8 +10,6 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 /// 前缀字节数。
 pub const PREFIX_LEN: usize = 16;
 
@@ -63,7 +61,11 @@ pub struct RpcPrefix {
 
 impl RpcPrefix {
     pub const fn new(kind: RpcMessageKind, txid: u64) -> Self {
-        Self { version: RPC_VERSION, kind, txid }
+        Self {
+            version: RPC_VERSION,
+            kind,
+            txid,
+        }
     }
 
     /// 以 little-endian 编码进 `out`，返回写入字节数。
@@ -93,28 +95,53 @@ impl RpcPrefix {
         if txid == 0 {
             return Err(FrameError::ZeroTxid);
         }
-        Ok(Self { version, kind, txid })
+        Ok(Self {
+            version,
+            kind,
+            txid,
+        })
     }
 }
 
-/// per-process 单调 txid 分配：非零起始、不重用、跳过回绕产出的 0
-/// （见 rpc.md「并发与回复路由」）。
-static NEXT_TXID: AtomicU64 = AtomicU64::new(1);
+/// per-process 单调 txid 分配：非零起始、不重用，耗尽后永久失败。
+static NEXT_TXID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
-pub fn next_txid() -> u64 {
-    loop {
-        let candidate = NEXT_TXID.fetch_add(1, Ordering::Relaxed);
-        if candidate != 0 {
-            return candidate;
-        }
+pub fn next_txid() -> Option<u64> {
+    NEXT_TXID.allocate()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseRejection {
+    UnknownVersion,
+    NotResponse,
+    TxidMismatch,
+    ProtocolMismatch,
+}
+
+pub fn validate_response(
+    expected_protocol: u64,
+    expected_txid: u64,
+    protocol: u64,
+    payload: &[u8],
+) -> Result<RpcPrefix, ResponseRejection> {
+    if protocol != expected_protocol {
+        return Err(ResponseRejection::ProtocolMismatch);
     }
+    let prefix = RpcPrefix::decode(payload).map_err(|_| ResponseRejection::UnknownVersion)?;
+    if prefix.kind != RpcMessageKind::Response {
+        return Err(ResponseRejection::NotResponse);
+    }
+    if prefix.txid != expected_txid {
+        return Err(ResponseRejection::TxidMismatch);
+    }
+    Ok(prefix)
 }
 
 /// 同步调用层依赖 ecall，仅内核目标编译；framing 核心 host 可测。
 #[cfg(target_arch = "riscv64")]
 pub mod caller;
 #[cfg(target_arch = "riscv64")]
-pub use caller::{CallError, Caller, Reply};
+pub use caller::{CallError, Caller, FrameRejection, Reply};
 
 #[cfg(test)]
 mod tests {
@@ -123,7 +150,11 @@ mod tests {
     #[test]
     fn prefix_roundtrip_all_kinds() {
         let mut buffer = [0u8; PREFIX_LEN];
-        for kind in [RpcMessageKind::Request, RpcMessageKind::Response, RpcMessageKind::Oneway] {
+        for kind in [
+            RpcMessageKind::Request,
+            RpcMessageKind::Response,
+            RpcMessageKind::Oneway,
+        ] {
             let prefix = RpcPrefix::new(kind, 0x0102_0304_0506_0708);
             let len = prefix.encode(&mut buffer);
             assert_eq!(len, PREFIX_LEN);
@@ -137,7 +168,10 @@ mod tests {
         let mut buffer = [0u8; PREFIX_LEN];
         RpcPrefix::new(RpcMessageKind::Request, 1).encode(&mut buffer);
         buffer[0] = 9;
-        assert_eq!(RpcPrefix::decode(&buffer), Err(FrameError::UnknownVersion(9)));
+        assert_eq!(
+            RpcPrefix::decode(&buffer),
+            Err(FrameError::UnknownVersion(9))
+        );
         buffer[0] = 1;
         buffer[2] = 7;
         assert_eq!(RpcPrefix::decode(&buffer), Err(FrameError::UnknownKind(7)));
@@ -160,8 +194,33 @@ mod tests {
 
     #[test]
     fn txids_are_nonzero_and_monotonic() {
-        let first = next_txid();
-        let second = next_txid();
-        assert!(first != 0 && second != 0 && second > first);
+        let first = next_txid().unwrap();
+        let second = next_txid().unwrap();
+        assert!(second > first);
+    }
+
+    #[test]
+    fn response_validation_classifies_every_rejection() {
+        let mut response = [0u8; PREFIX_LEN];
+        RpcPrefix::new(RpcMessageKind::Response, 7).encode(&mut response);
+        assert!(validate_response(3, 7, 3, &response).is_ok());
+        assert_eq!(
+            validate_response(3, 7, 4, &response),
+            Err(ResponseRejection::ProtocolMismatch)
+        );
+        assert_eq!(
+            validate_response(3, 7, 3, &response[..8]),
+            Err(ResponseRejection::UnknownVersion)
+        );
+        RpcPrefix::new(RpcMessageKind::Request, 7).encode(&mut response);
+        assert_eq!(
+            validate_response(3, 7, 3, &response),
+            Err(ResponseRejection::NotResponse)
+        );
+        RpcPrefix::new(RpcMessageKind::Response, 8).encode(&mut response);
+        assert_eq!(
+            validate_response(3, 7, 3, &response),
+            Err(ResponseRejection::TxidMismatch)
+        );
     }
 }

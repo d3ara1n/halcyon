@@ -14,23 +14,25 @@ pub enum ReserveError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PublishError<T> {
+    reservation: Reservation,
     value: T,
 }
 
 impl<T> PublishError<T> {
-    pub fn into_value(self) -> T {
-        self.value
+    pub fn into_parts(self) -> (Reservation, T) {
+        (self.reservation, self.value)
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct RequeueError<T> {
+    token: FinishToken,
     value: T,
 }
 
 impl<T> RequeueError<T> {
-    pub fn into_value(self) -> T {
-        self.value
+    pub fn into_parts(self) -> (FinishToken, T) {
+        (self.token, self.value)
     }
 }
 
@@ -63,8 +65,22 @@ impl<T> Slot<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableId(u64);
+
+impl TableId {
+    pub const fn new(value: u64) -> Self {
+        assert!(value != 0);
+        Self(value)
+    }
+}
+
+/// 1..=5 由内核静态队列占用；运行时构造从 6 起，两个域永不碰撞。
+static NEXT_TABLE_ID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(6);
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reservation {
+    table_id: TableId,
     slot: usize,
     generation: u32,
 }
@@ -88,6 +104,7 @@ impl<T> Taken<T> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct FinishToken {
+    table_id: TableId,
     owner: usize,
     slot: usize,
     generation: u32,
@@ -106,20 +123,37 @@ impl FinishToken {
 /// `SLOTS` 个全局债务槽按 `OWNERS` 条 FIFO 链分流。Reserve 时无需预知 owner；
 /// Publish 后槽只会出现在一条 owner 链中。
 pub struct WorkDebts<T, const OWNERS: usize, const SLOTS: usize> {
+    table_id: TableId,
     slots: [Slot<T>; SLOTS],
     heads: [Option<usize>; OWNERS],
     tails: [Option<usize>; OWNERS],
 }
 
 impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
-    pub const fn new() -> Self {
+    pub const fn new_with_id(table_id: TableId) -> Self {
         assert!(OWNERS > 0);
         assert!(SLOTS > 0);
         Self {
+            table_id,
             slots: [const { Slot::empty() }; SLOTS],
             heads: [None; OWNERS],
             tails: [None; OWNERS],
         }
+    }
+
+    pub fn try_new() -> Option<Self> {
+        NEXT_TABLE_ID
+            .allocate()
+            .map(TableId::new)
+            .map(Self::new_with_id)
+    }
+
+    pub fn new() -> Self {
+        Self::try_new().expect("work-debt table identity exhausted")
+    }
+
+    pub const fn table_id(&self) -> TableId {
+        self.table_id
     }
 
     pub fn reserve(&mut self) -> Result<Reservation, ReserveError> {
@@ -131,20 +165,24 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
             .ok_or(ReserveError::Full)?;
         entry.phase = Phase::Reserved;
         Ok(Reservation {
+            table_id: self.table_id,
             slot,
             generation: entry.generation,
         })
     }
 
-    pub fn cancel(&mut self, reservation: Reservation) -> bool {
+    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), Reservation> {
+        if reservation.table_id != self.table_id {
+            return Err(reservation);
+        }
         let Some(entry) = self.entry_mut(reservation.slot, reservation.generation) else {
-            return false;
+            return Err(reservation);
         };
         if entry.phase != Phase::Reserved {
-            return false;
+            return Err(reservation);
         }
         entry.phase = Phase::Empty;
-        true
+        Ok(())
     }
 
     pub fn publish(
@@ -153,15 +191,16 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         owner: usize,
         value: T,
     ) -> Result<(), PublishError<T>> {
-        if owner >= OWNERS {
-            return Err(PublishError { value });
+        if reservation.table_id != self.table_id || owner >= OWNERS {
+            return Err(PublishError { reservation, value });
         }
         let slot = reservation.slot;
-        let Some(entry) = self.entry_mut(slot, reservation.generation) else {
-            return Err(PublishError { value });
+        let generation = reservation.generation;
+        let Some(entry) = self.entry_mut(slot, generation) else {
+            return Err(PublishError { reservation, value });
         };
         if entry.phase != Phase::Reserved {
-            return Err(PublishError { value });
+            return Err(PublishError { reservation, value });
         }
         entry.owner = owner;
         entry.next = None;
@@ -194,6 +233,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
             .expect("pending work-debt slot must contain work");
         Some(Taken {
             token: FinishToken {
+                table_id: self.table_id,
                 owner,
                 slot,
                 generation,
@@ -203,12 +243,16 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
     }
 
     pub fn requeue(&mut self, token: FinishToken, value: T) -> Result<(), RequeueError<T>> {
+        if token.table_id != self.table_id {
+            return Err(RequeueError { token, value });
+        }
         let slot = token.slot;
-        let Some(entry) = self.entry_mut(slot, token.generation) else {
-            return Err(RequeueError { value });
+        let generation = token.generation;
+        let Some(entry) = self.entry_mut(slot, generation) else {
+            return Err(RequeueError { token, value });
         };
         if entry.phase != Phase::Taken || entry.owner != token.owner {
-            return Err(RequeueError { value });
+            return Err(RequeueError { token, value });
         }
         entry.value = Some(value);
         entry.next = None;
@@ -217,12 +261,15 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         Ok(())
     }
 
-    pub fn finish(&mut self, token: FinishToken) -> bool {
+    pub fn finish(&mut self, token: FinishToken) -> Result<(), FinishToken> {
+        if token.table_id != self.table_id {
+            return Err(token);
+        }
         let Some(entry) = self.entry_mut(token.slot, token.generation) else {
-            return false;
+            return Err(token);
         };
         if entry.phase != Phase::Taken || entry.owner != token.owner {
-            return false;
+            return Err(token);
         }
         assert!(entry.value.is_none(), "taken slot retained work at Finish");
         if entry.generation == u32::MAX {
@@ -231,12 +278,15 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
             entry.generation += 1;
             entry.phase = Phase::Empty;
         }
-        true
+        Ok(())
     }
 
     /// Taken 债务完成一次交付后继续保留同一容量 owner，重新回到 Reserved。
     /// token 与 reservation 均为 affine，代次无需变化：该槽从未释放给其它准入者。
     pub fn rearm(&mut self, token: FinishToken) -> Result<Reservation, FinishToken> {
+        if token.table_id != self.table_id {
+            return Err(token);
+        }
         let Some(entry) = self.entry_mut(token.slot, token.generation) else {
             return Err(token);
         };
@@ -246,6 +296,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         assert!(entry.value.is_none(), "taken slot retained work at Rearm");
         entry.phase = Phase::Reserved;
         Ok(Reservation {
+            table_id: token.table_id,
             slot: token.slot,
             generation: token.generation,
         })
@@ -282,5 +333,22 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
 impl<T, const OWNERS: usize, const SLOTS: usize> Default for WorkDebts<T, OWNERS, SLOTS> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReserveError, TableId, WorkDebts};
+
+    #[test]
+    fn maximum_generation_retires_slot_permanently() {
+        let mut debts: WorkDebts<(), 1, 1> = WorkDebts::new_with_id(TableId::new(99));
+        debts.slots[0].generation = u32::MAX;
+        let reservation = debts.reserve().unwrap();
+        debts.publish(reservation, 0, ()).unwrap();
+        let (token, ()) = debts.take(0).unwrap().into_parts();
+        assert!(debts.finish(token).is_ok());
+        assert_eq!(debts.available(), 0);
+        assert_eq!(debts.reserve(), Err(ReserveError::Full));
     }
 }

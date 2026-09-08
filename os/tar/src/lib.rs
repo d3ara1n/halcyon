@@ -29,7 +29,7 @@ const BLOCK: usize = 512;
 
 /// 解析整个归档，逐项回调（就地切片，不拷贝）。
 pub fn walk(data: &[u8], mut f: impl FnMut(Entry<'_>)) -> Result<(), TarError> {
-    if data.len() % BLOCK != 0 {
+    if !data.len().is_multiple_of(BLOCK) {
         return Err(TarError::BadBlock);
     }
     let mut pos = 0;
@@ -41,10 +41,7 @@ pub fn walk(data: &[u8], mut f: impl FnMut(Entry<'_>)) -> Result<(), TarError> {
         if &head[257..262] != b"ustar" {
             return Err(TarError::BadMagic);
         }
-        let name_len = head[..100]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(100);
+        let name_len = head[..100].iter().position(|&b| b == 0).unwrap_or(100);
         let name = core::str::from_utf8(&head[..name_len]).map_err(|_| TarError::BadName)?;
         let size = octal(&head[124..136])? as usize;
         let typeflag = head[156];
@@ -58,7 +55,10 @@ pub fn walk(data: &[u8], mut f: impl FnMut(Entry<'_>)) -> Result<(), TarError> {
             return Err(TarError::BadMagic);
         }
         if typeflag != b'5' {
-            f(Entry { name, data: &data[pos..data_end] });
+            f(Entry {
+                name,
+                data: &data[pos..data_end],
+            });
         } else {
             f(Entry { name, data: &[] });
         }

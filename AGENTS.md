@@ -43,10 +43,10 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 ## 构建与验证
 
 - 构建系统是 [Just](https://just.systems)，**统一走 `just`，不裸跑 `cargo build`**——内核的链接脚本和链接器（`riscv64-elf-ld`）靠 Justfile 注入 RUSTFLAGS；用户态靠自定义 target（`rinlib/riscv64-unknown-erhino-elf.json` + build-std）。
-- 秒级检查：`just check`（内核 target 需要 build-std，等价于 `cd os && cargo check -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`）；`cd shared && cargo check`。
+- 秒级检查：`just check`（内核 target 需要 build-std，等价于 `cd os && cargo check -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`）；`cd shared && cargo check`。全仓 lint 统一走 `just clippy`，按 shared/os/user host、kernel/user RISC-V、stress feature 与独立 gc target 分面执行 `-D warnings`，完整日志写入 `artifacts/lint/`；`just acceptance` 会先通过该门再运行 QEMU 路线。
 - host 单测（纯逻辑 crate，毫秒级）：**必须显式指 host target**——os workspace 默认 target 是 riscv，`cargo test` 直接跑会拿 no_std 环境去链 std：
   ```sh
-  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain -p ready_queue --target aarch64-apple-darwin
+  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain -p ready_queue -p memory_space -p remote_call -p runtime_gate -p memory_supply -p memory_pool -p funded_frame -p metadata_admission -p monotonic_id -p ordered_table -p work_debt --target aarch64-apple-darwin
   cd shared && cargo test --target aarch64-apple-darwin   # shared 也需显式 host target
   ```
 - 集成验证分档由用户态 `srv_init` 编译期 workload 控制，内核不感知测试政策：`just virt` 是日常 core 快线（确定性内存/IPC/Tunnel/Job/监督/reset）；`just virt-stress` 追加 control/Tunnel 重复压力、`max_work=1` Drain 与完整 16/16 竞态矩阵；`just virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持；`just acceptance` 是阶段收尾聚合，依次执行 debug stress、release core 与 `sifive_u` core。涉及调度域契约时另跑 `virt-hetero`/`virt-nofd`。

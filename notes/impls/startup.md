@@ -62,15 +62,15 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 4. 以真实句柄值构造出生块 prefix；payload owner 先与 root charge 合成 `BootFundedExtent`，prefix 在发布前直接回填，随后以 owner 借用投影完成可失败映射并无分配地安装本体，形成不可公开 Unmap 的只读 lease backing，不经历回库存再取得或无 owner 映射窗口；
 5. 在最终发布前准备 execution domain、`ReadyBatch` 全寿命调度准入、单线程 staged 缓冲与首线程 Attach；初始 entries 由 `PendingEntries` affine owner 保持，Handle reservation 先验证为 `PreparedCommit`；
 6. 最终临界区按 `HANDLE_TABLE → JOB_INNER → LIFECYCLE` 同时发布 capability、Job membership、Running 状态和 execution binding，不存在仍返回 `Result` 的不可逆动作；随后发布 `UnpublishedBound` 并交出携带同源 credit 的 `AdmittedThread`；
-7. `boot.rs` 执行内存池 syscall 自检、回投 package prefix，最后消费该 owner经无分配 Ready enqueue 首次发布线程。成功后 Kill 由 lifecycle/pick gate 接管，不能遗失尚未入队的 owner。
+7. `boot.rs` 执行内存池 syscall 自检、回投 package prefix，最后消费该 owner，经无分配 Ready enqueue 首次发布线程。成功后 Kill 由 lifecycle/pick gate 接管，不能遗失尚未入队的 owner。
 
-结构与组合验证由 [`地址空间事务与启动纵向计划`](../../plans/todo-2026-09-memory-transaction-state-machine.md) 记录。validated ELF admission 仍由独立计划拥有；它不改变这里已经闭合的构造 owner 与发布协议。
+结构与组合验证由 [`地址空间事务与启动纵向档案`](../../plans/archived/todo-2026-09-memory-transaction-state-machine.md) 记录。validated ELF admission 已由 `os/elf::validate` 接入此发布链；它在任何 Process/页表 owner 构造前冻结映像事实，不改变这里的构造 owner 与提交协议。
 
 initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；payload backing 与 root PoolBinding 在 init AddressSpace 有界收束时于锁外同步归还物理 extent 与 charge。内核没有 pid 特判的保留洞。
 
 ## 用户态公共 loader
 
-`os/elf` 是 bootstrap 与用户态共用的纯逻辑 parser。`user/frameworks/libprocess` 验证 entry、segment overlap、文件边界和页级 W^X，合并连续同权限页；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
+`os/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/frameworks/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
 
 ## init/pm 当前政策
 
@@ -84,7 +84,9 @@ root
    └─ acceptance
 ```
 
-所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，按 REAPABLE|CLOSED → ProcessDrain → Query 收束。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留 pm_domain control 作为兜底。pm 对委托域执行枚举→派生→kill→drain→seal。
+init 以 `libprocess::RequiredLaunchSet` 声明式 manifest 要求 `srv_fs`、`srv_pm`、`drv_spi_sifive`、acceptance target 和 pm-domain target 全部存在并成功启动；`test_fp` 按 execution domain 可选，stress 档另要求 hammer 映像。必选缺失/失败使整个 stage 失败并由 services JobControl 收束，不继续发布正常拓扑。
+
+所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，经 `libprocess::collect_process` 按有限 wait/drain/query policy 收束；失败 target 放回监督集合并升级给 root services JobControl，只有 Dead 快照核验后才 close/remove。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留独立 pm_domain control 作为兜底。pm 局部失败先执行有限域级 JobKill，仍失败则记录 unmanaged handoff 并退出，由 init 直接接管。
 
 acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域 job_kill。`srv_init` 默认编译为 core workload，只运行确定性内存、IPC、Tunnel、Job 与监督契约；`acceptance-stress` feature 在同一用户态编排器中追加 control/Tunnel 重复压力、`max_work=1` Drain 和完整 16/16 竞态矩阵。profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。init 在全部服务监督与资源收束锚点成立后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并常驻管理端点，保持 root supervisor 存活；当前不经独立电源服务转发。
 
@@ -92,5 +94,6 @@ acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域
 
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
 - handle_table host：consume/transfer 两类 pin、builder 保护、自授予/重复拒绝、rights 回滚、reservation 与 TRANSIT/GRANT；
-- libprocess host：entry、segment overlap 与页级 W^X；
-- QEMU acceptance：`virt` 是 debug core 快线，`virt-stress` 承担最小预算 Drain、重复压力与 16/16 竞态矩阵，`virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持，hetero/nofd 与 `sifive_u` 只叠加各自平台/调度域差异；`acceptance` 聚合阶段收尾所需的 stress、release 与 sifive_u。每种 wrapper 都校验 `acceptance workload: core|stress`，避免构建 feature 与所需锚点错配。virt 必须由 QEMU 正常退出证明 shutdown 后端成功；`sifive_u` 在内核明确返回 reset 失败后主动收割。
+- libprocess host：ELF 前置、必选映像缺失/启动失败与非法 supervision policy 在 syscall 前拒绝并返还 authority；
+- 工程静态门：`just clippy` 以 `-D warnings` 分别覆盖 shared/os/user host、kernel/user RISC-V、stress feature 与独立 gc target，完整日志写入 `artifacts/lint/`；`just acceptance` 在启动 QEMU 前先执行该门；
+- QEMU acceptance：`virt` 是 debug core 快线，`virt-stress` 承担最小预算 Drain、重复压力与 16/16 竞态矩阵，`virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持，hetero/nofd 与 `sifive_u` 只叠加各自平台/调度域差异；`acceptance` 聚合阶段收尾所需的 stress、release 与 sifive_u。每种 wrapper 都校验 `acceptance workload: core|stress`、必选拓扑、RPC reject cleanup、监督预算耗尽后 authority 续接和零 abandoned stack 等公共锚点，避免构建 feature 与所需语义错配。virt 必须由 QEMU 正常退出证明 shutdown 后端成功；`sifive_u` 在内核明确返回 reset 失败后主动收割。

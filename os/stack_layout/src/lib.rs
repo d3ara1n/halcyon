@@ -67,17 +67,17 @@ impl StackWindowLayout {
         if slots == 0 {
             return Err(LayoutError::NoSlots);
         }
-        if guard % PAGE_SIZE != 0
-            || emergency % PAGE_SIZE != 0
-            || stack_size % PAGE_SIZE != 0
-            || phys_base % PAGE_SIZE != 0
+        if !guard.is_multiple_of(PAGE_SIZE)
+            || !emergency.is_multiple_of(PAGE_SIZE)
+            || !stack_size.is_multiple_of(PAGE_SIZE)
+            || !phys_base.is_multiple_of(PAGE_SIZE)
         {
             return Err(LayoutError::NotPageAligned);
         }
         if stack_size <= emergency {
             return Err(LayoutError::EmptyFormal);
         }
-        if window % VPN2_SPAN != 0 || (window >> 30) & 0x1FF != top_slot {
+        if !window.is_multiple_of(VPN2_SPAN) || (window >> 30) & 0x1FF != top_slot {
             return Err(LayoutError::WrongWindowSlot);
         }
         let stride = stack_size
@@ -184,8 +184,7 @@ impl StackWindowLayout {
             return false;
         };
         rem < self.guard
-            || (self.guard + self.formal_span() <= rem
-                && rem < 2 * self.guard + self.formal_span())
+            || (self.guard + self.formal_span() <= rem && rem < 2 * self.guard + self.formal_span())
     }
 
     /// 窗口内已映射页的 VA→PA 换算（与建表互逆）；guard 洞与窗口外
@@ -252,13 +251,17 @@ impl Iterator for SlotMappings {
         let formal_pages = layout.formal_span() / PAGE_SIZE;
         let (va, pa) = if self.page < formal_pages {
             let va = layout.formal_range(slot).start + self.page * PAGE_SIZE;
-            (va, layout.phys_base + slot * layout.stack_size + self.page * PAGE_SIZE)
+            (
+                va,
+                layout.phys_base + slot * layout.stack_size + self.page * PAGE_SIZE,
+            )
         } else {
             let index = self.page - formal_pages;
             let va = layout.emergency_range(slot).start + index * PAGE_SIZE;
             (
                 va,
-                layout.phys_base + slot * layout.stack_size
+                layout.phys_base
+                    + slot * layout.stack_size
                     + layout.formal_span()
                     + index * PAGE_SIZE,
             )
@@ -359,7 +362,10 @@ mod tests {
     fn guards_are_unmapped_and_flagged() {
         let layout = virt_board();
         for slot in 0..layout.slots() {
-            for va in [layout.bottom_guard_range(slot).start, layout.bottom_guard_range(slot).end - 1] {
+            for va in [
+                layout.bottom_guard_range(slot).start,
+                layout.bottom_guard_range(slot).end - 1,
+            ] {
                 assert!(layout.in_guard(va));
                 assert_eq!(layout.translate(va), None);
             }
@@ -387,7 +393,8 @@ mod tests {
             for slot in 0..layout.slots() {
                 let slot_lo = layout.slot_base(slot);
                 let slot_hi = layout.slot_base(slot) + layout.stride();
-                for sp in (layout.formal_range(slot).start..=layout.formal_top(slot)).step_by(0x100) {
+                for sp in (layout.formal_range(slot).start..=layout.formal_top(slot)).step_by(0x100)
+                {
                     let target = sp - max_frame;
                     assert!(target >= slot_lo, "formal jump escapes slot");
                 }
@@ -406,8 +413,16 @@ mod tests {
         let good = (WINDOW, 8, 0x40000, GUARD, EMERGENCY, 0x80493000, TOP_SLOT);
         // 非顶槽窗口。
         assert_eq!(
-            StackWindowLayout::new(0xFFFF_FFFF_8000_0000, 8, 0x40000, GUARD, EMERGENCY, 0x80493000, TOP_SLOT)
-                .unwrap_err(),
+            StackWindowLayout::new(
+                0xFFFF_FFFF_8000_0000,
+                8,
+                0x40000,
+                GUARD,
+                EMERGENCY,
+                0x80493000,
+                TOP_SLOT
+            )
+            .unwrap_err(),
             LayoutError::WrongWindowSlot
         );
         // 窗口槽位与期望顶槽不符。
@@ -418,8 +433,16 @@ mod tests {
         );
         // 跨度超出单 vpn2 槽。
         assert_eq!(
-            StackWindowLayout::new(WINDOW, 8, 0x8000_0000, GUARD, EMERGENCY, 0x80493000, TOP_SLOT)
-                .unwrap_err(),
+            StackWindowLayout::new(
+                WINDOW,
+                8,
+                0x8000_0000,
+                GUARD,
+                EMERGENCY,
+                0x80493000,
+                TOP_SLOT
+            )
+            .unwrap_err(),
             LayoutError::SpanExceedsSlot
         );
         // 非页倍数。

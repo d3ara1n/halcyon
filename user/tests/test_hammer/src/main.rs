@@ -429,7 +429,7 @@ fn thread_spawn_race(gun: Handle) -> ! {
     if let Ok(result) = raw_spawn(parked_thread_entry, stack_pointer, 0, 0) {
         close(result.control).expect("spawn-race ThreadControl close failed");
     }
-    core::mem::forget(stack);
+    // raw stack mapping stays owned by this process address space until process drain.
     loop {
         thread::yield_now().expect("spawn-race coordinator yield failed");
     }
@@ -457,7 +457,7 @@ fn last_thread_exit_target(gun: Handle, code: i64) -> ! {
     )
     .expect("last-thread raw spawn failed");
     close(result.control).expect("last-thread ThreadControl close failed");
-    core::mem::forget(stack);
+    // raw stack mapping stays owned by this process address space until process drain.
     debug!("hammer target: last secondary thread ready");
     thread::exit(0)
 }
@@ -581,7 +581,7 @@ fn raw_thread_storm() {
         "storm probe control closed before DONE"
     );
     close(probe.control).expect("storm probe ThreadControl close failed");
-    core::mem::forget(stack);
+    // raw stack mapping stays owned by this process address space until process drain.
     debug!(
         "hammer target: thread storm passed: {} concurrent members",
         PROCESS_MAX_THREADS

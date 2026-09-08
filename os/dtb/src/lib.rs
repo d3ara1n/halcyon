@@ -14,6 +14,7 @@ extern crate alloc;
 
 use core::{fmt, str};
 
+pub mod cpu;
 pub mod memory;
 pub mod topology;
 
@@ -23,6 +24,48 @@ const FDT_END_NODE: u32 = 0x2;
 const FDT_PROP: u32 = 0x3;
 const FDT_NOP: u32 = 0x4;
 const FDT_END: u32 = 0x9;
+
+/// DTSpec 2.3.4 定义的节点运行状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeStatus {
+    Okay,
+    Disabled,
+    Reserved,
+    Failed,
+}
+
+/// `status` 必须是单个 NUL 结尾字符串且取值属于 DTSpec 接受集。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusError {
+    Malformed,
+    Unknown,
+}
+
+/// 严格解释节点 `status`；缺省等价于 `okay`。
+pub fn node_status(node: &Node<'_, '_>) -> Result<NodeStatus, StatusError> {
+    let Some(data) = node.prop("status") else {
+        return Ok(NodeStatus::Okay);
+    };
+    let value = property_string(data).ok_or(StatusError::Malformed)?;
+    match value {
+        "okay" => Ok(NodeStatus::Okay),
+        "disabled" => Ok(NodeStatus::Disabled),
+        "reserved" => Ok(NodeStatus::Reserved),
+        "fail" => Ok(NodeStatus::Failed),
+        value if value.starts_with("fail-") && value.len() > "fail-".len() => {
+            Ok(NodeStatus::Failed)
+        }
+        _ => Err(StatusError::Unknown),
+    }
+}
+
+/// 严格读取恰含一个 NUL 终止字符串的属性值。
+pub fn property_string(data: &[u8]) -> Option<&str> {
+    let value = data.strip_suffix(&[0])?;
+    (!value.contains(&0))
+        .then(|| str::from_utf8(value).ok())
+        .flatten()
+}
 
 /// 头部固定 40 字节。
 const HEADER_LEN: usize = 40;
@@ -94,7 +137,7 @@ fn validate_reservation_block(
     start: usize,
     limit: usize,
 ) -> Result<core::ops::Range<usize>, FdtError> {
-    if start < HEADER_LEN || start % 8 != 0 || start > limit {
+    if start < HEADER_LEN || !start.is_multiple_of(8) || start > limit {
         return Err(FdtError::InvalidReservationBlock);
     }
 

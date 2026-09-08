@@ -1,6 +1,6 @@
 # 生命周期监督 Authority 与失败升级政策计划
 
-> 当前 Review findings 归并后的机制计划。目标是建立可重启、可接管、可诊断的用户态监督状态机，不在 init/pm 各处逐个替换无限等待。
+> 状态：有限预算、authority 保留、失败升级与 init/pm 接管链已经完成，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。本档案记录用户态监督状态机，不把政策下沉到内核。
 
 ## 目标
 
@@ -13,14 +13,11 @@
 - manager 重启或单个监督步骤失败后，另一持有合法 authority 的管理者可接管；
 - 内核 `ProcessControl`/`JobControl` 的 CLOSED/REAPABLE 仍只表示已定义的生命周期屏障，不由用户态日志替代。
 
-## 当前问题簇
+## 当前状态（代码已完成）
 
-- `srv_init::launch_test_services` 对普通服务 spawn 失败只记录日志并继续；只有 pm 缺失才返回阶段错误。
-- `srv_init::supervise_services` 在 Drain 或 Query 失败后关闭 control 并移除监督项，可能丢失最后 authority。
-- `srv_init`、`srv_pm`、`libprocess::job_kill` 多处使用 `WAIT_TIMEOUT_INFINITE`，没有 deadline、重试预算或失败升级。
-- pm 委托域管理失败仅降级日志，init 兜底边界没有结构化记录。
+`libprocess` 提供 `SupervisionPolicy`、不可复制 `SupervisionTarget`、阶段/原因/进度 failure 与有限 `collect_process`；`job_kill` 的枚举 stall、wait、drain、query 和递归全部受默认 policy 约束，失败返还当前 Job/Process authority。init 的必选拓扑、直接监督与 root Job escalation 已接线；pm 的局部失败升级为域级 JobKill，仍失败记录 unmanaged handoff 并由 init 的独立 domain control 接管。
 
-## 最终监督状态机
+## 最终监督状态机（已实现）
 
 监督项不再只是 `(pid, control)`，而应表达策略与进度：
 
@@ -49,7 +46,7 @@ PermanentFailure / AuthorityLost / InconsistentSnapshot
 
 `Removed` 只能在 Drain Complete 且终态 Query 成功后发生。任何失败都不能以 `close(control)` 作为默认收尾。
 
-## 拓扑启动政策
+## 拓扑启动政策（已实现）
 
 启动前声明服务集合与必选/可选属性：
 
@@ -60,7 +57,7 @@ PermanentFailure / AuthorityLost / InconsistentSnapshot
 
 启动结果应携带实际拓扑与缺失/失败集合；监督循环只接受已声明集合的完整快照。
 
-## 等待与预算
+## 等待与预算（已实现）
 
 统一定义监督策略参数：
 
@@ -72,7 +69,7 @@ PermanentFailure / AuthorityLost / InconsistentSnapshot
 
 普通 `wait_many` 不再由业务代码直接传无限期限，除非该等待明确属于不可失败的协议自测并不承担系统收束职责。`libprocess::job_kill` 应接收或通过 policy 获得 deadline/budget，并在超时后返回包含进度与残留 authority 的错误。
 
-## Authority 保留与接管
+## Authority 保留与接管（已实现）
 
 - 每个监督项在 `REAPABLE`、Drain 和 Query 期间保留 control；
 - Drain/Query 返回 Busy 或暂时错误时，保留项并在下一轮重试；
@@ -100,14 +97,14 @@ PermanentFailure / AuthorityLost / InconsistentSnapshot
 
 ## 自然实施顺序
 
-1. 在 `libprocess` 定义带 deadline/budget/progress 的收束结果与策略接口；
-2. 将 `srv_init` 的服务启动改为声明式必选/可选集合和统一 stage failure；
-3. 将 `supervise_services` 改为保留 authority 的状态机，Drain/Query 失败不移除；
-4. 将 `srv_pm` 委托域收束迁移到同一 policy helper；
-5. 将 init/pm 关键无限等待替换为有限等待与重试/升级；
-6. 为 supervisor handoff、manager 重启、Job/Process 残留和预算耗尽定义协议/记录；
-7. 补 OOM、ObjectBusy、Query fault、IPI/Drain 停滞、必选服务缺失和 pm_domain 失败剧本；
-8. 运行 core/stress/release/sifive_u/acceptance 并验证失败状态可观察、authority 不丢失、最终 reset 只由政策提交。
+1. **已完成**：`libprocess` 定义带 deadline/budget/progress 与 authority owner 的收束接口；
+2. **已完成**：`srv_init` 使用声明式必选/可选集合和统一 stage failure；
+3. **已完成**：直接监督仅在 VerifiedDead 后移除，失败 target 放回集合；
+4. **已完成**：`srv_pm` 委托域迁移到同一 policy helper 与域级 escalation；
+5. **已完成**：init/pm 系统收束等待替换为有限等待，协议自测的无限等待保持明确隔离；
+6. **已完成**：Job/Process failure 携带阶段、进度和 authority，pm→init handoff 有正式日志；
+7. **已完成**：host 覆盖必选映像缺失/已见但启动失败、非法 policy 的无副作用 authority 返还；QEMU 以单次一 work unit 强制 Drain 预算耗尽并续接同一 authority，必选拓扑由公共验收锚点强制；
+8. **已完成**：core、debug stress、release core、sifive_u 与聚合 `just acceptance` 均通过；公共脚本强制检查必选拓扑、预算耗尽续接、RPC cleanup、零 abandoned stack 与最终 reset 锚点。
 
 ## 完成标准
 

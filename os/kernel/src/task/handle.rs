@@ -1,7 +1,6 @@
 //! 内核对象 Handle 表包装：类型/role/rights 校验与关闭分流。
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
@@ -103,12 +102,12 @@ impl Drop for PendingEntries {
     }
 }
 
-static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
+static NEXT_TRANSACTION: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
-pub(crate) fn transaction_token() -> u64 {
-    let token = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
-    assert!(token != 0, "Handle transaction identity exhausted");
-    token
+pub(crate) fn transaction_token() -> Result<u64, SystemCallError> {
+    NEXT_TRANSACTION
+        .allocate()
+        .ok_or(SystemCallError::ReachLimit)
 }
 
 /// 构造一项已经过对象 role 与最大 rights 校验的表项。
@@ -209,7 +208,7 @@ pub fn duplicate(
     entries
         .try_reserve(1)
         .map_err(|_| SystemCallError::OutOfMemory)?;
-    let token = transaction_token();
+    let token = transaction_token()?;
     let mut table = thread.process.handles.lock();
     entries.push(table.derive(source, rights).map_err(map_error)?);
     let reservation = table.reserve(1, token).map_err(map_error)?;
@@ -246,7 +245,7 @@ pub(crate) fn install_one(
         .try_reserve(1)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(entry);
-    let token = transaction_token();
+    let token = transaction_token()?;
     let mut table = thread.process.handles.lock();
     let reservation = table.reserve(1, token).map_err(map_error)?;
     let handle = reservation.handles()[0];

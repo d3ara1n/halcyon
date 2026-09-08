@@ -270,7 +270,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
         },
         SystemCall::MemoryUnmap => {
-            match task::proc::memory_unmap(thread, frame.x[10] as u64, frame.x[11] as u64) {
+            match task::proc::memory_unmap(thread, frame.x[10], frame.x[11]) {
                 Ok(plan) => {
                     sched::park_request_wait(plan);
                     Outcome::Wait
@@ -281,21 +281,19 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 }
             }
         }
-        SystemCall::MemoryProtect => match task::proc::memory_protect(
-            thread,
-            frame.x[10] as u64,
-            frame.x[11] as u64,
-            frame.x[12] as usize,
-        ) {
-            Ok(plan) => {
-                sched::park_request_wait(plan);
-                Outcome::Wait
+        SystemCall::MemoryProtect => {
+            match task::proc::memory_protect(thread, frame.x[10], frame.x[11], frame.x[12] as usize)
+            {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
             }
-            Err(error) => {
-                respond_error(frame, error);
-                Outcome::Completed
-            }
-        },
+        }
         SystemCall::MemoryPoolQuery => {
             respond_result(
                 frame,
@@ -393,7 +391,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             frame.x[10] as usize,
             frame.x[11] as usize,
             frame.x[12] as usize,
-            frame.x[13] as u64,
+            frame.x[13],
         ) {
             Ok(wait::WaitStart::Ready) => {
                 respond_ok(frame, 0);

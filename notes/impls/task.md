@@ -98,8 +98,11 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   shell 身份，电平不分叉）；shell 已消散时从 core 铸造新 shell 并在
   铸造点重放 REAPABLE 或 CLOSED——control 消散的进程由此接回管理
   入口（派生兑底）。递归 JobKill 是用户态政策，
-  公共实现 `libprocess::job_kill`（逐层 seal → 枚举 → 派生 kill →
-  drain → 等 CLOSED）。
+  公共实现 `libprocess::job_kill`（逐层 seal → 有限 stall 枚举 → 派生 kill →
+  有限 wait/drain/query → 等 CLOSED）。默认 policy 固定单次 wait timeout、
+  wait/drain/query 次数、单次 drain work 与 enumerate stall 上限；失败返回
+  Job/Process authority、阶段与进度，不默认 close。`collect_process` 的
+  `SupervisionTarget` 只在 Drain Complete 且 Query 核验 Dead 后关闭 control。
 
 ## 生命周期
 - **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（内嵌与
@@ -195,13 +198,11 @@ per-hart 帧。
 
 ### reserve/commit/rollback 协议
 
-Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举不可见；②单调 token
-凭据防错认（token 零值非法）；③commit/rollback 按 token 定位，结构性不可消失；HandleTable 跨 owner 发布先经
+Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举不可见；②各 identity domain 的非零单调 token
+凭据防错认，最大值发行后永久 Exhausted，不回绕；③commit/rollback 按 token 定位，结构性不可消失；HandleTable 跨 owner 发布先经
 `prepare_commit` 形成私有字段的 affine token，最终 `commit_prepared` 不返回可恢复错误；
-④全部在容器锁内完成，无分配失败路径（attach_member 的插入为锁内
-try_reserve 原子可失败，失败无副作用——协议三要素成立，第四要素由
-「失败时条目不可见」替代）。出生块由组装者经 Write 交付，无内核
-回滚面。
+④marker 的提交/回滚全部在容器锁内完成，无分配失败路径。`attach_member` 的插入是另一类锁内
+try_reserve 原子操作，失败无副作用，以“失败时条目不可见”闭合。KOID、PID/JID、AddressSpace 与事务 token 共用 `os/monotonic_id` 的耗尽机制，但各自持独立 allocator，不合并身份域；用户可达构造在发布前返回 ReachLimit。出生块由组装者经 Write 交付，无内核回滚面。
 
 ## sleep
 

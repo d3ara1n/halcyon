@@ -25,7 +25,14 @@ impl UserContext {
     /// 创建全零现场。FP 状态不存在依赖 hart 残留的 valid 状态；
     /// sp/gp/tp 等由装载方按 ABI 约定填写。
     pub fn zeroed() -> Self {
-        Self { x: [0; 32], sepc: 0, fp: FpState { f: [0; 32], fcsr: 0 } }
+        Self {
+            x: [0; 32],
+            sepc: 0,
+            fp: FpState {
+                f: [0; 32],
+                fcsr: 0,
+            },
+        }
     }
 }
 
@@ -58,7 +65,7 @@ const _: () = assert!(core::mem::offset_of!(FatalFrame, stval) == 264);
 const _: () = assert!(core::mem::offset_of!(FatalFrame, sepc) == 272);
 const _: () = assert!(core::mem::offset_of!(FatalFrame, satp) == 280);
 const _: () = assert!(core::mem::offset_of!(FatalFrame, sstatus) == 288);
-const _: () = assert!(core::mem::size_of::<FatalFrame>() % 16 == 0);
+const _: () = assert!(core::mem::size_of::<FatalFrame>().is_multiple_of(16));
 
 /// 调度循环的调用现场：ra + callee-saved s0..s11 + 尾部填充。
 ///

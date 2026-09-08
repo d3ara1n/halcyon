@@ -54,7 +54,7 @@ fn virt_layout() {
     let initfs = chosen.child("initfs").unwrap();
     let reg = initfs.prop("reg").unwrap();
     assert_eq!(cells_u64(reg, 2).unwrap(), 0xB000_0000);
-    assert_eq!(cells_u64(&reg[8..], 1).unwrap(), 0x1_0000_000);
+    assert_eq!(cells_u64(&reg[8..], 1).unwrap(), 0x1000_0000);
 
     // flash：4 tuple reg（2/2），验证多段与奇偶长度无关的推进
     let flash = root.child("flash@20000000").unwrap();
@@ -117,7 +117,7 @@ impl BlobBuilder {
         self.push_u32(0x1);
         let mut b = name.as_bytes().to_vec();
         b.push(0);
-        while b.len() % 4 != 0 {
+        while !b.len().is_multiple_of(4) {
             b.push(0);
         }
         self.struct_block.extend_from_slice(&b);
@@ -137,7 +137,7 @@ impl BlobBuilder {
         self.push_u32(data.len() as u32);
         self.push_u32(nameoff);
         self.struct_block.extend_from_slice(data);
-        while self.struct_block.len() % 4 != 0 {
+        while !self.struct_block.len().is_multiple_of(4) {
             self.struct_block.push(0xAA); // 填充字节任意，读取方必须跳过
         }
     }

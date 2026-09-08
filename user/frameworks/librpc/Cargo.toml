@@ -6,6 +6,7 @@ description = "Generic RPC framing over mailbox messages"
 edition = "2024"
 
 [dependencies]
+monotonic_id = { path = "../../../os/monotonic_id" }
 erhino_shared = { path = "../../../shared" }
 
 # 同步调用层依赖 rinlib（RISC-V ecall），仅内核目标编译；

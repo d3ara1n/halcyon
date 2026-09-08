@@ -4,7 +4,7 @@
 
 ## 当前推进门
 
-当前主线是 [`地址空间事务与进程启动发布的纵向重构`](todo-2026-09-memory-transaction-state-machine.md)。先冻结总 owner/提交/预算设计，完成地址空间全调用链与构造/Start/Ready 两个纵向单元，以及直接依赖的 authority 前置并按报告复核，再恢复本计划。
+地址空间事务、构造/Start/Ready、validated ELF、EXECUTE authority 及其它 A–E 实现项均已完成，实施记录见 [`地址空间事务与进程启动发布档案`](archived/todo-2026-09-memory-transaction-state-machine.md)。本计划继续暂停，直到当前工作树形成固定提交并由 [`Review program`](todo-2026-09-review-program.md) 完成 A–E 复核；复核通过后再恢复切片 8/9/10。
 
 切片编号 8/9/10 保留作跨文档定位，不表示可以脱离前置开工，也不允许以“到切片 10 再清理”为理由在切片 8/9 留下旧接口。每个能力单元必须连同真实消费者、失败路径、测试和旧路径删除一起交付。
 

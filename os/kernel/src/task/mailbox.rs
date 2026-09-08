@@ -78,9 +78,9 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            header: ObjectHeader::new(),
+    pub fn new() -> Result<Arc<Self>, SystemCallError> {
+        Arc::try_new(Self {
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: Spinlock::new(
                 crate::sync::ranks::MAILBOX,
                 MailboxState {
@@ -92,6 +92,7 @@ impl Mailbox {
                 },
             ),
         })
+        .map_err(|_| SystemCallError::OutOfMemory)
     }
 
     pub fn object_ref(this: &Arc<Self>) -> ObjectRef {
@@ -347,7 +348,7 @@ pub fn create(
     sender_rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let mailbox = Mailbox::new();
+    let mailbox = Mailbox::new()?;
     let object = Mailbox::object_ref(&mailbox);
     let mut entries = Vec::new();
     entries
@@ -362,7 +363,7 @@ pub fn create(
             .map_err(super::handle::map_error)?,
     );
 
-    let token = super::handle::transaction_token();
+    let token = super::handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
     let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
@@ -393,7 +394,7 @@ pub fn mint_sender(
     rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let token = super::handle::transaction_token();
+    let token = super::handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let owner_entry = table
         .get(owner, Rights::MANAGE)
@@ -441,7 +442,7 @@ pub fn make_send_once(
     rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let token = super::handle::transaction_token();
+    let token = super::handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let source_entry = table
         .get(source, Rights::DUPLICATE)
@@ -530,7 +531,10 @@ pub fn send(
     moves
         .try_reserve_exact(move_count)
         .map_err(|_| SystemCallError::OutOfMemory)?;
-    for bytes in raw_moves.chunks_exact(core::mem::size_of::<HandleMove>()) {
+    for bytes in raw_moves
+        .as_chunks::<{ core::mem::size_of::<HandleMove>() }>()
+        .0
+    {
         // SAFETY: HandleMove 仅含整数 newtype；缓冲可能不对齐，故 unaligned 读。
         let item = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<HandleMove>()) };
         moves.push((item.handle, item.rights));
@@ -623,7 +627,7 @@ pub fn receive(
         HandleRole::MailboxOwner,
     )?;
     let mailbox = concrete(&object)?;
-    let token = super::handle::transaction_token();
+    let token = super::handle::transaction_token()?;
     let (reservation, message) = {
         let mut table = thread.process.handles.lock();
         mailbox.begin_receive(&mut table, token, payload_capacity, handle_capacity)?

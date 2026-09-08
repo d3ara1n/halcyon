@@ -1,9 +1,9 @@
-//! ELF64 就地解析：ELF 头 + program header 遍历 + ISA 需求判定（host 可测）。
+//! 静态 RISC-V ELF64 的唯一 admission：头部、program headers、装载几何、
+//! 页级权限、入口与 ISA 需求一次验证（host 可测）。
 //!
-//! 只覆盖静态执行文件（ET_EXEC）的 PT_LOAD 段与用户执行需求
-//! （`e_flags` + `.riscv.attributes`，见 references/normative/
-//! riscv-psabi-v1.0/riscv-elf.adoc「Attributes」）——装载用户程序所需的最小面。
-//! 结构字段按 little-endian RISC-V ELF64 布局就地读，不拷贝。
+//! 只接受当前系统能完整解释的 ET_EXEC 面；动态链接、TLS、未知 segment 与
+//! 不可表达的权限明确拒绝。字段按 little-endian ELF64 布局就地读取，输出
+//! 同时供内核 bootstrap、用户态 launcher 与 host audit 使用。
 
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
@@ -24,11 +24,57 @@ pub struct LoadSegment {
     pub executable: bool,
 }
 
-/// 解析结果：入口地址 + 全部 PT_LOAD 段（按 vaddr 升序）。
+/// 页对齐、权限相同的连续装载区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadRun {
+    pub vaddr: u64,
+    pub memsz: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// 地址空间相关的 admission 边界。page_size 必须是二次幂，image_limit
+/// 是首个不可用于映像的虚拟地址（主栈与出生块由调用者保留在其上方）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadLimits {
+    pub page_size: u64,
+    pub image_limit: u64,
+}
+
+/// 已验证映像：调用者不得重新解释原始 program headers。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Elf {
-    pub entry: u64,
-    pub segments: alloc::vec::Vec<LoadSegment>,
+    entry: u64,
+    requirement: IsaRequirement,
+    /// 非空 PT_LOAD，保持规范要求的 vaddr 升序。
+    segments: alloc::vec::Vec<LoadSegment>,
+    /// PT_LOAD 页投影的权限并集，已拒绝 W+X。
+    runs: alloc::vec::Vec<LoadRun>,
+    /// 最高映像字节向上对齐到 page_size。
+    image_end: u64,
+}
+
+impl Elf {
+    pub const fn entry(&self) -> u64 {
+        self.entry
+    }
+
+    pub const fn requirement(&self) -> IsaRequirement {
+        self.requirement
+    }
+
+    pub fn segments(&self) -> &[LoadSegment] {
+        &self.segments
+    }
+
+    pub fn runs(&self) -> &[LoadRun] {
+        &self.runs
+    }
+
+    pub const fn image_end(&self) -> u64 {
+        self.image_end
+    }
 }
 
 /// 用户执行需求档位（notes/execution-context.md「内核与用户 ABI」）。
@@ -86,24 +132,55 @@ pub enum ElfError {
     BadMagic,
     BadClass,
     BadEndian,
+    BadVersion,
+    BadOsAbi,
     BadType,
     BadMachine,
-    BadPhoff,
+    BadHeaderSize,
+    BadProgramHeaders,
+    TooManyProgramHeaders,
+    TooManyLoadSegments,
+    UnsupportedProgramHeader,
+    BadProgramHeaderFlags,
+    BadProgramHeaderOrder,
+    BadSegmentGeometry,
+    BadSegmentAlignment,
+    UnsupportedProtection,
+    OverlappingSegments,
+    WriteExecutePage,
+    BadEntry,
+    BadLimits,
+    OutOfMemory,
+    Isa(IsaReqError),
 }
 
+const PT_NULL: u32 = 0;
 const PT_LOAD: u32 = 1;
+const PT_NOTE: u32 = 4;
+const PT_PHDR: u32 = 6;
+const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
+const PF_RWX: u32 = PF_R | PF_W | PF_X;
+const MAX_PROGRAM_HEADERS: usize = 128;
+const MAX_LOAD_SEGMENTS: usize = 64;
 
-/// 解析 ELF64 little-endian RISC-V 执行文件。
-pub fn parse(buf: &[u8]) -> Result<Elf, ElfError> {
+/// 验证 ELF64 little-endian RISC-V 静态执行映像。
+pub fn validate(buf: &[u8], limits: LoadLimits) -> Result<Elf, ElfError> {
     use core::mem::size_of;
 
     type Ehdr = [u8; 64];
     type Phdr = [u8; 56];
     const _: () = assert!(size_of::<Ehdr>() == 64 && size_of::<Phdr>() == 56);
 
+    if !limits.page_size.is_power_of_two()
+        || limits.image_limit == 0
+        || !limits.image_limit.is_multiple_of(limits.page_size)
+    {
+        return Err(ElfError::BadLimits);
+    }
     if buf.len() < size_of::<Ehdr>() {
         return Err(ElfError::TooShort);
     }
@@ -112,51 +189,283 @@ pub fn parse(buf: &[u8]) -> Result<Elf, ElfError> {
         return Err(ElfError::BadMagic);
     }
     if e[4] != 2 {
-        return Err(ElfError::BadClass); // ELF64
+        return Err(ElfError::BadClass);
     }
     if e[5] != 1 {
-        return Err(ElfError::BadEndian); // little-endian
+        return Err(ElfError::BadEndian);
     }
-    let e_type = u16_at(e, 16);
-    if e_type != 2 {
-        return Err(ElfError::BadType); // ET_EXEC
+    if e[6] != 1 || u32_at(e, 20) != 1 {
+        return Err(ElfError::BadVersion);
+    }
+    if e[7] != 0 || e[8] != 0 {
+        return Err(ElfError::BadOsAbi);
+    }
+    if u16_at(e, 16) != 2 {
+        return Err(ElfError::BadType);
     }
     if u16_at(e, 18) != 243 {
-        return Err(ElfError::BadMachine); // EM_RISCV
+        return Err(ElfError::BadMachine);
     }
+    if u16_at(e, 52) as usize != size_of::<Ehdr>() {
+        return Err(ElfError::BadHeaderSize);
+    }
+
     let entry = u64_at(e, 24);
-    let phoff = u64_at(e, 32) as usize;
+    let phoff = usize::try_from(u64_at(e, 32)).map_err(|_| ElfError::BadProgramHeaders)?;
     let phentsize = u16_at(e, 54) as usize;
     let phnum = u16_at(e, 56) as usize;
-    if phentsize != size_of::<Phdr>() {
-        return Err(ElfError::BadPhoff);
+    if phentsize != size_of::<Phdr>() || phnum == 0 {
+        return Err(ElfError::BadProgramHeaders);
     }
-    let table_end = phoff.checked_add(phnum.checked_mul(phentsize).ok_or(ElfError::BadPhoff)?)
-        .ok_or(ElfError::BadPhoff)?;
+    if phnum > MAX_PROGRAM_HEADERS {
+        return Err(ElfError::TooManyProgramHeaders);
+    }
+    let table_end = phoff
+        .checked_add(
+            phnum
+                .checked_mul(phentsize)
+                .ok_or(ElfError::BadProgramHeaders)?,
+        )
+        .ok_or(ElfError::BadProgramHeaders)?;
     if table_end > buf.len() {
-        return Err(ElfError::BadPhoff);
+        return Err(ElfError::BadProgramHeaders);
     }
 
     let mut segments = alloc::vec::Vec::new();
-    for i in 0..phnum {
-        let p: &Phdr = buf[phoff + i * phentsize..][..size_of::<Phdr>()]
+    segments
+        .try_reserve_exact(MAX_LOAD_SEGMENTS)
+        .map_err(|_| ElfError::OutOfMemory)?;
+    let mut previous_end = None;
+    let mut seen_load = false;
+    let mut phdr = None;
+    for index in 0..phnum {
+        let p: &Phdr = buf[phoff + index * phentsize..][..size_of::<Phdr>()]
             .try_into()
             .unwrap();
-        if u32_at(p, 0) != PT_LOAD {
+        let kind = u32_at(p, 0);
+        // gABI 明定 PT_NULL 除类型外所有成员均未定义，必须直接忽略。
+        if kind == PT_NULL {
             continue;
         }
-        segments.push(LoadSegment {
-            vaddr: u64_at(p, 16),
-            offset: u64_at(p, 8),
-            filesz: u64_at(p, 32),
-            memsz: u64_at(p, 40),
-            readable: u32_at(p, 4) & PF_R != 0,
-            writable: u32_at(p, 4) & PF_W != 0,
-            executable: u32_at(p, 4) & PF_X != 0,
+        let flags = u32_at(p, 4);
+        if flags & !PF_RWX != 0 {
+            return Err(ElfError::BadProgramHeaderFlags);
+        }
+        let offset = u64_at(p, 8);
+        let vaddr = u64_at(p, 16);
+        let filesz = u64_at(p, 32);
+        let memsz = u64_at(p, 40);
+        let align = u64_at(p, 48);
+        if align > 1 && (!align.is_power_of_two() || vaddr % align != offset % align) {
+            return Err(ElfError::BadSegmentAlignment);
+        }
+        match kind {
+            PT_LOAD => {
+                seen_load = true;
+                if segments.len() == MAX_LOAD_SEGMENTS {
+                    return Err(ElfError::TooManyLoadSegments);
+                }
+                if memsz == 0 || filesz > memsz {
+                    return Err(ElfError::BadSegmentGeometry);
+                }
+                let file_end = offset
+                    .checked_add(filesz)
+                    .ok_or(ElfError::BadSegmentGeometry)?;
+                if usize::try_from(file_end).map_or(true, |end| end > buf.len()) {
+                    return Err(ElfError::BadSegmentGeometry);
+                }
+                let end = vaddr
+                    .checked_add(memsz)
+                    .ok_or(ElfError::BadSegmentGeometry)?;
+                if end > limits.image_limit || vaddr % limits.page_size != offset % limits.page_size
+                {
+                    return Err(ElfError::BadSegmentAlignment);
+                }
+                if previous_end.is_some_and(|previous| vaddr < previous) {
+                    return Err(ElfError::OverlappingSegments);
+                }
+                previous_end = Some(end);
+                let readable = flags & PF_R != 0;
+                let writable = flags & PF_W != 0;
+                let executable = flags & PF_X != 0;
+                if flags == 0 || writable && !readable {
+                    return Err(ElfError::UnsupportedProtection);
+                }
+                segments.push(LoadSegment {
+                    vaddr,
+                    offset,
+                    filesz,
+                    memsz,
+                    readable,
+                    writable,
+                    executable,
+                });
+            }
+            PT_NOTE => validate_file_segment(buf, offset, filesz)?,
+            PT_PHDR => {
+                let table_bytes = (phnum * phentsize) as u64;
+                if seen_load
+                    || phdr.is_some()
+                    || flags != PF_R
+                    || offset != phoff as u64
+                    || filesz != table_bytes
+                    || memsz != table_bytes
+                {
+                    return Err(ElfError::BadProgramHeaderOrder);
+                }
+                validate_file_segment(buf, offset, filesz)?;
+                phdr = Some((vaddr, offset, filesz));
+            }
+            PT_GNU_STACK => {
+                if filesz != 0 || memsz != 0 || flags & PF_X != 0 {
+                    return Err(ElfError::UnsupportedProtection);
+                }
+            }
+            PT_RISCV_ATTRIBUTES => {
+                if flags != PF_R {
+                    return Err(ElfError::UnsupportedProtection);
+                }
+                validate_file_segment(buf, offset, filesz)?;
+            }
+            _ => return Err(ElfError::UnsupportedProgramHeader),
+        }
+    }
+    if segments.is_empty() {
+        return Err(ElfError::BadSegmentGeometry);
+    }
+    if let Some((phdr_vaddr, phdr_offset, phdr_size)) = phdr {
+        let covered = segments.iter().any(|segment| {
+            segment.offset <= phdr_offset
+                && segment
+                    .offset
+                    .checked_add(segment.filesz)
+                    .is_some_and(|end| phdr_offset + phdr_size <= end)
+                && segment.vaddr.checked_add(phdr_offset - segment.offset) == Some(phdr_vaddr)
+        });
+        if !covered {
+            return Err(ElfError::BadSegmentGeometry);
+        }
+    }
+    let entry_valid = segments.iter().any(|segment| {
+        segment.executable
+            && segment
+                .vaddr
+                .checked_add(segment.filesz)
+                .is_some_and(|end| segment.vaddr <= entry && entry < end)
+    });
+    if !entry_valid {
+        return Err(ElfError::BadEntry);
+    }
+
+    let (runs, image_end) = build_runs(&segments, limits.page_size)?;
+    let requirement = isa_requirement(buf).map_err(ElfError::Isa)?;
+    Ok(Elf {
+        entry,
+        requirement,
+        segments,
+        runs,
+        image_end,
+    })
+}
+
+fn validate_file_segment(buf: &[u8], offset: u64, filesz: u64) -> Result<(), ElfError> {
+    let end = offset
+        .checked_add(filesz)
+        .ok_or(ElfError::BadSegmentGeometry)?;
+    if usize::try_from(end).map_or(true, |end| end > buf.len()) {
+        return Err(ElfError::BadSegmentGeometry);
+    }
+    Ok(())
+}
+
+fn build_runs(
+    segments: &[LoadSegment],
+    page_size: u64,
+) -> Result<(alloc::vec::Vec<LoadRun>, u64), ElfError> {
+    let mut boundaries = alloc::vec::Vec::new();
+    boundaries
+        .try_reserve_exact(segments.len() * 2)
+        .map_err(|_| ElfError::OutOfMemory)?;
+    let mut image_end = 0;
+    for segment in segments {
+        let start = segment.vaddr / page_size * page_size;
+        let end = align_up(
+            segment
+                .vaddr
+                .checked_add(segment.memsz)
+                .ok_or(ElfError::BadSegmentGeometry)?,
+            page_size,
+        )?;
+        boundaries.push(start);
+        boundaries.push(end);
+        image_end = image_end.max(end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut runs: alloc::vec::Vec<LoadRun> = alloc::vec::Vec::new();
+    runs.try_reserve_exact(boundaries.len().saturating_sub(1))
+        .map_err(|_| ElfError::OutOfMemory)?;
+    for window in boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        let mut flags = 0;
+        for segment in segments {
+            let segment_start = segment.vaddr / page_size * page_size;
+            let segment_end = align_up(
+                segment
+                    .vaddr
+                    .checked_add(segment.memsz)
+                    .ok_or(ElfError::BadSegmentGeometry)?,
+                page_size,
+            )?;
+            if segment_start < end && start < segment_end {
+                if segment.readable {
+                    flags |= PF_R;
+                }
+                if segment.writable {
+                    flags |= PF_W;
+                }
+                if segment.executable {
+                    flags |= PF_X;
+                }
+            }
+        }
+        if flags == 0 {
+            continue;
+        }
+        if flags & (PF_W | PF_X) == PF_W | PF_X {
+            return Err(ElfError::WriteExecutePage);
+        }
+        let writable = flags & PF_W != 0;
+        let executable = flags & PF_X != 0;
+        // gABI 允许系统把 X-only 段提升为 R+X；当前页表保护恰采用该上界。
+        let readable = flags & PF_R != 0 || executable;
+        if let Some(previous) = runs.last_mut()
+            && previous.vaddr + previous.memsz == start
+            && previous.readable == readable
+            && previous.writable == writable
+            && previous.executable == executable
+        {
+            previous.memsz += end - start;
+            continue;
+        }
+        runs.push(LoadRun {
+            vaddr: start,
+            memsz: end - start,
+            readable,
+            writable,
+            executable,
         });
     }
-    segments.sort_by_key(|s| s.vaddr);
-    Ok(Elf { entry, segments })
+    Ok((runs, image_end))
+}
+
+fn align_up(value: u64, align: u64) -> Result<u64, ElfError> {
+    value
+        .checked_add(align - 1)
+        .map(|value| value / align * align)
+        .ok_or(ElfError::BadSegmentGeometry)
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
@@ -182,8 +491,8 @@ const EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x0004;
 const EF_RISCV_FLOAT_ABI_QUAD: u32 = 0x0006;
 const EF_RISCV_RVE: u32 = 0x0008;
 const EF_RISCV_TSO: u32 = 0x0010;
-/// 标准软件不得置位的保留位（bits 5-23）。
-const EF_RISCV_RESERVED: u32 = 0x00FF_FFE0;
+/// 本系统未定义 bits 5-31 的保留/非标准 ABI 扩展，全部 fail closed。
+const EF_RISCV_UNSUPPORTED: u32 = 0xFFFF_FFE0;
 
 const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 const TAG_FILE: u64 = 1;
@@ -198,7 +507,7 @@ const BASE_EXTENSIONS: [&str; 11] = [
 const D64_EXTENSIONS: [&str; 2] = ["f", "d"];
 
 /// 判定 ELF 的用户执行需求。`buf` 为完整 ELF 映像。
-pub fn isa_requirement(buf: &[u8]) -> Result<IsaRequirement, IsaReqError> {
+fn isa_requirement(buf: &[u8]) -> Result<IsaRequirement, IsaReqError> {
     if buf.len() < 64 {
         return Err(IsaReqError::MalformedAttributes);
     }
@@ -209,7 +518,7 @@ pub fn isa_requirement(buf: &[u8]) -> Result<IsaRequirement, IsaReqError> {
     let shnum = u16_at(buf, 60) as usize;
 
     // ---- e_flags 契约面（riscv-elf.adoc「Layout of e_flags」）----
-    if e_flags & EF_RISCV_RESERVED != 0 {
+    if e_flags & EF_RISCV_UNSUPPORTED != 0 {
         return Err(IsaReqError::BadFlags);
     }
     if e_flags & EF_RISCV_RVE != 0 {
@@ -277,11 +586,8 @@ pub fn isa_requirement(buf: &[u8]) -> Result<IsaRequirement, IsaReqError> {
 /// 剥离 token 尾部的版本后缀（`\d+p\d+` 可重复，如 `2p1`、`1p12_0p7p1`）。
 fn strip_version(token: &str) -> Option<&str> {
     let mut s = token;
-    loop {
-        // 结尾是 digit p digit* 的模式：找最后一个非版本边界
-        let Some(last_digit_end) = s.rfind(|c: char| c.is_ascii_digit()).map(|i| i + 1) else {
-            break;
-        };
+    // 结尾是 digit p digit* 的模式：找最后一个非版本边界
+    while let Some(last_digit_end) = s.rfind(|c: char| c.is_ascii_digit()).map(|i| i + 1) {
         if last_digit_end != s.len() {
             break;
         }
@@ -315,7 +621,16 @@ fn find_arch_string(
     shentsize: usize,
     shnum: usize,
 ) -> Result<&str, IsaReqError> {
-    if shentsize < 64 || shoff.checked_add(shnum.checked_mul(shentsize).ok_or(IsaReqError::MalformedAttributes)?).ok_or(IsaReqError::MalformedAttributes)? > buf.len() {
+    if shentsize < 64
+        || shoff
+            .checked_add(
+                shnum
+                    .checked_mul(shentsize)
+                    .ok_or(IsaReqError::MalformedAttributes)?,
+            )
+            .ok_or(IsaReqError::MalformedAttributes)?
+            > buf.len()
+    {
         return Err(IsaReqError::MalformedAttributes);
     }
     for i in 0..shnum {
@@ -326,7 +641,11 @@ fn find_arch_string(
         let off = u64_at(sh, 24) as usize;
         let size = u64_at(sh, 32) as usize;
         let data = buf
-            .get(off..off.checked_add(size).ok_or(IsaReqError::MalformedAttributes)?)
+            .get(
+                off..off
+                    .checked_add(size)
+                    .ok_or(IsaReqError::MalformedAttributes)?,
+            )
             .ok_or(IsaReqError::MalformedAttributes)?;
         return parse_attributes(data);
     }
@@ -358,7 +677,9 @@ fn parse_attributes(data: &[u8]) -> Result<&str, IsaReqError> {
             return Err(IsaReqError::MalformedAttributes);
         }
         let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        let end = tag_pos.checked_add(size).ok_or(IsaReqError::MalformedAttributes)?;
+        let end = tag_pos
+            .checked_add(size)
+            .ok_or(IsaReqError::MalformedAttributes)?;
         if end > data.len() {
             return Err(IsaReqError::MalformedAttributes);
         }
@@ -377,14 +698,21 @@ fn arch_from_subsection(mut body: &[u8]) -> Result<&str, IsaReqError> {
         let (tag, next) = uleb128(body, 0).ok_or(IsaReqError::MalformedAttributes)?;
         body = &body[next..];
         if tag == TAG_RISCV_ARCH {
-            let len = body.iter().position(|&b| b == 0).ok_or(IsaReqError::MalformedAttributes)?;
-            return core::str::from_utf8(&body[..len]).map_err(|_| IsaReqError::MalformedAttributes);
+            let len = body
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or(IsaReqError::MalformedAttributes)?;
+            return core::str::from_utf8(&body[..len])
+                .map_err(|_| IsaReqError::MalformedAttributes);
         }
         if tag % 2 == 0 {
             let (_, next) = uleb128(body, 0).ok_or(IsaReqError::MalformedAttributes)?;
             body = &body[next..];
         } else {
-            let len = body.iter().position(|&b| b == 0).ok_or(IsaReqError::MalformedAttributes)?;
+            let len = body
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or(IsaReqError::MalformedAttributes)?;
             body = &body[len + 1..];
         }
     }

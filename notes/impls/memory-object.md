@@ -16,7 +16,7 @@
 
 三个系统调用接入对象生命周期：
 
-- `MemoryObjectCreate(0x55)`：从当前进程绑定池取得固定长度 backing（长度按页取整后冻结，受 `MEMORY_OBJECT_MAX_PAGES` 硬上限约束），返回完整 rights 的 Handle。rights 上限是 `MAP | READ | WRITE | WAIT | MANAGE | DUPLICATE | TRANSIT | GRANT`；MemoryObject 没有 owner role，全部 Handle 是同一 capability，只以 rights 分权。
+- `MemoryObjectCreate(0x55)`：从当前进程绑定池取得固定长度 backing（长度按页取整后冻结，受 `MEMORY_OBJECT_MAX_PAGES` 硬上限约束），返回完整 rights 的 Handle。rights 上限是 `MAP | READ | WRITE | WAIT | MANAGE | DUPLICATE | TRANSIT | GRANT | EXECUTE`；MemoryObject 没有 owner role，全部 Handle 是同一 capability，只以 rights 分权。
 - `MemoryObjectQuery(0x56)`：`READ` 权下读固定宽快照（identity/bytes/write_views/state）。identity 只作诊断。
 - `MemoryObjectSeal(0x57)`：`MANAGE` 权下单向请求可执行发布。幂等，不阻塞也不登记等待者；完成经 WaitMany 观察 `EXECUTABLE` 电平（`1 << 5`），任意数量等待者复用通用等待面。
 
@@ -44,8 +44,13 @@ permit 的真值链：对象状态机铸造 → AddressSpace 事务持有（rese
 
 Tunnel 的 `Connection` 持 `Arc<MemoryObjectCore>`，两侧 RW view 经 `authorize_write_view` 与写许可线性化于对象锁；对象 backing 由创建进程绑定的 MemoryPool 支付。Tunnel view 是 object-owned lease（authority 归对象，只能经对象关闭撤销），与进程自有 view 走同一事务核、同一 permit 归还路径，只在 `MapAuthority` 维度不同。
 
+## 用户态 owner
+
+rinlib 的 `MemoryObject`/`MemoryPool` typed owner 只接纳当前进程已安装的对应 leaf role，安全创建/派生保持唯一 Handle 所有权；该 role 的内核 close 不含 Tunnel 异步路径。显式 `close(self)` 与 Drop 因而共用不可失败 leaf-close 边界，不再伪造一个可重试错误分支；close 错误只表示 unsafe `from_handle` 契约或内核 HandleTable 不变量破坏。
+
 ## 验证入口
 
 - host：`os/memory_space/tests/planner.rs` 覆盖对象授权、WritePermit、seal 状态推进、对象 offset、permit mismatch 与逐项 retire。
 - `srv_init` core 验收（`test_memory_mapping` 尾段）：创建 → 快照 → 同对象 RW/RO 双 view → Handle 先关仍可访问 → 部分撤销 → Pool charge 守恒。
-- 剩余覆盖缺口（登记于 review 计划，不阻塞收口）：seal 与 `EXECUTABLE` 电平的 WaitMany 观察无验收负载、跨进程 view 未覆盖、rights 拒绝矩阵未覆盖、`MemoryObjectQuery` 的 state 字段仅在 Mutable 断言。
+- `srv_init` capability 矩阵覆盖 Mutable 状态拒绝 RX、缺 `EXECUTE` 的派生 Handle 返回 `RightsDenied`、原 Handle 关闭后具 `MAP|READ|EXECUTE` 的派生 Handle 仍可完成 RX Map/Unmap，并观察 Seal 后 `EXECUTABLE` 电平与 Query 状态。
+- 剩余能力边界由数据面计划拥有：公共对象跨进程 view 与多页 Tunnel/RNL2 尚未实现，不属于当前单进程 MemoryObject authority 闭包。

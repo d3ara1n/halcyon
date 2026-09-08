@@ -290,7 +290,8 @@ const MEMORY_OBJECT_RIGHTS: erhino_shared::object::Rights = {
             | Rights::MANAGE.raw()
             | Rights::DUPLICATE.raw()
             | Rights::TRANSIT.raw()
-            | Rights::GRANT.raw(),
+            | Rights::GRANT.raw()
+            | Rights::EXECUTE.raw(),
     )
 };
 
@@ -478,7 +479,7 @@ pub(crate) fn map_view(
     let required = match protection {
         Protection::ReadOnly => Rights::MAP | Rights::READ,
         Protection::ReadWrite => Rights::MAP | Rights::READ | Rights::WRITE,
-        Protection::ReadExecute => Rights::MAP | Rights::READ,
+        Protection::ReadExecute => Rights::MAP | Rights::READ | Rights::EXECUTE,
     };
     let object = resolve(thread, handle, required)?;
     let core = Arc::clone(object.core());
@@ -527,8 +528,5 @@ pub(crate) fn map_view(
             return Err(SystemCallError::from(failure.error));
         }
     };
-    match super::proc::finish_running_map(thread, process, plan) {
-        Ok(wait) => Ok(wait),
-        Err(error) => Err(error),
-    }
+    super::proc::finish_running_map(thread, process, plan)
 }

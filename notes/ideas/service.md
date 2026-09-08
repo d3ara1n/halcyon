@@ -29,3 +29,11 @@ Absent -> Starting -> Ready(instance, protocol, endpoint) -> Draining -> Absent
 只有 Ready record 可供新客户端发现。服务退出关闭 owner，现有 sender 观察 `CLOSED`；目录清理旧 instance 后才发布替代者。客户端可在 CLOSED 后重新发现，但是否重试取决于协议幂等语义。
 
 撤销名称只阻止新发现，不追溯销毁已授 capability。需要主动撤销时，服务删除 badge 对应 GrantState、使用 lease/session 或代理层；不以 PID 重用模拟撤销。
+
+## 监督与接管
+
+系统配置必须把启动项声明为必选或可选。必选服务的映像缺失、构造失败或授权失败使整组启动失败，不能进入看似正常的服务拓扑；可选项失败则形成显式 Degraded 记录。launcher 只有在必选集合完整发布后才能宣布 stage Ready。
+
+监督 authority 在目标完成 Drain 且终态快照核验成功前不得关闭。每次等待、Drain、Query 与枚举停滞都受 policy 的 deadline、工作预算和重试次数约束；预算耗尽返回当前阶段、已完成工作与仍持 control 的 owner。局部监督者可以重试或把该 owner 连同进度交给上级；若目标仍在 Job 成员表内，上级也可用保留的 JobControl 重新派生 control 并执行整域收束。
+
+委托管理不消除根接管权。子域管理者持一份域内 JobControl，root supervisor 保留另一份独立 control；前者失败时停止关闭残留 authority并发布 handoff/unmanaged 诊断，后者按自己的 policy 接管。内核只发布 REAPABLE/CLOSED 与有界 Drain，不实现重启、deadline 或递归 JobKill。

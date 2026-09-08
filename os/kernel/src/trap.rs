@@ -73,10 +73,10 @@ unsafe extern "C" fn handle_user_trap(
 
     // 终止吸收：kill 先行冻结终因后，目标线程在任何 trap 入口都不再
     // 返回用户态（IPI 到达、量子耗尽、异常均在此汇合）。
-    if let Some(t) = thread {
-        if t.process.lifecycle.is_terminating() {
-            return Outcome::Killed as usize;
-        }
+    if let Some(t) = thread
+        && t.process.lifecycle.is_terminating()
+    {
+        return Outcome::Killed as usize;
     }
 
     let is_interrupt = scause >> 63 == 1;

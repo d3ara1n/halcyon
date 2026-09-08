@@ -1,6 +1,6 @@
 # Token、Generation 与 Epoch 身份边界收口计划
 
-> 当前 Review findings 的机制归并计划。只处理各类 token/generation/epoch 的身份域、回绕与耗尽语义；不重复事务状态机、启动 admission 或对象 capability 的 owner 真值。
+> 状态：各 identity domain、generation 退休与耗尽语义已经完成，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。本档案只记录 token/generation/epoch 的身份域，不重复事务状态机、启动 admission 或对象 capability 的 owner 真值。
 
 ## 目标
 
@@ -12,21 +12,17 @@
 - 耗尽时在状态污染前明确拒绝或永久退休；
 - token 对外暴露的字段只作诊断，真正校验由不可伪造的内部身份完成。
 
-## 当前问题簇
+## 当前状态（代码已完成）
 
-### Remote Call token
+`os/monotonic_id` 统一非零原子身份的耗尽语义：每个 domain 仍持独立 allocator，最大值最后发行一次后进入永久 Exhausted，后续申请不改状态。KOID、PID/JID、AddressSpace、Handle transaction、Job member/child、Remote/work-debt table、MemoryPool owner、rinlib MemoryMap cookie 与 librpc txid 已迁移；用户可达创建/提交入口在发布前返回 `ReachLimit`。
 
-`os/remote_call` 的 `Reservation`/`FinishToken` 只携带 `(target, slot, generation)`；`RemoteCalls::new` 为 public，`entry_mut` 不校验 token 所属表实例。当前内核只有一个全局表，实际跨表误用暂不可达，但纯逻辑 API 没有结构性防误用。
-
-### Handle/Job/work reservation token
-
-内核多个容器各自使用全局 `AtomicU64`：Handle transaction、Job member、deferred work。多数只拒绝零值，回绕后可能重新使用仍存 token。容器内部当前依靠锁内短事务和 `expect` 证明错配不可达，但没有统一耗尽策略。
+Remote Call 与 work-debt 的 reservation/finish token 均携带 `TableId`，跨表 cancel/publish/requeue/finish 在定位 slot 前拒绝，并原样返还 affine token/value；槽 generation 到最大值后永久 Retired。HandleTable 与 lifecycle member slot 保持相同退休纪律，Ready 继续使用保活 capacity core 而非整数 token。
 
 Ready 的来源校验由 `ready_queue::Admission` 保活的容量 core 和不可 Clone 的 `Admitted<T>` 承担，enqueue 以 core identity 拒绝跨队列 owner；该面不存在单调 token/回绕待办。实际容量与存量加法在准入前检查，随调度全寿命纵向机制验证，不增加一个平行 identity 真值。
 
-### AddressSpace epoch
+### AddressSpace epoch（已完成）
 
-`publish_epochs` 使用 `fetch_add` 后再 `checked_add`；达到 `u64::MAX` 时原子已环回为零，随后才 panic。现实中不可达，但违反“状态污染前拒绝”的边界原则。
+`publish_epochs` 使用 CAS 门禁，任一 epoch 达最大值时在 PTE/ledger Commit 前拒绝，不先写零；稳定 AddressSpace identity 也改由永久耗尽的 `AtomicIdUsize` 铸造。
 
 ### Hart raw-id / slot identity
 
@@ -72,9 +68,9 @@ Commit 前使用不污染状态的最大值门禁：只有确认旧 epoch 小于
 
 先盘点身份产生点、验证点与 owner，冻结不可回绕和错误域拒绝策略，再按凭据的完整消费链实施：
 
-1. **MemoryChange 凭据链**：Remote/work token、AddressSpace epoch、内核 reserve/commit/abort/finish 与 host/真实接线测试一起迁移。与内存事务计划单元一共用交付边界，不先改纯逻辑 crate 再 adapter 接回旧调用者，也不把 epoch 留到事务完成后补。
-2. **进程发布凭据链**：Handle pin/consume、Job member 及 Start/Bootstrap 使用点一起闭合，与构造单元二同步。各身份仍由自己的容器验证，不建立跨领域全局 token 真值。
-3. **其它独立消费者**：按各自完整 reserve→consume/abort 生命周期迁移，测试跨实例、错误 owner/phase、最大值和槽退休；当单元完成时删除旧 helper 和 fallback。
+1. **MemoryChange 凭据链（已完成）**：Remote/work token、AddressSpace identity/epoch、内核 reserve/commit/abort/finish 与 host/真实接线测试已一起迁移。与内存事务计划单元一共用交付边界，不先改纯逻辑 crate 再 adapter 接回旧调用者，也不把 epoch 留到事务完成后补。
+2. **进程发布凭据链（已完成）**：Handle pin/consume、Job member、PID/JID、KOID 及 Start/Bootstrap 使用点已一起闭合。各身份仍由自己的容器验证，不建立跨领域全局 token 真值。
+3. **其它独立消费者（已完成）**：MemoryPool owner、MemoryMap cookie 与 RPC txid 已迁移；host 测试覆盖并发唯一性、最大值耗尽、跨实例 owner 返还与槽永久退休。
 
 raw HartId/HartSlot 由 admission 计划提供 canonical 输入，本计划只验证运行期凭据没有混淆身份。每个单元自带 host debug/release 和所需多 hart 验证，不把测试与删除推迟到所有容器改完之后。
 

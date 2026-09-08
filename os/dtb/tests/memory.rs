@@ -144,6 +144,25 @@ fn disabled_memory_and_reserved_children_are_ignored() {
     assert!(map.reservations().is_empty());
 }
 
+#[test]
+fn rejects_unknown_or_malformed_memory_status() {
+    for (status, expected) in [
+        (b"ok\0".as_slice(), MemoryMapError::UnknownStatus),
+        (b"okay".as_slice(), MemoryMapError::MalformedStatus),
+    ] {
+        let mut b = base_tree();
+        b.begin("memory@80000000");
+        b.prop_str("device_type", "memory");
+        b.prop("status", status);
+        b.prop("reg", &tuple(0x8000_0000, 0x4000));
+        b.end();
+        b.end();
+        let blob = b.finish();
+        let fdt = Fdt::new(&blob).unwrap();
+        assert_eq!(parse::<4, 4>(&fdt, PAGE_SIZE).err().unwrap(), expected);
+    }
+}
+
 fn reserved_error(property: &str, data: &[u8]) -> MemoryMapError {
     let mut b = base_tree();
     b.begin("memory@80000000");

@@ -19,6 +19,13 @@ static PARENT_PID: AtomicU64 = AtomicU64::new(0);
 /// # Panics
 /// 块指针为空、可信长度不足或不匹配、魔数/版本不符、区段几何不自洽、
 /// reserved 非零时 panic，进程经运行时 panic 路径干净退出。
+#[cfg_attr(
+    not(target_arch = "riscv64"),
+    expect(
+        dead_code,
+        reason = "host tests do not execute the target startup entry"
+    )
+)]
 pub(crate) fn init(block: *const u8, block_len: usize) {
     assert!(!block.is_null(), "null startup block");
     // SAFETY: a0/a1 由内核 launch 同时设置并覆盖完整只读映射；运行时只读。

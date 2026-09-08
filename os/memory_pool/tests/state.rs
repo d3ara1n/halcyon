@@ -187,8 +187,7 @@ fn depth_limit_is_owned_by_the_state_machine() {
 #[test]
 fn forgotten_reservation_only_leaks_quota() {
     let mut pool = PoolState::root(id(1), 2).unwrap();
-    let reservation = pool.reserve_charge(1).unwrap();
-    core::mem::forget(reservation);
+    let _forgotten_reservation = pool.reserve_charge(1).unwrap();
     assert_eq!(pool.snapshot().available, 1);
     assert_eq!(pool.snapshot().reserved, 1);
     assert!(pool.reserve_charge(2).is_err());

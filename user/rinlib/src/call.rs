@@ -206,7 +206,10 @@ pub(crate) unsafe fn sys_memory_object_seal(object: Handle) -> SystemCallResult<
     sys_call(SystemCall::MemoryObjectSeal, object.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
-// returns nothing
+/// 终止当前线程；成功调用不返回用户代码。
+///
+/// # Safety
+/// 调用者不得依赖成功返回后的任何栈上或线程局部资源。
 pub unsafe fn sys_exit(code: ExitCode) -> SystemCallResult<()> {
     sys_call(SystemCall::Exit, code as usize, 0, 0, 0).map(|_| ())
 }
@@ -672,7 +675,10 @@ pub unsafe fn sys_notification_take(
     .map(|_| ())
 }
 
-// 当前线程睡眠指定毫秒（异步 syscall：内核登记期限，到期唤醒）
+/// 当前线程睡眠指定毫秒（异步 syscall：内核登记期限，到期唤醒）。
+///
+/// # Safety
+/// 调用者必须保证阻塞期间没有仅由当前执行点临时保活的跨调用借用。
 pub unsafe fn sys_sleep(ms: u64) -> SystemCallResult<()> {
     sys_call(SystemCall::Sleep, ms as usize, 0, 0, 0).map(|_| ())
 }

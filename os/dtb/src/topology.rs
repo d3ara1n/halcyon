@@ -6,7 +6,7 @@
 //! 分配与 affinity 策略属于内核（见 notes/execution-context.md「身份、
 //! 能力与拓扑」）。
 
-use alloc::{vec::Vec};
+use alloc::vec::Vec;
 
 use crate::Node;
 
@@ -96,7 +96,9 @@ fn walk(
 pub fn cpu_phandle_hartids(cpus: &Node<'_, '_>, address_cells: usize) -> Vec<(u32, u64)> {
     let mut map = Vec::new();
     for node in cpus.children() {
-        let is_cpu = node.name().is_ok_and(|n| n.split('@').next() == Some("cpu"));
+        let is_cpu = node
+            .name()
+            .is_ok_and(|n| n.split('@').next() == Some("cpu"));
         if !is_cpu {
             continue;
         }

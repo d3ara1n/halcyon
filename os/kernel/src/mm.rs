@@ -1,10 +1,10 @@
 //! 内核地址空间与启动切换（见 notes/impls/mm.md「内核地址空间与启动协议」）。
 //!
 //! 汇编侧机构：`_start` 在 bare satp 下写跳板 root 表（DRAM 槽 identity
-//! + 高半区别名）开 MMU 跳高半区；本模块在高半区构建正式内核页表
-//! （静态 root + 直映射 mega 项 + 栈窗口子树）并切换，`KERNEL_SATP`
-//! 经 registry 填入 record，secondary 的 `_enter_hart_high` 从 record
-//! 加载同一张表。
+//! 及高半区别名）开 MMU 跳高半区；本模块在高半区构建正式内核页表
+//!   （静态 root + 直映射 mega 项 + 栈窗口子树）并切换，`KERNEL_SATP`
+//!   经 registry 填入 record，secondary 的 `_enter_hart_high` 从 record
+//!   加载同一张表。
 //!
 //! 页表模式当前固定 Sv39；按 DTB mmu-type 自动选式是后续工作
 //! （见 notes/impls/mm.md「页表模式选择」）。
@@ -252,7 +252,7 @@ fn direct_map_contains(pa: usize) -> bool {
 /// entry 设施，只撤叶、不回收表。
 pub(crate) fn retire_transition_range(start_pa: usize, end_pa: usize) {
     assert!(
-        start_pa < end_pa && start_pa % PAGE_SIZE == 0 && end_pa % PAGE_SIZE == 0,
+        start_pa < end_pa && start_pa.is_multiple_of(PAGE_SIZE) && end_pa.is_multiple_of(PAGE_SIZE),
         "transition retirement range is not page aligned"
     );
     let root_pa = external::transition_root_pa();
@@ -381,7 +381,7 @@ pub fn init(board: &BoardInfo) {
     let direct_vpn_base = DIRECT_VPN2_BASE * pages_at(2);
     for range in board.direct_map_regions() {
         assert!(
-            range.start % PAGE_SIZE == 0 && range.len % PAGE_SIZE == 0,
+            range.start.is_multiple_of(PAGE_SIZE) && range.len.is_multiple_of(PAGE_SIZE),
             "kernel direct-map range is not page aligned"
         );
         mapper
@@ -393,7 +393,6 @@ pub fn init(board: &BoardInfo) {
             )
             .unwrap_or_else(|error| panic!("kernel direct-map construction failed: {error:?}"));
     }
-    drop(mapper);
 
     let satp = (SV39 << 60) | root.0;
     map_stack_window();

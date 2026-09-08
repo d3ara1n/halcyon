@@ -10,9 +10,9 @@
 |---|---|---|---|
 | hart 私有 | 单个 hart | tp 指针，无锁 | 执行点（当前线程、域指针、trap 锚）、hart 状态 |
 | 对象私有 | 进程/线程 | 所属对象的锁、Arc 引用计数 | 内存布局、邮箱、子进程列表 |
-| 全局 | 全系统 | `OnceLock` + Spinlock 粗锁 | 调度域、帧分配器、PID/JobId 分配器 |
+| 全局 | 全系统 | `OnceLock`、原子终态与 Spinlock 粗锁 | RuntimeGate、调度域、帧分配器、identity allocators |
 
-当前冷路径使用粗粒度锁；调度域内公平类是共享单锁 FIFO。per-hart timeout queue 已按唤醒所有权拆分，HandleTable 与对象状态仍由各对象锁保护。
+当前冷路径使用粗粒度锁；调度域内公平类是共享单锁 FIFO。`os/runtime_gate` 是无锁的全局启动终态，只允许 `Preparing -> Ready | Failed`，具体发布边界由 [`execution-context.md`](execution-context.md) 记录。per-hart timeout queue 已按唤醒所有权拆分，HandleTable 与对象状态仍由各对象锁保护。
 
 就绪队列不在 hart 私有层——它是调度域的共享容器（结构见 `task.md`「调度」），同域 hart 经域容器锁竞争；队列结构与策略封装在调度类内可替换。
 
@@ -101,4 +101,4 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 ## 进程容器与 PID
 
-内核没有全局进程表：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 由 `AtomicU64` 单调分配器分配、不复用；它们不构成全局操作入口。PID 是所属 Job 直接进程成员表的键，JobId 是直接 child Job 表的键；两者也作为 JobDerive 选择子和 provenance 诊断值。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。
+内核没有全局进程表：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 分别由 `os/monotonic_id::AtomicId64` 的独立 domain 分配，最大值最后发行一次后永久 Exhausted，绝不回绕复用；它们不构成全局操作入口。PID 是所属 Job 直接进程成员表的键，JobId 是直接 child Job 表的键；两者也作为 JobDerive 选择子和 provenance 诊断值。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。

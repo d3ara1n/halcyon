@@ -38,7 +38,8 @@ pub(crate) struct ThreadControl {
 impl ThreadControl {
     pub(crate) fn new() -> Result<Arc<Self>, erhino_shared::call::SystemCallError> {
         Arc::try_new(Self {
-            header: ObjectHeader::new(),
+            header: ObjectHeader::try_new()
+                .ok_or(erhino_shared::call::SystemCallError::ReachLimit)?,
             wait: crate::sync::Spinlock::new(
                 crate::sync::ranks::OBJECT_WAIT,
                 ObjectWaitState::new(ObjectSignals::NONE),
@@ -290,7 +291,7 @@ pub(crate) fn spawn(
         .reserve_ready(1)
         .map_err(|_| SystemCallError::OutOfMemory)?;
 
-    let token = super::handle::transaction_token();
+    let token = super::handle::transaction_token()?;
     let mut table = caller.process.handles.lock();
     let reservation = match table.reserve(1, token) {
         Ok(reservation) => reservation,

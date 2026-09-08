@@ -6,10 +6,7 @@
 //! 本 crate 只拥有额度算术和线性 token，不分配物理帧、不持内核对象引用，
 //! 也不决定 capability policy。内核适配层负责用 RAII 把 token 连回来源 core。
 
-use core::{
-    num::NonZeroU64,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::num::NonZeroU64;
 
 pub const MAX_DEPTH: u32 = erhino_shared::memory_pool::MEMORY_POOL_MAX_DEPTH;
 
@@ -35,14 +32,11 @@ impl PoolId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OwnerKey(NonZeroU64);
 
-static NEXT_OWNER_KEY: AtomicU64 = AtomicU64::new(1);
+static NEXT_OWNER_KEY: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
 fn mint_owner_key() -> Result<OwnerKey, PoolError> {
     NEXT_OWNER_KEY
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            (current != 0).then(|| current.wrapping_add(1))
-        })
-        .ok()
+        .allocate()
         .and_then(NonZeroU64::new)
         .map(OwnerKey)
         .ok_or(PoolError::IdentityExhausted)
@@ -367,6 +361,10 @@ impl PoolState {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "failure returns the complete affine child owner without heap allocation"
+    )]
     pub fn commit_child(
         &mut self,
         mut prepared: PreparedChild,
@@ -387,6 +385,10 @@ impl PoolState {
         Ok(prepared.state)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "failure returns the complete affine child owner without heap allocation"
+    )]
     pub fn rollback_child(
         &mut self,
         prepared: PreparedChild,

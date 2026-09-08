@@ -178,12 +178,12 @@ pub fn encode_payload(words: &[u64]) -> alloc::vec::Vec<u8> {
 }
 
 fn decode_words_var(payload: &[u8]) -> Option<alloc::vec::Vec<u64>> {
-    if payload.len() % 8 != 0 {
+    if !payload.len().is_multiple_of(8) {
         return None;
     }
     let mut words = alloc::vec::Vec::new();
     words.try_reserve_exact(payload.len() / 8).ok()?;
-    for chunk in payload.chunks_exact(8) {
+    for chunk in payload.as_chunks::<8>().0 {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(chunk);
         words.push(u64::from_le_bytes(bytes));

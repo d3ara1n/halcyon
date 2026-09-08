@@ -2,3 +2,6 @@
 name = "work_debt"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+monotonic_id = { path = "../monotonic_id" }

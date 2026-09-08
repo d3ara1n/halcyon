@@ -20,7 +20,7 @@ use rinlib::ipc::{
     wait::wait_many,
 };
 
-use crate::{next_txid, RpcMessageKind, RpcPrefix};
+use crate::{RpcMessageKind, RpcPrefix, next_txid, validate_response};
 
 /// 同步调用错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,13 +36,7 @@ pub enum CallError {
 }
 
 /// 应答 framing 违约的具体原因。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameRejection {
-    UnknownVersion,
-    NotResponse,
-    TxidMismatch,
-    ProtocolMismatch,
-}
+pub type FrameRejection = crate::ResponseRejection;
 
 impl From<SystemCallError> for CallError {
     fn from(value: SystemCallError) -> Self {
@@ -83,12 +77,26 @@ impl Caller {
         Ok(port)
     }
 
-    /// 废弃端口：超时后的迟到回复隔离，下次调用懒重建。
+    /// 废弃端口：迟到回复隔离，下次调用懒重建。
     fn discard_port(&mut self) {
         if let Some(port) = self.port.take() {
             let _ = close(port.peer);
             let _ = close(port.owner);
         }
+    }
+
+    /// 已接收但未接受的 response 统一收束：transit 不允许 Tunnel Endpoint，
+    /// 因而逐项 Handle close 与 ReplyPort discard 都是固定上界叶操作。
+    fn reject_reply(
+        &mut self,
+        message: rinlib::ipc::message::ReceivedMessage,
+        rejection: FrameRejection,
+    ) -> CallError {
+        for handle in message.handles {
+            let _ = close(handle);
+        }
+        self.discard_port();
+        CallError::Frame(rejection)
     }
 
     /// 发起一次同步调用。`body` 为协议层字节（不含 RpcPrefix）；
@@ -108,7 +116,7 @@ impl Caller {
             return Err(CallError::System(SystemCallError::IllegalArgument));
         }
         let port = self.ensure_port()?;
-        let txid = next_txid();
+        let txid = next_txid().ok_or(CallError::System(SystemCallError::ReachLimit))?;
 
         let mut payload = [0u8; PAYLOAD_MAX];
         RpcPrefix::new(RpcMessageKind::Request, txid).encode(&mut payload);
@@ -118,55 +126,57 @@ impl Caller {
         // slot 0：裁剪至 WRITE|TRANSIT 的一次性回复授权（跨协议公共约定；
         // TRANSIT 是暂存于消息并由接收方安装的内核前提）。
         let reply_once = make_send_once(port.peer, Rights::WRITE | Rights::TRANSIT)?;
-        let mut moves_storage = [HandleMove { handle: Handle::INVALID, rights: Rights::NONE };
-            1 + MESSAGE_HANDLE_MAX];
-        moves_storage[0] =
-            HandleMove { handle: reply_once, rights: Rights::WRITE | Rights::TRANSIT };
+        let mut moves_storage = [HandleMove {
+            handle: Handle::INVALID,
+            rights: Rights::NONE,
+        }; 1 + MESSAGE_HANDLE_MAX];
+        moves_storage[0] = HandleMove {
+            handle: reply_once,
+            rights: Rights::WRITE | Rights::TRANSIT,
+        };
         moves_storage[1..1 + extra_moves.len()].copy_from_slice(extra_moves);
         let moves = &moves_storage[..1 + extra_moves.len()];
 
-        send_blocking(service, protocol_id, &payload[..used], moves)
-            .map_err(|error| {
-                // 发送失败：尚未转移的 reply_once 留在本地，关闭防止泄漏。
-                let _ = close(reply_once);
-                error
-            })?;
+        send_blocking(service, protocol_id, &payload[..used], moves).inspect_err(|_| {
+            // 发送失败：尚未转移的 reply_once 留在本地，关闭防止泄漏。
+            let _ = close(reply_once);
+        })?;
 
         let items = [
-            WaitItem::new(port.owner, ObjectSignals::READABLE | ObjectSignals::CLOSED, 0),
+            WaitItem::new(
+                port.owner,
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                0,
+            ),
             WaitItem::new(service, ObjectSignals::CLOSED, 1),
         ];
-        let result = wait_many(&items, timeout_ms).map_err(|error| {
+        let result = wait_many(&items, timeout_ms).inspect_err(|_| {
             // 等待失败：迟到回复可能落地，废弃端口隔离。
             self.discard_port();
-            error
         })?;
         match WaitReason::from_u32(result.reason) {
             Some(WaitReason::Timeout) => {
                 self.discard_port();
                 Err(CallError::Timeout)
             }
-            // 观察到 CLOSED 必然以 Closed 收尾（终态独占电平）。
-            Some(WaitReason::Closed) if result.item_index == 1 => Err(CallError::ServiceClosed),
+            // 任一 CLOSED 都废弃本次 ReplyPort，隔离与关闭并发到达的回复。
+            Some(WaitReason::Closed) if result.item_index == 1 => {
+                self.discard_port();
+                Err(CallError::ServiceClosed)
+            }
             Some(WaitReason::Closed) => {
+                self.discard_port();
                 Err(CallError::System(SystemCallError::ObjectClosed))
             }
             _ => {
-                let message = receive(port.owner).map_err(|error| {
+                let message = receive(port.owner).inspect_err(|_| {
                     // 接收失败：同上，废弃端口隔离迟到回复。
                     self.discard_port();
-                    error
                 })?;
-                if message.header.kind != protocol_id {
-                    return Err(CallError::Frame(FrameRejection::ProtocolMismatch));
-                }
-                let prefix = RpcPrefix::decode(&message.payload)
-                    .map_err(|_| CallError::Frame(FrameRejection::UnknownVersion))?;
-                if prefix.kind != RpcMessageKind::Response {
-                    return Err(CallError::Frame(FrameRejection::NotResponse));
-                }
-                if prefix.txid != txid {
-                    return Err(CallError::Frame(FrameRejection::TxidMismatch));
+                if let Err(rejection) =
+                    validate_response(protocol_id, txid, message.header.kind, &message.payload)
+                {
+                    return Err(self.reject_reply(message, rejection));
                 }
                 Ok(Reply {
                     sender_pid: message.header.sender_pid,
@@ -176,5 +186,17 @@ impl Caller {
                 })
             }
         }
+    }
+}
+
+impl Default for Caller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Caller {
+    fn drop(&mut self) {
+        self.discard_port();
     }
 }

@@ -20,7 +20,7 @@ dispatcher 的 Wait 出口不提前改为 Killed，终止竞态由等待安装�
 
 ## Remote Call
 
-`os/remote_call` 是 `no_std`、禁止 unsafe 的固定槽纯逻辑核心。内核为每个 admitted hart 配置 4 个槽；槽状态按 `Empty → Reserved → Pending → Taken → Empty/Retired` 单向转换，reservation 与 finish token 均不可复制，generation 在复用前前进，耗尽时永久退休以拒绝 ABA。Reserve 容量不足不发布请求；Commit 前取消精确归还；Pending 电平是工作真值，门铃合并、重复或单次失败都不丢请求。host debug/release 各 5 项测试覆盖容量、回滚、目标隔离、无门铃消费、乱序完成、generation 和调用者预算。
+`os/remote_call` 是 `no_std`、禁止 unsafe 的固定槽纯逻辑核心。内核为每个 admitted hart 配置 4 个槽；槽状态按 `Empty → Reserved → Pending → Taken → Empty/Retired` 单向转换，reservation 与 finish token 均不可复制并携带 `TableId`，跨表错误在定位 slot 前拒绝且原样返还 owner；generation 在复用前前进，耗尽时永久退休以拒绝 ABA。Reserve 容量不足不发布请求；Commit 前取消精确归还；Pending 电平是工作真值，门铃合并、重复或单次失败都不丢请求。host 测试覆盖固定目标容量与回滚、目标隔离、门铃电平、完成乱序、有界 take、跨表 owner 返还和 generation 永久退休。
 
 内核 `remote_call` adapter 用 `REMOTE_CALL` 锁秩（650）包装全局固定表。`ReservedBatch` 在业务 Commit 前一次取得完整目标集合；admitted slot mask 在 registry 安装时以 release 发布为不可变原子快照，Reserve 可在业务锁内无锁验证目标，slot→raw hartid 展开仍只在锁外门铃边界读取 registry。`publish` 只在 `ADDRESS_SPACE → LIFECYCLE → REMOTE_CALL` 正序内发布请求并返回 affine `Doorbell`，调用者释放业务锁后才执行 `FENCE RW,RW` 和 SBI IPI。Remote Call 门铃失败返回失败位图并保留 Pending，不把已 Commit 业务改写成错误。目标在用户 trap 入口/出口和调度循环安全点每次最多处理 4 项，动作及最后完成回调均在槽锁外执行。
 

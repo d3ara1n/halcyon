@@ -61,7 +61,22 @@ fn classification_closes_and_prioritizes_permanent_over_boot() {
         range(0x1030_2000, 0x1030_4000)
     );
     assert_eq!(system.remaining_heap_chunks(), 0);
+    assert_eq!(system.consumed_heap_chunks(), 2);
     assert_eq!(system.remaining_recovery_tickets(), 0);
+    assert_eq!(system.consumed_recovery_tickets(), 1);
+    assert_eq!(
+        system.heap_ranges().collect::<Vec<_>>(),
+        [
+            range(0x1040_0000, 0x1050_0000),
+            range(0x1050_0000, 0x1060_0000),
+        ]
+    );
+    assert_eq!(
+        system.recovery_ranges().collect::<Vec<_>>(),
+        [range(0x1030_2000, 0x1030_4000)]
+    );
+    assert!(system.take_heap_chunk().is_none());
+    assert!(system.take_recovery_ticket().is_none());
 }
 
 #[test]

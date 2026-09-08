@@ -10,7 +10,7 @@
 //!
 //! 锁序规范（顶级）：**Job 链锁（先父后子，≤JOB_DEPTH_MAX 把）→ lifecycle
 //! 锁 → 其他对象锁**。创建/启动提交点在链锁内线性化「上行检查祖先 seal
-//! + 锁内分配 ID + 占位插入」，与 JobSeal（持单锁）在 owner 锁上互斥，
+//! 以及锁内分配 ID、占位插入」，与 JobSeal（持单锁）在 owner 锁上互斥，
 //! 先到者定胜负；ProcessStart 的提交闸门在同一链锁内嵌套调用
 //! lifecycle 线性化（锁序允许方向）。JobInner 锁内只改成员/子表与
 //! sealed/dead 位，不出游取锁、不做 uaccess；CLOSED 发布与完成传播在
@@ -176,28 +176,26 @@ static ROOT: crate::sync::Spinlock<Option<Arc<Job>>> =
     crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
 
 /// 下一个 JobId（单调不复用；root 恒 1 = 首次分配）。
-static NEXT_JID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_JID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
 /// 持久 PID 分配器（单调不复用；生命周期根是 Job 直接成员表）。
-static NEXT_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_PID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
 /// 下一个成员/子表事务 token。
-static NEXT_MEMBER_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_MEMBER_TOKEN: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
-fn alloc_jid() -> JobId {
-    NEXT_JID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+fn alloc_jid() -> Option<JobId> {
+    NEXT_JID.allocate()
 }
 
-pub fn alloc_pid() -> Pid {
-    NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+pub fn alloc_pid() -> Option<Pid> {
+    NEXT_PID.allocate()
 }
 
 fn next_member_token() -> Result<u64, SystemCallError> {
-    let token = NEXT_MEMBER_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if token == 0 {
-        return Err(SystemCallError::InternalError);
-    }
-    Ok(token)
+    NEXT_MEMBER_TOKEN
+        .allocate()
+        .ok_or(SystemCallError::ReachLimit)
 }
 
 /// 成员表事务预留凭据。
@@ -261,7 +259,7 @@ impl Job {
     pub fn root() -> Arc<Self> {
         let mut root = ROOT.lock();
         if root.is_none() {
-            let jid = alloc_jid();
+            let jid = alloc_jid().expect("root Job identity exhausted");
             *root = Some(
                 Arc::try_new(Self {
                     header: ObjectHeader::new(),
@@ -295,7 +293,7 @@ impl Job {
         parent: &Arc<Self>,
     ) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
-            header: ObjectHeader::new(),
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             jid,
             parent_jid,
             parent: Some(Arc::downgrade(parent)),
@@ -340,7 +338,7 @@ impl Job {
             return Err(SystemCallError::ObjectClosed);
         }
         let token = next_member_token()?;
-        let pid = alloc_pid();
+        let pid = alloc_pid().ok_or(SystemCallError::ReachLimit)?;
         let owner = guards.last_mut().expect("chain always contains the owner");
         owner
             .members
@@ -363,7 +361,7 @@ impl Job {
             return Err(SystemCallError::ObjectClosed);
         }
         let token = next_member_token()?;
-        let jid = alloc_jid();
+        let jid = alloc_jid().ok_or(SystemCallError::ReachLimit)?;
         let owner = guards.last_mut().expect("chain always contains the owner");
         owner
             .children
