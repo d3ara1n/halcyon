@@ -54,6 +54,7 @@ VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "150")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "30")
 SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "45")
+VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -211,7 +212,7 @@ virt-boot-failure:
 
 [private]
 run_boot_failure: make_dtb make_boot_package build_kernel
-    @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+    @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
 # 阶段收尾：静态门、完整 debug 压力、release core、平台差异及启动失败注入。
 # 每条 QEMU 由自身路线超时保护，聚合命令本身不另设跨路线总时限。

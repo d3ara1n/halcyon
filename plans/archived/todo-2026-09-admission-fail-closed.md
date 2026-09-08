@@ -1,6 +1,6 @@
 # 启动与平台 Admission Fail-Closed 收口计划
 
-> 状态：平台与 ELF admission 两个纵向子单元均已完成，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。二者共享 fail-closed 原则但不共用无意义的总状态机，接受/忽略/拒绝集合以 `references/CONTRACTS.md` 和本计划引用的固定规范为准。
+> 状态：平台与 ELF admission 两个纵向子单元均已完成，本实施计划现已归档；提交后复核由 [`Review program`](todo-2026-09-review-program.md) 统筹。二者共享 fail-closed 原则但不共用无意义的总状态机，接受/忽略/拒绝集合以 `references/CONTRACTS.md` 和本计划引用的固定规范为准。
 
 ## 目标
 

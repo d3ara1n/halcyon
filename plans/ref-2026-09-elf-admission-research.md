@@ -1,6 +1,6 @@
 # 静态 ELF admission 规范取证
 
-> 生命周期：本文件是只读参考资料。实现真值见 `os/elf`，实施档案见 [`admission-fail-closed`](archived/todo-2026-09-admission-fail-closed.md)，提交后复核由 [`Review program`](todo-2026-09-review-program.md) 统筹。
+> 生命周期：本文件是只读参考资料。实现真值见 `os/elf`，实施档案见 [`admission-fail-closed`](archived/todo-2026-09-admission-fail-closed.md)，本轮复核记录见 [`Review program 档案`](archived/todo-2026-09-review-program.md)。
 
 ## 规范入口
 

@@ -1,6 +1,6 @@
 # 历史审查清单：进程内存绑定与 root bootstrap
 
-> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
+> 本文件已由 `plans/archived/todo-2026-09-review-program.md` 批次 B 承接并归档；归档不表示审查完成。正式结论以对应批次 B 报告为准。
 
 > 【未来审查计划】审查对象固定为提交 `7c76097aa957abe14246191fb9bc097169f17fb2`（`feat(mm): 闭合进程内存绑定与根池启动链`）。只审该提交形成的 Unbound Process shell、一次性 ProcessBindMemory、Building 截止、AddressSpace root 资金化、root MemoryPool capability 交付与 BootPackage payload owner 闭包；切片 6 的中间页表/普通匿名 backing 全面资金化、公共 MemoryObject、多页 Tunnel 与 Runnel v2 不混入本结论。
 

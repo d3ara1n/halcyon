@@ -1,6 +1,6 @@
 # Capability 与 Affine Owner 错误边界收口计划
 
-> 状态：rights、用户态 owner、RPC 接收与 ticket 查询均已按各自完整调用链收口，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。它们共享错误原则，但不共用一个事务类型。
+> 状态：rights、用户态 owner、RPC 接收与 ticket 查询均已按各自完整调用链收口，本实施计划现已归档；提交后复核由 [`Review program`](todo-2026-09-review-program.md) 统筹。它们共享错误原则，但不共用一个事务类型。
 
 ## 目标
 

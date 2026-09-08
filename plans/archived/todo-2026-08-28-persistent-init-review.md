@@ -1,8 +1,8 @@
 # 历史审查清单：持久 init 监督政策
 
-> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 C 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-lifecycle-and-user-memory.md` 为准。
+> 本文件已由 `plans/archived/todo-2026-09-review-program.md` 批次 C 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-lifecycle-and-user-memory.md` 为准。
 
-> 【未来审查计划】对象是生命周期 step 6 的两笔提交；Review 纪律见 [`REVIEW.md`](REVIEW.md)。设计公理已入档 `notes/ideas/bootstrap.md`（委托语义、重启政策维度、init supervisor），实现现状见 `notes/impls/startup.md`「当前 init 集成政策」与 `notes/ideas/system-reset.md`。
+> 【未来审查计划】对象是生命周期 step 6 的两笔提交；Review 纪律见 [`REVIEW.md`](../REVIEW.md)。设计公理已入档 `notes/ideas/bootstrap.md`（委托语义、重启政策维度、init supervisor），实现现状见 `notes/impls/startup.md`「当前 init 集成政策」与 `notes/ideas/system-reset.md`。
 
 ## 提交对照
 

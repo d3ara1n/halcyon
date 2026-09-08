@@ -6,7 +6,7 @@
 > 提交。host 148/148、common debug/release、virt-hetero、virt-nofd 的 16/16
 > 矩阵及 `sifive_u` 连续十轮均通过。联合内存实施档案见
 > [`todo-2026-09-user-memory-mapping.md`](todo-2026-09-user-memory-mapping.md)，
-> 后续统一审查见 [`../todo-2026-09-review-program.md`](../todo-2026-09-review-program.md) 的批次 C。
+> 后续统一审查见 [`../todo-2026-09-review-program.md`](todo-2026-09-review-program.md) 的批次 C。
 
 ## 决策记录
 

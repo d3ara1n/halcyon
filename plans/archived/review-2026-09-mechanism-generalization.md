@@ -1,5 +1,18 @@
 # 批次 D-1：机制泛化改造 Review（代码轴）
 
+## 2026-09-08 最终复核（D-1，通过并归档）
+
+固定对象 `228b6a56dd75dc31ddb349556905634b1dc7c6ff`，范围 `8987f89..228b6a5`；OliveWillow 通过正式 send_to 回报定点只读复核结论：P2-D1-03 已闭合，同批暴露的输出终止锁序 P1 也已修复，无新 finding。旧 P1-D1-01/02 已在 `9ee2791` 复核关闭，本报告全部条目完成。
+
+- `task/tunnel/selftest.rs:141`、`:207` 生产 Create/Attach 失败覆盖 Conflict、无效输出、完整 Prepare 后的 Building gate 拒绝；失败后 Invitation/PTE/write_views 及库存恢复。`:328` 的真实 Pool reservation/HeapPressure 覆盖额度与元数据 OOM，不伪造返回值。`:267` 固定输出初检→真实 Unmap→Prepare→复检 Fault→rollback 的完整交错。
+- fixture 在 `:243` 起经 departure/deferred work、每批 `max_work=1` 的重复 ProcessDrain 收束，最终释放全部 Process/Connection/Endpoint/Invitation 后，Pool、frame 和 16 类 metadata 库存回到初始值。HeapPressure 释放后，已 claim 的 system heap 容量继续归 allocator，符合既有 ticket 生命周期，不是泄漏。
+- `uaccess.rs:110` 只冻结终因并向 Thread 固定槽移交待办；`proc.rs:4554`、`:4606` 保证首次交付、锁外 take 和 Drop 无遗留，`trap.rs:140` 在所有 handler guard 释放后交付并强制 Killed。全部生产 deliver_output 调用点共用该机制；并发终止的首达者责任保持唯一。
+- `test_hammer/src/main.rs:723` 三组各 8 轮确定顺序/并发竞争，检查 Invitation 消费、重复 close 的 StaleHandle 及双方 VA 复用；原 8 轮 close-vs-Unmap、16 轮 Endpoint 退出仍保留。启动期确定性失败与真实多 hart 用户负载各自提供对应证据。
+- 最终 `artifacts/review-fixes/acceptance.log` 七面 lint、24 轮矩阵、stress 16/16、release/sifive_u/nofd 及启动注入全部通过，`acceptance.status=0`。此前中间失败日志只作修复取证，不作为最终结果。
+
+以下保留首审、首次复核与实施记录；其中“开放/待复核”均为对应时点状态，不构成当前待办。
+
+
 ## P2-D1-03 补证与同批修复（待固定提交复核）
 
 `task/tunnel/selftest.rs` 已加入隔离 Building fixture，生产 Create/Attach 直接覆盖 Conflict、无效输出、完整 Prepare 后缺失 Running 提交资格；真实表页额度耗尽与堆耗尽分别触发 QuotaExceeded/NoFrame/OutOfMemory。失败后检查 Invitation、PTE、write_views 与库存不变。输出页在初检后由真实 MemoryUnmap 撤销，随后 Tunnel Prepare/输出复检失败/显式 rollback；fixture 经同一 Fault/离场/一 work unit ProcessDrain 收束，最终比较完整 Pool/frame 与 16 类 metadata admission 库存。

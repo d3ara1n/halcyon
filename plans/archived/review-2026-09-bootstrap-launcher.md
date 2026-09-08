@@ -21,7 +21,7 @@ elf/dtb/frame_pool/handle_table/monotonic_id/shared/libprocess host tests 通过
 以下保留历史目标的首审内容及不通过判定。
 
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 范围与基线
 

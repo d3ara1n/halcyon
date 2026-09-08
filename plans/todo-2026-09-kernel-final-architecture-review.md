@@ -2,7 +2,7 @@
 
 ## 性质
 
-这是一次**内核主线完成后的全局结构审查与重构计划**，不是当前 6E 的局部验收，也不阻塞 MemoryObject、多页 Tunnel、Runnel v2 或后续用户态服务实现。
+这是一次**内核主线完成后的全局结构审查与重构计划**。A–E 修复复核已经归档，本计划仍等待下列数据面与主要消费者触发条件，不阻塞多页 Tunnel、Runnel v2 或后续用户态服务实现。
 
 当前阶段只登记观察对象，不提前判定其最终去留。原因是只有内核主线、shared ABI、rinlib 与主要用户态消费者共同完成后，才能从全局视角判断某个机制究竟是长期基础、必要的阶段性边界，还是 A→B 迁移中遗留的 C/D/E/F。
 
@@ -92,7 +92,7 @@
 
 以下不是当前阶段的定论，只是未来 review 必须重新取证的候选观察点：
 
-- `os/kernel/src/task/tunnel.rs` 当前仍以单页 `FundedExtent` 表达 Tunnel backing；需在多页 Tunnel/ObjectBacking 完成后判断是否删除或统一；
+- `os/kernel/src/task/tunnel.rs` 对外仍为单页 Tunnel，内部已复用 `MemoryObjectCore`/`ObjectBacking` 多 extent 投影；多页能力与消费者完成后再复核是否还存在单页特化残留；
 - `os/kernel/src/task/proc.rs` 当前存在 `BackingPlanFailure`、重复 Map validation 与 `backing_permits` 多层传递；需在最终 MemoryObject/backing planner 完成后判断哪些应统一；
 - `frame.rs` 当前仍保留库存 selftest 的 raw `alloc_user_order` adapter；需在所有生产路径迁移后判断是否删除；
 - 固定 split metadata 上界、验收 workload 分支和 Pool 守恒观测方式需结合最终并发/碎片模型重新证明；

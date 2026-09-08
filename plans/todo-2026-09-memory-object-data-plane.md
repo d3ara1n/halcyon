@@ -1,23 +1,23 @@
 # 多页 Tunnel 与 Runnel 数据面
 
-> 当前暂停。方向由 `notes/ideas/{mm,object,task,bootstrap,tunnel,runnel,buffer-queue}.md` 拥有；现有实现见 `notes/impls/{mm,memory-object,tunnel,runnel}.md`。本计划只安排未完成的数据面能力与已登记的库存 selftest 来源收口，不再保留已完成地基的实施步骤。
+> 当前可恢复，下一自然单元为切片 8 多页 Tunnel。方向由 `notes/ideas/{mm,object,task,bootstrap,tunnel,runnel,buffer-queue}.md` 拥有；现有实现见 `notes/impls/{mm,memory-object,tunnel,runnel}.md`。本计划只安排未完成的数据面能力与已登记的库存 selftest 来源收口，不再保留已完成地基的实施步骤。
 
 ## 当前推进门
 
-地址空间事务、构造/Start/Ready、validated ELF 与 EXECUTE authority 已形成固定提交 `9ee2791`，实施记录见 [`地址空间事务与进程启动发布档案`](archived/todo-2026-09-memory-transaction-state-machine.md)。提交后复核保留 D-1 P2-D1-03 并新增 E-1 N-1/P1、E2-7-02/P2，由 [`Review program`](todo-2026-09-review-program.md) 和三份原报告唯一承接。本计划继续暂停，三项修复/补证并复核完成后恢复切片 8/9/10；不能把 D-1 前置反向交给切片 8 形成循环。
+地址空间事务、构造/Start/Ready、validated ELF 与 EXECUTE authority 的前置已完成；`228b6a5` 闭合最后的启动失败广播、nofd 锚点和 Tunnel 精确失败验证，A–E 全部报告已由独立 reviewer 确认归档。历史证据见 [`Review program 档案`](archived/todo-2026-09-review-program.md) 和 [`地址空间事务档案`](archived/todo-2026-09-memory-transaction-state-machine.md)。本计划可按切片 8→9 的依赖恢复，切片 10 保持独立 selftest 来源收口职责；本次归档不表示数据面能力已实施。
 
 切片编号 8/9/10 保留作跨文档定位，不表示可以脱离前置开工，也不允许以“到切片 10 再清理”为理由在切片 8/9 留下旧接口。每个能力单元必须连同真实消费者、失败路径、测试和旧路径删除一起交付。
 
 ## 已有地基与证据入口
 
-以下机制已经存在，不能因历史清单仍描述早期阶段就重新实施；其未闭合 findings 由 [`Review 统筹导航`](todo-2026-09-review-program.md) 分配给专题计划。
+以下机制已经存在，不能因历史清单仍描述早期阶段就重新实施；相关 findings 已经闭合，复核追溯见 [`Review program 档案`](archived/todo-2026-09-review-program.md)。
 
 | 已有机制 | 实现现状 | 首审证据 |
 |---|---|---|
 | 平台供给、系统储备、MemoryPool、funded broker | `notes/impls/mm.md` | [`B-1`](archived/review-2026-09-memory-supply-and-pool.md) |
-| Unbound/Bound、PoolBinding、root/页表 owner、deferred retire | `notes/impls/{mm,startup,task}.md` | [`B-2`](archived/review-2026-09-process-bind-page-table-retire.md)、[`E-1`](review-2026-09-system-audit-03-04.md) |
+| Unbound/Bound、PoolBinding、root/页表 owner、deferred retire | `notes/impls/{mm,startup,task}.md` | [`B-2`](archived/review-2026-09-process-bind-page-table-retire.md)、[`E-1`](archived/review-2026-09-system-audit-03-04.md) |
 | 匿名与对象来源、公共 MemoryObject、ObjectView、WritePermit | `notes/impls/{mm,memory-object,tunnel}.md` | [`A`](archived/review-2026-09-memory-transaction-unification.md) |
-| 单页 Tunnel/RNL1、IPC 与当前消费者 | `notes/impls/{tunnel,runnel,ipc}.md` | [`D-1`](review-2026-09-mechanism-generalization.md)、[`E-2`](review-2026-09-system-audit-05-07.md) |
+| 单页 Tunnel/RNL1、IPC 与当前消费者 | `notes/impls/{tunnel,runnel,ipc}.md` | [`D-1`](archived/review-2026-09-mechanism-generalization.md)、[`E-2`](archived/review-2026-09-system-audit-05-07.md) |
 
 历史设计与实施资料：[`IPC 数据面设计`](archived/todo-2026-09-ipc-data-plane-design.md)、[`MemoryObject 统一实施档案`](archived/todo-2026-09-memory-object-unification.md)、[`系统参照`](ref-2026-09-ipc-data-plane-systems.md)。历史提交与当时验证以报告、档案和 git history 为准，不在当前计划重复列出“下一步进入已完成切片”的指令。
 

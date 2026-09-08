@@ -1,5 +1,20 @@
 # 系统审计批次 E-1：启动/页表/TLB 与 SMP/调度/对象生命周期
 
+## 2026-09-08 最终复核（E-1，通过并归档）
+
+固定对象 `228b6a56dd75dc31ddb349556905634b1dc7c6ff`，范围 `8987f89..228b6a5`；WiseHare 正式 send_to 确认 N-1/P1 闭合，未发现新的可达 P0/P1/P2。原 M3-1..M3-4 已在 `9ee2791` 关闭，本报告全部 finding 完成。
+
+- `rt.rs:211` 起四个公共失败终段均在诊断前调用 publish_failed；alloc handler 进入同一 panic 路径。`registry.rs:280` 仅 CAS，不依赖锁/堆/tp，已 Ready/Failed 不回退或递归 panic。
+- `assembly.asm:222` 起先清 BSS，再安装 bootstrap fatal vector 和调用 Rust main；GATE 的正式 ELF 符号为 BSS。Bare secondary 的 PA fatal 不读取高半区状态，边界成立。
+- `tools/check-boot-failure.py` 在 boot::load 入口确认 Preparing；每次 park breakpoint 检查 Failed，终判还要求 GDB 退出 0、恰四次且四个唯一线程，以及对应故障诊断；无命中或错误 Gate 不可能通过。三份 panic/alloc/fatal GDB/QEMU 日志均满足条件，符号地址与被测 ELF 一致。
+- RuntimeGate 单向终态与 Release/Acquire 模型成立，debug/release 各 3 项通过。uaccess 交付也经本 reviewer 交叉核验：全部 syscall 路径在业务 guard 释放后进入 trap 尾段交付槽；唯一提前 Killed 在 dispatch 之前，不可能持新待办，协作式内核无嵌套用户 trap。
+- 最终 acceptance.log/status 证实七面 Clippy、stress 16/16、release、sifive_u、nofd 与三种启动注入均通过。早期锁序失败日志只保留为修复取证。
+
+工具 P3 已当场清理：AGENTS 明确预期启动故障使用专用 oracle，Justfile 增加 `VIRT_BOOT_FAILURE_TIMEOUT`（默认45秒）并传给 `--timeout`；`VIRT_BOOT_FAILURE_TIMEOUT=60 just --dry-run run_boot_failure` 确认透传。WiseHare 正式确认该配置接线已闭合、无需保留待办，默认运行语义不变。
+
+以下保留首审、首次复核与实施记录；旧“开放/待复核”均为历史时点状态。
+
+
 ## N-1 修复实现与验证（待固定提交复核）
 
 公共 panic/fatal/fatal_msg/bootstrap_fatal_report 在诊断前调用 `registry::publish_failed`，Preparing 单向转 Failed；Ready/Failed 不回退，也不会因再次失败递归 panic。普通 BSS 清零后的 Rust 环境不依赖 registry/tp；Bare PA 阶段保持独立停驻/Online 超时边界。

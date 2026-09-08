@@ -1,6 +1,6 @@
 # 生命周期监督 Authority 与失败升级政策计划
 
-> 状态：有限预算、authority 保留、失败升级与 init/pm 接管链已经完成，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。本档案记录用户态监督状态机，不把政策下沉到内核。
+> 状态：有限预算、authority 保留、失败升级与 init/pm 接管链已经完成，本实施计划现已归档；提交后复核由 [`Review program`](todo-2026-09-review-program.md) 统筹。本档案记录用户态监督状态机，不把政策下沉到内核。
 
 ## 目标
 

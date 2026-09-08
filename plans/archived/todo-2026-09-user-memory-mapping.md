@@ -1,6 +1,6 @@
 # 用户内存映射机制完整化
 
-- 状态：切片 1–8B 已由 `1cd6ab2` 至 `bdc83ef` 八笔提交收口；本实施计划归档，后续审查由 [`../todo-2026-09-review-program.md`](../todo-2026-09-review-program.md) 批次 C 统一承接。
+- 状态：切片 1–8B 已由 `1cd6ab2` 至 `bdc83ef` 八笔提交收口；本实施计划归档，后续审查由 [`../todo-2026-09-review-program.md`](todo-2026-09-review-program.md) 批次 C 统一承接。
 - 方向真值：[`notes/ideas/mm.md`](../../notes/ideas/mm.md)
 - 自然序：线程批三已由 `004cae5` 收口，当前进入 IPC 数据面设计；未来 review 不阻塞主线
 
@@ -175,7 +175,7 @@ Remote Call 仍是独立 hart 间短动作传输模块，不并入 AddressSpace�
 
 阶段记录：`os/remote_call` 已落地固定 8 hart × 4 槽的纯逻辑状态机与 kernel adapter，具备批量 Reserve 精确回滚、Pending 电平、generation 退休、锁外 IPI、trap/idle 有界消费、全量 `SFENCE.VMA`/可选 `FENCE.I`、release-sequence 最后确认及每 hart epoch cache。Process lifecycle 以 execution sequence/mandatory operation 闭合 active gate 与终止接管；稳定 AddressSpace 外壳提供 `prepare_shootdown → commit_shootdown → start`。真实 consumer 已覆盖 Running Extend、Tunnel Create/Attach/HandleClose；prepared WaitContext、发起线程消散和 ack 后 Retire/Complete 均已闭合。admitted mask 由 registry 安装时原子发布，Remote Reserve 不再把 registry LEAF 锁带入业务事务。host debug/release、clippy、`just check`、virt debug/release 与 sifive_u 已通过，10/10 竞态矩阵不变。
 
-未来代码复审已按提交 `6199985` 单独建立 [`todo-2026-08-30-remote-call-review.md`](../todo-2026-08-30-remote-call-review.md)；它不阻塞本计划继续迁移 AddressSpace。
+未来代码复审已按提交 `6199985` 单独建立 [`todo-2026-08-30-remote-call-review.md`](todo-2026-08-30-remote-call-review.md)；它不阻塞本计划继续迁移 AddressSpace。
 
 ### 6. AddressSpace 替换与现有调用者迁移
 
@@ -272,7 +272,7 @@ sifive_u 首轮 gate 在既有 Tunnel stress 中由 guard 捕获正式内核栈�
 
 ### 联合复审归档
 
-切片 1–7、8A 与 ThreadSpawn integration 已形成 `1cd6ab2` 至 `bdc83ef` 八笔真实提交；未来审查由 [`../todo-2026-09-review-program.md`](../todo-2026-09-review-program.md) 批次 C 统一承接，记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险。Review 统一复核 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整，不阻塞当前验收与自然序。
+切片 1–7、8A 与 ThreadSpawn integration 已形成 `1cd6ab2` 至 `bdc83ef` 八笔真实提交；未来审查由 [`../todo-2026-09-review-program.md`](todo-2026-09-review-program.md) 批次 C 统一承接，记录提交哈希、改动概要、所有权不变量、验证结果和未覆盖风险。Review 统一复核 Commit 前失败原子、跨批 Lock Ladder、shootdown/termination/HandleClose 竞态、permit/backing/handle/slot 守恒，以及旧路径删除是否完整，不阻塞当前验收与自然序。
 
 ## 对 ThreadSpawn 契约重审的解除条件
 

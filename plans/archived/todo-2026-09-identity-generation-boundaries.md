@@ -1,6 +1,6 @@
 # Token、Generation 与 Epoch 身份边界收口计划
 
-> 状态：各 identity domain、generation 退休与耗尽语义已经完成，本实施计划现已归档；提交后复核由 [`Review program`](../todo-2026-09-review-program.md) 统筹。本档案只记录 token/generation/epoch 的身份域，不重复事务状态机、启动 admission 或对象 capability 的 owner 真值。
+> 状态：各 identity domain、generation 退休与耗尽语义已经完成，本实施计划现已归档；提交后复核由 [`Review program`](todo-2026-09-review-program.md) 统筹。本档案只记录 token/generation/epoch 的身份域，不重复事务状态机、启动 admission 或对象 capability 的 owner 真值。
 
 ## 目标
 

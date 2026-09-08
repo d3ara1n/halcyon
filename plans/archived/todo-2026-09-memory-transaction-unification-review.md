@@ -1,6 +1,6 @@
 # 历史审查清单：统一内存事务核与公共 MemoryObject
 
-> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 A 承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-memory-transaction-unification.md` 为准。
+> 本文件已由 `plans/archived/todo-2026-09-review-program.md` 批次 A 承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-memory-transaction-unification.md` 为准。
 
 审查对象是提交，不是当前工作树。本篇记录本次任务对应的提交与改动概要，供日后 Review 对照。
 

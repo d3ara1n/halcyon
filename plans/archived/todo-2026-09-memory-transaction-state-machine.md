@@ -1,6 +1,6 @@
 # 地址空间事务与进程启动发布的纵向重构
 
-> 状态：两个纵向单元及其直接完成链已按最终结构接通并通过组合压力，validated ELF 与 EXECUTE authority 联合代码门也已闭合；本实施计划现已归档。多页 Tunnel / Runnel 切片 8/9 仍暂停，历史证据、其它 findings 归属及提交后复核入口见 [`Review program`](../todo-2026-09-review-program.md)。
+> 状态：两个纵向单元及其直接完成链已按最终结构接通并通过组合压力，validated ELF 与 EXECUTE authority 联合代码门也已闭合；本实施计划现已归档。多页 Tunnel / Runnel 切片 8/9 仍暂停，历史证据、其它 findings 归属及提交后复核入口见 [`Review program`](todo-2026-09-review-program.md)。
 
 ## 目标与边界
 

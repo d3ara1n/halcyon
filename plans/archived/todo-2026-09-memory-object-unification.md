@@ -1,7 +1,7 @@
 # 公共 MemoryObject 与数据面统一（6E 剩余 + 切片 7）
 
 > 【已收口】步骤 1–8 全部完成，见文末「收口记录」。未来审查见
-> [`../todo-2026-09-review-program.md`](../todo-2026-09-review-program.md) 的批次 A。
+> [`../todo-2026-09-review-program.md`](todo-2026-09-review-program.md) 的批次 A。
 >
 > 【原实施计划】合并 6E 剩余项（ObjectBacking、投影统一、对象侧 metadata admission）与切片 7（公共 MemoryObject ABI/Handle/用户面），用最终形态一次设计到位，避免为单独闭合 6E 而造临时层。方向契约由 `notes/ideas/mm.md` 拥有；前序 6E 部分完成状态见 `plans/todo-2026-09-memory-object-data-plane.md` 切片 6E 段落与提交 `2e18c6e`。
 

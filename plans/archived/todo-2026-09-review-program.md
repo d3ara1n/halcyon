@@ -1,6 +1,6 @@
-# Review findings 统筹导航
+# Review findings 统筹档案
 
-> `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774` 的 A–E 提交后复核已完成。六份报告闭合归档；D-1 保留 P2-D1-03，E-1 新增 N-1/P1，E-2 新增 E2-7-02/P2，program 尚未完成。本表和三份开放报告取代“全部实现已闭合、只等复核”的旧状态；已归档专题只是施工档案。
+> 状态：A–E 首审、机制重构与提交后复核全部完成，九份报告与本 program 归档。`9ee2791` 关闭首批六份报告，`8987f89` 固定三项开放记录，`228b6a56dd75dc31ddb349556905634b1dc7c6ff` 完成最后修复/验证；WiseHare 与 OliveWillow 正式定点复核均通过，无开放 finding。下一自然主线为多页 Tunnel/RNL2，见仍有效的数据面计划。
 
 ## 文档职责
 
@@ -15,27 +15,27 @@
 
 报告与专题计划可以并存，但不得同时声称拥有该 finding 的当前行动真值。报告保留历史结论，修复后追加复核证据；不改写目标提交曾经存在的缺陷。所有有效条目完成复核后才归档该报告，不能因为其中一个机制子集完成就整篇归档。
 
-## 本轮复核结果与唯一后续行动
+## 最终复核与归档结果
 
 WiseHare 负责 A/B-1/B-2/E-1，OliveWillow 负责 C-1/C-2/D-1/D-2/E-2，均只读、不改代码。结论以正式 send_to 消息及统筹交叉核验为准；早期 peek 摘要遗漏启动 P1，不构成最终证据。
 
-| 状态 | 唯一行动真值 | 下一步与完成门 |
+| 最后开放项 | 复核档案 | 最终结论 |
 |---|---|---|
-| **E-1 N-1 / P1**：Ready 前公共 panic/fatal 不广播 Failed | [E-1](review-2026-09-system-audit-03-04.md) | 在原子 Gate 终段统一闭合早期/正式环境的启动失败，不依赖锁/堆/tp；补 panic/alloc/fatal→secondary Failed 证据，固定修复提交复核。 |
-| **E2-7-02 / P2**：nofd 旧日志锚点导致假失败 | [E-2](review-2026-09-system-audit-05-07.md) | 对齐可选 test_fp 降级的稳定输出，保留 D64 拒绝与 reset 验收门；新提交重跑 nofd 并复核。 |
-| **P2-D1-03**：Tunnel 精确失败/交错证据不足 | [D-1](review-2026-09-mechanism-generalization.md) | 保留已有 close-vs-Unmap 与 Endpoint 退出压力；补 Conflict/NoFrame/输出失败/close-vs-Attach 的直接证据和守恒，不恢复旧 MappingLease。 |
+| E-1 N-1 / P1 | [E-1](review-2026-09-system-audit-03-04.md) | 228b6a5 闭合。四个公共失败入口诊断前广播，终态保持；GDB 三种真实失败注入各确认四 hart Failed 后停驻。WiseHare 通过。 |
+| E2-7-02 / P2 | [E-2](review-2026-09-system-audit-05-07.md) | 228b6a5 闭合。nofd 锚点对齐且加入 acceptance；有效输入通过、四种必要证据缺失/错误拒绝。OliveWillow 通过。 |
+| P2-D1-03 及补证暴露的输出锁序 P1 | [D-1](review-2026-09-mechanism-generalization.md) | 228b6a5 闭合。真实额度/堆 OOM、Conflict、撤销输出、24轮 close/Attach 和 max_work=1 重复 Drain 证明守恒；Thread 固定槽把终止待办交给锁外 trap。OliveWillow 通过，WiseHare 交叉确认输出交付。 |
 
-六份可归档报告：A、B-1、B-2、C-1、C-2、D-2。原 finding 的关闭不等于系统无残余风险；各报告均保留未执行的注入与组合验证限制。E2-7-01（lint）和 E2-5-01（RPC）已关闭，E-2 因新项继续开放。
+A、B-1、B-2、C-1、C-2、D-2 已在 9ee2791 复核关闭；本次完成 D-1/E-1/E-2，全部九份报告归档。报告保留历史失败及测试限制，归档不表示系统未来能力已经实现。定点复核另提的超时配置/文档 P3 已当场加入 VIRT_BOOT_FAILURE_TIMEOUT（默认45秒）并通过 dry-run 参数透传核验，不留待办。
 
-后续先处理启动失败真值与验收脚本，再完成 D-1 的独立验证单元；三项集中形成修复/验证批次后按固定提交复核。D-1 不转交依赖整个 program 闭合的切片 8，避免循环前置；也不新建重复 todo。多页 Tunnel/RNL2 与最终架构 review 保持暂停/原触发条件。
+最终运行证据：`THROTTLE=100 just acceptance` 完整退出0（七面 Clippy、stress16/16、release、sifive_u、nofd、三种 GDB 启动失败），`artifacts/review-fixes/acceptance.log` 与 `acceptance.status` 为最终依据；runtime_gate host debug/release 各3项通过，nofd oracle 有效输入接受、四类错误拒绝，无残留 QEMU。早期 50% flake、nofd 假失败、测试发现的锁序 panic 和断言修正保留在历史报告/失败日志，不混作最终结果。
 
-运行证据：七面 Clippy 通过；50% stress 两次已知 15/16 flake，100% stress 16/16 与 release/sifive_u/hetero 通过；nofd 因 E2-7-02 退出 1。本轮没有单次成功的 acceptance 聚合。路线日志与具体限制见 E-2 复核段，退出后已检查无残留 QEMU。
+program 完成，多页 Tunnel/RNL2 可恢复；系统审计总计划一并归档。最终全局架构 Review 仍等待数据面与主要消费者的既定触发条件，不因本轮关闭而提前执行。
 
 ## 已完成施工与交付边界
 
 ### 地址空间事务与进程启动
 
-[`memory-transaction-state-machine` 实施档案](archived/todo-2026-09-memory-transaction-state-machine.md)记录两个已完成的纵向单元：
+[`memory-transaction-state-machine` 实施档案](todo-2026-09-memory-transaction-state-machine.md)记录两个已完成的纵向单元：
 
 1. 地址空间：ledger / funding / 来源保活 / abort / PTE publish / Remote / retire，连同匿名、MemoryObject、Building、Tunnel 调用者一次迁移。
 2. 进程：私有 Bound 构造失败 / 普通 Start / Bootstrap / Job-lifecycle gate / 首次 Ready 发布一次迁移。
@@ -46,11 +46,11 @@ WiseHare 负责 A/B-1/B-2/E-1，OliveWillow 负责 C-1/C-2/D-1/D-2/E-2，均只�
 
 ### 其它专题
 
-- [`admission-fail-closed` 档案](archived/todo-2026-09-admission-fail-closed.md)：平台/ELF 输入的规范化、checked validation 与 immutable admission。
-- [`identity-generation-boundaries` 档案](archived/todo-2026-09-identity-generation-boundaries.md)：实例身份、代次、不可回绕与耗尽策略。
-- [`capability-owner-error-boundary` 档案](archived/todo-2026-09-capability-owner-error-boundary.md)：rights/signal、用户态 affine owner、已接收 capability 与 ReplyPort 的消费边界。
-- [`supervision-authority-policy` 档案](archived/todo-2026-09-supervision-authority-policy.md)：用户态 authority 保留、有限等待与失败升级。
-- 工程 lint 门已由 E-2 的 E2-7-01 闭合：`just clippy` 覆盖七个编译面，并作为 `just acceptance` 的前置门；nofd 的新增 E2-7-02 仍开放，见本轮复核结果。
+- [`admission-fail-closed` 档案](todo-2026-09-admission-fail-closed.md)：平台/ELF 输入的规范化、checked validation 与 immutable admission。
+- [`identity-generation-boundaries` 档案](todo-2026-09-identity-generation-boundaries.md)：实例身份、代次、不可回绕与耗尽策略。
+- [`capability-owner-error-boundary` 档案](todo-2026-09-capability-owner-error-boundary.md)：rights/signal、用户态 affine owner、已接收 capability 与 ReplyPort 的消费边界。
+- [`supervision-authority-policy` 档案](todo-2026-09-supervision-authority-policy.md)：用户态 authority 保留、有限等待与失败升级。
+- 工程 lint 门已由 E-2 的 E2-7-01 闭合：`just clippy` 覆盖七个编译面，并作为 `just acceptance` 的前置门；后续 nofd E2-7-02 也已闭合，见最终复核结果。
 
 以上是职责域，不是要求“一个专题全做完才开始下一个”的队列，也不是一套共用状态机。关联子单元按前置关系衔接；独立问题不强塞进当前内存重构。
 
@@ -68,14 +68,14 @@ WiseHare 负责 A/B-1/B-2/E-1，OliveWillow 负责 C-1/C-2/D-1/D-2/E-2，均只�
 | C-1 P2-07：ThreadControl CLOSED | Capability 计划，signal 子单元 | 已收窄为仅允许真实持续电平 DONE；C-1 固定提交复核已闭合 |
 | C-2 F1/F2：Remote token identity、AddressSpace epoch | Identity 计划 | Remote/work `TableId`、epoch CAS、全局单调 ID/token 与用户态 cookie/txid 已统一为不可回绕耗尽；跨表 owner 返还和最大代次退休测试通过 |
 | C-2 F3：UserStack cleanup | Capability/owner 计划 | Map/Unmap 对 ObjectBusy 按 tick 重试；终端 cleanup 错误记录并留给 AddressSpace drain，不再 panic/无限等待；core 验证零 abandoned |
-| D-1 P2-D1-03：MappingLease 失败/析构验证 | D-1 报告 | 机制已迁移，直接失败/交错证据仍不足，保持 P2 开放；详细已有/缺失覆盖与完成门见报告 |
+| D-1 P2-D1-03：MappingLease 失败/析构验证 | D-1 档案 | 228b6a5 的直接失败、输出撤销、close/Attach 与库存守恒证据通过复核；同批输出终止锁序缺陷已修复 |
 | D-2 F-02：启动 reservation 区间 | Admission 计划 | 已由 canonical memory/reservation admission 的 checked 对齐、排序、合并与重叠拒绝覆盖；不保留独立修复路径 |
 | D-2 F-05/F-06：ELF entry、PT_INTERP/flags | Admission 计划，ELF 纵向子单元 | 已由 `os/elf::validate` 统一 runtime、audit、launcher 与 Bootstrap；entry file-byte、header/flags 和页权限负向测试通过 |
 | D-2 F-07：reservation token | Identity 计划 | Handle/Job token 已使用永久耗尽的独立 domain；work-debt token 携 TableId；Ready 继续由保活 core 校验 |
 | E-1 M3-1：Bound 镜像失败 | 内存事务计划，纵向单元二 | 预付 `UnpublishedReservation` 与显式 rollback 已闭合；Drop 只作未消费 token 断言 |
-| E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | E-1 报告 | 原 findings 闭合；新 N-1/P1 是公共 panic/fatal 在 Ready 前漏广播 Failed，报告继续开放 |
+| E-1 M3-2/M3-3/M3-4：hart identity/Gate/order | E-1 档案 | 原 findings 与随后 N-1/P1 公共 panic/fatal 广播均已在固定提交复核闭合 |
 | E-2 E2-5-01：RPC reject capability/port | Capability/owner 计划，RPC 接收子单元 | 所有 reject 关闭已收 Handle 并 discard ReplyPort；QEMU 双调用验证 Handle stale 与新端口成功 |
-| E-2 E2-7-01：clippy / lint 门 | E-2 报告 | 原 lint finding 闭合；新增 E2-7-02/P2 nofd 锚点回归，报告继续开放 |
+| E-2 E2-7-01：clippy / lint 门 | E-2 档案 | 原 lint finding 与后续 nofd 锚点回归 E2-7-02 均闭合 |
 
 ### 本轮终段复核
 
@@ -110,21 +110,21 @@ WiseHare 负责 A/B-1/B-2/E-1，OliveWillow 负责 C-1/C-2/D-1/D-2/E-2，均只�
 - 任务分片只服务整体完成门：总体设计自顶向下约束 owner、容量、失败与发布边界；实施按依赖自下向上推进。分片代码可以暂未接通后续阶段，但必须直接采用最终接口，并在总计划登记连接点和剩余责任。
 - 不把“先改纯逻辑 crate → adapter 接回旧内核 → 最后清理调用者”当作阶段顺序。一个纵向单元跨所有必要模块；中间施工可先编辑底层、用编译器定位未迁移调用点，但不为短暂可编译引入兼容层或平行真值。
 - 设计确认、中间施工提交、完整纵向单元验收、提交后的 Review 是不同边界。中间提交只提供可回溯基线；局部编译或测试通过不构成专题完成。
-- 多页 Tunnel/RNL2 继续等待 D-1/E-1/E-2 三项收口；最终架构 Review 仍要求数据面既定触发条件满足。
+- D-1/E-1/E-2 三项已收口，多页 Tunnel/RNL2 可恢复；最终架构 Review 仍要求数据面既定触发条件满足。
 
 ## 首审报告索引
 
-每份报告保留历史目标、命令及验证限制，并在首部追加 `9ee2791` 的正式复核结果。五份专题实施计划已归档；六份报告闭合，D-1/E-1/E-2 持有本页列出的三个开放项。只有它们在后续固定提交中修复/补证并通过复核后，program 才能归档。
+各报告保留历史目标、命令及验证限制，在首部追加 9ee2791 或 228b6a5 的正式复核。五份专题实施计划、九份报告和本 program 均归档，本索引保留追溯关系，不再安排实施。
 
 | 批次 | 报告 | 历史目标范围 |
 |---|---|---|
-| A | [`memory-transaction-unification`](archived/review-2026-09-memory-transaction-unification.md) | `d2ff81e`、`5c0bbb0`、`d6a162c`，相关对象投影前置按 seam 引用 |
-| B-1 | [`memory-supply-and-pool`](archived/review-2026-09-memory-supply-and-pool.md) | `198e665`、`0a944c7`、`4715f3a`、`48227c8` |
-| B-2 | [`process-bind-page-table-retire`](archived/review-2026-09-process-bind-page-table-retire.md) | `7c76097`、`c522e50`、`7225673`、`cfad6cf`、`addb4a5`、`b4bfb20` |
-| C-1 | [`lifecycle-and-scheduling`](archived/review-2026-09-lifecycle-and-scheduling.md) | `d741880`、`bdc83ef`、`004cae5`、`fcbd5b6`、`b161163`、`1d7dc92` |
-| C-2 | [`remote-call-user-memory`](archived/review-2026-09-remote-call-user-memory.md) | 用户内存 `1cd6ab2` 至 `9358963`、`6199985`、`bdc83ef`、`004cae5` |
+| A | [`memory-transaction-unification`](review-2026-09-memory-transaction-unification.md) | `d2ff81e`、`5c0bbb0`、`d6a162c`，相关对象投影前置按 seam 引用 |
+| B-1 | [`memory-supply-and-pool`](review-2026-09-memory-supply-and-pool.md) | `198e665`、`0a944c7`、`4715f3a`、`48227c8` |
+| B-2 | [`process-bind-page-table-retire`](review-2026-09-process-bind-page-table-retire.md) | `7c76097`、`c522e50`、`7225673`、`cfad6cf`、`addb4a5`、`b4bfb20` |
+| C-1 | [`lifecycle-and-scheduling`](review-2026-09-lifecycle-and-scheduling.md) | `d741880`、`bdc83ef`、`004cae5`、`fcbd5b6`、`b161163`、`1d7dc92` |
+| C-2 | [`remote-call-user-memory`](review-2026-09-remote-call-user-memory.md) | 用户内存 `1cd6ab2` 至 `9358963`、`6199985`、`bdc83ef`、`004cae5` |
 | D-1 | [`mechanism-generalization`](review-2026-09-mechanism-generalization.md) | `15c7811`、`9c03251`、`95deea6` |
-| D-2 | [`bootstrap-launcher`](archived/review-2026-09-bootstrap-launcher.md) | `29c6519..1bc83ac` |
+| D-2 | [`bootstrap-launcher`](review-2026-09-bootstrap-launcher.md) | `29c6519..1bc83ac` |
 | E-1 | [`system-audit-03-04`](review-2026-09-system-audit-03-04.md) | `e5db4f3`，审计分片 3–4 |
 | E-2 | [`system-audit-05-07`](review-2026-09-system-audit-05-07.md) | `e5db4f3`，审计分片 5–7 |
 

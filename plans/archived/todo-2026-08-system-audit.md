@@ -1,6 +1,6 @@
 # 重写版系统审查
 
-> 当前状态：分片 1–2 已归档；分片 3–4、5–7 已完成首审并分别形成 [`review-2026-09-system-audit-03-04.md`](review-2026-09-system-audit-03-04.md) 与 [`review-2026-09-system-audit-05-07.md`](review-2026-09-system-audit-05-07.md)。两份报告均未通过最终收口， findings 由报告本身承载；后续需独立核验与修复后复审。
+> 状态：分片 1–7 的首审、修复与复核全部完成，本计划归档。分片 1–2 的历史报告和分片 3–4 的 [E-1](review-2026-09-system-audit-03-04.md)、5–7 的 [E-2](review-2026-09-system-audit-05-07.md) 均已关闭；最后修复基线为 `228b6a5`，WiseHare/OliveWillow 定点复核通过。下文保留原审查方法与模板，已不构成待实施队列。
 
 本审查面向当前整棵代码树，不以 diff 或旧实现为边界。目标是证明外部契约、内部设计和实现相互一致，并显式暴露尚无法证明的假设。
 
@@ -14,8 +14,8 @@
 
 按依赖顺序审查，每片固定自己的起始 commit：
 
-1. SBI 边界与地址纪律（已完成，[分片报告](archived/review-2026-08-audit-01-sbi.md)）；
-2. trapframe、上下文切换与 CSR（已完成，[分片报告](archived/review-2026-08-audit-02-trap-context.md)）；
+1. SBI 边界与地址纪律（已完成，[分片报告](review-2026-08-audit-01-sbi.md)）；
+2. trapframe、上下文切换与 CSR（已完成，[分片报告](review-2026-08-audit-02-trap-context.md)）；
 3. 启动、页表与 TLB（首审完成，见 `review-2026-09-system-audit-03-04.md`）；
 4. SMP、调度与对象生命周期（首审完成，见 `review-2026-09-system-audit-03-04.md`）；
 5. syscall 与 `shared/` ABI（首审完成，见 `review-2026-09-system-audit-05-07.md`）；

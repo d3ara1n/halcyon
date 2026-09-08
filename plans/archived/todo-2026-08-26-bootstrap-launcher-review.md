@@ -1,8 +1,8 @@
 # 历史审查清单：BootPackage / 用户态 launcher
 
-> 本文件已由 `plans/todo-2026-09-review-program.md` 批次 D 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-mechanism-and-launcher.md` 为准。
+> 本文件已由 `plans/archived/todo-2026-09-review-program.md` 批次 D 合并承接并归档；归档不表示审查完成。正式结论以 `plans/review-2026-09-mechanism-and-launcher.md` 为准。
 
-状态：**机会型任务（有空就做），不阻塞后续计划**。2026-08-26 机制层审查已完成（[archived/review-2026-08-26-bootstrap-launcher-mechanism.md](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)）：机制方向成立，launcher 基座可承接 process-lifecycle 工作；本计划的十切片代码审查保留，作为后续接入时发现问题的路线图，但不再是进入 `archived/todo-2026-08-26-process-lifecycle.md` 的前置条件。本文件冻结提交边界、设计契约、审查切片与核证入口；切片清单在执行代码审查时直接充当检查表。
+状态：**机会型任务（有空就做），不阻塞后续计划**。2026-08-26 机制层审查已完成（[archived/review-2026-08-26-bootstrap-launcher-mechanism.md](review-2026-08-26-bootstrap-launcher-mechanism.md)）：机制方向成立，launcher 基座可承接 process-lifecycle 工作；本计划的十切片代码审查保留，作为后续接入时发现问题的路线图，但不再是进入 `archived/todo-2026-08-26-process-lifecycle.md` 的前置条件。本文件冻结提交边界、设计契约、审查切片与核证入口；切片清单在执行代码审查时直接充当检查表。
 
 ## 提交范围
 

@@ -1,5 +1,16 @@
 # 系统审计批次 E-2：syscall/shared ABI、IPC/FAL/服务与工程化
 
+## 2026-09-08 最终复核（E-2，通过并归档）
+
+固定对象 `228b6a56dd75dc31ddb349556905634b1dc7c6ff`，范围 `8987f89..228b6a5`；OliveWillow 通过正式 send_to 确认 E2-7-02 闭合，无新 finding。E2-5-01/E2-7-01 已在前次固定提交复核关闭，本报告全部条目完成。
+
+`tools/qemu-acceptance.sh:65` 对齐 optional-degraded 锚点，并完整保留 NotSupported、Retained、cleanup_error None、Base64-only domain 与 Requested reset 检查；没有弱化 required/rejected 集合。`Justfile:218` 聚合加入 nofd，后续变更不能遗漏该路线。
+
+最终证据：`artifacts/review-fixes/acceptance.log:1` 起七面 lint 全通过，`:222` 起实际执行 nofd并正常 reset，随后进入 boot-failure；`acceptance.status=0`。`nofd-oracle.log` 有效输入返回 0，删除 D64 rejection/删除 reset/错误拒绝原因/清理错误四类全部返回 1。精确 Debug 文本仍是该输出契约，oracle 与真实路线共同约束其必要字段。早期 `clippy.status` 或失败日志是中间尝试，不能替代最终聚合证据。
+
+以下保留首审、首次复核与实施记录；“仍开放/待复核”仅描述对应历史时点。
+
+
 ## E2-7-02 修复实现与验证（待固定提交复核）
 
 nofd 锚点已与 `optional service bin/test_fp degraded` 对齐，保持完整 NotSupported/Retained/cleanup_error None 检查及 Base64 domain、Requested reset。`virt-nofd` 已纳入 acceptance，修复后完整 `THROTTLE=100 just acceptance` 退出 0，日志 `artifacts/review-fixes/acceptance.log`。
@@ -39,7 +50,7 @@ E2-7-02 尚开放，本报告保留根目录；首审两项关闭不代表全报
 
 审计分片 5（syscall/shared ABI）、分片 6（IPC/FAL/服务）和分片 7（工程化与全仓收口）。代码基线：`e5db4f32a507ca5bc26849b53e64c0a3b73fa82d`（`e5db4f3`）。工作树仅有预先存在的 plans 文档修改；本审计未修改文件、未提交代码。目标为系统审计首审，未经过独立 reviewer 核验；本报告 findings 状态为待核验/待修复。
 
-审计阅读了 `plans/todo-2026-08-system-audit.md`、`plans/REVIEW.md`、`references/CONTRACTS.md`，以及相关 `notes/ideas/`、`notes/impls/`。A–D 已知 findings 只作交叉确认，不重复编号。
+审计阅读了 `plans/archived/todo-2026-08-system-audit.md`、`plans/REVIEW.md`、`references/CONTRACTS.md`，以及相关 `notes/ideas/`、`notes/impls/`。A–D 已知 findings 只作交叉确认，不重复编号。
 
 ## 执行命令与结果
 
