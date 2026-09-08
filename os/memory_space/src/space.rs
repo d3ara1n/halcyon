@@ -226,8 +226,25 @@ pub struct MapResultLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermitRequirement {
-    pub object: ObjectId,
-    pub count: usize,
+    object: ObjectId,
+    /// 本次替换需要交给新区域的 permit 数量。
+    count: usize,
+    /// 其中不是从既有 writable 区域继承而来的数量；Sealing 必须为零。
+    new_writes: usize,
+}
+
+impl PermitRequirement {
+    pub const fn object(self) -> ObjectId {
+        self.object
+    }
+
+    pub const fn count(self) -> usize {
+        self.count
+    }
+
+    pub const fn new_writes(self) -> usize {
+        self.new_writes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,6 +417,8 @@ struct RegionTemplate {
     range: PageRange,
     owner: RegionOwner,
     kind: TemplateKind,
+    /// writable replacement 是否继承自本次将被替换的 writable 区域。
+    write_successor: bool,
 }
 
 impl RegionTemplate {
@@ -799,6 +818,7 @@ impl MemorySpace {
                 range: PageRange::new(reservation.start(), guard_before)?,
                 owner: request.owner,
                 kind: TemplateKind::Guard,
+                write_successor: false,
             });
         }
         replacements.push(RegionTemplate {
@@ -810,6 +830,7 @@ impl MemorySpace {
                 current: request.current,
                 maximum: request.maximum,
             },
+            write_successor: false,
         });
         if guard_after > 0 {
             replacements.push(RegionTemplate {
@@ -817,6 +838,7 @@ impl MemorySpace {
                 range: PageRange::new(usable.end(), guard_after)?,
                 owner: request.owner,
                 kind: TemplateKind::Guard,
+                write_successor: false,
             });
         }
 
@@ -1772,6 +1794,8 @@ fn template_from_region(
         range,
         owner: region.owner,
         kind,
+        write_successor: region.permit.is_some()
+            && matches!(kind, TemplateKind::Mapping { current: Protection::ReadWrite, .. }),
     })
 }
 
@@ -1811,6 +1835,7 @@ fn permit_requirements(
         let Some(object) = template.writable_object() else {
             continue;
         };
+        let is_new = usize::from(!template.write_successor);
         if let Some(requirement) = requirements
             .iter_mut()
             .find(|requirement| requirement.object == object)
@@ -1819,11 +1844,19 @@ fn permit_requirements(
                 .count
                 .checked_add(1)
                 .ok_or(ChangeError::PermitMismatch)?;
+            requirement.new_writes = requirement
+                .new_writes
+                .checked_add(is_new)
+                .ok_or(ChangeError::PermitMismatch)?;
         } else {
             requirements
                 .try_reserve(1)
                 .map_err(|_| ChangeError::AllocationFailed)?;
-            requirements.push(PermitRequirement { object, count: 1 });
+            requirements.push(PermitRequirement {
+                object,
+                count: 1,
+                new_writes: is_new,
+            });
         }
     }
     Ok(requirements)

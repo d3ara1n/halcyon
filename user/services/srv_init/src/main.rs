@@ -710,6 +710,56 @@ fn test_memory_mapping() -> Result<(), &'static str> {
         .unmap()
         .map_err(|_| "MemoryObject last view Unmap failed")?;
 
+    // Sealing 允许既有 writable view 收缩/切分，但拒绝把只读片段重新升为 writable。
+    let sealing = MemoryObject::create(3 * page).map_err(|_| "sealing object create failed")?;
+    let sealing_view = MappedRegion::map_object(
+        &sealing,
+        0,
+        3 * page,
+        0,
+        0,
+        MemoryProtection::ReadWrite,
+        Placement::Anywhere,
+    )
+    .map_err(|_| "sealing writable view Map failed")?;
+    let sealing_usable = sealing_view
+        .usable()
+        .ok_or("sealing writable view returned no usable range")?;
+    sealing.seal().map_err(|_| "sealing request failed")?;
+    sealing_view
+        .protect(
+            sealing_usable.start + page..sealing_usable.start + 2 * page,
+            MemoryProtection::ReadOnly,
+        )
+        .map_err(|_| "Sealing partial writable downgrade failed")?;
+    let snapshot = sealing
+        .query()
+        .map_err(|_| "sealing object query after downgrade failed")?;
+    if snapshot.state() != Some(MemoryObjectState::Sealing) || snapshot.write_views != 2 {
+        return Err("Sealing writable successor accounting invalid");
+    }
+    match sealing_view.protect(
+        sealing_usable.start + page..sealing_usable.start + 2 * page,
+        MemoryProtection::ReadWrite,
+    ) {
+        Err(SystemCallError::ObjectBusy) => {}
+        Err(_) => return Err("Sealing write re-enable returned the wrong error"),
+        Ok(()) => return Err("Sealing admitted a new writable region"),
+    }
+    sealing_view
+        .protect(sealing_usable.clone(), MemoryProtection::ReadOnly)
+        .map_err(|_| "Sealing final writable downgrade failed")?;
+    let snapshot = sealing
+        .query()
+        .map_err(|_| "sealing object final query failed")?;
+    if snapshot.state() != Some(MemoryObjectState::Executable) || snapshot.write_views != 0 {
+        return Err("Sealing did not complete after the last writable successor retired");
+    }
+    sealing_view
+        .unmap()
+        .map_err(|_| "sealing view Unmap failed")?;
+    sealing.close();
+
     // RX authority 与对象发布状态正交：完整 capability 在 Mutable 期仍不能执行，
     // Seal 后缺 EXECUTE 的裁剪副本也不能借对象状态绕过 rights。
     let executable = MemoryObject::create(page).map_err(|_| "executable object create failed")?;

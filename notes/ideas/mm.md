@@ -196,7 +196,7 @@ Mutable --SealExecutable--> Sealing --last WritePermit retired--> Executable
 | Sealing | 只读 view；既有 writable view 的撤销/降权 | 新 WritePermit、直接写、executable view、回到 Mutable | 最后一个 WritePermit 完成 retire |
 | Executable | 只读或读执行 view | 任意写入口、WritePermit、回到 Mutable/Sealing | 终态 |
 
-Mutable 允许只读 view，并允许在对象锁内取得 `WritePermit` 后建立或重新启用 writable view；不允许 executable view。`SealExecutable` 要求对象定义的管理 authority，并与 WritePermit 预留在同一对象锁上线性化：先取得 permit 的变更计入 seal 等待，先进入 Sealing 的对象拒绝新 writable view、重新加写权限和直接写入口。Sealing 允许既有 writable view 继续存在直至其 owner 显式撤销，但状态不可回退；Executable 永久拒绝全部写入口与 writable permit，只允许只读或读执行 view。普通 Protect 不能把读写 mapping 转成读执行，也不能重新打开已发布对象。
+Mutable 允许只读 view，并允许在对象锁内取得 `WritePermit` 后建立或重新启用 writable view；不允许 executable view。`SealExecutable` 要求对象定义的管理 authority，并与 WritePermit 预留在同一对象锁上线性化：先取得 permit 的变更计入 seal 等待，先进入 Sealing 的对象拒绝新 writable view、重新加写权限和直接写入口。Sealing 允许既有 writable view 继续存在直至其 owner 显式撤销，也允许通过 Unmap/Protect 把既有写授权切分或收窄；这种后继 permit 只延续原区域内的写范围，不是新的写授权。Sealing 仍拒绝新 writable view、把原只读范围重新加写或扩大写范围，状态不可回退；Executable 永久拒绝全部写入口与 writable permit，只允许只读或读执行 view。普通 Protect 不能把读写 mapping 转成读执行，也不能重新打开已发布对象。
 
 WritePermit 的计数覆盖 reserved、published 和 retiring 三个阶段。Map/Protect 在 Commit 前放弃 permit 可以直接回滚；Commit 后移除 W 权限或 Unmap 时，permit 随旧 view 进入 retire，只有 active-hart 快照全部完成 `SFENCE.VMA` 并以 acquire 收齐确认后才退出计数。最后一个 permit 的 retire 负责把 Sealing 单向推进到 Executable 并发布对象的 `EXECUTABLE` 电平（见下）；seal 发起线程消散不撤销已发布状态转换。RX view 只能在观察 Executable 后建立，并为可能执行该代码代次的 hart 推进 instruction epoch 与 `FENCE.I`。
 

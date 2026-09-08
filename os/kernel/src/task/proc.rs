@@ -477,6 +477,13 @@ struct PinnedMapResult {
 /// 与 PTE preflight。四个维度由字段存在性表达，不再每种组合各自成型：
 /// source（`backing` 有无）、output（`result` cookie 有无）、Unmap 切分预算
 /// （`backing_permits`）与 Building 的映像推进（`image_end`）。
+pub(crate) struct PermitSource {
+    object: ObjectId,
+    core: Arc<super::memory_object::MemoryObjectCore>,
+}
+
+pub(crate) type PermitSources = Box<Vec<PermitSource>>;
+
 pub(crate) struct MemoryChangePlan {
     change: PreparedChange,
     preflights: Vec<TranslationPreflight>,
@@ -489,6 +496,8 @@ pub(crate) struct MemoryChangePlan {
     published_view: Option<ObjectMappingLease>,
     /// Commit 时装入地址空间的 view 所有权（强引用 + admission）。
     view_owner: Option<PreparedObjectView>,
+    /// Validate 时冻结的 object 来源，覆盖锁外许可取得与失败回滚窗口。
+    permit_sources: Option<PermitSources>,
 }
 
 impl MemoryChangePlan {
@@ -509,6 +518,8 @@ struct MemoryChangeReservation {
     image_end: Option<usize>,
     published_view: Option<ObjectMappingLease>,
     view_owner: Option<PreparedEntry<ObjectViewOwner>>,
+    /// Validate 时冻结的 object 来源；Commit 前回滚不回查 live view 表。
+    permit_sources: Option<PermitSources>,
     /// 退役 owner 槽位由 Validate 结果确定，并在 Commit 前完成分配。
     retiring_views: Vec<RetiringObjectView>,
 }
@@ -527,6 +538,8 @@ pub(crate) struct ReclaimedTableFrames {
     /// 未发布的 view 所有权。它持对象强引用，析构可能归还 backing 与 Pool charge，
     /// 因此必须随本结构一起在 AddressSpace 锁外释放。
     view_owner: Option<PreparedObjectView>,
+    /// Validate 时冻结的 object 来源，不能在回滚时回查易失的 live view 表。
+    permit_sources: Option<PermitSources>,
 }
 
 impl ReclaimedTableFrames {
@@ -554,6 +567,7 @@ pub(crate) struct ObjectMappingLease {
 pub(crate) struct ObjectMapFailure {
     pub(crate) error: SpaceError,
     pub(crate) permits: Vec<WritePermit>,
+    pub(crate) sources: Option<PermitSources>,
 }
 
 impl PreparedMemoryChange {
@@ -1031,6 +1045,29 @@ impl AddressSpaceState {
         matches!(self, Self::Bound(_))
     }
 
+    pub(crate) fn view_sources(
+        &self,
+        requirements: &[PermitRequirement],
+    ) -> Result<Option<PermitSources>, SystemCallError> {
+        if requirements.is_empty() {
+            return Ok(None);
+        }
+        let bound = self.bound().map_err(SystemCallError::from)?;
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(requirements.len())
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        for requirement in requirements {
+            sources.push(PermitSource {
+                object: requirement.object(),
+                core: bound.view_core(requirement.object()),
+            });
+        }
+        Box::try_new(sources)
+            .map(Some)
+            .map_err(|_| SystemCallError::OutOfMemory)
+    }
+
     pub(crate) fn bind(
         &mut self,
         bound: Box<BoundAddressSpace>,
@@ -1075,6 +1112,7 @@ impl AddressSpaceState {
                 let MemoryChangePlan {
                     backing,
                     view_owner,
+                    permit_sources,
                     ..
                 } = plan;
                 return Err((
@@ -1086,6 +1124,7 @@ impl AddressSpaceState {
                         backing,
                         permits: Vec::new(),
                         view_owner,
+                        permit_sources,
                     },
                 ));
             }
@@ -2045,7 +2084,7 @@ fn start_running_memory_change(
                 .space
                 .lock()
                 .rollback_memory_change(prepared.take().expect($reason));
-            release_reclaimed_permits(&process, &mut reclaimed);
+            release_reclaimed_permits(&mut reclaimed);
             drop(reclaimed);
         }};
     }
@@ -2200,11 +2239,12 @@ pub(crate) fn memory_unmap(
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
     let process = thread.process.clone();
     let range = public_page_range(address, bytes)?;
-    let (validated, requirements, sponsor) = {
+    let (validated, requirements, sources, sponsor) = {
         let mut space = process.space.lock();
         let (validated, requirements) = space.validate_user_unmap(range)?;
+        let sources = space.view_sources(&requirements)?;
         let sponsor = Arc::clone(space.sponsor());
-        (validated, requirements, sponsor)
+        (validated, requirements, sources, sponsor)
     };
     let backing_permits = reserve_backing_split_metadata(&sponsor).map_err(post_validate_error)?;
     start_existing_change(
@@ -2212,6 +2252,7 @@ pub(crate) fn memory_unmap(
         process,
         validated,
         requirements,
+        sources,
         backing_permits,
         range,
     )
@@ -2229,15 +2270,18 @@ pub(crate) fn memory_protect(
     let raw = u32::try_from(protection).map_err(|_| SystemCallError::IllegalArgument)?;
     let protection = MemoryProtection::from_raw(raw).ok_or(SystemCallError::IllegalArgument)?;
     let protection = public_protection(protection);
-    let (validated, requirements) = {
+    let (validated, requirements, sources) = {
         let mut space = process.space.lock();
-        space.validate_user_protect(range, protection)?
+        let (validated, requirements) = space.validate_user_protect(range, protection)?;
+        let sources = space.view_sources(&requirements)?;
+        (validated, requirements, sources)
     };
     start_existing_change(
         thread,
         process,
         validated,
         requirements,
+        sources,
         Vec::new(),
         range,
     )
@@ -2246,17 +2290,21 @@ pub(crate) fn memory_protect(
 /// Unmap/Protect 的公共后半段：先在 AddressSpace 锁外按 Validate 报告的多重集向各
 /// 来源对象取得 WritePermit（对象锁秩低于 AddressSpace），再重入完成 reservation。
 ///
-/// 含 W 的 object view 被部分撤销或降权时，存活片段是新铸造的区域，各自需要一枚新
-/// permit；纯匿名变更的多重集为空，这条路径退化为原来的零 permit 形态。
+/// 含 W 的 object view 被部分撤销或降权时，存活片段各取得一枚后继 permit；planner
+/// 同时标明是否扩大原写范围，Sealing 只接受纯后继集合。纯匿名变更退化为零 permit。
 fn start_existing_change(
     thread: &Thread,
     process: Arc<Process>,
     validated: memory_space::ValidatedChange,
     requirements: Vec<PermitRequirement>,
+    sources: Option<PermitSources>,
     backing_permits: Vec<super::resources::BackingSlicePermit>,
     range: LedgerPageRange,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let (permits, sources) = match acquire_view_permits(&process, &requirements) {
+    let permits = match acquire_view_permits(
+        &requirements,
+        sources.as_deref().map(Vec::as_slice),
+    ) {
         Ok(acquired) => acquired,
         Err(error) => {
             // Validate 未预留任何资源，放弃计划无需回滚账本。
@@ -2266,12 +2314,17 @@ fn start_existing_change(
     };
     let plan_result = {
         let mut space = process.space.lock();
-        space.prepare_user_existing_change(validated, permits)
+        space.prepare_user_existing_change(validated, permits, sources)
     };
     let mut plan = match plan_result {
         Ok(plan) => plan,
         Err(failure) => {
-            release_view_permits(&sources, failure.permits);
+            let sources = failure
+                .sources
+                .as_deref()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            release_view_permits(sources, failure.permits);
             return Err(post_validate_error(failure.error));
         }
     };
@@ -2284,65 +2337,64 @@ fn start_existing_change(
 /// 按 Validate 报告的多重集向每个来源对象取得 WritePermit。任何一项失败时，已取得
 /// 的 permit 立即原样归还，账本零副作用。
 fn acquire_view_permits(
-    process: &Arc<Process>,
     requirements: &[PermitRequirement],
-) -> Result<
-    (
-        Vec<WritePermit>,
-        Vec<Arc<super::memory_object::MemoryObjectCore>>,
-    ),
-    SystemCallError,
-> {
+    sources: Option<&[PermitSource]>,
+) -> Result<Vec<WritePermit>, SystemCallError> {
     let mut permits = Vec::new();
-    let mut sources = Vec::new();
     if requirements.is_empty() {
-        return Ok((permits, sources));
+        return Ok(permits);
     }
+    let sources = sources.unwrap_or_default();
+    assert_eq!(
+        requirements.len(),
+        sources.len(),
+        "validated permit sources diverged from requirements"
+    );
     let total = requirements
         .iter()
         .try_fold(0usize, |sum, requirement| {
-            sum.checked_add(requirement.count)
+            sum.checked_add(requirement.count())
         })
         .ok_or(SystemCallError::InternalError)?;
     permits
         .try_reserve_exact(total)
         .map_err(|_| SystemCallError::OutOfMemory)?;
-    sources
-        .try_reserve_exact(requirements.len())
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    for requirement in requirements {
-        let core = process.space.lock().view_core(requirement.object);
-        match core.reserve_writes(requirement.count) {
+    for (requirement, source) in requirements.iter().zip(sources) {
+        assert_eq!(
+            source.object,
+            requirement.object(),
+            "validated permit source identity changed"
+        );
+        match source.core.reserve_replacement_writes(*requirement) {
             Ok(mut acquired) => {
                 permits.append(&mut acquired);
-                sources.push(core);
             }
             Err(error) => {
                 let failure = super::memory_object::map_object_error(error);
-                release_view_permits(&sources, permits);
+                release_view_permits(sources, permits);
                 return Err(failure);
             }
         }
     }
-    Ok((permits, sources))
+    Ok(permits)
 }
 
 /// 把未提交的 permit 原样归还来源对象。permit 自带来源身份，因此按对象分派。
 fn release_view_permits(
-    sources: &[Arc<super::memory_object::MemoryObjectCore>],
+    sources: &[PermitSource],
     permits: Vec<WritePermit>,
 ) {
     for permit in permits {
         let object = permit.object();
-        let core = sources
+        let source = sources
             .iter()
-            .find(|core| core.identity() == object)
+            .find(|source| source.object == object)
             .expect("reserved write permit lost its source object");
-        core.cancel_write(permit);
+        source.core.cancel_write(permit);
     }
 }
 
-fn release_reclaimed_permits(process: &Arc<Process>, reclaimed: &mut ReclaimedTableFrames) {
+fn release_reclaimed_permits(reclaimed: &mut ReclaimedTableFrames) {
     let owner_core = reclaimed
         .view_owner
         .as_ref()
@@ -2351,7 +2403,12 @@ fn release_reclaimed_permits(process: &Arc<Process>, reclaimed: &mut ReclaimedTa
         let object = permit.object();
         let core = match owner_core.as_ref().filter(|core| core.identity() == object) {
             Some(core) => Arc::clone(core),
-            None => process.space.lock().view_core(object),
+            None => reclaimed
+                .permit_sources
+                .as_deref()
+                .and_then(|sources| sources.iter().find(|source| source.object == object))
+                .map(|source| Arc::clone(&source.core))
+                .expect("reclaimed write permit lost its frozen source"),
         };
         core.cancel_write(permit);
     }
@@ -2368,7 +2425,7 @@ fn fund_and_complete_running(
         Ok(funded) => funded,
         Err(error) => {
             let mut reclaimed = process.space.lock().rollback_memory_change_plan(plan);
-            release_reclaimed_permits(process, &mut reclaimed);
+            release_reclaimed_permits(&mut reclaimed);
             drop(reclaimed);
             return Err(post_validate_error(error));
         }
@@ -2377,7 +2434,7 @@ fn fund_and_complete_running(
     match result {
         Ok(prepared) => Ok(prepared),
         Err((error, mut reclaimed)) => {
-            release_reclaimed_permits(process, &mut reclaimed);
+            release_reclaimed_permits(&mut reclaimed);
             drop(reclaimed);
             Err(post_validate_error(error))
         }
@@ -2698,6 +2755,7 @@ impl BoundAddressSpace {
             image_end: None,
             published_view: None,
             view_owner: None,
+            permit_sources: None,
         })
     }
 
@@ -2726,6 +2784,29 @@ impl BoundAddressSpace {
         backing.preflight_install(tree, range, offset, protection)
     }
 
+    #[inline(never)]
+    fn prepare_translations(
+        &mut self,
+        preflights: Vec<TranslationPreflight>,
+        reclaimed: &mut ReclaimedTableFrames,
+    ) -> Result<(), SpaceError> {
+        reclaimed
+            .translations
+            .try_reserve_exact(preflights.len())
+            .map_err(|_| SpaceError::NoFrame)?;
+        for (preflight, funded) in preflights.into_iter().zip(&mut reclaimed.funded) {
+            let owners = core::mem::take(funded);
+            match self.tt().prepare(preflight, owners) {
+                Ok(translation) => reclaimed.translations.push(translation),
+                Err(failure) => {
+                    reclaimed.failed_owners = Some(failure.owners);
+                    return Err(failure.error.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 锁外取得的表页 owner 进入 PTE reservation。Running、Building 与 bootstrap
     /// 共用本函数：三者的差异已在 plan 阶段表达为字段，发布前的步骤完全相同。
     /// 任何失败都回滚账本并把摘出的 owner 交回调用者在 AddressSpace 锁外析构。
@@ -2748,6 +2829,7 @@ impl BoundAddressSpace {
             image_end,
             published_view,
             mut view_owner,
+            permit_sources,
         } = plan;
         let mut reclaimed = ReclaimedTableFrames {
             funded,
@@ -2756,12 +2838,14 @@ impl BoundAddressSpace {
             backing,
             permits: Vec::new(),
             view_owner: None,
+            permit_sources: None,
         };
         macro_rules! fail {
             ($error:expr) => {{
                 self.release_backing_growth_all(&backing_growth);
                 reclaimed.permits = self.ledger().rollback(change);
                 reclaimed.view_owner = view_owner;
+                reclaimed.permit_sources = permit_sources;
                 self.clear_table_transaction();
                 return Err(($error, reclaimed));
             }};
@@ -2769,15 +2853,9 @@ impl BoundAddressSpace {
         if reclaimed.funded.len() != preflights.len() {
             fail!(SpaceError::NoFrame);
         }
-        if reclaimed
-            .translations
-            .try_reserve_exact(preflights.len())
-            .is_err()
-        {
-            fail!(SpaceError::NoFrame);
-        }
+        let preflight_count = preflights.len();
         let mut table_outcomes = Vec::new();
-        if table_outcomes.try_reserve_exact(preflights.len()).is_err() {
+        if table_outcomes.try_reserve_exact(preflight_count).is_err() {
             fail!(SpaceError::NoFrame);
         }
         let mut retiring_views = Vec::new();
@@ -2791,15 +2869,8 @@ impl BoundAddressSpace {
             Ok(token) => token,
             Err(error) => fail!(error),
         };
-        for (preflight, funded) in preflights.into_iter().zip(&mut reclaimed.funded) {
-            let owners = core::mem::take(funded);
-            match self.tt().prepare(preflight, owners) {
-                Ok(translation) => reclaimed.translations.push(translation),
-                Err(failure) => {
-                    reclaimed.failed_owners = Some(failure.owners);
-                    fail!(failure.error.into());
-                }
-            }
+        if let Err(error) = self.prepare_translations(preflights, &mut reclaimed) {
+            fail!(error);
         }
         let view_owner = match view_owner.take() {
             Some(view) => {
@@ -2832,6 +2903,7 @@ impl BoundAddressSpace {
             image_end,
             published_view,
             view_owner,
+            permit_sources,
             retiring_views,
         });
         Ok(token)
@@ -2841,12 +2913,14 @@ impl BoundAddressSpace {
         &mut self,
         validated: memory_space::ValidatedChange,
         permits: Vec<WritePermit>,
+        permit_sources: Option<PermitSources>,
     ) -> Result<MemoryChangePlan, ObjectMapFailure> {
         macro_rules! fail {
             ($error:expr, $permits:expr) => {{
                 return Err(ObjectMapFailure {
                     error: $error,
                     permits: $permits,
+                    sources: permit_sources,
                 });
             }};
         }
@@ -2912,6 +2986,7 @@ impl BoundAddressSpace {
             image_end: None,
             published_view: None,
             view_owner: None,
+            permit_sources,
         })
     }
 
@@ -2984,6 +3059,7 @@ impl BoundAddressSpace {
             table_outcomes,
             backing,
             view_owner,
+            permit_sources,
             result: _,
             backing_permits: _,
             backing_growth,
@@ -3002,6 +3078,7 @@ impl BoundAddressSpace {
             backing,
             permits,
             view_owner,
+            permit_sources,
         }
     }
 
@@ -3020,6 +3097,7 @@ impl BoundAddressSpace {
             backing_growth,
             image_end: _,
             published_view: _,
+            permit_sources,
         } = plan;
         self.release_backing_growth_all(&backing_growth);
         let permits = self.ledger().rollback(change);
@@ -3030,6 +3108,7 @@ impl BoundAddressSpace {
             backing,
             permits,
             view_owner,
+            permit_sources,
         }
     }
 
@@ -3051,6 +3130,7 @@ impl BoundAddressSpace {
             image_end,
             published_view,
             view_owner,
+            permit_sources,
             retiring_views,
         } = prepared.take();
         assert!(
@@ -3086,6 +3166,15 @@ impl BoundAddressSpace {
                 .and_then(|count| count.checked_add(delta.replacement))
                 .expect("object view region count diverged from ledger");
         }
+        debug_assert!(permit_sources.as_deref().is_none_or(|sources| {
+            sources.iter().all(|source| {
+                retiring_views
+                    .iter()
+                    .any(|view| view.object == source.object)
+            })
+        }));
+        // 每个冻结来源已由 retiring view 接力保活，释放这里只做 Arc 计数递减。
+        drop(permit_sources);
         let committed = self.ledger().commit(change);
         let table_outcomes = self.tt().publish_batch(translations, table_outcomes);
         let published = self.ledger().publish(committed);
@@ -3122,7 +3211,8 @@ impl BoundAddressSpace {
             Ok(prepared) => Ok(prepared),
             Err((error, mut reclaimed)) => {
                 let permits = reclaimed.take_permits();
-                Err((ObjectMapFailure { error, permits }, reclaimed))
+                let sources = core::mem::take(&mut reclaimed.permit_sources);
+                Err((ObjectMapFailure { error, permits, sources }, reclaimed))
             }
         }
     }
@@ -3229,6 +3319,7 @@ impl BoundAddressSpace {
             image_end,
             published_view: None,
             view_owner: None,
+            permit_sources: None,
         })
     }
 
@@ -3549,6 +3640,7 @@ impl BoundAddressSpace {
                 return Err(ObjectMapFailure {
                     error: $error,
                     permits: $permits,
+                    sources: None,
                 });
             }};
         }
@@ -3665,6 +3757,7 @@ impl BoundAddressSpace {
                 MapAuthority::AddressSpace => None,
             },
             view_owner: Some(view_owner),
+            permit_sources: None,
         })
     }
 
@@ -3737,6 +3830,7 @@ impl BoundAddressSpace {
             image_end: None,
             published_view: None,
             view_owner: None,
+            permit_sources: None,
         })
     }
 

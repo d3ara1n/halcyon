@@ -350,7 +350,13 @@ fn plan_side_mapping(
     let (intent, spans, view_owner) =
         match reserve_mapping_resources(connection, thread.process.resources.metadata(), va) {
             Ok(reserved) => reserved,
-            Err(error) => return Err(super::proc::ObjectMapFailure { error, permits }),
+            Err(error) => {
+                return Err(super::proc::ObjectMapFailure {
+                    error,
+                    permits,
+                    sources: None,
+                })
+            }
         };
     let mut space = thread.process.space.lock();
     let pool = Arc::clone(space.pool());

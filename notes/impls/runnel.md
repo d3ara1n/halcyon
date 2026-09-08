@@ -20,7 +20,9 @@ Producer 提供 `writable`、`write`、`set_eof`、`write_all`、`finish`；Cons
 
 Runnel 只负责字节流；双工通信由两条方向相反的单工 Tunnel 组合。记录边界、预注册 MemoryObject region、descriptor 和缓冲交接属于并列的 BufferQueue，不进入本协议。
 
-多页 Tunnel 与 RNL2 尚未实现；当前实现仍以单页 RNL1 为准。方向契约见 [`../ideas/tunnel.md`](../ideas/tunnel.md) 与 [`../ideas/runnel.md`](../ideas/runnel.md)，实施进度由 [`../../plans/todo-2026-09-memory-object-data-plane.md`](../../plans/todo-2026-09-memory-object-data-plane.md) 记录。
+多页 Tunnel 与 RNL2 尚未实现；当前实现仍以单页 RNL1 为准。RNL1 以 wrapping `u32` 累计游标直接 `% 3968` 取得物理环位置；`2^32` 不整除 3968，因此跨整数回绕的分段访问会静默错位，现有测试只分别覆盖差值回绕和普通环分段，不能证明组合正确。RNL2 必须从格式上分离累计进度与物理位置，不能只加宽为 `u64`。
+
+当前 `Producer/Consumer::handle()` 还会安全返回可复制 Endpoint Handle，而 rinlib raw close 可在 wrapper 存活时解除映射，使内部裸指针失去生命周期保障。正式数据面迁移必须由消费式 Endpoint owner 同时持有 Handle 与 mapping lease，协议 wrapper 只借用能力。方向契约见 [`../ideas/tunnel.md`](../ideas/tunnel.md) 与 [`../ideas/runnel.md`](../ideas/runnel.md)，以上两项及跨进程共享字节访问论证均由 [`数据面计划`](../../plans/todo-2026-09-memory-object-data-plane.md) 唯一承接。
 
 ## 验证入口
 

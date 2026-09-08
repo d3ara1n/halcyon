@@ -673,7 +673,7 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
             result: None,
         })
         .unwrap();
-    assert_eq!(validated.permit_requirements()[0].count, 1);
+    assert_eq!(validated.permit_requirements()[0].count(), 1);
     let failure = space.reserve(validated, Vec::new()).unwrap_err();
     assert_eq!(failure.error, ChangeError::PermitMismatch);
     assert_eq!(space.region_count(), 1);
@@ -753,6 +753,107 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
 }
 
 #[test]
+fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
+    let mut space = space();
+    let object_id = ObjectId::new(21).unwrap();
+    let mut object = MemoryObjectState::new(object_id, 3 * PAGE_SIZE, 8);
+    let validated = space
+        .validate_map(MapRequest {
+            bytes: 3 * PAGE_SIZE,
+            guard_before: 0,
+            guard_after: 0,
+            placement: MapPlacement::FixedEmpty { usable_start: BASE },
+            current: Protection::ReadWrite,
+            maximum: Protection::ReadWrite,
+            owner: RegionOwner::AddressSpace,
+            backing: MapBacking::Object {
+                authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
+                offset: 0,
+            },
+            result: None,
+        })
+        .unwrap();
+    let prepared = space
+        .reserve(validated, object.reserve_writes(1).unwrap())
+        .unwrap();
+    complete_prepared(&mut space, prepared);
+    assert_eq!(object.seal(), SealOutcome::Pending);
+
+    let middle = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
+    let validated = space
+        .validate_protect(ProtectRequest {
+            range: middle,
+            protection: Protection::ReadOnly,
+            authority: RegionOwner::AddressSpace,
+        })
+        .unwrap();
+    let requirement = validated.permit_requirements()[0];
+    assert_eq!(requirement.object(), object_id);
+    assert_eq!(requirement.count(), 2);
+    assert_eq!(requirement.new_writes(), 0);
+    let mut other = MemoryObjectState::new(ObjectId::new(22).unwrap(), PAGE_SIZE, 8);
+    assert_eq!(
+        other.reserve_replacement_writes(requirement),
+        Err(ObjectError::PermitDenied)
+    );
+    let permits = object.reserve_replacement_writes(requirement).unwrap();
+    let prepared = space.reserve(validated, permits).unwrap();
+    let committed = space.commit(prepared);
+    let published = space.publish(committed);
+    let synchronized = space.synchronize(published);
+    let (retiring, mut batch) = space.begin_retire(synchronized);
+    while batch.pop_fragment().is_some() {}
+    let old = batch
+        .pop_permit()
+        .expect("old writable permit must retire");
+    assert!(!object.retire_write(old));
+    assert!(batch.is_empty());
+    let retired = space.finish_retire(retiring, &batch);
+    space.complete(retired);
+    assert_eq!(object.state(), ExecutableState::Sealing);
+    assert_eq!(object.permit_count(), 2);
+
+    let validated = space
+        .validate_protect(ProtectRequest {
+            range: middle,
+            protection: Protection::ReadWrite,
+            authority: RegionOwner::AddressSpace,
+        })
+        .unwrap();
+    let requirement = validated.permit_requirements()[0];
+    assert_eq!(requirement.count(), 1);
+    assert_eq!(requirement.new_writes(), 1);
+    assert_eq!(
+        object.reserve_replacement_writes(requirement),
+        Err(ObjectError::PermitDenied)
+    );
+
+    let validated = space
+        .validate_protect(ProtectRequest {
+            range: PageRange::new(BASE, 3 * PAGE_SIZE).unwrap(),
+            protection: Protection::ReadOnly,
+            authority: RegionOwner::AddressSpace,
+        })
+        .unwrap();
+    assert!(validated.permit_requirements().is_empty());
+    let prepared = reserve_no_permits(&mut space, validated);
+    let committed = space.commit(prepared);
+    let published = space.publish(committed);
+    let synchronized = space.synchronize(published);
+    let (retiring, mut batch) = space.begin_retire(synchronized);
+    while batch.pop_fragment().is_some() {}
+    let mut sealed = false;
+    while let Some(permit) = batch.pop_permit() {
+        sealed |= object.retire_write(permit);
+    }
+    assert!(sealed);
+    let retired = space.finish_retire(retiring, &batch);
+    space.complete(retired);
+    assert_eq!(object.state(), ExecutableState::Executable);
+    assert_eq!(object.permit_count(), 0);
+}
+
+#[test]
 fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write() {
     let mut first_space = space();
     let object_id = ObjectId::new(12).unwrap();
@@ -818,7 +919,7 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
             authority: RegionOwner::AddressSpace,
         })
         .unwrap();
-    assert_eq!(validated.permit_requirements()[0].object, mutable_id);
+    assert_eq!(validated.permit_requirements()[0].object(), mutable_id);
     assert_eq!(executable.reserve_writes(1), Err(ObjectError::PermitDenied));
 }
 

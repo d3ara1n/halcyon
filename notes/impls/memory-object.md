@@ -24,7 +24,7 @@
 
 ## 对象状态与授权基元
 
-`MemoryObjectState` 以固定 `ObjectId` 标识对象，并保存可执行发布状态与在途可写 view 数量。状态单向经过 `Mutable → Sealing → Executable`：Mutable 可以授权符合最大权限的 view 并取得 `WritePermit`；Sealing 拒绝新的写许可；最后一个 permit 取消或退役后进入 Executable。
+`MemoryObjectState` 以固定 `ObjectId` 标识对象，并保存可执行发布状态与在途可写 view 数量。状态单向经过 `Mutable → Sealing → Executable`：Mutable 可以授权符合最大权限的 view 并取得 `WritePermit`；Sealing 拒绝新的写授权，但允许从既有 writable 区域派生范围不扩大的后继 permit，以支持部分 Unmap/Protect；最后一个 permit 取消或退役后进入 Executable。
 
 seal 不保存等待者：状态机只报告「本次是否发生 Executable 转换」，由调用方（对象 core）据此发布 `EXECUTABLE` 电平并完成通用等待者。发起 seal 的线程消散不影响已发布的状态转换；重复 seal 在 Executable 上幂等成功。
 
@@ -35,7 +35,7 @@ seal 不保存等待者：状态机只报告「本次是否发生 Executable 转
 permit 的真值链：对象状态机铸造 → AddressSpace 事务持有（reserved/published/retiring 三阶段）→ 同步确认后经 `view_core(object)` 归还对象状态机。`MemoryRetireSink` 只推进对象侧生命周期通知，不持有 permit。对象状态锁秩（250）低于 AddressSpace（300），因此：
 
 - 预取：view 所有权（`PreparedObjectView`）在 AddressSpace 锁外构造，身份随之取定，Commit 路径不回取对象锁；
-- 两段式 Unmap/Protect：Validate 在 AddressSpace 锁内定几何并报告 permit 多重集（含 W 的 object view 被部分撤销或降权时，存活片段是新铸造区域、各需一枚新 permit），permit 在 AddressSpace 锁外向对象取得后重入 Reserve；
+- 两段式 Unmap/Protect：Validate 在 AddressSpace 锁内定几何、冻结各 ObjectId 对应的 core 强引用，并报告 permit 多重集及每个 writable replacement 是否继承自旧 writable 区域；锁外向冻结来源取得 permit 后重入 Reserve。Sealing 只接受全部 replacement 都是既有写范围后继的请求，拒绝只读范围升权；失败回滚随事务携带的来源归还 permit，不回查易失的 live view 表；
 - 归还：retire 批次先在锁内取得对象 core 的强引用，解锁后再归还 permit。
 
 地址空间每对象持一枚 view owner（强引用 + `ObjectViewPermit`），保存在 fallible AVL 中。`region_count` 按 ledger Commit 的 `ObjectRegionDelta` 更新，Retire 不回扫 live ledger；同一批次每对象只保留一个 `RetiringObjectView`，强持 core 到该批 permit 归还完成，计数为零时再交出 live view owner。具体容量与退役步骤见 [`mm.md`](mm.md)。
@@ -50,7 +50,7 @@ rinlib 的 `MemoryObject`/`MemoryPool` typed owner 只接纳当前进程已安�
 
 ## 验证入口
 
-- host：`os/memory_space/tests/planner.rs` 覆盖对象授权、WritePermit、seal 状态推进、对象 offset、permit mismatch 与逐项 retire。
-- `srv_init` core 验收（`test_memory_mapping` 尾段）：创建 → 快照 → 同对象 RW/RO 双 view → Handle 先关仍可访问 → 部分撤销 → Pool charge 守恒。
+- host：`os/memory_space/tests/planner.rs` 覆盖对象授权、WritePermit、seal 状态推进、对象 offset、permit mismatch、逐项 retire，以及 Sealing 下 writable 区域切分/降权与只读范围重新加写的拒绝。
+- `srv_init` core 验收（`test_memory_mapping` 尾段）：创建 → 快照 → 同对象 RW/RO 双 view → Handle 先关仍可访问 → 部分撤销 → Sealing 三页 RW 中段降权、重加写拒绝与最终 Executable → Pool charge 守恒。
 - `srv_init` capability 矩阵覆盖 Mutable 状态拒绝 RX、缺 `EXECUTE` 的派生 Handle 返回 `RightsDenied`、原 Handle 关闭后具 `MAP|READ|EXECUTE` 的派生 Handle 仍可完成 RX Map/Unmap，并通过 Seal 后 Query 状态与 RX Map 检查可执行状态；该用例没有直接 WaitMany(`EXECUTABLE`) 断言。
 - 验证边界：当前公共 MemoryObject guest 用例在同一进程内执行；跨进程 view 与 Seal/WaitMany 的直接组合证据仍不足，不等同于现有对象不支持 capability 转移。A 报告保留该验证限制；多页 Tunnel/RNL2 的未来能力由数据面计划拥有。

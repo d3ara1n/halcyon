@@ -48,15 +48,17 @@ Connection 继续使用正式 MemoryObject backing core，仅将固定一页扩�
 
 - create/attach/close 直接消费已收口的 MemoryChange 协议，不手写新失败矩阵。
 - close retire 校验完整 lease range 与连续对象 offset，不依赖单 fragment/单 permit。
-- Endpoint 不可 TRANSIT/GRANT，Invitation 维持 affine consume-on-success；Handle close、detached drain 与 peer 状态使用同一生命周期真值。
+- Endpoint 不可 TRANSIT/GRANT，Invitation 维持 affine consume-on-success；Handle close、detached drain 与 peer 状态使用同一生命周期真值。rinlib 以消费式 Endpoint owner 同时拥有 Handle 与本地 mapping lease，Runnel/后续协议只能借用通知与等待能力；安全 API 不得导出可复制 raw Handle，使调用者能在协议 wrapper 存活时提前 close/unmap。
 - 验证一页、多页、多物理 extent、容量边界、VA 冲突、Attach 失败不消费、双端跨 hart close 与进程 drain 接管。
 - 每类失败均检查 Pool/frame/PTE/Handle/permit 守恒，Commit 后 allocator 禁用仍可完成；本单元删除全部被替代的单页几何假设与调用入口。
 
 ## 切片 9：RNL2 与真实消费者
 
-librunnel 从 Tunnel 映射几何构造动态 slice，按 `notes/ideas/runnel.md` 的 128 B RNL2 header、`u64` 游标、动态 capacity、几何 shadow 与 Acquire/Release/EOF/Broken/门铃协议实现。
+librunnel 从 Tunnel 映射几何构造动态 slice，按 `notes/ideas/runnel.md` 的 128 B RNL2 header、`u64` 累计进度、动态 capacity、几何 shadow 与 Acquire/Release/EOF/Broken/门铃协议实现。RNL1 已证实的回绕缺陷必须在格式中消除：物理环位置不能直接取 wrapping 累计游标 `% capacity`，因为一般 capacity 不整除 `2^N`，整数回绕会改变同一逻辑位置的物理余数；RNL2 应把累计进度与本地物理 cursor/epoch 分开，或采用另一条能证明跨 `u64` 回绕连续性的规则，不能只把 `u32` 加宽。
 
-这是格式和消费者的同一次纵向迁移：librunnel、rinlib 相关入口、RPC/FAL/服务实际调用点与测试一起切换，直接删除 RNL1，不留双版本分支。
+这是格式和消费者的同一次纵向迁移：librunnel、rinlib 相关入口、RPC/FAL/服务实际调用点与测试一起切换，直接删除 RNL1，不留双版本分支。安全封装还必须冻结跨进程字节访问的语言/平台边界：控制字段继续使用对齐原子；数据复制使用经审计的共享字节 primitive，并明确对端违反 SPSC 时能保证的数据完整性与内存安全范围，不能用 shadow 边界检查替代并发访问论证。
+
+阻塞规则默认保持“每次正进展在等待或返回前通知”。若要优化为空到非空、满到非满等关键转换才通知，必须先加入带 Acquire/Release 证明的等待意图或事件代次握手，覆盖发布者旧观察与等待者 ack→重查→入睡的竞争；不得仅凭环状态边沿省略门铃。
 
 FAL acceptance 至少使用一条大于单页的数据流验证跨进程 Open 基础；相关 FAL 前置由其所属计划负责，不由 ring 实现暗自补出服务发现机制。现有 IPC 压力覆盖不同页数、物理多 extent、游标回绕模型、create/Attach/close/kill 竞态，确认容量/对齐/恶意几何输入在边界明确拒绝。
 
@@ -83,4 +85,6 @@ FAL acceptance 至少使用一条大于单页的数据流验证跨进程 Open �
 - 失败注入覆盖分配、输出、Attach、close/kill 和最小预算 drain；保持完整日志，按 workload/业务/reset 锚点判定。
 - 静止点能证明 platform/system/user supply、Pool 与 FramePool 守恒；没有 Job 资源第二真值或生产 frame 来源旁路。
 - MemoryObject、多页 Tunnel、RNL2 的 ABI、实现、实际消费者与文档一致；scope 内普通/lease mapping、seal、close、drain 全部保持 owner/permit 责任。
+- RNL2 host 模型必须把累计游标置于 `u64::MAX` 邻域执行跨回绕分段读写，验证物理位置连续；普通小游标多圈测试不能替代。
+- 安全 owner 测试覆盖 wrapper 存活期无法提前 close/unmap，协议关闭消费 owner 后旧 mapping 不再可达；共享字节 primitive 另覆盖对端畸形控制值与并发访问边界。
 - 每单元删除旧 API 与过渡逻辑，提交后生成真实提交范围的未来 Review 入口；COMPASS 只导航下一能力，不重复历史实施步骤。

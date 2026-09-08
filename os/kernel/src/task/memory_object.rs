@@ -15,8 +15,8 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use memory_space::{
-    ExecutableState, MemoryObjectState, ObjectError, ObjectId, ObjectViewAuthorization, Protection,
-    SealOutcome, WritePermit,
+    ExecutableState, MemoryObjectState, ObjectError, ObjectId, ObjectViewAuthorization,
+    PermitRequirement, Protection, SealOutcome, WritePermit,
 };
 
 use crate::{
@@ -179,9 +179,15 @@ impl MemoryObjectCore {
         self.finish_seal(published);
     }
 
-    /// 在对象锁内预留一批写许可（view 准入与 seal 线性化共用同一把锁）。
-    pub(crate) fn reserve_writes(&self, count: usize) -> Result<Vec<WritePermit>, ObjectError> {
-        self.state.lock().machine.reserve_writes(count)
+    /// 为既有 view 的重排预留写许可；successor 属性来自 planner 的不可构造需求。
+    pub(crate) fn reserve_replacement_writes(
+        &self,
+        requirement: PermitRequirement,
+    ) -> Result<Vec<WritePermit>, ObjectError> {
+        self.state
+            .lock()
+            .machine
+            .reserve_replacement_writes(requirement)
     }
 
     /// 地址翻译确认后退役单个写许可；最后一个 permit 的退役发布 `EXECUTABLE`。

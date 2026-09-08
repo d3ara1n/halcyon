@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::Protection;
+use crate::{PermitRequirement, Protection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjectId(u64);
@@ -148,11 +148,38 @@ impl MemoryObjectState {
     }
 
     pub fn reserve_writes(&mut self, count: usize) -> Result<Vec<WritePermit>, ObjectError> {
+        self.reserve_write_count(count, count)
+    }
+
+    /// 消费 planner 产生的 replacement 需求。调用方不能自行声明 successor 属性；
+    /// 对象身份仍在状态锁内复核。
+    pub fn reserve_replacement_writes(
+        &mut self,
+        requirement: PermitRequirement,
+    ) -> Result<Vec<WritePermit>, ObjectError> {
+        if requirement.object() != self.object {
+            return Err(ObjectError::PermitDenied);
+        }
+        self.reserve_write_count(requirement.count(), requirement.new_writes())
+    }
+
+    fn reserve_write_count(
+        &mut self,
+        count: usize,
+        new_writes: usize,
+    ) -> Result<Vec<WritePermit>, ObjectError> {
         if count == 0 {
             return Ok(Vec::new());
         }
-        if self.state != ExecutableState::Mutable {
-            return Err(ObjectError::PermitDenied);
+        if new_writes > count {
+            return Err(ObjectError::PermitOverflow);
+        }
+        match self.state {
+            ExecutableState::Mutable => {}
+            ExecutableState::Sealing if new_writes == 0 => {}
+            ExecutableState::Sealing | ExecutableState::Executable => {
+                return Err(ObjectError::PermitDenied);
+            }
         }
         let new_count = self
             .permits

@@ -23,6 +23,8 @@ ServiceClosed、Wait/Receive 错误和 timeout 同样废弃端口，`Caller` 自
 
 异步多 in-flight dispatcher、协作式 Cancel、idempotency key 与服务端去重尚未实现。它们属于 RPC 层扩展，不改变 Mailbox 与 WaitMany ABI。
 
+同步 Caller 的有限 `timeout_ms` 当前只用于请求投递成功后的 ReplyPort 等待；之前的 `send_blocking` 在 MailboxFull 时无限等待，因此它还不是完整调用 deadline。用户态尚无公共单调时钟，不能通过重复相对 WaitMany 正确拼出总期限；该缺口由 [`单调时间与 RPC 全调用期限`](../../plans/todo-2026-09-monotonic-time-rpc-deadline.md) 唯一承接。
+
 host 覆盖全部 framing 分类；`srv_init` 真实双调用让第一条 protocol mismatch response 携带 capability，确认拒绝后 Handle 已 stale，再由同一 Caller 经新 ReplyPort 接收第二条合法 response。
 
 FAL 对 RpcPrefix 的使用和当前 provider 见 [`fal.md`](fal.md)。
