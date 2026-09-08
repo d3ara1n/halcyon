@@ -1,5 +1,30 @@
 # 批次 D-1：机制泛化改造 Review（代码轴）
 
+## 2026-09-08 提交后复核（D-1，仍开放）
+
+对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；OliveWillow 独立只读审查，WiseHare 交叉核对，统筹者复查现有 guest 负载。正式结论取自两位 reviewer 的 send_to 回报，不采用此前 peek 摘要。
+
+| Finding | 结论与证据 |
+|---|---|
+| P1-D1-01 / INSTALLING 悬挂 | 闭合。`os/kernel/src/task/wait.rs:481` rejected park 走 Abandoned→finish_installing→begin_finish→完成责任交接。 |
+| P1-D1-02 / deadline 不注销 | 闭合。`wait.rs:282` TimeoutRegistration 在 outcome/finish 及注册竞态中取消 token；`sched.rs:307`、`:358` 进入 owner timer queue。timer_queue 的取消、owner、generation 与堆修复 host 测试通过。 |
+| P2-D1-03 / 失败回滚与析构验证 | **保持 P2 开放**。旧 MappingLease Drop 回取锁路径已由显式 MemoryChange/rollback 替换；`tunnel.rs:397` abandon_mapping 在空间锁外取消 writes，REAPABLE close_detached 在 `:1156` 只逻辑关闭并交给 ProcessDrain。结构改善不足以替代下述直接失败证据。 |
+
+### P2-D1-03 唯一后续行动
+
+- 现状与位置：`os/kernel/src/task/tunnel.rs` 的 Create/Attach、abandon_mapping、abandon_unmap、显式 close 和 close_detached 已消费统一事务。`user/tests/test_hammer/src/main.rs:683` 已有 8 轮 Endpoint close 并发普通 Unmap；`:359` 的 tunnel_exit_target 留存 live Endpoint，stress 以 16 轮退出验证 ProcessDrain 接管。不能写成“完全没有并发/owner 消散覆盖”。
+- 仍缺：Conflict/NoFrame/OOM、输出写回失败、close-vs-Attach 的精确失败/交错证据，以及这些路径的 permit、backing、页表、Pool 守恒与锁阶检查。未证实独立泄漏或死锁，但原验证门尚未满足。
+- 目标：在现有最终事务接口上形成直接可重复的失败证据，失败不消费 Invitation、不残留 view/PTE/permit；已提交路径只沿原完成责任收束。不得重建旧 MappingLease 或临时 adapter。
+- 自然顺序：盘点注入点及已有测试→同一验证单元补齐失败/交错/守恒断言→运行 host 与对应 guest 组合→按新固定提交复核本条。无需等待多页 Tunnel/RNL2；后者目前依赖本轮 program，转交会形成循环。
+- 完成与归档门：上述失败和交错证据齐全、`notes/impls/{mm,tunnel}` 如实描述、reviewer 对固定提交确认闭合后才归档。本报告是唯一行动真值，不新建 todo、不转交已归档实施计划、不以降级 P3 消除待办。
+
+验证边界：主线全速 stress 16/16 已通过，仍不能证明精确故障注入；本报告保持根目录开放状态。
+
+---
+
+以下为原目标提交首审记录，其“当前”保留历史语境。
+
+
 > 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 范围与基线

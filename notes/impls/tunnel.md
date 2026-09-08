@@ -6,7 +6,7 @@ Tunnel 是内核提供的共享内存连接对象：`Connection` 持有共享 ba
 
 当前实现位于 `os/kernel/src/task/tunnel.rs`。`ConnectionState` 保存两侧 lease 与 `Alive`、`Invited`、`Closed` 状态；`Connection` 持 `Arc<MemoryObjectCore>`（对象身份、单页 `ObjectBacking`、可执行发布状态机与 backing metadata owner 的统一 core，见 [`memory-object.md`](memory-object.md)），复用 `memory_space` 的对象授权和 `WritePermit` 基元，但不向用户公开独立 MemoryObject Handle。
 
-当前 Tunnel 对外仍是单页，但内核侧已走多段对象投影路径——单页只是长度为一的退化情形，多页几何只需改变投影区间。backing 由 `MemoryObjectCore` 持有——创建进程绑定的 MemoryPool 经 funded broker 支付，随对象持物理 extent 与 Pool charge。`Endpoint` 与 `Invitation` 各持 `EndpointPermit` / `InvitationPermit`，attach 端由附着进程支付，与创建端分账；backing 持 `ObjectBackingPermit`，view 所有权（对象强引用 + `ObjectViewPermit`）与 `WritePermit` 的生命周期归 AddressSpace 统一管理（见 [`mm.md`](mm.md)）。Tunnel view 是 object-owned lease：`ObjectMappingLease` 记录位置、对象内偏移与权限，撤销与退役 fragment 复核都以它为凭据；单页容量和释放事实由本篇记录。单页连接的 close 与 detached drain 通过内存事务在 Commit 前预留 bounded work debt。
+当前 Tunnel 对外仍是单页，但内核侧已走多段对象投影路径——单页只是长度为一的退化情形，多页几何只需改变投影区间。backing 由 `MemoryObjectCore` 持有——创建进程绑定的 MemoryPool 经 funded broker 支付，随对象持物理 extent 与 Pool charge。`Endpoint` 与 `Invitation` 各持 `EndpointPermit` / `InvitationPermit`，attach 端由附着进程支付，与创建端分账；backing 持 `ObjectBackingPermit`，view 所有权（对象强引用 + `ObjectViewPermit`）与 `WritePermit` 的生命周期归 AddressSpace 统一管理（见 [`mm.md`](mm.md)）。Tunnel view 是 object-owned lease：`ObjectMappingLease` 记录位置、对象内偏移与权限，撤销与退役 fragment 复核都以它为凭据；单页容量和释放事实由本篇记录。显式 close 通过内存事务在 Commit 前预留 bounded work debt；REAPABLE 后的 detached close 只提交逻辑关闭，映射资源由 ProcessDrain 收束。
 
 `Endpoint` 是可等待对象，允许 `WAIT | SIGNAL | MANAGE`，可观察 `DATA | PEER_CLOSED | CLOSED`，不可进入 TRANSIT/GRANT。`Invitation` 允许 `MAP | TRANSIT | GRANT`，不可等待；它不可复制，成功 attach 后消费，失败不消费。Endpoint 与本进程地址空间 lease 绑定，不能通过 Handle 运输。
 
@@ -22,7 +22,7 @@ Tunnel 是内核提供的共享内存连接对象：`Connection` 持有共享 ba
 
 显式 Endpoint close 在摘除 Handle 前预留完整 lease 撤销事务。本端 side state 提交为 Closed，幸存端收到 `PEER_CLOSED`；本端和等待者收到 `CLOSED`，已经发布的映射不会在 stale translation 确认前提前拆除。
 
-进程进入 drain 后，detached close 把已提交的 `RetiringSpaceChange` 与 lease retire sink 保存在 Endpoint 的固定状态中，由后续 drain 批次继续推进。未完成时 entry 保留在 `pending_close`，不建立同步扫描或第二套回收路径。该退役游标、work debt、Remote ack 和最终资源退款的具体步骤由 [`mm.md`](mm.md) 唯一拥有。
+进程 REAPABLE 后，`close_detached` 在 Connection 锁内取走 lease 并提交 side Closed，锁外发布关闭通知；不创建 `RetiringSpaceChange`、lease retire sink 或另一笔 Unmap。Handle 阶段之后由 ProcessDrain 逐区域归还 view/WritePermit，再收束 backing/PTE。`pending_close` 只承接 Handle 摘除与 close 之间的预算切分。具体资源游标由 [`mm.md`](mm.md) 唯一拥有。
 
 Invitation 在未 attach 前被关闭或进入 transit 清理时，连接一侧转为 Closed，并向创建端发布 `PEER_CLOSED`。Attach 与 Invitation 放弃在同一 Connection 状态锁下竞争，旧 generation 不能重放。
 
@@ -34,4 +34,6 @@ Endpoint 的等待订阅复用通用 ObjectWaitState/WaitContext；WaitContext�
 
 ## 验证入口
 
-内核 Tunnel host/QEMU 验证覆盖 Create/Attach 的失败原子性、Invitation consume-on-success、权限与状态、跨 hart close、Endpoint drain 接管及 Pool/frame/PTE/Handle/permit 守恒。用户态页内协议不在本篇重复验证，见 [`runnel.md`](runnel.md)。
+`test_hammer::concurrent_tunnel_close` 覆盖 Endpoint close 与同地址空间普通 Unmap 的 8 轮并发；`tunnel_exit_target` 留存 Endpoint，由 stress 的 16 轮进程退出验证 ProcessDrain 接管。core 检查正常 Create/Attach/close、peer 状态及 Pool charge 退款。
+
+精确 Conflict/NoFrame、输出写回失败、close-vs-Attach 交错，以及失败前后 permit/backing/table/Pool 守恒的直接内核注入证据仍不足，由 [`D-1 P2-D1-03`](../../plans/review-2026-09-mechanism-generalization.md) 唯一承接；已有压力通过不替代这些失败验证。用户态页内协议见 [`runnel.md`](runnel.md)。

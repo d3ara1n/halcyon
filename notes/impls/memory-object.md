@@ -38,7 +38,7 @@ permit 的真值链：对象状态机铸造 → AddressSpace 事务持有（rese
 - 两段式 Unmap/Protect：Validate 在 AddressSpace 锁内定几何并报告 permit 多重集（含 W 的 object view 被部分撤销或降权时，存活片段是新铸造区域、各需一枚新 permit），permit 在 AddressSpace 锁外向对象取得后重入 Reserve；
 - 归还：retire 批次先在锁内取得对象 core 的强引用，解锁后再归还 permit。
 
-地址空间每对象持一枚 view owner（强引用 + `ObjectViewPermit`）。「是否仍有区域引用该对象」直接问账本，owner 不另记计数；账本不再有该对象区域时 owner 交出，但必须活到本批 permit 全部归还之后。
+地址空间每对象持一枚 view owner（强引用 + `ObjectViewPermit`），保存在 fallible AVL 中。`region_count` 按 ledger Commit 的 `ObjectRegionDelta` 更新，Retire 不回扫 live ledger；同一批次每对象只保留一个 `RetiringObjectView`，强持 core 到该批 permit 归还完成，计数为零时再交出 live view owner。具体容量与退役步骤见 [`mm.md`](mm.md)。
 
 ## Tunnel 内部复用
 
@@ -52,5 +52,5 @@ rinlib 的 `MemoryObject`/`MemoryPool` typed owner 只接纳当前进程已安�
 
 - host：`os/memory_space/tests/planner.rs` 覆盖对象授权、WritePermit、seal 状态推进、对象 offset、permit mismatch 与逐项 retire。
 - `srv_init` core 验收（`test_memory_mapping` 尾段）：创建 → 快照 → 同对象 RW/RO 双 view → Handle 先关仍可访问 → 部分撤销 → Pool charge 守恒。
-- `srv_init` capability 矩阵覆盖 Mutable 状态拒绝 RX、缺 `EXECUTE` 的派生 Handle 返回 `RightsDenied`、原 Handle 关闭后具 `MAP|READ|EXECUTE` 的派生 Handle 仍可完成 RX Map/Unmap，并观察 Seal 后 `EXECUTABLE` 电平与 Query 状态。
-- 剩余能力边界由数据面计划拥有：公共对象跨进程 view 与多页 Tunnel/RNL2 尚未实现，不属于当前单进程 MemoryObject authority 闭包。
+- `srv_init` capability 矩阵覆盖 Mutable 状态拒绝 RX、缺 `EXECUTE` 的派生 Handle 返回 `RightsDenied`、原 Handle 关闭后具 `MAP|READ|EXECUTE` 的派生 Handle 仍可完成 RX Map/Unmap，并通过 Seal 后 Query 状态与 RX Map 检查可执行状态；该用例没有直接 WaitMany(`EXECUTABLE`) 断言。
+- 验证边界：当前公共 MemoryObject guest 用例在同一进程内执行；跨进程 view 与 Seal/WaitMany 的直接组合证据仍不足，不等同于现有对象不支持 capability 转移。A 报告保留该验证限制；多页 Tunnel/RNL2 的未来能力由数据面计划拥有。

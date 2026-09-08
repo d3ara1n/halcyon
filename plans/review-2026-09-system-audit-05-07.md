@@ -1,5 +1,32 @@
 # 系统审计批次 E-2：syscall/shared ABI、IPC/FAL/服务与工程化
 
+## 2026-09-08 提交后复核（E-2，新增 P2，仍开放）
+
+固定对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`。OliveWillow 独立只读复核；统筹者运行平台路线发现 E2-7-02，OliveWillow 再以目标代码交叉确认。
+
+### E2-7-02 / P2：nofd 验收锚点与可选服务降级输出漂移
+
+- 位置：`tools/qemu-acceptance.sh:63` 的 nofd profile 仍要求 `failed to start bin/test_fp: SpawnFailure { error: System(NotSupported), grants: Retained, cleanup_error: None }`；`user/services/srv_init/src/main.rs:339` 起实际输出为 `optional service bin/test_fp degraded: SpawnFailure...`。
+- 复现：固定提交执行 `THROTTLE=100 just virt-nofd`，recipe 退出 1。guest 正常拒绝 D64、运行 Base64 core 并以 Requested reset 收束，wrapper 仅因缺旧锚点拒绝；完整日志 `artifacts/failed-acceptance-20260908-090925-47740.log`，第 125 行为实际降级输出；路线汇总见 `artifacts/review-9ee2791/virt-nofd.log`。
+- 影响：无 F/D 的正式验收路线出现确定性假失败；不能以 guest reset 成功或其它路线通过宣告 nofd 通过。这是监督输出变更未同步消费者的工程回归。
+- 修复与完成门：对齐稳定语义锚点，保留 Base64 domain、明确 D64/NotSupported 拒绝、grants/cleanup 与 reset 检查，不以删除锚点放松验收。新固定提交重跑 nofd，并验证未拒绝 D64 或未收束时仍不能通过。后续行动只在本报告，不新增重复 todo。
+
+### 原 findings
+
+| Finding | 结论与证据 |
+|---|---|
+| E2-5-01 / RPC reject | 闭合。`user/frameworks/librpc/src/caller.rs:80` reject_reply 逐项 close Handle 并 discard port；`:153` 起服务关闭、等待/接收错误、timeout 与 framing reject 隔离端口。`srv_init/src/main.rs:787` 双调用测试检查旧 Handle stale 和新端口成功。framing host 测试通过。 |
+| E2-7-01 / lint 门 | 闭合。`Justfile:72` 七面 `-D warnings`，`:209` acceptance 先执行 Clippy；统筹者本轮实际七面全部通过，完整日志在 `artifacts/lint/`。 |
+
+本轮运行证据：默认 `just acceptance` 在 50% stress 15/16 退出 124，单独 50% stress 同样失败；两次均为已登记 last-thread-exit-vs-kill 覆盖 flake且已走 failure shutdown，日志分别为 `artifacts/failed-acceptance-20260908-083623-32687.log`、`artifacts/failed-acceptance-20260908-083953-36586.log`。全速 stress 16/16、release、sifive_u、hetero 通过；nofd 按上述原因失败。不得把拆分成功路线写成单次 acceptance 聚合通过。
+
+E2-7-02 尚开放，本报告保留根目录；首审两项关闭不代表全报告可归档。
+
+---
+
+以下为历史首审与此前 lint 实施记录，旧“已闭合”仅针对所标原 finding。
+
+
 > 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；RPC reject 归 capability/owner 计划，E2-7-01 lint 门由本报告保留复核证据，当前实现已闭合。
 
 ## 范围、基线与证据边界

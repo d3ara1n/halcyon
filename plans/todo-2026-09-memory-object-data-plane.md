@@ -4,7 +4,7 @@
 
 ## 当前推进门
 
-地址空间事务、构造/Start/Ready、validated ELF、EXECUTE authority 及其它 A–E 实现项均已完成，实施记录见 [`地址空间事务与进程启动发布档案`](archived/todo-2026-09-memory-transaction-state-machine.md)。本计划继续暂停，直到当前工作树形成固定提交并由 [`Review program`](todo-2026-09-review-program.md) 完成 A–E 复核；复核通过后再恢复切片 8/9/10。
+地址空间事务、构造/Start/Ready、validated ELF 与 EXECUTE authority 已形成固定提交 `9ee2791`，实施记录见 [`地址空间事务与进程启动发布档案`](archived/todo-2026-09-memory-transaction-state-machine.md)。提交后复核保留 D-1 P2-D1-03 并新增 E-1 N-1/P1、E2-7-02/P2，由 [`Review program`](todo-2026-09-review-program.md) 和三份原报告唯一承接。本计划继续暂停，三项修复/补证并复核完成后恢复切片 8/9/10；不能把 D-1 前置反向交给切片 8 形成循环。
 
 切片编号 8/9/10 保留作跨文档定位，不表示可以脱离前置开工，也不允许以“到切片 10 再清理”为理由在切片 8/9 留下旧接口。每个能力单元必须连同真实消费者、失败路径、测试和旧路径删除一起交付。
 
@@ -14,9 +14,9 @@
 
 | 已有机制 | 实现现状 | 首审证据 |
 |---|---|---|
-| 平台供给、系统储备、MemoryPool、funded broker | `notes/impls/mm.md` | [`B-1`](review-2026-09-memory-supply-and-pool.md) |
-| Unbound/Bound、PoolBinding、root/页表 owner、deferred retire | `notes/impls/{mm,startup,task}.md` | [`B-2`](review-2026-09-process-bind-page-table-retire.md)、[`E-1`](review-2026-09-system-audit-03-04.md) |
-| 匿名与对象来源、公共 MemoryObject、ObjectView、WritePermit | `notes/impls/{mm,memory-object,tunnel}.md` | [`A`](review-2026-09-memory-transaction-unification.md) |
+| 平台供给、系统储备、MemoryPool、funded broker | `notes/impls/mm.md` | [`B-1`](archived/review-2026-09-memory-supply-and-pool.md) |
+| Unbound/Bound、PoolBinding、root/页表 owner、deferred retire | `notes/impls/{mm,startup,task}.md` | [`B-2`](archived/review-2026-09-process-bind-page-table-retire.md)、[`E-1`](review-2026-09-system-audit-03-04.md) |
+| 匿名与对象来源、公共 MemoryObject、ObjectView、WritePermit | `notes/impls/{mm,memory-object,tunnel}.md` | [`A`](archived/review-2026-09-memory-transaction-unification.md) |
 | 单页 Tunnel/RNL1、IPC 与当前消费者 | `notes/impls/{tunnel,runnel,ipc}.md` | [`D-1`](review-2026-09-mechanism-generalization.md)、[`E-2`](review-2026-09-system-audit-05-07.md) |
 
 历史设计与实施资料：[`IPC 数据面设计`](archived/todo-2026-09-ipc-data-plane-design.md)、[`MemoryObject 统一实施档案`](archived/todo-2026-09-memory-object-unification.md)、[`系统参照`](ref-2026-09-ipc-data-plane-systems.md)。历史提交与当时验证以报告、档案和 git history 为准，不在当前计划重复列出“下一步进入已完成切片”的指令。

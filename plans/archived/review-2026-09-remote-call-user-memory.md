@@ -1,6 +1,23 @@
 # 批次 C-2：Remote Call、AddressSpace epoch/TLB 与用户内存 Review
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
+## 2026-09-08 提交后复核（C-2，通过）
+
+对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；OliveWillow 独立只读审查。
+
+| Finding | 结论与证据 |
+|---|---|
+| F1 / 跨表 token | 闭合。`os/remote_call/src/lib.rs:55`、`:86` 的 Reservation/FinishToken 携 TableId，错表在定位 slot 前返还 affine owner；`tests/transport.rs:68` 跨表测试通过。不是冻结单实例策略。 |
+| F2 / epoch 回绕污染 | 闭合。`os/kernel/src/task/proc.rs:1810` 在同一 AddressSpace 锁下先检验需推进 epoch 未耗尽，拒绝发生在 ledger/PTE 发布前；`:1839` 发布后调用 `:987` 的 checked CAS，不依赖回绕后 panic。 |
+| F3 / UserStack cleanup panic | 闭合。`user/rinlib/src/thread.rs:107` 对 Busy 重试，终端错误发布 stack_cleanup_snapshot 并留给 AddressSpace drain；`srv_init/src/main.rs:1075` 检查 abandoned 计数。 |
+
+remote_call/monotonic_id 及相关 host 测试通过；统筹者全速 stress、release、sifive_u、hetero 通过。最大 epoch 的内核注入、UserStack 终端错误注入未现场执行，模型/静态证据不冒充 guest 覆盖。nofd 锚点失败归 E2-7-02。三个 finding 已关闭，本报告归档。
+
+---
+
+以下保留历史首审内容。
+
+
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围与基线
 

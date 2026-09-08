@@ -8,6 +8,8 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 两条路径在 formal entry 汇合，统一建立 gp、tp、sscratch、正式 stack、satp、CSR 和 stvec。过渡表在 cold boot 建成后只读；全体启动记录以 Release 发布后才发 HSM start。`os/runtime_gate` 将全局状态限制为 `Preparing -> Ready | Failed`：HSM 错误、formal CSR 拒绝或 Online 超时先以 Release 广播 Failed，晚到 secondary 以 Acquire 观察后停驻；只有全体 admitted hart Online、调度域和初始任务就绪后才发布 Ready 并进入调度循环。
 
+当前启动失败广播只接入上述显式分支。`rt.rs` 的 panic、fatal trap 与 `fatal_msg` 公共终段直接 park；若在全员 Online 后、Ready 前失败，secondary 可能持续等待 Preparing。此缺口由 [`E-1 N-1`](../../plans/review-2026-09-system-audit-03-04.md) 承接，不能把现有 RuntimeGate 单元测试当作公共 fatal 接线已经闭合的证据。
+
 ## 身份、能力与域
 
 `HartId` 保存 DT/SBI raw hartid，`HartSlot` 是按 admitted hartid 升序分配的稠密索引，`HartTopology` 保存可选 cpu-map。HartLocal、内核栈、active set 与 per-hart timer queue 都按 slot 索引；SBI 调用边界才转换回 raw hartid，IPI 的 `(mask, base)` 不接收内部 slot bitmap。

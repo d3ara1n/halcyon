@@ -1,5 +1,33 @@
 # 系统审计批次 E-1：启动/页表/TLB 与 SMP/调度/对象生命周期
 
+## 2026-09-08 提交后复核（E-1，新增 P1，仍开放）
+
+对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；WiseHare 独立只读审查，统筹者直接核对 rt/registry/boot。正式 send_to 报告包含下述 N-1，此前 peek 摘要漏报，不能作为“无新 P1”的依据。
+
+### N-1 / P1：Ready 前 panic/fatal 未广播 Failed
+
+- 位置：`os/kernel/src/rt.rs:172` 起全员 Online 后执行 bootstrap 回收、调度域构造及 `boot::load`，随后才 `publish_ready`；`:211` handle_fatal、`:255` fatal_msg、`:261` handle_panic 均直接 park，`:289` alloc error 转 panic。`os/kernel/src/boot.rs:52`、`:70`、`:96` 的 ELF/构造/launch expect 可在该窗口失败。
+- 可达性：secondary 已进入 `os/kernel/src/registry.rs:288` 的 wait_for_runtime；boot hart 在 Ready 前遇到坏 initial ELF、分配失败或 fatal，则自身停止，Gate 仍是 Preparing，其他 hart 持续自旋。这不是已修 M3-3 的 HSM 错误分支。
+- 违反契约：启动成功或失败应向全部 admitted hart 发布统一终态；公共终止路径不能遗漏启动失败责任。`runtime_gate` 模型通过仅证明状态机，不证明 panic/fatal 调用接线完整。
+- 修复方向：在可用的原子 Gate 边界统一处理 Preparing 阶段的 fatal/panic，广播应早于可能再次失败的诊断；不取 registry 锁、不分配、不依赖 tp，Ready/Failed 不被回退，也不因已终态再次 panic。早期地址环境与 bootstrap fatal 的适用边界必须明确，不机械在每个调用点补 publish_failed。
+- 验证/完成门：模型覆盖 Preparing/Ready/Failed 与并发失败，真实启动注入至少证明 boot hart panic/alloc/fatal 在 Ready 前失败后 secondary 观察 Failed 并停驻；正常多 hart/platform 路线回归。修复形成新提交后复核本条；本报告唯一拥有后续行动，不恢复归档计划或另建重复 todo。
+
+### 原 findings 复核
+
+| Finding | 结论与证据（路径相对仓库根，行号对应固定提交） |
+|---|---|
+| M3-1 / 未 drain Bound | 闭合。`os/kernel/src/task/proc.rs:4708` UnpublishedBound、`:4771` 构造失败显式 rollback，以及 `deferred_work.rs:86` 出生预付 unpublished debt，保证 Bound 不直接 Drop。 |
+| M3-2 / duplicate hart | 闭合。`os/dtb/src/cpu.rs:224` 排序和重复拒绝；`os/kernel/src/registry.rs:146` 再断言严格升序；cpu host tests 覆盖 duplicate/unsorted。 |
+| M3-3 / HSM error | 闭合。`os/kernel/src/rt.rs:121` 起完整发布 expected 集合，hart_start 错误在锁外 publish_failed；CSR/deadline/Online timeout 同样广播。公共 panic/fatal 漏口另列 N-1。 |
+| M3-4 / slot 顺序 | 闭合。CPU canonical sort 后 Board/main 只消费稳定列表，registry 拒绝错序。历史报告中的 `os/dtb/src/board.rs` 是路径勘误，实际内核文件为 `os/kernel/src/board.rs`。 |
+
+相关 dtb/runtime_gate host 模型通过；统筹者补跑全速 stress 16/16、release、sifive_u、hetero 通过。nofd 业务完成但脚本锚点失败，归 E2-7-02；本轮未取得单次 acceptance 聚合成功，未逐项 guest 注入 partial ELF/stack/table OOM/HSM failure。N-1 尚未修复，本报告不得归档。
+
+---
+
+以下为历史首审记录。
+
+
 > 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审计范围与基线

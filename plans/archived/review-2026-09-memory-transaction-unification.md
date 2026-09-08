@@ -1,6 +1,26 @@
 # 统一内存事务核与公共 MemoryObject Review
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
+## 2026-09-08 提交后复核（A，通过）
+
+固定对象：`9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`。WiseHare 独立只读审查，统筹者核对当前代码和组合验证。下列路径均相对仓库根，行号对应固定提交。
+
+| 原 finding | 结论与证据 |
+|---|---|
+| WritePermit 回滚泄漏 / P1 | 闭合。`os/kernel/src/task/proc.rs:2027`、`:2368` 失败路径交还 reclaimed permits；`:2347` 按 ObjectId 归还来源。`memory_space` rollback 返回 permit，相关 host 测试通过。 |
+| 同对象多个 retiring fragment 重复摘 owner / P1 | 闭合。`os/memory_space/src/space.rs:1333` 聚合 ObjectRegionDelta，`proc.rs:2785` 预留 distinct retiring 容量，`:3073` 每对象建立一个退役 owner；`:1270` 只消费唯一槽。 |
+| Commit 后 retire 分配 / P1 | 闭合。planner 在 Prepare 前计算容量，`proc.rs:455`、`:2785` 的 Vec 在发布前预留，后置 push 消费既有容量。匿名 backing 增长另由跨在途 reservation 计入。 |
+| 缺 EXECUTE / P1 | 闭合。`shared/src/object.rs:59` 定义独立位，`os/kernel/src/task/memory_object.rs:478` 要求 RX 的 MAP/READ/EXECUTE，`srv_init/src/main.rs:713` 起 guest 矩阵覆盖 Mutable、派生裁剪和原 Handle 关闭后合法 RX。 |
+
+验证：reviewer 运行 memory_space/shared host 测试通过；统筹者运行七面 Clippy，通过全速 stress 16/16、release、sifive_u、hetero。两次 50% stress 为既知 15/16 flake；nofd 因旧日志锚点失败，单独归 E2-7-02，不能写本轮 acceptance 聚合通过。
+
+证据限制：未现场重放逐步 OOM/stale 注入、Commit 后禁用 allocator 的整机测试、公共对象跨进程和多 extent/Seal-WaitMany 组合。现有 Seal/RX 用例没有直接 WaitMany(EXECUTABLE)，实现文档已更正；这些限制不伪装成已运行测试。四项正式 finding 已关闭，本报告归档；E-1/E-2 的新增问题不重复编号到 A。
+
+---
+
+以下是原目标提交的首审记录；其中“当前”及最终不通过判定均保留首审语境。
+
+
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围与基线
 

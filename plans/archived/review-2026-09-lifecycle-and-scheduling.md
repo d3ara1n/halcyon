@@ -1,6 +1,28 @@
 # 批次 C-1：线程生命周期、持久 init/pm 监督与调度域 Review
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
+## 2026-09-08 提交后复核（C-1，通过）
+
+对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；OliveWillow 独立只读审查，路径/行号对应该提交。
+
+| Finding | 结论与证据 |
+|---|---|
+| P1-C1-01 / authority 丢失 | 闭合。`srv_init/src/main.rs:1220` 失败 target 放回集合；`user/frameworks/libprocess/src/lib.rs:309` 收束仅在 Drain/VerifyDead 成功后 close；init 的 root authority、pm 的失败接管在 `main.rs:480`、`srv_pm/src/main.rs:226` 保留。 |
+| P1-C1-02 / 必选拓扑降级 | 闭合。`srv_init/src/main.rs:248`、`:353` RequiredLaunchSet/统一 stage_failure 拒绝缺失和未启动，失败走 services JobKill。 |
+| P1-C1-03 / steady_state | 历史修复复核通过。`srv_init/src/main.rs:533` 永久 loop。 |
+| P1-C1-04 / 隐式 shutdown | 历史修复复核通过。`srv_init/src/main.rs:508` 显式 SystemReset，失败留在 supervisor；调度器不按静默推断关机。 |
+| P1-C1-05 / raw IPI | 闭合。`os/kernel/src/registry.rs:240` 将 slot mask 逐项转 raw `(1, hartid)`；canonical CPU admission 固定身份。 |
+| P2-C1-06 / q-only | 闭合。`os/dtb/src/cpu.rs:192` 强制 q⇒d⇒f，dependency host 用例通过。 |
+| P2-C1-07 / CLOSED signal | 闭合。`os/kernel/src/task/thread.rs:214` 仅允许 DONE，`:55` 为真实发布点。 |
+| P2-C1-08 / 无限监督等待 | 闭合。`libprocess/src/lib.rs:225` policy 明确 wait/attempt/work/query/enumeration 预算，`:325` 起每阶段失败携 authority/progress 返回；init/pm 消费统一政策。 |
+
+reviewer 的 sched_domain/dtb/shared/libprocess 等 host 测试通过；统筹全速 stress 16/16、release、sifive_u、hetero 通过；nofd 业务完成但脚本锚点失败归 E2-7-02。sparse raw/SBI 与各类 supervisor failure 未逐项 guest 注入，不夸大已有覆盖。八项 finding 均关闭，本报告归档。
+
+---
+
+以下为历史首审记录，含历史目标的失败判定。
+
+
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围、基线与方法
 

@@ -1,6 +1,21 @@
 # 批次 B-2：ProcessBind、页表 owner 与 deferred retire Review
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
+## 2026-09-08 提交后复核（B-2，通过）
+
+固定对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；WiseHare 独立只读复核。
+
+F-1（Bootstrap post-Commit 可失败）闭合。`os/kernel/src/task/proc.rs:4708` 的 UnpublishedBound 显式 rollback/publish 承担私有 Bound 生命周期；`:4771` 起 ELF/stack 构造失败进入有界 drain。`:4995` 起 domain、Ready、staged 存储和 Attach 全部在提交前准备，`:5071` 起 Handle PreparedCommit、Job member reservation 与 Building operation 完成后，唯一不可逆临界区只消费已验证凭据，提交 capability/membership/Running/execution，随后移交已准入线程。`os/handle_table/src/lib.rs:468` 和 lifecycle `begin_running` 支撑该边界。
+
+统筹者在固定代码上补跑全速 stress 16/16、release、sifive_u、hetero 通过；七面 lint 通过。nofd 因脚本锚点失败归 E2-7-02。未重新逐步注入 partial ELF、table/stack/Attach/Job/Ready OOM；静态所有权论证与正常/压力结果不能写成这些注入已通过。
+
+原 F-1 已关闭，本报告归档。公共 panic/fatal 在 Ready 前不广播 Failed 是不同失败边界，由 E-1 N-1 独立保留，不因本报告关闭而视为已修复。
+
+---
+
+以下为原目标提交首审记录，历史不通过判定保留。
+
+
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 审查范围与方法
 

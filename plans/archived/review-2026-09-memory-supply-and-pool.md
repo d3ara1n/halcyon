@@ -1,6 +1,24 @@
 # 批次 B-1：平台供给、系统储备、MemoryPool 与 funded frame Review
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；下文第 7 节为首审归属记录，当前 F-1/F-2 归 admission、F-3/F-4 归 capability/owner 计划，不按报告逐项另排实施。
+## 2026-09-08 提交后复核（B-1，通过）
+
+固定对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；WiseHare 独立只读复核，路径/行号对应此提交。
+
+| Finding | 结论与证据 |
+|---|---|
+| F-1 / DT status | 闭合。`os/dtb/src/memory.rs:234` 共用 node_status，缺省/okay、合法不可用、unknown/malformed 分开；CPU 与 reservation 同边界。`tests/memory.rs:148` 及 cpu tests 覆盖拒绝集合。 |
+| F-2 / FramePool arithmetic | 闭合。`os/frame_pool/src/lib.rs:187` 对 arena/metadata 终态 checked preflight，写入前拒绝；`tests/pool.rs:237` 极端几何保持库存不变。 |
+| F-3 / MemoryPool Drop | 闭合，采用合法 typed owner leaf close 不可失败方案。`user/rinlib/src/memory_pool.rs:18` 冻结 unsafe 构造契约，`:70` 显式 close/Drop 共用 `ipc/object.rs:14` 的 leaf-close；内核 `task/handle.rs:182` 仅非法表项失败。违约 panic 保留，不当作普通用户错误策略。 |
+| F-4 / SystemSupply query | 闭合。`os/memory_supply/src/lib.rs:149` 分开 range snapshot 与 Option ticket owner，`tests/planner.rs:61` 覆盖消费后查询和再次 take。 |
+
+相关 dtb/frame_pool/memory_pool/memory_supply host 测试通过。统筹者补跑全速 stress、release、sifive_u、hetero 通过；nofd 旧锚点失败归 E2-7-02。非法 unsafe 构造和各启动错误未逐项 guest 注入，保留验证限制。四项 finding 闭合，本报告归档。
+
+---
+
+以下保留首审历史记录，旧“当前”及不通过判定不表示修复提交状态。
+
+
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；下文第 7 节为首审归属记录，当前 F-1/F-2 归 admission、F-3/F-4 归 capability/owner 计划，不按报告逐项另排实施。
 
 ## 1. 审查范围与基线
 
@@ -13,7 +31,7 @@
 
 基线按统筹计划为工作树 `2ed7e1e`。目标提交按各自提交内容逐项读取；当前工作树已有 plans 文档改动，但未作为目标提交证据。审查未修改文件、未提交代码。
 
-审查遵循 [`REVIEW.md`](REVIEW.md)，并参考四份历史审查清单、`notes/ideas/mm.md`、`notes/ideas/object.md` 与目标提交时的实现文档。
+审查遵循 [`REVIEW.md`](../REVIEW.md)，并参考四份历史审查清单、`notes/ideas/mm.md`、`notes/ideas/object.md` 与目标提交时的实现文档。
 
 ## 2. 执行命令与结果
 

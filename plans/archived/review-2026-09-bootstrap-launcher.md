@@ -1,6 +1,27 @@
 # 批次 D-2：BootPackage / 用户态 launcher 代码 Review
 
-> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
+## 2026-09-08 提交后复核（D-2，通过）
+
+对象 `9ee2791d3e18fdb7857fe41c74bacc7bb0c7c774`；OliveWillow 独立只读复核。
+
+| Finding | 结论与证据（行号对应该提交） |
+|---|---|
+| F-01 / payload 无 owner | 闭合。`os/kernel/src/boot.rs:27` 拆分 BootHeldExtent；`task/proc.rs:4941` 起先 fund 再借用映射、发布前安装 BootFundedExtent，失败由完整 owner 承接。 |
+| F-02 / holes 与 package 重叠 | 闭合。`os/kernel/src/frame.rs:125`、`:323` page-cover、排序归一化并拒绝 package 与 permanent/kernel/SBI、DTB/bootstrap 重叠；memory_supply 统一 clip/normalize/subtract。 |
+| F-03 / sifive_u 内存参数 | 闭合。`Justfile:39` 按模型固定 virt=1024M、sifive_u=128M，与 DT 一致。 |
+| F-04 / Control 与 Job 记账 | 闭合。`task/process.rs:398` 起创建 core/Builder/Control 并以同一 Handle reservation 输出，Job member 提交与生命周期接通。 |
+| F-05 / entry 与 BSS | 闭合。`os/elf/src/lib.rs:349` 要求 entry 落 executable file bytes；Bootstrap/launcher 消费同一 validated image；`task/proc.rs:4286` Attach 再校验 entry U/X 和 stack U/W。 |
+| F-06 / 未实现 headers | 闭合。`os/elf/src/lib.rs:250`、`:262` 分类 program headers、拒绝未知 flags/类型和 PT_INTERP 等未支持语义，合法可忽略 headers 保持明确区分；audit 调用同 Rust validator。 |
+| F-07 / token 回绕 | 闭合。`os/monotonic_id/src/lib.rs:15` 最大值发行后永久耗尽，`task/handle.rs:105` 映射 ReachLimit。 |
+
+elf/dtb/frame_pool/handle_table/monotonic_id/shared/libprocess host tests 通过。统筹补跑全速 stress、release、sifive_u、hetero 通过；nofd 的预期 D64 拒绝已发生，但脚本旧锚点失败归 E2-7-02。未逐项执行 BootPackage/ELF/资源失败 guest 注入。七项 finding 均关闭，本报告归档；不将测试限制写成未来能力不存在。
+
+---
+
+以下保留历史目标的首审内容及不通过判定。
+
+
+> 首审已完成；本报告保留目标提交证据与逐条复核条件，不重复首审。当前实施归属以 [`Review 统筹导航`](../todo-2026-09-review-program.md) 为准；正文建议保留首审语境，不作为现行实施顺序。
 
 ## 范围与基线
 
