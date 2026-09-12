@@ -1,6 +1,6 @@
 # 多页 Tunnel 与 Runnel 数据面
 
-> 切片 8/9 与切片 10 的实现及完整组合验收均已完成，本专题归档。8/9 的固定提交范围由统一架构 Review 入口登记；切片 10 当前尚未提交，提交后另登记真实哈希。调查基线：`726fc9f`；用户已确认方案及容量/审计约束修订。
+> 切片 8/9 与切片 10 的实现及完整组合验收均已完成，本专题归档。8/9 的固定提交范围由统一架构 Review 入口登记；切片 10 已提交为 `606b59db22f071943a4bfc2c174633454e449401`，固定提交代码复核由 [`库存来源 Review`](../todo-2026-09-frame-source-selftest-review.md) 拥有。调查基线：`726fc9f`；用户已确认方案及容量/审计约束修订。
 >
 > 方向由 `notes/ideas/{mm,object,tunnel,runnel,shared-memory}.md` 拥有；当前实现以 `notes/impls/{mm,memory-object,tunnel,runnel}.md` 与代码为准。本档案保存交付范围与验证证据，不再安排实施。
 

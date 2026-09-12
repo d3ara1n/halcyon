@@ -23,7 +23,7 @@
 - 独立物理 cursor、u64 回绕、几何 shadow、EOF、Invited 期发布、ack→重查→wait 和部分完成错误是否组合闭合。
 - backing/metadata/work 容量是否覆盖真实最后析构与退款调用链；12KiB guard 派生审计与两平台 256KiB 栈是否有完整布局、代码生成和运行证据，不能把单帧扫描当调用链证明。
 
-切片 10 已另行完成实现与完整验收：删除 raw allocation adapter/tracker、boot-held 直接拥有几何、统一 funding 自检、完整清零与切分退款、child 来源保活；当前尚未提交，获提交授权后登记真实哈希与固定范围。证据见数据面档案及 `artifacts/frame-source/`。正式 FAL Open 与 RPC deadline 的独立能力缺口不因数据面提交而完成；Review 保持下节统一触发条件。
+切片 10 已另行完成实现与完整验收并提交为 `606b59db22f071943a4bfc2c174633454e449401`：删除 raw allocation adapter/tracker、boot-held 直接拥有几何、统一 funding 自检、完整清零与切分退款、child 来源保活。固定提交代码复核由 [`库存来源 Review`](todo-2026-09-frame-source-selftest-review.md) 独立拥有，不在本计划重复安排。证据见数据面档案及 `artifacts/frame-source/`。正式 FAL Open 与 RPC deadline 的独立能力缺口不因数据面提交而完成；Review 保持下节统一触发条件。
 
 ## 触发条件
 
