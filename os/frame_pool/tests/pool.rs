@@ -293,6 +293,32 @@ fn stress_conserves_frames_and_recoalesces() {
 }
 
 #[test]
+fn overlapping_return_panics_before_inventory_mutation() {
+    for free_first in [false, true] {
+        let mut pool = pool(8);
+        add(&mut pool, 0, 8);
+        let base = pool.alloc_order(3).unwrap();
+        assert_eq!(base, frame(0));
+        let returned = if free_first { 0 } else { 4 };
+        pool.dealloc(frame(returned), 4);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.dealloc(base, 8);
+        }));
+        assert!(result.is_err());
+        assert_eq!(pool.free_frames(), 4);
+        assert_eq!(pool.alloc_at(frame(returned), 4), Ok(()));
+        assert_eq!(pool.free_frames(), 0);
+        let held = if free_first { 4 } else { 0 };
+        assert_eq!(
+            pool.alloc_at(frame(held), 4),
+            Err(AllocAtError::Unavailable)
+        );
+        pool.dealloc(base, 8);
+        assert_eq!(pool.alloc_order(3), Some(base));
+    }
+}
+
+#[test]
 #[should_panic(expected = "zero-frame deallocation")]
 fn zero_count_dealloc_panics() {
     let mut pool = pool(4);

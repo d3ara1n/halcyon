@@ -451,8 +451,18 @@ fn split_first_and_single_preserve_extent_ownership() {
     assert_eq!(quota.state.borrow().allocated, 8);
     assert_eq!(inventory.state.borrow().claimed, 8);
     drop(left);
+    assert_eq!(quota.state.borrow().allocated, 7);
+    assert_eq!(quota.state.borrow().available, 25);
+    assert_eq!(inventory.state.borrow().claimed, 7);
+    assert_eq!(inventory.state.borrow().free, 25);
     drop(right);
+    assert_eq!(quota.state.borrow().allocated, 4);
+    assert_eq!(quota.state.borrow().available, 28);
+    assert_eq!(inventory.state.borrow().claimed, 4);
+    assert_eq!(inventory.state.borrow().free, 28);
     drop(funded);
+    assert_eq!(quota.state.borrow().allocated, 0);
+    assert_eq!(inventory.state.borrow().claimed, 0);
     assert_eq!(quota.state.borrow().available, 32);
     assert_eq!(inventory.state.borrow().free, 32);
 }

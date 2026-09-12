@@ -21,6 +21,8 @@ use crate::{
     task::memory_pool::{MemoryCharge, MemoryPool, PreparedMemoryCharge},
 };
 
+pub(crate) mod selftest;
+
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
 const MAX_PERMANENT_RESERVATIONS: usize = MAX_PLATFORM_RESERVATIONS + 2;
 const MAX_BOOT_HOLDS: usize = 3;
@@ -733,7 +735,7 @@ pub(crate) fn fund_user_table_frame(
 /// owner 移交点；类型本身负责防止普通 funded path 伪造保留内容。
 #[must_use = "boot-held extent must be released or adopted into funded backing"]
 pub(crate) struct BootHeldExtent {
-    tracker: FrameTracker,
+    geometry: Option<ExtentGeometry>,
 }
 
 impl BootHeldExtent {
@@ -743,21 +745,47 @@ impl BootHeldExtent {
     /// FramePool，且本次启动中只允许构造一次 owner。
     pub(crate) unsafe fn adopt(base: FrameNumber, pages: usize) -> Self {
         Self {
-            tracker: FrameTracker::from_claimed(base, pages),
+            geometry: Some(
+                ExtentGeometry::new(base, pages).expect("invalid boot-held extent geometry"),
+            ),
         }
     }
 
+    fn geometry(&self) -> ExtentGeometry {
+        self.geometry
+            .expect("boot-held ownership already transferred")
+    }
+
     pub(crate) fn base(&self) -> FrameNumber {
-        self.tracker.base()
+        self.geometry().base()
     }
 
     pub(crate) fn pages(&self) -> usize {
-        self.tracker.count()
+        self.geometry().count()
     }
 
-    pub(crate) fn split_at(self, pages: usize) -> (Self, Self) {
-        let (left, right) = self.tracker.split_at(pages);
-        (Self { tracker: left }, Self { tracker: right })
+    pub(crate) fn split_at(mut self, pages: usize) -> (Self, Self) {
+        let (left, right) = self
+            .geometry()
+            .split_at(pages)
+            .expect("boot-held split must be strictly internal");
+        self.geometry = None;
+        (
+            Self {
+                geometry: Some(left),
+            },
+            Self {
+                geometry: Some(right),
+            },
+        )
+    }
+}
+
+impl Drop for BootHeldExtent {
+    fn drop(&mut self) {
+        if let Some(geometry) = self.geometry.take() {
+            with_pool(|pool| pool.dealloc(geometry.base(), geometry.count()));
+        }
     }
 }
 
@@ -815,52 +843,6 @@ pub(crate) fn fund_boot_held(
     })
 }
 
-/// 启动自检：真实穿过 quota、库存、清零、commit、extent 上限回滚与自然退款。
-pub(crate) fn funded_selftest(root: &Arc<MemoryPool>) {
-    const PAGES: usize = 3;
-
-    let pool_baseline = root.snapshot();
-    let frames_baseline = free_frames();
-    let funded = fund_user_frames(
-        root,
-        PAGES,
-        FundingLimits {
-            max_pages: PAGES,
-            max_extents: PAGES,
-        },
-    )
-    .expect("funded frame self-test failed");
-    assert_eq!(funded.pages(), PAGES);
-    assert!((1..=PAGES).contains(&funded.extent_count()));
-    assert_eq!(
-        funded.extents().map(|(_, pages)| pages).sum::<usize>(),
-        PAGES
-    );
-    let committed = root.snapshot();
-    assert_eq!(committed.available, pool_baseline.available - PAGES as u64);
-    assert_eq!(committed.allocated, pool_baseline.allocated + PAGES as u64);
-    assert_eq!(free_frames(), frames_baseline - PAGES);
-    drop(funded);
-    assert_eq!(root.snapshot(), pool_baseline);
-    assert_eq!(free_frames(), frames_baseline);
-
-    let limited = fund_user_frames(
-        root,
-        PAGES,
-        FundingLimits {
-            max_pages: PAGES,
-            max_extents: 1,
-        },
-    );
-    assert!(matches!(limited, Err(funded_frame::FundError::ExtentLimit)));
-    assert_eq!(root.snapshot(), pool_baseline);
-    assert_eq!(free_frames(), frames_baseline);
-    log!(
-        Memory,
-        "funded frame self-test passed: commit, rollback, and dual-ledger refund ok"
-    );
-}
-
 fn clear_claimed(base: FrameNumber, count: usize) {
     let bytes = count
         .checked_mul(PAGE_SIZE)
@@ -869,20 +851,6 @@ fn clear_claimed(base: FrameNumber, count: usize) {
     unsafe {
         core::ptr::write_bytes(mm::phys_to_virt(base.addr()) as *mut u8, 0, bytes);
     }
-}
-
-fn publish_claimed(base: FrameNumber, count: usize) -> FrameTracker {
-    clear_claimed(base, count);
-    FrameTracker::from_claimed(base, count)
-}
-
-/// 从 user inventory 分配 `2^order` 个物理连续帧；解锁后清零，再发布所有权。
-pub fn alloc_user_order(order: usize) -> Option<FrameTracker> {
-    let base = with_pool(|pool| pool.alloc_order(order))?;
-    let count = 1usize
-        .checked_shl(order as u32)
-        .expect("frame pool returned an invalid order");
-    Some(publish_claimed(base, count))
 }
 
 /// 归还一段启动期保留物理区间。
@@ -938,101 +906,4 @@ pub fn remaining_heap_chunks() -> usize {
         .as_ref()
         .expect("system supply not initialized")
         .remaining_heap_chunks()
-}
-
-/// RAII 帧 extent 所有权：Drop 时按 canonical blocks 有界归还。
-#[must_use = "dropping the tracker returns its frame extent to the inventory"]
-pub struct FrameTracker {
-    geometry: Option<ExtentGeometry>,
-}
-
-impl FrameTracker {
-    fn from_claimed(base: FrameNumber, count: usize) -> Self {
-        Self {
-            geometry: Some(
-                ExtentGeometry::new(base, count).expect("invalid claimed frame extent geometry"),
-            ),
-        }
-    }
-
-    fn geometry(&self) -> ExtentGeometry {
-        self.geometry
-            .expect("frame tracker ownership already transferred")
-    }
-
-    fn take_geometry(&mut self) -> ExtentGeometry {
-        self.geometry
-            .take()
-            .expect("frame tracker ownership already transferred")
-    }
-
-    pub fn base(&self) -> FrameNumber {
-        self.geometry().base()
-    }
-
-    pub fn count(&self) -> usize {
-        self.geometry().count()
-    }
-
-    /// 消费原 tracker，在内部边界切成两个互不重叠的 affine tracker。
-    pub fn split_at(mut self, offset: usize) -> (Self, Self) {
-        let geometry = self.take_geometry();
-        let (left, right) = geometry
-            .split_at(offset)
-            .expect("frame tracker split must be strictly internal");
-        (
-            Self {
-                geometry: Some(left),
-            },
-            Self {
-                geometry: Some(right),
-            },
-        )
-    }
-}
-
-impl Drop for FrameTracker {
-    fn drop(&mut self) {
-        if let Some(geometry) = self.geometry.take() {
-            with_pool(|pool| pool.dealloc(geometry.base(), geometry.count()));
-        }
-    }
-}
-
-/// 自检：分配→切割→写入→归还→重取验证清零，全程真硬件访问。
-pub fn selftest() {
-    let tracker = alloc_user_order(3).expect("self-test allocation failed");
-    let slots = mm::phys_to_virt(tracker.base().addr()) as *mut usize;
-    // SAFETY: 自检持有 8 帧，写首 8 槽不越界；高半区直映射下访问。
-    unsafe {
-        for index in 0..8 {
-            slots.add(index).write_volatile(0xDEAD_0000 + index);
-        }
-    }
-    let before = free_frames();
-    let (left, right) = tracker.split_at(4);
-    assert_eq!(left.count(), 4, "left split geometry mismatch");
-    assert_eq!(right.count(), 4, "right split geometry mismatch");
-    assert_eq!(
-        right.base(),
-        left.base() + left.count(),
-        "frame split overlaps or leaves a gap"
-    );
-    drop(left);
-    assert_eq!(
-        free_frames(),
-        before + 4,
-        "partial frame return accounting mismatch"
-    );
-    drop(right);
-    assert_eq!(
-        free_frames(),
-        before + 8,
-        "frame return accounting mismatch"
-    );
-    let tracker = alloc_user_order(3).expect("reallocation failed");
-    // SAFETY: 同上；首帧首槽读回验证锁外初始化已完成。
-    let first = unsafe { *(mm::phys_to_virt(tracker.base().addr()) as *const usize) };
-    assert!(first == 0, "allocation not zeroed");
-    log!(Frame, "self-test passed: alloc/split/dealloc/re-zero ok");
 }

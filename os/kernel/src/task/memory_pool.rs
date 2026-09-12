@@ -119,6 +119,16 @@ impl MemoryPool {
         assert_eq!(parent_committed.delegated, baseline.delegated + PAGES);
         assert_eq!(parent_committed.available, baseline.available - PAGES);
 
+        let frames_before_funding = crate::frame::free_frames();
+        let funded = crate::frame::fund_user_table_frame(&child)
+            .expect("child-funded frame self-test failed");
+        let mut child_funded = child_snapshot;
+        child_funded.available -= 1;
+        child_funded.allocated += 1;
+        assert_eq!(child.snapshot(), child_funded);
+        assert_eq!(root.snapshot(), parent_committed);
+        assert_eq!(crate::frame::free_frames(), frames_before_funding - 1);
+        let child_identity = Arc::downgrade(&child);
         let peer = Arc::clone(&child);
         drop(child);
         assert_eq!(
@@ -127,6 +137,21 @@ impl MemoryPool {
             "Pool credit returned before the last core reference disappeared"
         );
         drop(peer);
+        assert!(
+            child_identity.upgrade().is_some(),
+            "funded owner lost its source Pool"
+        );
+        assert_eq!(
+            root.snapshot(),
+            parent_committed,
+            "delegated credit returned while a child-funded owner remained alive"
+        );
+        drop(funded);
+        assert!(
+            child_identity.upgrade().is_none(),
+            "source Pool survived its last funded owner"
+        );
+        assert_eq!(crate::frame::free_frames(), frames_before_funding);
         assert_eq!(
             root.snapshot(),
             baseline,
@@ -168,7 +193,7 @@ impl MemoryPool {
         );
         log!(
             Memory,
-            "Pool self-test passed: rollback, commit, and last-reference refund ok"
+            "Pool self-test passed: rollback, commit, and funded-source last-reference refund ok"
         );
     }
 

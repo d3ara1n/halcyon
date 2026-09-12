@@ -1,10 +1,18 @@
 # 多页 Tunnel 与 Runnel 数据面
 
-> 切片 8/9 的实现与组合验收已完成；真实提交范围由统一架构 Review 入口登记，不在本专题立即执行 Review。切片 10 仍是独立未完成项。调查基线：`726fc9f`；用户已确认本方案及容量/审计约束修订，方案可随独立论证调整。
+> 切片 8/9 与切片 10 的实现及完整组合验收均已完成，本专题归档。8/9 的固定提交范围由统一架构 Review 入口登记；切片 10 当前尚未提交，提交后另登记真实哈希。调查基线：`726fc9f`；用户已确认方案及容量/审计约束修订。
 >
-> 方向由 `notes/ideas/{mm,object,tunnel,runnel,shared-memory}.md` 拥有；当前实现仍以 `notes/impls/{mm,memory-object,tunnel,runnel}.md` 与代码为准。本计划是本专题唯一实施真值点。
+> 方向由 `notes/ideas/{mm,object,tunnel,runnel,shared-memory}.md` 拥有；当前实现以 `notes/impls/{mm,memory-object,tunnel,runnel}.md` 与代码为准。本档案保存交付范围与验证证据，不再安排实施。
 
-## 最终验证证据
+## 切片 10 验证证据
+
+- `just check` 通过；相关 `frame_pool`、`funded_frame`、`memory_pool`、`memory_supply` host debug/release 通过，日志 `artifacts/frame-source/{check,host-debug,host-release}.log`。
+- 默认 50% 节流 `just acceptance` 通过：七面 clippy、debug stress 16/16、release core、sifive_u core、nofd 和 panic/alloc/fatal 三类启动 Failed 广播；完整聚合日志 `artifacts/frame-source/acceptance.log`。四条正常路线都要求新 frame 自检成功锚点，因此两平台四页 fixture、全范围清零、切分退款与 child 来源保活都已真实执行。
+- ELF 审计通过：debug 最大单帧仍为 `0x26f0`，release 最大单帧 `0x1250`，均小于布局派生的 12KiB 限额；每 hart 256KiB 栈布局不变。退出后无残留 QEMU/GDB。
+- 源码与现状文档已删除通用 raw allocation adapter/tracker；纯库存原语与来源分型 owner 保留，详细最终实现由 `notes/impls/{mm,internals}.md` 拥有。
+- 独立代码复核无开放 finding，报告见 [`库存来源代码复核`](review-2026-09-frame-source-selftest.md)；复核对象为基线 `e973763` 上的本次完整未提交实现，不冒充固定提交 Review。
+
+## 切片 8/9 验证证据
 
 - `just check` 与七面 `just clippy` 全通过。
 - os 全部纯逻辑 crate、shared 与八个用户态公共库的 host debug/release 全通过，日志在 `artifacts/data-plane/*host*.log`；RNL2 14 项模型测试、rinlib Endpoint owner 失败返还和 3 项 compile-fail 示例通过。
@@ -15,15 +23,15 @@
 - 共享访问 debug/release 反汇编已核对 lwu/ld/sw/sd、lbu/sb、acquire/release fence，后端不调用 memcpy/memmove 或原子运行库；日志 `artifacts/data-plane/shared-memory-{debug,release}-selected.asm`。
 - 旧 RNL1、固定 CAP、公开角色 Handle、单页 ABI/shootdown、单 RegionKey/fragment 退役假设与解析拆帧已删除。Create/Attach 共用完整 `prepare_side_mapping`，保留理由是消除重复编排。
 
-后续自然序：切片 10 可独立完成；FAL 正式服务能力由自己的计划继续设计；本专题事后 Review 留到统一架构审查。
+后续自然序：FAL 正式服务能力由自己的计划继续设计；8/9 事后 Review 留到统一架构审查，切片 10 的代码复核针对本次完整实现。
 
 ## 推进结论与交付范围
 
-A–E 前置已闭合，公共 MemoryObject、多 extent backing、AddressSpace 事务、Remote completion 与 ProcessDrain 均可复用，没有必须先另造内核机制的阻塞项。历史证据见 [`Review program 档案`](archived/todo-2026-09-review-program.md)。`4b27ce6` / `8aa7bc2` 的事后复核仍由独立的 [`后续复核计划`](todo-2026-09-design-audit-followup-review.md) 拥有，不插入本专题施工流程。
+A–E 前置已闭合，公共 MemoryObject、多 extent backing、AddressSpace 事务、Remote completion 与 ProcessDrain 均可复用，没有必须先另造内核机制的阻塞项。历史证据见 [`Review program 档案`](todo-2026-09-review-program.md)。`4b27ce6` / `8aa7bc2` 的事后复核仍由独立的 [`后续复核计划`](../todo-2026-09-design-audit-followup-review.md) 拥有，不插入本专题施工流程。
 
 **切片 8/9 合为一次完整交付**：多页 Tunnel ABI、Endpoint owner、安全关闭边界、共享内存访问、RNL2、现有消费者与验证一起完成。编号保留作历史定位，内部可按依赖施工，但不交付“多页内核 + 单页协议”的过渡状态，不在中途做局部闭环或验收。
 
-真实 Runnel 消费者是 `srv_init ↔ srv_pm`；Tunnel 机制消费者还包括 `srv_init` 生命周期/退出压力、`test_hammer` close/Attach/drain 与内核 Tunnel selftest。当前 `libfal::provider` 对 Open 返回 Unsupported，`librpc/libfs/srv_fs` 没有 Runnel 调用链。**本轮不承诺 FAL Open 已接线**；其 DirectoryGrant、provider 路由、服务发现与 Open 生命周期，以及“大于一页的正式 FAL 流”验收，统一由 [`FAL 服务能力计划`](todo-2026-09-fal-service-capabilities.md) 承接。现有 FAL/RPC 仅随 raw-close 安全边界作必要调用迁移。
+真实 Runnel 消费者是 `srv_init ↔ srv_pm`；Tunnel 机制消费者还包括 `srv_init` 生命周期/退出压力、`test_hammer` close/Attach/drain 与内核 Tunnel selftest。当前 `libfal::provider` 对 Open 返回 Unsupported，`librpc/libfs/srv_fs` 没有 Runnel 调用链。**本轮不承诺 FAL Open 已接线**；其 DirectoryGrant、provider 路由、服务发现与 Open 生命周期，以及“大于一页的正式 FAL 流”验收，统一由 [`FAL 服务能力计划`](../todo-2026-09-fal-service-capabilities.md) 承接。现有 FAL/RPC 仅随 raw-close 安全边界作必要调用迁移。
 
 不引入 resize、COW、pager、KernelMemoryBudget 公共 ABI、BufferQueue、DMA/IOMMU、动态链接、普通 Pool revoke/reparent、RPC 有限 deadline 或全局 Handle 类型重构。切片 10 保持独立库存 selftest 来源收口，不承担本轮旧接口清理。
 
@@ -55,7 +63,7 @@ A–E 前置已闭合，公共 MemoryObject、多 extent backing、AddressSpace 
 - `user/rinlib/src/ipc/tunnel.rs` / `call.rs`：只有裸 Handle 接口；`ipc/object.rs` 有安全 raw close；`process.rs::abandon_to_completion` 接收可伪造的 `ProcessCreateResult` 并无条件 close。
 - `user/frameworks/librunnel/src/lib.rs`：RNL1 固定容量、`u32 % CAP` 寻址、普通数据拷贝、公开 `handle()`；`srv_init/src/main.rs` 通过该 Handle 等待 peer close。
 - `user/frameworks/libfal/src/provider.rs`：Open 返回 Unsupported；`notes/impls/fal.md` 明确与 init/pm 数据面验证分开。
-- 外部契约：[`references/CONTRACTS.md`](../references/CONTRACTS.md) 中 RVWMO、Load and Store Instructions、Supervisor Memory-Management Fence Instruction；Rust 语言边界证据见 [`共享访问取证`](ref-2026-09-shared-memory-access.md)。
+- 外部契约：[`references/CONTRACTS.md`](../../references/CONTRACTS.md) 中 RVWMO、Load and Store Instructions、Supervisor Memory-Management Fence Instruction；Rust 语言边界证据见 [`共享访问取证`](../ref-2026-09-shared-memory-access.md)。
 
 ## 最终类型与所有权
 
@@ -163,7 +171,7 @@ lease 的最终凭据是 `LeaseKey + range + ObjectId + object_offset + protecti
 - 这是 **Halcyon RV64 + rustc/LLVM 的平台契约**，不是 Rust 标准已经形式化证明任意跨进程并发。正式承诺依赖后端代码生成和 ISA 核对；host 模型只证明合规原子模型下的协议，不冒充对恶意外部进程的语言证明。
 - host 测试用永久的原子存储后端：控制字段同宽 AtomicU32/U64，数据 AtomicU8 Relaxed；用合规原子写模拟畸形输入。实际混合宽/非原子恶意写由独立 guest 进程做平台测试，不能在 Rust host 测试中故意制造 UB。
 
-语言/平台证据与验证边界见 [`共享访问取证`](ref-2026-09-shared-memory-access.md)。
+语言/平台证据与验证边界见 [`共享访问取证`](../ref-2026-09-shared-memory-access.md)。
 
 ## RNL2 状态与算法
 
@@ -221,14 +229,17 @@ lease 的最终凭据是 `LeaseKey + range + ObjectId + object_offset + protecti
 6. 完成以上全部连接、失败和退出路径后，执行组合验证及全仓残留搜索；验证全部通过才标记 8/9 完成。
 7. 向用户展示 diff/摘要后取得提交授权；提交后按真实哈希登记未来 Review，不在施工中插入 Review。
 
-不设置临时 adapter 的保留期，因为本方案不引入临时接口；分片代码可以暂未接通，但必须是上述最终类型的一部分。切片 10、FAL、RPC deadline、最终架构 Review 的未完成状态不能被本轮验收勾销。
+不设置临时 adapter 的保留期，因为本方案不引入临时接口；分片代码可以暂未接通，但必须是上述最终类型的一部分。切片 8/9 的验收不勾销独立任务；切片 10 的独立完成证据见本档案开头，FAL、RPC deadline 与最终架构 Review 仍由各自入口拥有。
 
-## 切片 10：库存 selftest 来源收口
+## 切片 10：库存来源与启动自检收口
 
-| 项目 | 当前与目标 |
-|---|---|
-| 现状 | `os/kernel/src/frame.rs::selftest` 使用 raw `alloc_user_order`；当前无 `alloc_user_largest` 函数，库存 backend 的 claim_largest 与对外 raw adapter 应区分 |
-| 目标 | 库存模型测试验证纯 claim/return；内核接线自检经正式 funded owner 验证来源和退款，不保留可被生产误用的 raw adapter |
-| 前置/删除触发 | 事务/owner 结构已收口，可独立实施；不必等 RNL2，也不把 8/9 的旧路径留到本项 |
-| 验证 | host split/coalesce/重复归还；真实启动 Pool/frame 守恒；全仓无旧 raw alloc 入口 |
-| 自然顺序 | 冻结测试职责 → 同时迁移 selftest 与删除 API → 组合验证 → 删除本项记录并更新 impls |
+用户已确认完整方案并授权实施；整体连接与旧机制删除完成后统一验证，不做局部验收。全部完成门已通过，证据见本档案开头。
+
+- 最终物理来源分型：普通 claim 由 `ClaimedUserExtent` 与 `MemoryCharge` 合成 funded owner；`BootHeldExtent` 直接持 `Option<ExtentGeometry>`，以唯一 unsafe adopt 接管未入库存的启动范围，切分保持相邻且不重叠，Drop 回投，不清零启动内容。删除通用 `FrameTracker`、`alloc_user_order`、`publish_claimed` 与 main 的早期 raw 自检；保留纯库存 order/largest 原语和正式 clear。
+- 自检统一位于 `frame/selftest.rs`，boot 在 root 建立后、Ready 发布前调用。正式入口检查三页总几何、全范围零态、单页表 owner、完整 Pool 快照和 frame 守恒；一 extent 三页失败验证真实退款。
+- 私有 `DirtyInventory` 只委托正式库存来源，锁外把同一个独占 claim 全范围写脏并读回，再由真实 broker clear；逐字节零态证明不依赖重取相同 PA。它是永久测试来源端口，不是生产 adapter 或故障开关，不另建 raw 分配/归还路径。
+- 四页单 extent fixture 经正式 owner 转换后切成一页与三页，两种释放顺序都检查部分退款、存活一侧内容可访问和最终退款。连续四页是当前两平台启动供给前置，不扩大分配 ABI 承诺；不得为测试新增指定 PA 原语。
+- MemoryPool 现有 child 自检用 child 支付真实表页，核对 root delegated/child allocated，删除外部 child 强引用后 funded owner 继续保活来源，最后物理 owner 与 charge 析构才触发父级退款，不开放 child 构造 API。
+- host 库存测试补部分重叠归还的修改前拒绝；broker 切分测试补逐 owner 释放后的中间账本。精确析构次序和失败前不清零由 host 模型证明，不把启动静止点快照夸大为事件次序证据。
+- 新统一成功锚点仅在全部 frame 自检通过后输出，并纳入正常 QEMU required；boot-failure 继续独立判定。同步 `notes/impls/{mm,internals}.md` 与导航/Review 当前观察登记，历史归档和只读参考不改。
+- 整体完成门：相关 host debug/release、`just check`、全仓 clippy 与完整 `just acceptance`，核对 debug/release 帧审计和两平台四页 fixture；结束确认无 QEMU/GDB 残留。源码与现状文档无旧 raw adapter/tracker，BootPackage 内容与真实退役路线保持正确；通过后归档本计划并更新 COMPASS。提交仍需展示摘要后取得独立授权，未来代码 Review 只登记真实提交。

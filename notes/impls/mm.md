@@ -25,7 +25,7 @@ system  = metadata + heap + recovery
 
 ## 用户帧库存
 
-物理帧的用户库存由 `os/frame_pool` 的**外置元数据分级 order 树**管理。`frame_pool` 不使用堆且不含 unsafe；内核 adapter 负责真实帧清零、全局 POOL 锁与 `FrameTracker` RAII 所有权。
+物理帧的用户库存由 `os/frame_pool` 的**外置元数据分级 order 树**管理。`frame_pool` 不使用堆且不含 unsafe；内核 adapter 负责全局 POOL 锁、真实帧清零与来源分型的 affine 所有权：普通页由 `ClaimedUserExtent` 与 Pool charge 合成 funded owner，保留内容的启动页由 `BootHeldExtent` 直接持有。
 
 ### 结构
 
@@ -40,28 +40,28 @@ pub struct FramePool<'a> {
     /* tree metadata slice, arena metadata slice, counters */
 }
 
-pub struct FrameTracker {
+pub(crate) struct BootHeldExtent {
     geometry: Option<ExtentGeometry>,
 }
 ```
 
-`FramePool` 不再参数化帧内容后端，claim/return 路径只能读写外置树元数据。内核 adapter 取得 claimed geometry 后先释放 POOL 锁，再经 `phys_to_virt` 清零完整 extent；清零结束才构造 `FrameTracker`。`ExtentGeometry` 可复制但只表达几何，私有字段的 `FrameTracker` 才表达 affine 所有权。
+`FramePool` 不再参数化帧内容后端，claim/return 路径只能读写外置树元数据。内核 adapter 取得 claimed geometry 后立即由私有 `ClaimedUserExtent` 持有，先释放 POOL 锁，再经 `phys_to_virt` 清零完整 extent；broker 在全部 extent 清零后提交 Pool charge 并返回 funded owner。`ExtentGeometry` 可复制但只表达几何，不能复制物理所有权。`BootHeldExtent` 不走普通清零路径，只能在已验证的启动 reservation 移交点以 unsafe adopt 接管保留内容。
 
 ### 操作与契约
 
 - `add_managed_region(start, end)`：注册完整 DT memory，初态全部 unavailable；frame/arena/metadata 的目标计数与字节游标全部 checked 预计算，重叠、算术溢出、arena 超限或元数据不足在任何 metadata/arena 写入前失败。
 - `release_range(start, end)`：只把 planner 的 user-free 或生命周期结束的 user boot-held 区间发布为空闲；bootstrap、DTB 与 BootPackage prefix 回投走此入口。
-- `alloc_order(order)` / `alloc_largest(max_count)`：纯库存 crate 的 order 与最大 extent 原语；内核生产路径以来源 Pool 的 funded owner 取得匿名 backing 与 Tunnel backing，锁外清零后才发布；库存 selftest 暂保留 raw `alloc_user_order` adapter，待后续切片收口。
+- `alloc_order(order)` / `alloc_largest(max_count)`：纯库存 crate 的 order 与最大 extent 原语；内核生产路径以来源 Pool 的 funded owner 取得匿名 backing 与 Tunnel backing，锁外清零后才发布；内核不提供脱离来源 Pool 的普通 raw 分配入口。
 - `alloc_at(base, count)`：预验证完整指定区间空闲后，按 canonical blocks 精确取走；失败不改变库存。
-- `dealloc(base, count)`：任意区间 canonical 分解后沿祖先合并；重复归还或与现有空闲库存重叠立即触发断言。普通 `FrameTracker` 持 power-of-two extent，BootPackage payload 可持任意长度保留区间。
+- `dealloc(base, count)`：任意区间 canonical 分解后沿祖先合并；重复归还或与现有空闲库存重叠立即触发断言。普通 claim 初始为 power-of-two extent，资金化切分后的 owner 与 BootPackage payload 可持任意长度区间。
 
 库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
 
-`FrameTracker` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 tracker 并产生两个精确相邻 tracker。用户页表以来源 Pool 的 funded owner 直接保存 affine owner，不再把 owner 拆成裸帧号后通过 unsafe 重建。`FrameTracker::Drop` 直接走结构性有界归还。ProcessDrain 不再保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
+`BootHeldExtent` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 owner 并产生两个精确相邻 owner，Drop 将仍拥有的启动区间结构性有界回投库存。用户页表以来源 Pool 的 funded owner 直接保存 affine owner，不把 owner 拆成裸帧号后通过 unsafe 重建；funded owner 析构先归还物理页，再退来源 Pool charge。ProcessDrain 不再保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
 
 ## 物理供给验证
 
-17 项 FramePool host 用例覆盖库存结构、极端几何、失败原子性与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。内核启动自检分别覆盖 user inventory 的 claim/split/dealloc/re-zero、system heap ticket 首次消费，以及 funded broker 的真实 Pool/FramePool commit、extent-limit rollback 与双账本自然退款。系统储备批次收口时（验收拆档前的 full workload）virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前阶段收尾由 `just acceptance` 分别执行 debug stress、release core 与 sifive_u core。
+FramePool host 用例覆盖库存结构、极端几何、失败原子性、部分重叠归还的修改前拒绝与守恒；7 项 memory_supply debug/release 用例覆盖 permanent/boot 优先级、碎片化独立 chunk 放置、子预算不足、固定容量耗尽、失败 workspace 重规划、用途分型与 ticket 单调消费。`frame::selftest::run` 在 root Pool 建立后、Ready 发布前的启动静止点覆盖正式普通页与表页入口、真实 Pool/FramePool commit、extent-limit rollback、1+3 页切分的两种释放顺序和精确双账本退款。私有 `DirtyInventory` 委托正式 `UserInventory` 取得独占 claim，锁外写脏并读回完整范围，再交给 broker 的真实 clear；成功后逐字节检查所有 extent 为零，不依赖重取相同 PA。四页单 extent 是当前两平台启动供给的 fixture 前置，不是普通分配 ABI 承诺。MemoryPool 自检另验证 child 支付真实表页、funded owner 保活来源 core 与最后 owner 释放后的父级退款；事务先后与失败前不清零的事件证据由 broker host 模型拥有。切分后存活侧读写只验证访问范围，直映射不会随库存归还失效，因此不能单独证明独占所有权；该不变量还由 affine split/Drop 几何和库存测试支持。system heap 自检覆盖 ticket 首次消费。系统储备批次收口时（验收拆档前的 full workload）virt debug/release 与 `sifive_u` 均完成 16/16 acceptance；实测闭包为 virt debug `262144 = 1495 + 9515 + 4236 + 246898`、virt release `262144 = 1308 + 254 + 4236 + 256346`、sifive_u debug `32768 = 1063 + 9515 + 4124 + 18066`，对应 system 子账户分别为 virt `4236 = 140 + 4096 + 0` 与 sifive_u `4124 = 28 + 4096 + 0`。当前阶段收尾由 `just acceptance` 分别执行 debug stress、release core 与 sifive_u core。
 
 ## MemoryPool 额度与 metadata 准入
 
@@ -80,7 +80,7 @@ charge 与 delegation 使用不同的线性 reservation/credit 类型，所有�
 
 内核 `MemoryPool` 对象以 `Prepared → Committing → Active` 表达 Handle 发布事务。Prepared owner 在任何发布前失败时析构并回滚 parent reservation；Commit 后 child state 内嵌 credit、同时强持 parent，最后一个 core 引用消散时消费 child state、逐把锁把额度归父。`MemoryPoolQuery` 要求 READ，`MemoryPoolDerive` 要求 CREATE；child rights 必须是来源 rights 与 Pool 最大 rights 的子集，GRANT 同时用于 ProcessBindMemory 的 consume-on-success authority。init 的出生块固定安装同一 root core 的完整管理 Handle；内部 PoolBinding 与用户 Handle 共享 core，不复制额度。rinlib `MemoryPool` 是带 Drop close 的 affine owner，显式 `into_handle` 才把 authority 移回通用传输面。
 
-14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；8 项 admission 用例覆盖单槽/批量全局与本地耗尽、部分失败退款、精确批量退款和 sponsor 强保活。启动自检另穿过 ProcessBuilder/ProcessControl、MemoryChange/Wait/Remote 组合准入与 backing slice 的本地耗尽或退款，以及 Pool 的错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用与最后引用退款；debug `virt` core 已通过，既有阶段基线的 stress/release/sifive_u 完整 acceptance 结论不因本批改写。
+14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；8 项 admission 用例覆盖单槽/批量全局与本地耗尽、部分失败退款、精确批量退款和 sponsor 强保活。启动自检另穿过 ProcessBuilder/ProcessControl、MemoryChange/Wait/Remote 组合准入与 backing slice 的本地耗尽或退款，以及 Pool 的错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用、child-funded owner 来源保活与最后引用退款；debug `virt` core 已通过，既有阶段基线的 stress/release/sifive_u 完整 acceptance 结论不因本批改写。
 
 ## 资金化帧取得 broker
 
@@ -88,7 +88,7 @@ charge 与 delegation 使用不同的线性 reservation/credit 类型，所有�
 
 内核 `task/memory_pool.rs` 的 `PreparedMemoryCharge` 与 `MemoryCharge` 把纯逻辑 `ChargeReservation/AllocatedCredit` 接回来源 Pool core：前者析构回滚 reserved，后者强持 Pool 并在最后析构时退 allocated。`frame.rs` 的 `ClaimedUserExtent` 只在 POOL 锁内摘取 geometry，锁外清零；通用 `FundedFrames` 内部不可见的 `funded_frame::Funded` 按 extents 在前、charge 在后的字段顺序析构，且不提供可提前拆散两侧 owner 的公共入口。AddressSpace 页表帧（root 与中间表同形）使用单页/单 extent 的专用 `FundedTableFrame`，避免把 64-extents 通用存储内联进空壳与 Bind 调用栈。BootPackage 则由不可伪造的 `BootHeldExtent` 表达未入库存的启动 owner，payload 经 root charge 转成可同步 split 的 `BootFundedExtent`；普通 broker 仍无绕过清零的 generic adopt。system tickets 继续由 `SystemSupply` 的独立类型拥有。
 
-AddressSpace root、中间页表、普通 anonymous backing 与有界多页 Tunnel backing 均经 funded frame broker 接入来源 Pool charge；库存自检仍保留 `frame.rs` 的 raw adapter，待切片 10 收口时删除。匿名 backing 的多 extent owner 与页表投影共用锁外 funding seam，BackingSlicePermit 随每个 live/retiring extent owner 保活，Unmap 在 Commit 前按有界切分预算预留新 slice permits；Tunnel 返回正式多页映射几何，内部持有同一资金化 owner。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 不向 generic broker 增加任意拆包。12 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、跨 extent split/merge、wrong-owner、失败 owner 保全、析构顺序与双方程恢复；内核启动自检继续验证真实锁与 RAII 接线。
+AddressSpace root、中间页表、普通 anonymous backing 与有界多页 Tunnel backing 均经 funded frame broker 接入来源 Pool charge；内核启动自检复用正式 funding 入口与 broker 来源端口，不保留通用 raw adapter。匿名 backing 的多 extent owner 与页表投影共用锁外 funding seam，BackingSlicePermit 随每个 live/retiring extent owner 保活，Unmap 在 Commit 前按有界切分预算预留新 slice permits；Tunnel 返回正式多页映射几何，内部持有同一资金化 owner。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 不向 generic broker 增加任意拆包。12 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、跨 extent split/merge、wrong-owner、失败 owner 保全、析构顺序与双方程恢复；内核启动自检继续验证真实锁与 RAII 接线。
 
 ## 页表模式选择
 

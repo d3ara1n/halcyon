@@ -38,6 +38,6 @@
 
 ## 边界与完成门
 
-RNL1 回绕、Endpoint 安全 owner、共享字节访问与门铃握手由 `todo-2026-09-memory-object-data-plane.md` 承接；单调时间与 RPC 全调用期限由 `todo-2026-09-monotonic-time-rpc-deadline.md` 承接，不在本 Review 扩大范围。
+RNL1 回绕、Endpoint 安全 owner、共享字节访问与门铃握手的交付证据见 `archived/todo-2026-09-memory-object-data-plane.md`，固定提交范围由统一架构 Review 入口登记；单调时间与 RPC 全调用期限由 `todo-2026-09-monotonic-time-rpc-deadline.md` 承接，不在本 Review 扩大范围。
 
 未来 reviewer 对两笔固定提交及其组合状态完成只读复核，记录新 finding 或确认无 finding，并核对对应验证后，本计划移入 `plans/archived/`。Review 失败只在本文件登记修复与复核，不创建重复 todo。

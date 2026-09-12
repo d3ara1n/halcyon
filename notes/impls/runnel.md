@@ -24,4 +24,4 @@ host 测试覆盖一页/多页/最大容量、空满和分段、u64::MAX 邻域�
 
 真实 init↔pm 使用三页映射和 65536 B 数据，容量 12160 B，验证完整模式、EOF、背压与对端关闭。Tunnel geometry/多 extent/close/Attach/drain 与独立 guest 非合作字节改写由 [`tunnel.md`](tunnel.md) 的验证入口负责。FAL Open 尚未接线，不将 init↔pm 机制验证解释为正式文件流完成。
 
-本专题组合验证与交付状态以 [`数据面计划`](../../plans/todo-2026-09-memory-object-data-plane.md) 为准。
+本专题组合验证与交付证据见 [`数据面档案`](../../plans/archived/todo-2026-09-memory-object-data-plane.md)。

@@ -14,7 +14,7 @@
 |---|---|---|
 | `d00604a05d11d22656c02d0270161ba6301657d4` | 多页 Tunnel/RNL2 切片 8/9：几何 ABI、共同 backing、完整 lease、Endpoint owner、RV64 共享访问、真实消费者、失败/退役及旧路径删除；同时重校栈容量与布局派生审计 | host debug/release、七面 clippy、just check、默认与全速完整 acceptance（stress 16/16）、RNL2 14 项模型测试、审计工具 6 项测试和共享访问反汇编均通过 |
 
-该批对应 [`数据面计划`](todo-2026-09-memory-object-data-plane.md)，统一审查时重点重新取证：
+该批对应 [`数据面计划`](archived/todo-2026-09-memory-object-data-plane.md)，统一审查时重点重新取证：
 
 - Create/Attach 的结果与 shootdown 是否都来自唯一 lease 几何，所有 Commit 前失败是否保全 Invitation 和 affine owner；close 保活强环是否只在 Commit 后形成并按完成点解除。
 - 完整 lease 的无空洞范围、连续对象 offset、页覆盖去重和最终 permit 退役，是否不依赖单 RegionKey/fragment 或当前物理连续性。
@@ -23,7 +23,7 @@
 - 独立物理 cursor、u64 回绕、几何 shadow、EOF、Invited 期发布、ack→重查→wait 和部分完成错误是否组合闭合。
 - backing/metadata/work 容量是否覆盖真实最后析构与退款调用链；12KiB guard 派生审计与两平台 256KiB 栈是否有完整布局、代码生成和运行证据，不能把单帧扫描当调用链证明。
 
-切片 10、正式 FAL Open 与 RPC deadline 的独立能力缺口不因本批提交而完成；Review 保持下节统一触发条件。
+切片 10 已另行完成实现与完整验收：删除 raw allocation adapter/tracker、boot-held 直接拥有几何、统一 funding 自检、完整清零与切分退款、child 来源保活；当前尚未提交，获提交授权后登记真实哈希与固定范围。证据见数据面档案及 `artifacts/frame-source/`。正式 FAL Open 与 RPC deadline 的独立能力缺口不因数据面提交而完成；Review 保持下节统一触发条件。
 
 ## 触发条件
 
@@ -113,7 +113,7 @@
 
 - `os/kernel/src/task/tunnel.rs` 已贯通多页 Tunnel、MemoryObjectCore/ObjectBacking 多 extent 投影与完整 lease 退役，rinlib owner/RNL2/现有消费者已同步；未来按最终提交范围复核是否还存在阶段性特化或重复 authority；
 - `os/kernel/src/task/proc.rs` 当前存在 `BackingPlanFailure`、重复 Map validation 与 `backing_permits` 多层传递；需在最终 MemoryObject/backing planner 完成后判断哪些应统一；
-- `frame.rs` 当前仍保留库存 selftest 的 raw `alloc_user_order` adapter；需在所有生产路径迁移后判断是否删除；
+- `frame.rs` 普通页由私有 claim 与来源 charge 合成 funded owner，boot-held 直接持几何并经唯一 adopt 接管；旧 raw allocation adapter/tracker 已删除。统一自检与真实 child 来源保活已验证，未来按固定提交复核来源分型、切分及析构顺序，不重新把旧 adapter 视为现状；
 - 固定 split metadata 上界、验收 workload 分支和 Pool 守恒观测方式需结合最终并发/碎片模型重新证明；
 - 1–5 与 6A–6D 的既有 review 计划只验证对应提交，不替代本次全局架构收口。
 

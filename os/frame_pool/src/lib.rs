@@ -303,7 +303,7 @@ impl<'a> FramePool<'a> {
     /// 归还一段已分配或启动期保留的物理区间。
     ///
     /// 任意长度区间先做 canonical power-of-two 分解，每块归还沿树至多更新
-    /// `usize::BITS` 层。debug 构建拒绝与现有空闲块重叠。
+    /// `usize::BITS` 层。归还前拒绝与现有空闲块重叠，拒绝时不修改库存。
     pub fn dealloc(&mut self, base: FrameNumber, count: usize) {
         assert!(count > 0, "zero-frame deallocation");
         let end = base.0.checked_add(count).expect("frame range overflow");

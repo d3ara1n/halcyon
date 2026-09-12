@@ -28,6 +28,7 @@ mkdir -p artifacts
 log="artifacts/.qemu-acceptance-$$.log"
 
 required=(
+    "funded frame self-test passed: full-range zeroing, split, rollback, and source refund"
     "acceptance domain collected"
     "all services supervised to completion"
     "peer closed observed"
