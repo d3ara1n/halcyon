@@ -6,6 +6,25 @@
 
 当前阶段只登记观察对象，不提前判定其最终去留。原因是只有内核主线、shared ABI、rinlib 与主要用户态消费者共同完成后，才能从全局视角判断某个机制究竟是长期基础、必要的阶段性边界，还是 A→B 迁移中遗留的 C/D/E/F。
 
+## 已登记提交范围
+
+本表是已完成批次的事后审查入口，只登记固定提交与证据，不提前执行 Review。已有实施方案仅供参考；审查以整体需求、正确性和长期结构为依据，允许推翻方案，不以“已按方案完成”免除机制论证。
+
+| 提交 | 批次与范围 | 验证基线 |
+|---|---|---|
+| `d00604a05d11d22656c02d0270161ba6301657d4` | 多页 Tunnel/RNL2 切片 8/9：几何 ABI、共同 backing、完整 lease、Endpoint owner、RV64 共享访问、真实消费者、失败/退役及旧路径删除；同时重校栈容量与布局派生审计 | host debug/release、七面 clippy、just check、默认与全速完整 acceptance（stress 16/16）、RNL2 14 项模型测试、审计工具 6 项测试和共享访问反汇编均通过 |
+
+该批对应 [`数据面计划`](todo-2026-09-memory-object-data-plane.md)，统一审查时重点重新取证：
+
+- Create/Attach 的结果与 shootdown 是否都来自唯一 lease 几何，所有 Commit 前失败是否保全 Invitation 和 affine owner；close 保活强环是否只在 Commit 后形成并按完成点解除。
+- 完整 lease 的无空洞范围、连续对象 offset、页覆盖去重和最终 permit 退役，是否不依赖单 RegionKey/fragment 或当前物理连续性。
+- 安全 owner 是否封死直接/间接 raw close 旁路；协议终态后是否停止共享访问，清理失败是否保留责任及可查询诊断。
+- 共享访问的 Rust/LLVM/RV64 平台边界是否成立；host 合规模型与独立 guest 非合作改写证据不能互相替代或夸大为语言形式证明。
+- 独立物理 cursor、u64 回绕、几何 shadow、EOF、Invited 期发布、ack→重查→wait 和部分完成错误是否组合闭合。
+- backing/metadata/work 容量是否覆盖真实最后析构与退款调用链；12KiB guard 派生审计与两平台 256KiB 栈是否有完整布局、代码生成和运行证据，不能把单帧扫描当调用链证明。
+
+切片 10、正式 FAL Open 与 RPC deadline 的独立能力缺口不因本批提交而完成；Review 保持下节统一触发条件。
+
 ## 触发条件
 
 满足以下条件后执行：
