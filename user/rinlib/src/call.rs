@@ -14,6 +14,7 @@ use erhino_shared::{
         ThreadStartContext, Tid,
     },
     reset::{ResetAction, ResetReason},
+    tunnel::{TunnelAttachRequest, TunnelCreateRequest},
     wait::{WaitItem, WaitResult},
 };
 use num_traits::FromPrimitive;
@@ -457,27 +458,23 @@ pub unsafe fn sys_thread_exit(code: i64) -> ! {
     panic!("ThreadExit unexpectedly returned")
 }
 
-pub unsafe fn sys_tunnel_create(addr: usize, output: &mut HandlePair) -> SystemCallResult<()> {
+pub(crate) unsafe fn sys_tunnel_create(request: &TunnelCreateRequest) -> SystemCallResult<()> {
     sys_call(
         SystemCall::TunnelCreate,
-        addr,
-        output as *mut HandlePair as usize,
+        request as *const _ as usize,
+        0,
         0,
         0,
     )
     .map(|_| ())
 }
 
-pub unsafe fn sys_tunnel_attach(
-    invitation: Handle,
-    addr: usize,
-    output: &mut Handle,
-) -> SystemCallResult<()> {
+pub(crate) unsafe fn sys_tunnel_attach(request: &TunnelAttachRequest) -> SystemCallResult<()> {
     sys_call(
         SystemCall::TunnelAttach,
-        invitation.raw() as usize,
-        addr,
-        output as *mut Handle as usize,
+        request as *const _ as usize,
+        0,
+        0,
         0,
     )
     .map(|_| ())

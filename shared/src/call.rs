@@ -161,7 +161,7 @@ pub enum SystemCall {
     MemoryObjectSeal = 0x57,
 
     // -----Tunnel-----
-    /// 创建共享页、Endpoint 和一次性 Invitation。
+    /// 创建有界共享映射、Endpoint 和一次性 Invitation。
     TunnelCreate = 0x60,
     /// 原子消费 Invitation 并建立对端 Endpoint。
     TunnelAttach = 0x61,

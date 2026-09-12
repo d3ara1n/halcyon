@@ -10,7 +10,7 @@ Tunnel 不预留固定“控制页”。页内协议自行声明 header 与数�
 
 ## 建立与邀请
 
-`TunnelCreate(bytes, placement)` 建立持有 backing 的 Connection，并向创建者交付本地完整区间的 Endpoint、一次性 peer invitation 与规范化后的映射几何。Endpoint 与本进程的 object-owned 地址空间 lease 绑定，不可 duplicate、TRANSIT 或 GRANT；invitation 不可 duplicate，可按授权 TRANSIT 或直接 GRANT 给预期对端。它不是随机字符串、全局登记 key 或可猜测 bearer id。
+`TunnelCreate(bytes, placement)` 建立持有 backing 的 Connection，并向创建者交付本地完整区间的 Endpoint、一次性 peer invitation 与规范化后的映射几何。选址支持地址空间自动选择或在指定空闲区间建立映射；两端地址独立，以内核返回的规范化范围为准。Endpoint 与本进程的 object-owned 地址空间 lease 绑定，不可 duplicate、TRANSIT 或 GRANT；invitation 不可 duplicate，可按授权 TRANSIT 或直接 GRANT 给预期对端。它不是随机字符串、全局登记 key 或可猜测 bearer id。
 
 持 invitation 的一方调用 `TunnelAttach`，在本地选择合法映射位置；内核从 Connection 读取实际长度，预留完整多页 ObjectView，成功时原子消费 invitation 并返回 Endpoint 与映射几何。映射、权限、输出空间、页表 charge 或其它预留失败均不消费 invitation。A 端先关闭使 invitation 终态且 attach 失败；invitation 被丢弃通知 A 对端放弃；attach 先完成则双方进入存活关系。
 
@@ -19,6 +19,10 @@ Tunnel 不预留固定“控制页”。页内协议自行声明 header 与数�
 Connection 独占共享 backing 与两端参与方关系。每个端点按[内存模型](mm.md)把覆盖完整 backing 的 object-backed view 绑定到所在进程的内部 lease；区域与普通 mapping 进入同一冲突账本，但普通地址空间操作不能替换、切割或解除。端点 close 在消费 Handle 前预留完整 lease 撤销事务，提交后由 AddressSpace 持有 retire 状态和 Connection 强引用；显式调用者在相关 hart 确认失效后完成，进程 drain 则保留可恢复进度。
 
 一端关闭不突然拆除幸存端映射，幸存端以 `PEER_CLOSED` 得知页内对端数据已不可信并按协议进入 Broken。两端参与方都关闭只结束逻辑关系；全部 retiring view 完成后，最后一个 Connection 引用才释放 extents 并把 charge 归还创建者的 MemoryPool。关闭不可复活。attach 在 Connection 的单一线性化点竞争 invitation 与关闭：提交前任何失败完全回滚，提交后不再有可失败步骤。
+
+本地安全 Endpoint owner 同时持有 Handle 与映射存活责任；页内协议消费此 owner，仅向上层借出所需事件能力。不能在协议仍持有安全访问能力时，通过可复制 Handle 或可伪造的清理凭据提前撤销映射。共享数据访问只通过受 owner 生命周期约束的平台原语，不导出普通共享 slice。
+
+显式 close 消费 owner，提交前失败则原样返还，调用者可以重试或升级清理。析构遵守对象的收束政策：不无限重试、不因普通清理错误 panic；无法关闭的资源留在进程账本中由最终 drain 接管，并提供进程内可查询诊断。lease 完成以完整范围、连续对象偏移和所有退役责任均闭合为准，不以单个区域节点或单次回调代替。
 
 ## 门铃与对象状态
 

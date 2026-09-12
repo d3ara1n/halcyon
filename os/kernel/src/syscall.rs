@@ -527,7 +527,15 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::TunnelCreate => {
-            match crate::task::tunnel::create(thread, a0, frame.x[11] as usize) {
+            let request = {
+                let mut space = thread.process.space.lock();
+                // SAFETY: 固定宽 ABI 请求先完整拷入，用户地址经 uaccess 校验。
+                unsafe { uaccess::read_user_value(&mut space, a0) }
+            };
+            match request
+                .map_err(SystemCallError::from)
+                .and_then(|request| crate::task::tunnel::create(thread, request))
+            {
                 Ok(plan) => {
                     sched::park_request_wait(plan);
                     Outcome::Wait
@@ -539,12 +547,15 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
         }
         SystemCall::TunnelAttach => {
-            match crate::task::tunnel::attach(
-                thread,
-                Handle::from_raw(frame.x[10]),
-                frame.x[11] as usize,
-                frame.x[12] as usize,
-            ) {
+            let request = {
+                let mut space = thread.process.space.lock();
+                // SAFETY: 同 Create，先取得固定宽快照，再解释授权与几何。
+                unsafe { uaccess::read_user_value(&mut space, a0) }
+            };
+            match request
+                .map_err(SystemCallError::from)
+                .and_then(|request| crate::task::tunnel::attach(thread, request))
+            {
                 Ok(plan) => {
                     sched::park_request_wait(plan);
                     Outcome::Wait

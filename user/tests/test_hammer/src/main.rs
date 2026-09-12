@@ -9,7 +9,7 @@
 #![no_std]
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use libprocess::race::{
     self, ACTION_CLOSE, ACTION_CREATE, ACTION_CREATE_ABANDON, ACTION_DRAIN, ACTION_ENUMERATE,
     ACTION_EXIT, ACTION_KILL, ACTION_SEAL, ACTION_START, Cmd, HAMMER_CMD, HAMMER_CONTROL_RIGHTS,
@@ -120,7 +120,7 @@ fn execute(cmd: &Cmd, handles: &[Handle]) -> (Report, alloc::vec::Vec<u64>) {
     let (report, tail) = match cmd.action {
         ACTION_KILL => {
             let result = process::kill(handles[0], cmd.code as i64);
-            let _ = close(handles[0]);
+            let _ = unsafe { close(handles[0]) };
             done(result)
         }
         ACTION_START => {
@@ -128,7 +128,7 @@ fn execute(cmd: &Cmd, handles: &[Handle]) -> (Report, alloc::vec::Vec<u64>) {
             // Start 失败（如 seal 后 ObjectClosed）时 builder 未被消费，
             // 随指令关闭——否则残留至锤退出才由内核收。
             if result.is_err() {
-                let _ = close(handles[0]);
+                let _ = unsafe { close(handles[0]) };
             }
             done(result)
         }
@@ -136,18 +136,18 @@ fn execute(cmd: &Cmd, handles: &[Handle]) -> (Report, alloc::vec::Vec<u64>) {
         ACTION_CREATE_ABANDON => create(handles, true),
         ACTION_SEAL => {
             let result = process::seal_job(handles[0]);
-            let _ = close(handles[0]);
+            let _ = unsafe { close(handles[0]) };
             done(result)
         }
         ACTION_DRAIN => {
             let (report, tail) = drain(handles[0]);
-            let _ = close(handles[0]);
+            let _ = unsafe { close(handles[0]) };
             (report, tail)
         }
-        ACTION_CLOSE => done(close(handles[0])),
+        ACTION_CLOSE => done(unsafe { close(handles[0]) }),
         ACTION_ENUMERATE => {
             let (report, tail) = enumerate(handles[0]);
-            let _ = close(handles[0]);
+            let _ = unsafe { close(handles[0]) };
             (report, tail)
         }
         other => (
@@ -186,8 +186,8 @@ fn create(handles: &[Handle], abandon: bool) -> (Report, alloc::vec::Vec<u64>) {
     let report = match process::create(handles[0], HAMMER_CONTROL_RIGHTS) {
         Ok(created) => {
             if abandon {
-                let _ = close(created.builder);
-                let _ = close(created.control);
+                let _ = unsafe { close(created.builder) };
+                let _ = unsafe { close(created.control) };
                 Report {
                     status: 0,
                     aux0: created.pid,
@@ -208,7 +208,7 @@ fn create(handles: &[Handle], abandon: bool) -> (Report, alloc::vec::Vec<u64>) {
         },
     };
     // job handle 用毕即弃；builder/control 由 abandon 决定。
-    let _ = close(handles[0]);
+    let _ = unsafe { close(handles[0]) };
     (report, alloc::vec::Vec::new())
 }
 
@@ -354,22 +354,25 @@ fn thread_suite() {
     debug!("hammer target: same-address-space thread suite passed");
 }
 
-const TARGET_TUNNEL_VA: usize = 0x2200_0000;
 const TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
 
 fn tunnel_exit_target(gun: Handle) -> ! {
     let invitation =
         env::startup_handle(TARGET_INVITATION).expect("Tunnel exit target missing invitation");
-    let _endpoint =
-        tunnel::attach(invitation, TARGET_TUNNEL_VA).expect("Tunnel exit target attach failed");
-    // SAFETY: successful TunnelAttach mapped one shared page at TARGET_TUNNEL_VA.
-    let shared = unsafe { &*(TARGET_TUNNEL_VA as *const AtomicU64) };
-    let request = shared.load(Ordering::Acquire);
+    let endpoint =
+        tunnel::attach(invitation, Placement::Anywhere).expect("Tunnel exit target attach failed");
+    let shared = endpoint.memory();
+    let request = shared.load_u64(0, Ordering::Acquire);
     assert_ne!(
         request, 0,
         "Tunnel exit target observed an unpublished request"
     );
-    shared.store(request ^ TUNNEL_RESPONSE_MASK, Ordering::Release);
+    shared.store_u64(0, request ^ TUNNEL_RESPONSE_MASK, Ordering::Release);
+    // 非合作外端按字节改写同一控制区；对端只作有界整数/字节采样。
+    // 该测试在独立 guest 进程执行，不在 host Rust 原子模型内制造混合尺寸竞争。
+    for round in 0..512usize {
+        shared.write(8, &[round as u8; 32]);
+    }
     await_gun(gun);
     // Endpoint remains live in the process table; ProcessDrain must close its mapping lease.
     thread::exit(0x8c)
@@ -428,7 +431,7 @@ fn thread_spawn_race(gun: Handle) -> ! {
         .end;
     await_gun(gun);
     if let Ok(result) = raw_spawn(parked_thread_entry, stack_pointer, 0, 0) {
-        close(result.control).expect("spawn-race ThreadControl close failed");
+        unsafe { close(result.control) }.expect("spawn-race ThreadControl close failed");
     }
     // raw stack mapping stays owned by this process address space until process drain.
     loop {
@@ -457,7 +460,7 @@ fn last_thread_exit_target(gun: Handle, code: i64) -> ! {
         code as usize,
     )
     .expect("last-thread raw spawn failed");
-    close(result.control).expect("last-thread ThreadControl close failed");
+    unsafe { close(result.control) }.expect("last-thread ThreadControl close failed");
     // raw stack mapping stays owned by this process address space until process drain.
     debug!("hammer target: last secondary thread ready");
     thread::exit(0)
@@ -538,7 +541,7 @@ fn raw_thread_storm() {
             .expect("thread storm failed before the member limit");
         assert!(result.tid > last_tid, "thread ids are not monotonic");
         last_tid = result.tid;
-        close(result.control).expect("storm ThreadControl close failed");
+        unsafe { close(result.control) }.expect("storm ThreadControl close failed");
     }
 
     let probe_stack = usable.start + PROCESS_MAX_THREADS * PROCESS_PAGE_SIZE;
@@ -581,7 +584,7 @@ fn raw_thread_storm() {
         observed.observed.contains(ObjectSignals::DONE),
         "storm probe control closed before DONE"
     );
-    close(probe.control).expect("storm probe ThreadControl close failed");
+    unsafe { close(probe.control) }.expect("storm probe ThreadControl close failed");
     // raw stack mapping stays owned by this process address space until process drain.
     debug!(
         "hammer target: thread storm passed: {} concurrent members",
@@ -668,23 +671,29 @@ fn stale_translation_reuse() {
         .expect("thread suite replacement Unmap failed");
 }
 
-fn close_churn_handle(handle: Handle) -> Result<(), SystemCallError> {
+fn close_churn_endpoint(mut endpoint: tunnel::Endpoint) -> Result<(), SystemCallError> {
     loop {
-        match close(handle) {
+        match endpoint.close() {
             Ok(()) => return Ok(()),
-            Err(SystemCallError::ObjectBusy) => {
-                // SAFETY: HandleClose 事务未提交，handle authority 仍由调用者持有。
+            Err((returned, SystemCallError::ObjectBusy)) => {
+                endpoint = returned;
+                // SAFETY: 完整失败事务返回 owner，随后退避。
                 unsafe { sys_sleep(1).expect("Tunnel close retry sleep failed") };
             }
-            Err(error) => return Err(error),
+            Err((_returned, error)) => return Err(error),
         }
     }
 }
 
 fn concurrent_tunnel_close() {
     for round in 0..8usize {
-        let pair = rinlib::ipc::tunnel::create(THREAD_TUNNEL_VA)
-            .expect("thread suite TunnelCreate failed");
+        let (endpoint, invitation) = tunnel::create(
+            3 * PROCESS_PAGE_SIZE,
+            Placement::FixedEmpty {
+                usable_start: THREAD_TUNNEL_VA,
+            },
+        )
+        .expect("thread suite TunnelCreate failed");
         let region = MappedRegion::map_anonymous(
             2 * PROCESS_PAGE_SIZE,
             PROCESS_PAGE_SIZE,
@@ -697,7 +706,6 @@ fn concurrent_tunnel_close() {
         let release = Arc::new(AtomicBool::new(false));
         let child_ready = ready.clone();
         let child_release = release.clone();
-        let endpoint = pair.owner;
         let closer = thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(move || {
@@ -705,7 +713,7 @@ fn concurrent_tunnel_close() {
                 while !child_release.load(Ordering::Acquire) {
                     core::hint::spin_loop();
                 }
-                close_churn_handle(endpoint)
+                close_churn_endpoint(endpoint)
             })
             .expect("Tunnel close worker spawn failed");
         while !ready.load(Ordering::Acquire) {
@@ -714,7 +722,7 @@ fn concurrent_tunnel_close() {
         release.store(true, Ordering::Release);
         unmap_churn_region(region);
         closer.join().expect("concurrent Endpoint close failed");
-        close(pair.peer).expect("Tunnel invitation close failed");
+        unsafe { close(invitation) }.expect("Tunnel invitation close failed");
         debug!(
             "hammer target: concurrent Tunnel close round {} passed",
             round
@@ -727,8 +735,15 @@ fn tunnel_close_attach() {
     use core::sync::atomic::AtomicUsize;
     const PEER_VA: usize = THREAD_TUNNEL_VA + 0x20_0000;
     for round in 0..24 {
-        let pair = rinlib::ipc::tunnel::create(THREAD_TUNNEL_VA)
-            .expect("close/Attach TunnelCreate failed");
+        let (creator, invitation) = tunnel::create(
+            3 * PROCESS_PAGE_SIZE,
+            Placement::FixedEmpty {
+                usable_start: THREAD_TUNNEL_VA,
+            },
+        )
+        .expect("close/Attach TunnelCreate failed");
+        // SAFETY: 保存值仅用于 owner 关闭后的 generation 退休断言。
+        let creator_handle = unsafe { creator.raw_handle() };
         let phase = Arc::new(AtomicUsize::new(0));
         let child_phase = phase.clone();
         let policy = round / 8;
@@ -739,7 +754,12 @@ fn tunnel_close_attach() {
                     thread::yield_now().expect("Attach gate yield failed");
                 }
                 let result = loop {
-                    match rinlib::ipc::tunnel::attach(pair.peer, PEER_VA) {
+                    match tunnel::attach(
+                        invitation,
+                        Placement::FixedEmpty {
+                            usable_start: PEER_VA,
+                        },
+                    ) {
                         Err(SystemCallError::ObjectBusy) => {
                             thread::yield_now().expect("Attach retry yield failed")
                         }
@@ -750,7 +770,7 @@ fn tunnel_close_attach() {
                     Ok(endpoint) => {
                         assert_ne!(policy, 1, "Attach succeeded after creator close completed");
                         assert_eq!(
-                            close(pair.peer),
+                            unsafe { close(invitation) },
                             Err(SystemCallError::StaleHandle),
                             "Attach did not consume Invitation"
                         );
@@ -758,21 +778,26 @@ fn tunnel_close_attach() {
                         while child_phase.load(Ordering::Acquire) != 3 {
                             thread::yield_now().expect("peer close gate yield failed");
                         }
-                        close_churn_handle(endpoint).expect("attached Endpoint close failed");
-                        assert_eq!(close(endpoint), Err(SystemCallError::StaleHandle));
+                        // SAFETY: 保存值仅用于成功关闭后的重复 close 验证。
+                        let handle = unsafe { endpoint.raw_handle() };
+                        close_churn_endpoint(endpoint).expect("attached Endpoint close failed");
+                        assert_eq!(unsafe { close(handle) }, Err(SystemCallError::StaleHandle));
                     }
                     Err(error) => {
                         assert_eq!(error, SystemCallError::ObjectClosed);
                         assert_ne!(policy, 0, "ordered Attach unexpectedly lost to close");
-                        close(pair.peer).expect("failed Attach consumed Invitation");
-                        assert_eq!(close(pair.peer), Err(SystemCallError::StaleHandle));
+                        unsafe { close(invitation) }.expect("failed Attach consumed Invitation");
+                        assert_eq!(
+                            unsafe { close(invitation) },
+                            Err(SystemCallError::StaleHandle)
+                        );
                         child_phase.store(2, Ordering::Release);
                     }
                 }
             })
             .expect("close/Attach worker spawn failed");
         if policy == 1 {
-            close_churn_handle(pair.owner).expect("ordered creator close failed");
+            close_churn_endpoint(creator).expect("ordered creator close failed");
             phase.store(1, Ordering::Release);
         } else {
             phase.store(1, Ordering::Release);
@@ -781,9 +806,12 @@ fn tunnel_close_attach() {
                     thread::yield_now().expect("ordered Attach gate yield failed");
                 }
             }
-            close_churn_handle(pair.owner).expect("racing creator close failed");
+            close_churn_endpoint(creator).expect("racing creator close failed");
         }
-        assert_eq!(close(pair.owner), Err(SystemCallError::StaleHandle));
+        assert_eq!(
+            unsafe { close(creator_handle) },
+            Err(SystemCallError::StaleHandle)
+        );
         // worker 的状态 2 不能在主线程状态 3 后覆盖，先确认 Attach 已结束。
         while phase.load(Ordering::Acquire) != 2 {
             thread::yield_now().expect("Attach completion gate yield failed");
@@ -793,7 +821,7 @@ fn tunnel_close_attach() {
         // 每一轮都用普通映射复用两端 VA，直接确认两笔 lease/PTE 已撤销。
         for address in [THREAD_TUNNEL_VA, PEER_VA] {
             let region = MappedRegion::map_anonymous(
-                PROCESS_PAGE_SIZE,
+                3 * PROCESS_PAGE_SIZE,
                 0,
                 0,
                 MemoryProtection::ReadWrite,

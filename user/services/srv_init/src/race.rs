@@ -6,7 +6,7 @@
 // 以「终因组合合法 + Dead 收束 + 无泄漏」为强断言，终因胜负分布只作
 // 观察报告（证明锤进了窗口，不作通过条件）。
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::{
     JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
@@ -149,9 +149,9 @@ impl RaceHammers {
             let _ = self.send_cmd(i, &exit, &[]);
             self.fire(&[i]);
             let _ = self.report(i);
-            let _ = close(self.cmd[i]);
-            let _ = close(self.report[i]);
-            let _ = close(self.guns[i]);
+            let _ = unsafe { close(self.cmd[i]) };
+            let _ = unsafe { close(self.report[i]) };
+            let _ = unsafe { close(self.guns[i]) };
         }
     }
 }
@@ -233,9 +233,9 @@ fn spawn_tunnel_exit_target(
     }) {
         Ok(spawned) => Ok((spawned, gun_pair.peer)),
         Err(_) => {
-            let _ = close(gun_pair.owner);
-            let _ = close(gun_pair.peer);
-            let _ = close(invitation);
+            let _ = unsafe { close(gun_pair.owner) };
+            let _ = unsafe { close(gun_pair.peer) };
+            let _ = unsafe { close(invitation) };
             Err(SystemCallError::Unknown)
         }
     }
@@ -308,7 +308,7 @@ fn derive_and_reap(job: Handle, pid: u64, allowed: &[(u32, Option<i64>)]) -> Opt
         }
     };
     let code = drain_expect_dead(control, allowed);
-    let _ = close(control);
+    let _ = unsafe { close(control) };
     code
 }
 
@@ -384,8 +384,8 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     debug!(
         "race kill-vs-kill {} (code wins {}/{})",
@@ -450,8 +450,8 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     debug!(
         "race kill-vs-exit {} (exited {}/{} killed)",
@@ -501,8 +501,8 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     debug!(
         "race spawn-vs-kill {}",
@@ -575,8 +575,8 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     ok &= dist[0] != 0 && dist[1] != 0;
     debug!(
@@ -640,8 +640,8 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     debug!(
         "race kill-vs-fault {} (fault {}/{} killed)",
@@ -717,7 +717,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
             );
             ok = false;
         }
-        let _ = close(created.control);
+        let _ = unsafe { close(created.control) };
     }
     debug!(
         "race kill-vs-start {} (start-first {}/{} kill-first)",
@@ -753,8 +753,8 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             Some(pair) => pair,
             None => {
                 debug!("race kill-vs-park: hammer report missing");
-                let _ = close(target.control);
-                let _ = close(gun);
+                let _ = unsafe { close(target.control) };
+                let _ = unsafe { close(gun) };
                 ok = false;
                 continue;
             }
@@ -771,8 +771,8 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     debug!("race kill-vs-park {}", if ok { "passed" } else { "FAILED" });
     ok
@@ -820,8 +820,8 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
     }
     debug!(
         "race memory-vs-kill {}",
@@ -851,8 +851,8 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
         "memory guard fault {}",
         if ok { "passed" } else { "FAILED" }
     );
-    let _ = close(target.control);
-    let _ = close(gun);
+    let _ = unsafe { close(target.control) };
+    let _ = unsafe { close(gun) };
     ok
 }
 
@@ -875,58 +875,62 @@ fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
         "thread memory suite {}",
         if ok { "passed" } else { "FAILED" }
     );
-    let _ = close(target.control);
-    let _ = close(gun);
+    let _ = unsafe { close(target.control) };
+    let _ = unsafe { close(gun) };
     ok
 }
 
-const RACE_TUNNEL_VA: usize = 0x2200_0000;
 const RACE_TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
 const RACE_TUNNEL_ROUNDS: usize = 16;
 
 fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..RACE_TUNNEL_ROUNDS {
-        let pair = match tunnel_sys::create(RACE_TUNNEL_VA) {
-            Ok(pair) => pair,
-            Err(error) => {
-                debug!("Tunnel exit stress create failed: {:?}", error);
-                return false;
-            }
-        };
-        // SAFETY: TunnelCreate mapped one shared page at RACE_TUNNEL_VA.
-        let shared = unsafe { &*(RACE_TUNNEL_VA as *const AtomicU64) };
+        let (endpoint, invitation) =
+            match tunnel_sys::create(3 * 4096, rinlib::mm::Placement::Anywhere) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    debug!("Tunnel exit stress create failed: {:?}", error);
+                    return false;
+                }
+            };
+        let shared = endpoint.memory();
         let request = 0x7475_6e6e_656c_0000 | (round as u64 + 1);
-        shared.store(request, Ordering::Release);
-        let (target, gun) = match spawn_tunnel_exit_target(job, image, pair.peer) {
+        shared.store_u64(0, request, Ordering::Release);
+        let (target, gun) = match spawn_tunnel_exit_target(job, image, invitation) {
             Ok(target) => target,
             Err(error) => {
                 debug!("Tunnel exit stress target spawn failed: {:?}", error);
-                let _ = close(pair.owner);
+                let _ = endpoint.close();
                 return false;
             }
         };
         let expected = request ^ RACE_TUNNEL_RESPONSE_MASK;
         let mut published = false;
         for _ in 0..100 {
-            if shared.load(Ordering::Acquire) == expected {
+            if shared.load_u64(0, Ordering::Acquire) == expected {
                 published = true;
                 break;
             }
             // SAFETY: 值参数；让目标进程完成 Attach 与共享页发布。
             let _ = unsafe { sys_sleep(1) };
         }
+        for _ in 0..512 {
+            let mut sample = [0u8; 32];
+            shared.read(8, &mut sample);
+            let _ = shared.load_u64(8, Ordering::Acquire);
+            let _ = shared.load_u32(12, Ordering::Relaxed);
+        }
         let _ = notification::signal(gun, 1);
         let terminal = drain_expect_dead(
             target.control,
             &[(ProcessExitReason::Exited as u32, Some(0x8c))],
         );
-        let peer_closed = wait_many(
-            &[WaitItem::new(pair.owner, ObjectSignals::PEER_CLOSED, 0)],
-            WAIT_TIMEOUT_INFINITE,
-        )
-        .map(|result| result.observed.intersects(ObjectSignals::PEER_CLOSED))
-        .unwrap_or(false);
+        let peer_closed = endpoint
+            .events()
+            .wait(ObjectSignals::PEER_CLOSED, WAIT_TIMEOUT_INFINITE)
+            .map(|result| result.observed.intersects(ObjectSignals::PEER_CLOSED))
+            .unwrap_or(false);
         if !published || terminal.is_none() || !peer_closed {
             debug!(
                 "Tunnel exit stress round {} published={} peer_closed={}",
@@ -934,10 +938,14 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
-        let _ = close(gun);
-        let _ = close(pair.owner);
+        let _ = unsafe { close(target.control) };
+        let _ = unsafe { close(gun) };
+        let _ = endpoint.close();
     }
+    debug!(
+        "Tunnel external shared-byte access checks completed: {} rounds",
+        RACE_TUNNEL_ROUNDS
+    );
     debug!(
         "Tunnel exit stress {}: {} rounds",
         if ok { "passed" } else { "FAILED" },
@@ -1019,7 +1027,7 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
             );
             ok = false;
         }
-        let _ = close(created.control);
+        let _ = unsafe { close(created.control) };
     }
     debug!(
         "race kill-vs-abandon {} (killed {}/{} abandoned)",
@@ -1243,7 +1251,7 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
             ok = false;
         }
     }
-    let _ = close(child);
+    let _ = unsafe { close(child) };
     ok
 }
 
@@ -1270,12 +1278,12 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         };
         if let Err(error) = process::kill(target.control, kill_code) {
             debug!("race drain-vs-drain: kill failed: {:?}", error);
-            let _ = close(target.control);
+            let _ = unsafe { close(target.control) };
             return false;
         }
         // 竞争点在双 drain 本身：先等 REAPABLE 再同刻发双 drain。
         if !await_reapable(target.control) {
-            let _ = close(target.control);
+            let _ = unsafe { close(target.control) };
             return false;
         }
         let moves = [
@@ -1325,7 +1333,7 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             );
             ok = false;
         }
-        let _ = close(target.control);
+        let _ = unsafe { close(target.control) };
     }
     debug!(
         "race drain-vs-drain {}",

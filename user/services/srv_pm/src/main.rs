@@ -1,7 +1,7 @@
 //! pm：受托进程管理服务 + IPC 集成验证负载。
 //!
 //! 剧本：两次睡眠（timer 通路观测）→ 阻塞等 init 的 Invitation 消息 →
-//! 消费 Invitation → 写入 8192 字节校验模式（跨回绕、逐批摇铃）→ EOF+摇铃 →
+//! 消费 Invitation → 写入 65536 字节校验模式（跨回绕、逐批摇铃）→ EOF+摇铃 →
 //! 接收流控验证请求：填满目标邮箱、确认满箱错误、在 WRITABLE 上阻塞，
 //! 被 init 腾位唤醒后补发末尾消息 → 收束显式委托的 pm_domain 子域
 //! （枚举 → 派生 kill → drain → 封口）→ 退出（触发对端 PEER_CLOSED）。
@@ -37,9 +37,7 @@ use rinlib::{
     sys_sleep,
 };
 
-/// 隧道页映射地址：与 init 约定的一致（各自进程空间内的同一常量）。
-const TUNNEL_VA: usize = 0x4000_0000;
-const STREAM_LEN: usize = 8192;
+const STREAM_LEN: usize = 65536;
 /// 与 init 约定的流控验证消息号（见 init 的 WRITABLE_WAKE_* 常量）。
 const WRITABLE_WAKE_REQUEST: u64 = 640;
 const WRITABLE_WAKE_FILL: u64 = 641;
@@ -70,7 +68,7 @@ fn main() {
     }
     let invitation = message.handles[0];
 
-    let mut tunnel = match blocking::attach_producer(invitation, TUNNEL_VA) {
+    let mut tunnel = match blocking::attach_producer(invitation, rinlib::mm::Placement::Anywhere) {
         Ok(t) => t,
         Err(e) => {
             debug!("tunnel attach failed: {:?}", e);
@@ -227,14 +225,14 @@ fn escalate_domain(domain: Handle, retained_process: Option<Handle>) {
     match job_kill(domain, 0x66) {
         Ok(()) => {
             if let Some(control) = retained_process {
-                let _ = close(control);
+                let _ = unsafe { close(control) };
             }
             let snapshot = process::query_job(domain);
             debug!(
                 "pm: delegated domain seal passed (state {:?})",
                 snapshot.as_ref().map(|state| state.state)
             );
-            let _ = close(domain);
+            let _ = unsafe { close(domain) };
         }
         Err(failure) => {
             debug!(

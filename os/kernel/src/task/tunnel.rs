@@ -13,6 +13,10 @@ use core::{
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, HandlePair, ObjectSignals, Rights},
+    tunnel::{
+        TUNNEL_MAX_PAGES, TunnelAttachRequest, TunnelCreateRequest, TunnelCreateResult,
+        TunnelEndpointResult,
+    },
 };
 use memory_space::{BackingView, Protection, RegionKindView, RegionOwner, RetiringFragment};
 
@@ -337,7 +341,7 @@ fn cancel_writes(connection: &Connection, permits: Vec<memory_space::WritePermit
 fn plan_side_mapping(
     connection: &Connection,
     thread: &Thread,
-    va: usize,
+    placement: memory_space::MapPlacement,
     authorization: memory_space::ObjectViewAuthorization,
     permits: Vec<memory_space::WritePermit>,
 ) -> Result<
@@ -348,14 +352,15 @@ fn plan_side_mapping(
     super::proc::ObjectMapFailure,
 > {
     let (intent, spans, view_owner) =
-        match reserve_mapping_resources(connection, thread.process.resources.metadata(), va) {
+        match reserve_mapping_resources(connection, thread.process.resources.metadata(), placement)
+        {
             Ok(reserved) => reserved,
             Err(error) => {
                 return Err(super::proc::ObjectMapFailure {
                     error,
                     permits,
                     sources: None,
-                })
+                });
             }
         };
     let mut space = thread.process.space.lock();
@@ -363,6 +368,50 @@ fn plan_side_mapping(
     space
         .plan_object_map(&intent, 0, &spans, authorization, permits, view_owner)
         .map(|plan| (plan, pool))
+}
+
+/// 两侧共用完整 Prepare，失败 owner 在 AddressSpace 锁外统一归还。
+#[inline(never)]
+fn prepare_side_mapping(
+    connection: &Connection,
+    thread: &Thread,
+    placement: memory_space::MapPlacement,
+) -> Result<PreparedMemoryChange, SystemCallError> {
+    let (authorization, permits) = reserve_mapping(connection)?;
+    let (plan, pool) =
+        match plan_side_mapping(connection, thread, placement, authorization, permits) {
+            Ok(plan) => plan,
+            Err(failure) => {
+                cancel_writes(connection, failure.permits);
+                return Err(failure.error.into());
+            }
+        };
+    let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
+        Ok(owners) => owners,
+        Err(error) => {
+            let mut reclaimed = thread
+                .process
+                .space
+                .lock()
+                .rollback_memory_change_plan(plan);
+            let permits = reclaimed.take_permits();
+            drop(reclaimed);
+            cancel_writes(connection, permits);
+            return Err(error.into());
+        }
+    };
+    let mut space = thread.process.space.lock();
+    match space.complete_object_change(plan, owners) {
+        Ok(prepared) => Ok(prepared),
+        Err((failure, mut reclaimed)) => {
+            drop(space);
+            cancel_writes(connection, failure.permits);
+            let permits = reclaimed.take_permits();
+            drop(reclaimed);
+            cancel_writes(connection, permits);
+            Err(failure.error.into())
+        }
+    }
 }
 
 type ReservedMappingResources = (
@@ -376,10 +425,8 @@ type ReservedMappingResources = (
 fn reserve_mapping_resources(
     connection: &Connection,
     sponsor: &Arc<super::resources::MetadataSponsor>,
-    va: usize,
+    placement: memory_space::MapPlacement,
 ) -> Result<ReservedMappingResources, super::proc::SpaceError> {
-    // Tunnel 当前对外是单页，因而投影退化为长度为一的 span 序列；多页几何
-    // 只需改变投影区间，不涉及本函数形状。
     let object_pages = connection.core.backing.pages();
     let mut spans = Vec::new();
     if spans
@@ -390,7 +437,7 @@ fn reserve_mapping_resources(
     }
     connection.core.backing.project(0, object_pages, &mut spans);
     let intent = super::proc::MapIntent::object_lease(
-        va,
+        placement,
         object_pages * super::proc::PAGE_SIZE,
         Protection::ReadWrite,
     );
@@ -459,7 +506,8 @@ fn commit_side_close(endpoint: &Endpoint, connection: &mut ConnectionState) -> O
 /// 只是复核凭据，真值在账本。
 fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: RetiringFragment) {
     assert!(
-        fragment.range == lease.range
+        fragment.range.start() >= lease.range.start()
+            && fragment.range.end() <= lease.range.end()
             && fragment.owner == RegionOwner::Lease(lease.lease)
             && matches!(
                 fragment.kind,
@@ -468,7 +516,7 @@ fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: Retiring
                     current,
                     maximum,
                 } if object == lease.object
-                    && offset == lease.object_offset
+                    && offset == lease.object_offset + fragment.range.start() - lease.range.start()
                     && current == lease.protection
                     && maximum == lease.protection
             ),
@@ -478,7 +526,9 @@ fn validate_retired_lease_fragment(lease: ObjectMappingLease, fragment: Retiring
 
 struct LeaseRetireState {
     notice: Option<Option<PeerNotice>>,
-    fragment_retired: bool,
+    covered: [u64; (TUNNEL_MAX_PAGES as usize).div_ceil(64)],
+    retired_pages: usize,
+    expected_pages: usize,
 }
 
 struct LeaseRetire {
@@ -498,7 +548,9 @@ impl LeaseRetire {
                 crate::sync::ranks::MEMORY_COMPLETION,
                 LeaseRetireState {
                     notice: None,
-                    fragment_retired: false,
+                    covered: [0; (TUNNEL_MAX_PAGES as usize).div_ceil(64)],
+                    retired_pages: 0,
+                    expected_pages: 0,
                 },
             ),
         }
@@ -507,6 +559,10 @@ impl LeaseRetire {
     fn configure_lease(&self, endpoint: Arc<Endpoint>, lease: ObjectMappingLease) {
         self.holder.lock().replace(endpoint);
         self.lease.lock().replace(lease);
+        let mut state = self.state.lock();
+        state.covered.fill(0);
+        state.retired_pages = 0;
+        state.expected_pages = lease.range.pages();
     }
 
     fn install_notice(&self, notice: Option<PeerNotice>) {
@@ -525,18 +581,24 @@ impl MemoryRetireSink for LeaseRetire {
             .expect("Tunnel retire fragment arrived before lease configuration");
         validate_retired_lease_fragment(lease, fragment);
         let mut state = self.state.lock();
-        assert!(
-            !state.fragment_retired,
-            "Tunnel lease fragment retired twice"
-        );
-        state.fragment_retired = true;
+        let first = (fragment.range.start() - lease.range.start()) / super::proc::PAGE_SIZE;
+        for page in first..first + fragment.range.pages() {
+            let bit = 1u64 << (page % 64);
+            assert_eq!(
+                state.covered[page / 64] & bit,
+                0,
+                "Tunnel lease page retired twice"
+            );
+            state.covered[page / 64] |= bit;
+        }
+        state.retired_pages += fragment.range.pages();
     }
 
     fn finish(&self) {
         let mut state = self.state.lock();
         assert!(
-            state.fragment_retired,
-            "Tunnel lease completed before its view fragment retired"
+            state.retired_pages == state.expected_pages,
+            "Tunnel lease completed before its complete range retired"
         );
         let notice = state
             .notice
@@ -554,7 +616,7 @@ impl MemoryRetireSink for LeaseRetire {
 }
 
 #[inline(never)]
-fn new_connection(thread: &Thread) -> Result<Arc<Connection>, SystemCallError> {
+fn new_connection(thread: &Thread, pages: usize) -> Result<Arc<Connection>, SystemCallError> {
     let pool = {
         let space = thread.process.space.lock();
         Arc::clone(space.pool())
@@ -562,6 +624,7 @@ fn new_connection(thread: &Thread) -> Result<Arc<Connection>, SystemCallError> {
     let (core, connection_permit) = super::memory_object::MemoryObjectCore::new_tunnel_connection(
         &pool,
         thread.process.resources.metadata(),
+        pages,
     )?;
     let core = Arc::try_new(core).map_err(|_| SystemCallError::OutOfMemory)?;
     Arc::try_new(Connection {
@@ -580,10 +643,23 @@ fn new_connection(thread: &Thread) -> Result<Arc<Connection>, SystemCallError> {
 
 pub fn create(
     thread: &Thread,
-    va: usize,
-    output: usize,
+    request: TunnelCreateRequest,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let connection = new_connection(thread)?;
+    if request.reserved != 0 || request.bytes == 0 {
+        return Err(SystemCallError::IllegalArgument);
+    }
+    let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
+    let bytes = bytes
+        .checked_add(super::proc::PAGE_SIZE - 1)
+        .ok_or(SystemCallError::IllegalArgument)?;
+    let pages = bytes / super::proc::PAGE_SIZE;
+    if pages > TUNNEL_MAX_PAGES as usize {
+        return Err(SystemCallError::ReachLimit);
+    }
+    let placement = super::proc::MapIntent::parse_placement(request.address, request.placement)?;
+    let output =
+        usize::try_from(request.result_address).map_err(|_| SystemCallError::IllegalArgument)?;
+    let connection = new_connection(thread, pages)?;
     let sponsor = thread.process.resources.metadata();
     let endpoint = Endpoint::new(
         connection.clone(),
@@ -629,7 +705,9 @@ pub fn create(
     };
     {
         let mut space = thread.process.space.lock();
-        if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
+        if let Err(error) =
+            space.check_range(output, core::mem::size_of::<TunnelCreateResult>(), true)
+        {
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                 .expect("TunnelCreate reservation must remain owned");
@@ -637,57 +715,13 @@ pub fn create(
         }
     }
     let mut connection_state = connection.state.lock();
-    let (authorization, permits) = match reserve_mapping(&connection) {
-        Ok(reserved) => reserved,
+    let mut mapping = match prepare_side_mapping(&connection, thread, placement) {
+        Ok(prepared) => Some(prepared),
         Err(error) => {
             table
                 .rollback(reservation.take().expect("TunnelCreate reservation exists"))
                 .expect("TunnelCreate reservation must remain owned");
             return Err(error);
-        }
-    };
-    let mut mapping = {
-        let (plan, pool) = match plan_side_mapping(&connection, thread, va, authorization, permits)
-        {
-            Ok(prepared) => prepared,
-            Err(failure) => {
-                cancel_writes(&connection, failure.permits);
-                table
-                    .rollback(reservation.take().expect("TunnelCreate reservation exists"))
-                    .expect("TunnelCreate reservation must remain owned");
-                return Err(SystemCallError::from(failure.error));
-            }
-        };
-        let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
-            Ok(owners) => owners,
-            Err(error) => {
-                let permits = thread
-                    .process
-                    .space
-                    .lock()
-                    .rollback_memory_change_plan(plan)
-                    .take_permits();
-                cancel_writes(&connection, permits);
-                table
-                    .rollback(reservation.take().expect("TunnelCreate reservation exists"))
-                    .expect("TunnelCreate reservation must remain owned");
-                return Err(SystemCallError::from(error));
-            }
-        };
-        let mut space = thread.process.space.lock();
-        match space.complete_object_change(plan, owners) {
-            Ok(prepared) => Some(prepared),
-            Err((failure, mut reclaimed)) => {
-                drop(space);
-                cancel_writes(&connection, failure.permits);
-                let permits = reclaimed.take_permits();
-                drop(reclaimed);
-                cancel_writes(&connection, permits);
-                table
-                    .rollback(reservation.take().expect("TunnelCreate reservation exists"))
-                    .expect("TunnelCreate reservation must remain owned");
-                return Err(SystemCallError::from(failure.error));
-            }
         }
     };
 
@@ -726,12 +760,25 @@ pub fn create(
         }
     };
 
+    let lease_range = mapping
+        .as_ref()
+        .expect("TunnelCreate mapping exists")
+        .published_lease()
+        .range;
+    let result = TunnelCreateResult {
+        local: TunnelEndpointResult {
+            endpoint: pair.owner,
+            base: lease_range.start() as u64,
+            bytes: lease_range.bytes() as u64,
+        },
+        invitation: pair.peer,
+    };
     {
         let mut space = thread.process.space.lock();
-        // SAFETY: HandlePair 无 padding；复检失败即杀本进程。Commit 尚未发生，
+        // SAFETY: TunnelCreateResult 无 padding；复检失败即杀本进程。Commit 尚未发生，
         // 因而失败路径仍可完整回滚 handle、permit、ledger 与 PTE reservation。
         if let Err(error) =
-            unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &pair) }
+            unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
         {
             drop(space);
             abandon_mapping(
@@ -749,8 +796,8 @@ pub fn create(
     let committed = thread.process.space.commit_shootdown(
         &thread.process.lifecycle,
         shootdown,
-        va / super::proc::PAGE_SIZE,
-        1,
+        lease_range.start() / super::proc::PAGE_SIZE,
+        lease_range.pages(),
         false,
         true,
         |space| {
@@ -798,10 +845,15 @@ pub fn create(
 
 pub fn attach(
     thread: &Thread,
-    invitation_handle: Handle,
-    va: usize,
-    output: usize,
+    request: TunnelAttachRequest,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
+    if request.reserved != 0 {
+        return Err(SystemCallError::IllegalArgument);
+    }
+    let placement = super::proc::MapIntent::parse_placement(request.address, request.placement)?;
+    let output =
+        usize::try_from(request.result_address).map_err(|_| SystemCallError::IllegalArgument)?;
+    let invitation_handle = request.invitation;
     let token = handle::transaction_token()?;
     let mut table = thread.process.handles.lock();
     let object = {
@@ -840,7 +892,9 @@ pub fn attach(
 
     {
         let mut space = thread.process.space.lock();
-        if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
+        if let Err(error) =
+            space.check_range(output, core::mem::size_of::<TunnelEndpointResult>(), true)
+        {
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                 .expect("TunnelAttach reservation must remain owned");
@@ -864,57 +918,13 @@ pub fn attach(
             .expect("TunnelAttach reservation must remain owned");
         return Err(SystemCallError::ObjectClosed);
     }
-    let (authorization, permits) = match reserve_mapping(&invitation.connection) {
-        Ok(reserved) => reserved,
+    let mut mapping = match prepare_side_mapping(&invitation.connection, thread, placement) {
+        Ok(prepared) => Some(prepared),
         Err(error) => {
             table
                 .rollback(reservation.take().expect("TunnelAttach reservation exists"))
                 .expect("TunnelAttach reservation must remain owned");
             return Err(error);
-        }
-    };
-    let mut mapping = {
-        let (plan, pool) =
-            match plan_side_mapping(&invitation.connection, thread, va, authorization, permits) {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    cancel_writes(&invitation.connection, failure.permits);
-                    table
-                        .rollback(reservation.take().expect("TunnelAttach reservation exists"))
-                        .expect("TunnelAttach reservation must remain owned");
-                    return Err(SystemCallError::from(failure.error));
-                }
-            };
-        let owners = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
-            Ok(owners) => owners,
-            Err(error) => {
-                let permits = thread
-                    .process
-                    .space
-                    .lock()
-                    .rollback_memory_change_plan(plan)
-                    .take_permits();
-                cancel_writes(&invitation.connection, permits);
-                table
-                    .rollback(reservation.take().expect("TunnelAttach reservation exists"))
-                    .expect("TunnelAttach reservation must remain owned");
-                return Err(SystemCallError::from(error));
-            }
-        };
-        let mut space = thread.process.space.lock();
-        match space.complete_object_change(plan, owners) {
-            Ok(prepared) => Some(prepared),
-            Err((failure, mut reclaimed)) => {
-                drop(space);
-                cancel_writes(&invitation.connection, failure.permits);
-                let permits = reclaimed.take_permits();
-                drop(reclaimed);
-                cancel_writes(&invitation.connection, permits);
-                table
-                    .rollback(reservation.take().expect("TunnelAttach reservation exists"))
-                    .expect("TunnelAttach reservation must remain owned");
-                return Err(SystemCallError::from(failure.error));
-            }
         }
     };
 
@@ -953,11 +963,21 @@ pub fn attach(
         }
     };
 
+    let lease_range = mapping
+        .as_ref()
+        .expect("TunnelAttach mapping exists")
+        .published_lease()
+        .range;
+    let result = TunnelEndpointResult {
+        endpoint: endpoint_handle,
+        base: lease_range.start() as u64,
+        bytes: lease_range.bytes() as u64,
+    };
     {
         let mut space = thread.process.space.lock();
-        // SAFETY: Handle 无 padding；Commit 前复检失败按 fault 终止调用进程。
+        // SAFETY: TunnelEndpointResult 无 padding；Commit 前复检失败按 fault 终止调用进程。
         if let Err(error) =
-            unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &endpoint_handle) }
+            unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
         {
             drop(space);
             abandon_mapping(
@@ -975,8 +995,8 @@ pub fn attach(
     let committed = thread.process.space.commit_shootdown(
         &thread.process.lifecycle,
         shootdown,
-        va / super::proc::PAGE_SIZE,
-        1,
+        lease_range.start() / super::proc::PAGE_SIZE,
+        lease_range.pages(),
         false,
         true,
         |space| {
@@ -1091,7 +1111,6 @@ pub(crate) fn close_handle(
         .as_ref()
         .cloned()
         .expect("Tunnel endpoint close sink was not preallocated");
-    retire.configure_lease(endpoint.clone(), lease);
     let retire_sink: Arc<dyn MemoryRetireSink> = retire.clone();
     let (completion, plan) =
         match prepare_memory_completion(thread.process.clone(), 0, Some(retire_sink), None) {
@@ -1140,6 +1159,7 @@ pub(crate) fn close_handle(
                     .take()
                     .expect("Tunnel close Unmap commits exactly once"),
             );
+            retire.configure_lease(endpoint.clone(), lease);
             let notice = commit_side_close(&endpoint, &mut connection_state);
             retire.install_notice(notice);
             (entry, published)

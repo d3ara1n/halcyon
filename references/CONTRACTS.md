@@ -60,6 +60,16 @@
 | NUMA distance map | `normative/devicetree-schema-v2026.06/numa-distance-map-v1.yaml` |
 | RISC-V CPU 节点、现代 `riscv,isa-base`/`riscv,isa-extensions` | `normative/riscv-dt-bindings-linux-818bebeb/cpus.yaml`、`extensions.yaml` |
 
+## Rust 语言与共享内存访问
+
+本轮取证版本：rustc `c54751567b19c4ceb08b0412d83529c2568cba8b`（1.100.0-nightly，LLVM 23.1.0）。仓库当前使用浮动 nightly，实施时须记录实际版本并核对代码生成；证据边界见 [`共享访问取证`](../plans/ref-2026-09-shared-memory-access.md)。
+
+| 概念 | 固定源码 / 规范入口 |
+|---|---|
+| Rust 原子、混合尺寸访问、from_ptr 契约 | [core/sync/atomic.rs](https://github.com/rust-lang/rust/blob/c54751567b19c4ceb08b0412d83529c2568cba8b/library/core/src/sync/atomic.rs)「Memory model for atomic accesses」及整数原子 from_ptr |
+| 指针、allocation、volatile 与普通拷贝 | [core/ptr/mod.rs](https://github.com/rust-lang/rust/blob/c54751567b19c4ceb08b0412d83529c2568cba8b/library/core/src/ptr/mod.rs)「Safety」「Allocated object」、read_volatile/write_volatile |
+| inline asm 编译器义务 | [Rust Reference](https://doc.rust-lang.org/reference/inline-assembly.html#rules-for-inline-assembly)「Rules for inline assembly」；在线入口非固定快照，实际平台序列仍以本表 rustc 版本与固定 RISC-V ISA 验证 |
+
 ## 实现参照
 
 | 概念 | 文件 |

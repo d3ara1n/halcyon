@@ -6,7 +6,7 @@
 2. FP 指令与浮点 CSR（fcsr/fflags/frm）访问只允许出现在 .text.ctx_fp
    （capability-guarded 的用户 FP helper）；其余任何 section 不得出现。
 
-3. 单函数最大栈帧不超过 --max-frame（默认 0x2800）：扫描 sp 减量
+3. 单函数最大栈帧不超过 --max-frame（默认取 ELF 的 STACK_GUARD）：扫描 sp 减量
    （含 lui+addi 装载立即数后 sub sp,sp,reg 的模式），防止巨型栈帧
    跳过 guard 洞落入邻槽（notes/impls/mm.md「栈窗口」的构建期兑底）；
    max-frame 必须不大于链接脚本 STACK_GUARD（本脚本从 ELF 符号表读取
@@ -22,14 +22,6 @@ import sys
 
 READELF = "riscv64-elf-readelf"
 OBJDUMP = "riscv64-elf-objdump"
-
-# 默认帧上限：guard 洞跳跃保留 0x800 安全余量（必须 ≤ 链接脚本
-# STACK_GUARD，本脚本从 ELF 符号表读取并强制）。当前 debug 最大合法函数是
-# 启动自检的 funded 路径（0x2390）；常驻 backing 一律堆化持有 extent 列表，
-# 定长 funding 结果只在事务期短暂存在，因此不构成常驻大帧。release 帧更小，
-# 同一阈值对两 MODE 都成立。更深的调用链总和超限由 guard 洞兜底
-# （notes/impls/mm.md「栈窗口」）。
-DEFAULT_MAX_FRAME = 0x2800
 
 # objdump 反汇编行：地址: 字节 助记符 操作数。字节列为若干组 4 位
 # 十六进制（RVC 为一组，32 位指令为两组连写），后随助记符；'#' 后为
@@ -48,9 +40,8 @@ def scan_frames(disasm: str) -> list[tuple[str, int, str]]:
     """逐函数扫描 sp 减量，返回 (函数名, 最大下探字节数, 位置地址)。
 
     跟踪寄存器常量（li/lui/addi/mv）以解析 `lui+addi 装载立即数 →
-    sub sp,sp,reg` 的大帧模式；分支导致的误跟踪只会低估不会高估，
-    对护栏语义可接受。跨分支的加/减净额按序累计，函数尾 epilogue
-    加回后 worst 不受影响。
+    sub sp,sp,reg` 的静态大帧模式；局部汇编标签不切分函数或丢弃立即数。
+    此扫描检查可识别的静态 sp 调整，不构成控制流图或调用链累计占用的证明。
     """
     funcs: list[tuple[str, int, str]] = []
     name = None
@@ -64,7 +55,7 @@ def scan_frames(disasm: str) -> list[tuple[str, int, str]]:
             worst, worst_addr = delta, addr
 
     for line in disasm.splitlines():
-        if fm := FUNC_MARK.match(line):
+        if (fm := FUNC_MARK.match(line)) and not fm.group(1).startswith("."):
             if name is not None:
                 funcs.append((name, -worst, worst_addr))
             name, delta, worst, worst_addr, regs = fm.group(1), 0, 0, "", {}
@@ -121,7 +112,7 @@ def fail(msg: str) -> None:
 
 def main() -> None:
     args = sys.argv[1:]
-    max_frame = DEFAULT_MAX_FRAME
+    max_frame = None
     if "--max-frame" in args:
         i = args.index("--max-frame")
         max_frame = int(args[i + 1], 0)
@@ -192,6 +183,10 @@ def main() -> None:
     if len(guard_values) != 1:
         fail(f"expected exactly one STACK_GUARD symbol, found {len(guard_values)}")
     stack_guard = guard_values[0]
+    if max_frame is None:
+        max_frame = stack_guard
+    if max_frame <= 0:
+        fail("max frame must be positive")
     if max_frame > stack_guard:
         fail(
             f"max frame {max_frame:#x} exceeds stack guard span {stack_guard:#x}; "

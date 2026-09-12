@@ -13,8 +13,8 @@ use memory_space::{
     AddressRange, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError, LeaseKey,
     Limits, MapBacking, MapPlacement, MapRequest, MemorySpace, ObjectId, ObjectViewAuthorization,
     PageRange as LedgerPageRange, PermitRequirement, PreparedChange, ProtectRequest, Protection,
-    PublishedChange, RegionKey, RegionKindView, RegionOwner, RetireBatch, RetiringChange,
-    RetiringFragment, TranslationIntent, UnmapRequest, WritePermit,
+    PublishedChange, RegionKindView, RegionOwner, RetireBatch, RetiringChange, RetiringFragment,
+    TranslationIntent, UnmapRequest, WritePermit,
 };
 use ordered_table::{InsertError, OrderedTable, PreparedEntry};
 use page_table::{
@@ -554,7 +554,6 @@ impl ReclaimedTableFrames {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObjectMappingLease {
     pub(crate) lease: LeaseKey,
-    pub(crate) region: RegionKey,
     pub(crate) range: LedgerPageRange,
     pub(crate) object: ObjectId,
     pub(crate) object_offset: usize,
@@ -571,6 +570,12 @@ pub(crate) struct ObjectMapFailure {
 }
 
 impl PreparedMemoryChange {
+    pub(crate) fn published_lease(&self) -> ObjectMappingLease {
+        self.get()
+            .published_view
+            .expect("object lease mapping must retain its geometry")
+    }
+
     /// 指令流同步需求由已准备事务中的真实翻译意图推导，避免调用点遗漏 RX Map。
     pub(crate) fn requires_instruction_sync(&self) -> bool {
         self.get().change.translation_intents().iter().any(|intent| {
@@ -1990,16 +1995,7 @@ impl MapIntent {
                 offset,
             }
         };
-        let placement = match MemoryPlacement::from_raw(request.placement)
-            .ok_or(SystemCallError::IllegalArgument)?
-        {
-            MemoryPlacement::Anywhere if request.address == 0 => MapPlacement::Anywhere,
-            MemoryPlacement::FixedEmpty => MapPlacement::FixedEmpty {
-                usable_start: usize::try_from(request.address)
-                    .map_err(|_| SystemCallError::IllegalArgument)?,
-            },
-            MemoryPlacement::Anywhere => return Err(SystemCallError::IllegalArgument),
-        };
+        let placement = Self::parse_placement(request.address, request.placement)?;
         let result_range =
             AddressRange::new(result_address, core::mem::size_of::<MemoryMapResult>())
                 .map_err(|_| SystemCallError::IllegalArgument)?;
@@ -2015,13 +2011,35 @@ impl MapIntent {
         })
     }
 
-    /// 内部固定 placement 映射（Tunnel view）：无 guard、无结果槽，authority 归对象。
-    pub(crate) fn object_lease(va: usize, bytes: usize, protection: Protection) -> Self {
+    pub(crate) fn parse_placement(
+        address: u64,
+        placement: u32,
+    ) -> Result<MapPlacement, SystemCallError> {
+        match MemoryPlacement::from_raw(placement).ok_or(SystemCallError::IllegalArgument)? {
+            MemoryPlacement::Anywhere if address == 0 => Ok(MapPlacement::Anywhere),
+            MemoryPlacement::FixedEmpty => {
+                let usable_start =
+                    usize::try_from(address).map_err(|_| SystemCallError::IllegalArgument)?;
+                if !usable_start.is_multiple_of(PAGE_SIZE) || usable_start >= USER_TOP {
+                    return Err(SystemCallError::IllegalArgument);
+                }
+                Ok(MapPlacement::FixedEmpty { usable_start })
+            }
+            _ => Err(SystemCallError::IllegalArgument),
+        }
+    }
+
+    /// 对象 lease 无 guard、无结果槽；选址与普通映射共用正式政策。
+    pub(crate) fn object_lease(
+        placement: MapPlacement,
+        bytes: usize,
+        protection: Protection,
+    ) -> Self {
         Self {
             bytes,
             guard_before: 0,
             guard_after: 0,
-            placement: MapPlacement::FixedEmpty { usable_start: va },
+            placement,
             protection,
             result: None,
             source: MapSource::Object {
@@ -2301,10 +2319,7 @@ fn start_existing_change(
     backing_permits: Vec<super::resources::BackingSlicePermit>,
     range: LedgerPageRange,
 ) -> Result<super::wait::WaitPlan, SystemCallError> {
-    let permits = match acquire_view_permits(
-        &requirements,
-        sources.as_deref().map(Vec::as_slice),
-    ) {
+    let permits = match acquire_view_permits(&requirements, sources.as_deref().map(Vec::as_slice)) {
         Ok(acquired) => acquired,
         Err(error) => {
             // Validate 未预留任何资源，放弃计划无需回滚账本。
@@ -2380,10 +2395,7 @@ fn acquire_view_permits(
 }
 
 /// 把未提交的 permit 原样归还来源对象。permit 自带来源身份，因此按对象分派。
-fn release_view_permits(
-    sources: &[PermitSource],
-    permits: Vec<WritePermit>,
-) {
+fn release_view_permits(sources: &[PermitSource], permits: Vec<WritePermit>) {
     for permit in permits {
         let object = permit.object();
         let source = sources
@@ -3212,7 +3224,14 @@ impl BoundAddressSpace {
             Err((error, mut reclaimed)) => {
                 let permits = reclaimed.take_permits();
                 let sources = core::mem::take(&mut reclaimed.permit_sources);
-                Err((ObjectMapFailure { error, permits, sources }, reclaimed))
+                Err((
+                    ObjectMapFailure {
+                        error,
+                        permits,
+                        sources,
+                    },
+                    reclaimed,
+                ))
             }
         }
     }
@@ -3690,9 +3709,6 @@ impl BoundAddressSpace {
                 fail!(error, permits);
             }
         };
-        let region = change
-            .mapped_region_key()
-            .expect("object Map must reserve one usable region");
         let mut preflights = Vec::new();
         if preflights.try_reserve_exact(spans.len()).is_err() {
             let permits = self.ledger().rollback(change);
@@ -3748,7 +3764,6 @@ impl BoundAddressSpace {
             published_view: match intent.authority {
                 MapAuthority::ObjectLease => Some(ObjectMappingLease {
                     lease: lease_key,
-                    region,
                     range,
                     object,
                     object_offset,
@@ -3769,25 +3784,26 @@ impl BoundAddressSpace {
         lease: ObjectMappingLease,
     ) -> Result<MemoryChangePlan, SpaceError> {
         self.ensure_table_transaction_available()?;
-        let matches_lease = self.ledger().regions().any(|region| {
-            region.key == lease.region
-                && region.range == lease.range
-                && region.owner == RegionOwner::Lease(lease.lease)
-                && matches!(
-                    region.kind,
-                    RegionKindView::Mapping {
-                        backing: BackingView::Object {
-                            object,
-                            offset: region_offset,
-                        },
-                        current,
-                        maximum,
-                    } if object == lease.object
-                        && region_offset == lease.object_offset
-                        && current == lease.protection
-                        && maximum == lease.protection
-                )
-        });
+        let mut cursor = lease.range.start();
+        let mut matches_lease = true;
+        for region in self.ledger().regions().filter(|region| {
+            region.range.start() < lease.range.end() && region.range.end() > lease.range.start()
+        }) {
+            if region.range.start() != cursor
+                || region.range.end() > lease.range.end()
+                || region.owner != RegionOwner::Lease(lease.lease)
+                || !matches!(region.kind, RegionKindView::Mapping {
+                    backing: BackingView::Object { object, offset }, current, maximum,
+                } if object == lease.object
+                    && offset == lease.object_offset + cursor - lease.range.start()
+                    && current == lease.protection && maximum == lease.protection)
+            {
+                matches_lease = false;
+                break;
+            }
+            cursor = region.range.end();
+        }
+        let matches_lease = matches_lease && cursor == lease.range.end();
         if !matches_lease {
             return Err(SpaceError::BadSegment);
         }

@@ -23,7 +23,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
     let built = (|| {
         let pool = duplicate(crate::root_memory_pool(), Rights::GRANT)?;
         if let Err(error) = process::bind_memory(created.builder, pool) {
-            let _ = close(pool);
+            let _ = unsafe { close(pool) };
             return Err(error);
         }
         process::map(
@@ -52,7 +52,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
     match built {
         Ok(_) => Ok(created),
         Err(error) => {
-            process::abandon_to_completion(created)?;
+            unsafe { process::abandon_to_completion(created) }?;
             Err(error)
         }
     }

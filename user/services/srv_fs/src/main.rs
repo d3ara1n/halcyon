@@ -171,8 +171,9 @@ impl Fs {
             Ok(reply_to) => reply_to,
             Err(()) => {
                 // 槽位契约违反：关闭全部转入 Handle，静默丢弃。
+                // SAFETY: 真实 receive 安装的 entry；Endpoint 不允许 TRANSIT。
                 for handle in message.handles {
-                    let _ = rinlib::ipc::object::close(handle);
+                    let _ = unsafe { rinlib::ipc::object::close(handle) };
                 }
                 return;
             }
@@ -205,7 +206,8 @@ impl Fs {
         // 单 outstanding 调用下回复箱至多一条在途，永不触满；失败同样
         // 只关已持有的回复权，不 panic。
         if send(reply_to, PROTOCOL_ID, &reply[..librpc::PREFIX_LEN + len], &[]).is_err() {
-            let _ = rinlib::ipc::object::close(reply_to);
+            // SAFETY: 本请求收到的 send-once 回复授权，发送失败仍由本路径持有。
+            let _ = unsafe { rinlib::ipc::object::close(reply_to) };
         }
     }
 
@@ -216,7 +218,8 @@ impl Fs {
             return Err(());
         }
         let reply_to = message.handles[0];
-        let _ = rinlib::ipc::object::close(message.handles[1]);
+        // SAFETY: 私有分发只接受真实 receive 结果；槽 1 不可能为 Endpoint。
+        let _ = unsafe { rinlib::ipc::object::close(message.handles[1]) };
         Ok(reply_to)
     }
 }

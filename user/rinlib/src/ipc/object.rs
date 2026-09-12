@@ -7,8 +7,14 @@ use erhino_shared::{
 
 use crate::call::{sys_handle_close, sys_handle_duplicate};
 
-pub fn close(handle: Handle) -> Result<(), SystemCallError> {
-    // SAFETY: Handle 是值参数。
+/// # Safety
+/// 调用者须独占 entry 的关闭责任，不能撤销仍被安全 owner 或引用使用的映射。
+///
+/// ```compile_fail
+/// rinlib::ipc::object::close(rinlib::shared::object::Handle::INVALID);
+/// ```
+pub unsafe fn close(handle: Handle) -> Result<(), SystemCallError> {
+    // SAFETY: entry 关闭责任由调用者保证。
     unsafe { sys_handle_close(handle) }
 }
 
@@ -17,7 +23,8 @@ pub fn close(handle: Handle) -> Result<(), SystemCallError> {
 /// 此边界不可用于任意 raw Handle：合法 leaf owner 的表项仍在本进程且内核关闭
 /// 路径无异步阶段，因此错误只表示 unsafe owner 构造契约或内核不变量被破坏。
 pub(crate) fn close_leaf_owner(handle: Handle) {
-    close(handle)
+    // SAFETY: 私有调用者持有真实且独占的非映射 leaf owner。
+    unsafe { close(handle) }
         .unwrap_or_else(|error| panic!("typed leaf Handle close invariant violated: {error:?}"));
 }
 

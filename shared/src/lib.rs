@@ -32,5 +32,7 @@ pub mod object;
 pub mod message;
 /// 启动资源交付（StartupBlock：实际 Handle 数组 + opaque payload）
 pub mod startup;
+/// Tunnel 几何与请求
+pub mod tunnel;
 /// 统一对象等待
 pub mod wait;

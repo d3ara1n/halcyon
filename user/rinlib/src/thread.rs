@@ -261,7 +261,8 @@ impl<T> JoinHandle<T> {
             "ThreadControl closed before DONE"
         );
         fence(Ordering::Acquire);
-        object::close(control).expect("ThreadControl close failed");
+        // SAFETY: control 是私有 ThreadSpawn 输出，DONE 后唯一收束；不可能为 Endpoint。
+        unsafe { object::close(control) }.expect("ThreadControl close failed");
         self.stack
             .as_mut()
             .expect("JoinHandle lost its UserStack")

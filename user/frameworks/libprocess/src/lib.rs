@@ -163,7 +163,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         let binding_pool = duplicate(request.memory_pool, Rights::GRANT)?;
         if let Err(error) = process::bind_memory(builder, binding_pool) {
             // Bind 失败契约保留 pool Handle。
-            let _ = close(binding_pool);
+            let _ = unsafe { close(binding_pool) };
             return Err(error.into());
         }
         map_plan(builder, &image)?;
@@ -201,7 +201,8 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
     })();
 
     let cleanup_error = if result.is_err() {
-        process::abandon_to_completion(created).err()
+        // SAFETY: 本函数独占真实 Create 结果；失败发生在 Start 消费 builder 之前。
+        unsafe { process::abandon_to_completion(created) }.err()
     } else {
         None
     };
@@ -439,7 +440,8 @@ pub fn collect_process(
             progress,
         });
     }
-    if let Err(error) = close(target.control) {
+    // SAFETY: 完整 Wait/Drain/Query 已验证 ProcessControl role 和稳定终态；不会关闭 Endpoint。
+    if let Err(error) = unsafe { close(target.control) } {
         return Err(SupervisionFailure {
             target,
             stage: SupervisionStage::Close,
@@ -608,7 +610,8 @@ pub fn job_kill_with_policy(
                 }
             };
         job_kill_with_policy(child, code, policy)?;
-        if let Err(error) = close(child) {
+        // SAFETY: 本路径取得并完成收束的派生 child JobControl，不包含映射 owner。
+        if let Err(error) = unsafe { close(child) } {
             return Err(job_failure(
                 child,
                 JobKillStage::CloseChild,

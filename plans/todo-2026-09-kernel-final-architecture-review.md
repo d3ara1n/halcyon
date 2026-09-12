@@ -92,7 +92,7 @@
 
 以下不是当前阶段的定论，只是未来 review 必须重新取证的候选观察点：
 
-- `os/kernel/src/task/tunnel.rs` 对外仍为单页 Tunnel，内部已复用 `MemoryObjectCore`/`ObjectBacking` 多 extent 投影；多页能力与消费者完成后再复核是否还存在单页特化残留；
+- `os/kernel/src/task/tunnel.rs` 已贯通多页 Tunnel、MemoryObjectCore/ObjectBacking 多 extent 投影与完整 lease 退役，rinlib owner/RNL2/现有消费者已同步；未来按最终提交范围复核是否还存在阶段性特化或重复 authority；
 - `os/kernel/src/task/proc.rs` 当前存在 `BackingPlanFailure`、重复 Map validation 与 `backing_permits` 多层传递；需在最终 MemoryObject/backing planner 完成后判断哪些应统一；
 - `frame.rs` 当前仍保留库存 selftest 的 raw `alloc_user_order` adapter；需在所有生产路径迁移后判断是否删除；
 - 固定 split metadata 上界、验收 workload 分支和 Pool 守恒观测方式需结合最终并发/碎片模型重新证明；

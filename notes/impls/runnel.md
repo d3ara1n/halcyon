@@ -1,29 +1,27 @@
 # Runnel 实现
 
-Runnel 是运行在 Tunnel 映射区上的用户态单工 SPSC 字节流协议。内核只提供映射、端点、门铃和生命周期；页内控制块的格式、角色访问、游标校验和内存序全部由 `user/frameworks/librunnel` 封装。
+Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节流；布局方向见 [`../ideas/runnel.md`](../ideas/runnel.md)。内核只解释 Tunnel 几何、映射及生命周期。
 
-## 当前版本与布局
+## 布局与角色
 
-当前实现位于 `user/frameworks/librunnel/src/lib.rs`，仍是 RNL1，使用一个 4 KiB Tunnel 页：前 128 B 为控制区，后续空间为数据环，容量为 `4096 - 128` B。控制字段为 little-endian `MAGIC`、`VERSION`、`HEAD`、`TAIL` 和 `EOF`；协议版本值为 1。
+控制块固定 128 B：RNL2 magic、版本/header 长度、规范化总长度、动态 capacity、u64 head/tail、u32 EOF/flags；数据区是映射的剩余全部字节。create 在交出 Invitation 前初始化并 release 发布 magic，attach acquire 后验证必要字段并冻结本地容量，忽略保留字节。RNL1 与固定 CAP 已删除。
 
-Producer 只写 `HEAD`/`EOF`，只读 `TAIL`；Consumer 只写 `TAIL`，只读 `HEAD`/`EOF`。双方以本地 shadow 游标检查对端是否只向前推进、`used <= capacity` 且 EOF 只取 0/1；违反约束即把本端置为 Broken。数据写入先完成，再以 Release 发布游标；读取方以 Acquire 读取对端游标后访问数据。
+私有 `Transport` 是协议算法与承载之间的正式边界；guest 的 `Guest` 持 `Option<rinlib::ipc::tunnel::Endpoint>`，host 测试用固定宽原子控制字段及 AtomicU8 数据存储。`Channel` 持冻结容量、不可逆终态与清理错误；`ProducerCore`/`ConsumerCore` 持角色累计进度、最近接受的对端进度和独立物理 cursor。
 
-## 用户态封装
+角色从零建立且不能重建。物理 cursor 只按实际复制长度模 capacity 推进；累计 u64 只用于 wrapping 差值和合法前进量检查，不用于物理寻址。每次复制至多两段，先完成数据访问再 release 发布本方进度，对端 acquire 后取得可用范围。首次 acquire EOF 后取得 head 并冻结最终值；EOF 回落、最终 head 改变或非法进度均 Broken。
 
-`Producer` 与 `Consumer` 持有 Tunnel Endpoint Handle 和映射基址，构造入口区分创建方与接入方。`create_producer`、`create_consumer` 通过 TunnelCreate 建立连接；`attach_producer`、`attach_consumer` 通过 TunnelAttach 消费 Invitation。Attach 后的页内 magic/version 校验失败会关闭已取得的 Endpoint Handle，并向调用方报告 `BadMagic`。
+## owner、门铃与错误
 
-Producer 提供 `writable`、`write`、`set_eof`、`write_all`、`finish`；Consumer 提供 `readable`、`read`、`eof_reached`、`read_exact_or_eof`。阻塞封装遵循“检查 → 无进展时 acknowledge → 重查 → WaitMany”的闭环；取得进展后通过 TunnelNotify 提示对端。等待观察 `DATA | PEER_CLOSED | CLOSED`，真实可读/可写量始终来自控制块。
+公开 guest 接口在 `blocking` 模块：create 接受字节长度和 `rinlib::mm::Placement`，attach 接受 Invitation 和 placement；Producer/Consumer 独占 Endpoint，不导出 Handle 或共享 slice。共享访问通过 [`Tunnel owner`](tunnel.md) 借出的 `SharedMemory`，仅临时借用映射，不创建自引用结构。
 
-`RunnelError` 将页内校验失败区分为 `BadMagic`/`Broken`，将 Tunnel 终态映射为 `Closed`，其它系统调用错误保留为 `Syscall`。协议层不携带 Handle，不登记 MemoryObject，不定义记录边界，也不承担 BufferQueue 的 descriptor 或 buffer ownership。
+所有公开数据操作在正进展后通知，finish 在 EOF 发布后通知；Invited 期 ObjectNotAvailable 不代表 Closed，attach 首次检查取得已经发布的数据。无进展时 acknowledge → 重查 → WaitMany(DATA|PEER_CLOSED|CLOSED)，不做边沿省略。
 
-## 边界与后续
+`IoError` 同时报告协议/系统错误、已完成字节数和清理错误；批量操作累计整次调用进度，通知失败不能撤回已发布的数据。首次协议/等待错误进入不可逆终态并尝试关闭 Endpoint，失败 owner 保留在 Guest 中仅供清理，后续数据访问先拒绝。`close(self)` 失败返回完整角色；Consumer 的 `wait_peer_closed(&mut self, timeout)` 通过内部事件能力观察终态并停止后续数据访问，随后由调用者显式 close。Drop 的最终兜底由 rinlib owner 完成，不无限重试。
 
-Runnel 只负责字节流；双工通信由两条方向相反的单工 Tunnel 组合。记录边界、预注册 MemoryObject region、descriptor 和缓冲交接属于并列的 BufferQueue，不进入本协议。
+## 验证
 
-多页 Tunnel 与 RNL2 尚未实现；当前实现仍以单页 RNL1 为准。RNL1 以 wrapping `u32` 累计游标直接 `% 3968` 取得物理环位置；`2^32` 不整除 3968，因此跨整数回绕的分段访问会静默错位，现有测试只分别覆盖差值回绕和普通环分段，不能证明组合正确。RNL2 必须从格式上分离累计进度与物理位置，不能只加宽为 `u64`。
+host 测试覆盖一页/多页/最大容量、空满和分段、u64::MAX 邻域的实际字节传输、畸形布局、几何 shadow、非法游标/EOF、不可逆 Broken、通知失败的读写进度、关闭失败保留以及双线程流传输。
 
-当前 `Producer/Consumer::handle()` 还会安全返回可复制 Endpoint Handle，而 rinlib raw close 可在 wrapper 存活时解除映射，使内部裸指针失去生命周期保障。正式数据面迁移必须由消费式 Endpoint owner 同时持有 Handle 与 mapping lease，协议 wrapper 只借用能力。方向契约见 [`../ideas/tunnel.md`](../ideas/tunnel.md) 与 [`../ideas/runnel.md`](../ideas/runnel.md)，以上两项及跨进程共享字节访问论证均由 [`数据面计划`](../../plans/todo-2026-09-memory-object-data-plane.md) 唯一承接。
+真实 init↔pm 使用三页映射和 65536 B 数据，容量 12160 B，验证完整模式、EOF、背压与对端关闭。Tunnel geometry/多 extent/close/Attach/drain 与独立 guest 非合作字节改写由 [`tunnel.md`](tunnel.md) 的验证入口负责。FAL Open 尚未接线，不将 init↔pm 机制验证解释为正式文件流完成。
 
-## 验证入口
-
-`librunnel` 的 host 测试与 init 验收覆盖创建/接入、角色访问、环形游标、EOF、Broken、门铃和关闭；跨 hart、Endpoint lease、Invitation 生命周期与资源守恒由 [`tunnel.md`](tunnel.md) 及内核验收负责。
+本专题组合验证与交付状态以 [`数据面计划`](../../plans/todo-2026-09-memory-object-data-plane.md) 为准。

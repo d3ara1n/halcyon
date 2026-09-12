@@ -27,7 +27,6 @@ use libprocess::{
 };
 use librpc::{CallError, Caller, FrameRejection, RpcMessageKind, RpcPrefix};
 use librunnel::blocking;
-#[cfg(feature = "acceptance-stress")]
 use rinlib::ipc::tunnel as tunnel_sys;
 #[cfg(not(feature = "acceptance-stress"))]
 use rinlib::memory_pool::MemoryPool;
@@ -191,14 +190,10 @@ const JOB_FULL_RIGHTS: Rights = Rights::from_raw(
 const DELEGATED_DOMAIN_RIGHTS: Rights =
     Rights::from_raw(Rights::MANAGE.raw() | Rights::READ.raw() | Rights::WAIT.raw());
 
-/// 隧道页在本进程的映射地址（VA 分配器落地前由调用方自报）。
-const TUNNEL_VA: usize = 0x4000_0000;
-#[cfg(feature = "acceptance-stress")]
-const LIFECYCLE_VA: usize = TUNNEL_VA + 0x1000;
-#[cfg(feature = "acceptance-stress")]
-const FAILED_ATTACH_VA: usize = TUNNEL_VA + 0x2000;
-/// 验证数据量：超过环形容量（3968），强制写端分批与回绕。
-const STREAM_LEN: usize = 8192;
+/// 多页流与生命周期 fixture 各自使用正式自动选址。
+const TUNNEL_BYTES: usize = 3 * 4096;
+/// 超过多倍环容量，覆盖真实背压、分页与回绕。
+const STREAM_LEN: usize = 65536;
 #[cfg(feature = "acceptance-stress")]
 const CONTROL_STRESS: usize = 128;
 #[cfg(feature = "acceptance-stress")]
@@ -322,7 +317,7 @@ fn launch_test_services(
                             manifest.mark_started(REQUIRED_PM_TARGET);
                             debug!("pm domain target started as pid {}", second.pid);
                             names.register_process(second.pid, "bin/test_target@pm_domain");
-                            let _ = close(second.control);
+                            let _ = unsafe { close(second.control) };
                         }
                         Err(error) => {
                             debug!("required pm-domain target spawn failed: {:?}", error);
@@ -372,9 +367,9 @@ fn launch_test_services(
         stage_failure = Some("required topology incomplete");
     }
     if let Some(failure) = stage_failure {
-        let _ = close(delegated_domain);
-        let _ = close(pm_mailbox.owner);
-        let _ = close(pm_mailbox.peer);
+        let _ = unsafe { close(delegated_domain) };
+        let _ = unsafe { close(pm_mailbox.owner) };
+        let _ = unsafe { close(pm_mailbox.peer) };
         return Err(failure);
     }
     debug!(
@@ -428,13 +423,13 @@ fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
 
         let wrong_kind = duplicate(job, Rights::GRANT)?;
         let wrong_result = process::bind_memory(created.builder, wrong_kind);
-        let _ = close(wrong_kind);
+        let _ = unsafe { close(wrong_kind) };
         if wrong_result != Err(SystemCallError::WrongObjectType) {
             return Err(SystemCallError::InternalError);
         }
         let no_grant = duplicate(root_memory_pool(), Rights::READ)?;
         let rights_result = process::bind_memory(created.builder, no_grant);
-        let _ = close(no_grant);
+        let _ = unsafe { close(no_grant) };
         if rights_result != Err(SystemCallError::RightsDenied) {
             return Err(SystemCallError::InternalError);
         }
@@ -446,14 +441,14 @@ fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
         }
         let repeat = duplicate(root_memory_pool(), Rights::GRANT)?;
         let repeat_result = process::bind_memory(created.builder, repeat);
-        let _ = close(repeat);
+        let _ = unsafe { close(repeat) };
         if repeat_result != Err(SystemCallError::ObjectNotAvailable) {
             return Err(SystemCallError::InternalError);
         }
         Ok(())
     })();
 
-    let cleanup = process::abandon_to_completion(created);
+    let cleanup = unsafe { process::abandon_to_completion(created) };
     if result.is_err() || cleanup.is_err() {
         return Err("BindMemory contract or cleanup failed");
     }
@@ -517,7 +512,7 @@ fn submit_shutdown(root_job: Handle, reset: Handle) -> ! {
         system::reset(attenuated, ResetAction::Shutdown, ResetReason::Requested),
         Err(SystemCallError::RightsDenied)
     ));
-    close(attenuated).expect("attenuated SystemReset close must succeed");
+    unsafe { close(attenuated) }.expect("attenuated SystemReset close must succeed");
     debug!("system reset authority checks passed");
     debug!("init: submitting explicit system shutdown");
 
@@ -871,7 +866,7 @@ fn test_rpc_reject_cleanup() {
                         .expect("RPC valid response send failed");
                 }
             }
-            close(service.owner).expect("RPC test service owner close failed");
+            unsafe { close(service.owner) }.expect("RPC test service owner close failed");
         })
         .expect("RPC test worker spawn failed");
 
@@ -891,8 +886,8 @@ fn test_rpc_reject_cleanup() {
     assert!(reply.handles.is_empty());
 
     worker.join();
-    close(rejected.owner).expect("RPC rejected Handle owner close failed");
-    close(service.peer).expect("RPC test service sender close failed");
+    unsafe { close(rejected.owner) }.expect("RPC rejected Handle owner close failed");
+    unsafe { close(service.peer) }.expect("RPC test service sender close failed");
     debug!("RPC rejected reply cleanup passed");
 }
 
@@ -957,16 +952,17 @@ fn run(services: Handle) -> Result<(), &'static str> {
                 let bits =
                     notification::take(event.owner, u64::MAX).expect("notification take failed");
                 debug!("notification: cookie={}, bits={:#x}", result.cookie, bits);
-                let _ = close(moved);
+                let _ = unsafe { close(moved) };
             }
             Err(e) => debug!("receive failed: {:?}", e),
         },
         Err(e) => debug!("send failed: {:?}", e),
     }
-    let _ = close(event.owner);
-    let _ = close(pair.peer);
-    let _ = close(pair.owner);
+    let _ = unsafe { close(event.owner) };
+    let _ = unsafe { close(pair.peer) };
+    let _ = unsafe { close(pair.owner) };
 
+    test_tunnel_geometry();
     test_capability_badges_and_affine_owners();
     #[cfg(feature = "acceptance-stress")]
     stress_control_plane();
@@ -977,13 +973,14 @@ fn run(services: Handle) -> Result<(), &'static str> {
     test_writable_level();
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
-    let (mut tunnel, invitation) = match blocking::create_consumer(TUNNEL_VA) {
-        Ok(t) => t,
-        Err(e) => {
-            debug!("tunnel create failed: {:?}", e);
-            return Err("tunnel create failed");
-        }
-    };
+    let (mut tunnel, invitation) =
+        match blocking::create_consumer(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere) {
+            Ok(t) => t,
+            Err(e) => {
+                debug!("tunnel create failed: {:?}", e);
+                return Err("tunnel create failed");
+            }
+        };
     debug!("tunnel created");
     let invitation_move = [HandleMove {
         handle: invitation,
@@ -994,21 +991,25 @@ fn run(services: Handle) -> Result<(), &'static str> {
         return Err("send tunnel invitation failed");
     }
 
-    let mut buf = [0u8; STREAM_LEN];
-    match tunnel.read_exact_or_eof(&mut buf) {
-        Ok(n) => {
-            let ok = buf
-                .iter()
-                .enumerate()
-                .all(|(i, &b)| b == (i % 251 + 1) as u8);
-            debug!(
-                "stream received {} bytes, pattern {}",
-                n,
-                if ok { "ok" } else { "MISMATCH" }
-            );
-        }
-        Err(e) => debug!("stream read failed: {:?}", e),
+    let mut buf = rinlib::alloc::vec![0u8; STREAM_LEN + 1];
+    let n = tunnel.read_exact_or_eof(&mut buf).map_err(|error| {
+        debug!("stream read failed: {:?}", error);
+        "stream read failed"
+    })?;
+    if n != STREAM_LEN
+        || !buf[..n]
+            .iter()
+            .enumerate()
+            .all(|(i, &byte)| byte == (i % 251 + 1) as u8)
+    {
+        return Err("stream pattern or length mismatch");
     }
+    debug!("stream received {} bytes, pattern ok", n);
+    debug!(
+        "RNL2 multi-page stream passed: bytes={}, capacity={}",
+        n,
+        tunnel.capacity()
+    );
 
     // —— 流控唤醒面：pm 填满目标邮箱后在 WRITABLE 上阻塞，腾位唤醒 ——
     test_writable_wake(pm_mailbox);
@@ -1051,7 +1052,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
         return Err("acceptance domain collection failed");
     }
     debug!("acceptance domain collected");
-    let _ = close(acceptance);
+    let _ = unsafe { close(acceptance) };
 
     // —— 监督闭环：等待全部服务 REAPABLE/CLOSED，Drain 至 Complete，
     // 查询稳定终态后释放 control。对象 close 回调（含 pm 隧道端点的
@@ -1066,12 +1067,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     debug!("all services supervised to completion");
 
     // —— 事件面：对端终态位（Drain 已置位，电平等待立即返回）——
-    let items = [WaitItem::new(
-        tunnel.handle(),
-        ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-        0,
-    )];
-    let peer_closed = wait_supervision_signal(&items, "peer-closed")?;
+    let peer_closed = wait_supervision_signal(&mut tunnel, "peer-closed")?;
     debug!(
         "peer closed observed: bits={:#x}",
         peer_closed.observed.raw()
@@ -1133,7 +1129,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     debug!("thread stack cleanup passed");
     debug!("topology: final snapshot before system reset");
     dump_topology(root_job, &names, 0);
-    let _ = close(pm_domain);
+    let _ = unsafe { close(pm_domain) };
     Ok(())
 }
 
@@ -1171,7 +1167,7 @@ fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
         .ok()
         .and_then(|control| {
             let snapshot = process::query(control).ok();
-            let _ = close(control);
+            let _ = unsafe { close(control) };
             snapshot
         });
         match process_snapshot {
@@ -1193,7 +1189,7 @@ fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
         match process::derive_job(job, JobMemberKind::ChildJobs, jid, DELEGATED_DOMAIN_RIGHTS) {
             Ok(child) => {
                 dump_topology(child, names, depth + 1);
-                let _ = close(child);
+                let _ = unsafe { close(child) };
             }
             Err(error) => debug!(
                 "\x1b[36mtopology\x1b[0m: {indent}  child jid {} derive failed: {:?}",
@@ -1236,11 +1232,11 @@ fn supervise_terminated_services(
 }
 
 fn wait_supervision_signal(
-    items: &[WaitItem],
+    tunnel: &mut blocking::Consumer,
     label: &'static str,
 ) -> Result<rinlib::shared::wait::WaitResult, &'static str> {
     for attempt in 1..=DEFAULT_SUPERVISION_POLICY.wait_attempts {
-        match wait_many(items, DEFAULT_SUPERVISION_POLICY.wait_timeout_ms) {
+        match tunnel.wait_peer_closed(DEFAULT_SUPERVISION_POLICY.wait_timeout_ms) {
             Ok(result) if result.observed != ObjectSignals::NONE => return Ok(result),
             Ok(result) if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) => {}
             Ok(result) => {
@@ -1250,7 +1246,6 @@ fn wait_supervision_signal(
                 );
                 return Err("supervision wait returned no signal");
             }
-            Err(SystemCallError::ObjectBusy) => {}
             Err(error) => {
                 debug!(
                     "{} supervision wait failed at attempt {}: {:?}",
@@ -1322,11 +1317,11 @@ fn test_building_kill(job: Handle) {
     }
     if let Err(error) = process::kill(created.control, 0x123) {
         debug!("building kill: kill failed: {:?}", error);
-        let _ = close(created.builder);
-        let _ = close(created.control);
+        let _ = unsafe { close(created.builder) };
+        let _ = unsafe { close(created.control) };
         return;
     }
-    let _ = close(created.builder);
+    let _ = unsafe { close(created.builder) };
     let drained = process::drain_to_completion(created.control);
     let snapshot = process::query(created.control);
     match (drained, snapshot) {
@@ -1347,7 +1342,7 @@ fn test_building_kill(job: Handle) {
             );
         }
     }
-    let _ = close(created.control);
+    let _ = unsafe { close(created.control) };
 }
 
 /// 验收线 1：枚举→派生→kill 通路。test_target 的 pid 经 acceptance Job
@@ -1379,7 +1374,7 @@ fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
     })();
     match derived {
         Ok(control) => {
-            let _ = close(retained);
+            let _ = unsafe { close(retained) };
             process::kill(control, 0x77).expect("derived-control kill must be accepted");
             let mut exhausted = DEFAULT_SUPERVISION_POLICY;
             exhausted.drain_work = 1;
@@ -1470,12 +1465,12 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
         })
         .map_err(|error| {
             debug!("drain minimum-budget acceptance failed: spawn {:?}", error);
-            let _ = close(marker.owner);
+            let _ = unsafe { close(marker.owner) };
             "drain minimum-budget spawn failed"
         })?;
         if let Err(error) = process::kill(started.control, 0x5D) {
             debug!("drain minimum-budget acceptance failed: kill {:?}", error);
-            let _ = close(started.control);
+            let _ = unsafe { close(started.control) };
             return Err("drain minimum-budget kill failed");
         }
         if let Err(error) = wait_many(
@@ -1487,7 +1482,7 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
             WAIT_TIMEOUT_INFINITE,
         ) {
             debug!("drain minimum-budget acceptance failed: wait {:?}", error);
-            let _ = close(started.control);
+            let _ = unsafe { close(started.control) };
             return Err("drain minimum-budget wait failed");
         }
         let mut batches = 0usize;
@@ -1507,10 +1502,10 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
             if drained.is_ok() { "passed" } else { "failed" },
             batches
         );
-        let _ = close(started.control);
+        let _ = unsafe { close(started.control) };
         drained.map_err(|_| "drain minimum-budget did not complete")
     })();
-    let _ = close(marker.peer);
+    let _ = unsafe { close(marker.peer) };
     result
 }
 
@@ -1550,7 +1545,7 @@ fn test_job_seal_completion(job: Handle) {
             snapshot, children
         ),
     }
-    let _ = close(child);
+    let _ = unsafe { close(child) };
 }
 
 /// 验收线 3：派生兑底——control 全消散的 REAPABLE 进程经枚举+派生接管，
@@ -1564,14 +1559,14 @@ fn test_derive_fallback(job: Handle) {
     let pid = created.pid;
     if let Err(error) = process::kill(created.control, 0x1D) {
         debug!("derive fallback FAILED: kill {:?}", error);
-        let _ = close(created.builder);
-        let _ = close(created.control);
+        let _ = unsafe { close(created.builder) };
+        let _ = unsafe { close(created.control) };
         return;
     }
     // 终因已冻结为 Killed；builder 关闭的 abandonment 竞争不覆盖。
-    let _ = close(created.builder);
+    let _ = unsafe { close(created.builder) };
     // control 消散：无人收束，只能靠枚举+派生接管。
-    let _ = close(created.control);
+    let _ = unsafe { close(created.control) };
     let members = enumerate_members(job, JobMemberKind::MemberProcesses);
     let visible = matches!(&members, Ok(list) if list.contains(&pid));
     let minted = process::derive_job(
@@ -1600,7 +1595,7 @@ fn test_derive_fallback(job: Handle) {
                     visible, drained, snapshot
                 ),
             }
-            let _ = close(control);
+            let _ = unsafe { close(control) };
         }
         Err(error) => {
             debug!(
@@ -1632,8 +1627,8 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
     match (running, building) {
         (Ok(running), Ok(building)) => {
             let running_pid = running.pid;
-            let _ = close(running.control);
-            let _ = close(building.control);
+            let _ = unsafe { close(running.control) };
+            let _ = unsafe { close(building.control) };
             match job_kill(child, 0x3C) {
                 Ok(()) => {
                     let snapshot = process::query_job(child);
@@ -1660,7 +1655,7 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
             );
         }
     }
-    let _ = close(child);
+    let _ = unsafe { close(child) };
 }
 
 /// seal 先于 Start 的提交闸门：Building 成员在 seal 后 Start 返回
@@ -1674,7 +1669,7 @@ fn seal_before_start(job: Handle) {
     // 手工构建可启动的 Building：入口页（自旋）+ 栈顶页（失败自清理）。
     let Ok(created) = build_spin_building(child) else {
         debug!("seal gate (start) FAILED: building");
-        let _ = close(child);
+        let _ = unsafe { close(child) };
         return;
     };
     let sealed = process::seal_job(child);
@@ -1683,8 +1678,8 @@ fn seal_before_start(job: Handle) {
     // 收束：kill → drain → sealed+空完成 → CLOSED。
     let _ = process::kill(created.control, 0x3D);
     let _ = process::drain_to_completion(created.control);
-    let _ = close(created.control);
-    let _ = close(created.builder);
+    let _ = unsafe { close(created.control) };
+    let _ = unsafe { close(created.builder) };
     let waited = wait_many(
         &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
         WAIT_TIMEOUT_INFINITE,
@@ -1700,7 +1695,7 @@ fn seal_before_start(job: Handle) {
         gated,
         snapshot.as_ref().map(|s| s.state)
     );
-    let _ = close(child);
+    let _ = unsafe { close(child) };
 }
 
 /// seal 先于 Create：封口后成员/子 Job 创建口永久关闭（ObjectClosed）；
@@ -1728,9 +1723,9 @@ fn seal_before_create(job: Handle) {
         subjob.err()
     );
     if let Ok(handle) = subjob {
-        let _ = close(handle);
+        let _ = unsafe { close(handle) };
     }
-    let _ = close(child);
+    let _ = unsafe { close(child) };
 }
 
 /// 枚举收敛（可制造子集）：创建/收束交错下，新 Pid 单调递增、Dead
@@ -1758,16 +1753,16 @@ fn enumerate_convergence(job: Handle) {
         if let Err(error) = process::kill(created.control, 0x3E + round as i64) {
             ok = false;
             debug!("enumerate convergence FAILED: kill {:?}", error);
-            let _ = close(created.builder);
-            let _ = close(created.control);
+            let _ = unsafe { close(created.builder) };
+            let _ = unsafe { close(created.control) };
             continue;
         }
-        let _ = close(created.builder);
+        let _ = unsafe { close(created.builder) };
         if let Err(error) = process::drain_to_completion(created.control) {
             ok = false;
             debug!("enumerate convergence FAILED: drain {:?}", error);
         }
-        let _ = close(created.control);
+        let _ = unsafe { close(created.control) };
         match enumerate_members(job, JobMemberKind::MemberProcesses) {
             Ok(members) => {
                 if members.contains(&created.pid) {
@@ -1855,9 +1850,9 @@ fn test_capability_badges_and_affine_owners() {
     send(transferred, 889, &[], &[]).expect("transferred badged sender send failed");
     let message = receive(mailbox.owner).expect("transferred badged message receive failed");
     assert_eq!(message.header.sender_badge, BADGE);
-    close(transferred).expect("transferred badged sender close failed");
-    close(copy).expect("badged sender copy close failed");
-    close(badged).expect("badged sender close failed");
+    unsafe { close(transferred) }.expect("transferred badged sender close failed");
+    unsafe { close(copy) }.expect("badged sender copy close failed");
+    unsafe { close(badged) }.expect("badged sender close failed");
 
     assert!(matches!(
         duplicate(mailbox.owner, Rights::READ),
@@ -1904,12 +1899,12 @@ fn test_capability_badges_and_affine_owners() {
         1
     );
 
-    close(event.peer).expect("notification signaler close failed");
-    close(event.owner).expect("notification owner close failed");
-    close(mailbox.peer).expect("default sender close failed");
-    close(mailbox.owner).expect("mailbox owner close failed");
-    close(transport.peer).expect("owner transport sender close failed");
-    close(transport.owner).expect("owner transport owner close failed");
+    unsafe { close(event.peer) }.expect("notification signaler close failed");
+    unsafe { close(event.owner) }.expect("notification owner close failed");
+    unsafe { close(mailbox.peer) }.expect("default sender close failed");
+    unsafe { close(mailbox.owner) }.expect("mailbox owner close failed");
+    unsafe { close(transport.peer) }.expect("owner transport sender close failed");
+    unsafe { close(transport.owner) }.expect("owner transport owner close failed");
     debug!("capability badge and owner transport passed");
 }
 
@@ -1977,8 +1972,8 @@ fn test_send_once() {
     for _ in 0..MAILBOX_CAPACITY {
         discard(full.owner).expect("send-once full drain failed");
     }
-    close(full.peer).expect("send-once full sender close failed");
-    close(full.owner).expect("send-once full owner close failed");
+    unsafe { close(full.peer) }.expect("send-once full sender close failed");
+    unsafe { close(full.owner) }.expect("send-once full owner close failed");
 
     // once 同时作为发送目标与 transit move 会突破一次投递保证，必须在
     // 任何入队或摘除前整体拒绝；失败不消费 once。
@@ -2009,8 +2004,8 @@ fn test_send_once() {
     let message = receive(both.owner).expect("send-once alias recovery receive failed");
     assert_eq!(message.header.kind, 921);
     assert!(message.handles.is_empty());
-    close(both.peer).expect("send-once both sender close failed");
-    close(both.owner).expect("send-once both owner close failed");
+    unsafe { close(both.peer) }.expect("send-once both sender close failed");
+    unsafe { close(both.owner) }.expect("send-once both owner close failed");
     debug!("send-once passed");
 }
 
@@ -2043,8 +2038,8 @@ fn test_writable_level() {
     for _ in 0..MAILBOX_CAPACITY - 1 {
         discard(mailbox.owner).expect("writable drain failed");
     }
-    close(mailbox.peer).expect("writable sender close failed");
-    close(mailbox.owner).expect("writable owner close failed");
+    unsafe { close(mailbox.peer) }.expect("writable sender close failed");
+    unsafe { close(mailbox.owner) }.expect("writable owner close failed");
     debug!("writable level passed");
 }
 
@@ -2107,9 +2102,9 @@ fn test_writable_wake(pm_mailbox: Handle) {
         notification::take(spin.owner, u64::MAX),
         Err(SystemCallError::ObjectNotAvailable)
     ));
-    close(done.owner).expect("wake done owner close failed");
-    close(spin.owner).expect("wake spin owner close failed");
-    close(target.owner).expect("wake target owner close failed");
+    unsafe { close(done.owner) }.expect("wake done owner close failed");
+    unsafe { close(spin.owner) }.expect("wake spin owner close failed");
+    unsafe { close(target.owner) }.expect("wake target owner close failed");
     debug!("writable wake passed");
 }
 
@@ -2132,7 +2127,7 @@ fn stress_control_plane() {
         }];
         send(mailbox.peer, index as u64, &index.to_le_bytes(), &moves).expect("stress send failed");
         assert!(matches!(
-            close(event.peer),
+            unsafe { close(event.peer) },
             Err(SystemCallError::StaleHandle)
         ));
         let message = receive(mailbox.owner).expect("stress receive failed");
@@ -2143,10 +2138,10 @@ fn stress_control_plane() {
             notification::take(event.owner, 1).expect("stress take failed"),
             1
         );
-        close(message.handles[0]).expect("stress moved handle close failed");
-        close(event.owner).expect("stress notification owner close failed");
-        close(mailbox.peer).expect("stress mailbox sender close failed");
-        close(mailbox.owner).expect("stress mailbox owner close failed");
+        unsafe { close(message.handles[0]) }.expect("stress moved handle close failed");
+        unsafe { close(event.owner) }.expect("stress notification owner close failed");
+        unsafe { close(mailbox.peer) }.expect("stress mailbox sender close failed");
+        unsafe { close(mailbox.owner) }.expect("stress mailbox owner close failed");
     }
 
     let mailbox = create(
@@ -2174,48 +2169,101 @@ fn stress_control_plane() {
     for _ in 0..MAILBOX_CAPACITY {
         discard(mailbox.owner).expect("mailbox discard failed");
     }
-    close(event.peer).expect("retained signaler close failed");
-    close(event.owner).expect("retained owner close failed");
-    close(mailbox.peer).expect("full mailbox sender close failed");
-    close(mailbox.owner).expect("full mailbox owner close failed");
+    unsafe { close(event.peer) }.expect("retained signaler close failed");
+    unsafe { close(event.owner) }.expect("retained owner close failed");
+    unsafe { close(mailbox.peer) }.expect("full mailbox sender close failed");
+    unsafe { close(mailbox.owner) }.expect("full mailbox owner close failed");
     debug!(
         "control-plane stress passed: {} transactions",
         CONTROL_STRESS
     );
 }
 
+/// 实际 Running 调用链验证取整、双端不同 VA、完整共享范围与关闭后存活端。
+fn test_tunnel_geometry() {
+    use core::sync::atomic::Ordering;
+    use rinlib::mm::Placement;
+    for bytes in [1, 4096, 4097, 8192, 12288, 512 * 4096] {
+        let (creator, invitation) =
+            tunnel_sys::create(bytes, Placement::Anywhere).expect("Tunnel geometry Create failed");
+        let geometry = creator.geometry();
+        assert_eq!(geometry.bytes(), bytes.div_ceil(4096) * 4096);
+        for page in 0..geometry.bytes() / 4096 {
+            creator
+                .memory()
+                .store_u64(page * 4096, page as u64 + 1, Ordering::Release);
+        }
+        let peer = tunnel_sys::attach(invitation, Placement::Anywhere)
+            .expect("Tunnel geometry Attach failed");
+        assert_ne!(geometry.base(), peer.geometry().base());
+        assert_eq!(geometry.bytes(), peer.geometry().bytes());
+        for page in 0..geometry.bytes() / 4096 {
+            assert_eq!(
+                peer.memory().load_u64(page * 4096, Ordering::Acquire),
+                page as u64 + 1
+            );
+        }
+        let peer_base = peer.geometry().base();
+        creator
+            .close()
+            .expect("Tunnel geometry creator close failed");
+        assert_eq!(
+            peer.memory()
+                .load_u64(geometry.bytes() - 4096, Ordering::Acquire),
+            (geometry.bytes() / 4096) as u64
+        );
+        peer.close().expect("Tunnel geometry peer close failed");
+        for address in [geometry.base(), peer_base] {
+            let region = rinlib::mm::MappedRegion::map_anonymous(
+                geometry.bytes(),
+                0,
+                0,
+                rinlib::shared::mem::MemoryProtection::ReadWrite,
+                Placement::FixedEmpty {
+                    usable_start: address,
+                },
+            )
+            .expect("Tunnel geometry left a mapping behind");
+            region.unmap().expect("Tunnel geometry reuse Unmap failed");
+        }
+    }
+    debug!("Tunnel Running geometry checks passed: six lengths");
+}
+
 #[cfg(feature = "acceptance-stress")]
 fn test_tunnel_lifecycle() {
     for _ in 0..TUNNEL_STRESS {
-        let abandoned = tunnel_sys::create(LIFECYCLE_VA).expect("lifecycle tunnel create failed");
+        let (abandoned, invitation) =
+            tunnel_sys::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere)
+                .expect("lifecycle tunnel create failed");
         assert!(matches!(
             wait_many(
-                &[WaitItem::new(abandoned.peer, ObjectSignals::CLOSED, 0)],
+                &[WaitItem::new(invitation, ObjectSignals::CLOSED, 0)],
                 WAIT_TIMEOUT_INFINITE,
             ),
             Err(SystemCallError::RightsDenied)
         ));
-        close(abandoned.peer).expect("invitation close failed");
-        let result = wait_many(
-            &[WaitItem::new(
-                abandoned.owner,
-                ObjectSignals::PEER_CLOSED,
-                0,
-            )],
-            WAIT_TIMEOUT_INFINITE,
-        )
-        .expect("abandoned invitation wait failed");
+        // SAFETY: 本轮独占、未运输的 Invitation。
+        unsafe { close(invitation) }.expect("invitation close failed");
+        let result = abandoned
+            .events()
+            .wait(ObjectSignals::PEER_CLOSED, WAIT_TIMEOUT_INFINITE)
+            .expect("abandoned invitation wait failed");
         assert!(result.observed.intersects(ObjectSignals::PEER_CLOSED));
-        close(abandoned.owner).expect("lifecycle endpoint close failed");
+        abandoned.close().expect("lifecycle endpoint close failed");
 
-        let creator_closed =
-            tunnel_sys::create(LIFECYCLE_VA).expect("closed-creator tunnel create failed");
-        close(creator_closed.owner).expect("creator endpoint close failed");
+        let (creator_closed, invitation) =
+            tunnel_sys::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere)
+                .expect("closed-creator tunnel create failed");
+        creator_closed
+            .close()
+            .expect("creator endpoint close failed");
         assert!(matches!(
-            tunnel_sys::attach(creator_closed.peer, FAILED_ATTACH_VA),
+            tunnel_sys::attach(invitation, rinlib::mm::Placement::Anywhere),
             Err(SystemCallError::ObjectClosed)
         ));
-        close(creator_closed.peer).expect("closed invitation close failed");
+        // SAFETY: Attach 失败未消费本轮的 Invitation。
+        unsafe { close(invitation) }.expect("closed invitation close failed");
     }
     debug!("tunnel lifecycle stress passed: {} rounds", TUNNEL_STRESS);
 }

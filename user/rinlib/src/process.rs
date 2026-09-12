@@ -26,10 +26,20 @@ pub fn create_job(parent: Handle, rights: Rights) -> Result<Handle, SystemCallEr
 
 /// 放弃尚未 Start 的完整 Create 结果并推进至资源收束完成。清理步骤全部
 /// 尝试执行，返回最先发生的错误；调用者无需重复维护 close/drain 顺序。
-pub fn abandon_to_completion(created: ProcessCreateResult) -> Result<(), SystemCallError> {
-    let builder_result = close(created.builder);
+/// # Safety
+/// created 必须是调用者独占的真实、尚未 Start 的 Create 结果，两枚 Handle 均未消费。
+///
+/// ```compile_fail
+/// let created = rinlib::shared::proc::ProcessCreateResult {
+///     builder: rinlib::shared::object::Handle::INVALID,
+///     control: rinlib::shared::object::Handle::INVALID, pid: 0, reserved: 0,
+/// };
+/// rinlib::process::abandon_to_completion(created);
+/// ```
+pub unsafe fn abandon_to_completion(created: ProcessCreateResult) -> Result<(), SystemCallError> {
+    let builder_result = unsafe { close(created.builder) };
     let drain_result = drain_to_completion(created.control);
-    let control_result = close(created.control);
+    let control_result = unsafe { close(created.control) };
     builder_result?;
     drain_result?;
     control_result

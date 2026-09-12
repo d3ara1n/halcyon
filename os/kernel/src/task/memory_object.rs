@@ -129,17 +129,14 @@ impl MemoryObjectCore {
         Arc::try_new(core).map_err(|_| SystemCallError::OutOfMemory)
     }
 
-    /// 为 Tunnel Connection 创建内部对象 core（单页，可变）。
-    ///
-    /// 除了 backing 长度固定为单页外，其余与公共 MemoryObject 完全相同——同一套
-    /// ObjectId 铸造、状态机与 metadata admission。Connection 两端 Endpoint 共享
-    /// 同一对象，因此最多两个可写 view。
+    /// Tunnel 两端共用可变对象 core，最多两个可写 view；资金来源与公共对象一致。
     pub(crate) fn new_tunnel_connection(
         pool: &Arc<MemoryPool>,
         sponsor: &Arc<MetadataSponsor>,
+        pages: usize,
     ) -> Result<(Self, ConnectionPermit), SystemCallError> {
         let connection_permit = MetadataSponsor::reserve_connection(sponsor)?;
-        let core = Self::new(pool, sponsor, 1, 2)?;
+        let core = Self::new(pool, sponsor, pages, 2)?;
         Ok((core, connection_permit))
     }
 

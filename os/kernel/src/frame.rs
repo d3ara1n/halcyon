@@ -555,8 +555,8 @@ impl ObjectBacking {
 
     /// 对象内页区间到物理 span 的投影，追加写入 `spans`。
     ///
-    /// 单页 view 退化为长度为一的序列，因此单页 Tunnel 与多页对象共用同一条
-    /// translation 组装路径。越界由调用方在 Validate 阶段排除。
+    /// view 与 Tunnel 共用有界多 extent translation 组装路径；单页是退化几何。
+    /// 越界由调用方在 Validate 阶段排除。
     pub(crate) fn project(
         &self,
         offset_pages: usize,

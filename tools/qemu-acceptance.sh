@@ -38,6 +38,9 @@ required=(
     "supervision budget exhaustion retained authority:"
     "thread stack cleanup passed"
     "Tunnel failure rollback and inventory checks passed"
+    "Tunnel multi-page geometry and projection checks passed"
+    "Tunnel Running geometry checks passed: six lengths"
+    "RNL2 multi-page stream passed: bytes=65536, capacity=12160"
     "system reset accepted: action Shutdown, reason Requested"
 )
 case "$profile" in

@@ -80,8 +80,9 @@ impl Caller {
     /// 废弃端口：迟到回复隔离，下次调用懒重建。
     fn discard_port(&mut self) {
         if let Some(port) = self.port.take() {
-            let _ = close(port.peer);
-            let _ = close(port.owner);
+            // SAFETY: 私有 port 只由 mailbox_create 生成，本 Caller 独占；无映射 owner。
+            let _ = unsafe { close(port.peer) };
+            let _ = unsafe { close(port.owner) };
         }
     }
 
@@ -93,7 +94,8 @@ impl Caller {
         rejection: FrameRejection,
     ) -> CallError {
         for handle in message.handles {
-            let _ = close(handle);
+            // SAFETY: 私有拒绝路径只接收真实 receive 结果；Endpoint 不允许 TRANSIT。
+            let _ = unsafe { close(handle) };
         }
         self.discard_port();
         CallError::Frame(rejection)
@@ -139,7 +141,7 @@ impl Caller {
 
         send_blocking(service, protocol_id, &payload[..used], moves).inspect_err(|_| {
             // 发送失败：尚未转移的 reply_once 留在本地，关闭防止泄漏。
-            let _ = close(reply_once);
+            let _ = unsafe { close(reply_once) };
         })?;
 
         let items = [

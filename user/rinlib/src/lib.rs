@@ -13,6 +13,7 @@ pub mod dbg;
 pub mod env;
 pub mod ipc;
 pub mod mm;
+pub mod shared_memory;
 pub mod memory_object;
 pub mod memory_pool;
 pub mod preclude;

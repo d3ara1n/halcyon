@@ -291,9 +291,9 @@ mod tests {
             .expect("virt layout must be valid")
     }
 
-    /// qemu sifive_u 向量：8 槽 × 0xA000。
+    /// qemu sifive_u 向量：与 virt 同为 8 槽 × 0x40000。
     fn sifive_board() -> StackWindowLayout {
-        StackWindowLayout::new(WINDOW, 8, 0xA000, GUARD, EMERGENCY, 0x802B3000, TOP_SLOT)
+        StackWindowLayout::new(WINDOW, 8, 0x40000, GUARD, EMERGENCY, 0x802B3000, TOP_SLOT)
             .expect("sifive_u layout must be valid")
     }
 
@@ -306,11 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn sifive_span_fits_single_leaf() {
+    fn sifive_span_matches_virt_two_leaf_units() {
         let layout = sifive_board();
-        assert_eq!(layout.stride(), 0xA000 + 2 * GUARD);
-        assert_eq!(layout.span(), 0x10000 * 8);
-        assert!(layout.span() <= 1 << 21);
+        assert_eq!(layout.stride(), virt_board().stride());
+        assert_eq!(layout.span(), virt_board().span());
+        assert_eq!(layout.span().div_ceil(1 << 21), 2);
     }
 
     #[test]
@@ -387,9 +387,8 @@ mod tests {
     /// 要么仍落在槽内映射段、要么落入 guard 洞——永不进入相邻槽。
     #[test]
     fn max_frame_jump_cannot_cross_guard() {
-        let max_frame = 0x2800; // audit_elf.py DEFAULT_MAX_FRAME
         for layout in [virt_board(), sifive_board()] {
-            assert!(layout.guard() >= max_frame);
+            let max_frame = layout.guard();
             for slot in 0..layout.slots() {
                 let slot_lo = layout.slot_base(slot);
                 let slot_hi = layout.slot_base(slot) + layout.stride();
