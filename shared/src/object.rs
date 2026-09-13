@@ -131,18 +131,31 @@ impl ObjectSignals {
     pub const DONE: Self = Self(1 << 4);
     /// MemoryObject 已进入 Executable 终态：可建立读执行 view。置位后永不清除。
     pub const EXECUTABLE: Self = Self(1 << 5);
+    /// 对端已建立映射且尚未关闭，不表示页内协议或业务 Start 已完成。
+    pub const PEER_ATTACHED: Self = Self(1 << 6);
     pub const PEER_CLOSED: Self = Self(1 << 62);
     pub const CLOSED: Self = Self(1 << 63);
-    pub const KNOWN: Self = Self(
-        Self::READABLE.0
-            | Self::WRITABLE.0
-            | Self::DATA.0
-            | Self::REAPABLE.0
-            | Self::DONE.0
-            | Self::EXECUTABLE.0
-            | Self::PEER_CLOSED.0
-            | Self::CLOSED.0,
-    );
+    pub const BITS: &'static [Self] = &[
+        Self::READABLE,
+        Self::WRITABLE,
+        Self::DATA,
+        Self::REAPABLE,
+        Self::DONE,
+        Self::EXECUTABLE,
+        Self::PEER_ATTACHED,
+        Self::PEER_CLOSED,
+        Self::CLOSED,
+    ];
+
+    pub const KNOWN: Self = {
+        let mut index = 0;
+        let mut mask = 0;
+        while index < Self::BITS.len() {
+            mask |= Self::BITS[index].0;
+            index += 1;
+        }
+        Self(mask)
+    };
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -199,6 +212,68 @@ impl Not for ObjectSignals {
     fn not(self) -> Self {
         Self(!self.0)
     }
+}
+
+/// 公开的对象/role 判别不依赖 Rust enum 内存布局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ObjectKind {
+    Job = 1,
+    MemoryPool = 2,
+    MemoryObject = 3,
+    ProcessBuilder = 4,
+    ProcessControl = 5,
+    ThreadControl = 6,
+    Mailbox = 7,
+    Notification = 8,
+    TunnelEndpoint = 9,
+    TunnelInvitation = 10,
+    SystemReset = 11,
+    MailboxSender = 12,
+    Lifetime = 13,
+    Delivery = 14,
+    WaitSet = 15,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum HandleRole {
+    JobControl = 1,
+    MemoryPool = 2,
+    MemoryObject = 3,
+    ProcessBuilder = 4,
+    ProcessControl = 5,
+    ThreadControl = 6,
+    MailboxOwner = 7,
+    MailboxSender = 8,
+    MailboxSenderOnce = 9,
+    NotificationOwner = 10,
+    NotificationSignaler = 11,
+    TunnelEndpoint = 12,
+    TunnelInvitation = 13,
+    SystemResetControl = 14,
+    LifetimeObserver = 15,
+    Delivery = 16,
+    WaitSetOwner = 17,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct HandleDescription {
+    pub object_id: u64,
+    pub related_object_id: u64,
+    pub kind: u32,
+    pub role: u32,
+    pub rights: Rights,
+    pub badge: u64,
+    pub reserved: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct SenderResult {
+    pub sender: Handle,
+    pub lifetime: Handle,
 }
 
 /// 原子创建双角色对象时的 Handle 输出。

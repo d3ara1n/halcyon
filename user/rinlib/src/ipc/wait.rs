@@ -1,18 +1,21 @@
-//! WaitMany 的安全封装。
+//! WaitMany 的安全封装；相对便利入口归到唯一绝对核心。
 
+use crate::{call::sys_wait_many, time::Deadline};
 use erhino_shared::{
     call::SystemCallError,
     object::ObjectSignals,
     wait::{WaitItem, WaitReason, WaitResult},
 };
 
-use crate::call::sys_wait_many;
-
-/// 等待观察项完成，`timeout_ms` 为相对毫秒超时，`0` 表示无限等待。
-/// 超时时返回 `reason == Timeout` 的结果，无任何观察项被消费。
+/// 相对毫秒便利入口，零表示无限；只在入口转换一次。
 pub fn wait_many(items: &[WaitItem], timeout_ms: u64) -> Result<WaitResult, SystemCallError> {
+    wait_until(items, crate::time::timeout_millis(timeout_ms)?)
+}
+
+/// 多阶段操作共享同一绝对期限，不从本次等待时刻重新计时。
+pub fn wait_until(items: &[WaitItem], deadline: Deadline) -> Result<WaitResult, SystemCallError> {
     let mut output = WaitResult::new(0, ObjectSignals::NONE, 0, WaitReason::Signaled);
-    // SAFETY: items 与 output 在阻塞 syscall 完成前持续有效。
-    unsafe { sys_wait_many(items, &mut output, timeout_ms)? };
+    // SAFETY: 输入及输出在阻塞 syscall 完成前保持有效。
+    unsafe { sys_wait_many(items, &mut output, deadline)? };
     Ok(output)
 }

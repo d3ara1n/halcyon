@@ -21,7 +21,7 @@ ServiceClosed、Wait/Receive 错误和 timeout 同样废弃端口，`Caller` 自
 
 ## 当前边界
 
-异步多 in-flight dispatcher、协作式 Cancel、idempotency key 与服务端去重尚未实现。它们属于 RPC 层扩展，不改变 Mailbox 与 WaitMany ABI。
+异步多 in-flight dispatcher、协作式 Cancel、idempotency key 与服务端去重尚未实现。当前实现没有 typed Delivery 或完整投递阶段 owner；公共 IPC 与 dispatcher 的实施由 [`FAL 整体计划`](../../plans/todo-2026-09-fal-service-capabilities.md) 承接，未来 ABI 以该计划和期限计划为准。
 
 同步 Caller 的有限 `timeout_ms` 当前只用于请求投递成功后的 ReplyPort 等待；之前的 `send_blocking` 在 MailboxFull 时无限等待，因此它还不是完整调用 deadline。用户态尚无公共单调时钟，不能通过重复相对 WaitMany 正确拼出总期限；该缺口由 [`单调时间与 RPC 全调用期限`](../../plans/todo-2026-09-monotonic-time-rpc-deadline.md) 唯一承接。
 

@@ -227,8 +227,17 @@ impl MemoryObjectCore {
         self.state.lock().wait.subscribe(subscription)
     }
 
+    pub(crate) fn rearm_observer(&self, id: u64) -> Result<object::ObserverRearm, SystemCallError> {
+        self.state.lock().wait.rearm_observer(id)
+    }
+
+    pub(crate) fn cancel_observer(&self, id: u64) -> Option<object::CancelledObservation> {
+        self.state.lock().wait.cancel_observer(id)
+    }
+
     pub(crate) fn unsubscribe(&self, id: u64) {
-        self.state.lock().wait.unsubscribe(id);
+        let retired = self.state.lock().wait.unsubscribe(id);
+        drop(retired);
     }
 
     /// 发布 `EXECUTABLE` 电平并在对象锁外完成等待者。电平置位后持续为真，
@@ -314,14 +323,10 @@ impl object::KernelObject for MemoryObject {
         let mut used = 0;
         while used < budget {
             let advance = { self.core.state.lock().wait.advance_waiter() };
-            match advance {
-                super::object::WaitAdvance::Progress => used += 1,
-                super::object::WaitAdvance::Complete(context) => {
-                    super::wait::finish_offered(context);
-                    used += 1;
-                }
-                super::object::WaitAdvance::Done => return (used, true),
+            if advance.finish() {
+                return (used, true);
             }
+            used += 1;
         }
         (used, false)
     }
@@ -348,6 +353,14 @@ impl object::KernelObject for MemoryObject {
 
     fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
         self.core.subscribe(subscription)
+    }
+
+    fn rearm_observer(&self, id: u64) -> Result<object::ObserverRearm, SystemCallError> {
+        self.core.rearm_observer(id)
+    }
+
+    fn cancel_observer(&self, id: u64) -> Option<object::CancelledObservation> {
+        self.core.cancel_observer(id)
     }
 
     fn unsubscribe(&self, id: u64) {

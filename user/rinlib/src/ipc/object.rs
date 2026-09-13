@@ -18,14 +18,30 @@ pub unsafe fn close(handle: Handle) -> Result<(), SystemCallError> {
     unsafe { sys_handle_close(handle) }
 }
 
-/// 关闭由安全 typed owner 唯一持有的非 Tunnel 叶 Handle。
+/// 关闭由安全 typed owner 唯一持有的非映射对象 Handle。
 ///
-/// 此边界不可用于任意 raw Handle：合法 leaf owner 的表项仍在本进程且内核关闭
-/// 路径无异步阶段，因此错误只表示 unsafe owner 构造契约或内核不变量被破坏。
-pub(crate) fn close_leaf_owner(handle: Handle) {
-    // SAFETY: 私有调用者持有真实且独占的非映射 leaf owner。
+/// 此边界不可用于任意 raw Handle：合法 owner 的表项仍在本进程，关闭的必成资源
+/// 已在构造时预付；非空 WaitSet 由 syscall 等待内核退休。Drop 时不能返还 owner，
+/// 返回错误表示 unsafe 构造/撤销契约或内核不变量被破坏，不能静默遗弃该责任。
+pub(crate) fn close_object_owner(handle: Handle) {
+    // SAFETY: 私有调用者持有合法非映射对象 entry 的唯一关闭责任。
     unsafe { close(handle) }
-        .unwrap_or_else(|error| panic!("typed leaf Handle close invariant violated: {error:?}"));
+        .unwrap_or_else(|error| panic!("typed object Handle close invariant violated: {error:?}"));
+}
+
+pub fn query(handle: Handle) -> Result<erhino_shared::object::HandleDescription, SystemCallError> {
+    let mut output = erhino_shared::object::HandleDescription {
+        object_id: 0,
+        related_object_id: 0,
+        kind: 0,
+        role: 0,
+        rights: Rights::NONE,
+        badge: 0,
+        reserved: 0,
+    };
+    // SAFETY: 查询只读，output 在 ecall 期间有效。
+    unsafe { crate::call::sys_handle_query(handle, &mut output) }?;
+    Ok(output)
 }
 
 pub fn duplicate(handle: Handle, rights: Rights) -> Result<Handle, SystemCallError> {

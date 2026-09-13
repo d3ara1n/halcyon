@@ -62,6 +62,10 @@ pub mod ranks {
     pub const OBJECT_WAIT: Rank = Rank(500);
     /// 进程生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入）。
     pub const LIFECYCLE: Rank = Rank(600);
+    /// 授权对象最后消散的单向寿命发布，不反向访问业务容器。
+    pub const LIFETIME: Rank = Rank(620);
+    /// 持久就绪集合；来源和此目标状态锁不得嵌套。
+    pub const WAIT_SET: Rank = Rank(550);
     /// Commit 后完成槽：只在 lifecycle gate 内填充一次，完成方锁外取走后
     /// 才进入 AddressSpace 收束。
     pub const MEMORY_COMPLETION: Rank = Rank(625);

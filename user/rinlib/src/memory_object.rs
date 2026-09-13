@@ -74,12 +74,12 @@ impl MemoryObject {
 
     /// 关闭唯一持有的 MemoryObject leaf Handle；合法 typed owner 不存在可恢复失败。
     pub fn close(self) {
-        crate::ipc::object::close_leaf_owner(self.into_handle());
+        crate::ipc::object::close_object_owner(self.into_handle());
     }
 }
 
 impl Drop for MemoryObject {
     fn drop(&mut self) {
-        crate::ipc::object::close_leaf_owner(self.handle);
+        crate::ipc::object::close_object_owner(self.handle);
     }
 }

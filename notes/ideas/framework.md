@@ -1,27 +1,40 @@
 # 用户态服务框架
 
-rinlib 只提供 StartupBlock outer、对象、消息、等待和 Tunnel 的基础封装。用户态框架在其上实现通用协议流程，不能绕过 capability 或把 PID 当地址。装载链库（libelf、libprocess、ld-erhino）的定位由 [bootstrap](bootstrap.md) 拥有；本篇拥有运行期协议与服务框架库。
+rinlib 提供启动资源、对象、运输、时间、等待和 Tunnel 的基础封装。框架在其上组织协议与服务，不绕过 capability，不把 PID 或对象身份当作地址。装载链由 [bootstrap](bootstrap.md) 拥有，本篇拥有运行期库的分工。
 
-## RPC 框架（librpc）
+## rinlib 与 librpc
 
-librpc 实现 RpcPrefix、txid 分配、ReplyPort、send-once 回复授权、同步 Caller 与异步 dispatcher。它暴露 `sender_pid/sender_badge`，但不替业务协议决定身份或授权。
+rinlib 的安全 owner 区分能力运输、Delivery、Lifetime、需要 drain 的容器和绑定映射的 Endpoint。安全观察接口不导出关闭权或共享内存裸切片，失败必须保留仍需清理的 owner。
 
-## 服务框架（libsrv）
+librpc 拥有 RpcPrefix、txid、ReplyPort、同步 Caller、异步 dispatcher、PendingCall 和发送阶段错误。它提供已验证的运输 envelope，不替业务解释发送授权身份和 badge。完整规则见 [rpc](rpc.md)。
 
-libsrv 从 rinlib 取得 StartupBlock Handle 数组与 opaque payload，并按用户态 LauncherParcel 解释 args、服务 owner、namespace 和依赖。服务 owner 在 ProcessStart 前已经由 ProcessGrant 安装；libsrv 不靠尚不存在的邮箱接收“启动资源消息”。
+## 服务执行（libsrv）
 
-若服务协议需要 runnable 后的 activate/drain/reload 控制，应定义独立版本化 control message，不与 launch 混称 STARTUP。
+libsrv 按用户态启动契约解释 args、服务 owner、namespace 和依赖，不靠运行后的隐式消息补充启动 authority。activate、drain、reload 是独立控制协议，不与 launch 混称 STARTUP。
 
-libsrv 在普通用户线程上以 WaitMany 组合请求 Mailbox、控制 endpoint、timer 和 Notification，并提供 session/badge 分发、关闭传播与每客户端准入积木。
+服务采用普通用户线程中的状态拥有者和有界事件循环：
 
-## 文件系统协议与 provider 工具（libfal）
+- 一个状态拥有者修改本服务的授权、目录与注册状态；
+- WaitSet 汇集来源，ready token 只提示重查；
+- 每次推进一个请求、回复或流任务的有限工作，持续就绪者重新排到队尾；
+- 下游 RPC、发送背压和设备完成作为挂起状态，不在控制循环中阻塞；
+- 预算同时覆盖请求、outbox、注册、节点、grant、流、等待源和内存；
+- 退出先停止准入，再完成或取消任务、注销观察、drain WaitSet 并关闭 owner。
 
-libfal 定义 FAL wire、固定宽编解码、版本/长度校验和 provider 侧分发积木。协议 codec、provider toolkit 与参考 memfs 应保持分层，使客户端或真实 provider 不被迫依赖参考存储模型。
+单一共享 Mailbox 不保证不同客户端的入站公平。需要隔离的授权域使用独立入口队列，在服务内共同经过公平任务调度；同域别名共享配额。账户来自显式授权，不能用 PID 作为能力来源。
 
-## 文件系统客户端（libfs）
+服务自己拥有失败和资源边界。待发送回复有上限与期限；未 Attach 的 offer 有有限期限；每连接内存来源和空闲政策在建立时确定。没有进展的任务不能无限重置期限，也不能将未关闭资源从账本中删去。
 
-libfs 管理 `prefix → DirectoryGrant` 私有 namespace，负责路径规范化、最长前缀、走路、符号链接展开、Delegate 与从 LauncherParcel 组装初始 grants。它不承担所有系统服务的强制基础层；boot-critical endpoint 仍可直接 GRANT。
+## FAL 与文件客户端
 
-## 驱动框架（libdrv）
+libfal 拥有 wire、值编码、授权上下文、provider interface 和可替换的后端积木。codec 不依赖 memfs；memfs 只是一种正式后端，不把测试政策嵌进 provider 主循环。
 
-libdrv 在 MMIO/IRQ/DMA capabilities、badged service sender、消息和 Tunnel 上定义驱动协议与租借生命周期。设备枚举和匹配属于用户态设备管理服务，不下沉内核。
+libfs 拥有进程 namespace、稳定位置、逐步走路、符号链接、Delegate 和正式流客户端。前缀表拥有 grant，不登记由外部任意关闭的裸 Handle。boot-critical endpoint 仍可直接 grant，不要求所有服务经过文件发现。
+
+服务记录的生命周期与 schema 由 libsrv 拥有，通过通用 FAL Record 和 provider interface 投影；FAL 不硬编码系统服务路径。
+
+## Runnel 与驱动框架
+
+Runnel 的非阻塞推进、共享状态校验、通知和等待准备只有一个真值来源。阻塞门面与服务事件循环消费同一角色与状态机，不复制协议算法。构造验证失败时角色尚未建立，仍有资源的承载必须原样返还；运行期协议错误则固定不可逆终态，保留部分进度和未完成的清理责任。两类失败不能混成一个错误码后丢掉 owner。Runnel 不拥有文件完成、注册记录或上层取消政策。
+
+libdrv 在 MMIO、IRQ、DMA、显式 endpoint、消息和 Tunnel 上定义驱动协议。设备枚举、匹配和租借政策留在用户态设备管理服务，不进入通用事件机制或内核。

@@ -139,6 +139,8 @@ impl TableFrameOwner for frame::FundedTableFrame {
     }
 }
 
+pub(crate) mod selftest;
+
 struct TableMem;
 
 impl TableFrameMemory for TableMem {
@@ -578,21 +580,25 @@ impl PreparedMemoryChange {
 
     /// 指令流同步需求由已准备事务中的真实翻译意图推导，避免调用点遗漏 RX Map。
     pub(crate) fn requires_instruction_sync(&self) -> bool {
-        self.get().change.translation_intents().iter().any(|intent| {
-            matches!(
-                intent,
-                TranslationIntent::Install {
-                    protection: Protection::ReadExecute,
-                    ..
-                } | TranslationIntent::Protect {
-                    from: Protection::ReadExecute,
-                    ..
-                } | TranslationIntent::Protect {
-                    to: Protection::ReadExecute,
-                    ..
-                }
-            )
-        })
+        self.get()
+            .change
+            .translation_intents()
+            .iter()
+            .any(|intent| {
+                matches!(
+                    intent,
+                    TranslationIntent::Install {
+                        protection: Protection::ReadExecute,
+                        ..
+                    } | TranslationIntent::Protect {
+                        from: Protection::ReadExecute,
+                        ..
+                    } | TranslationIntent::Protect {
+                        to: Protection::ReadExecute,
+                        ..
+                    }
+                )
+            })
     }
 
     fn allocate() -> Result<Self, SpaceError> {
@@ -1363,7 +1369,7 @@ enum CompletionFinalization {
 
 pub(crate) struct MemoryChangeCompletion {
     process: Arc<Process>,
-    waiter: Arc<super::wait::WaitContext>,
+    waiter: super::wait::WaitIdentity,
     retire: Option<Arc<dyn MemoryRetireSink>>,
     finalization: crate::sync::Spinlock<Option<CompletionFinalization>>,
     published: crate::sync::Spinlock<Option<PublishedSpaceChange>>,
@@ -1377,7 +1383,7 @@ pub(crate) struct MemoryChangeCompletion {
 impl MemoryChangeCompletion {
     fn new(
         process: Arc<Process>,
-        waiter: Arc<super::wait::WaitContext>,
+        waiter: super::wait::WaitIdentity,
         retire: Option<Arc<dyn MemoryRetireSink>>,
         result_obligation: Option<super::thread::ThreadResultObligation>,
         change_metadata: super::resources::MemoryChangePermit,
@@ -1421,10 +1427,8 @@ impl MemoryChangeCompletion {
                 used += 1;
                 match stage {
                     CompletionFinalization::PublishMandatory => {
-                        if self.process.lifecycle.complete_mandatory()
-                            && let Some(control) = self.process.control()
-                        {
-                            control.publish_reapable();
+                        if self.process.lifecycle.complete_mandatory() {
+                            self.process.publish_reapable();
                         }
                         {
                             let mut finalization = self.finalization.lock();
@@ -1508,7 +1512,7 @@ pub(crate) fn prepare_memory_completion(
         super::resources::MetadataSponsor::reserve_memory_operation(process.resources.metadata())?;
     let (change_metadata, wait_metadata, remote_metadata) = metadata.into_parts();
     let work = crate::deferred_work::reserve().map_err(|_| SystemCallError::ReachLimit)?;
-    let (waiter, plan) = super::wait::prepare_memory(value, wait_metadata)?;
+    let (waiter, plan) = super::wait::prepare_kernel(value, wait_metadata)?;
     let completion = Arc::try_new(MemoryChangeCompletion::new(
         process,
         waiter,
@@ -1870,7 +1874,7 @@ impl AddressSpace {
             return Err(ShootdownChanged);
         }
         lifecycle
-            .commit_if_current(execution, mandatory, |active| {
+            .commit_running(Some(execution), mandatory, |active| {
                 debug_assert_eq!(active, execution.active());
                 let result = publish(&mut state);
                 let epochs = self.publish_epochs(instruction);
@@ -4301,7 +4305,7 @@ enum DrainFinalization {
 
 struct DrainState {
     cursor: usize,
-    pending_close: Option<super::handle::ProcessHandleEntry>,
+    pending_close: Option<super::handle::PendingClose>,
     finalization: Option<DrainFinalization>,
 }
 
@@ -4322,10 +4326,15 @@ pub struct Process {
     pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
     /// 生命周期状态机（顶级锁，见 lifecycle 模块锁序契约）。
     pub(crate) lifecycle: super::lifecycle::Lifecycle,
+    pub(crate) reapable_dependency: crate::deferred_work::Dependency,
     /// 观察壳的 weak 回指（REAPABLE/Dead 发布触达；HandleTable 条目强持 shell）。
     control: crate::sync::Spinlock<Option<alloc::sync::Weak<super::process::ProcessControl>>>,
     /// Drain 并发批次仲裁（try_lock；持锁期间推进有界收束）。
     pub(crate) drain_gate: crate::sync::Spinlock<()>,
+    pub(crate) drain_active: AtomicBool,
+    pub(crate) drain_waiter: Arc<super::wait::WaitContext>,
+    pub(crate) finalization_dependency: crate::deferred_work::Dependency,
+    finalization_debt: crate::sync::Spinlock<Option<crate::deferred_work::FinalizationReservation>>,
     /// HandleTable 收束游标与待关闭项（均由 drain_gate 串行）。
     drain_state: crate::sync::Spinlock<DrainState>,
     /// ProcessStart 提交点一次性冻结的执行绑定：非零域编号与执行需求；
@@ -4359,6 +4368,13 @@ impl Process {
     ) -> Result<Self, SpaceError> {
         let termination =
             crate::deferred_work::reserve_termination().map_err(|_| SpaceError::NoFrame)?;
+        let wait_metadata =
+            super::resources::MetadataSponsor::reserve_kernel_wait(resources.metadata())
+                .map_err(|_| SpaceError::NoFrame)?;
+        let drain_waiter =
+            super::wait::prepare_request(wait_metadata).map_err(|_| SpaceError::NoFrame)?;
+        let finalization_debt =
+            crate::deferred_work::reserve_finalization().map_err(|_| SpaceError::NoFrame)?;
         Ok(Self {
             pid,
             parent,
@@ -4372,7 +4388,15 @@ impl Process {
             ),
             lifecycle: super::lifecycle::Lifecycle::building(),
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
+            reapable_dependency: crate::deferred_work::Dependency::new(),
             drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
+            drain_active: AtomicBool::new(false),
+            drain_waiter,
+            finalization_dependency: crate::deferred_work::Dependency::new(),
+            finalization_debt: crate::sync::Spinlock::new(
+                crate::sync::ranks::LEAF,
+                Some(finalization_debt),
+            ),
             drain_state: crate::sync::Spinlock::new(
                 crate::sync::ranks::DRAIN_CURSOR,
                 DrainState {
@@ -4542,11 +4566,27 @@ impl Process {
         self.job.upgrade().expect("process outlives its job")
     }
 
+    pub(crate) fn publish_reapable(&self) {
+        self.reapable_dependency.notify();
+        if let Some(control) = self.control() {
+            control.publish_reapable();
+        }
+    }
+
+    pub(crate) fn drain_dependency(&self) -> super::request::FinishDependency {
+        self.drain_state
+            .lock()
+            .pending_close
+            .as_ref()
+            .expect("blocked drain lost its pending retirement")
+            .dependency()
+    }
+
     /// 有界收束一批（drain_gate 持有下调用）：先 HandleTable（对象 close
     /// 回调锁外执行，仍可用地址空间解除外部映射），后 AddressSpace，再推进
     /// 持久化终段。终段把 `publish_dead`、Job 成员摘除和祖先 CLOSED 传播
     /// 纳入同一预算；返回 Complete 前这些责任必须全部交付。
-    pub(crate) fn drain_batch(&self, budget: usize) -> (usize, bool) {
+    pub(crate) fn drain_batch(self: &Arc<Self>, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
         let mut work = 0;
 
@@ -4554,9 +4594,10 @@ impl Process {
         // 只消耗一次 close callback work unit。
         let pending = self.drain_state.lock().pending_close.take();
         if let Some(entry) = pending {
-            super::handle::close_entry(entry, self, true);
-            work += 1;
-            if work == budget {
+            let (used, remaining) = entry.advance(self, budget);
+            work += used;
+            if remaining.is_some() || work == budget {
+                self.drain_state.lock().pending_close = remaining;
                 return (work, false);
             }
         }
@@ -4566,6 +4607,12 @@ impl Process {
             if let Some(finalization) = finalization {
                 match finalization {
                     DrainFinalization::PublishDead => {
+                        let reservation = self
+                            .finalization_debt
+                            .lock()
+                            .take()
+                            .expect("process finalization published twice");
+                        reservation.publish(self.clone());
                         let (_state, reason, code) = self.lifecycle.snapshot();
                         if let Some(control) = self.control() {
                             control.publish_dead(self.pid, self.parent, reason, code);
@@ -4617,12 +4664,17 @@ impl Process {
             work += scanned;
             match outcome {
                 super::handle::TakeNext::Entry(entry) if work == budget => {
-                    self.drain_state.lock().pending_close = Some(entry);
+                    self.drain_state.lock().pending_close =
+                        Some(super::handle::PendingClose::Entry(entry));
                     return (work, false);
                 }
                 super::handle::TakeNext::Entry(entry) => {
-                    super::handle::close_entry(entry, self, true);
-                    work += 1;
+                    let (used, remaining) = super::handle::retire_entry(entry, self, budget - work);
+                    work += used;
+                    if remaining.is_some() {
+                        self.drain_state.lock().pending_close = remaining;
+                        return (work, false);
+                    }
                 }
                 super::handle::TakeNext::Progress => return (work, false),
                 super::handle::TakeNext::Exhausted if work == budget => return (work, false),

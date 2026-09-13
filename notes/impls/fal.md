@@ -1,6 +1,6 @@
 # FAL 实现现状
 
-方向见 [`../ideas/fal.md`](../ideas/fal.md) 与 [`../ideas/fs.md`](../ideas/fs.md)。通用 RpcPrefix/Caller 的实现由 [`rpc.md`](rpc.md) 唯一拥有；本篇只记录 FAL wire、provider、libfs 与当前验收边界。
+方向见 [`../ideas/fal.md`](../ideas/fal.md) 与 [`../ideas/fs.md`](../ideas/fs.md)。通用 RpcPrefix/Caller 的实现由 [`rpc.md`](rpc.md) 唯一拥有；本篇只记录 FAL wire、provider、libfs 与当前验收边界。正式服务方案已由 [`FAL 整体计划`](../../plans/todo-2026-09-fal-service-capabilities.md) 冻结但尚未实施，以下 v1、临时 anchor 和同进程验收仍是当前代码事实。
 
 ## libfal
 

@@ -198,7 +198,7 @@ pub enum ProcessDrainStatus {
 }
 
 /// 单次 Drain 的工作上界（内核封顶；work unit 由内核定义）。
-pub const PROCESS_DRAIN_MAX: u32 = 256;
+pub const PROCESS_DRAIN_MAX: u32 = crate::call::DRAIN_WORK_MAX;
 
 /// JobId(u64) type；全局单调不复用，与 Pid 分立空间，root 恒为 1。
 pub type JobId = u64;

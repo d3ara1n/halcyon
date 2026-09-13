@@ -27,7 +27,6 @@ struct NotificationState {
 }
 
 pub struct Notification {
-    #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
     state: Spinlock<NotificationState>,
 }
@@ -132,14 +131,10 @@ impl KernelObject for Notification {
                 let mut state = self.state.lock();
                 state.wait.advance_waiter()
             };
-            match advance {
-                super::object::WaitAdvance::Progress => used += 1,
-                super::object::WaitAdvance::Complete(context) => {
-                    super::wait::finish_offered(context);
-                    used += 1;
-                }
-                super::object::WaitAdvance::Done => return (used, true),
+            if advance.finish() {
+                return (used, true);
             }
+            used += 1;
         }
         (used, false)
     }
@@ -180,8 +175,17 @@ impl KernelObject for Notification {
         self.state.lock().wait.subscribe(subscription)
     }
 
+    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
+        self.state.lock().wait.rearm_observer(id)
+    }
+
+    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
+        self.state.lock().wait.cancel_observer(id)
+    }
+
     fn unsubscribe(&self, id: u64) {
-        self.state.lock().wait.unsubscribe(id);
+        let retired = self.state.lock().wait.unsubscribe(id);
+        drop(retired);
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {

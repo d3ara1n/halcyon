@@ -1,76 +1,71 @@
 # IPC 对象实现
 
-当前 IPC 控制面由进程本地 HandleTable、内核对象、统一等待、Mailbox 与 Notification 组成。共享 ABI 位于 `shared/src/{object,message,wait,startup,call}.rs`，用户封装位于 `user/rinlib/src/ipc/`；Tunnel 与 Runnel 的实现分别见 [`tunnel.md`](tunnel.md) 与 [`runnel.md`](runnel.md)。
+公共对象、消息、观察与内核退休前置 #13 已完成。ABI 位于 `shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/rinlib/src/ipc/`。施工证据见 [公共前置档案](../../plans/archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)。公共时间 #14、运输/RPC/服务执行 #15 和 FAL 业务仍未完成，不能把本前置完成视为总体交付。
 
-## Handle entry 与运输
+## Handle 与对象身份
 
-`os/handle_table` 是纯逻辑 generation slot 表。entry 保存 object、role、rights 与 immutable badge；duplicate、rights 裁剪、TRANSIT 和 GRANT 都保持 badge。
+`os/handle_table` 保存 generation slot、object、role、rights。目标槽先 reserve，失败 rollback 推进 generation；准备后的 commit 不分配。消息移动要求 TRANSIT，Building direct grant 要求 GRANT；请求权限必须属于源 entry 与目标 role 的权限交集。所有最后引用及 close callback 在表锁外交接。
 
-- `extract_moves` 要求 TRANSIT，供 Mailbox message；
-- 普通 direct grant 要求 GRANT；
-- ProcessGrant direct grant 复用同一 entry/rights 模型，受保护 builder 与 transfer entries 的 pin/提交事务见 [`startup.md`](startup.md)。
+`ObjectHeader` 使用不回绕 KOID。HandleQuery 只描述已有对象的 kind、role、rights、badge 与关联身份，不按身份打开对象或授予权限。Mailbox/Notification/WaitSet owner 不可 DUPLICATE/TRANSIT，但可按明确 GRANT 权限直接移交；Tunnel Endpoint 依赖本地 VM lease，不可作为非映射 Capability 运输。
 
-`task/handle.rs` 校验对象最大 rights，并在表锁外执行 close callback。Mailbox/Notification owner 可直接 GRANT，不可 TRANSIT；sender、signaler、send-once 与 Tunnel Invitation 可按 role TRANSIT/GRANT；Tunnel Endpoint 与本地 VM lease 绑定，不可运输。
+rinlib `Capability` 拥有合法非映射 entry，适用于叶对象和 affine owner；包装不自动授予 TRANSIT/GRANT。`into_raw` 移交唯一责任，失败 close 返还 owner；Drop 使用 `close_object_owner`，允许等待预付的内核退休，返回错误报告不变量破坏，不静默丢弃责任。WaitSet 的 `create_with_rights` 支持显式 GRANT，默认 `create` 权限仍为 READ/WAIT/MANAGE；`into_capability` 消耗原 owner，不复制关闭责任。
 
-## 生命周期 control roles
+## Mailbox 与交付
 
-ProcessControl 与 JobControl 的 Handle close/transit 都只消散 authority，不触发 kill、seal 或递归收束。ProcessBuilder 是 affine 构造 authority：最后一个 builder 消散时，Building process 以 Abandoned 进入终止路径。
+MailboxCreate 只交付 owner。MintSender 要求 owner MANAGE，原子创建独立 MailboxSender 和对应 LifetimeObserver。sender 的 KOID/badge 不可变，并强持目标队列；duplicate、once 派生和 move 保持该上下文。MessageHeader 的 PID 是来源信息，badge/context ID 是目标发送授权；内核生成，不由 payload 声明。
 
-ProcessControl 的电平分两阶段：REAPABLE 表示线程和 active hart 已离场，可执行 ProcessDrain；CLOSED 表示 HandleTable 与 AddressSpace 已完成收束、终态快照已冻结。JobControl CLOSED 表示本 Job 已 sealed 且直接成员/child Jobs 全部 Dead。
+Lifetime 只记录被观察的 sender KOID，不反向保活授权。最后 sender 引用释放时发布 CLOSED。每条 Message 的 affine Delivery 强持发送上下文；排队、接收预留、已安装接收能力均保留这项责任。Delivery 的 role 仅允许 TRANSIT/GRANT，不可 DUPLICATE。
 
-所属 Job 强持未 Dead Process core。若全部 ProcessControl shells 消散，JobDerive 可从成员 core 重新铸造单一 shell，并重放 REAPABLE 或 CLOSED，使管理者仍能完成 drain。
+队列上限为 16，每条最多 8 项业务 transit 加 1 项 Delivery。`MailboxState::publish` 从完整状态推导信号：READABLE 当且仅当队列非空且无 receiving，WRITABLE 的占用包含 receiving 占位；关闭冻结 CLOSED 并清除可读/可写。预留期间 Peek/Discard/另一 Receive 返回 Busy。
 
-## Mailbox 与 badge
+Send 按 HandleTable → Mailbox 锁阶准备 moves、Delivery、消息及容量，在同一提交内检查原 Deadline；失败保留 moves/once，成功才消费。Receive 初检输出后预留队头与目标槽，`finish_receive` 复制成功后原子交付；失败先退款表槽与队头，锁外通知。owner 已关闭时拒绝回插并锁外关闭 transit，成功复制则交付已经独立预留的消息。Discard/owner close 的队列析构在源锁外，fanout 有固定容量界限。
 
-`task/mailbox.rs` 实现唯一 owner、多 sender、16 条 FIFO、READABLE/WRITABLE/CLOSED 与 transit entries。
+rinlib `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
-MailboxCreate 原子返回 owner 与 badge-0 sender。MailboxMintSender 要求 owner MANAGE，铸造同对象 sender role、调用者指定 badge 和收窄 rights；MakeSendOnce 保持源 badge。
+## 通知与等待
 
-Send 在 `HandleTable → Mailbox` 锁序下，以当前 pid 和目标 sender badge 构造 MessageHeader。send-once target 与 moves alias 在任何摘除前拒绝。Receive 先预留目标 slots，再以 token 独占队头，完整写回后 commit；失败 rollback 且不出队。Discard 和 owner close 在对象锁外关闭 transit entries。
+Notification 保存 OR pending bits；READABLE 表示非零，Take 消费指定位。各对象的 `ObjectWaitState` 在源锁内记录 inactive→active 完整快照与 serial。通知与终态退休共用 `select_snapshot`，按未见且相关的最小 serial 选择，不按 signal 位序；无候选时当前 CLOSED 是终态 fallback。
 
-事务窗口内 READABLE/WRITABLE 是乐观电平；并发者可能得到一次 ObjectBusy 或操作条件已变化，回环重查不会丢事件。
+立即命中/拒绝安装、取消、扫描和 unsubscribe 都交出完整 retired Subscription。`WaitAdvance::finish` 在来源锁外释放引用及执行跨对象工作。CLOSED 下 Complete/Deferred/Lost 均摘来源槽，不依赖观察者消费事件来断开来源自环。
 
-## Notification
+`os/wait_context` 仲裁 Installing/Armed/Finishing/Done 与 outcome。WaitIdentity/WeakWaitIdentity 捕获不可回绕 epoch，lifecycle、source、timer、内存完成和请求取消都使用捕获身份。持久完成在 Done 前冻结 `(epoch,outcome)`，目标缓存按代次发布，旧回调不读取重置后的隐式当前 outcome。
 
-`task/notification.rs` 保存 OR pending bits。READABLE 只表示 pending 非零，NotificationTake 是唯一消费入口。owner 可直接 GRANT、不可 TRANSIT；signaler 可按 rights 委托。方向契约见 [`../ideas/signal.md`](../ideas/signal.md)。
+每 hart `TimerQueue` 使用 arena、索引最小堆和包含 owner/slot/generation 的稳定 token。单字 TimeoutRegistration 在 Unregistered/Token/Closed 仲裁退休责任；对象完成/错误/终止/到期只有赢家注销 token。跨 hart 删除在 owner queue 锁下进行，锁外释放 Context，owner 在下次装填点更新 timer。
 
-## WaitContext 与 Timeout
+## WaitSet 与内核退休
 
-`os/wait_context` 提供 `Installing → Armed → Finishing → Done` 和单 outcome 仲裁。`task/wait.rs` 解析 Handle/WAIT/allowed signals，在安装前暂持对象引用，在线程离开执行点后安装订阅，并负责结果交付和取消清理。
+WaitSet ABI 只有 Create/Register/Rearm/Receive/Remove 和 READABLE/CLOSED。one-shot 消费后 Rearm，在源锁内重查电平；正常 rearm 不重新分配完成存储。Remove 立即使 token/未消费 ready 失效，物理退休由内核继续。
 
-Waiting 注册现强持已验证的观察对象，Lifecycle Waiting 仍以弱 Context 供终止 continuation 定位；对象队列强持 Context。完成/取消时先取出线程 owner，再注销强注册，最后断开对象→Context 的边，避免最后一个观察 Handle 关闭时静默丢掉无限等待。`ObjectWaitState` 在 update 同锁段冻结每项命中候选，take_completer 不再重读可能已经清除的 live signals，并以游标和同一 WaitMany 的最小 item_index 规则选择候选。
+Create 预付唯一 retirement actor、普通 Close 回复与资源；Register 预付来源订阅、ready 和可复用 finish。Register/Rearm 登记 operations，跨来源工作锁外返回；actor 仅在 operations=0、cycle Done、source_id=0 时删除 registration。
 
-通知排水已改为固定槽 `notify_work::WorkDebts`：每个 RegisteredSubscription 在注册时取得一个 future-hit 槽；对象更新锁内冻结候选；同一对象以 `scheduled` 位保证至多一个在途债务，发布者只交出其中一个槽与对象来源，owner hart 每次安全点最多推进 16 步、单 debt turn 最多 4 步，剩余债务重排。Deferred 或继续存活的候选在 debt 完成后回收并重装槽，避免短暂命中后失去后续通知能力。槽耗尽在订阅安装前返回 OutOfMemory，不把失败拖到 signal 或事务提交后。已消费/取消的注册精确归还槽，WaitContext 强持来源直到注销。
+普通非空 Close 按 HandleTable → WaitSet → Lifecycle 提交 CLOSED/mandatory，摘 owner 后锁外发布 actor。成功回复表示自身退休完成；调用者终止或未安装 plan 只取消回复，不撤销 actor。CLOSED 的观察与私有 completion 分离，自观察/交叉观察不形成清理等待环。
 
-完成责任另由 WaitContext 出生时预付的 Finish 槽承载：每步只注销一个 registration 或完成一次 Ready/departure 交付。每个 Process 出生时预付 termination 槽，首次终止只发送冻结 active 位图的 IPI 并发布 continuation；continuation 每个 work unit 检查一个稳定成员槽，逐项取消 Waiting、锁外释放 Staging，空槽也计费。ThreadDeparture、MemoryChangeCompletion 与 ProcessDrain 分别在自己的固定状态机内推进；detached Tunnel close 不再另建后置 Unmap，而由 ProcessDrain 统一退役地址空间。ProcessBuilder 不公开 WAIT/CLOSED，ThreadControl 只允许真实可达的 DONE。
+`task/retirement.rs` 的预付 WorkDebt 强根独占对象推进。progress 和 completion 是独立 dependency：actor 监听前者，ProcessDrain/unpublished 监听后者。Blocked 不轮询、不计 runnable，早到 WakeToken 锁存；槽/Pending 更新在同一队列锁中，backend/source/最后引用交接在锁外。
 
-公开 ABI 参数 `timeout_ms` 是相对毫秒，零表示无限；完成原因 `WaitReason::Timeout` 的 wire 判别值为 3。内核安装时换算为单调时钟 `expires_at`。
+## ProcessDrain 继续
 
-每 hart 的 `TimerQueue` 位于独立 `os/timer_queue` 纯逻辑 crate：arena + 索引最小堆，稳定 token 含 owner slot、arena slot 与 generation；注册、取消、到期弹出 O(log n)，peek O(1)。WaitContext 的原子 `TimeoutRegistration` 在 Unregistered/Token/Closed 间仲裁：对象命中、错误、终止 Abandoned 或 Timeout 只有完成赢家负责退休 token。对象提前完成会立即从 owner queue 注销，不再强持 Context。
+Process 出生预付 reusable drain_waiter。`request.rs::DrainRequest` 捕获 Process/Control、输出、一次截断预算、累计 work 和 affine drain_active，暂停不重新解析 Handle、不重置预算。More 必须有正工作；内部零工作 Blocked 停驻同一请求。
 
-跨 hart 完成可以锁 owner queue 删除 token，但不远程重编程 owner timer；至多产生一次提前中断，owner 在下一装填点按新堆顶恢复。timer queue 锁外才析构被移除的 Context Arc。
+finish 首轮/恢复共用 StepResult。依赖按 context+epoch 登记/取消；新轮已停驻时旧取消仍拒绝。队列归还容量/Pending、请求/依赖退役后才 Done，锁外交付 admitted thread 或 Departure。间接结果写回失败冻结 caller Fault/StoreAccess；普通 WaitMany 仅观察，输出失败返回 MemoryNotAccessible。
 
-`clear_active` 与 `park_waiting` 之间若进程已 Terminating，安装者以 Abandoned 完成仍处于 Installing 的 Context，并确认线程离场；不会遗留 lifecycle 成员。用户显式 Cancelled ABI尚未接入，终止 Abandoned 不回用户态。
+Job 摘除前转交预付 Finalization 强根。后台与 Native 共用 drain_gate/游标；Native active 时后台停驻，DrainRequest Drop 先清 active 再通知。Caller/Control 消散不丢终段传播，完成后才释放根。
 
-异步 WaitMany 写回与同步 syscall 输出不同：结果页复检失败经 MemoryNotAccessible 返回等待线程，不杀进程。ThreadSpawn 已接入，同进程另一线程可在等待在途时解除结果页映射，复检失败经该错误通道交付。
+## 预算与准入
 
-## Handle close callbacks
+notification/finish/retirement 共用控制安全点 16 步，对进入时已有 runnable 的后类保留最低进度。运行中才出现的类别不保证同轮完成；下一安全点按实际 pending 参与预算。deferred memory/unpublished/termination/finalization 另共用独立 16 步，不合称全局单一 16。
 
-ProcessDrain 的阶段、预算与 pending close 由 [`task.md`](task.md) 唯一记录。本篇只拥有 Handle 摘出后的控制面对象收束语义。Mailbox 队列上限为 16 条、每条最多 8 个 transit entries，因此 owner close 的运输 fanout 至多 128；对象订阅上限为 1024，每个 WaitContext 最多 64 项，完成方在对象锁外清理。具体语义：
+20 类 admission 分开对象、消息交付、注册与等待责任；真实 heap 分配仍 fallible。finish 物理槽分区 Thread 8192/Kernel 8320/Persistent 8192，注册不能借用清理预留。固定槽与计数分别验证，不把计数等同驻留字节或跨表并发库存。
 
-- Mailbox owner：关闭邮箱、完成等待者并关闭有界队列中的 transit entries；
-- sender/signaler、ProcessControl、JobControl：叶子消散；
-- Tunnel Endpoint：关闭事务与 detached retire 见 [`tunnel.md`](tunnel.md) 和 [`mm.md`](mm.md)，本篇只负责 Handle close 的分派边界；
-- Tunnel Invitation：放弃未 attach 一侧并通知创建端，具体连接状态见 [`tunnel.md`](tunnel.md)；
-- WaitContext 不在 HandleTable，由终止路径单独取消。
+## 验证证据
 
-## 数据面索引
+- `wait_set/selftest.rs`：旧回调、Closed seen/迟到安装、通知/退休先行历史、反位序多 interest、终态 Deferred、operations 门、来源 reset × Remove/Close、两种三类压力和实际固定槽退款。
+- `retirement/selftest.rs`：Taken/业务完成/槽交回/新责任的排列，未安装 Close 取消、ticket 早晚 wake、actor 最后根、actor/Kernel finish/Object 构造耗尽退款。
+- `task/selftest.rs` 与 `wait_set/selftest/continuation.rs`：真实空间/域准入/等待安装/终止债务；Native parked 2/8 后恢复恰剩余 6；兄弟撤输出页冻结 StoreAccess；复用新轮也 parked，旧 epoch 不取消新依赖；所有 Pool/metadata/control/deferred/actor 退款。Ready 前夹具不执行用户指令或证明远端 shootdown。
+- `mailbox/selftest.rs`：预留 Busy/精确电平、真实撤页后 partial header 回滚、旧编号跨新槽仍 Stale、完整 payload/业务及 Delivery KOID 保持、Lifetime 实装通知、full/closed-owner 失败与退款。
+- `srv_init/public_ipc.rs`：真实双用户接收线程，确定性 FIFO 交接及 forced Full 后自由竞争，64 条 4096-byte payload/独立授权，不丢不重、单接收者顺序、once/Delivery/Lifetime 收束；非空转换 Drop；两跨进程 CLOSED 提交后 kill，两个目标精确终因和 Pool charge 退款。
+- 外部只读 GDB `artifacts/check/public-ipc-exit-gdb.log`：生产 Kill(0x131) 前 active 非零、三成员、mandatory=1；随后进入已安装 Waiting 取消，epoch=1、reusable=false/KernelResult0（Close 回复）。另 hart 用户 PC 与 actor 同时存在；只证明本次窗口，不把所有用户运行都标为 exact-window。ELF/SHA256 保留于同目录。
+- 最终日志 `artifacts/check/public-ipc-final-{core,sifive,release,nofd,boot-failure,clippy,host,shared-host}.log`：正常 core/平台/release/nofd、三种 Failed 全 hart 停驻、七面 lint、140+23 host 测试通过。普通路线 required anchors 包含全部新增公共自检与用户组合。
 
-Tunnel 的 Connection、Endpoint、Invitation、映射与关闭见 [`tunnel.md`](tunnel.md)。Runnel 的页内布局、角色视图、游标、内存序与门铃封装见 [`runnel.md`](runnel.md)。本篇不重复定义数据面对象的 backing、view 或协议不变量。
+完整 stress 的先前 300s Tunnel 截断与后续概率 15/16 未宣称修复或通过。用户延期的观测/判定工作唯一在 [验收可靠性任务](../../plans/todo-2026-09-13-acceptance-reliability.md)，不豁免新发现的正确性问题。本前置纳入 `task/fal-service-capabilities` 的混合集成基线，提交定位见 FAL 总计划交接节；不执行总体 acceptance/stress 收尾，不完成时间/执行/FAL。
 
-## 验证入口
-
-- handle_table host：generation、reservation、badge、运输、consume/transfer pin 与 rights 回滚；
-- wait_context/timer_queue host：安装窗口、唯一赢家、token generation/owner、堆删除与 cancel/expiry 竞争；
-- init core acceptance：badge、send-once、满箱/WRITABLE、Notification 与 WaitMany 确定性通路；Tunnel/Runnel 相关验收分别由 [`tunnel.md`](tunnel.md) 与 [`runnel.md`](runnel.md) 记录；stress workload 追加重复 control/Tunnel 生命周期、ProcessDrain `max_work=1` 和完整竞态矩阵；
-- QEMU：`virt`/release/hetero/nofd/sifive_u 分别验证 core 与平台差异，`virt-stress` 验证 16/16 竞态、公开 MemoryMap/Protect/Unmap、异 hart kill、guard fault 局部收束及压力回收；全部路线由 workload、服务监督、资源收束与 reset 终态的 fail-closed 锚点判定。
+Tunnel/Endpoint/backing 的机制见 [tunnel.md](tunnel.md) 与 [mm.md](mm.md)，Runnel 数据布局见 [runnel.md](runnel.md)，ProcessDrain 业务游标与 Job 生命周期见 [task.md](task.md)。

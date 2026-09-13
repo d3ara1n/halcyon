@@ -32,14 +32,11 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 
 use erhino_shared::proc::{PROCESS_MAX_THREADS, ProcessExitReason, ProcessState, Tid};
 
-use super::wait::WaitContext;
+use super::wait::{WaitIdentity, WeakWaitIdentity};
 
 /// 成员表条目：线程容器状态（容器真值）。
 #[derive(Clone)]
@@ -56,7 +53,7 @@ pub(crate) enum ThreadState {
     /// 在某 hart 执行点上；线程强引用由调度循环持有，IPI 吸收。
     Running { slot: usize },
     /// 无容器等待中；线程强引用由 WaitContext 持有，经 weak 触达取消。
-    Waiting { context: Weak<WaitContext> },
+    Waiting { context: WeakWaitIdentity },
     /// 已冻结终因、正在退出路径上（自杀线程或终止取消接管；reap /
     /// 完成方收尾摘除）。
     Exiting,
@@ -129,7 +126,7 @@ impl MemberSlot {
 /// 在锁外逐稳定槽驱动。
 pub(crate) enum TerminationSlot {
     Vacant,
-    Waiting(Weak<WaitContext>),
+    Waiting(WeakWaitIdentity),
     Staging(Arc<super::Thread>),
 }
 
@@ -336,18 +333,20 @@ impl Lifecycle {
         )
     }
 
-    /// Commit 在 AddressSpace 锁内重进 execution gate；闭包只允许执行已经
-    /// Reserve 完成、不可失败的短发布，锁外工作由返回 token 承接。
-    pub(crate) fn commit_if_current<R>(
+    /// Running 提交门；需要执行集合稳定的操作另外验证快照。
+    /// 闭包只执行已准备、不可失败的短发布，必成计数与提交在同一锁内成立。
+    pub(crate) fn commit_running<R>(
         &self,
-        snapshot: ExecutionSnapshot,
+        snapshot: Option<ExecutionSnapshot>,
         mandatory: bool,
         commit: impl FnOnce(u64) -> R,
     ) -> Result<R, ExecutionChanged> {
         let mut inner = self.inner.lock();
+        let execution_changed = snapshot.is_some_and(|snapshot| {
+            inner.execution_sequence != snapshot.sequence || inner.active != snapshot.active
+        });
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running)
-            || inner.execution_sequence != snapshot.sequence
-            || inner.active != snapshot.active
+            || execution_changed
         {
             return Err(ExecutionChanged);
         }
@@ -593,11 +592,7 @@ impl Lifecycle {
 
     /// park 发布线性化：Running → Waiting；已 Terminating 返回 false，
     /// 调用方不得发布等待，改走 Abandoned 取消。
-    pub(crate) fn park_waiting(
-        &self,
-        member: MemberKey,
-        context: &alloc::sync::Arc<WaitContext>,
-    ) -> bool {
+    pub(crate) fn park_waiting(&self, member: MemberKey, context: &WaitIdentity) -> bool {
         let mut inner = self.inner.lock();
         if self.is_terminating() {
             return false;
@@ -611,7 +606,7 @@ impl Lifecycle {
             debug_assert!(false, "parking thread must be Running");
         }
         entry.state = ThreadState::Waiting {
-            context: alloc::sync::Arc::downgrade(context),
+            context: context.downgrade(),
         };
         true
     }

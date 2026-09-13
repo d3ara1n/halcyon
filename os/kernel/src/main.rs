@@ -26,6 +26,7 @@ mod board;
 mod fp;
 // 执行环境准备态模块：原子切换接线后 dead_code 预期消除。
 mod boot;
+mod clock;
 mod context;
 mod csr;
 mod deferred_work;
@@ -140,7 +141,7 @@ pub fn main() {
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
     frame::release_device_tree(&board);
-    sched::init(board.timebase);
+    clock::init(board.timebase as u64);
     if let Some((addr, len)) = board.boot_package {
         rt::set_boot_package_region(addr, len);
     }

@@ -1,5 +1,8 @@
 use num_derive::{FromPrimitive, ToPrimitive};
 
+/// 单次资源收束的内核工作政策上限；对象仍可请求更小预算。
+pub const DRAIN_WORK_MAX: u32 = 256;
+
 /// Predefined system call errors
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
@@ -56,6 +59,10 @@ pub enum SystemCallError {
     WrongObjectType = 0x3a,
     /// Handle generation 已不匹配槽位。
     StaleHandle = 0x3b,
+    /// 单调时钟或期限超出本次启动支持的区间。
+    ClockRange = 0x3c,
+    /// 投递线性化点前期限已到，全部源能力未消费。
+    DeadlineExpired = 0x3d,
 }
 
 /// Predefined system calls
@@ -110,7 +117,7 @@ pub enum SystemCall {
     ThreadYield = 0x21,
     /// 由 ThreadStartContext 创建线程并写出 ThreadSpawnResult。
     ThreadSpawn = 0x22,
-    /// 当前线程睡眠指定毫秒（异步：登记期限后 Waiting，到期唤醒）
+    /// 当前线程等待绝对 Deadline（异步：Waiting，到期唤醒）。
     Sleep = 0x25,
     // -----对象与等待-----
     /// 关闭一个进程本地 Handle。
@@ -125,9 +132,23 @@ pub enum SystemCall {
     NotificationSignal = 0x34,
     /// 原子取走 Notification 待决位。
     NotificationTake = 0x35,
+    /// 无 capability 的公共单调时钟快照。
+    MonotonicNow = 0x36,
+    /// 查询本进程 Handle 的对象、role、rights 和关联身份。
+    HandleQuery = 0x37,
+    /// 创建有显式注册容量的持久观察集合。
+    WaitSetCreate = 0x38,
+    /// 注册一个来源并交付不复用的 token。
+    WaitSetRegister = 0x39,
+    /// 为已消费的 registration 建立新 arm 周期。
+    WaitSetRearm = 0x3a,
+    /// 原子接收有界 ready 批次。
+    WaitSetReceive = 0x3b,
+    /// 撤销 token 的后续 ready 交付并启动源清理。
+    WaitSetRemove = 0x3c,
 
     // -----消息-----
-    /// 创建 Mailbox receiver-owner/sender 对。
+    /// 创建唯一 Mailbox receiver-owner。
     MailboxCreate = 0x40,
     /// 向 sender Handle 指向的邮箱原子投递消息和 Handle moves。
     Send = 0x41,

@@ -34,7 +34,7 @@ fn attach_request(invitation: Handle, va: usize, output: usize) -> TunnelAttachR
 struct Inventory {
     pool: MemoryPoolSnapshot,
     frames: usize,
-    metadata: [usize; 16],
+    metadata: [usize; resources::ADMISSION_CLASSES],
 }
 
 impl Inventory {

@@ -8,5 +8,12 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-serde = { version = "1.0", default-features = false, features = ["derive"] }
-postcard = "1.0"
+metadata_admission = { path = "../../../os/metadata_admission" }
+monotonic_id = { path = "../../../os/monotonic_id" }
+ordered_table = { path = "../../../os/ordered_table" }
+timer_queue = { path = "../../../os/timer_queue" }
+erhino_shared = { path = "../../../shared" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }
+librpc = { path = "../librpc" }

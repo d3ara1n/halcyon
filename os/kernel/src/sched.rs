@@ -10,11 +10,13 @@
 
 use core::{
     arch::asm,
-    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use ready_queue::{Admission, ReadyQueue};
+
+pub(crate) mod selftest;
 
 use crate::sbi::DISARM;
 use crate::sync::Spinlock;
@@ -272,7 +274,7 @@ pub(crate) fn domain_by_index(index: usize) -> &'static SchedDomain {
 /// per-hart 期限队列：期限主人是登记 hart（唤醒所有权），登记、arm、
 /// 到期弹出与 idle 装填只碰本 hart 队列。跨 hart 完成仅按 token 锁住
 /// owner queue 删除项，且不远程重编程 owner timer。
-static HART_TIMERS: [Spinlock<timer_queue::TimerQueue<Arc<crate::task::wait::WaitContext>>>;
+static HART_TIMERS: [Spinlock<timer_queue::TimerQueue<crate::task::wait::WaitIdentity>>;
     hart::HART_NUM_LIMIT] =
     [const { Spinlock::new(crate::sync::ranks::LEAF, timer_queue::TimerQueue::unbound()) };
         hart::HART_NUM_LIMIT];
@@ -280,7 +282,7 @@ static HART_TIMERS: [Spinlock<timer_queue::TimerQueue<Arc<crate::task::wait::Wai
 /// 本 hart 的期限队列（slot 由 formal entry 设置，调用点均在调度循环或
 /// 其 Park 发布路径内）。
 #[inline]
-fn timers() -> &'static Spinlock<timer_queue::TimerQueue<Arc<crate::task::wait::WaitContext>>> {
+fn timers() -> &'static Spinlock<timer_queue::TimerQueue<crate::task::wait::WaitIdentity>> {
     &HART_TIMERS[hart::current().slot()]
 }
 
@@ -299,14 +301,10 @@ pub fn park_request_wait(plan: crate::task::wait::WaitPlan) {
     *slot = Some(plan);
 }
 
-pub fn expires_after_ms(timeout_ms: u64) -> u64 {
-    sbi::read_time().saturating_add(timeout_ms.saturating_mul(ticks_per_ms()))
-}
-
 /// 在发起 hart 的期限队列登记等待，并立刻按新堆顶装填本地时钟。
 pub(crate) fn register_wait_timeout(
     expires_at: u64,
-    context: Arc<crate::task::wait::WaitContext>,
+    context: crate::task::wait::WaitIdentity,
 ) -> Result<timer_queue::TimerToken, ()> {
     let owner_slot = hart::current().slot();
     let mut timers = timers().lock();
@@ -328,24 +326,8 @@ pub(crate) fn unregister_wait_timeout(token: timer_queue::TimerToken) {
     drop(removed);
 }
 
-/// 每毫秒 tick 数（init 时按 timebase 换算）。
-static TICKS_PER_MS: AtomicUsize = AtomicUsize::new(1);
-
-/// 时间片量子（毫秒）。
-const QUANTUM_MS: u64 = 10;
-
-pub fn init(timebase: usize) {
-    TICKS_PER_MS.store((timebase / 1000).max(1), Ordering::Relaxed);
-}
-
-fn ticks_per_ms() -> u64 {
-    TICKS_PER_MS.load(Ordering::Relaxed) as u64
-}
-
-/// 每秒 tick 数（bring_up_runtime 的上线超时计算用）。
-pub fn ticks_per_sec() -> u64 {
-    ticks_per_ms() * 1000
-}
+/// 调度量子同样从公共时钟几何取得，不能截断平台频率。
+const QUANTUM_NS: u64 = 10_000_000;
 
 /// 把本 hart 定时器设到期限队列最早到期点（队列空则不动）。
 fn arm_earliest() {
@@ -512,7 +494,8 @@ pub fn run() -> ! {
 
 /// 量子装填：时间片与本 hart 期限表最早期限取近（不睡过期）。
 fn arm_quantum() {
-    let quantum = sbi::read_time() + QUANTUM_MS * ticks_per_ms();
+    let quantum = crate::clock::after_ns(QUANTUM_NS)
+        .expect("scheduling quantum exceeds the platform clock epoch");
     let earliest = timers().lock().peek_expires_at();
     sbi::require(
         sbi::set_timer(earliest.unwrap_or(quantum).min(quantum)),

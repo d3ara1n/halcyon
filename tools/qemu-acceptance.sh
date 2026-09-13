@@ -29,6 +29,11 @@ log="artifacts/.qemu-acceptance-$$.log"
 
 required=(
     "funded frame self-test passed: full-range zeroing, split, rollback, and source refund"
+    "WaitSet deterministic interleaving checks passed:"
+    "Waiting continuation checks passed:"
+    "Mailbox ownership checks passed:"
+    "threaded mailbox receive contention passed:"
+    "committed IPC caller kill passed:"
     "acceptance domain collected"
     "all services supervised to completion"
     "peer closed observed"
@@ -54,6 +59,7 @@ case "$profile" in
         required+=(
             "acceptance workload: stress"
             "drain minimum-budget acceptance passed"
+            "retired WaitSet with 256 registrations"
             "Tunnel close/Attach failure matrix passed: 24 rounds"
             "race matrix acceptance passed: 16/16 scenarios passed"
         )

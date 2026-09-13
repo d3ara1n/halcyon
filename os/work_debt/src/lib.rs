@@ -4,8 +4,9 @@
 //! 固定容量、按 owner 分流的延后工作债务队列。
 //!
 //! 本 crate 不执行工作也不发送门铃。调用者在外部同步下于 Commit 前 Reserve，
-//! 在债务成立后 Publish；owner 以固定预算 Take，并将未完成工作 Requeue 或 Finish。
-//! Pending 电平而非门铃边沿是真值。
+//! 在债务成立后 Publish；owner 以固定预算 Take，并将工作 Requeue、Park 或 Finish。
+//! 依赖登记前取得一次性唤醒票据，先到达的 Wake 锁存在 Taken 状态。
+//! Pending 只包含可执行债务，不包含等待依赖的 Parked 债务。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReserveError {
@@ -42,6 +43,7 @@ enum Phase {
     Reserved,
     Pending,
     Taken,
+    Parked,
     Retired,
 }
 
@@ -51,6 +53,8 @@ struct Slot<T> {
     owner: usize,
     next: Option<usize>,
     value: Option<T>,
+    wake_armed: bool,
+    woken: bool,
 }
 
 impl<T> Slot<T> {
@@ -61,6 +65,8 @@ impl<T> Slot<T> {
             owner: 0,
             next: None,
             value: None,
+            wake_armed: false,
+            woken: false,
         }
     }
 }
@@ -75,8 +81,8 @@ impl TableId {
     }
 }
 
-/// 1..=5 由内核静态队列占用；运行时构造从 6 起，两个域永不碰撞。
-static NEXT_TABLE_ID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(6);
+/// 1..=7 由内核静态队列占用；运行时构造从 8 起，两个域永不碰撞。
+static NEXT_TABLE_ID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(8);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reservation {
@@ -120,6 +126,44 @@ impl FinishToken {
     }
 }
 
+/// 一次依赖的 affine 唤醒责任。必须 Wake 或 Cancel 后才能释放债务槽。
+#[derive(Debug, PartialEq, Eq)]
+pub struct WakeToken {
+    table_id: TableId,
+    owner: usize,
+    slot: usize,
+    generation: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkResult {
+    Parked,
+    /// 完成先于 Park 到达，同一债务已经重新入队。
+    Runnable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeResult {
+    /// Taken 的执行者尚未交回 payload；唤醒已锁存。
+    Latched,
+    Runnable {
+        owner: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState<D> {
+    Runnable,
+    Blocked(D),
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepResult<D> {
+    pub work_done: usize,
+    pub state: StepState<D>,
+}
+
 /// `SLOTS` 个全局债务槽按 `OWNERS` 条 FIFO 链分流。Reserve 时无需预知 owner；
 /// Publish 后槽只会出现在一条 owner 链中。
 pub struct WorkDebts<T, const OWNERS: usize, const SLOTS: usize> {
@@ -127,6 +171,7 @@ pub struct WorkDebts<T, const OWNERS: usize, const SLOTS: usize> {
     slots: [Slot<T>; SLOTS],
     heads: [Option<usize>; OWNERS],
     tails: [Option<usize>; OWNERS],
+    reserve_cursor: usize,
 }
 
 impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
@@ -138,6 +183,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
             slots: [const { Slot::empty() }; SLOTS],
             heads: [None; OWNERS],
             tails: [None; OWNERS],
+            reserve_cursor: 0,
         }
     }
 
@@ -157,13 +203,29 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
     }
 
     pub fn reserve(&mut self) -> Result<Reservation, ReserveError> {
-        let (slot, entry) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, entry)| entry.phase == Phase::Empty)
+        self.reserve_in(0..SLOTS)
+    }
+
+    /// 在调用者定义的固定分区中准入，不向其它分区借容量。
+    pub fn reserve_in(
+        &mut self,
+        range: core::ops::Range<usize>,
+    ) -> Result<Reservation, ReserveError> {
+        if range.start >= range.end || range.end > SLOTS {
+            return Err(ReserveError::Full);
+        }
+        let cursor = if range.contains(&self.reserve_cursor) {
+            self.reserve_cursor
+        } else {
+            range.start
+        };
+        let slot = (cursor..range.end)
+            .chain(range.start..cursor)
+            .find(|&slot| self.slots[slot].phase == Phase::Empty)
             .ok_or(ReserveError::Full)?;
+        let entry = &mut self.slots[slot];
         entry.phase = Phase::Reserved;
+        self.reserve_cursor = (slot + 1) % SLOTS;
         Ok(Reservation {
             table_id: self.table_id,
             slot,
@@ -226,6 +288,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
             self.tails[owner] = None;
         }
         entry.phase = Phase::Taken;
+        entry.woken = false;
         let generation = entry.generation;
         let value = entry
             .value
@@ -251,7 +314,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         let Some(entry) = self.entry_mut(slot, generation) else {
             return Err(RequeueError { token, value });
         };
-        if entry.phase != Phase::Taken || entry.owner != token.owner {
+        if entry.phase != Phase::Taken || entry.owner != token.owner || entry.wake_armed {
             return Err(RequeueError { token, value });
         }
         entry.value = Some(value);
@@ -261,6 +324,95 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         Ok(())
     }
 
+    /// 调用者在登记来源依赖前取得票据，并在来源同步下登记及复检条件。
+    /// 同一 Taken 周期至多一个依赖；票据消费前禁止 Finish/Rearm/Requeue。
+    pub fn arm_wake(&mut self, token: &FinishToken) -> Option<WakeToken> {
+        if token.table_id != self.table_id {
+            return None;
+        }
+        let entry = self.entry_mut(token.slot, token.generation)?;
+        if entry.phase != Phase::Taken
+            || entry.owner != token.owner
+            || entry.wake_armed
+            || entry.woken
+        {
+            return None;
+        }
+        entry.wake_armed = true;
+        Some(WakeToken {
+            table_id: token.table_id,
+            owner: token.owner,
+            slot: token.slot,
+            generation: token.generation,
+        })
+    }
+
+    pub fn cancel_wake(&mut self, wake: WakeToken) -> Result<(), WakeToken> {
+        if wake.table_id != self.table_id {
+            return Err(wake);
+        }
+        let Some(entry) = self.entry_mut(wake.slot, wake.generation) else {
+            return Err(wake);
+        };
+        // Parked 时取消唯一唤醒会遗留必成责任；只能由执行者取消未停驻的依赖。
+        if entry.phase != Phase::Taken || entry.owner != wake.owner || !entry.wake_armed {
+            return Err(wake);
+        }
+        entry.wake_armed = false;
+        Ok(())
+    }
+
+    /// 交回 payload 并等待已登记依赖；早到 Wake 则重新入队，不进入 Parked。
+    pub fn park(&mut self, token: FinishToken, value: T) -> Result<ParkResult, RequeueError<T>> {
+        if token.table_id != self.table_id {
+            return Err(RequeueError { token, value });
+        }
+        let Some(entry) = self.entry_mut(token.slot, token.generation) else {
+            return Err(RequeueError { token, value });
+        };
+        if entry.phase != Phase::Taken
+            || entry.owner != token.owner
+            || !(entry.wake_armed || entry.woken)
+        {
+            return Err(RequeueError { token, value });
+        }
+        entry.value = Some(value);
+        entry.next = None;
+        if entry.woken {
+            entry.woken = false;
+            entry.phase = Phase::Pending;
+            self.append(token.owner, token.slot);
+            Ok(ParkResult::Runnable)
+        } else {
+            entry.phase = Phase::Parked;
+            Ok(ParkResult::Parked)
+        }
+    }
+
+    pub fn wake(&mut self, wake: WakeToken) -> Result<WakeResult, WakeToken> {
+        if wake.table_id != self.table_id {
+            return Err(wake);
+        }
+        let Some(entry) = self.entry_mut(wake.slot, wake.generation) else {
+            return Err(wake);
+        };
+        if entry.owner != wake.owner
+            || !entry.wake_armed
+            || !matches!(entry.phase, Phase::Taken | Phase::Parked)
+        {
+            return Err(wake);
+        }
+        entry.wake_armed = false;
+        if entry.phase == Phase::Taken {
+            entry.woken = true;
+            Ok(WakeResult::Latched)
+        } else {
+            entry.phase = Phase::Pending;
+            self.append(wake.owner, wake.slot);
+            Ok(WakeResult::Runnable { owner: wake.owner })
+        }
+    }
+
     pub fn finish(&mut self, token: FinishToken) -> Result<(), FinishToken> {
         if token.table_id != self.table_id {
             return Err(token);
@@ -268,7 +420,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         let Some(entry) = self.entry_mut(token.slot, token.generation) else {
             return Err(token);
         };
-        if entry.phase != Phase::Taken || entry.owner != token.owner {
+        if entry.phase != Phase::Taken || entry.owner != token.owner || entry.wake_armed {
             return Err(token);
         }
         assert!(entry.value.is_none(), "taken slot retained work at Finish");
@@ -290,7 +442,7 @@ impl<T, const OWNERS: usize, const SLOTS: usize> WorkDebts<T, OWNERS, SLOTS> {
         let Some(entry) = self.entry_mut(token.slot, token.generation) else {
             return Err(token);
         };
-        if entry.phase != Phase::Taken || entry.owner != token.owner {
+        if entry.phase != Phase::Taken || entry.owner != token.owner || entry.wake_armed {
             return Err(token);
         }
         assert!(entry.value.is_none(), "taken slot retained work at Rearm");

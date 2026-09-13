@@ -11,9 +11,13 @@
 //! 长度和不变量，不得依赖本机 `usize`、结构体填充或未声明字节序。
 
 #![cfg_attr(not(test), no_std)]
+#![feature(allocator_api)]
 
 extern crate alloc;
 
+pub mod authority;
+pub mod backend;
+pub mod data;
 pub mod bytes;
 pub mod enumerate;
 pub mod header;
@@ -24,6 +28,12 @@ pub mod node;
 pub mod op;
 pub mod property;
 pub mod provider;
+pub mod protocol;
+pub mod store;
+pub mod value;
+
+#[cfg(target_arch = "riscv64")]
+pub mod grant;
 
 use librpc::PREFIX_LEN;
 

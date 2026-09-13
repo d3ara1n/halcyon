@@ -1,6 +1,20 @@
 //! 统一对象等待 ABI。
 
-use crate::object::{Handle, ObjectSignals};
+use crate::{
+    object::{Handle, ObjectSignals},
+    time::Deadline,
+};
+
+/// WaitMany 的完整输入；用户地址使用固定宽字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct WaitManyRequest {
+    pub items: u64,
+    pub count: u32,
+    pub reserved: u32,
+    pub result: u64,
+    pub deadline: Deadline,
+}
 
 /// 单次 WaitMany 的最大观察项数。
 pub const WAIT_MANY_MAX: usize = 64;
@@ -52,9 +66,6 @@ impl WaitReason {
     }
 }
 
-/// WaitMany 的可选超时参数值：无限等待。
-pub const WAIT_TIMEOUT_INFINITE: u64 = 0;
-
 /// WaitMany 的唯一完成结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
@@ -84,6 +95,7 @@ impl WaitResult {
 }
 
 const _: () = {
+    assert!(core::mem::size_of::<WaitManyRequest>() == 40);
     assert!(core::mem::size_of::<WaitItem>() == 32);
     assert!(core::mem::align_of::<WaitItem>() == 8);
     assert!(core::mem::size_of::<WaitResult>() == 32);

@@ -25,7 +25,8 @@
 | 内存所有权、地址空间与映射 | [mm](ideas/mm.md) | [mm](impls/mm.md) |
 | 系统调用与 remote call | [call](ideas/call.md) | [call](impls/call.md) |
 | IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象](impls/ipc.md) |
-| WaitMany 与 ObjectSignals | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |
+| ObjectSignals、WaitMany 与持久 WaitSet | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |
+| 公共单调时间与绝对期限 | [time](ideas/time.md) | [RPC 当前边界](impls/rpc.md) |
 | Notification | [signal](ideas/signal.md) | [IPC 对象](impls/ipc.md) |
 | Tunnel 与共享内存 | [tunnel](ideas/tunnel.md)、[shared-memory](ideas/shared-memory.md) | [Tunnel](impls/tunnel.md) |
 | Runnel | [runnel](ideas/runnel.md) | [Runnel](impls/runnel.md) |

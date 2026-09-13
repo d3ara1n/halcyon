@@ -11,18 +11,20 @@ use alloc::vec::Vec;
 
 const OWNER_BITS: u32 = 8;
 const SLOT_BITS: u32 = 28;
-const GENERATION_BITS: u32 = 28;
+const GENERATION_BITS: u32 = 27;
 const OWNER_MASK: u64 = (1 << OWNER_BITS) - 1;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 const GENERATION_MASK: u64 = (1 << GENERATION_BITS) - 1;
-/// 保留全一值给 WaitContext 的 Closed 状态。
-const GENERATION_MAX: u32 = GENERATION_MASK as u32 - 1;
+const GENERATION_MAX: u32 = GENERATION_MASK as u32;
 
 /// 稳定的期限注册标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerToken(u64);
 
 impl TimerToken {
+    /// 不透明 token 使用低 63 位，高位供单字 registration 控制状态使用。
+    pub const RAW_MASK: u64 = (1u64 << (OWNER_BITS + SLOT_BITS + GENERATION_BITS)) - 1;
+
     /// token 的原始稳定表示；供原子 registration 状态保存。
     pub const fn raw(self) -> u64 {
         self.0
@@ -30,7 +32,7 @@ impl TimerToken {
 
     /// 从先前由 [`Self::raw`] 取得的值恢复 token。
     ///
-    /// 调用方只能传入非零、非全一的既有 token。
+    /// 调用方只能传入既有 token，不能包含 RAW_MASK 之外的控制位。
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
@@ -72,6 +74,9 @@ enum SlotState<T> {
         value: T,
         heap_index: usize,
     },
+    Parked {
+        value: T,
+    },
     Retired,
 }
 
@@ -89,6 +94,7 @@ pub struct TimerQueue<T> {
     arena: Vec<Slot<T>>,
     free_head: Option<usize>,
     heap: Vec<usize>,
+    live: usize,
 }
 
 impl<T> TimerQueue<T> {
@@ -100,6 +106,7 @@ impl<T> TimerQueue<T> {
             arena: Vec::new(),
             free_head: None,
             heap: Vec::new(),
+            live: 0,
         }
     }
 
@@ -110,6 +117,7 @@ impl<T> TimerQueue<T> {
             arena: Vec::new(),
             free_head: None,
             heap: Vec::new(),
+            live: 0,
         }
     }
 
@@ -137,7 +145,10 @@ impl<T> TimerQueue<T> {
             return Err(AllocationFailed);
         };
         // 所有可能增长均在变更 free 链、arena 和 heap 前完成。
-        self.heap.try_reserve(1).map_err(|_| AllocationFailed)?;
+        let required = self.live.checked_add(1).ok_or(AllocationFailed)?;
+        self.heap
+            .try_reserve(required - self.heap.len())
+            .map_err(|_| AllocationFailed)?;
         if self.free_head.is_none() {
             self.arena.try_reserve(1).map_err(|_| AllocationFailed)?;
             if self.arena.len() >= SLOT_MASK as usize {
@@ -170,6 +181,7 @@ impl<T> TimerQueue<T> {
             heap_index,
         };
         self.heap.push(slot);
+        self.live += 1;
         self.sift_up(heap_index);
         Ok(TimerToken::new(owner_slot, slot, generation))
     }
@@ -180,11 +192,106 @@ impl<T> TimerQueue<T> {
             return None;
         }
         let slot = self.valid_slot(token)?;
-        let heap_index = match self.arena[slot].state {
-            SlotState::Occupied { heap_index, .. } => heap_index,
-            SlotState::Vacant { .. } | SlotState::Retired => return None,
+        match self.arena[slot].state {
+            SlotState::Occupied { heap_index, .. } => Some(self.remove_heap_index(heap_index)),
+            SlotState::Parked { .. } => {
+                let SlotState::Parked { value } =
+                    core::mem::replace(&mut self.arena[slot].state, SlotState::Retired)
+                else {
+                    unreachable!()
+                };
+                self.live -= 1;
+                self.recycle(slot);
+                Some(value)
+            }
+            SlotState::Vacant { .. } | SlotState::Retired => None,
+        }
+    }
+
+    /// 改期复用既有 arena 与堆槽，不分配、不改变 token generation。
+    pub fn reschedule(&mut self, token: TimerToken, deadline: u64) -> bool {
+        if self.owner_slot != Some(token.owner_slot()) {
+            return false;
+        }
+        let Some(slot) = self.valid_slot(token) else {
+            return false;
         };
-        Some(self.remove_heap_index(heap_index))
+        if matches!(self.arena[slot].state, SlotState::Parked { .. }) {
+            let SlotState::Parked { value } =
+                core::mem::replace(&mut self.arena[slot].state, SlotState::Retired)
+            else {
+                unreachable!()
+            };
+            let index = self.heap.len();
+            self.arena[slot].state = SlotState::Occupied {
+                expires_at: deadline,
+                value,
+                heap_index: index,
+            };
+            self.heap.push(slot);
+            self.sift_up(index);
+            return true;
+        }
+        let (old, index) = match &mut self.arena[slot].state {
+            SlotState::Occupied {
+                expires_at,
+                heap_index,
+                ..
+            } => {
+                let old = *expires_at;
+                *expires_at = deadline;
+                (old, *heap_index)
+            }
+            SlotState::Vacant { .. } | SlotState::Retired | SlotState::Parked { .. } => {
+                return false;
+            }
+        };
+        if deadline < old {
+            self.sift_up(index)
+        } else if deadline > old {
+            self.sift_down(index)
+        }
+        true
+    }
+
+    /// 暂停但保留 token、值与未来恢复所需堆容量，generation 不前进。
+    pub fn park(&mut self, token: TimerToken) -> bool {
+        if self.owner_slot != Some(token.owner_slot()) {
+            return false;
+        }
+        let Some(slot) = self.valid_slot(token) else {
+            return false;
+        };
+        let index = match self.arena[slot].state {
+            SlotState::Occupied { heap_index, .. } => heap_index,
+            SlotState::Parked { .. } => return true,
+            SlotState::Vacant { .. } | SlotState::Retired => return false,
+        };
+        let removed = self.detach_heap_index(index);
+        debug_assert_eq!(removed, slot);
+        let SlotState::Occupied { value, .. } =
+            core::mem::replace(&mut self.arena[slot].state, SlotState::Retired)
+        else {
+            unreachable!()
+        };
+        self.arena[slot].state = SlotState::Parked { value };
+        true
+    }
+
+    /// 同时取得最早项的 token、期限和值；可改期后继续持有预付槽。
+    pub fn peek(&self) -> Option<(TimerToken, u64, &T)> {
+        let slot = *self.heap.first()?;
+        let SlotState::Occupied {
+            expires_at, value, ..
+        } = &self.arena[slot].state
+        else {
+            unreachable!("timer heap points to inactive slot")
+        };
+        Some((
+            TimerToken::new(self.owner_slot?, slot, self.arena[slot].generation),
+            *expires_at,
+            value,
+        ))
     }
 
     /// 读取最早到期点；不移除。
@@ -205,11 +312,11 @@ impl<T> TimerQueue<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.heap.len()
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.live == 0
     }
 
     fn valid_slot(&self, token: TimerToken) -> Option<usize> {
@@ -221,7 +328,7 @@ impl<T> TimerQueue<T> {
     fn expires_at(&self, slot: usize) -> u64 {
         match self.arena[slot].state {
             SlotState::Occupied { expires_at, .. } => expires_at,
-            SlotState::Vacant { .. } | SlotState::Retired => {
+            SlotState::Vacant { .. } | SlotState::Retired | SlotState::Parked { .. } => {
                 unreachable!("heap names a non-live timer slot")
             }
         }
@@ -233,13 +340,13 @@ impl<T> TimerQueue<T> {
                 heap_index: current,
                 ..
             } => *current = heap_index,
-            SlotState::Vacant { .. } | SlotState::Retired => {
+            SlotState::Vacant { .. } | SlotState::Retired | SlotState::Parked { .. } => {
                 unreachable!("heap names a non-live timer slot")
             }
         }
     }
 
-    fn remove_heap_index(&mut self, heap_index: usize) -> T {
+    fn detach_heap_index(&mut self, heap_index: usize) -> usize {
         let slot = self.heap.swap_remove(heap_index);
         if heap_index < self.heap.len() {
             let replacement = self.heap[heap_index];
@@ -252,6 +359,12 @@ impl<T> TimerQueue<T> {
                 self.sift_down(heap_index);
             }
         }
+        slot
+    }
+
+    fn remove_heap_index(&mut self, heap_index: usize) -> T {
+        let slot = self.detach_heap_index(heap_index);
+        self.live -= 1;
         let state = core::mem::replace(&mut self.arena[slot].state, SlotState::Retired);
         let SlotState::Occupied { value, .. } = state else {
             unreachable!("removed timer slot was not live")
@@ -316,6 +429,44 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn parked_entries_keep_prepaid_capacity_and_allow_finite_maximum() {
+        let mut queue = TimerQueue::new(0);
+        let mut tokens = std::vec::Vec::new();
+        for value in 0..100 {
+            let token = queue.try_register(value, value).unwrap();
+            assert!(queue.park(token));
+            tokens.push(token);
+        }
+        assert_eq!(queue.len(), 100);
+        assert_eq!(queue.peek_expires_at(), None);
+        let capacity = queue.heap.capacity();
+        for token in &tokens {
+            assert!(queue.reschedule(*token, u64::MAX));
+        }
+        assert_eq!(queue.heap.capacity(), capacity);
+        assert_eq!(queue.pop_expired(u64::MAX).unwrap().1, 0);
+        for token in tokens.into_iter().skip(1) {
+            assert!(queue.cancel(token).is_some());
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn prepaid_reschedule_keeps_token_and_heap_order() {
+        let mut queue = TimerQueue::new(0);
+        let first = queue.try_register(20, 1).unwrap();
+        let second = queue.try_register(30, 2).unwrap();
+        assert!(queue.reschedule(second, 10));
+        assert_eq!(queue.peek(), Some((second, 10, &2)));
+        assert!(queue.reschedule(second, 40));
+        assert_eq!(queue.peek(), Some((first, 20, &1)));
+        assert!(queue.reschedule(first, u64::MAX));
+        assert_eq!(queue.cancel(first), Some(1));
+        assert!(!queue.reschedule(first, 0));
+        assert_eq!(queue.pop_expired(40), Some((second, 2)));
+    }
 
     #[test]
     fn unordered_registration_pops_in_expiry_order() {

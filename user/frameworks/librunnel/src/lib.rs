@@ -43,6 +43,19 @@ trait Transport {
     fn close(&mut self) -> Result<(), SystemCallError>;
 }
 
+pub struct InitFailure<T> {
+    pub owner: T,
+    pub error: RunnelError,
+}
+
+impl<T> core::fmt::Debug for InitFailure<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InitFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
 struct Channel<T> {
     transport: T,
     capacity: usize,
@@ -51,13 +64,16 @@ struct Channel<T> {
 }
 
 impl<T: Transport> Channel<T> {
-    fn new(transport: T, creator: bool) -> Result<Self, RunnelError> {
+    fn new(transport: T, creator: bool) -> Result<Self, InitFailure<T>> {
         let bytes = transport.bytes();
         if bytes < 4096
             || !bytes.is_multiple_of(4096)
             || bytes > erhino_shared::tunnel::TUNNEL_MAX_PAGES as usize * 4096
         {
-            return Err(RunnelError::BadFormat);
+            return Err(InitFailure {
+                owner: transport,
+                error: RunnelError::BadFormat,
+            });
         }
         let capacity = bytes - HEADER_BYTES;
         if creator {
@@ -77,7 +93,10 @@ impl<T: Transport> Channel<T> {
             || u64::from_le(transport.load64(0x10, Ordering::Relaxed)) != capacity as u64
             || transport.load32(0x2c, Ordering::Relaxed) != 0
         {
-            return Err(RunnelError::BadFormat);
+            return Err(InitFailure {
+                owner: transport,
+                error: RunnelError::BadFormat,
+            });
         }
         Ok(Self {
             transport,
@@ -160,14 +179,16 @@ struct ProducerCore<T> {
 }
 
 impl<T: Transport> ProducerCore<T> {
-    fn new(transport: T, creator: bool) -> Result<Self, RunnelError> {
-        let mut channel = Channel::new(transport, creator)?;
+    fn new(transport: T, creator: bool) -> Result<Self, InitFailure<T>> {
+        let channel = Channel::new(transport, creator)?;
         if channel.transport.load64(HEAD, Ordering::Relaxed) != 0
             || channel.transport.load64(TAIL, Ordering::Acquire) != 0
             || channel.transport.load32(EOF, Ordering::Acquire) != 0
         {
-            channel.fail(RunnelError::Broken, 0);
-            return Err(RunnelError::Broken);
+            return Err(InitFailure {
+                owner: channel.transport,
+                error: RunnelError::Broken,
+            });
         }
         Ok(Self {
             channel,
@@ -263,21 +284,26 @@ struct ConsumerCore<T> {
 }
 
 impl<T: Transport> ConsumerCore<T> {
-    fn new(transport: T, creator: bool) -> Result<Self, RunnelError> {
-        let mut channel = Channel::new(transport, creator)?;
-        if channel.transport.load64(TAIL, Ordering::Relaxed) != 0 {
-            channel.fail(RunnelError::Broken, 0);
-            return Err(RunnelError::Broken);
+    fn new(transport: T, creator: bool) -> Result<Self, InitFailure<T>> {
+        let channel = Channel::new(transport, creator)?;
+        let eof = u32::from_le(channel.transport.load32(EOF, Ordering::Acquire));
+        let head = u64::from_le(channel.transport.load64(HEAD, Ordering::Acquire));
+        if channel.transport.load64(TAIL, Ordering::Relaxed) != 0
+            || eof > 1
+            || head > channel.capacity as u64
+        {
+            return Err(InitFailure {
+                owner: channel.transport,
+                error: RunnelError::Broken,
+            });
         }
-        let mut consumer = Self {
+        Ok(Self {
             channel,
             tail: 0,
-            head_shadow: 0,
+            head_shadow: head,
             cursor: 0,
-            eof_head: None,
-        };
-        consumer.refresh().map_err(|error| error.error)?;
-        Ok(consumer)
+            eof_head: (eof == 1).then_some(head),
+        })
     }
 
     fn refresh(&mut self) -> Result<u64, IoError> {
@@ -382,6 +408,10 @@ pub mod blocking {
                 bytes,
             }
         }
+        fn into_endpoint(self) -> Endpoint {
+            self.endpoint
+                .expect("initialization failure lost Endpoint owner")
+        }
         fn endpoint(&self) -> &Endpoint {
             self.endpoint
                 .as_ref()
@@ -457,10 +487,12 @@ pub mod blocking {
         policy: Placement,
     ) -> Result<(Producer, Handle), RunnelError> {
         let (endpoint, invitation) = tunnel::create(bytes, policy).map_err(RunnelError::Syscall)?;
-        let core = ProducerCore::new(Guest::new(endpoint), true).inspect_err(|_| {
-            // SAFETY: 创建失败，Invitation 尚未交给上层且不能包含映射 owner。
-            let _ = unsafe { rinlib::ipc::object::close(invitation) };
-        })?;
+        let core = ProducerCore::new(Guest::new(endpoint), true)
+            .inspect_err(|_| {
+                // SAFETY: 创建失败，Invitation 尚未交给上层且不能包含映射 owner。
+                let _ = unsafe { rinlib::ipc::object::close(invitation) };
+            })
+            .map_err(|failure| failure.error)?;
         Ok((
             Producer {
                 core,
@@ -474,10 +506,12 @@ pub mod blocking {
         policy: Placement,
     ) -> Result<(Consumer, Handle), RunnelError> {
         let (endpoint, invitation) = tunnel::create(bytes, policy).map_err(RunnelError::Syscall)?;
-        let core = ConsumerCore::new(Guest::new(endpoint), true).inspect_err(|_| {
-            // SAFETY: 同 Producer，失败时放弃尚未发布的 Invitation。
-            let _ = unsafe { rinlib::ipc::object::close(invitation) };
-        })?;
+        let core = ConsumerCore::new(Guest::new(endpoint), true)
+            .inspect_err(|_| {
+                // SAFETY: 同 Producer，失败时放弃尚未发布的 Invitation。
+                let _ = unsafe { rinlib::ipc::object::close(invitation) };
+            })
+            .map_err(|failure| failure.error)?;
         Ok((
             Consumer {
                 core,
@@ -486,22 +520,102 @@ pub mod blocking {
             invitation,
         ))
     }
-    pub fn attach_producer(invitation: Handle, policy: Placement) -> Result<Producer, RunnelError> {
-        let endpoint = tunnel::attach(invitation, policy).map_err(RunnelError::Syscall)?;
+    /// # Safety
+    /// 原始 ABI 调用者独占 Invitation 的消费及未消费失败后的关闭责任。
+    pub unsafe fn attach_producer(
+        invitation: Handle,
+        policy: Placement,
+    ) -> Result<Producer, RunnelError> {
+        // SAFETY: 调用者传入唯一消费责任，成功后由 Guest 独占新映射。
+        let endpoint =
+            unsafe { tunnel::attach(invitation, policy) }.map_err(RunnelError::Syscall)?;
         Ok(Producer {
-            core: ProducerCore::new(Guest::new(endpoint), false)?,
+            core: ProducerCore::new(Guest::new(endpoint), false)
+                .map_err(|failure| failure.error)?,
             not_sync: core::marker::PhantomData,
         })
     }
-    pub fn attach_consumer(invitation: Handle, policy: Placement) -> Result<Consumer, RunnelError> {
-        let endpoint = tunnel::attach(invitation, policy).map_err(RunnelError::Syscall)?;
+    /// # Safety
+    /// 原始 ABI 调用者独占 Invitation 的消费及未消费失败后的关闭责任。
+    pub unsafe fn attach_consumer(
+        invitation: Handle,
+        policy: Placement,
+    ) -> Result<Consumer, RunnelError> {
+        // SAFETY: 调用者传入唯一消费责任，成功后由 Guest 独占新映射。
+        let endpoint =
+            unsafe { tunnel::attach(invitation, policy) }.map_err(RunnelError::Syscall)?;
         Ok(Consumer {
-            core: ConsumerCore::new(Guest::new(endpoint), false)?,
+            core: ConsumerCore::new(Guest::new(endpoint), false)
+                .map_err(|failure| failure.error)?,
             not_sync: core::marker::PhantomData,
         })
     }
 
+    #[derive(Debug)]
+    pub enum AttachFailure {
+        Tunnel(rinlib::ipc::invitation::AttachFailure),
+        Protocol(InitFailure<Endpoint>),
+    }
+
+    #[derive(Debug)]
+    pub enum CreateFailure {
+        System(SystemCallError),
+        Protocol {
+            endpoint: Endpoint,
+            invitation: rinlib::ipc::invitation::Invitation,
+            error: RunnelError,
+        },
+    }
+
+    fn producer(endpoint: Endpoint, creator: bool) -> Result<Producer, InitFailure<Endpoint>> {
+        ProducerCore::new(Guest::new(endpoint), creator)
+            .map(|core| Producer {
+                core,
+                not_sync: core::marker::PhantomData,
+            })
+            .map_err(|failure| InitFailure {
+                owner: failure.owner.into_endpoint(),
+                error: failure.error,
+            })
+    }
+    fn consumer(endpoint: Endpoint, creator: bool) -> Result<Consumer, InitFailure<Endpoint>> {
+        ConsumerCore::new(Guest::new(endpoint), creator)
+            .map(|core| Consumer {
+                core,
+                not_sync: core::marker::PhantomData,
+            })
+            .map_err(|failure| InitFailure {
+                owner: failure.owner.into_endpoint(),
+                error: failure.error,
+            })
+    }
+
     impl Producer {
+        pub fn create(
+            bytes: usize,
+            placement: Placement,
+        ) -> Result<(Self, rinlib::ipc::invitation::Invitation), CreateFailure> {
+            let (endpoint, invitation) =
+                rinlib::ipc::invitation::Invitation::create(bytes, placement)
+                    .map_err(CreateFailure::System)?;
+            match producer(endpoint, true) {
+                Ok(producer) => Ok((producer, invitation)),
+                Err(failure) => Err(CreateFailure::Protocol {
+                    endpoint: failure.owner,
+                    invitation,
+                    error: failure.error,
+                }),
+            }
+        }
+        pub fn attach(
+            invitation: rinlib::ipc::invitation::Invitation,
+            placement: Placement,
+        ) -> Result<Self, AttachFailure> {
+            let endpoint = invitation
+                .attach(placement)
+                .map_err(AttachFailure::Tunnel)?;
+            producer(endpoint, false).map_err(AttachFailure::Protocol)
+        }
         pub fn capacity(&self) -> usize {
             self.core.channel.capacity
         }
@@ -513,6 +627,37 @@ pub mod blocking {
         }
         pub fn write_all(&mut self, input: &[u8]) -> Result<(), IoError> {
             self.core.write_all(input)
+        }
+        pub fn prepare_wait(&mut self) -> Result<bool, IoError> {
+            if self.core.writable()? != 0 {
+                return Ok(true);
+            }
+            self.core.channel.acknowledge()?;
+            Ok(self.core.writable()? != 0)
+        }
+        pub fn all_consumed(&mut self) -> Result<bool, IoError> {
+            Ok(self.core.eof && self.core.writable()? == self.core.channel.capacity)
+        }
+        pub fn register(
+            &self,
+            set: &rinlib::ipc::wait_set::WaitSet,
+            cookie: u64,
+        ) -> Result<u64, SystemCallError> {
+            self.core.channel.transport.endpoint().events().register(
+                set,
+                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                cookie,
+            )
+        }
+        pub fn peer_attached(&self) -> Result<bool, SystemCallError> {
+            let result = self.core.channel.transport.endpoint().events().wait_until(
+                ObjectSignals::PEER_ATTACHED | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                rinlib::time::Deadline::at(0),
+            )?;
+            Ok(result.observed.intersects(ObjectSignals::PEER_ATTACHED)
+                && !result
+                    .observed
+                    .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED))
         }
         pub fn finish(&mut self) -> Result<(), IoError> {
             self.core.finish()
@@ -526,6 +671,31 @@ pub mod blocking {
     }
 
     impl Consumer {
+        pub fn create(
+            bytes: usize,
+            placement: Placement,
+        ) -> Result<(Self, rinlib::ipc::invitation::Invitation), CreateFailure> {
+            let (endpoint, invitation) =
+                rinlib::ipc::invitation::Invitation::create(bytes, placement)
+                    .map_err(CreateFailure::System)?;
+            match consumer(endpoint, true) {
+                Ok(consumer) => Ok((consumer, invitation)),
+                Err(failure) => Err(CreateFailure::Protocol {
+                    endpoint: failure.owner,
+                    invitation,
+                    error: failure.error,
+                }),
+            }
+        }
+        pub fn attach(
+            invitation: rinlib::ipc::invitation::Invitation,
+            placement: Placement,
+        ) -> Result<Self, AttachFailure> {
+            let endpoint = invitation
+                .attach(placement)
+                .map_err(AttachFailure::Tunnel)?;
+            consumer(endpoint, false).map_err(AttachFailure::Protocol)
+        }
         pub fn capacity(&self) -> usize {
             self.core.channel.capacity
         }
@@ -540,6 +710,34 @@ pub mod blocking {
         }
         pub fn eof_reached(&mut self) -> Result<bool, IoError> {
             self.core.eof_reached()
+        }
+        pub fn prepare_wait(&mut self) -> Result<bool, IoError> {
+            if self.core.readable()? != 0 || self.core.eof_reached()? {
+                return Ok(true);
+            }
+            self.core.channel.acknowledge()?;
+            Ok(self.core.readable()? != 0 || self.core.eof_reached()?)
+        }
+        pub fn register(
+            &self,
+            set: &rinlib::ipc::wait_set::WaitSet,
+            cookie: u64,
+        ) -> Result<u64, SystemCallError> {
+            self.core.channel.transport.endpoint().events().register(
+                set,
+                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                cookie,
+            )
+        }
+        pub fn peer_attached(&self) -> Result<bool, SystemCallError> {
+            let result = self.core.channel.transport.endpoint().events().wait_until(
+                ObjectSignals::PEER_ATTACHED | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                rinlib::time::Deadline::at(0),
+            )?;
+            Ok(result.observed.intersects(ObjectSignals::PEER_ATTACHED)
+                && !result
+                    .observed
+                    .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED))
         }
         pub fn close(mut self) -> Result<(), (Self, SystemCallError)> {
             match self.core.channel.close() {
@@ -828,15 +1026,39 @@ mod tests {
         producer.channel.transport.store32(4, 99, Ordering::Relaxed);
         assert!(matches!(
             ConsumerCore::new(c, false),
-            Err(RunnelError::BadFormat)
+            Err(InitFailure {
+                error: RunnelError::BadFormat,
+                ..
+            })
         ));
         let (p, c) = Host::pair(1);
         let mut producer = ProducerCore::new(p, true).unwrap();
         producer.write(b"x").unwrap();
         assert!(matches!(
             ProducerCore::new(c, false),
-            Err(RunnelError::Broken)
+            Err(InitFailure {
+                error: RunnelError::Broken,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn initialization_failure_returns_unclosed_transport() {
+        let (p, c) = Host::pair(1);
+        let producer = ProducerCore::new(p, true).unwrap();
+        producer.channel.transport.store32(4, 99, Ordering::Relaxed);
+        let failure = ConsumerCore::new(c, false)
+            .err()
+            .expect("bad header accepted");
+        assert_eq!(failure.error, RunnelError::BadFormat);
+        assert!(!failure.owner.closed.load(Ordering::Relaxed));
+        let mut owner = failure.owner;
+        owner.fail_close = true;
+        assert_eq!(owner.close(), Err(SystemCallError::ObjectBusy));
+        assert!(!owner.closed.load(Ordering::Relaxed));
+        owner.fail_close = false;
+        assert_eq!(owner.close(), Ok(()));
     }
 
     #[test]

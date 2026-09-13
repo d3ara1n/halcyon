@@ -1,6 +1,9 @@
 //! 消息原语（契约见 notes/ideas/message.md）：控制面小消息，投递永不阻塞。
 
-use crate::object::{Handle, ProcessId, Rights};
+use crate::{
+    object::{Handle, ProcessId, Rights},
+    time::Deadline,
+};
 
 /// 邮箱容量（条数）。满箱时 `Send` 立即返回
 /// [`crate::call::SystemCallError::MailboxFull`]；发送侧可观察 `WRITABLE`
@@ -21,7 +24,8 @@ pub struct SendHeader {
     pub kind: u64,
     pub payload_len: u32,
     pub handle_count: u32,
-    pub reserved: [u64; 5],
+    pub deadline: Deadline,
+    pub reserved: [u64; 3],
 }
 
 impl SendHeader {
@@ -30,7 +34,8 @@ impl SendHeader {
             kind,
             payload_len,
             handle_count,
-            reserved: [0; 5],
+            deadline: Deadline::INFINITE,
+            reserved: [0; 3],
         }
     }
 }
@@ -48,7 +53,8 @@ pub struct MessageHeader {
     pub kind: u64,
     pub payload_len: u32,
     pub handle_count: u32,
-    pub reserved: [u64; 4],
+    pub sender_context_id: u64,
+    pub reserved: [u64; 3],
 }
 
 impl MessageHeader {
@@ -65,9 +71,18 @@ impl MessageHeader {
             kind,
             payload_len,
             handle_count,
-            reserved: [0; 4],
+            sender_context_id: 0,
+            reserved: [0; 3],
         }
     }
+}
+
+/// 完整接收交付；Delivery 与业务 Handle 槽编号独立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct ReceiveResult {
+    pub header: MessageHeader,
+    pub delivery: Handle,
 }
 
 /// Send 时请求移动的一项 Handle 及其目标 rights。

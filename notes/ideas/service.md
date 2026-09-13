@@ -12,9 +12,11 @@ launcher 在 Building 阶段以独立的 Map/Write、Grant 与 Attach 动作准�
 
 ## 发现与调用
 
-服务可以向用户态目录发布 badged Mailbox sender 与原子 service record。record 至少把 instance、protocol/version 和 endpoint 作为一个一致快照。客户端取得 Handle 后直接 Send；badge 让同一服务队列区分 grant/session，PID 只用于审计。
+服务通过显式注册控制权向用户态目录发布 badged sender。一个原子 service record 同时包含 instance、protocol/version、endpoint 和记录代次，客户端一次读取就取得完整快照；不得逐字段拼接可能来自不同实例的值。
 
-请求回复时，客户端 TRANSIT send-once；批量数据面 TRANSIT Tunnel invitation。服务按 sender_badge 查 GrantState，并把 sender_pid 仅作为 provenance 或额外身份政策输入。内核只保证 capability 不可伪造、rights 不放大和事务原子。
+客户端取得 Handle 后直接调用。服务按内核提供的发送授权身份找到 grant/session，badge 是该授权的不可变标签，PID 只作 provenance。请求上下文拥有消息 Delivery 与 send-once 回复权，批量数据面交付 Tunnel Invitation；这些责任彼此独立。
+
+注册控制权限定可管理的名称或子树，与普通目录读写权分离。服务目录后端只通过注册状态机发布 Ready record，不能被普通 PropertyWrite 绕过。endpoint 必须有足够的查询、等待、复制和运输权，且已经符合发布者的出口政策；目录不能自行收窄一个未知业务协议的 badge 权限。
 
 boot-critical 依赖在 Building 阶段经直接 grant 写入 StartupBlock；动态依赖可通过 FAL 服务目录发现。首个目录提供者由 init 的显式启动拓扑打破引导环，不需要 PID Send 后门。
 
@@ -26,9 +28,13 @@ boot-critical 依赖在 Building 阶段经直接 grant 写入 StartupBlock；动
 Absent -> Starting -> Ready(instance, protocol, endpoint) -> Draining -> Absent
 ```
 
-只有 Ready record 可供新客户端发现。服务退出关闭 owner，现有 sender 观察 `CLOSED`；目录清理旧 instance 后才发布替代者。客户端可在 CLOSED 后重新发现，但是否重试取决于协议幂等语义。
+只有在 Ready 状态取得的记录快照可供发现。Starting 有建立期限；Draining 不再交付新的 endpoint。服务退出关闭 owner，客户端观察 CLOSED；endpoint 关闭或注册控制权的 Lifetime 终止都使目录撤销对应记录。
 
-撤销名称只阻止新发现，不追溯销毁已授 capability。需要主动撤销时，服务删除 badge 对应 GrantState、使用 lease/session 或代理层；不以 PID 重用模拟撤销。
+撤销和延迟清理携带 instance/记录代次条件，旧实例的完成不能删除替代者。一次已经取得的 Ready 快照可能随后失效，发现不是可用性保证。客户端可重新发现，但是否重试由业务幂等语义决定。
+
+撤销名称只阻止新发现，不追溯销毁已授 capability。政策撤销阻止特定授权的新操作准入；已准入请求和独立建立的连接按自身契约收束，不隐含跨服务递归撤销。capability 转交后的寿命由真实引用及交付责任决定，不依赖原进程保活或周期续租。
+
+服务记录 schema 与注册控制属于 libsrv，通用 Record、能力值和目录投影属于 FAL。首个承载者由启动拓扑指定，不因此成为所有进程必须经过的全局注册权威。
 
 ## 监督与接管
 

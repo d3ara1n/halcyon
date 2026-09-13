@@ -48,6 +48,36 @@ impl MappingGeometry {
 }
 
 #[derive(Debug)]
+pub struct EndpointCleanup {
+    handle: Option<Handle>,
+}
+
+impl EndpointCleanup {
+    pub fn close(mut self) -> Result<(), (Self, SystemCallError)> {
+        // SAFETY: 来自已消费邀请的唯一新 Endpoint entry，不提供任何共享映射借用。
+        match unsafe { super::object::close(self.handle.expect("endpoint cleanup already closed")) }
+        {
+            Ok(()) => {
+                self.handle = None;
+                Ok(())
+            }
+            Err(error) => Err((self, error)),
+        }
+    }
+}
+impl Drop for EndpointCleanup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // SAFETY: 异常退出只尝试本清理 owner 的一次关闭，失败交 ProcessDrain。
+            if let Err(error) = unsafe { super::object::close(handle) } {
+                ABANDONED_ENDPOINTS.fetch_add(1, Ordering::Relaxed);
+                LAST_CLEANUP_ERROR.store(error as usize, Ordering::Release);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 #[must_use = "an Endpoint owns its mapping until close or process drain"]
 pub struct Endpoint {
     handle: Option<Handle>,
@@ -55,9 +85,23 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    fn from_result(result: TunnelEndpointResult) -> Result<Self, SystemCallError> {
-        let base = usize::try_from(result.base).map_err(|_| SystemCallError::InternalError)?;
-        let bytes = usize::try_from(result.bytes).map_err(|_| SystemCallError::InternalError)?;
+    pub(crate) fn from_result(result: TunnelEndpointResult) -> Result<Self, SystemCallError> {
+        Self::from_result_owned(result).map_err(|(cleanup, error)| {
+            drop(cleanup);
+            error
+        })
+    }
+
+    pub(crate) fn from_result_owned(
+        result: TunnelEndpointResult,
+    ) -> Result<Self, (Option<EndpointCleanup>, SystemCallError)> {
+        let mut cleanup = result.endpoint.is_valid().then_some(EndpointCleanup {
+            handle: Some(result.endpoint),
+        });
+        let (Ok(base), Ok(bytes)) = (usize::try_from(result.base), usize::try_from(result.bytes))
+        else {
+            return Err((cleanup, SystemCallError::InternalError));
+        };
         if !result.endpoint.is_valid()
             || bytes == 0
             || bytes > TUNNEL_MAX_PAGES as usize * PROCESS_PAGE_SIZE
@@ -67,11 +111,10 @@ impl Endpoint {
                 .checked_add(bytes)
                 .is_none_or(|end| end > PROCESS_USER_TOP)
         {
-            if result.endpoint.is_valid() {
-                // SAFETY: 本 syscall 新生成的 entry 尚未形成任何安全 owner。
-                let _ = unsafe { super::object::close(result.endpoint) };
-            }
-            return Err(SystemCallError::InternalError);
+            return Err((cleanup, SystemCallError::InternalError));
+        }
+        if let Some(cleanup) = &mut cleanup {
+            cleanup.handle = None;
         }
         Ok(Self {
             handle: Some(result.endpoint),
@@ -150,23 +193,44 @@ impl EndpointEvents<'_> {
             call::sys_tunnel_acknowledge_data(self.0.handle.expect("Endpoint already closed"))
         }
     }
-    pub fn wait(
+    pub fn register(
+        &self,
+        set: &super::wait_set::WaitSet,
+        signals: ObjectSignals,
+        cookie: u64,
+    ) -> Result<u64, SystemCallError> {
+        set.register(WaitItem::new(
+            self.0.handle.expect("Endpoint already closed"),
+            signals,
+            cookie,
+        ))
+    }
+
+    pub fn wait_until(
         &self,
         signals: ObjectSignals,
-        timeout: u64,
+        deadline: crate::time::Deadline,
     ) -> Result<WaitResult, SystemCallError> {
-        super::wait::wait_many(
+        super::wait::wait_until(
             &[WaitItem::new(
                 self.0.handle.expect("Endpoint already closed"),
                 signals,
                 0,
             )],
-            timeout,
+            deadline,
         )
+    }
+
+    pub fn wait(
+        &self,
+        signals: ObjectSignals,
+        timeout: u64,
+    ) -> Result<WaitResult, SystemCallError> {
+        self.wait_until(signals, crate::time::timeout_millis(timeout)?)
     }
 }
 
-fn placement(placement: Placement) -> (u64, MemoryPlacement) {
+pub(crate) fn placement(placement: Placement) -> (u64, MemoryPlacement) {
     match placement {
         Placement::Anywhere => (0, MemoryPlacement::Anywhere),
         Placement::FixedEmpty { usable_start } => {
@@ -207,8 +271,10 @@ pub fn create(bytes: usize, policy: Placement) -> Result<(Endpoint, Handle), Sys
     Ok((endpoint, output.invitation))
 }
 
-/// 内核提交失败不消费 Invitation；成功后格式结果错误不恢复已消费的邀请。
-pub fn attach(invitation: Handle, policy: Placement) -> Result<Endpoint, SystemCallError> {
+/// # Safety
+/// 原始 ABI 调用者须独占 Invitation 的消费与失败后的关闭责任。
+/// 内核提交失败不消费；成功后的格式错误不恢复邀请。
+pub unsafe fn attach(invitation: Handle, policy: Placement) -> Result<Endpoint, SystemCallError> {
     let mut output = TunnelEndpointResult::empty();
     let (address, policy) = placement(policy);
     let request = TunnelAttachRequest::new(

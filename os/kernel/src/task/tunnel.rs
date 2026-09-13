@@ -63,7 +63,6 @@ enum PeerNotice {
 }
 
 pub struct Endpoint {
-    #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
     connection: Arc<Connection>,
     side: usize,
@@ -105,7 +104,12 @@ impl Endpoint {
     }
 
     fn set_signals(&self, signals: ObjectSignals) {
-        self.wait.lock().update(ObjectSignals::NONE, signals);
+        let clear = if signals.intersects(ObjectSignals::PEER_CLOSED) {
+            ObjectSignals::PEER_ATTACHED
+        } else {
+            ObjectSignals::NONE
+        };
+        self.wait.lock().update(clear, signals);
         self.finish_waiters();
     }
 
@@ -120,9 +124,10 @@ impl Endpoint {
     }
 
     fn finish_close(&self, notice: Option<PeerNotice>) {
-        self.wait
-            .lock()
-            .update(ObjectSignals::DATA, ObjectSignals::CLOSED);
+        self.wait.lock().update(
+            ObjectSignals::DATA | ObjectSignals::PEER_ATTACHED,
+            ObjectSignals::CLOSED,
+        );
         self.finish_waiters();
         publish_peer_notice(notice);
     }
@@ -193,8 +198,12 @@ impl KernelObject for Endpoint {
     }
 
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::TunnelEndpoint)
-            .then_some(ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)
+        (role == HandleRole::TunnelEndpoint).then_some(
+            ObjectSignals::DATA
+                | ObjectSignals::PEER_ATTACHED
+                | ObjectSignals::PEER_CLOSED
+                | ObjectSignals::CLOSED,
+        )
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -205,8 +214,17 @@ impl KernelObject for Endpoint {
         self.wait.lock().subscribe(subscription)
     }
 
+    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
+        self.wait.lock().rearm_observer(id)
+    }
+
+    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
+        self.wait.lock().cancel_observer(id)
+    }
+
     fn unsubscribe(&self, id: u64) {
-        self.wait.lock().unsubscribe(id);
+        let retired = self.wait.lock().unsubscribe(id);
+        drop(retired);
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
@@ -224,7 +242,6 @@ impl KernelObject for Endpoint {
 }
 
 pub struct Invitation {
-    #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
     connection: Arc<Connection>,
     side: usize,
@@ -1036,6 +1053,12 @@ pub fn attach(
             return Err(SystemCallError::ObjectBusy);
         }
     };
+    endpoint.set_signals(ObjectSignals::PEER_ATTACHED);
+    if let SideState::Alive(peer) = &connection_state.sides[1 - invitation.side]
+        && let Some(peer) = peer.upgrade()
+    {
+        peer.set_signals(ObjectSignals::PEER_ATTACHED);
+    }
     drop(connection_state);
     drop(table);
     drop(consumed); // invitation 被消费而非关闭，不执行 lifecycle callback。

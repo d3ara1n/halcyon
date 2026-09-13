@@ -1,10 +1,10 @@
 # 进程间通信
 
-IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信对象只经进程本地 Handle 操作，role、rights 与对象状态共同决定合法行为；PID 是 provenance，不是通信地址或 authority。等待统一由 [WaitMany](wait.md) 完成。
+IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信对象只经进程本地 Handle 操作，role、rights 与对象状态共同决定合法行为；PID 是 provenance，不是通信地址或 authority。一次等待与持久观察由 [WaitMany / WaitSet](wait.md) 统一完成。
 
 ## 三个面
 
-- **消息**（[message](message.md)）是控制面：有界、非阻塞的 Mailbox 投递，承载小 payload、内核生成的 `sender_pid/sender_badge` envelope 与原子 TRANSIT Handle；
+- **消息**（[message](message.md)）是控制面：有界、非阻塞的 Mailbox 投递，承载小 payload、内核生成的来源与发送授权 envelope、原子 TRANSIT Handle 和独立 Delivery；
 - **对象状态与 Notification**（[signal](signal.md)）是事件面：对象以非消费式电平表达可读、关闭等条件，Notification 提供显式消费的 OR 位集合；
 - **Tunnel**（[tunnel](tunnel.md)）是数据面：两个与本地地址空间 lease 绑定的 Endpoint 映射同一有界多页共享区间，页内协议遵守[共享内存公共契约](shared-memory.md)。
 
@@ -16,6 +16,6 @@ IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信
 
 `TRANSIT` 允许 Handle 暂存于消息，`GRANT` 允许 Building 期的直接跨表安装。unique owner 只走直接 GRANT；sender、signaler 与 invitation 可按授权经消息委托；Endpoint 与 VM 绑定而不移动。
 
-协议使用 badged sender 表达不可伪造的服务端授权上下文，`sender_pid` 只作 provenance。回复必须取得显式 send-once 或 sender capability，不能由 PID 或 badge 数值推导。
+协议使用独立的 badged sender 表达不可伪造的授权上下文，发送授权身份区分实例，sender_pid 只作 provenance。Lifetime 不保活被观察授权，Delivery 保活处理中的调用；回复仍需要显式 send-once 或 sender，不能由 Delivery、PID 或身份数值推导。
 
 启动根图由 launcher 在目标 runnable 前通过 ProcessGrant 与用户态 StartupBlock 建立，ProcessStart 只发布已经组装完成的线程。Mailbox owner 只是可选启动资源，不占固定寄存器或固定 Handle 数值。

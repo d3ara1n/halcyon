@@ -9,7 +9,7 @@ use erhino_shared::{
         HandleMove, MAILBOX_CAPACITY, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX,
         SendHeader,
     },
-    object::{Handle, HandlePair, ObjectSignals, Rights},
+    object::{Handle, ObjectSignals, Rights},
 };
 
 use crate::{sync::Spinlock, uaccess};
@@ -17,18 +17,30 @@ use crate::{sync::Spinlock, uaccess};
 use super::{
     Thread,
     handle::{ProcessHandleEntry, ProcessHandleTable, close_transit},
+    lifetime::LifetimeOwner,
     object::{
         HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
         SubscribeResult,
     },
     proc::Process,
+    resources::{IpcPermit, MetadataSponsor},
     wait::Subscription,
 };
+
+pub(crate) mod selftest;
+
+#[derive(Clone, Copy)]
+struct ReceiveOutput {
+    header: usize,
+    payload: usize,
+    handles: usize,
+}
 
 pub struct Message {
     pub header: MessageHeader,
     pub payload: Vec<u8>,
     pub handles: Vec<ProcessHandleEntry>,
+    pub delivery: ProcessHandleEntry,
 }
 
 impl Message {
@@ -36,6 +48,7 @@ impl Message {
         for handle in self.handles {
             close_transit(handle);
         }
+        close_transit(self.delivery);
     }
 }
 
@@ -47,8 +60,8 @@ struct MailboxState {
 }
 
 impl MailboxState {
-    /// 电平是状态的函数：READABLE ⇔ 队列非空，WRITABLE ⇔ 占用（队列加
-    /// 在逯接收占位）低于容量，CLOSED 终态独占。所有迁移点调用同一发布
+    /// 电平是状态的函数：READABLE ⇔ 无接收预留且队列非空，WRITABLE ⇔
+    /// 占用（队列加在途接收占位）低于容量，CLOSED 终态独占。所有迁移点调用同一发布
     /// 函数，不做增量转移——新增迁移点不可能遗漏或漂移。
     fn publish(&mut self) {
         if self.closed {
@@ -60,7 +73,7 @@ impl MailboxState {
         }
         let occupied = self.queue.len() + usize::from(self.receiving.is_some());
         let mut level = ObjectSignals::NONE;
-        if !self.queue.is_empty() {
+        if self.receiving.is_none() && !self.queue.is_empty() {
             level |= ObjectSignals::READABLE;
         }
         if occupied < MAILBOX_CAPACITY {
@@ -72,13 +85,83 @@ impl MailboxState {
 }
 
 pub struct Mailbox {
-    #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
     state: Spinlock<MailboxState>,
+    _permit: IpcPermit,
+}
+
+/// 一个可复制/转交的授权实例，badge 与目标队列都不可变。
+pub struct MailboxSender {
+    header: ObjectHeader,
+    badge: MailboxBadge,
+    queue: ObjectRef,
+    _lifetime: LifetimeOwner,
+    _permit: IpcPermit,
+}
+
+impl MailboxSender {
+    fn create(
+        queue: ObjectRef,
+        badge: MailboxBadge,
+        sponsor: &Arc<MetadataSponsor>,
+    ) -> Result<(ObjectRef, ObjectRef), SystemCallError> {
+        let header = ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?;
+        let (lifetime, observer) = LifetimeOwner::new(header.koid(), sponsor)?;
+        let sender = Arc::try_new(Self {
+            header,
+            badge,
+            queue,
+            _lifetime: lifetime,
+            _permit: MetadataSponsor::reserve_ipc(sponsor, super::resources::IpcClass::Object)?,
+        })
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+        Ok((sender, observer))
+    }
+}
+
+impl KernelObject for MailboxSender {
+    fn header(&self) -> &ObjectHeader {
+        &self.header
+    }
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::MailboxSender
+    }
+    fn related_id(&self) -> u64 {
+        self.queue.header().koid()
+    }
+    fn badge(&self) -> u64 {
+        self.badge
+    }
+    fn observation_source(&self) -> Option<ObjectRef> {
+        Some(self.queue.clone())
+    }
+    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
+        match role {
+            HandleRole::MailboxSender => Some(
+                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
+            ),
+            HandleRole::MailboxSenderOnce => {
+                Some(Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT)
+            }
+            _ => None,
+        }
+    }
+    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
+        matches!(
+            role,
+            HandleRole::MailboxSender | HandleRole::MailboxSenderOnce
+        )
+        .then_some(ObjectSignals::WRITABLE | ObjectSignals::CLOSED)
+    }
+    fn close_handle(&self, _: HandleRole, _: &Process, _: bool) {}
+    fn close_transit(&self, _: HandleRole) {}
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl Mailbox {
-    pub fn new() -> Result<Arc<Self>, SystemCallError> {
+    pub fn new(sponsor: &Arc<MetadataSponsor>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: Spinlock::new(
@@ -91,6 +174,7 @@ impl Mailbox {
                     closed: false,
                 },
             ),
+            _permit: MetadataSponsor::reserve_ipc(sponsor, super::resources::IpcClass::Object)?,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -106,6 +190,8 @@ impl Mailbox {
         moves: &[(erhino_shared::object::Handle, Rights)],
         header: MessageHeader,
         payload: Vec<u8>,
+        deadline: erhino_shared::time::Deadline,
+        delivery: ProcessHandleEntry,
     ) -> Result<(), SystemCallError> {
         let mut state = self.state.lock();
         if state.closed {
@@ -119,13 +205,16 @@ impl Mailbox {
             .queue
             .try_reserve(1)
             .map_err(|_| SystemCallError::OutOfMemory)?;
-        let handles = table
-            .extract_moves(moves)
+        let prepared = table
+            .prepare_extract_moves(moves)
             .map_err(super::handle::map_error)?;
+        crate::clock::check_delivery(deadline)?;
+        let handles = prepared.commit();
         state.queue.push_back(Message {
             header,
             payload,
             handles,
+            delivery,
         });
         state.publish();
         Ok(())
@@ -147,9 +236,6 @@ impl Mailbox {
     }
 
     /// 调用方已持 HandleTable 锁；本方法再取 Mailbox 锁并原子预留 slots/队头。
-    /// 已知简化：事务窗口内不重发布电平（READABLE 乐观保持，ObjectBusy
-    /// 兜底）；用户态多线程落地后评估事务内降级
-    /// （notes/impls/ipc.md「消息与 Notification」）。
     pub fn begin_receive(
         &self,
         table: &mut ProcessHandleTable,
@@ -164,20 +250,23 @@ impl Mailbox {
         if state.receiving.is_some() {
             return Err(SystemCallError::ObjectBusy);
         }
-        let Some(front) = state.queue.front() else {
+        let Some(front) = state.queue.front_mut() else {
             return Err(SystemCallError::ObjectNotAvailable);
         };
         if payload_capacity < front.payload.len() || handle_capacity < front.handles.len() {
             return Err(SystemCallError::BufferTooSmall);
         }
+        front
+            .handles
+            .try_reserve(1)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
         let reservation = table
-            .reserve(front.handles.len(), token)
+            .reserve(front.handles.len() + 1, token)
             .map_err(super::handle::map_error)?;
         state.receiving = Some(token);
-        Ok((
-            reservation,
-            state.queue.pop_front().expect("front was checked"),
-        ))
+        let message = state.queue.pop_front().expect("front was checked");
+        state.publish();
+        Ok((reservation, message))
     }
 
     pub fn commit_receive(&self, token: u64) {
@@ -200,6 +289,7 @@ impl Mailbox {
         );
         state.receiving = None;
         if state.closed {
+            state.publish();
             return Some(message);
         }
         state.queue.push_front(message);
@@ -267,14 +357,10 @@ impl KernelObject for Mailbox {
                 let mut state = self.state.lock();
                 state.wait.advance_waiter()
             };
-            match advance {
-                super::object::WaitAdvance::Progress => used += 1,
-                super::object::WaitAdvance::Complete(context) => {
-                    super::wait::finish_offered(context);
-                    used += 1;
-                }
-                super::object::WaitAdvance::Done => return (used, true),
+            if advance.finish() {
+                return (used, true);
             }
+            used += 1;
         }
         (used, false)
     }
@@ -292,12 +378,6 @@ impl KernelObject for Mailbox {
             HandleRole::MailboxOwner => {
                 Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
             }
-            HandleRole::MailboxSender => Some(
-                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
-            ),
-            HandleRole::MailboxSenderOnce => {
-                Some(Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT)
-            }
             _ => None,
         }
     }
@@ -305,9 +385,6 @@ impl KernelObject for Mailbox {
     fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
         match role {
             HandleRole::MailboxOwner => Some(ObjectSignals::READABLE | ObjectSignals::CLOSED),
-            HandleRole::MailboxSender | HandleRole::MailboxSenderOnce => {
-                Some(ObjectSignals::WRITABLE | ObjectSignals::CLOSED)
-            }
             _ => None,
         }
     }
@@ -320,8 +397,17 @@ impl KernelObject for Mailbox {
         self.state.lock().wait.subscribe(subscription)
     }
 
+    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
+        self.state.lock().wait.rearm_observer(id)
+    }
+
+    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
+        self.state.lock().wait.cancel_observer(id)
+    }
+
     fn unsubscribe(&self, id: u64) {
-        self.state.lock().wait.unsubscribe(id);
+        let retired = self.state.lock().wait.unsubscribe(id);
+        drop(retired);
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
@@ -330,11 +416,8 @@ impl KernelObject for Mailbox {
         }
     }
 
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(matches!(
-            role,
-            HandleRole::MailboxSender | HandleRole::MailboxSenderOnce
-        ));
+    fn close_transit(&self, _: HandleRole) {
+        unreachable!("Mailbox owner cannot enter a message")
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -342,47 +425,15 @@ impl KernelObject for Mailbox {
     }
 }
 
-pub fn create(
-    thread: &Thread,
-    owner_rights: Rights,
-    sender_rights: Rights,
-    output: usize,
-) -> Result<(), SystemCallError> {
-    let mailbox = Mailbox::new()?;
-    let object = Mailbox::object_ref(&mailbox);
-    let mut entries = Vec::new();
-    entries
-        .try_reserve(2)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    entries.push(
-        super::handle::entry(object.clone(), HandleRole::MailboxOwner, owner_rights)
-            .map_err(super::handle::map_error)?,
-    );
-    entries.push(
-        super::handle::entry(object, HandleRole::MailboxSender, sender_rights)
-            .map_err(super::handle::map_error)?,
-    );
-
-    let token = super::handle::transaction_token()?;
-    let mut table = thread.process.handles.lock();
-    let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
-    let pair = HandlePair::new(reservation.handles()[0], reservation.handles()[1]);
-    let mut space = thread.process.space.lock();
-    if let Err(error) = space.check_range(output, core::mem::size_of::<HandlePair>(), true) {
-        drop(space);
-        table
-            .rollback(reservation)
-            .expect("MailboxCreate reservation must remain owned");
-        return Err(error.into());
-    }
-    // SAFETY: HandlePair 无 padding；复检失败即杀本进程（deliver_output），
-    // 未提交的预留随进程消亡。
-    unsafe { uaccess::deliver_output(thread, &mut space, output, &pair) }?;
-    drop(space);
-    table
-        .commit(reservation, entries)
-        .expect("MailboxCreate reservation must remain owned");
-    Ok(())
+pub fn create(thread: &Thread, owner_rights: Rights, output: usize) -> Result<(), SystemCallError> {
+    let mailbox = Mailbox::new(thread.process.resources.metadata())?;
+    let entry = super::handle::entry(
+        Mailbox::object_ref(&mailbox),
+        HandleRole::MailboxOwner,
+        owner_rights,
+    )
+    .map_err(super::handle::map_error)?;
+    super::handle::install_one(thread, entry, output, || ())
 }
 
 /// 由 owner 铸造同一 mailbox 的 sender capability。badge 是该 capability
@@ -404,19 +455,32 @@ pub fn mint_sender(
     {
         return Err(SystemCallError::WrongObjectType);
     }
-    let object = owner_entry.object().clone();
+    let queue = owner_entry.object().clone();
+    let (sender, lifetime) =
+        MailboxSender::create(queue, badge, thread.process.resources.metadata())?;
     let mut entries = Vec::new();
     entries
-        .try_reserve_exact(1)
+        .try_reserve_exact(2)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
-        super::handle::entry_with_badge(object, HandleRole::MailboxSender, rights, badge)
+        super::handle::entry(sender, HandleRole::MailboxSender, rights)
             .map_err(super::handle::map_error)?,
     );
-    let reservation = table.reserve(1, token).map_err(super::handle::map_error)?;
-    let sender = reservation.handles()[0];
+    entries.push(
+        super::handle::entry(
+            lifetime,
+            HandleRole::LifetimeObserver,
+            Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+        )
+        .map_err(super::handle::map_error)?,
+    );
+    let reservation = table.reserve(2, token).map_err(super::handle::map_error)?;
+    let result = erhino_shared::object::SenderResult {
+        sender: reservation.handles()[0],
+        lifetime: reservation.handles()[1],
+    };
     let mut space = thread.process.space.lock();
-    if let Err(error) = space.check_range(output, core::mem::size_of::<Handle>(), true) {
+    if let Err(error) = space.check_range(output, core::mem::size_of_val(&result), true) {
         drop(space);
         table
             .rollback(reservation)
@@ -425,7 +489,7 @@ pub fn mint_sender(
     }
     // SAFETY: Handle 无 padding；复检失败即杀本进程（deliver_output），
     // 未提交的预留随进程消亡。
-    unsafe { uaccess::deliver_output(thread, &mut space, output, &sender) }?;
+    unsafe { uaccess::deliver_output(thread, &mut space, output, &result) }?;
     drop(space);
     table
         .commit(reservation, entries)
@@ -448,7 +512,7 @@ pub fn make_send_once(
         .get(source, Rights::DUPLICATE)
         .map_err(super::handle::map_error)?;
     if *source_entry.role() != HandleRole::MailboxSender
-        || source_entry.object().kind() != ObjectKind::Mailbox
+        || source_entry.object().kind() != ObjectKind::MailboxSender
     {
         return Err(SystemCallError::WrongObjectType);
     }
@@ -456,14 +520,13 @@ pub fn make_send_once(
         return Err(SystemCallError::RightsDenied);
     }
     let object = source_entry.object().clone();
-    let badge = source_entry.badge();
     // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(1)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(
-        super::handle::entry_with_badge(object, HandleRole::MailboxSenderOnce, rights, badge)
+        super::handle::entry(object, HandleRole::MailboxSenderOnce, rights)
             .map_err(super::handle::map_error)?,
     );
     let reservation = table.reserve(1, token).map_err(super::handle::map_error)?;
@@ -522,7 +585,7 @@ pub fn send(
     };
     if header.payload_len as usize != payload_len
         || header.handle_count as usize != move_count
-        || header.reserved != [0; 5]
+        || header.reserved != [0; 3]
     {
         return Err(SystemCallError::IllegalArgument);
     }
@@ -556,20 +619,37 @@ pub fn send(
         if once && moves.iter().any(|(handle, _)| *handle == mailbox_handle) {
             return Err(SystemCallError::IllegalArgument);
         }
-        let badge = entry.badge();
-        let object = entry.object().clone();
-        if object.kind() != ObjectKind::Mailbox {
-            return Err(SystemCallError::WrongObjectType);
-        }
-        let message_header = MessageHeader::new(
+        let context = entry.object().clone();
+        let sender = context
+            .as_any()
+            .downcast_ref::<MailboxSender>()
+            .ok_or(SystemCallError::WrongObjectType)?;
+        let object = sender.queue.clone();
+        let mut message_header = MessageHeader::new(
             thread.process.pid,
-            badge,
+            sender.badge,
             header.kind,
             header.payload_len,
             header.handle_count,
         );
+        message_header.sender_context_id = context.header().koid();
+        let delivery =
+            super::delivery::Delivery::create(context, thread.process.resources.metadata())?;
+        let delivery = super::handle::entry(
+            delivery,
+            HandleRole::Delivery,
+            Rights::TRANSIT | Rights::GRANT,
+        )
+        .map_err(super::handle::map_error)?;
         let mailbox = concrete(&object)?;
-        mailbox.enqueue_with(&mut table, &moves, message_header, payload)?;
+        mailbox.enqueue_with(
+            &mut table,
+            &moves,
+            message_header,
+            payload,
+            header.deadline,
+            delivery,
+        )?;
         if once {
             // 消费式 role：成功投递后源项仍在表内，直接摘除且不执行
             // lifecycle callback。target 与 transit alias 已在入队前拒绝。
@@ -615,7 +695,11 @@ pub fn receive(
         .ok_or(SystemCallError::IllegalArgument)?;
     {
         let mut space = thread.process.space.lock();
-        space.check_range(header_output, core::mem::size_of::<MessageHeader>(), true)?;
+        space.check_range(
+            header_output,
+            core::mem::size_of::<erhino_shared::message::ReceiveResult>(),
+            true,
+        )?;
         space.check_range(payload_output, payload_capacity, true)?;
         space.check_range(handles_output, handle_output_bytes, true)?;
     }
@@ -633,14 +717,44 @@ pub fn receive(
         mailbox.begin_receive(&mut table, token, payload_capacity, handle_capacity)?
     };
 
-    let output_handles = reservation.handles();
+    finish_receive(
+        thread,
+        mailbox,
+        token,
+        reservation,
+        message,
+        ReceiveOutput {
+            header: header_output,
+            payload: payload_output,
+            handles: handles_output,
+        },
+    )
+}
+
+/// 队头/目标表槽已预留，复制成功原子交付；失败先归还表槽与队头，再锁外通知。
+fn finish_receive(
+    thread: &Thread,
+    mailbox: &Mailbox,
+    token: u64,
+    reservation: handle_table::Reservation,
+    message: Message,
+    output: ReceiveOutput,
+) -> Result<(), SystemCallError> {
+    let output_handles = &reservation.handles()[..message.handles.len()];
+    let result = erhino_shared::message::ReceiveResult {
+        header: message.header,
+        delivery: *reservation
+            .handles()
+            .last()
+            .expect("Receive has a Delivery slot"),
+    };
     let copied = {
         let mut space = thread.process.space.lock();
         // SAFETY: MessageHeader 无 padding，Handle 是 u64 newtype。
         let header_result =
-            unsafe { uaccess::write_user_value(&mut space, header_output, &message.header) };
+            unsafe { uaccess::write_user_value(&mut space, output.header, &result) };
         header_result
-            .and_then(|_| uaccess::copy_to_user(&mut space, payload_output, &message.payload))
+            .and_then(|_| uaccess::copy_to_user(&mut space, output.payload, &message.payload))
             .and_then(|_| {
                 let bytes = unsafe {
                     core::slice::from_raw_parts(
@@ -648,7 +762,7 @@ pub fn receive(
                         core::mem::size_of_val(output_handles),
                     )
                 };
-                uaccess::copy_to_user(&mut space, handles_output, bytes)
+                uaccess::copy_to_user(&mut space, output.handles, bytes)
             })
     };
 
@@ -660,13 +774,19 @@ pub fn receive(
                 .expect("Receive reservation must remain owned");
             mailbox.rollback_receive(token, message)
         };
+        mailbox.finish_waiters();
         if let Some(message) = rejected {
             message.close_transit_handles();
         }
         return Err(error.into());
     }
 
-    let Message { handles, .. } = message;
+    let Message {
+        mut handles,
+        delivery,
+        ..
+    } = message;
+    handles.push(delivery);
     {
         let mut table = thread.process.handles.lock();
         table

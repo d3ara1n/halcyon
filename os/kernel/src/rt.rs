@@ -109,11 +109,7 @@ extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
 /// 等待全员 Online → 回收 bootstrap 页 → 装载初始任务 → 发布 Ready →
 /// 进入调度循环。任何矛盾使本次启动整体失败（不做部分降级）。
 fn bring_up_runtime() -> ! {
-    let timebase = crate::sched::ticks_per_sec();
-    let Some(deadline) = timebase
-        .checked_mul(10)
-        .and_then(|window| sbi::read_time().checked_add(window))
-    else {
+    let Ok(deadline) = crate::clock::after_ns(10_000_000_000) else {
         registry::publish_failed();
         fatal_msg(&format_args!("secondary hart bring-up deadline overflows"));
     };

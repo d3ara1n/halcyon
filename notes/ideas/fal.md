@@ -1,70 +1,84 @@
 # 文件系统抽象层
 
-FAL（Filesystem Abstract Layer）是用户态客户端库与目录提供者之间的固定宽协议。内核对路径、节点、挂载、属性和文件权限零感知，只提供对象、Mailbox、Tunnel 与等待。
+FAL（Filesystem Abstract Layer）是用户态客户端与目录提供者之间的固定宽协议。内核不感知路径、节点、挂载、属性和文件权限，只提供对象、Mailbox、Delivery、Tunnel 与等待。
 
 ## DirectoryGrant
 
-**DirectoryGrant** 是对 provider 内某个目录根及操作上限的用户态 capability，不是内核 Directory 对象。推荐由 badged Mailbox sender 承载：provider 以 sender_badge 查得根节点、FAL rights ceiling 与生命周期状态。
+DirectoryGrant 是对 provider 内一个稳定目录及操作上限的 capability，由独立的 badged Mailbox sender 承载。provider 按内核提供的发送授权身份找到授权状态；badge 是不可变标签，不假定同 badge 必然是同一寿命实例。
 
-请求路径只在 grant 根内命名对象，不携带 authority。进程如何用前缀表选择初始 grant、挂载和卸载由 [`fs.md`](fs.md) 唯一拥有。FAL 只规定 provider 可以在子树边界返回更具体的 DirectoryGrant，供客户端继续组合走路。
+请求路径只命名对象，不携带 authority。目录根是稳定对象，不是一条会随 rename 指向别处的路径。复制、转交不依赖原持有进程存活；provider 通过发送授权的 Lifetime 观察全部引用及交付责任的最终消散。具体寿命契约由 [message](message.md) 拥有。
 
-## 权限
+派生只能选择当前根内可到达的目录，并收窄权限；派生结果有独立寿命。关闭父 grant 不撤销子 grant。策略撤销阻止该 grant 的新操作准入，已准入操作、已建立的流和独立派生能力按自身契约完成或取消；不隐含跨 provider 的递归撤销。
 
-系统不要求 uid/gid 或 Unix 用户权限。授权分两层：
+## 权限与能力导出
 
-- 内核 Handle rights 控制 Send、Wait、Duplicate、TRANSIT、GRANT；
-- FAL grant rights 控制 Traverse、Enumerate、Create、Remove、Read、Write 等目录操作。
+授权分两层：内核 Handle rights 控制 Send、Wait、Duplicate、TRANSIT、GRANT；FAL rights 控制 Traverse、Enumerate、ReadProperty、WriteProperty、ReadStream、WriteStream、Create、Remove、Watch 与 AcquireCapability。
 
-provider 把 FAL rights ceiling 绑定在 GrantState 中。持有者不能自行放大；进入子树或缩小 rights 时调用 DeriveGrant，由 provider 铸造新 badge。若未来加入多用户，ACL 只参与 DirectoryGrant 铸造和收窄，不改变内核。
+有效权限是 grant 上限、节点支持和 provider 政策的交集。元数据描述当前 grant 下允许的操作，不是全系统通用 inode mode。uid/gid 或 ACL 不是必需前提；若引入，只参与 grant 铸造与政策校验。
 
-节点返回的可用操作是“当前 grant 下允许什么”，不是全系统通用的 inode mode。provider 可以内部实现 ACL、只读介质或更细政策，但 FAL 不强制身份模型。
+读取普通属性与取得其中 capability 分开授权。Handle 类型标签只是协议提示，接收者通过实际对象描述及对应协议验证其角色。导出遵循两类政策：
 
-## 走路
+- DirectoryGrant 必须由目标 provider 实际派生满足上限的发送授权；只裁剪内核 WRITE 等位无法收窄 FAL 权限。
+- 其他协议的 endpoint 使用发布者明确给出的导出授权。FAL 不能猜测该协议的 badge 含义；需要按调用者进一步衰减时，调用目标协议显式提供的派生操作。
 
-客户端负责路径规范化、前缀选择、符号链接展开与跨 provider 组合。请求相对某个 DirectoryGrant 携带剩余路径；provider 在 grant 根和 rights ceiling 内尽量行进，返回：
+## 走路与稳定位置
 
-- **Found**：抵达终点节点，携带类型与元数据；
-- **Delegate**：抵达下级 provider 边界，返回新的 DirectoryGrant、已消费前缀与剩余后缀；
-- **SymbolicLinkBoundary**：途中遇到符号链接，返回父位置、target 文本与剩余后缀，客户端继续解释。
+客户端负责 namespace、符号链接和跨 provider 组合。provider 在当前根和权限范围内尽量行进，返回 Found、Delegate 或 SymbolicLinkBoundary。
 
-逻辑位置由 DirectoryGrant、相对路径与权限上界组成。`..` 由客户端逻辑栈解释，不能越过 grant 根；绝对符号链接从调用进程自己的前缀表重启。整次解析限制展开次数、总字节、组件数和 provider 跳数。
+Delegate 返回新的 DirectoryGrant、消费前缀与剩余后缀。中间 provider 持有目标根 grant，按来访权限与绑定政策计算交集，并向目标 provider 派生后才交付；不得返回宽权限母本再要求客户端自行限制。路由不包含同步等待下游的控制循环。
 
-客户端库不是信任边界。provider 必须重新校验路径编码、长度、偏移、cursor、badge 对应 GrantState 与每次操作 rights。
+符号链接只是持久路径文本，不携带 Handle、不铸造 authority，可以悬空。相对 target 在已知逻辑父位置展开，绝对 target 从调用者自己的 namespace 重启。`..` 按实际走路顺序处理，不能在遇到链接前词法抵消 `link/..`；只能回到已持有的逻辑父位置，不能要求 provider 越过 grant 根取得父目录。
+
+每个边界报告必须恰好覆盖本次请求，满足组件边界与推进要求。整次解析限制链接次数、组件数、总字节和 provider 跳数；失败、重启和重试共同消费同一预算与 Deadline。
+
+路径结果不是稳定授权。Create、Delete、Move 针对稳定父目录 grant 和最终名字；需要操作先前所见节点时增加身份或版本前置条件，失配且无副作用地返回冲突。Open 在同一次本地操作中确认目标、鉴权并取得节点引用。单个 provider 的最终操作有线性化点，跨 provider 解析不承诺全局快照。
+
+携带待交付能力的修改先解析到目标 provider 和稳定父目录，再运输能力；不能把捐赠的 endpoint 沿途交给路由 provider。最终条件冲突是明确的未提交结果，普通超时不提供这种保证。
 
 ## 节点与属性
 
-节点分目录、属性、流与符号链接。挂载点不是节点类型。符号链接是 provider 持久化的路径文本，不携带 Handle、不铸造 authority，允许悬空，并在调用者 namespace 中解释。
+节点分目录、属性、流与符号链接，挂载点不是节点类型。目录项的名字与节点身份分离：移动改变目录项，删除名字不销毁已由 grant 或流引用的对象。删除非空目录不隐含递归操作。
 
-硬链接不进入通用协议：节点身份、unlink、watch、配额与链接计数无法在 provider 间透明统一。存储去重可由 provider 内部 reflink/COW 完成。
+属性包含固定宽整数、浮点、字符串、字节集、Array、异构具名 Record 与 Handle 引用。整个属性值，包括其所有 capability 字段，是一个一致快照；写入是整值替换。嵌套值共享一个总字节、深度、元素和 Handle 预算，槽引用必须完整、唯一且符合本次消息结构。
 
-属性是节点上的具名类型值，覆盖固定宽整数、浮点、字符串、字节集、`Array<T>` 和 `Handle[T]`。T 是协议类型提示，客户端仍以实际对象操作验证 role。
+重复读取的 Handle 属性持有具 DUPLICATE 与 TRANSIT 的母本，按出口政策派生后交付。affine 值只能通过显式 Take 消费：回复成功入箱是取走的提交点，投递前失败恢复原值，不能先清空再尝试发送。属性预留期间的并发操作返回忙或等待该预留完成。
 
-重复读取的 `Handle[T]` 属性要求 provider 母本同时具备 DUPLICATE 与 TRANSIT；每次读取派生、按调用 grant 收窄，并在应答中 TRANSIT。affine 值应定义为一次性属性，成功读取后变空，不能伪装成可重复读取。写入 Handle 属性是原子替换：成功接收新 entry 后关闭旧值。
+写入带 Handle 的属性先完整验证与预留，再原子替换旧值。请求尚未投递时能力仍归调用者；已投递之后由接收方承担接受、返还或关闭责任，回复丢失不意味着能力还在调用者本地。
+
+硬链接不进入通用协议；去重与 COW 可以由 provider 内部实现。Move 只承诺同 provider、同存储事务域内的原子移动，分别核验源 Remove 和目标 Create，跨域返回 CrossDevice。Copy 的基本承诺是普通流和不携带能力的数据属性复制；跨 provider 流复制由客户端编排，失败允许部分目标，不隐含 copy+delete 或原子替换。
 
 ## 服务发现
 
-动态服务可以作为目录中的原子 service record 发布，record 同时包含 instance、protocol/version 与 endpoint capability。客户端读取 endpoint 属性即取得经 provider 鉴权和收窄的 badged sender。
-
-boot-critical 依赖仍在目标 Building 期直接 grant，并由用户态 StartupBlock 描述；首个目录 provider 由 init 的显式启动拓扑建立。服务死亡由 endpoint `CLOSED` 表达，目录随后撤销旧 record；客户端是否重新发现和重试由业务协议决定。
+服务记录使用原子 Record，一次读取同时得到 instance、protocol/version、endpoint 和记录代次。服务发布、Ready/Draining、注册控制权和实例替换由 [service](service.md) 拥有。boot-critical 依赖仍直接 grant，不形成发现引导环。
 
 ## Watch
 
-Watch 使用显式 Subscribe RPC。客户端为每个订阅创建独立 Notification，并把 signaler TRANSIT 给 provider；provider 只向该订阅提交 create/delete/modify/rename 位。客户端关闭 owner 即结束订阅。Notification 的等待、Take 与竞争消费语义由 [`signal.md`](signal.md) 拥有；FAL 只规定各位的业务含义。需要可重放、高频或带负载事件时使用消息或共享内存日志。
+每个订阅使用独立 Notification。客户端交付具 SIGNAL、WAIT 和 TRANSIT 的 signaler；provider 在一次状态修改中完成鉴权、安装订阅并取得目录代次，然后回复订阅身份、代次和有效 mask。
 
-## 流
+安装后、回复接收前的变化仍须留下 pending 位。客户端先订阅再读取快照；枚举期间发生修改可以使 cursor 失效，重读不重建一个有丢事件窗口的订阅。
 
-Open 由 provider 建立 Tunnel，并在应答中 TRANSIT peer invitation；客户端 attach 后取得本地 Endpoint。流的顺序、EOF、backpressure 与页内错误由 Runnel 等协议表达，控制面只负责建立和最终状态。
+事件位表示 create/delete/modify/rename，允许 OR 合并，不表达次数、顺序、名字或重放。订阅结束有独立终态位，原因可查询。Unsubscribe 验证 grant 与订阅身份的归属，确认后不再提交新信号；已 pending 的位不因此虚构为尚未发生。Notification owner 关闭结束订阅，provider 观察 CLOSED 后清理；客户端同时观察 provider 的关闭，不能只等自己的 Notification。
 
-随机小块访问可用 ReadAt/WriteAt，受消息 payload 上限约束；大数据不在控制面分片。Endpoint 或服务关闭转换为客户端错误，不能把 PEER_CLOSED 当作正常 EOF。
+订阅只覆盖本 provider 中已授权的节点或目录直接成员，不隐含跨 provider 或递归 Watch。可重放、高频、带负载或递归事件系统属于独立能力。
 
-## 固定宽 RPC
+## Open 与流完成
 
-FAL payload 在通用 [`RpcPrefix`](rpc.md) 后追加 FAL 版本、kind、总长度与 reserved；slot 0 的 send-once 约定由通用 RPC 拥有。FAL 字段固定宽、little-endian、版本化，写者置零 reserved，读者验证长度和业务不变量。
+Open 为现有流节点建立单工连接，声明 Read 或 Write、offset、范围约束、协议和几何请求；不隐含 append、truncate、创建或原子文件替换。provider 预留配额、取得节点引用、建立 Tunnel，回复 Invitation、StreamControl、协商几何和 offer 期限。
 
-kind 覆盖 Lookup、Enumerate、属性 Read/Write、Create、Delete、Move、Copy、Link、Open、ReadAt、WriteAt。目录枚举使用不透明 cursor；并发修改可令 cursor 失效。
+客户端 Attach 并验证 Runnel 后，通过 StreamControl 提交 Start。provider 必须确认对端已实际 Attach，且 offer 尚未到期，才允许数据任务开始。Open、Attach、验证和 Start 消费同一客户端连接期限；offer 还受 provider 的独立有限期限约束。
 
-v1 的 Move 只承诺同一 provider/capability domain 内原子完成；跨 provider 返回 CrossDevice。跨域 Copy 由客户端经流编排并允许部分目标，Move 不隐式退化为 copy+delete。
+Read 时 provider 是 Producer，Write 时 provider 是 Consumer。非阻塞数据任务受公平工作预算驱动，背压只挂起该流。普通读取不默认承诺快照，写入允许部分完成；Finish 成功表示后端接受了相应字节，不默认表示已经持久落盘。
 
-## 边界
+控制状态为 Preparing → Offered → Active → Terminal → Retiring。StreamControl 提供 Query、Finish 与 Cancel：Query 立即给出状态，Finish 等待并返回稳定的业务最终结果，Cancel 返回取消结果和已确定的部分进度。流引用在 terminal 和清理期间仍有唯一 owner。
 
-FAL 不规定 provider 内部存储、缓存、一致性、ACL 或配额算法。内核不解析 badge、路径与节点；provider 负责 badge→GrantState、请求鉴权、准入和资源治理。
+Runnel EOF 只表示数据阶段结束，PEER_CLOSED 不表示成功。读流在确认 EOF 和全部字节消费后取得最终结果；写流在发布 EOF 后等待 provider 消费并完成后端工作。普通客户端读到正常 EOF 必须已经确认业务成功；写入方法返回的共享环进度不能冒充 Finish。
+
+未 Attach、未 Start、回复投递失败、控制权消散、数据端关闭和服务退出都走同一条取消或退役路径。已有部分字节不能回滚为未发生；最终结果未确认前服务退出，调用者不能推断成功。Drop 只负责放弃和清理，不等于 Finish。
+
+## 协议边界
+
+FAL 使用 [RpcPrefix](rpc.md) 后的固定宽版本化头、little-endian 字段和明确长度。请求 slot 0 的 send-once 由 RPC 拥有，回复没有这个保留槽；每个业务回复独立声明能力槽。Delivery 是运输责任，不进入业务槽编号。
+
+provider 对编码、长度、路径、cursor、身份、权限和槽布局重新验证。版本升级同时替换生产者和消费者，不保留临时 anchor 或无鉴权路径。FAL wire 留在用户态框架，shared 只拥有内核与用户态 ABI。
+
+provider 内部存储、缓存、持久性、ACL 和配额算法可以替换，但本篇承诺的授权、所有权、失败原子性和已声明能力范围必须独立成立。

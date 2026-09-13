@@ -15,6 +15,38 @@ use super::{
 
 pub type ProcessHandleTable = HandleTable<ObjectRef, HandleRole>;
 pub type ProcessHandleEntry = Entry<ObjectRef, HandleRole>;
+pub(crate) enum PendingClose {
+    Entry(ProcessHandleEntry),
+    Retirement(ObjectRef),
+}
+
+impl PendingClose {
+    pub(crate) fn dependency(&self) -> super::request::FinishDependency {
+        match self {
+            Self::Retirement(object) => {
+                super::request::FinishDependency::Retirement(object.clone())
+            }
+            Self::Entry(_) => panic!("unstarted entry cannot block on retirement"),
+        }
+    }
+
+    pub(crate) fn advance(self, owner: &Process, budget: usize) -> (usize, Option<Self>) {
+        match self {
+            Self::Entry(entry) => retire_entry(entry, owner, budget),
+            Self::Retirement(object) => {
+                if object
+                    .retirement()
+                    .expect("retirement ticket lost its backend")
+                    .is_finished()
+                {
+                    (1, None)
+                } else {
+                    (0, Some(Self::Retirement(object)))
+                }
+            }
+        }
+    }
+}
 pub use handle_table::TakeNext;
 
 pub(crate) struct PendingEntries {
@@ -128,23 +160,23 @@ pub fn entry(
     Ok(Entry::new(object, role, rights))
 }
 
-/// 构造带对象专用不可变 badge 的表项；badge 随 duplicate/move 保持。
-pub fn entry_with_badge(
-    object: ObjectRef,
-    role: HandleRole,
-    rights: Rights,
-    badge: u64,
-) -> Result<ProcessHandleEntry, TableError> {
-    if !rights.is_known() {
-        return Err(TableError::RightsDenied);
-    }
-    let allowed = object
-        .allowed_rights(role)
-        .ok_or(TableError::RightsDenied)?;
-    if !rights.is_subset_of(allowed) {
-        return Err(TableError::RightsDenied);
-    }
-    Ok(Entry::new_with_badge(object, role, rights, badge))
+/// 仅描述本进程真实持有的 entry，不通过身份数值打开对象。
+pub fn query(thread: &super::Thread, source: Handle, output: usize) -> Result<(), SystemCallError> {
+    let table = thread.process.handles.lock();
+    let entry = table.get(source, Rights::NONE).map_err(map_error)?;
+    let description = erhino_shared::object::HandleDescription {
+        object_id: entry.object().header().koid(),
+        related_object_id: entry.object().related_id(),
+        kind: entry.object().kind() as u32,
+        role: *entry.role() as u32,
+        rights: entry.rights(),
+        badge: entry.object().badge(),
+        reserved: 0,
+    };
+    let mut space = thread.process.space.lock();
+    // SAFETY: 固定宽字段无 padding，输出失败不改变 capability。
+    unsafe { crate::uaccess::write_user_value(&mut space, output, &description) }
+        .map_err(Into::into)
 }
 
 pub enum HandleCloseStart {
@@ -154,6 +186,18 @@ pub enum HandleCloseStart {
 
 /// 表项已从 HandleTable 摘除且表锁已释放；现在执行对象生命周期动作。
 pub fn close_entry(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
+    if let Some(target) = entry.object().retirement() {
+        assert!(
+            exiting,
+            "explicit object retirement must use its commit path"
+        );
+        let launch = target
+            .begin(entry.object().clone(), None)
+            .expect("detached retirement must remain prepaid");
+        launch.publish();
+        drop(entry);
+        return;
+    }
     if entry.object().kind() == super::object::ObjectKind::TunnelEndpoint {
         assert!(
             exiting,
@@ -162,8 +206,28 @@ pub fn close_entry(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
         super::tunnel::close_detached(entry, owner);
         return;
     }
-    let (object, role, _, _) = entry.into_parts();
+    let (object, role, _) = entry.into_parts();
     object.close_handle(role, owner, exiting);
+}
+
+/// 启动对象执行者并返回完成 ticket；ProcessDrain 不参与内部物理退休。
+pub(crate) fn retire_entry(
+    entry: ProcessHandleEntry,
+    owner: &Process,
+    budget: usize,
+) -> (usize, Option<PendingClose>) {
+    assert!(budget > 0, "entry retirement requires a positive budget");
+    if let Some(target) = entry.object().retirement() {
+        let object = entry.object().clone();
+        let launch = target
+            .begin(object.clone(), None)
+            .expect("detached retirement must remain prepaid");
+        launch.publish();
+        drop(entry);
+        return (1, Some(PendingClose::Retirement(object)));
+    }
+    close_entry(entry, owner, true);
+    (1, None)
 }
 
 pub fn close_entry_infallible(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
@@ -175,7 +239,7 @@ pub fn close_entry_infallible(entry: ProcessHandleEntry, owner: &Process, exitin
 }
 
 pub fn close_transit(entry: ProcessHandleEntry) {
-    let (object, role, _, _) = entry.into_parts();
+    let (object, role, _) = entry.into_parts();
     object.close_transit(role);
 }
 
@@ -188,12 +252,23 @@ pub fn close(thread: &super::Thread, handle: Handle) -> Result<HandleCloseStart,
     if tunnel {
         return super::tunnel::close_handle(thread, handle).map(HandleCloseStart::Wait);
     }
-    let entry = thread
-        .process
-        .handles
-        .lock()
-        .remove(handle)
-        .map_err(map_error)?;
+    let entry = {
+        let mut table = thread.process.handles.lock();
+        let entry = table.get(handle, Rights::NONE).map_err(map_error)?;
+        if let Some(target) = entry.object().retirement() {
+            let launch = target.begin(entry.object().clone(), Some(thread.process.clone()))?;
+            let entry = table
+                .remove(handle)
+                .expect("retirement commit must retain its handle slot");
+            drop(table);
+            drop(entry);
+            let plan = launch
+                .publish()
+                .expect("explicit retirement lost its reply");
+            return Ok(HandleCloseStart::Wait(plan));
+        }
+        table.remove(handle).map_err(map_error)?
+    };
     close_entry_infallible(entry, &thread.process, false);
     Ok(HandleCloseStart::Ready)
 }

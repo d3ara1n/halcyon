@@ -12,6 +12,12 @@
 
 系统调用表只命名内核独有且已经成立的原语，不为用户态策略、便利组合或未设计能力预占入口。线程 join 由可等待的 ThreadControl、DONE 电平、WaitMany 与 HandleClose 组成；结果记录、栈解除和 Drop 策略属于用户态库，因此不另设 ThreadJoin。ThreadKill 若未来出现，必须先确定终止 authority、终因和资源接管，再决定 ABI，不能只因调用号相邻而提前占位。
 
+## 时间与对象观察
+
+公共 MonotonicNow 读取系统单调时间域；有限 Send 和等待直接接受绝对 Deadline，完整契约由 [time](time.md) 拥有。用户库的相对时长入口只做一次转换，不构成第二套内核等待机制。
+
+HandleQuery 只描述调用者持有的真实 entry，不按裸对象身份打开对象。Lifetime、消息 Delivery 与 WaitSet 分别由 [object](object.md)、[message](message.md) 和 [wait](wait.md) 拥有。WaitSet 的可增长注册集合必须由 Seal/Drain 以硬预算收束，ProcessDrain 接管同一进度；内核不增加等待服务线程或无界 close callback。
+
 ## Remote Call
 
 Remote Call 是 hart 间内核短动作的传输层，由 IPI 门铃、固定容量请求槽和可选完成通知组成。请求槽的 Pending 电平是工作真值，IPI 只提示目标 hart 检查槽，不携带业务载荷；门铃可以合并或重复，目标在每个 trap 安全出口都检查本 hart 固定槽。普通调度唤醒只需要门铃，不伪造 Remote Call 请求。

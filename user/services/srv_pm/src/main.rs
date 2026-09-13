@@ -20,7 +20,7 @@ use librunnel::blocking;
 use rinlib::{
     env,
     ipc::{
-        message::{send, wait_message},
+        message::{send_raw, wait_message},
         notification,
         object::close,
         wait::wait_many,
@@ -32,7 +32,7 @@ use rinlib::{
         message::MAILBOX_CAPACITY,
         object::{Handle, ObjectSignals},
         proc::{JobMemberKind, ProcessExitReason},
-        wait::{WAIT_TIMEOUT_INFINITE, WaitItem},
+        wait::WaitItem,
     },
     sys_sleep,
 };
@@ -55,7 +55,7 @@ fn main() {
     debug!("awake after two sleeps");
 
     // 阻塞等 init 转移 Tunnel Invitation（消息到达 → WaitMany 唤醒）。
-    let message = match wait_message(mailbox) {
+    let mut message = match wait_message(mailbox) {
         Ok(r) => r,
         Err(e) => {
             debug!("wait_message failed: {:?}", e);
@@ -66,12 +66,18 @@ fn main() {
         debug!("unexpected message kind {}", message.header.kind);
         return;
     }
-    let invitation = message.handles[0];
-
-    let mut tunnel = match blocking::attach_producer(invitation, rinlib::mm::Placement::Anywhere) {
-        Ok(t) => t,
-        Err(e) => {
-            debug!("tunnel attach failed: {:?}", e);
+    let owner = message.handles.take(0).expect("pm Invitation slot missing");
+    let invitation = match rinlib::ipc::invitation::Invitation::from_capability(owner) {
+        Ok(invitation) => invitation,
+        Err(failure) => {
+            debug!("invalid Tunnel Invitation: {:?}", failure.error);
+            return;
+        }
+    };
+    let mut tunnel = match blocking::Producer::attach(invitation, rinlib::mm::Placement::Anywhere) {
+        Ok(tunnel) => tunnel,
+        Err(failure) => {
+            debug!("Tunnel attach failed: {:?}", failure);
             return;
         }
     };
@@ -111,15 +117,27 @@ fn main() {
         debug!("unexpected wake request kind {}", message.header.kind);
         return;
     }
-    let target = message.handles[0];
-    let done = message.handles[1];
-    let spin = message.handles[2];
+    let target = message
+        .handles
+        .get(0)
+        .expect("pm target slot missing")
+        .as_handle();
+    let done = message
+        .handles
+        .get(1)
+        .expect("pm completion slot missing")
+        .as_handle();
+    let spin = message
+        .handles
+        .get(2)
+        .expect("pm wake slot missing")
+        .as_handle();
 
     for _ in 0..MAILBOX_CAPACITY {
-        send(target, WRITABLE_WAKE_FILL, &[], &[]).expect("wake fill failed");
+        unsafe { send_raw(target, WRITABLE_WAKE_FILL, &[], &[]) }.expect("wake fill failed");
     }
     assert!(matches!(
-        send(target, WRITABLE_WAKE_FILL, &[], &[]),
+        unsafe { send_raw(target, WRITABLE_WAKE_FILL, &[], &[]) },
         Err(SystemCallError::MailboxFull)
     ));
     // 满箱错误是可观测失败；确认后置位通知，随后阻塞在 WRITABLE 上。
@@ -131,14 +149,13 @@ fn main() {
     )];
     let mut woke = false;
     loop {
-        match send(target, WRITABLE_WAKE_TAIL, &[], &[]) {
+        match unsafe { send_raw(target, WRITABLE_WAKE_TAIL, &[], &[]) } {
             Ok(()) => break,
             Err(SystemCallError::MailboxFull) => {
                 if woke {
                     notification::signal(spin, 1).expect("spurious wake signal failed");
                 }
-                let result =
-                    wait_many(&items, WAIT_TIMEOUT_INFINITE).expect("writable wait failed");
+                let result = wait_many(&items, 0).expect("writable wait failed");
                 assert!(result.observed.intersects(ObjectSignals::WRITABLE));
                 woke = true;
             }

@@ -17,7 +17,7 @@ use libprocess::{
     race::{self, Cmd, Report},
     spawn,
 };
-use rinlib::ipc::message::{create, send, wait_message};
+use rinlib::ipc::message::{create, send_raw, wait_message};
 use rinlib::ipc::notification;
 use rinlib::ipc::object::{close, duplicate};
 use rinlib::ipc::tunnel as tunnel_sys;
@@ -30,7 +30,7 @@ use rinlib::shared::object::{Handle, ObjectSignals, Rights};
 use rinlib::shared::proc::{
     HandleGrant, JobMemberKind, JobState, ProcessExitReason, ProcessFaultCode, ProcessState,
 };
-use rinlib::shared::wait::{WAIT_TIMEOUT_INFINITE, WaitItem};
+use rinlib::shared::wait::WaitItem;
 use rinlib::sys_sleep;
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
@@ -54,12 +54,12 @@ impl RaceHammers {
         };
         for i in 0..2 {
             let cmd_pair = create(
-                Rights::READ | Rights::WAIT | Rights::GRANT,
+                Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
                 // 指令携带 HandleMove（transit 暂存）需要 TRANSIT 位。
                 Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
             )?;
             let report_pair = create(
-                Rights::READ | Rights::WAIT,
+                Rights::READ | Rights::WAIT | Rights::MANAGE,
                 Rights::WRITE | Rights::WAIT | Rights::GRANT | Rights::DUPLICATE,
             )?;
             let gun_pair =
@@ -99,12 +99,14 @@ impl RaceHammers {
     }
 
     fn send_cmd(&self, hammer: usize, cmd: &Cmd, moves: &[HandleMove]) -> bool {
-        send(
-            self.cmd[hammer],
-            race::MSG_CMD,
-            &race::encode_cmd(cmd),
-            moves,
-        )
+        unsafe {
+            send_raw(
+                self.cmd[hammer],
+                race::MSG_CMD,
+                &race::encode_cmd(cmd),
+                moves,
+            )
+        }
         .is_ok()
     }
 
@@ -283,7 +285,7 @@ fn await_reapable(control: Handle) -> bool {
         ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
         0,
     )];
-    match wait_many(&items, WAIT_TIMEOUT_INFINITE) {
+    match wait_many(&items, 0) {
         Ok(_) => true,
         Err(error) => {
             debug!("race: reapable wait failed: {:?}", error);
@@ -928,7 +930,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
         );
         let peer_closed = endpoint
             .events()
-            .wait(ObjectSignals::PEER_CLOSED, WAIT_TIMEOUT_INFINITE)
+            .wait(ObjectSignals::PEER_CLOSED, 0)
             .map(|result| result.observed.intersects(ObjectSignals::PEER_CLOSED))
             .unwrap_or(false);
         if !published || terminal.is_none() || !peer_closed {

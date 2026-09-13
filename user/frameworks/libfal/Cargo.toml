@@ -7,3 +7,11 @@ edition = "2024"
 
 [dependencies]
 librpc = { path = "../librpc" }
+libsrv = { path = "../libsrv" }
+erhino_shared = { path = "../../../shared" }
+ordered_table = { path = "../../../os/ordered_table" }
+metadata_admission = { path = "../../../os/metadata_admission" }
+monotonic_id = { path = "../../../os/monotonic_id" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }

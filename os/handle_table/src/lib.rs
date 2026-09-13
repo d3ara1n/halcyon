@@ -32,21 +32,14 @@ pub struct Entry<T, R> {
     object: T,
     role: R,
     rights: Rights,
-    /// capability 副本携带的不可变 badge；具体语义由对象类型解释。
-    badge: u64,
 }
 
 impl<T, R> Entry<T, R> {
     pub const fn new(object: T, role: R, rights: Rights) -> Self {
-        Self::new_with_badge(object, role, rights, 0)
-    }
-
-    pub const fn new_with_badge(object: T, role: R, rights: Rights, badge: u64) -> Self {
         Self {
             object,
             role,
             rights,
-            badge,
         }
     }
 
@@ -62,12 +55,8 @@ impl<T, R> Entry<T, R> {
         self.rights
     }
 
-    pub const fn badge(&self) -> u64 {
-        self.badge
-    }
-
-    pub fn into_parts(self) -> (T, R, Rights, u64) {
-        (self.object, self.role, self.rights, self.badge)
+    pub fn into_parts(self) -> (T, R, Rights) {
+        (self.object, self.role, self.rights)
     }
 
     fn with_rights(mut self, rights: Rights) -> Self {
@@ -82,7 +71,6 @@ impl<T: Clone, R: Clone> Clone for Entry<T, R> {
             object: self.object.clone(),
             role: self.role.clone(),
             rights: self.rights,
-            badge: self.badge,
         }
     }
 }
@@ -123,6 +111,26 @@ pub struct Reservation {
 pub struct PreparedCommit<T, R> {
     reservation: Reservation,
     entries: Vec<Entry<T, R>>,
+}
+
+pub struct PreparedExtraction<'a, T, R> {
+    table: &'a mut HandleTable<T, R>,
+    items: &'a [(Handle, Rights)],
+    extracted: Vec<Entry<T, R>>,
+}
+
+impl<T, R> PreparedExtraction<'_, T, R> {
+    pub fn commit(mut self) -> Vec<Entry<T, R>> {
+        for (handle, rights) in self.items.iter().copied() {
+            self.extracted.push(
+                self.table
+                    .remove(handle)
+                    .expect("validated move remains installed")
+                    .with_rights(rights),
+            );
+        }
+        self.extracted
+    }
 }
 
 pub struct PrepareCommitFailure<T, R> {
@@ -244,7 +252,7 @@ impl<T, R> HandleTable<T, R> {
         &mut self,
         moves: &[(Handle, Rights)],
     ) -> Result<Vec<Entry<T, R>>, TableError> {
-        self.extract_with(moves, Rights::TRANSIT)
+        Ok(self.prepare_extract_with(moves, Rights::TRANSIT)?.commit())
     }
 
     /// 原子验证并移除一批待直接安装到另一 HandleTable 的 Handle。任何
@@ -253,7 +261,7 @@ impl<T, R> HandleTable<T, R> {
         &mut self,
         grants: &[(Handle, Rights)],
     ) -> Result<Vec<Entry<T, R>>, TableError> {
-        self.extract_with(grants, Rights::GRANT)
+        Ok(self.prepare_extract_with(grants, Rights::GRANT)?.commit())
     }
 
     /// Pin 一个提交时消费的独占 authority。验证与翻转在单临界区完成，
@@ -408,11 +416,19 @@ impl<T, R> HandleTable<T, R> {
         }
     }
 
-    fn extract_with(
-        &mut self,
-        items: &[(Handle, Rights)],
+    /// 借用表冻结校验结果，提交前可以放弃，提交不分配也不失败。
+    pub fn prepare_extract_moves<'a>(
+        &'a mut self,
+        moves: &'a [(Handle, Rights)],
+    ) -> Result<PreparedExtraction<'a, T, R>, TableError> {
+        self.prepare_extract_with(moves, Rights::TRANSIT)
+    }
+
+    fn prepare_extract_with<'a>(
+        &'a mut self,
+        items: &'a [(Handle, Rights)],
         transport: Rights,
-    ) -> Result<Vec<Entry<T, R>>, TableError> {
+    ) -> Result<PreparedExtraction<'a, T, R>, TableError> {
         let mut extracted = Vec::new();
         extracted
             .try_reserve(items.len())
@@ -431,10 +447,11 @@ impl<T, R> HandleTable<T, R> {
             }
         }
 
-        for (handle, rights) in items.iter().copied() {
-            extracted.push(self.remove(handle)?.with_rights(rights));
-        }
-        Ok(extracted)
+        Ok(PreparedExtraction {
+            table: self,
+            items,
+            extracted,
+        })
     }
 
     /// 预留一批不可见槽位；失败时不会留下部分预留。
@@ -603,37 +620,6 @@ impl<T, R> HandleTable<T, R> {
         TakeNext::Exhausted
     }
 
-    /// 消费整张表并零分配地迭代已安装项；进程退出路径使用。
-    pub fn into_entries(self) -> impl Iterator<Item = Entry<T, R>> {
-        self.slots.into_iter().filter_map(|slot| match slot.state {
-            SlotState::Occupied(entry) => Some(entry),
-            SlotState::Pinned(_, _) => None,
-            SlotState::Vacant | SlotState::Reserved(_) | SlotState::Retired => None,
-        })
-    }
-
-    /// 摘出所有已安装项，并清除任何事务预留。测试与非退出路径使用；
-    /// 进程最终回收优先消费 [`Self::into_entries`]，避免为清理再分配。
-    pub fn drain(&mut self) -> Vec<Entry<T, R>> {
-        let mut entries = Vec::new();
-        let _ = entries.try_reserve(self.occupied);
-        for index in 1..self.slots.len() {
-            let state = core::mem::replace(&mut self.slots[index].state, SlotState::Vacant);
-            match state {
-                SlotState::Occupied(entry) => {
-                    entries.push(entry);
-                    self.occupied -= 1;
-                    self.advance_generation(index);
-                }
-                SlotState::Pinned(_, _) => self.advance_generation(index),
-                SlotState::Reserved(_) => self.advance_generation(index),
-                SlotState::Retired => self.slots[index].state = SlotState::Retired,
-                SlotState::Vacant => {}
-            }
-        }
-        entries
-    }
-
     fn occupied_index(&self, handle: Handle) -> Result<usize, TableError> {
         if !handle.is_valid() {
             return Err(TableError::InvalidHandle);
@@ -732,10 +718,6 @@ mod tests {
         Entry::new(value, role, rights)
     }
 
-    fn badged_entry(value: u32, role: Role, rights: Rights, badge: u64) -> Entry<u32, Role> {
-        Entry::new_with_badge(value, role, rights, badge)
-    }
-
     #[test]
     fn stale_handle_never_names_reused_slot() {
         let mut table = HandleTable::with_limit(2);
@@ -780,22 +762,22 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_move_preserve_badge() {
+    fn duplicate_and_move_preserve_object_and_role() {
         let mut table = HandleTable::new();
         let source = table
-            .insert(badged_entry(
+            .insert(entry(
                 7,
                 Role::Sender,
                 Rights::WRITE | Rights::TRANSIT | Rights::DUPLICATE,
-                0xfeed_beef,
             ))
             .unwrap();
         let copy = table
             .duplicate(source, Rights::WRITE | Rights::TRANSIT)
             .unwrap();
-        assert_eq!(table.get(copy, Rights::WRITE).unwrap().badge(), 0xfeed_beef);
+        assert_eq!(*table.get(copy, Rights::WRITE).unwrap().object(), 7);
         let moved = table.extract_moves(&[(copy, Rights::WRITE)]).unwrap();
-        assert_eq!(moved[0].badge(), 0xfeed_beef);
+        assert_eq!(*moved[0].object(), 7);
+        assert_eq!(*moved[0].role(), Role::Sender);
     }
 
     #[test]
@@ -904,12 +886,19 @@ mod tests {
     }
 
     #[test]
-    fn drain_returns_entries_and_clears_reservations() {
+    fn bounded_take_clears_reservations() {
         let mut table = HandleTable::new();
         table.insert(entry(1, Role::Owner, Rights::READ)).unwrap();
         let _reservation = table.reserve(1, 17).unwrap();
-        let drained = table.drain();
-        assert_eq!(drained.len(), 1);
+        let mut cursor = 1;
+        assert!(matches!(
+            table.take_next_bounded(&mut cursor, 1),
+            TakeNext::Entry(_)
+        ));
+        assert!(matches!(
+            table.take_next_bounded(&mut cursor, 1),
+            TakeNext::Exhausted
+        ));
         assert!(table.is_empty());
     }
 

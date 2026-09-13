@@ -139,9 +139,15 @@ pub fn validate_response(
 
 /// 同步调用层依赖 ecall，仅内核目标编译；framing 核心 host 可测。
 #[cfg(target_arch = "riscv64")]
+pub mod exchange;
+#[cfg(target_arch = "riscv64")]
 pub mod caller;
 #[cfg(target_arch = "riscv64")]
-pub use caller::{CallError, Caller, FrameRejection, Reply};
+pub mod dispatcher;
+#[cfg(target_arch = "riscv64")]
+pub use caller::Caller;
+#[cfg(target_arch = "riscv64")]
+pub use exchange::{CallCause, CallError, CallPhase, FrameRejection, PreparedResponse, Reply, Request, RequestContext};
 
 #[cfg(test)]
 mod tests {

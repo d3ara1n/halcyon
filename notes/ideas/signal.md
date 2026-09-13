@@ -14,4 +14,4 @@ Notification 是按位 OR 合并、由消费者显式取走的独立对象。它
 
 Notification 不是广播队列：一个消费者取走某位后，其他消费者不再看到该位。需要每订阅者可靠通知时，provider 必须为每个订阅关系持有独立 Notification signaler，或使用可重放日志。
 
-ObjectSignals、WaitMany、Timeout 与取消的通用契约见 [`wait.md`](wait.md)，本篇不重复定义。
+ObjectSignals、WaitMany、WaitSet 与取消的通用契约见 [wait](wait.md)，绝对期限见 [time](time.md)。持久注册也只观察 READABLE/CLOSED，NotificationTake 仍是唯一的位消费入口。

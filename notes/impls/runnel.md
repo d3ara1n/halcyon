@@ -12,11 +12,15 @@ Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节
 
 ## owner、门铃与错误
 
-公开 guest 接口在 `blocking` 模块：create 接受字节长度和 `rinlib::mm::Placement`，attach 接受 Invitation 和 placement；Producer/Consumer 独占 Endpoint，不导出 Handle 或共享 slice。共享访问通过 [`Tunnel owner`](tunnel.md) 借出的 `SharedMemory`，仅临时借用映射，不创建自引用结构。
+公开 guest 接口在 `blocking` 模块：安全 `Producer/Consumer::create` 接受字节长度和 `rinlib::mm::Placement` 并返回 typed Invitation；安全 `attach` 消费 typed Invitation。内核未消费的失败保留 Invitation，已消费后的协议验证失败以 `InitFailure<Endpoint>` 返还本地映射 owner；异常几何清理由 rinlib 的 EndpointCleanup 保留。私有 Channel/ProducerCore/ConsumerCore 构造也以 InitFailure 返还 Transport，不在初始化失败时进入运行期 Broken/关闭路径。现有原始 ABI 工厂及 unsafe attach 函数只承接尚待迁移的验收调用者，正式 Open 使用安全入口。Producer/Consumer 独占 Endpoint，不导出 Handle 或共享 slice。共享访问通过 [`Tunnel owner`](tunnel.md) 借出的 `SharedMemory`，仅临时借用映射，不创建自引用结构。
 
 所有公开数据操作在正进展后通知，finish 在 EOF 发布后通知；Invited 期 ObjectNotAvailable 不代表 Closed，attach 首次检查取得已经发布的数据。无进展时 acknowledge → 重查 → WaitMany(DATA|PEER_CLOSED|CLOSED)，不做边沿省略。
 
 `IoError` 同时报告协议/系统错误、已完成字节数和清理错误；批量操作累计整次调用进度，通知失败不能撤回已发布的数据。首次协议/等待错误进入不可逆终态并尝试关闭 Endpoint，失败 owner 保留在 Guest 中仅供清理，后续数据访问先拒绝。`close(self)` 失败返回完整角色；Consumer 的 `wait_peer_closed(&mut self, timeout)` 通过内部事件能力观察终态并停止后续数据访问，随后由调用者显式 close。Drop 的最终兜底由 rinlib owner 完成，不无限重试。
+
+## 当前施工
+
+上述 typed 构造和错误 owner 是 FAL 整体施工中的连接点，尚未编译、测试或组合验收；新 host 用例只已写入，覆盖畸形 header 后承载未关闭、关闭失败保留、再次关闭成功。真实 FAL provider/Open 尚未接通；pm 接收侧已经从 HandleSet 提取 Capability、验证为 Invitation 并调用安全 Producer::attach，init 创建侧仍待迁入安全工厂。不能将本节源码状态解释为新的交付证据。
 
 ## 验证
 

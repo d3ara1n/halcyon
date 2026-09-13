@@ -141,8 +141,9 @@ unsafe extern "C" fn handle_user_trap(
     if let Some(t) = thread {
         t.finish_output_termination();
     }
-    // ecall 可能在本次 trap 内向当前 hart 发布请求；返回用户态前再消费一次。
+    // 业务 guard 已释放，统一推进两段式通知；剩余 pending 再发布门铃。
     deferred_work::drain_current();
+    crate::task::notify_work::drain_current();
     if thread.is_some_and(|t| t.process.lifecycle.is_terminating()) {
         Outcome::Killed as usize
     } else {

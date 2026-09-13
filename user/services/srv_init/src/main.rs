@@ -25,17 +25,19 @@ use libprocess::{
     SupervisionCause, SupervisionProgress, SupervisionStage, SupervisionTarget, collect_process,
     enumerate_members, job_kill, spawn,
 };
-use librpc::{CallError, Caller, FrameRejection, RpcMessageKind, RpcPrefix};
+use librpc::{
+    CallCause, CallError, CallPhase, Caller, FrameRejection, Request, RpcMessageKind, RpcPrefix,
+};
 use librunnel::blocking;
 use rinlib::ipc::tunnel as tunnel_sys;
-#[cfg(not(feature = "acceptance-stress"))]
+use rinlib::ipc::{capability::Capability, packet::Packet};
 use rinlib::memory_pool::MemoryPool;
 #[cfg(feature = "acceptance-stress")]
 use rinlib::shared::proc::ProcessDrainStatus;
 use rinlib::{
     env,
     ipc::{
-        message::{create, discard, make_send_once, mint_sender, receive, send, wait_message},
+        message::{create, discard, make_send_once, mint_sender, receive, send_raw, wait_message},
         notification,
         object::{close, duplicate},
         wait::wait_many,
@@ -55,12 +57,13 @@ use rinlib::{
         },
         reset::{ResetAction, ResetReason},
         startup::initial,
-        wait::{WAIT_TIMEOUT_INFINITE, WaitItem, WaitReason},
+        wait::{WaitItem, WaitReason},
     },
     system,
 };
 
 mod building;
+mod public_ipc;
 #[cfg(feature = "acceptance-stress")]
 mod race;
 use building::build_spin_building;
@@ -390,7 +393,6 @@ fn root_memory_pool() -> Handle {
         .expect("init must hold root MemoryPool authority")
 }
 
-#[cfg(not(feature = "acceptance-stress"))]
 fn root_pool_allocated() -> Result<u64, SystemCallError> {
     let handle = duplicate(root_memory_pool(), Rights::READ)?;
     // SAFETY: duplicate 新建唯一 raw owner，本作用域不保留 alias，Drop 负责关闭。
@@ -846,48 +848,68 @@ fn test_rpc_reject_cleanup() {
     let worker = rinlib::thread::Builder::new()
         .spawn(move || {
             for attempt in 0..2 {
-                let request = wait_message(service.owner).expect("RPC test request receive failed");
+                let mut request =
+                    wait_message(service.owner).expect("RPC test request receive failed");
                 let prefix =
                     RpcPrefix::decode(&request.payload).expect("RPC test request prefix invalid");
                 assert_eq!(prefix.kind, RpcMessageKind::Request);
-                let reply_once = request.handles[0];
+                let mut reply_once = request
+                    .handles
+                    .take(0)
+                    .expect("RPC test reply slot missing");
                 let mut response = [0u8; librpc::PREFIX_LEN + 1];
                 RpcPrefix::new(RpcMessageKind::Response, prefix.txid).encode(&mut response);
                 response[librpc::PREFIX_LEN] = attempt;
+                let protocol = if attempt == 0 { PROTOCOL + 1 } else { PROTOCOL };
+                let mut packet = Packet::new(protocol, &response)
+                    .expect("RPC response packet allocation failed");
                 if attempt == 0 {
-                    let moves = [HandleMove {
-                        handle: rejected.peer,
-                        rights: Rights::SIGNAL,
-                    }];
-                    send(reply_once, PROTOCOL + 1, &response, &moves)
-                        .expect("RPC malformed response send failed");
-                } else {
-                    send(reply_once, PROTOCOL, &response, &[])
-                        .expect("RPC valid response send failed");
+                    // SAFETY: 新创建的原始 signaler 尚未被其他 owner 接管，alias 仅用于 stale 检查。
+                    let capability = unsafe { Capability::from_raw(rejected.peer) };
+                    packet
+                        .push(capability, Rights::SIGNAL)
+                        .expect("RPC response capability preparation failed");
                 }
+                packet
+                    .try_reply(&mut reply_once, rinlib::time::Deadline::INFINITE)
+                    .expect("RPC response publication failed");
             }
             unsafe { close(service.owner) }.expect("RPC test service owner close failed");
         })
         .expect("RPC test worker spawn failed");
 
+    // SAFETY: 此 sender 由原始队列工厂创建，本测试在此唯一接管关闭责任。
+    let service_sender = unsafe { Capability::from_raw(service.peer) };
     let mut caller = Caller::new();
     assert!(matches!(
-        caller.call(service.peer, PROTOCOL, 0, b"reject", &[]),
-        Err(CallError::Frame(FrameRejection::ProtocolMismatch))
+        caller.call(
+            &service_sender,
+            rinlib::time::Deadline::INFINITE,
+            Request::new(PROTOCOL, b"reject").expect("RPC request preparation failed")
+        ),
+        Err(CallError {
+            phase: CallPhase::Sent,
+            cause: CallCause::Frame(FrameRejection::ProtocolMismatch),
+            ..
+        })
     ));
     assert!(matches!(
         notification::signal(rejected_alias, 1),
         Err(SystemCallError::StaleHandle)
     ));
     let reply = caller
-        .call(service.peer, PROTOCOL, 0, b"accept", &[])
+        .call(
+            &service_sender,
+            rinlib::time::Deadline::INFINITE,
+            Request::new(PROTOCOL, b"accept").expect("RPC request preparation failed"),
+        )
         .expect("RPC call after rejected reply failed");
     assert_eq!(reply.payload, [1]);
     assert!(reply.handles.is_empty());
 
     worker.join();
     unsafe { close(rejected.owner) }.expect("RPC rejected Handle owner close failed");
-    unsafe { close(service.peer) }.expect("RPC test service sender close failed");
+    drop(service_sender);
     debug!("RPC rejected reply cleanup passed");
 }
 
@@ -935,24 +957,25 @@ fn run(services: Handle) -> Result<(), &'static str> {
     }];
 
     // —— 同步消息 + Handle move + Notification/WaitMany 快路径 ——
-    match send(pair.peer, 114, &[5u8, 1u8, 4u8], &moves) {
+    match unsafe { send_raw(pair.peer, 114, &[5u8, 1u8, 4u8], &moves) } {
         Ok(()) => match receive(pair.owner) {
             Ok(message) => {
                 debug!(
                     "message: kind={}, payload={:?}",
                     message.header.kind, message.payload
                 );
-                let moved = message.handles[0];
+                let moved = message
+                    .handles
+                    .get(0)
+                    .expect("notification slot missing")
+                    .as_handle();
                 notification::signal(moved, 0x5).expect("notification signal failed");
-                let result = wait_many(
-                    &[WaitItem::new(event.owner, ObjectSignals::READABLE, 7)],
-                    WAIT_TIMEOUT_INFINITE,
-                )
-                .expect("notification wait failed");
+                let result =
+                    wait_many(&[WaitItem::new(event.owner, ObjectSignals::READABLE, 7)], 0)
+                        .expect("notification wait failed");
                 let bits =
                     notification::take(event.owner, u64::MAX).expect("notification take failed");
                 debug!("notification: cookie={}, bits={:#x}", result.cookie, bits);
-                let _ = unsafe { close(moved) };
             }
             Err(e) => debug!("receive failed: {:?}", e),
         },
@@ -969,8 +992,14 @@ fn run(services: Handle) -> Result<(), &'static str> {
     #[cfg(feature = "acceptance-stress")]
     test_tunnel_lifecycle();
     test_send_once();
+    test_wait_set_retirement();
     test_rpc_reject_cleanup();
     test_writable_level();
+    public_ipc::threaded_receive();
+    public_ipc::committed_kill(
+        acceptance,
+        target_image.as_deref().expect("IPC target image missing"),
+    );
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
     let (mut tunnel, invitation) =
@@ -986,7 +1015,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
         handle: invitation,
         rights: Rights::MAP,
     }];
-    if let Err(e) = send(pm_mailbox, 514, &[], &invitation_move) {
+    if let Err(e) = unsafe { send_raw(pm_mailbox, 514, &[], &invitation_move) } {
         debug!("send tunnel invitation failed: {:?}", e);
         return Err("send tunnel invitation failed");
     }
@@ -1450,23 +1479,41 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
         );
         "drain minimum-budget notification create failed"
     })?;
-    let grants = [HandleGrant {
-        handle: marker.owner,
-        rights: Rights::READ | Rights::WAIT,
-    }];
+    let ready = notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT)
+        .map_err(|_| {
+        let _ = unsafe { close(marker.owner) };
+        let _ = unsafe { close(marker.peer) };
+        "drain minimum-budget ready creation failed"
+    })?;
+    let grants = [
+        HandleGrant {
+            handle: marker.owner,
+            rights: Rights::READ | Rights::WAIT,
+        },
+        HandleGrant {
+            handle: ready.peer,
+            rights: Rights::SIGNAL,
+        },
+    ];
     let result = (|| {
         let started = spawn(SpawnRequest {
             memory_pool: root_memory_pool(),
             job,
             image,
-            payload: &[],
+            payload: b"retirement",
             grants: &grants,
             control_rights: SUPERVISOR_RIGHTS,
         })
         .map_err(|error| {
             debug!("drain minimum-budget acceptance failed: spawn {:?}", error);
             let _ = unsafe { close(marker.owner) };
+            let _ = unsafe { close(ready.peer) };
             "drain minimum-budget spawn failed"
+        })?;
+        wait_many(&[WaitItem::new(ready.owner, ObjectSignals::READABLE, 0)], 0).map_err(|_| {
+            let _ = process::kill(started.control, 0x5D);
+            let _ = unsafe { close(started.control) };
+            "drain minimum-budget target readiness failed"
         })?;
         if let Err(error) = process::kill(started.control, 0x5D) {
             debug!("drain minimum-budget acceptance failed: kill {:?}", error);
@@ -1479,7 +1526,7 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
                 ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
                 0,
             )],
-            WAIT_TIMEOUT_INFINITE,
+            0,
         ) {
             debug!("drain minimum-budget acceptance failed: wait {:?}", error);
             let _ = unsafe { close(started.control) };
@@ -1492,19 +1539,22 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
                 break Err(SystemCallError::InternalError);
             }
             match process::drain(started.control, 1) {
+                Ok(result) if result.work_done > 1 => break Err(SystemCallError::InternalError),
                 Ok(result) if result.status == ProcessDrainStatus::Complete as u32 => break Ok(()),
-                Ok(_) => continue,
+                Ok(result) if result.work_done == 1 => continue,
+                Ok(_) => break Err(SystemCallError::InternalError),
                 Err(error) => break Err(error),
             }
         };
         debug!(
-            "drain minimum-budget acceptance {}: {} batches",
+            "drain minimum-budget acceptance {}: {} batches, retired WaitSet with 256 registrations",
             if drained.is_ok() { "passed" } else { "failed" },
             batches
         );
         let _ = unsafe { close(started.control) };
         drained.map_err(|_| "drain minimum-budget did not complete")
     })();
+    let _ = unsafe { close(ready.owner) };
     let _ = unsafe { close(marker.peer) };
     result
 }
@@ -1517,10 +1567,7 @@ fn test_job_seal_completion(job: Handle) {
         return;
     };
     let sealed = process::seal_job(child);
-    let waited = wait_many(
-        &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
-        WAIT_TIMEOUT_INFINITE,
-    );
+    let waited = wait_many(&[WaitItem::new(child, ObjectSignals::CLOSED, 0)], 0);
     let snapshot = process::query_job(child);
     // 幂管：Dead 上重复 seal 成功且不改变状态。
     let resealed = process::seal_job(child);
@@ -1680,10 +1727,7 @@ fn seal_before_start(job: Handle) {
     let _ = process::drain_to_completion(created.control);
     let _ = unsafe { close(created.control) };
     let _ = unsafe { close(created.builder) };
-    let waited = wait_many(
-        &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
-        WAIT_TIMEOUT_INFINITE,
-    );
+    let waited = wait_many(&[WaitItem::new(child, ObjectSignals::CLOSED, 0)], 0);
     let snapshot = process::query_job(child);
     let passed = sealed.is_ok()
         && gated
@@ -1706,10 +1750,7 @@ fn seal_before_create(job: Handle) {
         return;
     };
     let sealed = process::seal_job(child);
-    let waited = wait_many(
-        &[WaitItem::new(child, ObjectSignals::CLOSED, 0)],
-        WAIT_TIMEOUT_INFINITE,
-    );
+    let waited = wait_many(&[WaitItem::new(child, ObjectSignals::CLOSED, 0)], 0);
     let member = process::create(child, SUPERVISOR_RIGHTS);
     let subjob = process::create_job(child, JOB_FULL_RIGHTS);
     let passed = sealed.is_ok()
@@ -1812,6 +1853,8 @@ fn test_capability_badges_and_affine_owners() {
         Rights::WRITE | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("badged sender mint failed");
+    let lifetime = badged.lifetime;
+    let badged = badged.sender;
     let copy = duplicate(badged, Rights::WRITE).expect("badged sender duplicate failed");
     assert!(matches!(
         mint_sender(mailbox.owner, BADGE + 1, Rights::SIGNAL),
@@ -1823,9 +1866,10 @@ fn test_capability_badges_and_affine_owners() {
     )
     .expect("capability transport mailbox create failed");
 
-    send(mailbox.peer, 880, &[], &[]).expect("default sender send failed");
-    send(badged, 881, &[], &[]).expect("badged sender send failed");
-    send(copy, 882, &[], &[]).expect("badged sender copy send failed");
+    unsafe { send_raw(mailbox.peer, 880, &[], &[]) }
+        .expect("explicit zero-badge sender send failed");
+    unsafe { send_raw(badged, 881, &[], &[]) }.expect("badged sender send failed");
+    unsafe { send_raw(copy, 882, &[], &[]) }.expect("badged sender copy send failed");
     for (kind, badge) in [(880, 0), (881, BADGE), (882, BADGE)] {
         let message = receive(mailbox.owner).expect("badged message receive failed");
         assert_eq!(message.header.kind, kind);
@@ -1833,7 +1877,7 @@ fn test_capability_badges_and_affine_owners() {
         assert_eq!(message.header.sender_badge, badge);
     }
     let once = make_send_once(badged, Rights::WRITE).expect("badged send-once mint failed");
-    send(once, 887, &[], &[]).expect("badged send-once send failed");
+    unsafe { send_raw(once, 887, &[], &[]) }.expect("badged send-once send failed");
     let message = receive(mailbox.owner).expect("badged send-once receive failed");
     assert_eq!(message.header.sender_badge, BADGE);
 
@@ -1843,16 +1887,20 @@ fn test_capability_badges_and_affine_owners() {
         handle: transit,
         rights: Rights::WRITE,
     }];
-    send(transport.peer, 888, &[], &moves).expect("badged sender transit failed");
+    unsafe { send_raw(transport.peer, 888, &[], &moves) }.expect("badged sender transit failed");
     let transferred = receive(transport.owner)
         .expect("badged sender transit receive failed")
-        .handles[0];
-    send(transferred, 889, &[], &[]).expect("transferred badged sender send failed");
+        .handles
+        .take(0)
+        .expect("badged sender slot missing")
+        .into_raw();
+    unsafe { send_raw(transferred, 889, &[], &[]) }.expect("transferred badged sender send failed");
     let message = receive(mailbox.owner).expect("transferred badged message receive failed");
     assert_eq!(message.header.sender_badge, BADGE);
     unsafe { close(transferred) }.expect("transferred badged sender close failed");
     unsafe { close(copy) }.expect("badged sender copy close failed");
     unsafe { close(badged) }.expect("badged sender close failed");
+    unsafe { close(lifetime) }.expect("badged sender observer close failed");
 
     assert!(matches!(
         duplicate(mailbox.owner, Rights::READ),
@@ -1863,10 +1911,10 @@ fn test_capability_badges_and_affine_owners() {
         rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
     }];
     assert!(matches!(
-        send(transport.peer, 883, &[], &owner_move),
+        unsafe { send_raw(transport.peer, 883, &[], &owner_move) },
         Err(SystemCallError::RightsDenied)
     ));
-    send(mailbox.peer, 884, &[], &[]).expect("owner must survive rejected transit");
+    unsafe { send_raw(mailbox.peer, 884, &[], &[]) }.expect("owner must survive rejected transit");
     assert_eq!(
         receive(mailbox.owner)
             .expect("owner receive after rejected transit failed")
@@ -1889,7 +1937,7 @@ fn test_capability_badges_and_affine_owners() {
         rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
     }];
     assert!(matches!(
-        send(transport.peer, 886, &[], &owner_move),
+        unsafe { send_raw(transport.peer, 886, &[], &owner_move) },
         Err(SystemCallError::RightsDenied)
     ));
     notification::signal(event.peer, 1).expect("notification owner must survive rejected transit");
@@ -1908,8 +1956,82 @@ fn test_capability_badges_and_affine_owners() {
     debug!("capability badge and owner transport passed");
 }
 
-/// 一次性投递权（send-once）：本进程内验证 mint、用后即摘、
-/// 经消息转移后由接收方一次性使用，以及原 sender 不受影响。
+/// 持久观察的轮次、立即失效与内核独立退休。
+fn test_wait_set_retirement() {
+    use rinlib::{ipc::wait_set::WaitSet, time::Deadline};
+
+    let event = notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
+        .expect("WaitSet retirement notification create failed");
+    let set = WaitSet::create(128).expect("WaitSet retirement create failed");
+    let mut tokens = alloc::vec::Vec::new();
+    for cookie in 0..64 {
+        tokens.push(
+            set.register(WaitItem::new(event.owner, ObjectSignals::READABLE, cookie))
+                .expect("WaitSet retirement registration failed"),
+        );
+    }
+    set.remove(tokens[0]).expect("WaitSet removal failed");
+    assert_eq!(set.rearm(tokens[0]), Err(SystemCallError::ObjectNotFound));
+    assert_eq!(set.remove(tokens[0]), Err(SystemCallError::ObjectNotFound));
+    notification::signal(event.peer, 1).expect("WaitSet notification signal failed");
+    set.wait(Deadline::INFINITE)
+        .expect("WaitSet readiness wait failed");
+    let records = set.receive(64).expect("WaitSet ready receive failed");
+    assert!(records.iter().all(|record| record.token != tokens[0]));
+    set.close()
+        .unwrap_or_else(|(_, error)| panic!("nonempty WaitSet close failed: {error:?}"));
+    unsafe { close(event.owner) }.expect("WaitSet source owner close failed");
+    unsafe { close(event.peer) }.expect("WaitSet source signaler close failed");
+
+    let event = notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
+        .expect("WaitSet rearm notification create failed");
+    let set = WaitSet::create(1).expect("WaitSet rearm create failed");
+    let token = set
+        .register(WaitItem::new(event.owner, ObjectSignals::READABLE, 4))
+        .expect("WaitSet rearm registration failed");
+    let mut generation = 0;
+    for _ in 0..16 {
+        notification::signal(event.peer, 1).expect("WaitSet rearm signal failed");
+        set.wait(Deadline::INFINITE)
+            .expect("WaitSet rearm wait failed");
+        let records = set.receive(1).expect("WaitSet rearm receive failed");
+        assert_eq!(records[0].token, token);
+        assert!(records[0].arm_generation > generation);
+        notification::take(event.owner, 1).expect("WaitSet rearm source reset failed");
+        let next = set.rearm(token).expect("WaitSet next arm failed");
+        assert!(next > records[0].arm_generation);
+        assert_eq!(set.receive(1), Err(SystemCallError::ObjectNotAvailable));
+        generation = records[0].arm_generation;
+    }
+    set.close()
+        .unwrap_or_else(|(_, error)| panic!("rearmed WaitSet close failed: {error:?}"));
+    unsafe { close(event.owner) }.expect("WaitSet rearm owner close failed");
+    unsafe { close(event.peer) }.expect("WaitSet rearm signaler close failed");
+
+    let set = WaitSet::create(4).expect("self-observing WaitSet create failed");
+    set.register(WaitItem::new(set.handle(), ObjectSignals::READABLE, 1))
+        .expect("WaitSet self-observation failed");
+    set.close()
+        .unwrap_or_else(|(_, error)| panic!("self-observing WaitSet close failed: {error:?}"));
+
+    let first = WaitSet::create(4).expect("cross-observing first WaitSet create failed");
+    let second = WaitSet::create(4).expect("cross-observing second WaitSet create failed");
+    first
+        .register(WaitItem::new(second.handle(), ObjectSignals::READABLE, 2))
+        .expect("first WaitSet cross-observation failed");
+    second
+        .register(WaitItem::new(first.handle(), ObjectSignals::READABLE, 3))
+        .expect("second WaitSet cross-observation failed");
+    first
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("first cross-observing close failed: {error:?}"));
+    second
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("second cross-observing close failed: {error:?}"));
+    debug!("WaitSet nonempty, self and cross retirement passed");
+}
+
+/// 一次性投递权：本地、转移、失败保留与原 sender 独立性。
 fn test_send_once() {
     let mailbox = create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
@@ -1918,9 +2040,9 @@ fn test_send_once() {
     .expect("send-once mailbox create failed");
     let once = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("make send once failed");
-    send(once, 900, &[1], &[]).expect("send once failed");
+    unsafe { send_raw(once, 900, &[1], &[]) }.expect("send once failed");
     assert!(matches!(
-        send(once, 901, &[], &[]),
+        unsafe { send_raw(once, 901, &[], &[]) },
         Err(SystemCallError::StaleHandle)
     ));
 
@@ -1930,19 +2052,24 @@ fn test_send_once() {
         handle: once,
         rights: Rights::WRITE,
     }];
-    send(mailbox.peer, 902, &[], &moves).expect("send-once transit failed");
+    unsafe { send_raw(mailbox.peer, 902, &[], &moves) }.expect("send-once transit failed");
     let first = receive(mailbox.owner).expect("send-once receive failed");
     assert_eq!(first.header.kind, 900);
-    let second = receive(mailbox.owner).expect("send-once transit receive failed");
+    let mut second = receive(mailbox.owner).expect("send-once transit receive failed");
     assert_eq!(second.header.kind, 902);
-    send(second.handles[0], 903, &[2], &[]).expect("transferred once send failed");
+    let transferred_once = second
+        .handles
+        .take(0)
+        .expect("send-once slot missing")
+        .into_raw();
+    unsafe { send_raw(transferred_once, 903, &[2], &[]) }.expect("transferred once send failed");
     assert!(matches!(
-        send(second.handles[0], 904, &[], &[]),
+        unsafe { send_raw(transferred_once, 904, &[], &[]) },
         Err(SystemCallError::StaleHandle)
     ));
 
     // 原 sender 仍可长期使用，不受派生影响。
-    send(mailbox.peer, 905, &[], &[]).expect("original sender still usable");
+    unsafe { send_raw(mailbox.peer, 905, &[], &[]) }.expect("original sender still usable");
     for expected in [903u64, 905] {
         let message = receive(mailbox.owner).expect("tail receive failed");
         assert_eq!(message.header.kind, expected);
@@ -1957,16 +2084,16 @@ fn test_send_once() {
     let once = make_send_once(full.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("send-once full mint failed");
     for _ in 0..MAILBOX_CAPACITY {
-        send(full.peer, 0, &[], &[]).expect("send-once full fill failed");
+        unsafe { send_raw(full.peer, 0, &[], &[]) }.expect("send-once full fill failed");
     }
     assert!(matches!(
-        send(once, 910, &[], &[]),
+        unsafe { send_raw(once, 910, &[], &[]) },
         Err(SystemCallError::MailboxFull)
     ));
     discard(full.owner).expect("send-once full make-room failed");
-    send(once, 911, &[], &[]).expect("failed send must not consume once");
+    unsafe { send_raw(once, 911, &[], &[]) }.expect("failed send must not consume once");
     assert!(matches!(
-        send(once, 912, &[], &[]),
+        unsafe { send_raw(once, 912, &[], &[]) },
         Err(SystemCallError::StaleHandle)
     ));
     for _ in 0..MAILBOX_CAPACITY {
@@ -1993,12 +2120,12 @@ fn test_send_once() {
         rights: Rights::WRITE,
     }];
     assert!(matches!(
-        send(once, 920, &[], &moves),
+        unsafe { send_raw(once, 920, &[], &moves) },
         Err(SystemCallError::IllegalArgument)
     ));
-    send(once, 921, &[], &[]).expect("rejected alias must not consume send-once");
+    unsafe { send_raw(once, 921, &[], &[]) }.expect("rejected alias must not consume send-once");
     assert!(matches!(
-        send(once, 922, &[], &[]),
+        unsafe { send_raw(once, 922, &[], &[]) },
         Err(SystemCallError::StaleHandle)
     ));
     let message = receive(both.owner).expect("send-once alias recovery receive failed");
@@ -2019,18 +2146,18 @@ fn test_writable_level() {
     .expect("writable mailbox create failed");
     let result = wait_many(
         &[WaitItem::new(mailbox.peer, ObjectSignals::WRITABLE, 1)],
-        WAIT_TIMEOUT_INFINITE,
+        0,
     )
     .expect("empty mailbox must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
 
     for _ in 0..MAILBOX_CAPACITY {
-        send(mailbox.peer, 0, &[], &[]).expect("writable fill failed");
+        unsafe { send_raw(mailbox.peer, 0, &[], &[]) }.expect("writable fill failed");
     }
     discard(mailbox.owner).expect("writable make-room failed");
     let result = wait_many(
         &[WaitItem::new(mailbox.peer, ObjectSignals::WRITABLE, 2)],
-        WAIT_TIMEOUT_INFINITE,
+        0,
     )
     .expect("mailbox below capacity must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
@@ -2076,14 +2203,12 @@ fn test_writable_wake(pm_mailbox: Handle) {
             rights: Rights::SIGNAL,
         },
     ];
-    send(pm_mailbox, WRITABLE_WAKE_REQUEST, &[], &moves).expect("wake request send failed");
+    unsafe { send_raw(pm_mailbox, WRITABLE_WAKE_REQUEST, &[], &moves) }
+        .expect("wake request send failed");
 
     // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
-    wait_many(
-        &[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)],
-        WAIT_TIMEOUT_INFINITE,
-    )
-    .expect("wake notification wait failed");
+    wait_many(&[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)], 0)
+        .expect("wake notification wait failed");
     notification::take(done.owner, u64::MAX).expect("wake notification take failed");
     discard(target.owner).expect("wake make-room failed");
 
@@ -2125,7 +2250,8 @@ fn stress_control_plane() {
             handle: event.peer,
             rights: Rights::SIGNAL,
         }];
-        send(mailbox.peer, index as u64, &index.to_le_bytes(), &moves).expect("stress send failed");
+        unsafe { send_raw(mailbox.peer, index as u64, &index.to_le_bytes(), &moves) }
+            .expect("stress send failed");
         assert!(matches!(
             unsafe { close(event.peer) },
             Err(SystemCallError::StaleHandle)
@@ -2133,12 +2259,20 @@ fn stress_control_plane() {
         let message = receive(mailbox.owner).expect("stress receive failed");
         assert_eq!(message.header.kind, index as u64);
         assert_eq!(message.payload, index.to_le_bytes());
-        notification::signal(message.handles[0], 1).expect("stress signal failed");
+        notification::signal(
+            message
+                .handles
+                .get(0)
+                .expect("stress signaler slot missing")
+                .as_handle(),
+            1,
+        )
+        .expect("stress signal failed");
         assert_eq!(
             notification::take(event.owner, 1).expect("stress take failed"),
             1
         );
-        unsafe { close(message.handles[0]) }.expect("stress moved handle close failed");
+        drop(message);
         unsafe { close(event.owner) }.expect("stress notification owner close failed");
         unsafe { close(mailbox.peer) }.expect("stress mailbox sender close failed");
         unsafe { close(mailbox.owner) }.expect("stress mailbox owner close failed");
@@ -2150,7 +2284,7 @@ fn stress_control_plane() {
     )
     .expect("full mailbox create failed");
     for _ in 0..MAILBOX_CAPACITY {
-        send(mailbox.peer, 0, &[], &[]).expect("mailbox fill failed");
+        unsafe { send_raw(mailbox.peer, 0, &[], &[]) }.expect("mailbox fill failed");
     }
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
@@ -2162,7 +2296,7 @@ fn stress_control_plane() {
         rights: Rights::SIGNAL,
     }];
     assert!(matches!(
-        send(mailbox.peer, 0, &[], &moves),
+        unsafe { send_raw(mailbox.peer, 0, &[], &moves) },
         Err(SystemCallError::MailboxFull)
     ));
     notification::signal(event.peer, 1).expect("failed Send must retain moved source");
@@ -2193,7 +2327,7 @@ fn test_tunnel_geometry() {
                 .memory()
                 .store_u64(page * 4096, page as u64 + 1, Ordering::Release);
         }
-        let peer = tunnel_sys::attach(invitation, Placement::Anywhere)
+        let peer = unsafe { tunnel_sys::attach(invitation, Placement::Anywhere) }
             .expect("Tunnel geometry Attach failed");
         assert_ne!(geometry.base(), peer.geometry().base());
         assert_eq!(geometry.bytes(), peer.geometry().bytes());
@@ -2237,17 +2371,14 @@ fn test_tunnel_lifecycle() {
             tunnel_sys::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere)
                 .expect("lifecycle tunnel create failed");
         assert!(matches!(
-            wait_many(
-                &[WaitItem::new(invitation, ObjectSignals::CLOSED, 0)],
-                WAIT_TIMEOUT_INFINITE,
-            ),
+            wait_many(&[WaitItem::new(invitation, ObjectSignals::CLOSED, 0)], 0,),
             Err(SystemCallError::RightsDenied)
         ));
         // SAFETY: 本轮独占、未运输的 Invitation。
         unsafe { close(invitation) }.expect("invitation close failed");
         let result = abandoned
             .events()
-            .wait(ObjectSignals::PEER_CLOSED, WAIT_TIMEOUT_INFINITE)
+            .wait(ObjectSignals::PEER_CLOSED, 0)
             .expect("abandoned invitation wait failed");
         assert!(result.observed.intersects(ObjectSignals::PEER_CLOSED));
         abandoned.close().expect("lifecycle endpoint close failed");
@@ -2259,7 +2390,7 @@ fn test_tunnel_lifecycle() {
             .close()
             .expect("creator endpoint close failed");
         assert!(matches!(
-            tunnel_sys::attach(invitation, rinlib::mm::Placement::Anywhere),
+            unsafe { tunnel_sys::attach(invitation, rinlib::mm::Placement::Anywhere) },
             Err(SystemCallError::ObjectClosed)
         ));
         // SAFETY: Attach 失败未消费本轮的 Invitation。
