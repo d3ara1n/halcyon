@@ -26,6 +26,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 
 | 文件 | 概要 |
 |---|---|
+| [`todo-2026-09-13-fal-integration-baseline-review.md`](todo-2026-09-13-fal-integration-baseline-review.md) | 未来 Review：固定 `d22b9d7` 的 #13 交付与混合集成边界，不把 #14/#15/FAL 草稿视为已完成能力 |
 | [`todo-2026-09-frame-source-selftest-review.md`](todo-2026-09-frame-source-selftest-review.md) | 未来代码 Review：固定复核 `606b59d` 的库存来源、boot-held affine owner、完整清零、切分退款与 child 来源保活，不阻塞 FAL 主线 |
 | [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
 | [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停、总体未交付：公共对象 #13 已完成，先收口公共时间 #14，再完成运输/RPC/执行 #15，随后恢复授权后端与业务 |
