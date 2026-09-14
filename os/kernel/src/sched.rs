@@ -340,7 +340,10 @@ fn arm_earliest() {
 /// 弹出本 hart 全部已到期项后，在锁外以 token 通知 context。弹出与
 /// 注销竞争时只有成功退休 token 的路径参与 Timeout outcome 仲裁。
 fn wake_expired() {
-    let now = sbi::read_time();
+    let Ok(now) = crate::clock::now_ticks() else {
+        crate::runtime_stop::check();
+        return;
+    };
     loop {
         let due = timers().lock().pop_expired(now);
         let Some((token, context)) = due else { break };
@@ -385,6 +388,7 @@ pub fn run() -> ! {
     let me = hart::current();
     let me_domain = current_domain();
     loop {
+        crate::runtime_stop::check();
         // idle 唤醒、门铃合并或先前 IPI 失败后，Pending 槽仍由安全点补消费。
         deferred_work::drain_current();
         crate::task::notify_work::drain_current();
@@ -402,6 +406,7 @@ pub fn run() -> ! {
         );
         // lifecycle gate：Terminating 线程不进用户态（惰性撤销）。
         let entered = loop {
+            crate::runtime_stop::check();
             let epochs = t.process.space.synchronize_local();
             match t
                 .process
@@ -494,8 +499,14 @@ pub fn run() -> ! {
 
 /// 量子装填：时间片与本 hart 期限表最早期限取近（不睡过期）。
 fn arm_quantum() {
-    let quantum = crate::clock::after_ns(QUANTUM_NS)
-        .expect("scheduling quantum exceeds the platform clock epoch");
+    let quantum = match crate::clock::after_ns(QUANTUM_NS) {
+        Ok(quantum) => quantum,
+        Err(_) => {
+            crate::runtime_stop::request();
+            crate::runtime_stop::check();
+            unreachable!("runtime stop did not park after clock epoch exhaustion");
+        }
+    };
     let earliest = timers().lock().peek_expires_at();
     sbi::require(
         sbi::set_timer(earliest.unwrap_or(quantum).min(quantum)),
@@ -519,6 +530,7 @@ fn reap(t: AdmittedThread) {
 /// idle：在本域登记空闲位 → 双重检查就绪工作 → 按期限表 arm（无期限则卸载）
 /// → wfi。醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
 fn idle() {
+    crate::runtime_stop::check();
     let domain = current_domain();
     let bit = 1u64 << hart::current().slot();
     domain.idle_mask.fetch_or(bit, Ordering::SeqCst);
@@ -537,6 +549,7 @@ fn idle() {
     };
     // SAFETY: wfi 等待局部使能的中断 pending 唤醒。
     unsafe { asm!("wfi", options(nomem, preserves_flags)) };
+    crate::runtime_stop::check();
     sbi::clear_ssip();
     domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
 

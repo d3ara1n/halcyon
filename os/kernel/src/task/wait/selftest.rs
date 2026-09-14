@@ -133,3 +133,68 @@ pub(crate) fn assert_cancelled(identity: &WaitIdentity) {
         "discarded committed reply retained a success outcome"
     );
 }
+
+pub(crate) fn time_install(root: &alloc::sync::Arc<crate::task::memory_pool::MemoryPool>) {
+    use crate::task::selftest::{Caller, pump, terminate};
+    use erhino_shared::time::Deadline;
+    pump();
+    let pool = root.snapshot();
+    let metadata = crate::task::resources::admission_usage();
+    let control = crate::task::notify_work::inventory_for_test();
+    let timers = crate::sched::selftest::timer_count();
+    for cancelled in [false, true] {
+        let mut caller = Caller::new(root);
+        let deadline = if cancelled {
+            Deadline::at(crate::clock::now().unwrap().max_deadline_ns)
+        } else {
+            Deadline::at(0)
+        };
+        let mut plan = super::sleep_plan(deadline).unwrap();
+        let context = super::WaitContext::new(plan.action, 0, None, false).unwrap();
+        let identity = WaitIdentity::new(context.clone());
+        plan.prepared = Some(identity.clone());
+        caller.park(plan);
+        pump();
+        if cancelled {
+            assert!(
+                !context.core.is_done(),
+                "future Sleep completed before cancellation"
+            );
+            assert_eq!(crate::sched::selftest::timer_count(), timers + 1);
+            terminate(&caller.process);
+            pump();
+            assert_cancelled(&identity);
+            assert_eq!(caller.process.lifecycle.member_count(), 0);
+        } else {
+            assert!(context.core.is_done());
+            assert!(
+                matches!(
+                    context.core.outcome_in(identity.epoch),
+                    WaitOutcome::Timeout
+                ),
+                "expired captured tick did not win during wait installation"
+            );
+            let thread = crate::sched::selftest::take(&caller.process);
+            // SAFETY: fixture 独占已完成 owner，没有用户执行点在访问 frame。
+            assert_eq!(unsafe { &*thread.frame_ptr() }.x[10], 0);
+            assert_eq!(unsafe { &*thread.frame_ptr() }.sepc, 4);
+            caller.thread = Some(thread);
+        }
+        assert_eq!(
+            crate::sched::selftest::timer_count(),
+            timers,
+            "Sleep retained a timer registration"
+        );
+        assert!(context.timeout_registration.take_cancellation().is_none());
+        caller.cleanup();
+    }
+    pump();
+    assert_eq!(root.snapshot(), pool);
+    assert_eq!(crate::task::resources::admission_usage(), metadata);
+    assert_eq!(crate::task::notify_work::inventory_for_test(), control);
+    assert_eq!(crate::sched::selftest::timer_count(), timers);
+    info!(
+        Task,
+        "Time wait installation checks passed: expired captured tick, registered timer cancellation, owner and timer refund"
+    );
+}

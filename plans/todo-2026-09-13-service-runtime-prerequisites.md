@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：[公共对象/观察/退休 #13](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 已完成；仍等待 [时间/绝对期限 #14](todo-2026-09-monotonic-time-rpc-deadline.md) 完成后实施。当前 rinlib/Runnel/RPC/libsrv 源码均需按目标重新核对，不视为已完成框架。本文件拥有用户态运输与通用执行机制施工，FAL 业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 在本任务完成后恢复。
+> 状态：[公共对象/观察/退休 #13](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 已完成；[时间/绝对期限 #14](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 已完成；本任务进入施工前审视。当前 rinlib/Runnel/RPC/libsrv 源码均需按目标重新核对，不视为已完成框架。本文件拥有用户态运输与通用执行机制施工，FAL 业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 在本任务完成后恢复。
 
 ## 闭合目标与任务边界
 

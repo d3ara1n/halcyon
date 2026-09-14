@@ -13,7 +13,7 @@
 - 旧阶段三项 continuation findings、Mailbox 三项 P2、最后六项公共测试/Capability 契约 P2 已逐项定点复核关闭；未留下兼容机制或生产 correctness finding。
 - 最终 `artifacts/check/public-ipc-final-{core,sifive,release,nofd,boot-failure,clippy,host,shared-host}.log`：core/128MiB/release/nofd 通过，panic/alloc/fatal 三种 Failed 全 hart 停驻通过，七面 lint 与 140+23 host 测试通过。新增组合进入正常 required anchors。
 - 先前完整 stress 的 300s Tunnel 截断与概率 15/16 未宣称修复或通过；用户已独立延期到 [验收可靠性任务](../todo-2026-09-13-acceptance-reliability.md)。不执行总体 acceptance/stress 收尾、不豁免新 correctness，不把 #13 完成视为时间/执行/FAL 交付。
-- 下一自然序：[公共时间](../todo-2026-09-monotonic-time-rpc-deadline.md) → [运输/RPC/服务执行](../todo-2026-09-13-service-runtime-prerequisites.md) → [FAL](../todo-2026-09-fal-service-capabilities.md)。包归属整理仍独立延期。
+- 下一自然序：[公共时间](../archived/todo-2026-09-monotonic-time-rpc-deadline.md) → [运输/RPC/服务执行](../todo-2026-09-13-service-runtime-prerequisites.md) → [FAL](../todo-2026-09-fal-service-capabilities.md)。包归属整理仍独立延期。
 
 ## 施工期材料
 

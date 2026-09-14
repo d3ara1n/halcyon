@@ -20,7 +20,7 @@ Lifetime 只记录被观察的 sender KOID，不反向保活授权。最后 send
 
 Send 按 HandleTable → Mailbox 锁阶准备 moves、Delivery、消息及容量，在同一提交内检查原 Deadline；失败保留 moves/once，成功才消费。Receive 初检输出后预留队头与目标槽，`finish_receive` 复制成功后原子交付；失败先退款表槽与队头，锁外通知。owner 已关闭时拒绝回插并锁外关闭 transit，成功复制则交付已经独立预留的消息。Discard/owner close 的队列析构在源锁外，fanout 有固定容量界限。
 
-rinlib `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
+rinlib `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
 ## 通知与等待
 

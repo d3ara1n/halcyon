@@ -189,7 +189,13 @@ fn prepare_items(
         return Ok(WaitStart::Ready);
     }
 
-    if expires_at.is_some_and(|expires| crate::sbi::read_time() >= expires) {
+    let expired = if expires_at.is_some() {
+        let now = crate::clock::now_ticks()?;
+        expires_at.is_some_and(|expires| now >= expires)
+    } else {
+        false
+    };
+    if expired {
         let result = WaitResult::new(0, ObjectSignals::NONE, u32::MAX, WaitReason::Timeout);
         let mut space = thread.process.space.lock();
         // SAFETY: 固定宽结果及 reserved 完整初始化，失败不发布等待。
@@ -923,7 +929,14 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
     }
 
     if let Some(expires_at) = plan.expires_at {
-        if crate::sbi::read_time() >= expires_at {
+        let now = match crate::clock::now_ticks() {
+            Ok(now) => now,
+            Err(_) => {
+                crate::runtime_stop::check();
+                unreachable!("runtime stop did not park after clock failure");
+            }
+        };
+        if now >= expires_at {
             context.offer(WaitOutcome::Timeout);
         } else {
             match sched::register_wait_timeout(expires_at, context.clone()) {

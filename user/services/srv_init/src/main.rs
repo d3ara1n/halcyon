@@ -66,6 +66,7 @@ mod building;
 mod public_ipc;
 #[cfg(feature = "acceptance-stress")]
 mod race;
+mod time_checks;
 use building::build_spin_building;
 #[cfg(feature = "acceptance-stress")]
 use race::race_matrix;
@@ -996,6 +997,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     test_rpc_reject_cleanup();
     test_writable_level();
     public_ipc::threaded_receive();
+    time_checks::run();
     public_ipc::committed_kill(
         acceptance,
         target_image.as_deref().expect("IPC target image missing"),

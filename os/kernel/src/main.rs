@@ -38,6 +38,7 @@ mod mm;
 mod registry;
 mod remote_call;
 mod rt;
+mod runtime_stop;
 mod sbi;
 mod sched;
 mod sync;

@@ -2,6 +2,10 @@
 
 use super::*;
 
+pub(crate) fn timer_count() -> usize {
+    timers().lock().len()
+}
+
 pub(crate) fn take(process: &Arc<crate::task::proc::Process>) -> AdmittedThread {
     let thread = process
         .domain()

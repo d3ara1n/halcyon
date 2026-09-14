@@ -32,6 +32,7 @@
 | 扩展上下文的 FS/Initial/Clean/Dirty 状态 | `machine.adoc`「Extension Context Status」 |
 | 浮点指令、寄存器与 fcsr | `f-st-ext.adoc`、`d-st-ext.adoc` |
 | RISC-V 弱内存模型、`FENCE` 与 acquire/release | `rvwmo.adoc`；解释见 `mm-eplan.adoc`「Fences」「Explicit Synchronization」 |
+| CSR 与内存先后、time 采样的 R/I/W fence | `zicsr.adoc`「CSR Access Ordering」；`rv32.adoc`「Memory Ordering Instructions」，CSR read 分类为 device input |
 | 原子指令与 LR/SC | `a-st-ext.adoc` |
 | time 计数器、跨 hart 同步、频率与回绕 | `counters.adoc`「"Zicntr" Extension for Base Counters and Timers」；`machine.adoc`「Machine Timer (mtime and mtimecmp) Registers」 |
 

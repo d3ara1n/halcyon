@@ -65,6 +65,7 @@ unsafe extern "C" fn handle_user_trap(
     stval: usize,
     frame: *mut UserContext,
 ) -> usize {
+    crate::runtime_stop::check();
     // SAFETY: 锚指向当前线程现场，本 hart 独占（模块契约）。
     let frame = unsafe { &mut *frame };
     let thread = hart::current().current_thread();
@@ -137,6 +138,7 @@ unsafe extern "C" fn handle_user_trap(
             panic!("unexpected interrupt in user trap: code={other:#x} stval={stval:#x}");
         }
     };
+    crate::runtime_stop::check();
     // handler 的业务 guard 已全部释放；统一交付输出复检失败的终止待办。
     if let Some(t) = thread {
         t.finish_output_termination();

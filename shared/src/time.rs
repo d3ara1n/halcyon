@@ -1,6 +1,5 @@
 //! 启动内单调时间域、固定宽期限与精确平台换算。
 
-pub type Timestamp = u64;
 pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +39,7 @@ impl Deadline {
 pub struct ClockSnapshot {
     pub now_ns: u64,
     pub max_deadline_ns: u64,
+    /// 名义 timebase tick 的向上取整纳秒单位，不保证可观察更新频率或唤醒精度。
     pub resolution_ns: u64,
     pub reserved: u64,
 }
@@ -76,12 +76,16 @@ impl ClockGeometry {
         let available = (u64::MAX - 1)
             .checked_sub(origin_ticks)
             .ok_or(TimeError::OutOfRange)?;
-        let max_ns =
-            u128::from(available) * u128::from(NANOS_PER_SECOND) / u128::from(frequency_hz);
+        // 最后可读 tick 的 floor(ns) 仍须可表示；由该 tick 反推最大期限，
+        // 才能保证有限期限向上取整不会越过公共时钟的可读区间。
+        let readable = ((u128::from(u64::MAX) + 1) * u128::from(frequency_hz) - 1)
+            / u128::from(NANOS_PER_SECOND);
+        let last = readable.min(u128::from(available));
+        let max_ns = last * u128::from(NANOS_PER_SECOND) / u128::from(frequency_hz);
         Ok(Self {
             frequency_hz,
             origin_ticks,
-            max_deadline_ns: max_ns.min(u128::from(u64::MAX)) as u64,
+            max_deadline_ns: max_ns as u64,
         })
     }
 
@@ -194,5 +198,83 @@ mod tests {
         let snapshot = geometry.snapshot(u64::MAX - 2).unwrap();
         assert_eq!(snapshot.after_ns(1), Ok(Deadline::at(2)));
         assert_eq!(snapshot.after_ns(u64::MAX), Err(TimeError::OutOfRange));
+    }
+
+    #[test]
+    fn slow_clock_deadline_end_is_also_readable() {
+        let geometry = ClockGeometry::new(1_000, 0).unwrap();
+        let last = geometry.max_deadline_ns();
+        assert!(last < u64::MAX);
+        let tick = geometry
+            .deadline_ticks(Deadline::at(last))
+            .unwrap()
+            .unwrap();
+        assert_eq!(geometry.elapsed_ns(tick), Ok(last));
+        assert_eq!(geometry.elapsed_ns(tick + 1), Err(TimeError::OutOfRange));
+        assert_eq!(
+            geometry.deadline_ticks(Deadline::at(last + 1)),
+            Err(TimeError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn exact_division_excludes_the_first_unreadable_tick() {
+        let clock = ClockGeometry::new(1_953_125, 0).unwrap();
+        let end = u64::MAX - 511;
+        let tick = (1u64 << 55) - 1;
+        assert_eq!(clock.max_deadline_ns(), end);
+        assert_eq!(clock.deadline_ticks(Deadline::at(end)), Ok(Some(tick)));
+        assert_eq!(clock.elapsed_ns(tick), Ok(end));
+        assert_eq!(clock.elapsed_ns(tick + 1), Err(TimeError::OutOfRange));
+        assert_eq!(
+            clock.deadline_ticks(Deadline::at(end + 1)),
+            Err(TimeError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn all_admitted_deadlines_round_up_inside_the_readable_epoch() {
+        for frequency in [
+            1,
+            999,
+            1_000,
+            32_768,
+            1_000_000,
+            10_000_000,
+            NANOS_PER_SECOND,
+            u64::MAX,
+        ] {
+            for origin in [0, 1, u64::MAX - 1024, u64::MAX - 2] {
+                let clock = ClockGeometry::new(frequency, origin).unwrap();
+                let end = clock.max_deadline_ns();
+                for ns in [0, 1, clock.resolution_ns(), end / 2, end] {
+                    if ns > end {
+                        continue;
+                    }
+                    let tick = clock.deadline_ticks(Deadline::at(ns)).unwrap().unwrap();
+                    assert!(tick < u64::MAX);
+                    assert!(clock.elapsed_ns(tick).unwrap() >= ns);
+                    if tick > origin {
+                        assert!(clock.elapsed_ns(tick - 1).unwrap() < ns);
+                    }
+                }
+                if let Some(outside) = end.checked_add(1) {
+                    assert_eq!(
+                        clock.deadline_ticks(Deadline::at(outside)),
+                        Err(TimeError::OutOfRange)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn geometry_rejects_invalid_origins_and_frequency() {
+        assert_eq!(ClockGeometry::new(0, 0), Err(TimeError::InvalidFrequency));
+        assert_eq!(ClockGeometry::new(1, u64::MAX), Err(TimeError::OutOfRange));
+        let end = ClockGeometry::new(1, u64::MAX - 1).unwrap();
+        assert_eq!(end.max_deadline_ns(), 0);
+        assert_eq!(end.deadline_ticks(Deadline::at(0)), Ok(Some(u64::MAX - 1)));
+        assert_eq!(end.deadline_ticks(Deadline::INFINITE), Ok(None));
     }
 }

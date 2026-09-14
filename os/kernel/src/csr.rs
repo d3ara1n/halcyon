@@ -36,7 +36,8 @@ pub const OWNED_STATUS_CLEAR: usize =
 
 /// 用户出口（pre-sret）清零的状态位：SIE/SPIE/SPP、SUM/MXR、VS=Off。
 /// FS 不在此列——Base 恒 Off、D64 先 Clean 再恢复。
-pub const PRE_SRET_CLEAR: usize = SSTATUS_SIE | SSTATUS_SPIE | SSTATUS_SPP | SSTATUS_SUM | SSTATUS_MXR | SSTATUS_VS;
+pub const PRE_SRET_CLEAR: usize =
+    SSTATUS_SIE | SSTATUS_SPIE | SSTATUS_SPP | SSTATUS_SUM | SSTATUS_MXR | SSTATUS_VS;
 
 // ---- sie/sip 来源位 ----
 pub const SIE_SSIE: usize = 1 << 1;

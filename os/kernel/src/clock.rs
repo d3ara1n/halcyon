@@ -23,9 +23,60 @@ static GEOMETRY: GeometryCell = GeometryCell {
     state: AtomicU8::new(0),
     value: UnsafeCell::new(MaybeUninit::uninit()),
 };
-static HIGH_TICKS: AtomicU64 = AtomicU64::new(0);
-static HIGH_NS: AtomicU64 = AtomicU64::new(0);
-static FAILED: AtomicBool = AtomicBool::new(false);
+pub(crate) mod selftest;
+
+struct ClockState {
+    high_ticks: AtomicU64,
+    high_ns: AtomicU64,
+    failed: AtomicBool,
+}
+
+impl ClockState {
+    const fn new(origin: u64) -> Self {
+        Self {
+            high_ticks: AtomicU64::new(origin),
+            high_ns: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn read(
+        &self,
+        geometry: ClockGeometry,
+        sample: impl FnOnce() -> u64,
+    ) -> Result<ClockSnapshot, SystemCallError> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(SystemCallError::ClockRange);
+        }
+        let prior = self.high_ticks.load(Ordering::Acquire);
+        let raw = sample();
+        if raw < prior && prior - raw > 1 {
+            self.failed.store(true, Ordering::Release);
+            return Err(SystemCallError::ClockRange);
+        }
+        // origin 同样是另一 hart 已发布的样本；允许一 tick 的合法差异，启动时间仍为零。
+        let raw = raw.max(geometry.origin_ticks());
+        let mut snapshot = geometry.snapshot(raw).map_err(|error| {
+            self.failed.store(true, Ordering::Release);
+            map_error(error)
+        })?;
+        self.high_ticks.fetch_max(raw, Ordering::AcqRel);
+        snapshot.now_ns = self
+            .high_ns
+            .fetch_max(snapshot.now_ns, Ordering::AcqRel)
+            .max(snapshot.now_ns);
+        if self.failed.load(Ordering::Acquire) {
+            return Err(SystemCallError::ClockRange);
+        }
+        Ok(snapshot)
+    }
+}
+
+static STATE: ClockState = ClockState::new(0);
+
+pub(crate) fn is_failed() -> bool {
+    STATE.failed.load(Ordering::Acquire)
+}
 
 pub fn init(frequency_hz: u64) {
     let origin = sbi::read_time();
@@ -38,7 +89,7 @@ pub fn init(frequency_hz: u64) {
             .is_ok(),
         "platform clock initialized twice"
     );
-    HIGH_TICKS.store(origin, Ordering::Relaxed);
+    STATE.high_ticks.store(origin, Ordering::Relaxed);
     // SAFETY: compare_exchange 授予唯一初始化权，读取方仅接受已发布的 state=2。
     unsafe { (*GEOMETRY.value.get()).write(geometry) };
     GEOMETRY.state.store(2, Ordering::Release);
@@ -64,28 +115,12 @@ pub fn map_error(error: TimeError) -> SystemCallError {
 }
 
 pub fn now() -> Result<ClockSnapshot, SystemCallError> {
-    if FAILED.load(Ordering::Acquire) {
-        return Err(SystemCallError::ClockRange);
-    }
-    // 在采样前读取高水位，避免把并发 hart 后来的样本当作回退证据。
-    let prior = HIGH_TICKS.load(Ordering::Acquire);
-    let raw = sbi::read_time();
-    if raw < geometry().origin_ticks() || raw.checked_add(1).is_some_and(|next| next < prior) {
-        FAILED.store(true, Ordering::Release);
-        return Err(SystemCallError::ClockRange);
-    }
-    let mut snapshot = geometry().snapshot(raw).map_err(|error| {
-        FAILED.store(true, Ordering::Release);
-        map_error(error)
-    })?;
-    HIGH_TICKS.fetch_max(raw, Ordering::AcqRel);
-    snapshot.now_ns = HIGH_NS
-        .fetch_max(snapshot.now_ns, Ordering::AcqRel)
-        .max(snapshot.now_ns);
-    if FAILED.load(Ordering::Acquire) {
-        return Err(SystemCallError::ClockRange);
-    }
-    Ok(snapshot)
+    STATE.read(geometry(), sbi::read_time)
+}
+
+pub(crate) fn now_ticks() -> Result<u64, SystemCallError> {
+    let _ = now()?;
+    Ok(STATE.high_ticks.load(Ordering::Acquire))
 }
 
 pub fn deadline_ticks(deadline: Deadline) -> Result<Option<u64>, SystemCallError> {

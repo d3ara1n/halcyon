@@ -142,6 +142,7 @@ fn bring_up_runtime() -> ! {
 
     // 等待全员 Online（Acquire 观察）；超时或状态矛盾即整体失败。
     loop {
+        crate::runtime_stop::check();
         if registry::gate_state() == registry::GateState::Failed {
             fatal_msg(&format_args!(
                 "secondary hart bring-up failed; boot aborted"
@@ -152,9 +153,17 @@ fn bring_up_runtime() -> ! {
                 .all(|(_, r)| r.state() == crate::registry::BootState::Online)
         });
         if all_online {
+            crate::runtime_stop::check();
             break;
         }
-        if sbi::read_time() > deadline {
+        let now = match crate::clock::now_ticks() {
+            Ok(now) => now,
+            Err(_) => {
+                crate::runtime_stop::check();
+                unreachable!("runtime stop did not park after clock failure");
+            }
+        };
+        if now > deadline {
             registry::publish_failed();
             fatal_msg(&format_args!(
                 "secondary hart bring-up timed out; boot aborted"
@@ -255,6 +264,18 @@ pub fn fatal_msg(args: &fmt::Arguments<'_>) -> ! {
     registry::publish_failed();
     let _ = writeln!(RawWriter, "\x1b[0;31mfatal\x1b[0m: {args}");
     hart::park()
+}
+
+pub(crate) fn runtime_stop_report(failed_slots: u64, clock_failed: bool) {
+    let cause = if clock_failed {
+        "platform clock failed"
+    } else {
+        "runtime stop requested"
+    };
+    let _ = writeln!(
+        RawWriter,
+        "Runtime stopped: {cause}; doorbell failure mask {failed_slots:#x}"
+    );
 }
 
 #[panic_handler]
