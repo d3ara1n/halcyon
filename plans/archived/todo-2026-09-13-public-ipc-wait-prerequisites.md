@@ -21,7 +21,7 @@
 
 目标是让公共 ABI 表达能力，而不是要求用户推进内核对象的内部状态。设计依据是可转移授权、在途交付责任、持久观察和短内核路径；不以现有 syscall 数量、已写代码或文档中的“冻结”为依据。
 
-本任务共同迁移 shared/kernel/rinlib、所有信号来源对象、通知/完成债务、普通 Close、ProcessDrain 及现有真实消费者。它们共享安装/完成/取消与关闭责任，不能按单个 syscall 或 happy path 拆成独立完成项。跨 workspace 包归属仅由 [未来整理计划](../todo-2026-09-13-workspace-package-ownership.md) 承接，本轮不搬包。
+本任务共同迁移 shared/kernel/rinlib、所有信号来源对象、通知/完成债务、普通 Close、ProcessDrain 及现有真实消费者。它们共享安装/完成/取消与关闭责任，不能按单个 syscall 或 happy path 拆成独立完成项。跨 workspace 包归属仅由 [已归档整理计划](todo-2026-09-13-workspace-package-ownership.md) 承接，本轮不搬包。
 
 ## 目标 ABI 与独立理由
 

@@ -22,9 +22,13 @@
 ```
 os/        内核 workspace：
              kernel/          erhino_kernel（no_std）
-             dtb/ frame_pool/ page_table/ tar/ elf/ handle_table/
-             wait_context/ timer_queue/ stack_layout/ sched_domain/ ready_queue/   纯逻辑 crate，host 可测
-shared/    erhino_shared：内核与用户态共享的 ABI（syscall、消息格式、同步原语）；FAL 是纯用户态线协议，落 user/frameworks/libfal，不在此处
+             dtb/ frame_pool/ page_table/ handle_table/ wait_context/
+             stack_layout/ sched_domain/ ready_queue/ memory_space/ remote_call/
+             runtime_gate/ memory_supply/ memory_pool/ funded_frame/ work_debt
+shared/    跨层 workspace：
+             erhino_shared/  内核与用户态共享的 ABI（syscall、消息格式、同步原语）
+             elf/ tar/ monotonic_id/ ordered_table/ timer_queue/ metadata_admission/
+             内核与用户态共用的可移植纯逻辑库
 user/      用户态 workspace：
              rinlib/
              services/    系统服务（srv_*）
@@ -46,8 +50,8 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 - 秒级检查：`just check`（内核 target 需要 build-std，等价于 `cd os && cargo check -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`）；`cd shared && cargo check`。全仓 lint 统一走 `just clippy`，按 shared/os/user host、kernel/user RISC-V、stress feature 与独立 gc target 分面执行 `-D warnings`，完整日志写入 `artifacts/lint/`；`just acceptance` 会先通过该门再运行 QEMU 路线。
 - host 单测（纯逻辑 crate，毫秒级）：**必须显式指 host target**——os workspace 默认 target 是 riscv，`cargo test` 直接跑会拿 no_std 环境去链 std：
   ```sh
-  cd os && cargo test -p tar -p elf -p page_table -p frame_pool -p dtb -p handle_table -p wait_context -p timer_queue -p stack_layout -p sched_domain -p ready_queue -p memory_space -p remote_call -p runtime_gate -p memory_supply -p memory_pool -p funded_frame -p metadata_admission -p monotonic_id -p ordered_table -p work_debt --target aarch64-apple-darwin
-  cd shared && cargo test --target aarch64-apple-darwin   # shared 也需显式 host target
+  cd os && cargo test --workspace --exclude erhino_kernel --target aarch64-apple-darwin
+  cd shared && cargo test --workspace --target aarch64-apple-darwin   # shared 也需显式 host target
   ```
 - 集成验证分档由用户态 `srv_init` 编译期 workload 控制，内核不感知测试政策：`just virt` 是日常 core 快线（确定性内存/IPC/Tunnel/Job/监督/reset）；`just virt-stress` 追加 control/Tunnel 重复压力、`max_work=1` Drain 与完整 16/16 竞态矩阵；`just virt-release` 以 core 覆盖优化代码生成和 trap 寄存器保持；`just acceptance` 是阶段收尾聚合，静态门后执行 debug stress、release core、`sifive_u` core、`virt-nofd` 和 `virt-boot-failure`。后者用外部 GDB 对正式 debug binary 注入 Ready 前 panic/alloc/fatal，并确认所有 hart 在 Failed 后停驻；完整日志见 `artifacts/boot-failure/`。涉及调度域契约时另跑 `virt-hetero`。
 - 常规 QEMU recipe 经 `tools/qemu-throttle.sh`（默认节流运行）和 `tools/qemu-acceptance.sh`，并按路线使用独立、可由同名 `*_TIMEOUT` 环境变量覆盖的运行超时。`virt-boot-failure` 同样节流，但由 `tools/check-boot-failure.py` 独立判定预期故障、限制调试器运行时间并回收进程组，超时可用 `VIRT_BOOT_FAILURE_TIMEOUT` 覆盖。超时从 QEMU 运行阶段计，不含冷编译。默认值依据对应 workload 的近期实测耗时留出宽裕余量，验收面或运行成本变化时应直接重校，不把旧数值当架构约束。判定以 workload 身份、业务收束与 reset 锚点为准，不能把矩阵中途超时当成内核挂死。全速调试用 `THROTTLE=100`。

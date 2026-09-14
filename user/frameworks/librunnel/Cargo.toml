@@ -6,7 +6,7 @@ description = "Runnel streaming protocol over tunnel shared pages"
 edition = "2024"
 
 [dependencies]
-erhino_shared = { path = "../../../shared" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
 
 # 阻塞流式层依赖 rinlib（内含 RISC-V ecall），仅内核目标编译；
 # 协议核心保持零 syscall 依赖，host 可测。

@@ -6,12 +6,12 @@ description = "Generic RPC framing over mailbox messages"
 edition = "2024"
 
 [dependencies]
-monotonic_id = { path = "../../../os/monotonic_id" }
-erhino_shared = { path = "../../../shared" }
+monotonic_id = { path = "../../../shared/monotonic_id" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
 
 # 同步调用层依赖 rinlib（RISC-V ecall），仅内核目标编译；
 # framing 核心保持零 syscall 依赖，host 可测。
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 rinlib = { path = "../../rinlib" }
-ordered_table = { path = "../../../os/ordered_table" }
-timer_queue = { path = "../../../os/timer_queue" }
+ordered_table = { path = "../../../shared/ordered_table" }
+timer_queue = { path = "../../../shared/timer_queue" }

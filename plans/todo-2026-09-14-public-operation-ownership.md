@@ -2,7 +2,7 @@
 
 > 状态：独立待实施的结构收束，不是运输/服务执行前置的整体开工阻塞。执行本专题前先按 `AGENTS.md`「标准施工流程」完成接手、规模审计、拆分/合并和设计闭包。审视基线为 `master@5d406a4...task/fal-service-capabilities@bf48cab`。ProcessDrain 的职责与 REAPABLE 触发已澄清，保留管理者有界推进；不以全体进程持续轮询、缺乏预算激励或必须自动回收作为改造依据。
 >
-> 当前下一任务是 [运输/服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md)。本文件只拥有内核等待、请求和退休执行的结构收束；共享算法/目录由 [已有包归属计划](todo-2026-09-13-workspace-package-ownership.md) 拥有，FAL 领域与业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 拥有。不重复安排同一问题。
+> 当前下一任务是 [运输/服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md)。本文件只拥有内核等待、请求和退休执行的结构收束；共享算法/目录已由 [已归档包归属计划](archived/todo-2026-09-13-workspace-package-ownership.md) 完成，FAL 领域与业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 拥有。不重复安排同一问题。
 
 ## 已明确的能力与职责
 

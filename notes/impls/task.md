@@ -67,9 +67,9 @@ authority。固定宽 ProcessQuery、异步幂等 ProcessKill、REAPABLE 电平
 
 ## Job 管理面（`task/job.rs`）
 
-Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
+Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`）：
 
-- **成员/子表**：`os/ordered_table` 提供有容量上限的 fallible AVL（键为 Pid/JobId，条目为事务占位或强持对象）。创建期以 `PreparedEntry` 在锁外预分配节点，提交/删除不分配；查找、插入、摘除为 O(log n)，不在终止或完成路径做宽度 memmove。枚举按事务屏障分页扫描，单批至多 `JOB_ENUMERATE_MAX` 项。
+- **成员/子表**：`ordered_table` 提供有容量上限的 fallible AVL（键为 Pid/JobId，条目为事务占位或强持对象）。创建期以 `PreparedEntry` 在锁外预分配节点，提交/删除不分配；查找、插入、摘除为 O(log n)，不在终止或完成路径做宽度 memmove。枚举按事务屏障分页扫描，单批至多 `JOB_ENUMERATE_MAX` 项。
 - **JobId**：全局单调不复用分配器（root 恒 1，与 Pid 分立空间）；
   Pid/JobId 分配都在 owner Job 锁内与占位插入同临界区，表内 ID 序 =
   分配序（消除多核乱序分配窗口下的枚举漏项）。
@@ -205,7 +205,7 @@ Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四
 凭据防错认，最大值发行后永久 Exhausted，不回绕；③commit/rollback 按 token 定位，结构性不可消失；HandleTable 跨 owner 发布先经
 `prepare_commit` 形成私有字段的 affine token，最终 `commit_prepared` 不返回可恢复错误；
 ④marker 的提交/回滚全部在容器锁内完成，无分配失败路径。`attach_member` 的插入是另一类锁内
-try_reserve 原子操作，失败无副作用，以“失败时条目不可见”闭合。KOID、PID/JID、AddressSpace 与事务 token 共用 `os/monotonic_id` 的耗尽机制，但各自持独立 allocator，不合并身份域；用户可达构造在发布前返回 ReachLimit。出生块由组装者经 Write 交付，无内核回滚面。
+try_reserve 原子操作，失败无副作用，以“失败时条目不可见”闭合。KOID、PID/JID、AddressSpace 与事务 token 共用 `monotonic_id` 的耗尽机制，但各自持独立 allocator，不合并身份域；用户可达构造在发布前返回 ReachLimit。出生块由组装者经 Write 交付，无内核回滚面。
 
 ## sleep
 

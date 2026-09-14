@@ -26,7 +26,7 @@ def main() -> int:
         "run",
         "--quiet",
         "--manifest-path",
-        str(root / "os/elf/Cargo.toml"),
+        str(root / "shared/elf/Cargo.toml"),
         "--features",
         "host-audit",
         "--target",

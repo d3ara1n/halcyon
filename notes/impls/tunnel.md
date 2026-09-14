@@ -12,7 +12,7 @@ Tunnel 接受非零字节长度，按页取整至最多 512 页；物理 backing
 
 ## Create 与 Attach
 
-`shared/src/tunnel.rs` 定义固定宽 Create/Attach 请求与结果；两个调用都从 a0 接收请求指针，结果包含 Endpoint、实际基址与长度，Create 额外交付 Invitation。选址复用 `MapIntent::parse_placement` 的 Anywhere/FixedEmpty；PreparedMemoryChange 的 lease.range 是输出与 shootdown 的共同几何来源。
+`shared/erhino_shared/src/tunnel.rs` 定义固定宽 Create/Attach 请求与结果；两个调用都从 a0 接收请求指针，结果包含 Endpoint、实际基址与长度，Create 额外交付 Invitation。选址复用 `MapIntent::parse_placement` 的 Anywhere/FixedEmpty；PreparedMemoryChange 的 lease.range 是输出与 shootdown 的共同几何来源。
 
 `TunnelCreate` 先为 Connection（`ConnectionPermit`）、Endpoint、Invitation、共享 backing 与两侧 Handle 预留 metadata，再在地址空间中建立创建端映射。映射、页表、输出槽、Handle 或 metadata 任一提交前步骤失败，事务回滚且不发布对象或消费资源。
 

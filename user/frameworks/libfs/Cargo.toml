@@ -6,5 +6,5 @@ description = "Client-side namespace library: prefix table, walking and symlink 
 edition = "2024"
 
 [dependencies]
-erhino_shared = { path = "../../../shared" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
 libfal = { path = "../libfal" }

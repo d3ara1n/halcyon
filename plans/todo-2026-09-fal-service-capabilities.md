@@ -20,9 +20,9 @@
 | 公共操作边界收束 | 独立结构整理，安排在执行前置与共享包之后 | `todo-2026-09-14-public-operation-ownership.md`；保留 ProcessDrain 分工，收束等待/请求/工作执行，覆盖全部真实内核消费者 |
 | FAL 业务 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
 | 验收可靠性改进 | 用户独立延期 | `todo-2026-09-13-acceptance-reliability.md` 和 KNOWN_ISSUES；概率覆盖误失败与原 Tunnel 静默截断分别处理，未绿 stress 不记通过 |
-| workspace 包归属 | 独立待实施，沿用原 todo | `todo-2026-09-13-workspace-package-ownership.md`；执行前置完成后、内核结构收束及 FAL 新业务前审视共用契约并迁移归属，本次没有搬包 |
+| workspace 包归属 | 已完成并归档 | `archived/todo-2026-09-13-workspace-package-ownership.md`；跨层 ABI 与 elf/tar/通用算法已统一组织进 shared workspace，算法语义未改 |
 
-代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按运输 owner/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
+代码定位：时间为 `shared/erhino_shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按运输 owner/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
 
 当前验证基线：七面 `just clippy`、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure 通过；GDB 只读捕获已安装 Close/active 的一次真实取消窗口，不保证每轮 exact-window。完整 stress 的旧截断/概率失败仍未解决；本快照没有总体 `just acceptance` 通过声明。
 
@@ -43,7 +43,7 @@
   → Open/Watch/注册/Move/Copy → 总体组合交付
 ```
 
-当前直接从执行前置的运输闭包开工；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](todo-2026-09-13-workspace-package-ownership.md) 不作为整体开工阻塞。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
+当前直接从执行前置的运输闭包开工；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 不作为整体开工阻塞，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
 
 本文下面保留的基线与代码连接点是审视材料，不是已完成证据。公共前置章节的旧 Seal/Drain 等候选已经被普通 Close/内核退休替代，旧 ABI 和用户维护编排已删除，不继续照旧施工或恢复兼容。
 
@@ -69,7 +69,7 @@
 
 公共对象、观察与退休前置已完成：独立发送授权/Delivery/Lifetime、WaitSet 普通内核退休、捕获 Native 继续/轮次取消、最后拥有根和真实消费者共同验证，旧维护 ABI 删除；新增真实线程接收、跨进程提交后 kill 与 GDB Waiting/active 窗口。最终 core/sifive/release/nofd、启动失败、七面 lint 和 163 项 host 测试通过，纳入当前 FAL 分支混合集成基线。完整 stress 的截断/概率判定仍由验收可靠性计划独立延期，不宣称通过或已修复。自然序转 运输/RPC/服务执行前置 → FAL；具体证据见公共前置档案与 notes/impls/ipc.md。下列条目是旧施工盘点，不是当前实现或交付保证，执行/业务恢复时须按实际代码重审：
 
-- `shared/src/time.rs` 已写入 Deadline、ClockSnapshot、ClockGeometry 和换算测试；`kernel/clock.rs` 接入单一时钟来源，调度量子与启动期限不再截断频率。
+- `shared/erhino_shared/src/time.rs` 已写入 Deadline、ClockSnapshot、ClockGeometry 和换算测试；`kernel/clock.rs` 接入单一时钟来源，调度量子与启动期限不再截断频率。
 - shared/kernel/rinlib 的绝对 WaitMany/Sleep/Send 已开始纵向迁移；同步 Caller 与异步 Dispatcher 已写入同一 deadline、Unsent/Sent 错误阶段和未发送 Request/能力归还，尚未形成编译与组合证据。
 - entry badge 已迁至独立 MailboxSender；Lifetime、Delivery、HandleQuery、ReceiveResult 和对应 syscall/封装已写入。Capability/HandleSet、ReceivedMessage、ReceiveBuffer/MessageStorage、Packet 和 RequestContext 已承担运输 owner；原始移动 Send 已改为显式 unsafe，既有验收消费端开始清除重复关闭，正式 srv_fs 旧泵仍待整体替换。
 - ObserverSink 已将 WaitContext 与 WaitSet arm 接入同一来源/完成债务。WaitSet 的注册、ready、rearm、remove、seal/drain 和 ProcessDrain 接管代码已写入，组合竞态与预算证据尚未补齐。

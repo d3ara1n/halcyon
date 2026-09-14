@@ -9,7 +9,7 @@ edition = "2024"
 
 [dependencies]
 rinlib = { path = "../../rinlib" }
-erhino_shared = { path = "../../../shared" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
 libfal = { path = "../../frameworks/libfal" }
 libfs = { path = "../../frameworks/libfs" }
 librpc = { path = "../../frameworks/librpc" }

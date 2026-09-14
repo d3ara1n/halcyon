@@ -4,7 +4,7 @@
 
 ## BootPackage v1
 
-`shared/src/boot.rs` 定义 64 字节 little-endian envelope：magic、version、header_len、flags、total_len、initial ELF offset/length、payload offset/length和 reserved。validator 使用 checked arithmetic，要求 canonical offset、页对齐 payload、零 padding和窗口内完整几何；payload 可为空。
+`shared/erhino_shared/src/boot.rs` 定义 64 字节 little-endian envelope：magic、version、header_len、flags、total_len、initial ELF offset/length、payload offset/length和 reserved。validator 使用 checked arithmetic，要求 canonical offset、页对齐 payload、零 padding和窗口内完整几何；payload 可为空。
 
 `tools/make-boot-package.py` 原子生成 `artifacts/boot-package.bin`。Just 构建把 `srv_init` 作为唯一 initial ELF，其余验证程序暂以确定序 ustar 组成 opaque payload。DTS `/chosen/boot-package` 只声明物理装载窗口；`board.rs` 验证窗口完整落在 DT memory 内。
 
@@ -12,7 +12,7 @@
 
 ## 出生块（Birth Block）线格式
 
-出生块是**组装者与接收进程的用户约定数据**，内核不构造、不映射、不校验。`shared/src/startup.rs` 只保留线格式定义与构造/校验函数（用户态库工具），布局：
+出生块是**组装者与接收进程的用户约定数据**，内核不构造、不映射、不校验。`shared/erhino_shared/src/startup.rs` 只保留线格式定义与构造/校验函数（用户态库工具），布局：
 
 ```text
 [StartupBlockHeader (48 B)]
@@ -29,7 +29,7 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload
 
 ## 组装 ABI（Building 期外部通道）
 
-`shared/src/proc.rs` 与 `shared/src/call.rs` 定义 fixed-width ABI，rinlib 封装位于 `user/rinlib/src/process.rs`：
+`shared/erhino_shared/src/proc.rs` 与 `shared/erhino_shared/src/call.rs` 定义 fixed-width ABI，rinlib 封装位于 `user/rinlib/src/process.rs`：
 
 - JobControl `CREATE`：JobCreate、ProcessCreate；
 - JobControl `MANAGE`：JobSeal、JobDerive；`READ`：JobQuery、JobEnumerate；
@@ -64,13 +64,13 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 6. 最终临界区按 `HANDLE_TABLE → JOB_INNER → LIFECYCLE` 同时发布 capability、Job membership、Running 状态和 execution binding，不存在仍返回 `Result` 的不可逆动作；随后发布 `UnpublishedBound` 并交出携带同源 credit 的 `AdmittedThread`；
 7. `boot.rs` 执行内存池 syscall 自检、回投 package prefix，最后消费该 owner，经无分配 Ready enqueue 首次发布线程。成功后 Kill 由 lifecycle/pick gate 接管，不能遗失尚未入队的 owner。
 
-结构与组合验证由 [`地址空间事务与启动纵向档案`](../../plans/archived/todo-2026-09-memory-transaction-state-machine.md) 记录。validated ELF admission 已由 `os/elf::validate` 接入此发布链；它在任何 Process/页表 owner 构造前冻结映像事实，不改变这里的构造 owner 与提交协议。
+结构与组合验证由 [`地址空间事务与启动纵向档案`](../../plans/archived/todo-2026-09-memory-transaction-state-machine.md) 记录。validated ELF admission 已由 `elf::validate` 接入此发布链；它在任何 Process/页表 owner 构造前冻结映像事实，不改变这里的构造 owner 与提交协议。
 
 initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；payload backing 与 root PoolBinding 在 init AddressSpace 有界收束时于锁外同步归还物理 extent 与 charge。内核没有 pid 特判的保留洞。
 
 ## 用户态公共 loader
 
-`os/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/frameworks/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
+`shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/frameworks/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
 
 ## init/pm 当前政策
 

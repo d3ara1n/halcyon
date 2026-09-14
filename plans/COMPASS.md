@@ -24,9 +24,9 @@
 
 **当前下一任务**：[运输 owner/Runnel → 通用执行与准入 → 完整 RPC/Outbox](todo-2026-09-13-service-runtime-prerequisites.md)，先按 `AGENTS.md`「标准施工流程」完成接手、规模审计、任务拆分/合并和设计闭包，再进入运输实施。ProcessDrain 由受信任管理者在 REAPABLE 后推进，普通应用不持续轮询，保留该契约；自动全程回收、预算激励和重新设计全监督拓扑均不是当前前置。开工仍核对实际所有权、取消与 Close 执行边界，不能把草稿存在当作能力完成。
 
-后续串行位置：[共享包契约与归属](todo-2026-09-13-workspace-package-ownership.md) → [内核等待/请求/退休结构收束](todo-2026-09-14-public-operation-ownership.md) → [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)。两项整理不阻塞当前执行前置整体开工；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。每个机制包含真实消费者迁移、失败/退出和旧路径删除，组合验收是完成门。
+后续串行位置：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成 → [内核等待/请求/退休结构收束](todo-2026-09-14-public-operation-ownership.md) → [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)。共享包整理是独立的小型 workspace 迁移，不阻塞当前执行前置整体开工；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。每个机制包含真实消费者迁移、失败/退出和旧路径删除，组合验收是完成门。
 
-可以先行的局部修复只有已定位、无需改变对外契约的收口，例如 Runnel 新观察方法的终态访问；唯一登记在执行前置。Delivery 独立身份/Peek 取舍在运输闭包开工前决定，不预设删除。共享包仍沿用原独立 todo，本轮没有搬包。
+可以先行的局部修复只有已定位、无需改变对外契约的收口，例如 Runnel 新观察方法的终态访问；唯一登记在执行前置。Delivery 独立身份/Peek 取舍在运输闭包开工前决定，不预设删除。共享包整理已作为独立小型任务开工：`shared/` 现组织为 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
 
 当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；本次设计审视基线为 `bf48cab`。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输/执行与 FAL 仍是草稿，验收可靠性保持独立延期。后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
 
@@ -41,7 +41,6 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停：先运输/执行/RPC，随后共享包与内核执行结构收束，再恢复后端、授权与业务 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 当前下一任务，三闭包：运输/Runnel → 通用执行/准入 → RPC/Outbox；同步真实消费者，包含 Runnel 终态修复与事件驱动监督 |
-| [`todo-2026-09-13-workspace-package-ownership.md`](todo-2026-09-13-workspace-package-ownership.md) | 复用既有独立立项：执行前置后、内核结构收束与 FAL 业务前统一共用算法契约/包归属；本轮未搬包 |
 | [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
 | [`todo-2026-09-14-kernel-memory-budget.md`](todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |

@@ -12,4 +12,4 @@ path = "src/bin/audit_user_elf.rs"
 required-features = ["host-audit"]
 
 [dependencies]
-erhino_shared = { path = "../../shared", optional = true }
+erhino_shared = { path = "../erhino_shared", optional = true }

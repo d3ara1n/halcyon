@@ -90,7 +90,7 @@ clippy:
         fi
     }
     run_lint shared-host artifacts/lint/shared.log \
-        bash -c 'cd shared && cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd shared && cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint os-host artifacts/lint/os-host.log \
         bash -c 'cd os && cargo clippy --workspace --exclude erhino_kernel --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint kernel-target artifacts/lint/kernel.log \
