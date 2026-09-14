@@ -47,7 +47,7 @@ Running→Terminating 的准入截止与 AddressSpace Commit 共享 Process exec
 
 运行资源与终态观察壳分离。所属 Job 的直接成员表强持尚未 Dead 的 Process core，Process 只以非拥有关系回指 Job；ProcessControl shell 同样只以非拥有关系定位 core。线程全部离场后 Process 仍由 Job 保活到 Drain 完成，Dead 发布时才从 Job 成员表移除。此后 AddressSpace 和 HandleTable 不受观察者持有的 control 影响，终态 shell 由最后一个 control Handle 保活并持续提供 PID、状态与终因快照。metadata admission 或 charge 必须覆盖 core、Builder 与 Control 各自的实际寿命，不能因 Dead 提前退款仍由观察壳占用的资源。
 
-线程、active hart 与已提交的地址空间修改全部离开执行或完成不可逆撤销后，ProcessControl 发布持续可见的 REAPABLE 电平。持 MANAGE authority 的管理服务以调用者给定、内核封顶的预算反复执行受保护收束；每批只处理有界数量的 Handle 和页表资源，进度保存在目标进程而非某个调用者中，同 authority 可在管理者重启后接管。最后一批完成时清除 REAPABLE 并发布 Dead/CLOSED，不把无界析构塞入单次内核路径。
+线程、active hart 与已提交的地址空间修改全部离开执行或完成不可逆撤销后，ProcessControl 发布持续可见的 REAPABLE 电平。持 MANAGE authority 的管理服务以调用者给定、内核封顶的预算反复执行受保护收束；每批只处理有界数量的 Handle 和页表资源，进度保存在目标进程而非某个调用者中，同 authority 可在管理者重启后接管。进程自身资源收束完成后，在 PublishDead 阶段清除 REAPABLE 并发布 Dead/CLOSED；Job 成员摘除、祖先传播等 Drain 终段责任可以跨预算继续，直到 ProcessDrain 返回 Complete，不把无界析构塞入单次内核路径。
 
 ## 回收责任、资源资助与执行
 

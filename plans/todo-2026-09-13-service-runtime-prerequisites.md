@@ -1,6 +1,24 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：当前下一实施任务，从运输 owner 与 Runnel 闭包开始。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](todo-2026-09-13-workspace-package-ownership.md) 独立安排在本执行前置后；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
+> 状态：当前下一任务，先完成接手、规模审计、任务拆分/合并和设计闭包，再从运输 owner 与 Runnel 闭包开始实施。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](todo-2026-09-13-workspace-package-ownership.md) 独立安排在本执行前置后；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
+
+## 开工流程与本任务审计门
+
+本任务先遵循 `AGENTS.md`「标准施工流程」，再进入下面三个机制闭包。当前阶段只完成接手与基线复核；运输闭包实施前必须形成可追溯的任务规模审计、拆分/合并决策和设计记录。
+
+### 规模审计
+
+审计必须覆盖：`Capability/Sender/SendOnce`、`Packet/ReceiveBuffer/MessageStorage/Delivery`、Invitation/Endpoint、Runnel Producer/Consumer、WaitSet 观察、RPC/Outbox/Runtime 的真实依赖；内核/shared/rinlib 两侧；每个 owner 与 authority 的转移；正常、满箱、未 Attach、初始化失败、部分传输、EOF/Broken、对端退出、取消、期限、调用者退出、Close/Drain、退休和退款；锁序、跨 hart、停驻/唤醒；现有 raw/阻塞/重复 close 路径及其删除条件。审计必须区分已实现代码、未接通草稿和目标设计，不以源码存在或局部测试通过替代责任证据。
+
+### 拆分/合并决策
+
+按可独立证明的语义闭包调整任务：强耦合的 ABI、运输 owner、观察协议、失败/取消/退休和真实消费者必须共同迁移；只有能独立定义完成语义、失败边界、删除条件和验证门的部分才拆分。Delivery/Peek 的公开语义、Runnel 角色与其真实调用者不得先拆成孤立类型任务；Runtime/ProcessDrain/Close 的关系也需按停驻和接管责任判断，不预设全面内核重构为前置。审计结论进入本计划或其唯一子计划，发现新前置即同步 `COMPASS.md`。
+
+### 设计完成门
+
+运输闭包编码前必须确定 Delivery 身份与 Peek 语义，完成 Capability/Packet/Receive/Invitation/Runnel 的类型图、所有权图、状态机、线性化点、锁阶和失败/取消/退出/退款路径，并确定真实消费者迁移与旧路径删除顺序。通用执行闭包编码前必须确定 Runtime 任务、WaitSet 注册、期限、Park/Wake、Close/Drain 停驻和监督接管边界。RPC 闭包编码前必须确定 Request/Reply/Outbox 阶段、Deadline 覆盖范围、迟到回复和调用者退出语义。设计结论进入 `notes/ideas/`；实现事实进入 `notes/impls/`。
+
+只有上述审计、拆分/合并和设计门完成后，才可将对应闭包标记为实施中；实施中发现证据推翻前提时，停止编码并回到审计/设计步骤。
 
 ## 闭合目标与边界
 

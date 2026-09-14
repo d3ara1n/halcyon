@@ -1,6 +1,6 @@
 # os/shared/user workspace 包归属整理
 
-> 状态：独立待实施，本次设计审视只更新任务顺序，不搬迁、不改 Cargo workspace 成员和 path 依赖。此文件唯一承接共用包的归属与公共算法契约；不另建共享库整理 todo。推荐位置见 [公共操作所有权收束计划](todo-2026-09-14-public-operation-ownership.md)。
+> 状态：独立待实施，先按 `AGENTS.md`「标准施工流程」完成接手、规模审计、拆分/合并和设计闭包；本次设计审视只更新任务顺序，不搬迁、不改 Cargo workspace 成员和 path 依赖。此文件唯一承接共用包的归属与公共算法契约；不另建共享库整理 todo。推荐位置见 [公共操作所有权收束计划](todo-2026-09-14-public-operation-ownership.md)。
 
 ## 目标与边界
 
@@ -25,6 +25,8 @@ os、shared、user 三个 workspace 作为各领域包的容器：内核专用�
 公共契约与目录同时审视：TimerQueue 的稳定 token、预付容量、park/reschedule 有独立用途，但 token 的可用位与 WaitContext 控制位目前相互约定，必须明确是公共的可标记 token 契约还是调用侧封装，不因单个消费者方便而削减所有使用者的身份空间。OrderedTable 的预付节点应清楚区分已分配存储与已预留表容量，准备后定 key 不得要求调用者理解树的内部状态。保留可证明的公共能力，不把共享目录变成内核调用者约定的集合。
 
 ## 自然实施顺序
+
+本计划执行前遵循 `AGENTS.md`「标准施工流程」；以下只记录包归属专题的审计对象、迁移顺序和完成门。
 
 1. 盘点 os/shared/user 的 package、实际依赖者、target/feature、host 检查和 Just 构建入口，区分 ABI、可移植共用逻辑和领域专用实现；同时审视 token 编码、预付存储/容量与取消协议，不仅按目录搬迁。
 2. 明确三 workspace 的目标成员图、目录/package/crate 唯一身份和统一构建矩阵；列出全部 path、Cargo.lock、工具脚本、文档及编辑器发现路径的共同迁移范围。

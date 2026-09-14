@@ -1092,9 +1092,9 @@ pub fn kill(thread: &Thread, control: Handle, code: i64) -> Result<KillOutcome, 
 }
 
 /// ProcessDrain(control, max_work)：REAPABLE/Dead 上推进固定预算收束。
-/// 仅 Complete 批次发布 Dead/CLOSED 并从 Job 成员表摘除 core；此后
-/// core 只剩空资源壳（root 帧已释放），最后 Arc 何时 drop 不影响
-/// Dead 语义。
+/// PublishDead 阶段发布 Dead/CLOSED；后续 Job 成员摘除与祖先传播可能跨预算
+/// 继续。Complete 表示 ProcessDrain 的全部持久收束责任已完成；此后 core
+/// 只剩空资源壳（root 帧已释放），最后 Arc 何时 drop 不影响 Dead 语义。
 pub enum DrainStart {
     Ready,
     Wait(super::wait::WaitPlan),
