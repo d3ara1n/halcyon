@@ -7,17 +7,17 @@
 - 运行期协作停止前置已完成：Ready 后停止请求使用已发布 admitted raw ID 广播现代 IPI，所有 4 个 virt hart 实际停在 `hart::park`，PARKED mask 为 `15`；自 IPI 的 SSIP 会先清理，停止不遍历 timer 或伪造 Timeout。
 - 当前提交基线为 `d22b9d7` 加本轮后续提交；分支 `task/fal-service-capabilities`。实现真值见 `notes/impls/time.md`，停止结构见归档的 runtime-stop 前置。
 - 日志：`artifacts/check/time-final-{core,release,sifive,nofd,clippy,host}.log`、`time-runtime-stop-{probe,gdb}.log`。并行构建曾触发共享 boot-package 临时文件竞争，串行 release 重跑通过；失败日志保留，不作为 guest 失败。
-- 不包含跨硬件 epoch 连续时间（第 8 节唯一未来范围）、RPC/Outbox/服务政策或 FAL；#17 的完整 stress 截断/概率失败继续独立延期。
+- 不包含跨硬件 epoch 连续时间（第 8 节唯一未来范围）、RPC/Outbox/服务政策或 FAL；验收可靠性任务的完整 stress 截断/概率失败继续独立延期。
 
-> 状态：#14 已完成并归档。方向参考 `notes/ideas/{time,wait,rpc,call}.md`，本文件安排的公共时钟、Deadline 换算、绝对 Wait/Sleep/Send ABI 与既有消费者已接通；[公共对象前置 #13](todo-2026-09-13-public-ipc-wait-prerequisites.md) 与运行期协作停止前置均已完成。后续 RPC/服务政策由 [执行前置](../todo-2026-09-13-service-runtime-prerequisites.md) 和 [FAL 总计划](../todo-2026-09-fal-service-capabilities.md) 消费。
+> 状态：公共时间前置已完成并归档。方向参考 `notes/ideas/{time,wait,rpc,call}.md`，本文件安排的公共时钟、Deadline 换算、绝对 Wait/Sleep/Send ABI 与既有消费者已接通；[公共对象前置](todo-2026-09-13-public-ipc-wait-prerequisites.md) 与运行期协作停止前置均已完成。后续 RPC/服务政策由 [执行前置](../todo-2026-09-13-service-runtime-prerequisites.md) 和 [FAL 总计划](../todo-2026-09-fal-service-capabilities.md) 消费。
 
 ## 当前施工位置
 
-由 checkpoint `de981a6` 恢复施工，researcher/explorer 显式使用 `agentrouter-openai-responses/deepseek-v4-flash`，不改全局配置。#14 已完成，以下记录最终实现与验证边界。首轮按固定 Zicsr CSR Access Ordering 修正 time 读的内存/CSR 双侧 fence 与编译器屏障；ClockState 独立拥有高水位/失败，可隔离编排旧样本、origin 一 tick、真正回退、epoch end 与并发失败。ClockGeometry 最大期限改由可读且可编程尾 tick 推导，补极端/低频与整除临界测试。实际实现见 `notes/impls/time.md`。
+由 checkpoint `de981a6` 恢复施工，researcher/explorer 显式使用 `agentrouter-openai-responses/deepseek-v4-flash`，不改全局配置。以下记录最终实现与验证边界。首轮按固定 Zicsr CSR Access Ordering 修正 time 读的内存/CSR 双侧 fence 与编译器屏障；ClockState 独立拥有高水位/失败，可隔离编排旧样本、origin 一 tick、真正回退、epoch end 与并发失败。ClockGeometry 最大期限改由可读且可编程尾 tick 推导，补极端/低频与整除临界测试。实际实现见 `notes/impls/time.md`。
 
 首轮 shared host、virt core 和七面 lint 通过，debug 反汇编确认 fence 序列，日志在 `artifacts/check/time-*`。定点 reviewer 未见实现 bug，要求补 `frequency=1_953_125` 整除末端 assert，已加入；源码阶段与隔离样本不证明实际多 hart 所有时序，任务仍未完成。下一闭包是 Wait/Sleep 的初始命中/At0/安装延期与发送到期 ownership，随后真实超时/跨 hart 时间读取和时间失败收束；RPC/Outbox/offer 属后续任务。
 
-ClockGeometry/Deadline/ClockSnapshot、kernel clock、调度/启动换算、绝对 WaitMany/Sleep/Send 以及 rinlib 接口已写入。typed Packet、投递阶段错误、同步 Caller 与异步 dispatcher 已写入同一期限语义。TimerQueue 已增加保留 token 的 park/reschedule，注册期为全部 live 项预留恢复所需堆容量；libsrv WorkQueue 每任务预付一个可停用期限槽，有限 u64 最大纳秒仍是有限期限，不以整数哨兵代替 Infinite。真实服务期限政策仍待正式任务与 FAL 状态机接通。#13 最终 shared host 23 项（含 Deadline 编码/非整千频率/epoch 上限）通过，用户背压沿用原 Deadline；这不完成本任务的 ClockGeometry 全边界、并发高水位/不可逆失败、安装/到期和完整时间消费者组合门。
+ClockGeometry/Deadline/ClockSnapshot、kernel clock、调度/启动换算、绝对 WaitMany/Sleep/Send 以及 rinlib 接口已写入。typed Packet、投递阶段错误、同步 Caller 与异步 dispatcher 已写入同一期限语义。TimerQueue 已增加保留 token 的 park/reschedule，注册期为全部 live 项预留恢复所需堆容量；libsrv WorkQueue 每任务预付一个可停用期限槽，有限 u64 最大纳秒仍是有限期限，不以整数哨兵代替 Infinite。真实服务期限政策仍待正式任务与 FAL 状态机接通。此前 shared host 23 项（含 Deadline 编码/非整千频率/epoch 上限）通过，用户背压沿用原 Deadline；这不完成本任务的 ClockGeometry 全边界、并发高水位/不可逆失败、安装/到期和完整时间消费者组合门。
 
 时间实现已通过本任务的构建、lint、host、core、平台和停止取证门；RPC/任务计时草稿仍归执行前置审视，不能用这些源码宣称后续消费者已成立。RPC/任务计时草稿归执行前置审视，不能用这些源码宣称消费者已成立；不得恢复相对内核路径来绕过未接通消费者。
 

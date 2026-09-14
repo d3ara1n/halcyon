@@ -1,31 +1,31 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：公共对象/观察/退休 #13 与公共时间 #14 已完成并归档；执行基座 #15 尚未完成，FAL 业务继续暂停，整体未交付。先完成执行前置再恢复业务；已有代码和先前“冻结”的记录不是免审视依据。用户允许为通用机制清理 ABI，内核与 rinlib 同步迁移。
+> 状态：公共对象/观察/退休与公共时间已完成并归档；执行基座尚未完成，FAL 业务继续暂停，整体未交付。先完成执行前置再恢复业务；已有代码和先前“冻结”的记录不是免审视依据。用户允许为通用机制清理 ABI，内核与 rinlib 同步迁移。
 >
 > 方向参考：`notes/ideas/{object,message,wait,time,rpc,framework,fal,fs,service,tunnel,runnel}.md`。本文件拥有 FAL 业务与总体依赖/交付导航；公共对象/观察/退休由 [公共前置计划](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 拥有，时钟/绝对期限由 [期限计划](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有，运输/RPC/服务执行由 [执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md) 拥有。计划审视由实施者负责，代码 reviewer 只审查代码；提交后登记未来代码 Review。
 
 ## 开发分支与交接
 
-集成基线提交：`d22b9d71ef810145bf4d5bfb3673ffec8640f361`（`chore(fal): 保存公共对象收口后的集成开发基线`），共 131 个文件。它包含 #13 交付与其余草稿，不是最终 FAL 合并提交。固定该提交的未来代码复核见 [集成基线 Review](todo-2026-09-13-fal-integration-baseline-review.md)；继续施工从本分支最新 HEAD 接手，不退回基线覆盖后续改动。
+集成基线提交：`d22b9d71ef810145bf4d5bfb3673ffec8640f361`（`chore(fal): 保存公共对象收口后的集成开发基线`），共 131 个文件。它包含公共对象前置交付与其余草稿，不是最终 FAL 合并提交。固定该提交的未来代码复核见 [集成基线 Review](todo-2026-09-13-fal-integration-baseline-review.md)；继续施工从本分支最新 HEAD 接手，不退回基线覆盖后续改动。
 
-- 开发分支：`task/fal-service-capabilities`，由本地 `master` 的 `5d406a4` 分出；该基点包含原有四个未推送提交。当前基线是公共对象交付与时间/执行/FAL 草稿的集成快照，不声称仅包含 #13，也不声称 FAL 已交付。
-- 交接入口：先读 `plans/COMPASS.md`、本节和对应专题计划；实现现状看 `notes/impls/`，目标契约看 `notes/ideas/`。会话任务编号只作导航，计划文件是跨会话真值。
+- 开发分支：`task/fal-service-capabilities`，由本地 `master` 的 `5d406a4` 分出；该基点包含原有四个未推送提交。当前基线是公共对象交付与时间/执行/FAL 草稿的集成快照，不声称仅包含公共对象前置，也不声称 FAL 已交付。
+- 交接入口：先读 `plans/COMPASS.md`、本节和对应专题计划；实现现状看 `notes/impls/`，目标契约看 `notes/ideas/`。会话内任务编号只作临时导航，不能写入项目语义，计划文件是跨会话真值。
 - 开发方式：本次混合快照不按文件硬拆。后续按运输、RPC/Outbox、服务执行等机制闭包逐项提交；每项包含真实调用者、失败/取消/退休、旧路径删除和验证，不以 passing fragment 标完成。总体完成并经授权后合并回 `master`；提交不包含 push 或合并授权。
 
 | 专题 | 交接状态 | 接手入口与剩余责任 |
 |---|---|---|
-| 公共对象 #13 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
-| 公共时间 #14 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
-| 运输/执行 #15 | #13/#14 已完成，工作量大，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；按 typed transport、RPC context、Outbox/Runtime、真实消费者迁移、组合收口五个机制闭包推进，完成 Packet/Delivery→任务/RPC/Outbox→terminal→retire→refund 后才恢复 FAL |
-| FAL 业务 #7 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
-| 验收可靠性 #17 | 用户独立延期 | `todo-2026-09-13-acceptance-reliability.md` 和 KNOWN_ISSUES；概率覆盖误失败与原 Tunnel 静默截断分别处理，未绿 stress 不记通过 |
+| 公共对象、观察与退休前置 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
+| 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
+| 运输/执行前置 | 公共对象与时间已完成，工作量大，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；按 typed transport、RPC context、Outbox/Runtime、真实消费者迁移、组合收口五个机制闭包推进，完成 Packet/Delivery→任务/RPC/Outbox→terminal→retire→refund 后才恢复 FAL |
+| FAL 业务 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
+| 验收可靠性改进 | 用户独立延期 | `todo-2026-09-13-acceptance-reliability.md` 和 KNOWN_ISSUES；概率覆盖误失败与原 Tunnel 静默截断分别处理，未绿 stress 不记通过 |
 | workspace 包归属 | 独立延期 | `todo-2026-09-13-workspace-package-ownership.md`；本主线不搬目录/包或修改 path 依赖以整理归属 |
 
-代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。#15 先完成 typed transport，再接 RPC context、Outbox/Runtime 和真实消费者；每阶段保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
+代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置先完成 typed transport，再接 RPC context、Outbox/Runtime 和真实消费者；每阶段保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
 
 当前验证基线：七面 `just clippy`、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure 通过；GDB 只读捕获已安装 Close/active 的一次真实取消窗口，不保证每轮 exact-window。完整 stress 的旧截断/概率失败仍未解决；本快照没有总体 `just acceptance` 通过声明。
 
-完整日志与诊断 ELF/SHA256 位于本机 `artifacts/check/public-ipc-final-*`、`public-ipc-exit-*` 及 boot-failure/lint 目录，均被 Git 忽略，不随 clone 交付。异机接手先 `just check`、`just clippy`，显式 host target 的算法/shared 单测，再按变更风险运行 `just virt`、`just virt-release`、`just sifive_u`、`just virt-nofd`、`just virt-boot-failure`；若需复现诊断，用档案指明的生产源码断点重新取证，不依赖旧二进制地址。总体 stress/acceptance 在收尾如实判定，不能用重跑直到绿替代 #17。
+完整日志与诊断 ELF/SHA256 位于本机 `artifacts/check/public-ipc-final-*`、`public-ipc-exit-*` 及 boot-failure/lint 目录，均被 Git 忽略，不随 clone 交付。异机接手先 `just check`、`just clippy`，显式 host target 的算法/shared 单测，再按变更风险运行 `just virt`、`just virt-release`、`just sifive_u`、`just virt-nofd`、`just virt-boot-failure`；若需复现诊断，用档案指明的生产源码断点重新取证，不依赖旧二进制地址。总体 stress/acceptance 在收尾如实判定，不能用重跑直到绿替代验收可靠性计划。
 
 ## 开工审视与任务依赖
 
@@ -63,7 +63,7 @@
 
 ## 当前施工位置
 
-公共对象 #13 已完成：独立发送授权/Delivery/Lifetime、WaitSet 普通内核退休、捕获 Native 继续/轮次取消、最后拥有根和真实消费者共同验证，旧维护 ABI 删除；新增真实线程接收、跨进程提交后 kill 与 GDB Waiting/active 窗口。最终 core/sifive/release/nofd、启动失败、七面 lint 和 163 项 host 测试通过，纳入当前 FAL 分支混合集成基线。完整 stress 的截断/概率判定仍由验收可靠性 #17 独立延期，不宣称通过或已修复。自然序转 #15 → FAL；具体证据见公共前置档案与 notes/impls/ipc.md。下列条目是旧施工盘点，不是当前实现或交付保证，执行/业务恢复时须按实际代码重审：
+公共对象、观察与退休前置已完成：独立发送授权/Delivery/Lifetime、WaitSet 普通内核退休、捕获 Native 继续/轮次取消、最后拥有根和真实消费者共同验证，旧维护 ABI 删除；新增真实线程接收、跨进程提交后 kill 与 GDB Waiting/active 窗口。最终 core/sifive/release/nofd、启动失败、七面 lint 和 163 项 host 测试通过，纳入当前 FAL 分支混合集成基线。完整 stress 的截断/概率判定仍由验收可靠性计划独立延期，不宣称通过或已修复。自然序转 运输/RPC/服务执行前置 → FAL；具体证据见公共前置档案与 notes/impls/ipc.md。下列条目是旧施工盘点，不是当前实现或交付保证，执行/业务恢复时须按实际代码重审：
 
 - `shared/src/time.rs` 已写入 Deadline、ClockSnapshot、ClockGeometry 和换算测试；`kernel/clock.rs` 接入单一时钟来源，调度量子与启动期限不再截断频率。
 - shared/kernel/rinlib 的绝对 WaitMany/Sleep/Send 已开始纵向迁移；同步 Caller 与异步 Dispatcher 已写入同一 deadline、Unsent/Sent 错误阶段和未发送 Request/能力归还，尚未形成编译与组合证据。

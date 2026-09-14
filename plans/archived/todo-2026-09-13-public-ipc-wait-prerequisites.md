@@ -1,6 +1,6 @@
 # 公共对象、观察与退休前置
 
-> 状态：#13 公共对象/消息/WaitSet/内核退休前置已完成并归档，纳入 `task/fal-service-capabilities` 的混合集成基线；提交定位见 FAL 总计划交接节。当前实现真值见 [IPC 实现记录](../../notes/impls/ipc.md)。下列施工期目标、阶段记录和当时的未完成项是历史证据，不再安排当前实施。公共时间 #14、执行基座 #15、FAL 总体仍未完成。
+> 状态：公共对象/消息/WaitSet/内核退休前置已完成并归档，纳入 `task/fal-service-capabilities` 的混合集成基线；提交定位见 FAL 总计划交接节。当前实现真值见 [IPC 实现记录](../../notes/impls/ipc.md)。下列施工期目标、阶段记录和当时的未完成项是历史证据，不再安排当前实施。公共时间、执行基座和 FAL 总体仍未完成。
 
 ## 完成证据与边界
 
@@ -12,7 +12,7 @@
 - 外部 GDB 捕获生产 Kill(0x131) 前 active=2、三成员、mandatory=1；随后真实 Waiting 取消 epoch1、reusable=false/KernelResult0，识别已安装 Close 回复。日志 `artifacts/check/public-ipc-exit-gdb.log`、完整 core `public-ipc-exit-probe.log`、保留 ELF `public-ipc-exit-kernel.elf` 与 SHA256。本次快照证明该窗口，不宣称每轮两回复都 Waiting。
 - 旧阶段三项 continuation findings、Mailbox 三项 P2、最后六项公共测试/Capability 契约 P2 已逐项定点复核关闭；未留下兼容机制或生产 correctness finding。
 - 最终 `artifacts/check/public-ipc-final-{core,sifive,release,nofd,boot-failure,clippy,host,shared-host}.log`：core/128MiB/release/nofd 通过，panic/alloc/fatal 三种 Failed 全 hart 停驻通过，七面 lint 与 140+23 host 测试通过。新增组合进入正常 required anchors。
-- 先前完整 stress 的 300s Tunnel 截断与概率 15/16 未宣称修复或通过；用户已独立延期到 [验收可靠性任务](../todo-2026-09-13-acceptance-reliability.md)。不执行总体 acceptance/stress 收尾、不豁免新 correctness，不把 #13 完成视为时间/执行/FAL 交付。
+- 先前完整 stress 的 300s Tunnel 截断与概率 15/16 未宣称修复或通过；用户已独立延期到 [验收可靠性任务](../todo-2026-09-13-acceptance-reliability.md)。不执行总体 acceptance/stress 收尾、不豁免新 correctness，不把公共对象前置完成视为时间/执行/FAL 交付。
 - 下一自然序：[公共时间](../archived/todo-2026-09-monotonic-time-rpc-deadline.md) → [运输/RPC/服务执行](../todo-2026-09-13-service-runtime-prerequisites.md) → [FAL](../todo-2026-09-fal-service-capabilities.md)。包归属整理仍独立延期。
 
 ## 施工期材料
@@ -121,7 +121,7 @@ Open owner / ProcessDrain entry
 - ABI 同步：shared 调用号与 DrainResult、kernel Seal/Drain 分派、rinlib raw/safe Seal/Drain 已删除；集合只允许 READABLE/CLOSED。KernelObject 提供 retirement backend，不在 Handle 按 WaitSet kind 继续扩大维护分支。静态队列身份 7，runtime 从 8 起。控制面 notification/finish/retirement 同一安全点最多 16 步，有 pending 的后类保留最低份额；idle 包含 actor runnable。
 - 来源 CLOSED 不再安装持久槽；终态扫描无未 seen epoch 仍用 CLOSED 当前快照 offer 并摘 full Subscription。WaitSet actor 也有界 pop 来源槽，不等待观察者消费/执行。复核发现旧 Done 后回调读取新 Armed outcome 的 P1，现完成方 Done 前捕获(epoch,outcome)，目标登记缓存且代次校验；Operation Drop 只发匹配缓存，定点复核确认关闭。来源迟到安装 P1 已修；复核续发现 CLOSED/Rearm 已 seen 后 selected=None 绕过退休，闭合分支及后续复核/确定性证据见本节最新记录。
 - 真实验收新增 64 注册非空关闭、Remove 立即失效、自观察、交叉观察与 16 轮 Rearm。actor stress 日志 artifacts/check/public-ipc-actor-stress.log 完整 16/16/reset；最终 CLOSED 无候选修复后 core 日志 public-ipc-actor-final-virt.log 通过。普通重构检查不等于所有依赖/容量/退出竞态覆盖。
-- 剩余验证真值以本节「下一自然序」为准；上述 actor 迁移最初的待验项已有本轮机制与运行证据，未完成项不由 passing fragment 或 lint 替代。未通过整体组合前不完成 #13，也不启动后续 FAL 业务。
+- 剩余验证真值以本节「下一自然序」为准；上述 actor 迁移最初的待验项已有本轮机制与运行证据，未完成项不由 passing fragment 或 lint 替代。未通过整体组合前不将公共对象前置标记为完成，也不启动后续 FAL 业务。
 
 上一轮 Native 请求施工证据：
 

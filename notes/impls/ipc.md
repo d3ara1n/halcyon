@@ -1,6 +1,6 @@
 # IPC 对象实现
 
-公共对象、消息、观察与内核退休前置 #13 已完成。ABI 位于 `shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/rinlib/src/ipc/`。施工证据见 [公共前置档案](../../plans/archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)。公共时间 #14、运输/RPC/服务执行 #15 和 FAL 业务仍未完成，不能把本前置完成视为总体交付。
+公共对象、消息、观察与内核退休前置已完成。ABI 位于 `shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/rinlib/src/ipc/`。施工证据见 [公共前置档案](../../plans/archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)。公共时间、运输/RPC/服务执行和 FAL 业务仍未全部完成，不能把本前置完成视为总体交付。
 
 ## Handle 与对象身份
 

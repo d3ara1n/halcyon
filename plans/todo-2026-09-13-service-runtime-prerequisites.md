@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：[公共对象/观察/退休 #13](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 已完成；[时间/绝对期限 #14](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 已完成；本任务进入施工前审视。当前 rinlib/Runnel/RPC/libsrv 源码均需按目标重新核对，不视为已完成框架。本文件拥有用户态运输与通用执行机制施工，FAL 业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 在本任务完成后恢复。
+> 状态：[公共对象/观察/退休前置](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 已完成；[时间/绝对期限前置](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 已完成；本任务进入施工前审视。当前 rinlib/Runnel/RPC/libsrv 源码均需按目标重新核对，不视为已完成框架。本文件拥有用户态运输与通用执行机制施工，FAL 业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 在本任务完成后恢复。
 
 ## 闭合目标与任务边界
 
@@ -10,9 +10,9 @@
 
 ## 规模、阶段与提交策略
 
-#15 是当前主线中继 #14 之后最大的机制任务。现有代码已经有若干类型草稿，但不能按源码行数或“已有框架”计入完成度；真正工作在于把所有权、阶段错误、取消、背压、期限、退休和退款接成闭合责任链，并迁移真实调用者。
+运输/RPC/服务执行前置是当前主线中继公共时间前置之后最大的机制任务。现有代码已经有若干类型草稿，但不能按源码行数或“已有框架”计入完成度；真正工作在于把所有权、阶段错误、取消、背压、期限、退休和退款接成闭合责任链，并迁移真实调用者。
 
-预计按以下五个机制闭包推进，每个闭包可独立构建、验证和提交，但前一闭包未完成时不宣称 #15 完成：
+预计按以下五个机制闭包推进，每个闭包可独立构建、验证和提交，但前一闭包未完成时不宣称本执行前置完成：
 
 1. **Typed transport**：审计 `Capability/HandleSet/Packet/ReceiveBuffer/Delivery`，完成 Runnel Producer/Consumer 的构造、Attach、部分进度、EOF/Broken、初始化失败和 Endpoint cleanup；迁移 pm/init 的实际工厂，保留 raw ABI 仅作明确 unsafe 验收边界。
 2. **RPC context**：统一同步/异步 RequestContext、预付回复、txid/Deadline、`Unsent`/`Sent`/`OutcomeUnknown`、关闭和取消；验证协议拒绝、迟到回复、附带能力退休与请求 owner 原样返还。
@@ -20,7 +20,7 @@
 4. **真实消费者迁移**：迁移 `srv_init`、`srv_pm`、`srv_fs`、`test_hammer` 及现有 Runnel/RPC 调用点；删除旧阻塞泵、重复 close、相对期限重试和没有真实 owner 的 adapter。
 5. **组合收口**：host/static/clippy、core/release/platform、初始化失败、取消、调用者退出、Sent 后超时、迟到回复、Endpoint 关闭、资源退款和旧路径删除一起验证；完成后才解除 FAL 业务前置。
 
-提交纪律：不按文件机械拆分强耦合 ABI/owner/通知/退休迁移；每个提交说明所闭合的机制、真实调用者、尚未覆盖的失败面和验证证据。跨阶段暂存的类型只能是最终结构的一部分，不能用兼容层或测试专用路径替代未完成责任。最终 #15 交付提交前，再登记固定 hash 的提交后 Review；不自动合并或 push。
+提交纪律：不按文件机械拆分强耦合 ABI/owner/通知/退休迁移；每个提交说明所闭合的机制、真实调用者、尚未覆盖的失败面和验证证据。跨阶段暂存的类型只能是最终结构的一部分，不能用兼容层或测试专用路径替代未完成责任。最终 运输/RPC/服务执行前置 交付提交前，再登记固定 hash 的提交后 Review；不自动合并或 push。
 
 ## 从最终调用反推的前置
 
