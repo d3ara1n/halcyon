@@ -22,11 +22,11 @@
 
 公共时间与公共对象已完成原交付；时间提交 `c6e0a84`，实现见 `notes/impls/{time,ipc}.md`。分支级设计审视另识别了公共操作与回收边界收束需求，不把原交付通过视为现有结构必须保留；本轮只更新设计与计划，没有实施重构或新增验收通过声明。
 
-**当前下一任务**：[消息运输 → 流运输/Runnel → 通用执行与准入 → 完整 RPC/Outbox](todo-2026-09-13-service-runtime-prerequisites.md)，先按 `AGENTS.md`「标准施工流程」完成接手、规模审计、任务拆分/合并和设计闭包，再进入消息运输实施。验收概率判定已改为确定性终因覆盖，历史 Tunnel 静默截断按墙钟敏感的偶发现象归档于 [`ref-2026-09-acceptance-timing-flake.md`](archived/ref-2026-09-acceptance-timing-flake.md)；当前无开放验收 todo，若新现场命中归档中的触发条件再立案。ProcessDrain 由受信任管理者在 REAPABLE 后推进，普通应用不持续轮询，保留该契约；自动全程回收、预算激励和重新设计全监督拓扑均不是当前前置。
+**当前下一任务**：[消息运输 → 流运输/Runnel → 通用执行与准入 → 完整 RPC/Outbox](todo-2026-09-13-service-runtime-prerequisites.md) 前两闭包已实施并提交（消息运输 `3060dd8`，流运输提交哈希随后登记）；下一实施为通用执行与准入闭包，先按 `AGENTS.md`「标准施工流程」完成接手、规模审计与设计闭包（Runtime 任务、WaitSet 注册、期限、Park/Wake、Close/Drain 停驻、监督接管边界及 Runnel 登记接入面与三条件观察结果形态）再编码。验收概率判定已改为确定性终因覆盖，历史 Tunnel 静默截断按墙钟敏感的偶发现象归档于 [`ref-2026-09-acceptance-timing-flake.md`](archived/ref-2026-09-acceptance-timing-flake.md)；当前无开放验收 todo，若新现场命中归档中的触发条件再立案。ProcessDrain 由受信任管理者在 REAPABLE 后推进，普通应用不持续轮询，保留该契约；自动全程回收、预算激励和重新设计全监督拓扑均不是当前前置。
 
 后续串行位置：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成 → [内核等待/请求/退休结构收束](todo-2026-09-14-public-operation-ownership.md) → [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)。共享包整理是独立的小型 workspace 迁移，不阻塞当前执行前置整体开工；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。每个机制包含真实消费者迁移、失败/退出和旧路径删除，组合验收是完成门。
 
-可以先行的局部修复只有已定位、无需改变对外契约的收口，例如 Runnel 新观察方法的终态访问；唯一登记在执行前置。Delivery 独立身份/Peek 取舍在运输闭包开工前决定，不预设删除。共享包整理已作为独立小型任务开工：`shared/` 现组织为 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
+无消费者的 Runnel 观察草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`，随基线 `d22b9d7` 入库）已在流运输闭包中删除，已立案终态访问缺陷随之消失；原始 ABI 工厂同批删除，typed create/attach 成为唯一构造入口，init 创建侧已迁移；观察/登记/取消语义移入通用执行闭包，由 Runtime 首个真实消费者共同定形。Delivery 独立身份与 Peek 已在消息闭包裁决保留。共享包整理已作为独立小型任务开工：`shared/` 现组织为 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
 
 当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；本次设计审视基线为 `bf48cab`。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输/执行与 FAL 仍是草稿；验收可靠性首轮已收口，历史时间敏感现场保留只读归档。后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
 
@@ -41,7 +41,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停：先运输/执行/RPC，随后共享包与内核执行结构收束，再恢复后端、授权与业务 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
-| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 当前下一任务，四闭包：消息运输（已完成待 Review）→ 流运输/Runnel（下一实施）→ 通用执行/准入 → RPC/Outbox；同步真实消费者，包含 Runnel 终态修复与事件驱动监督 |
+| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 四闭包：消息运输与流运输/Runnel 均已完成待 Review → 通用执行/准入（下一实施）→ RPC/Outbox；typed owner 已收口，事件驱动登记/观察/取消并入通用执行闭包 |
 | [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
 | [`todo-2026-09-14-kernel-memory-budget.md`](todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |

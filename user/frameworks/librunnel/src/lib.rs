@@ -387,14 +387,8 @@ impl<T: Transport> ConsumerCore<T> {
 #[cfg(target_arch = "riscv64")]
 pub mod blocking {
     use super::*;
-    use erhino_shared::{
-        object::{Handle, ObjectSignals},
-        wait::WaitResult,
-    };
-    use rinlib::{
-        ipc::tunnel::{self, Endpoint},
-        mm::Placement,
-    };
+    use erhino_shared::{object::ObjectSignals, wait::WaitResult};
+    use rinlib::{ipc::tunnel::Endpoint, mm::Placement};
 
     struct Guest {
         endpoint: Option<Endpoint>,
@@ -482,75 +476,6 @@ pub mod blocking {
         not_sync: core::marker::PhantomData<core::cell::Cell<()>>,
     }
 
-    pub fn create_producer(
-        bytes: usize,
-        policy: Placement,
-    ) -> Result<(Producer, Handle), RunnelError> {
-        let (endpoint, invitation) = tunnel::create(bytes, policy).map_err(RunnelError::Syscall)?;
-        let core = ProducerCore::new(Guest::new(endpoint), true)
-            .inspect_err(|_| {
-                // SAFETY: 创建失败，Invitation 尚未交给上层且不能包含映射 owner。
-                let _ = unsafe { rinlib::ipc::object::close(invitation) };
-            })
-            .map_err(|failure| failure.error)?;
-        Ok((
-            Producer {
-                core,
-                not_sync: core::marker::PhantomData,
-            },
-            invitation,
-        ))
-    }
-    pub fn create_consumer(
-        bytes: usize,
-        policy: Placement,
-    ) -> Result<(Consumer, Handle), RunnelError> {
-        let (endpoint, invitation) = tunnel::create(bytes, policy).map_err(RunnelError::Syscall)?;
-        let core = ConsumerCore::new(Guest::new(endpoint), true)
-            .inspect_err(|_| {
-                // SAFETY: 同 Producer，失败时放弃尚未发布的 Invitation。
-                let _ = unsafe { rinlib::ipc::object::close(invitation) };
-            })
-            .map_err(|failure| failure.error)?;
-        Ok((
-            Consumer {
-                core,
-                not_sync: core::marker::PhantomData,
-            },
-            invitation,
-        ))
-    }
-    /// # Safety
-    /// 原始 ABI 调用者独占 Invitation 的消费及未消费失败后的关闭责任。
-    pub unsafe fn attach_producer(
-        invitation: Handle,
-        policy: Placement,
-    ) -> Result<Producer, RunnelError> {
-        // SAFETY: 调用者传入唯一消费责任，成功后由 Guest 独占新映射。
-        let endpoint =
-            unsafe { tunnel::attach(invitation, policy) }.map_err(RunnelError::Syscall)?;
-        Ok(Producer {
-            core: ProducerCore::new(Guest::new(endpoint), false)
-                .map_err(|failure| failure.error)?,
-            not_sync: core::marker::PhantomData,
-        })
-    }
-    /// # Safety
-    /// 原始 ABI 调用者独占 Invitation 的消费及未消费失败后的关闭责任。
-    pub unsafe fn attach_consumer(
-        invitation: Handle,
-        policy: Placement,
-    ) -> Result<Consumer, RunnelError> {
-        // SAFETY: 调用者传入唯一消费责任，成功后由 Guest 独占新映射。
-        let endpoint =
-            unsafe { tunnel::attach(invitation, policy) }.map_err(RunnelError::Syscall)?;
-        Ok(Consumer {
-            core: ConsumerCore::new(Guest::new(endpoint), false)
-                .map_err(|failure| failure.error)?,
-            not_sync: core::marker::PhantomData,
-        })
-    }
-
     #[derive(Debug)]
     pub enum AttachFailure {
         Tunnel(rinlib::ipc::invitation::AttachFailure),
@@ -628,37 +553,6 @@ pub mod blocking {
         pub fn write_all(&mut self, input: &[u8]) -> Result<(), IoError> {
             self.core.write_all(input)
         }
-        pub fn prepare_wait(&mut self) -> Result<bool, IoError> {
-            if self.core.writable()? != 0 {
-                return Ok(true);
-            }
-            self.core.channel.acknowledge()?;
-            Ok(self.core.writable()? != 0)
-        }
-        pub fn all_consumed(&mut self) -> Result<bool, IoError> {
-            Ok(self.core.eof && self.core.writable()? == self.core.channel.capacity)
-        }
-        pub fn register(
-            &self,
-            set: &rinlib::ipc::wait_set::WaitSet,
-            cookie: u64,
-        ) -> Result<u64, SystemCallError> {
-            self.core.channel.transport.endpoint().events().register(
-                set,
-                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-                cookie,
-            )
-        }
-        pub fn peer_attached(&self) -> Result<bool, SystemCallError> {
-            let result = self.core.channel.transport.endpoint().events().wait_until(
-                ObjectSignals::PEER_ATTACHED | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-                rinlib::time::Deadline::at(0),
-            )?;
-            Ok(result.observed.intersects(ObjectSignals::PEER_ATTACHED)
-                && !result
-                    .observed
-                    .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED))
-        }
         pub fn finish(&mut self) -> Result<(), IoError> {
             self.core.finish()
         }
@@ -710,34 +604,6 @@ pub mod blocking {
         }
         pub fn eof_reached(&mut self) -> Result<bool, IoError> {
             self.core.eof_reached()
-        }
-        pub fn prepare_wait(&mut self) -> Result<bool, IoError> {
-            if self.core.readable()? != 0 || self.core.eof_reached()? {
-                return Ok(true);
-            }
-            self.core.channel.acknowledge()?;
-            Ok(self.core.readable()? != 0 || self.core.eof_reached()?)
-        }
-        pub fn register(
-            &self,
-            set: &rinlib::ipc::wait_set::WaitSet,
-            cookie: u64,
-        ) -> Result<u64, SystemCallError> {
-            self.core.channel.transport.endpoint().events().register(
-                set,
-                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-                cookie,
-            )
-        }
-        pub fn peer_attached(&self) -> Result<bool, SystemCallError> {
-            let result = self.core.channel.transport.endpoint().events().wait_until(
-                ObjectSignals::PEER_ATTACHED | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-                rinlib::time::Deadline::at(0),
-            )?;
-            Ok(result.observed.intersects(ObjectSignals::PEER_ATTACHED)
-                && !result
-                    .observed
-                    .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED))
         }
         pub fn close(mut self) -> Result<(), (Self, SystemCallError)> {
             match self.core.channel.close() {

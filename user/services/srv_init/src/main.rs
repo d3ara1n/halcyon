@@ -1015,11 +1015,26 @@ fn run(services: Handle) -> Result<(), &'static str> {
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
     let (mut tunnel, invitation) =
-        match blocking::create_consumer(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere) {
-            Ok(t) => t,
-            Err(e) => {
-                debug!("tunnel create failed: {:?}", e);
+        match blocking::Consumer::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere) {
+            Ok((consumer, invitation)) => (consumer, invitation),
+            Err(blocking::CreateFailure::System(error)) => {
+                debug!("tunnel create failed: {:?}", error);
                 return Err("tunnel create failed");
+            }
+            Err(blocking::CreateFailure::Protocol {
+                endpoint,
+                invitation,
+                error,
+            }) => {
+                // 协议初始化失败：本地映射与未发布邀请双 owner 显式关闭，失败仅记录。
+                if let Err((_, close_error)) = endpoint.close() {
+                    debug!("tunnel endpoint close failed: {:?}", close_error);
+                }
+                if let Err((_, close_error)) = invitation.into_capability().close() {
+                    debug!("tunnel invitation close failed: {:?}", close_error);
+                }
+                debug!("tunnel protocol init failed: {:?}", error);
+                return Err("tunnel init failed");
             }
         };
     debug!("tunnel created");
@@ -1036,11 +1051,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     })?;
     let mut packet = Packet::new(514, &[])
         .map_err(|_| "tunnel invitation packet allocation failed")?;
-    if let Err(failure) = packet.push(
-        // SAFETY: invitation 是 create_consumer 尚未发布的邀请输出，此处唯一接管。
-        unsafe { Capability::from_raw(invitation) },
-        Rights::MAP,
-    ) {
+    if let Err(failure) = packet.push(invitation.into_capability(), Rights::MAP) {
         let _ = failure.capability.close();
         return Err("tunnel invitation push failed");
     }

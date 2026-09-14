@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：当前下一任务。消息运输闭包已实施并提交（`3060dd8`，未来复核见 [消息运输 Review](todo-2026-09-14-message-transport-review.md)）；下一实施为流运输与 Runnel 闭包，其规模审计与设计闭包未完成前不得编码。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
+> 状态：当前下一任务。消息运输闭包（`3060dd8`）与流运输/Runnel 闭包均已实施并提交；下一实施为通用执行与准入闭包，其设计闭包未完成前不得编码。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
 
 ## 开工流程与本任务审计门
 
@@ -22,9 +22,11 @@
 
 这不是孤立类型任务拆分：每个闭包各自携带真实消费者迁移、失败路径与旧路径删除。
 
+二轮拆分已裁决（2026-09-14）：观察/登记/取消的消费语义从流运输闭包移入通用执行闭包。基线 `d22b9d7` 随混合快照入库的 `Producer/Consumer::{register, peer_attached, prepare_wait, all_consumed}` 没有任何真实消费者，register/peer_attached 还在运行期 fail 后绕过终态检查访问已关闭 Endpoint（已立案缺陷）；它们是为 Runtime 事件驱动接管预留的草稿面，不是完成交付。流运输闭包按「残留即见即清」删除这四个方法——缺陷随之消失，阻塞路径内部协议保持私有；事件驱动的登记接入、三条件观察结果与取消语义由通用执行闭包与 Runtime 首个真实消费者共同设计落地，不预设形状。rinlib `EndpointEvents` 的事件登记是通用 ABI 设施而非 Runnel 专面，保留。
+
 ### 设计完成门
 
-消息运输闭包编码前必须确定 Delivery 身份与 Peek 语义，完成 Capability/Packet/Receive/Invitation 的类型图、所有权图、状态机、线性化点、锁阶和失败/取消/退出/退款路径，并确定真实消费者迁移与旧路径删除顺序。流运输闭包编码前必须完成 Runnel 角色、typed Invitation 消费与观察协议的同类设计，并延续消息闭包定稿的 owner 形态。通用执行闭包编码前必须确定 Runtime 任务、WaitSet 注册、期限、Park/Wake、Close/Drain 停驻和监督接管边界。RPC 闭包编码前必须确定 Request/Reply/Outbox 阶段、Deadline 覆盖范围、迟到回复和调用者退出语义。设计结论进入 `notes/ideas/`；实现事实进入 `notes/impls/`。
+消息运输闭包编码前必须确定 Delivery 身份与 Peek 语义，完成 Capability/Packet/Receive/Invitation 的类型图、所有权图、状态机、线性化点、锁阶和失败/取消/退出/退款路径，并确定真实消费者迁移与旧路径删除顺序。流运输闭包编码前必须完成 Runnel 角色、typed Invitation 消费与阻塞路径失败边界的同类设计，并延续消息闭包定稿的 owner 形态；不设计任何观察/登记/取消 API（二轮拆分裁决移入通用执行）。通用执行闭包编码前必须确定 Runtime 任务、WaitSet 注册、期限、Park/Wake、Close/Drain 停驻和监督接管边界，并确定 Runnel 登记接入面与三条件观察结果的形态。RPC 闭包编码前必须确定 Request/Reply/Outbox 阶段、Deadline 覆盖范围、迟到回复和调用者退出语义。设计结论进入 `notes/ideas/`；实现事实进入 `notes/impls/`。
 
 只有上述审计、拆分/合并和设计门完成后，才可将对应闭包标记为实施中；实施中发现证据推翻前提时，停止编码并回到审计/设计步骤。
 
@@ -38,9 +40,11 @@
 
 ## 可以先行的局部收口
 
-Runnel 新增 `Producer/Consumer::register` 与 `peer_attached` 直接访问 Guest.endpoint，而运行期 fail 可先成功关闭 Endpoint；后续查询便绕过 Channel 的终态检查，进入 `closed channel accessed its mapping` 的 expect。该缺陷位于 `librunnel/src/lib.rs` 的 Channel::fail、Guest::endpoint/close 与新增观察方法，可以在流运输闭包开工时或其之前首先通过统一的终态访问边界修复并验证，不等待完整 Runtime，也不新增独立 todo。本次仅定位和立案，未修代码。
+Runnel 新增的 `Producer/Consumer::register` 与 `peer_attached` 直接访问 Guest.endpoint，而运行期 fail 可先成功关闭 Endpoint；后续查询便绕过 Channel 的终态检查，进入 `closed channel accessed its mapping` 的 expect。该缺陷位于 `librunnel/src/lib.rs` 的 Channel::fail、Guest::endpoint/close 与新增观察方法。
 
-同时明确“可写空间”“EOF 后全部消费”“对端已建立”是不同等待条件；不能用当前 prepare_wait 的布尔结果代替全部操作。完整观察/取消 API 的调整仍属于下面的流运输闭包，局部终态修复不能当作异步接口已经完成。
+二轮拆分裁决（见「拆分/合并决策」）改修复为删除：这批无消费者草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`，随基线 `d22b9d7` 入库）在流运输闭包开工时或其之前直接删除，缺陷随之消失，不新增独立 todo。删除时复核无其它终态后 endpoint 访问路径（`wait_peer_closed` 有 check 前置，不受影响）；阻塞推进的 acknowledge→重查→wait 保持私有协议，已有 host 覆盖。
+
+同时明确“可写空间”“EOF 后全部消费”“对端已建立”是不同等待条件；不能用布尔结果代替全部操作。完整观察/登记/取消 API 的设计与实现移入通用执行闭包，由 Runtime 作为首个真实消费者共同定形；本计划不保留任何无消费者观察面。
 
 ## 自然顺序：四个实施闭包与组合完成门
 
@@ -81,13 +85,17 @@ Runnel 新增 `Producer/Consumer::register` 与 `peer_attached` 直接访问 Gue
 
 ### 流运输与 Runnel 角色
 
-前置：消息运输闭包完成——Runnel attach 消费消息侧收束的 typed Invitation owner，接缝不引入 adapter。[局部终态修复](#可以先行的局部收口) 是唯一例外，独立于闭包顺序可先行。
+前置：消息运输闭包完成——Runnel attach 消费消息侧收束的 typed Invitation owner，接缝不引入 adapter。[无消费者观察面删除](#可以先行的局部收口) 是唯一例外，独立于闭包顺序可先行。
 
 1. 完成 Runnel Producer/Consumer 的构造、Attach、部分进度、EOF/Broken 与 Endpoint cleanup。未消费 Invitation、已消费但角色未建立的 transport、运行期 terminal 各有完整失败 owner。raw ABI 只保留有真实用途的 unsafe 边界。
-2. 将 ack→重查→登记/等待的正确协议封装进角色的推进与观察准备；业务不操作原始共享 cursor 或自行拼等待顺序。取消或遗忘准备操作只能影响自身协议进展，不能破坏内核映射与通知资源的归属。
+2. 阻塞推进路径（acknowledge→重查→wait）保持为角色内部协议并受 host 测试覆盖；业务不操作原始共享 cursor 或自行拼等待顺序。删除无消费者观察草稿面（register/peer_attached/prepare_wait/all_consumed）；事件驱动的登记/观察/取消接入面属通用执行闭包，本闭包不实现无真实消费者的 API。
 3. 同步迁移 pm/init 与全部现有运输工厂和流路径调用者，删除 raw 消费捷径和失败后丢失承载的分支。
 
-完成门：未 Attach、初始化失败、部分传输、EOF/Broken、对端退出与清理失败均有真实 owner；现有数据路径使用最终角色，旧路径删除；host/目标检查及相关 QEMU 运输组合通过。
+完成门：未 Attach、初始化失败、部分传输、EOF/Broken、对端退出与清理失败均有真实 owner；现有数据路径使用最终角色，旧路径与无消费者观察面删除；host/目标检查及相关 QEMU 运输组合通过。
+
+#### 实施记录（2026-09-14）
+
+已按上述范围完成：删除随基线 `d22b9d7` 入库的无消费者观察草稿面（`Producer/Consumer::{register, peer_attached, prepare_wait, all_consumed}`），register/peer_attached 在运行期 fail 后绕过终态检查访问已关闭 Endpoint 的缺陷随之消失（复核删除后无其它终态后 endpoint 访问路径，`wait_peer_closed` 有 check 前置）；删除原始 ABI 工厂（`create/attach_producer/consumer`），typed `Producer/Consumer::create/attach` 成为唯一构造入口；srv_init 数据面创建侧迁移至 `Consumer::create`，Invitation 以 typed owner 直接 `into_capability()` 进 Packet，消除 `Capability::from_raw` 接缝，`CreateFailure::Protocol` 双 owner（本地映射与未发布邀请）显式关闭并记录。pm 接收侧已 typed，不变；srv_init 自检/race 与 test_hammer 的 rinlib 原始 tunnel 调用属刻意内核契约验证，保留为 raw。阻塞推进的 acknowledge→重查→wait 保持私有协议，host 覆盖不变。验证：用户态框架 host 95 项（librunnel 15）、七面 clippy、virt core 与 virt-release 全绿；内核与 shared 未改动。观察/登记/取消接入面按二轮拆分裁决移入通用执行闭包。
 
 ### 通用执行与准入
 

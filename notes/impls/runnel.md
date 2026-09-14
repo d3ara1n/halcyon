@@ -12,7 +12,7 @@ Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节
 
 ## owner、门铃与错误
 
-公开 guest 接口在 `blocking` 模块：安全 `Producer/Consumer::create` 接受字节长度和 `rinlib::mm::Placement` 并返回 typed Invitation；安全 `attach` 消费 typed Invitation。内核未消费的失败保留 Invitation，已消费后的协议验证失败以 `InitFailure<Endpoint>` 返还本地映射 owner；异常几何清理由 rinlib 的 EndpointCleanup 保留。私有 Channel/ProducerCore/ConsumerCore 构造也以 InitFailure 返还 Transport，不在初始化失败时进入运行期 Broken/关闭路径。现有原始 ABI 工厂及 unsafe attach 函数只承接尚待迁移的验收调用者，正式 Open 使用安全入口。Producer/Consumer 独占 Endpoint，不导出 Handle 或共享 slice。共享访问通过 [`Tunnel owner`](tunnel.md) 借出的 `SharedMemory`，仅临时借用映射，不创建自引用结构。
+公开 guest 接口在 `blocking` 模块：安全 `Producer/Consumer::create` 接受字节长度和 `rinlib::mm::Placement` 并返回 typed Invitation；安全 `attach` 消费 typed Invitation。内核未消费的失败保留 Invitation，已消费后的协议验证失败以 `InitFailure<Endpoint>` 返还本地映射 owner；异常几何清理由 rinlib 的 EndpointCleanup 保留。私有 Channel/ProducerCore/ConsumerCore 构造也以 InitFailure 返还 Transport，不在初始化失败时进入运行期 Broken/关闭路径。原始 ABI 工厂及 unsafe attach 函数已删除，typed 安全入口是唯一构造路径。Producer/Consumer 独占 Endpoint，不导出 Handle 或共享 slice。共享访问通过 [`Tunnel owner`](tunnel.md) 借出的 `SharedMemory`，仅临时借用映射，不创建自引用结构。
 
 所有公开数据操作在正进展后通知，finish 在 EOF 发布后通知；Invited 期 ObjectNotAvailable 不代表 Closed，attach 首次检查取得已经发布的数据。无进展时 acknowledge → 重查 → WaitMany(DATA|PEER_CLOSED|CLOSED)，不做边沿省略。
 
@@ -20,7 +20,7 @@ Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节
 
 ## 当前施工
 
-上述 typed 构造和错误 owner 是 FAL 整体施工中的连接点，尚未编译、测试或组合验收；新 host 用例只已写入，覆盖畸形 header 后承载未关闭、关闭失败保留、再次关闭成功。真实 FAL provider/Open 尚未接通；pm 接收侧已经从 HandleSet 提取 Capability、验证为 Invitation 并调用安全 Producer::attach，init 创建侧仍待迁入安全工厂。不能将本节源码状态解释为新的交付证据。
+typed 构造与错误 owner 是唯一公开入口：原始 ABI 工厂与 unsafe attach 已删除，随基线 `d22b9d7` 入库的无消费者观察草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`）也已删除——其中 register/peer_attached 在运行期 fail 关闭 Endpoint 后绕过终态检查访问映射的缺陷随之消失；事件驱动的登记/观察/取消接入面由通用执行闭包与 Runtime 首个真实消费者共同定形，本库不保留无真实消费者的 API。pm 接收侧经 HandleSet 提取 Capability、转换为 Invitation 并调用安全 `Producer::attach`；init 创建侧经 `Consumer::create` 取得 typed Invitation，以 typed Packet 转移，协议初始化失败时显式关闭本地映射与未发布邀请双 owner。srv_init 自检与 test_hammer 保留 rinlib 原始 tunnel ABI 的刻意内核契约验证，不属迁移对象。真实 FAL provider/Open 尚未接通，不能将本节状态解释为 FAL Open 完成。
 
 ## 验证
 
