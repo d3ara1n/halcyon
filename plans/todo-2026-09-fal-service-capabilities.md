@@ -16,13 +16,13 @@
 |---|---|---|
 | 公共对象、观察与退休前置 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
 | 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
-| 运输/执行前置 | 当前下一实施任务，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；运输 owner/Runnel → 通用执行/准入 → 完整 RPC/Outbox，每项同步迁移真实消费者 |
+| 运输/执行前置 | 当前下一实施任务，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；消息运输 → 流运输/Runnel → 通用执行/准入 → 完整 RPC/Outbox，每项同步迁移真实消费者 |
 | 公共操作边界收束 | 独立结构整理，安排在执行前置与共享包之后 | `todo-2026-09-14-public-operation-ownership.md`；保留 ProcessDrain 分工，收束等待/请求/工作执行，覆盖全部真实内核消费者 |
 | FAL 业务 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
 | 验收可靠性改进 | 首轮已收口，历史墙钟敏感现象只读归档 | `plans/archived/ref-2026-09-acceptance-timing-flake.md`；新现场命中归档触发条件时重新立案，不以重跑直到绿替代证据 |
 | workspace 包归属 | 已完成并归档 | `archived/todo-2026-09-13-workspace-package-ownership.md`；跨层 ABI 与 elf/tar/通用算法已统一组织进 shared workspace，算法语义未改 |
 
-代码定位：时间为 `shared/erhino_shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按运输 owner/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
+代码定位：时间为 `shared/erhino_shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按消息运输、流运输/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
 
 当前验证基线：七面 `just clippy`、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure 通过；GDB 只读捕获已安装 Close/active 的一次真实取消窗口，不保证每轮 exact-window。完整 stress 的历史墙钟敏感现场已完成首轮验收收口，证据见 `plans/archived/ref-2026-09-acceptance-timing-flake.md`；本快照不把历史偶发现象当作当前 correctness 缺陷。
 
@@ -36,14 +36,14 @@
 
 ```text
 已交付公共时间与对象基线
-  → 运输 owner/Runnel → 通用执行/准入 → 完整 RPC/Outbox
+  → 消息运输 → 流运输/Runnel → 通用执行/准入 → 完整 RPC/Outbox
   → 共用算法契约与包归属（既有独立计划）
   → 内核等待/请求/退休结构收束（保留现有回收职责）
   → 后端准备/取消/退休 → 授权域/provider/v2客户端
   → Open/Watch/注册/Move/Copy → 总体组合交付
 ```
 
-当前直接从执行前置的运输闭包开工；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 不作为整体开工阻塞，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
+当前直接从执行前置的消息运输闭包开工；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 不作为整体开工阻塞，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
 
 本文下面保留的基线与代码连接点是审视材料，不是已完成证据。公共前置章节的旧 Seal/Drain 等候选已经被普通 Close/内核退休替代，旧 ABI 和用户维护编排已删除，不继续照旧施工或恢复兼容。
 
