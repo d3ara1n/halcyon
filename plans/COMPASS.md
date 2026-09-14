@@ -22,6 +22,8 @@
 
 #14 公共时间已完成并归档：CSR/内存采样排序、可读/可编程期限尾部、高水位/失败隔离、Wait/Sleep/Send 到期与 ownership、运行期协作停止及真实消费者验证均已通过；提交 `c6e0a84`，实现见 `notes/impls/time.md`。下一任务是 #15，researcher/explorer 继续使用有额度 provider 的 DeepSeek Flash。
 
+#15 工作量大于 #14，按 typed transport → RPC context → Outbox/Runtime → 真实消费者迁移 → 组合收口五个机制闭包逐项提交；具体责任链、失败/取消/退款完成门与提交纪律见执行前置计划。
+
 当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：#13/#14 完成；#15 与 FAL 仍是草稿；#17 与包归属继续独立延期。本次保存混合集成基线，后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
 
 plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报告。专题 todo 拥有当前实施，Review 保留目标提交证据与复核清单，二者不重复安排同一问题。已完成调查/复核进入 `archived/`，`ref-*` 是只读参考资料。当前全部活跃入口：

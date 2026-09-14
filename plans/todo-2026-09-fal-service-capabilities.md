@@ -16,12 +16,12 @@
 |---|---|---|
 | 公共对象 #13 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
 | 公共时间 #14 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
-| 运输/执行 #15 | #13/#14 已完成，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；Packet/Delivery→任务/RPC/Outbox→terminal→retire→refund 接完整，迁移 init/pm/fs/hammer 并删除旧推进 |
+| 运输/执行 #15 | #13/#14 已完成，工作量大，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；按 typed transport、RPC context、Outbox/Runtime、真实消费者迁移、组合收口五个机制闭包推进，完成 Packet/Delivery→任务/RPC/Outbox→terminal→retire→refund 后才恢复 FAL |
 | FAL 业务 #7 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
 | 验收可靠性 #17 | 用户独立延期 | `todo-2026-09-13-acceptance-reliability.md` 和 KNOWN_ISSUES；概率覆盖误失败与原 Tunnel 静默截断分别处理，未绿 stress 不记通过 |
 | workspace 包归属 | 独立延期 | `todo-2026-09-13-workspace-package-ownership.md`；本主线不搬目录/包或修改 path 依赖以整理归属 |
 
-代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。先核对现状、依赖、所有权/锁序与失败面再恢复施工，不按旧盘点直接续写。
+代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。#15 先完成 typed transport，再接 RPC context、Outbox/Runtime 和真实消费者；每阶段保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
 
 当前验证基线：七面 `just clippy`、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure 通过；GDB 只读捕获已安装 Close/active 的一次真实取消窗口，不保证每轮 exact-window。完整 stress 的旧截断/概率失败仍未解决；本快照没有总体 `just acceptance` 通过声明。
 

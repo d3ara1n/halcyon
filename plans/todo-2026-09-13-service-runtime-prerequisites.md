@@ -8,6 +8,20 @@
 
 本任务把 Packet/Delivery → Request/Task/Outbox → terminal → retire → refund 接成完整责任链。运输初始化、运行时状态、RPC 阶段和服务公平调度互相约束，必须共同迁移；不先写 FAL handler，再遇到失败时补基础 adapter。
 
+## 规模、阶段与提交策略
+
+#15 是当前主线中继 #14 之后最大的机制任务。现有代码已经有若干类型草稿，但不能按源码行数或“已有框架”计入完成度；真正工作在于把所有权、阶段错误、取消、背压、期限、退休和退款接成闭合责任链，并迁移真实调用者。
+
+预计按以下五个机制闭包推进，每个闭包可独立构建、验证和提交，但前一闭包未完成时不宣称 #15 完成：
+
+1. **Typed transport**：审计 `Capability/HandleSet/Packet/ReceiveBuffer/Delivery`，完成 Runnel Producer/Consumer 的构造、Attach、部分进度、EOF/Broken、初始化失败和 Endpoint cleanup；迁移 pm/init 的实际工厂，保留 raw ABI 仅作明确 unsafe 验收边界。
+2. **RPC context**：统一同步/异步 RequestContext、预付回复、txid/Deadline、`Unsent`/`Sent`/`OutcomeUnknown`、关闭和取消；验证协议拒绝、迟到回复、附带能力退休与请求 owner 原样返还。
+3. **Outbox 与服务运行体**：在业务提交前准备回复存储、Delivery 和发送额度；接通 `libsrv` Budget/Account/Charge、WorkQueue、Runtime、Wake，验证公平轮转、`max_work=1`、任务期限、背压和显式退休。
+4. **真实消费者迁移**：迁移 `srv_init`、`srv_pm`、`srv_fs`、`test_hammer` 及现有 Runnel/RPC 调用点；删除旧阻塞泵、重复 close、相对期限重试和没有真实 owner 的 adapter。
+5. **组合收口**：host/static/clippy、core/release/platform、初始化失败、取消、调用者退出、Sent 后超时、迟到回复、Endpoint 关闭、资源退款和旧路径删除一起验证；完成后才解除 FAL 业务前置。
+
+提交纪律：不按文件机械拆分强耦合 ABI/owner/通知/退休迁移；每个提交说明所闭合的机制、真实调用者、尚未覆盖的失败面和验证证据。跨阶段暂存的类型只能是最终结构的一部分，不能用兼容层或测试专用路径替代未完成责任。最终 #15 交付提交前，再登记固定 hash 的提交后 Review；不自动合并或 push。
+
 ## 从最终调用反推的前置
 
 - 安全发送失败返还完整未消费 Packet；成功消费 moves/send-once，借用的 owner 不被 raw helper 静默消费。
