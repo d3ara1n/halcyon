@@ -1,6 +1,6 @@
 # 公共时间实现
 
-时间前置 #14 已完成，分支为 `task/fal-service-capabilities`；提交仍待本轮用户授权。运行期协作停止作为其必要前置已完成，固定记录见 [runtime-stop 前置](../../plans/archived/todo-2026-09-13-runtime-stop-prerequisites.md)。本篇只记录实际时间机制，不宣称执行/FAL 交付；后续服务期限由 [执行前置](../../plans/todo-2026-09-13-service-runtime-prerequisites.md) 消费。
+时间前置 #14 已完成，分支为 `task/fal-service-capabilities`；实现提交为 `c6e0a84`。运行期协作停止作为其必要前置已完成，固定记录见 [runtime-stop 前置](../../plans/archived/todo-2026-09-13-runtime-stop-prerequisites.md)。本篇只记录实际时间机制，不宣称执行/FAL 交付；后续服务期限由 [执行前置](../../plans/todo-2026-09-13-service-runtime-prerequisites.md) 消费。
 
 `shared/src/time.rs` 定义显式 Infinite/At Deadline、ClockSnapshot 和 ClockGeometry。平台 frequency/origin 是换算唯一真值，elapsed 向下取整、有限期限向上取整，中间用 u128。最大期限从最后可读且可编程的 tick 推导：可读 offset 上界为 `((2^64 × frequency) - 1) / 1e9`，再与 `u64::MAX-1-origin` 取较小值；由该 tick 的 elapsed 反推上限，避免低频下准入期限的触发 tick 超过纳秒表示范围。`resolution_ns` 是名义 timebase tick 的 ceil 纳秒单位，不承诺可观察更新频率或唤醒精度。
 
