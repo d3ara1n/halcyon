@@ -12,7 +12,7 @@
 - 外部 GDB 捕获生产 Kill(0x131) 前 active=2、三成员、mandatory=1；随后真实 Waiting 取消 epoch1、reusable=false/KernelResult0，识别已安装 Close 回复。日志 `artifacts/check/public-ipc-exit-gdb.log`、完整 core `public-ipc-exit-probe.log`、保留 ELF `public-ipc-exit-kernel.elf` 与 SHA256。本次快照证明该窗口，不宣称每轮两回复都 Waiting。
 - 旧阶段三项 continuation findings、Mailbox 三项 P2、最后六项公共测试/Capability 契约 P2 已逐项定点复核关闭；未留下兼容机制或生产 correctness finding。
 - 最终 `artifacts/check/public-ipc-final-{core,sifive,release,nofd,boot-failure,clippy,host,shared-host}.log`：core/128MiB/release/nofd 通过，panic/alloc/fatal 三种 Failed 全 hart 停驻通过，七面 lint 与 140+23 host 测试通过。新增组合进入正常 required anchors。
-- 先前完整 stress 的 300s Tunnel 截断与概率 15/16 未宣称修复或通过；用户已独立延期到 [验收可靠性任务](../todo-2026-09-13-acceptance-reliability.md)。不执行总体 acceptance/stress 收尾、不豁免新 correctness，不把公共对象前置完成视为时间/执行/FAL 交付。
+- 先前完整 stress 的 300s Tunnel 截断与概率 15/16 在本任务收口时仍未解决；后续已补确定性终因覆盖与阶段观测，历史墙钟敏感现场见 [`验收时间敏感归档`](ref-2026-09-acceptance-timing-flake.md)。该后续结论不改变本任务当时的验证边界。
 - 下一自然序：[公共时间](../archived/todo-2026-09-monotonic-time-rpc-deadline.md) → [运输/RPC/服务执行](../todo-2026-09-13-service-runtime-prerequisites.md) → [FAL](../todo-2026-09-fal-service-capabilities.md)。包归属整理仍独立延期。
 
 ## 施工期材料
@@ -91,7 +91,7 @@ Open owner / ProcessDrain entry
 - Mailbox 已补 `mailbox/selftest.rs` 并与 WaitSet continuation 共用 `task/selftest.rs` 的真实 Bound space/域准入/用户复制/终止退休夹具；接收尾段 `finish_receive` 由生产与自检共用，不新增测试 syscall。独立 sender/duplicate/迁移 once 的身份、badge、role/裁剪 rights、成功消费与禁止二次 send 运行通过；queued/received Delivery 保 sender，最后引用关闭时 Lifetime 弱授权根消散且已安装 CLOSED 订阅实际被唤醒。
 - 真实接收预留后 READABLE 隐藏 queued followers，Peek/Discard/第二预留 Busy；范围初检后生产 Unmap 撤销 payload 页、header 已写而复制失败，生产尾段退款目标表槽/队头、锁外唤醒已装 WSet。重试完整 header/payload/业务 KOID/Delivery KOID 不变，新能力未关闭时全部旧编号为 StaleHandle。满箱 receiving 占位不腾容量，failed Send 同时保留 once 和 move 源；ownerclose 后在途仍保 life，再真实 Unmap+生产尾段 closed rollback 拒收并关闭最后 transit，队列不复活。整组 Pool/准入/control/deferred 退款，不把末尾库存代替交付断言。
 - 定点 reviewer 未见生产 bug，三项 P2 测试缺口（旧号跨复用、once 实际消费、Lifetime 通知）已修补并经第二轮定点复核关闭。最新 debug virt core/reset、128MiB sifive_u core/预期 reset NotSupported 收割、virt-release core/reset 与七面 clippy 通过，见 `artifacts/check/public-ipc-mailbox-{virt,sifive,release,clippy}.log`；正常路线新增 Mailbox ownership required anchor。本组不执行用户指令、不证明真实多 hart 或远端 shootdown，下一自然序 Native 完成坏输出/新轮 parked 旧取消、真实多 hart Waiting/active Caller 退出与接收竞争、通知历史/Deferred 小回归及更宽压力门。公共任务保持未完成。
-- 验收概率覆盖误失败与 Tunnel 静默截断已按用户安排统一转入 [验收可靠性 todo](../todo-2026-09-13-acceptance-reliability.md)，KNOWN_ISSUES/COMPASS 同步。本任务继续公共正确性施工，不反复重跑直到绿、不降低验收标准或把暂缓等同已修复。
+- 验收概率覆盖误失败与 Tunnel 静默截断已在后续首轮验收收口中处理；历史墙钟敏感现场与重开条件见 [`验收时间敏感归档`](ref-2026-09-acceptance-timing-flake.md)，本任务不再保留开放 todo 引用。
 - notification 的 publish/Pending 增、实槽 rearm/旧 Pending 减已统一 DEBTS 临界区，来源 complete_notification/Held/Release/Reschedule 与最后引用仍锁外。current owner/current hart 协作执行使旧分段计数不直接构成已证竞态；这是控制协议一致性收口，非 Tunnel 截断归因。定点 reviewer 确认槽、根、来源状态/跨 owner重排和锁阶闭合，未见确定问题。
 - `control_pressure` 建 64 来源订阅 backlog、实际 offer 后预排旧 finish 和空 actor Close；进入安全点前三类均 pending，同一安全点通知有 outcome/仍有未处理订阅、旧 finish Done、actor finished、总步骤不超过正式 MAX_STEPS_PER_SAFE_POINT（16）。排水后全 backlog Done/Signaled/READABLE，再关闭并与 baseline 比较全部槽及准入退款，不能仅以退款当成功交付。最终 virt core/reset 日志 `artifacts/check/public-ipc-control-pressure-virt.log` 通过；七面 clippy 日志 `public-ipc-control-pressure-clippy.log` 通过。
 - 本压力组证明隔离启动中进入安全点前已 pending 三类的保底进度，不证明真实多 hart 并发、执行中才入队类的同轮保证或非空 actor 多步吞吐；控制面 16 与 deferred_work 的独立 16 不合称单一总预算。消息顺序竞争/回滚与 Sender/Lifetime/Delivery 已见上述最新运行证据，真实多 hart 与其它组合门保持未完成。
@@ -112,7 +112,7 @@ Open owner / ProcessDrain entry
 - 定点 review 新增 second-round 完成过强 P1、预算仅看输出/身份 helper 未核 epoch 两个 P2，均已修订并经第二轮定点复核关闭；隔离生产 finish 的 6 步断言能捕获累计值 reset 后多执行 2 步。失败现场 `failed-acceptance-20260913-194924-13440.log`（fixture 未激活 Running 页表）、`195206-14603.log`（错误游标预期）、`195738-15925.log`（错误第二轮 Complete 预期）保留。
 - 最新组合在 debug stress 自检、128MiB sifive_u core 和 virt-release core 通过，见 `artifacts/check/public-ipc-waiting-continuation-{stress,sifive,release}.log`，新 Waiting continuation 锚点纳入所有正常 QEMU 路线。但本轮整体 stress 未通过：`failed-acceptance-20260913-201112-17670.log` 在 300s、THROTTLE=100 截在 close round7；诊断 360s 配方总 223.446s 走完 Tunnel 24 项后因已知 15/16 主动失败收割（`201738-25206.log`），普通复跑总 166.765s 同样 15/16（`202204-31065.log`）。不拿后续通过局部矩阵替原超时归因。
 - round7 无输出窗口已用外部 GDB 三次采样：`public-ipc-stall-gdb-{1,2,3}.log`/`public-ipc-stall-timing.json`；分别为等待投递/dispatch、MemoryMap preflight、Tunnel unmap 发布并伴另一 hart 等 lifecycle 锁，诊断轮后来走完矩阵。未见确定等待环，但无内部 round 前进计数，不能证明原 300s 轮同因。路径假设为页表每层 512 槽准备/发布成本及 yield 改 execution sequence 导致 ObjectBusy 重试，后续需计数证实，不更改 execution gate 或直接放宽时限；原 wrapper 明确 THROTTLE=100，不采纳默认 50% 推测。
-- 下一自然序：三类同时压力/总预算公平与消息 Sender/Lifetime/Delivery/Receive 回滚组合；真实多 hart Waiting/active 退出、Native 完成输出失效和新轮 parked dependency 旧取消继续补证。用户明确将概率验收判定与 Tunnel 截断/静默机制暂缓，唯一实施点为 [验收可靠性计划](../todo-2026-09-13-acceptance-reliability.md)，本任务继续施工；不把未绿组合记为通过，剩余公共正确性门仍须闭合。通知先行/多 interest 反向位序/终态 Deferred 小回归同专题补齐。FAL 业务仍暂停。
+- 下一自然序：三类同时压力/总预算公平与消息 Sender/Lifetime/Delivery/Receive 回滚组合；真实多 hart Waiting/active 退出、Native 完成输出失效和新轮 parked dependency 旧取消继续补证。用户明确的概率验收判定与 Tunnel 截断/静默问题已完成首轮验收收口，历史现场仅作只读参考；本任务继续施工，不把历史偶发现象当作公共正确性缺陷，新的触发证据应另立专题。通知先行/多 interest 反向位序/终态 Deferred 小回归同专题补齐。FAL 业务仍暂停。
 
 上一轮 actor 迁移证据：
 
@@ -163,7 +163,7 @@ Open owner / ProcessDrain entry
 |---|---|---|
 | 接收电平/原期限重试已收紧，顺序竞争/真实撤页复制失败与回滚唤醒已验证，实际并发组合不足 | mailbox.rs 完整事务与 rinlib message.rs 原期限；真实同进程线程接收/发送干扰 | 运行证明竞争无队列/能力损失及准入泄漏，原期限不被 Busy/NotAvailable 重试延长 |
 | actor/ticket、operations 与 ABI 已共同接通，组合覆盖不足 | 最新施工记录三组确定性竞态/退出/容量证据 | 未覆盖实测前不标记对象退休完成；旧路径不恢复作兼容 |
-| stress 静默截断与概率覆盖误失败，后续验收完善 | [验收可靠性计划](../todo-2026-09-13-acceptance-reliability.md) 唯一安排调查与改进；本文件仅保留当前证据 | 暂缓不宣称已修复；未绿组合如实报告，不能豁免新发现的公共正确性缺陷 |
+| stress 静默截断与概率覆盖误失败，后续验收完善 | 后续收口与历史证据见 [`验收时间敏感归档`](ref-2026-09-acceptance-timing-flake.md) | 该表保留施工期真值；未来新现场按归档触发条件重新立案 |
 
 ## 完成门
 

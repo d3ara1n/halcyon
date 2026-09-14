@@ -79,7 +79,7 @@ Runnel 新增 `Producer/Consumer::register` 与 `peer_attached` 直接访问 Gue
 
 ## 组合完成门与提交
 
-组合收口验证已经完成的三条闭包，不在最后阶段补主要功能或首次迁移消费者。执行适当 host/目标检查、just clippy、core/release/platform 及跨机制失败/取消/退款组合，证据能定位。完整 stress 的概率误判和原 Tunnel 静默截断仍由 [验收可靠性计划](todo-2026-09-13-acceptance-reliability.md) 独立拥有，未通过不得记为通过。
+组合收口验证已经完成的三条闭包，不在最后阶段补主要功能或首次迁移消费者。执行适当 host/目标检查、just clippy、core/release/platform 及跨机制失败/取消/退款组合，证据能定位。历史 stress 概率误判和 Tunnel 墙钟敏感截断见 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)；新现场命中其触发条件时重新立案，不以重跑直到绿替代证据。
 
 提交不按文件机械拆分 ABI/owner/观察/退休迁移；每个闭包登记真实调用者、删除的旧路径和验证证据。不能引入没有删除条件的 adapter 或测试专用运行体。已完成提交之后登记对应固定 hash 的未来 Review；提交、合并和 push 仍分别遵守授权边界。
 

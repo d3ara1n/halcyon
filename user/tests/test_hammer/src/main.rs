@@ -11,12 +11,12 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use libprocess::race::{
-    self, ACTION_CLOSE, ACTION_CREATE, ACTION_CREATE_ABANDON, ACTION_DRAIN, ACTION_ENUMERATE,
-    ACTION_EXIT, ACTION_KILL, ACTION_SEAL, ACTION_START, Cmd, HAMMER_CMD, HAMMER_CONTROL_RIGHTS,
-    HAMMER_GUN, HAMMER_REPORT, MODE_HAMMER, MODE_TARGET, MSG_CMD, MSG_REPORT, Report, TARGET_FAULT,
-    TARGET_GUARD_FAULT, TARGET_GUN, TARGET_INVITATION, TARGET_LAST_THREAD_EXIT_RACE,
-    TARGET_MEMORY_CHURN, TARGET_PARK, TARGET_SUICIDE, TARGET_THREAD_SPAWN_RACE,
-    TARGET_THREAD_SUITE, TARGET_TUNNEL_EXIT,
+    self, Cmd, Report, ACTION_CLOSE, ACTION_CREATE, ACTION_CREATE_ABANDON, ACTION_DRAIN,
+    ACTION_ENUMERATE, ACTION_EXIT, ACTION_KILL, ACTION_SEAL, ACTION_START, HAMMER_CMD,
+    HAMMER_CONTROL_RIGHTS, HAMMER_GUN, HAMMER_REPORT, MODE_HAMMER, MODE_TARGET, MSG_CMD,
+    MSG_REPORT, TARGET_FAULT, TARGET_GUARD_FAULT, TARGET_GUN, TARGET_INVITATION,
+    TARGET_LAST_THREAD_EXIT_RACE, TARGET_MEMORY_CHURN, TARGET_PARK, TARGET_SUICIDE,
+    TARGET_THREAD_SPAWN_RACE, TARGET_THREAD_SUITE, TARGET_TUNNEL_EXIT,
 };
 use rinlib::{
     env,
@@ -35,8 +35,8 @@ use rinlib::{
         mem::MemoryProtection,
         object::{Handle, ObjectSignals},
         proc::{
-            ExecutionProfile, JobMemberKind, PROCESS_MAX_THREADS, PROCESS_PAGE_SIZE,
-            ThreadSpawnResult, ThreadStartContext,
+            ExecutionProfile, JobMemberKind, ThreadSpawnResult, ThreadStartContext,
+            PROCESS_MAX_THREADS, PROCESS_PAGE_SIZE,
         },
         wait::WaitItem,
     },
@@ -671,11 +671,25 @@ fn stale_translation_reuse() {
 }
 
 fn close_churn_endpoint(mut endpoint: tunnel::Endpoint) -> Result<(), SystemCallError> {
+    let mut attempts = 0usize;
     loop {
+        attempts += 1;
         match endpoint.close() {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                debug!(
+                    "acceptance progress: phase=tunnel-close step=complete attempts={}",
+                    attempts
+                );
+                return Ok(());
+            }
             Err((returned, SystemCallError::ObjectBusy)) => {
                 endpoint = returned;
+                if attempts.is_multiple_of(64) {
+                    debug!(
+                        "acceptance progress: phase=tunnel-close step=retry attempts={}",
+                        attempts
+                    );
+                }
                 // SAFETY: 完整失败事务返回 owner，随后退避。
                 unsafe { sys_sleep(1).expect("Tunnel close retry sleep failed") };
             }
@@ -686,6 +700,10 @@ fn close_churn_endpoint(mut endpoint: tunnel::Endpoint) -> Result<(), SystemCall
 
 fn concurrent_tunnel_close() {
     for round in 0..8usize {
+        debug!(
+            "acceptance progress: phase=concurrent-tunnel-close round={}/8 step=start",
+            round + 1
+        );
         let (endpoint, invitation) = tunnel::create(
             3 * PROCESS_PAGE_SIZE,
             Placement::FixedEmpty {
@@ -715,7 +733,16 @@ fn concurrent_tunnel_close() {
                 close_churn_endpoint(endpoint)
             })
             .expect("Tunnel close worker spawn failed");
+        let mut ready_waits = 0usize;
         while !ready.load(Ordering::Acquire) {
+            ready_waits += 1;
+            if ready_waits.is_multiple_of(256) {
+                debug!(
+                    "acceptance progress: phase=concurrent-tunnel-close round={}/8 step=wait-worker waits={}",
+                    round + 1,
+                    ready_waits
+                );
+            }
             thread::yield_now().expect("Tunnel close coordinator yield failed");
         }
         release.store(true, Ordering::Release);
@@ -723,8 +750,8 @@ fn concurrent_tunnel_close() {
         closer.join().expect("concurrent Endpoint close failed");
         unsafe { close(invitation) }.expect("Tunnel invitation close failed");
         debug!(
-            "hammer target: concurrent Tunnel close round {} passed",
-            round
+            "acceptance progress: phase=concurrent-tunnel-close round={}/8 step=complete",
+            round + 1
         );
     }
 }
@@ -734,6 +761,11 @@ fn tunnel_close_attach() {
     use core::sync::atomic::AtomicUsize;
     const PEER_VA: usize = THREAD_TUNNEL_VA + 0x20_0000;
     for round in 0..24 {
+        debug!(
+            "acceptance progress: phase=tunnel-close-attach round={}/24 step=start policy={}",
+            round + 1,
+            round / 8
+        );
         let (creator, invitation) = tunnel::create(
             3 * PROCESS_PAGE_SIZE,
             Placement::FixedEmpty {
@@ -749,10 +781,21 @@ fn tunnel_close_attach() {
         let worker = thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(move || {
+                let mut gate_waits = 0usize;
                 while child_phase.load(Ordering::Acquire) == 0 {
+                    gate_waits += 1;
+                    if gate_waits.is_multiple_of(256) {
+                        debug!(
+                            "acceptance progress: phase=tunnel-close-attach round={}/24 step=wait-release waits={}",
+                            round + 1,
+                            gate_waits
+                        );
+                    }
                     thread::yield_now().expect("Attach gate yield failed");
                 }
+                let mut attempts = 0usize;
                 let result = loop {
+                    attempts += 1;
                     match unsafe {
                         tunnel::attach(
                             invitation,
@@ -762,6 +805,13 @@ fn tunnel_close_attach() {
                         )
                     } {
                         Err(SystemCallError::ObjectBusy) => {
+                            if attempts.is_multiple_of(64) {
+                                debug!(
+                                    "acceptance progress: phase=tunnel-close-attach round={}/24 step=attach-retry attempts={}",
+                                    round + 1,
+                                    attempts
+                                );
+                            }
                             thread::yield_now().expect("Attach retry yield failed")
                         }
                         other => break other,
@@ -776,7 +826,16 @@ fn tunnel_close_attach() {
                             "Attach did not consume Invitation"
                         );
                         child_phase.store(2, Ordering::Release);
+                        let mut close_waits = 0usize;
                         while child_phase.load(Ordering::Acquire) != 3 {
+                            close_waits += 1;
+                            if close_waits.is_multiple_of(256) {
+                                debug!(
+                                    "acceptance progress: phase=tunnel-close-attach round={}/24 step=wait-peer-close waits={}",
+                                    round + 1,
+                                    close_waits
+                                );
+                            }
                             thread::yield_now().expect("peer close gate yield failed");
                         }
                         // SAFETY: 保存值仅用于成功关闭后的重复 close 验证。
@@ -813,12 +872,29 @@ fn tunnel_close_attach() {
             unsafe { close(creator_handle) },
             Err(SystemCallError::StaleHandle)
         );
+        debug!(
+            "acceptance progress: phase=tunnel-close-attach round={}/24 step=creator-closed",
+            round + 1
+        );
         // worker 的状态 2 不能在主线程状态 3 后覆盖，先确认 Attach 已结束。
+        let mut attach_waits = 0usize;
         while phase.load(Ordering::Acquire) != 2 {
+            attach_waits += 1;
+            if attach_waits.is_multiple_of(256) {
+                debug!(
+                    "acceptance progress: phase=tunnel-close-attach round={}/24 step=wait-attach waits={}",
+                    round + 1,
+                    attach_waits
+                );
+            }
             thread::yield_now().expect("Attach completion gate yield failed");
         }
         phase.store(3, Ordering::Release);
         worker.join();
+        debug!(
+            "acceptance progress: phase=tunnel-close-attach round={}/24 step=worker-joined",
+            round + 1
+        );
         // 每一轮都用普通映射复用两端 VA，直接确认两笔 lease/PTE 已撤销。
         for address in [THREAD_TUNNEL_VA, PEER_VA] {
             let region = MappedRegion::map_anonymous(
@@ -833,6 +909,10 @@ fn tunnel_close_attach() {
             .expect("closed Tunnel left a mapping behind");
             unmap_churn_region(region);
         }
+        debug!(
+            "acceptance progress: phase=tunnel-close-attach round={}/24 step=complete",
+            round + 1
+        );
     }
     debug!("hammer target: Tunnel close/Attach failure matrix passed: 24 rounds");
 }

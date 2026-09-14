@@ -66,6 +66,6 @@ notification/finish/retirement 共用控制安全点 16 步，对进入时已有
 - 外部只读 GDB `artifacts/check/public-ipc-exit-gdb.log`：生产 Kill(0x131) 前 active 非零、三成员、mandatory=1；随后进入已安装 Waiting 取消，epoch=1、reusable=false/KernelResult0（Close 回复）。另 hart 用户 PC 与 actor 同时存在；只证明本次窗口，不把所有用户运行都标为 exact-window。ELF/SHA256 保留于同目录。
 - 最终日志 `artifacts/check/public-ipc-final-{core,sifive,release,nofd,boot-failure,clippy,host,shared-host}.log`：正常 core/平台/release/nofd、三种 Failed 全 hart 停驻、七面 lint、140+23 host 测试通过。普通路线 required anchors 包含全部新增公共自检与用户组合。
 
-完整 stress 的先前 300s Tunnel 截断与后续概率 15/16 未宣称修复或通过。用户延期的观测/判定工作唯一在 [验收可靠性任务](../../plans/todo-2026-09-13-acceptance-reliability.md)，不豁免新发现的正确性问题。本前置纳入 `task/fal-service-capabilities` 的混合集成基线，提交定位见 FAL 总计划交接节；不执行总体 acceptance/stress 收尾，不完成时间/执行/FAL。
+完整 stress 的先前 300s Tunnel 墙钟敏感截断与概率 15/16 判定缺口已完成首轮验收收口：确定性终因覆盖、运行身份和阶段观测已接入；历史现场与未来重开条件见 [`验收时间敏感归档`](../../plans/archived/ref-2026-09-acceptance-timing-flake.md)。本前置不把历史偶发现象当作当前 correctness 缺陷；若未来复现归档触发条件，必须重新立案并保留完整身份与进度证据。本前置纳入 `task/fal-service-capabilities` 的混合集成基线，提交定位见 FAL 总计划交接节；不完成时间/执行/FAL。
 
 Tunnel/Endpoint/backing 的机制见 [tunnel.md](tunnel.md) 与 [mm.md](mm.md)，Runnel 数据布局见 [runnel.md](runnel.md)，ProcessDrain 业务游标与 Job 生命周期见 [task.md](task.md)。

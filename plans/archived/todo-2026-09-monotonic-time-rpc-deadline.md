@@ -7,7 +7,7 @@
 - 运行期协作停止前置已完成：Ready 后停止请求使用已发布 admitted raw ID 广播现代 IPI，所有 4 个 virt hart 实际停在 `hart::park`，PARKED mask 为 `15`；自 IPI 的 SSIP 会先清理，停止不遍历 timer 或伪造 Timeout。
 - 当前提交基线为 `d22b9d7` 加本轮后续提交；分支 `task/fal-service-capabilities`。实现真值见 `notes/impls/time.md`，停止结构见归档的 runtime-stop 前置。
 - 日志：`artifacts/check/time-final-{core,release,sifive,nofd,clippy,host}.log`、`time-runtime-stop-{probe,gdb}.log`。并行构建曾触发共享 boot-package 临时文件竞争，串行 release 重跑通过；失败日志保留，不作为 guest 失败。
-- 不包含跨硬件 epoch 连续时间（第 8 节唯一未来范围）、RPC/Outbox/服务政策或 FAL；验收可靠性任务的完整 stress 截断/概率失败继续独立延期。
+- 不包含跨硬件 epoch 连续时间（第 8 节唯一未来范围）、RPC/Outbox/服务政策或 FAL；验收可靠性历史现场已归档于 [`验收时间敏感归档`](../ref-2026-09-acceptance-timing-flake.md)。
 
 > 状态：公共时间前置已完成并归档。方向参考 `notes/ideas/{time,wait,rpc,call}.md`，本文件安排的公共时钟、Deadline 换算、绝对 Wait/Sleep/Send ABI 与既有消费者已接通；[公共对象前置](todo-2026-09-13-public-ipc-wait-prerequisites.md) 与运行期协作停止前置均已完成。后续 RPC/服务政策由 [执行前置](../todo-2026-09-13-service-runtime-prerequisites.md) 和 [FAL 总计划](../todo-2026-09-fal-service-capabilities.md) 消费。
 

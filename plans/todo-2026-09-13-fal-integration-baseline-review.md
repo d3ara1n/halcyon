@@ -25,6 +25,6 @@
 
 当前本机基线：七面 clippy、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、三类 boot-failure 通过。定位见 `notes/impls/ipc.md` 与公共前置档案；artifacts 日志和 GDB ELF/SHA256 被 Git 忽略，异机重跑才能形成新的运行证据，不能声称 clone 自带验证产物。
 
-完整 stress 的旧静默截断与概率覆盖误失败未宣称通过或修复，唯一后续安排仍在 [验收可靠性计划](todo-2026-09-13-acceptance-reliability.md)。本 Review 不做重跑直到绿，不用延期豁免新 correctness finding。
+完整 stress 的旧静默截断与概率覆盖误失败已在后续验收收口中处理，历史证据与重开条件见 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)。本 Review 不做重跑直到绿，也不以历史偶发现象豁免新 correctness finding。
 
 报告按严重度给出固定代码引用、真实机制与可证性边界。公共对象前置的新正确性问题须立独立修复闭包并同步实现记录/导航；属于公共时间前置、运输/RPC/服务执行前置或 FAL 的剩余责任回写其既有唯一计划。所有 findings 有固定提交的关闭证据后归档本文件；本 Review 不替代最终装配/旧路径删除/整体交付门。

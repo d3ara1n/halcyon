@@ -9,13 +9,13 @@
 use core::sync::atomic::Ordering;
 
 use crate::{
-    JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
-    supervise_services,
+    building::build_spin_building, supervise_services, Supervised, JOB_FULL_RIGHTS,
+    SUPERVISOR_RIGHTS,
 };
 use libprocess::{
-    DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned, job_kill,
+    job_kill,
     race::{self, Cmd, Report},
-    spawn,
+    spawn, SpawnRequest, Spawned, DERIVED_CONTROL_RIGHTS,
 };
 use rinlib::ipc::message::{create, send_raw, wait_message};
 use rinlib::ipc::notification;
@@ -513,10 +513,77 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
+/// 在真实竞速前先用明确的顺序覆盖两种合法终因：一轮只放行末线程
+/// Exited，一轮在发枪前 Kill。该覆盖不依赖调度器随机选择胜者。
+fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
+    let exit_code = 0x4b0;
+    let (exit_target, exit_gun) =
+        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, exit_code) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!(
+                    "race last-thread coverage: exit-first target spawn failed: {:?}",
+                    error
+                );
+                return false;
+            }
+        };
+    // 目标主线程先退出，次线程在枪上等待；发枪后终因确定为 Exited。
+    unsafe { sys_sleep(30).expect("last-thread exit-first setup sleep failed") };
+    let exit_signal = notification::signal(exit_gun, 1).is_ok();
+    let exited = drain_expect_dead(
+        exit_target.control,
+        &[(ProcessExitReason::Exited as u32, Some(exit_code as i64))],
+    )
+    .is_some();
+    let _ = unsafe { close(exit_target.control) };
+    let _ = unsafe { close(exit_gun) };
+
+    let kill_code = 0x4c0;
+    let (kill_target, kill_gun) =
+        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, kill_code) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!(
+                    "race last-thread coverage: kill-first target spawn failed: {:?}",
+                    error
+                );
+                return false;
+            }
+        };
+    unsafe { sys_sleep(30).expect("last-thread kill-first setup sleep failed") };
+    let report = h.shoot(
+        0,
+        &race_cmd(race::ACTION_KILL, kill_code),
+        &[HandleMove {
+            handle: duplicate(kill_target.control, Rights::MANAGE | Rights::TRANSIT)
+                .unwrap_or(Handle::INVALID),
+            rights: Rights::MANAGE,
+        }],
+    );
+    let killed = matches!(report, Some((report, _)) if report.status == 0)
+        && drain_expect_dead(
+            kill_target.control,
+            &[(ProcessExitReason::Killed as u32, Some(kill_code as i64))],
+        )
+        .is_some();
+    let _ = unsafe { close(kill_target.control) };
+    let _ = unsafe { close(kill_gun) };
+
+    let ok = exit_signal && exited && killed;
+    debug!(
+        "race last-thread deterministic coverage {}: exited={} killed={}",
+        if ok { "passed" } else { "FAILED" },
+        exited,
+        killed
+    );
+    ok
+}
+
 /// 主线程先离场，只剩等待发令枪的次线程；其最后 ThreadExit 与 ProcessKill
-/// 竞争进程终因。两组确定性时序分别证明 Exited 与 Killed 首达都能完整收束。
+/// 竞争进程终因。随机轮次保留真实竞速，但不把胜负分布当作通过条件。
 fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
-    let mut ok = true;
+    let mut ok = cover_last_thread_exit_kill_outcomes(h, job, image);
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
         let exit_code = 0x490 + round as i64;
@@ -580,9 +647,10 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
         let _ = unsafe { close(target.control) };
         let _ = unsafe { close(gun) };
     }
-    ok &= dist[0] != 0 && dist[1] != 0;
+    // 竞态胜负由真实调度决定；单侧偏胜仍可能完全合法。两种终因的
+    // 确定性覆盖由本场景的顺序变体负责，随机轮次只报告实际分布。
     debug!(
-        "race last-thread-exit-vs-kill {} (exited {}/{} killed)",
+        "race last-thread-exit-vs-kill {} (observed exited {}/{} killed)",
         if ok { "passed" } else { "FAILED" },
         dist[0],
         dist[1]
@@ -1408,49 +1476,112 @@ pub(crate) fn race_matrix(
             return Err("race matrix hammer spawn failed");
         }
     };
+    macro_rules! scenario {
+        ($name:literal, $run:expr) => {{
+            debug!(
+                "acceptance progress: phase=race-matrix scenario={} step=start",
+                $name
+            );
+            let result = $run;
+            debug!(
+                "acceptance progress: phase=race-matrix scenario={} step=complete result={}",
+                $name,
+                if result { "passed" } else { "failed" }
+            );
+            result
+        }};
+    }
     let scenarios: [(&str, bool); 16] = [
-        ("kill-vs-kill", race_kill_kill(&h, acceptance, hammer_image)),
-        ("kill-vs-exit", race_kill_exit(&h, acceptance, hammer_image)),
+        (
+            "kill-vs-kill",
+            scenario!("kill-vs-kill", race_kill_kill(&h, acceptance, hammer_image)),
+        ),
+        (
+            "kill-vs-exit",
+            scenario!("kill-vs-exit", race_kill_exit(&h, acceptance, hammer_image)),
+        ),
         (
             "spawn-vs-kill",
-            race_thread_spawn_kill(&h, acceptance, hammer_image),
+            scenario!(
+                "spawn-vs-kill",
+                race_thread_spawn_kill(&h, acceptance, hammer_image)
+            ),
         ),
         (
             "last-thread-exit-vs-kill",
-            race_last_thread_exit_kill(&h, acceptance, hammer_image),
+            scenario!(
+                "last-thread-exit-vs-kill",
+                race_last_thread_exit_kill(&h, acceptance, hammer_image)
+            ),
         ),
         (
             "kill-vs-fault",
-            race_kill_fault(&h, acceptance, hammer_image),
+            scenario!(
+                "kill-vs-fault",
+                race_kill_fault(&h, acceptance, hammer_image)
+            ),
         ),
-        ("kill-vs-start", race_kill_start(&h, acceptance)),
-        ("kill-vs-park", race_kill_park(&h, acceptance, hammer_image)),
+        (
+            "kill-vs-start",
+            scenario!("kill-vs-start", race_kill_start(&h, acceptance)),
+        ),
+        (
+            "kill-vs-park",
+            scenario!("kill-vs-park", race_kill_park(&h, acceptance, hammer_image)),
+        ),
         (
             "memory-vs-kill",
-            race_memory_kill(&h, acceptance, hammer_image),
+            scenario!(
+                "memory-vs-kill",
+                race_memory_kill(&h, acceptance, hammer_image)
+            ),
         ),
         (
             "memory-guard-fault",
-            guard_fault_is_process_local(acceptance, hammer_image),
+            scenario!(
+                "memory-guard-fault",
+                guard_fault_is_process_local(acceptance, hammer_image)
+            ),
         ),
         (
             "thread-memory-suite",
-            thread_memory_suite(acceptance, hammer_image),
+            scenario!(
+                "thread-memory-suite",
+                thread_memory_suite(acceptance, hammer_image)
+            ),
         ),
         (
             "tunnel-exit-stress",
-            tunnel_exit_stress(acceptance, hammer_image),
+            scenario!(
+                "tunnel-exit-stress",
+                tunnel_exit_stress(acceptance, hammer_image)
+            ),
         ),
-        ("kill-vs-abandon", race_kill_abandon(&h, acceptance)),
-        ("create-vs-enumerate", race_create_enumerate(&h, acceptance)),
-        ("seal-vs-create", race_seal_create(&h, acceptance)),
+        (
+            "kill-vs-abandon",
+            scenario!("kill-vs-abandon", race_kill_abandon(&h, acceptance)),
+        ),
+        (
+            "create-vs-enumerate",
+            scenario!("create-vs-enumerate", race_create_enumerate(&h, acceptance)),
+        ),
+        (
+            "seal-vs-create",
+            scenario!("seal-vs-create", race_seal_create(&h, acceptance)),
+        ),
         (
             "drain-vs-drain",
-            race_drain_drain(&h, acceptance, target_image),
+            scenario!(
+                "drain-vs-drain",
+                race_drain_drain(&h, acceptance, target_image)
+            ),
         ),
         (
             "last-control",
-            race_last_control(&h, acceptance, target_image),
+            scenario!(
+                "last-control",
+                race_last_control(&h, acceptance, target_image)
+            ),
         ),
     ];
     h.shutdown();

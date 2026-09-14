@@ -50,7 +50,7 @@
 2. 明确公共执行协议与各类预付容量、停驻/唤醒、取消回复和必成责任；涉及硬件/ABI 时先从 `references/CONTRACTS.md` 取证，引用外部实现时从系统索引选择官方证据。
 3. 内核真实消费者共同迁移；正常 Close、ProcessDrain、内存 completion、unpublished 与 finalization 保持同一算法与正确的驱动层次。公开语义若确需改变，先论证并确认具体方案，再共同迁移 shared/rinlib/监督者。
 4. 删除具体请求侵入等待层、重复执行编排和不再成立的状态/trait 分支；不保留没有删除条件的 adapter。
-5. 验证错误顺序、旧 handle/epoch、调用线程取消、管理者接管、pending 对象退休与完整退款；完成身份不跨越 Thread DONE、结果记录和地址翻译同步屏障。执行相应 host、just check、just clippy、core/release/platform 与退出组合；stress 已知问题仍由验收可靠性计划拥有。
+5. 验证错误顺序、旧 handle/epoch、调用线程取消、管理者接管、pending 对象退休与完整退款；完成身份不跨越 Thread DONE、结果记录和地址翻译同步屏障。执行相应 host、just check、just clippy、core/release/platform 与退出组合；历史 stress 墙钟敏感现场见 `plans/archived/ref-2026-09-acceptance-timing-flake.md`，新失败按归档触发条件重新立案。
 
 完成需要全部真实消费者、失败/退出、旧机制删除和可定位验证；本次设计审视不是安全性证明。最终契约进 ideas，实现事实进 impls，完成后归档本计划；提交与合并另需明确授权。
 

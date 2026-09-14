@@ -42,10 +42,11 @@ QEMU_MEMORY := if MODEL == "virt" { "1024M" } else { "128M" }
 # 与 virt DTS 声明的 Zkr 能力一致；sifive_u 不声明该扩展。
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
 QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
-# CPU 节流百分比（tools/qemu-throttle.sh）：跑飞/panic 时 QEMU 满核空转的兜底。
-# 1-99 按比例节流；100 = 全速。默认 50；自定义经环境变量：
-# `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与
-# --set 均不穿透嵌套子进程，故不用它们传油门）。
+# CPU 节流百分比（tools/qemu-throttle.sh）：保留为跑飞/panic 或异常忙循环时
+# 的宿主资源保护；stress 也默认节流，不把它当作全速性能基准。
+# 1-99 按比例节流；100 = 全速。默认 50。常规验证保持默认节流，只有需要固定
+# 全速条件的专项诊断才显式使用 `THROTTLE=100 just virt-stress`。
+# 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线按近期实测耗时设置宽裕的 QEMU 运行超时；均可用同名环境变量单独覆盖。
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "30")
@@ -235,9 +236,9 @@ clean-qemu *args:
 [private]
 run_qemu_acceptance_platform timeout +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
-    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
 
 [private]
 run_qemu_acceptance_bounded timeout +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
-    @tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
