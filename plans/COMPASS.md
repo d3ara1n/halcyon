@@ -40,7 +40,8 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
 | [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停：先运输/执行/RPC，随后共享包与内核执行结构收束，再恢复后端、授权与业务 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
-| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 当前下一任务，四闭包：消息运输 → 流运输/Runnel → 通用执行/准入 → RPC/Outbox；同步真实消费者，包含 Runnel 终态修复与事件驱动监督 |
+| [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
+| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 当前下一任务，四闭包：消息运输（已完成待 Review）→ 流运输/Runnel（下一实施）→ 通用执行/准入 → RPC/Outbox；同步真实消费者，包含 Runnel 终态修复与事件驱动监督 |
 | [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
 | [`todo-2026-09-14-kernel-memory-budget.md`](todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |

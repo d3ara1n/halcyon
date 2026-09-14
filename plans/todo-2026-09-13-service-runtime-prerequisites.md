@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：当前下一任务，先完成接手、规模审计、任务拆分/合并和设计闭包，再从消息运输闭包开始实施。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
+> 状态：当前下一任务。消息运输闭包已实施并提交（`3060dd8`，未来复核见 [消息运输 Review](todo-2026-09-14-message-transport-review.md)）；下一实施为流运输与 Runnel 闭包，其规模审计与设计闭包未完成前不得编码。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
 
 ## 开工流程与本任务审计门
 
