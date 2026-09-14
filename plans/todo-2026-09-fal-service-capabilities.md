@@ -1,6 +1,6 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：公共对象/观察/退休与公共时间已完成并归档；执行基座尚未完成，FAL 业务继续暂停，整体未交付。先完成执行前置再恢复业务；已有代码和先前“冻结”的记录不是免审视依据。用户允许为通用机制清理 ABI，内核与 rinlib 同步迁移。
+> 状态：公共对象/观察/退休与公共时间已完成原交付并归档，下一任务是 [运输/服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md)。ProcessDrain 的管理者职责与 REAPABLE 触发已澄清，保留现有契约；不因先前对持续轮询的误解增加自动回收或预算激励前置。共享包与内核执行结构整理安排在执行前置后，FAL 业务仍暂停、整体未交付。公开契约若确需调整，先确定具体语义，再共同迁移内核与 rinlib。
 >
 > 方向参考：`notes/ideas/{object,message,wait,time,rpc,framework,fal,fs,service,tunnel,runnel}.md`。本文件拥有 FAL 业务与总体依赖/交付导航；公共对象/观察/退休由 [公共前置计划](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 拥有，时钟/绝对期限由 [期限计划](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有，运输/RPC/服务执行由 [执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md) 拥有。计划审视由实施者负责，代码 reviewer 只审查代码；提交后登记未来代码 Review。
 
@@ -16,12 +16,13 @@
 |---|---|---|
 | 公共对象、观察与退休前置 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
 | 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
-| 运输/执行前置 | 公共对象与时间已完成，工作量大，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；按 typed transport、RPC context、Outbox/Runtime、真实消费者迁移、组合收口五个机制闭包推进，完成 Packet/Delivery→任务/RPC/Outbox→terminal→retire→refund 后才恢复 FAL |
+| 运输/执行前置 | 当前下一实施任务，草稿未交付 | `todo-2026-09-13-service-runtime-prerequisites.md`；运输 owner/Runnel → 通用执行/准入 → 完整 RPC/Outbox，每项同步迁移真实消费者 |
+| 公共操作边界收束 | 独立结构整理，安排在执行前置与共享包之后 | `todo-2026-09-14-public-operation-ownership.md`；保留 ProcessDrain 分工，收束等待/请求/工作执行，覆盖全部真实内核消费者 |
 | FAL 业务 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
 | 验收可靠性改进 | 用户独立延期 | `todo-2026-09-13-acceptance-reliability.md` 和 KNOWN_ISSUES；概率覆盖误失败与原 Tunnel 静默截断分别处理，未绿 stress 不记通过 |
-| workspace 包归属 | 独立延期 | `todo-2026-09-13-workspace-package-ownership.md`；本主线不搬目录/包或修改 path 依赖以整理归属 |
+| workspace 包归属 | 独立待实施，沿用原 todo | `todo-2026-09-13-workspace-package-ownership.md`；执行前置完成后、内核结构收束及 FAL 新业务前审视共用契约并迁移归属，本次没有搬包 |
 
-代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置先完成 typed transport，再接 RPC context、Outbox/Runtime 和真实消费者；每阶段保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
+代码定位：时间为 `shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按运输 owner/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
 
 当前验证基线：七面 `just clippy`、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure 通过；GDB 只读捕获已安装 Close/active 的一次真实取消窗口，不保证每轮 exact-window。完整 stress 的旧截断/概率失败仍未解决；本快照没有总体 `just acceptance` 通过声明。
 
@@ -32,14 +33,15 @@
 本次任务划分失败的根因是把公共前置和正式服务能力混入一项过大的施工任务，并将文档确认误当成前置已成立。以后开工先反推正常、失败、取消、退出和退款路径，审视前置是否齐备、任务是否按机制闭合；自顶向下设计、自底向上完成完整前置。已有草稿不构成保留理由。
 
 ```text
-公共时间/Deadline ──────────────┐
-公共对象/通知/WaitSet/内核退休 ──┴─> 运输/Runnel/RPC/Outbox/libsrv
-                                       └─> 授权域/稳定后端/v2客户端
-                                             └─> Open/Watch/注册/Move/Copy
-                                                   └─> 真实装配/旧路径删除/总体交付
+已交付公共时间与对象基线
+  → 运输 owner/Runnel → 通用执行/准入 → 完整 RPC/Outbox
+  → 共用算法契约与包归属（既有独立计划）
+  → 内核等待/请求/退休结构收束（保留现有回收职责）
+  → 后端准备/取消/退休 → 授权域/provider/v2客户端
+  → Open/Watch/注册/Move/Copy → 总体组合交付
 ```
 
-时间与公共对象任务共同核对绝对 Send/Wait ABI，执行任务明确依赖二者；来源通知、完成、普通 Close 和 ProcessDrain 强耦合，共同放在公共对象任务内，不拆散。完整前置允许且必须适当验证；前置完成不是 FAL 完成，分片验证也不能代替任务闭包。workspace 包归属另见 [未来整理计划](todo-2026-09-13-workspace-package-ownership.md)，本轮不搬迁。
+当前直接从执行前置的运输闭包开工；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](todo-2026-09-13-workspace-package-ownership.md) 不作为整体开工阻塞。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
 
 本文下面保留的基线与代码连接点是审视材料，不是已完成证据。公共前置章节的旧 Seal/Drain 等候选已经被普通 Close/内核退休替代，旧 ABI 和用户维护编排已删除，不继续照旧施工或恢复兼容。
 
@@ -59,7 +61,7 @@
 
 不实现 CPU 预约、KernelMemoryBudget 公共 ABI、设备/中断/DMA、BufferQueue、系统关机政策或通用异步语言运行时。FAL 超出基本操作面的能力唯一承接见 [`扩展操作计划`](todo-2026-09-fal-extended-operations.md)。
 
-自然序：公共时间与 IPC 前置 → 服务执行/授权对象 → FAL 正式消费者 → BufferQueue 与设备/中断/DMA → 异构。最终全局架构 Review 等本专题主要消费者完成。
+自然序以「开工审视与任务依赖」为准：运输/执行/RPC → 共享包 → 内核执行结构收束 → FAL 后端/授权与业务。后续 BufferQueue、设备/中断/DMA 与异构各依实际能力前置推进；开放不可信创建域前须完成 [KernelMemoryBudget](todo-2026-09-14-kernel-memory-budget.md)，不把当前有界准入当作完整资源隔离。最终全局架构 Review 等本专题主要消费者完成。
 
 ## 当前施工位置
 
@@ -87,7 +89,7 @@
 - `rinlib/ipc/invitation.rs` 与 EndpointCleanup 已写入邀请未消费/已消费失败 owner；原始 Tunnel/Runnel Attach 已改为 unsafe，五处既有调用点已标明原始责任。Runnel Channel/ProducerCore/ConsumerCore 构造失败以 InitFailure 原样返还 Transport，安全 Producer/Consumer create/attach 接入 typed Invitation，协议初始化失败返还 Endpoint，不自动丢弃承载。pm 接收侧已迁入 typed Invitation/Producer::attach，init 创建侧与正式 Open 仍待迁入安全工厂；host 用例只已写入，未运行。
 - 代码 reviewer 的静态追踪发现 OrderedTable 内部 scan cursor 仍为 u64，已统一为 K；未运行构建或测试。其他 IPC 并发观察不构成运行安全性证据。
 
-下一连接点：先完成公共对象/通知/内核退休与时间前置，再完成运输/Runnel/RPC/Outbox/libsrv 执行前置；二者未成立前不继续 provider 或后端业务扩展。之后重新核对 FAL 草稿、接通正式业务与独立进程，最后执行总体组合门。公共前置不能再随业务施工反复补修。
+下一连接点以本计划顶部的新依赖图为准；以上旧施工盘点只用于定位草稿，不据其中过时的完成或 Seal/Drain 描述续写。执行基座成立后，先把后端的准备失败、取消与替换旧值清理收回完整后端 owner，再接授权/provider/client；不把后端退休逐项交给 handler，也不把 FAL 资源分类继续加进执行核心。
 
 实现细节收口：WaitSet 的 ready 双向链接存在正式 OrderedTable 注册记录中；入队/摘除使用固定数量的有界 AVL 查找，避免新增 unsafe intrusive 指针或无界 tombstone 扫描。收束政策上限统一从 shared `DRAIN_WORK_MAX` 取得，不能用用户传入的巨大预算把短内核路径放大成全表操作。
 
@@ -103,9 +105,9 @@
 | 2 服务任务运行体 | libsrv 任务、账户、显式债务唤醒、RPC dispatcher、Outbox 与有界 retire | 一个运行体实际驱动请求、下游调用和退役；所有完成/取消路径保留 Delivery，源码存在不等于已接通。 |
 | 3 授权目录与值 | NodeStore/PreparedMutation、GrantTable、Namespace/走路、Record/Handle/Take、跨 provider Derive | 替换旧路径模型和无鉴权 anchor；稳定位置、真实权限衰减与运输槽布局同步迁移。 |
 | 4 长生命周期业务 | Open offer/Attach/Start/EOF/Finish、Watch、注册/发现、同域 Move 与客户端 Copy | 全部 terminal/retire、部分进度、取消、静默退出与旧实例竞态闭合；不在 handler 中等待。 |
-| 5 真实装配与整体收口 | 两个 provider、独立 test_fal、init 启动能力图、全消费者迁移与旧路径删除 | 回到全部契约复核，集中执行第 14 节 host/静态/QEMU 组合门，再同步 impls；满足总体完成门之后才交付。 |
+| 5 整体组合收口 | 两个 provider、独立 test_fal 与 init 能力图的组合验证 | 各机制的真实装配、消费者迁移与旧路径删除须在各自闭包完成；本段集中执行第 14 节跨机制组合门并核对完整交付。 |
 
-当前业务暂停，公共对象/观察/退休任务重审后施工，时间前置同步核对。此前第 2–3 段源码是超前草稿；执行任务不得依赖未完成的内核基座，FAL 不得依赖未完成的执行基座。每轮记录实际责任链、前置证据、剩余连接和删除门；发现新缺失前置先修订任务图，不立即切回业务打补丁。
+以上是总体能力导航；当前实施顺序由顶部依赖图及各唯一 todo 拥有。FAL 后端先收束 PreparedMutation 的准备/取消/旧值退休责任、稳定节点及值 owner；随后 grant/授权准入/provider/client 共同迁移；最后按 Open、Watch、注册和事务业务各自的完整语义推进。store/backend/value/grant 是源码位置，不直接作为交付任务。每轮登记真实责任链、前置证据与删除门，发现缺失前置先修订任务图。
 
 ## 2. 公共对象类型与所有权参考
 

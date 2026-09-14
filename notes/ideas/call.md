@@ -16,7 +16,7 @@
 
 公共 MonotonicNow 读取系统单调时间域；有限 Send 和等待直接接受绝对 Deadline，完整契约由 [time](time.md) 拥有。用户库的相对时长入口只做一次转换，不构成第二套内核等待机制。
 
-HandleQuery 只描述调用者持有的真实 entry，不按裸对象身份打开对象。Lifetime、消息 Delivery 与 WaitSet 分别由 [object](object.md)、[message](message.md) 和 [wait](wait.md) 拥有。WaitSet 的可增长注册集合必须由 Seal/Drain 以硬预算收束，ProcessDrain 接管同一进度；内核不增加等待服务线程或无界 close callback。
+HandleQuery 只描述调用者持有的真实 entry，不按裸对象身份打开对象。Lifetime、消息 Delivery 与 WaitSet 分别由 [object](object.md)、[message](message.md) 和 [wait](wait.md) 拥有。WaitSet 的可增长注册集合由普通 Close 提交内核拥有的有界退休，ProcessDrain 只接入同一完成责任，不驱动集合的内部维护；内核不增加等待服务线程或无界 close callback。
 
 ## Remote Call
 

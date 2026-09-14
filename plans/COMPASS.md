@@ -20,11 +20,15 @@
 
 ## 活跃计划
 
-公共时间已完成并归档：CSR/内存采样排序、可读/可编程期限尾部、高水位/失败隔离、Wait/Sleep/Send 到期与 ownership、运行期协作停止及真实消费者验证均已通过；提交 `c6e0a84`，实现见 `notes/impls/time.md`。下一任务是运输/RPC/服务执行前置，researcher/explorer 继续使用有额度 provider 的 DeepSeek Flash。
+公共时间与公共对象已完成原交付；时间提交 `c6e0a84`，实现见 `notes/impls/{time,ipc}.md`。分支级设计审视另识别了公共操作与回收边界收束需求，不把原交付通过视为现有结构必须保留；本轮只更新设计与计划，没有实施重构或新增验收通过声明。
 
-运输/RPC/服务执行前置工作量大于公共时间前置，按 typed transport → RPC context → Outbox/Runtime → 真实消费者迁移 → 组合收口五个机制闭包逐项提交；具体责任链、失败/取消/退款完成门与提交纪律见执行前置计划。
+**当前下一任务**：[运输 owner/Runnel → 通用执行与准入 → 完整 RPC/Outbox](todo-2026-09-13-service-runtime-prerequisites.md)，从运输闭包开工审视并实施。ProcessDrain 由受信任管理者在 REAPABLE 后推进，普通应用不持续轮询，保留该契约；自动全程回收、预算激励和重新设计全监督拓扑均不是当前前置。开工仍核对实际所有权、取消与 Close 执行边界，不能把草稿存在当作能力完成。
 
-当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：公共对象前置与公共时间前置已完成；运输/RPC/服务执行前置与 FAL 仍是草稿；验收可靠性计划与包归属继续独立延期。本次保存混合集成基线，后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
+后续串行位置：[共享包契约与归属](todo-2026-09-13-workspace-package-ownership.md) → [内核等待/请求/退休结构收束](todo-2026-09-14-public-operation-ownership.md) → [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)。两项整理不阻塞当前执行前置整体开工；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。每个机制包含真实消费者迁移、失败/退出和旧路径删除，组合验收是完成门。
+
+可以先行的局部修复只有已定位、无需改变对外契约的收口，例如 Runnel 新观察方法的终态访问；唯一登记在执行前置。Delivery 独立身份/Peek 取舍在运输闭包开工前决定，不预设删除。共享包仍沿用原独立 todo，本轮没有搬包。
+
+当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；本次设计审视基线为 `bf48cab`。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输/执行与 FAL 仍是草稿，验收可靠性保持独立延期。后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
 
 plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报告。专题 todo 拥有当前实施，Review 保留目标提交证据与复核清单，二者不重复安排同一问题。已完成调查/复核进入 `archived/`，`ref-*` 是只读参考资料。当前全部活跃入口：
 
@@ -34,10 +38,13 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-13-monotonic-time-rpc-deadline-review.md`](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 未来 Review：固定 `c6e0a84` 的公共时钟、绝对期限、运行期停止与真实消费者边界，不把跨 epoch/RPC/FAL 责任混入复核 |
 | [`todo-2026-09-frame-source-selftest-review.md`](todo-2026-09-frame-source-selftest-review.md) | 未来代码 Review：固定复核 `606b59d` 的库存来源、boot-held affine owner、完整清零、切分退款与 child 来源保活，不阻塞 FAL 主线 |
 | [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
-| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停、总体未交付：公共对象 公共对象前置 与时间 公共时间前置 已完成，先完成运输/RPC/执行 运输/RPC/服务执行前置，随后恢复授权后端与业务 |
+| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停：先运输/执行/RPC，随后共享包与内核执行结构收束，再恢复后端、授权与业务 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
-| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 依赖公共时间与对象：运输/Runnel/RPC/Outbox/libsrv 责任链和真实消费者闭合后，才恢复 FAL |
-| [`todo-2026-09-13-workspace-package-ownership.md`](todo-2026-09-13-workspace-package-ownership.md) | 未来独立整理：os/shared/user 作为包容器，共用算法与 ABI 独立归属；本轮不搬 workspace/package |
+| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 当前下一任务，三闭包：运输/Runnel → 通用执行/准入 → RPC/Outbox；同步真实消费者，包含 Runnel 终态修复与事件驱动监督 |
+| [`todo-2026-09-13-workspace-package-ownership.md`](todo-2026-09-13-workspace-package-ownership.md) | 复用既有独立立项：执行前置后、内核结构收束与 FAL 业务前统一共用算法契约/包归属；本轮未搬包 |
+| [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
+| [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
+| [`todo-2026-09-14-kernel-memory-budget.md`](todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |
 | [`todo-2026-09-13-acceptance-reliability.md`](todo-2026-09-13-acceptance-reliability.md) | 用户暂缓：概率胜负覆盖判定、Tunnel 静默窗口观测与原截断取证；不阻塞当前公共正确性施工，不把未绿 stress 记为通过 |
 | [`todo-2026-09-fal-extended-operations.md`](todo-2026-09-fal-extended-operations.md) | 等真实消费者触发：递归 Copy/Delete、快照/持久性/原子替换、capability 属性 Copy、递归/可重放 Watch、append/组合 Open；不隐含在基本 FAL 完成中 |
 | [`todo-2026-09-platform-reserved-memory-lifecycle.md`](todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |
@@ -46,7 +53,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 等设备/中断/DMA 接入触发的唯一 review 承接项 |
 | [`todo-2026-09-kernel-final-architecture-review.md`](todo-2026-09-kernel-final-architecture-review.md) | 等 MemoryObject 主线、多页 Tunnel、Runnel v2 与主要用户态消费者完成，并在统筹批次 A–E 收口后执行的最终架构 review |
 
-公共对象前置 公共对象前置 已完成并[归档](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)，实现与验证真值见 `notes/impls/ipc.md`：Native 坏输出/新轮停驻旧取消、通知历史/终态摘槽/非空压力、真实双接收线程与 forced Full、跨进程提交后 kill 和 GDB 已装 Close/active 窗口已补，旧 findings 复核关闭；core/128MiB/release/nofd/启动失败、七面 lint、163 项 host 通过。完整 stress 的旧截断/概率判定仍由 验收可靠性计划 独立延期，未宣称通过；纳入当前 FAL 分支集成基线，提交定位见总计划交接节。下一自然序 运输/RPC/服务执行前置 → FAL，workspace 整理继续延期。
+公共对象前置 公共对象前置 已完成并[归档](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)，实现与验证真值见 `notes/impls/ipc.md`：Native 坏输出/新轮停驻旧取消、通知历史/终态摘槽/非空压力、真实双接收线程与 forced Full、跨进程提交后 kill 和 GDB 已装 Close/active 窗口已补，旧 findings 复核关闭；core/128MiB/release/nofd/启动失败、七面 lint、163 项 host 通过。完整 stress 的旧截断/概率判定仍由 验收可靠性计划 独立延期，未宣称通过；纳入当前 FAL 分支集成基线，提交定位见总计划交接节。原交付不包含本次公共操作边界重构；当前下一步以本节顶部接手顺序为准。
 
 A–E 的五份专题实施计划、九份报告、Review program 与系统审计总计划均已归档。最终修复基线为 `228b6a5`，WiseHare/OliveWillow 定点复核通过，无开放 finding；过程与验证边界见 [`Review program 档案`](archived/todo-2026-09-review-program.md)。
 
@@ -71,6 +78,8 @@ A–E 的五份专题实施计划、九份报告、Review program 与系统审�
 | Unmap 调用者唤醒点前移（Synchronize 即返回、retire 后台化） | 内存操作延迟实测成为瓶颈（需先具备测量面） | `ideas/mm.md`「MemoryChange 事务」 |
 
 ## 位置
+
+以下为历史批次与验证证据的导航，段内保留的“下一步”描述属于当时交接；当前任务与顺序以「活跃计划」顶部和对应唯一 todo 为准。
 
 - 已完成：boot/高半区启动协议、帧池（os/frame_pool）、堆、Sv39 页表（os/page_table）、板级解析（os/dtb）、任务模型（trap 路径与 trap 锚、域—类调度、进程/线程、BootPackage initial ELF bootstrap、syscall 面 Debug/Exit/MemoryMap/MemoryUnmap/MemoryProtect/Sleep、进程回收、timer/IPI 通路）与执行环境重构（a9a65cb）。IPC 前地基工程已完成（hart 身份统一、锁内存序、所有权单向化、uaccess 集中化；见 `plans/archived/2026-09-pre-ipc-groundwork.md`）。IPC 对象 / Handle 重建也已完成：进程本地 HandleTable、WaitContext、显式 Mailbox/Notification、原子 Handle move、Endpoint/Invitation 与 Acquire/Release Runnel 已贯通，实施档案见 [已归档计划](archived/2026-08-ipc-object-foundation.md)，实现现状见 `notes/impls/ipc.md`。
 - 已完成：**统一内存事务核与公共 MemoryObject 已收口（2026-09）**——切片 1–6D 与切片 7 全部完成。Running/Building/bootstrap/object view 四条路径收敛为单一 `MemoryChangePlan`/`PreparedMemoryChange`（source/authority/output/image_end/view 五个字段维度），四套平行 plan/complete/commit 类型与 Tunnel 两份回滚矩阵已删除，proc.rs 净减约 700 行。对象 view 的权限真值从 `ObjectViewAuthorization` 流出（原 `ReadWrite` 硬编码已清），公共 MemoryObject 经 `MemoryObjectCreate/Query/Seal(0x55-0x57)`、`ObjectSignals::EXECUTABLE` 与 `MemoryMapRequest.source` 接入，AddressSpace 持 per-object view owner 使对象独立于 Handle 存活。实施途中修正一个真实前置缺口：含 W 的 object view 被部分 Unmap/降权时存活片段需要后继 permit，因此 Unmap/Protect 采用两段式（Validate 定几何并冻结对象来源 → 锁外取得 permit → 重入 Reserve）；Sealing 允许只延续原写范围的切分/收缩，仍拒绝只读范围升权，失败回滚不再回查易失的 live view owner。实施档案见 [`archived/todo-2026-09-memory-object-unification.md`](archived/todo-2026-09-memory-object-unification.md)，历史 A 批复核见 [`Review program 档案`](archived/todo-2026-09-review-program.md)；本轮后续修复由 [`设计审查后续 Review`](todo-2026-09-design-audit-followup-review.md) 单列复核，不重开旧 program。实现现状见 `notes/impls/{mm,memory-object,tunnel}.md`。
