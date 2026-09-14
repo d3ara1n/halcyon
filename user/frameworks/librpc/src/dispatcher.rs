@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use erhino_shared::{
     call::SystemCallError,
-    object::{HandleRole, ObjectSignals, Rights},
+    object::{ObjectSignals, Rights},
     time::Deadline,
     wait::WaitItem,
     wait_set::ReadyRecord,
@@ -11,7 +11,7 @@ use erhino_shared::{
 use ordered_table::OrderedTable;
 use rinlib::ipc::{
     capability::Capability,
-    message::{Mailbox, MessageStorage, ReceiveBuffer},
+    message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
     wait_set::WaitSet,
 };
 use timer_queue::{TimerQueue, TimerToken};
@@ -30,7 +30,7 @@ struct SourceBinding {
 }
 
 struct PendingCall {
-    service: Capability,
+    service: MailboxSender,
     deadline: Deadline,
     protocol: u64,
     request: Option<Request>,
@@ -62,7 +62,7 @@ pub struct Dispatcher<'a> {
     set: &'a WaitSet,
     cookie: u64,
     owner: Mailbox,
-    sender: Capability,
+    sender: MailboxSender,
     receiver: ReceiveBuffer,
     reply_token: u64,
     reply_generation: u64,
@@ -95,13 +95,29 @@ impl<'a> Dispatcher<'a> {
             if self.sealed { return Err(CallCause::Shutdown) }
             request.new_attempt().map_err(cause)?;
             if rinlib::time::expired(deadline).map_err(cause)? { return Err(CallCause::Timeout) }
-            let description = service.description().map_err(cause)?;
-            if description.role != HandleRole::MailboxSender as u32 { return Err(CallCause::System(SystemCallError::WrongObjectType)) }
-            if !description.rights.contains(Rights::WRITE | Rights::WAIT) { return Err(CallCause::System(SystemCallError::RightsDenied)) }
-            request.attach_reply(&self.sender).map_err(cause)
+            Ok(())
         })();
         if let Err(cause) = early {
             return Err(StartFailure { service, error: CallError::unsent(cause, request), cleanup_error: None });
+        }
+        // 未知服务授权在唯一转换边界 Query 一次，此后重试不再重复 Query。
+        let (service, description) = match MailboxSender::from_capability(service) {
+            Ok(adopted) => adopted,
+            Err(failure) => {
+                return Err(StartFailure {
+                    service: failure.owner,
+                    error: CallError::unsent(cause(failure.error), request),
+                    cleanup_error: None,
+                })
+            }
+        };
+        if !description.rights.contains(Rights::WRITE | Rights::WAIT) {
+            let cause = CallCause::System(SystemCallError::RightsDenied);
+            return Err(StartFailure { service: service.into_capability(), error: CallError::unsent(cause, request), cleanup_error: None });
+        }
+        if let Err(error) = request.attach_reply(&self.sender) {
+            let cause = cause(error);
+            return Err(StartFailure { service: service.into_capability(), error: CallError::unsent(cause, request), cleanup_error: None });
         }
         let txid = request.txid();
         let pending = PendingCall { service, deadline, protocol: request.protocol(), request: Some(request),
@@ -138,7 +154,7 @@ impl<'a> Dispatcher<'a> {
 
     fn start_failure(mut pending: PendingCall, cause: CallCause) -> StartFailure {
         let request = pending.request.take().expect("unsent call lost its request");
-        StartFailure { service: pending.service, error: CallError::unsent(cause, request), cleanup_error: pending.cleanup_error }
+        StartFailure { service: pending.service.into_capability(), error: CallError::unsent(cause, request), cleanup_error: pending.cleanup_error }
     }
 
     fn register_source(&mut self, handle: erhino_shared::object::Handle, signals: ObjectSignals, txid: u64, kind: SourceKind) -> Result<u64, SystemCallError> {
@@ -293,7 +309,7 @@ impl<'a> Dispatcher<'a> {
         else { self.pending.get_mut(pending.previous).expect("RPC completion predecessor disappeared").next = pending.next; }
         if pending.next == 0 { self.completed_tail = pending.previous }
         else { self.pending.get_mut(pending.next).expect("RPC completion successor disappeared").previous = pending.previous; }
-        Some(Completion { service: pending.service, result: pending.result.take().expect("RPC completion lost its result"), cleanup_error: pending.cleanup_error })
+        Some(Completion { service: pending.service.into_capability(), result: pending.result.take().expect("RPC completion lost its result"), cleanup_error: pending.cleanup_error })
     }
 
     pub fn pop_completed(&mut self) -> Option<(u64, Completion)> {

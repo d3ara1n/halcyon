@@ -152,3 +152,31 @@ impl IntoIterator for HandleSet {
         self.slots.into_iter().flatten()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_returns_each_slot_once_and_reports_missing() {
+        let mut set = HandleSet::prepared(3).unwrap();
+        set.install(&[
+            Handle::from_parts(1, 1),
+            Handle::from_parts(2, 1),
+            Handle::from_parts(3, 1),
+        ]);
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.take(3).unwrap_err(), SystemCallError::IllegalArgument);
+        // 取出的 owner 在 host 上无 syscall，显式移出原始责任避免 Drop 关闭。
+        let _ = set.take(0).unwrap().into_raw();
+        assert_eq!(set.take(0).unwrap_err(), SystemCallError::IllegalArgument);
+        assert_eq!(set.remaining(), 2);
+        assert!(set.get(2).is_ok());
+        assert!(set.get(0).is_err());
+        let drained: alloc::vec::Vec<Capability> = set.into_iter().collect();
+        assert_eq!(drained.len(), 2);
+        for capability in drained {
+            let _ = capability.into_raw();
+        }
+    }
+}

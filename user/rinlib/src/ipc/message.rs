@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use erhino_shared::{
     call::SystemCallError,
     message::{HandleMove, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX},
-    object::{Handle, HandlePair, HandleRole, ObjectSignals, Rights, SenderResult},
+    object::{Handle, HandleDescription, HandlePair, HandleRole, ObjectSignals, Rights, SenderResult},
     time::Deadline,
     wait::{WaitItem, WaitReason},
 };
@@ -153,8 +153,113 @@ pub struct Mailbox {
     owner: Option<Handle>,
 }
 
+/// MailboxSender 目标的 typed owner；role 由铸造或转换边界保证，
+/// 投递路径不再重复 Query。
+#[derive(Debug)]
+pub struct MailboxSender {
+    capability: Capability,
+}
+
+/// send-once 回复授权的 typed owner；成功投递即消费，失败完整保留。
+#[derive(Debug)]
+pub struct SendOnce {
+    capability: Capability,
+}
+
+/// typed 转换边界失败时完整返还能力 owner。
+#[derive(Debug)]
+pub struct SenderAdoptFailure {
+    pub owner: Capability,
+    pub error: SystemCallError,
+}
+
+impl MailboxSender {
+    /// 未知能力在唯一转换边界 Query 一次；错误时完整返还 owner。
+    /// 返回的描述供调用方一次性完成 rights 检查，此后不再 Query。
+    pub fn from_capability(owner: Capability) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
+        let adopt = owner.description().and_then(|description| {
+            if description.role != HandleRole::MailboxSender as u32 {
+                return Err(SystemCallError::WrongObjectType);
+            }
+            Ok(description)
+        });
+        match adopt {
+            Ok(description) => Ok((Self { capability: owner }, description)),
+            Err(error) => Err(SenderAdoptFailure { owner, error }),
+        }
+    }
+    pub(crate) fn from_minted(capability: Capability) -> Self {
+        // MailboxMintSender 由内核保证 role，无需 Query。
+        Self { capability }
+    }
+    pub fn as_handle(&self) -> Handle {
+        self.capability.as_handle()
+    }
+    pub fn description(&self) -> Result<HandleDescription, SystemCallError> {
+        self.capability.description()
+    }
+    pub fn into_capability(self) -> Capability {
+        self.capability
+    }
+    pub fn close(self) -> Result<(), (Self, SystemCallError)> {
+        self.capability.close().map_err(|(capability, error)| (Self { capability }, error))
+    }
+    /// 消费 owner 并显式移交原始关闭责任；仅用于原始工厂与诊断边界。
+    pub fn into_raw(self) -> Handle {
+        self.capability.into_raw()
+    }
+    /// 不附带能力的普通发送；目标普通 sender 不被消费。
+    pub fn send(&self, kind: u64, payload: &[u8]) -> Result<(), SystemCallError> {
+        self.send_until(kind, payload, Deadline::INFINITE)
+    }
+    pub fn send_until(&self, kind: u64, payload: &[u8], deadline: Deadline) -> Result<(), SystemCallError> {
+        // SAFETY: 没有 move，目标普通 sender 不被消费。
+        unsafe { sys_send(self.as_handle(), kind, payload, &[], deadline) }
+    }
+}
+
+impl SendOnce {
+    /// 未知能力在唯一转换边界 Query 一次；错误时完整返还 owner。
+    pub fn from_capability(owner: Capability) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
+        let adopt = owner.description().and_then(|description| {
+            if description.role != HandleRole::MailboxSenderOnce as u32 {
+                return Err(SystemCallError::WrongObjectType);
+            }
+            Ok(description)
+        });
+        match adopt {
+            Ok(description) => Ok((Self { capability: owner }, description)),
+            Err(error) => Err(SenderAdoptFailure { owner, error }),
+        }
+    }
+    pub(crate) fn derived(capability: Capability) -> Self {
+        // MailboxMakeSendOnce 由内核保证 role，无需 Query。
+        Self { capability }
+    }
+    /// 已由调用方在同一验证事务中确认 MailboxSenderOnce role 的能力直接进入
+    /// typed owner；错误标记在内核投递时仍会以 WrongObjectType 拒绝。
+    pub fn from_validated(capability: Capability) -> Self {
+        Self { capability }
+    }
+    pub(crate) fn transferred(&mut self) {
+        self.capability.transferred();
+    }
+    pub fn as_handle(&self) -> Handle {
+        self.capability.as_handle()
+    }
+    pub fn description(&self) -> Result<HandleDescription, SystemCallError> {
+        self.capability.description()
+    }
+    pub fn into_capability(self) -> Capability {
+        self.capability
+    }
+    pub fn close(self) -> Result<(), (Self, SystemCallError)> {
+        self.capability.close().map_err(|(capability, error)| (Self { capability }, error))
+    }
+}
+
 pub struct MintedSender {
-    pub sender: Capability,
+    pub sender: MailboxSender,
     pub lifetime: Capability,
 }
 
@@ -177,7 +282,7 @@ impl Mailbox {
     ) -> Result<MintedSender, SystemCallError> {
         let minted = mint_sender(self.as_handle(), badge, rights)?;
         Ok(MintedSender {
-            sender: Capability::owned(minted.sender),
+            sender: MailboxSender::from_minted(Capability::owned(minted.sender)),
             lifetime: Capability::owned(minted.lifetime),
         })
     }
@@ -320,9 +425,9 @@ pub fn make_send_once(source: Handle, rights: Rights) -> Result<Handle, SystemCa
     Ok(output)
 }
 
-pub fn send_once(source: &Capability, rights: Rights) -> Result<Capability, SystemCallError> {
+pub fn send_once(source: &MailboxSender, rights: Rights) -> Result<SendOnce, SystemCallError> {
     let handle = make_send_once(source.as_handle(), rights)?;
-    Ok(Capability::owned(handle))
+    Ok(SendOnce::derived(Capability::owned(handle)))
 }
 
 pub fn mint_sender(

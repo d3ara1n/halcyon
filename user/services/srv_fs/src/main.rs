@@ -11,8 +11,7 @@
 use alloc::{fmt::Write, string::String, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
-    message::HandleMove,
-    object::{Handle, HandlePair, ObjectSignals, Rights},
+    object::{Handle, ObjectSignals, Rights},
     wait::{WaitItem, WaitReason},
 };
 use libfal::lookup::ResolvePolicy::{FollowAll, NoFollowFinal};
@@ -33,8 +32,12 @@ use libfs::{
 };
 use rinlib::{
     ipc::{
-        message::{create as mailbox_create, make_send_once, receive, send_raw},
+        capability::Capability,
+        message::{
+            Mailbox, MailboxSender, ReceivedMessage, SendOnce, receive, send_once,
+        },
         object::duplicate,
+        packet::Packet,
         wait::wait_many,
     },
     preclude::*,
@@ -78,29 +81,34 @@ fn check_path_len(bytes: &[u8]) -> Result<(), Status> {
 
 struct Fs {
     provider: MemFs,
-    owner: Handle,
-    peer: Handle,
-    reply: HandlePair,
+    owner: Mailbox,
+    sender: MailboxSender,
+    reply_owner: Mailbox,
+    reply_sender: MailboxSender,
     txid: u64,
 }
 
 impl Fs {
     fn new() -> Self {
-        let provider_mailbox = mailbox_create(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
-        )
-        .expect("provider mailbox create failed");
-        let reply = mailbox_create(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::DUPLICATE | Rights::TRANSIT,
-        )
-        .expect("reply mailbox create failed");
+        let owner = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
+            .expect("provider mailbox create failed");
+        let minted = owner
+            .mint(
+                0,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+            )
+            .expect("provider sender mint failed");
+        let reply_owner = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
+            .expect("reply mailbox create failed");
+        let reply_minted = reply_owner
+            .mint(0, Rights::WRITE | Rights::DUPLICATE | Rights::TRANSIT)
+            .expect("reply sender mint failed");
         Self {
             provider: MemFs::new(),
-            owner: provider_mailbox.owner,
-            peer: provider_mailbox.peer,
-            reply,
+            owner,
+            sender: minted.sender,
+            reply_owner,
+            reply_sender: reply_minted.sender,
             txid: 1,
         }
     }
@@ -123,25 +131,39 @@ impl Fs {
         // slot 0：一次性回复授权（携 TRANSIT 以便暂存于消息）；
         // slot 1：帧锚目录（副本，不消耗本地 grant）。
         let reply_once =
-            make_send_once(self.reply.peer, Rights::WRITE | Rights::TRANSIT).map_err(map_system)?;
-        let anchor_dup = duplicate(anchor, Rights::WRITE | Rights::TRANSIT).map_err(map_system)?;
-        let moves = [
-            HandleMove {
-                handle: reply_once,
-                rights: Rights::WRITE | Rights::TRANSIT,
-            },
-            HandleMove {
-                handle: anchor_dup,
-                rights: Rights::WRITE,
-            },
-        ];
-        unsafe { send_raw(self.peer, PROTOCOL_ID, &payload[..used], &moves) }
-            .map_err(map_system)?;
+            send_once(&self.reply_sender, Rights::WRITE | Rights::TRANSIT)
+                .map_err(map_system)?;
+        // SAFETY: duplicate 新建的帧锚副本，此处唯一接管关闭责任。
+        let anchor_dup = unsafe {
+            Capability::from_raw(
+                duplicate(anchor, Rights::WRITE | Rights::TRANSIT).map_err(map_system)?,
+            )
+        };
+        let mut packet =
+            Packet::new(PROTOCOL_ID, &payload[..used]).map_err(map_system)?;
+        for (capability, rights) in [
+            (reply_once.into_capability(), Rights::WRITE | Rights::TRANSIT),
+            (anchor_dup, Rights::WRITE),
+        ] {
+            if let Err(failure) = packet.push(capability, rights) {
+                // 拒绝时完整返还 owner：显式关闭，不泄漏承载。
+                let _ = failure.capability.close();
+                return Err(map_system(failure.error));
+            }
+        }
+        packet
+            .try_send(&self.sender, rinlib::time::Deadline::INFINITE)
+            .map_err(|mut failure| {
+                while let Some((capability, _)) = failure.packet.pop() {
+                    let _ = capability.close();
+                }
+                map_system(failure.error)
+            })?;
 
         loop {
             let items = [
-                WaitItem::new(self.owner, ObjectSignals::READABLE, 0),
-                WaitItem::new(self.reply.owner, ObjectSignals::READABLE, 1),
+                WaitItem::new(self.owner.as_handle(), ObjectSignals::READABLE, 0),
+                WaitItem::new(self.reply_owner.as_handle(), ObjectSignals::READABLE, 1),
             ];
             let result = wait_many(&items, PUMP_TIMEOUT_MS).map_err(map_system)?;
             if result.reason == WaitReason::Timeout as u32 {
@@ -153,7 +175,7 @@ impl Fs {
             self.serve_one();
         }
 
-        let message = receive(self.reply.owner).map_err(map_system)?;
+        let message = receive(self.reply_owner.as_handle()).map_err(map_system)?;
         if message.header.kind != PROTOCOL_ID || !message.handles.is_empty() {
             return Err(Status::Internal);
         }
@@ -177,9 +199,9 @@ impl Fs {
     /// 请求槽位契约：恰好 2 个 Handle（slot 0 回复授权、slot 1 帧锚）；
     /// 任何不消费的 Handle 显式关闭——Handle 生命周期由本函数守恒。
     fn serve_one(&mut self) {
-        let mut message = receive(self.owner).expect("provider receive failed");
-        let reply_to = match self.validate_request(&mut message) {
-            Ok(reply_to) => reply_to,
+        let mut message = receive(self.owner.as_handle()).expect("provider receive failed");
+        let reply_once = match self.validate_request(&mut message) {
+            Ok(reply_once) => reply_once,
             Err(()) => {
                 // 运输 owner 统一关闭未提取的能力和 Delivery。
                 return;
@@ -210,34 +232,35 @@ impl Fs {
             &out[..served.1.len],
         );
         // 单 outstanding 调用下回复箱至多一条在途，永不触满；失败同样
-        // 只关已持有的回复权，不 panic。
-        if unsafe {
-            send_raw(
-                reply_to,
-                PROTOCOL_ID,
-                &reply[..librpc::PREFIX_LEN + len],
-                &[],
-            )
-        }
-        .is_err()
-        {
-            // SAFETY: 本请求收到的 send-once 回复授权，发送失败仍由本路径持有。
-            let _ = unsafe { rinlib::ipc::object::close(reply_to) };
+        // 完整返还 Packet 与回复授权，显式关闭，不 panic 不泄漏。
+        let packet = Packet::new(
+            PROTOCOL_ID,
+            &reply[..librpc::PREFIX_LEN + len],
+        )
+        .expect("reply packet budget validated");
+        if let Err(failure) = packet.try_reply(reply_once, rinlib::time::Deadline::INFINITE) {
+            drop(failure.packet);
+            let _ = failure.reply.close();
         }
     }
 
-    /// 槽位契约校验：成功时摘出 slot 0 回复授权并关闭 slot 1 帧锚
-    /// （同进程泵不按锚分树，跨进程批次接入锚授权）。
+    /// 槽位契约校验：成功时摘出 slot 0 回复授权（typed 验证一次）并关闭
+    /// slot 1 帧锚（同进程泵不按锚分树，跨进程批次接入锚授权）。
     fn validate_request(
         &mut self,
-        message: &mut rinlib::ipc::message::ReceivedMessage,
-    ) -> Result<Handle, ()> {
+        message: &mut ReceivedMessage,
+    ) -> Result<SendOnce, ()> {
         if message.header.kind != PROTOCOL_ID || message.handles.len() != 2 {
             return Err(());
         }
-        let reply_to = message.handles.take(0).map_err(|_| ())?.into_raw();
+        let reply_once = message
+            .handles
+            .take(0)
+            .map_err(|_| ())
+            .and_then(|capability| SendOnce::from_capability(capability).map_err(|_| ()))
+            .map(|(once, _)| once);
         drop(message.handles.take(1).map_err(|_| ())?);
-        Ok(reply_to)
+        reply_once
     }
 }
 
@@ -481,7 +504,7 @@ fn main() {
     let mut table = PrefixTable::new();
     assert!(
         table
-            .mount("/", fs.peer)
+            .mount("/", fs.sender.as_handle())
             .expect("mount root failed")
             .is_none()
     );

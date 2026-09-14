@@ -22,6 +22,8 @@ Send 按 HandleTable → Mailbox 锁阶准备 moves、Delivery、消息及容量
 
 rinlib `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
+rinlib typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 role 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
+
 ## 通知与等待
 
 Notification 保存 OR pending bits；READABLE 表示非零，Take 消费指定位。各对象的 `ObjectWaitState` 在源锁内记录 inactive→active 完整快照与 serial。通知与终态退休共用 `select_snapshot`，按未见且相关的最小 serial 选择，不按 signal 位序；无候选时当前 CLOSED 是终态 fallback。

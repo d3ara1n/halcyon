@@ -8,7 +8,7 @@ use erhino_shared::{
 };
 use rinlib::ipc::{
     capability::{Capability, HandleSet},
-    message::{Delivery, ReceivedMessage, send_once},
+    message::{Delivery, MailboxSender, ReceivedMessage, SendOnce, send_once},
     packet::{Packet, PushFailure},
 };
 use crate::{FrameError, PREFIX_LEN, ResponseRejection, RpcMessageKind, RpcPrefix, next_txid, validate_response};
@@ -36,7 +36,9 @@ pub struct CallError {
 
 impl CallError {
     pub(crate) fn unsent(cause: CallCause, mut request: Request) -> Self {
-        request.detach_reply();
+        // 本次尝试不再投递；撤回的 send-once 回复授权由完整返还的 owner
+        // 显式关闭，不依赖 tombstone 状态表达消费。
+        drop(request.detach_reply());
         Self { phase: CallPhase::Unsent, cause, request: Some(request) }
     }
     pub(crate) fn sent(cause: CallCause) -> Self {
@@ -44,10 +46,12 @@ impl CallError {
     }
 }
 
+/// 出站请求；成功投递后 packet 已移交，请求仅保留 txid/协议标识供回复匹配。
 #[derive(Debug)]
 pub struct Request {
     pub(crate) txid: u64,
-    pub(crate) packet: Packet,
+    protocol: u64,
+    packet: Option<Packet>,
     reply_attached: bool,
 }
 
@@ -58,38 +62,52 @@ impl Request {
         let mut payload = [0; PAYLOAD_MAX];
         RpcPrefix::new(RpcMessageKind::Request, txid).encode(&mut payload);
         payload[PREFIX_LEN..PREFIX_LEN + body.len()].copy_from_slice(body);
-        Ok(Self { txid, packet: Packet::new(protocol, &payload[..PREFIX_LEN + body.len()])?, reply_attached: false })
+        Ok(Self { txid, protocol, packet: Some(Packet::new(protocol, &payload[..PREFIX_LEN + body.len()])?), reply_attached: false })
     }
     pub fn txid(&self) -> u64 { self.txid }
     pub(crate) fn new_attempt(&mut self) -> Result<(), SystemCallError> {
-        if self.packet.delivered() || self.reply_attached { return Err(SystemCallError::ObjectBusy) }
+        if self.reply_attached { return Err(SystemCallError::ObjectBusy) }
+        let packet = self.packet.as_mut().ok_or(SystemCallError::ObjectBusy)?;
         self.txid = next_txid().ok_or(SystemCallError::ReachLimit)?;
-        RpcPrefix::new(RpcMessageKind::Request, self.txid).encode(self.packet.payload_mut());
+        RpcPrefix::new(RpcMessageKind::Request, self.txid).encode(packet.payload_mut());
         Ok(())
     }
-    pub fn protocol(&self) -> u64 { self.packet.kind() }
+    pub fn protocol(&self) -> u64 { self.protocol }
     pub fn push(&mut self, capability: Capability, rights: Rights) -> Result<(), PushFailure> {
-        if self.reply_attached || self.packet.handle_count() >= MESSAGE_HANDLE_MAX - 1 {
+        let packet = match self.packet.as_mut() {
+            Some(packet) => packet,
+            None => return Err(PushFailure { error: SystemCallError::ObjectBusy, capability }),
+        };
+        if self.reply_attached || packet.handle_count() >= MESSAGE_HANDLE_MAX - 1 {
             return Err(PushFailure { error: SystemCallError::IllegalArgument, capability });
         }
-        self.packet.push(capability, rights)
+        packet.push(capability, rights)
     }
-    pub(crate) fn attach_reply(&mut self, source: &Capability) -> Result<(), SystemCallError> {
+    pub(crate) fn attach_reply(&mut self, source: &MailboxSender) -> Result<(), SystemCallError> {
         if self.reply_attached { return Err(SystemCallError::ObjectBusy) }
+        let packet = self.packet.as_mut().ok_or(SystemCallError::ObjectBusy)?;
         let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
         let reply = send_once(source, rights)?;
-        self.packet.push_front(reply, rights).map_err(|failure| failure.error)?;
+        packet.push_front(reply.into_capability(), rights).map_err(|failure| failure.error)?;
         self.reply_attached = true;
         Ok(())
     }
-    pub(crate) fn detach_reply(&mut self) {
-        if self.reply_attached && !self.packet.delivered() {
-            drop(self.packet.pop_front());
-        }
+    /// 撤回随附的 send-once 回复授权并完整返还 owner；未附或已投递时返回 None。
+    pub fn detach_reply(&mut self) -> Option<Capability> {
+        if !self.reply_attached { return None }
         self.reply_attached = false;
+        self.packet.as_mut().and_then(Packet::pop_front).map(|(capability, _)| capability)
     }
-    pub(crate) fn try_send(&mut self, service: &Capability, deadline: Deadline) -> Result<(), SystemCallError> {
-        self.packet.try_send(service, deadline)
+    /// 消费式投递：成功后 Packet 已移交；失败完整返还，可重试或拆解回收。
+    pub(crate) fn try_send(&mut self, service: &MailboxSender, deadline: Deadline) -> Result<(), SystemCallError> {
+        let packet = self.packet.take().ok_or(SystemCallError::ObjectBusy)?;
+        match packet.try_send(service, deadline) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.packet = Some(failure.packet);
+                Err(failure.error)
+            }
+        }
     }
 }
 
@@ -132,13 +150,14 @@ pub struct RejectedRequest {
     pub message: ReceivedMessage,
 }
 
+/// 服务端已接受的请求上下文：回复授权与交付责任保留到处理终结。
 #[derive(Debug)]
 pub struct RequestContext {
     pub envelope: MessageHeader,
     pub txid: u64,
     pub payload: alloc::vec::Vec<u8>,
     pub handles: HandleSet,
-    reply: Capability,
+    reply: Option<SendOnce>,
     delivery: Delivery,
 }
 
@@ -151,7 +170,9 @@ impl RequestContext {
             if prefix.kind != RpcMessageKind::Request { return Err(RequestRejection::NotRequest) }
             let reply = message.handles.get(0).map_err(RequestRejection::System)?;
             let description = reply.description().map_err(RequestRejection::System)?;
-            if description.role != HandleRole::MailboxSenderOnce as u32 || !description.rights.contains(Rights::WRITE | Rights::WAIT) {
+            if description.role != HandleRole::MailboxSenderOnce as u32
+                || !description.rights.contains(Rights::WRITE | Rights::WAIT)
+            {
                 return Err(RequestRejection::ReplyRole);
             }
             Ok(prefix)
@@ -160,17 +181,34 @@ impl RequestContext {
             Ok(prefix) => prefix,
             Err(reason) => return Err(RejectedRequest { reason, message }),
         };
-        let reply = message.handles.take(0).expect("validated reply slot disappeared");
+        // 校验通过后才取出槽位；role 已验证，typed owner 不再重复 Query。
+        let reply = SendOnce::from_validated(message.handles.take(0).expect("validated reply slot disappeared"));
         message.payload.drain(..PREFIX_LEN);
-        Ok(Self { envelope: message.header, txid: prefix.txid, payload: message.payload,
-            handles: message.handles, reply, delivery: message.delivery })
+        Ok(Self {
+            envelope: message.header, txid: prefix.txid, payload: message.payload,
+            handles: message.handles, reply: Some(reply), delivery: message.delivery,
+        })
+    }
+
+    /// 回复授权；投递成功后消费，失败路径会完整恢复。
+    pub fn reply(&self) -> Option<&SendOnce> { self.reply.as_ref() }
+    /// 交付责任保持到请求处理与回复责任终结；由调用方决定何时移交或关闭。
+    pub fn delivery(&self) -> &Delivery { &self.delivery }
+    fn take_reply(&mut self) -> Option<SendOnce> { self.reply.take() }
+}
+
+pub(crate) fn cause(error: SystemCallError) -> CallCause {
+    match error {
+        SystemCallError::DeadlineExpired => CallCause::Timeout,
+        SystemCallError::ObjectClosed => CallCause::ServiceClosed,
+        error => CallCause::System(error),
     }
 }
 
 #[derive(Debug)]
 pub struct PreparedResponse {
     context: RequestContext,
-    packet: Packet,
+    packet: Option<Packet>,
 }
 
 #[derive(Debug)]
@@ -189,31 +227,47 @@ impl PreparedResponse {
         let mut bytes = [0; PAYLOAD_MAX];
         RpcPrefix::new(RpcMessageKind::Response, context.txid).encode(&mut bytes);
         match Packet::new(context.envelope.kind, &bytes[..PREFIX_LEN + capacity]) {
-            Ok(packet) => Ok(Self { context, packet }),
+            Ok(packet) => Ok(Self { context, packet: Some(packet) }),
             Err(error) => Err(ResponseFailure { error, context }),
         }
     }
-    pub fn body_mut(&mut self) -> &mut [u8] { &mut self.packet.payload_mut()[PREFIX_LEN..] }
-    pub fn parts(&mut self) -> (&mut RequestContext, &mut [u8]) {
-        (&mut self.context, &mut self.packet.payload_mut()[PREFIX_LEN..])
+    fn packet(&mut self) -> Result<&mut Packet, SystemCallError> {
+        self.packet.as_mut().ok_or(SystemCallError::ObjectBusy)
+    }
+    pub fn body_mut(&mut self) -> Result<&mut [u8], SystemCallError> {
+        Ok(&mut self.packet()?.payload_mut()[PREFIX_LEN..])
+    }
+    pub fn parts(&mut self) -> Result<(&mut RequestContext, &mut [u8]), SystemCallError> {
+        match (&mut self.context, self.packet.as_mut()) {
+            (context, Some(packet)) => {
+                let body = &mut packet.payload_mut()[PREFIX_LEN..];
+                Ok((context, body))
+            }
+            (_, None) => Err(SystemCallError::ObjectBusy),
+        }
     }
     pub fn finish_body(&mut self, used: usize) -> Result<(), SystemCallError> {
-        self.packet.truncate_payload(PREFIX_LEN.checked_add(used).ok_or(SystemCallError::IllegalArgument)?)
+        let end = PREFIX_LEN.checked_add(used).ok_or(SystemCallError::IllegalArgument)?;
+        self.packet()?.truncate_payload(end)
     }
     pub fn push(&mut self, capability: Capability, rights: Rights) -> Result<(), PushFailure> {
-        self.packet.push(capability, rights)
+        match self.packet.as_mut() {
+            Some(packet) => packet.push(capability, rights),
+            None => Err(PushFailure { error: SystemCallError::ObjectBusy, capability }),
+        }
     }
+    /// 消费式回复：成功即交付 Packet 与 send-once 授权；失败二者完整返还。
     pub fn try_send(&mut self, deadline: Deadline) -> Result<(), SystemCallError> {
-        self.packet.try_reply(&mut self.context.reply, deadline)
+        let packet = self.packet.take().ok_or(SystemCallError::ObjectBusy)?;
+        let reply = self.context.take_reply().ok_or(SystemCallError::ObjectBusy)?;
+        match packet.try_reply(reply, deadline) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.packet = Some(failure.packet);
+                self.context.reply = Some(failure.reply);
+                Err(failure.error)
+            }
+        }
     }
-    pub fn reply_handle(&self) -> erhino_shared::object::Handle { self.context.reply.as_handle() }
-    pub fn delivery(&self) -> &Delivery { &self.context.delivery }
-}
-
-pub(crate) fn cause(error: SystemCallError) -> CallCause {
-    match error {
-        SystemCallError::DeadlineExpired => CallCause::Timeout,
-        SystemCallError::ObjectClosed => CallCause::ServiceClosed,
-        error => CallCause::System(error),
-    }
+    pub fn into_context(self) -> RequestContext { self.context }
 }

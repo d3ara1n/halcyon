@@ -7,15 +7,14 @@ use erhino_shared::{
     wait::{WaitItem, WaitReason},
 };
 use rinlib::ipc::{
-    capability::Capability,
-    message::Mailbox,
+    message::{Mailbox, MailboxSender},
     wait::wait_until,
 };
 use crate::exchange::{CallCause, CallError, Reply, Request, cause};
 
 struct ReplyPort {
     owner: Mailbox,
-    sender: Capability,
+    sender: MailboxSender,
 }
 
 impl ReplyPort {
@@ -38,7 +37,12 @@ impl Caller {
         Ok(())
     }
 
-    pub fn call(&mut self, service: &Capability, deadline: Deadline, mut request: Request) -> Result<Reply, CallError> {
+    pub fn call(
+        &mut self,
+        service: &MailboxSender,
+        deadline: Deadline,
+        mut request: Request,
+    ) -> Result<Reply, CallError> {
         let setup = (|| {
             request.new_attempt()?;
             let description = service.description()?;

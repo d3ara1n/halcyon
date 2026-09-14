@@ -20,7 +20,7 @@ use librunnel::blocking;
 use rinlib::{
     env,
     ipc::{
-        message::{send_raw, wait_message},
+        message::{MailboxSender, wait_message},
         notification,
         object::close,
         wait::wait_many,
@@ -106,7 +106,7 @@ fn main() {
     // 流控验证：请求携带 [目标邮箱 sender(WRITE|WAIT)、确认 signaler、
     // 虚假唤醒 signaler]。内联 send/wait 循环：醒来后再撞满箱即为虚假
     // 唤醒（唤醒必须由腾位引起），置 spin 位供 init 校验。
-    let message = match wait_message(mailbox) {
+    let mut message = match wait_message(mailbox) {
         Ok(r) => r,
         Err(e) => {
             debug!("wake request wait failed: {:?}", e);
@@ -117,11 +117,15 @@ fn main() {
         debug!("unexpected wake request kind {}", message.header.kind);
         return;
     }
-    let target = message
-        .handles
-        .get(0)
-        .expect("pm target slot missing")
-        .as_handle();
+    let (target, _) = match MailboxSender::from_capability(
+        message.handles.take(0).expect("pm target slot missing"),
+    ) {
+        Ok(adopted) => adopted,
+        Err(failure) => {
+            debug!("pm: wake target is not a mailbox sender: {:?}", failure.error);
+            return;
+        }
+    };
     let done = message
         .handles
         .get(1)
@@ -134,22 +138,22 @@ fn main() {
         .as_handle();
 
     for _ in 0..MAILBOX_CAPACITY {
-        unsafe { send_raw(target, WRITABLE_WAKE_FILL, &[], &[]) }.expect("wake fill failed");
+        target.send(WRITABLE_WAKE_FILL, &[]).expect("wake fill failed");
     }
     assert!(matches!(
-        unsafe { send_raw(target, WRITABLE_WAKE_FILL, &[], &[]) },
+        target.send(WRITABLE_WAKE_FILL, &[]),
         Err(SystemCallError::MailboxFull)
     ));
     // 满箱错误是可观测失败；确认后置位通知，随后阻塞在 WRITABLE 上。
     notification::signal(done, 1).expect("wake confirm signal failed");
     let items = [WaitItem::new(
-        target,
+        target.as_handle(),
         ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
         0,
     )];
     let mut woke = false;
     loop {
-        match unsafe { send_raw(target, WRITABLE_WAKE_TAIL, &[], &[]) } {
+        match target.send(WRITABLE_WAKE_TAIL, &[]) {
             Ok(()) => break,
             Err(SystemCallError::MailboxFull) => {
                 if woke {

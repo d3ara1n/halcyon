@@ -160,7 +160,7 @@ impl<'a> GrantTable<'a> {
         state.value_mut().token = Some(token);
         self.sources.insert_prepared(source.with_key(token));
         self.grants.insert_prepared(state);
-        Ok(minted.sender)
+        Ok(minted.sender.into_capability())
     }
 
     /// context 来自内核 MessageHeader，客户端 payload 的数字不能进入此入口。

@@ -56,6 +56,29 @@ Runnel 新增 `Producer/Consumer::register` 与 `peer_attached` 直接访问 Gue
 
 完成门：正常、满箱、投递失败、接收写回失败、transit 回滚、对端退出与调用者退出均有真实 owner；现有消息路径使用最终 owner，旧路径删除；host/目标检查及相关 QEMU 组合通过。若选择改变 Delivery/Peek 的公开契约，必须先确认具体语义并同次迁移内核/shared/rinlib/所有消费者。
 
+#### 规模审计结论与设计裁决（2026-09-14，基线 `e583d5e`）
+
+内核/shared 侧已闭合，本闭包不触碰内核与 shared：Peek(0x42) 已实装且 `receive()` 两段式分配依赖它；Delivery 已是独立 KernelObject（kind=14，rights 仅 TRANSIT|GRANT，ReceiveResult.delivery 字段与 HandleQuery related_id 已落）；Send 满箱/期限/关闭失败零消费、moves/once 原子（selftest 断言准入不泄漏）；Receive 写回失败 rollback 恢复队头或锁外关闭 transit；Discard 丢队头并关闭全部 transit 与 Delivery；锁序 HANDLE_TABLE(100)→MAILBOX(210) 有秩栈断言。
+
+两项裁决：
+
+1. Delivery 独立身份保持现状——已是独立对象，rinlib 侧只欠持有/出口收束（Reply::accept 后无显式出口、detach_reply drop send-once owner）。
+2. Peek 保留并正式化为公开 API——删除后退化为按 PAYLOAD_MAX 上限分配或 BufferTooSmall 盲试（错误码不携带所需尺寸），均劣于现状；无副作用队头观察对非阻塞推进有真实价值。
+
+缺口全部在 rinlib 类型层与消费者：`Sender`/`SendOnce` 无类型身份，send-once 靠 raw Handle + 每次运行时 Query；`Packet` 用 `delivered: bool` tombstone 与 `Capability.handle=None` 双重表达消费；`publish`/`try_send`/`try_reply` 失败仅返回错误码，承载去向靠约定；`MintedSender`/`make_send_once` 工厂返回裸 Handle/泛化 Capability，未利用「内核构造已保证 role」这一事实；消息侧类型零 host 单测。消费者分布：librpc 全 typed（受 Packet 语义拖累）；pm 接收侧 typed、发侧 raw；init 创建侧全 raw（Invitation 以裸 HandleMove 发送，失败后承载无 owner 管理，`srv_init/main.rs:1007-1022`）；srv_fs v1 泵全 raw 且有失败后 close 丢弃 reply 的模式。验收/竞态代码（time_checks/race/public_ipc/test_hammer）的 raw `send_raw_until` 等是对 unsafe 边界与内核契约的刻意验证，保留为 raw，不列为迁移对象。
+
+实施要点（自底向上）：
+
+1. `MintedSender`/`make_send_once` 工厂直接产出 typed owner（内核构造已保证 role，不再 Query）；未知能力在唯一转换边界 Query 一次后进入 typed owner，重试路径不再重复 Query。
+2. `Packet` 改消费式投递：`try_send(self)` 成功返回回执并消费 Packet，失败返还完整 Packet；删除 delivered tombstone；push 时 Query 一次并缓存 role/rights，同 owner 重试不再 Query。
+3. 收束 Delivery 出口：`Reply`/`RequestContext` 提供显式 delivery 访问/移交；`detach_reply` 返还 send-once owner 而非 drop。
+4. 共同迁移：librpc exchange/caller/dispatcher（Packet 消费式 + typed 目标）、pm 发侧、init 创建侧消息面（Packet+typed Invitation 发送；Runnel 工厂内部仍 raw，属流闭包）、srv_fs v1 泵消息面（保留泵结构，只换 owner；泵整体删除在 FAL 段）。
+5. 补消息侧 host 单测：push/pop 失败返还、try_send 失败返还、HandleSet take 边界、tombstone 消除后的类型状态断言。
+
+#### 实施记录（2026-09-14）
+
+已按上述要点完成：`MailboxSender`/`SendOnce` typed owner（铸造零 Query、转换边界单次 Query、`close`/`into_capability`/`into_raw` 完整出口）；`Packet` 消费式 `try_send(self)`/`try_reply(self, once)` 与 `SendFailure`/`ReplyFailure` 完整返还，delivered tombstone 删除；`MintedSender.sender`、`send_once` 返回 typed；`RequestContext.reply` 改 typed SendOnce（decode 校验后摘取），`detach_reply` 返还 owner，`PreparedResponse::try_send` take/restore。真实调用者迁移：librpc exchange/caller/dispatcher、pm 流控发侧、init 生产侧 Invitation 转移（失败路径不再丢裸 HandleMove 承载）、srv_fs v1 泵全消息面（含失败分支显式关 owner）。删除的旧路径：Packet tombstone、try_send/try_reply 每次重试 Query destination、srv_fs 失败后 close 丢弃 reply、init 失败后 HandleMove 丢失。验收/竞态夹具（time_checks/race/public_ipc/test_hammer）保留 unsafe raw 直验内核契约，属计划内 raw 边界用途。验证：rinlib host 7 项（新增 Packet/HandleSet 4 项）、用户态四框架 host 68 项、七面 clippy、virt core 与 virt-release 全绿；内核与 shared 未改动。
+
 ### 流运输与 Runnel 角色
 
 前置：消息运输闭包完成——Runnel attach 消费消息侧收束的 typed Invitation owner，接缝不引入 adapter。[局部终态修复](#可以先行的局部收口) 是唯一例外，独立于闭包顺序可先行。

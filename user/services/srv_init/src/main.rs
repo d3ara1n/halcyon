@@ -30,7 +30,11 @@ use librpc::{
 };
 use librunnel::blocking;
 use rinlib::ipc::tunnel as tunnel_sys;
-use rinlib::ipc::{capability::Capability, packet::Packet};
+use rinlib::ipc::{
+    capability::Capability,
+    message::{MailboxSender, SendOnce},
+    packet::Packet,
+};
 use rinlib::memory_pool::MemoryPool;
 #[cfg(feature = "acceptance-stress")]
 use rinlib::shared::proc::ProcessDrainStatus;
@@ -854,10 +858,14 @@ fn test_rpc_reject_cleanup() {
                 let prefix =
                     RpcPrefix::decode(&request.payload).expect("RPC test request prefix invalid");
                 assert_eq!(prefix.kind, RpcMessageKind::Request);
-                let mut reply_once = request
-                    .handles
-                    .take(0)
-                    .expect("RPC test reply slot missing");
+                let (reply_once, _) = SendOnce::from_capability(
+                    request
+                        .handles
+                        .take(0)
+                        .expect("RPC test reply slot missing"),
+                )
+                .map_err(|failure| failure.error)
+                .expect("RPC test reply slot is not a send-once");
                 let mut response = [0u8; librpc::PREFIX_LEN + 1];
                 RpcPrefix::new(RpcMessageKind::Response, prefix.txid).encode(&mut response);
                 response[librpc::PREFIX_LEN] = attempt;
@@ -872,7 +880,7 @@ fn test_rpc_reject_cleanup() {
                         .expect("RPC response capability preparation failed");
                 }
                 packet
-                    .try_reply(&mut reply_once, rinlib::time::Deadline::INFINITE)
+                    .try_reply(reply_once, rinlib::time::Deadline::INFINITE)
                     .expect("RPC response publication failed");
             }
             unsafe { close(service.owner) }.expect("RPC test service owner close failed");
@@ -880,7 +888,9 @@ fn test_rpc_reject_cleanup() {
         .expect("RPC test worker spawn failed");
 
     // SAFETY: 此 sender 由原始队列工厂创建，本测试在此唯一接管关闭责任。
-    let service_sender = unsafe { Capability::from_raw(service.peer) };
+    let (service_sender, _) = MailboxSender::from_capability(unsafe { Capability::from_raw(service.peer) })
+        .map_err(|failure| failure.error)
+        .expect("RPC test service sender adoption failed");
     let mut caller = Caller::new();
     assert!(matches!(
         caller.call(
@@ -1013,14 +1023,37 @@ fn run(services: Handle) -> Result<(), &'static str> {
             }
         };
     debug!("tunnel created");
-    let invitation_move = [HandleMove {
-        handle: invitation,
-        rights: Rights::MAP,
-    }];
-    if let Err(e) = unsafe { send_raw(pm_mailbox, 514, &[], &invitation_move) } {
-        debug!("send tunnel invitation failed: {:?}", e);
+    // 生产侧以 typed Packet 转移 Invitation：失败完整返还 owner，
+    // 不再以裸 HandleMove 表达（原失败路径承载直接丢失）。
+    let (pm_sender, _) = MailboxSender::from_capability(
+        // SAFETY: pm_mailbox 是原始队列工厂的 sender peer，此处唯一接管关闭责任；
+        // 发送后转回原始形态供后续验收面复用。
+        unsafe { Capability::from_raw(pm_mailbox) },
+    )
+    .map_err(|failure| {
+        let _ = failure.owner.close();
+        "pm mailbox sender adoption failed"
+    })?;
+    let mut packet = Packet::new(514, &[])
+        .map_err(|_| "tunnel invitation packet allocation failed")?;
+    if let Err(failure) = packet.push(
+        // SAFETY: invitation 是 create_consumer 尚未发布的邀请输出，此处唯一接管。
+        unsafe { Capability::from_raw(invitation) },
+        Rights::MAP,
+    ) {
+        let _ = failure.capability.close();
+        return Err("tunnel invitation push failed");
+    }
+    if let Err(mut failure) = packet.try_send(&pm_sender, rinlib::time::Deadline::INFINITE) {
+        let (invitation, _) = failure
+            .packet
+            .pop()
+            .expect("tunnel invitation transfer disappeared");
+        let _ = invitation.close();
+        debug!("send tunnel invitation failed: {:?}", failure.error);
         return Err("send tunnel invitation failed");
     }
+    let pm_mailbox = pm_sender.into_capability().into_raw();
 
     let mut buf = rinlib::alloc::vec![0u8; STREAM_LEN + 1];
     let n = tunnel.read_exact_or_eof(&mut buf).map_err(|error| {
