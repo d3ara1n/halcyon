@@ -18,11 +18,15 @@
 - **AddressSpace 是内存所有权 seam**：进程先有稳定 Unbound 身份，Building 期以一次性 ProcessBindMemory 附入 PoolBinding 与页表后转为 Bound；区域账本是映射真值，匿名 mapping 自有 affine extents，共享字节使用固定长度、容量有界的 MemoryObject；所有变更走 validate/reserve/commit/publish/synchronize/retire，跨 hart 完成以 epoch + Remote Call 确认闭合（`notes/ideas/mm.md`）。
 - **资源能力与 Job 正交**：Job 只做创建、成员与收束；MemoryPool 只支付 page-backed storage，KernelMemoryBudget 支付内核 metadata，CPU 由预约对象支付，设备由各自 capability 授权。ProcessCreate 只建 Building 空壳，资源经独立操作附入；capability 跨 Job 转移不改资源来源（`notes/ideas/{task,mm,object}.md`）。
 
+## 当前服务进程的定位
+
+当前 `srv_init`、`srv_fs`、`srv_pm` 等服务进程全部是内核与框架/标准库的验收夹具，不是正式系统工作成员。装配、消息数量、阶段顺序和固定容量可按测试需要实现；只有影响验收有效性、框架契约或资源收束证据时才要求修改，不为夹具建设生产级服务架构。待操作系统核心及框架/标准库较成熟、开始正式服务层建设后，再按各服务职责逐步替换这些进程；沿用进程名称不代表已完成正式化。
+
 ## 活跃计划
 
 公共时间与公共对象已完成原交付；时间提交 `c6e0a84`，实现见 `notes/impls/{time,ipc}.md`。分支级设计审视另识别了公共操作与回收边界收束需求，不把原交付通过视为现有结构必须保留；本轮只更新设计与计划，没有实施重构或新增验收通过声明。
 
-**当前任务**：[运输与服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md) 的消息运输（`3060dd8`）与流运输（`a2aabed`）已提交；通用执行与准入由 HighHolly 接手重构，已完成实现、最终完整验收和集中复核，提交为 `a3891b0`。Runtime 公平维护、输入 FIFO、预付重试与完整观察回执，Process/Job 原机器恢复，以及 init RootSupervisor 的长期接管和组合等待已经接通；实现见 `notes/impls/runtime.md`，修复与复核证据见已归档的 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)：R1–R16、C1–C7 全部关闭，最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，源码哈希一致。下一机制为 RPC/Outbox，尚未开工。内核/shared ABI 未改，shared/timer_queue 仅补预付载荷绑定接口。RPC/Outbox 与 FAL 仍未实施。公共对象/时间的历史验收和 [墙钟敏感现场归档](archived/ref-2026-09-acceptance-timing-flake.md) 保留，不替代当前快照的验证。
+**当前任务**：[运输与服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md) 的消息运输（`3060dd8`）与流运输（`a2aabed`）已提交；通用执行与准入由 HighHolly 接手重构，已完成实现、最终完整验收和集中复核，提交为 `a3891b0`。Runtime 公平维护、输入 FIFO、预付重试与完整观察回执，Process/Job 原机器恢复，以及 init RootSupervisor 的长期接管和组合等待已经接通；实现见 `notes/impls/runtime.md`，修复与复核证据见已归档的 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)：记录当时 R1–R16、C1–C7 的关闭结论，最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，源码哈希一致。提交后用户要求结构收口审视，证据与建议边界统一记录于 [固定提交 Review 的结构审视节](todo-2026-09-15-runtime-admission-review.md)：已按用户收窄范围完成 Runtime 核心清理、Job 有界分页、必要适配与 Active 停止补证，工作树未提交。最终 `artifacts/acceptance-cleanup-paging-20260915-131912.log` exit 0，7 个源码哈希一致，两份集中复核无 finding；原 PM 停止证据缺口关闭。服务仍按验收夹具处理，不实施服务架构化。下一机制 RPC/Outbox 未开工。内核/shared ABI 未改，shared/timer_queue 仅补预付载荷绑定接口。RPC/Outbox 与 FAL 仍未实施。公共对象/时间的历史验收和 [墙钟敏感现场归档](archived/ref-2026-09-acceptance-timing-flake.md) 保留，不替代当前快照的验证。
 
 后续串行位置：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成 → [内核等待/请求/退休结构收束](todo-2026-09-14-public-operation-ownership.md) → [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)。共享包整理是独立的小型 workspace 迁移，不阻塞当前执行前置整体开工；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。每个机制包含真实消费者迁移、失败/退出和旧路径删除，组合验收是完成门。
 
@@ -42,7 +46,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
 | [`todo-2026-09-14-stream-transport-review.md`](todo-2026-09-14-stream-transport-review.md) | 未来 Review：固定复核 `a2aabed` 的观察草稿面删除、raw 工厂删除、srv_init typed 创建迁移与终态访问边界，不预审通用执行闭包的观察接入形态 |
-| [`todo-2026-09-15-runtime-admission-review.md`](todo-2026-09-15-runtime-admission-review.md) | 未来 Review：固定复核 `a3891b0` 的通用执行/准入、观察与原机器恢复、持久根监督及真实消费者闭包 |
+| [`todo-2026-09-15-runtime-admission-review.md`](todo-2026-09-15-runtime-admission-review.md) | 固定 `a3891b0` 审视及清理记录：Runtime/Job 分页/Active 停止补证已完成未提交，最终验收与集中复核通过 |
 | [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 四闭包：消息运输与流运输/Runnel 均已完成待 Review → 通用执行/准入（`a3891b0` 已提交）→ RPC/Outbox（待实施）；typed owner 已收口，事件驱动登记/观察/取消并入通用执行闭包 |
 | [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |

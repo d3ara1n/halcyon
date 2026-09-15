@@ -449,18 +449,74 @@ enum JobPhase {
     Done,
 }
 
+/// 每层只保留一个ABI页；页内处理位置与下一次枚举游标分别推进。
+#[derive(Debug)]
+struct JobPage {
+    ids: Vec<u64>,
+    actual: usize,
+    position: usize,
+    next_cursor: u64,
+    more: bool,
+    stalls: u32,
+}
+
+impl JobPage {
+    fn new() -> Result<Self, SystemCallError> {
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(JOB_ENUMERATE_MAX)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        ids.resize(JOB_ENUMERATE_MAX, 0);
+        Ok(Self {
+            ids,
+            actual: 0,
+            position: 0,
+            next_cursor: 0,
+            more: false,
+            stalls: 0,
+        })
+    }
+
+    fn accept(
+        &mut self,
+        result: erhino_shared::proc::JobEnumerateResult,
+    ) -> Result<(), SystemCallError> {
+        let Some(ids) = self.ids.get(..result.actual as usize) else {
+            return Err(SystemCallError::InternalError);
+        };
+        // JobEnumerate返回单调ID，零进展不得跳过未决占位。
+        if result.more > 1
+            || ids.first().is_some_and(|id| *id <= self.next_cursor)
+            || ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || result.next_cursor != ids.last().copied().unwrap_or(self.next_cursor)
+        {
+            return Err(SystemCallError::InternalError);
+        }
+        self.actual = ids.len();
+        self.position = 0;
+        self.next_cursor = result.next_cursor;
+        self.more = result.more != 0;
+        self.stalls = if self.actual == 0 && self.more {
+            self.stalls.saturating_add(1)
+        } else {
+            0
+        };
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.actual = 0;
+        self.position = 0;
+        self.next_cursor = 0;
+        self.more = false;
+        self.stalls = 0;
+    }
+}
+
 #[derive(Debug)]
 struct JobFrame<O: ProcessOperations> {
     job: Handle,
     phase: JobPhase,
-    members: Vec<u64>,
-    member_cursor: usize,
-    member_enum_cursor: u64,
-    member_stalls: u32,
-    children: Vec<u64>,
-    child_cursor: usize,
-    child_enum_cursor: u64,
-    child_stalls: u32,
+    page: JobPage,
     current: Option<SupervisionTarget>,
     process: Option<Collector<O>>,
     child_job: Option<Handle>,
@@ -560,25 +616,10 @@ impl JobCollector<RealJobOperations> {
 
 impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
     fn new_frame(job: Handle) -> Result<JobFrame<O>, SystemCallError> {
-        let mut members = Vec::new();
-        members
-            .try_reserve_exact(JOB_ENUMERATE_MAX)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
-        let mut children = Vec::new();
-        children
-            .try_reserve_exact(JOB_ENUMERATE_MAX)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
         Ok(JobFrame {
             job,
             phase: JobPhase::Seal,
-            members,
-            member_cursor: 0,
-            member_enum_cursor: 0,
-            member_stalls: 0,
-            children,
-            child_cursor: 0,
-            child_enum_cursor: 0,
-            child_stalls: 0,
+            page: JobPage::new()?,
             current: None,
             process: None,
             child_job: None,
@@ -686,91 +727,55 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
             }
             JobPhase::Members | JobPhase::Children => {
                 let children = self.frames[i].phase == JobPhase::Children;
-                let (kind, cursor) = if children {
-                    (JobMemberKind::ChildJobs, self.frames[i].child_enum_cursor)
+                let kind = if children {
+                    JobMemberKind::ChildJobs
                 } else {
-                    (
-                        JobMemberKind::MemberProcesses,
-                        self.frames[i].member_enum_cursor,
+                    JobMemberKind::MemberProcesses
+                };
+                let stage = if children {
+                    JobKillStage::EnumerateChildren
+                } else {
+                    JobKillStage::EnumerateMembers
+                };
+                // 只有当前页已处理完才会回到枚举阶段；失败写回不损坏未兑现条目。
+                let result = {
+                    let frame = &mut self.frames[i];
+                    self.ops.enumerate_job(
+                        frame.job,
+                        kind,
+                        frame.page.next_cursor,
+                        &mut frame.page.ids,
                     )
-                };
-                let mut page = [0u64; JOB_ENUMERATE_MAX];
-                let result = self
-                    .ops
-                    .enumerate_job(self.frames[i].job, kind, cursor, &mut page)
-                    .map_err(|e| {
-                        self.fail(
-                            if children {
-                                JobKillStage::EnumerateChildren
-                            } else {
-                                JobKillStage::EnumerateMembers
-                            },
-                            JobKillCause::System(e),
-                        )
-                    })?;
-                let actual = result.actual as usize;
-                let stalls = if children {
-                    &mut self.frames[i].child_stalls
-                } else {
-                    &mut self.frames[i].member_stalls
-                };
-                if actual == 0 && result.more != 0 {
-                    *stalls = stalls.saturating_add(1);
-                    if *stalls >= self.policy.enumerate_stalls {
-                        return Err(self.fail(
-                            if children {
-                                JobKillStage::EnumerateChildren
-                            } else {
-                                JobKillStage::EnumerateMembers
-                            },
-                            JobKillCause::Timeout,
-                        ));
-                    }
-                } else {
-                    *stalls = 0;
-                    let reserve_failed = {
-                        let target = if children {
-                            &mut self.frames[i].children
-                        } else {
-                            &mut self.frames[i].members
-                        };
-                        if target.try_reserve_exact(actual).is_err() {
-                            true
-                        } else {
-                            target.extend_from_slice(&page[..actual]);
-                            false
-                        }
-                    };
-                    if reserve_failed {
-                        return Err(self.fail(
-                            if children {
-                                JobKillStage::EnumerateChildren
-                            } else {
-                                JobKillStage::EnumerateMembers
-                            },
-                            JobKillCause::System(SystemCallError::OutOfMemory),
-                        ));
-                    }
                 }
-                if result.more == 0 {
+                .map_err(|error| self.fail(stage, JobKillCause::System(error)))?;
+                self.frames[i]
+                    .page
+                    .accept(result)
+                    .map_err(|error| self.fail(stage, JobKillCause::System(error)))?;
+                if self.frames[i].page.actual == 0 && self.frames[i].page.more {
+                    if self.frames[i].page.stalls >= self.policy.enumerate_stalls {
+                        return Err(self.fail(stage, JobKillCause::Timeout));
+                    }
+                } else {
                     self.frames[i].phase = if children {
                         JobPhase::DeriveChild
                     } else {
                         JobPhase::DeriveMember
                     };
-                } else if children {
-                    self.frames[i].child_enum_cursor = result.next_cursor;
-                } else {
-                    self.frames[i].member_enum_cursor = result.next_cursor;
                 }
                 Ok(JobCollectorEvent::Progress)
             }
             JobPhase::DeriveMember => {
-                if self.frames[i].member_cursor == self.frames[i].members.len() {
-                    self.frames[i].phase = JobPhase::Children;
+                if self.frames[i].page.position == self.frames[i].page.actual {
+                    if self.frames[i].page.more {
+                        self.frames[i].phase = JobPhase::Members;
+                    } else {
+                        self.frames[i].page.reset();
+                        self.frames[i].phase = JobPhase::Children;
+                    }
                     return Ok(JobCollectorEvent::Progress);
                 }
-                let pid = self.frames[i].members[self.frames[i].member_cursor];
+                let pid = self.frames[i].page.ids[self.frames[i].page.position];
                 match self.ops.derive_job(
                     self.frames[i].job,
                     JobMemberKind::MemberProcesses,
@@ -781,7 +786,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                         self.frames[i].current = Some(SupervisionTarget::new(pid, control));
                         self.frames[i].phase = JobPhase::KillMember;
                     }
-                    Err(SystemCallError::ObjectNotFound) => self.frames[i].member_cursor += 1,
+                    Err(SystemCallError::ObjectNotFound) => self.frames[i].page.position += 1,
                     Err(error) => {
                         return Err(
                             self.fail(JobKillStage::DeriveMember, JobKillCause::System(error))
@@ -843,7 +848,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                             .progress
                             .process_work
                             .saturating_add(collected.progress.work_done);
-                        self.frames[i].member_cursor += 1;
+                        self.frames[i].page.position += 1;
                         self.frames[i].phase = JobPhase::DeriveMember;
                         Ok(JobCollectorEvent::Progress)
                     }
@@ -857,11 +862,15 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                 }
             }
             JobPhase::DeriveChild => {
-                if self.frames[i].child_cursor == self.frames[i].children.len() {
-                    self.frames[i].phase = JobPhase::WaitClosed;
+                if self.frames[i].page.position == self.frames[i].page.actual {
+                    self.frames[i].phase = if self.frames[i].page.more {
+                        JobPhase::Children
+                    } else {
+                        JobPhase::WaitClosed
+                    };
                     return Ok(JobCollectorEvent::Progress);
                 }
-                let jid = self.frames[i].children[self.frames[i].child_cursor];
+                let jid = self.frames[i].page.ids[self.frames[i].page.position];
                 self.frames.try_reserve_exact(1).map_err(|_| {
                     self.fail(
                         JobKillStage::DeriveChild,
@@ -883,7 +892,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                         prepared.job = child;
                         self.frames.push(prepared);
                     }
-                    Err(SystemCallError::ObjectNotFound) => self.frames[i].child_cursor += 1,
+                    Err(SystemCallError::ObjectNotFound) => self.frames[i].page.position += 1,
                     Err(error) => {
                         return Err(
                             self.fail(JobKillStage::DeriveChild, JobKillCause::System(error))
@@ -894,12 +903,12 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
             }
             JobPhase::CloseChild => {
                 let child_job = self.frames[i].child_job.expect("child job missing");
-                // SAFETY: child_job was derived by this frame and is closed only after success.
+                // child_job 由本层派生，只有关闭成功后才兑现其所有权。
                 self.ops
                     .close(child_job)
                     .map_err(|e| self.fail(JobKillStage::CloseChild, JobKillCause::System(e)))?;
                 self.frames[i].child_job = None;
-                self.frames[i].child_cursor += 1;
+                self.frames[i].page.position += 1;
                 self.progress.children_collected =
                     self.progress.children_collected.saturating_add(1);
                 self.frames[i].phase = JobPhase::DeriveChild;
@@ -971,6 +980,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
             .last_mut()
             .expect("job collector owns a root frame");
         frame.observation.renew();
+        frame.page.stalls = 0;
         if let Some(process) = &mut frame.process {
             process.replenish(policy);
         }
@@ -1233,7 +1243,7 @@ mod tests {
             {
                 output[0] = if job.raw() == 1 { 42 } else { 43 };
                 Ok(erhino_shared::proc::JobEnumerateResult {
-                    next_cursor: 42,
+                    next_cursor: output[0],
                     actual: 1,
                     more: 0,
                 })

@@ -52,22 +52,11 @@ impl SourcePlan {
     pub fn new(handle: Handle, signals: ObjectSignals) -> Self {
         Self { handle, signals }
     }
-    fn register(
-        self,
-        registrar: &dyn SourceRegistrar,
-        cookie: u64,
-    ) -> Result<u64, SystemCallError> {
-        registrar.register_item(WaitItem::new(self.handle, self.signals, cookie))
-    }
-}
-
-/// 安全登记能力：只取得观察授权，不授予数据访问或关闭权。
-pub trait SourceRegistrar {
-    fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError>;
 }
 
 /// 运行体依赖的观察与时间环境；真实实现是内核 WaitSet，host 测试用替身。
-pub trait SourceOps: SourceRegistrar {
+pub trait SourceOps {
+    fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError>;
     fn rearm(&self, token: u64) -> Result<u64, SystemCallError>;
     fn remove_source(&self, token: u64) -> Result<(), SystemCallError>;
     fn receive_into(&self, records: &mut [ReadyRecord]) -> Result<usize, SystemCallError>;
@@ -141,25 +130,17 @@ enum RequestOperation<T> {
     Source(SourceRequest),
 }
 
-struct PendingGate<T, K: Taxonomy> {
+struct PendingGate {
     task: u64,
-    requests: Requests<T>,
-    request_charge: Charge<K>,
     step: Step,
     has_pending: bool,
     refused: bool,
     rejection: Option<SystemCallError>,
 }
 
-pub enum SourceRequest {
-    /// 登记任务自有 handle 的观察；cookie 由运行体注入任务身份。
-    Add {
-        handle: Handle,
-        signals: ObjectSignals,
-        kind: SourceKind,
-    },
-    /// 采用领域角色产出的等待计划（Runnel 等；承载 handle 不出域）。
-    Arm { plan: SourcePlan, kind: SourceKind },
+enum SourceRequest {
+    /// 登记意图统一为值计划，cookie 由运行体注入任务身份。
+    Register { plan: SourcePlan, kind: SourceKind },
     /// 重新武装一个仍需观察的来源；不声明即保持解除。
     Rearm { source: SourceId },
     /// 撤销登记并释放其输入额度。
@@ -167,7 +148,7 @@ pub enum SourceRequest {
 }
 
 impl<T> Requests<T> {
-    pub fn new() -> Result<Self, SystemCallError> {
+    fn new() -> Result<Self, SystemCallError> {
         let mut operations = Vec::new();
         operations
             .try_reserve_exact(REQUEST_CAPACITY)
@@ -191,16 +172,8 @@ impl<T> Requests<T> {
         signals: ObjectSignals,
         kind: SourceKind,
     ) -> Result<(), SystemCallError> {
-        if self.operations.len() == REQUEST_CAPACITY {
-            return Err(SystemCallError::ReachLimit);
-        }
-        self.operations
-            .push(RequestOperation::Source(SourceRequest::Add {
-                handle,
-                signals,
-                kind,
-            }));
-        Ok(())
+        self.arm_source(SourcePlan::new(handle, signals), kind)
+            .map_err(|_| SystemCallError::ReachLimit)
     }
 
     pub fn arm_source(&mut self, plan: SourcePlan, kind: SourceKind) -> Result<(), SourcePlan> {
@@ -208,7 +181,10 @@ impl<T> Requests<T> {
             return Err(plan);
         }
         self.operations
-            .push(RequestOperation::Source(SourceRequest::Arm { plan, kind }));
+            .push(RequestOperation::Source(SourceRequest::Register {
+                plan,
+                kind,
+            }));
         Ok(())
     }
 
@@ -311,45 +287,42 @@ pub struct Runtime<T, S: SourceOps, K: Taxonomy = CoreResource> {
     retire_timers: TimerQueue<u64>,
     clock_now: u64,
     source_ready: bool,
-    pending_gate: Option<PendingGate<T, K>>,
+    pending_gate: Option<PendingGate>,
+    requests: Requests<T>,
     slots: ExecutionSlots,
     _input_charge: Charge<K>,
 }
 
 impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
-    /// 计算本运行体实际准入的最大输入额度，供受信任装配者建立账户。
-    pub fn input_budget(source_limit: usize) -> Result<usize, SystemCallError> {
-        let fixed = RECEIVE_MAX
+    /// 接收、scratch 与唯一请求缓冲的预付存储。
+    fn fixed_input_bytes(source_limit: usize) -> Result<usize, SystemCallError> {
+        RECEIVE_MAX
             .checked_mul(core::mem::size_of::<ReadyRecord>())
             .and_then(|bytes| {
                 source_limit
                     .checked_mul(core::mem::size_of::<SourceEvent>())
                     .and_then(|scratch| bytes.checked_add(scratch))
-            });
-        fixed
+            })
             .and_then(|bytes| {
                 REQUEST_CAPACITY
                     .checked_mul(core::mem::size_of::<RequestOperation<T>>())
                     .and_then(|gate| bytes.checked_add(gate))
             })
-            .and_then(|bytes| {
+            .ok_or(SystemCallError::ReachLimit)
+    }
+
+    /// 计算固定存储与全部可准入来源的输入额度，供装配者建立账户。
+    pub fn input_budget(source_limit: usize) -> Result<usize, SystemCallError> {
+        Self::fixed_input_bytes(source_limit)?
+            .checked_add(
                 source_limit
                     .checked_mul(
                         core::mem::size_of::<SourceEntry<K>>()
                             + core::mem::size_of::<ReadyRecord>(),
                     )
-                    .and_then(|sources| bytes.checked_add(sources))
-            })
+                    .ok_or(SystemCallError::ReachLimit)?,
+            )
             .ok_or(SystemCallError::ReachLimit)
-    }
-
-    fn new_requests(&self) -> Result<(Requests<T>, Charge<K>), SystemCallError> {
-        let bytes = core::mem::size_of::<RequestOperation<T>>()
-            .checked_mul(REQUEST_CAPACITY)
-            .ok_or(SystemCallError::OutOfMemory)?;
-        let charge = self.account.acquire_at(self.slots.input_bytes, bytes)?;
-        let requests = Requests::new()?;
-        Ok((requests, charge))
     }
 
     pub fn new(
@@ -362,16 +335,9 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
         if task_limit == 0 || source_limit == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let input_charge = account.acquire_at(
-            slots.input_bytes,
-            (RECEIVE_MAX * core::mem::size_of::<ReadyRecord>())
-                .checked_add(
-                    source_limit
-                        .checked_mul(core::mem::size_of::<SourceEvent>())
-                        .ok_or(SystemCallError::ReachLimit)?,
-                )
-                .ok_or(SystemCallError::ReachLimit)?,
-        )?;
+        let input_charge =
+            account.acquire_at(slots.input_bytes, Self::fixed_input_bytes(source_limit)?)?;
+        let requests = Requests::new()?;
         let mut records = Vec::new();
         records
             .try_reserve_exact(RECEIVE_MAX)
@@ -406,6 +372,7 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
             clock_now: 0,
             source_ready: false,
             pending_gate: None,
+            requests,
             slots,
             _input_charge: input_charge,
         })
@@ -898,15 +865,6 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
         let Some(id) = self.queue.pop_ready() else {
             return Ok(None);
         };
-        let (mut requests, request_charge) = match self.new_requests() {
-            Ok(requests) => requests,
-            Err(error) => {
-                self.queue
-                    .schedule(id)
-                    .expect("task must remain owned after request ledger failure");
-                return Err(TaskFailure { task: id, error });
-            }
-        };
         self.queue.mature_deadline(id, now);
         // 输入FIFO只弹出本次预算允许的记录，不遍历任务的全部登记。
         self.scratch.clear();
@@ -930,11 +888,8 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
             now_ns: now,
         };
         let result = {
-            let Some(task) = self.queue.slot(id).and_then(|slot| slot.task.as_mut()) else {
-                self.queue.schedule(id).expect("advance task disappeared");
-                return Ok(None);
-            };
-            task.advance(id, world, &mut requests, &mut input, budget)
+            let task = &mut self.queue.slot(id).expect("ready task remains owned").task;
+            task.advance(id, world, &mut self.requests, &mut input, budget)
         };
         let consumed = input.cursor;
         let timed_out = input.timed_out;
@@ -961,15 +916,13 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                 let error = result.err().unwrap_or(SystemCallError::InternalError);
                 // 即使进入失败 Gate/Hold，也保留任务当前的业务期限。
                 let _ = self.queue.update_deadline(id, deadline);
-                if requests.operations.is_empty() {
+                if self.requests.operations.is_empty() {
                     self.queue
                         .schedule(id)
                         .expect("failed task must remain owned");
                 } else {
                     self.pending_gate = Some(PendingGate {
                         task: id,
-                        requests,
-                        request_charge,
                         step: Step::Runnable,
                         has_pending,
                         refused: false,
@@ -980,11 +933,9 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
             }
         };
         advance.work_done = advance.work_done.max(1);
-        if !requests.operations.is_empty() {
+        if !self.requests.operations.is_empty() {
             self.pending_gate = Some(PendingGate {
                 task: id,
-                requests,
-                request_charge,
                 step: advance.step,
                 has_pending,
                 refused: false,
@@ -1073,9 +1024,7 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                     return;
                 }
                 let (kind, notify) = match request {
-                    SourceRequest::Add { kind, .. } | SourceRequest::Arm { kind, .. } => {
-                        (kind, true)
-                    }
+                    SourceRequest::Register { kind, .. } => (kind, true),
                     SourceRequest::Rearm { source } => (
                         self.sources
                             .get(source.token())
@@ -1114,7 +1063,7 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
         self.clock_now = now;
         let mut gate = self.pending_gate.take().expect("gate remains owned");
         self.queue.mature_deadline(gate.task, now);
-        if let Some(operation) = gate.requests.pop_front() {
+        if let Some(operation) = self.requests.pop_front() {
             if let Some(error) = gate.rejection {
                 self.reject_operation(gate.task, world, operation, error);
                 gate.refused = true;
@@ -1123,7 +1072,7 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                 gate.refused = true;
             }
         }
-        if !gate.requests.operations.is_empty() {
+        if !self.requests.operations.is_empty() {
             self.pending_gate = Some(gate);
             return Ok(Some(Advance {
                 work_done: 1,
@@ -1147,7 +1096,6 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                 task: gate.task,
                 error,
             })?;
-        drop(gate.request_charge);
         Ok(Some(Advance { work_done: 1, step }))
     }
 
@@ -1196,7 +1144,7 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                             let _ = self.drop_source(world, source.token());
                             false
                         }
-                        SourceRequest::Add { kind, .. } | SourceRequest::Arm { kind, .. } => {
+                        SourceRequest::Register { kind, .. } => {
                             self.queue
                                 .get_task_mut(task)
                                 .expect("requesting task disappeared before Complete refusal")
@@ -1229,25 +1177,8 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                     };
                 }
                 match request {
-                    SourceRequest::Add {
-                        handle,
-                        signals,
-                        kind,
-                    } => {
-                        if !self.queue.accepts_sources(task) {
-                            self.queue
-                                .get_task_mut(task)
-                                .expect("source task disappeared before stop refusal")
-                                .refused(
-                                    world,
-                                    RequestFailure::Source {
-                                        kind,
-                                        error: SystemCallError::ObjectClosed,
-                                    },
-                                );
-                            return true;
-                        }
-                        match self.add_source(task, handle, signals, kind) {
+                    SourceRequest::Register { plan, kind } => {
+                        match self.add_source(task, plan, kind) {
                             Ok(source) => {
                                 self.queue
                                     .get_task_mut(task)
@@ -1258,53 +1189,7 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                             Err(error) => {
                                 self.queue
                                     .get_task_mut(task)
-                                    .expect("source task disappeared before Gate refusal")
-                                    .refused(world, RequestFailure::Source { kind, error });
-                                true
-                            }
-                        }
-                    }
-                    SourceRequest::Arm { plan, kind } => {
-                        if !self.queue.accepts_sources(task) {
-                            self.queue
-                                .get_task_mut(task)
-                                .expect("source task disappeared before stop refusal")
-                                .refused(
-                                    world,
-                                    RequestFailure::Source {
-                                        kind,
-                                        error: SystemCallError::ObjectClosed,
-                                    },
-                                );
-                            return true;
-                        }
-                        let prepared = match self.prepare_source(task, kind, 1) {
-                            Ok(prepared) => prepared,
-                            Err(error) => {
-                                self.queue
-                                    .get_task_mut(task)
-                                    .expect("source task disappeared before Gate refusal")
-                                    .refused(world, RequestFailure::Source { kind, error });
-                                return true;
-                            }
-                        };
-                        let set = self.set.as_ref().expect("runtime set already closed");
-                        match plan.register(set, task) {
-                            Ok(token) => {
-                                let source = self
-                                    .adopt_entry(task, token, prepared)
-                                    .expect("prepared source entry must commit");
-                                self.queue
-                                    .get_task_mut(task)
-                                    .expect("registered task must exist")
-                                    .registered(world, kind, source);
-                                false
-                            }
-                            Err(error) => {
-                                self.cancel_prepared_source(prepared);
-                                self.queue
-                                    .get_task_mut(task)
-                                    .expect("source task disappeared before Gate refusal")
+                                    .expect("source task remains owned")
                                     .refused(world, RequestFailure::Source { kind, error });
                                 true
                             }
@@ -1395,16 +1280,18 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
     fn add_source(
         &mut self,
         task: u64,
-        handle: Handle,
-        signals: ObjectSignals,
+        plan: SourcePlan,
         kind: SourceKind,
     ) -> Result<SourceId, SystemCallError> {
+        if !self.queue.accepts_sources(task) {
+            return Err(SystemCallError::ObjectClosed);
+        }
         let prepared = self.prepare_source(task, kind, 1)?;
         match self
             .set
             .as_ref()
             .expect("runtime set already closed")
-            .register_item(WaitItem::new(handle, signals, task))
+            .register_item(WaitItem::new(plan.handle, plan.signals, task))
         {
             Ok(token) => self.adopt_entry(task, token, prepared),
             Err(error) => {
@@ -1506,14 +1393,10 @@ impl<T, K: Taxonomy> Runtime<T, rinlib::ipc::wait_set::WaitSet, K> {
 }
 
 #[cfg(target_arch = "riscv64")]
-impl SourceRegistrar for rinlib::ipc::wait_set::WaitSet {
+impl SourceOps for rinlib::ipc::wait_set::WaitSet {
     fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError> {
         rinlib::ipc::wait_set::WaitSet::register(self, item)
     }
-}
-
-#[cfg(target_arch = "riscv64")]
-impl SourceOps for rinlib::ipc::wait_set::WaitSet {
     fn rearm(&self, token: u64) -> Result<u64, SystemCallError> {
         rinlib::ipc::wait_set::WaitSet::rearm(self, token)
     }
@@ -1641,7 +1524,7 @@ mod tests {
         })
     }
 
-    impl SourceRegistrar for FakeSet {
+    impl SourceOps for FakeSet {
         fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError> {
             let mut inner = self.shared.inner.borrow_mut();
             let token = inner.next_token;
@@ -1654,9 +1537,6 @@ mod tests {
                 .push((item.handle, item.signals, item.cookie));
             Ok(token)
         }
-    }
-
-    impl SourceOps for FakeSet {
         fn rearm(&self, token: u64) -> Result<u64, SystemCallError> {
             let mut inner = self.shared.inner.borrow_mut();
             if inner.queued.get(&token).copied().unwrap_or(false)
@@ -2647,10 +2527,18 @@ mod tests {
         let mut world = World::default();
         let task = rt.spawn(ToyTask { turns: 1 }, 2).unwrap();
         let first = rt
-            .add_source(task, Handle::from_raw(1), ObjectSignals::READABLE, 1)
+            .add_source(
+                task,
+                SourcePlan::new(Handle::from_raw(1), ObjectSignals::READABLE),
+                1,
+            )
             .unwrap();
         let second = rt
-            .add_source(task, Handle::from_raw(2), ObjectSignals::READABLE, 2)
+            .add_source(
+                task,
+                SourcePlan::new(Handle::from_raw(2), ObjectSignals::READABLE),
+                2,
+            )
             .unwrap();
         shared.set_remove_busy(1);
         assert_eq!(

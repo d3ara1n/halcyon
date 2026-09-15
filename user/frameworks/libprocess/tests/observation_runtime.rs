@@ -14,7 +14,7 @@ use libprocess::{
 };
 use libsrv::{
     budget::{Budget, CoreResource},
-    runtime::{Runtime, SourceOps, SourceRegistrar, SourceSet},
+    runtime::{Runtime, SourceOps, SourceSet},
 };
 use std::{
     cell::RefCell,
@@ -94,7 +94,7 @@ impl ProcessOperations for Environment {
         Ok(())
     }
 }
-impl SourceRegistrar for Environment {
+impl SourceOps for Environment {
     fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError> {
         let mut state = self.0.borrow_mut();
         if let Some(error) = state.register_error {
@@ -105,8 +105,6 @@ impl SourceRegistrar for Environment {
         state.entries.insert(token, (item, false));
         Ok(token)
     }
-}
-impl SourceOps for Environment {
     fn rearm(&self, _: u64) -> Result<u64, SystemCallError> {
         panic!("one-shot observation must not rearm")
     }

@@ -1,6 +1,6 @@
 # 用户态执行与监督
 
-`user/frameworks/libsrv` 拥有单 actor 的执行机制；`libprocess` 拥有 Process/Job 收束政策与状态机；`srv_init` 的 `supervisor.rs` 拥有根监督责任。内核对象和 ABI 沿用现有 WaitSet、ProcessDrain 与 Job 管理面。
+当前服务进程均为内核和框架/标准库验收夹具；正式服务层在核心较成熟后逐步替换，装配可按测试需要实现。`user/frameworks/libsrv` 拥有单 actor 的执行机制；`libprocess` 拥有 Process/Job 收束政策与状态机；`srv_init` 的 `supervisor.rs` 拥有根监督责任。内核对象和 ABI 沿用现有 WaitSet、ProcessDrain 与 Job 管理面。
 
 ## Runtime 的调度、输入与退休
 
@@ -10,9 +10,9 @@
 
 每个任务的输入 FIFO 链接位于正式来源记录中，以稳定 token 寻址。来源 ready 进入预付 pending 槽，仅入队一次；advance 最多取本次预算允许的记录，未消费记录按原序还回队首。无需遍历该任务的全部潜在来源，也没有注销留下的无界 tombstone。Rearm、Remove 与迟到 generation 共用同一账本。
 
-`Requests` 的有限容量是每次任务推进的输出政策，不是服务连接数限制。请求按序进入 PendingGate，每步执行或拒绝一个操作；失败 advance 的剩余请求也保留到后续 Gate 结算。拒绝即使发生在业务提出 Complete 后，也让原任务再次取得推进机会，处理返还的责任。失败推进的业务期限与 ready/Hold 状态独立保留，Gate 收尾重新读取任务状态而不清空业务 timer；同一已投递期限不会被重复武装。任务执行和 Gate 回调前按该任务的通知义务确认到期，不依赖有预算的期限堆已弹出其 timer；较早的执行 Retry 不能使任务在未取得已到期业务输入时改写期限。Rearm/Remove 在正常、Complete 和失败 Gate 中都校验任务归属，维护面使用独立内部入口。请求、接收与 scratch 存储、来源记录都有准入；`Runtime::input_budget` 按实际类型大小和来源数量推导装配账户所需的输入额度。
+`Requests` 的有限容量是每次任务推进的输出政策，不是服务连接数限制。其缓冲和额度在 Runtime 创建时预备，推进间复用；PendingGate 只持结算状态，存在 Gate 时不推进新的任务，每步从同一缓冲执行或拒绝一个操作；失败 advance 的剩余请求也保留到后续 Gate 结算。拒绝即使发生在业务提出 Complete 后，也让原任务再次取得推进机会，处理返还的责任。失败推进的业务期限与 ready/Hold 状态独立保留，Gate 收尾重新读取任务状态而不清空业务 timer；同一已投递期限不会被重复武装。任务执行和 Gate 回调前按该任务的通知义务确认到期，不依赖有预算的期限堆已弹出其 timer；较早的执行 Retry 不能使任务在未取得已到期业务输入时改写期限。Rearm/Remove 在正常、Complete 和失败 Gate 中都校验任务归属，维护面使用独立内部入口。请求、接收与 scratch 存储、来源记录都有准入；`Runtime::input_budget` 按实际类型大小和来源数量推导装配账户所需的输入额度。
 
-`SourcePlan` 是不透明的值类型，携带普通 WaitSet 登记意图，不拥有关闭权或共享数据访问权。Runnel 等领域生成计划，运行体注入任务 cookie 并登记。计划本身不分配，也不通过任意注册回调引入另一套执行路径。Add/Arm 在调用内核前准备额度、来源节点和退休期限槽；失败退款，初始登记直接使用第一代次。
+`SourcePlan` 是不透明的值类型，携带普通 WaitSet 登记意图，不拥有关闭权或共享数据访问权。Runnel 等领域生成计划，运行体注入任务 cookie 并登记。计划本身不分配，也不通过任意注册回调引入另一套执行路径。Add/Arm 入口统一为 Register 值计划，直接经 SourceOps 登记。在调用内核前准备额度、来源节点和退休期限槽；失败退款，初始登记直接使用第一代次。
 
 登记和实际注销分别经 `Task::registered`、`Task::unregistered` 交付回执。任务不必等第一条来源事件才能取得 SourceId，因而首次等待超时也能撤销观察；机器在注销回执后才兑现被观察 owner 的关闭。
 
@@ -32,7 +32,7 @@
 
 `ObservationSlot` 连接 Runtime：处理登记回执、来源事件、期限、来源错误及注销回执，再将匹配结果交给原机器。`SuperviseTask` 与 `job_driver.rs` 共用此连接。同步门面使用同一个 Observation 的绝对等待，RetryAt 使用绝对 sleep；状态机内部没有阻塞 wait。
 
-`JobCollector` 使用单一 frame stack，每步处理一个枚举批、成员或子 Job 阶段。frame 与分页增长在派生 authority 前 fallible 预留；child 完成后才回退并关闭其 control。成员直接使用同一个 Process Collector。`JobKillFailure` 按值返还原 JobCollector，不在入口或错误包装中依赖不可失败 Box 分配。
+`JobCollector` 使用单一 frame stack，每步处理一个枚举批、成员或子 Job 阶段。每个 frame 的 JobPage 只持一份 JOB_ENUMERATE_MAX 容量的预付页，成员与 children 按阶段复用；页内条目完成后才推进 position，页耗尽且 more 才按 next_cursor 取下一页，不累积全量列表。每批验证实际条数、严格递增 ID 和游标，不越过未决占位；零进展预算可由 replenish 续接。栈位和子页在派生 authority 前 fallible 预留，child 完成后才回退并关闭其 control，关闭失败仍保留父页和位置。后续页失败保留前批已提交的进度，枚举输入游标不变。成员直接使用同一个 Process Collector。`JobKillFailure` 按值返还原 JobCollector，不在入口或错误包装中依赖不可失败 Box 分配。
 
 ## init 与 pm 的真实装配
 
@@ -42,8 +42,10 @@ Job duty 持有原机器、待准入任务、Runtime、世界与失败处置；B
 
 根按持续游标推进可工作运行体，统一等待所有健康集合和最早期限，不在某个 duty 内调用无限 run。可恢复错误退避，永久错误仍以原类型持有责任，其他运行体继续。失败脚本结束后，services 机器接管管理范围；已摘除对象的旧 control 仍由原 duty 兑现，不能靠重新枚举替代。所有责任确已结束后才尝试失败 reset；平台拒绝时保留根。流建立失败的 Endpoint/Invitation 也有预备清理槽。辅助 Job controls、启动 mailbox/委托副本及流控通知通过预备能力账本的工厂创建，脚本只借用 handle；内核确认 Grant/Send 消费后才兑现本地 owner。pm sender 始终保持 typed owner，不转回无人负责的 raw handle。正常关闭和失败 reset 均覆盖该账本，活动 Job 借用的 root 不会提前关闭。
 
-pm 的 DomainTask 直接使用 JobDriver，删除另一套成员枚举/收束编排；运行体每轮 `max_work=1`。域收束后通过 seal/shutdown_turn 结束长期邮箱任务，证明真实停止路径。不可恢复错误在 owner 仍存活时以非零状态退出，由 init 的独立管理能力接管；该政策不用于 init。
+pm 的 DomainTask 直接使用 JobDriver，删除另一套成员枚举/收束编排；运行体每轮 `max_work=1`。MailboxTask 在分发测试消息后继续停驻，Flow 在 TAIL 后派生 Domain，保留测试阶段顺序。域收束后 main 调用 seal/shutdown_turn；stop 回调检查邮箱已有实际登记，最终检查注销回执已完成、Task/InputBytes 额度归零，并输出必检锚点 `pm: active mailbox stop and refund passed`。不可恢复错误在 owner 仍存活时以非零状态退出，由 init 的独立管理能力接管；该政策不用于 init。
 
 init 的 done→腾位→TAIL 使用同一绝对期限。root 故障隔离验收通过正式运行体构造部分准入失败、一个失败成员与健康成员，再给原机器续作额度；另让一台 Job Runtime 暂停时完成另一台 Batch Runtime。两条成功锚点均纳入 QEMU 验收脚本。另验证创建 mailbox 后 duplicate 拒绝仍保留两端 owner、关闭接收端后 Send 拒绝仍保留待移交 JobControl，以及正常结束时辅助能力回到仅保留 services 根的账本基线。seal/create 竞态夹具的临时 JobControl 副本也走同一账本，仅在发送成功后兑现移交。
 
 源码与验证索引见 `plans/archived/review-2026-09-15-runtime-closure.md`。同步便利门面和刻意 raw 的顺序验收脚手架继续保留；RPC/Outbox、FAL 业务与内核公共操作重构不属于本闭包。
+
+当前清理批次的 host 证据见 `artifacts/cleanup-paging-host.log`：分配失败时预付 Gate 仍返还失败派生任务并退休；Job 多页成员/children、嵌套、条目消失、零进展、后页错误与关闭失败均从原状态恢复，栈和子页分配失败先于派生能力。core 及完整 acceptance 已验证 Active 邮箱停止及退款；最终 `artifacts/acceptance-cleanup-paging-20260915-131912.log` exit 0，源码哈希一致，两份集中复核均无 finding。完整边界见固定提交 Review 的已授权批次记录。

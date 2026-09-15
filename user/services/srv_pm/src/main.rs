@@ -53,6 +53,8 @@ struct PmWorld {
     producer: Option<blocking::Producer>,
     fatal: bool,
     domain_done: bool,
+    mailbox_registered: bool,
+    mailbox_stopped: bool,
 }
 
 impl PmWorld {
@@ -65,7 +67,6 @@ impl PmWorld {
 struct MailboxTask {
     buffer: ReceiveBuffer,
     registered: bool,
-    dispatched: usize,
     failed: bool,
     stopping: bool,
 }
@@ -75,7 +76,6 @@ impl MailboxTask {
         Self {
             buffer: ReceiveBuffer::new().expect("pm: receive buffer"),
             registered: false,
-            dispatched: 0,
             failed: false,
             stopping: false,
         }
@@ -192,7 +192,6 @@ impl Task<PmWorld> for MailboxTask {
                             step: Step::Complete,
                         });
                     }
-                    self.dispatched += 1;
                 }
                 Err(failure) => {
                     debug!("invalid Tunnel Invitation: {:?}", failure.error);
@@ -243,7 +242,6 @@ impl Task<PmWorld> for MailboxTask {
                     step: Step::Complete,
                 });
             }
-            self.dispatched += 1;
         } else {
             debug!("unexpected message kind {}", header.kind);
             world.fail();
@@ -252,17 +250,21 @@ impl Task<PmWorld> for MailboxTask {
                 step: Step::Complete,
             });
         }
-        if self.dispatched == 2 {
-            Ok(Advance {
-                work_done: 1,
-                step: Step::Complete,
-            })
-        } else {
-            requests.rearm(source)?;
-            Ok(Advance {
-                work_done: 1,
-                step: Step::Parked,
-            })
+        requests.rearm(source)?;
+        Ok(Advance {
+            work_done: 1,
+            step: Step::Parked,
+        })
+    }
+
+    fn registered(&mut self, world: &mut PmWorld, kind: SourceKind, _: SourceId) {
+        if kind == KIND_MAILBOX {
+            world.mailbox_registered = true;
+        }
+    }
+    fn unregistered(&mut self, world: &mut PmWorld, kind: SourceKind, _: SourceId) {
+        if kind == KIND_MAILBOX {
+            world.mailbox_registered = false;
         }
     }
 
@@ -281,7 +283,12 @@ impl Task<PmWorld> for MailboxTask {
         world.fail();
     }
 
-    fn stop(&mut self, _world: &mut PmWorld) {
+    fn stop(&mut self, world: &mut PmWorld) {
+        assert!(
+            world.mailbox_registered,
+            "mailbox stop must consume an active registration"
+        );
+        world.mailbox_stopped = true;
         self.stopping = true;
     }
 }
@@ -814,6 +821,7 @@ impl Task<PmWorld> for PmTask {
 
     fn registered(&mut self, world: &mut PmWorld, kind: SourceKind, source: SourceId) {
         match self {
+            Self::Mailbox(task) => task.registered(world, kind, source),
             Self::Domain(task) => task.registered(world, kind, source),
             Self::Stream(task) => task.registered(world, kind, source),
             _ => {}
@@ -821,6 +829,7 @@ impl Task<PmWorld> for PmTask {
     }
     fn unregistered(&mut self, world: &mut PmWorld, kind: SourceKind, source: SourceId) {
         match self {
+            Self::Mailbox(task) => task.unregistered(world, kind, source),
             Self::Domain(task) => task.unregistered(world, kind, source),
             Self::Stream(task) => task.unregistered(world, kind, source),
             _ => {}
@@ -871,6 +880,8 @@ fn main() {
         producer: None,
         fatal: false,
         domain_done: false,
+        mailbox_registered: false,
+        mailbox_stopped: false,
     };
     if let Err(failure) = runtime.spawn(PmTask::Mailbox(MailboxTask::new()), 2) {
         debug!("pm: mailbox task refused: {:?}", failure.error);
@@ -935,6 +946,13 @@ fn main() {
             Err(error) => panic!("pm: close failure exit failed: {:?}", error),
         }
     }
+    assert!(
+        world.mailbox_stopped && !world.mailbox_registered,
+        "active mailbox stop must finish unregistering its source"
+    );
+    assert_eq!(account.usage(CoreResource::Task).0, 0);
+    assert_eq!(account.usage(CoreResource::InputBytes).0, 0);
+    debug!("pm: active mailbox stop and refund passed");
     debug!("pm: shutdown complete");
 }
 

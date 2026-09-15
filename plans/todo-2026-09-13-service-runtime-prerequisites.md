@@ -2,6 +2,8 @@
 
 > 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，已提交为 `a3891b0`；固定提交复核登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 与 FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
 
+提交后的结构审视见 [固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态和装配边界的收敛建议；用户已授权并完成收窄后的 Runtime 清理、Job 单页收束和停止补证；host/目标检查/完整 acceptance 与集中复核均通过，本批尚未提交。服务架构化不在范围内。
+
 ## 开工流程与本任务审计门
 
 本任务遵循 `AGENTS.md`「标准施工流程」，按下述四个机制闭包推进。消息、流运输的历史审计与交付记录保留；当前通用执行的责任链、修复证据和完成状态由唯一 Runtime 闭包报告维护。
@@ -167,7 +169,7 @@ HighHolly 已接替 SilverSeal 实施，工作树保持单一写入者。原初�
 - 公共接缝：SourcePlan 为不透明值描述，删除 Runnel 等待计划的动态 Box；input_budget 按实际类型与容量推导账户额度。shared/timer_queue 的 value_mut 仅用于预付后绑定 token，不修改调度算法或 ABI。
 - Collector：Process/Job 共用带唯一身份和绝对期限的观察契约，区分 Ready/Timeout/SourceError。Process Close 前保留快照，错误按值返还原机器。Job 单栈推进、派生前 fallible 预留，删除错误包装 Box 和内部阻塞 wait；同步和 Runtime 驱动共用状态机。
 - init：RootSupervisor 在服务启动前拥有长期槽和 services 待命机器；Job/Batch/Read 的输入、运行体、世界、结果和关闭责任均留在根。部分准入失败不停止已入队任务，多个运行体组合等待，永久失败不退出管理根或丢弃原机器。流建立失败也有预备清理槽。辅助 Job、启动 mailbox、委托副本与流控通知的能力槽均先于获取预备；pm sender 保持 typed owner，内核消费回执才触发移交，正常/失败关闭均由根账本承担。
-- pm：域管理只使用 JobDriver，删除重复成员编排；实际以 max_work=1 驱动，并以 seal/shutdown_turn 结束长期邮箱任务。非零异常退出由 init 管理能力接管。
+- pm：域管理只使用 JobDriver，删除重复成员编排；实际以 max_work=1 驱动。本批让测试邮箱保持 Active 到 stop，检查实际登记、注销回执和最终账户退款；新增必检锚点已通过完整 acceptance。测试阶段关系保持，未建设正式服务架构。非零异常退出由 init 管理能力接管。
 - 证据：正式 Runtime host 验证持续来源/Gate/退休/停止/退款、部分输入、独立来源重试、失败任务隔离；ProcessOperations 与真实 Runtime 集成验证注销 Busy、Close 恢复、首次观察超时/错误和连续 Drain Busy；init 的真实批次/独立运行体故障隔离锚点进入 QEMU 必检项。
 
-验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。R1–R16 和 C1–C7 均有关闭证据，唯一 Review 报告已归档。通用执行与准入已完成并提交为 `a3891b0`；本计划仍拥有尚未实施的 RPC/Outbox，不能把四闭包整体标为完成。
+验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。当时 R1–R16 和 C1–C7 的关闭记录已归档。后续结构审视纠正了其中 R15 对 PM 实际停止的证明，本批已通过 Active 登记→stop→注销→退款补证关闭；Runtime 预付清理与 Job 单页收束的最终证据见固定提交 Review 的已授权批次。通用执行与准入初次交付为 `a3891b0`；本计划仍拥有尚未实施的 RPC/Outbox，不能把四闭包整体标为完成。

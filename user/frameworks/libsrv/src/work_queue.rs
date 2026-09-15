@@ -17,7 +17,7 @@ pub fn abandoned_tasks() -> usize {
 }
 
 pub(crate) struct Slot<T, K: Taxonomy> {
-    pub(crate) task: Option<T>,
+    pub(crate) task: T,
     pub(crate) sources: Vec<u64>,
     pub(crate) max_sources: usize,
     pub(crate) retiring_sources: usize,
@@ -137,7 +137,7 @@ impl<T, K: Taxonomy> WorkQueue<T, K> {
             });
         }
         let slot = Slot {
-            task: Some(task),
+            task,
             sources,
             max_sources,
             retiring_sources: 0,
@@ -169,7 +169,7 @@ impl<T, K: Taxonomy> WorkQueue<T, K> {
                 let _ = self.timers.cancel(retry_timer);
                 return Err(InsertFailure {
                     error,
-                    task: slot.task.expect("prepared slot lost its task"),
+                    task: slot.task,
                 });
             }
         };
@@ -191,7 +191,7 @@ impl<T, K: Taxonomy> WorkQueue<T, K> {
     }
 
     pub(crate) fn get_task_mut(&mut self, id: u64) -> Option<&mut T> {
-        self.tasks.get_mut(id).and_then(|slot| slot.task.as_mut())
+        self.tasks.get_mut(id).map(|slot| &mut slot.task)
     }
 
     pub(crate) fn slot(&mut self, id: u64) -> Option<&mut Slot<T, K>> {
@@ -411,9 +411,7 @@ impl<T, K: Taxonomy> WorkQueue<T, K> {
         self.timers.park(slot.retry_timer);
         if !slot.stopping {
             slot.stopping = true;
-            if let Some(task) = slot.task.as_mut() {
-                task.stop(world);
-            }
+            slot.task.stop(world);
         }
         self.schedule(id)
     }

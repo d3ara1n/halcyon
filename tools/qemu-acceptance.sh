@@ -66,6 +66,7 @@ required=(
     "root supervision failure isolation passed"
     "root startup ownership rollback passed"
     "root auxiliary capability cleanup passed"
+    "pm: active mailbox stop and refund passed"
     "root independent runtime failure isolation passed"
     "peer closed observed"
     "pm delegated domain confirmed Dead"
