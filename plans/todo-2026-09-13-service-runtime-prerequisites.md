@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，尚未提交。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 与 FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
+> 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，已提交为 `a3891b0`；固定提交复核登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 与 FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
 
 ## 开工流程与本任务审计门
 
@@ -170,4 +170,4 @@ HighHolly 已接替 SilverSeal 实施，工作树保持单一写入者。原初�
 - pm：域管理只使用 JobDriver，删除重复成员编排；实际以 max_work=1 驱动，并以 seal/shutdown_turn 结束长期邮箱任务。非零异常退出由 init 管理能力接管。
 - 证据：正式 Runtime host 验证持续来源/Gate/退休/停止/退款、部分输入、独立来源重试、失败任务隔离；ProcessOperations 与真实 Runtime 集成验证注销 Busy、Close 恢复、首次观察超时/错误和连续 Drain Busy；init 的真实批次/独立运行体故障隔离锚点进入 QEMU 必检项。
 
-验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。R1–R16 和 C1–C7 均有关闭证据，唯一 Review 报告已归档。通用执行与准入已完成、未提交；本计划仍拥有尚未实施的 RPC/Outbox，不能把四闭包整体标为完成。
+验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。R1–R16 和 C1–C7 均有关闭证据，唯一 Review 报告已归档。通用执行与准入已完成并提交为 `a3891b0`；本计划仍拥有尚未实施的 RPC/Outbox，不能把四闭包整体标为完成。

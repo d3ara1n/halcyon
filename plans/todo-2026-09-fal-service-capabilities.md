@@ -16,7 +16,7 @@
 |---|---|---|
 | 公共对象、观察与退休前置 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
 | 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
-| 运输/执行前置 | 消息与流运输已提交；通用执行/准入已完成未提交；RPC/Outbox 待实施 | `todo-2026-09-13-service-runtime-prerequisites.md`；消息运输 → 流运输/Runnel → 通用执行/准入 → 完整 RPC/Outbox，每项同步迁移真实消费者 |
+| 运输/执行前置 | 消息与流运输已提交；通用执行/准入已提交 `a3891b0`；RPC/Outbox 待实施 | `todo-2026-09-13-service-runtime-prerequisites.md`；消息运输 → 流运输/Runnel → 通用执行/准入 → 完整 RPC/Outbox，每项同步迁移真实消费者 |
 | 公共操作边界收束 | 独立结构整理，安排在执行前置与共享包之后 | `todo-2026-09-14-public-operation-ownership.md`；保留 ProcessDrain 分工，收束等待/请求/工作执行，覆盖全部真实内核消费者 |
 | FAL 业务 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
 | 验收可靠性改进 | 首轮已收口，历史墙钟敏感现象只读归档 | `plans/archived/ref-2026-09-acceptance-timing-flake.md`；新现场命中归档触发条件时重新立案，不以重跑直到绿替代证据 |
@@ -43,7 +43,7 @@
   → Open/Watch/注册/Move/Copy → 总体组合交付
 ```
 
-消息与流运输已提交，通用执行/准入已完成实现、完整验收与复核但未提交，下一机制为 RPC/Outbox；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 不作为整体开工阻塞，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
+消息与流运输已提交，通用执行/准入已完成实现、完整验收与复核并提交为 `a3891b0`，下一机制为 RPC/Outbox；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 不作为整体开工阻塞，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
 
 本文下面保留的基线与代码连接点是审视材料，不是已完成证据。公共前置章节的旧 Seal/Drain 等候选已经被普通 Close/内核退休替代，旧 ABI 和用户维护编排已删除，不继续照旧施工或恢复兼容。
 
