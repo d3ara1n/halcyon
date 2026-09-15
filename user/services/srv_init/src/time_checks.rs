@@ -136,8 +136,29 @@ fn delivery_deadline() {
         message::receive(inbox.owner),
         Err(SystemCallError::ObjectNotAvailable)
     ));
-    let deadline = time::after(Duration::from_millis(30).unwrap()).unwrap();
-    unsafe { message::send_raw_until(once, 92, &[9], &moves, deadline) }.unwrap();
+    // 成功提交探针不依赖亚调度周期窗口。QEMU 节流周期为 0.5s，
+    // 两个周期给正常调度留下执行机会；提交前过期仍是合法的未消费结果。
+    // 每次重试是明确的新 Send，且逐次核验 owner；不重跑整个验收掩盖失败。
+    let mut committed_deadline = None;
+    for _ in 0..3 {
+        let candidate = time::after(Duration::from_millis(1_000).unwrap()).unwrap();
+        match unsafe { message::send_raw_until(once, 92, &[9], &moves, candidate) } {
+            Ok(()) => {
+                committed_deadline = Some(candidate);
+                break;
+            }
+            Err(SystemCallError::DeadlineExpired) => {
+                assert_eq!(query(once).unwrap().rights, Rights::WRITE | Rights::WAIT);
+                assert_eq!(
+                    query(moved).unwrap().rights,
+                    Rights::WRITE | Rights::TRANSIT
+                );
+                debug!("delivery deadline probe expired before commit; authority retained");
+            }
+            Err(error) => panic!("delivery deadline probe failed: {:?}", error),
+        }
+    }
+    let deadline = committed_deadline.expect("delivery probe received no finite execution window");
     assert_eq!(query(once), Err(SystemCallError::StaleHandle));
     assert_eq!(query(moved), Err(SystemCallError::StaleHandle));
     time::sleep_until(deadline).unwrap();

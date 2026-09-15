@@ -208,6 +208,19 @@ impl<T> TimerQueue<T> {
         }
     }
 
+    /// 修改既有登记的载荷，不改变期限、堆位置或 token 代次。
+    /// 调用方可先预付槽位，再在外部操作提交后绑定正式身份。
+    pub fn value_mut(&mut self, token: TimerToken) -> Option<&mut T> {
+        if self.owner_slot != Some(token.owner_slot()) {
+            return None;
+        }
+        let slot = self.valid_slot(token)?;
+        match &mut self.arena[slot].state {
+            SlotState::Occupied { value, .. } | SlotState::Parked { value } => Some(value),
+            SlotState::Vacant { .. } | SlotState::Retired => None,
+        }
+    }
+
     /// 改期复用既有 arena 与堆槽，不分配、不改变 token generation。
     pub fn reschedule(&mut self, token: TimerToken, deadline: u64) -> bool {
         if self.owner_slot != Some(token.owner_slot()) {
@@ -429,6 +442,20 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn binding_prepaid_payload_preserves_deadline_and_rejects_stale_tokens() {
+        let mut queue = TimerQueue::new(0);
+        let token = queue.try_register(10, 0).unwrap();
+        assert!(queue.park(token));
+        *queue.value_mut(token).unwrap() = 42;
+        assert!(queue.reschedule(token, 20));
+        assert_eq!(queue.peek(), Some((token, 20, &42)));
+        assert_eq!(queue.cancel(token), Some(42));
+        let next = queue.try_register(30, 7).unwrap();
+        assert!(queue.value_mut(token).is_none());
+        assert_eq!(queue.value_mut(next), Some(&mut 7));
+    }
 
     #[test]
     fn parked_entries_keep_prepaid_capacity_and_allow_finite_maximum() {

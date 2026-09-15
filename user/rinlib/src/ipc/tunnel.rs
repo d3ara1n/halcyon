@@ -206,6 +206,15 @@ impl EndpointEvents<'_> {
         ))
     }
 
+    /// 构造观察登记项：只携带观察条件，不导出映射访问或关闭权。
+    pub fn wait_item(&self, signals: ObjectSignals, cookie: u64) -> WaitItem {
+        WaitItem::new(
+            self.0.handle.expect("Endpoint already closed"),
+            signals,
+            cookie,
+        )
+    }
+
     pub fn wait_until(
         &self,
         signals: ObjectSignals,

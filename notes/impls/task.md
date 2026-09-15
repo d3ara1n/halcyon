@@ -97,12 +97,12 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   移表）ObjectNotFound。派生 ProcessControl 复用存活 shell（单一
   shell 身份，电平不分叉）；shell 已消散时从 core 铸造新 shell 并在
   铸造点重放 REAPABLE 或 CLOSED——control 消散的进程由此接回管理
-  入口（派生兑底）。递归 JobKill 是用户态政策，
-  公共实现 `libprocess::job_kill`（逐层 seal → 有限 stall 枚举 → 派生 kill →
-  有限 wait/drain/query → 等 CLOSED）。默认 policy 固定单次 wait timeout、
-  wait/drain/query 次数、单次 drain work 与 enumerate stall 上限；失败返回
-  Job/Process authority、阶段与进度，不默认 close。`collect_process` 的
-  `SupervisionTarget` 只在 Drain Complete 且 Query 核验 Dead 后关闭 control。
+  入口（派生兑底）。Job 树收束是用户态政策，公共 `JobCollector` 用单一
+  显式 frame stack 逐层 seal、分页枚举、派生 kill、Process 收束与 CLOSED
+  观察；`job_kill` 是消费同一机器的同步门面。默认 policy 给出观察期限、
+  重试次数与工作量上限；失败按值返还原 Job/Process 机器，保持阶段、
+  快照和 authority，不默认 close。只有 Drain Complete 且 Query 核验 Dead
+  后才关闭 ProcessControl；详细运行期连接见 [`runtime.md`](runtime.md)。
 
 ## 生命周期
 - **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（内嵌与

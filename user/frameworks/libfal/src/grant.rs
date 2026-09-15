@@ -15,7 +15,8 @@ use erhino_shared::{
     wait::WaitItem,
     wait_set::ReadyRecord,
 };
-use libsrv::budget::{Account, Charge, Resource};
+use crate::resource::FalResource;
+use libsrv::budget::{Account, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
 use rinlib::ipc::{capability::Capability, message::Mailbox, wait_set::WaitSet};
@@ -47,14 +48,14 @@ struct GrantState {
     root: NodeRef,
     rights: FalRights,
     output_transport_rights: Rights,
-    account: Arc<Account>,
+    account: Arc<Account<FalResource>>,
     policy: PolicyState,
     lifetime: Option<Capability>,
     token: Option<u64>,
     _slot: Permit,
-    _grant_charge: Charge,
-    _observer_charge: Charge,
-    _storage_charge: Charge,
+    _grant_charge: Charge<FalResource>,
+    _observer_charge: Charge<FalResource>,
+    _storage_charge: Charge<FalResource>,
 }
 
 pub struct GrantTable<'a> {
@@ -98,7 +99,7 @@ impl<'a> GrantTable<'a> {
         mailbox: &Mailbox,
         root: NodeRef,
         policy: Issuance,
-        account: Arc<Account>,
+        account: Arc<Account<FalResource>>,
         badge: u64,
     ) -> Result<Capability, SystemCallError> {
         if self.sealed {
@@ -113,10 +114,10 @@ impl<'a> GrantTable<'a> {
             return Err(SystemCallError::RightsDenied);
         }
         let slot = Counter::try_acquire(&self.slots).map_err(|_| SystemCallError::QuotaExceeded)?;
-        let grant_charge = account.acquire(Resource::Grant, 1)?;
-        let observer_charge = account.acquire(Resource::WaitSource, 1)?;
+        let grant_charge = account.acquire(FalResource::Grant, 1)?;
+        let observer_charge = account.acquire(FalResource::WaitSource, 1)?;
         let storage_charge = account.acquire(
-            Resource::Bytes,
+            FalResource::Bytes,
             PreparedEntry::<GrantState>::allocation_bytes()
                 + PreparedEntry::<u64>::allocation_bytes(),
         )?;

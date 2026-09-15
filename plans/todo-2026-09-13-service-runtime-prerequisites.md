@@ -1,10 +1,10 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：当前下一任务。消息运输闭包（`3060dd8`）与流运输/Runnel 闭包（`a2aabed`，未来复核见 [流运输 Review](todo-2026-09-14-stream-transport-review.md)）均已实施并提交；下一实施为通用执行与准入闭包，其设计闭包未完成前不得编码。公共对象/观察/退休与公共时间已完成原交付，现有 rinlib/Runnel/RPC/libsrv 中仍有未接通草稿。ProcessDrain 的管理者职责和 REAPABLE 触发已澄清，不重做回收契约、不增加预算激励前置。[内核执行结构收束](todo-2026-09-14-public-operation-ownership.md) 与 [共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档；实际发现阻断正确性的缺口时才按完整机制调整依赖。总体顺序见 [FAL 总计划](todo-2026-09-fal-service-capabilities.md)。
+> 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，尚未提交。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 与 FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
 
 ## 开工流程与本任务审计门
 
-本任务先遵循 `AGENTS.md`「标准施工流程」，再进入下面三个机制闭包。当前阶段只完成接手与基线复核；运输闭包实施前必须形成可追溯的任务规模审计、拆分/合并决策和设计记录。
+本任务遵循 `AGENTS.md`「标准施工流程」，按下述四个机制闭包推进。消息、流运输的历史审计与交付记录保留；当前通用执行的责任链、修复证据和完成状态由唯一 Runtime 闭包报告维护。
 
 ### 规模审计
 
@@ -101,6 +101,17 @@ Runnel 新增的 `Producer/Consumer::register` 与 `peer_attached` 直接访问 
 
 前置：消息与流运输闭包完成，实施者已核对现有 Close 的挂起/失败边界与操作 owner 的执行契约。现有 ProcessDrain 分工不作为缺失前置；若执行模型确实需要现有机制不具备的能力，再按证据提升完整专题。目标是在没有 FAL 的情况下，运行体也能独立承接现有数据处理及清理责任。
 
+#### 通用执行与准入设计裁决（2026-09-14，基线 `f4a4d57`）
+
+**审计结论**：本闭包无内核/shared 改动——WaitSet 登记/Rearm、`EndpointEvents::register`、REAPABLE/CLOSED 观察与信号面全部已有；挂起关闭的停驻来源已核实为内核内部退休确认（tunnel close 等待内存事务跨 hart 收束，不等待 peer 进程），界域由 hart 前进决定。铺路现状：budget/wake 有 libfal 消费；work_queue/runtime/dispatcher 无消费者但按「铺路面与消费者」准则（AGENTS.md）续用不重建，替换仅限严格更优处（cookie 真值路由→token 表、Resource 领域大枚举→泛型分类、collect_process 独立循环→单一状态机+同步门面）。ThreadSpawn/JoinHandle 已完备，现存服务全为单线程测试形态；内核无配额机制，只有资源支付不变量与用户态准入库（metadata_admission+budget）。
+
+**裁决与终态**（详尽论证见 `notes/ideas/framework.md`、`notes/ideas/runnel.md`）：
+
+1. 单一闭包、单次实施、一次提交：执行核心单独拆出无消费者，数据面与监督两族消费者同为 pm/init，登记寿命/generation/重 arm 的 owner 形态必须一次定稿；实施序内 pm/init 直接写终态，无混合形态。实施序：budget 泛型化+删除 libsrv→librpc 无用依赖 → Runtime（独占 WaitSet、token 来源表+arm_generation 过滤、每来源预付槽「未消费不重 arm」、调度报告×生命周期两维、Gate 运行中派生、spawn→run→close 公开面、非空放弃逐槽有界析构替代 forget） → librunnel arm/poll（条件选信号集、typed 三条件、PeerAttached 满足后不复登记） → libprocess 监督状态机+同步门面（CLOSED≠Drain Complete；ObjectBusy 绝对期限重试；More 回队尾） → pm 全量任务化 → init 数据面/监督段+race 迁移 → 旧路径删除。
+2. 消费者：pm 全量任务化为主证明负载（多任务公平/静默唤醒/期限/停止/退款，max_work=1 重放）；init 只迁生产结构段（数据面+常驻监督），验收脚手架保持顺序形态，验收拓扑与锚点业务语义不变；长存活纪律由 init 的持久 RootSupervisor 证明。
+3. 后置接缝（按「铺路面与消费者」登记触发条件，非禁建）：专职退休执行线程——多线程服务中循环不应为退休停驻时；跨线程提交队列+门铃——首个多线程服务定形；额度等待登记——首个真实等待者定形公平/预留语义。RPC 闭包所需机制（多来源、期限、Gate、完成输入）均由本闭包真实责任消费，不预建 txid/Outbox 面。
+4. 实施中验证点：核实 tunnel close 停驻在单 hart 节流验收下的实际时长不构成公平性障碍；若证据推翻（如发现跨进程依赖停驻），退休执行线程提前入闭包。
+
 - Budget/Account/Charge 提供账户、额度、预留与退款机制；FAL 的 Node/Grant/Watch/ServiceRecord 等资源分类移回领域，不能不断扩充执行核心的枚举。
 - 常驻监督是实际执行消费者：管理者纳管后观察 ProcessControl 的 REAPABLE/CLOSED；就绪后进入公平回收队列，More 继续安排下一批，失败保留 authority 并重试/升级。不让普通应用轮询 Drain，不先等待依赖 Drain 才发布的对端关闭；保持当前管理拓扑，不为本阶段改成唯一 pm 创建服务。
 - Runtime 拥有稳定任务、来源与任务的绑定、注册寿命、arm generation/迟到事件过滤、期限唤醒和任务 Wake。WorkQueue 可以是内部算法，不要求调用者同时操作 WorkQueue 和 Runtime 才维持一致性。
@@ -135,3 +146,28 @@ Runnel 新增的 `Producer/Consumer::register` 与 `peer_attached` 直接访问 
 本计划只迁移已有 FAL 调用的基础 API 使用；正式授权域、NodeStore/MemoryBackend/StoredValue、值与 wire、provider 装配属于 FAL 总计划。执行前置不以这些未接通草稿作为通用能力已成立的证明。
 
 本计划的四项闭包完成后，按总计划完成内核执行结构整理（共享包契约与归属已归档），再进入 FAL 后端的准备/取消/替换值退休与稳定身份闭包，随后完成 grant/授权准入/provider/client 的共同迁移，最后扩展业务操作。后端产生的正常清理责任由后端持有并接入公共执行，不交给 handler 手工逐项 close；业务明确转移的能力才作为结果交付。具体责任与顺序唯一记录在总计划。
+
+## 首次接管裁决记录（2026-09-15，历史）
+
+以下为首次接管时的裁决，最终实施者及状态以文首和下一节为准。当时由 SilverSeal 接手实施；SharpGale/其他协作者停止对同一工作树编辑，不沿用当前实现中已证实错误的登记、输入和退休路径。以下问题按机制重构，不以局部补丁或兼容双轨掩盖：
+
+1. **Runtime 登记事务**：WaitSet `register` 后不做首次 `rearm`，初始代次直接收编；Add/Arm 共用任务存活、来源数量、额度和节点预留准入。登记后的任何失败均保留撤销责任，禁止孤儿 token。
+2. **Runtime 输入账本**：来源事件、期限和拒绝均进入每任务有界 inbox；advance 只消费实际读取部分，剩余输入和错误路径完整回存，不以 `has_pending` 布尔值替代事实。拒绝按请求顺序交付，不能覆盖或静默丢失。
+3. **Runtime Gate 与生命周期**：请求应用有界、可观察、带 owner；`Complete` 不再允许没有交付闭包的异步请求。任务、来源退休和 WaitSet 收束共同决定 `run` 的完成，空队列不得在无限期限上误等待。来源清理使用有界退休队列和重试预算。
+4. **Runnel 观察接缝**：Consumer 首次满足 `PEER_ATTACHED` 后撤销旧登记并按新条件重新 arm；持久电平不能靠 generation 过滤解决。EOF 已发布但尚未全部消费时不报告 `Writable`。poll 的错误、acknowledge 和重查结果由真实任务消费。
+5. **监督状态机**：修复 `SuperviseTask` 首次登记不可达、Collector 取出后的错误恢复、期限消费/清除和同步门面的 Busy 节流；`Collector::step_close` 保持“成功关闭后兑现 control、失败保留 authority”的单一语义。
+6. **真实消费者迁移**：pm/init 的 arm refusal、来源错误、PeerAttached 重规划、FlowTask 有界填箱和 capability owner 转移一并迁移；不保留只为通过测试的 adapter。`Task::Family` 继续保证队列族同构；通用监督任务若无真实驱动点则不作为完成证据。
+7. **验证门**：先补 FakeSet 的 consumed/queued/持久电平/部分输入/撤销 Busy/Complete 请求模型，再运行受影响 host 测试、`just check`、`just clippy` 与 `just virt`/必要 release 路线。任何一个不变量未有回归证据，计划保持进行中。
+
+## 接手后的最终实现（2026-09-15）
+
+HighHolly 已接替 SilverSeal 实施，工作树保持单一写入者。原初轮实现和两轮复核暴露的问题保留在唯一 [Review 报告](archived/review-2026-09-15-runtime-closure.md)，不得据历史 passing 路线宣称当前责任链完成。
+
+- Runtime：事件接收、来源退休和任务退休独立轮转；每任务输入 FIFO 只处理本轮预算的真实记录；来源退休与任务执行失败退避都有预付期限槽；最近期限不全表扫描。登记/注销回执、Gate 拒绝、Complete 后返还责任、停止时继续观察与最终退款共同接通。
+- 公共接缝：SourcePlan 为不透明值描述，删除 Runnel 等待计划的动态 Box；input_budget 按实际类型与容量推导账户额度。shared/timer_queue 的 value_mut 仅用于预付后绑定 token，不修改调度算法或 ABI。
+- Collector：Process/Job 共用带唯一身份和绝对期限的观察契约，区分 Ready/Timeout/SourceError。Process Close 前保留快照，错误按值返还原机器。Job 单栈推进、派生前 fallible 预留，删除错误包装 Box 和内部阻塞 wait；同步和 Runtime 驱动共用状态机。
+- init：RootSupervisor 在服务启动前拥有长期槽和 services 待命机器；Job/Batch/Read 的输入、运行体、世界、结果和关闭责任均留在根。部分准入失败不停止已入队任务，多个运行体组合等待，永久失败不退出管理根或丢弃原机器。流建立失败也有预备清理槽。辅助 Job、启动 mailbox、委托副本与流控通知的能力槽均先于获取预备；pm sender 保持 typed owner，内核消费回执才触发移交，正常/失败关闭均由根账本承担。
+- pm：域管理只使用 JobDriver，删除重复成员编排；实际以 max_work=1 驱动，并以 seal/shutdown_turn 结束长期邮箱任务。非零异常退出由 init 管理能力接管。
+- 证据：正式 Runtime host 验证持续来源/Gate/退休/停止/退款、部分输入、独立来源重试、失败任务隔离；ProcessOperations 与真实 Runtime 集成验证注销 Busy、Close 恢复、首次观察超时/错误和连续 Drain Busy；init 的真实批次/独立运行体故障隔离锚点进入 QEMU 必检项。
+
+验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。R1–R16 和 C1–C7 均有关闭证据，唯一 Review 报告已归档。通用执行与准入已完成、未提交；本计划仍拥有尚未实施的 RPC/Outbox，不能把四闭包整体标为完成。

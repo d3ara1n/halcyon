@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 pub mod race;
 
 use erhino_shared::{
@@ -13,15 +15,23 @@ use erhino_shared::{
     proc::{
         ExecutionProfile, HandleGrant, JOB_ENUMERATE_MAX, JobMemberKind, JobState,
         PROCESS_DRAIN_MAX, PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE,
-        PROCESS_USER_TOP, ProcessDrainStatus, ProcessMapFlags, ProcessSnapshot, ProcessState,
-        ThreadStartContext,
+        PROCESS_USER_TOP, ProcessMapFlags, ProcessSnapshot, ThreadStartContext,
     },
-    wait::{WaitItem, WaitReason},
+    time::Deadline,
 };
 use rinlib::{
     ipc::object::{close, duplicate},
-    ipc::wait::wait_many,
     process,
+};
+
+pub mod job_driver;
+pub mod observation;
+pub mod supervise;
+use observation::{Observation, ObservationResult, ObservationState};
+use supervise::{ProcessOperations, RealProcessOperations};
+
+pub use supervise::{
+    Collector, SUPERVISE_SOURCE, StepOutcome, SuperviseResult, SuperviseSink, SuperviseTask,
 };
 
 const MAX_MAP_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
@@ -279,8 +289,13 @@ pub enum SupervisionStage {
 pub enum SupervisionCause {
     InvalidPolicy,
     Timeout,
+    /// 任务被停止接管；authority 完整保留在失败结果中交回。
+    Stopped,
     System(SystemCallError),
-    InconsistentSnapshot { pid: u64, state: u32 },
+    InconsistentSnapshot {
+        pid: u64,
+        state: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -291,14 +306,8 @@ pub struct SupervisionProgress {
     pub query_attempts: u32,
 }
 
-#[must_use = "failed supervision retains live authority"]
-#[derive(Debug)]
-pub struct SupervisionFailure {
-    pub target: SupervisionTarget,
-    pub stage: SupervisionStage,
-    pub cause: SupervisionCause,
-    pub progress: SupervisionProgress,
-}
+/// 失败继续持有完整 Process 机器，包含观察、Drain、Verify 或 Closing 阶段。
+pub type SupervisionFailure = supervise::CollectorFailure;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectedProcess {
@@ -309,151 +318,58 @@ pub struct CollectedProcess {
 
 /// 有限预算地等待、Drain 并核验一个 Process；成功后关闭 control，失败原样返还
 /// authority 与进度，调用者可重试、handoff 或升级到所属 Job。
+#[expect(
+    clippy::result_large_err,
+    reason = "失败按值返还完整机器，不在错误路径分配"
+)]
 pub fn collect_process(
     target: SupervisionTarget,
     policy: SupervisionPolicy,
 ) -> Result<CollectedProcess, SupervisionFailure> {
-    let mut progress = SupervisionProgress::default();
+    let machine = Collector::new(target, policy);
     if !valid_policy(policy) {
-        return Err(SupervisionFailure {
-            target,
-            stage: SupervisionStage::WaitReapable,
-            cause: SupervisionCause::InvalidPolicy,
-            progress,
-        });
+        return Err(machine.fail(
+            SupervisionStage::WaitReapable,
+            SupervisionCause::InvalidPolicy,
+        ));
     }
+    collect_remaining(machine)
+}
 
-    let mut reapable = false;
-    for attempt in 1..=policy.wait_attempts {
-        progress.wait_attempts = attempt;
-        match wait_many(
-            &[WaitItem::new(
-                target.control,
-                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-                0,
-            )],
-            policy.wait_timeout_ms,
-        ) {
-            Ok(result)
-                if result
-                    .observed
-                    .intersects(ObjectSignals::REAPABLE | ObjectSignals::CLOSED) =>
-            {
-                reapable = true;
-                break;
-            }
-            Ok(result) if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) => {}
-            Ok(_) => {
-                return Err(SupervisionFailure {
-                    target,
-                    stage: SupervisionStage::WaitReapable,
-                    cause: SupervisionCause::System(SystemCallError::InternalError),
-                    progress,
-                });
-            }
-            Err(SystemCallError::ObjectBusy) => {}
+/// 同步门面恢复原机器，绝不由裸 control 重建已进行中的关闭阶段。
+#[expect(
+    clippy::result_large_err,
+    reason = "失败按值返还完整机器，不在错误路径分配"
+)]
+pub fn collect_remaining(mut machine: Collector) -> Result<CollectedProcess, SupervisionFailure> {
+    loop {
+        let now = match rinlib::time::snapshot() {
+            Ok(snapshot) => snapshot.now_ns,
             Err(error) => {
-                return Err(SupervisionFailure {
-                    target,
-                    stage: SupervisionStage::WaitReapable,
-                    cause: SupervisionCause::System(error),
-                    progress,
-                });
+                return Err(machine.fail_current(SupervisionCause::System(error)));
             }
-        }
-    }
-    if !reapable {
-        return Err(SupervisionFailure {
-            target,
-            stage: SupervisionStage::WaitReapable,
-            cause: SupervisionCause::Timeout,
-            progress,
-        });
-    }
-
-    let mut complete = false;
-    for attempt in 1..=policy.drain_attempts {
-        progress.drain_attempts = attempt;
-        match process::drain(target.control, policy.drain_work) {
-            Ok(result) => {
-                progress.work_done = progress.work_done.saturating_add(result.work_done);
-                if result.status == ProcessDrainStatus::Complete as u32 {
-                    complete = true;
-                    break;
+        };
+        match machine.step(now) {
+            StepOutcome::Continue(next) => machine = next,
+            StepOutcome::Observe(request, mut next) => {
+                let result = observation::wait(request)
+                    .map_err(SupervisionCause::System)
+                    .and_then(|(now, result)| next.observe(request, result, now));
+                if let Err(cause) = result {
+                    return Err(next.fail_current(cause));
                 }
+                machine = next;
             }
-            Err(SystemCallError::ObjectBusy) => {}
-            Err(error) => {
-                return Err(SupervisionFailure {
-                    target,
-                    stage: SupervisionStage::Drain,
-                    cause: SupervisionCause::System(error),
-                    progress,
-                });
+            StepOutcome::RetryAt(at, next) => {
+                if let Err(error) = rinlib::time::sleep_until(Deadline::at(at)) {
+                    return Err(next.fail_current(SupervisionCause::System(error)));
+                }
+                machine = next;
             }
+            StepOutcome::Done(done) => return Ok(done),
+            StepOutcome::Escalate(failure) => return Err(failure),
         }
     }
-    if !complete {
-        return Err(SupervisionFailure {
-            target,
-            stage: SupervisionStage::Drain,
-            cause: SupervisionCause::Timeout,
-            progress,
-        });
-    }
-
-    let mut snapshot = None;
-    for attempt in 1..=policy.query_attempts {
-        progress.query_attempts = attempt;
-        match process::query(target.control) {
-            Ok(value) => {
-                snapshot = Some(value);
-                break;
-            }
-            Err(SystemCallError::ObjectBusy) => {}
-            Err(error) => {
-                return Err(SupervisionFailure {
-                    target,
-                    stage: SupervisionStage::VerifyDead,
-                    cause: SupervisionCause::System(error),
-                    progress,
-                });
-            }
-        }
-    }
-    let Some(snapshot) = snapshot else {
-        return Err(SupervisionFailure {
-            target,
-            stage: SupervisionStage::VerifyDead,
-            cause: SupervisionCause::Timeout,
-            progress,
-        });
-    };
-    if snapshot.pid != target.pid || snapshot.state != ProcessState::Dead as u32 {
-        return Err(SupervisionFailure {
-            target,
-            stage: SupervisionStage::VerifyDead,
-            cause: SupervisionCause::InconsistentSnapshot {
-                pid: snapshot.pid,
-                state: snapshot.state,
-            },
-            progress,
-        });
-    }
-    // SAFETY: 完整 Wait/Drain/Query 已验证 ProcessControl role 和稳定终态；不会关闭 Endpoint。
-    if let Err(error) = unsafe { close(target.control) } {
-        return Err(SupervisionFailure {
-            target,
-            stage: SupervisionStage::Close,
-            cause: SupervisionCause::System(error),
-            progress,
-        });
-    }
-    Ok(CollectedProcess {
-        pid: snapshot.pid,
-        snapshot,
-        progress,
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,7 +405,7 @@ pub struct JobKillProgress {
 #[derive(Debug)]
 pub struct JobKillFailure {
     pub job: Handle,
-    pub process: Option<SupervisionTarget>,
+    pub collector: Option<JobCollector<RealJobOperations>>,
     pub stage: JobKillStage,
     pub cause: JobKillCause,
     pub progress: JobKillProgress,
@@ -502,181 +418,618 @@ pub fn job_kill(job: Handle, code: i64) -> Result<(), JobKillFailure> {
 /// 递归 JobKill（用户态政策，内核不递归）。每个 wait、enumeration 与 drain
 /// 都受 policy 约束；失败保留当前 JobControl，并在派生 ProcessControl 尚未收束时
 /// 随错误返还，不以无限等待或默认 close 掩盖残留。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCollectorEvent {
+    Progress,
+    RetryAt(u64),
+    Observe(Observation),
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobCollectorError {
+    pub stage: JobKillStage,
+    pub cause: JobKillCause,
+    pub progress: JobKillProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobPhase {
+    Seal,
+    Members,
+    DeriveMember,
+    KillMember,
+    CollectMember,
+    Children,
+    DeriveChild,
+    CloseChild,
+    WaitClosed,
+    VerifyDead,
+    Done,
+}
+
+#[derive(Debug)]
+struct JobFrame<O: ProcessOperations> {
+    job: Handle,
+    phase: JobPhase,
+    members: Vec<u64>,
+    member_cursor: usize,
+    member_enum_cursor: u64,
+    member_stalls: u32,
+    children: Vec<u64>,
+    child_cursor: usize,
+    child_enum_cursor: u64,
+    child_stalls: u32,
+    current: Option<SupervisionTarget>,
+    process: Option<Collector<O>>,
+    child_job: Option<Handle>,
+    observation: ObservationState,
+}
+
+pub trait JobOperations: ProcessOperations {
+    fn seal_job(&self, job: Handle) -> Result<(), SystemCallError>;
+    fn enumerate_job(
+        &self,
+        job: Handle,
+        kind: JobMemberKind,
+        cursor: u64,
+        output: &mut [u64],
+    ) -> Result<erhino_shared::proc::JobEnumerateResult, SystemCallError>;
+    fn derive_job(
+        &self,
+        job: Handle,
+        kind: JobMemberKind,
+        id: u64,
+        rights: Rights,
+    ) -> Result<Handle, SystemCallError>;
+    fn kill(&self, control: Handle, code: i64) -> Result<(), SystemCallError>;
+    fn query_job(&self, job: Handle) -> Result<erhino_shared::proc::JobSnapshot, SystemCallError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealJobOperations;
+
+impl JobOperations for RealJobOperations {
+    fn seal_job(&self, job: Handle) -> Result<(), SystemCallError> {
+        process::seal_job(job)
+    }
+    fn enumerate_job(
+        &self,
+        job: Handle,
+        kind: JobMemberKind,
+        cursor: u64,
+        output: &mut [u64],
+    ) -> Result<erhino_shared::proc::JobEnumerateResult, SystemCallError> {
+        process::enumerate_job(job, kind, cursor, output)
+    }
+    fn derive_job(
+        &self,
+        job: Handle,
+        kind: JobMemberKind,
+        id: u64,
+        rights: Rights,
+    ) -> Result<Handle, SystemCallError> {
+        process::derive_job(job, kind, id, rights)
+    }
+    fn kill(&self, control: Handle, code: i64) -> Result<(), SystemCallError> {
+        process::kill(control, code)
+    }
+    fn query_job(&self, job: Handle) -> Result<erhino_shared::proc::JobSnapshot, SystemCallError> {
+        process::query_job(job)
+    }
+}
+
+impl ProcessOperations for RealJobOperations {
+    fn probe(
+        &self,
+        control: Handle,
+        signals: ObjectSignals,
+    ) -> Result<ObservationResult, SystemCallError> {
+        RealProcessOperations.probe(control, signals)
+    }
+    fn drain(
+        &self,
+        control: Handle,
+        work: u32,
+    ) -> Result<erhino_shared::proc::ProcessDrainResult, SystemCallError> {
+        RealProcessOperations.drain(control, work)
+    }
+    fn query(&self, control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
+        RealProcessOperations.query(control)
+    }
+    fn close(&self, control: Handle) -> Result<(), SystemCallError> {
+        RealProcessOperations.close(control)
+    }
+}
+
+#[derive(Debug)]
+pub struct JobCollector<O: JobOperations + Clone + core::fmt::Debug = RealJobOperations> {
+    frames: Vec<JobFrame<O>>,
+    code: i64,
+    policy: SupervisionPolicy,
+    progress: JobKillProgress,
+    ops: O,
+}
+
+impl JobCollector<RealJobOperations> {
+    pub fn new(job: Handle, code: i64, policy: SupervisionPolicy) -> Result<Self, SystemCallError> {
+        Self::new_with_ops(job, code, policy, RealJobOperations)
+    }
+}
+
+impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
+    fn new_frame(job: Handle) -> Result<JobFrame<O>, SystemCallError> {
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(JOB_ENUMERATE_MAX)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(JOB_ENUMERATE_MAX)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        Ok(JobFrame {
+            job,
+            phase: JobPhase::Seal,
+            members,
+            member_cursor: 0,
+            member_enum_cursor: 0,
+            member_stalls: 0,
+            children,
+            child_cursor: 0,
+            child_enum_cursor: 0,
+            child_stalls: 0,
+            current: None,
+            process: None,
+            child_job: None,
+            observation: ObservationState::default(),
+        })
+    }
+
+    pub fn new_with_ops(
+        job: Handle,
+        code: i64,
+        policy: SupervisionPolicy,
+        ops: O,
+    ) -> Result<Self, SystemCallError> {
+        if !valid_policy(policy) {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(1)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        frames.push(Self::new_frame(job)?);
+        Ok(Self {
+            frames,
+            code,
+            policy,
+            progress: JobKillProgress::default(),
+            ops,
+        })
+    }
+
+    pub fn root_job(&self) -> Handle {
+        self.frames.first().expect("job collector has no root").job
+    }
+
+    pub fn progress(&self) -> JobKillProgress {
+        let mut progress = self.progress;
+        if let Some(process) = self.frames.last().and_then(|frame| frame.process.as_ref()) {
+            progress.process_work = progress
+                .process_work
+                .saturating_add(process.progress().work_done);
+        }
+        progress
+    }
+
+    pub fn probe(&self, request: Observation) -> Result<ObservationResult, SystemCallError> {
+        self.ops.probe(request.control, request.signals)
+    }
+
+    pub fn stage(&self) -> JobKillStage {
+        let frame = self
+            .frames
+            .last()
+            .expect("Job collector owns its active frame");
+        match frame.phase {
+            JobPhase::Seal => JobKillStage::Seal,
+            JobPhase::Members => JobKillStage::EnumerateMembers,
+            JobPhase::DeriveMember => JobKillStage::DeriveMember,
+            JobPhase::KillMember => JobKillStage::KillMember,
+            JobPhase::CollectMember => JobKillStage::CollectMember(
+                frame
+                    .process
+                    .as_ref()
+                    .map_or(SupervisionStage::WaitReapable, Collector::stage),
+            ),
+            JobPhase::Children => JobKillStage::EnumerateChildren,
+            JobPhase::DeriveChild => JobKillStage::DeriveChild,
+            JobPhase::CloseChild => JobKillStage::CloseChild,
+            JobPhase::WaitClosed => JobKillStage::WaitClosed,
+            JobPhase::VerifyDead | JobPhase::Done => JobKillStage::VerifyDead,
+        }
+    }
+
+    fn fail_current(&self, cause: JobKillCause) -> JobCollectorError {
+        self.fail(self.stage(), cause)
+    }
+
+    fn fail(&self, stage: JobKillStage, cause: JobKillCause) -> JobCollectorError {
+        JobCollectorError {
+            stage,
+            cause,
+            progress: self.progress(),
+        }
+    }
+
+    pub fn step(&mut self, now_ns: u64) -> Result<JobCollectorEvent, JobCollectorError> {
+        let i = self.frames.len() - 1;
+        if self.frames[i].phase == JobPhase::Done {
+            if i == 0 {
+                return Ok(JobCollectorEvent::Done);
+            }
+            self.frames.pop();
+            self.frames
+                .last_mut()
+                .expect("parent frame missing after child completion")
+                .phase = JobPhase::CloseChild;
+            return Ok(JobCollectorEvent::Progress);
+        }
+        match self.frames[i].phase {
+            JobPhase::Seal => {
+                self.ops
+                    .seal_job(self.frames[i].job)
+                    .map_err(|e| self.fail(JobKillStage::Seal, JobKillCause::System(e)))?;
+                self.frames[i].phase = JobPhase::Members;
+                Ok(JobCollectorEvent::Progress)
+            }
+            JobPhase::Members | JobPhase::Children => {
+                let children = self.frames[i].phase == JobPhase::Children;
+                let (kind, cursor) = if children {
+                    (JobMemberKind::ChildJobs, self.frames[i].child_enum_cursor)
+                } else {
+                    (
+                        JobMemberKind::MemberProcesses,
+                        self.frames[i].member_enum_cursor,
+                    )
+                };
+                let mut page = [0u64; JOB_ENUMERATE_MAX];
+                let result = self
+                    .ops
+                    .enumerate_job(self.frames[i].job, kind, cursor, &mut page)
+                    .map_err(|e| {
+                        self.fail(
+                            if children {
+                                JobKillStage::EnumerateChildren
+                            } else {
+                                JobKillStage::EnumerateMembers
+                            },
+                            JobKillCause::System(e),
+                        )
+                    })?;
+                let actual = result.actual as usize;
+                let stalls = if children {
+                    &mut self.frames[i].child_stalls
+                } else {
+                    &mut self.frames[i].member_stalls
+                };
+                if actual == 0 && result.more != 0 {
+                    *stalls = stalls.saturating_add(1);
+                    if *stalls >= self.policy.enumerate_stalls {
+                        return Err(self.fail(
+                            if children {
+                                JobKillStage::EnumerateChildren
+                            } else {
+                                JobKillStage::EnumerateMembers
+                            },
+                            JobKillCause::Timeout,
+                        ));
+                    }
+                } else {
+                    *stalls = 0;
+                    let reserve_failed = {
+                        let target = if children {
+                            &mut self.frames[i].children
+                        } else {
+                            &mut self.frames[i].members
+                        };
+                        if target.try_reserve_exact(actual).is_err() {
+                            true
+                        } else {
+                            target.extend_from_slice(&page[..actual]);
+                            false
+                        }
+                    };
+                    if reserve_failed {
+                        return Err(self.fail(
+                            if children {
+                                JobKillStage::EnumerateChildren
+                            } else {
+                                JobKillStage::EnumerateMembers
+                            },
+                            JobKillCause::System(SystemCallError::OutOfMemory),
+                        ));
+                    }
+                }
+                if result.more == 0 {
+                    self.frames[i].phase = if children {
+                        JobPhase::DeriveChild
+                    } else {
+                        JobPhase::DeriveMember
+                    };
+                } else if children {
+                    self.frames[i].child_enum_cursor = result.next_cursor;
+                } else {
+                    self.frames[i].member_enum_cursor = result.next_cursor;
+                }
+                Ok(JobCollectorEvent::Progress)
+            }
+            JobPhase::DeriveMember => {
+                if self.frames[i].member_cursor == self.frames[i].members.len() {
+                    self.frames[i].phase = JobPhase::Children;
+                    return Ok(JobCollectorEvent::Progress);
+                }
+                let pid = self.frames[i].members[self.frames[i].member_cursor];
+                match self.ops.derive_job(
+                    self.frames[i].job,
+                    JobMemberKind::MemberProcesses,
+                    pid,
+                    DERIVED_CONTROL_RIGHTS,
+                ) {
+                    Ok(control) => {
+                        self.frames[i].current = Some(SupervisionTarget::new(pid, control));
+                        self.frames[i].phase = JobPhase::KillMember;
+                    }
+                    Err(SystemCallError::ObjectNotFound) => self.frames[i].member_cursor += 1,
+                    Err(error) => {
+                        return Err(
+                            self.fail(JobKillStage::DeriveMember, JobKillCause::System(error))
+                        );
+                    }
+                }
+                Ok(JobCollectorEvent::Progress)
+            }
+            JobPhase::KillMember => {
+                let target = self.frames[i]
+                    .current
+                    .take()
+                    .expect("kill lost process authority");
+                match self.ops.kill(target.control(), self.code) {
+                    Ok(()) => {
+                        self.frames[i].current = Some(target);
+                        self.frames[i].phase = JobPhase::CollectMember;
+                        Ok(JobCollectorEvent::Progress)
+                    }
+                    Err(error) => {
+                        self.frames[i].current = Some(target);
+                        Err(self.fail(JobKillStage::KillMember, JobKillCause::System(error)))
+                    }
+                }
+            }
+            JobPhase::CollectMember => {
+                if self.frames[i].process.is_none() {
+                    let target = self.frames[i]
+                        .current
+                        .take()
+                        .expect("member authority must remain owned");
+                    self.frames[i].process = Some(Collector::new_with_ops(
+                        target,
+                        self.policy,
+                        self.ops.clone(),
+                    ));
+                }
+                let collector = self.frames[i]
+                    .process
+                    .take()
+                    .expect("member machine must remain owned");
+                match collector.step(now_ns) {
+                    StepOutcome::Observe(request, next) => {
+                        self.frames[i].process = Some(next);
+                        Ok(JobCollectorEvent::Observe(request))
+                    }
+                    StepOutcome::Continue(next) => {
+                        self.frames[i].process = Some(next);
+                        Ok(JobCollectorEvent::Progress)
+                    }
+                    StepOutcome::RetryAt(at, next) => {
+                        self.frames[i].process = Some(next);
+                        Ok(JobCollectorEvent::RetryAt(at))
+                    }
+                    StepOutcome::Done(collected) => {
+                        self.progress.members_collected =
+                            self.progress.members_collected.saturating_add(1);
+                        self.progress.process_work = self
+                            .progress
+                            .process_work
+                            .saturating_add(collected.progress.work_done);
+                        self.frames[i].member_cursor += 1;
+                        self.frames[i].phase = JobPhase::DeriveMember;
+                        Ok(JobCollectorEvent::Progress)
+                    }
+                    StepOutcome::Escalate(failure) => {
+                        self.frames[i].process = Some(failure.collector);
+                        Err(self.fail(
+                            JobKillStage::CollectMember(failure.stage),
+                            JobKillCause::Process(failure.cause),
+                        ))
+                    }
+                }
+            }
+            JobPhase::DeriveChild => {
+                if self.frames[i].child_cursor == self.frames[i].children.len() {
+                    self.frames[i].phase = JobPhase::WaitClosed;
+                    return Ok(JobCollectorEvent::Progress);
+                }
+                let jid = self.frames[i].children[self.frames[i].child_cursor];
+                self.frames.try_reserve_exact(1).map_err(|_| {
+                    self.fail(
+                        JobKillStage::DeriveChild,
+                        JobKillCause::System(SystemCallError::OutOfMemory),
+                    )
+                })?;
+                let mut prepared = Self::new_frame(Handle::INVALID).map_err(|error| {
+                    self.fail(JobKillStage::DeriveChild, JobKillCause::System(error))
+                })?;
+                match self.ops.derive_job(
+                    self.frames[i].job,
+                    JobMemberKind::ChildJobs,
+                    jid,
+                    DERIVED_CONTROL_RIGHTS,
+                ) {
+                    Ok(child) => {
+                        self.frames[i].child_job = Some(child);
+                        self.frames[i].phase = JobPhase::CloseChild;
+                        prepared.job = child;
+                        self.frames.push(prepared);
+                    }
+                    Err(SystemCallError::ObjectNotFound) => self.frames[i].child_cursor += 1,
+                    Err(error) => {
+                        return Err(
+                            self.fail(JobKillStage::DeriveChild, JobKillCause::System(error))
+                        );
+                    }
+                }
+                Ok(JobCollectorEvent::Progress)
+            }
+            JobPhase::CloseChild => {
+                let child_job = self.frames[i].child_job.expect("child job missing");
+                // SAFETY: child_job was derived by this frame and is closed only after success.
+                self.ops
+                    .close(child_job)
+                    .map_err(|e| self.fail(JobKillStage::CloseChild, JobKillCause::System(e)))?;
+                self.frames[i].child_job = None;
+                self.frames[i].child_cursor += 1;
+                self.progress.children_collected =
+                    self.progress.children_collected.saturating_add(1);
+                self.frames[i].phase = JobPhase::DeriveChild;
+                Ok(JobCollectorEvent::Progress)
+            }
+            JobPhase::WaitClosed => {
+                let job = self.frames[i].job;
+                self.frames[i]
+                    .observation
+                    .request(job, ObjectSignals::CLOSED, now_ns, self.policy)
+                    .map(JobCollectorEvent::Observe)
+                    .map_err(|cause| {
+                        self.fail(JobKillStage::WaitClosed, JobKillCause::Process(cause))
+                    })
+            }
+            JobPhase::VerifyDead => {
+                let snapshot = self
+                    .ops
+                    .query_job(self.frames[i].job)
+                    .map_err(|e| self.fail(JobKillStage::VerifyDead, JobKillCause::System(e)))?;
+                if snapshot.state != JobState::Dead as u32 {
+                    return Err(self.fail(
+                        JobKillStage::VerifyDead,
+                        JobKillCause::InconsistentState(snapshot.state),
+                    ));
+                }
+                self.frames[i].phase = JobPhase::Done;
+                if i == 0 {
+                    Ok(JobCollectorEvent::Done)
+                } else {
+                    Ok(JobCollectorEvent::Progress)
+                }
+            }
+            JobPhase::Done => unreachable!("completed frame handled before dispatch"),
+        }
+    }
+
+    /// 消费指定观察，只改变状态；下一步事件必须由 step 明确取得。
+    pub fn observe(
+        &mut self,
+        request: Observation,
+        result: ObservationResult,
+        now: u64,
+    ) -> Result<(), JobCollectorError> {
+        let frame = self
+            .frames
+            .last_mut()
+            .expect("job collector owns a root frame");
+        let outcome = match frame.phase {
+            JobPhase::CollectMember => frame
+                .process
+                .as_mut()
+                .ok_or(SupervisionCause::System(SystemCallError::IllegalArgument))
+                .and_then(|process| process.observe(request, result, now)),
+            JobPhase::WaitClosed => frame.observation.accept(request, result, now).map(|ready| {
+                if ready {
+                    frame.phase = JobPhase::VerifyDead;
+                }
+            }),
+            _ => Err(SupervisionCause::System(SystemCallError::IllegalArgument)),
+        };
+        outcome.map_err(|cause| self.fail_current(JobKillCause::Process(cause)))
+    }
+
+    pub fn replenish(&mut self, policy: SupervisionPolicy) {
+        self.policy = policy;
+        let frame = self
+            .frames
+            .last_mut()
+            .expect("job collector owns a root frame");
+        frame.observation.renew();
+        if let Some(process) = &mut frame.process {
+            process.replenish(policy);
+        }
+    }
+}
+
 pub fn job_kill_with_policy(
     job: Handle,
     code: i64,
     policy: SupervisionPolicy,
 ) -> Result<(), JobKillFailure> {
-    let mut progress = JobKillProgress::default();
-    if !valid_policy(policy) {
-        return Err(job_failure(
-            job,
-            JobKillStage::Seal,
-            JobKillCause::System(SystemCallError::IllegalArgument),
-            progress,
-        ));
-    }
-    process::seal_job(job).map_err(|error| {
+    let collector = JobCollector::new(job, code, policy).map_err(|error| {
         job_failure(
             job,
             JobKillStage::Seal,
             JobKillCause::System(error),
-            progress,
+            JobKillProgress::default(),
         )
     })?;
+    collect_job_remaining(collector)
+}
 
-    let members =
-        enumerate_members_with_limit(job, JobMemberKind::MemberProcesses, policy.enumerate_stalls)
-            .map_err(|error| {
-                job_failure(
-                    job,
-                    JobKillStage::EnumerateMembers,
-                    JobKillCause::System(error),
-                    progress,
-                )
-            })?;
-    for pid in members {
-        let control = match process::derive_job(
-            job,
-            JobMemberKind::MemberProcesses,
-            pid,
-            DERIVED_CONTROL_RIGHTS,
-        ) {
-            Ok(control) => control,
-            Err(SystemCallError::ObjectNotFound) => continue,
+/// 同步驱动原 Job 机器；失败结果按值返还，不需要错误包装分配。
+pub fn collect_job_remaining(mut collector: JobCollector) -> Result<(), JobKillFailure> {
+    loop {
+        let result: Result<bool, JobCollectorError> = (|| {
+            let now = rinlib::time::snapshot()
+                .map_err(|error| collector.fail_current(JobKillCause::System(error)))?
+                .now_ns;
+            match collector.step(now)? {
+                JobCollectorEvent::Progress => Ok(false),
+                JobCollectorEvent::Done => Ok(true),
+                JobCollectorEvent::Observe(request) => {
+                    let (now, result) = observation::wait(request)
+                        .map_err(|error| collector.fail_current(JobKillCause::System(error)))?;
+                    collector.observe(request, result, now)?;
+                    Ok(false)
+                }
+                JobCollectorEvent::RetryAt(at) => {
+                    rinlib::time::sleep_until(Deadline::at(at))
+                        .map_err(|error| collector.fail_current(JobKillCause::System(error)))?;
+                    Ok(false)
+                }
+            }
+        })();
+        match result {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(error) => {
-                return Err(job_failure(
-                    job,
-                    JobKillStage::DeriveMember,
-                    JobKillCause::System(error),
-                    progress,
-                ));
-            }
-        };
-        let target = SupervisionTarget::new(pid, control);
-        if let Err(error) = process::kill(control, code) {
-            return Err(JobKillFailure {
-                job,
-                process: Some(target),
-                stage: JobKillStage::KillMember,
-                cause: JobKillCause::System(error),
-                progress,
-            });
-        }
-        match collect_process(target, policy) {
-            Ok(collected) => {
-                progress.members_collected = progress.members_collected.saturating_add(1);
-                progress.process_work = progress
-                    .process_work
-                    .saturating_add(collected.progress.work_done);
-            }
-            Err(failure) => {
-                progress.process_work = progress
-                    .process_work
-                    .saturating_add(failure.progress.work_done);
                 return Err(JobKillFailure {
-                    job,
-                    process: Some(failure.target),
-                    stage: JobKillStage::CollectMember(failure.stage),
-                    cause: JobKillCause::Process(failure.cause),
-                    progress,
+                    job: collector.root_job(),
+                    collector: Some(collector),
+                    stage: error.stage,
+                    cause: error.cause,
+                    progress: error.progress,
                 });
             }
         }
     }
-
-    let children =
-        enumerate_members_with_limit(job, JobMemberKind::ChildJobs, policy.enumerate_stalls)
-            .map_err(|error| {
-                job_failure(
-                    job,
-                    JobKillStage::EnumerateChildren,
-                    JobKillCause::System(error),
-                    progress,
-                )
-            })?;
-    for jid in children {
-        let child =
-            match process::derive_job(job, JobMemberKind::ChildJobs, jid, DERIVED_CONTROL_RIGHTS) {
-                Ok(child) => child,
-                Err(SystemCallError::ObjectNotFound) => continue,
-                Err(error) => {
-                    return Err(job_failure(
-                        job,
-                        JobKillStage::DeriveChild,
-                        JobKillCause::System(error),
-                        progress,
-                    ));
-                }
-            };
-        job_kill_with_policy(child, code, policy)?;
-        // SAFETY: 本路径取得并完成收束的派生 child JobControl，不包含映射 owner。
-        if let Err(error) = unsafe { close(child) } {
-            return Err(job_failure(
-                child,
-                JobKillStage::CloseChild,
-                JobKillCause::System(error),
-                progress,
-            ));
-        }
-        progress.children_collected = progress.children_collected.saturating_add(1);
-    }
-
-    let mut closed = false;
-    for _ in 0..policy.wait_attempts {
-        match wait_many(
-            &[WaitItem::new(job, ObjectSignals::CLOSED, 0)],
-            policy.wait_timeout_ms,
-        ) {
-            Ok(result) if result.observed.intersects(ObjectSignals::CLOSED) => {
-                closed = true;
-                break;
-            }
-            Ok(result) if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) => {}
-            Ok(_) => {
-                return Err(job_failure(
-                    job,
-                    JobKillStage::WaitClosed,
-                    JobKillCause::System(SystemCallError::InternalError),
-                    progress,
-                ));
-            }
-            Err(SystemCallError::ObjectBusy) => {}
-            Err(error) => {
-                return Err(job_failure(
-                    job,
-                    JobKillStage::WaitClosed,
-                    JobKillCause::System(error),
-                    progress,
-                ));
-            }
-        }
-    }
-    if !closed {
-        return Err(job_failure(
-            job,
-            JobKillStage::WaitClosed,
-            JobKillCause::Timeout,
-            progress,
-        ));
-    }
-    let snapshot = process::query_job(job).map_err(|error| {
-        job_failure(
-            job,
-            JobKillStage::VerifyDead,
-            JobKillCause::System(error),
-            progress,
-        )
-    })?;
-    if snapshot.state != JobState::Dead as u32 {
-        return Err(job_failure(
-            job,
-            JobKillStage::VerifyDead,
-            JobKillCause::InconsistentState(snapshot.state),
-            progress,
-        ));
-    }
-    Ok(())
 }
 
 fn valid_policy(policy: SupervisionPolicy) -> bool {
@@ -697,7 +1050,7 @@ fn job_failure(
 ) -> JobKillFailure {
     JobKillFailure {
         job,
-        process: None,
+        collector: None,
         stage,
         cause,
         progress,
@@ -837,6 +1190,151 @@ fn map_stack(builder: Handle) -> Result<(), SpawnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    #[derive(Debug, Default)]
+    struct FakeJobState {
+        close_failures: usize,
+        close_successes: usize,
+        member: bool,
+        drain_calls: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeJobOps {
+        state: Rc<RefCell<FakeJobState>>,
+    }
+
+    impl JobOperations for FakeJobOps {
+        fn seal_job(&self, _job: Handle) -> Result<(), SystemCallError> {
+            Ok(())
+        }
+
+        fn enumerate_job(
+            &self,
+            job: Handle,
+            kind: JobMemberKind,
+            cursor: u64,
+            output: &mut [u64],
+        ) -> Result<erhino_shared::proc::JobEnumerateResult, SystemCallError> {
+            if self.state.borrow().member
+                && kind == JobMemberKind::MemberProcesses
+                && job.raw() == 1
+            {
+                output[0] = 7;
+                return Ok(erhino_shared::proc::JobEnumerateResult {
+                    next_cursor: 7,
+                    actual: 1,
+                    more: 0,
+                });
+            }
+            if kind == JobMemberKind::ChildJobs && (job.raw() == 1 || job.raw() == 2) && cursor == 0
+            {
+                output[0] = if job.raw() == 1 { 42 } else { 43 };
+                Ok(erhino_shared::proc::JobEnumerateResult {
+                    next_cursor: 42,
+                    actual: 1,
+                    more: 0,
+                })
+            } else {
+                Ok(erhino_shared::proc::JobEnumerateResult {
+                    next_cursor: cursor,
+                    actual: 0,
+                    more: 0,
+                })
+            }
+        }
+
+        fn derive_job(
+            &self,
+            _job: Handle,
+            kind: JobMemberKind,
+            id: u64,
+            _rights: Rights,
+        ) -> Result<Handle, SystemCallError> {
+            if kind == JobMemberKind::MemberProcesses && id == 7 {
+                return Ok(Handle::from_raw(70));
+            }
+            if kind == JobMemberKind::ChildJobs && id == 42 {
+                Ok(Handle::from_raw(2))
+            } else if kind == JobMemberKind::ChildJobs && id == 43 {
+                Ok(Handle::from_raw(3))
+            } else {
+                Err(SystemCallError::ObjectNotFound)
+            }
+        }
+
+        fn kill(&self, _control: Handle, _code: i64) -> Result<(), SystemCallError> {
+            Ok(())
+        }
+
+        fn query_job(
+            &self,
+            job: Handle,
+        ) -> Result<erhino_shared::proc::JobSnapshot, SystemCallError> {
+            Ok(erhino_shared::proc::JobSnapshot {
+                jid: job.raw(),
+                parent_jid: 0,
+                state: JobState::Dead as u32,
+                live_processes: 0,
+                live_children: 0,
+                reserved: 0,
+                reserved2: 0,
+            })
+        }
+    }
+
+    impl ProcessOperations for FakeJobOps {
+        fn probe(
+            &self,
+            _: Handle,
+            signals: ObjectSignals,
+        ) -> Result<ObservationResult, SystemCallError> {
+            Ok(ObservationResult::Ready(signals))
+        }
+        fn drain(
+            &self,
+            _control: Handle,
+            _work: u32,
+        ) -> Result<erhino_shared::proc::ProcessDrainResult, SystemCallError> {
+            let mut state = self.state.borrow_mut();
+            assert!(state.member);
+            state.drain_calls += 1;
+            match state.drain_calls {
+                1 => Ok(erhino_shared::proc::ProcessDrainResult {
+                    work_done: 3,
+                    status: erhino_shared::proc::ProcessDrainStatus::More as u32,
+                    reserved: 0,
+                }),
+                2 => Err(SystemCallError::InternalError),
+                _ => Ok(erhino_shared::proc::ProcessDrainResult {
+                    work_done: 2,
+                    status: erhino_shared::proc::ProcessDrainStatus::Complete as u32,
+                    reserved: 0,
+                }),
+            }
+        }
+        fn query(&self, _control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
+            Ok(ProcessSnapshot {
+                pid: 7,
+                parent_pid: 0,
+                state: erhino_shared::proc::ProcessState::Dead as u32,
+                reason: 0,
+                code: 0,
+                reserved: 0,
+            })
+        }
+        fn close(&self, _control: Handle) -> Result<(), SystemCallError> {
+            let mut state = self.state.borrow_mut();
+            if state.close_failures != 0 {
+                state.close_failures -= 1;
+                return Err(SystemCallError::ObjectBusy);
+            }
+            state.close_successes += 1;
+            Ok(())
+        }
+    }
 
     #[test]
     fn spawn_requires_cleanup_authority_before_parsing_or_syscalls() {
@@ -882,14 +1380,87 @@ mod tests {
             policy,
         )
         .unwrap_err();
-        assert_eq!(failure.target.pid(), 7);
-        assert_eq!(failure.target.control().raw(), 0x1_0000_0001);
+        assert_eq!(failure.collector.pid(), 7);
+        assert_eq!(failure.collector.wait_control().raw(), 0x1_0000_0001);
         assert_eq!(failure.stage, SupervisionStage::WaitReapable);
         assert_eq!(failure.cause, SupervisionCause::InvalidPolicy);
 
         let failure = job_kill_with_policy(Handle::from_raw(0x2_0000_0001), 1, policy).unwrap_err();
         assert_eq!(failure.job.raw(), 0x2_0000_0001);
         assert_eq!(failure.stage, JobKillStage::Seal);
-        assert!(failure.process.is_none());
+        assert!(failure.collector.is_none());
+    }
+
+    #[test]
+    fn job_failure_reports_current_process_work_without_double_counting_recovery() {
+        let state = Rc::new(RefCell::new(FakeJobState {
+            member: true,
+            ..FakeJobState::default()
+        }));
+        let mut collector = JobCollector::new_with_ops(
+            Handle::from_raw(1),
+            0,
+            DEFAULT_SUPERVISION_POLICY,
+            FakeJobOps { state },
+        )
+        .unwrap();
+        let mut failed = false;
+        loop {
+            match collector.step(0) {
+                Ok(JobCollectorEvent::Observe(request)) => collector
+                    .observe(request, ObservationResult::Ready(request.signals), 0)
+                    .unwrap(),
+                Ok(JobCollectorEvent::Progress) => {}
+                Ok(JobCollectorEvent::Done) => break,
+                Ok(JobCollectorEvent::RetryAt(_)) => panic!("fixture uses a hard failure"),
+                Err(error) => {
+                    assert!(!failed);
+                    failed = true;
+                    assert_eq!(
+                        error.stage,
+                        JobKillStage::CollectMember(SupervisionStage::Drain)
+                    );
+                    assert_eq!(error.progress.process_work, 3);
+                    assert_eq!(collector.progress().process_work, 3);
+                }
+            }
+        }
+        assert!(failed);
+        assert_eq!(collector.progress().process_work, 5);
+        assert_eq!(collector.progress().members_collected, 1);
+    }
+
+    #[test]
+    fn job_collector_recovers_nested_child_close_failure_without_double_close() {
+        let state = Rc::new(RefCell::new(FakeJobState {
+            close_failures: 1,
+            close_successes: 0,
+            ..FakeJobState::default()
+        }));
+        let ops = FakeJobOps {
+            state: state.clone(),
+        };
+        let mut collector =
+            JobCollector::new_with_ops(Handle::from_raw(1), 0x55, DEFAULT_SUPERVISION_POLICY, ops)
+                .unwrap();
+        let mut now = 0;
+        loop {
+            match collector.step(now) {
+                Ok(JobCollectorEvent::RetryAt(at)) => now = at,
+                Ok(JobCollectorEvent::Observe(request)) => {
+                    collector
+                        .observe(request, ObservationResult::Ready(request.signals), now)
+                        .unwrap();
+                }
+                Ok(JobCollectorEvent::Progress) => {}
+                Ok(JobCollectorEvent::Done) => break,
+                Err(error) => {
+                    assert_eq!(error.stage, JobKillStage::CloseChild);
+                    assert_eq!(state.borrow().close_successes, 0);
+                    now = now.saturating_add(1_000_000);
+                }
+            }
+        }
+        assert_eq!(state.borrow().close_successes, 2);
     }
 }

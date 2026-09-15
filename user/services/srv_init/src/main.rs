@@ -21,15 +21,19 @@
 #![no_std]
 
 use libprocess::{
-    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, RequiredLaunchSet, SpawnRequest,
-    SupervisionCause, SupervisionProgress, SupervisionStage, SupervisionTarget, collect_process,
-    enumerate_members, job_kill, spawn,
+    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, RequiredLaunchSet,
+    SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
+    SupervisionStage, SupervisionTarget, collect_process, enumerate_members, spawn,
 };
 use librpc::{
     CallCause, CallError, CallPhase, Caller, FrameRejection, Request, RpcMessageKind, RpcPrefix,
 };
-use librunnel::blocking;
+use librunnel::{ConsumerReady, blocking};
+use libsrv::runtime::{
+    Advance, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step, Task,
+};
 use rinlib::ipc::tunnel as tunnel_sys;
+use rinlib::ipc::wait_set::WaitSet;
 use rinlib::ipc::{
     capability::Capability,
     message::{MailboxSender, SendOnce},
@@ -66,6 +70,9 @@ use rinlib::{
     system,
 };
 
+mod supervisor;
+use supervisor::RootSupervisor;
+
 mod building;
 mod public_ipc;
 #[cfg(feature = "acceptance-stress")]
@@ -83,17 +90,18 @@ struct Supervised {
 
 struct LaunchedServices {
     pm_mailbox: Handle,
-    supervised: alloc::vec::Vec<Supervised>,
     target_image: Option<alloc::vec::Vec<u8>>,
     hammer_image: Option<alloc::vec::Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SupervisionBatchFailure {
-    pid: u64,
-    stage: SupervisionStage,
-    cause: SupervisionCause,
-    progress: SupervisionProgress,
+enum RunFailure {
+    Message(&'static str),
+}
+
+impl From<&'static str> for RunFailure {
+    fn from(message: &'static str) -> Self {
+        Self::Message(message)
+    }
 }
 
 /// 拓扑语义名登记：内核无名字概念，init 在建域与启动时记录 jid/pid
@@ -232,22 +240,24 @@ fn required_image(name: &str) -> Option<u64> {
 /// 从声明式 initfs 政策启动服务拓扑。必选映像缺失或任一必选 spawn 失败使
 /// 整个 stage 失败；test_fp 是按 admitted execution domain 决定的可选服务。
 fn launch_test_services(
+    root: &mut RootSupervisor,
     services: Handle,
     pm_domain: Handle,
     acceptance: Handle,
     names: &mut TopologyNames,
 ) -> Result<LaunchedServices, &'static str> {
-    let pm_mailbox = create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
-    )
-    .map_err(|_| "pm mailbox create failed")?;
+    let pm_mailbox = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
+        )
+        .map_err(|_| "pm mailbox create failed")?;
     // GRANT 是直接跨表安装：授出的源 handle 被消费，先复制保留 init 对
     // 委托域的直接收束权（兜底 job_kill 的 authority 源）。
-    let delegated_domain =
-        duplicate(pm_domain, JOB_FULL_RIGHTS).map_err(|_| "pm domain duplicate failed")?;
+    let delegated_domain = root
+        .duplicate(pm_domain, JOB_FULL_RIGHTS)
+        .map_err(|_| "pm domain duplicate failed")?;
     let control_rights = SUPERVISOR_RIGHTS;
-    let mut supervised = alloc::vec::Vec::new();
     let mut manifest = RequiredLaunchSet::new(REQUIRED_IMAGES, REQUIRED_STARTED);
     let mut stage_failure = None;
     // test_target/test_hammer 映像留存：竞态矩阵与验收线的靶/锤复用。
@@ -290,14 +300,26 @@ fn launch_test_services(
         } else {
             (services, &[])
         };
-        match spawn(SpawnRequest {
+        if root.reserve_process().is_err() {
+            stage_failure = Some("process supervision admission failed");
+            return;
+        }
+        let spawned = spawn(SpawnRequest {
             memory_pool: root_memory_pool(),
             job,
             image: entry.data,
             payload: &[],
             grants,
             control_rights,
-        }) {
+        });
+        if entry.name == "bin/srv_pm"
+            && (spawned.is_ok()
+                || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
+        {
+            root.transferred(pm_mailbox.owner);
+            root.transferred(delegated_domain);
+        }
+        match spawned {
             Ok(process) => {
                 if let Some(bit) = required {
                     manifest.mark_started(bit);
@@ -310,7 +332,12 @@ fn launch_test_services(
                     // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
                     // acceptance Job 枚举可见 test_target 的 pid，派生 MANAGE
                     // control 后 kill——保留 control 在派生接管后关闭。
-                    test_derive_kill(acceptance, process.pid, process.control);
+                    if let Err(error) =
+                        test_derive_kill(root, acceptance, process.pid, process.control)
+                    {
+                        stage_failure = Some(error);
+                        return;
+                    }
                     // 委托域靶：control 即弃（关闭 control 永不隐式终止），
                     // pm 的派生因此走铸造路径，域内收束权归 pm。
                     match spawn(SpawnRequest {
@@ -333,7 +360,7 @@ fn launch_test_services(
                         }
                     }
                 } else {
-                    supervised.push(Supervised {
+                    root.track_process(Supervised {
                         pid: process.pid,
                         control: process.control,
                     });
@@ -375,9 +402,6 @@ fn launch_test_services(
         stage_failure = Some("required topology incomplete");
     }
     if let Some(failure) = stage_failure {
-        let _ = unsafe { close(delegated_domain) };
-        let _ = unsafe { close(pm_mailbox.owner) };
-        let _ = unsafe { close(pm_mailbox.peer) };
         return Err(failure);
     }
     debug!(
@@ -387,7 +411,6 @@ fn launch_test_services(
     );
     Ok(LaunchedServices {
         pm_mailbox: pm_mailbox.peer,
-        supervised,
         target_image,
         hammer_image,
     })
@@ -471,44 +494,41 @@ fn main() {
     let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
     let reset =
         env::startup_handle(initial::SYSTEM_RESET).expect("init must hold SystemReset authority");
-    let services = match process::create_job(root_job, JOB_FULL_RIGHTS) {
+    // 尚无服务责任时准备根承载；失败不会遗忘已启动服务。
+    let mut root = loop {
+        match RootSupervisor::prepare() {
+            Ok(root) => break root,
+            Err(error) => {
+                debug!("root supervisor preparation failed: {:?}", error);
+                if let Ok(deadline) = rinlib::time::timeout_millis(100) {
+                    let _ = rinlib::time::sleep_until(deadline);
+                }
+            }
+        }
+    };
+    let services = match root.create_job(root_job, JOB_FULL_RIGHTS) {
         Ok(job) => job,
         Err(error) => {
             debug!("services job create failed: {:?}", error);
-            steady_state();
+            root.serve_forever();
         }
     };
-    debug!("services job established");
-    if let Err(stage) = run(services) {
-        debug!("init acceptance failed: {}", stage);
-        // root 仍持 services JobControl；有限收束失败时保留该 authority 并进入
-        // 稳态接管，成功才提交 SystemFailure reset。
-        match job_kill(services, 0x1F) {
-            Ok(()) => {
-                debug!("failure-path services collection completed");
-                debug!("init: submitting failure shutdown");
-                match system::reset(reset, ResetAction::Shutdown, ResetReason::SystemFailure) {
-                    Err(error) => {
-                        debug!("failure shutdown rejected: {:?}", error);
-                        steady_state()
-                    }
-                    Ok(never) => match never {},
-                }
-            }
-            Err(error) => {
-                debug!(
-                    "root supervision retained authority after failed collection: {:?}",
-                    error
-                );
-                steady_state()
-            }
-        }
+    if let Err(error) = root.bind_services(services) {
+        debug!("root standby preparation failed: {:?}", error);
+        root.serve_forever();
     }
-    submit_shutdown(root_job, reset);
+    debug!("services job established");
+    if let Err(failure) = run(&mut root, services) {
+        match failure {
+            RunFailure::Message(stage) => debug!("init acceptance failed: {}", stage),
+        }
+        root.serve_forever();
+    }
+    submit_shutdown(root_job, reset, root);
 }
 
 /// 先验证 capability 负路径，再提交唯一的成功路径。
-fn submit_shutdown(root_job: Handle, reset: Handle) -> ! {
+fn submit_shutdown(root_job: Handle, reset: Handle, root: RootSupervisor) -> ! {
     assert!(matches!(
         system::reset(root_job, ResetAction::Shutdown, ResetReason::Requested),
         Err(SystemCallError::WrongObjectType)
@@ -526,48 +546,23 @@ fn submit_shutdown(root_job: Handle, reset: Handle) -> ! {
     match system::reset(reset, ResetAction::Shutdown, ResetReason::Requested) {
         Err(error) => {
             debug!("system reset failed: {:?}", error);
-            steady_state()
+            root.idle_forever()
         }
         Ok(never) => match never {},
     }
 }
 
-/// 平台拒绝系统复位后的稳定形态：init 保持 root supervisor 存活并等待。
-fn steady_state() -> ! {
-    let endpoint = create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT,
-    )
-    .expect("steady-state endpoint create failed");
-    debug!("init: steady-state supervision (persistent root supervisor)");
-    loop {
-        match wait_message(endpoint.owner) {
-            Ok(message) => {
-                debug!(
-                    "BUG: steady-state endpoint received kind {}",
-                    message.header.kind
-                )
-            }
-            Err(error) => debug!("steady-state wait ended: {:?}", error),
-        }
-    }
-}
-
 /// 小集合收束辅助：对保留 control 的服务 kill → 等待收束 → Drain →
 /// close（验收线 1 的派生接管路径复用）。
-fn kill_and_supervise(job: Handle, mut supervised: alloc::vec::Vec<Supervised>) {
+fn kill_and_supervise(
+    root: &mut RootSupervisor,
+    _job: Handle,
+    supervised: alloc::vec::Vec<Supervised>,
+) -> Result<(), &'static str> {
     for target in &supervised {
         let _ = process::kill(target.control, 0x1F);
     }
-    if let Err(error) = supervise_services(&mut supervised) {
-        debug!(
-            "process supervision handoff: pid={}, stage={:?}, cause={:?}, progress={:?}",
-            error.pid, error.stage, error.cause, error.progress
-        );
-        if let Err(escalation) = job_kill(job, 0x1F) {
-            debug!("job supervision escalation failed: {:?}", escalation);
-        }
-    }
+    root.collect_targets(supervised)
 }
 
 fn test_memory_mapping() -> Result<(), &'static str> {
@@ -888,9 +883,10 @@ fn test_rpc_reject_cleanup() {
         .expect("RPC test worker spawn failed");
 
     // SAFETY: 此 sender 由原始队列工厂创建，本测试在此唯一接管关闭责任。
-    let (service_sender, _) = MailboxSender::from_capability(unsafe { Capability::from_raw(service.peer) })
-        .map_err(|failure| failure.error)
-        .expect("RPC test service sender adoption failed");
+    let (service_sender, _) =
+        MailboxSender::from_capability(unsafe { Capability::from_raw(service.peer) })
+            .map_err(|failure| failure.error)
+            .expect("RPC test service sender adoption failed");
     let mut caller = Caller::new();
     assert!(matches!(
         caller.call(
@@ -925,25 +921,27 @@ fn test_rpc_reject_cleanup() {
 }
 
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
-fn run(services: Handle) -> Result<(), &'static str> {
+fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     debug!("acceptance workload: {}", ACCEPTANCE_WORKLOAD);
     let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
     test_memory_mapping()?;
     #[cfg(not(feature = "acceptance-stress"))]
     test_process_memory_binding(services)?;
-    let pm_domain = process::create_job(services, JOB_FULL_RIGHTS)
+    let pm_domain = root
+        .create_job(services, JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
-    let acceptance = process::create_job(services, JOB_FULL_RIGHTS)
+    let acceptance = root
+        .create_job(services, JOB_FULL_RIGHTS)
         .map_err(|_| "acceptance job create failed")?;
+    root.verify_startup_capture()?;
     let mut names = TopologyNames::new();
     names.register_job(root_job, "root");
     names.register_job(services, "services");
     names.register_job(pm_domain, "pm_domain");
     names.register_job(acceptance, "acceptance");
     names.register_process(env::pid() as u64, "init");
-    let launched = launch_test_services(services, pm_domain, acceptance, &mut names)?;
+    let launched = launch_test_services(root, services, pm_domain, acceptance, &mut names)?;
     let pm_mailbox = launched.pm_mailbox;
-    let mut supervised = launched.supervised;
     let target_image = launched.target_image;
     let hammer_image = launched.hammer_image;
 
@@ -1014,80 +1012,69 @@ fn run(services: Handle) -> Result<(), &'static str> {
     );
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
-    let (mut tunnel, invitation) =
+    let (tunnel, invitation) =
         match blocking::Consumer::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere) {
             Ok((consumer, invitation)) => (consumer, invitation),
             Err(blocking::CreateFailure::System(error)) => {
                 debug!("tunnel create failed: {:?}", error);
-                return Err("tunnel create failed");
+                return Err(RunFailure::Message("tunnel create failed"));
             }
             Err(blocking::CreateFailure::Protocol {
                 endpoint,
                 invitation,
                 error,
             }) => {
-                // 协议初始化失败：本地映射与未发布邀请双 owner 显式关闭，失败仅记录。
-                if let Err((_, close_error)) = endpoint.close() {
-                    debug!("tunnel endpoint close failed: {:?}", close_error);
-                }
-                if let Err((_, close_error)) = invitation.into_capability().close() {
-                    debug!("tunnel invitation close failed: {:?}", close_error);
-                }
+                root.retain_transport(endpoint, invitation);
                 debug!("tunnel protocol init failed: {:?}", error);
-                return Err("tunnel init failed");
+                return Err(RunFailure::Message("tunnel init failed"));
             }
         };
+    root.start_read(tunnel, alloc::vec::Vec::new());
     debug!("tunnel created");
     // 生产侧以 typed Packet 转移 Invitation：失败完整返还 owner，
     // 不再以裸 HandleMove 表达（原失败路径承载直接丢失）。
-    let (pm_sender, _) = MailboxSender::from_capability(
-        // SAFETY: pm_mailbox 是原始队列工厂的 sender peer，此处唯一接管关闭责任；
-        // 发送后转回原始形态供后续验收面复用。
-        unsafe { Capability::from_raw(pm_mailbox) },
-    )
-    .map_err(|failure| {
-        let _ = failure.owner.close();
-        "pm mailbox sender adoption failed"
-    })?;
-    let mut packet = Packet::new(514, &[])
-        .map_err(|_| "tunnel invitation packet allocation failed")?;
+    let mut packet =
+        Packet::new(514, &[]).map_err(|_| "tunnel invitation packet allocation failed")?;
     if let Err(failure) = packet.push(invitation.into_capability(), Rights::MAP) {
-        let _ = failure.capability.close();
-        return Err("tunnel invitation push failed");
+        root.retain_capability(failure.capability);
+        return Err(RunFailure::Message("tunnel invitation push failed"));
     }
-    if let Err(mut failure) = packet.try_send(&pm_sender, rinlib::time::Deadline::INFINITE) {
+    if let Err(mut failure) =
+        packet.try_send(root.sender(pm_mailbox), rinlib::time::Deadline::INFINITE)
+    {
         let (invitation, _) = failure
             .packet
             .pop()
             .expect("tunnel invitation transfer disappeared");
-        let _ = invitation.close();
+        root.retain_capability(invitation);
         debug!("send tunnel invitation failed: {:?}", failure.error);
-        return Err("send tunnel invitation failed");
+        return Err(RunFailure::Message("send tunnel invitation failed"));
     }
-    let pm_mailbox = pm_sender.into_capability().into_raw();
 
-    let mut buf = rinlib::alloc::vec![0u8; STREAM_LEN + 1];
-    let n = tunnel.read_exact_or_eof(&mut buf).map_err(|error| {
-        debug!("stream read failed: {:?}", error);
-        "stream read failed"
-    })?;
+    root.await_read()?;
+    let read = root.read_world();
+    let n = read.filled;
     if n != STREAM_LEN
-        || !buf[..n]
+        || !read.buffer[..n]
             .iter()
             .enumerate()
             .all(|(i, &byte)| byte == (i % 251 + 1) as u8)
     {
-        return Err("stream pattern or length mismatch");
+        return Err(RunFailure::Message("stream pattern or length mismatch"));
     }
     debug!("stream received {} bytes, pattern ok", n);
     debug!(
         "RNL2 multi-page stream passed: bytes={}, capacity={}",
         n,
-        tunnel.capacity()
+        read.tunnel
+            .as_ref()
+            .expect("read duty owns its tunnel")
+            .capacity()
     );
 
     // —— 流控唤醒面：pm 填满目标邮箱后在 WRITABLE 上阻塞，腾位唤醒 ——
-    test_writable_wake(pm_mailbox);
+    test_writable_wake(root, pm_mailbox)?;
+    root.close_control(pm_mailbox)?;
 
     // —— live kill 正路径：Building 目标的确定性 kill/drain/终态验证 ——
     test_building_kill(acceptance);
@@ -1095,16 +1082,18 @@ fn run(services: Handle) -> Result<(), &'static str> {
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image.as_deref() {
-        Some(image) => test_job_management(acceptance, image)?,
-        None => return Err("job management acceptance image unavailable"),
+        Some(image) => test_job_management(root, acceptance, image)?,
+        None => {
+            return Err(RunFailure::Message(
+                "job management acceptance image unavailable",
+            ));
+        }
     }
 
     // 短寿命服务的线程已退出并不释放 AddressSpace；在高峰矩阵前收束已进入
     // Terminating/Dead 的成员，仍 Running 的服务继续由末尾监督闭环持有。
-    let reclaimed = supervise_terminated_services(&mut supervised).map_err(|error| {
-        debug!("pre-race service supervision failed: {:?}", error);
-        "pre-race service supervision failed"
-    })?;
+    root.verify_failure_isolation(acceptance)?;
+    let reclaimed = root.collect_terminated()?;
     debug!(
         "pre-race service supervision reclaimed {} process(es)",
         reclaimed
@@ -1114,35 +1103,36 @@ fn run(services: Handle) -> Result<(), &'static str> {
     // Building kill、Job 管理与服务监督收束。
     #[cfg(feature = "acceptance-stress")]
     match (target_image.as_deref(), hammer_image.as_deref()) {
-        (Some(target), Some(hammer)) => race_matrix(acceptance, target, hammer)?,
-        _ => return Err("race matrix acceptance images unavailable"),
+        (Some(target), Some(hammer)) => race_matrix(root, acceptance, target, hammer)?,
+        _ => {
+            return Err(RunFailure::Message(
+                "race matrix acceptance images unavailable",
+            ));
+        }
     }
     #[cfg(not(feature = "acceptance-stress"))]
     let _ = hammer_image;
 
     // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
     // 稳态拓扑。
-    if let Err(error) = job_kill(acceptance, 0x1E) {
-        debug!("acceptance domain collection failed: {:?}", error);
-        return Err("acceptance domain collection failed");
-    }
+    root.collect_job(acceptance, 0x1E)?;
     debug!("acceptance domain collected");
-    let _ = unsafe { close(acceptance) };
+    root.close_control(acceptance)?;
 
     // —— 监督闭环：等待全部服务 REAPABLE/CLOSED，Drain 至 Complete，
     // 查询稳定终态后释放 control。对象 close 回调（含 pm 隧道端点的
     // PEER_CLOSED 发布）发生在 Drain 期间——监督先于对端终态等待。 ——
-    if let Err(error) = supervise_services(&mut supervised) {
-        debug!(
-            "service supervision requires root handoff: pid={}, stage={:?}, cause={:?}, progress={:?}",
-            error.pid, error.stage, error.cause, error.progress
-        );
-        return Err("service supervision failed");
-    }
+    root.collect_services()?;
     debug!("all services supervised to completion");
 
     // —— 事件面：对端终态位（Drain 已置位，电平等待立即返回）——
-    let peer_closed = wait_supervision_signal(&mut tunnel, "peer-closed")?;
+    let peer_closed = wait_supervision_signal(
+        root.read_world()
+            .tunnel
+            .as_mut()
+            .expect("root owns the tunnel"),
+        "peer-closed",
+    )?;
     debug!(
         "peer closed observed: bits={:#x}",
         peer_closed.observed.raw()
@@ -1150,7 +1140,7 @@ fn run(services: Handle) -> Result<(), &'static str> {
     #[cfg(not(feature = "acceptance-stress"))]
     let tunnel_pool_before_close =
         root_pool_allocated().map_err(|_| "tunnel Pool pre-close query failed")?;
-    tunnel.close().map_err(|_| "tunnel close failed")?;
+    root.close_read()?;
 
     #[cfg(not(feature = "acceptance-stress"))]
     let tunnel_pool_after_close =
@@ -1163,7 +1153,9 @@ fn run(services: Handle) -> Result<(), &'static str> {
                 "tunnel Pool charge did not decrease after close: before={}, after={}",
                 tunnel_pool_before_close, tunnel_pool_after_close
             );
-            return Err("tunnel Pool charge did not refund after close");
+            return Err(RunFailure::Message(
+                "tunnel Pool charge did not refund after close",
+            ));
         }
         debug!(
             "tunnel Pool conservation after close passed: before={}, after={}, refunded={}",
@@ -1177,17 +1169,16 @@ fn run(services: Handle) -> Result<(), &'static str> {
     let domain_state = process::query_job(pm_domain);
     if !matches!(&domain_state, Ok(s) if s.state == JobState::Dead as u32) {
         debug!("pm delegated domain not collected by pm; init collecting");
-        job_kill(pm_domain, 0x1F).map_err(|error| {
-            debug!("pm delegated domain collection failed: {:?}", error);
-            "pm delegated domain collection failed"
-        })?;
+        root.collect_job(pm_domain, 0x1F)?;
     }
     let domain_state = process::query_job(pm_domain).map_err(|error| {
         debug!("pm delegated domain final query failed: {:?}", error);
         "pm delegated domain final query failed"
     })?;
     if domain_state.state != JobState::Dead as u32 {
-        return Err("pm delegated domain did not reach Dead");
+        return Err(RunFailure::Message(
+            "pm delegated domain did not reach Dead",
+        ));
     }
     debug!("pm delegated domain confirmed Dead");
 
@@ -1199,12 +1190,15 @@ fn run(services: Handle) -> Result<(), &'static str> {
             "thread stack cleanup recorded {} abandoned mapping(s), last error {:?}",
             stack_cleanup.abandoned, stack_cleanup.last_error
         );
-        return Err("thread stack cleanup abandoned mappings");
+        return Err(RunFailure::Message(
+            "thread stack cleanup abandoned mappings",
+        ));
     }
     debug!("thread stack cleanup passed");
     debug!("topology: final snapshot before system reset");
     dump_topology(root_job, &names, 0);
-    let _ = unsafe { close(pm_domain) };
+    root.close_control(pm_domain)?;
+    root.verify_idle_ownership()?;
     Ok(())
 }
 
@@ -1276,34 +1270,255 @@ fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
 
 /// 只收束已经离开 Building/Running 的服务，避免已 reaped 线程的地址空间在
 /// 后续高峰负载中继续占帧；状态仍活跃的成员原样留给最终监督闭环。
-fn supervise_terminated_services(
-    supervised: &mut alloc::vec::Vec<Supervised>,
-) -> Result<usize, SupervisionBatchFailure> {
-    let mut reclaimed = 0;
-    let mut index = 0;
-    while index < supervised.len() {
-        let state =
-            process::query(supervised[index].control).map_err(|error| SupervisionBatchFailure {
-                pid: supervised[index].pid,
-                stage: SupervisionStage::VerifyDead,
-                cause: SupervisionCause::System(error),
-                progress: SupervisionProgress::default(),
-            })?;
-        if state.state == ProcessState::Building as u32
-            || state.state == ProcessState::Running as u32
-        {
-            index += 1;
-            continue;
+const KIND_STREAM_READ: SourceKind = 1;
+
+/// 数据面段运行体的世界：流角色与缓冲在段内共享，段末交回脚本。
+struct ReadWorld {
+    tunnel: Option<blocking::Consumer>,
+    buffer: alloc::vec::Vec<u8>,
+    filled: usize,
+    failed: bool,
+}
+
+/// 消费侧读取任务：arm/poll 三条件接入，按预算推进，EOF 即完成。
+struct StreamReadTask {
+    source: Option<SourceId>,
+    arm_failed: Option<SystemCallError>,
+    stopping: bool,
+    removing: bool,
+}
+
+enum InitTask {
+    StreamRead(StreamReadTask),
+}
+
+impl Task<ReadWorld> for StreamReadTask {
+    type Family = InitTask;
+
+    fn advance(
+        &mut self,
+        _id: u64,
+        world: &mut ReadWorld,
+        requests: &mut Requests<InitTask>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        if self.stopping {
+            if let Some(source) = self.source {
+                if !self.removing {
+                    requests.remove(source)?;
+                    self.removing = true;
+                }
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Parked,
+                });
+            }
+            if let Some(tunnel) = world.tunnel.take() {
+                match tunnel.close() {
+                    Ok(()) => {}
+                    Err((tunnel, error)) => {
+                        world.tunnel = Some(tunnel);
+                        debug!("stream read stop close failed: {:?}", error);
+                        return Err(SystemCallError::InternalError);
+                    }
+                }
+            }
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Complete,
+            });
         }
-        let target = supervised.swap_remove(index);
-        let mut ready = alloc::vec::Vec::from([target]);
-        if let Err(failure) = supervise_services(&mut ready) {
-            supervised.append(&mut ready);
-            return Err(failure);
+        let tunnel = world
+            .tunnel
+            .as_mut()
+            .expect("stream read world lost its tunnel");
+        if let Some(error) = self.arm_failed.take() {
+            debug!("stream read source registration failed: {:?}", error);
+            world.failed = true;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Complete,
+            });
         }
-        reclaimed += 1;
+        let mut source = None;
+        let mut replace_source = false;
+        while let Some(event) = input.pull() {
+            if event.kind != KIND_STREAM_READ {
+                continue;
+            }
+            source = Some(event.source);
+            if event.error != 0 {
+                debug!("stream read source failed: error={}", event.error);
+                world.failed = true;
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Complete,
+                });
+            }
+            match tunnel.poll(event.observed) {
+                Ok(Some(ConsumerReady::PeerAttached))
+                | Ok(Some(ConsumerReady::Readable {
+                    peer_attached: true,
+                    ..
+                })) => replace_source = true,
+                Ok(Some(ConsumerReady::EofDrained)) => {
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Complete,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    debug!("stream read poll failed: {:?}", error);
+                    world.failed = true;
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Complete,
+                    });
+                }
+            }
+        }
+        let mut work = 0;
+        while world.filled < world.buffer.len() && world.filled < STREAM_LEN && work < budget {
+            match tunnel.read(&mut world.buffer[world.filled..]) {
+                Ok(0) => break,
+                Ok(count) => {
+                    world.filled += count;
+                    work += 1;
+                }
+                Err(error) => {
+                    debug!("stream read failed: {:?}", error);
+                    world.failed = true;
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Complete,
+                    });
+                }
+            }
+        }
+        if world.failed {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Complete,
+            });
+        }
+        if world.filled >= STREAM_LEN {
+            // 已读满目标量：EOF 判定后交付，否则等终末事件。
+            match tunnel.eof_reached() {
+                Ok(true) => {
+                    return Ok(Advance {
+                        work_done: work.max(1),
+                        step: Step::Complete,
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    debug!("stream eof check failed: {:?}", error);
+                    world.failed = true;
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Complete,
+                    });
+                }
+            }
+        }
+        if replace_source {
+            let source = source.expect("PeerAttached event lost its source");
+            requests.remove(source)?;
+            self.source = None;
+        } else if let Some(source) = source {
+            self.source = Some(source);
+            requests.rearm(source)?;
+        }
+        if self.source.is_none() {
+            let plan = match tunnel.wait_plan() {
+                Ok(plan) => plan,
+                Err(error) => {
+                    debug!("stream wait plan failed: {:?}", error);
+                    world.failed = true;
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Complete,
+                    });
+                }
+            };
+            requests
+                .arm_source(plan, KIND_STREAM_READ)
+                .map_err(|_| SystemCallError::ReachLimit)?;
+        }
+        Ok(Advance {
+            work_done: work.max(1),
+            step: Step::Parked,
+        })
     }
-    Ok(reclaimed)
+
+    fn registered(&mut self, _world: &mut ReadWorld, kind: SourceKind, source: SourceId) {
+        if kind == KIND_STREAM_READ {
+            self.source = Some(source);
+        }
+    }
+    fn unregistered(&mut self, _world: &mut ReadWorld, _kind: SourceKind, source: SourceId) {
+        if self.source == Some(source) {
+            self.source = None;
+            self.removing = false;
+        }
+    }
+
+    fn refused(&mut self, _world: &mut ReadWorld, failure: RequestFailure<InitTask>) {
+        let error = match failure {
+            RequestFailure::Spawn { error, .. } | RequestFailure::Source { error, .. } => error,
+        };
+        self.arm_failed = Some(error);
+    }
+
+    fn stop(&mut self, _world: &mut ReadWorld) {
+        self.stopping = true;
+    }
+}
+
+impl Task<ReadWorld> for InitTask {
+    type Family = InitTask;
+
+    fn advance(
+        &mut self,
+        id: u64,
+        world: &mut ReadWorld,
+        requests: &mut Requests<InitTask>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        match self {
+            Self::StreamRead(task) => task.advance(id, world, requests, input, budget),
+        }
+    }
+
+    fn registered(&mut self, world: &mut ReadWorld, kind: SourceKind, source: SourceId) {
+        match self {
+            Self::StreamRead(task) => task.registered(world, kind, source),
+        }
+    }
+    fn unregistered(&mut self, world: &mut ReadWorld, kind: SourceKind, source: SourceId) {
+        match self {
+            Self::StreamRead(task) => task.unregistered(world, kind, source),
+        }
+    }
+
+    fn refused(&mut self, world: &mut ReadWorld, failure: RequestFailure<InitTask>) {
+        match self {
+            Self::StreamRead(task) => task.refused(world, failure),
+        }
+    }
+
+    fn stop(&mut self, world: &mut ReadWorld) {
+        match self {
+            Self::StreamRead(task) => task.stop(world),
+        }
+    }
+
+    fn deadline(&self) -> rinlib::shared::time::Deadline {
+        rinlib::shared::time::Deadline::INFINITE
+    }
 }
 
 fn wait_supervision_signal(
@@ -1337,42 +1552,16 @@ fn wait_supervision_signal(
     Err("supervision wait timed out")
 }
 
-/// 有限 policy 下逐项等待、Drain、Query；只有 VerifiedDead 后才由 libprocess
-/// 关闭 control 并移除。失败 target 重新放回集合，供 root Job 接管或后续重试。
-fn supervise_services(
-    supervised: &mut alloc::vec::Vec<Supervised>,
-) -> Result<(), SupervisionBatchFailure> {
-    while let Some(target) = supervised.pop() {
-        match collect_process(
-            SupervisionTarget::new(target.pid, target.control),
-            DEFAULT_SUPERVISION_POLICY,
-        ) {
-            Ok(collected) => {
-                debug!(
-                    "pid {} supervised: work={}, state={}, reason={}, code={}",
-                    collected.pid,
-                    collected.progress.work_done,
-                    collected.snapshot.state,
-                    collected.snapshot.reason,
-                    collected.snapshot.code
-                );
-            }
-            Err(failure) => {
-                let reported = SupervisionBatchFailure {
-                    pid: failure.target.pid(),
-                    stage: failure.stage,
-                    cause: failure.cause,
-                    progress: failure.progress,
-                };
-                supervised.push(Supervised {
-                    pid: failure.target.pid(),
-                    control: failure.target.into_control(),
-                });
-                return Err(reported);
-            }
-        }
+struct SupervisorWorld {
+    results: alloc::vec::Vec<SuperviseResult>,
+    failures: usize,
+}
+
+impl SuperviseSink for SupervisorWorld {
+    fn supervised(&mut self, result: SuperviseResult) {
+        self.failures += usize::from(result.outcome.is_err());
+        self.results.push(result);
     }
-    Ok(())
 }
 
 /// Building 目标的确定性 kill：Create 后未 Start，kill 冻结终因
@@ -1424,7 +1613,12 @@ fn test_building_kill(job: Handle) {
 /// 枚举可见，JobDerive 派生 MANAGE control 后 kill 并监督收束；原保留
 /// control 在派生接管后关闭（关闭 control 永不隐式终止）。任一步失败
 /// 降级回保留 control 路径，不影响既有验收面。
-fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
+fn test_derive_kill(
+    root: &mut RootSupervisor,
+    job: Handle,
+    pid: u64,
+    retained: Handle,
+) -> Result<(), &'static str> {
     let derived = (|| {
         let members = enumerate_members(job, JobMemberKind::MemberProcesses)?;
         if !members.contains(&pid) {
@@ -1463,8 +1657,9 @@ fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
                 "supervision budget exhaustion retained authority: pid={}, work={}",
                 pid, failure.progress.work_done
             );
-            let collected = collect_process(failure.target, DEFAULT_SUPERVISION_POLICY)
-                .expect("retained supervision authority must resume collection");
+            let mut machine = failure.collector;
+            machine.replenish(DEFAULT_SUPERVISION_POLICY);
+            let collected = root.collect_machine(machine)?;
             assert_eq!(collected.snapshot.reason, ProcessExitReason::Killed as u32);
             assert_eq!(collected.snapshot.code, 0x77);
             debug!(
@@ -1480,22 +1675,28 @@ fn test_derive_kill(job: Handle, pid: u64, retained: Handle) {
             debug!("derive kill degraded ({:?}); using retained control", error);
             process::kill(retained, 0x77).expect("live kill of a fresh process must be accepted");
             kill_and_supervise(
+                root,
                 job,
                 alloc::vec::Vec::from([Supervised {
                     pid,
                     control: retained,
                 }]),
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 /// Job 管理面验收入口（step 5）。真跨核竞态矩阵（含并发 Create/枚举
 /// 乱序窗口）归 step 9 验证矩阵，此处只覆盖可确定性制造的场景。
-fn test_job_management(job: Handle, image: &[u8]) -> Result<(), &'static str> {
+fn test_job_management(
+    root: &mut RootSupervisor,
+    job: Handle,
+    image: &[u8],
+) -> Result<(), &'static str> {
     test_job_seal_completion(job);
     test_derive_fallback(job);
-    test_job_kill_composition(job, image);
+    test_job_kill_composition(root, job, image)?;
     seal_before_start(job);
     seal_before_create(job);
     enumerate_convergence(job);
@@ -1703,10 +1904,14 @@ fn test_derive_fallback(job: Handle) {
 /// 以及一个 Building 成员，两者 control 均消散——libprocess::job_kill 一把
 /// 收束（seal → 枚举 → 派生 kill → drain → 等 CLOSED 全链，派生走铸造
 /// 路径）。
-fn test_job_kill_composition(job: Handle, image: &[u8]) {
-    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
+fn test_job_kill_composition(
+    root: &mut RootSupervisor,
+    job: Handle,
+    image: &[u8],
+) -> Result<(), &'static str> {
+    let Ok(child) = root.create_job(job, JOB_FULL_RIGHTS) else {
         debug!("job kill composition FAILED: job create failed");
-        return;
+        return Err("job kill composition job create failed");
     };
     let running = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
@@ -1722,7 +1927,7 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
             let running_pid = running.pid;
             let _ = unsafe { close(running.control) };
             let _ = unsafe { close(building.control) };
-            match job_kill(child, 0x3C) {
+            match root.collect_job(child, 0x3C) {
                 Ok(()) => {
                     let snapshot = process::query_job(child);
                     match snapshot {
@@ -1731,12 +1936,17 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
                             running_pid, snapshot.jid
                         ),
                         snapshot => {
-                            debug!("job kill composition FAILED: child snapshot={:?}", snapshot)
+                            debug!("job kill composition FAILED: child snapshot={:?}", snapshot);
+                            return Err("job kill composition child snapshot failed");
                         }
                     }
                 }
                 Err(error) => {
-                    debug!("job kill composition FAILED: {:?}", error);
+                    debug!(
+                        "job kill composition FAILED: stage={:?}, cause={:?}, retained_collector={}",
+                        "root-owned", error, true
+                    );
+                    return Err("job kill composition collection failed");
                 }
             }
         }
@@ -1746,9 +1956,11 @@ fn test_job_kill_composition(job: Handle, image: &[u8]) {
                 running.err(),
                 building.err()
             );
+            return Err("job kill composition member creation failed");
         }
     }
-    let _ = unsafe { close(child) };
+    root.close_control(child)?;
+    Ok(())
 }
 
 /// seal 先于 Start 的提交闸门：Building 成员在 seal 后 Start 返回
@@ -2219,22 +2431,25 @@ fn test_writable_level() {
 /// 跨进程流控唤醒：pm 填满目标邮箱后在 WRITABLE 上阻塞，本进程腾出一个
 /// 位置唤醒它。pm 侧内联检测虚假唤醒（醒来后再撞满箱即置 spin 位），
 /// 末尾校验 spin 为空——唤醒只能由腾位引起，证明等待路径真实走过。
-fn test_writable_wake(pm_mailbox: Handle) {
-    let target = create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-    )
-    .expect("wake target mailbox create failed");
-    let done = notification::create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::TRANSIT,
-    )
-    .expect("wake done notification create failed");
-    let spin = notification::create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::TRANSIT,
-    )
-    .expect("wake spin notification create failed");
+fn test_writable_wake(root: &mut RootSupervisor, pm_mailbox: Handle) -> Result<(), &'static str> {
+    let target = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        )
+        .map_err(|_| "wake target mailbox create failed")?;
+    let done = root
+        .create_notification(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::SIGNAL | Rights::TRANSIT,
+        )
+        .map_err(|_| "wake done notification create failed")?;
+    let spin = root
+        .create_notification(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::SIGNAL | Rights::TRANSIT,
+        )
+        .map_err(|_| "wake spin notification create failed")?;
     let moves = [
         HandleMove {
             handle: target.peer,
@@ -2250,33 +2465,60 @@ fn test_writable_wake(pm_mailbox: Handle) {
         },
     ];
     unsafe { send_raw(pm_mailbox, WRITABLE_WAKE_REQUEST, &[], &moves) }
-        .expect("wake request send failed");
+        .map_err(|_| "wake request send failed")?;
+    root.transferred(target.peer);
+    root.transferred(done.peer);
+    root.transferred(spin.peer);
 
     // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
-    wait_many(&[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)], 0)
-        .expect("wake notification wait failed");
-    notification::take(done.owner, u64::MAX).expect("wake notification take failed");
-    discard(target.owner).expect("wake make-room failed");
+    let deadline = rinlib::time::timeout_millis(5_000).map_err(|_| "wake deadline failed")?;
+    let done_wait = rinlib::ipc::wait::wait_until(
+        &[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)],
+        deadline,
+    )
+    .map_err(|_| "wake notification wait failed")?;
+    if WaitReason::from_u32(done_wait.reason) == Some(WaitReason::Timeout) {
+        return Err("pm writable wake confirmation timed out");
+    }
+    notification::take(done.owner, u64::MAX).map_err(|_| "wake notification take failed")?;
+    discard(target.owner).map_err(|_| "wake make-room failed")?;
 
     // 队列：15 × FILL + TAIL。逐条校验，末尾必然是被唤醒后补发的 TAIL。
     for index in 0..MAILBOX_CAPACITY {
-        let message = wait_message(target.owner).expect("wake drain failed");
+        let ready = rinlib::ipc::wait::wait_until(
+            &[WaitItem::new(
+                target.owner,
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                0,
+            )],
+            deadline,
+        )
+        .map_err(|_| "writable tail wait failed")?;
+        if WaitReason::from_u32(ready.reason) == Some(WaitReason::Timeout) {
+            return Err("pm writable tail timed out");
+        }
+        let message = receive(target.owner).map_err(|_| "writable tail receive failed")?;
         let expected = if index + 1 == MAILBOX_CAPACITY {
             WRITABLE_WAKE_TAIL
         } else {
             WRITABLE_WAKE_FILL
         };
-        assert_eq!(message.header.kind, expected);
+        if message.header.kind != expected {
+            return Err("unexpected writable wake message");
+        }
     }
     // TAIL 已入队即 pm 已退出循环；此前的任何虚假唤醒都会留下 spin 位。
-    assert!(matches!(
+    if !matches!(
         notification::take(spin.owner, u64::MAX),
         Err(SystemCallError::ObjectNotAvailable)
-    ));
-    unsafe { close(done.owner) }.expect("wake done owner close failed");
-    unsafe { close(spin.owner) }.expect("wake spin owner close failed");
-    unsafe { close(target.owner) }.expect("wake target owner close failed");
+    ) {
+        return Err("writable wake reported a spurious completion");
+    }
+    root.close_control(done.owner)?;
+    root.close_control(spin.owner)?;
+    root.close_control(target.owner)?;
     debug!("writable wake passed");
+    Ok(())
 }
 
 #[cfg(feature = "acceptance-stress")]

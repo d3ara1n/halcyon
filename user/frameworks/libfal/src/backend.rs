@@ -9,7 +9,8 @@ use crate::{
 };
 use alloc::{string::String, sync::Arc};
 use erhino_shared::call::SystemCallError;
-use libsrv::budget::{Account, Charge, Resource};
+use crate::resource::FalResource;
+use libsrv::budget::{Account, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
 
@@ -36,7 +37,7 @@ impl From<SystemCallError> for BackendError {
 struct Entry {
     node: NodeId,
     slot: Option<Permit>,
-    _charge: Charge,
+    _charge: Charge<FalResource>,
 }
 pub struct Directory {
     entries: OrderedTable<Entry, String>,
@@ -232,7 +233,7 @@ fn name(value: &str) -> Result<String, BackendError> {
 
 impl<C> MemoryBackend<C> {
     pub fn new(
-        account: &Arc<Account>,
+        account: &Arc<Account<FalResource>>,
         limit: usize,
         wake: alloc::rc::Rc<dyn libsrv::wake::Wake>,
     ) -> Result<Self, BackendError> {
@@ -394,7 +395,7 @@ impl<C> MemoryBackend<C> {
             let slot = Counter::try_acquire(&self.entry_slots)
                 .map_err(|_| SystemCallError::QuotaExceeded)?;
             let charge = access.account().acquire(
-                Resource::Bytes,
+                FalResource::Bytes,
                 position.name.len() + PreparedEntry::<Entry, String>::allocation_bytes(),
             )?;
             // 候选尚未入表，身份在节点准备完成后确定，不能因此延后名字存储预留。
@@ -576,7 +577,7 @@ impl<C> MemoryBackend<C> {
             return Err(BackendError::Exists);
         }
         let charge = destination.account().acquire(
-            Resource::Bytes,
+            FalResource::Bytes,
             final_name.len() + PreparedEntry::<Entry, String>::allocation_bytes(),
         )?;
         let entry = directory

@@ -3,7 +3,10 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg(any(test, target_arch = "riscv64"))]
 
+extern crate alloc;
+
 use core::sync::atomic::Ordering;
+
 use erhino_shared::call::SystemCallError;
 
 pub const HEADER_BYTES: usize = 128;
@@ -19,6 +22,30 @@ pub enum RunnelError {
     Broken,
     Closed,
     Syscall(SystemCallError),
+}
+
+/// 生产者侧可继续推进的等待条件；终态统一经 [`IoError`] 报告。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerReady {
+    Writable {
+        bytes: usize,
+    },
+    /// 已发布 EOF 且对端已消费至最终 head。
+    EofConsumed,
+}
+
+/// 消费者侧等待条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerReady {
+    Readable {
+        bytes: usize,
+        /// 此结果同时观察到对端建立，调用方需按新的等待条件重建登记。
+        peer_attached: bool,
+    },
+    /// 对端映射已建立但尚无数据；持久电平，满足后不再重复登记。
+    PeerAttached,
+    /// 已观察 EOF 且本地已消费至最终 head。
+    EofDrained,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +204,6 @@ struct ProducerCore<T> {
     cursor: usize,
     eof: bool,
 }
-
 impl<T: Transport> ProducerCore<T> {
     fn new(transport: T, creator: bool) -> Result<Self, InitFailure<T>> {
         let channel = Channel::new(transport, creator)?;
@@ -273,6 +299,30 @@ impl<T: Transport> ProducerCore<T> {
             error
         })
     }
+
+    fn probe_ready(&mut self) -> Result<Option<ProducerReady>, IoError> {
+        let writable = self.writable()?;
+        if self.eof {
+            return Ok((writable == self.channel.capacity).then_some(ProducerReady::EofConsumed));
+        }
+        if writable > 0 {
+            return Ok(Some(ProducerReady::Writable { bytes: writable }));
+        }
+        Ok(None)
+    }
+
+    /// 唤醒后重查：先探条件，未满足则确认 DATA 后再探一次；
+    /// 仍未满足返回 None（任务重新登记/重 arm 后停驻）。
+    fn poll(&mut self, terminal: bool) -> Result<Option<ProducerReady>, IoError> {
+        if terminal {
+            return Err(self.channel.fail(RunnelError::Closed, 0));
+        }
+        if let Some(ready) = self.probe_ready()? {
+            return Ok(Some(ready));
+        }
+        self.channel.acknowledge()?;
+        self.probe_ready()
+    }
 }
 
 struct ConsumerCore<T> {
@@ -281,6 +331,7 @@ struct ConsumerCore<T> {
     head_shadow: u64,
     cursor: usize,
     eof_head: Option<u64>,
+    peer_established: bool,
 }
 
 impl<T: Transport> ConsumerCore<T> {
@@ -303,6 +354,7 @@ impl<T: Transport> ConsumerCore<T> {
             head_shadow: head,
             cursor: 0,
             eof_head: (eof == 1).then_some(head),
+            peer_established: head > 0 || eof == 1,
         })
     }
 
@@ -356,6 +408,43 @@ impl<T: Transport> ConsumerCore<T> {
             self.channel.notify(count)?;
         }
         Ok(count)
+    }
+
+    fn probe_ready(&mut self, attached: bool) -> Result<Option<ConsumerReady>, IoError> {
+        let readable = self.readable()?;
+        if readable > 0 {
+            let peer_attached = !self.peer_established;
+            self.peer_established = true;
+            return Ok(Some(ConsumerReady::Readable {
+                bytes: readable,
+                peer_attached,
+            }));
+        }
+        if self.eof_reached()? {
+            return Ok(Some(ConsumerReady::EofDrained));
+        }
+        if attached && !self.peer_established {
+            self.peer_established = true;
+            return Ok(Some(ConsumerReady::PeerAttached));
+        }
+        Ok(None)
+    }
+
+    /// 唤醒后重查：先探条件，未满足则确认 DATA 后再探一次。
+    fn poll(&mut self, terminal: bool, attached: bool) -> Result<Option<ConsumerReady>, IoError> {
+        if terminal {
+            return Err(self.channel.fail(RunnelError::Closed, 0));
+        }
+        if let Some(ready) = self.probe_ready(attached)? {
+            return Ok(Some(ready));
+        }
+        self.channel.acknowledge()?;
+        self.probe_ready(attached)
+    }
+
+    /// 建立前登记包含持久电平 PEER_ATTACHED，满足后不再重复登记。
+    fn includes_peer_attached(&self) -> bool {
+        !self.peer_established
     }
 
     fn read_exact_or_eof(&mut self, output: &mut [u8]) -> Result<usize, IoError> {
@@ -467,6 +556,8 @@ pub mod blocking {
         }
     }
 
+    /// 领域登记计划：承载 endpoint 观察项的 Copy 值，handle 不出域；
+    /// cookie 由运行体在登记时注入重建。
     pub struct Producer {
         core: ProducerCore<Guest>,
         not_sync: core::marker::PhantomData<core::cell::Cell<()>>,
@@ -562,6 +653,26 @@ pub mod blocking {
                 Err(error) => Err((self, error)),
             }
         }
+
+        /// 当前等待条件的登记计划；DATA 涵盖腾空与全部消费两种进展。
+        pub fn wait_plan(&mut self) -> Result<libsrv::runtime::SourcePlan, IoError> {
+            self.core.channel.check()?;
+            let signals = ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED;
+            let item = self
+                .core
+                .channel
+                .transport
+                .endpoint()
+                .events()
+                .wait_item(signals, 0);
+            Ok(libsrv::runtime::SourcePlan::new(item.handle, item.signals))
+        }
+
+        /// 唤醒后重查：观察信号合成类型化条件；终态经 IoError 报告。
+        pub fn poll(&mut self, observed: ObjectSignals) -> Result<Option<ProducerReady>, IoError> {
+            let terminal = observed.intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
+            self.core.poll(terminal)
+        }
     }
 
     impl Consumer {
@@ -628,6 +739,31 @@ pub mod blocking {
                 self.core.channel.terminal = Some(RunnelError::Closed);
             }
             Ok(result)
+        }
+
+        /// 当前等待条件的登记计划；建立前包含持久电平 PEER_ATTACHED。
+        pub fn wait_plan(&mut self) -> Result<libsrv::runtime::SourcePlan, IoError> {
+            self.core.channel.check()?;
+            let mut signals =
+                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED;
+            if self.core.includes_peer_attached() {
+                signals |= ObjectSignals::PEER_ATTACHED;
+            }
+            let item = self
+                .core
+                .channel
+                .transport
+                .endpoint()
+                .events()
+                .wait_item(signals, 0);
+            Ok(libsrv::runtime::SourcePlan::new(item.handle, item.signals))
+        }
+
+        /// 唤醒后重查：观察信号合成类型化条件；终态经 IoError 报告。
+        pub fn poll(&mut self, observed: ObjectSignals) -> Result<Option<ConsumerReady>, IoError> {
+            let terminal = observed.intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
+            let attached = observed.intersects(ObjectSignals::PEER_ATTACHED);
+            self.core.poll(terminal, attached)
         }
     }
 }
@@ -1027,5 +1163,59 @@ mod tests {
             });
             assert_eq!(output[..total], input);
         }
+    }
+
+    #[test]
+    fn producer_poll_reports_writable_eof_consumed_and_pending() {
+        let (mut p, mut c) = pair(1);
+        // 新流：可写空间即条件。
+        assert_eq!(
+            p.poll(false).unwrap(),
+            Some(ProducerReady::Writable {
+                bytes: p.channel.capacity
+            })
+        );
+        // 写满后无进展：acknowledge 重查仍无。
+        let fill = vec![1u8; p.channel.capacity];
+        assert_eq!(p.write(&fill).unwrap(), p.channel.capacity);
+        assert_eq!(p.poll(false).unwrap(), None);
+        // 消费腾空 + EOF 发布：全部消费条件成立。
+        let mut drain = vec![0u8; p.channel.capacity];
+        assert_eq!(c.read(&mut drain).unwrap(), p.channel.capacity);
+        p.finish().unwrap();
+        assert_eq!(p.poll(false).unwrap(), Some(ProducerReady::EofConsumed));
+        // 终态观察直接失败。
+        assert_eq!(p.poll(true).unwrap_err().error, RunnelError::Closed);
+    }
+
+    #[test]
+    fn consumer_poll_reports_attach_readable_and_drained() {
+        let (mut p, mut c) = pair(1);
+        // 未建立：空流上 PEER_ATTACHED 观察返回建立条件且此后不再纳入。
+        assert!(c.includes_peer_attached());
+        assert_eq!(
+            c.poll(false, true).unwrap(),
+            Some(ConsumerReady::PeerAttached)
+        );
+        assert!(!c.includes_peer_attached());
+        assert_eq!(c.poll(false, true).unwrap(), None);
+        // 有数据优先于一切：Readable 携带字节数。
+        let payload = [7u8; 16];
+        assert_eq!(p.write(&payload).unwrap(), 16);
+        assert_eq!(
+            c.poll(false, false).unwrap(),
+            Some(ConsumerReady::Readable {
+                bytes: 16,
+                peer_attached: false,
+            })
+        );
+        // 读尽 + EOF：EofDrained 成立。
+        let mut drain = [0u8; 16];
+        assert_eq!(c.read(&mut drain).unwrap(), 16);
+        p.finish().unwrap();
+        assert_eq!(
+            c.poll(false, false).unwrap(),
+            Some(ConsumerReady::EofDrained)
+        );
     }
 }

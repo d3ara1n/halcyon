@@ -29,6 +29,7 @@ pub mod op;
 pub mod property;
 pub mod provider;
 pub mod protocol;
+pub mod resource;
 pub mod store;
 pub mod value;
 

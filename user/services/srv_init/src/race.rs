@@ -9,13 +9,12 @@
 use core::sync::atomic::Ordering;
 
 use crate::{
-    building::build_spin_building, supervise_services, Supervised, JOB_FULL_RIGHTS,
-    SUPERVISOR_RIGHTS,
+    JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
 };
 use libprocess::{
-    job_kill,
+    DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned,
     race::{self, Cmd, Report},
-    spawn, SpawnRequest, Spawned, DERIVED_CONTROL_RIGHTS,
+    spawn,
 };
 use rinlib::ipc::message::{create, send_raw, wait_message};
 use rinlib::ipc::notification;
@@ -1223,8 +1222,8 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
 /// seal vs 并发 Create：锤 seal 与锤 Create 同刻。Seal 线性化一次后
 /// 创建口永久关闭——首轮 create 与 seal 竞争（任意结果），后续轮必
 /// ObjectClosed；残留 Building 由 job_kill 收束，child 完成 Dead。
-fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
-    let child = match process::create_job(job, JOB_FULL_RIGHTS) {
+fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> bool {
+    let child = match root.create_job(job, JOB_FULL_RIGHTS) {
         Ok(handle) => handle,
         Err(error) => {
             debug!("race seal-vs-create: child job failed: {:?}", error);
@@ -1232,14 +1231,32 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
         }
     };
     let closed = SystemCallError::ObjectClosed as i64;
+    let seal_control = match root.duplicate(child, Rights::MANAGE | Rights::TRANSIT) {
+        Ok(handle) => handle,
+        Err(error) => {
+            debug!("race seal-vs-create: seal control failed: {:?}", error);
+            return false;
+        }
+    };
     let seal_moves = [HandleMove {
-        handle: duplicate(child, Rights::MANAGE | Rights::TRANSIT).unwrap_or(Handle::INVALID),
+        handle: seal_control,
         rights: Rights::MANAGE,
     }];
     let mut ok = h.send_cmd(0, &race_cmd(race::ACTION_SEAL, 0), &seal_moves);
+    if ok {
+        root.transferred(seal_control);
+    } else {
+        return false;
+    }
     let mut first_gated: Option<bool> = None;
     for round in 0..4u64 {
-        let job_b = duplicate(child, Rights::CREATE | Rights::TRANSIT).unwrap_or(Handle::INVALID);
+        let job_b = match root.duplicate(child, Rights::CREATE | Rights::TRANSIT) {
+            Ok(handle) => handle,
+            Err(error) => {
+                debug!("race seal-vs-create: create control failed: {:?}", error);
+                return false;
+            }
+        };
         let create = race_cmd(race::ACTION_CREATE, 0);
         let sent = h.send_cmd(
             1,
@@ -1249,6 +1266,11 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
                 rights: Rights::CREATE,
             }],
         );
+        if sent {
+            root.transferred(job_b);
+        } else {
+            return false;
+        }
         if round == 0 {
             h.fire(&[0, 1]);
         } else {
@@ -1299,9 +1321,11 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
             ok = false;
         }
     }
-    match job_kill(child, 0xB00) {
+    let mut close_child = false;
+    match root.collect_job(child, 0xB00) {
         Ok(()) => match process::query_job(child) {
             Ok(snapshot) if snapshot.state == JobState::Dead as u32 => {
+                close_child = true;
                 debug!(
                     "race seal-vs-create {} (first create gated: {:?})",
                     if ok { "passed" } else { "FAILED" },
@@ -1317,11 +1341,16 @@ fn race_seal_create(h: &RaceHammers, job: Handle) -> bool {
             }
         },
         Err(error) => {
-            debug!("race seal-vs-create: job_kill failed: {:?}", error);
+            debug!(
+                "race seal-vs-create: job_kill failed: stage={:?}, cause={:?}, retained_collector={}",
+                "root-owned", error, true
+            );
             ok = false;
         }
     }
-    let _ = unsafe { close(child) };
+    if close_child && root.close_control(child).is_err() {
+        return false;
+    }
     ok
 }
 
@@ -1465,6 +1494,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 /// 竞态矩阵入口：双锤编队 → 16 场景 → 退场收束 → 汇总。失败场景逐个
 /// 点名，汇总行是全矩阵的 grep 锚点。
 pub(crate) fn race_matrix(
+    root: &mut RootSupervisor,
     acceptance: Handle,
     target_image: &[u8],
     hammer_image: &[u8],
@@ -1567,7 +1597,7 @@ pub(crate) fn race_matrix(
         ),
         (
             "seal-vs-create",
-            scenario!("seal-vs-create", race_seal_create(&h, acceptance)),
+            scenario!("seal-vs-create", race_seal_create(root, &h, acceptance)),
         ),
         (
             "drain-vs-drain",
@@ -1585,7 +1615,7 @@ pub(crate) fn race_matrix(
         ),
     ];
     h.shutdown();
-    let mut hammer_targets = alloc::vec::Vec::from([
+    let hammer_targets = alloc::vec::Vec::from([
         Supervised {
             pid: h.pids[0],
             control: h.controls[0],
@@ -1595,7 +1625,7 @@ pub(crate) fn race_matrix(
             control: h.controls[1],
         },
     ]);
-    let hammer_supervision = supervise_services(&mut hammer_targets);
+    let hammer_supervision = root.collect_targets(hammer_targets);
     let supervision_ok = hammer_supervision.is_ok();
     if !supervision_ok {
         debug!("race matrix acceptance failed: hammer supervision degraded");

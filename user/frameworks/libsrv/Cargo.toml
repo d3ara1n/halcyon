@@ -16,4 +16,3 @@ erhino_shared = { path = "../../../shared/erhino_shared" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 rinlib = { path = "../../rinlib" }
-librpc = { path = "../librpc" }

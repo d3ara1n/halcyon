@@ -12,3 +12,4 @@ erhino_shared = { path = "../../../shared/erhino_shared" }
 # 协议核心保持零 syscall 依赖，host 可测。
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 rinlib = { path = "../../rinlib" }
+libsrv = { path = "../libsrv" }

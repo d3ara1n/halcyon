@@ -11,7 +11,8 @@ use erhino_shared::{
     message::{MESSAGE_HANDLE_MAX, PAYLOAD_MAX},
     object::{HandleDescription, Rights},
 };
-use libsrv::budget::{Account, Charge, Resource};
+use crate::resource::FalResource;
+use libsrv::budget::{Account, Charge};
 
 pub const HEADER_LEN: usize = 16;
 
@@ -410,7 +411,7 @@ pub struct StoredHandle<C> {
 pub struct StoredValue<C> {
     pub bytes: Vec<u8>,
     pub handles: Vec<StoredHandle<C>>,
-    _charge: Charge,
+    _charge: Charge<FalResource>,
 }
 
 pub struct StoreFailure<C> {
@@ -424,7 +425,7 @@ impl<C: Capability> StoredValue<C> {
         owners: Vec<C>,
         slot_base: usize,
         byte_budget: usize,
-        account: &Arc<Account>,
+        account: &Arc<Account<FalResource>>,
     ) -> Result<Self, StoreFailure<C>> {
         let prepare = (|| {
             let fields = validate(bytes, slot_base, owners.len(), byte_budget)?;
@@ -470,7 +471,7 @@ impl<C: Capability> StoredValue<C> {
                 .checked_add(owners.len() * core::mem::size_of::<StoredHandle<C>>())
                 .ok_or(ValueError::Budget)?;
             let charge = account
-                .acquire(Resource::Bytes, allocation)
+                .acquire(FalResource::Bytes, allocation)
                 .map_err(ValueError::Capability)?;
             let mut stored = Vec::new();
             stored

@@ -8,7 +8,8 @@ use core::{
 
 static ABANDONED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 use erhino_shared::{call::SystemCallError, message::PAYLOAD_MAX};
-use libsrv::budget::{Account, Charge, Resource};
+use crate::resource::FalResource;
+use libsrv::budget::{Account, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
 
@@ -16,7 +17,7 @@ pub const BLOCK_BYTES: usize = 4096;
 struct Block {
     bytes: Box<[u8; BLOCK_BYTES]>,
     slot: Option<Permit>,
-    _charge: Charge,
+    _charge: Charge<FalResource>,
 }
 
 pub struct Data {
@@ -34,8 +35,8 @@ pub struct PreparedWrite {
 }
 
 impl Data {
-    pub fn new(account: &Arc<Account>) -> Result<Self, SystemCallError> {
-        let capacity = (account.usage(Resource::Bytes).1 / BLOCK_BYTES).max(1);
+    pub fn new(account: &Arc<Account<FalResource>>) -> Result<Self, SystemCallError> {
+        let capacity = (account.usage(FalResource::Bytes).1 / BLOCK_BYTES).max(1);
         Ok(Self {
             blocks: ManuallyDrop::new(OrderedTable::new(capacity)),
             slots: Arc::try_new(Counter::new(capacity))
@@ -77,7 +78,7 @@ impl Data {
         &self,
         offset: u64,
         input: &[u8],
-        account: &Arc<Account>,
+        account: &Arc<Account<FalResource>>,
     ) -> Result<PreparedWrite, SystemCallError> {
         if input.len() > PAYLOAD_MAX {
             return Err(SystemCallError::IllegalArgument);
@@ -105,7 +106,7 @@ impl Data {
             let within = (position % BLOCK_BYTES as u64) as usize;
             let size = (BLOCK_BYTES - within).min(input.len() - done);
             let charge = account.acquire(
-                Resource::Bytes,
+                FalResource::Bytes,
                 BLOCK_BYTES + PreparedEntry::<Block>::allocation_bytes(),
             )?;
             let old = self.blocks.get(key);

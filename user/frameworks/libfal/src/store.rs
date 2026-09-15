@@ -10,7 +10,8 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use erhino_shared::call::SystemCallError;
-use libsrv::budget::{Account, Charge, Resource};
+use crate::resource::FalResource;
+use libsrv::budget::{Account, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
 
@@ -112,8 +113,8 @@ struct Record<P> {
     lease: Rc<Lease>,
     payload: Option<P>,
     _slot: Permit,
-    _node_charge: Charge,
-    _storage_charge: Charge,
+    _node_charge: Charge<FalResource>,
+    _storage_charge: Charge<FalResource>,
 }
 
 pub struct PreparedNode<P> {
@@ -161,7 +162,7 @@ pub struct PrepareFailure<P> {
 impl<P> NodeStore<P> {
     pub fn new(
         root: P,
-        account: &Arc<Account>,
+        account: &Arc<Account<FalResource>>,
         limit: usize,
         wake: Rc<dyn libsrv::wake::Wake>,
     ) -> Result<(Self, NodeRef), PrepareFailure<P>> {
@@ -205,7 +206,7 @@ impl<P> NodeStore<P> {
     pub fn prepare(
         &self,
         payload: P,
-        account: &Arc<Account>,
+        account: &Arc<Account<FalResource>>,
     ) -> Result<PreparedNode<P>, PrepareFailure<P>> {
         let reserve = (|| {
             if self.sealed {
@@ -213,9 +214,9 @@ impl<P> NodeStore<P> {
             }
             let slot =
                 Counter::try_acquire(&self.slots).map_err(|_| SystemCallError::QuotaExceeded)?;
-            let node_charge = account.acquire(Resource::Node, 1)?;
+            let node_charge = account.acquire(FalResource::Node, 1)?;
             let storage_charge = account.acquire(
-                Resource::Bytes,
+                FalResource::Bytes,
                 PreparedEntry::<Record<P>>::allocation_bytes() + core::mem::size_of::<Lease>(),
             )?;
             let id = NodeId(NEXT_NODE.allocate().ok_or(SystemCallError::ReachLimit)?);
@@ -456,12 +457,9 @@ mod tests {
         Rc::new(TestWake)
     }
 
-    fn account() -> Arc<Account> {
-        let mut limits = [0; Resource::COUNT];
-        limits[Resource::Account as usize] = 1;
-        limits[Resource::Node as usize] = 10;
-        limits[Resource::Bytes as usize] = 10000;
-        Budget::new(limits).unwrap().account(limits).unwrap()
+    fn account() -> Arc<Account<FalResource>> {
+        let limits = [10, 10000, 0, 0, 0, 0, 0, 0, 0, 0];
+        Budget::new(&limits, 1).unwrap().account(&limits).unwrap()
     }
 
     #[test]
@@ -502,7 +500,7 @@ mod tests {
         assert!(!store.retire_step(1).unwrap().done);
         drop(root);
         assert!(store.retire_step(1).unwrap().done);
-        assert_eq!(account.usage(Resource::Node).0, 0);
+        assert_eq!(account.usage(FalResource::Node).0, 0);
         assert!(store.close().is_ok());
     }
 
@@ -540,7 +538,7 @@ mod tests {
         ));
         drop(pending);
         assert!(!store.has_retire_work());
-        assert_eq!(account.usage(Resource::Node).0, 1);
+        assert_eq!(account.usage(FalResource::Node).0, 1);
         store.seal();
         drop(root);
         assert!(store.retire_step(1).unwrap().done);

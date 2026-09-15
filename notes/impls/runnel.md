@@ -18,9 +18,15 @@ Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节
 
 `IoError` 同时报告协议/系统错误、已完成字节数和清理错误；批量操作累计整次调用进度，通知失败不能撤回已发布的数据。首次协议/等待错误进入不可逆终态并尝试关闭 Endpoint，失败 owner 保留在 Guest 中仅供清理，后续数据访问先拒绝。`close(self)` 失败返回完整角色；Consumer 的 `wait_peer_closed(&mut self, timeout)` 通过内部事件能力观察终态并停止后续数据访问，随后由调用者显式 close。Drop 的最终兜底由 rinlib owner 完成，不无限重试。
 
-## 当前施工
+## 执行接入
 
-typed 构造与错误 owner 是唯一公开入口：原始 ABI 工厂与 unsafe attach 已删除，随基线 `d22b9d7` 入库的无消费者观察草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`）也已删除——其中 register/peer_attached 在运行期 fail 关闭 Endpoint 后绕过终态检查访问映射的缺陷随之消失；事件驱动的登记/观察/取消接入面由通用执行闭包与 Runtime 首个真实消费者共同定形，本库不保留无真实消费者的 API。pm 接收侧经 HandleSet 提取 Capability、转换为 Invitation 并调用安全 `Producer::attach`；init 创建侧经 `Consumer::create` 取得 typed Invitation，以 typed Packet 转移，协议初始化失败时显式关闭本地映射与未发布邀请双 owner。srv_init 自检与 test_hammer 保留 rinlib 原始 tunnel ABI 的刻意内核契约验证，不属迁移对象。真实 FAL provider/Open 尚未接通，不能将本节状态解释为 FAL Open 完成。
+`wait_plan` 返回不透明的 `libsrv::SourcePlan` 值，描述当前角色的等待信号，不分配 Box，也不导出 Endpoint Handle。Runtime 完成登记、generation 过滤、重 arm 与注销，角色通过 `poll` 执行 acknowledge 和状态重查。
+
+Producer 区分 Writable 与 EOF 后的 EofConsumed；Consumer 区分 Readable、PeerAttached 与 EofDrained。对端首次建立可以和数据同批出现，Readable 携带建立变化标志，调用者撤销旧来源并用新的计划登记；建立后不再订阅持久 PEER_ATTACHED 电平。所有入口先检查终态，不访问已关闭映射。
+
+pm 使用安全 Producer::attach；init 使用 Consumer::create 并以 typed Packet 转移 Invitation。init 的 RootSupervisor 持有数据面 Runtime、Consumer 和缓冲，建立失败的 Endpoint/Invitation 也进入预备清理槽。数据停止在注销回执后关闭角色；异常 pm 退出由 init 收束进程。实现责任详见 [runtime.md](runtime.md)。
+
+srv_init 自检与 test_hammer 保留 rinlib 原始 Tunnel ABI 的刻意内核契约验证。真实 FAL provider/Open 尚未接通，本节不表示正式文件 Open 已完成。
 
 ## 验证
 

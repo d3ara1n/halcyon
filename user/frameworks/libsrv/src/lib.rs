@@ -6,8 +6,8 @@
 extern crate alloc;
 
 pub mod budget;
+pub mod runtime;
 pub mod wake;
 pub mod work_queue;
 
-#[cfg(target_arch = "riscv64")]
-pub mod runtime;
+pub use runtime::{Advance, Input, Requests, Runtime, SourceEvent, SourceId, SourceKind, SourcePlan, Step, Task, TaskFailure};

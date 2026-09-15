@@ -16,4 +16,5 @@ rinlib = { path = "../../rinlib" }
 librunnel = { path = "../../frameworks/librunnel" }
 librpc = { path = "../../frameworks/librpc" }
 libprocess = { path = "../../frameworks/libprocess" }
+libsrv = { path = "../../frameworks/libsrv" }
 tar = { path = "../../../shared/tar" }

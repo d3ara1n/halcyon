@@ -2,6 +2,7 @@
 
 use crate::store::NodeRef;
 use alloc::sync::Arc;
+use crate::resource::FalResource;
 use libsrv::budget::Account;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +56,7 @@ impl core::ops::BitAnd for FalRights {
 pub struct AccessSnapshot {
     pub(crate) root: NodeRef,
     pub(crate) rights: FalRights,
-    pub(crate) account: Arc<Account>,
+    pub(crate) account: Arc<Account<FalResource>>,
 }
 
 impl AccessSnapshot {
@@ -65,7 +66,7 @@ impl AccessSnapshot {
     pub fn rights(&self) -> FalRights {
         self.rights
     }
-    pub fn account(&self) -> &Arc<Account> {
+    pub fn account(&self) -> &Arc<Account<FalResource>> {
         &self.account
     }
 }
