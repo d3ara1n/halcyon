@@ -1,6 +1,6 @@
-# 通用执行与准入固定提交 Review
+# 通用执行、RPC 与 Outbox 整体固定提交 Review
 
-> 【未来审查计划】固定对象为 `a3891b00c60acc0f91e964c183bb0eea7359404f`（`feat(runtime): 闭合通用执行准入与持久监督`），父提交 `2efbc87d816ad8ddfb061f8b2f04de254970b91f`。提交后登记，供未来独立只读审查使用；该提交的实现与完整验收已经完成；原 R1–R16/C1–C7 复核记录保留于档案。2026-09-15 用户要求审视多轮修补后的最终结构，本文件同时记录该固定快照的设计反馈；其中 PM 真实停止的旧完成声明曾被代码证据推翻；下述已授权清理批次现已补齐并通过集中复核。
+> 【未来审查计划】本文件合并 Runtime/准入、Runtime 清理/Job 分页及 RPC/Outbox 的整体固定提交 Review。固定提交序列为：`a3891b00c60acc0f91e964c183bb0eea7359404f`（`feat(runtime): 闭合通用执行准入与持久监督`）→ `5de2780fe4802f2bb31ddeeafccf87737ba80cc4`（`refactor(runtime): 复用预付请求并有界分页收束 Job`）→ `e0b5c45914d5c9b25f228b1dfc7f4a384ae77375`（`feat(rpc): 接通出站运行体与 Runtime`）→ `4e18e5e`（`feat(rpc): 闭合Runtime与Outbox服务执行链`）。提交后登记，供未来对整个机制闭包进行一次独立只读审查；此前两份阶段性 Review 的历史证据合并保留于本文件。
 
 ## 范围
 
@@ -9,6 +9,7 @@
 - libprocess 的 Observation、Process/Job 原机器恢复、同步门面和 JobDriver；错误阶段、进度与 authority 一并保留。
 - init 的持久 RootSupervisor、组合等待、失败隔离与预备能力账本；pm 正式 JobDriver、最小预算执行与停止；相关验收与文档。
 - shared/timer_queue 只增加预付载荷绑定接口；内核与 shared ABI 没有改动。RPC/Outbox、FAL 业务及内核公共操作重构不在本提交范围内。
+- RPC/Outbox：Dispatcher Runtime 接缝、Runtime Wake、RequestContext/PreparedResponse/Outbox、Commit 前准入、回复退休/退款，以及 `srv_init`/长期 `srv_fs` 真实消费者迁移和旧阻塞泵删除。
 
 ## 复核重点
 
@@ -70,4 +71,18 @@
 
 - 完整 `just acceptance` 已通过：`artifacts/acceptance-cleanup-paging-20260915-131912.log` exit 0，stress 16/16、release、sifive_u、nofd、panic/alloc/fatal 启动失败三线均通过。对应 `.sources.json` 的 7 个本批改动源码哈希一致，无 QEMU/GDB 残留；sub-4/sub-5 已完成一次集中只读复核，两者均无 finding；分别确认 Runtime 预付/Gate/owner 与 Job 分页/派生前预付/恢复/Active 停止契约。
 
-本批 S1 停止补证、S3 核心清理与 S4 有界分页均完成，原 PM 停止证据缺口关闭；没有开放修复项。S2/S5/S6 按用户确认的测试夹具边界不构成本批待办，不另挂延期。正式实现四个文件合计净减少 86 行，新增测试不计入该数。生产源码与最终聚合哈希保持一致，文档完成状态同步更新。本批已提交 `5de2780fe4802f2bb31ddeeafccf87737ba80cc4`，未 push；固定差异复核见 [未来 Review](todo-2026-09-15-runtime-cleanup-paging-review.md)，本文件保留原始审视与本批证据。
+本批 S1 停止补证、S3 核心清理与 S4 有界分页均完成，原 PM 停止证据缺口关闭；没有开放修复项。S2/S5/S6 按用户确认的测试夹具边界不构成本批待办，不另挂延期。正式实现四个文件合计净减少 86 行，新增测试不计入该数。生产源码与最终聚合哈希保持一致，文档完成状态同步更新。本批已提交 `5de2780fe4802f2bb31ddeeafccf87737ba80cc4`，未 push；本文件现作为整体固定提交 Review 的唯一入口，并保留原始审视与本批证据。
+
+## RPC/Outbox 追加闭包（`e0b5c45` → `4e18e5e`）
+
+追加范围包括 Dispatcher 的可嵌入 Runtime 任务族、Runtime Wake、RequestContext/PreparedResponse/Outbox、Commit 前准入、回复退休/退款，以及 `srv_init`/长期 `srv_fs` 真实消费者迁移和旧阻塞泵删除。
+
+追加复核重点：
+
+1. Wake 请求缓冲暂满、目标已退休、调用者退出和拒绝回执不会丢失完成责任或保留无界 owner。
+2. Outbox 在业务副作用前完成任务/来源/回复存储准入；`Sent`、`Abandoned`、期限、关闭和停止分别持有正确的 Delivery/reply-once/额度终态。
+3. 来源注册、重臂、移除失败在 `max_work=1` 下继续推进；注销确认先于任务退休，失败不伪造退款。
+4. `srv_fs` 长期 Runtime 统一拥有 Ingress、业务请求与 Outbox；旧 `wait_many → serve_one` 泵、每请求 Runtime、手写 framing 和重复 close 已删除。
+5. Dispatcher 的异步多 in-flight 接缝没有恢复第二事件循环；真实消费者和服务退出仍由同一 Runtime 收束。
+
+追加证据：目标检查和 clippy `-D warnings`、shared workspace host 测试、`libsrv`/`libprocess`/`librpc` host 测试及 `just virt` 均通过；实现事实见 `notes/impls/rpc.md`，完整接续记录见执行前置计划。本追加批次不另建 Review 任务，和前两阶段共同构成一个整体固定提交审查对象。

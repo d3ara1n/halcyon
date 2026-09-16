@@ -2,7 +2,7 @@
 
 > 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，已提交为 `a3891b0`；固定提交复核登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 已进入第一阶段施工，FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
 
-提交后的结构审视见 [固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态和装配边界的收敛建议；用户已授权并完成收窄后的 Runtime 清理、Job 单页收束和停止补证；host/目标检查/完整 acceptance 与集中复核均通过，本批已提交 `5de2780`，固定提交复核见 [未来 Review](todo-2026-09-15-runtime-cleanup-paging-review.md)。服务架构化不在范围内。
+提交后的结构审视见[整体固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态、Runtime Wake、RPC/Outbox 和真实消费者边界的收敛建议；Runtime 清理、Job 单页收束、停止补证及 RPC/Outbox 已完成，固定提交序列统一由该 Review 承载。服务架构化不在范围内。
 
 ## RPC/Outbox 当前接力状态
 

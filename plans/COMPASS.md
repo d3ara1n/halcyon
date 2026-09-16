@@ -46,8 +46,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
 | [`todo-2026-09-14-stream-transport-review.md`](todo-2026-09-14-stream-transport-review.md) | 未来 Review：固定复核 `a2aabed` 的观察草稿面删除、raw 工厂删除、srv_init typed 创建迁移与终态访问边界，不预审通用执行闭包的观察接入形态 |
-| [`todo-2026-09-15-runtime-cleanup-paging-review.md`](todo-2026-09-15-runtime-cleanup-paging-review.md) | 未来 Review：固定 `5de2780` 的预付请求复用、Job 单页恢复与 Active 停止补证 |
-| [`todo-2026-09-15-runtime-admission-review.md`](todo-2026-09-15-runtime-admission-review.md) | 固定 `a3891b0` 审视及清理记录：Runtime/Job 分页/Active 停止补证已提交 `5de2780`，最终验收与集中复核通过 |
+| [`todo-2026-09-15-runtime-admission-review.md`](todo-2026-09-15-runtime-admission-review.md) | 整体固定提交 Review：`a3891b0` → `5de2780` → `e0b5c45` → `4e18e5e`，覆盖 Runtime/Job 分页/Active 停止、RPC/Outbox、真实消费者与组合验证 |
 | [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 消息运输、流运输/Runnel 与通用执行/准入已完成；下一项是按内部顺序施工的单一 RPC/Outbox 闭包，过程不独立验收，完整消费者迁移与组合验证在闭包收口时进行 |
 | [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
