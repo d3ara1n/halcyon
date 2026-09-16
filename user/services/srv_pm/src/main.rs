@@ -279,6 +279,10 @@ impl Task<PmWorld> for MailboxTask {
                 debug!("pm mailbox source refused: {:?}", error);
                 self.failed = true;
             }
+            RequestFailure::Wake { error, .. } => {
+                debug!("pm task wake refused: {:?}", error);
+                self.failed = true;
+            }
         }
         world.fail();
     }
@@ -503,7 +507,9 @@ impl Task<PmWorld> for StreamTask {
 
     fn refused(&mut self, _world: &mut PmWorld, failure: RequestFailure<PmTask>) {
         let error = match failure {
-            RequestFailure::Spawn { error, .. } | RequestFailure::Source { error, .. } => error,
+            RequestFailure::Spawn { error, .. }
+            | RequestFailure::Source { error, .. }
+            | RequestFailure::Wake { error, .. } => error,
         };
         self.source_failed = Some(error);
     }
@@ -690,7 +696,9 @@ impl Task<PmWorld> for FlowTask {
                 debug!("flow domain spawn refused: {:?}", error);
                 world.fail();
             }
-            RequestFailure::Source { error, .. } => self.source_failed = Some(error),
+            RequestFailure::Source { error, .. } | RequestFailure::Wake { error, .. } => {
+                self.source_failed = Some(error)
+            }
         }
     }
 
@@ -773,6 +781,7 @@ impl Task<PmWorld> for DomainTask {
                 }
             }
             RequestFailure::Spawn { .. } => world.fail(),
+            RequestFailure::Wake { .. } => world.fail(),
         }
     }
     // 已开始收束的域仍须完成，停止不取消管理责任。

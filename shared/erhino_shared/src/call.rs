@@ -65,6 +65,40 @@ pub enum SystemCallError {
     DeadlineExpired = 0x3d,
 }
 
+impl SystemCallError {
+    pub const fn from_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0x00 => Some(Self::NoError),
+            0x01 => Some(Self::Unknown),
+            0x02 => Some(Self::InternalError),
+            0x03 => Some(Self::IllegalArgument),
+            0x04 => Some(Self::FunctionNotAvailable),
+            0x10 => Some(Self::PermissionDenied),
+            0x20 => Some(Self::OutOfMemory),
+            0x21 => Some(Self::InvalidAddress),
+            0x22 => Some(Self::MemoryNotAccessible),
+            0x23 => Some(Self::AddressConflict),
+            0x24 => Some(Self::NotMapped),
+            0x25 => Some(Self::QuotaExceeded),
+            0x30 => Some(Self::ObjectNotFound),
+            0x31 => Some(Self::ObjectNotAvailable),
+            0x32 => Some(Self::ObjectNotAccessible),
+            0x33 => Some(Self::ReachLimit),
+            0x34 => Some(Self::NotSupported),
+            0x35 => Some(Self::MailboxFull),
+            0x36 => Some(Self::ObjectBusy),
+            0x37 => Some(Self::BufferTooSmall),
+            0x38 => Some(Self::ObjectClosed),
+            0x39 => Some(Self::RightsDenied),
+            0x3a => Some(Self::WrongObjectType),
+            0x3b => Some(Self::StaleHandle),
+            0x3c => Some(Self::ClockRange),
+            0x3d => Some(Self::DeadlineExpired),
+            _ => None,
+        }
+    }
+}
+
 /// Predefined system calls
 ///
 /// Only accessible in userspace

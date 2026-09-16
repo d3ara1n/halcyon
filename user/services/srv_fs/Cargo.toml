@@ -13,3 +13,4 @@ erhino_shared = { path = "../../../shared/erhino_shared" }
 libfal = { path = "../../frameworks/libfal" }
 libfs = { path = "../../frameworks/libfs" }
 librpc = { path = "../../frameworks/librpc" }
+libsrv = { path = "../../frameworks/libsrv" }

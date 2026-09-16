@@ -147,9 +147,13 @@ pub mod caller;
 #[cfg(target_arch = "riscv64")]
 pub mod dispatcher;
 #[cfg(target_arch = "riscv64")]
+pub mod outbox;
+#[cfg(target_arch = "riscv64")]
 pub use caller::Caller;
 #[cfg(target_arch = "riscv64")]
 pub use exchange::{CallCause, CallError, CallPhase, FrameRejection, PreparedResponse, Reply, Request, RequestContext};
+#[cfg(target_arch = "riscv64")]
+pub use outbox::{Outbox, OutboxResult};
 
 #[cfg(test)]
 mod tests {

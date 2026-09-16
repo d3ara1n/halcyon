@@ -8,11 +8,12 @@
 
 #![no_std]
 
+mod server;
+
 use alloc::{fmt::Write, string::String, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
-    object::{Handle, ObjectSignals, Rights},
-    wait::{WaitItem, WaitReason},
+    object::{Handle, Rights},
 };
 use libfal::lookup::ResolvePolicy::{FollowAll, NoFollowFinal};
 use libfal::{
@@ -20,7 +21,6 @@ use libfal::{
     header::{FalHeader, Kind, Status},
     io,
     lookup::{self, LookupRequest, NodeInfo, ResolvePolicy},
-    memfs::MemFs,
     node::{NodeAttributes, NodeKind},
     op,
     property::{self, EncodedItem},
@@ -33,18 +33,11 @@ use libfs::{
 use rinlib::{
     ipc::{
         capability::Capability,
-        message::{
-            Mailbox, MailboxSender, ReceivedMessage, SendOnce, receive, send_once,
-        },
+        message::{Mailbox, MailboxSender},
         object::duplicate,
-        packet::Packet,
-        wait::wait_many,
     },
     preclude::*,
 };
-
-/// 泵等待的超时（毫秒）：演示负载的诊断上限，正常往返毫秒级完成。
-const PUMP_TIMEOUT_MS: u64 = 500;
 
 /// 应答承载：消息上限扣除 RpcPrefix 与 FalHeader——由协议常量推导。
 const REPLY_BODY_MAX: usize =
@@ -80,12 +73,9 @@ fn check_path_len(bytes: &[u8]) -> Result<(), Status> {
 }
 
 struct Fs {
-    provider: MemFs,
-    owner: Mailbox,
     sender: MailboxSender,
-    reply_owner: Mailbox,
-    reply_sender: MailboxSender,
-    txid: u64,
+    caller: librpc::Caller,
+    worker: Option<rinlib::thread::JoinHandle<()>>,
 }
 
 impl Fs {
@@ -98,184 +88,65 @@ impl Fs {
                 Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
             )
             .expect("provider sender mint failed");
-        let reply_owner = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
-            .expect("reply mailbox create failed");
-        let reply_minted = reply_owner
-            .mint(0, Rights::WRITE | Rights::DUPLICATE | Rights::TRANSIT)
-            .expect("reply sender mint failed");
+        let worker = rinlib::thread::Builder::new()
+            .spawn(move || server::run(owner))
+            .expect("provider Runtime thread spawn failed");
         Self {
-            provider: MemFs::new(),
-            owner,
             sender: minted.sender,
-            reply_owner,
-            reply_sender: reply_minted.sender,
-            txid: 1,
+            caller: librpc::Caller::new(),
+            worker: Some(worker),
         }
     }
 
     /// 一次经内核 mailbox 的调用-服务往返；返回 FalHeader 之后的应答 body。
     fn call(&mut self, kind: Kind, body: &[u8], anchor: Handle) -> Result<Vec<u8>, Status> {
-        // 消息总长契约在入口显式校验，而非依赖内核报错。
-        if librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN + body.len()
-            > erhino_shared::message::PAYLOAD_MAX
+        if libfal::FAL_HEADER_LEN + body.len()
+            > erhino_shared::message::PAYLOAD_MAX - librpc::PREFIX_LEN
         {
             return Err(Status::IllegalArgument);
         }
-        self.txid += 1;
-        let mut payload = alloc::vec![
-            0u8;
-            librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN + body.len()
-        ];
-        let used = build_request(&mut payload, self.txid, kind, body);
-
-        // slot 0：一次性回复授权（携 TRANSIT 以便暂存于消息）；
-        // slot 1：帧锚目录（副本，不消耗本地 grant）。
-        let reply_once =
-            send_once(&self.reply_sender, Rights::WRITE | Rights::TRANSIT)
-                .map_err(map_system)?;
-        // SAFETY: duplicate 新建的帧锚副本，此处唯一接管关闭责任。
+        let mut payload = alloc::vec![0u8; libfal::FAL_HEADER_LEN + body.len()];
+        FalHeader::new(kind, payload.len() as u32).encode(&mut payload);
+        payload[libfal::FAL_HEADER_LEN..].copy_from_slice(body);
+        let mut request = librpc::Request::new(PROTOCOL_ID, &payload).map_err(map_system)?;
         let anchor_dup = unsafe {
             Capability::from_raw(
                 duplicate(anchor, Rights::WRITE | Rights::TRANSIT).map_err(map_system)?,
             )
         };
-        let mut packet =
-            Packet::new(PROTOCOL_ID, &payload[..used]).map_err(map_system)?;
-        for (capability, rights) in [
-            (reply_once.into_capability(), Rights::WRITE | Rights::TRANSIT),
-            (anchor_dup, Rights::WRITE),
-        ] {
-            if let Err(failure) = packet.push(capability, rights) {
-                // 拒绝时完整返还 owner：显式关闭，不泄漏承载。
-                let _ = failure.capability.close();
-                return Err(map_system(failure.error));
-            }
-        }
-        packet
-            .try_send(&self.sender, rinlib::time::Deadline::INFINITE)
-            .map_err(|mut failure| {
-                while let Some((capability, _)) = failure.packet.pop() {
-                    let _ = capability.close();
-                }
-                map_system(failure.error)
+        request
+            .push(anchor_dup, Rights::WRITE)
+            .map_err(|failure| map_system(failure.error))?;
+        let reply = self
+            .caller
+            .call(&self.sender, rinlib::time::Deadline::INFINITE, request)
+            .map_err(|error| {
+                debug!("fs: RPC call failed: {:?}", error);
+                Status::Internal
             })?;
-
-        loop {
-            let items = [
-                WaitItem::new(self.owner.as_handle(), ObjectSignals::READABLE, 0),
-                WaitItem::new(self.reply_owner.as_handle(), ObjectSignals::READABLE, 1),
-            ];
-            let result = wait_many(&items, PUMP_TIMEOUT_MS).map_err(map_system)?;
-            if result.reason == WaitReason::Timeout as u32 {
-                return Err(Status::Internal);
-            }
-            if result.item_index == 1 {
-                break;
-            }
-            self.serve_one();
-        }
-
-        let message = receive(self.reply_owner.as_handle()).map_err(map_system)?;
-        if message.header.kind != PROTOCOL_ID || !message.handles.is_empty() {
+        if !reply.handles.is_empty() {
             return Err(Status::Internal);
         }
-        let prefix = librpc::RpcPrefix::decode(&message.payload).map_err(|_| Status::Internal)?;
-        if prefix.kind != librpc::RpcMessageKind::Response || prefix.txid != self.txid {
+        if reply.payload.len() < libfal::FAL_HEADER_LEN {
             return Err(Status::Internal);
         }
-        let header_start = librpc::PREFIX_LEN;
-        let header = FalHeader::decode(
-            &message.payload[header_start..header_start + libfal::FAL_HEADER_LEN],
-        )
-        .map_err(|_| Status::Internal)?;
+        let header = FalHeader::decode(&reply.payload[..libfal::FAL_HEADER_LEN])
+            .map_err(|_| Status::Internal)?;
         if header.kind != kind {
             return Err(Status::Internal);
         }
-        let total = librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN;
-        Ok(message.payload[total..].to_vec())
+        Ok(reply.payload[libfal::FAL_HEADER_LEN..].to_vec())
     }
 
-    /// 服务提供者邮箱的队头请求：解码 → memfs → 经 send-once 回复。
-    /// 请求槽位契约：恰好 2 个 Handle（slot 0 回复授权、slot 1 帧锚）；
-    /// 任何不消费的 Handle 显式关闭——Handle 生命周期由本函数守恒。
-    fn serve_one(&mut self) {
-        let mut message = receive(self.owner.as_handle()).expect("provider receive failed");
-        let reply_once = match self.validate_request(&mut message) {
-            Ok(reply_once) => reply_once,
-            Err(()) => {
-                // 运输 owner 统一关闭未提取的能力和 Delivery。
-                return;
-            }
-        };
-
-        let mut out = [0u8; REPLY_BODY_MAX];
-        let served = match librpc::RpcPrefix::decode(&message.payload) {
-            Ok(prefix) => match provider::serve(
-                &mut self.provider,
-                &message.payload[librpc::PREFIX_LEN..],
-                &mut out,
-            ) {
-                Ok(served) => (prefix.txid, served),
-                Err(_) => (prefix.txid, internal_served(&mut out)),
-            },
-            Err(_) => {
-                // framing 违约无 txid 可回：以 1 占位（调用侧 txid 校验拒收）。
-                (1, internal_served(&mut out))
-            }
-        };
-
-        let mut reply = [0u8; librpc::PREFIX_LEN + REPLY_BODY_MAX];
-        librpc::RpcPrefix::new(librpc::RpcMessageKind::Response, served.0).encode(&mut reply);
-        let len = provider::encode_reply(
-            &mut reply[librpc::PREFIX_LEN..],
-            served.1.kind,
-            &out[..served.1.len],
-        );
-        // 单 outstanding 调用下回复箱至多一条在途，永不触满；失败同样
-        // 完整返还 Packet 与回复授权，显式关闭，不 panic 不泄漏。
-        let packet = Packet::new(
-            PROTOCOL_ID,
-            &reply[..librpc::PREFIX_LEN + len],
-        )
-        .expect("reply packet budget validated");
-        if let Err(failure) = packet.try_reply(reply_once, rinlib::time::Deadline::INFINITE) {
-            drop(failure.packet);
-            let _ = failure.reply.close();
-        }
+    fn shutdown(&mut self) {
+        self.sender
+            .send(server::STOP_KIND, &[])
+            .expect("provider stop send failed");
+        self.worker
+            .take()
+            .expect("provider worker already joined")
+            .join();
     }
-
-    /// 槽位契约校验：成功时摘出 slot 0 回复授权（typed 验证一次）并关闭
-    /// slot 1 帧锚（同进程泵不按锚分树，跨进程批次接入锚授权）。
-    fn validate_request(
-        &mut self,
-        message: &mut ReceivedMessage,
-    ) -> Result<SendOnce, ()> {
-        if message.header.kind != PROTOCOL_ID || message.handles.len() != 2 {
-            return Err(());
-        }
-        let reply_once = message
-            .handles
-            .take(0)
-            .map_err(|_| ())
-            .and_then(|capability| SendOnce::from_capability(capability).map_err(|_| ()))
-            .map(|(once, _)| once);
-        drop(message.handles.take(1).map_err(|_| ())?);
-        reply_once
-    }
-}
-
-fn build_request(out: &mut [u8], txid: u64, kind: Kind, body: &[u8]) -> usize {
-    let start = librpc::PREFIX_LEN + libfal::FAL_HEADER_LEN;
-    assert!(
-        out.len() >= start + body.len(),
-        "request buffer under-sized"
-    );
-    let prefix = librpc::RpcPrefix::new(librpc::RpcMessageKind::Request, txid);
-    prefix.encode(out);
-    let header = FalHeader::new(kind, (libfal::FAL_HEADER_LEN + body.len()) as u32);
-    header.encode(&mut out[librpc::PREFIX_LEN..]);
-    out[start..start + body.len()].copy_from_slice(body);
-    start + body.len()
 }
 
 fn map_system(error: SystemCallError) -> Status {
@@ -601,4 +472,5 @@ fn main() {
     assert!(hello_entries.iter().any(|(name, _)| name == "world"));
 
     debug!("fs acceptance passed");
+    fs.shutdown();
 }

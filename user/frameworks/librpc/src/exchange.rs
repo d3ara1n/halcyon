@@ -3,7 +3,7 @@
 use erhino_shared::{
     call::SystemCallError,
     message::{MessageHeader, MESSAGE_HANDLE_MAX, PAYLOAD_MAX},
-    object::{HandleRole, Rights},
+    object::{Handle, HandleRole, Rights},
     time::Deadline,
 };
 use rinlib::ipc::{
@@ -268,6 +268,12 @@ impl PreparedResponse {
                 Err(failure.error)
             }
         }
+    }
+    pub(crate) fn reply_handle(&self) -> Result<Handle, SystemCallError> {
+        self.context
+            .reply()
+            .map(SendOnce::as_handle)
+            .ok_or(SystemCallError::ObjectBusy)
     }
     pub fn into_context(self) -> RequestContext { self.context }
 }

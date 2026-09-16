@@ -116,6 +116,10 @@ pub enum RequestFailure<T> {
         kind: SourceKind,
         error: SystemCallError,
     },
+    Wake {
+        task: u64,
+        error: SystemCallError,
+    },
 }
 
 /// 任务在 advance 内声明的运行体请求；advance 返回后按序应用。
@@ -128,6 +132,7 @@ const REQUEST_CAPACITY: usize = 16;
 enum RequestOperation<T> {
     Spawn { task: T, max_sources: usize },
     Source(SourceRequest),
+    Wake { task: u64 },
 }
 
 struct PendingGate {
@@ -203,6 +208,15 @@ impl<T> Requests<T> {
         }
         self.operations
             .push(RequestOperation::Source(SourceRequest::Remove { source }));
+        Ok(())
+    }
+
+    /// 请求唤醒同一 Runtime 中的另一项活动任务；不持有任务或 Runtime 借用。
+    pub fn wake(&mut self, task: u64) -> Result<(), SystemCallError> {
+        if self.operations.len() == REQUEST_CAPACITY {
+            return Err(SystemCallError::ReachLimit);
+        }
+        self.operations.push(RequestOperation::Wake { task });
         Ok(())
     }
 
@@ -1019,6 +1033,12 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                         },
                     );
             }
+            RequestOperation::Wake { task: target } => {
+                self.queue
+                    .get_task_mut(task)
+                    .expect("requesting task disappeared while rejecting wake")
+                    .refused(world, RequestFailure::Wake { task: target, error });
+            }
             RequestOperation::Source(request) => {
                 if self.reject_foreign_source(task, world, &request) {
                     return;
@@ -1132,6 +1152,17 @@ impl<T, S: SourceOps, K: Taxonomy> Runtime<T, S, K> {
                             );
                         true
                     }
+                }
+            }
+            RequestOperation::Wake { task: target } => {
+                if let Err(error) = self.queue.schedule(target) {
+                    self.queue
+                        .get_task_mut(task)
+                        .expect("requesting task disappeared before wake refusal")
+                        .refused(world, RequestFailure::Wake { task: target, error });
+                    true
+                } else {
+                    false
                 }
             }
             RequestOperation::Source(request) => {
@@ -1976,7 +2007,9 @@ mod tests {
         }
         fn refused(&mut self, world: &mut World, failure: RequestFailure<Self>) {
             let error = match failure {
-                RequestFailure::Spawn { error, .. } | RequestFailure::Source { error, .. } => error,
+                RequestFailure::Spawn { error, .. }
+                | RequestFailure::Source { error, .. }
+                | RequestFailure::Wake { error, .. } => error,
             };
             world.refusals.push(error);
         }
@@ -2885,7 +2918,9 @@ mod tests {
         }
         fn refused(&mut self, _world: &mut World, failure: RequestFailure<Self>) {
             let error = match failure {
-                RequestFailure::Spawn { error, .. } | RequestFailure::Source { error, .. } => error,
+                RequestFailure::Spawn { error, .. }
+                | RequestFailure::Source { error, .. }
+                | RequestFailure::Wake { error, .. } => error,
             };
             panic!("PlanTask Gate request failed: {error:?}")
         }

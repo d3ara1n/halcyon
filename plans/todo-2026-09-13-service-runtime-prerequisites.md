@@ -6,7 +6,89 @@
 
 ## RPC/Outbox 当前接力状态
 
-当前接力已完成任务规模审计与设计收口，并完成第一阶段“出站状态与 Runtime 接缝”：`Dispatcher` 已改为 `libsrv::runtime::Task<()>`，删除自持 WaitSet、来源登记、直接重臂/期限推进和 `mem::forget` 放弃循环；纯逻辑 `OutboundStage` 与有界 `Sweep` 已补 host testcase；用户态 RISC-V `librpc` check、`just check`、七面 `just clippy` 与 `librpc` host testcase 通过。RPC/Outbox 仍是一个合并机制闭包，下一阶段为入站 `RequestContext`/`PreparedResponse`/Outbox 与回复准入；真实消费者迁移、旧阻塞泵删除和完整组合验证尚未开始，后续会话从该位置继续。
+当前接力已完成任务规模审计与设计收口，并完成第一阶段“出站状态与 Runtime 接缝”：`e0b5c45` 已将 Dispatcher 的协议状态接到 Runtime 任务推进，删除自持 WaitSet、来源登记、直接重臂/期限推进和 `mem::forget` 放弃循环；纯逻辑 `OutboundStage` 与有界 `Sweep` 已补 host testcase；用户态 RISC-V `librpc` check、`just check`、七面 `just clippy` 与 `librpc` host testcase 通过。
+
+2026-09-16 的接续重审确认：这仍是同一个 RPC/Outbox 闭包，`e0b5c45` 是可复用的铺路基线，不需要另立 todo 或推翻出站 owner/阶段设计；但“出站阶段已完成、只剩入站”这一表述过强。当前尚未闭合 Dispatcher 与服务任务族的最终组合、任务间完成唤醒、业务 Commit 前的任务/来源/回复准入，以及回复故障后的完整退休。后续会话从同一计划继续，先完成下节列出的局部修正与设计收口，再实施入站 `RequestContext`/`PreparedResponse`/Outbox、真实消费者迁移、旧阻塞泵删除和最终组合验证。
+
+## RPC/Outbox 接续重审与实施裁决（2026-09-16，基线 `e0b5c45`）
+
+### 范围结论
+
+本次是同一闭包的中途接力，不拆出新的“出站”或“Outbox”任务。已提交的 `Request`/Packet 消费式 owner、`PendingCall`/txid 路由、绝对 Deadline、共享 ReplyPort、来源注销等待、`OutboundStage` 与有界 `Sweep` 均保留；重审只修正会阻断最终组合的边界，不回滚已验证的运输和 Runtime 基础。
+
+### 继续施工前的必要修正
+
+1. 所有故障停止入口统一进入幂等的停止/注销/退休流程。`receive_replies` 不能先单独写 `sealed` 后再返回，否则后续 `begin_stop` 不会启动清理，挂起调用可能永久留在 `pending`。
+2. 删除或私有化 `Dispatcher::reply_sender`。共享回复邮箱只能通过每个请求携带的 send-once 授权接收回复，不能暴露可伪造回复或填满邮箱的普通发送 owner。
+3. 明确 Runtime 投递的 timeout 输入不能被提前消费后丢失；`Dispatcher` 必须在任意推进阶段保留并处理已交付的期限命中，`max_work=1` 不能使调用无限停驻。
+4. 来源错误保留实际 `SystemCallError`，只在 RPC 对外错误边界做分类；不能把所有普通来源错误压成 `InternalError`，也不能把所有回复来源错误压成 `ObjectClosed`。
+5. 清理错误字段必须有真实写入和观察责任；若清理由 Runtime 负责重试，则删除当前没有生产者的 `cleanup_error`，不要保留伪状态。
+
+这些是接续前的局部修正，不构成新的闭包，也不要求重新实现消息/流运输。
+
+### 最终任务类型与唤醒接缝
+
+`Dispatcher` 不再把 `Task<()>` 作为最终服务组合接口。当前 `Task::Family = Self` 使它只能独占 `Runtime<Dispatcher>`，无法和入站任务、业务任务及 Outbox 共享同一个服务 Runtime。保留 Dispatcher 作为协议状态拥有者和可嵌入推进器，由服务侧的 `ServiceTask`/任务族统一实现 `Task<ServiceWorld>`，并转发 Dispatcher 的 `advance`、`registered`、`unregistered`、`refused`、`stop` 和 `deadline`。
+
+服务 Runtime 的最终形状为：
+
+```text
+Runtime<ServiceTask, WaitSet, ServiceWorld>
+  └── ServiceTask 任务族
+      ├── RPC 出站协议任务（持有 Dispatcher 状态或其驱动）
+      ├── 入站/业务请求任务（持有 RequestContext）
+      └── 回复阶段（持有 PreparedResponse/Outbox）
+```
+
+任务之间不直接取得 Runtime 借用。需要提交下游调用或交付完成结果时，经 Runtime 应用的有界请求声明任务唤醒；顺序固定为先保存请求/结果 owner，再提交 wake 请求。txid、等待者关联和迟到回复仍由 librpc 持有，Runtime 只负责任务调度和唤醒，不保存协议状态。
+
+### Commit 屏障与 Outbox 责任
+
+入站请求的最终顺序冻结为：
+
+```text
+Receive/Delivery
+  → RequestContext 解码与能力校验
+  → PreparedResponse/Outbox、任务、来源和额度预留
+  → 实际任务准入及来源登记
+  → 业务副作用/Commit
+  → 回复发送或明确放弃
+  → 来源注销、Delivery/回复授权退休、精确退款
+```
+
+业务副作用前必须完成回复存储、发送额度、任务槽及所需来源的准入。`srv_fs` 当前 `serve_one` 先修改 MemFs、后创建回复 Packet，迁移时必须反转为先完成有界回复准备，再调用业务 Commit；不能以回复失败后补偿 MemFs 替代准入屏障。Outbox 持有 `RequestContext`、reply-once、Delivery、PreparedResponse 和发送阶段，回复失败不伪造已提交业务回滚。
+
+通用 RPC 前缀不凭空推断服务端 Deadline。Outbox 接收调用方或协议 Header 已解析的绝对 Deadline；FAL Header 的期限由 FAL 解析层提供，librpc 只负责统一发送背压、接收和最终接受检查的阶段语义。
+
+### 接续顺序与完成门
+
+1. 完成上述五项局部修正，并补 Dispatcher×Runtime 的 `max_work=1`、故障停止、期限和来源错误测试。
+2. 将 Dispatcher 改为可嵌入服务任务族的协议驱动，补有界任务提交/完成唤醒接缝，不恢复第二个事件循环。
+3. 实现入站 `RequestContext` → `PreparedResponse` → Outbox 状态机，覆盖满箱、关闭、期限、取消、服务退出、调用者退出和退款；回复阶段沿用同一请求任务槽，不在 Commit 后申请不可保证的任务。
+4. 整体迁移 `srv_fs` 请求往返和 `srv_init` 真实 RPC 验收；迁移期间删除旧回复授权缺少 `WAIT`、手工 receive/serve/send 阻塞泵及重复 close 路径。
+5. 最后统一执行 host/目标检查、七面 clippy、core/release/platform 与跨机制失败/取消/退款组合验证，再做结构收口 Review。
+
+在第 3 步前，不把 `PreparedResponse` 的现有构造函数或 `Dispatcher` 的独立 `Task<()>` 形状视为最终 API；在第 4 步前，不声称 RPC/Outbox 闭包完成。
+
+## RPC/Outbox 闭包收口记录（当前工作树，未提交）
+
+后续施工已沿同一闭包完成以下责任链：
+
+- `Dispatcher` 不再实现固定 `Task<()>`；协议推进、来源回调和停止/期限接口可由服务任务族嵌入。Runtime 新增有界 `Wake` 请求，来源声明/移除/重臂及完成唤醒在请求缓冲暂满时保留重试责任。回复来源错误保留实际 `SystemCallError`，回复故障统一进入可退休停止路径；公开普通 `reply_sender` 已删除。
+- `Outbox` 已成为正式入站回复 owner：持有 `RequestContext`、Delivery、send-once、PreparedResponse 和来源注册；先完成来源准入，再允许业务 Commit；支持可写背压、重臂、期限、关闭/错误、停止、来源注销和精确任务/输入额度退款。回复失败产生 `Abandoned`，不伪造业务回滚。
+- `srv_init` 合法第二次 RPC 回复已迁移到真实 Outbox Runtime；第一次协议拒绝仍保留为刻意 raw/拒绝路径验收。
+- `srv_fs` 已删除每请求 Runtime、`wait_many → serve_one` 重入泵、手写 RPC framing/回复校验、手工 `validate_request` 和重复 close。客户端使用 `Caller`；provider 运行于长期单一 Runtime：Ingress 先接收并预备 Outbox，RequestTask 在来源实际登记后才执行 MemFs 业务，再沿同一任务发送并退休回复。服务停止通过控制消息和 JoinHandle 显式收束。
+- `srv_fs` 的业务 Commit 已置于 Outbox 来源准入之后；调用者退出/回复关闭的 `Abandoned` 是服务可继续运行的终态，不再升级为服务 panic。
+
+验证证据：
+
+- shared workspace host 测试全部通过；
+- `libsrv`、`libprocess`、`librpc` host 测试全部通过（共 43 项相关测试）；
+- `librpc`、`libsrv`、`libprocess`、`srv_fs`、`srv_init`、`srv_pm` 目标 clippy `-D warnings` 通过；
+- 用户态 RISC-V 目标检查通过；
+- `just virt` 通过：FAL fs 验收、服务监督、Outbox 真实回复、资源退款和显式 reset 均通过。
+
+当前不把没有真实多路复用消费者的异步 `Dispatcher::begin_for` 另造测试服务；它已作为可嵌入协议驱动保留，后续首个真实多 in-flight 服务消费者出现时直接接入同一 `ServiceTask` 族。RPC/Outbox 当前闭包的真实消费者和旧路径删除门已关闭；提交前仍需按项目流程做结构 Review，提交后登记固定提交 Review。
 
 ## 开工流程与本任务审计门
 

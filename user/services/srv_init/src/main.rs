@@ -26,7 +26,8 @@ use libprocess::{
     SupervisionStage, SupervisionTarget, collect_process, enumerate_members, spawn,
 };
 use librpc::{
-    CallCause, CallError, CallPhase, Caller, FrameRejection, Request, RpcMessageKind, RpcPrefix,
+    CallCause, CallError, CallPhase, Caller, FrameRejection, Outbox, OutboxResult, Request,
+    RequestContext, RpcMessageKind, RpcPrefix,
 };
 use librunnel::{ConsumerReady, blocking};
 use libsrv::runtime::{
@@ -850,33 +851,61 @@ fn test_rpc_reject_cleanup() {
             for attempt in 0..2 {
                 let mut request =
                     wait_message(service.owner).expect("RPC test request receive failed");
-                let prefix =
-                    RpcPrefix::decode(&request.payload).expect("RPC test request prefix invalid");
-                assert_eq!(prefix.kind, RpcMessageKind::Request);
-                let (reply_once, _) = SendOnce::from_capability(
-                    request
-                        .handles
-                        .take(0)
-                        .expect("RPC test reply slot missing"),
-                )
-                .map_err(|failure| failure.error)
-                .expect("RPC test reply slot is not a send-once");
-                let mut response = [0u8; librpc::PREFIX_LEN + 1];
-                RpcPrefix::new(RpcMessageKind::Response, prefix.txid).encode(&mut response);
-                response[librpc::PREFIX_LEN] = attempt;
-                let protocol = if attempt == 0 { PROTOCOL + 1 } else { PROTOCOL };
-                let mut packet = Packet::new(protocol, &response)
-                    .expect("RPC response packet allocation failed");
                 if attempt == 0 {
+                    let prefix = RpcPrefix::decode(&request.payload)
+                        .expect("RPC test request prefix invalid");
+                    assert_eq!(prefix.kind, RpcMessageKind::Request);
+                    let (reply_once, _) = SendOnce::from_capability(
+                        request
+                            .handles
+                            .take(0)
+                            .expect("RPC test reply slot missing"),
+                    )
+                    .map_err(|failure| failure.error)
+                    .expect("RPC test reply slot is not a send-once");
+                    let mut response = [0u8; librpc::PREFIX_LEN + 1];
+                    RpcPrefix::new(RpcMessageKind::Response, prefix.txid)
+                        .encode(&mut response);
+                    response[librpc::PREFIX_LEN] = attempt;
+                    let mut packet = Packet::new(PROTOCOL + 1, &response)
+                        .expect("RPC response packet allocation failed");
                     // SAFETY: 新创建的原始 signaler 尚未被其他 owner 接管，alias 仅用于 stale 检查。
                     let capability = unsafe { Capability::from_raw(rejected.peer) };
                     packet
                         .push(capability, Rights::SIGNAL)
                         .expect("RPC response capability preparation failed");
+                    packet
+                        .try_reply(reply_once, rinlib::time::Deadline::INFINITE)
+                        .expect("RPC rejection response publication failed");
+                    continue;
                 }
-                packet
-                    .try_reply(reply_once, rinlib::time::Deadline::INFINITE)
-                    .expect("RPC response publication failed");
+
+                let context = RequestContext::decode(request, PROTOCOL)
+                    .map_err(|rejected| rejected.reason)
+                    .expect("RPC test request context invalid");
+                let mut outbox = Outbox::prepare(
+                    context,
+                    1,
+                    rinlib::time::Deadline::INFINITE,
+                    1,
+                )
+                .map_err(|failure| failure.error)
+                .expect("RPC test Outbox preparation failed");
+                outbox
+                    .response_mut()
+                    .expect("RPC test response remains owned")
+                    .body_mut()
+                    .expect("RPC test response body unavailable")[0] = attempt;
+                outbox
+                    .response_mut()
+                    .expect("RPC test response remains owned")
+                    .finish_body(1)
+                    .expect("RPC test response body finalize failed");
+                assert_eq!(
+                    run_rpc_outbox(outbox),
+                    OutboxResult::Sent,
+                    "RPC Outbox did not deliver the accepted response"
+                );
             }
             unsafe { close(service.owner) }.expect("RPC test service owner close failed");
         })
@@ -918,6 +947,98 @@ fn test_rpc_reject_cleanup() {
     unsafe { close(rejected.owner) }.expect("RPC rejected Handle owner close failed");
     drop(service_sender);
     debug!("RPC rejected reply cleanup passed");
+}
+
+struct RpcOutboxTask {
+    outbox: Outbox,
+}
+
+#[derive(Default)]
+struct RpcOutboxWorld {
+    result: Option<OutboxResult>,
+}
+
+impl Task<RpcOutboxWorld> for RpcOutboxTask {
+    type Family = Self;
+
+    fn advance(
+        &mut self,
+        _id: u64,
+        _world: &mut RpcOutboxWorld,
+        requests: &mut Requests<Self>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        let advance = self.outbox.advance(requests, input, budget)?;
+        Ok(advance)
+    }
+
+    fn refused(&mut self, world: &mut RpcOutboxWorld, failure: RequestFailure<Self>) {
+        self.outbox.refused(world, failure);
+        world.result = self.outbox.result();
+    }
+
+    fn registered(&mut self, world: &mut RpcOutboxWorld, kind: SourceKind, source: SourceId) {
+        self.outbox.registered(world, kind, source);
+    }
+
+    fn unregistered(&mut self, world: &mut RpcOutboxWorld, kind: SourceKind, source: SourceId) {
+        self.outbox.unregistered(world, kind, source);
+        world.result = self.outbox.result();
+    }
+
+    fn stop(&mut self, world: &mut RpcOutboxWorld) {
+        self.outbox.stop(world);
+        world.result = self.outbox.result();
+    }
+
+    fn deadline(&self) -> rinlib::time::Deadline {
+        self.outbox.deadline()
+    }
+}
+
+fn run_rpc_outbox(outbox: Outbox) -> OutboxResult {
+    let budget =
+        libsrv::budget::Budget::<libsrv::budget::CoreResource>::new(&[2, 64 * 1024], 1)
+            .expect("RPC Outbox budget creation failed");
+    let account = budget
+        .account(&[2, 64 * 1024])
+        .expect("RPC Outbox account creation failed");
+    let set = WaitSet::create(4).expect("RPC Outbox WaitSet creation failed");
+    let mut runtime = Runtime::<RpcOutboxTask, WaitSet>::new(
+        set,
+        1,
+        1,
+        libsrv::budget::CoreResource::EXECUTION_SLOTS,
+        &account,
+    )
+    .expect("RPC Outbox Runtime creation failed");
+    runtime
+        .spawn(RpcOutboxTask { outbox }, 1)
+        .map_err(|failure| failure.error)
+        .expect("RPC Outbox task admission failed");
+    let mut world = RpcOutboxWorld::default();
+    runtime
+        .run(&mut world, 1)
+        .expect("RPC Outbox Runtime failed");
+    let result = world.result.expect("RPC Outbox lost terminal result");
+    runtime
+        .close()
+        .map_err(|(_, error)| error)
+        .expect("RPC Outbox Runtime close failed");
+    assert_eq!(
+        account.usage(libsrv::budget::CoreResource::Task).0,
+        0,
+        "RPC Outbox task charge did not refund"
+    );
+    assert_eq!(
+        account
+            .usage(libsrv::budget::CoreResource::InputBytes)
+            .0,
+        0,
+        "RPC Outbox input charge did not refund"
+    );
+    result
 }
 
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
@@ -1467,7 +1588,9 @@ impl Task<ReadWorld> for StreamReadTask {
 
     fn refused(&mut self, _world: &mut ReadWorld, failure: RequestFailure<InitTask>) {
         let error = match failure {
-            RequestFailure::Spawn { error, .. } | RequestFailure::Source { error, .. } => error,
+            RequestFailure::Spawn { error, .. }
+            | RequestFailure::Source { error, .. }
+            | RequestFailure::Wake { error, .. } => error,
         };
         self.arm_failed = Some(error);
     }

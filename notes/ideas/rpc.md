@@ -44,7 +44,7 @@ Timeout 只停止本地等待。服务取消、幂等键、去重和重试属于
 
 RPC/Outbox 是一个机制闭包，出站与入站只按依赖顺序施工，不各自形成验收任务。Runtime 是唯一的用户态执行与观察拥有者：它负责 WaitSet 来源登记、arm generation、事件输入、绝对期限唤醒、注销重试、任务公平推进、停止和最终退休。RPC 不再持有自己的 WaitSet、来源表、重臂循环、期限驱动或进程级放弃循环。
 
-RPC 任务只拥有协议状态：PendingCall、txid 路由、Request/Reply 阶段、ReplyPort、RequestContext、Outbox、Delivery 和业务结果。RPC 通过 Runtime 的任务请求声明来源登记、重臂与移除，并在任务输入中消费来源事件；Runtime 回执来源身份和注销结果，RPC 保留对应状态直到回执完成。协议期限仍由 RPC 保存并决定业务超时，Runtime 只根据任务报告的最近绝对期限负责唤醒。
+RPC 任务只拥有协议状态：PendingCall、txid 路由、Request/Reply 阶段、ReplyPort、RequestContext、Outbox、Delivery 和业务结果。Dispatcher 是可嵌入的协议推进器，不以固定 `Task<()>` 作为服务组合边界；最终由服务自己的任务族统一实现 `Task<ServiceWorld>`，转发 Dispatcher 与入站/业务任务的 Runtime 回调。RPC 通过 Runtime 的任务请求声明来源登记、重臂与移除，并在任务输入中消费来源事件；任务间提交和完成通过 Runtime 应用的有界唤醒请求连接，Runtime 不保存 txid 或业务状态。Runtime 回执来源身份和注销结果，RPC 保留对应状态直到回执完成。入站 Outbox 必须在业务 Commit 前完成回复存储、任务和来源准入；回复失败只终结交付责任，不伪造业务回滚。协议期限仍由 RPC 保存并决定业务超时，Runtime 只根据任务报告的最近绝对期限负责唤醒。
 
 同步 Caller 是同一出站状态机的阻塞门面，不维护第二套投递或错误阶段语义。`Dispatcher` 的最终形态是 RPC 状态/路由任务，不是独立事件循环；`RequestContext`、`PreparedResponse` 与 Outbox 共同持有入站请求至回复终结的责任。业务 Commit 前必须完成回复存储、发送额度、任务和来源准入，Commit 后回复失败只报告结果，不伪造业务回滚。
 

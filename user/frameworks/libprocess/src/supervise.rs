@@ -491,6 +491,7 @@ impl<O: ProcessOperations, W: SuperviseSink<O>> Task<W> for SuperviseTask<O> {
         match failure {
             RequestFailure::Source { kind, error } => self.observation.refused(kind, error),
             RequestFailure::Spawn { .. } => unreachable!("supervision does not spawn tasks"),
+            RequestFailure::Wake { .. } => unreachable!("supervision does not wake tasks"),
         }
     }
     fn stop(&mut self, _world: &mut W) {

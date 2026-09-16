@@ -9,7 +9,7 @@ use erhino_shared::{
     time::Deadline,
 };
 use libsrv::runtime::{
-    Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step, Task,
+    Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
 use ordered_table::OrderedTable;
 use rinlib::ipc::{
@@ -56,7 +56,8 @@ struct PendingCall {
     closed: SourceState,
     stage: OutboundStage,
     queued: bool,
-    cleanup_error: Option<SystemCallError>,
+    waiter: Option<u64>,
+    wake_queued: bool,
     previous: u64,
     next: u64,
 }
@@ -65,14 +66,12 @@ struct PendingCall {
 pub struct Completion {
     pub service: Capability,
     pub result: Result<Reply, CallError>,
-    pub cleanup_error: Option<SystemCallError>,
 }
 
 #[derive(Debug)]
 pub struct StartFailure {
     pub service: Capability,
     pub error: CallError,
-    pub cleanup_error: Option<SystemCallError>,
 }
 
 /// 多 in-flight RPC 的协议任务。
@@ -97,6 +96,7 @@ pub struct Dispatcher {
     removals: Sweep,
     stopping: Sweep,
     retiring: Sweep,
+    wake_pending: bool,
     phase: u8,
     reply_rearm_needed: bool,
     next_source_key: u64,
@@ -134,6 +134,7 @@ impl Dispatcher {
             removals: Sweep::default(),
             stopping: Sweep::default(),
             retiring: Sweep::default(),
+            wake_pending: false,
             phase: 0,
             reply_rearm_needed: false,
             next_source_key: 2,
@@ -142,19 +143,22 @@ impl Dispatcher {
         })
     }
 
-    pub fn reply_sender(&self) -> &MailboxSender {
-        &self.sender
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "准入失败原样返还服务授权及请求拥有者，错误路径不分配"
-    )]
     pub fn begin(
         &mut self,
         service: Capability,
         deadline: Deadline,
+        request: Request,
+    ) -> Result<u64, StartFailure> {
+        self.begin_for(service, deadline, request, None)
+    }
+
+    /// 提交调用并在完成进入 FIFO 后请求唤醒指定 Runtime 任务。
+    pub fn begin_for(
+        &mut self,
+        service: Capability,
+        deadline: Deadline,
         mut request: Request,
+        waiter: Option<u64>,
     ) -> Result<u64, StartFailure> {
         let early = (|| {
             if self.sealed {
@@ -170,7 +174,6 @@ impl Dispatcher {
             return Err(StartFailure {
                 service,
                 error: CallError::unsent(cause, request),
-                cleanup_error: None,
             });
         }
 
@@ -180,7 +183,6 @@ impl Dispatcher {
                 return Err(StartFailure {
                     service: failure.owner,
                     error: CallError::unsent(cause(failure.error), request),
-                    cleanup_error: None,
                 });
             }
         };
@@ -188,14 +190,12 @@ impl Dispatcher {
             return Err(StartFailure {
                 service: service.into_capability(),
                 error: CallError::unsent(CallCause::System(SystemCallError::RightsDenied), request),
-                cleanup_error: None,
             });
         }
         if let Err(error) = request.attach_reply(&self.sender) {
             return Err(StartFailure {
                 service: service.into_capability(),
                 error: CallError::unsent(cause(error), request),
-                cleanup_error: None,
             });
         }
         let storage = match MessageStorage::new() {
@@ -204,7 +204,6 @@ impl Dispatcher {
                 return Err(StartFailure {
                     service: service.into_capability(),
                     error: CallError::unsent(cause(error), request),
-                    cleanup_error: None,
                 });
             }
         };
@@ -217,7 +216,6 @@ impl Dispatcher {
                         CallCause::System(SystemCallError::IllegalArgument),
                         request,
                     ),
-                    cleanup_error: None,
                 });
             }
         };
@@ -227,7 +225,6 @@ impl Dispatcher {
                 return Err(StartFailure {
                     service: service.into_capability(),
                     error: CallError::unsent(cause(error), request),
-                    cleanup_error: None,
                 });
             }
         };
@@ -237,7 +234,6 @@ impl Dispatcher {
                 return Err(StartFailure {
                     service: service.into_capability(),
                     error: CallError::unsent(cause(error), request),
-                    cleanup_error: None,
                 });
             }
         };
@@ -267,7 +263,8 @@ impl Dispatcher {
             },
             stage: OutboundStage::Ready,
             queued: false,
-            cleanup_error: None,
+            waiter,
+            wake_queued: false,
             previous: 0,
             next: 0,
         };
@@ -331,10 +328,6 @@ impl Dispatcher {
         Ok(txid)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "失败路径原样返还请求、服务授权与清理责任"
-    )]
     fn start_failure(
         &mut self,
         mut pending: PendingCall,
@@ -350,7 +343,6 @@ impl Dispatcher {
         Err(StartFailure {
             service: pending.service.into_capability(),
             error: CallError::unsent(cause, request),
-            cleanup_error: pending.cleanup_error,
         })
     }
 
@@ -391,6 +383,27 @@ impl Dispatcher {
                 .next = txid;
         }
         self.completed_tail = txid;
+    }
+
+    fn wake_completion<F>(&mut self, requests: &mut Requests<F>) {
+        self.wake_pending = false;
+        let mut txid = self.completed_head;
+        while txid != 0 {
+            let next = self.pending.get(txid).map_or(0, |pending| pending.next);
+            let Some(pending) = self.pending.get_mut(txid) else {
+                break;
+            };
+            if let Some(waiter) = pending.waiter
+                && !pending.wake_queued
+            {
+                if requests.wake(waiter).is_err() {
+                    self.wake_pending = true;
+                    break;
+                }
+                pending.wake_queued = true;
+            }
+            txid = next;
+        }
     }
 
     fn complete(&mut self, txid: u64, result: Result<Reply, CallCause>) {
@@ -467,7 +480,7 @@ impl Dispatcher {
                 Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => break,
                 Err(error) => {
                     self.fault = Some(error);
-                    self.sealed = true;
+                    self.begin_stop();
                     return Err(error);
                 }
             }
@@ -509,8 +522,8 @@ impl Dispatcher {
         Ok(used)
     }
 
-    fn declare_source(
-        requests: &mut Requests<Self>,
+    fn declare_source<F>(
+        requests: &mut Requests<F>,
         state: &mut SourceState,
         plan: SourcePlan,
     ) -> bool {
@@ -535,7 +548,7 @@ impl Dispatcher {
         }
     }
 
-    fn declare_remove(requests: &mut Requests<Self>, state: &mut SourceState) -> bool {
+    fn declare_remove<F>(requests: &mut Requests<F>, state: &mut SourceState) -> bool {
         let Some(source) = state.source else {
             return false;
         };
@@ -576,7 +589,7 @@ impl Dispatcher {
         }
     }
 
-    fn declare_registrations(&mut self, requests: &mut Requests<Self>) {
+    fn declare_registrations<F>(&mut self, requests: &mut Requests<F>) {
         if self.sealed {
             self.registrations = Sweep::default();
             return;
@@ -593,6 +606,8 @@ impl Dispatcher {
                 .is_ok()
             {
                 self.reply_requested = true;
+            } else {
+                self.registrations.request();
             }
             return;
         }
@@ -601,6 +616,8 @@ impl Dispatcher {
                 && requests.rearm(source).is_ok()
             {
                 self.reply_rearm_needed = false;
+            } else {
+                self.registrations.request();
             }
             return;
         }
@@ -628,12 +645,15 @@ impl Dispatcher {
                     ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
                 ),
             );
-        if declared_closed || declared_writable {
+        let incomplete = pending.result.is_none()
+            && (pending.closed.source.is_none()
+                || (pending.request.is_some() && pending.writable.source.is_none()));
+        if declared_closed || declared_writable || incomplete {
             self.registrations.request();
         }
     }
 
-    fn declare_removals(&mut self, requests: &mut Requests<Self>) {
+    fn declare_removals<F>(&mut self, requests: &mut Requests<F>) {
         if self.sealed
             && !self.reply_removing
             && let Some(source) = self.reply_source
@@ -652,18 +672,30 @@ impl Dispatcher {
                 && Self::declare_remove(requests, &mut pending.writable);
             let remove_closed =
                 pending.result.is_some() && Self::declare_remove(requests, &mut pending.closed);
+            let needs_retry = pending.result.is_some() && !Self::clean(pending);
             if remove_writable || remove_closed {
                 self.removals.request();
             }
             if pending.result.is_some() {
                 self.queue_completion(txid);
             }
+            if needs_retry {
+                self.removals.request();
+            }
         }
     }
 
     fn process_event(&mut self, event: SourceEvent) -> Result<usize, SystemCallError> {
         if event.kind == self.reply_key {
-            if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+            if event.error != 0 {
+                self.fault = Some(
+                    SystemCallError::from_u32(event.error)
+                        .unwrap_or(SystemCallError::InternalError),
+                );
+                self.begin_stop();
+                return Ok(1);
+            }
+            if event.observed.intersects(ObjectSignals::CLOSED) {
                 self.fault = Some(SystemCallError::ObjectClosed);
                 self.begin_stop();
                 return Ok(1);
@@ -678,7 +710,10 @@ impl Dispatcher {
         if event.error != 0 {
             self.complete(
                 binding.txid,
-                Err(CallCause::System(SystemCallError::InternalError)),
+                Err(CallCause::System(
+                    SystemCallError::from_u32(event.error)
+                        .unwrap_or(SystemCallError::InternalError),
+                )),
             );
             return Ok(1);
         }
@@ -732,6 +767,7 @@ impl Dispatcher {
             || self.removals.active
             || self.stopping.active
             || self.retiring.active
+            || self.wake_pending
             || (!self.sealed
                 && (self.reply_rearm_needed
                     || (self.reply_source.is_none() && !self.reply_requested)))
@@ -787,7 +823,6 @@ impl Dispatcher {
                 .result
                 .take()
                 .expect("RPC completion lost its result"),
-            cleanup_error: pending.cleanup_error,
         })
     }
 
@@ -800,21 +835,16 @@ impl Dispatcher {
     }
 }
 
-impl Task<()> for Dispatcher {
-    type Family = Self;
-
-    fn advance(
+impl Dispatcher {
+    pub fn advance<F>(
         &mut self,
-        _id: u64,
-        _world: &mut (),
-        requests: &mut Requests<Self>,
+        requests: &mut Requests<F>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
         if budget == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let _ = input.take_timeout();
         for _ in 0..budget {
             let phase = self.phase;
             self.phase = (self.phase + 1) % 7;
@@ -825,11 +855,16 @@ impl Task<()> for Dispatcher {
                     }
                 }
                 1 => {
+                    let timed_out = input.take_timeout();
                     if let Some((_, txid)) = self.deadlines.pop_expired(input.now_ns()) {
                         if let Some(pending) = self.pending.get_mut(txid) {
                             pending.timer = None;
                         }
                         self.complete(txid, Err(CallCause::Timeout));
+                    } else if timed_out {
+                        // Runtime 的期限与 Dispatcher 的内部堆共享同一绝对时钟。
+                        // 若当前轮尚未弹出对应项，保留输入交给 Runtime 重新投递。
+                        self.phase = 1;
                     }
                 }
                 2 => self.declare_registrations(requests),
@@ -839,6 +874,7 @@ impl Task<()> for Dispatcher {
                 _ => self.retire_abandoned(),
             }
         }
+        self.wake_completion(requests);
 
         let complete = self.sealed
             && self.pending.is_empty()
@@ -858,28 +894,46 @@ impl Task<()> for Dispatcher {
         })
     }
 
-    fn refused(&mut self, _world: &mut (), failure: RequestFailure<Self>) {
-        if let RequestFailure::Source { kind, error } = failure {
-            if kind == self.reply_key {
-                self.reply_requested = false;
-                self.fault = Some(error);
-                self.begin_stop();
-                return;
-            }
-            let Some(binding) = self.bindings.get(kind).copied() else {
-                return;
-            };
-            if let Some(pending) = self.pending.get_mut(binding.txid) {
-                match binding.role {
-                    SourceRole::Writable => pending.writable.requested = false,
-                    SourceRole::Closed => pending.closed.requested = false,
+    pub fn refused<W, F>(&mut self, _world: &mut W, failure: RequestFailure<F>) {
+        match failure {
+            RequestFailure::Source { kind, error } => {
+                if kind == self.reply_key {
+                    self.reply_requested = false;
+                    self.fault = Some(error);
+                    self.begin_stop();
+                    return;
                 }
+                let Some(binding) = self.bindings.get(kind).copied() else {
+                    return;
+                };
+                if let Some(pending) = self.pending.get_mut(binding.txid) {
+                    match binding.role {
+                        SourceRole::Writable => pending.writable.requested = false,
+                        SourceRole::Closed => pending.closed.requested = false,
+                    }
+                }
+                self.complete(binding.txid, Err(CallCause::System(error)));
             }
-            self.complete(binding.txid, Err(CallCause::System(error)));
+            RequestFailure::Wake { task, .. } => {
+                let mut txid = self.completed_head;
+                while txid != 0 {
+                    let Some(pending) = self.pending.get_mut(txid) else {
+                        break;
+                    };
+                    let next = pending.next;
+                    if pending.waiter == Some(task) {
+                        pending.waiter = None;
+                        pending.wake_queued = false;
+                    }
+                    txid = next;
+                }
+                self.retiring.request();
+            }
+            RequestFailure::Spawn { .. } => {}
         }
     }
 
-    fn registered(&mut self, _world: &mut (), kind: u64, source: SourceId) {
+    pub fn registered<W>(&mut self, _world: &mut W, kind: u64, source: SourceId) {
         if kind == self.reply_key {
             self.reply_requested = false;
             self.reply_source = Some(source);
@@ -901,7 +955,7 @@ impl Task<()> for Dispatcher {
         self.removals.request();
     }
 
-    fn unregistered(&mut self, _world: &mut (), kind: u64, _source: SourceId) {
+    pub fn unregistered<W>(&mut self, _world: &mut W, kind: u64, _source: SourceId) {
         if kind == self.reply_key {
             self.reply_source = None;
             self.reply_requested = false;
@@ -925,11 +979,11 @@ impl Task<()> for Dispatcher {
         self.retiring.request();
     }
 
-    fn stop(&mut self, _world: &mut ()) {
+    pub fn stop<W>(&mut self, _world: &mut W) {
         self.begin_stop();
     }
 
-    fn deadline(&self) -> Deadline {
+    pub fn deadline(&self) -> Deadline {
         if self.sealed {
             Deadline::INFINITE
         } else {

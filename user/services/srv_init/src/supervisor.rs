@@ -87,8 +87,10 @@ impl Task<JobWorld> for JobTask {
         self.driver.unregistered(kind, source);
     }
     fn refused(&mut self, _world: &mut JobWorld, failure: RequestFailure<Self>) {
-        if let RequestFailure::Source { kind, error } = failure {
-            self.driver.refused(kind, error);
+        match failure {
+            RequestFailure::Source { kind, error } => self.driver.refused(kind, error),
+            RequestFailure::Wake { .. } => {}
+            RequestFailure::Spawn { .. } => {}
         }
     }
     // Job 任务本身即为收束责任，停止业务不撤销该责任。
