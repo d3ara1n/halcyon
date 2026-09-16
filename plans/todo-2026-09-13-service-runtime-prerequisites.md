@@ -1,12 +1,16 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，已提交为 `a3891b0`；固定提交复核登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 与 FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
+> 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，已提交为 `a3891b0`；固定提交复核登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 已进入第一阶段施工，FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
 
 提交后的结构审视见 [固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态和装配边界的收敛建议；用户已授权并完成收窄后的 Runtime 清理、Job 单页收束和停止补证；host/目标检查/完整 acceptance 与集中复核均通过，本批已提交 `5de2780`，固定提交复核见 [未来 Review](todo-2026-09-15-runtime-cleanup-paging-review.md)。服务架构化不在范围内。
 
+## RPC/Outbox 当前接力状态
+
+当前接力已完成任务规模审计与设计收口，并完成第一阶段“出站状态与 Runtime 接缝”：`Dispatcher` 已改为 `libsrv::runtime::Task<()>`，删除自持 WaitSet、来源登记、直接重臂/期限推进和 `mem::forget` 放弃循环；纯逻辑 `OutboundStage` 与有界 `Sweep` 已补 host testcase；用户态 RISC-V `librpc` check、`just check`、七面 `just clippy` 与 `librpc` host testcase 通过。RPC/Outbox 仍是一个合并机制闭包，下一阶段为入站 `RequestContext`/`PreparedResponse`/Outbox 与回复准入；真实消费者迁移、旧阻塞泵删除和完整组合验证尚未开始，后续会话从该位置继续。
+
 ## 开工流程与本任务审计门
 
-本任务遵循 `AGENTS.md`「标准施工流程」，按下述四个机制闭包推进。消息、流运输的历史审计与交付记录保留；当前通用执行的责任链、修复证据和完成状态由唯一 Runtime 闭包报告维护。
+本任务遵循 `AGENTS.md`「标准施工流程」，按下述机制顺序推进。消息、流运输的历史审计与交付记录保留；当前通用执行的责任链、修复证据和完成状态由唯一 Runtime 闭包报告维护。过程阶段不另立独立交付或验收语义；只有完整机制闭合后才进入该机制的组合验证。
 
 ### 规模审计
 
@@ -128,6 +132,14 @@ Runnel 新增的 `Producer/Consumer::register` 与 `peer_attached` 直接访问 
 
 前置：消息/流运输与通用执行闭包完成。同步 Caller 可以独立阻塞使用；异步 Dispatcher 单向接入公共执行核心，二者共享 framing、投递状态和期限语义，不强求相同的端口失效范围。
 
+RPC 与 Outbox 是一个合并的机制闭包，不拆成两个各自验收的任务。内部按以下顺序施工：
+
+1. 先收束 `Request`、`ReplyPort`、`PendingCall`、txid 和异步出站驱动，把现有 Dispatcher 改为消费 Runtime 的状态/观察能力；同步 Caller 作为同一出站状态机的阻塞门面。
+2. 再接通 `RequestContext`、`PreparedResponse`、Outbox、reply-once、Delivery 和回复准入；这些对象共同承担入站请求直到回复终结的责任，不能按文件另拆。
+3. 最后迁移真实消费者、删除旧阻塞泵和重复 close 路径，并在同一闭包内完成责任链收口。
+
+上述阶段只表达实施顺序，不构成中间完成门。过程中只为稳定的 framing、所有权转换和状态推进函数保留必要 testcase；不为未闭合的 Dispatcher、Outbox 或临时消费者运行独立 QEMU/组合验收，也不把局部可用性记为机制交付。
+
 - Request/RequestContext/PreparedResponse、txid、ReplyPort 与 PendingCall 共同表达 Unsent/Sent/完成。Unsent 失败返还请求；Sent 超时、关闭或取消本地等待报告结果未知，不自动重试副作用。
 - 同一 Deadline 覆盖发送背压、接收和最终回复接受；注册与期限唤醒交执行核心，协议自己的 Deadline 和 txid 仍由 RPC 持有，不能因去重丢掉独立语义。
 - 在业务 Commit 前预付回复存储和发送额度，Outbox 随同一请求/回复 owner 持有 reply-once、Delivery 与准入。Outbox 的协议责任属于 RPC，排队、期限和唤醒消费执行核心；libsrv 不另建一份拥有相同回复的记录。
@@ -135,19 +147,19 @@ Runnel 新增的 `Producer/Consumer::register` 与 `peer_attached` 直接访问 
 - 协议拒绝、迟到回复、附带能力、取消和退出统一走 owner 收束；不能在长期存活服务中依赖 mem::forget 等待整个进程退出完成正常清理。
 - 同步迁移 init 的真实 RPC 验收、srv_fs 既有请求往返以及全部现有 RPC 调用点，删除旧阻塞泵、相对期限重试和重复 close。
 
-完成门：请求到回复或放弃的每条责任链接通；满箱、Sent 后超时、迟到/畸形回复、服务退出与调用者退出均有真实验证；所有旧路径删除后再标 RPC 闭包完成。
+完成门：请求到回复或放弃的每条责任链接通；所有真实消费者与清理路径使用最终机制；旧阻塞泵、相对期限重试和重复 close 路径删除。只有到此闭包完整收口后，才统一执行满箱、Sent 后超时、迟到/畸形回复、服务退出、调用者退出、Outbox 退款和跨机制组合验证；局部阶段不单独宣称通过。
 
 ## 组合完成门与提交
 
-组合收口验证已经完成的四条闭包，不在最后阶段补主要功能或首次迁移消费者。执行适当 host/目标检查、just clippy、core/release/platform 及跨机制失败/取消/退款组合，证据能定位。历史 stress 概率误判和 Tunnel 墙钟敏感截断见 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)；新现场命中其触发条件时重新立案，不以重跑直到绿替代证据。
+组合收口验证本前置计划已完成的机制与本次 RPC/Outbox 闭包；不在局部阶段补主要功能或制造临时验收消费者。执行适当 host/目标检查、`just clippy`、core/release/platform 及跨机制失败/取消/退款组合，证据能定位。稳定纯函数和状态推进的 testcase 可在施工中随实现补齐，但不替代闭包完成后的整体验证。历史 stress 概率误判和 Tunnel 墙钟敏感截断见 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)；新现场命中其触发条件时重新立案，不以重跑直到绿替代证据。
 
-提交不按文件机械拆分 ABI/owner/观察/退休迁移；每个闭包登记真实调用者、删除的旧路径和验证证据。不能引入没有删除条件的 adapter 或测试专用运行体。已完成提交之后登记对应固定 hash 的未来 Review；提交、合并和 push 仍分别遵守授权边界。
+提交不按文件机械拆分 ABI/owner/观察/退休迁移；RPC/Outbox 按上述单一闭包组织提交，内部阶段不各自登记为独立交付。闭包收口时登记真实调用者、删除的旧路径和整体验证证据。不能引入没有删除条件的 adapter 或测试专用运行体。已完成提交之后登记对应固定 hash 的未来 Review；提交、合并和 push 仍分别遵守授权边界。
 
 ## FAL 连接与唯一归属
 
 本计划只迁移已有 FAL 调用的基础 API 使用；正式授权域、NodeStore/MemoryBackend/StoredValue、值与 wire、provider 装配属于 FAL 总计划。执行前置不以这些未接通草稿作为通用能力已成立的证明。
 
-本计划的四项闭包完成后，按总计划完成内核执行结构整理（共享包契约与归属已归档），再进入 FAL 后端的准备/取消/替换值退休与稳定身份闭包，随后完成 grant/授权准入/provider/client 的共同迁移，最后扩展业务操作。后端产生的正常清理责任由后端持有并接入公共执行，不交给 handler 手工逐项 close；业务明确转移的能力才作为结果交付。具体责任与顺序唯一记录在总计划。
+本计划前置完成后，按总计划完成内核执行结构整理（共享包契约与归属已归档），再进入 FAL 后端的准备/取消/替换值退休与稳定身份闭包，随后完成 grant/授权准入/provider/client 的共同迁移，最后扩展业务操作。后端产生的正常清理责任由后端持有并接入公共执行，不交给 handler 手工逐项 close；业务明确转移的能力才作为结果交付。具体责任与顺序唯一记录在总计划。
 
 ## 首次接管裁决记录（2026-09-15，历史）
 

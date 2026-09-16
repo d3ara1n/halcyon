@@ -19,11 +19,34 @@
 
 ServiceClosed、Wait/Receive 错误和 timeout 同样废弃端口，`Caller` 自身析构也关闭仍存 ReplyPort；因而失败、提前放弃或并发迟到回复都不能污染下一次调用。可进入 transit 的 role 都是固定上界叶 close（Tunnel Endpoint 不具 TRANSIT），reject cleanup 不建立新的异步 owner。公开参数 `timeout_ms` 是相对毫秒超时，零表示无限。超时只停止本地等待：Caller 关闭并废弃整个 ReplyPort，下次调用懒重建；迟到回复因 owner 已关闭而投递失败。返回 `CallError::Timeout`，不自动重试可能有副作用的请求。
 
+## 异步出站任务
+
+`dispatcher.rs` 的 `Dispatcher` 已改为 `libsrv::runtime::Task<()>`：它只拥有
+PendingCall、txid 路由、Request/Reply 阶段、ReplyPort、MessageStorage 和
+完成 FIFO。WaitSet 来源、arm generation、事件输入、期限唤醒、来源注销重试、
+任务停止和最终退休全部由 Runtime 拥有。Dispatcher 通过 `Requests::arm_source`、
+`rearm`、`remove` 声明观察操作，在 `Input` 中消费 `SourceEvent`；不再持有独立
+WaitSet、来源表、直接期限推进或 `mem::forget` 放弃循环。
+
+出站阶段由纯逻辑 `OutboundStage` 表达：`Ready → WaitingWritable → Ready`
+可因满箱重试，成功投递进入 `Sent`，超时、关闭、拒绝或合法回复进入
+`Terminal`。该状态机有 host testcase；目标代码的 Runtime 接缝通过用户态 RISC-V
+`cargo check -p librpc -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`、
+`just check` 与七面 `just clippy`。当前尚无真实异步服务消费者或完整组合验收。
+
 ## 当前边界
 
-异步多 in-flight dispatcher、协作式 Cancel、idempotency key 与服务端去重尚未实现。当前实现没有 typed Delivery 或完整投递阶段 owner；公共 IPC 与 dispatcher 的实施由 [`FAL 整体计划`](../../plans/todo-2026-09-fal-service-capabilities.md) 承接，未来 ABI 以该计划和期限计划为准。
+`RequestContext`、`PreparedResponse`、Outbox、协作式 Cancel、idempotency key
+与服务端去重仍未闭合。当前 Dispatcher 只是 RPC/Runtime 闭包的第一阶段实现，
+尚未迁移 `srv_init`/`srv_fs` 真实路径，也未删除 srv_fs 的旧阻塞泵。完整入站
+回复责任、业务 Commit 前准入、失败/退出/退款和跨机制验收由
+[`RPC/Outbox 前置计划`](../../plans/todo-2026-09-13-service-runtime-prerequisites.md)
+继续承接。
 
-同步 Caller 的有限 `timeout_ms` 当前只用于请求投递成功后的 ReplyPort 等待；之前的 `send_blocking` 在 MailboxFull 时无限等待，因此它还不是完整调用 deadline。公共单调时钟与绝对期限现已由 [`单调时间与 RPC 全调用期限`](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 接通；RPC 的完整阶段策略、Unsent/Sent 和迟到回复仍由执行前置继续承接。
+同步 Caller 与异步出站任务共用 Request 阶段、绝对 Deadline 和 owner 语义；
+同步 Caller 仍是阻塞门面，不另建协议状态机。公共单调时钟与绝对期限由
+[`单调时间与 RPC 全调用期限`](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md)
+接通。
 
 host 覆盖全部 framing 分类；`srv_init` 真实双调用让第一条 protocol mismatch response 携带 capability，确认拒绝后 Handle 已 stale，再由同一 Caller 经新 ReplyPort 接收第二条合法 response。
 

@@ -21,3 +21,5 @@ Cargo.lock
 
 .gdb_history
 os/cargo/
+
+.DS_Store
