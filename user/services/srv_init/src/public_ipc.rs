@@ -299,6 +299,8 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
     unsafe { close(nested.builder) }.unwrap();
     let ready =
         notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
+    let drain_done =
+        notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
     let control = duplicate(nested.control, Rights::MANAGE | Rights::GRANT).unwrap();
     let started = crate::spawn(crate::SpawnRequest {
         memory_pool: crate::root_memory_pool(),
@@ -318,6 +320,10 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
                 handle: ready.peer,
                 rights: Rights::SIGNAL,
             },
+            HandleGrant {
+                handle: drain_done.peer,
+                rights: Rights::SIGNAL,
+            },
         ],
         control_rights: crate::SUPERVISOR_RIGHTS,
     })
@@ -328,16 +334,37 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
         deadline,
     )
     .unwrap();
-    let mut closed = 0;
-    while closed != 3 {
-        monitor.wait(deadline).unwrap();
-        for record in monitor.receive(2).unwrap() {
-            assert!(
-                record.observed.intersects(ObjectSignals::CLOSED),
-                "IPC exit monitor lost a close commit"
-            );
-            closed |= 1 << record.cookie;
+    // 同 authority 的探针观察 ObjectBusy，且目标线程尚未发布 syscall 返回，
+    // 才把 caller 视为处于同一在途 Drain 周期。精确的 active/parked 取消窗口
+    // 由内核确定性夹具覆盖；这里证明真实用户线程退出与管理者接管的组合。
+    loop {
+        match process::drain(nested.control, 1) {
+            Err(SystemCallError::ObjectBusy) => {
+                let done = wait_until(
+                    &[WaitItem::new(drain_done.owner, ObjectSignals::READABLE, 0)],
+                    time::Deadline::at(0),
+                )
+                .unwrap();
+                assert!(
+                    !done.observed.intersects(ObjectSignals::READABLE),
+                    "ownership probe observed a Drain that had already returned"
+                );
+                break;
+            }
+            Ok(result) => {
+                assert_ne!(
+                    result.status,
+                    rinlib::shared::proc::ProcessDrainStatus::Complete as u32,
+                    "probe completed the target before the captured Drain acquired ownership"
+                );
+            }
+            Err(error) => panic!("committed IPC ownership probe failed: {error:?}"),
         }
+        thread::yield_now().expect("IPC ownership probe yield failed");
+        assert!(
+            !time::expired(deadline).unwrap(),
+            "committed IPC Drain never exposed its active owner"
+        );
     }
     process::kill(started.control, 0x131).unwrap();
     wait_until(
@@ -383,9 +410,25 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
         ),
         "builder close changed the nested target's frozen terminal result"
     );
+    let mut closed = 0;
+    while closed != 3 {
+        monitor.wait(deadline).unwrap();
+        for record in monitor.receive(2).unwrap() {
+            assert!(
+                record.observed.intersects(ObjectSignals::CLOSED),
+                "IPC exit monitor lost a close commit"
+            );
+            closed |= 1 << record.cookie;
+        }
+    }
     monitor.close().map_err(|(_, error)| error).unwrap();
     // SAFETY: 两个进程已完整退休，monitor已关闭，不再存在这些 source/control 的用户借用。
-    for h in [started.control, nested.control, ready.owner] {
+    for h in [
+        started.control,
+        nested.control,
+        ready.owner,
+        drain_done.owner,
+    ] {
         unsafe { close(h) }.unwrap();
     }
     for source in sources {
@@ -399,6 +442,6 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
         "committed IPC target processes failed to refund their Pool charge"
     );
     debug!(
-        "committed IPC caller kill passed: observed Close and Native commits, active caller exit, target retirement"
+        "committed IPC caller kill passed: captured in-flight Drain cycle, caller exit, manager takeover, Close, and target retirement"
     );
 }

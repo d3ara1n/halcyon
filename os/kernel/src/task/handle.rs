@@ -17,31 +17,18 @@ pub type ProcessHandleTable = HandleTable<ObjectRef, HandleRole>;
 pub type ProcessHandleEntry = Entry<ObjectRef, HandleRole>;
 pub(crate) enum PendingClose {
     Entry(ProcessHandleEntry),
-    Retirement(ObjectRef),
+    Retirement(super::retirement::RetirementTicket),
 }
 
 impl PendingClose {
-    pub(crate) fn dependency(&self) -> super::request::FinishDependency {
-        match self {
-            Self::Retirement(object) => {
-                super::request::FinishDependency::Retirement(object.clone())
-            }
-            Self::Entry(_) => panic!("unstarted entry cannot block on retirement"),
-        }
-    }
-
     pub(crate) fn advance(self, owner: &Process, budget: usize) -> (usize, Option<Self>) {
         match self {
             Self::Entry(entry) => retire_entry(entry, owner, budget),
-            Self::Retirement(object) => {
-                if object
-                    .retirement()
-                    .expect("retirement ticket lost its backend")
-                    .is_finished()
-                {
+            Self::Retirement(ticket) => {
+                if ticket.is_finished() {
                     (1, None)
                 } else {
-                    (0, Some(Self::Retirement(object)))
+                    (0, Some(Self::Retirement(ticket)))
                 }
             }
         }
@@ -224,7 +211,12 @@ pub(crate) fn retire_entry(
             .expect("detached retirement must remain prepaid");
         launch.publish();
         drop(entry);
-        return (1, Some(PendingClose::Retirement(object)));
+        return (
+            1,
+            Some(PendingClose::Retirement(
+                super::retirement::RetirementTicket::new(object),
+            )),
+        );
     }
     close_entry(entry, owner, true);
     (1, None)

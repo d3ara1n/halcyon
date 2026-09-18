@@ -4,23 +4,14 @@ use super::*;
 
 pub(crate) fn inventory() -> [(usize, usize); 4] {
     let owner = hart::current().slot();
-    let memory = DEBTS.lock().available();
-    let unpublished = UNPUBLISHED_DEBTS.lock().available();
-    let termination = TERMINATION_DEBTS.lock().available();
-    let finalization = FINALIZATION_DEBTS.lock().available();
+    let memory = DEBTS.available();
+    let unpublished = UNPUBLISHED_DEBTS.available();
+    let termination = TERMINATION_DEBTS.available();
+    let finalization = FINALIZATION_DEBTS.available();
     [
-        (memory, PENDING[owner].load(Ordering::Acquire)),
-        (
-            unpublished,
-            UNPUBLISHED_PENDING[owner].load(Ordering::Acquire),
-        ),
-        (
-            termination,
-            TERMINATION_PENDING[owner].load(Ordering::Acquire),
-        ),
-        (
-            finalization,
-            FINALIZATION_PENDING[owner].load(Ordering::Acquire),
-        ),
+        (memory, DEBTS.pending(owner)),
+        (unpublished, UNPUBLISHED_DEBTS.pending(owner)),
+        (termination, TERMINATION_DEBTS.pending(owner)),
+        (finalization, FINALIZATION_DEBTS.pending(owner)),
     ]
 }

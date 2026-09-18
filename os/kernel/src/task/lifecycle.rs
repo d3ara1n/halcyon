@@ -199,6 +199,14 @@ struct LifecycleInner {
 }
 
 impl LifecycleInner {
+    fn is_reapable(&self, terminating: bool) -> bool {
+        terminating
+            && self.member_count == 0
+            && self.active == 0
+            && self.building_ops == 0
+            && self.mandatory_ops == 0
+    }
+
     fn prepare_member(&mut self) -> Result<(Tid, MemberKey, bool), AttachFault> {
         if self.member_count >= PROCESS_MAX_THREADS {
             return Err(AttachFault::Limit);
@@ -367,11 +375,7 @@ impl Lifecycle {
             .mandatory_ops
             .checked_sub(1)
             .expect("mandatory operation completed without registration");
-        self.is_terminating()
-            && inner.member_count == 0
-            && inner.active == 0
-            && inner.building_ops == 0
-            && inner.mandatory_ops == 0
+        inner.is_reapable(self.is_terminating())
     }
 
     /// Building 操作准入：只在精确 Building 状态登记。登记先于终止/Start
@@ -393,11 +397,7 @@ impl Lifecycle {
     pub(crate) fn leave_building_op(&self) -> bool {
         let mut inner = self.inner.lock();
         inner.building_ops -= 1;
-        self.is_terminating()
-            && inner.member_count == 0
-            && inner.active == 0
-            && inner.building_ops == 0
-            && inner.mandatory_ops == 0
+        inner.is_reapable(self.is_terminating())
     }
 
     /// 附入线程（ProcessAttach / bootstrap 内嵌组装）：锁内分配 tid、
@@ -489,11 +489,7 @@ impl Lifecycle {
             ThreadState::Spawning { thread } => thread,
             _ => unreachable!("only Spawning member can roll back"),
         };
-        let reapable = self.is_terminating()
-            && inner.member_count == 0
-            && inner.active == 0
-            && inner.building_ops == 0
-            && inner.mandatory_ops == 0;
+        let reapable = inner.is_reapable(self.is_terminating());
         (thread, reapable)
     }
 
@@ -580,10 +576,7 @@ impl Lifecycle {
             }
             None => todo.ipi_slots = inner.active,
         }
-        todo.reapable = inner.member_count == 0
-            && inner.active == 0
-            && inner.building_ops == 0
-            && inner.mandatory_ops == 0;
+        todo.reapable = inner.is_reapable(true);
         advance_execution(&mut inner);
         self.state
             .store(state_index(ProcessState::Terminating), Ordering::Release);
@@ -701,11 +694,7 @@ impl Lifecycle {
             self.state
                 .store(state_index(ProcessState::Terminating), Ordering::Release);
         }
-        let reapable = self.is_terminating()
-            && inner.member_count == 0
-            && inner.active == 0
-            && inner.building_ops == 0
-            && inner.mandatory_ops == 0;
+        let reapable = inner.is_reapable(self.is_terminating());
         todo.reapable = reapable;
         (started_termination.then_some(todo), reapable)
     }
@@ -753,11 +742,7 @@ impl Lifecycle {
     /// 与各完成路径的发布判定同一合取。
     pub(crate) fn is_reapable(&self) -> bool {
         let inner = self.inner.lock();
-        self.is_terminating()
-            && inner.member_count == 0
-            && inner.active == 0
-            && inner.building_ops == 0
-            && inner.mandatory_ops == 0
+        inner.is_reapable(self.is_terminating())
     }
 
     /// 固定宽快照（ProcessQuery）：state 与终因在同一临界区内取得，
@@ -777,10 +762,7 @@ impl Lifecycle {
     pub(crate) fn mark_dead(&self) -> (ProcessExitReason, i64) {
         let inner = self.inner.lock();
         assert!(
-            inner.member_count == 0
-                && inner.active == 0
-                && inner.building_ops == 0
-                && inner.mandatory_ops == 0,
+            inner.is_reapable(self.is_terminating()),
             "process reached Dead with live lifecycle obligations"
         );
         let frozen = (inner.reason, inner.code);

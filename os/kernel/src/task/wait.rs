@@ -6,7 +6,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
 use erhino_shared::{
     call::SystemCallError,
     object::ObjectSignals,
@@ -47,6 +46,7 @@ pub struct WaitPlan {
     pub expires_at: Option<u64>,
     /// Commit 前预构造的 context；普通对象等待由 install 阶段创建。
     prepared: Option<WaitIdentity>,
+    operation: Option<Arc<dyn super::request::WaitOperation>>,
 }
 
 impl Drop for WaitPlan {
@@ -55,14 +55,21 @@ impl Drop for WaitPlan {
             && (identity.reusable || self.cancel_on_drop)
         {
             identity.abandon();
+            self.operation.take();
             if matches!(identity.core.arm_in(identity.epoch), ArmResult::Complete(_)) {
                 finish_offered(identity);
             }
+        } else {
+            self.operation.take();
         }
     }
 }
 
 impl WaitPlan {
+    pub(crate) fn bind_operation(&mut self, operation: Arc<dyn super::request::WaitOperation>) {
+        assert!(self.operation.replace(operation).is_none());
+    }
+
     pub(crate) fn committed_reply(&mut self) {
         self.cancel_on_drop = true;
     }
@@ -209,6 +216,7 @@ fn prepare_items(
         action: WaitAction::WaitMany { result_ptr },
         expires_at,
         prepared: None,
+        operation: None,
     }))
 }
 
@@ -221,6 +229,7 @@ pub fn sleep_plan(deadline: Deadline) -> Result<WaitPlan, SystemCallError> {
         action: WaitAction::Sleep,
         expires_at: Some(expires_at),
         prepared: None,
+        operation: None,
     })
 }
 
@@ -287,17 +296,22 @@ impl WaitIdentity {
             return OfferResult::Lost;
         }
         let result = self.offer(WaitOutcome::Abandoned);
-        let dependency = {
-            let dependency = self.dependency.lock();
-            dependency
-                .as_ref()
-                .filter(|(epoch, _)| *epoch == self.epoch)
-                .map(|(_, dependency)| dependency.clone())
+        let executor = {
+            let cancellation = self.context.request_cancellation.lock();
+            cancellation.as_ref().and_then(Weak::upgrade)
         };
-        if let Some(dependency) = dependency {
-            dependency.cancel(self.key());
+        if let Some(executor) = executor {
+            super::request::WaitOperation::cancel(&*executor, self.key());
         }
         result
+    }
+
+    pub(crate) fn bind_cancellation(&self, executor: Weak<dyn super::request::WaitOperation>) {
+        *self.context.request_cancellation.lock() = Some(executor);
+    }
+
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.core.is_abandoned(self.epoch)
     }
 
     pub(crate) fn key(&self) -> crate::deferred_work::WaitKey {
@@ -305,15 +319,6 @@ impl WaitIdentity {
             context: Arc::as_ptr(&self.context) as usize,
             epoch: self.epoch.value(),
         }
-    }
-
-    pub(crate) fn register_dependency(
-        &self,
-        dependency: super::request::FinishDependency,
-        action: crate::deferred_work::WakeAction,
-    ) {
-        *self.dependency.lock() = Some((self.epoch, dependency.clone()));
-        dependency.register(action, || self.core.is_abandoned(self.epoch));
     }
 
     /// token 与等待轮次共同限定到期事件，不能重新定位复用后的 context。
@@ -364,24 +369,6 @@ impl ObserverSink {
         }
     }
 
-    pub(crate) fn register_dependency(
-        &self,
-        dependency: super::request::FinishDependency,
-        action: crate::deferred_work::WakeAction,
-    ) {
-        match self {
-            Self::Thread(identity) => identity.register_dependency(dependency, action),
-            Self::Persistent(_) => unreachable!("persistent finish cannot block on a request"),
-        }
-    }
-
-    pub(crate) fn wait_key(&self) -> crate::deferred_work::WaitKey {
-        match self {
-            Self::Thread(identity) => identity.key(),
-            Self::Persistent(_) => unreachable!("persistent finish has no request identity"),
-        }
-    }
-
     pub(crate) fn restart(&self) -> Result<u64, SystemCallError> {
         match self {
             Self::Persistent(cycle) => cycle.restart(),
@@ -417,23 +404,10 @@ impl ObserverSink {
         }
     }
 
-    pub(crate) fn finish_step(
-        &self,
-        budget: usize,
-    ) -> work_debt::StepResult<super::request::FinishDependency> {
+    pub(crate) fn finish_step(&self, budget: usize) -> (usize, bool) {
         match self {
             Self::Thread(context) => context.finish_step(context.epoch, budget),
-            Self::Persistent(cycle) => {
-                let (work_done, complete) = cycle.finish_step(budget);
-                work_debt::StepResult {
-                    work_done,
-                    state: if complete {
-                        work_debt::StepState::Complete
-                    } else {
-                        work_debt::StepState::Runnable
-                    },
-                }
-            }
+            Self::Persistent(cycle) => cycle.finish_step(budget),
         }
     }
 }
@@ -535,9 +509,7 @@ pub struct WaitContext {
     finish_state: Spinlock<Option<FinishState>>,
     _metadata: Option<super::resources::KernelWaitPermit>,
     reusable: bool,
-    used: AtomicBool,
-    request: Spinlock<Option<super::request::DrainRequest>>,
-    dependency: Spinlock<Option<(WaitEpoch, super::request::FinishDependency)>>,
+    request_cancellation: Spinlock<Option<Weak<dyn super::request::WaitOperation>>>,
 }
 
 impl WaitContext {
@@ -568,19 +540,17 @@ impl WaitContext {
             finish_state: Spinlock::new(crate::sync::ranks::LEAF, None),
             _metadata: metadata,
             reusable,
-            used: AtomicBool::new(false),
-            request: Spinlock::new(crate::sync::ranks::LEAF, None),
-            dependency: Spinlock::new(crate::sync::ranks::LEAF, None),
+            request_cancellation: Spinlock::new(crate::sync::ranks::LEAF, None),
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
 
-    pub(crate) fn bind_request(
+    pub(crate) fn prepare_reusable_wait(
         self: &Arc<Self>,
-        request: super::request::DrainRequest,
-    ) -> Result<WaitPlan, SystemCallError> {
+        first_use: bool,
+    ) -> Result<(WaitIdentity, WaitPlan), SystemCallError> {
         assert!(self.reusable, "kernel request used a single-use wait");
-        if self.used.swap(true, Ordering::AcqRel) {
+        if !first_use {
             if !self.core.is_done() || self.finish_reservation.lock().is_none() {
                 return Err(SystemCallError::ObjectBusy);
             }
@@ -594,20 +564,16 @@ impl WaitContext {
                 "request wait failed to restart"
             );
         }
-        *self.request.lock() = Some(request);
         let identity = WaitIdentity::new(self.clone());
-        assert_eq!(
-            identity.offer(WaitOutcome::KernelComplete),
-            OfferResult::Deferred,
-            "kernel request was armed before installation"
-        );
-        Ok(WaitPlan {
+        let plan = WaitPlan {
             cancel_on_drop: true,
             groups: Vec::new(),
             action: self.action,
             expires_at: None,
-            prepared: Some(identity),
-        })
+            prepared: Some(identity.clone()),
+            operation: None,
+        };
+        Ok((identity, plan))
     }
 
     fn offer_in(&self, epoch: WaitEpoch, outcome: WaitOutcome) -> OfferResult {
@@ -657,20 +623,13 @@ impl WaitContext {
 
     /// 推进一个已获完成权的上下文；每次只注销一个 registration 或执行一次
     /// 最终线程交付，完成责任由预付 finish slot 持续承载。
-    fn finish_step(
-        &self,
-        epoch: WaitEpoch,
-        budget: usize,
-    ) -> work_debt::StepResult<super::request::FinishDependency> {
-        use work_debt::{StepResult, StepState};
+    fn finish_step(&self, epoch: WaitEpoch, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
         assert_eq!(
             self.core.epoch(),
             epoch,
             "finish payload references a stale wait epoch"
         );
-        let retired_dependency = self.dependency.lock().take();
-        drop(retired_dependency);
         let mut used = 0;
         while used < budget {
             let registration = self.registrations.lock().pop();
@@ -679,55 +638,12 @@ impl WaitContext {
                 used += 1;
                 continue;
             }
-            if self.reusable {
-                let mut request = self
-                    .request
-                    .lock()
-                    .take()
-                    .expect("request finish lost its captured input");
-                let thread = self.thread.lock().take();
-                let advance = if let Some(thread) = thread.as_ref()
-                    && !self.core.is_abandoned(epoch)
-                    && !thread.process.lifecycle.is_terminating()
-                {
-                    request.step(thread, budget - used)
-                } else {
-                    StepResult {
-                        work_done: 0,
-                        state: StepState::Complete,
-                    }
-                };
-                *self.request.lock() = Some(request);
-                used += advance.work_done;
-                match advance.state {
-                    StepState::Complete => {
-                        let mut state = self.finish_state.lock();
-                        let finish = state.as_mut().expect("request finish state disappeared");
-                        finish.delivered = true;
-                        finish.delivery = thread;
-                        return StepResult {
-                            work_done: used.max(1),
-                            state: StepState::Complete,
-                        };
-                    }
-                    state => {
-                        *self.thread.lock() = thread;
-                        return StepResult {
-                            work_done: used,
-                            state,
-                        };
-                    }
-                }
-            }
             let mut state = self.finish_state.lock();
             let finish = state
                 .as_mut()
                 .expect("wait completion step without finish state");
             if finish.delivered {
-                return StepResult {
-                    work_done: used.max(1),
-                    state: StepState::Complete,
-                };
+                return (used.max(1), true);
             }
             finish.delivered = true;
             drop(state);
@@ -738,15 +654,9 @@ impl WaitContext {
                 .expect("finish state disappeared")
                 .delivery = thread;
             used += 1;
-            return StepResult {
-                work_done: used,
-                state: StepState::Complete,
-            };
+            return (used, true);
         }
-        StepResult {
-            work_done: used,
-            state: StepState::Runnable,
-        }
+        (used, false)
     }
 
     /// 队列已完成槽位与 Pending 交接，才开放终态并在锁外交付线程。
@@ -770,7 +680,6 @@ impl WaitContext {
                 "single-use wait retained finish capacity"
             );
         }
-        let request = self.request.lock().take();
         let finish = self
             .finish_state
             .lock()
@@ -785,7 +694,6 @@ impl WaitContext {
             self.core.mark_done_in(epoch),
             "wait completion epoch changed"
         );
-        drop(request);
         if let Some(thread) = finish.delivery {
             if matches!(outcome, WaitOutcome::Abandoned)
                 || thread.process.lifecycle.is_terminating()
@@ -879,6 +787,7 @@ pub fn prepare_kernel(
         action: WaitAction::KernelResult { value },
         expires_at: None,
         prepared: Some(context.clone()),
+        operation: None,
     };
     Ok((context, plan))
 }
@@ -898,6 +807,7 @@ pub(crate) fn prepare_request(
 /// 可取消性在 lifecycle 锁内线性化；已 Terminating 则不发布等待，
 /// 直接以 Abandoned 取消（线程不回用户态）。
 pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
+    let operation = plan.operation.take();
     let context = match plan.prepared.take() {
         Some(context) => context,
         None => match WaitContext::new(plan.action, plan.groups.len(), None, false) {
@@ -920,12 +830,16 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
             // 能代表事务完成，不能恢复已经放弃回复权的线程。安装者统一取得
             // Installing 完成权并以 Abandoned 执行 departure confirmation。
             let _ = context.abandon();
+            drop(operation);
             match context.core.arm_in(context.epoch) {
                 ArmResult::Complete(_) => finish_offered(context),
                 ArmResult::Armed | ArmResult::ExternalCompleter => (),
             }
             return;
         }
+    }
+    if let Some(operation) = operation {
+        operation.start(context.key());
     }
 
     if let Some(expires_at) = plan.expires_at {
@@ -1073,23 +987,6 @@ pub(crate) fn schedule_waiters(wait: &Spinlock<ObjectWaitState>) {
         return;
     };
     reservation.publish(target);
-}
-
-/// 通知 owner 在固定预算内推进候选；未完成的对象债务由 work queue 重排。
-pub(crate) fn drain_waiters(wait: &Spinlock<ObjectWaitState>, budget: usize) -> (usize, bool) {
-    debug_assert!(budget > 0);
-    let mut used = 0;
-    while used < budget {
-        let advance = {
-            let mut held = wait.lock();
-            held.advance_waiter()
-        };
-        if advance.finish() {
-            return (used, true);
-        }
-        used += 1;
-    }
-    (used, false)
 }
 
 /// 对象信号更新在释放对象锁后调用；只有 Complete 方可进入。

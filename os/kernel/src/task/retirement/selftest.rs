@@ -3,16 +3,12 @@
 use super::*;
 
 pub(crate) fn inventory() -> (usize, usize) {
-    (
-        DEBTS.lock().available(),
-        PENDING[hart::current().slot()].load(Ordering::Acquire),
-    )
+    (DEBTS.available(), DEBTS.pending(hart::current().slot()))
 }
 
 pub(crate) fn complete_window(target: &ObjectRef, after_return: bool, concurrent: impl FnOnce()) {
     let owner = hart::current().slot();
     let taken = DEBTS
-        .lock()
         .take(owner)
         .expect("actor completion fixture was not runnable");
     let (token, object) = taken.into_parts();
@@ -27,13 +23,13 @@ pub(crate) fn complete_window(target: &ObjectRef, after_return: bool, concurrent
         "actor completion fixture did not reach Complete"
     );
     if after_return {
-        let reservation = return_slot(owner, token);
+        let reservation = return_slot(token);
         assert!(!has_current(), "returned actor remained runnable");
         concurrent();
-        backend.finish(reservation, object.clone());
+        let _ = backend.finish(reservation, object.clone());
     } else {
         concurrent();
-        backend.finish(return_slot(owner, token), object.clone());
+        backend.finish(return_slot(token), object.clone());
     }
     assert!(
         has_current(),

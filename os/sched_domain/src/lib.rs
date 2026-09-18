@@ -119,7 +119,10 @@ pub fn plan(caps: &[HartCapabilities]) -> DomainPlan {
             });
         slot_domain.push(index);
     }
-    DomainPlan { slot_domain, signatures }
+    DomainPlan {
+        slot_domain,
+        signatures,
+    }
 }
 
 #[cfg(test)]
@@ -133,7 +136,10 @@ mod tests {
     /// 与调度无关的扩展差异（V）不产生域边界：同签名即同域。
     #[test]
     fn irrelevant_extension_does_not_split() {
-        let p = plan(&[caps(true, true, false, true), caps(true, true, false, false)]);
+        let p = plan(&[
+            caps(true, true, false, true),
+            caps(true, true, false, false),
+        ]);
         assert_eq!(p.domain_count(), 1);
         assert_eq!(p.slot_domain(0), 0);
         assert_eq!(p.slot_domain(1), 0);
@@ -161,7 +167,10 @@ mod tests {
     #[test]
     fn q_hart_joins_base_domain_not_d64() {
         // Q（FLEN 128）与无 FP hart 同签名：都不满足 D64。
-        let p = plan(&[caps(true, true, true, false), caps(true, true, false, false)]);
+        let p = plan(&[
+            caps(true, true, true, false),
+            caps(true, true, false, false),
+        ]);
         assert_eq!(p.domain_count(), 2);
         assert_eq!(p.resolve(IsaRequirement::D64), Some(1));
         assert_eq!(p.resolve(IsaRequirement::Base64), Some(0));

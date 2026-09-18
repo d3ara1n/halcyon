@@ -79,12 +79,9 @@ pub(crate) fn collect(process: &Arc<Process>) {
         "fixture cleanup started before reapability"
     );
     for _ in 0..8192 {
-        let (_, complete) = {
-            let _gate = process.drain_gate.lock();
-            process.drain_batch(128)
-        };
+        let (_, outcome) = proc::selftest::advance_unmanaged(process, 128);
         pump();
-        if complete {
+        if matches!(outcome, super::proc::DrainBatchOutcome::Complete) {
             return;
         }
     }

@@ -180,8 +180,8 @@ impl KernelObject for Endpoint {
         self.wait.lock().complete_notification(reservation)
     }
 
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        super::wait::drain_waiters(&self.wait, budget)
+    fn advance_waiter(&self) -> super::object::WaitAdvance {
+        self.wait.lock().advance_waiter()
     }
 
     fn header(&self) -> &ObjectHeader {

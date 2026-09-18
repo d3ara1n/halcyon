@@ -46,7 +46,7 @@ Create 预付唯一 retirement actor、普通 Close 回复与资源；Register �
 
 ## ProcessDrain 继续
 
-Process 出生预付 reusable drain_waiter。`request.rs::DrainRequest` 捕获 Process/Control、输出、一次截断预算、累计 work 和 affine drain_active，暂停不重新解析 Handle、不重置预算。More 必须有正工作；内部零工作 Blocked 停驻同一请求。
+Process 出生预付 reusable drain_waiter。`request.rs::DrainExecutor` 持有 `DrainRequest`、请求债务和可复用 `WaitContext`；请求捕获 Process/Control、输出、一次截断预算、累计 work 和 affine drain_active，暂停不重新解析 Handle、不重置预算。More 必须有正工作；内部零工作 Blocked 停驻同一请求。等待层不再推进 DrainRequest，只通过 `WaitOperation` 提供取消接缝。
 
 finish 首轮/恢复共用 StepResult。依赖按 context+epoch 登记/取消；新轮已停驻时旧取消仍拒绝。队列归还容量/Pending、请求/依赖退役后才 Done，锁外交付 admitted thread 或 Departure。间接结果写回失败冻结 caller Fault/StoreAccess；普通 WaitMany 仅观察，输出失败返回 MemoryNotAccessible。
 

@@ -1,16 +1,16 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：消息运输（`3060dd8`）和流运输/Runnel（`a2aabed`）已提交。通用执行与准入由 HighHolly 接手重构，实现、确定性回归、完整 acceptance 与集中复核均已完成，已提交为 `a3891b0`；固定提交复核登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。唯一修复/复核真值见 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)，实现见 `notes/impls/runtime.md`。RPC/Outbox 已进入第一阶段施工，FAL 业务未进入施工。公共对象和时间已交付；[公共操作所有权](todo-2026-09-14-public-operation-ownership.md) 仍待实施，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。当前只为用户态预付退休槽给 shared/timer_queue 补载荷绑定接口，没有修改内核或 shared ABI。
+> 状态：消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核统一登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。本计划不再拥有未完成的用户态执行能力，后续只保留各闭包的交付记录。公共对象、时间与[公共操作所有权](archived/todo-2026-09-14-public-operation-ownership.md)均已交付；自然顺序已恢复 FAL 业务，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。
 
 提交后的结构审视见[整体固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态、Runtime Wake、RPC/Outbox 和真实消费者边界的收敛建议；Runtime 清理、Job 单页收束、停止补证及 RPC/Outbox 已完成，固定提交序列统一由该 Review 承载。服务架构化不在范围内。
 
-## RPC/Outbox 当前接力状态
+## RPC/Outbox 闭包状态记录
 
-当前接力已完成任务规模审计与设计收口，并完成第一阶段“出站状态与 Runtime 接缝”：`e0b5c45` 已将 Dispatcher 的协议状态接到 Runtime 任务推进，删除自持 WaitSet、来源登记、直接重臂/期限推进和 `mem::forget` 放弃循环；纯逻辑 `OutboundStage` 与有界 `Sweep` 已补 host testcase；用户态 RISC-V `librpc` check、`just check`、七面 `just clippy` 与 `librpc` host testcase 通过。
+RPC/Outbox 已在同一机制闭包内完成。`e0b5c45` 是出站状态与 Runtime 接缝，`4e18e5e` 完成 Dispatcher 任务族、入站 `RequestContext`/`PreparedResponse`/`Outbox`、Commit 前准入、真实消费者迁移、旧阻塞泵删除以及回复退休/退款。以下接续文字保留为设计审视记录，不再表示存在未完成的 RPC 阶段。
 
-2026-09-16 的接续重审确认：这仍是同一个 RPC/Outbox 闭包，`e0b5c45` 是可复用的铺路基线，不需要另立 todo 或推翻出站 owner/阶段设计；但“出站阶段已完成、只剩入站”这一表述过强。当前尚未闭合 Dispatcher 与服务任务族的最终组合、任务间完成唤醒、业务 Commit 前的任务/来源/回复准入，以及回复故障后的完整退休。后续会话从同一计划继续，先完成下节列出的局部修正与设计收口，再实施入站 `RequestContext`/`PreparedResponse`/Outbox、真实消费者迁移、旧阻塞泵删除和最终组合验证。
+2026-09-16 的接续重审曾确认：`e0b5c45` 只是可复用的铺路基线，不能单独代表 RPC/Outbox 完成。该审视提出的局部修正、服务任务族接缝、入站 Outbox、真实消费者迁移和旧阻塞泵删除，已在 `4e18e5e` 的同一闭包中完成；当前只保留本节作为设计演进记录。
 
-## RPC/Outbox 接续重审与实施裁决（2026-09-16，基线 `e0b5c45`）
+## RPC/Outbox 接续重审与实施裁决（2026-09-16，历史基线 `e0b5c45`）
 
 ### 范围结论
 
@@ -70,7 +70,7 @@ Receive/Delivery
 
 在第 3 步前，不把 `PreparedResponse` 的现有构造函数或 `Dispatcher` 的独立 `Task<()>` 形状视为最终 API；在第 4 步前，不声称 RPC/Outbox 闭包完成。
 
-## RPC/Outbox 闭包收口记录（当前工作树，未提交）
+## RPC/Outbox 闭包收口记录（已提交 `4e18e5e`）
 
 后续施工已沿同一闭包完成以下责任链：
 

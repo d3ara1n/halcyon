@@ -24,15 +24,15 @@
 
 ## 活跃计划
 
-公共时间与公共对象已完成原交付；时间提交 `c6e0a84`，实现见 `notes/impls/{time,ipc}.md`。分支级设计审视另识别了公共操作与回收边界收束需求，不把原交付通过视为现有结构必须保留；本轮只更新设计与计划，没有实施重构或新增验收通过声明。
+公共时间、公共对象与公共操作所有权专题均已完成；时间提交 `c6e0a84`，实现见 `notes/impls/{time,ipc,task}.md`，公共操作过程与最终验收见归档计划。
 
-**当前任务**：[运输与服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md) 的消息运输（`3060dd8`）与流运输（`a2aabed`）已提交；通用执行与准入由 HighHolly 接手重构，已完成实现、最终完整验收和集中复核，提交为 `a3891b0`。Runtime 公平维护、输入 FIFO、预付重试与完整观察回执，Process/Job 原机器恢复，以及 init RootSupervisor 的长期接管和组合等待已经接通；实现见 `notes/impls/runtime.md`，修复与复核证据见已归档的 [Runtime 闭包报告](archived/review-2026-09-15-runtime-closure.md)：记录当时 R1–R16、C1–C7 的关闭结论，最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，源码哈希一致。提交后用户要求结构收口审视，证据与建议边界统一记录于 [固定提交 Review 的结构审视节](todo-2026-09-15-runtime-admission-review.md)：已按用户收窄范围完成 Runtime 核心清理、Job 有界分页、必要适配与 Active 停止补证，提交为 `5de2780`。最终 `artifacts/acceptance-cleanup-paging-20260915-131912.log` exit 0，7 个源码哈希一致，两份集中复核无 finding；原 PM 停止证据缺口关闭。服务仍按验收夹具处理，不实施服务架构化。RPC/Outbox 已在同一闭包内完成：Dispatcher 可嵌入 Runtime 任务族，入站 RequestContext/PreparedResponse/Outbox、Commit 前准入、回复退休与退款已接通；srv_init/srv_fs 真实消费者已迁移，srv_fs 长期 Runtime、旧阻塞泵和手写回复路径已删除。目标检查、host 测试、clippy 与 `just virt` 均通过；实现见 `notes/impls/rpc.md`，完整接续记录见执行前置计划。下一自然序是公共操作所有权收束，再进入 FAL 后端/授权闭包。内核/shared ABI 未改，shared/timer_queue 仅补预付载荷绑定接口。FAL 业务尚未实施。公共对象/时间的历史验收和 [墙钟敏感现场归档](archived/ref-2026-09-acceptance-timing-flake.md) 保留，不替代当前快照的验证。
+**当前任务**：[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 **F0 重新基线审计**。运输与服务执行前置已完成：消息运输（`3060dd8`）、流运输（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；[公共操作所有权专题](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并通过 host、七面 clippy 与完整 acceptance。F0 只以当前源码重建 v1/v2 类型图、owner/authority 图和自然依赖，产出首个后端闭包的真实消费者、失败/退出/退款与旧路径删除门；完成前不直接续写旧草稿。实现现状入口为 `notes/impls/fal.md`。
 
-后续串行位置：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成 → [内核等待/请求/退休结构收束](todo-2026-09-14-public-operation-ownership.md) → [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)。共享包整理是独立的小型 workspace 迁移，不阻塞当前执行前置整体开工；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。RPC/Outbox 作为一个合并机制闭包按内部顺序施工，过程阶段不各自验收；完整消费者迁移、失败/退出、旧路径删除和组合验证统一作为该闭包的完成门。
+串行前置已全部完成：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) → [内核等待/请求/退休结构收束](archived/todo-2026-09-14-public-operation-ownership.md)。自然顺序现进入 [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。
 
 无消费者的 Runnel 观察草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`，随基线 `d22b9d7` 入库）已在流运输闭包中删除，已立案终态访问缺陷随之消失；原始 ABI 工厂同批删除，typed create/attach 成为唯一构造入口，init 创建侧已迁移；观察/登记/取消语义移入通用执行闭包，由 Runtime 首个真实消费者共同定形。Delivery 独立身份与 Peek 已在消息闭包裁决保留。共享包整理已作为独立小型任务开工：`shared/` 现组织为 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
 
-当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；本次设计审视基线为 `bf48cab`。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输/执行与 FAL 仍是草稿；验收可靠性首轮已收口，历史时间敏感现场保留只读归档。后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
+当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；本次设计审视基线为 `bf48cab`。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输、服务执行和公共操作 P0–P6 已完成，当前待施工为 FAL 业务的重新审计与自然依赖拆分。验收可靠性首轮已收口，历史时间敏感现场保留只读归档。后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
 
 plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报告。专题 todo 拥有当前实施，Review 保留目标提交证据与复核清单，二者不重复安排同一问题。已完成调查/复核进入 `archived/`，`ref-*` 是只读参考资料。当前全部活跃入口：
 
@@ -42,13 +42,12 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-13-monotonic-time-rpc-deadline-review.md`](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 未来 Review：固定 `c6e0a84` 的公共时钟、绝对期限、运行期停止与真实消费者边界，不把跨 epoch/RPC/FAL 责任混入复核 |
 | [`todo-2026-09-frame-source-selftest-review.md`](todo-2026-09-frame-source-selftest-review.md) | 未来代码 Review：固定复核 `606b59d` 的库存来源、boot-held affine owner、完整清零、切分退款与 child 来源保活，不阻塞 FAL 主线 |
 | [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
-| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | FAL 业务暂停：先运输/执行/RPC，随后共享包与内核执行结构收束，再恢复后端、授权与业务 |
+| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | 当前主线 F0：重建 v1/v2 类型与责任图，裁决首个后端准备/取消/退休闭包；完成前不进入实现 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
 | [`todo-2026-09-14-stream-transport-review.md`](todo-2026-09-14-stream-transport-review.md) | 未来 Review：固定复核 `a2aabed` 的观察草稿面删除、raw 工厂删除、srv_init typed 创建迁移与终态访问边界，不预审通用执行闭包的观察接入形态 |
 | [`todo-2026-09-15-runtime-admission-review.md`](todo-2026-09-15-runtime-admission-review.md) | 整体固定提交 Review：`a3891b0` → `5de2780` → `e0b5c45` → `4e18e5e`，覆盖 Runtime/Job 分页/Active 停止、RPC/Outbox、真实消费者与组合验证 |
-| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 消息运输、流运输/Runnel 与通用执行/准入已完成；下一项是按内部顺序施工的单一 RPC/Outbox 闭包，过程不独立验收，完整消费者迁移与组合验证在闭包收口时进行 |
-| [`todo-2026-09-14-public-operation-ownership.md`](todo-2026-09-14-public-operation-ownership.md) | 执行前置及共享包之后收束内核等待/请求/退休结构；保留 ProcessDrain，不作为当前整体开工前置 |
+| [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 消息运输、流运输/Runnel、通用执行/准入与 RPC/Outbox 均已完成；保留闭包交付和固定提交 Review，不再拥有下一项用户态执行施工 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
 | [`todo-2026-09-14-kernel-memory-budget.md`](todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |
 | [`todo-2026-09-fal-extended-operations.md`](todo-2026-09-fal-extended-operations.md) | 等真实消费者触发：递归 Copy/Delete、快照/持久性/原子替换、capability 属性 Copy、递归/可重放 Watch、append/组合 Open；不隐含在基本 FAL 完成中 |

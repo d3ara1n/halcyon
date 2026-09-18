@@ -16,7 +16,7 @@
 
 | 发现 | 本计划拥有的部分 | 归他处拥有的部分 |
 |---|---|---|
-| A1 退役债务不变量不可局部验证 | 债务批次数的观测面与断言要求 | 退休/请求结构收束归 [`public-operation-ownership`](todo-2026-09-14-public-operation-ownership.md) |
+| A1 退役债务不变量不可局部验证 | 债务批次数的观测面与断言要求 | 退休/请求结构收束已归档于 [`public-operation-ownership`](archived/todo-2026-09-14-public-operation-ownership.md) |
 | A2 全局 metadata 配额不可归属 | 触发条件认定与常量依据审查 | 配额机制本身归 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) |
 | A3 libfal→libsrv 依赖反向 | 全部（本计划唯一拥有） | — |
 | B1 同步 Caller 与事件循环并存 | 「阻塞必须显式」的类型要求 | typed PendingCall / Outbox 归 [`service-runtime-prerequisites`](todo-2026-09-13-service-runtime-prerequisites.md) |

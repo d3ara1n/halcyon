@@ -65,15 +65,23 @@ pub const COLOR_DEBUG: &str = "90";
 /// 无色话题行（log!）：`[topic     ] message`，对齐不着色。
 pub fn log_topic(topic: &str, args: Arguments<'_>) {
     let mut buf = [b' '; TOPIC_WIDTH];
-    console_write(format_args!("[{}] {}\n", fill_padded(&mut buf, topic), args));
+    console_write(format_args!(
+        "[{}] {}\n",
+        fill_padded(&mut buf, topic),
+        args
+    ));
 }
 
 /// 等级话题行（等级宏）：话题头按等级色着色、固定宽度对齐，正文不着色。
 pub fn log_tagged(tag: &str, color: &str, args: Arguments<'_>) {
     let mut buf = [b' '; TOPIC_WIDTH];
-    console_write(format_args!("\x1b[{}m[{}]\x1b[0m {}\n", color, fill_padded(&mut buf, tag), args));
+    console_write(format_args!(
+        "\x1b[{}m[{}]\x1b[0m {}\n",
+        color,
+        fill_padded(&mut buf, tag),
+        args
+    ));
 }
-
 
 macro_rules! print {
     ($($arg:tt)*) => {

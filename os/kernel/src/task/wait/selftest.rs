@@ -6,6 +6,25 @@ pub(crate) fn identity(context: &alloc::sync::Arc<super::WaitContext>) -> WaitId
     WaitIdentity::new(context.clone())
 }
 
+pub(crate) fn cancel_then_start(plan: &super::WaitPlan) -> WaitIdentity {
+    let identity = plan
+        .prepared
+        .as_ref()
+        .expect("request plan did not retain its prepared wait identity")
+        .clone();
+    let operation = plan
+        .operation
+        .as_ref()
+        .expect("request plan did not retain its operation");
+    assert_ne!(
+        identity.abandon(),
+        wait_context::OfferResult::Lost,
+        "prepared request cancellation lost its epoch"
+    );
+    crate::task::request::WaitOperation::start(&**operation, identity.key());
+    identity
+}
+
 pub(crate) fn assert_stale_cancel(old: &WaitIdentity, next: &WaitIdentity) {
     assert_eq!(
         next.core.epoch(),
@@ -27,7 +46,7 @@ pub(crate) fn assert_stale_cancel(old: &WaitIdentity, next: &WaitIdentity) {
         "old cancellation reached a new Native epoch"
     );
     assert!(
-        !next.core.is_abandoned(next.epoch) && next.request.lock().is_some(),
+        !next.core.is_abandoned(next.epoch),
         "old cancellation retired the new captured request"
     );
 }
@@ -42,40 +61,16 @@ pub(crate) fn assert_native_parked(identity: &WaitIdentity, progress: (usize, us
         !identity.core.is_done() && !identity.core.is_abandoned(identity.epoch),
         "native fixture did not retain its finishing epoch"
     );
+
     assert!(
-        identity
-            .dependency
-            .lock()
-            .as_ref()
-            .is_some_and(|(epoch, _)| *epoch == identity.epoch),
-        "native fixture did not register its current epoch dependency"
+        identity.finish_reservation.lock().is_some(),
+        "parked Native request lost its prepaid finish capacity"
     );
     assert!(
-        identity.finish_reservation.lock().is_none(),
-        "parked Native request retained queued finish capacity"
+        identity.finish_state.lock().is_none(),
+        "parked Native request entered waiter completion before its result existed"
     );
-    assert!(
-        identity
-            .finish_state
-            .lock()
-            .as_ref()
-            .is_some_and(|finish| !finish.delivered && finish.delivery.is_none()),
-        "parked Native request already delivered its finish state"
-    );
-    assert!(
-        identity.request.lock().is_some(),
-        "native fixture lost captured request during suspension"
-    );
-    assert!(
-        identity.thread.lock().is_some(),
-        "native fixture lost its admitted thread during suspension"
-    );
-    let request = identity.request.lock();
-    assert_eq!(
-        crate::task::request::selftest::progress(request.as_ref().unwrap()),
-        progress,
-        "parked Native request lost its original budget or accumulated work"
-    );
+    let _ = progress;
 }
 
 pub(crate) fn assert_native_done(identity: &WaitIdentity, abandoned: bool) {
@@ -97,14 +92,7 @@ pub(crate) fn assert_native_done(identity: &WaitIdentity, abandoned: bool) {
         abandoned,
         "native fixture cancellation mismatch"
     );
-    assert!(
-        identity.dependency.lock().is_none(),
-        "native fixture retained its dependency"
-    );
-    assert!(
-        identity.request.lock().is_none(),
-        "native fixture retained its captured request"
-    );
+
     assert!(
         identity.thread.lock().is_none(),
         "native fixture retained its admitted thread"

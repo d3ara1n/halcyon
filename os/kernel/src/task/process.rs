@@ -297,19 +297,8 @@ impl KernelObject for ProcessControl {
         self.state.lock().wait.complete_notification(reservation)
     }
 
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        let mut used = 0;
-        while used < budget {
-            let advance = {
-                let mut state = self.state.lock();
-                state.wait.advance_waiter()
-            };
-            if advance.finish() {
-                return (used, true);
-            }
-            used += 1;
-        }
-        (used, false)
+    fn advance_waiter(&self) -> super::object::WaitAdvance {
+        self.state.lock().wait.advance_waiter()
     }
 
     fn header(&self) -> &ObjectHeader {
@@ -1001,7 +990,7 @@ pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo
         drop(reservation);
         return;
     }
-    reservation.publish(process.clone(), slots);
+    crate::deferred_work::publish_termination(reservation, process.clone(), slots);
 }
 
 /// termination debt 每步只检查一个稳定成员槽；空槽同样诚实计费。
@@ -1129,9 +1118,14 @@ pub fn drain(
         return Err(SystemCallError::ObjectNotAvailable);
     }
     let budget = (max_work as usize).min(PROCESS_DRAIN_MAX as usize);
-    let waiter = process.drain_waiter.clone();
-    let request = super::request::DrainRequest::acquire(process, control, output, budget)?;
-    waiter.bind_request(request).map(DrainStart::Wait)
+    let caller = thread.process.clone();
+    let result = thread.result_obligation();
+    let request =
+        super::request::DrainRequest::acquire(&process, control, caller, result, output, budget)?;
+    process
+        .drain_executor
+        .begin(&process, request)
+        .map(DrainStart::Wait)
 }
 
 fn write_drain_result(

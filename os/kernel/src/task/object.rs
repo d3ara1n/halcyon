@@ -620,11 +620,10 @@ pub trait KernelObject: Any + Send + Sync {
     /// 消息中的 transit Handle 被丢弃；只有持 TRANSIT 的 entry 可进入。
     fn close_transit(&self, role: HandleRole);
 
-    /// 从已发布的对象候选中推进至多 `budget` 个 waiter；返回
-    /// `(实际步骤, 是否已完成本次通知债务)`。
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        let _ = budget;
-        (0, true)
+    /// 在来源对象锁内推进一次已发布的 waiter 候选。通知执行器拥有预算
+    /// 循环；对象只负责自己的电平、历史与订阅真值。
+    fn advance_waiter(&self) -> WaitAdvance {
+        WaitAdvance::Done
     }
 
     fn complete_waiter_drain(

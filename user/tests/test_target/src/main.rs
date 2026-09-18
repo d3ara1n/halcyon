@@ -7,7 +7,9 @@ use rinlib::{
     env,
     ipc::{notification, wait_set::WaitSet},
     preclude::*,
-    shared::{object::ObjectSignals, wait::WaitItem},
+    shared::{
+        call::SystemCallError, object::ObjectSignals, proc::ProcessDrainStatus, wait::WaitItem,
+    },
     sys_sleep,
 };
 
@@ -29,6 +31,7 @@ fn ipc_kill_target() -> ! {
     let owner = env::startup_handle(0).expect("IPC kill target missing Close owner");
     let control = env::startup_handle(1).expect("IPC kill target missing Drain control");
     let ready = env::startup_handle(2).expect("IPC kill target missing ready signaler");
+    let done = env::startup_handle(3).expect("IPC kill target missing Drain completion signaler");
     let close = rinlib::thread::Builder::new()
         .spawn(move || {
             // SAFETY: startup 转入的 owner 只有本线程承担关闭责任。
@@ -38,8 +41,17 @@ fn ipc_kill_target() -> ! {
         .expect("IPC Close thread spawn failed");
     let drain = rinlib::thread::Builder::new()
         .spawn(move || {
-            rinlib::process::drain_to_completion(control)
-                .expect("IPC target captured Drain failed");
+            loop {
+                match rinlib::process::drain(control, 128) {
+                    Ok(result) if result.status == ProcessDrainStatus::Complete as u32 => break,
+                    Ok(_) => {}
+                    Err(SystemCallError::ObjectBusy) => {
+                        rinlib::thread::yield_now().expect("IPC Drain ownership retry failed");
+                    }
+                    Err(error) => panic!("IPC target captured Drain failed: {error:?}"),
+                }
+            }
+            notification::signal(done, 1).expect("IPC target Drain completion signal failed");
         })
         .expect("IPC Drain thread spawn failed");
     notification::signal(ready, 1).expect("IPC target active publication failed");

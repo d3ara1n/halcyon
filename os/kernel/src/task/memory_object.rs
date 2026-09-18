@@ -319,16 +319,8 @@ impl object::KernelObject for MemoryObject {
             .complete_notification(reservation)
     }
 
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        let mut used = 0;
-        while used < budget {
-            let advance = { self.core.state.lock().wait.advance_waiter() };
-            if advance.finish() {
-                return (used, true);
-            }
-            used += 1;
-        }
-        (used, false)
+    fn advance_waiter(&self) -> object::WaitAdvance {
+        self.core.state.lock().wait.advance_waiter()
     }
 
     fn header(&self) -> &object::ObjectHeader {

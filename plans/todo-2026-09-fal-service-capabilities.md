@@ -1,6 +1,6 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：公共对象/观察/退休与公共时间已完成原交付并归档；验收可靠性首轮已收口，历史墙钟敏感现场保留于 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)，下一任务是 [运输/服务执行前置](todo-2026-09-13-service-runtime-prerequisites.md)。ProcessDrain 的管理者职责与 REAPABLE 触发已澄清，保留现有契约；不因先前对持续轮询的误解增加自动回收或预算激励前置。共享包与内核执行结构整理安排在执行前置后，FAL 业务仍暂停、整体未交付。公开契约若确需调整，先确定具体语义，再共同迁移内核与 rinlib。
+> 状态：公共对象/观察/退休、公共时间、消息/流运输、通用执行/准入、RPC/Outbox 以及公共操作专题 P0–P6 前置均已完成并分别记录；公共操作最终档案见 [`archived/todo-2026-09-14-public-operation-ownership.md`](archived/todo-2026-09-14-public-operation-ownership.md)。验收可靠性首轮已收口，历史墙钟敏感现场保留于 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)。自然顺序现进入 F0 重新基线审计，但整体仍未交付；F0 先按当前代码重建类型/责任图和依赖拆分，不直接续写旧草稿。ProcessDrain 的管理者职责与 REAPABLE 触发保持现有契约。
 >
 > 方向参考：`notes/ideas/{object,message,wait,time,rpc,framework,fal,fs,service,tunnel,runnel}.md`。本文件拥有 FAL 业务与总体依赖/交付导航；公共对象/观察/退休由 [公共前置计划](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 拥有，时钟/绝对期限由 [期限计划](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有，运输/RPC/服务执行由 [执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md) 拥有。计划审视由实施者负责，代码 reviewer 只审查代码；提交后登记未来代码 Review。
 
@@ -16,15 +16,15 @@
 |---|---|---|
 | 公共对象、观察与退休前置 | 完成，已归档 | `notes/impls/ipc.md` 与公共前置档案；保持内核拥有退休、捕获 epoch/预算、来源锁外交接及准入退款，不恢复 Seal/Drain |
 | 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
-| 运输/执行前置 | 消息与流运输已提交；通用执行/准入已提交 `a3891b0`；RPC/Outbox 待实施 | `todo-2026-09-13-service-runtime-prerequisites.md`；消息运输 → 流运输/Runnel → 通用执行/准入 → 完整 RPC/Outbox，每项同步迁移真实消费者 |
-| 公共操作边界收束 | 独立结构整理，安排在执行前置与共享包之后 | `todo-2026-09-14-public-operation-ownership.md`；保留 ProcessDrain 分工，收束等待/请求/工作执行，覆盖全部真实内核消费者 |
-| FAL 业务 | 暂停，整体未交付 | 本计划；store/backend/grant/protocol 等均须重审，`srv_fs` 仍有 v1 MemFs/同进程泵，不用该路径补偿尚未完成的执行基座 |
+| 运输/执行前置 | 消息与流运输、通用执行/准入及 RPC/Outbox 均已提交并验证 | `todo-2026-09-13-service-runtime-prerequisites.md`；保留各闭包证据和固定提交 Review，不再安排新的用户态执行阶段 |
+| 公共操作边界收束 | P0–P6 完成，已归档 | `archived/todo-2026-09-14-public-operation-ownership.md`；两组四类公平性、跨 hart/退出/接管/退款和结构残留均已收口 |
+| FAL 业务 | 恢复接手，整体未交付 | 本计划；先重审 store/backend/grant/protocol 的真实责任链和自然依赖，`srv_fs` 仍有 v1 MemFs/同进程泵，不把夹具当正式后端 |
 | 验收可靠性改进 | 首轮已收口，历史墙钟敏感现象只读归档 | `plans/archived/ref-2026-09-acceptance-timing-flake.md`；新现场命中归档触发条件时重新立案，不以重跑直到绿替代证据 |
 | workspace 包归属 | 已完成并归档 | `archived/todo-2026-09-13-workspace-package-ownership.md`；跨层 ABI 与 elf/tar/通用算法已统一组织进 shared workspace，算法语义未改 |
 
 代码定位：时间为 `shared/erhino_shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按消息运输、流运输/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
 
-当前验证基线：七面 `just clippy`、140+23 host、virt core/release、128MiB sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure 通过；GDB 只读捕获已安装 Close/active 的一次真实取消窗口，不保证每轮 exact-window。完整 stress 的历史墙钟敏感现场已完成首轮验收收口，证据见 `plans/archived/ref-2026-09-acceptance-timing-flake.md`；本快照不把历史偶发现象当作当前 correctness 缺陷。
+当前验证基线：公共操作 P6 最终快照已通过七面 `just clippy`、os/shared host、`just check` 和完整 `just acceptance`；完整 acceptance 包含 stress 16/16、release、sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure。确定性内核夹具覆盖请求 start/cancel/epoch、两组四类公平性与 Finalization 交棒；用户态覆盖在途 Drain caller 退出与管理者接管。完整 stress 的历史墙钟敏感现场已完成首轮验收收口，证据见 `plans/archived/ref-2026-09-acceptance-timing-flake.md`。
 
 完整日志与诊断 ELF/SHA256 位于本机 `artifacts/check/public-ipc-final-*`、`public-ipc-exit-*` 及 boot-failure/lint 目录，均被 Git 忽略，不随 clone 交付。异机接手先 `just check`、`just clippy`，显式 host target 的算法/shared 单测，再按变更风险运行 `just virt`、`just virt-release`、`just sifive_u`、`just virt-nofd`、`just virt-boot-failure`；若需复现诊断，用档案指明的生产源码断点重新取证，不依赖旧二进制地址。总体 stress/acceptance 在收尾如实判定，不能用重跑直到绿替代验收可靠性计划。
 
@@ -35,15 +35,14 @@
 本次任务划分失败的根因是把公共前置和正式服务能力混入一项过大的施工任务，并将文档确认误当成前置已成立。FAL 恢复施工时，必须按上述流程从目标契约反推正常、失败、取消、退出和退款路径，审视前置是否齐备、任务是否按机制闭合；自顶向下设计、自底向上完成完整前置。已有草稿不构成保留理由。
 
 ```text
-已交付公共时间与对象基线
-  → 消息运输 → 流运输/Runnel → 通用执行/准入 → 完整 RPC/Outbox
+已交付公共时间、对象、运输与服务执行基线
   → 共用算法契约与包归属（既有独立计划）
-  → 内核等待/请求/退休结构收束（保留现有回收职责）
+  → 内核等待/请求/退休结构收束（已完成）
   → 后端准备/取消/退休 → 授权域/provider/v2客户端
   → Open/Watch/注册/Move/Copy → 总体组合交付
 ```
 
-消息与流运输已提交，通用执行/准入已完成实现、完整验收与复核并提交为 `a3891b0`，下一机制为 RPC/Outbox；[公共操作结构收束](todo-2026-09-14-public-operation-ownership.md) 不作为整体开工阻塞，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已完成并归档。源码中的真实耦合仍需按计划收束，不因 Drain 分工合理而全部关闭；若 Close 执行上下文等具体能力阻断当前正确性，按证据提升对应完整机制，不能把全面内核重构或新根监督体系作为假定前置。每个闭包包含真实消费者、失败/退出及旧路径删除。
+消息与流运输、通用执行/准入和 RPC/Outbox 已分别完成实现、真实消费者迁移、失败/退出/退款验证并提交；[公共操作结构收束](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并归档。FAL 恢复不再等待机制前置，但若具体能力以代码事实证明缺失新契约，仍按证据提升完整机制，不把全面内核重构或新根监督体系作为假定前置。每个后续闭包仍必须包含真实消费者、失败/退出及旧路径删除。
 
 本文下面保留的基线与代码连接点是审视材料，不是已完成证据。公共前置章节的旧 Seal/Drain 等候选已经被普通 Close/内核退休替代，旧 ABI 和用户维护编排已删除，不继续照旧施工或恢复兼容。
 
@@ -67,7 +66,32 @@
 
 ## 当前施工位置
 
-公共对象、观察与退休前置已完成：独立发送授权/Delivery/Lifetime、WaitSet 普通内核退休、捕获 Native 继续/轮次取消、最后拥有根和真实消费者共同验证，旧维护 ABI 删除；新增真实线程接收、跨进程提交后 kill 与 GDB Waiting/active 窗口。最终 core/sifive/release/nofd、启动失败、七面 lint 和 163 项 host 测试通过，纳入当前 FAL 分支混合集成基线。完整 stress 的历史概率判定与 Tunnel 墙钟敏感现场已由验收首轮收口并进入只读归档。自然序转 运输/RPC/服务执行前置 → FAL；具体证据见公共前置档案与 notes/impls/ipc.md。下列条目是旧施工盘点，不是当前实现或交付保证，执行/业务恢复时须按实际代码重审：
+公共对象、时间、运输/RPC/服务执行、共享包归属和公共操作 P0–P6 已全部完成；FAL 不再等待机制前置。当前唯一施工位置是 **F0 重新基线审计**，不是直接续写某个 `libfal` 文件。
+
+### F0 重新基线审计（下一阶段）
+
+F0 按以下依赖产出一次完成，不形成独立业务交付：
+
+1. 以 `user/frameworks/libfal`、`libfs`、`libsrv`、`librpc`、`rinlib`、`srv_fs` 和启动 grant 为代码真值，逐项标出 v1 真实消费者、v2 已有积木、未接通接口和重复表示；旧计划文字不能替代调用图。
+2. 对首个后端闭包盘点 NodeStore、PreparedMutation、目录/属性/流 payload、retire wake、Account/Charge 的正常、准备失败、取消、冲突、替换旧值、最后引用、退出与退款责任；每条责任链必须有明确 owner 和生产调用点。
+3. 盘点 GrantTable、namespace/Delegate、FAL2 codec、provider/client、Open/Watch/注册/Move/Copy 对后端形状的真实依赖；只把会改变首个闭包类型图的能力提升为前置，其余按自然序留在后续闭包。
+4. 重写本计划的施工段与删除门：每项记录前置、真实消费者、失败边界、旧 v1 删除条件和验证门；删除已经被代码推翻的旧盘点，不另建平行 todo。
+
+F0 的完成标准是：当前 v1/v2 类型图、authority/owner 图、状态机和依赖图均有代码落点；未知项已经裁决或成为唯一阻塞条目；首个实现闭包的真实消费者与完整退款路径明确。完成前只允许只读调查和必要的文档校正，不把 host 编译通过当成后端交付。
+
+预期自然顺序如下；F0 可按代码证据合并强耦合项，但不得按文件拆分：
+
+```text
+F0 重新基线审计
+  → F1 后端准备/取消/退休 owner（首个实现闭包）
+  → F2 授权域 + namespace/Delegate + FAL2 provider/client 共同迁移
+  → F3 Open/Watch/注册/Move/Copy 等长生命周期业务
+  → F4 独立 provider/client 装配、旧 v1 删除与整体组合验收
+```
+
+F1 默认边界是让一个真实 provider 纵向消费 NodeStore、PreparedMutation、payload retirement、显式 wake 和账户退款；若 F0 证明 Grant 或 codec 是其类型闭包不可分割的一部分，则在同一计划中合并迁移。不得以现有 `srv_fs` v1 `MemFs`/同进程装配充当 F1 消费者。
+
+下面条目是此前混合工作树的定位材料，不是当前实现或交付保证；F0 必须逐条以实际代码确认、修正或删除：
 
 - `shared/erhino_shared/src/time.rs` 已写入 Deadline、ClockSnapshot、ClockGeometry 和换算测试；`kernel/clock.rs` 接入单一时钟来源，调度量子与启动期限不再截断频率。
 - shared/kernel/rinlib 的绝对 WaitMany/Sleep/Send 已开始纵向迁移；同步 Caller 与异步 Dispatcher 已写入同一 deadline、Unsent/Sent 错误阶段和未发送 Request/能力归还，尚未形成编译与组合证据。

@@ -81,8 +81,71 @@ impl TableId {
     }
 }
 
-/// 1..=7 由内核静态队列占用；运行时构造从 8 起，两个域永不碰撞。
-static NEXT_TABLE_ID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(8);
+/// 1..=9 由内核静态队列占用；运行时构造从 10 起，两个域永不碰撞。
+static NEXT_TABLE_ID: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(10);
+
+/// 一组固定顺序债务在单个安全点内的公平预算。
+///
+/// 入口时已经 runnable 的每个后续类别各保留一个执行机会；当前类别可使用
+/// 其余预算，但单个 payload 的推进仍受 `turn_limit` 限制。类别按索引单调
+/// 推进，运行中才出现的工作可使用剩余预算，却不会追溯挤占早先类别。
+pub struct FairBudget<const CLASSES: usize> {
+    total: usize,
+    turn_limit: usize,
+    pending: [bool; CLASSES],
+    used: usize,
+    class: usize,
+}
+
+impl<const CLASSES: usize> FairBudget<CLASSES> {
+    pub fn new(total: usize, turn_limit: usize, pending: [bool; CLASSES]) -> Self {
+        assert!(turn_limit > 0, "fair budget turn limit must be nonzero");
+        assert!(
+            pending.iter().filter(|pending| **pending).count() <= total,
+            "fair budget cannot reserve more classes than total work"
+        );
+        Self {
+            total,
+            turn_limit,
+            pending,
+            used: 0,
+            class: 0,
+        }
+    }
+
+    pub fn remaining(&mut self, class: usize) -> usize {
+        assert!(class < CLASSES, "fair budget class is out of range");
+        assert!(
+            class >= self.class,
+            "fair budget classes must advance monotonically"
+        );
+        self.class = class;
+        let reserved = self.pending[class + 1..]
+            .iter()
+            .filter(|pending| **pending)
+            .count();
+        self.total
+            .saturating_sub(reserved)
+            .saturating_sub(self.used)
+    }
+
+    pub fn turn(&mut self, class: usize) -> usize {
+        self.remaining(class).min(self.turn_limit)
+    }
+
+    pub fn charge(&mut self, class: usize, work: usize) {
+        let remaining = self.remaining(class);
+        assert!(
+            work <= remaining,
+            "fair budget charge exceeded the class allowance"
+        );
+        self.used += work;
+    }
+
+    pub fn used(&self) -> usize {
+        self.used
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reservation {

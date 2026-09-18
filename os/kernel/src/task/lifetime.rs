@@ -95,14 +95,8 @@ impl KernelObject for Lifetime {
     }
     fn close_handle(&self, _: HandleRole, _: &Process, _: bool) {}
     fn close_transit(&self, _: HandleRole) {}
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        for used in 0..budget {
-            let advance = self.wait.lock().advance_waiter();
-            if advance.finish() {
-                return (used, true);
-            }
-        }
-        (budget, false)
+    fn advance_waiter(&self) -> super::object::WaitAdvance {
+        self.wait.lock().advance_waiter()
     }
     fn complete_waiter_drain(
         &self,

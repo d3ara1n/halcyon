@@ -7,23 +7,77 @@ use super::{
 };
 use crate::{
     deferred_work::{Dependency, WakeAction},
-    hart, registry,
-    sync::Spinlock,
+    hart,
+    work_ledger::{DebtLedger, Reservation as LedgerReservation},
 };
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use erhino_shared::call::SystemCallError;
 
-const HARTS: usize = hart::HART_NUM_LIMIT;
 const SLOTS: usize = super::resources::REGISTRATION_FINISH_LIMIT;
-type Debts = work_debt::WorkDebts<ObjectRef, HARTS, SLOTS>;
-static DEBTS: Spinlock<Debts> = Spinlock::new(
-    crate::sync::ranks::WORK_DEBT,
-    Debts::new_with_id(work_debt::TableId::new(7)),
-);
-static PENDING: [AtomicUsize; HARTS] = [const { AtomicUsize::new(0) }; HARTS];
+type Debts = DebtLedger<ObjectRef, SLOTS>;
+static DEBTS: Debts = Debts::new(work_debt::TableId::new(7));
 
 pub(crate) mod selftest;
+
+/// 已提交对象退休的稳定内部票据。票据持有对象强引用，只暴露完成依赖，
+/// 不把 RetirementTarget 的执行容量和回复责任泄漏给请求层。
+#[derive(Clone)]
+pub(crate) struct RetirementTicket {
+    object: ObjectRef,
+}
+
+pub(crate) struct RetirementCompletion {
+    pub(crate) reply: Option<WaitIdentity>,
+    pub(crate) owner: Option<Arc<Process>>,
+}
+
+impl RetirementCompletion {
+    pub(crate) fn deliver(self) {
+        if let Some(owner) = self.owner
+            && owner.lifecycle.complete_mandatory()
+        {
+            owner.publish_reapable();
+        }
+        if let Some(reply) = self.reply {
+            reply.complete_kernel();
+        }
+    }
+}
+
+impl RetirementTicket {
+    pub(crate) fn new(object: ObjectRef) -> Self {
+        assert!(
+            object.retirement().is_some(),
+            "retirement ticket requires a retirement backend"
+        );
+        Self { object }
+    }
+
+    pub(crate) fn register(&self, action: WakeAction, cancelled: impl FnOnce() -> bool) {
+        let target = self
+            .object
+            .retirement()
+            .expect("retirement ticket lost its backend");
+        target
+            .completion()
+            .register(action, || target.is_finished() || cancelled());
+    }
+
+    pub(crate) fn cancel(&self, key: crate::deferred_work::WaitKey) {
+        self.object
+            .retirement()
+            .expect("retirement ticket lost its backend")
+            .completion()
+            .cancel_keyed(key);
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.object
+            .retirement()
+            .expect("retirement ticket lost its backend")
+            .is_finished()
+    }
+}
 
 pub(crate) trait RetirementTarget: Send + Sync {
     fn begin(
@@ -34,7 +88,7 @@ pub(crate) trait RetirementTarget: Send + Sync {
     fn step(&self, budget: usize) -> work_debt::StepResult<()>;
     fn register_progress(&self, wake: WakeAction);
     fn publish_progress(&self);
-    fn finish(&self, reservation: Reservation, object: ObjectRef);
+    fn finish(&self, reservation: Reservation, object: ObjectRef) -> Option<RetirementCompletion>;
     fn completion(&self) -> &Dependency;
     fn is_finished(&self) -> bool;
 }
@@ -59,148 +113,65 @@ impl Launch {
     }
 }
 
-pub(crate) struct Reservation(Option<work_debt::Reservation>);
+pub(crate) type Reservation = LedgerReservation<ObjectRef, SLOTS>;
 
 pub(crate) fn reserve() -> Result<Reservation, SystemCallError> {
-    DEBTS
-        .lock()
-        .reserve()
-        .map(|slot| Reservation(Some(slot)))
-        .map_err(|_| SystemCallError::OutOfMemory)
-}
-
-impl Reservation {
-    pub(crate) fn publish(mut self, object: ObjectRef) {
-        let owner = hart::current().slot();
-        let slot = self.0.take().expect("object maintenance published twice");
-        {
-            let mut debts = DEBTS.lock();
-            debts
-                .publish(slot, owner, object)
-                .unwrap_or_else(|_| panic!("prepaid object maintenance must publish"));
-            PENDING[owner].fetch_add(1, Ordering::Release);
-        }
-        ring(owner);
-    }
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if let Some(slot) = self.0.take() {
-            assert!(
-                DEBTS.lock().cancel(slot).is_ok(),
-                "object maintenance reservation must refund"
-            );
-        }
-    }
-}
-
-fn ring(owner: usize) {
-    if registry::try_ipi_slots(1u64 << owner) != 0 {
-        warn!(
-            Task,
-            "Object retirement doorbell failed for hart slot {owner}; work remains pending"
-        );
-    }
+    DEBTS.reserve().map_err(|_| SystemCallError::OutOfMemory)
 }
 
 fn wake(token: work_debt::WakeToken) {
-    let result = {
-        let mut debts = DEBTS.lock();
-        let result = debts
-            .wake(token)
-            .expect("object retirement wake lost its owner");
-        if let work_debt::WakeResult::Runnable { owner } = result {
-            PENDING[owner].fetch_add(1, Ordering::Release);
-        }
-        result
-    };
-    if let work_debt::WakeResult::Runnable { owner } = result {
-        ring(owner);
-    }
+    DEBTS.wake_raw(token);
 }
 
 pub(crate) fn has_current() -> bool {
-    PENDING[hart::current().slot()].load(Ordering::Acquire) != 0
+    DEBTS.pending(hart::current().slot()) != 0
 }
 
-fn return_slot(owner: usize, token: work_debt::FinishToken) -> Reservation {
-    let mut debts = DEBTS.lock();
-    let slot = debts
-        .rearm(token)
-        .expect("object maintenance must return its slot");
-    assert!(
-        PENDING[owner].fetch_sub(1, Ordering::AcqRel) > 0,
-        "object maintenance must be pending"
-    );
-    Reservation(Some(slot))
+fn return_slot(token: super::super::work_ledger::Token<ObjectRef, SLOTS>) -> Reservation {
+    token.rearm()
 }
 
 pub(crate) fn drain_current(budget: usize) -> usize {
     let owner = hart::current().slot();
     let mut used = 0;
     while used < budget {
-        let Some(taken) = DEBTS.lock().take(owner) else {
+        let Some(taken) = DEBTS.take(owner) else {
             break;
         };
         let (token, object) = taken.into_parts();
         let backend = object
             .retirement()
             .expect("queued object lost retirement backend");
-        let advance = backend.step((budget - used).min(4));
+        let advance =
+            backend.step((budget - used).min(crate::work_ledger::MAX_STEPS_PER_DEBT_TURN));
         assert!(
-            advance.work_done <= (budget - used).min(4),
+            advance.work_done <= (budget - used).min(crate::work_ledger::MAX_STEPS_PER_DEBT_TURN),
             "object retirement exceeded its budget"
         );
         used += advance.work_done.max(1);
         match advance.state {
             work_debt::StepState::Complete => {
-                let reservation = return_slot(owner, token);
-                backend.finish(reservation, object.clone());
+                let reservation = return_slot(token);
+                if let Some(completion) = backend.finish(reservation, object.clone()) {
+                    completion.deliver();
+                }
             }
             work_debt::StepState::Runnable => {
                 assert!(
                     advance.work_done > 0,
                     "runnable object retirement made no progress"
                 );
-                DEBTS
-                    .lock()
-                    .requeue(token, object)
-                    .unwrap_or_else(|_| panic!("object retirement must requeue"));
+                token.requeue(object);
             }
             work_debt::StepState::Blocked(()) => {
-                let ticket = DEBTS
-                    .lock()
-                    .arm_wake(&token)
+                let ticket = token
+                    .arm_wake()
                     .expect("object retirement must own its wake");
-                backend.register_progress(WakeAction::unkeyed(ticket, wake));
-                let mut debts = DEBTS.lock();
-                if debts
-                    .park(token, object)
-                    .unwrap_or_else(|_| panic!("object retirement must park"))
-                    == work_debt::ParkResult::Parked
-                {
-                    assert!(
-                        PENDING[owner].fetch_sub(1, Ordering::AcqRel) > 0,
-                        "parked retirement must be pending"
-                    );
-                }
+                backend.register_progress(WakeAction::unkeyed(ticket.into_raw(), wake));
+                token.park(object);
             }
         }
     }
-    if has_current() {
-        ring(owner);
-    }
+    DEBTS.ring_if_pending(owner);
     used
-}
-
-pub(crate) fn deliver_completion(reply: Option<WaitIdentity>, owner: Option<Arc<Process>>) {
-    if let Some(owner) = owner
-        && owner.lifecycle.complete_mandatory()
-    {
-        owner.publish_reapable();
-    }
-    if let Some(reply) = reply {
-        reply.complete_kernel();
-    }
 }

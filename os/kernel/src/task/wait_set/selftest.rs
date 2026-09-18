@@ -6,17 +6,11 @@ use crate::task::retirement::RetirementTarget;
 
 pub(crate) mod continuation;
 
-type TicketDebts = work_debt::WorkDebts<crate::task::handle::PendingClose, 1, 1>;
-static TICKETS: crate::sync::Spinlock<Option<TicketDebts>> =
-    crate::sync::Spinlock::new(crate::sync::ranks::WORK_DEBT, None);
+type TicketLedger = crate::work_ledger::DebtLedger<crate::task::handle::PendingClose, 1>;
+static TICKETS: TicketLedger = TicketLedger::new(work_debt::TableId::new(9));
 
 fn wake_ticket(token: work_debt::WakeToken) {
-    TICKETS
-        .lock()
-        .as_mut()
-        .unwrap()
-        .wake(token)
-        .expect("retirement ticket fixture lost its affine wake");
+    TICKETS.wake_raw(token);
 }
 
 fn set(sponsor: &Arc<MetadataSponsor>) -> ObjectRef {
@@ -647,25 +641,25 @@ fn ticket_completion(sponsor: &Arc<MetadataSponsor>, early: bool) {
         super::super::resources::ProcessResources::try_new().expect("ticket owner sponsor failed"),
     )
     .expect("ticket owner process failed");
-    let (token, ticket) = {
-        let mut queue = TICKETS.lock();
-        let queue = queue.as_mut().unwrap();
-        let reservation = queue.reserve().expect("ticket fixture admission failed");
-        queue
-            .publish(reservation, 0, PendingClose::Retirement(target.clone()))
-            .unwrap_or_else(|_| panic!("ticket fixture publication failed"));
-        queue.take(0).unwrap().into_parts()
-    };
+    let reservation = TICKETS.reserve().expect("ticket fixture admission failed");
+    reservation.publish_quiet(PendingClose::Retirement(
+        super::super::retirement::RetirementTicket::new(target.clone()),
+    ));
+    let owner = crate::hart::current().slot();
+    let (token, ticket) = TICKETS.take(owner).unwrap().into_parts();
     let (used, ticket) = ticket.advance(&process, 1);
     assert_eq!(
         used, 0,
         "pending retirement ticket charged work while blocked"
     );
     let ticket = ticket.expect("pending retirement ticket completed too early");
-    let dependency = ticket.dependency();
-    let wake = TICKETS.lock().as_mut().unwrap().arm_wake(&token).unwrap();
+    let PendingClose::Retirement(dependency) = &ticket else {
+        panic!("ticket fixture lost its retirement dependency")
+    };
+    let dependency = dependency.clone();
+    let wake = token.arm_wake().unwrap();
     dependency.register(
-        crate::deferred_work::WakeAction::unkeyed(wake, wake_ticket),
+        crate::deferred_work::WakeAction::unkeyed(wake.into_raw(), wake_ticket),
         || false,
     );
     let mut operation = Some(operation);
@@ -673,12 +667,7 @@ fn ticket_completion(sponsor: &Arc<MetadataSponsor>, early: bool) {
         drop(operation.take());
         settle();
     }
-    let parked = TICKETS
-        .lock()
-        .as_mut()
-        .unwrap()
-        .park(token, ticket)
-        .unwrap_or_else(|_| panic!("ticket fixture failed to park"));
+    let parked = token.park(ticket);
     assert_eq!(
         parked,
         if early {
@@ -689,18 +678,16 @@ fn ticket_completion(sponsor: &Arc<MetadataSponsor>, early: bool) {
         "ticket completion lost its early/late wake boundary"
     );
     if !early {
-        assert!(
-            !TICKETS.lock().as_ref().unwrap().has_pending(0),
+        assert_eq!(
+            TICKETS.pending(owner),
+            0,
             "blocked ticket remained runnable"
         );
         drop(operation.take());
         settle();
     }
     let (token, ticket) = TICKETS
-        .lock()
-        .as_mut()
-        .unwrap()
-        .take(0)
+        .take(owner)
         .expect("retirement completion failed to wake its ticket")
         .into_parts();
     let (used, ticket) = ticket.advance(&process, 1);
@@ -712,14 +699,9 @@ fn ticket_completion(sponsor: &Arc<MetadataSponsor>, early: bool) {
         ticket.is_none(),
         "completed actor did not release its pending ticket"
     );
-    TICKETS
-        .lock()
-        .as_mut()
-        .unwrap()
-        .finish(token)
-        .expect("ticket fixture failed to refund its slot");
+    token.finish();
     assert_eq!(
-        TICKETS.lock().as_ref().unwrap().available(),
+        TICKETS.available(),
         1,
         "ticket fixture retained its slot or wake"
     );
@@ -839,7 +821,7 @@ fn constructor_pressure(sponsor: &Arc<MetadataSponsor>) {
 fn control_pressure(sponsor: &Arc<MetadataSponsor>, nonempty_actor: bool) {
     use crate::task::notify_work;
     let source = set(sponsor);
-    let backlog = notify_work::MAX_STEPS_PER_SAFE_POINT * 4;
+    let backlog = crate::work_ledger::MAX_STEPS_PER_SAFE_POINT * 4;
     let target: ObjectRef = WaitSet::new(backlog, sponsor).expect("control pressure target failed");
     let mut cycles = Vec::with_capacity(backlog);
     for _ in 0..backlog {
@@ -865,7 +847,8 @@ fn control_pressure(sponsor: &Arc<MetadataSponsor>, nonempty_actor: bool) {
         .update(ObjectSignals::READABLE, ObjectSignals::READABLE);
     finish_set.notify();
     // 来源实际 offer 获得完成权，留下已排队 finish；通知槽仍由正式 runner 收束。
-    assert_eq!(finish_source.drain_waiters(1).0, 1);
+    let advance = finish_source.advance_waiter();
+    assert!(!advance.finish(), "waiter notification finished too early");
     assert!(
         finish.core.has_outcome() && finish.finish.lock().is_none(),
         "control pressure did not publish its prepaid finish responsibility"
@@ -904,7 +887,7 @@ fn control_pressure(sponsor: &Arc<MetadataSponsor>, nonempty_actor: bool) {
     );
     let used = notify_work::drain_current();
     assert!(
-        used <= notify_work::MAX_STEPS_PER_SAFE_POINT,
+        used <= crate::work_ledger::MAX_STEPS_PER_SAFE_POINT,
         "control pressure exceeded the shared safe-point budget"
     );
     assert!(
@@ -968,10 +951,6 @@ fn control_pressure(sponsor: &Arc<MetadataSponsor>, nonempty_actor: bool) {
 }
 
 pub(crate) fn run(sponsor: &Arc<MetadataSponsor>) {
-    let old = TICKETS
-        .lock()
-        .replace(TicketDebts::try_new().expect("ticket fixture table identity exhausted"));
-    assert!(old.is_none(), "ticket fixture initialized twice");
     let before = super::super::resources::admission_usage();
     let work_before = super::super::notify_work::inventory_for_test();
     let actor_before = super::super::retirement::selftest::inventory();

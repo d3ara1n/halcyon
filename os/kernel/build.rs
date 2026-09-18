@@ -17,7 +17,10 @@ fn main() {
             .unwrap_or_else(|| manifest_dir.join("../platforms/qemu/virt/memory.x")),
         "platform memory script",
     );
-    let linker_script = canonicalize(manifest_dir.join("../platforms/linker.ld"), "kernel linker script");
+    let linker_script = canonicalize(
+        manifest_dir.join("../platforms/linker.ld"),
+        "kernel linker script",
+    );
 
     println!("cargo::rerun-if-env-changed={MEMORY_SCRIPT_ENV}");
     println!("cargo::rerun-if-changed={}", memory_script.display());
@@ -25,8 +28,9 @@ fn main() {
 
     let memory = fs::read_to_string(&memory_script).expect("cannot read platform memory script");
     let linker = fs::read_to_string(&linker_script).expect("cannot read kernel linker script");
-    let generated_script = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not provide OUT_DIR"))
-        .join("erhino.ld");
+    let generated_script =
+        PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not provide OUT_DIR"))
+            .join("erhino.ld");
 
     fs::write(&generated_script, format!("{memory}\n{linker}"))
         .expect("cannot generate kernel linker script");

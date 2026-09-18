@@ -136,8 +136,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   `members 为空 && active == 0 && building_ops == 0 && mandatory_ops == 0` 的持续电平：
   线程全部离场但 Remote completion 尚未收束时不会提前发布。
   线程终止清理只推进到 REAPABLE；完整资源回收仍由管理者提交 ProcessDrain 批次。
-  `DrainRequest` 捕获目标、输出和剩余预算，经可复用 WaitContext 在依赖未完成时挂起；
-  关闭回复或调用者退出不撤销已经启动的对象退休，但不会自动提交剩余 Process 全程回收。
+  `DrainRequest` 捕获目标、输出和剩余预算，经 `DrainExecutor` 持有的可复用完成上下文在依赖未完成时挂起；等待层只负责完成仲裁、订阅注销、线程交付和请求取消接缝。Waiting 发布与请求 debt 启动之间允许终止方先取得取消权：`WaitOperation::start/cancel` 都携带捕获的 `WaitKey`，取消先赢会共同退休 request/activation，迟到 start 为空操作；启动先赢则已发布 debt 在执行时观察取消。旧 epoch 的延迟回调因 key 不匹配不能触及下一轮 activation。关闭回复或调用者退出不撤销已经启动的对象退休，但不会自动提交剩余 Process 全程回收。
   Dead 在 drain 的 PublishDead 阶段发布，不等于该批已返回 Complete。HandleTable 先逐槽扫描摘项
   （take_next_bounded 硬预算），扫描与 close 各计一个 work unit；预算恰在
   摘项后耗尽时 entry 存入 Process `pending_close`，下一批优先在表锁外消费。
@@ -153,9 +152,14 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
   空壳）。PublishDead 前先发布出生预付的 Finalization 独立强根，后续祖先传播和 Done
   可以跨预算推进；该终段不会因 caller/control 或 Job 成员根消散而丢失。批次以
-  drain_active 取得全寿命许可，drain_gate 串行每次实际推进；并发批次返回 ObjectBusy。
+  `Process` 的 `try_acquire_drain`/`release_drain` 封装 `drain_active` 全寿命许可，
+  `drain_gate` 只在 Process 内部串行 managed、unpublished 与 finalization 推进；并发批次返回 ObjectBusy。Unpublished 到 PublishDead 时允许其 debt 与新发布的 Finalization 强根短暂重叠，但两者不能并发推进同一游标；活动 managed 批次会让 Finalization 依赖停驻，许可释放再唤醒。
+  deferred 的 MemoryChange/Unpublished/Termination/Finalization 与 control 的 Notification/Finish/Request/Retirement 各构成一组四类安全点预算。入口 runnable 的后续类别各保留一次执行机会，阻塞登记计执行成本但不计公开 Drain `work_done`；总预算与单债务 turn
+  由 `work_ledger` 统一提供 16/4 常量，通用分配算术由 `work_debt::FairBudget` 承担。Unpublished rollback 当前只由 boot
+  `spawn_from_elf` 生产并使用独立单槽账本，不能借用内存事务容量。
   Drain 进度存目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
-  持有可恢复监督 authority 的管理者可以接管。这是可恢复的管理者驱动，不是终止后的自动回收。init 持久保留服务 control，并按负载阶段监督：高峰竞态矩阵前先查询并收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace；仍处于 Building/Running 的成员留在集合，末尾再统一 WaitMany(REAPABLE|CLOSED) → Drain 至 Complete → 终态快照。对象 close 回调（如隧道 PEER_CLOSED）发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
+  并以 `DrainBatchOutcome::{More, Blocked(RetirementTicket), Complete}` 返回类型化的
+  继续、阻塞和完成原因；持有可恢复监督 authority 的管理者可以接管。这是可恢复的管理者驱动，不是终止后的自动回收。init 持久保留服务 control，并按负载阶段监督：高峰竞态矩阵前先查询并收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace；仍处于 Building/Running 的成员留在集合，末尾再统一 WaitMany(REAPABLE|CLOSED) → Drain 至 Complete → 终态快照。对象 close 回调（如隧道 PEER_CLOSED）发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
 - **当前监督与资助**：`srv_init::launch_test_services` 通过 `SpawnRequest.memory_pool = root_memory_pool()` 为服务及委托域靶提供同一来源；`libprocess::spawn` 复制 GRANT-only Pool authority 后交 ProcessBindMemory，没有自动派生每个子进程的固定额度。pm 获得不含 CREATE 的委托 JobControl，init 保留独立域 control 兜底；该授权没有绑定独立页池。`ProcessResources::try_new` 为新进程从全局 admission 建立 MetadataSponsor，未消费父进程的可委派 metadata 预算。页 charge 退回其来源 Pool，metadata permit 退回原 sponsor/global counter，均不因执行 Drain 的进程而改记。当前依靠可信 init/pm 的显式监督政策，不能声称已建立每个管理域的独立资助与回收激励；`max_work` 只是批次工作界限，deferred work 也没有按资助者归账的 CPU 预约计费。
 - **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker并预留 caller Handle 槽；输出写入后先形成 `HandleTable::PreparedCommit`，再在 `HANDLE_TABLE → JOB_INNER` 临界区把 capability 与成员同时发布。Bootstrap 采用同一 typed commit，并在锁区内继续提交 lifecycle Running 与 execution binding；所有可恢复失败都在此之前。JobCreate 同构保留 child marker 与预留槽协议。ProcessStart 事务见 [`startup.md`](startup.md)。
 - **对象关闭**：叶 role 在 Handle 摘出后、表锁外执行有界 callback；容器通过退休后端提交独立执行者，ProcessDrain 保存 PendingClose::Retirement 完成 ticket，不执行对象内部扫描。尚未启动关闭的摘出项保存为 PendingClose::Entry，仍等下一批推进。具体关闭与准入契约见 [`ipc.md`](ipc.md)，不能把所有关闭都当成同步 callback。

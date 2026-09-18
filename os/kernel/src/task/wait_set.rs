@@ -541,14 +541,8 @@ impl KernelObject for WaitSet {
     fn close_transit(&self, _: HandleRole) {
         unreachable!("WaitSet owner cannot enter messages")
     }
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        for used in 0..budget {
-            let advance = self.state.lock().wait.advance_waiter();
-            if advance.finish() {
-                return (used, true);
-            }
-        }
-        (budget, false)
+    fn advance_waiter(&self) -> super::object::WaitAdvance {
+        self.state.lock().wait.advance_waiter()
     }
     fn complete_waiter_drain(
         &self,
@@ -690,7 +684,11 @@ impl super::retirement::RetirementTarget for WaitSet {
         self.retirement_progress.notify();
     }
 
-    fn finish(&self, reservation: super::retirement::Reservation, object: ObjectRef) {
+    fn finish(
+        &self,
+        reservation: super::retirement::Reservation,
+        object: ObjectRef,
+    ) -> Option<super::retirement::RetirementCompletion> {
         let again = {
             let mut state = self.state.lock();
             if state.retire_head != 0
@@ -715,8 +713,7 @@ impl super::retirement::RetirementTarget for WaitSet {
                     drop(plan);
                     self.retired.store(true, Ordering::Release);
                     self.retirement_completion.notify();
-                    super::retirement::deliver_completion(reply, owner);
-                    return;
+                    return Some(super::retirement::RetirementCompletion { reply, owner });
                 }
                 assert!(
                     state.actor.replace(reservation).is_none(),
@@ -728,6 +725,7 @@ impl super::retirement::RetirementTarget for WaitSet {
         if let Some(work) = again {
             work.publish(object);
         }
+        None
     }
 
     fn completion(&self) -> &crate::deferred_work::Dependency {
