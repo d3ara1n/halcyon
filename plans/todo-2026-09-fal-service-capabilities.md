@@ -1,6 +1,6 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：公共对象/观察/退休、公共时间、消息/流运输、通用执行/准入、RPC/Outbox 以及公共操作专题 P0–P6 前置均已完成并分别记录；公共操作最终档案见 [`archived/todo-2026-09-14-public-operation-ownership.md`](archived/todo-2026-09-14-public-operation-ownership.md)。验收可靠性首轮已收口，历史墙钟敏感现场保留于 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)。自然顺序现进入 F0 重新基线审计，但整体仍未交付；F0 先按当前代码重建类型/责任图和依赖拆分，不直接续写旧草稿。ProcessDrain 的管理者职责与 REAPABLE 触发保持现有契约。
+> 状态：公共对象/观察/退休、公共时间、消息/流运输、通用执行/准入、RPC/Outbox 以及公共操作专题 P0–P6 前置均已完成并分别记录；公共操作最终档案见 [`archived/todo-2026-09-14-public-operation-ownership.md`](archived/todo-2026-09-14-public-operation-ownership.md)。验收可靠性首轮已收口，历史墙钟敏感现场保留于 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)。**F0 重新基线审计已完成，整体 FAL 仍未交付；下一施工位置为 F1 单 provider 授权—后端—协议—执行闭包。** F0 依据当前源码重建了真实消费者、owner/authority 图、失败/退休/退款责任和自然依赖，不继续沿用被代码推翻的旧拆分。ProcessDrain 的管理者职责与 REAPABLE 触发保持现有契约。
 >
 > 方向参考：`notes/ideas/{object,message,wait,time,rpc,framework,fal,fs,service,tunnel,runnel}.md`。本文件拥有 FAL 业务与总体依赖/交付导航；公共对象/观察/退休由 [公共前置计划](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 拥有，时钟/绝对期限由 [期限计划](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有，运输/RPC/服务执行由 [执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md) 拥有。计划审视由实施者负责，代码 reviewer 只审查代码；提交后登记未来代码 Review。
 
@@ -10,7 +10,7 @@
 
 - 开发分支：`task/fal-service-capabilities`，由本地 `master` 的 `5d406a4` 分出；该基点包含原有四个未推送提交。当前基线是公共对象交付与时间/执行/FAL 草稿的集成快照，不声称仅包含公共对象前置，也不声称 FAL 已交付。
 - 交接入口：先读 `plans/COMPASS.md`、本节和对应专题计划；实现现状看 `notes/impls/`，目标契约看 `notes/ideas/`。会话内任务编号只作临时导航，不能写入项目语义，计划文件是跨会话真值。
-- 开发方式：本次混合快照不按文件硬拆。后续按运输、RPC/Outbox、服务执行等机制闭包逐项提交；每项包含真实调用者、失败/取消/退休、旧路径删除和验证，不以 passing fragment 标完成。总体完成并经授权后合并回 `master`；提交不包含 push 或合并授权。
+- 开发方式：本次 F0 只产生文档基线，不按文件硬拆或进入业务实现。后续按 F1–F4 的语义闭包逐项提交；每项包含真实调用者、失败/取消/退出/退休/退款、旧路径删除和验证，不以 passing fragment 标完成。总体完成并经授权后合并回 `master`；提交不包含 push 或合并授权。
 
 | 专题 | 交接状态 | 接手入口与剩余责任 |
 |---|---|---|
@@ -18,11 +18,11 @@
 | 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
 | 运输/执行前置 | 消息与流运输、通用执行/准入及 RPC/Outbox 均已提交并验证 | `todo-2026-09-13-service-runtime-prerequisites.md`；保留各闭包证据和固定提交 Review，不再安排新的用户态执行阶段 |
 | 公共操作边界收束 | P0–P6 完成，已归档 | `archived/todo-2026-09-14-public-operation-ownership.md`；两组四类公平性、跨 hart/退出/接管/退款和结构残留均已收口 |
-| FAL 业务 | 恢复接手，整体未交付 | 本计划；先重审 store/backend/grant/protocol 的真实责任链和自然依赖，`srv_fs` 仍有 v1 MemFs/同进程泵，不把夹具当正式后端 |
+| FAL 业务 | F0 已完成，整体未交付 | 本计划；下一步进入 F1 单 provider 授权—后端—协议—执行闭包，不把 v2 积木或 srv_fs v1 夹具当成已交付能力 |
 | 验收可靠性改进 | 首轮已收口，历史墙钟敏感现象只读归档 | `plans/archived/ref-2026-09-acceptance-timing-flake.md`；新现场命中归档触发条件时重新立案，不以重跑直到绿替代证据 |
 | workspace 包归属 | 已完成并归档 | `archived/todo-2026-09-13-workspace-package-ownership.md`；跨层 ABI 与 elf/tar/通用算法已统一组织进 shared workspace，算法语义未改 |
 
-代码定位：时间为 `shared/erhino_shared/src/time.rs`、`os/kernel/src/clock.rs`、sched/wait/mailbox 与 `user/rinlib/src/time.rs`；执行为 rinlib ipc、`librunnel`、`librpc/{caller,dispatcher,exchange}.rs`、`libsrv/{budget,work_queue,runtime,wake}.rs`。执行前置按消息运输、流运输/Runnel、通用执行/准入、完整 RPC/Outbox 顺序推进；每项同时迁移真实消费者并保持失败/取消/退休/退款闭包，不按旧盘点直接续写。
+代码定位：F0 以 `user/frameworks/libfal`、`libfs`、`libsrv`、`librpc`、`rinlib`、`srv_fs` 和 `srv_init` 为真值；F1 将共同接通 Runtime/WaitSet、GrantTable、FAL2 wire/provider/client、MemoryBackend 及退休唤醒。既有运输、RPC 和执行前置的实现事实分别由对应 `notes/impls/` 与固定提交 Review 拥有，本计划不再重新安排其施工。
 
 当前验证基线：公共操作 P6 最终快照已通过七面 `just clippy`、os/shared host、`just check` 和完整 `just acceptance`；完整 acceptance 包含 stress 16/16、release、sifive_u、virt-nofd、panic/alloc/fatal 三类 boot-failure。确定性内核夹具覆盖请求 start/cancel/epoch、两组四类公平性与 Finalization 交棒；用户态覆盖在途 Drain caller 退出与管理者接管。完整 stress 的历史墙钟敏感现场已完成首轮验收收口，证据见 `plans/archived/ref-2026-09-acceptance-timing-flake.md`。
 
@@ -38,8 +38,11 @@
 已交付公共时间、对象、运输与服务执行基线
   → 共用算法契约与包归属（既有独立计划）
   → 内核等待/请求/退休结构收束（已完成）
-  → 后端准备/取消/退休 → 授权域/provider/v2客户端
-  → Open/Watch/注册/Move/Copy → 总体组合交付
+  → F0 重新基线审计（已完成）
+  → F1 单 provider 授权—后端—协议—执行闭包
+  → F2 独立 provider/client 与 namespace/Delegate 迁移
+  → F3 Open/Watch/注册/Move/Copy 等长生命周期业务
+  → F4 旧 v1 删除、独立装配与整体组合验收
 ```
 
 消息与流运输、通用执行/准入和 RPC/Outbox 已分别完成实现、真实消费者迁移、失败/退出/退款验证并提交；[公共操作结构收束](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并归档。FAL 恢复不再等待机制前置，但若具体能力以代码事实证明缺失新契约，仍按证据提升完整机制，不把全面内核重构或新根监督体系作为假定前置。每个后续闭包仍必须包含真实消费者、失败/退出及旧路径删除。
@@ -48,7 +51,7 @@
 
 ## 1. 基线、交付范围与自然序
 
-调查基线 `5d406a4`：多页 Tunnel/RNL2 已实现，`606b59d` 完成库存来源与正式自检。当前代码仍是：entry 自带 badge、Mailbox owner/sender 共用一个对象、Receive 后无内核交付 owner、WaitMany 相对毫秒且最多 64 项；`libsrv` 为空壳，`srv_fs` 用同进程客户端泵，无正式 grant、Delegate、Open、Watch、服务发现。
+审计前调查基线 `5d406a4`：多页 Tunnel/RNL2 已实现，`606b59d` 完成库存来源与正式自检。该基线材料只用于解释旧计划为何需要重审；当前真值以本计划上方 F0 源码审计结论和 `notes/impls/fal.md` 为准。
 
 整体目标是以通用对象寿命、消息交付、持久观察和绝对期限支撑正式服务，再一次接通 FAL。交付包含：
 
@@ -66,32 +69,48 @@
 
 ## 当前施工位置
 
-公共对象、时间、运输/RPC/服务执行、共享包归属和公共操作 P0–P6 已全部完成；FAL 不再等待机制前置。当前唯一施工位置是 **F0 重新基线审计**，不是直接续写某个 `libfal` 文件。
+公共对象、时间、运输/RPC/服务执行、共享包归属和公共操作 P0–P6 已全部完成；F0 重新基线审计已按当前源码完成。F0 不形成业务交付，产出的是后续实现必须遵守的唯一类型图、责任图和依赖边界。
 
-### F0 重新基线审计（下一阶段）
+### F0 重新基线审计结论（已完成）
 
-F0 按以下依赖产出一次完成，不形成独立业务交付：
+#### 1. 真实生产调用图
 
-1. 以 `user/frameworks/libfal`、`libfs`、`libsrv`、`librpc`、`rinlib`、`srv_fs` 和启动 grant 为代码真值，逐项标出 v1 真实消费者、v2 已有积木、未接通接口和重复表示；旧计划文字不能替代调用图。
-2. 对首个后端闭包盘点 NodeStore、PreparedMutation、目录/属性/流 payload、retire wake、Account/Charge 的正常、准备失败、取消、冲突、替换旧值、最后引用、退出与退款责任；每条责任链必须有明确 owner 和生产调用点。
-3. 盘点 GrantTable、namespace/Delegate、FAL2 codec、provider/client、Open/Watch/注册/Move/Copy 对后端形状的真实依赖；只把会改变首个闭包类型图的能力提升为前置，其余按自然序留在后续闭包。
-4. 重写本计划的施工段与删除门：每项记录前置、真实消费者、失败边界、旧 v1 删除条件和验证门；删除已经被代码推翻的旧盘点，不另建平行 todo。
+- 当前唯一真实 FAL 生产消费者是 `user/services/srv_fs`：`srv_init` 以空 grants 启动它；`srv_fs::Fs` 同时拥有 provider sender、同步 `Caller` 和 worker，在同一进程中把自有 MailboxSender 当作 `PrefixTable` 根 anchor。
+- 客户端路径为 `libfs::resolve` → `Fs::call` → `librpc::Caller` → Mailbox/Delivery → `srv_fs::Ingress`/`RequestTask` → `Outbox` → `libfal::provider::serve` → `MemFs`，真实经过内核运输，但业务状态不跨进程、不经过 FAL authority。
+- v1 provider 只校验 slot 1 有一个 handle，随后完全不解释 anchor；`MemFs` 从自身 root 行走，权限来自可由请求指定的节点属性，`property_write` 忽略授权上下文。`Move/Copy/Open` 仍返回 `Unsupported`，客户端没有 Delete/长生命周期业务消费者。
+- `libfs` 的 `PrefixTable` 持裸 `Handle`，`Delegate` 只有 host mock 产生；`srv_init` 没有 namespace/FAL 装配，启动 grant 没有交付 FAL endpoint。
 
-F0 的完成标准是：当前 v1/v2 类型图、authority/owner 图、状态机和依赖图均有代码落点；未知项已经裁决或成为唯一阻塞条目；首个实现闭包的真实消费者与完整退款路径明确。完成前只允许只读调查和必要的文档校正，不把 host 编译通过当成后端交付。
+#### 2. v2 类型图与实际接线
 
-预期自然顺序如下；F0 可按代码证据合并强耦合项，但不得按文件拆分：
+- `NodeStore`/`MemoryBackend`/`Data`/`StoredValue`/`PreparedMutation` 构成自洽的 v2 后端积木：NodeRef 的 pin 与目录 link 分账，准备事务预付 slot/Charge，commit 无分配，冲突原样返还 mutation，旧属性/流块/目录项由结果或退休路径承担，最后引用通过 `Wake` 发布退休工作。
+- `AccessSnapshot` 的唯一构造点是 `GrantTable::snapshot`；`MemoryBackend` 的 lookup、create/delete/write/property/move 全部要求该 snapshot。由此授权不是 F1 之后可随意接入的旁路，而是后端类型闭包的一部分。
+- `GrantTable` 绑定实际 provider Mailbox identity，发行 sender/Lifetime、登记 CLOSED 观察并按 sender koid 查表；但它借用 `WaitSet`，而正式 `Runtime` 独占并关闭自己的 WaitSet。首个 provider 必须由同一个服务状态拥有者协调 GrantTable、Runtime、backend 和 retire wake，不能把 GrantTable 作为独立全局对象拼接。
+- `protocol.rs` 只有 FAL2 request/header decode 与少量字段校验，没有 response 编码、client 构造、provider trait 或生产引用；`authority.rs`、`grant.rs`、`backend.rs`、`store.rs`、`data.rs`、`value.rs`、`resource.rs` 均没有生产消费者。
+
+#### 3. owner/authority 与失败责任
+
+- 未提交阶段：PreparedNode、PreparedMutation、PreparedWrite、StoredValue、GrantState 持有全部节点 pin、目录/块 slot、Account Charge、能力 owner；准备失败或冲突必须原样返还事务/输入 owner，不能只返回错误码。
+- 已提交阶段：目录替换、属性替换、流块替换和节点摘链分别产生旧值/退休责任；回复失败只能形成 `OutboxResult::Abandoned`，不能伪造业务回滚。后端退休由显式任务推进，`Wake` 只负责唤醒，不能依赖下一次业务请求。
+- 服务退出必须先停止准入，再停止/取消请求，收束 GrantTable、backend retire queue、Delivery、回复授权和 WaitSet，最后关闭 owner 并确认全部账户退款。当前 v2 积木的非空 Drop 只记录 `abandoned_*` 计数，且 `NotificationWake` 没有生产构造点，因此这些路径在 F1 必须由真实 provider 接通并补证。
+- F0 验证缺口已登记：v2 `backend/data/value/grant/protocol` 没有模块测试，只有 `store` 的三项 host 测试；不能用现有 host 编译或 v1 QEMU 通过冒充 v2 后端交付。
+
+#### 4. 依赖裁决与新自然序
+
+F0 裁决不再把“后端”与“授权/执行/协议”拆成可独立验收的文件任务：
 
 ```text
-F0 重新基线审计
-  → F1 后端准备/取消/退休 owner（首个实现闭包）
-  → F2 授权域 + namespace/Delegate + FAL2 provider/client 共同迁移
-  → F3 Open/Watch/注册/Move/Copy 等长生命周期业务
-  → F4 独立 provider/client 装配、旧 v1 删除与整体组合验收
+F0 重新基线审计（已完成）
+  → F1 单 provider 闭包：服务状态拥有者 + Runtime/WaitSet + GrantTable + FAL2 response/client/provider 接缝 + MemoryBackend/NodeStore/Data/Value
+  → F2 两个独立 provider/client：DirectoryGrant、namespace/Delegate、真实启动能力图与跨 provider 路由
+  → F3 长生命周期业务：Open/Attach/Start/EOF/Finish、Watch、服务注册/发现、同域 Move、普通 Copy
+  → F4 删除 FAL1 临时 anchor/无鉴权 MemFs/同进程泵，独立 test_fal 与组合验收
 ```
 
-F1 默认边界是让一个真实 provider 纵向消费 NodeStore、PreparedMutation、payload retirement、显式 wake 和账户退款；若 F0 证明 Grant 或 codec 是其类型闭包不可分割的一部分，则在同一计划中合并迁移。不得以现有 `srv_fs` v1 `MemFs`/同进程装配充当 F1 消费者。
+F1 的唯一真实消费者是一个正式 provider 运行体及其最小 client；不得以 `srv_fs` v1 `MemFs`、同进程 self-pump、slot-1 anchor 或仅 host mock 充当 F1 消费者。F1 必须同时证明：授权快照可取得且不能伪造、后端五类 mutation 的准备/取消/冲突/提交/旧值退休、服务任务的公平推进与显式 wake、期限/调用者退出/服务退出、Delivery/Outbox 交付以及 Account/metadata 退款。
 
-下面条目是此前混合工作树的定位材料，不是当前实现或交付保证；F0 必须逐条以实际代码确认、修正或删除：
+F0 完成标准已满足：当前 v1/v2 调用图、authority/owner 图、状态与责任边界均有源码落点；旧计划中“先单独实现后端、再接授权”的错误前提已删除；未知项均转为 F1 的明确接缝或后续唯一阻塞项。完成 F0 不代表 F1 已开工，也不代表 FAL 业务已交付。
+
+下面条目是 F0 审计前混合工作树的定位材料；与上面结论冲突时以上面的当前源码审计为准。后续 F1 只取实际代码事实，不把这些历史盘点或局部源码存在当作完成证据：
 
 - `shared/erhino_shared/src/time.rs` 已写入 Deadline、ClockSnapshot、ClockGeometry 和换算测试；`kernel/clock.rs` 接入单一时钟来源，调度量子与启动期限不再截断频率。
 - shared/kernel/rinlib 的绝对 WaitMany/Sleep/Send 已开始纵向迁移；同步 Caller 与异步 Dispatcher 已写入同一 deadline、Unsent/Sent 错误阶段和未发送 Request/能力归还，尚未形成编译与组合证据。
@@ -133,7 +152,7 @@ F1 默认边界是让一个真实 provider 纵向消费 NodeStore、PreparedMuta
 | 4 长生命周期业务 | Open offer/Attach/Start/EOF/Finish、Watch、注册/发现、同域 Move 与客户端 Copy | 全部 terminal/retire、部分进度、取消、静默退出与旧实例竞态闭合；不在 handler 中等待。 |
 | 5 整体组合收口 | 两个 provider、独立 test_fal 与 init 能力图的组合验证 | 各机制的真实装配、消费者迁移与旧路径删除须在各自闭包完成；本段集中执行第 14 节跨机制组合门并核对完整交付。 |
 
-以上是总体能力导航；当前实施顺序由顶部依赖图及各唯一 todo 拥有。FAL 后端先收束 PreparedMutation 的准备/取消/旧值退休责任、稳定节点及值 owner；随后 grant/授权准入/provider/client 共同迁移；最后按 Open、Watch、注册和事务业务各自的完整语义推进。store/backend/value/grant 是源码位置，不直接作为交付任务。每轮登记真实责任链、前置证据与删除门，发现缺失前置先修订任务图。
+以上是总体能力导航；当前实施顺序由 F0 代码审计后的依赖图及各唯一 todo 拥有。F1 必须把 Runtime/WaitSet、GrantTable、FAL2 codec/provider/client 和后端 owner 作为一个单 provider 纵向闭包共同迁移；F2 再接独立 provider/client、namespace/Delegate 和真实启动能力图；F3 才进入 Open、Watch、注册/发现、Move/Copy 等长生命周期业务。store/backend/value/grant 仍是源码位置，不直接作为交付任务。每轮登记真实责任链、前置证据、失败/退出/退款路径和旧 v1 删除门，发现新前置先修订本计划。
 
 ## 2. 公共对象类型与所有权参考
 
@@ -402,9 +421,9 @@ create/delete/modify/rename 按位合并；另有 TERMINATED 位，原因通过�
 | B 身份/交付 | os/handle_table、kernel task/{object,handle,mailbox}，新增 lifetime/delivery；shared、rinlib | 全部 Mailbox 创建、duplicate、send-once、transit、ProcessGrant、Receive/Discard/Drain 迁移。 |
 | C 持久观察 | kernel task/{wait,object,notify_work}，WaitSet；trap/sched 安全点、ProcessDrain、rinlib | WaitMany 共用来源机制、通用通知/完成发布、普通 Close 内核退休与 ProcessDrain/异常退出；旧 Seal/Drain ABI 删除。 |
 | D 执行/协议基座 | librpc、libsrv、rinlib Tunnel、librunnel | 真正可组合等待、PEER_ATTACHED、outbox、账户、全部 owner/期限失败路径。 |
-| E 授权/后端 | libfal、libfs | NodeStore、GrantState、namespace、Delegate、位置竞态与严格 wire。 |
-| F 业务能力 | libsrv service backend、libfal/libfs | Record/Handle、注册/发现、Open、Watch、Move、Copy 及所有 terminal/retire。 |
-| G 真实装配 | srv_init、srv_fs、test_fal、现有服务/驱动/验收消费者 | 启动能力图、独立进程、全 ABI 迁移、旧泵/anchor 删除、整体组合验证。 |
+| E/F1 授权—后端—协议—执行 | `libfal`、`libfs`、`libsrv`、`librpc`、`rinlib` | 一个真实 provider 状态拥有者共同消费 GrantTable、AccessSnapshot、FAL2 wire、NodeStore/PreparedMutation、payload retire、显式 wake 与账户退款；不能拆成无消费者的后端或授权阶段。 |
+| F/F2–F3 业务与跨 provider | `libsrv` service backend、`libfal/libfs` | DirectoryGrant、namespace/Delegate、Record/Handle、注册/发现、Open、Watch、Move、Copy 及所有 terminal/retire；每项必须有真实 client/provider 消费者。 |
+| G/F4 真实装配 | `srv_init`、`srv_fs`、`test_fal`、现有服务/驱动/验收消费者 | 启动能力图、独立进程、全 ABI 迁移、旧泵/anchor 删除、两个独立 provider 与组合验证。 |
 
 方向文档已经描述最终契约；实施中只把真实落地事实同步到 impls，不能把本表状态提前写成已实现。代码提交前按项目要求展示摘要并取得 commit 授权；本计划不包含 commit 或 push 授权。
 

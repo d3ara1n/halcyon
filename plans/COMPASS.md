@@ -26,9 +26,9 @@
 
 公共时间、公共对象与公共操作所有权专题均已完成；时间提交 `c6e0a84`，公共操作提交 `8e0467a`，实现见 `notes/impls/{time,ipc,task}.md`，过程与最终验收见归档计划，固定提交审查见 [`todo-2026-09-18-public-operation-ownership-review.md`](todo-2026-09-18-public-operation-ownership-review.md)。
 
-**当前任务**：[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 **F0 重新基线审计**。运输与服务执行前置已完成：消息运输（`3060dd8`）、流运输（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；[公共操作所有权专题](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并通过 host、七面 clippy 与完整 acceptance。F0 只以当前源码重建 v1/v2 类型图、owner/authority 图和自然依赖，产出首个后端闭包的真实消费者、失败/退出/退款与旧路径删除门；完成前不直接续写旧草稿。实现现状入口为 `notes/impls/fal.md`。
+**当前任务**：[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 **F0 重新基线审计已完成**。代码事实确认当前唯一生产链仍是 `srv_fs` 的 FAL1 同进程自客户端/自 provider；`NodeStore`、`MemoryBackend`、`Data`、`StoredValue`、`GrantTable`、FAL2 codec 均无正式生产消费者。F0 已裁决不能把后端与授权/Runtime/协议拆成文件阶段：下一步是 F1 单 provider 授权—后端—协议—执行纵向闭包，必须共同接通真实 provider/client、Runtime/WaitSet、GrantTable、AccessSnapshot、后端准备/冲突/退休、显式 wake 与账户退款；完成前不删除 v1 路径、不以 v1 QEMU 或 host 积木测试冒充 FAL2 交付。运输与服务执行前置（消息运输 `3060dd8`、流运输 `a2aabed`、通用执行与准入 `a3891b0`、RPC/Outbox `4e18e5e`）以及公共操作所有权 P0–P6 均已完成并通过既定验证。实现现状入口为 `notes/impls/fal.md`。
 
-串行前置已全部完成：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) → [内核等待/请求/退休结构收束](archived/todo-2026-09-14-public-operation-ownership.md)。自然顺序现进入 [FAL 后端/授权闭包 → 业务操作](todo-2026-09-fal-service-capabilities.md)；只有实际证据表明某个缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。
+串行前置已全部完成：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) → [内核等待/请求/退休结构收束](archived/todo-2026-09-14-public-operation-ownership.md)。自然顺序现进入 FAL F1 单 provider 授权—后端—协议—执行闭包 → F2 独立 provider/client 与 namespace/Delegate → F3 Open/Watch/注册/Move/Copy → F4 旧 v1 删除与组合验收；只有实际证据表明缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。
 
 无消费者的 Runnel 观察草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`，随基线 `d22b9d7` 入库）已在流运输闭包中删除，已立案终态访问缺陷随之消失；原始 ABI 工厂同批删除，typed create/attach 成为唯一构造入口，init 创建侧已迁移；观察/登记/取消语义移入通用执行闭包，由 Runtime 首个真实消费者共同定形。Delivery 独立身份与 Peek 已在消息闭包裁决保留。共享包整理已作为独立小型任务开工：`shared/` 现组织为 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
 
@@ -42,7 +42,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-13-monotonic-time-rpc-deadline-review.md`](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 未来 Review：固定 `c6e0a84` 的公共时钟、绝对期限、运行期停止与真实消费者边界，不把跨 epoch/RPC/FAL 责任混入复核 |
 | [`todo-2026-09-frame-source-selftest-review.md`](todo-2026-09-frame-source-selftest-review.md) | 未来代码 Review：固定复核 `606b59d` 的库存来源、boot-held affine owner、完整清零、切分退款与 child 来源保活，不阻塞 FAL 主线 |
 | [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
-| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | 当前主线 F0：重建 v1/v2 类型与责任图，裁决首个后端准备/取消/退休闭包；完成前不进入实现 |
+| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | F0 重新基线审计已完成；当前下一阶段为 F1 单 provider 授权—后端—协议—执行闭包，整体 FAL 尚未交付 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
 | [`todo-2026-09-14-stream-transport-review.md`](todo-2026-09-14-stream-transport-review.md) | 未来 Review：固定复核 `a2aabed` 的观察草稿面删除、raw 工厂删除、srv_init typed 创建迁移与终态访问边界，不预审通用执行闭包的观察接入形态 |
