@@ -24,7 +24,7 @@
 
 ## 活跃计划
 
-公共时间、公共对象与公共操作所有权专题均已完成；时间提交 `c6e0a84`，实现见 `notes/impls/{time,ipc,task}.md`，公共操作过程与最终验收见归档计划。
+公共时间、公共对象与公共操作所有权专题均已完成；时间提交 `c6e0a84`，公共操作提交 `8e0467a`，实现见 `notes/impls/{time,ipc,task}.md`，过程与最终验收见归档计划，固定提交审查见 [`todo-2026-09-18-public-operation-ownership-review.md`](todo-2026-09-18-public-operation-ownership-review.md)。
 
 **当前任务**：[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 **F0 重新基线审计**。运输与服务执行前置已完成：消息运输（`3060dd8`）、流运输（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；[公共操作所有权专题](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并通过 host、七面 clippy 与完整 acceptance。F0 只以当前源码重建 v1/v2 类型图、owner/authority 图和自然依赖，产出首个后端闭包的真实消费者、失败/退出/退款与旧路径删除门；完成前不直接续写旧草稿。实现现状入口为 `notes/impls/fal.md`。
 
@@ -47,6 +47,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
 | [`todo-2026-09-14-stream-transport-review.md`](todo-2026-09-14-stream-transport-review.md) | 未来 Review：固定复核 `a2aabed` 的观察草稿面删除、raw 工厂删除、srv_init typed 创建迁移与终态访问边界，不预审通用执行闭包的观察接入形态 |
 | [`todo-2026-09-15-runtime-admission-review.md`](todo-2026-09-15-runtime-admission-review.md) | 整体固定提交 Review：`a3891b0` → `5de2780` → `e0b5c45` → `4e18e5e`，覆盖 Runtime/Job 分页/Active 停止、RPC/Outbox、真实消费者与组合验证 |
+| [`todo-2026-09-18-public-operation-ownership-review.md`](todo-2026-09-18-public-operation-ownership-review.md) | 未来 Review：固定复核 `8e0467a` 的工作债务账本、请求代次仲裁、Process 退休交棒、两组四类公平预算及组合验证，不扩大到后续 FAL 实现 |
 | [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 消息运输、流运输/Runnel、通用执行/准入与 RPC/Outbox 均已完成；保留闭包交付和固定提交 Review，不再拥有下一项用户态执行施工 |
 | [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
 | [`todo-2026-09-14-kernel-memory-budget.md`](todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |
