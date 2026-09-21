@@ -62,7 +62,22 @@ provider-local Watch 表固定上限 8；表以单调 subscription id 寻址，�
 
 Unsubscribe 先从发布表摘除并清空尚未 signal 的 pending 位，再唤醒任务撤销 source，回复确认后不再产生新事件；Notification owner 静默关闭走同一退休路径。Subscribe 回复 abandoned 会由服务端主动摘表、撤源和退款，不依赖客户端最终关闭；provider 停止时先合并并 signal `TERMINATED`，随后撤源关闭 signaler。`srv_init` 在两个独立 provider 上验证目录 CREATE、节点 MODIFY、代次推进、外来 grant context 拒绝、显式取消后静默、owner 静默消散、节点删除终态、provider 停止终态与最终 Watch/WaitSource 退款。
 
-当前接力位置为 F3d 服务注册/发现。注册表、`ServiceRecord` 和 `RegistrationControl` 尚未实现，第 8 节计划内容需结合当前启动/路由装配完成任务规模审计与设计裁决；现有 route-management endpoint 只拥有跨 provider 路由绑定，不能视为注册权威。公共记账与执行已分别收口到 `libbudget`、`libexecution`；未来服务领域库的正式名称是 `libservice`，但只在 F3d 有真实发布/发现消费者时建立。库重排已由 `96ee03b` 提交并归档，F3d 现从规模审计恢复。
+## 剩余能力的代码基线
+
+FAL 总计划第 4/8 节已完成跨阶段边界及 F3d 详细设计，下一步为实施；本轮没有新增运行代码。注册表、`ServiceRecord`、`RegistrationControl`、`libservice` 及通用 provider/Registry 后端均尚不存在，不能把设计完成记成服务发现已交付。F3e/F3f 仍需各自的局部详细设计。
+
+当前源码对 F3d 的约束：
+
+- `srv_fs::World`、`lookup_v2`、`node_info_v2`、`serve_v2` 和 Watch 安装复查直接消费 `MemoryBackend/Body`；`progress_dispatch` 的结果路由面向 Delegate。当前每个进程只有一个 FAL provider；设计中的同 Runtime 双 provider 尚未接入。
+- `NodeRef` 只保持稳定身份及 pin，`NodeStore::get_mut` 仍能改变 payload，不提供不可变属性快照。现有同步 Read 不能直接延长为跨下游 RPC 的借用。
+- `StoredValue::prepare` 可以接收 Directory 标签及政策，但 `duplicate_for_reply` 与 affine Take 的 Directory 出口返回 Unsupported；目标 provider 的 `GrantTable::prepare_derive` 与正式 Delegate 已存在。标签并不验证目标 FAL 协议；设计所需通用异步 Record 派生尚未接通。
+- `GrantTable::prepare_derive` 继承父账户/运输政策；当前 route Delegate 的权限计算为路径 grant 与绑定 ceiling 交集。这是路径语义，尚无服务 Record 的独立出口权限计算。
+- `Issuance::output_transport` 已存入 GrantState 并随 Derive 继承，但未进入 AccessSnapshot；`output_rights` 无实际调用者，Record Read/Take 未执行该运输上限。F3d 总计划单列其接通责任；现状不宣称影子政策已经生效。
+- `watch::Table`/WakeSet 上限为 8；effects 最多 3 个节点，publish 同步写 pending/generation 后返回需唤醒 task。`publish_watch_events` 逐个调用 `Requests::wake`；Runtime 单次 Requests 容量为 16，没有一条批量唤醒原语。可配置准入和持有剩余责任的 WakeBatch 尚未实现。
+- `server::run` 当前配置 Task=32、Source=64、Node=64、Bytes=2 MiB、Grant=16、Watch=8、FAL WaitSource=48；InputBytes 从 Runtime 推导。唯一 Account 绑定执行/FAL 两个 view，服务 view 尚不存在。FAL Request/Outbox/Offer/Stream 的零槽当前不计费，不能把它们说成已预付独立额度。
+- 停止时 seal GrantTable/Runtime，`shutdown_turn` 逐任务交付 stop；任务驱动 Outbox、撤源及退休，Drained 后关闭 Runtime、授权表与 route owner，并断言账户退款。新增 Registry/出口责任尚不在这条实际收束链中。
+
+当前 `srv_init` 仍从两个 srv_fs 的 bootstrap 分别接收 root，route-management 仅拥有跨 provider 路由绑定。设计中的 A 目录承载、B StartupBlock 名称授权/主动发布、init 先订阅后发现及真实调用尚未迁移；旧启动链的删除条件与顺序由唯一总计划拥有。公共记账/执行和库重排基线仍为 `96ee03b`，不因本次设计重开。
 
 
 ## F1 接手边界
@@ -82,4 +97,4 @@ F1 的唯一真实消费者是正式 provider 运行体及其最小 client。不
 
 F1 的目标类型图已进一步冻结：`libexecution::Runtime` 是 WaitSet 的唯一登记/接收/关闭 owner；grant Lifetime 由正式 Runtime task 观察，GrantTable 不再直接借用 WaitSet；backend retire 由预先登记的 Notification source 显式唤醒。provider-local 根 DirectoryGrant 与基础操作最小 client 已建立。执行与 FAL 领域分别使用 `ExecutionResource`、`FalResource`，并通过同一 `libbudget::Account` 的两个 view 共享付款来源而不混合分类。
 
-F2 接通独立 provider/client、namespace/Delegate、真实启动能力图和跨 provider 路由，并在最后一个旧消费者迁移时删除 v1 临时 anchor、无鉴权 MemFs 与同进程旧泵；F3a–F3c 已依次接通公开 Move、Record/Handle/Take、属性 Copy 与 Watch。下一闭包为 F3d 注册/发现，之后才是 F3e Open、F3f 流 Copy；F4 只建立独立 `test_fal`、完成组合验收与归档。
+F2 接通独立 provider/client、namespace/Delegate、真实启动能力图，并在最后一个旧消费者迁移时删除 v1 临时 anchor、无鉴权 MemFs 与同进程旧泵；F3a–F3c 已依次接通公开 Move、Record/Handle/Take、属性 Copy 与 Watch。剩余设计与任务顺序由 FAL 总计划唯一拥有；F4 只建立独立 `test_fal`、完成组合验收与归档，不承接尚未完成的生产 owner 或失败路径。

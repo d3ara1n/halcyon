@@ -21,6 +21,10 @@ DirectoryGrant 是对 provider 内一个稳定目录及操作上限的 capabilit
 - DirectoryGrant 必须由目标 provider 实际派生满足上限的发送授权；只裁剪内核 WRITE 等位无法收窄 FAL 权限。
 - 其他协议的 endpoint 使用发布者明确给出的导出授权。FAL 不能猜测该协议的 badge 含义；需要按调用者进一步衰减时，调用目标协议显式提供的派生操作。
 
+DirectoryGrant 属性出口与路径 Delegate 共享目标派生机制，但不共享权限计算：路径委派保持来访路径权限与 route ceiling 的交集；属性出口先在存储域验证 ReadProperty/AcquireCapability，再按该字段的出口 ceiling 向目标域派生。存储域的只读权限不等于目标域只能读。派生返回的协议、目录类型、槽位及实际运输权利仍须验证，不能靠 Handle 标签证明。
+
+存储域授权还可限定导出 capability 的 TRANSIT/GRANT 转授方式，字段出口政策不得突破该运输上限；不满足时整个出口失败，不部分交付或伪改原属性。这一上限与目标能力的业务使用权分别校验，不能拿运输位掩码裁掉目标协议的操作权。Read 与 affine Take 遵守同一出口门。
+
 ## 走路与稳定位置
 
 客户端负责 namespace、符号链接和跨 provider 组合。provider 在当前根和权限范围内尽量行进，返回 Found、Delegate 或 SymbolicLinkBoundary。
@@ -41,15 +45,21 @@ Delegate 返回新的 DirectoryGrant、消费前缀与剩余后缀。中间 prov
 
 属性包含固定宽整数、浮点、字符串、字节集、Array、异构具名 Record 与 Handle 引用。整个属性值，包括其所有 capability 字段，是一个一致快照；写入是整值替换。嵌套值共享一个总字节、深度、元素和 Handle 预算，槽引用必须完整、唯一且符合本次消息结构。
 
+节点引用只保住身份，不自动冻结属性内容。需要异步导出 capability 的读取，必须先在后端的一次状态访问中取得完整内容与出口 owner，再释放后端借用并执行下游调用；不能等待期间按名字补读字段。成功派生的出口与完整回复由请求 owner 持有，部分失败、取消和回复放弃均关闭未交付能力，保留仍需退休的责任，不重新执行具有副作用的业务请求。
+
 重复读取的 Handle 属性持有具 DUPLICATE 与 TRANSIT 的母本，按出口政策派生后交付。affine 值只能通过显式 Take 消费：回复成功入箱是取走的提交点，投递前失败恢复原值，不能先清空再尝试发送。属性预留期间的并发操作返回忙或等待该预留完成。
 
 写入带 Handle 的属性先完整验证与预留，再原子替换旧值。请求尚未投递时能力仍归调用者；已投递之后由接收方承担接受、返还或关闭责任，回复丢失不意味着能力还在调用者本地。
 
 硬链接不进入通用协议；去重与 COW 可以由 provider 内部实现。Move 只承诺同 provider、同存储事务域内的原子移动，分别核验源 Remove 和目标 Create，跨域返回 CrossDevice。Copy 的基本承诺是普通流和不携带能力的数据属性复制；跨 provider 流复制由客户端编排，失败允许部分目标，不隐含 copy+delete 或原子替换。
 
+流 Copy 的成功需要源与目标的业务最终结果均成功，不能以字节搬运结束替代。操作分别保留读取、传输和目标已确认接受的进度；一端失败时仍负责另一端的停止与退休，尚未确认的结果明确报告未知。部分目标的处理必须区分本次创建对象与同名替代者；没有身份和权限依据时不能以失败清理为由删除目标。
+
 ## 服务发现
 
 服务记录使用原子 Record，一次读取同时得到 instance、protocol/version、endpoint 和记录代次。服务发布、Ready/Draining、注册控制权和实例替换由 [service](service.md) 拥有。boot-critical 依赖仍直接 grant，不形成发现引导环。
+
+服务目录消费通用投影接口，不要求 FAL 理解服务状态。投影由服务注册权威控制，不能通过普通文件修改绕过；发现视图失效的事件与代次由其发布契约定义，不通过扩大通用 Watch 为递归事件系统来补偿。
 
 ## Watch
 
@@ -59,19 +69,23 @@ Delegate 返回新的 DirectoryGrant、消费前缀与剩余后缀。中间 prov
 
 事件位表示 create/delete/modify/rename，允许 OR 合并，不表达次数、顺序、名字或重放。订阅结束有独立终态位，原因可查询。Unsubscribe 验证 grant 与订阅身份的归属，确认后不再提交新信号；已 pending 的位不因此虚构为尚未发生。Notification owner 关闭结束订阅，provider 观察 CLOSED 后清理；客户端同时观察 provider 的关闭，不能只等自己的 Notification。
 
+提交产生的失效状态与后续任务唤醒是不同责任。通知待发送并不表示消费者已被唤醒；发布者须持有预付的剩余唤醒责任，按执行预算推进，不能因为一次批量唤醒装不下就丢失尾部。取消只影响相应订阅，provider 停止则由统一退出路径接管尚未兑现的发布责任。
+
 订阅只覆盖本 provider 中已授权的节点或目录直接成员，不隐含跨 provider 或递归 Watch。可重放、高频、带负载或递归事件系统属于独立能力。
 
 ## Open 与流完成
 
-Open 为现有流节点建立单工连接，声明 Read 或 Write、offset、范围约束、协议和几何请求；不隐含 append、truncate、创建或原子文件替换。provider 预留配额、取得节点引用、建立 Tunnel，回复 Invitation、StreamControl、协商几何和 offer 期限。
+Open 为现有流节点建立单工连接，声明 Read 或 Write、offset、范围约束、协议和几何请求；不隐含 append、truncate、创建或原子文件替换。文件位置、范围终点和业务进度的算术溢出必须明确拒绝，不能因回绕而解释成另一个有效范围。provider 预留配额、取得节点引用、建立 Tunnel，回复 Invitation、StreamControl、协商几何和 offer 期限。
 
 客户端 Attach 并验证 Runnel 后，通过 StreamControl 提交 Start。provider 必须确认对端已实际 Attach，且 offer 尚未到期，才允许数据任务开始。Open、Attach、验证和 Start 消费同一客户端连接期限；offer 还受 provider 的独立有限期限约束。
 
 Read 时 provider 是 Producer，Write 时 provider 是 Consumer。非阻塞数据任务受公平工作预算驱动，背压只挂起该流。普通读取不默认承诺快照，写入允许部分完成；Finish 成功表示后端接受了相应字节，不默认表示已经持久落盘。
 
+应用提交、共享环发布或消费、后端实际接受是不同进度。后端尚未接受的已取出字节必须仍有明确 owner，失败报告不能把传输进度冒充业务进度。已经打开的流保留稳定对象身份，名字移动或删除不把它重定向到替代者；非快照读取仍须由后端明确并发变化和范围终点的行为。
+
 控制状态为 Preparing → Offered → Active → Terminal → Retiring。StreamControl 提供 Query、Finish 与 Cancel：Query 立即给出状态，Finish 等待并返回稳定的业务最终结果，Cancel 返回取消结果和已确定的部分进度。流引用在 terminal 和清理期间仍有唯一 owner。
 
-Runnel EOF 只表示数据阶段结束，PEER_CLOSED 不表示成功。读流在确认 EOF 和全部字节消费后取得最终结果；写流在发布 EOF 后等待 provider 消费并完成后端工作。普通客户端读到正常 EOF 必须已经确认业务成功；写入方法返回的共享环进度不能冒充 Finish。
+Runnel EOF 只表示数据阶段结束，PEER_CLOSED 不表示成功；业务最终状态与后端错误通过流控制协议返回，不写入 Runnel 共享头。读流在确认 EOF 和全部字节消费后取得最终结果；写流在发布 EOF 后等待 provider 消费并完成后端工作。普通客户端读到正常 EOF 必须已经确认业务成功；写入方法返回的共享环进度不能冒充 Finish。
 
 未 Attach、未 Start、回复投递失败、控制权消散、数据端关闭和服务退出都走同一条取消或退役路径。已有部分字节不能回滚为未发生；最终结果未确认前服务退出，调用者不能推断成功。Drop 只负责放弃和清理，不等于 Finish。
 
