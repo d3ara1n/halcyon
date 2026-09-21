@@ -62,7 +62,7 @@ provider-local Watch 表固定上限 8；表以单调 subscription id 寻址，�
 
 Unsubscribe 先从发布表摘除并清空尚未 signal 的 pending 位，再唤醒任务撤销 source，回复确认后不再产生新事件；Notification owner 静默关闭走同一退休路径。Subscribe 回复 abandoned 会由服务端主动摘表、撤源和退款，不依赖客户端最终关闭；provider 停止时先合并并 signal `TERMINATED`，随后撤源关闭 signaler。`srv_init` 在两个独立 provider 上验证目录 CREATE、节点 MODIFY、代次推进、外来 grant context 拒绝、显式取消后静默、owner 静默消散、节点删除终态、provider 停止终态与最终 Watch/WaitSource 退款。
 
-当前接力位置为 F3d 服务注册/发现。注册表、`ServiceRecord` 和 `RegistrationControl` 尚未实现，第 8 节计划内容需结合当前启动/路由装配完成任务规模审计与设计裁决；现有 route-management endpoint 只拥有跨 provider 路由绑定，不能视为注册权威。公共记账与执行已分别收口到 `libbudget`、`libexecution`；未来服务领域库的正式名称是 `libservice`，但只在 F3d 有真实发布/发现消费者时建立。当前工作树基于固定 FAL 基线 `2124413`，库重排闭包待提交后即可恢复 F3d。
+当前接力位置为 F3d 服务注册/发现。注册表、`ServiceRecord` 和 `RegistrationControl` 尚未实现，第 8 节计划内容需结合当前启动/路由装配完成任务规模审计与设计裁决；现有 route-management endpoint 只拥有跨 provider 路由绑定，不能视为注册权威。公共记账与执行已分别收口到 `libbudget`、`libexecution`；未来服务领域库的正式名称是 `libservice`，但只在 F3d 有真实发布/发现消费者时建立。库重排已由 `96ee03b` 提交并归档，F3d 现从规模审计恢复。
 
 
 ## F1 接手边界

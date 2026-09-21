@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核统一登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。本计划只保留各闭包交付记录。当前公共记账/执行与服务领域的知识归属、包依赖及目录迁移由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)唯一拥有，完成后恢复 FAL F3d；下文 libsrv 路径与旧包分工是交付基线，不作为保留领域倒置的依据。公共对象、时间与[公共操作所有权](archived/todo-2026-09-14-public-operation-ownership.md)均已交付，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。
+> 状态：消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核统一登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。公共记账/执行与服务领域的知识归属、包依赖及目录迁移已由[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)闭合；下文 libsrv 路径与旧包分工只记录交付基线。公共对象、时间与[公共操作所有权](archived/todo-2026-09-14-public-operation-ownership.md)均已交付，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。
 
 提交后的结构审视见[整体固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态、Runtime Wake、RPC/Outbox 和真实消费者边界的收敛建议；Runtime 清理、Job 单页收束、停止补证及 RPC/Outbox 已完成，固定提交序列统一由该 Review 承载。服务架构化不在范围内。
 
@@ -124,7 +124,7 @@ Receive/Delivery
 
 本任务接通 Packet/Delivery → Request/Task/Outbox → terminal → retire → refund。运输由 rinlib/Runnel 拥有；任务调度、观察注册寿命、任务唤醒与期限唤醒由执行核心拥有；RPC 路由及请求/回复责任由 librpc 拥有。执行核心不认识 FAL 节点、grant、Watch 或服务记录，也不依赖 RPC 的请求状态。
 
-库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；未来 `libservice` 消费 RPC/FAL 等领域能力，通用能力库不反向依赖它。具体包/类型图和既有消费者迁移由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)承担，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
+库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；未来 `libservice` 消费 RPC/FAL 等领域能力，通用能力库不反向依赖它。具体包/类型图和既有消费者迁移已由[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)闭合，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
 
 ## 可以先行的局部收口
 

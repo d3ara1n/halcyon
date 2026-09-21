@@ -37,4 +37,4 @@
 
 未来 reviewer 使用新上下文只读核对固定提交与其父提交，遵循 [Review 纪律](REVIEW.md)，不以当前分支后续迁移代码替代该快照。finding 给出位置、可达性、影响与违反的契约；若需要补证，明确区分缺少证据和已证实缺陷。
 
-库归属及依赖问题继续由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)唯一承接，FAL 尚未交付的业务由总计划承接；不为同一问题另起平行任务。其他实际 finding 的证据与修复/复核入口集中登记，不直接修改代码。审查与复核完成后归档本计划；本文件的存在不表示已经执行 Review。
+库归属及依赖问题已由[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)闭合，其固定提交由[库重排 Review](todo-2026-09-21-library-knowledge-ownership-review.md)审查；不得用后续结构反推本计划固定的旧快照无问题。FAL 尚未交付的业务由总计划承接，其他实际 finding 的证据与修复/复核入口集中登记，不直接修改代码。审查与复核完成后归档本计划；本文件的存在不表示已经执行 Review。

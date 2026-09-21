@@ -1,11 +1,11 @@
 # 用户态库知识归属、依赖与目录重排
 
-> 状态：L0–L5 已完成，代码、文档、命名、结构 Review 与组合验证均已收口；等待用户授权提交，提交后归档本计划并登记固定提交 Review。用户态共同命名规则见 [`user/README.md`](../user/README.md)，库领域与依赖规则见 [`user/libraries/README.md`](../user/libraries/README.md)。FAL F3d 可在本专题提交后从规模审计恢复。
+> 状态：L0–L5 已完成并归档，实现提交为 `96ee03b0d1641c86ed8ab05951bad6954ea84db4`（`refactor(user): 重排用户态库归属与命名`），父提交为 `2124413`。代码、文档、命名、结构 Review 与组合验证均已收口；固定提交审查见 [`library-knowledge-ownership-review`](../todo-2026-09-21-library-knowledge-ownership-review.md)。用户态共同命名规则见 [`user/README.md`](../../user/README.md)，库领域与依赖规则见 [`user/libraries/README.md`](../../user/libraries/README.md)。
 
 ## 接手基线与任务边界
 
-- 基线分支 `task/fal-service-capabilities`，固定代码提交 `dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`（父提交 `84eeed6`）；F1–F3c 的代码、文档、装配及本专题原则/计划已整体保存。未来固定提交审查见[基线 Review](todo-2026-09-21-fal-library-baseline-review.md)。接手保留基线之后的全部工作树变化，不通过回退或重建 checkout 丢弃迁移成果。
-- 接手先读本计划、[COMPASS](COMPASS.md)、[FAL 交接](todo-2026-09-fal-service-capabilities.md#跨会话接力断点)，按 AGENTS 的标准施工流程核对当前工作树和验证证据。
+- 基线分支 `task/fal-service-capabilities`，固定代码提交 `dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`（父提交 `84eeed6`）；F1–F3c 的代码、文档、装配及本专题原则/计划已整体保存。固定该基线的未来审查见[基线 Review](../todo-2026-09-21-fal-library-baseline-review.md)。接手期间保留基线之后的全部工作树变化，未通过回退或重建 checkout 丢弃迁移成果。
+- 接手入口曾为本计划、[COMPASS](../COMPASS.md) 与 [FAL 交接](../todo-2026-09-fal-service-capabilities.md#跨会话接力断点)；本计划归档后不再拥有新施工。
 - 本计划拥有现有库的知识归属、类型与依赖图、全部真实消费者迁移、目录迁移、用户态 crate/binary 命名规则和相应文档收口。FAL 总计划继续拥有 F3d–F4 的业务实现与整体验收，执行前置计划保留既有机制的交付事实，不重复安排本任务。
 - 不在本任务中实现服务注册/发现、Open、流 Copy 或新服务拓扑；不因库分层新增内核服务类型或权限等级。尚未实施的服务框架能力保留其领域归属与接缝，具体消费者随 F3d 设计，不用空 facade 或伪消费者宣称交付。
 - 组件命名按 `user/README.md` 的统一规则：单个普通领域词使用完整名称，多词领域使用公认缩写或正式专名；`srv_`、`drv_`、`test_` 只作为二进制角色前缀。讨论中的 `libproc`、`libsrv`、`libdrv` 不构成保留或新建这些缩写库名的理由。
@@ -133,4 +133,4 @@ L0–L5 已完成。`user/README.md` 现作为用户态总体入口，本轮只�
 
 L5 验证通过：Cargo metadata 列表无 `libdrv`，`user/Cargo.lock` 无残留 package，代码/构建入口无 `libraries/libdrv`、`name = "libdrv"` 或 `libdrv =`；九份受影响 Markdown 的本地链接检查通过，`git diff --check`、`just check`、七面 `just clippy` 和默认 50% `just virt` 通过，退出后无残留 QEMU。L5 未修改任何运行机制源码，只删除空 crate/空依赖并更新文档与构建枚举，因此 L4 的同工作树完整 `THROTTLE=100 just acceptance` 证据继续有效，不重复运行平台与 boot-failure 聚合。
 
-当前唯一后续是取得提交授权；提交后将本计划移入 `plans/archived/`，更新 `COMPASS` 为 F3d 当前任务，并生成记录该提交哈希的未来 Review 计划。F3d 从 [`FAL 整体计划`](todo-2026-09-fal-service-capabilities.md) 第 8 节的任务规模审计继续，不提前建立空 `libservice` 或预设 provider trait。
+本专题已提交并归档。后续由 [`FAL 整体计划`](../todo-2026-09-fal-service-capabilities.md) 从第 8 节的 F3d 服务注册/发现任务规模审计继续；未来 `libservice` 只随真实发布者与发现消费者建立，不提前创建空 crate 或预设 provider trait。

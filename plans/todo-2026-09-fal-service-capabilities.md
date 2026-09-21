@@ -1,6 +1,6 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：公共前置及 F0–F2 已完成。F2 已交付两个独立 provider、严格 FAL2 wire/client、DirectoryGrant Namespace、真实跨 provider Delegate、独立 route-management endpoint、在途下游调用与 provider 停止/Outbox abandoned 责任，并删除 FAL1、`MemFs`、slot-1 anchor 和同进程泵。F3a 同域 Move、F3b Record/Handle/Take 与属性 Copy、F3c Watch 已到代码实施、审查修复和 core 组合门。库知识/目录/命名重排 L0–L5 已收口，F3d 服务注册/发现等待该前置提交后重新审计；新前置不改写既有机制证据。整体 FAL 仍未交付，F4 负责独立 `test_fal` 与最终组合验收。ProcessDrain 的管理者职责与 REAPABLE 触发保持现有契约。
+> 状态：公共前置及 F0–F2 已完成。F2 已交付两个独立 provider、严格 FAL2 wire/client、DirectoryGrant Namespace、真实跨 provider Delegate、独立 route-management endpoint、在途下游调用与 provider 停止/Outbox abandoned 责任，并删除 FAL1、`MemFs`、slot-1 anchor 和同进程泵。F3a 同域 Move、F3b Record/Handle/Take 与属性 Copy、F3c Watch 已到代码实施、审查修复和 core 组合门。库知识/目录/命名重排已经 `96ee03b` 提交并归档；当前从第 8 节恢复 F3d 服务注册/发现的规模审计与设计闭包。整体 FAL 仍未交付，F4 负责独立 `test_fal` 与最终组合验收。ProcessDrain 的管理者职责与 REAPABLE 触发保持现有契约。
 >
 > 方向参考：`notes/ideas/{object,message,wait,time,rpc,framework,fal,fs,service,tunnel,runnel}.md`。本文件拥有 FAL 业务与总体依赖/交付导航；公共对象/观察/退休由 [公共前置计划](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) 拥有，时钟/绝对期限由 [期限计划](archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有，运输/RPC/服务执行由 [执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md) 拥有。计划审视由实施者负责，代码 reviewer 只审查代码；提交后登记未来代码 Review。
 
@@ -10,7 +10,7 @@
 
 - 开发分支：`task/fal-service-capabilities`，由本地 `master` 的 `5d406a4` 分出；F1–F3c 的代码、文档、验收装配与库重排原则已整体固定为 `dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`，父提交为 `84eeed6`（F0 文档重排）。固定提交审查见[基线 Review](todo-2026-09-21-fal-library-baseline-review.md)，该提交不表示整体 FAL 完成交付。
 - 交接入口：先读 `plans/COMPASS.md`、本节和对应专题计划；实现现状看 `notes/impls/`，目标契约看 `notes/ideas/`。会话内任务编号只作临时导航，不能写入项目语义，计划文件是跨会话真值。
-- 开发方式：F0 形成文档基线；F1–F3c 的连续迁移以 `dfcf7a3` 整体保存。库重排 L0–L5 已完成，当前等待提交授权；提交后恢复 F3d，随后依次进入 F3e、F3f 与 F4。每项仍须包含真实调用者、失败/取消/退出/退休/退款、旧路径删除和验证，不以 passing fragment 标完成。保留基线之后的全部工作树变化；后续实现提交、合并与 push 仍须取得用户授权。
+- 开发方式：F0 形成文档基线；F1–F3c 的连续迁移以 `dfcf7a3` 整体保存，库重排 L0–L5 以 `96ee03b` 提交并归档。当前从 F3d 规模审计开始，随后依次进入 F3e、F3f 与 F4。每项仍须包含真实调用者、失败/取消/退出/退休/退款、旧路径删除和验证，不以 passing fragment 标完成。保留基线之后的全部工作树变化；后续实现提交、合并与 push 仍须取得用户授权。
 
 | 专题 | 交接状态 | 接手入口与剩余责任 |
 |---|---|---|
@@ -18,8 +18,8 @@
 | 公共时间与绝对期限前置 | 已完成并归档 | `archived/todo-2026-09-monotonic-time-rpc-deadline.md` 与 `notes/impls/time.md`；完整期限与运行期协作停止已接通，跨硬件 epoch 连续时间按唯一延后项保留 |
 | 运输/执行前置 | 消息与流运输、通用执行/准入及 RPC/Outbox 均已提交并验证 | `todo-2026-09-13-service-runtime-prerequisites.md`；保留各闭包证据和固定提交 Review，不再安排新的用户态执行阶段 |
 | 公共操作边界收束 | P0–P6 完成，已归档 | `archived/todo-2026-09-14-public-operation-ownership.md`；两组四类公平性、跨 hart/退出/接管/退款和结构残留均已收口 |
-| 库知识归属、目录与命名 | L0–L5 已完成；等待提交授权 | [库重排计划](todo-2026-09-21-library-knowledge-ownership.md)；公共记账/执行、目录迁移、用户态组件命名、空 `libdrv` 删除和未来 `libservice` / `libdriver` 名称均已收口 |
-| FAL 业务 | F0–F2、F3a–F3c 已到开发门；F3d 等待库重排提交 | 本计划继续拥有 Move、Record/Handle、Watch、注册发现、Open 与 Copy 的业务契约；F4 负责独立 test_fal 与整体组合验收，整体 FAL 尚未交付 |
+| 库知识归属、目录与命名 | 完成，已提交并归档 | [库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)；实现提交 `96ee03b`，固定提交审查见[未来 Review](todo-2026-09-21-library-knowledge-ownership-review.md) |
+| FAL 业务 | F0–F2、F3a–F3c 已到开发门；当前恢复 F3d | 第 8 节先审计真实发布者、发现消费者、注册权威、投影、Watch、预算与退出责任，再形成设计闭包；F4 负责独立 test_fal 与整体组合验收 |
 | 验收可靠性改进 | 首轮已收口，历史墙钟敏感现象只读归档 | `plans/archived/ref-2026-09-acceptance-timing-flake.md`；新现场命中归档触发条件时重新立案，不以重跑直到绿替代证据 |
 | workspace 包归属 | 已完成并归档 | `archived/todo-2026-09-13-workspace-package-ownership.md`；跨层 ABI 与 elf/tar/通用算法已统一组织进 shared workspace，算法语义未改 |
 
@@ -50,7 +50,7 @@ F1 已收口为单 provider 基础闭包。F2 在两个独立进程上补齐真�
   → F4 独立 test_fal 与整体组合验收
 ```
 
-消息与流运输、通用执行/准入和 RPC/Outbox 已分别完成实现、真实消费者迁移、失败/退出/退款验证并提交；[公共操作结构收束](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并归档。当前新增前置是已确认的库知识与依赖倒置，唯一承接见[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)，F3d 在其完成前暂停业务实施。该专题同时审视本计划中的包分工、资源分类及组合接口；本文既有代码路径用于基线定位，不构成保留错位归属的依据。每个后续闭包仍必须包含真实消费者、失败/退出及旧路径删除。
+消息与流运输、通用执行/准入和 RPC/Outbox 已分别完成实现、真实消费者迁移、失败/退出/退款验证并提交；[公共操作结构收束](archived/todo-2026-09-14-public-operation-ownership.md) 的 P0–P6 也已完成并归档。[库知识归属、依赖、目录与命名重排](archived/todo-2026-09-21-library-knowledge-ownership.md) 已由 `96ee03b` 闭合，新的知识归属、包分工、资源分类及组合接口成为 F3d 当前基线。每个后续闭包仍必须包含真实消费者、失败/退出及旧路径删除。
 
 本文下面保留的基线与代码连接点是审视材料，不是已完成证据。公共前置章节的旧 Seal/Drain 等候选已经被普通 Close/内核退休替代，旧 ABI 和用户维护编排已删除，不继续照旧施工或恢复兼容。
 
@@ -74,7 +74,7 @@ F1 已收口为单 provider 基础闭包。F2 在两个独立进程上补齐真�
 
 ## 当前施工位置
 
-公共对象、时间、运输/RPC/服务执行、共享包归属、公共操作 P0–P6 及 F0–F2 的机制基线保持。F3a 同域 Move、F3b Record/Handle/Take 与属性 Copy、F3c Watch 已到代码实施、定点审查修复和 core 组合门；当前先执行[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)的 L0–L4，再按新知识归属与依赖图恢复 F3d 规模审计。F2 的类型图、责任图、启动能力图与删除结果作为迁移基线；F3 后续每项仍按责任链闭合。
+公共对象、时间、运输/RPC/服务执行、共享包归属、公共操作 P0–P6、库知识/目录/命名重排及 F0–F2 的机制基线保持。F3a 同域 Move、F3b Record/Handle/Take 与属性 Copy、F3c Watch 已到代码实施、定点审查修复和 core 组合门；当前按新的 `libbudget` / `libexecution` / `libservice` 知识边界恢复 F3d 规模审计。F2 的类型图、责任图、启动能力图与删除结果作为迁移基线；F3 后续每项仍按责任链闭合。
 
 ### F3 规模审计与重排裁决
 
@@ -154,7 +154,7 @@ F3c 已发布严格 `Subscribe`、`QuerySubscription`、`Unsubscribe` wire 与 `
 
 F3c 已完成的最近证据是：`just check`、RISC-V 全用户程序构建、`libfal` host 27 项、`libfs` host 17 项、七面 `just clippy`、`THROTTLE=100 just virt`、`THROTTLE=100 just virt-release` 与 `git diff --check`。未执行的是 F3/F4 收尾才要求的完整 stress、`sifive_u`、`virt-nofd`、boot-failure 和 `just acceptance`；下一会话不得把这些未跑门写成 F3c 缺陷，也不得把 core/release 通过冒充整体 FAL 验收。
 
-用户态库知识归属、目录迁移与组件命名已经完成实现、结构 Review 和组合验证；未来服务领域库的正式名称为 `libservice`，但 F3d 不预建空 crate。库重排提交后，F3d 从规模审计恢复。第 8 节仍是方向草稿：读取 `notes/ideas/service.md`、`user/README.md`、`user/libraries/README.md`、`notes/impls/fal.md` 和当前 `srv_init`/`srv_fs` 启动与 route 装配，盘点首个真实发布者、发现消费者、ServiceRecord capability 槽、RegistrationControl owner、Ready/Draining/撤销状态、旧实例竞态、Watch 组合、预算与退出退款；确认这些责任链后再更新本计划的 F3d 设计闭包并实施。不得预设 `libservice` 已有注册表、不得把 route-management endpoint 直接改名充当注册权威，也不得提前建立无真实消费者的全局 registry。
+用户态库知识归属、目录迁移与组件命名已经由 `96ee03b` 完成并归档；未来服务领域库的正式名称为 `libservice`，但 F3d 不预建空 crate。当前从规模审计恢复。第 8 节仍是方向草稿：读取 `notes/ideas/service.md`、`user/README.md`、`user/libraries/README.md`、`notes/impls/fal.md` 和当前 `srv_init`/`srv_fs` 启动与 route 装配，盘点首个真实发布者、发现消费者、ServiceRecord capability 槽、RegistrationControl owner、Ready/Draining/撤销状态、旧实例竞态、Watch 组合、预算与退出退款；确认这些责任链后再更新本计划的 F3d 设计闭包并实施。不得预设 `libservice` 已有注册表、不得把 route-management endpoint 直接改名充当注册权威，也不得提前建立无真实消费者的全局 registry。
 
 ### F0 重新基线审计结论（已完成）
 
