@@ -757,6 +757,16 @@ impl RootSupervisor {
         Ok(count)
     }
 
+    pub(super) fn collect_process(&mut self, pid: u64) -> Result<(), &'static str> {
+        let index = self
+            .processes
+            .iter()
+            .position(|target| target.pid == pid)
+            .ok_or("supervised process is not in the root ledger")?;
+        let target = self.processes.swap_remove(index);
+        self.collect_one(target)
+    }
+
     /// 一台运行体被策略错误停驻时，另一台批次仍完成，并恢复原 Job 机器。
     pub(super) fn verify_failure_isolation(&mut self, parent: Handle) -> Result<(), &'static str> {
         let child = self

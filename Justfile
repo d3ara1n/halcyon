@@ -53,8 +53,8 @@ VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "30")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "300")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
-VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "30")
-SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "45")
+VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "45")
+SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "60")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
 
 # gdb

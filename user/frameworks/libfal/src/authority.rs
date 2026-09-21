@@ -1,8 +1,8 @@
 //! FAL 业务权限独立于内核运输 rights；授权快照固定已准入请求的操作上限。
 
+use crate::resource::FalResource;
 use crate::store::NodeRef;
 use alloc::sync::Arc;
-use crate::resource::FalResource;
 use libsrv::budget::Account;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,7 @@ impl core::ops::BitAnd for FalRights {
     }
 }
 
+#[derive(Clone)]
 pub struct AccessSnapshot {
     pub(crate) root: NodeRef,
     pub(crate) rights: FalRights,

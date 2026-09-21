@@ -1,15 +1,15 @@
 //! 内存后端的稳定名字事务；节点、名字、属性 owner 与流数据分别拥有资源。
 
+use crate::resource::FalResource;
 use crate::{
     authority::{AccessSnapshot, FalRights},
     data::{Data, PreparedWrite},
     node::NodeKind,
     store::{NodeId, NodeRef, NodeStore, Payload, PreparedNode, RetireContext, RetireProgress},
-    value::{Capability, StoredValue},
+    value::{Capability, StoredValue, TakenValue},
 };
 use alloc::{string::String, sync::Arc};
 use erhino_shared::call::SystemCallError;
-use crate::resource::FalResource;
 use libsrv::budget::{Account, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
@@ -53,6 +53,7 @@ pub struct MemoryNode<C> {
     rights: FalRights,
     version: u64,
     parent: Option<NodeId>,
+    take_reserved: bool,
 }
 
 impl<C> MemoryNode<C> {
@@ -72,6 +73,9 @@ impl<C> MemoryNode<C> {
     }
     pub fn body(&self) -> &Body<C> {
         &self.body
+    }
+    pub fn take_reserved(&self) -> bool {
+        self.take_reserved
     }
 }
 
@@ -150,6 +154,13 @@ pub struct PreparedMutation<C> {
     intent: Intent<C>,
 }
 
+pub struct PreparedTake<C> {
+    target: NodeRef,
+    version: u64,
+    next_version: u64,
+    value: Option<TakenValue<C>>,
+}
+
 enum Intent<C> {
     Move {
         source: NodeRef,
@@ -157,6 +168,8 @@ enum Intent<C> {
         target: NodeRef,
         source_version: u64,
         destination_version: u64,
+        target_version: u64,
+        target_next: u64,
         source_next: u64,
         destination_next: u64,
         source_name: String,
@@ -176,6 +189,8 @@ enum Intent<C> {
         version: u64,
         next_version: u64,
         target: NodeRef,
+        target_version: u64,
+        target_next: u64,
         name: String,
     },
     Write {
@@ -231,7 +246,7 @@ fn name(value: &str) -> Result<String, BackendError> {
     Ok(owned)
 }
 
-impl<C> MemoryBackend<C> {
+impl<C: Capability> MemoryBackend<C> {
     pub fn new(
         account: &Arc<Account<FalResource>>,
         limit: usize,
@@ -249,6 +264,7 @@ impl<C> MemoryBackend<C> {
             rights: FalRights::ALL,
             version: 1,
             parent: None,
+            take_reserved: false,
         };
         let (nodes, root) = NodeStore::new(root, account, limit, wake)
             .map_err(|failure| BackendError::Resource(failure.error))?;
@@ -309,6 +325,74 @@ impl<C> MemoryBackend<C> {
             .pin_linked(entry.node)
             .ok_or(BackendError::NotFound)
     }
+
+    pub fn enumerate<F>(
+        &self,
+        parent: &NodeRef,
+        access: &AccessSnapshot,
+        cursor: u64,
+        limit: usize,
+        mut visit: F,
+    ) -> Result<u64, BackendError>
+    where
+        F: FnMut(&str, &NodeRef, &MemoryNode<C>),
+    {
+        if limit == 0 {
+            return Err(BackendError::InvalidName);
+        }
+        let node = self.nodes.get(parent).ok_or(BackendError::NotFound)?;
+        if !access
+            .rights()
+            .intersect(node.rights)
+            .contains(FalRights::ENUMERATE)
+        {
+            return Err(BackendError::Permission);
+        }
+        let Body::Directory(directory) = &node.body else {
+            return Err(BackendError::NotDirectory);
+        };
+        let epoch = u32::try_from(self.epoch)
+            .map_err(|_| BackendError::Resource(SystemCallError::ReachLimit))?;
+        let ordinal = if cursor == 0 {
+            0
+        } else {
+            if (cursor >> 32) as u32 != epoch {
+                return Err(BackendError::Conflict);
+            }
+            usize::try_from(cursor as u32)
+                .map_err(|_| BackendError::Resource(SystemCallError::ReachLimit))?
+        };
+        let mut after = None;
+        let mut index = 0usize;
+        let mut emitted = 0usize;
+        while let Some((name, entry)) = directory.entries.next_after(after) {
+            after = Some(name.as_str());
+            if index < ordinal {
+                index += 1;
+                continue;
+            }
+            let reference = self
+                .nodes
+                .pin_linked(entry.node)
+                .ok_or(BackendError::NotFound)?;
+            let child = self.nodes.get(&reference).ok_or(BackendError::NotFound)?;
+            if child.take_reserved {
+                return Err(BackendError::Busy);
+            }
+            visit(name, &reference, child);
+            emitted += 1;
+            index += 1;
+            if emitted == limit {
+                let more = directory.entries.next_after(after).is_some();
+                return Ok(if more {
+                    ((epoch as u64) << 32) | index as u64
+                } else {
+                    0
+                });
+            }
+        }
+        Ok(0)
+    }
     fn parent(
         &self,
         position: &Position,
@@ -354,6 +438,13 @@ impl<C> MemoryBackend<C> {
                     .is_none_or(|node| node.version != version)
         }) {
             return Err(BackendError::Conflict);
+        }
+        if self
+            .nodes
+            .get(&target)
+            .is_some_and(|node| node.take_reserved)
+        {
+            return Err(BackendError::Busy);
         }
         Ok(target)
     }
@@ -424,6 +515,7 @@ impl<C> MemoryBackend<C> {
             rights,
             version: 1,
             parent: Some(position.parent.id()),
+            take_reserved: false,
         };
         let node = match self.nodes.prepare(payload, access.account()) {
             Ok(node) => node,
@@ -455,6 +547,11 @@ impl<C> MemoryBackend<C> {
     ) -> Result<PreparedMutation<C>, BackendError> {
         let parent = self.parent(&position, access, FalRights::REMOVE)?;
         let target = self.target(&position)?;
+        let target_node = self.nodes.get(&target).ok_or(BackendError::NotFound)?;
+        let target_version = target_node.version;
+        let target_next = target_version
+            .checked_add(1)
+            .ok_or(SystemCallError::ReachLimit)?;
         if let Body::Directory(directory) =
             &self.nodes.get(&target).ok_or(BackendError::NotFound)?.body
             && !directory.entries.is_empty()
@@ -476,6 +573,8 @@ impl<C> MemoryBackend<C> {
                     .ok_or(SystemCallError::ReachLimit)?,
                 target,
                 name: position.name,
+                target_version,
+                target_next,
             },
         })
     }
@@ -535,6 +634,9 @@ impl<C> MemoryBackend<C> {
             if !matches!(node.body, Body::Property(_)) {
                 return Err(BackendError::Permission);
             }
+            if node.take_reserved {
+                return Err(BackendError::Busy);
+            }
             Ok((
                 node.version,
                 node.version
@@ -558,6 +660,92 @@ impl<C> MemoryBackend<C> {
         })
     }
 
+    pub fn prepare_take(
+        &mut self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+    ) -> Result<PreparedTake<C>, BackendError> {
+        if self.nodes.is_sealed() {
+            return Err(BackendError::Closed);
+        }
+        let node = self.nodes.get_mut(&target).ok_or(BackendError::NotFound)?;
+        if node.take_reserved {
+            return Err(BackendError::Busy);
+        }
+        if !access
+            .rights()
+            .intersect(node.rights)
+            .contains(FalRights::READ_PROPERTY | FalRights::ACQUIRE_CAPABILITY)
+        {
+            return Err(BackendError::Permission);
+        }
+        let Body::Property(value) = &mut node.body else {
+            return Err(BackendError::Permission);
+        };
+        let next_version = node
+            .version
+            .checked_add(1)
+            .ok_or(SystemCallError::ReachLimit)?;
+        let mut empty = alloc::vec::Vec::new();
+        empty
+            .try_reserve_exact(crate::value::HEADER_LEN)
+            .map_err(|_| BackendError::Resource(SystemCallError::OutOfMemory))?;
+        let taken = value.take(empty).map_err(|error| match error {
+            crate::value::ValueError::Affine => BackendError::Permission,
+            crate::value::ValueError::Capability(error) => BackendError::Resource(error),
+            crate::value::ValueError::Allocation => {
+                BackendError::Resource(SystemCallError::OutOfMemory)
+            }
+            _ => BackendError::Conflict,
+        })?;
+        let version = node.version;
+        node.take_reserved = true;
+        Ok(PreparedTake {
+            target,
+            version,
+            next_version,
+            value: Some(taken),
+        })
+    }
+
+    pub fn take_value(prepared: &mut PreparedTake<C>) -> TakenValue<C> {
+        prepared.value.take().expect("take value already consumed")
+    }
+
+    pub fn commit_take(&mut self, prepared: PreparedTake<C>) {
+        let node = self
+            .nodes
+            .get_mut(&prepared.target)
+            .expect("reserved take node disappeared");
+        assert!(
+            node.take_reserved && node.version == prepared.version,
+            "reserved take state changed before commit"
+        );
+        let Body::Property(stored) = &mut node.body else {
+            panic!("reserved take property changed kind");
+        };
+        stored.commit_take();
+        node.take_reserved = false;
+        node.version = prepared.next_version;
+    }
+
+    pub fn rollback_take(&mut self, mut prepared: PreparedTake<C>, value: TakenValue<C>) {
+        let node = self
+            .nodes
+            .get_mut(&prepared.target)
+            .expect("reserved take node disappeared during rollback");
+        assert!(
+            node.take_reserved && node.version == prepared.version,
+            "reserved take state changed before rollback"
+        );
+        let Body::Property(stored) = &mut node.body else {
+            panic!("reserved take property changed kind");
+        };
+        stored.restore(value);
+        node.take_reserved = false;
+        prepared.value = None;
+    }
+
     pub fn prepare_move(
         &self,
         source: Position,
@@ -567,6 +755,11 @@ impl<C> MemoryBackend<C> {
     ) -> Result<PreparedMutation<C>, BackendError> {
         let source_parent = self.parent(&source, source_access, FalRights::REMOVE)?;
         let target = self.target(&source)?;
+        let target_node = self.nodes.get(&target).ok_or(BackendError::NotFound)?;
+        let target_version = target_node.version;
+        let target_next = target_version
+            .checked_add(1)
+            .ok_or(SystemCallError::ReachLimit)?;
         let destination_position = self.position(destination.root(), final_name, None)?;
         let destination_parent =
             self.parent(&destination_position, destination, FalRights::CREATE)?;
@@ -624,6 +817,8 @@ impl<C> MemoryBackend<C> {
                     .version
                     .checked_add(1)
                     .ok_or(SystemCallError::ReachLimit)?,
+                target_version,
+                target_next,
                 source_name: source.name,
                 entry,
                 ancestor,
@@ -687,9 +882,9 @@ impl<C> MemoryBackend<C> {
         mutation: PreparedMutation<C>,
     ) -> Result<CommitResult<C>, CommitFailure<C>> {
         let valid = !self.nodes.is_sealed() && self.epoch == mutation.epoch && match &mutation.intent {
-            Intent::Move { source, destination, target, source_version, destination_version, source_name, entry, checked, .. } => *checked && self.nodes.get(source).is_some_and(|node| node.version == *source_version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(source_name.as_str()).is_some_and(|entry| entry.node == target.id()))) && self.nodes.get(destination).is_some_and(|node| node.version == *destination_version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(entry.key_ref().as_str()).is_none())),
+            Intent::Move { source, destination, target, source_version, destination_version, target_version, source_name, entry, checked, .. } => *checked && self.nodes.get(target).is_some_and(|node| node.version == *target_version && !node.take_reserved) && self.nodes.get(source).is_some_and(|node| node.version == *source_version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(source_name.as_str()).is_some_and(|entry| entry.node == target.id()))) && self.nodes.get(destination).is_some_and(|node| node.version == *destination_version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(entry.key_ref().as_str()).is_none())),
             Intent::Create { parent, version, entry, .. } => self.nodes.get(parent).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(entry.key_ref().as_str()).is_none())),
-            Intent::Delete { parent, version, target, name, .. } => self.nodes.get(parent).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(name.as_str()).is_some_and(|entry| entry.node == target.id()))),
+            Intent::Delete { parent, version, target, target_version, name, .. } => self.nodes.get(parent).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(name.as_str()).is_some_and(|entry| entry.node == target.id()))) && self.nodes.get(target).is_some_and(|node| node.version == *target_version && !node.take_reserved),
             Intent::Write { target, version, data, .. } => self.nodes.get(target).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Stream(stream) if stream.validates(data))),
             Intent::Property { target, version, .. } => self.nodes.get(target).is_some_and(|node| node.version == *version && matches!(node.body, Body::Property(_))),
         };
@@ -708,6 +903,7 @@ impl<C> MemoryBackend<C> {
                 mut entry,
                 source_next,
                 destination_next,
+                target_next,
                 ..
             } => {
                 let source_node = self
@@ -732,10 +928,9 @@ impl<C> MemoryBackend<C> {
                 };
                 directory.entries.insert_prepared(entry);
                 destination_node.version = destination_next;
-                self.nodes
-                    .get_mut(&target)
-                    .expect("moved node disappeared")
-                    .parent = Some(destination.id());
+                let target_node = self.nodes.get_mut(&target).expect("moved node disappeared");
+                target_node.parent = Some(destination.id());
+                target_node.version = target_next;
                 CommitResult::Moved(target)
             }
             Intent::Create {
@@ -763,6 +958,7 @@ impl<C> MemoryBackend<C> {
                 target,
                 name,
                 next_version,
+                target_next,
                 ..
             } => {
                 let parent = self
@@ -775,10 +971,12 @@ impl<C> MemoryBackend<C> {
                 let _ = directory.entries.remove_by(name.as_str());
                 parent.version = next_version;
                 self.nodes.unlink(&target);
-                self.nodes
+                let target_node = self
+                    .nodes
                     .get_mut(&target)
-                    .expect("deleted node disappeared")
-                    .parent = None;
+                    .expect("deleted node disappeared");
+                target_node.parent = None;
+                target_node.version = target_next;
                 CommitResult::Deleted(target)
             }
             Intent::Write {
@@ -841,5 +1039,223 @@ impl<C: Capability> MemoryBackend<C> {
         } else {
             Err(self)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::Value;
+    use alloc::{rc::Rc, sync::Arc, vec::Vec};
+    use erhino_shared::{call::SystemCallError, object::HandleDescription, object::Rights};
+    use libsrv::{
+        budget::{Budget, Taxonomy},
+        wake::Wake,
+    };
+
+    #[derive(Clone)]
+    struct TestCapability;
+
+    impl Capability for TestCapability {
+        fn description(&self) -> Result<HandleDescription, SystemCallError> {
+            Ok(HandleDescription {
+                object_id: 1,
+                related_object_id: 1,
+                kind: 0,
+                role: erhino_shared::object::HandleRole::MailboxSender as u32,
+                rights: Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+                badge: 0,
+                reserved: 0,
+            })
+        }
+
+        fn duplicate(&self, _rights: Rights) -> Result<Self, SystemCallError> {
+            Ok(self.clone())
+        }
+
+        fn close(self) -> Result<(), (Self, SystemCallError)> {
+            Ok(())
+        }
+    }
+
+    struct TestWake;
+
+    impl Wake for TestWake {
+        fn publish(&self) {}
+    }
+
+    fn account() -> Arc<Account<FalResource>> {
+        let mut limits = [0; FalResource::COUNT];
+        limits[FalResource::Node.slot()] = 8;
+        limits[FalResource::Bytes.slot()] = 32 * 1024;
+        limits[FalResource::Grant.slot()] = 2;
+        limits[FalResource::WaitSource.slot()] = 2;
+        Budget::new(&limits, 1).unwrap().account(&limits).unwrap()
+    }
+
+    fn access(root: NodeRef, account: Arc<Account<FalResource>>) -> AccessSnapshot {
+        AccessSnapshot {
+            root,
+            rights: FalRights::ALL,
+            account,
+        }
+    }
+
+    #[test]
+    fn prepare_drop_refunds_node_and_conflict_preserves_state() {
+        let account = account();
+        let mut backend =
+            MemoryBackend::<TestCapability>::new(&account, 4, Rc::new(TestWake)).unwrap();
+        let root = backend.root().unwrap().clone();
+        let access = access(root.clone(), account.clone());
+
+        let mut encoded = [0; 32];
+        let encoded_len = Value::Integer(1)
+            .encode(&mut encoded)
+            .expect("test property encoding failed");
+        let bytes_before = account.usage(FalResource::Bytes).0;
+        let stored = StoredValue::<TestCapability>::prepare(
+            &encoded[..encoded_len],
+            Vec::new(),
+            1,
+            64,
+            &account,
+        )
+        .unwrap_or_else(|_| panic!("property value preparation failed"));
+        match backend.prepare_property(root.clone(), &access, stored) {
+            Err(failure) => {
+                assert_eq!(failure.error, BackendError::Permission);
+                drop(failure.value);
+            }
+            Ok(_) => panic!("directory accepted a property replacement"),
+        }
+        assert_eq!(account.usage(FalResource::Bytes).0, bytes_before);
+
+        let position = backend.position(&root, "pending", None).unwrap();
+        let prepared = backend
+            .prepare_create(position, &access, backend.directory_body(), FalRights::ALL)
+            .unwrap_or_else(|_| panic!("pending create preparation failed"));
+        assert_eq!(account.usage(FalResource::Node).0, 2);
+        drop(prepared);
+        assert_eq!(account.usage(FalResource::Node).0, 1);
+
+        let position = backend.position(&root, "child", None).unwrap();
+        let child = backend
+            .commit(
+                backend
+                    .prepare_create(position, &access, backend.directory_body(), FalRights::ALL)
+                    .unwrap_or_else(|_| panic!("child create preparation failed")),
+            )
+            .unwrap_or_else(|_| panic!("child create commit failed"));
+        let CommitResult::Created(child) = child else {
+            panic!("create did not return a node");
+        };
+        let wrong = NodeId::from_raw(child.id().raw() + 1).unwrap();
+        let position = backend.position(&root, "child", Some((wrong, 1))).unwrap();
+        assert!(matches!(
+            backend.prepare_delete(position, &access),
+            Err(BackendError::Conflict)
+        ));
+        assert!(backend.get(&child).is_some());
+        drop(child);
+
+        drop(access);
+        backend.seal();
+        drop(root);
+        while !backend.is_empty() {
+            backend.retire_step(1).unwrap();
+        }
+        assert!(backend.close().is_ok());
+        assert_eq!(account.usage(FalResource::Node).0, 0);
+    }
+
+    #[test]
+    fn move_commits_after_bounded_validation() {
+        let account = account();
+        let mut backend =
+            MemoryBackend::<TestCapability>::new(&account, 8, Rc::new(TestWake)).unwrap();
+        let root = backend.root().unwrap().clone();
+        let access = access(root.clone(), account.clone());
+        let mut encoded = [0; 32];
+        let encoded_len = Value::Integer(1)
+            .encode(&mut encoded)
+            .expect("move source value encoding failed");
+
+        let source = backend
+            .commit(
+                backend
+                    .prepare_create(
+                        backend.position(&root, "source", None).unwrap(),
+                        &access,
+                        Body::Property(
+                            StoredValue::prepare(
+                                &encoded[..encoded_len],
+                                Vec::new(),
+                                1,
+                                64,
+                                &account,
+                            )
+                            .unwrap_or_else(|_| panic!("source value preparation failed")),
+                        ),
+                        FalRights::READ_PROPERTY,
+                    )
+                    .unwrap_or_else(|_| panic!("source create preparation failed")),
+            )
+            .unwrap_or_else(|_| panic!("source create commit failed"));
+        let CommitResult::Created(source) = source else {
+            panic!("source create did not return a node");
+        };
+        drop(source);
+        let destination = backend
+            .commit(
+                backend
+                    .prepare_create(
+                        backend.position(&root, "destination", None).unwrap(),
+                        &access,
+                        backend.directory_body(),
+                        FalRights::ALL,
+                    )
+                    .unwrap_or_else(|_| panic!("destination create preparation failed")),
+            )
+            .unwrap_or_else(|_| panic!("destination create commit failed"));
+        let CommitResult::Created(destination) = destination else {
+            panic!("destination create did not return a node");
+        };
+        let source_position = backend.position(&root, "source", None).unwrap();
+        let mut mutation = backend
+            .prepare_move(source_position, &access, &access, "moved")
+            .unwrap_or_else(|_| panic!("move preparation failed"));
+        assert!(
+            backend
+                .validate_move_step(&mut mutation, 1)
+                .unwrap_or_else(|_| panic!("move validation failed"))
+        );
+        let CommitResult::Moved(moved) = backend
+            .commit(mutation)
+            .unwrap_or_else(|_| panic!("move commit failed"))
+        else {
+            panic!("move did not return the moved node");
+        };
+        assert_eq!(
+            backend.get(&moved).expect("moved node missing").version(),
+            2,
+            "Move did not advance the target node generation"
+        );
+        drop(moved);
+        assert!(matches!(
+            backend.lookup_child(&root, "source", &access),
+            Err(BackendError::NotFound)
+        ));
+        assert!(backend.lookup_child(&root, "moved", &access).is_ok());
+        drop(destination);
+
+        drop(access);
+        backend.seal();
+        drop(root);
+        while !backend.is_empty() {
+            backend.retire_step(1).unwrap();
+        }
+        assert!(backend.close().is_ok());
+        assert_eq!(account.usage(FalResource::Node).0, 0);
     }
 }

@@ -84,6 +84,16 @@ impl Permit {
     pub const fn slots(&self) -> usize {
         self.slots
     }
+
+    pub fn shrink_to(&mut self, slots: usize) {
+        assert!(slots <= self.slots, "metadata admission permit cannot grow");
+        let released = self.slots - slots;
+        if released != 0 {
+            let previous = self.counter.used.fetch_sub(released, Ordering::Relaxed);
+            assert!(previous >= released, "metadata admission permit underflow");
+            self.slots = slots;
+        }
+    }
 }
 
 impl Drop for Permit {
@@ -133,5 +143,10 @@ impl<S> SponsoredPermit<S> {
             _local: local,
             _sponsor: Arc::clone(sponsor),
         })
+    }
+
+    pub fn shrink_to(&mut self, slots: usize) {
+        self._global.shrink_to(slots);
+        self._local.shrink_to(slots);
     }
 }

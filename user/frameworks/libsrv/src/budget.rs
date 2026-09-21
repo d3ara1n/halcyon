@@ -57,9 +57,8 @@ fn counters<K: Taxonomy>(limits: &[usize]) -> Result<Vec<Option<Arc<Counter>>>, 
         .try_reserve_exact(K::COUNT)
         .map_err(|_| SystemCallError::OutOfMemory)?;
     for limit in limits {
-        let counter = (*limit != 0).then(|| {
-            Arc::try_new(Counter::new(*limit)).map_err(|_| SystemCallError::OutOfMemory)
-        });
+        let counter = (*limit != 0)
+            .then(|| Arc::try_new(Counter::new(*limit)).map_err(|_| SystemCallError::OutOfMemory));
         let counter = match counter {
             Some(counter) => Some(counter?),
             None => None,
@@ -109,8 +108,7 @@ impl<K: Taxonomy> Budget<K> {
             .accounts
             .as_ref()
             .ok_or(SystemCallError::QuotaExceeded)?;
-        let permit =
-            Counter::try_acquire(counter).map_err(|_| SystemCallError::QuotaExceeded)?;
+        let permit = Counter::try_acquire(counter).map_err(|_| SystemCallError::QuotaExceeded)?;
         let id = NEXT_ACCOUNT.allocate().ok_or(SystemCallError::ReachLimit)?;
         Arc::try_new(Account {
             id,
@@ -191,6 +189,16 @@ impl<K: Taxonomy> Charge<K> {
     pub fn units(&self) -> usize {
         self.units
     }
+
+    pub fn shrink_to(&mut self, units: usize) {
+        assert!(units <= self.units, "budget charge cannot grow");
+        if let Some(permit) = self._permit.as_mut() {
+            permit.shrink_to(units);
+        } else {
+            assert_eq!(units, 0, "zero budget charge cannot retain units");
+        }
+        self.units = units;
+    }
 }
 
 impl<K: Taxonomy> core::fmt::Debug for Charge<K> {
@@ -258,6 +266,17 @@ mod tests {
                 .units(),
             0
         );
+    }
+
+    #[test]
+    fn shrinking_charge_refunds_both_limits() {
+        let budget = Budget::<CoreResource>::new(&limits(), 1).unwrap();
+        let account = budget.account(&[usize::MAX, 8]).unwrap();
+        let mut charge = account.acquire(CoreResource::InputBytes, 7).unwrap();
+        charge.shrink_to(2);
+        assert_eq!(charge.units(), 2);
+        assert_eq!(account.usage(CoreResource::InputBytes), (2, 8));
+        assert_eq!(budget.usage(CoreResource::InputBytes), (2, 10));
     }
 
     #[test]

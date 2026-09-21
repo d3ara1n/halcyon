@@ -1,6 +1,6 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核统一登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。本计划不再拥有未完成的用户态执行能力，后续只保留各闭包的交付记录。公共对象、时间与[公共操作所有权](archived/todo-2026-09-14-public-operation-ownership.md)均已交付；自然顺序已恢复 FAL 业务，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。
+> 状态：消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核统一登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。本计划只保留各闭包交付记录。当前公共记账/执行与服务领域的知识归属、包依赖及目录迁移由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)唯一拥有，完成后恢复 FAL F3d；下文 libsrv 路径与旧包分工是交付基线，不作为保留领域倒置的依据。公共对象、时间与[公共操作所有权](archived/todo-2026-09-14-public-operation-ownership.md)均已交付，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。
 
 提交后的结构审视见[整体固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态、Runtime Wake、RPC/Outbox 和真实消费者边界的收敛建议；Runtime 清理、Job 单页收束、停止补证及 RPC/Outbox 已完成，固定提交序列统一由该 Review 承载。服务架构化不在范围内。
 
@@ -56,7 +56,7 @@ Receive/Delivery
   → 来源注销、Delivery/回复授权退休、精确退款
 ```
 
-业务副作用前必须完成回复存储、发送额度、任务槽及所需来源的准入。`srv_fs` 当前 `serve_one` 先修改 MemFs、后创建回复 Packet，迁移时必须反转为先完成有界回复准备，再调用业务 Commit；不能以回复失败后补偿 MemFs 替代准入屏障。Outbox 持有 `RequestContext`、reply-once、Delivery、PreparedResponse 和发送阶段，回复失败不伪造已提交业务回滚。
+业务副作用前必须完成回复存储、发送额度、任务槽及所需来源的准入。`srv_fs` 已迁为先完成有界 Outbox/来源准备，再调用 FAL2 业务 Commit；不能以回复失败后补偿业务状态替代准入屏障。Outbox 持有 `RequestContext`、reply-once、Delivery、PreparedResponse 和发送阶段，回复失败不伪造已提交业务回滚。
 
 通用 RPC 前缀不凭空推断服务端 Deadline。Outbox 接收调用方或协议 Header 已解析的绝对 Deadline；FAL Header 的期限由 FAL 解析层提供，librpc 只负责统一发送背压、接收和最终接受检查的阶段语义。
 
@@ -77,7 +77,7 @@ Receive/Delivery
 - `Dispatcher` 不再实现固定 `Task<()>`；协议推进、来源回调和停止/期限接口可由服务任务族嵌入。Runtime 新增有界 `Wake` 请求，来源声明/移除/重臂及完成唤醒在请求缓冲暂满时保留重试责任。回复来源错误保留实际 `SystemCallError`，回复故障统一进入可退休停止路径；公开普通 `reply_sender` 已删除。
 - `Outbox` 已成为正式入站回复 owner：持有 `RequestContext`、Delivery、send-once、PreparedResponse 和来源注册；先完成来源准入，再允许业务 Commit；支持可写背压、重臂、期限、关闭/错误、停止、来源注销和精确任务/输入额度退款。回复失败产生 `Abandoned`，不伪造业务回滚。
 - `srv_init` 合法第二次 RPC 回复已迁移到真实 Outbox Runtime；第一次协议拒绝仍保留为刻意 raw/拒绝路径验收。
-- `srv_fs` 已删除每请求 Runtime、`wait_many → serve_one` 重入泵、手写 RPC framing/回复校验、手工 `validate_request` 和重复 close。客户端使用 `Caller`；provider 运行于长期单一 Runtime：Ingress 先接收并预备 Outbox，RequestTask 在来源实际登记后才执行 MemFs 业务，再沿同一任务发送并退休回复。服务停止通过控制消息和 JoinHandle 显式收束。
+- `srv_fs` 已删除每请求 Runtime、`wait_many → serve_one` 重入泵、手写 RPC framing/回复校验、手工 `validate_request` 和重复 close。客户端使用正式 FAL2 client；provider 运行于进程主线程的长期单一 Runtime：Ingress 先接收并预备 Outbox，RequestTask 在来源实际登记后才执行 MemoryBackend 业务，再沿同一任务发送并退休回复。服务停止通过同一 Runtime 观察 release source 并返回 ProviderReport。
 - `srv_fs` 的业务 Commit 已置于 Outbox 来源准入之后；调用者退出/回复关闭的 `Abandoned` 是服务可继续运行的终态，不再升级为服务 panic。
 
 验证证据：
@@ -124,7 +124,7 @@ Receive/Delivery
 
 本任务接通 Packet/Delivery → Request/Task/Outbox → terminal → retire → refund。运输由 rinlib/Runnel 拥有；任务调度、观察注册寿命、任务唤醒与期限唤醒由执行核心拥有；RPC 路由及请求/回复责任由 librpc 拥有。执行核心不认识 FAL 节点、grant、Watch 或服务记录，也不依赖 RPC 的请求状态。
 
-库依赖图必须单向：异步 RPC 消费执行能力，不能与 libsrv 的执行核心互相依赖。服务 schema 或控制协议若需要 RPC，与纯执行能力明确分层；包的最终拆分在类型/依赖图审视后决定，不用相互回调或临时 adapter 掩盖循环。
+库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；服务框架消费 RPC/FAL 等领域能力，通用能力库不反向依赖 libsrv。具体包/类型图和既有消费者迁移由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)承担，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
 
 ## 可以先行的局部收口
 

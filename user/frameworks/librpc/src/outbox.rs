@@ -84,6 +84,15 @@ impl Outbox {
         self.response.map(PreparedResponse::into_context)
     }
 
+    pub fn drain_capabilities(
+        &mut self,
+        visit: impl FnMut(rinlib::ipc::capability::Capability, erhino_shared::object::Rights),
+    ) {
+        if let Some(response) = self.response.as_mut() {
+            response.drain_capabilities(visit);
+        }
+    }
+
     fn complete(&mut self, result: OutboxResult) {
         if self.result.is_none() {
             self.stage.finish();

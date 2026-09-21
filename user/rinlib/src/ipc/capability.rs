@@ -142,6 +142,14 @@ impl HandleSet {
     pub fn remaining(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
+
+    /// 消费所有仍由集合持有的能力 owner。
+    ///
+    /// 槽位布局属于已验证的消息结构；调用方只在完成协议校验后使用该出口，
+    /// 因而不会重新构造或复制任何 Handle。
+    pub fn take_all(&mut self) -> Vec<Capability> {
+        self.slots.iter_mut().filter_map(Option::take).collect()
+    }
 }
 
 impl IntoIterator for HandleSet {

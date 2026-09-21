@@ -1,5 +1,6 @@
 //! 稳定节点身份、链接/pin 分账与有界退休。节点内容不拥有递归目录树。
 
+use crate::resource::FalResource;
 use alloc::{
     rc::{Rc, Weak},
     sync::Arc,
@@ -10,7 +11,6 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use erhino_shared::call::SystemCallError;
-use crate::resource::FalResource;
 use libsrv::budget::{Account, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
@@ -21,6 +21,10 @@ static ABANDONED: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeId(u64);
 impl NodeId {
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
     pub fn raw(self) -> u64 {
         self.0
     }
@@ -422,7 +426,7 @@ pub fn abandoned_nodes() -> usize {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
-    use libsrv::budget::Budget;
+    use libsrv::budget::{Budget, Taxonomy};
 
     #[derive(Debug)]
     struct Directory {
@@ -458,7 +462,9 @@ mod tests {
     }
 
     fn account() -> Arc<Account<FalResource>> {
-        let limits = [10, 10000, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut limits = [0; FalResource::COUNT];
+        limits[FalResource::Node.slot()] = 10;
+        limits[FalResource::Bytes.slot()] = 10000;
         Budget::new(&limits, 1).unwrap().account(&limits).unwrap()
     }
 

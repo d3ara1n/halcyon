@@ -20,19 +20,21 @@
 
 ## 当前服务进程的定位
 
-当前 `srv_init`、`srv_fs`、`srv_pm` 等服务进程全部是内核与框架/标准库的验收夹具，不是正式系统工作成员。装配、消息数量、阶段顺序和固定容量可按测试需要实现；只有影响验收有效性、框架契约或资源收束证据时才要求修改，不为夹具建设生产级服务架构。待操作系统核心及框架/标准库较成熟、开始正式服务层建设后，再按各服务职责逐步替换这些进程；沿用进程名称不代表已完成正式化。
+当前运行配置仍是验收配置，但不能据此把服务内部全部实现视为临时代码。成熟度按层次登记：`libsrv` Runtime、`libprocess` 收束、`librpc`、FAL2 provider/GrantTable 等已有正式 owner、失败、退出和退款契约的机制属于正式实现；`srv_init` 根监督、`srv_pm` JobDriver 和 `srv_fs` 双 provider 运行体是这些机制的正式装配接缝。固定剧本、消息数量、日志、容量和当前进程组合仍是验收政策，可随负载替换；FAL1/self-client 双轨已在 F2 删除。一个 binary 可以同时包含正式机制、正式接缝、验收政策和过渡路径，必须在对应 `notes/impls/` 与唯一专题计划分别记录，不能用“整个服务正式/整个服务只是夹具”的单一标签掩盖边界。
 
 ## 活跃计划
 
 公共时间、公共对象与公共操作所有权专题均已完成；时间提交 `c6e0a84`，公共操作提交 `8e0467a`，实现见 `notes/impls/{time,ipc,task}.md`，过程与最终验收见归档计划，固定提交审查见 [`todo-2026-09-18-public-operation-ownership-review.md`](todo-2026-09-18-public-operation-ownership-review.md)。
 
-**当前任务**：[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 **F0 重新基线审计已完成**。代码事实确认当前唯一生产链仍是 `srv_fs` 的 FAL1 同进程自客户端/自 provider；`NodeStore`、`MemoryBackend`、`Data`、`StoredValue`、`GrantTable`、FAL2 codec 均无正式生产消费者。F0 已裁决不能把后端与授权/Runtime/协议拆成文件阶段：下一步是 F1 单 provider 授权—后端—协议—执行纵向闭包，必须共同接通真实 provider/client、Runtime/WaitSet、GrantTable、AccessSnapshot、后端准备/冲突/退休、显式 wake 与账户退款；完成前不删除 v1 路径、不以 v1 QEMU 或 host 积木测试冒充 FAL2 交付。运输与服务执行前置（消息运输 `3060dd8`、流运输 `a2aabed`、通用执行与准入 `a3891b0`、RPC/Outbox `4e18e5e`）以及公共操作所有权 P0–P6 均已完成并通过既定验证。实现现状入口为 `notes/impls/fal.md`。
+**当前任务**：[用户态库知识归属、依赖与目录重排](todo-2026-09-21-library-knowledge-ownership.md) 已立项，下一步为 L0 知识/依赖审计与设计。该专题统一承接公共记账与执行的独立归属、服务领域与通用能力库的单向依赖、`user/frameworks/` → `user/libraries/` 迁移及相关设计/计划更新；原则已进入 `user/frameworks/README.md` 和 `notes/ideas/framework.md`，源码与目录尚未迁移。FAL F3d 在该前置完成后恢复。
 
-串行前置已全部完成：[共享包契约与归属](archived/todo-2026-09-13-workspace-package-ownership.md) → [内核等待/请求/退休结构收束](archived/todo-2026-09-14-public-operation-ownership.md)。自然顺序现进入 FAL F1 单 provider 授权—后端—协议—执行闭包 → F2 独立 provider/client 与 namespace/Delegate → F3 Open/Watch/注册/Move/Copy → F4 旧 v1 删除与组合验收；只有实际证据表明缺失能力阻断当前闭包，才提升对应完整机制并同步依赖。
+[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 F0–F2、F3a 同域 Move、F3b Record/Handle/Take 与属性 Copy、F3c Watch 已到当前开发门。F2 已交付严格 wire、sub-grant、`DirectoryGrant<G>` walking、两个独立 provider、真实 route/Delegate、已提交回复 abandoned、已投递下游调用退出及 ProviderReport；FAL1、`MemFs`、slot-1 anchor、self-client 和旧泵已删除。F3b 已接通值能力槽、repeatable 出口、affine Take 回复提交/失败恢复与跨 provider 无能力属性 Copy；F3c 已接通有界订阅表、Notification signaler、generation、Query/Unsubscribe、修改事件、静默退出和 provider 终态。整体 FAL 尚未交付，现状入口为 `notes/impls/{fal,startup,runtime,rpc}.md`。
+
+自然顺序为库知识/依赖重排及目录迁移 → F3d 服务注册/发现重新规模审计 → F3e Open → F3f 流 Copy → F4 独立 `test_fal` 与组合验收。已有公共机制和 F0–F3c 的通过证据保留，库归属调整不倒置为这些机制未实现；迁移后的验证由新专题负责，FAL 业务与整体完成门仍由 FAL 总计划负责。
 
 无消费者的 Runnel 观察草稿面（`register`/`peer_attached`/`prepare_wait`/`all_consumed`，随基线 `d22b9d7` 入库）已在流运输闭包中删除，已立案终态访问缺陷随之消失；原始 ABI 工厂同批删除，typed create/attach 成为唯一构造入口，init 创建侧已迁移；观察/登记/取消语义移入通用执行闭包，由 Runtime 首个真实消费者共同定形。Delivery 独立身份与 Peek 已在消息闭包裁决保留。共享包整理已作为独立小型任务开工：`shared/` 现组织为 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
 
-当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；本次设计审视基线为 `bf48cab`。交接先读 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输、服务执行和公共操作 P0–P6 已完成，当前待施工为 FAL 业务的重新审计与自然依赖拆分。验收可靠性首轮已收口，历史时间敏感现场保留只读归档。后续按机制闭包逐项提交，最终经授权合并，不自动 push。历史验证日志/诊断产物只在本机 artifacts，异机需按该交接节重跑。
+当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；当前 HEAD `84eeed6` 之上的未提交工作树共同包含 F1–F3c，切换会话不得 reset、checkout 覆盖或只保留 Watch 增量。交接先读[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)及 [FAL 总计划的开发分支与交接](todo-2026-09-fal-service-capabilities.md#开发分支与交接)：运输、服务执行、公共操作 P0–P6、FAL F0–F3c 的机制基线保持，当前唯一位置为库重排 L0，F3d 等待该前置完成。验收可靠性首轮已收口，历史时间敏感现场保留只读归档。后续按机制闭包逐项提交，最终经授权合并，不自动 commit、push；历史日志/诊断产物只在本机 artifacts，异机需按交接节重跑。
 
 plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报告。专题 todo 拥有当前实施，Review 保留目标提交证据与复核清单，二者不重复安排同一问题。已完成调查/复核进入 `archived/`，`ref-*` 是只读参考资料。当前全部活跃入口：
 
@@ -42,7 +44,8 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-13-monotonic-time-rpc-deadline-review.md`](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 未来 Review：固定 `c6e0a84` 的公共时钟、绝对期限、运行期停止与真实消费者边界，不把跨 epoch/RPC/FAL 责任混入复核 |
 | [`todo-2026-09-frame-source-selftest-review.md`](todo-2026-09-frame-source-selftest-review.md) | 未来代码 Review：固定复核 `606b59d` 的库存来源、boot-held affine owner、完整清零、切分退款与 child 来源保活，不阻塞 FAL 主线 |
 | [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
-| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | F0 重新基线审计已完成；当前下一阶段为 F1 单 provider 授权—后端—协议—执行闭包，整体 FAL 尚未交付 |
+| [`todo-2026-09-21-library-knowledge-ownership.md`](todo-2026-09-21-library-knowledge-ownership.md) | 当前前置：按领域重排知识与依赖，公共记账/执行独立归属，frameworks → libraries，同步设计与活跃计划；已立项未实施，从 L0 开始 |
+| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | F0–F2、F3a–F3c 已到开发门；F3d 等待库重排后重新审计，F4 负责独立 `test_fal` 与最终组合验收；整体 FAL 尚未交付 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
 | [`todo-2026-09-14-stream-transport-review.md`](todo-2026-09-14-stream-transport-review.md) | 未来 Review：固定复核 `a2aabed` 的观察草稿面删除、raw 工厂删除、srv_init typed 创建迁移与终态访问边界，不预审通用执行闭包的观察接入形态 |

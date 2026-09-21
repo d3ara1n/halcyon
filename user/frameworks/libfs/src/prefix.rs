@@ -1,15 +1,36 @@
-//! 前缀表：名字前缀 → 目录 Handle，最长前缀匹配。
+//! 前缀表：名字前缀 → DirectoryGrant owner，最长前缀匹配。
 
 use alloc::{string::String, vec::Vec};
 
 use erhino_shared::object::Handle;
 
-/// 前缀表条目。
+/// provider 内稳定目录的客户端授权 owner。内部 endpoint 类型由运输层决定；
+/// Namespace 只持有并移动这个完整 owner，不观察或复制裸 Handle 数值。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountEntry {
+pub struct DirectoryGrant<G> {
+    endpoint: G,
+}
+
+impl<G> DirectoryGrant<G> {
+    pub const fn new(endpoint: G) -> Self {
+        Self { endpoint }
+    }
+
+    pub const fn endpoint(&self) -> &G {
+        &self.endpoint
+    }
+
+    pub fn into_endpoint(self) -> G {
+        self.endpoint
+    }
+}
+
+/// 前缀表条目；`G` 是客户端持有的 DirectoryGrant owner。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry<G = Handle> {
     /// 规范化为无尾 `/` 的绝对前缀；根为 `/`。
     pub prefix: String,
-    pub directory: Handle,
+    pub directory: DirectoryGrant<G>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +46,20 @@ pub enum BadPrefix {
 }
 
 /// 前缀表：插入即规范化，重复前缀替换（重挂载）。
-#[derive(Debug, Default)]
-pub struct PrefixTable {
-    entries: Vec<MountEntry>,
+#[derive(Debug)]
+pub struct PrefixTable<G = Handle> {
+    entries: Vec<MountEntry<G>>,
 }
 
-impl PrefixTable {
+impl<G> Default for PrefixTable<G> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<G> PrefixTable<G> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -38,21 +67,31 @@ impl PrefixTable {
     /// 规范化前缀：`/a/b/` → `/a/b`；`/` 保持 `/`。
     pub fn normalize(prefix: &str) -> Result<String, PrefixError> {
         if !prefix.starts_with('/') {
-            return Err(PrefixError { kind: BadPrefix::NotAbsolute });
+            return Err(PrefixError {
+                kind: BadPrefix::NotAbsolute,
+            });
         }
         if prefix == "/" {
             return Ok(String::from("/"));
         }
         let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
-        if trimmed[1..].split('/').any(|s| s.is_empty() || s == "." || s == "..") {
-            return Err(PrefixError { kind: BadPrefix::IllegalSegment });
+        if trimmed[1..]
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return Err(PrefixError {
+                kind: BadPrefix::IllegalSegment,
+            });
         }
         Ok(String::from(trimmed))
     }
 
-    /// 挂载：插入或替换同前缀条目。替换时返还旧 Handle（关闭权在
-    /// 调用方——前缀表只是登记处，不是 Handle 所有者）。
-    pub fn mount(&mut self, prefix: &str, directory: Handle) -> Result<Option<Handle>, PrefixError> {
+    /// 挂载：插入或替换同前缀条目。替换时返还旧 grant owner。
+    pub fn mount(
+        &mut self,
+        prefix: &str,
+        directory: DirectoryGrant<G>,
+    ) -> Result<Option<DirectoryGrant<G>>, PrefixError> {
         let prefix = Self::normalize(prefix)?;
         if let Some(entry) = self.entries.iter_mut().find(|e| e.prefix == prefix) {
             let replaced = core::mem::replace(&mut entry.directory, directory);
@@ -62,8 +101,8 @@ impl PrefixTable {
         Ok(None)
     }
 
-    /// 卸载：移除条目并返回其 Handle（关闭由调用方决定）。
-    pub fn unmount(&mut self, prefix: &str) -> Option<Handle> {
+    /// 卸载：移除条目并返回其 grant owner。
+    pub fn unmount(&mut self, prefix: &str) -> Option<DirectoryGrant<G>> {
         let prefix = Self::normalize(prefix).ok()?;
         let index = self.entries.iter().position(|e| e.prefix == prefix)?;
         Some(self.entries.remove(index).directory)
@@ -72,8 +111,8 @@ impl PrefixTable {
     /// 最长前缀匹配：返回命中条目与相对后缀（`/` 根条目匹配一切，
     /// 后缀为去掉前缀后去掉首个 `/` 的部分；命中根则后缀为整段路径
     /// 去掉开头 `/`）。无条目命中返回 None。
-    pub fn match_path<'a>(&'a self, path: &'a str) -> Option<(&'a MountEntry, &'a str)> {
-        let mut best: Option<(&'a MountEntry, &'a str)> = None;
+    pub fn match_path<'a>(&'a self, path: &'a str) -> Option<(&'a MountEntry<G>, &'a str)> {
+        let mut best: Option<(&'a MountEntry<G>, &'a str)> = None;
         for entry in &self.entries {
             let suffix = if entry.prefix == "/" {
                 match path.strip_prefix('/') {
@@ -109,7 +148,7 @@ impl PrefixTable {
         best
     }
 
-    pub fn entries(&self) -> &[MountEntry] {
+    pub fn entries(&self) -> &[MountEntry<G>] {
         &self.entries
     }
 }
@@ -125,31 +164,50 @@ mod tests {
     #[test]
     fn mount_normalizes_and_replaces() {
         let mut table = PrefixTable::new();
-        table.mount("/a/b/", handle(1)).unwrap();
+        table
+            .mount("/a/b/", DirectoryGrant::new(handle(1)))
+            .unwrap();
         assert_eq!(table.entries()[0].prefix, "/a/b");
-        // 重挂载返还旧 Handle，由调用方决定关闭。
-        assert_eq!(table.mount("/a/b", handle(2)).unwrap(), Some(handle(1)));
+        // 重挂载返还旧 grant owner，由调用方决定关闭。
+        assert_eq!(
+            table.mount("/a/b", DirectoryGrant::new(handle(2))).unwrap(),
+            Some(DirectoryGrant::new(handle(1)))
+        );
         assert_eq!(table.entries().len(), 1);
-        assert_eq!(table.entries()[0].directory, handle(2));
+        assert_eq!(table.entries()[0].directory, DirectoryGrant::new(handle(2)));
     }
 
     #[test]
     fn rejects_bad_prefixes() {
         let mut table = PrefixTable::new();
-        assert_eq!(table.mount("a/b", handle(1)), Err(PrefixError { kind: BadPrefix::NotAbsolute }));
         assert_eq!(
-            table.mount("/a/../b", handle(1)),
-            Err(PrefixError { kind: BadPrefix::IllegalSegment })
+            table.mount("a/b", DirectoryGrant::new(handle(1))),
+            Err(PrefixError {
+                kind: BadPrefix::NotAbsolute
+            })
         );
-        assert_eq!(table.mount("/a//b", handle(1)), Err(PrefixError { kind: BadPrefix::IllegalSegment }));
+        assert_eq!(
+            table.mount("/a/../b", DirectoryGrant::new(handle(1))),
+            Err(PrefixError {
+                kind: BadPrefix::IllegalSegment
+            })
+        );
+        assert_eq!(
+            table.mount("/a//b", DirectoryGrant::new(handle(1))),
+            Err(PrefixError {
+                kind: BadPrefix::IllegalSegment
+            })
+        );
     }
 
     #[test]
     fn longest_prefix_wins_with_correct_suffix() {
         let mut table = PrefixTable::new();
-        table.mount("/", handle(10)).unwrap();
-        table.mount("/a", handle(11)).unwrap();
-        table.mount("/a/b", handle(12)).unwrap();
+        table.mount("/", DirectoryGrant::new(handle(10))).unwrap();
+        table.mount("/a", DirectoryGrant::new(handle(11))).unwrap();
+        table
+            .mount("/a/b", DirectoryGrant::new(handle(12)))
+            .unwrap();
 
         let (entry, suffix) = table.match_path("/a/b/c/d").unwrap();
         assert_eq!(entry.prefix, "/a/b");
@@ -176,8 +234,8 @@ mod tests {
     #[test]
     fn unmount_removes_entry() {
         let mut table = PrefixTable::new();
-        table.mount("/a", handle(3)).unwrap();
-        assert_eq!(table.unmount("/a"), Some(handle(3)));
+        table.mount("/a", DirectoryGrant::new(handle(3))).unwrap();
+        assert_eq!(table.unmount("/a"), Some(DirectoryGrant::new(handle(3))));
         assert!(table.match_path("/a/x").is_none());
         assert_eq!(table.unmount("/a"), None);
     }

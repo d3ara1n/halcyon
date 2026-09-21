@@ -2,7 +2,7 @@
 //!
 //! 状态是单个逻辑位置列表 `logical`（前缀表条目以下的组件，含未确认
 //! 尾部）加帧栈 `frames`（`frames[i].base` 分区 provider 区域：`logical
-//! [base..]` 可从该帧 Handle 到达）。`..` 对逻辑列表词法回退、按需收缩
+//! [base..]` 可从该帧 DirectoryGrant 到达）。`..` 对逻辑列表词法回退、按需收缩
 //! 帧栈，namespace 根处钳制；绝对 target 对前缀表重启整次解析，相对
 //! target 原地替换链接分量；展开次数（40）、组件数、字节数与 Lookup
 //! 步数受上限约束。终段策略随请求声明，提供者不解释 target。
@@ -11,19 +11,21 @@ use alloc::{string::String, vec::Vec};
 
 use erhino_shared::object::Handle;
 use libfal::{
-    header::Status,
-    lookup::ResolvePolicy,
     node::{NodeAttributes, NodeKind},
+    protocol::{ResolvePolicy, Status},
 };
 
-use crate::prefix::PrefixTable;
+use crate::prefix::{DirectoryGrant, PrefixTable};
 use crate::{BYTE_LIMIT, COMPONENT_LIMIT, SYMLINK_LIMIT};
 
 /// Found 的节点元数据摘要（客户端所有权形态，含自描述 value 尾——
 /// SymbolicLink 的 target；其余 kind 为空）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeSummary {
+    pub identity: u64,
+    pub version: u64,
     pub kind: NodeKind,
+    pub rights: libfal::authority::FalRights,
     pub attributes: NodeAttributes,
     pub size: u64,
     pub value: alloc::vec::Vec<u8>,
@@ -31,20 +33,30 @@ pub struct NodeSummary {
 
 /// 单次 Lookup 的客户端视图结果（真实传输把线形映射到这里）。
 #[derive(Debug, Clone, PartialEq)]
-pub enum LookupOutcome {
+pub enum LookupOutcome<G = Handle> {
     Found(NodeSummary),
-    Delegate { dir: Handle, consumed: String, remaining: String },
-    Link { consumed: String, target: String, remaining: String },
+    Delegate {
+        dir: G,
+        consumed: String,
+        remaining: String,
+    },
+    Link {
+        consumed: String,
+        target: String,
+        remaining: String,
+    },
 }
 
 /// 走路传输抽象：host 测试注入 mock，真实实现走 librpc/libfal。
 pub trait WalkTransport {
+    type Endpoint: Clone;
+
     fn lookup(
         &mut self,
-        dir: Handle,
+        dir: &DirectoryGrant<Self::Endpoint>,
         policy: ResolvePolicy,
         path: &str,
-    ) -> Result<LookupOutcome, Status>;
+    ) -> Result<LookupOutcome<DirectoryGrant<Self::Endpoint>>, Status>;
 }
 
 /// 解析错误。
@@ -68,38 +80,37 @@ impl ResolveError {
     /// 归一化为 FAL 状态：op 层透传给调用方。
     pub fn status(self) -> Status {
         match self {
-            Self::IllegalPath => Status::IllegalPath,
+            Self::IllegalPath => Status::Invalid,
             Self::NoProvider => Status::NotFound,
             Self::Status(status) => status,
-            Self::TooManyLinks => Status::TooManyLinks,
-            Self::BudgetExceeded | Self::StepLimit => Status::IllegalArgument,
+            Self::TooManyLinks | Self::BudgetExceeded | Self::StepLimit => Status::Invalid,
         }
     }
 }
 
-/// 解析终点：帧锚 Handle + 相对后缀与节点信息。
+/// 解析终点：帧锚 DirectoryGrant + 相对后缀与节点信息。
 ///
-/// 后续操作（Enumerate/PropertyRead/…）以 `anchor` 为 Handle slot 1、
-/// `rel` 为 body 内相对路径寻址；两个值来自最后一次成功的 Lookup。
+/// 后续操作以 `anchor` 的授权身份和 `rel` 相对路径寻址；两个值来自
+/// 最后一次成功的 Lookup。
 #[derive(Debug, Clone, PartialEq)]
-pub struct Position {
-    pub anchor: Handle,
+pub struct Position<G = Handle> {
+    pub anchor: G,
     pub rel: String,
     pub info: NodeSummary,
 }
 
 /// ResolveParent 的结果：父目录位置 + 终段名。
 #[derive(Debug, Clone, PartialEq)]
-pub struct ParentPosition {
-    pub dir: Position,
+pub struct ParentPosition<G = Handle> {
+    pub dir: Position<G>,
     pub child: String,
 }
 
 /// 单次解析的 Lookup 步数上限。
 const STEP_LIMIT: usize = 256;
 
-struct Frame {
-    dir: Handle,
+struct Frame<G> {
+    dir: G,
     base: usize,
 }
 
@@ -137,17 +148,21 @@ fn split_absolute(path: &str) -> Result<Vec<&str>, ResolveError> {
 
 /// 解析绝对路径至终点。`policy` 为 FollowAll / NoFollowFinal；
 /// ResolveParent 用 [`resolve_parent`]。
-pub fn resolve(
-    transport: &mut impl WalkTransport,
-    table: &PrefixTable,
+pub fn resolve<T: WalkTransport>(
+    transport: &mut T,
+    table: &PrefixTable<T::Endpoint>,
     path: &str,
     policy: ResolvePolicy,
-) -> Result<Position, ResolveError> {
+) -> Result<Position<DirectoryGrant<T::Endpoint>>, ResolveError> {
     debug_assert!(matches!(
         policy,
         ResolvePolicy::FollowAll | ResolvePolicy::NoFollowFinal
     ));
-    let mut budget = Budget { links: SYMLINK_LIMIT, components: 0, bytes: 0 };
+    let mut budget = Budget {
+        links: SYMLINK_LIMIT,
+        components: 0,
+        bytes: 0,
+    };
     if !path.starts_with('/') {
         return Err(ResolveError::IllegalPath);
     }
@@ -157,7 +172,10 @@ pub fn resolve(
     'restart: loop {
         let (entry, suffix) = table.match_path(&current).ok_or(ResolveError::NoProvider)?;
         let mut frames = Vec::new();
-        frames.push(Frame { dir: entry.directory, base: 0 });
+        frames.push(Frame {
+            dir: entry.directory.clone(),
+            base: 0,
+        });
         let mut logical: Vec<String> = Vec::new();
         for segment in split_absolute_suffix(suffix)? {
             budget.charge(segment)?;
@@ -175,10 +193,12 @@ pub fn resolve(
 
             if rel.is_empty() {
                 // 位置即帧锚本身：空路径查询其节点信息。
-                let info = transport.lookup(frame.dir, policy, "").map_err(ResolveError::Status)?;
+                let info = transport
+                    .lookup(&frame.dir, policy, "")
+                    .map_err(ResolveError::Status)?;
                 return match info {
                     LookupOutcome::Found(info) => Ok(Position {
-                        anchor: frame.dir,
+                        anchor: frame.dir.clone(),
                         rel: String::new(),
                         info,
                     }),
@@ -188,19 +208,34 @@ pub fn resolve(
             }
 
             let outcome = transport
-                .lookup(frame.dir, policy, &rel)
+                .lookup(&frame.dir, policy, &rel)
                 .map_err(ResolveError::Status)?;
             match outcome {
                 LookupOutcome::Found(info) => {
-                    return Ok(Position { anchor: frame.dir, rel, info });
+                    return Ok(Position {
+                        anchor: frame.dir.clone(),
+                        rel,
+                        info,
+                    });
                 }
-                LookupOutcome::Delegate { dir, consumed, remaining } => {
+                LookupOutcome::Delegate {
+                    dir,
+                    consumed,
+                    remaining,
+                } => {
                     // Delegate 契约：consumed + remaining 连续覆盖本帧 rel。
                     let consumed_count =
                         verify_cover(&logical[frame.base..], &consumed, &remaining, None)?;
-                    frames.push(Frame { dir, base: frame.base + consumed_count });
+                    frames.push(Frame {
+                        dir,
+                        base: frame.base + consumed_count,
+                    });
                 }
-                LookupOutcome::Link { consumed, target, remaining } => {
+                LookupOutcome::Link {
+                    consumed,
+                    target,
+                    remaining,
+                } => {
                     if budget.links == 0 {
                         return Err(ResolveError::TooManyLinks);
                     }
@@ -208,8 +243,7 @@ pub fn resolve(
                     // Link 契约：consumed + [链接分量] + remaining 覆盖 rel；
                     // 链接分量名不在 wire 上，位置即 consumed 之后。
                     let frame_rel = &logical[frame.base..];
-                    let consumed_count =
-                        verify_cover(frame_rel, &consumed, &remaining, Some(()))?;
+                    let consumed_count = verify_cover(frame_rel, &consumed, &remaining, Some(()))?;
                     let link_at = frame.base + consumed_count;
                     debug_assert!(link_at < logical.len());
                     let after: Vec<String> = logical.split_off(link_at + 1);
@@ -242,11 +276,11 @@ pub fn resolve(
 
 /// 解析至终段父目录（create/delete/rename 语义）：父路径 FollowAll，
 /// 返回父位置与终段名。
-pub fn resolve_parent(
-    transport: &mut impl WalkTransport,
-    table: &PrefixTable,
+pub fn resolve_parent<T: WalkTransport>(
+    transport: &mut T,
+    table: &PrefixTable<T::Endpoint>,
     path: &str,
-) -> Result<ParentPosition, ResolveError> {
+) -> Result<ParentPosition<DirectoryGrant<T::Endpoint>>, ResolveError> {
     let mut segments = split_absolute(path)?;
     let child = segments.pop().ok_or(ResolveError::IllegalPath)?;
     if child == "." || child == ".." {
@@ -255,7 +289,10 @@ pub fn resolve_parent(
     let mut parent = String::from("/");
     parent.push_str(&segments.join("/"));
     let dir = resolve(transport, table, &parent, ResolvePolicy::FollowAll)?;
-    Ok(ParentPosition { dir, child: String::from(child) })
+    Ok(ParentPosition {
+        dir,
+        child: String::from(child),
+    })
 }
 
 fn split_absolute_suffix(suffix: &str) -> Result<Vec<&str>, ResolveError> {
@@ -271,7 +308,7 @@ fn split_absolute_suffix(suffix: &str) -> Result<Vec<&str>, ResolveError> {
 }
 
 /// `.`/`..` 的词法处理：`..` 弹出逻辑组件并收缩越界帧，根处钳制。
-fn normalize(logical: &mut Vec<String>, frames: &mut Vec<Frame>) {
+fn normalize<G>(logical: &mut Vec<String>, frames: &mut Vec<Frame<G>>) {
     let mut work: Vec<String> = Vec::with_capacity(logical.len());
     let mut changed = false;
     for component in logical.drain(..) {
@@ -339,15 +376,27 @@ fn verify_cover(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libfal::lookup::ResolvePolicy::{FollowAll, NoFollowFinal};
     use libfal::node::{NodeAttributes, NodeKind};
+    use libfal::protocol::ResolvePolicy::{FollowAll, NoFollowFinal};
 
     fn handle(raw: u64) -> Handle {
         Handle::from_raw(raw)
     }
 
+    fn grant(raw: u64) -> DirectoryGrant<Handle> {
+        DirectoryGrant::new(handle(raw))
+    }
+
     fn info(kind: NodeKind) -> NodeSummary {
-        NodeSummary { kind, attributes: NodeAttributes::NONE, size: 0, value: alloc::vec::Vec::new() }
+        NodeSummary {
+            identity: 0,
+            version: 0,
+            kind,
+            rights: libfal::authority::FalRights::NONE,
+            attributes: NodeAttributes::NONE,
+            size: 0,
+            value: alloc::vec::Vec::new(),
+        }
     }
 
     /// mock 提供者图（grant "/" → A=1）：
@@ -364,29 +413,29 @@ mod tests {
     }
 
     impl WalkTransport for MockTransport {
+        type Endpoint = Handle;
+
         fn lookup(
             &mut self,
-            dir: Handle,
+            dir: &DirectoryGrant<Handle>,
             policy: ResolvePolicy,
             path: &str,
-        ) -> Result<LookupOutcome, Status> {
+        ) -> Result<LookupOutcome<DirectoryGrant<Handle>>, Status> {
             self.last_policy = Some(policy);
             let found = |kind| Ok(LookupOutcome::Found(info(kind)));
-            match (dir.raw(), path) {
+            match (dir.endpoint().raw(), path) {
                 (1, "") => found(NodeKind::Directory),
                 (1, "a") => found(NodeKind::Directory),
-                (1, "a/b") | (1, "a/b/deep") if path == "a/b/deep" => {
-                    found(NodeKind::Property)
-                }
+                (1, "a/b") | (1, "a/b/deep") if path == "a/b/deep" => found(NodeKind::Property),
                 (1, "a/b") => found(NodeKind::Directory),
                 // 委托边界：consumed 含边界分量 sub，dir2 为其 Handle。
                 (1, "a/b/sub") => Ok(LookupOutcome::Delegate {
-                    dir: handle(3),
+                    dir: grant(3),
                     consumed: String::from("a/b/sub"),
                     remaining: String::new(),
                 }),
                 (1, "a/b/sub/x") | (1, "a/b/sub/extra") => Ok(LookupOutcome::Delegate {
-                    dir: handle(3),
+                    dir: grant(3),
                     consumed: String::from("a/b/sub"),
                     remaining: String::from(if path == "a/b/sub/x" { "x" } else { "extra" }),
                 }),
@@ -449,7 +498,7 @@ mod tests {
 
     fn table() -> PrefixTable {
         let mut table = PrefixTable::new();
-        assert!(table.mount("/", handle(1)).unwrap().is_none());
+        assert!(table.mount("/", grant(1)).unwrap().is_none());
         table
     }
 
@@ -462,7 +511,7 @@ mod tests {
 
         let position = resolve(&mut mock, &table(), "/a/b/deep", FollowAll).unwrap();
         assert_eq!(position.info.kind, NodeKind::Property);
-        assert_eq!(position.anchor, handle(1));
+        assert_eq!(position.anchor, grant(1));
         assert_eq!(position.rel, "a/b/deep");
     }
 
@@ -506,12 +555,12 @@ mod tests {
         let mut mock = MockTransport::new();
         let position = resolve(&mut mock, &table(), "/a/b/sub/x", FollowAll).unwrap();
         assert_eq!(position.info.kind, NodeKind::Stream);
-        assert_eq!(position.anchor, handle(3));
+        assert_eq!(position.anchor, grant(3));
         assert_eq!(position.rel, "x");
 
         // 委托边界 + 剩余后缀。
         let position = resolve(&mut mock, &table(), "/a/b/sub/extra", FollowAll).unwrap();
-        assert_eq!(position.anchor, handle(3));
+        assert_eq!(position.anchor, grant(3));
         assert_eq!(position.rel, "extra");
     }
 
@@ -522,7 +571,7 @@ mod tests {
         let position = resolve(&mut mock, &table(), "/a/b/sub/../deep", FollowAll).unwrap();
         assert_eq!(position.info.kind, NodeKind::Property);
         assert_eq!(position.rel, "a/b/deep");
-        assert_eq!(position.anchor, handle(1));
+        assert_eq!(position.anchor, grant(1));
     }
 
     #[test]

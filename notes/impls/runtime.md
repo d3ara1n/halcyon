@@ -1,6 +1,8 @@
 # 用户态执行与监督
 
-当前服务进程均为内核和框架/标准库验收夹具；正式服务层在核心较成熟后逐步替换，装配可按测试需要实现。`user/frameworks/libsrv` 拥有单 actor 的执行机制；`libprocess` 拥有 Process/Job 收束政策与状态机；`srv_init` 的 `supervisor.rs` 拥有根监督责任。内核对象和 ABI 沿用现有 WaitSet、ProcessDrain 与 Job 管理面。
+当前运行配置是验收配置，但实现成熟度按责任层而不是 binary 整体判定。`user/frameworks/libsrv` 的 actor 执行机制、`libprocess` 的 Process/Job 收束状态机和 `librpc` 的调用/Outbox owner 已是正式机制；`srv_init::supervisor` 的根监督、`srv_pm` 的 JobDriver 与 `srv_fs` 的双 provider Runtime 是正式装配接缝。固定拓扑、阶段剧本、消息数量、日志和容量仍是验收政策，不构成未来正式运行配置。FAL1 自客户端和兼容泵已经删除；后续服务若新增过渡路径，仍须在对应专题计划登记删除条件。内核对象和 ABI 沿用现有 WaitSet、ProcessDrain 与 Job 管理面。
+
+成熟度采用四类记录：正式机制（可脱离当前剧本成立的 owner/状态机契约）、正式装配接缝（启动 grant、endpoint 与监督 authority 的目标结构）、验收政策（可替换的场景编排）和过渡路径（有唯一计划、删除条件与验证门）。同一服务可同时包含四类；实现文档描述当前归属，方向文档不记录阶段标签。
 
 ## Runtime 的调度、输入与退休
 
@@ -11,6 +13,8 @@
 每个任务的输入 FIFO 链接位于正式来源记录中，以稳定 token 寻址。来源 ready 进入预付 pending 槽，仅入队一次；advance 最多取本次预算允许的记录，未消费记录按原序还回队首。无需遍历该任务的全部潜在来源，也没有注销留下的无界 tombstone。Rearm、Remove 与迟到 generation 共用同一账本。
 
 `Requests` 的有限容量是每次任务推进的输出政策，不是服务连接数限制。其缓冲和额度在 Runtime 创建时预备，推进间复用；PendingGate 只持结算状态，存在 Gate 时不推进新的任务，每步从同一缓冲执行或拒绝一个操作；失败 advance 的剩余请求也保留到后续 Gate 结算。拒绝即使发生在业务提出 Complete 后，也让原任务再次取得推进机会，处理返还的责任。失败推进的业务期限与 ready/Hold 状态独立保留，Gate 收尾重新读取任务状态而不清空业务 timer；同一已投递期限不会被重复武装。任务执行和 Gate 回调前按该任务的通知义务确认到期，不依赖有预算的期限堆已弹出其 timer；较早的执行 Retry 不能使任务在未取得已到期业务输入时改写期限。Rearm/Remove 在正常、Complete 和失败 Gate 中都校验任务归属，维护面使用独立内部入口。请求、接收与 scratch 存储、来源记录都有准入；`Runtime::input_budget` 按实际类型大小和来源数量推导装配账户所需的输入额度。
+
+`metadata_admission::Permit`、`SponsoredPermit` 与 `libsrv::Charge` 支持只减不增的 `shrink_to`：资源实际占用缩小时立即返还差额，并同步更新本地账户与 sponsor/global 两层计数；增长仍必须重新准入。FAL 成功 Take 用这一出口把原属性 Bytes charge 收缩到空值实际长度，避免把已移交值的历史容量保留到节点退休。
 
 `SourcePlan` 是不透明的值类型，携带普通 WaitSet 登记意图，不拥有关闭权或共享数据访问权。Runnel 等领域生成计划，运行体注入任务 cookie 并登记。计划本身不分配，也不通过任意注册回调引入另一套执行路径。Add/Arm 入口统一为 Register 值计划，直接经 SourceOps 登记。在调用内核前准备额度、来源节点和退休期限槽；失败退款，初始登记直接使用第一代次。
 

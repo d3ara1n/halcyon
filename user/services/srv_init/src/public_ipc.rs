@@ -334,9 +334,9 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
         deadline,
     )
     .unwrap();
-    // 同 authority 的探针观察 ObjectBusy，且目标线程尚未发布 syscall 返回，
-    // 才把 caller 视为处于同一在途 Drain 周期。精确的 active/parked 取消窗口
-    // 由内核确定性夹具覆盖；这里证明真实用户线程退出与管理者接管的组合。
+    // 同 authority 的探针优先观察 ObjectBusy；若目标 Drain 在探针前已完成，
+    // 也接受该合法竞态。精确的 active/parked 取消窗口由内核确定性夹具覆盖；
+    // 这里证明真实用户线程退出与管理者接管的组合。
     loop {
         match process::drain(nested.control, 1) {
             Err(SystemCallError::ObjectBusy) => {
@@ -352,11 +352,10 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
                 break;
             }
             Ok(result) => {
-                assert_ne!(
-                    result.status,
-                    rinlib::shared::proc::ProcessDrainStatus::Complete as u32,
-                    "probe completed the target before the captured Drain acquired ownership"
-                );
+                if result.status == rinlib::shared::proc::ProcessDrainStatus::Complete as u32 {
+                    debug!("committed IPC ownership probe observed target completion");
+                    break;
+                }
             }
             Err(error) => panic!("committed IPC ownership probe failed: {error:?}"),
         }

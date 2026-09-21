@@ -33,37 +33,40 @@ WaitSet、来源表、直接期限推进或 `mem::forget` 放弃循环。
 可因满箱重试，成功投递进入 `Sent`，超时、关闭、拒绝或合法回复进入
 `Terminal`。该状态机有 host testcase；目标代码的 Runtime 接缝通过用户态 RISC-V
 `cargo check -p librpc -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem`、
-`just check` 与七面 `just clippy`。当前尚无真实异步服务消费者或完整组合验收。
+`just check` 与七面 `just clippy`。`srv_fs` 的跨 provider Delegate 是真实异步消费者：Dispatcher 在同一 Runtime 内向下游 Derive，完成后唤醒原 DelegateTask。
 
-## 接续重审
+## 当前嵌入与边界
 
-该提交是 RPC/Outbox 闭包的前半段铺路，不是最终服务组合 API。`Task<()>` 与
-`Family = Self` 使 Dispatcher 只能独占一个 Runtime，不能和入站请求、业务
-任务及 Outbox 组成同一服务任务族；后续应保留协议状态和推进逻辑，改为由服务
-任务族嵌入并转发 Runtime 回调。任务间提交/完成需要经 Runtime 应用的有界
-wake 请求，不能让业务轮询 Dispatcher 完成队列。
+`Dispatcher` 现由外层服务 Runtime 通过 `Runtime::get_task_mut` 提交调用、接收
+完成并推进来源注销；它不拥有第二套 WaitSet，也不在 handler 中同步等待。完成结果
+进入有界 FIFO，由原任务取得并继续推进，停止时先取消或收束下游调用，再注销来源、
+关闭回复端点并退休 Dispatcher owner。`srv_fs` 的跨 provider Delegate 是当前真实
+多 in-flight 消费者：A 的 Runtime 将 Derive 投递给 B，B 关闭或 A 停止时均沿
+`CallPhase` 和 `OutboxResult` 的明确阶段收束。
 
-接续前必须修复：回复邮箱故障后统一启动停止收束、删除公开普通 `reply_sender`、
-保留任意阶段交付的 timeout 输入、原样保留来源 `SystemCallError`，并删除或补齐
-当前没有写入点的 `cleanup_error`。这些修正不推翻已提交的 Packet owner、
-PendingCall、绝对期限、来源注销和 `OutboundStage`。
+Dispatcher 保留协议状态、PendingCall、回复存储、期限和运输 owner；Runtime 仍拥有
+WaitSet、来源登记、期限唤醒和最终退休。后续增加消费者时复用这一嵌入边界，不恢复
+独立 WaitSet、阻塞泵、无限重试或业务轮询完成队列。
 
 入站最终顺序是先准入 `PreparedResponse`/Outbox、任务和来源，再执行业务副作用；
-回复失败只报告交付结果，不伪造业务回滚。当前 `srv_fs` 仍先执行 MemFs 再准备
-回复，因此不能作为 Outbox 已接通的证据。
+回复失败只报告交付结果，不伪造业务回滚。`srv_fs` 在 Commit 前预备 Outbox/来源；QEMU 已证明提交后的满回复箱在 provider release 时形成 `Abandoned(Shutdown)`，业务节点仍可见，随后全部 owner 与账户收束。
 
 ## 当前边界
 
 `RequestContext`、`PreparedResponse` 与 Outbox 已闭合：Outbox 持有请求
 Delivery、reply-once、预付回复存储和 Runtime 来源，先完成来源准入再允许业务
 Commit，发送失败进入 `Abandoned` 并保持已提交业务事实，来源注销后任务才退休。
+尚未成功投递时，`PreparedResponse::drain_capabilities` 与 Outbox 同名出口可逆序逐项
+取回 Packet 中的业务 capability；该出口不复制 owner，也不访问已被成功发送消费的
+Packet。它只提供运输 owner 的显式收束点，业务是否已经提交、能否恢复仍由上层协议
+状态机决定；FAL affine Take 的提交/回滚边界见 [`fal.md`](fal.md)。
 `srv_init` 合法回复和 `srv_fs` provider 已迁移真实 Outbox；`srv_fs` 的旧阻塞泵、
 手写 framing/回复路径和每请求 Runtime 已删除。当前尚未实现服务端幂等键或去重，
 它们仍是协议扩展，不属于基本 Outbox 完成门。
 
-Dispatcher 已改成可嵌入协议驱动，不再固定实现 `Task<()>`；Runtime 提供有界
-Wake 请求并保留 Gate 暂满时的重试责任。当前没有真实多 in-flight 服务消费者，
-因此 `begin_for` 保留为后续真实消费者的接缝，不另造测试服务证明它。
+`Dispatcher` 已改成可嵌入协议驱动；Runtime 提供有界 Wake 请求并保留 Gate 暂满时
+的重试责任。`begin_for` 已由跨 provider Delegate 真实消费，后续消费者应沿用其
+waiter/task 归属和停止收束契约。
 
 同步 Caller 与异步出站任务共用 Request 阶段、绝对 Deadline 和 owner 语义；
 同步 Caller 仍是阻塞门面，不另建协议状态机。公共单调时钟与绝对期限由

@@ -1,5 +1,6 @@
 //! 统一属性值编码；非递归验证所有嵌套值、名字及能力槽。
 
+use crate::resource::FalResource;
 use crate::{
     authority::FalRights,
     bytes::{Reader, Writer},
@@ -11,7 +12,6 @@ use erhino_shared::{
     message::{MESSAGE_HANDLE_MAX, PAYLOAD_MAX},
     object::{HandleDescription, Rights},
 };
-use crate::resource::FalResource;
 use libsrv::budget::{Account, Charge};
 
 pub const HEADER_LEN: usize = 16;
@@ -92,6 +92,8 @@ pub enum ValueError {
     HandleSlots,
     Allocation,
     Capability(SystemCallError),
+    Affine,
+    Unsupported,
 }
 
 pub trait Capability: Sized {
@@ -419,6 +421,14 @@ pub struct StoreFailure<C> {
     pub handles: Vec<C>,
 }
 
+/// 从属性中取出的完整值；能力 owner 仍由调用方决定交付或恢复。
+pub struct TakenValue<C> {
+    pub bytes: Vec<u8>,
+    pub handles: Vec<StoredHandle<C>>,
+}
+
+pub type ExportedValue<C> = (Vec<u8>, Vec<(C, Rights)>);
+
 impl<C: Capability> StoredValue<C> {
     pub fn prepare(
         bytes: &[u8],
@@ -528,5 +538,242 @@ impl<C: Capability> StoredValue<C> {
             }
         }
         Ok(self.handles.is_empty())
+    }
+
+    pub fn has_affine(&self) -> bool {
+        self.handles
+            .iter()
+            .any(|handle| handle.policy.mode == ExportMode::Affine)
+    }
+
+    /// 复制可重复导出的能力，并把编码中的槽位重写为回复槽位。
+    ///
+    /// DirectoryGrant 不允许走普通 Duplicate；它必须由 provider 的
+    /// Derive 路径产生新的授权。affine 值只能走显式 Take。
+    pub fn duplicate_for_reply(&self) -> Result<ExportedValue<C>, ValueError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.bytes.len())
+            .map_err(|_| ValueError::Allocation)?;
+        bytes.extend_from_slice(&self.bytes);
+        let fields = validate(&bytes, 0, self.handles.len(), bytes.len())
+            .map_err(|_| ValueError::Encoding)?;
+        let mut owners = Vec::new();
+        owners
+            .try_reserve_exact(self.handles.len())
+            .map_err(|_| ValueError::Allocation)?;
+        for (slot, (handle, field)) in self.handles.iter().zip(fields).enumerate() {
+            if handle.policy.mode == ExportMode::Affine {
+                return Err(ValueError::Affine);
+            }
+            if handle.policy.protocol == Protocol::Directory {
+                return Err(ValueError::Unsupported);
+            }
+            let owner = handle
+                .owner
+                .duplicate(handle.policy.transport)
+                .map_err(ValueError::Capability)?;
+            bytes[field.slot_offset..field.slot_offset + 2]
+                .copy_from_slice(&(slot as u16).to_le_bytes());
+            owners.push((owner, handle.policy.transport));
+        }
+        Ok((bytes, owners))
+    }
+
+    /// 线性化 affine Take：存储值立即变为空 Blob，原始值与 owner 交给操作任务。
+    /// 原有额度仍由这个 StoredValue 持有，避免在提交前重新申请资源。
+    pub fn take(&mut self, mut empty: Vec<u8>) -> Result<TakenValue<C>, ValueError> {
+        if !self.has_affine() {
+            return Err(ValueError::Affine);
+        }
+        if empty.capacity() < HEADER_LEN {
+            return Err(ValueError::Allocation);
+        }
+        empty.extend_from_slice(&[Tag::Blob as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let bytes = core::mem::replace(&mut self.bytes, empty);
+        let handles = core::mem::take(&mut self.handles);
+        Ok(TakenValue { bytes, handles })
+    }
+
+    pub fn restore(&mut self, taken: TakenValue<C>) {
+        self.bytes = taken.bytes;
+        self.handles = taken.handles;
+    }
+
+    pub fn commit_take(&mut self) {
+        assert!(
+            self.handles.is_empty(),
+            "committed take retained capability owners"
+        );
+        self._charge.shrink_to(self.bytes.len());
+    }
+}
+
+/// 将属性值中的业务槽位从请求布局重写为回复布局。
+pub fn rebase_slots(
+    bytes: &[u8],
+    handle_count: usize,
+    from_base: usize,
+    to_base: usize,
+) -> Result<Vec<u8>, ValueError> {
+    let fields = validate(bytes, from_base, handle_count, bytes.len())?;
+    let mut rebased = bytes.to_vec();
+    for (slot, field) in fields.into_iter().enumerate() {
+        let target = slot
+            .checked_add(to_base)
+            .filter(|slot| *slot <= u16::MAX as usize)
+            .ok_or(ValueError::HandleSlots)?;
+        rebased[field.slot_offset..field.slot_offset + 2]
+            .copy_from_slice(&(target as u16).to_le_bytes());
+    }
+    Ok(rebased)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use erhino_shared::object::{HandleDescription, HandleRole};
+    use libsrv::budget::{Budget, Taxonomy};
+
+    #[derive(Clone)]
+    struct TestCapability {
+        id: u64,
+        role: HandleRole,
+        rights: Rights,
+    }
+
+    impl Capability for TestCapability {
+        fn description(&self) -> Result<HandleDescription, SystemCallError> {
+            Ok(HandleDescription {
+                object_id: self.id,
+                related_object_id: 1,
+                kind: 0,
+                role: self.role as u32,
+                rights: self.rights,
+                badge: 0,
+                reserved: 0,
+            })
+        }
+
+        fn duplicate(&self, rights: Rights) -> Result<Self, SystemCallError> {
+            if !rights.is_subset_of(self.rights) {
+                return Err(SystemCallError::RightsDenied);
+            }
+            Ok(Self {
+                id: self.id,
+                role: self.role,
+                rights,
+            })
+        }
+
+        fn close(self) -> Result<(), (Self, SystemCallError)> {
+            Ok(())
+        }
+    }
+
+    fn account() -> Arc<Account<FalResource>> {
+        let mut limits = [0; FalResource::COUNT];
+        limits[FalResource::Bytes.slot()] = 4096;
+        Budget::new(&limits, 1).unwrap().account(&limits).unwrap()
+    }
+
+    fn handle_value(mode: ExportMode) -> Vec<u8> {
+        let value = Value::Handle {
+            slot: 1,
+            policy: ExportPolicy {
+                protocol: Protocol::Mailbox,
+                mode,
+                transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                fal_ceiling: FalRights::NONE,
+            },
+        };
+        let mut bytes = vec![0; value.encoded_len().unwrap()];
+        let used = value.encode(&mut bytes).unwrap();
+        bytes.truncate(used);
+        bytes
+    }
+
+    fn capability() -> TestCapability {
+        TestCapability {
+            id: 7,
+            role: HandleRole::MailboxSender,
+            rights: Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        }
+    }
+
+    #[test]
+    fn repeatable_export_duplicates_and_rebases_reply_slot() {
+        let stored = StoredValue::prepare(
+            &handle_value(ExportMode::Repeatable),
+            vec![capability()],
+            1,
+            PAYLOAD_MAX,
+            &account(),
+        )
+        .unwrap_or_else(|_| panic!("repeatable value preparation failed"));
+        let (bytes, handles) = stored.duplicate_for_reply().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].0.id, 7);
+        assert_eq!(validate(&bytes, 0, 1, PAYLOAD_MAX).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn affine_take_can_be_restored_without_losing_owner() {
+        let mut stored = StoredValue::prepare(
+            &handle_value(ExportMode::Affine),
+            vec![capability()],
+            1,
+            PAYLOAD_MAX,
+            &account(),
+        )
+        .unwrap_or_else(|_| panic!("affine value preparation failed"));
+        let mut empty = Vec::new();
+        empty.try_reserve_exact(HEADER_LEN).unwrap();
+        let taken = stored.take(empty).unwrap();
+        assert_eq!(taken.handles.len(), 1);
+        assert!(stored.handles.is_empty());
+        assert!(validate(&stored.bytes, 0, 0, PAYLOAD_MAX).is_ok());
+        stored.restore(taken);
+        assert!(stored.has_affine());
+        assert_eq!(validate(&stored.bytes, 0, 1, PAYLOAD_MAX).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_roundtrip_rejects_duplicate_field_names() {
+        let fields = [
+            Field {
+                name: "instance",
+                value: Value::Integer(17),
+            },
+            Field {
+                name: "protocol",
+                value: Value::Str("fal"),
+            },
+        ];
+        let value = Value::Record(&fields);
+        let mut bytes = vec![0; value.encoded_len().unwrap()];
+        let used = value.encode(&mut bytes).unwrap();
+        bytes.truncate(used);
+        assert!(validate(&bytes, 0, 0, PAYLOAD_MAX).is_ok());
+
+        let duplicate = [
+            Field {
+                name: "endpoint",
+                value: Value::Integer(1),
+            },
+            Field {
+                name: "endpoint",
+                value: Value::Integer(2),
+            },
+        ];
+        let value = Value::Record(&duplicate);
+        let mut bytes = vec![0; value.encoded_len().unwrap()];
+        let used = value.encode(&mut bytes).unwrap();
+        bytes.truncate(used);
+        assert_eq!(
+            validate(&bytes, 0, 0, PAYLOAD_MAX),
+            Err(ValueError::DuplicateField)
+        );
     }
 }

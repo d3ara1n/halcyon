@@ -1,9 +1,9 @@
 //! libfs：客户端命名空间库——前缀表、逐子树委托走路与符号链接展开
 //! （契约见 notes/ideas/fal.md「命名空间」「走路」）。
 //!
-//! 命名空间是进程私有的「名字前缀 → 目录 Handle」路由表；走路引擎
+//! 命名空间是进程私有的「名字前缀 → DirectoryGrant」路由表；走路引擎
 //! 在客户端展开符号链接（迭代式组件队列 + 逻辑目录栈，`..` 不上行
-//! 穿过权限上界），抵达终点后以 `Position`（帧锚 Handle + 相对后缀）
+//! 穿过权限上界），抵达终点后以 `Position`（帧锚 grant + 相对后缀）
 //! 寻址后续操作。rinlib 保持纯运行时，本库不依赖 syscall——传输由
 //! [`resolve::WalkTransport`] 抽象注入，host 可测；真实传输随 fs 集成
 //! 批次接入。
@@ -12,6 +12,8 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "riscv64")]
+pub mod client;
 pub mod prefix;
 pub mod resolve;
 
