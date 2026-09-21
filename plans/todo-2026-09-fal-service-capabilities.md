@@ -6,11 +6,11 @@
 
 ## 开发分支与交接
 
-集成基线提交：`d22b9d71ef810145bf4d5bfb3673ffec8640f361`（`chore(fal): 保存公共对象收口后的集成开发基线`），共 131 个文件。它包含公共对象前置交付与其余草稿，不是最终 FAL 合并提交。固定该提交的未来代码复核见 [集成基线 Review](todo-2026-09-13-fal-integration-baseline-review.md)；当前接手必须保留本分支 HEAD 之后的完整未提交工作树，不退回该基线覆盖后续改动。
+历史集成基线提交：`d22b9d71ef810145bf4d5bfb3673ffec8640f361`（`chore(fal): 保存公共对象收口后的集成开发基线`），共 131 个文件。它包含公共对象前置交付与其余草稿，不是最终 FAL 合并提交。固定该提交的未来代码复核见 [集成基线 Review](todo-2026-09-13-fal-integration-baseline-review.md)；当前接手以 `dfcf7a3` 及其后续变化为准，不退回该历史基线覆盖后续改动。
 
-- 开发分支：`task/fal-service-capabilities`，由本地 `master` 的 `5d406a4` 分出；当前 HEAD 为 `84eeed6`（F0 文档重排）。F1–F3c 的代码、文档和验收装配仍共同位于未提交工作树，切换会话不得 reset、checkout 覆盖或把其中任一阶段误当成已固定提交。
+- 开发分支：`task/fal-service-capabilities`，由本地 `master` 的 `5d406a4` 分出；F1–F3c 的代码、文档、验收装配与库重排原则已整体固定为 `dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`，父提交为 `84eeed6`（F0 文档重排）。固定提交审查见[基线 Review](todo-2026-09-21-fal-library-baseline-review.md)，该提交不表示整体 FAL 完成交付。
 - 交接入口：先读 `plans/COMPASS.md`、本节和对应专题计划；实现现状看 `notes/impls/`，目标契约看 `notes/ideas/`。会话内任务编号只作临时导航，不能写入项目语义，计划文件是跨会话真值。
-- 开发方式：F0 只形成文档基线；F1–F3c 随后按语义闭包连续实施，但目前仍共同位于未提交工作树。下一会话先接手库重排计划 L0，其完成后恢复 F3d，再依次进入 F3e、F3f 与 F4；每项仍须包含真实调用者、失败/取消/退出/退休/退款、旧路径删除和验证，不以 passing fragment 标完成。任何提交、合并或 push 均需另行取得用户授权。
+- 开发方式：F0 形成文档基线；F1–F3c 的连续迁移以 `dfcf7a3` 整体保存。下一会话先接手库重排计划 L0，其完成后恢复 F3d，再依次进入 F3e、F3f 与 F4；每项仍须包含真实调用者、失败/取消/退出/退休/退款、旧路径删除和验证，不以 passing fragment 标完成。保留基线之后的全部工作树变化；后续实现提交、合并与 push 仍须取得用户授权。
 
 | 专题 | 交接状态 | 接手入口与剩余责任 |
 |---|---|---|
@@ -150,7 +150,7 @@ F3c 已发布严格 `Subscribe`、`QuerySubscription`、`Unsubscribe` wire 与 `
 
 ### 跨会话接力断点
 
-接手基线是分支 `task/fal-service-capabilities`、HEAD `84eeed6` 加当前未提交工作树。F1–F3c 尚未拆分或固定为提交；现有新增、修改和删除文件共同构成连续迁移，不得回退到 HEAD、`d22b9d7` 或只挑 Watch 文件继续。接手时先运行 `git status --short --branch` 与 `git diff --check`，确认工作树仍包含 `libfal`/`libfs`/`librpc`/`libsrv`、`srv_fs`、`srv_init` 及对应 notes/plans 的整组变化。
+接手分支为 `task/fal-service-capabilities`，代码与方向/计划基线为 `dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`。F1–F3c 的全部新增、修改和删除共同构成该连续迁移快照，提交后审查登记与导航更新另以文档提交保存。接手时先运行 `git status --short --branch` 与 `git diff --check`，保留该基线之后的全部工作树变化，不回退到 `84eeed6`、`d22b9d7` 或只挑 Watch 文件继续。
 
 F3c 已完成的最近证据是：`just check`、RISC-V 全用户程序构建、`libfal` host 27 项、`libfs` host 17 项、七面 `just clippy`、`THROTTLE=100 just virt`、`THROTTLE=100 just virt-release` 与 `git diff --check`。未执行的是 F3/F4 收尾才要求的完整 stress、`sifive_u`、`virt-nofd`、boot-failure 和 `just acceptance`；下一会话不得把这些未跑门写成 F3c 缺陷，也不得把 core/release 通过冒充整体 FAL 验收。
 
