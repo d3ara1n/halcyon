@@ -10,6 +10,7 @@
 
 - 开发分支：`task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出。
 - F1–F3c 连续实现基线：`dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`；库知识、目录与命名重排：`96ee03b0d1641c86ed8ab05951bad6954ea84db4`；本次文档修订接手 HEAD：`3607f22`，接手时工作树干净。
+- 跨阶段边界与 F3d 设计固定提交：`1000270ef2b54c35bc56acda10943dd94c0e7e12`；[未来设计 Review](todo-2026-09-21-fal-service-design-review.md) 在提交后登记，待实现闭包完成后执行，不阻塞 F3d，也不作为运行能力交付证据。
 - 当前实现入口：[`FAL`](../notes/impls/fal.md)、[`RPC`](../notes/impls/rpc.md)、[`Runtime`](../notes/impls/runtime.md)、[`Runnel`](../notes/impls/runnel.md)、[`启动`](../notes/impls/startup.md)。组件命名与依赖先读 [`user/README.md`](../user/README.md) 和 [`user/libraries/README.md`](../user/libraries/README.md)。
 - 方向入口：`notes/ideas/{fal,fs,service,framework,message,wait,time,rpc,tunnel,runnel}.md`。方向文档不是实现完成证据；当前代码也不自动决定未来边界。
 

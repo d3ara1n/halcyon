@@ -34,7 +34,7 @@
 
 无消费者的 Runnel 观察草稿面及原始 ABI 工厂已删除；typed create/attach 是唯一构造入口，正式 poll/SourcePlan 已由 init↔pm 的 Runtime 消费，后续 Open 应续用而非重建观察层。Delivery 独立身份与 Peek 保留。共享包整理已完成：`shared/` 作为独立 workspace，`erhino_shared` 与跨层纯逻辑库（含 `elf`、`tar`、`monotonic_id`、`ordered_table`、`timer_queue`、`metadata_admission`）各自保持独立 package。
 
-当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；F1–F3c 基线为 `dfcf7a3`，用户态库知识/目录/命名重排为 `96ee03b`，本次计划修订接手 HEAD 为 `3607f22`。前者固定审查见[基线 Review](todo-2026-09-21-fal-library-baseline-review.md)，库重排过程见[归档计划](archived/todo-2026-09-21-library-knowledge-ownership.md)、固定审查见[库重排 Review](todo-2026-09-21-library-knowledge-ownership-review.md)。当前从 [FAL 剩余设计任务](todo-2026-09-fal-service-capabilities.md#4-剩余能力设计闭包)及[接力断点](todo-2026-09-fal-service-capabilities.md#跨会话接力断点)接手，保留后续工作树变化，不回退到旧 F0 或库重排前结构。后续实现提交、合并与 push 仍须授权；历史日志/诊断产物只在本机 artifacts，异机按影响面重跑。
+当前开发分支为 `task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出；F1–F3c 基线为 `dfcf7a3`，用户态库知识/目录/命名重排为 `96ee03b`，设计接手基线为 `3607f22`，跨阶段边界与 F3d 设计提交为 `1000270`。前者固定审查见[基线 Review](todo-2026-09-21-fal-library-baseline-review.md)，库重排过程见[归档计划](archived/todo-2026-09-21-library-knowledge-ownership.md)、固定审查见[库重排 Review](todo-2026-09-21-library-knowledge-ownership-review.md)；本轮[设计 Review](todo-2026-09-21-fal-service-design-review.md) 已登记，待实现闭包完成后执行。当前从 [F3d 施工顺序](todo-2026-09-fal-service-capabilities.md#88-施工顺序与完成门)及[接力断点](todo-2026-09-fal-service-capabilities.md#跨会话接力断点)接手，保留后续工作树变化，不回退到旧 F0 或库重排前结构。后续实现提交、合并与 push 仍须授权；历史日志/诊断产物只在本机 artifacts，异机按影响面重跑。
 
 plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报告。专题 todo 拥有当前实施，Review 保留目标提交证据与复核清单，二者不重复安排同一问题。已完成调查/复核进入 `archived/`，`ref-*` 是只读参考资料。当前全部活跃入口：
 
@@ -47,6 +47,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`archived/todo-2026-09-21-library-knowledge-ownership.md`](archived/todo-2026-09-21-library-knowledge-ownership.md) | 已完成并归档：`96ee03b` 交付公共记账/执行、领域与目录重排、用户态组件命名和空库删除 |
 | [`todo-2026-09-21-library-knowledge-ownership-review.md`](todo-2026-09-21-library-knowledge-ownership-review.md) | 未来 Review：固定审查 `96ee03b` 的记账/执行不变量、全部真实消费者、目录迁移、旧路径删除及命名收口 |
 | [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | 第 4/8 节设计已闭合，下一步按 §8.8 实施 F3d；第 9/10 节保留 Open/Copy 局部设计门，第 12 节拥有独立 test_fal 与组合门；仅文档，无新增运行证据 |
+| [`todo-2026-09-21-fal-service-design-review.md`](todo-2026-09-21-fal-service-design-review.md) | 未来设计 Review：固定文档提交 `1000270`；待 F3d 实现闭包完成后核对设计与最终机制，不把设计提交当作运行证据，不阻塞当前施工 |
 | [`todo-2026-09-21-fal-library-baseline-review.md`](todo-2026-09-21-fal-library-baseline-review.md) | 未来 Review：固定 `dfcf7a3` 的 F1–F3c 连续实现、消费者与库重排前基线；不把整体 FAL 或库重排标为已完成 |
 | [`todo-2026-09-monotonic-time-rpc-deadline.md`](archived/todo-2026-09-monotonic-time-rpc-deadline.md) | 时间前置 公共时间前置 已完成并归档：精确时钟、MonotonicNow、绝对 Wait/Sleep/Send、运行期协作停止与现有消费者；由执行/业务任务消费完整 Deadline |
 | [`todo-2026-09-14-message-transport-review.md`](todo-2026-09-14-message-transport-review.md) | 未来 Review：固定复核 `3060dd8` 的 typed 运输层、消费式 Packet、take/restore 重试与消费者迁移失败路径，不重开流闭包设计 |
