@@ -1,6 +1,6 @@
 # 通用 RPC 实现
 
-方向见 [`../ideas/rpc.md`](../ideas/rpc.md)。通用 framing 与同步调用器位于 `user/frameworks/librpc`；rinlib 只提供 Mailbox、Handle 与 WaitMany，不解释 RPC。
+方向见 [`../ideas/rpc.md`](../ideas/rpc.md)。通用 framing 与同步调用器位于 `user/libraries/librpc`；rinlib 只提供 Mailbox、Handle 与 WaitMany，不解释 RPC。
 
 ## Framing
 
@@ -22,7 +22,7 @@ ServiceClosed、Wait/Receive 错误和 timeout 同样废弃端口，`Caller` 自
 ## 异步出站任务
 
 `e0b5c45` 的 `dispatcher.rs` 已将 `Dispatcher` 改为
-`libsrv::runtime::Task<()>`：它只拥有
+`libexecution::runtime::Task<()>`：它只拥有
 PendingCall、txid 路由、Request/Reply 阶段、ReplyPort、MessageStorage 和
 完成 FIFO。WaitSet 来源、arm generation、事件输入、期限唤醒、来源注销重试、
 任务停止和最终退休全部由 Runtime 拥有。Dispatcher 通过 `Requests::arm_source`、

@@ -4,8 +4,8 @@
 
 use super::*;
 use alloc::vec::Vec;
+use libexecution::runtime::{DriveState, TaskFailure};
 use libprocess::{Collector, job_driver::JobDriver};
-use libsrv::runtime::{DriveState, TaskFailure};
 use rinlib::shared::time::Deadline;
 
 const ROOT_WAIT_TARGETS: usize = 6;
@@ -237,15 +237,11 @@ fn can_drive<T>(rt: &Runtime<T, WaitSet>, now: u64) -> bool {
 
 fn runtime<T>(capacity: usize, sources: usize) -> Result<Runtime<T, WaitSet>, SystemCallError> {
     let bytes = Runtime::<T, WaitSet>::input_budget(sources)?;
-    let budget = libsrv::budget::Budget::new(&[capacity, bytes], 1)?;
+    let budget = Budget::new(&[capacity, bytes], 1)?;
     let account = budget.account(&[capacity, bytes])?;
-    Runtime::new(
-        WaitSet::create(sources)?,
-        capacity,
-        sources,
-        libsrv::budget::CoreResource::EXECUTION_SLOTS,
-        &account,
-    )
+    let account =
+        account.view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])?;
+    Runtime::new(WaitSet::create(sources)?, capacity, sources, &account)
 }
 
 /// 关闭失败把原运行体放回原槽；该操作不需要申请新的错误承载。

@@ -34,7 +34,7 @@ Absent -> Starting -> Ready(instance, protocol, endpoint) -> Draining -> Absent
 
 撤销名称只阻止新发现，不追溯销毁已授 capability。政策撤销阻止特定授权的新操作准入；已准入请求和独立建立的连接按自身契约收束，不隐含跨服务递归撤销。capability 转交后的寿命由真实引用及交付责任决定，不依赖原进程保活或周期续租。
 
-服务记录 schema 与注册控制属于 libsrv，通用 Record、能力值和目录投影属于 FAL。首个承载者由启动拓扑指定，不因此成为所有进程必须经过的全局注册权威。
+服务记录 schema 与注册控制属于 libservice，通用 Record、能力值和目录投影属于 FAL。首个承载者由启动拓扑指定，不因此成为所有进程必须经过的全局注册权威。
 
 ## 监督与接管
 

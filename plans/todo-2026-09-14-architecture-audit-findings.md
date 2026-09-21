@@ -1,6 +1,6 @@
 # 架构审计发现承接
 
-> 状态：待逐条审视的发现清单，不是当前实施任务，不阻塞任何活跃专题。审视基线为 `master` 分支 `f4a4d57`（工作树另有「通用执行与准入」闭包的未提交改动，与本清单无关）。每条发现都须先按 `AGENTS.md`「标准施工流程」完成接手、规模审计与设计闭包，再决定实施、降级为文档修正或关闭。
+> 状态：待逐条审视的开放发现清单，不是当前实施任务，不阻塞任何活跃专题。审视基线为 `master` 分支 `f4a4d57`（工作树另有「通用执行与准入」闭包的未提交改动，与本清单无关）。每条发现都须先按 `AGENTS.md`「标准施工流程」完成接手、规模审计与设计闭包，再决定实施、降级为文档修正或关闭；已关闭条目从本清单删除，由对应专题和 git 历史保留证据。
 >
 > 本计划只拥有下列发现的**判断与验证面**。发现涉及的机制改造归各自既有专题（见「归属映射」），不重复安排同一问题。
 
@@ -18,10 +18,7 @@
 |---|---|---|
 | A1 退役债务不变量不可局部验证 | 债务批次数的观测面与断言要求 | 退休/请求结构收束已归档于 [`public-operation-ownership`](archived/todo-2026-09-14-public-operation-ownership.md) |
 | A2 全局 metadata 配额不可归属 | 触发条件认定与常量依据审查 | 配额机制本身归 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) |
-| A3 libfal→libsrv 依赖反向 | 全部（本计划唯一拥有） | — |
 | B1 同步 Caller 与事件循环并存 | 「阻塞必须显式」的类型要求 | typed PendingCall / Outbox 归 [`service-runtime-prerequisites`](todo-2026-09-13-service-runtime-prerequisites.md) |
-| B2 srv_fs 验证面与成本不匹配 | 全部（本计划唯一拥有） | FAL 业务操作归 [`fal-service-capabilities`](todo-2026-09-fal-service-capabilities.md) |
-| B3 `shared::service::Endpoint` 空占位 | 全部（本计划唯一拥有） | 服务发现实现归 FAL 总计划 |
 | C1–C3 容量/粒度/派生依据 | 全部（本计划唯一拥有） | — |
 | M1 裸帧号穿越 affine 所有权边界 | 全部（本计划唯一拥有） | — |
 | M2 metadata 耗尽后果是内核 panic | 事实核实（是否为真实 panic 面） | 配额与预算机制归 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) |
@@ -58,25 +55,12 @@
 
 **把握程度**：高（常量取值已核对）。未核对全部使用点，也未确认是否已有未成文的 per-sponsor 收紧路径。
 
-### A3 `libfal` 依赖 `libsrv`，依赖方向与分层声明相反
-
-**现状与位置**：`user/frameworks/libfal/Cargo.toml` 依赖 `libsrv`；`libfal/src/{authority,backend,data,grant,store,value}.rs` 的**公开类型签名**中出现 `libsrv::budget::{Account, Charge}` 与 `Rc<dyn libsrv::wake::Wake>`。
-
-**判断**：`notes/ideas/framework.md` 声明「准入机制提供账户、额度、预留与真实释放后的退款；领域资源类别由领域定义」。`Taxonomy` 反转该机制已经做对（分类归 `libfal::resource`，机制归 `libsrv::budget`），但**依赖方向做反了**：协议库的公开类型里出现执行框架的具体类型。后果是 provider 实现被迫知道记账；`bytes.rs`/`header.rs`/`node.rs`/`protocol.rs` 这些本可独立 host 可测的纯逻辑被迫拖着 libsrv 才能编译；未来跨信任域复用 FAL 会带着执行框架的额度语义一起走。
-
-**待办**：把额度与唤醒的**抽象**下移到 libsrv 之下（`shared/` 内新 crate，或 `libfal` 自己定义 trait 并由服务层注入），`libfal` 面向 `&dyn Budget` / `&dyn Wake` 编程，具体 `Account` 由服务层提供。完成标准是 `libfal` 不再依赖 `libsrv`，且 `memfs` 请求路径不再出现具体 `Charge` 类型。
-
-**触发条件**：立即可做，成本最低。建议作为本清单首项。
-
-**验证**：`libfal` 的 host 测试独立通过；`cargo tree -p libfal` 无 `libsrv`；`just clippy` 用户态面通过。
-
-**把握程度**：高。
 
 ## B 类：当前阶段的实质矛盾
 
 ### B1 同步阻塞 `Caller` 与事件循环执行模型并存，且类型上不可区分
 
-**现状与位置**：`user/frameworks/librpc/src/caller.rs` 的 `Caller` 为同步阻塞、线程私有 ReplyPort、一次一个 outstanding；`notes/impls/rpc.md` 自承「`send_blocking` 在 MailboxFull 时无限等待，因此它还不是完整调用 deadline」。同时 `notes/ideas/framework.md` 要求「下游 RPC、发送背压和设备完成作为挂起状态，不在控制循环中阻塞」，`user/frameworks/libsrv/src/runtime.rs` 是异步单 actor 有界推进。
+**现状与位置**：`user/libraries/librpc/src/caller.rs` 的 `Caller` 为同步阻塞、线程私有 ReplyPort、一次一个 outstanding；`notes/impls/rpc.md` 自承「`send_blocking` 在 MailboxFull 时无限等待，因此它还不是完整调用 deadline」。同时 `notes/ideas/framework.md` 要求「下游 RPC、发送背压和设备完成作为挂起状态，不在控制循环中阻塞」，`user/libraries/libexecution/src/runtime.rs` 是异步单 actor 有界推进。
 
 **判断**：两套执行模型都是**正式形态**而非标注的过渡。在 `no_std` 服务里一次 `Caller::call()` 会直接停住 actor 线程，而类型上看不出来。这不需要谁犯错，只需有人自然地写 `let r = caller.call(...)`。
 
@@ -86,23 +70,7 @@
 
 **把握程度**：高（`notes/impls/rpc.md` 已自承该缺口）。
 
-### B2 `srv_fs` 的验证面与维护成本不匹配
 
-**现状与位置**：`user/services/srv_fs/src/main.rs` 同进程 memfs provider + 客户端泵；`notes/impls/fal.md` 自列边界：slot 1 是临时 anchor 副本、无 DirectoryGrant、无 rights ceiling、provider 与 client 同进程、Lookup Delegate 只在 mock 中、Open 返回 Unsupported、Move/Copy 返回 Unsupported。
-
-**判断**：剥掉上述边界后，该负载实际覆盖的是 Mailbox 往返 + Handle move + send-once——而这三项在公共 IPC 前置中已有更严格的 fixture（真实双接收线程、forced Full、64 条独立授权、跨进程 CLOSE 提交后 kill）。风险是它会让人误以为 FAL 已通，而泵逻辑是一笔真实的自检维护成本。
-
-**待办**：在 FAL 业务恢复前二选一——接上真实 DirectoryGrant 使 slot 1 名实相符，或降为最小 smoke。完成标准是该负载的验证声明与实际覆盖面一致，无中间态。
-
-**把握程度**：高（`notes/impls/fal.md` 已自列边界）。
-
-### B3 `shared::service::Endpoint` 是空占位 struct
-
-**现状与位置**：`shared/erhino_shared/src/service.rs` 全文为 `pub struct Endpoint {}`；`shared/erhino_shared/src/sync.rs` 全文为 `pub mod spin;`。`notes/ideas/service.md` 已是完整契约，但代码中该名字会被 import，且 `Endpoint` 当前有三重含义（Tunnel Endpoint、Mailbox 的 endpoint 概念、未来的服务 endpoint）。
-
-**待办**：要么现在定名（`ServiceRecord` / `ServiceEndpoint`），要么删除空文件等实现落地。完成标准是不存在无实现的公开占位类型。
-
-**把握程度**：高。
 
 ## C 类：容量与依据（可能过度设计，需重新论证而非直接改）
 

@@ -25,7 +25,7 @@ FAL1 protocol id、FalHeader、slot-1 anchor、`MemFs`、旧 provider dispatch �
 - `GrantTable::snapshot` 是 `AccessSnapshot` 的唯一构造点；GrantTable 绑定真实 provider Mailbox identity，以 sender context 查表，持 Lifetime CLOSED 观察和账户收费。`prepare_derive` 从活动父 grant 继承账户与运输 ceiling、拒绝权限放大，并为稳定目录 root 创建独立 sender/Lifetime。Runtime task 先登记 Lifetime source 再安装和回复发布；回复放弃会关闭 sender 并走同一退休退款路径。
 - FAL2 `protocol.rs` 提供 Lookup/Create/Read/Write/ReadAt/WriteAt/Delete/Enumerate/Link/Derive/Move/Take/Subscribe/QuerySubscription/Unsubscribe；Lookup 成功体为严格 Found/Delegate/LinkBoundary 三态，Delegate 与 Derive 成功各要求回复 capability slot 0，Move 的请求 slot 1 携带目标 DirectoryGrant，Subscribe 的请求 slot 1 携带 Notification signaler，属性值按自身 Handle 字段声明业务槽，枚举项流按声明 count 完整消费且拒绝残尾。
 - `srv_fs::server::run` 统一拥有 Runtime/WaitSet、GrantTable、MemoryBackend、退休 Notification/`NotificationWake`、Outbox 和 provider-local 根 grant。Ingress 从内核填入的 `sender_context_id` 获取 `AccessSnapshot`，payload 中的数字不能伪造授权。
-- `FalResource` 的 `Task`/`InputBytes` 槽由 Runtime 预算消费；Node/Bytes/Grant/Watch/WaitSource 由 FAL 后端、授权和观察状态消费。Request/Outbox 仍不重复计入机械 Runtime 槽。
+- provider 由同一 `libbudget::Account` 建立两个不可变视图：`AccountView<ExecutionResource>` 支付 Runtime 的 Task/InputBytes，`AccountView<FalResource>` 支付 Node/Bytes/Grant/Watch/WaitSource。两个视图共享付款身份与总账额度，Request/Outbox 不重复计入机械执行槽。
 
 - F2 已接通两个独立 provider、独立管理 endpoint 与真实 Delegate：init 为两个 `srv_fs` 分别提供 bootstrap/release/route mailbox，取得 object identity 不同的 root grant，再经 provider A 的 route endpoint 交付 provider B 的母 grant和 FAL rights ceiling。A 的普通 Lookup 命中绑定后不直接转交母本，而由同一 Runtime 中的 `librpc::Dispatcher` 非阻塞调用 B 的 Derive；完成后 `DelegateTask` 将独立子 grant、consumed 与 remaining 随严格 capability slot 0 回复。init 的 Namespace 只挂 A 的 `/`，正式 `libfs::client::Transport` 已通过 `/second` 与 `/second/f2-dir/leaf` 跨越 Delegate 访问 B，并验证授权衰减。启动 grants 缺失或 role 错误时 fail-closed。
 ### Owner 与收束边界
@@ -34,7 +34,7 @@ FAL1 protocol id、FalHeader、slot-1 anchor、`MemFs`、旧 provider dispatch �
 
 后端成功替换/摘链后的旧值由显式 retire task 通过 Notification 电平唤醒并按预算推进；release Notification 是同一 Runtime 的正式 source。服务退出顺序为停止准入、Dispatcher 取消/完成下游调用、撤销全部 grant Lifetime source、收束 backend retire、移除 route/release/retire source、关闭 Runtime。固定宽 `ProviderReport` 在全部账户归零后报告 committed、回复 abandoned 和已投递下游调用 abandoned。
 
-当前 host 验证为 `libfal` 27 项、`libfs` 17 项。F3c 增量已通过七面 `just clippy`、`git diff --check`、`THROTTLE=100 just virt` 与 `THROTTLE=100 just virt-release`；完整 `just acceptance` 最近一次证据仍是 F2 基线，覆盖 stress 16/16、release、`sifive_u`、`virt-nofd` 与 panic/alloc/fatal 三类 boot-failure，后续 F3 按专题整体收尾统一重跑。双 provider/退出组合纳入后，`VIRT_NOFD_TIMEOUT=45s`、`SIFIVE_U_TIMEOUT=60s` 均已按实际负载重校。QEMU 除双 provider/Delegate 正常链外还覆盖两条确定性退出链：B 在业务提交后因满回复箱停驻，release 产生 `abandoned=1`；A 的下游 Derive 已进入 init 持有的静默 Mailbox，release 产生 `downstream_abandoned=1`，随后 Cancelled 客户端回复也以 `abandoned=1` 收束。两端最终均完成 Runtime、GrantTable、Watch、route owner、Delivery/reply-once、账户退款与监督回收。
+当前 host 验证为 `libbudget` 6 项、`libexecution` 22 项、`libfal` 27 项、`libprocess` 16 项；`libfs` 既有 17 项保持通过基线。库迁移后的 `just check`、七面 `just clippy`、`git diff --check` 与 `THROTTLE=100 just acceptance` 已通过，完整覆盖 stress 16/16、release、`sifive_u`、`virt-nofd` 与 panic/alloc/fatal 三类 boot-failure。双 provider/退出组合纳入后，`VIRT_NOFD_TIMEOUT=45s`、`SIFIVE_U_TIMEOUT=60s` 均已按实际负载重校。QEMU 除双 provider/Delegate 正常链外还覆盖两条确定性退出链：B 在业务提交后因满回复箱停驻，release 产生 `abandoned=1`；A 的下游 Derive 已进入 init 持有的静默 Mailbox，release 产生 `downstream_abandoned=1`，随后 Cancelled 客户端回复也以 `abandoned=1` 收束。两端最终均完成 Runtime、GrantTable、Watch、route owner、Delivery/reply-once、账户退款与监督回收。
 
 ## F3a 同域 Move 接线
 
@@ -62,7 +62,7 @@ provider-local Watch 表固定上限 8；表以单调 subscription id 寻址，�
 
 Unsubscribe 先从发布表摘除并清空尚未 signal 的 pending 位，再唤醒任务撤销 source，回复确认后不再产生新事件；Notification owner 静默关闭走同一退休路径。Subscribe 回复 abandoned 会由服务端主动摘表、撤源和退款，不依赖客户端最终关闭；provider 停止时先合并并 signal `TERMINATED`，随后撤源关闭 signaler。`srv_init` 在两个独立 provider 上验证目录 CREATE、节点 MODIFY、代次推进、外来 grant context 拒绝、显式取消后静默、owner 静默消散、节点删除终态、provider 停止终态与最终 Watch/WaitSource 退款。
 
-当前接力位置为 F3d 服务注册/发现。注册表、`ServiceRecord` 和 `RegistrationControl` 尚未实现，第 8 节计划内容仍待结合当前启动/路由装配完成任务规模审计与设计裁决；现有 route-management endpoint 只拥有跨 provider 路由绑定，不能视为注册权威。F1–F3c 仍处于 HEAD `84eeed6` 之上的同一未提交工作树，完整 acceptance 留到 F3/F4 整体收尾。
+当前接力位置为 F3d 服务注册/发现。注册表、`ServiceRecord` 和 `RegistrationControl` 尚未实现，第 8 节计划内容需结合当前启动/路由装配完成任务规模审计与设计裁决；现有 route-management endpoint 只拥有跨 provider 路由绑定，不能视为注册权威。公共记账与执行已分别收口到 `libbudget`、`libexecution`；未来服务领域库的正式名称是 `libservice`，但只在 F3d 有真实发布/发现消费者时建立。当前工作树基于固定 FAL 基线 `2124413`，库重排闭包待提交后即可恢复 F3d。
 
 
 ## F1 接手边界
@@ -80,6 +80,6 @@ F1 不再拆成“先后端、后授权”的文件阶段，而是一个单 prov
 
 F1 的唯一真实消费者是正式 provider 运行体及其最小 client。不得以 v1 `MemFs`、同进程 self-pump、slot-1 anchor 或 host mock 充当 F1 消费者。完成门必须覆盖授权不可伪造、五类 mutation 的正常/准备失败/取消/冲突/提交/旧值退休、服务公平推进、期限、调用者退出、服务退出、Delivery/Outbox 和 metadata/account 退款。
 
-F1 的目标类型图已进一步冻结：Runtime 是 WaitSet 的唯一登记/接收/关闭 owner；grant Lifetime 由正式 Runtime task 观察，GrantTable 不再直接借用 WaitSet；backend retire 由预先登记的 Notification source 显式唤醒；`FalResource` 同时提供领域槽与 Runtime task/input 槽。F1 建立 provider-local 根 DirectoryGrant 和基础操作最小 client，Move 仅覆盖后端事务状态机，不发布后续业务 opcode。
+F1 的目标类型图已进一步冻结：`libexecution::Runtime` 是 WaitSet 的唯一登记/接收/关闭 owner；grant Lifetime 由正式 Runtime task 观察，GrantTable 不再直接借用 WaitSet；backend retire 由预先登记的 Notification source 显式唤醒。provider-local 根 DirectoryGrant 与基础操作最小 client 已建立。执行与 FAL 领域分别使用 `ExecutionResource`、`FalResource`，并通过同一 `libbudget::Account` 的两个 view 共享付款来源而不混合分类。
 
 F2 接通独立 provider/client、namespace/Delegate、真实启动能力图和跨 provider 路由，并在最后一个旧消费者迁移时删除 v1 临时 anchor、无鉴权 MemFs 与同进程旧泵；F3a–F3c 已依次接通公开 Move、Record/Handle/Take、属性 Copy 与 Watch。下一闭包为 F3d 注册/发现，之后才是 F3e Open、F3f 流 Copy；F4 只建立独立 `test_fal`、完成组合验收与归档。

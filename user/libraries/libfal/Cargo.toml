@@ -1,0 +1,18 @@
+[package]
+name = "libfal"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Filesystem abstract layer: wire protocol and provider building blocks"
+edition = "2024"
+
+[dependencies]
+librpc = { path = "../librpc" }
+libbudget = { path = "../libbudget" }
+libexecution = { path = "../libexecution" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+ordered_table = { path = "../../../shared/ordered_table" }
+metadata_admission = { path = "../../../shared/metadata_admission" }
+monotonic_id = { path = "../../../shared/monotonic_id" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }

@@ -124,7 +124,7 @@ Receive/Delivery
 
 本任务接通 Packet/Delivery → Request/Task/Outbox → terminal → retire → refund。运输由 rinlib/Runnel 拥有；任务调度、观察注册寿命、任务唤醒与期限唤醒由执行核心拥有；RPC 路由及请求/回复责任由 librpc 拥有。执行核心不认识 FAL 节点、grant、Watch 或服务记录，也不依赖 RPC 的请求状态。
 
-库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；服务框架消费 RPC/FAL 等领域能力，通用能力库不反向依赖 libsrv。具体包/类型图和既有消费者迁移由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)承担，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
+库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；未来 `libservice` 消费 RPC/FAL 等领域能力，通用能力库不反向依赖它。具体包/类型图和既有消费者迁移由[库重排计划](todo-2026-09-21-library-knowledge-ownership.md)承担，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
 
 ## 可以先行的局部收口
 

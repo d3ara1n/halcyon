@@ -11,13 +11,17 @@
 
 #![no_std]
 
+use libbudget::Budget;
+use libexecution::{
+    ExecutionResource,
+    runtime::{
+        Advance, DriveState, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step,
+        Task,
+    },
+};
 use libprocess::job_driver::JobDriver;
 use libprocess::{DEFAULT_SUPERVISION_POLICY, JobCollector};
 use librunnel::blocking;
-use libsrv::budget::{Budget, CoreResource};
-use libsrv::runtime::{
-    Advance, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step, Task,
-};
 use rinlib::{
     env,
     ipc::{
@@ -876,12 +880,13 @@ fn main() {
     let domain = env::startup_handle(1).expect("pm: delegated domain control is missing");
 
     // 执行核心：任务与输入额度在公开前准备。
-    let budget = Budget::<CoreResource>::new(&[16, 64 * 1024], 1).expect("pm: budget");
+    let budget = Budget::new(&[16, 64 * 1024], 1).expect("pm: budget");
     let account = budget.account(&[16, 64 * 1024]).expect("pm: account");
+    let account = account
+        .view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
+        .expect("pm: execution budget binding");
     let set = WaitSet::create(64).expect("pm: wait set");
-    let mut runtime =
-        Runtime::<PmTask, WaitSet>::new(set, 16, 16, CoreResource::EXECUTION_SLOTS, &account)
-            .expect("pm: runtime");
+    let mut runtime = Runtime::<PmTask, WaitSet>::new(set, 16, 16, &account).expect("pm: runtime");
 
     let mut world = PmWorld {
         mailbox,
@@ -925,9 +930,9 @@ fn main() {
             exit_failed();
         }
         match runtime.drive_state() {
-            libsrv::runtime::DriveState::Drained => break,
-            libsrv::runtime::DriveState::Runnable => {}
-            libsrv::runtime::DriveState::Waiting(deadline) => {
+            DriveState::Drained => break,
+            DriveState::Runnable => {}
+            DriveState::Waiting(deadline) => {
                 if world.domain_done && !stopping {
                     continue;
                 }
@@ -959,8 +964,8 @@ fn main() {
         world.mailbox_stopped && !world.mailbox_registered,
         "active mailbox stop must finish unregistering its source"
     );
-    assert_eq!(account.usage(CoreResource::Task).0, 0);
-    assert_eq!(account.usage(CoreResource::InputBytes).0, 0);
+    assert_eq!(account.usage(ExecutionResource::Task).0, 0);
+    assert_eq!(account.usage(ExecutionResource::InputBytes).0, 0);
     debug!("pm: active mailbox stop and refund passed");
     debug!("pm: shutdown complete");
 }

@@ -1,6 +1,6 @@
 # Runnel 实现
 
-Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节流；布局方向见 [`../ideas/runnel.md`](../ideas/runnel.md)。内核只解释 Tunnel 几何、映射及生命周期。
+Runnel 在 `user/libraries/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节流；布局方向见 [`../ideas/runnel.md`](../ideas/runnel.md)。内核只解释 Tunnel 几何、映射及生命周期。
 
 ## 布局与角色
 
@@ -20,7 +20,7 @@ Runnel 在 `user/frameworks/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节
 
 ## 执行接入
 
-`wait_plan` 返回不透明的 `libsrv::SourcePlan` 值，描述当前角色的等待信号，不分配 Box，也不导出 Endpoint Handle。Runtime 完成登记、generation 过滤、重 arm 与注销，角色通过 `poll` 执行 acknowledge 和状态重查。
+`wait_plan` 返回不透明的 `libexecution::SourcePlan` 值，描述当前角色的等待信号，不分配 Box，也不导出 Endpoint Handle。Runtime 完成登记、generation 过滤、重 arm 与注销，角色通过 `poll` 执行 acknowledge 和状态重查。
 
 Producer 区分 Writable 与 EOF 后的 EofConsumed；Consumer 区分 Readable、PeerAttached 与 EofDrained。对端首次建立可以和数据同批出现，Readable 携带建立变化标志，调用者撤销旧来源并用新的计划登记；建立后不再订阅持久 PEER_ATTACHED 电平。所有入口先检查终态，不访问已关闭映射。
 

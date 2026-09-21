@@ -20,6 +20,13 @@
 
 #![no_std]
 
+use libbudget::Budget;
+use libexecution::{
+    ExecutionResource,
+    runtime::{
+        Advance, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step, Task,
+    },
+};
 use libfal::{
     authority::FalRights,
     client::{Client as FalClient, SubscriptionEvent},
@@ -42,9 +49,6 @@ use librpc::{
     RequestContext, RpcMessageKind, RpcPrefix,
 };
 use librunnel::{ConsumerReady, blocking};
-use libsrv::runtime::{
-    Advance, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step, Task,
-};
 use rinlib::ipc::tunnel as tunnel_sys;
 use rinlib::ipc::wait_set::WaitSet;
 use rinlib::ipc::{
@@ -2008,20 +2012,16 @@ impl Task<RpcOutboxWorld> for RpcOutboxTask {
 }
 
 fn run_rpc_outbox(outbox: Outbox) -> OutboxResult {
-    let budget = libsrv::budget::Budget::<libsrv::budget::CoreResource>::new(&[2, 64 * 1024], 1)
-        .expect("RPC Outbox budget creation failed");
+    let budget = Budget::new(&[2, 64 * 1024], 1).expect("RPC Outbox budget creation failed");
     let account = budget
         .account(&[2, 64 * 1024])
         .expect("RPC Outbox account creation failed");
+    let account = account
+        .view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
+        .expect("RPC Outbox account binding failed");
     let set = WaitSet::create(4).expect("RPC Outbox WaitSet creation failed");
-    let mut runtime = Runtime::<RpcOutboxTask, WaitSet>::new(
-        set,
-        1,
-        1,
-        libsrv::budget::CoreResource::EXECUTION_SLOTS,
-        &account,
-    )
-    .expect("RPC Outbox Runtime creation failed");
+    let mut runtime = Runtime::<RpcOutboxTask, WaitSet>::new(set, 1, 1, &account)
+        .expect("RPC Outbox Runtime creation failed");
     runtime
         .spawn(RpcOutboxTask { outbox }, 1)
         .map_err(|failure| failure.error)
@@ -2036,12 +2036,12 @@ fn run_rpc_outbox(outbox: Outbox) -> OutboxResult {
         .map_err(|(_, error)| error)
         .expect("RPC Outbox Runtime close failed");
     assert_eq!(
-        account.usage(libsrv::budget::CoreResource::Task).0,
+        account.usage(ExecutionResource::Task).0,
         0,
         "RPC Outbox task charge did not refund"
     );
     assert_eq!(
-        account.usage(libsrv::budget::CoreResource::InputBytes).0,
+        account.usage(ExecutionResource::InputBytes).0,
         0,
         "RPC Outbox input charge did not refund"
     );

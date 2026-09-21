@@ -13,10 +13,11 @@ acceptance-stress = []
 
 [dependencies]
 rinlib = { path = "../../rinlib" }
-librunnel = { path = "../../frameworks/librunnel" }
-librpc = { path = "../../frameworks/librpc" }
-libprocess = { path = "../../frameworks/libprocess" }
-libfal = { path = "../../frameworks/libfal" }
-libfs = { path = "../../frameworks/libfs" }
-libsrv = { path = "../../frameworks/libsrv" }
+librunnel = { path = "../../libraries/librunnel" }
+librpc = { path = "../../libraries/librpc" }
+libprocess = { path = "../../libraries/libprocess" }
+libfal = { path = "../../libraries/libfal" }
+libfs = { path = "../../libraries/libfs" }
+libbudget = { path = "../../libraries/libbudget" }
+libexecution = { path = "../../libraries/libexecution" }
 tar = { path = "../../../shared/tar" }

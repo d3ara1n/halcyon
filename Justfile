@@ -49,7 +49,7 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 # 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线按近期实测耗时设置宽裕的 QEMU 运行超时；均可用同名环境变量单独覆盖。
-VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "30")
+VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "45")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "300")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
@@ -97,7 +97,7 @@ clippy:
     run_lint kernel-target artifacts/lint/kernel.log \
         bash -c 'cd os && cargo clippy -p erhino_kernel --bin erhino_kernel {{ZFLAGS}} -- -D warnings'
     run_lint user-host artifacts/lint/user-host.log \
-        bash -c 'cd user && cargo clippy -p rinlib -p librpc -p librunnel -p libfal -p libprocess -p libdrv -p libfs -p libsrv --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd user && cargo clippy -p rinlib -p libbudget -p libexecution -p librpc -p librunnel -p libfal -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint user-target artifacts/lint/user-target.log \
         bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-stress artifacts/lint/user-stress.log \

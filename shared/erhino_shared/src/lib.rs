@@ -24,8 +24,6 @@ pub mod object;
 pub mod proc;
 /// 系统复位语义
 pub mod reset;
-/// Service
-pub mod service;
 /// 启动资源交付（StartupBlock：实际 Handle 数组 + opaque payload）
 pub mod startup;
 /// Locks

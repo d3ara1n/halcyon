@@ -9,6 +9,15 @@ use erhino_shared::{
     object::{Handle, HandleRole, ObjectSignals, Rights},
     time::Deadline,
 };
+use libbudget::{Budget, Charge, Taxonomy};
+use libexecution::{
+    ExecutionResource,
+    runtime::{
+        Advance, DriveState, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step,
+        Task,
+    },
+    wake::NotificationWake,
+};
 use libfal::{
     authority::{AccessSnapshot, FalRights},
     backend::{BackendError, Body, CommitResult, MemoryBackend, PreparedTake},
@@ -24,14 +33,6 @@ use libfal::{
 };
 use librpc::dispatcher::{Completion, Dispatcher};
 use librpc::{CallCause, CallError, Outbox, OutboxResult, Request as RpcRequest, RequestContext};
-use libsrv::{
-    budget::{Budget, Charge},
-    runtime::{
-        Advance, DriveState, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step,
-        Task,
-    },
-    wake::NotificationWake,
-};
 use rinlib::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
@@ -94,8 +95,8 @@ struct WatchOwner {
     path: String,
     mask: protocol::WatchMask,
     signaler: Option<Capability>,
-    _watch_charge: Charge<FalResource>,
-    _source_charge: Charge<FalResource>,
+    _watch_charge: Charge,
+    _source_charge: Charge,
 }
 
 struct WatchTask {
@@ -3305,7 +3306,7 @@ impl Task<World> for ServiceTask {
 }
 
 fn progress_dispatch(
-    runtime: &mut Runtime<ServiceTask, WaitSet, FalResource>,
+    runtime: &mut Runtime<ServiceTask, WaitSet>,
     world: &mut World,
     bindings: &mut Vec<(u64, u64)>,
 ) -> Result<(), SystemCallError> {
@@ -3395,25 +3396,32 @@ pub(super) fn run(
     route_mailbox: Handle,
     release: Handle,
 ) {
-    use libsrv::budget::Taxonomy;
-
     let task_limit = 32;
     let source_limit = 64;
-    let input_bytes = Runtime::<ServiceTask, WaitSet, FalResource>::input_budget(source_limit)
+    let input_bytes = Runtime::<ServiceTask, WaitSet>::input_budget(source_limit)
         .expect("provider Runtime input budget calculation failed");
-    let mut limits = [0; FalResource::COUNT];
-    limits[FalResource::Task.slot()] = task_limit;
-    limits[FalResource::InputBytes.slot()] = input_bytes;
-    limits[FalResource::Node.slot()] = 64;
-    limits[FalResource::Bytes.slot()] = 2 * 1024 * 1024;
-    limits[FalResource::Grant.slot()] = 16;
-    limits[FalResource::Watch.slot()] = WATCH_LIMIT;
-    limits[FalResource::WaitSource.slot()] = 48;
-    let budget =
-        Budget::<FalResource>::new(&limits, 1).expect("provider Runtime budget creation failed");
+    let execution_layout = [0, 1];
+    let fal_layout = [2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let mut limits = [0; ExecutionResource::COUNT + FalResource::COUNT];
+    limits[execution_layout[ExecutionResource::Task.slot()]] = task_limit;
+    limits[execution_layout[ExecutionResource::InputBytes.slot()]] = input_bytes;
+    limits[fal_layout[FalResource::Node.slot()]] = 64;
+    limits[fal_layout[FalResource::Bytes.slot()]] = 2 * 1024 * 1024;
+    limits[fal_layout[FalResource::Grant.slot()]] = 16;
+    limits[fal_layout[FalResource::Watch.slot()]] = WATCH_LIMIT;
+    limits[fal_layout[FalResource::WaitSource.slot()]] = 48;
+    let budget = Budget::new(&limits, 1).expect("provider Runtime budget creation failed");
+    let execution_binding = execution_layout.map(|index| budget.slot(index).unwrap());
+    let fal_binding = fal_layout.map(|index| budget.slot(index).unwrap());
     let account = budget
         .account(&limits)
         .expect("provider Runtime account creation failed");
+    let execution_account = account
+        .view::<ExecutionResource>(&execution_binding)
+        .expect("provider execution budget binding failed");
+    let fal_account = account
+        .view::<FalResource>(&fal_binding)
+        .expect("provider FAL budget binding failed");
     let event = notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
         .expect("provider retirement notification creation failed");
     // SAFETY: NotificationCreate returned two fresh affine entries; this worker owns both.
@@ -3423,8 +3431,8 @@ pub(super) fn run(
     let wake = NotificationWake::new(retire_signaler, RETIRE_BIT)
         .map_err(|(_, error)| error)
         .expect("provider retirement wake validation failed");
-    let backend =
-        MemoryBackend::new(&account, 64, Rc::new(wake)).expect("provider backend creation failed");
+    let backend = MemoryBackend::new(&fal_account, 64, Rc::new(wake))
+        .expect("provider backend creation failed");
     let mut grants = GrantTable::new(&mailbox, 16).expect("provider grant table creation failed");
     let root = backend
         .root()
@@ -3442,20 +3450,15 @@ pub(super) fn run(
                     | Rights::DUPLICATE,
                 output_transport: Rights::TRANSIT,
             },
-            account.clone(),
+            fal_account.clone(),
             0,
         )
         .map_err(|failure| failure.error)
         .expect("provider root grant preparation failed");
     let set = WaitSet::create(source_limit).expect("provider Runtime WaitSet creation failed");
-    let mut runtime = Runtime::<ServiceTask, WaitSet, FalResource>::new(
-        set,
-        task_limit,
-        source_limit,
-        FalResource::EXECUTION_SLOTS,
-        &account,
-    )
-    .expect("provider Runtime creation failed");
+    let mut runtime =
+        Runtime::<ServiceTask, WaitSet>::new(set, task_limit, source_limit, &execution_account)
+            .expect("provider Runtime creation failed");
     let retire_task = runtime
         .spawn(ServiceTask::Retire(RetireTask::new(retire_owner)), 1)
         .map_err(|failure| failure.error)
@@ -3585,8 +3588,6 @@ pub(super) fn run(
         .expect("provider route mailbox close failed");
     rinlib::debug!("fs provider shutdown: route mailbox closed");
     for kind in [
-        FalResource::Task,
-        FalResource::InputBytes,
         FalResource::Node,
         FalResource::Bytes,
         FalResource::Grant,
@@ -3594,9 +3595,16 @@ pub(super) fn run(
         FalResource::WaitSource,
     ] {
         assert_eq!(
-            account.usage(kind).0,
+            fal_account.usage(kind).0,
             0,
-            "provider account did not refund {kind:?}"
+            "provider FAL account did not refund {kind:?}"
+        );
+    }
+    for kind in [ExecutionResource::Task, ExecutionResource::InputBytes] {
+        assert_eq!(
+            execution_account.usage(kind).0,
+            0,
+            "provider execution account did not refund {kind:?}"
         );
     }
     rinlib::debug!("fs provider shutdown: account refunded");

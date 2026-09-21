@@ -9,4 +9,3 @@ edition = "2024"
 
 [dependencies]
 rinlib = { path = "../../rinlib" }
-libdrv = { path = "../../frameworks/libdrv" }

@@ -70,7 +70,7 @@ initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；pay
 
 ## 用户态公共 loader
 
-`shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/frameworks/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
+`shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/libraries/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
 
 ## init/pm 当前政策
 

@@ -30,11 +30,12 @@ shared/    跨层 workspace：
              elf/ tar/ monotonic_id/ ordered_table/ timer_queue/ metadata_admission/
              内核与用户态共用的可移植纯逻辑库
 user/      用户态 workspace：
+             README.md      用户态共同规则入口（总体布局未定稿）
              rinlib/
              services/    系统服务（srv_*）
              drivers/     用户态驱动（drv_*）
              tests/       验收进程（test_*）
-             frameworks/  用户态公共框架与正式库
+             libraries/   按领域组织的用户态公共库
 notes/     设计文档：
              根      导读、索引与跨专题通用内容
              ideas/  方向性设计——自顶向下的抽象视角
@@ -64,8 +65,8 @@ plans/     计划与档案，命名纪律见「约定」；入口 COMPASS.md（�
 ## 约定
 
 - 文档、注释、提交信息都用中文。格式上使用 Conventional Commits，以前的提交未使用标准格式，不当作参考。
-- **Rust 组件身份唯一**：目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致，不设置只为补偿命名差异的别名。系统服务使用 `srv_<domain>`，用户态驱动使用 `drv_<domain>`，验收进程使用 `test_<domain>`；正式库跟随领域正式名（FAL → `libfal`，Runnel → `librunnel`）。禁止 `_src`、`_impl` 等实现痕迹后缀，不为省字发明新缩写。这里约束的是源码与 Rust 构建身份，不预设未来的 Display Name、服务发现名或运行时实例名。
-- **用户态库按领域组织**：新增库、调整知识归属或依赖前，读取 [用户态库分层纪律](user/frameworks/README.md)；通用记账、通用执行与服务领域各有独立归属，库知识、进程角色和 capability 授权分别判断。
+- **Rust 组件身份唯一**：目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致，不设置只为补偿命名差异的别名。具体命名统一读取 [`user/README.md`](user/README.md)：单个普通领域词写全（`libprocess`、`libservice`、`libdriver`），多词领域使用公认缩写（`librpc`、`libfs`、`libfal`），正式专名保持正式拼写（`librunnel`、`rinlib`）；`srv_`、`drv_`、`test_` 仅作为二进制角色前缀。禁止 `_src`、`_impl` 等实现痕迹后缀，不为省字发明新缩写。这里约束的是源码与 Rust 构建身份，不预设未来的 Display Name、服务发现名或运行时实例名。
+- **用户态库按领域组织**：新增库、调整知识归属或依赖、组装跨领域能力前，先读 [用户态共同规则](user/README.md)，再读 [用户态库分层纪律](user/libraries/README.md)；前者拥有组件身份与命名，后者拥有记账/执行/服务等领域的依赖与组合规则。
 - **运行时输出统一正式英文**：内核与用户态日志、panic/assert/expect 消息、构建工具输出（如 Justfile 的 echo）一律用正式英文措辞，保证可 grep、可跨终端阅读；中文仅出现在文档、注释与提交信息中。
 - `git tag pre-ai` 之前的提交全部为人工编写，不含 AI 参与；之后的提交如由 AI 辅助，提交前按当前会话的实际模型与 provider 生成 `Co-Authored-By` trailer。格式为：
   ```

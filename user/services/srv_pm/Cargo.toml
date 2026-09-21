@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 rinlib = {path = "../../rinlib"}
-librunnel = { path = "../../frameworks/librunnel" }
-libsrv = { path = "../../frameworks/libsrv" }
-libprocess = { path = "../../frameworks/libprocess" }
+librunnel = { path = "../../libraries/librunnel" }
+libbudget = { path = "../../libraries/libbudget" }
+libexecution = { path = "../../libraries/libexecution" }
+libprocess = { path = "../../libraries/libprocess" }
