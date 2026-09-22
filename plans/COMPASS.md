@@ -65,7 +65,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-kernel-final-architecture-review.md`](todo-2026-09-kernel-final-architecture-review.md) | 等 MemoryObject 主线、多页 Tunnel、Runnel v2 与主要用户态消费者完成，并在统筹批次 A–E 收口后执行的最终架构 review |
 | [`todo-2026-09-14-architecture-audit-findings.md`](todo-2026-09-14-architecture-audit-findings.md) | 审计发现承接清单（A 设计层 / B 阶段矛盾 / C 容量依据 / D 文档定性）；不占活跃串行位，逐条审视后各自并入归属专题或单独立案 |
 
-公共对象前置 公共对象前置 已完成并[归档](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)，实现与验证真值见 `notes/impls/ipc.md`：Native 坏输出/新轮停驻旧取消、通知历史/终态摘槽/非空压力、真实双接收线程与 forced Full、跨进程提交后 kill 和 GDB 已装 Close/active 窗口已补，旧 findings 复核关闭；core/128MiB/release/nofd/启动失败、七面 lint、163 项 host 通过。后续验收可靠性收口已补运行身份、阶段观测和确定性终因覆盖；历史 Tunnel 墙钟截断仅保留只读归档，不作为开放缺陷。原交付不包含本次公共操作边界重构；当前下一步以本节顶部接手顺序为准。
+公共对象前置 公共对象前置 已完成并[归档](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)，当前实现见 `notes/impls/ipc.md`，过程与验证证据见对应归档计划：Native 坏输出/新轮停驻旧取消、通知历史/终态摘槽/非空压力、真实双接收线程与 forced Full、跨进程提交后 kill 和 GDB 已装 Close/active 窗口已补，旧 findings 复核关闭；core/128MiB/release/nofd/启动失败、七面 lint、163 项 host 通过。后续验收可靠性收口已补运行身份、阶段观测和确定性终因覆盖；历史 Tunnel 墙钟截断仅保留只读归档，不作为开放缺陷。原交付不包含本次公共操作边界重构；当前下一步以本节顶部接手顺序为准。
 
 A–E 的五份专题实施计划、九份报告、Review program 与系统审计总计划均已归档。最终修复基线为 `228b6a5`，WiseHare/OliveWillow 定点复核通过，无开放 finding；过程与验证边界见 [`Review program 档案`](archived/todo-2026-09-review-program.md)。
 
@@ -118,4 +118,4 @@ A–E 的五份专题实施计划、九份报告、Review program 与系统审�
 - 框架先行、实现从简：结构一次到位，实现按需求渐进替换（如调度域/类）。
 - 共享 ABI 改动内核与用户态两侧同步，不留单边。
 - 施工统一遵循 `AGENTS.md`「标准施工流程」；本文件只维护方向、位置、计划入口、完成证据和残留导航，不重复定义任务审计、设计、实施与验证流程。
-- 文档即决策：方向性结论进 notes/，本文件只导航；收口记录完成证据、剩余责任与下一步自然序。提交需用户另行授权，未提交不妨碍审视与验证。
+- 文档归属遵循 `AGENTS.md`「心智模型」：notes 按视角维护方向与当前实现说明，对应计划拥有工作记录；本文件只摘要导航至完成证据、剩余责任与下一步自然序。提交需用户另行授权，未提交不妨碍审视与验证。
