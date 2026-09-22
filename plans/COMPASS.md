@@ -35,6 +35,7 @@
 |---|---|
 | [FAL 服务能力](todo-2026-09-fal-service-capabilities.md) | 主线；从顶部接力入口继续，整体未交付 |
 | [内核身份统一](todo-2026-09-22-kernel-identity.md) | 待实施；`erhino_kernel` → `kernel`，不改变全仓命名规则，不打断 FAL |
+| [Agent 规范与导航审查](todo-2026-09-22-agent-guidance-review.md) | 待审固定 `60e3253`；规则一致性、完成条件、导航与历史保留 |
 | [FAL 集成基线审查](todo-2026-09-13-fal-integration-baseline-review.md) | 待审固定 `d22b9d7`；公共对象前置与混合集成边界 |
 | [公共时间审查](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 待审固定 `c6e0a84`；时钟、绝对期限与消费者 |
 | [库存来源审查](todo-2026-09-frame-source-selftest-review.md) | 待审固定 `606b59d`；库存、boot-held owner、清零与退款 |
