@@ -1,10 +1,10 @@
 # 用户态
 
-用户态总体布局与运行配置尚未定稿；本篇当前只记录已经成立、对全部用户态 Rust 组件生效的共同规则。库的知识归属与依赖纪律见 [`libraries/README.md`](libraries/README.md)。
+用户态总体布局与运行配置尚未定稿；本篇拥有用户态组件共同规则，其中 Rust 身份一致与领域命名纪律由 [AGENTS](../AGENTS.md) 指定为全仓适用。库的知识归属与依赖纪律见 [`libraries/README.md`](libraries/README.md)。
 
 ## Rust 组件命名
 
-目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致。名称描述稳定的领域或进程角色，不描述源码阶段、实现位置或临时装配。
+全仓 Rust 组件的目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致。名称描述稳定的领域或进程角色，不描述源码阶段、实现位置或临时装配。现有违规项必须整改，不构成规则例外；内核统一为 `kernel` 的待实施范围见[命名计划](../plans/todo-2026-09-22-kernel-identity.md)。
 
 ### 领域名称
 
@@ -18,7 +18,7 @@
 
 ### 二进制角色前缀
 
-可执行 crate 使用固定角色前缀，前缀之后的领域名仍遵守上述规则：
+用户态可执行 crate 使用固定角色前缀，前缀之后的领域名仍遵守上述规则：
 
 | 角色 | 格式 | 示例 |
 |---|---|---|
