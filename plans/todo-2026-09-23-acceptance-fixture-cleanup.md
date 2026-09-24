@@ -47,6 +47,13 @@
 
 验收判定收敛：`test_derive_kill` 的枚举/派生失败仍用保留 control 收束靶进程，但最后返回错误，不再将降级当作通过；`tools/qemu-acceptance.sh` 把 Job 子项既有的 ` FAILED` 日志判为失败。两个 fixture 的独立进程与并发覆盖保持不变。
 
+## 下一批自检审查结论
+
+- **时钟回退**：`os/kernel/src/clock/selftest.rs` 验证 origin 偏斜、单调水印、延迟旧样本、不可逆 `ClockRange` 闩锁、epoch 末端和嵌套并发失败；真实生产消费者是 `clock::is_failed()` → `runtime_stop` 的全 hart 停驻。`srv_init::time_checks` 只能观察健康时钟、参数溢出和跨线程单调，不能注入 tick 回退，保留。
+- **WaitSet 交错**：`os/kernel/src/task/wait_set/selftest.rs` 及 `continuation.rs` 直接编排 stale completion、closed-seen、late install、rearm/retirement、actor window、ticket wake、Native parked/cancel/stale epoch 和三类压力退款。用户态现有 256 注册退休与 drain 只覆盖正常收割路径，不能在内核内部步骤间插桩，保留。
+- **Tunnel 堆耗尽**：`os/kernel/src/task/tunnel/selftest.rs` 的 `HeapPressure` 使用真实 allocator 验证 `NoFrame`/`OutOfMemory` 和退款；同时覆盖 admission、Remote、Quota、输出页撤销的失败收束。stress 的 close/Attach 竞态、碎片 backing 退休和 Running 几何没有等价的堆耗尽或中途撤销覆盖，保留。
+- **可重审子项**：Tunnel selftest 中与堆耗尽无关的部分参数错误矩阵理论上可迁入正式用户态 Running 路径，但当前没有对应用户态覆盖。只有新增参数矩阵、独立错误断言和资源归零证据后，才可删除该子窗口；不得借此删除整个 Tunnel selftest。
+
 ## 首批验证
 
 - `just check`、`just clippy` 七个分面和 `git diff --check` 通过；删除自检后暴露的死代码包装已清除，再次检查通过。
@@ -63,4 +70,4 @@
 
 ## 下一步
 
-保留两个 fixture 直到上述独立窗口有等价消费者；下一批逐项审查内核其余自检中时钟回退、WaitSet 交错及 Tunnel 堆耗尽等窗口，不整批删除。零复制借用已经解除当前平台内存阻塞，但不替代 fixture 生命周期清理。
+保留两个 binary 和上述三类启动期 selftest。下一次只在有独立替代证据时重审：Tunnel 参数错误子矩阵需先补正式用户态 Running 覆盖；WaitSet continuation 需先补 parked/cancel/stale-epoch 的 stress 断言；时钟回退需有可控且不污染平台 `ClockState` 的正式注入入口。零复制借用已解除平台内存阻塞，但不替代 fixture 生命周期清理。

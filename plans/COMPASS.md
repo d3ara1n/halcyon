@@ -4,13 +4,13 @@
 
 ## 近期顺序
 
-1. [FAL 服务能力与内核身份闭包提交审查](todo-2026-09-24-fal-kernel-closure-review.md)：先核对 `dda8a5b` 与追加的 `5b29915` 两次固定变更；只读 Review。
-2. [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md)：先只读核实 M2 的用户可达 metadata 耗尽路径，再据结论安排所属修复；其余发现按该记录的归属与触发处理，不整体阻塞其他任务。
-3. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口；与独立 Review 无技术前置关系，可并行排期。
+1. [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md)：当前执行 M2；核实并修复用户可达 metadata OOM panic 面后，再按 M3/A2、M5 归属安排后续任务。
+2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口；与 M2 无技术前置关系，可在 M2 收口后排期。
 
 ## 待排期审查
 
-近期闭包审查之后，原则上先审公共机制，再审其上的用户态基线。以下为接手顺序，不要求旧审查全部完成才能继续新能力；每份计划自行固定审查对象和 finding 去向。
+近期施工完成后，先由 reviewer 汇总现有 Review 档案和 findings，形成一个明确范围、优先级和唯一入口的总体 Review 任务，再按该任务执行审查。以下为既有审查材料的候选接手顺序，不表示下一项施工，也不要求旧审查全部完成才能继续新能力。
+FAL 固定提交审查计划暂不单独排在近期顺序中；它等待整体 Review 档案分析后纳入总体审查任务。
 
 1. [FAL 集成基线](todo-2026-09-13-fal-integration-baseline-review.md)
 2. [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md)
