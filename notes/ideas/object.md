@@ -1,6 +1,6 @@
 # 对象、Capability 与 Handle
 
-对象是内核管理且可由进程引用的资源。用户态不直接持有对象身份，而是在自己的 HandleTable 中持有一项 **capability entry**；**Handle** 只是该 entry 的进程本地不透明名字。
+对象是内核管理且可由进程引用的资源。用户态在自己的 HandleTable 中持有一项 **capability entry**；**Handle** 是该 entry 的进程本地不透明名字。查询得到的对象身份只用于比较与诊断，不能据此寻址或取得 capability。
 
 ## Handle 是本地名字
 
@@ -10,18 +10,19 @@ Handle 不能序列化为跨进程凭据。把其数值写入文件、共享内�
 
 ## Capability entry
 
-每项 entry 由四个正交维度组成：
+每项 entry 由三个正交维度组成：
 
 ```text
-object + lifecycle role + rights + immutable badge
+object + lifecycle role + rights
 ```
 
 - **object**：被引用的内核对象；
 - **role**：owner、sender、invitation、endpoint 等对象关系与生命周期位置；
-- **rights**：允许执行的操作；
-- **badge**：对象类型可解释的不可变授权上下文，普通 entry 为零。
+- **rights**：允许执行的操作。
 
-role 不能由 rights 伪造；badge 不改变对象身份或生命周期。duplicate、移动和 rights 裁剪都保持 object、role 与 badge，只能缩小 rights。
+role 不能由 rights 伪造。duplicate 与移动保持 object 和 role，只能缩小 rights；对象专门定义的派生操作可以产生另一个合法 role，例如 sender 派生同一发送授权的 send-once。
+
+badge 属于发送授权对象的不可变上下文，不是所有 capability entry 都带的一项独立身份。其保存、运输和解释边界由 [message](message.md) 拥有。
 
 通用 rights：
 
@@ -46,6 +47,20 @@ MemoryObject 的 Handle 只授权建立新映射或管理 backing；映射本身
 
 MemoryObject 的可执行发布状态、WritePermit 与 mapping retire 由[内存模型](mm.md)共同拥有。`SealExecutable` 要求对象定义的管理 authority，并与新 WritePermit 在对象锁上线性化；对象进入 Sealing 后拒绝新写入口，最后一个 retiring writable view 收到全部地址翻译确认后才释放 permit 并推进 Executable。Handle 关闭或 seal 发起线程消散都不能绕过该计数、撤销已发布 seal 或让 backing 在 stale writable translation 仍可能存在时析构。
 
+## Lifetime 与观察
+
+Lifetime 表达一个明确拥有者的最终消散。拥有者可以是内核中的发送授权等对象，观察者只持有独立的 Lifetime 状态，不反向保活被观察对象。全部能力引用及保留该上下文的操作责任释放后，拥有者结束，Lifetime 单向进入 CLOSED。
+
+Lifetime 只描述寿命，不授予业务操作，不表示服务健康、请求成功或资源政策撤销。它不以强引用计数的某个瞬时读数推断终态，也不从 PID 退出推断已经转交的 capability 失效。拥有者本身不作为一个可由观察者提前关闭的用户 Handle 出口。
+
+Mailbox 的发送授权与接收后 Delivery 如何保活调用上下文由 [message](message.md) 拥有。WaitSet 如何保留观察引用和收束注册由 [wait](wait.md) 拥有。
+
+## HandleQuery
+
+调用者可以只读查询自己实际持有的 entry：对象身份、类型、role、rights，以及该对象定义的关联身份和不可变标签。查询不改变 rights，不暴露内核地址，不接受裸对象身份去打开对象。
+
+对象身份在本次启动内不复用，不跨启动当作永久身份。两个进程的 Handle 数值不能比较，但可以在已经分别持有合法 capability 的前提下比较对象身份。发送授权的关联身份是目标 Mailbox；Lifetime 的关联身份是被观察对象；Delivery 的关联身份是被调用的发送授权。这些关系只帮助协议验证已收到的能力，不能由客户端填写的同值数字替代。
+
 ## MemoryPool 与 MemoryObject interface
 
 MemoryPool 是 page-backed storage 的预算 capability：core 持有固定页额度及其守恒状态，不持有进程、地址空间、child 或活对象列表。root pool 由内核按可信用户物理供给铸造并交给 init；`Derive` 从父池原子转移非零固定额度形成 child core，不能复制额度。普通 Handle 的 duplicate、TRANSIT 与 GRANT 只共享或移动对同一 core 的 authority，不改变容量；Pool capability 没有 owner role，关闭状态、等待电平与枚举的缺失由[内存模型](mm.md)统一规定。
@@ -60,11 +75,11 @@ MemoryObject 的公共 interface 只包含固定长度创建、固定宽 Query�
 
 KernelMemoryBudget 与 MemoryPool 是两种正交 capability：前者支付内核 metadata 与对象壳，后者支付页后备资源。ProcessResources 可以同时持两种不可转移 binding，用户态资源管理器按政策组合交付；Job 不因此变成资源套餐或统计真值。在 KernelMemoryBudget 公开前，进程的内部 MetadataSponsor 只提供固定 permits；MemoryObject 等可脱离创建进程存活的对象取得 permit 后强持 sponsor 到自身析构，不能在进程 Dead 时提前退款或转嫁到持有 Handle 的进程。
 
-Mailbox 有唯一 receiver-owner。owner 不可复制，可持 `GRANT` 直接交付给 Building child，但不能持 `TRANSIT` 进入消息；sender 可复制、可按授权 TRANSIT/GRANT，并可携带 mailbox owner 铸造的 badge。owner 关闭或所在进程退出后 Mailbox 进入 `CLOSED`，清空队列及未接收 entry；残留 sender 只观察终态。
+Mailbox 有唯一 receiver-owner。owner 不可复制，可持 GRANT 直接交付给 Building child，但不能进入消息。sender 引用独立的发送授权对象，可按权限复制和运输；其身份、badge、Lifetime 和消息 Delivery 由 [message](message.md) 统一定义。owner 关闭后队列进入 CLOSED，清空未接收的消息；残留 sender 不能继续调用该队列。
 
 Notification 同样有唯一 owner 和可委托 signaler。owner 只直接 grant，不进入消息；signaler 可按授权 TRANSIT/GRANT。owner 关闭使 Notification 终态。
 
-某些 role 是 affine 且消费式的：Mailbox send-once 在首次成功投递后消费，Tunnel invitation 在成功 attach 后消费。失败不消费。它们可以移动但不能复制。
+某些 role 是 affine 且消费式的：Mailbox send-once 在首次成功投递后消费，Tunnel invitation 在成功 attach 后消费。失败不消费。Delivery 是 affine 的消息交付责任，显式关闭才解除该责任。这些 role 可以移动但不能复制。
 
 Tunnel Endpoint 与进程地址空间 lease 绑定，既不能 TRANSIT，也不能 GRANT；跨进程建立对端使用 invitation。
 
@@ -72,18 +87,31 @@ Tunnel Endpoint 与进程地址空间 lease 绑定，既不能 TRANSIT，也不�
 
 用户态安全接口必须区分可复制的 ABI Handle 数值与真正的关闭责任。数值合法或由可公开构造的 ABI 结果包裹，不足以证明调用者可以关闭它；可能撤销映射的 raw close 与任意原始清理组合必须具有显式 unsafe 边界，或接受不可伪造的消费式 owner。安全协议持有访问能力期间，任何间接 cleanup 入口也不能绕过这一责任。
 
-用户态 affine owner 的析构政策取决于内核 close 契约：唯一持有、合法构造且关闭为无异步阶段的叶 Handle 可以提供不可失败 RAII close，错误只表示 unsafe 构造或内核不变量破坏；需要跨 hart 确认或可能返回 Busy 的 mapping owner 必须显式等待/重试。后者在终端清理错误时不得由 Drop 无限等待或 panic，可以把仍由 AddressSpace 账本拥有的映射留给进程级 drain，但必须留下进程内可查询诊断。消息接收后尚未被协议接受的 capability 不进入业务 owner：拒绝路径须关闭全部已安装 entry 并废弃接收端口，不能让迟到或畸形回复污染后续请求。
+用户态 affine owner 的析构政策取决于关闭契约。合法内核对象的必成关闭责任须在出生或产生该义务前准入；普通 close 可以提交退休并通过线程 Waiting 等待，析构无需编排内核容器维护状态。需要业务协商、可失败映射清理或明确部分结果的用户态 owner 仍使用显式协议，不能由 Drop 伪造成功、无限重试或 panic；失败保留真实资源与诊断，监督收束复用正式进程清理。
+
+收到的消息和回复先由运输 owner 持有全部能力及 Delivery，协议成功提取后才移交业务 owner。拒绝路径统一释放未提取项。私有同步回复端口可整端废弃；共享 dispatcher 则按不复用的请求身份丢弃迟到回复，不能关闭其他请求仍在使用的端口。
+
+## 调用者失约与所有权边界
+
+内核必须把直接调用 ABI 的用户进程视为不可信主体。用户库的类型、Drop 和建议调用顺序只帮助正确使用，不是内核状态、权限或资源守恒的信任前提。重复、乱序、遗漏后续调用，以及关闭句柄、线程终止或进程退出，都必须由内核自己的准入、事务与所有权规则处理。
+
+用户决定业务意图、是否继续观察、是否继续使用仍持有的资源；内核负责每次操作的合法性、提交后的必成责任、资源归属及最终释放条件。操作已被接受后，需要完成的内部维护不能依赖用户再调用 finish、ack 或 drain 才保持不变量。尚未提交的准备可以回滚；已经提交的责任必须由稳定拥有者承接，放弃回复不能撤回这份责任。
+
+应区分三种后果：不消费事件导致业务不再推进；持有合法能力导致其资源仍被占用；资源失去可识别拥有者或已提交维护无法完成。前两者可以是明确的使用或配额政策，第三者不能成为正常 ABI 用法的后果。进程、Job 等管理域还须分别声明终止受理与回收启动的关系；资源仍可由监督者接管，不等于回收已经不依赖监督者继续执行。
+
+用户态框架同样应由完整的操作或资源 owner 承担机械清理，使业务代码只提交意图并持有结果。忘记析构可以保留该进程仍拥有的资源，但不能令内核账本失真；可信服务自身的有界停止、清理与退款仍需单独完成，不能用最终杀进程替代正常路径。资源有账本和硬上限只证明可归属及失败安全，不自动证明不同授权域之间的 DoS 隔离。
 
 ## 收束分层
 
-关闭的本地工作量决定对象采用两种收束机制；是否需要等待另一个 hart 的完成确认是正交维度：
+收束按责任归属分层；总工作量决定是否需要持久退休状态，不直接决定是否把驱动责任交给用户：
 
-- **有界 close**：对象本地关闭工作不超过容量常数。owner 不可 TRANSIT，消息内不含容器 role，可转移 role 的关闭恒为叶子操作，唯一的容器收束受对象容量上限约束。若关闭同时撤销 object-owned mapping，Handle 层必须在消费 entry 前预留地址空间事务；提交后 mapping retire 可以通过 WaitContext 异步完成，但对象不在 close callback 中自旋或保存无界工作。
-- **有界 drain**：收束总量可能超过单次调用正常预算的对象（进程的 HandleTable 与地址空间），先发布可收束电平，由持管理 authority 的服务以硬预算分批驱动，进度保存在目标而非调用者。Drain 摘下的 entry 若触发尚不能提交的地址空间事务，作为可恢复 pending close 保留，不能丢弃 lease 或绕过完成确认。
+- **叶关闭**：固定数量的本地责任直接释放，不隐藏全表遍历或跨对象级联。
+- **内核对象退休**：收束总量超出单次预算或需要跨 hart 确认时，普通关闭提交稳定的内核拥有根，按安全点预算推进；来源依赖未完成时停驻，完成后继续。提交前准备必成资源，提交后调用者退出不能丢失责任。WaitSet 内部订阅退休属于此层，无须公开维护状态。
+- **监督收束**：进程/Job 的终止选择、成员监督和资源回收是管理 authority 的政策。进程 Drain 保留有界批次及稳定目标游标；摘出对象若需内核退休，以正式 pending ticket 等待同一机制，不另写一套对象清理算法。没有可执行进度时可以挂起，不能把内部阻塞转成用户无进度重试。
 
-分类判据是本地收束总量是否超出单次预算，不是对象类型；异步确认不把固定容量对象变成无界容器。容量可参数化的容器或引入级联关闭时，必须跨入 drain 档，不能抬高有界 close 的常数。
+容量可参数化或引入级联时必须建立可分步退休的拥有根，不能通过抬高常数维持同步析构，也不能以“总量很大”为理由强迫用户维护内核容器。各队列共享明确的公平执行预算；异步确认、业务停止与资源退休是不同边界。
 
-MemoryObject 只有在 backing 受硬容量上限约束时才属于有界 close；其普通可转移 Handle 的最终消散最多释放该容量内的固定工作。若对象容量不再有硬上限，它必须先进入有管理 authority、持续电平和可恢复进度的 drain 档，不能沿用普通引用计数析构。具体 backing、mapping retire 与完成边界由[内存模型](mm.md)拥有。
+MemoryObject 的 backing 若受硬容量上限约束，最终消散可以在该界限内释放；若不再有硬上限，必须先建立稳定的分步退休责任，不能沿用无界引用计数析构。具体 backing、mapping retire 与完成边界由[内存模型](mm.md)拥有。
 
 ## 两种跨表交付
 
@@ -123,4 +151,4 @@ init bootstrap 是唯一内核内嵌组装特例：内核为 initial process 构
 
 ## 边界
 
-对象模型只提供引用、role、rights、badge、运输和终态。服务协议如何解释 badge、认证请求、派生更窄 grant、执行配额或撤销，属于用户态协议。sender PID 可作 provenance，不能代替显式 capability。
+对象模型提供引用、role、rights、身份观察、运输和终态。发送授权保存不可变 badge，Lifetime 观察最终消散，Delivery 保留交付责任；它们都不解释业务。服务协议如何鉴权、派生更窄 grant、执行配额或撤销，属于用户态协议。sender PID 可作 provenance，不能代替显式 capability。

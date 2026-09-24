@@ -42,14 +42,20 @@ Runnel 只回答字节流，不携带记录、Handle、MemoryObject 注册或 bu
 
 数据进度一经发布不能因后续通知失败而回滚。公开操作必须同时报告错误和已经完成的字节数，批量操作累计整次调用的进度，避免调用者重试整段造成重复数据。EOF 已发布后的通知失败同样不撤销 EOF。
 
-阻塞角色反复执行：检查控制块；无进展则 `TunnelAcknowledgeData`；重新检查；仍无进展才以 WaitMany 等待 `DATA | PEER_CLOSED | CLOSED`；醒来后从头检查。消费者只在读至空后确认 DATA，生产者只在无空间时确认并等待腾空提示。
+所有驱动方式共用非阻塞推进与等待准备：检查控制块；无进展则 acknowledge DATA；重新检查；仍无进展才等待 DATA、PEER_CLOSED 或 CLOSED。阻塞门面使用 WaitMany，服务事件循环使用 WaitSet；醒来都从真实控制块重查。消费者只在读至空后确认 DATA，生产者只在无空间时确认并等待腾空提示。客户端跨多批等待须传同一绝对 Deadline；等待超时报告已完成字节数，不把流误判为 Broken，也不自动关闭资源。
+
+角色独占 Endpoint，向执行框架只交付安全的观察注册能力，不导出原始 Handle 或映射访问权。建立阶段创建端两种角色都可观察内核的 PEER_ATTACHED，不能用环可读/可写量替代 Attach 事实；实际协议验证仍由 attach 方完成。Attach 错误必须明确区分 Invitation 尚未消费与已消费后协议失败，清理 owner 随错误保留。Create 在内核已发布但用户态输出校验失败时，同样须返还 Endpoint/Invitation 或异常几何清理 owner，不只返回错误码。
+
+等待条件是三个互不相同的观察事实——可写空间出现、已发布 EOF 后对端消费至最终 head、对端映射建立——不能合并为一个布尔结果；每次唤醒后从控制块重查并返回带领域载荷的类型化结果。登记按当前等待条件选择信号：对端建立是持久电平，满足后不再重复登记；数据条件随 acknowledge→重查→再等待循环逐轮重新登记。登记寿命由执行核心拥有，角色只声明当前等待什么；业务不手工编排 acknowledge、重 arm 或 token。
+
+首次协议/等待错误只冻结不可逆终态，不提前关闭仍由执行框架登记来源的 Endpoint；执行 owner 注销来源后显式 close，失败返回完整角色供继续清理。生产者的“已发布 EOF 且对端已消费全部字节”可以作为上层完成的一个前置事实；后端写入、持久性、最终状态和取消仍由上层控制协议决定。Runnel 不把传输 EOF 或 Endpoint 关闭转换成文件操作成功。
 
 ## 分工
 
 | 关注点 | 归属 |
 |---|---|
-| 多页 backing、映射、端点、邀请、关闭与 `PEER_CLOSED` | Tunnel |
-| DATA、WaitMany 与门铃调用 | 对象状态和等待机制 |
+| 多页 backing、映射、端点、邀请、Attach 状态与关闭 | Tunnel |
+| DATA、WaitMany、WaitSet 与门铃调用 | 对象状态和等待机制 |
 | 布局、角色、游标、内存序、EOF 与 Broken | Runnel |
 | 记录、region 注册、descriptor 与 buffer 交接 | BufferQueue |
 | 连接身份鉴权与请求语义 | 上层服务协议 |

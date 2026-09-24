@@ -6,4 +6,4 @@ description = "Lifecycle race matrix hammer and race target"
 
 [dependencies]
 rinlib = { path = "../../rinlib" }
-libprocess = { path = "../../frameworks/libprocess" }
+libprocess = { path = "../../libraries/libprocess" }

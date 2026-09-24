@@ -1,0 +1,11 @@
+[package]
+name = "libbudget"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "User-space budget accounts and domain views"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared/erhino_shared" }
+metadata_admission = { path = "../../../shared/metadata_admission" }
+monotonic_id = { path = "../../../shared/monotonic_id" }

@@ -201,17 +201,25 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
         }
         SystemCall::ProcessDrain => {
-            respond_result(
-                frame,
-                task::process::drain(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as u32,
-                    frame.x[12] as usize,
-                )
-                .map(|_| 0),
-            );
-            Outcome::Completed
+            match task::process::drain(
+                thread,
+                Handle::from_raw(frame.x[10]),
+                frame.x[11] as u32,
+                frame.x[12] as usize,
+            ) {
+                Ok(task::process::DrainStart::Ready) => {
+                    respond_ok(frame, 0);
+                    Outcome::Completed
+                }
+                Ok(task::process::DrainStart::Wait(plan)) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
         }
         SystemCall::JobSeal => {
             respond_result(
@@ -347,17 +355,24 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::Sleep => {
-            let ms = a0 as u64;
-            if ms == 0 {
-                respond_ok(frame, 0);
-            } else {
-                // 只登记本 hart 意图槽；全局发布由调度循环在线程离开
-                // 执行点后由 sched::run 的 Park 分支完成，唤醒所有权随迁。
-                let expires_at = sched::expires_after_ms(ms);
-                sched::park_request_wait(wait::sleep_plan(expires_at));
-                return Outcome::Wait; // 不前进 sepc，完成唤醒后由帧携带结果
+            let plan = (|| {
+                let deadline = {
+                    let mut space = thread.process.space.lock();
+                    // SAFETY: Deadline 仅含固定宽整数，sleep_plan 验证判别和值域。
+                    unsafe { uaccess::read_user_value(&mut space, a0) }?
+                };
+                wait::sleep_plan(deadline)
+            })();
+            match plan {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
             }
-            Outcome::Completed
         }
         SystemCall::HandleClose => match handle::close(thread, Handle::from_raw(frame.x[10])) {
             Ok(handle::HandleCloseStart::Ready) => {
@@ -386,13 +401,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::WaitMany => match wait::prepare(
-            thread,
-            frame.x[10] as usize,
-            frame.x[11] as usize,
-            frame.x[12] as usize,
-            frame.x[13],
-        ) {
+        SystemCall::WaitMany => match wait::prepare(thread, a0) {
             Ok(wait::WaitStart::Ready) => {
                 respond_ok(frame, 0);
                 Outcome::Completed
@@ -439,16 +448,84 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::MailboxCreate => {
+        SystemCall::WaitSetCreate => {
             respond_result(
                 frame,
-                mailbox::create(
+                task::wait_set::create(
                     thread,
-                    Rights::from_raw(frame.x[10]),
+                    a0,
                     Rights::from_raw(frame.x[11]),
                     frame.x[12] as usize,
                 )
                 .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::WaitSetRegister => {
+            respond_result(
+                frame,
+                task::wait_set::register(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::WaitSetRearm => {
+            respond_result(
+                frame,
+                task::wait_set::rearm(thread, Handle::from_raw(frame.x[10]), frame.x[11])
+                    .map(|generation| generation as usize),
+            );
+            Outcome::Completed
+        }
+        SystemCall::WaitSetReceive => {
+            respond_result(
+                frame,
+                task::wait_set::receive(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                    frame.x[13] as usize,
+                )
+                .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::WaitSetRemove => {
+            respond_result(
+                frame,
+                task::wait_set::remove(thread, Handle::from_raw(frame.x[10]), frame.x[11])
+                    .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::HandleQuery => {
+            respond_result(
+                frame,
+                handle::query(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::MonotonicNow => {
+            let result = crate::clock::now().and_then(|snapshot| {
+                let mut space = thread.process.space.lock();
+                // SAFETY: ClockSnapshot 无 padding，完整初始化，失败没有业务副作用。
+                unsafe { uaccess::write_user_value(&mut space, a0, &snapshot) }.map_err(Into::into)
+            });
+            respond_result(frame, result.map(|_| 0));
+            Outcome::Completed
+        }
+        SystemCall::MailboxCreate => {
+            respond_result(
+                frame,
+                mailbox::create(thread, Rights::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
             );
             Outcome::Completed
         }

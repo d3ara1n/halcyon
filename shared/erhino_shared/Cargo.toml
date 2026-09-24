@@ -1,0 +1,11 @@
+[package]
+name = "erhino_shared"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+num-traits = { version = "0.2", default-features = false}
+num-derive = "0.5"
+lock_api = "0.4"

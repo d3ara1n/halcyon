@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-monotonic_id = { path = "../monotonic_id" }
-erhino_shared = { path = "../../shared" }
+monotonic_id = { path = "../../shared/monotonic_id" }
+erhino_shared = { path = "../../shared/erhino_shared" }

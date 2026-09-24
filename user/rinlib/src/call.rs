@@ -7,15 +7,16 @@ use erhino_shared::{
     memory_object::{MemoryObjectCreateRequest, MemoryObjectSnapshot},
     memory_pool::MemoryPoolSnapshot,
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
-    object::{Handle, HandlePair, Rights},
+    object::{Handle, HandleDescription, HandlePair, Rights, SenderResult},
     proc::{
         ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
         ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadSpawnResult,
         ThreadStartContext, Tid,
     },
     reset::{ResetAction, ResetReason},
+    time::{ClockSnapshot, Deadline},
     tunnel::{TunnelAttachRequest, TunnelCreateRequest},
-    wait::{WaitItem, WaitResult},
+    wait::{WaitItem, WaitManyRequest, WaitResult},
 };
 use num_traits::FromPrimitive;
 
@@ -516,14 +517,13 @@ pub unsafe fn sys_handle_duplicate(
 
 pub unsafe fn sys_mailbox_create(
     owner_rights: Rights,
-    sender_rights: Rights,
-    output: &mut HandlePair,
+    output: &mut Handle,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::MailboxCreate,
         owner_rights.raw() as usize,
-        sender_rights.raw() as usize,
-        output as *mut HandlePair as usize,
+        output as *mut Handle as usize,
+        0,
         0,
     )
     .map(|_| ())
@@ -534,8 +534,10 @@ pub unsafe fn sys_send(
     kind: u64,
     payload: &[u8],
     moves: &[HandleMove],
+    deadline: Deadline,
 ) -> SystemCallResult<()> {
-    let header = SendHeader::new(kind, payload.len() as u32, moves.len() as u32);
+    let mut header = SendHeader::new(kind, payload.len() as u32, moves.len() as u32);
+    header.deadline = deadline;
     sys_call6(
         SystemCall::Send,
         [
@@ -563,7 +565,7 @@ pub unsafe fn sys_peek(mailbox: Handle, output: &mut MessageHeader) -> SystemCal
 
 pub unsafe fn sys_receive(
     mailbox: Handle,
-    header: &mut MessageHeader,
+    header: &mut erhino_shared::message::ReceiveResult,
     payload: &mut [u8],
     handles: &mut [Handle],
 ) -> SystemCallResult<()> {
@@ -571,7 +573,7 @@ pub unsafe fn sys_receive(
         SystemCall::Receive,
         [
             mailbox.raw() as usize,
-            header as *mut MessageHeader as usize,
+            header as *mut erhino_shared::message::ReceiveResult as usize,
             payload.as_mut_ptr() as usize,
             payload.len(),
             handles.as_mut_ptr() as usize,
@@ -604,14 +606,28 @@ pub unsafe fn sys_mailbox_mint_sender(
     owner: Handle,
     badge: MailboxBadge,
     rights: Rights,
-    output: &mut Handle,
+    output: &mut SenderResult,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::MailboxMintSender,
         owner.raw() as usize,
         badge as usize,
         rights.raw() as usize,
-        output as *mut Handle as usize,
+        output as *mut SenderResult as usize,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_handle_query(
+    source: Handle,
+    output: &mut HandleDescription,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::HandleQuery,
+        source.raw() as usize,
+        output as *mut HandleDescription as usize,
+        0,
+        0,
     )
     .map(|_| ())
 }
@@ -619,14 +635,32 @@ pub unsafe fn sys_mailbox_mint_sender(
 pub unsafe fn sys_wait_many(
     items: &[WaitItem],
     result: &mut WaitResult,
-    timeout_ms: u64,
+    deadline: Deadline,
 ) -> SystemCallResult<()> {
+    let request = WaitManyRequest {
+        items: items.as_ptr() as u64,
+        count: u32::try_from(items.len()).map_err(|_| SystemCallError::IllegalArgument)?,
+        reserved: 0,
+        result: result as *mut WaitResult as u64,
+        deadline,
+    };
     sys_call(
         SystemCall::WaitMany,
-        items.as_ptr() as usize,
-        items.len(),
-        result as *mut WaitResult as usize,
-        timeout_ms as usize,
+        &request as *const WaitManyRequest as usize,
+        0,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_monotonic_now(output: &mut ClockSnapshot) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MonotonicNow,
+        output as *mut ClockSnapshot as usize,
+        0,
+        0,
+        0,
     )
     .map(|_| ())
 }
@@ -672,10 +706,90 @@ pub unsafe fn sys_notification_take(
     .map(|_| ())
 }
 
-/// 当前线程睡眠指定毫秒（异步 syscall：内核登记期限，到期唤醒）。
+/// 相对毫秒便利入口；内核只接受一次转换后的绝对期限。
 ///
 /// # Safety
 /// 调用者必须保证阻塞期间没有仅由当前执行点临时保活的跨调用借用。
 pub unsafe fn sys_sleep(ms: u64) -> SystemCallResult<()> {
-    sys_call(SystemCall::Sleep, ms as usize, 0, 0, 0).map(|_| ())
+    let deadline = crate::time::after(crate::time::Duration::from_millis(ms)?)?;
+    // SAFETY: 期限值在 ecall 期间有效，调用者满足本函数的阻塞借用契约。
+    unsafe { sys_sleep_until(&deadline) }
+}
+
+pub(crate) unsafe fn sys_sleep_until(deadline: &Deadline) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::Sleep,
+        deadline as *const Deadline as usize,
+        0,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_wait_set_create(
+    limit: usize,
+    rights: Rights,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::WaitSetCreate,
+        limit,
+        rights.raw() as usize,
+        output as *mut Handle as usize,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_wait_set_register(
+    set: Handle,
+    item: &WaitItem,
+    output: &mut u64,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::WaitSetRegister,
+        set.raw() as usize,
+        item as *const WaitItem as usize,
+        output as *mut u64 as usize,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_wait_set_rearm(set: Handle, token: u64) -> SystemCallResult<u64> {
+    sys_call(
+        SystemCall::WaitSetRearm,
+        set.raw() as usize,
+        token as usize,
+        0,
+        0,
+    )
+    .map(|generation| generation as u64)
+}
+
+pub(crate) unsafe fn sys_wait_set_remove(set: Handle, token: u64) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::WaitSetRemove,
+        set.raw() as usize,
+        token as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) unsafe fn sys_wait_set_receive(
+    set: Handle,
+    records: &mut [erhino_shared::wait_set::ReadyRecord],
+    count: &mut u32,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::WaitSetReceive,
+        set.raw() as usize,
+        records.as_mut_ptr() as usize,
+        records.len(),
+        count as *mut u32 as usize,
+    )
+    .map(|_| ())
 }

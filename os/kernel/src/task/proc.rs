@@ -139,6 +139,8 @@ impl TableFrameOwner for frame::FundedTableFrame {
     }
 }
 
+pub(crate) mod selftest;
+
 struct TableMem;
 
 impl TableFrameMemory for TableMem {
@@ -578,21 +580,25 @@ impl PreparedMemoryChange {
 
     /// 指令流同步需求由已准备事务中的真实翻译意图推导，避免调用点遗漏 RX Map。
     pub(crate) fn requires_instruction_sync(&self) -> bool {
-        self.get().change.translation_intents().iter().any(|intent| {
-            matches!(
-                intent,
-                TranslationIntent::Install {
-                    protection: Protection::ReadExecute,
-                    ..
-                } | TranslationIntent::Protect {
-                    from: Protection::ReadExecute,
-                    ..
-                } | TranslationIntent::Protect {
-                    to: Protection::ReadExecute,
-                    ..
-                }
-            )
-        })
+        self.get()
+            .change
+            .translation_intents()
+            .iter()
+            .any(|intent| {
+                matches!(
+                    intent,
+                    TranslationIntent::Install {
+                        protection: Protection::ReadExecute,
+                        ..
+                    } | TranslationIntent::Protect {
+                        from: Protection::ReadExecute,
+                        ..
+                    } | TranslationIntent::Protect {
+                        to: Protection::ReadExecute,
+                        ..
+                    }
+                )
+            })
     }
 
     fn allocate() -> Result<Self, SpaceError> {
@@ -1357,13 +1363,19 @@ impl RetiringSpaceChange {
 enum CompletionFinalization {
     PublishMandatory,
     ReleaseResult,
-    FinishWaiter,
+    DeliverWaiter,
     Done,
+}
+
+pub(crate) struct MemoryRetireAdvance {
+    pub(crate) work_done: usize,
+    pub(crate) complete: bool,
+    pub(crate) completion: Option<super::retirement::RetirementCompletion>,
 }
 
 pub(crate) struct MemoryChangeCompletion {
     process: Arc<Process>,
-    waiter: Arc<super::wait::WaitContext>,
+    waiter: super::wait::WaitIdentity,
     retire: Option<Arc<dyn MemoryRetireSink>>,
     finalization: crate::sync::Spinlock<Option<CompletionFinalization>>,
     published: crate::sync::Spinlock<Option<PublishedSpaceChange>>,
@@ -1377,7 +1389,7 @@ pub(crate) struct MemoryChangeCompletion {
 impl MemoryChangeCompletion {
     fn new(
         process: Arc<Process>,
-        waiter: Arc<super::wait::WaitContext>,
+        waiter: super::wait::WaitIdentity,
         retire: Option<Arc<dyn MemoryRetireSink>>,
         result_obligation: Option<super::thread::ThreadResultObligation>,
         change_metadata: super::resources::MemoryChangePermit,
@@ -1407,8 +1419,8 @@ impl MemoryChangeCompletion {
     }
 
     /// 由 work-debt owner hart 推进不超过 `budget` 个固定粒度；最终批次再兑销
-    /// 进程与线程义务。返回 `(实际步骤, 已完成)`。
-    pub(crate) fn advance_retire(&self, budget: usize) -> (usize, bool) {
+    /// 进程与线程义务。最终回复由 deferred-work driver 在锁外交付。
+    pub(crate) fn advance_retire(&self, budget: usize) -> MemoryRetireAdvance {
         debug_assert!(budget > 0);
         let mut change = self.retiring.lock().take();
         let mut used = 0;
@@ -1421,10 +1433,8 @@ impl MemoryChangeCompletion {
                 used += 1;
                 match stage {
                     CompletionFinalization::PublishMandatory => {
-                        if self.process.lifecycle.complete_mandatory()
-                            && let Some(control) = self.process.control()
-                        {
-                            control.publish_reapable();
+                        if self.process.lifecycle.complete_mandatory() {
+                            self.process.publish_reapable();
                         }
                         {
                             let mut finalization = self.finalization.lock();
@@ -1436,17 +1446,31 @@ impl MemoryChangeCompletion {
                         drop(result_obligation);
                         {
                             let mut finalization = self.finalization.lock();
-                            finalization.replace(CompletionFinalization::FinishWaiter);
+                            finalization.replace(CompletionFinalization::DeliverWaiter);
                         }
                     }
-                    CompletionFinalization::FinishWaiter => {
-                        self.waiter.clone().complete_kernel();
+                    CompletionFinalization::DeliverWaiter => {
+                        let waiter = self.waiter.clone();
                         {
                             let mut finalization = self.finalization.lock();
                             finalization.replace(CompletionFinalization::Done);
                         }
+                        return MemoryRetireAdvance {
+                            work_done: used,
+                            complete: true,
+                            completion: Some(super::retirement::RetirementCompletion {
+                                reply: Some(waiter),
+                                owner: None,
+                            }),
+                        };
                     }
-                    CompletionFinalization::Done => return (used, true),
+                    CompletionFinalization::Done => {
+                        return MemoryRetireAdvance {
+                            work_done: used,
+                            complete: true,
+                            completion: None,
+                        };
+                    }
                 }
                 continue;
             }
@@ -1468,7 +1492,11 @@ impl MemoryChangeCompletion {
         if let Some(change) = change {
             self.retiring.lock().replace(change);
         }
-        (used, false)
+        MemoryRetireAdvance {
+            work_done: used,
+            complete: false,
+            completion: None,
+        }
     }
 }
 
@@ -1494,7 +1522,7 @@ impl crate::remote_call::Completion for MemoryChangeCompletion {
             .lock()
             .take()
             .expect("memory completion lost its work debt reservation");
-        work.publish(self);
+        crate::deferred_work::publish_memory(work, self);
     }
 }
 
@@ -1508,7 +1536,7 @@ pub(crate) fn prepare_memory_completion(
         super::resources::MetadataSponsor::reserve_memory_operation(process.resources.metadata())?;
     let (change_metadata, wait_metadata, remote_metadata) = metadata.into_parts();
     let work = crate::deferred_work::reserve().map_err(|_| SystemCallError::ReachLimit)?;
-    let (waiter, plan) = super::wait::prepare_memory(value, wait_metadata)?;
+    let (waiter, plan) = super::wait::prepare_kernel(value, wait_metadata)?;
     let completion = Arc::try_new(MemoryChangeCompletion::new(
         process,
         waiter,
@@ -1870,7 +1898,7 @@ impl AddressSpace {
             return Err(ShootdownChanged);
         }
         lifecycle
-            .commit_if_current(execution, mandatory, |active| {
+            .commit_running(Some(execution), mandatory, |active| {
                 debug_assert_eq!(active, execution.active());
                 let result = publish(&mut state);
                 let epochs = self.publish_epochs(instruction);
@@ -4299,9 +4327,15 @@ enum DrainFinalization {
     Done,
 }
 
+pub(crate) enum DrainBatchOutcome {
+    More,
+    Blocked(super::retirement::RetirementTicket),
+    Complete,
+}
+
 struct DrainState {
     cursor: usize,
-    pending_close: Option<super::handle::ProcessHandleEntry>,
+    pending_close: Option<super::handle::PendingClose>,
     finalization: Option<DrainFinalization>,
 }
 
@@ -4322,10 +4356,15 @@ pub struct Process {
     pub(crate) handles: crate::sync::Spinlock<super::handle::ProcessHandleTable>,
     /// 生命周期状态机（顶级锁，见 lifecycle 模块锁序契约）。
     pub(crate) lifecycle: super::lifecycle::Lifecycle,
+    pub(crate) reapable_dependency: crate::deferred_work::Dependency,
     /// 观察壳的 weak 回指（REAPABLE/Dead 发布触达；HandleTable 条目强持 shell）。
     control: crate::sync::Spinlock<Option<alloc::sync::Weak<super::process::ProcessControl>>>,
     /// Drain 并发批次仲裁（try_lock；持锁期间推进有界收束）。
-    pub(crate) drain_gate: crate::sync::Spinlock<()>,
+    drain_gate: crate::sync::Spinlock<()>,
+    drain_active: AtomicBool,
+    pub(crate) drain_executor: Arc<super::request::DrainExecutor>,
+    pub(crate) finalization_dependency: crate::deferred_work::Dependency,
+    finalization_debt: crate::sync::Spinlock<Option<crate::deferred_work::FinalizationReservation>>,
     /// HandleTable 收束游标与待关闭项（均由 drain_gate 串行）。
     drain_state: crate::sync::Spinlock<DrainState>,
     /// ProcessStart 提交点一次性冻结的执行绑定：非零域编号与执行需求；
@@ -4359,6 +4398,16 @@ impl Process {
     ) -> Result<Self, SpaceError> {
         let termination =
             crate::deferred_work::reserve_termination().map_err(|_| SpaceError::NoFrame)?;
+        let wait_metadata =
+            super::resources::MetadataSponsor::reserve_kernel_wait(resources.metadata())
+                .map_err(|_| SpaceError::NoFrame)?;
+        let drain_waiter =
+            super::wait::prepare_request(wait_metadata).map_err(|_| SpaceError::NoFrame)?;
+        let request_reservation = super::request::reserve().map_err(|_| SpaceError::NoFrame)?;
+        let drain_executor = super::request::DrainExecutor::new(drain_waiter, request_reservation)
+            .map_err(|_| SpaceError::NoFrame)?;
+        let finalization_debt =
+            crate::deferred_work::reserve_finalization().map_err(|_| SpaceError::NoFrame)?;
         Ok(Self {
             pid,
             parent,
@@ -4372,7 +4421,15 @@ impl Process {
             ),
             lifecycle: super::lifecycle::Lifecycle::building(),
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),
+            reapable_dependency: crate::deferred_work::Dependency::new(),
             drain_gate: crate::sync::Spinlock::new(crate::sync::ranks::DRAIN_GATE, ()),
+            drain_active: AtomicBool::new(false),
+            drain_executor,
+            finalization_dependency: crate::deferred_work::Dependency::new(),
+            finalization_debt: crate::sync::Spinlock::new(
+                crate::sync::ranks::LEAF,
+                Some(finalization_debt),
+            ),
             drain_state: crate::sync::Spinlock::new(
                 crate::sync::ranks::DRAIN_CURSOR,
                 DrainState {
@@ -4542,11 +4599,84 @@ impl Process {
         self.job.upgrade().expect("process outlives its job")
     }
 
+    pub(crate) fn publish_reapable(&self) {
+        self.reapable_dependency.notify();
+        if let Some(control) = self.control() {
+            control.publish_reapable();
+        }
+    }
+
+    pub(crate) fn try_acquire_drain(&self) -> bool {
+        let _gate = self.drain_gate.lock();
+        self.drain_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn release_drain(&self) {
+        assert!(
+            self.drain_active.swap(false, Ordering::AcqRel),
+            "drain batch permit released twice"
+        );
+        self.finalization_dependency.notify();
+    }
+
+    pub(crate) fn assert_unpublished_rollback_entry(&self) {
+        debug_assert!(
+            self.finalization_debt.lock().is_some(),
+            "unpublished process already transferred finalization ownership"
+        );
+        debug_assert!(
+            self.drain_state.lock().finalization.is_none(),
+            "unpublished process already entered finalization"
+        );
+    }
+
+    pub(crate) fn advance_managed_drain(
+        self: &Arc<Self>,
+        budget: usize,
+    ) -> (usize, DrainBatchOutcome) {
+        let _gate = self.drain_gate.lock();
+        assert!(
+            self.drain_active.load(Ordering::Acquire),
+            "managed drain advanced without its batch permit"
+        );
+        self.drain_batch(budget)
+    }
+
+    pub(crate) fn advance_unpublished_drain(
+        self: &Arc<Self>,
+        budget: usize,
+    ) -> (usize, DrainBatchOutcome) {
+        let _gate = self.drain_gate.lock();
+        assert!(
+            !self.drain_active.load(Ordering::Acquire),
+            "unpublished drain overlapped a managed batch"
+        );
+        self.drain_batch(budget)
+    }
+
+    pub(crate) fn advance_finalization_drain(
+        self: &Arc<Self>,
+        budget: usize,
+    ) -> Option<(usize, DrainBatchOutcome)> {
+        let _gate = self.drain_gate.lock();
+        if self.drain_active.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.drain_batch(budget))
+        }
+    }
+
+    pub(crate) fn finalization_can_advance(&self) -> bool {
+        !self.drain_active.load(Ordering::Acquire)
+    }
+
     /// 有界收束一批（drain_gate 持有下调用）：先 HandleTable（对象 close
     /// 回调锁外执行，仍可用地址空间解除外部映射），后 AddressSpace，再推进
     /// 持久化终段。终段把 `publish_dead`、Job 成员摘除和祖先 CLOSED 传播
     /// 纳入同一预算；返回 Complete 前这些责任必须全部交付。
-    pub(crate) fn drain_batch(&self, budget: usize) -> (usize, bool) {
+    fn drain_batch(self: &Arc<Self>, budget: usize) -> (usize, DrainBatchOutcome) {
         debug_assert!(budget > 0);
         let mut work = 0;
 
@@ -4554,10 +4684,17 @@ impl Process {
         // 只消耗一次 close callback work unit。
         let pending = self.drain_state.lock().pending_close.take();
         if let Some(entry) = pending {
-            super::handle::close_entry(entry, self, true);
-            work += 1;
-            if work == budget {
-                return (work, false);
+            let (used, remaining) = entry.advance(self, budget);
+            work += used;
+            if remaining.is_some() || work == budget {
+                self.drain_state.lock().pending_close = remaining;
+                if work == 0
+                    && let Some(super::handle::PendingClose::Retirement(ticket)) =
+                        self.drain_state.lock().pending_close.as_ref()
+                {
+                    return (0, DrainBatchOutcome::Blocked(ticket.clone()));
+                }
+                return (work, DrainBatchOutcome::More);
             }
         }
 
@@ -4566,6 +4703,12 @@ impl Process {
             if let Some(finalization) = finalization {
                 match finalization {
                     DrainFinalization::PublishDead => {
+                        let reservation = self
+                            .finalization_debt
+                            .lock()
+                            .take()
+                            .expect("process finalization published twice");
+                        reservation.publish(self.clone());
                         let (_state, reason, code) = self.lifecycle.snapshot();
                         if let Some(control) = self.control() {
                             control.publish_dead(self.pid, self.parent, reason, code);
@@ -4596,7 +4739,7 @@ impl Process {
                             .and_then(|control| control.take_drain_owner());
                         drop(drain_owner);
                         work += 1;
-                        return (work, true);
+                        return (work, DrainBatchOutcome::Complete);
                     }
                 }
                 work += 1;
@@ -4617,15 +4760,24 @@ impl Process {
             work += scanned;
             match outcome {
                 super::handle::TakeNext::Entry(entry) if work == budget => {
-                    self.drain_state.lock().pending_close = Some(entry);
-                    return (work, false);
+                    self.drain_state.lock().pending_close =
+                        Some(super::handle::PendingClose::Entry(entry));
+                    return (work, DrainBatchOutcome::More);
                 }
                 super::handle::TakeNext::Entry(entry) => {
-                    super::handle::close_entry(entry, self, true);
-                    work += 1;
+                    let (used, remaining) = super::handle::retire_entry(entry, self, budget - work);
+                    work += used;
+                    if remaining.is_some() {
+                        self.drain_state.lock().pending_close = remaining;
+                        return (work, DrainBatchOutcome::More);
+                    }
                 }
-                super::handle::TakeNext::Progress => return (work, false),
-                super::handle::TakeNext::Exhausted if work == budget => return (work, false),
+                super::handle::TakeNext::Progress => {
+                    return (work, DrainBatchOutcome::More);
+                }
+                super::handle::TakeNext::Exhausted if work == budget => {
+                    return (work, DrainBatchOutcome::More);
+                }
                 super::handle::TakeNext::Exhausted => {
                     let ((space_work, complete), retired) = {
                         let mut space = self.space.lock();
@@ -4641,13 +4793,13 @@ impl Process {
                     }
                     work += space_work;
                     if work == budget {
-                        return (work, false);
+                        return (work, DrainBatchOutcome::More);
                     }
                     continue;
                 }
             }
         }
-        (work, false)
+        (work, DrainBatchOutcome::More)
     }
 }
 
@@ -4878,6 +5030,7 @@ impl UnpublishedBound {
             .expect("unpublished bound drain reservation missing");
         // 先冻结 Building，并把 Waiting/Staging 清理发布到出生时预付的
         // termination debt；unpublished drain 在 REAPABLE 前只保留责任。
+        process.assert_unpublished_rollback_entry();
         let todo = process
             .lifecycle
             .request_termination(ProcessExitReason::Killed, 0, None);

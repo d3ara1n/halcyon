@@ -212,12 +212,19 @@ use crate::sync::Spinlock;
 static REGISTRY: Spinlock<Option<HartRegistry>> = Spinlock::new(crate::sync::ranks::LEAF, None);
 /// 安装后不可变的 admitted slot 位图，供业务事务无锁验证 Remote Call 目标。
 static ADMITTED_MASK: AtomicU64 = AtomicU64::new(0);
+// ID 在发布 ADMITTED_MASK 前写入；调用方先 Acquire 读取 mask，再 Relaxed 读取槽。
+static ADMITTED_IDS: [AtomicUsize; HART_NUM_LIMIT] =
+    [const { AtomicUsize::new(usize::MAX) }; HART_NUM_LIMIT];
 
 /// boot 构造完成后安装（只能发生一次）。
 pub fn install(registry: HartRegistry) {
     let admitted = registry.admitted_mask();
     let mut guard = REGISTRY.lock();
     assert!(guard.is_none(), "registry already installed");
+    for (slot, record) in registry.records() {
+        debug_assert_eq!(slot.0, record.slot.0, "registry slot/index mismatch");
+        ADMITTED_IDS[slot.0].store(record.hartid, Ordering::Relaxed);
+    }
     *guard = Some(registry);
     assert_eq!(
         ADMITTED_MASK.swap(admitted, Ordering::Release),
@@ -237,6 +244,10 @@ pub fn admitted_mask() -> u64 {
     admitted
 }
 
+pub(crate) fn admitted_mask_if_published() -> u64 {
+    ADMITTED_MASK.load(Ordering::Acquire)
+}
+
 /// 把 slot 位图展开为 raw hartid 后逐个发送，返回失败的稠密 slot 位图。
 /// Pending/Ready 等业务真值必须已在调用前发布；IPI 只作门铃，失败不撤销业务。
 /// 内部 slot 位图绝不直接解释为 SBI hart mask。
@@ -244,16 +255,17 @@ pub fn admitted_mask() -> u64 {
 /// Remote Call 门铃：请求 Pending 电平
 /// 已在调用前发布，门铃失败不得撤销业务或伪造完成。
 pub fn try_ipi_slots(mask: u64) -> u64 {
-    with_registry(|reg| {
-        let mut failed = 0;
-        for (slot, record) in reg.records() {
-            let bit = 1u64 << slot.0;
-            if mask & bit != 0 && crate::sbi::send_ipi(1, record.hartid).is_err() {
-                failed |= bit;
-            }
+    let targets = mask & admitted_mask();
+    let mut failed = 0;
+    for (slot, id) in ADMITTED_IDS.iter().enumerate() {
+        let bit = 1u64 << slot;
+        let hartid = id.load(Ordering::Relaxed);
+        debug_assert!(targets & bit == 0 || hartid != usize::MAX);
+        if targets & bit != 0 && crate::sbi::send_ipi(1, hartid).is_err() {
+            failed |= bit;
         }
-        failed
-    })
+    }
+    failed
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +300,7 @@ pub fn publish_failed() {
 /// 返回 true 表示可以进入调度器；false 表示启动失败，hart 应停驻等待复位。
 pub fn wait_for_runtime() -> bool {
     loop {
+        crate::runtime_stop::check();
         match gate_state() {
             GateState::Ready => return true,
             GateState::Failed => return false,

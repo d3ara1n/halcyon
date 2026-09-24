@@ -67,9 +67,9 @@ authority。固定宽 ProcessQuery、异步幂等 ProcessKill、REAPABLE 电平
 
 ## Job 管理面（`task/job.rs`）
 
-Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
+Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`）：
 
-- **成员/子表**：`os/ordered_table` 提供有容量上限的 fallible AVL（键为 Pid/JobId，条目为事务占位或强持对象）。创建期以 `PreparedEntry` 在锁外预分配节点，提交/删除不分配；查找、插入、摘除为 O(log n)，不在终止或完成路径做宽度 memmove。枚举按事务屏障分页扫描，单批至多 `JOB_ENUMERATE_MAX` 项。
+- **成员/子表**：`ordered_table` 提供有容量上限的 fallible AVL（键为 Pid/JobId，条目为事务占位或强持对象）。创建期以 `PreparedEntry` 在锁外预分配节点，提交/删除不分配；查找、插入、摘除为 O(log n)，不在终止或完成路径做宽度 memmove。枚举按事务屏障分页扫描，单批至多 `JOB_ENUMERATE_MAX` 项。
 - **JobId**：全局单调不复用分配器（root 恒 1，与 Pid 分立空间）；
   Pid/JobId 分配都在 owner Job 锁内与占位插入同临界区，表内 ID 序 =
   分配序（消除多核乱序分配窗口下的枚举漏项）。
@@ -97,12 +97,12 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   移表）ObjectNotFound。派生 ProcessControl 复用存活 shell（单一
   shell 身份，电平不分叉）；shell 已消散时从 core 铸造新 shell 并在
   铸造点重放 REAPABLE 或 CLOSED——control 消散的进程由此接回管理
-  入口（派生兑底）。递归 JobKill 是用户态政策，
-  公共实现 `libprocess::job_kill`（逐层 seal → 有限 stall 枚举 → 派生 kill →
-  有限 wait/drain/query → 等 CLOSED）。默认 policy 固定单次 wait timeout、
-  wait/drain/query 次数、单次 drain work 与 enumerate stall 上限；失败返回
-  Job/Process authority、阶段与进度，不默认 close。`collect_process` 的
-  `SupervisionTarget` 只在 Drain Complete 且 Query 核验 Dead 后关闭 control。
+  入口（派生兑底）。Job 树收束是用户态政策，公共 `JobCollector` 用单一
+  显式 frame stack 逐层 seal、分页枚举、派生 kill、Process 收束与 CLOSED
+  观察；`job_kill` 是消费同一机器的同步门面。默认 policy 给出观察期限、
+  重试次数与工作量上限；失败按值返还原 Job/Process 机器，保持阶段、
+  快照和 authority，不默认 close。只有 Drain Complete 且 Query 核验 Dead
+  后才关闭 ProcessControl；详细运行期连接见 [`runtime.md`](runtime.md)。
 
 ## 生命周期
 - **创建**：唯一 init 由内核从 BootPackage initial ELF 构造（内嵌与
@@ -135,8 +135,9 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   「地址空间归属纪律」）；reap 先 drop 线程强引用再做离场确认。REAPABLE 是
   `members 为空 && active == 0 && building_ops == 0 && mandatory_ops == 0` 的持续电平：
   线程全部离场但 Remote completion 尚未收束时不会提前发布。
-  任何容器路径都只到达 REAPABLE；Dead
-  仅由 ProcessDrain 的 Complete 分支发布。HandleTable 先逐槽扫描摘项
+  线程终止清理只推进到 REAPABLE；完整资源回收仍由管理者提交 ProcessDrain 批次。
+  `DrainRequest` 捕获目标、输出和剩余预算，经 `DrainExecutor` 持有的可复用完成上下文在依赖未完成时挂起；等待层只负责完成仲裁、订阅注销、线程交付和请求取消接缝。Waiting 发布与请求 debt 启动之间允许终止方先取得取消权：`WaitOperation::start/cancel` 都携带捕获的 `WaitKey`，取消先赢会共同退休 request/activation，迟到 start 为空操作；启动先赢则已发布 debt 在执行时观察取消。旧 epoch 的延迟回调因 key 不匹配不能触及下一轮 activation。关闭回复或调用者退出不撤销已经启动的对象退休，但不会自动提交剩余 Process 全程回收。
+  Dead 在 drain 的 PublishDead 阶段发布，不等于该批已返回 Complete。HandleTable 先逐槽扫描摘项
   （take_next_bounded 硬预算），扫描与 close 各计一个 work unit；预算恰在
   摘项后耗尽时 entry 存入 Process `pending_close`，下一批优先在表锁外消费。
   REAPABLE 后 Tunnel detached close 只提交无失败逻辑关闭，不再创建 MemoryChange
@@ -149,13 +150,19 @@ Job 的创建域/管理域机制面（ABI 见 `shared/src/proc.rs`）：
   的 Lock Ladder。预算分别计费 close 尝试、ledger fragment、extent 摘取/归还与页表槽检查/摘除；单次 order 树操作另有只依赖地址位宽与 DT memory region 上限的结构常数界，批次执行量受 budget 线性约束。
   完成时发布序固定：shell 先冻结终态快照并置 CLOSED（原子清 REAPABLE，外部无
   Dead+REAPABLE 混合视图）→ core 内部置 Dead → Job 成员表摘除（core 仅剩
-  空壳）。并发批次以 drain_gate（try_lock → ObjectBusy）仲裁；Drain 进度存
-  目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
-  同一 authority 可接管。init 持久保留服务 control，并按负载阶段监督：高峰竞态矩阵前先查询并收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace；仍处于 Building/Running 的成员留在集合，末尾再统一 WaitMany(REAPABLE|CLOSED) → Drain 至 Complete → 终态快照。对象 close 回调（如隧道 PEER_CLOSED）发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
+  空壳）。PublishDead 前先发布出生预付的 Finalization 独立强根，后续祖先传播和 Done
+  可以跨预算推进；该终段不会因 caller/control 或 Job 成员根消散而丢失。批次以
+  `Process` 的 `try_acquire_drain`/`release_drain` 封装 `drain_active` 全寿命许可，
+  `drain_gate` 只在 Process 内部串行 managed、unpublished 与 finalization 推进；并发批次返回 ObjectBusy。Unpublished 到 PublishDead 时允许其 debt 与新发布的 Finalization 强根短暂重叠，但两者不能并发推进同一游标；活动 managed 批次会让 Finalization 依赖停驻，许可释放再唤醒。
+  deferred 的 MemoryChange/Unpublished/Termination/Finalization 与 control 的 Notification/Finish/Request/Retirement 各构成一组四类安全点预算。入口 runnable 的后续类别各保留一次执行机会，阻塞登记计执行成本但不计公开 Drain `work_done`；总预算与单债务 turn
+  由 `work_ledger` 统一提供 16/4 常量，通用分配算术由 `work_debt::FairBudget` 承担。Unpublished rollback 当前只由 boot
+  `spawn_from_elf` 生产并使用独立单槽账本，不能借用内存事务容量。
+  Drain 进度存目标进程（handle 游标/pending close + 地址空间阶段游标 + 待归还 extent），
+  并以 `DrainBatchOutcome::{More, Blocked(RetirementTicket), Complete}` 返回类型化的
+  继续、阻塞和完成原因；持有可恢复监督 authority 的管理者可以接管。这是可恢复的管理者驱动，不是终止后的自动回收。init 持久保留服务 control，并按负载阶段监督：高峰竞态矩阵前先查询并收束已进入 Terminating/Dead 的短寿命服务，释放其 AddressSpace；仍处于 Building/Running 的成员留在集合，末尾再统一 WaitMany(REAPABLE|CLOSED) → Drain 至 Complete → 终态快照。对象 close 回调（如隧道 PEER_CLOSED）发生在 Drain 期间，用户态等待序必须先监督后观察终态位。
+- **当前监督与资助**：`srv_init::launch_test_services` 通过 `SpawnRequest.memory_pool = root_memory_pool()` 为服务及委托域靶提供同一来源；`libprocess::spawn` 复制 GRANT-only Pool authority 后交 ProcessBindMemory，没有自动派生每个子进程的固定额度。pm 获得不含 CREATE 的委托 JobControl，init 保留独立域 control 兜底；该授权没有绑定独立页池。`ProcessResources::try_new` 为新进程从全局 admission 建立 MetadataSponsor，未消费父进程的可委派 metadata 预算。页 charge 退回其来源 Pool，metadata permit 退回原 sponsor/global counter，均不因执行 Drain 的进程而改记。当前依靠可信 init/pm 的显式监督政策，不能声称已建立每个管理域的独立资助与回收激励；`max_work` 只是批次工作界限，deferred work 也没有按资助者归账的 CPU 预约计费。
 - **创建/启动事务**：ProcessCreate 先锁定 Job 成员 marker并预留 caller Handle 槽；输出写入后先形成 `HandleTable::PreparedCommit`，再在 `HANDLE_TABLE → JOB_INNER` 临界区把 capability 与成员同时发布。Bootstrap 采用同一 typed commit，并在锁区内继续提交 lifecycle Running 与 execution binding；所有可恢复失败都在此之前。JobCreate 同构保留 child marker 与预留槽协议。ProcessStart 事务见 [`startup.md`](startup.md)。
-- **对象 close callback**：Handle 摘出后才在表锁外执行；各 role 的
-  callback 与固定 fanout 上界由 [`ipc.md`](ipc.md)「Handle close
-  callbacks」唯一记录。任务层只依赖“单次 callback 有固定上界”这一契约。
+- **对象关闭**：叶 role 在 Handle 摘出后、表锁外执行有界 callback；容器通过退休后端提交独立执行者，ProcessDrain 保存 PendingClose::Retirement 完成 ticket，不执行对象内部扫描。尚未启动关闭的摘出项保存为 PendingClose::Entry，仍等下一批推进。具体关闭与准入契约见 [`ipc.md`](ipc.md)，不能把所有关闭都当成同步 callback。
 - **用户态页故障一律杀进程**：本内核无按需分配，所有区域创建时显式
   映射，fault 即程序缺陷。打印诊断行（pid / sepc / 故障地址 / 操作）
   后走终止路径，绝不 panic 内核。
@@ -202,7 +209,7 @@ Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四
 凭据防错认，最大值发行后永久 Exhausted，不回绕；③commit/rollback 按 token 定位，结构性不可消失；HandleTable 跨 owner 发布先经
 `prepare_commit` 形成私有字段的 affine token，最终 `commit_prepared` 不返回可恢复错误；
 ④marker 的提交/回滚全部在容器锁内完成，无分配失败路径。`attach_member` 的插入是另一类锁内
-try_reserve 原子操作，失败无副作用，以“失败时条目不可见”闭合。KOID、PID/JID、AddressSpace 与事务 token 共用 `os/monotonic_id` 的耗尽机制，但各自持独立 allocator，不合并身份域；用户可达构造在发布前返回 ReachLimit。出生块由组装者经 Write 交付，无内核回滚面。
+try_reserve 原子操作，失败无副作用，以“失败时条目不可见”闭合。KOID、PID/JID、AddressSpace 与事务 token 共用 `monotonic_id` 的耗尽机制，但各自持独立 allocator，不合并身份域；用户可达构造在发布前返回 ReachLimit。出生块由组装者经 Write 交付，无内核回滚面。
 
 ## sleep
 

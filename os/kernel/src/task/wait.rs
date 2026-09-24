@@ -1,19 +1,25 @@
 //! WaitContext：多对象等待的安装、完成仲裁、订阅清理与结果交付。
 
-use alloc::{sync::Arc, vec::Vec};
+pub(crate) mod selftest;
+
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use erhino_shared::{
     call::SystemCallError,
     object::ObjectSignals,
-    wait::{WAIT_MANY_MAX, WAIT_TIMEOUT_INFINITE, WaitCookie, WaitItem, WaitReason, WaitResult},
+    time::Deadline,
+    wait::{WAIT_MANY_MAX, WaitCookie, WaitItem, WaitManyRequest, WaitReason, WaitResult},
 };
 use num_traits::ToPrimitive;
-use wait_context::{ArmResult, OfferResult, TimeoutRegistration, WaitCore};
+use wait_context::{ArmResult, OfferResult, TimeoutRegistration, WaitCore, WaitEpoch};
 
 use crate::{context::UserContext, sched, sync::Spinlock, uaccess};
 
 use super::{
     Thread,
-    object::{ObjectRef, ObjectWaitState, WaitAdvance},
+    object::{ObjectRef, ObjectWaitState},
 };
 
 /// 同一对象上的一个已解析等待输入。
@@ -22,6 +28,7 @@ pub(crate) struct WaitInterest {
     pub signals: ObjectSignals,
     pub cookie: WaitCookie,
     pub index: u32,
+    _authority: ObjectRef,
 }
 
 /// syscall 阶段按对象归并并保留授权的观察组。同一对象只登记一次，
@@ -33,11 +40,39 @@ pub struct ResolvedWaitGroup {
 
 /// 线程离开执行点前登记的等待意图。
 pub struct WaitPlan {
+    cancel_on_drop: bool,
     pub groups: Vec<ResolvedWaitGroup>,
     pub action: WaitAction,
     pub expires_at: Option<u64>,
     /// Commit 前预构造的 context；普通对象等待由 install 阶段创建。
-    prepared: Option<Arc<WaitContext>>,
+    prepared: Option<WaitIdentity>,
+    operation: Option<Arc<dyn super::request::WaitOperation>>,
+}
+
+impl Drop for WaitPlan {
+    fn drop(&mut self) {
+        if let Some(identity) = self.prepared.take()
+            && (identity.reusable || self.cancel_on_drop)
+        {
+            identity.abandon();
+            self.operation.take();
+            if matches!(identity.core.arm_in(identity.epoch), ArmResult::Complete(_)) {
+                finish_offered(identity);
+            }
+        } else {
+            self.operation.take();
+        }
+    }
+}
+
+impl WaitPlan {
+    pub(crate) fn bind_operation(&mut self, operation: Arc<dyn super::request::WaitOperation>) {
+        assert!(self.operation.replace(operation).is_none());
+    }
+
+    pub(crate) fn committed_reply(&mut self) {
+        self.cancel_on_drop = true;
+    }
 }
 
 /// 等待完成后如何写回用户现场。
@@ -47,14 +82,33 @@ pub enum WaitStart {
 }
 
 /// WaitMany syscall 入口：复制 ABI、解析 Handle/rights，并完成初始检查。
-/// `timeout_ms` 为相对毫秒超时，`0` 表示无限等待。
-pub fn prepare(
+/// 结构化请求直接携带绝对期限，不从安装时刻重置预算。
+pub fn prepare(thread: &Thread, request_ptr: usize) -> Result<WaitStart, SystemCallError> {
+    let request: WaitManyRequest = {
+        let mut space = thread.process.space.lock();
+        // SAFETY: 请求只含固定宽整数，任意位型可读取，随后验证判别与 reserved。
+        unsafe { uaccess::read_user_value(&mut space, request_ptr) }?
+    };
+    if request.reserved != 0 {
+        return Err(SystemCallError::IllegalArgument);
+    }
+    prepare_items(
+        thread,
+        request.items as usize,
+        request.count as usize,
+        request.result as usize,
+        request.deadline,
+    )
+}
+
+fn prepare_items(
     thread: &Thread,
     items_ptr: usize,
     count: usize,
     result_ptr: usize,
-    timeout_ms: u64,
+    deadline: Deadline,
 ) -> Result<WaitStart, SystemCallError> {
+    let expires_at = crate::clock::deadline_ticks(deadline)?;
     if count == 0 || count > WAIT_MANY_MAX {
         return Err(SystemCallError::IllegalArgument);
     }
@@ -101,11 +155,15 @@ pub fn prepare(
             if item.signals.raw() & !allowed.raw() != 0 {
                 return Err(SystemCallError::IllegalArgument);
             }
-            let object = entry.object().clone();
+            let authority = entry.object().clone();
+            let object = authority
+                .observation_source()
+                .unwrap_or_else(|| authority.clone());
             let interest = WaitInterest {
                 signals: item.signals,
                 cookie: item.cookie,
                 index: index as u32,
+                _authority: authority,
             };
             if let Some(group) = groups
                 .iter_mut()
@@ -127,37 +185,52 @@ pub fn prepare(
         }
     }
 
-    for group in &groups {
-        let current = group.object.signals();
-        if let Some(result) = Subscription::outcome_for(&group.items, current) {
-            let mut space = thread.process.space.lock();
-            // SAFETY: WaitResult 字段和 reserved 全部初始化，结构无 padding。
-            unsafe { uaccess::write_user_value(&mut space, result_ptr, &result) }?;
-            return Ok(WaitStart::Ready);
-        }
+    let ready = groups
+        .iter()
+        .filter_map(|group| Subscription::outcome_for(&group.items, group.object.signals()))
+        .min_by_key(|result| result.item_index);
+    if let Some(result) = ready {
+        let mut space = thread.process.space.lock();
+        // SAFETY: 初始扫描按真实输入索引选择，结果完整初始化且无 padding。
+        unsafe { uaccess::write_user_value(&mut space, result_ptr, &result) }?;
+        return Ok(WaitStart::Ready);
     }
 
-    let expires_at = if timeout_ms == WAIT_TIMEOUT_INFINITE {
-        None
+    let expired = if expires_at.is_some() {
+        let now = crate::clock::now_ticks()?;
+        expires_at.is_some_and(|expires| now >= expires)
     } else {
-        Some(sched::expires_after_ms(timeout_ms))
+        false
     };
+    if expired {
+        let result = WaitResult::new(0, ObjectSignals::NONE, u32::MAX, WaitReason::Timeout);
+        let mut space = thread.process.space.lock();
+        // SAFETY: 固定宽结果及 reserved 完整初始化，失败不发布等待。
+        unsafe { uaccess::write_user_value(&mut space, result_ptr, &result) }?;
+        return Ok(WaitStart::Ready);
+    }
 
     Ok(WaitStart::Park(WaitPlan {
+        cancel_on_drop: false,
         groups,
         action: WaitAction::WaitMany { result_ptr },
         expires_at,
         prepared: None,
+        operation: None,
     }))
 }
 
-pub fn sleep_plan(expires_at: u64) -> WaitPlan {
-    WaitPlan {
+pub fn sleep_plan(deadline: Deadline) -> Result<WaitPlan, SystemCallError> {
+    let expires_at =
+        crate::clock::deadline_ticks(deadline)?.ok_or(SystemCallError::IllegalArgument)?;
+    Ok(WaitPlan {
+        cancel_on_drop: false,
         groups: Vec::new(),
         action: WaitAction::Sleep,
         expires_at: Some(expires_at),
         prepared: None,
-    }
+        operation: None,
+    })
 }
 
 /// 等待完成后如何写回用户现场。
@@ -174,21 +247,203 @@ pub enum WaitOutcome {
     Error(SystemCallError),
     KernelComplete,
     Timeout,
-    #[expect(dead_code, reason = "显式取消 ABI 接入后使用")]
     Cancelled,
     /// 终止取消：线程不回用户态，随上下文消散（kill/abandonment 路径）。
     Abandoned,
 }
 
+/// 在途事件捕获某一轮等待，不通过可复用 context 的当前身份重新定位。
+#[derive(Clone)]
+pub struct WaitIdentity {
+    context: Arc<WaitContext>,
+    epoch: WaitEpoch,
+}
+
+#[derive(Clone)]
+pub(crate) struct WeakWaitIdentity {
+    context: Weak<WaitContext>,
+    epoch: WaitEpoch,
+}
+
+impl WeakWaitIdentity {
+    pub(crate) fn upgrade(&self) -> Option<WaitIdentity> {
+        self.context.upgrade().map(|context| WaitIdentity {
+            context,
+            epoch: self.epoch,
+        })
+    }
+}
+
+impl WaitIdentity {
+    fn new(context: Arc<WaitContext>) -> Self {
+        let epoch = context.core.epoch();
+        Self { context, epoch }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakWaitIdentity {
+        WeakWaitIdentity {
+            context: Arc::downgrade(&self.context),
+            epoch: self.epoch,
+        }
+    }
+
+    pub(crate) fn offer(&self, outcome: WaitOutcome) -> OfferResult {
+        self.context.offer_in(self.epoch, outcome)
+    }
+
+    pub(crate) fn abandon(&self) -> OfferResult {
+        if !self.core.abandon(self.epoch) {
+            return OfferResult::Lost;
+        }
+        let result = self.offer(WaitOutcome::Abandoned);
+        let executor = {
+            let cancellation = self.context.request_cancellation.lock();
+            cancellation.as_ref().and_then(Weak::upgrade)
+        };
+        if let Some(executor) = executor {
+            super::request::WaitOperation::cancel(&*executor, self.key());
+        }
+        result
+    }
+
+    pub(crate) fn bind_cancellation(&self, executor: Weak<dyn super::request::WaitOperation>) {
+        *self.context.request_cancellation.lock() = Some(executor);
+    }
+
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.core.is_abandoned(self.epoch)
+    }
+
+    pub(crate) fn key(&self) -> crate::deferred_work::WaitKey {
+        crate::deferred_work::WaitKey {
+            context: Arc::as_ptr(&self.context) as usize,
+            epoch: self.epoch.value(),
+        }
+    }
+
+    /// token 与等待轮次共同限定到期事件，不能重新定位复用后的 context。
+    pub(crate) fn expire(self, token: timer_queue::TimerToken) {
+        if self.timeout_registration.retire(token)
+            && self.offer(WaitOutcome::Timeout) == OfferResult::Complete
+        {
+            finish_offered(self);
+        }
+    }
+
+    pub(crate) fn complete_kernel(self) {
+        if self.offer(WaitOutcome::KernelComplete) == OfferResult::Complete {
+            finish_offered(self);
+        }
+    }
+}
+
+impl core::ops::Deref for WaitIdentity {
+    type Target = WaitContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum ObserverSink {
+    Thread(WaitIdentity),
+    Persistent(Arc<super::wait_set::ArmCycle>),
+}
+
+impl From<WaitIdentity> for ObserverSink {
+    fn from(context: WaitIdentity) -> Self {
+        Self::Thread(context)
+    }
+}
+
+impl ObserverSink {
+    pub(crate) fn persistent(&self) -> bool {
+        matches!(self, Self::Persistent(_))
+    }
+
+    pub(crate) fn reuses_finish(&self) -> bool {
+        match self {
+            Self::Thread(identity) => identity.reusable,
+            Self::Persistent(_) => true,
+        }
+    }
+
+    pub(crate) fn restart(&self) -> Result<u64, SystemCallError> {
+        match self {
+            Self::Persistent(cycle) => cycle.restart(),
+            Self::Thread(_) => Err(SystemCallError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn arm(&self) -> Option<ObserverSink> {
+        match self {
+            Self::Persistent(cycle) => cycle.arm().then(|| self.clone()),
+            Self::Thread(_) => unreachable!("thread observer cannot be rearmed"),
+        }
+    }
+
+    pub(crate) fn complete_finish(
+        &self,
+        reservation: Option<super::notify_work::FinishReservation>,
+    ) {
+        match self {
+            Self::Persistent(cycle) => cycle.return_finish(
+                reservation.expect("persistent finish lost its prepaid reservation"),
+            ),
+            Self::Thread(context) => {
+                context.complete_finish(context.epoch, reservation);
+            }
+        }
+    }
+
+    pub(crate) fn offer(&self, outcome: WaitOutcome) -> OfferResult {
+        match self {
+            Self::Thread(context) => context.offer(outcome),
+            Self::Persistent(cycle) => cycle.offer(outcome),
+        }
+    }
+
+    pub(crate) fn finish_step(&self, budget: usize) -> (usize, bool) {
+        match self {
+            Self::Thread(context) => context.finish_step(context.epoch, budget),
+            Self::Persistent(cycle) => cycle.finish_step(budget),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Subscription {
-    pub context: Arc<WaitContext>,
+    pub sink: ObserverSink,
     /// 订阅所属对象；通知债务通过它交给目标 drain owner。
     pub object: ObjectRef,
     items: Vec<WaitInterest>,
 }
 
 impl Subscription {
+    pub(crate) fn single(
+        sink: ObserverSink,
+        source: ObjectRef,
+        authority: ObjectRef,
+        item: WaitItem,
+    ) -> Result<Self, SystemCallError> {
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(1)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        items.push(WaitInterest {
+            signals: item.signals,
+            cookie: item.cookie,
+            index: 0,
+            _authority: authority,
+        });
+        Ok(Self {
+            sink,
+            object: source,
+            items,
+        })
+    }
+
     pub(crate) fn interest(&self) -> ObjectSignals {
         self.items
             .iter()
@@ -239,6 +494,7 @@ struct Registration {
 struct FinishState {
     outcome: WaitOutcome,
     delivered: bool,
+    delivery: Option<sched::AdmittedThread>,
 }
 
 /// 一次 Waiting 的唯一线程所有者和完成仲裁点。
@@ -251,21 +507,29 @@ pub struct WaitContext {
     action: WaitAction,
     finish_reservation: Spinlock<Option<super::notify_work::FinishReservation>>,
     finish_state: Spinlock<Option<FinishState>>,
-    _memory_metadata: Option<super::resources::MemoryWaitPermit>,
+    _metadata: Option<super::resources::KernelWaitPermit>,
+    reusable: bool,
+    request_cancellation: Spinlock<Option<Weak<dyn super::request::WaitOperation>>>,
 }
 
 impl WaitContext {
     fn new(
         action: WaitAction,
         registration_capacity: usize,
-        memory_metadata: Option<super::resources::MemoryWaitPermit>,
+        metadata: Option<super::resources::KernelWaitPermit>,
+        reusable: bool,
     ) -> Result<Arc<Self>, SystemCallError> {
         let mut registrations = Vec::new();
         registrations
             .try_reserve(registration_capacity)
             .map_err(|_| SystemCallError::OutOfMemory)?;
-        let finish_reservation =
-            super::notify_work::reserve_finish().map_err(|_| SystemCallError::OutOfMemory)?;
+        let finish_class = if metadata.is_some() {
+            super::notify_work::FinishClass::Kernel
+        } else {
+            super::notify_work::FinishClass::Thread
+        };
+        let finish_reservation = super::notify_work::reserve_finish(finish_class)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
         Arc::try_new(Self {
             core: WaitCore::new(),
             thread: Spinlock::new(crate::sync::ranks::LEAF, None),
@@ -274,35 +538,51 @@ impl WaitContext {
             action,
             finish_reservation: Spinlock::new(crate::sync::ranks::LEAF, Some(finish_reservation)),
             finish_state: Spinlock::new(crate::sync::ranks::LEAF, None),
-            _memory_metadata: memory_metadata,
+            _metadata: metadata,
+            reusable,
+            request_cancellation: Spinlock::new(crate::sync::ranks::LEAF, None),
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
 
-    pub(crate) fn offer(&self, outcome: WaitOutcome) -> OfferResult {
-        let result = self.core.offer(outcome);
+    pub(crate) fn prepare_reusable_wait(
+        self: &Arc<Self>,
+        first_use: bool,
+    ) -> Result<(WaitIdentity, WaitPlan), SystemCallError> {
+        assert!(self.reusable, "kernel request used a single-use wait");
+        if !first_use {
+            if !self.core.is_done() || self.finish_reservation.lock().is_none() {
+                return Err(SystemCallError::ObjectBusy);
+            }
+            self.core
+                .epoch()
+                .next()
+                .ok_or(SystemCallError::ReachLimit)?;
+            // SAFETY: 批次许可唯一；旧请求、线程和容量已在 DONE 前退役。
+            assert!(
+                unsafe { self.core.restart_done() },
+                "request wait failed to restart"
+            );
+        }
+        let identity = WaitIdentity::new(self.clone());
+        let plan = WaitPlan {
+            cancel_on_drop: true,
+            groups: Vec::new(),
+            action: self.action,
+            expires_at: None,
+            prepared: Some(identity.clone()),
+            operation: None,
+        };
+        Ok((identity, plan))
+    }
+
+    fn offer_in(&self, epoch: WaitEpoch, outcome: WaitOutcome) -> OfferResult {
+        let result = self.core.offer_in(epoch, outcome);
         if result != OfferResult::Lost {
             // 只退休原子状态；对象锁内的完成方不得在此获取 owner queue 锁。
             self.timeout_registration.close();
         }
         result
-    }
-
-    /// 内核事务在完成其业务所有权收束后提交唯一成功结果。
-    pub(crate) fn complete_kernel(self: Arc<Self>) {
-        if self.offer(WaitOutcome::KernelComplete) == OfferResult::Complete {
-            finish_offered(self);
-        }
-    }
-
-    /// 在本 hart timer queue 弹出到期项后调用。只有仍发布该 token 的
-    /// context 能退休它并竞争 Timeout outcome。
-    pub(crate) fn expire(self: Arc<Self>, token: timer_queue::TimerToken) {
-        if self.timeout_registration.retire(token)
-            && self.offer(WaitOutcome::Timeout) == OfferResult::Complete
-        {
-            finish_offered(self);
-        }
     }
 
     /// queue token 先产生，随后以 CAS 发布；若完成者已关闭 context，立即
@@ -333,6 +613,7 @@ impl WaitContext {
         let previous = self.finish_state.lock().replace(FinishState {
             outcome,
             delivered: false,
+            delivery: None,
         });
         assert!(
             previous.is_none(),
@@ -342,8 +623,13 @@ impl WaitContext {
 
     /// 推进一个已获完成权的上下文；每次只注销一个 registration 或执行一次
     /// 最终线程交付，完成责任由预付 finish slot 持续承载。
-    pub(crate) fn finish_step(&self, budget: usize) -> (usize, bool) {
+    fn finish_step(&self, epoch: WaitEpoch, budget: usize) -> (usize, bool) {
         debug_assert!(budget > 0);
+        assert_eq!(
+            self.core.epoch(),
+            epoch,
+            "finish payload references a stale wait epoch"
+        );
         let mut used = 0;
         while used < budget {
             let registration = self.registrations.lock().pop();
@@ -359,25 +645,67 @@ impl WaitContext {
             if finish.delivered {
                 return (used.max(1), true);
             }
-            let outcome = finish.outcome;
             finish.delivered = true;
             drop(state);
             let thread = self.thread.lock().take();
-            if let Some(thread) = thread {
-                if !matches!(outcome, WaitOutcome::Abandoned) {
-                    self.deliver(&thread, outcome);
-                    sched::enqueue(thread);
-                } else {
-                    let departure = thread.departure();
-                    drop(thread);
-                    departure.request(super::thread::DepartureKind::Terminated);
-                }
-            }
-            self.core.mark_done();
+            self.finish_state
+                .lock()
+                .as_mut()
+                .expect("finish state disappeared")
+                .delivery = thread;
             used += 1;
             return (used, true);
         }
         (used, false)
+    }
+
+    /// 队列已完成槽位与 Pending 交接，才开放终态并在锁外交付线程。
+    fn complete_finish(
+        &self,
+        epoch: WaitEpoch,
+        reservation: Option<super::notify_work::FinishReservation>,
+    ) {
+        if self.reusable {
+            let reservation = reservation.expect("request wait lost its prepaid capacity");
+            assert!(
+                self.finish_reservation
+                    .lock()
+                    .replace(reservation)
+                    .is_none(),
+                "request wait returned finish capacity twice"
+            );
+        } else {
+            assert!(
+                reservation.is_none(),
+                "single-use wait retained finish capacity"
+            );
+        }
+        let finish = self
+            .finish_state
+            .lock()
+            .take()
+            .expect("finish completed without a delivery");
+        let outcome = if self.core.is_abandoned(epoch) {
+            WaitOutcome::Abandoned
+        } else {
+            finish.outcome
+        };
+        assert!(
+            self.core.mark_done_in(epoch),
+            "wait completion epoch changed"
+        );
+        if let Some(thread) = finish.delivery {
+            if matches!(outcome, WaitOutcome::Abandoned)
+                || thread.process.lifecycle.is_terminating()
+            {
+                let departure = thread.departure();
+                drop(thread);
+                departure.request(super::thread::DepartureKind::Terminated);
+            } else {
+                self.deliver(&thread, outcome);
+                sched::enqueue(thread);
+            }
+        }
     }
 
     fn deliver(&self, thread: &Thread, outcome: WaitOutcome) {
@@ -441,30 +769,49 @@ impl WaitContext {
     }
 }
 
-/// 为 Commit 后必成的内存事务预构造 Installing context。metadata permit 随
+/// 为 Commit 后必成的内核操作预构造 Installing context。metadata permit 随
 /// WaitContext 的真实析构退款，不随 creator 或 completion 提前消散。
-pub fn prepare_memory(
+pub fn prepare_kernel(
     value: usize,
-    metadata: super::resources::MemoryWaitPermit,
-) -> Result<(Arc<WaitContext>, WaitPlan), SystemCallError> {
-    let context = WaitContext::new(WaitAction::KernelResult { value }, 0, Some(metadata))?;
+    metadata: super::resources::KernelWaitPermit,
+) -> Result<(WaitIdentity, WaitPlan), SystemCallError> {
+    let context = WaitIdentity::new(WaitContext::new(
+        WaitAction::KernelResult { value },
+        0,
+        Some(metadata),
+        false,
+    )?);
     let plan = WaitPlan {
+        cancel_on_drop: false,
         groups: Vec::new(),
         action: WaitAction::KernelResult { value },
         expires_at: None,
         prepared: Some(context.clone()),
+        operation: None,
     };
     Ok((context, plan))
+}
+
+pub(crate) fn prepare_request(
+    metadata: super::resources::KernelWaitPermit,
+) -> Result<Arc<WaitContext>, SystemCallError> {
+    WaitContext::new(
+        WaitAction::KernelResult { value: 0 },
+        0,
+        Some(metadata),
+        true,
+    )
 }
 
 /// 调度循环在线程离开执行点后安装一次 WaitMany：Waiting 记录与
 /// 可取消性在 lifecycle 锁内线性化；已 Terminating 则不发布等待，
 /// 直接以 Abandoned 取消（线程不回用户态）。
 pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
+    let operation = plan.operation.take();
     let context = match plan.prepared.take() {
         Some(context) => context,
-        None => match WaitContext::new(plan.action, plan.groups.len(), None) {
-            Ok(context) => context,
+        None => match WaitContext::new(plan.action, plan.groups.len(), None, false) {
+            Ok(context) => WaitIdentity::new(context),
             Err(error) => {
                 deliver_install_error(thread, plan.action, error);
                 return;
@@ -482,52 +829,63 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
             // 终止取得 park 线性化点后，业务 completion 即使已经到达也只
             // 能代表事务完成，不能恢复已经放弃回复权的线程。安装者统一取得
             // Installing 完成权并以 Abandoned 执行 departure confirmation。
-            let _ = context.offer(WaitOutcome::Abandoned);
-            context
-                .core
-                .finish_installing()
-                .expect("installing owner must finish rejected park");
-            context.begin_finish(WaitOutcome::Abandoned);
-            let reservation = context
-                .finish_reservation
-                .lock()
-                .take()
-                .expect("abandoned wait lost finish reservation");
-            super::notify_work::publish_finish(reservation, context.clone());
+            let _ = context.abandon();
+            drop(operation);
+            match context.core.arm_in(context.epoch) {
+                ArmResult::Complete(_) => finish_offered(context),
+                ArmResult::Armed | ArmResult::ExternalCompleter => (),
+            }
             return;
         }
     }
+    if let Some(operation) = operation {
+        operation.start(context.key());
+    }
 
     if let Some(expires_at) = plan.expires_at {
-        match sched::register_wait_timeout(expires_at, context.clone()) {
-            Ok(token) => context.publish_timeout_registration(token),
-            Err(()) => {
-                context.offer(WaitOutcome::Error(SystemCallError::OutOfMemory));
+        let now = match crate::clock::now_ticks() {
+            Ok(now) => now,
+            Err(_) => {
+                crate::runtime_stop::check();
+                unreachable!("runtime stop did not park after clock failure");
+            }
+        };
+        if now >= expires_at {
+            context.offer(WaitOutcome::Timeout);
+        } else {
+            match sched::register_wait_timeout(expires_at, context.clone()) {
+                Ok(token) => context.publish_timeout_registration(token),
+                Err(()) => {
+                    context.offer(WaitOutcome::Error(SystemCallError::OutOfMemory));
+                }
             }
         }
     }
 
-    for group in plan.groups {
+    for group in core::mem::take(&mut plan.groups) {
         if context.core.has_outcome() {
             break;
         }
         let object = group.object;
         let subscription = Subscription {
-            context: context.clone(),
+            sink: ObserverSink::Thread(context.clone()),
             object: object.clone(),
             items: group.items,
         };
         match object.subscribe(subscription) {
-            super::object::SubscribeResult::Ready(outcome) => {
+            super::object::SubscribeResult::Ready { outcome, retired } => {
+                drop(retired);
                 context.offer(outcome);
             }
             super::object::SubscribeResult::Registered(id) => {
                 context.remember(object, id);
             }
-            super::object::SubscribeResult::ReachLimit => {
+            super::object::SubscribeResult::ReachLimit(retired) => {
+                drop(retired);
                 context.offer(WaitOutcome::Error(SystemCallError::ReachLimit));
             }
-            super::object::SubscribeResult::OutOfMemory => {
+            super::object::SubscribeResult::OutOfMemory(retired) => {
+                drop(retired);
                 context.offer(WaitOutcome::Error(SystemCallError::OutOfMemory));
             }
         }
@@ -539,7 +897,7 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
     if context.core.has_outcome() {
         let outcome = context
             .core
-            .finish_installing()
+            .finish_installing_in(context.epoch)
             .expect("Installing owner must finish an existing outcome");
         context.begin_finish(outcome);
         let reservation = context
@@ -551,7 +909,7 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
         return;
     }
 
-    match context.core.arm() {
+    match context.core.arm_in(context.epoch) {
         ArmResult::Armed => {}
         ArmResult::Complete(outcome) => {
             context.begin_finish(outcome);
@@ -570,7 +928,7 @@ pub fn install(thread: sched::AdmittedThread, mut plan: WaitPlan) {
 
 /// 安装中的上下文必持有发起线程；取其进程引用与 tid 做 lifecycle 线性化。
 fn context_thread_identity(
-    context: &Arc<WaitContext>,
+    context: &WaitIdentity,
 ) -> (
     alloc::sync::Arc<super::proc::Process>,
     super::lifecycle::MemberKey,
@@ -631,35 +989,19 @@ pub(crate) fn schedule_waiters(wait: &Spinlock<ObjectWaitState>) {
     reservation.publish(target);
 }
 
-/// 通知 owner 在固定预算内推进候选；未完成的对象债务由 work queue 重排。
-pub(crate) fn drain_waiters(wait: &Spinlock<ObjectWaitState>, budget: usize) -> (usize, bool) {
-    debug_assert!(budget > 0);
-    let mut used = 0;
-    while used < budget {
-        let advance = {
-            let mut held = wait.lock();
-            held.advance_waiter()
-        };
-        match advance {
-            WaitAdvance::Progress => used += 1,
-            WaitAdvance::Complete(context) => {
-                finish_offered(context);
-                used += 1;
-            }
-            WaitAdvance::Done => return (used, true),
-        }
-    }
-    (used, false)
-}
-
 /// 对象信号更新在释放对象锁后调用；只有 Complete 方可进入。
-pub(crate) fn finish_offered(context: Arc<WaitContext>) {
-    let outcome = context.core.outcome();
-    context.begin_finish(outcome);
-    let reservation = context
-        .finish_reservation
-        .lock()
-        .take()
-        .expect("offered wait lost finish reservation");
-    super::notify_work::publish_finish(reservation, context);
+pub(crate) fn finish_offered(sink: impl Into<ObserverSink>) {
+    match sink.into() {
+        ObserverSink::Thread(context) => {
+            let outcome = context.core.outcome_in(context.epoch);
+            context.begin_finish(outcome);
+            let reservation = context
+                .finish_reservation
+                .lock()
+                .take()
+                .expect("offered wait lost finish reservation");
+            super::notify_work::publish_finish(reservation, context);
+        }
+        ObserverSink::Persistent(cycle) => cycle.publish_finish(),
+    }
 }

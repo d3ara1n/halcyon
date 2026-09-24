@@ -192,8 +192,9 @@ pub fn hart_start(hartid: usize, start_addr: usize, opaque: usize) -> SbiResult 
 #[inline]
 pub fn read_time() -> u64 {
     let t: u64;
-    // SAFETY: time 是 S 态可读的只读 CSR。
-    unsafe { asm!("csrr {}, time", out(reg) t, options(nomem)) };
+    // SAFETY: time 是 S 态可读的只读 CSR。Zicsr「CSR Access Ordering」
+    // 将 CSR read 归为 I；两侧 fence 保序高水位读取/发布，asm 保留编译器内存屏障。
+    unsafe { asm!("fence rw, i", "csrr {}, time", "fence i, rw", out(reg) t, options(nostack)) };
     t
 }
 

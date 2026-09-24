@@ -51,12 +51,16 @@ pub fn load(address: usize, length: usize) {
     )
     .expect("BootPackage initial ELF admission failed");
     task::resources::init();
+    crate::clock::selftest::run();
     task::resources::self_test();
     task::proc::building_cutoff_selftest();
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
     frame::selftest::run(&root_pool);
     task::tunnel::selftest::run(&root_pool);
+    task::wait_set::selftest::continuation::run(&root_pool);
+    task::mailbox::selftest::run(&root_pool);
+    task::wait::selftest::time_install(&root_pool);
     let pid = task::alloc_pid().expect("initial process identity exhausted");
     assert_eq!(pid, 1, "initial process must receive PID 1");
     let root_job = task::job::Job::root();

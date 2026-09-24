@@ -1,21 +1,21 @@
 [package]
-name = "erhino_kernel"
+name = "kernel"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-erhino_shared = { path = "../../shared" }
+erhino_shared = { path = "../../shared/erhino_shared" }
 dtb = { path = "../dtb" }
 lock_api = "0.4"
 talc = "5"
 page_table = { path = "../page_table" }
 frame_pool = { path = "../frame_pool" }
-elf = { path = "../elf" }
+elf = { path = "../../shared/elf" }
 sched_domain = { path = "../sched_domain" }
 ready_queue = { path = "../ready_queue" }
 handle_table = { path = "../handle_table" }
 wait_context = { path = "../wait_context" }
-timer_queue = { path = "../timer_queue" }
+timer_queue = { path = "../../shared/timer_queue" }
 stack_layout = { path = "../stack_layout" }
 remote_call = { path = "../remote_call" }
 runtime_gate = { path = "../runtime_gate" }
@@ -23,8 +23,8 @@ memory_space = { path = "../memory_space" }
 memory_supply = { path = "../memory_supply" }
 memory_pool = { path = "../memory_pool" }
 funded_frame = { path = "../funded_frame" }
-metadata_admission = { path = "../metadata_admission" }
-monotonic_id = { path = "../monotonic_id" }
-ordered_table = { path = "../ordered_table" }
+metadata_admission = { path = "../../shared/metadata_admission" }
+monotonic_id = { path = "../../shared/monotonic_id" }
+ordered_table = { path = "../../shared/ordered_table" }
 work_debt = { path = "../work_debt" }
 num-traits = { version = "0.2", default-features = false }

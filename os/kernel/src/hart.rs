@@ -212,6 +212,9 @@ pub fn tp_slot() -> usize {
 /// 永久停放当前 hart：SIE 关闭下 wfi 等待。致命错误的终态；
 /// 调度循环的 idle 不走这里（见 sched.rs）。
 pub fn park() -> ! {
+    // 停止态不再消费任何 supervisor 中断；否则已编程的 STIP/自 IPI 会令
+    // WFI 立即返回并把永久停驻退化为忙等。
+    crate::csr::write_sie(0);
     loop {
         // SAFETY: wfi 无副作用，仅等待中断 pending 唤醒。
         unsafe { asm!("wfi", options(nomem, preserves_flags)) };

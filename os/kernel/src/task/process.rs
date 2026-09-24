@@ -25,7 +25,7 @@ use super::{
         SubscribeResult,
     },
     proc::{Process, ThreadAttachError},
-    wait::{Subscription, WaitOutcome, finish_offered},
+    wait::{Subscription, finish_offered},
 };
 use wait_context::OfferResult;
 
@@ -297,23 +297,8 @@ impl KernelObject for ProcessControl {
         self.state.lock().wait.complete_notification(reservation)
     }
 
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        let mut used = 0;
-        while used < budget {
-            let advance = {
-                let mut state = self.state.lock();
-                state.wait.advance_waiter()
-            };
-            match advance {
-                super::object::WaitAdvance::Progress => used += 1,
-                super::object::WaitAdvance::Complete(context) => {
-                    super::wait::finish_offered(context);
-                    used += 1;
-                }
-                super::object::WaitAdvance::Done => return (used, true),
-            }
-        }
-        (used, false)
+    fn advance_waiter(&self) -> super::object::WaitAdvance {
+        self.state.lock().wait.advance_waiter()
     }
 
     fn header(&self) -> &ObjectHeader {
@@ -341,8 +326,17 @@ impl KernelObject for ProcessControl {
         self.state.lock().wait.subscribe(subscription)
     }
 
+    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
+        self.state.lock().wait.rearm_observer(id)
+    }
+
+    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
+        self.state.lock().wait.cancel_observer(id)
+    }
+
     fn unsubscribe(&self, id: u64) {
-        self.state.lock().wait.unsubscribe(id);
+        let retired = self.state.lock().wait.unsubscribe(id);
+        drop(retired);
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
@@ -630,7 +624,7 @@ impl BuildingLease {
 impl Drop for BuildingLease {
     fn drop(&mut self) {
         if self.active && self.process.lifecycle.leave_building_op() {
-            control_publish_reapable(&self.process.control());
+            self.process.publish_reapable();
         }
     }
 }
@@ -987,7 +981,7 @@ pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo
     let reservation = process.take_termination_reservation();
     if todo.reapable {
         drop(reservation);
-        control_publish_reapable(&process.control());
+        process.publish_reapable();
         return;
     }
     let slots = process.lifecycle.termination_slot_count();
@@ -996,7 +990,7 @@ pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo
         drop(reservation);
         return;
     }
-    reservation.publish(process.clone(), slots);
+    crate::deferred_work::publish_termination(reservation, process.clone(), slots);
 }
 
 /// termination debt 每步只检查一个稳定成员槽；空槽同样诚实计费。
@@ -1015,7 +1009,7 @@ pub(crate) fn advance_termination_cleanup(
             super::lifecycle::TerminationSlot::Vacant => {}
             super::lifecycle::TerminationSlot::Waiting(weak) => {
                 if let Some(context) = weak.upgrade()
-                    && context.offer(WaitOutcome::Abandoned) == OfferResult::Complete
+                    && context.abandon() == OfferResult::Complete
                 {
                     finish_offered(context);
                 }
@@ -1025,15 +1019,9 @@ pub(crate) fn advance_termination_cleanup(
     }
     let complete = *cursor == slots;
     if complete && process.lifecycle.is_reapable() {
-        control_publish_reapable(&process.control());
+        process.publish_reapable();
     }
     (used, complete)
-}
-
-fn control_publish_reapable(control: &Option<Arc<ProcessControl>>) {
-    if let Some(control) = control {
-        control.publish_reapable();
-    }
 }
 
 /// 线程级结果义务归零后的离场确认。正常末线程在 lifecycle 线性化点铸造
@@ -1047,7 +1035,7 @@ pub fn confirm_departure(
     if let Some(todo) = termination {
         run_termination_todo(process, todo);
     } else if reapable {
-        control_publish_reapable(&process.control());
+        process.publish_reapable();
     }
 }
 
@@ -1093,15 +1081,20 @@ pub fn kill(thread: &Thread, control: Handle, code: i64) -> Result<KillOutcome, 
 }
 
 /// ProcessDrain(control, max_work)：REAPABLE/Dead 上推进固定预算收束。
-/// 仅 Complete 批次发布 Dead/CLOSED 并从 Job 成员表摘除 core；此后
-/// core 只剩空资源壳（root 帧已释放），最后 Arc 何时 drop 不影响
-/// Dead 语义。
+/// PublishDead 阶段发布 Dead/CLOSED；后续 Job 成员摘除与祖先传播可能跨预算
+/// 继续。Complete 表示 ProcessDrain 的全部持久收束责任已完成；此后 core
+/// 只剩空资源壳（root 帧已释放），最后 Arc 何时 drop 不影响 Dead 语义。
+pub enum DrainStart {
+    Ready,
+    Wait(super::wait::WaitPlan),
+}
+
 pub fn drain(
     thread: &Thread,
     control: Handle,
     max_work: u32,
     output: usize,
-) -> Result<(), SystemCallError> {
+) -> Result<DrainStart, SystemCallError> {
     if max_work == 0 {
         return Err(SystemCallError::IllegalArgument);
     }
@@ -1119,36 +1112,20 @@ pub fn drain(
         reserved: 0,
     };
     let Some(process) = control.core().upgrade() else {
-        return write_drain_result(thread, output, dead_result());
+        return write_drain_result(thread, output, dead_result()).map(|_| DrainStart::Ready);
     };
     if !control.is_dead() && !control.signals().contains(ObjectSignals::REAPABLE) {
         return Err(SystemCallError::ObjectNotAvailable);
     }
-    let Some(_gate) = process.drain_gate.try_lock() else {
-        return Err(SystemCallError::ObjectBusy);
-    };
     let budget = (max_work as usize).min(PROCESS_DRAIN_MAX as usize);
-    let (work, complete) = process.drain_batch(budget);
-    debug_assert!(work <= budget, "drain over budget: {} > {}", work, budget);
-    // drain_batch 持有终段游标；只有 publish_dead、Job 摘除与祖先传播
-    // 全部完成后才返回 Complete。
-    // drain_gate 必须先于 process 强引用释放：complete 分支后 core 可能
-    // 只剩本局部强引用，Process::Drop 的 close 回调链不得发生在 gate
-    // 持有之下（显式 drop，不依赖声明顺序的逆序巧合）。
-    drop(_gate);
-    write_drain_result(
-        thread,
-        output,
-        ProcessDrainResult {
-            work_done: work as u32,
-            status: if complete {
-                ProcessDrainStatus::Complete as u32
-            } else {
-                ProcessDrainStatus::More as u32
-            },
-            reserved: 0,
-        },
-    )
+    let caller = thread.process.clone();
+    let result = thread.result_obligation();
+    let request =
+        super::request::DrainRequest::acquire(&process, control, caller, result, output, budget)?;
+    process
+        .drain_executor
+        .begin(&process, request)
+        .map(DrainStart::Wait)
 }
 
 fn write_drain_result(

@@ -4,11 +4,8 @@ members = [
     "page_table",
     "frame_pool",
     "dtb",
-    "tar",
-    "elf",
     "handle_table",
     "wait_context",
-    "timer_queue",
     "stack_layout",
     "sched_domain",
     "ready_queue",
@@ -18,9 +15,6 @@ members = [
     "memory_supply",
     "memory_pool",
     "funded_frame",
-    "metadata_admission",
-    "monotonic_id",
-    "ordered_table",
     "work_debt",
 ]
 resolver = "2"

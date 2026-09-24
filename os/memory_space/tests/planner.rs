@@ -803,9 +803,7 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
     let synchronized = space.synchronize(published);
     let (retiring, mut batch) = space.begin_retire(synchronized);
     while batch.pop_fragment().is_some() {}
-    let old = batch
-        .pop_permit()
-        .expect("old writable permit must retire");
+    let old = batch.pop_permit().expect("old writable permit must retire");
     assert!(!object.retire_write(old));
     assert!(batch.is_empty());
     let retired = space.finish_retire(retiring, &batch);

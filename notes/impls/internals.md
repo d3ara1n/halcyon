@@ -101,4 +101,15 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 ## 进程容器与 PID
 
-内核没有全局进程表：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 分别由 `os/monotonic_id::AtomicId64` 的独立 domain 分配，最大值最后发行一次后永久 Exhausted，绝不回绕复用；它们不构成全局操作入口。PID 是所属 Job 直接进程成员表的键，JobId 是直接 child Job 表的键；两者也作为 JobDerive 选择子和 provenance 诊断值。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。
+内核没有全局进程表：未 Dead 进程的生命周期根是 Job 直接成员表（`MemberEntry::Process(Arc<Process>)`，`task/job.rs`），root Job 由内核 static anchor 强持。PID 与 JobId 分别由 `monotonic_id::AtomicId64` 的独立 domain 分配，最大值最后发行一次后永久 Exhausted，绝不回绕复用；它们不构成全局操作入口。PID 是所属 Job 直接进程成员表的键，JobId 是直接 child Job 表的键；两者也作为 JobDerive 选择子和 provenance 诊断值。所有权图与成员表机制见 [`task.md`](task.md)「Job、Building process 与发布」。
+## Commit 后债务账本
+
+当前内核的延后工作由多张固定容量 `WorkDebts` 表承载。表的 payload、容量、owner FIFO、预算顺序和来源条件各不相同，因此不合并为一个业务执行器；公共机械责任由内核侧静态 `DebtLedger<T, SLOTS>` 统一维护。账本绑定唯一 `TableId`，Reservation、Taken 与 Wake ticket 不跨账本流转。
+
+`DebtLedger` 只负责槽位状态转换、Pending 电平、预付槽退款、park/wake/finish/rearm 和 owner 门铃。业务 `step`、依赖登记与条件复检、完成回调、回复交付和 payload 析构均在账本锁外执行。Pending 表示可执行或已取出的工作责任，不因 `take` 减少；只有 Park、Finish 或 Rearm 归还执行责任时减少，早到 Wake 的 Taken 责任不重复计数。
+
+发布策略由调用者显式选择：跨 hart 的新可执行债务和 Parked→Runnable 唤醒敲 owner 门铃；已处于当前安全点推进范围内的内存、通知和完成发布使用静默入口，由安全点末尾统一观察 Pending。门铃失败不撤销 Pending、不伪造完成，idle 仍以 Pending 电平为准。
+
+P2 已把 `ProcessDrain` 的请求推进从 `WaitContext::finish_step` 移到独立 `DrainExecutor` 和请求债务表。请求对象持有目标/调用者引用、批次预算、输出位置、`ThreadResultObligation` 和批次许可；等待上下文只保留完成仲裁、订阅注销、线程交付及按 epoch 定位的取消接缝。WaitPlan 独占请求启动责任，安装前丢弃取消未发布请求；依赖登记带捕获 wait key 并复检 Abandoned。请求债务与通知、Finish、退休共享 16 步安全点预算，公开 Drain 工作量只累计实际资源工作。continuation 自检已验证停驻/恢复、Waiting kill、安装前丢弃、旧 epoch、StoreAccess、累计预算和请求槽退款。
+
+P3+P4 已将通知推进的预算循环集中在 `notify_work`：`KernelObject::advance_waiter` 只在具体来源锁内推进一个候选，订阅释放、完成 offer、门铃和槽归还均保持在来源/账本锁外。对象退休使用 `task::retirement::RetirementTicket` 持有已提交对象强引用；请求取消、PendingClose 轮询和退休完成依赖通过票据接缝，不再由请求层反复查询 `ObjectRef::retirement()`。`RetirementTarget::finish` 和 `MemoryChangeCompletion::advance_retire` 都通过 `RetirementCompletion` 把最终回复交给 driver 在锁外交付；内存事务仍保留独立的 Remote ack、资源退休和 mandatory/result 阶段。WaitSet actor 的静止/最终退休窗口已由现有交错自检覆盖，未发现需要继续拆分状态字段的证据；请求可复用完成上下文的首用/重启政策已下沉到 DrainExecutor，WaitContext 只保留窄 restart 校验。P3+P4 收口验证已通过 `just check`、七面 clippy、os workspace host 回归和完整 `just acceptance`；后者包含 stress 16/16、release、sifive_u、nofd 和三类 boot-failure。release 仍报告既有 `runtime_stop::parked_mask` dead-code 警告与链接器 RWX 提示。四类工作同时 pending 的统一公平性属于 P6 组合门。

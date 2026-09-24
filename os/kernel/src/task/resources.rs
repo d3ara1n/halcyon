@@ -45,6 +45,29 @@ const OBJECT_VIEWS_PER_SPONSOR: usize = 256;
 const CONNECTIONS_PER_SPONSOR: usize = 16;
 const ENDPOINTS_PER_SPONSOR: usize = 32;
 const INVITATIONS_PER_SPONSOR: usize = 16;
+/// 前期 count 政策，不承诺等量字节能驻留；真实分配仍独立 fallible。
+#[derive(Clone, Copy)]
+pub(crate) enum IpcClass {
+    Object,
+    Delivery,
+    Registration,
+    Wait,
+}
+
+impl IpcClass {
+    const COUNT: usize = 4;
+    const LIMITS: [usize; Self::COUNT] = [
+        handle_table::DEFAULT_HANDLE_LIMIT,
+        handle_table::DEFAULT_HANDLE_LIMIT,
+        super::notify_work::SLOTS,
+        super::notify_work::SLOTS,
+    ];
+}
+
+pub(crate) const KERNEL_FINISH_LIMIT: usize =
+    MEMORY_WAIT_GLOBAL_LIMIT + IpcClass::LIMITS[IpcClass::Wait as usize];
+pub(crate) const REGISTRATION_FINISH_LIMIT: usize =
+    IpcClass::LIMITS[IpcClass::Registration as usize];
 
 #[derive(Clone)]
 struct MetadataAdmission {
@@ -64,13 +87,16 @@ struct MetadataAdmission {
     connections: Arc<Counter>,
     endpoints: Arc<Counter>,
     invitations: Arc<Counter>,
+    ipc: [Arc<Counter>; IpcClass::COUNT],
 }
 
 static ADMISSION: crate::sync::Spinlock<Option<MetadataAdmission>> =
     crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
 
 /// 固定容量元数据库存的只读观测；不复制 permit 或资源所有权。
-pub(crate) fn admission_usage() -> [usize; 16] {
+pub(crate) const ADMISSION_CLASSES: usize = 16 + IpcClass::COUNT;
+
+pub(crate) fn admission_usage() -> [usize; ADMISSION_CLASSES] {
     let admission = ADMISSION.lock();
     let a = admission
         .as_ref()
@@ -92,6 +118,10 @@ pub(crate) fn admission_usage() -> [usize; 16] {
         a.connections.used(),
         a.endpoints.used(),
         a.invitations.used(),
+        a.ipc[IpcClass::Object as usize].used(),
+        a.ipc[IpcClass::Delivery as usize].used(),
+        a.ipc[IpcClass::Registration as usize].used(),
+        a.ipc[IpcClass::Wait as usize].used(),
     ]
 }
 
@@ -163,15 +193,97 @@ pub(crate) fn init() {
             INVITATION_GLOBAL_LIMIT,
             "Tunnel Invitation admission allocation failed",
         ),
+        ipc: core::array::from_fn(|class| {
+            new_counter(IpcClass::LIMITS[class], "IPC admission allocation failed")
+        }),
     };
     let mut admission = ADMISSION.lock();
     assert!(admission.is_none(), "metadata admission initialized twice");
     *admission = Some(counters);
 }
 
+/// 构造压力自检由单一批量 guard 占满 Object 额度，不驻留逐项 permit 数组。
+pub(crate) fn exhaust_objects_for_test(sponsor: &Arc<MetadataSponsor>) -> IpcPermit {
+    let class = IpcClass::Object as usize;
+    IpcPermit {
+        _permit: SponsoredPermit::try_acquire_many(
+            sponsor,
+            &sponsor.ipc_global[class],
+            &sponsor.ipc_local[class],
+            IpcClass::LIMITS[class],
+        )
+        .expect("object constructor pressure admission failed"),
+    }
+}
+
 /// 启动期真实穿过 Process shell 类型化子额度：本地耗尽、最后 owner 退款与重取。
 pub(crate) fn self_test() {
     let resources = ProcessResources::try_new().expect("process metadata self-test sponsor failed");
+    let isolated_usage = admission_usage();
+    let sponsor = resources.metadata();
+    let registration = IpcClass::Registration as usize;
+    let registrations = SponsoredPermit::try_acquire_many(
+        sponsor,
+        &sponsor.ipc_global[registration],
+        &sponsor.ipc_local[registration],
+        IpcClass::LIMITS[registration],
+    )
+    .expect("IPC registration isolation self-test acquire failed");
+    let mut finish_slots = alloc::vec::Vec::new();
+    finish_slots
+        .try_reserve_exact(REGISTRATION_FINISH_LIMIT)
+        .expect("persistent finish isolation self-test storage failed");
+    for _ in 0..REGISTRATION_FINISH_LIMIT {
+        finish_slots.push(
+            super::notify_work::reserve_finish(super::notify_work::FinishClass::Persistent)
+                .expect("persistent finish isolation self-test acquire failed"),
+        );
+    }
+    assert!(
+        super::notify_work::reserve_finish(super::notify_work::FinishClass::Persistent).is_err(),
+        "persistent finish isolation self-test did not exhaust its partition"
+    );
+    let thread_finish = super::notify_work::reserve_finish(super::notify_work::FinishClass::Thread)
+        .expect("persistent pressure blocked ordinary finish admission");
+    assert!(
+        matches!(
+            MetadataSponsor::reserve_ipc(sponsor, IpcClass::Registration),
+            Err(SystemCallError::ReachLimit)
+        ),
+        "IPC registration isolation self-test did not exhaust its class"
+    );
+    let delivery = MetadataSponsor::reserve_ipc(sponsor, IpcClass::Delivery)
+        .expect("IPC registration pressure blocked delivery admission");
+    let object = MetadataSponsor::reserve_ipc(sponsor, IpcClass::Object)
+        .expect("IPC registration pressure blocked object admission");
+    let class_usage = admission_usage();
+    let wait = MetadataSponsor::reserve_kernel_wait(resources.metadata())
+        .expect("kernel result wait admission self-test acquire failed");
+    let (context, plan) = super::wait::prepare_kernel(0, wait)
+        .expect("kernel result wait admission self-test prepare failed");
+    assert_eq!(
+        admission_usage()[16 + IpcClass::Wait as usize],
+        class_usage[16 + IpcClass::Wait as usize] + 1,
+        "kernel result wait admission self-test did not retain its permit"
+    );
+    drop(context);
+    assert_eq!(
+        admission_usage()[16 + IpcClass::Wait as usize],
+        class_usage[16 + IpcClass::Wait as usize] + 1,
+        "kernel result wait admission self-test refunded before plan release"
+    );
+    drop(plan);
+    assert_eq!(
+        admission_usage(),
+        class_usage,
+        "kernel result wait admission self-test did not refund its resources"
+    );
+    drop((registrations, delivery, object, finish_slots, thread_finish));
+    assert_eq!(
+        admission_usage(),
+        isolated_usage,
+        "IPC isolation self-test did not refund its resources"
+    );
     let builder = MetadataSponsor::reserve_builder(resources.metadata())
         .expect("ProcessBuilder metadata self-test acquire failed");
     assert!(matches!(
@@ -183,6 +295,7 @@ pub(crate) fn self_test() {
         MetadataSponsor::reserve_builder(resources.metadata())
             .expect("ProcessBuilder metadata self-test refund failed"),
     );
+    super::wait_set::selftest::run(resources.metadata());
 
     let control = MetadataSponsor::reserve_control(resources.metadata())
         .expect("ProcessControl metadata self-test acquire failed");
@@ -304,6 +417,8 @@ pub(crate) struct MetadataSponsor {
     endpoint_local: Arc<Counter>,
     invitation_global: Arc<Counter>,
     invitation_local: Arc<Counter>,
+    ipc_global: [Arc<Counter>; IpcClass::COUNT],
+    ipc_local: [Arc<Counter>; IpcClass::COUNT],
 }
 
 impl MetadataSponsor {
@@ -328,6 +443,12 @@ impl MetadataSponsor {
         let connection_local = new_local(CONNECTIONS_PER_SPONSOR)?;
         let endpoint_local = new_local(ENDPOINTS_PER_SPONSOR)?;
         let invitation_local = new_local(INVITATIONS_PER_SPONSOR)?;
+        let ipc_local = [
+            new_local(IpcClass::LIMITS[0])?,
+            new_local(IpcClass::LIMITS[1])?,
+            new_local(IpcClass::LIMITS[2])?,
+            new_local(IpcClass::LIMITS[3])?,
+        ];
         Arc::try_new(Self {
             _global_slot: global_slot,
             pool_global: counters.pool_cores,
@@ -360,8 +481,39 @@ impl MetadataSponsor {
             endpoint_local,
             invitation_global: counters.invitations,
             invitation_local,
+            ipc_global: counters.ipc,
+            ipc_local,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
+    }
+
+    fn acquire_ipc(
+        sponsor: &Arc<Self>,
+        class: IpcClass,
+    ) -> Result<SponsoredPermit<Self>, SystemCallError> {
+        SponsoredPermit::try_acquire(
+            sponsor,
+            &sponsor.ipc_global[class as usize],
+            &sponsor.ipc_local[class as usize],
+        )
+        .map_err(|_| SystemCallError::ReachLimit)
+    }
+
+    pub(crate) fn reserve_ipc(
+        sponsor: &Arc<Self>,
+        class: IpcClass,
+    ) -> Result<IpcPermit, SystemCallError> {
+        Ok(IpcPermit {
+            _permit: Self::acquire_ipc(sponsor, class)?,
+        })
+    }
+
+    pub(crate) fn reserve_kernel_wait(
+        sponsor: &Arc<Self>,
+    ) -> Result<KernelWaitPermit, SystemCallError> {
+        Ok(KernelWaitPermit {
+            _permit: Self::acquire_ipc(sponsor, IpcClass::Wait)?,
+        })
     }
 
     pub(crate) fn reserve_pool_core(
@@ -454,7 +606,7 @@ impl MetadataSponsor {
         .map_err(|_| SystemCallError::ReachLimit)?;
         Ok(MemoryOperationPermits {
             change: MemoryChangePermit { _permit: change },
-            wait: MemoryWaitPermit { _permit: wait },
+            wait: KernelWaitPermit { _permit: wait },
             remote: RemoteCompletionPermit { _permit: remote },
         })
     }
@@ -545,6 +697,10 @@ impl PoolCorePermit {
 }
 
 /// ProcessBuilder 壳的唯一 metadata owner；最后 capability 消散才退款。
+pub(crate) struct IpcPermit {
+    _permit: SponsoredPermit<MetadataSponsor>,
+}
+
 pub(crate) struct BuilderPermit {
     _permit: SponsoredPermit<MetadataSponsor>,
 }
@@ -570,7 +726,8 @@ pub(crate) struct MemoryChangePermit {
     _permit: SponsoredPermit<MetadataSponsor>,
 }
 
-pub(crate) struct MemoryWaitPermit {
+/// 内核结果等待的存储资助；准入来源由产生必成义务的组件选择。
+pub(crate) struct KernelWaitPermit {
     _permit: SponsoredPermit<MetadataSponsor>,
 }
 
@@ -580,14 +737,14 @@ pub(crate) struct RemoteCompletionPermit {
 
 pub(crate) struct MemoryOperationPermits {
     change: MemoryChangePermit,
-    wait: MemoryWaitPermit,
+    wait: KernelWaitPermit,
     remote: RemoteCompletionPermit,
 }
 
 impl MemoryOperationPermits {
     pub(crate) fn into_parts(
         self,
-    ) -> (MemoryChangePermit, MemoryWaitPermit, RemoteCompletionPermit) {
+    ) -> (MemoryChangePermit, KernelWaitPermit, RemoteCompletionPermit) {
         (self.change, self.wait, self.remote)
     }
 }

@@ -34,7 +34,7 @@ fn attach_request(invitation: Handle, va: usize, output: usize) -> TunnelAttachR
 struct Inventory {
     pool: MemoryPoolSnapshot,
     frames: usize,
-    metadata: [usize; 16],
+    metadata: [usize; resources::ADMISSION_CLASSES],
 }
 
 impl Inventory {
@@ -318,7 +318,10 @@ pub(crate) fn run(root: &Arc<MemoryPool>) {
     drop(departure);
     while crate::deferred_work::drain_current() != 0 {}
     assert!(process.lifecycle.is_reapable());
-    while !process.drain_batch(1).1 {}
+    while !matches!(
+        super::super::proc::selftest::advance_unmanaged(&process, 1).1,
+        super::super::proc::DrainBatchOutcome::Complete
+    ) {}
     drop(process);
     drop(invitation);
     drop(endpoint);

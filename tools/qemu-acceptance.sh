@@ -25,12 +25,49 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 mkdir -p artifacts
-log="artifacts/.qemu-acceptance-$$.log"
+run_id="$(date +%Y%m%d-%H%M%S)-$$"
+log="artifacts/.qemu-acceptance-${run_id}.log"
+meta="artifacts/.qemu-acceptance-${run_id}.meta"
+{
+    printf 'run_id=%s\n' "$run_id"
+    printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    printf 'workload=%s\n' "${ERHINO_ACCEPTANCE_WORKLOAD:-unknown}"
+    printf 'profile=%s\n' "$profile"
+    printf 'throttle=%s\n' "${THROTTLE:-unknown}"
+    printf 'platform=%s\n' "${PLATFORM:-unknown}"
+    printf 'model=%s\n' "${MODEL:-unknown}"
+    printf 'mode=%s\n' "${MODE:-unknown}"
+    printf 'kernel=%s\n' "${ERHINO_KERNEL_ELF:-unknown}"
+    printf 'boot_package=%s\n' "${ERHINO_BOOT_PACKAGE:-unknown}"
+    if [[ -n "${ERHINO_KERNEL_ELF:-}" && -f "$ERHINO_KERNEL_ELF" ]]; then
+        printf 'kernel_sha256=%s\n' "$(shasum -a 256 "$ERHINO_KERNEL_ELF" | awk '{print $1}')"
+    fi
+    if [[ -n "${ERHINO_BOOT_PACKAGE:-}" && -f "$ERHINO_BOOT_PACKAGE" ]]; then
+        printf 'boot_package_sha256=%s\n' "$(shasum -a 256 "$ERHINO_BOOT_PACKAGE" | awk '{print $1}')"
+    fi
+    printf 'pid=%s\n' "$$"
+    printf 'command='
+    printf '%q ' "$@"
+    printf '\n'
+} > "$meta"
 
 required=(
     "funded frame self-test passed: full-range zeroing, split, rollback, and source refund"
+    "WaitSet deterministic interleaving checks passed:"
+    "Waiting continuation checks passed:"
+    "Mailbox ownership checks passed:"
+    "Clock state checks passed:"
+    "Time wait installation checks passed:"
+    "public time deadline checks passed:"
+    "threaded mailbox receive contention passed:"
+    "committed IPC caller kill passed:"
     "acceptance domain collected"
     "all services supervised to completion"
+    "root supervision failure isolation passed"
+    "root startup ownership rollback passed"
+    "root auxiliary capability cleanup passed"
+    "pm: active mailbox stop and refund passed"
+    "root independent runtime failure isolation passed"
     "peer closed observed"
     "pm delegated domain confirmed Dead"
     "system reset authority checks passed"
@@ -42,6 +79,29 @@ required=(
     "Tunnel multi-page geometry and projection checks passed"
     "Tunnel Running geometry checks passed: six lengths"
     "RNL2 multi-page stream passed: bytes=65536, capacity=12160"
+    "FAL2 Open control and terminal cases passed after 16384 bytes"
+    "FAL2 independent stream content and frozen read passed"
+    "FAL2 cancellable RPC phases passed"
+    "FAL2 independent consumer shutdown passed"
+    "FAL2 independent Create uncertainty and reply isolation passed"
+    "FAL2 independent property copy passed"
+    "FAL2 independent cross-provider Move rejection passed"
+    "FAL2 independent Delegate and restricted Open passed"
+    "FAL2 independent Watch authorization passed"
+    "FAL2 independent repeatable handle read passed"
+    "FAL2 independent affine Take recovery passed"
+    "FAL2 independent Create Modify and Delete Watch passed"
+    "FAL2 independent enumeration and same-provider Move passed"
+    "FAL2 independent property Copy and stream ReadAt passed"
+    "FAL2 independent unattached Open expired and retired"
+    "FAL2 independent Open offer discarded"
+    "FAL2 independent pre-Start EOF gate passed"
+    "FAL2 independent primary and secondary bounded Open read passed"
+    "FAL2 independent conditional Open identity and pin passed"
+    "FAL2 independent Open reply authority retired after abandonment"
+    "FAL2 independent cross-provider stream Copy passed"
+    "FAL2 independent Copy conflict, empty and cancellation variants passed"
+    "FAL2 independent exclusive target Create and pinned cleanup passed"
     "system reset accepted: action Shutdown, reason Requested"
 )
 case "$profile" in
@@ -54,6 +114,7 @@ case "$profile" in
         required+=(
             "acceptance workload: stress"
             "drain minimum-budget acceptance passed"
+            "retired WaitSet with 256 registrations"
             "Tunnel close/Attach failure matrix passed: 24 rounds"
             "race matrix acceptance passed: 16/16 scenarios passed"
         )
@@ -84,6 +145,7 @@ fi
 
 rejected=(
     "acceptance failed"
+    " FAILED"
     "Kernel panicking"
     "Panicking in "
     "Panicking: no information available."
@@ -148,9 +210,18 @@ show_summary() {
 # 失败即保留现场：无法重现的非确定性失败、锚点缺失或挂死一旦删日志就只能重跑。
 keep_log() {
     local reason="$1"
-    local kept="artifacts/failed-acceptance-$(date +%Y%m%d-%H%M%S)-$$.log"
+    local kept="artifacts/failed-acceptance-${run_id}.log"
+    local kept_meta="artifacts/failed-acceptance-${run_id}.meta"
+    local last_progress
+    last_progress="$(grep -F 'acceptance progress:' "$log" 2>/dev/null | tail -n 1 || true)"
     if mv "$log" "$kept" 2>/dev/null; then
+        mv "$meta" "$kept_meta" 2>/dev/null || true
         echo "QEMU acceptance failure log kept: $kept ($reason)" >&2
+        if [[ -n "$last_progress" ]]; then
+            echo "QEMU acceptance last progress: $last_progress" >&2
+        else
+            echo "QEMU acceptance last progress: none" >&2
+        fi
         show_summary "$kept" >&2
     fi
 }
@@ -158,6 +229,11 @@ keep_log() {
 if [[ "$status" -ne 0 ]]; then
     if ! $allow_timeout || [[ "$status" -ne 124 ]]; then
         echo "QEMU acceptance failed: command exited with status $status." >&2
+        if grep -Fq 'acceptance progress:' "$log" 2>/dev/null; then
+            echo "QEMU acceptance classification: failure-after-progress" >&2
+        else
+            echo "QEMU acceptance classification: failure-without-progress" >&2
+        fi
         keep_log "exit status $status"
         exit "$status"
     fi
@@ -183,4 +259,4 @@ if [[ "$status" -eq 124 ]]; then
     echo "QEMU acceptance passed (harvested after explicit reset failure)."
 fi
 show_summary "$log"
-rm -f "$log"
+rm -f "$log" "$meta"

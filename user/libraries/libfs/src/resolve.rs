@@ -1,0 +1,641 @@
+//! 走路引擎：逐子树委托 Lookup、符号链接展开与 `..` 的客户端解释。
+//!
+//! 状态是单个逻辑位置列表 `logical`（前缀表条目以下的组件，含未确认
+//! 尾部）加帧栈 `frames`（`frames[i].base` 分区 provider 区域：`logical
+//! [base..]` 可从该帧 DirectoryGrant 到达）。`..` 对逻辑列表词法回退、按需收缩
+//! 帧栈，namespace 根处钳制；绝对 target 对前缀表重启整次解析，相对
+//! target 原地替换链接分量；展开次数（40）、组件数、字节数与 Lookup
+//! 步数受上限约束。终段策略随请求声明，提供者不解释 target。
+
+use alloc::{string::String, vec::Vec};
+
+use erhino_shared::object::Handle;
+use libfal::{
+    node::{NodeAttributes, NodeKind},
+    protocol::{ResolvePolicy, Status},
+};
+
+use crate::prefix::{DirectoryGrant, PrefixTable};
+use crate::{BYTE_LIMIT, COMPONENT_LIMIT, SYMLINK_LIMIT};
+
+/// Found 的节点元数据摘要（客户端所有权形态，含自描述 value 尾——
+/// SymbolicLink 的 target；其余 kind 为空）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeSummary {
+    pub identity: u64,
+    pub version: u64,
+    pub kind: NodeKind,
+    pub rights: libfal::authority::FalRights,
+    pub attributes: NodeAttributes,
+    pub size: u64,
+    pub value: alloc::vec::Vec<u8>,
+}
+
+/// 单次 Lookup 的客户端视图结果（真实传输把线形映射到这里）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LookupOutcome<G = Handle> {
+    Found(NodeSummary),
+    Delegate {
+        dir: G,
+        consumed: String,
+        remaining: String,
+    },
+    Link {
+        consumed: String,
+        target: String,
+        remaining: String,
+    },
+}
+
+/// 走路传输抽象：host 测试注入 mock，真实实现走 librpc/libfal。
+pub trait WalkTransport {
+    type Endpoint: Clone;
+
+    fn lookup(
+        &mut self,
+        dir: &DirectoryGrant<Self::Endpoint>,
+        policy: ResolvePolicy,
+        path: &str,
+    ) -> Result<LookupOutcome<DirectoryGrant<Self::Endpoint>>, Status>;
+}
+
+/// 解析错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// 路径不是绝对路径或含空段。
+    IllegalPath,
+    /// 无前缀条目命中（namespace 未覆盖）。
+    NoProvider,
+    /// 提供者返回的错误状态。
+    Status(Status),
+    /// 符号链接展开超限（40）。
+    TooManyLinks,
+    /// 组件数或字节预算耗尽。
+    BudgetExceeded,
+    /// 单次解析的 Lookup 步数超限（提供者退化或恶意循环）。
+    StepLimit,
+}
+
+impl ResolveError {
+    /// 归一化为 FAL 状态：op 层透传给调用方。
+    pub fn status(self) -> Status {
+        match self {
+            Self::IllegalPath => Status::Invalid,
+            Self::NoProvider => Status::NotFound,
+            Self::Status(status) => status,
+            Self::TooManyLinks | Self::BudgetExceeded | Self::StepLimit => Status::Invalid,
+        }
+    }
+}
+
+/// 解析终点：帧锚 DirectoryGrant + 相对后缀与节点信息。
+///
+/// 后续操作以 `anchor` 的授权身份和 `rel` 相对路径寻址；两个值来自
+/// 最后一次成功的 Lookup。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Position<G = Handle> {
+    pub anchor: G,
+    pub rel: String,
+    pub info: NodeSummary,
+}
+
+/// ResolveParent 的结果：父目录位置 + 终段名。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParentPosition<G = Handle> {
+    pub dir: Position<G>,
+    pub child: String,
+}
+
+/// 单次解析的 Lookup 步数上限。
+const STEP_LIMIT: usize = 256;
+
+struct Frame<G> {
+    dir: G,
+    base: usize,
+}
+
+struct Budget {
+    links: usize,
+    components: usize,
+    bytes: usize,
+}
+
+impl Budget {
+    fn charge(&mut self, name: &str) -> Result<(), ResolveError> {
+        self.components += 1;
+        self.bytes += name.len();
+        if self.components > COMPONENT_LIMIT || self.bytes > BYTE_LIMIT {
+            return Err(ResolveError::BudgetExceeded);
+        }
+        Ok(())
+    }
+}
+
+fn split_absolute(path: &str) -> Result<Vec<&str>, ResolveError> {
+    if !path.starts_with('/') {
+        return Err(ResolveError::IllegalPath);
+    }
+    let body = &path[1..];
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let segments = body.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err(ResolveError::IllegalPath);
+    }
+    Ok(segments)
+}
+
+/// 解析绝对路径至终点。`policy` 为 FollowAll / NoFollowFinal；
+/// ResolveParent 用 [`resolve_parent`]。
+pub fn resolve<T: WalkTransport>(
+    transport: &mut T,
+    table: &PrefixTable<T::Endpoint>,
+    path: &str,
+    policy: ResolvePolicy,
+) -> Result<Position<DirectoryGrant<T::Endpoint>>, ResolveError> {
+    debug_assert!(matches!(
+        policy,
+        ResolvePolicy::FollowAll | ResolvePolicy::NoFollowFinal
+    ));
+    let mut budget = Budget {
+        links: SYMLINK_LIMIT,
+        components: 0,
+        bytes: 0,
+    };
+    if !path.starts_with('/') {
+        return Err(ResolveError::IllegalPath);
+    }
+    let mut steps = 0usize;
+    let mut current = String::from(path);
+
+    'restart: loop {
+        let (entry, suffix) = table.match_path(&current).ok_or(ResolveError::NoProvider)?;
+        let mut frames = Vec::new();
+        frames.push(Frame {
+            dir: entry.directory.clone(),
+            base: 0,
+        });
+        let mut logical: Vec<String> = Vec::new();
+        for segment in split_absolute_suffix(suffix)? {
+            budget.charge(segment)?;
+            logical.push(String::from(segment));
+        }
+
+        loop {
+            normalize(&mut logical, &mut frames);
+            let frame = frames.last().expect("frames never empty");
+            let rel = logical[frame.base..].join("/");
+            steps += 1;
+            if steps > STEP_LIMIT {
+                return Err(ResolveError::StepLimit);
+            }
+
+            if rel.is_empty() {
+                // 位置即帧锚本身：空路径查询其节点信息。
+                let info = transport
+                    .lookup(&frame.dir, policy, "")
+                    .map_err(ResolveError::Status)?;
+                return match info {
+                    LookupOutcome::Found(info) => Ok(Position {
+                        anchor: frame.dir.clone(),
+                        rel: String::new(),
+                        info,
+                    }),
+                    // 空路径不产生边界：提供者不得对根返回 Delegate/Link。
+                    _ => Err(ResolveError::Status(Status::Internal)),
+                };
+            }
+
+            let outcome = transport
+                .lookup(&frame.dir, policy, &rel)
+                .map_err(ResolveError::Status)?;
+            match outcome {
+                LookupOutcome::Found(info) => {
+                    return Ok(Position {
+                        anchor: frame.dir.clone(),
+                        rel,
+                        info,
+                    });
+                }
+                LookupOutcome::Delegate {
+                    dir,
+                    consumed,
+                    remaining,
+                } => {
+                    // Delegate 契约：consumed + remaining 连续覆盖本帧 rel。
+                    let consumed_count =
+                        verify_cover(&logical[frame.base..], &consumed, &remaining, None)?;
+                    frames.push(Frame {
+                        dir,
+                        base: frame.base + consumed_count,
+                    });
+                }
+                LookupOutcome::Link {
+                    consumed,
+                    target,
+                    remaining,
+                } => {
+                    if budget.links == 0 {
+                        return Err(ResolveError::TooManyLinks);
+                    }
+                    budget.links -= 1;
+                    // Link 契约：consumed + [链接分量] + remaining 覆盖 rel；
+                    // 链接分量名不在 wire 上，位置即 consumed 之后。
+                    let frame_rel = &logical[frame.base..];
+                    let consumed_count = verify_cover(frame_rel, &consumed, &remaining, Some(()))?;
+                    let link_at = frame.base + consumed_count;
+                    debug_assert!(link_at < logical.len());
+                    let after: Vec<String> = logical.split_off(link_at + 1);
+                    logical.pop(); // 链接分量本身被 target 替换
+
+                    if target.starts_with('/') {
+                        // 绝对 target：以组件方式拼接，空 target（"/"）仅留根。
+                        current = String::from(target.as_str());
+                        for component in &after {
+                            if !current.ends_with('/') {
+                                current.push('/');
+                            }
+                            current.push_str(component);
+                        }
+                        continue 'restart;
+                    }
+                    for segment in target.split('/') {
+                        if segment.is_empty() {
+                            return Err(ResolveError::IllegalPath);
+                        }
+                        budget.charge(segment)?;
+                        logical.push(String::from(segment));
+                    }
+                    logical.extend(after);
+                }
+            }
+        }
+    }
+}
+
+/// 解析至终段父目录（create/delete/rename 语义）：父路径 FollowAll，
+/// 返回父位置与终段名。
+pub fn resolve_parent<T: WalkTransport>(
+    transport: &mut T,
+    table: &PrefixTable<T::Endpoint>,
+    path: &str,
+) -> Result<ParentPosition<DirectoryGrant<T::Endpoint>>, ResolveError> {
+    let mut segments = split_absolute(path)?;
+    let child = segments.pop().ok_or(ResolveError::IllegalPath)?;
+    if child == "." || child == ".." {
+        return Err(ResolveError::IllegalPath);
+    }
+    let mut parent = String::from("/");
+    parent.push_str(&segments.join("/"));
+    let dir = resolve(transport, table, &parent, ResolvePolicy::FollowAll)?;
+    Ok(ParentPosition {
+        dir,
+        child: String::from(child),
+    })
+}
+
+fn split_absolute_suffix(suffix: &str) -> Result<Vec<&str>, ResolveError> {
+    if suffix.is_empty() {
+        return Ok(Vec::new());
+    }
+    let segments = suffix.split('/').collect::<Vec<_>>();
+    // 空段非法；`.` 与 `..` 合法——由词法归一在走路前处理。
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err(ResolveError::IllegalPath);
+    }
+    Ok(segments)
+}
+
+/// `.`/`..` 的词法处理：`..` 弹出逻辑组件并收缩越界帧，根处钳制。
+fn normalize<G>(logical: &mut Vec<String>, frames: &mut Vec<Frame<G>>) {
+    let mut work: Vec<String> = Vec::with_capacity(logical.len());
+    let mut changed = false;
+    for component in logical.drain(..) {
+        match component.as_str() {
+            "." => changed = true,
+            ".." => {
+                changed = true;
+                if work.pop().is_some() {
+                    while frames.len() > 1 && frames.last().unwrap().base > work.len() {
+                        frames.pop();
+                    }
+                }
+            }
+            name => work.push(String::from(name)),
+        }
+    }
+    if changed {
+        while frames.len() > 1 && frames.last().unwrap().base > work.len() {
+            frames.pop();
+        }
+    }
+    *logical = work;
+}
+
+/// 验证提供者边界报告与本帧逻辑位置的吻合，返回 consumed 组件数。
+///
+/// Delegate：`consumed + remaining` 逐组件连续覆盖 `frame_rel`。
+/// Link（`with_link = Some(())`）：`consumed + [链接分量] + remaining`
+/// 覆盖——链接分量名不在 wire 上，跳过一个不比较的位置。
+fn verify_cover(
+    frame_rel: &[String],
+    consumed: &str,
+    remaining: &str,
+    with_link: Option<()>,
+) -> Result<usize, ResolveError> {
+    let consumed_segments: Vec<&str> = if consumed.is_empty() {
+        Vec::new()
+    } else {
+        consumed.split('/').collect()
+    };
+    let remaining_segments: Vec<&str> = if remaining.is_empty() {
+        Vec::new()
+    } else {
+        remaining.split('/').collect()
+    };
+    let skip = usize::from(with_link.is_some());
+    let total = consumed_segments.len() + skip + remaining_segments.len();
+    if frame_rel.len() < total {
+        return Err(ResolveError::IllegalPath);
+    }
+    for (offset, segment) in consumed_segments.iter().enumerate() {
+        if frame_rel[offset] != *segment {
+            return Err(ResolveError::IllegalPath);
+        }
+    }
+    for (offset, segment) in remaining_segments.iter().enumerate() {
+        let index = consumed_segments.len() + skip + offset;
+        if frame_rel[index] != *segment {
+            return Err(ResolveError::IllegalPath);
+        }
+    }
+    Ok(consumed_segments.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libfal::node::{NodeAttributes, NodeKind};
+    use libfal::protocol::ResolvePolicy::{FollowAll, NoFollowFinal};
+
+    fn handle(raw: u64) -> Handle {
+        Handle::from_raw(raw)
+    }
+
+    fn grant(raw: u64) -> DirectoryGrant<Handle> {
+        DirectoryGrant::new(handle(raw))
+    }
+
+    fn info(kind: NodeKind) -> NodeSummary {
+        NodeSummary {
+            identity: 0,
+            version: 0,
+            kind,
+            rights: libfal::authority::FalRights::NONE,
+            attributes: NodeAttributes::NONE,
+            size: 0,
+            value: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// mock 提供者图（grant "/" → A=1）：
+    /// A: a/{b/{deep, sub→委托 B}, link→"b/deep", abst→"/a/b", loop→"loop"}
+    /// B（3）: sub 根下有 x。
+    struct MockTransport {
+        last_policy: Option<ResolvePolicy>,
+    }
+
+    impl MockTransport {
+        fn new() -> Self {
+            Self { last_policy: None }
+        }
+    }
+
+    impl WalkTransport for MockTransport {
+        type Endpoint = Handle;
+
+        fn lookup(
+            &mut self,
+            dir: &DirectoryGrant<Handle>,
+            policy: ResolvePolicy,
+            path: &str,
+        ) -> Result<LookupOutcome<DirectoryGrant<Handle>>, Status> {
+            self.last_policy = Some(policy);
+            let found = |kind| Ok(LookupOutcome::Found(info(kind)));
+            match (dir.endpoint().raw(), path) {
+                (1, "") => found(NodeKind::Directory),
+                (1, "a") => found(NodeKind::Directory),
+                (1, "a/b") | (1, "a/b/deep") if path == "a/b/deep" => found(NodeKind::Property),
+                (1, "a/b") => found(NodeKind::Directory),
+                // 委托边界：consumed 含边界分量 sub，dir2 为其 Handle。
+                (1, "a/b/sub") => Ok(LookupOutcome::Delegate {
+                    dir: grant(3),
+                    consumed: String::from("a/b/sub"),
+                    remaining: String::new(),
+                }),
+                (1, "a/b/sub/x") | (1, "a/b/sub/extra") => Ok(LookupOutcome::Delegate {
+                    dir: grant(3),
+                    consumed: String::from("a/b/sub"),
+                    remaining: String::from(if path == "a/b/sub/x" { "x" } else { "extra" }),
+                }),
+                (1, "a/link") => match policy {
+                    ResolvePolicy::NoFollowFinal => found(NodeKind::SymbolicLink),
+                    _ => Ok(LookupOutcome::Link {
+                        consumed: String::from("a"),
+                        target: String::from("b/deep"),
+                        remaining: String::new(),
+                    }),
+                },
+                (1, "a/abst") => match policy {
+                    ResolvePolicy::NoFollowFinal => found(NodeKind::SymbolicLink),
+                    _ => Ok(LookupOutcome::Link {
+                        consumed: String::from("a"),
+                        target: String::from("/a/b"),
+                        remaining: String::new(),
+                    }),
+                },
+                (1, "a/loop") => Ok(LookupOutcome::Link {
+                    consumed: String::from("a"),
+                    target: String::from("loop"),
+                    remaining: String::new(),
+                }),
+                // 中途链接：a/mid 是链接，consumed=a、剩余 tail。
+                (1, "a/mid/tail") => Ok(LookupOutcome::Link {
+                    consumed: String::from("a"),
+                    target: String::from("b"),
+                    remaining: String::from("tail"),
+                }),
+                (1, "a/mid") => Ok(LookupOutcome::Link {
+                    consumed: String::from("a"),
+                    target: String::from("b"),
+                    remaining: String::new(),
+                }),
+                // 恶意边界：consumed 与请求不符。
+                (1, "a/forged") => Ok(LookupOutcome::Link {
+                    consumed: String::from("zz"),
+                    target: String::from("b"),
+                    remaining: String::new(),
+                }),
+                // 恶意边界：remaining 与实际分量错位。
+                (1, "a/forged2") => Ok(LookupOutcome::Link {
+                    consumed: String::from("a"),
+                    target: String::from("b"),
+                    remaining: String::from("zz"),
+                }),
+                // 绝对 target 为根：仅剩 after。
+                (1, "a/toroot") => Ok(LookupOutcome::Link {
+                    consumed: String::from("a"),
+                    target: String::from("/"),
+                    remaining: String::new(),
+                }),
+                (3, "") => found(NodeKind::Directory),
+                (3, "x") | (3, "extra") => found(NodeKind::Stream),
+                _ => Err(Status::NotFound),
+            }
+        }
+    }
+
+    fn table() -> PrefixTable {
+        let mut table = PrefixTable::new();
+        assert!(table.mount("/", grant(1)).unwrap().is_none());
+        table
+    }
+
+    #[test]
+    fn plain_lookup_and_root() {
+        let mut mock = MockTransport::new();
+        let position = resolve(&mut mock, &table(), "/", FollowAll).unwrap();
+        assert_eq!(position.info.kind, NodeKind::Directory);
+        assert_eq!(position.rel, "");
+
+        let position = resolve(&mut mock, &table(), "/a/b/deep", FollowAll).unwrap();
+        assert_eq!(position.info.kind, NodeKind::Property);
+        assert_eq!(position.anchor, grant(1));
+        assert_eq!(position.rel, "a/b/deep");
+    }
+
+    #[test]
+    fn policy_is_passed_through() {
+        let mut mock = MockTransport::new();
+        resolve(&mut mock, &table(), "/a/b", NoFollowFinal).unwrap();
+        assert_eq!(mock.last_policy, Some(NoFollowFinal));
+    }
+
+    #[test]
+    fn relative_and_absolute_symlink_expansion() {
+        let mut mock = MockTransport::new();
+        let position = resolve(&mut mock, &table(), "/a/link", FollowAll).unwrap();
+        assert_eq!(position.info.kind, NodeKind::Property);
+        assert_eq!(position.rel, "a/b/deep");
+
+        let position = resolve(&mut mock, &table(), "/a/abst", FollowAll).unwrap();
+        assert_eq!(position.rel, "a/b");
+    }
+
+    #[test]
+    fn no_follow_final_returns_link_node() {
+        let mut mock = MockTransport::new();
+        let position = resolve(&mut mock, &table(), "/a/link", NoFollowFinal).unwrap();
+        assert_eq!(position.info.kind, NodeKind::SymbolicLink);
+        assert_eq!(position.rel, "a/link");
+    }
+
+    #[test]
+    fn symlink_loop_hits_limit() {
+        let mut mock = MockTransport::new();
+        assert_eq!(
+            resolve(&mut mock, &table(), "/a/loop", FollowAll).unwrap_err(),
+            ResolveError::TooManyLinks
+        );
+    }
+
+    #[test]
+    fn delegation_crosses_provider() {
+        let mut mock = MockTransport::new();
+        let position = resolve(&mut mock, &table(), "/a/b/sub/x", FollowAll).unwrap();
+        assert_eq!(position.info.kind, NodeKind::Stream);
+        assert_eq!(position.anchor, grant(3));
+        assert_eq!(position.rel, "x");
+
+        // 委托边界 + 剩余后缀。
+        let position = resolve(&mut mock, &table(), "/a/b/sub/extra", FollowAll).unwrap();
+        assert_eq!(position.anchor, grant(3));
+        assert_eq!(position.rel, "extra");
+    }
+
+    #[test]
+    fn dotdot_crosses_delegation_boundary() {
+        let mut mock = MockTransport::new();
+        // 词法归一发生在走路前：sub/.. 抵消，A 内直达 deep。
+        let position = resolve(&mut mock, &table(), "/a/b/sub/../deep", FollowAll).unwrap();
+        assert_eq!(position.info.kind, NodeKind::Property);
+        assert_eq!(position.rel, "a/b/deep");
+        assert_eq!(position.anchor, grant(1));
+    }
+
+    #[test]
+    fn dotdot_clamps_at_namespace_root() {
+        let mut mock = MockTransport::new();
+        let position = resolve(&mut mock, &table(), "/../../a/b/deep", FollowAll).unwrap();
+        assert_eq!(position.rel, "a/b/deep");
+    }
+
+    #[test]
+    fn resolve_parent_splits_final_component() {
+        let mut mock = MockTransport::new();
+        let parent = resolve_parent(&mut mock, &table(), "/a/b/new").unwrap();
+        assert_eq!(parent.dir.rel, "a/b");
+        assert_eq!(parent.dir.info.kind, NodeKind::Directory);
+        assert_eq!(parent.child, "new");
+
+        // 根下创建：父位置即根锚。
+        let parent = resolve_parent(&mut mock, &table(), "/new").unwrap();
+        assert_eq!(parent.dir.rel, "");
+        assert_eq!(parent.child, "new");
+    }
+
+    #[test]
+    fn mid_path_link_with_remaining_expands() {
+        // a/mid/tail：consumed=a、链接分量 mid、remaining=tail。
+        // 展开 b 后应查 "b/tail"（mock 无此臂 → NotFound 表明路径正确拼接）。
+        let mut mock = MockTransport::new();
+        let error = resolve(&mut mock, &table(), "/a/mid/tail", FollowAll).unwrap_err();
+        assert!(matches!(error, ResolveError::Status(Status::NotFound)));
+    }
+
+    #[test]
+    fn forged_boundaries_are_rejected() {
+        let mut mock = MockTransport::new();
+        assert!(matches!(
+            resolve(&mut mock, &table(), "/a/forged", FollowAll),
+            Err(ResolveError::IllegalPath)
+        ));
+        assert!(matches!(
+            resolve(&mut mock, &table(), "/a/forged2", FollowAll),
+            Err(ResolveError::IllegalPath)
+        ));
+    }
+
+    #[test]
+    fn absolute_root_target_resolves_root() {
+        // 绝对 target "/"：重启后即根。
+        let mut mock = MockTransport::new();
+        let position = resolve(&mut mock, &table(), "/a/toroot", FollowAll).unwrap();
+        assert_eq!(position.rel, "");
+        assert_eq!(position.info.kind, NodeKind::Directory);
+    }
+
+    #[test]
+    fn rejects_relative_and_empty_segments() {
+        let mut mock = MockTransport::new();
+        assert_eq!(
+            resolve(&mut mock, &table(), "a/b", FollowAll).unwrap_err(),
+            ResolveError::IllegalPath
+        );
+        assert_eq!(
+            resolve(&mut mock, &table(), "/a//b", FollowAll).unwrap_err(),
+            ResolveError::IllegalPath
+        );
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "libprocess"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libexecution = { path = "../libexecution" }
+monotonic_id = { path = "../../../shared/monotonic_id" }
+num-traits = { version = "0.2", default-features = false }
+rinlib = { path = "../../rinlib" }
+elf = { path = "../../../shared/elf" }
+
+[dev-dependencies]
+libbudget = { path = "../libbudget" }

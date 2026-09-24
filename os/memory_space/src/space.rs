@@ -1795,7 +1795,13 @@ fn template_from_region(
         owner: region.owner,
         kind,
         write_successor: region.permit.is_some()
-            && matches!(kind, TemplateKind::Mapping { current: Protection::ReadWrite, .. }),
+            && matches!(
+                kind,
+                TemplateKind::Mapping {
+                    current: Protection::ReadWrite,
+                    ..
+                }
+            ),
     })
 }
 

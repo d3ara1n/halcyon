@@ -9,7 +9,13 @@ edition = "2024"
 
 [dependencies]
 rinlib = { path = "../../rinlib" }
-erhino_shared = { path = "../../../shared" }
-libfal = { path = "../../frameworks/libfal" }
-libfs = { path = "../../frameworks/libfs" }
-librpc = { path = "../../frameworks/librpc" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libfal = { path = "../../libraries/libfal" }
+libfs = { path = "../../libraries/libfs" }
+librpc = { path = "../../libraries/librpc" }
+libbudget = { path = "../../libraries/libbudget" }
+libexecution = { path = "../../libraries/libexecution" }
+libservice = { path = "../../libraries/libservice" }
+librunnel = { path = "../../libraries/librunnel" }
+ordered_table = { path = "../../../shared/ordered_table" }
+metadata_admission = { path = "../../../shared/metadata_admission" }

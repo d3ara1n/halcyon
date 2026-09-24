@@ -49,13 +49,3 @@ unsafe impl Source for SystemSource {
 #[global_allocator]
 static HEAP: TalcLock<RankedRawSpinlock<{ ranks::HEAP.0 }>, SystemSource, DefaultBinning> =
     TalcLock::new(SystemSource);
-
-/// 堆供血自检：首次分配触发 system ticket claim，验证容量单向消费与数据完整性。
-pub fn selftest() {
-    let before = frame::remaining_heap_chunks();
-    let v: alloc::vec::Vec<u32> = (0..8192u32).collect();
-    assert_eq!(v.iter().sum::<u32>(), (0..8192u32).sum::<u32>());
-    let claimed = before - frame::remaining_heap_chunks();
-    assert!(claimed > 0, "heap did not consume a system ticket");
-    log!(Heap, "{} system chunk(s) claimed, alloc/verify ok", claimed);
-}

@@ -8,7 +8,7 @@ use erhino_shared::object::{ObjectSignals, Rights};
 use super::{
     notify_work,
     proc::Process,
-    wait::{Subscription, WaitContext, WaitOutcome},
+    wait::{Subscription, WaitOutcome},
 };
 
 /// 仅用于诊断和内核内部关联的对象身份；不是用户凭据。
@@ -26,49 +26,7 @@ pub fn try_mint_koid() -> Option<Koid> {
 /// 单对象订阅额度；使协作式信号发布路径有明确工作上界。
 pub const OBJECT_WAIT_LIMIT: usize = 1024;
 
-/// 用户 Handle 所指对象的内核类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectKind {
-    Job,
-    MemoryPool,
-    MemoryObject,
-    ProcessBuilder,
-    ProcessControl,
-    ThreadControl,
-    Mailbox,
-    Notification,
-    TunnelEndpoint,
-    TunnelInvitation,
-    SystemReset,
-}
-
-/// Handle 在对象生命周期中的角色。rights 决定操作，role 决定关系。
-///
-/// 收束公理（close fanout 上界的结构来源）：owner 不可 TRANSIT，
-/// 因此消息内不含容器角色，唯一可 TRANSIT 的角色 close 恒为 O(1)
-/// 叶子操作（不同步排空另一对象容器）。新增 role 时必须维持该
-/// 推导：可 TRANSIT ⟹ close 是叶子；需要级联收束的容器角色只能作
-/// owner 直接 GRANT，或改走 REAPABLE + 有界 drain（见 ideas/object.md
-/// 「收束分层」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandleRole {
-    JobControl,
-    MemoryPool,
-    /// MemoryObject 没有 owner role：全部 Handle 是同一 capability，只以 rights 分权。
-    MemoryObject,
-    ProcessBuilder,
-    ProcessControl,
-    ThreadControl,
-    MailboxOwner,
-    MailboxSender,
-    /// 一次性投递权：成功 Send 后由内核摘除，失败不消费。
-    MailboxSenderOnce,
-    NotificationOwner,
-    NotificationSignaler,
-    TunnelEndpoint,
-    TunnelInvitation,
-    SystemResetControl,
-}
+pub use erhino_shared::object::{HandleRole, ObjectKind};
 
 /// 只含稳定身份的共同头；对象状态和订阅必须与类型数据共用一把对象锁。
 pub struct ObjectHeader {
@@ -90,16 +48,7 @@ impl ObjectHeader {
     }
 }
 
-const SIGNAL_BITS: [ObjectSignals; 8] = [
-    ObjectSignals::READABLE,
-    ObjectSignals::WRITABLE,
-    ObjectSignals::DATA,
-    ObjectSignals::REAPABLE,
-    ObjectSignals::DONE,
-    ObjectSignals::EXECUTABLE,
-    ObjectSignals::PEER_CLOSED,
-    ObjectSignals::CLOSED,
-];
+const SIGNAL_BITS: &[ObjectSignals] = ObjectSignals::BITS;
 
 #[derive(Clone, Copy)]
 struct SignalEpoch {
@@ -123,9 +72,27 @@ struct RegisteredSubscription {
 }
 
 pub(crate) enum WaitAdvance {
-    Progress,
-    Complete(Arc<WaitContext>),
+    Progress(Option<Subscription>),
+    Complete {
+        sink: super::wait::ObserverSink,
+        retired: Option<Subscription>,
+    },
     Done,
+}
+
+impl WaitAdvance {
+    /// 来源锁已释放后交接订阅引用与完成责任；返回 true 表示扫描结束。
+    pub(crate) fn finish(self) -> bool {
+        match self {
+            Self::Progress(retired) => drop(retired),
+            Self::Complete { sink, retired } => {
+                drop(retired);
+                super::wait::finish_offered(sink);
+            }
+            Self::Done => return true,
+        }
+        false
+    }
 }
 
 /// 嵌入具体对象状态锁中的电平、发布代次与订阅槽。发布者只更新固定八个
@@ -143,6 +110,64 @@ pub struct ObjectWaitState {
     dirty: bool,
     scheduled: bool,
     notification: Option<notify_work::Reservation>,
+}
+
+fn select_snapshot(
+    epochs: &[SignalEpoch; SIGNAL_BITS.len()],
+    seen: &[u64; SIGNAL_BITS.len()],
+    interest: ObjectSignals,
+    current: ObjectSignals,
+) -> Option<ObjectSignals> {
+    let mut selected: Option<(u64, ObjectSignals)> = None;
+    for (index, bit) in SIGNAL_BITS.iter().copied().enumerate() {
+        let epoch = epochs[index];
+        if epoch.generation == seen[index]
+            || (!interest.intersects(bit) && bit != ObjectSignals::CLOSED)
+        {
+            continue;
+        }
+        if selected.is_none_or(|(serial, _)| epoch.serial < serial) {
+            selected = Some((epoch.serial, epoch.snapshot));
+        }
+    }
+    selected
+        .map(|(_, snapshot)| snapshot)
+        .or_else(|| current.intersects(ObjectSignals::CLOSED).then_some(current))
+}
+
+pub(crate) fn check_history_for_test() {
+    let mut state = ObjectWaitState::new(ObjectSignals::NONE);
+    let mut seen = [0; SIGNAL_BITS.len()];
+    let interest = ObjectSignals::DATA | ObjectSignals::PEER_ATTACHED;
+    state.update(ObjectSignals::NONE, ObjectSignals::PEER_ATTACHED);
+    state.update(ObjectSignals::PEER_ATTACHED, ObjectSignals::DATA);
+    assert_eq!(
+        select_snapshot(&state.epochs, &seen, interest, state.signals),
+        Some(ObjectSignals::PEER_ATTACHED),
+        "signal bit order replaced the earlier historical serial"
+    );
+    let attached = SIGNAL_BITS
+        .iter()
+        .position(|bit| *bit == ObjectSignals::PEER_ATTACHED)
+        .unwrap();
+    seen[attached] = state.epochs[attached].generation;
+    assert_eq!(
+        select_snapshot(&state.epochs, &seen, interest, state.signals),
+        Some(ObjectSignals::DATA),
+        "seen history suppressed another interested signal"
+    );
+    state.update(ObjectSignals::DATA, ObjectSignals::CLOSED);
+    assert_eq!(
+        select_snapshot(&state.epochs, &seen, interest, state.signals),
+        Some(ObjectSignals::DATA),
+        "terminal publication replaced unseen data history"
+    );
+    seen = core::array::from_fn(|index| state.epochs[index].generation);
+    assert_eq!(
+        select_snapshot(&state.epochs, &seen, interest, state.signals),
+        Some(ObjectSignals::CLOSED),
+        "seen terminal serial lost its CLOSED fallback"
+    );
 }
 
 impl ObjectWaitState {
@@ -221,16 +246,24 @@ impl ObjectWaitState {
     }
 
     pub fn subscribe(&mut self, subscription: Subscription) -> SubscribeResult {
-        if let Some(outcome) = subscription.outcome(self.signals) {
-            return SubscribeResult::Ready(outcome);
+        let immediate = subscription.outcome(self.signals);
+        let persistent = subscription.sink.persistent();
+        if (!persistent || self.signals.intersects(ObjectSignals::CLOSED))
+            && let Some(outcome) = immediate
+        {
+            return SubscribeResult::Ready {
+                outcome,
+                retired: subscription,
+            };
         }
+        let sink = subscription.sink.clone();
         if self.active_waiters >= OBJECT_WAIT_LIMIT || self.next_id == 0 {
-            return SubscribeResult::ReachLimit;
+            return SubscribeResult::ReachLimit(subscription);
         }
         if self.active_waiters == 0 && !self.scheduled && self.notification.is_none() {
             self.notification = match notify_work::reserve() {
                 Ok(reservation) => Some(reservation),
-                Err(()) => return SubscribeResult::OutOfMemory,
+                Err(()) => return SubscribeResult::OutOfMemory(subscription),
             };
         }
         let slot = match self.waiters.iter().position(Option::is_none) {
@@ -240,7 +273,7 @@ impl ObjectWaitState {
                     if self.active_waiters == 0 {
                         self.notification.take();
                     }
-                    return SubscribeResult::OutOfMemory;
+                    return SubscribeResult::OutOfMemory(subscription);
                 }
                 self.waiters.push(None);
                 self.waiters.len() - 1
@@ -257,21 +290,74 @@ impl ObjectWaitState {
         if self.scheduled {
             self.dirty = true;
         }
+        if persistent && let Some(outcome) = immediate {
+            assert!(
+                sink.offer(outcome) != wait_context::OfferResult::Complete,
+                "persistent observer armed before source installation"
+            );
+        }
         SubscribeResult::Registered(id)
     }
 
-    pub fn unsubscribe(&mut self, id: u64) {
+    pub fn rearm_observer(
+        &mut self,
+        id: u64,
+    ) -> Result<ObserverRearm, erhino_shared::call::SystemCallError> {
+        let current = self.signals;
+        let seen = core::array::from_fn(|index| self.epochs[index].generation);
+        let registered = self
+            .waiters
+            .iter_mut()
+            .flatten()
+            .find(|waiter| waiter.id == id)
+            .ok_or(erhino_shared::call::SystemCallError::ObjectNotFound)?;
+        let generation = registered.subscription.sink.restart()?;
+        registered.seen = seen;
+        if let Some(outcome) = registered.subscription.outcome(current) {
+            registered.subscription.sink.offer(outcome);
+        }
+        let completion = registered.subscription.sink.arm();
+        Ok(ObserverRearm {
+            generation,
+            completion,
+        })
+    }
+
+    pub fn cancel_observer(&mut self, id: u64) -> Option<CancelledObservation> {
+        let slot = self
+            .waiters
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|waiter| waiter.id == id))?;
+        let waiter = slot
+            .take()
+            .expect("observer slot disappeared under source lock");
+        self.active_waiters -= 1;
+        if self.active_waiters == 0 && !self.scheduled {
+            self.notification.take();
+        }
+        let sink = waiter.subscription.sink.clone();
+        let result = sink.offer(WaitOutcome::Cancelled);
+        Some(CancelledObservation {
+            sink,
+            result,
+            retired: waiter.subscription,
+        })
+    }
+
+    pub(crate) fn unsubscribe(&mut self, id: u64) -> Option<Subscription> {
         if let Some(slot) = self
             .waiters
             .iter_mut()
             .find(|slot| slot.as_ref().is_some_and(|waiter| waiter.id == id))
         {
-            slot.take();
+            let retired = slot.take().expect("subscription slot disappeared");
             self.active_waiters -= 1;
             if self.active_waiters == 0 && !self.scheduled {
                 self.notification.take();
             }
+            return Some(retired.subscription);
         }
+        None
     }
 
     pub(crate) fn take_notification(&mut self) -> Option<(notify_work::Reservation, ObjectRef)> {
@@ -321,45 +407,68 @@ impl ObjectWaitState {
         self.scan_cursor = (index + 1) % self.waiters.len();
         self.scan_remaining -= 1;
         let Some(waiter) = self.waiters[index].as_mut() else {
-            return WaitAdvance::Progress;
+            return WaitAdvance::Progress(None);
         };
 
-        let interest = waiter.subscription.interest();
-        let mut selected: Option<(u64, ObjectSignals)> = None;
-        for (signal_index, bit) in SIGNAL_BITS.iter().copied().enumerate() {
-            let epoch = self.epochs[signal_index];
-            if epoch.generation == waiter.seen[signal_index]
-                || (!interest.intersects(bit) && bit != ObjectSignals::CLOSED)
-            {
-                continue;
-            }
-            if selected.is_none_or(|(serial, _)| epoch.serial < serial) {
-                selected = Some((epoch.serial, epoch.snapshot));
-            }
-        }
+        let selected = select_snapshot(
+            &self.epochs,
+            &waiter.seen,
+            waiter.subscription.interest(),
+            self.signals,
+        );
         waiter.seen = core::array::from_fn(|signal_index| self.epochs[signal_index].generation);
-        let Some((_, snapshot)) = selected else {
-            return WaitAdvance::Progress;
+        let Some(snapshot) = selected else {
+            return WaitAdvance::Progress(None);
         };
         let outcome = waiter
             .subscription
             .outcome(snapshot)
             .expect("selected signal epoch must match its subscription");
-        match waiter.subscription.context.offer(outcome) {
-            wait_context::OfferResult::Deferred => WaitAdvance::Progress,
+        match waiter.subscription.sink.offer(outcome) {
+            wait_context::OfferResult::Deferred => {
+                let retired = if self.signals.intersects(ObjectSignals::CLOSED) {
+                    self.active_waiters -= 1;
+                    Some(
+                        self.waiters[index]
+                            .take()
+                            .expect("closed subscription disappeared")
+                            .subscription,
+                    )
+                } else {
+                    None
+                };
+                WaitAdvance::Progress(retired)
+            }
             wait_context::OfferResult::Lost => {
-                self.waiters[index].take();
-                self.active_waiters -= 1;
-                WaitAdvance::Progress
+                let retired = if !waiter.subscription.sink.persistent()
+                    || self.signals.intersects(ObjectSignals::CLOSED)
+                {
+                    let retired = self.waiters[index]
+                        .take()
+                        .expect("lost subscription disappeared");
+                    self.active_waiters -= 1;
+                    Some(retired.subscription)
+                } else {
+                    None
+                };
+                WaitAdvance::Progress(retired)
             }
             wait_context::OfferResult::Complete => {
-                let context = self.waiters[index]
-                    .take()
-                    .expect("completed waiter disappeared")
-                    .subscription
-                    .context;
-                self.active_waiters -= 1;
-                WaitAdvance::Complete(context)
+                let (sink, retired) = if waiter.subscription.sink.persistent()
+                    && !self.signals.intersects(ObjectSignals::CLOSED)
+                {
+                    (waiter.subscription.sink.clone(), None)
+                } else {
+                    let retired = self.waiters[index]
+                        .take()
+                        .expect("completed waiter disappeared");
+                    self.active_waiters -= 1;
+                    (
+                        retired.subscription.sink.clone(),
+                        Some(retired.subscription),
+                    )
+                };
+                WaitAdvance::Complete { sink, retired }
             }
         }
     }
@@ -387,20 +496,94 @@ impl ObjectWaitState {
             notify_work::Completion::Held
         }
     }
+
+    /// 终态来源不再保留观察授权；逐槽摘除，与通知扫描共享来源锁。
+    pub(crate) fn retire_closed_step(&mut self) -> WaitAdvance {
+        assert!(
+            self.signals().intersects(ObjectSignals::CLOSED),
+            "open source retired its subscriptions"
+        );
+        let Some(slot) = self.waiters.pop() else {
+            return WaitAdvance::Done;
+        };
+        let Some(waiter) = slot else {
+            return WaitAdvance::Progress(None);
+        };
+        self.active_waiters -= 1;
+        if self.active_waiters == 0 && !self.scheduled {
+            self.notification.take();
+        }
+        let snapshot = select_snapshot(
+            &self.epochs,
+            &waiter.seen,
+            waiter.subscription.interest(),
+            self.signals,
+        )
+        .expect("closed source failed to select a terminal snapshot");
+        let outcome = waiter
+            .subscription
+            .outcome(snapshot)
+            .expect("closed source failed to produce a terminal observation");
+        let sink = waiter.subscription.sink.clone();
+        if sink.offer(outcome) == wait_context::OfferResult::Complete {
+            WaitAdvance::Complete {
+                sink,
+                retired: Some(waiter.subscription),
+            }
+        } else {
+            WaitAdvance::Progress(Some(waiter.subscription))
+        }
+    }
+
+    pub(crate) fn subscriptions_retired(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    pub(crate) fn active_waiters_for_test(&self) -> usize {
+        self.active_waiters
+    }
+}
+
+pub struct ObserverRearm {
+    pub(crate) generation: u64,
+    pub(crate) completion: Option<super::wait::ObserverSink>,
+}
+
+pub struct CancelledObservation {
+    pub(crate) sink: super::wait::ObserverSink,
+    pub(crate) result: wait_context::OfferResult,
+    pub(crate) retired: Subscription,
 }
 
 pub enum SubscribeResult {
-    Ready(WaitOutcome),
+    Ready {
+        outcome: WaitOutcome,
+        retired: Subscription,
+    },
     Registered(u64),
-    ReachLimit,
-    OutOfMemory,
+    ReachLimit(Subscription),
+    OutOfMemory(Subscription),
 }
 
 /// 所有可经 Handle 引用的内核对象。
 pub trait KernelObject: Any + Send + Sync {
-    #[expect(dead_code, reason = "对象诊断接口使用")]
+    fn retirement(&self) -> Option<&dyn super::retirement::RetirementTarget> {
+        None
+    }
     fn header(&self) -> &ObjectHeader;
     fn kind(&self) -> ObjectKind;
+
+    fn related_id(&self) -> u64 {
+        0
+    }
+    fn badge(&self) -> u64 {
+        0
+    }
+
+    /// 本次授权的实际电平来源；使用引用由等待上下文另外保留。
+    fn observation_source(&self) -> Option<ObjectRef> {
+        None
+    }
 
     /// 此对象是否接受 role；接受时返回该 role 的最大 rights。
     fn allowed_rights(&self, role: HandleRole) -> Option<Rights>;
@@ -420,17 +603,27 @@ pub trait KernelObject: Any + Send + Sync {
 
     fn unsubscribe(&self, _id: u64) {}
 
+    fn rearm_observer(
+        &self,
+        _id: u64,
+    ) -> Result<ObserverRearm, erhino_shared::call::SystemCallError> {
+        Err(erhino_shared::call::SystemCallError::NotSupported)
+    }
+
+    fn cancel_observer(&self, _id: u64) -> Option<CancelledObservation> {
+        None
+    }
+
     /// Handle 从表中移除且表锁已释放后的 lifecycle 回调。
     fn close_handle(&self, role: HandleRole, owner: &Process, exiting: bool);
 
     /// 消息中的 transit Handle 被丢弃；只有持 TRANSIT 的 entry 可进入。
     fn close_transit(&self, role: HandleRole);
 
-    /// 从已发布的对象候选中推进至多 `budget` 个 waiter；返回
-    /// `(实际步骤, 是否已完成本次通知债务)`。
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        let _ = budget;
-        (0, true)
+    /// 在来源对象锁内推进一次已发布的 waiter 候选。通知执行器拥有预算
+    /// 循环；对象只负责自己的电平、历史与订阅真值。
+    fn advance_waiter(&self) -> WaitAdvance {
+        WaitAdvance::Done
     }
 
     fn complete_waiter_drain(

@@ -28,7 +28,10 @@ macro_rules! debug {
 
 pub fn debug(args: Arguments) {
     let mut buf = [0u8; DEBUG_BUF];
-    let mut w = SliceWriter { buf: &mut buf, len: 0 };
+    let mut w = SliceWriter {
+        buf: &mut buf,
+        len: 0,
+    };
     // Arguments 实现 Display；写入失败只发生在截断，静默收尾。
     let _ = write!(w, "{}", args);
     unsafe {

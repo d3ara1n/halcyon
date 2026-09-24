@@ -69,12 +69,12 @@ impl MemoryPool {
 
     /// 关闭唯一持有的 MemoryPool leaf Handle；合法 typed owner 不存在可恢复失败。
     pub fn close(self) {
-        crate::ipc::object::close_leaf_owner(self.into_handle());
+        crate::ipc::object::close_object_owner(self.into_handle());
     }
 }
 
 impl Drop for MemoryPool {
     fn drop(&mut self) {
-        crate::ipc::object::close_leaf_owner(self.handle);
+        crate::ipc::object::close_object_owner(self.handle);
     }
 }

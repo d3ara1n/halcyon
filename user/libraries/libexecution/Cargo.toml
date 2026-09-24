@@ -1,0 +1,16 @@
+[package]
+name = "libexecution"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Bounded user-space task execution and observation"
+edition = "2024"
+
+[dependencies]
+libbudget = { path = "../libbudget" }
+monotonic_id = { path = "../../../shared/monotonic_id" }
+ordered_table = { path = "../../../shared/ordered_table" }
+timer_queue = { path = "../../../shared/timer_queue" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }

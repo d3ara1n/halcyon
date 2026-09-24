@@ -26,7 +26,9 @@ Connection 独占共享 backing 与两端参与方关系。每个端点按[内�
 
 ## 门铃与对象状态
 
-每个 Endpoint 是可等待对象。对端调用 `TunnelNotify` 时，内核置本端 `DATA`；它只是提示重新检查控制块，不计数、不证明数据存在。端点拥有者只在页内协议达到无进展条件后调用 `TunnelAcknowledgeData` 确认本端 `DATA`，再重查控制块并以 WaitMany 等待 `DATA`、`PEER_CLOSED` 或 `CLOSED`。不存在通用信号清除，终态位不能确认。
+每个 Endpoint 是可等待对象。PEER_ATTACHED 表示对端已完成 Attach 且尚未关闭，由 Connection 的真实状态导出；它不证明对端已经完成页内协议验证或业务 Start。Invited、Attached 和 Closed 可以明确区分，业务不能靠客户端自报 Attach 成功取消 offer 期限。
+
+对端调用 TunnelNotify 时，内核置本端 DATA；它只提示重查控制块，不计数、不证明数据存在。端点拥有者在无进展时 acknowledge DATA、重查，再通过 WaitMany 或 WaitSet 观察 DATA、PEER_CLOSED、CLOSED。需要建立阶段观察时额外选择 PEER_ATTACHED；进入数据阶段后不持续订阅这一常真条件。不存在通用信号清除，终态位不能确认。
 
 隧道机制方向中立：共享 backing 与两个端点不区分读写。单工、双工、记录边界、门铃时机与缓冲所有权由页内协议定义；双工字节流仍使用两条反向单工隧道。
 

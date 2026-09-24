@@ -1,15 +1,16 @@
 # Halcyon
 
 Halcyon 是以 eRhino RV64 微内核为核心、包含用户态系统服务与跨组件契约的完整系统项目。
-内核二进制为 `erhino_kernel`，用户态标准库替代品为 `rinlib`。长工作一律在用户态系统服务
-（`srv_init` / `srv_fs` / `srv_pm`），内核只做短路径转发。
+用户态基础运行库为 `rinlib`。内核采用协作式执行，每次推进有结构性工作上界；业务政策与可由用户态承担的长工作在用户态服务中完成，已提交的特权维护由内核分批收束。
+内核构建身份为 `kernel`，目录保持为 `os/kernel/`；系统专名仍为 eRhino。
 
 ## 文档
 
 - [notes/](notes/README.md)：设计文档，按 ideas/（系统应该是什么）与 impls/（实际怎么做）
   两个视角分层，附全主题索引；
 - [plans/COMPASS.md](plans/COMPASS.md)：方向、位置与活跃计划导航；
-- [AGENTS.md](AGENTS.md)：协作约定、仓库结构与构建验证细则。
+- [AGENTS.md](AGENTS.md)：项目契约、协作边界、施工流程与按需阅读入口；
+- [构建与验证手册](plans/BUILD-AND-TEST.md)：工具链、检查命令、QEMU 路线与证据边界。
 
 ## 快速开始
 
@@ -36,13 +37,13 @@ just virt-release  # release core 验收
 just virt-hetero   # 多调度域（无 F/D 的 Base64 域 + D64 域）集成验证
 just virt-nofd     # 无兼容域验证（全 Base64 拓扑）
 just sifive_u      # qemu sifive_u：板级 core 验收（hart 0 禁用）
-just acceptance    # 阶段收尾聚合：stress + release + sifive_u
+just acceptance    # 闭包收尾：clippy + stress + release + sifive_u + nofd + boot-failure
 ```
 
 秒级检查与仅编译内核：
 
 ```sh
-just check         # 内核 + shared 的 cargo check
+just check         # os workspace 及其依赖的 cargo check
 just build_kernel  # 仅编译内核（alias: just b）
 ```
 
@@ -52,7 +53,7 @@ just build_kernel  # 仅编译内核（alias: just b）
 # 终端 1（THROTTLE=100 关闭节流，便于断点单步）
 THROTTLE=100 just PLATFORM=qemu MODEL=virt run_qemu -smp cores=4 -s -S
 # 终端 2
-riscv64-elf-gdb artifacts/qemu/virt/erhino_kernel -ex 'target remote :1234'
+riscv64-elf-gdb artifacts/qemu/virt/kernel -ex 'target remote :1234'
 ```
 
 导出 QEMU 生成的设备树：

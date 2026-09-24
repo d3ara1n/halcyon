@@ -1,0 +1,17 @@
+[package]
+name = "libfs"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Client-side namespace library: prefix table, walking and symlink expansion"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libfal = { path = "../libfal" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }
+librunnel = { path = "../librunnel" }
+librpc = { path = "../librpc" }
+libbudget = { path = "../libbudget" }
+libexecution = { path = "../libexecution" }

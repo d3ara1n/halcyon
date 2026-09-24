@@ -26,6 +26,7 @@ mod board;
 mod fp;
 // 执行环境准备态模块：原子切换接线后 dead_code 预期消除。
 mod boot;
+mod clock;
 mod context;
 mod csr;
 mod deferred_work;
@@ -37,6 +38,7 @@ mod mm;
 mod registry;
 mod remote_call;
 mod rt;
+mod runtime_stop;
 mod sbi;
 mod sched;
 mod sync;
@@ -44,6 +46,7 @@ mod syscall;
 mod task;
 mod trap;
 mod uaccess;
+mod work_ledger;
 
 // 汇编布局契约：offset_of! 是唯一真值，经 const operands 注入
 // assembly.asm（见 abi::asm 常量表）。
@@ -136,11 +139,10 @@ pub fn main() {
         log!(Boot, "package @{:#x} ({:#x})", addr, actual);
     }
     frame::init(&board);
-    heap::selftest();
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
     frame::release_device_tree(&board);
-    sched::init(board.timebase);
+    clock::init(board.timebase as u64);
     if let Some((addr, len)) = board.boot_package {
         rt::set_boot_package_region(addr, len);
     }

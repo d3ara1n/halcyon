@@ -898,12 +898,3 @@ pub fn take_heap_chunk() -> Option<HeapChunkTicket> {
         .expect("system supply not initialized")
         .take_heap_chunk()
 }
-
-/// 尚未交给内核 heap 的 system chunk 数。
-pub fn remaining_heap_chunks() -> usize {
-    SYSTEM_SUPPLY
-        .lock()
-        .as_ref()
-        .expect("system supply not initialized")
-        .remaining_heap_chunks()
-}

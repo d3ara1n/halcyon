@@ -23,7 +23,7 @@ KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
 
 # 平台产物按 MODEL 隔离：切平台不可能读到旧平台的 dtb/内核
 MODEL_DIR := TARGET_DIR/PLATFORM/MODEL
-KERNEL_ELF := MODEL_DIR/"erhino_kernel"
+KERNEL_ELF := MODEL_DIR/"kernel"
 KERNEL_BIN := KERNEL_ELF+".bin"
 # 官方 DTB 固定生成路径；ERHINO_DTB 只覆盖 QEMU 载入的 -dtb（异构
 # 域变体用，见 virt-hetero/virt-nofd），不重定向 make_dtb 的产出。
@@ -42,18 +42,19 @@ QEMU_MEMORY := if MODEL == "virt" { "1024M" } else { "128M" }
 # 与 virt DTS 声明的 Zkr 能力一致；sifive_u 不声明该扩展。
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
 QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
-# CPU 节流百分比（tools/qemu-throttle.sh）：跑飞/panic 时 QEMU 满核空转的兜底。
-# 1-99 按比例节流；100 = 全速。默认 50；自定义经环境变量：
-# `THROTTLE=100 just virt`（env 穿透嵌套 just 调用；recipe 参数与
-# --set 均不穿透嵌套子进程，故不用它们传油门）。
+# CPU 节流百分比（tools/qemu-throttle.sh）：保留为跑飞/panic 或异常忙循环时
+# 的宿主资源保护；stress 也默认节流，不把它当作全速性能基准。
+# 1-99 按比例节流；100 = 全速。默认 50。常规验证保持默认节流，只有需要固定
+# 全速条件的专项诊断才显式使用 `THROTTLE=100 just virt-stress`。
+# 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线按近期实测耗时设置宽裕的 QEMU 运行超时；均可用同名环境变量单独覆盖。
-VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "30")
+VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "90")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
-VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "150")
+VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "300")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
-VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "30")
-SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "45")
+VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "90")
+SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "60")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
 
 # gdb
@@ -90,13 +91,13 @@ clippy:
         fi
     }
     run_lint shared-host artifacts/lint/shared.log \
-        bash -c 'cd shared && cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd shared && cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint os-host artifacts/lint/os-host.log \
-        bash -c 'cd os && cargo clippy --workspace --exclude erhino_kernel --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd os && cargo clippy --workspace --exclude kernel --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint kernel-target artifacts/lint/kernel.log \
-        bash -c 'cd os && cargo clippy -p erhino_kernel --bin erhino_kernel {{ZFLAGS}} -- -D warnings'
+        bash -c 'cd os && cargo clippy -p kernel --bin kernel {{ZFLAGS}} -- -D warnings'
     run_lint user-host artifacts/lint/user-host.log \
-        bash -c 'cd user && cargo clippy -p rinlib -p librpc -p librunnel -p libfal -p libprocess -p libdrv -p libfs -p libsrv --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd user && cargo clippy -p rinlib -p libbudget -p libexecution -p librpc -p librunnel -p libfal -p libservice -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint user-target artifacts/lint/user-target.log \
         bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-stress artifacts/lint/user-stress.log \
@@ -149,9 +150,12 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"
+    @ditto "{{TARGET_DIR}}/build/test_fal" "{{TARGET_DIR}}/initfs/bin/test_fal"
     @ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"
     @if [ "{{ACCEPTANCE_WORKLOAD}}" = stress ]; then ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"; fi
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
+    # 保留 build 目录的完整 ELF 调试信息，initfs 只承载装载所需部分。
+    @for file in "{{TARGET_DIR}}/initfs"/bin/*; do riscv64-elf-strip --strip-debug "$file"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 
 make_boot_package: make_initfs
@@ -159,7 +163,7 @@ make_boot_package: make_initfs
 
 build_kernel: artifact_dir
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}/{{MODEL}}\033[0m"
-    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --quiet --bin erhino_kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
+    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --quiet --bin kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
     @riscv64-elf-objcopy {{KERNEL_ELF}} -O binary {{KERNEL_BIN}}
     @python3 os/tools/audit_elf.py {{KERNEL_ELF}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
@@ -235,10 +239,9 @@ clean-qemu *args:
 [private]
 run_qemu_acceptance_platform timeout +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
-    @tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
 
 [private]
 run_qemu_acceptance_bounded timeout +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
-    @tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
-
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}

@@ -4,7 +4,7 @@
 
 ## BootPackage v1
 
-`shared/src/boot.rs` 定义 64 字节 little-endian envelope：magic、version、header_len、flags、total_len、initial ELF offset/length、payload offset/length和 reserved。validator 使用 checked arithmetic，要求 canonical offset、页对齐 payload、零 padding和窗口内完整几何；payload 可为空。
+`shared/erhino_shared/src/boot.rs` 定义 64 字节 little-endian envelope：magic、version、header_len、flags、total_len、initial ELF offset/length、payload offset/length和 reserved。validator 使用 checked arithmetic，要求 canonical offset、页对齐 payload、零 padding和窗口内完整几何；payload 可为空。
 
 `tools/make-boot-package.py` 原子生成 `artifacts/boot-package.bin`。Just 构建把 `srv_init` 作为唯一 initial ELF，其余验证程序暂以确定序 ustar 组成 opaque payload。DTS `/chosen/boot-package` 只声明物理装载窗口；`board.rs` 验证窗口完整落在 DT memory 内。
 
@@ -12,7 +12,7 @@
 
 ## 出生块（Birth Block）线格式
 
-出生块是**组装者与接收进程的用户约定数据**，内核不构造、不映射、不校验。`shared/src/startup.rs` 只保留线格式定义与构造/校验函数（用户态库工具），布局：
+出生块是**组装者与接收进程的用户约定数据**，内核不构造、不映射、不校验。`shared/erhino_shared/src/startup.rs` 只保留线格式定义与构造/校验函数（用户态库工具），布局：
 
 ```text
 [StartupBlockHeader (48 B)]
@@ -29,7 +29,7 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload
 
 ## 组装 ABI（Building 期外部通道）
 
-`shared/src/proc.rs` 与 `shared/src/call.rs` 定义 fixed-width ABI，rinlib 封装位于 `user/rinlib/src/process.rs`：
+`shared/erhino_shared/src/proc.rs` 与 `shared/erhino_shared/src/call.rs` 定义 fixed-width ABI，rinlib 封装位于 `user/rinlib/src/process.rs`：
 
 - JobControl `CREATE`：JobCreate、ProcessCreate；
 - JobControl `MANAGE`：JobSeal、JobDerive；`READ`：JobQuery、JobEnumerate；
@@ -64,13 +64,13 @@ ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building aba
 6. 最终临界区按 `HANDLE_TABLE → JOB_INNER → LIFECYCLE` 同时发布 capability、Job membership、Running 状态和 execution binding，不存在仍返回 `Result` 的不可逆动作；随后发布 `UnpublishedBound` 并交出携带同源 credit 的 `AdmittedThread`；
 7. `boot.rs` 执行内存池 syscall 自检、回投 package prefix，最后消费该 owner，经无分配 Ready enqueue 首次发布线程。成功后 Kill 由 lifecycle/pick gate 接管，不能遗失尚未入队的 owner。
 
-结构与组合验证由 [`地址空间事务与启动纵向档案`](../../plans/archived/todo-2026-09-memory-transaction-state-machine.md) 记录。validated ELF admission 已由 `os/elf::validate` 接入此发布链；它在任何 Process/页表 owner 构造前冻结映像事实，不改变这里的构造 owner 与提交协议。
+结构与组合验证由 [`地址空间事务与启动纵向档案`](../../plans/archived/todo-2026-09-memory-transaction-state-machine.md) 记录。validated ELF admission 已由 `elf::validate` 接入此发布链；它在任何 Process/页表 owner 构造前冻结映像事实，不改变这里的构造 owner 与提交协议。
 
 initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；payload backing 与 root PoolBinding 在 init AddressSpace 有界收束时于锁外同步归还物理 extent 与 charge。内核没有 pid 特判的保留洞。
 
 ## 用户态公共 loader
 
-`os/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/frameworks/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
+`shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/libraries/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 自构造出生块 → Write 写入映像顶之上的页对齐区 → Attach → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
 
 ## init/pm 当前政策
 
@@ -86,9 +86,11 @@ root
 
 init 以 `libprocess::RequiredLaunchSet` 声明式 manifest 要求 `srv_fs`、`srv_pm`、`drv_spi_sifive`、acceptance target 和 pm-domain target 全部存在并成功启动；`test_fp` 按 execution domain 可选，stress 档另要求 hammer 映像。必选缺失/失败使整个 stage 失败并由 services JobControl 收束，不继续发布正常拓扑。
 
-所有常规服务是 services 的直接成员。init 保留每个 ProcessControl，经 `libprocess::collect_process` 按有限 wait/drain/query policy 收束；失败 target 放回监督集合并升级给 root services JobControl，只有 Dead 快照核验后才 close/remove。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。init 保留独立 pm_domain control 作为兜底。pm 局部失败先执行有限域级 JobKill，仍失败则记录 unmanaged handoff 并退出，由 init 直接接管。
+所有常规服务是 services 的直接成员。init 的 RootSupervisor 在子服务启动前持有长期责任槽并预备 services 的待命 Job 机器；每个 ProcessControl 在启动成功后立即进入预留账本。辅助 Job、启动 mailbox、委托副本和流控通知均先预备根能力槽再创建；脚本借用 handle，pm sender 保持 typed owner，只有内核 Grant/Send 确认消费才从账本移交。关闭失败保留原 owner，活动 Job 借用的 root 不提前关闭。Process、Job、读取与待关闭 Runtime 的失败保留原机器、世界和结果，由同一个根组合等待与推进，不能只把裸 target 放回集合重新构造。只有 Drain Complete 和 Dead 快照成立后才兑现 control。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。pm 使用正式 JobDriver 收束委托域，运行体以 max_work=1 推进；测试邮箱持续停驻到域完成后的 shutdown，回调确认 Active 登记实际消费 stop，最终检查注销与额度退款；不可恢复失败以非零状态退出，由 init 的独立管理能力接管。具体结构与失败政策见 [runtime.md](runtime.md)。
 
-acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域 job_kill。`srv_init` 默认编译为 core workload，只运行确定性内存、IPC、Tunnel、Job 与监督契约；`acceptance-stress` feature 在同一用户态编排器中追加 control/Tunnel 重复压力、`max_work=1` Drain 和完整 16/16 竞态矩阵。profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。init 在全部服务监督与资源收束锚点成立后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并常驻管理端点，保持 root supervisor 存活；当前不经独立电源服务转发。
+`srv_fs` 的启动接缝前三项分别为 init 预建的 bootstrap Mailbox sender、release Notification owner、与普通 FAL grant 分离的 route-management Mailbox owner；A 的第四项是注册 Mailbox owner，B 的第四项是从 A 授权 root 派生的 exact-name 注册 sender。init 以同一映像启动两个独立 provider，为每个实例分别创建接缝、监督槽与 ProcessControl；provider 主线程直接运行正式 Runtime。A 回复 FAL/服务目录/授权 root 后，init 先订阅目录并派生 B 名称授权；B 主动 Register、PublishReady，init 通过 A 目录的 ServiceRecord 派生 B grant，再经 A 的 route endpoint 交付 B 母 grant 与权限 ceiling。普通 Namespace 只挂 A，`libfal::client`/`libfs::client` 通过 A 返回的 Delegate 访问 B，随后逐个 signal release。release 由 provider Runtime 自己观察；全部任务、来源和账户收束后，provider 经 bootstrap 返回固定宽 `ProviderReport`。缺少 grant 或 role 错误时 fail-closed。两组创建、ProcessGrant 消费、绑定、接收、release、报告和关闭均进入 RootSupervisor 能力账本；固定业务剧本属于 init 的验收政策，provider 内不再有 self-client 或兼容泵。
+
+acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域 job_kill。`srv_init` 默认编译为 core workload，只运行确定性内存、IPC、Tunnel、Job 与监督契约；`acceptance-stress` feature 在同一用户态编排器中追加 control/Tunnel 重复压力、`max_work=1` Drain 和完整 16/16 竞态矩阵。profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。initfs 镜像打包时只剥离副本的调试段，构建目录保留原 ELF；新增独立 `test_fal` 后该收缩使 128 MiB sifive_u 上 A/B provider 与测试进程可同时装载，不减少用户程序的装载段或取消其他验收。init 在全部服务监督与资源收束锚点成立后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并保留 RootSupervisor 的责任与空闲等待集合；失败路径不重建一套临时监督器。当前不经独立电源服务转发。
 
 ## 验证
 

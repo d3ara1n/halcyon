@@ -1,38 +1,66 @@
-# 等待
+# 等待与持久观察
 
-等待是系统中唯一把线程转入 Waiting 的完成入口。消息接收、隧道门铃、进程终态和 Notification 都先表现为对象状态，再由 `WaitMany` 统一观察；Sleep 也复用同一等待所有权和定时来源。
+等待是系统中把线程转入 Waiting 的统一完成入口。消息、Tunnel、进程终态、Lifetime 与 Notification 先表现为对象状态，再由 WaitMany 或持久 WaitSet 观察；Sleep 复用同一等待所有权和定时来源。
 
 ## ObjectSignals
 
-可等待对象公开一组电平状态。每一位表示当前为真的条件，不是某个等待者私有的事件：Mailbox `READABLE` 表示至少有一条完整消息，Tunnel `DATA` 表示应重新检查共享控制块，ProcessControl `REAPABLE` 表示管理者可以开始有界收束，`CLOSED` 表示不可复活的终态，MemoryObject `EXECUTABLE` 表示可执行发布已进入终态。
+可等待对象公开电平条件。Mailbox READABLE 表示当前可以尝试接收消息；队头被另一接收事务占有时暂不成立，Tunnel DATA 提示重查共享控制块，PEER_ATTACHED 表示对端映射已经建立且尚未关闭，ProcessControl REAPABLE 表示可以收束，CLOSED 表示不可复活的终态，MemoryObject EXECUTABLE 表示可执行发布完成。
 
-WaitMany 只观察状态，不清位、不消费资源。对象语义拥有者显式改变电平：Receive 取走最后一条消息后清 READABLE，Tunnel 协议确认无进展后清 DATA，Notification 由专用 Take 消费待决位。醒来者必须重新执行真实操作，并接受并发消费者可能已先一步改变条件。已登记等待的命中候选须在对象状态发布点保留；后续清位不抹去该候选。异步交付可以延迟完成处理，但不能只重读最新电平来替代发布时的观察，也不能把不同更新的位 OR 成一份从未同时成立的结果快照。
+观察不清位、不消费业务资源。Receive、Tunnel acknowledge 和 NotificationTake 才改变各自条件。醒来者必须重试实际操作，并接受并发消费者已改变条件。
 
-不是每个 capability 都可等待。对象 role 必须同时公开合法 signals，Handle 还必须持有 WAIT；一次性 Tunnel Invitation 等纯授权角色不因内部存在关闭状态而自动成为可等待对象。
+已登记观察的命中候选须在对象发布时保留；后续清位不抹去候选。异步交付不能只重读最新电平，也不能把不同更新 OR 成从未同时成立的快照。
+
+role 必须公开合法 signals，Handle 还必须有 WAIT。Invitation、Delivery 等纯授权或交付角色不因内部有寿命而自动可等待。等待解析区分“本次已验证的使用引用”和“真正的电平来源”；多个发送授权可以观察同一 Mailbox，不能复制队列电平真值。
 
 ## WaitMany
 
-每个输入项是 `{handle, signals, cookie}`，结果是 `{cookie, observed, item_index, reason}`，不回显可能已经失效的 Handle。完成原因包括：
+每项包含 Handle、signals 和 cookie，结果包含 cookie、observed、item_index 和 reason，不回显可能失效的 Handle。完成原因包括 Signaled、Closed、Timeout，以及未来公开取消的独立结果 Cancelled。
 
-- `Signaled`：关心的普通电平命中；
-- `Closed`：对象进入 CLOSED；
-- `Timeout`：相对超时到达且没有对象完成；
-- `Cancelled`：未来公开取消操作的独立结果。
+内核接受 [绝对 Deadline](time.md)。用户库可以提供相对时长便利入口，但只在入口转换一次。有限零时点不是无限：初始观察已有条件可立即命中，否则返回 Timeout；由此可以表达非阻塞观察。有限 RPC 仍在接受回复时独立核验其 Deadline。
 
-公开 `timeout_ms` 是相对毫秒时长，零表示无限；它不是绝对时钟 Deadline。需要绝对时间的上层协议应先基于公开单调时钟计算剩余时长，或未来使用独立的绝对等待 ABI。超时与取消不能互相伪装。
+同一 Handle 可按不同条件重复出现。同一次初始检查或同一对象更新命中多项时，最小 item_index 获胜；不同对象变化由首先取得完成权者决定，不承诺跨对象原子快照。
 
-同一 Handle 可用不同 signals/cookie 重复出现。一次初始检查或同一对象更新同时命中多个项时，输入中最小 `item_index` 获胜；不同对象并发变化由首先取得完成权者决定，不虚构跨对象原子快照。
+解析 Handle 后，等待持有已验证的观察来源直至注销或完成。另一线程关闭或转移原 Handle 不撤销在途观察，对象 owner 关闭则发布 Closed。Waiting 线程的执行责任另有稳定拥有根，订阅不能成为线程唯一的保活来源。
 
-调用入口解析 Handle 并保留对象引用后，本次等待持有已验证的授权；该观察来源必须保活到本项注销或完成，不能只在安装时暂借。另一线程关闭或转移原 Handle 不撤销在途操作。对象 owner 关闭仍以 Closed 完成。
+## WaitSet
 
-Waiting 执行责任必须有独立于观察对象最后一个 Handle 的稳定拥有根；订阅关系不能成为线程唯一的保活来源。等待结束时先解除注册与观察授权，再把执行责任交给就绪或离场路径，不能因观察壳析构而静默消散线程。
+WaitSet 是持久观察集合，供长期服务把大量对象状态汇入有界接收批次。它不替代对象状态、不接收业务消息，也不执行用户回调。
+
+拥有者可以逐项 Register、Rearm、Remove，并批量 Receive 就绪记录。每个 registration 有不复用的 token、用户 cookie、观察条件和预付的结果槽。Register 不批量遍历全部来源；集合规模由显式资源预算决定，不受单次 WaitMany 输入项数量限制。
+
+注册周期为：
+
+```text
+Installing → Armed → Queued → Disarmed
+                        ↑         |
+                        └─ Rearm ─┘
+任一存活状态 → Removing → Dead
+```
+
+一轮 arm 最多交付一条记录。Queued 之后保留第一次获选的完整快照，不累积无界事件；Receive 消费记录并进入 Disarmed，只有显式 Rearm 才开始下一轮。Rearm 必须原子观察当前电平，已经成立的条件不能因没有新边沿而丢失。
+
+WaitSet 的 READABLE 只表示其就绪队列非空。Receive 以有界批次原子交付，输出失败不消费记录。Remove 使该 token 不再产生可接收的新记录，并收束源订阅及在途完成责任；已经被用户取走的旧记录仍需由用户按 token 的有效状态过滤。
+
+持久注册保留已验证的观察来源。原 Handle 关闭后，来源对象的终态仍可到达，不依赖一个已经退休的表槽。内核注册不授予数据访问或映射关闭权；用户态协议可以借出观察能力而继续独占自身数据 owner。
+
+## WaitSet 的收束
+
+WaitSet 是容量可增长的内核容器，其来源订阅和结果存储由内核拥有并 [有界退休](object.md)。用户停止服务业务与内核维护集合是不同责任；用户只提交普通关闭，不编排内部维护与退休步骤。
+
+- 普通关闭原子停止新操作和结果交付，转交稳定的内核退休责任；非空不是关闭失败理由。
+- 每次执行只推进有界工作；依赖在途安装、重置或完成时停驻，完成后继续，不热循环也不申请无法保证的清理资源。
+- 关闭提交即发布 CLOSED，退休完成使用内部完成责任；关闭成功返回时集合自身的订阅、安装和完成资源已收束。
+- 调用线程终止不撤销已提交关闭；进程退出与正常关闭复用同一退休机制，不遗漏已经从表中摘除的对象。
+- 关闭不等待其他观察者运行或消费事件，避免自观察和互相观察形成清理依赖环。
+
+owner 唯一、不可 TRANSIT；可以在 Building 期直接 GRANT。显式 close 和正常析构使用普通关闭，允许通过线程 Waiting 等待内核退休，而不是在内核栈上自旋。用户服务仍须独立停止准入、完成/取消业务任务和释放运输责任，集合关闭不替代这些业务契约。
 
 ## 安装、完成与取消
 
-未立即命中时，dispatcher 只建立等待意图；线程离开 hart 执行点后，调度侧才发布订阅和 timeout registration。对象命中、Timeout、安装错误与终止取消竞争同一个 outcome，唯一赢家取走线程所有权、注销定时项并清理全部订阅。
+WaitMany 与 WaitSet 共用来源订阅、发布快照与有界通知机制。订阅的完成目标可以是一次线程等待或一个持久注册周期；不复制对象电平算法，不让来源锁内执行跨对象清理。
 
-命中候选、唯一 outcome 仲裁与最终交付是不同责任。候选保留不等于已经取得完成权；对象、Timeout、错误与终止仍按同一仲裁规则竞争，不新增跨对象的真实事件时间排序承诺。完成节点、后续清理存储与进度责任必须在接受等待前准备，发布者不负责同步遍历全部等待者及其全部订阅。批量收束按实际工作推进，线程级结果义务解除也不能隐式触发整条离场和通知链。
+WaitMany 未立即命中时，dispatcher 建立等待意图；线程离开 hart 后才发布订阅和定时项。对象、Timeout、安装错误与终止取消竞争唯一 outcome。WaitSet 的 Installing 同样隔离尚未发布的注册与提前命中；失败必须撤销整个注册，不能留下幽灵结果。
 
-进程终止使用内部 `Abandoned` 完成，不回到用户态，也不冒充公开 Cancelled。完成后的 timeout registration 必须立即注销，不能继续持有 WaitContext 或阻止系统静默。
+命中候选、唯一 outcome 与最终交付是不同责任。结果槽、通知及完成清理责任均在接受观察前准备；发布者不分配，也不同步遍历所有订阅。批量清理按实际工作推进，最终析构不能隐藏另一次全表遍历。
 
-Notification 的消费语义由 [`signal.md`](signal.md) 唯一拥有；具体 WaitContext 与 timer queue 实现见 [`../impls/ipc.md`](../impls/ipc.md)。
+进程终止使用内部 Abandoned，不返回用户态，不冒充公开 Cancelled。完成后的定时项和来源订阅必须及时注销。Notification 消费由 [signal](signal.md) 拥有；业务超时与重试由各协议拥有。

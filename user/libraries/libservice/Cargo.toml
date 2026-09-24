@@ -1,0 +1,22 @@
+[package]
+name = "libservice"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Service registration, discovery records, and lifecycle control"
+edition = "2024"
+
+[dependencies]
+libfal = { path = "../libfal" }
+librpc = { path = "../librpc" }
+libbudget = { path = "../libbudget" }
+libexecution = { path = "../libexecution" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+ordered_table = { path = "../../../shared/ordered_table" }
+metadata_admission = { path = "../../../shared/metadata_admission" }
+monotonic_id = { path = "../../../shared/monotonic_id" }
+
+[dev-dependencies]
+libfal = { path = "../libfal", features = ["test-support"] }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+rinlib = { path = "../../rinlib" }

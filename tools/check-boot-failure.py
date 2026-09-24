@@ -40,10 +40,10 @@ def run_case(mode, kernel, addresses, command, logs, timeout):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    load = addresses["erhino_kernel::boot::load"]
-    park = addresses["erhino_kernel::hart::park"]
-    gate = addresses["erhino_kernel::registry::GATE"]
-    allocation = addresses["erhino_kernel::rt::handle_alloc_error"]
+    load = addresses["kernel::boot::load"]
+    park = addresses["kernel::hart::park"]
+    gate = addresses["kernel::registry::GATE"]
+    allocation = addresses["kernel::rt::handle_alloc_error"]
     # 在 boot::load 函数入口（尚无 prologue）注入：坏 envelope 长度、Layout
     # 分配失败 handler、真实非法指令 S-mode trap。Layout 两个机器字均为 8，
     # 不依赖其内部 size/alignment 字段次序。ABI 由钉住的 debug binary 决定。

@@ -19,7 +19,6 @@ use super::{
 };
 
 pub struct SystemReset {
-    #[expect(dead_code, reason = "KernelObject 共同头供后续对象诊断使用")]
     header: ObjectHeader,
     in_flight: AtomicBool,
 }

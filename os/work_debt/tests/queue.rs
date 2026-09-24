@@ -149,14 +149,14 @@ fn cancellation_storm_preserves_capacity_and_fifo_progress() {
 #[test]
 fn generation_advances_before_slot_reuse() {
     let mut debts = Debts::new();
-    let reservation = debts.reserve().unwrap();
+    let reservation = debts.reserve_in(0..1).unwrap();
     let generation = reservation.generation();
     debts.publish(reservation, 0, 1).unwrap();
     let (token, _) = debts.take(0).unwrap().into_parts();
     assert_eq!(token.generation(), generation);
     assert!(debts.finish(token).is_ok());
 
-    let next = debts.reserve().unwrap();
+    let next = debts.reserve_in(0..1).unwrap();
     assert_ne!(next.generation(), generation);
     assert!(debts.cancel(next).is_ok());
 }

@@ -1,85 +1,94 @@
 # 罗盘
 
-> 跨会话导航：方向、位置、戒律。只存上下文不排任务——走法由目标与架构自然序决定，每次收口时维护。
+当前任务与按需入口。施工规则由 [AGENTS](../AGENTS.md) 拥有，进度、阻塞和验证证据由各任务唯一工作记录拥有；本篇只保留接手摘要与链接，不累积历史接力指令。
 
-## 方向
+## 当前接手
 
-构建 notes/ 所描述的 Halcyon：以 RISC-V 微内核 eRhino（内核二进制 `erhino_kernel`）为核心，用户态以 `rinlib`、系统服务与跨组件契约共同构成。方向性结论（细节见 notes/ 对应篇）：
+**当前接手：FAL 服务能力与内核身份统一提交后的独立 Review**：[审查计划](todo-2026-09-24-fal-kernel-closure-review.md) 固定提交 `dda8a5b6f4fd7700378f9e85804c6b1d30826601`，核对 FAL 责任链、`kernel` 身份迁移、构建入口、notes/plans 归档与提交范围。FAL 基本能力、内核身份施工和 Agent 规范审查均已完成；当前不执行新的实现改动。
 
-- **微内核 ↔ 协作式互为因果**：长工作一律在用户态服务，内核路径恒短，内核态不可打断是推论不是选项（ideas/kernel.md「协作式内核」）。
-- **调度 = 域—类—执行点三层**：异构 hart 即多域；策略在类内整体可替换；扩展是横向加项不是改结构（ideas/task.md、impls/task.md「调度」）。
-- **单一归属不变量**：线程任意时刻恰处于一个容器——类队列 / hart current / 无容器（impls/task.md）。
-- **唤醒所有权**：timer = 自己的确定期限，IPI = 他方请求，无主唤醒不存在（impls/internals.md「唤醒所有权」）。
-- **异步 syscall = 内核请求 + wake**：内核永不等待，阻塞表达为 Waiting，完成即唤醒（ideas/call.md）。
-- **ABI 演进两侧同步**：shared/ 不冻结，内核与 rinlib 一起改。
-- **纯 capability 授权**：无进程权限等级；平台根由内核按事实铸造、init 决定策略；Handle 以 TRANSIT/GRANT 区分消息暂存与直接跨表安装，badged sender 承载用户态 grant（`notes/ideas/object.md`）。
-- **框架先行、实现从简**：整体系统设计为先，搭框架再填充——结构一次到位，实现按需求渐进替换（如调度域/类）。
-- **单一内存事务核**：匿名与对象来源、Running 与 Building authority、结果 cookie 与 view 发布都是同一事务的字段维度，不是平行编排；新增来源或输出是加一个维度，不是加一套 plan/complete（`notes/impls/mm.md`「用户地址空间」）。
-- **AddressSpace 是内存所有权 seam**：进程先有稳定 Unbound 身份，Building 期以一次性 ProcessBindMemory 附入 PoolBinding 与页表后转为 Bound；区域账本是映射真值，匿名 mapping 自有 affine extents，共享字节使用固定长度、容量有界的 MemoryObject；所有变更走 validate/reserve/commit/publish/synchronize/retire，跨 hart 完成以 epoch + Remote Call 确认闭合（`notes/ideas/mm.md`）。
-- **资源能力与 Job 正交**：Job 只做创建、成员与收束；MemoryPool 只支付 page-backed storage，KernelMemoryBudget 支付内核 metadata，CPU 由预约对象支付，设备由各自 capability 授权。ProcessCreate 只建 Building 空壳，资源经独立操作附入；capability 跨 Job 转移不改资源来源（`notes/ideas/{task,mm,object}.md`）。
+- 当前唯一施工入口已从 FAL 切换到固定提交审查；FAL 实现计划与内核身份计划均已完成，保留其验证证据和历史审查导航。
+- FAL 的 D0–D5、F4 结构复核/组合验收以及内核身份改名的构建、host、QEMU、boot-failure 证据分别写入所属计划；剩余仅为各固定提交的独立 Review。
+- 当前状态：准备接手 `60e3253` 的只读规范/导航审查；不修改实现代码，不把当前未提交工作树混入目标提交结论。
 
-## 活跃计划
+## 按主题阅读
 
-plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报告。专题 todo 拥有当前实施，Review 保留目标提交证据与复核清单，二者不重复安排同一问题。已完成调查/复核进入 `archived/`，`ref-*` 是只读参考资料。当前全部活跃入口：
+| 主题 | 方向或规则 | 当前实现 |
+|---|---|---|
+| 内核边界、有界推进与提交后责任 | [kernel](../notes/ideas/kernel.md)、[object](../notes/ideas/object.md) | [internals](../notes/impls/internals.md)、[call](../notes/impls/call.md) |
+| 任务、调度域与生命周期 | [task](../notes/ideas/task.md)、[execution-context](../notes/ideas/execution-context.md) | [task](../notes/impls/task.md)、[execution-context](../notes/impls/execution-context.md) |
+| 内存、资源来源与事务 | [mm](../notes/ideas/mm.md) | [mm](../notes/impls/mm.md)、[memory-object](../notes/impls/memory-object.md) |
+| 用户态领域与执行 | [库分层](../user/libraries/README.md)、[framework](../notes/ideas/framework.md) | [runtime](../notes/impls/runtime.md)、[startup](../notes/impls/startup.md) |
+| FAL、服务与 RPC | [fal](../notes/ideas/fal.md)、[service](../notes/ideas/service.md)、[rpc](../notes/ideas/rpc.md) | [fal](../notes/impls/fal.md)、[rpc](../notes/impls/rpc.md) |
+| 其他设计主题 | [notes 索引](../notes/README.md) | 同索引中的 impl 拥有篇 |
+| 构建、QEMU 与平台 | [BUILD-AND-TEST](BUILD-AND-TEST.md) | 参数与命令以 Justfile 为准 |
+| 故障调查与工具 | [DEBUG-PLAYBOOK](DEBUG-PLAYBOOK.md)、[TOOLING-PITFALLS](TOOLING-PITFALLS.md) | 按故障选择，不作为每次接手必读材料 |
+| 交付前检查与独立审查 | [REVIEW](REVIEW.md) | 完成条件由 AGENTS 唯一定义 |
 
-| 文件 | 概要 |
+验收配置不等于全部实现都是临时机制。服务进程中的正式机制、装配接缝、验收政策与过渡路径分别在 impls 和唯一工作记录中说明；当前 FAL 实现入口为上表对应篇。
+
+## 活跃工作记录
+
+专题实施与独立 Review 分别拥有自己的工作记录；同一问题不在两处安排。已完成但尚保留审查导航的入口明确标注，不作为新的施工顺序。
+
+| 文件 | 状态与范围 |
 |---|---|
-| [`todo-2026-09-frame-source-selftest-review.md`](todo-2026-09-frame-source-selftest-review.md) | 未来代码 Review：固定复核 `606b59d` 的库存来源、boot-held affine owner、完整清零、切分退款与 child 来源保活，不阻塞 FAL 主线 |
-| [`todo-2026-09-design-audit-followup-review.md`](todo-2026-09-design-audit-followup-review.md) | 未来 Review：固定复核 `4b27ce6` 与 `8aa7bc2` 的 RX 同步、重复工作删除、对象来源保活和 Sealing 收缩，不重开 A–E program |
-| [`todo-2026-09-fal-service-capabilities.md`](todo-2026-09-fal-service-capabilities.md) | RNL2 后设计/实施 DirectoryGrant、跨 provider 路由、服务发现、正式 Open 与 Watch；正式 FAL 多页流验收归此，不作为数据面前置 |
-| [`todo-2026-09-monotonic-time-rpc-deadline.md`](todo-2026-09-monotonic-time-rpc-deadline.md) | 有限 RPC timeout 的完整调用语义：先建立公共单调时间 seam，再让投递背压与回复等待消费同一绝对 deadline；正式开放有限时限 RPC 前完成 |
-| [`todo-2026-09-platform-reserved-memory-lifecycle.md`](todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |
-| [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md) | 未来设计项：独立用户态电源管理服务需重新设计职责、拓扑、协议与 capability 分配 |
-| [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) | 未来设计项：闭合用户态从关机意图到最终 reset 的服务收束政策，不预设执行主体、拓扑或协议 |
-| [`todo-2026-08-26-review-carryover.md`](todo-2026-08-26-review-carryover.md) | 等设备/中断/DMA 接入触发的唯一 review 承接项 |
-| [`todo-2026-09-kernel-final-architecture-review.md`](todo-2026-09-kernel-final-architecture-review.md) | 等 MemoryObject 主线、多页 Tunnel、Runnel v2 与主要用户态消费者完成，并在统筹批次 A–E 收口后执行的最终架构 review |
+| [FAL 服务能力](todo-2026-09-fal-service-capabilities.md) | F3d/F3e/F3f 与 F4-1/F4-2/F4-3 已完成；完整验收通过，保留无稳定正式注入入口的验证限制 |
+| [验收 fixture 清理](todo-2026-09-23-acceptance-fixture-cleanup.md) | 消费者矩阵、映像 owner 与失败判定已核对；两个 binary 暂留，余下逐项审查其他自检窗口 |
+| [内核身份统一](todo-2026-09-22-kernel-identity.md) | 已完成；package、默认 target、crate identifier、产物与有效入口统一为 `kernel`，构建/host/QEMU/boot-failure 验证通过 |
+| [Agent 规范与导航审查](archived/todo-2026-09-22-agent-guidance-review.md) | 已归档并关闭；报告见 [archived/review-2026-09-24-agent-guidance.md](archived/review-2026-09-24-agent-guidance.md) |
+| [FAL/内核闭包提交审查](todo-2026-09-24-fal-kernel-closure-review.md) | 当前接手；固定提交 `dda8a5b6`，FAL 责任链、`kernel` 身份迁移与文档边界 |
+| [FAL 集成基线审查](todo-2026-09-13-fal-integration-baseline-review.md) | 待审固定 `d22b9d7`；公共对象前置与混合集成边界 |
+| [公共时间审查](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 待审固定 `c6e0a84`；时钟、绝对期限与消费者 |
+| [库存来源审查](todo-2026-09-frame-source-selftest-review.md) | 待审固定 `606b59d`；库存、boot-held owner、清零与退款 |
+| [设计审查后续复核](todo-2026-09-design-audit-followup-review.md) | 待审 `4b27ce6`、`8aa7bc2`；RX 同步、来源保活与 Sealing 收缩 |
+| [库归属重排审查](todo-2026-09-21-library-knowledge-ownership-review.md) | 待审固定 `96ee03b`；记账、执行、消费者与命名迁移 |
+| [FAL 设计审查](todo-2026-09-21-fal-service-design-review.md) | 固定文档提交 `1000270`；待对应实现闭合后审查，非实现验收证据 |
+| [FAL 库基线审查](todo-2026-09-21-fal-library-baseline-review.md) | 待审固定 `dfcf7a3`；F1–F3c 与库重排前基线 |
+| [消息运输审查](todo-2026-09-14-message-transport-review.md) | 待审固定 `3060dd8`；typed 运输、消费式 Packet 与失败路径 |
+| [流运输审查](todo-2026-09-14-stream-transport-review.md) | 待审固定 `a2aabed`；typed 工厂、观察草稿删除与终态边界 |
+| [运行期准入审查](todo-2026-09-15-runtime-admission-review.md) | 待审 `a3891b0` → `5de2780` → `e0b5c45` → `4e18e5e`；Runtime、RPC、Outbox 与消费者 |
+| [公共操作所有权审查](todo-2026-09-18-public-operation-ownership-review.md) | 待审固定 `8e0467a`；工作债务、请求代次与退出交棒 |
+| [执行前置交付记录](todo-2026-09-13-service-runtime-prerequisites.md) | 前置已完成；保留交付与固定提交审查导航，不拥有后续执行施工 |
+| [用户内存 owner](todo-2026-09-14-user-memory-owner-lifecycle.md) | 执行基座和 FAL 基础之后，由长期动态 mapping / 正式 reaper 需求触发 |
+| [内核 metadata 预算](todo-2026-09-14-kernel-memory-budget.md) | 不可信分配/创建域隔离触发，默认排在 FAL 基础与映射 owner 后 |
+| [FAL 扩展操作](todo-2026-09-fal-extended-operations.md) | 真实消费者触发；不隐含在基本 FAL 交付中 |
+| [平台保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) | 正式设备/DMA 接入前完成相关规范支持 |
+| [电源管理服务](todo-2026-09-power-management-service.md) | 未来设计；职责、拓扑、协议与能力分配单独裁决 |
+| [系统关机编排](todo-2026-09-system-shutdown-orchestration.md) | 未来设计；不预设电源管理服务的执行主体与职责 |
+| [设备审查承接](todo-2026-08-26-review-carryover.md) | 设备、中断、DMA 接入时触发 |
+| [内核最终架构审查](todo-2026-09-kernel-final-architecture-review.md) | 等主要用户态消费者及该计划前置完成 |
+| [架构审计发现](todo-2026-09-14-architecture-audit-findings.md) | 逐项并入所属专题或独立立案，不占活跃串行位 |
 
-A–E 的五份专题实施计划、九份报告、Review program 与系统审计总计划均已归档。最终修复基线为 `228b6a5`，WiseHare/OliveWillow 定点复核通过，无开放 finding；过程与验证边界见 [`Review program 档案`](archived/todo-2026-09-review-program.md)。
+## 待触发事项
 
-常驻手册：[`REVIEW.md`](REVIEW.md) 规定设计与代码两类 Review 的事后审查纪律（不进入任务流程、不阻碍验收）；`DEBUG-PLAYBOOK.md` 与 `TOOLING-PITFALLS.md` 分别记录调试和工具纪律。
-
-## 挂起项
-
-无计划文档、纯等触发条件的延后项素引（收口时扫描本表：条件到即转正式计划或并入主线；本表只存索引，真值在详情列所指处）。有计划文档的排队看活跃计划表，会消灭的问题看 `KNOWN_ISSUES.md`，review 承接看 carryover——三者不在此重复。
+仅索引尚无独立计划的事项，详情由对应文档拥有；触发后并入所属工作记录或立案。本表不重复活跃计划或 KNOWN_ISSUES。
 
 | 事项 | 触发 | 详情 |
 |---|---|---|
-| CPU 预约对象（budget/period、pick 边界配额过滤） | 不可信执行域接入 | `ideas/task.md`「线程」 |
-| fence.i 代码代次优化 | active 集合条件已满足；另一半「开销实测可见」需先具备 dispatch 计时手段（Zicntr）且占比可见 | `impls/task.md`「调度」 |
-| 显式 affinity / 跨域迁移 ABI | 真实多域硬件成为运行环境或出现多域放置需求（ThreadSpawn 前置已落地）；接入边界公理见详情 | `ideas/execution-context.md`「调度域」、`archived/todo-2026-08-28-domain-eligibility.md` 决策 3–4 |
-| initfs manifest / 服务编排 | 需要正式服务编排 | `ideas/bootstrap.md` |
-| ld-erhino 动态链接（PT_INTERP、共享库） | 无明确触发，构想态 | `ideas/bootstrap.md` |
-| F-only/Q/V/TSO 档位建模 | 真实需求出现 | `impls/execution-context.md` |
-| TLS ABI（用户 tp 置零中） | 需要 TLS 时 | `impls/task.md` |
-| 多用户 / ACL | 多用户需求 | `ideas/object.md` |
-| ASID 分配 + 定向 shootdown 优化 | 地址空间切换开销实测 | `impls/task.md` |
-| 过渡 admission/Remote 槽高水位可观测性 | KernelMemoryBudget 立案或容量重校需求出现 | `ideas/mm.md`「MemoryPool 与 backing charge」 |
-| Unmap 调用者唤醒点前移（Synchronize 即返回、retire 后台化） | 内存操作延迟实测成为瓶颈（需先具备测量面） | `ideas/mm.md`「MemoryChange 事务」 |
+| CPU 预约对象 | 不可信执行域接入 | [task](../notes/ideas/task.md)「线程」 |
+| fence.i 代码代次优化 | 具备计时手段且开销实测可见 | [task 实现](../notes/impls/task.md)「调度」 |
+| 显式 affinity / 跨域迁移 ABI | 真实多域硬件或放置需求 | [execution-context](../notes/ideas/execution-context.md)「调度域」、[域准入档案](archived/todo-2026-08-28-domain-eligibility.md) |
+| initfs manifest / 服务编排 | 正式服务编排需求 | [bootstrap](../notes/ideas/bootstrap.md) |
+| ld-erhino 动态链接 | 构想态，尚无明确触发 | [bootstrap](../notes/ideas/bootstrap.md) |
+| F-only/Q/V/TSO 档位 | 真实需求 | [execution-context 实现](../notes/impls/execution-context.md) |
+| TLS ABI | TLS 需求 | [task 实现](../notes/impls/task.md) |
+| 多用户 / ACL | 多用户需求 | [object](../notes/ideas/object.md) |
+| ASID 与定向 shootdown | 地址空间切换开销实测 | [task 实现](../notes/impls/task.md) |
+| admission / Remote 槽高水位 | KernelMemoryBudget 立案或容量重校 | [mm](../notes/ideas/mm.md)「MemoryPool 与 backing charge」 |
+| Unmap 唤醒点前移 | 有测量证据的内存操作延迟瓶颈 | [mm](../notes/ideas/mm.md)「MemoryChange 事务」 |
 
-## 位置
+## 完成证据与历史入口
 
-- 已完成：boot/高半区启动协议、帧池（os/frame_pool）、堆、Sv39 页表（os/page_table）、板级解析（os/dtb）、任务模型（trap 路径与 trap 锚、域—类调度、进程/线程、BootPackage initial ELF bootstrap、syscall 面 Debug/Exit/MemoryMap/MemoryUnmap/MemoryProtect/Sleep、进程回收、timer/IPI 通路）与执行环境重构（a9a65cb）。IPC 前地基工程已完成（hart 身份统一、锁内存序、所有权单向化、uaccess 集中化；见 `plans/archived/2026-09-pre-ipc-groundwork.md`）。IPC 对象 / Handle 重建也已完成：进程本地 HandleTable、WaitContext、显式 Mailbox/Notification、原子 Handle move、Endpoint/Invitation 与 Acquire/Release Runnel 已贯通，实施档案见 [已归档计划](archived/2026-08-ipc-object-foundation.md)，实现现状见 `notes/impls/ipc.md`。
-- 已完成：**统一内存事务核与公共 MemoryObject 已收口（2026-09）**——切片 1–6D 与切片 7 全部完成。Running/Building/bootstrap/object view 四条路径收敛为单一 `MemoryChangePlan`/`PreparedMemoryChange`（source/authority/output/image_end/view 五个字段维度），四套平行 plan/complete/commit 类型与 Tunnel 两份回滚矩阵已删除，proc.rs 净减约 700 行。对象 view 的权限真值从 `ObjectViewAuthorization` 流出（原 `ReadWrite` 硬编码已清），公共 MemoryObject 经 `MemoryObjectCreate/Query/Seal(0x55-0x57)`、`ObjectSignals::EXECUTABLE` 与 `MemoryMapRequest.source` 接入，AddressSpace 持 per-object view owner 使对象独立于 Handle 存活。实施途中修正一个真实前置缺口：含 W 的 object view 被部分 Unmap/降权时存活片段需要后继 permit，因此 Unmap/Protect 采用两段式（Validate 定几何并冻结对象来源 → 锁外取得 permit → 重入 Reserve）；Sealing 允许只延续原写范围的切分/收缩，仍拒绝只读范围升权，失败回滚不再回查易失的 live view owner。实施档案见 [`archived/todo-2026-09-memory-object-unification.md`](archived/todo-2026-09-memory-object-unification.md)，历史 A 批复核见 [`Review program 档案`](archived/todo-2026-09-review-program.md)；本轮后续修复由 [`设计审查后续 Review`](todo-2026-09-design-audit-followup-review.md) 单列复核，不重开旧 program。实现现状见 `notes/impls/{mm,memory-object,tunnel}.md`。
-- 后续设计：用户态系统关机编排与独立电源管理服务分别立案，二者不互相预设执行主体、职责、拓扑、协议或 capability 分配。计划见 [`todo-2026-09-system-shutdown-orchestration.md`](todo-2026-09-system-shutdown-orchestration.md) 与 [`todo-2026-09-power-management-service.md`](todo-2026-09-power-management-service.md)。
-- 已完成：**显式系统复位已收口（2026-09）**——eRhino 自有 reset ABI、primordial `SystemReset` capability、init 直接提交与 SBI 显式映射已落地；调度器不再从 quiescent 推断关机，idle 只负责 WFI 与唤醒路由；virt 五线与 sifive_u 平台失败返回均通过。实施档案见 [`archived/todo-2026-09-explicit-system-reset.md`](archived/todo-2026-09-explicit-system-reset.md)，旧竞态调查见 [`archived/todo-2026-08-29-early-quiescent-shutdown.md`](archived/todo-2026-08-29-early-quiescent-shutdown.md)。
-- 已完成：**竞态矩阵覆盖增强已收口（2026-09）**——锤侧延迟变体（`Cmd.aux` 转正为执行前延迟，奇数轮锤延迟 10ms），kill-vs-exit/fault/abandon 双侧终因均有胜出记录，全验证线 10/10；实施档案见 [archived/todo-2026-08-28-race-matrix-coverage.md](archived/todo-2026-08-28-race-matrix-coverage.md)。
-- 已完成：**完整进程生命周期 step 1–10 已收口（2026-08-28）**——per-hart 索引最小堆 Timeout queue、WaitContext 稳定 token 注销、任意非零预算 ProcessDrain、Invitation 非等待角色与 fail-closed QEMU acceptance 已落地；原启动大事务随后演进为独立 Grant/Attach 与纯发布 Start，当前实现以本节批一事务复审结论为准。实施档案见 `archived/todo-2026-08-26-process-lifecycle.md` 与 `archived/todo-2026-08-28-step10-correctness.md`。
-- 已完成：**完整进程生命周期 step 2–6 已落地**——step 2–4（ProcessControl 前移、lifecycle 顶级锁状态机、全局进程表退役、跨 hart kill、硬上界 ProcessDrain、init 监督闭环）已过统一代码 Review（[archived/review-2026-08-27-process-lifecycle-code-review.md](archived/review-2026-08-27-process-lifecycle-code-review.md)）；step 5（Job 管理面）已实施收口：JobSeal/Query/Enumerate/Derive、有序成员表、链锁封口、完成传播与 libprocess 递归 job_kill；**step 6（持久 init 监督政策与 pm 委托域）已实施收口（2026-08-28）**：init 建 root → services → pm_domain/acceptance 拓扑，委托域 JobControl 经 StartupBlock grants 授 pm（MANAGE|READ|WAIT，无 CREATE）而 init 保留复制件作直接收束权；pm 对域内 Running 靶走 枚举→派生（铸造）→kill→drain→seal；失败路径整树 job_kill(services)；init 正常路径在全部收束后提交显式 reset，平台拒绝时常驻管理端点保持 root supervisor；拓扑快照两处打印供调试。FAL 剩余面（DirectoryGrant、每订阅者 watch、跨进程 provider）仍排在其后。
-- **机制层泛化改造已落地（2026-08-27）**：以 [archived/review-2026-08-27-mechanism-generalization.md](archived/review-2026-08-27-mechanism-generalization.md) 为纲的四批改造——① impls 失同步修复与 KernelRequest 正名（每机制恰一篇拥有的归属纪律入 README）；② Timeout queue per-hart 化（唤醒所有权结构化；本轮已演进为稳定 token 的索引最小堆）；③ RAII 收束契约（tunnel `MappingLease`、`phys_to_virt` 栈区 debug 断言、ideas/object.md「收束分层」公理替代 close fanout 枚举证明）；④ **Lock Ladder**：`sync::ranks` 秩表 + per-hart 秩栈断言（同秩链段 key 递增：链锁 jid、表嵌套 pid；talc 经 `RankedRawSpinlock` 类型级注入；bootstrap 专用帧经 formal entry 切换），锁序契约按实测重写并修正旧基线三错（lifecycle 方向、drain_gate/HEAP/POOL 未入档、AddressSpace 双层）。全部负载 debug 构建验证无违规；reserve/commit/rollback 协议四要素成文。
-- FAL/RPC 首批已落地——方向 C 拍板（无中央 VFS、symlink 无 hardlink、Lookup 三值应答）；librpc（RpcPrefix/同步 Caller）、libfal（线协议/memfs/provider）、libfs（前缀表/走路引擎）与 fs 真路径验收线达成（`54d3e02`/`bf32c1c`，实现现状见 `notes/impls/fal.md`）。
-- IPC ABI 基座已重构：Entry 保存 immutable badge，MessageHeader 区分 sender_pid/sender_badge，Mailbox owner 可 mint sender；TRANSIT/GRANT 分离 buffered message 与 Building 期 direct grant；send-once target/transit alias 已拒绝。完整审查见 [`archived/review-2026-08-26-notes-design.md`](archived/review-2026-08-26-notes-design.md)，实现现状见 `notes/impls/ipc.md`。
-- StartupBlock v2 与 BootPackage 启动链已落地：outer 为 Header + 实际 child Handle 数组 + 可零 padding + opaque payload；内核只解析 fixed envelope 与唯一 init ELF，payload 由 boot-held owner 直接转为 root-funded immutable lease backing，init 同时取得与内部 PoolBinding 同源的 root MemoryPool capability。实现现状见 `notes/impls/startup.md`。
-- 对照负载分置于 `user/services/`、`user/drivers/` 与 `user/tests/`：当前服务为 `srv_init`、`srv_fs`、`srv_pm`，驱动为 `drv_spi_sifive`，验收进程为 `test_fp`、`test_hammer`、`test_target`。`srv_fs` 经用户态 FAL 真路径完成创建、枚举、属性、符号链接与偏移读写；旧 fs ABI 尸体已清，KNOWN_ISSUES 桩条目已消解。
-- 用户态 launcher 基座已落地：root Job/JobControl、affine ProcessBuilder、显式 MemoryPool、一次性 ProcessBindMemory、Bound 后的 Building-only Map/Write/Grant/Attach、纯发布 ProcessStart、ProcessControl 与公共 `libprocess` 已贯通；组装失败统一执行 builder close → ProcessDrain → control close，Grant 是否已消费由 `SpawnFailure` 显式报告。init 以临时 ustar 政策启动其余负载，内核不含 tar/service policy；initfs manifest/archive 仍在需要正式服务编排时另案设计。方向见 `notes/ideas/{task,bootstrap}.md`，实现现状见 `notes/impls/{startup,task}.md`。
-- 下一自然序：A–E Review program 已收口：`228b6a5` 完成启动 Failed 广播、nofd 验收及 Tunnel 精确失败/交错验证，并修复补证暴露的输出终止锁序缺陷；两位独立 reviewer 确认全部关闭，九份报告与统筹/系统审计计划归档。多页 Tunnel/Runnel v2（切片 8/9）实现与完整验收已完成，事后审查纳入统一架构 Review：有界几何 ABI、Endpoint 与 raw cleanup 安全边界、独立物理 cursor、共享访问平台契约、正进展通知及部分完成错误已贯通真实消费者；RNL1、单页接口和重复 Prepare 编排已删除。工程限额按独立依据重校：guard 12KiB 派生审计阈值，两平台每 hart 栈统一 256KiB，不为经验门槛拆帧。切片 10 已完成实现与完整验收：raw allocation adapter 与通用 tracker 已删除，boot-held 直接拥有几何；正式 funding 自检、全范围清零、切分双账本退款与 child 来源保活已贯通。切片 10 已提交为 `606b59d`，未来固定提交复核见 [`库存来源代码 Review`](todo-2026-09-frame-source-selftest-review.md)；数据面专题已归档，交付与证据见 [`数据面档案`](archived/todo-2026-09-memory-object-data-plane.md)。下一步进入 FAL 服务能力计划（DirectoryGrant、跨进程 provider、服务发现与 Open）→ BufferQueue 与设备/中断/DMA 接入 → 异构。单调时间与 RPC 全调用 deadline 是正交能力，在正式开放有限时限 RPC 前完成，不改变数据面自然序。最终全局架构 Review 仍等待数据面及主要消费者完成；系统关机编排与独立电源管理服务保持各自未来计划，不在本轮实施。**step 7（ThreadSpawn 前多线程 teardown barrier）已实施收口（2026-08-28）**：线程成员表（tid 寻址、离场即摘）取代单值记录，等待取消锁外游标化（零分配），归一收敛到 trap 汇编非 Resume 出口，KNOWN_ISSUES 写回 panic 面消解（deliver_output 复检即杀 + 分发出口终止检查）；ThreadSpawn 接入面清单入档计划篇。**首次 release 验证暴露并修复 trap 入口 x5 破坏**（SPP 检查在保存前用 t0，每次用户 trap 覆写用户 x5；修复经已保存的 t5 中转，寄存器纪律入档 execution-context.md，调查档案 [archived/review-2026-08-28-release-trap-entry-x5.md](archived/review-2026-08-28-release-trap-entry-x5.md)）；自此 release 验证线纳入阶段收尾必跑（`just virt-release`）。**step 8（capability-derived 调度域 eligibility 与 D64 开放）已实施收口（2026-08-28）**：域按需求满足签名等价类推导（`os/sched_domain` 纯逻辑 crate，host 可测）、boot 冻结、Start 提交点绑定进程，多域默认落最弱兼容域；reserve/commit/rollback 上收 `SchedClass` trait（F2 勾销）；D64 兼容谓词修正（FLEN 恰 64，Q 排除）；验证面新增 `test_fp` D64 负载（gc target：fsqrt/fmadd 位型、FPR/fcsr 跨 trap 往返、轮转复检）与 `virt-hetero`/`virt-nofd` 多域 DTB 变体（`tools/make-hetero-dts.py` + `ERHINO_DTB`）；virt/virt-release/hetero/nofd/sifive_u/host 全绿，方向公理入档 ideas/task.md「线程」。生命周期 step 10 文档终态已收口。**step 9（多核竞态验证矩阵）已实施收口（2026-08-28）**：`test_hammer` 双锤负载（HAMMER 执行器/TARGET 竞态靶，`libprocess::race` 线协议）+ init 竞态矩阵段 10 场景（kill vs kill/Exit/fault/Start/park/abandonment、并发 Create+枚举乱序窗口、seal vs 并发 Create、双 Drain ObjectBusy 仲裁、最后 control 消散派生兑底）；验证中修复内核 `dealloc_bounded` 完成路径 off-by-one（最后一跳用满预算时 work_done 超 max 违约，host 回归补齐）与 sifive_u BootPackage 装载窗口（尾部 32MB→64MB，零内存代价）；virt/virt-release/hetero/nofd/sifive_u 矩阵 10/10、host 全绿。**ThreadSpawn 三批与用户内存 8B 已收口（`bdc83ef` / `004cae5`）**——teardown barrier、成员表、active 位图、每线程 FP 状态与域绑定直接复用；Running spawn 使用独立 Spawning 状态，用户态以普通匿名 mapping 建立双 guard 栈并由 JoinHandle 结构化收束，线程级 result obligation 与进程 mandatory_ops 保持不同职责；竞态矩阵扩至 16/16，carryover IPC 压力四线与 `sifive_u` 连续十轮通过，实施计划已归档。BootPackage / launcher 基座已过机制层审查（[`archived/review-2026-08-26-bootstrap-launcher-mechanism.md`](archived/review-2026-08-26-bootstrap-launcher-mechanism.md)，F1 payload 收编 owned backing、F3 Pid 拓宽 u64 已实施）；initfs 内部协议在需要正式服务编排时单独设计。
+当前实现从 notes 读取；以下记录仅作追溯，不继承其中的历史“下一步”。
 
-## 戒律
-
-- 内核态路径保持短；出现「必须内核抢占」的需求 = 工作放错了地方，修方向不修模型。
-- 公平性靠数据结构性质（FIFO 等），不靠记账字段——旧内核死因是记账字段无写入点。
-- 用户可触发的 fault 一律杀进程绝不 panic 内核；syscall 未知号返回错误。
-- 全局状态按三层纪律（hart 私有走 tp / 对象走锁 / 全局 OnceLock+Spinlock），禁 static mut。
-- 用户内存访问：SUM 直访 + translate 前置校验，不软件遍历页表拷贝。
-- 框架先行、实现从简：结构一次到位，实现按需求渐进替换（如调度域/类）。
-- 共享 ABI 改动内核与用户态两侧同步，不留单边。
-- 文档即决策：方向性结论进 notes/，本文件只导航；每轮收口于「决策入档、代码全绿（debug 与 release）已提交、下一步自然序明确」。
+| 主题 | 记录 |
+|---|---|
+| 本次导航整理前的完整记录 | [COMPASS 快照](archived/ref-2026-09-22-compass-snapshot.md)，保留原工作树中的历史过程与旧接力摘要 |
+| Agent 规范与导航整理 | [完成记录](archived/todo-2026-09-22-agent-guidance.md)；内核命名整改仍由活跃计划承接 |
+| 公共对象前置 | [交付档案](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md) |
+| 公共时间 `c6e0a84` | [交付档案](archived/todo-2026-09-monotonic-time-rpc-deadline.md) |
+| 公共操作 `8e0467a` | [交付档案](archived/todo-2026-09-14-public-operation-ownership.md) |
+| 用户态库归属 `96ee03b` | [迁移档案](archived/todo-2026-09-21-library-knowledge-ownership.md) |
+| A–E 审查收口 `228b6a5` | [Review program](archived/todo-2026-09-review-program.md) |
+| 内存事务与数据面 | [MemoryObject 统一](archived/todo-2026-09-memory-object-unification.md)、[数据面档案](archived/todo-2026-09-memory-object-data-plane.md) |
+| 验收时间敏感现象 | [调查与重开条件](archived/ref-2026-09-acceptance-timing-flake.md) |

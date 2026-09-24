@@ -599,8 +599,8 @@ impl KernelObject for Job {
         self.wait.lock().complete_notification(reservation)
     }
 
-    fn drain_waiters(&self, budget: usize) -> (usize, bool) {
-        super::wait::drain_waiters(&self.wait, budget)
+    fn advance_waiter(&self) -> super::object::WaitAdvance {
+        self.wait.lock().advance_waiter()
     }
 
     fn header(&self) -> &ObjectHeader {
@@ -635,8 +635,17 @@ impl KernelObject for Job {
         self.wait.lock().subscribe(subscription)
     }
 
+    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
+        self.wait.lock().rearm_observer(id)
+    }
+
+    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
+        self.wait.lock().cancel_observer(id)
+    }
+
     fn unsubscribe(&self, id: u64) {
-        self.wait.lock().unsubscribe(id);
+        let retired = self.wait.lock().unsubscribe(id);
+        drop(retired);
     }
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
