@@ -3239,8 +3239,6 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
             .expect("discovered secondary provider grant missing"),
         FalRights::TRAVERSE | FalRights::ENUMERATE,
     )?;
-    consumer.continue_business()?;
-    consumer.await_report(test_fal::report::COMPLETE)?;
     let first_grant = alloc::sync::Arc::new(
         first_fs
             .grant
@@ -3271,17 +3269,6 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     namespace
         .mount("/provider-b", DirectoryGrant::new(second_stream_grant))
         .map_err(|_| "secondary FAL2 stream namespace mount failed")?;
-    let mut transport = FalTransport::new(rinlib::time::Deadline::INFINITE);
-    let first_stream = libfs::resolve::resolve(
-        &mut transport,
-        &namespace,
-        "/probe-stream",
-        libfal::protocol::ResolvePolicy::FollowAll,
-    )
-    .map_err(|_| "FAL2 Open namespace resolve failed")?;
-    exercise_open_streams(root, &mut transport, &first_stream)?;
-    exercise_cancellable_rpc(root)?;
-    drop(namespace);
     let mut shutdown_watch_client = FalClient::new();
     let shutdown_watch = shutdown_watch_client
         .subscribe(
@@ -3301,10 +3288,24 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
             .as_ref()
             .expect("discovered secondary provider grant missing"),
     )?;
+    consumer.continue_business()?;
+    consumer.await_report(test_fal::report::COPY_ARMED)?;
+    notification::signal(second_fs.release, 1)
+        .map_err(|_| RunFailure::Message("secondary provider in-flight Copy release signal failed"))?;
+    consumer.await_report(test_fal::report::COMPLETE)?;
+    let mut transport = FalTransport::new(rinlib::time::Deadline::INFINITE);
+    let first_stream = libfs::resolve::resolve(
+        &mut transport,
+        &namespace,
+        "/probe-stream",
+        libfal::protocol::ResolvePolicy::FollowAll,
+    )
+    .map_err(|_| "FAL2 Open namespace resolve failed")?;
+    exercise_open_streams(root, &mut transport, &first_stream)?;
+    exercise_cancellable_rpc(root)?;
+    drop(namespace);
     drop(second_fs.grant.take());
     consumer.observe_shutdown()?;
-    notification::signal(second_fs.release, 1)
-        .map_err(|_| RunFailure::Message("secondary provider release signal failed"))?;
     consumer.await_report(test_fal::report::PROVIDER_CLOSED)?;
     consumer.finish(root)?;
     let second_report = collect_fs_provider(

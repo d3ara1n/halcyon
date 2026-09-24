@@ -91,6 +91,8 @@ required=(
     "FAL2 independent repeatable handle read passed"
     "FAL2 independent affine Take recovery passed"
     "FAL2 independent Create Modify and Delete Watch passed"
+    "FAL2 resource quota saturation and recovery passed"
+    "FAL2 in-flight Copy provider shutdown passed"
     "FAL2 independent enumeration and same-provider Move passed"
     "FAL2 independent property Copy and stream ReadAt passed"
     "FAL2 independent unattached Open expired and retired"

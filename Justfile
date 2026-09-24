@@ -51,10 +51,10 @@ THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线按近期实测耗时设置宽裕的 QEMU 运行超时；均可用同名环境变量单独覆盖。
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "90")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
-VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "300")
+VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "420")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "90")
-SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "60")
+SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "120")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
 
 # gdb

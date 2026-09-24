@@ -522,21 +522,24 @@ F4 建立独立 `test_fal`，迁移 srv_init 内的业务断言、协议拒绝�
 
 ## 跨会话接力断点
 
-当前工作树基线 HEAD `ff73a9e`、分支 `task/fal-service-capabilities`，F3d–F3f 与相关验收 fixture 改动尚未提交；保留现存所有未提交改动，提交/合并/push 仍需分别授权。F3d 登记/发现、D1–D5 findings 及验收证据见 §8；F3e 的公共 Open/Stream 与 A/B provider 收口见 §9。
+本工作记录对应 F3d–F3f、F4 与本轮故障验证收口；实现、正式 A/B 消费者、验收预算和文档均已纳入本次提交。F3d 登记/发现、D1–D5 findings 及验收证据见 §8；F3e 的公共 Open/Stream 与 A/B provider 收口见 §9。
 
-F3f 已在正式 A/B 进程接通条件 Open、`CreatedTarget`、同/跨 provider 流 Copy、单 Runtime Task 双端泵、可选外部取消与 typed 清理 owner。最新入口与剩余注入限制见 §10；core/stress 中 B 已接受至少 4 KiB 后的用户线程取消、预取消、不误删替代者、Unsent/Sent RPC owner、host 122 项、`just check`、七面 clippy 与修复后完整 `just acceptance` 均通过。阶段日志：`artifacts/f3f-final-check.log`、`artifacts/f3f-final-host-tests.log`、`artifacts/f3f-owner-final-acceptance.log`；最新 F4 代码的整体验收见下文。
+F3f 已在正式 A/B 进程接通条件 Open、`CreatedTarget`、同/跨 provider 流 Copy、单 Runtime Task 双端泵、可选外部取消与 typed 清理 owner。最新入口与剩余注入限制见 §10；core/stress 中 B 已接受至少 4 KiB 后的 provider 退出、资源表配额饱和/恢复、不误删替代者、Unsent/Sent RPC owner、host 122 项、`just check`、七面 clippy 与修复后完整 `just acceptance` 均通过。阶段日志：`artifacts/f3f-final-check.log`、`artifacts/f3f-final-host-tests.log`、`artifacts/f3f-owner-final-acceptance.log`；最新 F4 代码的整体验收见下文。
 
 F4 当前接线已闭合：`srv_init` 的 `launch_fal_consumer`、`launch_secondary_fs` 和 `run` 掌握 A/B 启动、阶段通知、ProviderReport、ProcessControl 与 ProviderClosed 监督；`user/tests/test_fal/src/{lib,main}.rs` 拥有独立 A/B 业务断言、Create 不确定性/回复隔离、普通流内容/冻结终点、完成终态和 provider CLOSED 后未投递观察。`librpc::CallOperation` 以单一状态机提供发送/回复/Abort/Drop 收束；`libfal::ClientOperation` 暴露分步调用和分类结果；`libfs::client::copy` 消费分类并双端独立清理。`test_fal` 的 A/目录 sender 裁掉 `GRANT`，B grant 仅由 ServiceRecord 派生，不将 scoped registration authority 或 release/监督权交给消费者。
 
 当前承诺已完成：F4-3 调用模型与 RPC→FAL→Create、F4-2 业务断言移交、F4 退出与故障组合均已接通并通过结构复核。
-最终收口已完成：按 REVIEW 核对契约、owner、失败收束、必要复杂度、临时结构及删除条件；`just check`、`just clippy`、受影响代码构建与完整 `just acceptance` 均通过。剩余 OOM、强制 close、Gate source refusal 仅因没有稳定正式注入入口保留为验证限制，不影响当前已承诺路径的结构闭合。
+最终收口已完成：按 REVIEW 核对契约、owner、失败收束、必要复杂度、临时结构及删除条件；`just check`、`just clippy`、受影响代码构建与完整 `just acceptance` 均通过。资源表配额拒绝/恢复及 B 中途退出 Copy 已形成 core/stress target 证据；OOM、强制 close、Gate source refusal 仍因没有稳定正式注入入口保留为验证限制，不影响当前已承诺路径的结构闭合。
 
-最终完整代码验收：`artifacts/fal-f4-acceptance-final.log`，包含七面 clippy、virt stress 16/16、virt release core、sifive_u core、virt-nofd 及三类 boot-failure；`artifacts/fal-f4-check.log` 与 `artifacts/fal-f4-clippy.log` 为对应静态证据。
+最终完整代码验收：`artifacts/fal-fault-acceptance-final-3.log`，包含七面 clippy、virt stress 16/16、virt release core、sifive_u core、virt-nofd 及三类 boot-failure；本轮 stress 计时见 `artifacts/fal-fault-virt-stress-420.time`（`real 221.52s`），聚合计时见 `artifacts/fal-fault-acceptance-final-3.time`（`real 399.88s`）。core/stress 及静态证据分别见 `artifacts/fal-fault-virt-core.log`、`artifacts/fal-fault-virt-stress-420.log` 与 `artifacts/fal-fault-clippy.log`。
 
 | 保留限制 / owner | 触发与删除条件 |
 |---|---|
-| F3d 正式服务来源登记拒绝难以稳定注入；owner 为 §8/F4 | 现以 Runtime host Gate/退款、注册 owner 链及真实 stress 覆盖；仅在真实准入拒绝可稳定复现时补独立验收，不能假称已注入。|
-| F3f Close/OOM/损坏 Reply 缺稳定入口；owner 为 §10/F4 | 现由 typed 返还与 host/真实取消/结构核对证明本地责任；F4 创建真正双 provider 消费者后构造可控故障，若对应分支仍无法稳定触发，记录具体边界与复核条件，不能将缺口算作已验。|
-| F3f provider 中途退出、最终失败及未知创建的系统矩阵 | F4 已在 `test_fal` 正式 A/B 验证已投递 Create 未知、provider CLOSED 后未投递、双端取消与退出退款；稳定入口缺失的强制最终后端失败/close 注入仍由 typed owner 与代码审查覆盖，待未来出现正式触发条件时复核。 |
+| F3d 正式服务来源登记拒绝难以稳定注入；owner 为 §8/F4 | Runtime 的 source 预算按最大存活任务预付，正式 provider 对 `RequestFailure::Source` 进入 fatal 路径；正常流量不能把它当业务级拒绝。本轮补充资源表配额耗尽/释放恢复，source refusal 继续由 Runtime host Gate/退款与预算结构证据覆盖；只有预算异常可复现时才新增 target 验收。|
+| F3f Close/OOM/损坏 Reply 缺稳定入口；owner 为 §10/F4 | 真正堆 OOM 没有正式耗尽旋钮，provider 单线程下 tunnel close 失败条件不可达，正式 srv_fs 没有损坏 Create reply 的生产者；本轮不增加测试专用 opcode、服务或内核钩子，继续由 typed owner、host affine close/分配失败和真实取消/回复隔离证据覆盖。|
+| F3f provider 中途退出、最终失败及未知创建的系统矩阵 | 本轮在 `test_fal` 正式 A/B 中新增 B 已接受部分数据后的在途 Copy：消费者报告 armed，init 释放 B，Copy 观察部分进度、失败和目标 owner/清理边界，再复用既有 ProviderClosed/退出退款对账；强制后端最终失败仍无正式制造者，保留上述边界。 |
+| 本轮 FAL 故障验证任务 | 已完成：流表/Watch 配额耗尽后恢复、`COPY_ARMED` 阶段协议及 B 中途退出 Copy 已接入正式 A/B；core/stress、sifive_u、virt-release、virt-nofd、boot-failure 与完整 `just acceptance` 均通过；未引入第二套运行体。|
+
+本轮实现与 core/stress/virt-release/sifive_u/virt-nofd 均已通过；`just clippy`、`just build_user`、`git diff --check` 和 `bash -n tools/qemu-acceptance.sh` 通过。sifive_u 缺失 `public time deadline checks passed:` anchor 的原因已定位为 60 秒路线预算不足，默认值已调整为 120 秒并通过；考虑到 FAL 资源/退出验证继续增长，virt stress 默认值同步从 300 秒放宽为 420 秒。最终 `just acceptance` 通过，实测 `real 399.88s`。
 
 验收 fixture 的两个映像因独立覆盖暂留，后续内核自检审计由其[独立计划](todo-2026-09-23-acceptance-fixture-cleanup.md)承接。

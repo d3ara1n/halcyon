@@ -52,7 +52,7 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 
 常规路线经 `tools/qemu-throttle.sh` 和 `tools/qemu-acceptance.sh`。默认 `THROTTLE=50`，stress 同样节流，不作为全速性能基准；GDB 与全速专项诊断用 `THROTTLE=100`。节流只限制宿主资源占用，全速也仍经过路线的日志、锚点与超时判定。
 
-各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT` 覆盖。默认值只在 Justfile 维护。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
+各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 默认 420 秒，因为竞态矩阵和 FAL 资源/退出组合持续增加；sifive_u 默认 120 秒，因为 128MiB/五 hart 路线在完整 FAL core workload 下需要更长的 QEMU 仿真预算。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
 
 超时负责收割异常停滞，不是性能目标。默认值依据对应 workload 在相同节流条件下的近期正常耗时留出宽裕余量；验收面或运行成本变化时重校。正常运行经常接近上限时，先确认运行身份和进展，再调整 recipe 与文档，不能把基础设施截断当成内核挂死，也不能用放宽超时掩盖缺失业务锚点。调查已定位的早期卡死时可临时收紧。
 

@@ -33,7 +33,7 @@ use rinlib::{
     shared::call::SystemCallError,
     shared::{
         message::MAILBOX_CAPACITY,
-        object::{ObjectSignals, Rights},
+        object::{Handle, ObjectSignals, Rights},
         wait::{WaitItem, WaitReason},
     },
     time,
@@ -353,6 +353,111 @@ fn exercise_property_watch(
         return Err("FAL consumer cancelled root Watch received Delete");
     }
     drop(root_watch);
+    Ok(())
+}
+
+fn exercise_resource_quota_recovery(
+    client: &mut Client,
+    transport: &mut Transport,
+    stream: &resolve::Position<Grant>,
+    grant: &MailboxSender,
+    deadline: time::Deadline,
+) -> Result<(), &'static str> {
+    const STREAM_LIMIT: usize = 15;
+    const WATCH_LIMIT: usize = 24;
+    let mut streams = Vec::new();
+    for _ in 0..STREAM_LIMIT {
+        let stream = transport
+            .open_stream(
+                stream,
+                protocol::StreamDirection::Read,
+                0,
+                Some(1),
+                deadline,
+            )
+            .map_err(|_| "FAL consumer stream quota setup failed")?;
+        streams.push(stream);
+    }
+    match transport.open_stream(
+        stream,
+        protocol::StreamDirection::Read,
+        0,
+        Some(1),
+        deadline,
+    ) {
+        Err(libfs::client::StreamOpenFailure::Call(
+            libfal::client::ClientError::Status(protocol::Status::Quota),
+        )) => {}
+        Ok(stream) => {
+            stream
+                .close()
+                .map_err(|_| "FAL consumer over-quota stream close failed")?;
+            return Err("FAL consumer stream quota was not enforced");
+        }
+        Err(_) => return Err("FAL consumer stream quota returned the wrong error"),
+    }
+    for stream in streams {
+        stream
+            .close()
+            .map_err(|_| "FAL consumer stream quota recovery close failed")?;
+    }
+    let recovered = transport
+        .open_stream(
+            stream,
+            protocol::StreamDirection::Read,
+            0,
+            Some(1),
+            deadline,
+        )
+        .map_err(|_| "FAL consumer stream quota did not recover")?;
+    recovered
+        .close()
+        .map_err(|_| "FAL consumer recovered stream close failed")?;
+
+    let mut watches = Vec::new();
+    loop {
+        match client.subscribe(grant, "", protocol::WatchMask::CREATE, deadline) {
+            Ok(watch) if watches.len() < WATCH_LIMIT => watches.push(watch),
+            Ok(watch) => {
+                client
+                    .unsubscribe(&watch, deadline)
+                    .map_err(|_| "FAL consumer over-quota Watch cleanup failed")?;
+                return Err("FAL consumer Watch quota was not enforced");
+            }
+            Err(libfal::client::ClientError::Status(protocol::Status::Quota)) => break,
+            Err(_) => return Err("FAL consumer Watch quota returned the wrong error"),
+        }
+    }
+    if watches.is_empty() {
+        return Err("FAL consumer Watch quota setup failed");
+    }
+    debug!("FAL2 Watch quota saturated at {} subscriptions", watches.len());
+    for watch in watches {
+        client
+            .unsubscribe(&watch, deadline)
+            .map_err(|_| "FAL consumer Watch quota recovery cleanup failed")?;
+    }
+    let recovered = loop {
+        match client.subscribe(grant, "", protocol::WatchMask::CREATE, deadline) {
+            Ok(watch) => break watch,
+            Err(libfal::client::ClientError::Status(protocol::Status::Quota)) => {
+                if time::expired(deadline)
+                    .map_err(|_| "FAL consumer Watch quota recovery clock failed")?
+                {
+                    return Err("FAL consumer Watch quota did not recover");
+                }
+                time::sleep_until(
+                    time::timeout_millis(1)
+                        .map_err(|_| "FAL consumer Watch quota recovery deadline failed")?,
+                )
+                .map_err(|_| "FAL consumer Watch quota recovery sleep failed")?;
+            }
+            Err(_) => return Err("FAL consumer Watch quota recovery returned the wrong error"),
+        }
+    };
+    client
+        .unsubscribe(&recovered, deadline)
+        .map_err(|_| "FAL consumer recovered Watch cleanup failed")?;
     Ok(())
 }
 
@@ -1861,6 +1966,167 @@ fn exercise_copy_after_progress_cancel(
         .map_err(|_| "FAL consumer midflight cancel close failed")?;
     Ok(())
 }
+
+fn exercise_copy_during_provider_shutdown(
+    transport: &mut Transport,
+    namespace: &PrefixTable<Arc<MailboxSender>>,
+    first_parent: &Grant,
+    second_parent: &Grant,
+    report_signaler: Handle,
+    deadline: time::Deadline,
+) -> Result<(), &'static str> {
+    let rights = FalRights::READ_STREAM | FalRights::WRITE_STREAM;
+    let mut client = Client::new();
+    let created = client
+        .call(
+            first_parent.endpoint(),
+            &Request::Create {
+                name: "consumer-copy-mid-source",
+                kind: NodeKind::Stream,
+                rights,
+                value: &[],
+            },
+            deadline,
+        )
+        .map_err(|_| "FAL consumer midflight source Create failed")?;
+    let (_, Response::Node(_)) = protocol::decode_response(&created.payload)
+        .map_err(|_| "FAL consumer midflight source reply invalid")?
+    else {
+        return Err("FAL consumer midflight source shape invalid");
+    };
+    let position = resolve::resolve(
+        transport,
+        namespace,
+        "/consumer-copy-mid-source",
+        protocol::ResolvePolicy::FollowAll,
+    )
+    .map_err(|_| "FAL consumer midflight source resolve failed")?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(65_536)
+        .map_err(|_| "FAL consumer midflight source allocation failed")?;
+    for index in 0..65_536 {
+        data.push((index % 251) as u8);
+    }
+    let mut write = transport
+        .open_stream(
+            &position,
+            protocol::StreamDirection::Write,
+            0,
+            Some(data.len() as u64),
+            deadline,
+        )
+        .map_err(|_| "FAL consumer midflight source Open failed")?;
+    write
+        .write_until(&data, deadline)
+        .map_err(|_| "FAL consumer midflight source Write failed")?;
+    write
+        .end_write()
+        .map_err(|_| "FAL consumer midflight source EOF failed")?;
+    let info = transport
+        .finish_stream(&write, deadline)
+        .map_err(|_| "FAL consumer midflight source Finish failed")?;
+    if info.outcome != protocol::Status::Ok || info.accepted != data.len() as u64 {
+        return Err("FAL consumer midflight source incomplete");
+    }
+    write
+        .close()
+        .map_err(|_| "FAL consumer midflight source close failed")?;
+
+    let observer = second_parent.clone();
+    let watcher = rinlib::thread::Builder::new()
+        .spawn(move || -> Result<(), SystemCallError> {
+            let mut observer_client = Client::new();
+            loop {
+                match observer_client.call(
+                    observer.endpoint(),
+                    &Request::Lookup {
+                        path: "consumer-copy-mid-target",
+                    },
+                    deadline,
+                ) {
+                    Ok(reply) => {
+                        if let Ok((_, Response::Node(node))) =
+                            protocol::decode_response(&reply.payload)
+                            && node.size >= 4096
+                        {
+                            notification::signal(report_signaler, report::COPY_ARMED)?;
+                            break Ok(());
+                        }
+                    }
+                    Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {}
+                    Err(_) => return Err(SystemCallError::InternalError),
+                }
+                if time::expired(deadline)? {
+                    return Err(SystemCallError::DeadlineExpired);
+                }
+                time::sleep_until(time::timeout_millis(1)?)?;
+            }
+        })
+        .map_err(|_| "FAL consumer midflight watcher spawn failed")?;
+    let result = transport.copy_stream(libfs::client::CopyRequest {
+        source: &position,
+        destination_parent: second_parent,
+        destination_name: "consumer-copy-mid-target",
+        destination_rights: rights,
+        deadline,
+        cancel: None,
+    });
+    watcher
+        .join()
+        .map_err(|_| "FAL consumer midflight watcher join failed")?;
+    let Err(mut result) = result else {
+        return Err("FAL consumer midflight Copy ignored provider shutdown");
+    };
+    if result.target_bytes < 4096 || result.target_bytes > data.len() as u64 {
+        return Err("FAL consumer midflight Copy progress or owner mismatch");
+    }
+    let _target = result
+        .take_target()
+        .ok_or("FAL consumer midflight target missing")?;
+    let current = client
+        .call(
+            first_parent.endpoint(),
+            &Request::Lookup {
+                path: "consumer-copy-mid-source",
+            },
+            deadline,
+        )
+        .map_err(|_| "FAL consumer midflight source lookup failed")?;
+    let (_, Response::Node(current)) = protocol::decode_response(&current.payload)
+        .map_err(|_| "FAL consumer midflight source lookup reply invalid")?
+    else {
+        return Err("FAL consumer midflight source lookup shape invalid");
+    };
+    loop {
+        match client.call(
+            first_parent.endpoint(),
+            &Request::Delete {
+                name: "consumer-copy-mid-source",
+                expected: protocol::Expected {
+                    identity: current.identity,
+                    version: current.version,
+                },
+            },
+            deadline,
+        ) {
+            Ok(_) => break,
+            Err(libfal::client::ClientError::Status(protocol::Status::Busy)) => {
+                if time::expired(deadline)
+                    .map_err(|_| "FAL consumer midflight cleanup clock failed")?
+                {
+                    return Err("FAL consumer midflight source cleanup timed out");
+                }
+                time::sleep_until(
+                    time::timeout_millis(10)
+                        .map_err(|_| "FAL consumer midflight cleanup retry deadline failed")?,
+                )
+                .map_err(|_| "FAL consumer midflight cleanup retry sleep failed")?;
+            }
+            Err(_) => return Err("FAL consumer midflight source cleanup failed"),
+        }
+    }
+    Ok(())
+}
 fn run() -> Result<(), &'static str> {
     let (primary, primary_desc) =
         MailboxSender::from_capability(startup_capability(startup::PRIMARY_ROOT)?)
@@ -2152,6 +2418,7 @@ fn run() -> Result<(), &'static str> {
             &secondary_parent,
             deadline,
         )?;
+        debug!("FAL2 independent Copy conflict and empty variants passed");
         exercise_copy_after_progress_cancel(
             &mut transport,
             &namespace,
@@ -2189,6 +2456,14 @@ fn run() -> Result<(), &'static str> {
         debug!("FAL2 independent Open reply authority retired after abandonment");
         exercise_stream_contents(&mut transport, &primary_stream, deadline)?;
         debug!("FAL2 independent stream content and frozen read passed");
+        exercise_resource_quota_recovery(
+            &mut client,
+            &mut transport,
+            &primary_stream,
+            &primary,
+            deadline,
+        )?;
+        debug!("FAL2 resource quota saturation and recovery passed");
         let watch = client
             .subscribe(&primary, "", protocol::WatchMask::CREATE, deadline)
             .map_err(|_| "FAL consumer Watch subscription failed")?;
@@ -2255,6 +2530,15 @@ fn run() -> Result<(), &'static str> {
             exercise_property_watch(&mut client, grant, deadline)?;
         }
         debug!("FAL2 independent Create Modify and Delete Watch passed");
+        exercise_copy_during_provider_shutdown(
+            &mut transport,
+            &namespace,
+            &DirectoryGrant::new(primary.clone()),
+            &secondary_parent,
+            report_signaler.as_handle(),
+            deadline,
+        )?;
+        debug!("FAL2 in-flight Copy provider shutdown passed");
     }
     drop(directory);
     notification::signal(report_signaler.as_handle(), report::COMPLETE)

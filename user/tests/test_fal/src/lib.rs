@@ -17,4 +17,5 @@ pub mod report {
     pub const SECONDARY_DISCOVERED: u64 = 2;
     pub const COMPLETE: u64 = 4;
     pub const PROVIDER_CLOSED: u64 = 8;
+    pub const COPY_ARMED: u64 = 16;
 }
