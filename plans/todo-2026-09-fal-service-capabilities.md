@@ -1,16 +1,16 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：F0–F3f 与 F4-1/F4-2/F4-3 已在未提交工作树接通，并完成分层、结构与组合验证；正式服务来源登记拒绝、OOM、强制 close 和 Gate source refusal 因无稳定外部注入入口保留为验证限制，不宣称已注入。F4 已完成独立 `test_fal` 的 A/B 能力链、业务消费者迁移、RPC→FAL→Create 生命周期、provider 退出观察和整体验收；当前基本 FAL 交付完成，后续只处理固定提交 Review 或明确触发的验证限制。
+> 状态：基本 FAL 的 F0–F4 能力与真实消费者已完成，闭包提交为 `dda8a5b`，后续故障验证及验收预算提交为 `5b29915`（已合入 `master`）。正式服务来源登记拒绝、OOM、强制 close 和 Gate source refusal 因无稳定正式注入入口保留为验证限制，不宣称已注入；后续由[固定提交 Review](todo-2026-09-24-fal-kernel-closure-review.md)或下文明确的触发条件接手。
 >
-> 本文件唯一拥有基本 FAL 的剩余设计、施工、残留与整体完成门，不另建平行设计计划。统一流程遵循 `AGENTS.md`；方向契约进入 `notes/ideas/`，实现事实进入 `notes/impls/`，本文只记录任务特有的决策、依赖和证据。固定提交 Review 保留原证据，不重复安排本文件拥有的实施。
+> 本文件唯一保存基本 FAL 的交付范围、设计裁决、施工与验证证据及保留限制。统一流程遵循 `AGENTS.md`；方向契约进入 `notes/ideas/`，实现事实进入 `notes/impls/`，本文只记录任务特有的决策、依赖和证据。固定提交 Review 不重复安排本文件已完成的实施。
 
 ## 1. 接手基线与证据
 
 ### 当前代码与文档基线
 
-- 开发分支：`task/fal-service-capabilities`，从本地 `master` 的 `5d406a4` 分出。
-- F1–F3c 历史连续实现基线：`dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`；库知识、目录与命名重排：`96ee03b0d1641c86ed8ab05951bad6954ea84db4`；早期文档接手 HEAD `3607f22` 当时工作树干净。当前 HEAD/工作树以文末跨会话断点为准。
-- 跨阶段边界与 F3d 设计固定提交：`1000270ef2b54c35bc56acda10943dd94c0e7e12`；[未来设计 Review](todo-2026-09-21-fal-service-design-review.md) 在提交后登记，待实现闭包完成后执行，不阻塞 F3d，也不作为运行能力交付证据。
+- 历史开发分支 `task/fal-service-capabilities` 从 `5d406a4` 分出；闭包提交 `dda8a5b` 经 `7b04c81` 合入 `master`，追加故障验证提交 `5b29915`。本记录不以旧开发分支或未提交工作树作为当前接手基线；实际 HEAD/工作树仍须在接手时核对。
+- F1–F3c 历史连续实现基线：`dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`；库知识、目录与命名重排：`96ee03b0d1641c86ed8ab05951bad6954ea84db4`；早期文档接手 HEAD `3607f22` 当时工作树干净。
+- 跨阶段边界与 F3d 设计固定提交：`1000270ef2b54c35bc56acda10943dd94c0e7e12`；[设计 Review](todo-2026-09-21-fal-service-design-review.md) 已登记且实现对照提交 `dda8a5b` 已具备，待排期执行；文档提交本身不作为运行能力交付证据。
 - 当前实现入口：[`FAL`](../notes/impls/fal.md)、[`RPC`](../notes/impls/rpc.md)、[`Runtime`](../notes/impls/runtime.md)、[`Runnel`](../notes/impls/runnel.md)、[`启动`](../notes/impls/startup.md)。组件命名与依赖先读 [`user/README.md`](../user/README.md) 和 [`user/libraries/README.md`](../user/libraries/README.md)。
 - 方向入口：`notes/ideas/{fal,fs,service,framework,message,wait,time,rpc,tunnel,runnel}.md`。方向文档不是实现完成证据；当前代码也不自动决定未来边界。
 
@@ -66,9 +66,9 @@ F4 汇合 F3d、F3e、F3f 的全部责任。施工顺序保持「设计 → F3d 
 | 任务 | 当前状态 | 前置与真实消费者 | 完成边界 |
 |---|---|---|---|
 | 剩余能力设计闭包 | F3d–F3f 与 F4 当前设计、实现、结构复核和组合验收均已收口；验证限制单独保留 | Memory/Registry 双域、A→B 委托与发现、A/B provider、`test_fal` 与 init 监督消费者 | 当前承诺完成；未来正式注入入口出现时沿所属机制复核，不在测试进程重建机制 |
-| F3d（含 F3a/F3c 回溯修复） | 当前未提交工作树已完成代码、结构复核与组合验收；保留正式来源拒绝注入限制 | Memory/Registry 双域、A→B 委托与发现、init namespace 消费者 | §8.10 修复与证据已记录；继续保留现有代码供 F3e 依赖，不归档整体 FAL 记录 |
-| F3e | 已完成当前 Open/流闭包；完整验收、正式消费者与结构检查见第 9 节，特定故障注入缺口有唯一触发记录 | F3b、typed Tunnel/Runnel、Runtime/Outbox；provider 与正式流客户端 | F3f 在已验证的流完成/退款契约上组合 Copy，不制造新运输运行体 |
-| F3f | 条件 Open、独占目标与双端 Copy 已接通；§10 有当前证据及故障注入限制 | F3e、稳定位置与独占 Create；libfs 双端复制调用者 | 双端最终失败等未验场景归 F4-3，揭示生产缺陷即回 §10 修复 |
+| F3d（含 F3a/F3c 回溯修复） | 已提交并通过代码、结构与组合验收；保留正式来源拒绝注入限制 | Memory/Registry 双域、A→B 委托与发现、init namespace 消费者 | §8.10 记录修复与证据；新缺陷回到所属责任链处理 |
+| F3e | Open/流闭包已提交；完整验收、正式消费者与结构检查见第 9 节 | F3b、typed Tunnel/Runnel、Runtime/Outbox；provider 与正式流客户端 | 特定故障注入限制见 §9，发现生产缺陷回 §9 修复 |
+| F3f | 条件 Open、独占目标与双端 Copy 已提交；§10 有证据及故障注入限制 | F3e、稳定位置与独占 Create；libfs 双端复制调用者 | B 中途退出 Copy 已补验；强制后端最终失败等无正式入口场景按 §10/下文限制处理 |
 | F4 | F4-1、F4-2、F4-3 均已完成；RPC→FAL→Create、普通业务迁移、退出观察、双端清理和完整故障组合已闭合 | F3d–F3f 的正式 A/B provider、`test_fal` 与 init 监督消费者 | `just check`、七面 clippy、完整 `just acceptance` 通过；OOM/强制 close/Gate source refusal 因无稳定正式注入入口保留验证限制 |
 
 公共接缝按共同契约与长期变化边界组织，不按文件或 opcode 拆成独立交付。可为未来能力提前设计或建设独立基础；涉及当前责任链的结构调整在本闭包整体完成，独立前置另行立案并链接。实施顺序不限制设计视野，不为维持局部步骤而引入随后必拆的补丁。
@@ -107,13 +107,13 @@ F4 汇合 F3d、F3e、F3f 的全部责任。施工顺序保持「设计 → F3d 
 
 首个拓扑、Backend/provider 接缝、身份/注册协议、平面投影、Directory Record Read、Watch 唤醒承载及 F3d 全失败矩阵见第 8 节。长期契约写入 `notes/ideas/{service,fal,framework}.md`。保留 RegistrationControl sender 的不复用身份作为 instance，依据是内核对象身份与消息 context 的真实契约，不把它当秘密或节点身份。
 
-| 边界 | 唯一 owner / 当前裁决 | 尚待局部设计的内容 |
+| 边界 | 唯一 owner / 当前责任 | 实施与证据入口 |
 |---|---|---|
-| 发布—发现—调用 | A 承载服务目录，B 发布 FAL2 根，init 经发现调用 B 并装配 route；F4 迁移业务消费者至 test_fal | 无阻塞拓扑选择；具体代码容量由第 8.6 节成本公式核算 |
-| 服务到 FAL | Registry 既是注册状态 owner 又是受控 Backend；libfal 的 provider/出口/Watch 通用，绝不依赖 libservice | F3d 实施内部类型/文件拆分不改变责任 |
-| FAL 到 Open | A/B 的 MemoryBackend 是真实流后端；F3e 在同一 provider/Runtime 内按已鉴权稳定节点形成 owned Open lease，交给数据及控制任务；Registry 对流操作拒绝 | 第 9 节详细 wire、lease 类型、非快照读并发行为、空闲/结果保留政策和控制状态机 |
-| 流客户端到 Copy | 当前 init 通过 libfs 正式流客户端操作 A/B；F4-2 将这些业务断言迁到已启动的 test_fal。Copy 的唯一状态机组合稳定位置、两端 Open/Runnel/最终结果 | 第 10 节 API、两端停止顺序、结果结构；不新建复制服务或阻塞泵 |
-| 付款到退出 | 各 provider 的可信授权账户支付自身元数据/派生 grant，PoolBinding 支付将来的流 backing；客户端支付自身缓冲/执行。Runtime 管观察，业务 owner 管状态/退休，init 持根监督 | F3e 的映射/Invitation/Endpoint 成本，F3f 的缓冲及未确认进度；开工前预付，不能留给全局 mapping 延期 |
+| 发布—发现—调用 | A 承载服务目录，B 发布 FAL2 根；init 经发现装配 route 并持根监督，`test_fal` 执行业务调用 | 第 8 节的身份、容量与注册证据；第 12 节的消费者迁移 |
+| 服务到 FAL | Registry 既是注册状态 owner 又是受控 Backend；libfal 的 provider/出口/Watch 通用，不依赖 libservice | 第 8 节的接缝与失败矩阵 |
+| FAL 到 Open | A/B 的 MemoryBackend 是流后端；provider/Runtime 按已鉴权稳定节点形成 owned Open lease，交给数据及控制任务；Registry 拒绝流操作 | 第 9 节的 wire、lease、终态与清理证据 |
+| 流客户端到 Copy | `test_fal` 经 libfs 正式流客户端操作 A/B；Copy 组合稳定位置、两端 Open/Runnel 和最终结果，init 仅持监督责任 | 第 10 节的 Copy owner 与第 12 节的正式消费和退出验证 |
+| 付款到退出 | provider 授权账户支付元数据/派生 grant，PoolBinding 支付流 backing；客户端支付缓冲/执行。Runtime 管观察，业务 owner 管状态/退休，init 持根监督 | 第 8–12 节的预付、停止和归零证据；正式故障注入限制见文末 |
 
 跨阶段的线性化顺序固定：发现完整 snapshot 取得 → 异步能力派生/回复交付；Open 的稳定节点鉴权/pin → offer 交付 → Attach 确认及 Start → 后端接受/业务结果 → 退休；Copy 的目标独占 Create → 双端连接/搬运 → 两端业务成功 → 自身退休。传输入箱、环进度、业务提交、已知结果与退款互不替代。已接通的 Open 回复 slot 0=StreamControl、slot 1=Invitation；当前 owner/失败行为见 §9 与实现说明。
 
@@ -165,16 +165,11 @@ Halcyon 的摘名/撤权边界由本地 capability/GrantTable 寿命契约独立
 - 所有锁序、跨线程/跨 hart 影响、最后引用析构与关闭停驻成本均在开工审计中核对。用户态单状态拥有者不能跨下游 RPC/流等待持后端锁；不为当前单线程消费者预建多线程运行体。
 - 当前正常清理不能依赖杀进程兜底；失败保留可继续处理的 owner。监督者 ProcessDrain 是异常最终接管，不是正常关闭协议的替代物。
 
-## 7. 唯一残留与接通清单
+## 7. 接通与保留限制
 
-本表导航本专题尚待核定/接通的责任，不把全部已有实现定性为临时代码。owner 指闭包实施者；详细处置只写在所链接的所属章节，完成后从表删除或转为长期 notes。此次方向检查的正确性项、减法候选及触发条件统一在 §12「结构优先与回顾简化」，不在这里复制。
+施工期的 Open/Copy 正式消费者迁移、init 普通业务断言移交、RPC→FAL→Create 分类、双端清理和 Record 组合验证已在 F4 完成；对应实现、删除项及证据见 §9–12。B 已接受部分数据后的 provider 退出与资源表配额拒绝/恢复由后续 `5b29915` 补验。当前没有待迁移的 F4-2/F4-3 残留，也不为验收恢复 raw 工厂或第二套运行体。
 
-| 现状与位置 | 目标与责任 owner | 触发、保留期限与完成/删除门 |
-|---|---|---|
-| Open/StreamControl/provider 数据任务已接通且 F3e 结构/组合门通过；来源拒绝、强制 close 等无稳定入口的注入限制见 §9 | F4-2 将现有 Open 业务断言迁至 test_fal，F4-3 按真实边界补可控故障 | 迁移时删 init 对应断言；若独立故障场景暴露生产 owner 缺陷，回 §9 修复，不恢复 raw 工厂或第二套 WaitSet |
-| 无 capability 属性 Copy 与双端流 Copy 均已接通，普通 Copy 消费者已迁入 test_fal；双端最终失败、未知创建与 provider 中途退出仍缺组合证据 | F4-3 证明失败结果与退款，具体续作见 §12 | 按长期调用/组合模型完善操作接缝；复用正式 A/B，不建测试专用泵或服务 |
-| 主要业务已迁入 `test_fal`，init 仍有 Open/回读等普通断言与监督剧本混合；route 当前仅一个绑定槽 | F4-2 剩余移交与删除条件见 §12；init 保留正式装配/监督 | 单 route 可保留，扩容由真实拓扑触发；迁移删除同义断言而不扩大测试协议 |
-| Record 生产往返、多嵌套能力组合尚缺完整独立验收矩阵 | F4 对 F3b 正式 API 补组合验证 | 第 12 节逐项证明完整快照、槽/权限/失败 owner，不借测试引入第二套实现 |
+无稳定正式入口的来源拒绝、OOM、强制 close、Gate source refusal 与强制后端最终失败仍是验证限制；各自 owner、触发和删除条件见文末「保留限制 / owner」表。单 route 绑定槽可保留，真实拓扑扩容时再核定。
 
 ## 8. 服务注册与发现
 
@@ -324,7 +319,7 @@ F3d 接通 **repeatable DirectoryGrant 的普通 Record Read**，MemoryBackend �
 | D4 provider 边界 | 已完成（按重评边界） | `libfal::provider` 拥有 State/Retirement/Grant/Watch；srv_fs 保留 Read/Delegate/Request、Dispatcher、route、注册和停止编排；不预建 DispatchPort |
 | D5 组合验证 | 已完成 | `just check`、七面 clippy、host 包测试、virt stress/core、sifive_u、virt-nofd、boot-failure、ServiceResource/FAL/Execution 归零通过；fixture 映像已零复制借用 |
 
-D0–D5 与下述结构修复在当前未提交工作树已收口。正式服务来源拒绝的动态注入仍是验证限制；当现有入口出现可控来源拒绝条件或真实消费者触发时，F3d owner 须用正式服务链复核资源返还，不为制造用例新增测试运行体。验收 fixture 生命周期清理另有独立计划；不重新开启已关闭的 D4 Dispatcher facade 方向。
+D0–D5 与下述结构修复已随闭包提交收口。正式服务来源拒绝的动态注入仍是验证限制；当现有入口出现可控来源拒绝条件或真实消费者触发时，F3d owner 须用正式服务链复核资源返还，不为制造用例新增测试运行体。验收 fixture 生命周期清理另有独立计划；不重新开启已关闭的 D4 Dispatcher facade 方向。
 
 ### 8.10 最终结构复核结果
 
@@ -518,11 +513,11 @@ F4 建立独立 `test_fal`，迁移 srv_init 内的业务断言、协议拒绝�
 - 当前承诺全闭合后：`just check`、`just clippy`、相关 os/shared/user host 与完整 `just acceptance`，覆盖 debug stress、release core、sifive_u、virt-nofd 和 boot-failure；涉及调度域契约另跑 virt-hetero。新增库/独立 binary 同步纳入 workspace、构建、lint 和 workload，不遗漏 target 分面。
 - 长命令完整日志写 artifacts，保留退出码；默认节流、超时按现行 recipe。正常负载成本变化时重校超时，不把截断判为内核故障；退出后确认无残留进程。历史通过或全速诊断不替代本次需要的组合证据。
 - 结构收口核对最终类型/authority/owner、重复真值、旧路径、失败退款、锁序、有界性、文档及已有 findings；当前承诺已闭合，剩余仅为明确记录的外部注入验证限制，影响当前正确性的事项不得延期。
-- F3d–F3f 的真实消费者、全部清理、旧路径删除及本节组合门已成立，整体基本 FAL 交付完成。同步 impls/COMPASS；本计划保留至提交前摘要与归档手续完成，提交前展示摘要并取得授权，提交后登记固定提交 Review。commit、合并、push 分别取得授权。
+- F3d–F3f 的真实消费者、全部清理、旧路径删除及本节组合门已成立，整体基本 FAL 交付完成；实现说明已同步，`dda8a5b` 与 `5b29915` 的固定提交 Review 由[审查计划](todo-2026-09-24-fal-kernel-closure-review.md)承接。本记录保留交付证据与触发限制；历史提交/合并过程不作为现行接力指令。
 
 ## 跨会话接力断点
 
-本工作记录对应 F3d–F3f、F4 与本轮故障验证收口；实现、正式 A/B 消费者、验收预算和文档均已纳入本次提交。F3d 登记/发现、D1–D5 findings 及验收证据见 §8；F3e 的公共 Open/Stream 与 A/B provider 收口见 §9。
+本工作记录对应 F3d–F3f、F4 与后续故障验证收口；实现和正式 A/B 消费者在 `dda8a5b` 闭合，补充故障验证与验收预算在 `5b29915` 提交。F3d 登记/发现、D1–D5 findings 及验收证据见 §8；F3e 的公共 Open/Stream 与 A/B provider 收口见 §9。
 
 F3f 已在正式 A/B 进程接通条件 Open、`CreatedTarget`、同/跨 provider 流 Copy、单 Runtime Task 双端泵、可选外部取消与 typed 清理 owner。最新入口与剩余注入限制见 §10；core/stress 中 B 已接受至少 4 KiB 后的 provider 退出、资源表配额饱和/恢复、不误删替代者、Unsent/Sent RPC owner、host 122 项、`just check`、七面 clippy 与修复后完整 `just acceptance` 均通过。阶段日志：`artifacts/f3f-final-check.log`、`artifacts/f3f-final-host-tests.log`、`artifacts/f3f-owner-final-acceptance.log`；最新 F4 代码的整体验收见下文。
 

@@ -2,16 +2,16 @@
 
 ## 状态与决定
 
-已完成。用户于 2026-09-22 明确：全仓组件身份规则继续生效，`os/kernel/` 的 Rust package、默认 binary target 与 crate identifier 统一为 `kernel`；`erhino_kernel` 已清理，不是命名例外。系统品牌 Halcyon、微内核专名 eRhino 与用户态基础库 rinlib 不受此构建身份迁移影响。
+已完成，随 `dda8a5b` 提交并经 `7b04c81` 合入 `master`；提交后的独立检查由[固定审查计划](todo-2026-09-24-fal-kernel-closure-review.md)承接。用户于 2026-09-22 明确：全仓组件身份规则继续生效，`os/kernel/` 的 Rust package、默认 binary target 与 crate identifier 统一为 `kernel`；`erhino_kernel` 已清理，不是命名例外。系统品牌 Halcyon、微内核专名 eRhino 与用户态基础库 rinlib 不受此构建身份迁移影响。
 
 本计划承接 FAL 完成后的内核构建身份整改；改名不改变内核 ABI、权限或运行语义。
 
 ## 当前事实与目标
 
-- 登记基线：`task/fal-service-capabilities`，FAL 工作树仍含未提交改动；本闭包只同步内核身份相关路径。
+- 历史登记基线：`task/fal-service-capabilities` 当时有未提交的 FAL 改动；本闭包只同步内核身份相关路径。当前提交与合入状态见上文。
 - 目录叶名为 `os/kernel`，package、默认 binary target、Justfile 产物和有效调试/验收入口统一使用 `kernel`。
 - 目标：源码构建身份与有效命令、产物路径统一使用 `kernel`，不保留 package alias、兼容二进制或旧路径副本。
-- owner：本专题实施者；唯一待改清单由本计划承载，其他文档只链接。
+- owner：本专题实施者；改名范围与验证证据由本计划承载，其他文档只链接。
 
 ## 依赖与迁移范围
 
