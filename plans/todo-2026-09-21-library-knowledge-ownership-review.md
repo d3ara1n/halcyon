@@ -40,4 +40,4 @@
 
 未来 reviewer 使用新上下文只读核对固定提交及其父提交，遵循 [Review 纪律](REVIEW.md)。finding 必须给出具体位置、可达性、影响和违反的契约；缺少运行证据与已证实实现缺陷应分开陈述。
 
-F3d 服务注册/发现、`libservice` 的真实 schema/状态机、Open、流 Copy 与独立 `test_fal` 不属于该提交的已交付能力，由 [FAL 总计划](todo-2026-09-fal-service-capabilities.md) 继续拥有。审查完成后归档本计划；本文件的存在不表示 Review 已执行。
+F3d 服务注册/发现、`libservice` 的真实 schema/状态机、Open、流 Copy 与独立 `test_fal` 不属于该固定提交的已交付能力；后续交付证据见 [FAL 档案](archived/todo-2026-09-fal-service-capabilities.md)。审查完成后归档本计划；本文件的存在不表示 Review 已执行。

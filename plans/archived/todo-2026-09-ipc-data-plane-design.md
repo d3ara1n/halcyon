@@ -1,6 +1,6 @@
 # IPC 数据面演进设计
 
-> 状态：**设计已完成（2026-09）**。开始点为 `adef9a7`；用户已确认 MemoryObject-first、显式 MemoryPool、删除 Job 预算职责，以及额度池与全局物理库存分离。实施由 [`../todo-2026-09-memory-object-data-plane.md`](../todo-2026-09-memory-object-data-plane.md) 承接；外部事实摘要见 [`../ref-2026-09-ipc-data-plane-systems.md`](../ref-2026-09-ipc-data-plane-systems.md)。
+> 状态：**设计已完成（2026-09）**。开始点为 `adef9a7`；用户已确认 MemoryObject-first、显式 MemoryPool、删除 Job 预算职责，以及额度池与全局物理库存分离。实施由 [`../todo-2026-09-memory-object-data-plane.md`](todo-2026-09-memory-object-data-plane.md) 承接；外部事实摘要见 [`../ref-2026-09-ipc-data-plane-systems.md`](../ref-2026-09-ipc-data-plane-systems.md)。
 
 ## 驱动问题
 

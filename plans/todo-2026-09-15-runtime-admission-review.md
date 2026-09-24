@@ -29,7 +29,7 @@
 
 ## 完成门
 
-未来 reviewer 使用新上下文只读核对该固定提交，finding 必须给出位置、可达路径、影响与违反的契约。无 finding 后归档本计划；有实际 finding 时由唯一报告承载修复与复核，不复制已有问题。后续 RPC/Outbox 仍由[执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md)拥有。
+未来 reviewer 使用新上下文只读核对固定提交序列，finding 必须给出位置、可达路径、影响与违反的契约。无 finding 后归档本计划；有实际 finding 时由唯一报告承载修复与复核，不复制已有问题。RPC/Outbox 的已交付范围及证据见[执行前置档案](archived/todo-2026-09-13-service-runtime-prerequisites.md)。
 
 ## 提交后的结构审视（2026-09-15，基线 d2d83de）
 

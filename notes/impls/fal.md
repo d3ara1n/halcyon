@@ -1,10 +1,10 @@
 # FAL 实现现状
 
-方向见 [`../ideas/fal.md`](../ideas/fal.md) 与 [`../ideas/fs.md`](../ideas/fs.md)。通用 RPC/Runtime/Runnel 的实现分别由 [`rpc.md`](rpc.md)、[`runtime.md`](runtime.md) 与 [`runnel.md`](runnel.md) 拥有；本篇只记录 FAL 当前代码事实。唯一施工导航是 [`FAL 整体计划`](../../plans/todo-2026-09-fal-service-capabilities.md)。
+方向见 [`../ideas/fal.md`](../ideas/fal.md) 与 [`../ideas/fs.md`](../ideas/fs.md)。通用 RPC/Runtime/Runnel 的实现分别由 [`rpc.md`](rpc.md)、[`runtime.md`](runtime.md) 与 [`runnel.md`](runnel.md) 拥有；本篇只记录 FAL 当前代码事实。基本能力的交付证据见 [`FAL 档案`](../../plans/archived/todo-2026-09-fal-service-capabilities.md)，后续任务由 [COMPASS](../../plans/COMPASS.md) 导航。
 
 ## 正式生产链
 
-F1、F2 与 F3a–F3d 已接通先前的组合门；F3e 的 Open/流正在同一未提交工作树接入。init 为 A 提供四项启动 grant（bootstrap、release、route、注册 Mailbox owner）；A 在注册 root 的 Lifetime 观察准入后发行 root sender。init 接收 A 的 FAL 根、服务目录根与授权 root，先订阅目录根，再以 DelegateName 从 A 取得 exact-name `fs.secondary` sender，作为 B 的第四项启动 grant。每个 `srv_fs` 进程主线程仍只运行一个 Runtime，A 在同一运行体内承载内存域和 Registry：
+F1–F4 的基本能力及独立 `test_fal` 消费者已交付；Open/流与 Copy 不是未提交施工。init 为 A 提供四项启动 grant（bootstrap、release、route、注册 Mailbox owner）；A 在注册 root 的 Lifetime 观察准入后发行 root sender。init 接收 A 的 FAL 根、服务目录根与授权 root，先订阅目录根，再以 DelegateName 从 A 取得 exact-name `fs.secondary` sender，作为 B 的第四项启动 grant。每个 `srv_fs` 进程主线程仍只运行一个 Runtime，A 在同一运行体内承载内存域和 Registry：
 
 ```text
 srv_init / libfs::resolve
@@ -28,7 +28,7 @@ FAL1 protocol id、FalHeader、slot-1 anchor、`MemFs`、旧 provider dispatch �
 - A 当前仅有一套 FAL Mailbox/GrantTable/Watch，内存根和发现根各获独立 sender-context 授权及 NodeRef；`ServiceBackend` 按节点存储身份选择后端，跨域 Move 仍返回 CrossDevice。注册控制另有 Mailbox/AuthorityTable。A 的两枚 bootstrap FAL root 保留 GRANT 供 init 在 Building 阶段直授，普通派生 grant 不继承该运输权；共享入口不提供两域独立接收、封口或公平额度。
 - provider 由同一 `libbudget::Account` 建立 ExecutionResource、FalResource 和 ServiceResource 三种不可变视图：分别支付 Runtime Task/InputBytes、FAL Node/Bytes/Grant/Watch/WaitSource，以及 Registry Authority/Registration/Bytes/WaitSource。Task/Source 上限按 G=16、A=16、R=16、W=24、请求并发预留 Q=16、下游 D=8、流表 S=15 与固定任务/来源公式推导；每流预留流任务与一个控制回复任务、最多三个流来源和一个控制回复来源，FAL WaitSource 额度另外增加 2S。Node 额度同时覆盖内存根及 Registry 根/记录，服务来源付款覆盖 A+2R。Q 是共享任务池内的并发预留，不是独立隔离配额；Bytes 尚需结合极端 Record/节点负载验证。
 
-- F2 的既有 Delegate 请求链仍运行：A 的 route endpoint 保存从服务发现所得 B 母 grant 与 FAL ceiling；普通 Lookup 命中绑定后，A 的 Dispatcher 非阻塞调用 B 的 Derive，`DelegateTask` 回复独立子 grant、consumed 与 remaining。此前 init 从两个 bootstrap 直接取得业务 root；F3d 工作树已删 B 的直交旁路，改由 A 目录 Record 出口取得 B 母 grant，再装配 `/second` route。`libfs::client::Transport` 继续跨越 `/second` 与 `/second/f2-dir/leaf` 验证授权衰减，启动 grants 缺失或 role 错误时 fail-closed。
+- F2 的既有 Delegate 请求链仍运行：A 的 route endpoint 保存从服务发现所得 B 母 grant 与 FAL ceiling；普通 Lookup 命中绑定后，A 的 Dispatcher 非阻塞调用 B 的 Derive，`DelegateTask` 回复独立子 grant、consumed 与 remaining。B 的直交旁路已删除，改由 A 目录 Record 出口取得 B 母 grant，再装配 `/second` route。`libfs::client::Transport` 继续跨越 `/second` 与 `/second/f2-dir/leaf` 验证授权衰减，启动 grants 缺失或 role 错误时 fail-closed。
 ### Owner 与收束边界
 
 未提交准备阶段必须携带全部 owner：节点 pin、目录/块 Permit、Account Charge、能力 owner、回复和 Delivery。准备失败或 commit 冲突原样返还这些责任。成功提交后，旧值和最后引用由后端结果与退休队列承接；回复失败只能形成 `OutboxResult::Abandoned`，不能伪造业务回滚。服务退出需要停止准入、取消/完成请求、收束 GrantTable、backend retire queue、Delivery、reply-once、WaitSet，并确认账户退款。
@@ -61,7 +61,7 @@ provider-local Watch 表配置上限为 24，`libfal::watch::WakeBatch` 在 Runt
 
 Unsubscribe 先从发布表摘除并清空尚未 signal 的 pending 位，再唤醒任务撤销 source，回复确认后不再产生新事件；Notification owner 静默关闭走同一退休路径。Subscribe 回复 abandoned 会由服务端主动摘表、撤源和退款，不依赖客户端最终关闭；provider 停止时先合并并 signal `TERMINATED`，随后撤源关闭 signaler。`srv_init` 在两个独立 provider 上验证目录 CREATE、节点 MODIFY、代次推进、外来 grant context 拒绝、显式取消后静默、owner 静默消散、节点删除终态、provider 停止终态与最终 Watch/WaitSource 退款。
 
-## F3d 当前施工事实
+## F3d 实现事实
 
 `libservice::{protocol,record,authority,registry,resource,client}` 已有严格注册 codec、固定 ServiceRecord schema、sender-context authority、Registry 的 Starting/Ready/Draining/Terminal 与投影。Registry 只实现只读 `Backend`；A 的 `ServiceBackend` 在同一 Runtime 内装配 MemoryBackend 的写面和 Registry 的只读根，不再要求 Registry 实现假 `MutationBackend`。A 的同一 Runtime/Dispatcher 服务两个 FAL 根和 RegistrationControl Mailbox；A mint 的 root sender 在 Lifetime source 准入后出版，init 用 root 调用 DelegateName，取得同样先有 Lifetime/Outbox 来源再交付的 exact-name `fs.secondary` sender；B 持该 sender 异步 Register→PublishReady。init 在 B 启动前已订阅 A 目录根；收到 CREATE 后读取 `fs.secondary` Record，经 Directory Derive 取得 B 子 grant 并真实调用，B root 不直授 init。B 退出后 init 检查旧记录 TERMINATED、目录根 DELETE 和再读 NotFound。
 

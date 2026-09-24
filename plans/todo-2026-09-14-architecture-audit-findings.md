@@ -18,7 +18,7 @@
 |---|---|---|
 | A1 退役债务不变量不可局部验证 | 债务批次数的观测面与断言要求 | 退休/请求结构收束已归档于 [`public-operation-ownership`](archived/todo-2026-09-14-public-operation-ownership.md) |
 | A2 全局 metadata 配额不可归属 | 触发条件认定与常量依据审查 | 配额机制本身归 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) |
-| B1 同步 Caller 与事件循环并存 | 「阻塞必须显式」的类型要求 | typed PendingCall / Outbox 归 [`service-runtime-prerequisites`](todo-2026-09-13-service-runtime-prerequisites.md) |
+| B1 同步 Caller 与事件循环并存 | 「阻塞必须显式」的类型要求 | typed PendingCall / Outbox 归 [`service-runtime-prerequisites`](archived/todo-2026-09-13-service-runtime-prerequisites.md) |
 | C1–C3 容量/粒度/派生依据 | 全部（本计划唯一拥有） | — |
 | M1 裸帧号穿越 affine 所有权边界 | 全部（本计划唯一拥有） | — |
 | M2 metadata 耗尽后果是内核 panic | 事实核实（是否为真实 panic 面） | 配额与预算机制归 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) |

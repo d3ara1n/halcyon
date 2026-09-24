@@ -30,4 +30,4 @@
 
 ## 边界与完成门
 
-本计划仅拥有 `3060dd8` 的固定提交复核；流运输/Runnel 闭包、通用执行与 RPC 闭包由[执行前置计划](todo-2026-09-13-service-runtime-prerequisites.md)继续拥有，不在本 Review 内重审。未来 reviewer 使用新上下文只读审查目标提交，核对清单各点，记录有证据的 finding 或确认无 finding；无 finding 后归档本计划，有 finding 由一份 review 报告承载修复与复核。
+本计划仅拥有 `3060dd8` 的固定提交复核；流运输/Runnel、通用执行与 RPC 的交付证据见[执行前置档案](archived/todo-2026-09-13-service-runtime-prerequisites.md)，不在本 Review 内重审。未来 reviewer 使用新上下文只读审查目标提交，核对清单各点，记录有证据的 finding 或确认无 finding；无 finding 后归档本计划，有 finding 由一份 review 报告承载修复与复核。

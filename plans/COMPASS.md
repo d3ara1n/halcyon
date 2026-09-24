@@ -56,3 +56,4 @@
 | ASID 与定向 shootdown | 地址空间切换开销实测 | [task 实现](../notes/impls/task.md) |
 | admission / Remote 槽高水位 | metadata 预算立案、容量重校或耗尽现场 | [mm](../notes/ideas/mm.md)、[架构审计 M5](todo-2026-09-14-architecture-audit-findings.md#m5-内核堆没有压力观测也没有接近上限时的分级拒绝) |
 | Unmap 唤醒点前移 | 内存操作延迟瓶颈有测量证据 | [mm](../notes/ideas/mm.md) |
+| FAL 正式故障注入补证 | 稳定正式注入入口出现，或生产故障暴露清理问题 | [FAL 交付档案](archived/todo-2026-09-fal-service-capabilities.md#跨会话接力断点) |

@@ -30,7 +30,7 @@
 - 完整 FAL `just acceptance`，日志 `artifacts/fal-f4-acceptance-final.log`
 - `git diff --check`
 
-后续 `5b29915` 的验收证据、耗时及仍未覆盖的正式故障注入条件由 [FAL 工作记录](todo-2026-09-fal-service-capabilities.md#跨会话接力断点) 保留；日志属于当时本机，不随 Git 交付。上述证据不是独立 Review 结论，复核须分别核对两次固定变更，不能用当前 HEAD 替代目标提交。
+后续 `5b29915` 的验收证据、耗时及仍未覆盖的正式故障注入条件由 [FAL 工作记录](archived/todo-2026-09-fal-service-capabilities.md#跨会话接力断点) 保留；日志属于当时本机，不随 Git 交付。上述证据不是独立 Review 结论，复核须分别核对两次固定变更，不能用当前 HEAD 替代目标提交。
 
 ## 复核门
 

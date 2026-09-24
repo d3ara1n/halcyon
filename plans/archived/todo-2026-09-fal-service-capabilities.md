@@ -1,6 +1,6 @@
 # FAL 服务能力与公共 IPC 前置
 
-> 状态：基本 FAL 的 F0–F4 能力与真实消费者已完成，闭包提交为 `dda8a5b`，后续故障验证及验收预算提交为 `5b29915`（已合入 `master`）。正式服务来源登记拒绝、OOM、强制 close 和 Gate source refusal 因无稳定正式注入入口保留为验证限制，不宣称已注入；后续由[固定提交 Review](todo-2026-09-24-fal-kernel-closure-review.md)或下文明确的触发条件接手。
+> 状态：已完成并归档。基本 FAL 的 F0–F4 能力与真实消费者由 `dda8a5b` 交付，后续故障验证及验收预算由 `5b29915` 补充（已合入 `master`）。正式服务来源登记拒绝、OOM、强制 close 和 Gate source refusal 因无稳定正式注入入口保留为验证限制，不宣称已注入；固定提交由[独立 Review](../todo-2026-09-24-fal-kernel-closure-review.md)核对，未来触发的验证需求从文末限制重新立案。
 >
 > 本文件唯一保存基本 FAL 的交付范围、设计裁决、施工与验证证据及保留限制。统一流程遵循 `AGENTS.md`；方向契约进入 `notes/ideas/`，实现事实进入 `notes/impls/`，本文只记录任务特有的决策、依赖和证据。固定提交 Review 不重复安排本文件已完成的实施。
 
@@ -10,19 +10,19 @@
 
 - 历史开发分支 `task/fal-service-capabilities` 从 `5d406a4` 分出；闭包提交 `dda8a5b` 经 `7b04c81` 合入 `master`，追加故障验证提交 `5b29915`。本记录不以旧开发分支或未提交工作树作为当前接手基线；实际 HEAD/工作树仍须在接手时核对。
 - F1–F3c 历史连续实现基线：`dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`；库知识、目录与命名重排：`96ee03b0d1641c86ed8ab05951bad6954ea84db4`；早期文档接手 HEAD `3607f22` 当时工作树干净。
-- 跨阶段边界与 F3d 设计固定提交：`1000270ef2b54c35bc56acda10943dd94c0e7e12`；[设计 Review](todo-2026-09-21-fal-service-design-review.md) 已登记且实现对照提交 `dda8a5b` 已具备，待排期执行；文档提交本身不作为运行能力交付证据。
-- 当前实现入口：[`FAL`](../notes/impls/fal.md)、[`RPC`](../notes/impls/rpc.md)、[`Runtime`](../notes/impls/runtime.md)、[`Runnel`](../notes/impls/runnel.md)、[`启动`](../notes/impls/startup.md)。组件命名与依赖先读 [`user/README.md`](../user/README.md) 和 [`user/libraries/README.md`](../user/libraries/README.md)。
+- 跨阶段边界与 F3d 设计固定提交：`1000270ef2b54c35bc56acda10943dd94c0e7e12`；[设计 Review](../todo-2026-09-21-fal-service-design-review.md) 已登记且实现对照提交 `dda8a5b` 已具备，待排期执行；文档提交本身不作为运行能力交付证据。
+- 当前实现入口：[`FAL`](../../notes/impls/fal.md)、[`RPC`](../../notes/impls/rpc.md)、[`Runtime`](../../notes/impls/runtime.md)、[`Runnel`](../../notes/impls/runnel.md)、[`启动`](../../notes/impls/startup.md)。组件命名与依赖先读 [`user/README.md`](../../user/README.md) 和 [`user/libraries/README.md`](../../user/libraries/README.md)。
 - 方向入口：`notes/ideas/{fal,fs,service,framework,message,wait,time,rpc,tunnel,runnel}.md`。方向文档不是实现完成证据；当前代码也不自动决定未来边界。
 
 | 基线 | 已成立的责任与证据入口 | 后续不得误读为 |
 |---|---|---|
-| 公共对象、观察与退休 | [公共前置档案](archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)、`notes/impls/ipc.md` | 需要恢复旧 WaitSet Seal/Drain 或用户态退休编排 |
-| 公共时间 | `c6e0a84`；[期限档案](archived/todo-2026-09-monotonic-time-rpc-deadline.md)、`notes/impls/time.md` | FAL 已有完整连接/运行期政策 |
+| 公共对象、观察与退休 | [公共前置档案](todo-2026-09-13-public-ipc-wait-prerequisites.md)、`notes/impls/ipc.md` | 需要恢复旧 WaitSet Seal/Drain 或用户态退休编排 |
+| 公共时间 | `c6e0a84`；[期限档案](todo-2026-09-monotonic-time-rpc-deadline.md)、`notes/impls/time.md` | FAL 已有完整连接/运行期政策 |
 | 消息、流运输、执行与 RPC/Outbox | [执行前置交付导航](todo-2026-09-13-service-runtime-prerequisites.md)；Runtime 是观察与任务寿命 owner，Runnel 已有 poll/SourcePlan 及 init↔pm 消费者 | FAL 正式文件 Open/流已由 F3e/F4 接通，不恢复旧 Runnel 观察层 |
-| 公共操作所有权 | `8e0467a`；[公共操作档案](archived/todo-2026-09-14-public-operation-ownership.md) | 业务已拥有注册或流状态机 |
-| F0–F2 | 严格 FAL2、GrantTable/稳定节点、双独立 provider、route/Delegate、下游退出与 Outbox abandoned；[固定基线审查](todo-2026-09-21-fal-library-baseline-review.md) | route-management endpoint 已是注册权威 |
+| 公共操作所有权 | `8e0467a`；[公共操作档案](todo-2026-09-14-public-operation-ownership.md) | 业务已拥有注册或流状态机 |
+| F0–F2 | 严格 FAL2、GrantTable/稳定节点、双独立 provider、route/Delegate、下游退出与 Outbox abandoned；[固定基线审查](../todo-2026-09-21-fal-library-baseline-review.md) | route-management endpoint 已是注册权威 |
 | F3a–F3c | 同域 Move、Record/Handle/Take、无 capability 属性 Copy、Watch；同一固定基线与 `notes/impls/fal.md` | F3d–F4 已补齐注册/发现、Open、流 Copy、退出观察与整体验收 |
-| 库知识与命名 | `96ee03b`；[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)、[固定审查](todo-2026-09-21-library-knowledge-ownership-review.md) | 已存在 libservice 或通用服务目录后端 |
+| 库知识与命名 | `96ee03b`；[库重排档案](todo-2026-09-21-library-knowledge-ownership.md)、[固定审查](../todo-2026-09-21-library-knowledge-ownership-review.md) | 已存在 libservice 或通用服务目录后端 |
 
 FAL1、`MemFs`、slot-1 anchor、self-client、旧泵、原始 Runnel 工厂和无消费者观察草稿均已删除，不再列作未来删除项。历史混合集成基线 `d22b9d7` 与旧 F0 盘点只用于追溯，不用于恢复旧路径。
 
@@ -32,7 +32,7 @@ FAL1、`MemFs`、slot-1 anchor、self-client、旧泵、原始 Runnel 工厂和�
 - 较新的库重排收口记录了同工作树的完整 `THROTTLE=100 just acceptance`；L5 删除空库后另过 `just check`、七面 lint、默认 50% `just virt`。该证据验证当时的 F0–F3c 及公共基线，不覆盖尚不存在的 F3d–F3f。
 - 库重排后的 host 基线包括 libfal 27、libfs 17、libexecution 22、libbudget 6 项。测试数量仅是历史快照，不作为未来完成标准。
 - 双 provider 退出证据包括：业务已提交但回复满箱，停止后 `abandoned=1`；下游 Derive 已投递到静默 Mailbox，停止后 `downstream_abandoned=1`。两端最后完成授权、观察、后端、运输 owner 和账户收束。
-- 完整日志在本机 `artifacts/`，不随 Git 交付。异机按影响面重跑，不能把历史日志路径视为可复现证据。历史墙钟敏感现场见[只读档案](archived/ref-2026-09-acceptance-timing-flake.md)，不是当前开放缺陷，也不授权忽略新失败或重跑直到绿。
+- 完整日志在本机 `artifacts/`，不随 Git 交付。异机按影响面重跑，不能把历史日志路径视为可复现证据。历史墙钟敏感现场见[只读档案](ref-2026-09-acceptance-timing-flake.md)，不是当前开放缺陷，也不授权忽略新失败或重跑直到绿。
 
 ## 2. 交付范围与非目标
 
@@ -45,9 +45,9 @@ FAL1、`MemFs`、slot-1 anchor、self-client、旧泵、原始 Runnel 工厂和�
 - Watch 是有界合并的失效提示，不是事件历史；不承诺递归、跨 provider 或重放。
 - 服务发现分发 capability，后续直接调用；不强制全系统经过一个全局 registry，不承诺健康检查、自动重启、无缝滚动升级或透明重试非幂等调用。
 
-[扩展操作计划](todo-2026-09-fal-extended-operations.md) 唯一承接递归操作、快照/持久性/原子替换、capability 属性 Copy、扩展 Watch、append/组合 Open。本计划不复制这些待办；新需求若触发，先修订边界与依赖，不能暗中扩大基本操作。
+[扩展操作计划](../todo-2026-09-fal-extended-operations.md) 唯一承接递归操作、快照/持久性/原子替换、capability 属性 Copy、扩展 Watch、append/组合 Open。本计划不复制这些待办；新需求若触发，先修订边界与依赖，不能暗中扩大基本操作。
 
-CPU 预约、KernelMemoryBudget、设备/中断/DMA、BufferQueue、通用异步语言运行时、系统关机编排及电源管理不在本专题。开放不可信创建域前须满足 [KernelMemoryBudget](todo-2026-09-14-kernel-memory-budget.md) 的前置；当前有界准入不等于跨域资源隔离。[映射 owner 延期项](todo-2026-09-14-user-memory-owner-lifecycle.md) 不能承接当前 Open 必须完成的 Endpoint 关闭与退款；若现有 owner 无法闭合正常清理，须先重排前置。
+CPU 预约、KernelMemoryBudget、设备/中断/DMA、BufferQueue、通用异步语言运行时、系统关机编排及电源管理不在本专题。开放不可信创建域前须满足 [KernelMemoryBudget](../todo-2026-09-14-kernel-memory-budget.md) 的前置；当前有界准入不等于跨域资源隔离。[映射 owner 延期项](../todo-2026-09-14-user-memory-owner-lifecycle.md) 不能承接当前 Open 必须完成的 Endpoint 关闭与退款；若现有 owner 无法闭合正常清理，须先重排前置。
 
 ## 3. 技术依赖与施工顺序
 
@@ -332,7 +332,7 @@ D0–D5 与下述结构修复已随闭包提交收口。正式服务来源拒绝
 | Registry `starting` 期限索引与 Registration 的状态/期限重复，批量 API 无生产调用 | 删索引、`starting_key`、额外 PreparedEntry/Bytes 收费和 host-only 批量 API；`expire_if_starting(instance, now)` 直接核对 Starting 与本实例期限。现有 host 覆盖 Ready 先胜、到期先胜与 seal，真实 provider timer/账户经组合验收。 |
 | 三份 `valid_name` 与控制索引中相同 minted id 的 `identity`/`instance` 重复 | `libservice::protocol::valid_name` 为 wire/authority/Registry 单一规则，控制索引只存 instance/task_id；现有无效名称 host 契约及 A/B 注册、Query、失效真实拓扑通过。 |
 
-本轮 `just check`、七面 `just clippy`、`libservice` host 17 项及完整 `just acceptance`（debug stress 16/16、release core、sifive_u、virt-nofd、boot-failure）通过；最终 Move/Take 补修后重跑了七面 clippy 与完整 acceptance，未重复与之无关的 host 测试。无遗留 QEMU/GDB 进程。fixture 的判定收敛由[验收 fixture 清理](todo-2026-09-23-acceptance-fixture-cleanup.md#消费者与覆盖审计)记录。Read/Delegate/Request 和 Dispatcher 仍属 `srv_fs` 的真实编排，不为迁移建立新 facade。
+本轮 `just check`、七面 `just clippy`、`libservice` host 17 项及完整 `just acceptance`（debug stress 16/16、release core、sifive_u、virt-nofd、boot-failure）通过；最终 Move/Take 补修后重跑了七面 clippy 与完整 acceptance，未重复与之无关的 host 测试。无遗留 QEMU/GDB 进程。fixture 的判定收敛由[验收 fixture 清理](../todo-2026-09-23-acceptance-fixture-cleanup.md#消费者与覆盖审计)记录。Read/Delegate/Request 和 Dispatcher 仍属 `srv_fs` 的真实编排，不为迁移建立新 facade。
 
 
 ## 9. Open 与流完成
@@ -513,7 +513,7 @@ F4 建立独立 `test_fal`，迁移 srv_init 内的业务断言、协议拒绝�
 - 当前承诺全闭合后：`just check`、`just clippy`、相关 os/shared/user host 与完整 `just acceptance`，覆盖 debug stress、release core、sifive_u、virt-nofd 和 boot-failure；涉及调度域契约另跑 virt-hetero。新增库/独立 binary 同步纳入 workspace、构建、lint 和 workload，不遗漏 target 分面。
 - 长命令完整日志写 artifacts，保留退出码；默认节流、超时按现行 recipe。正常负载成本变化时重校超时，不把截断判为内核故障；退出后确认无残留进程。历史通过或全速诊断不替代本次需要的组合证据。
 - 结构收口核对最终类型/authority/owner、重复真值、旧路径、失败退款、锁序、有界性、文档及已有 findings；当前承诺已闭合，剩余仅为明确记录的外部注入验证限制，影响当前正确性的事项不得延期。
-- F3d–F3f 的真实消费者、全部清理、旧路径删除及本节组合门已成立，整体基本 FAL 交付完成；实现说明已同步，`dda8a5b` 与 `5b29915` 的固定提交 Review 由[审查计划](todo-2026-09-24-fal-kernel-closure-review.md)承接。本记录保留交付证据与触发限制；历史提交/合并过程不作为现行接力指令。
+- F3d–F3f 的真实消费者、全部清理、旧路径删除及本节组合门已成立，整体基本 FAL 交付完成；实现说明已同步，`dda8a5b` 与 `5b29915` 的固定提交 Review 由[审查计划](../todo-2026-09-24-fal-kernel-closure-review.md)承接。本记录保留交付证据与触发限制；历史提交/合并过程不作为现行接力指令。
 
 ## 跨会话接力断点
 
@@ -537,4 +537,4 @@ F4 当前接线已闭合：`srv_init` 的 `launch_fal_consumer`、`launch_second
 
 本轮实现与 core/stress/virt-release/sifive_u/virt-nofd 均已通过；`just clippy`、`just build_user`、`git diff --check` 和 `bash -n tools/qemu-acceptance.sh` 通过。sifive_u 缺失 `public time deadline checks passed:` anchor 的原因已定位为 60 秒路线预算不足，默认值已调整为 120 秒并通过；考虑到 FAL 资源/退出验证继续增长，virt stress 默认值同步从 300 秒放宽为 420 秒。最终 `just acceptance` 通过，实测 `real 399.88s`。
 
-验收 fixture 的两个映像因独立覆盖暂留，后续内核自检审计由其[独立计划](todo-2026-09-23-acceptance-fixture-cleanup.md)承接。
+验收 fixture 的两个映像因独立覆盖暂留，后续内核自检审计由其[独立计划](../todo-2026-09-23-acceptance-fixture-cleanup.md)承接。

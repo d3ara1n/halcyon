@@ -2,7 +2,7 @@
 
 > 状态：P0–P6 已全部完成并归档。专题最终结构保持独立领域执行器和债务容量，只统一账本机械协议、请求代次仲裁、Process 级退休交棒与两组安全点公平预算；公开 ProcessDrain、REAPABLE/CLOSED 和管理者职责未改变。最终 host、七面 clippy 与完整 acceptance 证据见文末 P6 收口记录。
 >
-> 本文是公共操作所有权专题的只读实施档案。共享算法/目录已由 [包归属档案](todo-2026-09-13-workspace-package-ownership.md) 完成，FAL 领域与业务由 [总计划](../todo-2026-09-fal-service-capabilities.md) 拥有；自然顺序已经进入 FAL 的重新接手与规模审计。
+> 本文是公共操作所有权专题的只读实施档案。共享算法/目录已由 [包归属档案](todo-2026-09-13-workspace-package-ownership.md) 完成，FAL 领域与业务由 [总计划](todo-2026-09-fal-service-capabilities.md) 拥有；自然顺序已经进入 FAL 的重新接手与规模审计。
 
 ## 已明确的能力与职责
 

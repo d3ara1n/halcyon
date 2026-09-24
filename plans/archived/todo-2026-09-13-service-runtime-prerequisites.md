@@ -1,8 +1,8 @@
 # 用户态运输、RPC 与服务执行前置
 
-> 状态：消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核统一登记于 [未来 Review](todo-2026-09-15-runtime-admission-review.md)。公共记账/执行与服务领域的知识归属、包依赖及目录迁移已由[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)闭合；下文 libsrv 路径与旧包分工只记录交付基线。公共对象、时间与[公共操作所有权](archived/todo-2026-09-14-public-operation-ownership.md)均已交付，[共享包整理](archived/todo-2026-09-13-workspace-package-ownership.md) 已归档。
+> 状态：已完成并归档。消息运输（`3060dd8`）、流运输/Runnel（`a2aabed`）、通用执行与准入（`a3891b0`）以及 RPC/Outbox（`4e18e5e`）均已完成相应闭包和验证；固定提交复核登记于 [独立 Review](../todo-2026-09-15-runtime-admission-review.md)。公共记账/执行与服务领域的知识归属、包依赖及目录迁移已由[库重排档案](todo-2026-09-21-library-knowledge-ownership.md)闭合；下文 libsrv 路径与旧包分工只记录交付基线。公共对象、时间与[公共操作所有权](todo-2026-09-14-public-operation-ownership.md)均已交付，[共享包整理](todo-2026-09-13-workspace-package-ownership.md) 已归档。
 
-提交后的结构审视见[整体固定提交 Review](todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态、Runtime Wake、RPC/Outbox 和真实消费者边界的收敛建议；Runtime 清理、Job 单页收束、停止补证及 RPC/Outbox 已完成，固定提交序列统一由该 Review 承载。服务架构化不在范围内。
+提交后的结构审视见[整体固定提交 Review](../todo-2026-09-15-runtime-admission-review.md)：PM 实际停止的旧声明已更正，并记录失败交付、分页、核心状态、Runtime Wake、RPC/Outbox 和真实消费者边界的收敛建议；Runtime 清理、Job 单页收束、停止补证及 RPC/Outbox 已完成，固定提交序列统一由该 Review 承载。服务架构化不在范围内。
 
 ## RPC/Outbox 闭包状态记录
 
@@ -124,7 +124,7 @@ Receive/Delivery
 
 本任务接通 Packet/Delivery → Request/Task/Outbox → terminal → retire → refund。运输由 rinlib/Runnel 拥有；任务调度、观察注册寿命、任务唤醒与期限唤醒由执行核心拥有；RPC 路由及请求/回复责任由 librpc 拥有。执行核心不认识 FAL 节点、grant、Watch 或服务记录，也不依赖 RPC 的请求状态。
 
-库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；未来 `libservice` 消费 RPC/FAL 等领域能力，通用能力库不反向依赖它。具体包/类型图和既有消费者迁移已由[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)闭合，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
+库依赖从知识使用者指向提供者。异步 RPC 可以消费公共执行能力，公共执行和独立记账均不属于服务领域；未来 `libservice` 消费 RPC/FAL 等领域能力，通用能力库不反向依赖它。具体包/类型图和既有消费者迁移已由[库重排档案](todo-2026-09-21-library-knowledge-ownership.md)闭合，本计划不再保留无 owner 的“以后决定拆包”项，也不用回调或临时 adapter 掩盖倒置。
 
 ## 可以先行的局部收口
 
@@ -233,7 +233,7 @@ RPC 与 Outbox 是一个合并的机制闭包，不拆成两个各自验收的�
 
 ## 组合完成门与提交
 
-组合收口验证本前置计划已完成的机制与本次 RPC/Outbox 闭包；不在局部阶段补主要功能或制造临时验收消费者。执行适当 host/目标检查、`just clippy`、core/release/platform 及跨机制失败/取消/退款组合，证据能定位。稳定纯函数和状态推进的 testcase 可在施工中随实现补齐，但不替代闭包完成后的整体验证。历史 stress 概率误判和 Tunnel 墙钟敏感截断见 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)；新现场命中其触发条件时重新立案，不以重跑直到绿替代证据。
+组合收口验证本前置计划已完成的机制与本次 RPC/Outbox 闭包；不在局部阶段补主要功能或制造临时验收消费者。执行适当 host/目标检查、`just clippy`、core/release/platform 及跨机制失败/取消/退款组合，证据能定位。稳定纯函数和状态推进的 testcase 可在施工中随实现补齐，但不替代闭包完成后的整体验证。历史 stress 概率误判和 Tunnel 墙钟敏感截断见 [只读归档](ref-2026-09-acceptance-timing-flake.md)；新现场命中其触发条件时重新立案，不以重跑直到绿替代证据。
 
 提交不按文件机械拆分 ABI/owner/观察/退休迁移；RPC/Outbox 按上述单一闭包组织提交，内部阶段不各自登记为独立交付。闭包收口时登记真实调用者、删除的旧路径和整体验证证据。不能引入没有删除条件的 adapter 或测试专用运行体。已完成提交之后登记对应固定 hash 的未来 Review；提交、合并和 push 仍分别遵守授权边界。
 
@@ -257,7 +257,7 @@ RPC 与 Outbox 是一个合并的机制闭包，不拆成两个各自验收的�
 
 ## 接手后的最终实现（2026-09-15）
 
-HighHolly 已接替 SilverSeal 实施，工作树保持单一写入者。原初轮实现和两轮复核暴露的问题保留在唯一 [Review 报告](archived/review-2026-09-15-runtime-closure.md)，不得据历史 passing 路线宣称当前责任链完成。
+HighHolly 已接替 SilverSeal 实施，工作树保持单一写入者。原初轮实现和两轮复核暴露的问题保留在唯一 [Review 报告](review-2026-09-15-runtime-closure.md)，不得据历史 passing 路线宣称当前责任链完成。
 
 - Runtime：事件接收、来源退休和任务退休独立轮转；每任务输入 FIFO 只处理本轮预算的真实记录；来源退休与任务执行失败退避都有预付期限槽；最近期限不全表扫描。登记/注销回执、Gate 拒绝、Complete 后返还责任、停止时继续观察与最终退款共同接通。
 - 公共接缝：SourcePlan 为不透明值描述，删除 Runnel 等待计划的动态 Box；input_budget 按实际类型与容量推导账户额度。shared/timer_queue 的 value_mut 仅用于预付后绑定 token，不修改调度算法或 ABI。
@@ -266,4 +266,4 @@ HighHolly 已接替 SilverSeal 实施，工作树保持单一写入者。原初�
 - pm：域管理只使用 JobDriver，删除重复成员编排；实际以 max_work=1 驱动。本批让测试邮箱保持 Active 到 stop，检查实际登记、注销回执和最终账户退款；新增必检锚点已通过完整 acceptance。测试阶段关系保持，未建设正式服务架构。非零异常退出由 init 管理能力接管。
 - 证据：正式 Runtime host 验证持续来源/Gate/退休/停止/退款、部分输入、独立来源重试、失败任务隔离；ProcessOperations 与真实 Runtime 集成验证注销 Busy、Close 恢复、首次观察超时/错误和连续 Drain Busy；init 的真实批次/独立运行体故障隔离锚点进入 QEMU 必检项。
 
-验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。当时 R1–R16 和 C1–C7 的关闭记录已归档。后续结构审视纠正了其中 R15 对 PM 实际停止的证明，本批已通过 Active 登记→stop→注销→退款补证关闭；Runtime 预付清理与 Job 单页收束的最终证据见固定提交 Review 的已授权批次。通用执行与准入初次交付为 `a3891b0`；本计划仍拥有尚未实施的 RPC/Outbox，不能把四闭包整体标为完成。
+验证与复核已完成：最终 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，31 个改动源码哈希一致；host、just check、七面 lint、stress 16/16、release/sifive_u/nofd 与启动失败三线通过。当时 R1–R16 和 C1–C7 的关闭记录已归档。后续结构审视纠正了其中 R15 对 PM 实际停止的证明，本批已通过 Active 登记→stop→注销→退款补证关闭；Runtime 预付清理与 Job 单页收束的最终证据见固定提交 Review 的已授权批次。通用执行与准入初次交付为 `a3891b0`；此处仅记录当时 RPC/Outbox 尚未实施的接力状态，后续已由 `4e18e5e` 完成交付。

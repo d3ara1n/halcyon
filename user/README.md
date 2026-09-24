@@ -4,7 +4,7 @@
 
 ## Rust 组件命名
 
-全仓 Rust 组件的目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致。名称描述稳定的领域或进程角色，不描述源码阶段、实现位置或临时装配。现有违规项必须整改，不构成规则例外；内核统一为 `kernel` 的待实施范围见[命名计划](../plans/todo-2026-09-22-kernel-identity.md)。
+全仓 Rust 组件的目录叶名、Cargo package 名、默认 binary/library target 名与 crate identifier 必须一致。名称描述稳定的领域或进程角色，不描述源码阶段、实现位置或临时装配。现有违规项必须整改，不构成规则例外。
 
 ### 领域名称
 

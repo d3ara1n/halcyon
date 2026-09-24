@@ -1,6 +1,6 @@
 # RV64 共享内存访问的语言与平台证据
 
-> 【只读参考资料】为多页 Tunnel/RNL2 实施前设计取证。事实与证明边界在此记录；推荐方案与交付义务由 [`数据面计划`](todo-2026-09-memory-object-data-plane.md) 和 `notes/ideas/shared-memory.md` 拥有。
+> 【只读参考资料】为多页 Tunnel/RNL2 实施前设计取证。事实与证明边界在此记录；推荐方案与交付义务由 [`数据面计划`](archived/todo-2026-09-memory-object-data-plane.md) 和 `notes/ideas/shared-memory.md` 拥有。
 
 ## 版本
 

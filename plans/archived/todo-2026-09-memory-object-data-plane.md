@@ -31,7 +31,7 @@ A–E 前置已闭合，公共 MemoryObject、多 extent backing、AddressSpace 
 
 **切片 8/9 合为一次完整交付**：多页 Tunnel ABI、Endpoint owner、安全关闭边界、共享内存访问、RNL2、现有消费者与验证一起完成。编号保留作历史定位，内部可按依赖施工，但不交付“多页内核 + 单页协议”的过渡状态，不在中途做局部闭环或验收。
 
-真实 Runnel 消费者是 `srv_init ↔ srv_pm`；Tunnel 机制消费者还包括 `srv_init` 生命周期/退出压力、`test_hammer` close/Attach/drain 与内核 Tunnel selftest。当前 `libfal::provider` 对 Open 返回 Unsupported，`librpc/libfs/srv_fs` 没有 Runnel 调用链。**本轮不承诺 FAL Open 已接线**；其 DirectoryGrant、provider 路由、服务发现与 Open 生命周期，以及“大于一页的正式 FAL 流”验收，统一由 [`FAL 服务能力计划`](../todo-2026-09-fal-service-capabilities.md) 承接。现有 FAL/RPC 仅随 raw-close 安全边界作必要调用迁移。
+真实 Runnel 消费者是 `srv_init ↔ srv_pm`；Tunnel 机制消费者还包括 `srv_init` 生命周期/退出压力、`test_hammer` close/Attach/drain 与内核 Tunnel selftest。当前 `libfal::provider` 对 Open 返回 Unsupported，`librpc/libfs/srv_fs` 没有 Runnel 调用链。**本轮不承诺 FAL Open 已接线**；其 DirectoryGrant、provider 路由、服务发现与 Open 生命周期，以及“大于一页的正式 FAL 流”验收，统一由 [`FAL 服务能力计划`](todo-2026-09-fal-service-capabilities.md) 承接。现有 FAL/RPC 仅随 raw-close 安全边界作必要调用迁移。
 
 不引入 resize、COW、pager、KernelMemoryBudget 公共 ABI、BufferQueue、DMA/IOMMU、动态链接、普通 Pool revoke/reparent、RPC 有限 deadline 或全局 Handle 类型重构。切片 10 保持独立库存 selftest 来源收口，不承担本轮旧接口清理。
 

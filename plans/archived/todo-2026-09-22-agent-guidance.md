@@ -28,7 +28,7 @@
 - 构建与平台细节迁入 `plans/BUILD-AND-TEST.md`，按当前配置修正浮动 nightly、内核/用户态 JSON target、check 作用域和 acceptance 路线；README 与工具手册同步入口。
 - kernel idea 明确每次推进有界与内核提交后责任，不把内核退休转成用户维护；用户态 README 明确身份纪律全仓生效，用户态角色前缀范围保持清楚。
 - COMPASS 去除历史施工叙述与重复戒律，保留 FAL 主线断点、全部原活跃 todo 链接、待触发事项和证据索引；完整原文保存在 [整理前快照](ref-2026-09-22-compass-snapshot.md)。
-- `kernel` 改名由 [唯一后续计划](../todo-2026-09-22-kernel-identity.md)承接，未改 Cargo、Justfile、工具脚本或代码；原有 FAL 未提交改动保留。
+- `kernel` 改名由 [唯一后续计划](todo-2026-09-22-kernel-identity.md)承接，未改 Cargo、Justfile、工具脚本或代码；原有 FAL 未提交改动保留。
 
 ## 验证证据与边界
 

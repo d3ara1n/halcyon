@@ -1,6 +1,6 @@
 # FAL 扩展操作与一致性能力
 
-> 状态：等真实消费者触发的未来计划。本文件只拥有基本 FAL 范围之外的能力，不承接当前正式 grant、Open、Watch、注册/发现、同域 Move 或普通 Copy；这些由 [`FAL 整体计划`](todo-2026-09-fal-service-capabilities.md) 唯一交付。
+> 状态：等真实消费者触发的未来计划。本文件只拥有基本 FAL 范围之外的能力，不承接当前正式 grant、Open、Watch、注册/发现、同域 Move 或普通 Copy；这些由 [`FAL 整体计划`](archived/todo-2026-09-fal-service-capabilities.md) 唯一交付。
 
 ## 当前范围与延后理由
 

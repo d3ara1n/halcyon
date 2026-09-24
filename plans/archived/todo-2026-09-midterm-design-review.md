@@ -1,6 +1,6 @@
 # 中期设计审查：notes 全量与机制收敛
 
-> 【待实施计划】审查对象是当前 `notes/` 全量（ideas + impls + README），以提交 `b6b05d1` 的快照为基线冻结。主线（切片 6D 收尾与 6E）由并行会话实施中，因此本审查 **docs-only**：代码仅作取证参考且可能过时，一切 finding 必须锚定文档；代码级结论待 6D/6E 落地后由对应代码审查验证。Review 纪律见 [`REVIEW.md`](REVIEW.md)。
+> 【待实施计划】审查对象是当前 `notes/` 全量（ideas + impls + README），以提交 `b6b05d1` 的快照为基线冻结。主线（切片 6D 收尾与 6E）由并行会话实施中，因此本审查 **docs-only**：代码仅作取证参考且可能过时，一切 finding 必须锚定文档；代码级结论待 6D/6E 落地后由对应代码审查验证。Review 纪律见 [`REVIEW.md`](../REVIEW.md)。
 
 ## 背景与动机
 

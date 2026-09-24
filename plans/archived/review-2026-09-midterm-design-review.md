@@ -1,6 +1,6 @@
 # 中期设计审查报告：notes 全量与机制收敛
 
-> 基线 `b6b05d1` 的 notes/ 快照；docs-only（切片 6D 收尾与 6E 由并行会话实施中，代码结论不作依据）。审查计划见 [`todo-2026-09-midterm-design-review.md`](todo-2026-09-midterm-design-review.md)，纪律见 [`REVIEW.md`](REVIEW.md)。每条 finding 给出证据与动作分类；triage 后行动项落地、本报告归档。
+> 基线 `b6b05d1` 的 notes/ 快照；docs-only（切片 6D 收尾与 6E 由并行会话实施中，代码结论不作依据）。审查计划见 [`todo-2026-09-midterm-design-review.md`](todo-2026-09-midterm-design-review.md)，纪律见 [`REVIEW.md`](../REVIEW.md)。每条 finding 给出证据与动作分类；triage 后行动项落地、本报告归档。
 
 ## 总体结论
 
