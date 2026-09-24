@@ -10,7 +10,7 @@
 
 ## 前置、触发与自然顺序
 
-硬触发：开放不可信 Process/对象创建域、委派独立 metadata 预算，或真实服务要求一域不能耗尽其他域的公共元数据容量。必须在开放前完成；不能用对象数量上限或自动进程回收代替隔离。
+硬触发：开放不可信 Process/对象创建域、委派独立 metadata 预算，或真实服务要求一域不能耗尽其他域的公共元数据容量。必须在开放前完成；不能用对象数量上限或自动进程回收代替隔离。按 `be6dae3` 核对，当前 `srv_pm` 持有的 `pm_domain` JobControl 只有 MANAGE|READ|WAIT，没有 CREATE；ProcessCreate 仍由可信 init 执行，故现有委托管理域并未触发不可信创建域前置。普通 Running 进程仍可按其 sponsor 限额创建被授权的对象/映射，未来一旦承诺域间额度保证，本项立即成为前置。全局 region slot 的 32 倍数值与 heap 压力观测另由[架构审计 A2/M3/M5](todo-2026-09-14-architecture-audit-findings.md)校准；独立预算不能取代字节容量证明。
 
 前置是公共对象/进程回收的职责设计、稳定 sponsor/permit 生命周期和 shared ABI 归属。公共回收采用受信任管理者职责模型，不依赖本项先实现；是否实现独立 metadata 预算由资源隔离需求决定。普通进程即使不持 ProcessControl MANAGE，运行期也能创建其被允许的对象或映射，限制 Drain authority 不能代替分配准入。当前每个新进程从全局准入建立自己的 MetadataSponsor，尚非从父级可委派预算扣除；不得把按进程限额写成创建者承担全部成本。与 [用户态映射 owner](todo-2026-09-14-user-memory-owner-lifecycle.md) 没有算法依赖；两者均未触发时，默认在当前 FAL 基础交付后先处理映射 owner，再处理本项。若不可信创建域更早触发，本项提前且不等待映射 owner 重构。
 

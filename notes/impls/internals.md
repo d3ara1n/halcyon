@@ -95,7 +95,7 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 
 - 物理供给（os/memory_supply，固定 workspace planner）：启动期按 permanent、boot-held、system、user-free 分类；FramePool metadata、16×1 MiB heap chunks 与当前为零的 recovery 子预算以不同 ticket 类型隔离，失败不发布部分计划。
 - 用户帧库存（os/frame_pool，外置元数据分级 order 树）：只发布 planner 的 user-free 与生命周期结束的 user boot-held；claim、split、coalesce、指定区间和归还的库存步骤由固定 arena 数与地址位宽限定。普通页由私有 claim 保活，在 POOL 锁外清零并提交来源 Pool charge 后才发布 funded owner；页表直接持有 funded owner，保留内容的启动 reservation 由 `BootHeldExtent` 经唯一 unsafe adopt 接管、消费式切分并在最后析构时回投。设计细节见 [`mm.md`](mm.md)「帧库存」。
-- 内核堆（talc）：管任意尺寸小对象；`SystemSource` 在 allocator 忙碌时只从独立 `SYSTEM_SUPPLY` O(1) 消费一个启动期预清零的 heap ticket，不进入用户 FramePool，也不借 recovery。ticket 用尽后普通 metadata 分配 OOM；对象级 admission 是独立机制。
+- 内核堆（talc）：管任意尺寸小对象；`SystemSource` 在 allocator 忙碌时只从独立 `SYSTEM_SUPPLY` O(1) 消费一个启动期预清零的 heap ticket，不进入用户 FramePool，也不借 recovery。Talc 找不到可用块且无法再取得 ticket 时普通 metadata 分配 OOM；对象级 admission 是独立机制。启用 talc `counters` 后，启动装载结束与获得 SystemReset authority 的 reset 前各读一次 claimed/allocated/available/fragment 计数；复制快照并释放 HEAP 锁后才读独立的 system ticket 计数并写日志。`chunks` 是已永久 claim 的数量，不等于耗尽的堆；两个采样点也不构成运行期高水位或 allocator 最大连续可分配块的证明。
 
 三层的碎片域、锁与失败边界彼此独立。planner 使 FramePool metadata 和堆供血都不再反向依赖用户库存，从物理所有权上消除“库存元数据由自身供血”及 HEAP→POOL 的运行时环。
 

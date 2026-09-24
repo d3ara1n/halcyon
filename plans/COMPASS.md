@@ -4,8 +4,8 @@
 
 ## 近期顺序
 
-1. [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md)：当前执行 M2；核实并修复用户可达 metadata OOM panic 面后，再按 M3/A2、M5 归属安排后续任务。
-2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口；与 M2 无技术前置关系，可在 M2 收口后排期。
+1. [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md)：M2 已修复，A2/M3/M5 已有 RV64 布局与 core/stress 堆快照；下一步补运行中峰值及并发饱和证据，校准全局准入政策，独立预算按授权触发。
+2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口；与 metadata 容量校准无技术前置关系，可独立排期。
 
 ## 待排期审查
 

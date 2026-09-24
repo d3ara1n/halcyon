@@ -662,6 +662,14 @@ pub struct MemorySpace {
 }
 
 impl MemorySpace {
+    /// 目标架构上的 ledger 条目布局；容量预算还需计入 Vec 与 allocator 开销。
+    pub const fn entry_sizes() -> (usize, usize) {
+        (
+            core::mem::size_of::<Region>(),
+            core::mem::size_of::<TransactionRecord>(),
+        )
+    }
+
     pub fn new(bounds: PageRange, limits: Limits) -> Result<Self, ChangeError> {
         if limits.max_regions == 0
             || limits.max_transactions == 0

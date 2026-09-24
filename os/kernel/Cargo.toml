@@ -7,7 +7,7 @@ edition = "2024"
 erhino_shared = { path = "../../shared/erhino_shared" }
 dtb = { path = "../dtb" }
 lock_api = "0.4"
-talc = "5"
+talc = { version = "5", features = ["counters"] }
 page_table = { path = "../page_table" }
 frame_pool = { path = "../frame_pool" }
 elf = { path = "../../shared/elf" }

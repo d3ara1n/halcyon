@@ -22,7 +22,7 @@ use core::{
 
 use erhino_shared::proc::Termination;
 
-use crate::{context::FatalFrame, csr, external, hart, registry, sbi};
+use crate::{context::FatalFrame, csr, external, hart, heap, registry, sbi};
 
 static BOOT_HARTID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DTB: AtomicUsize = AtomicUsize::new(0);
@@ -186,6 +186,18 @@ fn bring_up_runtime() -> ! {
     let (addr, len) = crate::rt::boot_package_region()
         .expect("BootPackage unavailable; initial process cannot start");
     boot::load(addr, len);
+    let (region_bytes, transaction_bytes) = memory_space::MemorySpace::entry_sizes();
+    log!(
+        Heap,
+        "ledger entries: region {} x {}, transaction {} x {}; minimum storage {} bytes",
+        region_bytes,
+        crate::task::resources::REGION_SLOTS_PER_ADDRESS_SPACE,
+        transaction_bytes,
+        crate::task::resources::MEMORY_CHANGES_PER_ADDRESS_SPACE,
+        region_bytes * crate::task::resources::REGION_SLOTS_PER_ADDRESS_SPACE
+            + transaction_bytes * crate::task::resources::MEMORY_CHANGES_PER_ADDRESS_SPACE
+    );
+    heap::log_snapshot("ready");
     registry::publish_ready();
     crate::remote_call::selftest();
     crate::sched::run()

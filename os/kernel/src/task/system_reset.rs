@@ -112,6 +112,7 @@ pub fn request(
         reason,
         crate::frame::free_frames()
     );
+    crate::heap::log_snapshot("reset");
     let result = crate::sbi::system_reset(platform_action, platform_reason);
     reset.finish_failed();
 

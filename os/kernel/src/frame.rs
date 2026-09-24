@@ -898,3 +898,11 @@ pub fn take_heap_chunk() -> Option<HeapChunkTicket> {
         .expect("system supply not initialized")
         .take_heap_chunk()
 }
+
+pub fn consumed_heap_chunks() -> usize {
+    SYSTEM_SUPPLY
+        .lock()
+        .as_ref()
+        .expect("system supply not initialized")
+        .consumed_heap_chunks()
+}

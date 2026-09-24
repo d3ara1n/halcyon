@@ -1,6 +1,6 @@
 # 架构审计发现承接
 
-> 状态：M2 已核实并完成三处用户可达不可失败 heap 分配的修复与验证；其余发现仍为待逐条审视清单。下一步按 M3/A2 与 M5 的归属和触发条件判断预算及观测项紧急度；其余项按下文归属分别安排。原始审视基线为 `master` 的 `f4a4d57`（当时另有执行闭包未提交改动），不能当作当前工作树状态。进入实施的发现须按 `AGENTS.md` 施工流程核对事实并闭合设计；已关闭条目从本清单删除，由对应专题和 git 历史保留证据。
+> 状态：M2 的三处用户可达不可失败 heap 分配已修复并验证；A2/M3/M5 的触发和准入路径已核对，RV64 布局成本与正式 core/stress 两点堆采样已有开发证据。尚无运行中峰值、32 张账本饱和与其它 metadata 同时驻留的证据，不能以当前采样承诺 32 可满额准入；下一步补峰值与并发负载并据此校准全局政策，独立预算仍按授权触发。原始审视基线为 `master` 的 `f4a4d57`（当时另有执行闭包未提交改动），不能当作当前工作树状态。进入实施的发现须按 `AGENTS.md` 施工流程核对事实并闭合设计；已关闭条目从本清单删除，由对应专题和 git 历史保留证据。
 >
 > 本计划只拥有下列发现的**判断与验证面**。发现涉及的机制改造归各自既有专题（见「归属映射」），不重复安排同一问题。
 
@@ -45,15 +45,17 @@
 
 ### A2 全局 metadata 配额不可归属，与「纯 capability 授权」承诺冲突
 
-**现状与位置**：`os/kernel/src/task/resources.rs` 顶部常量。`REGION_SLOTS_PER_ADDRESS_SPACE = 4_096`、`MAX_ADMITTED_BOUND_ADDRESS_SPACES = 32`、`REGION_SLOT_GLOBAL_LIMIT = 两者相乘`、`ADDRESS_SPACE_GLOBAL_LIMIT = 4_096`、`PROCESS_GLOBAL_LIMIT = 4_096`。每笔成功 Map 至少产生一个 Region 与一个 `ReservationGroup`，切分还会铸造新 RegionKey，因此 region slot 是**一个全局共享池**，容量等于 32 个满密度地址空间。
+**现状与位置**：`os/kernel/src/task/resources.rs` 顶部常量。`REGION_SLOTS_PER_ADDRESS_SPACE = 4_096`、`MAX_ADMITTED_BOUND_ADDRESS_SPACES = 32`、`REGION_SLOT_GLOBAL_LIMIT = 两者相乘`、`ADDRESS_SPACE_GLOBAL_LIMIT = 4_096`、`PROCESS_GLOBAL_LIMIT = 4_096`。每笔成功 Map 至少产生一个 Region 与一个 `ReservationGroup`，切分还会铸造新 RegionKey；但全局 region slot 在 Bind 时按整张账本预留，而非随每次 Map 单独扣减。其容量对应 32 张满密度账本的准入，不是已证明的堆驻留能力。
 
-**判断**：`notes/ideas/mm.md` 自己写明「资源有账本和硬上限只证明可归属及失败安全，不自动证明不同授权域之间的 DoS 隔离」。当前 region slot / object view / endpoint / connection 等 per-sponsor 限额都挂在全局 admission 上，per-sponsor 限额是平摊的、不能授权、不能收紧。capability 授权的是**操作权**，不授权**资源额度**，而全局 metadata 池是 ambient 的。后果是：任何持 JobControl 的受托域都可以合法耗尽全局 region slot，使关键路径 Map 返回 `OutOfMemory`，且没有任何授权机制阻止——配额不在它的 capability 图上。另外 `MAX_ADMITTED_BOUND_ADDRESS_SPACES = 32` 是 `REGION_SLOT_GLOBAL_LIMIT` 的推导依据，但真正决定容量的是物理 metadata 字节；32 目前没有可追溯来源，与 `AGENTS.md`「工程限额必须有依据」冲突。
+**核实后的判断**：`notes/ideas/mm.md` 已明确区分有界准入与跨域 DoS 隔离。当前 per-sponsor 限额挂在全局 admission 上，不能转授或按域收紧；持 `CREATE` 的 JobControl 可以创建自己的 sponsor 并与其它创建者竞争全局容量，但只持 JobControl 不足以创建。`srv_init::DELEGATED_DOMAIN_RIGHTS` 授给 `srv_pm` 的 `pm_domain` control 只有 MANAGE|READ|WAIT，明确没有 CREATE；`srv_pm` 当前没有 ProcessCreate 路径。实际 ProcessCreate 调用集中在可信 `srv_init` 的启动与验收脚本，因此「现有 pm_domain 已是受托创建域」的原判断不成立。普通 Running 进程仍可在自己的 sponsor 内创建被授权的对象/映射，不能把 JobControl 的 CREATE 限制当成未来跨域预算隔离。32 是共享全局 region 与 planner transaction 容量的政策因子，不是从 heap 字节推导的容量证明；其来源尚未找到。
 
-**待办**：① 审查 `MAX_ADMITTED_BOUND_ADDRESS_SPACES` 等常量的依据，或按实际 metadata 字节从系统储备推导，或明确降级为「当前政策，见 KernelMemoryBudget」；② 认定 KernelMemoryBudget 的触发条件是否已被满足——`srv_pm` 已持 `pm_domain` JobControl 并管理子域进程，「受托创建域」在架构上已经存在，只是域内目前全是自研负载。
+**当前触发结论**：尚无证据表明已开放不可信创建域或需要跨域保证额度的真实消费者，KernelMemoryBudget 的硬触发条件目前未满足；`pm_domain` 是受托管理域，不是受托创建域。未来给域外进程授予 `CREATE`，或承诺一域不能耗尽另一域的 metadata 容量之前，必须完成独立预算，不得以当前全局政策代替。该结论同步由 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) 承接。
 
-**完成标准**：常量的依据可一句话说清并指向单一真值来源；触发条件的认定有明确结论（已满足 / 未满足 + 判定理由），结论写回 `notes/ideas/mm.md` 或 `kernel-memory-budget` 计划。
+**已测下界与待办**：目标 RV64 的 Region/transaction 条目为 96/64 字节，单张账本预留至少 393472 字节；32 张至少 12591104 字节，约为 16 MiB 物理 heap 储备的四分之三，尚未计入壳、其它对象和 allocator 开销。core/stress 的终点观测见「本轮核验与接力」。仍须取得真实创建时每张 Bound 地址空间的完整 heap 成本、运行期高水位/最大连续可用块、其它对象及完成路径的同时驻留成本、准入类别峰值与接近 32 张账本时的失败出口，再决定全局政策数值或降级为有出处的部署限制；不能单凭 32 张 ledger 的 Vec 下界推断可兑现容量。
 
-**把握程度**：高（常量取值已核对）。未核对全部使用点，也未确认是否已有未成文的 per-sponsor 收紧路径。
+**完成标准**：触发条件已按当前授权图判断；容量项仍待真实字节成本和运行期压力数据，使常量的理由可一句话说清并指向单一真值来源。未经校准不得把 32 写成系统可保证同时驻留的数量。
+
+**把握程度**：授权、Bind 路径和两种条目的 RV64 布局高；全对象成本与 32 的安全余量尚无测量。
 
 
 ## B 类：当前阶段的实质矛盾
@@ -135,11 +137,11 @@
 
 ### M3 region slot 的全局不可归属配额（A2 的容量面）
 
-**现状与位置**：`os/kernel/src/task/resources.rs`：`REGION_SLOTS_PER_ADDRESS_SPACE = 4_096`、`MAX_ADMITTED_BOUND_ADDRESS_SPACES = 32`、`REGION_SLOT_GLOBAL_LIMIT = 二者相乘`。
+**现状与位置**：`os/kernel/src/task/resources.rs`：`REGION_SLOTS_PER_ADDRESS_SPACE = 4_096`、`MAX_ADMITTED_BOUND_ADDRESS_SPACES = 32`、`REGION_SLOT_GLOBAL_LIMIT = 二者相乘`，planner transaction 全局数也同乘 32。`reserve_address_space` 在 Bind 前一次占用完整的 4096+4 槽，不是每笔 Map 各占一个全局 region slot；`os/memory_space/src/space.rs::MemorySpace::new` 在构造时以 `try_reserve_exact` 预留真实 4096 个 `Region` 和 4 个 transaction 的堆容量，失败在发布前返回 `NoFrame`/`OutOfMemory`。Region slot 的全局计数表示可接纳的整张 ledger 的上限，不等于实际 live fragment 数，也不保证相应 heap 字节已经可用。
 
-**判断**：每笔成功 Map 至少产生 1 个 Region 与 1 个 ReservationGroup，故 region slot 是全局共享池。`notes/impls/mm.md` 给出了 `REGION_SLOT_GLOBAL_LIMIT = 131072` 的算术推导，但 **32 本身无依据**——真正决定容量的是每 fragment 的 metadata 字节数。对照同一文档中 `MAX_ARENAS = 2048` 的推导（`16 × 2 × usize::BITS`，有依据），32 属于「政策常量伪装成容量推导」，违反 `AGENTS.md`「工程限额必须有依据」。
+**判断**：4096 是当前每地址空间固定 ledger 容量，同时作为本地 admission 上限；32 是全局最多完整预留 32 张 ledger 的准入政策。RV64 已知 ledger 元素的最低预留为 12591104 字节（32 张），但没有从其余 bytes、并发负载和系统储备推导出 32 的依据。即使只有一个 live fragment，Bind 也消耗一张 ledger 的全局 slots 和对应 Vec 容量。保留 32 作为待校准政策不等于保证 32 张满载账本能与其它 metadata 同时驻留，也不等于 4096 个 fragment 由任何全局字节预算担保。
 
-**待办**：与 A2 合并处理——给出依据（按实际 metadata 字节从系统储备推导）或明确降级为「当前政策，见 KernelMemoryBudget」。
+**待办**：与 A2 合并按真实 `Region`/transaction 布局、allocator 开销与其它对象峰值校准。独立 KernelMemoryBudget 解决来源隔离，不自动使全局容量数值合理；全局字节容量与域内可授权额度分别论证。
 
 **把握程度**：高（常量取值与推导链已核对）。
 
@@ -157,11 +159,11 @@
 
 **现状与位置**：`os/kernel/src/frame.rs` 的 `HEAP_CHUNK_LIMIT = 16`（每 chunk 1 MiB）、`RECOVERY_TICKET_LIMIT = 0`；`os/kernel/src/heap.rs` 的 `SystemSource` 只做 O(1) ticket pop，ticket 一经消费永久归堆且不支持归还。admission/Remote 槽高水位观测曾仅以 KernelMemoryBudget 立案或容量重校为触发条件；本项要求额外考虑用户可达 metadata 耗尽现场，候选登记见 [COMPASS](COMPASS.md#尚未立案的候选)。
 
-**判断**：当前 heap ticket 上限为 16 MiB（16 × 1 MiB），不是全部 metadata 容量的唯一真值；这一路径尚缺压力观测和接近上限时的分级拒绝证据。用户可达耗尽是否真的触发 M2 所述 panic 须先核实，不能把它当作已证实的后果。仅以 KernelMemoryBudget 立案或容量重校作为高水位观测触发条件仍可能偏窄。
+**核实后的判断**：M2 已证实并修复三处用户可达的不可失败分配；不能再以「是否真的触发 panic 待核实」作为 M5 前置。`admission_usage()` 统计 20 类 slot 的当前用量，主要用于启动自检；本轮启用 talc 5.0.4 的 `counters`，在 Ready 和授权 reset 时输出 claimed/allocated/available/fragment 与已消费的 system ticket 数。virt/core 的 Ready/Reset 分别为 allocated 404768/420152、available 16368224/16351680 字节；virt/stress 的 Reset 为 allocated 487288、available 16284544 字节。core Ready 与两条路线的 Reset 均已消费 16 个 ticket、claim 16776856 字节，证明「剩余 ticket 为零」不等于 allocator 已耗尽。快照并非高水位，且日志无法证明没有短时分配峰值或碎片导致的大块分配失败。
 
-**待办**：① 把触发条件放宽为「任何用户可达的 metadata 耗尽现场」（与 M2 联动）；② 提供 heap 高水位/剩余量观测，并在接近上限时对新的创建类操作返回干净错误而非等待 panic。
+**待办**：补代表性运行中峰值、准入计数峰值、接近容量时最大连续分配能力/失败布局的证据；当前两点观测不得宣称为高水位。采集不得在 allocator 锁内重入分配或引入锁序逆转。若实际观测或故障显示特定创建类操作需要分级拒绝，再依据其最坏准备成本和必须保留的完成容量定阈值、准入点及干净错误出口；不能用剩余 ticket 数或随意高水位代替 allocator 可用量与完成责任证明。真实 metadata OOM 现场、未来不可信创建域或容量重校任一出现时重排本项；现阶段保持 fallible 创建与已预付完成路径，不增设无依据的拒绝阈值。
 
-**把握程度**：中（常量与消费路径已核对，观测面缺失已确认；未评估实现成本）。
+**把握程度**：高（计数与采样点有代码和 QEMU 证据）；运行中峰值与阈值成本仍未知。
 
 ## D 类：协作式定性的诚实质疑（文档定性，不立案实施）
 
@@ -196,18 +198,23 @@
 
 ## 自然顺序
 
-当前只将 M2 的只读事实核实排入近期任务；其余发现不整体占用串行位置。以下为核实后的建议顺序，各项按归属接入既有专题或独立立案，不表示彼此均有技术依赖：
+M2 已修复，A2/M3 的授权触发与 M5 的两点观测已核实；下一项是运行期峰值及并发容量校准，不要求先实现独立预算。其余发现不整体占用串行位置；以下顺序仅用于接手，不表示彼此均有技术依赖：
 
 ```text
-M2 核实（纯读码；结论决定 A2/M3/M5 的紧急度）
+M5 运行中峰值 + A2/M3 并发容量校准（共享 heap/Region 证据）
   → M1（核实 affine claim token 的所有权窄缝）
-  → A2 + M3（同一配额问题，合并判断）
-  → M4 / M5（分别核实 extent 容器与堆压力观测）
+  → M4（核实 extent 容器）
   → B1（阻塞显式化，与现有 typed PendingCall 对照）
   → A1（观测面，待触发条件或主动补证）
   → C1 / C3（容量依据，各自独立）
   → C2（需先采集数据）
   → D（文档定性）
 ```
+
+KernelMemoryBudget 不按上述串行顺序自动开工；不可信创建域、独立预算授权或跨域容量保证一旦需要，须在开放前提前处理。
+
+## 本轮核验与接力
+
+`be6dae3` 的干净工作树为调查基线；首轮只读核对全局及本地计数、Bind 前整体预留和 fallible ledger 存储、JobControl 的 CREATE 校验、`srv_init` 对 `srv_pm` 的实际 grant。随后接入 Talc `counters`、目标布局与两点堆观测；`just check`、`just clippy`、virt/core、virt/stress 均通过（本轮运行摘要保存在 `artifacts/heap-core-run.log` 与 `artifacts/heap-stress-run.log`，成功 QEMU 路线的原始临时日志按工具惯例删除）。stress 摘要仅保留 Reset 行，故不把未留存的 Ready 行计作证据。检查重点：HEAP 计数复制后释放锁，再读取 SYSTEM_SUPPLY 并写 console；没有新增 ABI、跨组件 owner、分配准入阈值或测试专用消费者。Talc 启用 `counters` 增加常数级计数更新与 allocator 状态大小，尚未基准测试吞吐。未做同时准入 32 张账本或运行中峰值测试，本计划的容量完成标准仍未满足，保持进行中。
 
 每项在开工时按其归属映射并入对应专题；本计划唯一拥有的 C 类、M1、M4 等若需实施则单独立案。完成一项后从本清单删除该条并回填结论去向；全部清空后本计划归档。

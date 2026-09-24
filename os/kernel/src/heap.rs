@@ -49,3 +49,18 @@ unsafe impl Source for SystemSource {
 #[global_allocator]
 static HEAP: TalcLock<RankedRawSpinlock<{ ranks::HEAP.0 }>, SystemSource, DefaultBinning> =
     TalcLock::new(SystemSource);
+
+/// 仅在明确的观测点调用；计数快照不代表两个采样点之间的峰值。
+pub(crate) fn log_snapshot(stage: &str) {
+    let counters = *HEAP.lock().counters();
+    let chunks = frame::consumed_heap_chunks();
+    log!(
+        Heap,
+        "{stage}: claimed {} allocated {} available {} fragments {} chunks {}",
+        counters.claimed_bytes,
+        counters.allocated_bytes,
+        counters.available_bytes,
+        counters.fragment_count,
+        chunks
+    );
+}
