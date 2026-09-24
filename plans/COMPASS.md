@@ -4,7 +4,7 @@
 
 ## 当前接手
 
-**当前接手：FAL 集成基线固定提交审查**：[审查计划](todo-2026-09-13-fal-integration-baseline-review.md) 针对固定提交 `d22b9d7`，只读核对公共对象前置与混合集成边界。Agent 规范审查已归档并关闭；FAL 基本能力和内核组件身份统一均已完成，当前未提交工作树仍需按任务摘要整理。
+**当前接手：FAL 服务能力与内核身份统一提交后的独立 Review**：[审查计划](todo-2026-09-24-fal-kernel-closure-review.md) 固定提交 `dda8a5b6f4fd7700378f9e85804c6b1d30826601`，核对 FAL 责任链、`kernel` 身份迁移、构建入口、notes/plans 归档与提交范围。FAL 基本能力、内核身份施工和 Agent 规范审查均已完成；当前不执行新的实现改动。
 
 - 当前唯一施工入口已从 FAL 切换到固定提交审查；FAL 实现计划与内核身份计划均已完成，保留其验证证据和历史审查导航。
 - FAL 的 D0–D5、F4 结构复核/组合验收以及内核身份改名的构建、host、QEMU、boot-failure 证据分别写入所属计划；剩余仅为各固定提交的独立 Review。
@@ -36,6 +36,7 @@
 | [验收 fixture 清理](todo-2026-09-23-acceptance-fixture-cleanup.md) | 消费者矩阵、映像 owner 与失败判定已核对；两个 binary 暂留，余下逐项审查其他自检窗口 |
 | [内核身份统一](todo-2026-09-22-kernel-identity.md) | 已完成；package、默认 target、crate identifier、产物与有效入口统一为 `kernel`，构建/host/QEMU/boot-failure 验证通过 |
 | [Agent 规范与导航审查](archived/todo-2026-09-22-agent-guidance-review.md) | 已归档并关闭；报告见 [archived/review-2026-09-24-agent-guidance.md](archived/review-2026-09-24-agent-guidance.md) |
+| [FAL/内核闭包提交审查](todo-2026-09-24-fal-kernel-closure-review.md) | 当前接手；固定提交 `dda8a5b6`，FAL 责任链、`kernel` 身份迁移与文档边界 |
 | [FAL 集成基线审查](todo-2026-09-13-fal-integration-baseline-review.md) | 待审固定 `d22b9d7`；公共对象前置与混合集成边界 |
 | [公共时间审查](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 待审固定 `c6e0a84`；时钟、绝对期限与消费者 |
 | [库存来源审查](todo-2026-09-frame-source-selftest-review.md) | 待审固定 `606b59d`；库存、boot-held owner、清零与退款 |
