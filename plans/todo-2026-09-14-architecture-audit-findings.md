@@ -1,6 +1,6 @@
 # 架构审计发现承接
 
-> 状态：待逐条审视的开放发现清单，不是当前实施任务，不阻塞其他专题。先只读核实 M2 的用户可达 metadata 耗尽路径，再判断预算与观测项的紧急度；其余项按下文归属分别安排。原始审视基线为 `master` 的 `f4a4d57`（当时另有执行闭包未提交改动），不能当作当前工作树状态。进入实施的发现须按 `AGENTS.md` 施工流程核对事实并闭合设计；已关闭条目从本清单删除，由对应专题和 git 历史保留证据。
+> 状态：M2 已核实并完成三处用户可达不可失败 heap 分配的修复与验证；其余发现仍为待逐条审视清单。下一步按 M3/A2 与 M5 的归属和触发条件判断预算及观测项紧急度；其余项按下文归属分别安排。原始审视基线为 `master` 的 `f4a4d57`（当时另有执行闭包未提交改动），不能当作当前工作树状态。进入实施的发现须按 `AGENTS.md` 施工流程核对事实并闭合设计；已关闭条目从本清单删除，由对应专题和 git 历史保留证据。
 >
 > 本计划只拥有下列发现的**判断与验证面**。发现涉及的机制改造归各自既有专题（见「归属映射」），不重复安排同一问题。
 
@@ -124,9 +124,14 @@
 
 **判断**：两条规则冲突。若存在用户可达路径能把内核 metadata 吃光（结合 M3 的全局不可归属配额与 20 类 admission 的累计占用，这类路径不必恶意即可构成），则「合法 syscall → 内核 panic」成立。M2 与 M3 是同一问题的两面：**不可归属的全局配额 + 耗尽即 panic = 可被合法调用触发的内核死亡**。
 
-**待办（必须先补证）**：核实是否所有用户可达路径上的 metadata 分配都走 fallible 版本（`try_reserve` 等），使 `alloc_error_handler` 只在内核内部 bug 时触发。核实结果为「是」则本条降级为文档措辞修正；为「否」则须把对应路径改为返回 `SystemCallError::OutOfMemory`。**在核实前不改代码。**
+**核实结果（2026-09-24）**：该风险在当前代码中真实存在，不是纯文档冲突。已确认三条用户可达路径：
+- `os/kernel/src/syscall.rs` 的 `Debug` syscall 原先用 `alloc::vec![0; len]` 和 `alloc::format!`；
+- `os/kernel/src/task/proc.rs` 的 `Process::new` 原先构造 `ProcessHandleTable::new()`，其 `os/handle_table` 实现用 `vec![Slot { ... }]` 创建首槽。
+- `os/kernel/src/task/process.rs` 的 `ProcessGrant` 原先用 `map(...).collect()` 隐式分配 grant pairs。
+三处在 heap ticket 用尽时都会进入 `#[alloc_error_handler]` 的 panic，而不是返回 `SystemCallError::OutOfMemory`。消息、Wait、Map、线程、句柄、对象和 Tunnel 的已达分配点均已核对，使用 `try_reserve`/`try_reserve_exact`/`Arc::try_new` 或事务错误映射；`OrderedTable::new` 与 `VecDeque::new` 只建立空状态，不发生堆分配。
+**修复与验证**：Debug 缓冲改为 `try_reserve_exact` 并移除动态 pid tag；HandleTable 首槽改为 fallible `try_new`/`try_with_limit`，Process 构造将失败映射为 `SpaceError::NoFrame`；ProcessGrant 的 grant pairs 改为 `try_reserve_exact` + `push`；测试 fixture 同步迁移。`handle_table` host 18 项测试、`just check` 和 `just clippy` 均通过，当前 M2 的三处 panic 面已闭合。M3 的全局 quota 依据和 M5 的高水位观测仍不因 M2 修复自动关闭。
 
-**把握程度**：中——两条规则的冲突已确认，**未**逐条核实所有分配点的 fallibility。
+**把握程度**：高——三处用户可达不可失败分配已由代码定位、修复，并由 host/target 检查验证；其余已扫描分配点均有 fallible 预留或位于启动期/自检期。
 
 ### M3 region slot 的全局不可归属配额（A2 的容量面）
 

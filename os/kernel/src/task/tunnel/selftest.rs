@@ -165,7 +165,8 @@ pub(crate) fn run(root: &Arc<MemoryPool>) {
     let baseline = Inventory::read(root);
     let original = core::mem::replace(
         &mut *process.handles.lock(),
-        handle::ProcessHandleTable::with_limit(1),
+        handle::ProcessHandleTable::try_with_limit(1)
+            .expect("handle table fixture allocation failed"),
     );
     assert_failed(
         create(&thread, create_request(VA, output)),

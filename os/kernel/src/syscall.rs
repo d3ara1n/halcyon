@@ -670,7 +670,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
 }
 
 /// Debug(ptr, len)：读用户内存打印（rinlib debug! 的观测通道，测试用）。
-/// 纯透传零策略：拷入内核堆后以 `[pid N]` 话题、debug 等级色输出；
+/// 纯透传零策略：拷入内核堆后以 Debug 话题、pid 与 debug 等级色输出；
 /// 要自定义格式/颜色的用户态自己拼进消息字符串。正式的用户态输出
 /// 是未来的 console 服务（设备租借 + IPC），不经过内核日志。
 fn debug_print(frame: &mut UserContext, thread: &Thread) {
@@ -681,23 +681,32 @@ fn debug_print(frame: &mut UserContext, thread: &Thread) {
         respond_error(frame, SystemCallError::MemoryNotAccessible);
         return;
     }
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        respond_error(frame, SystemCallError::OutOfMemory);
+        return;
+    }
+    buf.resize(len, 0);
     let mut space = thread.process.space.lock();
-    let mut buf = alloc::vec![0u8; len];
     if let Err(e) = uaccess::copy_from_user(&mut space, &mut buf, ptr) {
         drop(space);
         respond_error(frame, e.into());
         return;
     }
     drop(space);
-    let tag = alloc::format!("pid {}", thread.process.pid);
     match core::str::from_utf8(&buf) {
-        Ok(msg) => {
-            crate::console::log_tagged(&tag, crate::console::COLOR_DEBUG, format_args!("{}", msg))
-        }
-        Err(_) => crate::console::log_tagged(
-            &tag,
+        Ok(msg) => crate::console::log_tagged(
+            "Debug",
             crate::console::COLOR_DEBUG,
-            format_args!("non-UTF-8 message, {} bytes", len),
+            format_args!("pid {}: {}", thread.process.pid, msg),
+        ),
+        Err(_) => crate::console::log_tagged(
+            "Debug",
+            crate::console::COLOR_DEBUG,
+            format_args!(
+                "pid {}: non-UTF-8 message, {} bytes",
+                thread.process.pid, len
+            ),
         ),
     }
     respond_ok(frame, len);

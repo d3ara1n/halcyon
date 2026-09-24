@@ -783,10 +783,13 @@ pub fn grant(
         };
         crate::uaccess::copy_from_user(&mut caller_space, grant_bytes, grants_ptr)?;
     }
-    let grant_pairs: Vec<(Handle, Rights)> = grants
-        .iter()
-        .map(|grant| (grant.handle, grant.rights))
-        .collect();
+    let mut grant_pairs = Vec::new();
+    grant_pairs
+        .try_reserve_exact(grants.len())
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    for grant in &grants {
+        grant_pairs.push((grant.handle, grant.rights));
+    }
 
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let builder = &concrete_builder(&builder_object)?;

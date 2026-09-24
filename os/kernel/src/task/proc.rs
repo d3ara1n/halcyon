@@ -4417,7 +4417,7 @@ impl Process {
             handles: crate::sync::Spinlock::chained(
                 crate::sync::ranks::HANDLE_TABLE,
                 pid,
-                super::handle::ProcessHandleTable::new(),
+                super::handle::ProcessHandleTable::try_new().map_err(|_| SpaceError::NoFrame)?,
             ),
             lifecycle: super::lifecycle::Lifecycle::building(),
             control: crate::sync::Spinlock::new(crate::sync::ranks::OBJECT_WAIT, None),

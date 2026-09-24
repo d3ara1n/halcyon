@@ -163,21 +163,25 @@ pub struct HandleTable<T, R> {
 }
 
 impl<T, R> HandleTable<T, R> {
-    pub fn new() -> Self {
-        Self::with_limit(DEFAULT_HANDLE_LIMIT)
+    pub fn try_new() -> Result<Self, TableError> {
+        Self::try_with_limit(DEFAULT_HANDLE_LIMIT)
     }
 
-    pub fn with_limit(limit: usize) -> Self {
+    pub fn try_with_limit(limit: usize) -> Result<Self, TableError> {
         // slot 0 永远无效，结构上直接退休。
-        let slots = alloc::vec![Slot {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(1)
+            .map_err(|_| TableError::AllocationFailed)?;
+        slots.push(Slot {
             generation: 0,
             state: SlotState::Retired,
-        }];
-        Self {
+        });
+        Ok(Self {
             slots,
             limit: limit.min(u32::MAX as usize),
             occupied: 0,
-        }
+        })
     }
 
     pub const fn len(&self) -> usize {
@@ -696,12 +700,6 @@ impl<T, R> HandleTable<T, R> {
     }
 }
 
-impl<T, R> Default for HandleTable<T, R> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -720,7 +718,7 @@ mod tests {
 
     #[test]
     fn stale_handle_never_names_reused_slot() {
-        let mut table = HandleTable::with_limit(2);
+        let mut table = HandleTable::try_with_limit(2).unwrap();
         let old = table.insert(entry(1, Role::Owner, Rights::READ)).unwrap();
         assert_eq!(table.remove(old).unwrap().object, 1);
         let new = table.insert(entry(2, Role::Owner, Rights::READ)).unwrap();
@@ -734,7 +732,7 @@ mod tests {
 
     #[test]
     fn generation_wrap_retires_slot() {
-        let mut table = HandleTable::with_limit(2);
+        let mut table = HandleTable::try_with_limit(2).unwrap();
         let first = table.insert(entry(1, Role::Owner, Rights::READ)).unwrap();
         let index = first.slot() as usize;
         table.slots[index].generation = u32::MAX;
@@ -747,7 +745,7 @@ mod tests {
 
     #[test]
     fn duplicate_requires_right_and_cannot_amplify() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let source = table
             .insert(entry(7, Role::Sender, Rights::WRITE | Rights::DUPLICATE))
             .unwrap();
@@ -763,7 +761,7 @@ mod tests {
 
     #[test]
     fn duplicate_and_move_preserve_object_and_role() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let source = table
             .insert(entry(
                 7,
@@ -782,7 +780,7 @@ mod tests {
 
     #[test]
     fn failed_move_keeps_every_source() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let a = table
             .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSIT))
             .unwrap();
@@ -799,7 +797,7 @@ mod tests {
 
     #[test]
     fn transit_and_direct_grant_require_distinct_rights() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let owner = table
             .insert(entry(1, Role::Owner, Rights::READ | Rights::GRANT))
             .unwrap();
@@ -825,7 +823,7 @@ mod tests {
 
     #[test]
     fn successful_move_retires_source_values() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let a = table
             .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSIT))
             .unwrap();
@@ -839,7 +837,7 @@ mod tests {
 
     #[test]
     fn reservation_commit_is_all_or_nothing() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let reservation = table.reserve(2, 9).unwrap();
         let handles = reservation.handles().to_vec();
         assert_eq!(table.len(), 0);
@@ -861,7 +859,7 @@ mod tests {
 
     #[test]
     fn prepared_commit_can_return_entries_before_publication() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         let reservation = table.reserve(1, 10).unwrap();
         let temporary = reservation.handles()[0];
         let prepared = table
@@ -876,7 +874,7 @@ mod tests {
 
     #[test]
     fn rollback_invalidates_temporary_values() {
-        let mut table: HandleTable<u32, Role> = HandleTable::new();
+        let mut table: HandleTable<u32, Role> = HandleTable::try_new().unwrap();
         let reservation = table.reserve(1, 11).unwrap();
         let temporary = reservation.handles()[0];
         table.rollback(reservation).unwrap();
@@ -887,7 +885,7 @@ mod tests {
 
     #[test]
     fn bounded_take_clears_reservations() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         table.insert(entry(1, Role::Owner, Rights::READ)).unwrap();
         let _reservation = table.reserve(1, 17).unwrap();
         let mut cursor = 1;
@@ -904,7 +902,7 @@ mod tests {
 
     #[test]
     fn take_next_needs_no_cleanup_allocation() {
-        let mut table = HandleTable::new();
+        let mut table = HandleTable::try_new().unwrap();
         table.insert(entry(1, Role::Owner, Rights::READ)).unwrap();
         table.insert(entry(2, Role::Owner, Rights::READ)).unwrap();
         let _reservation = table.reserve(1, 23).unwrap();
@@ -920,7 +918,7 @@ mod tests {
 
     #[test]
     fn limit_is_explicit() {
-        let mut table = HandleTable::with_limit(1);
+        let mut table = HandleTable::try_with_limit(1).unwrap();
         table.insert(entry(1, Role::Owner, Rights::READ)).unwrap();
         assert_eq!(
             table
@@ -943,7 +941,7 @@ mod pin_tests {
 
     #[test]
     fn consume_pin_hides_entry_until_commit() {
-        let mut table = Table::new();
+        let mut table = Table::try_new().unwrap();
         let handle = table.insert(entry(10)).unwrap();
         table.pin_consume(handle, Rights::READ, 7).unwrap();
         assert!(matches!(
@@ -961,7 +959,7 @@ mod pin_tests {
 
     #[test]
     fn unpin_restores_transfer_entries_losslessly() {
-        let mut table = Table::new();
+        let mut table = Table::try_new().unwrap();
         let protected = table.insert(entry(20)).unwrap();
         let grant = table.insert(entry(21)).unwrap();
         table
@@ -991,7 +989,7 @@ mod pin_tests {
 
     #[test]
     fn transfer_pin_validates_before_mutating() {
-        let mut table = Table::new();
+        let mut table = Table::try_new().unwrap();
         let protected = table.insert(entry(30)).unwrap();
         let no_grant = table.insert(Entry::new(31, 1, Rights::READ)).unwrap();
         assert!(matches!(
@@ -1009,7 +1007,7 @@ mod pin_tests {
 
     #[test]
     fn transfer_commit_preserves_request_order() {
-        let mut table = Table::new();
+        let mut table = Table::try_new().unwrap();
         let protected = table.insert(entry(1)).unwrap();
         let first_slot = table.insert(entry(2)).unwrap();
         let second_slot = table.insert(entry(3)).unwrap();
@@ -1033,7 +1031,7 @@ mod pin_tests {
 
     #[test]
     fn take_next_bounded_respects_scan_budget() {
-        let mut table = Table::with_limit(4096);
+        let mut table = Table::try_with_limit(4096).unwrap();
         let h1 = table.insert(entry(1)).unwrap();
         // 表扩到大量空槽后放入第二项。
         for i in 0..200 {
