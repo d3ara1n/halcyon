@@ -1,6 +1,5 @@
 //! srv_fs 验收 provider 的长期 Runtime 装配。
 
-use crate::watch::{self, ControlError, Effect, Effects};
 use alloc::vec::Vec;
 use alloc::{rc::Rc, string::String};
 use erhino_shared::{
@@ -9,7 +8,7 @@ use erhino_shared::{
     object::{Handle, HandleRole, ObjectSignals, Rights},
     time::Deadline,
 };
-use libbudget::{Budget, Charge, Taxonomy};
+use libbudget::{AccountView, Budget, Charge, Taxonomy};
 use libexecution::{
     ExecutionResource,
     runtime::{
@@ -20,45 +19,91 @@ use libexecution::{
 };
 use libfal::{
     authority::{AccessSnapshot, FalRights},
-    backend::{BackendError, Body, CommitResult, MemoryBackend, PreparedTake},
+    backend::{
+        Backend as FalBackend, BackendError, CommitFailure, CommitResult, CreateError, CreateInput,
+        LookupResult, MemoryBackend, MutationBackend as FalMutationBackend, NodeMetadata, Position,
+        PreparedMutation, PreparedTake, PropertyFailure, ProviderBackend as FalProviderBackend,
+        ReadError,
+    },
     bytes::Writer,
-    data::Data,
-    grant::{GrantObserver, GrantTable, Issuance, PreparedGrant},
+    grant::{GrantTable, Issuance},
     node::{NodeKind, validate_path},
-    protocol,
+    protocol, provider,
     resource::FalResource,
     route,
-    store::{NodeId, NodeRef},
-    value::{ExportPolicy, Protocol as ValueProtocol, StoredHandle, StoredValue, TakenValue},
+    store::{NodeId, NodeRef, RetireProgress},
+    value::{
+        ExportMode, ExportPolicy, Protocol as ValueProtocol, ReadSnapshot, SnapshotHandle,
+        StoredHandle, StoredValue, TakenValue,
+    },
+    watch::{self, ControlError, Effect, Effects, WakeBatch},
 };
 use librpc::dispatcher::{Completion, Dispatcher};
 use librpc::{CallCause, CallError, Outbox, OutboxResult, Request as RpcRequest, RequestContext};
+use libservice::{
+    protocol as service_protocol,
+    registry::{Registry, RegistryError},
+    resource::ServiceResource,
+};
 use rinlib::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
     notification,
-    object::duplicate,
+    object::{duplicate, query},
     packet::Packet,
     wait::wait_until,
     wait_set::WaitSet,
 };
 
+mod authority;
+use authority::AuthorityTask;
+mod registration;
+use registration::{IssuedRegistration, PendingRegistration, RegistrationReplyTask};
+mod stream;
+use stream::{OpenArgs, StreamControlTask, StreamTable, StreamTask};
 const KIND_MAILBOX: SourceKind = 1;
-const KIND_REPLY: SourceKind = 1;
+const KIND_REPLY: SourceKind = 11;
 const KIND_GRANT_LIFETIME: SourceKind = 2;
 const KIND_RETIRE: SourceKind = 3;
 const KIND_ROUTE: SourceKind = 4;
 const KIND_RELEASE: SourceKind = 5;
 const KIND_WATCH_OWNER: SourceKind = 6;
-const WATCH_LIMIT: usize = watch::LIMIT;
-const RETIRE_BIT: u64 = 1;
+const KIND_REGISTRATION: SourceKind = 7;
+const KIND_REGISTRATION_LIFETIME: SourceKind = 8;
+const KIND_REGISTRATION_ENDPOINT: SourceKind = 9;
+const KIND_AUTHORITY_LIFETIME: SourceKind = 10;
+const KIND_STREAM_LIFETIME: SourceKind = 12;
+const KIND_STREAM_DATA: SourceKind = 13;
+const MEMORY_NODE_LIMIT: usize = 64;
+const REGISTRATION_LIMIT: usize = 16;
+const GRANT_LIMIT: usize = 16;
+const AUTHORITY_LIMIT: usize = REGISTRATION_LIMIT;
+const WATCH_LIMIT: usize = 24;
+const REQUEST_HEADROOM: usize = 16;
+const STREAM_LIMIT: usize = REQUEST_HEADROOM - 1;
 const DISPATCH_LIMIT: usize = 8;
+const RETIRE_BIT: u64 = 1;
 
-struct RouteBinding {
-    name: String,
-    target: MailboxSender,
-    rights: FalRights,
-}
+// 固定任务：retire、dispatcher、FAL ingress、route、release，以及 A 的注册 ingress
+// 或 B 的注册 client；其余按各域最多同时存活的任务计算。
+const TASK_LIMIT: usize = 6
+    + GRANT_LIMIT
+    + AUTHORITY_LIMIT
+    + REGISTRATION_LIMIT
+    + WATCH_LIMIT
+    + REQUEST_HEADROOM
+    + 2 * STREAM_LIMIT
+    + DISPATCH_LIMIT;
+// 固定来源含 dispatcher 的 2D+1；请求余量按回复与下游两来源预留。
+const SOURCE_LIMIT: usize = 7
+    + (2 * DISPATCH_LIMIT + 1)
+    + 2 * GRANT_LIMIT
+    + 2 * AUTHORITY_LIMIT
+    + 3 * REGISTRATION_LIMIT
+    + 2 * WATCH_LIMIT
+    + 2 * REQUEST_HEADROOM
+    + 4 * STREAM_LIMIT
+    + DISPATCH_LIMIT;
 
 struct DispatchSubmission {
     waiter: u64,
@@ -67,886 +112,632 @@ struct DispatchSubmission {
     request: RpcRequest,
 }
 
-struct World {
-    mailbox: Mailbox,
+enum DispatchIntent {
+    Submit(DispatchSubmission),
+    Cancel { txid: u64 },
+}
+
+enum RegistrationEndpoint {
+    Authority(Mailbox),
+    Client(MailboxSender),
+}
+
+struct ServiceBackend {
+    memory: MemoryBackend<Capability>,
+    registry: Option<Registry<Capability>>,
+    route: Option<route::Binding<Capability>>,
+}
+
+impl ServiceBackend {
+    fn new(
+        fal_account: &AccountView<FalResource>,
+        service_account: &AccountView<ServiceResource>,
+        wake: Rc<dyn libexecution::wake::Wake>,
+        registry: bool,
+    ) -> Result<Self, BackendError> {
+        let mut memory = MemoryBackend::new(fal_account, MEMORY_NODE_LIMIT, wake.clone())?;
+        let registry = match registry
+            .then(|| {
+                Registry::new(
+                    fal_account.clone(),
+                    service_account.clone(),
+                    REGISTRATION_LIMIT,
+                    wake,
+                )
+            })
+            .transpose()
+        {
+            Ok(registry) => registry,
+            Err(error) => {
+                // 尚未发布的 Memory 只有无能力的根，seal 后可有界退休。
+                memory.seal();
+                while !memory.is_empty() {
+                    memory
+                        .retire_step(1)
+                        .expect("unpublished memory root retirement failed");
+                }
+                assert!(
+                    memory.close().is_ok(),
+                    "unpublished memory root retained an owner"
+                );
+                return Err(registry_backend_error(error));
+            }
+        };
+        Ok(Self {
+            memory,
+            registry,
+            route: None,
+        })
+    }
+
+    fn registry_root(&self) -> Option<NodeRef> {
+        self.registry.as_ref()?.root().cloned()
+    }
+
+    fn registry_for_access(&self, access: &AccessSnapshot) -> Option<&Registry<Capability>> {
+        let registry = self.registry.as_ref()?;
+        registry.owns_node(access.root()).then_some(registry)
+    }
+
+    fn registry_for_ref(&self, reference: &NodeRef) -> Option<&Registry<Capability>> {
+        let registry = self.registry.as_ref()?;
+        registry.owns_node(reference).then_some(registry)
+    }
+
+    fn bind_route(
+        &mut self,
+        name: &str,
+        target: MailboxSender,
+        rights: FalRights,
+    ) -> Result<(), BackendError> {
+        let root = self.memory.root().ok_or(BackendError::Closed)?;
+        let name = copy_request_name(name).map_err(BackendError::Resource)?;
+        self.route = Some(route::Binding::new(
+            root,
+            name,
+            target.into_capability(),
+            rights,
+        ));
+        Ok(())
+    }
+}
+
+fn registry_backend_error(error: RegistryError) -> BackendError {
+    match error {
+        RegistryError::Closed => BackendError::Closed,
+        RegistryError::Permission => BackendError::Permission,
+        RegistryError::Invalid => BackendError::InvalidName,
+        RegistryError::Exists => BackendError::Exists,
+        RegistryError::NotFound => BackendError::NotFound,
+        RegistryError::Conflict | RegistryError::Expired => BackendError::Conflict,
+        RegistryError::Resource(error) => BackendError::Resource(error),
+    }
+}
+
+impl FalBackend<Capability> for ServiceBackend {
+    fn root(&self) -> Option<&NodeRef> {
+        self.memory.root()
+    }
+
+    fn resolve(&self, access: &AccessSnapshot, path: &str) -> Result<NodeRef, BackendError> {
+        if let Some(registry) = self.registry_for_access(access) {
+            registry.resolve(access, path)
+        } else {
+            self.memory.resolve(access, path)
+        }
+    }
+
+    fn lookup(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<LookupResult<Capability>, BackendError> {
+        if let Some(registry) = self.registry_for_access(access) {
+            return registry.lookup(access, path);
+        }
+        if let Some(binding) = self.route.as_ref()
+            && let Some(boundary) = binding.lookup(access, path)?
+        {
+            return Ok(boundary);
+        }
+        self.memory.lookup(access, path)
+    }
+
+    fn metadata(
+        &self,
+        reference: &NodeRef,
+        ceiling: FalRights,
+    ) -> Result<NodeMetadata, BackendError> {
+        if let Some(registry) = self.registry_for_ref(reference) {
+            registry.metadata(reference, ceiling)
+        } else {
+            self.memory.metadata(reference, ceiling)
+        }
+    }
+
+    fn enumerate<F>(
+        &self,
+        parent: &NodeRef,
+        access: &AccessSnapshot,
+        cursor: u64,
+        limit: usize,
+        visit: F,
+    ) -> Result<u64, BackendError>
+    where
+        F: FnMut(&str, &NodeRef, NodeMetadata),
+    {
+        if let Some(registry) = self.registry_for_access(access) {
+            registry.enumerate(parent, access, cursor, limit, visit)
+        } else {
+            FalBackend::enumerate(&self.memory, parent, access, cursor, limit, visit)
+        }
+    }
+
+    fn read_snapshot(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<ReadSnapshot<Capability>, ReadError> {
+        if let Some(registry) = self.registry_for_access(access) {
+            registry.read_snapshot(access, path)
+        } else {
+            self.memory.read_snapshot(access, path)
+        }
+    }
+
+    fn watch_snapshot(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<(NodeRef, u64), BackendError> {
+        if let Some(registry) = self.registry_for_access(access) {
+            registry.watch_snapshot(access, path)
+        } else {
+            self.memory.watch_snapshot(access, path)
+        }
+    }
+
+    fn seal(&mut self) {
+        self.route = None;
+        self.memory.seal();
+        if let Some(registry) = self.registry.as_mut() {
+            registry.seal();
+        }
+    }
+
+    fn has_retire_work(&self) -> bool {
+        self.memory.has_retire_work()
+            || self
+                .registry
+                .as_ref()
+                .is_some_and(FalBackend::has_retire_work)
+    }
+
+    fn retire_step(&mut self, budget: usize) -> Result<RetireProgress, SystemCallError> {
+        if budget == 0 {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let memory = self.memory.retire_step(budget)?;
+        if memory.work_done == budget {
+            return Ok(RetireProgress {
+                work_done: memory.work_done,
+                done: !self.has_retire_work(),
+            });
+        }
+        let registry = if let Some(registry) = self.registry.as_mut() {
+            registry.retire_step(budget - memory.work_done)?
+        } else {
+            RetireProgress {
+                work_done: 0,
+                done: true,
+            }
+        };
+        Ok(RetireProgress {
+            work_done: memory.work_done + registry.work_done,
+            done: memory.done && registry.done,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.route.is_none()
+            && self.memory.is_empty()
+            && self.registry.as_ref().is_none_or(FalBackend::is_empty)
+    }
+
+    fn close(self) -> Result<(), Self> {
+        if !self.is_empty() {
+            return Err(self);
+        }
+        let Self {
+            memory,
+            registry,
+            route: _,
+        } = self;
+        let Ok(()) = memory.close() else {
+            unreachable!("empty memory backend refused close")
+        };
+        if let Some(registry) = registry {
+            let Ok(()) = registry.close() else {
+                unreachable!("empty Registry backend refused close")
+            };
+        }
+        Ok(())
+    }
+}
+
+impl FalMutationBackend<Capability> for ServiceBackend {
+    type TakeReservation = PreparedTake<Capability>;
+    type Position = Position;
+    type Mutation = PreparedMutation<Capability>;
+    fn lookup_child(
+        &self,
+        parent: &NodeRef,
+        name: &str,
+        access: &AccessSnapshot,
+    ) -> Result<NodeRef, BackendError> {
+        if let Some(registry) = self.registry_for_ref(parent) {
+            if registry.root().ok_or(BackendError::Closed)?.id() != parent.id() {
+                return Err(BackendError::NotDirectory);
+            }
+            registry.resolve(access, name)
+        } else {
+            self.memory.lookup_child(parent, name, access)
+        }
+    }
+
+    fn read_stream(
+        &self,
+        reference: &NodeRef,
+        access: &AccessSnapshot,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, BackendError> {
+        if self.registry_for_ref(reference).is_some() {
+            Err(BackendError::WrongType)
+        } else {
+            self.memory.read_stream(reference, access, offset, buffer)
+        }
+    }
+
+    fn property(&self, reference: &NodeRef) -> Result<&StoredValue<Capability>, BackendError> {
+        if self.registry_for_ref(reference).is_some() {
+            Err(BackendError::WrongType)
+        } else {
+            self.memory.property(reference)
+        }
+    }
+
+    fn position(
+        &self,
+        parent: &NodeRef,
+        final_name: &str,
+        expected: Option<(NodeId, u64)>,
+    ) -> Result<Self::Position, BackendError> {
+        if self.registry_for_ref(parent).is_some() {
+            Err(BackendError::Permission)
+        } else {
+            self.memory.position(parent, final_name, expected)
+        }
+    }
+
+    fn prepare_create(
+        &self,
+        position: Self::Position,
+        access: &AccessSnapshot,
+        input: CreateInput<'_>,
+        owners: &mut Vec<Capability>,
+        rights: FalRights,
+    ) -> Result<Self::Mutation, CreateError> {
+        if self.registry_for_access(access).is_some() {
+            Err(CreateError::Backend(BackendError::Permission))
+        } else {
+            self.memory
+                .prepare_create_input(position, access, input, owners, rights)
+        }
+    }
+
+    fn prepare_delete(
+        &self,
+        position: Self::Position,
+        access: &AccessSnapshot,
+    ) -> Result<Self::Mutation, BackendError> {
+        self.memory.prepare_delete(position, access)
+    }
+
+    fn prepare_property(
+        &self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+        value: StoredValue<Capability>,
+    ) -> Result<Self::Mutation, PropertyFailure<Capability>> {
+        if self.registry_for_ref(&target).is_some() {
+            Err(PropertyFailure {
+                error: BackendError::Permission,
+                value,
+            })
+        } else {
+            self.memory.prepare_property(target, access, value)
+        }
+    }
+
+    fn prepare_write(
+        &self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<Self::Mutation, BackendError> {
+        if self.registry_for_ref(&target).is_some() {
+            Err(BackendError::Permission)
+        } else {
+            self.memory.prepare_write(target, access, offset, bytes)
+        }
+    }
+
+    fn prepare_move(
+        &self,
+        source: Self::Position,
+        source_access: &AccessSnapshot,
+        destination: &AccessSnapshot,
+        final_name: &str,
+    ) -> Result<Self::Mutation, BackendError> {
+        let source_registry = self.registry_for_ref(source.parent()).is_some();
+        let destination_registry = self.registry_for_access(destination).is_some();
+        if source_registry != destination_registry {
+            Err(BackendError::CrossDevice)
+        } else if source_registry {
+            Err(BackendError::Permission)
+        } else {
+            self.memory
+                .prepare_move(source, source_access, destination, final_name)
+        }
+    }
+
+    fn validate_move_step(
+        &self,
+        mutation: &mut Self::Mutation,
+        budget: usize,
+    ) -> Result<bool, BackendError> {
+        self.memory.validate_move_step(mutation, budget)
+    }
+
+    fn commit(
+        &mut self,
+        mutation: Self::Mutation,
+    ) -> Result<CommitResult, CommitFailure<Self::Mutation>> {
+        self.memory.commit(mutation)
+    }
+
+    fn prepare_take(
+        &mut self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+    ) -> Result<Self::TakeReservation, BackendError> {
+        if self.registry_for_ref(&target).is_some() {
+            Err(BackendError::Permission)
+        } else {
+            self.memory.prepare_take(target, access)
+        }
+    }
+
+    fn take_value(prepared: &mut Self::TakeReservation) -> TakenValue<Capability> {
+        MemoryBackend::take_value(prepared)
+    }
+
+    fn commit_take(&mut self, prepared: Self::TakeReservation) {
+        self.memory.commit_take(prepared);
+    }
+
+    fn rollback_take(&mut self, prepared: Self::TakeReservation, value: TakenValue<Capability>) {
+        self.memory.rollback_take(prepared, value);
+    }
+}
+
+trait RuntimeBackend: FalProviderBackend<Capability> {
+    fn registry(&self) -> Option<&Registry<Capability>>;
+    fn registry_mut(&mut self) -> Option<&mut Registry<Capability>>;
+    fn bind_route(
+        &mut self,
+        name: &str,
+        target: MailboxSender,
+        rights: FalRights,
+    ) -> Result<(), BackendError>;
+}
+
+impl RuntimeBackend for ServiceBackend {
+    fn registry(&self) -> Option<&Registry<Capability>> {
+        self.registry.as_ref()
+    }
+
+    fn registry_mut(&mut self) -> Option<&mut Registry<Capability>> {
+        self.registry.as_mut()
+    }
+
+    fn bind_route(
+        &mut self,
+        name: &str,
+        target: MailboxSender,
+        rights: FalRights,
+    ) -> Result<(), BackendError> {
+        ServiceBackend::bind_route(self, name, target, rights)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RegistrationControl {
+    instance: u64,
+    task_id: u64,
+}
+
+struct World<B = ServiceBackend> {
+    provider: provider::State<B>,
     route_mailbox: Handle,
-    route: Option<RouteBinding>,
-    dispatch_submission: Option<DispatchSubmission>,
+    dispatch_intent: Option<DispatchIntent>,
     dispatcher_task: u64,
-    backend: Option<MemoryBackend<Capability>>,
-    grants: Option<GrantTable>,
+    root_grant_task: u64,
+    registry_grant_task: Option<u64>,
+    registration_endpoint: Option<RegistrationEndpoint>,
+    registration_ready: bool,
     root_sender: Option<MailboxSender>,
-    retire_task: u64,
-    retire_ready: bool,
-    backend_sealed: bool,
-    committed: u64,
-    abandoned: u64,
+    registry_sender: Option<MailboxSender>,
+    registration_root_sender: Option<MailboxSender>,
+    registration_controls: Vec<RegistrationControl>,
+    streams: StreamTable,
     downstream_abandoned: u64,
-    watches: watch::Table,
     stop: bool,
     failed: bool,
 }
 
-struct WatchOwner {
-    id: u64,
-    context: u64,
-    node: NodeRef,
-    access: AccessSnapshot,
-    path: String,
-    mask: protocol::WatchMask,
-    signaler: Option<Capability>,
-    _watch_charge: Charge,
-    _source_charge: Charge,
-}
-
-struct WatchTask {
-    owner: WatchOwner,
-    outbox: Option<Outbox>,
-    info: Option<protocol::SubscriptionInfo>,
-    task_id: Option<u64>,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
-    encoded: bool,
-    recorded: bool,
-    stopping: bool,
-    provider_stopping: bool,
-    registration_error: Option<protocol::Status>,
-}
-
-impl WatchTask {
-    fn new(owner: WatchOwner, outbox: Outbox) -> Self {
-        Self {
-            owner,
-            outbox: Some(outbox),
-            info: None,
-            task_id: None,
-            source: None,
-            requested: false,
-            removing: false,
-            encoded: false,
-            recorded: false,
-            stopping: false,
-            provider_stopping: false,
-            registration_error: None,
-        }
-    }
-
-    fn record_outbox(&mut self, world: &mut World) -> Result<(), SystemCallError> {
-        let Some(outbox) = self.outbox.as_ref() else {
-            return Ok(());
-        };
-        if !outbox.is_complete() || self.recorded {
-            return Ok(());
-        }
-        world.committed = world
-            .committed
-            .checked_add(1)
-            .ok_or(SystemCallError::ReachLimit)?;
-        if let Some(OutboxResult::Abandoned(cause)) = outbox.result() {
-            world.abandoned = world
-                .abandoned
-                .checked_add(1)
-                .ok_or(SystemCallError::ReachLimit)?;
-            rinlib::debug!(
-                "fs: Subscribe response abandoned after install: {:?}",
-                cause
+impl<B> World<B> {
+    fn publish_initial_grant(&mut self, task_id: u64, sender: MailboxSender) {
+        if task_id == self.root_grant_task {
+            assert!(
+                self.root_sender.replace(sender).is_none(),
+                "root grant published more than once"
             );
+        } else if Some(task_id) == self.registry_grant_task {
+            assert!(
+                self.registry_sender.replace(sender).is_none(),
+                "Registry root grant published more than once"
+            );
+        } else {
+            panic!("unexpected initial grant task");
         }
-        self.recorded = true;
-        Ok(())
-    }
-
-    fn encode_reply(&mut self) -> Result<(), SystemCallError> {
-        if self.encoded {
-            return Ok(());
-        }
-        let outbox = self.outbox.as_mut().expect("Watch response owner missing");
-        let status = self.registration_error.unwrap_or(protocol::Status::Ok);
-        let response = self
-            .info
-            .map(protocol::Response::Subscription)
-            .unwrap_or(protocol::Response::Empty);
-        let used = protocol::encode_response(
-            protocol::Op::Subscribe,
-            status,
-            outbox.deadline(),
-            &response,
-            outbox.response_mut()?.body_mut()?,
-        )
-        .ok_or(SystemCallError::InternalError)?;
-        outbox.response_mut()?.finish_body(used)?;
-        self.encoded = true;
-        Ok(())
-    }
-
-    fn close_signaler(&mut self) -> Result<(), SystemCallError> {
-        let Some(signaler) = self.owner.signaler.take() else {
-            return Ok(());
-        };
-        signaler.close().map_err(|(_, error)| error)
     }
 }
 
-impl Task<World> for WatchTask {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> provider::Host<B> for World<B> {
+    fn provider(&self) -> &provider::State<B> {
+        &self.provider
+    }
+    fn provider_mut(&mut self) -> &mut provider::State<B> {
+        &mut self.provider
+    }
+    fn publish_initial_grant(&mut self, task_id: u64, sender: MailboxSender) {
+        World::publish_initial_grant(self, task_id, sender);
+    }
+    fn stopping(&self) -> bool {
+        self.stop
+    }
+    fn fail(&mut self) {
+        self.failed = true;
+    }
+}
+
+type WatchTask = provider::Watch;
+
+impl<B: RuntimeBackend> Task<World<B>> for WatchTask {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
-        self.task_id.get_or_insert(id);
-        while let Some(event) = input.pull() {
-            if event.kind == KIND_REPLY {
-                if let Some(outbox) = self.outbox.as_mut() {
-                    outbox.observe(event);
-                }
-            } else if event.kind == KIND_WATCH_OWNER
-                && (event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED))
-            {
-                self.stopping = true;
-            }
-        }
-        if input.take_timeout()
-            && let Some(outbox) = self.outbox.as_mut()
-        {
-            outbox.timed_out();
-        }
-
-        if !self.stopping && self.info.is_none() && self.registration_error.is_none() {
-            if self.source.is_none() && !self.requested {
-                requests.add_source(
-                    self.owner
-                        .signaler
-                        .as_ref()
-                        .expect("Watch signaler missing before registration")
-                        .as_handle(),
-                    ObjectSignals::CLOSED,
-                    KIND_WATCH_OWNER,
-                )?;
-                self.requested = true;
-            }
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
-        }
-
-        if !self.stopping && self.info.is_some() && !world.watches.contains(self.owner.id) {
-            self.stopping = true;
-        }
-
-        if self.stopping {
-            if world.watches.contains(self.owner.id) {
-                if self.provider_stopping {
-                    let mut bits = world
-                        .watches
-                        .take_pending(self.owner.id)
-                        .map_or(protocol::WatchMask::NONE, |(pending, _)| pending);
-                    bits |= protocol::WatchMask::TERMINATED;
-                    match notification::signal(
-                        self.owner
-                            .signaler
-                            .as_ref()
-                            .expect("installed Watch lost its signaler")
-                            .as_handle(),
-                        bits.raw(),
-                    ) {
-                        Ok(()) | Err(SystemCallError::ObjectClosed) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                world.watches.remove(self.owner.id);
-            }
-            if let Some(outbox) = self.outbox.as_mut() {
-                if !outbox.is_complete() {
-                    outbox.stop(world);
-                    let advance = outbox.drive(requests, budget)?;
-                    if !outbox.is_complete() {
-                        return Ok(advance);
-                    }
-                }
-                self.record_outbox(world)?;
-                self.outbox = None;
-            }
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Runnable,
-                });
-            }
-            if self.source.is_none() && !self.requested {
-                self.close_signaler()?;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Parked,
-            });
-        }
-
-        if let Some((pending, _)) = world.watches.take_pending(self.owner.id)
-            && !pending.is_empty()
-        {
-            match notification::signal(
-                self.owner
-                    .signaler
-                    .as_ref()
-                    .expect("installed Watch lost its signaler")
-                    .as_handle(),
-                pending.raw(),
-            ) {
-                Ok(()) => {}
-                Err(SystemCallError::ObjectClosed) => {
-                    self.stopping = true;
-                    return Ok(Advance {
-                        work_done: 1,
-                        step: Step::Runnable,
-                    });
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        if self.outbox.is_some() {
-            if self
-                .outbox
-                .as_ref()
-                .is_some_and(|outbox| !outbox.is_admitted() && outbox.result().is_none())
-            {
-                return Ok(self
-                    .outbox
-                    .as_mut()
-                    .expect("Watch response owner missing")
-                    .admit(requests));
-            }
-            if !self.encoded
-                && self
-                    .outbox
-                    .as_ref()
-                    .is_some_and(|outbox| outbox.result().is_none())
-            {
-                self.encode_reply()?;
-            }
-            let advance = self
-                .outbox
-                .as_mut()
-                .expect("Watch response owner missing")
-                .drive(requests, budget)?;
-            if self.outbox.as_ref().is_some_and(Outbox::is_complete) {
-                let abandoned = matches!(
-                    self.outbox.as_ref().and_then(Outbox::result),
-                    Some(OutboxResult::Abandoned(_))
-                );
-                self.record_outbox(world)?;
-                self.outbox = None;
-                if abandoned || self.registration_error.is_some() {
-                    self.stopping = true;
-                    return Ok(Advance {
-                        work_done: 1,
-                        step: Step::Runnable,
-                    });
-                }
-            } else {
-                return Ok(advance);
-            }
-        }
-        Ok(Advance {
-            work_done: 1,
-            step: Step::Parked,
-        })
+        provider::Watch::advance(self, id, world, requests, input, budget)
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<ServiceTask>) {
-        match failure {
-            RequestFailure::Source {
-                kind: KIND_WATCH_OWNER,
-                error,
-            } => {
-                self.requested = false;
-                self.registration_error = Some(match error {
-                    SystemCallError::ObjectClosed | SystemCallError::StaleHandle => {
-                        protocol::Status::Cancelled
-                    }
-                    SystemCallError::QuotaExceeded => protocol::Status::Quota,
-                    SystemCallError::OutOfMemory => protocol::Status::Resource,
-                    _ => protocol::Status::Internal,
-                });
-            }
-            failure => {
-                if let Some(outbox) = self.outbox.as_mut() {
-                    outbox.refused(world, failure);
-                }
-            }
-        }
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        provider::Watch::refused(self, world, failure);
     }
 
-    fn registered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
-        if kind == KIND_REPLY {
-            if let Some(outbox) = self.outbox.as_mut() {
-                outbox.registered(world, kind, source);
-            }
-            return;
-        }
-        if kind != KIND_WATCH_OWNER {
-            return;
-        }
-        self.requested = false;
-        self.source = Some(source);
-        let installation = (|| {
-            let backend = world
-                .backend
-                .as_ref()
-                .expect("provider backend missing during Watch installation");
-            let current = resolve_v2(backend, &self.owner.access, &self.owner.path)
-                .map_err(backend_status)?;
-            if current.id() != self.owner.node.id() {
-                return Err(protocol::Status::Conflict);
-            }
-            let node = backend.get(&current).ok_or(protocol::Status::NotFound)?;
-            if !self
-                .owner
-                .access
-                .rights()
-                .intersect(node.rights())
-                .contains(FalRights::WATCH)
-            {
-                return Err(protocol::Status::Permission);
-            }
-            Ok(node.version())
-        })();
-        match installation {
-            Ok(generation) => {
-                let info = world.watches.install(
-                    self.owner.id,
-                    self.owner.context,
-                    self.owner.node.id(),
-                    self.task_id.expect("Watch task id missing at installation"),
-                    generation,
-                    self.owner.mask,
-                );
-                self.info = Some(info);
-            }
-            Err(status) => self.registration_error = Some(status),
-        }
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        provider::Watch::registered(self, world, kind, source);
     }
 
-    fn unregistered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
-        if kind == KIND_REPLY {
-            if let Some(outbox) = self.outbox.as_mut() {
-                outbox.unregistered(world, kind, source);
-            }
-        } else if kind == KIND_WATCH_OWNER && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
-        }
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        provider::Watch::unregistered(self, world, kind, source);
     }
 
-    fn stop(&mut self, _world: &mut World) {
-        self.provider_stopping = true;
-        self.stopping = true;
+    fn stop(&mut self, _world: &mut World<B>) {
+        provider::Watch::stop(self);
     }
 
     fn deadline(&self) -> Deadline {
-        self.outbox
-            .as_ref()
-            .map_or(Deadline::INFINITE, Outbox::deadline)
+        provider::Watch::deadline(self)
     }
 }
 
-struct GrantTask {
-    prepared: Option<PreparedGrant>,
-    observer: Option<GrantObserver>,
-    publication: GrantPublication,
-    outbox: Option<Outbox>,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
-    stopping: bool,
-}
+type GrantTask = provider::Grant;
 
-enum GrantPublication {
-    Root,
-    Reply {
-        info: protocol::NodeInfo,
-        sender: Option<MailboxSender>,
-        encoded: bool,
-    },
-}
-
-impl GrantTask {
-    fn root(prepared: PreparedGrant) -> Self {
-        Self {
-            prepared: Some(prepared),
-            observer: None,
-            publication: GrantPublication::Root,
-            outbox: None,
-            source: None,
-            requested: false,
-            removing: false,
-            stopping: false,
-        }
-    }
-
-    fn reply(prepared: PreparedGrant, outbox: Outbox, info: protocol::NodeInfo) -> Self {
-        Self {
-            prepared: Some(prepared),
-            observer: None,
-            publication: GrantPublication::Reply {
-                info,
-                sender: None,
-                encoded: false,
-            },
-            outbox: Some(outbox),
-            source: None,
-            requested: false,
-            removing: false,
-            stopping: false,
-        }
-    }
-
-    fn drive_publication(
-        &mut self,
-        requests: &mut Requests<ServiceTask>,
-        budget: usize,
-    ) -> Result<Option<Advance>, SystemCallError> {
-        let GrantPublication::Reply {
-            info,
-            sender,
-            encoded,
-        } = &mut self.publication
-        else {
-            return Ok(None);
-        };
-        let Some(active) = self.outbox.as_mut() else {
-            return Ok(None);
-        };
-        if active.result().is_none() && !active.is_admitted() {
-            return Ok(Some(active.admit(requests)));
-        }
-        if active.result().is_none() && !*encoded {
-            let deadline = active.deadline();
-            let response = active.response_mut()?;
-            let used = protocol::encode_response(
-                protocol::Op::Derive,
-                protocol::Status::Ok,
-                deadline,
-                &protocol::Response::Node(*info),
-                response.body_mut()?,
-            )
-            .ok_or(SystemCallError::InternalError)?;
-            let grant = sender
-                .take()
-                .expect("derived grant installation lost its sender");
-            response
-                .push(
-                    grant.into_capability(),
-                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
-                )
-                .map_err(|failure| failure.error)?;
-            response.finish_body(used)?;
-            *encoded = true;
-        }
-        let advance = active.drive(requests, budget)?;
-        if active.is_complete() {
-            let abandoned = !matches!(active.result(), Some(OutboxResult::Sent));
-            self.outbox = None;
-            if abandoned {
-                *sender = None;
-                self.stopping = true;
-            }
-            return Ok(Some(Advance {
-                work_done: advance.work_done,
-                step: if self.stopping {
-                    Step::Runnable
-                } else {
-                    Step::Parked
-                },
-            }));
-        }
-        Ok(Some(advance))
-    }
-}
-
-impl Task<World> for GrantTask {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for GrantTask {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
-        _id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        id: u64,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
-        _budget: usize,
+        budget: usize,
     ) -> Result<Advance, SystemCallError> {
-        while let Some(event) = input.pull() {
-            if event.kind == KIND_REPLY {
-                if let Some(outbox) = self.outbox.as_mut() {
-                    outbox.observe(event);
-                }
-            } else if event.kind == KIND_GRANT_LIFETIME
-                && (event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED))
-            {
-                self.stopping = true;
-            }
-        }
-        if input.take_timeout()
-            && let Some(outbox) = self.outbox.as_mut()
-        {
-            outbox.timed_out();
-        }
-
-        if self.stopping {
-            if let GrantPublication::Reply { sender, .. } = &mut self.publication {
-                if let Some(active) = self.outbox.as_mut() {
-                    active.stop(world);
-                    let advance = active.drive(requests, 1)?;
-                    if !active.is_complete() {
-                        return Ok(advance);
-                    }
-                }
-                self.outbox = None;
-                *sender = None;
-            }
-            if self.prepared.is_some() && !self.requested {
-                self.prepared = None;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Runnable,
-                });
-            }
-            if self.source.is_none()
-                && !self.requested
-                && let Some(observer) = self.observer.take()
-            {
-                let context = observer.context();
-                requests.wake(world.retire_task)?;
-                let removed = world
-                    .grants
-                    .as_mut()
-                    .expect("grant table missing during retirement")
-                    .remove(context);
-                assert!(removed, "retiring grant missing from table");
-                match observer.close() {
-                    Ok(()) => {
-                        return Ok(Advance {
-                            work_done: 1,
-                            step: Step::Complete,
-                        });
-                    }
-                    Err((observer, error)) => {
-                        self.observer = Some(observer);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-
-        if self.observer.is_some() {
-            if let Some(advance) = self.drive_publication(requests, 1)? {
-                return Ok(advance);
-            }
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Parked,
-            });
-        }
-        if !world.retire_ready {
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
-        }
-        if !self.requested {
-            let prepared = self
-                .prepared
-                .as_ref()
-                .expect("grant installation lost its prepared owner");
-            requests.add_source(
-                prepared.lifetime_handle(),
-                ObjectSignals::CLOSED,
-                KIND_GRANT_LIFETIME,
-            )?;
-            self.requested = true;
-        }
-        Ok(Advance {
-            work_done: 1,
-            step: Step::Runnable,
-        })
+        provider::Grant::advance(self, id, world, requests, input, budget)
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<ServiceTask>) {
-        match failure {
-            RequestFailure::Source {
-                kind: KIND_GRANT_LIFETIME,
-                ..
-            } => {
-                self.requested = false;
-                self.stopping = true;
-                if !world.stop {
-                    world.failed = true;
-                }
-            }
-            failure => {
-                if let Some(outbox) = self.outbox.as_mut() {
-                    outbox.refused(world, failure);
-                }
-            }
-        }
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        provider::Grant::refused(self, world, failure);
     }
 
-    fn registered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
-        if kind == KIND_REPLY {
-            if let Some(outbox) = self.outbox.as_mut() {
-                outbox.registered(world, kind, source);
-            }
-            return;
-        }
-        if kind != KIND_GRANT_LIFETIME {
-            return;
-        }
-        self.requested = false;
-        self.source = Some(source);
-        let prepared = self
-            .prepared
-            .take()
-            .expect("grant source registered without prepared owner");
-        let installed = world
-            .grants
-            .as_mut()
-            .expect("grant table missing during installation")
-            .install(prepared);
-        match &mut self.publication {
-            GrantPublication::Root => assert!(
-                world.root_sender.replace(installed.sender).is_none(),
-                "root grant published more than once"
-            ),
-            GrantPublication::Reply { sender, .. } => {
-                assert!(
-                    sender.replace(installed.sender).is_none(),
-                    "derived grant sender published more than once"
-                );
-            }
-        }
-        self.observer = Some(installed.observer);
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        provider::Grant::registered(self, world, kind, source);
     }
 
-    fn unregistered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
-        if kind == KIND_REPLY {
-            if let Some(outbox) = self.outbox.as_mut() {
-                outbox.unregistered(_world, kind, source);
-            }
-        } else if kind == KIND_GRANT_LIFETIME && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
-        }
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        provider::Grant::unregistered(self, world, kind, source);
     }
 
-    fn stop(&mut self, _world: &mut World) {
-        self.stopping = true;
+    fn stop(&mut self, _world: &mut World<B>) {
+        provider::Grant::stop(self);
     }
 
     fn deadline(&self) -> Deadline {
-        match &self.publication {
-            GrantPublication::Root => Deadline::INFINITE,
-            GrantPublication::Reply { .. } => self
-                .outbox
-                .as_ref()
-                .map_or(Deadline::INFINITE, Outbox::deadline),
-        }
+        provider::Grant::deadline(self)
     }
 }
 
-struct RetireTask {
-    owner: Capability,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
-    rearm_needed: bool,
-    stopping: bool,
-}
+struct RetireTask(provider::Retirement);
 
 impl RetireTask {
     fn new(owner: Capability) -> Self {
-        Self {
-            owner,
-            source: None,
-            requested: false,
-            removing: false,
-            rearm_needed: false,
-            stopping: false,
-        }
+        Self(provider::Retirement::new(owner, KIND_RETIRE, RETIRE_BIT))
     }
 }
 
-impl Task<World> for RetireTask {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for RetireTask {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         _id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
-        let mut signaled = false;
-        while let Some(event) = input.pull() {
-            if event.kind != KIND_RETIRE {
-                continue;
-            }
-            if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
-                world.failed = true;
-                self.stopping = true;
-            } else if event.observed.intersects(ObjectSignals::READABLE) {
-                signaled = true;
-                self.rearm_needed = true;
-            }
-        }
-        if signaled {
-            let _ = notification::take(self.owner.as_handle(), RETIRE_BIT)?;
-        }
-
-        if self.stopping
-            && world
-                .grants
-                .as_ref()
-                .expect("grant table missing during shutdown")
-                .is_empty()
-            && !world.backend_sealed
-        {
-            rinlib::debug!("fs provider shutdown: sealing backend");
-            world
-                .backend
-                .as_mut()
-                .expect("backend missing during shutdown")
-                .seal();
-            world.backend_sealed = true;
-        }
-
-        let backend = world
-            .backend
-            .as_mut()
-            .expect("backend missing during retirement");
-        if backend.has_retire_work() {
-            backend.retire_step(budget)?;
-            return Ok(Advance {
-                work_done: budget,
-                step: Step::Runnable,
-            });
-        }
-
-        if self.stopping && world.backend_sealed && backend.is_empty() {
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                rinlib::debug!("fs provider shutdown: removing retirement source");
-                requests.remove(source)?;
-                self.removing = true;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Runnable,
-                });
-            }
-            if self.source.is_none() && !self.requested {
-                let backend = world
-                    .backend
-                    .take()
-                    .expect("backend disappeared before close");
-                if let Err(backend) = backend.close() {
-                    world.backend = Some(backend);
-                    return Err(SystemCallError::ObjectBusy);
-                }
-                rinlib::debug!("fs provider shutdown: backend retired");
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
-        }
-
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                self.owner.as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                KIND_RETIRE,
-            )?;
-            self.requested = true;
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
-        }
-        if self.rearm_needed
-            && let Some(source) = self.source
-        {
-            requests.rearm(source)?;
-            self.rearm_needed = false;
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
-        }
-        Ok(Advance {
-            work_done: 1,
-            step: Step::Parked,
-        })
+        let (provider, failed) = (&mut world.provider, &mut world.failed);
+        self.0
+            .advance(provider, requests, input, budget, || *failed = true)
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<ServiceTask>) {
-        if let RequestFailure::Source {
-            kind: KIND_RETIRE, ..
-        } = failure
-        {
-            self.requested = false;
-            if !world.stop {
-                world.failed = true;
-            }
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        if self.0.refused(failure) && !world.stop {
+            world.failed = true;
         }
     }
 
-    fn registered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
-        if kind == KIND_RETIRE {
-            self.requested = false;
-            self.source = Some(source);
-            world.retire_ready = true;
-        }
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        self.0.registered(&mut world.provider, kind, source);
     }
 
-    fn unregistered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
-        if kind == KIND_RETIRE && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
-            self.rearm_needed = false;
-        }
+    fn unregistered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        self.0.unregistered(kind, source);
     }
 
-    fn stop(&mut self, _world: &mut World) {
-        self.stopping = true;
+    fn stop(&mut self, _world: &mut World<B>) {
+        self.0.stop();
     }
 }
 
@@ -970,14 +761,14 @@ impl ReleaseTask {
     }
 }
 
-impl Task<World> for ReleaseTask {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for ReleaseTask {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         _id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -1034,18 +825,18 @@ impl Task<World> for ReleaseTask {
         })
     }
 
-    fn refused(&mut self, world: &mut World, _failure: RequestFailure<ServiceTask>) {
+    fn refused(&mut self, world: &mut World<B>, _failure: RequestFailure<ServiceTask<B>>) {
         world.failed = true;
     }
 
-    fn registered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+    fn registered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_RELEASE {
             self.requested = false;
             self.source = Some(source);
         }
     }
 
-    fn unregistered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+    fn unregistered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_RELEASE && self.source == Some(source) {
             self.source = None;
             self.requested = false;
@@ -1053,7 +844,7 @@ impl Task<World> for ReleaseTask {
         }
     }
 
-    fn stop(&mut self, _world: &mut World) {
+    fn stop(&mut self, _world: &mut World<B>) {
         self.released = true;
     }
 }
@@ -1078,14 +869,14 @@ impl RouteIngress {
     }
 }
 
-impl Task<World> for RouteIngress {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         _id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -1149,7 +940,7 @@ impl Task<World> for RouteIngress {
             Err(error) => return Err(error),
         }
         let message = MessageStorage::new()?.take(&mut self.buffer)?;
-        let mut context = match RequestContext::decode(message, route::ID) {
+        let context = match RequestContext::decode(message, route::ID) {
             Ok(context) => context,
             Err(_) => {
                 requests.rearm(self.source.expect("route source remains registered"))?;
@@ -1159,43 +950,13 @@ impl Task<World> for RouteIngress {
                 });
             }
         };
-        let mut status = route::Status::Invalid;
-        if context.handles.remaining() == 1
-            && let Ok(binding) = route::Bind::decode(&context.payload)
-            && binding.rights.contains(FalRights::TRAVERSE)
-            && let Ok(capability) = context.handles.get(1)
-        {
-            let rights = Rights::WRITE | Rights::WAIT | Rights::DUPLICATE;
-            if let Ok(description) = capability.description()
-                && description.rights.contains(rights)
-            {
-                let capability = context
-                    .handles
-                    .take(1)
-                    .expect("validated route target disappeared");
-                match MailboxSender::from_capability(capability) {
-                    Ok((target, _)) => {
-                        world.route = Some(RouteBinding {
-                            name: String::from(binding.name),
-                            target,
-                            rights: binding.rights,
-                        });
-                        status = route::Status::Ok;
-                    }
-                    Err(_) => status = route::Status::Invalid,
-                }
-            } else {
-                status = route::Status::Permission;
-            }
-        }
         let outbox = Outbox::prepare(context, route::RESPONSE_LEN, Deadline::INFINITE, KIND_REPLY)
             .map_err(|_| SystemCallError::InternalError)?;
         requests
             .spawn(
-                ServiceTask::Request(RequestTask {
+                ServiceTask::RouteReply(RouteReplyTask {
                     outbox,
-                    mode: RequestMode::RouteAck(status),
-                    committed: false,
+                    encoded: false,
                     recorded: false,
                 }),
                 1,
@@ -1208,18 +969,18 @@ impl Task<World> for RouteIngress {
         })
     }
 
-    fn refused(&mut self, world: &mut World, _failure: RequestFailure<ServiceTask>) {
+    fn refused(&mut self, world: &mut World<B>, _failure: RequestFailure<ServiceTask<B>>) {
         world.failed = true;
     }
 
-    fn registered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+    fn registered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_ROUTE {
             self.requested = false;
             self.source = Some(source);
         }
     }
 
-    fn unregistered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+    fn unregistered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_ROUTE && self.source == Some(source) {
             self.source = None;
             self.requested = false;
@@ -1227,20 +988,153 @@ impl Task<World> for RouteIngress {
         }
     }
 
-    fn stop(&mut self, _world: &mut World) {
+    fn stop(&mut self, _world: &mut World<B>) {
         self.stopping = true;
     }
 }
 
-struct Ingress {
+struct RouteReplyTask {
+    outbox: Outbox,
+    encoded: bool,
+    recorded: bool,
+}
+
+impl RouteReplyTask {
+    fn bind<B: RuntimeBackend>(
+        world: &mut World<B>,
+        context: &mut RequestContext,
+    ) -> route::Status {
+        if context.handles.remaining() != 1 {
+            return route::Status::Invalid;
+        }
+        let Ok(binding) = route::Bind::decode(&context.payload) else {
+            return route::Status::Invalid;
+        };
+        if !binding.rights.contains(FalRights::TRAVERSE) {
+            return route::Status::Invalid;
+        }
+        let Ok(capability) = context.handles.get(1) else {
+            return route::Status::Invalid;
+        };
+        let rights = Rights::WRITE | Rights::WAIT | Rights::DUPLICATE;
+        let Ok(description) = capability.description() else {
+            return route::Status::Permission;
+        };
+        if !description.rights.contains(rights) {
+            return route::Status::Permission;
+        }
+        let capability = context
+            .handles
+            .take(1)
+            .expect("validated route target disappeared");
+        let Ok((target, _)) = MailboxSender::from_capability(capability) else {
+            return route::Status::Invalid;
+        };
+        match world.provider.backend.as_mut() {
+            Some(backend) => backend
+                .bind_route(binding.name, target, binding.rights)
+                .map_or(route::Status::Internal, |_| route::Status::Ok),
+            None => route::Status::Internal,
+        }
+    }
+}
+
+impl<B: RuntimeBackend> Task<World<B>> for RouteReplyTask {
+    type Family = ServiceTask<B>;
+
+    fn advance(
+        &mut self,
+        _id: u64,
+        world: &mut World<B>,
+        requests: &mut Requests<Self::Family>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        while let Some(event) = input.pull() {
+            self.outbox.observe(event);
+        }
+        if input.take_timeout() {
+            self.outbox.timed_out();
+        }
+        if !self.encoded && self.outbox.result().is_none() {
+            if !self.outbox.is_admitted() {
+                return Ok(self.outbox.admit(requests));
+            }
+            let status = {
+                let (context, _) = self.outbox.response_mut()?.parts()?;
+                Self::bind(world, context)
+            };
+            let used = route::encode_status(status, self.outbox.response_mut()?.body_mut()?)
+                .ok_or(SystemCallError::InternalError)?;
+            self.outbox.response_mut()?.finish_body(used)?;
+            self.encoded = true;
+        }
+        let advance = self.outbox.drive(requests, budget)?;
+        if advance.step == Step::Complete && self.encoded && !self.recorded {
+            record_provider_response(world, &self.outbox, true)?;
+            self.recorded = true;
+        }
+        Ok(advance)
+    }
+
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<Self::Family>) {
+        self.outbox.refused(world, failure);
+    }
+
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        self.outbox.registered(world, kind, source);
+    }
+
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        self.outbox.unregistered(world, kind, source);
+    }
+
+    fn stop(&mut self, world: &mut World<B>) {
+        self.outbox.stop(world);
+    }
+
+    fn deadline(&self) -> Deadline {
+        self.outbox.deadline()
+    }
+}
+
+enum PendingFalTask<B: RuntimeBackend> {
+    Request(RequestTask<B>),
+    Read(ReadTask),
+    Grant(GrantTask),
+    Watch(WatchTask),
+    Delegate(DelegateTask),
+    Stream(StreamTask),
+    StreamControl(StreamControlTask),
+}
+
+impl<B: RuntimeBackend> PendingFalTask<B> {
+    fn into_service(self) -> ServiceTask<B> {
+        match self {
+            Self::Request(task) => ProviderTask::Request(task).into(),
+            Self::Read(task) => ProviderTask::Read(task).into(),
+            Self::Grant(task) => ProviderTask::Grant(task).into(),
+            Self::Watch(task) => ProviderTask::Watch(task).into(),
+            Self::Delegate(task) => ProviderTask::Delegate(task).into(),
+            Self::Stream(task) => ServiceTask::Stream(task),
+            Self::StreamControl(task) => ServiceTask::StreamControl(task),
+        }
+    }
+}
+
+struct Ingress<B: RuntimeBackend> {
     buffer: ReceiveBuffer,
     source: Option<SourceId>,
     requested: bool,
     removing: bool,
     stopping: bool,
+    gate_pending: bool,
+    queued: Option<(PendingFalTask<B>, usize)>,
+    refusal: Option<Outbox>,
+    refusal_deadline: Deadline,
 }
 
-impl Ingress {
+impl<B: RuntimeBackend> Ingress<B> {
     fn new() -> Self {
         Self {
             buffer: ReceiveBuffer::new().expect("provider receive buffer creation failed"),
@@ -1248,59 +1142,152 @@ impl Ingress {
             requested: false,
             removing: false,
             stopping: false,
+            gate_pending: false,
+            queued: None,
+            refusal: None,
+            refusal_deadline: Deadline::INFINITE,
         }
+    }
+    fn reject_task(&mut self, task: ServiceTask<B>, error: SystemCallError, world: &mut World<B>) {
+        let mut outbox = task.into_fal_refusal();
+        self.gate_pending = false;
+        let status = match error {
+            SystemCallError::QuotaExceeded | SystemCallError::ReachLimit => protocol::Status::Quota,
+            SystemCallError::OutOfMemory => protocol::Status::Resource,
+            _ => protocol::Status::Cancelled,
+        };
+        if self.stopping {
+            outbox.stop(world);
+        } else {
+            let cap =
+                rinlib::time::timeout_millis(5_000).expect("FAL refusal deadline unavailable");
+            let original = outbox
+                .deadline()
+                .instant()
+                .expect("FAL refusal request deadline invalid");
+            self.refusal_deadline =
+                Deadline::at(original.map_or(cap.at_ns, |at| at.min(cap.at_ns)));
+            let response = outbox.response_mut().expect("FAL refusal lost reply owner");
+            let (context, body) = response.parts().expect("FAL refusal lost request body");
+            let (header, _) = protocol::decode_request(&context.payload)
+                .expect("FAL refusal lost validated request");
+            let used = encode_v2(
+                body,
+                header.op,
+                status,
+                header.deadline,
+                protocol::Response::Empty,
+            )
+            .expect("FAL refusal reply layout invalid");
+            response
+                .finish_body(used)
+                .expect("FAL refusal reply length invalid");
+        }
+        self.refusal = Some(outbox);
     }
 }
 
-impl Task<World> for Ingress {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         _id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
-        _budget: usize,
+        budget: usize,
     ) -> Result<Advance, SystemCallError> {
+        let mut ready = false;
+        while let Some(event) = input.pull() {
+            if event.kind == KIND_REPLY {
+                if let Some(outbox) = self.refusal.as_mut() {
+                    outbox.observe(event);
+                }
+            } else if event.kind == KIND_MAILBOX {
+                if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+                    world.failed = true;
+                    self.stopping = true;
+                } else {
+                    ready = true;
+                }
+            } else {
+                return Err(SystemCallError::InternalError);
+            }
+        }
+        if input.take_timeout()
+            && let Some(outbox) = self.refusal.as_mut()
+        {
+            outbox.timed_out();
+        }
         if self.stopping {
+            self.queued = None;
             if let Some(source) = self.source
                 && !self.removing
             {
                 requests.remove(source)?;
                 self.removing = true;
             }
+            if let Some(outbox) = self.refusal.as_mut() {
+                outbox.stop(world);
+                let advance = outbox.drive(requests, budget)?;
+                if !outbox.is_complete() {
+                    return Ok(advance);
+                }
+                self.refusal = None;
+                self.refusal_deadline = Deadline::INFINITE;
+            }
             return Ok(Advance {
                 work_done: 1,
-                step: if self.source.is_none() && !self.requested {
+                step: if self.source.is_none() && !self.requested && !self.gate_pending {
                     Step::Complete
                 } else {
                     Step::Parked
                 },
             });
         }
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                world.mailbox.as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                KIND_MAILBOX,
-            )?;
-            self.requested = true;
+        if let Some(outbox) = self.refusal.as_mut() {
+            let advance = if outbox.result().is_none() && !outbox.is_admitted() {
+                outbox.admit(requests)
+            } else {
+                outbox.drive(requests, budget)?
+            };
+            if !outbox.is_complete() {
+                return Ok(advance);
+            }
+            self.refusal = None;
+            self.refusal_deadline = Deadline::INFINITE;
+            requests.rearm(self.source.expect("provider source remains registered"))?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        if let Some((task, max_sources)) = self.queued.take() {
+            match requests.spawn(task.into_service(), max_sources) {
+                Ok(()) => self.gate_pending = true,
+                Err(task) => self.queued = Some((task.into_fal_pending(), max_sources)),
+            }
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
             });
         }
-        let mut ready = false;
-        while let Some(event) = input.pull() {
-            if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
-                world.failed = true;
-                self.stopping = true;
-            } else {
-                ready = true;
-            }
+        if self.gate_pending {
+            self.gate_pending = false;
+            requests.rearm(self.source.expect("provider source remains registered"))?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
         }
-        if self.stopping {
+        if self.source.is_none() && !self.requested {
+            requests.add_source(
+                world.provider.mailbox.as_handle(),
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                KIND_MAILBOX,
+            )?;
+            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -1312,7 +1299,7 @@ impl Task<World> for Ingress {
                 step: Step::Parked,
             });
         }
-        match self.buffer.receive(world.mailbox.as_handle()) {
+        match self.buffer.receive(world.provider.mailbox.as_handle()) {
             Ok(()) => {}
             Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => {
                 requests.rearm(self.source.expect("provider source remains registered"))?;
@@ -1366,7 +1353,47 @@ impl Task<World> for Ingress {
                 });
             }
         };
+        if matches!(
+            request,
+            protocol::Request::Start
+                | protocol::Request::QueryStream
+                | protocol::Request::FinishStream
+                | protocol::Request::CancelStream
+        ) {
+            let identity = context.envelope.sender_context_id;
+            let session_end = world.streams.get(identity)
+                .and_then(|entry| entry.session_deadline.instant().ok().flatten())
+                .unwrap_or(input.now_ns().saturating_add(5_000_000_000));
+            let reply_end = header.deadline.instant().ok().flatten()
+                .unwrap_or(u64::MAX)
+                .min(session_end);
+            let reply_deadline = Deadline::at(reply_end);
+            let outbox = match Outbox::prepare(
+                context,
+                protocol::HEADER_LEN + protocol::StreamInfo::ENCODED_LEN,
+                reply_deadline,
+                KIND_REPLY,
+            ) {
+                Ok(outbox) => outbox,
+                Err(_) => {
+                    requests.rearm(self.source.expect("provider source remains registered"))?;
+                    return Ok(Advance { work_done: 1, step: Step::Parked });
+                }
+            };
+            let task = ServiceTask::StreamControl(StreamControlTask::new(
+                outbox,
+                header,
+                reply_deadline,
+                identity,
+            ));
+            match requests.spawn(task, 1) {
+                Ok(()) => self.gate_pending = true,
+                Err(task) => self.queued = Some((task.into_fal_pending(), 1)),
+            }
+            return Ok(Advance { work_done: 1, step: Step::Runnable });
+        }
         let Some(access) = world
+            .provider
             .grants
             .as_ref()
             .expect("grant table missing during request admission")
@@ -1379,6 +1406,73 @@ impl Task<World> for Ingress {
             });
         };
         let sender_context = context.envelope.sender_context_id;
+        if let protocol::Request::Open {
+            path,
+            expected_identity,
+            direction,
+            offset,
+            length,
+            session_deadline,
+            stream_protocol,
+            tunnel_bytes,
+        } = request
+        {
+            let args = copy_request_name(path)
+                .map_err(|_| protocol::Status::Resource)
+                .map(|path| OpenArgs {
+                    path,
+                    expected_identity,
+                    direction,
+                    offset,
+                    length,
+                    session_deadline,
+                    stream_protocol,
+                    tunnel_bytes,
+                });
+            let reply_end = input.now_ns().saturating_add(5_000_000_000).min(
+                header.deadline.instant().ok().flatten().unwrap_or(u64::MAX),
+            );
+            let reply_deadline = Deadline::at(reply_end);
+            let outbox = match Outbox::prepare(
+                context,
+                protocol::HEADER_LEN + protocol::StreamOffer::ENCODED_LEN,
+                reply_deadline,
+                KIND_REPLY,
+            ) {
+                Ok(outbox) => outbox,
+                Err(_) => {
+                    requests.rearm(self.source.expect("provider source remains registered"))?;
+                    return Ok(Advance { work_done: 1, step: Step::Parked });
+                }
+            };
+            let task = ServiceTask::Stream(StreamTask::new(outbox, header, reply_deadline, access, args));
+            match requests.spawn(task, 3) {
+                Ok(()) => self.gate_pending = true,
+                Err(task) => self.queued = Some((task.into_fal_pending(), 3)),
+            }
+            return Ok(Advance { work_done: 1, step: Step::Runnable });
+        }
+        let mut read_failure = None;
+        let read_snapshot = if let protocol::Request::Read { path } = request {
+            let backend = world
+                .provider
+                .backend
+                .as_ref()
+                .expect("provider backend missing during Read preparation");
+            match FalBackend::read_snapshot(backend, &access, path) {
+                Ok(snapshot) => Some(snapshot),
+                Err(ReadError::Backend(error)) => {
+                    read_failure = Some(backend_status(error));
+                    None
+                }
+                Err(ReadError::Value(error)) => {
+                    read_failure = Some(value_status(error));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut watch_failure = None;
         let watch_owner = if let protocol::Request::Subscribe { path, mask } = request {
             let prepared = (|| {
@@ -1396,18 +1490,12 @@ impl Task<World> for Ingress {
                     return Err(protocol::Status::Invalid);
                 }
                 let backend = world
+                    .provider
                     .backend
                     .as_ref()
                     .expect("provider backend missing during Watch preparation");
-                let node = resolve_v2(backend, &access, path).map_err(backend_status)?;
-                let state = backend.get(&node).ok_or(protocol::Status::NotFound)?;
-                if !access
-                    .rights()
-                    .intersect(state.rights())
-                    .contains(FalRights::WATCH)
-                {
-                    return Err(protocol::Status::Permission);
-                }
+                let (node, _) =
+                    FalBackend::watch_snapshot(backend, &access, path).map_err(backend_status)?;
                 let mut watch_path = String::new();
                 watch_path
                     .try_reserve_exact(path.len())
@@ -1429,20 +1517,21 @@ impl Task<World> for Ingress {
                         _ => protocol::Status::Internal,
                     })?;
                 let id = world
+                    .provider
                     .watches
                     .allocate_id()
                     .ok_or(protocol::Status::Resource)?;
-                Ok(WatchOwner {
+                Ok(provider::WatchOwner::new(
                     id,
-                    context: sender_context,
+                    sender_context,
                     node,
-                    access: access.clone(),
-                    path: watch_path,
+                    access.clone(),
+                    watch_path,
                     mask,
-                    signaler: Some(capability),
-                    _watch_charge: watch_charge,
-                    _source_charge: source_charge,
-                })
+                    capability,
+                    watch_charge,
+                    source_charge,
+                ))
             })();
             match prepared {
                 Ok(owner) => Some(owner),
@@ -1461,6 +1550,7 @@ impl Task<World> for Ingress {
                 .take(1)
                 .map_err(|_| SystemCallError::IllegalArgument)?;
             match world
+                .provider
                 .grants
                 .as_ref()
                 .expect("grant table missing during request admission")
@@ -1482,15 +1572,29 @@ impl Task<World> for Ingress {
         };
         let mut delegate_failure = None;
         let delegated = if let protocol::Request::Lookup { path } = request {
-            match world.route.as_ref() {
-                Some(binding) => match prepare_delegate(binding, &access, path, header) {
-                    Ok(delegate) => delegate,
+            let backend = world
+                .provider
+                .backend
+                .as_ref()
+                .expect("provider backend missing during lookup");
+            match backend.lookup(&access, path) {
+                Ok(LookupResult::DelegationBoundary {
+                    target,
+                    rights,
+                    consumed,
+                    remaining,
+                }) => match prepare_delegate(target, rights, consumed, remaining, header) {
+                    Ok(delegate) => Some(delegate),
                     Err(status) => {
                         delegate_failure = Some(status);
                         None
                     }
                 },
-                None => None,
+                Ok(_) => None,
+                Err(error) => {
+                    delegate_failure = Some(backend_status(error));
+                    None
+                }
             }
         } else {
             None
@@ -1502,6 +1606,7 @@ impl Task<World> for Ingress {
                     return Err(protocol::Status::Permission);
                 }
                 let backend = world
+                    .provider
                     .backend
                     .as_ref()
                     .expect("provider backend missing during grant derivation");
@@ -1511,11 +1616,12 @@ impl Task<World> for Ingress {
                     return Err(protocol::Status::NotDirectory);
                 }
                 let prepared = world
+                    .provider
                     .grants
                     .as_mut()
                     .expect("grant table missing during derivation")
                     .prepare_derive(
-                        &world.mailbox,
+                        &world.provider.mailbox,
                         context.envelope.sender_context_id,
                         root,
                         rights,
@@ -1564,36 +1670,56 @@ impl Task<World> for Ingress {
                 }
             };
             match move_destination {
-                Some(destination) if move_failure.is_none() => Some(MoveOperation {
-                    access: access.clone(),
-                    destination,
-                    header,
-                    source_parent: String::from(source_parent),
-                    source_name: String::from(source_name),
-                    destination_name: String::from(destination_name),
-                    expected,
-                    prepared: None,
-                    source_parent_ref: None,
-                    target_ref: None,
-                }),
+                Some(destination) if move_failure.is_none() => {
+                    let prepared = (|| {
+                        Ok::<_, SystemCallError>(MoveOperation {
+                            access: access.clone(),
+                            destination,
+                            header,
+                            source_parent: copy_request_name(source_parent)?,
+                            source_name: copy_request_name(source_name)?,
+                            destination_name: copy_request_name(destination_name)?,
+                            expected,
+                            prepared: None,
+                            source_parent_ref: None,
+                            target_ref: None,
+                        })
+                    })();
+                    match prepared {
+                        Ok(operation) => Some(operation),
+                        Err(_) => {
+                            move_failure = Some(protocol::Status::Resource);
+                            None
+                        }
+                    }
+                }
                 _ => None,
             }
         } else {
             None
         };
+        let mut take_failure = None;
         let take_operation = if let protocol::Request::Take { path } = request {
-            Some(TakeOperation {
-                access: access.clone(),
-                header,
-                path: String::from(path),
-                prepared: None,
-                reference: None,
-                bytes: None,
-                policies: Vec::new(),
-                restore_handles: Vec::new(),
-                encoded: false,
-                failed: false,
-            })
+            copy_request_name(path).map_or_else(
+                |_| {
+                    take_failure = Some(protocol::Status::Resource);
+                    None
+                },
+                |path| {
+                    Some(TakeOperation {
+                        access: access.clone(),
+                        header,
+                        path,
+                        prepared: None,
+                        reference: None,
+                        bytes: None,
+                        policies: Vec::new(),
+                        restore_handles: Vec::new(),
+                        encoded: false,
+                        failed: false,
+                    })
+                },
+            )
         } else {
             None
         };
@@ -1602,20 +1728,26 @@ impl Task<World> for Ingress {
                 context: sender_context,
                 header,
                 kind: WatchControlKind::Query(id),
+                result: None,
+                pending_wake: None,
                 encoded: false,
             }),
             protocol::Request::Unsubscribe { id } => Some(WatchControlOperation {
                 context: sender_context,
                 header,
                 kind: WatchControlKind::Unsubscribe(id),
+                result: None,
+                pending_wake: None,
                 encoded: false,
             }),
             _ => None,
         };
         let mode = if let Some(status) = watch_failure
             .or(move_failure)
+            .or(take_failure)
             .or(derive_failure)
             .or(delegate_failure)
+            .or(read_failure)
         {
             RequestMode::V2Failure { header, status }
         } else if let Some(operation) = move_operation {
@@ -1644,76 +1776,111 @@ impl Task<World> for Ingress {
             }
         };
         let (task, max_sources) = if let Some(delegate) = delegated {
-            (ServiceTask::Delegate(delegate.with_outbox(outbox)), 1)
+            (
+                ProviderTask::Delegate(delegate.with_outbox(outbox)).into(),
+                1,
+            )
         } else if let Some((prepared, info)) = derived {
             (
-                ServiceTask::Grant(GrantTask::reply(prepared, outbox, info)),
+                ProviderTask::Grant(GrantTask::reply(
+                    prepared,
+                    outbox,
+                    info,
+                    KIND_REPLY,
+                    KIND_GRANT_LIFETIME,
+                ))
+                .into(),
                 2,
             )
+        } else if let Some(snapshot) = read_snapshot {
+            (
+                ProviderTask::Read(ReadTask::new(outbox, header, snapshot)).into(),
+                1,
+            )
         } else if let Some(owner) = watch_owner {
-            (ServiceTask::Watch(WatchTask::new(owner, outbox)), 2)
+            (
+                ProviderTask::Watch(WatchTask::new(owner, outbox, KIND_REPLY, KIND_WATCH_OWNER))
+                    .into(),
+                2,
+            )
         } else {
             (
-                ServiceTask::Request(RequestTask {
+                ServiceTask::Fal(ProviderTask::Request(RequestTask {
                     outbox,
                     mode,
                     committed: false,
                     recorded: false,
-                }),
+                    wakes: WakeBatch::new(WATCH_LIMIT).map_err(|_| SystemCallError::OutOfMemory)?,
+                })),
                 1,
             )
         };
-        requests
-            .spawn(task, max_sources)
-            .map_err(|_| SystemCallError::ReachLimit)?;
-        requests.rearm(self.source.expect("provider source remains registered"))?;
+        match requests.spawn(task, max_sources) {
+            Ok(()) => self.gate_pending = true,
+            Err(task) => self.queued = Some((task.into_fal_pending(), max_sources)),
+        }
         Ok(Advance {
             work_done: 1,
-            step: Step::Parked,
+            step: Step::Runnable,
         })
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<ServiceTask>) {
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
         match failure {
-            RequestFailure::Spawn { .. }
-            | RequestFailure::Source { .. }
-            | RequestFailure::Wake { .. } => world.failed = true,
+            RequestFailure::Spawn { task, error } => self.reject_task(task, error, world),
+            failure @ RequestFailure::Source {
+                kind: KIND_REPLY, ..
+            } => {
+                if let Some(outbox) = self.refusal.as_mut() {
+                    outbox.refused(world, failure);
+                }
+            }
+            RequestFailure::Source { .. } | RequestFailure::Wake { .. } => {
+                world.failed = true;
+            }
         }
     }
-
-    fn registered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_MAILBOX {
             self.requested = false;
             self.source = Some(source);
+        } else if kind == KIND_REPLY
+            && let Some(outbox) = self.refusal.as_mut()
+        {
+            outbox.registered(world, kind, source);
         }
     }
-
-    fn unregistered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_MAILBOX && self.source == Some(source) {
             self.source = None;
             self.requested = false;
             self.removing = false;
+        } else if kind == KIND_REPLY
+            && let Some(outbox) = self.refusal.as_mut()
+        {
+            outbox.unregistered(world, kind, source);
         }
     }
-
-    fn stop(&mut self, _world: &mut World) {
+    fn stop(&mut self, world: &mut World<B>) {
         self.stopping = true;
+        self.queued = None;
+        if let Some(outbox) = self.refusal.as_mut() {
+            outbox.stop(world);
+        }
+    }
+    fn deadline(&self) -> Deadline {
+        self.refusal_deadline
     }
 }
 
-fn publish_watch_events(
-    world: &mut World,
-    requests: &mut Requests<ServiceTask>,
+fn publish_watch_events<B: RuntimeBackend>(
+    world: &mut World<B>,
     effects: &Effects,
-) -> Result<(), SystemCallError> {
-    if effects.is_empty() {
-        return Ok(());
+    wakes: &mut WakeBatch,
+) {
+    if !effects.is_empty() {
+        world.provider.watches.publish(effects, wakes);
     }
-    let wakes = world.watches.publish(effects);
-    for task in wakes.iter() {
-        requests.wake(task)?;
-    }
-    Ok(())
 }
 
 fn backend_status(error: BackendError) -> protocol::Status {
@@ -1725,6 +1892,9 @@ fn backend_status(error: BackendError) -> protocol::Status {
         BackendError::NotEmpty => protocol::Status::NotEmpty,
         BackendError::Conflict => protocol::Status::Conflict,
         BackendError::InvalidName | BackendError::Cycle => protocol::Status::Invalid,
+        BackendError::WrongType => protocol::Status::Invalid,
+        BackendError::Unsupported => protocol::Status::Unsupported,
+        BackendError::CrossDevice => protocol::Status::CrossDevice,
         BackendError::Busy | BackendError::Closed => protocol::Status::Busy,
         BackendError::Resource(SystemCallError::QuotaExceeded) => protocol::Status::Quota,
         BackendError::Resource(SystemCallError::OutOfMemory) => protocol::Status::Resource,
@@ -1751,83 +1921,46 @@ fn value_status(error: libfal::value::ValueError) -> protocol::Status {
     }
 }
 
+fn export_status(error: SystemCallError) -> protocol::Status {
+    match error {
+        SystemCallError::OutOfMemory | SystemCallError::ReachLimit => protocol::Status::Resource,
+        SystemCallError::QuotaExceeded => protocol::Status::Quota,
+        SystemCallError::ObjectClosed
+        | SystemCallError::ObjectNotFound
+        | SystemCallError::StaleHandle => protocol::Status::GrantRevoked,
+        SystemCallError::DeadlineExpired => protocol::Status::Cancelled,
+        _ => protocol::Status::Internal,
+    }
+}
+
 fn resolve_v2(
-    backend: &MemoryBackend<Capability>,
+    backend: &impl FalBackend<Capability>,
     access: &AccessSnapshot,
     path: &str,
 ) -> Result<NodeRef, BackendError> {
-    if !validate_path(path.as_bytes()) {
-        return Err(BackendError::InvalidName);
-    }
-    let mut current = access.root().clone();
-    if path.is_empty() {
-        return Ok(current);
-    }
-    for component in path.split('/') {
-        current = backend.lookup_child(&current, component, access)?;
-    }
-    Ok(current)
-}
-
-enum LookupV2 {
-    Found(NodeRef),
-    Link {
-        reference: NodeRef,
-        consumed: String,
-        target: String,
-        remaining: String,
-    },
+    FalBackend::resolve(backend, access, path)
 }
 
 fn lookup_v2(
-    backend: &MemoryBackend<Capability>,
+    backend: &impl FalBackend<Capability>,
     access: &AccessSnapshot,
     path: &str,
-) -> Result<LookupV2, BackendError> {
-    if !validate_path(path.as_bytes()) {
-        return Err(BackendError::InvalidName);
-    }
-    let mut current = access.root().clone();
-    if path.is_empty() {
-        return Ok(LookupV2::Found(current));
-    }
-    let components = path.split('/').collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
-        current = backend.lookup_child(&current, component, access)?;
-        let node = backend.get(&current).ok_or(BackendError::NotFound)?;
-        if let Body::Link(target) = node.body() {
-            return Ok(LookupV2::Link {
-                reference: current,
-                consumed: components[..index].join("/"),
-                target: target.clone(),
-                remaining: components[index + 1..].join("/"),
-            });
-        }
-    }
-    Ok(LookupV2::Found(current))
+) -> Result<LookupResult<Capability>, BackendError> {
+    FalBackend::lookup(backend, access, path)
 }
 
 fn node_info_v2(
-    backend: &MemoryBackend<Capability>,
+    backend: &impl FalBackend<Capability>,
     reference: &NodeRef,
     ceiling: FalRights,
 ) -> Result<protocol::NodeInfo, BackendError> {
-    let node = backend.get(reference).ok_or(BackendError::NotFound)?;
-    if node.take_reserved() {
-        return Err(BackendError::Busy);
-    }
-    let size = match node.body() {
-        Body::Directory(_) => 0,
-        Body::Property(value) => value.bytes.len() as u64,
-        Body::Stream(data) => data.len(),
-        Body::Link(target) => target.len() as u64,
-    };
+    let metadata = FalBackend::metadata(backend, reference, ceiling)?;
     Ok(protocol::NodeInfo {
-        identity: reference.id().raw(),
-        version: node.version(),
-        kind: node.kind(),
-        rights: node.rights().intersect(ceiling),
-        size,
+        identity: metadata.identity,
+        version: metadata.version,
+        kind: metadata.kind,
+        rights: metadata.rights,
+        size: metadata.size,
     })
 }
 
@@ -1843,16 +1976,15 @@ fn encode_v2(
 }
 
 fn push_watch_effect(
-    backend: &MemoryBackend<Capability>,
+    backend: &impl FalBackend<Capability>,
     effects: &mut Effects,
     node: &NodeRef,
     events: protocol::WatchMask,
     terminal: Option<protocol::WatchReason>,
 ) -> Result<(), SystemCallError> {
-    let generation = backend
-        .get(node)
-        .ok_or(SystemCallError::InternalError)?
-        .version();
+    let generation = FalBackend::metadata(backend, node, FalRights::ALL)
+        .map_err(|_| SystemCallError::InternalError)?
+        .version;
     effects.push(Effect {
         node: node.id(),
         generation,
@@ -1862,9 +1994,9 @@ fn push_watch_effect(
     Ok(())
 }
 
-fn drive_move(
-    backend: &mut MemoryBackend<Capability>,
-    operation: &mut MoveOperation,
+fn drive_move<B: RuntimeBackend>(
+    backend: &mut B,
+    operation: &mut MoveOperation<B>,
     out: &mut [u8],
     budget: usize,
     effects: &mut Effects,
@@ -1883,8 +2015,12 @@ fn drive_move(
             Ok(parent) => parent,
             Err(error) => return failure(backend_status(error)).map(Some),
         };
-        let target = match backend.lookup_child(&parent, &operation.source_name, &operation.access)
-        {
+        let target = match FalMutationBackend::lookup_child(
+            backend,
+            &parent,
+            &operation.source_name,
+            &operation.access,
+        ) {
             Ok(target) => target,
             Err(error) => return failure(backend_status(error)).map(Some),
         };
@@ -1941,28 +2077,25 @@ fn drive_move(
             let destination = operation.destination.root();
             effects.push(Effect {
                 node: source.id(),
-                generation: backend
-                    .get(source)
-                    .expect("committed Move source parent disappeared")
-                    .version(),
+                generation: FalBackend::metadata(backend, source, FalRights::ALL)
+                    .map_err(|_| SystemCallError::InternalError)?
+                    .version,
                 events: protocol::WatchMask::RENAME,
                 terminal: None,
             });
             effects.push(Effect {
                 node: destination.id(),
-                generation: backend
-                    .get(destination)
-                    .expect("committed Move destination parent disappeared")
-                    .version(),
+                generation: FalBackend::metadata(backend, destination, FalRights::ALL)
+                    .map_err(|_| SystemCallError::InternalError)?
+                    .version,
                 events: protocol::WatchMask::RENAME,
                 terminal: None,
             });
             effects.push(Effect {
                 node: target.id(),
-                generation: backend
-                    .get(target)
-                    .expect("committed Move target disappeared")
-                    .version(),
+                generation: FalBackend::metadata(backend, target, FalRights::ALL)
+                    .map_err(|_| SystemCallError::InternalError)?
+                    .version,
                 events: protocol::WatchMask::RENAME,
                 terminal: None,
             });
@@ -1979,8 +2112,8 @@ struct ServeTransfers<'a> {
     effects: &'a mut Effects,
 }
 
-fn serve_v2(
-    backend: &mut MemoryBackend<Capability>,
+fn serve_v2<B: RuntimeBackend>(
+    backend: &mut B,
     access: &AccessSnapshot,
     expected: protocol::Header,
     payload: &[u8],
@@ -2008,7 +2141,7 @@ fn serve_v2(
                 Err(error) => return failure(out, backend_status(error)),
             };
             match lookup {
-                LookupV2::Found(reference) => {
+                LookupResult::Found(reference) => {
                     let info = match node_info_v2(backend, &reference, access.rights()) {
                         Ok(info) => info,
                         Err(error) => return failure(out, backend_status(error)),
@@ -2021,7 +2154,7 @@ fn serve_v2(
                         protocol::Response::Node(info),
                     )
                 }
-                LookupV2::Link {
+                LookupResult::LinkBoundary {
                     reference,
                     consumed,
                     target,
@@ -2044,6 +2177,7 @@ fn serve_v2(
                         },
                     )
                 }
+                LookupResult::DelegationBoundary { .. } => failure(out, protocol::Status::Conflict),
             }
         }
         protocol::Request::Create {
@@ -2055,42 +2189,20 @@ fn serve_v2(
             if name.contains('/') || name.is_empty() {
                 return failure(out, protocol::Status::Invalid);
             }
-            let body = match kind {
-                NodeKind::Directory if value.is_empty() => backend.directory_body(),
-                NodeKind::Property => {
-                    let owners = core::mem::take(transfers.input);
-                    match StoredValue::prepare(value, owners, 1, PAYLOAD_MAX, access.account()) {
-                        Ok(value) => Body::Property(value),
-                        Err(failure_value) => {
-                            transfers.input.extend(failure_value.handles);
-                            return failure(out, value_status(failure_value.error));
-                        }
-                    }
-                }
-                NodeKind::Stream if value.is_empty() => match Data::new(access.account()) {
-                    Ok(data) => Body::Stream(data),
-                    Err(SystemCallError::QuotaExceeded) => {
-                        return failure(out, protocol::Status::Quota);
-                    }
-                    Err(SystemCallError::OutOfMemory) => {
-                        return failure(out, protocol::Status::Resource);
-                    }
-                    Err(_) => return failure(out, protocol::Status::Internal),
-                },
-                NodeKind::Directory | NodeKind::Stream => {
-                    return failure(out, protocol::Status::Invalid);
-                }
-                NodeKind::SymbolicLink => {
-                    return failure(out, protocol::Status::Unsupported);
-                }
-            };
             let position = match backend.position(access.root(), name, None) {
                 Ok(position) => position,
                 Err(error) => return failure(out, backend_status(error)),
             };
-            let mutation = match backend.prepare_create(position, access, body, rights) {
+            let mutation = match backend.prepare_create(
+                position,
+                access,
+                CreateInput::Node { kind, value },
+                transfers.input,
+                rights,
+            ) {
                 Ok(mutation) => mutation,
-                Err(create) => return failure(out, backend_status(create.error)),
+                Err(CreateError::Backend(error)) => return failure(out, backend_status(error)),
+                Err(CreateError::Value(error)) => return failure(out, value_status(error)),
             };
             let created = match backend.commit(mutation) {
                 Ok(CommitResult::Created(created)) => created,
@@ -2126,11 +2238,17 @@ fn serve_v2(
                 Ok(position) => position,
                 Err(error) => return failure(out, backend_status(error)),
             };
-            let mutation =
-                match backend.prepare_create(position, access, Body::Link(target.into()), rights) {
-                    Ok(mutation) => mutation,
-                    Err(create) => return failure(out, backend_status(create.error)),
-                };
+            let mutation = match backend.prepare_create(
+                position,
+                access,
+                CreateInput::Link(target),
+                transfers.input,
+                rights,
+            ) {
+                Ok(mutation) => mutation,
+                Err(CreateError::Backend(error)) => return failure(out, backend_status(error)),
+                Err(CreateError::Value(error)) => return failure(out, value_status(error)),
+            };
             let created = match backend.commit(mutation) {
                 Ok(CommitResult::Created(created)) => created,
                 Ok(_) => return failure(out, protocol::Status::Internal),
@@ -2169,24 +2287,19 @@ fn serve_v2(
             writer.u16(0);
             writer.u16(0);
             let mut count = 0u16;
-            let next = match backend.enumerate(
+            let next = match FalBackend::enumerate(
+                backend,
                 &parent,
                 access,
                 cursor,
                 page_limit,
-                |name, reference, node| {
+                |name, reference, metadata| {
                     writer.sized_bytes(name.as_bytes());
                     writer.u64(reference.id().raw());
-                    writer.u64(node.version());
-                    writer.u32(node.kind() as u32);
-                    writer.u32(node.rights().intersect(access.rights()).raw());
-                    let size = match node.body() {
-                        Body::Directory(_) => 0,
-                        Body::Property(value) => value.bytes.len() as u64,
-                        Body::Stream(data) => data.len(),
-                        Body::Link(target) => target.len() as u64,
-                    };
-                    writer.u64(size);
+                    writer.u64(metadata.version);
+                    writer.u32(metadata.kind as u32);
+                    writer.u32(metadata.rights.raw());
+                    writer.u64(metadata.size);
                     count += 1;
                 },
             ) {
@@ -2206,53 +2319,28 @@ fn serve_v2(
             .encode(&mut out[..protocol::HEADER_LEN]);
             Some(protocol::HEADER_LEN + used).ok_or(SystemCallError::InternalError)
         }
-        protocol::Request::Read { path } | protocol::Request::Take { path } => {
-            let reference = match resolve_v2(backend, access, path) {
-                Ok(reference) => reference,
-                Err(error) => return failure(out, backend_status(error)),
+        protocol::Request::Read { path } => {
+            let snapshot = match FalBackend::read_snapshot(backend, access, path) {
+                Ok(snapshot) => snapshot,
+                Err(ReadError::Backend(error)) => {
+                    return failure(out, backend_status(error));
+                }
+                Err(ReadError::Value(error)) => {
+                    return failure(out, value_status(error));
+                }
             };
-            let node = backend
-                .get(&reference)
-                .ok_or(SystemCallError::InternalError)?;
-            if !access
-                .rights()
-                .intersect(node.rights())
-                .contains(FalRights::READ_PROPERTY)
-            {
-                return failure(out, protocol::Status::Permission);
-            }
-            let Body::Property(value) = node.body() else {
-                return failure(out, protocol::Status::Invalid);
-            };
-            if node.take_reserved() {
-                return failure(out, protocol::Status::Busy);
-            }
-            if !value.handles.is_empty()
-                && !access
-                    .rights()
-                    .intersect(node.rights())
-                    .contains(FalRights::ACQUIRE_CAPABILITY)
-            {
-                return failure(out, protocol::Status::Permission);
-            }
-            let (value_bytes, handles) = match value.duplicate_for_reply() {
+            let mut direct = match snapshot.into_direct() {
                 Ok(exported) => exported,
-                Err(libfal::value::ValueError::Affine) => {
-                    return failure(out, protocol::Status::Busy);
-                }
-                Err(libfal::value::ValueError::Unsupported) => {
-                    return failure(out, protocol::Status::Unsupported);
-                }
-                Err(error) => return failure(out, value_status(error)),
+                Err(_) => return failure(out, protocol::Status::Unsupported),
             };
             let used = encode_v2(
                 out,
                 header.op,
                 protocol::Status::Ok,
                 header.deadline,
-                protocol::Response::Value(&value_bytes),
+                protocol::Response::Value(&direct.bytes),
             )?;
-            transfers.output.extend(handles);
+            transfers.output.append(&mut direct.handles);
             Ok(used)
         }
         protocol::Request::Write { path, value } => {
@@ -2273,8 +2361,8 @@ fn serve_v2(
                 Ok(mutation) => mutation,
                 Err(property) => return failure(out, backend_status(property.error)),
             };
-            let mut old = match backend.commit(mutation) {
-                Ok(CommitResult::PropertyReplaced(old)) => old,
+            match backend.commit(mutation) {
+                Ok(CommitResult::PropertyReplaced) => (),
                 Ok(_) => return failure(out, protocol::Status::Internal),
                 Err(commit) => return failure(out, backend_status(commit.error)),
             };
@@ -2285,12 +2373,6 @@ fn serve_v2(
                 protocol::WatchMask::MODIFY,
                 None,
             )?;
-            if !old
-                .retire_step(usize::MAX)
-                .map_err(|_| SystemCallError::InternalError)?
-            {
-                return failure(out, protocol::Status::Internal);
-            }
             encode_v2(
                 out,
                 header.op,
@@ -2308,25 +2390,21 @@ fn serve_v2(
                 Ok(reference) => reference,
                 Err(error) => return failure(out, backend_status(error)),
             };
-            let node = backend
-                .get(&reference)
-                .ok_or(SystemCallError::InternalError)?;
-            if !access
-                .rights()
-                .intersect(node.rights())
-                .contains(FalRights::READ_STREAM)
-            {
-                return failure(out, protocol::Status::Permission);
-            }
-            let Body::Stream(data) = node.body() else {
-                return failure(out, protocol::Status::Invalid);
-            };
             let maximum = PAYLOAD_MAX - librpc::PREFIX_LEN - protocol::HEADER_LEN - 2;
             if count as usize > maximum {
                 return failure(out, protocol::Status::Invalid);
             }
             let mut bytes = [0; PAYLOAD_MAX];
-            let read = data.read(offset, &mut bytes[..count as usize]);
+            let read = match FalMutationBackend::read_stream(
+                backend,
+                &reference,
+                access,
+                offset,
+                &mut bytes[..count as usize],
+            ) {
+                Ok(read) => read,
+                Err(error) => return failure(out, backend_status(error)),
+            };
             encode_v2(
                 out,
                 header.op,
@@ -2381,7 +2459,7 @@ fn serve_v2(
                 Some((identity, expected.version))
             };
             let parent = access.root().clone();
-            let target = match backend.lookup_child(&parent, name, access) {
+            let target = match FalMutationBackend::lookup_child(backend, &parent, name, access) {
                 Ok(target) => target,
                 Err(error) => return failure(out, backend_status(error)),
             };
@@ -2421,29 +2499,50 @@ fn serve_v2(
                 protocol::Response::Empty,
             )
         }
+        protocol::Request::Take { .. } => failure(out, protocol::Status::Unsupported),
         protocol::Request::Derive { .. }
         | protocol::Request::Move { .. }
         | protocol::Request::Subscribe { .. }
         | protocol::Request::QuerySubscription { .. }
-        | protocol::Request::Unsubscribe { .. } => failure(out, protocol::Status::Internal),
+        | protocol::Request::Unsubscribe { .. }
+        | protocol::Request::Open { .. } => failure(out, protocol::Status::Internal),
+        protocol::Request::Start
+        | protocol::Request::QueryStream
+        | protocol::Request::FinishStream
+        | protocol::Request::CancelStream => failure(out, protocol::Status::Permission),
     }
 }
 
-struct RequestTask {
-    outbox: Outbox,
-    mode: RequestMode,
-    committed: bool,
-    recorded: bool,
+fn record_provider_response<B: RuntimeBackend>(
+    world: &mut World<B>,
+    outbox: &Outbox,
+    business_committed: bool,
+) -> Result<(), SystemCallError> {
+    world.provider.record_response(
+        business_committed,
+        matches!(outbox.result(), Some(OutboxResult::Abandoned(_))),
+    )?;
+    if let Some(OutboxResult::Abandoned(cause)) = outbox.result() {
+        rinlib::debug!("fs: provider response abandoned after commit: {:?}", cause);
+    }
+    Ok(())
 }
 
-enum RequestMode {
-    RouteAck(route::Status),
+struct RequestTask<B: RuntimeBackend> {
+    outbox: Outbox,
+    mode: RequestMode<B>,
+    committed: bool,
+    recorded: bool,
+    wakes: WakeBatch,
+}
+
+enum RequestMode<B: RuntimeBackend> {
     V2 {
         access: AccessSnapshot,
         header: protocol::Header,
     },
-    Move(MoveOperation),
-    Take(TakeOperation),
+    Move(MoveOperation<B>),
+    Take(TakeOperation<B>),
     WatchControl(WatchControlOperation),
     V2Failure {
         header: protocol::Header,
@@ -2460,49 +2559,60 @@ struct WatchControlOperation {
     context: u64,
     header: protocol::Header,
     kind: WatchControlKind,
+    result: Option<(protocol::Status, Option<protocol::SubscriptionInfo>)>,
+    pending_wake: Option<u64>,
     encoded: bool,
 }
 
 impl WatchControlOperation {
-    fn drive(
+    fn drive<B: RuntimeBackend>(
         &mut self,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         out: &mut [u8],
-    ) -> Result<usize, SystemCallError> {
+    ) -> Result<Option<usize>, SystemCallError> {
         if self.encoded {
-            return Ok(0);
+            return Ok(Some(0));
         }
-        let (status, response) = match self.kind {
-            WatchControlKind::Query(id) => match world.watches.query(id, self.context) {
-                Ok(info) => (protocol::Status::Ok, protocol::Response::Subscription(info)),
-                Err(ControlError::NotFound) => {
-                    (protocol::Status::NotFound, protocol::Response::Empty)
+        if self.result.is_none() {
+            let result = match self.kind {
+                WatchControlKind::Query(id) => match world.provider.watches.query(id, self.context)
+                {
+                    Ok(info) => (protocol::Status::Ok, Some(info)),
+                    Err(ControlError::NotFound) => (protocol::Status::NotFound, None),
+                    Err(ControlError::Permission) => (protocol::Status::Permission, None),
+                },
+                WatchControlKind::Unsubscribe(id) => {
+                    match world.provider.watches.cancel(id, self.context) {
+                        Ok(task) => {
+                            self.pending_wake = Some(task);
+                            (protocol::Status::Ok, None)
+                        }
+                        Err(ControlError::NotFound) => (protocol::Status::NotFound, None),
+                        Err(ControlError::Permission) => (protocol::Status::Permission, None),
+                    }
                 }
-                Err(ControlError::Permission) => {
-                    (protocol::Status::Permission, protocol::Response::Empty)
-                }
-            },
-            WatchControlKind::Unsubscribe(id) => match world.watches.cancel(id, self.context) {
-                Ok(task) => {
-                    requests.wake(task)?;
-                    (protocol::Status::Ok, protocol::Response::Empty)
-                }
-                Err(ControlError::NotFound) => {
-                    (protocol::Status::NotFound, protocol::Response::Empty)
-                }
-                Err(ControlError::Permission) => {
-                    (protocol::Status::Permission, protocol::Response::Empty)
-                }
-            },
-        };
+            };
+            self.result = Some(result);
+        }
+        if let Some(task) = self.pending_wake {
+            match requests.wake(task) {
+                Ok(()) => self.pending_wake = None,
+                Err(SystemCallError::ReachLimit) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let (status, info) = self.result.expect("Watch control result missing");
+        let response = info
+            .map(protocol::Response::Subscription)
+            .unwrap_or(protocol::Response::Empty);
         let used = encode_v2(out, self.header.op, status, self.header.deadline, response)?;
         self.encoded = true;
-        Ok(used)
+        Ok(Some(used))
     }
 }
 
-struct MoveOperation {
+struct MoveOperation<B: RuntimeBackend> {
     access: AccessSnapshot,
     destination: AccessSnapshot,
     header: protocol::Header,
@@ -2510,16 +2620,16 @@ struct MoveOperation {
     source_name: String,
     destination_name: String,
     expected: Option<(NodeId, u64)>,
-    prepared: Option<libfal::backend::PreparedMutation<Capability>>,
+    prepared: Option<B::Mutation>,
     source_parent_ref: Option<NodeRef>,
     target_ref: Option<NodeRef>,
 }
 
-struct TakeOperation {
+struct TakeOperation<B: RuntimeBackend> {
     access: AccessSnapshot,
     header: protocol::Header,
     path: String,
-    prepared: Option<PreparedTake<Capability>>,
+    prepared: Option<B::TakeReservation>,
     reference: Option<NodeRef>,
     bytes: Option<Vec<u8>>,
     policies: Vec<ExportPolicy>,
@@ -2528,12 +2638,8 @@ struct TakeOperation {
     failed: bool,
 }
 
-impl TakeOperation {
-    fn drive(
-        &mut self,
-        backend: &mut MemoryBackend<Capability>,
-        outbox: &mut Outbox,
-    ) -> Result<usize, SystemCallError> {
+impl<B: RuntimeBackend> TakeOperation<B> {
+    fn drive(&mut self, backend: &mut B, outbox: &mut Outbox) -> Result<usize, SystemCallError> {
         if self.encoded {
             return Ok(0);
         }
@@ -2552,20 +2658,9 @@ impl TakeOperation {
                     );
                 }
             };
-            let value = match backend.get(&reference).map(|node| node.body()) {
-                Some(Body::Property(value)) => value,
-                Some(_) => {
-                    self.failed = true;
-                    self.encoded = true;
-                    return encode_v2(
-                        outbox.response_mut()?.body_mut()?,
-                        self.header.op,
-                        protocol::Status::Invalid,
-                        self.header.deadline,
-                        protocol::Response::Empty,
-                    );
-                }
-                None => {
+            let value = match FalMutationBackend::property(backend, &reference) {
+                Ok(value) => value,
+                Err(BackendError::NotFound) => {
                     self.failed = true;
                     self.encoded = true;
                     return encode_v2(
@@ -2576,7 +2671,29 @@ impl TakeOperation {
                         protocol::Response::Empty,
                     );
                 }
+                Err(_) => {
+                    self.failed = true;
+                    self.encoded = true;
+                    return encode_v2(
+                        outbox.response_mut()?.body_mut()?,
+                        self.header.op,
+                        protocol::Status::Invalid,
+                        self.header.deadline,
+                        protocol::Response::Empty,
+                    );
+                }
             };
+            if let Err(error) = value.validate_output_transport(self.access.output_transport()) {
+                self.failed = true;
+                self.encoded = true;
+                return encode_v2(
+                    outbox.response_mut()?.body_mut()?,
+                    self.header.op,
+                    value_status(error),
+                    self.header.deadline,
+                    protocol::Response::Empty,
+                );
+            }
             if value
                 .handles
                 .iter()
@@ -2629,7 +2746,7 @@ impl TakeOperation {
                 }
             };
             self.reference = Some(watch_reference);
-            let taken = MemoryBackend::take_value(&mut prepared);
+            let taken = B::take_value(&mut prepared);
             self.bytes = Some(taken.bytes);
             self.prepared = Some(prepared);
 
@@ -2686,7 +2803,7 @@ impl TakeOperation {
 
     fn finalize(
         &mut self,
-        backend: &mut MemoryBackend<Capability>,
+        backend: &mut B,
         outbox: &mut Outbox,
         effects: &mut Effects,
     ) -> Result<bool, SystemCallError> {
@@ -2736,14 +2853,14 @@ impl TakeOperation {
     }
 }
 
-impl Task<World> for RequestTask {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for RequestTask<B> {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         _id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -2753,15 +2870,17 @@ impl Task<World> for RequestTask {
         if input.take_timeout() {
             self.outbox.timed_out();
         }
+        if !self.wakes.is_empty() && !self.wakes.drive(requests)? {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
+        }
         if !self.committed && self.outbox.result().is_none() {
             if !self.outbox.is_admitted() {
                 return Ok(self.outbox.admit(requests));
             }
             let used = match &mut self.mode {
-                RequestMode::RouteAck(status) => {
-                    route::encode_status(*status, self.outbox.response_mut()?.body_mut()?)
-                        .ok_or(SystemCallError::InternalError)?
-                }
                 RequestMode::V2 { access, header } => {
                     let mut effects = Effects::default();
                     let used = {
@@ -2776,6 +2895,7 @@ impl Task<World> for RequestTask {
                         };
                         let used = serve_v2(
                             world
+                                .provider
                                 .backend
                                 .as_mut()
                                 .expect("provider backend missing during request"),
@@ -2792,13 +2912,14 @@ impl Task<World> for RequestTask {
                         }
                         used
                     };
-                    publish_watch_events(world, requests, &effects)?;
+                    publish_watch_events(world, &effects, &mut self.wakes);
                     used
                 }
                 RequestMode::Move(operation) => {
                     let mut effects = Effects::default();
                     let Some(used) = drive_move(
                         world
+                            .provider
                             .backend
                             .as_mut()
                             .expect("provider backend missing during move"),
@@ -2813,18 +2934,30 @@ impl Task<World> for RequestTask {
                             step: Step::Runnable,
                         });
                     };
-                    publish_watch_events(world, requests, &effects)?;
+                    publish_watch_events(world, &effects, &mut self.wakes);
                     used
                 }
                 RequestMode::Take(operation) => operation.drive(
                     world
+                        .provider
                         .backend
                         .as_mut()
                         .expect("provider backend missing during take"),
                     &mut self.outbox,
                 )?,
                 RequestMode::WatchControl(operation) => {
-                    operation.drive(world, requests, self.outbox.response_mut()?.body_mut()?)?
+                    let Some(used) = operation.drive(
+                        world,
+                        requests,
+                        self.outbox.response_mut()?.body_mut()?,
+                    )?
+                    else {
+                        return Ok(Advance {
+                            work_done: 1,
+                            step: Step::Runnable,
+                        });
+                    };
+                    used
                 }
                 RequestMode::V2Failure { header, status } => encode_v2(
                     self.outbox.response_mut()?.body_mut()?,
@@ -2836,6 +2969,12 @@ impl Task<World> for RequestTask {
             };
             self.outbox.response_mut()?.finish_body(used)?;
             self.committed = true;
+            if !self.wakes.is_empty() && !self.wakes.drive(requests)? {
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Runnable,
+                });
+            }
         }
         let advance = self.outbox.drive(requests, budget)?;
         if advance.step == Step::Complete && self.committed && !self.recorded {
@@ -2843,48 +2982,407 @@ impl Task<World> for RequestTask {
                 let mut effects = Effects::default();
                 let committed = operation.finalize(
                     world
+                        .provider
                         .backend
                         .as_mut()
                         .expect("provider backend missing during take finalization"),
                     &mut self.outbox,
                     &mut effects,
                 )?;
-                publish_watch_events(world, requests, &effects)?;
+                publish_watch_events(world, &effects, &mut self.wakes);
                 committed
             } else {
                 true
             };
-            if business_committed {
-                world.committed = world
-                    .committed
-                    .checked_add(1)
-                    .ok_or(SystemCallError::ReachLimit)?;
+            record_provider_response(world, &self.outbox, business_committed)?;
+            self.recorded = true;
+            if !self.wakes.is_empty() && !self.wakes.drive(requests)? {
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Runnable,
+                });
             }
+        }
+        Ok(advance)
+    }
+
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        match failure {
+            RequestFailure::Wake {
+                error: SystemCallError::ObjectNotFound,
+                ..
+            } => {
+                // Watch 已取消/完成：该 stale wake 的债务已经自然解除。
+            }
+            RequestFailure::Wake { .. } => world.failed = true,
+            other => self.outbox.refused(world, other),
+        }
+    }
+
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        self.outbox.registered(world, kind, source);
+    }
+
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        self.outbox.unregistered(world, kind, source);
+    }
+
+    fn stop(&mut self, world: &mut World<B>) {
+        self.outbox.stop(world);
+    }
+
+    fn deadline(&self) -> Deadline {
+        self.outbox.deadline()
+    }
+}
+
+struct PendingDirectoryExport {
+    index: usize,
+    policy: ExportPolicy,
+    mailbox: u64,
+    context: u64,
+}
+
+struct ReadTask {
+    outbox: Outbox,
+    header: protocol::Header,
+    snapshot: Option<ReadSnapshot<Capability>>,
+    pending: Option<PendingDirectoryExport>,
+    dispatch: DownstreamState,
+    status: Option<protocol::Status>,
+    encoded: bool,
+    recorded: bool,
+}
+
+impl ReadTask {
+    fn new(outbox: Outbox, header: protocol::Header, snapshot: ReadSnapshot<Capability>) -> Self {
+        Self {
+            outbox,
+            header,
+            snapshot: Some(snapshot),
+            pending: None,
+            dispatch: DownstreamState::Queued,
+            status: None,
+            encoded: false,
+            recorded: false,
+        }
+    }
+
+    fn submitted(&mut self, result: Result<u64, Completion>) {
+        assert!(
+            matches!(self.dispatch, DownstreamState::Queued),
+            "Directory export submission completed from an invalid state"
+        );
+        self.dispatch = match result {
+            Ok(txid) => DownstreamState::Pending(txid),
+            Err(completion) => DownstreamState::Complete(completion),
+        };
+    }
+
+    fn completed(&mut self, txid: u64, completion: Completion) {
+        assert!(
+            matches!(self.dispatch, DownstreamState::Pending(pending) | DownstreamState::Cancelling(pending) if pending == txid),
+            "Directory export completion txid mismatch"
+        );
+        self.dispatch = DownstreamState::Complete(completion);
+    }
+
+    fn begin_next_export(&mut self) -> bool {
+        let prepared = (|| {
+            let Some(snapshot) = self.snapshot.as_mut() else {
+                return Ok(false);
+            };
+            let Some(index) = snapshot
+                .handles
+                .iter()
+                .position(|handle| matches!(handle, SnapshotHandle::Directory { .. }))
+            else {
+                return Ok(false);
+            };
+            let SnapshotHandle::Directory { provider, policy } = snapshot.handles.remove(index)
+            else {
+                unreachable!()
+            };
+            let description = provider.description().map_err(export_status)?;
+            let request = protocol::Request::Derive {
+                path: "",
+                rights: policy.fal_ceiling,
+            };
+            let capacity = protocol::HEADER_LEN
+                .checked_add(request.encoded_len().ok_or(protocol::Status::Invalid)?)
+                .ok_or(protocol::Status::Resource)?;
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(capacity)
+                .map_err(|_| protocol::Status::Resource)?;
+            payload.resize(capacity, 0);
+            let used = protocol::encode_request(&request, self.header.deadline, &mut payload)
+                .ok_or(protocol::Status::Internal)?;
+            payload.truncate(used);
+            let request = RpcRequest::new(protocol::ID, &payload).map_err(export_status)?;
+            self.pending = Some(PendingDirectoryExport {
+                index,
+                policy,
+                mailbox: description.related_object_id,
+                context: description.object_id,
+            });
+            self.dispatch = DownstreamState::Ready {
+                service: provider,
+                request,
+            };
+            Ok(true)
+        })();
+        match prepared {
+            Ok(started) => started,
+            Err(status) => {
+                self.status = Some(status);
+                false
+            }
+        }
+    }
+
+    fn consume_completion(&mut self) -> Result<(), SystemCallError> {
+        let completion = match core::mem::replace(&mut self.dispatch, DownstreamState::Queued) {
+            DownstreamState::Complete(completion) => completion,
+            other => {
+                self.dispatch = other;
+                return Ok(());
+            }
+        };
+        drop(completion.service);
+        let pending = self
+            .pending
+            .take()
+            .expect("Directory export completion lost its pending field");
+        let outcome = match completion.result {
+            Ok(mut reply) => {
+                let decoded = protocol::decode_response(&reply.payload);
+                match decoded {
+                    Ok((header, protocol::Response::Node(node)))
+                        if header.op == protocol::Op::Derive
+                            && header.status == protocol::Status::Ok
+                            && header.deadline == self.header.deadline
+                            && node.kind == NodeKind::Directory
+                            && node.rights == pending.policy.fal_ceiling
+                            && reply.handles.remaining() == 1 =>
+                    {
+                        let capability = reply
+                            .handles
+                            .take(0)
+                            .map_err(|_| SystemCallError::InternalError)?;
+                        match MailboxSender::from_capability(capability) {
+                            Ok((sender, description))
+                                if description.related_object_id == pending.mailbox
+                                    && description.object_id != pending.context
+                                    && pending
+                                        .policy
+                                        .transport
+                                        .is_subset_of(description.rights) =>
+                            {
+                                let child = sender.into_capability();
+                                child
+                                    .duplicate(pending.policy.transport)
+                                    .map_err(export_status)
+                            }
+                            Ok(_) | Err(_) => Err(protocol::Status::Internal),
+                        }
+                    }
+                    Ok((header, _))
+                        if header.op == protocol::Op::Derive
+                            && header.status != protocol::Status::Ok
+                            && header.deadline == self.header.deadline
+                            && reply.handles.is_empty() =>
+                    {
+                        Err(header.status)
+                    }
+                    _ => Err(protocol::Status::Internal),
+                }
+            }
+            Err(CallError { cause, .. }) => Err(match cause {
+                CallCause::Timeout | CallCause::Cancelled | CallCause::Shutdown => protocol::Status::Cancelled,
+                CallCause::ServiceClosed => protocol::Status::GrantRevoked,
+                CallCause::System(error) => export_status(error),
+                CallCause::Frame(_) => protocol::Status::Internal,
+            }),
+        };
+        match outcome {
+            Ok(owner) => {
+                self.snapshot
+                    .as_mut()
+                    .expect("Directory export snapshot disappeared")
+                    .handles
+                    .insert(
+                        pending.index,
+                        SnapshotHandle::Direct {
+                            owner,
+                            policy: pending.policy,
+                        },
+                    );
+            }
+            Err(status) => self.status = Some(status),
+        }
+        Ok(())
+    }
+
+    fn encode(&mut self) -> Result<(), SystemCallError> {
+        if self.encoded || self.outbox.result().is_some() {
+            self.snapshot = None;
+            self.encoded = true;
+            return Ok(());
+        }
+        let response = self.outbox.response_mut()?;
+        if let Some(status) = self.status {
+            self.snapshot = None;
+            let used = protocol::encode_response(
+                protocol::Op::Read,
+                status,
+                self.header.deadline,
+                &protocol::Response::Empty,
+                response.body_mut()?,
+            )
+            .ok_or(SystemCallError::InternalError)?;
+            response.finish_body(used)?;
+            self.encoded = true;
+            return Ok(());
+        }
+        let snapshot = self
+            .snapshot
+            .as_mut()
+            .expect("Read snapshot disappeared before encoding");
+        let used = protocol::encode_response(
+            protocol::Op::Read,
+            protocol::Status::Ok,
+            self.header.deadline,
+            &protocol::Response::Value(&snapshot.bytes),
+            response.body_mut()?,
+        )
+        .ok_or(SystemCallError::InternalError)?;
+        while !snapshot.handles.is_empty() {
+            let handle = snapshot.handles.remove(0);
+            let SnapshotHandle::Direct { owner, policy } = handle else {
+                panic!("Read reply encoded before Directory export completed")
+            };
+            if let Err(failure) = response.push(owner, policy.transport) {
+                snapshot.handles.insert(
+                    0,
+                    SnapshotHandle::Direct {
+                        owner: failure.capability,
+                        policy,
+                    },
+                );
+                return Err(failure.error);
+            }
+        }
+        response.finish_body(used)?;
+        self.snapshot = None;
+        self.encoded = true;
+        Ok(())
+    }
+}
+
+impl<B: RuntimeBackend> Task<World<B>> for ReadTask {
+    type Family = ServiceTask<B>;
+
+    fn advance(
+        &mut self,
+        id: u64,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        while let Some(event) = input.pull() {
+            self.outbox.observe(event);
+        }
+        if input.take_timeout() {
+            self.outbox.timed_out();
+        }
+        if world.stop {
+            self.outbox.stop(world);
+        }
+        if self.outbox.result().is_some() {
+            self.snapshot = None;
+            self.pending = None;
+            self.encoded = true;
+            if let Some(advance) = abandon_downstream(&mut self.dispatch, id, world, requests)? {
+                return Ok(advance);
+            }
+        }
+        if self.outbox.result().is_none() && !self.outbox.is_admitted() {
+            return Ok(self.outbox.admit(requests));
+        }
+        if matches!(self.dispatch, DownstreamState::Complete(_)) {
+            self.consume_completion()?;
+        }
+        if !self.encoded
+            && self.status.is_none()
+            && matches!(self.dispatch, DownstreamState::Queued)
+            && self.begin_next_export()
+        {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
+        }
+        if matches!(self.dispatch, DownstreamState::Ready { .. }) {
+            if world.dispatch_intent.is_some() {
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Runnable,
+                });
+            }
+            requests.wake(world.dispatcher_task)?;
+            let ready = core::mem::replace(&mut self.dispatch, DownstreamState::Queued);
+            let DownstreamState::Ready { service, request } = ready else {
+                unreachable!()
+            };
+            world.dispatch_intent = Some(DispatchIntent::Submit(DispatchSubmission {
+                waiter: id,
+                service,
+                deadline: self.header.deadline,
+                request,
+            }));
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        if matches!(self.dispatch, DownstreamState::Pending(_)) {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        if !self.encoded {
+            self.encode()?;
+        }
+        let advance = self.outbox.drive(requests, budget)?;
+        if advance.step == Step::Complete && !self.recorded {
+            world.provider.record_response(
+                true,
+                matches!(self.outbox.result(), Some(OutboxResult::Abandoned(_))),
+            )?;
             if let Some(OutboxResult::Abandoned(cause)) = self.outbox.result() {
-                world.abandoned = world
-                    .abandoned
-                    .checked_add(1)
-                    .ok_or(SystemCallError::ReachLimit)?;
-                rinlib::debug!("fs: provider response abandoned after commit: {:?}", cause);
+                rinlib::debug!("fs: Read response abandoned after snapshot: {:?}", cause);
             }
             self.recorded = true;
         }
         Ok(advance)
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<ServiceTask>) {
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
         self.outbox.refused(world, failure);
     }
 
-    fn registered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         self.outbox.registered(world, kind, source);
     }
 
-    fn unregistered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         self.outbox.unregistered(world, kind, source);
     }
 
-    fn stop(&mut self, world: &mut World) {
+    fn stop(&mut self, world: &mut World<B>) {
         self.outbox.stop(world);
     }
 
@@ -2908,7 +3406,7 @@ impl DelegateSetup {
             header: self.header,
             consumed: self.consumed,
             remaining: self.remaining,
-            dispatch: DelegateDispatch::Ready {
+            dispatch: DownstreamState::Ready {
                 service: self.service,
                 request: self.request,
             },
@@ -2919,32 +3417,12 @@ impl DelegateSetup {
 }
 
 fn prepare_delegate(
-    binding: &RouteBinding,
-    access: &AccessSnapshot,
-    path: &str,
+    target: Capability,
+    rights: FalRights,
+    consumed: String,
+    remaining: String,
     header: protocol::Header,
-) -> Result<Option<DelegateSetup>, protocol::Status> {
-    let remaining = if path == binding.name {
-        ""
-    } else {
-        let Some(remaining) = path
-            .strip_prefix(binding.name.as_str())
-            .and_then(|suffix| suffix.strip_prefix('/'))
-        else {
-            return Ok(None);
-        };
-        remaining
-    };
-    if !access
-        .rights()
-        .contains(FalRights::TRAVERSE | FalRights::ACQUIRE_CAPABILITY)
-    {
-        return Err(protocol::Status::Permission);
-    }
-    let rights = access.rights().intersect(binding.rights);
-    if !rights.contains(FalRights::TRAVERSE) {
-        return Err(protocol::Status::Permission);
-    }
+) -> Result<DelegateSetup, protocol::Status> {
     let request = protocol::Request::Derive { path: "", rights };
     let capacity = protocol::HEADER_LEN
         .checked_add(request.encoded_len().ok_or(protocol::Status::Invalid)?)
@@ -2958,33 +3436,68 @@ fn prepare_delegate(
         .ok_or(protocol::Status::Internal)?;
     payload.truncate(used);
     let rpc = RpcRequest::new(protocol::ID, &payload).map_err(|_| protocol::Status::Resource)?;
-    let transport = Rights::WRITE | Rights::WAIT;
-    let duplicated =
-        duplicate(binding.target.as_handle(), transport).map_err(|error| match error {
-            SystemCallError::QuotaExceeded => protocol::Status::Quota,
-            SystemCallError::OutOfMemory => protocol::Status::Resource,
-            SystemCallError::ObjectClosed => protocol::Status::GrantRevoked,
-            _ => protocol::Status::Internal,
-        })?;
-    // SAFETY: ObjectDuplicate returned a fresh affine entry owned by this submission.
-    let service = unsafe { Capability::from_raw(duplicated) };
-    Ok(Some(DelegateSetup {
+    Ok(DelegateSetup {
         header,
-        consumed: binding.name.clone(),
-        remaining: String::from(remaining),
-        service,
+        consumed,
+        remaining,
+        service: target,
         request: rpc,
-    }))
+    })
 }
 
-enum DelegateDispatch {
+enum DownstreamState {
     Ready {
         service: Capability,
         request: RpcRequest,
     },
     Queued,
     Pending(u64),
+    Cancelling(u64),
     Complete(Completion),
+}
+
+fn abandon_downstream<B: RuntimeBackend>(
+    dispatch: &mut DownstreamState,
+    id: u64,
+    world: &mut World<B>,
+    requests: &mut Requests<ServiceTask<B>>,
+) -> Result<Option<Advance>, SystemCallError> {
+    match dispatch {
+        DownstreamState::Ready { .. } | DownstreamState::Complete(_) => {
+            *dispatch = DownstreamState::Queued;
+        }
+        DownstreamState::Queued => {
+            if matches!(
+                world.dispatch_intent.as_ref(),
+                Some(DispatchIntent::Submit(submission)) if submission.waiter == id
+            ) {
+                world.dispatch_intent = None;
+            }
+        }
+        DownstreamState::Pending(txid) => {
+            if world.dispatch_intent.is_some() {
+                return Ok(Some(Advance {
+                    work_done: 1,
+                    step: Step::Runnable,
+                }));
+            }
+            let txid = *txid;
+            requests.wake(world.dispatcher_task)?;
+            world.dispatch_intent = Some(DispatchIntent::Cancel { txid });
+            *dispatch = DownstreamState::Cancelling(txid);
+            return Ok(Some(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            }));
+        }
+        DownstreamState::Cancelling(_) => {
+            return Ok(Some(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 struct DelegateTask {
@@ -2992,7 +3505,7 @@ struct DelegateTask {
     header: protocol::Header,
     consumed: String,
     remaining: String,
-    dispatch: DelegateDispatch,
+    dispatch: DownstreamState,
     committed: bool,
     recorded: bool,
 }
@@ -3000,26 +3513,26 @@ struct DelegateTask {
 impl DelegateTask {
     fn submitted(&mut self, result: Result<u64, Completion>) {
         assert!(
-            matches!(self.dispatch, DelegateDispatch::Queued),
+            matches!(self.dispatch, DownstreamState::Queued),
             "Delegate submission completed from an invalid state"
         );
         self.dispatch = match result {
-            Ok(txid) => DelegateDispatch::Pending(txid),
-            Err(completion) => DelegateDispatch::Complete(completion),
+            Ok(txid) => DownstreamState::Pending(txid),
+            Err(completion) => DownstreamState::Complete(completion),
         };
     }
 
     fn completed(&mut self, txid: u64, completion: Completion) {
         assert!(
-            matches!(self.dispatch, DelegateDispatch::Pending(pending) if pending == txid),
+            matches!(self.dispatch, DownstreamState::Pending(pending) | DownstreamState::Cancelling(pending) if pending == txid),
             "Delegate completion txid mismatch"
         );
-        self.dispatch = DelegateDispatch::Complete(completion);
+        self.dispatch = DownstreamState::Complete(completion);
     }
 
     fn encode_completion(&mut self) -> Result<(), SystemCallError> {
-        let completion = match core::mem::replace(&mut self.dispatch, DelegateDispatch::Queued) {
-            DelegateDispatch::Complete(completion) => completion,
+        let completion = match core::mem::replace(&mut self.dispatch, DownstreamState::Queued) {
+            DownstreamState::Complete(completion) => completion,
             other => {
                 self.dispatch = other;
                 return Ok(());
@@ -3065,7 +3578,7 @@ impl DelegateTask {
                 }
             }
             Err(CallError { cause, .. }) => match cause {
-                CallCause::Timeout | CallCause::Shutdown => protocol::Status::Cancelled,
+                CallCause::Timeout | CallCause::Cancelled | CallCause::Shutdown => protocol::Status::Cancelled,
                 CallCause::ServiceClosed => protocol::Status::GrantRevoked,
                 CallCause::Frame(_) | CallCause::System(_) => protocol::Status::Internal,
             },
@@ -3108,14 +3621,14 @@ impl DelegateTask {
     }
 }
 
-impl Task<World> for DelegateTask {
-    type Family = ServiceTask;
+impl<B: RuntimeBackend> Task<World<B>> for DelegateTask {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         id: u64,
-        world: &mut World,
-        requests: &mut Requests<ServiceTask>,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -3125,33 +3638,42 @@ impl Task<World> for DelegateTask {
         if input.take_timeout() {
             self.outbox.timed_out();
         }
+        if world.stop {
+            self.outbox.stop(world);
+        }
+        if !self.committed && self.outbox.result().is_some() {
+            if let Some(advance) = abandon_downstream(&mut self.dispatch, id, world, requests)? {
+                return Ok(advance);
+            }
+            return self.outbox.drive(requests, budget);
+        }
         if self.outbox.result().is_none() && !self.outbox.is_admitted() {
             return Ok(self.outbox.admit(requests));
         }
-        if matches!(self.dispatch, DelegateDispatch::Ready { .. }) {
-            if world.dispatch_submission.is_some() {
+        if matches!(self.dispatch, DownstreamState::Ready { .. }) {
+            if world.dispatch_intent.is_some() {
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Runnable,
                 });
             }
             requests.wake(world.dispatcher_task)?;
-            let ready = core::mem::replace(&mut self.dispatch, DelegateDispatch::Queued);
-            let DelegateDispatch::Ready { service, request } = ready else {
+            let ready = core::mem::replace(&mut self.dispatch, DownstreamState::Queued);
+            let DownstreamState::Ready { service, request } = ready else {
                 unreachable!()
             };
-            world.dispatch_submission = Some(DispatchSubmission {
+            world.dispatch_intent = Some(DispatchIntent::Submit(DispatchSubmission {
                 waiter: id,
                 service,
                 deadline: self.header.deadline,
                 request,
-            });
+            }));
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
             });
         }
-        if !self.committed && matches!(self.dispatch, DelegateDispatch::Complete(_)) {
+        if !self.committed && matches!(self.dispatch, DownstreamState::Complete(_)) {
             self.encode_completion()?;
         }
         if !self.committed {
@@ -3162,15 +3684,11 @@ impl Task<World> for DelegateTask {
         }
         let advance = self.outbox.drive(requests, budget)?;
         if advance.step == Step::Complete && self.committed && !self.recorded {
-            world.committed = world
-                .committed
-                .checked_add(1)
-                .ok_or(SystemCallError::ReachLimit)?;
+            world.provider.record_response(
+                true,
+                matches!(self.outbox.result(), Some(OutboxResult::Abandoned(_))),
+            )?;
             if let Some(OutboxResult::Abandoned(cause)) = self.outbox.result() {
-                world.abandoned = world
-                    .abandoned
-                    .checked_add(1)
-                    .ok_or(SystemCallError::ReachLimit)?;
                 rinlib::debug!("fs: Delegate response abandoned after commit: {:?}", cause);
             }
             self.recorded = true;
@@ -3178,19 +3696,19 @@ impl Task<World> for DelegateTask {
         Ok(advance)
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<ServiceTask>) {
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
         self.outbox.refused(world, failure);
     }
 
-    fn registered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         self.outbox.registered(world, kind, source);
     }
 
-    fn unregistered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         self.outbox.unregistered(world, kind, source);
     }
 
-    fn stop(&mut self, world: &mut World) {
+    fn stop(&mut self, world: &mut World<B>) {
         self.outbox.stop(world);
     }
 
@@ -3199,154 +3717,1313 @@ impl Task<World> for DelegateTask {
     }
 }
 
-enum ServiceTask {
+fn service_status(error: RegistryError) -> service_protocol::Status {
+    match error {
+        RegistryError::Closed => service_protocol::Status::Cancelled,
+        RegistryError::Permission => service_protocol::Status::Permission,
+        RegistryError::Invalid => service_protocol::Status::Invalid,
+        RegistryError::Exists => service_protocol::Status::Exists,
+        RegistryError::NotFound => service_protocol::Status::NotFound,
+        RegistryError::Conflict => service_protocol::Status::Conflict,
+        RegistryError::Expired => service_protocol::Status::Expired,
+        RegistryError::Resource(SystemCallError::QuotaExceeded) => service_protocol::Status::Quota,
+        RegistryError::Resource(SystemCallError::ObjectBusy) => service_protocol::Status::Busy,
+        RegistryError::Resource(_) => service_protocol::Status::Resource,
+    }
+}
+
+fn check_registration_authority<B: RuntimeBackend>(
+    world: &World<B>,
+    identity: u64,
+    name: &str,
+) -> Result<(), RegistryError> {
+    world
+        .provider
+        .backend
+        .as_ref()
+        .and_then(RuntimeBackend::registry)
+        .ok_or(RegistryError::Closed)?
+        .authorize_name(identity, name)
+}
+
+fn drain_registration<B: RuntimeBackend>(
+    world: &mut World<B>,
+    instance: u64,
+    reason: service_protocol::TerminalReason,
+) -> Effects {
+    world
+        .provider
+        .backend
+        .as_mut()
+        .and_then(RuntimeBackend::registry_mut)
+        .and_then(|registry| registry.begin_drain(instance, reason).ok())
+        .map_or_else(Effects::default, |transition| transition.effects)
+}
+
+fn remove_registration_control<B: RuntimeBackend>(
+    world: &mut World<B>,
+    control: RegistrationControl,
+    reason: service_protocol::TerminalReason,
+) -> Effects {
+    if let Some(index) = world
+        .registration_controls
+        .iter()
+        .position(|candidate| candidate.instance == control.instance)
+    {
+        world.registration_controls.swap_remove(index);
+    }
+    let effects = drain_registration(world, control.instance, reason);
+    if let Some(registry) = world
+        .provider
+        .backend
+        .as_mut()
+        .and_then(RuntimeBackend::registry_mut)
+    {
+        registry.release_control(control.instance);
+    }
+    effects
+}
+
+enum RegistrationCommand {
+    Register {
+        name: String,
+        protocol: u64,
+        version: u32,
+        policy: ExportPolicy,
+        establish_deadline: Deadline,
+        endpoint: Capability,
+    },
+    QueryName(String),
+    Withdraw(String, u64, u64),
+    PublishReady,
+    BeginDrain,
+    Query,
+    DelegateName(String),
+}
+
+fn copy_request_name(name: &str) -> Result<String, SystemCallError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(name.len())
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    copy.push_str(name);
+    Ok(copy)
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "额度拒绝时原样保留已预付任务 owner，避免在无额度路径额外堆分配"
+)]
+enum PendingRegistrationTask {
+    Authority(AuthorityTask),
+    Reply(RegistrationReplyTask),
+}
+
+impl PendingRegistrationTask {
+    fn into_service<B: RuntimeBackend>(self) -> ServiceTask<B> {
+        match self {
+            Self::Authority(task) => ServiceTask::Authority(task),
+            Self::Reply(task) => ServiceTask::RegistrationReply(task),
+        }
+    }
+}
+
+struct RegistrationIngress {
+    buffer: ReceiveBuffer,
+    source: Option<SourceId>,
+    requested: bool,
+    removing: bool,
+    stopping: bool,
+    gate_pending: bool,
+    queued: Option<(PendingRegistrationTask, usize)>,
+    refusal: Option<Outbox>,
+}
+
+impl RegistrationIngress {
+    fn new() -> Self {
+        Self {
+            buffer: ReceiveBuffer::new()
+                .expect("RegistrationControl receive buffer creation failed"),
+            source: None,
+            requested: false,
+            gate_pending: false,
+            queued: None,
+            refusal: None,
+            removing: false,
+            stopping: false,
+        }
+    }
+    fn reject_task<B: RuntimeBackend>(
+        &mut self,
+        task: ServiceTask<B>,
+        error: SystemCallError,
+        world: &mut World<B>,
+    ) {
+        let (mut outbox, op) = task.into_registration_refusal();
+        self.gate_pending = false;
+        let status = match error {
+            SystemCallError::QuotaExceeded | SystemCallError::ReachLimit => {
+                service_protocol::Status::Quota
+            }
+            SystemCallError::OutOfMemory => service_protocol::Status::Resource,
+            _ => service_protocol::Status::Cancelled,
+        };
+        if self.stopping {
+            outbox.stop(world);
+        } else {
+            let deadline = outbox.deadline();
+            let response = outbox
+                .response_mut()
+                .expect("registration refusal lost prepared reply");
+            let used = service_protocol::encode_response(
+                op,
+                status,
+                deadline,
+                service_protocol::Response::Empty,
+                response
+                    .body_mut()
+                    .expect("registration refusal lost reply body"),
+            )
+            .expect("registration refusal reply layout invalid");
+            response
+                .finish_body(used)
+                .expect("registration refusal reply length invalid");
+        }
+        self.refusal = Some(outbox);
+    }
+}
+
+impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
+    type Family = ServiceTask<B>;
+
+    fn advance(
+        &mut self,
+        _id: u64,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        let mut ready = false;
+        while let Some(event) = input.pull() {
+            if event.kind == KIND_REPLY {
+                if let Some(outbox) = self.refusal.as_mut() {
+                    outbox.observe(event);
+                }
+            } else if event.kind == KIND_REGISTRATION {
+                if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+                    rinlib::debug!(
+                        "RegistrationControl terminal event: error={}, signals={:#x}",
+                        event.error,
+                        event.observed.raw()
+                    );
+                    world.failed = true;
+                    self.stopping = true;
+                } else {
+                    ready = true;
+                }
+            } else {
+                return Err(SystemCallError::InternalError);
+            }
+        }
+        if input.take_timeout()
+            && let Some(outbox) = self.refusal.as_mut()
+        {
+            outbox.timed_out();
+        }
+        if self.stopping {
+            self.queued = None;
+            if let Some(source) = self.source
+                && !self.removing
+            {
+                requests.remove(source)?;
+                self.removing = true;
+            }
+            if let Some(outbox) = self.refusal.as_mut() {
+                outbox.stop(world);
+                let advance = outbox.drive(requests, budget)?;
+                if !outbox.is_complete() {
+                    return Ok(advance);
+                }
+                self.refusal = None;
+            }
+            return Ok(Advance {
+                work_done: 1,
+                step: if self.source.is_none() && !self.requested && !self.gate_pending {
+                    Step::Complete
+                } else {
+                    Step::Parked
+                },
+            });
+        }
+        if let Some(outbox) = self.refusal.as_mut() {
+            let advance = if outbox.result().is_none() && !outbox.is_admitted() {
+                outbox.admit(requests)
+            } else {
+                outbox.drive(requests, budget)?
+            };
+            if !outbox.is_complete() {
+                return Ok(advance);
+            }
+            self.refusal = None;
+            requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        if let Some((task, max_sources)) = self.queued.take() {
+            match requests.spawn(task.into_service(), max_sources) {
+                Ok(()) => self.gate_pending = true,
+                Err(task) => {
+                    self.queued = Some((task.into_registration_pending(), max_sources));
+                }
+            }
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
+        }
+        if self.gate_pending {
+            self.gate_pending = false;
+            requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        let Some(RegistrationEndpoint::Authority(mailbox)) = world.registration_endpoint.as_ref()
+        else {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Complete,
+            });
+        };
+        if self.source.is_none() && !self.requested {
+            requests.add_source(
+                mailbox.as_handle(),
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                KIND_REGISTRATION,
+            )?;
+            self.requested = true;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
+        }
+        if !ready {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        let handle = match world.registration_endpoint.as_ref() {
+            Some(RegistrationEndpoint::Authority(mailbox)) => mailbox.as_handle(),
+            _ => return Err(SystemCallError::InternalError),
+        };
+        match self.buffer.receive(handle) {
+            Ok(()) => {}
+            Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => {
+                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Parked,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        let message = MessageStorage::new()?.take(&mut self.buffer)?;
+        let mut context = match RequestContext::decode(message, service_protocol::ID) {
+            Ok(context) => context,
+            Err(_) => {
+                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Parked,
+                });
+            }
+        };
+        let (header, decoded) = match service_protocol::decode_request(&context.payload) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Parked,
+                });
+            }
+        };
+        if context.handles.remaining() != service_protocol::request_capability_count(header.op) {
+            requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        let command = (|| {
+            Ok::<_, SystemCallError>(match decoded {
+                service_protocol::Request::Register {
+                    name,
+                    protocol,
+                    version,
+                    policy,
+                    establish_deadline,
+                } => RegistrationCommand::Register {
+                    name: copy_request_name(name)?,
+                    protocol,
+                    version,
+                    policy,
+                    establish_deadline,
+                    endpoint: context
+                        .handles
+                        .take(1)
+                        .map_err(|_| SystemCallError::IllegalArgument)?,
+                },
+                service_protocol::Request::QueryName { name } => {
+                    RegistrationCommand::QueryName(copy_request_name(name)?)
+                }
+                service_protocol::Request::Withdraw {
+                    name,
+                    expected_instance,
+                    expected_generation,
+                } => RegistrationCommand::Withdraw(
+                    copy_request_name(name)?,
+                    expected_instance,
+                    expected_generation,
+                ),
+                service_protocol::Request::PublishReady => RegistrationCommand::PublishReady,
+                service_protocol::Request::BeginDrain => RegistrationCommand::BeginDrain,
+                service_protocol::Request::Query => RegistrationCommand::Query,
+                service_protocol::Request::DelegateName { name } => {
+                    RegistrationCommand::DelegateName(copy_request_name(name)?)
+                }
+            })
+        })();
+        let sender_context = context.envelope.sender_context_id;
+        let now_ns = input.now_ns();
+        let mut reply_until = now_ns.saturating_add(5_000_000_000);
+        if let Some(caller_until) = header
+            .deadline
+            .instant()
+            .map_err(|_| SystemCallError::IllegalArgument)?
+        {
+            reply_until = reply_until.min(caller_until);
+        }
+        if let Ok(RegistrationCommand::Register {
+            establish_deadline, ..
+        }) = &command
+        {
+            let establish_until = establish_deadline
+                .instant()
+                .map_err(|_| SystemCallError::IllegalArgument)?
+                .ok_or(SystemCallError::IllegalArgument)?;
+            reply_until = reply_until.min(establish_until);
+        }
+        let outbox = match Outbox::prepare(
+            context,
+            PAYLOAD_MAX - librpc::PREFIX_LEN,
+            Deadline::at(reply_until),
+            KIND_REPLY,
+        ) {
+            Ok(outbox) => outbox,
+            Err(_) => {
+                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Parked,
+                });
+            }
+        };
+        let mut status = service_protocol::Status::Ok;
+        let mut response = service_protocol::Response::Empty;
+        let mut issued = None;
+        let mut authority_issue = None;
+        let mut action = None;
+        let wakes = if matches!(
+            command,
+            Ok(RegistrationCommand::Register { .. }
+                | RegistrationCommand::Withdraw(..)
+                | RegistrationCommand::PublishReady
+                | RegistrationCommand::BeginDrain)
+        ) {
+            WakeBatch::new(WATCH_LIMIT + 1)
+        } else {
+            WakeBatch::new(0)
+        };
+        let wakes = match wakes {
+            Ok(wakes) => wakes,
+            Err(_) => {
+                status = service_protocol::Status::Resource;
+                WakeBatch::new(0).expect("zero-capacity WakeBatch does not allocate")
+            }
+        };
+        if let Err(error) = &command {
+            status = service_status(RegistryError::Resource(*error));
+        }
+        if status == service_protocol::Status::Ok {
+            match command.expect("validated registration command lost") {
+                RegistrationCommand::Register {
+                    name,
+                    protocol,
+                    version,
+                    policy,
+                    establish_deadline,
+                    endpoint,
+                } => {
+                    if let Err(error) = check_registration_authority(world, sender_context, &name) {
+                        status = service_status(error);
+                        drop(endpoint);
+                    } else {
+                        let charges = (|| {
+                            let registry = world
+                                .provider
+                                .backend
+                                .as_ref()
+                                .and_then(RuntimeBackend::registry)
+                                .ok_or(RegistryError::Closed)?;
+                            Ok::<_, RegistryError>((
+                                registry.reserve_wait_source()?,
+                                registry.reserve_wait_source()?,
+                            ))
+                        })();
+                        match charges {
+                            Ok((control_charge, observation_charge)) => {
+                                match endpoint.duplicate(Rights::WAIT) {
+                                    Ok(observation) => {
+                                        let minted = match world.registration_endpoint.as_ref() {
+                                            Some(RegistrationEndpoint::Authority(mailbox)) => {
+                                                mailbox.mint(
+                                                    0,
+                                                    Rights::WRITE
+                                                        | Rights::WAIT
+                                                        | Rights::TRANSIT
+                                                        | Rights::DUPLICATE,
+                                                )
+                                            }
+                                            _ => Err(SystemCallError::ObjectClosed),
+                                        };
+                                        match minted {
+                                            Ok(minted) => {
+                                                let identity = minted
+                                                    .sender
+                                                    .description()
+                                                    .expect("minted control description failed")
+                                                    .object_id;
+                                                issued = Some(IssuedRegistration {
+                                                    pending: PendingRegistration {
+                                                        authority_identity: sender_context,
+                                                        name,
+                                                        protocol,
+                                                        version,
+                                                        policy,
+                                                        establish_deadline,
+                                                        endpoint,
+                                                        instance: identity,
+                                                    },
+                                                    sender: minted.sender,
+                                                    lifetime: minted.lifetime,
+                                                    endpoint_observer: observation,
+                                                    lifetime_charge: control_charge,
+                                                    endpoint_charge: observation_charge,
+                                                });
+                                            }
+                                            Err(error) => {
+                                                status =
+                                                    service_status(RegistryError::Resource(error));
+                                                drop(endpoint);
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        status = service_status(RegistryError::Resource(error));
+                                        drop(endpoint);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                status = service_status(error);
+                                drop(endpoint);
+                            }
+                        }
+                    }
+                }
+                RegistrationCommand::QueryName(name) => {
+                    let result = check_registration_authority(world, sender_context, &name)
+                        .and_then(|()| {
+                            world
+                                .provider
+                                .backend
+                                .as_mut()
+                                .and_then(RuntimeBackend::registry_mut)
+                                .ok_or(RegistryError::Closed)?
+                                .query_name(sender_context, &name)
+                        });
+                    match result {
+                        Ok(info) => response = service_protocol::Response::Instance(info),
+                        Err(error) => status = service_status(error),
+                    }
+                }
+                RegistrationCommand::Withdraw(name, instance, generation) => {
+                    action = Some(RegistrationCommand::Withdraw(name, instance, generation));
+                }
+                RegistrationCommand::PublishReady => {
+                    action = Some(RegistrationCommand::PublishReady);
+                }
+                RegistrationCommand::BeginDrain => {
+                    action = Some(RegistrationCommand::BeginDrain);
+                }
+                RegistrationCommand::Query => {
+                    let control = world
+                        .registration_controls
+                        .iter()
+                        .copied()
+                        .find(|control| control.instance == sender_context);
+                    match control.and_then(|control| {
+                        world
+                            .provider
+                            .backend
+                            .as_mut()
+                            .and_then(RuntimeBackend::registry_mut)
+                            .and_then(|registry| registry.query(control.instance).ok())
+                    }) {
+                        Some(info) => response = service_protocol::Response::Instance(info),
+                        None => status = service_protocol::Status::Permission,
+                    }
+                }
+                RegistrationCommand::DelegateName(name) => {
+                    let result = (|| {
+                        let registry = world
+                            .provider
+                            .backend
+                            .as_ref()
+                            .and_then(RuntimeBackend::registry)
+                            .ok_or(RegistryError::Closed)?;
+                        let prepared = registry.prepare_name_authority(sender_context, &name)?;
+                        let charge = registry.reserve_wait_source()?;
+                        let minted = match world.registration_endpoint.as_ref() {
+                            Some(RegistrationEndpoint::Authority(mailbox)) => mailbox
+                                .mint(
+                                    0,
+                                    Rights::WRITE
+                                        | Rights::WAIT
+                                        | Rights::TRANSIT
+                                        | Rights::DUPLICATE
+                                        | Rights::GRANT,
+                                )
+                                .map_err(RegistryError::Resource)?,
+                            _ => return Err(RegistryError::Closed),
+                        };
+                        Ok::<_, RegistryError>((prepared, minted, charge))
+                    })();
+                    match result {
+                        Ok(issue) => authority_issue = Some(issue),
+                        Err(error) => status = service_status(error),
+                    }
+                }
+            }
+        }
+        let (task, max_sources) = if let Some((prepared, minted, charge)) = authority_issue {
+            (
+                ServiceTask::Authority(AuthorityTask::reply(prepared, minted, charge, outbox)),
+                2,
+            )
+        } else {
+            (
+                ServiceTask::RegistrationReply(RegistrationReplyTask::new(
+                    outbox,
+                    header.op,
+                    status,
+                    response,
+                    issued,
+                    action.map(|command| (sender_context, command)),
+                    wakes,
+                )),
+                3,
+            )
+        };
+        match requests.spawn(task, max_sources) {
+            Ok(()) => self.gate_pending = true,
+            Err(task) => self.queued = Some((task.into_registration_pending(), max_sources)),
+        }
+        Ok(Advance {
+            work_done: 1,
+            step: Step::Runnable,
+        })
+    }
+
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        match failure {
+            RequestFailure::Spawn { task, error } => self.reject_task(task, error, world),
+            failure @ RequestFailure::Source {
+                kind: KIND_REPLY, ..
+            } => {
+                if let Some(outbox) = self.refusal.as_mut() {
+                    outbox.refused(world, failure);
+                }
+            }
+            RequestFailure::Source { kind, error } => {
+                rinlib::debug!(
+                    "RegistrationControl source refused: kind={}, error={:?}",
+                    kind,
+                    error
+                );
+                world.failed = true;
+            }
+            RequestFailure::Wake { task, error } => {
+                rinlib::debug!(
+                    "RegistrationControl wake refused: task={}, error={:?}",
+                    task,
+                    error
+                );
+                world.failed = true;
+            }
+        }
+    }
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        if kind == KIND_REGISTRATION {
+            self.source = Some(source);
+            self.requested = false;
+        } else if kind == KIND_REPLY
+            && let Some(outbox) = self.refusal.as_mut()
+        {
+            outbox.registered(world, kind, source);
+        }
+    }
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        if kind == KIND_REGISTRATION && self.source == Some(source) {
+            self.source = None;
+            self.requested = false;
+            self.removing = false;
+        } else if kind == KIND_REPLY
+            && let Some(outbox) = self.refusal.as_mut()
+        {
+            outbox.unregistered(world, kind, source);
+        }
+    }
+    fn stop(&mut self, world: &mut World<B>) {
+        self.stopping = true;
+        self.queued = None;
+        if let Some(outbox) = self.refusal.as_mut() {
+            outbox.stop(world);
+        }
+    }
+    fn deadline(&self) -> Deadline {
+        self.refusal
+            .as_ref()
+            .map_or(Deadline::INFINITE, Outbox::deadline)
+    }
+}
+
+enum RegistrationClientPhase {
+    Register,
+    PublishReady,
+    Published { control: Capability },
+}
+
+struct RegistrationClientTask {
+    phase: RegistrationClientPhase,
+    dispatch: DownstreamState,
+    deadline: Deadline,
+    stopping: bool,
+}
+
+impl RegistrationClientTask {
+    fn new(
+        service: Capability,
+        endpoint: Capability,
+        deadline: Deadline,
+    ) -> Result<Self, SystemCallError> {
+        let policy = ExportPolicy {
+            protocol: ValueProtocol::Directory,
+            mode: ExportMode::Repeatable,
+            transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+            fal_ceiling: FalRights::ALL,
+        };
+        let request = service_protocol::Request::Register {
+            name: "fs.secondary",
+            protocol: protocol::ID,
+            version: protocol::VERSION as u32,
+            policy,
+            establish_deadline: deadline,
+        };
+        let mut payload = [0; PAYLOAD_MAX - librpc::PREFIX_LEN];
+        let used = service_protocol::encode_request(&request, deadline, &mut payload)
+            .ok_or(SystemCallError::InternalError)?;
+        let mut request = RpcRequest::new(service_protocol::ID, &payload[..used])?;
+        request
+            .push(endpoint, policy.transport)
+            .map_err(|failure| failure.error)?;
+        Ok(Self {
+            phase: RegistrationClientPhase::Register,
+            dispatch: DownstreamState::Ready { service, request },
+            deadline,
+            stopping: false,
+        })
+    }
+
+    fn submitted(&mut self, result: Result<u64, Completion>) {
+        assert!(matches!(self.dispatch, DownstreamState::Queued));
+        self.dispatch = match result {
+            Ok(txid) => DownstreamState::Pending(txid),
+            Err(completion) => DownstreamState::Complete(completion),
+        };
+    }
+
+    fn completed(&mut self, txid: u64, completion: Completion) {
+        assert!(matches!(self.dispatch, DownstreamState::Pending(pending) if pending == txid));
+        self.dispatch = DownstreamState::Complete(completion);
+    }
+
+    fn consume_completion<B: RuntimeBackend>(
+        &mut self,
+        world: &mut World<B>,
+    ) -> Result<(), SystemCallError> {
+        let completion = match core::mem::replace(&mut self.dispatch, DownstreamState::Queued) {
+            DownstreamState::Complete(completion) => completion,
+            state => {
+                self.dispatch = state;
+                return Ok(());
+            }
+        };
+        let Completion { service, result } = completion;
+        let mut reply = result.map_err(|_| SystemCallError::ObjectClosed)?;
+        let (header, response) = service_protocol::decode_response(&reply.payload)
+            .map_err(|_| SystemCallError::InternalError)?;
+        if header.status != service_protocol::Status::Ok {
+            return Err(SystemCallError::InternalError);
+        }
+        match self.phase {
+            RegistrationClientPhase::Register => {
+                let service_protocol::Response::Instance(info) = response else {
+                    return Err(SystemCallError::InternalError);
+                };
+                if info.state != service_protocol::State::Starting || reply.handles.remaining() != 1
+                {
+                    return Err(SystemCallError::InternalError);
+                }
+                drop(service);
+                let control = reply
+                    .handles
+                    .take(0)
+                    .map_err(|_| SystemCallError::InternalError)?;
+                let request_body = service_protocol::Request::PublishReady;
+                let mut payload = [0; service_protocol::HEADER_LEN];
+                let used =
+                    service_protocol::encode_request(&request_body, header.deadline, &mut payload)
+                        .ok_or(SystemCallError::InternalError)?;
+                let request = RpcRequest::new(service_protocol::ID, &payload[..used])?;
+                self.phase = RegistrationClientPhase::PublishReady;
+                self.dispatch = DownstreamState::Ready {
+                    service: control,
+                    request,
+                };
+            }
+            RegistrationClientPhase::PublishReady => {
+                let service_protocol::Response::Instance(info) = response else {
+                    return Err(SystemCallError::InternalError);
+                };
+                if info.state != service_protocol::State::Ready || !reply.handles.is_empty() {
+                    return Err(SystemCallError::InternalError);
+                }
+                self.phase = RegistrationClientPhase::Published { control: service };
+                world.registration_ready = true;
+            }
+            RegistrationClientPhase::Published { .. } => {
+                return Err(SystemCallError::InternalError);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<B: RuntimeBackend> Task<World<B>> for RegistrationClientTask {
+    type Family = ServiceTask<B>;
+    fn advance(
+        &mut self,
+        id: u64,
+        world: &mut World<B>,
+        requests: &mut Requests<ServiceTask<B>>,
+        _input: &mut Input<'_>,
+        _budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        if self.stopping {
+            if !matches!(self.phase, RegistrationClientPhase::Published { .. })
+                && matches!(
+                    self.dispatch,
+                    DownstreamState::Queued | DownstreamState::Pending(_)
+                )
+            {
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Parked,
+                });
+            }
+            if let RegistrationClientPhase::Published { control } =
+                core::mem::replace(&mut self.phase, RegistrationClientPhase::PublishReady)
+            {
+                drop(control);
+            }
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Complete,
+            });
+        }
+        if matches!(self.dispatch, DownstreamState::Ready { .. }) {
+            if world.dispatch_intent.is_some() {
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Runnable,
+                });
+            }
+            requests.wake(world.dispatcher_task)?;
+            let state = core::mem::replace(&mut self.dispatch, DownstreamState::Queued);
+            let DownstreamState::Ready { service, request } = state else {
+                unreachable!()
+            };
+            world.dispatch_intent = Some(DispatchIntent::Submit(DispatchSubmission {
+                waiter: id,
+                service,
+                deadline: self.deadline,
+                request,
+            }));
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        }
+        if matches!(self.dispatch, DownstreamState::Complete(_)) {
+            self.consume_completion(world)?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
+        }
+        Ok(Advance {
+            work_done: 1,
+            step: Step::Parked,
+        })
+    }
+    fn refused(&mut self, world: &mut World<B>, _failure: RequestFailure<ServiceTask<B>>) {
+        world.failed = true;
+    }
+    fn registered(&mut self, _world: &mut World<B>, _kind: SourceKind, _source: SourceId) {}
+    fn unregistered(&mut self, _world: &mut World<B>, _kind: SourceKind, _source: SourceId) {}
+    fn stop(&mut self, _world: &mut World<B>) {
+        self.stopping = true;
+    }
+    fn deadline(&self) -> Deadline {
+        match self.phase {
+            RegistrationClientPhase::Published { .. } => Deadline::INFINITE,
+            _ => self.deadline,
+        }
+    }
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Runtime 按 Task 上限预分配整族 owner，内联避免绕过额度的额外堆分配"
+)]
+enum ProviderTask<B: RuntimeBackend> {
     Delegate(DelegateTask),
-    Dispatcher(Dispatcher),
     Grant(GrantTask),
-    Ingress(Ingress),
-    Release(ReleaseTask),
-    Request(RequestTask),
+    Ingress(Ingress<B>),
+    Read(ReadTask),
+    Request(RequestTask<B>),
     Retire(RetireTask),
-    Route(RouteIngress),
     Watch(WatchTask),
 }
 
-impl Task<World> for ServiceTask {
-    type Family = Self;
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Runtime 按 Task 上限预分配整族 owner，内联避免绕过额度的额外堆分配"
+)]
+enum ServiceTask<B: RuntimeBackend> {
+    Fal(ProviderTask<B>),
+    Authority(AuthorityTask),
+    Dispatcher(Dispatcher),
+    Release(ReleaseTask),
+    RegistrationClient(RegistrationClientTask),
+    Route(RouteIngress),
+    RouteReply(RouteReplyTask),
+    RegistrationIngress(RegistrationIngress),
+    RegistrationReply(RegistrationReplyTask),
+    Stream(StreamTask),
+    StreamControl(StreamControlTask),
+}
+
+impl<B: RuntimeBackend> From<ProviderTask<B>> for ServiceTask<B> {
+    fn from(task: ProviderTask<B>) -> Self {
+        Self::Fal(task)
+    }
+}
+
+impl<B: RuntimeBackend> ServiceTask<B> {
+    fn into_registration_refusal(mut self) -> (Outbox, service_protocol::Op) {
+        match &mut self {
+            Self::Authority(task) => (
+                task.take_refused_outbox()
+                    .expect("authority refusal lost reply owner"),
+                service_protocol::Op::DelegateName,
+            ),
+            Self::RegistrationReply(task) => task
+                .take_refused_outbox()
+                .expect("registration refusal lost reply owner"),
+            _ => panic!("registration admission returned unrelated task"),
+        }
+    }
+    fn into_registration_pending(self) -> PendingRegistrationTask {
+        match self {
+            Self::Authority(task) => PendingRegistrationTask::Authority(task),
+            Self::RegistrationReply(task) => PendingRegistrationTask::Reply(task),
+            _ => panic!("registration admission returned unrelated task"),
+        }
+    }
+    fn into_fal_pending(self) -> PendingFalTask<B> {
+        if let Self::Stream(task) = self {
+            return PendingFalTask::Stream(task);
+        }
+        if let Self::StreamControl(task) = self {
+            return PendingFalTask::StreamControl(task);
+        }
+        let Self::Fal(task) = self else {
+            panic!("FAL admission returned unrelated task");
+        };
+        task.into_pending()
+    }
+    fn into_fal_refusal(self) -> Outbox {
+        if let Self::Stream(task) = self {
+            return task.into_refused_outbox();
+        }
+        if let Self::StreamControl(task) = self {
+            return task.into_refused_outbox();
+        }
+        let Self::Fal(task) = self else {
+            panic!("FAL admission returned unrelated task");
+        };
+        task.into_refused_outbox()
+    }
+}
+
+impl<B: RuntimeBackend> ProviderTask<B> {
+    fn into_pending(self) -> PendingFalTask<B> {
+        match self {
+            Self::Request(task) => PendingFalTask::Request(task),
+            Self::Read(task) => PendingFalTask::Read(task),
+            Self::Grant(task) => PendingFalTask::Grant(task),
+            Self::Watch(task) => PendingFalTask::Watch(task),
+            Self::Delegate(task) => PendingFalTask::Delegate(task),
+            _ => panic!("FAL admission returned unrelated task"),
+        }
+    }
+    fn into_refused_outbox(self) -> Outbox {
+        match self {
+            Self::Request(task) => task.outbox,
+            Self::Read(task) => task.outbox,
+            Self::Delegate(task) => task.outbox,
+            Self::Grant(mut task) => task.take_refused_outbox(),
+            Self::Watch(mut task) => task.take_refused_outbox(),
+            _ => panic!("FAL admission returned unrelated task"),
+        }
+    }
+}
+
+impl<B: RuntimeBackend> Task<World<B>> for ProviderTask<B> {
+    type Family = ServiceTask<B>;
 
     fn advance(
         &mut self,
         id: u64,
-        world: &mut World,
-        requests: &mut Requests<Self>,
+        world: &mut World<B>,
+        requests: &mut Requests<Self::Family>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
         match self {
             Self::Delegate(task) => task.advance(id, world, requests, input, budget),
-            Self::Dispatcher(task) => task.advance(requests, input, budget),
             Self::Grant(task) => task.advance(id, world, requests, input, budget),
             Self::Ingress(task) => task.advance(id, world, requests, input, budget),
-            Self::Release(task) => task.advance(id, world, requests, input, budget),
+            Self::Read(task) => task.advance(id, world, requests, input, budget),
             Self::Request(task) => task.advance(id, world, requests, input, budget),
             Self::Retire(task) => task.advance(id, world, requests, input, budget),
-            Self::Route(task) => task.advance(id, world, requests, input, budget),
             Self::Watch(task) => task.advance(id, world, requests, input, budget),
         }
     }
 
-    fn refused(&mut self, world: &mut World, failure: RequestFailure<Self>) {
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<Self::Family>) {
         match self {
             Self::Delegate(task) => task.refused(world, failure),
-            Self::Dispatcher(task) => task.refused(world, failure),
             Self::Grant(task) => task.refused(world, failure),
             Self::Ingress(task) => task.refused(world, failure),
-            Self::Release(task) => task.refused(world, failure),
+            Self::Read(task) => task.refused(world, failure),
             Self::Request(task) => task.refused(world, failure),
             Self::Retire(task) => task.refused(world, failure),
-            Self::Route(task) => task.refused(world, failure),
             Self::Watch(task) => task.refused(world, failure),
         }
     }
 
-    fn registered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         match self {
             Self::Delegate(task) => task.registered(world, kind, source),
-            Self::Dispatcher(task) => task.registered(world, kind, source),
             Self::Grant(task) => task.registered(world, kind, source),
             Self::Ingress(task) => task.registered(world, kind, source),
-            Self::Release(task) => task.registered(world, kind, source),
+            Self::Read(task) => task.registered(world, kind, source),
             Self::Request(task) => task.registered(world, kind, source),
             Self::Retire(task) => task.registered(world, kind, source),
-            Self::Route(task) => task.registered(world, kind, source),
             Self::Watch(task) => task.registered(world, kind, source),
         }
     }
 
-    fn unregistered(&mut self, world: &mut World, kind: SourceKind, source: SourceId) {
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         match self {
             Self::Delegate(task) => task.unregistered(world, kind, source),
-            Self::Dispatcher(task) => task.unregistered(world, kind, source),
             Self::Grant(task) => task.unregistered(world, kind, source),
             Self::Ingress(task) => task.unregistered(world, kind, source),
-            Self::Release(task) => task.unregistered(world, kind, source),
+            Self::Read(task) => task.unregistered(world, kind, source),
             Self::Request(task) => task.unregistered(world, kind, source),
             Self::Retire(task) => task.unregistered(world, kind, source),
-            Self::Route(task) => task.unregistered(world, kind, source),
             Self::Watch(task) => task.unregistered(world, kind, source),
         }
     }
 
-    fn stop(&mut self, world: &mut World) {
+    fn stop(&mut self, world: &mut World<B>) {
         match self {
             Self::Delegate(task) => task.stop(world),
-            Self::Dispatcher(task) => task.stop(world),
-            Self::Grant(task) => task.stop(world),
+            Self::Grant(task) => task.stop(),
             Self::Ingress(task) => task.stop(world),
-            Self::Release(task) => task.stop(world),
+            Self::Read(task) => task.stop(world),
             Self::Request(task) => task.stop(world),
             Self::Retire(task) => task.stop(world),
-            Self::Route(task) => task.stop(world),
-            Self::Watch(task) => task.stop(world),
+            Self::Watch(task) => task.stop(),
         }
     }
 
     fn deadline(&self) -> Deadline {
         match self {
-            Self::Delegate(task) => task.deadline(),
-            Self::Dispatcher(task) => task.deadline(),
-            Self::Grant(task) => task.deadline(),
-            Self::Watch(task) => task.deadline(),
-            Self::Ingress(_) | Self::Release(_) | Self::Retire(_) | Self::Route(_) => {
-                Deadline::INFINITE
-            }
-            Self::Request(task) => task.deadline(),
+            Self::Delegate(task) => <DelegateTask as Task<World<B>>>::deadline(task),
+            Self::Grant(task) => <GrantTask as Task<World<B>>>::deadline(task),
+            Self::Read(task) => <ReadTask as Task<World<B>>>::deadline(task),
+            Self::Request(task) => <RequestTask<B> as Task<World<B>>>::deadline(task),
+            Self::Watch(task) => <WatchTask as Task<World<B>>>::deadline(task),
+            Self::Ingress(task) => <Ingress<B> as Task<World<B>>>::deadline(task),
+            Self::Retire(_) => Deadline::INFINITE,
         }
     }
 }
 
-fn progress_dispatch(
-    runtime: &mut Runtime<ServiceTask, WaitSet>,
-    world: &mut World,
+impl<B: RuntimeBackend> Task<World<B>> for ServiceTask<B> {
+    type Family = Self;
+
+    fn advance(
+        &mut self,
+        id: u64,
+        world: &mut World<B>,
+        requests: &mut Requests<Self>,
+        input: &mut Input<'_>,
+        budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        match self {
+            Self::Fal(task) => task.advance(id, world, requests, input, budget),
+            Self::Dispatcher(task) => task.advance(requests, input, budget),
+            Self::Authority(task) => task.advance(id, world, requests, input, budget),
+            Self::Release(task) => task.advance(id, world, requests, input, budget),
+            Self::Route(task) => task.advance(id, world, requests, input, budget),
+            Self::RouteReply(task) => task.advance(id, world, requests, input, budget),
+            Self::RegistrationClient(task) => task.advance(id, world, requests, input, budget),
+            Self::RegistrationIngress(task) => task.advance(id, world, requests, input, budget),
+            Self::RegistrationReply(task) => task.advance(id, world, requests, input, budget),
+            Self::Stream(task) => task.advance(id, world, requests, input, budget),
+            Self::StreamControl(task) => task.advance(id, world, requests, input, budget),
+        }
+    }
+
+    fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<Self>) {
+        match self {
+            Self::Fal(task) => task.refused(world, failure),
+            Self::Dispatcher(task) => task.refused(world, failure),
+            Self::Authority(task) => task.refused(world, failure),
+            Self::Release(task) => task.refused(world, failure),
+            Self::Route(task) => task.refused(world, failure),
+            Self::RouteReply(task) => task.refused(world, failure),
+            Self::RegistrationClient(task) => task.refused(world, failure),
+            Self::RegistrationIngress(task) => task.refused(world, failure),
+            Self::RegistrationReply(task) => task.refused(world, failure),
+            Self::Stream(task) => task.refused(world, failure),
+            Self::StreamControl(task) => task.refused(world, failure),
+        }
+    }
+
+    fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        match self {
+            Self::Fal(task) => task.registered(world, kind, source),
+            Self::Dispatcher(task) => task.registered(world, kind, source),
+            Self::Authority(task) => task.registered(world, kind, source),
+            Self::Release(task) => task.registered(world, kind, source),
+            Self::Route(task) => task.registered(world, kind, source),
+            Self::RouteReply(task) => task.registered(world, kind, source),
+            Self::RegistrationClient(task) => task.registered(world, kind, source),
+            Self::RegistrationIngress(task) => task.registered(world, kind, source),
+            Self::RegistrationReply(task) => task.registered(world, kind, source),
+            Self::Stream(task) => task.registered(world, kind, source),
+            Self::StreamControl(task) => task.registered(world, kind, source),
+        }
+    }
+
+    fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
+        match self {
+            Self::Fal(task) => task.unregistered(world, kind, source),
+            Self::Dispatcher(task) => task.unregistered(world, kind, source),
+            Self::Authority(task) => task.unregistered(world, kind, source),
+            Self::Release(task) => task.unregistered(world, kind, source),
+            Self::Route(task) => task.unregistered(world, kind, source),
+            Self::RouteReply(task) => task.unregistered(world, kind, source),
+            Self::RegistrationClient(task) => task.unregistered(world, kind, source),
+            Self::RegistrationIngress(task) => task.unregistered(world, kind, source),
+            Self::RegistrationReply(task) => task.unregistered(world, kind, source),
+            Self::Stream(task) => task.unregistered(world, kind, source),
+            Self::StreamControl(task) => task.unregistered(world, kind, source),
+        }
+    }
+
+    fn stop(&mut self, world: &mut World<B>) {
+        match self {
+            Self::Fal(task) => task.stop(world),
+            Self::Dispatcher(task) => task.stop(world),
+            Self::Authority(task) => task.stop(world),
+            Self::Release(task) => task.stop(world),
+            Self::Route(task) => task.stop(world),
+            Self::RouteReply(task) => task.stop(world),
+            Self::RegistrationClient(task) => task.stop(world),
+            Self::RegistrationIngress(task) => task.stop(world),
+            Self::RegistrationReply(task) => task.stop(world),
+            Self::Stream(task) => task.stop(world),
+            Self::StreamControl(task) => task.stop(world),
+        }
+    }
+
+    fn deadline(&self) -> Deadline {
+        match self {
+            Self::Fal(task) => <ProviderTask<B> as Task<World<B>>>::deadline(task),
+            Self::Dispatcher(task) => task.deadline(),
+            Self::RegistrationIngress(task) => {
+                <RegistrationIngress as Task<World<B>>>::deadline(task)
+            }
+            Self::Release(_) | Self::Route(_) => Deadline::INFINITE,
+            Self::RouteReply(task) => <RouteReplyTask as Task<World<B>>>::deadline(task),
+            Self::Authority(task) => <AuthorityTask as Task<World<B>>>::deadline(task),
+            Self::RegistrationClient(task) => {
+                <RegistrationClientTask as Task<World<B>>>::deadline(task)
+            }
+            Self::RegistrationReply(task) => {
+                <RegistrationReplyTask as Task<World<B>>>::deadline(task)
+            }
+            Self::Stream(task) => <StreamTask as Task<World<B>>>::deadline(task),
+            Self::StreamControl(task) => <StreamControlTask as Task<World<B>>>::deadline(task),
+        }
+    }
+}
+
+impl<B: RuntimeBackend> ProviderTask<B> {
+    fn downstream_submitted(&mut self, result: Result<u64, Completion>) -> bool {
+        match self {
+            Self::Delegate(task) => task.submitted(result),
+            Self::Read(task) => task.submitted(result),
+            _ => return false,
+        }
+        true
+    }
+
+    fn downstream_completed(&mut self, txid: u64, completion: Completion) -> bool {
+        match self {
+            Self::Delegate(task) => task.completed(txid, completion),
+            Self::Read(task) => task.completed(txid, completion),
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl<B: RuntimeBackend> ServiceTask<B> {
+    fn downstream_submitted(&mut self, result: Result<u64, Completion>) -> bool {
+        match self {
+            Self::Fal(task) => task.downstream_submitted(result),
+            Self::RegistrationClient(task) => {
+                task.submitted(result);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn downstream_completed(&mut self, txid: u64, completion: Completion) -> bool {
+        match self {
+            Self::Fal(task) => task.downstream_completed(txid, completion),
+            Self::RegistrationClient(task) => {
+                task.completed(txid, completion);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn progress_dispatch<B: RuntimeBackend>(
+    runtime: &mut Runtime<ServiceTask<B>, WaitSet>,
+    world: &mut World<B>,
     bindings: &mut Vec<(u64, u64)>,
 ) -> Result<(), SystemCallError> {
-    if let Some(submission) = world.dispatch_submission.take() {
-        let waiter = submission.waiter;
-        let started = {
-            let Some(ServiceTask::Dispatcher(dispatcher)) =
-                runtime.get_task_mut(world.dispatcher_task)
-            else {
-                return Err(SystemCallError::InternalError);
-            };
-            dispatcher.begin_for(
-                submission.service,
-                submission.deadline,
-                submission.request,
-                Some(waiter),
-            )
-        };
-        match started {
-            Ok(txid) => {
-                if bindings.len() == bindings.capacity() {
-                    return Err(SystemCallError::ReachLimit);
+    if let Some(intent) = world.dispatch_intent.take() {
+        match intent {
+            DispatchIntent::Submit(submission) => {
+                let waiter = submission.waiter;
+                let started = {
+                    let Some(ServiceTask::Dispatcher(dispatcher)) =
+                        runtime.get_task_mut(world.dispatcher_task)
+                    else {
+                        return Err(SystemCallError::InternalError);
+                    };
+                    dispatcher.begin_for(
+                        submission.service,
+                        submission.deadline,
+                        submission.request,
+                        Some(waiter),
+                    )
+                };
+                match started {
+                    Ok(txid) => {
+                        if bindings.len() == bindings.capacity() {
+                            return Err(SystemCallError::ReachLimit);
+                        }
+                        bindings.push((txid, waiter));
+                        let Some(task) = runtime.get_task_mut(waiter) else {
+                            return Err(SystemCallError::InternalError);
+                        };
+                        if !task.downstream_submitted(Ok(txid)) {
+                            return Err(SystemCallError::InternalError);
+                        }
+                        runtime.wake(world.dispatcher_task)?;
+                    }
+                    Err(failure) => {
+                        let completion = Completion {
+                            service: failure.service,
+                            result: Err(failure.error),
+                        };
+                        let Some(task) = runtime.get_task_mut(waiter) else {
+                            return Err(SystemCallError::InternalError);
+                        };
+                        if !task.downstream_submitted(Err(completion)) {
+                            return Err(SystemCallError::InternalError);
+                        }
+                        runtime.wake(waiter)?;
+                    }
                 }
-                bindings.push((txid, waiter));
-                let Some(ServiceTask::Delegate(task)) = runtime.get_task_mut(waiter) else {
-                    return Err(SystemCallError::InternalError);
-                };
-                task.submitted(Ok(txid));
-                runtime.wake(world.dispatcher_task)?;
             }
-            Err(failure) => {
-                let completion = Completion {
-                    service: failure.service,
-                    result: Err(failure.error),
-                };
-                let Some(ServiceTask::Delegate(task)) = runtime.get_task_mut(waiter) else {
+            DispatchIntent::Cancel { txid } => {
+                let Some(ServiceTask::Dispatcher(dispatcher)) =
+                    runtime.get_task_mut(world.dispatcher_task)
+                else {
                     return Err(SystemCallError::InternalError);
                 };
-                task.submitted(Err(completion));
-                runtime.wake(waiter)?;
+                dispatcher.cancel(txid);
+                runtime.wake(world.dispatcher_task)?;
             }
         }
     }
@@ -3381,10 +5058,12 @@ fn progress_dispatch(
                 .checked_add(1)
                 .ok_or(SystemCallError::ReachLimit)?;
         }
-        let Some(ServiceTask::Delegate(task)) = runtime.get_task_mut(waiter) else {
+        let Some(task) = runtime.get_task_mut(waiter) else {
             return Err(SystemCallError::InternalError);
         };
-        task.completed(txid, completion);
+        if !task.downstream_completed(txid, completion) {
+            return Err(SystemCallError::InternalError);
+        }
         runtime.wake(waiter)?;
     }
     Ok(())
@@ -3395,24 +5074,89 @@ pub(super) fn run(
     bootstrap: MailboxSender,
     route_mailbox: Handle,
     release: Handle,
+    registration: Handle,
 ) {
-    let task_limit = 32;
-    let source_limit = 64;
-    let input_bytes = Runtime::<ServiceTask, WaitSet>::input_budget(source_limit)
+    let registration_role = query(registration)
+        .expect("provider registration endpoint query failed")
+        .role;
+    let registration_endpoint = match registration_role {
+        role if role == HandleRole::MailboxOwner as u32 => {
+            // SAFETY: StartupBlock transfers the unique RegistrationControl Mailbox owner to provider A.
+            let capability = unsafe { Capability::from_raw(registration) };
+            let (mailbox, _) = Mailbox::from_capability(capability)
+                .map_err(|failure| failure.error)
+                .expect("provider registration Mailbox has an invalid role");
+            RegistrationEndpoint::Authority(mailbox)
+        }
+        role if role == HandleRole::MailboxSender as u32 => {
+            // SAFETY: StartupBlock transfers the unique RegistrationControl sender to provider B.
+            let capability = unsafe { Capability::from_raw(registration) };
+            let (sender, _) = MailboxSender::from_capability(capability)
+                .map_err(|failure| failure.error)
+                .expect("provider registration sender has an invalid role");
+            RegistrationEndpoint::Client(sender)
+        }
+        _ => panic!("provider registration endpoint has an invalid role"),
+    };
+    let has_registry = matches!(registration_endpoint, RegistrationEndpoint::Authority(_));
+    run_with_backend(
+        mailbox,
+        bootstrap,
+        route_mailbox,
+        release,
+        registration_endpoint,
+        move |account, service_account, wake| {
+            let backend = ServiceBackend::new(account, service_account, wake, has_registry)?;
+            let registry_root = backend.registry_root();
+            Ok((backend, registry_root))
+        },
+    );
+}
+
+fn run_with_backend<B, F>(
+    mailbox: Mailbox,
+    bootstrap: MailboxSender,
+    route_mailbox: Handle,
+    release: Handle,
+    registration_endpoint: RegistrationEndpoint,
+    backend_factory: F,
+) where
+    B: RuntimeBackend,
+    F: FnOnce(
+        &AccountView<FalResource>,
+        &AccountView<ServiceResource>,
+        Rc<dyn libexecution::wake::Wake>,
+    ) -> Result<(B, Option<NodeRef>), BackendError>,
+{
+    let registration_authority =
+        matches!(&registration_endpoint, RegistrationEndpoint::Authority(_));
+    let registration_client_expected =
+        matches!(&registration_endpoint, RegistrationEndpoint::Client(_));
+    let task_limit = TASK_LIMIT;
+    let source_limit = SOURCE_LIMIT;
+    let input_bytes = Runtime::<ServiceTask<B>, WaitSet>::input_budget(source_limit)
         .expect("provider Runtime input budget calculation failed");
     let execution_layout = [0, 1];
     let fal_layout = [2, 3, 4, 5, 6, 7, 8, 9, 10];
-    let mut limits = [0; ExecutionResource::COUNT + FalResource::COUNT];
+    let service_layout = [11, 12, 13, 14];
+    let mut limits = [0; ExecutionResource::COUNT + FalResource::COUNT + ServiceResource::COUNT];
     limits[execution_layout[ExecutionResource::Task.slot()]] = task_limit;
     limits[execution_layout[ExecutionResource::InputBytes.slot()]] = input_bytes;
-    limits[fal_layout[FalResource::Node.slot()]] = 64;
+    limits[fal_layout[FalResource::Node.slot()]] = MEMORY_NODE_LIMIT + REGISTRATION_LIMIT + 1;
     limits[fal_layout[FalResource::Bytes.slot()]] = 2 * 1024 * 1024;
-    limits[fal_layout[FalResource::Grant.slot()]] = 16;
+    limits[fal_layout[FalResource::Grant.slot()]] = GRANT_LIMIT;
     limits[fal_layout[FalResource::Watch.slot()]] = WATCH_LIMIT;
-    limits[fal_layout[FalResource::WaitSource.slot()]] = 48;
+    limits[fal_layout[FalResource::WaitSource.slot()]] =
+        GRANT_LIMIT + WATCH_LIMIT + 2 * STREAM_LIMIT;
+    limits[service_layout[ServiceResource::Authority.slot()]] = AUTHORITY_LIMIT;
+    limits[service_layout[ServiceResource::Registration.slot()]] = REGISTRATION_LIMIT;
+    limits[service_layout[ServiceResource::Bytes.slot()]] = 64 * 1024;
+    limits[service_layout[ServiceResource::WaitSource.slot()]] =
+        AUTHORITY_LIMIT + 2 * REGISTRATION_LIMIT;
     let budget = Budget::new(&limits, 1).expect("provider Runtime budget creation failed");
     let execution_binding = execution_layout.map(|index| budget.slot(index).unwrap());
     let fal_binding = fal_layout.map(|index| budget.slot(index).unwrap());
+    let service_binding = service_layout.map(|index| budget.slot(index).unwrap());
     let account = budget
         .account(&limits)
         .expect("provider Runtime account creation failed");
@@ -3422,6 +5166,9 @@ pub(super) fn run(
     let fal_account = account
         .view::<FalResource>(&fal_binding)
         .expect("provider FAL budget binding failed");
+    let service_account = account
+        .view::<ServiceResource>(&service_binding)
+        .expect("provider service budget binding failed");
     let event = notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
         .expect("provider retirement notification creation failed");
     // SAFETY: NotificationCreate returned two fresh affine entries; this worker owns both.
@@ -3431,9 +5178,33 @@ pub(super) fn run(
     let wake = NotificationWake::new(retire_signaler, RETIRE_BIT)
         .map_err(|(_, error)| error)
         .expect("provider retirement wake validation failed");
-    let backend = MemoryBackend::new(&fal_account, 64, Rc::new(wake))
-        .expect("provider backend creation failed");
-    let mut grants = GrantTable::new(&mailbox, 16).expect("provider grant table creation failed");
+    let (mut backend, registry_root) =
+        backend_factory(&fal_account, &service_account, Rc::new(wake))
+            .expect("provider backend creation failed");
+    let root_authority_task = if let RegistrationEndpoint::Authority(registration_mailbox) =
+        &registration_endpoint
+    {
+        let registry = backend
+            .registry_mut()
+            .expect("registration owner requires Registry");
+        let prepared = registry
+            .prepare_root_authority()
+            .expect("root registration authority preparation failed");
+        let charge = registry
+            .reserve_wait_source()
+            .expect("root authority observation charge failed");
+        let minted = registration_mailbox
+            .mint(
+                0,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE | Rights::GRANT,
+            )
+            .expect("root registration authority mint failed");
+        Some(AuthorityTask::root(prepared, minted, charge))
+    } else {
+        None
+    };
+    let mut grants =
+        GrantTable::new(&mailbox, GRANT_LIMIT).expect("provider grant table creation failed");
     let root = backend
         .root()
         .expect("provider backend root missing")
@@ -3447,7 +5218,8 @@ pub(super) fn run(
                 sender_transport: Rights::WRITE
                     | Rights::WAIT
                     | Rights::TRANSIT
-                    | Rights::DUPLICATE,
+                    | Rights::DUPLICATE
+                    | Rights::GRANT,
                 output_transport: Rights::TRANSIT,
             },
             fal_account.clone(),
@@ -3455,12 +5227,41 @@ pub(super) fn run(
         )
         .map_err(|failure| failure.error)
         .expect("provider root grant preparation failed");
+    let registry_rights = FalRights::TRAVERSE
+        .union(FalRights::ENUMERATE)
+        .union(FalRights::READ_PROPERTY)
+        .union(FalRights::WATCH)
+        .union(FalRights::ACQUIRE_CAPABILITY);
+    let prepared_registry_root = registry_root
+        .map(|root| {
+            grants.prepare_issue(
+                &mailbox,
+                root,
+                Issuance {
+                    rights: registry_rights,
+                    sender_transport: Rights::WRITE
+                        | Rights::WAIT
+                        | Rights::TRANSIT
+                        | Rights::DUPLICATE
+                        | Rights::GRANT,
+                    output_transport: Rights::TRANSIT,
+                },
+                fal_account.clone(),
+                0,
+            )
+        })
+        .transpose()
+        .map_err(|failure| failure.error)
+        .expect("Registry root grant preparation failed");
     let set = WaitSet::create(source_limit).expect("provider Runtime WaitSet creation failed");
     let mut runtime =
-        Runtime::<ServiceTask, WaitSet>::new(set, task_limit, source_limit, &execution_account)
+        Runtime::<ServiceTask<B>, WaitSet>::new(set, task_limit, source_limit, &execution_account)
             .expect("provider Runtime creation failed");
     let retire_task = runtime
-        .spawn(ServiceTask::Retire(RetireTask::new(retire_owner)), 1)
+        .spawn(
+            ProviderTask::Retire(RetireTask::new(retire_owner)).into(),
+            1,
+        )
         .map_err(|failure| failure.error)
         .expect("provider retirement task admission failed");
     let dispatcher = Dispatcher::new(DISPATCH_LIMIT).expect("provider Dispatcher creation failed");
@@ -3468,14 +5269,43 @@ pub(super) fn run(
         .spawn(ServiceTask::Dispatcher(dispatcher), DISPATCH_LIMIT * 2 + 1)
         .map_err(|failure| failure.error)
         .expect("provider Dispatcher admission failed");
-    runtime
-        .spawn(ServiceTask::Grant(GrantTask::root(prepared_root)), 1)
+    let root_grant_task = runtime
+        .spawn(
+            ProviderTask::Grant(GrantTask::root(prepared_root, KIND_GRANT_LIFETIME)).into(),
+            1,
+        )
         .map_err(|failure| failure.error)
         .expect("provider root grant task admission failed");
+    let registry_expected = prepared_registry_root.is_some();
+    let registry_grant_task = prepared_registry_root.map(|prepared_registry_root| {
+        runtime
+            .spawn(
+                ProviderTask::Grant(GrantTask::root(prepared_registry_root, KIND_GRANT_LIFETIME))
+                    .into(),
+                1,
+            )
+            .map_err(|failure| failure.error)
+            .expect("Registry root grant task admission failed")
+    });
     runtime
-        .spawn(ServiceTask::Ingress(Ingress::new()), 1)
+        .spawn(ProviderTask::Ingress(Ingress::new()).into(), 2)
         .map_err(|failure| failure.error)
         .expect("provider ingress admission failed");
+    if let Some(root_authority_task) = root_authority_task {
+        runtime
+            .spawn(ServiceTask::Authority(root_authority_task), 1)
+            .map_err(|failure| failure.error)
+            .expect("root registration authority admission failed");
+    }
+    if registration_authority {
+        runtime
+            .spawn(
+                ServiceTask::RegistrationIngress(RegistrationIngress::new()),
+                2,
+            )
+            .map_err(|failure| failure.error)
+            .expect("RegistrationControl ingress admission failed");
+    }
     runtime
         .spawn(ServiceTask::Route(RouteIngress::new()), 1)
         .map_err(|failure| failure.error)
@@ -3486,22 +5316,36 @@ pub(super) fn run(
         .spawn(ServiceTask::Release(ReleaseTask::new(release)), 1)
         .map_err(|failure| failure.error)
         .expect("provider release task admission failed");
+    let mut registration_controls = Vec::new();
+    registration_controls
+        .try_reserve_exact(REGISTRATION_LIMIT)
+        .expect("registration control table allocation failed");
     let mut world = World {
-        mailbox,
+        provider: provider::State {
+            mailbox,
+            backend: Some(backend),
+            grants: Some(grants),
+            watches: watch::Table::new(WATCH_LIMIT)
+                .expect("provider Watch table allocation failed"),
+            retire_task,
+            retire_ready: false,
+            backend_sealed: false,
+            committed: 0,
+            abandoned: 0,
+        },
         route_mailbox,
-        route: None,
-        dispatch_submission: None,
+        dispatch_intent: None,
         dispatcher_task,
-        backend: Some(backend),
-        grants: Some(grants),
+        root_grant_task,
+        registry_grant_task,
+        registration_endpoint: Some(registration_endpoint),
+        registration_ready: !registration_client_expected,
         root_sender: None,
-        retire_task,
-        retire_ready: false,
-        backend_sealed: false,
-        committed: 0,
-        abandoned: 0,
+        registry_sender: None,
+        registration_root_sender: None,
+        registration_controls,
+        streams: StreamTable::new(STREAM_LIMIT),
         downstream_abandoned: 0,
-        watches: watch::Table::new().expect("provider Watch table allocation failed"),
         stop: false,
         failed: false,
     };
@@ -3510,10 +5354,15 @@ pub(super) fn run(
         .try_reserve_exact(DISPATCH_LIMIT)
         .expect("provider dispatch binding allocation failed");
     let mut sealing = false;
+    let mut root_published = false;
+    let mut registry_published = false;
+    let mut registration_root_published = !registration_authority;
+    let mut ready_published = false;
     loop {
         assert!(!world.failed, "provider Runtime entered a fatal state");
         if world.stop && !sealing {
             world
+                .provider
                 .grants
                 .as_mut()
                 .expect("provider grant table missing during seal")
@@ -3530,22 +5379,112 @@ pub(super) fn run(
         progress_dispatch(&mut runtime, &mut world, &mut dispatch_bindings)
             .expect("provider dispatch integration failed");
         if let Some(sender) = world.root_sender.take() {
-            let mut packet = Packet::new(protocol::ROOT_GRANT_KIND, &[])
-                .expect("provider root grant packet creation failed");
+            if matches!(
+                world.registration_endpoint,
+                Some(RegistrationEndpoint::Client(_))
+            ) {
+                let endpoint = duplicate(
+                    sender.as_handle(),
+                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+                )
+                .map(|handle| {
+                    // SAFETY: duplicate returned a fresh endpoint owner for Registry storage.
+                    unsafe { Capability::from_raw(handle) }
+                })
+                .expect("business endpoint duplication for registration failed");
+                let Some(RegistrationEndpoint::Client(target)) = world.registration_endpoint.take()
+                else {
+                    unreachable!()
+                };
+                let deadline = rinlib::time::timeout_millis(5_000)
+                    .expect("registration deadline construction failed");
+                let task =
+                    RegistrationClientTask::new(target.into_capability(), endpoint, deadline)
+                        .expect("registration client request preparation failed");
+                runtime
+                    .spawn(ServiceTask::RegistrationClient(task), 0)
+                    .map_err(|failure| {
+                        drop(failure.task);
+                        failure.error
+                    })
+                    .expect("registration client task admission failed");
+            }
+            if registration_client_expected {
+                drop(sender);
+            } else {
+                let mut packet = Packet::new(protocol::ROOT_GRANT_KIND, &[])
+                    .expect("provider root grant packet creation failed");
+                packet
+                    .push(
+                        sender.into_capability(),
+                        Rights::WRITE
+                            | Rights::WAIT
+                            | Rights::TRANSIT
+                            | Rights::DUPLICATE
+                            | Rights::GRANT,
+                    )
+                    .map_err(|failure| failure.error)
+                    .expect("provider root grant packet preparation failed");
+                packet
+                    .try_send(&bootstrap, Deadline::INFINITE)
+                    .map_err(|failure| failure.error)
+                    .expect("provider root grant publication failed");
+            }
+            root_published = true;
+        }
+        if let Some(sender) = world.registry_sender.take() {
+            let mut packet = Packet::new(service_protocol::DIRECTORY_GRANT_KIND, &[])
+                .expect("Registry root grant packet creation failed");
             packet
                 .push(
                     sender.into_capability(),
-                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+                    Rights::WRITE
+                        | Rights::WAIT
+                        | Rights::TRANSIT
+                        | Rights::DUPLICATE
+                        | Rights::GRANT,
                 )
                 .map_err(|failure| failure.error)
-                .expect("provider root grant packet preparation failed");
+                .expect("Registry root grant packet preparation failed");
             packet
                 .try_send(&bootstrap, Deadline::INFINITE)
                 .map_err(|failure| failure.error)
-                .expect("provider root grant publication failed");
+                .expect("Registry root grant publication failed");
+            registry_published = true;
+        }
+        if root_published
+            && registry_published
+            && let Some(sender) = world.registration_root_sender.take()
+        {
+            let mut packet = Packet::new(service_protocol::AUTHORITY_GRANT_KIND, &[])
+                .expect("root registration authority packet creation failed");
+            packet
+                .push(
+                    sender.into_capability(),
+                    Rights::WRITE
+                        | Rights::WAIT
+                        | Rights::TRANSIT
+                        | Rights::DUPLICATE
+                        | Rights::GRANT,
+                )
+                .map_err(|failure| failure.error)
+                .expect("root registration authority packet preparation failed");
+            packet
+                .try_send(&bootstrap, Deadline::INFINITE)
+                .map_err(|failure| failure.error)
+                .expect("root registration authority publication failed");
+            registration_root_published = true;
+        }
+        if root_published
+            && (!registry_expected || registry_published)
+            && registration_root_published
+            && world.registration_ready
+            && !ready_published
+        {
             bootstrap
                 .send(protocol::PROVIDER_READY_KIND, &[])
                 .expect("provider Ready publication failed");
+            ready_published = true;
         }
         match runtime.drive_state() {
             DriveState::Drained => break,
@@ -3562,15 +5501,17 @@ pub(super) fn run(
         .map_err(|(_, error)| error)
         .expect("provider Runtime close failed");
     assert!(
-        dispatch_bindings.is_empty() && world.dispatch_submission.is_none(),
+        dispatch_bindings.is_empty() && world.dispatch_intent.is_none(),
         "provider dispatch owners remained after shutdown"
     );
     assert!(
-        world.watches.is_empty(),
+        world.provider.watches.is_empty(),
         "provider Watch records remained after Runtime shutdown"
     );
+    assert!(world.streams.is_empty(), "provider Stream records remained after Runtime shutdown");
     rinlib::debug!("fs provider shutdown: Runtime closed");
     world
+        .provider
         .grants
         .take()
         .expect("provider grant table missing at close")
@@ -3579,7 +5520,7 @@ pub(super) fn run(
         .expect("provider grant table close failed");
     rinlib::debug!("fs provider shutdown: GrantTable closed");
     assert!(
-        world.backend.is_none(),
+        world.provider.backend.is_none(),
         "provider backend remained after shutdown"
     );
     // SAFETY: StartupBlock transferred the unique route mailbox owner to this process,
@@ -3607,10 +5548,22 @@ pub(super) fn run(
             "provider execution account did not refund {kind:?}"
         );
     }
+    for kind in [
+        ServiceResource::Authority,
+        ServiceResource::Registration,
+        ServiceResource::Bytes,
+        ServiceResource::WaitSource,
+    ] {
+        assert_eq!(
+            service_account.usage(kind).0,
+            0,
+            "provider service account did not refund {kind:?}"
+        );
+    }
     rinlib::debug!("fs provider shutdown: account refunded");
     let report = protocol::ProviderReport {
-        committed: world.committed,
-        abandoned: world.abandoned,
+        committed: world.provider.committed,
+        abandoned: world.provider.abandoned,
         downstream_abandoned: world.downstream_abandoned,
     };
     let mut payload = [0; protocol::PROVIDER_REPORT_LEN];

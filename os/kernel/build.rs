@@ -35,7 +35,7 @@ fn main() {
     fs::write(&generated_script, format!("{memory}\n{linker}"))
         .expect("cannot generate kernel linker script");
     println!(
-        "cargo::rustc-link-arg-bin=erhino_kernel=-T{}",
+        "cargo::rustc-link-arg-bin=kernel=-T{}",
         generated_script.display()
     );
 }

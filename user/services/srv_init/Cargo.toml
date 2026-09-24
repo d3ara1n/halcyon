@@ -18,6 +18,8 @@ librpc = { path = "../../libraries/librpc" }
 libprocess = { path = "../../libraries/libprocess" }
 libfal = { path = "../../libraries/libfal" }
 libfs = { path = "../../libraries/libfs" }
+libservice = { path = "../../libraries/libservice" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
+test_fal = { path = "../../tests/test_fal" }
 tar = { path = "../../../shared/tar" }

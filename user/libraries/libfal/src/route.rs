@@ -4,10 +4,92 @@
 //! 的装配者发送，并携带目标 provider 的母 DirectoryGrant。
 
 use crate::{
+    authority::AccessSnapshot,
+    backend::{BackendError, LookupResult},
+    store::{NodeId, NodeRef},
+    value::Capability,
+};
+use crate::{
     authority::FalRights,
     bytes::{DecodeError, Reader, Writer},
     node::validate_path,
 };
+use alloc::string::String;
+use erhino_shared::object::Rights;
+
+/// 管理绑定只附着于签发它的根；解析结果持有目标副本，不再依赖可替换的绑定。
+pub struct Binding<C: Capability> {
+    root: NodeId,
+    name: String,
+    target: C,
+    rights: FalRights,
+}
+
+impl<C: Capability> Binding<C> {
+    pub fn new(root: &NodeRef, name: String, target: C, rights: FalRights) -> Self {
+        Self {
+            root: root.id(),
+            name,
+            target,
+            rights,
+        }
+    }
+
+    pub fn lookup(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<Option<LookupResult<C>>, BackendError> {
+        if access.root().id() != self.root {
+            return Ok(None);
+        }
+        if !validate_path(path.as_bytes()) {
+            return Err(BackendError::InvalidName);
+        }
+        let remaining = if path == self.name {
+            ""
+        } else {
+            let Some(remaining) = path
+                .strip_prefix(self.name.as_str())
+                .and_then(|suffix| suffix.strip_prefix('/'))
+            else {
+                return Ok(None);
+            };
+            remaining
+        };
+        if !access
+            .rights()
+            .contains(FalRights::TRAVERSE | FalRights::ACQUIRE_CAPABILITY)
+            || !access.output_transport().contains(Rights::TRANSIT)
+        {
+            return Err(BackendError::Permission);
+        }
+        let rights = access.rights().intersect(self.rights);
+        if !rights.contains(FalRights::TRAVERSE) {
+            return Err(BackendError::Permission);
+        }
+        let target = self
+            .target
+            .duplicate(Rights::WRITE | Rights::WAIT)
+            .map_err(BackendError::Resource)?;
+        let mut consumed = String::new();
+        consumed
+            .try_reserve_exact(self.name.len())
+            .map_err(|_| BackendError::Resource(erhino_shared::call::SystemCallError::OutOfMemory))?;
+        consumed.push_str(&self.name);
+        let mut remaining_owned = String::new();
+        remaining_owned
+            .try_reserve_exact(remaining.len())
+            .map_err(|_| BackendError::Resource(erhino_shared::call::SystemCallError::OutOfMemory))?;
+        remaining_owned.push_str(remaining);
+        Ok(Some(LookupResult::DelegationBoundary {
+            target,
+            rights,
+            consumed,
+            remaining: remaining_owned,
+        }))
+    }
+}
 
 /// Provider 路由管理 RPC 协议标识。
 pub const ID: u64 = 0x4641_4c32_5254_4501;

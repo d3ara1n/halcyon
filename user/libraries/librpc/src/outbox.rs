@@ -19,15 +19,16 @@ pub enum OutboxResult {
 
 /// 单个入站请求的回复责任。
 ///
-/// Outbox 在构造时取得完整回复存储，之后只在同一 Runtime 的任务推进中
-/// 注册可写/关闭来源、重试发送和等待来源注销。业务状态已提交后，回复失败
-/// 只产生 `Abandoned`，不会伪造业务回滚。
+/// Outbox 构造时取得完整回复存储；业务提交前先登记 CLOSED 观察。正文准备好后
+/// 尝试发送，只有邮箱满时才将同一来源切换为 WRITABLE|CLOSED 并等待可写。
+/// 业务已提交后的回复失败只产生 `Abandoned`，不会伪造业务回滚。
 #[derive(Debug)]
 pub struct Outbox {
     response: Option<PreparedResponse>,
     deadline: Deadline,
     source_kind: u64,
     source: Option<SourceId>,
+    source_writable: bool,
     requested: bool,
     removing: bool,
     rearm_needed: bool,
@@ -63,6 +64,7 @@ impl Outbox {
             deadline,
             source_kind,
             source: None,
+            source_writable: false,
             requested: false,
             removing: false,
             rearm_needed: false,
@@ -119,6 +121,16 @@ impl Outbox {
             return;
         }
         if let Some(source) = self.source {
+            // 空邮箱的 WRITABLE 会立即消耗一次性观察；切换前只等 CLOSED。
+            if matches!(self.stage, OutboundStage::WaitingWritable) && !self.source_writable {
+                if requests.remove(source).is_ok() {
+                    self.removing = true;
+                    self.operation_retry = false;
+                } else {
+                    self.operation_retry = true;
+                }
+                return;
+            }
             if self.rearm_needed {
                 if requests.rearm(source).is_ok() {
                     self.rearm_needed = false;
@@ -136,13 +148,19 @@ impl Outbox {
                         response
                             .reply_handle()
                             .expect("live Outbox must retain reply-once owner"),
-                        ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+                        if matches!(self.stage, OutboundStage::WaitingWritable) {
+                            ObjectSignals::WRITABLE | ObjectSignals::CLOSED
+                        } else {
+                            ObjectSignals::CLOSED
+                        },
                     ),
                     self.source_kind,
                 )
                 .is_ok()
         {
             self.requested = true;
+            self.source_writable = matches!(self.stage, OutboundStage::WaitingWritable);
+            self.rearm_needed = false;
             self.operation_retry = false;
         } else {
             self.operation_retry = true;
@@ -271,6 +289,7 @@ impl Outbox {
         if kind == self.source_kind && self.source == Some(source) {
             self.source = None;
             self.requested = false;
+            self.source_writable = false;
             self.removing = false;
         }
     }

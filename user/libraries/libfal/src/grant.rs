@@ -135,7 +135,9 @@ impl GrantTable {
     }
 
     fn validate_policy(policy: Issuance) -> Result<(), SystemCallError> {
+        let forwarding = Rights::TRANSIT | Rights::GRANT;
         if !policy.output_transport.is_known()
+            || !policy.output_transport.is_subset_of(forwarding)
             || !policy.sender_transport.is_known()
             || !policy
                 .sender_transport
@@ -330,19 +332,13 @@ impl GrantTable {
         Some(AccessSnapshot {
             root: state.root.clone(),
             rights: state.rights,
+            output_transport: state.output_transport_rights,
             account: state.account.clone(),
         })
     }
 
     pub fn mailbox_id(&self) -> u64 {
         self.mailbox_id
-    }
-
-    pub fn output_rights(&self, context: u64) -> Option<Rights> {
-        self.grants
-            .get(context)
-            .filter(|state| state.policy == PolicyState::Active)
-            .map(|state| state.output_transport_rights)
     }
 
     /// Move 的收到能力必须实际指向本表已登记 sender，不能只按 badge 认领。

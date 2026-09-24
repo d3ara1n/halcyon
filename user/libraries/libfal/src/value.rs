@@ -426,7 +426,128 @@ pub struct TakenValue<C> {
     pub handles: Vec<StoredHandle<C>>,
 }
 
-pub type ExportedValue<C> = (Vec<u8>, Vec<(C, Rights)>);
+pub struct DirectSnapshot<C> {
+    pub bytes: Vec<u8>,
+    pub handles: Vec<(C, Rights)>,
+    _charge: Charge,
+}
+
+pub enum SnapshotHandle<C> {
+    Direct { owner: C, policy: ExportPolicy },
+    Directory { provider: C, policy: ExportPolicy },
+}
+
+pub struct ReadSnapshot<C> {
+    pub bytes: Vec<u8>,
+    pub handles: Vec<SnapshotHandle<C>>,
+    _charge: Charge,
+}
+
+pub struct SnapshotFailure<C> {
+    pub error: ValueError,
+    pub handles: Vec<SnapshotHandle<C>>,
+}
+
+impl<C> ReadSnapshot<C> {
+    pub fn into_direct(self) -> Result<DirectSnapshot<C>, Self> {
+        if self
+            .handles
+            .iter()
+            .any(|handle| matches!(handle, SnapshotHandle::Directory { .. }))
+        {
+            return Err(self);
+        }
+        let Self {
+            bytes,
+            handles,
+            _charge,
+        } = self;
+        let handles = handles
+            .into_iter()
+            .map(|handle| match handle {
+                SnapshotHandle::Direct { owner, policy } => (owner, policy.transport),
+                SnapshotHandle::Directory { .. } => unreachable!(),
+            })
+            .collect();
+        Ok(DirectSnapshot {
+            bytes,
+            handles,
+            _charge,
+        })
+    }
+
+    pub fn has_directory(&self) -> bool {
+        self.handles
+            .iter()
+            .any(|handle| matches!(handle, SnapshotHandle::Directory { .. }))
+    }
+
+    pub fn prepare(
+        bytes: &[u8],
+        handles: Vec<SnapshotHandle<C>>,
+        account: &AccountView<FalResource>,
+    ) -> Result<Self, SnapshotFailure<C>> {
+        let fields = match validate(bytes, 0, handles.len(), bytes.len()) {
+            Ok(fields) => fields,
+            Err(error) => return Err(SnapshotFailure { error, handles }),
+        };
+        if !handles.iter().zip(&fields).all(|(handle, field)| {
+            let policy = match handle {
+                SnapshotHandle::Direct { policy, .. }
+                | SnapshotHandle::Directory { policy, .. } => *policy,
+            };
+            policy == field.policy
+        }) {
+            return Err(SnapshotFailure {
+                error: ValueError::Encoding,
+                handles,
+            });
+        }
+        let handle_bytes = match handles
+            .len()
+            .checked_mul(core::mem::size_of::<SnapshotHandle<C>>())
+        {
+            Some(bytes) => bytes,
+            None => {
+                return Err(SnapshotFailure {
+                    error: ValueError::Budget,
+                    handles,
+                });
+            }
+        };
+        let allocation = match bytes.len().checked_add(handle_bytes) {
+            Some(allocation) => allocation,
+            None => {
+                return Err(SnapshotFailure {
+                    error: ValueError::Budget,
+                    handles,
+                });
+            }
+        };
+        let charge = match account.acquire(FalResource::Bytes, allocation) {
+            Ok(charge) => charge,
+            Err(error) => {
+                return Err(SnapshotFailure {
+                    error: ValueError::Capability(error),
+                    handles,
+                });
+            }
+        };
+        let mut snapshot = Vec::new();
+        if snapshot.try_reserve_exact(bytes.len()).is_err() {
+            return Err(SnapshotFailure {
+                error: ValueError::Allocation,
+                handles,
+            });
+        }
+        snapshot.extend_from_slice(bytes);
+        Ok(Self {
+            bytes: snapshot,
+            handles,
+            _charge: charge,
+        })
+    }
+}
 
 impl<C: Capability> StoredValue<C> {
     pub fn prepare(
@@ -545,11 +666,30 @@ impl<C: Capability> StoredValue<C> {
             .any(|handle| handle.policy.mode == ExportMode::Affine)
     }
 
-    /// 复制可重复导出的能力，并把编码中的槽位重写为回复槽位。
-    ///
-    /// DirectoryGrant 不允许走普通 Duplicate；它必须由 provider 的
-    /// Derive 路径产生新的授权。affine 值只能走显式 Take。
-    pub fn duplicate_for_reply(&self) -> Result<ExportedValue<C>, ValueError> {
+    /// 捕获一次完整属性读取快照。字段 owner 在返回前全部取得；Directory 字段
+    /// 只取得供异步 Derive 使用的目标母授权引用，不直接作为结果交付。
+    pub fn read_snapshot(
+        &self,
+        output_transport: Rights,
+        account: &AccountView<FalResource>,
+    ) -> Result<ReadSnapshot<C>, ValueError> {
+        if self.has_affine() {
+            return Err(ValueError::Affine);
+        }
+        self.validate_output_transport(output_transport)?;
+        let handle_bytes = self
+            .handles
+            .len()
+            .checked_mul(core::mem::size_of::<SnapshotHandle<C>>())
+            .ok_or(ValueError::Budget)?;
+        let allocation = self
+            .bytes
+            .len()
+            .checked_add(handle_bytes)
+            .ok_or(ValueError::Budget)?;
+        let charge = account
+            .acquire(FalResource::Bytes, allocation)
+            .map_err(ValueError::Capability)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(self.bytes.len())
@@ -562,21 +702,57 @@ impl<C: Capability> StoredValue<C> {
             .try_reserve_exact(self.handles.len())
             .map_err(|_| ValueError::Allocation)?;
         for (slot, (handle, field)) in self.handles.iter().zip(fields).enumerate() {
-            if handle.policy.mode == ExportMode::Affine {
-                return Err(ValueError::Affine);
-            }
-            if handle.policy.protocol == Protocol::Directory {
-                return Err(ValueError::Unsupported);
-            }
-            let owner = handle
-                .owner
-                .duplicate(handle.policy.transport)
-                .map_err(ValueError::Capability)?;
+            let snapshot = if handle.policy.protocol == Protocol::Directory {
+                let provider = handle
+                    .owner
+                    .duplicate(Rights::WRITE | Rights::WAIT)
+                    .map_err(ValueError::Capability)?;
+                SnapshotHandle::Directory {
+                    provider,
+                    policy: handle.policy,
+                }
+            } else {
+                let owner = handle
+                    .owner
+                    .duplicate(handle.policy.transport)
+                    .map_err(ValueError::Capability)?;
+                SnapshotHandle::Direct {
+                    owner,
+                    policy: handle.policy,
+                }
+            };
             bytes[field.slot_offset..field.slot_offset + 2]
                 .copy_from_slice(&(slot as u16).to_le_bytes());
-            owners.push((owner, handle.policy.transport));
+            owners.push(snapshot);
         }
-        Ok((bytes, owners))
+        Ok(ReadSnapshot {
+            bytes,
+            handles: owners,
+            _charge: charge,
+        })
+    }
+
+    /// 同步非目录读取；Directory 字段由异步出口任务处理。
+    pub fn duplicate_for_reply(
+        &self,
+        output_transport: Rights,
+        account: &AccountView<FalResource>,
+    ) -> Result<DirectSnapshot<C>, ValueError> {
+        self.read_snapshot(output_transport, account)?
+            .into_direct()
+            .map_err(|_| ValueError::Unsupported)
+    }
+    pub fn validate_output_transport(&self, output_transport: Rights) -> Result<(), ValueError> {
+        let forwarding = Rights::TRANSIT | Rights::GRANT;
+        if !output_transport.is_known() || !output_transport.is_subset_of(forwarding) {
+            return Err(ValueError::Capability(SystemCallError::RightsDenied));
+        }
+        for handle in &self.handles {
+            if !(handle.policy.transport & forwarding).is_subset_of(output_transport) {
+                return Err(ValueError::Capability(SystemCallError::RightsDenied));
+            }
+        }
+        Ok(())
     }
 
     /// 线性化 affine Take：存储值立即变为空 Blob，原始值与 owner 交给操作任务。
@@ -634,7 +810,7 @@ mod tests {
     use erhino_shared::object::{HandleDescription, HandleRole};
     use libbudget::{Budget, Taxonomy};
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     struct TestCapability {
         id: u64,
         role: HandleRole,
@@ -655,6 +831,9 @@ mod tests {
         }
 
         fn duplicate(&self, rights: Rights) -> Result<Self, SystemCallError> {
+            if self.id == 8 {
+                return Err(SystemCallError::ObjectBusy);
+            }
             if !rights.is_subset_of(self.rights) {
                 return Err(SystemCallError::RightsDenied);
             }
@@ -696,6 +875,22 @@ mod tests {
         bytes
     }
 
+    fn directory_value() -> Vec<u8> {
+        let value = Value::Handle {
+            slot: 1,
+            policy: ExportPolicy {
+                protocol: Protocol::Directory,
+                mode: ExportMode::Repeatable,
+                transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                fal_ceiling: FalRights::TRAVERSE,
+            },
+        };
+        let mut bytes = vec![0; value.encoded_len().unwrap()];
+        let used = value.encode(&mut bytes).unwrap();
+        bytes.truncate(used);
+        bytes
+    }
+
     fn capability() -> TestCapability {
         TestCapability {
             id: 7,
@@ -706,18 +901,106 @@ mod tests {
 
     #[test]
     fn repeatable_export_duplicates_and_rebases_reply_slot() {
+        let account = account();
         let stored = StoredValue::prepare(
             &handle_value(ExportMode::Repeatable),
             vec![capability()],
             1,
             PAYLOAD_MAX,
-            &account(),
+            &account,
         )
         .unwrap_or_else(|_| panic!("repeatable value preparation failed"));
-        let (bytes, handles) = stored.duplicate_for_reply().unwrap();
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].0.id, 7);
-        assert_eq!(validate(&bytes, 0, 1, PAYLOAD_MAX).unwrap().len(), 1);
+        let direct = stored
+            .duplicate_for_reply(Rights::TRANSIT, &account)
+            .unwrap();
+        assert_eq!(direct.handles.len(), 1);
+        assert_eq!(direct.handles[0].0.id, 7);
+        assert_eq!(validate(&direct.bytes, 0, 1, PAYLOAD_MAX).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn directory_field_is_retained_for_async_derivation() {
+        let account = account();
+        let stored = StoredValue::prepare(
+            &directory_value(),
+            vec![capability()],
+            1,
+            PAYLOAD_MAX,
+            &account,
+        )
+        .unwrap_or_else(|_| panic!("directory value preparation failed"));
+        let snapshot = stored
+            .read_snapshot(Rights::TRANSIT, &account)
+            .unwrap_or_else(|_| panic!("directory snapshot preparation failed"));
+        assert!(snapshot.has_directory());
+        assert!(snapshot.into_direct().is_err());
+    }
+
+    #[test]
+    fn output_transport_ceiling_is_checked_before_snapshot_duplication() {
+        let account = account();
+        let stored = StoredValue::prepare(
+            &handle_value(ExportMode::Repeatable),
+            vec![capability()],
+            1,
+            PAYLOAD_MAX,
+            &account,
+        )
+        .unwrap_or_else(|_| panic!("repeatable value preparation failed"));
+        let before = account.usage(FalResource::Bytes).0;
+        assert!(matches!(
+            stored.duplicate_for_reply(Rights::NONE, &account),
+            Err(ValueError::Capability(SystemCallError::RightsDenied))
+        ));
+        assert_eq!(account.usage(FalResource::Bytes).0, before);
+    }
+
+    #[test]
+    fn multi_field_snapshot_failure_refunds_partial_export() {
+        let fields = [
+            Field {
+                name: "first",
+                value: Value::Handle {
+                    slot: 1,
+                    policy: ExportPolicy {
+                        protocol: Protocol::Mailbox,
+                        mode: ExportMode::Repeatable,
+                        transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                        fal_ceiling: FalRights::NONE,
+                    },
+                },
+            },
+            Field {
+                name: "second",
+                value: Value::Handle {
+                    slot: 2,
+                    policy: ExportPolicy {
+                        protocol: Protocol::Mailbox,
+                        mode: ExportMode::Repeatable,
+                        transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                        fal_ceiling: FalRights::NONE,
+                    },
+                },
+            },
+        ];
+        let value = Value::Record(&fields);
+        let mut bytes = vec![0; value.encoded_len().unwrap()];
+        let used = value.encode(&mut bytes).unwrap();
+        bytes.truncate(used);
+        let account = account();
+        let first = capability();
+        let mut second = capability();
+        second.id = 8;
+        let stored = StoredValue::prepare(&bytes, vec![first, second], 1, PAYLOAD_MAX, &account)
+            .unwrap_or_else(|_| panic!("record preparation failed"));
+        let before = account.usage(FalResource::Bytes).0;
+        assert!(matches!(
+            stored.read_snapshot(Rights::TRANSIT, &account),
+            Err(ValueError::Capability(SystemCallError::ObjectBusy))
+        ));
+        assert_eq!(account.usage(FalResource::Bytes).0, before);
+        assert_eq!(stored.handles.len(), 2);
+        assert!(validate(&stored.bytes, 0, 2, PAYLOAD_MAX).is_ok());
     }
 
     #[test]

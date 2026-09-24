@@ -248,7 +248,17 @@ pub(crate) fn placement(placement: Placement) -> (u64, MemoryPlacement) {
     }
 }
 
-pub fn create(bytes: usize, policy: Placement) -> Result<(Endpoint, Handle), SystemCallError> {
+pub(crate) struct CreateFailure {
+    pub error: SystemCallError,
+    pub endpoint: Option<Endpoint>,
+    pub cleanup: Option<EndpointCleanup>,
+    pub invitation: Option<Handle>,
+}
+
+pub(crate) fn create_owned(
+    bytes: usize,
+    policy: Placement,
+) -> Result<(Endpoint, Handle), CreateFailure> {
     let mut output = TunnelCreateResult::empty();
     let (address, policy) = placement(policy);
     let request = TunnelCreateRequest::new(
@@ -258,26 +268,51 @@ pub fn create(bytes: usize, policy: Placement) -> Result<(Endpoint, Handle), Sys
         policy,
     );
     // SAFETY: 请求与结果在包括等待的整个 syscall 期间有效。
-    unsafe { call::sys_tunnel_create(&request)? };
-    let endpoint = Endpoint::from_result(output.local).inspect_err(|_| {
-        // SAFETY: 尚未交付的本次创建 Invitation，失败时不能遗留其引用。
-        if output.invitation.is_valid() {
-            let _ = unsafe { super::object::close(output.invitation) };
-        }
+    unsafe { call::sys_tunnel_create(&request) }.map_err(|error| CreateFailure {
+        error,
+        endpoint: None,
+        cleanup: None,
+        invitation: None,
     })?;
+    validate_created(bytes, output)
+}
+
+fn validate_created(
+    bytes: usize,
+    output: TunnelCreateResult,
+) -> Result<(Endpoint, Handle), CreateFailure> {
+    let invitation = output.invitation.is_valid().then_some(output.invitation);
+    let endpoint =
+        Endpoint::from_result_owned(output.local).map_err(|(cleanup, error)| CreateFailure {
+            error,
+            endpoint: None,
+            cleanup,
+            invitation,
+        })?;
     if !output.invitation.is_valid()
         || bytes
             .checked_add(PROCESS_PAGE_SIZE - 1)
             .map(|value| value / PROCESS_PAGE_SIZE * PROCESS_PAGE_SIZE)
             != Some(endpoint.geometry.bytes)
     {
-        // SAFETY: Invitation 是本次创建、尚未运输的 entry。
-        if output.invitation.is_valid() {
-            let _ = unsafe { super::object::close(output.invitation) };
-        }
-        return Err(SystemCallError::InternalError);
+        return Err(CreateFailure {
+            error: SystemCallError::InternalError,
+            endpoint: Some(endpoint),
+            cleanup: None,
+            invitation,
+        });
     }
     Ok((endpoint, output.invitation))
+}
+
+pub fn create(bytes: usize, policy: Placement) -> Result<(Endpoint, Handle), SystemCallError> {
+    create_owned(bytes, policy).map_err(|failure| {
+        if let Some(invitation) = failure.invitation {
+            // SAFETY: 原始调用者未接收的本次创建 Invitation；失败由进程 drain 兜底。
+            let _ = unsafe { super::object::close(invitation) };
+        }
+        failure.error
+    })
 }
 
 /// # Safety
@@ -319,5 +354,52 @@ mod tests {
         assert_eq!(returned.geometry.base(), 0x1000);
         assert_eq!(returned.geometry.bytes(), 3 * PROCESS_PAGE_SIZE);
         assert!(returned.finish_close(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn malformed_create_geometry_preserves_both_published_owners() {
+        let endpoint = Handle::from_parts(1, 1);
+        let invitation = Handle::from_parts(2, 1);
+        let failure = validate_created(
+            PROCESS_PAGE_SIZE,
+            TunnelCreateResult {
+                local: TunnelEndpointResult {
+                    endpoint,
+                    base: 0x1000,
+                    bytes: 0,
+                },
+                invitation,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.error, SystemCallError::InternalError);
+        assert!(failure.endpoint.is_none());
+        assert_eq!(failure.cleanup.as_ref().unwrap().handle, Some(endpoint));
+        assert_eq!(failure.invitation, Some(invitation));
+        // 合成 handle 没有内核对象；测试仅核对 affine owner，不触发 host close。
+        core::mem::forget(failure);
+    }
+
+    #[test]
+    fn mismatched_create_length_preserves_endpoint_and_invitation() {
+        let endpoint = Handle::from_parts(3, 1);
+        let invitation = Handle::from_parts(4, 1);
+        let failure = validate_created(
+            2 * PROCESS_PAGE_SIZE,
+            TunnelCreateResult {
+                local: TunnelEndpointResult {
+                    endpoint,
+                    base: 0x1000,
+                    bytes: PROCESS_PAGE_SIZE as u64,
+                },
+                invitation,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.error, SystemCallError::InternalError);
+        assert_eq!(failure.endpoint.as_ref().unwrap().handle, Some(endpoint));
+        assert!(failure.cleanup.is_none());
+        assert_eq!(failure.invitation, Some(invitation));
+        core::mem::forget(failure);
     }
 }

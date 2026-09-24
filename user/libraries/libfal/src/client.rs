@@ -1,13 +1,13 @@
 //! FAL2 同步客户端：统一 wire、状态与 capability 槽契约。
 
-use alloc::vec;
+use alloc::vec::Vec;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     time::Deadline,
     wait::{WaitItem, WaitReason},
 };
-use librpc::{CallError, Caller, Reply, Request as RpcRequest};
+use librpc::{CallCause, CallError, CallOperation, CallPhase, Caller, Reply, Request as RpcRequest};
 use rinlib::ipc::{
     capability::Capability,
     message::{MailboxSender, SenderAdoptFailure},
@@ -26,8 +26,61 @@ pub enum ClientError {
     Protocol,
 }
 
+#[derive(Debug)]
+pub enum ClientCallFailure {
+    NoRequest(ClientError),
+    Unsent(CallError),
+    Unknown(ClientError),
+    Rejected(Status),
+}
+
+impl ClientCallFailure {
+    pub fn into_error(self) -> ClientError {
+        match self {
+            Self::NoRequest(error) | Self::Unknown(error) => error,
+            Self::Unsent(error) => ClientError::Transport(error),
+            Self::Rejected(status) => ClientError::Status(status),
+        }
+    }
+}
+
 pub struct Client {
     caller: Caller,
+}
+
+pub enum ClientProgress {
+    Pending,
+    Reply(Reply),
+    Rejected(ClientError),
+}
+
+pub struct ClientOperation<'a> {
+    call: CallOperation<'a>,
+    op: protocol::Op,
+}
+
+impl ClientOperation<'_> {
+    pub fn phase(&self) -> Option<CallPhase> {
+        self.call.phase()
+    }
+
+    pub fn advance(&mut self) -> Result<ClientProgress, CallCause> {
+        match self.call.advance()? {
+            None => Ok(ClientProgress::Pending),
+            Some(reply) => Ok(match Client::validate_reply(self.op, reply) {
+                Ok(reply) => ClientProgress::Reply(reply),
+                Err(error) => ClientProgress::Rejected(error),
+            }),
+        }
+    }
+
+    pub fn wait_ready(&self) -> Result<(), CallCause> {
+        self.call.wait_ready()
+    }
+
+    pub fn abort(&mut self, cause: CallCause) -> Option<CallError> {
+        self.call.abort(cause)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,9 +150,74 @@ impl Client {
         request: &Request<'_>,
         deadline: Deadline,
     ) -> Result<Reply, ClientError> {
+        self.call_cancelable(grant, request, deadline, None)
+    }
+
+    pub fn call_cancelable(
+        &mut self,
+        grant: &MailboxSender,
+        request: &Request<'_>,
+        deadline: Deadline,
+        cancel: Option<Handle>,
+    ) -> Result<Reply, ClientError> {
         let op = request.op();
         let rpc = Self::encode(request, deadline)?;
-        self.finish_call(grant, op, deadline, rpc)
+        self.finish_call(grant, op, deadline, rpc, cancel)
+    }
+
+    pub fn begin_call<'a>(
+        &'a mut self,
+        grant: &'a MailboxSender,
+        request: &Request<'_>,
+        deadline: Deadline,
+        cancel: Option<Handle>,
+    ) -> Result<ClientOperation<'a>, ClientCallFailure> {
+        let op = request.op();
+        let rpc = Self::encode(request, deadline).map_err(ClientCallFailure::NoRequest)?;
+        self.begin_encoded(grant, op, deadline, rpc, cancel)
+            .map_err(ClientCallFailure::Unsent)
+    }
+
+    pub fn call_classified(
+        &mut self,
+        grant: &MailboxSender,
+        request: &Request<'_>,
+        deadline: Deadline,
+        cancel: Option<Handle>,
+    ) -> Result<Reply, ClientCallFailure> {
+        let operation = self.begin_call(grant, request, deadline, cancel)?;
+        Self::drive(operation)
+    }
+
+    fn drive(mut operation: ClientOperation<'_>) -> Result<Reply, ClientCallFailure> {
+        loop {
+            match operation.advance() {
+                Ok(ClientProgress::Reply(reply)) => return Ok(reply),
+                Ok(ClientProgress::Rejected(ClientError::Status(status))) => {
+                    return Err(ClientCallFailure::Rejected(status));
+                }
+                Ok(ClientProgress::Rejected(error)) => {
+                    return Err(ClientCallFailure::Unknown(error));
+                }
+                Ok(ClientProgress::Pending) => {}
+                Err(cause) => {
+                    let error = operation.abort(cause).expect("failed call remains pending");
+                    return Err(Self::classify_transport(error));
+                }
+            }
+            if let Err(cause) = operation.wait_ready() {
+                let error = operation.abort(cause).expect("waiting call remains pending");
+                return Err(Self::classify_transport(error));
+            }
+        }
+    }
+
+    fn classify_transport(error: CallError) -> ClientCallFailure {
+        if error.phase == CallPhase::Unsent {
+            ClientCallFailure::Unsent(error)
+        } else {
+            ClientCallFailure::Unknown(ClientError::Transport(error))
+        }
     }
 
     pub fn call_with_target(
@@ -133,18 +251,22 @@ impl Client {
         let capability = unsafe { Capability::from_raw(handle) };
         rpc.push(capability, rights)
             .map_err(|failure| ClientError::System(failure.error))?;
-        self.finish_call(grant, op, deadline, rpc)
+        self.finish_call(grant, op, deadline, rpc, None)
     }
 
     fn encode(request: &Request<'_>, deadline: Deadline) -> Result<RpcRequest, ClientError> {
         let capacity = protocol::HEADER_LEN
             .checked_add(request.encoded_len().ok_or(ClientError::Protocol)?)
             .ok_or(ClientError::Protocol)?;
-        let mut payload = vec![0; capacity];
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(capacity)
+            .map_err(|_| ClientError::System(SystemCallError::OutOfMemory))?;
+        payload.resize(capacity, 0);
         let used = protocol::encode_request(request, deadline, &mut payload)
             .ok_or(ClientError::Protocol)?;
         payload.truncate(used);
-        RpcRequest::new(protocol::ID, &payload).map_err(|_| ClientError::Protocol)
+        RpcRequest::new(protocol::ID, &payload).map_err(ClientError::System)
     }
 
     fn finish_call(
@@ -153,11 +275,27 @@ impl Client {
         op: protocol::Op,
         deadline: Deadline,
         rpc: RpcRequest,
+        cancel: Option<Handle>,
     ) -> Result<Reply, ClientError> {
-        let reply = self
-            .caller
-            .call(grant, deadline, rpc)
+        let operation = self
+            .begin_encoded(grant, op, deadline, rpc, cancel)
             .map_err(ClientError::Transport)?;
+        Self::drive(operation).map_err(ClientCallFailure::into_error)
+    }
+
+    fn begin_encoded<'a>(
+        &'a mut self,
+        grant: &'a MailboxSender,
+        op: protocol::Op,
+        deadline: Deadline,
+        rpc: RpcRequest,
+        cancel: Option<Handle>,
+    ) -> Result<ClientOperation<'a>, CallError> {
+        let call = CallOperation::new(&mut self.caller, grant, deadline, rpc, cancel)?;
+        Ok(ClientOperation { call, op })
+    }
+
+    fn validate_reply(op: protocol::Op, reply: Reply) -> Result<Reply, ClientError> {
         let (header, response) =
             protocol::decode_response(&reply.payload).map_err(|_| ClientError::Protocol)?;
         if header.op != op {
@@ -297,7 +435,7 @@ impl Client {
         let mut rpc = Self::encode(&request, deadline)?;
         rpc.push(signaler, Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT)
             .map_err(|failure| ClientError::System(failure.error))?;
-        let reply = self.finish_call(grant, op, deadline, rpc)?;
+        let reply = self.finish_call(grant, op, deadline, rpc, None)?;
         let (_, Response::Subscription(info)) =
             protocol::decode_response(&reply.payload).map_err(|_| ClientError::Protocol)?
         else {

@@ -28,7 +28,7 @@ pub enum TarError {
 const BLOCK: usize = 512;
 
 /// 解析整个归档，逐项回调（就地切片，不拷贝）。
-pub fn walk(data: &[u8], mut f: impl FnMut(Entry<'_>)) -> Result<(), TarError> {
+pub fn walk<'a>(data: &'a [u8], mut f: impl FnMut(Entry<'a>)) -> Result<(), TarError> {
     if !data.len().is_multiple_of(BLOCK) {
         return Err(TarError::BadBlock);
     }

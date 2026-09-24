@@ -4,12 +4,11 @@
 
 ## 当前接手
 
-**FAL 主线**：[FAL 后端、授权与业务](todo-2026-09-fal-service-capabilities.md) 的 F3d 结构回改尚未闭合。分支 `task/fal-service-capabilities`，接手基线 `2811d48`，已有未提交工作树须保留。
+**当前接手：FAL 集成基线固定提交审查**：[审查计划](todo-2026-09-13-fal-integration-baseline-review.md) 针对固定提交 `d22b9d7`，只读核对公共对象前置与混合集成边界。Agent 规范审查已归档并关闭；FAL 基本能力和内核组件身份统一均已完成，当前未提交工作树仍需按任务摘要整理。
 
-- 唯一入口：[跨会话接力断点](todo-2026-09-fal-service-capabilities.md#跨会话接力断点)，施工顺序见 [§8.8](todo-2026-09-fal-service-capabilities.md#88-施工顺序与完成门)。
-- 当前阻断：D2/D3 普通与注册 Ingress 的入箱、任务 Gate、Outbox 来源准入、业务提交及正常满载下 owner 返还；随后独立验证上游放弃而 A 继续运行。D4 provider 提取不得越过这些阻断。
-- D1 全局路由删除、Property/Take 冲突修复及局部 D2/D3 开发证据见唯一计划；历史 host、lint、core 通过不代表整体 FAL 完成。
-- 后续导航：F3d → F3e Open → F3f 流 Copy → F4 组合验收；技术依赖和每步设计门以计划为准，Open/Copy 不因接口草案存在而视为已实施。
+- 当前唯一施工入口已从 FAL 切换到固定提交审查；FAL 实现计划与内核身份计划均已完成，保留其验证证据和历史审查导航。
+- FAL 的 D0–D5、F4 结构复核/组合验收以及内核身份改名的构建、host、QEMU、boot-failure 证据分别写入所属计划；剩余仅为各固定提交的独立 Review。
+- 当前状态：准备接手 `60e3253` 的只读规范/导航审查；不修改实现代码，不把当前未提交工作树混入目标提交结论。
 
 ## 按主题阅读
 
@@ -33,9 +32,10 @@
 
 | 文件 | 状态与范围 |
 |---|---|
-| [FAL 服务能力](todo-2026-09-fal-service-capabilities.md) | 主线；从顶部接力入口继续，整体未交付 |
-| [内核身份统一](todo-2026-09-22-kernel-identity.md) | 待实施；`erhino_kernel` → `kernel`，不改变全仓命名规则，不打断 FAL |
-| [Agent 规范与导航审查](todo-2026-09-22-agent-guidance-review.md) | 待审固定 `60e3253`；规则一致性、完成条件、导航与历史保留 |
+| [FAL 服务能力](todo-2026-09-fal-service-capabilities.md) | F3d/F3e/F3f 与 F4-1/F4-2/F4-3 已完成；完整验收通过，保留无稳定正式注入入口的验证限制 |
+| [验收 fixture 清理](todo-2026-09-23-acceptance-fixture-cleanup.md) | 消费者矩阵、映像 owner 与失败判定已核对；两个 binary 暂留，余下逐项审查其他自检窗口 |
+| [内核身份统一](todo-2026-09-22-kernel-identity.md) | 已完成；package、默认 target、crate identifier、产物与有效入口统一为 `kernel`，构建/host/QEMU/boot-failure 验证通过 |
+| [Agent 规范与导航审查](archived/todo-2026-09-22-agent-guidance-review.md) | 已归档并关闭；报告见 [archived/review-2026-09-24-agent-guidance.md](archived/review-2026-09-24-agent-guidance.md) |
 | [FAL 集成基线审查](todo-2026-09-13-fal-integration-baseline-review.md) | 待审固定 `d22b9d7`；公共对象前置与混合集成边界 |
 | [公共时间审查](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) | 待审固定 `c6e0a84`；时钟、绝对期限与消费者 |
 | [库存来源审查](todo-2026-09-frame-source-selftest-review.md) | 待审固定 `606b59d`；库存、boot-held owner、清零与退款 |

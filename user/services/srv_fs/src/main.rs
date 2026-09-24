@@ -5,7 +5,6 @@
 extern crate alloc;
 
 mod server;
-mod watch;
 
 use erhino_shared::object::{Handle, Rights};
 use rinlib::ipc::{
@@ -31,7 +30,8 @@ fn main() {
     let bootstrap = startup_sender(0, "provider bootstrap sender is missing");
     let release = startup_handle(1, "provider release owner is missing");
     let route = startup_handle(2, "provider route mailbox owner is missing");
+    let registration = startup_handle(3, "provider registration endpoint is missing");
     let mailbox = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
         .expect("provider mailbox creation failed");
-    server::run(mailbox, bootstrap, route, release);
+    server::run(mailbox, bootstrap, route, release, registration);
 }

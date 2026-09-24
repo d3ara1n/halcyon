@@ -49,16 +49,18 @@ use librpc::{
     RequestContext, RpcMessageKind, RpcPrefix,
 };
 use librunnel::{ConsumerReady, blocking};
+use libservice::{client as service_client, protocol as service_protocol, record::ServiceRecord};
 use rinlib::ipc::tunnel as tunnel_sys;
 use rinlib::ipc::wait_set::WaitSet;
 use rinlib::ipc::{
     capability::Capability,
-    message::{MailboxSender, SendOnce, send_once},
+    message::{Mailbox, MailboxSender, SendOnce, send_once},
     packet::Packet,
 };
 use rinlib::memory_pool::MemoryPool;
 #[cfg(feature = "acceptance-stress")]
 use rinlib::shared::proc::ProcessDrainStatus;
+use rinlib::time::Deadline;
 use rinlib::{
     env,
     ipc::{
@@ -106,15 +108,20 @@ struct Supervised {
 }
 
 struct LaunchedServices {
+    first_fs: AcceptedFsProvider,
+    registry_root_watch: libfal::client::Subscription,
     pm_mailbox: Handle,
-    fs_bootstrap: Handle,
-    fs_release: Handle,
-    fs_route: Handle,
     fs_bootstrap_second: Handle,
     fs_release_second: Handle,
     fs_route_second: Handle,
-    target_image: Option<alloc::vec::Vec<u8>>,
-    hammer_image: Option<alloc::vec::Vec<u8>>,
+    fs_bootstrap_second_sender: Handle,
+    fs_release_second_owner: Handle,
+    fs_route_second_owner: Handle,
+    fs_second_scope: Handle,
+    fs_second_image: &'static [u8],
+    test_fal_image: &'static [u8],
+    target_image: Option<&'static [u8]>,
+    hammer_image: Option<&'static [u8]>,
 }
 
 enum RunFailure {
@@ -235,6 +242,11 @@ const TUNNEL_BYTES: usize = 3 * 4096;
 const STREAM_LEN: usize = 65536;
 #[cfg(feature = "acceptance-stress")]
 const CONTROL_STRESS: usize = 128;
+const CANCELLATION_PROBES: usize = if cfg!(feature = "acceptance-stress") {
+    10
+} else {
+    0
+};
 #[cfg(feature = "acceptance-stress")]
 const TUNNEL_STRESS: usize = 64;
 #[cfg(feature = "acceptance-stress")]
@@ -247,8 +259,11 @@ const REQUIRED_PM: u64 = 1 << 1;
 const REQUIRED_DRIVER: u64 = 1 << 2;
 const REQUIRED_TARGET: u64 = 1 << 3;
 const REQUIRED_PM_TARGET: u64 = 1 << 4;
-const REQUIRED_IMAGES: u64 = REQUIRED_FS | REQUIRED_PM | REQUIRED_DRIVER | REQUIRED_TARGET;
-const REQUIRED_STARTED: u64 = REQUIRED_IMAGES | REQUIRED_PM_TARGET;
+const REQUIRED_FAL: u64 = 1 << 5;
+const REQUIRED_IMAGES: u64 =
+    REQUIRED_FS | REQUIRED_PM | REQUIRED_DRIVER | REQUIRED_TARGET | REQUIRED_FAL;
+const REQUIRED_STARTED: u64 =
+    REQUIRED_FS | REQUIRED_PM | REQUIRED_DRIVER | REQUIRED_TARGET | REQUIRED_PM_TARGET;
 
 fn required_image(name: &str) -> Option<u64> {
     match name {
@@ -256,6 +271,7 @@ fn required_image(name: &str) -> Option<u64> {
         "bin/srv_pm" => Some(REQUIRED_PM),
         "bin/drv_spi_sifive" => Some(REQUIRED_DRIVER),
         "bin/test_target" => Some(REQUIRED_TARGET),
+        "bin/test_fal" => Some(REQUIRED_FAL),
         _ => None,
     }
 }
@@ -305,6 +321,9 @@ fn launch_test_services(
             Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
         )
         .map_err(|_| "second fs route mailbox create failed")?;
+    let fs_registration = root
+        .create_mailbox_owner(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
+        .map_err(|_| "fs registration mailbox create failed")?;
     // GRANT 是直接跨表安装：授出的源 handle 被消费，先复制保留 init 对
     // 委托域的直接收束权（兜底 job_kill 的 authority 源）。
     let delegated_domain = root
@@ -313,16 +332,21 @@ fn launch_test_services(
     let control_rights = SUPERVISOR_RIGHTS;
     let mut manifest = RequiredLaunchSet::new(REQUIRED_IMAGES, REQUIRED_STARTED);
     let mut stage_failure = None;
-    // test_target/test_hammer 映像留存：竞态矩阵与验收线的靶/锤复用。
-    let mut target_image: Option<alloc::vec::Vec<u8>> = None;
-    let mut hammer_image: Option<alloc::vec::Vec<u8>> = None;
+    // 按需启动的验收进程直接借用启动包的只读映像，避免复制 ELF 到 init 堆。
+    let mut target_image: Option<&'static [u8]> = None;
+    let mut hammer_image: Option<&'static [u8]> = None;
+    let mut test_fal_image: Option<&'static [u8]> = None;
+    let mut fs_second_image: Option<&'static [u8]> = None;
+    let mut fs_second_scope = None;
+    let mut primary_provider = None;
+    let mut registry_root_watch = None;
     let result = tar::walk(env::startup_payload(), |entry| {
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
             return;
         }
         if entry.name == "bin/test_hammer" {
             // 竞态锤不是常驻服务：只留存映像，由剧本按需 spawn。
-            hammer_image = Some(alloc::vec::Vec::from(entry.data));
+            hammer_image = Some(entry.data);
             return;
         }
         let required = required_image(entry.name);
@@ -333,6 +357,10 @@ fn launch_test_services(
             return;
         }
         if stage_failure.is_some() {
+            return;
+        }
+        if entry.name == "bin/test_fal" {
+            test_fal_image = Some(entry.data);
             return;
         }
         let pm_grants = [
@@ -358,18 +386,8 @@ fn launch_test_services(
                 handle: fs_route.owner,
                 rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
             },
-        ];
-        let fs_grants_second = [
             HandleGrant {
-                handle: fs_bootstrap_second.peer,
-                rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-            },
-            HandleGrant {
-                handle: fs_release_second.owner,
-                rights: Rights::READ | Rights::WAIT,
-            },
-            HandleGrant {
-                handle: fs_route_second.owner,
+                handle: fs_registration,
                 rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
             },
         ];
@@ -409,6 +427,7 @@ fn launch_test_services(
             root.transferred(fs_bootstrap.peer);
             root.transferred(fs_release.owner);
             root.transferred(fs_route.owner);
+            root.transferred(fs_registration);
         }
         match spawned {
             Ok(process) => {
@@ -419,7 +438,7 @@ fn launch_test_services(
                 names.register_process(process.pid, entry.name);
                 // 持久 init 保留 control：监督、等待与收束的 authority 源。
                 if entry.name == "bin/test_target" {
-                    target_image = Some(alloc::vec::Vec::from(entry.data));
+                    target_image = Some(entry.data);
                     // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
                     // acceptance Job 枚举可见 test_target 的 pid，派生 MANAGE
                     // control 后 kill——保留 control 在派生接管后关闭。
@@ -455,39 +474,53 @@ fn launch_test_services(
                         pid: process.pid,
                         control: process.control,
                     });
-                    if root.reserve_process().is_err() {
-                        stage_failure = Some("second fs supervision admission failed");
-                        return;
-                    }
-                    let second = spawn(SpawnRequest {
-                        memory_pool: root_memory_pool(),
-                        job: services,
-                        image: entry.data,
-                        payload: &[],
-                        grants: &fs_grants_second,
-                        control_rights,
-                    });
-                    if second.is_ok()
-                        || matches!(&second, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed)
-                    {
-                        root.transferred(fs_bootstrap_second.peer);
-                        root.transferred(fs_release_second.owner);
-                        root.transferred(fs_route_second.owner);
-                    }
-                    match second {
-                        Ok(second) => {
-                            debug!("second fs provider started as pid {}", second.pid);
-                            names.register_process(second.pid, "bin/srv_fs@second");
-                            root.track_process(Supervised {
-                                pid: second.pid,
-                                control: second.control,
-                            });
+                    let prepared = (|| -> Result<_, &'static str> {
+                        let primary = accept_fs_provider(
+                            fs_bootstrap.owner,
+                            fs_release.peer,
+                            fs_route.peer,
+                            true,
+                        )?;
+                        if primary.pid != process.pid {
+                            return Err("primary provider bootstrap sender mismatch");
                         }
+                        let directory = primary
+                            .directory
+                            .as_ref()
+                            .ok_or("primary provider omitted service directory")?;
+                        let deadline = rinlib::time::timeout_millis(10_000)
+                            .map_err(|_| "registration bootstrap deadline invalid")?;
+                        let watch = FalClient::new()
+                            .subscribe(
+                                directory,
+                                "",
+                                protocol::WatchMask::CREATE | protocol::WatchMask::DELETE,
+                                deadline,
+                            )
+                            .map_err(|_| "service directory root subscription failed")?;
+                        let authority = primary
+                            .registration_root
+                            .as_ref()
+                            .ok_or("primary provider omitted registration authority")?;
+                        let scoped =
+                            service_client::delegate_name(authority, "fs.secondary", deadline)
+                                .map_err(|_| "fs name authority delegation failed")?;
+                        let scope_handle = root
+                            .own_sender(scoped)
+                            .map_err(|_| "fs name authority ownership admission failed")?;
+                        Ok((primary, watch, scope_handle))
+                    })();
+                    let (primary, watch, scope_handle) = match prepared {
+                        Ok(prepared) => prepared,
                         Err(error) => {
-                            debug!("required second fs provider spawn failed: {:?}", error);
-                            stage_failure = Some("required second fs provider spawn failed");
+                            stage_failure = Some(error);
+                            return;
                         }
-                    }
+                    };
+                    primary_provider = Some(primary);
+                    registry_root_watch = Some(watch);
+                    fs_second_scope = Some(scope_handle);
+                    fs_second_image = Some(entry.data);
                 } else {
                     root.track_process(Supervised {
                         pid: process.pid,
@@ -539,22 +572,272 @@ fn launch_test_services(
         manifest.started()
     );
     Ok(LaunchedServices {
+        first_fs: primary_provider.ok_or("primary provider bootstrap incomplete")?,
+        registry_root_watch: registry_root_watch.ok_or("service discovery watch missing")?,
         pm_mailbox: pm_mailbox.peer,
-        fs_bootstrap: fs_bootstrap.owner,
-        fs_release: fs_release.peer,
-        fs_route: fs_route.peer,
         fs_bootstrap_second: fs_bootstrap_second.owner,
         fs_release_second: fs_release_second.peer,
         fs_route_second: fs_route_second.peer,
+        fs_bootstrap_second_sender: fs_bootstrap_second.peer,
+        fs_release_second_owner: fs_release_second.owner,
+        fs_route_second_owner: fs_route_second.owner,
+        fs_second_scope: fs_second_scope.ok_or("second fs name scope missing")?,
+        fs_second_image: fs_second_image.ok_or("second fs image missing")?,
+        test_fal_image: test_fal_image.ok_or("FAL consumer image missing")?,
         target_image,
         hammer_image,
     })
 }
 
+fn launch_secondary_fs(
+    root: &mut RootSupervisor,
+    services: Handle,
+    names: &mut TopologyNames,
+    image: &'static [u8],
+    grants: [Handle; 4],
+) -> Result<(), &'static str> {
+    let [bootstrap, release, route, scope] = grants;
+    let grants = [
+        HandleGrant {
+            handle: bootstrap,
+            rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        },
+        HandleGrant {
+            handle: release,
+            rights: Rights::READ | Rights::WAIT,
+        },
+        HandleGrant {
+            handle: route,
+            rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
+        },
+        HandleGrant {
+            handle: scope,
+            rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+        },
+    ];
+    root.reserve_process()
+        .map_err(|_| "second fs supervision admission failed")?;
+    let spawned = spawn(SpawnRequest {
+        memory_pool: root_memory_pool(),
+        job: services,
+        image,
+        payload: &[],
+        grants: &grants,
+        control_rights: SUPERVISOR_RIGHTS,
+    });
+    if spawned.is_ok()
+        || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed)
+    {
+        for grant in grants {
+            root.transferred(grant.handle);
+        }
+    }
+    let second = spawned.map_err(|error| {
+        debug!("required second fs provider spawn failed: {:?}", error);
+        "required second fs provider spawn failed"
+    })?;
+    debug!("second fs provider started as pid {}", second.pid);
+    names.register_process(second.pid, "bin/srv_fs@second");
+    root.track_process(Supervised {
+        pid: second.pid,
+        control: second.control,
+    });
+    Ok(())
+}
+
+struct FalConsumerCoordinator {
+    pid: u64,
+    control: Handle,
+    report_owner: Handle,
+    command_signaler: Handle,
+}
+
+impl FalConsumerCoordinator {
+    fn await_report(&self, expected: u64) -> Result<(), &'static str> {
+        let deadline = rinlib::time::timeout_millis(120_000)
+            .map_err(|_| "FAL consumer phase deadline invalid")?;
+        let mut terminal = None;
+        loop {
+            let bits = match notification::take(self.report_owner, u64::MAX) {
+                Ok(bits) => bits,
+                Err(SystemCallError::ObjectNotAvailable) => 0,
+                Err(_) => return Err("FAL consumer phase report take failed"),
+            };
+            if bits != 0 {
+                if bits == expected {
+                    return Ok(());
+                }
+                return Err("FAL consumer phase report out of order");
+            }
+            if let Some(reason) = terminal {
+                return Err(reason);
+            }
+            let result = rinlib::ipc::wait::wait_until(
+                &[
+                    WaitItem::new(
+                        self.report_owner,
+                        ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                        1,
+                    ),
+                    WaitItem::new(
+                        self.control,
+                        ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                        2,
+                    ),
+                ],
+                deadline,
+            )
+            .map_err(|_| "FAL consumer phase wait failed")?;
+            if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
+                terminal = Some("FAL consumer phase timed out");
+            } else if result.item_index == 1 {
+                terminal = Some("FAL consumer exited before phase report");
+            } else if result.observed.intersects(ObjectSignals::CLOSED) {
+                terminal = Some("FAL consumer phase channel closed");
+            } else if WaitReason::from_u32(result.reason) != Some(WaitReason::Signaled) {
+                terminal = Some("FAL consumer phase wait cancelled");
+            }
+        }
+    }
+
+    fn continue_business(&self) -> Result<(), &'static str> {
+        notification::signal(self.command_signaler, test_fal::command::CONTINUE)
+            .map_err(|_| "FAL consumer continuation signal failed")
+    }
+
+    fn observe_shutdown(&self) -> Result<(), &'static str> {
+        notification::signal(self.command_signaler, test_fal::command::OBSERVE_SHUTDOWN)
+            .map_err(|_| "FAL consumer shutdown signal failed")
+    }
+
+    fn finish(self, root: &mut RootSupervisor) -> Result<(), &'static str> {
+        let deadline = rinlib::time::timeout_millis(120_000)
+            .map_err(|_| "FAL consumer exit deadline invalid")?;
+        let result = rinlib::ipc::wait::wait_until(
+            &[WaitItem::new(
+                self.control,
+                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                1,
+            )],
+            deadline,
+        )
+        .map_err(|_| "FAL consumer exit wait failed")?;
+        if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
+            return Err("FAL consumer exit timed out");
+        }
+        let exit = process::query(self.control).map_err(|_| "FAL consumer exit query failed")?;
+        if exit.reason != ProcessExitReason::Exited as u32 || exit.code != 0 {
+            return Err("FAL consumer exited without successful result");
+        }
+        root.collect_process(self.pid)?;
+        root.close_control(self.report_owner)?;
+        root.close_control(self.command_signaler)?;
+        Ok(())
+    }
+}
+
+fn launch_fal_consumer(
+    root: &mut RootSupervisor,
+    services: Handle,
+    names: &mut TopologyNames,
+    image: &'static [u8],
+    primary: &AcceptedFsProvider,
+) -> Result<FalConsumerCoordinator, &'static str> {
+    let root_grant = primary
+        .grant
+        .as_ref()
+        .ok_or("FAL consumer primary grant missing")?;
+    let directory = primary
+        .directory
+        .as_ref()
+        .ok_or("FAL consumer service directory missing")?;
+    let root_rights = root_grant
+        .description()
+        .map_err(|_| "FAL consumer primary rights query failed")?
+        .rights;
+    let directory_rights = directory
+        .description()
+        .map_err(|_| "FAL consumer directory rights query failed")?
+        .rights;
+    let primary_child_rights = root_rights & !Rights::GRANT;
+    let directory_child_rights = directory_rights & !Rights::GRANT;
+    root.reserve_process()
+        .map_err(|_| "FAL consumer supervision admission failed")?;
+    let primary_copy = root
+        .duplicate(root_grant.as_handle(), root_rights)
+        .map_err(|_| "FAL consumer primary grant duplicate failed")?;
+    let directory_copy = root
+        .duplicate(directory.as_handle(), directory_rights)
+        .map_err(|_| "FAL consumer directory grant duplicate failed")?;
+    let command = root
+        .create_notification(
+            Rights::READ | Rights::WAIT | Rights::GRANT,
+            Rights::SIGNAL | Rights::GRANT,
+        )
+        .map_err(|_| "FAL consumer command channel create failed")?;
+    let report = root
+        .create_notification(
+            Rights::READ | Rights::WAIT | Rights::GRANT,
+            Rights::SIGNAL | Rights::GRANT,
+        )
+        .map_err(|_| "FAL consumer report channel create failed")?;
+    let grants = [
+        HandleGrant {
+            handle: primary_copy,
+            rights: primary_child_rights,
+        },
+        HandleGrant {
+            handle: directory_copy,
+            rights: directory_child_rights,
+        },
+        HandleGrant {
+            handle: command.owner,
+            rights: Rights::READ | Rights::WAIT,
+        },
+        HandleGrant {
+            handle: report.peer,
+            rights: Rights::SIGNAL,
+        },
+    ];
+    let spawned = spawn(SpawnRequest {
+        memory_pool: root_memory_pool(),
+        job: services,
+        image,
+        payload: &[],
+        grants: &grants,
+        control_rights: SUPERVISOR_RIGHTS,
+    });
+    if spawned.is_ok()
+        || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed)
+    {
+        for grant in grants {
+            root.transferred(grant.handle);
+        }
+    }
+    let consumer = spawned.map_err(|error| {
+        debug!("required FAL consumer spawn failed: {:?}", error);
+        "required FAL consumer spawn failed"
+    })?;
+    names.register_process(consumer.pid, "bin/test_fal");
+    root.track_process(Supervised {
+        pid: consumer.pid,
+        control: consumer.control,
+    });
+    Ok(FalConsumerCoordinator {
+        pid: consumer.pid,
+        control: consumer.control,
+        report_owner: report.owner,
+        command_signaler: command.peer,
+    })
+}
+
 struct AcceptedFsProvider {
     pid: u64,
-    grant: MailboxSender,
-    sender_identity: u64,
+    grant: Option<MailboxSender>,
+    sender_identity: Option<u64>,
+    mailbox_identity: Option<u64>,
+    directory: Option<MailboxSender>,
+    registration_root: Option<MailboxSender>,
     bootstrap: Handle,
     release: Handle,
     route: Handle,
@@ -564,72 +847,538 @@ fn accept_fs_provider(
     bootstrap: Handle,
     release: Handle,
     route: Handle,
+    expect_root: bool,
 ) -> Result<AcceptedFsProvider, &'static str> {
     let mut published =
-        wait_message(bootstrap).map_err(|_| "fs root grant hand-off receive failed")?;
-    if published.header.kind != protocol::ROOT_GRANT_KIND || published.handles.remaining() != 1 {
-        return Err("fs root grant hand-off layout invalid");
-    }
-    let capability = published
-        .handles
-        .take(0)
-        .map_err(|_| "fs root grant hand-off capability missing")?;
+        wait_message(bootstrap).map_err(|_| "fs provider publication receive failed")?;
     let pid = published.header.sender_pid;
-    let (grant, grant_description) = MailboxSender::from_capability(capability)
-        .map_err(|_| "fs root grant hand-off role invalid")?;
-    let mut client = FalClient::new();
-    let lookup = client
-        .call(
-            &grant,
-            &FalRequest::Lookup { path: "" },
-            rinlib::time::Deadline::INFINITE,
-        )
-        .map_err(|_| "independent FAL2 root lookup failed")?;
-    let (_, FalResponse::Node(info)) =
-        protocol::decode_response(&lookup.payload).map_err(|_| "independent FAL2 reply invalid")?
-    else {
-        return Err("independent FAL2 root lookup shape invalid");
+    let mut grant = None;
+    let mut sender_identity = None;
+    let mut mailbox_identity = None;
+    if published.header.kind == protocol::ROOT_GRANT_KIND {
+        if !expect_root || published.handles.remaining() != 1 {
+            return Err("fs root grant hand-off layout invalid");
+        }
+        let capability = published
+            .handles
+            .take(0)
+            .map_err(|_| "fs root grant hand-off capability missing")?;
+        let (root, description) = MailboxSender::from_capability(capability)
+            .map_err(|_| "fs root grant hand-off role invalid")?;
+        if !description.rights.contains(
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE | Rights::GRANT,
+        ) {
+            return Err("primary fs root transport rights invalid");
+        }
+        let mut client = FalClient::new();
+        let lookup = client
+            .call(
+                &root,
+                &FalRequest::Lookup { path: "" },
+                rinlib::time::Deadline::INFINITE,
+            )
+            .map_err(|_| "independent FAL2 root lookup failed")?;
+        let (_, FalResponse::Node(info)) = protocol::decode_response(&lookup.payload)
+            .map_err(|_| "independent FAL2 reply invalid")?
+        else {
+            return Err("independent FAL2 root lookup shape invalid");
+        };
+        if info.kind != NodeKind::Directory || !info.rights.contains(FalRights::TRAVERSE) {
+            return Err("independent FAL2 root grant metadata invalid");
+        }
+        let child = client
+            .derive(
+                &root,
+                "",
+                FalRights::TRAVERSE | FalRights::ENUMERATE,
+                rinlib::time::Deadline::INFINITE,
+            )
+            .map_err(|_| "independent FAL2 derive failed")?;
+        let child_lookup = client
+            .call(
+                &child,
+                &FalRequest::Lookup { path: "" },
+                rinlib::time::Deadline::INFINITE,
+            )
+            .map_err(|_| "independent FAL2 child lookup failed")?;
+        let (_, FalResponse::Node(child_info)) =
+            protocol::decode_response(&child_lookup.payload)
+                .map_err(|_| "independent FAL2 child reply invalid")?
+        else {
+            return Err("independent FAL2 child lookup shape invalid");
+        };
+        if child_info.rights != (FalRights::TRAVERSE | FalRights::ENUMERATE) {
+            return Err("independent FAL2 child grant attenuation failed");
+        }
+        drop(child);
+        sender_identity = Some(description.object_id);
+        mailbox_identity = Some(description.related_object_id);
+        grant = Some(root);
+        published =
+            wait_message(bootstrap).map_err(|_| "fs provider publication receive failed")?;
+    } else if expect_root {
+        return Err("primary provider omitted root grant");
+    }
+    let directory = if published.header.kind == service_protocol::DIRECTORY_GRANT_KIND {
+        if published.handles.remaining() != 1 {
+            return Err("service directory grant layout invalid");
+        }
+        let capability = published
+            .handles
+            .take(0)
+            .map_err(|_| "service directory grant capability missing")?;
+        let (directory, description) = MailboxSender::from_capability(capability)
+            .map_err(|_| "service directory grant role invalid")?;
+        if !description.rights.contains(
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE | Rights::GRANT,
+        ) {
+            return Err("service directory root transport rights invalid");
+        }
+        published = wait_message(bootstrap).map_err(|_| "fs provider ready receive failed")?;
+        Some(directory)
+    } else {
+        None
     };
-    if info.kind != NodeKind::Directory || !info.rights.contains(FalRights::TRAVERSE) {
-        return Err("independent FAL2 root grant metadata invalid");
-    }
-    let child = client
-        .derive(
-            &grant,
-            "",
-            FalRights::TRAVERSE | FalRights::ENUMERATE,
-            rinlib::time::Deadline::INFINITE,
-        )
-        .map_err(|_| "independent FAL2 derive failed")?;
-    let child_lookup = client
-        .call(
-            &child,
-            &FalRequest::Lookup { path: "" },
-            rinlib::time::Deadline::INFINITE,
-        )
-        .map_err(|_| "independent FAL2 child lookup failed")?;
-    let (_, FalResponse::Node(child_info)) = protocol::decode_response(&child_lookup.payload)
-        .map_err(|_| "independent FAL2 child reply invalid")?
-    else {
-        return Err("independent FAL2 child lookup shape invalid");
+    let registration_root = if expect_root {
+        if directory.is_none()
+            || published.header.kind != service_protocol::AUTHORITY_GRANT_KIND
+            || published.header.sender_pid != pid
+            || published.handles.remaining() != 1
+        {
+            return Err("primary provider registration root layout invalid");
+        }
+        let capability = published
+            .handles
+            .take(0)
+            .map_err(|_| "registration root grant missing")?;
+        let (root, description) = MailboxSender::from_capability(capability)
+            .map_err(|_| "registration root grant role invalid")?;
+        if !description.rights.contains(
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE | Rights::GRANT,
+        ) {
+            return Err("registration root transport rights invalid");
+        }
+        Some(root)
+    } else {
+        if directory.is_some()
+            || published.header.kind != protocol::PROVIDER_READY_KIND
+            || !published.handles.is_empty()
+        {
+            return Err("secondary provider Ready layout invalid");
+        }
+        None
     };
-    if child_info.rights != (FalRights::TRAVERSE | FalRights::ENUMERATE) {
-        return Err("independent FAL2 child grant attenuation failed");
-    }
-    drop(child);
-
-    let ready = wait_message(bootstrap).map_err(|_| "fs provider ready receive failed")?;
-    if ready.header.kind != protocol::PROVIDER_READY_KIND || !ready.handles.is_empty() {
-        return Err("fs provider ready layout invalid");
-    }
     Ok(AcceptedFsProvider {
         pid,
         grant,
-        sender_identity: grant_description.object_id,
+        sender_identity,
+        mailbox_identity,
+        directory,
+        registration_root,
         bootstrap,
         release,
         route,
     })
+}
+
+fn confirm_primary_fs_ready(provider: &AcceptedFsProvider) -> Result<(), &'static str> {
+    let ready =
+        wait_message(provider.bootstrap).map_err(|_| "primary provider Ready receive failed")?;
+    if ready.header.kind != protocol::PROVIDER_READY_KIND
+        || ready.header.sender_pid != provider.pid
+        || !ready.handles.is_empty()
+    {
+        return Err("primary provider Ready layout invalid");
+    }
+    Ok(())
+}
+
+fn discover_registered_fs(
+    directory: &MailboxSender,
+    primary_mailbox: u64,
+    root_watch: &libfal::client::Subscription,
+) -> Result<(MailboxSender, u64, u64, libfal::client::Subscription), &'static str> {
+    let deadline = rinlib::time::Deadline::INFINITE;
+    let mut client = FalClient::new();
+    match root_watch
+        .wait(deadline)
+        .map_err(|_| "service directory publication Watch failed")?
+    {
+        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::CREATE) => {}
+        _ => return Err("service directory omitted Ready publication"),
+    }
+    let watch = client
+        .subscribe(
+            directory,
+            "fs.secondary",
+            protocol::WatchMask::MODIFY | protocol::WatchMask::DELETE,
+            deadline,
+        )
+        .map_err(|_| "service discovery subscribe failed")?;
+    let mut read = client
+        .call(
+            directory,
+            &FalRequest::Read {
+                path: "fs.secondary",
+            },
+            deadline,
+        )
+        .map_err(|_| "service discovery Record read failed")?;
+    let (header, FalResponse::Value(value)) = protocol::decode_response(&read.payload)
+        .map_err(|_| "service discovery Record reply invalid")?
+    else {
+        return Err("service discovery Record reply shape invalid");
+    };
+    if header.status != protocol::Status::Ok || read.handles.remaining() != 1 {
+        return Err("service discovery Record export incomplete");
+    }
+    let record = ServiceRecord::decode(value).map_err(|_| "service discovery Record invalid")?;
+    if record.protocol != protocol::ID || record.version != protocol::VERSION as u32 {
+        return Err("service discovery Record protocol mismatch");
+    }
+    let capability = read
+        .handles
+        .take(0)
+        .map_err(|_| "service discovery derived grant missing")?;
+    let (discovered, description) = MailboxSender::from_capability(capability)
+        .map_err(|_| "service discovery derived grant role invalid")?;
+    if description.related_object_id == primary_mailbox {
+        return Err("service discovery resolved the primary provider");
+    }
+    let lookup = client
+        .call(&discovered, &FalRequest::Lookup { path: "" }, deadline)
+        .map_err(|_| "discovered provider invocation failed")?;
+    let (_, FalResponse::Node(info)) = protocol::decode_response(&lookup.payload)
+        .map_err(|_| "discovered provider reply invalid")?
+    else {
+        return Err("discovered provider reply shape invalid");
+    };
+    if info.kind != NodeKind::Directory || !info.rights.contains(FalRights::TRAVERSE) {
+        return Err("discovered provider root metadata invalid");
+    }
+    debug!("service discovery root-watch-read-derive-call passed");
+    Ok((
+        discovered,
+        description.object_id,
+        description.related_object_id,
+        watch,
+    ))
+}
+
+fn exercise_open_streams(
+    root: &mut RootSupervisor,
+    transport: &mut FalTransport,
+    position: &libfs::resolve::Position<libfs::client::Grant>,
+) -> Result<(), &'static str> {
+    let deadline =
+        rinlib::time::timeout_millis(20_000).map_err(|_| "FAL2 Open session deadline failed")?;
+
+    let payload_len = 16_384;
+    let cancel = transport
+        .open_stream(
+            position,
+            protocol::StreamDirection::Write,
+            9,
+            Some(4),
+            deadline,
+        )
+        .map_err(|_| "FAL2 Open cancel setup failed")?;
+    let info = transport
+        .cancel_stream(&cancel, deadline)
+        .map_err(|_| "FAL2 Open Cancel failed")?;
+    let again = transport
+        .finish_stream(&cancel, deadline)
+        .map_err(|_| "FAL2 Open cancelled Finish failed")?;
+    let queried = transport
+        .query_stream(&cancel, deadline)
+        .map_err(|_| "FAL2 Open cancelled Query failed")?;
+    if info != again
+        || info != queried
+        || info.outcome != protocol::Status::Cancelled
+        || info.reason != protocol::StreamReason::Cancelled
+        || info.accepted != 0
+    {
+        return Err("FAL2 Open Cancel result changed");
+    }
+    cancel
+        .close()
+        .map_err(|_| "FAL2 Open Cancel close failed")?;
+    let invalid = transport.open_stream(
+        position,
+        protocol::StreamDirection::Read,
+        u64::MAX,
+        Some(2),
+        deadline,
+    );
+    if !matches!(
+        invalid,
+        Err(libfs::client::StreamOpenFailure::Call(
+            libfal::client::ClientError::Protocol
+                | libfal::client::ClientError::Status(protocol::Status::Invalid)
+        ))
+    ) {
+        return Err("FAL2 Open overflow was not rejected before publication");
+    }
+    let mut bounded = transport
+        .open_stream(
+            position,
+            protocol::StreamDirection::Write,
+            9,
+            Some(4),
+            deadline,
+        )
+        .map_err(|_| "FAL2 Open bounded write setup failed")?;
+    bounded
+        .write_until(b"ABCDEF", deadline)
+        .map_err(|_| "FAL2 Open bounded write transport failed")?;
+    let _ = bounded.end_write();
+    let info = transport
+        .finish_stream(&bounded, deadline)
+        .map_err(|_| "FAL2 Open bounded write Finish failed")?;
+    if info.outcome != protocol::Status::Invalid
+        || info.accepted != 4
+        || info.transported != 5
+        || info.reason != protocol::StreamReason::Backend
+    {
+        return Err("FAL2 Open bounded write partial result mismatch");
+    }
+    bounded
+        .close()
+        .map_err(|_| "FAL2 Open bounded write close failed")?;
+    let mut abandoned = transport
+        .open_stream(
+            position,
+            protocol::StreamDirection::Read,
+            3,
+            Some(6),
+            deadline,
+        )
+        .map_err(|_| "FAL2 Open abandoned data setup failed")?;
+    abandoned
+        .close_data()
+        .map_err(|_| "FAL2 Open abandoned data close failed")?;
+    let info = transport
+        .finish_stream(&abandoned, deadline)
+        .map_err(|_| "FAL2 Open abandoned data Finish failed")?;
+    if info.outcome != protocol::Status::Cancelled
+        || info.reason != protocol::StreamReason::PeerClosed
+        || info.accepted > info.transported
+    {
+        return Err("FAL2 Open peer close reported success");
+    }
+    abandoned
+        .close()
+        .map_err(|_| "FAL2 Open abandoned control close failed")?;
+    let mut progress = transport
+        .open_stream(
+            position,
+            protocol::StreamDirection::Read,
+            9,
+            Some(payload_len),
+            deadline,
+        )
+        .map_err(|_| "FAL2 Open read progress setup failed")?;
+    let mut consumed = [0; 4096];
+    if transport
+        .read_stream_until(&mut progress, &mut consumed, deadline)
+        .map_err(|_| "FAL2 Open read progress transport failed")?
+        != consumed.len()
+    {
+        return Err("FAL2 Open read progress short read");
+    }
+    let partial = transport
+        .cancel_stream(&progress, deadline)
+        .map_err(|_| "FAL2 Open read progress Cancel failed")?;
+    if partial.outcome != protocol::Status::Cancelled
+        || partial.accepted != consumed.len() as u64
+        || partial.transported < partial.accepted
+    {
+        return Err("FAL2 Open read Cancel lost consumed progress");
+    }
+    progress
+        .close()
+        .map_err(|_| "FAL2 Open read progress close failed")?;
+    let waiting = transport
+        .open_stream(
+            position,
+            protocol::StreamDirection::Write,
+            9,
+            None,
+            deadline,
+        )
+        .map_err(|_| "FAL2 Open concurrent Finish setup failed")?;
+    let retried = FalClient::new()
+        .call(
+            waiting
+                .control_sender()
+                .ok_or("FAL2 duplicate Start control owner missing")?,
+            &FalRequest::Start,
+            deadline,
+        )
+        .map_err(|_| "FAL2 duplicate Start failed")?;
+    if !matches!(
+        protocol::decode_response(&retried.payload),
+        Ok((
+            _,
+            FalResponse::StreamInfo(protocol::StreamInfo {
+                state: protocol::StreamState::Active,
+                ..
+            })
+        ))
+    ) {
+        return Err("FAL2 duplicate Start changed state");
+    }
+    let reply_mailbox = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        )
+        .map_err(|_| "FAL2 Open concurrent Finish reply mailbox failed")?;
+    let txid = 0x4653_5452_4649_4e49;
+    send_raw_fal_request(
+        waiting
+            .control_sender()
+            .ok_or("FAL2 Open control owner missing")?,
+        root.sender(reply_mailbox.peer),
+        &FalRequest::FinishStream,
+        txid,
+        deadline,
+    )
+    .map_err(|_| "FAL2 Open blocked Finish send failed")?;
+    rinlib::time::sleep_until(
+        rinlib::time::timeout_millis(20)
+            .map_err(|_| "FAL2 Open blocked Finish settle deadline failed")?,
+    )
+    .map_err(|_| "FAL2 Open blocked Finish settle failed")?;
+    if !matches!(
+        receive(reply_mailbox.owner),
+        Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy)
+    ) {
+        return Err("FAL2 Open Finish replied before the stream ended");
+    }
+    let cancelled = transport
+        .cancel_stream(&waiting, deadline)
+        .map_err(|_| "FAL2 Open concurrent Cancel failed")?;
+    let reply = rinlib::ipc::message::wait_message_until(reply_mailbox.owner, deadline)
+        .map_err(|_| "FAL2 Open blocked Finish did not wake")?;
+    let prefix =
+        RpcPrefix::decode(&reply.payload).map_err(|_| "FAL2 Open blocked Finish prefix invalid")?;
+    let (header, FalResponse::StreamInfo(finished)) =
+        protocol::decode_response(&reply.payload[librpc::PREFIX_LEN..])
+            .map_err(|_| "FAL2 Open blocked Finish reply invalid")?
+    else {
+        return Err("FAL2 Open blocked Finish reply shape invalid");
+    };
+    if prefix.kind != RpcMessageKind::Response
+        || prefix.txid != txid
+        || header.status != protocol::Status::Ok
+        || cancelled != finished
+        || cancelled.outcome != protocol::Status::Cancelled
+    {
+        return Err("FAL2 Open blocked Finish diverged from Cancel");
+    }
+    root.close_control(reply_mailbox.peer)?;
+    root.close_control(reply_mailbox.owner)?;
+    waiting
+        .close()
+        .map_err(|_| "FAL2 Open concurrent control close failed")?;
+    debug!(
+        "FAL2 Open control and terminal cases passed after {} bytes",
+        payload_len
+    );
+    Ok(())
+}
+
+fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static str> {
+    let deadline =
+        rinlib::time::timeout_millis(5_000).map_err(|_| "FAL2 cancellable RPC deadline failed")?;
+    let event = notification::create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE,
+        Rights::SIGNAL | Rights::TRANSIT,
+    )
+    .map_err(|_| "FAL2 cancellable RPC Notification failed")?;
+    // SAFETY: NotificationCreate 已移交该唯一的读端 owner。
+    let cancel = unsafe { Capability::from_raw(event.owner) };
+    notification::signal(event.peer, 1).map_err(|_| "FAL2 cancellable RPC signal failed")?;
+    let blocked = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        )
+        .map_err(|_| "FAL2 cancellable RPC blocked mailbox failed")?;
+    for index in 0..MAILBOX_CAPACITY {
+        root.sender(blocked.peer)
+            .send(0x4341_4e43_454c_0000 + index as u64, &[])
+            .map_err(|_| "FAL2 cancellable RPC mailbox fill failed")?;
+    }
+    let mut caller = librpc::Caller::new();
+    let request = librpc::Request::new(protocol::ID, b"cancel")
+        .map_err(|_| "FAL2 cancellable RPC first request failed")?;
+    let first = caller.call_cancelable(
+        root.sender(blocked.peer),
+        deadline,
+        request,
+        Some(cancel.as_handle()),
+    );
+    let Err(mut first) = first else {
+        return Err("FAL2 cancellable RPC did not return unsent owner");
+    };
+    if first.phase != librpc::CallPhase::Unsent
+        || first.cause != librpc::CallCause::Cancelled
+        || !first.has_unretired_owners()
+    {
+        return Err("FAL2 cancellable RPC unsent phase invalid");
+    }
+    drop(
+        first
+            .take_unsent_request()
+            .ok_or("FAL2 cancellable RPC request missing")?,
+    );
+    if first.has_unretired_owners() {
+        return Err("FAL2 cancellable RPC request owner not released");
+    }
+    root.close_control(blocked.owner)?;
+    root.close_control(blocked.peer)?;
+
+    let sent = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        )
+        .map_err(|_| "FAL2 cancellable RPC sent mailbox failed")?;
+    let request = librpc::Request::new(protocol::ID, b"cancel")
+        .map_err(|_| "FAL2 cancellable RPC second request failed")?;
+    let second = caller.call_cancelable(
+        root.sender(sent.peer),
+        deadline,
+        request,
+        Some(cancel.as_handle()),
+    );
+    let Err(mut second) = second else {
+        return Err("FAL2 cancellable RPC did not preserve sent uncertainty");
+    };
+    if second.phase != librpc::CallPhase::Sent
+        || second.cause != librpc::CallCause::Cancelled
+        || !second.has_unretired_owners()
+    {
+        return Err("FAL2 cancellable RPC sent phase invalid");
+    }
+    second
+        .retry_cleanup()
+        .map_err(|_| "FAL2 cancellable RPC reply owner close failed")?;
+    if second.has_unretired_owners() {
+        return Err("FAL2 cancellable RPC reply owner not released");
+    }
+    root.close_control(sent.owner)?;
+    root.close_control(sent.peer)?;
+    cancel
+        .close()
+        .map_err(|_| "FAL2 cancellable RPC owner close failed")?;
+    // SAFETY: 本函数仍独占 Notification 的信号端点。
+    unsafe { rinlib::ipc::object::close(event.peer) }
+        .map_err(|_| "FAL2 cancellable RPC peer close failed")?;
+    debug!("FAL2 cancellable RPC phases passed");
+    Ok(())
 }
 
 fn fal_call(
@@ -677,23 +1426,10 @@ fn fal_mailbox_handle(mode: ExportMode) -> Result<alloc::vec::Vec<u8>, &'static 
     Ok(bytes)
 }
 
-fn exercise_fs_provider(
-    root: &mut RootSupervisor,
-    grant: &MailboxSender,
-) -> Result<(), &'static str> {
+fn exercise_fs_provider(grant: &MailboxSender) -> Result<(), &'static str> {
     let deadline = rinlib::time::Deadline::INFINITE;
     let mut client = FalClient::new();
-    let root_watch = client
-        .subscribe(
-            grant,
-            "",
-            protocol::WatchMask::CREATE | protocol::WatchMask::DELETE | protocol::WatchMask::RENAME,
-            deadline,
-        )
-        .map_err(|_| "FAL2 root Watch subscription failed")?;
-    let root_generation = root_watch.info().generation;
     let initial = fal_blob(b"initial")?;
-    let updated = fal_blob(b"updated")?;
     let leaf_value = fal_blob(b"leaf")?;
     let delete_value = fal_blob(b"delete")?;
 
@@ -712,122 +1448,6 @@ fn exercise_fs_provider(
     else {
         return Err("FAL2 property create shape invalid");
     };
-    match root_watch
-        .wait(deadline)
-        .map_err(|_| "FAL2 root Watch wait failed")?
-    {
-        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::CREATE) => {}
-        _ => return Err("FAL2 root Watch omitted Create"),
-    }
-    let root_watch_info = client
-        .query_subscription(&root_watch, deadline)
-        .map_err(|_| "FAL2 root Watch query failed")?;
-    if root_watch_info.generation <= root_generation
-        || root_watch_info.reason != protocol::WatchReason::Active
-    {
-        return Err("FAL2 root Watch generation did not advance");
-    }
-    let foreign_watch_context = client
-        .derive(grant, "", FalRights::TRAVERSE | FalRights::WATCH, deadline)
-        .map_err(|_| "FAL2 Watch foreign context derive failed")?;
-    if !matches!(
-        client.call(
-            &foreign_watch_context,
-            &FalRequest::QuerySubscription {
-                id: root_watch.info().id,
-            },
-            deadline,
-        ),
-        Err(libfal::client::ClientError::Status(
-            protocol::Status::Permission
-        ))
-    ) {
-        return Err("FAL2 Watch accepted a foreign subscription context");
-    }
-    drop(foreign_watch_context);
-    client
-        .unsubscribe(&root_watch, deadline)
-        .map_err(|_| "FAL2 root Watch cancellation failed")?;
-    let property_watch = client
-        .subscribe(
-            grant,
-            "probe-property",
-            protocol::WatchMask::MODIFY,
-            deadline,
-        )
-        .map_err(|_| "FAL2 property Watch subscription failed")?;
-    let property_generation = property_watch.info().generation;
-    let read = fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Read {
-            path: "probe-property",
-        },
-    )?;
-    let (_, FalResponse::Value(value)) =
-        protocol::decode_response(&read.payload).map_err(|_| "FAL2 property read reply invalid")?
-    else {
-        return Err("FAL2 property read shape invalid");
-    };
-    if value != initial {
-        return Err("FAL2 property initial value mismatch");
-    }
-    fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Write {
-            path: "probe-property",
-            value: &updated,
-        },
-    )?;
-    match property_watch
-        .wait(deadline)
-        .map_err(|_| "FAL2 property Watch wait failed")?
-    {
-        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::MODIFY) => {}
-        _ => return Err("FAL2 property Watch omitted Modify"),
-    }
-    let property_watch_info = client
-        .query_subscription(&property_watch, deadline)
-        .map_err(|_| "FAL2 property Watch query failed")?;
-    if property_watch_info.generation <= property_generation
-        || property_watch_info.reason != protocol::WatchReason::Active
-    {
-        return Err("FAL2 property Watch generation did not advance");
-    }
-    drop(property_watch);
-    client
-        .copy_property(
-            grant,
-            "probe-property",
-            grant,
-            "probe-property-copy",
-            FalRights::READ_PROPERTY,
-            deadline,
-        )
-        .map_err(|_| "FAL2 property copy failed")?;
-    if !matches!(
-        root_watch.wait(rinlib::time::Deadline::at(0)),
-        Err(SystemCallError::DeadlineExpired)
-    ) {
-        return Err("FAL2 cancelled Watch received a later event");
-    }
-    drop(root_watch);
-    let copied = fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Read {
-            path: "probe-property-copy",
-        },
-    )?;
-    let (_, FalResponse::Value(copied)) = protocol::decode_response(&copied.payload)
-        .map_err(|_| "FAL2 copied property reply invalid")?
-    else {
-        return Err("FAL2 copied property shape invalid");
-    };
-    if copied != updated {
-        return Err("FAL2 copied property value mismatch");
-    }
 
     let repeatable_handle = fal_mailbox_handle(ExportMode::Repeatable)?;
     let repeatable_rights = Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT;
@@ -845,23 +1465,6 @@ fn exercise_fs_provider(
             deadline,
         )
         .map_err(|_| "FAL2 repeatable handle property create failed")?;
-    for _ in 0..2 {
-        let mut repeated = fal_call(
-            &mut client,
-            grant,
-            &FalRequest::Read {
-                path: "probe-repeatable-handle",
-            },
-        )?;
-        let capability = repeated
-            .handles
-            .take(0)
-            .map_err(|_| "FAL2 repeatable handle reply missing")?;
-        let (sender, _) = MailboxSender::from_capability(capability)
-            .map_err(|_| "FAL2 repeatable handle role invalid")?;
-        drop(sender);
-    }
-
     let affine_handle = fal_mailbox_handle(ExportMode::Affine)?;
     let handle_property = client
         .call_with_target(
@@ -884,67 +1487,13 @@ fn exercise_fs_provider(
     ) {
         return Err("FAL2 affine handle property shape invalid");
     }
-    let abandoned_take = root
-        .create_mailbox(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
-        )
-        .map_err(|_| "FAL2 affine take rollback mailbox creation failed")?;
-    send_raw_fal_request(
-        grant,
-        root.sender(abandoned_take.peer),
-        &FalRequest::Take {
-            path: "probe-affine-handle",
-        },
-        0x5441_4b45_524f_4c4c,
-    )?;
-    root.close_control(abandoned_take.owner)?;
-    let mut taken = None;
-    for _ in 0..32 {
-        match client.take(grant, "probe-affine-handle", deadline) {
-            Ok(reply) => {
-                taken = Some(reply);
-                break;
-            }
-            Err(libfal::client::ClientError::Status(protocol::Status::Busy)) => {}
-            Err(_) => return Err("FAL2 affine handle take failed"),
-        }
-    }
-    let mut taken = taken.ok_or("FAL2 affine handle was not restored after abandoned reply")?;
-    root.close_control(abandoned_take.peer)?;
-    let capability = taken
-        .handles
-        .take(0)
-        .map_err(|_| "FAL2 affine handle take reply missing")?;
-    let (sender, _) = MailboxSender::from_capability(capability)
-        .map_err(|_| "FAL2 affine handle take role invalid")?;
-    drop(sender);
-    let empty = fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Read {
-            path: "probe-affine-handle",
-        },
-    )?;
-    if !empty.handles.is_empty() {
-        return Err("FAL2 affine handle remained after take");
-    }
-    let (_, FalResponse::Value(empty_value)) =
-        protocol::decode_response(&empty.payload).map_err(|_| "FAL2 affine empty reply invalid")?
-    else {
-        return Err("FAL2 affine empty reply shape invalid");
-    };
-    if empty_value != fal_blob(b"")? {
-        return Err("FAL2 affine property was not emptied");
-    }
-
     fal_call(
         &mut client,
         grant,
         &FalRequest::Create {
             name: "probe-stream",
             kind: NodeKind::Stream,
-            rights: FalRights::READ_STREAM | FalRights::WRITE_STREAM,
+            rights: FalRights::READ_STREAM | FalRights::WRITE_STREAM | FalRights::WATCH,
             value: &[],
         },
     )?;
@@ -965,23 +1514,27 @@ fn exercise_fs_provider(
     if count != 6 {
         return Err("FAL2 stream write count mismatch");
     }
-    let read = fal_call(
+
+    fal_call(
         &mut client,
         grant,
-        &FalRequest::ReadAt {
-            path: "probe-stream",
-            offset: 3,
-            count: 6,
+        &FalRequest::Create {
+            name: "move-source",
+            kind: NodeKind::Property,
+            rights: FalRights::READ_PROPERTY,
+            value: &delete_value,
         },
     )?;
-    let (_, FalResponse::Value(value)) =
-        protocol::decode_response(&read.payload).map_err(|_| "FAL2 stream read reply invalid")?
-    else {
-        return Err("FAL2 stream read shape invalid");
-    };
-    if value != b"stream" {
-        return Err("FAL2 stream value mismatch");
-    }
+    fal_call(
+        &mut client,
+        grant,
+        &FalRequest::Create {
+            name: "move-target",
+            kind: NodeKind::Directory,
+            rights: FalRights::ALL,
+            value: &[],
+        },
+    )?;
 
     fal_call(
         &mut client,
@@ -1028,167 +1581,7 @@ fn exercise_fs_provider(
             rights: FalRights::TRAVERSE,
         },
     )?;
-    let enumeration = fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Enumerate {
-            path: "",
-            cursor: 0,
-            limit: 1024,
-        },
-    )?;
-    let (_, FalResponse::Entries(entries)) = protocol::decode_response(&enumeration.payload)
-        .map_err(|_| "FAL2 enumeration reply invalid")?
-    else {
-        return Err("FAL2 enumeration shape invalid");
-    };
-    let mut saw_directory = false;
-    let mut saw_link = false;
-    for entry in entries.iter() {
-        let entry = entry.map_err(|_| "FAL2 enumeration entry invalid")?;
-        saw_directory |= entry.name == "f2-dir" && entry.info.kind == NodeKind::Directory;
-        saw_link |= entry.name == "f2-link" && entry.info.kind == NodeKind::SymbolicLink;
-    }
-    if !saw_directory || !saw_link {
-        return Err("FAL2 enumeration omitted created entries");
-    }
 
-    let delete = fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Create {
-            name: "probe-delete",
-            kind: NodeKind::Property,
-            rights: FalRights::READ_PROPERTY | FalRights::WATCH,
-            value: &delete_value,
-        },
-    )?;
-    let (_, FalResponse::Node(delete)) = protocol::decode_response(&delete.payload)
-        .map_err(|_| "FAL2 delete target reply invalid")?
-    else {
-        return Err("FAL2 delete target shape invalid");
-    };
-    let delete_watch = client
-        .subscribe(grant, "probe-delete", protocol::WatchMask::DELETE, deadline)
-        .map_err(|_| "FAL2 delete Watch subscription failed")?;
-    fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Delete {
-            name: "probe-delete",
-            expected: protocol::Expected {
-                identity: delete.identity,
-                version: delete.version,
-            },
-        },
-    )?;
-    match delete_watch
-        .wait(deadline)
-        .map_err(|_| "FAL2 delete Watch wait failed")?
-    {
-        SubscriptionEvent::Events(events)
-            if events.contains(protocol::WatchMask::DELETE)
-                && events.contains(protocol::WatchMask::TERMINATED) => {}
-        _ => return Err("FAL2 delete Watch omitted Delete or Terminated"),
-    }
-    let delete_watch_info = client
-        .query_subscription(&delete_watch, deadline)
-        .map_err(|_| "FAL2 delete Watch query failed")?;
-    if delete_watch_info.reason != protocol::WatchReason::NodeDeleted
-        || delete_watch_info.generation <= delete.version
-    {
-        return Err("FAL2 delete Watch terminal state invalid");
-    }
-    client
-        .unsubscribe(&delete_watch, deadline)
-        .map_err(|_| "FAL2 delete Watch cancellation failed")?;
-    drop(delete_watch);
-    if !fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Lookup {
-            path: "probe-delete",
-        },
-    )
-    .is_err()
-    {
-        return Err("FAL2 delete target remained visible");
-    }
-
-    let move_source = fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Create {
-            name: "move-source",
-            kind: NodeKind::Property,
-            rights: FalRights::READ_PROPERTY,
-            value: &delete_value,
-        },
-    )?;
-    let (_, FalResponse::Node(move_source)) = protocol::decode_response(&move_source.payload)
-        .map_err(|_| "FAL2 move source reply invalid")?
-    else {
-        return Err("FAL2 move source shape invalid");
-    };
-    fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Create {
-            name: "move-target",
-            kind: NodeKind::Directory,
-            rights: FalRights::ALL,
-            value: &[],
-        },
-    )?;
-    let move_target = client
-        .derive(
-            grant,
-            "move-target",
-            FalRights::TRAVERSE | FalRights::CREATE | FalRights::ENUMERATE,
-            deadline,
-        )
-        .map_err(|_| "FAL2 move destination derive failed")?;
-    client
-        .move_entry(
-            grant,
-            &move_target,
-            libfal::client::MoveEntry {
-                source_parent: "",
-                source_name: "move-source",
-                destination_name: "moved",
-                expected: protocol::Expected {
-                    identity: move_source.identity,
-                    version: move_source.version,
-                },
-            },
-            deadline,
-        )
-        .map_err(|_| "FAL2 same-provider move failed")?;
-    if !fal_call(
-        &mut client,
-        grant,
-        &FalRequest::Lookup {
-            path: "move-source",
-        },
-    )
-    .is_err()
-    {
-        return Err("FAL2 moved source remained visible");
-    }
-    let moved = fal_call(
-        &mut client,
-        &move_target,
-        &FalRequest::Lookup { path: "moved" },
-    )?;
-    if !matches!(
-        protocol::decode_response(&moved.payload)
-            .map_err(|_| "FAL2 moved target reply invalid")?
-            .1,
-        FalResponse::Node(_)
-    ) {
-        return Err("FAL2 moved target shape invalid");
-    }
-    drop(move_target);
     if property.kind != NodeKind::Property {
         return Err("FAL2 property metadata invalid");
     }
@@ -1247,14 +1640,15 @@ fn send_raw_fal_request(
     reply_sender: &MailboxSender,
     request: &FalRequest<'_>,
     txid: u64,
-) -> Result<(), &'static str> {
+    send_deadline: Deadline,
+) -> Result<(), SystemCallError> {
     let capacity = protocol::HEADER_LEN
         .checked_add(
             request
                 .encoded_len()
-                .ok_or("raw FAL2 request length invalid")?,
+                .ok_or(SystemCallError::IllegalArgument)?,
         )
-        .ok_or("raw FAL2 request length overflow")?;
+        .ok_or(SystemCallError::IllegalArgument)?;
     let mut payload = alloc::vec![0; librpc::PREFIX_LEN + capacity];
     RpcPrefix::new(RpcMessageKind::Request, txid).encode(&mut payload);
     let used = protocol::encode_request(
@@ -1262,19 +1656,17 @@ fn send_raw_fal_request(
         rinlib::time::Deadline::INFINITE,
         &mut payload[librpc::PREFIX_LEN..],
     )
-    .ok_or("raw FAL2 request encoding failed")?;
+    .ok_or(SystemCallError::IllegalArgument)?;
     payload.truncate(librpc::PREFIX_LEN + used);
-    let mut packet =
-        Packet::new(protocol::ID, &payload).map_err(|_| "raw FAL2 packet creation failed")?;
+    let mut packet = Packet::new(protocol::ID, &payload)?;
     let reply_rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
-    let reply =
-        send_once(reply_sender, reply_rights).map_err(|_| "raw FAL2 reply-once creation failed")?;
+    let reply = send_once(reply_sender, reply_rights)?;
     packet
         .push_front(reply.into_capability(), reply_rights)
-        .map_err(|_| "raw FAL2 reply attachment failed")?;
+        .map_err(|failure| failure.error)?;
     packet
-        .try_send(grant, rinlib::time::Deadline::INFINITE)
-        .map_err(|_| "raw FAL2 request send failed")
+        .try_send(grant, send_deadline)
+        .map_err(|failure| failure.error)
 }
 
 fn stage_abandoned_reply(
@@ -1303,18 +1695,33 @@ fn stage_abandoned_reply(
             value: &committed,
         },
         0x4142_414e_444f_4e45,
-    )?;
+        Deadline::INFINITE,
+    )
+    .map_err(|_| "FAL2 abandoned request send failed")?;
     root.close_control(reply.peer)?;
     let mut client = FalClient::new();
-    let lookup = client
-        .call(
+    let deadline =
+        rinlib::time::timeout_millis(5_000).map_err(|_| "FAL2 commit probe deadline invalid")?;
+    let lookup = loop {
+        match client.call(
             grant,
             &FalRequest::Lookup {
                 path: "abandoned-create",
             },
-            rinlib::time::Deadline::INFINITE,
-        )
-        .map_err(|_| "FAL2 abandoned request did not commit")?;
+            deadline,
+        ) {
+            Ok(reply) => break reply,
+            Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {
+                if rinlib::time::expired(deadline).map_err(|_| "FAL2 commit probe clock failed")? {
+                    return Err("FAL2 abandoned request did not commit");
+                }
+            }
+            Err(error) => {
+                debug!("FAL2 abandoned commit probe failed: {:?}", error);
+                return Err("FAL2 abandoned request did not commit");
+            }
+        }
+    };
     let (_, FalResponse::Node(info)) =
         protocol::decode_response(&lookup.payload).map_err(|_| "FAL2 commit probe invalid")?
     else {
@@ -1337,6 +1744,172 @@ fn finish_abandoned_reply(root: &mut RootSupervisor, reply: Handle) -> Result<()
         return Err("FAL2 abandoned response was unexpectedly delivered");
     }
     root.close_control(reply)
+}
+
+#[cfg(feature = "acceptance-stress")]
+fn stress_fal2_admission(
+    root: &mut RootSupervisor,
+    grant: &MailboxSender,
+    authority: &MailboxSender,
+) -> Result<(), &'static str> {
+    const REQUESTS: usize = 150;
+    let mut replies = alloc::vec::Vec::new();
+    replies
+        .try_reserve_exact(REQUESTS)
+        .map_err(|_| "FAL2 admission probe reply storage exhausted")?;
+    for index in 0..REQUESTS {
+        let reply = root
+            .create_mailbox(
+                Rights::READ | Rights::WAIT | Rights::MANAGE,
+                Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+            )
+            .map_err(|_| "FAL2 admission probe mailbox creation failed")?;
+        for filler in 0..MAILBOX_CAPACITY {
+            root.sender(reply.peer)
+                .send(0x4641_4c32_5052_4553 + filler as u64, &[])
+                .map_err(|_| "FAL2 admission probe mailbox fill failed")?;
+        }
+        match send_raw_fal_request(
+            grant,
+            root.sender(reply.peer),
+            &FalRequest::Lookup {
+                path: "pressure-missing",
+            },
+            0x5052_4553_5300_0000 + index as u64,
+            rinlib::time::timeout_millis(10_000)
+                .map_err(|_| "FAL2 admission probe send deadline invalid")?,
+        ) {
+            Ok(()) => replies.push(reply),
+            Err(SystemCallError::MailboxFull | SystemCallError::DeadlineExpired) => {
+                debug!("FAL2 admission send backpressure at request {}", index);
+                for _ in 0..MAILBOX_CAPACITY {
+                    discard(reply.owner)
+                        .map_err(|_| "FAL2 admission unsent filler discard failed")?;
+                }
+                root.close_control(reply.peer)?;
+                root.close_control(reply.owner)?;
+                break;
+            }
+            Err(error) => {
+                debug!(
+                    "FAL2 admission raw send failed: index={}, error={:?}",
+                    index, error
+                );
+                return Err("FAL2 admission probe send failed");
+            }
+        }
+        if index % 8 == 7 {
+            rinlib::time::sleep_until(
+                rinlib::time::timeout_millis(100)
+                    .map_err(|_| "FAL2 admission pacing deadline invalid")?,
+            )
+            .map_err(|_| "FAL2 admission pacing failed")?;
+        }
+    }
+    rinlib::time::sleep_until(
+        rinlib::time::timeout_millis(2_000)
+            .map_err(|_| "FAL2 admission probe settling deadline invalid")?,
+    )
+    .map_err(|_| "FAL2 admission probe settle failed")?;
+    let deadline = rinlib::time::timeout_millis(5_000)
+        .map_err(|_| "Registry admission probe deadline invalid")?;
+    let request = service_protocol::Request::QueryName {
+        name: "fs.secondary",
+    };
+    let mut payload = alloc::vec![0; service_protocol::HEADER_LEN
+        + request
+            .encoded_len()
+            .ok_or("Registry admission probe size invalid")?];
+    let used = service_protocol::encode_request(&request, deadline, &mut payload)
+        .ok_or("Registry admission probe encoding failed")?;
+    let rpc = Request::new(service_protocol::ID, &payload[..used])
+        .map_err(|_| "Registry admission probe RPC invalid")?;
+    let reply = Caller::new()
+        .call(authority, deadline, rpc)
+        .map_err(|_| "Registry admission probe call failed")?;
+    let (header, _) = service_protocol::decode_response(&reply.payload)
+        .map_err(|_| "Registry admission probe reply invalid")?;
+    if header.op != service_protocol::Op::QueryName
+        || header.status != service_protocol::Status::Quota
+        || !reply.handles.is_empty()
+    {
+        return Err("Registry admission probe did not reject saturated task pool");
+    }
+    let receive_deadline = rinlib::time::timeout_millis(30_000)
+        .map_err(|_| "FAL2 admission probe receive deadline invalid")?;
+    for reply in &replies {
+        for _ in 0..MAILBOX_CAPACITY {
+            discard(reply.owner).map_err(|_| "FAL2 admission probe filler discard failed")?;
+        }
+    }
+    let mut quota = 0;
+    for (index, mailbox) in replies.into_iter().enumerate() {
+        let reply = rinlib::ipc::message::wait_message_until(mailbox.owner, receive_deadline)
+            .map_err(|_| "FAL2 admission probe response missing")?;
+        if reply.header.kind != protocol::ID || !reply.handles.is_empty() {
+            return Err("FAL2 admission probe response layout invalid");
+        }
+        let prefix = RpcPrefix::decode(&reply.payload)
+            .map_err(|_| "FAL2 admission probe RPC prefix invalid")?;
+        if prefix.kind != RpcMessageKind::Response
+            || prefix.txid != 0x5052_4553_5300_0000 + index as u64
+        {
+            return Err("FAL2 admission probe RPC reply kind invalid");
+        }
+        let (header, FalResponse::Empty) =
+            protocol::decode_response(&reply.payload[librpc::PREFIX_LEN..])
+                .map_err(|_| "FAL2 admission probe response invalid")?
+        else {
+            return Err("FAL2 admission probe response shape invalid");
+        };
+        match header.status {
+            protocol::Status::Quota => quota += 1,
+            protocol::Status::NotFound => {}
+            _ => return Err("FAL2 admission probe unexpected status"),
+        }
+        root.close_control(mailbox.peer)?;
+        root.close_control(mailbox.owner)?;
+    }
+    if quota == 0 {
+        return Err("FAL2 admission probe did not reach request quota");
+    }
+    if !matches!(
+        FalClient::new().call(
+            grant,
+            &FalRequest::Lookup {
+                path: "pressure-cleared"
+            },
+            rinlib::time::timeout_millis(5_000)
+                .map_err(|_| "FAL2 admission recovery deadline invalid")?,
+        ),
+        Err(libfal::client::ClientError::Status(
+            protocol::Status::NotFound
+        ))
+    ) {
+        return Err("FAL2 admission probe did not recover");
+    }
+    let deadline = rinlib::time::timeout_millis(5_000)
+        .map_err(|_| "Registry admission recovery deadline invalid")?;
+    let used = service_protocol::encode_request(&request, deadline, &mut payload)
+        .ok_or("Registry admission recovery encoding failed")?;
+    let rpc = Request::new(service_protocol::ID, &payload[..used])
+        .map_err(|_| "Registry admission recovery RPC invalid")?;
+    let reply = Caller::new()
+        .call(authority, deadline, rpc)
+        .map_err(|_| "Registry admission recovery call failed")?;
+    let (header, _) = service_protocol::decode_response(&reply.payload)
+        .map_err(|_| "Registry admission recovery reply invalid")?;
+    if header.op != service_protocol::Op::QueryName
+        || header.status != service_protocol::Status::NotFound
+        || !reply.handles.is_empty()
+    {
+        return Err("Registry admission probe did not recover");
+    }
+    debug!(
+        "FAL2 admission pressure passed: requests={}, quota={}",
+        REQUESTS, quota
+    );
+    Ok(())
 }
 
 struct StalledDelegate {
@@ -1375,7 +1948,9 @@ fn stage_stalled_delegate(
             path: "stalled/leaf",
         },
         0x5354_414c_4c45_4401,
-    )?;
+        Deadline::INFINITE,
+    )
+    .map_err(|_| "FAL2 stalled request send failed")?;
     root.close_control(client_reply.peer)?;
     root.close_control(downstream.peer)?;
     let downstream_message =
@@ -1402,6 +1977,518 @@ fn stage_stalled_delegate(
     })
 }
 
+fn call_registration(
+    authority: &MailboxSender,
+    request: &service_protocol::Request<'_>,
+    deadline: Deadline,
+    endpoint: Option<rinlib::ipc::capability::Capability>,
+) -> Result<librpc::Reply, &'static str> {
+    let mut payload = alloc::vec![0; service_protocol::HEADER_LEN
+        + request.encoded_len().ok_or("registration request size invalid")?];
+    let used = service_protocol::encode_request(request, deadline, &mut payload)
+        .ok_or("registration request encoding failed")?;
+    let mut rpc = Request::new(service_protocol::ID, &payload[..used])
+        .map_err(|_| "registration RPC request invalid")?;
+    if let Some(endpoint) = endpoint {
+        rpc.push(
+            endpoint,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+        )
+        .map_err(|_| "registration endpoint attachment failed")?;
+    }
+    Caller::new()
+        .call(authority, deadline, rpc)
+        .map_err(|_| "registration RPC call failed")
+}
+
+fn send_raw_registration_request(
+    authority: &MailboxSender,
+    reply_sender: &MailboxSender,
+    request: &service_protocol::Request<'_>,
+    endpoint: Option<Capability>,
+    txid: u64,
+    deadline: Deadline,
+) -> Result<(), SystemCallError> {
+    let capacity = service_protocol::HEADER_LEN
+        .checked_add(
+            request
+                .encoded_len()
+                .ok_or(SystemCallError::IllegalArgument)?,
+        )
+        .ok_or(SystemCallError::IllegalArgument)?;
+    let mut payload = alloc::vec![0; librpc::PREFIX_LEN + capacity];
+    RpcPrefix::new(RpcMessageKind::Request, txid).encode(&mut payload);
+    let used =
+        service_protocol::encode_request(request, deadline, &mut payload[librpc::PREFIX_LEN..])
+            .ok_or(SystemCallError::IllegalArgument)?;
+    payload.truncate(librpc::PREFIX_LEN + used);
+    let mut packet = Packet::new(service_protocol::ID, &payload)?;
+    if let Some(endpoint) = endpoint {
+        packet
+            .push(
+                endpoint,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+            )
+            .map_err(|failure| failure.error)?;
+    }
+    let reply_rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+    let reply = send_once(reply_sender, reply_rights)?;
+    packet
+        .push_front(reply.into_capability(), reply_rights)
+        .map_err(|failure| failure.error)?;
+    packet
+        .try_send(authority, deadline)
+        .map_err(|failure| failure.error)
+}
+
+fn blocked_registration_reply(
+    root: &mut RootSupervisor,
+) -> Result<rinlib::shared::object::HandlePair, &'static str> {
+    let reply = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        )
+        .map_err(|_| "registration blocked reply mailbox creation failed")?;
+    for index in 0..MAILBOX_CAPACITY {
+        root.sender(reply.peer)
+            .send(0x5245_4742_4c4f_434b + index as u64, &[])
+            .map_err(|_| "registration blocked reply fill failed")?;
+    }
+    Ok(reply)
+}
+
+fn registration_endpoint_sender(
+    endpoint: Handle,
+    rights: Rights,
+) -> Result<Capability, &'static str> {
+    // SAFETY: duplicate 创建独立 handle，由返回的 capability 唯一负责关闭。
+    Ok(unsafe {
+        Capability::from_raw(
+            duplicate(endpoint, rights)
+                .map_err(|_| "registration endpoint sender duplicate failed")?,
+        )
+    })
+}
+
+fn query_registration_name(
+    authority: &MailboxSender,
+    name: &str,
+    deadline: Deadline,
+) -> Result<Option<service_protocol::InstanceInfo>, &'static str> {
+    let reply = call_registration(
+        authority,
+        &service_protocol::Request::QueryName { name },
+        deadline,
+        None,
+    )?;
+    let (header, response) = service_protocol::decode_response(&reply.payload)
+        .map_err(|_| "registration name query reply invalid")?;
+    match (header.status, response) {
+        (service_protocol::Status::Ok, service_protocol::Response::Instance(info)) => {
+            Ok(Some(info))
+        }
+        (service_protocol::Status::NotFound, service_protocol::Response::Empty) => Ok(None),
+        _ => Err("registration name query status invalid"),
+    }
+}
+
+fn probe_registration_reply_boundaries(
+    root: &mut RootSupervisor,
+    directory: &MailboxSender,
+    authority: &MailboxSender,
+) -> Result<(), &'static str> {
+    let deadline = rinlib::time::timeout_millis(15_000)
+        .map_err(|_| "registration reply probe deadline invalid")?;
+    let name = "probe.reply";
+    let scoped = service_client::delegate_name(authority, name, deadline)
+        .map_err(|_| "registration reply probe delegation failed")?;
+    let endpoint = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        )
+        .map_err(|_| "registration reply probe endpoint failed")?;
+    let transport = Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT;
+    let policy = ExportPolicy {
+        protocol: ValueProtocol::Mailbox,
+        mode: ExportMode::Repeatable,
+        transport,
+        fal_ceiling: FalRights::NONE,
+    };
+    let register = service_protocol::Request::Register {
+        name,
+        protocol: service_protocol::ID,
+        version: u32::from(service_protocol::VERSION),
+        policy,
+        establish_deadline: deadline,
+    };
+    let abandoned = blocked_registration_reply(root)?;
+    send_raw_registration_request(
+        &scoped,
+        root.sender(abandoned.peer),
+        &register,
+        Some(registration_endpoint_sender(endpoint.peer, transport)?),
+        0x5245_4741_4241_4e44,
+        deadline,
+    )
+    .map_err(|_| "registration abandoned Register send failed")?;
+    root.close_control(abandoned.peer)?;
+    loop {
+        if matches!(
+            query_registration_name(&scoped, name, deadline)?,
+            Some(info) if info.state == service_protocol::State::Starting
+        ) {
+            break;
+        }
+        if rinlib::time::expired(deadline).map_err(|_| "registration Starting clock failed")? {
+            return Err("registration abandoned Register never reached Starting");
+        }
+    }
+    root.close_control(abandoned.owner)?;
+    loop {
+        if query_registration_name(&scoped, name, deadline)?.is_none() {
+            break;
+        }
+        if rinlib::time::expired(deadline).map_err(|_| "registration abandon clock failed")? {
+            return Err("registration abandoned establishment retained its name");
+        }
+    }
+    let watch = FalClient::new()
+        .subscribe(
+            directory,
+            "",
+            protocol::WatchMask::CREATE | protocol::WatchMask::DELETE,
+            deadline,
+        )
+        .map_err(|_| "registration reply probe root Watch failed")?;
+    let mut established = call_registration(
+        &scoped,
+        &register,
+        deadline,
+        Some(registration_endpoint_sender(endpoint.peer, transport)?),
+    )?;
+    let (header, response) = service_protocol::decode_response(&established.payload)
+        .map_err(|_| "registration reply probe Register reply invalid")?;
+    if header.status != service_protocol::Status::Ok
+        || !matches!(response, service_protocol::Response::Instance(info) if info.state == service_protocol::State::Starting)
+        || established.handles.remaining() != 1
+    {
+        return Err("registration reply probe Register refused");
+    }
+    let control = established
+        .handles
+        .take(0)
+        .map_err(|_| "registration reply probe control missing")?;
+    let (control, _) = MailboxSender::from_capability(control)
+        .map_err(|_| "registration reply probe control role invalid")?;
+    let blocked_ready = blocked_registration_reply(root)?;
+    send_raw_registration_request(
+        &control,
+        root.sender(blocked_ready.peer),
+        &service_protocol::Request::PublishReady,
+        None,
+        0x5245_4752_4541_4459,
+        deadline,
+    )
+    .map_err(|_| "registration blocked Ready send failed")?;
+    root.close_control(blocked_ready.peer)?;
+    if !matches!(
+        watch.wait(deadline).map_err(|_| "registration blocked Ready CREATE missing")?,
+        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::CREATE)
+    ) {
+        return Err("registration blocked Ready CREATE invalid");
+    }
+    let ready = call_registration(&control, &service_protocol::Request::Query, deadline, None)?;
+    let (header, response) = service_protocol::decode_response(&ready.payload)
+        .map_err(|_| "registration blocked Ready Query invalid")?;
+    let service_protocol::Response::Instance(info) = response else {
+        return Err("registration blocked Ready Query shape invalid");
+    };
+    if header.status != service_protocol::Status::Ok || info.state != service_protocol::State::Ready
+    {
+        return Err("registration blocked Ready did not commit");
+    }
+    root.close_control(blocked_ready.owner)?;
+    let blocked_withdraw = blocked_registration_reply(root)?;
+    send_raw_registration_request(
+        &scoped,
+        root.sender(blocked_withdraw.peer),
+        &service_protocol::Request::Withdraw {
+            name,
+            expected_instance: info.instance,
+            expected_generation: info.generation,
+        },
+        None,
+        0x5245_4757_4954_4844,
+        deadline,
+    )
+    .map_err(|_| "registration blocked Withdraw send failed")?;
+    root.close_control(blocked_withdraw.peer)?;
+    if !matches!(
+        watch.wait(deadline).map_err(|_| "registration blocked Withdraw DELETE missing")?,
+        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::DELETE)
+    ) {
+        return Err("registration blocked Withdraw DELETE invalid");
+    }
+    let drained = call_registration(&control, &service_protocol::Request::Query, deadline, None)?;
+    let (header, response) = service_protocol::decode_response(&drained.payload)
+        .map_err(|_| "registration blocked Withdraw Query invalid")?;
+    if header.status != service_protocol::Status::Ok
+        || !matches!(response, service_protocol::Response::Instance(info)
+            if info.reason == service_protocol::TerminalReason::Withdrawn
+                && matches!(info.state, service_protocol::State::Draining | service_protocol::State::Terminal))
+    {
+        return Err("registration blocked Withdraw did not commit");
+    }
+    root.close_control(blocked_withdraw.owner)?;
+    if query_registration_name(&scoped, name, deadline)?.is_some() {
+        return Err("registration blocked Withdraw retained its name");
+    }
+    root.close_control(endpoint.owner)?;
+    root.close_control(endpoint.peer)?;
+    drop(control);
+    drop(scoped);
+    drop(watch);
+    debug!("registration abandoned Register and blocked Ready/Withdraw committed consistently");
+    Ok(())
+}
+
+fn probe_registration_endpoint_retirement(
+    root: &mut RootSupervisor,
+    directory: &MailboxSender,
+    authority: &MailboxSender,
+) -> Result<(), &'static str> {
+    let deadline = rinlib::time::timeout_millis(10_000)
+        .map_err(|_| "registration endpoint probe deadline invalid")?;
+    let watch = FalClient::new()
+        .subscribe(
+            directory,
+            "",
+            protocol::WatchMask::CREATE | protocol::WatchMask::DELETE,
+            deadline,
+        )
+        .map_err(|_| "registration endpoint probe root Watch failed")?;
+    let scoped = service_client::delegate_name(authority, "probe.endpoint", deadline)
+        .map_err(|_| "registration endpoint probe delegation failed")?;
+    let endpoint = root
+        .create_mailbox(
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+        )
+        .map_err(|_| "registration endpoint probe mailbox failed")?;
+    let transport = Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE;
+    let policy = ExportPolicy {
+        protocol: ValueProtocol::Mailbox,
+        mode: ExportMode::Repeatable,
+        transport,
+        fal_ceiling: FalRights::NONE,
+    };
+    let sender = registration_endpoint_sender(endpoint.peer, transport)?;
+    let mut registered = call_registration(
+        &scoped,
+        &service_protocol::Request::Register {
+            name: "probe.endpoint",
+            protocol: service_protocol::ID,
+            version: u32::from(service_protocol::VERSION),
+            policy,
+            establish_deadline: deadline,
+        },
+        deadline,
+        Some(sender),
+    )?;
+    let (header, response) = service_protocol::decode_response(&registered.payload)
+        .map_err(|_| "registration endpoint probe Register reply invalid")?;
+    if header.status != service_protocol::Status::Ok
+        || !matches!(response, service_protocol::Response::Instance(_))
+        || registered.handles.remaining() != 1
+    {
+        return Err("registration endpoint probe Register refused");
+    }
+    let capability = registered
+        .handles
+        .take(0)
+        .map_err(|_| "registration endpoint probe control missing")?;
+    let (control, _) = MailboxSender::from_capability(capability)
+        .map_err(|_| "registration endpoint probe control role invalid")?;
+    debug!("FAL2 registration endpoint probe registered");
+    let published = call_registration(
+        &control,
+        &service_protocol::Request::PublishReady,
+        deadline,
+        None,
+    )?;
+    let (header, response) = service_protocol::decode_response(&published.payload)
+        .map_err(|_| "registration endpoint probe Ready reply invalid")?;
+    if header.status != service_protocol::Status::Ok
+        || !matches!(response, service_protocol::Response::Instance(info) if info.state == service_protocol::State::Ready)
+    {
+        return Err("registration endpoint probe Ready refused");
+    }
+    debug!("FAL2 registration endpoint probe ready");
+    if !matches!(
+        watch.wait(deadline).map_err(|_| "registration endpoint probe CREATE missing")?,
+        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::CREATE)
+    ) {
+        return Err("registration endpoint probe CREATE invalid");
+    }
+    root.close_control(endpoint.owner)?;
+    debug!("FAL2 registration endpoint probe endpoint closed");
+    if !matches!(
+        watch.wait(deadline).map_err(|_| "registration endpoint probe DELETE missing")?,
+        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::DELETE)
+    ) {
+        return Err("registration endpoint probe DELETE invalid");
+    }
+    debug!("FAL2 registration endpoint probe delete observed");
+    let queried = call_registration(&control, &service_protocol::Request::Query, deadline, None)?;
+    let (header, response) = service_protocol::decode_response(&queried.payload)
+        .map_err(|_| "registration endpoint probe Query reply invalid")?;
+    if header.status != service_protocol::Status::Ok
+        || !matches!(response, service_protocol::Response::Instance(info)
+            if info.reason == service_protocol::TerminalReason::EndpointClosed
+                && matches!(info.state, service_protocol::State::Draining | service_protocol::State::Terminal))
+    {
+        return Err("registration endpoint probe control lost endpoint terminal state");
+    }
+    if !matches!(
+        FalClient::new().call(
+            directory,
+            &FalRequest::Read {
+                path: "probe.endpoint"
+            },
+            deadline,
+        ),
+        Err(libfal::client::ClientError::Status(
+            protocol::Status::NotFound
+        ))
+    ) {
+        return Err("registration endpoint probe remained discoverable");
+    }
+    root.close_control(endpoint.peer)?;
+    drop(control);
+    drop(scoped);
+    drop(watch);
+    debug!("registration endpoint CLOSED withdrew Ready while control remained active");
+    Ok(())
+}
+
+#[cfg(feature = "acceptance-stress")]
+fn reply_to_cancelled_delegate(
+    mut downstream: rinlib::ipc::message::ReceivedMessage,
+) -> Result<(), &'static str> {
+    let request = RpcPrefix::decode(&downstream.payload)
+        .map_err(|_| "cancelled Derive reply prefix invalid")?;
+    let reply = downstream
+        .handles
+        .take(0)
+        .map_err(|_| "cancelled Derive reply sender missing")?;
+    let (reply, _) = rinlib::ipc::message::SendOnce::from_capability(reply)
+        .map_err(|_| "cancelled Derive reply sender role invalid")?;
+    let returned =
+        rinlib::ipc::message::Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
+            .map_err(|_| "cancelled Derive reply capability creation failed")?;
+    let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+    let minted = returned
+        .mint(0, rights)
+        .map_err(|_| "cancelled Derive reply capability mint failed")?;
+    let lifetime = minted.lifetime;
+    let granted = minted.sender.into_capability();
+    let mut body = [0; protocol::HEADER_LEN + 128];
+    let used = protocol::encode_response(
+        protocol::Op::Derive,
+        protocol::Status::Ok,
+        Deadline::INFINITE,
+        &FalResponse::Node(protocol::NodeInfo {
+            identity: 1,
+            version: 1,
+            kind: libfal::node::NodeKind::Directory,
+            rights: FalRights::TRAVERSE,
+            size: 0,
+        }),
+        &mut body,
+    )
+    .ok_or("cancelled Derive reply body invalid")?;
+    let mut payload = alloc::vec![0; librpc::PREFIX_LEN + used];
+    RpcPrefix::new(RpcMessageKind::Response, request.txid).encode(&mut payload);
+    payload[librpc::PREFIX_LEN..].copy_from_slice(&body[..used]);
+    let mut packet =
+        Packet::new(protocol::ID, &payload).map_err(|_| "cancelled Derive reply packet invalid")?;
+    packet
+        .push(granted, rights)
+        .map_err(|_| "cancelled Derive reply capability attachment failed")?;
+    let deadline = rinlib::time::timeout_millis(5_000)
+        .map_err(|_| "cancelled Derive reply deadline invalid")?;
+    packet
+        .try_reply(reply, deadline)
+        .map_err(|_| "cancelled Derive late reply was not accepted")?;
+    let observed = wait_many(
+        &[WaitItem::new(
+            lifetime.as_handle(),
+            ObjectSignals::CLOSED,
+            0,
+        )],
+        5_000,
+    )
+    .map_err(|_| "cancelled Derive late capability was not released")?;
+    if !observed.observed.contains(ObjectSignals::CLOSED) {
+        return Err("cancelled Derive late capability Lifetime was not closed");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "acceptance-stress")]
+fn cancel_stalled_delegate_while_provider_runs(
+    root: &mut RootSupervisor,
+    route: Handle,
+    grant: &MailboxSender,
+) -> Result<(), &'static str> {
+    let mut stalled = alloc::vec::Vec::new();
+    stalled
+        .try_reserve_exact(CANCELLATION_PROBES)
+        .map_err(|_| "FAL2 cancellation probe storage exhausted")?;
+    for index in 0..CANCELLATION_PROBES {
+        debug!("FAL2 upstream cancellation staging: index={}", index);
+        let pending = stage_stalled_delegate(root, route, grant)?;
+        debug!("FAL2 upstream cancellation delivered: index={}", index);
+        root.close_control(pending.client_reply)?;
+        stalled.push(pending);
+        rinlib::time::sleep_until(
+            rinlib::time::timeout_millis(50)
+                .map_err(|_| "FAL2 upstream cancellation pacing deadline invalid")?,
+        )
+        .map_err(|_| "FAL2 upstream cancellation pacing failed")?;
+    }
+    for (index, pending) in stalled.into_iter().enumerate() {
+        if index == 0 {
+            reply_to_cancelled_delegate(pending.downstream)?;
+        } else {
+            drop(pending.downstream);
+        }
+        root.close_control(pending.downstream_owner)?;
+    }
+    if !matches!(
+        FalClient::new().call(
+            grant,
+            &FalRequest::Lookup {
+                path: "cancelled-recovered"
+            },
+            rinlib::time::timeout_millis(5_000)
+                .map_err(|_| "FAL2 cancellation recovery deadline invalid")?,
+        ),
+        Err(libfal::client::ClientError::Status(
+            protocol::Status::NotFound
+        ))
+    ) {
+        return Err("FAL2 cancellation did not recover provider ingress");
+    }
+    debug!(
+        "FAL2 upstream cancellation released pending Dispatcher slots: probes={}",
+        CANCELLATION_PROBES
+    );
+    Ok(())
+}
+
 fn finish_stalled_delegate(
     root: &mut RootSupervisor,
     stalled: StalledDelegate,
@@ -1424,6 +2511,15 @@ fn release_fs_provider(
     route: Handle,
 ) -> Result<protocol::ProviderReport, &'static str> {
     notification::signal(release, 1).map_err(|_| "fs provider release signal failed")?;
+    collect_fs_provider(root, bootstrap, release, route)
+}
+
+fn collect_fs_provider(
+    root: &mut RootSupervisor,
+    bootstrap: Handle,
+    release: Handle,
+    route: Handle,
+) -> Result<protocol::ProviderReport, &'static str> {
     let stopped =
         wait_message(bootstrap).map_err(|_| "fs provider shutdown report receive failed")?;
     if stopped.header.kind != protocol::PROVIDER_STOPPED_KIND || !stopped.handles.is_empty() {
@@ -2070,136 +3166,197 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     names.register_process(env::pid() as u64, "init");
     let launched = launch_test_services(root, services, pm_domain, acceptance, &mut names)?;
     let pm_mailbox = launched.pm_mailbox;
-    let first_fs = accept_fs_provider(
-        launched.fs_bootstrap,
-        launched.fs_release,
-        launched.fs_route,
+    let mut first_fs = launched.first_fs;
+    let registry_root_watch = launched.registry_root_watch;
+    confirm_primary_fs_ready(&first_fs)?;
+    let consumer = launch_fal_consumer(
+        root,
+        services,
+        &mut names,
+        launched.test_fal_image,
+        &first_fs,
     )?;
-    let second_fs = accept_fs_provider(
+    consumer.await_report(test_fal::report::DISCOVERY_ARMED)?;
+    launch_secondary_fs(
+        root,
+        services,
+        &mut names,
+        launched.fs_second_image,
+        [
+            launched.fs_bootstrap_second_sender,
+            launched.fs_release_second_owner,
+            launched.fs_route_second_owner,
+            launched.fs_second_scope,
+        ],
+    )?;
+    let mut second_fs = accept_fs_provider(
         launched.fs_bootstrap_second,
         launched.fs_release_second,
         launched.fs_route_second,
+        false,
     )?;
+    let directory = first_fs.directory.as_ref().ok_or(RunFailure::Message(
+        "primary provider omitted service directory grant",
+    ))?;
+    if second_fs.directory.is_some() {
+        return Err(RunFailure::Message(
+            "secondary provider unexpectedly published a service directory",
+        ));
+    }
+    let primary_mailbox = first_fs.mailbox_identity.ok_or(RunFailure::Message(
+        "primary provider root identity missing",
+    ))?;
+    let (discovered, sender_identity, mailbox_identity, registry_shutdown_watch) =
+        discover_registered_fs(directory, primary_mailbox, &registry_root_watch)
+            .map_err(RunFailure::Message)?;
+    second_fs.grant = Some(discovered);
+    second_fs.sender_identity = Some(sender_identity);
+    second_fs.mailbox_identity = Some(mailbox_identity);
     if first_fs.sender_identity == second_fs.sender_identity {
         return Err(RunFailure::Message(
             "independent FAL2 providers returned the same sender identity",
         ));
     }
-    exercise_fs_provider(root, &first_fs.grant)?;
-    exercise_fs_provider(root, &second_fs.grant)?;
-    let mut property_copy = FalClient::new();
-    property_copy
-        .copy_property(
-            &first_fs.grant,
-            "probe-property",
-            &second_fs.grant,
-            "cross-provider-property-copy",
-            FalRights::READ_PROPERTY,
-            rinlib::time::Deadline::INFINITE,
-        )
-        .map_err(|_| RunFailure::Message("cross-provider FAL2 property copy failed"))?;
-    let copied = property_copy
-        .call(
-            &second_fs.grant,
-            &FalRequest::Read {
-                path: "cross-provider-property-copy",
-            },
-            rinlib::time::Deadline::INFINITE,
-        )
-        .map_err(|_| RunFailure::Message("cross-provider FAL2 property read failed"))?;
-    let (_, FalResponse::Value(copied)) = protocol::decode_response(&copied.payload)
-        .map_err(|_| RunFailure::Message("cross-provider FAL2 property reply invalid"))?
-    else {
-        return Err(RunFailure::Message(
-            "cross-provider FAL2 property reply shape invalid",
-        ));
-    };
-    if copied != fal_blob(b"updated")? {
-        return Err(RunFailure::Message(
-            "cross-provider FAL2 property value mismatch",
-        ));
-    }
-    let mut move_client = FalClient::new();
-    if !matches!(
-        move_client.move_entry(
-            &first_fs.grant,
-            &second_fs.grant,
-            libfal::client::MoveEntry {
-                source_parent: "",
-                source_name: "move-source",
-                destination_name: "cross-device",
-                expected: protocol::Expected::NONE,
-            },
-            rinlib::time::Deadline::INFINITE,
-        ),
-        Err(libfal::client::ClientError::Status(
-            protocol::Status::CrossDevice
-        ))
-    ) {
-        return Err(RunFailure::Message(
-            "cross-provider FAL2 move was not rejected as CrossDevice",
-        ));
-    }
+    consumer.await_report(test_fal::report::SECONDARY_DISCOVERED)?;
+    exercise_fs_provider(
+        first_fs
+            .grant
+            .as_ref()
+            .expect("primary provider grant missing"),
+    )?;
+    exercise_fs_provider(
+        second_fs
+            .grant
+            .as_ref()
+            .expect("discovered secondary provider grant missing"),
+    )?;
     bind_fs_route(
         first_fs.route,
         "second",
-        &second_fs.grant,
+        second_fs
+            .grant
+            .as_ref()
+            .expect("discovered secondary provider grant missing"),
         FalRights::TRAVERSE | FalRights::ENUMERATE,
     )?;
-    let first_grant = alloc::sync::Arc::new(first_fs.grant);
+    consumer.continue_business()?;
+    consumer.await_report(test_fal::report::COMPLETE)?;
+    let first_grant = alloc::sync::Arc::new(
+        first_fs
+            .grant
+            .take()
+            .expect("primary provider grant missing"),
+    );
     let mut namespace = PrefixTable::new();
     namespace
         .mount("/", DirectoryGrant::new(first_grant.clone()))
         .map_err(|_| "first FAL2 namespace mount failed")?;
+    let second_stream_grant = FalClient::new()
+        .derive(
+            second_fs
+                .grant
+                .as_ref()
+                .expect("secondary provider grant missing"),
+            "",
+            FalRights::TRAVERSE
+                | FalRights::ENUMERATE
+                | FalRights::READ_STREAM
+                | FalRights::WRITE_STREAM
+                | FalRights::CREATE
+                | FalRights::REMOVE,
+            rinlib::time::Deadline::INFINITE,
+        )
+        .map_err(|_| "secondary FAL2 stream grant derive failed")?;
+    let second_stream_grant = alloc::sync::Arc::new(second_stream_grant);
+    namespace
+        .mount("/provider-b", DirectoryGrant::new(second_stream_grant))
+        .map_err(|_| "secondary FAL2 stream namespace mount failed")?;
     let mut transport = FalTransport::new(rinlib::time::Deadline::INFINITE);
-    let first_root = libfs::resolve::resolve(
+    let first_stream = libfs::resolve::resolve(
         &mut transport,
         &namespace,
-        "/",
+        "/probe-stream",
         libfal::protocol::ResolvePolicy::FollowAll,
     )
-    .map_err(|_| "first FAL2 namespace resolve failed")?;
-    let second_root = libfs::resolve::resolve(
-        &mut transport,
-        &namespace,
-        "/second",
-        libfal::protocol::ResolvePolicy::FollowAll,
-    )
-    .map_err(|_| "second FAL2 namespace resolve failed")?;
-    let second_property = libfs::resolve::resolve(
-        &mut transport,
-        &namespace,
-        "/second/f2-dir/leaf",
-        libfal::protocol::ResolvePolicy::FollowAll,
-    )
-    .map_err(|_| "delegated FAL2 remaining path resolve failed")?;
-    if first_root.info.kind != NodeKind::Directory
-        || second_root.info.kind != NodeKind::Directory
-        || second_root.info.rights != (FalRights::TRAVERSE | FalRights::ENUMERATE)
-        || second_property.info.kind != NodeKind::Property
-    {
-        return Err(RunFailure::Message(
-            "FAL2 Delegate returned invalid metadata or remaining-path result",
-        ));
-    }
+    .map_err(|_| "FAL2 Open namespace resolve failed")?;
+    exercise_open_streams(root, &mut transport, &first_stream)?;
+    exercise_cancellable_rpc(root)?;
     drop(namespace);
     let mut shutdown_watch_client = FalClient::new();
     let shutdown_watch = shutdown_watch_client
         .subscribe(
-            &second_fs.grant,
+            second_fs
+                .grant
+                .as_ref()
+                .expect("discovered secondary provider grant missing"),
             "",
             protocol::WatchMask::CREATE,
             rinlib::time::Deadline::INFINITE,
         )
         .map_err(|_| RunFailure::Message("FAL2 shutdown Watch subscription failed"))?;
-    let abandoned_reply = stage_abandoned_reply(root, &second_fs.grant)?;
-    drop(second_fs.grant);
-    let second_report = release_fs_provider(
+    let abandoned_reply = stage_abandoned_reply(
+        root,
+        second_fs
+            .grant
+            .as_ref()
+            .expect("discovered secondary provider grant missing"),
+    )?;
+    drop(second_fs.grant.take());
+    consumer.observe_shutdown()?;
+    notification::signal(second_fs.release, 1)
+        .map_err(|_| RunFailure::Message("secondary provider release signal failed"))?;
+    consumer.await_report(test_fal::report::PROVIDER_CLOSED)?;
+    consumer.finish(root)?;
+    let second_report = collect_fs_provider(
         root,
         second_fs.bootstrap,
         second_fs.release,
         second_fs.route,
     )?;
+    debug!("FAL2 secondary provider collected");
+    let registry_shutdown_events = registry_shutdown_watch
+        .take()
+        .map_err(|_| RunFailure::Message("Registry shutdown Watch take failed"))?;
+    if !registry_shutdown_events.contains(protocol::WatchMask::TERMINATED) {
+        return Err(RunFailure::Message(
+            "Registry automatic withdrawal omitted Watch termination",
+        ));
+    }
+    drop(registry_shutdown_watch);
+    debug!("FAL2 registry provider withdrawal observed");
+    match registry_root_watch
+        .wait(
+            rinlib::time::timeout_millis(5_000)
+                .map_err(|_| RunFailure::Message("Registry Watch deadline invalid"))?,
+        )
+        .map_err(|_| RunFailure::Message("Registry root withdrawal Watch failed"))?
+    {
+        SubscriptionEvent::Events(events) if events.contains(protocol::WatchMask::DELETE) => {}
+        _ => {
+            return Err(RunFailure::Message(
+                "Registry root omitted withdrawal DELETE",
+            ));
+        }
+    }
+    match FalClient::new().call(
+        first_fs
+            .directory
+            .as_ref()
+            .expect("Registry directory root missing"),
+        &FalRequest::Read {
+            path: "fs.secondary",
+        },
+        rinlib::time::Deadline::INFINITE,
+    ) {
+        Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {}
+        _ => {
+            return Err(RunFailure::Message(
+                "withdrawn service remained discoverable",
+            ));
+        }
+    }
+    debug!("FAL2 withdrawn provider lookup rejected");
+    drop(registry_root_watch);
     let shutdown_events = shutdown_watch
         .take()
         .map_err(|_| RunFailure::Message("FAL2 shutdown Watch take failed"))?;
@@ -2209,7 +3366,52 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
         ));
     }
     drop(shutdown_watch);
+    debug!("FAL2 provider shutdown watch observed");
     finish_abandoned_reply(root, abandoned_reply)?;
+    debug!("FAL2 abandoned reply drained");
+    debug!("FAL2 registration reply boundary probe starting");
+    probe_registration_reply_boundaries(
+        root,
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or(RunFailure::Message("service directory root missing"))?,
+        first_fs
+            .registration_root
+            .as_ref()
+            .ok_or(RunFailure::Message("registration root missing"))?,
+    )
+    .map_err(RunFailure::Message)?;
+    debug!("FAL2 registration reply boundary probe passed");
+    debug!("FAL2 registration endpoint retirement probe starting");
+    probe_registration_endpoint_retirement(
+        root,
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or(RunFailure::Message("service directory root missing"))?,
+        first_fs
+            .registration_root
+            .as_ref()
+            .ok_or(RunFailure::Message("registration root missing"))?,
+    )
+    .map_err(RunFailure::Message)?;
+    debug!("FAL2 registration endpoint retirement probe passed");
+    #[cfg(feature = "acceptance-stress")]
+    stress_fal2_admission(
+        root,
+        &first_grant,
+        first_fs
+            .registration_root
+            .as_ref()
+            .ok_or(RunFailure::Message(
+                "registration root missing during stress",
+            ))?,
+    )
+    .map_err(RunFailure::Message)?;
+    #[cfg(feature = "acceptance-stress")]
+    cancel_stalled_delegate_while_provider_runs(root, first_fs.route, &first_grant)
+        .map_err(RunFailure::Message)?;
     let stalled = stage_stalled_delegate(root, first_fs.route, &first_grant)?;
     drop(first_grant);
     let first_report =
@@ -2219,14 +3421,19 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
         || second_report.committed == 0
         || first_report.abandoned != 1
         || second_report.abandoned != 1
-        || first_report.downstream_abandoned != 1
+        || first_report.downstream_abandoned != (CANCELLATION_PROBES + 1) as u64
         || second_report.downstream_abandoned != 0
     {
         return Err(RunFailure::Message("FAL2 provider shutdown report invalid"));
     }
     debug!(
         "independent FAL2 provider Delegate passed: roots={:#x}/{:#x}",
-        first_fs.sender_identity, second_fs.sender_identity
+        first_fs
+            .sender_identity
+            .expect("primary sender identity missing"),
+        second_fs
+            .sender_identity
+            .expect("discovered sender identity missing")
     );
     root.collect_process(first_fs.pid)?;
     root.collect_process(second_fs.pid)?;
@@ -2295,18 +3502,29 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     test_writable_level();
     public_ipc::threaded_receive();
     time_checks::run();
-    public_ipc::committed_kill(
-        acceptance,
-        target_image.as_deref().expect("IPC target image missing"),
-    );
+    public_ipc::committed_kill(acceptance, target_image.expect("IPC target image missing"));
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
     let (tunnel, invitation) =
         match blocking::Consumer::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere) {
             Ok((consumer, invitation)) => (consumer, invitation),
-            Err(blocking::CreateFailure::System(error)) => {
+            Err(blocking::CreateFailure::Tunnel(
+                rinlib::ipc::invitation::CreateFailure::System(error),
+            )) => {
                 debug!("tunnel create failed: {:?}", error);
                 return Err(RunFailure::Message("tunnel create failed"));
+            }
+            Err(blocking::CreateFailure::Tunnel(
+                rinlib::ipc::invitation::CreateFailure::Published {
+                    endpoint,
+                    cleanup,
+                    invitation,
+                    error,
+                },
+            )) => {
+                root.retain_failed_create(endpoint, cleanup, invitation);
+                debug!("tunnel create output invalid: {:?}", error);
+                return Err(RunFailure::Message("tunnel create output invalid"));
             }
             Err(blocking::CreateFailure::Protocol {
                 endpoint,
@@ -2370,7 +3588,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
 
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
     // JobKill 组合与 seal 闸门可行子集 ——
-    match target_image.as_deref() {
+    match target_image {
         Some(image) => test_job_management(root, acceptance, image)?,
         None => {
             return Err(RunFailure::Message(
@@ -2391,7 +3609,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     // 完整生命周期多核竞态矩阵属于 stress workload；core 仍覆盖确定性的
     // Building kill、Job 管理与服务监督收束。
     #[cfg(feature = "acceptance-stress")]
-    match (target_image.as_deref(), hammer_image.as_deref()) {
+    match (target_image, hammer_image) {
         (Some(target), Some(hammer)) => race_matrix(root, acceptance, target, hammer)?,
         _ => {
             return Err(RunFailure::Message(
@@ -2902,8 +4120,7 @@ fn test_building_kill(job: Handle) {
 
 /// 验收线 1：枚举→派生→kill 通路。test_target 的 pid 经 acceptance Job
 /// 枚举可见，JobDerive 派生 MANAGE control 后 kill 并监督收束；原保留
-/// control 在派生接管后关闭（关闭 control 永不隐式终止）。任一步失败
-/// 降级回保留 control 路径，不影响既有验收面。
+/// control 在派生接管后关闭（关闭 control 永不隐式终止）。
 fn test_derive_kill(
     root: &mut RootSupervisor,
     job: Handle,
@@ -2963,7 +4180,7 @@ fn test_derive_kill(
             );
         }
         Err(error) => {
-            debug!("derive kill degraded ({:?}); using retained control", error);
+            debug!("derive kill FAILED: enumerate/derive {:?}", error);
             process::kill(retained, 0x77).expect("live kill of a fresh process must be accepted");
             kill_and_supervise(
                 root,
@@ -2973,6 +4190,7 @@ fn test_derive_kill(
                     control: retained,
                 }]),
             )?;
+            return Err("derive kill enumeration or control derivation failed");
         }
     }
     Ok(())

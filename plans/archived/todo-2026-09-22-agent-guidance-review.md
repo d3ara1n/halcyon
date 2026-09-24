@@ -2,9 +2,9 @@
 
 ## 对象与状态
 
-待独立 Review。目标提交 `60e3253`（`docs: 整理代理规则、完成条件与接力导航`），父提交 `2811d48`。本计划在目标提交之后登记，只安排文档审查，不构成新的代码验收或 FAL 施工任务。
+发现 1 个 P2 finding，已由归档报告 [`review-2026-09-24-agent-guidance.md`](review-2026-09-24-agent-guidance.md) 修复并关闭。目标提交 `60e3253`（`docs: 整理代理规则、完成条件与接力导航`），父提交 `2811d48`。本计划保留原审查范围与移交入口，不承载 finding 修复。
 
-实施与验证证据见[整理档案](archived/todo-2026-09-22-agent-guidance.md)，整理前导航见[只读快照](archived/ref-2026-09-22-compass-snapshot.md)。审查方法遵守 [REVIEW](REVIEW.md)。本登记及 COMPASS 中的对应链接属于该提交的审查元数据，不递归生成另一份审查计划。
+实施与验证证据见[整理档案](todo-2026-09-22-agent-guidance.md)，整理前导航见[只读快照](ref-2026-09-22-compass-snapshot.md)。审查方法遵守 [REVIEW](../REVIEW.md)。本登记及 COMPASS 中的对应链接属于该提交的审查元数据，不递归生成另一份审查计划。
 
 ## 改动概要
 
@@ -28,4 +28,4 @@
 
 目标提交交付前已完成本地链接/锚点检查、配置对照、快照还原和差异检查；详见整理档案。本次未运行 Rust/QEMU，未改 Cargo、Justfile 或实现代码。该提交不证明仍在工作树中的 FAL 改动正确，也未实施内核改名。
 
-独立审查形成报告后，由报告承载 findings 的修复与复核，本计划记录移交入口后归档。
+独立审查已形成并归档报告 [`review-2026-09-24-agent-guidance.md`](review-2026-09-24-agent-guidance.md)，finding 已修复与复核；本计划已归档。

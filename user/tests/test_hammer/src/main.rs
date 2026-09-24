@@ -135,7 +135,7 @@ fn execute(
         ACTION_KILL => done(process::kill(capability.as_handle(), cmd.code as i64)),
         ACTION_START => {
             let builder = capability.into_raw();
-            let result = start_target(cmd, builder);
+            let result = process::start(builder, ExecutionProfile::Base64 as u32);
             if result.is_err() {
                 // SAFETY: 从运输 owner 取出的 builder，失败未消费且无其他 owner。
                 let _ = unsafe { close(builder) };
@@ -176,11 +176,6 @@ fn done<T>(result: Result<T, SystemCallError>) -> (Report, alloc::vec::Vec<u64>)
         },
         alloc::vec::Vec::new(),
     )
-}
-
-fn start_target(cmd: &Cmd, builder: Handle) -> Result<(), SystemCallError> {
-    let _ = (cmd.entry, cmd.sp);
-    process::start(builder, ExecutionProfile::Base64 as u32)
 }
 
 fn create(job: Handle, abandon: bool) -> (Report, alloc::vec::Vec<u64>) {

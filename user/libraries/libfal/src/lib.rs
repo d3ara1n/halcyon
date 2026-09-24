@@ -24,9 +24,12 @@ pub mod resource;
 pub mod route;
 pub mod store;
 pub mod value;
+pub mod watch;
 
 #[cfg(target_arch = "riscv64")]
 pub mod grant;
+#[cfg(target_arch = "riscv64")]
+pub mod provider;
 
 /// 路径字节（UTF-8）的协议上限。
 pub const PATH_MAX: usize = 512;

@@ -1,12 +1,14 @@
-//! Provider-local Watch publication table; signaler ownership remains in Runtime tasks.
+//! Provider 通用 Watch 发布表；订阅任务拥有 signaler、来源与回复责任。
 
-use alloc::vec::Vec;
-use libfal::{
+use crate::{
     protocol::{SubscriptionInfo, WatchMask, WatchReason},
     store::NodeId,
 };
+use alloc::vec::Vec;
+use erhino_shared::call::SystemCallError;
+use libexecution::runtime::Requests;
 
-pub const LIMIT: usize = 8;
+pub const MAX_MUTATION_EFFECTS: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Effect {
@@ -18,7 +20,7 @@ pub struct Effect {
 
 #[derive(Default)]
 pub struct Effects {
-    items: [Option<Effect>; 3],
+    items: [Option<Effect>; MAX_MUTATION_EFFECTS],
     len: usize,
 }
 
@@ -32,7 +34,7 @@ impl Effects {
         self.len += 1;
     }
 
-    fn iter(&self) -> impl Iterator<Item = Effect> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = Effect> + '_ {
         self.items[..self.len].iter().copied().flatten()
     }
 
@@ -58,30 +60,82 @@ struct Record {
     reason: WatchReason,
 }
 
-pub struct WakeSet {
-    tasks: [u64; LIMIT],
-    len: usize,
+/// 一次提交已经产生、但尚未全部交给 Runtime 的唤醒责任。
+///
+/// 存储在业务提交前按 provider 的 Watch 准入上界预备；`publish` 只写入已有
+/// 容量。Runtime 的单步 Requests 队列满时保留游标，由原任务后续继续兑现。
+pub struct WakeBatch {
+    tasks: Vec<u64>,
+    cursor: usize,
 }
 
-impl WakeSet {
-    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        self.tasks[..self.len].iter().copied()
+impl WakeBatch {
+    pub fn new(limit: usize) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut tasks = Vec::new();
+        tasks.try_reserve_exact(limit)?;
+        Ok(Self { tasks, cursor: 0 })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cursor == self.tasks.len()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.tasks.len().saturating_sub(self.cursor)
+    }
+
+    pub fn drive<F>(&mut self, requests: &mut Requests<F>) -> Result<bool, SystemCallError> {
+        while let Some(task) = self.tasks.get(self.cursor).copied() {
+            match requests.wake(task) {
+                Ok(()) => self.cursor += 1,
+                Err(SystemCallError::ReachLimit) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        self.tasks.clear();
+        self.cursor = 0;
+        Ok(true)
+    }
+
+    fn begin(&mut self) {
+        assert!(
+            self.is_empty(),
+            "WakeBatch reused with undelivered wake debt"
+        );
+        self.tasks.clear();
+        self.cursor = 0;
+    }
+
+    pub fn push_unique(&mut self, task: u64) {
+        if !self.tasks.contains(&task) {
+            assert!(
+                self.tasks.len() < self.tasks.capacity(),
+                "WakeBatch capacity is smaller than Watch admission"
+            );
+            self.tasks.push(task);
+        }
     }
 }
 
 pub struct Table {
     records: Vec<Record>,
+    limit: usize,
     next_id: u64,
 }
 
 impl Table {
-    pub fn new() -> Result<Self, alloc::collections::TryReserveError> {
+    pub fn new(limit: usize) -> Result<Self, alloc::collections::TryReserveError> {
         let mut records = Vec::new();
-        records.try_reserve_exact(LIMIT)?;
+        records.try_reserve_exact(limit)?;
         Ok(Self {
             records,
+            limit,
             next_id: 1,
         })
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     pub fn allocate_id(&mut self) -> Option<u64> {
@@ -99,10 +153,7 @@ impl Table {
         generation: u64,
         requested: WatchMask,
     ) -> SubscriptionInfo {
-        assert!(
-            self.records.len() < self.records.capacity(),
-            "Watch table overflow"
-        );
+        assert!(self.records.len() < self.limit, "Watch table overflow");
         let mask = requested | WatchMask::TERMINATED;
         self.records.push(Record {
             id,
@@ -165,11 +216,8 @@ impl Table {
         Some((pending, record.reason))
     }
 
-    pub fn publish(&mut self, effects: &Effects) -> WakeSet {
-        let mut wakes = WakeSet {
-            tasks: [0; LIMIT],
-            len: 0,
-        };
+    pub fn publish(&mut self, effects: &Effects, wakes: &mut WakeBatch) {
+        wakes.begin();
         for effect in effects.iter() {
             for record in &mut self.records {
                 if record.node != effect.node || record.reason != WatchReason::Active {
@@ -186,13 +234,11 @@ impl Table {
                 let was_empty = record.pending.is_empty();
                 record.pending |= events;
                 record.generation = effect.generation;
-                if was_empty && !wakes.tasks[..wakes.len].contains(&record.task) {
-                    wakes.tasks[wakes.len] = record.task;
-                    wakes.len += 1;
+                if was_empty {
+                    wakes.push_unique(record.task);
                 }
             }
         }
-        wakes
     }
 
     pub fn is_empty(&self) -> bool {
@@ -207,5 +253,63 @@ impl Table {
             pending: record.pending,
             reason: record.reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_batch_retains_more_tasks_than_one_runtime_step() {
+        let node = NodeId::from_raw(7).unwrap();
+        let mut table = Table::new(24).unwrap();
+        for task in 1..=24 {
+            let id = table.allocate_id().unwrap();
+            table.install(id, 9, node, task, 1, WatchMask::MODIFY);
+        }
+        let mut effects = Effects::default();
+        effects.push(Effect {
+            node,
+            generation: 2,
+            events: WatchMask::MODIFY,
+            terminal: None,
+        });
+        let mut wakes = WakeBatch::new(table.limit()).unwrap();
+        table.publish(&effects, &mut wakes);
+        assert_eq!(wakes.remaining(), 24);
+        for id in 1..=24 {
+            let info = table.query(id, 9).unwrap();
+            assert_eq!(info.generation, 2);
+            assert!(info.pending.contains(WatchMask::MODIFY));
+        }
+    }
+
+    #[test]
+    fn publish_wakes_each_task_once_and_terminal_is_sticky() {
+        let node = NodeId::from_raw(11).unwrap();
+        let mut table = Table::new(3).unwrap();
+        let first = table.allocate_id().unwrap();
+        let second = table.allocate_id().unwrap();
+        table.install(first, 1, node, 41, 1, WatchMask::DELETE);
+        table.install(second, 1, node, 41, 1, WatchMask::DELETE);
+        let mut effects = Effects::default();
+        effects.push(Effect {
+            node,
+            generation: 4,
+            events: WatchMask::DELETE,
+            terminal: Some(WatchReason::NodeDeleted),
+        });
+        let mut wakes = WakeBatch::new(table.limit()).unwrap();
+        table.publish(&effects, &mut wakes);
+        assert_eq!(wakes.remaining(), 1);
+        assert_eq!(
+            table.query(first, 1).unwrap().reason,
+            WatchReason::NodeDeleted
+        );
+        assert_eq!(
+            table.query(second, 1).unwrap().reason,
+            WatchReason::NodeDeleted
+        );
     }
 }

@@ -7,7 +7,7 @@ extern crate alloc;
 
 use core::sync::atomic::Ordering;
 
-use erhino_shared::call::SystemCallError;
+use erhino_shared::{call::SystemCallError, time::Deadline};
 
 pub const HEADER_BYTES: usize = 128;
 pub const MAGIC: u32 = 0x324c_4e52;
@@ -21,6 +21,7 @@ pub enum RunnelError {
     BadFormat,
     Broken,
     Closed,
+    TimedOut,
     Syscall(SystemCallError),
 }
 
@@ -30,6 +31,8 @@ pub enum ProducerReady {
     Writable {
         bytes: usize,
     },
+    /// 创建端观察到内核已建立 peer 映射；仍须由上层协议核验 Start。
+    PeerAttached,
     /// 已发布 EOF 且对端已消费至最终 head。
     EofConsumed,
 }
@@ -39,7 +42,7 @@ pub enum ProducerReady {
 pub enum ConsumerReady {
     Readable {
         bytes: usize,
-        /// 此结果同时观察到对端建立，调用方需按新的等待条件重建登记。
+        /// 本次同时观察到内核 PEER_ATTACHED，需按新的等待条件重建来源。
         peer_attached: bool,
     },
     /// 对端映射已建立但尚无数据；持久电平，满足后不再重复登记。
@@ -52,7 +55,6 @@ pub enum ConsumerReady {
 pub struct IoError {
     pub error: RunnelError,
     pub completed: usize,
-    pub cleanup_error: Option<SystemCallError>,
 }
 
 /// 永久的协议/承载分工；host 使用合规原子存储，guest 使用 owner 约束的平台访问。
@@ -66,7 +68,7 @@ trait Transport {
     fn write(&self, offset: usize, input: &[u8]);
     fn notify(&self) -> Result<(), SystemCallError>;
     fn acknowledge(&self) -> Result<(), SystemCallError>;
-    fn wait(&self) -> Result<bool, SystemCallError>;
+    fn wait(&self, deadline: Deadline) -> Result<Option<bool>, SystemCallError>;
     fn close(&mut self) -> Result<(), SystemCallError>;
 }
 
@@ -87,7 +89,6 @@ struct Channel<T> {
     transport: T,
     capacity: usize,
     terminal: Option<RunnelError>,
-    cleanup_error: Option<SystemCallError>,
 }
 
 impl<T: Transport> Channel<T> {
@@ -129,7 +130,6 @@ impl<T: Transport> Channel<T> {
             transport,
             capacity,
             terminal: None,
-            cleanup_error: None,
         })
     }
 
@@ -138,7 +138,6 @@ impl<T: Transport> Channel<T> {
             Some(error) => Err(IoError {
                 error,
                 completed: 0,
-                cleanup_error: self.cleanup_error,
             }),
             None => Ok(()),
         }
@@ -147,12 +146,10 @@ impl<T: Transport> Channel<T> {
     fn fail(&mut self, error: RunnelError, completed: usize) -> IoError {
         if self.terminal.is_none() {
             self.terminal = Some(error);
-            self.cleanup_error = self.transport.close().err();
         }
         IoError {
             error: self.terminal.unwrap(),
             completed,
-            cleanup_error: self.cleanup_error,
         }
     }
 
@@ -171,11 +168,17 @@ impl<T: Transport> Channel<T> {
             .map_err(|error| self.fail(RunnelError::Syscall(error), 0))
     }
 
-    fn wait(&mut self) -> Result<(), IoError> {
+    fn wait(&mut self, deadline: Deadline) -> Result<(), IoError> {
         self.check()?;
-        match self.transport.wait() {
-            Ok(false) => Ok(()),
-            Ok(true) | Err(SystemCallError::ObjectClosed) => Err(self.fail(RunnelError::Closed, 0)),
+        match self.transport.wait(deadline) {
+            Ok(Some(false)) => Ok(()),
+            Ok(None) => Err(IoError {
+                error: RunnelError::TimedOut,
+                completed: 0,
+            }),
+            Ok(Some(true)) | Err(SystemCallError::ObjectClosed) => {
+                Err(self.fail(RunnelError::Closed, 0))
+            }
             Err(error) => Err(self.fail(RunnelError::Syscall(error), 0)),
         }
     }
@@ -203,6 +206,7 @@ struct ProducerCore<T> {
     tail_shadow: u64,
     cursor: usize,
     eof: bool,
+    peer_established: bool,
 }
 impl<T: Transport> ProducerCore<T> {
     fn new(transport: T, creator: bool) -> Result<Self, InitFailure<T>> {
@@ -222,6 +226,7 @@ impl<T: Transport> ProducerCore<T> {
             tail_shadow: 0,
             cursor: 0,
             eof: false,
+            peer_established: !creator,
         })
     }
 
@@ -278,7 +283,7 @@ impl<T: Transport> ProducerCore<T> {
         self.channel.notify(0)
     }
 
-    fn write_all(&mut self, input: &[u8]) -> Result<(), IoError> {
+    fn write_all(&mut self, input: &[u8], deadline: Deadline) -> Result<(), IoError> {
         self.channel.check()?;
         let mut completed = 0;
         let result = (|| {
@@ -288,7 +293,7 @@ impl<T: Transport> ProducerCore<T> {
                 if count == 0 {
                     self.channel.acknowledge()?;
                     if self.writable()? == 0 {
-                        self.channel.wait()?;
+                        self.channel.wait(deadline)?;
                     }
                 }
             }
@@ -313,9 +318,13 @@ impl<T: Transport> ProducerCore<T> {
 
     /// 唤醒后重查：先探条件，未满足则确认 DATA 后再探一次；
     /// 仍未满足返回 None（任务重新登记/重 arm 后停驻）。
-    fn poll(&mut self, terminal: bool) -> Result<Option<ProducerReady>, IoError> {
+    fn poll(&mut self, terminal: bool, attached: bool) -> Result<Option<ProducerReady>, IoError> {
         if terminal {
             return Err(self.channel.fail(RunnelError::Closed, 0));
+        }
+        if attached && !self.peer_established {
+            self.peer_established = true;
+            return Ok(Some(ProducerReady::PeerAttached));
         }
         if let Some(ready) = self.probe_ready()? {
             return Ok(Some(ready));
@@ -332,6 +341,7 @@ struct ConsumerCore<T> {
     cursor: usize,
     eof_head: Option<u64>,
     peer_established: bool,
+    kernel_attached: bool,
 }
 
 impl<T: Transport> ConsumerCore<T> {
@@ -354,7 +364,8 @@ impl<T: Transport> ConsumerCore<T> {
             head_shadow: head,
             cursor: 0,
             eof_head: (eof == 1).then_some(head),
-            peer_established: head > 0 || eof == 1,
+            peer_established: !creator || head > 0 || eof == 1,
+            kernel_attached: !creator,
         })
     }
 
@@ -410,20 +421,19 @@ impl<T: Transport> ConsumerCore<T> {
         Ok(count)
     }
 
-    fn probe_ready(&mut self, attached: bool) -> Result<Option<ConsumerReady>, IoError> {
+    fn probe_ready(&mut self, newly_attached: bool) -> Result<Option<ConsumerReady>, IoError> {
         let readable = self.readable()?;
         if readable > 0 {
-            let peer_attached = !self.peer_established;
             self.peer_established = true;
             return Ok(Some(ConsumerReady::Readable {
                 bytes: readable,
-                peer_attached,
+                peer_attached: newly_attached,
             }));
         }
         if self.eof_reached()? {
             return Ok(Some(ConsumerReady::EofDrained));
         }
-        if attached && !self.peer_established {
+        if newly_attached {
             self.peer_established = true;
             return Ok(Some(ConsumerReady::PeerAttached));
         }
@@ -435,19 +445,25 @@ impl<T: Transport> ConsumerCore<T> {
         if terminal {
             return Err(self.channel.fail(RunnelError::Closed, 0));
         }
-        if let Some(ready) = self.probe_ready(attached)? {
+        let newly_attached = attached && !self.kernel_attached;
+        self.kernel_attached |= attached;
+        if let Some(ready) = self.probe_ready(newly_attached)? {
             return Ok(Some(ready));
         }
         self.channel.acknowledge()?;
-        self.probe_ready(attached)
+        self.probe_ready(newly_attached)
     }
 
     /// 建立前登记包含持久电平 PEER_ATTACHED，满足后不再重复登记。
     fn includes_peer_attached(&self) -> bool {
-        !self.peer_established
+        !self.kernel_attached
     }
 
-    fn read_exact_or_eof(&mut self, output: &mut [u8]) -> Result<usize, IoError> {
+    fn read_exact_or_eof(
+        &mut self,
+        output: &mut [u8],
+        deadline: Deadline,
+    ) -> Result<usize, IoError> {
         self.channel.check()?;
         let mut completed = 0;
         let result = (|| {
@@ -460,7 +476,7 @@ impl<T: Transport> ConsumerCore<T> {
                 if self.readable()? == 0 {
                     self.channel.acknowledge()?;
                     if self.readable()? == 0 && !self.eof_reached()? {
-                        self.channel.wait()?;
+                        self.channel.wait(deadline)?;
                     }
                 }
             }
@@ -476,7 +492,10 @@ impl<T: Transport> ConsumerCore<T> {
 #[cfg(target_arch = "riscv64")]
 pub mod blocking {
     use super::*;
-    use erhino_shared::{object::ObjectSignals, wait::WaitResult};
+    use erhino_shared::{
+        object::ObjectSignals,
+        wait::{WaitReason, WaitResult},
+    };
     use rinlib::{ipc::tunnel::Endpoint, mm::Placement};
 
     struct Guest {
@@ -529,17 +548,22 @@ pub mod blocking {
         fn acknowledge(&self) -> Result<(), SystemCallError> {
             self.endpoint().events().acknowledge_data()
         }
-        fn wait(&self) -> Result<bool, SystemCallError> {
+        fn wait(&self, deadline: Deadline) -> Result<Option<bool>, SystemCallError> {
             self.endpoint()
                 .events()
-                .wait(
+                .wait_until(
                     ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
-                    0,
+                    deadline,
                 )
-                .map(|result| {
-                    result
-                        .observed
-                        .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)
+                .and_then(|result| match WaitReason::from_u32(result.reason) {
+                    Some(WaitReason::Timeout) => Ok(None),
+                    Some(WaitReason::Closed | WaitReason::Cancelled) => Ok(Some(true)),
+                    Some(WaitReason::Signaled) => {
+                        Ok(Some(result.observed.intersects(
+                            ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED,
+                        )))
+                    }
+                    None => Err(SystemCallError::InternalError),
                 })
         }
         fn close(&mut self) -> Result<(), SystemCallError> {
@@ -575,7 +599,7 @@ pub mod blocking {
 
     #[derive(Debug)]
     pub enum CreateFailure {
-        System(SystemCallError),
+        Tunnel(rinlib::ipc::invitation::CreateFailure),
         Protocol {
             endpoint: Endpoint,
             invitation: rinlib::ipc::invitation::Invitation,
@@ -613,7 +637,7 @@ pub mod blocking {
         ) -> Result<(Self, rinlib::ipc::invitation::Invitation), CreateFailure> {
             let (endpoint, invitation) =
                 rinlib::ipc::invitation::Invitation::create(bytes, placement)
-                    .map_err(CreateFailure::System)?;
+                    .map_err(CreateFailure::Tunnel)?;
             match producer(endpoint, true) {
                 Ok(producer) => Ok((producer, invitation)),
                 Err(failure) => Err(CreateFailure::Protocol {
@@ -635,6 +659,10 @@ pub mod blocking {
         pub fn capacity(&self) -> usize {
             self.core.channel.capacity
         }
+        /// 对创建端为已观察的内核 PEER_ATTACHED；附着端在构造时即已建立。
+        pub fn peer_attached(&self) -> bool {
+            self.core.peer_established
+        }
         pub fn writable(&mut self) -> Result<usize, IoError> {
             self.core.writable()
         }
@@ -642,7 +670,10 @@ pub mod blocking {
             self.core.write(input)
         }
         pub fn write_all(&mut self, input: &[u8]) -> Result<(), IoError> {
-            self.core.write_all(input)
+            self.write_all_until(input, Deadline::INFINITE)
+        }
+        pub fn write_all_until(&mut self, input: &[u8], deadline: Deadline) -> Result<(), IoError> {
+            self.core.write_all(input, deadline)
         }
         pub fn finish(&mut self) -> Result<(), IoError> {
             self.core.finish()
@@ -657,7 +688,11 @@ pub mod blocking {
         /// 当前等待条件的登记计划；DATA 涵盖腾空与全部消费两种进展。
         pub fn wait_plan(&mut self) -> Result<libexecution::runtime::SourcePlan, IoError> {
             self.core.channel.check()?;
-            let signals = ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED;
+            let mut signals =
+                ObjectSignals::DATA | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED;
+            if !self.core.peer_established {
+                signals |= ObjectSignals::PEER_ATTACHED;
+            }
             let item = self
                 .core
                 .channel
@@ -671,10 +706,22 @@ pub mod blocking {
             ))
         }
 
+        pub fn terminal_wait_plan(&self) -> libexecution::runtime::SourcePlan {
+            let item = self
+                .core
+                .channel
+                .transport
+                .endpoint()
+                .events()
+                .wait_item(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED, 0);
+            libexecution::runtime::SourcePlan::new(item.handle, item.signals)
+        }
+
         /// 唤醒后重查：观察信号合成类型化条件；终态经 IoError 报告。
         pub fn poll(&mut self, observed: ObjectSignals) -> Result<Option<ProducerReady>, IoError> {
             let terminal = observed.intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
-            self.core.poll(terminal)
+            let attached = observed.intersects(ObjectSignals::PEER_ATTACHED);
+            self.core.poll(terminal, attached)
         }
     }
 
@@ -685,7 +732,7 @@ pub mod blocking {
         ) -> Result<(Self, rinlib::ipc::invitation::Invitation), CreateFailure> {
             let (endpoint, invitation) =
                 rinlib::ipc::invitation::Invitation::create(bytes, placement)
-                    .map_err(CreateFailure::System)?;
+                    .map_err(CreateFailure::Tunnel)?;
             match consumer(endpoint, true) {
                 Ok(consumer) => Ok((consumer, invitation)),
                 Err(failure) => Err(CreateFailure::Protocol {
@@ -707,6 +754,10 @@ pub mod blocking {
         pub fn capacity(&self) -> usize {
             self.core.channel.capacity
         }
+        /// 创建端仅在内核 PEER_ATTACHED 到达后成立；附着端构造时即已建立。
+        pub fn peer_attached(&self) -> bool {
+            self.core.kernel_attached
+        }
         pub fn readable(&mut self) -> Result<usize, IoError> {
             self.core.readable()
         }
@@ -714,7 +765,14 @@ pub mod blocking {
             self.core.read(output)
         }
         pub fn read_exact_or_eof(&mut self, output: &mut [u8]) -> Result<usize, IoError> {
-            self.core.read_exact_or_eof(output)
+            self.read_exact_or_eof_until(output, Deadline::INFINITE)
+        }
+        pub fn read_exact_or_eof_until(
+            &mut self,
+            output: &mut [u8],
+            deadline: Deadline,
+        ) -> Result<usize, IoError> {
+            self.core.read_exact_or_eof(output, deadline)
         }
         pub fn eof_reached(&mut self) -> Result<bool, IoError> {
             self.core.eof_reached()
@@ -765,6 +823,17 @@ pub mod blocking {
             ))
         }
 
+        pub fn terminal_wait_plan(&self) -> libexecution::runtime::SourcePlan {
+            let item = self
+                .core
+                .channel
+                .transport
+                .endpoint()
+                .events()
+                .wait_item(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED, 0);
+            libexecution::runtime::SourcePlan::new(item.handle, item.signals)
+        }
+
         /// 唤醒后重查：观察信号合成类型化条件；终态经 IoError 报告。
         pub fn poll(&mut self, observed: ObjectSignals) -> Result<Option<ConsumerReady>, IoError> {
             let terminal = observed.intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
@@ -800,6 +869,7 @@ mod tests {
     struct Host {
         storage: Arc<Storage>,
         fail_notify: Arc<AtomicBool>,
+        wait_timeout: Arc<AtomicBool>,
         closed: Arc<AtomicBool>,
         notifications: Arc<AtomicUsize>,
         fail_close: bool,
@@ -823,6 +893,7 @@ mod tests {
             let make = || Self {
                 storage: storage.clone(),
                 fail_notify: Arc::new(AtomicBool::new(false)),
+                wait_timeout: Arc::new(AtomicBool::new(false)),
                 closed: Arc::new(AtomicBool::new(false)),
                 notifications: Arc::new(AtomicUsize::new(0)),
                 fail_close: false,
@@ -899,9 +970,13 @@ mod tests {
         fn acknowledge(&self) -> Result<(), SystemCallError> {
             Ok(())
         }
-        fn wait(&self) -> Result<bool, SystemCallError> {
+        fn wait(&self, _deadline: Deadline) -> Result<Option<bool>, SystemCallError> {
             std::thread::yield_now();
-            Ok(false)
+            Ok(if self.wait_timeout.load(Ordering::Relaxed) {
+                None
+            } else {
+                Some(false)
+            })
         }
         fn close(&mut self) -> Result<(), SystemCallError> {
             if self.fail_close {
@@ -919,6 +994,12 @@ mod tests {
             ProducerCore::new(p, true).unwrap(),
             ConsumerCore::new(c, false).unwrap(),
         )
+    }
+
+    fn consumer_creator_pair(pages: usize) -> (ProducerCore<Host>, ConsumerCore<Host>) {
+        let (p, c) = Host::pair(pages);
+        let consumer = ConsumerCore::new(c, true).unwrap();
+        (ProducerCore::new(p, false).unwrap(), consumer)
     }
     #[test]
     fn empty_full_and_split_copies() {
@@ -1001,12 +1082,50 @@ mod tests {
             .fail_notify
             .store(true, Ordering::Relaxed);
         p.channel.transport.fail_close = true;
-        let error = p.write_all(b"payload").unwrap_err();
+        let error = p.write_all(b"payload", Deadline::INFINITE).unwrap_err();
         assert_eq!(error.completed, 7);
         assert_eq!(error.error, RunnelError::Closed);
-        assert_eq!(error.cleanup_error, Some(SystemCallError::ObjectBusy));
+        assert!(!p.channel.transport.closed.load(Ordering::Relaxed));
+        assert_eq!(p.channel.close(), Err(SystemCallError::ObjectBusy));
         assert_eq!(p.head, 7);
         assert_eq!(p.write(b"again").unwrap_err().completed, 0);
+    }
+
+    #[test]
+    fn absolute_wait_timeout_preserves_progress_and_role() {
+        let (mut p, mut c) = pair(1);
+        let capacity = p.channel.capacity;
+        let input = vec![7; capacity + 1];
+        p.channel
+            .transport
+            .wait_timeout
+            .store(true, Ordering::Relaxed);
+        let error = p.write_all(&input, Deadline::at(123)).unwrap_err();
+        assert_eq!(error.error, RunnelError::TimedOut);
+        assert_eq!(error.completed, capacity);
+        assert!(p.channel.terminal.is_none());
+        assert!(!p.channel.transport.closed.load(Ordering::Relaxed));
+        let mut first = [0; 1];
+        assert_eq!(c.read(&mut first).unwrap(), 1);
+        assert_eq!(p.write(&input[capacity..]).unwrap(), 1);
+
+        let (mut p, mut c) = pair(1);
+        p.write(&[3]).unwrap();
+        c.channel
+            .transport
+            .wait_timeout
+            .store(true, Ordering::Relaxed);
+        let mut output = [0; 2];
+        let error = c
+            .read_exact_or_eof(&mut output, Deadline::at(123))
+            .unwrap_err();
+        assert_eq!(error.error, RunnelError::TimedOut);
+        assert_eq!(error.completed, 1);
+        assert_eq!(output[0], 3);
+        assert!(c.channel.terminal.is_none());
+        p.write(&[4]).unwrap();
+        assert_eq!(c.read(&mut output[1..]).unwrap(), 1);
+        assert_eq!(output, [3, 4]);
     }
 
     #[test]
@@ -1088,7 +1207,9 @@ mod tests {
             .fail_notify
             .store(true, Ordering::Relaxed);
         let mut out = [0; 10];
-        let error = c.read_exact_or_eof(&mut out).unwrap_err();
+        let error = c
+            .read_exact_or_eof(&mut out, Deadline::INFINITE)
+            .unwrap_err();
         assert_eq!(error.completed, 5);
         assert_eq!(&out[..5], b"hello");
         assert_eq!(c.tail, 5);
@@ -1129,29 +1250,38 @@ mod tests {
         let (p, c) = Host::pair(3);
         let mut producer = ProducerCore::new(p, true).unwrap();
         producer.channel.transport.invited = true;
-        producer.write_all(b"published-before-attach").unwrap();
+        producer
+            .write_all(b"published-before-attach", Deadline::INFINITE)
+            .unwrap();
         producer.finish().unwrap();
         let mut consumer = ConsumerCore::new(c, false).unwrap();
         let mut output = [0; 64];
-        let count = consumer.read_exact_or_eof(&mut output).unwrap();
+        let count = consumer
+            .read_exact_or_eof(&mut output, Deadline::INFINITE)
+            .unwrap();
         assert_eq!(&output[..count], b"published-before-attach");
         assert!(consumer.eof_reached().unwrap());
     }
     #[test]
     fn zero_length_operations_cannot_revive_broken_channel() {
         let (mut p, mut c) = pair(1);
-        p.write_all(&[]).unwrap();
-        assert_eq!(c.read_exact_or_eof(&mut []).unwrap(), 0);
+        p.write_all(&[], Deadline::INFINITE).unwrap();
+        assert_eq!(c.read_exact_or_eof(&mut [], Deadline::INFINITE).unwrap(), 0);
         p.channel
             .transport
             .store64(HEAD, u64::MAX, Ordering::Release);
         assert_eq!(c.readable().unwrap_err().error, RunnelError::Broken);
         assert_eq!(
-            c.read_exact_or_eof(&mut []).unwrap_err().error,
+            c.read_exact_or_eof(&mut [], Deadline::INFINITE)
+                .unwrap_err()
+                .error,
             RunnelError::Broken
         );
         assert_eq!(p.writable().unwrap_err().error, RunnelError::Broken);
-        assert_eq!(p.write_all(&[]).unwrap_err().error, RunnelError::Broken);
+        assert_eq!(
+            p.write_all(&[], Deadline::INFINITE).unwrap_err().error,
+            RunnelError::Broken
+        );
     }
     #[test]
     fn concurrent_blocking_roles_and_eof() {
@@ -1162,10 +1292,14 @@ mod tests {
             let mut output = vec![0; total + 1];
             std::thread::scope(|scope| {
                 scope.spawn(|| {
-                    p.write_all(&input).unwrap();
+                    p.write_all(&input, Deadline::INFINITE).unwrap();
                     p.finish().unwrap();
                 });
-                assert_eq!(c.read_exact_or_eof(&mut output).unwrap(), total);
+                assert_eq!(
+                    c.read_exact_or_eof(&mut output, Deadline::INFINITE)
+                        .unwrap(),
+                    total
+                );
             });
             assert_eq!(output[..total], input);
         }
@@ -1174,9 +1308,22 @@ mod tests {
     #[test]
     fn producer_poll_reports_writable_eof_consumed_and_pending() {
         let (mut p, mut c) = pair(1);
-        // 新流：可写空间即条件。
+        // 环的可写空间不证明对端已经 Attach。
         assert_eq!(
-            p.poll(false).unwrap(),
+            p.poll(false, false).unwrap(),
+            Some(ProducerReady::Writable {
+                bytes: p.channel.capacity
+            })
+        );
+        assert!(!p.peer_established);
+        // 内核建立电平即使与 Writable 同时到达也只报告一次。
+        assert_eq!(
+            p.poll(false, true).unwrap(),
+            Some(ProducerReady::PeerAttached)
+        );
+        assert!(p.peer_established);
+        assert_eq!(
+            p.poll(false, true).unwrap(),
             Some(ProducerReady::Writable {
                 bytes: p.channel.capacity
             })
@@ -1184,26 +1331,32 @@ mod tests {
         // 写满后无进展：acknowledge 重查仍无。
         let fill = vec![1u8; p.channel.capacity];
         assert_eq!(p.write(&fill).unwrap(), p.channel.capacity);
-        assert_eq!(p.poll(false).unwrap(), None);
+        assert_eq!(p.poll(false, false).unwrap(), None);
         // 消费腾空 + EOF 发布：全部消费条件成立。
         let mut drain = vec![0u8; p.channel.capacity];
         assert_eq!(c.read(&mut drain).unwrap(), p.channel.capacity);
         p.finish().unwrap();
-        assert_eq!(p.poll(false).unwrap(), Some(ProducerReady::EofConsumed));
+        assert_eq!(
+            p.poll(false, false).unwrap(),
+            Some(ProducerReady::EofConsumed)
+        );
         // 终态观察直接失败。
-        assert_eq!(p.poll(true).unwrap_err().error, RunnelError::Closed);
+        assert_eq!(p.poll(true, false).unwrap_err().error, RunnelError::Closed);
     }
 
     #[test]
     fn consumer_poll_reports_attach_readable_and_drained() {
-        let (mut p, mut c) = pair(1);
+        let (mut p, mut c) = consumer_creator_pair(1);
         // 未建立：空流上 PEER_ATTACHED 观察返回建立条件且此后不再纳入。
         assert!(c.includes_peer_attached());
+        assert!(!c.kernel_attached);
         assert_eq!(
             c.poll(false, true).unwrap(),
             Some(ConsumerReady::PeerAttached)
         );
         assert!(!c.includes_peer_attached());
+        assert!(c.kernel_attached);
+        assert!(c.peer_established);
         assert_eq!(c.poll(false, true).unwrap(), None);
         // 有数据优先于一切：Readable 携带字节数。
         let payload = [7u8; 16];
@@ -1223,5 +1376,51 @@ mod tests {
             c.poll(false, false).unwrap(),
             Some(ConsumerReady::EofDrained)
         );
+    }
+
+    #[test]
+    fn consumer_data_does_not_replace_kernel_attach_event() {
+        let (mut p, mut c) = consumer_creator_pair(1);
+        assert!(!c.peer_established);
+        assert!(!c.kernel_attached);
+        assert_eq!(p.write(&[7]).unwrap(), 1);
+        assert_eq!(
+            c.poll(false, false).unwrap(),
+            Some(ConsumerReady::Readable {
+                bytes: 1,
+                peer_attached: false,
+            })
+        );
+        assert!(c.peer_established);
+        assert!(!c.kernel_attached);
+        assert!(c.includes_peer_attached());
+        assert_eq!(
+            c.poll(false, true).unwrap(),
+            Some(ConsumerReady::Readable {
+                bytes: 1,
+                peer_attached: true,
+            })
+        );
+        assert!(c.kernel_attached);
+        assert!(!c.includes_peer_attached());
+        let mut data = [0; 1];
+        assert_eq!(c.read(&mut data).unwrap(), 1);
+        assert_eq!(data, [7]);
+    }
+
+    #[test]
+    fn consumer_late_attach_event_survives_drained_data() {
+        let (mut p, mut c) = consumer_creator_pair(1);
+        assert_eq!(p.write(&[9]).unwrap(), 1);
+        let mut data = [0; 1];
+        assert_eq!(c.read(&mut data).unwrap(), 1);
+        assert_eq!(c.poll(false, false).unwrap(), None);
+        assert!(c.includes_peer_attached());
+        assert_eq!(
+            c.poll(false, true).unwrap(),
+            Some(ConsumerReady::PeerAttached)
+        );
+        assert!(c.kernel_attached);
+        assert!(!c.includes_peer_attached());
     }
 }

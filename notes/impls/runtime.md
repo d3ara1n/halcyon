@@ -12,7 +12,9 @@
 
 每个任务的输入 FIFO 链接位于正式来源记录中，以稳定 token 寻址。来源 ready 进入预付 pending 槽，仅入队一次；advance 最多取本次预算允许的记录，未消费记录按原序还回队首。无需遍历该任务的全部潜在来源，也没有注销留下的无界 tombstone。Rearm、Remove 与迟到 generation 共用同一账本。
 
-`Requests` 的有限容量是每次任务推进的输出政策，不是服务连接数限制。其缓冲和额度在 Runtime 创建时预备，推进间复用；PendingGate 只持结算状态，存在 Gate 时不推进新的任务，每步从同一缓冲执行或拒绝一个操作；失败 advance 的剩余请求也保留到后续 Gate 结算。拒绝即使发生在业务提出 Complete 后，也让原任务再次取得推进机会，处理返还的责任。失败推进的业务期限与 ready/Hold 状态独立保留，Gate 收尾重新读取任务状态而不清空业务 timer；同一已投递期限不会被重复武装。任务执行和 Gate 回调前按该任务的通知义务确认到期，不依赖有预算的期限堆已弹出其 timer；较早的执行 Retry 不能使任务在未取得已到期业务输入时改写期限。Rearm/Remove 在正常、Complete 和失败 Gate 中都校验任务归属，维护面使用独立内部入口。请求、接收与 scratch 存储、来源记录都有准入；`Runtime::input_budget` 按实际类型大小和来源数量推导装配账户所需的输入额度。
+`Requests` 的有限容量是每次任务推进的输出政策，不是服务连接数限制。其缓冲和额度在 Runtime 创建时预备，推进间复用；PendingGate 只持结算状态，存在 Gate 时不推进新的任务，每步从同一缓冲执行或拒绝一个操作；失败 advance 的剩余请求也保留到后续 Gate 结算。拒绝即使发生在业务提出 Complete 后，也让原任务再次取得推进机会，处理返还的责任；来源超过该任务的上限时 Gate 通过 `RequestFailure::Source` 返还错误，不登记来源，任务与 InputBytes 在真正退休后退款。失败推进的业务期限与 ready/Hold 状态独立保留，Gate 收尾重新读取任务状态而不清空业务 timer；同一已投递期限不会被重复武装。任务执行和 Gate 回调前按该任务的通知义务确认到期，不依赖有预算的期限堆已弹出其 timer；较早的执行 Retry 不能使任务在未取得已到期业务输入时改写期限。Rearm/Remove 在正常、Complete 和失败 Gate 中都校验任务归属，维护面使用独立内部入口。请求、接收与 scratch 存储、来源记录都有准入；`Runtime::input_budget` 按实际类型大小和来源数量推导装配账户所需的输入额度。
+
+创建期间 `Runtime::try_new` 在容量/分配拒绝时按值返还原 SourceSet 和错误，输入 Charge 随未完成装配退款；已有 `new` 保持原错误签名，FAL Copy 这种在用户调用中动态创建 WaitSet 的消费者使用 `try_new`，明确关闭失败仍保留 set。Copy 的一条任务最多登记源/目标各 DATA 与仅终态来源、可选取消来源共五项；本地 Budget/Account 按 `Runtime::input_budget` 预付，所有来源注销回执和任务退休后检查 Task/InputBytes 归零，Set 关闭失败由 CopyFailure 带缓冲快照续作。
 
 `libbudget` 在 `metadata_admission::Permit` 与 `SponsoredPermit` 上建立非领域化 Budget/Account、带预算身份的 `BudgetSlot`、不可变 `AccountView<K>` 与非泛型 Charge。Account 是唯一付款身份；领域视图只把分类绑定到同一实际布局，跨 Budget 的槽会被拒绝，视图克隆只克隆 Arc、不重新分配绑定或创建账户。零单位 Charge 也持有账户，保证结构性账户名额直到真实 owner 释放；计量 Charge 支持只减不增的 `shrink_to`，资源实际占用缩小时立即返还差额，并同步更新本地账户与 sponsor/global 两层计数。FAL 成功 Take 用这一出口把原属性 Bytes charge 收缩到空值实际长度，避免把已移交值的历史容量保留到节点退休。
 

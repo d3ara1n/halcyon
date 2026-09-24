@@ -336,6 +336,9 @@ impl<P> NodeStore<P> {
     pub fn has_retire_work(&self) -> bool {
         self.current.is_some() || self.retire.head.borrow().is_some()
     }
+    pub fn wake_retirement(&self) {
+        self.retire.wake.publish();
+    }
 
     /// 撤下根链接；grant/流保留的 pin 仍须先退休，不能越过真实存活引用。
     pub fn seal(&mut self) {

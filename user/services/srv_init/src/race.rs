@@ -143,8 +143,6 @@ impl RaceHammers {
             let exit = Cmd {
                 action: race::ACTION_EXIT,
                 code: 0,
-                entry: 0,
-                sp: 0,
                 aux: 0,
             };
             let _ = self.send_cmd(i, &exit, &[]);
@@ -161,8 +159,6 @@ fn race_cmd(action: u64, code: u64) -> Cmd {
     Cmd {
         action,
         code,
-        entry: 0,
-        sp: 0,
         aux: 0,
     }
 }
@@ -173,8 +169,6 @@ fn race_cmd_delayed(action: u64, code: u64, delay_ms: u64) -> Cmd {
     Cmd {
         action,
         code,
-        entry: 0,
-        sp: 0,
         aux: delay_ms,
     }
 }

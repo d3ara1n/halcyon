@@ -9,7 +9,9 @@ use alloc::vec::Vec;
 use erhino_shared::{
     call::SystemCallError,
     message::{HandleMove, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX},
-    object::{Handle, HandleDescription, HandlePair, HandleRole, ObjectSignals, Rights, SenderResult},
+    object::{
+        Handle, HandleDescription, HandlePair, HandleRole, ObjectSignals, Rights, SenderResult,
+    },
     time::Deadline,
     wait::{WaitItem, WaitReason},
 };
@@ -173,10 +175,18 @@ pub struct SenderAdoptFailure {
     pub error: SystemCallError,
 }
 
+#[derive(Debug)]
+pub struct MailboxAdoptFailure {
+    pub owner: Capability,
+    pub error: SystemCallError,
+}
+
 impl MailboxSender {
     /// 未知能力在唯一转换边界 Query 一次；错误时完整返还 owner。
     /// 返回的描述供调用方一次性完成 rights 检查，此后不再 Query。
-    pub fn from_capability(owner: Capability) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
+    pub fn from_capability(
+        owner: Capability,
+    ) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
         let adopt = owner.description().and_then(|description| {
             if description.role != HandleRole::MailboxSender as u32 {
                 return Err(SystemCallError::WrongObjectType);
@@ -202,7 +212,9 @@ impl MailboxSender {
         self.capability
     }
     pub fn close(self) -> Result<(), (Self, SystemCallError)> {
-        self.capability.close().map_err(|(capability, error)| (Self { capability }, error))
+        self.capability
+            .close()
+            .map_err(|(capability, error)| (Self { capability }, error))
     }
     /// 消费 owner 并显式移交原始关闭责任；仅用于原始工厂与诊断边界。
     pub fn into_raw(self) -> Handle {
@@ -212,7 +224,12 @@ impl MailboxSender {
     pub fn send(&self, kind: u64, payload: &[u8]) -> Result<(), SystemCallError> {
         self.send_until(kind, payload, Deadline::INFINITE)
     }
-    pub fn send_until(&self, kind: u64, payload: &[u8], deadline: Deadline) -> Result<(), SystemCallError> {
+    pub fn send_until(
+        &self,
+        kind: u64,
+        payload: &[u8],
+        deadline: Deadline,
+    ) -> Result<(), SystemCallError> {
         // SAFETY: 没有 move，目标普通 sender 不被消费。
         unsafe { sys_send(self.as_handle(), kind, payload, &[], deadline) }
     }
@@ -220,7 +237,9 @@ impl MailboxSender {
 
 impl SendOnce {
     /// 未知能力在唯一转换边界 Query 一次；错误时完整返还 owner。
-    pub fn from_capability(owner: Capability) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
+    pub fn from_capability(
+        owner: Capability,
+    ) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
         let adopt = owner.description().and_then(|description| {
             if description.role != HandleRole::MailboxSenderOnce as u32 {
                 return Err(SystemCallError::WrongObjectType);
@@ -254,7 +273,9 @@ impl SendOnce {
         self.capability
     }
     pub fn close(self) -> Result<(), (Self, SystemCallError)> {
-        self.capability.close().map_err(|(capability, error)| (Self { capability }, error))
+        self.capability
+            .close()
+            .map_err(|(capability, error)| (Self { capability }, error))
     }
 }
 
@@ -264,6 +285,27 @@ pub struct MintedSender {
 }
 
 impl Mailbox {
+    /// 将 StartupBlock 或消息转入的唯一 Mailbox owner 收编为 typed owner。
+    pub fn from_capability(
+        owner: Capability,
+    ) -> Result<(Self, HandleDescription), MailboxAdoptFailure> {
+        let adopt = owner.description().and_then(|description| {
+            if description.role != HandleRole::MailboxOwner as u32 {
+                return Err(SystemCallError::WrongObjectType);
+            }
+            Ok(description)
+        });
+        match adopt {
+            Ok(description) => Ok((
+                Self {
+                    owner: Some(owner.into_raw()),
+                },
+                description,
+            )),
+            Err(error) => Err(MailboxAdoptFailure { owner, error }),
+        }
+    }
+
     pub fn create(rights: Rights) -> Result<Self, SystemCallError> {
         let mut owner = Handle::INVALID;
         // SAFETY: 新创建的 receiver-owner 由此对象独占。
@@ -305,6 +347,20 @@ impl Mailbox {
 
     pub fn into_raw(mut self) -> Handle {
         self.owner.take().expect("Mailbox owner already consumed")
+    }
+
+    pub fn close(mut self) -> Result<(), (Self, SystemCallError)> {
+        let Some(owner) = self.owner else {
+            return Ok(());
+        };
+        // SAFETY: self 独占 Mailbox owner；失败保留 owner，成功后禁止 Drop 重复关闭。
+        match unsafe { super::object::close(owner) } {
+            Ok(()) => {
+                self.owner = None;
+                Ok(())
+            }
+            Err(error) => Err((self, error)),
+        }
     }
 }
 

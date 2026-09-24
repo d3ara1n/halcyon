@@ -10,14 +10,16 @@
 
 ## 同步 Caller
 
-`Caller` 懒创建并复用线程私有 ReplyPort；同一实例只允许一个 outstanding call。发送步骤是：
+`Caller` 懒创建并复用线程私有 ReplyPort；同一实例只允许一个 outstanding call。`CallOperation` 借用 Caller 及其 ReplyPort，保存发送前 Request、Deadline 与可选取消能力；同步 `call_cancelable` 驱动它。操作状态严格为 `Unsent(Request)`、`Sent` 或 `Completed`：
 
 1. 从独立 `monotonic_id` domain 分配单调非零 txid 并编码 RpcPrefix；最大值后永久返回 ReachLimit，不回绕路由旧回复；
 2. 从 ReplyPort sender 派生 send-once，作为 slot 0 与业务 Handles 一起投递；
-3. WaitMany 同时观察 ReplyPort READABLE/CLOSED 与服务 endpoint CLOSED；
+3. WaitMany 同时观察 ReplyPort READABLE/CLOSED 与服务 endpoint CLOSED；`call_cancelable` 的投递背压和回复等待另观察调用者借用的取消能力 READABLE/CLOSED，仍使用同一绝对期限；
 4. 接收后由纯逻辑 `validate_response` 验证 protocol id、Response kind 与 txid；任一拒绝都逐项关闭已安装 Handle、废弃当前 ReplyPort，再返回 typed rejection。
 
-ServiceClosed、Wait/Receive 错误和 timeout 同样废弃端口，`Caller` 自身析构也关闭仍存 ReplyPort；因而失败、提前放弃或并发迟到回复都不能污染下一次调用。可进入 transit 的 role 都是固定上界叶 close（Tunnel Endpoint 不具 TRANSIT），reject cleanup 不建立新的异步 owner。公开参数 `timeout_ms` 是相对毫秒超时，零表示无限。超时只停止本地等待：Caller 关闭并废弃整个 ReplyPort，下次调用懒重建；迟到回复因 owner 已关闭而投递失败。返回 `CallError::Timeout`，不自动重试可能有副作用的请求。
+同步驱动在 ServiceClosed、Wait/Receive 错误、timeout 和外部取消时废弃当前 ReplyPort；可进入 transit 的 role 都是固定上界叶 close（Tunnel Endpoint 不具 TRANSIT），reject cleanup 不建立新的异步 owner。`CallOperation::advance` 只做一次非阻塞发送或回复尝试；`wait_ready` 按未发送/已发送分别观察 service writable 或 ReplyPort，并观察 service close/cancel。成功接收回复进入 `Completed`，完成操作不能再次推进；`abort` 按阶段返还原 Request 或 ReplyCleanup。已发送操作被显式 abort 或直接 Drop 时都会隔离旧 ReplyPort，迟到回复不能进入下一调用。`CallError` 的互斥 owner 是 `Unsent(Request)`、`Reply(ReplyCleanup)` 或 None：发送前拒绝保留原请求；发送后未确认按 Sent 返回未知，关闭失败保留 typed owner 供 `retry_cleanup`。RPC 不自动重试可能有副作用的已投递请求。
+
+分步接口已由 `libfal::ClientOperation` 接通：调用者可观察阶段、非阻塞推进、等待、abort 和完成回复；`call_classified` 将编码失败、未投递、已投递未知与明确业务拒绝分开。`caller.rs` 仅在 RISC-V 目标编译，生命周期证据由正式 A/B `test_fal` 的迟到回复、完成后不可推进、provider CLOSED 后未投递请求及 Copy 消费提供；host framing/OutboundStage 测试不替代该行为证据。
 
 ## 异步出站任务
 

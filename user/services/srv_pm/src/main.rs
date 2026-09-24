@@ -37,7 +37,7 @@ use rinlib::{
         object::{Handle, ObjectSignals},
         time::Deadline,
     },
-    sys_exit, sys_sleep,
+    sys_exit,
 };
 
 const STREAM_LEN: usize = 65536;
@@ -870,12 +870,6 @@ fn main() {
     debug!("Hello, pm!");
     // 服务出生自带的邮箱 owner（StartupBlock Handle[0]）。
     let mailbox = env::startup_handle(0).expect("pm: mailbox owner grant is missing");
-    // sleep 异步通路验证：登记期限 → Waiting → timer 唤醒 → 继续。
-    unsafe {
-        sys_sleep(30).expect("sleep");
-        sys_sleep(10).expect("sleep again");
-    }
-    debug!("awake after two sleeps");
     // StartupBlock Handle[1] = init 授出的 pm_domain JobControl。
     let domain = env::startup_handle(1).expect("pm: delegated domain control is missing");
 

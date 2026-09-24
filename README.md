@@ -2,7 +2,7 @@
 
 Halcyon 是以 eRhino RV64 微内核为核心、包含用户态系统服务与跨组件契约的完整系统项目。
 用户态基础运行库为 `rinlib`。内核采用协作式执行，每次推进有结构性工作上界；业务政策与可由用户态承担的长工作在用户态服务中完成，已提交的特权维护由内核分批收束。
-内核当前构建名为 `erhino_kernel`，按全仓组件身份规则统一为 `kernel` 的后续工作见[命名计划](plans/todo-2026-09-22-kernel-identity.md)。
+内核构建身份为 `kernel`，目录保持为 `os/kernel/`；系统专名仍为 eRhino。
 
 ## 文档
 
@@ -53,7 +53,7 @@ just build_kernel  # 仅编译内核（alias: just b）
 # 终端 1（THROTTLE=100 关闭节流，便于断点单步）
 THROTTLE=100 just PLATFORM=qemu MODEL=virt run_qemu -smp cores=4 -s -S
 # 终端 2
-riscv64-elf-gdb artifacts/qemu/virt/erhino_kernel -ex 'target remote :1234'
+riscv64-elf-gdb artifacts/qemu/virt/kernel -ex 'target remote :1234'
 ```
 
 导出 QEMU 生成的设备树：

@@ -7,6 +7,11 @@ use crate::{
 };
 use erhino_shared::time::Deadline;
 
+mod stream;
+pub use stream::{
+    RNL2_PROTOCOL, StreamDirection, StreamInfo, StreamOffer, StreamReason, StreamState,
+};
+
 pub const ID: u64 = 0x4641_4c32;
 pub const ROOT_GRANT_KIND: u64 = 0x4641_4c32_524f_4f54;
 pub const PROVIDER_READY_KIND: u64 = 0x4641_4c32_5245_4144;
@@ -78,6 +83,11 @@ pub enum Op {
     Subscribe = 13,
     QuerySubscription = 14,
     Unsubscribe = 15,
+    Open = 16,
+    Start = 17,
+    QueryStream = 18,
+    FinishStream = 19,
+    CancelStream = 20,
 }
 
 impl Op {
@@ -98,6 +108,11 @@ impl Op {
             13 => Some(Self::Subscribe),
             14 => Some(Self::QuerySubscription),
             15 => Some(Self::Unsubscribe),
+            16 => Some(Self::Open),
+            17 => Some(Self::Start),
+            18 => Some(Self::QueryStream),
+            19 => Some(Self::FinishStream),
+            20 => Some(Self::CancelStream),
             _ => None,
         }
     }
@@ -414,6 +429,20 @@ pub enum Request<'a> {
     Unsubscribe {
         id: u64,
     },
+    Open {
+        path: &'a str,
+        expected_identity: Option<core::num::NonZeroU64>,
+        direction: StreamDirection,
+        offset: u64,
+        length: Option<u64>,
+        session_deadline: Deadline,
+        stream_protocol: u32,
+        tunnel_bytes: u32,
+    },
+    Start,
+    QueryStream,
+    FinishStream,
+    CancelStream,
 }
 
 fn text<'a>(reader: &mut Reader<'a>) -> Result<&'a str, DecodeError> {
@@ -446,6 +475,11 @@ impl<'a> Request<'a> {
             Self::Subscribe { .. } => Op::Subscribe,
             Self::QuerySubscription { .. } => Op::QuerySubscription,
             Self::Unsubscribe { .. } => Op::Unsubscribe,
+            Self::Open { .. } => Op::Open,
+            Self::Start => Op::Start,
+            Self::QueryStream => Op::QueryStream,
+            Self::FinishStream => Op::FinishStream,
+            Self::CancelStream => Op::CancelStream,
         }
     }
 
@@ -478,6 +512,20 @@ impl<'a> Request<'a> {
             Self::Take { path } => text_len(path),
             Self::Subscribe { path, .. } => 8usize.checked_add(text_len(path)?),
             Self::QuerySubscription { .. } | Self::Unsubscribe { .. } => Some(8),
+            Self::Open {
+                path,
+                offset,
+                length,
+                session_deadline,
+                ..
+            } => {
+                session_deadline.instant().ok()??;
+                if let Some(length) = length {
+                    offset.checked_add(*length)?;
+                }
+                56usize.checked_add(text_len(path)?)
+            }
+            Self::Start | Self::QueryStream | Self::FinishStream | Self::CancelStream => Some(0),
         }
     }
 
@@ -564,6 +612,29 @@ impl<'a> Request<'a> {
                 writer.sized_bytes(path.as_bytes());
             }
             Self::QuerySubscription { id } | Self::Unsubscribe { id } => writer.u64(*id),
+            Self::Open {
+                path,
+                expected_identity,
+                direction,
+                offset,
+                length,
+                session_deadline,
+                stream_protocol,
+                tunnel_bytes,
+            } => {
+                writer.u32(*direction as u32);
+                writer.u32(u32::from(length.is_some()));
+                writer.u64(*offset);
+                writer.u64(length.unwrap_or(0));
+                writer.u32(session_deadline.kind);
+                writer.u32(session_deadline.reserved);
+                writer.u64(session_deadline.at_ns);
+                writer.u32(*stream_protocol);
+                writer.u32(*tunnel_bytes);
+                writer.u64(expected_identity.map_or(0, core::num::NonZeroU64::get));
+                writer.sized_bytes(path.as_bytes());
+            }
+            Self::Start | Self::QueryStream | Self::FinishStream | Self::CancelStream => {}
         }
     }
 
@@ -661,6 +732,48 @@ impl<'a> Request<'a> {
                 }
                 Self::Unsubscribe { id }
             }
+            Op::Open => {
+                let direction = StreamDirection::from_raw(reader.u32()?).ok_or(DecodeError)?;
+                let flags = reader.u32()?;
+                if flags & !1 != 0 {
+                    return Err(DecodeError);
+                }
+                let offset = reader.u64()?;
+                let raw_length = reader.u64()?;
+                if flags == 0 && raw_length != 0 {
+                    return Err(DecodeError);
+                }
+                let length = (flags == 1).then_some(raw_length);
+                if let Some(length) = length {
+                    offset.checked_add(length).ok_or(DecodeError)?;
+                }
+                let session_deadline = Deadline {
+                    kind: reader.u32()?,
+                    reserved: reader.u32()?,
+                    at_ns: reader.u64()?,
+                };
+                if session_deadline
+                    .instant()
+                    .map_err(|_| DecodeError)?
+                    .is_none()
+                {
+                    return Err(DecodeError);
+                }
+                Self::Open {
+                    direction,
+                    offset,
+                    length,
+                    session_deadline,
+                    stream_protocol: reader.u32()?,
+                    tunnel_bytes: reader.u32()?,
+                    expected_identity: core::num::NonZeroU64::new(reader.u64()?),
+                    path: text(&mut reader)?,
+                }
+            }
+            Op::Start => Self::Start,
+            Op::QueryStream => Self::QueryStream,
+            Op::FinishStream => Self::FinishStream,
+            Op::CancelStream => Self::CancelStream,
         };
         reader.finish()?;
         Ok(request)
@@ -794,6 +907,8 @@ pub enum Response<'a> {
     Written(u32),
     Empty,
     Subscription(SubscriptionInfo),
+    StreamOffer(StreamOffer),
+    StreamInfo(StreamInfo),
 }
 
 impl<'a> Response<'a> {
@@ -829,6 +944,16 @@ impl<'a> Response<'a> {
             Self::Written(_) => Some(4),
             Self::Empty => Some(0),
             Self::Subscription(_) => Some(SubscriptionInfo::ENCODED_LEN),
+            Self::StreamOffer(_) if op == Op::Open => Some(StreamOffer::ENCODED_LEN),
+            Self::StreamInfo(_)
+                if matches!(
+                    op,
+                    Op::Start | Op::QueryStream | Op::FinishStream | Op::CancelStream
+                ) =>
+            {
+                Some(StreamInfo::ENCODED_LEN)
+            }
+            _ => None,
         }
     }
 
@@ -872,6 +997,8 @@ impl<'a> Response<'a> {
             Self::Written(count) => writer.u32(*count),
             Self::Empty => {}
             Self::Subscription(info) => info.write(writer),
+            Self::StreamOffer(offer) => offer.write(writer),
+            Self::StreamInfo(info) => info.write(writer),
         }
     }
 
@@ -921,6 +1048,10 @@ impl<'a> Response<'a> {
             Op::Subscribe | Op::QuerySubscription => {
                 Self::Subscription(SubscriptionInfo::read(&mut reader)?)
             }
+            Op::Open => Self::StreamOffer(StreamOffer::read(&mut reader)?),
+            Op::Start | Op::QueryStream | Op::FinishStream | Op::CancelStream => {
+                Self::StreamInfo(StreamInfo::read(&mut reader)?)
+            }
         };
         reader.finish()?;
         Ok(response)
@@ -954,6 +1085,11 @@ impl<'a> Response<'a> {
             | (Op::WriteAt, Self::Written(_))
             | (Op::Write | Op::Delete | Op::Move | Op::Unsubscribe, Self::Empty)
             | (Op::Subscribe | Op::QuerySubscription, Self::Subscription(_)) => Some(0),
+            (Op::Open, Self::StreamOffer(_)) => Some(2),
+            (
+                Op::Start | Op::QueryStream | Op::FinishStream | Op::CancelStream,
+                Self::StreamInfo(_),
+            ) => Some(0),
             _ => None,
         }
     }

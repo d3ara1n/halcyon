@@ -18,7 +18,9 @@ ReplyPort sender 派生的 send-once 保持同一发送授权，以 WRITE、WAIT
 
 ## 并发与回复路由
 
-Mailbox 严格 FIFO，无选择性 Receive。同步 Caller 私有 ReplyPort，同一 port 同时最多一个 outstanding call；失败或超时可以关闭并废弃整个 port。
+Mailbox 严格 FIFO，无选择性 Receive。同步 Caller 私有 ReplyPort，同一 port 同时最多一个 outstanding call；失败、超时或调用者的外部取消可以关闭并废弃整个 port。未投递的请求仍归调用者，已投递但未确认的业务结果仍为未知；ReplyPort 关闭失败的 owner 必须随调用错误返还并可重试，而非仅依赖析构。
+
+单调用的分步接口遵守同一规则：放弃尚未完成的操作后，旧回复不能进入后续调用；接受回复后形成终态，不能再次解释为未决调用。错误的未发送/已发送分类来自实际投递阶段，本地编码失败不会产生远端未知副作用。同步驱动和外部驱动共享这份语义；公共操作模型可面向长期同步/异步组合提前设计，避免各业务分别维护运输状态与清理规则。具体业务语义仍由相应协议拥有。
 
 异步多 in-flight 使用一个 dispatcher 按不复用的 txid 路由。单个请求超时只退休该 pending 项，不能关闭其他请求共享的回复端口。不存在 pending waiter 的回复连同能力一起丢弃，不保留无限 tombstone。
 

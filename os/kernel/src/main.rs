@@ -139,7 +139,6 @@ pub fn main() {
         log!(Boot, "package @{:#x} ({:#x})", addr, actual);
     }
     frame::init(&board);
-    heap::selftest();
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
     frame::release_device_tree(&board);

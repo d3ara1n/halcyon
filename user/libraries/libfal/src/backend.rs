@@ -4,11 +4,11 @@ use crate::resource::FalResource;
 use crate::{
     authority::{AccessSnapshot, FalRights},
     data::{Data, PreparedWrite},
-    node::NodeKind,
+    node::{NodeKind, validate_path},
     store::{NodeId, NodeRef, NodeStore, Payload, PreparedNode, RetireContext, RetireProgress},
-    value::{Capability, StoredValue, TakenValue},
+    value::{Capability, ReadSnapshot, StoredValue, TakenValue, ValueError},
 };
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use erhino_shared::call::SystemCallError;
 use libbudget::{AccountView, Charge};
 use metadata_admission::{Counter, Permit};
@@ -27,6 +27,9 @@ pub enum BackendError {
     Busy,
     Closed,
     Resource(SystemCallError),
+    WrongType,
+    CrossDevice,
+    Unsupported,
 }
 impl From<SystemCallError> for BackendError {
     fn from(error: SystemCallError) -> Self {
@@ -34,21 +37,101 @@ impl From<SystemCallError> for BackendError {
     }
 }
 
+pub enum LookupResult<C: Capability> {
+    Found(NodeRef),
+    LinkBoundary {
+        reference: NodeRef,
+        consumed: String,
+        target: String,
+        remaining: String,
+    },
+    DelegationBoundary {
+        target: C,
+        rights: FalRights,
+        consumed: String,
+        remaining: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeMetadata {
+    pub identity: u64,
+    pub version: u64,
+    pub kind: NodeKind,
+    pub rights: FalRights,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    Backend(BackendError),
+    Value(ValueError),
+}
+
+impl From<BackendError> for ReadError {
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+impl From<ValueError> for ReadError {
+    fn from(error: ValueError) -> Self {
+        Self::Value(error)
+    }
+}
+
+/// FAL provider 对后端可观察状态的通用契约。
+pub trait Backend<C: Capability>: Sized {
+    fn root(&self) -> Option<&NodeRef>;
+    fn resolve(&self, access: &AccessSnapshot, path: &str) -> Result<NodeRef, BackendError>;
+    fn lookup(&self, access: &AccessSnapshot, path: &str) -> Result<LookupResult<C>, BackendError>;
+    fn metadata(
+        &self,
+        reference: &NodeRef,
+        ceiling: FalRights,
+    ) -> Result<NodeMetadata, BackendError>;
+    fn enumerate<F>(
+        &self,
+        parent: &NodeRef,
+        access: &AccessSnapshot,
+        cursor: u64,
+        limit: usize,
+        visit: F,
+    ) -> Result<u64, BackendError>
+    where
+        F: FnMut(&str, &NodeRef, NodeMetadata);
+    fn read_snapshot(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<ReadSnapshot<C>, ReadError>;
+    fn watch_snapshot(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<(NodeRef, u64), BackendError>;
+    fn seal(&mut self);
+    fn has_retire_work(&self) -> bool;
+    fn retire_step(&mut self, budget: usize) -> Result<RetireProgress, SystemCallError>;
+    fn is_empty(&self) -> bool;
+    fn close(self) -> Result<(), Self>;
+}
+
 struct Entry {
     node: NodeId,
     slot: Option<Permit>,
     _charge: Charge,
 }
-pub struct Directory {
+struct Directory {
     entries: OrderedTable<Entry, String>,
 }
-pub enum Body<C> {
+enum Body<C> {
     Directory(Directory),
     Property(StoredValue<C>),
     Stream(Data),
     Link(String),
 }
-pub struct MemoryNode<C> {
+struct MemoryNode<C> {
     body: Body<C>,
     rights: FalRights,
     version: u64,
@@ -57,7 +140,7 @@ pub struct MemoryNode<C> {
 }
 
 impl<C> MemoryNode<C> {
-    pub fn kind(&self) -> NodeKind {
+    fn kind(&self) -> NodeKind {
         match self.body {
             Body::Directory(_) => NodeKind::Directory,
             Body::Property(_) => NodeKind::Property,
@@ -65,16 +148,16 @@ impl<C> MemoryNode<C> {
             Body::Link(_) => NodeKind::SymbolicLink,
         }
     }
-    pub fn version(&self) -> u64 {
+    fn version(&self) -> u64 {
         self.version
     }
-    pub fn rights(&self) -> FalRights {
+    fn rights(&self) -> FalRights {
         self.rights
     }
-    pub fn body(&self) -> &Body<C> {
+    fn body(&self) -> &Body<C> {
         &self.body
     }
-    pub fn take_reserved(&self) -> bool {
+    fn take_reserved(&self) -> bool {
         self.take_reserved
     }
 }
@@ -143,6 +226,7 @@ impl Position {
 pub struct MemoryBackend<C> {
     nodes: NodeStore<MemoryNode<C>>,
     root: Option<NodeRef>,
+    retiring_property: Option<StoredValue<C>>,
     entry_slots: Arc<Counter>,
     limit: usize,
     epoch: u64,
@@ -207,24 +291,127 @@ enum Intent<C> {
     },
 }
 
-pub enum CommitResult<C> {
+pub enum CommitResult {
     Created(NodeRef),
     Deleted(NodeRef),
     Written,
     Moved(NodeRef),
-    PropertyReplaced(StoredValue<C>),
+    PropertyReplaced,
 }
-pub struct CommitFailure<C> {
+pub struct CommitFailure<M> {
     pub error: BackendError,
-    pub mutation: PreparedMutation<C>,
+    pub mutation: M,
 }
 pub struct PropertyFailure<C> {
     pub error: BackendError,
     pub value: StoredValue<C>,
 }
-pub struct CreateFailure<C> {
-    pub error: BackendError,
-    pub body: Body<C>,
+struct CreateFailure<C> {
+    error: BackendError,
+    _body: Body<C>,
+}
+
+pub enum CreateInput<'a> {
+    Node { kind: NodeKind, value: &'a [u8] },
+    Link(&'a str),
+}
+
+pub enum CreateError {
+    Backend(BackendError),
+    Value(ValueError),
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "mutation commit 必须原样返还预备 owner，避免失败路径丢失事务责任"
+)]
+pub trait MutationBackend<C: Capability>: Backend<C> {
+    type TakeReservation;
+    type Position;
+    type Mutation;
+    fn lookup_child(
+        &self,
+        parent: &NodeRef,
+        name: &str,
+        access: &AccessSnapshot,
+    ) -> Result<NodeRef, BackendError>;
+    fn read_stream(
+        &self,
+        reference: &NodeRef,
+        access: &AccessSnapshot,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, BackendError>;
+    fn property(&self, reference: &NodeRef) -> Result<&StoredValue<C>, BackendError>;
+    fn position(
+        &self,
+        parent: &NodeRef,
+        final_name: &str,
+        expected: Option<(NodeId, u64)>,
+    ) -> Result<Self::Position, BackendError>;
+    fn prepare_create(
+        &self,
+        position: Self::Position,
+        access: &AccessSnapshot,
+        input: CreateInput<'_>,
+        owners: &mut Vec<C>,
+        rights: FalRights,
+    ) -> Result<Self::Mutation, CreateError>;
+    fn prepare_delete(
+        &self,
+        position: Self::Position,
+        access: &AccessSnapshot,
+    ) -> Result<Self::Mutation, BackendError>;
+    fn prepare_property(
+        &self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+        value: StoredValue<C>,
+    ) -> Result<Self::Mutation, PropertyFailure<C>>;
+    fn prepare_write(
+        &self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<Self::Mutation, BackendError>;
+    fn prepare_move(
+        &self,
+        source: Self::Position,
+        source_access: &AccessSnapshot,
+        destination: &AccessSnapshot,
+        final_name: &str,
+    ) -> Result<Self::Mutation, BackendError>;
+    fn validate_move_step(
+        &self,
+        mutation: &mut Self::Mutation,
+        budget: usize,
+    ) -> Result<bool, BackendError>;
+    fn commit(
+        &mut self,
+        mutation: Self::Mutation,
+    ) -> Result<CommitResult, CommitFailure<Self::Mutation>>;
+    fn prepare_take(
+        &mut self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+    ) -> Result<Self::TakeReservation, BackendError>;
+    fn take_value(prepared: &mut Self::TakeReservation) -> TakenValue<C>;
+    fn commit_take(&mut self, prepared: Self::TakeReservation);
+    fn rollback_take(&mut self, prepared: Self::TakeReservation, value: TakenValue<C>);
+}
+
+/// 可由同一 FAL provider Runtime 驱动的完整后端契约。
+pub trait ProviderBackend<C: Capability>: MutationBackend<C> {}
+impl<C: Capability, B: MutationBackend<C>> ProviderBackend<C> for B {}
+
+fn owned_text(value: &str) -> Result<String, BackendError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| BackendError::Resource(SystemCallError::OutOfMemory))?;
+    owned.push_str(value);
+    Ok(owned)
 }
 
 fn name(value: &str) -> Result<String, BackendError> {
@@ -238,12 +425,7 @@ fn name(value: &str) -> Result<String, BackendError> {
     {
         return Err(BackendError::InvalidName);
     }
-    let mut owned = String::new();
-    owned
-        .try_reserve_exact(value.len())
-        .map_err(|_| BackendError::Resource(SystemCallError::OutOfMemory))?;
-    owned.push_str(value);
-    Ok(owned)
+    owned_text(value)
 }
 
 impl<C: Capability> MemoryBackend<C> {
@@ -271,6 +453,7 @@ impl<C: Capability> MemoryBackend<C> {
         Ok(Self {
             nodes,
             root: Some(root),
+            retiring_property: None,
             entry_slots,
             limit,
             epoch: 1,
@@ -279,7 +462,7 @@ impl<C: Capability> MemoryBackend<C> {
     pub fn root(&self) -> Option<&NodeRef> {
         self.root.as_ref()
     }
-    pub fn get(&self, reference: &NodeRef) -> Option<&MemoryNode<C>> {
+    fn get(&self, reference: &NodeRef) -> Option<&MemoryNode<C>> {
         self.nodes.get(reference)
     }
     pub fn position(
@@ -326,7 +509,7 @@ impl<C: Capability> MemoryBackend<C> {
             .ok_or(BackendError::NotFound)
     }
 
-    pub fn enumerate<F>(
+    fn enumerate<F>(
         &self,
         parent: &NodeRef,
         access: &AccessSnapshot,
@@ -448,13 +631,13 @@ impl<C: Capability> MemoryBackend<C> {
         }
         Ok(target)
     }
-    pub fn directory_body(&self) -> Body<C> {
+    fn directory_body(&self) -> Body<C> {
         Body::Directory(Directory {
             entries: OrderedTable::new(self.limit),
         })
     }
 
-    pub fn prepare_create(
+    fn prepare_create(
         &self,
         position: Position,
         access: &AccessSnapshot,
@@ -463,7 +646,7 @@ impl<C: Capability> MemoryBackend<C> {
     ) -> Result<PreparedMutation<C>, CreateFailure<C>> {
         let parent = match self.parent(&position, access, FalRights::CREATE) {
             Ok(parent) => parent,
-            Err(error) => return Err(CreateFailure { error, body }),
+            Err(error) => return Err(CreateFailure { error, _body: body }),
         };
         let reserve = (|| {
             let Body::Directory(directory) = &parent.body else {
@@ -508,7 +691,7 @@ impl<C: Capability> MemoryBackend<C> {
         })();
         let (version, next_version, next_epoch, mut entry) = match reserve {
             Ok(reserved) => reserved,
-            Err(error) => return Err(CreateFailure { error, body }),
+            Err(error) => return Err(CreateFailure { error, _body: body }),
         };
         let payload = MemoryNode {
             body,
@@ -522,7 +705,7 @@ impl<C: Capability> MemoryBackend<C> {
             Err(failure) => {
                 return Err(CreateFailure {
                     error: BackendError::Resource(failure.error),
-                    body: failure.payload.body,
+                    _body: failure.payload.body,
                 });
             }
         };
@@ -538,6 +721,61 @@ impl<C: Capability> MemoryBackend<C> {
                 entry,
             },
         })
+    }
+
+    pub fn prepare_create_input(
+        &self,
+        position: Position,
+        access: &AccessSnapshot,
+        input: CreateInput<'_>,
+        owners: &mut Vec<C>,
+        rights: FalRights,
+    ) -> Result<PreparedMutation<C>, CreateError> {
+        let body = match input {
+            CreateInput::Node {
+                kind: NodeKind::Directory,
+                value: [],
+            } => self.directory_body(),
+            CreateInput::Node {
+                kind: NodeKind::Stream,
+                value: [],
+            } => Body::Stream(
+                Data::new(access.account())
+                    .map_err(|error| CreateError::Backend(BackendError::Resource(error)))?,
+            ),
+            CreateInput::Node {
+                kind: NodeKind::Property,
+                value,
+            } => {
+                let owned = core::mem::take(owners);
+                let stored = match StoredValue::prepare(
+                    value,
+                    owned,
+                    1,
+                    erhino_shared::message::PAYLOAD_MAX,
+                    access.account(),
+                ) {
+                    Ok(stored) => stored,
+                    Err(failure) => {
+                        owners.extend(failure.handles);
+                        return Err(CreateError::Value(failure.error));
+                    }
+                };
+                Body::Property(stored)
+            }
+            CreateInput::Node {
+                kind: NodeKind::SymbolicLink,
+                ..
+            } => {
+                return Err(CreateError::Backend(BackendError::Unsupported));
+            }
+            CreateInput::Node { .. } => {
+                return Err(CreateError::Backend(BackendError::InvalidName));
+            }
+            CreateInput::Link(target) => Body::Link(String::from(target)),
+        };
+        self.prepare_create(position, access, body, rights)
+            .map_err(|failure| CreateError::Backend(failure.error))
     }
 
     pub fn prepare_delete(
@@ -622,6 +860,9 @@ impl<C: Capability> MemoryBackend<C> {
         let validate = (|| {
             if self.nodes.is_sealed() {
                 return Err(BackendError::Closed);
+            }
+            if self.retiring_property.is_some() {
+                return Err(BackendError::Busy);
             }
             let node = self.nodes.get(&target).ok_or(BackendError::NotFound)?;
             if !access
@@ -880,13 +1121,19 @@ impl<C: Capability> MemoryBackend<C> {
     pub fn commit(
         &mut self,
         mutation: PreparedMutation<C>,
-    ) -> Result<CommitResult<C>, CommitFailure<C>> {
+    ) -> Result<CommitResult, CommitFailure<PreparedMutation<C>>> {
+        if self.retiring_property.is_some() && matches!(&mutation.intent, Intent::Property { .. }) {
+            return Err(CommitFailure {
+                error: BackendError::Busy,
+                mutation,
+            });
+        }
         let valid = !self.nodes.is_sealed() && self.epoch == mutation.epoch && match &mutation.intent {
             Intent::Move { source, destination, target, source_version, destination_version, target_version, source_name, entry, checked, .. } => *checked && self.nodes.get(target).is_some_and(|node| node.version == *target_version && !node.take_reserved) && self.nodes.get(source).is_some_and(|node| node.version == *source_version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(source_name.as_str()).is_some_and(|entry| entry.node == target.id()))) && self.nodes.get(destination).is_some_and(|node| node.version == *destination_version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(entry.key_ref().as_str()).is_none())),
             Intent::Create { parent, version, entry, .. } => self.nodes.get(parent).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(entry.key_ref().as_str()).is_none())),
             Intent::Delete { parent, version, target, target_version, name, .. } => self.nodes.get(parent).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Directory(directory) if directory.entries.get_by(name.as_str()).is_some_and(|entry| entry.node == target.id()))) && self.nodes.get(target).is_some_and(|node| node.version == *target_version && !node.take_reserved),
             Intent::Write { target, version, data, .. } => self.nodes.get(target).is_some_and(|node| node.version == *version && matches!(&node.body, Body::Stream(stream) if stream.validates(data))),
-            Intent::Property { target, version, .. } => self.nodes.get(target).is_some_and(|node| node.version == *version && matches!(node.body, Body::Property(_))),
+            Intent::Property { target, version, .. } => self.nodes.get(target).is_some_and(|node| node.version == *version && !node.take_reserved && matches!(node.body, Body::Property(_))),
         };
         if !valid {
             return Err(CommitFailure {
@@ -1009,9 +1256,13 @@ impl<C: Capability> MemoryBackend<C> {
                 let Body::Property(old) = &mut target.body else {
                     unreachable!()
                 };
-                let old = core::mem::replace(old, value);
+                let mut old = core::mem::replace(old, value);
                 target.version = next_version;
-                CommitResult::PropertyReplaced(old)
+                if !matches!(old.retire_step(2), Ok(true)) {
+                    self.retiring_property = Some(old);
+                    self.nodes.wake_retirement();
+                }
+                CommitResult::PropertyReplaced
             }
         };
         self.epoch = mutation.next_epoch;
@@ -1023,18 +1274,48 @@ impl<C: Capability> MemoryBackend<C> {
         self.root = None;
     }
     pub fn has_retire_work(&self) -> bool {
-        self.nodes.has_retire_work()
+        self.retiring_property.is_some() || self.nodes.has_retire_work()
     }
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.retiring_property.is_none() && self.nodes.is_empty()
     }
 }
 impl<C: Capability> MemoryBackend<C> {
     pub fn retire_step(&mut self, budget: usize) -> Result<RetireProgress, SystemCallError> {
+        if budget == 0 {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        if let Some(old) = self.retiring_property.as_mut() {
+            let done = old.retire_step(1)?;
+            if done {
+                self.retiring_property = None;
+            }
+            if budget == 1 {
+                return Ok(RetireProgress {
+                    work_done: 1,
+                    done: !self.has_retire_work(),
+                });
+            }
+            if self.nodes.has_retire_work() {
+                let progress = self.nodes.retire_step(budget - 1)?;
+                return Ok(RetireProgress {
+                    work_done: 1 + progress.work_done,
+                    done: !self.has_retire_work(),
+                });
+            }
+            return Ok(RetireProgress {
+                work_done: 1,
+                done: !self.has_retire_work(),
+            });
+        }
         self.nodes.retire_step(budget)
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "关闭失败返还后端及待退休属性 owner，错误路径不分配"
+    )]
     pub fn close(self) -> Result<(), Self> {
-        if self.nodes.is_sealed() && self.nodes.is_empty() {
+        if self.nodes.is_sealed() && self.is_empty() {
             Ok(())
         } else {
             Err(self)
@@ -1042,10 +1323,192 @@ impl<C: Capability> MemoryBackend<C> {
     }
 }
 
+impl<C: Capability> Backend<C> for MemoryBackend<C> {
+    fn root(&self) -> Option<&NodeRef> {
+        MemoryBackend::root(self)
+    }
+
+    fn resolve(&self, access: &AccessSnapshot, path: &str) -> Result<NodeRef, BackendError> {
+        if !validate_path(path.as_bytes()) {
+            return Err(BackendError::InvalidName);
+        }
+        let mut current = access.root().clone();
+        if path.is_empty() {
+            return Ok(current);
+        }
+        for component in path.split('/') {
+            current = self.lookup_child(&current, component, access)?;
+        }
+        Ok(current)
+    }
+
+    fn lookup(&self, access: &AccessSnapshot, path: &str) -> Result<LookupResult<C>, BackendError> {
+        if !validate_path(path.as_bytes()) {
+            return Err(BackendError::InvalidName);
+        }
+        let mut current = access.root().clone();
+        if path.is_empty() {
+            return Ok(LookupResult::Found(current));
+        }
+        let mut start = 0;
+        for component in path.split('/') {
+            current = self.lookup_child(&current, component, access)?;
+            let node = self.get(&current).ok_or(BackendError::NotFound)?;
+            let end = start + component.len();
+            if let Body::Link(target) = node.body() {
+                let target = owned_text(target)?;
+                let consumed = owned_text(if start == 0 { "" } else { &path[..start - 1] })?;
+                let remaining = owned_text(path.get(end + 1..).unwrap_or(""))?;
+                return Ok(LookupResult::LinkBoundary {
+                    reference: current,
+                    consumed,
+                    target,
+                    remaining,
+                });
+            }
+            start = end + 1;
+        }
+        Ok(LookupResult::Found(current))
+    }
+
+    fn metadata(
+        &self,
+        reference: &NodeRef,
+        ceiling: FalRights,
+    ) -> Result<NodeMetadata, BackendError> {
+        let node = self.get(reference).ok_or(BackendError::NotFound)?;
+        if node.take_reserved() {
+            return Err(BackendError::Busy);
+        }
+        let size = match node.body() {
+            Body::Directory(_) => 0,
+            Body::Property(value) => value.bytes.len() as u64,
+            Body::Stream(data) => data.len(),
+            Body::Link(target) => target.len() as u64,
+        };
+        Ok(NodeMetadata {
+            identity: reference.id().raw(),
+            version: node.version(),
+            kind: node.kind(),
+            rights: node.rights().intersect(ceiling),
+            size,
+        })
+    }
+
+    fn enumerate<F>(
+        &self,
+        parent: &NodeRef,
+        access: &AccessSnapshot,
+        cursor: u64,
+        limit: usize,
+        mut visit: F,
+    ) -> Result<u64, BackendError>
+    where
+        F: FnMut(&str, &NodeRef, NodeMetadata),
+    {
+        MemoryBackend::enumerate(
+            self,
+            parent,
+            access,
+            cursor,
+            limit,
+            |name, reference, node| {
+                let size = match node.body() {
+                    Body::Directory(_) => 0,
+                    Body::Property(value) => value.bytes.len() as u64,
+                    Body::Stream(data) => data.len(),
+                    Body::Link(target) => target.len() as u64,
+                };
+                visit(
+                    name,
+                    reference,
+                    NodeMetadata {
+                        identity: reference.id().raw(),
+                        version: node.version(),
+                        kind: node.kind(),
+                        rights: node.rights().intersect(access.rights()),
+                        size,
+                    },
+                );
+            },
+        )
+    }
+
+    fn read_snapshot(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<ReadSnapshot<C>, ReadError> {
+        let reference = self.resolve(access, path)?;
+        let node = self.get(&reference).ok_or(BackendError::NotFound)?;
+        if node.take_reserved() {
+            return Err(BackendError::Busy.into());
+        }
+        if !access
+            .rights()
+            .intersect(node.rights())
+            .contains(FalRights::READ_PROPERTY)
+        {
+            return Err(BackendError::Permission.into());
+        }
+        let Body::Property(value) = node.body() else {
+            return Err(BackendError::WrongType.into());
+        };
+        if !value.handles.is_empty()
+            && !access
+                .rights()
+                .intersect(node.rights())
+                .contains(FalRights::ACQUIRE_CAPABILITY)
+        {
+            return Err(BackendError::Permission.into());
+        }
+        value
+            .read_snapshot(access.output_transport(), access.account())
+            .map_err(ReadError::Value)
+    }
+
+    fn watch_snapshot(
+        &self,
+        access: &AccessSnapshot,
+        path: &str,
+    ) -> Result<(NodeRef, u64), BackendError> {
+        let reference = self.resolve(access, path)?;
+        let node = self.get(&reference).ok_or(BackendError::NotFound)?;
+        if !access
+            .rights()
+            .intersect(node.rights())
+            .contains(FalRights::WATCH)
+        {
+            return Err(BackendError::Permission);
+        }
+        Ok((reference, node.version()))
+    }
+
+    fn seal(&mut self) {
+        MemoryBackend::seal(self);
+    }
+
+    fn has_retire_work(&self) -> bool {
+        MemoryBackend::has_retire_work(self)
+    }
+
+    fn retire_step(&mut self, budget: usize) -> Result<RetireProgress, SystemCallError> {
+        MemoryBackend::retire_step(self, budget)
+    }
+
+    fn is_empty(&self) -> bool {
+        MemoryBackend::is_empty(self)
+    }
+
+    fn close(self) -> Result<(), Self> {
+        MemoryBackend::close(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::Value;
+    use crate::value::{ExportMode, ExportPolicy, Protocol, Value};
     use alloc::{rc::Rc, vec::Vec};
     use erhino_shared::{call::SystemCallError, object::HandleDescription, object::Rights};
     use libbudget::{Budget, Taxonomy};
@@ -1076,6 +1539,26 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailingCapability {
+        fail_once: Rc<core::cell::Cell<bool>>,
+    }
+    impl Capability for FailingCapability {
+        fn description(&self) -> Result<HandleDescription, SystemCallError> {
+            TestCapability.description()
+        }
+        fn duplicate(&self, _rights: Rights) -> Result<Self, SystemCallError> {
+            Ok(self.clone())
+        }
+        fn close(self) -> Result<(), (Self, SystemCallError)> {
+            if self.fail_once.replace(false) {
+                Err((self, SystemCallError::ObjectBusy))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     struct TestWake;
 
     impl Wake for TestWake {
@@ -1099,6 +1582,7 @@ mod tests {
         AccessSnapshot {
             root,
             rights: FalRights::ALL,
+            output_transport: erhino_shared::object::Rights::TRANSIT,
             account,
         }
     }
@@ -1169,6 +1653,145 @@ mod tests {
         }
         assert!(backend.close().is_ok());
         assert_eq!(account.usage(FalResource::Node).0, 0);
+    }
+
+    #[test]
+    fn pinned_stream_survives_unlink_until_last_owner_retires() {
+        let account = account();
+        let mut backend =
+            MemoryBackend::<TestCapability>::new(&account, 4, Rc::new(TestWake)).unwrap();
+        let root = backend.root().unwrap().clone();
+        let access = access(root.clone(), account.clone());
+        let position = backend.position(&root, "stream", None).unwrap();
+        let mut handles = Vec::new();
+        let created = backend
+            .prepare_create_input(
+                position,
+                &access,
+                CreateInput::Node {
+                    kind: NodeKind::Stream,
+                    value: &[],
+                },
+                &mut handles,
+                FalRights::ALL,
+            )
+            .unwrap_or_else(|_| panic!("stream creation preparation failed"));
+        let CommitResult::Created(created) = backend
+            .commit(created)
+            .unwrap_or_else(|_| panic!("stream creation failed"))
+        else {
+            panic!("stream creation returned the wrong result");
+        };
+        let opened = backend.resolve(&access, "stream").unwrap();
+        assert_eq!(opened.id(), created.id());
+        let write = backend
+            .prepare_write(opened.clone(), &access, 0, b"data")
+            .unwrap();
+        assert!(matches!(backend.commit(write), Ok(CommitResult::Written)));
+        let position = backend.position(&root, "stream", None).unwrap();
+        let removed = backend.prepare_delete(position, &access).unwrap();
+        let CommitResult::Deleted(removed) = backend
+            .commit(removed)
+            .unwrap_or_else(|_| panic!("stream deletion failed"))
+        else {
+            panic!("stream deletion returned the wrong result");
+        };
+        drop(removed);
+        drop(created);
+        assert!(matches!(
+            backend.resolve(&access, "stream"),
+            Err(BackendError::NotFound)
+        ));
+        let mut bytes = [0; 4];
+        assert_eq!(
+            backend
+                .read_stream(&opened, &access, 0, &mut bytes)
+                .unwrap(),
+            4
+        );
+        assert_eq!(&bytes, b"data");
+        let write = backend
+            .prepare_write(opened.clone(), &access, 1, b"ONE")
+            .unwrap();
+        assert!(matches!(backend.commit(write), Ok(CommitResult::Written)));
+        assert_eq!(
+            backend
+                .read_stream(&opened, &access, 0, &mut bytes)
+                .unwrap(),
+            4
+        );
+        assert_eq!(&bytes, b"dONE");
+        drop(opened);
+        drop(access);
+        drop(root);
+        backend.seal();
+        while !backend.is_empty() {
+            backend.retire_step(1).unwrap();
+        }
+        assert!(backend.close().is_ok());
+        assert_eq!(account.usage(FalResource::Node).0, 0);
+        assert_eq!(account.usage(FalResource::Bytes).0, 0);
+    }
+
+    #[test]
+    fn create_input_retains_unprepared_handles_and_hides_body() {
+        let account = account();
+        let mut backend =
+            MemoryBackend::<TestCapability>::new(&account, 4, Rc::new(TestWake)).unwrap();
+        let root = backend.root().unwrap().clone();
+        let access = access(root.clone(), account.clone());
+        let bytes_before = account.usage(FalResource::Bytes).0;
+        let mut owners = vec![TestCapability];
+        let position = backend.position(&root, "invalid", None).unwrap();
+        assert!(matches!(
+            backend.prepare_create_input(
+                position,
+                &access,
+                CreateInput::Node {
+                    kind: NodeKind::Property,
+                    value: &[0],
+                },
+                &mut owners,
+                FalRights::ALL,
+            ),
+            Err(CreateError::Value(_))
+        ));
+        assert_eq!(owners.len(), 1);
+        assert_eq!(account.usage(FalResource::Bytes).0, bytes_before);
+
+        let mut encoded = [0; 32];
+        let used = Value::Integer(7).encode(&mut encoded).unwrap();
+        owners.clear();
+        let position = backend.position(&root, "property", None).unwrap();
+        let mutation = backend
+            .prepare_create_input(
+                position,
+                &access,
+                CreateInput::Node {
+                    kind: NodeKind::Property,
+                    value: &encoded[..used],
+                },
+                &mut owners,
+                FalRights::ALL,
+            )
+            .unwrap_or_else(|_| panic!("property input preparation failed"));
+        let created = backend
+            .commit(mutation)
+            .unwrap_or_else(|_| panic!("create failed"));
+        let CommitResult::Created(created) = created else {
+            panic!("create returned the wrong result");
+        };
+        assert!(backend.property(&created).is_ok());
+        drop(created);
+        drop(access);
+        backend.seal();
+        drop(root);
+        while !backend.is_empty() {
+            backend.retire_step(1).unwrap();
+        }
+        assert!(backend.close().is_ok());
+        assert_eq!(account.usage(FalResource::Node).0, 0);
+        assert_eq!(account.usage(FalResource::Bytes).0, 0);
     }
 
     #[test]
@@ -1259,5 +1882,359 @@ mod tests {
         }
         assert!(backend.close().is_ok());
         assert_eq!(account.usage(FalResource::Node).0, 0);
+    }
+    #[test]
+    fn root_route_is_not_visible_from_other_grant_roots() {
+        let account = account();
+        let mut memory =
+            MemoryBackend::<TestCapability>::new(&account, 4, Rc::new(TestWake)).unwrap();
+        let other = MemoryBackend::<TestCapability>::new(&account, 2, Rc::new(TestWake)).unwrap();
+        let root = memory.root().unwrap().clone();
+        let other_root = other.root().unwrap().clone();
+        let root_access = access(root.clone(), account.clone());
+        let child = memory
+            .prepare_create(
+                memory.position(&root, "child", None).unwrap(),
+                &root_access,
+                memory.directory_body(),
+                FalRights::ALL,
+            )
+            .unwrap_or_else(|failure| {
+                panic!("child creation preparation failed: {:?}", failure.error)
+            });
+        let CommitResult::Created(child) = memory
+            .commit(child)
+            .unwrap_or_else(|failure| panic!("child creation failed: {:?}", failure.error))
+        else {
+            panic!("child directory creation returned no node");
+        };
+        let binding = crate::route::Binding::new(
+            &root,
+            String::from("second"),
+            TestCapability,
+            FalRights::TRAVERSE | FalRights::ENUMERATE,
+        );
+        let other_access = access(other_root.clone(), account.clone());
+        let child_access = access(child.clone(), account.clone());
+        assert!(binding.lookup(&other_access, "second").unwrap().is_none());
+        assert!(
+            binding
+                .lookup(&child_access, "second/leaf")
+                .unwrap()
+                .is_none()
+        );
+        assert!(binding.lookup(&root_access, "seconded").unwrap().is_none());
+        let Some(LookupResult::DelegationBoundary {
+            rights,
+            consumed,
+            remaining,
+            target: _,
+        }) = binding.lookup(&root_access, "second/leaf").unwrap()
+        else {
+            panic!("root route failed to resolve");
+        };
+        assert_eq!(rights, FalRights::TRAVERSE | FalRights::ENUMERATE);
+        assert_eq!(consumed, "second");
+        assert_eq!(remaining, "leaf");
+        let mut no_export = root_access.clone();
+        no_export.output_transport = Rights::WAIT;
+        assert!(matches!(
+            binding.lookup(&no_export, "second"),
+            Err(BackendError::Permission)
+        ));
+        memory.seal();
+        drop(root_access);
+        drop(child_access);
+        drop(other_access);
+        drop(no_export);
+        drop(child);
+        drop(root);
+        while !memory.is_empty() {
+            memory.retire_step(1).unwrap();
+        }
+        assert!(memory.close().is_ok());
+        drop(other_root);
+        let mut other = other;
+        other.seal();
+        while !other.is_empty() {
+            other.retire_step(1).unwrap();
+        }
+        assert!(other.close().is_ok());
+    }
+
+    #[test]
+    fn property_commit_preserves_a_later_take_reservation() {
+        let account = account();
+        let mut backend =
+            MemoryBackend::<TestCapability>::new(&account, 4, Rc::new(TestWake)).unwrap();
+        let root = backend.root().unwrap().clone();
+        let access = access(root.clone(), account.clone());
+        let stored = || {
+            let value = Value::Handle {
+                slot: 1,
+                policy: ExportPolicy {
+                    protocol: Protocol::Mailbox,
+                    mode: ExportMode::Affine,
+                    transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                    fal_ceiling: FalRights::NONE,
+                },
+            };
+            let mut bytes = [0; 64];
+            let used = value.encode(&mut bytes).unwrap();
+            StoredValue::prepare(&bytes[..used], alloc::vec![TestCapability], 1, 64, &account)
+                .unwrap_or_else(|_| panic!("property preparation failed"))
+        };
+        let property = backend
+            .commit(
+                backend
+                    .prepare_create(
+                        backend.position(&root, "value", None).unwrap(),
+                        &access,
+                        Body::Property(stored()),
+                        FalRights::ALL,
+                    )
+                    .unwrap_or_else(|_| panic!("property create preparation failed")),
+            )
+            .unwrap_or_else(|_| panic!("property create failed"));
+        let CommitResult::Created(property) = property else {
+            panic!("property create did not return a node");
+        };
+        let original_version = backend.get(&property).unwrap().version();
+        let mutation = backend
+            .prepare_property(property.clone(), &access, stored())
+            .unwrap_or_else(|_| panic!("property mutation preparation failed"));
+        let mut take = backend.prepare_take(property.clone(), &access).unwrap();
+        let taken = MemoryBackend::take_value(&mut take);
+        let failure = match backend.commit(mutation) {
+            Err(failure) => failure,
+            Ok(_) => panic!("reserved property accepted a stale mutation"),
+        };
+        assert_eq!(failure.error, BackendError::Conflict);
+        assert_eq!(backend.get(&property).unwrap().version(), original_version);
+        drop(failure.mutation);
+        backend.rollback_take(take, taken);
+        assert_eq!(backend.get(&property).unwrap().version(), original_version);
+        drop(access);
+        backend.seal();
+        drop(property);
+        drop(root);
+        while !backend.is_empty() {
+            backend.retire_step(1).unwrap();
+        }
+        assert!(backend.close().is_ok());
+        assert_eq!(account.usage(FalResource::Node).0, 0);
+        assert_eq!(account.usage(FalResource::Bytes).0, 0);
+    }
+    #[test]
+    fn property_replacement_retains_failed_close_until_bounded_retirement() {
+        let account = account();
+        let mut backend =
+            MemoryBackend::<FailingCapability>::new(&account, 4, Rc::new(TestWake)).unwrap();
+        let root = backend.root().unwrap().clone();
+        let access = access(root.clone(), account.clone());
+        let fail_once = Rc::new(core::cell::Cell::new(true));
+        let stored = |fail_once: Rc<core::cell::Cell<bool>>| {
+            let value = Value::Handle {
+                slot: 1,
+                policy: ExportPolicy {
+                    protocol: Protocol::Mailbox,
+                    mode: ExportMode::Affine,
+                    transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                    fal_ceiling: FalRights::NONE,
+                },
+            };
+            let mut bytes = [0; 64];
+            let used = value.encode(&mut bytes).unwrap();
+            StoredValue::prepare(
+                &bytes[..used],
+                alloc::vec![FailingCapability { fail_once }],
+                1,
+                64,
+                &account,
+            )
+            .unwrap_or_else(|_| panic!("property preparation failed"))
+        };
+        let property = backend
+            .commit(
+                backend
+                    .prepare_create(
+                        backend.position(&root, "value", None).unwrap(),
+                        &access,
+                        Body::Property(stored(fail_once.clone())),
+                        FalRights::ALL,
+                    )
+                    .unwrap_or_else(|_| panic!("property create preparation failed")),
+            )
+            .unwrap_or_else(|_| panic!("property create failed"));
+        let CommitResult::Created(property) = property else {
+            panic!("property create did not return a node");
+        };
+        let mutation = backend
+            .prepare_property(
+                property.clone(),
+                &access,
+                stored(Rc::new(core::cell::Cell::new(false))),
+            )
+            .unwrap_or_else(|_| panic!("property mutation preparation failed"));
+        assert!(matches!(
+            backend.commit(mutation),
+            Ok(CommitResult::PropertyReplaced)
+        ));
+        assert!(!fail_once.get());
+        assert!(backend.has_retire_work());
+        assert_eq!(
+            backend
+                .prepare_property(
+                    property.clone(),
+                    &access,
+                    stored(Rc::new(core::cell::Cell::new(false))),
+                )
+                .err()
+                .expect("second property write should wait for retirement")
+                .error,
+            BackendError::Busy
+        );
+        assert!(backend.retire_step(1).unwrap().done);
+        assert!(!backend.has_retire_work());
+        assert!(
+            backend
+                .prepare_property(
+                    property.clone(),
+                    &access,
+                    stored(Rc::new(core::cell::Cell::new(false))),
+                )
+                .is_ok()
+        );
+        drop(access);
+        backend.seal();
+        drop(property);
+        drop(root);
+        while !backend.is_empty() {
+            backend.retire_step(1).unwrap();
+        }
+        assert!(backend.close().is_ok());
+        assert_eq!(account.usage(FalResource::Node).0, 0);
+        assert_eq!(account.usage(FalResource::Bytes).0, 0);
+    }
+}
+#[allow(clippy::items_after_test_module)]
+impl<C: Capability> MutationBackend<C> for MemoryBackend<C> {
+    type TakeReservation = PreparedTake<C>;
+    type Position = Position;
+    type Mutation = PreparedMutation<C>;
+    fn lookup_child(
+        &self,
+        parent: &NodeRef,
+        name: &str,
+        access: &AccessSnapshot,
+    ) -> Result<NodeRef, BackendError> {
+        MemoryBackend::lookup_child(self, parent, name, access)
+    }
+    fn read_stream(
+        &self,
+        reference: &NodeRef,
+        access: &AccessSnapshot,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, BackendError> {
+        let node = self.get(reference).ok_or(BackendError::NotFound)?;
+        if !access
+            .rights()
+            .intersect(node.rights())
+            .contains(FalRights::READ_STREAM)
+        {
+            return Err(BackendError::Permission);
+        }
+        let Body::Stream(data) = node.body() else {
+            return Err(BackendError::WrongType);
+        };
+        Ok(data.read(offset, buffer))
+    }
+    fn property(&self, reference: &NodeRef) -> Result<&StoredValue<C>, BackendError> {
+        let node = self.get(reference).ok_or(BackendError::NotFound)?;
+        let Body::Property(value) = node.body() else {
+            return Err(BackendError::WrongType);
+        };
+        Ok(value)
+    }
+    fn position(
+        &self,
+        parent: &NodeRef,
+        final_name: &str,
+        expected: Option<(NodeId, u64)>,
+    ) -> Result<Self::Position, BackendError> {
+        MemoryBackend::position(self, parent, final_name, expected)
+    }
+    fn prepare_create(
+        &self,
+        position: Self::Position,
+        access: &AccessSnapshot,
+        input: CreateInput<'_>,
+        owners: &mut Vec<C>,
+        rights: FalRights,
+    ) -> Result<Self::Mutation, CreateError> {
+        MemoryBackend::prepare_create_input(self, position, access, input, owners, rights)
+    }
+    fn prepare_delete(
+        &self,
+        position: Self::Position,
+        access: &AccessSnapshot,
+    ) -> Result<Self::Mutation, BackendError> {
+        MemoryBackend::prepare_delete(self, position, access)
+    }
+    fn prepare_property(
+        &self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+        value: StoredValue<C>,
+    ) -> Result<Self::Mutation, PropertyFailure<C>> {
+        MemoryBackend::prepare_property(self, target, access, value)
+    }
+    fn prepare_write(
+        &self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<Self::Mutation, BackendError> {
+        MemoryBackend::prepare_write(self, target, access, offset, bytes)
+    }
+    fn prepare_move(
+        &self,
+        source: Self::Position,
+        source_access: &AccessSnapshot,
+        destination: &AccessSnapshot,
+        final_name: &str,
+    ) -> Result<Self::Mutation, BackendError> {
+        MemoryBackend::prepare_move(self, source, source_access, destination, final_name)
+    }
+    fn validate_move_step(
+        &self,
+        mutation: &mut Self::Mutation,
+        budget: usize,
+    ) -> Result<bool, BackendError> {
+        MemoryBackend::validate_move_step(self, mutation, budget)
+    }
+    fn commit(
+        &mut self,
+        mutation: Self::Mutation,
+    ) -> Result<CommitResult, CommitFailure<Self::Mutation>> {
+        MemoryBackend::commit(self, mutation)
+    }
+    fn prepare_take(
+        &mut self,
+        target: NodeRef,
+        access: &AccessSnapshot,
+    ) -> Result<Self::TakeReservation, BackendError> {
+        MemoryBackend::prepare_take(self, target, access)
+    }
+    fn take_value(prepared: &mut Self::TakeReservation) -> TakenValue<C> {
+        MemoryBackend::take_value(prepared)
+    }
+    fn commit_take(&mut self, prepared: Self::TakeReservation) {
+        MemoryBackend::commit_take(self, prepared)
+    }
+    fn rollback_take(&mut self, prepared: Self::TakeReservation, value: TakenValue<C>) {
+        MemoryBackend::rollback_take(self, prepared, value)
     }
 }

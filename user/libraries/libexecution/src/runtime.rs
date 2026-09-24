@@ -344,36 +344,56 @@ impl<T, S: SourceOps> Runtime<T, S> {
         source_limit: usize,
         account: &AccountView<ExecutionResource>,
     ) -> Result<Self, SystemCallError> {
+        Self::try_new(set, task_limit, source_limit, account).map_err(|(set, error)| {
+            drop(set);
+            error
+        })
+    }
+
+    pub fn try_new(
+        set: S,
+        task_limit: usize,
+        source_limit: usize,
+        account: &AccountView<ExecutionResource>,
+    ) -> Result<Self, (S, SystemCallError)> {
         if task_limit == 0 || source_limit == 0 {
-            return Err(SystemCallError::IllegalArgument);
+            return Err((set, SystemCallError::IllegalArgument));
         }
-        let input_charge = account.acquire(
-            ExecutionResource::InputBytes,
-            Self::fixed_input_bytes(source_limit)?,
-        )?;
-        let requests = Requests::new()?;
-        let mut records = Vec::new();
-        records
-            .try_reserve_exact(RECEIVE_MAX)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
-        records.resize(
-            RECEIVE_MAX,
-            ReadyRecord {
-                token: 0,
-                arm_generation: 0,
-                cookie: 0,
-                observed: ObjectSignals::NONE,
-                reason: 0,
-                error: 0,
-            },
-        );
-        let mut scratch = Vec::new();
-        scratch
-            .try_reserve_exact(source_limit)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
+        let prepared = (|| -> Result<_, SystemCallError> {
+            let input_charge = account.acquire(
+                ExecutionResource::InputBytes,
+                Self::fixed_input_bytes(source_limit)?,
+            )?;
+            let requests = Requests::new()?;
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(RECEIVE_MAX)
+                .map_err(|_| SystemCallError::OutOfMemory)?;
+            records.resize(
+                RECEIVE_MAX,
+                ReadyRecord {
+                    token: 0,
+                    arm_generation: 0,
+                    cookie: 0,
+                    observed: ObjectSignals::NONE,
+                    reason: 0,
+                    error: 0,
+                },
+            );
+            let mut scratch: Vec<SourceEvent> = Vec::new();
+            scratch
+                .try_reserve_exact(source_limit)
+                .map_err(|_| SystemCallError::OutOfMemory)?;
+            let queue = WorkQueue::new(task_limit)?;
+            Ok((input_charge, requests, records, scratch, queue))
+        })();
+        let (input_charge, requests, records, scratch, queue) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((set, error)),
+        };
         Ok(Self {
             set: Some(set),
-            queue: WorkQueue::new(task_limit)?,
+            queue,
             sources: OrderedTable::new(source_limit),
             account: account.clone(),
             records,
@@ -1744,6 +1764,26 @@ mod tests {
     }
 
     #[test]
+    fn constructor_refusal_returns_source_set_and_refunds_budget() {
+        let shared = fake_shared();
+        let funding = account();
+        let (set, error) = match Runtime::<ToyTask, FakeSet>::try_new(
+            FakeSet::new(&shared),
+            0,
+            1,
+            &funding,
+        ) {
+            Ok(_) => panic!("zero task capacity was admitted"),
+            Err(failure) => failure,
+        };
+        assert_eq!(error, SystemCallError::IllegalArgument);
+        assert!(Rc::ptr_eq(&set.shared, &shared));
+        set.close_set().map_err(|(_, error)| error).unwrap();
+        assert_eq!(funding.usage(ExecutionResource::Task).0, 0);
+        assert_eq!(funding.usage(ExecutionResource::InputBytes).0, 0);
+    }
+
+    #[test]
     fn yielding_tasks_alternate_fairly() {
         let shared = fake_shared();
         let mut rt: Runtime<ToyTask, FakeSet> =
@@ -1994,12 +2034,40 @@ mod tests {
                 | RequestFailure::Wake { error, .. } => error,
             };
             world.refusals.push(error);
+            self.events_seen = self.complete_after;
         }
         fn stop(&mut self, _world: &mut World) {}
     }
 
     fn source_runtime(shared: &Rc<FakeShared>) -> Runtime<SourceTask, FakeSet> {
         Runtime::new(FakeSet::new(shared), 4, 8, &account()).unwrap()
+    }
+
+    #[test]
+    fn source_limit_refusal_returns_task_and_refunds_slot() {
+        let shared = fake_shared();
+        let funding = account();
+        let mut rt = Runtime::new(FakeSet::new(&shared), 2, 1, &funding).unwrap();
+        let baseline_task = funding.usage(ExecutionResource::Task);
+        let baseline_input = funding.usage(ExecutionResource::InputBytes);
+        let mut world = World::default();
+        rt.spawn(
+            SourceTask {
+                handle: Handle::from_parts(3, 1),
+                requested: false,
+                events_seen: 0,
+                complete_after: 1,
+            },
+            0,
+        )
+        .unwrap();
+        rt.run(&mut world, 3).unwrap();
+        assert_eq!(world.refusals, [SystemCallError::ReachLimit]);
+        assert!(shared.registered().is_empty());
+        assert_eq!(rt.pending_sources(), 0);
+        assert!(rt.is_empty());
+        assert_eq!(funding.usage(ExecutionResource::Task), baseline_task);
+        assert_eq!(funding.usage(ExecutionResource::InputBytes), baseline_input);
     }
 
     #[test]
@@ -2790,6 +2858,132 @@ mod tests {
             assert_eq!(world.removed, 1);
             assert!(rt.close().is_ok());
         }
+    }
+
+    #[derive(Default)]
+    struct MultiSourceWorld {
+        registered: usize,
+        unregistered: usize,
+        owner_closed: bool,
+    }
+
+    struct MultiSourceTask {
+        phase: u8,
+        sources: [Option<SourceId>; 4],
+    }
+
+    impl Task<MultiSourceWorld> for MultiSourceTask {
+        type Family = Self;
+
+        fn advance(
+            &mut self,
+            _: u64,
+            world: &mut MultiSourceWorld,
+            requests: &mut Requests<Self>,
+            _: &mut Input<'_>,
+            _: usize,
+        ) -> Result<Advance, SystemCallError> {
+            match self.phase {
+                0 => {
+                    for kind in 1..=4 {
+                        requests.add_source(
+                            Handle::from_raw(20 + kind),
+                            ObjectSignals::READABLE,
+                            kind,
+                        )?;
+                    }
+                    self.phase = 1;
+                }
+                1 if world.registered == 4 => {
+                    for source in self.sources.into_iter().flatten() {
+                        requests.remove(source)?;
+                    }
+                    self.phase = 2;
+                }
+                2 if world.unregistered == 4 => {
+                    world.owner_closed = true;
+                    self.phase = 3;
+                }
+                _ => {}
+            }
+            Ok(Advance {
+                work_done: 1,
+                step: if self.phase == 3 {
+                    Step::Complete
+                } else if self.phase == 2 {
+                    Step::Parked
+                } else {
+                    Step::Runnable
+                },
+            })
+        }
+
+        fn refused(&mut self, _: &mut MultiSourceWorld, failure: RequestFailure<Self>) {
+            match failure {
+                RequestFailure::Source { kind, error } => {
+                    panic!("four-source registration {kind} failed: {error:?}")
+                }
+                RequestFailure::Spawn { error, .. } => {
+                    panic!("four-source task spawn failed: {error:?}")
+                }
+                _ => panic!("four-source admission returned unexpected failure"),
+            }
+        }
+
+        fn registered(&mut self, world: &mut MultiSourceWorld, kind: SourceKind, source: SourceId) {
+            assert!(self.sources[(kind - 1) as usize].replace(source).is_none());
+            world.registered += 1;
+        }
+
+        fn unregistered(
+            &mut self,
+            world: &mut MultiSourceWorld,
+            kind: SourceKind,
+            source: SourceId,
+        ) {
+            assert_eq!(self.sources[(kind - 1) as usize].take(), Some(source));
+            assert!(
+                !world.owner_closed,
+                "owner closed before source removal callback"
+            );
+            world.unregistered += 1;
+        }
+
+        fn stop(&mut self, _: &mut MultiSourceWorld) {}
+    }
+
+    #[test]
+    fn four_sources_retire_before_their_owner_closes() {
+        let shared = fake_shared();
+        let input_bytes = Runtime::<MultiSourceTask, FakeSet>::input_budget(4).unwrap();
+        let limits = [8, input_bytes];
+        let budget = Budget::new(&limits, 1).unwrap();
+        let account = budget.account(&limits).unwrap();
+        let view = account
+            .view(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
+            .unwrap();
+        let mut rt = Runtime::new(FakeSet::new(&shared), 1, 4, &view).unwrap();
+        let mut world = MultiSourceWorld::default();
+        rt.spawn(
+            MultiSourceTask {
+                phase: 0,
+                sources: [None; 4],
+            },
+            4,
+        )
+        .unwrap_or_else(|_| panic!("four-source task admission failed"));
+        for _ in 0..80 {
+            if world.owner_closed && rt.is_empty() {
+                break;
+            }
+            rt.turn(&mut world, 1).unwrap();
+        }
+        assert_eq!(world.registered, 4);
+        assert_eq!(world.unregistered, 4);
+        assert!(world.owner_closed);
+        assert_eq!(shared.removes().len(), 4);
+        assert_eq!(rt.pending_sources(), 0);
+        assert!(rt.close().is_ok());
     }
 
     #[derive(Debug)]

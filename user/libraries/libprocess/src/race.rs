@@ -65,7 +65,7 @@ pub const ACTION_ENUMERATE: u64 = 9;
 pub const HAMMER_CONTROL_RIGHTS: Rights =
     Rights::from_raw(Rights::READ.raw() | Rights::WAIT.raw() | Rights::MANAGE.raw());
 
-/// 指令 payload：5×u64 小端。moves 槽位由动作决定（KILL/DRAIN/CLOSE
+/// 指令 payload：3×u64 小端。moves 槽位由动作决定（KILL/DRAIN/CLOSE
 /// 用 moves[0]=control，START 用 moves[0]=builder，CREATE/CREATE_ABANDON
 /// 用 moves[0]=job，SEAL/ENUMERATE 用 moves[0]=job control）。
 #[derive(Debug, Clone, Copy)]
@@ -73,10 +73,6 @@ pub struct Cmd {
     pub action: u64,
     /// KILL 的 exit code。
     pub code: u64,
-    /// START 的入口地址。
-    pub entry: u64,
-    /// START 的栈顶。
-    pub sp: u64,
     /// 执行前延迟（毫秒）：锤等枪后先 sys_sleep 再执行，时序变体用
     /// （对侧先行窗口）；0 = 醒后即打。
     pub aux: u64,
@@ -97,7 +93,7 @@ pub struct Report {
 /// 指令编码为消息 payload。
 pub fn encode_cmd(cmd: &Cmd) -> alloc::vec::Vec<u8> {
     let mut payload = alloc::vec::Vec::new();
-    for word in [cmd.action, cmd.code, cmd.entry, cmd.sp, cmd.aux] {
+    for word in [cmd.action, cmd.code, cmd.aux] {
         payload.extend_from_slice(&word.to_le_bytes());
     }
     payload
@@ -105,12 +101,10 @@ pub fn encode_cmd(cmd: &Cmd) -> alloc::vec::Vec<u8> {
 
 /// 指令解码：长度不足返回 None（协议违约，调用方按 FAILED 记）。
 pub fn decode_cmd(payload: &[u8]) -> Option<Cmd> {
-    decode_words::<5>(payload).map(|words| Cmd {
+    decode_words::<3>(payload).map(|words| Cmd {
         action: words[0],
         code: words[1],
-        entry: words[2],
-        sp: words[3],
-        aux: words[4],
+        aux: words[2],
     })
 }
 

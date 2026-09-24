@@ -8,7 +8,7 @@
 - Rust edition 2024，工具链由根目录 `rust-toolchain` 选择；当前内容是浮动 `nightly`，并未固定日期。取证或比较代码生成时记录实际 rustc 版本。
 - 内核、共享库、用户态分别属于 `os/`、`shared/`、`user/` 三个 workspace，以 path 依赖连接。内核 target 为 `os/riscv64imac-unknown-erhino.json`，用户态默认 target 为 `user/rinlib/riscv64imac-unknown-erhino-elf.json`，均使用 build-std；浮点验收 `test_fp` 使用独立 gc target。
 - **统一走 `just`，不裸跑 `cargo build`**。内核链接器 `riscv64-elf-ld` 和链接脚本由构建入口配置，用户态由自定义 target 与 build-std 提供运行环境。
-- 内核当前 package/二进制仍为 `erhino_kernel`；本文命令反映当前构建。统一为 `kernel` 的后续迁移见[命名计划](todo-2026-09-22-kernel-identity.md)，迁移时同步命令与产物路径。
+- 内核 package、默认 binary target 和产物名统一为 `kernel`；本文命令与构建入口以此为准。
 - initfs 使用 tar 时避免 bsdtar 的 `._` AppleDouble 文件混入归档。
 
 ```sh
@@ -25,7 +25,7 @@ just clippy
 纯逻辑 crate 的 host 测试必须显式指定 host target，不能继承 RISC-V 默认 target 去链接 std。当前开发机命令：
 
 ```sh
-(cd os && cargo test --workspace --exclude erhino_kernel --target aarch64-apple-darwin)
+(cd os && cargo test --workspace --exclude kernel --target aarch64-apple-darwin)
 (cd shared && cargo test --workspace --target aarch64-apple-darwin)
 ```
 

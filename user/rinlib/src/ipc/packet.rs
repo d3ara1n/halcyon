@@ -1,5 +1,7 @@
 //! 出站消息拥有全部运输能力；失败完整返还，成功提交即消费 owner。
 
+use super::capability::Capability;
+use super::message::{MailboxSender, SendOnce};
 use alloc::vec::Vec;
 use erhino_shared::{
     call::SystemCallError,
@@ -7,8 +9,6 @@ use erhino_shared::{
     object::{Handle, Rights},
     time::Deadline,
 };
-use super::capability::Capability;
-use super::message::{MailboxSender, SendOnce};
 
 #[derive(Debug)]
 struct Transfer {
@@ -46,26 +46,50 @@ pub struct ReplyFailure {
 
 impl Packet {
     pub fn new(kind: u64, payload: &[u8]) -> Result<Self, SystemCallError> {
-        if payload.len() > PAYLOAD_MAX { return Err(SystemCallError::IllegalArgument) }
+        if payload.len() > PAYLOAD_MAX {
+            return Err(SystemCallError::IllegalArgument);
+        }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(payload.len()).map_err(|_| SystemCallError::OutOfMemory)?;
+        bytes
+            .try_reserve_exact(payload.len())
+            .map_err(|_| SystemCallError::OutOfMemory)?;
         bytes.extend_from_slice(payload);
         let mut transfers = Vec::new();
-        transfers.try_reserve_exact(MESSAGE_HANDLE_MAX).map_err(|_| SystemCallError::OutOfMemory)?;
-        Ok(Self { kind, payload: bytes, transfers })
+        transfers
+            .try_reserve_exact(MESSAGE_HANDLE_MAX)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        Ok(Self {
+            kind,
+            payload: bytes,
+            transfers,
+        })
     }
 
-    pub fn kind(&self) -> u64 { self.kind }
-    pub fn payload(&self) -> &[u8] { &self.payload }
-    pub fn payload_mut(&mut self) -> &mut [u8] { &mut self.payload }
+    pub fn kind(&self) -> u64 {
+        self.kind
+    }
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.payload
+    }
     pub fn truncate_payload(&mut self, len: usize) -> Result<(), SystemCallError> {
-        if len > self.payload.len() { return Err(SystemCallError::IllegalArgument) }
+        if len > self.payload.len() {
+            return Err(SystemCallError::IllegalArgument);
+        }
         self.payload.truncate(len);
         Ok(())
     }
-    pub fn handle_count(&self) -> usize { self.transfers.len() }
+    pub fn handle_count(&self) -> usize {
+        self.transfers.len()
+    }
 
-    fn check_transfer(&self, capability: &Capability, rights: Rights) -> Result<(), SystemCallError> {
+    fn check_transfer(
+        &self,
+        capability: &Capability,
+        rights: Rights,
+    ) -> Result<(), SystemCallError> {
         if self.transfers.len() == MESSAGE_HANDLE_MAX || !rights.is_known() {
             return Err(SystemCallError::IllegalArgument);
         }
@@ -84,7 +108,11 @@ impl Packet {
         Ok(())
     }
 
-    pub fn push_front(&mut self, capability: Capability, rights: Rights) -> Result<(), PushFailure> {
+    pub fn push_front(
+        &mut self,
+        capability: Capability,
+        rights: Rights,
+    ) -> Result<(), PushFailure> {
         if let Err(error) = self.check_transfer(&capability, rights) {
             return Err(PushFailure { error, capability });
         }
@@ -93,19 +121,27 @@ impl Packet {
     }
 
     pub fn pop_front(&mut self) -> Option<(Capability, Rights)> {
-        if self.transfers.is_empty() { return None }
+        if self.transfers.is_empty() {
+            return None;
+        }
         let transfer = self.transfers.remove(0);
         Some((transfer.capability, transfer.rights))
     }
 
     /// 调用方准备撤回尚未投递的末项时，完整取回 owner。
     pub fn pop(&mut self) -> Option<(Capability, Rights)> {
-        self.transfers.pop().map(|transfer| (transfer.capability, transfer.rights))
+        self.transfers
+            .pop()
+            .map(|transfer| (transfer.capability, transfer.rights))
     }
 
     /// 消费式投递：成功即消费 Packet 与全部 transit owner，失败完整返还。
     /// 目标 role 由 MailboxSender 类型保证，重试路径不再重复 Query。
-    pub fn try_send(self, destination: &MailboxSender, deadline: Deadline) -> Result<(), SendFailure> {
+    pub fn try_send(
+        self,
+        destination: &MailboxSender,
+        deadline: Deadline,
+    ) -> Result<(), SendFailure> {
         match self.publish(destination.as_handle(), deadline) {
             Ok(()) => Ok(()),
             Err((packet, error)) => Err(SendFailure { error, packet }),
@@ -120,23 +156,45 @@ impl Packet {
                 once.transferred();
                 Ok(())
             }
-            Err((packet, error)) => Err(ReplyFailure { error, packet, reply: once }),
+            Err((packet, error)) => Err(ReplyFailure {
+                error,
+                packet,
+                reply: once,
+            }),
         }
     }
 
-    fn publish(mut self, destination: Handle, deadline: Deadline) -> Result<(), (Packet, SystemCallError)> {
-        let mut moves = [HandleMove { handle: Handle::INVALID, rights: Rights::NONE }; MESSAGE_HANDLE_MAX];
+    fn publish(
+        mut self,
+        destination: Handle,
+        deadline: Deadline,
+    ) -> Result<(), (Packet, SystemCallError)> {
+        let mut moves = [HandleMove {
+            handle: Handle::INVALID,
+            rights: Rights::NONE,
+        }; MESSAGE_HANDLE_MAX];
         for (item, transfer) in moves.iter_mut().zip(&self.transfers) {
-            *item = HandleMove { handle: transfer.capability.as_handle(), rights: transfer.rights };
+            *item = HandleMove {
+                handle: transfer.capability.as_handle(),
+                rights: transfer.rights,
+            };
         }
         // SAFETY: Packet 独占全部源 entry，目标 role 已由 typed owner 保证，
         // 失败不消费任何 owner，成功即完整移交运输责任。
         let sent = unsafe {
-            crate::call::sys_send(destination, self.kind, &self.payload, &moves[..self.transfers.len()], deadline)
+            crate::call::sys_send(
+                destination,
+                self.kind,
+                &self.payload,
+                &moves[..self.transfers.len()],
+                deadline,
+            )
         };
         match sent {
             Ok(()) => {
-                for transfer in &mut self.transfers { transfer.capability.transferred() }
+                for transfer in &mut self.transfers {
+                    transfer.capability.transferred()
+                }
                 Ok(())
             }
             Err(error) => Err((self, error)),

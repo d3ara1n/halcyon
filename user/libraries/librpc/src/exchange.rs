@@ -27,6 +27,7 @@ pub enum CallPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallCause {
     Timeout,
+    Cancelled,
     ServiceClosed,
     Shutdown,
     Frame(FrameRejection),
@@ -37,7 +38,14 @@ pub enum CallCause {
 pub struct CallError {
     pub phase: CallPhase,
     pub cause: CallCause,
-    pub request: Option<Request>,
+    pub owner: CallOwner,
+}
+
+#[derive(Debug)]
+pub enum CallOwner {
+    Unsent(Request),
+    Reply(crate::caller::ReplyCleanup),
+    None,
 }
 
 impl CallError {
@@ -48,14 +56,51 @@ impl CallError {
         Self {
             phase: CallPhase::Unsent,
             cause,
-            request: Some(request),
+            owner: CallOwner::Unsent(request),
         }
     }
     pub(crate) fn sent(cause: CallCause) -> Self {
+        Self::sent_with_cleanup(cause, None)
+    }
+
+    pub(crate) fn sent_with_cleanup(
+        cause: CallCause,
+        cleanup: Option<crate::caller::ReplyCleanup>,
+    ) -> Self {
         Self {
             phase: CallPhase::Sent,
             cause,
-            request: None,
+            owner: cleanup.map_or(CallOwner::None, CallOwner::Reply),
+        }
+    }
+
+    pub fn has_unretired_owners(&self) -> bool {
+        match &self.owner {
+            CallOwner::Unsent(_) => true,
+            CallOwner::Reply(cleanup) => cleanup.has_owners(),
+            CallOwner::None => false,
+        }
+    }
+
+    pub fn take_unsent_request(&mut self) -> Option<Request> {
+        if !matches!(self.owner, CallOwner::Unsent(_)) {
+            return None;
+        }
+        match core::mem::replace(&mut self.owner, CallOwner::None) {
+            CallOwner::Unsent(request) => Some(request),
+            _ => unreachable!("checked CallOwner variant changed"),
+        }
+    }
+
+    pub fn retry_cleanup(&mut self) -> Result<(), SystemCallError> {
+        match &mut self.owner {
+            CallOwner::Unsent(_) => Err(SystemCallError::ObjectBusy),
+            CallOwner::Reply(cleanup) => {
+                cleanup.retry_close()?;
+                self.owner = CallOwner::None;
+                Ok(())
+            }
+            CallOwner::None => Ok(()),
         }
     }
 }

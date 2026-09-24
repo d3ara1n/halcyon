@@ -20,6 +20,17 @@ pub struct InvitationFailure {
 }
 
 #[derive(Debug)]
+pub enum CreateFailure {
+    System(SystemCallError),
+    Published {
+        endpoint: Option<Endpoint>,
+        cleanup: Option<super::tunnel::EndpointCleanup>,
+        invitation: Option<Invitation>,
+        error: SystemCallError,
+    },
+}
+
+#[derive(Debug)]
 pub enum AttachFailure {
     Unconsumed {
         invitation: Invitation,
@@ -32,8 +43,25 @@ pub enum AttachFailure {
 }
 
 impl Invitation {
-    pub fn create(bytes: usize, placement: Placement) -> Result<(Endpoint, Self), SystemCallError> {
-        let (endpoint, handle) = super::tunnel::create(bytes, placement)?;
+    pub fn create(bytes: usize, placement: Placement) -> Result<(Endpoint, Self), CreateFailure> {
+        let (endpoint, handle) =
+            super::tunnel::create_owned(bytes, placement).map_err(|failure| {
+                if failure.endpoint.is_none()
+                    && failure.cleanup.is_none()
+                    && failure.invitation.is_none()
+                {
+                    CreateFailure::System(failure.error)
+                } else {
+                    CreateFailure::Published {
+                        endpoint: failure.endpoint,
+                        cleanup: failure.cleanup,
+                        invitation: failure.invitation.map(|handle| Self {
+                            owner: Capability::owned(handle),
+                        }),
+                        error: failure.error,
+                    }
+                }
+            })?;
         Ok((
             endpoint,
             Self {
@@ -56,6 +84,12 @@ impl Invitation {
     }
     pub fn into_capability(self) -> Capability {
         self.owner
+    }
+
+    pub fn close(self) -> Result<(), (Self, SystemCallError)> {
+        self.owner
+            .close()
+            .map_err(|(owner, error)| (Self { owner }, error))
     }
     pub fn attach(self, policy: Placement) -> Result<Endpoint, AttachFailure> {
         let mut output = TunnelEndpointResult::empty();

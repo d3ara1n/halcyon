@@ -15,3 +15,7 @@ libfs = { path = "../../libraries/libfs" }
 librpc = { path = "../../libraries/librpc" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
+libservice = { path = "../../libraries/libservice" }
+librunnel = { path = "../../libraries/librunnel" }
+ordered_table = { path = "../../../shared/ordered_table" }
+metadata_admission = { path = "../../../shared/metadata_admission" }

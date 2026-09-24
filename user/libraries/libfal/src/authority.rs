@@ -2,6 +2,7 @@
 
 use crate::resource::FalResource;
 use crate::store::NodeRef;
+use erhino_shared::object::Rights;
 use libbudget::AccountView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,9 @@ impl FalRights {
     pub const fn intersect(self, ceiling: Self) -> Self {
         Self(self.0 & ceiling.0)
     }
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 impl core::ops::BitOr for FalRights {
@@ -56,6 +60,7 @@ impl core::ops::BitAnd for FalRights {
 pub struct AccessSnapshot {
     pub(crate) root: NodeRef,
     pub(crate) rights: FalRights,
+    pub(crate) output_transport: Rights,
     pub(crate) account: AccountView<FalResource>,
 }
 
@@ -66,7 +71,27 @@ impl AccessSnapshot {
     pub fn rights(&self) -> FalRights {
         self.rights
     }
+    pub fn output_transport(&self) -> Rights {
+        self.output_transport
+    }
+
     pub fn account(&self) -> &AccountView<FalResource> {
         &self.account
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_for_test(
+        root: NodeRef,
+        rights: FalRights,
+        output_transport: Rights,
+        account: AccountView<FalResource>,
+    ) -> Self {
+        Self {
+            root,
+            rights,
+            output_transport,
+            account,
+        }
     }
 }

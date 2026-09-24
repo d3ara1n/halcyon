@@ -205,6 +205,7 @@ pub(super) struct RootSupervisor {
     capabilities: Vec<CapabilityEntry>,
     capability_cursor: usize,
     endpoint_cleanup: Cleanup<rinlib::ipc::tunnel::Endpoint>,
+    endpoint_create_cleanup: Cleanup<rinlib::ipc::tunnel::EndpointCleanup>,
     capability_cleanup: Cleanup<Capability>,
     services: Option<Handle>,
     jobs: [Option<JobDuty>; ROOT_JOB_SLOTS],
@@ -278,6 +279,7 @@ impl RootSupervisor {
             capabilities: Vec::new(),
             capability_cursor: 0,
             endpoint_cleanup: Cleanup::empty(),
+            endpoint_create_cleanup: Cleanup::empty(),
             capability_cleanup: Cleanup::empty(),
             services: None,
             jobs: [None, None],
@@ -378,6 +380,31 @@ impl RootSupervisor {
             }
         }
     }
+    pub(super) fn create_mailbox_owner(
+        &mut self,
+        rights: Rights,
+    ) -> Result<Handle, SystemCallError> {
+        let [slot] = self.reserve_capabilities()?;
+        match Mailbox::create(rights) {
+            Ok(mailbox) => {
+                let owner = mailbox.into_raw();
+                self.adopt(slot, owner);
+                Ok(owner)
+            }
+            Err(error) => {
+                self.capabilities[slot].reserved = false;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn own_sender(&mut self, sender: MailboxSender) -> Result<Handle, SystemCallError> {
+        let [slot] = self.reserve_capabilities()?;
+        let handle = sender.as_handle();
+        self.capabilities[slot].owner = Some(RootCapability::Sender(sender));
+        Ok(handle)
+    }
+
     pub(super) fn create_mailbox(
         &mut self,
         owner: Rights,
@@ -654,6 +681,22 @@ impl RootSupervisor {
         );
         self.endpoint_cleanup.owner = Some(endpoint);
         self.retain_capability(invitation.into_capability());
+    }
+    pub(super) fn retain_failed_create(
+        &mut self,
+        endpoint: Option<rinlib::ipc::tunnel::Endpoint>,
+        cleanup: Option<rinlib::ipc::tunnel::EndpointCleanup>,
+        invitation: Option<rinlib::ipc::invitation::Invitation>,
+    ) {
+        assert!(
+            self.endpoint_cleanup.owner.is_none() && self.endpoint_create_cleanup.owner.is_none(),
+            "stream setup has one endpoint"
+        );
+        self.endpoint_cleanup.owner = endpoint;
+        self.endpoint_create_cleanup.owner = cleanup;
+        if let Some(invitation) = invitation {
+            self.retain_capability(invitation.into_capability());
+        }
     }
 
     fn begin_batch(&mut self, incoming: Vec<Supervised>, one: Option<Supervised>) -> usize {
@@ -1208,6 +1251,8 @@ impl RootSupervisor {
         }
         self.endpoint_cleanup
             .step(now, rinlib::ipc::tunnel::Endpoint::close);
+        self.endpoint_create_cleanup
+            .step(now, rinlib::ipc::tunnel::EndpointCleanup::close);
         self.capability_cleanup.step(now, Capability::close);
         if self.failing {
             for index in 0..ROOT_JOB_SLOTS {
@@ -1269,6 +1314,7 @@ impl RootSupervisor {
             && self.read.is_none()
             && self.processes.is_empty()
             && self.endpoint_cleanup.owner.is_none()
+            && self.endpoint_create_cleanup.owner.is_none()
             && self.capability_cleanup.owner.is_none()
             && self.capabilities.iter().all(|entry| entry.owner.is_none())
         {
@@ -1285,9 +1331,12 @@ impl RootSupervisor {
             [WaitItem::new(self.idle.handle(), ObjectSignals::READABLE, 0); ROOT_WAIT_TARGETS];
         let mut count = 1;
         let mut deadline = None;
-        let mut runnable = self.endpoint_cleanup.runnable() || self.capability_cleanup.runnable();
+        let mut runnable = self.endpoint_cleanup.runnable()
+            || self.endpoint_create_cleanup.runnable()
+            || self.capability_cleanup.runnable();
         for at in [
             self.endpoint_cleanup.disposition.retry,
+            self.endpoint_create_cleanup.disposition.retry,
             self.capability_cleanup.disposition.retry,
         ]
         .into_iter()

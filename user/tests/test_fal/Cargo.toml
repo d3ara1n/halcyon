@@ -1,0 +1,13 @@
+[package]
+name = "test_fal"
+version = "0.1.0"
+edition = "2024"
+description = "FAL acceptance consumer"
+
+[dependencies]
+rinlib = { path = "../../rinlib" }
+libfal = { path = "../../libraries/libfal" }
+libservice = { path = "../../libraries/libservice" }
+libfs = { path = "../../libraries/libfs" }
+librpc = { path = "../../libraries/librpc" }
+librunnel = { path = "../../libraries/librunnel" }
