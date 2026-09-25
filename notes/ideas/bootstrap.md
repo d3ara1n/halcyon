@@ -144,6 +144,8 @@ Zircon 把 bootdata 作为显式 VMO 交给普通 userboot，由 userboot 解析
 
 这项保活由地址空间及合法 launcher/程序环境契约承担，不是将 Rust 切片随意强转为 static。公开的 StartupPayload 持有经验证的只读视图凭据，借出的字节切片绑定到该视图的借用；它可以显式 clone 并跨本进程线程共享，但不拥有原始 Handle 数组，也不拥有 backing 回收权。丢弃所有 payload 视图不提前解除映像；只有进程地址空间收束返还 backing 与计费。未来若需要启动区提前回收，必须增加真实的映射交接契约后再改变此寿命，不能让当前上下文 Drop 偷做。
 
+StartupBlock、初始 grants 和 payload 视图是进程环境资源；附入线程的执行栈、结果记录和线程环境状态是线程资源。ProcessAttach 的构建者为所选 user contract 准备 control/栈 owner 的稳定交接，子进程入口再采用到 PTR；尚未决定的 ABI、失败与未采用时的 owner 由工作计划闭合。Rust profile 当前只采用一个 `_start` 入口，其他附入线程不自动获得 Rust runtime 契约。采用后，Attached 与 Spawned 使用同一结果发布、ThreadExit 和 cleanup 状态机，不按 TID/PID 选择另一套生命周期协议。
+
 进入 Rust 安全接口的原始指针接管仍是 unsafe：调用者须保证完整映像可读、长度可表示、内容稳定及上述寿命。outer 格式校验只能验证已可访问字节的布局，不能证明一个任意指针可读。平台入口适配器是该不变量的唯一生产接点，非法启动输入按程序失败收束，不把用户地址错误变成内核 panic。
 
 ### 启动凭据与采用

@@ -71,9 +71,9 @@ ProcessDrain 可以由受信任的进程管理服务专职承担，由根监督�
 
 线程属于且仅属于一个进程，持有独立 UserContext 与 FP 状态；栈是进程资源，由组装者或进程自己供给。只有线程参与调度；进程提供资源环境与执行需求，不是调度队列成员。
 
-内核无「主线程」角色，只有「首线程」——组装时附入的第一条线程（tid 1），携带出生信息只因信息必须交给第一个执行者；是否初始化、是否 spawn 工作线程、初始化完是否退出，全是用户政策。线程出生不携带资源、死亡不留遗产、生存只耗 CPU——执行需求是进程级属性，栈与句柄是进程资源。
+内核无「主线程」角色；ProcessAttach 产生的是构建期附入线程，ThreadSpawn 产生的是运行期线程。附入线程携带出生信息是启动交接需要，不赋予数字身份任何政策含义。选定 user contract 为 Attached/Spawned 建立同一类进程级线程记录；ThreadSpawn 在提交前预登记，Attached 由构建者准备交接、在子进程入口采用。线程栈、结果和 control 是记录中的线程资源，进程仍负责最终资源域。
 
-**进程的生 = Start 入册（首线程已在表），进程的死 = 末线程离场**——线程 presence 从两端定义进程生命周期。无线程的进程停留在 Building，从未活过。
+**进程的生 = Start 入册（至少一个附入线程已在表），进程的死 = 末线程离场**——线程 presence 从两端定义进程生命周期。无线程的进程停留在 Building，从未活过；构建期附入线程和运行期生成线程的用户态 cleanup 契约由所选 runtime 决定。
 
 线程任意时刻恰处于一个稳定所有权容器：
 
@@ -112,50 +112,51 @@ ProcessGrant 可以在内存绑定前独立完成，因为 HandleTable 属于空
 
 ## 用户态线程资源收束
 
-内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈。libthread 以普通匿名 mapping 组成双 guard 的 UserStack，并把栈、入口状态、结果记录与 ThreadControl 组合为 affine JoinHandle。join 是 DONE、统一等待与内核资源关闭之上的用户态协议，不另设 syscall；基础映射和等待由 libkernel 提供。成功 join 同时意味着执行已经结束和包装器拥有的资源已收束，任务返回值与清理失败分别报告。默认 Drop 保留等待线程结束的结构化语义，不能将尚在运行的线程静默 detach；若收束失败则必须移交预先准入的退休 owner，不把诊断计数当资源承接。此承接机制属于 [用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md) 的必要前置，当前实现尚未具备。
+内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈。libthread 拥有 ThreadRecord、ThreadObservation、结果发布和 cleanup 状态机；进程运行环境建立并持有 `ProcessThreadRegistry`（PTR），PTR 独占已采用 ThreadRecord 的生命周期 owner。公开 `Thread` 只持有可 Clone、可失效的观察/控制对象，不借用或拥有 ThreadRecord；ThreadControl 仍由 libkernel 提供。Attached 与 Spawned 的产生事务可以不同，但采用到 PTR 后使用同一记录和状态机，不按 TID/PID 分支。构建者至 PTR 的 Attached 所有权转移和异常路径仍须先在计划中闭合。
 
 ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 joiner 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。
 
 ### 线程环境与结果交接
 
-libthread 拥有本进程线程的准备、发布与回收契约。`ThreadEnvironment`、`ThreadFactory`、`PreparedThread` 是拟定的接口角色：调用者构造工厂时显式提供运行环境，工厂为每次启动准备独立的环境 owner。所选语言 runtime 可以实现该环境；需要线程的通用库只消费 libthread 的契约，不导入具体 runtime。外部组装新进程首线程仍属于 libprocess 的 Building 通道，不由此接口代替。
+libthread 拥有本进程线程的准备、发布、结果和回收机制。`ThreadEnvironment`、`ThreadFactory`、`PreparedThread`、`ThreadRecord`、`ThreadObservation` 和公开 `Thread` 是拟定的接口角色：调用者构造工厂时显式提供运行环境和抽象登记端口，工厂在 syscall 前登记稳定记录；具体 PTR 由 libruntime 持有，libthread 不反向依赖它。所选语言 runtime 可以实现该环境；需要线程的通用库只消费 `Thread`/结果领取契约，不导入具体 runtime。ProcessAttach 与 ThreadSpawn 在进程构建/运行阶段分别产生记录，接入 PTR 后不再区分线程身份。
 
 环境是显式的生命周期接口：父侧准备可发送的每线程状态，子侧进入/离开，DONE 后可在收束者侧退休。接口只理解这些阶段，不含具体 runtime 类型、默认全局 hook 或服务政策。语言环境实现必须在自己的状态中记录部分成功，不允许线程库猜测哪些外部资源已建立。当前只承诺 abort 型 Rust 环境，不因接口预留接点建设 TLS、unwind 或 detach。
 
 ### 准备与发布
 
-工厂使用调用方选择的栈策略和已配置的收束域；不存在脱离程序环境的隐式默认工厂。准备之前先准入一个完整责任槽，供正常、失败、Drop 和取消路径共同使用。槽的容量和计费由显式资源配置决定，不在失败路径临时分配，也不以任意新常数限制线程总量。
+工厂使用调用方选择的栈策略和已配置的 PTR 记录容量；不存在脱离程序环境的隐式默认工厂。准备之前先在 PTR 预留完整记录和 cleanup 责任，供正常、失败、控制 handle 丢弃和取消路径共同使用。槽的容量和计费由显式资源配置决定，不在失败路径临时分配，也不以任意新常数限制线程总量。
 
-准备顺序是：退役责任准入 → 入口/结果 packet 与环境的可失败准备 → 带 guard 的栈 → PreparedThread。每一步失败完整返还尚未执行的任务、环境状态与已取得资源；调用者可以取消或处理清理，线程尚未进入 Ready。便利 spawn 可以将 prepare/start 组合，但不能吞掉清理失败 owner。
+准备顺序是：登记端口取得记录/容量准入 → 入口/结果 packet 与环境的可失败准备 → 带 guard 的栈 → PreparedThread。每一步失败都由登记端口/PTR 记录完整返还尚未执行的任务、环境状态与已取得资源；调用者可以取消或由 runtime driver 继续处理，线程尚未进入 Running。便利 spawn 可以将 prepare/start 组合，但不能丢失 PTR 的清理责任。
 
-PreparedThread 的 start 只提交一次 ThreadSpawn，失败返回 PreparedThread 而不是销毁任务，成功产生 JoinHandle。子线程可能在父侧收到 syscall 返回前运行，所以所有 packet 地址、环境、结果槽与回收责任必须在提交前稳定；不能在 syscall 成功之后才分配 Join 所需记录。不得在进入 syscall 时持有子线程退出必须取得的用户锁。
+PreparedThread 的 start 只提交一次 ThreadSpawn，失败返回 PreparedThread 而不是销毁任务，成功后返回公开 `Thread`/一次性结果领取接口，生命周期记录仍由 PTR 持有。子线程可能在发起侧收到 syscall 返回前运行，所以所有 packet 地址、环境、结果槽与回收责任必须在提交前稳定；不能在 syscall 成功之后才登记 PTR 记录。结果领取权可在 record cleanup 后继续存在时的存储寿命、无人领取时的析构及过期语义尚未冻结，不以一个可失效观察壳代替所有权证明。不得在进入 syscall 时持有子线程退出必须取得的用户锁。
 
 内核发布成功但输出不符合固定结果契约属于完整性失败，不能当作未启动并释放栈。正常错误遵守未发布返还；完整性失败只能进入进程故障策略，不能伪造可重试 PreparedThread。
 
 ### 子侧环境与结果发布
 
 ```text
-Prepared → Published → Entering → Running → Leaving → ResultPublished
-                                                      ↓
-                                内核 ThreadExit → DONE → Collecting → Collected
+Registered → Starting → Running
+                    → ResultPublished / Unpublished
+                    → ThreadExit → KernelDone
+                    → Retiring → Retired
 ```
 
-父侧只操作它自己的 Join/回收控制，不与子侧同时取得 packet 的 `&mut`。DONE 前，子侧是其任务与环境状态的唯一执行者；DONE 后，执行访问才转交给收束者。共享发布字使用原子操作，任务/结果存储的已初始化状态独立维护，不能用一枚含义混杂的 done 位描述全部事实。
+公开 Thread 只操作自己的观察/控制对象，不与 PTR 同时取得 ThreadRecord 的 `&mut`。DONE 前，子侧是其任务与环境状态的唯一执行者；DONE 后，PTR 才取得 cleanup claim。共享发布字使用原子操作，任务/结果存储的已初始化状态独立维护，不能用一枚含义混杂的 done 位描述全部事实。
 
-子侧进入失败时不运行任务，保留未执行 closure 和部分环境状态，发布 EnterFailed。正常任务返回先将 T 放入明确已初始化的存储，再完成环境 leave；leave 失败也必须保留这个 T，并报告单独的环境结束错误。最终 publication 用 release 发布完整 outcome，之后只执行不再访问业务数据的 ThreadExit。收束者在 DONE 后 acquire 观察发布状态；结果发布早于 DONE 不允许提前回收栈。
+子侧进入失败时不运行任务，保留未执行 closure 和部分环境状态，发布 EnterFailed。正常任务返回先将 T 放入明确已初始化的存储，再完成环境 leave；leave 失败也必须保留这个 T，并报告单独的环境结束错误。最终 publication 用 release 发布完整 outcome，之后只执行不再访问业务数据的 ThreadExit。PTR 在 DONE 后 acquire 观察发布状态，再逐步处理 cleanup；结果发布早于 DONE 不允许提前回收栈。
 
-线程未经过终结包装器而结束时，DONE 不证明任务返回或环境已经正常离开。未发布结果归为 Incomplete，不读取未初始化的 T。closure 是否已经移入调用栈、结果是否实际已写入、环境的哪些动作已完成分别依据状态恢复；不能对已移走 closure 执行第二次 Drop，也不能从抛弃的任意调用栈恢复 Rust 局部变量。安全环境契约不得承诺任意指令位置终止后的通用析构。底层直接 ThreadExit 是需要调用者自行承担这些义务的 raw/unsafe 逃生口，不作为普通 Rust closure 的安全提前返回方式。进程终止仍是进程级最终资源边界。
+线程未经过终结包装器而结束时，DONE 不证明任务返回或环境已经正常离开。PTR 内部必须保留 `Unpublished` 等事实状态，不读取未初始化的 T；这不是普通 Rust 线程的安全结果，而是 raw/unsafe 逃生后的诊断和完整性边界。closure 是否已经移入调用栈、结果是否实际已写入、环境的哪些动作已完成分别依据状态恢复；不能对已移走 closure 执行第二次 Drop，也不能从抛弃的任意调用栈恢复 Rust 局部变量。底层 `ThreadExit(code)` 由 libkernel 提供，libthread 不声明可绕过 wrapper 的安全出口；其他语言 runtime 可以在自己的 wrapper 中消费该原语。进程终止仍是进程级最终资源边界。
 
 闭包及返回值需要 Send 与静态拥有的捕获，不提供借用调用者栈的 scoped thread。任务、结果和环境状态只能被移出/丢弃一次；具体环境若违反其 unsafe 初始化/终结契约，按进程完整性失败处理，不继续交付可能已损坏的语言对象。
 
 ### Join、期限和清理
 
-JoinHandle 的等待以 ThreadControl DONE 为事实。期限只限制本次等待/重试政策，不杀子线程、不撤销已提交 MemoryChange，也不把未完成包装成取消成功。等待期限到达或观察错误时，完整 Join owner 返还调用者，可再次 join 或移交明确的监督者。
+Thread 的等待以 ThreadControl DONE 为事实。期限只限制本次观察/重试政策，不杀子线程、不撤销已提交 MemoryChange，也不改变 PTR 的生命周期 owner。观察期限到达或 capability 失效时，公开 Thread 只报告观察结果；结果领取和 cleanup 仍由 PTR/运行时 driver 负责。
 
-DONE 后才解码并移出可交付的 ThreadOutcome，然后收束环境、packet、栈映射和 Control。至少保留足够的离场证明到栈已不再被执行；环境需要最后依赖的资源必须比它晚释放。已取得的返回值不因 Unmap 失败被丢弃：返回结果与 ThreadCleanup 分别移交，失败后重新推进不得重复环境析构、Control close 或 outcome 领取。wait、Control close、固定输出不一致和 Unmap 永久错误必须进入明确的 Join/cleanup/supervisor owner，不能由 Drop 的 panic 或 abandoned 计数吞掉。
+DONE 后 PTR 才能确认 ThreadOutcome 是否可交付，并以单步状态机收束环境、packet、栈映射和 Control。至少保留足够的离场证明到栈已不再被执行；环境需要最后依赖的资源必须比它晚释放。已取得的返回值不因 Unmap 失败被丢弃；领取、无人领取时的析构和 record 退休必须恰好一次，具体结果存储与领取权的寿命边界留在工作计划中冻结。失败后重新推进不得重复环境析构、Control close 或 outcome 领取。wait、Control close、固定输出不一致和 Unmap 永久错误必须进入 PTR 的明确状态，不能由 public Thread 的 Drop 或 abandoned 计数吞掉。
 
-同步 Join 与外部执行器使用同一收束状态机。一次推进执行一个有界动作或返回观察/重试请求，不在 libthread 内启动任务循环；libexecution 可以在使用侧持有该状态机并登记观察。同步驱动使用相同结果，不另写第二套 Busy 重试规则。状态机不依赖 libexecution。
+PTR 的 cleanup driver 与任何外部执行器使用同一收束状态机。一次推进执行一个有界动作或返回观察/重试请求；libthread 不依赖具体 executor，libruntime 负责把 driver 接入已有运行体或其他执行上下文。同步观察和异步推进使用相同结果，不另写第二套 Busy 重试规则。
 
-尚未开始的 PreparedThread 取消只回收未发布资源；Join 的取消只放弃当前等待并返还 owner；Drop 默认仍等待 DONE。调用方无法在 Drop 接收错误，因此 factory 必须事先取得资源退休的稳定承接：接收剩余 ThreadCleanup 是无分配、不可拒绝的责任转交，之后由既有用户态执行/监督配置按预算推进。移交前不能丢失观察、环境状态、映射或计费。
+尚未开始的 PreparedThread 取消只回收未发布资源；Thread 只放弃观察/控制权，不触碰 PTR owner；ThreadRecord 的 cleanup 只有 PTR driver 可以推进。PTR 预先取得记录、容量和计费，确保原调用者退出后责任仍然存在。具体 driver 的调度时机、关闭顺序和失败政策仍记入本计划 TODO，不把“没有调用者控制 handle”误写成“没有生命周期 owner”。
 
-承接配置必须复用已有通用执行、等待、准入和停止契约。线程 cleanup 的跨线程交付由 libthread 拥有固定容量 `RetirementDomain`：每个 PreparedThread 先取得不可拒绝的 permit，cleanup record 以 release/acquire 发布到稳定槽位，既有用户态执行器以任务形式逐步推进，直到结果、环境、Control、映射和付款责任全部结算。domain seal 只禁止新 permit，已有 permit 仍可发布；receiver task 只有在 `sealed && outstanding == 0` 后才能注销来源并关闭 Runtime。libthread 不依赖具体 executor、FAL 或 runtime，也不把通知当作债务 owner。首个实现的 JoinHandle 保持线程局部，跨线程只转交已经稳定且满足 SAFETY 的 ThreadCleanup record；不为自 join 新增 current Tid ABI。没有这些前提就不能开放宣称可安全 Drop 的线程工厂；最终进程回收或缺陷计数不能代替运行期精确收束。当前实现与复用边界见 [运行体实现](../impls/runtime.md#资源退休消费者与复用边界)，具体施工前置与代码差距由[用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md)记录。
+PTR 是已采用记录的进程级唯一生命周期 owner：Spawned 在提交前预登记，Attached 在入口采用构建者预备的交接；线程死亡只推进到 KernelDone，不能因观察 handle 消失而删除 record。libruntime 的 ThreadDriver 负责在确定时机调用 PTR 的单步 cleanup；它可以复用 libexecution，但不把 supervisor 或隐藏线程写进 libthread 契约。ProcessDrain 是最后执行者无法继续用户态 cleanup 时的内核终局，不替代正常 PTR 回收。driver 具体调度、Attached control/栈 owner 的启动交接、结果领取寿命、关闭顺序和容量预算仍由 [用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md)记录。
