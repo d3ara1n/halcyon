@@ -13,6 +13,7 @@
 | 类型 | 入口 |
 |---|---|
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
+| Review | [条件性容量校准提交](todo-2026-09-25-capacity-calibration-review.md) |
 | Review | [FAL 集成基线](todo-2026-09-13-fal-integration-baseline-review.md) |
 | Review | [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) |
 | Review | [库存来源与自检](todo-2026-09-frame-source-selftest-review.md) |

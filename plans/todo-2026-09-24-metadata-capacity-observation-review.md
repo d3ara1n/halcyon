@@ -1,12 +1,12 @@
 # Metadata 容量观测提交后独立审查
 
-> 状态：待独立 Review。本记录只安排固定提交的事后审查，不替代架构审计 A2/M3/M5 的未完成容量校准，也不表示已验证 32 个 Bound AddressSpace 可同时驻留。
+> 状态：待独立 Review。本记录只安排原固定提交的事后审查；该提交尚未包含后续容量校准。后续顺序/并发及混合负载的条件性准入证据另由[容量校准提交 Review](todo-2026-09-25-capacity-calibration-review.md) 固定对象审查，不表示任意工作集都有物理容量保证。
 
 ## 固定对象
 
 - 提交：`bfe38ff244c3fa283240444ab26c0030214ccbd9`，父提交 `be6dae30e6018d93890e71f95bc0c2c00e0585cf`。
 - 范围：Talc `counters`、Ready/reset 堆快照、heap ticket 消费数、RV64 ledger 条目布局输出，以及对应 mm/internals、审计工作记录和 COMPASS 更新。
-- 未包含：分配准入、共享 ABI、独立 KernelMemoryBudget、运行中高水位采样或 32 张账本饱和负载。未闭合容量责任仍由[架构审计工作记录](todo-2026-09-14-architecture-audit-findings.md)拥有。
+- 未包含：分配准入、共享 ABI、独立 KernelMemoryBudget、运行中边界采样或 32 张账本验收。这些后续工作的结论与延期边界由[架构审计工作记录](todo-2026-09-14-architecture-audit-findings.md)拥有。
 
 ## 审查重点
 
