@@ -146,6 +146,7 @@ unsafe extern "C" fn handle_user_trap(
     // 业务 guard 已释放，统一推进两段式通知；剩余 pending 再发布门铃。
     deferred_work::drain_current();
     crate::task::notify_work::drain_current();
+    crate::heap::sample();
     if thread.is_some_and(|t| t.process.lifecycle.is_terminating()) {
         Outcome::Killed as usize
     } else {

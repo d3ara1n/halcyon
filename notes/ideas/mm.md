@@ -158,6 +158,8 @@ Map 的 Reserve 已经唯一确定 usable 与 reservation 范围。`MemoryMapRes
 Unmap/Protect 的旧 backing、旧权限或 writable-view permit 在 Synchronize 期间由事务隔离持有，不能归还库存、映射到其它地址、退出 seal 计数或被另一对象重新解释。Retire 只在全部确认后释放旧 OwnedExtents、旧 ObjectView、写 permit 与过期元数据。Retire 批次的对象来源集与容器容量必须在 Commit 前从完整计划推导并去重；同一地址空间对同一对象的 view owner 在一笔批次中至多交出一次，每笔仍持足以完成其全部许可归还的来源引用。Commit 后可以依据账本确定 live view 是否已经消散，但不能再从 live view 查询补找退款来源；其它批次先完成、最后 Handle 消散或对象全部区域移除，都不使当前义务失去 owner。一般事务状态属于地址空间而非发起线程；等待远端确认的 System Call 通过 WaitContext park，发起线程终止只消散最终返回权。进程终止冻结后拒绝新事务并接管已 Commit 的事务；只有线程、active hart、事务与对象 lease 全部完成或进入可恢复收束后，地址空间才可进入最终 drain。
 容量证明覆盖资源的整个生命周期，而不只是一次创建。常驻 backing 经多次切割后可以积累碎片；每笔变更的发布资格必须同时覆盖当前存量、其它在途事务尚未兑现的增长与本次最大瞬时增长，不能用初始 funding 的 extent 上限代替。配额许可与实际承载这些 owner 的存储容量必须同时预付；内部存储方式可以替换，但提交后增长不得重新触发可失败分配。
 
+全局对象准入上限不自动承诺等量的 heap 字节或任意未来工作集容量。当前 `Bound AddressSpace` 数量政策只表达 metadata ledger 的条件性准入；新建和普通变更在 Commit 前按具体计划预留所有可失败资源，预留失败是普通可恢复错误。Commit 后的事务、退出和 drain 必须仅消费已持有的 owner、reservation、work debt 与稳定游标并最终完成。若未来要对指定最大工作集作物理容量硬保证，必须另行定义布局上界、完成余量和连续空间/专用 arena 预留，不得从对象数量常量或 aggregate heap 观测推导。
+
 最后一个地址翻译确认只把事务推进到 Retiring，不授予在 Remote Call 完成回调中执行任意宽度收束的许可。若 backing slice、表页或元数据的退役超过单次固定预算，事务成为显式的内核 work debt：由安全出口按游标逐批推进，未完成时由明确的 hart 唤醒所有者再次敲门，全部 owner 已在容器锁外释放后才进入 Complete、兑销 mandatory operation 并唤醒调用者。预算必须覆盖完整调用链，包括查找、容器移动、最后引用析构和通知传播；不能把一次许可归还可能引出的任意宽度通知隐藏为常数工作。具有结构硬上界的收束可作为一个固定粒度，其余工作必须显式保留进度。该机制没有后台内核线程，不绑定原发起线程，也不允许终止路径另建同步扫描旁路；进程终止只接管同一事务与同一游标。唤醒点取 Complete 而非 Synchronize 是刻意取舍：单管线单完成点让结果义务、mandatory operation 与 join 边界共用一个定义，代价是调用者返回延迟包含全部 retire 批次、随 extent 数线性增长。若实测成为瓶颈，合法的范式内优化是把调用者返回提前到 Synchronize（对外完成边界不变），retire 纯后台推进；两者都不改变 Commit 与 Synchronize 的既有语义。
 
 ## 跨 Hart 地址翻译同步

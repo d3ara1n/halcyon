@@ -4,25 +4,26 @@
 
 ## 近期顺序
 
-1. [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md)：M2 已修复，A2/M3/M5 已有 RV64 布局与 core/stress 堆快照；下一步补运行中峰值及并发饱和证据，校准全局准入政策，独立预算按授权触发。
-2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口；与 metadata 容量校准无技术前置关系，可独立排期。
+1. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
 
-## 待排期审查
+## 可择机任务与审查
 
-近期施工完成后，先由 reviewer 汇总现有 Review 档案和 findings，形成一个明确范围、优先级和唯一入口的总体 Review 任务，再按该任务执行审查。以下为既有审查材料的候选接手顺序，不表示下一项施工，也不要求旧审查全部完成才能继续新能力。
-FAL 固定提交审查计划暂不单独排在近期顺序中；它等待整体 Review 档案分析后纳入总体审查任务。
+以下不表示自然顺序，也不阻塞新的系统能力。架构审计剩余发现可随时择机复核；容量计量暂缓，待真实故障、消费者或明确的硬容量承诺再重开。Review 材料待 reviewer 汇总现有档案与 findings，形成明确范围、优先级和唯一入口的总体 Review 任务；FAL 固定提交审查计划也由该任务纳入。
 
-1. [FAL 集成基线](todo-2026-09-13-fal-integration-baseline-review.md)
-2. [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md)
-3. [库存来源与自检](todo-2026-09-frame-source-selftest-review.md)
-4. [设计审查后续内存机制](todo-2026-09-design-audit-followup-review.md)
-5. [消息运输](todo-2026-09-14-message-transport-review.md)
-6. [流运输与 Runnel](todo-2026-09-14-stream-transport-review.md)
-7. [公共操作所有权](todo-2026-09-18-public-operation-ownership-review.md)
-8. [通用执行、RPC 与 Outbox](todo-2026-09-15-runtime-admission-review.md)
-9. [用户态库知识归属与命名](todo-2026-09-21-library-knowledge-ownership-review.md)
-10. [FAL 库基线](todo-2026-09-21-fal-library-baseline-review.md)
-11. [FAL 注册发现设计](todo-2026-09-21-fal-service-design-review.md)
+| 类型 | 入口 |
+|---|---|
+| 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
+| Review | [FAL 集成基线](todo-2026-09-13-fal-integration-baseline-review.md) |
+| Review | [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) |
+| Review | [库存来源与自检](todo-2026-09-frame-source-selftest-review.md) |
+| Review | [设计审查后续内存机制](todo-2026-09-design-audit-followup-review.md) |
+| Review | [消息运输](todo-2026-09-14-message-transport-review.md) |
+| Review | [流运输与 Runnel](todo-2026-09-14-stream-transport-review.md) |
+| Review | [公共操作所有权](todo-2026-09-18-public-operation-ownership-review.md) |
+| Review | [通用执行、RPC 与 Outbox](todo-2026-09-15-runtime-admission-review.md) |
+| Review | [用户态库知识归属与命名](todo-2026-09-21-library-knowledge-ownership-review.md) |
+| Review | [FAL 库基线](todo-2026-09-21-fal-library-baseline-review.md) |
+| Review | [FAL 注册发现设计](todo-2026-09-21-fal-service-design-review.md) |
 
 ## 条件触发的计划
 
@@ -54,6 +55,6 @@ FAL 固定提交审查计划暂不单独排在近期顺序中；它等待整体 
 | TLS ABI | TLS 需求 | [task 实现](../notes/impls/task.md) |
 | 多用户 / ACL | 多用户需求 | [object](../notes/ideas/object.md) |
 | ASID 与定向 shootdown | 地址空间切换开销实测 | [task 实现](../notes/impls/task.md) |
-| admission / Remote 槽高水位 | metadata 预算立案、容量重校或耗尽现场 | [mm](../notes/ideas/mm.md)、[架构审计 M5](todo-2026-09-14-architecture-audit-findings.md#m5-内核堆没有压力观测也没有接近上限时的分级拒绝) |
+| 更细粒度 heap 计量或硬容量保证 | 真实 OOM/退休故障、指定工作集的容量承诺或观测到的性能瓶颈 | [架构审计 A2/M3/M5](todo-2026-09-14-architecture-audit-findings.md)、[mm](../notes/ideas/mm.md) |
 | Unmap 唤醒点前移 | 内存操作延迟瓶颈有测量证据 | [mm](../notes/ideas/mm.md) |
 | FAL 正式故障注入补证 | 稳定正式注入入口出现，或生产故障暴露清理问题 | [FAL 交付档案](archived/todo-2026-09-fal-service-capabilities.md#跨会话接力断点) |

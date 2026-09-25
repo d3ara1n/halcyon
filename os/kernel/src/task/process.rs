@@ -591,6 +591,13 @@ pub fn bind_memory(
         .pop()
         .expect("BindMemory committed Pool entry missing");
     super::handle::close_entry_infallible(pool_entry, &thread.process, false);
+    crate::heap::log_snapshot("bind");
+    log!(
+        Task,
+        "metadata bind usage {:?} peaks {:?}",
+        super::resources::admission_usage(),
+        super::resources::admission_peak()
+    );
     Ok(())
 }
 

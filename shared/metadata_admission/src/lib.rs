@@ -17,6 +17,7 @@ pub struct ReachLimit;
 pub struct Counter {
     limit: usize,
     used: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 impl Counter {
@@ -25,6 +26,7 @@ impl Counter {
         Self {
             limit,
             used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
         }
     }
 
@@ -34,6 +36,15 @@ impl Counter {
 
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
+    }
+
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// 只能在无并发 acquire/release 时重设观测基线。
+    pub fn reset_peak(&self) {
+        self.peak.store(self.used(), Ordering::Relaxed);
     }
 
     pub fn try_acquire(counter: &Arc<Self>) -> Result<Permit, ReachLimit> {
@@ -59,6 +70,18 @@ impl Counter {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    let mut peak = counter.peak.load(Ordering::Relaxed);
+                    while peak < next {
+                        match counter.peak.compare_exchange_weak(
+                            peak,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => peak = observed,
+                        }
+                    }
                     return Ok(Permit {
                         counter: Arc::clone(counter),
                         slots,

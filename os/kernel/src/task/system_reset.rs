@@ -113,6 +113,12 @@ pub fn request(
         crate::frame::free_frames()
     );
     crate::heap::log_snapshot("reset");
+    log!(
+        Task,
+        "metadata reset usage {:?} peaks {:?}",
+        crate::task::resources::admission_usage(),
+        crate::task::resources::admission_peak()
+    );
     let result = crate::sbi::system_reset(platform_action, platform_reason);
     reset.finish_failed();
 

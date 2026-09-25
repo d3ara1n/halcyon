@@ -58,7 +58,7 @@ use rinlib::ipc::{
     packet::Packet,
 };
 use rinlib::memory_pool::MemoryPool;
-#[cfg(feature = "acceptance-stress")]
+#[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
 use rinlib::shared::proc::ProcessDrainStatus;
 use rinlib::time::Deadline;
 use rinlib::{
@@ -251,8 +251,21 @@ const CANCELLATION_PROBES: usize = if cfg!(feature = "acceptance-stress") {
 const TUNNEL_STRESS: usize = 64;
 #[cfg(feature = "acceptance-stress")]
 const ACCEPTANCE_WORKLOAD: &str = "stress";
-#[cfg(not(feature = "acceptance-stress"))]
+#[cfg(feature = "capacity-calibration")]
+const ACCEPTANCE_WORKLOAD: &str = "capacity";
+#[cfg(all(
+    not(feature = "acceptance-stress"),
+    not(feature = "capacity-calibration")
+))]
 const ACCEPTANCE_WORKLOAD: &str = "core";
+#[cfg(feature = "capacity-calibration")]
+// init 自身已经占用一个 Bound AddressSpace；本轮再保留 31 个，达到全局
+// 32 个的现行准入上限后，再尝试第 33 个。
+const CAPACITY_ADDITIONAL_ADDRESS_SPACES: usize = 31;
+#[cfg(feature = "capacity-calibration")]
+const CAPACITY_CONCURRENT_WORKERS: usize = 4;
+#[cfg(feature = "capacity-calibration")]
+const CAPACITY_CONCURRENT_PER_WORKER: usize = 8;
 
 const REQUIRED_FS: u64 = 1 << 0;
 const REQUIRED_PM: u64 = 1 << 1;
@@ -2606,6 +2619,319 @@ fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[cfg(feature = "capacity-calibration")]
+fn test_bound_address_space_capacity(job: Handle) -> Result<(), &'static str> {
+    let baseline = root_pool_allocated().map_err(|_| "capacity Pool baseline query failed")?;
+    let mut retained: [Option<rinlib::shared::proc::ProcessCreateResult>;
+        CAPACITY_ADDITIONAL_ADDRESS_SPACES] = [None; CAPACITY_ADDITIONAL_ADDRESS_SPACES];
+
+    let result = (|| {
+        for (index, slot) in retained.iter_mut().enumerate() {
+            let created = process::create(job, SUPERVISOR_RIGHTS)
+                .map_err(|_| SystemCallError::InternalError)?;
+            let pool = match duplicate(root_memory_pool(), Rights::GRANT) {
+                Ok(pool) => pool,
+                Err(error) => {
+                    let _ = unsafe { process::abandon_to_completion(created) };
+                    return Err(error);
+                }
+            };
+            match process::bind_memory(created.builder, pool) {
+                Ok(()) => {
+                    if let Err(error) = process::map(
+                        created.builder,
+                        0x1000,
+                        rinlib::shared::proc::PROCESS_PAGE_SIZE,
+                        rinlib::shared::proc::ProcessMapFlags::READ
+                            | rinlib::shared::proc::ProcessMapFlags::EXECUTE,
+                    ) {
+                        let _ = unsafe { process::abandon_to_completion(created) };
+                        return Err(error);
+                    }
+                    if let Err(error) = process::map(
+                        created.builder,
+                        rinlib::shared::proc::PROCESS_USER_TOP
+                            - rinlib::shared::proc::PROCESS_PAGE_SIZE,
+                        rinlib::shared::proc::PROCESS_PAGE_SIZE,
+                        rinlib::shared::proc::ProcessMapFlags::READ
+                            | rinlib::shared::proc::ProcessMapFlags::WRITE,
+                    ) {
+                        let _ = unsafe { process::abandon_to_completion(created) };
+                        return Err(error);
+                    }
+                    *slot = Some(created);
+                    debug!(
+                        "capacity calibration retained {} mapped additional Bound AddressSpace(s), total={}, pool_allocated={}",
+                        index + 1,
+                        index + 2,
+                        root_pool_allocated().map_err(|_| SystemCallError::InternalError)?
+                    );
+                }
+                Err(error) => {
+                    let _ = unsafe { close(pool) };
+                    let _ = unsafe { process::abandon_to_completion(created) };
+                    return Err(error);
+                }
+            }
+        }
+
+        let extra =
+            process::create(job, SUPERVISOR_RIGHTS).map_err(|_| SystemCallError::InternalError)?;
+        let extra_pool = match duplicate(root_memory_pool(), Rights::GRANT) {
+            Ok(pool) => pool,
+            Err(error) => {
+                let _ = unsafe { process::abandon_to_completion(extra) };
+                return Err(error);
+            }
+        };
+        match process::bind_memory(extra.builder, extra_pool) {
+            Err(SystemCallError::ReachLimit) => {
+                let _ = unsafe { close(extra_pool) };
+                let _ = unsafe { process::abandon_to_completion(extra) };
+                debug!("capacity calibration rejected 33rd bound address space: ReachLimit");
+                Ok(())
+            }
+            Err(error) => {
+                debug!(
+                    "capacity calibration rejected 33rd bound address space with unexpected error: {:?}",
+                    error
+                );
+                let _ = unsafe { close(extra_pool) };
+                let _ = unsafe { process::abandon_to_completion(extra) };
+                Err(SystemCallError::InternalError)
+            }
+            Ok(()) => {
+                let _ = unsafe { process::abandon_to_completion(extra) };
+                Err(SystemCallError::InternalError)
+            }
+        }
+    })();
+
+    let mut cleanup_error = false;
+    for created in retained.iter_mut().filter_map(Option::take) {
+        if unsafe { process::abandon_to_completion(created) }.is_err() {
+            cleanup_error = true;
+        }
+    }
+    if result.is_err() || cleanup_error {
+        return Err("capacity calibration construction or cleanup failed");
+    }
+    if root_pool_allocated().map_err(|_| "capacity Pool final query failed")? != baseline {
+        return Err("capacity calibration Pool charge did not refund");
+    }
+    debug!("capacity calibration passed: 32 bound address spaces");
+    Ok(())
+}
+
+#[cfg(feature = "capacity-calibration")]
+fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str> {
+    type WorkerResult = (
+        [Option<rinlib::shared::proc::ProcessCreateResult>; CAPACITY_CONCURRENT_PER_WORKER],
+        usize,
+        usize,
+        usize,
+    );
+
+    let ready = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let go = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let mut workers: [Option<rinlib::thread::JoinHandle<WorkerResult>>;
+        CAPACITY_CONCURRENT_WORKERS] = core::array::from_fn(|_| None);
+    for slot in &mut workers {
+        let ready = ready.clone();
+        let launch_go = go.clone();
+        let pool = root_memory_pool();
+        *slot = match rinlib::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                ready.fetch_add(1, core::sync::atomic::Ordering::Release);
+                while !launch_go.load(core::sync::atomic::Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                let mut entries = [None; CAPACITY_CONCURRENT_PER_WORKER];
+                let mut successes = 0;
+                let mut limit_failures = 0;
+                let mut unexpected_failures = 0;
+                for entry in &mut entries {
+                    let created = match process::create(job, SUPERVISOR_RIGHTS) {
+                        Ok(created) => created,
+                        Err(_) => {
+                            unexpected_failures += 1;
+                            break;
+                        }
+                    };
+                    let binding = match duplicate(pool, Rights::GRANT) {
+                        Ok(binding) => binding,
+                        Err(_) => {
+                            let _ = unsafe { process::abandon_to_completion(created) };
+                            unexpected_failures += 1;
+                            break;
+                        }
+                    };
+                    match process::bind_memory(created.builder, binding) {
+                        Ok(()) => {
+                            *entry = Some(created);
+                            successes += 1;
+                        }
+                        Err(SystemCallError::ReachLimit) => {
+                            let _ = unsafe { close(binding) };
+                            let _ = unsafe { process::abandon_to_completion(created) };
+                            limit_failures += 1;
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = unsafe { close(binding) };
+                            let _ = unsafe { process::abandon_to_completion(created) };
+                            unexpected_failures += 1;
+                            break;
+                        }
+                    }
+                }
+                (entries, successes, limit_failures, unexpected_failures)
+            }) {
+            Ok(worker) => Some(worker),
+            Err(_) => {
+                go.store(true, core::sync::atomic::Ordering::Release);
+                for worker in workers.iter_mut().filter_map(Option::take) {
+                    let (entries, _, _, _) = worker.join();
+                    for created in entries.into_iter().flatten() {
+                        let _ = unsafe { process::abandon_to_completion(created) };
+                    }
+                }
+                return Err("capacity concurrent worker spawn failed");
+            }
+        };
+    }
+    while ready.load(core::sync::atomic::Ordering::Acquire) != CAPACITY_CONCURRENT_WORKERS {
+        core::hint::spin_loop();
+    }
+    go.store(true, core::sync::atomic::Ordering::Release);
+
+    let mut results: [Option<WorkerResult>; CAPACITY_CONCURRENT_WORKERS] =
+        core::array::from_fn(|_| None);
+    for (worker, result) in workers.iter_mut().zip(results.iter_mut()) {
+        let worker = worker
+            .take()
+            .ok_or("capacity concurrent worker handle missing")?;
+        *result = Some(worker.join());
+    }
+
+    let mut successes = 0;
+    let mut limit_failures = 0;
+    let mut unexpected_failures = 0;
+    let mut cleanup_error = false;
+    for result in results.into_iter().flatten() {
+        let (entries, worker_successes, worker_limit_failures, worker_unexpected_failures) = result;
+        successes += worker_successes;
+        limit_failures += worker_limit_failures;
+        unexpected_failures += worker_unexpected_failures;
+        for created in entries.into_iter().flatten() {
+            if unsafe { process::abandon_to_completion(created) }.is_err() {
+                cleanup_error = true;
+            }
+        }
+    }
+    if successes != CAPACITY_ADDITIONAL_ADDRESS_SPACES
+        || limit_failures == 0
+        || unexpected_failures != 0
+        || cleanup_error
+    {
+        return Err("capacity concurrent create/bind or cleanup failed");
+    }
+    debug!(
+        "capacity calibration concurrent passed: {} additional Bound AddressSpace(s), {} ReachLimit rejection(s)",
+        successes, limit_failures
+    );
+    Ok(())
+}
+
+#[cfg(feature = "capacity-calibration")]
+fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'static str> {
+    const MIXED_BOUND: usize = 8;
+    let mut retained: [Option<rinlib::shared::proc::ProcessCreateResult>; MIXED_BOUND] =
+        [None; MIXED_BOUND];
+    let result = (|| {
+        for slot in &mut retained {
+            let created = process::create(job, SUPERVISOR_RIGHTS)
+                .map_err(|_| "mixed process create failed")?;
+            let pool = match duplicate(root_memory_pool(), Rights::GRANT) {
+                Ok(pool) => pool,
+                Err(_) => {
+                    let _ = unsafe { process::abandon_to_completion(created) };
+                    return Err("mixed memory Pool duplicate failed");
+                }
+            };
+            if let Err(error) = process::bind_memory(created.builder, pool) {
+                let _ = unsafe { close(pool) };
+                let _ = unsafe { process::abandon_to_completion(created) };
+                return Err(match error {
+                    SystemCallError::ReachLimit => "mixed BindMemory reached the limit",
+                    _ => "mixed BindMemory failed",
+                });
+            }
+            if let Err(error) = process::map(
+                created.builder,
+                0x1000,
+                rinlib::shared::proc::PROCESS_PAGE_SIZE,
+                rinlib::shared::proc::ProcessMapFlags::READ
+                    | rinlib::shared::proc::ProcessMapFlags::EXECUTE,
+            ) {
+                let _ = unsafe { process::abandon_to_completion(created) };
+                return Err(match error {
+                    SystemCallError::ReachLimit => "mixed ProcessMap reached the limit",
+                    _ => "mixed ProcessMap failed",
+                });
+            }
+            if let Err(error) = process::map(
+                created.builder,
+                rinlib::shared::proc::PROCESS_USER_TOP - rinlib::shared::proc::PROCESS_PAGE_SIZE,
+                rinlib::shared::proc::PROCESS_PAGE_SIZE,
+                rinlib::shared::proc::ProcessMapFlags::READ
+                    | rinlib::shared::proc::ProcessMapFlags::WRITE,
+            ) {
+                let _ = unsafe { process::abandon_to_completion(created) };
+                return Err(match error {
+                    SystemCallError::ReachLimit => "mixed stack ProcessMap reached the limit",
+                    _ => "mixed stack ProcessMap failed",
+                });
+            }
+            *slot = Some(created);
+        }
+        let pool_before = root_pool_allocated().map_err(|_| "mixed Pool baseline query failed")?;
+        test_memory_mapping()?;
+        let pool_after = root_pool_allocated().map_err(|_| "mixed Pool final query failed")?;
+        debug!(
+            "capacity calibration mixed mapping Pool charge: before={}, after={}",
+            pool_before, pool_after
+        );
+        if pool_after > pool_before {
+            return Err("mixed memory mapping increased the Pool charge");
+        }
+        test_drain_minimum_budget(job, image)?;
+        Ok(())
+    })();
+
+    let mut cleanup_error = false;
+    for created in retained.iter_mut().filter_map(Option::take) {
+        if unsafe { process::abandon_to_completion(created) }.is_err() {
+            cleanup_error = true;
+        }
+    }
+    if let Err(error) = result {
+        debug!("capacity calibration mixed workload failed: {}", error);
+    }
+    if cleanup_error {
+        debug!("capacity calibration mixed cleanup failed");
+    }
+    if result.is_err() || cleanup_error {
+        return Err("mixed Bound AddressSpace workload or cleanup failed");
+    }
+    debug!(
+        "capacity calibration mixed passed: {} resident Bound AddressSpace(s), mapping and drain workload",
+        MIXED_BOUND
+    );
+    Ok(())
+}
+
 fn main() {
     debug!("Hello, init!");
     let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
@@ -2683,7 +3009,10 @@ fn kill_and_supervise(
 }
 
 fn test_memory_mapping() -> Result<(), &'static str> {
-    #[cfg(not(feature = "acceptance-stress"))]
+    #[cfg(all(
+        not(feature = "acceptance-stress"),
+        not(feature = "capacity-calibration")
+    ))]
     let pool_baseline = root_pool_allocated().map_err(|_| "memory Pool baseline query failed")?;
     let page = rinlib::shared::proc::PROCESS_PAGE_SIZE;
     let region = MappedRegion::map_anonymous(
@@ -2940,7 +3269,10 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     executable_view.close();
     no_execute.close();
     rx.unmap().map_err(|_| "authorized RX view Unmap failed")?;
-    #[cfg(not(feature = "acceptance-stress"))]
+    #[cfg(all(
+        not(feature = "acceptance-stress"),
+        not(feature = "capacity-calibration")
+    ))]
     if root_pool_allocated().map_err(|_| "memory Pool final query failed")? != pool_baseline {
         return Err("MemoryObject backing Pool charge did not refund");
     }
@@ -3151,6 +3483,10 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     test_memory_mapping()?;
     #[cfg(not(feature = "acceptance-stress"))]
     test_process_memory_binding(services)?;
+    #[cfg(feature = "capacity-calibration")]
+    test_bound_address_space_capacity(services)?;
+    #[cfg(feature = "capacity-calibration")]
+    test_bound_address_space_concurrency(services)?;
     let pm_domain = root
         .create_job(services, JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
@@ -3590,7 +3926,11 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image {
-        Some(image) => test_job_management(root, acceptance, image)?,
+        Some(image) => {
+            #[cfg(feature = "capacity-calibration")]
+            test_bound_address_space_mixed(acceptance, image)?;
+            test_job_management(root, acceptance, image)?
+        }
         None => {
             return Err(RunFailure::Message(
                 "job management acceptance image unavailable",
@@ -4223,7 +4563,7 @@ fn test_job_management(
 /// 含 child Handle 的 REAPABLE 进程以 `max_work=1` 收束。More 必须由
 /// rinlib 拒绝零进展；这里逐批推进至 Complete，覆盖 pending close 的
 /// 扫描/关闭分离边界。
-#[cfg(feature = "acceptance-stress")]
+#[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
 fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static str> {
     let marker = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,

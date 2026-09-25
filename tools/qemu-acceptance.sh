@@ -121,6 +121,15 @@ case "$profile" in
             "race matrix acceptance passed: 16/16 scenarios passed"
         )
         ;;
+    capacity)
+        required+=(
+            "acceptance workload: capacity"
+            "capacity calibration passed: 32 bound address spaces"
+            "capacity calibration rejected 33rd bound address space: ReachLimit"
+            "capacity calibration concurrent passed: 31 additional Bound AddressSpace(s)"
+            "capacity calibration mixed passed: 8 resident Bound AddressSpace(s)"
+        )
+        ;;
     hetero)
         required+=(
             "acceptance workload: core"
@@ -261,4 +270,12 @@ if [[ "$status" -eq 124 ]]; then
     echo "QEMU acceptance passed (harvested after explicit reset failure)."
 fi
 show_summary "$log"
-rm -f "$log" "$meta"
+if [[ "${QEMU_ACCEPTANCE_KEEP_LOG:-0}" == "1" ]]; then
+    kept="artifacts/qemu-acceptance-${run_id}.log"
+    kept_meta="artifacts/qemu-acceptance-${run_id}.meta"
+    mv "$log" "$kept"
+    mv "$meta" "$kept_meta"
+    echo "QEMU acceptance log kept: $kept"
+else
+    rm -f "$log" "$meta"
+fi

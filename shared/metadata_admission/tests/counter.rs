@@ -10,6 +10,7 @@ fn exhaustion_and_drop_restore_capacity() {
     let first = Counter::try_acquire(&counter).unwrap();
     let second = Counter::try_acquire(&counter).unwrap();
     assert_eq!(counter.used(), 2);
+    assert_eq!(counter.peak(), 2);
     assert!(matches!(Counter::try_acquire(&counter), Err(ReachLimit)));
 
     drop(first);
@@ -19,6 +20,12 @@ fn exhaustion_and_drop_restore_capacity() {
 
     drop((second, replacement));
     assert_eq!(counter.used(), 0);
+    assert_eq!(counter.peak(), 2);
+    counter.reset_peak();
+    assert_eq!(counter.peak(), 0);
+    let one = Counter::try_acquire(&counter).unwrap();
+    assert_eq!(counter.peak(), 1);
+    drop(one);
 }
 
 #[test]
@@ -27,9 +34,11 @@ fn bulk_permit_reserves_and_refunds_exact_capacity() {
     let bulk = Counter::try_acquire_many(&counter, 6).unwrap();
     assert_eq!(bulk.slots(), 6);
     assert_eq!(counter.used(), 6);
+    assert_eq!(counter.peak(), 6);
     assert!(Counter::try_acquire_many(&counter, 3).is_err());
     let tail = Counter::try_acquire_many(&counter, 2).unwrap();
     assert_eq!(counter.used(), 8);
+    assert_eq!(counter.peak(), 8);
     drop(bulk);
     assert_eq!(counter.used(), 2);
     drop(tail);
@@ -80,8 +89,10 @@ fn concurrent_acquisition_never_exceeds_limit() {
         .collect();
     assert_eq!(permits.len(), LIMIT);
     assert_eq!(counter.used(), LIMIT);
+    assert_eq!(counter.peak(), LIMIT);
     drop(permits);
     assert_eq!(counter.used(), 0);
+    assert_eq!(counter.peak(), LIMIT);
 }
 
 #[test]

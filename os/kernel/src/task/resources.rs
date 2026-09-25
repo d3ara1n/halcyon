@@ -90,6 +90,33 @@ struct MetadataAdmission {
     ipc: [Arc<Counter>; IpcClass::COUNT],
 }
 
+impl MetadataAdmission {
+    fn counters(&self) -> [&Counter; ADMISSION_CLASSES] {
+        [
+            &self.sponsors,
+            &self.pool_cores,
+            &self.address_spaces,
+            &self.builders,
+            &self.controls,
+            &self.region_slots,
+            &self.planner_transactions,
+            &self.backing_slices,
+            &self.memory_changes,
+            &self.memory_waits,
+            &self.remote_completions,
+            &self.object_backings,
+            &self.object_views,
+            &self.connections,
+            &self.endpoints,
+            &self.invitations,
+            &self.ipc[IpcClass::Object as usize],
+            &self.ipc[IpcClass::Delivery as usize],
+            &self.ipc[IpcClass::Registration as usize],
+            &self.ipc[IpcClass::Wait as usize],
+        ]
+    }
+}
+
 static ADMISSION: crate::sync::Spinlock<Option<MetadataAdmission>> =
     crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
 
@@ -98,31 +125,31 @@ pub(crate) const ADMISSION_CLASSES: usize = 16 + IpcClass::COUNT;
 
 pub(crate) fn admission_usage() -> [usize; ADMISSION_CLASSES] {
     let admission = ADMISSION.lock();
-    let a = admission
+    admission
         .as_ref()
-        .expect("metadata admission is not initialized");
-    [
-        a.sponsors.used(),
-        a.pool_cores.used(),
-        a.address_spaces.used(),
-        a.builders.used(),
-        a.controls.used(),
-        a.region_slots.used(),
-        a.planner_transactions.used(),
-        a.backing_slices.used(),
-        a.memory_changes.used(),
-        a.memory_waits.used(),
-        a.remote_completions.used(),
-        a.object_backings.used(),
-        a.object_views.used(),
-        a.connections.used(),
-        a.endpoints.used(),
-        a.invitations.used(),
-        a.ipc[IpcClass::Object as usize].used(),
-        a.ipc[IpcClass::Delivery as usize].used(),
-        a.ipc[IpcClass::Registration as usize].used(),
-        a.ipc[IpcClass::Wait as usize].used(),
-    ]
+        .expect("metadata admission is not initialized")
+        .counters()
+        .map(Counter::used)
+}
+
+pub(crate) fn admission_peak() -> [usize; ADMISSION_CLASSES] {
+    let admission = ADMISSION.lock();
+    admission
+        .as_ref()
+        .expect("metadata admission is not initialized")
+        .counters()
+        .map(Counter::peak)
+}
+
+pub(crate) fn reset_admission_peaks() {
+    let admission = ADMISSION.lock();
+    for counter in admission
+        .as_ref()
+        .expect("metadata admission is not initialized")
+        .counters()
+    {
+        counter.reset_peak();
+    }
 }
 
 /// heap 就绪后、首个 Process/Pool core 构造前初始化固定全局 slots。

@@ -1,6 +1,6 @@
 # 架构审计发现承接
 
-> 状态：M2 的三处用户可达不可失败 heap 分配已修复并验证；A2/M3/M5 的触发和准入路径已核对，RV64 布局成本与正式 core/stress 两点堆采样已有开发证据。尚无运行中峰值、32 张账本饱和与其它 metadata 同时驻留的证据，不能以当前采样承诺 32 可满额准入；下一步补峰值与并发负载并据此校准全局政策，独立预算仍按授权触发。原始审视基线为 `master` 的 `f4a4d57`（当时另有执行闭包未提交改动），不能当作当前工作树状态。进入实施的发现须按 `AGENTS.md` 施工流程核对事实并闭合设计；已关闭条目从本清单删除，由对应专题和 git 历史保留证据。
+> 状态：M2 已修复；本轮 A2/M3/M5 容量校准及提交后/退出预留审计已完成。正式 capacity 路线验证了 32 张 Bound ledger 的顺序与并发准入、第 33 张 `ReachLimit`、31 张各两笔 Map 的收束，以及 8 张常驻 Bound 与 Map/partial Unmap/backing/drain 混合运行。32 已确定为允许提交前分配失败的条件性准入上限，不承诺任意工作集的物理余量。其他审计发现保留在本记录，暂缓主动计量，随真实消费者、故障或明确的设计/审查需求择机处理；本记录不归档，也不占近期施工顺序。原始审视基线为 `master` 的 `f4a4d57`（当时另有执行闭包未提交改动），不能当作当前工作树状态。
 >
 > 本计划只拥有下列发现的**判断与验证面**。发现涉及的机制改造归各自既有专题（见「归属映射」），不重复安排同一问题。
 
@@ -24,7 +24,7 @@
 | M2 metadata 耗尽后果是内核 panic | 事实核实（是否为真实 panic 面） | 配额与预算机制归 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) |
 | M3 region slot 全局不可归属配额 | 同 A2（同一问题的容量面） | 配额机制本身归 `kernel-memory-budget` |
 | M4 固定 64 extents 限制碎片容忍度 | 全部（本计划唯一拥有） | — |
-| M5 内核堆无压力观测与扩展路径 | 观测面要求 | 预算归属归 `kernel-memory-budget` |
+| M5 内核堆压力观测与扩展路径 | 条件性准入校准结果与未来触发条件 | 预算归属归 `kernel-memory-budget` |
 | D 协作式延迟无观测面 | 「内核路径恒短是待测断言」的文档定性 | fence.i 优化的计时前提见 [task 实现](../notes/impls/task.md)；内核驻留时间观测属本项待核需求 |
 
 ## A 类：设计层实质问题
@@ -51,9 +51,9 @@
 
 **当前触发结论**：尚无证据表明已开放不可信创建域或需要跨域保证额度的真实消费者，KernelMemoryBudget 的硬触发条件目前未满足；`pm_domain` 是受托管理域，不是受托创建域。未来给域外进程授予 `CREATE`，或承诺一域不能耗尽另一域的 metadata 容量之前，必须完成独立预算，不得以当前全局政策代替。该结论同步由 [`kernel-memory-budget`](todo-2026-09-14-kernel-memory-budget.md) 承接。
 
-**已测下界与待办**：目标 RV64 的 Region/transaction 条目为 96/64 字节，单张账本预留至少 393472 字节；32 张至少 12591104 字节，约为 16 MiB 物理 heap 储备的四分之三，尚未计入壳、其它对象和 allocator 开销。core/stress 的终点观测见「本轮核验与接力」。仍须取得真实创建时每张 Bound 地址空间的完整 heap 成本、运行期高水位/最大连续可用块、其它对象及完成路径的同时驻留成本、准入类别峰值与接近 32 张账本时的失败出口，再决定全局政策数值或降级为有出处的部署限制；不能单凭 32 张 ledger 的 Vec 下界推断可兑现容量。
+**已测下界与校准结论**：目标 RV64 的 Region/transaction 条目为 96/64 字节，单张账本预留至少 393472 字节；32 张至少 12591104 字节，约为 16 MiB 物理 heap 储备的四分之三，尚未计入壳、其它对象和 allocator 开销。本轮真实顺序/并发 Bind、混合负载、准入峰值与失败出口见「本轮容量校准施工记录」。32 仅限制可同时准入的完整 ledger 数量；实际分配仍在提交前 fallible，不由该计数保证 heap 字节或未来连续空间。没有需要重新设定数值的已知故障或跨域硬保证需求。
 
-**完成标准**：触发条件已按当前授权图判断；容量项仍待真实字节成本和运行期压力数据，使常量的理由可一句话说清并指向单一真值来源。未经校准不得把 32 写成系统可保证同时驻留的数量。
+**本轮结论**：授权触发条件已按当前授权图判断，条件性准入的负载校准已完成；不得把 32 写成系统对任意工作集保证同时驻留的数量。未来若需硬容量或跨域隔离承诺，先明确消费者与最坏工作集，再在对应计划中设计预留或独立预算。
 
 **把握程度**：授权、Bind 路径和两种条目的 RV64 布局高；全对象成本与 32 的安全余量尚无测量。
 
@@ -139,9 +139,9 @@
 
 **现状与位置**：`os/kernel/src/task/resources.rs`：`REGION_SLOTS_PER_ADDRESS_SPACE = 4_096`、`MAX_ADMITTED_BOUND_ADDRESS_SPACES = 32`、`REGION_SLOT_GLOBAL_LIMIT = 二者相乘`，planner transaction 全局数也同乘 32。`reserve_address_space` 在 Bind 前一次占用完整的 4096+4 槽，不是每笔 Map 各占一个全局 region slot；`os/memory_space/src/space.rs::MemorySpace::new` 在构造时以 `try_reserve_exact` 预留真实 4096 个 `Region` 和 4 个 transaction 的堆容量，失败在发布前返回 `NoFrame`/`OutOfMemory`。Region slot 的全局计数表示可接纳的整张 ledger 的上限，不等于实际 live fragment 数，也不保证相应 heap 字节已经可用。
 
-**判断**：4096 是当前每地址空间固定 ledger 容量，同时作为本地 admission 上限；32 是全局最多完整预留 32 张 ledger 的准入政策。RV64 已知 ledger 元素的最低预留为 12591104 字节（32 张），但没有从其余 bytes、并发负载和系统储备推导出 32 的依据。即使只有一个 live fragment，Bind 也消耗一张 ledger 的全局 slots 和对应 Vec 容量。保留 32 作为待校准政策不等于保证 32 张满载账本能与其它 metadata 同时驻留，也不等于 4096 个 fragment 由任何全局字节预算担保。
+**判断**：4096 是当前每地址空间固定 ledger 容量，同时作为本地 admission 上限；32 是全局最多准入 32 张完整 ledger 的条件性政策。RV64 已知 ledger 元素的最低预留为 12591104 字节（32 张），未计其它成本；本轮顺序、并发和混合验收给出了特定 QEMU/virt 负载的成功证据，而不是从其余 bytes 与系统储备推导出的硬容量保证。即使只有一个 live fragment，Bind 也消耗一张 ledger 的全局 slots 和对应 Vec 容量；提交前的实际 heap 分配仍可失败。
 
-**待办**：与 A2 合并按真实 `Region`/transaction 布局、allocator 开销与其它对象峰值校准。独立 KernelMemoryBudget 解决来源隔离，不自动使全局容量数值合理；全局字节容量与域内可授权额度分别论证。
+**后续条件**：已与 A2 合并完成本轮条件性准入校准。只有未来需要指定工作集的物理容量保证、出现真实分配/退休故障，或需跨域隔离时，才分别论证连续空间预留、完成余量与独立 KernelMemoryBudget；预算隔离不能由 32 这个计数代替。
 
 **把握程度**：高（常量取值与推导链已核对）。
 
@@ -155,15 +155,15 @@
 
 **把握程度**：中（常量与推导来源已核对，未核实碎片化实测数据）。
 
-### M5 内核堆没有压力观测，也没有接近上限时的分级拒绝
+### M5 内核堆压力观测与按需分级拒绝
 
-**现状与位置**：`os/kernel/src/frame.rs` 的 `HEAP_CHUNK_LIMIT = 16`（每 chunk 1 MiB）、`RECOVERY_TICKET_LIMIT = 0`；`os/kernel/src/heap.rs` 的 `SystemSource` 只做 O(1) ticket pop，ticket 一经消费永久归堆且不支持归还。admission/Remote 槽高水位观测曾仅以 KernelMemoryBudget 立案或容量重校为触发条件；本项要求额外考虑用户可达 metadata 耗尽现场，候选登记见 [COMPASS](COMPASS.md#尚未立案的候选)。
+**现状与位置**：`os/kernel/src/frame.rs` 的 `HEAP_CHUNK_LIMIT = 16`（每 chunk 1 MiB）、`RECOVERY_TICKET_LIMIT = 0`；`os/kernel/src/heap.rs` 的 `SystemSource` 只做 O(1) ticket pop，ticket 一经消费永久归堆且不支持归还。本轮已建立 Counter 成功 acquire 的高水位，以及 heap 在 trap/Bind/Reset 边界的采样极值和 source 失败布局；后者不是 allocator 内每笔分配的瞬时峰值，也不报告最大连续空闲块。
 
-**核实后的判断**：M2 已证实并修复三处用户可达的不可失败分配；不能再以「是否真的触发 panic 待核实」作为 M5 前置。`admission_usage()` 统计 20 类 slot 的当前用量，主要用于启动自检；本轮启用 talc 5.0.4 的 `counters`，在 Ready 和授权 reset 时输出 claimed/allocated/available/fragment 与已消费的 system ticket 数。virt/core 的 Ready/Reset 分别为 allocated 404768/420152、available 16368224/16351680 字节；virt/stress 的 Reset 为 allocated 487288、available 16284544 字节。core Ready 与两条路线的 Reset 均已消费 16 个 ticket、claim 16776856 字节，证明「剩余 ticket 为零」不等于 allocator 已耗尽。快照并非高水位，且日志无法证明没有短时分配峰值或碎片导致的大块分配失败。
+**核实后的判断**：M2 已证实并修复三处用户可达的不可失败分配；不能再以「是否真的触发 panic 待核实」作为 M5 前置。`admission_usage()` 统计 20 类 slot 的当前用量，Counter 另有成功 acquire 的峰值；talc 的 `counters` 在 Ready 和授权 reset 时输出 claimed/allocated/available/fragment 与已消费的 system ticket 数，并在 trap/Bind/Reset 累积采样极值。首轮 virt/core 的 Ready/Reset 分别为 allocated 404768/420152、available 16368224/16351680 字节；virt/stress 的 Reset 为 allocated 487288、available 16284544 字节。core Ready 与两条路线的 Reset 均已消费 16 个 ticket、claim 16776856 字节，证明「剩余 ticket 为零」不等于 allocator 已耗尽。后续运行期结果见下方容量校准记录；边界采样仍无法证明没有 syscall 内短时分配峰值或碎片导致的大块分配失败。
 
-**待办**：补代表性运行中峰值、准入计数峰值、接近容量时最大连续分配能力/失败布局的证据；当前两点观测不得宣称为高水位。采集不得在 allocator 锁内重入分配或引入锁序逆转。若实际观测或故障显示特定创建类操作需要分级拒绝，再依据其最坏准备成本和必须保留的完成容量定阈值、准入点及干净错误出口；不能用剩余 ticket 数或随意高水位代替 allocator 可用量与完成责任证明。真实 metadata OOM 现场、未来不可信创建域或容量重校任一出现时重排本项；现阶段保持 fallible 创建与已预付完成路径，不增设无依据的拒绝阈值。
+**本轮结论与后续条件**：已测正式顺序/并发 32 张 Bound、33rd `ReachLimit`、混合 Map/Unmap/backing/drain 及完整收束；现阶段保持 fallible 创建与已预付完成路径，不增设无依据的拒绝阈值。若未来真实 OOM、退休失败、需保证指定工作集容量或跨域隔离，再明确最大布局与完成余量，决定是否增加 allocator-native 观测、连续空间预留或预算机制；不能用剩余 ticket 数或采样极值替代保证。
 
-**把握程度**：高（计数与采样点有代码和 QEMU 证据）；运行中峰值与阈值成本仍未知。
+**把握程度**：高（Counter 高水位、heap 边界采样与 QEMU 场景有代码及运行证据）；allocator 内瞬时峰值、最大连续块和任意工作集保证未经测量，也不属于当前条件性准入承诺。
 
 ## D 类：协作式定性的诚实质疑（文档定性，不立案实施）
 
@@ -196,25 +196,81 @@
 - **清零在 POOL 锁外、quota commit 之前**——长工作不持锁（符合协作式），且失败时两类 owner 分别 RAII 回滚。
 - **容量证明覆盖整个生命周期**——`reserved_extent_growth` 统计在途事务尚未兑现的最坏增长，而非只覆盖单次创建。
 
-## 自然顺序
+## 排期与接手
 
-M2 已修复，A2/M3 的授权触发与 M5 的两点观测已核实；下一项是运行期峰值及并发容量校准，不要求先实现独立预算。其余发现不整体占用串行位置；以下顺序仅用于接手，不表示彼此均有技术依赖：
+M2 已修复，A2/M3/M5 的条件性准入校准已完成。其余发现不占近期施工顺序，也没有相互的默认执行顺序；M1、M4、B1、A1、C1–C3 与 D 可随实际消费者、故障或明确的设计/审查需求择机复核。启动某项前按上方归属映射核对当前代码与已有计划，发现仍成立再确定范围，不以重复计量为默认下一步。
 
-```text
-M5 运行中峰值 + A2/M3 并发容量校准（共享 heap/Region 证据）
-  → M1（核实 affine claim token 的所有权窄缝）
-  → M4（核实 extent 容器）
-  → B1（阻塞显式化，与现有 typed PendingCall 对照）
-  → A1（观测面，待触发条件或主动补证）
-  → C1 / C3（容量依据，各自独立）
-  → C2（需先采集数据）
-  → D（文档定性）
-```
-
-KernelMemoryBudget 不按上述串行顺序自动开工；不可信创建域、独立预算授权或跨域容量保证一旦需要，须在开放前提前处理。
+KernelMemoryBudget 独立按不可信创建域、预算授权或跨域容量保证触发；必须在相应能力开放前完成，不因本记录暂缓而延期这一前置。
 
 ## 本轮核验与接力
 
-`be6dae3` 的干净工作树为调查基线；首轮只读核对全局及本地计数、Bind 前整体预留和 fallible ledger 存储、JobControl 的 CREATE 校验、`srv_init` 对 `srv_pm` 的实际 grant。随后接入 Talc `counters`、目标布局与两点堆观测；`just check`、`just clippy`、virt/core、virt/stress 均通过（本轮运行摘要保存在 `artifacts/heap-core-run.log` 与 `artifacts/heap-stress-run.log`，成功 QEMU 路线的原始临时日志按工具惯例删除）。stress 摘要仅保留 Reset 行，故不把未留存的 Ready 行计作证据。检查重点：HEAP 计数复制后释放锁，再读取 SYSTEM_SUPPLY 并写 console；没有新增 ABI、跨组件 owner、分配准入阈值或测试专用消费者。Talc 启用 `counters` 增加常数级计数更新与 allocator 状态大小，尚未基准测试吞吐。未做同时准入 32 张账本或运行中峰值测试，本计划的容量完成标准仍未满足，保持进行中。
+`be6dae3` 的干净工作树为首轮调查基线；当时只读核对全局及本地计数、Bind 前整体预留和 fallible ledger 存储、JobControl 的 CREATE 校验、`srv_init` 对 `srv_pm` 的实际 grant。随后接入 Talc `counters`、目标布局与 Ready/Reset 两点堆观测；`just check`、`just clippy`、virt/core、virt/stress 均通过（首轮摘要保存在本地 `artifacts/heap-core-run.log` 与 `artifacts/heap-stress-run.log`）。该轮没有测 32 张账本或运行中采样；后续校准及其局限见下节。Talc `counters` 增加常数级计数更新与 allocator 状态大小，尚未单独基准测试吞吐。
 
-每项在开工时按其归属映射并入对应专题；本计划唯一拥有的 C 类、M1、M4 等若需实施则单独立案。完成一项后从本清单删除该条并回填结论去向；全部清空后本计划归档。
+
+## 容量校准记录（2026-09-24 至 2026-09-25）
+
+### 范围与非目标
+
+本轮闭合 M5 的运行中 heap/admission 峰值观测，以及 A2/M3 的真实 Bound AddressSpace 容量边界。测试必须经过正式 `ProcessCreate → ProcessBindMemory` 路径，覆盖顺序创建、并发创建、混合运行压力、`N+1` 失败和完整收束。
+本轮不实现独立 `KernelMemoryBudget`，不因测试方便改变 `MAX_ADMITTED_BOUND_ADDRESS_SPACES`、Region ledger 或 planner transaction 的政策常量，不新增测试专用内核 syscall。
+
+### 观测契约
+
+- heap 记录 `claimed`、`allocated`、`available`、`fragments`、已消费 chunks；当前实现的极值只取 Ready 后 trap/Bind/Reset 采样点，source 取不到 ticket 时保留失败分配布局。它们不是 syscall 内连续高水位或最大连续空闲块。
+- metadata admission 记录每类 Counter 当前值和峰值，至少包括 AddressSpace、Region、planner transaction、backing、MemoryChange、Wait、Remote 与 IPC。
+- workload 记录同时存活的 Bound AddressSpace 数、阶段、操作结果和错误类型；创建成功不等于容量校准完成。
+- 观测不得在 HEAP 锁内重入分配，不得改变锁序；失败或收束路径也必须记录。
+
+### 压力矩阵与完成门
+
+1. `N=1..32` 顺序 Create+Bind，保持全部 Bound 存活，测量每张完整 ledger 的实际增量。
+2. `N=1..32` 并发 Create+Bind，复用正式多线程/多 hart 验收路径，观察全局 admission 竞争。
+3. 在 8 张常驻 Bound 上叠加 Map、Protect、partial Unmap、backing view 收缩与正式 drain；core/stress 的其余 Tunnel、Job 和退出路线独立回归，不把它们误称为与 32 张同时驻留。
+4. 在最大成功点继续尝试 `N+1`，区分 `ReachLimit`、`OutOfMemory`、`NoFrame` 与其它错误；不得以任意错误代替准入边界。
+5. 达到压力后执行 kill/exit/drain，记录收束期间采样最低余量并核对 Pool、frame、metadata 和 process 账户回到基线；init 自身占用的账户不归零。
+6. 重复固定顺序、并发和混合场景；本地 `artifacts/` 保留完整输出和命令身份，不能把现有 stress 竞态通过误称为 32 张账本容量证据。
+
+本轮条件性准入的完成门是：明确采样盲区、顺序/并发 `N=1..32` 结果、`N+1` 失败出口及完整收束账户，再决定是否保留政策上限。上述证据已经取得，32 保留不变。aggregate available、碎片数量或无 source failure 不构成任意未来工作集的物理保证；最大连续块与硬容量保证不属于本轮完成门。
+
+### 实施顺序与验证
+
+先实现无分配峰值观测，再接通正式 workload；开发期间按影响运行 `just check`、`just clippy`、必要的 host 检查和 `just virt`/`just virt-stress`。成功结果写入 `artifacts/` 并回填本节；失败保留完整日志、退出码和未闭合责任。`COMPASS` 只在本轮状态发生变化后更新摘要。
+
+### 首轮实施与验证结果（2026-09-24）
+
+#### 已实施
+
+- `metadata_admission::Counter` 增加无分配 `peak()` 和 Ready 基线 `reset_peak()`；资源表提供每类 admission 当前值/峰值快照。
+- heap 在用户 trap 收尾以及 Bind/Reset 读取 allocated/available/fragments 并累积采样极值；Ready 建立基线，source 无 ticket 时记录失败布局。采样不能覆盖单个 syscall 内的瞬时极值。
+- `srv_init` 增加显式 `capacity-calibration` feature 与 `just virt-capacity` 路线，沿真实 ProcessCreate → ProcessBindMemory 保留 31 个新增对象，使总 Bound AddressSpace 达到现行 32 上限；第 33 个尝试要求 `ReachLimit`，随后使用正式 abandon-to-completion 收束并核对 Pool 退款。
+- `srv_init` capacity workload 追加 4 线程并发 Create+Bind；每线程最多 8 个，达到 31 个新增成功后仅允许 `ReachLimit`，主线程统一 Join 和 abandon-to-completion。
+- `srv_init` capacity workload 追加 8 个常驻、已映射 Bound process，与正式 stress 的 `drain minimum-budget` 共存；256 registrations 分批完成 4165 次 drain 后再统一 abandon。
+- `tools/qemu-acceptance.sh` 增加 capacity profile 和成功日志保留开关；完整日志使用 `QEMU_ACCEPTANCE_KEEP_LOG=1` 保存。
+
+#### 结果
+
+- capacity 完整日志：[qemu-acceptance-20260924-232158-63165.log](../artifacts/qemu-acceptance-20260924-232158-63165.log)。31 个新增 Bind 全部成功，总计 32 个 Bound AddressSpace；第 33 个返回 `ReachLimit`；测试收束后通过全部现有 acceptance 锚点。
+- capacity Reset heap：`claimed=16776856`、最终 `allocated=420488`、运行 `peak_allocated=12743568`、`min_available=4007936`、`peak_fragments=109`、`source_failures=0`。这是顺序完整 ledger 场景，不是混合 stress 的容量上界。
+- capacity Reset metadata peaks（数组顺序由 `admission_usage` 定义）：AddressSpace `33`、Region slots `131072`、planner transactions `128`；第 33 个失败尝试发生了可回滚的暂时 admission 峰值，最终 current usage 已恢复为基线。
+- capacity 映射阶段通过：31 个新增 Bound process 各保留入口页和栈顶页两笔真实 `ProcessMap`，随后由 abandon-to-completion 清理；完整日志为 [qemu-acceptance-20260924-234213-77204.log](../artifacts/qemu-acceptance-20260924-234213-77204.log)，Reset 峰值 `peak_allocated=12791440`、`min_available=3956096`、`peak_fragments=115`、`source_failures=0`。
+- capacity 并发阶段通过：4 个用户线程合计 31 个新增 Bind 成功、1 次 `ReachLimit`，并发结果完整收束；完整日志为 [qemu-acceptance-20260924-233555-74291.log](../artifacts/qemu-acceptance-20260924-233555-74291.log)，Reset 峰值 `peak_allocated=12761152`、`min_available=3989824`、`peak_fragments=123`、`source_failures=0`。
+- capacity 混合阶段通过：8 个常驻 Bound AddressSpace 与完整 MemoryObject Map/Protect/partial Unmap、backing view 收缩和正式 `drain minimum-budget` 共存；drain 256 registrations 分 4165 批完成。最终日志 [qemu-acceptance-20260925-004612-5596.log](../artifacts/qemu-acceptance-20260925-004612-5596.log) 的 Reset 采样极值 `peak_allocated=12791184`、`min_available=3956352`、`peak_fragments=314`、`source_failures=0`，账户回到 init 基线。
+- capacity、core、stress 均完成显式 system reset 和资源收束；stress Reset heap 为 `peak_allocated=4172632`、`min_available=12476640`、`peak_fragments=509`、`source_failures=0`。
+- 最终开发检查：`just check` 通过；capacity feature 下 `just clippy` 的 shared-host、os-host、kernel-target、user-host、user-target、user-stress、user-fp 均通过；`metadata_admission` aarch64 host 8 tests 通过；capacity `just build_user` 与 ELF audit、`just virt-capacity`、`just virt`、`just virt-stress` 通过。首次 capacity fixture 把 init 自身的一个 Bound 重复计入，已修正。混合场景原有 MemoryObject 全局 Pool 退款相等断言在其它 charge 同时退休时失败；混合前后实测 `11204→11203`、`11203→11203`，故 capacity 只要求不净增加，正式 core 仍保留精确断言。局部账差不能单独证明本次 mapping 退款；最终账户及 reset 锚点已通过。相关失败日志保留在 `artifacts/failed-acceptance-20260925-000218-83080.log`。
+
+#### 重复验证与延期边界
+
+- 已完成固定顺序重复：清理短路修正后两次 QEMU capacity 分别见 [repeat A](../artifacts/qemu-acceptance-20260925-003347-92693.log) 与 [repeat B](../artifacts/qemu-acceptance-20260925-003539-95589.log)；两次均为 32 张成功、第 33 张 `ReachLimit`、并发 31 张成功、8 张混合与 4165 批 drain 完成，Reset `allocated=420680`、`peak_allocated=12791184`、`min_available=3956352`、`source_failures=0`，碎片峰值分别为 301/318。
+- Counter acquire 高水位为精确原子峰值；heap 极值只在 trap/Bind/Reset 边界采样，可能漏掉 syscall 内短暂峰值。Talc 仅公开 aggregate available 和 fragment count，没有最大连续空闲块接口；source failure 只报告 source 无法取得 ticket 或 claim 失败的请求。这些局限已纳入条件性准入结论，不阻塞本轮交付。
+- 延期项由本记录保留：若真实 OOM/退休故障、指定工作集的硬容量承诺或性能瓶颈出现，再核对消费者、最大布局、完成余量及锁序，决定是否增加 allocator 内计量或连续空间/专用 arena 预留。触发前不继续为 32 重复计量；完成条件是相关操作在定义的工作集下满足新承诺，并可在压力与退休路径验证。
+
+### 交付前结构检查与当前判断（2026-09-25）
+
+- 受影响的真实消费者仍是 `srv_init` 正式验收编排：capacity feature 不进入共享 ABI；default core/stress 分支未更改测试门。Bound 的 PoolBinding、Region/planner permits 和 Builder/Control 仍沿原有 owner 路径取得并通过 abandon-to-completion 收束；用户可达失败返回 `ReachLimit`，测试逐项收束不再因首次错误短路。
+- `MetadataAdmission::counters()` 统一 usage、peak、reset 的 20 类顺序；Ready 前建立无并发基线，精确 peak 在每次成功 acquire 上更新，失败事务已预付但退款的临时占用也会计入峰值。观测只获取原有 HEAP/ADMISSION 锁、按顺序释放后写日志，不增加交叉持锁或 heap 内分配；在 trap 末尾采样增加一次 HEAP 锁，core/stress 回归已通过，尚未量化额外性能成本。
+- `MemorySpace::new` 在 Bind 内 `try_reserve_exact(4096)` 创建 Region Vec，RV64 Region 条目 96 字节，单次请求至少 `393216` 字节；transaction Vec 为 `4×64=256` 字节。完成的顺序和并发 32 张 Bind 证明这些请求在各次创建时成功；不能由当时成功推出长寿命混合负载下未来最大连续块。
+- 最后一次验证 [qemu-acceptance-20260925-005251-9127.log](../artifacts/qemu-acceptance-20260925-005251-9127.log)：32 张成功、第 33 张 `ReachLimit`、4 线程 31 张成功、8 张常驻混合 Map/Unmap/backing/drain 通过。Reset `peak_allocated=12791184`、`min_available=3956352`、`peak_fragments=319`、`source_failures=0`；mixed mapping Pool `11206→11203`，净额未增加，但其它退休同时发生，不能据此推出局部精确退款。
+- 当前判断：保留现行 32 作为条件性准入上限，不提高限额，也不将其描述为任何业务工作集的物理容量保证；内核 fallible 分配路径仍决定真实 OOM 边界。M5 的严格瞬时峰值与连续空闲块并非该契约的必需前置；后续有实际需求时按上面的延期条件复核。本记录因其他审计发现保留，但容量校准本轮已完成。
+- advisor（`moeflux-openai-responses/gpt-6-astra`）复核结论已采纳：32 是条件性全局准入上限；新建和普通操作在 Commit 前允许 `OutOfMemory`/`NoFrame`/`ReachLimit`，但一旦 Commit，事务必须只消费已持有的 owner、reservation、work debt 和稳定游标并最终完成；退出/drain 同理。最大连续块观测可以辅助未来硬容量方案的诊断，但不足以替代连续空间预留或专用 arena。当前授权范围内不引入 `KernelMemoryBudget`、不调整 32。
+- post-Commit 责任审计：`MemoryChangeCompletion` 在启动前取得 metadata、Wait、Remote、work debt 和 completion；`MemorySpace::commit_inner` 注明不得分配；`Process::new` 取得 termination、drain waiter、request、finalization debt；`drain_batch` 只消费既有 finalization/handle/address-space owner 并按预算推进。已有 ideas/impls 契约与这些实现一致，未发现本轮必须修复的未预留责任。
+其余发现开工时按归属映射核对既有专题；本计划唯一拥有的 C 类、M1、M4 等若需实施再明确范围。已完成的 M2 与 A2/M3/M5 容量校准在本记录保留结论和证据，不再次排入施工；其余发现经复核关闭或移交后，本记录再归档。
