@@ -1,5 +1,7 @@
 # 平台保留内存完整生命周期
 
+整体设计接点由 [设备体系细化计划](todo-2026-09-device-system-design.md) 协调；本篇继续独占平台 region、动态保留区与 reusable 的详细决策和实施记录。当前进入跨领域设计，不表示下列实施切片已获授权或前置已完成。
+
 > 【未来实施计划】承接 Devicetree Specification v0.4 的动态 `/reserved-memory`、`reusable` 与设备 `memory-region` 引用。静态 `reg`、FDT reservation block 和 `no-map` 由当前 MemoryPool 主线的供给账本切片先行闭合；本计划必须在正式设备/DMA 资源接入前完成，不把未知语义降级成永久排除区。
 
 ## 外部契约

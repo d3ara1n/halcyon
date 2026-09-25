@@ -129,6 +129,8 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   同时增加 `mandatory_ops`，只有业务 Complete 后才递减。dispatch/leave 以本 hart
   已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本 hart。
   ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Exited 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadSpawn 仅接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadSpawnResult`，内核铸造 waitable ThreadControl。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。ThreadControl close 只消散观察壳，不影响线程 core；等待面只允许真实可达的 DONE，不暴露从不发布的 CLOSED。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
+
+当前 rinlib 的 thread packet 用 `MaybeUninit<T>` 保存结果，join/Drop 等待 DONE 后通过 Acquire fence 接管，没有独立的结果发布判别字；safe `thread::exit` 可以绕过任务函数返回。libthread 目标将这些情况区分为已发布结果与 Incomplete，不对未初始化的 T 取值或 Drop。UserStack 解除 Busy 时循环 Sleep，其它失败只累计 abandoned count，映射留至 ProcessDrain；这不是目标的运行期退休 owner。具体修正由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 与 [用户内存 owner](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md) 联合设计，当前尚无 ThreadCleanup、退休准入或环境工厂。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)

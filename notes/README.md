@@ -33,7 +33,9 @@
 | BufferQueue | [buffer-queue](ideas/buffer-queue.md) | — |
 | 通用 RPC | [rpc](ideas/rpc.md) | [rpc](impls/rpc.md) |
 | 服务进程与用户态框架 | [service](ideas/service.md)、[framework](ideas/framework.md) | [startup](impls/startup.md)、[rpc](impls/rpc.md)、[fal](impls/fal.md) |
+| 用户态库组合与可替换 Rust runtime | [framework](ideas/framework.md) | [framework](impls/framework.md) |
+| 用户态内核接口、安全 owner 与失败交付 | [kernel-interface](ideas/kernel-interface.md) | [framework](impls/framework.md)、对应对象实现篇 |
 | 文件系统 namespace 与 FAL | [fs](ideas/fs.md)、[fal](ideas/fal.md) | [fal](impls/fal.md) |
-| 设备资源授权 | [device](ideas/device.md) | — |
+| 设备声明、发现/PnP、驱动接管、租约与资源机制 | [device](ideas/device.md) | — |
 
 应用层构想不属于系统契约，单独位于 [`ideas/applications/`](ideas/applications/)；当前包含机器人 [ECS](ideas/applications/ecs.md)。

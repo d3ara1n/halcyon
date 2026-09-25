@@ -32,6 +32,16 @@ Runtime 固定消费 `AccountView<ExecutionResource>`；任务与输入字节不
 
 `close` 在任务、来源或 Gate 未清空时返还完整 Runtime；WaitSet 关闭失败同样返还原运行体。异常 Drop 只是进程放弃的兜底，不是正常清理或精确退款的证明。
 
+## 资源退休消费者与复用边界
+
+执行器已提供任务准入、稳定记录、失败保留/退避、观察登记/注销与停止后的预算推进。`WorkQueue::insert` 在发布前取得 Task 额度、双 timer 槽、输入和稳定节点；`Runtime::prepare_source/adopt_entry` 在内核 Register 前准备来源记录与退休 timer。`Runtime::spawn` 仍可失败并返还任务，因此它不是在任意资源 Drop 处都能成功的提交接口，也不提供多个 OS 线程可并发操作的公开接收端。
+
+FAL 是正式退休消费者：`libfal/store.rs` 的 NodeRef Drop 在最后 pin/link 消失时，把已有 Lease 链入 RetireQueue 并调用 `libexecution::wake::Wake`，发布不新分配；payload 一直由 NodeStore 记录持有。`retire_step` 取出 payload 推进一步，无论返回成功或错误先放回记录，完成后才删除并释放计费。`libfal/provider.rs::Retirement` 已接上 Notification source、take/rearm、backend 预算清理、停止后的空表检查与注销回执。完整节点语义归 [FAL 实现](fal.md)。
+
+这条路径使用 Rc/Cell/RefCell，属于 provider 单线程节点/链接生命周期；不是跨 OS 线程的任意 cleanup 队列。非空 NodeStore Drop 记录 abandoned 并保留表，WorkQueue 非空 Drop 记录 abandoned 后销毁任务；这些不是运行体被丢弃后仍有推进者的证明。NotificationWake 把 ObjectClosed 当可结束发布处理，也不能单独证明该责任另有接收者。
+
+RootSupervisor 的 `Cleanup<T>` 在 `srv_init/src/supervisor.rs:137-162` 以原槽承接关闭失败，Endpoint/EndpointCleanup/Capability 三类固定实例由根轮转推进；资源工厂先预留 capability 账本再创建对象。它提供实际 owner/重试模式，但不是公共任意资源服务，不能自动接管其它进程的栈地址。现有 libthread 目标所需的同进程跨线程发布与栈/环境清理尚未接通；现有基座如何承接这类消费者由 [用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md) 记录，不需要重建执行循环。
+
 ## Process 与 Job 收束
 
 `libprocess/supervise.rs` 的 Collector 从等待 REAPABLE/CLOSED 开始，依次进入 Drain、Verify、Close。`ProcessOperations` 使真实系统调用和故障替换测试消费同一台机器。Close 成功前保留 snapshot；所有失败与停止结果都持有完整 Collector。管理者给原机器续作额度时不重建 Drain、不回退游标、不丢 Closing 快照。

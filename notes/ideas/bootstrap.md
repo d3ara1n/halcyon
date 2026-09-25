@@ -131,3 +131,44 @@ Dead 表示进程的地址空间和 HandleTable 已经完成释放；exit status
 ## 外部参照的边界
 
 Zircon 把 bootdata 作为显式 VMO 交给普通 userboot，由 userboot 解析 BOOTFS 和后续 ELF；seL4 把 BootInfo 与 root capabilities 交给 root task，由用户态构造后续 VSpace/TCB/CNode。Halcyon 采用相同的责任边界，但不因此照搬 VMO、untyped 或某个具体启动协议；本系统的独立理由是让 eRhino 只保留不可替代的 bootstrap 机制，并让后续装载遵守同一 capability 模型。
+
+## 用户态接收与一次性交接
+
+程序环境与 syscall 分层见 [framework](framework.md)、[用户侧内核接口](kernel-interface.md)。本节拥有启动映像、初始能力和应用上下文的接收契约；它不定义 payload 中的服务 schema，也不赋予启动身份额外权限。
+
+### 启动映像的寿命
+
+所有遵守该程序环境契约的 launcher 都必须交付连续、完整、用户只读且不可执行的 StartupBlock 映像，并在首次进入应用前保持内容稳定。普通 launcher 可以直接按最终只读权限 Map，再经 Building Write 填充；不以接收者自律代替映射权限，也不为此复制 init 的大 payload。内核 bootstrap 与用户态 launcher 交付相同的接收契约，具体 backing 来源仍不同。
+
+接收方把该映像作为**进程寿命输入**：直到进程地址空间收束前保持映射，不向安全用户态 API 交付可解除或写入它的 region owner。来自平台入口的块基和字节数不包含完整 reservation/guard/backing 责任，不能据此伪造 MappedRegion。libkernel 的任意地址 Unmap/Protect 或原始写入是 unsafe 边界；正常安全 region 操作必须使用自身真实 owner，不能影响此输入。
+
+这项保活由地址空间及合法 launcher/程序环境契约承担，不是将 Rust 切片随意强转为 static。公开的 StartupPayload 持有经验证的只读视图凭据，借出的字节切片绑定到该视图的借用；它可以显式 clone 并跨本进程线程共享，但不拥有原始 Handle 数组，也不拥有 backing 回收权。丢弃所有 payload 视图不提前解除映像；只有进程地址空间收束返还 backing 与计费。未来若需要启动区提前回收，必须增加真实的映射交接契约后再改变此寿命，不能让当前上下文 Drop 偷做。
+
+进入 Rust 安全接口的原始指针接管仍是 unsafe：调用者须保证完整映像可读、长度可表示、内容稳定及上述寿命。outer 格式校验只能验证已可访问字节的布局，不能证明一个任意指针可读。平台入口适配器是该不变量的唯一生产接点，非法启动输入按程序失败收束，不把用户地址错误变成内核 panic。
+
+### 启动凭据与采用
+
+入口适配器创建不可 Clone、不可安全伪造的 StartupSeed。它唯一持有本次启动的一次接收责任，包含稳定映像的来源证明及尚未被其它用户态 owner 接管的初始表项集合。相同入口或指针不能经安全接口再次生成凭据；新线程调用不走第二次进程启动采用。
+
+启动采用按以下顺序完成：
+
+1. **纯验证**：无堆检查 outer 格式、边界、reserved 与长度表示。Handle 数值和 payload 此时只是借用数据，不向应用公开可消费的 owner。
+2. **准备**：语言环境建立 allocator 后，按实际 Handle 数预留全部槽位与验证工作区；拒绝 INVALID 和重复表项数值。两个不同 Handle 指向同一 object 并不构成重复。
+3. **核实**：对每个表项查询其真实 kind/role/rights，验证已知、可安全采用的非本地映射 role。不得按 object_id 数值重新打开对象，也不能要求接收后的 rights 仍含来源方此前使用的 GRANT/TRANSIT。
+4. **采用提交**：所有可失败工作结束后，一次消费 Seed，把每个初始 entry 的关闭责任安装到唯一 InitialGrants 槽，并产生 CurrentProcessInfo 和 payload 视图。该用户态提交不执行新的内核 Grant，不改变表项 identity；提交后不再分配或执行可失败 Query。
+5. **交付**：StartupContext 交给应用；runtime 不保留一份可再次领取的副本。应用可拆出只读视图和 InitialGrants，将最窄的能力交给实际消费者。
+
+准备或核实失败返回错误和原 Seed，未建立部分 typed owner，也不关闭任意 raw 初始表项。分配失败可以在已有环境中重试；非法/重复/不支持的输入不能跳过继续调用应用，runtime 走进程失败出口，内核表项由进程收束负责。丢弃未经验证的 Seed 不能以 Drop 猜测各 raw Handle 的安全关闭方式。
+
+StartupSeed 的来源保证与 HandleQuery 缺一不可：Query 核实对象属性，Seed 保证表项尚未被用户态重复接管。单纯解析一段字节、得到一串看起来合法的 Handle，不足以创建 StartupContext。纯格式解析结果也不能安全转换为 CurrentProcessInfo 的来源凭据。
+
+### 应用可见的接口责任
+
+- **CurrentProcessInfo**：可以复制的启动身份与创建关系视图，字段由启动路径形成，不通过普通构造器任意填写。它用于正确传递创建者 provenance；不证明内核认证，不等于 ProcessControl。进程管理 API 接收该上下文而不读取 runtime 全局，也不接受易混淆的裸 parent_pid 替代。
+- **StartupPayload**：只读、可 clone/共享的 opaque payload 视图；没有文件系统、服务配置或设备语义，解析这些语义的库自行负责。
+- **InitialGrants**：本进程初始非映射 Capability 的唯一槽位 owner，不可 Clone；独占 move 可以跨线程，共享并发领取需由调用方显式同步。查询槽位信息不授予关闭或消费权。
+- **StartupContext**：组合上述三者的初始交接值，可拆开；grant 部分不能因只读信息可复制而跟着复制。不存在安全的 `startup_handles() -> &'static [Handle]` 接管捷径。
+
+按索引领取是仅发生在用户态槽位上的原子语义：索引越界或已领取都不修改其它槽；成功取走完整 Capability 并留下 Taken 状态。随后将它转换为具体 role 的失败，返还该 Capability 给调用者，不自动放回原槽或关闭。需要预先检查 role 时使用槽描述，不将检查结果当成第二个 owner。
+
+未领取能力由 InitialGrants 继续负责。显式关闭剩余项只关闭它实际拥有的非映射 entry，已领取者完全由新的 owner 处理；关闭不是杀进程、Drain Job 或设备停机。合法表项的 Drop 使用 [object](object.md) 已定义的关闭/退休契约，可能停驻但不启动用户态业务清理循环；异常终止仍以进程 HandleTable 收束为最终责任。不因一个未用的管理 Handle 被 Drop 就宣告它管理的资源已经结束。

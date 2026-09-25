@@ -40,7 +40,7 @@ Timeout 只停止本地等待。服务取消、幂等键、去重和重试属于
 
 控制循环通过 [WaitSet](wait.md) 推进 Mailbox、下游 PendingCall 和 outbox。来源关闭、观察失败、期限到达与正常完成都进入同一任务收束路径。
 
-通用 framing 与调用状态属于 librpc；任务推进、观察与执行准入属于 libexecution；服务组合政策属于 libservice；rinlib 只封装内核对象、运输、时间和等待。
+通用 framing 与调用生命周期属于 librpc；libkernel 提供 Mailbox、Handle、WaitMany、时间和等待基础契约，不解释 RPC。具体 Rust runtime 由可执行程序选择，librpc 不依赖 libruntime。
 
 ## Runtime 接缝
 

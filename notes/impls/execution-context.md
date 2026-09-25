@@ -35,6 +35,8 @@ F-only、Q、V、TSO 与未建模扩展由 loader 拒绝。Q-capable hart 可运
 
 Building 首线程与 Running 期 ThreadSpawn 共用 `ThreadStartContext` 到 `UserContext` 的编码：entry 写 sepc，sp 写 x2，arg1/arg2 写 a0/a1，其余 GPR、tp、FP 状态清零。ThreadSpawn 在新线程入队前完成现场构造和 execution binding 继承；线程只能进入进程已冻结的兼容调度域。ThreadExit 与被终止线程都走非 Resume trap 出口，先切回 kernel satp、清 active，再由调度侧释放执行容器并请求 `ThreadDeparture`，不会在仍使用用户 root 时发布 DONE。
 
+当前用户首入口为 `rinlib/linker.ld` 的 ENTRY(main)，由 rustc main shim 进入 lang_start；工作线程直接进入 rinlib 的泛型 Rust trampoline。两者没有在用户侧装载 gp，出生 gp/tp 为零；用户 linker 未定义 `__global_pointer$`，两个 target 没有显式禁用 relaxation。这里只记录这些事实，不推断链接器必然生成或消除 gp-relative 指令。目标是首/工作入口都经过明确 gp 准备，再调用 Rust 桥接；见 [目标入口契约](../ideas/execution-context.md#用户态平台入口) 与 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md)。当前 PT_TLS 不在 shared/elf admission 白名单，tp=0 不提供 TLS。
+
 ## Trap 与 CSR
 
 formal stvec 指向共同 direct-mode 入口，sscratch 在正式环境中恒指 HartLocal。入口先经 sscratch 取得 hart 锚，并把原始用户 t5/t6 保存到 HartLocal scratch；恢复 sscratch 锚后才复用已保存的临时寄存器读取 SPP。SPP=0 保存 UserContext，SPP=1 进入 per-hart FatalFrame。UserContext 保存完成前不得覆盖任何尚未保存的用户寄存器；除 a0/a1 返回值外，全部用户 GPR 跨 ecall 保持。

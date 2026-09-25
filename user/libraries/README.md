@@ -4,7 +4,7 @@
 
 ## 按领域组织
 
-一个库集中拥有一个领域的概念、类型、契约与可复用机制。管理接口与消费接口可以同属一个领域库，按角色提供不同接口；不按调用者是不是系统服务、是否持管理权拆出相互重复的知识库。runtime、framework、client、server 描述实现或使用方式，不替代领域归属。
+一个库集中拥有一个领域的概念、类型、契约与可复用机制。管理接口与消费接口可以同属一个领域库，按角色提供不同接口；不按调用者是不是系统服务、是否持管理权拆出相互重复的知识库。framework、client、server 等使用方式不替代领域归属；`libruntime` 的独立领域是 Rust 程序环境，不承担通用执行或其它库的资源入口。
 
 库提供知识与实现，capability 决定可操作的对象及权利，进程通过组合库、授权与业务承担运行角色。链接一个库不产生权限，也不自动启动该库涉及的全部运行角色。普通进程可以使用进程领域类型和查询接口；pm 组合服务框架与进程领域库，并凭实际取得的控制能力承担管理职责。
 
@@ -19,7 +19,7 @@
 - `libfal` 拥有通用目录、节点、Record/Handle 值、授权和 FAL 协议；`libservice` 可用 Record 表达 ServiceRecord，`libfal` 不定义 ServiceRecord、服务状态或服务资源类别。
 - `librpc` 拥有请求回复及调用生命周期，`libfs` 拥有 namespace 与路径访问，`librunnel` 拥有流协议，`libprocess` 拥有进程领域能力。它们可以直接消费公共执行和记账，不反向依赖 `libservice`。
 - 驱动公共知识的正式库名是 `libdriver`，设备领域库名是 `libdevice`；当前没有真实公共驱动机制，因此不保留空库占位。
-- `rinlib` 拥有程序基础运行环境与内核契约的安全封装，启动 payload 的用户态领域语义由上层解释。内核、共享 ABI 与 `rinlib` 不拥有服务概念；下层出现服务专用结构必须重新判断归属。
+- `libkernel` 拥有用户态内核调用与资源的安全封装；`libruntime` 可以组合 `libprocess::context`、`libthread` 和 libkernel 完成程序环境职责，但不复制这些知识或成为其通用 facade。其它领域/机制库不得反向依赖具体 runtime，程序直接使用知识 owner 的 API；库使用 core/alloc，不选择具体 global allocator。链接只复用知识，不授予 capability，也不自动启动线程、IPC 接收器或服务。当前 `rinlib` 的拆分、改名及迁移由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 承接，完整边界由 [framework](../../notes/ideas/framework.md) 拥有。
 
 领域知识收敛不要求把整条调用链搬到一个库。服务记录的完整性和生命周期由服务领域负责，Record 编码由 FAL 负责，消息投递由运输层负责。改变服务规则不应要求这些下层同步理解新的服务含义。
 

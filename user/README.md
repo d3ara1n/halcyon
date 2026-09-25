@@ -8,9 +8,9 @@
 
 ### 领域名称
 
-- 单个普通领域词使用完整英文单词：`libprocess`、`libservice`、`libdriver`、`libdevice`、`libbudget`、`libexecution`。
+- 单个普通领域词使用完整英文单词：`libkernel`、`libruntime`、`libprocess`、`libthread`、`libservice`、`libdriver`、`libdevice`、`libbudget`、`libexecution`。
 - 多词领域使用业界公认且在本项目中含义唯一的缩写：Remote Procedure Call → `librpc`，File System → `libfs`，File Abstraction Layer → `libfal`。
-- 正式专名保持正式拼写：Runnel → `librunnel`；`rinlib` 是用户态基础运行库的既有正式名称。
+- 正式专名保持正式拼写：Runnel → `librunnel`。Rust 程序环境的目标库名为 `libruntime`，位于 `user/libraries/libruntime`；当前 `rinlib` 的拆分改名由 [运行时分层计划](../plans/todo-2026-09-runtime-kernel-library-separation.md) 承接，不保留旧名 alias 或 facade。
 - 单词过长时，只能使用已有、通行且不会与其他领域冲突的缩写；不得仅为省字符临时截短。缩写一旦成为公开组件名，应在本篇或相应方向文档中记录其展开与领域含义。
 - acronym 在 Rust 标识符中使用小写；文档正文仍按正式写法书写，如 RPC、FAL、FS。
 

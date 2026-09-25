@@ -115,13 +115,13 @@ Running 进程对自己的地址空间具有固有管理权；组装者只凭 Pr
 
 Map 以字节长度请求匿名或 MemoryObject backing，并同时声明权限、placement 与两端 guard。匿名来源由目标进程绑定池取得 backing；对象来源验证 Handle、对象内页对齐 offset、范围和 rights，不重新分配数据页。`Anywhere` 由账本选择完整空洞；`FixedEmpty` 只在指定范围完全空闲时成功。不存在隐式覆盖旧区域的 fixed 模式，替换必须显式 Unmap 后再 Map。成功结果包含可访问区间及含 guard 的完整 reservation 区间；AllocationKey 与 RegionKey 都是内核账本身份，不进入以地址区间为真值的用户 ABI。
 
-单次请求的页数、guard 数量、区域切分数、PTE 步数和元数据增长都有共享硬上限。超出上限由用户态运行时在安全 interface 后分段组合；rinlib 内部以 affine region 表达 allocator arena、线程栈等映射所有权。完整解除消费原 region；部分解除消费原 region，并按请求洞的左右两侧返回至多两个 compound fragment，每个 fragment 可以同时描述 usable mapping 与相邻 reservation-only guard。该所有权类型不是应用扩堆 interface；内核 ABI 仍以地址区间为真值。
+单次请求的页数、guard 数量、区域切分数、PTE 步数和元数据增长都有共享硬上限。超出上限由用户侧在安全 interface 后分段组合；libkernel 以 affine region 表达通用映射所有权，runtime 用它承载 allocator arena，libthread 用它承载本进程用户线程栈。完整解除消费原 region；部分解除消费原 region，并按请求洞的左右两侧返回至多两个 compound fragment，每个 fragment 可以同时描述 usable mapping 与相邻 reservation-only guard。该所有权类型不是应用扩堆 interface；内核 ABI 仍以地址区间为真值。
 
 Unmap 采用严格全覆盖语义：目标范围必须被调用者可解除的 mapping 或 reservation 完整覆盖；空洞、越界或 object-owned lease 使整笔请求在 Commit 前失败。调用者负责先停止其它线程对该区间的访问；内核保证成功返回后不存在 stale translation，不能替应用修复并发 use-after-unmap。
 
 Protect 只能在 mapping 创建时冻结的权限上限内改变当前权限。权限只允许只读、读写与读执行，不提供 write-only 或 W+X；增加权限、收窄权限和解除映射都走同一 MemoryChange 与地址翻译同步纪律。
 
-连续堆顶不是地址空间真值。rinlib allocator 在内部取得并持有若干匿名 arena，向应用只暴露分配器语义，不暴露 Extend、brk 或堆映射操作；线程库同样消费通用 Map/Unmap 建立带 guard 的栈。不存在内核线程栈分配调用或固定预映射栈池。
+连续堆顶不是地址空间真值。所选 runtime 的 allocator（如 libruntime）通过 libkernel 取得并持有若干匿名 arena，向应用提供 Rust 分配器语义；公共库使用 core/alloc，不依赖该 allocator 的实现。libthread 同样消费通用 Map/Unmap 建立本进程内带 guard 的线程栈；新进程首栈的外部组装由 libprocess 经 Building 通道完成。不存在内核线程栈分配调用或固定预映射栈池。
 
 ## Guard 与故障
 
@@ -151,9 +151,9 @@ Validate 检查完整范围、authority、生命周期、权限与固定宽输�
 
 Commit 是不可逆线性化点。此前任何失败都保持账本、PTE、backing 和请求槽零副作用；一旦 Commit 成功，事务归 AddressSpace 且必然完成。区域与 PTE 可以在有硬上限的 Publish 段逐项更新，未同步的其它线程在调用进行期间可能观察到旧状态或正在发布的新状态；内核不承诺任意多页在所有 hart 上瞬时切换。Synchronize 完成并向仍存活的调用者返回后，所有目标 hart 必须已经达到新 epoch，这才是对外完成边界。
 
-Map 的 Reserve 已经唯一确定 usable 与 reservation 范围。`MemoryMapResult` 使用调用者提供的稳定结果槽，包含四个固定宽范围字段和位于末尾、自然对齐的 committed cookie；request 携带非零 cookie，调用者把 committed 初始化为零，Validate 拒绝非零初值或不满足原子对齐的槽。Reserve 从 ledger 取得覆盖该固定宽可写范围的 `UserWriteLease`，阻止其它事务在 Commit 或 rollback 前撤销、降权或替换结果 backing；lease 保存有界、已验证的写入投影，使 Commit 不必重新进入 uaccess 或 AddressSpace lock。全部可失败检查与资源预留完成后，内核先写 payload，再在 execution gate 内通过 lease 以 release store 把同一 cookie 写入 committed 字段；该 store 就是 Map 的 Commit。用户或 rinlib 只有以 acquire 观察到 cookie 匹配后才可相信 payload 完整，cookie 为零时 payload 内容无语义；在 System Call 成功返回前仍不得访问新 mapping。Commit 后释放 UserWriteLease，不再执行可能失败的 uaccess。
+Map 的 Reserve 已经唯一确定 usable 与 reservation 范围。`MemoryMapResult` 使用调用者提供的稳定结果槽，包含四个固定宽范围字段和位于末尾、自然对齐的 committed cookie；request 携带非零 cookie，调用者把 committed 初始化为零，Validate 拒绝非零初值或不满足原子对齐的槽。Reserve 从 ledger 取得覆盖该固定宽可写范围的 `UserWriteLease`，阻止其它事务在 Commit 或 rollback 前撤销、降权或替换结果 backing；lease 保存有界、已验证的写入投影，使 Commit 不必重新进入 uaccess 或 AddressSpace lock。全部可失败检查与资源预留完成后，内核先写 payload，再在 execution gate 内通过 lease 以 release store 把同一 cookie 写入 committed 字段；该 store 就是 Map 的 Commit。用户侧内核封装只有以 acquire 观察到 cookie 匹配后才可相信 payload 完整，cookie 为零时 payload 内容无语义；在 System Call 成功返回前仍不得访问新 mapping。Commit 后释放 UserWriteLease，不再执行可能失败的 uaccess。
 
-结果槽必须位于调用前已经存在且可写的 eager mapping；UserWriteLease 只 pin 固定宽 ledger/backing 与写权限，不把用户指针变成可长期解引用的内核引用。与 lease 冲突的 Unmap/Protect 在各自 Commit 前返回 Busy。rinlib 为可能 park 的 Map 把结果槽放进随线程保留到 join 的运行时记录，而不是可提前回收的临时缓冲。若调用线程在 Commit 前消散，事务释放 lease 并回滚；若在 Commit 后消散，结果承诺已经属于进程，事务继续完成。线程的 departed/join 完成边界不得越过仍挂接于该线程结果记录的 committed transaction，因而接管者在 join 后观察 cookie 时也已经越过 mapping 完成边界。
+结果槽必须位于调用前已经存在且可写的 eager mapping；UserWriteLease 只 pin 固定宽 ledger/backing 与写权限，不把用户指针变成可长期解引用的内核引用。与 lease 冲突的 Unmap/Protect 在各自 Commit 前返回 Busy。用户侧内核封装与线程 owner 必须共同保证可能 park 的 Map 结果记录保留到 join 的完成边界，不能依赖某个具体 runtime 的私有缓冲。若调用线程在 Commit 前消散，事务释放 lease 并回滚；若在 Commit 后消散，结果承诺已经属于进程，事务继续完成。线程的 departed/join 完成边界不得越过仍挂接于该线程结果记录的 committed transaction，因而接管者在 join 后观察 cookie 时也已经越过 mapping 完成边界。
 
 Unmap/Protect 的旧 backing、旧权限或 writable-view permit 在 Synchronize 期间由事务隔离持有，不能归还库存、映射到其它地址、退出 seal 计数或被另一对象重新解释。Retire 只在全部确认后释放旧 OwnedExtents、旧 ObjectView、写 permit 与过期元数据。Retire 批次的对象来源集与容器容量必须在 Commit 前从完整计划推导并去重；同一地址空间对同一对象的 view owner 在一笔批次中至多交出一次，每笔仍持足以完成其全部许可归还的来源引用。Commit 后可以依据账本确定 live view 是否已经消散，但不能再从 live view 查询补找退款来源；其它批次先完成、最后 Handle 消散或对象全部区域移除，都不使当前义务失去 owner。一般事务状态属于地址空间而非发起线程；等待远端确认的 System Call 通过 WaitContext park，发起线程终止只消散最终返回权。进程终止冻结后拒绝新事务并接管已 Commit 的事务；只有线程、active hart、事务与对象 lease 全部完成或进入可恢复收束后，地址空间才可进入最终 drain。
 容量证明覆盖资源的整个生命周期，而不只是一次创建。常驻 backing 经多次切割后可以积累碎片；每笔变更的发布资格必须同时覆盖当前存量、其它在途事务尚未兑现的增长与本次最大瞬时增长，不能用初始 funding 的 extent 上限代替。配额许可与实际承载这些 owner 的存储容量必须同时预付；内部存储方式可以替换，但提交后增长不得重新触发可失败分配。
