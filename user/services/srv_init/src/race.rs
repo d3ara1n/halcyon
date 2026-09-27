@@ -27,7 +27,7 @@ use rinlib::shared::call::SystemCallError;
 use rinlib::shared::message::HandleMove;
 use rinlib::shared::object::{Handle, ObjectSignals, Rights};
 use rinlib::shared::proc::{
-    HandleGrant, JobMemberKind, JobState, ProcessExitReason, ProcessFaultCode, ProcessState,
+    HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
 };
 use rinlib::shared::wait::WaitItem;
 use rinlib::sys_sleep;
@@ -142,7 +142,7 @@ impl RaceHammers {
         for i in 0..2 {
             let exit = Cmd {
                 action: race::ACTION_EXIT,
-                code: 0,
+                token: 0,
                 aux: 0,
             };
             let _ = self.send_cmd(i, &exit, &[]);
@@ -155,20 +155,20 @@ impl RaceHammers {
     }
 }
 
-fn race_cmd(action: u64, code: u64) -> Cmd {
+fn race_cmd(action: u64, token: u64) -> Cmd {
     Cmd {
         action,
-        code,
+        token,
         aux: 0,
     }
 }
 
 /// 延迟变体指令：锤醒后先 sleep `delay_ms` 再执行，把窗口让给对侧
 /// 先行（时序变体用，见 race::Cmd::aux）。
-fn race_cmd_delayed(action: u64, code: u64, delay_ms: u64) -> Cmd {
+fn race_cmd_delayed(action: u64, token: u64, delay_ms: u64) -> Cmd {
     Cmd {
         action,
-        code,
+        token,
         aux: delay_ms,
     }
 }
@@ -236,11 +236,11 @@ fn spawn_tunnel_exit_target(
     }
 }
 
-/// 收束到 Dead 后断言终因在允许集合内；code 通配用 None。返回终因
-/// code（通配时回传实际值），违约返回 None。先等 REAPABLE|CLOSED 电平
+/// 收束到 Dead 后断言终因在允许集合内；返回实际终因，违约返回 None。
+/// 先等 REAPABLE|CLOSED 电平
 /// （ProcessDrain 仅在 REAPABLE/Dead 上适用，kill 后线程退出路径是
 /// 异步的，不能立即 drain）。
-fn drain_expect_dead(control: Handle, allowed: &[(u32, Option<i64>)]) -> Option<i64> {
+fn drain_expect_dead(control: Handle, allowed: &[u32]) -> Option<u32> {
     if !await_reapable(control) {
         return None;
     }
@@ -255,18 +255,14 @@ fn drain_expect_dead(control: Handle, allowed: &[(u32, Option<i64>)]) -> Option<
         debug!("race: terminal state {} is not Dead", snapshot.state);
         return None;
     }
-    for (reason, code) in allowed {
-        if snapshot.reason == *reason {
-            match code {
-                None => return Some(snapshot.code),
-                Some(expected) if snapshot.code == *expected => return Some(snapshot.code),
-                _ => {}
-            }
+    for cause in allowed {
+        if snapshot.cause == *cause {
+            return Some(snapshot.cause);
         }
     }
     debug!(
-        "race: terminal reason {} code {:#x} not in allowed set",
-        snapshot.reason, snapshot.code
+        "race: terminal cause {} not in allowed set",
+        snapshot.cause
     );
     None
 }
@@ -361,16 +357,20 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 break;
             }
         };
-        let kills_ok = rep_a.status == 0 && rep_b.status == 0;
+        let kills_ok = rep_a.status == 0
+            && rep_b.status == 0
+            && (rep_a.aux0 == 0) != (rep_b.aux0 == 0);
         let allowed = [
-            (ProcessExitReason::Killed as u32, Some(codes[0])),
-            (ProcessExitReason::Killed as u32, Some(codes[1])),
+            TerminationCause::Killed as u32,
+            TerminationCause::Killed as u32,
         ];
         let terminal = drain_expect_dead(target.control, &allowed);
-        match terminal {
-            Some(code) if code == codes[0] => wins[0] += 1,
-            Some(_) => wins[1] += 1,
-            None => ok = false,
+        if terminal != Some(TerminationCause::Killed as u32) {
+            ok = false;
+        } else if rep_a.aux0 == 0 {
+            wins[0] += 1;
+        } else if rep_b.aux0 == 0 {
+            wins[1] += 1;
         }
         if !sent || !kills_ok {
             debug!(
@@ -383,7 +383,7 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let _ = unsafe { close(gun) };
     }
     debug!(
-        "race kill-vs-kill {} (code wins {}/{})",
+        "race kill-vs-kill {} (accepted wins {}/{})",
         if ok { "passed" } else { "FAILED" },
         wins[0],
         wins[1]
@@ -391,17 +391,17 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
-/// kill vs Exit：靶自杀与锤 kill 同刻起跑，终因 Exited/Killed 二者
-/// 恰一，code 与胜者匹配。奇数轮锤延迟 1ms 再 kill：靶的 Exit 先
-/// 线性化，观察 Exited 胜出侧（kill 后到幂等）。
+/// kill vs ProcessTerminate：靶自杀与锤 kill 同刻起跑，终因 Completed/Killed 二者
+/// 恰一，cause 判定。奇数轮锤延迟 1ms 再 kill：靶的主动结束 先
+/// 线性化，观察 Completed 胜出侧（kill 后到幂等）。
 fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let exit_code = 0x300 + round as i64;
+        let payload = 0x300 + round as i64;
         let kill_code = 0x400 + round as i64;
         let (target, gun) =
-            match spawn_race_target(job, image, race::TARGET_SUICIDE, exit_code as u64) {
+            match spawn_race_target(job, image, race::TARGET_SUICIDE, payload as u64) {
                 Ok(pair) => pair,
                 Err(error) => {
                     debug!("race kill-vs-exit: target spawn failed: {:?}", error);
@@ -429,13 +429,13 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             alloc::vec::Vec::new(),
         ));
         let allowed = [
-            (ProcessExitReason::Exited as u32, Some(exit_code)),
-            (ProcessExitReason::Killed as u32, Some(kill_code)),
+            TerminationCause::Completed as u32,
+            TerminationCause::Killed as u32,
         ];
         let terminal = drain_expect_dead(target.control, &allowed);
         match terminal {
-            Some(code) if code == exit_code => dist[0] += 1,
-            Some(_) => dist[1] += 1,
+            Some(cause) if cause == TerminationCause::Completed as u32 => dist[0] += 1,
+            Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
             _ => ok = false,
         }
         if !sent || rep.status != 0 {
@@ -457,7 +457,7 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
-/// Running 期 ThreadSpawn 与异 hart ProcessKill 竞速。偶数轮 kill 同刻提交，
+/// Running 期 ThreadCreate 与异 hart ProcessKill 竞速。偶数轮 kill 同刻提交，
 /// 奇数轮延迟 kill 让 spawn 先入册；无论线性化次序，新增成员都必须被终止收束。
 fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
@@ -485,7 +485,7 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let report = h.report(0).map(|(report, _)| report);
         let terminal = drain_expect_dead(
             target.control,
-            &[(ProcessExitReason::Killed as u32, Some(kill_code))],
+            &[TerminationCause::Killed as u32],
         );
         if !sent || !matches!(report, Some(report) if report.status == 0) || terminal.is_none() {
             debug!(
@@ -507,11 +507,11 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 }
 
 /// 在真实竞速前先用明确的顺序覆盖两种合法终因：一轮只放行末线程
-/// Exited，一轮在发枪前 Kill。该覆盖不依赖调度器随机选择胜者。
+/// Completed，一轮在发枪前 Kill。该覆盖不依赖调度器随机选择胜者。
 fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
-    let exit_code = 0x4b0;
+    let payload = 0x4b0;
     let (exit_target, exit_gun) =
-        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, exit_code) {
+        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, payload) {
             Ok(pair) => pair,
             Err(error) => {
                 debug!(
@@ -521,12 +521,12 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
                 return false;
             }
         };
-    // 目标主线程先退出，次线程在枪上等待；发枪后终因确定为 Exited。
+    // 目标主线程先退出，次线程在枪上等待；发枪后终因确定为 Completed。
     unsafe { sys_sleep(30).expect("last-thread exit-first setup sleep failed") };
     let exit_signal = notification::signal(exit_gun, 1).is_ok();
     let exited = drain_expect_dead(
         exit_target.control,
-        &[(ProcessExitReason::Exited as u32, Some(exit_code as i64))],
+        &[TerminationCause::Completed as u32],
     )
     .is_some();
     let _ = unsafe { close(exit_target.control) };
@@ -557,7 +557,7 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
     let killed = matches!(report, Some((report, _)) if report.status == 0)
         && drain_expect_dead(
             kill_target.control,
-            &[(ProcessExitReason::Killed as u32, Some(kill_code as i64))],
+            &[TerminationCause::Killed as u32],
         )
         .is_some();
     let _ = unsafe { close(kill_target.control) };
@@ -579,13 +579,13 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
     let mut ok = cover_last_thread_exit_kill_outcomes(h, job, image);
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let exit_code = 0x490 + round as i64;
+        let payload = 0x490 + round as i64;
         let kill_code = 0x4a0 + round as i64;
         let (target, gun) = match spawn_race_target(
             job,
             image,
             race::TARGET_LAST_THREAD_EXIT_RACE,
-            exit_code as u64,
+            payload as u64,
         ) {
             Ok(pair) => pair,
             Err(error) => {
@@ -620,12 +620,12 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
         }
         let report = h.report(0).map(|(report, _)| report);
         let allowed = [
-            (ProcessExitReason::Exited as u32, Some(exit_code)),
-            (ProcessExitReason::Killed as u32, Some(kill_code)),
+            TerminationCause::Completed as u32,
+            TerminationCause::Killed as u32,
         ];
         match drain_expect_dead(target.control, &allowed) {
-            Some(code) if code == exit_code => dist[0] += 1,
-            Some(_) => dist[1] += 1,
+            Some(cause) if cause == TerminationCause::Completed as u32 => dist[0] += 1,
+            Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
             None => ok = false,
         }
         if !sent || !matches!(report, Some(report) if report.status == 0) {
@@ -687,13 +687,13 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             alloc::vec::Vec::new(),
         ));
         let allowed = [
-            (ProcessExitReason::Fault as u32, Some(4)),
-            (ProcessExitReason::Killed as u32, Some(kill_code)),
+            TerminationCause::Faulted as u32,
+            TerminationCause::Killed as u32,
         ];
         let terminal = drain_expect_dead(target.control, &allowed);
         match terminal {
-            Some(4) => dist[0] += 1,
-            Some(_) => dist[1] += 1,
+            Some(cause) if cause == TerminationCause::Faulted as u32 => dist[0] += 1,
+            Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
             _ => ok = false,
         }
         if !sent || rep.status != 0 {
@@ -762,7 +762,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
         let closed = SystemCallError::ObjectClosed as i64;
         let start_side_ok = rep_start.status == 0 || rep_start.status == closed;
         let kill_side_ok = rep_kill.status == 0;
-        let allowed = [(ProcessExitReason::Killed as u32, Some(kill_code))];
+        let allowed = [TerminationCause::Killed as u32];
         let terminal = drain_expect_dead(created.control, &allowed);
         match rep_start.status {
             0 => dist[0] += 1,
@@ -823,7 +823,7 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             }
         };
         fire_race(h, gun, &[]);
-        let allowed = [(ProcessExitReason::Killed as u32, Some(kill_code))];
+        let allowed = [TerminationCause::Killed as u32];
         let terminal = drain_expect_dead(target.control, &allowed);
         if rep.status != 0 || terminal.is_none() {
             debug!(
@@ -871,7 +871,7 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         );
         fire_race(h, gun, &[0]);
         let report = h.report(0).map(|(report, _)| report);
-        let allowed = [(ProcessExitReason::Killed as u32, Some(kill_code))];
+        let allowed = [TerminationCause::Killed as u32];
         let terminal = drain_expect_dead(target.control, &allowed);
         if !sent || report.is_none_or(|report| report.status != 0) || terminal.is_none() {
             debug!(
@@ -904,10 +904,7 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
         }
     };
     let _ = notification::signal(gun, 1);
-    let allowed = [(
-        ProcessExitReason::Fault as u32,
-        Some(ProcessFaultCode::LoadAccess as i64),
-    )];
+    let allowed = [TerminationCause::Faulted as u32];
     let terminal = drain_expect_dead(target.control, &allowed);
     let ok = terminal.is_some();
     debug!(
@@ -919,9 +916,9 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
     ok
 }
 
-/// ThreadSpawn/user-memory 8B：目标进程内部建立真实多线程，完成同 AddressSpace
+/// ThreadCreate/user-memory 8B：目标进程内部建立真实多线程，完成同 AddressSpace
 /// stale translation、Endpoint close/普通 Unmap 并发及结构化 stack/join 收束；
-/// 末线程通过 ThreadExit 被动冻结进程 Exited 终态。
+/// 末线程通过 ThreadExit 被动冻结进程 Completed 终态。
 fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
     let (target, gun) = match spawn_race_target(job, image, race::TARGET_THREAD_SUITE, 0) {
         Ok(pair) => pair,
@@ -931,7 +928,7 @@ fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
         }
     };
     let _ = notification::signal(gun, 1);
-    let allowed = [(ProcessExitReason::Exited as u32, Some(0x8b))];
+    let allowed = [TerminationCause::Completed as u32];
     let terminal = drain_expect_dead(target.control, &allowed);
     let ok = terminal.is_some();
     debug!(
@@ -987,7 +984,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
         let _ = notification::signal(gun, 1);
         let terminal = drain_expect_dead(
             target.control,
-            &[(ProcessExitReason::Exited as u32, Some(0x8c))],
+            &[TerminationCause::Completed as u32],
         );
         let peer_closed = endpoint
             .events()
@@ -1070,12 +1067,12 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
             alloc::vec::Vec::new(),
         ));
         let allowed = [
-            (ProcessExitReason::Killed as u32, Some(kill_code)),
-            (ProcessExitReason::Abandoned as u32, Some(0)),
+            TerminationCause::Killed as u32,
+            TerminationCause::Abandoned as u32,
         ];
         let terminal = drain_expect_dead(created.control, &allowed);
         match terminal {
-            Some(code) if code == kill_code => dist[0] += 1,
+            Some(cause) if cause == TerminationCause::Killed as u32 => dist[0] += 1,
             Some(_) => dist[1] += 1,
             _ => {}
         }
@@ -1198,7 +1195,7 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
         );
         ok = false;
     }
-    let abandoned = [(ProcessExitReason::Abandoned as u32, Some(0))];
+    let abandoned = [TerminationCause::Abandoned as u32];
     for pid in &pids {
         if derive_and_reap(job, *pid, &abandoned).is_none() {
             ok = false;
@@ -1316,7 +1313,7 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
         }
     }
     let mut close_child = false;
-    match root.collect_job(child, 0xB00) {
+    match root.collect_job(child) {
         Ok(()) => match process::query_job(child) {
             Ok(snapshot) if snapshot.state == JobState::Dead as u32 => {
                 close_child = true;
@@ -1369,7 +1366,7 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 return false;
             }
         };
-        if let Err(error) = process::kill(target.control, kill_code) {
+        if let Err(error) = process::kill(target.control) {
             debug!("race drain-vs-drain: kill failed: {:?}", error);
             let _ = unsafe { close(target.control) };
             return false;
@@ -1413,7 +1410,7 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let legal = (rep_a.status == 0 || rep_a.status == busy)
             && (rep_b.status == 0 || rep_b.status == busy)
             && (rep_a.status == 0 || rep_b.status == 0);
-        let allowed = [(ProcessExitReason::Killed as u32, Some(kill_code))];
+        let allowed = [TerminationCause::Killed as u32];
         let terminal = drain_expect_dead(target.control, &allowed);
         if !sent || !legal || terminal.is_none() {
             debug!(
@@ -1469,7 +1466,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 continue;
             }
         };
-        let allowed = [(ProcessExitReason::Killed as u32, Some(kill_code))];
+        let allowed = [TerminationCause::Killed as u32];
         let terminal = derive_and_reap(job, pid, &allowed);
         if rep.status != 0 || terminal.is_none() {
             debug!(

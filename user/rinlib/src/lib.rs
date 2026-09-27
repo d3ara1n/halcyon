@@ -8,7 +8,7 @@ pub use erhino_shared as shared;
 pub extern crate alloc;
 
 mod call;
-pub use call::{sys_exit, sys_sleep};
+pub use call::{sys_process_abort, sys_process_terminate, sys_sleep, sys_thread_exit};
 pub mod dbg;
 pub mod env;
 pub mod ipc;

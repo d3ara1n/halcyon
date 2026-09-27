@@ -111,8 +111,10 @@ pub enum SystemCall {
     SystemReset = 0x02,
 
     // -----Process control-----
-    /// Finalized process notifies kernel to cleanup
-    Exit = 0x10,
+    /// 当前进程主动中止执行，终因 Terminated；不等待 Drain。
+    ProcessTerminate = 0x10,
+    /// 当前进程的 runtime 报告完整性失败，终因 Aborted。
+    ProcessAbort = 0x23,
     /// 从已有 JobControl 创建子 JobControl。
     JobCreate = 0x11,
     /// 在 Job 内创建空的 Building process，返回 affine ProcessBuilder。
@@ -123,15 +125,15 @@ pub enum SystemCall {
     ProcessWrite = 0x14,
     /// 消费 ProcessBuilder，入册进程（活体门：已附线程 ≥1）。
     ProcessStart = 0x15,
-    /// 为 Building process 附线程（线程是组装资源，无观察壳）。
-    ProcessAttach = 0x1d,
+    /// 创建挂起线程；target 为 ProcessBuilder 或 INVALID self 哨兵。
+    ThreadCreate = 0x1d,
     /// 为 Building process 安装 grants 并输出目标侧句柄值。
     ProcessGrant = 0x1e,
     /// 以具 GRANT authority 的 MemoryPool 一次性绑定 Building process。
     ProcessBindMemory = 0x1f,
     /// 读 ProcessControl 的固定宽生命周期快照。
     ProcessQuery = 0x16,
-    /// 持 MANAGE authority 的异步幂等终止请求。
+    /// 持 MANAGE authority 的非等待幂等终止请求；a1=0 首次接受，1 已终止中。
     ProcessKill = 0x17,
     /// REAPABLE/Dead 上推进有界资源收束批次。
     ProcessDrain = 0x18,
@@ -145,12 +147,14 @@ pub enum SystemCall {
     JobDerive = 0x1c,
 
     // -----Thread-----
-    /// 正常结束当前线程；若为末线程则冻结进程 Exited 终态。
+    /// 正常结束当前线程；若为末线程则冻结进程 Completed 终态。
     ThreadExit = 0x20,
     /// 在完整事务边界把当前线程重新放入调度队列。
     ThreadYield = 0x21,
-    /// 由 ThreadStartContext 创建线程并写出 ThreadSpawnResult。
-    ThreadSpawn = 0x22,
+    /// 将 Created ThreadControl 发布为 Ready，无输出、无分配。
+    ThreadStart = 0x22,
+    /// 冻结 Building process 的执行需求与调度域。
+    ProcessBindExecution = 0x24,
     /// 当前线程等待绝对 Deadline（异步：Waiting，到期唤醒）。
     Sleep = 0x25,
     // -----对象与等待-----

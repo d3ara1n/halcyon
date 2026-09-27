@@ -700,7 +700,7 @@ impl WaitContext {
             {
                 let departure = thread.departure();
                 drop(thread);
-                departure.request(super::thread::DepartureKind::Terminated);
+                departure.request();
             } else {
                 self.deliver(&thread, outcome);
                 sched::enqueue(thread);

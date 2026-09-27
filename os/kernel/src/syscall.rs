@@ -7,7 +7,7 @@
 use erhino_shared::{
     call::{SystemCall, SystemCallError},
     object::{Handle, Rights},
-    proc::ProcessMapFlags,
+    proc::{ProcessMapFlags, TerminationCause, TerminationDetail},
 };
 use num_traits::{FromPrimitive, ToPrimitive};
 
@@ -57,28 +57,65 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::Exit => {
+        SystemCall::ProcessTerminate => {
             let process = thread.process.clone();
             let todo = thread.process.lifecycle.request_termination(
-                erhino_shared::proc::ProcessExitReason::Exited,
-                a0 as i64,
+                TerminationCause::Terminated,
+                TerminationDetail::NONE,
+                Some(thread.member()),
+            );
+            task::process::run_termination_todo(&process, todo);
+            Outcome::Killed
+        }
+        SystemCall::ProcessAbort => {
+            let process = thread.process.clone();
+            let todo = thread.process.lifecycle.request_termination(
+                TerminationCause::Aborted,
+                TerminationDetail::NONE,
                 Some(thread.member()),
             );
             task::process::run_termination_todo(&process, todo);
             Outcome::Killed
         }
         SystemCall::ThreadExit => {
-            thread.mark_normal_exit(a0 as i64);
+            let _ = a0;
             Outcome::Killed
         }
         SystemCall::ThreadYield => {
             respond_ok(frame, 0);
             Outcome::Requeue
         }
-        SystemCall::ThreadSpawn => {
+        SystemCall::ThreadCreate => {
+            let result = if frame.x[10] == Handle::INVALID.raw() {
+                task_thread::create(thread, frame.x[11] as usize, frame.x[12] as usize)
+            } else {
+                task::process::create_thread(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
+                )
+                .map(|_| ())
+            };
+            respond_result(frame, result.map(|_| 0));
+            Outcome::Completed
+        }
+        SystemCall::ThreadStart => {
             respond_result(
                 frame,
-                task_thread::spawn(thread, frame.x[10] as usize, frame.x[11] as usize).map(|_| 0),
+                task_thread::start(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::ProcessBindExecution => {
+            respond_result(
+                frame,
+                task::process::bind_execution(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    frame.x[11] as usize,
+                )
+                .map(|_| 0),
             );
             Outcome::Completed
         }
@@ -151,16 +188,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         SystemCall::ProcessStart => {
             respond_result(
                 frame,
-                task::process::start(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                task::process::start(thread, Handle::from_raw(frame.x[10]))
                     .map(|_| 0),
-            );
-            Outcome::Completed
-        }
-        SystemCall::ProcessAttach => {
-            respond_result(
-                frame,
-                task::process::attach(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
-                    .map(|tid| tid as usize),
             );
             Outcome::Completed
         }
@@ -187,9 +216,13 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::ProcessKill => {
-            match task::process::kill(thread, Handle::from_raw(frame.x[10]), frame.x[11] as i64) {
+            match task::process::kill(thread, Handle::from_raw(frame.x[10])) {
                 Ok(task::process::KillOutcome::Accepted) => {
                     respond_ok(frame, 0);
+                    Outcome::Completed
+                }
+                Ok(task::process::KillOutcome::AlreadyTerminating) => {
+                    respond_ok(frame, 1);
                     Outcome::Completed
                 }
                 // 自杀式调用不返回用户态；终因已在 lifecycle 冻结。

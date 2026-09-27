@@ -80,7 +80,7 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
-            ExecutionProfile, HandleGrant, JobMemberKind, JobState, ProcessExitReason, ProcessState,
+            ExecutionProfile, HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
         },
         reset::{ResetAction, ResetReason},
         startup::initial,
@@ -200,7 +200,7 @@ fn process_state_name(state: u32) -> &'static str {
 fn exit_reason_name(reason: u32) -> &'static str {
     match reason {
         0 => "None",
-        1 => "Exited",
+        1 => "Completed",
         2 => "Fault",
         3 => "Killed",
         4 => "Abandoned",
@@ -739,7 +739,7 @@ impl FalConsumerCoordinator {
             return Err("FAL consumer exit timed out");
         }
         let exit = process::query(self.control).map_err(|_| "FAL consumer exit query failed")?;
-        if exit.reason != ProcessExitReason::Exited as u32 || exit.code != 0 {
+        if exit.cause != TerminationCause::Completed as u32 || exit.detail.word0 != 0 {
             return Err("FAL consumer exited without successful result");
         }
         root.collect_process(self.pid)?;
@@ -3003,7 +3003,7 @@ fn kill_and_supervise(
     supervised: alloc::vec::Vec<Supervised>,
 ) -> Result<(), &'static str> {
     for target in &supervised {
-        let _ = process::kill(target.control, 0x1F);
+        let _ = process::kill(target.control);
     }
     root.collect_targets(supervised)
 }
@@ -3963,7 +3963,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
 
     // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
     // 稳态拓扑。
-    root.collect_job(acceptance, 0x1E)?;
+    root.collect_job(acceptance)?;
     debug!("acceptance domain collected");
     root.close_control(acceptance)?;
 
@@ -4017,7 +4017,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     let domain_state = process::query_job(pm_domain);
     if !matches!(&domain_state, Ok(s) if s.state == JobState::Dead as u32) {
         debug!("pm delegated domain not collected by pm; init collecting");
-        root.collect_job(pm_domain, 0x1F)?;
+        root.collect_job(pm_domain)?;
     }
     let domain_state = process::query_job(pm_domain).map_err(|error| {
         debug!("pm delegated domain final query failed: {:?}", error);
@@ -4093,8 +4093,8 @@ fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
                 names.process_name(pid),
                 pid,
                 process_state_name(snapshot.state),
-                exit_reason_name(snapshot.reason),
-                snapshot.code
+                exit_reason_name(snapshot.cause),
+                snapshot.detail.word0
             ),
             None => debug!(
                 "\x1b[36mtopology\x1b[0m: {indent}  process pid {} (query failed)",
@@ -4429,7 +4429,7 @@ fn test_building_kill(job: Handle) {
     if let Ok(snapshot) = before {
         debug!("building kill: initial state={}", snapshot.state);
     }
-    if let Err(error) = process::kill(created.control, 0x123) {
+    if let Err(error) = process::kill(created.control) {
         debug!("building kill: kill failed: {:?}", error);
         let _ = unsafe { close(created.builder) };
         let _ = unsafe { close(created.control) };
@@ -4441,12 +4441,12 @@ fn test_building_kill(job: Handle) {
     match (drained, snapshot) {
         (Ok(_), Ok(snapshot))
             if snapshot.state == ProcessState::Dead as u32
-                && snapshot.reason == ProcessExitReason::Killed as u32
-                && snapshot.code == 0x123 =>
+                && snapshot.cause == TerminationCause::Killed as u32
+                && snapshot.detail == rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
         {
             debug!(
                 "building kill passed: pid {} Dead/Killed/{:#x}",
-                created.pid, snapshot.code
+                created.pid, snapshot.detail.word0
             );
         }
         (work, snapshot) => {
@@ -4493,7 +4493,7 @@ fn test_derive_kill(
     match derived {
         Ok(control) => {
             let _ = unsafe { close(retained) };
-            process::kill(control, 0x77).expect("derived-control kill must be accepted");
+            process::kill(control).expect("derived-control kill must be accepted");
             let mut exhausted = DEFAULT_SUPERVISION_POLICY;
             exhausted.drain_work = 1;
             exhausted.drain_attempts = 1;
@@ -4509,20 +4509,23 @@ fn test_derive_kill(
             let mut machine = failure.collector;
             machine.replenish(DEFAULT_SUPERVISION_POLICY);
             let collected = root.collect_machine(machine)?;
-            assert_eq!(collected.snapshot.reason, ProcessExitReason::Killed as u32);
-            assert_eq!(collected.snapshot.code, 0x77);
+            assert_eq!(collected.snapshot.cause, TerminationCause::Killed as u32);
+            assert_eq!(
+                collected.snapshot.detail,
+                rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
+            );
             debug!(
-                "pid {} supervised: work={}, state={}, reason={}, code={}",
+                "pid {} supervised: work={}, state={}, cause={}, detail={}",
                 pid,
                 collected.progress.work_done,
                 collected.snapshot.state,
-                collected.snapshot.reason,
-                collected.snapshot.code
+                collected.snapshot.cause,
+                collected.snapshot.detail.word0
             );
         }
         Err(error) => {
             debug!("derive kill FAILED: enumerate/derive {:?}", error);
-            process::kill(retained, 0x77).expect("live kill of a fresh process must be accepted");
+            process::kill(retained).expect("live kill of a fresh process must be accepted");
             kill_and_supervise(
                 root,
                 job,
@@ -4608,11 +4611,11 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
             "drain minimum-budget spawn failed"
         })?;
         wait_many(&[WaitItem::new(ready.owner, ObjectSignals::READABLE, 0)], 0).map_err(|_| {
-            let _ = process::kill(started.control, 0x5D);
+            let _ = process::kill(started.control);
             let _ = unsafe { close(started.control) };
             "drain minimum-budget target readiness failed"
         })?;
-        if let Err(error) = process::kill(started.control, 0x5D) {
+        if let Err(error) = process::kill(started.control) {
             debug!("drain minimum-budget acceptance failed: kill {:?}", error);
             let _ = unsafe { close(started.control) };
             return Err("drain minimum-budget kill failed");
@@ -4701,7 +4704,7 @@ fn test_derive_fallback(job: Handle) {
         return;
     };
     let pid = created.pid;
-    if let Err(error) = process::kill(created.control, 0x1D) {
+    if let Err(error) = process::kill(created.control) {
         debug!("derive fallback FAILED: kill {:?}", error);
         let _ = unsafe { close(created.builder) };
         let _ = unsafe { close(created.control) };
@@ -4726,12 +4729,12 @@ fn test_derive_fallback(job: Handle) {
             match (drained, snapshot) {
                 (Ok(_), Ok(snapshot))
                     if snapshot.state == ProcessState::Dead as u32
-                        && snapshot.reason == ProcessExitReason::Killed as u32
-                        && snapshot.code == 0x1D =>
+                        && snapshot.cause == TerminationCause::Killed as u32
+                        && snapshot.detail == rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
                 {
                     debug!(
                         "derive fallback passed: pid {} minted control drained to Dead/Killed/{:#x}",
-                        pid, snapshot.code
+                        pid, snapshot.detail.word0
                     );
                 }
                 (drained, snapshot) => debug!(
@@ -4777,7 +4780,7 @@ fn test_job_kill_composition(
             let running_pid = running.pid;
             let _ = unsafe { close(running.control) };
             let _ = unsafe { close(building.control) };
-            match root.collect_job(child, 0x3C) {
+            match root.collect_job(child) {
                 Ok(()) => {
                     let snapshot = process::query_job(child);
                     match snapshot {
@@ -4828,10 +4831,10 @@ fn seal_before_start(job: Handle) {
         return;
     };
     let sealed = process::seal_job(child);
-    let started = process::start(created.builder, ExecutionProfile::Base64 as u32);
+    let started = process::start(created.builder);
     let gated = matches!(started, Err(SystemCallError::ObjectClosed));
     // 收束：kill → drain → sealed+空完成 → CLOSED。
-    let _ = process::kill(created.control, 0x3D);
+    let _ = process::kill(created.control);
     let _ = process::drain_to_completion(created.control);
     let _ = unsafe { close(created.control) };
     let _ = unsafe { close(created.builder) };
@@ -4899,7 +4902,7 @@ fn enumerate_convergence(job: Handle) {
             );
         }
         previous = created.pid;
-        if let Err(error) = process::kill(created.control, 0x3E + round as i64) {
+        if let Err(error) = process::kill(created.control) {
             ok = false;
             debug!("enumerate convergence FAILED: kill {:?}", error);
             let _ = unsafe { close(created.builder) };

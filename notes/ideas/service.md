@@ -4,7 +4,7 @@
 
 ## 启动与授权
 
-launcher 在 Building 阶段以独立的 Map/Write、Grant 与 Attach 动作准备映像、用户态 StartupBlock、初始 capabilities 和线程现场，再由 ProcessStart 一次发布全部预育线程。常见组装方式是 launcher 创建 Mailbox、保留 sender，把唯一 owner 直接 GRANT 给 child；服务也可以启动后自行创建 endpoint。
+launcher 在 Building 阶段以独立的 Map/Write、Grant 与 ThreadCreate(Building) 动作准备映像、用户态 StartupBlock、初始 capabilities 和线程现场，再由 ProcessStart 一次发布全部预育线程。常见组装方式是 launcher 创建 Mailbox、保留 sender，把唯一 owner 直接 GRANT 给 child；服务也可以启动后自行创建 endpoint。
 
 普通服务的 payload 可采用用户态 LauncherParcel，按索引描述 args、配置、namespace routes 与 Handle 语义。内核不理解普通 StartupBlock outer、“服务邮箱”或任何业务 tag；只有 init bootstrap 保留内核构造的同形 outer。
 

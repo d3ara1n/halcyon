@@ -19,8 +19,8 @@
 //!
 //! 成员表是线程容器记录的真值：条目只在线程强引用真正消散后由持有方
 //! 经 thread_departed 摘除：kill 不把仍在队列或等待竞争中的线程摘除，
-//! 只组装触达待办。Staging 条目携带 Building 预育线程强引用，环由预付的
-//! termination continuation 逐稳定槽打破；Spawning 条目只覆盖 Running spawn 的固定宽
+//! 只组装触达待办。Created 条目携带 Building 预育线程强引用，环由预付的
+//! termination continuation 逐稳定槽打破；Created 条目只覆盖 Running spawn 的固定宽
 //! 输出与不可失败提交窗口，终止游标不能摘取，由发起方提交为 Ready 或在
 //! 输出 fault 后回滚。
 //! 唤醒到再调度之间存在过渡窗口：自然完成的等待线程
@@ -34,7 +34,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::{sync::Arc, vec::Vec};
 
-use erhino_shared::proc::{PROCESS_MAX_THREADS, ProcessExitReason, ProcessState, Tid};
+use erhino_shared::proc::{
+    PROCESS_MAX_THREADS, ProcessState, TerminationCause, TerminationDetail, Tid,
+};
 
 use super::wait::{WaitIdentity, WeakWaitIdentity};
 
@@ -46,10 +48,7 @@ pub(crate) enum ThreadState {
     /// 已附入但尚未入册（Building 预育表）：线程强引用由成员表持有，
     /// Start 提交点整体转 Ready（强引用移交类队列）；终止 continuation
     /// 经稳定成员槽摘除并在锁外释放。
-    Staging { thread: Arc<super::Thread> },
-    /// Running ThreadSpawn 已分配 tid、尚未完成固定宽输出与 Ready 发布；
-    /// 强引用由成员表持有，termination 只能等待提交尾段。
-    Spawning { thread: Arc<super::Thread> },
+    Created { thread: Arc<super::Thread> },
     /// 在某 hart 执行点上；线程强引用由调度循环持有，IPI 吸收。
     Running { slot: usize },
     /// 无容器等待中；线程强引用由 WaitContext 持有，经 weak 触达取消。
@@ -85,8 +84,8 @@ impl MemberKey {
     }
 }
 
-/// Running ThreadSpawn 在线性化段得到的成员身份。
-pub(crate) type SpawnMember = MemberKey;
+/// Running ThreadCreate 在线性化段得到的成员身份。
+pub(crate) type CreatedMember = MemberKey;
 
 /// begin_running 失败分类（活体门与计数一致性在同一锁内判定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +126,7 @@ impl MemberSlot {
 pub(crate) enum TerminationSlot {
     Vacant,
     Waiting(WeakWaitIdentity),
-    Staging(Arc<super::Thread>),
+    Created(Arc<super::Thread>),
 }
 
 #[derive(Default)]
@@ -176,9 +175,9 @@ pub(crate) struct Lifecycle {
 }
 
 struct LifecycleInner {
-    reason: ProcessExitReason,
-    code: i64,
-    /// 固定上界成员槽：离场按 MemberKey O(1) 摘除，空槽可在新 ThreadSpawn
+    cause: TerminationCause,
+    detail: TerminationDetail,
+    /// 固定上界成员槽：离场按 MemberKey O(1) 摘除，空槽可在新 ThreadCreate
     /// 复用；generation 耗尽的槽永久退休，不发生 ABA。
     members: Vec<MemberSlot>,
     member_count: usize,
@@ -311,8 +310,8 @@ impl Lifecycle {
             inner: crate::sync::Spinlock::new(
                 crate::sync::ranks::LIFECYCLE,
                 LifecycleInner {
-                    reason: ProcessExitReason::None,
-                    code: 0,
+                    cause: TerminationCause::None,
+                    detail: TerminationDetail::NONE,
                     members: Vec::new(),
                     member_count: 0,
                     next_tid: 1,
@@ -400,9 +399,9 @@ impl Lifecycle {
         inner.is_reapable(self.is_terminating())
     }
 
-    /// 附入线程（ProcessAttach / bootstrap 内嵌组装）：锁内分配 tid、
+    /// 附入线程（ThreadCreate / bootstrap 内嵌组装）：锁内分配 tid、
     /// 经闭包构造线程（Arc 分配取 HEAP 锁，LIFECYCLE→HEAP 合法秩）并
-    /// 插入 Staging 条目（强引用由成员表持有）。原子可失败：
+    /// 插入 Created 条目（强引用由成员表持有）。原子可失败：
     /// Closed/Limit/Oom 均无副作用（tid 未消耗）。仅 Building 态接受。
     pub(crate) fn attach_member(
         &self,
@@ -414,12 +413,12 @@ impl Lifecycle {
         }
         let (tid, key, append) = inner.prepare_member()?;
         let thread = build(tid, key)?;
-        inner.install_member(key, append, ThreadState::Staging { thread });
+        inner.install_member(key, append, ThreadState::Created { thread });
         Ok(tid)
     }
 
     /// 已取得 Building operation lease 的 Attach 提交。登记早于终止截止时，
-    /// 后到的 Terminating 不得撤销提交资格：若截止仍未发生则插入 Staging；
+    /// 后到的 Terminating 不得撤销提交资格：若截止仍未发生则插入 Created；
     /// 若已发生则消费 tid 并把新线程作为终止接管资源交回调用方锁外析构。
     /// Start 无法越过该 lease，因此这里不可能观察到 Running；Dead 必须等待
     /// building_ops 归零，也不可能先于本提交。
@@ -432,7 +431,7 @@ impl Lifecycle {
         let thread = build(tid, key)?;
         match self.state.load(Ordering::Acquire) {
             state if state == state_index(ProcessState::Building) => {
-                inner.install_member(key, append, ThreadState::Staging { thread });
+                inner.install_member(key, append, ThreadState::Created { thread });
                 Ok((tid, None))
             }
             state if state == state_index(ProcessState::Terminating) => {
@@ -443,13 +442,13 @@ impl Lifecycle {
         }
     }
 
-    /// Running ThreadSpawn 线性化：检查准入与上界，锁内构造线程并插入
-    /// Spawning。返回的 Arc 与成员表引用同源，不分配额外 backing。Spawning
+    /// Running ThreadCreate 线性化：检查准入与上界，锁内构造线程并插入
+    /// Created。返回的 Arc 与成员表引用同源，不分配额外 backing。Created
     /// 阻止 REAPABLE，termination 不会摘取它。
-    pub(crate) fn begin_spawn(
+    pub(crate) fn create_running(
         &self,
         build: impl FnOnce(Tid, MemberKey) -> Result<Arc<super::Thread>, AttachFault>,
-    ) -> Result<(SpawnMember, Arc<super::Thread>), AttachFault> {
+    ) -> Result<(CreatedMember, Arc<super::Thread>), AttachFault> {
         let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running) {
             return Err(AttachFault::Closed);
@@ -459,7 +458,7 @@ impl Lifecycle {
         inner.install_member(
             key,
             append,
-            ThreadState::Spawning {
+            ThreadState::Created {
                 thread: thread.clone(),
             },
         );
@@ -467,34 +466,43 @@ impl Lifecycle {
         Ok((key, thread))
     }
 
-    /// 固定宽输出成功后的不可失败提交：Spawning → Ready，并把成员表强引用
+    /// 固定宽输出成功后的不可失败提交：Created → Ready，并把成员表强引用
     /// 交给调用方提交到已经预留的调度槽。即使 termination 已冻结也必须完成。
-    pub(crate) fn commit_spawn(&self, member: SpawnMember) -> Arc<super::Thread> {
+    pub(crate) fn start_created(
+        &self,
+        member: CreatedMember,
+    ) -> Result<Arc<super::Thread>, erhino_shared::call::SystemCallError> {
         let mut inner = self.inner.lock();
+        if self.state.load(Ordering::Acquire) != state_index(ProcessState::Running) {
+            return Err(erhino_shared::call::SystemCallError::ObjectClosed);
+        }
+        if !matches!(inner.member_mut(member).state, ThreadState::Created { .. }) {
+            return Err(erhino_shared::call::SystemCallError::ObjectBusy);
+        }
         let state = core::mem::replace(&mut inner.member_mut(member).state, ThreadState::Ready);
         advance_execution(&mut inner);
         match state {
-            ThreadState::Spawning { thread } => thread,
-            _ => unreachable!("spawn member must remain Spawning through commit"),
+            ThreadState::Created { thread } => Ok(thread),
+            _ => unreachable!("created member state changed under lifecycle lock"),
         }
     }
 
     /// 固定宽输出 fault 的防御回滚。线程从未进入调度容器；调用方锁外 drop
     /// 返回的强引用，并在 true 时发布进程 REAPABLE。
-    pub(crate) fn rollback_spawn(&self, member: SpawnMember) -> (Arc<super::Thread>, bool) {
+    pub(crate) fn rollback_created(&self, member: CreatedMember) -> (Arc<super::Thread>, bool) {
         let mut inner = self.inner.lock();
         let entry = inner.remove_member(member);
         advance_execution(&mut inner);
         let thread = match entry.state {
-            ThreadState::Spawning { thread } => thread,
-            _ => unreachable!("only Spawning member can roll back"),
+            ThreadState::Created { thread } => thread,
+            _ => unreachable!("only Created member can roll back"),
         };
         let reapable = inner.is_reapable(self.is_terminating());
         (thread, reapable)
     }
 
     /// 成员表当前长度（Start 活体门与入册预留的计数输入；Building 期
-    /// 成员全部是 Staging 预育条目）。
+    /// 成员全部是 Created 预育条目）。
     pub(crate) fn member_count(&self) -> usize {
         self.inner.lock().member_count
     }
@@ -502,15 +510,14 @@ impl Lifecycle {
     /// ProcessStart 线性化（含预育提取）：Building → Running。同一
     /// lifecycle 锁内完成：活体门（表非空）、计数一致性（members.len()
     /// == expected，防御并发 attach 插队）、building_ops 消费、状态
-    /// 发布、全部 Staging 条目转 Ready 并把线程强引用交出到 `out`
+    /// 发布、全部 Created 条目转 Ready 并把线程强引用预留发布链
     /// （容量由调用方预预留；锁内零分配零 drop）。提取与转换原子
-    /// 合并消除了「gate 后、入队前」窗口内异 hart kill 游标摘走 Staging
-    /// 条目的竞态——begin_running 成功后表内不再有 Staging。
+    /// 合并消除了「gate 后、入队前」窗口内异 hart kill 游标摘走 Created
+    /// 条目的竞态——begin_running 成功后表内不再有 Created。
     pub(crate) fn begin_running(
         &self,
         expected: usize,
-        out: &mut Vec<Arc<super::Thread>>,
-    ) -> Result<(), BeginFault> {
+    ) -> Result<Option<Arc<super::Thread>>, BeginFault> {
         let mut inner = self.inner.lock();
         if self.state.load(Ordering::Acquire) != state_index(ProcessState::Building) {
             return Err(BeginFault::Closed);
@@ -527,20 +534,29 @@ impl Lifecycle {
         }
         debug_assert!(inner.building_ops > 0, "start must hold a building op");
         inner.building_ops -= 1;
+        let mut head = None;
+        let mut tail: Option<Arc<super::Thread>> = None;
         for slot in inner.members.iter_mut() {
             let Some(entry) = slot.entry.as_mut() else {
                 continue;
             };
             let state = core::mem::replace(&mut entry.state, ThreadState::Ready);
             match state {
-                ThreadState::Staging { thread } => out.push(thread),
-                _ => unreachable!("Building member must be Staging before start commit"),
+                ThreadState::Created { thread } => {
+                    if let Some(previous) = tail {
+                        previous.set_publish_next(Some(thread.clone()));
+                    } else {
+                        head = Some(thread.clone());
+                    }
+                    tail = Some(thread);
+                }
+                _ => unreachable!("Building member must be Created before start commit"),
             }
         }
         advance_execution(&mut inner);
         self.state
             .store(state_index(ProcessState::Running), Ordering::Release);
-        Ok(())
+        Ok(head)
     }
 
     /// 请求终止：首次到达者冻结终因并组装锁外待办；后续请求幂等返回空。
@@ -549,11 +565,11 @@ impl Lifecycle {
     /// 出口）；`None`：外部触达（kill/abandonment，IPI 目标 = 冻结时刻
     /// active 位图：覆盖仍在用户态与 Resume 热路径循环中的全部 hart，
     /// 冻结后 enter_running 拒绝、位只减不增）。Ready 成员无需主动触达
-    /// （pick gate 吸收）；Waiting/Staging 由预付 continuation 逐稳定槽取消或摘除。
+    /// （pick gate 吸收）；Waiting/Created 由预付 continuation 逐稳定槽取消或摘除。
     pub(crate) fn request_termination(
         &self,
-        reason: ProcessExitReason,
-        code: i64,
+        cause: TerminationCause,
+        detail: TerminationDetail,
         exiting: Option<MemberKey>,
     ) -> TerminationTodo {
         let mut todo = TerminationTodo::default();
@@ -561,13 +577,13 @@ impl Lifecycle {
         if self.state.load(Ordering::Acquire) >= state_index(ProcessState::Terminating) {
             return todo; // 终因已冻结：幂等，后续事件只协助收束
         }
-        inner.reason = reason;
-        inner.code = code;
+        inner.cause = cause;
+        inner.detail = detail;
         todo.started = true;
         match exiting {
             Some(member) => {
                 let slot = crate::hart::current().slot();
-                // 自杀线程必在执行点上（Staging 预育线程从未进入容器，
+                // 自杀线程必在执行点上（Created 预育线程从未进入容器，
                 // 不可能发起 syscall；覆盖写丢弃的旧值不含强引用）。
                 let entry = inner.member_mut(member);
                 debug_assert!(matches!(entry.state, ThreadState::Running { .. }));
@@ -673,12 +689,8 @@ impl Lifecycle {
     }
 
     /// 线程离场完成：调用方已经移除执行容器强引用，且线程级结果义务归零。
-    /// 正常末线程在此冻结进程 Exited 终态；已有进程级终止则保持首达终因。
-    pub(crate) fn thread_departed(
-        &self,
-        member: MemberKey,
-        normal_code: Option<i64>,
-    ) -> (Option<TerminationTodo>, bool) {
+    /// 末线程在此冻结 Completed；已有进程级终止则保持首达终因。
+    pub(crate) fn thread_departed(&self, member: MemberKey) -> (Option<TerminationTodo>, bool) {
         let mut todo = TerminationTodo::default();
         let mut inner = self.inner.lock();
         inner.remove_member(member);
@@ -687,8 +699,8 @@ impl Lifecycle {
             && inner.member_count == 0;
         if started_termination {
             todo.started = true;
-            inner.reason = ProcessExitReason::Exited;
-            inner.code = normal_code.expect("last Running thread must exit normally");
+            inner.cause = TerminationCause::Completed;
+            inner.detail = TerminationDetail::NONE;
             todo.ipi_slots = inner.active;
             advance_execution(&mut inner);
             self.state
@@ -704,7 +716,7 @@ impl Lifecycle {
     }
 
     /// 终止 continuation 每个 work unit 只检查一个稳定槽。Terminating 后
-    /// 不再新增成员槽；Waiting 不再增加，Staging 只可能被本游标摘除。
+    /// 不再新增成员槽；Waiting 不再增加，Created 只可能被本游标摘除。
     pub(crate) fn take_termination_slot(&self, index: usize) -> TerminationSlot {
         let mut inner = self.inner.lock();
         let Some(slot) = inner.members.get_mut(index) else {
@@ -720,17 +732,10 @@ impl Lifecycle {
                     _ => unreachable!("matched Waiting member changed state"),
                 }
             }
-            ThreadState::Staging { .. } => {
-                let generation = slot.generation;
-                let tid = entry.tid;
-                let entry = inner.remove_member(MemberKey {
-                    slot: index,
-                    generation,
-                    tid,
-                });
-                match entry.state {
-                    ThreadState::Staging { thread } => TerminationSlot::Staging(thread),
-                    _ => unreachable!("matched Staging member changed state"),
+            ThreadState::Created { .. } => {
+                match core::mem::replace(&mut entry.state, ThreadState::Exiting) {
+                    ThreadState::Created { thread } => TerminationSlot::Created(thread),
+                    _ => unreachable!("matched Created member changed state"),
                 }
             }
             _ => TerminationSlot::Vacant,
@@ -747,7 +752,7 @@ impl Lifecycle {
 
     /// 固定宽快照（ProcessQuery）：state 与终因在同一临界区内取得，
     /// 不返回「Running + 已冻结终因」的混合视图。
-    pub(crate) fn snapshot(&self) -> (ProcessState, ProcessExitReason, i64) {
+    pub(crate) fn snapshot(&self) -> (ProcessState, TerminationCause, TerminationDetail) {
         let inner = self.inner.lock();
         let state = match self.state.load(Ordering::Acquire) {
             0 => ProcessState::Building,
@@ -755,17 +760,17 @@ impl Lifecycle {
             2 => ProcessState::Terminating,
             _ => ProcessState::Dead,
         };
-        (state, inner.reason, inner.code)
+        (state, inner.cause, inner.detail)
     }
 
     /// Dead 发布（收束完成后调用）：冻结终态并返回终因。
-    pub(crate) fn mark_dead(&self) -> (ProcessExitReason, i64) {
+    pub(crate) fn mark_dead(&self) -> (TerminationCause, TerminationDetail) {
         let inner = self.inner.lock();
         assert!(
             inner.is_reapable(self.is_terminating()),
             "process reached Dead with live lifecycle obligations"
         );
-        let frozen = (inner.reason, inner.code);
+        let frozen = (inner.cause, inner.detail);
         self.state
             .store(state_index(ProcessState::Dead), Ordering::Release);
         frozen

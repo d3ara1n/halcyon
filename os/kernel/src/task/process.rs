@@ -11,8 +11,9 @@ use erhino_shared::{
     object::{Handle, ObjectSignals, Rights},
     proc::{
         ExecutionProfile, HandleGrant, PROCESS_DRAIN_MAX, PROCESS_MAX_GRANTS, Pid,
-        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessExitReason,
-        ProcessMapFlags, ProcessSnapshot, ProcessState, ThreadStartContext, Tid,
+        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags,
+        ProcessSnapshot, ProcessState, TerminationCause, TerminationDetail, ThreadCreateResult,
+        ThreadStartContext,
     },
 };
 
@@ -25,6 +26,7 @@ use super::{
         SubscribeResult,
     },
     proc::{Process, ThreadAttachError},
+    thread::{self, ThreadControl},
     wait::{Subscription, finish_offered},
 };
 use wait_context::OfferResult;
@@ -106,7 +108,7 @@ impl ProcessBuilder {
         };
         let todo = process
             .lifecycle
-            .request_termination(ProcessExitReason::Abandoned, 0, None);
+            .request_termination(TerminationCause::Abandoned, TerminationDetail::NONE, None);
         run_termination_todo(&process, todo);
     }
 }
@@ -149,8 +151,8 @@ impl KernelObject for ProcessBuilder {
 struct DeadSnapshot {
     pid: u64,
     parent_pid: u64,
-    reason: ProcessExitReason,
-    code: i64,
+    cause: TerminationCause,
+    detail: TerminationDetail,
 }
 
 struct ControlState {
@@ -204,8 +206,8 @@ impl ProcessControl {
                 pid: dead.pid,
                 parent_pid: dead.parent_pid,
                 state: ProcessState::Dead as u32,
-                reason: dead.reason as u32,
-                code: dead.code,
+                cause: dead.cause as u32,
+                detail: dead.detail,
                 reserved: 0,
             };
         }
@@ -213,13 +215,13 @@ impl ProcessControl {
             .core
             .upgrade()
             .expect("live control core must be held by its job");
-        let (state_, reason, code) = core.lifecycle.snapshot();
+        let (state_, cause, detail) = core.lifecycle.snapshot();
         ProcessSnapshot {
             pid: core.pid,
             parent_pid: core.parent,
             state: state_ as u32,
-            reason: reason as u32,
-            code,
+            cause: cause as u32,
+            detail,
             reserved: 0,
         }
     }
@@ -255,15 +257,21 @@ impl ProcessControl {
 
     /// Dead 发布：冻结终态快照、清 REAPABLE、置 CLOSED（收束完成点调用）。
     /// 同样不分配。
-    pub fn publish_dead(&self, pid: u64, parent_pid: u64, reason: ProcessExitReason, code: i64) {
+    pub fn publish_dead(
+        &self,
+        pid: u64,
+        parent_pid: u64,
+        cause: TerminationCause,
+        detail: TerminationDetail,
+    ) {
         {
             let mut state = self.state.lock();
             if state.dead.is_none() {
                 state.dead = Some(DeadSnapshot {
                     pid,
                     parent_pid,
-                    reason,
-                    code,
+                    cause,
+                    detail,
                 });
                 state
                     .wait
@@ -617,10 +625,6 @@ impl BuildingLease {
         })
     }
 
-    /// 只有持有已登记 lease 才能调用终止截止后仍具提交资格的 Attach seam。
-    fn attach_thread(&self, context: ThreadStartContext) -> Result<Tid, ThreadAttachError> {
-        self.process.attach_thread_registered(context)
-    }
 
     /// begin_running 已在 lifecycle 线性化点消费 Building 操作登记。
     fn commit_running(mut self) {
@@ -726,15 +730,16 @@ pub fn write(
     })()
 }
 
-/// ProcessAttach(builder, descriptor)：组装者向 Building process 附入
+/// ThreadCreate(builder, descriptor)：组装者向 Building process 附入
 /// 线程（线程是组装资源）。内核零资源分配——栈与出生块由组装者经
-/// Map/Write 供给；本调用只创建执行基底并插入预育表（Staging）。
+/// Map/Write 供给；本调用只创建执行基底并插入预育表（Created）。
 /// 无观察壳：组装不是协作，组装者在 Start 之后不再观察内部状态。
-pub fn attach(
+pub fn create_thread(
     thread: &Thread,
     builder_handle: Handle,
     descriptor_ptr: usize,
-) -> Result<Tid, SystemCallError> {
+    result_ptr: usize,
+) -> Result<(), SystemCallError> {
     let descriptor = unsafe {
         crate::uaccess::read_user_value::<ThreadStartContext>(
             &mut thread.process.space.lock(),
@@ -744,15 +749,59 @@ pub fn attach(
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let builder = &concrete_builder(&builder_object)?;
     let process = builder.process()?;
-    let lease = BuildingLease::begin(process)?;
-    lease
-        .attach_thread(descriptor)
-        .map_err(|error| match error {
-            ThreadAttachError::Context(error) => SystemCallError::from(error),
-            ThreadAttachError::Closed => SystemCallError::ObjectClosed,
-            ThreadAttachError::Limit => SystemCallError::ReachLimit,
-            ThreadAttachError::Oom => SystemCallError::OutOfMemory,
-        })
+    if !process.space.lock().is_bound() || !process.is_execution_bound() {
+        return Err(SystemCallError::ObjectNotAvailable);
+    }
+    let _lease = BuildingLease::begin(process.clone())?;
+    let control = ThreadControl::new()?;
+    let ready_batch = process
+        .domain()
+        .reserve_ready(1)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    let object = ThreadControl::object_ref(&control);
+    let entry = super::handle::entry(
+        object,
+        HandleRole::ThreadControl,
+        thread::CONTROL_MAX_RIGHTS,
+    )
+    .map_err(super::handle::map_error)?;
+    let token = super::handle::transaction_token()?;
+    let mut target_table = process.handles.lock();
+    let reservation = target_table
+        .reserve(1, token)
+        .map_err(super::handle::map_error)?;
+    let target_handle = reservation.handles()[0];
+    drop(target_table);
+    let (tid, created) = match process.attach_thread_with_control(descriptor, &control) {
+        Ok(value) => value,
+        Err(error) => {
+            process
+                .handles
+                .lock()
+                .rollback(reservation)
+                .expect("ThreadCreate target reservation must remain owned");
+            return Err(match error {
+                ThreadAttachError::Context(error) => SystemCallError::from(error),
+                ThreadAttachError::Closed => SystemCallError::ObjectClosed,
+                ThreadAttachError::Limit => SystemCallError::ReachLimit,
+                ThreadAttachError::Oom => SystemCallError::OutOfMemory,
+            });
+        }
+    };
+    control.bind_thread(&created);
+    created.install_ready_batch(ready_batch);
+    process
+        .handles
+        .lock()
+        .commit(reservation, alloc::vec![entry])
+        .expect("ThreadCreate target reservation must remain owned");
+    let result = ThreadCreateResult {
+        tid,
+        reserved: 0,
+        control: target_handle,
+    };
+    let mut space = thread.process.space.lock();
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, result_ptr, &result) }.map(|_| ())
 }
 
 /// ProcessGrant(builder, grants_ptr, count, out_values)：组装者把 grants
@@ -877,10 +926,28 @@ pub fn grant(
     })()
 }
 
-/// ProcessStart(builder, profile)：活体门（已附线程 ≥1）→ Building →
-/// Running → execution binding 冻结 → 预育线程整体入册（转 Ready）。
+/// ProcessStart(builder)：活体门（已附线程 ≥1）→ Building →
+/// Running → execution binding 冻结 → Created 线程整体入册（转 Ready）。
 /// 唯一首次发布 runnable 的提交点；builder 在此消费。
-pub fn start(
+pub fn start(thread: &Thread, builder_handle: Handle) -> Result<(), SystemCallError> {
+
+    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
+    let builder = &concrete_builder(&builder_object)?;
+    let process = builder.process()?;
+    let lease = BuildingLease::begin(process.clone())?;
+    if !process.space.lock().is_bound() {
+        return Err(SystemCallError::ObjectNotAvailable);
+    }
+    match start_created_members(thread, builder_handle, builder, &process) {
+        Ok(()) => {
+            lease.commit_running();
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn bind_execution(
     thread: &Thread,
     builder_handle: Handle,
     profile: usize,
@@ -890,46 +957,35 @@ pub fn start(
         value if value == ExecutionProfile::D64 as usize => elf::IsaRequirement::D64,
         _ => return Err(SystemCallError::IllegalArgument),
     };
-
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let builder = &concrete_builder(&builder_object)?;
+    let builder = concrete_builder(&builder_object)?;
     let process = builder.process()?;
-    let lease = BuildingLease::begin(process.clone())?;
-    if !process.space.lock().is_bound() {
-        return Err(SystemCallError::ObjectNotAvailable);
+    if !process.space.lock().is_bound()
+        || process.lifecycle.snapshot().0 != ProcessState::Building
+    {
+        return Err(SystemCallError::ObjectClosed);
     }
-    match start_staged(thread, builder_handle, builder, &process, requirement) {
-        Ok(()) => {
-            lease.commit_running();
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let domain = crate::sched::resolve_domain(requirement).ok_or(SystemCallError::NotSupported)?;
+    process.bind_execution(requirement, domain);
+    Ok(())
 }
 
-fn start_staged(
+fn start_created_members(
     thread: &Thread,
     builder_handle: Handle,
     builder: &ProcessBuilder,
     process: &Arc<Process>,
-    requirement: elf::IsaRequirement,
 ) -> Result<(), SystemCallError> {
-    // eligibility：执行需求 → 兼容域中最弱者（平台无兼容 hart 是
-    // NotSupported 的平台事实语义；域绑定在提交点冻结）。
-    let domain = crate::sched::resolve_domain(requirement).ok_or(SystemCallError::NotSupported)?;
-
-    // 可失败段：按预育成员数预留就绪批次与提交缓冲。计数读点与 gate
+    if !process.is_execution_bound() {
+        return Err(SystemCallError::ObjectNotAvailable);
+    }
+    // 可失败段：读取成员计数与提交 pin。计数读点与 gate
     // 判点之间存在并发 attach 窗口——begin_running 以 expected 拒绝
     // 插队（ObjectBusy），组装者以新计数重试。
     let count = process.lifecycle.member_count();
     if count == 0 {
         return Err(SystemCallError::ObjectNotAvailable); // 活体门：从未活过
     }
-    let mut staged = Vec::new();
-    staged
-        .try_reserve_exact(count)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-
     // 提交前最后的可失败步骤：调用者表内原子 pin builder。
     let pin_token = super::handle::transaction_token()?;
     {
@@ -938,28 +994,21 @@ fn start_staged(
             return Err(super::handle::map_error(error));
         }
     }
-    // 为整个可调度寿命支付存储，失败不增加部分准入责任。
-    let ready_batch = match domain.reserve_ready(count) {
-        Ok(batch) => batch,
-        Err(()) => {
-            thread.process.handles.lock().unpin(pin_token);
-            return Err(SystemCallError::OutOfMemory);
-        }
-    };
-
     // 提交线性化点：链锁内「上行检查祖先 seal + Building → Running
-    // （含预育提取）」——活体门、计数一致性与 Staging 强引用交出在
+    // （含预育提取）」——活体门、计数一致性与 Created 强引用交出在
     // 同一 lifecycle 锁内原子完成，消除 gate 后、入队前的 kill 游标
     // 窗口。失败则无损 unpin 后回滚就绪预留。
-    if let Err(error) = super::job::Job::start_commit_gate(process, count, &mut staged) {
-        thread.process.handles.lock().unpin(pin_token);
-        return Err(error);
-    }
+    let head = match super::job::Job::start_commit_gate(process, count) {
+        Ok(head) => head,
+        Err(error) => {
+            thread.process.handles.lock().unpin(pin_token);
+            return Err(error);
+        }
+    };
 
     // 提交区：容量已预留、槽位已 pin、线程已交出——以下全部不可失败。
     // requirement 与兼容域在此合为单一 execution binding；线程随后只经
     // 所属域的类队列出现。
-    process.bind_execution(requirement, domain);
     let builder_entry = thread
         .process
         .handles
@@ -967,7 +1016,11 @@ fn start_staged(
         .commit_pinned_consume(pin_token, builder_handle);
     builder.consume();
     super::handle::close_entry_infallible(builder_entry, &thread.process, false);
-    ready_batch.publish(staged);
+    let mut current = head;
+    while let Some(created) = current {
+        current = created.take_publish_next();
+        created.publish_ready();
+    }
     Ok(())
 }
 
@@ -1024,7 +1077,10 @@ pub(crate) fn advance_termination_cleanup(
                     finish_offered(context);
                 }
             }
-            super::lifecycle::TerminationSlot::Staging(thread) => drop(thread),
+            super::lifecycle::TerminationSlot::Created(thread) => {
+                thread.abandon_created();
+                drop(thread);
+            }
         }
     }
     let complete = *cursor == slots;
@@ -1039,9 +1095,8 @@ pub(crate) fn advance_termination_cleanup(
 pub fn confirm_departure(
     process: &Arc<Process>,
     member: super::lifecycle::MemberKey,
-    normal_code: Option<i64>,
 ) {
-    let (termination, reapable) = process.lifecycle.thread_departed(member, normal_code);
+    let (termination, reapable) = process.lifecycle.thread_departed(member);
     if let Some(todo) = termination {
         run_termination_todo(process, todo);
     } else if reapable {
@@ -1065,19 +1120,20 @@ pub fn query(thread: &Thread, control: Handle, output: usize) -> Result<(), Syst
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
     Accepted,
+    AlreadyTerminating,
     TerminatedCaller,
 }
 
-pub fn kill(thread: &Thread, control: Handle, code: i64) -> Result<KillOutcome, SystemCallError> {
+pub fn kill(thread: &Thread, control: Handle) -> Result<KillOutcome, SystemCallError> {
     let object = resolve_control(thread, control, Rights::MANAGE)?;
     let control = concrete_control(&object)?;
     let Some(process) = control.core().upgrade() else {
-        return Ok(KillOutcome::Accepted); // 已 Dead：幂等成功
+        return Ok(KillOutcome::AlreadyTerminating);
     };
     if process.pid == thread.process.pid {
         let todo = process.lifecycle.request_termination(
-            ProcessExitReason::Killed,
-            code,
+            TerminationCause::Killed,
+            TerminationDetail::PROCESS_CONTROL_KILL,
             Some(thread.member()),
         );
         run_termination_todo(&process, todo);
@@ -1085,9 +1141,14 @@ pub fn kill(thread: &Thread, control: Handle, code: i64) -> Result<KillOutcome, 
     }
     let todo = process
         .lifecycle
-        .request_termination(ProcessExitReason::Killed, code, None);
+        .request_termination(TerminationCause::Killed, TerminationDetail::PROCESS_CONTROL_KILL, None);
+    let first = todo.started;
     run_termination_todo(&process, todo);
-    Ok(KillOutcome::Accepted)
+    Ok(if first {
+        KillOutcome::Accepted
+    } else {
+        KillOutcome::AlreadyTerminating
+    })
 }
 
 /// ProcessDrain(control, max_work)：REAPABLE/Dead 上推进固定预算收束。
@@ -1131,7 +1192,15 @@ pub fn drain(
     let caller = thread.process.clone();
     let result = thread.result_obligation();
     let request =
-        super::request::DrainRequest::acquire(&process, control, caller, result, output, budget)?;
+        super::request::DrainRequest::acquire(
+            &process,
+            control,
+            caller,
+            thread.member().tid(),
+            result,
+            output,
+            budget,
+        )?;
     process
         .drain_executor
         .begin(&process, request)

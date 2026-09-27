@@ -124,8 +124,12 @@ unsafe extern "C" fn handle_user_trap(
             if let Some(t) = thread {
                 let fault = erhino_shared::proc::ProcessFaultCode::from_scause(code);
                 let todo = t.process.lifecycle.request_termination(
-                    erhino_shared::proc::ProcessExitReason::Fault,
-                    fault as i64,
+                    erhino_shared::proc::TerminationCause::Faulted,
+                    erhino_shared::proc::TerminationDetail::fault(
+                        t.member().tid(),
+                        fault,
+                        stval as u64,
+                    ),
                     Some(t.member()),
                 );
                 let process = t.process.clone();

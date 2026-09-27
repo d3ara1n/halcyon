@@ -20,8 +20,6 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use erhino_shared::proc::Termination;
-
 use crate::{context::FatalFrame, csr, external, hart, heap, registry, sbi};
 
 static BOOT_HARTID: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -51,7 +49,7 @@ impl fmt::Write for RawWriter {
 }
 
 #[lang = "start"]
-fn rust_start<T: Termination + 'static>(
+fn rust_start<T: 'static>(
     main: fn() -> T,
     hartid_as_argc: isize,
     argv: *const *const u8,

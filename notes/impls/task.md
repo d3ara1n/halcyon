@@ -4,7 +4,7 @@
 
 ## 进程执行环境
 
-进程持有 AddressSpace 与 HandleTable；用户半区映像、启动布局终点、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。Start 提交点把 ELF 判定的 `IsaRequirement` 与兼容 `SchedDomain` 合成一次性的非零 execution binding ID；需求与域从同一个 `AtomicUsize` 解码，未绑定、部分冻结与 Base64/零哨兵重合均不可表示。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ProcessAttach 的 arg1/arg2 传入）；用户 tp 当前置零。Running 期堆由 rinlib 的匿名 `MappedRegion` arena 组成，任务层不持连续堆顶。
+进程持有 AddressSpace 与 HandleTable；用户半区映像、启动布局终点、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。Start 提交点把 ELF 判定的 `IsaRequirement` 与兼容 `SchedDomain` 合成一次性的非零 execution binding ID；需求与域从同一个 `AtomicUsize` 解码，未绑定、部分冻结与 Base64/零哨兵重合均不可表示。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ThreadCreate(Building) 的 context arg1/arg2 传入）；用户 tp 当前置零。Running 期堆由 rinlib 的匿名 `MappedRegion` arena 组成，任务层不持连续堆顶。
 
 ## 调度：域—类—执行点三层组合
 
@@ -14,13 +14,13 @@
 │ owner: AdmittedThread   │  │ SchedDomain           │◀─│ trait SchedClass         │
 │ （调度循环 + idle 循环）  │  │  classes: 优先级序数组 │  │ enqueue / pick /         │
 │ 域归属经 per-slot 域表   │─▶│  idle_mask: 域空闲位图 │  │ has_ready / reserve /    │
-└─────────────────────────┘  └──────────────────────┘  │ publish_batch            │
+└─────────────────────────┘  └──────────────────────┘  │ enqueue / publish_one            │
                                                        └─────────────────────────┘
 ```
 
 - **执行点**：hart 的运行现场（当前线程、trap 锚），见 `internals.md`「tp 寄存器」。调度循环与 idle 循环是执行点的行为。
 - **调度域**：`SchedDomain` 持有优先级序的调度类数组与域内 `idle_mask`。线程经 `process.domain()` 只进入已绑定域的类队列，wake 只向该域 idle hart 发门铃，静默谓词遍历全部域。硬件能力、域划分、D64 eligibility 与绑定冻结由 [`execution-context.md`](execution-context.md) 唯一记录。
-- **调度类**：公平类以 LEAF 锁保护 `os/ready_queue::ReadyQueue<Arc<Thread>>`，通过 `SchedClass` 实现 enqueue/pick/has_ready 与 reserve_batch/publish_batch。`SchedDomain::reserve_ready` 返回绑定实际类存储的 `ReadyBatch`；Start、Bootstrap、ThreadSpawn 都在不可逆点前取得整批准入，失败不产生前缀发布。
+- **调度类**：公平类以 LEAF 锁保护 `os/ready_queue::ReadyQueue<Arc<Thread>>`，通过 `SchedClass` 实现 enqueue/pick/has_ready 与 reserve_batch。`SchedDomain::reserve_ready` 返回绑定实际类存储的 `ReadyBatch`，每线程以 `publish_one` 无分配交付；Start、Bootstrap、ThreadCreate 都在不可逆点前取得每线程准入，Start/Bootstrap 通过预留发布链交付，失败不产生前缀发布。
 
 `ready_queue::Admission` 支付整个可调度寿命的存储，未交付 credit 随 Drop 原子退还。`AdmittedThread = Admitted<Arc<Thread>>` 不可 Clone，由值与一个同源 credit 组成；队列只接受该 owner。Running/Waiting 保留 credit，进入 Ready 不重新分配；取消或最终离场才归还。纯逻辑队列以保活的容量 core 校验来源，不使用整数 token 或 marker，取消不反取队列锁，pick 不扫描出生预留。
 
@@ -40,7 +40,7 @@ ProcessWrite 可由其它 hart 通过物理直映射填充可执行帧。调度�
 调度类队列（Ready） ｜ hart current（Running） ｜ WaitContext（Waiting）
 ```
 
-lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exiting`。Staging 是 Building 期预育形态：条目携带线程强引用，内嵌 bootstrap Attach 在无并发条件下由 `attach_member` 锁内分配 tid、构造并插入；syscall Attach 则凭已登记 lease 进入 `attach_registered_member`，若终止已在登记后截止，提交仍成功但新线程不再入容器，而是作为终止接管资源在 lifecycle 锁外直接析构。Start 由 `begin_running` 同一临界区整体把现存 Staging 转 Ready 并提取全部强引用。Spawning 是 Running 期 ThreadSpawn 的提交中间态：调用先预留 ThreadControl Handle 与目标域全寿命调度准入，再在 lifecycle 锁内校验 Running、分配 tid 并插入；输出成功后不可失败地提交 Handle、Spawning→Ready 与调度 owner，输出失败则完整回滚。终止路径不摘尚未完成提交的 Spawning，待提交尾段完成后按普通成员收束。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；稳定 `MemberKey { slot, generation, tid }` 是内核唯一线程身份，`Thread` 不重复保存 tid。slot 可以复用，generation 防止旧 departure 或等待凭据错指新成员，tid 负责 ABI 输出与诊断。并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
+lifecycle 成员表记录 `Created / Ready / Running / Waiting / Exiting`。ThreadCreate(Building) 与 bootstrap 通过 `attach_member` 在锁内分配 tid、构造并插入 Created；ThreadCreate(self) 在 Running 校验内创建 Created，并提前取得目标调度域的 Ready 准入与 ThreadControl。Running 线程的 ThreadStart 在 lifecycle 锁内完成 Created→Ready，再消费准入发布；Building 线程仍由 ProcessStart 的批量尾段发布，ThreadStart 对 Building 进程拒绝。输出失败回滚 Running 创建并以 Faulted(UserAccess) 收束调用者；Created 在线程终止或最后一个未启动 Control 关闭时经 ThreadDeparture 发布 DONE。Exiting 表示终止路径已取得离场所有权。线程最终离场即从成员表摘除，不保留 Dead 记录。tid 从 1 起单调不复用，0 是非身份值；稳定 `MemberKey { slot, generation, tid }` 是内核唯一线程身份，`Thread` 不重复保存 tid。slot 可以复用，generation 防止旧 departure 或等待凭据错指新成员，tid 负责 ABI 输出与诊断。并发成员数硬界为 1024。容器成员资格是真值；Waiting 完成后先经 `sched::enqueue` 发布 Ready，lifecycle 记录由下一次 `enter_running` 收编。timer queue 与类队列均为 Lock Ladder LEAF 锁。
 
 ### 等待的所有权与仲裁
 
@@ -53,7 +53,7 @@ lifecycle 成员表记录 `Staging / Spawning / Ready / Running / Waiting / Exit
 root Job 由内核 static anchor 强持（所有权图：anchor ─strong→ root Job，
 parent ─strong→ children，child ─weak→ parent；Job 直接成员表 ─strong→
 未 Dead 的 Process cores，Process ─weak→ Job）。JobCreate 派生层级；
-ProcessCreate 必须持 CREATE，只生成稳定身份、空 HandleTable、`AddressSpaceState::Unbound`、affine ProcessBuilder 与从 Building 起即存在的 ProcessControl；它不创建 ledger/root page table，也不取得 MemoryPool charge。Process core 的 sponsor slot 与 `ProcessResources` 同寿命，Builder/Control 各自持有 sponsor+global 类型化 permit：Builder 随最后 authority 消散退款，Control permit 随最后终态观察壳消散，core Dead 不会替仍存壳提前退款。创建事务在提交点把 Building shell 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/回滚不遗留成员）。`ProcessBindMemory(builder, pool)` 以 Builder MANAGE 与 Pool GRANT 为 authority，在 Building operation lease 下 pin 两项、串行化同一 shell 的竞争 Bind，并在锁外准备 AddressSpace metadata permit、单页 funded root 与完整页表；`Unbound → Bound` 发布和 Pool entry 逻辑消费在同一 HandleTable→AddressSpace 提交段完成，失败保留 Pool Handle 并自然回滚全部 owner。内核没有全局进程表：单调 PID 分配器只分配身份，未 Dead core 的生命周期根是 Job 成员表。用户态组装序列为 ProcessBindMemory → ProcessMap/Write → ProcessGrant → ProcessAttach → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类原子预留完整 Ready 批次。
+ProcessCreate 必须持 CREATE，只生成稳定身份、空 HandleTable、`AddressSpaceState::Unbound`、affine ProcessBuilder 与从 Building 起即存在的 ProcessControl；它不创建 ledger/root page table，也不取得 MemoryPool charge。Process core 的 sponsor slot 与 `ProcessResources` 同寿命，Builder/Control 各自持有 sponsor+global 类型化 permit：Builder 随最后 authority 消散退款，Control permit 随最后终态观察壳消散，core Dead 不会替仍存壳提前退款。创建事务在提交点把 Building shell 插入 Job 直接成员表（对 Seal/枚举可见，输出失败/回滚不遗留成员）。`ProcessBindMemory(builder, pool)` 以 Builder MANAGE 与 Pool GRANT 为 authority，在 Building operation lease 下 pin 两项、串行化同一 shell 的竞争 Bind，并在锁外准备 AddressSpace metadata permit、单页 funded root 与完整页表；`Unbound → Bound` 发布和 Pool entry 逻辑消费在同一 HandleTable→AddressSpace 提交段完成，失败保留 Pool Handle 并自然回滚全部 owner。内核没有全局进程表：单调 PID 分配器只分配身份，未 Dead core 的生命周期根是 Job 成员表。用户态组装序列为 ProcessBindMemory → ProcessMap/Write → ProcessGrant → ProcessBindExecution → ThreadCreate → ProcessStart（线程是组装资源，完整事务见 [`startup.md`](startup.md)），Start 按预育成员数在目标调度类原子预留完整 Ready 批次。
 每个 Job 在创建时冻结 jid/parent_jid 不可变字段（Dead 后父对象可先
 释放，快照仍可应答）。
 
@@ -111,14 +111,14 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   驱动 ProcessBuilder 组装。内核不解析 initfs 或服务拓扑。
 - **状态机**：`Building → Running → Terminating → Dead`，真值在
   Process 内嵌 lifecycle（原子 state 快读 + 顶级锁保护终因/线程成员
-  表/active 位图）。Exit、fault、ProcessKill 与 Building abandonment 在
-  各自适用状态竞争首次终止线性化点冻结终因（reason + i64 code），
+  表/active 位图）。ProcessTerminate/Abort、fault、ProcessKill 与 Building abandonment 在
+  各自适用状态竞争首次终止线性化点冻结终因（TerminationCause + TerminationDetail），
   后续事件幂等不覆盖；fault 经稳定 ProcessFaultCode 编码，不固化裸
   scause。线程成员表使用稳定 slot/generation 身份（离场即摘除、表空即无线程），
   是线程容器唯一真值：pick 后 trap 入口统一检查 Terminating（惰性撤销），
   enqueue 无条件入队不反向触碰 lifecycle 锁。每个 Process 出生时预付一枚
   termination debt；首次终止固定成本发布 IPI 与 continuation，后者每个 work
-  unit 只检查一个稳定成员槽，Waiting 逐项 offer(Abandoned)、Staging 逐项锁外
+  unit 只检查一个稳定成员槽，Waiting 逐项 offer(Abandoned)、Created 逐项锁外
   释放，空槽扫描同样计费。单 outcome 仲裁与自然完成方无双重处置；对
   唤醒后未再调度的 stale Waiting 记录 offer 必然落败，由 pick gate
   吸收后 reap 摘除。Running 由终止待办向冻结时刻的 active 位图
@@ -128,9 +128,9 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   `ADDRESS_SPACE → LIFECYCLE` 锁序下拒绝同值 ABA；已经 Commit、终止不可撤销的事务
   同时增加 `mandatory_ops`，只有业务 Complete 后才递减。dispatch/leave 以本 hart
   已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本 hart。
-  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Exited 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadSpawn 仅接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadSpawnResult`，内核铸造 waitable ThreadControl。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。ThreadControl close 只消散观察壳，不影响线程 core；等待面只允许真实可达的 DONE，不暴露从不发布的 CLOSED。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
+  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Completed 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadCreate(self) 接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadCreateResult`，随后由 ThreadStart 发布，内核铸造 waitable ThreadControl。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。ThreadControl close 只消散观察壳，不影响线程 core；等待面只允许真实可达的 DONE，不暴露从不发布的 CLOSED。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
 
-当前 rinlib 的 thread packet 用 `MaybeUninit<T>` 保存结果，join/Drop 等待 DONE 后通过 Acquire fence 接管，没有独立的结果发布判别字；公开的 safe `thread::exit(code)` 可以绕过任务函数返回，且当前 JoinHandle 仍按结果已初始化处理。目标 libthread 不公开可绕过 wrapper 的安全 exit：正常 Rust 路径发布 Returned/EnterFailed，内部保留 Unpublished 事实，不对未初始化的 T 取值或 Drop；libkernel 的 unsafe `ThreadExit(code)` 供内部 trampoline 和其他语言 runtime 消费。UserStack 解除 Busy 时循环 Sleep，其它失败只累计 abandoned count，映射留至 ProcessDrain；目标由 PTR 持有 ThreadRecord，libruntime ThreadDriver 推进 cleanup。具体修正由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 与 [用户内存 owner](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md) 联合设计，当前尚无 PTR、ThreadObservation、ThreadDriver 或环境工厂。
+当前 rinlib 的 thread packet 用 `MaybeUninit<T>` 保存结果，join/Drop 等待 DONE 后通过 Acquire fence 接管，没有独立的结果发布判别字；安全 `thread::exit` 已删除，底层仅提供 unsafe `ThreadExit()` 供内部 trampoline 和其它语言 runtime 消费。目标 libthread 正常 Rust 路径发布 Returned/EnterFailed，内部保留 Unpublished 事实，不对未初始化的 T 取值或 Drop；UserStack 解除 Busy 时循环 Sleep，其它失败只累计 abandoned count，映射留至 ProcessDrain；目标由 PTR 持有 ThreadRecord，libruntime ThreadDriver 推进 cleanup。具体修正由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 与 [用户内存 owner](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md) 联合设计，当前尚无 PTR、ThreadObservation、ThreadDriver 或环境工厂。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)

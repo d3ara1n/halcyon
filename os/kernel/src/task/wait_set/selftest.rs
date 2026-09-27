@@ -551,15 +551,19 @@ fn caller() -> (Arc<Process>, Vec<Arc<Thread>>) {
         })
         .expect("Close caller member failed");
     let mut threads = Vec::with_capacity(1);
-    process
+    let mut next = process
         .lifecycle
-        .begin_running(1, &mut threads)
+        .begin_running(1)
         .expect("Close caller start failed");
+    while let Some(thread) = next {
+        next = thread.take_publish_next();
+        threads.push(thread);
+    }
     (process, threads)
 }
 
 fn abandoned_close(sponsor: &Arc<MetadataSponsor>) {
-    use erhino_shared::proc::ProcessExitReason;
+    use erhino_shared::proc::{TerminationCause, TerminationDetail};
     let source = set(sponsor);
     let target = set(sponsor);
     let (cycle, subscription, operation) = prepare(&target, &source);
@@ -586,12 +590,16 @@ fn abandoned_close(sponsor: &Arc<MetadataSponsor>) {
         .expect("Close caller lost prepaid reply");
     let todo = process
         .lifecycle
-        .request_termination(ProcessExitReason::Killed, 7, None);
+        .request_termination(
+            TerminationCause::Killed,
+            TerminationDetail::PROCESS_CONTROL_KILL,
+            None,
+        );
     assert!(
         !todo.reapable,
         "Close caller became reapable before departure"
     );
-    let (_, reapable) = process.lifecycle.thread_departed(member, None);
+    let (_, reapable) = process.lifecycle.thread_departed(member);
     assert!(
         !reapable,
         "Close mandatory responsibility did not delay caller reapability"

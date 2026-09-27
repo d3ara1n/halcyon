@@ -159,7 +159,7 @@ fn check_fcsr_across_trap(round: u64) {
 fn expect(condition: bool, round: u64, what: &str) {
     if !condition {
         // 失败走 panic：rt 的 panic handler 以非零码退出，init 监督面
-        // 观察到 Exited(-1)；成功路径由 main 返回自然 Exited(0)。
+        // 观察到 Aborted；成功路径由 main 返回后入口线程离场，末线程时为 Completed。
         panic!("fp verification failed at round {round}: {what}");
     }
 }

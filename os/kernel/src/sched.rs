@@ -35,8 +35,6 @@ pub trait SchedClass: Sync {
     fn pick(&self) -> Option<AdmittedThread>;
     fn has_ready(&self) -> bool;
     fn reserve_batch(&self, count: usize) -> Result<Admission, ()>;
-    /// 整批在一次类锁内交付；没有 marker、token 或存量扫描。
-    fn publish_batch(&self, admission: Admission, threads: Vec<Arc<Thread>>);
 }
 
 /// 公平类：FIFO 轮转 + 固定量子。
@@ -72,17 +70,6 @@ impl SchedClass for FairClass {
         self.ready.lock().reserve(count).map_err(|_| ())
     }
 
-    fn publish_batch(&self, mut admission: Admission, threads: Vec<Arc<Thread>>) {
-        assert_eq!(
-            admission.remaining(),
-            threads.len(),
-            "ready batch/thread count mismatch"
-        );
-        let mut ready = self.ready.lock();
-        for thread in threads {
-            ready.enqueue(admission.admit(thread));
-        }
-    }
 }
 
 /// 调度域：一组能力兼容且策略相同的 hart 共享的类层次，按序查询、先到
@@ -144,14 +131,13 @@ pub struct ReadyBatch {
 }
 
 impl ReadyBatch {
-    pub fn publish(self, threads: Vec<Arc<Thread>>) {
+    pub fn publish_one(self, thread: Arc<Thread>) {
         assert!(
-            threads
-                .iter()
-                .all(|thread| core::ptr::eq(thread.process.domain(), self.domain)),
+            core::ptr::eq(thread.process.domain(), self.domain),
             "ready batch belongs to another execution domain"
         );
-        self.domain.classes[0].publish_batch(self.admission, threads);
+        let mut admission = self.admission;
+        self.domain.classes[0].enqueue(admission.admit(thread));
         self.domain.wake_one();
     }
 
@@ -521,9 +507,8 @@ fn reap(t: AdmittedThread) {
     // 强持到 departure 完成成员确认。
     let process = t.process.clone();
     let departure = t.departure();
-    let departure_kind = t.departure_kind();
     drop(t);
-    departure.request(departure_kind);
+    departure.request();
     drop(process);
 }
 

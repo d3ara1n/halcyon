@@ -9,12 +9,12 @@ use erhino_shared::{
     call::SystemCallError,
     mem::MemoryProtection,
     object::{Handle, ObjectSignals},
-    proc::{PROCESS_PAGE_SIZE, ThreadSpawnResult, ThreadStartContext, Tid},
+    proc::{PROCESS_PAGE_SIZE, ThreadCreateResult, ThreadStartContext, Tid},
     wait::WaitItem,
 };
 
 use crate::{
-    call::{sys_sleep, sys_thread_exit, sys_thread_spawn, sys_thread_yield},
+    call::{sys_sleep, sys_thread_create, sys_thread_exit, sys_thread_start, sys_thread_yield},
     ipc::{object, wait},
     mm::{MappedRegion, Placement},
 };
@@ -46,7 +46,7 @@ fn record_abandoned_stack(error: SystemCallError) {
     });
 }
 
-/// 直接提交 ThreadSpawn 原语，不接管入口参数、用户栈或返回的 ThreadControl。
+/// 直接提交 ThreadCreate 原语，不接管入口参数、用户栈或返回的 ThreadControl。
 ///
 /// # Safety
 ///
@@ -54,10 +54,17 @@ fn record_abandoned_stack(error: SystemCallError) {
 /// 唯一收束路径。通常应使用 [`Builder::spawn`]。
 pub unsafe fn spawn_raw(
     context: &ThreadStartContext,
-    result: &mut ThreadSpawnResult,
+    result: &mut ThreadCreateResult,
 ) -> Result<(), SystemCallError> {
     // SAFETY: 借用保证 syscall 期间的输入/输出地址有效；跨调用资源责任由调用者承担。
-    unsafe { sys_thread_spawn(context, result) }
+    unsafe { sys_thread_create(Handle::INVALID, context, result) }
+}
+
+/// # Safety
+///
+/// `control` must be the MANAGE-capable control returned by `spawn_raw`.
+pub unsafe fn start_raw(control: Handle) -> Result<(), SystemCallError> {
+    unsafe { sys_thread_start(control) }
 }
 
 struct UserStack {
@@ -148,7 +155,7 @@ where
     packet.result.write(function());
     fence(Ordering::Release);
     // SAFETY: result 已完整发布；成功的 ThreadExit 不返回本线程。
-    unsafe { sys_thread_exit(0) }
+    unsafe { sys_thread_exit() }
 }
 
 unsafe fn take_packet<F, T>(packet: NonNull<()>) -> T {
@@ -199,7 +206,7 @@ impl Builder {
             arg1: packet.as_ptr() as usize as u64,
             arg2: 0,
         };
-        let mut result = ThreadSpawnResult {
+        let mut result = ThreadCreateResult {
             tid: 0,
             reserved: 0,
             control: Handle::INVALID,
@@ -213,8 +220,14 @@ impl Builder {
         }
         assert!(
             result.tid != 0 && result.reserved == 0 && result.control.is_valid(),
-            "ThreadSpawn returned an invalid fixed-width result"
+            "ThreadCreate returned an invalid fixed-width result"
         );
+        if let Err(error) = unsafe { sys_thread_start(result.control) } {
+            let _ = unsafe { object::close(result.control) };
+            unsafe { drop_packet::<F, T>(packet.cast()) };
+            stack.release();
+            return Err(error);
+        }
         Ok(JoinHandle {
             tid: result.tid,
             control: Some(result.control),
@@ -261,7 +274,7 @@ impl<T> JoinHandle<T> {
             "ThreadControl closed before DONE"
         );
         fence(Ordering::Acquire);
-        // SAFETY: control 是私有 ThreadSpawn 输出，DONE 后唯一收束；不可能为 Endpoint。
+        // SAFETY: control 是私有 ThreadCreate 输出，DONE 后唯一收束；不可能为 Endpoint。
         unsafe { object::close(control) }.expect("ThreadControl close failed");
         self.stack
             .as_mut()
@@ -303,9 +316,4 @@ where
 pub fn yield_now() -> Result<(), SystemCallError> {
     // SAFETY: ThreadYield carries no borrowed user pointer.
     unsafe { sys_thread_yield() }
-}
-
-pub fn exit(code: i64) -> ! {
-    // SAFETY: ThreadExit is terminal for the current thread.
-    unsafe { sys_thread_exit(code) }
 }

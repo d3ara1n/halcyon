@@ -241,7 +241,7 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
     use rinlib::{
         ipc::{notification, object::duplicate, wait_set::WaitSet},
         process,
-        shared::proc::{HandleGrant, ProcessExitReason, ProcessState},
+        shared::proc::{HandleGrant, TerminationCause, ProcessState},
     };
     let mut sources = Vec::new();
     let monitor = WaitSet::create(2).unwrap();
@@ -294,7 +294,7 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
         &mut [Handle::INVALID],
     )
     .unwrap();
-    process::kill(nested.control, 0x130).unwrap();
+    process::kill(nested.control).unwrap();
     // SAFETY: Building builder 不再组装，Kill 已冻结终因，关闭仅退还该 affine owner。
     unsafe { close(nested.builder) }.unwrap();
     let ready =
@@ -365,7 +365,7 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
             "committed IPC Drain never exposed its active owner"
         );
     }
-    process::kill(started.control, 0x131).unwrap();
+    process::kill(started.control).unwrap();
     wait_until(
         &[WaitItem::new(
             started.control,
@@ -378,8 +378,11 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
     process::drain_to_completion(started.control).unwrap();
     let snapshot = process::query(started.control).unwrap();
     assert_eq!(snapshot.state, ProcessState::Dead as u32);
-    assert_eq!(snapshot.reason, ProcessExitReason::Killed as u32);
-    assert_eq!(snapshot.code, 0x131);
+    assert_eq!(snapshot.cause, TerminationCause::Killed as u32);
+    assert_eq!(
+        snapshot.detail,
+        rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
+    );
     // 捕获请求被 kill 时目标可能已自然结束；否则由原 control 接同一游标收口。
     loop {
         match process::drain(nested.control, 128) {
@@ -401,11 +404,11 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
     }
     let snapshot = process::query(nested.control).unwrap();
     assert_eq!(
-        (snapshot.state, snapshot.reason, snapshot.code),
+        (snapshot.state, snapshot.cause, snapshot.detail.word0),
         (
             ProcessState::Dead as u32,
-            ProcessExitReason::Killed as u32,
-            0x130
+            TerminationCause::Killed as u32,
+            1
         ),
         "builder close changed the nested target's frozen terminal result"
     );

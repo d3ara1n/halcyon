@@ -1,13 +1,13 @@
 //! 进程与线程：资源容器 / 执行容器（见 notes/impls/task.md）。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
     mem::{MemoryMapRequest, MemoryMapResult, MemoryPlacement, MemoryProtection},
-    proc::{Pid, ProcessExitReason, ProcessMapFlags, ProcessState, ThreadStartContext, Tid},
+    proc::{Pid, ProcessMapFlags, ProcessState, TerminationCause, TerminationDetail, ThreadStartContext, Tid},
 };
 use memory_space::{
     AddressRange, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError, LeaseKey,
@@ -4444,54 +4444,42 @@ impl Process {
         })
     }
 
-    /// 显式附入一条 Building 线程。syscall 与 bootstrap 共用此出生路径；
-    /// 调用者负责持有 Building 操作登记，Start 只发布这里已存在的线程。
-    pub(crate) fn attach_thread(
-        self: &Arc<Self>,
-        context: ThreadStartContext,
-    ) -> Result<Tid, ThreadAttachError> {
-        self.space
-            .lock()
-            .validate_initial_context(context.entry as usize, context.stack_pointer as usize)
-            .map_err(ThreadAttachError::Context)?;
-        self.lifecycle
-            .attach_member(|_, member| {
-                let thread = Thread::new_thread(member, self, context)
-                    .map_err(|_| super::lifecycle::AttachFault::Oom)?;
-                Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
-            })
-            .map_err(|fault| match fault {
-                super::lifecycle::AttachFault::Closed => ThreadAttachError::Closed,
-                super::lifecycle::AttachFault::Limit => ThreadAttachError::Limit,
-                super::lifecycle::AttachFault::Oom => ThreadAttachError::Oom,
-            })
-    }
 
-    /// 已登记 Building lease 的 Attach 提交；后到终止由 lifecycle 接管新线程。
-    pub(crate) fn attach_thread_registered(
+    pub(crate) fn attach_thread_with_control(
         self: &Arc<Self>,
         context: ThreadStartContext,
-    ) -> Result<Tid, ThreadAttachError> {
+        control: &Arc<super::thread::ThreadControl>,
+    ) -> Result<(Tid, Arc<Thread>), ThreadAttachError> {
         self.space
             .lock()
             .validate_initial_context(context.entry as usize, context.stack_pointer as usize)
             .map_err(ThreadAttachError::Context)?;
-        let (tid, retired) = self
+        let mut created = None;
+        let tid = self
             .lifecycle
-            .attach_registered_member(|_, member| {
-                let thread = Thread::new_thread(member, self, context)
-                    .map_err(|_| super::lifecycle::AttachFault::Oom)?;
-                Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)
+            .attach_member(|_, member| {
+                let thread = Thread::new_thread_with_control(
+                    member,
+                    self,
+                    context,
+                    Some(control),
+                )
+                .map_err(|_| super::lifecycle::AttachFault::Oom)?;
+                let thread = Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)?;
+                created = Some(thread.clone());
+                Ok(thread)
             })
             .map_err(|fault| match fault {
                 super::lifecycle::AttachFault::Closed => ThreadAttachError::Closed,
                 super::lifecycle::AttachFault::Limit => ThreadAttachError::Limit,
                 super::lifecycle::AttachFault::Oom => ThreadAttachError::Oom,
             })?;
-        // 终止已截止时，线程从未进入容器；在 lifecycle 锁外消费接管资源。
-        drop(retired);
-        Ok(tid)
+        Ok((
+            tid,
+            created.expect("successful attach must retain created thread"),
+        ))
     }
+
 
     /// 冻结进程级执行绑定（需求 + 兼容域），不可重复。
     pub(crate) fn bind_execution(
@@ -4517,6 +4505,10 @@ impl Process {
             "process execution must be bound before dispatch"
         );
         execution
+    }
+
+    pub(crate) fn is_execution_bound(&self) -> bool {
+        self.execution.load(Ordering::Acquire) != 0
     }
 
     /// 执行需求（trap FP 档位判定）。
@@ -4585,9 +4577,9 @@ impl Process {
             *slot = Some(Arc::downgrade(&control));
             control
         };
-        let (state, reason, code) = self.lifecycle.snapshot();
+        let (state, cause, detail) = self.lifecycle.snapshot();
         if state == ProcessState::Dead {
-            control.publish_dead(self.pid, self.parent, reason, code);
+            control.publish_dead(self.pid, self.parent, cause, detail);
         } else if self.lifecycle.is_reapable() {
             control.publish_reapable();
         }
@@ -4709,9 +4701,9 @@ impl Process {
                             .take()
                             .expect("process finalization published twice");
                         reservation.publish(self.clone());
-                        let (_state, reason, code) = self.lifecycle.snapshot();
+                        let (_state, cause, detail) = self.lifecycle.snapshot();
                         if let Some(control) = self.control() {
-                            control.publish_dead(self.pid, self.parent, reason, code);
+                            control.publish_dead(self.pid, self.parent, cause, detail);
                         }
                         self.lifecycle.mark_dead();
                         let next = if self.job_member_committed.load(Ordering::Acquire) {
@@ -4812,8 +4804,8 @@ pub struct Thread {
     pub process: Arc<Process>,
     frame: UnsafeCell<UserContext>,
     departure: Arc<super::thread::ThreadDeparture>,
-    normal_exit: AtomicBool,
-    exit_code: AtomicI64,
+    ready_batch: crate::sync::Spinlock<Option<crate::sched::ReadyBatch>>,
+    publish_next: crate::sync::Spinlock<Option<Arc<Thread>>>,
     /// 输出复检在业务锁内冻结终因，待办由当前 trap 在释放全部业务锁后交付。
     output_termination: crate::sync::Spinlock<Option<super::lifecycle::TerminationTodo>>,
 }
@@ -4864,13 +4856,56 @@ impl Thread {
             process: process.clone(),
             frame: UnsafeCell::new(ctx),
             departure,
-            normal_exit: AtomicBool::new(false),
-            exit_code: AtomicI64::new(0),
+            ready_batch: crate::sync::Spinlock::new(crate::sync::ranks::WORK_DEBT, None),
+            publish_next: crate::sync::Spinlock::new(crate::sync::ranks::WORK_DEBT, None),
             output_termination: crate::sync::Spinlock::new(
                 crate::sync::ranks::MEMORY_COMPLETION,
                 None,
             ),
         })
+    }
+
+    pub(crate) fn install_ready_batch(&self, batch: crate::sched::ReadyBatch) {
+        let mut slot = self.ready_batch.lock();
+        assert!(slot.replace(batch).is_none(), "thread ready batch installed twice");
+    }
+
+    pub(crate) fn set_publish_next(&self, next: Option<Arc<Thread>>) {
+        *self.publish_next.lock() = next;
+    }
+
+    pub(crate) fn take_publish_next(&self) -> Option<Arc<Thread>> {
+        self.publish_next.lock().take()
+    }
+
+    pub(crate) fn abandon_created(&self) {
+        self.departure.request();
+    }
+
+    pub(crate) fn start(self: &Arc<Self>) -> Result<(), erhino_shared::call::SystemCallError> {
+        let thread = self.process.lifecycle.start_created(self.member)?;
+        debug_assert!(Arc::ptr_eq(self, &thread));
+        let batch = self
+            .ready_batch
+            .lock()
+            .take()
+            .ok_or(erhino_shared::call::SystemCallError::InternalError)?;
+        batch.publish_one(self.clone());
+        Ok(())
+    }
+
+    pub(crate) fn publish_ready(self: &Arc<Self>) {
+        let batch = self
+            .ready_batch
+            .lock()
+            .take()
+            .expect("Created thread must own a Ready admission");
+        self.departure.mark_started();
+        batch.publish_one(self.clone());
+    }
+
+    pub(crate) fn mark_started(&self) {
+        self.departure.mark_started();
     }
 
     pub(crate) fn defer_output_termination(&self, todo: super::lifecycle::TerminationTodo) {
@@ -4890,24 +4925,6 @@ impl Thread {
 
     pub fn frame_ptr(&self) -> *mut UserContext {
         self.frame.get()
-    }
-
-    pub(crate) fn mark_normal_exit(&self, code: i64) {
-        self.exit_code.store(code, Ordering::Relaxed);
-        assert!(
-            self.normal_exit
-                .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-                .is_ok(),
-            "thread normal exit recorded twice"
-        );
-    }
-
-    pub(crate) fn departure_kind(&self) -> super::thread::DepartureKind {
-        if self.normal_exit.load(Ordering::Acquire) {
-            super::thread::DepartureKind::Normal(self.exit_code.load(Ordering::Relaxed))
-        } else {
-            super::thread::DepartureKind::Terminated
-        }
     }
 
     pub(crate) const fn member(&self) -> super::lifecycle::MemberKey {
@@ -4951,7 +4968,7 @@ pub(crate) fn building_cutoff_selftest() {
     );
     let todo = process
         .lifecycle
-        .request_termination(ProcessExitReason::Killed, 0, None);
+        .request_termination(TerminationCause::Killed, TerminationDetail::PROCESS_CONTROL_KILL, None);
     assert!(
         !todo.reapable,
         "registered Building operation must delay termination"
@@ -4983,7 +5000,7 @@ pub(crate) fn building_cutoff_selftest() {
     assert_eq!(
         process.lifecycle.member_count(),
         0,
-        "post-cutoff Attach must not leave a Staging member"
+        "post-cutoff Attach must not leave a Created member"
     );
     drop(retired);
     assert!(
@@ -5028,12 +5045,12 @@ impl UnpublishedBound {
             .drain
             .take()
             .expect("unpublished bound drain reservation missing");
-        // 先冻结 Building，并把 Waiting/Staging 清理发布到出生时预付的
+        // 先冻结 Building，并把 Waiting/Created 清理发布到出生时预付的
         // termination debt；unpublished drain 在 REAPABLE 前只保留责任。
         process.assert_unpublished_rollback_entry();
         let todo = process
             .lifecycle
-            .request_termination(ProcessExitReason::Killed, 0, None);
+            .request_termination(TerminationCause::Killed, TerminationDetail::PROCESS_CONTROL_KILL, None);
         super::process::run_termination_todo(&process, todo);
         drain.publish(process);
     }
@@ -5135,7 +5152,7 @@ pub(crate) fn launch_bootstrap(
                 return Err(SpaceError::ReachLimit);
             }
         };
-        if handles.try_reserve(2).is_err() {
+        if handles.try_reserve(3).is_err() {
             handles.close(&process, true);
             return Err(SpaceError::NoFrame);
         }
@@ -5162,6 +5179,21 @@ pub(crate) fn launch_bootstrap(
             )
             .expect("bootstrap ProcessControl rights are static"),
         );
+        let thread_control = match super::thread::ThreadControl::new() {
+            Ok(control) => control,
+            Err(_) => {
+                handles.close(&process, true);
+                return Err(SpaceError::NoFrame);
+            }
+        };
+        handles.push(
+            super::handle::entry(
+                super::thread::ThreadControl::object_ref(&thread_control),
+                super::object::HandleRole::ThreadControl,
+                super::thread::CONTROL_MAX_RIGHTS,
+            )
+            .expect("bootstrap ThreadControl rights are static"),
+        );
 
         handles.push(
             super::handle::entry(
@@ -5174,11 +5206,6 @@ pub(crate) fn launch_bootstrap(
                     | erhino_shared::object::Rights::GRANT,
             )
             .expect("bootstrap root Pool rights are static"),
-        );
-        assert_eq!(
-            handles.entries().len(),
-            erhino_shared::startup::initial::HANDLE_COUNT,
-            "initial capability graph has an unexpected handle count"
         );
 
         let reservation = {
@@ -5195,12 +5222,30 @@ pub(crate) fn launch_bootstrap(
             }
         };
 
-        let block = match erhino_shared::startup::build_startup_prefix(
+        let control_handle = reservation
+            .handles()
+            .last()
+            .copied()
+            .expect("bootstrap ThreadControl handle missing");
+        let entry_descriptor = erhino_shared::startup::EntryThreadDescriptor {
+            kind: erhino_shared::startup::ENTRY_THREAD_SECTION_KIND,
+            version: erhino_shared::startup::ENTRY_THREAD_SECTION_VERSION,
+            section_len: core::mem::size_of::<
+                erhino_shared::startup::EntryThreadDescriptor,
+            >() as u32,
+            control: control_handle,
+            stack_reservation_start: (USER_TOP - STACK_SIZE) as u64,
+            stack_reservation_len: STACK_SIZE as u64,
+            usable_start: (USER_TOP - STACK_SIZE) as u64,
+            usable_len: STACK_SIZE as u64,
+        };
+        let block = match erhino_shared::startup::build_startup_prefix_with_entry(
             process.pid,
             process.parent,
             reservation.handles(),
             PAGE_SIZE,
             payload.len(),
+            entry_descriptor,
         ) {
             Ok(block) => block,
             Err(error) => {
@@ -5314,25 +5359,17 @@ pub(crate) fn launch_bootstrap(
                 return Err(SpaceError::NoFrame);
             }
         };
-        let mut staged = Vec::new();
-        if staged.try_reserve_exact(1).is_err() {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("launch reservation must remain owned");
-            for handle in handles {
-                super::handle::close_entry_infallible(handle, &process, true);
-            }
-            return Err(SpaceError::NoFrame);
-        }
-        match process.attach_thread(ThreadStartContext {
+        process.bind_execution(requirement, domain);
+        let (_, created_thread) = match process.attach_thread_with_control(
+            ThreadStartContext {
             entry: entry as u64,
             stack_pointer: USER_TOP as u64,
             arg1: block_va as u64,
             arg2: block_len as u64,
-        }) {
-            Ok(_) => {}
+            },
+            &thread_control,
+        ) {
+            Ok(thread) => thread,
             Err(ThreadAttachError::Context(error)) => {
                 process
                     .handles
@@ -5358,7 +5395,8 @@ pub(crate) fn launch_bootstrap(
             Err(ThreadAttachError::Closed | ThreadAttachError::Limit) => {
                 unreachable!("bootstrap attach must target an empty Building process")
             }
-        }
+        };
+        thread_control.bind_thread(&created_thread);
         let mut table = process.handles.lock();
         let prepared = match table.prepare_commit(reservation, handles.take()) {
             Ok(prepared) => prepared,
@@ -5390,23 +5428,27 @@ pub(crate) fn launch_bootstrap(
         // 唯一不可逆提交段：HandleTable → Job owner → lifecycle 顺序取锁，
         // capability、成员身份、Running 状态和 execution binding 在释放任一
         // 发布锁前全部完成；之后只剩 Ready admission 与未发布 drain 槽取消。
+        let mut ready_head = None;
         process.mark_job_member_committed();
         job.commit_member_with(member, process.clone(), || {
             table.commit_prepared(prepared);
-            process
-                .lifecycle
-                .begin_running(1, &mut staged)
-                .expect("bootstrap process cannot be terminating");
-            process.bind_execution(requirement, domain);
+            ready_head = Some(
+                process
+                    .lifecycle
+                    .begin_running(1)
+                    .expect("bootstrap process cannot be terminating")
+                    .expect("bootstrap thread missing"),
+            );
         });
         drop(table);
-        let thread = staged.pop().expect("bootstrap staging thread missing");
         drop(
             unpublished
                 .take()
                 .expect("bootstrap publish lost unpublished bound owner")
                 .publish(),
         );
+        let thread = ready_head.expect("bootstrap thread missing");
+        thread.mark_started();
         Ok(ready_batch.admit(thread))
     })();
     match result {

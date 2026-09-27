@@ -35,12 +35,12 @@ use rinlib::{
         mem::MemoryProtection,
         object::{Handle, ObjectSignals},
         proc::{
-            ExecutionProfile, JobMemberKind, ThreadSpawnResult, ThreadStartContext,
+            ExecutionProfile, JobMemberKind, ThreadCreateResult, ThreadStartContext,
             PROCESS_MAX_THREADS, PROCESS_PAGE_SIZE,
         },
         wait::WaitItem,
     },
-    sys_exit, sys_sleep, thread,
+    sys_process_terminate, sys_sleep, thread,
 };
 
 fn main() {
@@ -132,10 +132,29 @@ fn execute(
         Err(error) => return done::<()>(Err(error)),
     };
     match cmd.action {
-        ACTION_KILL => done(process::kill(capability.as_handle(), cmd.code as i64)),
+        ACTION_KILL => match process::kill(capability.as_handle()) {
+            Ok(process::KillOutcome::Accepted) => (
+                Report {
+                    status: 0,
+                    aux0: 0,
+                    aux1: 0,
+                },
+                alloc::vec::Vec::new(),
+            ),
+            Ok(process::KillOutcome::AlreadyTerminating) => (
+                Report {
+                    status: 0,
+                    aux0: 1,
+                    aux1: 0,
+                },
+                alloc::vec::Vec::new(),
+            ),
+            Err(error) => done::<()>(Err(error)),
+        },
         ACTION_START => {
             let builder = capability.into_raw();
-            let result = process::start(builder, ExecutionProfile::Base64 as u32);
+            let result = process::bind_execution(builder, ExecutionProfile::Base64 as u32)
+                .and_then(|_| process::start(builder));
             if result.is_err() {
                 // SAFETY: 从运输 owner 取出的 builder，失败未消费且无其他 owner。
                 let _ = unsafe { close(builder) };
@@ -285,7 +304,7 @@ fn target_mode(words: &[u64]) {
         thread_spawn_race(gun);
     }
     if role == TARGET_LAST_THREAD_EXIT_RACE {
-        last_thread_exit_target(gun, words.get(2).copied().unwrap_or(0) as i64);
+        last_thread_exit_target(gun, words.get(2).copied().unwrap_or(0));
     }
     if role == TARGET_TUNNEL_EXIT {
         tunnel_exit_target(gun);
@@ -293,10 +312,9 @@ fn target_mode(words: &[u64]) {
     await_gun(gun);
     match role {
         TARGET_SUICIDE => {
-            let code = words.get(2).copied().unwrap_or(0) as i64;
-            debug!("hammer target: exiting with {}", code);
-            // SAFETY: 值参数；本进程经 Exit 自灭。
-            unsafe { sys_exit(code).expect("hammer target exit") };
+            debug!("hammer target: terminating");
+            // SAFETY: 值参数；本进程主动结束。
+            unsafe { sys_process_terminate() }
         }
         TARGET_FAULT => {
             debug!("hammer target: faulting");
@@ -308,7 +326,7 @@ fn target_mode(words: &[u64]) {
         TARGET_GUARD_FAULT => guard_fault(),
         TARGET_THREAD_SUITE => {
             thread_suite();
-            thread::exit(0x8b);
+            unsafe { rinlib::sys_thread_exit() }
         }
         TARGET_PARK => loop {
             // SAFETY: 值参数；高频 park 供 kill 取消线竞速。
@@ -370,7 +388,7 @@ fn tunnel_exit_target(gun: Handle) -> ! {
     }
     await_gun(gun);
     // Endpoint remains live in the process table; ProcessDrain must close its mapping lease.
-    thread::exit(0x8c)
+    unsafe { rinlib::sys_thread_exit() }
 }
 
 type RawThreadEntry = extern "C" fn(usize, usize) -> !;
@@ -380,23 +398,24 @@ fn raw_spawn(
     stack_pointer: usize,
     arg1: usize,
     arg2: usize,
-) -> Result<ThreadSpawnResult, SystemCallError> {
+) -> Result<ThreadCreateResult, SystemCallError> {
     let context = ThreadStartContext {
         entry: entry as *const () as usize as u64,
         stack_pointer: stack_pointer as u64,
         arg1: arg1 as u64,
         arg2: arg2 as u64,
     };
-    let mut result = ThreadSpawnResult {
+    let mut result = ThreadCreateResult {
         tid: 0,
         reserved: 0,
         control: Handle::INVALID,
     };
     // SAFETY: context/result live for the synchronous call; the caller owns a mapped stack.
     unsafe { thread::spawn_raw(&context, &mut result) }?;
+    unsafe { thread::start_raw(result.control) }?;
     assert!(
         result.tid != 0 && result.reserved == 0 && result.control.is_valid(),
-        "raw ThreadSpawn returned an invalid result"
+        "raw ThreadCreate returned an invalid result"
     );
     Ok(result)
 }
@@ -434,15 +453,15 @@ fn thread_spawn_race(gun: Handle) -> ! {
     }
 }
 
-extern "C" fn last_thread_exit_entry(gun: usize, code: usize) -> ! {
+extern "C" fn last_thread_exit_entry(gun: usize, _token: usize) -> ! {
     // 让创建者主线程先完成 ThreadExit；随后再消费电平枪进入末线程竞速。
     // SAFETY: 值参数；sleep 后仍由 Notification 电平保存发令。
     unsafe { sys_sleep(20).expect("last secondary setup sleep failed") };
     await_gun(Handle::from_raw(gun as u64));
-    thread::exit(code as i64)
+    unsafe { rinlib::sys_thread_exit() }
 }
 
-fn last_thread_exit_target(gun: Handle, code: i64) -> ! {
+fn last_thread_exit_target(gun: Handle, token: u64) -> ! {
     let stack = raw_stack(PROCESS_PAGE_SIZE);
     let stack_pointer = stack
         .usable()
@@ -452,13 +471,13 @@ fn last_thread_exit_target(gun: Handle, code: i64) -> ! {
         last_thread_exit_entry,
         stack_pointer,
         gun.raw() as usize,
-        code as usize,
+        token as usize,
     )
     .expect("last-thread raw spawn failed");
     unsafe { close(result.control) }.expect("last-thread ThreadControl close failed");
     // raw stack mapping stays owned by this process address space until process drain.
     debug!("hammer target: last secondary thread ready");
-    thread::exit(0)
+    unsafe { rinlib::sys_thread_exit() }
 }
 
 struct DropMarker(Arc<AtomicBool>);
@@ -509,11 +528,11 @@ extern "C" fn storm_thread_entry(gate: usize, _unused: usize) -> ! {
         thread::yield_now().expect("storm worker yield failed");
     }
     gate.exiting.fetch_add(1, Ordering::Release);
-    thread::exit(0)
+    unsafe { rinlib::sys_thread_exit() }
 }
 
 extern "C" fn probe_thread_entry(_arg1: usize, _arg2: usize) -> ! {
-    thread::exit(0)
+    unsafe { rinlib::sys_thread_exit() }
 }
 
 fn raw_thread_storm() {
@@ -543,7 +562,7 @@ fn raw_thread_storm() {
     assert_eq!(
         raw_spawn(storm_thread_entry, probe_stack, gate_pointer, 0).unwrap_err(),
         SystemCallError::ReachLimit,
-        "ThreadSpawn did not enforce PROCESS_MAX_THREADS"
+        "ThreadCreate did not enforce PROCESS_MAX_THREADS"
     );
 
     while gate.started.load(Ordering::Acquire) != child_count {

@@ -1,11 +1,23 @@
 use core::{alloc::Layout, panic::PanicInfo};
 use erhino_shared::sync::spin::SimpleLock;
-use erhino_shared::{mem::MemoryProtection, proc::Termination};
+use erhino_shared::mem::MemoryProtection;
 use talc::{TalcLock, base::Talc, base::binning::Binning, source::Source};
 
 use crate::env;
 use crate::mm::{MappedRegion, Placement};
-use crate::{call::sys_exit, debug};
+use crate::{call::{sys_process_abort, sys_thread_exit}, debug};
+
+trait ProgramOutcome {
+    fn succeeded(self) -> bool;
+}
+
+impl ProgramOutcome for () {
+    fn succeeded(self) -> bool { true }
+}
+
+impl<E> ProgramOutcome for Result<(), E> {
+    fn succeeded(self) -> bool { self.is_ok() }
+}
 
 const INITIAL_ARENA_BYTES: usize = 64 * 1024;
 const MAX_GEOMETRIC_ARENA_BYTES: usize = 16 * 1024 * 1024;
@@ -68,7 +80,7 @@ unsafe impl Source for HeapSource {
 static HEAP_ALLOCATOR: TalcLock<SimpleLock, HeapSource> = TalcLock::new(HeapSource::new());
 
 #[lang = "start"]
-fn lang_start<T: Termination + 'static>(
+fn lang_start<T: ProgramOutcome + 'static>(
     main: fn() -> T,
     argc: isize,
     argv: *const *const u8,
@@ -90,11 +102,10 @@ fn lang_start<T: Termination + 'static>(
     }
     // 信号分发说明：内核只做置位与唤醒，进程级信号的接收/分发由程序
     // 自行安排（监听线程模式待多线程里程碑接入 rt；见 notes/ideas/signal.md）。
-    let code = main().to_exit_code();
-    unsafe {
-        loop {
-            sys_exit(code).expect("this can't be wrong");
-        }
+    if main().succeeded() {
+        unsafe { sys_thread_exit() }
+    } else {
+        unsafe { sys_process_abort() }
     }
 }
 
@@ -110,11 +121,7 @@ fn handle_panic(info: &PanicInfo) -> ! {
     } else {
         debug!("Panicking: no information available.");
     }
-    unsafe {
-        loop {
-            sys_exit(-1).expect("this can't be wrong");
-        }
-    }
+    unsafe { sys_process_abort() }
 }
 
 #[alloc_error_handler]

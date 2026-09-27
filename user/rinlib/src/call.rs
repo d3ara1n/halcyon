@@ -9,9 +9,9 @@ use erhino_shared::{
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
     object::{Handle, HandleDescription, HandlePair, Rights, SenderResult},
     proc::{
-        ExitCode, HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
-        ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadSpawnResult,
-        ThreadStartContext, Tid,
+        HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
+        ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadCreateResult,
+        ThreadStartContext,
     },
     reset::{ResetAction, ResetReason},
     time::{ClockSnapshot, Deadline},
@@ -212,8 +212,14 @@ pub(crate) unsafe fn sys_memory_object_seal(object: Handle) -> SystemCallResult<
 ///
 /// # Safety
 /// 调用者不得依赖成功返回后的任何栈上或线程局部资源。
-pub unsafe fn sys_exit(code: ExitCode) -> SystemCallResult<()> {
-    sys_call(SystemCall::Exit, code as usize, 0, 0, 0).map(|_| ())
+pub unsafe fn sys_process_terminate() -> ! {
+    let _ = sys_call(SystemCall::ProcessTerminate, 0, 0, 0, 0);
+    panic!("ProcessTerminate unexpectedly returned")
+}
+
+pub unsafe fn sys_process_abort() -> ! {
+    let _ = sys_call(SystemCall::ProcessAbort, 0, 0, 0, 0);
+    panic!("ProcessAbort unexpectedly returned")
 }
 
 pub unsafe fn sys_job_create(
@@ -329,15 +335,14 @@ pub unsafe fn sys_process_query(
     .map(|_| ())
 }
 
-pub unsafe fn sys_process_kill(control: Handle, code: i64) -> SystemCallResult<()> {
+pub unsafe fn sys_process_kill(control: Handle) -> SystemCallResult<usize> {
     sys_call(
         SystemCall::ProcessKill,
         control.raw() as usize,
-        code as usize,
+        0,
         0,
         0,
     )
-    .map(|_| ())
 }
 
 pub unsafe fn sys_process_drain(
@@ -386,9 +391,23 @@ pub unsafe fn sys_process_write(
     .map(|_| ())
 }
 
-pub unsafe fn sys_process_start(builder: Handle, profile: u32) -> SystemCallResult<()> {
+pub unsafe fn sys_process_start(builder: Handle) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ProcessStart,
+        builder.raw() as usize,
+        0,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_process_bind_execution(
+    builder: Handle,
+    profile: u32,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::ProcessBindExecution,
         builder.raw() as usize,
         profile as usize,
         0,
@@ -397,18 +416,19 @@ pub unsafe fn sys_process_start(builder: Handle, profile: u32) -> SystemCallResu
     .map(|_| ())
 }
 
-pub unsafe fn sys_process_attach(
-    builder: Handle,
+pub unsafe fn sys_thread_create(
+    target: Handle,
     descriptor: &ThreadStartContext,
-) -> SystemCallResult<Tid> {
+    result: &mut ThreadCreateResult,
+) -> SystemCallResult<()> {
     sys_call(
-        SystemCall::ProcessAttach,
-        builder.raw() as usize,
+        SystemCall::ThreadCreate,
+        target.raw() as usize,
         descriptor as *const ThreadStartContext as usize,
-        0,
+        result as *mut ThreadCreateResult as usize,
         0,
     )
-    .map(|tid| tid as Tid)
+    .map(|_| ())
 }
 
 pub unsafe fn sys_process_grant(
@@ -426,29 +446,19 @@ pub unsafe fn sys_process_grant(
     .map(|_| ())
 }
 
-pub unsafe fn sys_thread_spawn(
-    context: &ThreadStartContext,
-    result: &mut ThreadSpawnResult,
-) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::ThreadSpawn,
-        context as *const ThreadStartContext as usize,
-        result as *mut ThreadSpawnResult as usize,
-        0,
-        0,
-    )
-    .map(|_| ())
+pub unsafe fn sys_thread_start(control: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::ThreadStart, control.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
 pub unsafe fn sys_thread_yield() -> SystemCallResult<()> {
     sys_call(SystemCall::ThreadYield, 0, 0, 0, 0).map(|_| ())
 }
 
-pub unsafe fn sys_thread_exit(code: i64) -> ! {
+pub unsafe fn sys_thread_exit() -> ! {
     let _ = unsafe {
         raw_call(
             SystemCall::ThreadExit as usize,
-            code as usize,
+            0,
             0,
             0,
             0,

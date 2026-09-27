@@ -16,6 +16,8 @@ pub const STARTUP_VERSION: u16 = 2;
 
 /// 块基魔数（"STARTUPB"）。
 pub const STARTUP_BLOCK_MAGIC: u64 = u64::from_le_bytes(*b"STARTUPB");
+pub const ENTRY_THREAD_SECTION_KIND: u16 = 1;
+pub const ENTRY_THREAD_SECTION_VERSION: u16 = 1;
 
 /// initial process 固定 capability 图中的 Handle 索引。
 pub mod initial {
@@ -44,11 +46,33 @@ pub struct StartupBlockHeader {
     /// payload 相对块基的偏移；不得早于 Handle 数组末尾。
     pub payload_off: u32,
     pub payload_len: u32,
+    pub entry_descriptor_off: u32,
+    pub entry_descriptor_len: u32,
     pub reserved: u32,
 }
 
+/// StartupBlock payload 起始处的必需入口线程 section。section 由 launcher
+/// 先以 INVALID control 写入，再在 ThreadCreate 成功后回填 child-local 值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct EntryThreadDescriptor {
+    pub kind: u16,
+    pub version: u16,
+    pub section_len: u32,
+    pub control: Handle,
+    pub stack_reservation_start: u64,
+    pub stack_reservation_len: u64,
+    pub usable_start: u64,
+    pub usable_len: u64,
+}
+
 const _: () = {
-    assert!(core::mem::size_of::<StartupBlockHeader>() == 48);
+    assert!(core::mem::size_of::<EntryThreadDescriptor>() == 48);
+    assert!(core::mem::align_of::<EntryThreadDescriptor>() == 8);
+};
+
+const _: () = {
+    assert!(core::mem::size_of::<StartupBlockHeader>() == 56);
     assert!(core::mem::align_of::<StartupBlockHeader>() == 8);
 };
 
@@ -73,6 +97,8 @@ pub enum StartupParseError {
     PayloadBeforeHandles,
     NonzeroPadding,
     InvalidHandle,
+    MissingEntryThread,
+    BadEntryThread,
 }
 
 /// 校验内核定义的 outer 几何并返回已解码 header。输入无需对齐。
@@ -110,7 +136,23 @@ pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, Startu
     if payload_end != block.len() {
         return Err(StartupParseError::LengthMismatch);
     }
-    if block[handles_end..payload_off]
+    let descriptor_off = if header.entry_descriptor_len == 0 {
+        payload_off
+    } else {
+        header.entry_descriptor_off as usize
+    };
+    let descriptor_end = descriptor_off
+        .checked_add(header.entry_descriptor_len as usize)
+        .ok_or(StartupParseError::GeometryOverflow)?;
+    if header.entry_descriptor_len as usize != 0
+        && (descriptor_off < handles_end || descriptor_end > payload_off)
+    {
+        return Err(StartupParseError::GeometryOverflow);
+    }
+    if block[handles_end..descriptor_off]
+        .iter()
+        .any(|byte| *byte != 0)
+        || block[descriptor_end..payload_off]
         .iter()
         .any(|byte| *byte != 0)
     {
@@ -127,6 +169,110 @@ pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, Startu
         }
     }
     Ok(header)
+}
+
+/// 校验并解码 payload 起始处的入口线程 section，返回 descriptor 与业务 payload。
+pub fn entry_thread_descriptor(
+    block: &[u8],
+    header: StartupBlockHeader,
+) -> Result<(EntryThreadDescriptor, &[u8]), StartupParseError> {
+    if header.entry_descriptor_len as usize != core::mem::size_of::<EntryThreadDescriptor>() {
+        return Err(StartupParseError::MissingEntryThread);
+    }
+    let descriptor_start = header.entry_descriptor_off as usize;
+    let descriptor = unsafe {
+        core::ptr::read_unaligned(
+            block.as_ptr().add(descriptor_start).cast::<EntryThreadDescriptor>(),
+        )
+    };
+    let stack_end = descriptor
+        .stack_reservation_start
+        .checked_add(descriptor.stack_reservation_len);
+    let usable_end = descriptor.usable_start.checked_add(descriptor.usable_len);
+    if descriptor.kind != ENTRY_THREAD_SECTION_KIND
+        || descriptor.version != ENTRY_THREAD_SECTION_VERSION
+        || descriptor.section_len as usize != core::mem::size_of::<EntryThreadDescriptor>()
+        || !descriptor.control.is_valid()
+        || descriptor.stack_reservation_len == 0
+        || descriptor.usable_len == 0
+        || descriptor.usable_start < descriptor.stack_reservation_start
+        || !matches!((stack_end, usable_end), (Some(stack_end), Some(usable_end)) if usable_end <= stack_end)
+    {
+        return Err(StartupParseError::BadEntryThread);
+    }
+    Ok((
+        descriptor,
+        &block[header.payload_off as usize..],
+    ))
+}
+
+pub fn build_startup_block_with_entry(
+    pid: Pid,
+    parent_pid: Pid,
+    handles: &[Handle],
+    entry: EntryThreadDescriptor,
+    payload: &[u8],
+) -> Result<Vec<u8>, StartupBuildError> {
+    let descriptor_off = core::mem::size_of::<StartupBlockHeader>()
+        .checked_add(handles.len() * core::mem::size_of::<Handle>())
+        .ok_or(StartupBuildError::Overflow)?;
+    let payload_off = descriptor_off
+        .checked_add(core::mem::size_of::<EntryThreadDescriptor>())
+        .ok_or(StartupBuildError::Overflow)?;
+    let mut block = build_startup_prefix_with_entry(
+        pid,
+        parent_pid,
+        handles,
+        payload_off,
+        payload.len(),
+        entry,
+    )?;
+    block.try_reserve_exact(payload.len()).map_err(|_| StartupBuildError::AllocationFailed)?;
+    block.extend_from_slice(payload);
+    Ok(block)
+}
+
+pub fn build_startup_prefix_with_entry(
+    pid: Pid,
+    parent_pid: Pid,
+    handles: &[Handle],
+    payload_off: usize,
+    payload_len: usize,
+    entry: EntryThreadDescriptor,
+) -> Result<Vec<u8>, StartupBuildError> {
+    let descriptor_off = core::mem::size_of::<StartupBlockHeader>()
+        .checked_add(handles.len() * core::mem::size_of::<Handle>())
+        .ok_or(StartupBuildError::Overflow)?;
+    let descriptor_end = descriptor_off
+        .checked_add(core::mem::size_of::<EntryThreadDescriptor>())
+        .ok_or(StartupBuildError::Overflow)?;
+    if payload_off < descriptor_end {
+        return Err(StartupBuildError::Overflow);
+    }
+    let mut block = build_startup_prefix(
+        pid,
+        parent_pid,
+        handles,
+        payload_off,
+        payload_len,
+    )?;
+    let descriptor_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&entry as *const EntryThreadDescriptor).cast::<u8>(),
+            core::mem::size_of::<EntryThreadDescriptor>(),
+        )
+    };
+    block[descriptor_off..descriptor_end].copy_from_slice(descriptor_bytes);
+    let mut header =
+        unsafe { core::ptr::read_unaligned(block.as_ptr().cast::<StartupBlockHeader>()) };
+    header.entry_descriptor_off =
+        u32::try_from(descriptor_off).map_err(|_| StartupBuildError::Overflow)?;
+    header.entry_descriptor_len =
+        u32::try_from(descriptor_bytes.len()).map_err(|_| StartupBuildError::Overflow)?;
+    unsafe {
+        core::ptr::write_unaligned(block.as_mut_ptr().cast::<StartupBlockHeader>(), header);
+    }
+    Ok(block)
 }
 
 /// 以实际 child-local Handle 构造完整、紧凑的启动块。
@@ -185,6 +331,8 @@ pub fn build_startup_prefix(
         handle_count: u32::try_from(handles.len()).map_err(|_| StartupBuildError::Overflow)?,
         payload_off: u32::try_from(payload_off).map_err(|_| StartupBuildError::Overflow)?,
         payload_len: u32::try_from(payload_len).map_err(|_| StartupBuildError::Overflow)?,
+        entry_descriptor_off: 0,
+        entry_descriptor_len: 0,
         reserved: 0,
     };
 

@@ -1,7 +1,5 @@
 use crate::object::{Handle, Rights};
 
-/// ExitCode(i64) type for process
-pub type ExitCode = i64;
 /// Pid(u64) type for process；单调不复用，宽度与 ProcessId 一致。
 pub type Pid = u64;
 /// Tid(u32) type for thread
@@ -80,8 +78,7 @@ pub struct HandleGrant {
     pub rights: Rights,
 }
 
-/// 线程出生现场，由 ProcessAttach（Building 外部通道）与 ThreadSpawn
-/// （Running 内部通道）共用。所有地址都是目标进程用户 VA；entry 必须位于
+/// 线程出生现场，由 ThreadCreate 的 Building 外部通道与 Running 自身通道共用。所有地址都是目标进程用户 VA；entry 必须位于
 /// 可执行页，sp 已映射且 16 字节对齐（内核做 translate 前置校验，运行期
 /// fault 走用户 fault 杀进程）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,18 +95,18 @@ const _: () = {
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
 };
 
-/// ThreadSpawn 同步输出；control 是等待 DONE 的 ThreadControl handle。
+/// ThreadCreate 同步输出；control 是目标表内的 ThreadControl handle。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
-pub struct ThreadSpawnResult {
+pub struct ThreadCreateResult {
     pub tid: Tid,
     pub reserved: u32,
     pub control: Handle,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<ThreadSpawnResult>() == 16);
-    assert!(core::mem::align_of::<ThreadSpawnResult>() == 8);
+    assert!(core::mem::size_of::<ThreadCreateResult>() == 16);
+    assert!(core::mem::align_of::<ThreadCreateResult>() == 8);
 };
 
 /// ProcessControl 固定宽状态快照。
@@ -119,8 +116,8 @@ pub struct ProcessSnapshot {
     pub pid: Pid,
     pub parent_pid: Pid,
     pub state: u32,
-    pub reason: u32,
-    pub code: i64,
+    pub cause: u32,
+    pub detail: TerminationDetail,
     pub reserved: u64,
 }
 
@@ -134,22 +131,45 @@ pub enum ProcessState {
     Dead = 3,
 }
 
-/// 终因判别值（`ProcessSnapshot::reason`）。
-/// Building/Running 要求 reason=None 且 code=0；Abandoned 的 code 固定为 0；
-/// Terminating/Dead 的终因在首次终止线性化点冻结。
+/// 终因判别值（`ProcessSnapshot::cause`）。
+/// Building/Running 要求 None、零 detail；Terminating/Dead 在首次终止点冻结。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum ProcessExitReason {
+pub enum TerminationCause {
     None = 0,
-    Exited = 1,
-    Fault = 2,
-    Killed = 3,
-    Abandoned = 4,
+    Completed = 1,
+    Terminated = 2,
+    Aborted = 3,
+    Killed = 4,
+    Faulted = 5,
+    Abandoned = 6,
+}
+
+/// 终因附带的内核事实。Faulted: word0 低 32 位是 tid，高 32 位是
+/// ProcessFaultCode；word1 是故障用户 VA。Killed: word0=1 表示
+/// ProcessControl 请求；其余原因两个 word 均为零。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub struct TerminationDetail {
+    pub word0: u64,
+    pub word1: u64,
+}
+
+impl TerminationDetail {
+    pub const NONE: Self = Self { word0: 0, word1: 0 };
+    pub const PROCESS_CONTROL_KILL: Self = Self { word0: 1, word1: 0 };
+
+    pub const fn fault(tid: Tid, kind: ProcessFaultCode, address: u64) -> Self {
+        Self {
+            word0: (tid as u64) | ((kind as u64) << 32),
+            word1: address,
+        }
+    }
 }
 
 /// Fault 终因的稳定编码；不把裸 `scause` 固化为生命周期 ABI。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i64)]
+#[repr(u32)]
 pub enum ProcessFaultCode {
     Unknown = 0,
     InstructionAccess = 1,
@@ -160,6 +180,8 @@ pub enum ProcessFaultCode {
     InstructionMisaligned = 6,
     LoadMisaligned = 7,
     StoreMisaligned = 8,
+    /// syscall 用户内存访问或已提交结果的输出复检失败。
+    UserAccess = 9,
 }
 
 impl ProcessFaultCode {
@@ -261,40 +283,15 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessCreateResult>() == 32);
     assert!(core::mem::size_of::<HandleGrant>() == 16);
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
-    assert!(core::mem::size_of::<ProcessSnapshot>() == 40);
-    assert!(core::mem::size_of::<ThreadSpawnResult>() == 16);
+    assert!(core::mem::size_of::<ProcessSnapshot>() == 48);
+    assert!(core::mem::size_of::<ThreadCreateResult>() == 16);
     assert!(core::mem::size_of::<ProcessDrainResult>() == 16);
     assert!(core::mem::size_of::<ProcessState>() == 4);
-    assert!(core::mem::size_of::<ProcessExitReason>() == 4);
+    assert!(core::mem::size_of::<TerminationCause>() == 4);
+    assert!(core::mem::size_of::<TerminationDetail>() == 16);
     assert!(core::mem::size_of::<ProcessDrainStatus>() == 4);
     assert!(core::mem::size_of::<JobSnapshot>() == 40);
     assert!(core::mem::size_of::<JobState>() == 4);
     assert!(core::mem::size_of::<JobMemberKind>() == 4);
     assert!(core::mem::size_of::<JobEnumerateResult>() == 16);
 };
-/// Process's main function product
-pub trait Termination {
-    /// Get completed process's exit code
-    fn to_exit_code(self) -> ExitCode;
-}
-
-impl Termination for () {
-    fn to_exit_code(self) -> ExitCode {
-        0
-    }
-}
-
-impl Termination for bool {
-    fn to_exit_code(self) -> ExitCode {
-        if self { 0 } else { -1 }
-    }
-}
-
-/// ExitCode for process result which treated as Termination
-pub type ProgramResult = Result<(), ExitCode>;
-
-impl Termination for ProgramResult {
-    fn to_exit_code(self) -> ExitCode {
-        if let Err(code) = self { code } else { 0 }
-    }
-}

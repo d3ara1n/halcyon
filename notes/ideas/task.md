@@ -37,7 +37,7 @@ Building -> Running -> Terminating -> Dead
 
 Building 不是一笔必须整体回滚的大事务，而是若干各自原子的资源附入：内存绑定、Map/Write、capability Grant、线程 Attach 以及未来其它资源绑定分别完成，成功项立即属于目标；后续失败不把已经交付的 capability 或资源倒流回组装者。`ProcessBindMemory` 是唯一页资源绑定操作，消费 Pool Handle 并把 AddressSpace 从 Unbound 转为 Bound；绑定事务语义由[内存模型](mm.md)唯一拥有。未绑定进程仍是合法 Building 壳，可以接收不依赖地址空间的 grants，也可以被放弃或终止。
 
-ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止点。执行需求在第一次线程创建前由独立 Building 绑定固定，线程创建据此取得全寿命调度准入；Start 不再接收执行描述、不选择调度域、不分配交接或调度结构，只确认内存已绑定、至少一条挂起线程已创建、Job 启动门开放、除 Start 自身外没有 Building 操作在途，然后关闭组装权并以有界尾段发布全部已准备的挂起线程。Start 可以因并发终止、Job seal 或在途组装被拒绝，但不因资源不足失败。Building 操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、ThreadCreate 或 Bind。
+ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止点。执行需求在第一次线程创建前由独立 Building 绑定固定，线程创建据此取得全寿命调度准入；Start 不再接收执行描述、不选择调度域、不分配交接或调度结构，只确认内存已绑定、至少一条挂起线程已创建、Job 启动门开放、除 Start 自身外没有 Building 操作在途，然后关闭组装权并摘取预留发布链，发布全部已准备的挂起线程。Start 可以因并发终止、Job seal 或在途组装被拒绝，但不因资源不足失败。Building 操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、ThreadCreate 或 Bind。
 
 Terminating 阶段禁止新线程和新等待，撤销 Ready、取消 Waiting，并等待各 hart 上的 Running 线程离场。随后管理者以有界操作先收束 HandleTable，再收束地址空间；Unbound 地址空间直接完成该阶段，Bound 地址空间只有在事务、lease、backing 与页表全部经有界 drain 释放后才完成。全部资源收束后进程进入 Dead，ProcessControl 的 CLOSED 才发布，因此等待 CLOSED 是资源收束完成屏障，不只是终止请求已受理。
 
@@ -52,7 +52,7 @@ Completed（末线程离场）、ProcessTerminate、fault、ProcessKill 与 Buil
 | `Completed` | 所有线程离场，进程达成完成 | 无 |
 | `Terminated` | 进程主动 `ProcessTerminate()`，未达成完成即结束 | 无 |
 | `Aborted` | 所选 runtime 判定程序无法继续（panic、OOM、入口返回错误）并调用 `ProcessAbort()` | 无 |
-| `Killed` | 经 ProcessControl 或 Job authority 终止 | 发起来源类别 |
+| `Killed` | 经 ProcessControl authority 终止；JobKill 最终也使用此机制 | 实际内核入口类别，不记录调用者提供的数值 |
 | `Faulted` | 内核检测到不可恢复用户 fault | tid、稳定 fault 类型、地址 |
 | `Abandoned` | Building 期未 Start 即放弃 | 无 |
 

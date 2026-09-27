@@ -37,20 +37,12 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、payload
 - **ProcessBindMemory**：以 Pool GRANT authority 一次性把 shell 绑定为完整 AddressSpace；成功消费传入 Pool Handle，失败保留；
 - ProcessMap/Write：只接受精确 Building 且已 Bound 的 process，完成匿名零页映射与 backing 回填；
 - **ProcessGrant**：把 grants 从组装者表移入目标表，输出目标侧句柄值数组（组装者写入出生块）；
-- **ProcessAttach**：向已 Bound 的 Building process 附入线程（`ThreadStartContext`：entry/sp/arg1/arg2），返回 tid；内核不分配用户栈与出生块，无观察壳；该现场类型也供 Running 期 ThreadSpawn 使用；
-- **ProcessStart**：Bound readiness + 活体检查门（已附线程 ≥1）→ `Building → Running` → 一次冻结 execution binding → 预育线程整体入册；消费 builder。profile 为平铺参数。
-
-ProcessBuilder 不可 duplicate，最后一个 builder 关闭触发 Building abandonment（预育线程与已装句柄随收束消解）。ProcessMap 最终权限拒绝 W+X；ProcessWrite 不要求最终 PTE 可写。
-
-### 四 op 事务
-
-**ProcessBindMemory**：精确 BuildingLease 登记 → 同一 shell 的原子 Bind reservation → 调用者表 `pin_transfer`，把 builder 作为受保护 authority、Pool entry 作为 consume-on-success authority，统一拒绝 alias/错误 role/rights/pin 冲突 → 锁外准备 AddressSpace metadata permit、单页 funded root、kernel shared root 与 ledger → HandleTable→AddressSpace 双锁内复检 Unbound、发布 Bound 并逻辑摘出 Pool entry → 锁外完成 close 尾段。重复串行 Bind 返回 ObjectNotAvailable，并发 Bind 返回 ObjectBusy；提交前任意失败恢复 pin 并保留 Pool Handle。
-
-**ProcessGrant**：BuildingLease 登记准入 → 调用者表 `pin_transfer`，把 builder 作为受保护 authority、grants 作为待搬移集合统一验证（MANAGE/GRANT、rights 子集、去重、拒绝 builder 自授予）→ 目标表 reserve 槽位与 moved 缓冲预留 → 输出目标句柄值（copy_to_user，失败 rollback + unpin）→ `commit_pinned_transfer` 只提取 grants 并原样恢复 builder → 目标表 commit。成功即一次独立完成的所有权转移；后续组装失败不会把 handles 还给调用者，libprocess 以 `SpawnFailure.grants = Consumed` 明示。单批上界由 shared `PROCESS_MAX_GRANTS` 唯一定义；组装侧超限在建进程前报 `TooManyGrants`。rinlib 安全封装要求 grants/output 等长，裸 syscall 不暴露第二个长度。
-
-**ProcessAttach**：拷入 `ThreadStartContext` → 精确 BuildingLease 登记 → `Process::attach_thread_registered` 校验出生现场（entry 可执行、sp 可写且 16 对齐）→ `lifecycle::attach_registered_member(闭包)` 在 lifecycle 锁内构造线程并决定归宿。若此时仍为 Building，检查表长上限（`PROCESS_MAX_THREADS` 1024）、try_reserve 容量、分配 tid 并插入 Staging；若终止在 lease 登记后截止，登记资格不被撤销，调用仍成功取得 tid，但新线程不入容器而作为终止接管资源在 lifecycle 锁外析构。Context/Limit/Oom 失败均无成员副作用；终止若先于 lease 则入口直接返回 ObjectClosed。bootstrap 在无并发条件下复用 `Process::attach_thread → attach_member` 的精确 Building 路径。Staging 强引用与 `Thread.process` 构成的环仅存在于 Building 期，终止游标 `take_first_staging` 打破。
-
-**ProcessStart**：精确 BuildingLease 登记与 Bound readiness → 解析 profile/解析兼容域 → 按预育数预留提取缓冲 → `pin_consume` 独占 builder → `SchedDomain::reserve_ready` 在一次类锁内预付整个线程批次的全寿命队列容量 → Job 链锁内上行检查 seal + `begin_running(expected, out_staged)`（要求 `building_ops == 1`，活体门、`Building → Running`、Staging→Ready 与强引用交出原子完成）→ 提交区一次冻结 execution binding、消费 builder、`ReadyBatch::publish` 整批发布 AdmittedThread。并发 Bind/Map/Write/Grant/Attach 仍持登记时返回 ObjectBusy，不会被 Start 越过；并发 Attach 使 expected 失配同样返回 ObjectBusy。所有提交前失败均 unpin，未消费的调度准入随 owner 析构原子归还，Start 可重试。BuildingLease 的 Drop 统一配平 Building 操作计数，成功由 `commit_running` 消费登记，不存在手工 enter/leave 分支遗漏。
+- **ProcessBindExecution**：在首次 ThreadCreate 前冻结 ISA requirement 与兼容调度域；重复绑定拒绝。
+- **ThreadCreate**：拷入 `ThreadStartContext`，target 为 ProcessBuilder 或 self 哨兵；校验 Bound/执行绑定，构造完整 Created 线程、ThreadControl 与 Running 期全寿命 Ready 准入，输出 `ThreadCreateResult{tid, control}`。Building control 原子安装目标表，Running control 安装调用者表；输出写失败冻结调用者 `Faulted(UserAccess)`。
+- **ThreadStart**：只接受带 MANAGE right 的 ThreadControl；Running Created 在线程 lifecycle 锁内转 Ready 并消费准入发布，Building 线程拒绝，不分配。
+- **ProcessStart**：只检查 Bound、执行绑定、已创建线程、Job 门与无并发 Building 操作，随后消费 builder 并批量发布 Building Created 线程；发布尾段已改为 ThreadCreate 时预留准入与 Thread 内嵌发布链，Start 锁内摘取、锁外逐项交给调度器。
+- **Building abandonment**：ProcessBuilder 最后 authority 消散或进程终止时，未启动 Created 线程经 ThreadDeparture 发布 DONE；已启动线程按普通离场收束。
+- **bootstrap**：仍在无并发启动路径构造初始成员；后续需改为复用 ThreadCreate 的 control/准入核心，消除独立 Attach 叙述。
 
 ## 唯一 init bootstrap
 

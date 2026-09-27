@@ -4,7 +4,8 @@ use super::*;
 use crate::task::selftest::{Activated, Caller, bound, collect, pump, terminate};
 use crate::task::{handle, memory_pool::MemoryPool, proc, process, wait};
 use erhino_shared::proc::{
-    ProcessDrainResult, ProcessDrainStatus, ProcessExitReason, ProcessFaultCode,
+    ProcessDrainResult, ProcessDrainStatus, ProcessFaultCode, TerminationCause,
+    TerminationDetail,
 };
 
 fn waiting_close(root: &Arc<MemoryPool>) {
@@ -272,8 +273,12 @@ fn native(root: &Arc<MemoryPool>, cancelled: bool, faulted: bool) {
                     caller.process.lifecycle.snapshot().2
                 ),
                 (
-                    ProcessExitReason::Fault,
-                    ProcessFaultCode::StoreAccess as i64
+                    TerminationCause::Faulted,
+                    TerminationDetail::fault(
+                        caller.thread().member().tid(),
+                        ProcessFaultCode::UserAccess,
+                        caller.output as u64,
+                    )
                 ),
                 "committed Native output failure did not freeze StoreAccess"
             );

@@ -2,9 +2,9 @@
 
 use crate::call::{
     sys_job_create, sys_job_derive, sys_job_enumerate, sys_job_query, sys_job_seal,
-    sys_process_attach, sys_process_bind_memory, sys_process_create, sys_process_drain,
+    sys_process_bind_execution, sys_process_bind_memory, sys_process_create, sys_process_drain,
     sys_process_grant, sys_process_kill, sys_process_map, sys_process_query, sys_process_start,
-    sys_process_write,
+    sys_process_write, sys_thread_create,
 };
 use crate::ipc::object::close;
 use erhino_shared::{
@@ -13,7 +13,8 @@ use erhino_shared::{
     proc::{
         HandleGrant, JOB_ENUMERATE_MAX, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
         PROCESS_DRAIN_MAX, ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus,
-        ProcessMapFlags, ProcessSnapshot, ThreadStartContext, Tid,
+        ProcessMapFlags, ProcessSnapshot, TerminationDetail, ThreadCreateResult,
+        ThreadStartContext,
     },
 };
 
@@ -161,11 +162,15 @@ pub fn write(builder: Handle, target: usize, source: &[u8]) -> Result<(), System
     unsafe { sys_process_write(builder, target, source) }
 }
 
-/// ProcessAttach：组装者向 Building process 附入线程（外部通道；线程是
+/// ThreadCreate：组装者向 Building process 附入线程（外部通道；线程是
 /// 组装资源）。栈与出生参数由组装者经 Map/Write 预先供给。
-pub fn attach(builder: Handle, descriptor: &ThreadStartContext) -> Result<Tid, SystemCallError> {
-    // SAFETY: descriptor 在 syscall 期间保持有效。
-    unsafe { sys_process_attach(builder, descriptor) }
+pub fn thread_create(
+    builder: Handle,
+    descriptor: &ThreadStartContext,
+    result: &mut ThreadCreateResult,
+) -> Result<(), SystemCallError> {
+    // SAFETY: descriptor/result 在 syscall 期间保持有效。
+    unsafe { sys_thread_create(builder, descriptor, result) }
 }
 
 /// ProcessGrant：组装者把 grants 装入目标 Building process 的 HandleTable
@@ -184,9 +189,14 @@ pub fn grant(
 }
 
 /// ProcessStart：活体门（已附线程 ≥1）检查后首次发布进程；builder 消费。
-pub fn start(builder: Handle, profile: u32) -> Result<(), SystemCallError> {
+pub fn start(builder: Handle) -> Result<(), SystemCallError> {
     // SAFETY: 值参数由内核完整校验。
-    unsafe { sys_process_start(builder, profile) }
+    unsafe { sys_process_start(builder) }
+}
+
+pub fn bind_execution(builder: Handle, profile: u32) -> Result<(), SystemCallError> {
+    // SAFETY: profile is a scalar and builder is a caller-owned capability.
+    unsafe { sys_process_bind_execution(builder, profile) }
 }
 
 /// ProcessQuery：固定宽生命周期快照。未知判别值与非法组合拒绝
@@ -196,8 +206,8 @@ pub fn query(control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
         pid: 0,
         parent_pid: 0,
         state: 0,
-        reason: 0,
-        code: 0,
+        cause: 0,
+        detail: TerminationDetail::NONE,
         reserved: 0,
     };
     // SAFETY: snapshot 在 syscall 期间有效且可写。
@@ -207,43 +217,60 @@ pub fn query(control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
 }
 
 fn validate_snapshot(snapshot: &ProcessSnapshot) -> Result<(), SystemCallError> {
-    use erhino_shared::proc::{ProcessExitReason, ProcessState};
+    use erhino_shared::proc::{ProcessFaultCode, TerminationCause, ProcessState};
     if snapshot.reserved != 0 {
         return Err(SystemCallError::InternalError);
     }
     let state = snapshot.state;
-    let reason = snapshot.reason;
+    let cause = snapshot.cause;
     let ok_state = state <= ProcessState::Dead as u32;
-    let ok_reason = reason <= ProcessExitReason::Abandoned as u32;
-    if !ok_state || !ok_reason {
+    let ok_cause = cause <= TerminationCause::Abandoned as u32;
+    if !ok_state || !ok_cause {
         return Err(SystemCallError::InternalError);
     }
     let live = state == ProcessState::Building as u32 || state == ProcessState::Running as u32;
     let terminal = state == ProcessState::Terminating as u32 || state == ProcessState::Dead as u32;
-    // 终态/终止态必须携带终因；活态必须 reason=None 且 code=0。
-    if terminal && reason == ProcessExitReason::None as u32 {
+    if terminal && cause == TerminationCause::None as u32 {
         return Err(SystemCallError::InternalError);
     }
-    if reason == ProcessExitReason::None as u32 && snapshot.code != 0 {
+    let detail_valid = match cause {
+        x if x == TerminationCause::None as u32
+            || x == TerminationCause::Completed as u32
+            || x == TerminationCause::Terminated as u32
+            || x == TerminationCause::Aborted as u32
+            || x == TerminationCause::Abandoned as u32 => snapshot.detail == TerminationDetail::NONE,
+        x if x == TerminationCause::Killed as u32 => {
+            snapshot.detail == TerminationDetail::PROCESS_CONTROL_KILL
+        }
+        x if x == TerminationCause::Faulted as u32 => {
+            (snapshot.detail.word0 >> 32) <= ProcessFaultCode::UserAccess as u64
+        }
+        _ => false,
+    };
+    if !detail_valid {
         return Err(SystemCallError::InternalError);
     }
-    if live && (reason != ProcessExitReason::None as u32 || snapshot.code != 0) {
-        return Err(SystemCallError::InternalError);
-    }
-    if reason == ProcessExitReason::Abandoned as u32 && snapshot.code != 0 {
-        return Err(SystemCallError::InternalError);
-    }
-    if reason == ProcessExitReason::Fault as u32 && !(0..=8).contains(&snapshot.code) {
+    if live && cause != TerminationCause::None as u32 {
         return Err(SystemCallError::InternalError);
     }
     Ok(())
 }
 
-/// ProcessKill：异步幂等终止请求（MANAGE）。成功仅表示请求被接受或
-/// 目标已越过不可逆终止边界；不表示 teardown 完成。自杀式调用不返回。
-pub fn kill(control: Handle, code: i64) -> Result<(), SystemCallError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    Accepted,
+    AlreadyTerminating,
+}
+
+/// ProcessKill：异步幂等终止请求（MANAGE）。返回值只反映终止线性化，
+/// 不表示 teardown 完成；自杀式调用不返回。
+pub fn kill(control: Handle) -> Result<KillOutcome, SystemCallError> {
     // SAFETY: 值参数由内核完整校验。
-    unsafe { sys_process_kill(control, code) }
+    match unsafe { sys_process_kill(control)? } {
+        0 => Ok(KillOutcome::Accepted),
+        1 => Ok(KillOutcome::AlreadyTerminating),
+        _ => Err(SystemCallError::InternalError),
+    }
 }
 
 /// ProcessDrain：REAPABLE/Dead 上推进固定预算收束批次（MANAGE）。

@@ -17,6 +17,7 @@ use erhino_shared::{
         PROCESS_DRAIN_MAX, PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE,
         PROCESS_USER_TOP, ProcessMapFlags, ProcessSnapshot, ThreadStartContext,
     },
+    startup::{EntryThreadDescriptor, StartupBlockHeader},
     time::Deadline,
 };
 use rinlib::{
@@ -178,7 +179,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         }
         map_plan(builder, &image)?;
         write_segments(builder, &image, request.image)?;
-        map_stack(builder)?;
+        let (stack_start, stack_len) = map_stack(builder)?;
 
         let profile = match image.requirement() {
             elf::IsaRequirement::Base64 => ExecutionProfile::Base64,
@@ -193,7 +194,24 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             process::grant(builder, request.grants, &mut granted[..grant_len])?;
             grants_consumed = true;
         }
-        let block = build_birth_block(created.pid, &granted[..grant_len], request.payload)?;
+        let entry = erhino_shared::startup::EntryThreadDescriptor {
+            kind: erhino_shared::startup::ENTRY_THREAD_SECTION_KIND,
+            version: erhino_shared::startup::ENTRY_THREAD_SECTION_VERSION,
+            section_len: core::mem::size_of::<
+                erhino_shared::startup::EntryThreadDescriptor,
+            >() as u32,
+            control: Handle::INVALID,
+            stack_reservation_start: stack_start as u64,
+            stack_reservation_len: stack_len as u64,
+            usable_start: stack_start as u64,
+            usable_len: stack_len as u64,
+        };
+        let block = build_birth_block(
+            created.pid,
+            &granted[..grant_len],
+            entry,
+            request.payload,
+        )?;
         let image_top = usize::try_from(image.image_end()).map_err(|_| SpawnError::InvalidImage)?;
         let block_va = write_birth_block(builder, &block, image_top)?;
         let descriptor = ThreadStartContext {
@@ -202,8 +220,27 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             arg1: block_va as u64,
             arg2: block.len() as u64,
         };
-        process::attach(builder, &descriptor)?;
-        process::start(builder, profile as u32)?;
+        process::bind_execution(builder, profile as u32)?;
+        let mut thread_created = erhino_shared::proc::ThreadCreateResult {
+            tid: 0,
+            reserved: 0,
+            control: Handle::INVALID,
+        };
+        process::thread_create(builder, &descriptor, &mut thread_created)?;
+        let entry = EntryThreadDescriptor {
+            control: thread_created.control,
+            ..entry
+        };
+        let entry_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&entry as *const EntryThreadDescriptor).cast::<u8>(),
+                core::mem::size_of::<EntryThreadDescriptor>(),
+            )
+        };
+        let entry_offset = core::mem::size_of::<StartupBlockHeader>()
+            + grant_len * core::mem::size_of::<Handle>();
+        process::write(builder, block_va + entry_offset, entry_bytes)?;
+        process::start(builder)?;
         Ok(Spawned {
             pid: created.pid,
             control: created.control,
@@ -411,8 +448,8 @@ pub struct JobKillFailure {
     pub progress: JobKillProgress,
 }
 
-pub fn job_kill(job: Handle, code: i64) -> Result<(), JobKillFailure> {
-    job_kill_with_policy(job, code, DEFAULT_SUPERVISION_POLICY)
+pub fn job_kill(job: Handle) -> Result<(), JobKillFailure> {
+    job_kill_with_policy(job, DEFAULT_SUPERVISION_POLICY)
 }
 
 /// 递归 JobKill（用户态政策，内核不递归）。每个 wait、enumeration 与 drain
@@ -539,7 +576,7 @@ pub trait JobOperations: ProcessOperations {
         id: u64,
         rights: Rights,
     ) -> Result<Handle, SystemCallError>;
-    fn kill(&self, control: Handle, code: i64) -> Result<(), SystemCallError>;
+    fn kill(&self, control: Handle) -> Result<(), SystemCallError>;
     fn query_job(&self, job: Handle) -> Result<erhino_shared::proc::JobSnapshot, SystemCallError>;
 }
 
@@ -568,8 +605,8 @@ impl JobOperations for RealJobOperations {
     ) -> Result<Handle, SystemCallError> {
         process::derive_job(job, kind, id, rights)
     }
-    fn kill(&self, control: Handle, code: i64) -> Result<(), SystemCallError> {
-        process::kill(control, code)
+    fn kill(&self, control: Handle) -> Result<(), SystemCallError> {
+        process::kill(control).map(|_| ())
     }
     fn query_job(&self, job: Handle) -> Result<erhino_shared::proc::JobSnapshot, SystemCallError> {
         process::query_job(job)
@@ -602,15 +639,14 @@ impl ProcessOperations for RealJobOperations {
 #[derive(Debug)]
 pub struct JobCollector<O: JobOperations + Clone + core::fmt::Debug = RealJobOperations> {
     frames: Vec<JobFrame<O>>,
-    code: i64,
     policy: SupervisionPolicy,
     progress: JobKillProgress,
     ops: O,
 }
 
 impl JobCollector<RealJobOperations> {
-    pub fn new(job: Handle, code: i64, policy: SupervisionPolicy) -> Result<Self, SystemCallError> {
-        Self::new_with_ops(job, code, policy, RealJobOperations)
+    pub fn new(job: Handle, policy: SupervisionPolicy) -> Result<Self, SystemCallError> {
+        Self::new_with_ops(job, policy, RealJobOperations)
     }
 }
 
@@ -629,7 +665,6 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
 
     pub fn new_with_ops(
         job: Handle,
-        code: i64,
         policy: SupervisionPolicy,
         ops: O,
     ) -> Result<Self, SystemCallError> {
@@ -643,7 +678,6 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
         frames.push(Self::new_frame(job)?);
         Ok(Self {
             frames,
-            code,
             policy,
             progress: JobKillProgress::default(),
             ops,
@@ -800,7 +834,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                     .current
                     .take()
                     .expect("kill lost process authority");
-                match self.ops.kill(target.control(), self.code) {
+                match self.ops.kill(target.control()) {
                     Ok(()) => {
                         self.frames[i].current = Some(target);
                         self.frames[i].phase = JobPhase::CollectMember;
@@ -989,10 +1023,9 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
 
 pub fn job_kill_with_policy(
     job: Handle,
-    code: i64,
     policy: SupervisionPolicy,
 ) -> Result<(), JobKillFailure> {
-    let collector = JobCollector::new(job, code, policy).map_err(|error| {
+    let collector = JobCollector::new(job, policy).map_err(|error| {
         job_failure(
             job,
             JobKillStage::Seal,
@@ -1156,9 +1189,16 @@ fn write_segments(builder: Handle, image: &elf::Elf, file: &[u8]) -> Result<(), 
 fn build_birth_block(
     target_pid: u64,
     handles: &[Handle],
+    entry: EntryThreadDescriptor,
     payload: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, SpawnError> {
-    erhino_shared::startup::build_startup_block(target_pid, rinlib::env::pid(), handles, payload)
+    erhino_shared::startup::build_startup_block_with_entry(
+        target_pid,
+        rinlib::env::pid(),
+        handles,
+        entry,
+        payload,
+    )
         .map_err(|_| SpawnError::InvalidImage)
 }
 
@@ -1187,14 +1227,14 @@ fn write_birth_block(builder: Handle, block: &[u8], image_top: usize) -> Result<
     Ok(base)
 }
 
-fn map_stack(builder: Handle) -> Result<(), SpawnError> {
+fn map_stack(builder: Handle) -> Result<(usize, usize), SpawnError> {
     let base = PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE;
     let permissions = ProcessMapFlags::READ | ProcessMapFlags::WRITE;
     for offset in (0..PROCESS_MAIN_STACK_SIZE).step_by(MAX_MAP_BYTES) {
         let len = MAX_MAP_BYTES.min(PROCESS_MAIN_STACK_SIZE - offset);
         process::map(builder, base + offset, len, permissions)?;
     }
-    Ok(())
+    Ok((base, PROCESS_MAIN_STACK_SIZE))
 }
 
 #[cfg(test)]
@@ -1275,7 +1315,7 @@ mod tests {
             }
         }
 
-        fn kill(&self, _control: Handle, _code: i64) -> Result<(), SystemCallError> {
+        fn kill(&self, _control: Handle) -> Result<(), SystemCallError> {
             Ok(())
         }
 
@@ -1330,8 +1370,8 @@ mod tests {
                 pid: 7,
                 parent_pid: 0,
                 state: erhino_shared::proc::ProcessState::Dead as u32,
-                reason: 0,
-                code: 0,
+                cause: 0,
+                detail: erhino_shared::proc::TerminationDetail::NONE,
                 reserved: 0,
             })
         }
@@ -1395,7 +1435,8 @@ mod tests {
         assert_eq!(failure.stage, SupervisionStage::WaitReapable);
         assert_eq!(failure.cause, SupervisionCause::InvalidPolicy);
 
-        let failure = job_kill_with_policy(Handle::from_raw(0x2_0000_0001), 1, policy).unwrap_err();
+        let failure =
+            job_kill_with_policy(Handle::from_raw(0x2_0000_0001), policy).unwrap_err();
         assert_eq!(failure.job.raw(), 0x2_0000_0001);
         assert_eq!(failure.stage, JobKillStage::Seal);
         assert!(failure.collector.is_none());
@@ -1409,7 +1450,6 @@ mod tests {
         }));
         let mut collector = JobCollector::new_with_ops(
             Handle::from_raw(1),
-            0,
             DEFAULT_SUPERVISION_POLICY,
             FakeJobOps { state },
         )
@@ -1451,7 +1491,7 @@ mod tests {
             state: state.clone(),
         };
         let mut collector =
-            JobCollector::new_with_ops(Handle::from_raw(1), 0x55, DEFAULT_SUPERVISION_POLICY, ops)
+            JobCollector::new_with_ops(Handle::from_raw(1), DEFAULT_SUPERVISION_POLICY, ops)
                 .unwrap();
         let mut now = 0;
         loop {

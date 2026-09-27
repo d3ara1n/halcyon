@@ -565,24 +565,22 @@ impl Job {
     /// 嵌套于链锁内，锁序规范允许方向）。失败（seal 先到或进程已
     /// 终止）返回 ObjectClosed，调用方整体回滚。
     /// ProcessStart 提交闸门：链锁内「上行检查祖先 seal + Building →
-    /// Running（含预育提取）」（活体门、计数一致性与 Staging 提取在
+    /// Running（含预育提取）」（活体门、计数一致性与 Created 提取在
     /// begin_running 锁内原子完成；lifecycle 锁嵌套于链锁内，锁序
-    /// Job 链锁 → lifecycle 锁）。expected 是调用方预留就绪容量的成员
-    /// 计数，out 容量同由调用方预预留；并发 attach 插队报 ObjectBusy
+    /// Job 链锁 → lifecycle 锁）。expected 是调用方读取的成员计数；并发 attach 插队报 ObjectBusy
     /// （调用方以新计数重试）。
     pub(crate) fn start_commit_gate(
         process: &Arc<Process>,
         expected: usize,
-        out: &mut Vec<Arc<crate::task::Thread>>,
-    ) -> Result<(), SystemCallError> {
+    ) -> Result<Option<Arc<crate::task::Thread>>, SystemCallError> {
         let job = process.job();
         let chain = collect_chain(&job)?;
         let guards = lock_chain(&chain)?;
         if guards.iter().any(|state| state.sealed) {
             return Err(SystemCallError::ObjectClosed);
         }
-        match process.lifecycle.begin_running(expected, out) {
-            Ok(()) => Ok(()),
+        match process.lifecycle.begin_running(expected) {
+            Ok(head) => Ok(head),
             Err(super::lifecycle::BeginFault::Closed) => Err(SystemCallError::ObjectClosed),
             Err(super::lifecycle::BeginFault::StaleCount | super::lifecycle::BeginFault::Busy) => {
                 Err(SystemCallError::ObjectBusy)

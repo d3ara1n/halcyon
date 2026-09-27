@@ -6,7 +6,7 @@ use crate::task::{lifecycle, memory_pool::MemoryPool, proc, resources};
 use core::alloc::Layout;
 use erhino_shared::{
     memory_pool::MemoryPoolSnapshot,
-    proc::{ProcessExitReason, ThreadStartContext},
+    proc::{TerminationCause, ThreadStartContext},
 };
 
 const VA: usize = 0x6000_0000;
@@ -315,7 +315,7 @@ pub(crate) fn run(root: &Arc<MemoryPool>) {
     fail_revoked_output(&thread, &connection, invitation_handle, output, target);
     let departure = thread.departure();
     drop(thread);
-    departure.request(super::super::thread::DepartureKind::Terminated);
+        departure.request();
     drop(departure);
     while crate::deferred_work::drain_current() != 0 {}
     assert!(process.lifecycle.is_reapable());
@@ -473,13 +473,13 @@ fn fail_revoked_output(
         .lock()
         .check_range(output, core::mem::size_of::<Handle>(), true)
         .unwrap();
-    let mut staged = Vec::with_capacity(1);
     assert!(process.lifecycle.enter_building_op());
-    process
+    drop(
+        process
         .lifecycle
-        .begin_running(1, &mut staged)
-        .expect("Tunnel test Start failed");
-    drop(staged);
+        .begin_running(1)
+        .expect("Tunnel test Start failed"),
+    );
     let slot = crate::hart::current().slot();
     assert!(matches!(
         process
@@ -557,7 +557,7 @@ fn fail_revoked_output(
             .get(invitation_handle, Rights::MAP)
             .is_ok()
     );
-    assert_eq!(process.lifecycle.snapshot().1, ProcessExitReason::Fault);
+    assert_eq!(process.lifecycle.snapshot().1, TerminationCause::Faulted);
 
     assert!(process.lifecycle.clear_active_if(slot, || true));
 }

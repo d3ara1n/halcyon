@@ -6,7 +6,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::Ordering;
 use erhino_shared::{
     call::SystemCallError,
-    proc::{ProcessDrainResult, ProcessDrainStatus, ProcessExitReason, ProcessFaultCode},
+    proc::{ProcessDrainResult, ProcessDrainStatus, ProcessFaultCode, Tid},
 };
 use work_debt::{StepResult, StepState};
 
@@ -244,6 +244,7 @@ pub(crate) fn reserve() -> Result<Reservation, ()> {
 pub(crate) struct DrainRequest {
     _control: Arc<ProcessControl>,
     caller: Arc<Process>,
+    caller_tid: Tid,
     result: Option<ThreadResultObligation>,
     output: usize,
     budget: usize,
@@ -268,6 +269,7 @@ impl DrainRequest {
         target: &Arc<Process>,
         control: Arc<ProcessControl>,
         caller: Arc<Process>,
+        caller_tid: Tid,
         result: ThreadResultObligation,
         output: usize,
         budget: usize,
@@ -278,6 +280,7 @@ impl DrainRequest {
         Ok(Self {
             _control: control,
             caller,
+            caller_tid,
             result: Some(result),
             output,
             budget,
@@ -352,8 +355,12 @@ impl DrainRequest {
                 };
                 if copied.is_err() {
                     let todo = self.caller.lifecycle.request_termination(
-                        ProcessExitReason::Fault,
-                        ProcessFaultCode::StoreAccess as i64,
+                        erhino_shared::proc::TerminationCause::Faulted,
+                        erhino_shared::proc::TerminationDetail::fault(
+                            self.caller_tid,
+                            ProcessFaultCode::UserAccess,
+                            self.output as u64,
+                        ),
                         None,
                     );
                     super::process::run_termination_todo(&self.caller, todo);

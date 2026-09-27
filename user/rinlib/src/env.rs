@@ -1,14 +1,15 @@
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use erhino_shared::{
     object::Handle,
     proc::Pid,
-    startup::{StartupBlockHeader, validate_startup_block},
+    startup::{entry_thread_descriptor, EntryThreadDescriptor, StartupBlockHeader, validate_startup_block},
 };
 
 /// 启动块基址。0 = 未初始化（启动契约：lang_start 在任何用户代码前写入）。
 /// 块为只读映射的不可变快照，写入后仅读。
 static BLOCK: AtomicUsize = AtomicUsize::new(0);
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// 0 = 未初始化（启动契约：lang_start 在任何用户代码前写入）。
 static PID: AtomicU64 = AtomicU64::new(0);
 static PARENT_PID: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +33,14 @@ pub(crate) fn init(block: *const u8, block_len: usize) {
     let bytes = unsafe { core::slice::from_raw_parts(block, block_len) };
     let header = validate_startup_block(bytes)
         .unwrap_or_else(|error| panic!("invalid startup block: {:?}", error));
+    entry_thread_descriptor(bytes, header)
+        .unwrap_or_else(|error| panic!("invalid entry thread descriptor: {:?}", error));
+    if INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        panic!("startup entry initialized twice");
+    }
 
     PID.store(header.pid, Ordering::Relaxed);
     PARENT_PID.store(header.parent_pid, Ordering::Relaxed);
@@ -60,7 +69,7 @@ pub fn parent_pid() -> Pid {
 pub fn startup_handles() -> &'static [Handle] {
     let (base, header) = block_and_header();
     // SAFETY: init 已验证 Handle 区位于完整块内；块基页对齐且 header 为
-    // 48 字节，数组起点保持 Handle 所需的 8 字节对齐。
+    // 固定布局字节，数组起点保持 Handle 所需的 8 字节对齐。
     unsafe {
         core::slice::from_raw_parts(
             base.byte_add(core::mem::size_of::<StartupBlockHeader>())
@@ -79,10 +88,21 @@ pub fn startup_handle(index: usize) -> Option<Handle> {
 pub fn startup_payload() -> &'static [u8] {
     let (base, header) = block_and_header();
     // SAFETY: init 已验证 payload 规范区间完整落在只读块内。
-    unsafe {
+    let bytes = unsafe {
         core::slice::from_raw_parts(
-            base.byte_add(header.payload_off as usize),
-            header.payload_len as usize,
+            base,
+            header.block_len as usize,
         )
-    }
+    };
+    entry_thread_descriptor(bytes, header)
+        .expect("startup entry descriptor missing")
+        .1
+}
+
+pub fn entry_thread() -> EntryThreadDescriptor {
+    let (base, header) = block_and_header();
+    let bytes = unsafe { core::slice::from_raw_parts(base, header.block_len as usize) };
+    entry_thread_descriptor(bytes, header)
+        .expect("startup entry descriptor missing")
+        .0
 }

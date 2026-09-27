@@ -79,8 +79,8 @@ impl ProcessOperations for Environment {
             pid: 7,
             parent_pid: 0,
             state: ProcessState::Dead as u32,
-            reason: 0,
-            code: 0,
+            cause: 0,
+            detail: erhino_shared::proc::TerminationDetail::NONE,
             reserved: 0,
         })
     }

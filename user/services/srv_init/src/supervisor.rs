@@ -103,7 +103,6 @@ impl Task<JobWorld> for JobTask {
 struct JobDuty {
     active: bool,
     root: Handle,
-    code: i64,
     pending: Option<JobTask>,
     runtime: Option<Runtime<JobTask, WaitSet>>,
     world: JobWorld,
@@ -548,7 +547,7 @@ impl RootSupervisor {
 
     pub(super) fn bind_services(&mut self, services: Handle) -> Result<(), SystemCallError> {
         self.services = Some(services);
-        let index = self.begin_job(services, 0x1F, None);
+        let index = self.begin_job(services, None);
         let duty = self.jobs[index]
             .as_mut()
             .expect("standby duty remains owned");
@@ -565,7 +564,7 @@ impl RootSupervisor {
         self.processes.push(target);
     }
 
-    fn begin_job(&mut self, root: Handle, code: i64, machine: Option<JobCollector>) -> usize {
+    fn begin_job(&mut self, root: Handle, machine: Option<JobCollector>) -> usize {
         if let Some(index) = self
             .jobs
             .iter()
@@ -590,7 +589,6 @@ impl RootSupervisor {
         self.jobs[index] = Some(JobDuty {
             active: true,
             root,
-            code,
             pending: machine.map(|machine| JobTask {
                 driver: JobDriver::new(machine),
             }),
@@ -604,8 +602,8 @@ impl RootSupervisor {
         index
     }
 
-    pub(super) fn collect_job(&mut self, root: Handle, code: i64) -> Result<(), &'static str> {
-        let index = self.begin_job(root, code, None);
+    pub(super) fn collect_job(&mut self, root: Handle) -> Result<(), &'static str> {
+        let index = self.begin_job(root, None);
         loop {
             self.turn_and_wait(Some(Await::Job(index)))
                 .map_err(|_| "root supervision wait failed")?;
@@ -811,11 +809,11 @@ impl RootSupervisor {
         let child = self
             .create_job(parent, JOB_FULL_RIGHTS)
             .map_err(|_| "root isolation Job create failed")?;
-        let index = self.begin_job(child, 0x1F, None);
+        let index = self.begin_job(child, None);
         let duty = self.jobs[index]
             .as_mut()
             .expect("isolation duty remains owned");
-        let mut machine = JobCollector::new(child, 0x1F, DEFAULT_SUPERVISION_POLICY)
+        let mut machine = JobCollector::new(child, DEFAULT_SUPERVISION_POLICY)
             .map_err(|_| "root isolation machine preparation failed")?;
         machine.replenish(libprocess::SupervisionPolicy {
             wait_attempts: 0,
@@ -857,7 +855,7 @@ impl RootSupervisor {
             .map_err(|_| "root isolation resume failed")?;
         duty.error = None;
         duty.world.failure = None;
-        self.collect_job(child, 0x1F)?;
+        self.collect_job(child)?;
         self.close_control(child)?;
         debug!("root independent runtime failure isolation passed");
         Ok(())
@@ -1004,7 +1002,6 @@ impl RootSupervisor {
             duty.pending = Some(JobTask {
                 driver: JobDriver::new(JobCollector::new(
                     duty.root,
-                    duty.code,
                     DEFAULT_SUPERVISION_POLICY,
                 )?),
             });
@@ -1157,8 +1154,8 @@ impl RootSupervisor {
                     done.pid,
                     done.progress.work_done,
                     done.snapshot.state,
-                    done.snapshot.reason,
-                    done.snapshot.code
+                    done.snapshot.cause,
+                    done.snapshot.detail.word0
                 );
                 duty.result_cursor += 1;
             } else {
@@ -1460,7 +1457,7 @@ impl RootSupervisor {
             self.begin_batch(incoming, None);
         }
         if failing && let Some(services) = self.services {
-            self.begin_job(services, 0x1F, None);
+            self.begin_job(services, None);
         }
         debug!("init: persistent root supervisor owns all pending duties");
         loop {

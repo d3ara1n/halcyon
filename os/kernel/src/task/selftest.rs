@@ -10,7 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use erhino_shared::proc::{ProcessExitReason, ThreadStartContext};
+use erhino_shared::proc::{TerminationCause, TerminationDetail, ThreadStartContext};
 
 pub(crate) struct Caller {
     pub(crate) process: Arc<Process>,
@@ -69,7 +69,11 @@ pub(crate) fn pump() {
 pub(crate) fn terminate(process: &Arc<Process>) {
     let todo = process
         .lifecycle
-        .request_termination(ProcessExitReason::Killed, 73, None);
+        .request_termination(
+            TerminationCause::Killed,
+            TerminationDetail::PROCESS_CONTROL_KILL,
+            None,
+        );
     process::run_termination_todo(process, todo);
 }
 
@@ -133,10 +137,14 @@ impl Caller {
             .reserve_ready(count)
             .expect("fixture ready admission failed");
         let mut staged = Vec::with_capacity(count);
-        process
+        let mut next = process
             .lifecycle
-            .begin_running(count, &mut staged)
+            .begin_running(count)
             .expect("fixture start failed");
+        while let Some(thread) = next {
+            next = thread.take_publish_next();
+            staged.push(thread);
+        }
         process.bind_execution(elf::IsaRequirement::Base64, domain);
         let callers: Vec<_> = staged
             .into_iter()
@@ -207,7 +215,7 @@ impl Caller {
             terminate(&self.process);
             let departure = thread.departure();
             drop(thread);
-            departure.request(super::thread::DepartureKind::Terminated);
+            departure.request();
         } else {
             terminate(&self.process);
         }

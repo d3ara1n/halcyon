@@ -1,4 +1,4 @@
-//! 线程公开面：waitable ThreadControl 壳与 Running ThreadSpawn 事务。
+//! 线程公开面：waitable ThreadControl 壳与 Running ThreadCreate 事务。
 
 use alloc::{
     sync::{Arc, Weak},
@@ -12,7 +12,10 @@ use core::{
 use erhino_shared::{
     call::SystemCallError,
     object::{ObjectSignals, Rights},
-    proc::{ProcessExitReason, ProcessFaultCode, ThreadSpawnResult, ThreadStartContext},
+    proc::{
+        ProcessFaultCode, TerminationCause, TerminationDetail, ThreadCreateResult,
+        ThreadStartContext,
+    },
 };
 
 use super::{
@@ -24,8 +27,12 @@ use super::{
     wait::{Subscription, schedule_waiters},
 };
 
-const CONTROL_MAX_RIGHTS: Rights = Rights::from_raw(
-    Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSIT.raw() | Rights::GRANT.raw(),
+pub(crate) const CONTROL_MAX_RIGHTS: Rights = Rights::from_raw(
+    Rights::WAIT.raw()
+        | Rights::DUPLICATE.raw()
+        | Rights::TRANSIT.raw()
+        | Rights::GRANT.raw()
+        | Rights::MANAGE.raw(),
 );
 static RESULT_OBLIGATION_DELAY_OBSERVED: AtomicBool = AtomicBool::new(false);
 
@@ -33,6 +40,8 @@ static RESULT_OBLIGATION_DELAY_OBSERVED: AtomicBool = AtomicBool::new(false);
 pub(crate) struct ThreadControl {
     header: ObjectHeader,
     wait: crate::sync::Spinlock<ObjectWaitState>,
+    thread: crate::sync::Spinlock<Option<Weak<super::proc::Thread>>>,
+    started: AtomicBool,
 }
 
 impl ThreadControl {
@@ -44,6 +53,8 @@ impl ThreadControl {
                 crate::sync::ranks::OBJECT_WAIT,
                 ObjectWaitState::new(ObjectSignals::NONE),
             ),
+            thread: crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None),
+            started: AtomicBool::new(false),
         })
         .map_err(|_| erhino_shared::call::SystemCallError::OutOfMemory)
     }
@@ -59,17 +70,25 @@ impl ThreadControl {
             .update(ObjectSignals::NONE, ObjectSignals::DONE);
         schedule_waiters(&self.wait);
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DepartureKind {
-    Normal(i64),
-    Terminated,
+    pub(crate) fn bind_thread(&self, thread: &Arc<super::proc::Thread>) {
+        *self.thread.lock() = Some(Arc::downgrade(thread));
+    }
+
+    pub(crate) fn start(&self) -> Result<(), SystemCallError> {
+        let thread = self
+            .thread
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(SystemCallError::ObjectClosed)?;
+        thread.start()
+    }
 }
 
 struct DepartureState {
     result_obligations: usize,
-    requested: Option<DepartureKind>,
+    requested: bool,
     finalizing: bool,
 }
 
@@ -95,7 +114,7 @@ impl ThreadDeparture {
                 crate::sync::ranks::LEAF,
                 DepartureState {
                     result_obligations: 0,
-                    requested: None,
+                    requested: false,
                     finalizing: false,
                 },
             ),
@@ -115,11 +134,11 @@ impl ThreadDeparture {
         }
     }
 
-    pub(crate) fn request(&self, kind: DepartureKind) {
+    pub(crate) fn request(&self) {
         let (finalize, delayed) = {
             let mut state = self.state.lock();
             assert!(
-                state.requested.replace(kind).is_none(),
+                !core::mem::replace(&mut state.requested, true),
                 "thread departure requested twice"
             );
             let delayed = state.result_obligations != 0;
@@ -132,27 +151,32 @@ impl ThreadDeparture {
             );
         }
         if finalize {
-            self.finalize(kind);
+            self.finalize();
+        }
+    }
+
+    pub(crate) fn mark_started(&self) {
+        if let Some(control) = self.control.as_ref().and_then(Weak::upgrade) {
+            control.started.store(true, Ordering::Release);
         }
     }
 
     fn complete_result(&self) {
-        let (finalize, kind) = {
+        let finalize = {
             let mut state = self.state.lock();
             state.result_obligations = state
                 .result_obligations
                 .checked_sub(1)
                 .expect("thread result obligation completed without registration");
-            let kind = state.requested;
-            (Self::claim_finalize(&mut state), kind)
+            Self::claim_finalize(&mut state)
         };
         if finalize {
-            self.finalize(kind.expect("claimed finalization must retain departure kind"));
+            self.finalize();
         }
     }
 
     fn claim_finalize(state: &mut DepartureState) -> bool {
-        if state.requested.is_some() && state.result_obligations == 0 && !state.finalizing {
+        if state.requested && state.result_obligations == 0 && !state.finalizing {
             state.finalizing = true;
             true
         } else {
@@ -160,16 +184,12 @@ impl ThreadDeparture {
         }
     }
 
-    fn finalize(&self, kind: DepartureKind) {
+    fn finalize(&self) {
         let process = self
             .process
             .upgrade()
             .expect("process core vanished before thread departure");
-        let normal_code = match kind {
-            DepartureKind::Normal(code) => Some(code),
-            DepartureKind::Terminated => None,
-        };
-        super::process::confirm_departure(&process, self.member, normal_code);
+        super::process::confirm_departure(&process, self.member);
         if let Some(control) = self.control.as_ref().and_then(Weak::upgrade) {
             control.publish_done();
         }
@@ -238,6 +258,11 @@ impl KernelObject for ThreadControl {
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
         debug_assert!(role == HandleRole::ThreadControl);
+        if !self.started.load(Ordering::Acquire) {
+            if let Some(thread) = self.thread.lock().as_ref().and_then(Weak::upgrade) {
+                thread.abandon_created();
+            }
+        }
     }
 
     fn close_transit(&self, role: HandleRole) {
@@ -263,7 +288,7 @@ fn map_context_fault(error: super::proc::SpaceError) -> SystemCallError {
 
 /// Running 期同步创建线程。固定宽结果写出成功后，handle/member/Ready
 /// 三项按不可失败顺序发布。
-pub(crate) fn spawn(
+pub(crate) fn create(
     caller: &super::Thread,
     context_address: usize,
     result_address: usize,
@@ -290,10 +315,6 @@ pub(crate) fn spawn(
         .map_err(|_| SystemCallError::OutOfMemory)?;
     entries.push(entry);
 
-    let mut ready = Vec::new();
-    ready
-        .try_reserve_exact(1)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
     let ready_batch = caller
         .process
         .domain()
@@ -312,7 +333,7 @@ pub(crate) fn spawn(
     let mut space = caller.process.space.lock();
     if let Err(error) = space.check_range(
         result_address,
-        core::mem::size_of::<ThreadSpawnResult>(),
+        core::mem::size_of::<ThreadCreateResult>(),
         true,
     ) {
         table
@@ -329,7 +350,7 @@ pub(crate) fn spawn(
         return Err(map_context_fault(error));
     }
 
-    let (member, thread) = match caller.process.lifecycle.begin_spawn(|_, member| {
+    let (member, thread) = match caller.process.lifecycle.create_running(|_, member| {
         let thread = super::Thread::new_thread_with_control(
             member,
             &caller.process,
@@ -348,15 +369,15 @@ pub(crate) fn spawn(
             return Err(map_attach_fault(error));
         }
     };
-    let result = ThreadSpawnResult {
+    let result = ThreadCreateResult {
         tid: member.tid(),
         reserved: 0,
         control: result_handle,
     };
-    // SAFETY: ThreadSpawnResult 的 u32/u32/Handle 恰好覆盖 16 字节，无 padding。
+    // SAFETY: ThreadCreateResult 的 u32/u32/Handle 恰好覆盖 16 字节，无 padding。
     let output = unsafe { crate::uaccess::write_user_value(&mut space, result_address, &result) };
     if let Err(error) = output {
-        let (staged, _reapable) = caller.process.lifecycle.rollback_spawn(member);
+        let (staged, _reapable) = caller.process.lifecycle.rollback_created(member);
         drop(space);
         table
             .rollback(reservation)
@@ -365,8 +386,8 @@ pub(crate) fn spawn(
         drop(thread);
         drop(staged);
         let todo = caller.process.lifecycle.request_termination(
-            ProcessExitReason::Fault,
-            ProcessFaultCode::StoreAccess as i64,
+            TerminationCause::Faulted,
+            TerminationDetail::fault(caller.member().tid(), ProcessFaultCode::UserAccess, result_address as u64),
             Some(caller.member()),
         );
         super::process::run_termination_todo(&caller.process, todo);
@@ -378,10 +399,28 @@ pub(crate) fn spawn(
         .commit(reservation, entries)
         .expect("spawn reservation must remain owned");
     drop(table);
-    let staged = caller.process.lifecycle.commit_spawn(member);
-    debug_assert!(Arc::ptr_eq(&thread, &staged));
+    control.bind_thread(&thread);
+    thread.install_ready_batch(ready_batch);
     drop(thread);
-    ready.push(staged);
-    ready_batch.publish(ready);
     Ok(())
+}
+
+pub(crate) fn start(caller: &super::Thread, handle: erhino_shared::object::Handle) -> Result<(), SystemCallError> {
+    let object = {
+        let table = caller.process.handles.lock();
+        let entry = table
+            .get(handle, Rights::MANAGE)
+            .map_err(super::handle::map_error)?;
+        if *entry.role() != HandleRole::ThreadControl
+            || entry.object().kind() != ObjectKind::ThreadControl
+        {
+            return Err(SystemCallError::WrongObjectType);
+        }
+        entry.object().clone()
+    };
+    let any: alloc::sync::Arc<dyn Any + Send + Sync> = object;
+    let control = any
+        .downcast::<ThreadControl>()
+        .map_err(|_| SystemCallError::WrongObjectType)?;
+    control.start()
 }

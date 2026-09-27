@@ -3,8 +3,8 @@ use rinlib::shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
-        PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult, ProcessMapFlags,
-        ThreadStartContext,
+        ExecutionProfile, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult, ProcessMapFlags,
+        ThreadCreateResult, ThreadStartContext,
     },
 };
 use rinlib::{
@@ -32,6 +32,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
             PROCESS_PAGE_SIZE,
             ProcessMapFlags::READ | ProcessMapFlags::EXECUTE,
         )?;
+        process::bind_execution(created.builder, ExecutionProfile::Base64 as u32)?;
         process::write(created.builder, 0x1000, &SPIN_FOREVER)?;
         process::map(
             created.builder,
@@ -39,7 +40,12 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
             PROCESS_PAGE_SIZE,
             ProcessMapFlags::READ | ProcessMapFlags::WRITE,
         )?;
-        process::attach(
+        let mut thread = ThreadCreateResult {
+            tid: 0,
+            reserved: 0,
+            control: Handle::INVALID,
+        };
+        process::thread_create(
             created.builder,
             &ThreadStartContext {
                 entry: 0x1000,
@@ -47,6 +53,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
                 arg1: 0,
                 arg2: 0,
             },
+            &mut thread,
         )
     })();
     match built {

@@ -37,7 +37,7 @@ use rinlib::{
         object::{Handle, ObjectSignals},
         time::Deadline,
     },
-    sys_exit,
+    sys_process_abort,
 };
 
 const STREAM_LEN: usize = 65536;
@@ -751,7 +751,6 @@ impl Task<PmWorld> for DomainTask {
         if self.driver.is_none() {
             self.driver = Some(JobDriver::new(JobCollector::new(
                 world.domain,
-                0x66,
                 self.policy,
             )?));
         }
@@ -893,10 +892,7 @@ fn main() {
     };
     if let Err(failure) = runtime.spawn(PmTask::Mailbox(MailboxTask::new()), 2) {
         debug!("pm: mailbox task refused: {:?}", failure.error);
-        match unsafe { sys_exit(-1) } {
-            Ok(()) => unreachable!("pm: mailbox failure exit unexpectedly returned"),
-            Err(error) => panic!("pm: mailbox failure exit failed: {:?}", error),
-        }
+        unsafe { sys_process_abort() }
     }
 
     let mut stopping = false;
@@ -949,10 +945,7 @@ fn main() {
     }
     if let Err((_runtime, error)) = runtime.close() {
         debug!("pm: runtime close failed: {:?}", error);
-        match unsafe { sys_exit(-1) } {
-            Ok(()) => unreachable!("pm: close failure exit unexpectedly returned"),
-            Err(error) => panic!("pm: close failure exit failed: {:?}", error),
-        }
+        unsafe { sys_process_abort() }
     }
     assert!(
         world.mailbox_stopped && !world.mailbox_registered,
@@ -966,8 +959,5 @@ fn main() {
 
 /// pm 有明确上级监督者；不可恢复失败在原 owner 仍存活时退出进程。
 fn exit_failed() -> ! {
-    match unsafe { sys_exit(-1) } {
-        Ok(()) => unreachable!("pm failure exit returned"),
-        Err(error) => panic!("pm failure exit failed: {:?}", error),
-    }
+    unsafe { sys_process_abort() }
 }

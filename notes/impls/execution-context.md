@@ -20,7 +20,7 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 普通 Ready、termination、Remote 与 deferred-work IPI 都只作已发布业务真值的门铃，发送 API 返回失败 slot mask；失败不撤销 Pending/Ready、不伪造完成，也不在发送者上 panic。
 
-`os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessStart 解析平铺的 execution profile，选择最弱兼容域，并在 lifecycle 提交后以单个 `AtomicUsize` 一次冻结 requirement 与域 index；零值只表示未绑定，不会与 Base64 混淆。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
+`os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessBindExecution 解析平铺的 execution profile，选择最弱兼容域，并在首次 ThreadCreate 前以单个 `AtomicUsize` 一次冻结 requirement 与域 index；ProcessStart 只验证该 binding；零值只表示未绑定，不会与 Base64 混淆。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
 
 ## ABI 档位与 UserContext
 
@@ -33,7 +33,7 @@ F-only、Q、V、TSO 与未建模扩展由 loader 拒绝。Q-capable hart 可运
 
 `os/kernel/src/context.rs::UserContext` 每线程保存 GPR、sepc 与完整 `FpState`；`FpState` 含 32 个 FPR 和 fcsr，创建时全零。D64 切入时完整恢复并置 FS=Clean，trap 只在 FS=Dirty 时回写，随后恢复内核 FS=Off。局部 F/D helper 位于独立代码 section；`test_fp` 验证 FPR/fcsr 跨 ecall、Sleep 和调度轮转保持。
 
-Building 首线程与 Running 期 ThreadSpawn 共用 `ThreadStartContext` 到 `UserContext` 的编码：entry 写 sepc，sp 写 x2，arg1/arg2 写 a0/a1，其余 GPR、tp、FP 状态清零。ThreadSpawn 在新线程入队前完成现场构造和 execution binding 继承；线程只能进入进程已冻结的兼容调度域。ThreadExit 与被终止线程都走非 Resume trap 出口，先切回 kernel satp、清 active，再由调度侧释放执行容器并请求 `ThreadDeparture`，不会在仍使用用户 root 时发布 DONE。
+Building 首线程与 Running 期 ThreadCreate 共用 `ThreadStartContext` 到 `UserContext` 的编码：entry 写 sepc，sp 写 x2，arg1/arg2 写 a0/a1，其余 GPR、tp、FP 状态清零。ProcessBindExecution 在首次 ThreadCreate 前冻结 requirement 与兼容调度域；ThreadCreate 只继承已冻结的 execution binding，线程只能进入该域。ThreadExit 与被终止线程都走非 Resume trap 出口，先切回 kernel satp、清 active，再由调度侧释放执行容器并请求 `ThreadDeparture`，不会在仍使用用户 root 时发布 DONE。
 
 当前用户首入口为 `rinlib/linker.ld` 的 ENTRY(main)，由 rustc main shim 进入 lang_start；工作线程直接进入 rinlib 的泛型 Rust trampoline。两者没有在用户侧装载 gp，出生 gp/tp 为零；用户 linker 未定义 `__global_pointer$`，两个 target 没有显式禁用 relaxation。这里只记录这些事实，不推断链接器必然生成或消除 gp-relative 指令。目标是首/工作入口都经过明确 gp 准备，再调用 Rust 桥接；见 [目标入口契约](../ideas/execution-context.md#用户态平台入口) 与 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md)。当前 PT_TLS 不在 shared/elf admission 白名单，tp=0 不提供 TLS。
 

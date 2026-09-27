@@ -15,7 +15,7 @@ pub const MODE_HAMMER: u64 = 1;
 /// payload word[0]：竞态靶模式。
 pub const MODE_TARGET: u64 = 2;
 
-/// TARGET payload word[1]：等枪后 sys_exit(code) 正常退出。
+/// TARGET payload word[1]：等枪后 sys_process_terminate() 正常退出。
 pub const TARGET_SUICIDE: u64 = 1;
 /// TARGET payload word[1]：等枪后解引用空指针（LoadAccess fault）。
 pub const TARGET_FAULT: u64 = 2;
@@ -27,7 +27,7 @@ pub const TARGET_MEMORY_CHURN: u64 = 4;
 pub const TARGET_GUARD_FAULT: u64 = 5;
 /// TARGET payload word[1]：真实同 AddressSpace 多线程映射与 join 组合验收。
 pub const TARGET_THREAD_SUITE: u64 = 6;
-/// TARGET payload word[1]：Running 期 ThreadSpawn 与异 hart ProcessKill 竞速。
+/// TARGET payload word[1]：Running 期 ThreadCreate 与异 hart ProcessKill 竞速。
 pub const TARGET_THREAD_SPAWN_RACE: u64 = 7;
 /// TARGET payload word[1]：仅余次线程时 ThreadExit 与异 hart ProcessKill 竞速。
 pub const TARGET_LAST_THREAD_EXIT_RACE: u64 = 8;
@@ -71,8 +71,8 @@ pub const HAMMER_CONTROL_RIGHTS: Rights =
 #[derive(Debug, Clone, Copy)]
 pub struct Cmd {
     pub action: u64,
-    /// KILL 的 exit code。
-    pub code: u64,
+    /// KILL 的 exit token。
+    pub token: u64,
     /// 执行前延迟（毫秒）：锤等枪后先 sys_sleep 再执行，时序变体用
     /// （对侧先行窗口）；0 = 醒后即打。
     pub aux: u64,
@@ -93,7 +93,7 @@ pub struct Report {
 /// 指令编码为消息 payload。
 pub fn encode_cmd(cmd: &Cmd) -> alloc::vec::Vec<u8> {
     let mut payload = alloc::vec::Vec::new();
-    for word in [cmd.action, cmd.code, cmd.aux] {
+    for word in [cmd.action, cmd.token, cmd.aux] {
         payload.extend_from_slice(&word.to_le_bytes());
     }
     payload
@@ -103,7 +103,7 @@ pub fn encode_cmd(cmd: &Cmd) -> alloc::vec::Vec<u8> {
 pub fn decode_cmd(payload: &[u8]) -> Option<Cmd> {
     decode_words::<3>(payload).map(|words| Cmd {
         action: words[0],
-        code: words[1],
+        token: words[1],
         aux: words[2],
     })
 }

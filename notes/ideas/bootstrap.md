@@ -117,7 +117,7 @@ Building → Running → Terminating → Dead
 - **JobControl**：创建、封口、分页枚举与按 ID 派生直接成员、故障收束的 authority，不是进程权限等级；
 - **MemoryPool**：page-backed storage authority；可以共享、移动和派生 child，但成功附入进程的 PoolBinding 不再是 Handle，也不可转移。
 
-Building 阶段的 Bind、BindExecution、Map/Write、Grant 与 ThreadCreate 各自是边界明确的原子组装动作；每个挂起线程在创建时已取得完整调度准入与离场资源。ProcessStart 只检查 AddressSpace 已 Bound、至少一条挂起线程、Job 门满足且没有其它 Building 操作在途，然后消费 builder、以有界尾段发布全部挂起线程。地址空间变更与启动发布是两个职责明确的协议，不把整个 ELF 装载包装为一笔巨型内存事务。
+Building 阶段的 Bind、BindExecution、Map/Write、Grant 与 ThreadCreate 各自是边界明确的原子组装动作；每个挂起线程在创建时已取得完整调度准入与离场资源。ProcessStart 只检查 AddressSpace 已 Bound、至少一条挂起线程、Job 门满足且没有其它 Building 操作在途，然后消费 builder、摘取预留发布链并发布全部挂起线程。地址空间变更与启动发布是两个职责明确的协议，不把整个 ELF 装载包装为一笔巨型内存事务。
 
 Bootstrap 与普通 Start 共用同一发布协议：资源准备全部发生在各自的创建动作中，Start 只复检 Job、生命周期和线程集合，提交后由明确 owner 完成不可失败的 Ready 交接。初始成员和 capabilities 尚私有、普通进程已经处于可观察的 Building，是输入所有权的差别，不产生第二套提交尾段。终止早于提交时拒绝启动，挂起线程经离场协议发布 DONE；晚于提交时由已提交启动责任与正常终止机制接管全部线程，不因尚未实际入队而丢失它们。ProcessControl 身份不因启动而更换。launcher 可以按配置保留、转交或立即关闭 control；关闭 control 不终止进程。Start 前失败保持目标不可运行，并由组装者决定重试或放弃后完整收束；已成功的 Bind、Grant 或 ThreadCreate 资源已归目标所有，不因后续失败自动退回。
 

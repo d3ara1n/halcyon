@@ -117,8 +117,12 @@ pub unsafe fn deliver_output<T: Copy>(
     unsafe { write_user_value(space, dst, value) }.map_err(|error| {
         let process = thread.process.clone();
         let todo = process.lifecycle.request_termination(
-            erhino_shared::proc::ProcessExitReason::Fault,
-            erhino_shared::proc::ProcessFaultCode::StoreAccess as i64,
+            erhino_shared::proc::TerminationCause::Faulted,
+            erhino_shared::proc::TerminationDetail::fault(
+                thread.member().tid(),
+                erhino_shared::proc::ProcessFaultCode::UserAccess,
+                dst as u64,
+            ),
             Some(thread.member()),
         );
         // 调用方仍可能持 Handle/Connection/AddressSpace 锁；IPI、debt 与通知
