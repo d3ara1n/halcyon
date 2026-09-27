@@ -34,13 +34,13 @@ trap 来源由硬件状态判定，不依赖可被用户伪造的内存标记。
 
 ## 用户态平台入口
 
-用户 ELF 的正式入口采用不返回的 `_start`。入口地址仍由 ELF 提供，内核不认识符号名或 runtime 包名。内核建立已准入的执行 profile、PC、栈和两项整数参数；用户平台适配器在调用任何普通 Rust/C 函数之前完成进程映像要求的寄存器准备。首线程适配归 runtime，工作线程适配归 libthread，共同使用 user/platforms 的平台契约。
+用户 ELF 的正式入口采用不返回的 `_start`。入口地址仍由 ELF 提供，内核不认识符号名或 runtime 包名。内核建立已准入的执行 profile、PC、栈和两项整数参数；用户平台适配器在调用任何普通 Rust/C 函数之前完成进程映像要求的寄存器准备。入口线程适配归 runtime，运行期线程 trampoline 归 libthread，共同使用 user/platforms 的平台契约。
 
 | 项目 | 内核/装载方的责任 | 用户平台入口的责任 |
 |---|---|---|
 | PC | 验证可执行映射，绑定线程执行需求 | 进入显式无编译器序言的适配段，不依赖 main 包装函数 |
 | SP | 交付可用且 16 字节对齐的用户栈；先有 backing，再允许执行 | 保持对齐；不切换成无 owner 的临时栈，不使用 red zone |
-| a0/a1 | 首线程为 StartupBlock 基址/字节数；工作线程为其显式上下文参数 | gp 准备不得破坏参数，首线程交 runtime 校验，工作线程交 trampoline |
+| a0/a1 | 入口线程为 StartupBlock 基址/字节数；运行期线程为其显式上下文参数 | gp 准备不得破坏参数，入口线程交 runtime 校验，运行期线程交 trampoline |
 | gp | 新出生现场不承诺继承调用者 gp | 每次入口从本映像的 `__global_pointer$` 初始化，包含所有新工作线程 |
 | tp | 当前不交付 TLS/TCB，出生为零 | 当前保持无 TLS；不将零当作有效 TLS 基址 |
 | ra | 没有合法调用方返回地址 | 所有入口最终调用受控 Exit，不 ret 到零或随机地址 |
@@ -48,7 +48,7 @@ trap 来源由硬件状态判定，不依赖可被用户伪造的内存标记。
 
 RISC-V psABI 要求标准过程入口和过程执行中 SP 保持 128 bit 对齐，gp/tp 不作通用临时寄存器；这些机器约定不要求引入 POSIX。a0/a1 的启动语义属于 eRhino 自有 ABI，不能由 argc/argv 的 Rust/C main 签名暗示。
 
-共同链接布局必须定义本映像的 `__global_pointer$`，由布局依据 small-data 可寻址窗口选择位置；初始化在首个符号数据访问之前完成，采用 psABI 推荐的 `.option push` / `.option norelax` PC-relative 装载序列 / `.option pop`。不能依赖某个链接器版本在未定义该符号时恰好不生成 gp-relative 访问，也不能只为首线程初始化 gp 后让其它线程从零开始。实现可共享平台汇编模板，但 libthread 与 libruntime 都不得通过相互依赖取得该知识。
+共同链接布局必须定义本映像的 `__global_pointer$`，由布局依据 small-data 可寻址窗口选择位置；初始化在首个符号数据访问之前完成，采用 psABI 推荐的 `.option push` / `.option norelax` PC-relative 装载序列 / `.option pop`。不能依赖某个链接器版本在未定义该符号时恰好不生成 gp-relative 访问，也不能只为入口线程初始化 gp 后让其它线程从零开始。实现可共享平台汇编模板，但 libthread 与 libruntime 都不得通过相互依赖取得该知识。
 
 首/工作入口仅做必要寄存器设置，然后以正常 psABI 跳转或调用相应 `extern C` Rust 桥接函数。工作入口的地址是单一平台 trampoline，具体任务通过稳定 packet 中的函数入口表达，避免为每个 F/T 重复定义全局汇编符号。函数入口由 libthread 在准备时构造，原始任意地址仍是 unsafe；packet 不因为保存函数指针就丢掉类型与资源证明。
 

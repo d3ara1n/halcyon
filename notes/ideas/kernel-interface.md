@@ -40,7 +40,7 @@ role 转换在入口验证一次。输入 role 不符、未满足该类型明确
 | 有预算的推进 | 返回 progress 和仍需推进的责任 | 已完成步骤不回滚，未完成 owner 与进度一起保留 |
 | 成功不返回 | 进程/线程或系统终局已经提交 | 仅在真实拒绝时返回错误；不得继续按成功结果运行 |
 
-Packet/SendOnce 的发送失败返还各自 owner；绑定 Pool、向 Building 进程 Grant、消费 ProcessBuilder 的 Start、消费 Invitation 的 Attach 分别遵守其提交点。Grant 输出的是目标进程的表项数值，不是调用者可关闭的本地 Capability。接口不得把目标数值误包装为本进程 owner。
+Packet/SendOnce 的发送失败返还各自 owner；绑定 Pool、向 Building 进程 Grant、在 Building 进程 ThreadCreate、消费 ProcessBuilder 的 Start、消费 Invitation 的 Attach 分别遵守其提交点。Grant 与 Building ThreadCreate 输出的是目标进程的表项数值，不是调用者可关闭的本地 Capability。接口不得把目标数值误包装为本进程 owner。
 
 Close 与业务停止不同。非映射表项的最后一次关闭可按内核预付退休契约完成；关闭 JobControl 不杀死成员，关闭 ProcessControl 不等于 ProcessDrain，关闭 Pool 不撤销已经分配的资源。用户态组合拥有的 drain/停止责任要先显式接管或交付，不能让 generic Capability 的 Drop 冒充已完成。
 
@@ -69,11 +69,11 @@ libkernel 不自动轮询 Mailbox、不因 Retry/Busy 创建 executor task，也
 |---|---|---|
 | object / capability | entry 描述、borrow、duplicate、Close、合法接管与转换 | 业务身份解释和管理政策 |
 | memory / mapping | Pool、MemoryObject、region、Map/Unmap/Protect、共享访问 view | allocator arena 策略、用户栈、文件缓存 |
-| process / thread 原语 | 控制能力、Create/Bind/Grant/Attach/Start、Query/Drain 单步、ThreadSpawn/Exit | ELF、ProcessBuilder 组合、监督、线程环境、结果与 Join |
+| process / thread 原语 | 控制能力、Create/Bind/BindExecution/Grant/Start、Query/Drain 单步、ThreadCreate/ThreadStart/ThreadExit、ProcessTerminate/ProcessAbort | ELF、ProcessBuilder 组合、监督、线程环境、Registry 与结果 |
 | ipc / notification / wait | Mailbox、sender、Delivery、Packet、通知角色、Tunnel、WaitSet 与等待 | RPC、Runnel/BufferQueue、事件任务、服务注册 |
 | startup view | 平台交付的稳定字节 view 和仅读验证边界 | libprocess 的身份/payload 解释、初始能力采用与分配 |
 | time / system / debug | 单调时间、期限、self 终止、受权系统复位和零堆诊断 | 语言终止政策、关机编排、日志服务 |
 
-ProcessControl/ThreadControl 的安全包装只拥有内核表项，不附带用户栈、closure 或进程监督责任。libthread 的 Join 与 libprocess 的监督组合持有这些包装再加自身资源；不同层不能对同一表项建立两份关闭 owner。
+ProcessControl/ThreadControl 的安全包装只拥有内核表项，不附带用户栈、closure 或进程监督责任。libthread 以共享引用持有同一 ThreadControl owner（公开 Thread 与 Registry record 共享，最后引用 Close），libprocess 的监督组合持有 ProcessControl；不同层不能对同一表项建立两份关闭 owner。
 
 接口实现时为每个出口记录可分配、可停驻和消费形态，不靠调用者记忆隐含前提。通用接口不预占尚未设计的设备 syscall；设备层在后续整体设计完成后加入同一资源责任规则。

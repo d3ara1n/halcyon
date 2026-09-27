@@ -19,15 +19,15 @@
 | `shared/erhino_shared` | 内核/用户共用 ABI、固定宽调用号、Handle/rights、Pid/Tid、结果布局与校验 | 不拥有用户侧调用代码、Rust 返回值政策或语言入口 |
 | `libkernel` | ecall、错误解码、内核资源 safe owner、映射、时间、Wait、Mailbox、Notification 等原语 | runtime 的低层依赖；不会自动取得 capability，不依赖上层执行或领域库 |
 | `libprocess` | 当前进程身份/启动上下文，以及独立的 Job/Process 构造、装载与监督组合 | runtime 消费上下文模块；不自动执行创建、管理或监督操作 |
-| `libthread` | 本进程线程的环境契约、栈、准备/发布、ThreadRecord/Observation、结果和 cleanup step | runtime 提供语言环境实现；其它消费者也可直接组合这套线程机制 |
-| `libruntime` | Rust `_start` 入口、allocator、panic/OOM/入口结束政策、PTR 和 ThreadDriver、线程环境实现 | 组合上述库；不复制 Process/Thread 类型、关闭账本或线程状态机 |
+| `libthread` | 本进程线程的环境契约、栈、准备/发布、ThreadRegistry/ThreadRecord、结果和 cleanup step | runtime 提供语言环境实现；其它消费者也可直接组合这套线程机制 |
+| `libruntime` | Rust `_start` 入口、allocator、panic/OOM/入口错误政策、ThreadRegistry 实例与线程环境实现 | 组合上述库；不复制 Process/Thread 类型、关闭账本或线程状态机 |
 | `libexecution` / `librpc` | 事件任务推进 / 请求应答协议 | 按用途选择，不是普通程序语言启动的必经路径 |
 
 libkernel 是 user workspace 的公共库，不因共享使用进入 shared workspace。它的 raw/safe 边界、值/borrow/owner、转换/失败返还及分配/停驻分类由 [用户态内核接口](kernel-interface.md) 唯一规定；本篇只拥有这些接口如何被上层组合。
 
 Pid/Tid 的固定宽表示来自 shared，当前进程视图和 Process 的领域操作来自 libprocess；只为了读取 PID 不需要持有 ProcessControl，也不应从 runtime facade 获取第二个 PID 类型。启动块中的身份是启动方提供的 provenance，不因外层格式校验就变成内核认证；IPC 鉴权依据内核 envelope 和实际 capability，不能使用该值冒充 caller 身份。
 
-自进程 ThreadSpawn、映射和退出依照内核既有隐含 self 作用域、绑定预算与准入规则；针对其它对象的管理或通信依赖相应能力。不虚构每个当前进程操作都需要一枚新 capability，也不因链接库而增加权限。
+自进程 ThreadCreate/ThreadStart、映射和离场依照内核既有隐含 self 作用域、绑定预算与准入规则；针对其它对象的管理或通信依赖相应能力。不虚构每个当前进程操作都需要一枚新 capability，也不因链接库而增加权限。
 
 ### 依赖图与 Cargo 边界
 
@@ -57,41 +57,41 @@ flowchart TB
 
 `libprocess` 的 context 为无 allocator 初始化副作用的基础模块；装载、构造和监督作为 `management` 功能集，才依赖 ELF、执行等知识。libruntime 对它使用关闭默认功能的 context 依赖；需要管理的 binary 显式启用 management。Cargo feature 是编译知识选择，不是 runtime 行为或权限开关；feature 被其它消费者合并启用，也不能自动启动服务或扩大授权。这样不必为一个 PID 再拆一层薄类型库，也不让 runtime 的基础依赖强制拉入进程管理的运行机制。
 
-libthread 不依赖 libprocess、libexecution 或 libruntime；进程内线程机制只消费内核的 self 作用域与明确交付的线程环境。进程管理者对新进程首栈/寄存器的外部组装仍由 libprocess 拥有，不以内部 ThreadSpawn 接口代替 Building ProcessAttach。
+libthread 不依赖 libprocess、libexecution 或 libruntime；进程内线程机制只消费内核的 self 作用域与明确交付的线程环境。进程管理者在 Building 期为新进程创建挂起线程、准备首栈与出生块仍由 libprocess 拥有，不以运行期 ThreadCreate/ThreadStart 接口代替。
 
 程序直接使用某领域 API 时显式导入其库。libruntime 可以暴露它实际拥有的组合，例如程序入口和 Rust 线程环境构造，但不把下层所有类型重导出成万能 std facade。替换 runtime 的实现只需满足平台入口与所消费的领域契约，领域库不随之更换。
 
 ### 启动上下文与入口方案
 
-runtime 经显式 no_main/entry! 取得平台入口参数，先作无堆验证，再初始化 allocator、PTR 和 Attached entry 环境，采用启动能力后才调用应用。启动映像的进程寿命、StartupSeed 的唯一来源、初始能力采用/失败以及 Context/Payload/Grants 的交付由 [bootstrap 的接收契约](bootstrap.md#用户态接收与一次性交接) 唯一规定。
+runtime 经显式 no_main/entry! 取得平台入口参数，先作无堆验证，再初始化 allocator、ThreadRegistry，并采用 `EntryThreadDescriptor` 把入口线程登记为普通 ThreadRecord，采用启动能力后才调用应用。启动映像的进程寿命、StartupSeed 的唯一来源、初始能力采用/失败以及 Context/Payload/Grants/入口线程描述的交付由 [bootstrap 的接收契约](bootstrap.md#用户态接收与一次性交接) 唯一规定。
 
 libkernel 提供底层稳定启动 view；libprocess::context 拥有 StartupSeed 与采用逻辑，并在充分的来源/角色证明下建立 libkernel Capability。libruntime 只在原始平台入口跨 unsafe 边界取得 Seed，不拥有第二份 Handle 表或进程身份。它在 StartupContext 就绪后构造应用参数和线程工厂，失败则进入明确的进程失败出口，不执行任何应用入口。
 
 Context 的只读身份和 payload 可以按各自规则复制/共享，初始 grant 只能转移一次。普通程序或领域库从显式交付的对象取用这些知识，不读取 runtime 私有 env。启动格式校验不认证身份，CurrentProcessInfo 不等于 ProcessControl；业务鉴权继续依赖内核 envelope 与真实能力。
 
-### 线程环境与 ProcessThreadRegistry 方案
+### 线程环境与 ThreadRegistry 方案
 
-libthread 拥有本进程线程的环境契约、工厂、准备/发布、结果和 ThreadRecord/ThreadObservation 机制；libruntime 提供具体 Rust 环境并持有进程级 `ProcessThreadRegistry`（PTR）及其 driver。公开 `Thread` 只持有可 Clone、可失效的观察/控制对象，不借用或拥有 PTR 内部记录。环境在创建工厂和准备入口时显式交付，每次 Attach/Spawn 都先登记稳定记录，不使用全局 runtime hook。线程的完整状态、失败与结果发布、DONE 与 Map 义务、清理边界由 [task](task.md#线程环境与结果交接) 唯一规定。libthread 不公开可绕过 wrapper 的安全 `thread::exit`；libkernel 的 unsafe `ThreadExit(code)` 只由 libthread 内部 trampoline、libruntime 首入口或其他受控 runtime 消费。
+libthread 拥有线程环境契约、工厂、ThreadRegistry（槽、唯一 cleanup claim、单步 reap、seal）、ResultCell 与公开 `Thread`/`JoinHandle<T>`；libruntime 只建立并持有一个进程级 Registry 实例、提供容量配置和 Rust 环境实现，不定义任何槽或状态规则。三类 owner 的寿命划分、结果仲裁与协作式回收由 [task](task.md#用户态线程资源收束) 唯一规定。libthread 不公开可绕过 wrapper 的安全线程离场；libkernel 的 unsafe `ThreadExit()` 只由 libthread trampoline、libruntime 入口或其他受控 runtime 消费。
 
-线程工厂还要求在准备前由 PTR 取得稳定记录和 cleanup 容量，确保调用者丢弃 `Thread` 后线程资源仍有唯一 owner。线程死亡只标记 KernelDone，只有 PTR driver 才能逐步收束 ThreadRecord。driver 属于 libruntime，可复用已有执行能力；libthread 不反向依赖 executor，也不因库链接自动启动消息泵或隐藏线程。driver 的调度时机、Attach 交接和关闭顺序由 [用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md)记录。
+不存在专职 cleanup driver 或隐藏线程。Registry 由线程 API 的调用点协作推进：prepare 前、子线程离场前和 join 观察到 DONE 时各执行有界 reap；已使用 libexecution 的程序可以把 DONE 登记为等待来源加速回收。回收不承诺及时，积压以 Registry 容量为上界，进程终局由 ProcessDrain 收回。
 
-这允许 runtime 依赖线程库而不出现反向知识依赖。通用接口只描述线程生命周期，不能把某个 runtime 的私有初始化惯例藏进抽象。ProcessAttach 和 ThreadSpawn 的记录构造方式可以不同，但进入 PTR 后复用同一 wrapper、结果发布和 cleanup 状态机；不能按 TID/PID 分支。当前 Rust profile 只支持一个 `_start` 入口，PM 的多 Attach 能力属于内核/其他 user contract，不自动成为 Rust runtime 能力。TLS、unwind、detach 不因此成为本次承诺。
+这允许 runtime 依赖线程库而不出现反向知识依赖。通用接口只描述线程生命周期，不能把某个 runtime 的私有初始化惯例藏进抽象。入口线程与运行期线程的出生授权不同，但登记后复用同一 record、结果和 cleanup 状态机，不按 TID/PID 分支。Rust profile 只有一个 `_start` 入口，由描述符一次采用强制；其他 Building 挂起线程需要其他入口契约。TLS、unwind、detach 不因此成为本次承诺。
 
 ### 消息、Notification 与运行时事件
 
 [消息](message.md) 的 Mailbox/Delivery 与 [Notification](signal.md) 的 OR 合并、take 语义归内核对象契约，用户安全接口在 libkernel；可在当前线程直接收发或等待，不要求额外监听线程。RPC 才增加请求/回复与调用责任，事件循环由 libexecution 拥有；二者按消费者需求组合。
 
-如果程序环境需要停止请求、协作取消或 PTR driver 唤醒等带语义的事件，libruntime 可以消费已授的 Mailbox/Notification 并组合线程/执行能力，但该事件协议与处理政策要单独明确。它不能把底层任意 pending 位当成终止授权，也不把 Notification 冒充 POSIX 异步 handler。处理器在普通受控执行上下文运行，不在任意用户指令位置注入。无事件入口的默认程序不创建业务监听线程，不预留虚构的 root channel；PTR driver 的最小执行上下文及其启动/关闭仍由运行时计划决定。
+如果程序环境需要停止请求、协作取消等带语义的事件，libruntime 可以消费已授的 Mailbox/Notification 并组合线程/执行能力，但该事件协议与处理政策要单独明确。它不能把底层任意 pending 位当成终止授权，也不把 Notification 冒充 POSIX 异步 handler。处理器在普通受控执行上下文运行，不在任意用户指令位置注入。无事件入口的默认程序不创建监听线程，不预留虚构的 root channel。
 
-消息/通知是普通程序可用的基础能力，不等于每个空程序都必须有一个业务活动接收器。runtime 的库依赖、启动时实际分配的资源和 PTR driver 行为分别记录；需要增加主动接收时必须定义 authority、预算、线程/观察 owner 及停止回收，不能仅用“程序需要 signal”跳过这些契约。
+消息/通知是普通程序可用的基础能力，不等于每个空程序都必须有一个活动接收器。runtime 的库依赖、启动时实际分配的资源和后台运行行为分别记录；需要增加主动接收时必须定义 authority、预算、线程/观察 owner 及停止回收，不能仅用“程序需要 signal”跳过这些契约。
 
 ### allocator、终止与平台边界
 
 领域库使用 core/alloc API，不选择全局分配器。libruntime 安装 allocator，但自身初始化/扩容所需的 Map/Unmap、基本关闭、诊断与退出必须不分配、不读尚未初始化的程序环境；runtime 依赖 libprocess/libthread 不意味着在堆就绪前调用它们所有接口。
 
-Rust 返回值到退出码的 `Termination` 归 libruntime；固定宽 `ExitCode` 和 `ProcessExit/ThreadExit` 归 shared。普通 Rust 线程以用户态 `T` 发布结果，wrapper 随后调用 libkernel 的 unsafe `ThreadExit(code)`；`ThreadControl::WAIT` 只观察 DONE，不取得 `T` 或逐线程退出码。`fn main` 返回只结束执行它的当前入口线程，不自动代替进程 Exit；末线程的进程终态仍由内核统一冻结。当前 abort 型 panic/OOM 策略保留，不因搬库引入 unwind。
+系统没有退出码：线程离场即完成，进程终局只记录 [task 的结构化原因](task.md#终局原因)。`fn main` 返回 `Ok` 只结束入口线程，入口线程与其他线程对等，进程在末线程离场时 Completed；返回 `Err`、panic 或 OOM 时 runtime 记录诊断后调用 `ProcessAbort()`。程序需要主动结束资源体时显式 `ProcessTerminate()`。普通 Rust 线程以 `ResultCell<T>` 交付结果，`ThreadControl` 只提供 DONE。当前 abort 型 panic/OOM 策略保留，不因搬库引入 unwind。
 
-用户平台 target JSON/ISA 与共同 ELF 布局由 `user/platforms/` 拥有，通用 `_start` 与 ThreadStartContext 的出生现场遵守 [执行环境入口契约](execution-context.md#用户态平台入口)。runtime 提供 Attached entry 语言适配，libthread 提供 Spawned wrapper 适配，两者都先完成无 Rust 序言的平台寄存器准备，再进入同一用户态线程状态机。目标用户程序使用 no_main/entry!，保留必需 panic/OOM handler，删除 lang_start/argc/argv 借位；内核自己的入口不依赖用户 Rust 返回值政策。具体入口文件、链接和反汇编验证门由分层计划拥有。
+用户平台 target JSON/ISA 与共同 ELF 布局由 `user/platforms/` 拥有，通用 `_start` 与 ThreadStartContext 的出生现场遵守 [执行环境入口契约](execution-context.md#用户态平台入口)。runtime 提供入口线程适配，libthread 提供运行期线程 trampoline，两者都先完成无 Rust 序言的平台寄存器准备，再进入同一用户态线程状态机。目标用户程序使用 no_main/entry!，保留必需 panic/OOM handler，删除 lang_start/argc/argv 借位；内核自己的入口不依赖用户 Rust 返回值政策。具体入口文件、链接和反汇编验证门由分层计划拥有。
 
 host 测试覆盖纯值、校验和既有注入状态机；真实 syscall 仅由受支持目标后端执行。不能把 host panic stub 当成 syscall 证据，也不为可替换 runtime 再造一个全局可切换后端或临时 runtime。验证同时覆盖 Cargo 功能组合、依赖方向、入口/全局符号和初始化顺序。
 

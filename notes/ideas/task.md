@@ -37,11 +37,26 @@ Building -> Running -> Terminating -> Dead
 
 Building 不是一笔必须整体回滚的大事务，而是若干各自原子的资源附入：内存绑定、Map/Write、capability Grant、线程 Attach 以及未来其它资源绑定分别完成，成功项立即属于目标；后续失败不把已经交付的 capability 或资源倒流回组装者。`ProcessBindMemory` 是唯一页资源绑定操作，消费 Pool Handle 并把 AddressSpace 从 Unbound 转为 Bound；绑定事务语义由[内存模型](mm.md)唯一拥有。未绑定进程仍是合法 Building 壳，可以接收不依赖地址空间的 grants，也可以被放弃或终止。
 
-ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止和执行需求对兼容调度域绑定的冻结点。Start 必须同时确认内存已绑定、至少一条线程已附入、所需执行资源已满足、Job 启动门开放，并且除 Start 自身外没有 Building 操作在途。Building 操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、Attach 或 Bind。
+ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止点。执行需求在第一次线程创建前由独立 Building 绑定固定，线程创建据此取得全寿命调度准入；Start 不再接收执行描述、不选择调度域、不分配交接或调度结构，只确认内存已绑定、至少一条挂起线程已创建、Job 启动门开放、除 Start 自身外没有 Building 操作在途，然后关闭组装权并以有界尾段发布全部已准备的挂起线程。Start 可以因并发终止、Job seal 或在途组装被拒绝，但不因资源不足失败。Building 操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、ThreadCreate 或 Bind。
 
 Terminating 阶段禁止新线程和新等待，撤销 Ready、取消 Waiting，并等待各 hart 上的 Running 线程离场。随后管理者以有界操作先收束 HandleTable，再收束地址空间；Unbound 地址空间直接完成该阶段，Bound 地址空间只有在事务、lease、backing 与页表全部经有界 drain 释放后才完成。全部资源收束后进程进入 Dead，ProcessControl 的 CLOSED 才发布，因此等待 CLOSED 是资源收束完成屏障，不只是终止请求已受理。
 
-Exit、fault、ProcessKill 与 Building abandonment 在各自适用的 Building 或 Running 状态竞争进入 Terminating 的唯一线性化点；用户态 JobKill 最终也只对成员执行同一个 ProcessKill 原语。首个完成转换者冻结终因与退出码，后续事件只能协助收束，不得覆盖已经可观察的终态事实。ProcessKill 成功表示请求已被接受或目标此前已经越过不可逆终止边界，不表示 teardown 已完成；自杀式调用不返回用户态。
+Completed（末线程离场）、ProcessTerminate、fault、ProcessKill 与 Building abandonment 在各自适用的 Building 或 Running 状态竞争进入 Terminating 的唯一线性化点；用户态 JobKill 最终也只对成员执行同一个 ProcessKill 原语。首个完成转换者冻结结构化终局原因，后续事件只能协助收束，不得覆盖已经可观察的终态事实。ProcessKill 成功表示请求已被接受或目标此前已经越过不可逆终止边界，不表示 teardown 已完成；自杀式调用不返回用户态。
+
+### 终局原因
+
+进程是资源体，不是交付一个整数结果的作业；线程是执行体，离场即完成。系统不设进程或线程退出码。进程终局只记录内核能证明的原因：
+
+| 原因 | 触发 | 附带事实 |
+|---|---|---|
+| `Completed` | 所有线程离场，进程达成完成 | 无 |
+| `Terminated` | 进程主动 `ProcessTerminate()`，未达成完成即结束 | 无 |
+| `Aborted` | 所选 runtime 判定程序无法继续（panic、OOM、入口返回错误）并调用 `ProcessAbort()` | 无 |
+| `Killed` | 经 ProcessControl 或 Job authority 终止 | 发起来源类别 |
+| `Faulted` | 内核检测到不可恢复用户 fault | tid、稳定 fault 类型、地址 |
+| `Abandoned` | Building 期未 Start 即放弃 | 无 |
+
+程序只能选择 Completed（让线程全部离场）、Terminated 或 Aborted；Killed/Faulted/Abandoned 是内核事实，用户不能伪造。失败细节、配置错误或业务状态走日志或与监督者的 IPC 协议，不塞入终局字段。监督者依据原因决定重启、隔离或上报。
 
 Running→Terminating 的准入截止与 AddressSpace Commit 共享 Process execution gate。Commit 按 AddressSpace lock 在外、execution gate 在内的顺序取得两者；终止只在 gate 内发布截止，释放后才接管 AddressSpace，不反向取锁。终止先线性化时，尚未 Commit 的 Running 内存事务必须回滚且结果 cookie 保持零；事务 Commit 先线性化时，终止路径只能接管并等待其 synchronize/retire，不能把已承诺结果重新解释为失败。Building Bind/Map/Write/Grant/Attach 使用登记获胜的 operation lease，Start 与终止负责关闭新登记并等待已有 lease；两类事务共享 gate，但不能混用 Commit 与登记两个胜负点。
 
@@ -71,9 +86,9 @@ ProcessDrain 可以由受信任的进程管理服务专职承担，由根监督�
 
 线程属于且仅属于一个进程，持有独立 UserContext 与 FP 状态；栈是进程资源，由组装者或进程自己供给。只有线程参与调度；进程提供资源环境与执行需求，不是调度队列成员。
 
-内核无「主线程」角色；ProcessAttach 产生的是构建期附入线程，ThreadSpawn 产生的是运行期线程。附入线程携带出生信息是启动交接需要，不赋予数字身份任何政策含义。选定 user contract 为 Attached/Spawned 建立同一类进程级线程记录；ThreadSpawn 在提交前预登记，Attached 由构建者准备交接、在子进程入口采用。线程栈、结果和 control 是记录中的线程资源，进程仍负责最终资源域。
+内核无「主线程」角色。线程统一经 **ThreadCreate → 启动** 两段出生：ThreadCreate 创建完整但挂起的线程（UserContext、全寿命调度准入、成员登记和 ThreadControl），失败零副作用；挂起线程不运行、不入 Ready。Building 期由 ProcessControl authority 在目标进程创建，Control 原子安装到目标 HandleTable，并只能由 ProcessStart 批量发布；Running 期由进程对 self 创建，Control 交给调用者，由 ThreadStart 单独发布。两种 authority 与发布点不同，线程对象、准入和离场协议相同，出生信息只是启动交接需要，不赋予数字身份政策含义。
 
-**进程的生 = Start 入册（至少一个附入线程已在表），进程的死 = 末线程离场**——线程 presence 从两端定义进程生命周期。无线程的进程停留在 Building，从未活过；构建期附入线程和运行期生成线程的用户态 cleanup 契约由所选 runtime 决定。
+**进程的生 = Start 发布（至少一个挂起线程已创建），进程的完成 = 末线程离场**。末线程离场使进程以 Completed 进入 Terminating；Dead/CLOSED 仍以资源 Drain 完成为准。无线程的进程停留在 Building，从未活过；挂起未启动的线程被终止或放弃时同样经离场协议发布 DONE。
 
 线程任意时刻恰处于一个稳定所有权容器：
 
@@ -89,7 +104,7 @@ ProcessDrain 可以由受信任的进程管理服务专职承担，由根监督�
 
 ## 组装双通道
 
-线程、内存、句柄与其它资源各有外部组装通道和内部运行通道。外部通道由唯一 ProcessBuilder 在 Building 期执行一次性 Bind、Map/Write、Grant 与 Attach；内部通道由 Running 进程自己的 syscall 执行 Map/Unmap、Spawn 与 Transit。两条内存通道只区分 authority 与可用阶段，共用[内存模型](mm.md)定义的 Bound AddressSpace、backing 和事务；连续堆顶不构成第三套内核映射机制。
+线程、内存、句柄与其它资源各有外部组装通道和内部运行通道。外部通道由唯一 ProcessBuilder 在 Building 期执行一次性 Bind、执行需求绑定、Map/Write、Grant 与 ThreadCreate；内部通道由 Running 进程自己的 syscall 执行 Map/Unmap、ThreadCreate/ThreadStart 与 Transit。两条内存通道只区分 authority 与可用阶段，共用[内存模型](mm.md)定义的 Bound AddressSpace、backing 和事务；连续堆顶不构成第三套内核映射机制。
 
 自然组装顺序是：
 
@@ -98,65 +113,75 @@ ProcessCreate
   -> ProcessBindMemory
   -> ProcessMap / ProcessWrite
   -> ProcessGrant
-  -> ProcessAttach
+  -> ProcessBindExecution
+  -> ThreadCreate(Building)
   -> ProcessStart
 ```
 
-ProcessGrant 可以在内存绑定前独立完成，因为 HandleTable 属于空壳；但 Map、Write、线程 Attach 与 Start 都要求 Bound AddressSpace。未来 KernelMemoryBudget、CPU 预约或设备资源各自使用独立绑定/Grant，不引入万能资源包或重新扩大 ProcessCreate 事务。Start 只发布已经满足 readiness 的资源环境；组装者在 Start 之后不再持 Builder authority。
+ProcessGrant 可以在内存绑定前独立完成，因为 HandleTable 属于空壳；但 Map、Write、ThreadCreate 与 Start 都要求 Bound AddressSpace，ThreadCreate 还要求执行需求已绑定。执行需求绑定一次且不可改变，不由首个线程隐式决定。未来 KernelMemoryBudget、CPU 预约或设备资源各自使用独立绑定/Grant，不引入万能资源包或重新扩大 ProcessCreate 事务。Start 只发布已经满足 readiness 的资源环境；组装者在 Start 之后不再持 Builder authority。
 
 创建子进程不隐式继承父进程权限。launcher 在 Building 期通过 ProcessGrant 明确选择 capability 与目标 rights，每项目标 rights 只能缩小；Grant 一旦成功就是独立完成的所有权转移，不因后续 Bind、Attach 或 Start 失败而回到组装者。opaque payload 同样由组装者在 Start 前写入目标地址空间，Start 只发布已组装完成的资源环境。`parent_pid` 仅记录创建关系，与 capability 派生无关。
 
 ## 多线程终止边界
 
-多线程进程必须维护成员关系与 active-hart 集合。进程回收要先阻止任何线程再次返回用户态，再取消 Ready/Waiting，并请求各 hart 上的 Running 线程在安全边界自行离场。active 身份既服务终止屏障，也为地址空间 translation epoch 提供执行点快照：hart 只有在完成已承诺的地址翻译同步并切回 kernel satp 后才能清除身份，快照后进入者必须在返回用户态前观察最新 epoch。最后一个终止确认到达且在途地址空间事务完成后，管理者才能分批回收页表和数据帧。ThreadSpawn 必须复用同一成员关系、active-hart barrier 与 WaitContext cancellation；线程消散可以放弃回复，但其 departed/join 完成不能越过仍挂接结果记录的 committed System Call。join 确认线程离场且该挂接已解除后，用户态才可接管结果并按[内存模型](mm.md)解除或复用其栈。
+多线程进程必须维护成员关系与 active-hart 集合。进程回收要先阻止任何线程再次返回用户态，再取消 Ready/Waiting、离场挂起线程，并请求各 hart 上的 Running 线程在安全边界自行离场。active 身份既服务终止屏障，也为地址空间 translation epoch 提供执行点快照：hart 只有在完成已承诺的地址翻译同步并切回 kernel satp 后才能清除身份，快照后进入者必须在返回用户态前观察最新 epoch。最后一个终止确认到达且在途地址空间事务完成后，管理者才能分批回收页表和数据帧。运行期 ThreadCreate/ThreadStart 复用同一成员关系、active-hart barrier 与 WaitContext cancellation；线程消散可以放弃回复，但其 DONE 不能越过仍挂接结果记录的 committed System Call。DONE 且该挂接已解除后，用户态才可按[内存模型](mm.md)解除或复用其栈。
 
 ## 用户态线程资源收束
 
-内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈。libthread 拥有 ThreadRecord、ThreadObservation、结果发布和 cleanup 状态机；进程运行环境建立并持有 `ProcessThreadRegistry`（PTR），PTR 独占已采用 ThreadRecord 的生命周期 owner。公开 `Thread` 只持有可 Clone、可失效的观察/控制对象，不借用或拥有 ThreadRecord；ThreadControl 仍由 libkernel 提供。Attached 与 Spawned 的产生事务可以不同，但采用到 PTR 后使用同一记录和状态机，不按 TID/PID 分支。构建者至 PTR 的 Attached 所有权转移和异常路径仍须先在计划中闭合。
+内核只创建执行现场与可等待的 ThreadControl，不分配或接管用户栈，也不记录线程结果。用户态按寿命把线程责任拆成三个 owner，不以一个 record 承载不同寿命：
 
-ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 joiner 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。
+| owner | 内容 | 寿命 | 提供者 |
+|---|---|---|---|
+| `ThreadRecord`（Registry 槽） | 栈 region、环境残余状态、Control 引用、cleanup 进度 | 登记至 DONE 后机械 cleanup 完成 | libthread `ThreadRegistry` |
+| 共享 ThreadControl | 内核 entry 与持久 DONE | 最后一个引用释放时 Close | libkernel 类型，Arc 共享 |
+| `ResultCell<T>` | 一次性结果与领取/放弃仲裁 | 结果被领取或析构，最后一个引用释放内存 | libthread |
 
-### 线程环境与结果交接
+`ThreadRegistry` 的机制（固定容量槽、唯一 cleanup claim、单步 `reap_step`、seal）全部属于 libthread，只对环境类型泛型，不含任务或结果类型。所选 runtime 建立并持有一个进程级实例、提供容量与环境实现；不存在跨库登记端口或第二份槽规则。公开 `Thread` 持有共享 ThreadControl，DONE 是持久事实，观察永不失效；结果领取权 `JoinHandle<T>` 持有 `ResultCell<T>`。record 退休不影响观察与结果，未领取结果也不占 Registry 槽。
 
-libthread 拥有本进程线程的准备、发布、结果和回收机制。`ThreadEnvironment`、`ThreadFactory`、`PreparedThread`、`ThreadRecord`、`ThreadObservation` 和公开 `Thread` 是拟定的接口角色：调用者构造工厂时显式提供运行环境和抽象登记端口，工厂在 syscall 前登记稳定记录；具体 PTR 由 libruntime 持有，libthread 不反向依赖它。所选语言 runtime 可以实现该环境；需要线程的通用库只消费 `Thread`/结果领取契约，不导入具体 runtime。ProcessAttach 与 ThreadSpawn 在进程构建/运行阶段分别产生记录，接入 PTR 后不再区分线程身份。
+ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 cleanup 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。
 
-环境是显式的生命周期接口：父侧准备可发送的每线程状态，子侧进入/离开，DONE 后可在收束者侧退休。接口只理解这些阶段，不含具体 runtime 类型、默认全局 hook 或服务政策。语言环境实现必须在自己的状态中记录部分成功，不允许线程库猜测哪些外部资源已建立。当前只承诺 abort 型 Rust 环境，不因接口预留接点建设 TLS、unwind 或 detach。
+### 线程环境
 
-### 准备与发布
+`ThreadEnvironment` 是显式生命周期接口：创建侧准备可发送的每线程状态，子侧进入/离开，DONE 后 cleanup 侧退休残余状态。retire 必须有界且不停驻，因为它在 cleanup step 中执行；enter/leave 在线程自身执行，可以执行任意语言初始化。实现必须在自身状态记录部分成功，线程库不猜测外部资源。当前只承诺 abort 型 Rust 环境，不建设 TLS、unwind 或 detach。
 
-工厂使用调用方选择的栈策略和已配置的 PTR 记录容量；不存在脱离程序环境的隐式默认工厂。准备之前先在 PTR 预留完整记录和 cleanup 责任，供正常、失败、控制 handle 丢弃和取消路径共同使用。槽的容量和计费由显式资源配置决定，不在失败路径临时分配，也不以任意新常数限制线程总量。
-
-准备顺序是：登记端口取得记录/容量准入 → 入口/结果 packet 与环境的可失败准备 → 带 guard 的栈 → PreparedThread。每一步失败都由登记端口/PTR 记录完整返还尚未执行的任务、环境状态与已取得资源；调用者可以取消或由 runtime driver 继续处理，线程尚未进入 Running。便利 spawn 可以将 prepare/start 组合，但不能丢失 PTR 的清理责任。
-
-PreparedThread 的 start 只提交一次 ThreadSpawn，失败返回 PreparedThread 而不是销毁任务，成功后返回公开 `Thread`/一次性结果领取接口，生命周期记录仍由 PTR 持有。子线程可能在发起侧收到 syscall 返回前运行，所以所有 packet 地址、环境、结果槽与回收责任必须在提交前稳定；不能在 syscall 成功之后才登记 PTR 记录。结果领取权可在 record cleanup 后继续存在时的存储寿命、无人领取时的析构及过期语义尚未冻结，不以一个可失效观察壳代替所有权证明。不得在进入 syscall 时持有子线程退出必须取得的用户锁。
-
-内核发布成功但输出不符合固定结果契约属于完整性失败，不能当作未启动并释放栈。正常错误遵守未发布返还；完整性失败只能进入进程故障策略，不能伪造可重试 PreparedThread。
-
-### 子侧环境与结果发布
+### 创建、登记与启动
 
 ```text
-Registered → Starting → Running
-                    → ResultPublished / Unpublished
-                    → ThreadExit → KernelDone
-                    → Retiring → Retired
+prepare: Registry 槽准入 → 环境准备 → 带 guard 的栈 → ResultCell/packet
+  → ThreadCreate（挂起，取得 Control）→ 登记 ThreadRecord
+  → ThreadStart → Thread + JoinHandle<T>
 ```
 
-公开 Thread 只操作自己的观察/控制对象，不与 PTR 同时取得 ThreadRecord 的 `&mut`。DONE 前，子侧是其任务与环境状态的唯一执行者；DONE 后，PTR 才取得 cleanup claim。共享发布字使用原子操作，任务/结果存储的已初始化状态独立维护，不能用一枚含义混杂的 done 位描述全部事实。
+线程在 Create 与 Start 之间不运行，因此 record、packet 与 ResultCell 在 Start 之前已经稳定，不存在“子线程早于 syscall 返回运行”的登记竞争。Start 前的每一步失败按反向顺序返还；ThreadCreate 已成功而放弃启动时，关闭挂起线程由内核离场并发布 DONE，record 随后按普通 cleanup 收束，closure 在放弃者线程上 Drop。ThreadStart 的拒绝返还 PreparedThread。内核成功但固定输出不符合契约属于进程完整性失败，不伪造可重试状态。进入 syscall 时不得持有子线程退出所需的用户锁。
 
-子侧进入失败时不运行任务，保留未执行 closure 和部分环境状态，发布 EnterFailed。正常任务返回先将 T 放入明确已初始化的存储，再完成环境 leave；leave 失败也必须保留这个 T，并报告单独的环境结束错误。最终 publication 用 release 发布完整 outcome，之后只执行不再访问业务数据的 ThreadExit。PTR 在 DONE 后 acquire 观察发布状态，再逐步处理 cleanup；结果发布早于 DONE 不允许提前回收栈。
+Building 期创建的线程由构建者供栈（Building Map）并在 StartupBlock 写入版本化 `EntryThreadDescriptor`（子侧 Control 值、reservation 与 usable 范围）。子进程 runtime 入口用一次性原子采用该描述，在自身 Registry 中登记 record 后才进入应用 wrapper。Rust profile 只有一个 `_start` 采用者，第二次进入 `_start` 是进程完整性失败；其它 Building 线程须使用别的入口契约。采用前进程终止时这些都是进程资源，由 ProcessDrain 收束，不跨地址空间运输 Rust 对象。
 
-线程未经过终结包装器而结束时，DONE 不证明任务返回或环境已经正常离开。PTR 内部必须保留 `Unpublished` 等事实状态，不读取未初始化的 T；这不是普通 Rust 线程的安全结果，而是 raw/unsafe 逃生后的诊断和完整性边界。closure 是否已经移入调用栈、结果是否实际已写入、环境的哪些动作已完成分别依据状态恢复；不能对已移走 closure 执行第二次 Drop，也不能从抛弃的任意调用栈恢复 Rust 局部变量。底层 `ThreadExit(code)` 由 libkernel 提供，libthread 不声明可绕过 wrapper 的安全出口；其他语言 runtime 可以在自己的 wrapper 中消费该原语。进程终止仍是进程级最终资源边界。
+### 结果发布
 
-闭包及返回值需要 Send 与静态拥有的捕获，不提供借用调用者栈的 scoped thread。任务、结果和环境状态只能被移出/丢弃一次；具体环境若违反其 unsafe 初始化/终结契约，按进程完整性失败处理，不继续交付可能已损坏的语言对象。
+`ResultCell` 以单个原子状态 `Empty → Published | ReceiverGone` 仲裁 T 的唯一移动或析构，且 T 总在用户线程上 Drop：
 
-### Join、期限和清理
+| 路径 | 动作 |
+|---|---|
+| 子线程正常返回 | 写入 T → 环境 leave → CAS Empty→Published（release）；失败说明领取方已放弃，子线程自行 Drop T |
+| 子线程 enter 失败 | 不运行 F，在子线程 Drop F，发布 EnterFailed |
+| JoinHandle 领取 | 观察 DONE → acquire 读取：Published 取出 T；Empty 返回 Incomplete，不读取未初始化内存 |
+| JoinHandle Drop | CAS Empty→ReceiverGone；失败说明已发布，在本线程取出并 Drop T |
 
-Thread 的等待以 ThreadControl DONE 为事实。期限只限制本次观察/重试政策，不杀子线程、不撤销已提交 MemoryChange，也不改变 PTR 的生命周期 owner。观察期限到达或 capability 失效时，公开 Thread 只报告观察结果；结果领取和 cleanup 仍由 PTR/运行时 driver 负责。
+leave 失败保留 T 并单独报告环境错误。Incomplete 只出现于绕过 wrapper 的 raw ThreadExit 或完整性故障；libkernel 的 `ThreadExit()` 是 unsafe 原语，libthread 不提供可绕过 wrapper 的安全 exit。闭包及返回值需要 Send 与静态拥有的捕获，不提供 scoped thread。
 
-DONE 后 PTR 才能确认 ThreadOutcome 是否可交付，并以单步状态机收束环境、packet、栈映射和 Control。至少保留足够的离场证明到栈已不再被执行；环境需要最后依赖的资源必须比它晚释放。已取得的返回值不因 Unmap 失败被丢弃；领取、无人领取时的析构和 record 退休必须恰好一次，具体结果存储与领取权的寿命边界留在工作计划中冻结。失败后重新推进不得重复环境析构、Control close 或 outcome 领取。wait、Control close、固定输出不一致和 Unmap 永久错误必须进入 PTR 的明确状态，不能由 public Thread 的 Drop 或 abandoned 计数吞掉。
+### 离场与 cleanup
 
-PTR 的 cleanup driver 与任何外部执行器使用同一收束状态机。一次推进执行一个有界动作或返回观察/重试请求；libthread 不依赖具体 executor，libruntime 负责把 driver 接入已有运行体或其他执行上下文。同步观察和异步推进使用相同结果，不另写第二套 Busy 重试规则。
+`ThreadExit()` 不带参数：线程离场即完成。DONE 后 `reap_step` 只执行机械动作：环境 retire、释放 Control 引用、Unmap 栈、归还槽；Busy 返回 Wait，永久错误保留 record 并进入进程完整性故障，不降级为计数或 panic。任意用户代码（F、T、enter/leave）从不在 cleanup 中执行。
 
-尚未开始的 PreparedThread 取消只回收未发布资源；Thread 只放弃观察/控制权，不触碰 PTR owner；ThreadRecord 的 cleanup 只有 PTR driver 可以推进。PTR 预先取得记录、容量和计费，确保原调用者退出后责任仍然存在。具体 driver 的调度时机、关闭顺序和失败政策仍记入本计划 TODO，不把“没有调用者控制 handle”误写成“没有生命周期 owner”。
+系统没有专职 driver 线程，cleanup 为协作式推进，契约只承诺容量不被已死线程占用，不承诺及时回收：
 
-PTR 是已采用记录的进程级唯一生命周期 owner：Spawned 在提交前预登记，Attached 在入口采用构建者预备的交接；线程死亡只推进到 KernelDone，不能因观察 handle 消失而删除 record。libruntime 的 ThreadDriver 负责在确定时机调用 PTR 的单步 cleanup；它可以复用 libexecution，但不把 supervisor 或隐藏线程写进 libthread 契约。ProcessDrain 是最后执行者无法继续用户态 cleanup 时的内核终局，不替代正常 PTR 回收。driver 具体调度、Attached control/栈 owner 的启动交接、结果领取寿命、关闭顺序和容量预算仍由 [用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md)记录。
+- prepare 取槽前先 reap 已 DONE 的记录，槽耗尽只说明确有等量线程仍活着或 Busy；
+- 线程 wrapper 在 ThreadExit 前对其它已 DONE 记录做有界次数 reap；
+- join 观察到 DONE 时推进一次 reap；
+- 已运行 libexecution 的程序可把 DONE 登记为等待来源加速回收，不创建隐藏线程。
+
+积压以 Registry 容量为上界；进程终局时剩余 record、自身栈和最后离场线程的资源由 ProcessDrain 收束，这是正常终局而非泄漏。期限只限制本次观察，不杀子线程、不撤销已提交 MemoryChange。Thread 与 JoinHandle 的 Drop 不等待、不触碰 record。
+
+### 入口线程与程序终局
+
+runtime 入口线程与其它线程对等：`main` 返回 `Ok` 只结束该线程，进程在全部线程离场时 Completed；返回错误、panic 或 OOM 由 runtime 记日志后 `ProcessAbort()`。程序需要在未完成时结束整体，显式调用 `ProcessTerminate()`。施工计划见 [用户内存 owner 计划](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md)。

@@ -9,6 +9,8 @@
 
 当前前置：[用户态映射 owner 的线程退休接力](todo-2026-09-14-user-memory-owner-lifecycle.md#跨会话接力断点)，在既有执行基座上闭合同进程跨线程承接与活性；其它映射扩展仍按需求触发。
 
+本轮设计审阅处置：[用户态分层与线程生命周期](review-2026-09-26-runtime-thread-design.md)，固定审阅 `d4ed354`、`67b9303`；线程迁移施工前闭合报告所列契约。
+
 ## 近期顺序
 
 1. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
