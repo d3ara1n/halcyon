@@ -2,12 +2,8 @@
 //! 是其唯一正常出口（验证 Waiting 取消与幂等竞争，见 init 剧本）。
 
 #![no_std]
-#![no_main]
 
 extern crate libruntime;
-
-#[used]
-static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use libkernel::{
     ipc::{notification, wait_set::WaitSet},
@@ -18,12 +14,13 @@ use libkernel::{
     sys_sleep,
 };
 
-fn app_main() {
-    if libruntime::startup::startup_payload() == b"ipc-kill" {
-        ipc_kill_target();
+fn main() {
+    let mut startup = libruntime::startup::take().expect("target startup context is missing");
+    if startup.payload() == b"ipc-kill" {
+        ipc_kill_target(&mut startup);
     }
-    if libruntime::startup::startup_payload() == b"retirement" {
-        retirement_target();
+    if startup.payload() == b"retirement" {
+        retirement_target(&mut startup);
     }
     debug!("target alive");
     loop {
@@ -32,19 +29,27 @@ fn app_main() {
     }
 }
 
-fn ipc_kill_target() -> ! {
-    let owner = libruntime::startup::startup_handle(0).expect("IPC kill target missing Close owner");
-    let control = libruntime::startup::startup_handle(1).expect("IPC kill target missing Drain control");
-    let ready = libruntime::startup::startup_handle(2).expect("IPC kill target missing ready signaler");
-    let done = libruntime::startup::startup_handle(3).expect("IPC kill target missing Drain completion signaler");
-    let close = libthread::Builder::new()
+fn ipc_kill_target(startup: &mut libruntime::startup::StartupContext) -> ! {
+    let owner = startup
+        .take_handle(0)
+        .expect("IPC kill target missing Close owner");
+    let control = startup
+        .take_handle(1)
+        .expect("IPC kill target missing Drain control");
+    let ready = startup
+        .take_handle(2)
+        .expect("IPC kill target missing ready signaler");
+    let done = startup
+        .take_handle(3)
+        .expect("IPC kill target missing Drain completion signaler");
+    let close = libruntime::thread::Builder::new()
         .spawn(move || {
             // SAFETY: startup 转入的 owner 只有本线程承担关闭责任。
             unsafe { libkernel::ipc::object::close(owner) }
                 .expect("IPC target committed Close failed");
         })
         .expect("IPC Close thread spawn failed");
-    let drain = libthread::Builder::new()
+    let drain = libruntime::thread::Builder::new()
         .spawn(move || {
             loop {
                 match libkernel::process::drain(control, 128) {
@@ -60,7 +65,7 @@ fn ipc_kill_target() -> ! {
         })
         .expect("IPC Drain thread spawn failed");
     notification::signal(ready, 1).expect("IPC target active publication failed");
-    // 两个 JoinHandle 与未返回线程由正式进程退出路径接管；主线程进入用户 spin，
+    // 两个 ResultReceiver 与未返回线程由正式进程退出路径接管；主线程进入用户 spin，
     // 外部 Kill 允许与 Close/Drain 的自然完成或取消竞速，精确 Waiting 窗口由 GDB 取证。
     loop {
         core::hint::black_box((&close, &drain));
@@ -68,9 +73,13 @@ fn ipc_kill_target() -> ! {
     }
 }
 
-fn retirement_target() -> ! {
-    let source = libruntime::startup::startup_handle(0).expect("retirement target missing observation source");
-    let ready = libruntime::startup::startup_handle(1).expect("retirement target missing ready signaler");
+fn retirement_target(startup: &mut libruntime::startup::StartupContext) -> ! {
+    let source = startup
+        .take_handle(0)
+        .expect("retirement target missing observation source");
+    let ready = startup
+        .take_handle(1)
+        .expect("retirement target missing ready signaler");
     let set = WaitSet::create(256).expect("retirement target WaitSet creation failed");
     for cookie in 0..256 {
         set.register(WaitItem::new(source, ObjectSignals::READABLE, cookie))
@@ -83,5 +92,3 @@ fn retirement_target() -> ! {
         unsafe { sys_sleep(1000).expect("retirement target sleep failed") };
     }
 }
-
-libruntime::entry!(app_main);

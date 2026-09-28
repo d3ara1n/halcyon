@@ -1,6 +1,7 @@
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::{alloc::Layout, panic::PanicInfo};
-#[cfg(target_arch = "riscv64")]
-use core::arch::asm;
 
 use erhino_shared::mem::MemoryProtection;
 use erhino_shared::sync::spin::SimpleLock;
@@ -12,15 +13,16 @@ use libkernel::{
     ThreadControl,
 };
 use libprocess::context::StartupContext;
-use libthread::{NoEnvironment, ThreadRegistry};
+use libthread::{NoEnvironment, ResultReceiver, ThreadFactory, ThreadRegistry};
 use lock_api::Mutex;
 use talc::{base::binning::Binning, base::Talc, source::Source, TalcLock};
 
 unsafe extern "C" {
-    fn __halcyon_main() -> !;
+    #[link_name = "main"]
+    fn rust_main() -> isize;
 }
 
-pub trait MainOutcome {
+trait MainOutcome {
     fn finish(self) -> !;
 }
 
@@ -31,14 +33,15 @@ impl MainOutcome for () {
     }
 }
 
-impl<E> MainOutcome for Result<(), E> {
+impl<E: core::fmt::Debug> MainOutcome for Result<(), E> {
     fn finish(self) -> ! {
         match self {
             Ok(()) => {
                 // SAFETY: successful application completion leaves no user result work.
                 unsafe { sys_thread_exit() }
             }
-            Err(_) => {
+            Err(error) => {
+                dbg::debug(format_args!("application main failed: {:?}", error));
                 // SAFETY: an unsuccessful application result is process failure.
                 unsafe { sys_process_abort() }
             }
@@ -46,15 +49,31 @@ impl<E> MainOutcome for Result<(), E> {
     }
 }
 
-pub fn finish<T: MainOutcome>(outcome: T) -> ! {
+fn finish<T: MainOutcome>(outcome: T) -> ! {
     outcome.finish()
 }
 
 type Lock = SimpleLock;
 
-static ENTRY_REGISTRY: Mutex<Lock, Option<ThreadRegistry<NoEnvironment>>> =
+const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
+const RUNTIME_REGISTRY_CAPACITY: usize = 64;
+
+static ENTRY_REGISTRY: Mutex<Lock, Option<&'static ThreadRegistry<NoEnvironment>>> =
     Mutex::const_new(Lock::new(), None);
 static STARTUP_CONTEXT: Mutex<Lock, Option<StartupContext>> = Mutex::const_new(Lock::new(), None);
+
+fn registry() -> &'static ThreadRegistry<NoEnvironment> {
+    let mut guard = ENTRY_REGISTRY.lock();
+    if let Some(registry) = *guard {
+        return registry;
+    }
+    let registry = Box::leak(Box::new(
+        ThreadRegistry::new(RUNTIME_REGISTRY_CAPACITY)
+            .expect("runtime thread registry capacity is valid"),
+    ));
+    *guard = Some(registry);
+    registry
+}
 
 fn adopt_entry_thread() {
     let mut context = unsafe { StartupContext::adopt() }.expect("startup grant adoption failed");
@@ -63,7 +82,7 @@ fn adopt_entry_thread() {
         .take_handle(descriptor.control_index as usize)
         .expect("entry thread control grant is missing");
     *STARTUP_CONTEXT.lock() = Some(context);
-    let registry = ThreadRegistry::new(64).expect("entry thread registry allocation failed");
+    let registry = registry();
     // SAFETY: StartupBlock validation proves the reservation geometry, and the
     // claimed control is the descriptor-selected unique ThreadControl owner.
     unsafe {
@@ -76,34 +95,49 @@ fn adopt_entry_thread() {
             )
             .expect("entry thread adoption failed");
     }
-    *ENTRY_REGISTRY.lock() = Some(registry);
 }
 
-pub fn startup_pid() -> erhino_shared::proc::Pid {
-    STARTUP_CONTEXT.lock().as_ref().expect("startup context missing").pid()
+pub mod thread {
+    use super::{registry, NoEnvironment, ResultReceiver, ThreadFactory};
+    use erhino_shared::call::SystemCallError;
+    pub use libthread::yield_now;
+
+    pub struct Builder {
+        stack_bytes: usize,
+    }
+
+    impl Builder {
+        pub const fn new() -> Self {
+            Self {
+                stack_bytes: super::DEFAULT_STACK_BYTES,
+            }
+        }
+
+        pub const fn stack_size(mut self, bytes: usize) -> Self {
+            self.stack_bytes = bytes;
+            self
+        }
+
+        pub fn spawn<F, T>(self, function: F) -> Result<ResultReceiver<T, NoEnvironment>, SystemCallError>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            ThreadFactory::new(registry(), NoEnvironment)
+                .stack_size(self.stack_bytes)
+                .spawn(function)
+        }
+    }
+
+    impl Default for Builder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
-pub fn startup_parent_pid() -> erhino_shared::proc::Pid {
-    STARTUP_CONTEXT
-        .lock()
-        .as_ref()
-        .expect("startup context missing")
-        .parent_pid()
-}
-
-pub fn startup_handle(index: usize) -> Option<erhino_shared::object::Handle> {
-    STARTUP_CONTEXT
-        .lock()
-        .as_mut()?
-        .take_or_duplicate_handle(index)
-}
-
-pub fn startup_payload() -> &'static [u8] {
-    STARTUP_CONTEXT
-        .lock()
-        .as_ref()
-        .expect("startup context missing")
-        .payload()
+pub fn take_startup_context() -> Option<StartupContext> {
+    STARTUP_CONTEXT.lock().take()
 }
 
 const INITIAL_ARENA_BYTES: usize = 64 * 1024;
@@ -164,29 +198,21 @@ unsafe impl Source for HeapSource {
 #[global_allocator]
 static HEAP_ALLOCATOR: TalcLock<SimpleLock, HeapSource> = TalcLock::new(HeapSource::new());
 
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-/// # Safety
-///
-/// The platform must enter this symbol with a valid StartupBlock pointer and
-/// length in the ABI argument registers.
-pub unsafe extern "C" fn _start(block: *const u8, block_len: usize) -> ! {
-    // SAFETY: `_start` is the ELF entry and establishes the ABI global pointer
-    // before any runtime code can access static data.
-    unsafe {
-        asm!(
-            "la gp, __global_pointer$",
-            options(nostack, preserves_flags)
-        );
-    }
-    // SAFETY: `_start` received the platform's valid StartupBlock pair.
-    unsafe { __runtime_start(block, block_len) }
+pub unsafe extern "C" fn _start(_: *const u8, _: usize) -> ! {
+    core::arch::naked_asm!(
+        ".option push",
+        ".option norelax",
+        "la gp, __global_pointer$",
+        ".option pop",
+        "tail {bridge}",
+        bridge = sym __libruntime_start,
+    )
 }
 
 #[unsafe(no_mangle)]
-/// # Safety
-///
-/// Called only by the runtime-owned `_start` bridge after gp initialization.
-pub unsafe extern "C" fn __runtime_start(block: *const u8, block_len: usize) -> ! {
+unsafe extern "C" fn __libruntime_start(block: *const u8, block_len: usize) -> ! {
     // SAFETY: the platform launcher places a stable, read-only StartupBlock
     // at the a0/a1 pair consumed by the runtime entry.
     unsafe { kernel_startup::init(block, block_len) };
@@ -200,8 +226,22 @@ pub unsafe extern "C" fn __runtime_start(block: *const u8, block_len: usize) -> 
         .expect("initial heap arena allocation failed");
     }
     adopt_entry_thread();
-    // SAFETY: the binary exports exactly one runtime-owned application entry.
-    unsafe { __halcyon_main() }
+    // SAFETY: rustc emits the binary `main` shim. It calls the lang item
+    // below, which never returns after MainOutcome::finish.
+    unsafe {
+        rust_main();
+        sys_process_abort()
+    }
+}
+
+#[lang = "start"]
+fn lang_start<T: MainOutcome + 'static>(
+    main: fn() -> T,
+    _argc: isize,
+    _argv: *const *const u8,
+    _sigpipe: u8,
+) -> isize {
+    finish(main())
 }
 
 #[panic_handler]

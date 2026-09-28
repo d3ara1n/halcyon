@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use erhino_shared::{
     call::SystemCallError,
-    object::Handle,
+    object::{Handle, HandleRole, Rights},
     proc::Pid,
     startup::EntryThreadDescriptor,
 };
@@ -66,10 +66,22 @@ impl StartupContext {
             .try_reserve_exact(count)
             .map_err(|_| ContextError::InvalidGrant(SystemCallError::OutOfMemory))?;
         for index in 0..count {
-            let handle = startup::startup_handle(index).ok_or(ContextError::MissingGrant)?;
+            let handle = startup::handle(index).ok_or(ContextError::MissingGrant)?;
+            for prior in 0..index {
+                if startup::handle(prior) == Some(handle) {
+                    return Err(ContextError::InvalidGrant(SystemCallError::IllegalArgument));
+                }
+            }
             // SAFETY: StartupBlock grants are unique entries installed in this
             // process; claiming each index transfers its close responsibility.
             let capability = unsafe { Capability::from_raw(handle) };
+            let description = capability.description().map_err(ContextError::InvalidGrant)?;
+            if index == startup::entry_thread().control_index as usize
+                && (description.role != HandleRole::ThreadControl as u32
+                    || !description.rights.contains(Rights::MANAGE))
+            {
+                return Err(ContextError::InvalidGrant(SystemCallError::WrongObjectType));
+            }
             slots.push(Some(capability));
         }
         Ok(Self {
@@ -105,14 +117,43 @@ impl StartupContext {
         self.grants.take(index).map(Capability::into_raw)
     }
 
-    pub fn take_or_duplicate_handle(&mut self, index: usize) -> Option<Handle> {
-        if let Ok(Some(capability)) = self.grants.duplicate(index) {
-            return Some(capability.into_raw());
+    pub fn take_or_duplicate_handle(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<Handle>, SystemCallError> {
+        if let Some(capability) = self.grants.duplicate(index)? {
+            return Ok(Some(capability.into_raw()));
         }
-        self.take_handle(index)
+        Ok(self.take_handle(index))
     }
 
     pub fn duplicate_handle(&self, index: usize) -> Result<Option<Handle>, SystemCallError> {
         Ok(self.grants.duplicate(index)?.map(Capability::into_raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_grants_accept_64_plus_entry_control_and_reject_oob() {
+        let mut slots = Vec::new();
+        for index in 0..65 {
+            let handle = Handle::from_parts(0x100 + index as u32, 1);
+            // SAFETY: the test models the already-installed child-local grants;
+            // ownership is exercised only through the affine slot container.
+            slots.push(Some(unsafe { Capability::from_raw(handle) }));
+        }
+        let mut grants = InitialGrants { slots };
+
+        assert_eq!(grants.len(), 65);
+        let claimed = grants.take(64);
+        assert!(claimed.is_some());
+        core::mem::forget(claimed);
+        assert!(grants.take(65).is_none());
+        // Host tests cannot close kernel capabilities; the modeled owners are
+        // intentionally leaked after exercising the slot boundary.
+        core::mem::forget(grants);
     }
 }

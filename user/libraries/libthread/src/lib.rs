@@ -6,8 +6,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 use erhino_shared::{
@@ -27,11 +26,9 @@ use lock_api::Mutex;
 type Lock = erhino_shared::sync::spin::SimpleLock;
 
 const EMPTY: u8 = 0;
-const WRITING: u8 = 1;
-const PUBLISHED: u8 = 2;
-const RECEIVER_GONE: u8 = 3;
+const PUBLISHED: u8 = 1;
+const RECEIVER_GONE: u8 = 2;
 const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
-const DEFAULT_REGISTRY_CAPACITY: usize = 64;
 
 /// One-shot result storage shared by the producer and its observer.
 pub struct ResultCell<T> {
@@ -53,25 +50,21 @@ impl<T> ResultCell<T> {
     /// Publish at most once. A receiver that was dropped wins the race and
     /// makes the producer responsible for dropping `value`.
     pub fn publish(&self, value: T) -> Result<(), T> {
-        if self
-            .state
-            .compare_exchange(EMPTY, WRITING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if self.state.load(Ordering::Acquire) != EMPTY {
             return Err(value);
         }
-        // SAFETY: WRITING is exclusively owned by this producer; abandon can
-        // mark it ReceiverGone but never accesses the value.
+        // SAFETY: only this producer writes the value while the state is
+        // Empty. A receiver that wins `abandon` never reads the storage.
         unsafe { (*self.value.get()).write(value) };
         if self
             .state
-            .compare_exchange(WRITING, PUBLISHED, Ordering::Release, Ordering::Acquire)
+            .compare_exchange(EMPTY, PUBLISHED, Ordering::Release, Ordering::Acquire)
             .is_ok()
         {
             Ok(())
         } else {
-            // SAFETY: only the receiver can change WRITING to ReceiverGone,
-            // and it does not read or drop the in-progress value.
+            // SAFETY: ReceiverGone is only written by the receiver and never
+            // reads the value. The producer owns the failed publication.
             Err(unsafe { (*self.value.get()).assume_init_read() })
         }
     }
@@ -125,22 +118,18 @@ impl<T> Drop for ResultCell<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinOutcome<T> {
-    Returned(T),
-    Incomplete,
-}
-
 /// Runtime-specific state that can be prepared before a thread is created.
-pub trait ThreadEnvironment {
+pub trait ThreadEnvironment: Send + Sync + 'static {
     type Child: Send + 'static;
     type Residue: Send + 'static;
-    type Error: Send + 'static;
+    type EnterError: Send + 'static;
+    type LeaveError: Send + 'static;
+    type RetireError: Send + 'static;
 
-    fn prepare(&self) -> Result<Self::Child, Self::Error>;
-    fn enter(&self, child: Self::Child) -> Result<Self::Residue, Self::Error>;
-    fn leave(&self, residue: &mut Self::Residue) -> Result<(), Self::Error>;
-    fn retire(&self, residue: Self::Residue) -> Result<(), Self::Error>;
+    fn prepare(&self) -> Result<Self::Child, Self::EnterError>;
+    fn enter(&self, child: Self::Child) -> Result<Self::Residue, Self::EnterError>;
+    fn leave(&self, residue: &mut Self::Residue) -> Result<(), Self::LeaveError>;
+    fn retire(&self, residue: Self::Residue) -> Result<(), Self::RetireError>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -149,41 +138,67 @@ pub struct NoEnvironment;
 impl ThreadEnvironment for NoEnvironment {
     type Child = ();
     type Residue = ();
-    type Error = ();
+    type EnterError = ();
+    type LeaveError = ();
+    type RetireError = ();
 
-    fn prepare(&self) -> Result<Self::Child, Self::Error> {
+    fn prepare(&self) -> Result<Self::Child, Self::EnterError> {
         Ok(())
     }
 
-    fn enter(&self, _: Self::Child) -> Result<Self::Residue, Self::Error> {
+    fn enter(&self, _: Self::Child) -> Result<Self::Residue, Self::EnterError> {
         Ok(())
     }
 
-    fn leave(&self, _: &mut Self::Residue) -> Result<(), Self::Error> {
+    fn leave(&self, _: &mut Self::Residue) -> Result<(), Self::LeaveError> {
         Ok(())
     }
 
-    fn retire(&self, _: Self::Residue) -> Result<(), Self::Error> {
+    fn retire(&self, _: Self::Residue) -> Result<(), Self::RetireError> {
         Ok(())
     }
+}
+
+pub enum ThreadOutcome<T, E: ThreadEnvironment> {
+    Returned {
+        value: T,
+        leave: Result<(), E::LeaveError>,
+    },
+    EnterFailed(E::EnterError),
+    Incomplete,
+}
+
+#[derive(Debug)]
+struct CleanupProgress {
+    retired: bool,
+    abandoned: bool,
+    done: bool,
 }
 
 struct ThreadRecord<E: ThreadEnvironment> {
     stack: Option<MappedRegion>,
-    control: Arc<ThreadControl>,
+    control: Option<Arc<ThreadControl>>,
     environment: Arc<E>,
     residue: Arc<ResidueCell<E::Residue>>,
-    packet: Option<PacketOwner>,
+    cleanup: CleanupProgress,
+}
+
+enum SlotState<E: ThreadEnvironment> {
+    Free,
+    Reserved,
+    Live(ThreadRecord<E>),
+    Claimed(Option<ThreadRecord<E>>),
+    Faulted(ThreadRecord<E>),
 }
 
 struct RegistryInner<E: ThreadEnvironment> {
-    slots: Vec<Option<ThreadRecord<E>>>,
+    slots: Vec<SlotState<E>>,
+    sealed: bool,
 }
 
 /// Fixed-capacity cooperative owner for thread records.
 pub struct ThreadRegistry<E: ThreadEnvironment> {
     inner: Mutex<Lock, RegistryInner<E>>,
-    sealed: AtomicBool,
     cursor: AtomicUsize,
 }
 
@@ -192,7 +207,7 @@ pub enum RegistryError {
     Sealed,
     Full,
     InvalidEntry,
-    Cleanup,
+    InvalidSlot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +215,16 @@ pub enum ReapProgress {
     Idle,
     Progress { completed: usize },
     Wait,
-    Failed,
+    Failed(CleanupFault),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupFault {
+    Wait(SystemCallError),
+    Retire,
+    MissingStack,
+    Unmap(SystemCallError),
+    InvalidSlot,
 }
 
 impl<E: ThreadEnvironment> ThreadRegistry<E> {
@@ -212,10 +236,12 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         slots
             .try_reserve_exact(capacity)
             .map_err(|_| SystemCallError::OutOfMemory)?;
-        slots.resize_with(capacity, || None);
+        slots.resize_with(capacity, || SlotState::Free);
         Ok(Self {
-            inner: Mutex::new(RegistryInner { slots }),
-            sealed: AtomicBool::new(false),
+            inner: Mutex::new(RegistryInner {
+                slots,
+                sealed: false,
+            }),
             cursor: AtomicUsize::new(0),
         })
     }
@@ -225,50 +251,76 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
     }
 
     pub fn seal(&self) {
-        self.sealed.store(true, Ordering::Release);
+        self.inner.lock().sealed = true;
     }
 
-    fn insert(
-        &self,
-        record: ThreadRecord<E>,
-    ) -> Result<usize, (RegistryError, ThreadRecord<E>)> {
-        if self.sealed.load(Ordering::Acquire) {
-            return Err((RegistryError::Sealed, record));
-        }
+    fn reserve(&self) -> Result<usize, RegistryError> {
         let mut inner = self.inner.lock();
+        if inner.sealed {
+            return Err(RegistryError::Sealed);
+        }
         let Some((index, slot)) = inner
             .slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| slot.is_none())
+            .find(|(_, slot)| match slot {
+                SlotState::Free => true,
+                SlotState::Faulted(record) => {
+                    let _ = record.cleanup.retired;
+                    false
+                }
+                _ => false,
+            })
         else {
-            return Err((RegistryError::Full, record));
+            return Err(RegistryError::Full);
         };
-        *slot = Some(record);
+        *slot = SlotState::Reserved;
         Ok(index)
     }
 
-    fn cancel(&self, index: usize) -> Result<(), SystemCallError> {
-        let mut record = self
-            .inner
-            .lock()
-            .slots
-            .get_mut(index)
-            .and_then(Option::take)
-            .ok_or(SystemCallError::IllegalArgument)?;
-        let stack = record.stack.take().ok_or(SystemCallError::InternalError)?;
-        match stack.unmap() {
-            Ok(()) => {
-                drop(record.packet.take());
-                drop(record.control);
-                Ok(())
-            }
-            Err((stack, error)) => {
-                record.stack = Some(stack);
-                self.inner.lock().slots[index] = Some(record);
-                Err(error)
-            }
+    fn release_reserved(&self, index: usize) -> Result<(), RegistryError> {
+        let mut inner = self.inner.lock();
+        let slot = inner.slots.get_mut(index).ok_or(RegistryError::InvalidSlot)?;
+        if !matches!(slot, SlotState::Reserved) {
+            return Err(RegistryError::InvalidSlot);
         }
+        *slot = SlotState::Free;
+        Ok(())
+    }
+
+    fn register(
+        &self,
+        index: usize,
+        record: ThreadRecord<E>,
+    ) -> Result<(), (RegistryError, ThreadRecord<E>)> {
+        let mut inner = self.inner.lock();
+        if inner.sealed {
+            return Err((RegistryError::Sealed, record));
+        }
+        let Some(slot) = inner.slots.get_mut(index) else {
+            return Err((RegistryError::InvalidSlot, record));
+        };
+        if !matches!(slot, SlotState::Reserved) {
+            return Err((RegistryError::InvalidSlot, record));
+        }
+        *slot = SlotState::Live(record);
+        Ok(())
+    }
+
+    fn cancel_prepared(&self, index: usize) -> Result<(), RegistryError> {
+        let control = {
+            let mut inner = self.inner.lock();
+            let slot = inner.slots.get_mut(index).ok_or(RegistryError::InvalidSlot)?;
+            match slot {
+                SlotState::Live(record) => {
+                    record.cleanup.abandoned = true;
+                    record.control.take()
+                }
+                _ => return Err(RegistryError::InvalidSlot),
+            }
+        };
+        drop(control);
+        Ok(())
     }
 
     /// Reap at most `budget` completed records. It never waits for a child or
@@ -280,12 +332,25 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
             let Some((index, record)) = ({
                 let mut inner = self.inner.lock();
                 let len = inner.slots.len();
+                if len == 0 {
+                    break;
+                }
                 let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
                 let mut found = None;
                 for offset in 0..len {
                     let index = (start + offset) % len;
-                    if let Some(record) = inner.slots[index].take() {
-                        found = Some((index, record));
+                    let slot = &mut inner.slots[index];
+                    let claim = match core::mem::replace(slot, SlotState::Free) {
+                        SlotState::Live(record) => Some(record),
+                        SlotState::Claimed(Some(record)) => Some(record),
+                        state => {
+                            *slot = state;
+                            None
+                        }
+                    };
+                    if claim.is_some() {
+                        *slot = SlotState::Claimed(None);
+                        found = claim.map(|record| (index, record));
                         break;
                     }
                 }
@@ -294,48 +359,60 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                 break;
             };
             let mut record = record;
-            let observed = libkernel::ipc::wait::wait_until(
-                &[erhino_shared::wait::WaitItem::new(
-                    record.control.as_handle(),
-                    erhino_shared::object::ObjectSignals::DONE,
-                    0,
-                )],
-                erhino_shared::time::Deadline::at(0),
-            );
-            if !matches!(
-                observed,
-                Ok(result)
-                    if result.observed.contains(erhino_shared::object::ObjectSignals::DONE)
-            ) {
-                self.inner.lock().slots[index] = Some(record);
+            let done = match record.control.as_ref() {
+                None if record.cleanup.abandoned || record.cleanup.done => true,
+                None => false,
+                Some(control) => match libkernel::ipc::wait::wait_until(
+                    &[erhino_shared::wait::WaitItem::new(
+                        control.as_handle(),
+                        erhino_shared::object::ObjectSignals::DONE,
+                        0,
+                    )],
+                    erhino_shared::time::Deadline::at(0),
+                ) {
+                    Ok(result) => result
+                        .observed
+                        .contains(erhino_shared::object::ObjectSignals::DONE),
+                    Err(error) => {
+                        self.restore_claimed(index, record);
+                        return ReapProgress::Failed(CleanupFault::Wait(error));
+                    }
+                },
+            };
+            if !done {
+                self.restore_claimed(index, record);
                 saw_wait = true;
                 continue;
             }
-            if let Some(residue) = record.residue.take()
+            record.cleanup.done = true;
+            if !record.cleanup.retired {
+                if let Some(residue) = record.residue.take()
                     && record.environment.retire(residue).is_err()
-            {
-                self.inner.lock().slots[index] = Some(record);
-                return ReapProgress::Failed;
+                {
+                    self.set_faulted(index, record);
+                    return ReapProgress::Failed(CleanupFault::Retire);
+                }
+                record.cleanup.retired = true;
             }
+            drop(record.control.take());
             let Some(stack) = record.stack.take() else {
-                self.inner.lock().slots[index] = Some(record);
-                return ReapProgress::Failed;
+                self.set_faulted(index, record);
+                return ReapProgress::Failed(CleanupFault::MissingStack);
             };
             match stack.unmap() {
                 Ok(()) => {
-                    drop(record.packet.take());
-                    drop(record.control);
+                    self.finish_claimed(index);
                     completed += 1;
                 }
                 Err((stack, SystemCallError::ObjectBusy)) => {
                     record.stack = Some(stack);
-                    self.inner.lock().slots[index] = Some(record);
+                    self.restore_claimed(index, record);
                     saw_wait = true;
                 }
-                Err((stack, _)) => {
+                Err((stack, error)) => {
                     record.stack = Some(stack);
-                    self.inner.lock().slots[index] = Some(record);
-                    return ReapProgress::Failed;
+                    self.set_faulted(index, record);
+                    return ReapProgress::Failed(CleanupFault::Unmap(error));
                 }
             }
         }
@@ -345,6 +422,27 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
             ReapProgress::Wait
         } else {
             ReapProgress::Idle
+        }
+    }
+
+    fn restore_claimed(&self, index: usize, record: ThreadRecord<E>) {
+        let mut inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get_mut(index) {
+            *slot = SlotState::Claimed(Some(record));
+        }
+    }
+
+    fn set_faulted(&self, index: usize, record: ThreadRecord<E>) {
+        let mut inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get_mut(index) {
+            *slot = SlotState::Faulted(record);
+        }
+    }
+
+    fn finish_claimed(&self, index: usize) {
+        let mut inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get_mut(index) {
+            *slot = SlotState::Free;
         }
     }
 
@@ -365,6 +463,7 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         environment: E,
         residue: E::Residue,
     ) -> Result<Thread, RegistryError> {
+        let slot = self.reserve()?;
         let stack = unsafe {
             MappedRegion::from_reservation(
                 desc.stack_reservation_start as usize,
@@ -373,23 +472,76 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                 desc.usable_len as usize,
             )
         }
-        .map_err(|_| RegistryError::InvalidEntry)?;
+        .map_err(|_| {
+            let _ = self.release_reserved(slot);
+            RegistryError::InvalidEntry
+        })?;
         let thread = Thread {
             id: 0,
             control: Arc::new(control),
         };
-        self.insert(ThreadRecord {
+        let record = ThreadRecord {
             stack: Some(stack),
-            control: Arc::clone(&thread.control),
+            control: Some(Arc::clone(&thread.control)),
             environment: Arc::new(environment),
             residue: Arc::new(ResidueCell::new(residue)),
-            packet: None,
-        })
-        .map_err(|(error, _)| error)?;
+            cleanup: CleanupProgress {
+                retired: false,
+                abandoned: false,
+                done: false,
+            },
+        };
+        if let Err((error, _record)) = self.register(slot, record) {
+            let _ = self.release_reserved(slot);
+            return Err(error);
+        }
         Ok(thread)
     }
 }
 
+fn registry_error_to_system(error: RegistryError) -> SystemCallError {
+    match error {
+        RegistryError::Sealed => SystemCallError::ObjectClosed,
+        RegistryError::Full => SystemCallError::ReachLimit,
+        RegistryError::InvalidEntry | RegistryError::InvalidSlot => SystemCallError::InternalError,
+    }
+}
+
+fn cleanup_integrity_failure(fault: CleanupFault) -> ! {
+    libkernel::dbg::debug(format_args!("libthread cleanup integrity failure: {:?}", fault));
+    // SAFETY: cleanup lost a committed owner or an irreversible progress
+    // invariant; continuing would make the process resource state unsound.
+    unsafe { libkernel::sys_process_abort() }
+}
+
+fn reap_or_abort<E: ThreadEnvironment>(registry: &'static ThreadRegistry<E>) {
+    if let ReapProgress::Failed(fault) = registry.reap(1) {
+        cleanup_integrity_failure(fault);
+    }
+}
+
+fn observe_done(
+    control: &ThreadControl,
+    deadline: erhino_shared::time::Deadline,
+) -> Result<bool, SystemCallError> {
+    let item = erhino_shared::wait::WaitItem::new(
+        control.as_handle(),
+        erhino_shared::object::ObjectSignals::DONE,
+        0,
+    );
+    let result = libkernel::ipc::wait::wait_until(core::slice::from_ref(&item), deadline)?;
+    Ok(result
+        .observed
+        .contains(erhino_shared::object::ObjectSignals::DONE))
+}
+
+fn unmap_or_abort(stack: MappedRegion) {
+    if let Err((_, error)) = stack.unmap() {
+        cleanup_integrity_failure(CleanupFault::Unmap(error));
+    }
+}
+
+#[derive(Clone)]
 pub struct Thread {
     id: Tid,
     control: Arc<ThreadControl>,
@@ -402,6 +554,13 @@ impl Thread {
 
     pub fn control(&self) -> &Arc<ThreadControl> {
         &self.control
+    }
+
+    pub fn wait(
+        &self,
+        deadline: erhino_shared::time::Deadline,
+    ) -> Result<bool, SystemCallError> {
+        observe_done(&self.control, deadline)
     }
 }
 
@@ -431,93 +590,90 @@ impl<T> ResidueCell<T> {
     }
 }
 
+#[repr(C)]
 struct Packet<E, F, T>
 where
     E: ThreadEnvironment,
 {
+    entry: extern "C" fn(usize, usize) -> !,
     environment: Arc<E>,
     child: Option<E::Child>,
     function: Option<F>,
-    result: Arc<ResultCell<T>>,
+    result: Arc<ResultCell<ThreadOutcome<T, E>>>,
     residue: Arc<ResidueCell<E::Residue>>,
-    started: Arc<AtomicBool>,
 }
 
-struct PacketOwner {
-    ptr: NonNull<()>,
-    drop: unsafe fn(NonNull<()>),
-}
-
-unsafe impl Send for PacketOwner {}
-
-impl Drop for PacketOwner {
-    fn drop(&mut self) {
-        // The child has consumed the function before publishing DONE. If a
-        // raw exit bypasses the wrapper, retaining the allocation is safer
-        // than dropping user closure state on the reaper thread.
-        unsafe { (self.drop)(self.ptr) }
-    }
-}
-
-unsafe fn drop_packet<E, F, T>(ptr: NonNull<()>)
-where
-    E: ThreadEnvironment,
-{
-    let packet = unsafe { Box::from_raw(ptr.cast::<Packet<E, F, T>>().as_ptr()) };
-    if packet.function.is_none()
-        || !packet.started.load(Ordering::Acquire)
-    {
-        drop(packet);
-    } else {
-        let _ = Box::leak(packet);
-    }
-}
-
-extern "C" fn trampoline<E, F, T>(packet: usize, _: usize) -> !
+extern "C" fn trampoline<E, F, T>(packet: usize, registry: usize) -> !
 where
     E: ThreadEnvironment,
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    // SAFETY: the packet is installed before ThreadStart and remains owned by
-    // the registry until DONE.
-    let packet = unsafe { &mut *(packet as *mut Packet<E, F, T>) };
+    // SAFETY: ThreadFactory only encodes a `'static` Registry reference in
+    // arg2, and the packet is transferred exactly once after ThreadStart.
+    let registry = unsafe { &*(registry as *const ThreadRegistry<E>) };
+    let mut packet = unsafe { Box::from_raw(packet as *mut Packet<E, F, T>) };
     let child = packet.child.take().expect("thread child environment consumed twice");
     let mut residue = match packet.environment.enter(child) {
         Ok(residue) => residue,
-        Err(_) => {
+        Err(error) => {
             if let Some(function) = packet.function.take() {
                 drop(function);
             }
-            packet.result.abandon();
-            // SAFETY: an environment cannot be entered, so this process
-            // cannot satisfy the thread contract.
-            unsafe { libkernel::sys_process_abort() }
+            let outcome = ThreadOutcome::EnterFailed(error);
+            if let Err(outcome) = packet.result.publish(outcome) {
+                drop(outcome);
+            }
+            drop(packet);
+            reap_or_abort(registry);
+            // SAFETY: the result is published before kernel departure.
+            unsafe { libkernel::sys_thread_exit() }
         }
     };
     let function = packet.function.take().expect("thread packet consumed twice");
     let result = function();
-    if packet.environment.leave(&mut residue).is_err() {
-        drop(result);
-        // SAFETY: the environment failed to leave before result publication.
-        unsafe { libkernel::sys_process_abort() }
-    }
+    let leave = packet.environment.leave(&mut residue);
     packet.residue.publish(residue);
-    if let Err(result) = packet.result.publish(result) {
-        drop(result);
+    let outcome = ThreadOutcome::Returned {
+        value: result,
+        leave,
+    };
+    if let Err(outcome) = packet.result.publish(outcome) {
+        drop(outcome);
     }
+    drop(packet);
+    reap_or_abort(registry);
     // SAFETY: ResultCell has been resolved before the kernel departure.
     unsafe { libkernel::sys_thread_exit() }
 }
 
-pub struct ThreadFactory<'r, E: ThreadEnvironment> {
-    registry: &'r ThreadRegistry<E>,
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" fn __libthread_worker_entry(_: usize, _: usize) -> ! {
+    core::arch::naked_asm!(
+        ".option push",
+        ".option norelax",
+        "la gp, __global_pointer$",
+        ".option pop",
+        "ld t0, 0(a0)",
+        "jr t0",
+    )
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+extern "C" fn __libthread_worker_entry(_: usize, _: usize) -> ! {
+    panic!("worker entry is only available on riscv64 targets")
+}
+
+pub struct ThreadFactory<E: ThreadEnvironment> {
+    registry: &'static ThreadRegistry<E>,
     environment: Arc<E>,
     stack_bytes: usize,
 }
 
-impl<'r, E: ThreadEnvironment> ThreadFactory<'r, E> {
-    pub fn new(registry: &'r ThreadRegistry<E>, environment: E) -> Self {
+impl<E: ThreadEnvironment> ThreadFactory<E> {
+    pub fn new(registry: &'static ThreadRegistry<E>, environment: E) -> Self {
         Self {
             registry,
             environment: Arc::new(environment),
@@ -530,7 +686,7 @@ impl<'r, E: ThreadEnvironment> ThreadFactory<'r, E> {
         self
     }
 
-    pub fn spawn<F, T>(&self, function: F) -> Result<JoinHandle<T>, SystemCallError>
+    pub fn spawn<F, T>(&self, function: F) -> Result<ResultReceiver<T, E>, SystemCallError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -540,17 +696,28 @@ impl<'r, E: ThreadEnvironment> ThreadFactory<'r, E> {
             .map_err(|(_, error)| error)
     }
 
-    pub fn prepare<F, T>(&self, function: F) -> Result<PreparedThread<'_, F, T, E>, SystemCallError>
+    pub fn prepare<F, T>(&self, function: F) -> Result<PreparedThread<F, T, E>, SystemCallError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        reap_or_abort(self.registry);
+        let slot = self
+            .registry
+            .reserve()
+            .map_err(registry_error_to_system)?;
         let child = self.environment.prepare()
-            .map_err(|_| SystemCallError::OutOfMemory)?;
+            .map_err(|_| {
+                let _ = self.registry.release_reserved(slot);
+                SystemCallError::OutOfMemory
+            })?;
         let stack_bytes = self
             .stack_bytes
             .checked_add(PROCESS_PAGE_SIZE - 1)
-            .ok_or(SystemCallError::IllegalArgument)?
+            .ok_or_else(|| {
+                let _ = self.registry.release_reserved(slot);
+                SystemCallError::IllegalArgument
+            })?
             / PROCESS_PAGE_SIZE
             * PROCESS_PAGE_SIZE;
         let stack = loop {
@@ -565,32 +732,42 @@ impl<'r, E: ThreadEnvironment> ThreadFactory<'r, E> {
                 Err(SystemCallError::ObjectBusy) => {
                     // Another mapping publication owns the current page-table
                     // generation; yield before retrying the construction.
-                    unsafe { libkernel::sys_sleep(1) }?;
+                    if let Err(error) = unsafe { libkernel::sys_sleep(1) } {
+                        let _ = self.registry.release_reserved(slot);
+                        return Err(error);
+                    }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let _ = self.registry.release_reserved(slot);
+                    return Err(error);
+                }
             }
         };
-        let result = Arc::new(ResultCell::new());
+        let result = Arc::new(ResultCell::<ThreadOutcome<T, E>>::new());
         let residue = Arc::new(ResidueCell::empty());
-        let started = Arc::new(AtomicBool::new(false));
         let packet = Box::new(Packet {
+            entry: trampoline::<E, F, T>,
             environment: Arc::clone(&self.environment),
             child: Some(child),
             function: Some(function),
             result: Arc::clone(&result),
             residue: Arc::clone(&residue),
-            started: Arc::clone(&started),
         });
-        let packet = NonNull::from(Box::leak(packet));
-        let stack_pointer = stack
-            .usable()
-            .ok_or(SystemCallError::InternalError)?
-            .end;
+        let packet_pointer = (&*packet as *const Packet<E, F, T>) as usize;
+        let stack_pointer = match stack.usable() {
+            Some(usable) => usable.end,
+            None => {
+                drop(packet);
+                unmap_or_abort(stack);
+                let _ = self.registry.release_reserved(slot);
+                return Err(SystemCallError::InternalError);
+            }
+        };
         let context = ThreadStartContext {
-            entry: trampoline::<E, F, T> as *const () as usize as u64,
+            entry: __libthread_worker_entry as *const () as usize as u64,
             stack_pointer: stack_pointer as u64,
-            arg1: packet.as_ptr() as usize as u64,
-            arg2: 0,
+            arg1: packet_pointer as u64,
+            arg2: self.registry as *const ThreadRegistry<E> as usize as u64,
         };
         let mut created = ThreadCreateResult {
             tid: 0,
@@ -600,8 +777,9 @@ impl<'r, E: ThreadEnvironment> ThreadFactory<'r, E> {
         // SAFETY: all syscall pointers refer to live stack values; the stack
         // and packet were prepared before creation.
         if let Err(error) = unsafe { kernel_thread::create(Handle::INVALID, &context, &mut created) } {
-            unsafe { drop_packet::<E, F, T>(packet.cast()) };
-            let _ = stack.unmap();
+            drop(packet);
+            unmap_or_abort(stack);
+            let _ = self.registry.release_reserved(slot);
             return Err(error);
         }
         let control = unsafe { ThreadControl::from_raw(created.control) };
@@ -610,59 +788,52 @@ impl<'r, E: ThreadEnvironment> ThreadFactory<'r, E> {
             control: Arc::new(control),
         };
         let record = ThreadRecord {
-                stack: Some(stack),
-                control: Arc::clone(&thread.control),
-                environment: Arc::clone(&self.environment),
-                residue,
-                packet: Some(PacketOwner {
-                    ptr: packet.cast(),
-                    drop: drop_packet::<E, F, T>,
-                }),
-            };
-        let slot = match self.registry.insert(record) {
-            Ok(slot) => slot,
-            Err((_, record)) => {
-                let stack = record.stack.expect("new thread record stack missing");
-                drop(record.packet);
-                drop(record.control);
-                let _ = stack.unmap();
-                return Err(SystemCallError::ReachLimit);
-            }
+            stack: Some(stack),
+            control: Some(Arc::clone(&thread.control)),
+            environment: Arc::clone(&self.environment),
+            residue,
+            cleanup: CleanupProgress {
+                retired: false,
+                abandoned: false,
+                done: false,
+            },
         };
+        if let Err((error, record)) = self.registry.register(slot, record) {
+            drop(packet);
+            drop(thread);
+            let stack = record.stack.expect("new thread record stack missing");
+            unmap_or_abort(stack);
+            let _ = self.registry.release_reserved(slot);
+            return Err(registry_error_to_system(error));
+        }
         Ok(PreparedThread {
             result,
             thread: Some(thread),
-            registry_ref: self.registry,
-            registry: self.registry as *const _ as *const (),
-            reap: reap_erased::<E>,
+            packet: Some(packet),
+            registry: self.registry,
             slot,
             started: false,
-            packet_started: started,
-            marker: core::marker::PhantomData,
-            function: core::marker::PhantomData,
         })
     }
 }
 
-pub struct PreparedThread<'r, F, T, E: ThreadEnvironment> {
-    result: Arc<ResultCell<T>>,
+pub struct PreparedThread<F, T, E: ThreadEnvironment> {
+    result: Arc<ResultCell<ThreadOutcome<T, E>>>,
     thread: Option<Thread>,
-    registry_ref: &'r ThreadRegistry<E>,
-    registry: *const (),
-    reap: unsafe fn(*const (), usize) -> ReapProgress,
+    packet: Option<Box<Packet<E, F, T>>>,
+    registry: &'static ThreadRegistry<E>,
     slot: usize,
     started: bool,
-    packet_started: Arc<AtomicBool>,
-    marker: core::marker::PhantomData<T>,
-    function: core::marker::PhantomData<F>,
 }
 
-impl<'r, F, T, E: ThreadEnvironment> PreparedThread<'r, F, T, E> {
-    pub fn start(mut self) -> Result<JoinHandle<T>, (Self, SystemCallError)>
+impl<F, T, E: ThreadEnvironment> PreparedThread<F, T, E> {
+    pub fn start(mut self) -> Result<ResultReceiver<T, E>, (Self, SystemCallError)>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        let packet = self.packet.take().expect("prepared packet missing");
+        let packet = Box::into_raw(packet) as usize;
         if let Err(error) = self
             .thread
             .as_ref()
@@ -670,152 +841,82 @@ impl<'r, F, T, E: ThreadEnvironment> PreparedThread<'r, F, T, E> {
             .control
             .start()
         {
+            // SAFETY: ThreadStart rejected the Created control, so the
+            // trampoline could not have consumed this packet.
+            self.packet = Some(unsafe { Box::from_raw(packet as *mut Packet<E, F, T>) });
             return Err((self, error));
         }
-        self.packet_started.store(true, Ordering::Release);
         let thread = self.thread.take().expect("PreparedThread started twice");
         self.started = true;
-        Ok(JoinHandle {
+        let receiver = ResultReceiver {
             result: self.result.clone(),
-            thread: Some(thread),
+            control: Arc::clone(&thread.control),
             registry: self.registry,
-            reap: self.reap,
-        })
+            id: thread.id,
+        };
+        drop(thread);
+        Ok(receiver)
     }
 }
 
-impl<'r, F, T, E: ThreadEnvironment> Drop for PreparedThread<'r, F, T, E> {
+impl<F, T, E: ThreadEnvironment> Drop for PreparedThread<F, T, E> {
     fn drop(&mut self) {
         if !self.started {
-            let _ = self.registry_ref.cancel(self.slot);
+            let thread = self.thread.take();
+            if self.registry.cancel_prepared(self.slot).is_err() {
+                cleanup_integrity_failure(CleanupFault::InvalidSlot);
+            }
+            drop(thread);
         }
     }
 }
 
-pub struct JoinHandle<T> {
-    result: Arc<ResultCell<T>>,
-    thread: Option<Thread>,
-    registry: *const (),
-    reap: unsafe fn(*const (), usize) -> ReapProgress,
+pub struct ResultReceiver<T, E: ThreadEnvironment> {
+    result: Arc<ResultCell<ThreadOutcome<T, E>>>,
+    control: Arc<ThreadControl>,
+    registry: &'static ThreadRegistry<E>,
+    id: Tid,
 }
 
-unsafe impl<T: Send> Send for JoinHandle<T> {}
+unsafe impl<T: Send, E: ThreadEnvironment> Send for ResultReceiver<T, E> {}
 
-impl<T> JoinHandle<T> {
+impl<T, E: ThreadEnvironment> ResultReceiver<T, E> {
     pub fn id(&self) -> Tid {
-        self.thread.as_ref().expect("joined thread owner missing").id()
+        self.id
     }
 
-    pub fn try_join(&self) -> JoinOutcome<T> {
-        let _ = unsafe { (self.reap)(self.registry, 1) };
-        match self.result.take() {
-            Some(value) => JoinOutcome::Returned(value),
-            None => JoinOutcome::Incomplete,
+    pub fn thread(&self) -> Thread {
+        Thread {
+            id: self.id,
+            control: Arc::clone(&self.control),
         }
     }
 
-    /// Wait for DONE and return the published value. Dropping a handle remains
-    /// non-blocking; only an explicit join opts into observation.
-    pub fn join(mut self) -> T {
-        let item = erhino_shared::wait::WaitItem::new(
-            self.thread
-                .as_ref()
-                .expect("joined thread owner missing")
-                .control()
-                .as_handle(),
-            erhino_shared::object::ObjectSignals::DONE,
-            0,
-        );
-        let observed = libkernel::ipc::wait::wait_until(
-            core::slice::from_ref(&item),
-            erhino_shared::time::Deadline::INFINITE,
-        )
-        .expect("ThreadControl wait failed");
-        assert!(
-            observed.observed.contains(erhino_shared::object::ObjectSignals::DONE),
-            "ThreadControl closed before DONE"
-        );
-        self.thread.take();
-        let _ = unsafe { (self.reap)(self.registry, 1) };
-        match self.result.take() {
-            Some(value) => value,
-            None => panic!("thread wrapper exited without publishing a result"),
+    pub fn try_join(self) -> Result<ThreadOutcome<T, E>, Self> {
+        let done = match observe_done(&self.control, erhino_shared::time::Deadline::at(0)) {
+            Ok(done) => done,
+            Err(error) => cleanup_integrity_failure(CleanupFault::Wait(error)),
+        };
+        if !done {
+            return Err(self);
         }
+        reap_or_abort(self.registry);
+        Ok(self.result.take().unwrap_or(ThreadOutcome::Incomplete))
+    }
+
+    pub fn join(self) -> ThreadOutcome<T, E> {
+        if let Err(error) = observe_done(&self.control, erhino_shared::time::Deadline::INFINITE) {
+            cleanup_integrity_failure(CleanupFault::Wait(error));
+        }
+        reap_or_abort(self.registry);
+        self.result.take().unwrap_or(ThreadOutcome::Incomplete)
     }
 }
 
-impl<T> Drop for JoinHandle<T> {
+impl<T, E: ThreadEnvironment> Drop for ResultReceiver<T, E> {
     fn drop(&mut self) {
         self.result.abandon();
-        self.thread.take();
-        // Drop never waits. A completed record may be reclaimed opportunistically.
-        let _ = unsafe { (self.reap)(self.registry, 1) };
     }
-}
-
-/// Compatibility builder used by existing programs while they are migrated to
-/// an explicitly owned runtime registry.
-pub struct Builder {
-    stack_bytes: usize,
-}
-
-impl Builder {
-    pub const fn new() -> Self {
-        Self {
-            stack_bytes: DEFAULT_STACK_BYTES,
-        }
-    }
-
-    pub const fn stack_size(mut self, bytes: usize) -> Self {
-        self.stack_bytes = bytes;
-        self
-    }
-
-    pub fn spawn<F, T>(self, function: F) -> Result<JoinHandle<T>, SystemCallError>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        static REGISTRY: Mutex<Lock, Option<ThreadRegistry<NoEnvironment>>> = Mutex::const_new(
-            Lock::new(),
-            None,
-        );
-        let mut guard = REGISTRY.lock();
-        if guard.is_none() {
-            *guard = Some(
-                ThreadRegistry::new(DEFAULT_REGISTRY_CAPACITY)
-                    .expect("default thread registry capacity is valid"),
-            );
-        }
-        let registry = guard.as_ref().expect("registry initialized");
-        ThreadFactory::new(registry, NoEnvironment)
-            .stack_size(self.stack_bytes)
-            .spawn(function)
-            .map(|mut handle| {
-                handle.registry = registry as *const _ as *const ();
-                handle.reap = reap_erased::<NoEnvironment>;
-                handle
-            })
-    }
-}
-
-unsafe fn reap_erased<E: ThreadEnvironment>(registry: *const (), budget: usize) -> ReapProgress {
-    // SAFETY: callers install a pointer to the matching live registry.
-    unsafe { &*(registry as *const ThreadRegistry<E>) }.reap(budget)
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn spawn<F, T>(function: F) -> Result<JoinHandle<T>, SystemCallError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    Builder::new().spawn(function)
 }
 
 pub fn yield_now() -> Result<(), SystemCallError> {
@@ -847,7 +948,7 @@ pub unsafe fn start_raw(control: Handle) -> Result<(), SystemCallError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JoinOutcome, ResultCell};
+    use super::ResultCell;
 
     #[test]
     fn result_cell_publishes_once() {
@@ -877,8 +978,4 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn join_outcome_is_explicit_for_unpublished_result() {
-        let _: JoinOutcome<u32> = JoinOutcome::Incomplete;
-    }
 }

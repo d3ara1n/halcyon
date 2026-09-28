@@ -17,7 +17,8 @@ use libkernel::{
     },
     time::{self, Deadline, Duration},
 };
-use libthread as thread;
+use libthread::ThreadOutcome;
+use libruntime::thread;
 
 pub(super) fn run() {
     let start = time::snapshot().unwrap();
@@ -196,7 +197,13 @@ fn causal_reads() {
         );
     }
     for worker in workers {
-        worker.join();
+        assert!(matches!(
+            worker.join(),
+            ThreadOutcome::Returned {
+                leave: Ok(()),
+                ..
+            }
+        ));
     }
     assert!(time::snapshot().unwrap().now_ns >= high.load(Ordering::Acquire));
 }

@@ -19,12 +19,8 @@
 //! 编排器中追加重复压力、最小预算 Drain 与完整竞态矩阵。内核不感知该档位。
 
 #![no_std]
-#![no_main]
 
 extern crate libruntime;
-
-#[used]
-static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use libbudget::Budget;
 use libexecution::{
@@ -50,6 +46,7 @@ use libprocess::{
     SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
     SupervisionStage, SupervisionTarget, collect_process, enumerate_members, spawn,
 };
+use libthread::ThreadOutcome;
 use librpc::{
     CallCause, CallError, CallPhase, Caller, FrameRejection, Outbox, OutboxResult, Request,
     RequestContext, RpcMessageKind, RpcPrefix,
@@ -93,6 +90,9 @@ use libkernel::{
     },
     system,
 };
+use libkernel::shared::proc::Pid;
+use erhino_shared::sync::spin::SimpleLock;
+use lock_api::Mutex;
 
 mod supervisor;
 use supervisor::RootSupervisor;
@@ -127,6 +127,30 @@ struct LaunchedServices {
     test_fal_image: &'static [u8],
     target_image: Option<&'static [u8]>,
     hammer_image: Option<&'static [u8]>,
+}
+
+struct InitStartup {
+    pid: Pid,
+    payload: &'static [u8],
+    root_memory_pool: Handle,
+}
+
+static INIT_STARTUP: Mutex<SimpleLock, Option<InitStartup>> = Mutex::const_new(SimpleLock::new(), None);
+
+fn init_pid() -> Pid {
+    INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs are not initialized")
+        .pid
+}
+
+fn init_payload() -> &'static [u8] {
+    INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs are not initialized")
+        .payload
 }
 
 enum RunFailure {
@@ -358,7 +382,7 @@ fn launch_test_services(
     let mut fs_second_scope = None;
     let mut primary_provider = None;
     let mut registry_root_watch = None;
-    let result = tar::walk(libruntime::startup::startup_payload(), |entry| {
+    let result = tar::walk(init_payload(), |entry| {
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
             return;
         }
@@ -2552,8 +2576,11 @@ fn collect_fs_provider(
 }
 
 fn root_memory_pool() -> Handle {
-    libruntime::startup::startup_handle(initial::ROOT_MEMORY_POOL)
-        .expect("init must hold root MemoryPool authority")
+    INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs are not initialized")
+        .root_memory_pool
 }
 
 fn root_pool_allocated() -> Result<u64, SystemCallError> {
@@ -2739,13 +2766,13 @@ fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str>
 
     let ready = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
     let go = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let mut workers: [Option<libthread::JoinHandle<WorkerResult>>;
+    let mut workers: [Option<libthread::ResultReceiver<WorkerResult, libthread::NoEnvironment>>;
         CAPACITY_CONCURRENT_WORKERS] = core::array::from_fn(|_| None);
     for slot in &mut workers {
         let ready = ready.clone();
         let launch_go = go.clone();
         let pool = root_memory_pool();
-        *slot = match libthread::Builder::new()
+        *slot = match libruntime::thread::Builder::new()
             .stack_size(64 * 1024)
             .spawn(move || {
                 ready.fetch_add(1, core::sync::atomic::Ordering::Release);
@@ -2797,7 +2824,7 @@ fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str>
             Err(_) => {
                 go.store(true, core::sync::atomic::Ordering::Release);
                 for worker in workers.iter_mut().filter_map(Option::take) {
-                    let (entries, _, _, _) = worker.join();
+                    let (entries, _, _, _) = take_thread_result(worker.join());
                     for created in entries.into_iter().flatten() {
                         let _ = unsafe { process::abandon_to_completion(created) };
                     }
@@ -2817,7 +2844,7 @@ fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str>
         let worker = worker
             .take()
             .ok_or("capacity concurrent worker handle missing")?;
-        *result = Some(worker.join());
+        *result = Some(take_thread_result(worker.join()));
     }
 
     let mut successes = 0;
@@ -2937,13 +2964,38 @@ fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'sta
     Ok(())
 }
 
-fn app_main() {
+fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) -> T {
+    match outcome {
+        ThreadOutcome::Returned {
+            value,
+            leave: Ok(()),
+        } => value,
+        ThreadOutcome::Returned {
+            leave: Err(()), ..
+        }
+        | ThreadOutcome::EnterFailed(())
+        | ThreadOutcome::Incomplete => panic!("runtime worker did not complete"),
+    }
+}
+
+fn main() {
     debug!("Hello, init!");
-    let root_job = libruntime::startup::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
-    let mut reset = Some(
-        libruntime::startup::startup_handle(initial::SYSTEM_RESET)
-            .expect("init must hold SystemReset authority"),
-    );
+    let mut startup = libruntime::startup::take().expect("init startup context is missing");
+    let root_job = startup
+        .take_handle(initial::ROOT_JOB)
+        .expect("init must hold root JobControl");
+    let reset_handle = startup
+        .take_handle(initial::SYSTEM_RESET)
+        .expect("init must hold SystemReset authority");
+    let root_memory_pool = startup
+        .take_handle(initial::ROOT_MEMORY_POOL)
+        .expect("init must hold root MemoryPool authority");
+    *INIT_STARTUP.lock() = Some(InitStartup {
+            pid: startup.pid(),
+            payload: startup.payload(),
+            root_memory_pool,
+        });
+    let mut reset = Some(reset_handle);
     // 尚无服务责任时准备根承载；失败不会遗忘已启动服务。
     let mut root = loop {
         match RootSupervisor::prepare(&mut reset) {
@@ -3302,7 +3354,7 @@ fn test_rpc_reject_cleanup() {
     )
     .expect("RPC rejected Handle notification create failed");
     let rejected_alias = rejected.peer;
-    let worker = libthread::Builder::new()
+    let worker = libruntime::thread::Builder::new()
         .spawn(move || {
             for attempt in 0..2 {
                 let mut request =
@@ -3393,7 +3445,7 @@ fn test_rpc_reject_cleanup() {
     assert_eq!(reply.payload, [1]);
     assert!(reply.handles.is_empty());
 
-    worker.join();
+    take_thread_result(worker.join());
     unsafe { close(rejected.owner) }.expect("RPC rejected Handle owner close failed");
     drop(service_sender);
     debug!("RPC rejected reply cleanup passed");
@@ -3506,7 +3558,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     names.register_job(services, "services");
     names.register_job(pm_domain, "pm_domain");
     names.register_job(acceptance, "acceptance");
-    names.register_process(libruntime::startup::pid() as u64, "init");
+    names.register_process(init_pid() as u64, "init");
     let launched = launch_test_services(root, services, pm_domain, acceptance, &mut names)?;
     let pm_mailbox = launched.pm_mailbox;
     let mut first_fs = launched.first_fs;
@@ -4980,7 +5032,7 @@ fn test_capability_badges_and_affine_owners() {
     for (kind, badge) in [(880, 0), (881, BADGE), (882, BADGE)] {
         let message = receive(mailbox.owner).expect("badged message receive failed");
         assert_eq!(message.header.kind, kind);
-        assert_eq!(message.header.sender_pid, libruntime::startup::pid() as u64);
+        assert_eq!(message.header.sender_pid, init_pid() as u64);
         assert_eq!(message.header.sender_badge, badge);
     }
     let once = make_send_once(badged, Rights::WRITE).expect("badged send-once mint failed");
@@ -5535,5 +5587,3 @@ fn test_tunnel_lifecycle() {
     }
     debug!("tunnel lifecycle stress passed: {} rounds", TUNNEL_STRESS);
 }
-
-libruntime::entry!(app_main);

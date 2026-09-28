@@ -1,6 +1,6 @@
 //! Job 收束机器的 Runtime 接缝：观察注销回执先于机器恢复，所有事件完整分派。
 
-use crate::{JobCollector, JobCollectorError, JobCollectorEvent, observation::ObservationSlot};
+use super::{JobCollector, JobCollectorError, JobCollectorEvent, observation::ObservationSlot};
 use erhino_shared::{call::SystemCallError, time::Deadline};
 use libexecution::runtime::{Advance, Input, Requests, SourceId, SourceKind, Step};
 
@@ -23,7 +23,7 @@ impl JobDriver {
     pub fn machine(&self) -> &JobCollector {
         &self.machine
     }
-    pub fn replenish(&mut self, policy: crate::SupervisionPolicy) {
+    pub fn replenish(&mut self, policy: super::SupervisionPolicy) {
         self.machine.replenish(policy);
         self.failure = None;
         self.retry_at = None;

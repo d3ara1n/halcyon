@@ -10,12 +10,8 @@
 //! 的用户态政策，init 保留直接收束权作兜底。
 
 #![no_std]
-#![no_main]
 
 extern crate libruntime;
-
-#[used]
-static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use libbudget::Budget;
 use libexecution::{
@@ -870,12 +866,17 @@ impl Task<PmWorld> for PmTask {
     }
 }
 
-fn app_main() {
+fn main() {
     debug!("Hello, pm!");
+    let mut startup = libruntime::startup::take().expect("pm: startup context is missing");
     // 服务出生自带的邮箱 owner（StartupBlock Handle[0]）。
-    let mailbox = libruntime::startup::startup_handle(0).expect("pm: mailbox owner grant is missing");
+    let mailbox = startup
+        .take_handle(0)
+        .expect("pm: mailbox owner grant is missing");
     // StartupBlock Handle[1] = init 授出的 pm_domain JobControl。
-    let domain = libruntime::startup::startup_handle(1).expect("pm: delegated domain control is missing");
+    let domain = startup
+        .take_handle(1)
+        .expect("pm: delegated domain control is missing");
 
     // 执行核心：任务与输入额度在公开前准备。
     let budget = Budget::new(&[16, 64 * 1024], 1).expect("pm: budget");
@@ -966,5 +967,3 @@ fn app_main() {
 fn exit_failed() -> ! {
     unsafe { sys_process_abort() }
 }
-
-libruntime::entry!(app_main);

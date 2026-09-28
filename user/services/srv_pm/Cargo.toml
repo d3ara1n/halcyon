@@ -12,5 +12,5 @@ libkernel = {path = "../../libraries/libkernel"}
 librunnel = { path = "../../libraries/librunnel" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
-libprocess = { path = "../../libraries/libprocess" }
+libprocess = { path = "../../libraries/libprocess", features = ["management"] }
 libruntime = { path = "../../libraries/libruntime" }

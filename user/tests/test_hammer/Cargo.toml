@@ -6,6 +6,6 @@ description = "Lifecycle race matrix hammer and race target"
 
 [dependencies]
 libkernel = { path = "../../libraries/libkernel" }
-libprocess = { path = "../../libraries/libprocess" }
+libprocess = { path = "../../libraries/libprocess", features = ["management"] }
 libruntime = { path = "../../libraries/libruntime" }
 libthread = { path = "../../libraries/libthread" }

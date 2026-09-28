@@ -140,7 +140,11 @@ ProcessGrant 可以在内存绑定前独立完成，因为 HandleTable 属于空
 | 共享 ThreadControl | 内核 entry 与持久 DONE | 最后一个引用释放时 Close | libkernel 类型，Arc 共享 |
 | `ResultCell<T>` | 一次性结果与领取/放弃仲裁 | 结果被领取或析构，最后一个引用释放内存 | libthread |
 
-`ThreadRegistry` 的机制（固定容量槽、唯一 cleanup claim、单步 `reap_step`、seal）全部属于 libthread，只对环境类型泛型，不含任务或结果类型。所选 runtime 建立并持有一个进程级实例、提供容量与环境实现；不存在跨库登记端口或第二份槽规则。公开 `Thread` 持有共享 ThreadControl，DONE 是持久事实，观察永不失效；结果领取权 `JoinHandle<T>` 持有 `ResultCell<T>`。record 退休不影响观察与结果，未领取结果也不占 Registry 槽。
+`ThreadRegistry` 的机制（固定容量槽、唯一 cleanup claim、单步 `reap_step`、seal）全部属于 libthread，只对环境类型泛型，不含任务或结果类型。所选 runtime 建立并持有一个进程级实例、提供容量与环境实现；不存在跨库登记端口或第二份槽规则。公开 `Thread` 持有共享 ThreadControl，DONE 是持久事实，观察永不失效；结果领取权 `ResultReceiver<T>` 持有 `ResultCell<T>`；它只领取结果，不是 Rust std 的 join/detach 句柄，Drop 语义是放弃结果。record 退休不影响观察与结果，未领取结果也不占 Registry 槽。
+
+`Thread`、`ResultReceiver<T>` 与 packet 都以共享引用保活各自依赖的 Registry 核心或 ResultCell，不以裸指针或注释证明存活；Registry 实例由 runtime 持有至进程终局，局部 Registry 的销毁不能使任何观察者或运行中 packet 悬垂。环境类型本身须满足其实际共享方式（跨线程共享即 `Send + Sync + 'static`）。
+
+槽状态为 `Free → Reserved → Live → Claimed → Free`：prepare 取得 Reserved，登记转 Live，reap 转 Claimed 并在完成后才回到 Free；Claimed 与 Reserved 都不可被再次分配。准入、登记与 seal 在同一仲裁边界线性化，seal 返回后不再有新登记。
 
 ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 cleanup 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。
 
@@ -153,10 +157,12 @@ ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该
 ```text
 prepare: Registry 槽准入 → 环境准备 → 带 guard 的栈 → ResultCell/packet
   → ThreadCreate（挂起，取得 Control）→ 登记 ThreadRecord
-  → ThreadStart → Thread + JoinHandle<T>
+  → ThreadStart → Thread + ResultReceiver<T>
 ```
 
-线程在 Create 与 Start 之间不运行，因此 record、packet 与 ResultCell 在 Start 之前已经稳定，不存在“子线程早于 syscall 返回运行”的登记竞争。Start 前的每一步失败按反向顺序返还；ThreadCreate 已成功而放弃启动时，关闭最后 Control 引用由内核离场并发布 DONE，record 随后按普通 cleanup 收束，closure 在放弃者线程上 Drop。ThreadStart 的拒绝返还 PreparedThread。已成功的内核操作若写回输出用户地址失败，统一以发起 tid 和失败 VA 冻结 `Faulted(UserAccess)`，不能报告可重试成功；提交前事务仍回滚其未公开资源。进入 syscall 时不得持有子线程退出所需的用户锁。
+packet（F、子侧环境状态、ResultCell 引用）是独立 owner，不属于 record：Start 成功后由子线程 trampoline 取得并在子线程消耗或 Drop；Start 前放弃时由放弃者取回。record 从不持有擦除类型的 packet 析构器。
+
+线程在 Create 与 Start 之间不运行，因此 record、packet 与 ResultCell 在 Start 之前已经稳定，不存在“子线程早于 syscall 返回运行”的登记竞争。Start 前的每一步失败按反向顺序返还；ThreadCreate 已成功而放弃启动时，关闭最后 Control 引用由内核离场并发布 DONE，record 随后按普通 cleanup 收束，closure 在放弃者线程上 Drop。放弃不以 Unmap 成功为前提：先释放 Control 引用使内核发布 DONE，栈交普通 cleanup；任何 Unmap 拒绝都返还原 region owner，不 `let _` 丢弃。ThreadStart 的拒绝返还 PreparedThread。已成功的内核操作若写回输出用户地址失败，统一以发起 tid 和失败 VA 冻结 `Faulted(UserAccess)`，不能报告可重试成功；提交前事务仍回滚其未公开资源。进入 syscall 时不得持有子线程退出所需的用户锁。
 
 Building 期创建的线程由构建者供栈（Building Map）；其 child-local Control 是 StartupBlock grants/Handle 数组的一项。版本化 `EntryThreadDescriptor` 只记录该项的零基索引与栈 reservation、usable 范围，接收时由同一列表解析，不复制句柄值。子进程 runtime 入口用一次性原子采用该描述，在自身 Registry 中按普通 region owner 登记入口栈 record 后才进入应用 wrapper；运行期栈也由该 owner/cleanup 模型收束，不按来源分支。Rust profile 只有一个 `_start` 采用者，第二次进入 `_start` 是进程完整性失败；其它 Building 线程须使用别的入口契约。采用前进程终止时这些都是进程资源，由 ProcessDrain 收束，不跨地址空间运输 Rust 对象。
 
@@ -167,24 +173,24 @@ Building 期创建的线程由构建者供栈（Building Map）；其 child-loca
 | 路径 | 动作 |
 |---|---|
 | 子线程正常返回 | 写入 T → 环境 leave → CAS Empty→Published（release）；失败说明领取方已放弃，子线程自行 Drop T |
-| 子线程 enter 失败 | 不运行 F，在子线程 Drop F，发布 EnterFailed |
-| JoinHandle 领取 | 观察 DONE → acquire 读取：Published 取出 T；Empty 返回 Incomplete，不读取未初始化内存 |
-| JoinHandle Drop | CAS Empty→ReceiverGone；失败说明已发布，在本线程取出并 Drop T |
+| 子线程 enter 失败 | 不运行 F，在子线程 Drop F，发布 `EnterFailed(环境错误)`，不 abort 进程 |
+| ResultReceiver 领取 | 必须先观察 DONE；未 DONE 时 try 形式返回 `Pending`，不读结果。DONE 后 acquire：Published 取出 T；Empty 返回 `Incomplete`，不 panic、不读取未初始化内存 |
+| ResultReceiver Drop | CAS Empty→ReceiverGone；失败说明已发布，在本线程取出并 Drop T |
 
-leave 失败保留 T 并单独报告环境错误。Incomplete 只出现于绕过 wrapper 的 raw ThreadExit 或完整性故障；libkernel 的 `ThreadExit()` 是 unsafe 原语，libthread 不提供可绕过 wrapper 的安全 exit。闭包及返回值需要 Send 与静态拥有的捕获，不提供 scoped thread。
+结果类型为 `Returned { value: T, leave: Result<(), 环境错误> } | EnterFailed(环境错误) | Incomplete`：leave 失败保留 T 并单独报告环境错误。普通环境失败不升级为进程 abort；只有违反 wrapper 自身不变量才是完整性失败。Incomplete 只出现于绕过 wrapper 的 raw ThreadExit 或完整性故障；libkernel 的 `ThreadExit()` 是 unsafe 原语，libthread 不提供可绕过 wrapper 的安全 exit。闭包及返回值需要 Send 与静态拥有的捕获，不提供 scoped thread。
 
 ### 离场与 cleanup
 
-`ThreadExit()` 不带参数：线程离场即完成。DONE 后 `reap_step` 只执行机械动作：环境 retire、释放 Control 引用、Unmap 栈、归还槽；Busy 返回 Wait，永久错误保留 record 并进入进程完整性故障，不降级为计数或 panic。任意用户代码（F、T、enter/leave）从不在 cleanup 中执行。
+`ThreadExit()` 不带参数：线程离场即完成。DONE 后 `reap_step` 只执行机械动作：环境 retire、释放 Control 引用、Unmap 栈、归还槽；Busy 返回 Wait，永久错误保留 record 与已完成进度（retire 已消费的残余不再重复、未完成步骤不跳过）并经 `ProcessAbort()` 进入进程完整性故障，不忽略、不降级为计数或 panic。任意用户代码（F、T、enter/leave）从不在 cleanup 中执行。
 
 系统没有专职 driver 线程，cleanup 为协作式推进，契约只承诺容量不被已死线程占用，不承诺及时回收：
 
 - prepare 取槽前先 reap 已 DONE 的记录，槽耗尽只说明确有等量线程仍活着或 Busy；
 - 线程 wrapper 在 ThreadExit 前对其它已 DONE 记录做有界次数 reap；
-- join 观察到 DONE 时推进一次 reap；
+- ResultReceiver 领取观察到 DONE 时推进一次 reap（领取调用本身，不是 Drop）；
 - 已运行 libexecution 的程序可把 DONE 登记为等待来源加速回收，不创建隐藏线程。
 
-积压以 Registry 容量为上界；进程终局时剩余 record、自身栈和最后离场线程的资源由 ProcessDrain 收束，这是正常终局而非泄漏。期限只限制本次观察，不杀子线程、不撤销已提交 MemoryChange。Thread 与 JoinHandle 的 Drop 不等待、不触碰 record。
+积压以 Registry 容量为上界；进程终局时剩余 record、自身栈和最后离场线程的资源由 ProcessDrain 收束，这是正常终局而非泄漏。期限只限制本次观察，不杀子线程、不撤销已提交 MemoryChange。`Thread` 与 `ResultReceiver` 的 Drop 只放弃各自的观察/结果引用，不等待、不 reap、不触碰 record，也不调用可能停驻的 syscall。
 
 ### 入口线程与程序终局
 

@@ -6,8 +6,8 @@
 //! 跨批继续，Drain Complete 才是关闭 control 的前置。对象繁忙按绝对
 //! 期限重试（REAPABLE 是持久电平，不能靠重新观察重试）。
 
-use crate::observation::{Observation, ObservationResult, ObservationSlot, ObservationState};
-use crate::{
+use super::observation::{Observation, ObservationResult, ObservationSlot, ObservationState};
+use super::{
     CollectedProcess, SupervisionCause, SupervisionPolicy, SupervisionProgress, SupervisionStage,
     SupervisionTarget,
 };
@@ -230,7 +230,7 @@ impl<O: ProcessOperations> Collector<O> {
 
     /// 每步至多一次系统操作；等待与实际重试期限由机器保留。
     pub fn step(mut self, now_ns: u64) -> StepOutcome<O> {
-        if !crate::valid_policy(self.policy) {
+        if !super::valid_policy(self.policy) {
             let stage = self.stage();
             return self.escalate(stage, SupervisionCause::InvalidPolicy);
         }
@@ -585,7 +585,7 @@ mod tests {
         let target = SupervisionTarget::new(7, erhino_shared::object::Handle::from_raw(9));
         let collector = Collector::new_with_ops(
             target,
-            crate::DEFAULT_SUPERVISION_POLICY,
+            super::super::DEFAULT_SUPERVISION_POLICY,
             FakeOps(state.clone()),
         );
         let collector = match collector.step(0) {

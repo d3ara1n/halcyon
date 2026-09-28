@@ -13,7 +13,8 @@
 
 ## 近期顺序
 
-1. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
+1. [运行时分层校正](review-2026-09-28-runtime-layering.md#处置与校正范围)：f519a99 独立审查的 19 项发现及入口/启动上下文设计纠正，先于分层后续工作。
+2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
 
 ## 可择机任务与审查
 
@@ -48,6 +49,7 @@
 | [系统关机编排](todo-2026-09-system-shutdown-orchestration.md) | 正式长期服务需关机收束，或对外承诺优雅关机前 |
 | [电源管理服务](todo-2026-09-power-management-service.md) | 独立电源管理需求明确后 |
 | [内核最终架构审查](todo-2026-09-kernel-final-architecture-review.md) | 主要用户态消费者及计划所列主线前置完成后 |
+| [Halcyon std 平台层](todo-2026-09-28-halcyon-std.md) | 出现必须依赖 std 的真实第三方需求 |
 | [对象级最后 capability 引用机制](todo-2026-09-28-capability-last-reference.md) | 生命周期收敛切面提交后，先只读盘点现有“最后引用”语义 |
 
 ## 尚未立案的候选

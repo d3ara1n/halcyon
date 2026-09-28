@@ -3,13 +3,27 @@ name = "libprocess"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+management = ["dep:elf", "dep:libexecution"]
+
 [dependencies]
 erhino_shared = { path = "../../../shared/erhino_shared" }
-libexecution = { path = "../libexecution" }
+libexecution = { path = "../libexecution", optional = true }
 monotonic_id = { path = "../../../shared/monotonic_id" }
 num-traits = { version = "0.2", default-features = false }
 libkernel = { path = "../libkernel" }
-elf = { path = "../../../shared/elf" }
+elf = { path = "../../../shared/elf", optional = true }
 
 [dev-dependencies]
 libbudget = { path = "../libbudget" }
+
+[[test]]
+name = "execution_recovery"
+path = "tests/execution_recovery.rs"
+required-features = ["management"]
+
+[[test]]
+name = "observation_runtime"
+path = "tests/observation_runtime.rs"
+required-features = ["management"]

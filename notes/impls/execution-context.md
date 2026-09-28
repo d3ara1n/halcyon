@@ -35,7 +35,7 @@ F-only、Q、V、TSO 与未建模扩展由 loader 拒绝。Q-capable hart 可运
 
 Building 首线程与 Running 期 ThreadCreate 共用 `ThreadStartContext` 到 `UserContext` 的编码：entry 写 sepc，sp 写 x2，arg1/arg2 写 a0/a1，其余 GPR、tp、FP 状态清零。ProcessBindExecution 在首次 ThreadCreate 前冻结 requirement 与兼容调度域；ThreadCreate 只继承已冻结的 execution binding，线程只能进入该域。ThreadExit 与被终止线程都走非 Resume trap 出口，先切回 kernel satp、清 active，再由调度侧释放执行容器并请求 `ThreadDeparture`，不会在仍使用用户 root 时发布 DONE。
 
-当前用户首入口由 `user/platforms/linker.ld` 的 `ENTRY(_start)` 定位；`libruntime::_start` 以 RV64 内联入口指令建立 `gp`，保持 a0/a1 StartupBlock 参数后进入 `__runtime_start`。runtime 完成 heap、StartupContext 与入口 ThreadRegistry 接管，再调用由各 binary 的 `libruntime::entry!(app_main)` 生成的内部 ABI 桥接；该符号只服务链接，不是应用 API。运行期线程由 `libthread` trampoline 进入，栈映射遇到 transient ObjectBusy 时让出后重试。Base64/D64 target 均显式使用 `riscv64-elf-ld`、`__global_pointer$` 和 no_main；入口与 trampoline 反汇编门已通过。当前 PT_TLS 不在 shared/elf admission 白名单，tp=0 不提供 TLS。
+当前用户首入口由 `user/platforms/linker.ld` 的 `ENTRY(_start)` 定位；`libruntime::_start` 以 RV64 norelax 入口适配段建立 `gp`，保持 a0/a1 StartupBlock 参数后进入 runtime start。runtime 完成 heap、StartupContext 与入口 ThreadRegistry 接管，再由 `start` lang item 接收 rustc 的 `main` shim。运行期线程由 `libthread` trampoline 进入，栈映射遇到 transient ObjectBusy 时让出后重试。Base64/D64 target 均显式使用 `riscv64-elf-ld`、`__global_pointer$`；入口与 trampoline 反汇编门已通过。当前 PT_TLS 不在 shared/elf admission 白名单，tp=0 不提供 TLS。
 
 ## Trap 与 CSR
 

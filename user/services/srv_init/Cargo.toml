@@ -14,9 +14,10 @@ capacity-calibration = []
 
 [dependencies]
 libkernel = { path = "../../libraries/libkernel" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
 librunnel = { path = "../../libraries/librunnel" }
 librpc = { path = "../../libraries/librpc" }
-libprocess = { path = "../../libraries/libprocess" }
+libprocess = { path = "../../libraries/libprocess", features = ["management"] }
 libfal = { path = "../../libraries/libfal" }
 libfs = { path = "../../libraries/libfs" }
 libservice = { path = "../../libraries/libservice" }
@@ -24,5 +25,6 @@ libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
 libruntime = { path = "../../libraries/libruntime" }
 libthread = { path = "../../libraries/libthread" }
+lock_api = "0.4"
 test_fal = { path = "../../tests/test_fal" }
 tar = { path = "../../../shared/tar" }

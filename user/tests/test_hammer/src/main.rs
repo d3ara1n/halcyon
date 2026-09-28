@@ -7,12 +7,8 @@
 //! 自灭（Suicide/Fault）或高频 park，与锤的 kill 同刻起跑。
 
 #![no_std]
-#![no_main]
 
 extern crate libruntime;
-
-#[used]
-static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,17 +43,34 @@ use libkernel::{
     },
     sys_process_terminate, sys_sleep,
 };
-use libthread as thread;
+use libthread::ThreadOutcome;
+use libthread as raw_thread;
+use libruntime::thread;
 
-fn app_main() {
-    let Some(words) = race::decode_payload(libruntime::startup::startup_payload()) else {
+fn main() {
+    let mut startup = libruntime::startup::take().expect("hammer startup context is missing");
+    let Some(words) = race::decode_payload(startup.payload()) else {
         debug!("hammer: invalid payload");
         return;
     };
     match words.first().copied().unwrap_or(0) {
-        MODE_HAMMER => hammer_mode(),
-        MODE_TARGET => target_mode(&words),
+        MODE_HAMMER => hammer_mode(&mut startup),
+        MODE_TARGET => target_mode(&mut startup, &words),
         other => debug!("hammer: unknown mode {}", other),
+    }
+}
+
+fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) -> T {
+    match outcome {
+        ThreadOutcome::Returned {
+            value,
+            leave: Ok(()),
+        } => value,
+        ThreadOutcome::Returned {
+            leave: Err(()), ..
+        }
+        | ThreadOutcome::EnterFailed(())
+        | ThreadOutcome::Incomplete => panic!("runtime worker did not complete"),
     }
 }
 
@@ -68,11 +81,14 @@ fn await_gun(gun: Handle) {
     let _ = notification::take(gun, u64::MAX);
 }
 
-fn hammer_mode() {
+fn hammer_mode(startup: &mut libruntime::startup::StartupContext) {
     let (Some(cmd_box), Some(report_box), Some(gun)) = (
-        libruntime::startup::startup_handle(HAMMER_CMD),
-        libruntime::startup::startup_handle(HAMMER_REPORT),
-        libruntime::startup::startup_handle(HAMMER_GUN),
+        startup
+            .take_handle(HAMMER_CMD),
+        startup
+            .take_handle(HAMMER_REPORT),
+        startup
+            .take_handle(HAMMER_GUN),
     ) else {
         debug!("hammer: missing grants");
         return;
@@ -296,8 +312,10 @@ fn enumerate(control: Handle) -> (Report, alloc::vec::Vec<u64>) {
     )
 }
 
-fn target_mode(words: &[u64]) {
-    let Some(gun) = libruntime::startup::startup_handle(TARGET_GUN) else {
+fn target_mode(startup: &mut libruntime::startup::StartupContext, words: &[u64]) {
+    let Some(gun) = startup
+        .take_handle(TARGET_GUN)
+    else {
         debug!("hammer target: missing gun");
         return;
     };
@@ -312,7 +330,7 @@ fn target_mode(words: &[u64]) {
         last_thread_exit_target(gun, words.get(2).copied().unwrap_or(0));
     }
     if role == TARGET_TUNNEL_EXIT {
-        tunnel_exit_target(gun);
+        tunnel_exit_target(startup, gun);
     }
     await_gun(gun);
     match role {
@@ -374,9 +392,13 @@ fn thread_suite() {
 
 const TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
 
-fn tunnel_exit_target(gun: Handle) -> ! {
-    let invitation =
-        libruntime::startup::startup_handle(TARGET_INVITATION).expect("Tunnel exit target missing invitation");
+fn tunnel_exit_target(
+    startup: &mut libruntime::startup::StartupContext,
+    gun: Handle,
+) -> ! {
+    let invitation = startup
+        .take_handle(TARGET_INVITATION)
+        .expect("Tunnel exit target missing invitation");
     let endpoint = unsafe { tunnel::attach(invitation, Placement::Anywhere) }
         .expect("Tunnel exit target attach failed");
     let shared = endpoint.memory();
@@ -416,8 +438,8 @@ fn raw_spawn(
         control: Handle::INVALID,
     };
     // SAFETY: context/result live for the synchronous call; the caller owns a mapped stack.
-    unsafe { thread::spawn_raw(&context, &mut result) }?;
-    unsafe { thread::start_raw(result.control) }?;
+    unsafe { raw_thread::spawn_raw(&context, &mut result) }?;
+    unsafe { raw_thread::start_raw(result.control) }?;
     assert!(
         result.tid != 0 && result.reserved == 0 && result.control.is_valid(),
         "raw ThreadCreate returned an invalid result"
@@ -500,7 +522,7 @@ fn join_publication() {
             .spawn(move || (sequence, sequence.rotate_left(7) ^ 0x5a5a_5a5a))
             .expect("join publication spawn failed");
         assert_eq!(
-            worker.join(),
+            take_thread_result(worker.join()),
             (sequence, sequence.rotate_left(7) ^ 0x5a5a_5a5a),
             "join observed an incompletely published result"
         );
@@ -512,10 +534,10 @@ fn join_publication() {
         .stack_size(16 * 1024)
         .spawn(move || DropMarker(child_dropped))
         .expect("structured Drop worker spawn failed");
-    drop(worker);
+    drop(take_thread_result(worker.join()));
     assert!(
         dropped.load(Ordering::Acquire),
-        "JoinHandle Drop returned before destroying the published result"
+        "joined result did not destroy the published value"
     );
 }
 
@@ -678,7 +700,7 @@ fn stale_translation_reuse() {
     // SAFETY: replacement 恰好重新取得 address 的 RW usable 页。
     unsafe { (address as *mut u64).write_volatile(NEW_TRANSLATION_VALUE) };
     release.store(true, Ordering::Release);
-    let observed = worker.join();
+    let observed = take_thread_result(worker.join());
     assert_eq!(
         observed,
         (OLD_TRANSLATION_VALUE, NEW_TRANSLATION_VALUE),
@@ -766,7 +788,7 @@ fn concurrent_tunnel_close() {
         }
         release.store(true, Ordering::Release);
         unmap_churn_region(region);
-        closer.join().expect("concurrent Endpoint close failed");
+        take_thread_result(closer.join()).expect("concurrent Endpoint close failed");
         unsafe { close(invitation) }.expect("Tunnel invitation close failed");
         debug!(
             "acceptance progress: phase=concurrent-tunnel-close round={}/8 step=complete",
@@ -909,7 +931,7 @@ fn tunnel_close_attach() {
             thread::yield_now().expect("Attach completion gate yield failed");
         }
         phase.store(3, Ordering::Release);
-        worker.join();
+        take_thread_result(worker.join());
         debug!(
             "acceptance progress: phase=tunnel-close-attach round={}/24 step=worker-joined",
             round + 1
@@ -1058,5 +1080,3 @@ fn guard_fault() {
     let _ = unsafe { core::ptr::read_volatile(guard as *const u64) };
     core::hint::black_box(region);
 }
-
-libruntime::entry!(app_main);

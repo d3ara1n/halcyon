@@ -13,7 +13,6 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// 0 = 未初始化（启动契约：runtime entry 在任何用户代码前写入）。
 static PID: AtomicU64 = AtomicU64::new(0);
 static PARENT_PID: AtomicU64 = AtomicU64::new(0);
-static CLAIMED: AtomicU64 = AtomicU64::new(0);
 
 /// 解析并校验内核定义的 StartupBlock 外层。payload 内容完全不解释；
 /// launcher 与当前进程自行约定其格式。
@@ -44,7 +43,6 @@ pub unsafe fn init(block: *const u8, block_len: usize) {
 
     PID.store(header.pid, Ordering::Relaxed);
     PARENT_PID.store(header.parent_pid, Ordering::Relaxed);
-    CLAIMED.store(0, Ordering::Relaxed);
     BLOCK.store(block as usize, Ordering::Release);
 }
 
@@ -85,28 +83,8 @@ pub fn grant_count() -> usize {
 }
 
 /// 按 launcher/child 约定的数组序号一次性领取一项启动 Handle。
-pub fn startup_handle(index: usize) -> Option<Handle> {
-    if index >= u64::BITS as usize {
-        return None;
-    }
-    let bit = 1u64 << index;
-    loop {
-        let claimed = CLAIMED.load(Ordering::Acquire);
-        if claimed & bit != 0 {
-            return None;
-        }
-        if CLAIMED
-            .compare_exchange(
-                claimed,
-                claimed | bit,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            return startup_handles().get(index).copied();
-        }
-    }
+pub fn handle(index: usize) -> Option<Handle> {
+    startup_handles().get(index).copied()
 }
 
 /// launcher 与当前进程自行解释的不透明 payload。

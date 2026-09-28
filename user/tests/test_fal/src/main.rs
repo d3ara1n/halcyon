@@ -1,11 +1,7 @@
 //! 独立 FAL 验收消费者。启动与 provider 退出由 init 持有。
 #![no_std]
-#![no_main]
 
 extern crate libruntime;
-
-#[used]
-static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 extern crate alloc;
 
@@ -22,6 +18,7 @@ use libfs::{
     prefix::{DirectoryGrant, PrefixTable},
     resolve,
 };
+use libthread::ThreadOutcome;
 use librpc::{CallCause, CallPhase, RpcMessageKind, RpcPrefix};
 use librunnel::blocking;
 use libservice::record::ServiceRecord;
@@ -45,8 +42,13 @@ use libkernel::{
 };
 use test_fal::{command, report, startup};
 
-fn startup_capability(index: usize) -> Result<Capability, &'static str> {
-    let handle = libruntime::startup::startup_handle(index).ok_or("FAL consumer startup grant missing")?;
+fn startup_capability(
+    startup: &mut libruntime::startup::StartupContext,
+    index: usize,
+) -> Result<Capability, &'static str> {
+    let handle = startup
+        .take_handle(index)
+        .ok_or("FAL consumer startup grant missing")?;
     // SAFETY: StartupBlock 将各唯一的非映射 grant 移交给当前进程。
     Ok(unsafe { Capability::from_raw(handle) })
 }
@@ -1863,7 +1865,7 @@ fn exercise_copy_after_progress_cancel(
     let cancel = unsafe { Capability::from_raw(event.owner) };
     let peer = event.peer;
     let observer = second_parent.clone();
-    let watcher = libthread::Builder::new()
+    let watcher = libruntime::thread::Builder::new()
         .spawn(move || -> Result<(), SystemCallError> {
             let mut observer_client = Client::new();
             loop {
@@ -1903,8 +1905,7 @@ fn exercise_copy_after_progress_cancel(
         deadline,
         cancel: Some(&cancel),
     });
-    watcher
-        .join()
+    take_thread_result(watcher.join())
         .map_err(|_| "FAL consumer midflight watcher join failed")?;
     let Err(mut result) = result else {
         return Err("FAL consumer midflight Copy ignored cancellation");
@@ -2038,7 +2039,7 @@ fn exercise_copy_during_provider_shutdown(
         .map_err(|_| "FAL consumer midflight source close failed")?;
 
     let observer = second_parent.clone();
-    let watcher = libthread::Builder::new()
+    let watcher = libruntime::thread::Builder::new()
         .spawn(move || -> Result<(), SystemCallError> {
             let mut observer_client = Client::new();
             loop {
@@ -2076,8 +2077,7 @@ fn exercise_copy_during_provider_shutdown(
         deadline,
         cancel: None,
     });
-    watcher
-        .join()
+    take_thread_result(watcher.join())
         .map_err(|_| "FAL consumer midflight watcher join failed")?;
     let Err(mut result) = result else {
         return Err("FAL consumer midflight Copy ignored provider shutdown");
@@ -2132,19 +2132,19 @@ fn exercise_copy_during_provider_shutdown(
     }
     Ok(())
 }
-fn run() -> Result<(), &'static str> {
+fn run(startup: &mut libruntime::startup::StartupContext) -> Result<(), &'static str> {
     let (primary, primary_desc) =
-        MailboxSender::from_capability(startup_capability(startup::PRIMARY_ROOT)?)
+        MailboxSender::from_capability(startup_capability(startup, startup::PRIMARY_ROOT)?)
             .map_err(|_| "FAL consumer primary grant invalid")?;
     let (directory, directory_desc) =
-        MailboxSender::from_capability(startup_capability(startup::SERVICE_DIRECTORY)?)
+        MailboxSender::from_capability(startup_capability(startup, startup::SERVICE_DIRECTORY)?)
             .map_err(|_| "FAL consumer service directory invalid")?;
     if primary_desc.rights.contains(Rights::GRANT) || directory_desc.rights.contains(Rights::GRANT)
     {
         return Err("FAL consumer received process grant authority");
     }
-    let command_owner = startup_capability(startup::COMMAND_OWNER)?;
-    let report_signaler = startup_capability(startup::REPORT_SIGNALER)?;
+    let command_owner = startup_capability(startup, startup::COMMAND_OWNER)?;
+    let report_signaler = startup_capability(startup, startup::REPORT_SIGNALER)?;
     let deadline = time::timeout_millis(120_000).map_err(|_| "FAL consumer deadline invalid")?;
     let mut client = Client::new();
     let primary_lookup = client
@@ -2597,10 +2597,23 @@ fn run() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn app_main() {
-    if let Err(error) = run() {
-        panic!("test_fal acceptance failed: {error}");
+fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) -> T {
+    match outcome {
+        ThreadOutcome::Returned {
+            value,
+            leave: Ok(()),
+        } => value,
+        ThreadOutcome::Returned {
+            leave: Err(()), ..
+        }
+        | ThreadOutcome::EnterFailed(())
+        | ThreadOutcome::Incomplete => panic!("runtime worker did not complete"),
     }
 }
 
-libruntime::entry!(app_main);
+fn main() {
+    let mut startup = libruntime::startup::take().expect("FAL consumer startup context is missing");
+    if let Err(error) = run(&mut startup) {
+        panic!("test_fal acceptance failed: {error}");
+    }
+}

@@ -17,7 +17,8 @@ use libkernel::{
     },
     time,
 };
-use libthread as thread;
+use libthread::ThreadOutcome;
+use libruntime::thread;
 
 const MESSAGES: usize = MAILBOX_CAPACITY * 4;
 
@@ -139,7 +140,17 @@ pub(super) fn threaded_receive() {
     }
     let mut delivered = Vec::new();
     for worker in workers {
-        delivered.extend(worker.join());
+        match worker.join() {
+            ThreadOutcome::Returned {
+                value,
+                leave: Ok(()),
+            } => delivered.extend(value),
+            ThreadOutcome::Returned {
+                leave: Err(()), ..
+            }
+            | ThreadOutcome::EnterFailed(())
+            | ThreadOutcome::Incomplete => panic!("threaded Mailbox worker did not complete"),
+        }
     }
     delivered.sort_unstable();
     assert!(
@@ -203,7 +214,7 @@ fn inspect(mut message: libkernel::ipc::message::ReceivedMessage, seen: &mut Vec
         index + 1,
         "threaded Mailbox badge crossed a delivery"
     );
-    assert_eq!(message.header.sender_pid, libruntime::startup::pid() as u64);
+    assert_eq!(message.header.sender_pid, super::init_pid() as u64);
     assert_eq!(message.payload.len(), PAYLOAD_MAX);
     for chunk in message.payload.as_chunks::<8>().0 {
         assert_eq!(
