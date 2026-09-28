@@ -1,19 +1,25 @@
 //! FAL2 内存 provider 的正式进程装配。
 
 #![no_std]
+#![no_main]
+
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 extern crate alloc;
 
 mod server;
 
 use erhino_shared::object::{Handle, Rights};
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender},
 };
 
 fn startup_handle(index: usize, missing: &'static str) -> Handle {
-    rinlib::env::startup_handle(index).expect(missing)
+    libruntime::startup::startup_handle(index).expect(missing)
 }
 
 fn startup_sender(index: usize, missing: &'static str) -> MailboxSender {
@@ -26,7 +32,7 @@ fn startup_sender(index: usize, missing: &'static str) -> MailboxSender {
         .expect("provider bootstrap sender has an invalid role")
 }
 
-fn main() {
+fn app_main() {
     let bootstrap = startup_sender(0, "provider bootstrap sender is missing");
     let release = startup_handle(1, "provider release owner is missing");
     let route = startup_handle(2, "provider route mailbox owner is missing");
@@ -35,3 +41,5 @@ fn main() {
         .expect("provider mailbox creation failed");
     server::run(mailbox, bootstrap, route, release, registration);
 }
+
+libruntime::entry!(app_main);

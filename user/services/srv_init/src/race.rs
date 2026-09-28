@@ -16,21 +16,21 @@ use libprocess::{
     race::{self, Cmd, Report},
     spawn,
 };
-use rinlib::ipc::message::{create, send_raw, wait_message};
-use rinlib::ipc::notification;
-use rinlib::ipc::object::{close, duplicate};
-use rinlib::ipc::tunnel as tunnel_sys;
-use rinlib::ipc::wait::wait_many;
-use rinlib::preclude::*;
-use rinlib::process;
-use rinlib::shared::call::SystemCallError;
-use rinlib::shared::message::HandleMove;
-use rinlib::shared::object::{Handle, ObjectSignals, Rights};
-use rinlib::shared::proc::{
+use libkernel::ipc::message::{create, send_raw, wait_message};
+use libkernel::ipc::notification;
+use libkernel::ipc::object::{close, duplicate};
+use libkernel::ipc::tunnel as tunnel_sys;
+use libkernel::ipc::wait::wait_many;
+use libkernel::preclude::*;
+use libkernel::process;
+use libkernel::shared::call::SystemCallError;
+use libkernel::shared::message::HandleMove;
+use libkernel::shared::object::{Handle, ObjectSignals, Rights};
+use libkernel::shared::proc::{
     HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
 };
-use rinlib::shared::wait::WaitItem;
-use rinlib::sys_sleep;
+use libkernel::shared::wait::WaitItem;
+use libkernel::sys_sleep;
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
 /// 分箱，天然归属，无需锤标识）。
@@ -936,7 +936,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..RACE_TUNNEL_ROUNDS {
         let (endpoint, invitation) =
-            match tunnel_sys::create(3 * 4096, rinlib::mm::Placement::Anywhere) {
+            match tunnel_sys::create(3 * 4096, libkernel::mm::Placement::Anywhere) {
                 Ok(pair) => pair,
                 Err(error) => {
                     debug!("Tunnel exit stress create failed: {:?}", error);

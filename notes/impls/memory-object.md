@@ -4,7 +4,7 @@
 
 ## 实现形态
 
-公共 MemoryObject 已接入独立 Handle、系统调用 ABI 与 rinlib affine owner，与 Tunnel 共用同一个对象 core。
+公共 MemoryObject 已接入独立 Handle、系统调用 ABI 与 libkernel affine owner，与 Tunnel 共用同一个对象 core。
 
 `memory_space` crate 提供 `ObjectId`、`ObjectViewAuthorization`、`WritePermit`、`MemoryObjectState`、`ExecutableState` 与 `SealOutcome`。它不访问页表、物理帧、HandleTable、hart 或用户指针。
 
@@ -46,7 +46,7 @@ Tunnel 的 `Connection` 持 `Arc<MemoryObjectCore>`，两侧 RW view 经 `author
 
 ## 用户态 owner
 
-rinlib 的 `MemoryObject`/`MemoryPool` typed owner 只接纳当前进程已安装的对应 leaf role，安全创建/派生保持唯一 Handle 所有权；该 role 的内核 close 不含 Tunnel 异步路径。显式 `close(self)` 与 Drop 因而共用不可失败 leaf-close 边界，不再伪造一个可重试错误分支；close 错误只表示 unsafe `from_handle` 契约或内核 HandleTable 不变量破坏。
+libkernel 的 `MemoryObject`/`MemoryPool` typed owner 只接纳当前进程已安装的对应 leaf role，安全创建/派生保持唯一 Handle 所有权；该 role 的内核 close 不含 Tunnel 异步路径。显式 `close(self)` 与 Drop 因而共用不可失败 leaf-close 边界，不再伪造一个可重试错误分支；close 错误只表示 unsafe `from_handle` 契约或内核 HandleTable 不变量破坏。
 
 ## 验证入口
 

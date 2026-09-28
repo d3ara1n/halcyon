@@ -3,7 +3,7 @@
 use alloc::vec;
 use erhino_shared::{object::Rights, time::Deadline};
 use librpc::{CallError, Caller, Request as RpcRequest};
-use rinlib::ipc::message::MailboxSender;
+use libkernel::ipc::message::MailboxSender;
 
 use crate::protocol::{self, Request, Response, Scope, Status};
 

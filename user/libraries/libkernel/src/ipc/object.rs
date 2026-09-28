@@ -11,7 +11,7 @@ use crate::call::{sys_handle_close, sys_handle_duplicate};
 /// 调用者须独占 entry 的关闭责任，不能撤销仍被安全 owner 或引用使用的映射。
 ///
 /// ```compile_fail
-/// rinlib::ipc::object::close(rinlib::shared::object::Handle::INVALID);
+/// libkernel::ipc::object::close(libkernel::shared::object::Handle::INVALID);
 /// ```
 pub unsafe fn close(handle: Handle) -> Result<(), SystemCallError> {
     // SAFETY: entry 关闭责任由调用者保证。

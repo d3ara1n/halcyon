@@ -1,0 +1,11 @@
+[package]
+name = "libthread"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Userspace thread ownership, results and cooperative reaping"
+edition = "2024"
+
+[dependencies]
+libkernel = { path = "../libkernel" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+lock_api = "0.4"

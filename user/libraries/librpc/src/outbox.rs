@@ -88,7 +88,7 @@ impl Outbox {
 
     pub fn drain_capabilities(
         &mut self,
-        visit: impl FnMut(rinlib::ipc::capability::Capability, erhino_shared::object::Rights),
+        visit: impl FnMut(libkernel::ipc::capability::Capability, erhino_shared::object::Rights),
     ) {
         if let Some(response) = self.response.as_mut() {
             response.drain_capabilities(visit);

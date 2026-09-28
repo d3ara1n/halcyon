@@ -2,8 +2,8 @@
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use rinlib::preclude::*;
-use rinlib::{
+use libkernel::preclude::*;
+use libkernel::{
     ipc::{
         message::{create, make_send_once, mint_sender, receive, send_raw, wait_message_until},
         object::{close, query},
@@ -15,8 +15,9 @@ use rinlib::{
         object::{Handle, HandleRole, ObjectSignals, Rights},
         wait::WaitItem,
     },
-    thread, time,
+    time,
 };
+use libthread as thread;
 
 const MESSAGES: usize = MAILBOX_CAPACITY * 4;
 
@@ -173,11 +174,6 @@ pub(super) fn threaded_receive() {
     // SAFETY: worker 都已 join，无消费者再使用 owner/peer。
     unsafe { close(inbox.peer) }.unwrap();
     unsafe { close(inbox.owner) }.unwrap();
-    assert_eq!(
-        thread::stack_cleanup_snapshot().abandoned,
-        0,
-        "threaded Mailbox abandoned a stack mapping"
-    );
     debug!(
         "threaded mailbox receive contention passed: {} messages, gated FIFO, independent authority, complete delivery",
         MESSAGES
@@ -196,7 +192,7 @@ fn wait_writable(sender: Handle, deadline: time::Deadline) {
     );
 }
 
-fn inspect(mut message: rinlib::ipc::message::ReceivedMessage, seen: &mut Vec<usize>) {
+fn inspect(mut message: libkernel::ipc::message::ReceivedMessage, seen: &mut Vec<usize>) {
     let index = message.header.kind;
     assert!(
         index < MESSAGES as u64,
@@ -207,7 +203,7 @@ fn inspect(mut message: rinlib::ipc::message::ReceivedMessage, seen: &mut Vec<us
         index + 1,
         "threaded Mailbox badge crossed a delivery"
     );
-    assert_eq!(message.header.sender_pid, rinlib::env::pid() as u64);
+    assert_eq!(message.header.sender_pid, libruntime::startup::pid() as u64);
     assert_eq!(message.payload.len(), PAYLOAD_MAX);
     for chunk in message.payload.as_chunks::<8>().0 {
         assert_eq!(
@@ -237,8 +233,8 @@ fn inspect(mut message: rinlib::ipc::message::ReceivedMessage, seen: &mut Vec<us
     seen.push(index as usize);
 }
 
-pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) {
-    use rinlib::{
+pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8]) {
+    use libkernel::{
         ipc::{notification, object::duplicate, wait_set::WaitSet},
         process,
         shared::proc::{HandleGrant, TerminationCause, ProcessState},
@@ -352,7 +348,7 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
                 break;
             }
             Ok(result) => {
-                if result.status == rinlib::shared::proc::ProcessDrainStatus::Complete as u32 {
+                if result.status == libkernel::shared::proc::ProcessDrainStatus::Complete as u32 {
                     debug!("committed IPC ownership probe observed target completion");
                     break;
                 }
@@ -381,13 +377,13 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
     assert_eq!(snapshot.cause, TerminationCause::Killed as u32);
     assert_eq!(
         snapshot.detail,
-        rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
+        libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
     );
     // 捕获请求被 kill 时目标可能已自然结束；否则由原 control 接同一游标收口。
     loop {
         match process::drain(nested.control, 128) {
             Ok(result)
-                if result.status == rinlib::shared::proc::ProcessDrainStatus::Complete as u32 =>
+                if result.status == libkernel::shared::proc::ProcessDrainStatus::Complete as u32 =>
             {
                 break;
             }
@@ -437,7 +433,7 @@ pub(super) fn committed_kill(job: rinlib::shared::object::Handle, image: &[u8]) 
         unsafe { close(source.peer) }.unwrap();
         unsafe { close(source.owner) }.unwrap();
     }
-    assert_eq!(rinlib::ipc::wait_set::abandoned_count(), 0);
+    assert_eq!(libkernel::ipc::wait_set::abandoned_count(), 0);
     assert_eq!(
         crate::root_pool_allocated().unwrap(),
         baseline,

@@ -4,7 +4,7 @@
 
 ## 进程执行环境
 
-进程持有 AddressSpace 与 HandleTable；用户半区映像、启动布局终点、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。Start 提交点把 ELF 判定的 `IsaRequirement` 与兼容 `SchedDomain` 合成一次性的非零 execution binding ID；需求与域从同一个 `AtomicUsize` 解码，未绑定、部分冻结与 Base64/零哨兵重合均不可表示。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ThreadCreate(Building) 的 context arg1/arg2 传入）；用户 tp 当前置零。Running 期堆由 rinlib 的匿名 `MappedRegion` arena 组成，任务层不持连续堆顶。
+进程持有 AddressSpace 与 HandleTable；用户半区映像、启动布局终点、首线程栈和 ASID 由 [`mm.md`](mm.md) 唯一记录。Start 提交点把 ELF 判定的 `IsaRequirement` 与兼容 `SchedDomain` 合成一次性的非零 execution binding ID；需求与域从同一个 `AtomicUsize` 解码，未绑定、部分冻结与 Base64/零哨兵重合均不可表示。首线程出生现场：sp 为组装者供给的栈顶（16 字节对齐），a0/a1 为出生块基址与长度（组装者经 ThreadCreate(Building) 的 context arg1/arg2 传入）；用户 tp 当前置零。Running 期堆由 libruntime 的匿名 `libkernel::MappedRegion` arena 组成，任务层不持连续堆顶。
 
 ## 调度：域—类—执行点三层组合
 
@@ -128,9 +128,9 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   `ADDRESS_SPACE → LIFECYCLE` 锁序下拒绝同值 ABA；已经 Commit、终止不可撤销的事务
   同时增加 `mandatory_ops`，只有业务 Complete 后才递减。dispatch/leave 以本 hart
   已确认的 AddressSpace epoch 作为登记/清除 active 的硬 gate。自杀路径排除本 hart。
-  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Completed 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadCreate(self) 接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadCreateResult`，随后由 ThreadStart 发布，内核铸造 waitable ThreadControl。`CapabilityRef` 是 HandleTable 表项和在途 entry 中的引用；铸造/Clone 增加 ThreadControl capability 计数，entry 最终 Drop 统一减少，纯内核 Arc、订阅与执行容器不计。归零只领取 Created，不影响 Ready/Running；只剩 WAIT-only 引用也不提前放弃。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。等待面只允许真实可达的 DONE，不暴露从不发布的 CLOSED。join 不是 syscall：rinlib 以 WaitMany(DONE) + HandleClose 组合，并在 Acquire 后接管结果与用户栈。未实现的 ThreadKill 不在 syscall 枚举中占号。
+  ThreadExit 只结束当前线程；末线程以首次终止线性化点冻结进程 Completed 终因。ThreadYield 以 Requeue outcome 在完整 syscall 边界重新排队。ThreadCreate(self) 接受当前 Running 线程 authority 与固定宽 `ThreadStartContext`/`ThreadCreateResult`，随后由 ThreadStart 发布，内核铸造 waitable ThreadControl。`CapabilityRef` 是 HandleTable 表项和在途 entry 中的引用；铸造/Clone 增加 ThreadControl capability 计数，entry 最终 Drop 统一减少，纯内核 Arc、订阅与执行容器不计。归零只领取 Created，不影响 Ready/Running；只剩 WAIT-only 引用也不提前放弃。每次离场由 `ThreadDeparture` 在执行容器释放后摘除成员；若发起线程仍挂有 committed Map 结果义务，则延迟摘除和 DONE 发布，义务归零后再继续。等待面只允许真实可达的 DONE，不暴露从不发布的 CLOSED。join 不是 syscall：`libthread` 以 WaitMany(DONE) + Registry reap 组合，并在 Acquire 后接管 ResultCell 与用户栈。`JoinHandle::Drop` 不等待；未实现的 ThreadKill 不在 syscall 枚举中占号。
 
-当前 rinlib 的 thread packet 用 `MaybeUninit<T>` 保存结果，join/Drop 等待 DONE 后通过 Acquire fence 接管，没有独立的结果发布判别字；安全 `thread::exit` 已删除，底层仅提供 unsafe `ThreadExit()` 供内部 trampoline 和其它语言 runtime 消费。目标 libthread 正常 Rust 路径发布 Returned/EnterFailed，内部保留 Unpublished 事实，不对未初始化的 T 取值或 Drop；UserStack 解除 Busy 时循环 Sleep，其它失败只累计 abandoned count，映射留至 ProcessDrain；目标由 PTR 持有 ThreadRecord，libruntime ThreadDriver 推进 cleanup。具体修正由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 与 [用户内存 owner](../../plans/todo-2026-09-14-user-memory-owner-lifecycle.md) 联合设计，当前尚无 PTR、ThreadObservation、ThreadDriver 或环境工厂。
+`libthread::ResultCell<T>` 以独立状态字区分 Empty/Writing/Published/ReceiverGone；trampoline 只在闭包完成后发布结果，安全路径不能绕过发布调用 ThreadExit。正常 Rust 路径发布 Returned，receiver 放弃后 producer 在用户线程内收束 T；Registry 记录栈、ThreadControl、环境 residue 和 packet owner，reap 以预算推进，ObjectBusy 让出后重试，不记录 abandoned 计数。`PreparedThread` 在 Start 前保有完整 packet/栈/Control，Start 失败返还 self 并由 Drop 取消。`ThreadEnvironment::enter/leave` 在用户 trampoline 执行，`retire` 由 DONE 后的 Registry owner 执行；`libruntime` 持有入口 Registry 实例，普通 Builder 的 record 也复用同一回收机制。
 - **退出收束**（有界分批，管理者驱动）：trap 汇编非-Resume 出口统一
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)

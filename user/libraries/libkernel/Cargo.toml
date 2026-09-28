@@ -1,0 +1,13 @@
+[package]
+name = "libkernel"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Userspace eRhino kernel contracts and syscall owners"
+edition = "2024"
+
+[dependencies]
+monotonic_id = { path = "../../../shared/monotonic_id" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+talc = "5.0"
+lock_api = "0.4"
+num-traits = { version = "0.2", default-features = false }

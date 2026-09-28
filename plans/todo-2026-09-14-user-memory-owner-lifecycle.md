@@ -1,6 +1,6 @@
 # 用户态映射 owner 与线程生命周期施工计划
 
-> 状态：**终局原因与 ThreadCreate/ThreadStart 机制面已实施，ThreadRegistry/owner 迁移待施工**。本记录拥有线程出生（ThreadCreate/Start）、终局原因替换退出码、用户态线程三 owner 与协作式 cleanup 的施工范围、顺序和验证门。契约由 [task](../notes/ideas/task.md) 拥有（「终局原因」「线程：执行单元」「用户态线程资源收束」），组合边界由 [framework](../notes/ideas/framework.md)、入口交接由 [bootstrap](../notes/ideas/bootstrap.md#启动映像的寿命) 拥有。审阅 findings 的处置记录在 [runtime-thread 审阅](review-2026-09-26-runtime-thread-design.md)。普通 mapping/堆 arena 的其它退休需求不在本轮范围，保留在末节。
+> 状态：**本轮已完成**。ThreadCreate/ThreadStart、终局原因、`libthread` Registry/ResultCell、入口线程采用、`libruntime` runtime 入口和全部消费者迁移均已接通；普通 mapping/堆 arena 的其它退休需求仍不在本轮范围。契约由 [task](../notes/ideas/task.md) 拥有，组合边界由 [framework](../notes/ideas/framework.md)、入口交接由 [bootstrap](../notes/ideas/bootstrap.md#启动映像的寿命) 拥有。验证证据见运行时分层计划和本记录末节。
 
 ## 目标与非目标
 
@@ -60,7 +60,7 @@ Staging/Spawning 合并为 Created；`ProcessAttach`、`ThreadSpawn`、`ThreadSp
 
 ## 用户态类型
 
-libkernel（由当前 rinlib 拆出，见[分层计划](todo-2026-09-runtime-kernel-library-separation.md)）：`ThreadControl` owner（Close on Drop）、`thread_create`/`thread_start`、unsafe `thread_exit()`、`process_terminate()`/`process_abort()`、`TerminationCause` 解码。
+libkernel：`ThreadControl` owner（Close on Drop）、`thread_create`/`thread_start`、unsafe `thread_exit()`、`process_terminate()`/`process_abort()`、`TerminationCause` 解码。
 
 libthread：
 
@@ -68,10 +68,10 @@ libthread：
 pub trait ThreadEnvironment { type Child: Send; type Residue: Send; /* prepare / enter / leave / retire（retire 有界不停驻） */ }
 pub struct ThreadRegistry<E: ThreadEnvironment> { /* 固定容量槽、claim、seal */ }
 pub struct ThreadFactory<'r, E> { /* &Registry + 栈策略 */ }
-pub struct PreparedThread<F, T, E> { /* 槽、栈、packet、ResultCell、挂起 Control */ }
+pub struct PreparedThread<'r, F, T, E> { /* Registry 槽、栈、packet、ResultCell、挂起 Control */ }
 pub struct Thread { control: Arc<ThreadControl> }
-pub struct JoinHandle<T> { cell: Arc<ResultCell<T>>, thread: Thread }
-pub enum JoinOutcome<T> { Returned(T), EnterFailed(EnvError), LeaveFailed(T, EnvError), Incomplete }
+pub struct JoinHandle<T> { cell: Arc<ResultCell<T>>, thread: Option<Thread> }
+pub enum JoinOutcome<T> { Returned(T), Incomplete }
 
 impl<E> ThreadRegistry<E> {
     pub fn reap(&self, budget: usize) -> ReapProgress; // 协作推进唯一入口
@@ -80,9 +80,9 @@ impl<E> ThreadRegistry<E> {
 }
 ```
 
-`ResultCell` 状态 `Empty/Published/ReceiverGone` 与交错表见 task「结果发布」。record 字段：栈 `MappedRegion`、`Option<E::Residue>`、`Arc<ThreadControl>`、cleanup 进度；不含 F/T，无 vtable。槽 claim 用原子 CAS，reap 只处理 claim 成功且 DONE 已观察的槽。
+`ResultCell` 状态 `Empty/Writing/Published/ReceiverGone` 与交错表见 task「结果发布」。record 字段：栈 `MappedRegion`、`Arc<ResidueCell<E::Residue>>`、环境 owner、`Arc<ThreadControl>`、packet cleanup；不含 F/T，无 vtable。槽以固定锁保护并用轮转游标公平认领，reap 只处理认领且 DONE 已观察的槽。PreparedThread 在 ThreadStart 前持有 packet/栈/Control；Start 失败返还 self，由 Drop 取消并收束未启动 packet。
 
-libruntime：`_start` 汇编入口 → 无堆校验 → allocator → `ThreadRegistry` 静态实例（容量来自启动配置/链接常量，按下节）→ `adopt_entry`（原子 once）→ StartupContext → `main`；`Ok` → wrapper 离场路径（reap + `thread_exit()`），`Err`/panic/OOM → 日志 + `process_abort()`。
+libruntime：`_start` 入口 → StartupBlock 校验 → allocator → `ThreadRegistry` → `adopt_entry`（once）→ StartupContext → `entry!(app_main)` 生成的内部桥接；`Ok` → ThreadExit，`Err`/panic/OOM → 日志 + ProcessAbort。应用源码不直接依赖内部桥接符号。
 
 ## 容量与预算
 
@@ -106,12 +106,12 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 | 入口未采用前进程终止 | ProcessDrain 收回栈与 Control |
 | main 返回、worker 仍运行 | 进程继续；末线程离场 → Completed |
 
-### 当前未闭合责任
-- bootstrap 初始线程已复用 ThreadCreate 的 ThreadControl、MANAGE rights、Created/Departure 与预留 Ready 准入；shared/startup v3 的入口 section v2 引用 grants/Handle 数组中的 Control 索引。剩余一次采用与 ThreadRegistry 登记归 Registry/libruntime 切面。
-- `ProcessStart` 已改为 Create 时每线程预留 ReadyBatch、lifecycle 锁内挂接并摘取 Thread 内嵌发布链、锁外逐项发布；bootstrap 也复用单线程 Create/Ready admission，不再有普通路径的 Start 承接 Vec。
-- `user/libraries/libprocess/src/lib.rs` 的 `Spawned.control` 是监督用 ProcessControl；ThreadCreate 的 child-local ThreadControl 加入出生块 grants 数组，descriptor 只引用索引。后续 Registry/libruntime 负责一次采用与入口 ThreadRecord owner。
-- StartupBlock v3/入口 section v2 已落地：包含 grants 数组索引、stack reservation、usable 范围及 kind/version/len；init 与普通 launcher 共用 `shared/startup` 校验，普通 launcher 在 ThreadCreate(Building) 后一次写完整块。descriptor 的一次采用与 ThreadRegistry 登记留给后续 libthread/libruntime 切面。
-- ThreadRegistry/owner 尚未施工：当前 `rinlib::JoinHandle` 仍直接持有 Control、栈和 Result packet；后续需迁为固定槽 Registry、共享 ThreadControl、ResultCell 三 owner，并由 libruntime 负责入口 Registry 实例与 descriptor adopt。
+### 已闭合责任与延期边界
+- bootstrap 初始线程已复用 ThreadCreate 的 ThreadControl、MANAGE rights、Created/Departure 与预留 Ready 准入；StartupBlock grants/descriptor 已由 `StartupContext` 一次采用，入口 Control 与运行期线程共用 Registry record。
+- `ProcessStart` 已改为 Create 时每线程预留 ReadyBatch，bootstrap 也复用单线程 Create/Ready admission，不再有普通路径的 Start 承接 Vec。
+- `user/libraries/libprocess/src/lib.rs` 的 `Spawned.control` 仍是监督用 ProcessControl；ThreadCreate 的 child-local ThreadControl 加入出生块 grants 数组，descriptor 只引用索引，runtime 负责入口 owner 转交。
+- StartupBlock v3/入口 section v2 已落地：包含 grants 数组索引、stack reservation、usable 范围及 kind/version/len；普通 launcher 在 ThreadCreate(Building) 后一次写完整块。
+- ThreadRegistry/owner、ResultCell、PreparedThread、入口 adopt 和运行时入口已施工完成。普通出生块最终只读映像仍是分层计划登记的范围外后续工作，不影响本次 owner 交付。
 
 ### ProcessStart 发布结构裁决
 
@@ -119,26 +119,21 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 
 源码核对结果：选择路线 2。`lifecycle` 锁为 rank 600，Ready 队列使用 LEAF rank 150；现有锁序明确禁止在 lifecycle 锁内取得持久 Ready 集合锁，`ReadyBatch::publish` 也会取得调度类锁。因此不能在 lifecycle 临界区直接入队。必须在线程 Create 时预留并挂接嵌入式发布节点，Start 在 lifecycle 锁内只完成 Building→Running、Created→Ready 和发布链摘取，锁外把已预留节点交给调度器；Start 不分配，且不再使用 `Vec<Arc<Thread>>` 承接。
 
-## 消费者迁移
+## 消费者迁移与结果
 
-- `user/rinlib/src/rt.rs`：删除 `to_exit_code` 路径；main 返回 Ok 只走 `ThreadExit()`，Err/panic/OOM 走 `ProcessAbort()`。
-- `user/rinlib/src/thread.rs`、`process.rs`、`call.rs`：迁到 libkernel/libthread 新 API；删除 safe `exit`、`UserStack` abandoned 计数、`wait_and_release`。
-- `srv_init/main.rs`（子进程成功判定旧 `reason==Exited && code==0`）→ `cause==Completed`，并按 `TerminationDetail` 校验。
-- `srv_init/race.rs`：以旧 code 区分竞速胜者的用例改为比较 `TerminationCause`；双 Kill 通过真实 `KillOutcome::Accepted/AlreadyTerminating` 报告胜者，其它竞速只断言允许的终因。
-- `srv_init/public_ipc.rs`、`test_hammer`、`test_target`、`shared/elf/audit_user_elf.rs`：按新签名迁移。
-- libprocess launcher：BindExecution、ThreadCreate(Building)、写 `EntryThreadDescriptor`。
+- `libruntime` 通过 `entry!(app_main)` 统一应用入口；`() / Ok(())` 走 ThreadExit，`Err`/panic/OOM 走 ProcessAbort，无数值退出码。
+- `libthread`、`libprocess`、服务、驱动和验收程序已迁移到 libkernel/libthread/libruntime 最终 owner；旧 safe exit、旧栈 abandoned 计数、`wait_and_release`、旧 code/reason 判定和旧 syscall 副本已删除。
+- `srv_init`、`test_hammer`、`test_target`、ELF audit 及全部真实消费者已按 `TerminationCause`、新 ThreadCreate/Start 和 StartupBlock descriptor 签名接通。
 
-## 施工顺序
+## 施工顺序与结果
 
-1. shared ABI（调用号、`TerminationCause`、`TerminationDetail`、`ThreadCreateResult`、`EntryThreadDescriptor`、删除 ExitCode）。**终局原因子切面已完成。**
-2. 内核：BindExecution → ThreadCreate/Created 态/Start 链发布 → ThreadStart → 挂起线程离场 DONE → 终局原因 → bootstrap 同源 → selftest。
-3. libkernel 封装（与分层计划的 rinlib 拆分同步进行，不保留 alias）。
-4. libthread：ResultCell → Registry/reap → Factory/Prepared → 入口 adopt；host 单测覆盖 ResultCell 交错与 Registry claim。
-5. libruntime `_start`、main 语义、abort 路径。
-6. 消费者迁移并删除旧路径。
-7. `just check`、`just clippy`、QEMU 路线（按 [构建手册](BUILD-AND-TEST.md)）与交付前结构检查。
+1. shared ABI、内核生命周期和 bootstrap：已完成。
+2. libkernel、libprocess context、libthread Registry/ResultCell/Prepared/trampoline：已完成。
+3. libruntime `_start`、gp、heap、`entry!`、panic/OOM 和终局收束：已完成。
+4. 全部消费者迁移、旧目录/入口/退出路径删除：已完成。
+5. `just check`、`just clippy`、host tests、两 target ELF 门和完整 acceptance：已完成。
 
-终局原因与 ThreadCreate/ThreadStart/bootstrap/ProcessStart 机制面已完成开发检查；完整用户态验收与 ThreadRegistry/owner/libruntime 仍属后续切面。
+终局原因、ThreadCreate/ThreadStart/bootstrap/ProcessStart、ThreadRegistry/owner/libruntime 和消费者迁移均已完成；`just check`、`just clippy`、host tests、两 target ELF 门及完整 acceptance 均通过。
 
 ## 验证门
 
@@ -149,7 +144,7 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 
 ## 删除清单
 
-`ExitCode`、`ProgramResult`、`Termination::to_exit_code`、`ProcessExitReason`、snapshot `code` 字段、`ProcessExit`、`ProcessAttach`、`ThreadSpawn`/`ThreadSpawnResult`、lifecycle `Staging`/`Spawning` 态与 Start staged Vec、`rinlib::thread::{exit, JoinHandle::Drop 等待, UserStack abandoned}`、`wait_and_release`。
+`ExitCode`、`ProgramResult`、`Termination::to_exit_code`、`ProcessExitReason`、snapshot `code` 字段、`ProcessExit`、`ProcessAttach`、`ThreadSpawn`/`ThreadSpawnResult`、lifecycle `Staging`/`Spawning` 态与 Start staged Vec、旧 thread safe exit、同步 Drop 等待、UserStack abandoned 计数、`wait_and_release`。
 
 ## 范围外残留
 
@@ -157,4 +152,4 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 
 ## 跨会话接力
 
-终局原因及生命周期收敛由 [已归档的生命周期工作记录](archived/todo-2026-09-28-lifecycle-convergence.md) 接续。当前 ThreadCreate/ThreadStart、Builder/Control 关闭、Building lease、输出故障与 StartupBlock v3 已接通；完整 srv_init 消费迁移及 Registry/owner/libruntime 分层仍未闭合。旧 descriptor 值字段与回填路径已删除；本计划下一步进入 ThreadRegistry/owner/libruntime，从 grants 索引采用入口 Control，以 reservation 建立普通 region owner，并接通 DONE 后统一 cleanup。先前开发证据为 `artifacts/dev/bootstrap-descriptor-check-final.log`、`artifacts/dev/bootstrap-descriptor-user-check-final.log`、`artifacts/dev/bootstrap-startup-test-final.log`、`artifacts/dev/bootstrap-libprocess-test-final.log`；本轮验证见收敛工作记录。
+终局原因及生命周期收敛由 [已归档的生命周期工作记录](archived/todo-2026-09-28-lifecycle-convergence.md) 接续。当前 ThreadCreate/ThreadStart、Builder/Control 关闭、Building lease、输出故障、StartupBlock v3、ThreadRegistry/owner/libruntime 和全部消费者均已闭合。旧 descriptor 值字段、回填路径、safe exit、UserStack abandoned、同步 Drop 等待及 `wait_and_release` 已删除；本轮验证为 `just check`、`just clippy`、host tests、两 target ELF 门和完整 `just acceptance`。

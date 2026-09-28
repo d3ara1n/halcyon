@@ -1,5 +1,5 @@
 use crate::SUPERVISOR_RIGHTS;
-use rinlib::shared::{
+use libkernel::shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
@@ -7,7 +7,7 @@ use rinlib::shared::{
         ThreadCreateResult, ThreadStartContext,
     },
 };
-use rinlib::{
+use libkernel::{
     ipc::object::{close, duplicate},
     process,
 };

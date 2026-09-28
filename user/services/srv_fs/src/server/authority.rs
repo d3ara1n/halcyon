@@ -1,6 +1,6 @@
 use super::*;
 use libservice::authority::PreparedAuthority;
-use rinlib::ipc::message::MintedSender;
+use libkernel::ipc::message::MintedSender;
 
 pub(super) enum AuthorityPublication {
     Root,

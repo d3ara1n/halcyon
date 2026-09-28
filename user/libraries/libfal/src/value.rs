@@ -102,7 +102,7 @@ pub trait Capability: Sized {
 }
 
 #[cfg(target_arch = "riscv64")]
-impl Capability for rinlib::ipc::capability::Capability {
+impl Capability for libkernel::ipc::capability::Capability {
     fn description(&self) -> Result<HandleDescription, SystemCallError> {
         self.description()
     }

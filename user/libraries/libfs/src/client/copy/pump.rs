@@ -11,7 +11,7 @@ use libexecution::{
         SourcePlan, Step, Task,
     },
 };
-use rinlib::ipc::wait_set::WaitSet;
+use libkernel::ipc::wait_set::WaitSet;
 
 const SOURCE_DATA: SourceKind = 1;
 const TARGET_DATA: SourceKind = 2;
@@ -165,11 +165,11 @@ struct PumpTask {
     removing: [bool; 5],
     armed: [bool; 5],
     stopping: bool,
-    deadline: rinlib::time::Deadline,
+    deadline: libkernel::time::Deadline,
 }
 
 impl PumpTask {
-    fn new(deadline: rinlib::time::Deadline) -> Self {
+    fn new(deadline: libkernel::time::Deadline) -> Self {
         Self {
             sources: [None; 5],
             requested: [false; 5],
@@ -482,7 +482,7 @@ impl Task<PumpWorld<'_>> for PumpTask {
         world.outcome.get_or_insert(PumpFault::Cancelled);
     }
 
-    fn deadline(&self) -> rinlib::time::Deadline {
+    fn deadline(&self) -> libkernel::time::Deadline {
         self.deadline
     }
 }
@@ -505,7 +505,7 @@ pub fn run_pump(
     source: &mut Stream,
     target: &mut Stream,
     cancel: Option<&Capability>,
-    deadline: rinlib::time::Deadline,
+    deadline: libkernel::time::Deadline,
 ) -> Result<PumpSummary, PumpRunFailure> {
     let source_limit = if cancel.is_some() { 5 } else { 4 };
     let input =

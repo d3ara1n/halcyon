@@ -8,8 +8,9 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rinlib = {path = "../../rinlib"}
+libkernel = {path = "../../libraries/libkernel"}
 librunnel = { path = "../../libraries/librunnel" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
 libprocess = { path = "../../libraries/libprocess" }
+libruntime = { path = "../../libraries/libruntime" }

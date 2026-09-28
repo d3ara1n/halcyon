@@ -8,7 +8,7 @@ use erhino_shared::{
 use libbudget::Charge;
 use libexecution::runtime::{Advance, Input, RequestFailure, Requests, SourceId, SourceKind, Step};
 use librpc::{Outbox, OutboxResult};
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender},
     notification,
@@ -160,7 +160,7 @@ impl Retirement {
         }
 
         if state.seal_when_grants_drained(self.stopping) {
-            rinlib::debug!("FAL provider shutdown: sealing backend");
+            libkernel::debug!("FAL provider shutdown: sealing backend");
         }
         if state.retire_step(budget)? {
             return Ok(Advance {
@@ -181,7 +181,7 @@ impl Retirement {
             }
             if self.source.is_none() && !self.requested {
                 state.close_backend()?;
-                rinlib::debug!("FAL provider shutdown: backend retired");
+                libkernel::debug!("FAL provider shutdown: backend retired");
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Complete,

@@ -31,11 +31,11 @@ pub fn create_job(parent: Handle, rights: Rights) -> Result<Handle, SystemCallEr
 /// created 必须是调用者独占的真实、尚未 Start 的 Create 结果，两枚 Handle 均未消费。
 ///
 /// ```compile_fail
-/// let created = rinlib::shared::proc::ProcessCreateResult {
-///     builder: rinlib::shared::object::Handle::INVALID,
-///     control: rinlib::shared::object::Handle::INVALID, pid: 0, reserved: 0,
+/// let created = libkernel::shared::proc::ProcessCreateResult {
+///     builder: libkernel::shared::object::Handle::INVALID,
+///     control: libkernel::shared::object::Handle::INVALID, pid: 0, reserved: 0,
 /// };
-/// rinlib::process::abandon_to_completion(created);
+/// libkernel::process::abandon_to_completion(created);
 /// ```
 pub unsafe fn abandon_to_completion(created: ProcessCreateResult) -> Result<(), SystemCallError> {
     let builder_result = unsafe { close(created.builder) };

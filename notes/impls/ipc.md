@@ -1,6 +1,6 @@
 # IPC 对象实现
 
-公共对象、消息、观察与内核退休前置已完成。ABI 位于 `shared/erhino_shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/rinlib/src/ipc/`。施工证据见 [公共前置档案](../../plans/archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)。公共时间、运输/RPC/服务执行和 FAL 业务仍未全部完成，不能把本前置完成视为总体交付。
+公共对象、消息、观察与内核退休前置已完成。ABI 位于 `shared/erhino_shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/libraries/libkernel/src/ipc/`。施工证据见 [公共前置档案](../../plans/archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)。公共时间、运输/RPC/服务执行和 FAL 业务仍未全部完成，不能把本前置完成视为总体交付。
 
 ## Handle 与对象身份
 
@@ -8,7 +8,7 @@
 
 `ObjectHeader` 使用不回绕 KOID。HandleQuery 只描述已有对象的 kind、role、rights、badge 与关联身份，不按身份打开对象或授予权限。Mailbox/Notification/WaitSet owner 不可 DUPLICATE/TRANSIT，但可按明确 GRANT 权限直接移交；Tunnel Endpoint 依赖本地 VM lease，不可作为非映射 Capability 运输。
 
-rinlib `Capability` 拥有合法非映射 entry，适用于叶对象和 affine owner；包装不自动授予 TRANSIT/GRANT。`into_raw` 移交唯一责任，失败 close 返还 owner；Drop 使用 `close_object_owner`，允许等待预付的内核退休，返回错误报告不变量破坏，不静默丢弃责任。WaitSet 的 `create_with_rights` 支持显式 GRANT，默认 `create` 权限仍为 READ/WAIT/MANAGE；`into_capability` 消耗原 owner，不复制关闭责任。
+libkernel `Capability` 拥有合法非映射 entry，适用于叶对象和 affine owner；包装不自动授予 TRANSIT/GRANT。`into_raw` 移交唯一责任，失败 close 返还 owner；Drop 使用 `close_object_owner`，允许等待预付的内核退休，返回错误报告不变量破坏，不静默丢弃责任。WaitSet 的 `create_with_rights` 支持显式 GRANT，默认 `create` 权限仍为 READ/WAIT/MANAGE；`into_capability` 消耗原 owner，不复制关闭责任。
 
 ## Mailbox 与交付
 
@@ -20,9 +20,9 @@ Lifetime 只记录被观察的 sender KOID，不反向保活授权。最后 send
 
 Send 按 HandleTable → Mailbox 锁阶准备 moves、Delivery、消息及容量，在同一提交内检查原 Deadline；失败保留 moves/once，成功才消费。Receive 初检输出后预留队头与目标槽，`finish_receive` 复制成功后原子交付；复检写回失败以发起 tid/失败 VA 冻结 `Faulted(UserAccess)`，同时退款表槽与队头，锁外通知。owner 已关闭时拒绝回插并锁外关闭 transit，成功复制则交付已经独立预留的消息。部分写入不发布权限，调用者已进入终止而不能在用户态重试。Discard/owner close 的队列析构在源锁外，fanout 有固定容量界限。
 
-rinlib `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
+libkernel `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
-rinlib typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 role 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
+libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 role 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
 
 ## 通知与等待
 

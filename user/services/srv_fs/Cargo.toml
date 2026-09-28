@@ -8,7 +8,7 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rinlib = { path = "../../rinlib" }
+libkernel = { path = "../../libraries/libkernel" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 libfal = { path = "../../libraries/libfal" }
 libfs = { path = "../../libraries/libfs" }
@@ -17,5 +17,6 @@ libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
 libservice = { path = "../../libraries/libservice" }
 librunnel = { path = "../../libraries/librunnel" }
+libruntime = { path = "../../libraries/libruntime" }
 ordered_table = { path = "../../../shared/ordered_table" }
 metadata_admission = { path = "../../../shared/metadata_admission" }

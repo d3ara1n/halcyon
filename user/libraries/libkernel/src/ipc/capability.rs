@@ -42,6 +42,10 @@ impl Capability {
         Ok(Self::owned(handle))
     }
 
+    pub fn duplicate_all(&self) -> Result<Self, SystemCallError> {
+        self.duplicate(self.description()?.rights)
+    }
+
     pub fn close(mut self) -> Result<(), (Self, SystemCallError)> {
         // SAFETY: self 独占合法非映射对象 entry 的关闭责任，失败仍保留原 owner。
         match unsafe { super::object::close(self.as_handle()) } {

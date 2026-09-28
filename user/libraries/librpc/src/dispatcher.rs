@@ -12,7 +12,7 @@ use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
 use ordered_table::OrderedTable;
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
 };
@@ -165,7 +165,7 @@ impl Dispatcher {
                 return Err(CallCause::Shutdown);
             }
             request.new_attempt().map_err(cause)?;
-            if rinlib::time::expired(deadline).map_err(cause)? {
+            if libkernel::time::expired(deadline).map_err(cause)? {
                 return Err(CallCause::Timeout);
             }
             Ok(())

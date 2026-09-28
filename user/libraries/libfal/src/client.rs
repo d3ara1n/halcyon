@@ -8,7 +8,7 @@ use erhino_shared::{
     wait::{WaitItem, WaitReason},
 };
 use librpc::{CallCause, CallError, CallOperation, CallPhase, Caller, Reply, Request as RpcRequest};
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::Capability,
     message::{MailboxSender, SenderAdoptFailure},
     notification,

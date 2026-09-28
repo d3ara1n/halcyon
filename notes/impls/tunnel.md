@@ -34,13 +34,13 @@ Invitation 在未 attach 前被关闭或进入 transit 清理时，连接一侧�
 
 Endpoint 的等待订阅复用通用 ObjectWaitState/WaitContext；WaitContext、TimerQueue 和 WaitMany 实现见 [`ipc.md`](ipc.md)。Tunnel 不拥有页内数据格式、游标、记录边界或 buffer ownership。
 
-## rinlib owner 与共享访问
+## libkernel owner 与共享访问
 
-`user/rinlib/src/ipc/tunnel.rs::Endpoint` 独占 Handle 与只读 MappingGeometry；create/attach 工厂返回正式 owner，事件操作借用 owner 并内部组装 WaitItem，安全接口不导出原始 Handle。`raw_handle` 是明确的 unsafe 诊断边界，仅用于关闭后 generation 检查。
+`user/libraries/libkernel/src/ipc/tunnel.rs::Endpoint` 独占 Handle 与只读 MappingGeometry；create/attach 工厂返回正式 owner，事件操作借用 owner 并内部组装 WaitItem，安全接口不导出原始 Handle。`raw_handle` 是明确的 unsafe 诊断边界，仅用于关闭后 generation 检查。
 
 `close(self)` 失败返回完整 owner；Drop 单次尝试，普通错误记入饱和 abandoned 计数与 last_error，由 `cleanup_snapshot` 查询，残留 entry/映射留给 ProcessDrain。`ipc::object::close` 与 `process::abandon_to_completion` 均为 unsafe raw cleanup，不能由可构造 ABI 数值安全撤销其它 owner 的映射；compile-fail 示例覆盖这些入口及 memory 借用期间消费 owner。
 
-`user/rinlib/src/shared_memory.rs` 提供受 owner 生命周期约束的有界视图；控制字段用 RV64 lwu/ld/sw/sd，自然对齐，acquire 在 load 后 fence r,rw、release 在 store 前 fence rw,w；数据只作 lbu/sb 字节访问，不建立普通共享 slice。asm 保留默认内存副作用，guest 只承诺 Halcyon 的正常一致性 RAM 平台边界，不声称 Rust 标准已形式化覆盖任意外部写者。证据见 [`共享访问取证`](../../plans/ref-2026-09-shared-memory-access.md)。
+`user/libraries/libkernel/src/shared_memory.rs` 提供受 owner 生命周期约束的有界视图；控制字段用 RV64 lwu/ld/sw/sd，自然对齐，acquire 在 load 后 fence r,rw、release 在 store 前 fence rw,w；数据只作 lbu/sb 字节访问，不建立普通共享 slice。asm 保留默认内存副作用，guest 只承诺 Halcyon 的正常一致性 RAM 平台边界，不声称 Rust 标准已形式化覆盖任意外部写者。证据见 [`共享访问取证`](../../plans/ref-2026-09-shared-memory-access.md)。
 
 ## 验证入口
 

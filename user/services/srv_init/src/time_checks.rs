@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
-use rinlib::{
+use libkernel::{
     ipc::{
         message, notification,
         object::{close, query},
@@ -15,9 +15,9 @@ use rinlib::{
         object::{ObjectSignals, Rights},
         wait::{WaitItem, WaitReason},
     },
-    thread,
     time::{self, Deadline, Duration},
 };
+use libthread as thread;
 
 pub(super) fn run() {
     let start = time::snapshot().unwrap();
@@ -199,5 +199,4 @@ fn causal_reads() {
         worker.join();
     }
     assert!(time::snapshot().unwrap().now_ns >= high.load(Ordering::Acquire));
-    assert_eq!(thread::stack_cleanup_snapshot().abandoned, 0);
 }

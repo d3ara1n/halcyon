@@ -8,6 +8,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod race;
+pub mod context;
 
 use erhino_shared::{
     call::SystemCallError,
@@ -20,7 +21,7 @@ use erhino_shared::{
     startup::{EntryThreadDescriptor, StartupBlockHeader},
     time::Deadline,
 };
-use rinlib::{
+use libkernel::{
     ipc::object::{close, duplicate},
     process,
 };
@@ -377,7 +378,7 @@ pub fn collect_process(
 )]
 pub fn collect_remaining(mut machine: Collector) -> Result<CollectedProcess, SupervisionFailure> {
     loop {
-        let now = match rinlib::time::snapshot() {
+        let now = match libkernel::time::snapshot() {
             Ok(snapshot) => snapshot.now_ns,
             Err(error) => {
                 return Err(machine.fail_current(SupervisionCause::System(error)));
@@ -395,7 +396,7 @@ pub fn collect_remaining(mut machine: Collector) -> Result<CollectedProcess, Sup
                 machine = next;
             }
             StepOutcome::RetryAt(at, next) => {
-                if let Err(error) = rinlib::time::sleep_until(Deadline::at(at)) {
+                if let Err(error) = libkernel::time::sleep_until(Deadline::at(at)) {
                     return Err(next.fail_current(SupervisionCause::System(error)));
                 }
                 machine = next;
@@ -1037,7 +1038,7 @@ pub fn job_kill_with_policy(
 pub fn collect_job_remaining(mut collector: JobCollector) -> Result<(), JobKillFailure> {
     loop {
         let result: Result<bool, JobCollectorError> = (|| {
-            let now = rinlib::time::snapshot()
+            let now = libkernel::time::snapshot()
                 .map_err(|error| collector.fail_current(JobKillCause::System(error)))?
                 .now_ns;
             match collector.step(now)? {
@@ -1050,7 +1051,7 @@ pub fn collect_job_remaining(mut collector: JobCollector) -> Result<(), JobKillF
                     Ok(false)
                 }
                 JobCollectorEvent::RetryAt(at) => {
-                    rinlib::time::sleep_until(Deadline::at(at))
+                    libkernel::time::sleep_until(Deadline::at(at))
                         .map_err(|error| collector.fail_current(JobKillCause::System(error)))?;
                     Ok(false)
                 }
@@ -1191,7 +1192,7 @@ fn build_birth_block(
 ) -> Result<alloc::vec::Vec<u8>, SpawnError> {
     erhino_shared::startup::build_startup_block_with_entry(
         target_pid,
-        rinlib::env::pid(),
+        libkernel::startup::pid(),
         handles,
         entry,
         payload,

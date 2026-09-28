@@ -7,7 +7,7 @@ use erhino_shared::{
     time::Deadline,
     wait::{WaitItem, WaitReason},
 };
-use rinlib::ipc::{
+use libkernel::ipc::{
     message::{Mailbox, MailboxSender},
     wait::wait_until,
 };

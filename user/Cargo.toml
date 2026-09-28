@@ -1,6 +1,8 @@
 [workspace]
 members = [
-    "rinlib",
+    "libraries/libkernel",
+    "libraries/libthread",
+    "libraries/libruntime",
     "services/srv_init",
     "services/srv_fs",
     "services/srv_pm",

@@ -244,7 +244,7 @@ impl ObservationSlot {
 /// 同步驱动只负责等待，机器仍验证同一个请求、期限和结果。
 pub fn wait(request: Observation) -> Result<(u64, ObservationResult), SystemCallError> {
     use erhino_shared::wait::{WaitItem, WaitReason};
-    let result = match rinlib::ipc::wait::wait_until(
+    let result = match libkernel::ipc::wait::wait_until(
         &[WaitItem::new(request.control, request.signals, request.id)],
         request.deadline,
     ) {
@@ -254,7 +254,7 @@ pub fn wait(request: Observation) -> Result<(u64, ObservationResult), SystemCall
         Ok(result) => ObservationResult::Ready(result.observed),
         Err(error) => ObservationResult::SourceError(error),
     };
-    Ok((rinlib::time::snapshot()?.now_ns, result))
+    Ok((libkernel::time::snapshot()?.now_ns, result))
 }
 
 #[cfg(test)]

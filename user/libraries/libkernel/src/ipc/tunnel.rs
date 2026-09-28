@@ -126,7 +126,7 @@ impl Endpoint {
         self.geometry
     }
     /// ```compile_fail
-    /// let (endpoint, _) = rinlib::ipc::tunnel::create(4096, rinlib::mm::Placement::Anywhere).unwrap();
+    /// let (endpoint, _) = libkernel::ipc::tunnel::create(4096, libkernel::mm::Placement::Anywhere).unwrap();
     /// let memory = endpoint.memory();
     /// let _ = endpoint.close();
     /// let _ = memory.len();

@@ -54,7 +54,7 @@ impl CreatedTarget {
         &self,
         transport: &mut Transport,
         length: Option<u64>,
-        session_deadline: rinlib::time::Deadline,
+        session_deadline: libkernel::time::Deadline,
     ) -> Result<Stream, StreamOpenFailure> {
         self.open_write_cancelable(transport, length, session_deadline, None)
     }
@@ -64,7 +64,7 @@ impl CreatedTarget {
         &self,
         transport: &mut Transport,
         length: Option<u64>,
-        session_deadline: rinlib::time::Deadline,
+        session_deadline: libkernel::time::Deadline,
         cancel: Option<erhino_shared::object::Handle>,
     ) -> Result<Stream, StreamOpenFailure> {
         let expected = NonZeroU64::new(self.info.identity).ok_or(StreamOpenFailure::Call(
@@ -88,7 +88,7 @@ impl CreatedTarget {
     pub fn delete_if_current(
         self,
         transport: &mut Transport,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<(), (Self, libfal::client::ClientError)> {
         let lookup = match transport.client.call(
             self.locator.parent.endpoint(),
@@ -150,7 +150,7 @@ impl Transport {
         parent: &Grant,
         name: &str,
         rights: FalRights,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<CreatedTarget, TargetCreationFailure> {
         self.create_stream_target_cancelable(parent, name, rights, deadline, None)
     }
@@ -161,7 +161,7 @@ impl Transport {
         parent: &Grant,
         name: &str,
         rights: FalRights,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
         cancel: Option<erhino_shared::object::Handle>,
     ) -> Result<CreatedTarget, TargetCreationFailure> {
         let mut owned = String::new();
@@ -241,7 +241,7 @@ pub struct CopyRequest<'a> {
     pub destination_parent: &'a Grant,
     pub destination_name: &'a str,
     pub destination_rights: FalRights,
-    pub deadline: rinlib::time::Deadline,
+    pub deadline: libkernel::time::Deadline,
     pub cancel: Option<&'a Capability>,
 }
 
@@ -296,14 +296,14 @@ fn cancellation_observed(cancel: Option<&Capability>) -> Result<bool, SystemCall
     let Some(cancel) = cancel else {
         return Ok(false);
     };
-    let now = rinlib::time::Instant::now()?.as_nanos();
-    match rinlib::ipc::wait::wait_until(
+    let now = libkernel::time::Instant::now()?.as_nanos();
+    match libkernel::ipc::wait::wait_until(
         &[WaitItem::new(
             cancel.as_handle(),
             ObjectSignals::READABLE | ObjectSignals::CLOSED,
             0,
         )],
-        rinlib::time::Deadline::at(now),
+        libkernel::time::Deadline::at(now),
     ) {
         Ok(result) => {
             let reason =
@@ -438,7 +438,7 @@ impl CopyFailure {
 
     pub fn retry_cleanup(
         &mut self,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<(), CopyCleanupError> {
         if let Some(pump) = self.pump.take() {
             let (Some(source), Some(destination)) =
@@ -492,7 +492,7 @@ impl CopyFailure {
                 && self.target_result.is_none()
                 && self.cleanup_errors[1].is_none());
         let deadline = if needs_cancel {
-            let limit = rinlib::time::timeout_millis(5_000)
+            let limit = libkernel::time::timeout_millis(5_000)
                 .map_err(CopyCleanupError::Deadline)?;
             let limit_ns = limit.instant().map_err(|_| {
                 CopyCleanupError::Deadline(SystemCallError::IllegalArgument)
@@ -500,7 +500,7 @@ impl CopyFailure {
             match deadline.instant().map_err(|_| {
                 CopyCleanupError::Deadline(SystemCallError::IllegalArgument)
             })? {
-                Some(requested) => rinlib::time::Deadline::at(requested.min(limit_ns)),
+                Some(requested) => libkernel::time::Deadline::at(requested.min(limit_ns)),
                 None => limit,
             }
         } else {
@@ -610,7 +610,7 @@ impl Transport {
         macro_rules! fail {
             ($cause:expr) => {{
                 state.cause = $cause;
-                let cleanup_deadline = rinlib::time::timeout_millis(5_000).unwrap_or(request.deadline);
+                let cleanup_deadline = libkernel::time::timeout_millis(5_000).unwrap_or(request.deadline);
                 let _ = state.retry_cleanup(cleanup_deadline);
                 return Err(state);
             }};

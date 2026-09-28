@@ -1,6 +1,6 @@
 # 通用 RPC 实现
 
-方向见 [`../ideas/rpc.md`](../ideas/rpc.md)。当前通用 framing 与同步调用器位于 `user/libraries/librpc`；`rinlib` 当前提供 Mailbox、Handle、WaitMany、时间等底层封装，不解释 RPC。目标结构是由 `libkernel` 提供这些内核契约，迁移见 [运行时与内核契约库分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md)；本篇以下实现事实仍按当前 rinlib 代码描述。
+方向见 [`../ideas/rpc.md`](../ideas/rpc.md)。当前通用 framing 与同步调用器位于 `user/libraries/librpc`；`libkernel` 当前提供 Mailbox、Handle、WaitMany、时间等底层封装，不解释 RPC。目标结构是由 `libkernel` 提供这些内核契约，迁移见 [运行时与内核契约库分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md)；本篇以下实现事实仍按当前 libkernel 代码描述。
 
 ## Framing
 

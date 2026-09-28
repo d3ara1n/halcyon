@@ -19,6 +19,12 @@
 //! 编排器中追加重复压力、最小预算 Drain 与完整竞态矩阵。内核不感知该档位。
 
 #![no_std]
+#![no_main]
+
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use libbudget::Budget;
 use libexecution::{
@@ -50,19 +56,18 @@ use librpc::{
 };
 use librunnel::{ConsumerReady, blocking};
 use libservice::{client as service_client, protocol as service_protocol, record::ServiceRecord};
-use rinlib::ipc::tunnel as tunnel_sys;
-use rinlib::ipc::wait_set::WaitSet;
-use rinlib::ipc::{
+use libkernel::ipc::tunnel as tunnel_sys;
+use libkernel::ipc::wait_set::WaitSet;
+use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, SendOnce, send_once},
     packet::Packet,
 };
-use rinlib::memory_pool::MemoryPool;
+use libkernel::memory_pool::MemoryPool;
 #[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
-use rinlib::shared::proc::ProcessDrainStatus;
-use rinlib::time::Deadline;
-use rinlib::{
-    env,
+use libkernel::shared::proc::ProcessDrainStatus;
+use libkernel::time::Deadline;
+use libkernel::{
     ipc::{
         message::{create, discard, make_send_once, mint_sender, receive, send_raw, wait_message},
         notification,
@@ -353,7 +358,7 @@ fn launch_test_services(
     let mut fs_second_scope = None;
     let mut primary_provider = None;
     let mut registry_root_watch = None;
-    let result = tar::walk(env::startup_payload(), |entry| {
+    let result = tar::walk(libruntime::startup::startup_payload(), |entry| {
         if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
             return;
         }
@@ -501,7 +506,7 @@ fn launch_test_services(
                             .directory
                             .as_ref()
                             .ok_or("primary provider omitted service directory")?;
-                        let deadline = rinlib::time::timeout_millis(10_000)
+                        let deadline = libkernel::time::timeout_millis(10_000)
                             .map_err(|_| "registration bootstrap deadline invalid")?;
                         let watch = FalClient::new()
                             .subscribe(
@@ -667,7 +672,7 @@ struct FalConsumerCoordinator {
 
 impl FalConsumerCoordinator {
     fn await_report(&self, expected: u64) -> Result<(), &'static str> {
-        let deadline = rinlib::time::timeout_millis(120_000)
+        let deadline = libkernel::time::timeout_millis(120_000)
             .map_err(|_| "FAL consumer phase deadline invalid")?;
         let mut terminal = None;
         loop {
@@ -685,7 +690,7 @@ impl FalConsumerCoordinator {
             if let Some(reason) = terminal {
                 return Err(reason);
             }
-            let result = rinlib::ipc::wait::wait_until(
+            let result = libkernel::ipc::wait::wait_until(
                 &[
                     WaitItem::new(
                         self.report_owner,
@@ -724,9 +729,9 @@ impl FalConsumerCoordinator {
     }
 
     fn finish(self, root: &mut RootSupervisor) -> Result<(), &'static str> {
-        let deadline = rinlib::time::timeout_millis(120_000)
+        let deadline = libkernel::time::timeout_millis(120_000)
             .map_err(|_| "FAL consumer exit deadline invalid")?;
-        let result = rinlib::ipc::wait::wait_until(
+        let result = libkernel::ipc::wait::wait_until(
             &[WaitItem::new(
                 self.control,
                 ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
@@ -888,7 +893,7 @@ fn accept_fs_provider(
             .call(
                 &root,
                 &FalRequest::Lookup { path: "" },
-                rinlib::time::Deadline::INFINITE,
+                libkernel::time::Deadline::INFINITE,
             )
             .map_err(|_| "independent FAL2 root lookup failed")?;
         let (_, FalResponse::Node(info)) = protocol::decode_response(&lookup.payload)
@@ -904,14 +909,14 @@ fn accept_fs_provider(
                 &root,
                 "",
                 FalRights::TRAVERSE | FalRights::ENUMERATE,
-                rinlib::time::Deadline::INFINITE,
+                libkernel::time::Deadline::INFINITE,
             )
             .map_err(|_| "independent FAL2 derive failed")?;
         let child_lookup = client
             .call(
                 &child,
                 &FalRequest::Lookup { path: "" },
-                rinlib::time::Deadline::INFINITE,
+                libkernel::time::Deadline::INFINITE,
             )
             .map_err(|_| "independent FAL2 child lookup failed")?;
         let (_, FalResponse::Node(child_info)) =
@@ -1011,7 +1016,7 @@ fn discover_registered_fs(
     primary_mailbox: u64,
     root_watch: &libfal::client::Subscription,
 ) -> Result<(MailboxSender, u64, u64, libfal::client::Subscription), &'static str> {
-    let deadline = rinlib::time::Deadline::INFINITE;
+    let deadline = libkernel::time::Deadline::INFINITE;
     let mut client = FalClient::new();
     match root_watch
         .wait(deadline)
@@ -1084,7 +1089,7 @@ fn exercise_open_streams(
     position: &libfs::resolve::Position<libfs::client::Grant>,
 ) -> Result<(), &'static str> {
     let deadline =
-        rinlib::time::timeout_millis(20_000).map_err(|_| "FAL2 Open session deadline failed")?;
+        libkernel::time::timeout_millis(20_000).map_err(|_| "FAL2 Open session deadline failed")?;
 
     let payload_len = 16_384;
     let cancel = transport
@@ -1258,8 +1263,8 @@ fn exercise_open_streams(
         deadline,
     )
     .map_err(|_| "FAL2 Open blocked Finish send failed")?;
-    rinlib::time::sleep_until(
-        rinlib::time::timeout_millis(20)
+    libkernel::time::sleep_until(
+        libkernel::time::timeout_millis(20)
             .map_err(|_| "FAL2 Open blocked Finish settle deadline failed")?,
     )
     .map_err(|_| "FAL2 Open blocked Finish settle failed")?;
@@ -1272,7 +1277,7 @@ fn exercise_open_streams(
     let cancelled = transport
         .cancel_stream(&waiting, deadline)
         .map_err(|_| "FAL2 Open concurrent Cancel failed")?;
-    let reply = rinlib::ipc::message::wait_message_until(reply_mailbox.owner, deadline)
+    let reply = libkernel::ipc::message::wait_message_until(reply_mailbox.owner, deadline)
         .map_err(|_| "FAL2 Open blocked Finish did not wake")?;
     let prefix =
         RpcPrefix::decode(&reply.payload).map_err(|_| "FAL2 Open blocked Finish prefix invalid")?;
@@ -1304,7 +1309,7 @@ fn exercise_open_streams(
 
 fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static str> {
     let deadline =
-        rinlib::time::timeout_millis(5_000).map_err(|_| "FAL2 cancellable RPC deadline failed")?;
+        libkernel::time::timeout_millis(5_000).map_err(|_| "FAL2 cancellable RPC deadline failed")?;
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
         Rights::SIGNAL | Rights::TRANSIT,
@@ -1388,7 +1393,7 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
         .close()
         .map_err(|_| "FAL2 cancellable RPC owner close failed")?;
     // SAFETY: 本函数仍独占 Notification 的信号端点。
-    unsafe { rinlib::ipc::object::close(event.peer) }
+    unsafe { libkernel::ipc::object::close(event.peer) }
         .map_err(|_| "FAL2 cancellable RPC peer close failed")?;
     debug!("FAL2 cancellable RPC phases passed");
     Ok(())
@@ -1400,7 +1405,7 @@ fn fal_call(
     request: &FalRequest<'_>,
 ) -> Result<librpc::Reply, &'static str> {
     client
-        .call(grant, request, rinlib::time::Deadline::INFINITE)
+        .call(grant, request, libkernel::time::Deadline::INFINITE)
         .map_err(|_| "FAL2 provider operation failed")
 }
 
@@ -1440,7 +1445,7 @@ fn fal_mailbox_handle(mode: ExportMode) -> Result<alloc::vec::Vec<u8>, &'static 
 }
 
 fn exercise_fs_provider(grant: &MailboxSender) -> Result<(), &'static str> {
-    let deadline = rinlib::time::Deadline::INFINITE;
+    let deadline = libkernel::time::Deadline::INFINITE;
     let mut client = FalClient::new();
     let initial = fal_blob(b"initial")?;
     let leaf_value = fal_blob(b"leaf")?;
@@ -1637,7 +1642,7 @@ fn bind_fs_route(
         )
         .map_err(|_| "fs route target attachment failed")?;
     let reply = Caller::new()
-        .call(&route_sender, rinlib::time::Deadline::INFINITE, request)
+        .call(&route_sender, libkernel::time::Deadline::INFINITE, request)
         .map_err(|_| "fs route binding RPC failed")?;
     if !reply.handles.is_empty()
         || route::decode_status(&reply.payload).map_err(|_| "fs route binding reply invalid")?
@@ -1666,7 +1671,7 @@ fn send_raw_fal_request(
     RpcPrefix::new(RpcMessageKind::Request, txid).encode(&mut payload);
     let used = protocol::encode_request(
         request,
-        rinlib::time::Deadline::INFINITE,
+        libkernel::time::Deadline::INFINITE,
         &mut payload[librpc::PREFIX_LEN..],
     )
     .ok_or(SystemCallError::IllegalArgument)?;
@@ -1714,7 +1719,7 @@ fn stage_abandoned_reply(
     root.close_control(reply.peer)?;
     let mut client = FalClient::new();
     let deadline =
-        rinlib::time::timeout_millis(5_000).map_err(|_| "FAL2 commit probe deadline invalid")?;
+        libkernel::time::timeout_millis(5_000).map_err(|_| "FAL2 commit probe deadline invalid")?;
     let lookup = loop {
         match client.call(
             grant,
@@ -1725,7 +1730,7 @@ fn stage_abandoned_reply(
         ) {
             Ok(reply) => break reply,
             Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {
-                if rinlib::time::expired(deadline).map_err(|_| "FAL2 commit probe clock failed")? {
+                if libkernel::time::expired(deadline).map_err(|_| "FAL2 commit probe clock failed")? {
                     return Err("FAL2 abandoned request did not commit");
                 }
             }
@@ -1789,7 +1794,7 @@ fn stress_fal2_admission(
                 path: "pressure-missing",
             },
             0x5052_4553_5300_0000 + index as u64,
-            rinlib::time::timeout_millis(10_000)
+            libkernel::time::timeout_millis(10_000)
                 .map_err(|_| "FAL2 admission probe send deadline invalid")?,
         ) {
             Ok(()) => replies.push(reply),
@@ -1812,19 +1817,19 @@ fn stress_fal2_admission(
             }
         }
         if index % 8 == 7 {
-            rinlib::time::sleep_until(
-                rinlib::time::timeout_millis(100)
+            libkernel::time::sleep_until(
+                libkernel::time::timeout_millis(100)
                     .map_err(|_| "FAL2 admission pacing deadline invalid")?,
             )
             .map_err(|_| "FAL2 admission pacing failed")?;
         }
     }
-    rinlib::time::sleep_until(
-        rinlib::time::timeout_millis(2_000)
+    libkernel::time::sleep_until(
+        libkernel::time::timeout_millis(2_000)
             .map_err(|_| "FAL2 admission probe settling deadline invalid")?,
     )
     .map_err(|_| "FAL2 admission probe settle failed")?;
-    let deadline = rinlib::time::timeout_millis(5_000)
+    let deadline = libkernel::time::timeout_millis(5_000)
         .map_err(|_| "Registry admission probe deadline invalid")?;
     let request = service_protocol::Request::QueryName {
         name: "fs.secondary",
@@ -1848,7 +1853,7 @@ fn stress_fal2_admission(
     {
         return Err("Registry admission probe did not reject saturated task pool");
     }
-    let receive_deadline = rinlib::time::timeout_millis(30_000)
+    let receive_deadline = libkernel::time::timeout_millis(30_000)
         .map_err(|_| "FAL2 admission probe receive deadline invalid")?;
     for reply in &replies {
         for _ in 0..MAILBOX_CAPACITY {
@@ -1857,7 +1862,7 @@ fn stress_fal2_admission(
     }
     let mut quota = 0;
     for (index, mailbox) in replies.into_iter().enumerate() {
-        let reply = rinlib::ipc::message::wait_message_until(mailbox.owner, receive_deadline)
+        let reply = libkernel::ipc::message::wait_message_until(mailbox.owner, receive_deadline)
             .map_err(|_| "FAL2 admission probe response missing")?;
         if reply.header.kind != protocol::ID || !reply.handles.is_empty() {
             return Err("FAL2 admission probe response layout invalid");
@@ -1892,7 +1897,7 @@ fn stress_fal2_admission(
             &FalRequest::Lookup {
                 path: "pressure-cleared"
             },
-            rinlib::time::timeout_millis(5_000)
+            libkernel::time::timeout_millis(5_000)
                 .map_err(|_| "FAL2 admission recovery deadline invalid")?,
         ),
         Err(libfal::client::ClientError::Status(
@@ -1901,7 +1906,7 @@ fn stress_fal2_admission(
     ) {
         return Err("FAL2 admission probe did not recover");
     }
-    let deadline = rinlib::time::timeout_millis(5_000)
+    let deadline = libkernel::time::timeout_millis(5_000)
         .map_err(|_| "Registry admission recovery deadline invalid")?;
     let used = service_protocol::encode_request(&request, deadline, &mut payload)
         .ok_or("Registry admission recovery encoding failed")?;
@@ -1926,7 +1931,7 @@ fn stress_fal2_admission(
 }
 
 struct StalledDelegate {
-    downstream: rinlib::ipc::message::ReceivedMessage,
+    downstream: libkernel::ipc::message::ReceivedMessage,
     downstream_owner: Handle,
     client_reply: Handle,
 }
@@ -1994,7 +1999,7 @@ fn call_registration(
     authority: &MailboxSender,
     request: &service_protocol::Request<'_>,
     deadline: Deadline,
-    endpoint: Option<rinlib::ipc::capability::Capability>,
+    endpoint: Option<libkernel::ipc::capability::Capability>,
 ) -> Result<librpc::Reply, &'static str> {
     let mut payload = alloc::vec![0; service_protocol::HEADER_LEN
         + request.encoded_len().ok_or("registration request size invalid")?];
@@ -2056,7 +2061,7 @@ fn send_raw_registration_request(
 
 fn blocked_registration_reply(
     root: &mut RootSupervisor,
-) -> Result<rinlib::shared::object::HandlePair, &'static str> {
+) -> Result<libkernel::shared::object::HandlePair, &'static str> {
     let reply = root
         .create_mailbox(
             Rights::READ | Rights::WAIT | Rights::MANAGE,
@@ -2111,7 +2116,7 @@ fn probe_registration_reply_boundaries(
     directory: &MailboxSender,
     authority: &MailboxSender,
 ) -> Result<(), &'static str> {
-    let deadline = rinlib::time::timeout_millis(15_000)
+    let deadline = libkernel::time::timeout_millis(15_000)
         .map_err(|_| "registration reply probe deadline invalid")?;
     let name = "probe.reply";
     let scoped = service_client::delegate_name(authority, name, deadline)
@@ -2154,7 +2159,7 @@ fn probe_registration_reply_boundaries(
         ) {
             break;
         }
-        if rinlib::time::expired(deadline).map_err(|_| "registration Starting clock failed")? {
+        if libkernel::time::expired(deadline).map_err(|_| "registration Starting clock failed")? {
             return Err("registration abandoned Register never reached Starting");
         }
     }
@@ -2163,7 +2168,7 @@ fn probe_registration_reply_boundaries(
         if query_registration_name(&scoped, name, deadline)?.is_none() {
             break;
         }
-        if rinlib::time::expired(deadline).map_err(|_| "registration abandon clock failed")? {
+        if libkernel::time::expired(deadline).map_err(|_| "registration abandon clock failed")? {
             return Err("registration abandoned establishment retained its name");
         }
     }
@@ -2272,7 +2277,7 @@ fn probe_registration_endpoint_retirement(
     directory: &MailboxSender,
     authority: &MailboxSender,
 ) -> Result<(), &'static str> {
-    let deadline = rinlib::time::timeout_millis(10_000)
+    let deadline = libkernel::time::timeout_millis(10_000)
         .map_err(|_| "registration endpoint probe deadline invalid")?;
     let watch = FalClient::new()
         .subscribe(
@@ -2388,7 +2393,7 @@ fn probe_registration_endpoint_retirement(
 
 #[cfg(feature = "acceptance-stress")]
 fn reply_to_cancelled_delegate(
-    mut downstream: rinlib::ipc::message::ReceivedMessage,
+    mut downstream: libkernel::ipc::message::ReceivedMessage,
 ) -> Result<(), &'static str> {
     let request = RpcPrefix::decode(&downstream.payload)
         .map_err(|_| "cancelled Derive reply prefix invalid")?;
@@ -2396,10 +2401,10 @@ fn reply_to_cancelled_delegate(
         .handles
         .take(0)
         .map_err(|_| "cancelled Derive reply sender missing")?;
-    let (reply, _) = rinlib::ipc::message::SendOnce::from_capability(reply)
+    let (reply, _) = libkernel::ipc::message::SendOnce::from_capability(reply)
         .map_err(|_| "cancelled Derive reply sender role invalid")?;
     let returned =
-        rinlib::ipc::message::Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
+        libkernel::ipc::message::Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
             .map_err(|_| "cancelled Derive reply capability creation failed")?;
     let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
     let minted = returned
@@ -2430,7 +2435,7 @@ fn reply_to_cancelled_delegate(
     packet
         .push(granted, rights)
         .map_err(|_| "cancelled Derive reply capability attachment failed")?;
-    let deadline = rinlib::time::timeout_millis(5_000)
+    let deadline = libkernel::time::timeout_millis(5_000)
         .map_err(|_| "cancelled Derive reply deadline invalid")?;
     packet
         .try_reply(reply, deadline)
@@ -2466,8 +2471,8 @@ fn cancel_stalled_delegate_while_provider_runs(
         debug!("FAL2 upstream cancellation delivered: index={}", index);
         root.close_control(pending.client_reply)?;
         stalled.push(pending);
-        rinlib::time::sleep_until(
-            rinlib::time::timeout_millis(50)
+        libkernel::time::sleep_until(
+            libkernel::time::timeout_millis(50)
                 .map_err(|_| "FAL2 upstream cancellation pacing deadline invalid")?,
         )
         .map_err(|_| "FAL2 upstream cancellation pacing failed")?;
@@ -2486,7 +2491,7 @@ fn cancel_stalled_delegate_while_provider_runs(
             &FalRequest::Lookup {
                 path: "cancelled-recovered"
             },
-            rinlib::time::timeout_millis(5_000)
+            libkernel::time::timeout_millis(5_000)
                 .map_err(|_| "FAL2 cancellation recovery deadline invalid")?,
         ),
         Err(libfal::client::ClientError::Status(
@@ -2547,7 +2552,7 @@ fn collect_fs_provider(
 }
 
 fn root_memory_pool() -> Handle {
-    env::startup_handle(initial::ROOT_MEMORY_POOL)
+    libruntime::startup::startup_handle(initial::ROOT_MEMORY_POOL)
         .expect("init must hold root MemoryPool authority")
 }
 
@@ -2569,8 +2574,8 @@ fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
         if process::map(
             created.builder,
             0x1000,
-            rinlib::shared::proc::PROCESS_PAGE_SIZE,
-            rinlib::shared::proc::ProcessMapFlags::READ,
+            libkernel::shared::proc::PROCESS_PAGE_SIZE,
+            libkernel::shared::proc::ProcessMapFlags::READ,
         ) != Err(SystemCallError::ObjectNotAvailable)
         {
             return Err(SystemCallError::InternalError);
@@ -2622,7 +2627,7 @@ fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
 #[cfg(feature = "capacity-calibration")]
 fn test_bound_address_space_capacity(job: Handle) -> Result<(), &'static str> {
     let baseline = root_pool_allocated().map_err(|_| "capacity Pool baseline query failed")?;
-    let mut retained: [Option<rinlib::shared::proc::ProcessCreateResult>;
+    let mut retained: [Option<libkernel::shared::proc::ProcessCreateResult>;
         CAPACITY_ADDITIONAL_ADDRESS_SPACES] = [None; CAPACITY_ADDITIONAL_ADDRESS_SPACES];
 
     let result = (|| {
@@ -2641,20 +2646,20 @@ fn test_bound_address_space_capacity(job: Handle) -> Result<(), &'static str> {
                     if let Err(error) = process::map(
                         created.builder,
                         0x1000,
-                        rinlib::shared::proc::PROCESS_PAGE_SIZE,
-                        rinlib::shared::proc::ProcessMapFlags::READ
-                            | rinlib::shared::proc::ProcessMapFlags::EXECUTE,
+                        libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                        libkernel::shared::proc::ProcessMapFlags::READ
+                            | libkernel::shared::proc::ProcessMapFlags::EXECUTE,
                     ) {
                         let _ = unsafe { process::abandon_to_completion(created) };
                         return Err(error);
                     }
                     if let Err(error) = process::map(
                         created.builder,
-                        rinlib::shared::proc::PROCESS_USER_TOP
-                            - rinlib::shared::proc::PROCESS_PAGE_SIZE,
-                        rinlib::shared::proc::PROCESS_PAGE_SIZE,
-                        rinlib::shared::proc::ProcessMapFlags::READ
-                            | rinlib::shared::proc::ProcessMapFlags::WRITE,
+                        libkernel::shared::proc::PROCESS_USER_TOP
+                            - libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                        libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                        libkernel::shared::proc::ProcessMapFlags::READ
+                            | libkernel::shared::proc::ProcessMapFlags::WRITE,
                     ) {
                         let _ = unsafe { process::abandon_to_completion(created) };
                         return Err(error);
@@ -2726,7 +2731,7 @@ fn test_bound_address_space_capacity(job: Handle) -> Result<(), &'static str> {
 #[cfg(feature = "capacity-calibration")]
 fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str> {
     type WorkerResult = (
-        [Option<rinlib::shared::proc::ProcessCreateResult>; CAPACITY_CONCURRENT_PER_WORKER],
+        [Option<libkernel::shared::proc::ProcessCreateResult>; CAPACITY_CONCURRENT_PER_WORKER],
         usize,
         usize,
         usize,
@@ -2734,13 +2739,13 @@ fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str>
 
     let ready = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
     let go = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let mut workers: [Option<rinlib::thread::JoinHandle<WorkerResult>>;
+    let mut workers: [Option<libthread::JoinHandle<WorkerResult>>;
         CAPACITY_CONCURRENT_WORKERS] = core::array::from_fn(|_| None);
     for slot in &mut workers {
         let ready = ready.clone();
         let launch_go = go.clone();
         let pool = root_memory_pool();
-        *slot = match rinlib::thread::Builder::new()
+        *slot = match libthread::Builder::new()
             .stack_size(64 * 1024)
             .spawn(move || {
                 ready.fetch_add(1, core::sync::atomic::Ordering::Release);
@@ -2847,7 +2852,7 @@ fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str>
 #[cfg(feature = "capacity-calibration")]
 fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'static str> {
     const MIXED_BOUND: usize = 8;
-    let mut retained: [Option<rinlib::shared::proc::ProcessCreateResult>; MIXED_BOUND] =
+    let mut retained: [Option<libkernel::shared::proc::ProcessCreateResult>; MIXED_BOUND] =
         [None; MIXED_BOUND];
     let result = (|| {
         for slot in &mut retained {
@@ -2871,9 +2876,9 @@ fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'sta
             if let Err(error) = process::map(
                 created.builder,
                 0x1000,
-                rinlib::shared::proc::PROCESS_PAGE_SIZE,
-                rinlib::shared::proc::ProcessMapFlags::READ
-                    | rinlib::shared::proc::ProcessMapFlags::EXECUTE,
+                libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                libkernel::shared::proc::ProcessMapFlags::READ
+                    | libkernel::shared::proc::ProcessMapFlags::EXECUTE,
             ) {
                 let _ = unsafe { process::abandon_to_completion(created) };
                 return Err(match error {
@@ -2883,10 +2888,10 @@ fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'sta
             }
             if let Err(error) = process::map(
                 created.builder,
-                rinlib::shared::proc::PROCESS_USER_TOP - rinlib::shared::proc::PROCESS_PAGE_SIZE,
-                rinlib::shared::proc::PROCESS_PAGE_SIZE,
-                rinlib::shared::proc::ProcessMapFlags::READ
-                    | rinlib::shared::proc::ProcessMapFlags::WRITE,
+                libkernel::shared::proc::PROCESS_USER_TOP - libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                libkernel::shared::proc::ProcessMapFlags::READ
+                    | libkernel::shared::proc::ProcessMapFlags::WRITE,
             ) {
                 let _ = unsafe { process::abandon_to_completion(created) };
                 return Err(match error {
@@ -2932,19 +2937,21 @@ fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'sta
     Ok(())
 }
 
-fn main() {
+fn app_main() {
     debug!("Hello, init!");
-    let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
-    let reset =
-        env::startup_handle(initial::SYSTEM_RESET).expect("init must hold SystemReset authority");
+    let root_job = libruntime::startup::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
+    let mut reset = Some(
+        libruntime::startup::startup_handle(initial::SYSTEM_RESET)
+            .expect("init must hold SystemReset authority"),
+    );
     // 尚无服务责任时准备根承载；失败不会遗忘已启动服务。
     let mut root = loop {
-        match RootSupervisor::prepare() {
+        match RootSupervisor::prepare(&mut reset) {
             Ok(root) => break root,
             Err(error) => {
                 debug!("root supervisor preparation failed: {:?}", error);
-                if let Ok(deadline) = rinlib::time::timeout_millis(100) {
-                    let _ = rinlib::time::sleep_until(deadline);
+                if let Ok(deadline) = libkernel::time::timeout_millis(100) {
+                    let _ = libkernel::time::sleep_until(deadline);
                 }
             }
         }
@@ -2961,12 +2968,13 @@ fn main() {
         root.serve_forever();
     }
     debug!("services job established");
-    if let Err(failure) = run(&mut root, services) {
+    if let Err(failure) = run(&mut root, services, root_job) {
         match failure {
             RunFailure::Message(stage) => debug!("init acceptance failed: {}", stage),
         }
         root.serve_forever();
     }
+    let reset = root.take_reset();
     submit_shutdown(root_job, reset, root);
 }
 
@@ -3014,7 +3022,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
         not(feature = "capacity-calibration")
     ))]
     let pool_baseline = root_pool_allocated().map_err(|_| "memory Pool baseline query failed")?;
-    let page = rinlib::shared::proc::PROCESS_PAGE_SIZE;
+    let page = libkernel::shared::proc::PROCESS_PAGE_SIZE;
     let region = MappedRegion::map_anonymous(
         3 * page,
         page,
@@ -3294,7 +3302,7 @@ fn test_rpc_reject_cleanup() {
     )
     .expect("RPC rejected Handle notification create failed");
     let rejected_alias = rejected.peer;
-    let worker = rinlib::thread::Builder::new()
+    let worker = libthread::Builder::new()
         .spawn(move || {
             for attempt in 0..2 {
                 let mut request =
@@ -3322,7 +3330,7 @@ fn test_rpc_reject_cleanup() {
                         .push(capability, Rights::SIGNAL)
                         .expect("RPC response capability preparation failed");
                     packet
-                        .try_reply(reply_once, rinlib::time::Deadline::INFINITE)
+                        .try_reply(reply_once, libkernel::time::Deadline::INFINITE)
                         .expect("RPC rejection response publication failed");
                     continue;
                 }
@@ -3330,7 +3338,7 @@ fn test_rpc_reject_cleanup() {
                 let context = RequestContext::decode(request, PROTOCOL)
                     .map_err(|rejected| rejected.reason)
                     .expect("RPC test request context invalid");
-                let mut outbox = Outbox::prepare(context, 1, rinlib::time::Deadline::INFINITE, 1)
+                let mut outbox = Outbox::prepare(context, 1, libkernel::time::Deadline::INFINITE, 1)
                     .map_err(|failure| failure.error)
                     .expect("RPC test Outbox preparation failed");
                 outbox
@@ -3362,7 +3370,7 @@ fn test_rpc_reject_cleanup() {
     assert!(matches!(
         caller.call(
             &service_sender,
-            rinlib::time::Deadline::INFINITE,
+            libkernel::time::Deadline::INFINITE,
             Request::new(PROTOCOL, b"reject").expect("RPC request preparation failed")
         ),
         Err(CallError {
@@ -3378,7 +3386,7 @@ fn test_rpc_reject_cleanup() {
     let reply = caller
         .call(
             &service_sender,
-            rinlib::time::Deadline::INFINITE,
+            libkernel::time::Deadline::INFINITE,
             Request::new(PROTOCOL, b"accept").expect("RPC request preparation failed"),
         )
         .expect("RPC call after rejected reply failed");
@@ -3434,7 +3442,7 @@ impl Task<RpcOutboxWorld> for RpcOutboxTask {
         world.result = self.outbox.result();
     }
 
-    fn deadline(&self) -> rinlib::time::Deadline {
+    fn deadline(&self) -> libkernel::time::Deadline {
         self.outbox.deadline()
     }
 }
@@ -3477,9 +3485,8 @@ fn run_rpc_outbox(outbox: Outbox) -> OutboxResult {
 }
 
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
-fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
+fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<(), RunFailure> {
     debug!("acceptance workload: {}", ACCEPTANCE_WORKLOAD);
-    let root_job = env::startup_handle(initial::ROOT_JOB).expect("init must hold root JobControl");
     test_memory_mapping()?;
     #[cfg(not(feature = "acceptance-stress"))]
     test_process_memory_binding(services)?;
@@ -3499,7 +3506,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     names.register_job(services, "services");
     names.register_job(pm_domain, "pm_domain");
     names.register_job(acceptance, "acceptance");
-    names.register_process(env::pid() as u64, "init");
+    names.register_process(libruntime::startup::pid() as u64, "init");
     let launched = launch_test_services(root, services, pm_domain, acceptance, &mut names)?;
     let pm_mailbox = launched.pm_mailbox;
     let mut first_fs = launched.first_fs;
@@ -3598,7 +3605,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
                 | FalRights::WRITE_STREAM
                 | FalRights::CREATE
                 | FalRights::REMOVE,
-            rinlib::time::Deadline::INFINITE,
+            libkernel::time::Deadline::INFINITE,
         )
         .map_err(|_| "secondary FAL2 stream grant derive failed")?;
     let second_stream_grant = alloc::sync::Arc::new(second_stream_grant);
@@ -3614,7 +3621,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
                 .expect("discovered secondary provider grant missing"),
             "",
             protocol::WatchMask::CREATE,
-            rinlib::time::Deadline::INFINITE,
+            libkernel::time::Deadline::INFINITE,
         )
         .map_err(|_| RunFailure::Message("FAL2 shutdown Watch subscription failed"))?;
     let abandoned_reply = stage_abandoned_reply(
@@ -3629,7 +3636,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     notification::signal(second_fs.release, 1)
         .map_err(|_| RunFailure::Message("secondary provider in-flight Copy release signal failed"))?;
     consumer.await_report(test_fal::report::COMPLETE)?;
-    let mut transport = FalTransport::new(rinlib::time::Deadline::INFINITE);
+    let mut transport = FalTransport::new(libkernel::time::Deadline::INFINITE);
     let first_stream = libfs::resolve::resolve(
         &mut transport,
         &namespace,
@@ -3663,7 +3670,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
     debug!("FAL2 registry provider withdrawal observed");
     match registry_root_watch
         .wait(
-            rinlib::time::timeout_millis(5_000)
+            libkernel::time::timeout_millis(5_000)
                 .map_err(|_| RunFailure::Message("Registry Watch deadline invalid"))?,
         )
         .map_err(|_| RunFailure::Message("Registry root withdrawal Watch failed"))?
@@ -3683,7 +3690,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
         &FalRequest::Read {
             path: "fs.secondary",
         },
-        rinlib::time::Deadline::INFINITE,
+        libkernel::time::Deadline::INFINITE,
     ) {
         Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {}
         _ => {
@@ -3843,16 +3850,16 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
     let (tunnel, invitation) =
-        match blocking::Consumer::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere) {
+        match blocking::Consumer::create(TUNNEL_BYTES, libkernel::mm::Placement::Anywhere) {
             Ok((consumer, invitation)) => (consumer, invitation),
             Err(blocking::CreateFailure::Tunnel(
-                rinlib::ipc::invitation::CreateFailure::System(error),
+                libkernel::ipc::invitation::CreateFailure::System(error),
             )) => {
                 debug!("tunnel create failed: {:?}", error);
                 return Err(RunFailure::Message("tunnel create failed"));
             }
             Err(blocking::CreateFailure::Tunnel(
-                rinlib::ipc::invitation::CreateFailure::Published {
+                libkernel::ipc::invitation::CreateFailure::Published {
                     endpoint,
                     cleanup,
                     invitation,
@@ -3884,7 +3891,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
         return Err(RunFailure::Message("tunnel invitation push failed"));
     }
     if let Err(mut failure) =
-        packet.try_send(root.sender(pm_mailbox), rinlib::time::Deadline::INFINITE)
+        packet.try_send(root.sender(pm_mailbox), libkernel::time::Deadline::INFINITE)
     {
         let (invitation, _) = failure
             .packet
@@ -4032,17 +4039,6 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
 
     // 终态拓扑快照（调试参考）：预期 root 仅剩 init + services，services
     // 空（Dead 的 pm_domain/acceptance 已从成员表移除）——收束干净的不变量。
-    let stack_cleanup = rinlib::thread::stack_cleanup_snapshot();
-    if stack_cleanup.abandoned != 0 {
-        debug!(
-            "thread stack cleanup recorded {} abandoned mapping(s), last error {:?}",
-            stack_cleanup.abandoned, stack_cleanup.last_error
-        );
-        return Err(RunFailure::Message(
-            "thread stack cleanup abandoned mappings",
-        ));
-    }
-    debug!("thread stack cleanup passed");
     debug!("topology: final snapshot before system reset");
     dump_topology(root_job, &names, 0);
     root.close_control(pm_domain)?;
@@ -4053,7 +4049,7 @@ fn run(root: &mut RootSupervisor, services: Handle) -> Result<(), RunFailure> {
 /// 递归打印 Job/Process 拓扑（调试参考）：直接成员经派生 control 查询
 /// 生命周期快照后即关，child Job 派生 JobControl 下钻——纯观察，不消费
 /// authority、不改状态。青色 topology 标记便于在灰度用户态日志中定位
-/// （rinlib debug! 元许在消息内自拼 ANSI）。
+/// （libkernel debug! 元许在消息内自拼 ANSI）。
 fn dump_topology(job: Handle, names: &TopologyNames, depth: usize) {
     let indent = "  ".repeat(depth);
     let job_snapshot = process::query_job(job).ok();
@@ -4366,15 +4362,15 @@ impl Task<ReadWorld> for InitTask {
         }
     }
 
-    fn deadline(&self) -> rinlib::shared::time::Deadline {
-        rinlib::shared::time::Deadline::INFINITE
+    fn deadline(&self) -> libkernel::shared::time::Deadline {
+        libkernel::shared::time::Deadline::INFINITE
     }
 }
 
 fn wait_supervision_signal(
     tunnel: &mut blocking::Consumer,
     label: &'static str,
-) -> Result<rinlib::shared::wait::WaitResult, &'static str> {
+) -> Result<libkernel::shared::wait::WaitResult, &'static str> {
     for attempt in 1..=DEFAULT_SUPERVISION_POLICY.wait_attempts {
         match tunnel.wait_peer_closed(DEFAULT_SUPERVISION_POLICY.wait_timeout_ms) {
             Ok(result) if result.observed != ObjectSignals::NONE => return Ok(result),
@@ -4442,7 +4438,7 @@ fn test_building_kill(job: Handle) {
         (Ok(_), Ok(snapshot))
             if snapshot.state == ProcessState::Dead as u32
                 && snapshot.cause == TerminationCause::Killed as u32
-                && snapshot.detail == rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
+                && snapshot.detail == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
         {
             debug!(
                 "building kill passed: pid {} Dead/Killed/{:#x}",
@@ -4512,7 +4508,7 @@ fn test_derive_kill(
             assert_eq!(collected.snapshot.cause, TerminationCause::Killed as u32);
             assert_eq!(
                 collected.snapshot.detail,
-                rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
+                libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
             );
             debug!(
                 "pid {} supervised: work={}, state={}, cause={}, detail={}",
@@ -4564,7 +4560,7 @@ fn test_job_management(
 }
 
 /// 含 child Handle 的 REAPABLE 进程以 `max_work=1` 收束。More 必须由
-/// rinlib 拒绝零进展；这里逐批推进至 Complete，覆盖 pending close 的
+/// libkernel 拒绝零进展；这里逐批推进至 Complete，覆盖 pending close 的
 /// 扫描/关闭分离边界。
 #[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
 fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static str> {
@@ -4730,7 +4726,7 @@ fn test_derive_fallback(job: Handle) {
                 (Ok(_), Ok(snapshot))
                     if snapshot.state == ProcessState::Dead as u32
                         && snapshot.cause == TerminationCause::Killed as u32
-                        && snapshot.detail == rinlib::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
+                        && snapshot.detail == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
                 {
                     debug!(
                         "derive fallback passed: pid {} minted control drained to Dead/Killed/{:#x}",
@@ -4984,7 +4980,7 @@ fn test_capability_badges_and_affine_owners() {
     for (kind, badge) in [(880, 0), (881, BADGE), (882, BADGE)] {
         let message = receive(mailbox.owner).expect("badged message receive failed");
         assert_eq!(message.header.kind, kind);
-        assert_eq!(message.header.sender_pid, env::pid() as u64);
+        assert_eq!(message.header.sender_pid, libruntime::startup::pid() as u64);
         assert_eq!(message.header.sender_badge, badge);
     }
     let once = make_send_once(badged, Rights::WRITE).expect("badged send-once mint failed");
@@ -5069,7 +5065,7 @@ fn test_capability_badges_and_affine_owners() {
 
 /// 持久观察的轮次、立即失效与内核独立退休。
 fn test_wait_set_retirement() {
-    use rinlib::{ipc::wait_set::WaitSet, time::Deadline};
+    use libkernel::{ipc::wait_set::WaitSet, time::Deadline};
 
     let event = notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
         .expect("WaitSet retirement notification create failed");
@@ -5324,8 +5320,8 @@ fn test_writable_wake(root: &mut RootSupervisor, pm_mailbox: Handle) -> Result<(
     root.transferred(spin.peer);
 
     // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
-    let deadline = rinlib::time::timeout_millis(5_000).map_err(|_| "wake deadline failed")?;
-    let done_wait = rinlib::ipc::wait::wait_until(
+    let deadline = libkernel::time::timeout_millis(5_000).map_err(|_| "wake deadline failed")?;
+    let done_wait = libkernel::ipc::wait::wait_until(
         &[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)],
         deadline,
     )
@@ -5338,7 +5334,7 @@ fn test_writable_wake(root: &mut RootSupervisor, pm_mailbox: Handle) -> Result<(
 
     // 队列：15 × FILL + TAIL。逐条校验，末尾必然是被唤醒后补发的 TAIL。
     for index in 0..MAILBOX_CAPACITY {
-        let ready = rinlib::ipc::wait::wait_until(
+        let ready = libkernel::ipc::wait::wait_until(
             &[WaitItem::new(
                 target.owner,
                 ObjectSignals::READABLE | ObjectSignals::CLOSED,
@@ -5457,7 +5453,7 @@ fn stress_control_plane() {
 /// 实际 Running 调用链验证取整、双端不同 VA、完整共享范围与关闭后存活端。
 fn test_tunnel_geometry() {
     use core::sync::atomic::Ordering;
-    use rinlib::mm::Placement;
+    use libkernel::mm::Placement;
     for bytes in [1, 4096, 4097, 8192, 12288, 512 * 4096] {
         let (creator, invitation) =
             tunnel_sys::create(bytes, Placement::Anywhere).expect("Tunnel geometry Create failed");
@@ -5489,11 +5485,11 @@ fn test_tunnel_geometry() {
         );
         peer.close().expect("Tunnel geometry peer close failed");
         for address in [geometry.base(), peer_base] {
-            let region = rinlib::mm::MappedRegion::map_anonymous(
+            let region = libkernel::mm::MappedRegion::map_anonymous(
                 geometry.bytes(),
                 0,
                 0,
-                rinlib::shared::mem::MemoryProtection::ReadWrite,
+                libkernel::shared::mem::MemoryProtection::ReadWrite,
                 Placement::FixedEmpty {
                     usable_start: address,
                 },
@@ -5509,7 +5505,7 @@ fn test_tunnel_geometry() {
 fn test_tunnel_lifecycle() {
     for _ in 0..TUNNEL_STRESS {
         let (abandoned, invitation) =
-            tunnel_sys::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere)
+            tunnel_sys::create(TUNNEL_BYTES, libkernel::mm::Placement::Anywhere)
                 .expect("lifecycle tunnel create failed");
         assert!(matches!(
             wait_many(&[WaitItem::new(invitation, ObjectSignals::CLOSED, 0)], 0,),
@@ -5525,13 +5521,13 @@ fn test_tunnel_lifecycle() {
         abandoned.close().expect("lifecycle endpoint close failed");
 
         let (creator_closed, invitation) =
-            tunnel_sys::create(TUNNEL_BYTES, rinlib::mm::Placement::Anywhere)
+            tunnel_sys::create(TUNNEL_BYTES, libkernel::mm::Placement::Anywhere)
                 .expect("closed-creator tunnel create failed");
         creator_closed
             .close()
             .expect("creator endpoint close failed");
         assert!(matches!(
-            unsafe { tunnel_sys::attach(invitation, rinlib::mm::Placement::Anywhere) },
+            unsafe { tunnel_sys::attach(invitation, libkernel::mm::Placement::Anywhere) },
             Err(SystemCallError::ObjectClosed)
         ));
         // SAFETY: Attach 失败未消费本轮的 Invitation。
@@ -5539,3 +5535,5 @@ fn test_tunnel_lifecycle() {
     }
     debug!("tunnel lifecycle stress passed: {} rounds", TUNNEL_STRESS);
 }
+
+libruntime::entry!(app_main);

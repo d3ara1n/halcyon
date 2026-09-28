@@ -45,7 +45,7 @@ use libservice::{
     registry::{Registry, RegistryError},
     resource::ServiceResource,
 };
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
     notification,
@@ -1160,7 +1160,7 @@ impl<B: RuntimeBackend> Ingress<B> {
             outbox.stop(world);
         } else {
             let cap =
-                rinlib::time::timeout_millis(5_000).expect("FAL refusal deadline unavailable");
+                libkernel::time::timeout_millis(5_000).expect("FAL refusal deadline unavailable");
             let original = outbox
                 .deadline()
                 .instant()
@@ -2523,7 +2523,7 @@ fn record_provider_response<B: RuntimeBackend>(
         matches!(outbox.result(), Some(OutboxResult::Abandoned(_))),
     )?;
     if let Some(OutboxResult::Abandoned(cause)) = outbox.result() {
-        rinlib::debug!("fs: provider response abandoned after commit: {:?}", cause);
+        libkernel::debug!("fs: provider response abandoned after commit: {:?}", cause);
     }
     Ok(())
 }
@@ -3363,7 +3363,7 @@ impl<B: RuntimeBackend> Task<World<B>> for ReadTask {
                 matches!(self.outbox.result(), Some(OutboxResult::Abandoned(_))),
             )?;
             if let Some(OutboxResult::Abandoned(cause)) = self.outbox.result() {
-                rinlib::debug!("fs: Read response abandoned after snapshot: {:?}", cause);
+                libkernel::debug!("fs: Read response abandoned after snapshot: {:?}", cause);
             }
             self.recorded = true;
         }
@@ -3689,7 +3689,7 @@ impl<B: RuntimeBackend> Task<World<B>> for DelegateTask {
                 matches!(self.outbox.result(), Some(OutboxResult::Abandoned(_))),
             )?;
             if let Some(OutboxResult::Abandoned(cause)) = self.outbox.result() {
-                rinlib::debug!("fs: Delegate response abandoned after commit: {:?}", cause);
+                libkernel::debug!("fs: Delegate response abandoned after commit: {:?}", cause);
             }
             self.recorded = true;
         }
@@ -3911,7 +3911,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
                 }
             } else if event.kind == KIND_REGISTRATION {
                 if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
-                    rinlib::debug!(
+                    libkernel::debug!(
                         "RegistrationControl terminal event: error={}, signals={:#x}",
                         event.error,
                         event.observed.raw()
@@ -4361,7 +4361,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
                 }
             }
             RequestFailure::Source { kind, error } => {
-                rinlib::debug!(
+                libkernel::debug!(
                     "RegistrationControl source refused: kind={}, error={:?}",
                     kind,
                     error
@@ -4369,7 +4369,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
                 world.failed = true;
             }
             RequestFailure::Wake { task, error } => {
-                rinlib::debug!(
+                libkernel::debug!(
                     "RegistrationControl wake refused: task={}, error={:?}",
                     task,
                     error
@@ -5396,7 +5396,7 @@ fn run_with_backend<B, F>(
                 else {
                     unreachable!()
                 };
-                let deadline = rinlib::time::timeout_millis(5_000)
+                let deadline = libkernel::time::timeout_millis(5_000)
                     .expect("registration deadline construction failed");
                 let task =
                     RegistrationClientTask::new(target.into_capability(), endpoint, deadline)
@@ -5509,7 +5509,7 @@ fn run_with_backend<B, F>(
         "provider Watch records remained after Runtime shutdown"
     );
     assert!(world.streams.is_empty(), "provider Stream records remained after Runtime shutdown");
-    rinlib::debug!("fs provider shutdown: Runtime closed");
+    libkernel::debug!("fs provider shutdown: Runtime closed");
     world
         .provider
         .grants
@@ -5518,16 +5518,16 @@ fn run_with_backend<B, F>(
         .close()
         .map_err(|_| SystemCallError::ObjectBusy)
         .expect("provider grant table close failed");
-    rinlib::debug!("fs provider shutdown: GrantTable closed");
+    libkernel::debug!("fs provider shutdown: GrantTable closed");
     assert!(
         world.provider.backend.is_none(),
         "provider backend remained after shutdown"
     );
     // SAFETY: StartupBlock transferred the unique route mailbox owner to this process,
     // and Runtime has removed its final WaitSet source before reaching this point.
-    unsafe { rinlib::ipc::object::close(world.route_mailbox) }
+    unsafe { libkernel::ipc::object::close(world.route_mailbox) }
         .expect("provider route mailbox close failed");
-    rinlib::debug!("fs provider shutdown: route mailbox closed");
+    libkernel::debug!("fs provider shutdown: route mailbox closed");
     for kind in [
         FalResource::Node,
         FalResource::Bytes,
@@ -5560,7 +5560,7 @@ fn run_with_backend<B, F>(
             "provider service account did not refund {kind:?}"
         );
     }
-    rinlib::debug!("fs provider shutdown: account refunded");
+    libkernel::debug!("fs provider shutdown: account refunded");
     let report = protocol::ProviderReport {
         committed: world.provider.committed,
         abandoned: world.provider.abandoned,
@@ -5573,7 +5573,7 @@ fn run_with_backend<B, F>(
     bootstrap
         .send(protocol::PROVIDER_STOPPED_KIND, &payload[..used])
         .expect("provider shutdown report failed");
-    rinlib::debug!(
+    libkernel::debug!(
         "fs provider shutdown report: committed={}, abandoned={}, downstream_abandoned={}",
         report.committed,
         report.abandoned,

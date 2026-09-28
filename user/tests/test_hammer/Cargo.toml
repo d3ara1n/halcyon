@@ -5,5 +5,7 @@ edition = "2024"
 description = "Lifecycle race matrix hammer and race target"
 
 [dependencies]
-rinlib = { path = "../../rinlib" }
+libkernel = { path = "../../libraries/libkernel" }
 libprocess = { path = "../../libraries/libprocess" }
+libruntime = { path = "../../libraries/libruntime" }
+libthread = { path = "../../libraries/libthread" }

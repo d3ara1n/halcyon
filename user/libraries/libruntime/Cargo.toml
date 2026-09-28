@@ -1,0 +1,14 @@
+[package]
+name = "libruntime"
+version = "0.1.0"
+authors = ["Chien Zhang (zqy0224@live.com)"]
+description = "Rust program runtime for eRhino"
+edition = "2024"
+
+[dependencies]
+libkernel = { path = "../libkernel" }
+libthread = { path = "../libthread" }
+libprocess = { path = "../libprocess" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+talc = "5.0"
+lock_api = "0.4"

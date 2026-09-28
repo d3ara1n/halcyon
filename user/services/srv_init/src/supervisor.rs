@@ -6,7 +6,7 @@ use super::*;
 use alloc::vec::Vec;
 use libexecution::runtime::{DriveState, TaskFailure};
 use libprocess::{Collector, job_driver::JobDriver};
-use rinlib::shared::time::Deadline;
+use libkernel::shared::time::Deadline;
 
 const ROOT_WAIT_TARGETS: usize = 6;
 const ROOT_JOB_SLOTS: usize = 2;
@@ -203,8 +203,8 @@ pub(super) struct RootSupervisor {
     idle: WaitSet,
     capabilities: Vec<CapabilityEntry>,
     capability_cursor: usize,
-    endpoint_cleanup: Cleanup<rinlib::ipc::tunnel::Endpoint>,
-    endpoint_create_cleanup: Cleanup<rinlib::ipc::tunnel::EndpointCleanup>,
+    endpoint_cleanup: Cleanup<libkernel::ipc::tunnel::Endpoint>,
+    endpoint_create_cleanup: Cleanup<libkernel::ipc::tunnel::EndpointCleanup>,
     capability_cleanup: Cleanup<Capability>,
     services: Option<Handle>,
     jobs: [Option<JobDuty>; ROOT_JOB_SLOTS],
@@ -214,6 +214,7 @@ pub(super) struct RootSupervisor {
     cursor: usize,
     failing: bool,
     reset_attempted: bool,
+    reset: Option<Handle>,
 }
 
 #[derive(Clone, Copy)]
@@ -272,9 +273,10 @@ where
 
 impl RootSupervisor {
     /// 必须在创建 services/启动任何子进程之前完成。
-    pub(super) fn prepare() -> Result<Self, SystemCallError> {
+    pub(super) fn prepare(reset: &mut Option<Handle>) -> Result<Self, SystemCallError> {
+        let idle = WaitSet::create(1)?;
         Ok(Self {
-            idle: WaitSet::create(1)?,
+            idle,
             capabilities: Vec::new(),
             capability_cursor: 0,
             endpoint_cleanup: Cleanup::empty(),
@@ -288,7 +290,12 @@ impl RootSupervisor {
             cursor: 0,
             failing: false,
             reset_attempted: false,
+            reset: reset.take(),
         })
+    }
+
+    pub(super) fn take_reset(&mut self) -> Handle {
+        self.reset.take().expect("root supervisor reset authority missing")
     }
     fn reserve_capabilities<const N: usize>(&mut self) -> Result<[usize; N], SystemCallError> {
         self.capabilities
@@ -362,8 +369,8 @@ impl RootSupervisor {
     }
     fn create_pair(
         &mut self,
-        create: impl FnOnce() -> Result<rinlib::shared::object::HandlePair, SystemCallError>,
-    ) -> Result<rinlib::shared::object::HandlePair, SystemCallError> {
+        create: impl FnOnce() -> Result<libkernel::shared::object::HandlePair, SystemCallError>,
+    ) -> Result<libkernel::shared::object::HandlePair, SystemCallError> {
         let slots: [usize; 2] = self.reserve_capabilities()?;
         match create() {
             Ok(pair) => {
@@ -408,7 +415,7 @@ impl RootSupervisor {
         &mut self,
         owner: Rights,
         sender: Rights,
-    ) -> Result<rinlib::shared::object::HandlePair, SystemCallError> {
+    ) -> Result<libkernel::shared::object::HandlePair, SystemCallError> {
         let pair = self.create_pair(|| create(owner, sender))?;
         let entry = self
             .capabilities
@@ -438,7 +445,7 @@ impl RootSupervisor {
         &mut self,
         owner: Rights,
         signaler: Rights,
-    ) -> Result<rinlib::shared::object::HandlePair, SystemCallError> {
+    ) -> Result<libkernel::shared::object::HandlePair, SystemCallError> {
         self.create_pair(|| notification::create(owner, signaler))
     }
     pub(super) fn sender(&self, handle: Handle) -> &MailboxSender {
@@ -670,8 +677,8 @@ impl RootSupervisor {
     }
     pub(super) fn retain_transport(
         &mut self,
-        endpoint: rinlib::ipc::tunnel::Endpoint,
-        invitation: rinlib::ipc::invitation::Invitation,
+        endpoint: libkernel::ipc::tunnel::Endpoint,
+        invitation: libkernel::ipc::invitation::Invitation,
     ) {
         assert!(
             self.endpoint_cleanup.owner.is_none(),
@@ -682,9 +689,9 @@ impl RootSupervisor {
     }
     pub(super) fn retain_failed_create(
         &mut self,
-        endpoint: Option<rinlib::ipc::tunnel::Endpoint>,
-        cleanup: Option<rinlib::ipc::tunnel::EndpointCleanup>,
-        invitation: Option<rinlib::ipc::invitation::Invitation>,
+        endpoint: Option<libkernel::ipc::tunnel::Endpoint>,
+        cleanup: Option<libkernel::ipc::tunnel::EndpointCleanup>,
+        invitation: Option<libkernel::ipc::invitation::Invitation>,
     ) {
         assert!(
             self.endpoint_cleanup.owner.is_none() && self.endpoint_create_cleanup.owner.is_none(),
@@ -833,7 +840,7 @@ impl RootSupervisor {
             }
         }
         self.verify_batch_handoff()?;
-        let now = rinlib::time::snapshot()
+        let now = libkernel::time::snapshot()
             .map_err(|_| "root isolation clock failed")?
             .now_ns;
         let duty = self.jobs[index]
@@ -1214,7 +1221,7 @@ impl RootSupervisor {
     }
 
     fn turn_and_wait(&mut self, awaited: Option<Await>) -> Result<(), SystemCallError> {
-        let now = rinlib::time::snapshot()?.now_ns;
+        let now = libkernel::time::snapshot()?.now_ns;
         // 五个运行体槽持续轮转；每轮各至多一个工作单位。
         for _ in 0..5 {
             let index = self.cursor;
@@ -1247,9 +1254,9 @@ impl RootSupervisor {
             }
         }
         self.endpoint_cleanup
-            .step(now, rinlib::ipc::tunnel::Endpoint::close);
+            .step(now, libkernel::ipc::tunnel::Endpoint::close);
         self.endpoint_create_cleanup
-            .step(now, rinlib::ipc::tunnel::EndpointCleanup::close);
+            .step(now, libkernel::ipc::tunnel::EndpointCleanup::close);
         self.capability_cleanup.step(now, Capability::close);
         if self.failing {
             for index in 0..ROOT_JOB_SLOTS {
@@ -1317,7 +1324,7 @@ impl RootSupervisor {
         {
             self.reset_attempted = true;
             debug!("failure-path services collection completed");
-            if let Some(reset) = env::startup_handle(initial::SYSTEM_RESET) {
+            if let Some(reset) = self.reset.take() {
                 match system::reset(reset, ResetAction::Shutdown, ResetReason::SystemFailure) {
                     Ok(never) => match never {},
                     Err(error) => debug!("failure shutdown rejected: {:?}", error),
@@ -1412,7 +1419,7 @@ impl RootSupervisor {
         if runnable || outcome {
             return Ok(());
         }
-        let result = rinlib::ipc::wait::wait_until(
+        let result = libkernel::ipc::wait::wait_until(
             &items[..count],
             deadline.map_or(Deadline::INFINITE, Deadline::at),
         )?;
@@ -1463,8 +1470,8 @@ impl RootSupervisor {
         loop {
             if let Err(error) = self.turn_and_wait(None) {
                 debug!("root supervisor infrastructure failure: {:?}", error);
-                if let Ok(now) = rinlib::time::snapshot() {
-                    let _ = rinlib::time::sleep_until(Deadline::at(later(now.now_ns)));
+                if let Ok(now) = libkernel::time::snapshot() {
+                    let _ = libkernel::time::sleep_until(Deadline::at(later(now.now_ns)));
                 }
             }
         }

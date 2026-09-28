@@ -1434,7 +1434,7 @@ impl<T, S: SourceOps> Drop for Runtime<T, S> {
 }
 
 #[cfg(target_arch = "riscv64")]
-impl<T> Runtime<T, rinlib::ipc::wait_set::WaitSet> {
+impl<T> Runtime<T, libkernel::ipc::wait_set::WaitSet> {
     /// 仅借出集合观察目标，不转移接收、登记或关闭权。
     pub fn wait_item(&self, cookie: u64) -> WaitItem {
         WaitItem::new(
@@ -1449,31 +1449,31 @@ impl<T> Runtime<T, rinlib::ipc::wait_set::WaitSet> {
 }
 
 #[cfg(target_arch = "riscv64")]
-impl SourceOps for rinlib::ipc::wait_set::WaitSet {
+impl SourceOps for libkernel::ipc::wait_set::WaitSet {
     fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError> {
-        rinlib::ipc::wait_set::WaitSet::register(self, item)
+        libkernel::ipc::wait_set::WaitSet::register(self, item)
     }
     fn rearm(&self, token: u64) -> Result<u64, SystemCallError> {
-        rinlib::ipc::wait_set::WaitSet::rearm(self, token)
+        libkernel::ipc::wait_set::WaitSet::rearm(self, token)
     }
     fn remove_source(&self, token: u64) -> Result<(), SystemCallError> {
-        rinlib::ipc::wait_set::WaitSet::remove(self, token)
+        libkernel::ipc::wait_set::WaitSet::remove(self, token)
     }
     fn receive_into(&self, records: &mut [ReadyRecord]) -> Result<usize, SystemCallError> {
-        rinlib::ipc::wait_set::WaitSet::receive_into(self, records)
+        libkernel::ipc::wait_set::WaitSet::receive_into(self, records)
     }
     fn wait(&self, deadline: Deadline) -> Result<(), SystemCallError> {
-        rinlib::ipc::wait_set::WaitSet::wait(self, deadline).map(|_| ())
+        libkernel::ipc::wait_set::WaitSet::wait(self, deadline).map(|_| ())
     }
     fn now_ns(&self) -> Result<u64, SystemCallError> {
-        rinlib::time::snapshot().map(|snapshot| snapshot.now_ns)
+        libkernel::time::snapshot().map(|snapshot| snapshot.now_ns)
     }
 }
 
 #[cfg(target_arch = "riscv64")]
-impl SourceSet for rinlib::ipc::wait_set::WaitSet {
+impl SourceSet for libkernel::ipc::wait_set::WaitSet {
     fn close_set(self) -> Result<(), (Self, SystemCallError)> {
-        rinlib::ipc::wait_set::WaitSet::close(self)
+        libkernel::ipc::wait_set::WaitSet::close(self)
     }
 }
 

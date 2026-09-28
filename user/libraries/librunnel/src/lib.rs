@@ -496,7 +496,7 @@ pub mod blocking {
         object::ObjectSignals,
         wait::{WaitReason, WaitResult},
     };
-    use rinlib::{ipc::tunnel::Endpoint, mm::Placement};
+    use libkernel::{ipc::tunnel::Endpoint, mm::Placement};
 
     struct Guest {
         endpoint: Option<Endpoint>,
@@ -593,16 +593,16 @@ pub mod blocking {
 
     #[derive(Debug)]
     pub enum AttachFailure {
-        Tunnel(rinlib::ipc::invitation::AttachFailure),
+        Tunnel(libkernel::ipc::invitation::AttachFailure),
         Protocol(InitFailure<Endpoint>),
     }
 
     #[derive(Debug)]
     pub enum CreateFailure {
-        Tunnel(rinlib::ipc::invitation::CreateFailure),
+        Tunnel(libkernel::ipc::invitation::CreateFailure),
         Protocol {
             endpoint: Endpoint,
-            invitation: rinlib::ipc::invitation::Invitation,
+            invitation: libkernel::ipc::invitation::Invitation,
             error: RunnelError,
         },
     }
@@ -634,9 +634,9 @@ pub mod blocking {
         pub fn create(
             bytes: usize,
             placement: Placement,
-        ) -> Result<(Self, rinlib::ipc::invitation::Invitation), CreateFailure> {
+        ) -> Result<(Self, libkernel::ipc::invitation::Invitation), CreateFailure> {
             let (endpoint, invitation) =
-                rinlib::ipc::invitation::Invitation::create(bytes, placement)
+                libkernel::ipc::invitation::Invitation::create(bytes, placement)
                     .map_err(CreateFailure::Tunnel)?;
             match producer(endpoint, true) {
                 Ok(producer) => Ok((producer, invitation)),
@@ -648,7 +648,7 @@ pub mod blocking {
             }
         }
         pub fn attach(
-            invitation: rinlib::ipc::invitation::Invitation,
+            invitation: libkernel::ipc::invitation::Invitation,
             placement: Placement,
         ) -> Result<Self, AttachFailure> {
             let endpoint = invitation
@@ -729,9 +729,9 @@ pub mod blocking {
         pub fn create(
             bytes: usize,
             placement: Placement,
-        ) -> Result<(Self, rinlib::ipc::invitation::Invitation), CreateFailure> {
+        ) -> Result<(Self, libkernel::ipc::invitation::Invitation), CreateFailure> {
             let (endpoint, invitation) =
-                rinlib::ipc::invitation::Invitation::create(bytes, placement)
+                libkernel::ipc::invitation::Invitation::create(bytes, placement)
                     .map_err(CreateFailure::Tunnel)?;
             match consumer(endpoint, true) {
                 Ok(consumer) => Ok((consumer, invitation)),
@@ -743,7 +743,7 @@ pub mod blocking {
             }
         }
         pub fn attach(
-            invitation: rinlib::ipc::invitation::Invitation,
+            invitation: libkernel::ipc::invitation::Invitation,
             placement: Placement,
         ) -> Result<Self, AttachFailure> {
             let endpoint = invitation

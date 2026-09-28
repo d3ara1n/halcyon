@@ -10,6 +10,12 @@
 //! 的用户态政策，init 保留直接收束权作兜底。
 
 #![no_std]
+#![no_main]
+
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use libbudget::Budget;
 use libexecution::{
@@ -22,8 +28,7 @@ use libexecution::{
 use libprocess::job_driver::JobDriver;
 use libprocess::{DEFAULT_SUPERVISION_POLICY, JobCollector};
 use librunnel::blocking;
-use rinlib::{
-    env,
+use libkernel::{
     ipc::{
         invitation::Invitation,
         message::{MailboxSender, MessageStorage, ReceiveBuffer},
@@ -305,7 +310,7 @@ impl Task<PmWorld> for MailboxTask {
 struct StreamTask {
     invitation: Option<Invitation>,
     producer: Option<blocking::Producer>,
-    cancelled_invitation: Option<rinlib::ipc::capability::Capability>,
+    cancelled_invitation: Option<libkernel::ipc::capability::Capability>,
     removing: bool,
     source: Option<SourceId>,
     source_failed: Option<SystemCallError>,
@@ -366,7 +371,7 @@ impl Task<PmWorld> for StreamTask {
                 .invitation
                 .take()
                 .expect("stream task lost its invitation");
-            match blocking::Producer::attach(invitation, rinlib::mm::Placement::Anywhere) {
+            match blocking::Producer::attach(invitation, libkernel::mm::Placement::Anywhere) {
                 Ok(producer) => {
                     self.producer = Some(producer);
                     debug!("tunnel attached");
@@ -526,8 +531,8 @@ impl Task<PmWorld> for StreamTask {
 /// 流控任务：填满目标邮箱、确认后在 WRITABLE 上停驻，腾位唤醒补发末尾。
 struct FlowTask {
     target: MailboxSender,
-    done: Option<rinlib::ipc::capability::Capability>,
-    spin: Option<rinlib::ipc::capability::Capability>,
+    done: Option<libkernel::ipc::capability::Capability>,
+    spin: Option<libkernel::ipc::capability::Capability>,
     filled: usize,
     verified_full: bool,
     woke: bool,
@@ -740,7 +745,7 @@ impl Task<PmWorld> for DomainTask {
     ) -> Result<Advance, SystemCallError> {
         if self.closing {
             // SAFETY: domain 是启动委托的唯一 control；Job 机器已完成且观察已注销。
-            unsafe { rinlib::ipc::object::close(world.domain) }?;
+            unsafe { libkernel::ipc::object::close(world.domain) }?;
             world.domain_done = true;
             debug!("pm: delegated domain managed");
             return Ok(Advance {
@@ -865,12 +870,12 @@ impl Task<PmWorld> for PmTask {
     }
 }
 
-fn main() {
+fn app_main() {
     debug!("Hello, pm!");
     // 服务出生自带的邮箱 owner（StartupBlock Handle[0]）。
-    let mailbox = env::startup_handle(0).expect("pm: mailbox owner grant is missing");
+    let mailbox = libruntime::startup::startup_handle(0).expect("pm: mailbox owner grant is missing");
     // StartupBlock Handle[1] = init 授出的 pm_domain JobControl。
-    let domain = env::startup_handle(1).expect("pm: delegated domain control is missing");
+    let domain = libruntime::startup::startup_handle(1).expect("pm: delegated domain control is missing");
 
     // 执行核心：任务与输入额度在公开前准备。
     let budget = Budget::new(&[16, 64 * 1024], 1).expect("pm: budget");
@@ -926,7 +931,7 @@ fn main() {
                 if world.domain_done && !stopping {
                     continue;
                 }
-                if let Err(error) = rinlib::ipc::wait::wait_until(&[runtime.wait_item(0)], deadline)
+                if let Err(error) = libkernel::ipc::wait::wait_until(&[runtime.wait_item(0)], deadline)
                 {
                     debug!("pm: runtime wait failed: {:?}", error);
                     exit_failed();
@@ -961,3 +966,5 @@ fn main() {
 fn exit_failed() -> ! {
     unsafe { sys_process_abort() }
 }
+
+libruntime::entry!(app_main);

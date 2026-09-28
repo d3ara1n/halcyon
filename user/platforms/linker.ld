@@ -1,5 +1,5 @@
 OUTPUT_ARCH("riscv")
-ENTRY(main)
+ENTRY(_start)
 
 SECTIONS
 {
@@ -18,6 +18,7 @@ SECTIONS
   .data : {
     *(.sdata .sdata.*)
     *(.data .data.*)
+    PROVIDE(__global_pointer$ = . + 0x800);
   }
 
   . = ALIGN(4096);

@@ -17,7 +17,7 @@ use erhino_shared::{
 use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceId, SourceKind, Step, Task,
 };
-use rinlib::{ipc::object::close, process};
+use libkernel::{ipc::object::close, process};
 
 pub trait ProcessOperations: Clone + core::fmt::Debug {
     /// 期限到达时的最终非阻塞检查，遵循内核 ready 优先于 timeout 的裁决。
@@ -49,7 +49,7 @@ impl ProcessOperations for RealProcessOperations {
     ) -> Result<ObservationResult, SystemCallError> {
         use erhino_shared::wait::{WaitItem, WaitReason};
         let result =
-            rinlib::ipc::wait::wait_until(&[WaitItem::new(control, signals, 0)], Deadline::at(0))?;
+            libkernel::ipc::wait::wait_until(&[WaitItem::new(control, signals, 0)], Deadline::at(0))?;
         Ok(
             if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
                 ObservationResult::TimedOut

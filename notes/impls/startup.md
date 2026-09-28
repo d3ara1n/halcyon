@@ -24,13 +24,13 @@
 
 Header 保存 magic、version、块长、pid、parent_pid、Handle 数、descriptor offset/length、payload offset/length 与 reserved。几何要求 Handle 数组、descriptor 与 payload 依序落在块内，空隙全零；descriptor 的 control_index 必须小于 handle_count，reserved 为零，栈区间无溢出且 usable 落在 reservation 内。Handle 数组保存目标进程 HandleTable 的真实句柄值（由 ProcessGrant 或 Building ThreadCreate 输出），不从 index 推导 slot/generation。普通 launcher 只写一次包含 Control 的完整块。
 
-**`parent_pid` 语义**：描述**目标进程**的创建关系，因此是**组装者自身的 pid**（= 目标的创建者，与内核 ProcessQuery 快照的 parent_pid 同一真值），不是组装者的父。组装者在构造出生块时必须传 `rinlib::env::pid()`——传 `env::parent_pid()` 会错位一代（init parent 0 spawn 服务时出生块里会是 0 而非 1）。当前无消费方（潜伏字段），但不能靠「没人读」放任语义错误。
+**`parent_pid` 语义**：描述**目标进程**的创建关系，因此是**组装者自身的 pid**（= 目标的创建者，与内核 ProcessQuery 快照的 parent_pid 同一真值），不是组装者的父。组装者在构造出生块时必须传 `libruntime::startup::pid()`——传 `env::parent_pid()` 会错位一代（init parent 0 spawn 服务时出生块里会是 0 而非 1）。当前无消费方（潜伏字段），但不能靠「没人读」放任语义错误。
 
-接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（rinlib `env::init` 沿用 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl、Handle[1] primordial SystemReset、Handle[2] init ProcessControl、Handle[3] root MemoryPool、Handle[4] 入口 ThreadControl；索引由 `shared::startup::initial` 定义，descriptor 显式引用第 4 项。内部 PoolBinding 与 Handle[3] 指向同一个 root core，不复制额度。普通进程先排列显式 grants，Building ThreadCreate 的 child-local Control 追加到同一数组并由 descriptor 引用；其余 slot 含义由具体启动协议定义，不属于通用线格式。
+接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（libruntime `startup::init` 沿用 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl、Handle[1] primordial SystemReset、Handle[2] init ProcessControl、Handle[3] root MemoryPool、Handle[4] 入口 ThreadControl；索引由 `shared::startup::initial` 定义，descriptor 显式引用第 4 项。内部 PoolBinding 与 Handle[3] 指向同一个 root core，不复制额度。普通进程先排列显式 grants，Building ThreadCreate 的 child-local Control 追加到同一数组并由 descriptor 引用；其余 slot 含义由具体启动协议定义，不属于通用线格式。
 
 ## 组装 ABI（Building 期外部通道）
 
-`shared/erhino_shared/src/proc.rs` 与 `shared/erhino_shared/src/call.rs` 定义 fixed-width ABI，rinlib 封装位于 `user/rinlib/src/process.rs`：
+`shared/erhino_shared/src/proc.rs` 与 `shared/erhino_shared/src/call.rs` 定义 fixed-width ABI，`libkernel` 封装位于 `user/libraries/libkernel/src/process.rs`：
 
 - JobControl `CREATE`：JobCreate、ProcessCreate；
 - JobControl `MANAGE`：JobSeal、JobDerive；`READ`：JobQuery、JobEnumerate；
@@ -63,9 +63,9 @@ initial ELF 与 prefix 完成后，package 前缀 owner 首次回投帧池；pay
 
 ## 用户态公共 loader
 
-`shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/libraries/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 映射按最终长度计算的出生区 → Building ThreadCreate → 将 child-local Control 追加 grants → 单次 Write 完整出生块 → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 rinlib `abandon_to_completion` 执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
+`shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/libraries/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 复制 GRANT-only authority并依次驱动 Create → BindMemory → 分块 ProcessMap/ProcessWrite → Grant → 映射按最终长度计算的出生区 → Building ThreadCreate → 将 child-local Control 追加 grants → 单次 Write 完整出生块 → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 `libprocess` 的 drain/close 收束链执行 builder close → ProcessDrain → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
 
-当前 `libprocess::map_birth_block`（`user/libraries/libprocess/src/lib.rs`）使用 READ|WRITE 映射出生块，ThreadCreate 后一次填充；`rinlib::env` 以静态视图解释它并按索引返回 raw Handle，尚未一次领取。内核 `AddressSpace::write_building`（`os/kernel/src/task/proc.rs`）不要求目标最终 PTE 可写，因此未来可直接映射为 READ 再填充，不需要新增装载调用。目标的统一只读/进程寿命映像、StartupSeed 与 InitialGrants 见 [bootstrap 接收契约](../ideas/bootstrap.md#用户态接收与一次性交接)，差距由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 承接，当前代码尚未迁移。
+当前 `libprocess::map_birth_block`（`user/libraries/libprocess/src/lib.rs`）使用 READ|WRITE 映射出生块，ThreadCreate 后一次填充；`libprocess::context::StartupContext` 在 `libruntime` 入口完成 StartupBlock 校验后的 grants 一次采用，并按索引保有 Capability owner。入口 descriptor 的 Control 被转给 `libthread::ThreadRegistry`，普通 grant 由 runtime startup API 显式转交。内核 `AddressSpace::write_building`（`os/kernel/src/task/proc.rs`）不要求目标最终 PTE 可写，因此保持现有 Building 写入契约。统一只读/进程寿命映像及 owner 责任见 [bootstrap 接收契约](../ideas/bootstrap.md#启动映像的寿命)，本轮迁移已通过完整 acceptance。
 
 ## init/pm 当前政策
 

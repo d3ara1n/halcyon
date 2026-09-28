@@ -7,6 +7,12 @@
 //! 自灭（Suicide/Fault）或高频 park，与锤的 kill 同刻起跑。
 
 #![no_std]
+#![no_main]
+
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,8 +24,7 @@ use libprocess::race::{
     TARGET_LAST_THREAD_EXIT_RACE, TARGET_MEMORY_CHURN, TARGET_PARK, TARGET_SUICIDE,
     TARGET_THREAD_SPAWN_RACE, TARGET_THREAD_SUITE, TARGET_TUNNEL_EXIT,
 };
-use rinlib::{
-    env,
+use libkernel::{
     ipc::{
         message::{send_raw, wait_message},
         notification,
@@ -40,11 +45,12 @@ use rinlib::{
         },
         wait::WaitItem,
     },
-    sys_process_terminate, sys_sleep, thread,
+    sys_process_terminate, sys_sleep,
 };
+use libthread as thread;
 
-fn main() {
-    let Some(words) = race::decode_payload(env::startup_payload()) else {
+fn app_main() {
+    let Some(words) = race::decode_payload(libruntime::startup::startup_payload()) else {
         debug!("hammer: invalid payload");
         return;
     };
@@ -64,9 +70,9 @@ fn await_gun(gun: Handle) {
 
 fn hammer_mode() {
     let (Some(cmd_box), Some(report_box), Some(gun)) = (
-        env::startup_handle(HAMMER_CMD),
-        env::startup_handle(HAMMER_REPORT),
-        env::startup_handle(HAMMER_GUN),
+        libruntime::startup::startup_handle(HAMMER_CMD),
+        libruntime::startup::startup_handle(HAMMER_REPORT),
+        libruntime::startup::startup_handle(HAMMER_GUN),
     ) else {
         debug!("hammer: missing grants");
         return;
@@ -122,7 +128,7 @@ fn hammer_mode() {
 
 fn execute(
     cmd: &Cmd,
-    handles: &mut rinlib::ipc::capability::HandleSet,
+    handles: &mut libkernel::ipc::capability::HandleSet,
 ) -> (Report, alloc::vec::Vec<u64>) {
     if handles.len() != 1 {
         return done::<()>(Err(SystemCallError::IllegalArgument));
@@ -291,7 +297,7 @@ fn enumerate(control: Handle) -> (Report, alloc::vec::Vec<u64>) {
 }
 
 fn target_mode(words: &[u64]) {
-    let Some(gun) = env::startup_handle(TARGET_GUN) else {
+    let Some(gun) = libruntime::startup::startup_handle(TARGET_GUN) else {
         debug!("hammer target: missing gun");
         return;
     };
@@ -325,7 +331,7 @@ fn target_mode(words: &[u64]) {
         TARGET_GUARD_FAULT => guard_fault(),
         TARGET_THREAD_SUITE => {
             thread_suite();
-            unsafe { rinlib::sys_thread_exit() }
+            unsafe { libkernel::sys_thread_exit() }
         }
         TARGET_PARK => loop {
             // SAFETY: 值参数；高频 park 供 kill 取消线竞速。
@@ -370,7 +376,7 @@ const TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
 
 fn tunnel_exit_target(gun: Handle) -> ! {
     let invitation =
-        env::startup_handle(TARGET_INVITATION).expect("Tunnel exit target missing invitation");
+        libruntime::startup::startup_handle(TARGET_INVITATION).expect("Tunnel exit target missing invitation");
     let endpoint = unsafe { tunnel::attach(invitation, Placement::Anywhere) }
         .expect("Tunnel exit target attach failed");
     let shared = endpoint.memory();
@@ -387,7 +393,7 @@ fn tunnel_exit_target(gun: Handle) -> ! {
     }
     await_gun(gun);
     // Endpoint remains live in the process table; ProcessDrain must close its mapping lease.
-    unsafe { rinlib::sys_thread_exit() }
+    unsafe { libkernel::sys_thread_exit() }
 }
 
 type RawThreadEntry = extern "C" fn(usize, usize) -> !;
@@ -457,7 +463,7 @@ extern "C" fn last_thread_exit_entry(gun: usize, _token: usize) -> ! {
     // SAFETY: 值参数；sleep 后仍由 Notification 电平保存发令。
     unsafe { sys_sleep(20).expect("last secondary setup sleep failed") };
     await_gun(Handle::from_raw(gun as u64));
-    unsafe { rinlib::sys_thread_exit() }
+    unsafe { libkernel::sys_thread_exit() }
 }
 
 fn last_thread_exit_target(gun: Handle, token: u64) -> ! {
@@ -476,7 +482,7 @@ fn last_thread_exit_target(gun: Handle, token: u64) -> ! {
     unsafe { close(result.control) }.expect("last-thread ThreadControl close failed");
     // raw stack mapping stays owned by this process address space until process drain.
     debug!("hammer target: last secondary thread ready");
-    unsafe { rinlib::sys_thread_exit() }
+    unsafe { libkernel::sys_thread_exit() }
 }
 
 struct DropMarker(Arc<AtomicBool>);
@@ -527,11 +533,11 @@ extern "C" fn storm_thread_entry(gate: usize, _unused: usize) -> ! {
         thread::yield_now().expect("storm worker yield failed");
     }
     gate.exiting.fetch_add(1, Ordering::Release);
-    unsafe { rinlib::sys_thread_exit() }
+    unsafe { libkernel::sys_thread_exit() }
 }
 
 extern "C" fn probe_thread_entry(_arg1: usize, _arg2: usize) -> ! {
-    unsafe { rinlib::sys_thread_exit() }
+    unsafe { libkernel::sys_thread_exit() }
 }
 
 fn raw_thread_storm() {
@@ -1052,3 +1058,5 @@ fn guard_fault() {
     let _ = unsafe { core::ptr::read_volatile(guard as *const u64) };
     core::hint::black_box(region);
 }
+
+libruntime::entry!(app_main);

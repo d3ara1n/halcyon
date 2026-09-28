@@ -8,11 +8,17 @@
 //! 3. fcsr 舍入模式（RTZ）跨 syscall 保持——fcsr 同属 UserContext。
 
 #![no_std]
+#![no_main]
+
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 use core::arch::asm;
 use core::hint::black_box;
 
-use rinlib::{debug, sys_sleep};
+use libkernel::{debug, sys_sleep};
 
 /// f64 位型常量（IEEE 754 binary64，LP64D 硬件结果）。
 const SQRT2: u64 = 0x3FF6_A09E_667F_3BCD;
@@ -21,7 +27,7 @@ const THIRTEEN: u64 = 0x402A_0000_0000_0000;
 const PROBE_F30: u64 = 0x0000_0000_DEAD_BEEF;
 const PROBE_F31: u64 = 0x7FF8_0000_C0FF_EE01;
 
-fn main() {
+fn app_main() {
     debug!("FP verification test started (D64 profile)");
 
     for round in 1..=4u64 {
@@ -163,3 +169,5 @@ fn expect(condition: bool, round: u64, what: &str) {
         panic!("fp verification failed at round {round}: {what}");
     }
 }
+
+libruntime::entry!(app_main);

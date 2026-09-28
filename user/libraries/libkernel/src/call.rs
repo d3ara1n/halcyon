@@ -450,10 +450,17 @@ pub unsafe fn sys_process_grant(
     .map(|_| ())
 }
 
+/// # Safety
+///
+/// `control` must be a live ThreadControl entry with MANAGE authority owned
+/// by the caller.
 pub unsafe fn sys_thread_start(control: Handle) -> SystemCallResult<()> {
     sys_call(SystemCall::ThreadStart, control.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
+/// # Safety
+///
+/// The caller must be executing in a live user thread.
 pub unsafe fn sys_thread_yield() -> SystemCallResult<()> {
     sys_call(SystemCall::ThreadYield, 0, 0, 0, 0).map(|_| ())
 }

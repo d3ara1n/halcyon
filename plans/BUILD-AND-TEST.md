@@ -6,7 +6,7 @@
 
 - 开发机为 macOS，系统工具为 Homebrew 的 `just`、`dtc`、`qemu`、`riscv64-elf-binutils`、`riscv64-elf-gdb`；系统级安装由用户执行。
 - Rust edition 2024，工具链由根目录 `rust-toolchain` 选择；当前内容是浮动 `nightly`，并未固定日期。取证或比较代码生成时记录实际 rustc 版本。
-- 内核、共享库、用户态分别属于 `os/`、`shared/`、`user/` 三个 workspace，以 path 依赖连接。内核 target 为 `os/riscv64imac-unknown-erhino.json`，用户态默认 target 为 `user/rinlib/riscv64imac-unknown-erhino-elf.json`，均使用 build-std；浮点验收 `test_fp` 使用独立 gc target。
+- 内核、共享库、用户态分别属于 `os/`、`shared/`、`user/` 三个 workspace，以 path 依赖连接。内核 target 为 `os/riscv64imac-unknown-erhino.json`，用户态默认 target 为 `user/platforms/riscv64imac-unknown-erhino-elf.json`，均使用 build-std；浮点验收 `test_fp` 使用独立 gc target。
 - **统一走 `just`，不裸跑 `cargo build`**。内核链接器 `riscv64-elf-ld` 和链接脚本由构建入口配置，用户态由自定义 target 与 build-std 提供运行环境。
 - 内核 package、默认 binary target 和产物名统一为 `kernel`；本文命令与构建入口以此为准。
 - initfs 使用 tar 时避免 bsdtar 的 `._` AppleDouble 文件混入归档。

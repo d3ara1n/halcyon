@@ -7,7 +7,7 @@ use libfal::{
     protocol::{self, Expected, Request, ResolvePolicy, Response, Status},
 };
 use librunnel::blocking::{self, Consumer, Producer};
-use rinlib::{
+use libkernel::{
     ipc::{
         capability::Capability,
         invitation::{Invitation, InvitationFailure},
@@ -39,7 +39,7 @@ struct OpenTarget<'a> {
 
 pub struct Transport {
     client: Client,
-    deadline: rinlib::time::Deadline,
+    deadline: libkernel::time::Deadline,
 }
 
 enum StreamRole {
@@ -201,7 +201,7 @@ impl Stream {
     fn read_until(
         &mut self,
         buffer: &mut [u8],
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<usize, librunnel::IoError> {
         match self.role.as_mut() {
             Some(StreamRole::Reader(role)) => role.read_exact_or_eof_until(buffer, deadline),
@@ -215,7 +215,7 @@ impl Stream {
     pub fn write_until(
         &mut self,
         bytes: &[u8],
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<(), librunnel::IoError> {
         match self.role.as_mut() {
             Some(StreamRole::Writer(role)) => role.write_all_until(bytes, deadline),
@@ -240,7 +240,7 @@ impl Stream {
         &self,
         client: &mut Client,
         request: &Request<'_>,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
         self.control_call_cancelable(client, request, deadline, None)
     }
@@ -249,7 +249,7 @@ impl Stream {
         &self,
         client: &mut Client,
         request: &Request<'_>,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
         cancel: Option<erhino_shared::object::Handle>,
     ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
         let control = self
@@ -308,7 +308,7 @@ impl Stream {
 }
 
 impl Transport {
-    pub const fn new(deadline: rinlib::time::Deadline) -> Self {
+    pub const fn new(deadline: libkernel::time::Deadline) -> Self {
         Self {
             client: Client::new(),
             deadline,
@@ -317,8 +317,8 @@ impl Transport {
 
     fn call_deadline(
         &self,
-        session: rinlib::time::Deadline,
-    ) -> Result<rinlib::time::Deadline, libfal::client::ClientError> {
+        session: libkernel::time::Deadline,
+    ) -> Result<libkernel::time::Deadline, libfal::client::ClientError> {
         let session_end = session
             .instant()
             .map_err(|_| libfal::client::ClientError::Protocol)?
@@ -328,10 +328,10 @@ impl Transport {
             .instant()
             .map_err(|_| libfal::client::ClientError::Protocol)?
             .unwrap_or(u64::MAX);
-        let now = rinlib::time::Instant::now()
+        let now = libkernel::time::Instant::now()
             .map_err(libfal::client::ClientError::System)?
             .as_nanos();
-        Ok(rinlib::time::Deadline::at(
+        Ok(libkernel::time::Deadline::at(
             session_end
                 .min(own_end)
                 .min(now.saturating_add(5_000_000_000)),
@@ -345,7 +345,7 @@ impl Transport {
         direction: protocol::StreamDirection,
         offset: u64,
         length: Option<u64>,
-        session_deadline: rinlib::time::Deadline,
+        session_deadline: libkernel::time::Deadline,
     ) -> Result<Stream, StreamOpenFailure> {
         self.open_stream_with_cancel(position, direction, offset, length, session_deadline, None)
     }
@@ -357,7 +357,7 @@ impl Transport {
         direction: protocol::StreamDirection,
         offset: u64,
         length: Option<u64>,
-        session_deadline: rinlib::time::Deadline,
+        session_deadline: libkernel::time::Deadline,
         cancel: Option<erhino_shared::object::Handle>,
     ) -> Result<Stream, StreamOpenFailure> {
         if position.info.kind != NodeKind::Stream {
@@ -389,7 +389,7 @@ impl Transport {
         direction: protocol::StreamDirection,
         offset: u64,
         length: Option<u64>,
-        session_deadline: rinlib::time::Deadline,
+        session_deadline: libkernel::time::Deadline,
     ) -> Result<Stream, StreamOpenFailure> {
         let deadline = self
             .call_deadline(session_deadline)
@@ -472,7 +472,7 @@ impl Transport {
             Err(failure) => {
                 let failure = match failure {
                     blocking::AttachFailure::Tunnel(
-                        rinlib::ipc::invitation::AttachFailure::Unconsumed { invitation, error },
+                        libkernel::ipc::invitation::AttachFailure::Unconsumed { invitation, error },
                     ) => AttachOwners {
                         error: AttachError::System(error),
                         invitation: Some(invitation),
@@ -480,7 +480,7 @@ impl Transport {
                         cleanup: None,
                     },
                     blocking::AttachFailure::Tunnel(
-                        rinlib::ipc::invitation::AttachFailure::Consumed { cleanup, error },
+                        libkernel::ipc::invitation::AttachFailure::Consumed { cleanup, error },
                     ) => AttachOwners {
                         error: AttachError::System(error),
                         invitation: None,
@@ -506,7 +506,7 @@ impl Transport {
             offer,
         };
         loop {
-            let now = match rinlib::time::Instant::now() {
+            let now = match libkernel::time::Instant::now() {
                 Ok(now) => now,
                 Err(error) => {
                     return Err(StreamOpenFailure::Start {
@@ -568,7 +568,7 @@ impl Transport {
     pub fn query_stream(
         &mut self,
         stream: &Stream,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
         stream.control_call(&mut self.client, &Request::QueryStream, deadline)
     }
@@ -577,7 +577,7 @@ impl Transport {
         &mut self,
         stream: &mut Stream,
         buffer: &mut [u8],
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<usize, StreamReadFailure> {
         if buffer.is_empty() {
             return Err(StreamReadFailure::EmptyBuffer);
@@ -600,7 +600,7 @@ impl Transport {
     pub fn finish_stream(
         &mut self,
         stream: &Stream,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
         stream.control_call(&mut self.client, &Request::FinishStream, deadline)
     }
@@ -608,7 +608,7 @@ impl Transport {
     fn finish_stream_cancelable(
         &mut self,
         stream: &Stream,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
         cancel: Option<erhino_shared::object::Handle>,
     ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
         stream.control_call_cancelable(&mut self.client, &Request::FinishStream, deadline, cancel)
@@ -617,7 +617,7 @@ impl Transport {
     pub fn cancel_stream(
         &mut self,
         stream: &Stream,
-        deadline: rinlib::time::Deadline,
+        deadline: libkernel::time::Deadline,
     ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
         stream.control_call(&mut self.client, &Request::CancelStream, deadline)
     }

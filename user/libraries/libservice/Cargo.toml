@@ -19,4 +19,4 @@ monotonic_id = { path = "../../../shared/monotonic_id" }
 libfal = { path = "../libfal", features = ["test-support"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-rinlib = { path = "../../rinlib" }
+libkernel = { path = "../libkernel" }

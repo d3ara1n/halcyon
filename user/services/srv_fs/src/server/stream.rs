@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use librunnel::blocking;
 use metadata_admission::{Counter, Permit};
 use ordered_table::{InsertError, OrderedTable, PreparedEntry};
-use rinlib::{
+use libkernel::{
     ipc::{
         invitation::Invitation,
         tunnel::{Endpoint, EndpointCleanup},
@@ -256,7 +256,7 @@ impl StreamTask {
         {
             return Err(protocol::Status::Unsupported);
         }
-        let now = rinlib::time::Instant::now()
+        let now = libkernel::time::Instant::now()
             .map_err(|_| protocol::Status::Internal)?
             .as_nanos();
         let session = args
@@ -423,7 +423,7 @@ impl StreamTask {
                 Ok(())
             }
             Err(librunnel::blocking::CreateFailure::Tunnel(
-                rinlib::ipc::invitation::CreateFailure::Published {
+                libkernel::ipc::invitation::CreateFailure::Published {
                     endpoint,
                     cleanup,
                     invitation,
@@ -445,7 +445,7 @@ impl StreamTask {
                 Err(protocol::Status::Internal)
             }
             Err(librunnel::blocking::CreateFailure::Tunnel(
-                rinlib::ipc::invitation::CreateFailure::System(error),
+                libkernel::ipc::invitation::CreateFailure::System(error),
             )) => Err(stream_status(error)),
         }
     }
@@ -841,7 +841,7 @@ impl StreamTask {
             && let Err((role, _)) = role.close()
         {
             entry.role = Some(role);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -851,7 +851,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.close()
         {
             entry.failed_endpoint = Some(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -861,7 +861,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.close()
         {
             entry.failed_cleanup = Some(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -905,7 +905,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.close()
         {
             self.returned.push(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -927,7 +927,7 @@ impl StreamTask {
             && let Err((role, _)) = role.close()
         {
             entry.role = Some(role);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -937,7 +937,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.close()
         {
             entry.failed_endpoint = Some(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -947,7 +947,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.close()
         {
             entry.failed_cleanup = Some(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -957,7 +957,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.into_capability().close()
         {
             self.returned.push(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -967,7 +967,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.into_capability().close()
         {
             self.returned.push(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -977,7 +977,7 @@ impl StreamTask {
             && let Err((owner, _)) = owner.close()
         {
             entry.lifetime = Some(owner);
-            self.retry_deadline = rinlib::time::timeout_millis(10).ok();
+            self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
                 step: Step::Parked,

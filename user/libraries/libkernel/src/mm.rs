@@ -30,6 +30,40 @@ pub struct UnmapRemainder {
 }
 
 impl MappedRegion {
+    /// Rebuild a region owner for a mapping whose reservation was supplied by
+    /// the process startup contract.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that the ranges describe a live, ordinary mapping
+    /// exclusively owned by this value and that no other owner will unmap it.
+    pub unsafe fn from_reservation(
+        reservation_start: usize,
+        reservation_len: usize,
+        usable_start: usize,
+        usable_len: usize,
+    ) -> Result<Self, SystemCallError> {
+        let reservation_end = reservation_start
+            .checked_add(reservation_len)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        let usable_end = usable_start
+            .checked_add(usable_len)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        let reservation = reservation_start..reservation_end;
+        let usable = usable_start..usable_end;
+        if !valid_page_range(&reservation)
+            || !valid_page_range(&usable)
+            || usable.start < reservation.start
+            || usable.end > reservation.end
+        {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        Ok(Self {
+            reservation,
+            usable: Some(usable),
+        })
+    }
+
     pub fn map_anonymous(
         bytes: usize,
         guard_before: usize,

@@ -17,7 +17,7 @@ use erhino_shared::{
 use libbudget::{AccountView, Charge};
 use metadata_admission::{Counter, Permit};
 use ordered_table::{OrderedTable, PreparedEntry};
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MintedSender},
 };
@@ -125,7 +125,7 @@ impl GrantTable {
         if limit == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let mailbox_id = rinlib::ipc::object::query(mailbox.as_handle())?.object_id;
+        let mailbox_id = libkernel::ipc::object::query(mailbox.as_handle())?.object_id;
         Ok(Self {
             grants: ManuallyDrop::new(OrderedTable::new(limit)),
             slots: Arc::try_new(Counter::new(limit)).map_err(|_| SystemCallError::OutOfMemory)?,

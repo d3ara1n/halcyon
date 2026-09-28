@@ -6,19 +6,19 @@
     "eh-frame-header": false,
     "emit-debug-gdb-scripts": true,
     "features": "+m,+a,+c",
-    "linker": "rust-lld",
-    "linker-flavor": "ld.lld",
+    "linker": "riscv64-elf-ld",
+    "linker-flavor": "ld",
     "llvm-abiname": "lp64",
-    "llvm-target": "riscv64",
+    "llvm-target": "riscv64-unknown-none-elf",
     "max-atomic-width": 64,
     "panic-strategy": "abort",
     "relocation-model": "static",
     "target-pointer-width": 64,
-    "os": "erhino",
+    "os": "none",
     "pre-link-args": {
-      "ld.lld": [
+      "ld": [
         "-T",
-        "rinlib/linker.ld"
+        "platforms/linker.ld"
       ]
     }
 }

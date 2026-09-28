@@ -1,31 +1,28 @@
 # 用户态框架分层实现
 
-当前实现尚未完成目标分层。`user/rinlib` 同时承载 RISC-V `ecall` 入口、系统调用包装、内核对象/Handle/IPC/内存/等待安全封装，以及 Rust `lang_start`、全局 allocator、panic/OOM 和退出处理。公共库中的多个 riscv64 代码路径因此直接依赖 `rinlib`；`libprocess` 还无条件依赖它并读取 `rinlib::env::pid()`。目标拆入 libkernel、libthread 和 libruntime，并细化 libprocess 的 context/management 边界；当前代码继续使用旧名称，直到迁移完成。
+当前实现已完成本次运行时分层迁移。`libkernel` 拥有 RV64 ecall、错误解码、内核对象/IPC/MM/process 原语和安全资源 owner；`libthread` 拥有 `ResultCell`、固定容量 `ThreadRegistry`、线程工厂、trampoline 与协作式 reap；`libruntime` 拥有 `_start`、gp 初始化、全局 allocator、panic/OOM 处理、入口线程接管和应用入口交接。`libprocess::context` 持有 StartupBlock 的一次采用与初始 capability owner。
 
-目标结构由 [`../ideas/framework.md`](../ideas/framework.md) 拥有，迁移范围、顺序和施工门由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 拥有。目标 runtime 可以单向组合进程上下文、线程与内核资源库；当前尚无 libkernel/libthread/libruntime、context 功能拆分、显式 entry! 或新线程环境契约，不能按目标结构描述实际代码。
+目标结构由 [`../ideas/framework.md`](../ideas/framework.md) 拥有，迁移范围、验证证据和历史取舍由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 拥有。普通库只依赖知识 owner，不依赖 `libruntime`；用户程序显式链接 `libruntime`，由 `_start` 先完成运行时准备，再进入 runtime 生成的应用桥接。应用源码只写 `libruntime::entry!(app_main)`，不直接命名 ABI 符号。
 
 ## 当前职责分布
 
-- `shared/erhino_shared` 拥有调用号、固定宽 ABI、对象角色、rights、请求/结果布局和共享校验；没有 ecall 汇编。
-- `rinlib::call` 拥有当前唯一用户态 ecall stub、错误解码和 syscall wrappers。
-- `rinlib::ipc`、`mm`、`process`、`memory_object`、`memory_pool`、`thread`、`time`、`system` 混合提供内核资源包装和用户态高层组合。
-- `rinlib::rt` 私有，仅在 RV64 启用，拥有 lang start、allocator、panic/OOM 和 main 终止；它调用同 crate 的当前资源包装。
-- `rinlib::env` 解析 StartupBlock 并保存进程 PID、parent PID 和启动块视图；`libprocess` 目前读取其中的 PID 构造出生块。
-- `libprocess`、`librpc`、`librunnel`、`libfal`、`libfs`、`libservice`、`libexecution` 的部分目标代码当前依赖 rinlib 的 IPC、MM、time 或 process API；`libbudget` 当前不依赖 rinlib。
-- `shared/erhino_shared/src/proc.rs:276-300` 当前还包含 Rust `Termination`/`ProgramResult`；用户 `rinlib::rt` 转换 main 返回值，`os/kernel/src/rt.rs` 则只借其泛型约束，实际调用 main 后 park。该语言政策尚未迁出 shared。
-- 两个用户 target JSON 和共同 `linker.ld` 仍在 `user/rinlib/`；`user/.cargo/config.toml`、target 的 `-T rinlib/linker.ld` 和 Justfile 点名这些路径。脚本中的 `ENTRY(main)` 仍与 rustc 入口包装相连，目标的平台资产与 runtime 入口拆分尚未实施。
-- `rinlib::rt` 的旧注释提到未来信号监听线程，但当前实际入口只初始化环境和堆，再调用 main；现有 Notification 的 signal/take 不包含异步 handler 或自动监听器。目标选择按消费者需要组合，不把该注释当成已完成或必需的运行机制。
+- `shared/erhino_shared` 拥有调用号、固定宽 ABI、对象角色、rights、请求/结果布局和共享校验。
+- `user/libraries/libkernel` 拥有 `call`、IPC/MM、MemoryObject/MemoryPool、Process/Thread 原语、时间和系统控制；`ThreadControl` 是唯一关闭 owner。
+- `user/libraries/libprocess::context` 解析并采用启动 grants，保留进程身份、payload、入口 descriptor 和 capability 槽；高层进程装载/监督仍归 `libprocess`。
+- `user/libraries/libthread` 的 `JoinHandle::Drop` 从不等待；显式 `join` 才观察 DONE。结果发布有独立状态字，线程退出不再提供安全逃生路径。
+- `user/libraries/libruntime` 的 `_start` 保持 a0/a1，建立 gp，初始化 heap，采用入口 ThreadControl 并按 reservation 建立普通 `MappedRegion` owner；`entry!` 生成的应用桥接把 `()`/`Result<(), _>` 交给 `finish`，分别收束为 ThreadExit/ProcessAbort，panic/OOM 也由 runtime 调用 ProcessAbort。
+- 所有服务、驱动和验收程序均为 `no_main`，显式依赖 runtime/thread/kernel owner；不存在旧目录、旧 alias 或 facade。
+- 用户 target 与共同 linker 位于 `user/platforms/`；linker `ENTRY(_start)`，两个 target 使用 `riscv64-elf-ld` 以生成受审计的 SystemV ELF ABI。
 
-这些是实现事实，不是对目标结构的授权。设计与实现的差距必须随分层计划的单一迁移闭包消除，不能在此通过 facade 或 re-export 伪装成已完成。
+## 当前启动和资源接口
 
-## 当前启动和资源接口的限制
-
-- `rinlib::env` 的 `startup_handles()` 和 `startup_payload()` 返回静态原始视图；没有 StartupSeed、一次采用表或初始 Handle 的单次领取状态。当前各调用点各自承担 raw → owner 的 unsafe 接管前提，HandleQuery 不能证明唯一关闭责任。
-- 普通 `libprocess::map_birth_block` 将出生块映射为 READ|WRITE，ThreadCreate 后一次写入；内核 bootstrap 的启动映像是只读。普通程序当前没有与目标一致的硬件只读约束，不能把 init 的保证直接扩写成全体 launcher 的事实。详细构造见 [startup](startup.md)。
-- Notification、Job/Process 操作当前主要为 raw Handle 函数；ThreadControl 内联在 rinlib JoinHandle。目标安全包装尚未建立，不能将接口草案写成可调用 API。
-- Capability 只覆盖非本地映射表项；Endpoint 带本地映射与借用约束，MappedRegion 不是 Handle。它们的失败/Drop 行为不同，现状分别由 IPC/mm 实现篇拥有。
-- Mailbox Send/Receive 当前业务非阻塞；Packet/ReceiveBuffer 的预付分配、WaitMany/WaitSet 的显式等待，以及含内核退休的 Close/Map 停驻是不同事实。迁移不把带 Deadline 的发送改为底层重试循环。
+- `libruntime` 没有名为 `main` 的应用入口 API。`finish` 只负责把已经执行完的应用结果转换为 ThreadExit 或 ProcessAbort；各 binary 使用 `libruntime::entry!(app_main)` 生成桥接函数。
+- `__halcyon_main` 是该宏生成的内部 ELF 链接符号：`_start` 位于 runtime crate，而真正的应用函数位于 binary crate，两个 crate 需要一个稳定的链接边界。它不是用户需要实现、调用或依赖的业务 API；源码中只应出现 `entry!`。将来若入口改为链接器保留的 section/trait 注册机制，替换的也是这个内部桥，不改变应用函数契约。
+- runtime 入口先由 `libprocess::context::StartupContext::adopt` 一次领取所有初始 grants；入口 descriptor 指向的 Control 转为入口 Registry record，普通程序 grant 通过 context owner 一次转交或按 capability 权限显式派生。
+- StartupBlock 映像保持进程寿命；入口栈 reservation/usable 几何被转换为普通 region owner，Registry 不区分入口线程和运行期线程的回收路径。
+- `ThreadRegistry::reap` 以固定槽、轮转游标和有界预算推进，不设置专职 driver。栈解除映射遇到 `ObjectBusy` 返回等待并由下一次协作推进；`PreparedThread` 在 Start 前持有未启动资源，Start 失败返还 self 由 Drop 取消；T/F 不在非用户线程 Drop。
+- Capability、Endpoint、MappedRegion 的失败/Drop 行为仍分别由 IPC/MM 实现篇拥有；跨模块组合不复制这些 owner。
 
 ## 当前验证边界
 
-本篇只记录现状。没有新增 `libkernel`，没有迁移 Cargo 依赖、目录、入口配置或 ABI；目标分层尚未通过构建或 acceptance。固定提交 Review 和历史实现文档中的 `rinlib` 名称保留为当时事实，当前实现说明也保留旧名以便核对源码。
+host 单测、`just check`、`just clippy`、用户 ELF audit、Base64/D64 `_start`/gp 入口反汇编门和 `just acceptance` 均已通过。acceptance 覆盖 virt stress 16/16、virt core/release、sifive_u、nofd 及 panic/alloc/fatal boot-failure；QEMU DTS 工具自身的既有 warning 不影响验收判定。

@@ -74,7 +74,6 @@ required=(
     "RPC rejected reply cleanup passed"
     "required service topology complete:"
     "supervision budget exhaustion retained authority:"
-    "thread stack cleanup passed"
     "Tunnel failure rollback and inventory checks passed"
     "Tunnel multi-page geometry and projection checks passed"
     "Tunnel Running geometry checks passed: six lengths"

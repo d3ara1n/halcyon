@@ -1,5 +1,11 @@
 //! 独立 FAL 验收消费者。启动与 provider 退出由 init 持有。
 #![no_std]
+#![no_main]
+
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
 
 extern crate alloc;
 
@@ -19,8 +25,7 @@ use libfs::{
 use librpc::{CallCause, CallPhase, RpcMessageKind, RpcPrefix};
 use librunnel::blocking;
 use libservice::record::ServiceRecord;
-use rinlib::{
-    env,
+use libkernel::{
     ipc::{
         capability::Capability,
         message::{self, Mailbox, MailboxSender},
@@ -41,7 +46,7 @@ use rinlib::{
 use test_fal::{command, report, startup};
 
 fn startup_capability(index: usize) -> Result<Capability, &'static str> {
-    let handle = env::startup_handle(index).ok_or("FAL consumer startup grant missing")?;
+    let handle = libruntime::startup::startup_handle(index).ok_or("FAL consumer startup grant missing")?;
     // SAFETY: StartupBlock 将各唯一的非映射 grant 移交给当前进程。
     Ok(unsafe { Capability::from_raw(handle) })
 }
@@ -348,7 +353,7 @@ fn exercise_property_watch(
     }
     if !matches!(
         root_watch.wait(time::Deadline::at(0)),
-        Err(rinlib::shared::call::SystemCallError::DeadlineExpired)
+        Err(libkernel::shared::call::SystemCallError::DeadlineExpired)
     ) {
         return Err("FAL consumer cancelled root Watch received Delete");
     }
@@ -812,7 +817,7 @@ fn exercise_prestart_eof(
         .map_err(|_| "FAL consumer pre-Start Invitation missing")?;
     let (control, _) = MailboxSender::from_capability(control_owner)
         .map_err(|_| "FAL consumer pre-Start control role invalid")?;
-    let invitation = rinlib::ipc::invitation::Invitation::from_capability(invitation_owner)
+    let invitation = libkernel::ipc::invitation::Invitation::from_capability(invitation_owner)
         .map_err(|_| "FAL consumer pre-Start Invitation role invalid")?;
     let mut producer = blocking::Producer::attach(invitation, Placement::Anywhere)
         .map_err(|_| "FAL consumer pre-Start Attach failed")?;
@@ -1699,7 +1704,7 @@ fn exercise_copy_variants(
         .close()
         .map_err(|_| "FAL consumer Copy cancellation owner close failed")?;
     // SAFETY: this function still uniquely owns the Notification signal endpoint.
-    unsafe { rinlib::ipc::object::close(event.peer) }
+    unsafe { libkernel::ipc::object::close(event.peer) }
         .map_err(|_| "FAL consumer Copy cancellation peer close failed")?;
 
     let local = transport
@@ -1858,7 +1863,7 @@ fn exercise_copy_after_progress_cancel(
     let cancel = unsafe { Capability::from_raw(event.owner) };
     let peer = event.peer;
     let observer = second_parent.clone();
-    let watcher = rinlib::thread::Builder::new()
+    let watcher = libthread::Builder::new()
         .spawn(move || -> Result<(), SystemCallError> {
             let mut observer_client = Client::new();
             loop {
@@ -1887,7 +1892,7 @@ fn exercise_copy_after_progress_cancel(
                 time::sleep_until(time::timeout_millis(1)?)?;
             }
             // SAFETY: watcher uniquely owns this signal endpoint.
-            unsafe { rinlib::ipc::object::close(peer) }
+            unsafe { libkernel::ipc::object::close(peer) }
         })
         .map_err(|_| "FAL consumer midflight watcher spawn failed")?;
     let result = transport.copy_stream(libfs::client::CopyRequest {
@@ -2033,7 +2038,7 @@ fn exercise_copy_during_provider_shutdown(
         .map_err(|_| "FAL consumer midflight source close failed")?;
 
     let observer = second_parent.clone();
-    let watcher = rinlib::thread::Builder::new()
+    let watcher = libthread::Builder::new()
         .spawn(move || -> Result<(), SystemCallError> {
             let mut observer_client = Client::new();
             loop {
@@ -2592,8 +2597,10 @@ fn run() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn main() {
+fn app_main() {
     if let Err(error) = run() {
         panic!("test_fal acceptance failed: {error}");
     }
 }
+
+libruntime::entry!(app_main);

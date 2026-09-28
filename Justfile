@@ -98,13 +98,13 @@ clippy:
     run_lint kernel-target artifacts/lint/kernel.log \
         bash -c 'cd os && cargo clippy -p kernel --bin kernel {{ZFLAGS}} -- -D warnings'
     run_lint user-host artifacts/lint/user-host.log \
-        bash -c 'cd user && cargo clippy -p rinlib -p libbudget -p libexecution -p librpc -p librunnel -p libfal -p libservice -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd user && cargo clippy -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p libfal -p libservice -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint user-target artifacts/lint/user-target.log \
         bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-stress artifacts/lint/user-stress.log \
         bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features acceptance-stress {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-fp artifacts/lint/user-fp.log \
-        bash -c 'cd user && cargo clippy -p test_fp --bin test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{ZFLAGS_USER}} -- -D warnings'
+        bash -c 'cd user && cargo clippy -p test_fp --bin test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{ZFLAGS_USER}} -- -D warnings'
 
 clean:
     #!/usr/bin/env bash
@@ -141,7 +141,7 @@ build_user: artifact_dir
     if [ "{{ACCEPTANCE_WORKLOAD}}" = stress ]; then
         RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     fi
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_fp --target rinlib/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
     echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 

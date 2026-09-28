@@ -2,9 +2,14 @@
 //! 是其唯一正常出口（验证 Waiting 取消与幂等竞争，见 init 剧本）。
 
 #![no_std]
+#![no_main]
 
-use rinlib::{
-    env,
+extern crate libruntime;
+
+#[used]
+static RUNTIME_ENTRY: unsafe extern "C" fn(*const u8, usize) -> ! = libruntime::__runtime_start;
+
+use libkernel::{
     ipc::{notification, wait_set::WaitSet},
     preclude::*,
     shared::{
@@ -13,11 +18,11 @@ use rinlib::{
     sys_sleep,
 };
 
-fn main() {
-    if env::startup_payload() == b"ipc-kill" {
+fn app_main() {
+    if libruntime::startup::startup_payload() == b"ipc-kill" {
         ipc_kill_target();
     }
-    if env::startup_payload() == b"retirement" {
+    if libruntime::startup::startup_payload() == b"retirement" {
         retirement_target();
     }
     debug!("target alive");
@@ -28,25 +33,25 @@ fn main() {
 }
 
 fn ipc_kill_target() -> ! {
-    let owner = env::startup_handle(0).expect("IPC kill target missing Close owner");
-    let control = env::startup_handle(1).expect("IPC kill target missing Drain control");
-    let ready = env::startup_handle(2).expect("IPC kill target missing ready signaler");
-    let done = env::startup_handle(3).expect("IPC kill target missing Drain completion signaler");
-    let close = rinlib::thread::Builder::new()
+    let owner = libruntime::startup::startup_handle(0).expect("IPC kill target missing Close owner");
+    let control = libruntime::startup::startup_handle(1).expect("IPC kill target missing Drain control");
+    let ready = libruntime::startup::startup_handle(2).expect("IPC kill target missing ready signaler");
+    let done = libruntime::startup::startup_handle(3).expect("IPC kill target missing Drain completion signaler");
+    let close = libthread::Builder::new()
         .spawn(move || {
             // SAFETY: startup 转入的 owner 只有本线程承担关闭责任。
-            unsafe { rinlib::ipc::object::close(owner) }
+            unsafe { libkernel::ipc::object::close(owner) }
                 .expect("IPC target committed Close failed");
         })
         .expect("IPC Close thread spawn failed");
-    let drain = rinlib::thread::Builder::new()
+    let drain = libthread::Builder::new()
         .spawn(move || {
             loop {
-                match rinlib::process::drain(control, 128) {
+                match libkernel::process::drain(control, 128) {
                     Ok(result) if result.status == ProcessDrainStatus::Complete as u32 => break,
                     Ok(_) => {}
                     Err(SystemCallError::ObjectBusy) => {
-                        rinlib::thread::yield_now().expect("IPC Drain ownership retry failed");
+                        libthread::yield_now().expect("IPC Drain ownership retry failed");
                     }
                     Err(error) => panic!("IPC target captured Drain failed: {error:?}"),
                 }
@@ -64,8 +69,8 @@ fn ipc_kill_target() -> ! {
 }
 
 fn retirement_target() -> ! {
-    let source = env::startup_handle(0).expect("retirement target missing observation source");
-    let ready = env::startup_handle(1).expect("retirement target missing ready signaler");
+    let source = libruntime::startup::startup_handle(0).expect("retirement target missing observation source");
+    let ready = libruntime::startup::startup_handle(1).expect("retirement target missing ready signaler");
     let set = WaitSet::create(256).expect("retirement target WaitSet creation failed");
     for cookie in 0..256 {
         set.register(WaitItem::new(source, ObjectSignals::READABLE, cookie))
@@ -78,3 +83,5 @@ fn retirement_target() -> ! {
         unsafe { sys_sleep(1000).expect("retirement target sleep failed") };
     }
 }
+
+libruntime::entry!(app_main);

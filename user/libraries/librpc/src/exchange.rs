@@ -10,7 +10,7 @@ use erhino_shared::{
     object::{Handle, HandleRole, Rights},
     time::Deadline,
 };
-use rinlib::ipc::{
+use libkernel::ipc::{
     capability::{Capability, HandleSet},
     message::{Delivery, MailboxSender, ReceivedMessage, SendOnce, send_once},
     packet::{Packet, PushFailure},
@@ -225,7 +225,7 @@ impl Reply {
             .map_err(CallCause::Frame)?;
         // 在已接收的私有字节中移除 prefix，不引入接受后的分配失败。
         message.payload.drain(..PREFIX_LEN);
-        if rinlib::time::expired(deadline).map_err(CallCause::System)? {
+        if libkernel::time::expired(deadline).map_err(CallCause::System)? {
             return Err(CallCause::Timeout);
         }
         Ok(Self {
