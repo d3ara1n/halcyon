@@ -1,6 +1,7 @@
 //! 内核对象 Handle 表包装：类型/role/rights 校验与关闭分流。
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use core::ops::Deref;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, Rights},
@@ -13,8 +14,46 @@ use super::{
     proc::Process,
 };
 
-pub type ProcessHandleTable = HandleTable<ObjectRef, HandleRole>;
-pub type ProcessHandleEntry = Entry<ObjectRef, HandleRole>;
+/// 表项/运输中的一份 capability；临时内核 Arc 不参与可启动引用计数。
+pub struct CapabilityRef(ObjectRef);
+
+impl CapabilityRef {
+    fn new(object: ObjectRef) -> Self {
+        if let Some(control) = object.as_any().downcast_ref::<super::thread::ThreadControl>() {
+            control.acquire_capability();
+        }
+        Self(object)
+    }
+
+    pub fn as_object(&self) -> &ObjectRef {
+        &self.0
+    }
+}
+
+impl Clone for CapabilityRef {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.0))
+    }
+}
+
+impl Deref for CapabilityRef {
+    type Target = ObjectRef;
+
+    fn deref(&self) -> &ObjectRef {
+        &self.0
+    }
+}
+
+impl Drop for CapabilityRef {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.as_any().downcast_ref::<super::thread::ThreadControl>() {
+            control.release_capability();
+        }
+    }
+}
+
+pub type ProcessHandleTable = HandleTable<CapabilityRef, HandleRole>;
+pub type ProcessHandleEntry = Entry<CapabilityRef, HandleRole>;
 pub(crate) enum PendingClose {
     Entry(ProcessHandleEntry),
     Retirement(super::retirement::RetirementTicket),
@@ -144,7 +183,7 @@ pub fn entry(
     if !rights.is_subset_of(allowed) {
         return Err(TableError::RightsDenied);
     }
-    Ok(Entry::new(object, role, rights))
+    Ok(Entry::new(CapabilityRef::new(object), role, rights))
 }
 
 /// 仅描述本进程真实持有的 entry，不通过身份数值打开对象。
@@ -162,8 +201,7 @@ pub fn query(thread: &super::Thread, source: Handle, output: usize) -> Result<()
     };
     let mut space = thread.process.space.lock();
     // SAFETY: 固定宽字段无 padding，输出失败不改变 capability。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &description) }
-        .map_err(Into::into)
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &description) }
 }
 
 pub enum HandleCloseStart {
@@ -179,7 +217,7 @@ pub fn close_entry(entry: ProcessHandleEntry, owner: &Process, exiting: bool) {
             "explicit object retirement must use its commit path"
         );
         let launch = target
-            .begin(entry.object().clone(), None)
+            .begin(entry.object().as_object().clone(), None)
             .expect("detached retirement must remain prepaid");
         launch.publish();
         drop(entry);
@@ -205,7 +243,7 @@ pub(crate) fn retire_entry(
 ) -> (usize, Option<PendingClose>) {
     assert!(budget > 0, "entry retirement requires a positive budget");
     if let Some(target) = entry.object().retirement() {
-        let object = entry.object().clone();
+        let object = entry.object().as_object().clone();
         let launch = target
             .begin(object.clone(), None)
             .expect("detached retirement must remain prepaid");
@@ -248,7 +286,7 @@ pub fn close(thread: &super::Thread, handle: Handle) -> Result<HandleCloseStart,
         let mut table = thread.process.handles.lock();
         let entry = table.get(handle, Rights::NONE).map_err(map_error)?;
         if let Some(target) = entry.object().retirement() {
-            let launch = target.begin(entry.object().clone(), Some(thread.process.clone()))?;
+            let launch = target.begin(entry.object().as_object().clone(), Some(thread.process.clone()))?;
             let entry = table
                 .remove(handle)
                 .expect("retirement commit must retain its handle slot");

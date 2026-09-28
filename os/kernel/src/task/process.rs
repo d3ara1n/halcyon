@@ -749,10 +749,10 @@ pub fn create_thread(
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let builder = &concrete_builder(&builder_object)?;
     let process = builder.process()?;
+    let _lease = BuildingLease::begin(process.clone())?;
     if !process.space.lock().is_bound() || !process.is_execution_bound() {
         return Err(SystemCallError::ObjectNotAvailable);
     }
-    let _lease = BuildingLease::begin(process.clone())?;
     let control = ThreadControl::new()?;
     let ready_batch = process
         .domain()
@@ -960,14 +960,12 @@ pub fn bind_execution(
     let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let builder = concrete_builder(&builder_object)?;
     let process = builder.process()?;
-    if !process.space.lock().is_bound()
-        || process.lifecycle.snapshot().0 != ProcessState::Building
-    {
+    let _lease = BuildingLease::begin(process.clone())?;
+    if !process.space.lock().is_bound() {
         return Err(SystemCallError::ObjectClosed);
     }
     let domain = crate::sched::resolve_domain(requirement).ok_or(SystemCallError::NotSupported)?;
-    process.bind_execution(requirement, domain);
-    Ok(())
+    process.bind_execution(requirement, domain)
 }
 
 fn start_created_members(
@@ -1078,7 +1076,7 @@ pub(crate) fn advance_termination_cleanup(
                 }
             }
             super::lifecycle::TerminationSlot::Created(thread) => {
-                thread.abandon_created();
+                thread.finish_created_departure();
                 drop(thread);
             }
         }
@@ -1233,7 +1231,7 @@ fn resolve_builder(
     {
         return Err(SystemCallError::WrongObjectType);
     }
-    Ok(entry.object().clone())
+    Ok(entry.object().as_object().clone())
 }
 
 fn resolve_control(
@@ -1250,7 +1248,7 @@ fn resolve_control(
     {
         return Err(SystemCallError::WrongObjectType);
     }
-    Ok(entry.object().clone())
+    Ok(entry.object().as_object().clone())
 }
 
 fn concrete_builder(object: &ObjectRef) -> Result<&ProcessBuilder, SystemCallError> {

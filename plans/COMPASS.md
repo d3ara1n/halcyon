@@ -9,7 +9,7 @@
 
 当前前置：[用户态映射 owner 的线程退休接力](todo-2026-09-14-user-memory-owner-lifecycle.md#跨会话接力断点)，在既有执行基座上闭合同进程跨线程承接与活性；其它映射扩展仍按需求触发。
 
-本轮设计审阅处置：[用户态分层与线程生命周期](review-2026-09-26-runtime-thread-design.md)，固定审阅 `d4ed354`、`67b9303`；线程迁移施工前闭合报告所列契约。
+本轮设计审阅处置：[用户态分层与线程生命周期](review-2026-09-26-runtime-thread-design.md)，固定审阅 `d4ed354`、`67b9303`；剩余分层/Registry 契约由对应活跃计划接续。
 
 ## 近期顺序
 
@@ -48,6 +48,7 @@
 | [系统关机编排](todo-2026-09-system-shutdown-orchestration.md) | 正式长期服务需关机收束，或对外承诺优雅关机前 |
 | [电源管理服务](todo-2026-09-power-management-service.md) | 独立电源管理需求明确后 |
 | [内核最终架构审查](todo-2026-09-kernel-final-architecture-review.md) | 主要用户态消费者及计划所列主线前置完成后 |
+| [对象级最后 capability 引用机制](todo-2026-09-28-capability-last-reference.md) | 生命周期收敛切面提交后，先只读盘点现有“最后引用”语义 |
 
 ## 尚未立案的候选
 

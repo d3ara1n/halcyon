@@ -21,7 +21,7 @@
 ## 当前启动和资源接口的限制
 
 - `rinlib::env` 的 `startup_handles()` 和 `startup_payload()` 返回静态原始视图；没有 StartupSeed、一次采用表或初始 Handle 的单次领取状态。当前各调用点各自承担 raw → owner 的 unsafe 接管前提，HandleQuery 不能证明唯一关闭责任。
-- 普通 `libprocess::write_birth_block` 将出生块映射为 READ|WRITE；内核 bootstrap 的启动映像是只读。普通程序当前没有与目标一致的硬件只读约束，不能把 init 的保证直接扩写成全体 launcher 的事实。详细构造见 [startup](startup.md)。
+- 普通 `libprocess::map_birth_block` 将出生块映射为 READ|WRITE，ThreadCreate 后一次写入；内核 bootstrap 的启动映像是只读。普通程序当前没有与目标一致的硬件只读约束，不能把 init 的保证直接扩写成全体 launcher 的事实。详细构造见 [startup](startup.md)。
 - Notification、Job/Process 操作当前主要为 raw Handle 函数；ThreadControl 内联在 rinlib JoinHandle。目标安全包装尚未建立，不能将接口草案写成可调用 API。
 - Capability 只覆盖非本地映射表项；Endpoint 带本地映射与借用约束，MappedRegion 不是 Handle。它们的失败/Drop 行为不同，现状分别由 IPC/mm 实现篇拥有。
 - Mailbox Send/Receive 当前业务非阻塞；Packet/ReceiveBuffer 的预付分配、WaitMany/WaitSet 的显式等待，以及含内核退休的 Close/Map 停驻是不同事实。迁移不把带 Deadline 的发送改为底层重试循环。

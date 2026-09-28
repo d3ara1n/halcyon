@@ -549,7 +549,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             let result = crate::clock::now().and_then(|snapshot| {
                 let mut space = thread.process.space.lock();
                 // SAFETY: ClockSnapshot 无 padding，完整初始化，失败没有业务副作用。
-                unsafe { uaccess::write_user_value(&mut space, a0, &snapshot) }.map_err(Into::into)
+                unsafe { uaccess::deliver_output(thread, &mut space, a0, &snapshot) }
             });
             respond_result(frame, result.map(|_| 0));
             Outcome::Completed

@@ -34,20 +34,20 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 
 ## 当前基线与证据
 
-分支 `master`、提交 `67b9303`；以下源码事实为迁移前基线，代码未改。
+分支 `master`，生命周期收敛代码基线为 `a592e38` 之后的未提交工作树；以下表格仍只记录分层迁移前的用户态结构事实，已完成的内核/shared 生命周期施工不在本计划重复拥有。
 
 | 位置 | 当前事实 | 迁移方向 |
 |---|---|---|
-| `user/rinlib/src/call.rs` | 唯一用户态 RV64 ecall、错误解码与 syscall wrapper；host stub panic | libkernel 内部 call/raw 与安全出口 |
+| `user/rinlib/src/call.rs` | 唯一用户态 RV64 ecall、错误解码与 syscall wrapper；仍是当前用户态边界 | libkernel 内部 call/raw 与安全出口 |
 | `rinlib/src/{ipc,mm,memory_object,memory_pool,shared_memory,time,system}` | typed owner、失败返还、映射/运输/等待 | libkernel 的用户侧资源契约 |
 | `rinlib/src/process.rs` | Job/Process 原语、快照校验和 drain_to_completion 混合 | 原语到 libkernel，组合管理到 libprocess |
 | `rinlib/src/env.rs` | 启动块、PID/parent PID 静态变量、可反复读取 raw Handle 数组 | 格式/view/语义采用分层；libprocess context 显式转交 |
-| `rinlib/src/thread.rs` | raw spawn、UserStack、闭包 packet、Join、栈清理诊断；DONE 后假定结果初始化 | 原语到 libkernel（ThreadCreate/ThreadStart），Registry/ResultCell 到 libthread |
-| `rinlib/src/rt.rs` | lang_start 以 argc/argv 接收块基/长度、初始化 heap、main 返回转码；panic/OOM | libruntime 显式平台入口与应用交接，删除用户 lang_start 借位 |
+| `rinlib/src/thread.rs` | raw spawn、UserStack、闭包 packet、Join、栈清理诊断；仍未迁移 | 原语到 libkernel（ThreadCreate/ThreadStart），Registry/ResultCell 到 libthread |
+| `rinlib/src/rt.rs` | 当前仍以 lang_start 的 argc/argv 槽接收 StartupBlock 基址/长度、初始化 heap，并以 main 返回值决定 ThreadExit/ProcessAbort；panic/OOM 走 abort | libruntime 显式平台入口与应用交接，删除用户 lang_start 借位 |
 | `rinlib/src/rt.rs:91-92` | 遗留注释提到未来监听线程接入 rt | 与当前 Notification 契约区分；实施删改旧假设，不据此默认引入监听线程 |
-| `erhino_shared/src/proc.rs:276-300` | Rust Termination/ProgramResult 与 ExitCode ABI 混合 | 全部删除，换为 TerminationCause |
+| `erhino_shared/src/proc.rs` | 结构化 TerminationCause 已落地；Rust runtime 迁移仍未开始 | 迁移剩余用户态结果/入口策略，不再引入数值退出码 |
 | `os/kernel/src/rt.rs` | T:Termination 但只调用 main 后 park，不消费返回转换 | 去除未使用的用户语言返回约束，不改 kernel boot/hart 语义 |
-| `libprocess/src/lib.rs:1161` | 出生块读取 rinlib::env::pid() | 经显式 CurrentProcessInfo 取得启动方 provenance |
+| `libprocess/src/lib.rs` | 出生块构造已使用当前 launcher provenance，并在 ThreadCreate 后一次写入完整 StartupBlock；context 仍未拆出 | 经显式 CurrentProcessInfo 取得启动方 provenance，并迁移 context |
 | `user/rinlib/*.json` 与 `linker.ld` | target 指向 rinlib/linker.ld，脚本 ENTRY(main) | 平台中立资产和 `_start` 接口 |
 
 七个公共库直接依赖 rinlib：libexecution、libprocess、librpc、librunnel、libfal、libfs、libservice；libbudget 不依赖。另有 3 个服务、4 个验收程序、1 个驱动，共 15 个 crate。公共库不调用 runtime 初始化或 allocator；host 测试 allocator 属测试 binary。
@@ -80,7 +80,7 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 
 ### 源码核实与必须纠正的前提
 
-- 普通 `libprocess::write_birth_block` 当前使用 READ|WRITE；init 的 map_bootstrap_block 则只读。`env` 返回静态不可变视图不等于普通启动已经有硬件只读保证。后续实施把普通出生块改为 READ，仍通过 Building Write 填充；`task/proc.rs::write_building` 明确允许不具写权限的最终 PTE，无需新增 syscall。
+- 普通 `libprocess::map_birth_block` 当前使用 READ|WRITE，ThreadCreate 后一次写入；init 的 bootstrap block 则只读。context/runtime 迁移仍需把普通出生块改为最终只读映射，再通过 Building Write 填充；`task/proc.rs::write_building` 明确允许不具写权限的最终 PTE，无需新增 syscall。
 - 起始地址/字节长不足以重建 MappedRegion 的 reservation/backing owner。本次统一为进程寿命启动映像，不新增 StartupUnmap，也不复制大 initfs。该选择与现有 init payload 保活一致；未来提前释放需独立契约。
 - HandleQuery 只读且不转交 owner；role adopter 不能独自防止双重接管。StartupSeed 的一次来源和查询结果必须同时成立。
 - 非映射 Capability 与 Endpoint 不可混用；现有 Receive/Packet 的预付容器可以复用其机制思路，但初始 grants 不受消息的固定八个槽限制，不能直接拿消息上限限制 StartupBlock。
@@ -89,7 +89,7 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 
 线程契约由 [task](../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
 
-当前 `rinlib::thread::JoinHandle` 的 join/Drop 同步等待 DONE 并无条件 `assume_init`，safe `thread::exit(code)` 可绕过结果写入，栈清理失败只计 abandoned；这些路径在迁移中整体删除，不沿入 libthread。当前入口经 rustc main shim 借 argc/argv 进入 lang_start；目标改为 `_start`，需同步修改入口符号、target/linker 资产、Building ThreadCreate 与 EntryThreadDescriptor。
+当前 `rinlib::thread::JoinHandle` 仍同步等待 DONE，并由旧 packet 路径承担结果接管；safe `thread::exit` 和 UserStack abandoned 计数已在生命周期施工中删除。当前入口仍经 rustc main shim 借 argc/argv 进入 lang_start；目标改为 `_start`，需同步修改入口符号、target/linker 资产、Building ThreadCreate 与 EntryThreadDescriptor。
 
 ### 入口和 profile 事实门
 
@@ -229,8 +229,8 @@ stateDiagram-v2
 
 ### 工作树与授权
 
-- 接力时分支 `master`，HEAD `67b9303`。本轮改动为文档，留在工作树，未 commit/push。
-- 线程/终局方案已由用户确认（ABI 可自由优化）；代码施工按 owner 计划顺序进行，开工前仍需确认实施授权。
+- 接力时分支 `master`，HEAD 仍为 `a592e38`，工作树包含生命周期收敛实现与同步文档，未 commit/push。
+- 线程/终局方案已由用户确认并已施工；StartupBlock v3、ProcessBindExecution lease、统一输出 fault 与 ThreadControl 最后引用规则已在归档生命周期记录中完成，Registry/owner/libruntime 仍未施工。
 - 保留工作树中其余已提交或未提交的设计资料；`plans/archived/todo-2026-09-device-architecture.md` 只表示初始概念稿完成，不代表设备详细设计完成。
 
 ### 已确定，不重复选方案
@@ -281,13 +281,13 @@ stateDiagram-v2
 
 #### Kernel 与 shared 的施工边界
 
-kernel/shared 的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution、TerminationCause、删除 ExitCode/ProcessExit/ProcessAttach/ThreadSpawn、挂起线程离场发布 DONE）由 [owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 拥有，先于 libthread 施工。本计划另需：普通出生块最终只读，复用 `write_building`；`os/kernel/src/rt.rs` 删除未消费的 `Termination` 约束。
+kernel/shared 的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution、TerminationCause、删除 ExitCode/ProcessExit/ProcessAttach/ThreadSpawn、挂起线程离场发布 DONE）已由[归档生命周期记录](archived/todo-2026-09-28-lifecycle-convergence.md)完成。本计划仍需：普通出生块最终只读，复用 `write_building`；`os/kernel/src/rt.rs` 删除未消费的 `Termination` 约束。
 设备 D1 的对象关系与 authority 可并行设计，入口见 [设备接力](todo-2026-09-device-system-design.md#当前进度与接力)；不要因本计划推进而登记设备 API、MMIO/IRQ/DMA 或驱动已完成。
 
 ### 取证与验证状态
 
 后续每块设计同时核对 ideas、impls、实际导出/调用者与已有测试语义；代码若超前补齐描述，代码与目标不符则记录真实差距，不默认任一侧正确。本轮已核实 Runtime/WorkQueue/Wake、FAL NodeStore/Retirement、Process Collector/Observation、init RootSupervisor；详细路径和复用边界在用户内存 owner 记录，不需要重复整仓盘点。只有源码变化或具体新问题才重取相关证据。
 
-累计 diff 均为 Markdown；固定 psABI 与源码为只读取证。接口草案未编译，未运行 host/target/QEMU。线程设计已定稿，代码施工与验证尚未开始，计划保持活跃。
+累计接口草案仍未编译；生命周期收敛代码及其 host/target/QEMU 验证已由归档记录拥有，本计划的 libkernel/libthread/libruntime 施工仍未开始，保持活跃。
 
 换会话前收口检查：`git diff --check` 通过；本轮继续整理设计/契约文档，没有代码、Cargo、ABI 或构建配置改动，也没有提交。下一会话按本节与所链接的线程 cleanup 接力继续。

@@ -56,6 +56,7 @@ pub fn load(address: usize, length: usize) {
     task::proc::building_cutoff_selftest();
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
+    task::thread::capability_lifecycle_selftest(&root_pool);
     frame::selftest::run(&root_pool);
     task::tunnel::selftest::run(&root_pool);
     task::wait_set::selftest::continuation::run(&root_pool);

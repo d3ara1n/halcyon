@@ -114,22 +114,42 @@ pub unsafe fn deliver_output<T: Copy>(
     value: &T,
 ) -> Result<(), erhino_shared::call::SystemCallError> {
     // SAFETY: 调用方保证 T 的完整对象表示均已初始化。
-    unsafe { write_user_value(space, dst, value) }.map_err(|error| {
-        let process = thread.process.clone();
-        let todo = process.lifecycle.request_termination(
-            erhino_shared::proc::TerminationCause::Faulted,
-            erhino_shared::proc::TerminationDetail::fault(
-                thread.member().tid(),
-                erhino_shared::proc::ProcessFaultCode::UserAccess,
-                dst as u64,
-            ),
-            Some(thread.member()),
-        );
-        // 调用方仍可能持 Handle/Connection/AddressSpace 锁；IPI、debt 与通知
-        // 必须等这些 guard 全部释放，由当前 trap 统一交付，不能在这里出游。
+    let bytes = unsafe {
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    };
+    deliver_bytes(thread, space, dst, bytes)
+}
+
+/// 多段输出共享同一失败规则；返回错误只用于调用方回滚尚未提交的事务。
+pub fn deliver_bytes(
+    thread: &Thread,
+    space: &mut AddressSpaceState,
+    dst: usize,
+    bytes: &[u8],
+) -> Result<(), erhino_shared::call::SystemCallError> {
+    copy_to_user(space, dst, bytes).map_err(|error| {
+        let todo = fault_output(&thread.process, thread.member().tid(), dst, Some(thread.member()));
+        // 业务锁可能仍在调用方栈上；trap 在锁释放后交付终止待办。
         thread.defer_output_termination(todo);
         error.into()
     })
+}
+
+pub fn fault_output(
+    process: &alloc::sync::Arc<crate::task::proc::Process>,
+    tid: erhino_shared::proc::Tid,
+    dst: usize,
+    exiting: Option<crate::task::lifecycle::MemberKey>,
+) -> crate::task::lifecycle::TerminationTodo {
+    process.lifecycle.request_termination(
+        erhino_shared::proc::TerminationCause::Faulted,
+        erhino_shared::proc::TerminationDetail::fault(
+            tid,
+            erhino_shared::proc::ProcessFaultCode::UserAccess,
+            dst as u64,
+        ),
+        exiting,
+    )
 }
 
 /// 从内核拷入用户内存（dst 为用户 VA，src 为内核缓冲）。

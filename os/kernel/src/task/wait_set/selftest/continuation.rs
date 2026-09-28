@@ -149,6 +149,7 @@ fn native(root: &Arc<MemoryPool>, cancelled: bool, faulted: bool) {
     )
     .expect("Native fixture control installation failed");
     let control_handle: Handle = caller.read(caller.output);
+    let caller_tid = caller.thread().member().tid();
     let sentinel = [0xa5u8; core::mem::size_of::<ProcessDrainResult>()];
     caller.put(caller.output, &sentinel);
     let process::DrainStart::Wait(plan) =
@@ -275,12 +276,12 @@ fn native(root: &Arc<MemoryPool>, cancelled: bool, faulted: bool) {
                 (
                     TerminationCause::Faulted,
                     TerminationDetail::fault(
-                        caller.thread().member().tid(),
+                        caller_tid,
                         ProcessFaultCode::UserAccess,
                         caller.output as u64,
                     )
                 ),
-                "committed Native output failure did not freeze StoreAccess"
+                "committed Native output failure did not freeze UserAccess"
             );
             assert!(
                 !proc::selftest::drain_active(&target),

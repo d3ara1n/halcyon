@@ -145,7 +145,9 @@ impl Caller {
             next = thread.take_publish_next();
             staged.push(thread);
         }
-        process.bind_execution(elf::IsaRequirement::Base64, domain);
+        process
+            .bind_execution(elf::IsaRequirement::Base64, domain)
+            .expect("fixture execution binding must be unique");
         let callers: Vec<_> = staged
             .into_iter()
             .map(|thread| Self {

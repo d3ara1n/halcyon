@@ -444,7 +444,7 @@ pub fn mint_sender(
     {
         return Err(SystemCallError::WrongObjectType);
     }
-    let queue = owner_entry.object().clone();
+    let queue = owner_entry.object().as_object().clone();
     let (sender, lifetime) =
         MailboxSender::create(queue, badge, thread.process.resources.metadata())?;
     let mut entries = Vec::new();
@@ -508,7 +508,7 @@ pub fn make_send_once(
     if !rights.is_subset_of(source_entry.rights()) {
         return Err(SystemCallError::RightsDenied);
     }
-    let object = source_entry.object().clone();
+    let object = source_entry.object().as_object().clone();
     // 所有可失败步骤先于预留：entry 构造与分配失败时不产生任何表状态。
     let mut entries = Vec::new();
     entries
@@ -608,7 +608,7 @@ pub fn send(
         if once && moves.iter().any(|(handle, _)| *handle == mailbox_handle) {
             return Err(SystemCallError::IllegalArgument);
         }
-        let context = entry.object().clone();
+        let context = entry.object().as_object().clone();
         let sender = context
             .as_any()
             .downcast_ref::<MailboxSender>()
@@ -663,7 +663,7 @@ pub fn peek(thread: &Thread, mailbox_handle: Handle, output: usize) -> Result<()
     let header = concrete(&object)?.peek()?;
     let mut space = thread.process.space.lock();
     // SAFETY: MessageHeader 所有字段与 reserved 均已初始化且无 padding。
-    unsafe { uaccess::write_user_value(&mut space, output, &header) }?;
+    unsafe { uaccess::deliver_output(thread, &mut space, output, &header) }?;
     Ok(())
 }
 
@@ -741,9 +741,9 @@ fn finish_receive(
         let mut space = thread.process.space.lock();
         // SAFETY: MessageHeader 无 padding，Handle 是 u64 newtype。
         let header_result =
-            unsafe { uaccess::write_user_value(&mut space, output.header, &result) };
+            unsafe { uaccess::deliver_output(thread, &mut space, output.header, &result) };
         header_result
-            .and_then(|_| uaccess::copy_to_user(&mut space, output.payload, &message.payload))
+            .and_then(|_| uaccess::deliver_bytes(thread, &mut space, output.payload, &message.payload))
             .and_then(|_| {
                 let bytes = unsafe {
                     core::slice::from_raw_parts(
@@ -751,7 +751,7 @@ fn finish_receive(
                         core::mem::size_of_val(output_handles),
                     )
                 };
-                uaccess::copy_to_user(&mut space, output.handles, bytes)
+                uaccess::deliver_bytes(thread, &mut space, output.handles, bytes)
             })
     };
 
@@ -767,7 +767,7 @@ fn finish_receive(
         if let Some(message) = rejected {
             message.close_transit_handles();
         }
-        return Err(error.into());
+        return Err(error);
     }
 
     let Message {
@@ -815,7 +815,7 @@ fn resolve(
     if *entry.role() != role || entry.object().kind() != ObjectKind::Mailbox {
         return Err(SystemCallError::WrongObjectType);
     }
-    Ok(entry.object().clone())
+    Ok(entry.object().as_object().clone())
 }
 
 fn concrete(object: &ObjectRef) -> Result<&Mailbox, SystemCallError> {

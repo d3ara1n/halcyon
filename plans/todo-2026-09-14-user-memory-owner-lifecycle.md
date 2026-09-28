@@ -107,10 +107,10 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 | main 返回、worker 仍运行 | 进程继续；末线程离场 → Completed |
 
 ### 当前未闭合责任
-- bootstrap 初始线程已复用 ThreadCreate 的 ThreadControl、MANAGE rights、Created/Departure 与预留 Ready 准入；EntryThreadDescriptor 已由 shared/startup v1 校验，初始 Control 通过 descriptor 传递。剩余一次采用与 ThreadRegistry 登记归 Registry/libruntime 切面。
+- bootstrap 初始线程已复用 ThreadCreate 的 ThreadControl、MANAGE rights、Created/Departure 与预留 Ready 准入；shared/startup v3 的入口 section v2 引用 grants/Handle 数组中的 Control 索引。剩余一次采用与 ThreadRegistry 登记归 Registry/libruntime 切面。
 - `ProcessStart` 已改为 Create 时每线程预留 ReadyBatch、lifecycle 锁内挂接并摘取 Thread 内嵌发布链、锁外逐项发布；bootstrap 也复用单线程 Create/Ready admission，不再有普通路径的 Start 承接 Vec。
-- `user/libraries/libprocess/src/lib.rs` 已恢复 `Spawned.control` 为监督用 ProcessControl；ThreadCreate 的 child-local ThreadControl 只写入 EntryThreadDescriptor。后续 Registry/libruntime 负责一次采用与入口 ThreadRecord owner。
-- bootstrap descriptor ABI v1 已落地：StartupBlock 内固定 section，包含 child-local ThreadControl、stack reservation、usable 范围及 kind/version/len；init 与普通 launcher 共用 `shared/startup` 校验，普通 launcher 在 ThreadCreate(Building) 后经 Building Write 回填 control。descriptor 的一次采用与 ThreadRegistry 登记留给后续 libthread/libruntime 切面。
+- `user/libraries/libprocess/src/lib.rs` 的 `Spawned.control` 是监督用 ProcessControl；ThreadCreate 的 child-local ThreadControl 加入出生块 grants 数组，descriptor 只引用索引。后续 Registry/libruntime 负责一次采用与入口 ThreadRecord owner。
+- StartupBlock v3/入口 section v2 已落地：包含 grants 数组索引、stack reservation、usable 范围及 kind/version/len；init 与普通 launcher 共用 `shared/startup` 校验，普通 launcher 在 ThreadCreate(Building) 后一次写完整块。descriptor 的一次采用与 ThreadRegistry 登记留给后续 libthread/libruntime 切面。
 - ThreadRegistry/owner 尚未施工：当前 `rinlib::JoinHandle` 仍直接持有 Control、栈和 Result packet；后续需迁为固定槽 Registry、共享 ThreadControl、ResultCell 三 owner，并由 libruntime 负责入口 Registry 实例与 descriptor adopt。
 
 ### ProcessStart 发布结构裁决
@@ -157,4 +157,4 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 
 ## 跨会话接力
 
-终局原因切面已从 shared ABI 经内核、rinlib、libprocess 与现有监督消费者接通。ThreadCreate/ThreadStart 已接通 shared ABI、MANAGE right、ProcessBindExecution、Running 期挂起创建/启动、Building 目标控制输出和 Created 放弃离场；完整 srv_init 消费迁移及 Registry/owner/libruntime 分层仍未闭合；bootstrap 已复用 ThreadCreate 核心并交付 EntryThreadDescriptor v1。ProcessStart 普通路径已改为预留准入与嵌入发布链。开发证据为 `artifacts/dev/bootstrap-descriptor-check-final.log`、`artifacts/dev/bootstrap-descriptor-user-check-final.log`、`artifacts/dev/bootstrap-startup-test-final.log`、`artifacts/dev/bootstrap-libprocess-test-final.log`；完整用户态 target 验收尚未执行，直接检查 srv_init/test_hammer 受既有 feature/no_std 目标前提阻断。下一步进入 ThreadRegistry/owner/libruntime，接通 descriptor 一次采用与普通入口记录。
+终局原因及生命周期收敛由 [已归档的生命周期工作记录](archived/todo-2026-09-28-lifecycle-convergence.md) 接续。当前 ThreadCreate/ThreadStart、Builder/Control 关闭、Building lease、输出故障与 StartupBlock v3 已接通；完整 srv_init 消费迁移及 Registry/owner/libruntime 分层仍未闭合。旧 descriptor 值字段与回填路径已删除；本计划下一步进入 ThreadRegistry/owner/libruntime，从 grants 索引采用入口 Control，以 reservation 建立普通 region owner，并接通 DONE 后统一 cleanup。先前开发证据为 `artifacts/dev/bootstrap-descriptor-check-final.log`、`artifacts/dev/bootstrap-descriptor-user-check-final.log`、`artifacts/dev/bootstrap-startup-test-final.log`、`artifacts/dev/bootstrap-libprocess-test-final.log`；本轮验证见收敛工作记录。

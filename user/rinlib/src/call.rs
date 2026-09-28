@@ -208,7 +208,7 @@ pub(crate) unsafe fn sys_memory_object_seal(object: Handle) -> SystemCallResult<
     sys_call(SystemCall::MemoryObjectSeal, object.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
-/// 终止当前线程；成功调用不返回用户代码。
+/// 终止当前进程；成功调用不返回用户代码。
 ///
 /// # Safety
 /// 调用者不得依赖成功返回后的任何栈上或线程局部资源。
@@ -217,6 +217,10 @@ pub unsafe fn sys_process_terminate() -> ! {
     panic!("ProcessTerminate unexpectedly returned")
 }
 
+/// 中止当前进程；成功调用不返回用户代码。
+///
+/// # Safety
+/// 调用者不得依赖当前线程栈、线程局部状态或未执行的用户态析构继续收束资源。
 pub unsafe fn sys_process_abort() -> ! {
     let _ = sys_call(SystemCall::ProcessAbort, 0, 0, 0, 0);
     panic!("ProcessAbort unexpectedly returned")
@@ -454,6 +458,10 @@ pub unsafe fn sys_thread_yield() -> SystemCallResult<()> {
     sys_call(SystemCall::ThreadYield, 0, 0, 0, 0).map(|_| ())
 }
 
+/// 结束当前线程；不运行调用栈的用户态析构。
+///
+/// # Safety
+/// 调用者须先交付线程结果与环境责任，不能再依赖当前栈或线程局部对象。
 pub unsafe fn sys_thread_exit() -> ! {
     let _ = unsafe {
         raw_call(

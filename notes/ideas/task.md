@@ -29,7 +29,9 @@ Job 的生命周期是 Open、Sealed、Dead。Open Job 即使没有成员也保�
 
 进程不以“驱动级”“服务级”等 ambient 权限授权 syscall。ProcessBuilder 只授权 Building 组装，关闭即放弃构造并请求目标终止；ProcessControl 从空壳创建起授权查询、终止、等待和受保护资源收束，观察者可持去除 MANAGE 的 READ/WAIT control。创建关系本身不产生管理权。
 
-进程生命周期统一为：
+进程与线程遵循同一出生与离场形状：Create 备齐资源并保持挂起，Start 只发布可运行责任，离场后持续提供各自的终局事实。进程的事实是首因及 Drain 后的 CLOSED，线程的事实是成员摘除与结果义务归零后的 DONE；Control 只持观察/管理 authority，不是核心资源或出生责任的 owner。两者的持久事实不依赖创建者继续调用。
+
+进程生命周期为：
 
 ```text
 Building -> Running -> Terminating -> Dead
@@ -37,11 +39,11 @@ Building -> Running -> Terminating -> Dead
 
 Building 不是一笔必须整体回滚的大事务，而是若干各自原子的资源附入：内存绑定、Map/Write、capability Grant、线程 Attach 以及未来其它资源绑定分别完成，成功项立即属于目标；后续失败不把已经交付的 capability 或资源倒流回组装者。`ProcessBindMemory` 是唯一页资源绑定操作，消费 Pool Handle 并把 AddressSpace 从 Unbound 转为 Bound；绑定事务语义由[内存模型](mm.md)唯一拥有。未绑定进程仍是合法 Building 壳，可以接收不依赖地址空间的 grants，也可以被放弃或终止。
 
-ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止点。执行需求在第一次线程创建前由独立 Building 绑定固定，线程创建据此取得全寿命调度准入；Start 不再接收执行描述、不选择调度域、不分配交接或调度结构，只确认内存已绑定、至少一条挂起线程已创建、Job 启动门开放、除 Start 自身外没有 Building 操作在途，然后关闭组装权并摘取预留发布链，发布全部已准备的挂起线程。Start 可以因并发终止、Job seal 或在途组装被拒绝，但不因资源不足失败。Building 操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、ThreadCreate 或 Bind。
+ProcessStart 是唯一首次发布 runnable 的提交点，也是 Building 组装截止点。执行需求在第一次线程创建前由独立 Building 绑定固定，线程创建据此取得全寿命调度准入；Start 不再接收执行描述、不选择调度域、不分配交接或调度结构，只确认内存已绑定、至少一条挂起线程已创建、Job 启动门开放、除 Start 自身外没有 Building 操作在途，然后关闭组装权并摘取预留发布链，发布全部已准备的挂起线程。Start 可以因并发终止、Job seal 或在途组装被拒绝，但不因资源不足失败。BindMemory、BindExecution、Map、Write、Grant 与 Building ThreadCreate 共用一次 Building operation lease 和同一计数；操作只能在精确 Building 状态登记，登记即冻结该操作的提交资格：登记先于终止截止时，操作获准完成且终止路径等待并接管其成功结果；Start 因其它操作仍在途而不能抢先发布。Start 或终止先线性化时，后续组装登记拒绝，因此不会出现 Running 后才提交的 Map、Grant、ThreadCreate 或 Bind。
 
 Terminating 阶段禁止新线程和新等待，撤销 Ready、取消 Waiting，并等待各 hart 上的 Running 线程离场。随后管理者以有界操作先收束 HandleTable，再收束地址空间；Unbound 地址空间直接完成该阶段，Bound 地址空间只有在事务、lease、backing 与页表全部经有界 drain 释放后才完成。全部资源收束后进程进入 Dead，ProcessControl 的 CLOSED 才发布，因此等待 CLOSED 是资源收束完成屏障，不只是终止请求已受理。
 
-Completed（末线程离场）、ProcessTerminate、fault、ProcessKill 与 Building abandonment 在各自适用的 Building 或 Running 状态竞争进入 Terminating 的唯一线性化点；用户态 JobKill 最终也只对成员执行同一个 ProcessKill 原语。首个完成转换者冻结结构化终局原因，后续事件只能协助收束，不得覆盖已经可观察的终态事实。ProcessKill 成功表示请求已被接受或目标此前已经越过不可逆终止边界，不表示 teardown 已完成；自杀式调用不返回用户态。
+Completed（末线程离场）、ProcessTerminate、ProcessAbort、fault、ProcessKill 与 Building abandonment 在各自适用的 Building 或 Running 状态竞争进入 Terminating 的唯一带原因线性化点；syscall 按各自 authority 仍分开，用户态 JobKill 最终只对成员执行 ProcessKill。首个完成转换者冻结结构化终局原因，后续事件只能协助收束，不得覆盖已经可观察的终态事实。ProcessKill 返回 Accepted 或 AlreadyTerminating，不表示 teardown 已完成；自杀式调用不返回用户态。未来 ThreadKill 使用同样的两值返回形状，不因此提前引入调用号。
 
 ### 终局原因
 
@@ -89,6 +91,8 @@ ProcessDrain 可以由受信任的进程管理服务专职承担，由根监督�
 内核无「主线程」角色。线程统一经 **ThreadCreate → 启动** 两段出生：ThreadCreate 创建完整但挂起的线程（UserContext、全寿命调度准入、成员登记和 ThreadControl），失败零副作用；挂起线程不运行、不入 Ready。Building 期由 ProcessControl authority 在目标进程创建，Control 原子安装到目标 HandleTable，并只能由 ProcessStart 批量发布；Running 期由进程对 self 创建，Control 交给调用者，由 ThreadStart 单独发布。两种 authority 与发布点不同，线程对象、准入和离场协议相同，出生信息只是启动交接需要，不赋予数字身份政策含义。
 
 **进程的生 = Start 发布（至少一个挂起线程已创建），进程的完成 = 末线程离场**。末线程离场使进程以 Completed 进入 Terminating；Dead/CLOSED 仍以资源 Drain 完成为准。无线程的进程停留在 Building，从未活过；挂起未启动的线程被终止或放弃时同样经离场协议发布 DONE。
+
+关闭最后一份 ThreadControl capability 引用（包括运输中、已提交未交付的引用）若线程仍为 Created，就与 ThreadStart/进程终止在成员锁内争取 Created→Exiting 的唯一离场权；关闭非末份只消散授权，不提前放弃。只剩 WAIT 权时也等待最后一份引用消散，观察者仍可等待 DONE。未启动线程与已启动线程共用 ThreadDeparture；迟到的离场请求观察已有提交，不重复发布。ThreadStart 要求所属进程自己的 MANAGE Control，WAIT 只观察。
 
 线程任意时刻恰处于一个稳定所有权容器：
 
@@ -152,9 +156,9 @@ prepare: Registry 槽准入 → 环境准备 → 带 guard 的栈 → ResultCell
   → ThreadStart → Thread + JoinHandle<T>
 ```
 
-线程在 Create 与 Start 之间不运行，因此 record、packet 与 ResultCell 在 Start 之前已经稳定，不存在“子线程早于 syscall 返回运行”的登记竞争。Start 前的每一步失败按反向顺序返还；ThreadCreate 已成功而放弃启动时，关闭挂起线程由内核离场并发布 DONE，record 随后按普通 cleanup 收束，closure 在放弃者线程上 Drop。ThreadStart 的拒绝返还 PreparedThread。内核成功但固定输出不符合契约属于进程完整性失败，不伪造可重试状态。进入 syscall 时不得持有子线程退出所需的用户锁。
+线程在 Create 与 Start 之间不运行，因此 record、packet 与 ResultCell 在 Start 之前已经稳定，不存在“子线程早于 syscall 返回运行”的登记竞争。Start 前的每一步失败按反向顺序返还；ThreadCreate 已成功而放弃启动时，关闭最后 Control 引用由内核离场并发布 DONE，record 随后按普通 cleanup 收束，closure 在放弃者线程上 Drop。ThreadStart 的拒绝返还 PreparedThread。已成功的内核操作若写回输出用户地址失败，统一以发起 tid 和失败 VA 冻结 `Faulted(UserAccess)`，不能报告可重试成功；提交前事务仍回滚其未公开资源。进入 syscall 时不得持有子线程退出所需的用户锁。
 
-Building 期创建的线程由构建者供栈（Building Map）并在 StartupBlock 写入版本化 `EntryThreadDescriptor`（子侧 Control 值、reservation 与 usable 范围）。子进程 runtime 入口用一次性原子采用该描述，在自身 Registry 中登记 record 后才进入应用 wrapper。Rust profile 只有一个 `_start` 采用者，第二次进入 `_start` 是进程完整性失败；其它 Building 线程须使用别的入口契约。采用前进程终止时这些都是进程资源，由 ProcessDrain 收束，不跨地址空间运输 Rust 对象。
+Building 期创建的线程由构建者供栈（Building Map）；其 child-local Control 是 StartupBlock grants/Handle 数组的一项。版本化 `EntryThreadDescriptor` 只记录该项的零基索引与栈 reservation、usable 范围，接收时由同一列表解析，不复制句柄值。子进程 runtime 入口用一次性原子采用该描述，在自身 Registry 中按普通 region owner 登记入口栈 record 后才进入应用 wrapper；运行期栈也由该 owner/cleanup 模型收束，不按来源分支。Rust profile 只有一个 `_start` 采用者，第二次进入 `_start` 是进程完整性失败；其它 Building 线程须使用别的入口契约。采用前进程终止时这些都是进程资源，由 ProcessDrain 收束，不跨地址空间运输 Rust 对象。
 
 ### 结果发布
 

@@ -388,7 +388,7 @@ impl JobOperations for Environment {
             Ok(Handle::from_raw(id))
         }
     }
-    fn kill(&self, _: Handle, _: i64) -> Result<(), SystemCallError> {
+    fn kill(&self, _: Handle) -> Result<(), SystemCallError> {
         Ok(())
     }
     fn query_job(&self, job: Handle) -> Result<JobSnapshot, SystemCallError> {
@@ -431,7 +431,7 @@ fn multiple_pages_preserve_progress_through_stalls_missing_entries_and_nested_cl
         ..DEFAULT_SUPERVISION_POLICY
     };
     let mut collector =
-        JobCollector::new_with_ops(Handle::from_raw(1), 0, policy, Environment(state.clone()))
+        JobCollector::new_with_ops(Handle::from_raw(1), policy, Environment(state.clone()))
             .unwrap();
     let mut stages = Vec::new();
     let mut done = false;
@@ -502,7 +502,6 @@ fn zero_progress_cannot_advance_past_an_unpublished_entry() {
     }));
     let mut collector = JobCollector::new_with_ops(
         Handle::from_raw(1),
-        0,
         DEFAULT_SUPERVISION_POLICY,
         Environment(state.clone()),
     )
@@ -534,7 +533,6 @@ fn stack_and_child_page_allocation_fail_before_deriving_authority() {
         }));
         let mut collector = JobCollector::new_with_ops(
             Handle::from_raw(1),
-            0,
             DEFAULT_SUPERVISION_POLICY,
             Environment(state.clone()),
         )

@@ -12,12 +12,12 @@ use crate::object::Handle;
 use crate::proc::Pid;
 
 /// 块格式版本。
-pub const STARTUP_VERSION: u16 = 2;
+pub const STARTUP_VERSION: u16 = 3;
 
 /// 块基魔数（"STARTUPB"）。
 pub const STARTUP_BLOCK_MAGIC: u64 = u64::from_le_bytes(*b"STARTUPB");
 pub const ENTRY_THREAD_SECTION_KIND: u16 = 1;
-pub const ENTRY_THREAD_SECTION_VERSION: u16 = 1;
+pub const ENTRY_THREAD_SECTION_VERSION: u16 = 2;
 
 /// initial process 固定 capability 图中的 Handle 索引。
 pub mod initial {
@@ -25,16 +25,17 @@ pub mod initial {
     pub const SYSTEM_RESET: usize = 1;
     pub const SELF_PROCESS: usize = 2;
     pub const ROOT_MEMORY_POOL: usize = 3;
-    pub const HANDLE_COUNT: usize = 4;
+    pub const ENTRY_THREAD_CONTROL: usize = ROOT_MEMORY_POOL + 1;
+    pub const HANDLE_COUNT: usize = ENTRY_THREAD_CONTROL + 1;
 }
 
-/// 启动块头。其后紧跟 `handle_count` 个实际 child-local Handle；允许以
-/// 零字节填充到 payload_off，再放置不透明 payload。
+/// 启动块头。其后依次是 `handle_count` 个 child-local Handle、
+/// 入口 descriptor 和不透明 payload；相邻段间仅允许零字节填充。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct StartupBlockHeader {
     pub magic: u64,
-    /// 块总长（字节，含头、Handle 数组与 payload）。
+    /// 块总长（字节，含头、Handle 数组、descriptor 与 payload）。
     pub block_len: u32,
     pub version: u16,
     pub reserved0: u16,
@@ -43,7 +44,7 @@ pub struct StartupBlockHeader {
     /// 仅表示创建关系，不能推导管理、继承或回收权。
     pub parent_pid: Pid,
     pub handle_count: u32,
-    /// payload 相对块基的偏移；不得早于 Handle 数组末尾。
+    /// payload 相对块基的偏移；不得早于 descriptor 末尾。
     pub payload_off: u32,
     pub payload_len: u32,
     pub entry_descriptor_off: u32,
@@ -51,15 +52,16 @@ pub struct StartupBlockHeader {
     pub reserved: u32,
 }
 
-/// StartupBlock payload 起始处的必需入口线程 section。section 由 launcher
-/// 先以 INVALID control 写入，再在 ThreadCreate 成功后回填 child-local 值。
+/// StartupBlock payload 前的入口线程 section；Control 引用 Handle 数组中的
+/// child-local grant，不在描述符中复制句柄值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct EntryThreadDescriptor {
     pub kind: u16,
     pub version: u16,
     pub section_len: u32,
-    pub control: Handle,
+    pub control_index: u32,
+    pub reserved: u32,
     pub stack_reservation_start: u64,
     pub stack_reservation_len: u64,
     pub usable_start: u64,
@@ -176,6 +178,9 @@ pub fn entry_thread_descriptor(
     block: &[u8],
     header: StartupBlockHeader,
 ) -> Result<(EntryThreadDescriptor, &[u8]), StartupParseError> {
+    if validate_startup_block(block)? != header {
+        return Err(StartupParseError::GeometryOverflow);
+    }
     if header.entry_descriptor_len as usize != core::mem::size_of::<EntryThreadDescriptor>() {
         return Err(StartupParseError::MissingEntryThread);
     }
@@ -192,7 +197,8 @@ pub fn entry_thread_descriptor(
     if descriptor.kind != ENTRY_THREAD_SECTION_KIND
         || descriptor.version != ENTRY_THREAD_SECTION_VERSION
         || descriptor.section_len as usize != core::mem::size_of::<EntryThreadDescriptor>()
-        || !descriptor.control.is_valid()
+        || descriptor.reserved != 0
+        || descriptor.control_index >= header.handle_count
         || descriptor.stack_reservation_len == 0
         || descriptor.usable_len == 0
         || descriptor.usable_start < descriptor.stack_reservation_start
@@ -214,7 +220,7 @@ pub fn build_startup_block_with_entry(
     payload: &[u8],
 ) -> Result<Vec<u8>, StartupBuildError> {
     let descriptor_off = core::mem::size_of::<StartupBlockHeader>()
-        .checked_add(handles.len() * core::mem::size_of::<Handle>())
+        .checked_add(core::mem::size_of_val(handles))
         .ok_or(StartupBuildError::Overflow)?;
     let payload_off = descriptor_off
         .checked_add(core::mem::size_of::<EntryThreadDescriptor>())
@@ -241,7 +247,7 @@ pub fn build_startup_prefix_with_entry(
     entry: EntryThreadDescriptor,
 ) -> Result<Vec<u8>, StartupBuildError> {
     let descriptor_off = core::mem::size_of::<StartupBlockHeader>()
-        .checked_add(handles.len() * core::mem::size_of::<Handle>())
+        .checked_add(core::mem::size_of_val(handles))
         .ok_or(StartupBuildError::Overflow)?;
     let descriptor_end = descriptor_off
         .checked_add(core::mem::size_of::<EntryThreadDescriptor>())
@@ -475,6 +481,52 @@ mod tests {
         assert_eq!(
             validate_startup_block(&corrupted),
             Err(StartupParseError::LengthMismatch)
+        );
+    }
+
+    #[test]
+    fn entry_control_references_a_valid_grant() {
+        let handles = [Handle::from_parts(7, 3), Handle::from_parts(8, 4)];
+        let entry = EntryThreadDescriptor {
+            kind: ENTRY_THREAD_SECTION_KIND,
+            version: ENTRY_THREAD_SECTION_VERSION,
+            section_len: core::mem::size_of::<EntryThreadDescriptor>() as u32,
+            control_index: 1,
+            reserved: 0,
+            stack_reservation_start: 0x1000,
+            stack_reservation_len: 0x3000,
+            usable_start: 0x2000,
+            usable_len: 0x2000,
+        };
+        let block = build_startup_block_with_entry(2, 1, &handles, entry, b"seed")
+            .expect("entry startup block must assemble");
+        let header = validate_startup_block(&block).expect("entry startup block must validate");
+        assert_eq!(entry_thread_descriptor(&block, header), Ok((entry, b"seed".as_slice())));
+        for index in [0, handles.len() as u32] {
+            let mut invalid = block.clone();
+            let offset = header.entry_descriptor_off as usize
+                + core::mem::offset_of!(EntryThreadDescriptor, control_index);
+            invalid[offset..offset + 4].copy_from_slice(&index.to_ne_bytes());
+            assert_eq!(
+                entry_thread_descriptor(&invalid, header).is_ok(),
+                index == 0,
+            );
+        }
+        let mut invalid = block;
+        let offset = header.entry_descriptor_off as usize
+            + core::mem::offset_of!(EntryThreadDescriptor, reserved);
+        invalid[offset..offset + 4].copy_from_slice(&1u32.to_ne_bytes());
+        assert_eq!(
+            entry_thread_descriptor(&invalid, header),
+            Err(StartupParseError::BadEntryThread),
+        );
+        let forged = StartupBlockHeader {
+            entry_descriptor_off: u32::MAX,
+            ..header
+        };
+        assert_eq!(
+            entry_thread_descriptor(&invalid, forged),
+            Err(StartupParseError::GeometryOverflow),
         );
     }
 }

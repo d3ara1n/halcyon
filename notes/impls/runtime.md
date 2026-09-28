@@ -60,7 +60,7 @@ Job duty 持有原机器、待准入任务、Runtime、世界与失败处置；B
 
 根按持续游标推进可工作运行体，统一等待所有健康集合和最早期限，不在某个 duty 内调用无限 run。可恢复错误退避，永久错误仍以原类型持有责任，其他运行体继续。失败脚本结束后，services 机器接管管理范围；已摘除对象的旧 control 仍由原 duty 兑现，不能靠重新枚举替代。所有责任确已结束后才尝试失败 reset；平台拒绝时保留根。流建立失败的 Endpoint/Invitation 也有预备清理槽。辅助 Job controls、启动 mailbox/委托副本及流控通知通过预备能力账本的工厂创建，脚本只借用 handle；内核确认 Grant/Send 消费后才兑现本地 owner。pm sender 始终保持 typed owner，不转回无人负责的 raw handle。正常关闭和失败 reset 均覆盖该账本，活动 Job 借用的 root 不会提前关闭。
 
-pm 的 DomainTask 直接使用 JobDriver，删除另一套成员枚举/收束编排；运行体每轮 `max_work=1`。MailboxTask 在分发测试消息后继续停驻，Flow 在 TAIL 后派生 Domain，保留测试阶段顺序。域收束后 main 调用 seal/shutdown_turn；stop 回调检查邮箱已有实际登记，最终检查注销回执已完成、Task/InputBytes 额度归零，并输出必检锚点 `pm: active mailbox stop and refund passed`。不可恢复错误在 owner 仍存活时以非零状态退出，由 init 的独立管理能力接管；该政策不用于 init。
+pm 的 DomainTask 直接使用 JobDriver，删除另一套成员枚举/收束编排；运行体每轮 `max_work=1`。MailboxTask 在分发测试消息后继续停驻，Flow 在 TAIL 后派生 Domain，保留测试阶段顺序。域收束后 main 调用 seal/shutdown_turn；stop 回调检查邮箱已有实际登记，最终检查注销回执已完成、Task/InputBytes 额度归零，并输出必检锚点 `pm: active mailbox stop and refund passed`。不可恢复错误调用 ProcessAbort，由 init 的独立管理能力接管；该政策不用于 init。
 
 init 的 done→腾位→TAIL 使用同一绝对期限。root 故障隔离验收通过正式运行体构造部分准入失败、一个失败成员与健康成员，再给原机器续作额度；另让一台 Job Runtime 暂停时完成另一台 Batch Runtime。两条成功锚点均纳入 QEMU 验收脚本。另验证创建 mailbox 后 duplicate 拒绝仍保留两端 owner、关闭接收端后 Send 拒绝仍保留待移交 JobControl，以及正常结束时辅助能力回到仅保留 services 根的账本基线。seal/create 竞态夹具的临时 JobControl 副本也走同一账本，仅在发送成功后兑现移交。
 

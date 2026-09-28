@@ -4,7 +4,7 @@
 
 ## 同步调用
 
-同步 handler 在一次 trap 内完成：结果写入 UserContext、sepc 前进 4，dispatcher 返回 Resume。输出地址先校验，副作用后的最终写回统一使用 `uaccess::deliver_output`；若同进程另一线程在两次 AddressSpace 临界区之间拆除输出映射，复检失败冻结调用进程 `(Fault, StoreAccess)`，不把已发生副作用与错误返回混合。
+同步 handler 在一次 trap 内完成：结果写入 UserContext、sepc 前进 4，dispatcher 返回 Resume。输入/输出地址在操作前按需预校验，已成功操作的最终固定宽或多段写回使用 `uaccess::deliver_output/deliver_bytes`；若同进程另一线程在两次 AddressSpace 临界区之间拆除输出映射，复检失败以发起 tid 和失败用户 VA 冻结 `Faulted(UserAccess)`，trap 在业务锁释放后执行终止待办，不把已发生副作用报告为可重试成功。提交前尚能回滚的槽位/队头由其 owner 无损归还。
 
 `deliver_output` 失败时在持业务锁的范围内只冻结 Fault 终因，唯一 TerminationTodo 移入当前 Thread 的固定 `output_termination` 槽（MEMORY_COMPLETION 秩）。handler 返回后全部业务 guard 已释放，trap 尾段经 `finish_output_termination` 执行 IPI、termination debt 与通知；执行容器保持 Thread 存活，未交付待办禁止随 Thread 析构。随后生命周期检查将出口改为 Killed，不再返回用户态。其它 hart 的并发终止同样由最终出口检查吸收。
 

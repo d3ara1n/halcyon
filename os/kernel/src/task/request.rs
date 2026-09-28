@@ -6,7 +6,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::Ordering;
 use erhino_shared::{
     call::SystemCallError,
-    proc::{ProcessDrainResult, ProcessDrainStatus, ProcessFaultCode, Tid},
+    proc::{ProcessDrainResult, ProcessDrainStatus, Tid},
 };
 use work_debt::{StepResult, StepState};
 
@@ -354,13 +354,10 @@ impl DrainRequest {
                     crate::uaccess::put_user_indirect(&mut space, self.output, bytes)
                 };
                 if copied.is_err() {
-                    let todo = self.caller.lifecycle.request_termination(
-                        erhino_shared::proc::TerminationCause::Faulted,
-                        erhino_shared::proc::TerminationDetail::fault(
-                            self.caller_tid,
-                            ProcessFaultCode::UserAccess,
-                            self.output as u64,
-                        ),
+                    let todo = crate::uaccess::fault_output(
+                        &self.caller,
+                        self.caller_tid,
+                        self.output,
                         None,
                     );
                     super::process::run_termination_todo(&self.caller, todo);

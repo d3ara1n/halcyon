@@ -285,7 +285,7 @@ fn await_reapable(control: Handle) -> bool {
 
 /// 派生兜底收束（REAPABLE 无主靶）：枚举+派生+drain，断言同
 /// [`drain_expect_dead`]。
-fn derive_and_reap(job: Handle, pid: u64, allowed: &[(u32, Option<i64>)]) -> Option<i64> {
+fn derive_and_reap(job: Handle, pid: u64, allowed: &[u32]) -> Option<u32> {
     let control = match process::derive_job(
         job,
         JobMemberKind::MemberProcesses,
@@ -298,9 +298,9 @@ fn derive_and_reap(job: Handle, pid: u64, allowed: &[(u32, Option<i64>)]) -> Opt
             return None;
         }
     };
-    let code = drain_expect_dead(control, allowed);
+    let cause = drain_expect_dead(control, allowed);
     let _ = unsafe { close(control) };
-    code
+    cause
 }
 
 /// 靶枪与锤枪连发（fire 顺序无关紧要：电平语义不丢令，窗口差只是一个
@@ -398,10 +398,8 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let payload = 0x300 + round as i64;
-        let kill_code = 0x400 + round as i64;
         let (target, gun) =
-            match spawn_race_target(job, image, race::TARGET_SUICIDE, payload as u64) {
+            match spawn_race_target(job, image, race::TARGET_SUICIDE, 0) {
                 Ok(pair) => pair,
                 Err(error) => {
                     debug!("race kill-vs-exit: target spawn failed: {:?}", error);
@@ -414,9 +412,9 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             rights: Rights::MANAGE,
         }];
         let kill = if round % 2 == 1 {
-            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+            race_cmd_delayed(race::ACTION_KILL, 0, 10)
         } else {
-            race_cmd(race::ACTION_KILL, kill_code as u64)
+            race_cmd(race::ACTION_KILL, 0)
         };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
@@ -469,16 +467,15 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 return false;
             }
         };
-        let kill_code = 0x480 + round as i64;
         let moves = [HandleMove {
             handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
                 .unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
         let kill = if round % 2 == 1 {
-            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+            race_cmd_delayed(race::ACTION_KILL, 0, 10)
         } else {
-            race_cmd(race::ACTION_KILL, kill_code as u64)
+            race_cmd(race::ACTION_KILL, 0)
         };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
@@ -509,9 +506,8 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 /// 在真实竞速前先用明确的顺序覆盖两种合法终因：一轮只放行末线程
 /// Completed，一轮在发枪前 Kill。该覆盖不依赖调度器随机选择胜者。
 fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
-    let payload = 0x4b0;
     let (exit_target, exit_gun) =
-        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, payload) {
+        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, 0) {
             Ok(pair) => pair,
             Err(error) => {
                 debug!(
@@ -532,9 +528,8 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
     let _ = unsafe { close(exit_target.control) };
     let _ = unsafe { close(exit_gun) };
 
-    let kill_code = 0x4c0;
     let (kill_target, kill_gun) =
-        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, kill_code) {
+        match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, 0) {
             Ok(pair) => pair,
             Err(error) => {
                 debug!(
@@ -547,7 +542,7 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
     unsafe { sys_sleep(30).expect("last-thread kill-first setup sleep failed") };
     let report = h.shoot(
         0,
-        &race_cmd(race::ACTION_KILL, kill_code),
+        &race_cmd(race::ACTION_KILL, 0),
         &[HandleMove {
             handle: duplicate(kill_target.control, Rights::MANAGE | Rights::TRANSIT)
                 .unwrap_or(Handle::INVALID),
@@ -579,13 +574,11 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
     let mut ok = cover_last_thread_exit_kill_outcomes(h, job, image);
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let payload = 0x490 + round as i64;
-        let kill_code = 0x4a0 + round as i64;
         let (target, gun) = match spawn_race_target(
             job,
             image,
             race::TARGET_LAST_THREAD_EXIT_RACE,
-            payload as u64,
+            0,
         ) {
             Ok(pair) => pair,
             Err(error) => {
@@ -605,9 +598,9 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
             rights: Rights::MANAGE,
         }];
         let kill = if round % 2 == 1 {
-            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+            race_cmd_delayed(race::ACTION_KILL, 0, 10)
         } else {
-            race_cmd(race::ACTION_KILL, kill_code as u64)
+            race_cmd(race::ACTION_KILL, 0)
         };
         let sent = h.send_cmd(0, &kill, &moves);
         if round % 2 == 0 {
@@ -626,7 +619,7 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
         match drain_expect_dead(target.control, &allowed) {
             Some(cause) if cause == TerminationCause::Completed as u32 => dist[0] += 1,
             Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
-            None => ok = false,
+            _ => ok = false,
         }
         if !sent || !matches!(report, Some(report) if report.status == 0) {
             debug!(
@@ -658,7 +651,6 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let kill_code = 0x500 + round as i64;
         let (target, gun) = match spawn_race_target(job, image, race::TARGET_FAULT, 0) {
             Ok(pair) => pair,
             Err(error) => {
@@ -672,9 +664,9 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             rights: Rights::MANAGE,
         }];
         let kill = if round % 2 == 1 {
-            race_cmd_delayed(race::ACTION_KILL, kill_code as u64, 10)
+            race_cmd_delayed(race::ACTION_KILL, 0, 10)
         } else {
-            race_cmd(race::ACTION_KILL, kill_code as u64)
+            race_cmd(race::ACTION_KILL, 0)
         };
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
@@ -728,7 +720,6 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
                 return false;
             }
         };
-        let kill_code = 0x600 + round as i64;
         // builder 不可 duplicate（无 DUPLICATE 位）：原件经消息移交。
         let start_moves = [HandleMove {
             handle: created.builder,
@@ -740,7 +731,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
             rights: Rights::MANAGE,
         }];
         let start_cmd = race_cmd(race::ACTION_START, 0);
-        let kill_cmd = race_cmd(race::ACTION_KILL, kill_code as u64);
+        let kill_cmd = race_cmd(race::ACTION_KILL, 0);
         let sent = h.send_cmd(0, &start_cmd, &start_moves) && h.send_cmd(1, &kill_cmd, &kill_moves);
         h.fire(&[0, 1]);
         let (rep_start, _) = h.report(0).unwrap_or((
@@ -796,7 +787,6 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
 fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..2u64 {
-        let kill_code = 0x700 + round as i64;
         let (target, gun) = match spawn_race_target(job, image, race::TARGET_PARK, 0) {
             Ok(pair) => pair,
             Err(error) => {
@@ -806,7 +796,7 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         };
         let (rep, _) = match h.shoot(
             0,
-            &race_cmd(race::ACTION_KILL, kill_code as u64),
+            &race_cmd(race::ACTION_KILL, 0),
             &[HandleMove {
                 handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
                     .unwrap_or(Handle::INVALID),
@@ -847,7 +837,6 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..4u64 {
-        let kill_code = 0xb00 + round as i64;
         let (target, gun) = match spawn_race_target(job, image, race::TARGET_MEMORY_CHURN, 0) {
             Ok(pair) => pair,
             Err(error) => {
@@ -859,7 +848,7 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         // SAFETY: 纯相对延迟，不携带用户指针。
         unsafe { sys_sleep(10).expect("memory race warmup sleep failed") };
         // warmup 后以短延迟覆盖大 backing 清零期间的跨 hart ack 窗口。
-        let kill = race_cmd_delayed(race::ACTION_KILL, kill_code as u64, round);
+        let kill = race_cmd_delayed(race::ACTION_KILL, 0, round);
         let sent = h.send_cmd(
             0,
             &kill,
@@ -1028,7 +1017,6 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
                 return false;
             }
         };
-        let kill_code = 0x800 + round as i64;
         let close_cmd = if round % 2 == 1 {
             race_cmd_delayed(race::ACTION_CLOSE, 0, 10)
         } else {
@@ -1046,7 +1034,7 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
         let sent = h.send_cmd(0, &close_cmd, &close_moves)
             && h.send_cmd(
                 1,
-                &race_cmd(race::ACTION_KILL, kill_code as u64),
+                &race_cmd(race::ACTION_KILL, 0),
                 &kill_moves,
             );
         h.fire(&[0, 1]);
@@ -1351,7 +1339,6 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let busy = SystemCallError::ObjectBusy as i64;
     for round in 0..2u64 {
-        let kill_code = 0x900 + round as i64;
         let target = match spawn(SpawnRequest {
             job,
             memory_pool: crate::root_memory_pool(),
@@ -1438,7 +1425,6 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..2u64 {
-        let kill_code = 0xA00 + round as i64;
         let target = match spawn(SpawnRequest {
             job,
             memory_pool: crate::root_memory_pool(),
@@ -1458,7 +1444,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             handle: target.control,
             rights: Rights::MANAGE,
         }];
-        let (rep, _) = match h.shoot(0, &race_cmd(race::ACTION_KILL, kill_code as u64), &moves) {
+        let (rep, _) = match h.shoot(0, &race_cmd(race::ACTION_KILL, 0), &moves) {
             Some(pair) => pair,
             None => {
                 debug!("race last-control: hammer report missing");

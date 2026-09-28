@@ -4486,7 +4486,7 @@ impl Process {
         &self,
         requirement: elf::IsaRequirement,
         domain: &'static crate::sched::SchedDomain,
-    ) {
+    ) -> Result<(), erhino_shared::call::SystemCallError> {
         const REQUIREMENT_BIT: usize = 1;
         let requirement_bit = match requirement {
             elf::IsaRequirement::Base64 => 0,
@@ -4495,7 +4495,8 @@ impl Process {
         let encoded = ((domain.index() + 1) << 1) | requirement_bit;
         self.execution
             .compare_exchange(0, encoded, Ordering::Release, Ordering::Relaxed)
-            .expect("execution binding frozen twice");
+            .map_err(|_| erhino_shared::call::SystemCallError::ObjectNotAvailable)?;
+        Ok(())
     }
 
     fn execution(&self) -> usize {
@@ -4879,6 +4880,14 @@ impl Thread {
     }
 
     pub(crate) fn abandon_created(&self) {
+        let Some(created) = self.process.lifecycle.claim_created_departure(self.member) else {
+            return;
+        };
+        self.departure.request();
+        drop(created);
+    }
+
+    pub(crate) fn finish_created_departure(&self) {
         self.departure.request();
     }
 
@@ -4900,12 +4909,7 @@ impl Thread {
             .lock()
             .take()
             .expect("Created thread must own a Ready admission");
-        self.departure.mark_started();
         batch.publish_one(self.clone());
-    }
-
-    pub(crate) fn mark_started(&self) {
-        self.departure.mark_started();
     }
 
     pub(crate) fn defer_output_termination(&self, todo: super::lifecycle::TerminationTodo) {
@@ -5188,15 +5192,6 @@ pub(crate) fn launch_bootstrap(
         };
         handles.push(
             super::handle::entry(
-                super::thread::ThreadControl::object_ref(&thread_control),
-                super::object::HandleRole::ThreadControl,
-                super::thread::CONTROL_MAX_RIGHTS,
-            )
-            .expect("bootstrap ThreadControl rights are static"),
-        );
-
-        handles.push(
-            super::handle::entry(
                 super::memory_pool::MemoryPool::object_ref(&root_pool),
                 super::object::HandleRole::MemoryPool,
                 erhino_shared::object::Rights::CREATE
@@ -5206,6 +5201,24 @@ pub(crate) fn launch_bootstrap(
                     | erhino_shared::object::Rights::GRANT,
             )
             .expect("bootstrap root Pool rights are static"),
+        );
+        assert_eq!(
+            handles.entries().len(),
+            erhino_shared::startup::initial::ENTRY_THREAD_CONTROL,
+            "bootstrap capability order changed before entry Control"
+        );
+        handles.push(
+            super::handle::entry(
+                super::thread::ThreadControl::object_ref(&thread_control),
+                super::object::HandleRole::ThreadControl,
+                super::thread::CONTROL_MAX_RIGHTS,
+            )
+            .expect("bootstrap ThreadControl rights are static"),
+        );
+        assert_eq!(
+            handles.entries().len(),
+            erhino_shared::startup::initial::HANDLE_COUNT,
+            "bootstrap capability count changed"
         );
 
         let reservation = {
@@ -5222,18 +5235,14 @@ pub(crate) fn launch_bootstrap(
             }
         };
 
-        let control_handle = reservation
-            .handles()
-            .last()
-            .copied()
-            .expect("bootstrap ThreadControl handle missing");
         let entry_descriptor = erhino_shared::startup::EntryThreadDescriptor {
             kind: erhino_shared::startup::ENTRY_THREAD_SECTION_KIND,
             version: erhino_shared::startup::ENTRY_THREAD_SECTION_VERSION,
             section_len: core::mem::size_of::<
                 erhino_shared::startup::EntryThreadDescriptor,
             >() as u32,
-            control: control_handle,
+            control_index: erhino_shared::startup::initial::ENTRY_THREAD_CONTROL as u32,
+            reserved: 0,
             stack_reservation_start: (USER_TOP - STACK_SIZE) as u64,
             stack_reservation_len: STACK_SIZE as u64,
             usable_start: (USER_TOP - STACK_SIZE) as u64,
@@ -5359,7 +5368,9 @@ pub(crate) fn launch_bootstrap(
                 return Err(SpaceError::NoFrame);
             }
         };
-        process.bind_execution(requirement, domain);
+        process
+            .bind_execution(requirement, domain)
+            .expect("bootstrap execution binding must be unique");
         let (_, created_thread) = match process.attach_thread_with_control(
             ThreadStartContext {
             entry: entry as u64,
@@ -5448,7 +5459,6 @@ pub(crate) fn launch_bootstrap(
                 .publish(),
         );
         let thread = ready_head.expect("bootstrap thread missing");
-        thread.mark_started();
         Ok(ready_batch.admit(thread))
     })();
     match result {

@@ -35,7 +35,7 @@ use rinlib::{
         mem::MemoryProtection,
         object::{Handle, ObjectSignals},
         proc::{
-            ExecutionProfile, JobMemberKind, ThreadCreateResult, ThreadStartContext,
+            JobMemberKind, ThreadCreateResult, ThreadStartContext,
             PROCESS_MAX_THREADS, PROCESS_PAGE_SIZE,
         },
         wait::WaitItem,
@@ -153,8 +153,7 @@ fn execute(
         },
         ACTION_START => {
             let builder = capability.into_raw();
-            let result = process::bind_execution(builder, ExecutionProfile::Base64 as u32)
-                .and_then(|_| process::start(builder));
+            let result = process::start(builder);
             if result.is_err() {
                 // SAFETY: 从运输 owner 取出的 builder，失败未消费且无其他 owner。
                 let _ = unsafe { close(builder) };

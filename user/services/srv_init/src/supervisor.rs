@@ -1150,7 +1150,7 @@ impl RootSupervisor {
                     .as_ref()
                     .expect("all results succeeded");
                 debug!(
-                    "pid {} supervised: work={}, state={}, reason={}, code={}",
+                    "pid {} supervised: work={}, state={}, reason={}, detail0={}",
                     done.pid,
                     done.progress.work_done,
                     done.snapshot.state,

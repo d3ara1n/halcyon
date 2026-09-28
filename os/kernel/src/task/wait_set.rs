@@ -744,7 +744,7 @@ fn resolve(thread: &Thread, handle: Handle, rights: Rights) -> Result<ObjectRef,
     if *entry.role() != HandleRole::WaitSetOwner || entry.object().kind() != ObjectKind::WaitSet {
         return Err(SystemCallError::WrongObjectType);
     }
-    Ok(entry.object().clone())
+    Ok(entry.object().as_object().clone())
 }
 
 pub(crate) fn concrete(object: &ObjectRef) -> Result<&WaitSet, SystemCallError> {
@@ -800,11 +800,11 @@ pub fn register(
         if item.signals.raw() & !allowed.raw() != 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let authority = item_entry.object().clone();
+        let authority = item_entry.object().as_object().clone();
         let source = authority
             .observation_source()
             .unwrap_or_else(|| authority.clone());
-        (set.object().clone(), authority, source)
+        (set.object().as_object().clone(), authority, source)
     };
     let set = concrete(&set_object)?;
     let target = set_object.clone();
@@ -842,7 +842,7 @@ pub fn register(
                 ordered_table::InsertError::Allocation(_) => SystemCallError::OutOfMemory,
             })?;
         // SAFETY: 地址初检完成，先交付 token 后公开注册。失败无注册副作用。
-        unsafe { uaccess::write_user_value(&mut space, output, &token) }?;
+        unsafe { uaccess::deliver_output(thread, &mut space, output, &token) }?;
         state.entries.insert_prepared(prepared);
     }
     let _operation = Operation {
@@ -942,9 +942,11 @@ pub fn receive(
                 core::mem::size_of_val(records.as_slice()),
             )
         };
-        uaccess::copy_to_user(&mut space, output, bytes)?;
+        uaccess::deliver_bytes(thread, &mut space, output, bytes)?;
         // SAFETY: count 为固定宽，所有写回成功后才消费 ready 队列。
-        unsafe { uaccess::write_user_value(&mut space, count_output, &(records.len() as u32)) }?;
+        unsafe {
+            uaccess::deliver_output(thread, &mut space, count_output, &(records.len() as u32))
+        }?;
         for record in &records {
             state.unlink(record.token);
             state

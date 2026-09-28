@@ -787,7 +787,7 @@ pub fn enumerate(
             actual * core::mem::size_of::<u64>(),
         )
     };
-    crate::uaccess::copy_to_user(&mut space, buf, bytes)?;
+    crate::uaccess::deliver_bytes(thread, &mut space, buf, bytes)?;
     // SAFETY: JobEnumerateResult 字段全部初始化，无 padding；复检失败
     // 即杀本进程（deliver_output）。
     unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }

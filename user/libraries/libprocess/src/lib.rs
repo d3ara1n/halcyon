@@ -185,11 +185,10 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             elf::IsaRequirement::Base64 => ExecutionProfile::Base64,
             elf::IsaRequirement::D64 => ExecutionProfile::D64,
         };
-        // 组装序列（线程是组装资源）：Grant 装句柄 → 组装者自构造出生块
-        // （shared::startup 线格式）→ Write 写入约定区 → Attach 首线程
-        // （arg1/arg2 = 块基/块长）→ Start 入册。
+        // 出生区先映射，ThreadCreate 再取得 child-local Control；最后一次
+        // 写入包含全部 grants 的出生块，Start 只发布已准备的线程。
         let grant_len = request.grants.len();
-        let mut granted = [Handle::INVALID; PROCESS_MAX_GRANTS];
+        let mut granted = [Handle::INVALID; PROCESS_MAX_GRANTS + 1];
         if grant_len > 0 {
             process::grant(builder, request.grants, &mut granted[..grant_len])?;
             grants_consumed = true;
@@ -200,25 +199,25 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             section_len: core::mem::size_of::<
                 erhino_shared::startup::EntryThreadDescriptor,
             >() as u32,
-            control: Handle::INVALID,
+            control_index: grant_len as u32,
+            reserved: 0,
             stack_reservation_start: stack_start as u64,
             stack_reservation_len: stack_len as u64,
             usable_start: stack_start as u64,
             usable_len: stack_len as u64,
         };
-        let block = build_birth_block(
-            created.pid,
-            &granted[..grant_len],
-            entry,
-            request.payload,
-        )?;
         let image_top = usize::try_from(image.image_end()).map_err(|_| SpawnError::InvalidImage)?;
-        let block_va = write_birth_block(builder, &block, image_top)?;
+        let block_len = core::mem::size_of::<StartupBlockHeader>()
+            .checked_add((grant_len + 1) * core::mem::size_of::<Handle>())
+            .and_then(|len| len.checked_add(core::mem::size_of::<EntryThreadDescriptor>()))
+            .and_then(|len| len.checked_add(request.payload.len()))
+            .ok_or(SpawnError::InvalidImage)?;
+        let block_va = map_birth_block(builder, block_len, image_top)?;
         let descriptor = ThreadStartContext {
             entry: image.entry(),
             stack_pointer: PROCESS_USER_TOP as u64,
             arg1: block_va as u64,
-            arg2: block.len() as u64,
+            arg2: block_len as u64,
         };
         process::bind_execution(builder, profile as u32)?;
         let mut thread_created = erhino_shared::proc::ThreadCreateResult {
@@ -227,19 +226,17 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             control: Handle::INVALID,
         };
         process::thread_create(builder, &descriptor, &mut thread_created)?;
-        let entry = EntryThreadDescriptor {
-            control: thread_created.control,
-            ..entry
-        };
-        let entry_bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&entry as *const EntryThreadDescriptor).cast::<u8>(),
-                core::mem::size_of::<EntryThreadDescriptor>(),
-            )
-        };
-        let entry_offset = core::mem::size_of::<StartupBlockHeader>()
-            + grant_len * core::mem::size_of::<Handle>();
-        process::write(builder, block_va + entry_offset, entry_bytes)?;
+        granted[grant_len] = thread_created.control;
+        let block = build_birth_block(
+            created.pid,
+            &granted[..=grant_len],
+            entry,
+            request.payload,
+        )?;
+        if block.len() != block_len {
+            return Err(SpawnError::InvalidImage);
+        }
+        process::write(builder, block_va, &block)?;
         process::start(builder)?;
         Ok(Spawned {
             pid: created.pid,
@@ -1204,17 +1201,17 @@ fn build_birth_block(
 
 /// 出生块写入约定区：validated ELF 的映像顶之上页对齐放置——组装者
 /// 掌握映像布局（Map 由其驱动），无需查询目标布局游标；块的只读性由接收方
-/// 运行时自行遵守（v1 约定，见计划篇 D6c）。逐页映射并单次回填，
+/// 运行时自行遵守（见分层计划）。逐页映射，内容由创建完入口线程的调用方一次写入，
 /// 返回块基址。
-fn write_birth_block(builder: Handle, block: &[u8], image_top: usize) -> Result<usize, SpawnError> {
+fn map_birth_block(builder: Handle, block_len: usize, image_top: usize) -> Result<usize, SpawnError> {
     let base = image_top.div_ceil(PROCESS_PAGE_SIZE) * PROCESS_PAGE_SIZE;
     let end = base
-        .checked_add(block.len())
+        .checked_add(block_len)
         .ok_or(SpawnError::InvalidImage)?;
     if end > PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE {
         return Err(SpawnError::InvalidImage);
     }
-    let span_pages = block.len().div_ceil(PROCESS_PAGE_SIZE);
+    let span_pages = block_len.div_ceil(PROCESS_PAGE_SIZE);
     let span = span_pages * PROCESS_PAGE_SIZE;
     let permissions = ProcessMapFlags::READ | ProcessMapFlags::WRITE;
     let mut mapped = 0usize;
@@ -1223,7 +1220,6 @@ fn write_birth_block(builder: Handle, block: &[u8], image_top: usize) -> Result<
         process::map(builder, base + mapped, len, permissions).map_err(SpawnError::System)?;
         mapped += len;
     }
-    process::write(builder, base, block).map_err(SpawnError::System)?;
     Ok(base)
 }
 

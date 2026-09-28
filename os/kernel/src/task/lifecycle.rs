@@ -487,6 +487,27 @@ impl Lifecycle {
         }
     }
 
+    /// 最后 Control 消散与 Start/终止游标在同一状态真值上争取离场权。
+    pub(crate) fn claim_created_departure(&self, member: CreatedMember) -> Option<Arc<super::Thread>> {
+        let mut inner = self.inner.lock();
+        let slot = inner.members.get_mut(member.slot)?;
+        if slot.generation != member.generation || slot.entry.as_ref()?.tid != member.tid {
+            return None;
+        }
+        let entry = slot.entry.as_mut()?;
+        if matches!(entry.state, ThreadState::Created { .. }) {
+            let ThreadState::Created { thread } =
+                core::mem::replace(&mut entry.state, ThreadState::Exiting)
+            else {
+                unreachable!("Created member changed under lifecycle lock");
+            };
+            advance_execution(&mut inner);
+            Some(thread)
+        } else {
+            None
+        }
+    }
+
     /// 固定宽输出 fault 的防御回滚。线程从未进入调度容器；调用方锁外 drop
     /// 返回的强引用，并在 true 时发布进程 REAPABLE。
     pub(crate) fn rollback_created(&self, member: CreatedMember) -> (Arc<super::Thread>, bool) {

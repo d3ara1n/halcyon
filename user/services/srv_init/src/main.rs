@@ -80,7 +80,7 @@ use rinlib::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{
-            ExecutionProfile, HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
+            HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
         },
         reset::{ResetAction, ResetReason},
         startup::initial,

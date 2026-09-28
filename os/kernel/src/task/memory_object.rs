@@ -391,7 +391,7 @@ fn resolve(
     {
         return Err(SystemCallError::WrongObjectType);
     }
-    let any: Arc<dyn core::any::Any + Send + Sync> = entry.object().clone();
+    let any: Arc<dyn core::any::Any + Send + Sync> = entry.object().as_object().clone();
     any.downcast::<MemoryObject>()
         .map_err(|_| SystemCallError::WrongObjectType)
 }

@@ -7,7 +7,12 @@ use crate::task::{
     proc,
     selftest::{Activated, Caller, pump},
 };
-use erhino_shared::{message::ReceiveResult, object::SenderResult, wait::WaitItem};
+use erhino_shared::{
+    message::ReceiveResult,
+    object::SenderResult,
+    proc::{ProcessFaultCode, TerminationCause, TerminationDetail},
+    wait::WaitItem,
+};
 
 fn object_of(caller: &Caller, h: Handle) -> ObjectRef {
     caller
@@ -17,6 +22,7 @@ fn object_of(caller: &Caller, h: Handle) -> ObjectRef {
         .get(h, Rights::NONE)
         .unwrap()
         .object()
+        .as_object()
         .clone()
 }
 
@@ -323,9 +329,7 @@ fn writeback_rollback(root: &Arc<MemoryPool>) {
         .begin_receive(&mut caller.process.handles.lock(), token, 4, 1)
         .unwrap();
     let reserved = reservation.handles().to_vec();
-    let delivery_id = message.delivery.object().header().koid();
     let expected_header = message.header;
-    let moved_id = message.handles[0].object().header().koid();
     assert!(
         !mailbox.signals().intersects(ObjectSignals::READABLE),
         "receive reservation left queued followers readable"
@@ -404,15 +408,23 @@ fn writeback_rollback(root: &Arc<MemoryPool>) {
             Err(SystemCallError::MemoryNotAccessible)
         );
     }
-    assert!(
-        !caller.process.lifecycle.is_terminating(),
-        "rolled-back Receive incorrectly faulted its caller"
+    assert_eq!(
+        (
+            caller.process.lifecycle.snapshot().1,
+            caller.process.lifecycle.snapshot().2,
+        ),
+        (
+            TerminationCause::Faulted,
+            TerminationDetail::fault(
+                caller.thread().member().tid(),
+                ProcessFaultCode::UserAccess,
+                output.payload as u64,
+            ),
+        ),
+        "Receive output failure lost its initiating thread and VA"
     );
     let partial: ReceiveResult = caller.read(output.header);
-    assert_eq!(
-        partial.header.kind, 1,
-        "Receive did not reach its partial-header write boundary"
-    );
+    assert_eq!(partial.header, expected_header, "Receive partial header changed");
     assert!(
         reserved.last() == Some(&partial.delivery),
         "partial header lost its reserved Delivery identity"
@@ -437,41 +449,7 @@ fn writeback_rollback(root: &Arc<MemoryPool>) {
         watch_object.signals().intersects(ObjectSignals::READABLE),
         "rollback failed to wake its installed observer"
     );
-    let retry = caller.output - proc::PAGE_SIZE;
-    let first = receive_message(&caller, owner, retry, 1);
-    assert_eq!(
-        first.header, expected_header,
-        "rollback changed the reserved envelope"
-    );
-    assert_eq!(
-        caller.read::<[u8; 4]>(retry + 80),
-        [1, 2, 3, 1],
-        "rollback changed the queued payload"
-    );
-    assert_eq!(
-        object_of(&caller, caller.read(retry + 96)).header().koid(),
-        moved_id,
-        "rollback changed the transit capability identity"
-    );
-    for &h in &reserved {
-        assert!(
-            matches!(
-                caller.process.handles.lock().get(h, Rights::NONE),
-                Err(handle_table::TableError::StaleHandle)
-            ),
-            "old partial output regained authority after slot reuse"
-        );
-    }
-    assert_eq!(
-        object_of(&caller, first.delivery).header().koid(),
-        delivery_id,
-        "retry replaced the affine Delivery"
-    );
-    close(&caller, caller.read(retry + 96));
-    close(&caller, first.delivery);
-    let second = receive_message(&caller, owner, retry, 0);
-    assert_eq!(second.header.kind, 2);
-    close(&caller, second.delivery);
+    caller.thread().finish_output_termination();
     caller.cleanup();
 }
 
@@ -583,6 +561,22 @@ fn capacity_closed(root: &Arc<MemoryPool>) {
         mailbox.state.lock().queue.is_empty(),
         "closed rollback resurrected the queue"
     );
+    assert_eq!(
+        (
+            caller.process.lifecycle.snapshot().1,
+            caller.process.lifecycle.snapshot().2,
+        ),
+        (
+            TerminationCause::Faulted,
+            TerminationDetail::fault(
+                caller.thread().member().tid(),
+                ProcessFaultCode::UserAccess,
+                output.payload as u64,
+            ),
+        ),
+        "closed Receive output failure lost its initiating thread and VA"
+    );
+    caller.thread().finish_output_termination();
     caller.cleanup();
 }
 

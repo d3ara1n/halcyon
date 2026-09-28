@@ -155,7 +155,7 @@ fn prepare_items(
             if item.signals.raw() & !allowed.raw() != 0 {
                 return Err(SystemCallError::IllegalArgument);
             }
-            let authority = entry.object().clone();
+            let authority = entry.object().as_object().clone();
             let object = authority
                 .observation_source()
                 .unwrap_or_else(|| authority.clone());
@@ -192,7 +192,7 @@ fn prepare_items(
     if let Some(result) = ready {
         let mut space = thread.process.space.lock();
         // SAFETY: 初始扫描按真实输入索引选择，结果完整初始化且无 padding。
-        unsafe { uaccess::write_user_value(&mut space, result_ptr, &result) }?;
+        unsafe { uaccess::deliver_output(thread, &mut space, result_ptr, &result) }?;
         return Ok(WaitStart::Ready);
     }
 
@@ -206,7 +206,7 @@ fn prepare_items(
         let result = WaitResult::new(0, ObjectSignals::NONE, u32::MAX, WaitReason::Timeout);
         let mut space = thread.process.space.lock();
         // SAFETY: 固定宽结果及 reserved 完整初始化，失败不发布等待。
-        unsafe { uaccess::write_user_value(&mut space, result_ptr, &result) }?;
+        unsafe { uaccess::deliver_output(thread, &mut space, result_ptr, &result) }?;
         return Ok(WaitStart::Ready);
     }
 
@@ -703,7 +703,13 @@ impl WaitContext {
                 departure.request();
             } else {
                 self.deliver(&thread, outcome);
-                sched::enqueue(thread);
+                if thread.process.lifecycle.is_terminating() {
+                    let departure = thread.departure();
+                    drop(thread);
+                    departure.request();
+                } else {
+                    sched::enqueue(thread);
+                }
             }
         }
     }
@@ -938,7 +944,7 @@ fn context_thread_identity(
     (thread.process.clone(), thread.member())
 }
 
-/// 将 WaitResult 写回用户现场并推进 sepc；写回失败则携带错误返回。
+/// 将 WaitResult 写回用户现场；完成后复检失败按用户访问 fault 收束。
 fn deliver_wait_result(
     thread: &Thread,
     frame: &mut UserContext,
@@ -961,9 +967,14 @@ fn deliver_wait_result(
             frame.x[10] = 0;
             frame.x[11] = 0;
         }
-        Err(error) => {
-            let error = SystemCallError::from(error);
-            frame.x[10] = error.to_usize().unwrap_or(1) as u64;
+        Err(_) => {
+            let todo = uaccess::fault_output(
+                &thread.process,
+                thread.member().tid(),
+                result_ptr,
+                None,
+            );
+            super::process::run_termination_todo(&thread.process, todo);
         }
     }
     frame.sepc += 4;

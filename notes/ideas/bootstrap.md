@@ -41,10 +41,10 @@ initfs 直接成为 init StartupBlock 的 opaque payload，不另建 Archive、M
 
 ```text
 init 虚拟地址空间中的 StartupBlock
-[Header][actual Handles][zero padding][read-only mapped initfs]
+[Header][actual Handles][EntryThreadDescriptor][zero padding][read-only mapped initfs]
 ```
 
-StartupBlock outer 允许 Handle 数组结束与 payload 起点之间存在零填充。普通进程的小 payload 可以紧凑复制；init 的大 payload 从 BootPackage 页直接映射到同一连续虚拟块，`startup_payload()` 对二者提供相同切片语义。
+StartupBlock outer 在 Handle 数组后携带入口线程 descriptor，descriptor 与 payload 之间允许零填充。普通进程的小 payload 可以紧凑复制；init 的大 payload 从 BootPackage 页直接映射到同一连续虚拟块，`startup_payload()` 对二者提供相同切片语义。
 
 映射必须为用户可读、不可写、不可执行。payload 页不进入普通进程可转授对象图：关闭 Handle 不能影响它，也没有任何运行时入口能重新映射或转授这些页。映入 init 前，这些页从 boot-held 原子转换为由 init root pool 支付的 funded backing；页与 primordial charge 随地址空间销毁一起经正常 retire 返回库存和 pool，不允许只迁移物理所有权而遗漏计费。BootPackage 物理占用按 envelope 的实际总长保留，而不是按 Devicetree 中的最大装载窗口保留。
 
@@ -145,7 +145,7 @@ Zircon 把 bootdata 作为显式 VMO 交给普通 userboot，由 userboot 解析
 
 这项保活由地址空间及合法 launcher/程序环境契约承担，不是将 Rust 切片随意强转为 static。公开的 StartupPayload 持有经验证的只读视图凭据，借出的字节切片绑定到该视图的借用；它可以显式 clone 并跨本进程线程共享，但不拥有原始 Handle 数组，也不拥有 backing 回收权。丢弃所有 payload 视图不提前解除映像；只有进程地址空间收束返还 backing 与计费。未来若需要启动区提前回收，必须增加真实的映射交接契约后再改变此寿命，不能让当前上下文 Drop 偷做。
 
-StartupBlock、初始 grants 和 payload 视图是进程环境资源；入口线程的执行栈与 ThreadControl 是线程资源。构建者经 Building Map 建立入口栈，ThreadCreate 把 child-local Control 安装到目标表，并在 StartupBlock 中写入版本化 `EntryThreadDescriptor`（Control 表项值、栈 reservation 与 usable 范围）。子进程 runtime 以原子 once 采用该描述符，把入口线程登记为普通 ThreadRecord；第二次进入 `_start` 属于进程完整性失败，这是 Rust profile 只有一个入口的强制点。未采用前进程终止时，这些都是进程资源，由 ProcessDrain 收回，不跨地址空间运输 Rust 对象。采用后入口线程与运行期线程使用同一结果、离场和 cleanup 状态机，不按 TID/PID 分支。
+StartupBlock、初始 grants 和 payload 视图是进程环境资源；入口线程的执行栈与 ThreadControl 是线程资源。构建者经 Building Map 建立入口栈，ThreadCreate 把 child-local Control 安装到目标表，并将该句柄加入 StartupBlock 的 grants/Handle 数组；版本化 `EntryThreadDescriptor` 只引用对应零基索引与栈 reservation、usable 范围。子进程 runtime 以原子 once 采用该描述符，用 reservation 重建普通 region owner 并把入口线程登记为普通 ThreadRecord；第二次进入 `_start` 属于进程完整性失败，这是 Rust profile 只有一个入口的强制点。未采用前进程终止时，这些都是进程资源，由 ProcessDrain 收回，不跨地址空间运输 Rust 对象。采用后入口线程与运行期线程使用同一结果、离场和 cleanup 状态机，不按 TID/PID 分支。
 
 进入 Rust 安全接口的原始指针接管仍是 unsafe：调用者须保证完整映像可读、长度可表示、内容稳定及上述寿命。outer 格式校验只能验证已可访问字节的布局，不能证明一个任意指针可读。平台入口适配器是该不变量的唯一生产接点，非法启动输入按程序失败收束，不把用户地址错误变成内核 panic。
 

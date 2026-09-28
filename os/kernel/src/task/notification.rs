@@ -256,8 +256,8 @@ pub fn take(
     let mut space = thread.process.space.lock();
     space.check_range(output, core::mem::size_of::<u64>(), true)?;
     let taken = notification.take(mask)?;
-    // SAFETY: u64 无 padding，且 space 锁使预校验到复制之间无映射变化。
-    unsafe { crate::uaccess::write_user_value(&mut space, output, &taken) }?;
+    // SAFETY: u64 无 padding；消费信号后的写回失败终止发起进程。
+    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &taken) }?;
     Ok(())
 }
 
@@ -274,7 +274,7 @@ fn resolve(
     if *entry.role() != role || entry.object().kind() != ObjectKind::Notification {
         return Err(SystemCallError::WrongObjectType);
     }
-    Ok(entry.object().clone())
+    Ok(entry.object().as_object().clone())
 }
 
 fn concrete(object: &ObjectRef) -> Result<&Notification, SystemCallError> {

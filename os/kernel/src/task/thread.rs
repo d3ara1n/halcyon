@@ -6,16 +6,13 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use erhino_shared::{
     call::SystemCallError,
     object::{ObjectSignals, Rights},
-    proc::{
-        ProcessFaultCode, TerminationCause, TerminationDetail, ThreadCreateResult,
-        ThreadStartContext,
-    },
+    proc::{ThreadCreateResult, ThreadStartContext},
 };
 
 use super::{
@@ -41,7 +38,7 @@ pub(crate) struct ThreadControl {
     header: ObjectHeader,
     wait: crate::sync::Spinlock<ObjectWaitState>,
     thread: crate::sync::Spinlock<Option<Weak<super::proc::Thread>>>,
-    started: AtomicBool,
+    capabilities: AtomicUsize,
 }
 
 impl ThreadControl {
@@ -54,7 +51,7 @@ impl ThreadControl {
                 ObjectWaitState::new(ObjectSignals::NONE),
             ),
             thread: crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None),
-            started: AtomicBool::new(false),
+            capabilities: AtomicUsize::new(0),
         })
         .map_err(|_| erhino_shared::call::SystemCallError::OutOfMemory)
     }
@@ -75,13 +72,33 @@ impl ThreadControl {
         *self.thread.lock() = Some(Arc::downgrade(thread));
     }
 
-    pub(crate) fn start(&self) -> Result<(), SystemCallError> {
+    pub(crate) fn acquire_capability(&self) {
+        self.capabilities
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| count.checked_add(1))
+            .expect("ThreadControl capability count exhausted");
+    }
+
+    pub(crate) fn release_capability(&self) {
+        let old = self.capabilities.fetch_sub(1, Ordering::AcqRel);
+        assert!(old != 0, "ThreadControl capability released twice");
+        if old == 1 {
+            let thread = self.thread.lock().as_ref().and_then(Weak::upgrade);
+            if let Some(thread) = thread {
+                thread.abandon_created();
+            }
+        }
+    }
+
+    pub(crate) fn start(&self, caller: &Arc<Process>) -> Result<(), SystemCallError> {
         let thread = self
             .thread
             .lock()
             .as_ref()
             .and_then(Weak::upgrade)
             .ok_or(SystemCallError::ObjectClosed)?;
+        if !Arc::ptr_eq(&thread.process, caller) {
+            return Err(SystemCallError::RightsDenied);
+        }
         thread.start()
     }
 }
@@ -137,10 +154,9 @@ impl ThreadDeparture {
     pub(crate) fn request(&self) {
         let (finalize, delayed) = {
             let mut state = self.state.lock();
-            assert!(
-                !core::mem::replace(&mut state.requested, true),
-                "thread departure requested twice"
-            );
+            if core::mem::replace(&mut state.requested, true) {
+                return;
+            }
             let delayed = state.result_obligations != 0;
             (Self::claim_finalize(&mut state), delayed)
         };
@@ -152,12 +168,6 @@ impl ThreadDeparture {
         }
         if finalize {
             self.finalize();
-        }
-    }
-
-    pub(crate) fn mark_started(&self) {
-        if let Some(control) = self.control.as_ref().and_then(Weak::upgrade) {
-            control.started.store(true, Ordering::Release);
         }
     }
 
@@ -258,11 +268,6 @@ impl KernelObject for ThreadControl {
 
     fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
         debug_assert!(role == HandleRole::ThreadControl);
-        if !self.started.load(Ordering::Acquire) {
-            if let Some(thread) = self.thread.lock().as_ref().and_then(Weak::upgrade) {
-                thread.abandon_created();
-            }
-        }
     }
 
     fn close_transit(&self, role: HandleRole) {
@@ -385,9 +390,10 @@ pub(crate) fn create(
         drop(table);
         drop(thread);
         drop(staged);
-        let todo = caller.process.lifecycle.request_termination(
-            TerminationCause::Faulted,
-            TerminationDetail::fault(caller.member().tid(), ProcessFaultCode::UserAccess, result_address as u64),
+        let todo = crate::uaccess::fault_output(
+            &caller.process,
+            caller.member().tid(),
+            result_address,
             Some(caller.member()),
         );
         super::process::run_termination_todo(&caller.process, todo);
@@ -416,11 +422,68 @@ pub(crate) fn start(caller: &super::Thread, handle: erhino_shared::object::Handl
         {
             return Err(SystemCallError::WrongObjectType);
         }
-        entry.object().clone()
+        entry.object().as_object().clone()
     };
     let any: alloc::sync::Arc<dyn Any + Send + Sync> = object;
     let control = any
         .downcast::<ThreadControl>()
         .map_err(|_| SystemCallError::WrongObjectType)?;
-    control.start()
+    control.start(&caller.process)
+}
+
+/// 运输中的副本使最后一个表项关闭后 Created 线程仍保持可启动。
+pub(crate) fn capability_lifecycle_selftest(root: &Arc<super::memory_pool::MemoryPool>) {
+    for terminate_first in [false, true] {
+        let process = super::selftest::bound(root);
+        let control = ThreadControl::new().expect("fixture ThreadControl creation failed");
+        let first = super::handle::entry(
+            ThreadControl::object_ref(&control),
+            HandleRole::ThreadControl,
+            CONTROL_MAX_RIGHTS,
+        )
+        .expect("fixture ThreadControl capability failed");
+        let transit = first.clone();
+        let mut staged = None;
+        process
+            .lifecycle
+            .attach_member(|_, member| {
+                let thread = Arc::try_new(
+                    super::Thread::new_thread_with_control(
+                        member,
+                        &process,
+                        ThreadStartContext {
+                            entry: 0,
+                            stack_pointer: 0,
+                            arg1: 0,
+                            arg2: 0,
+                        },
+                        Some(&control),
+                    )
+                    .map_err(|_| super::lifecycle::AttachFault::Oom)?,
+                )
+                .map_err(|_| super::lifecycle::AttachFault::Oom)?;
+                staged = Some(thread.clone());
+                Ok(thread)
+            })
+            .expect("fixture Created thread failed");
+        let created = staged.expect("fixture Created thread missing");
+        control.bind_thread(&created);
+        drop(created);
+        drop(first);
+        assert_eq!(control.capabilities.load(Ordering::Acquire), 1);
+        assert_eq!(process.lifecycle.member_count(), 1);
+        if terminate_first {
+            super::selftest::terminate(&process);
+            super::selftest::pump();
+            assert_eq!(process.lifecycle.member_count(), 0);
+        }
+        drop(transit);
+        assert_eq!(process.lifecycle.member_count(), 0);
+        assert!(control.signals().contains(ObjectSignals::DONE));
+        if !terminate_first {
+            super::selftest::terminate(&process);
+        }
+        super::selftest::pump();
+        super::selftest::collect(&process);
+    }
 }

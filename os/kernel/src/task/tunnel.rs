@@ -882,7 +882,7 @@ pub fn attach(
         {
             return Err(SystemCallError::WrongObjectType);
         }
-        entry.object().clone()
+        entry.object().as_object().clone()
     };
     let invitation = concrete_invitation(&object)?;
     let endpoint = Endpoint::new(
@@ -1079,7 +1079,7 @@ pub(crate) fn close_handle(
         {
             return Err(SystemCallError::WrongObjectType);
         }
-        entry.object().clone()
+        entry.object().as_object().clone()
     };
     let endpoint = concrete_endpoint_arc(&object)?;
     let mut connection_state = endpoint.connection.state.lock();
@@ -1251,7 +1251,7 @@ fn resolve_endpoint(
     {
         return Err(SystemCallError::WrongObjectType);
     }
-    Ok(entry.object().clone())
+    Ok(entry.object().as_object().clone())
 }
 
 fn concrete_endpoint(object: &ObjectRef) -> Result<&Endpoint, SystemCallError> {
