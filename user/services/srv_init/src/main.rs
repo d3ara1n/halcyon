@@ -82,7 +82,7 @@ use libprocess::{
     DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, RequiredLaunchSet,
     SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
     SupervisionStage, SupervisionTarget, collect_process,
-    context::{CurrentProcessInfo, StartupContext},
+    context::{CurrentProcessInfo, StartupPayload},
     enumerate_members, spawn,
 };
 use librpc::{
@@ -130,7 +130,8 @@ struct LaunchedServices {
 }
 
 struct InitStartup {
-    context: StartupContext,
+    process: CurrentProcessInfo,
+    payload: StartupPayload,
     root_memory_pool: Handle,
 }
 
@@ -165,8 +166,7 @@ fn init_pid() -> Pid {
         .lock()
         .as_ref()
         .expect("init startup inputs are not initialized")
-        .context
-        .process()
+        .process
         .pid()
 }
 
@@ -175,8 +175,7 @@ fn init_process_info() -> CurrentProcessInfo {
         .lock()
         .as_ref()
         .expect("init startup inputs are not initialized")
-        .context
-        .process()
+        .process
 }
 
 fn with_init_payload<R>(f: impl FnOnce(&[u8]) -> R) -> R {
@@ -184,7 +183,7 @@ fn with_init_payload<R>(f: impl FnOnce(&[u8]) -> R) -> R {
     let startup = guard
         .as_ref()
         .expect("init startup inputs are not initialized");
-    let payload = *startup.context.payload();
+    let payload = startup.payload;
     drop(guard);
     f(payload.as_bytes())
 }
@@ -3023,18 +3022,23 @@ fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) ->
 
 fn main() {
     debug!("Hello, init!");
-    let mut startup = libruntime::startup::take().expect("init startup context is missing");
-    let root_job = startup
-        .take_handle(initial::ROOT_JOB)
+    let startup = libruntime::startup::take().expect("init startup context is missing");
+    let (process, payload, mut grants) = startup.into_parts();
+    let root_job = grants
+        .take(initial::ROOT_JOB)
+        .map(Capability::into_raw)
         .expect("init must hold root JobControl");
-    let reset_handle = startup
-        .take_handle(initial::SYSTEM_RESET)
+    let reset_handle = grants
+        .take(initial::SYSTEM_RESET)
+        .map(Capability::into_raw)
         .expect("init must hold SystemReset authority");
-    let root_memory_pool = startup
-        .take_handle(initial::ROOT_MEMORY_POOL)
+    let root_memory_pool = grants
+        .take(initial::ROOT_MEMORY_POOL)
+        .map(Capability::into_raw)
         .expect("init must hold root MemoryPool authority");
     *INIT_STARTUP.lock() = Some(InitStartup {
-        context: startup,
+        process,
+        payload,
         root_memory_pool,
     });
     let mut reset = Some(reset_handle);

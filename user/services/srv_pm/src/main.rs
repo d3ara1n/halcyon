@@ -868,14 +868,17 @@ impl Task<PmWorld> for PmTask {
 
 fn main() {
     debug!("Hello, pm!");
-    let mut startup = libruntime::startup::take().expect("pm: startup context is missing");
+    let startup = libruntime::startup::take().expect("pm: startup context is missing");
+    let (_process, _payload, mut grants) = startup.into_parts();
     // 服务出生自带的邮箱 owner（StartupBlock Handle[0]）。
-    let mailbox = startup
-        .take_handle(0)
+    let mailbox = grants
+        .take(0)
+        .map(libkernel::ipc::capability::Capability::into_raw)
         .expect("pm: mailbox owner grant is missing");
     // StartupBlock Handle[1] = init 授出的 pm_domain JobControl。
-    let domain = startup
-        .take_handle(1)
+    let domain = grants
+        .take(1)
+        .map(libkernel::ipc::capability::Capability::into_raw)
         .expect("pm: delegated domain control is missing");
 
     // 执行核心：任务与输入额度在公开前准备。

@@ -43,14 +43,12 @@ use libkernel::{
 use test_fal::{command, report, startup};
 
 fn startup_capability(
-    startup: &mut libruntime::startup::StartupContext,
+    startup: &mut libruntime::startup::InitialGrants,
     index: usize,
 ) -> Result<Capability, &'static str> {
-    let handle = startup
-        .take_handle(index)
-        .ok_or("FAL consumer startup grant missing")?;
-    // SAFETY: StartupBlock 将各唯一的非映射 grant 移交给当前进程。
-    Ok(unsafe { Capability::from_raw(handle) })
+    startup
+        .take(index)
+        .ok_or("FAL consumer startup grant missing")
 }
 
 fn send_unawaited_request(
@@ -2132,7 +2130,7 @@ fn exercise_copy_during_provider_shutdown(
     }
     Ok(())
 }
-fn run(startup: &mut libruntime::startup::StartupContext) -> Result<(), &'static str> {
+fn run(startup: &mut libruntime::startup::InitialGrants) -> Result<(), &'static str> {
     let (primary, primary_desc) =
         MailboxSender::from_capability(startup_capability(startup, startup::PRIMARY_ROOT)?)
             .map_err(|_| "FAL consumer primary grant invalid")?;
@@ -2612,8 +2610,9 @@ fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) ->
 }
 
 fn main() {
-    let mut startup = libruntime::startup::take().expect("FAL consumer startup context is missing");
-    if let Err(error) = run(&mut startup) {
+    let startup = libruntime::startup::take().expect("FAL consumer startup context is missing");
+    let (_process, _payload, mut grants) = startup.into_parts();
+    if let Err(error) = run(&mut grants) {
         panic!("test_fal acceptance failed: {error}");
     }
 }

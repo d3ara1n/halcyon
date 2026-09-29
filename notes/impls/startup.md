@@ -24,9 +24,10 @@
 
 Header 保存 magic、version、块长、pid、parent_pid、Handle 数、descriptor offset/length、payload offset/length 与 reserved。几何要求 Handle 数组、descriptor 与 payload 依序落在块内，空隙全零；descriptor 的 control_index 必须小于 handle_count，reserved 为零，栈区间无溢出且 usable 落在 reservation 内。Handle 数组保存目标进程 HandleTable 的真实句柄值（由 ProcessGrant 或 Building ThreadCreate 输出），不从 index 推导 slot/generation。普通 launcher 只写一次包含 Control 的完整块。
 
-**`parent_pid` 语义**：描述目标进程的创建关系，即目标 launcher 的当前 `CurrentProcessInfo` 中的 parent provenance，与 ProcessQuery 快照中的 parent_pid 同一真值。`SpawnRequest` 显式携带 launcher 从受控 `StartupContext` 读取的完整身份视图；不通过 runtime 全局 getter 隐式推导。
+**`parent_pid` 语义**：描述目标进程的创建关系，即目标 launcher 的当前 `CurrentProcessInfo::pid()`（创建者 PID），与 ProcessQuery 快照中的 parent_pid 同一真值；孙进程的 parent 因而是直接父进程而非祖父。`SpawnRequest` 显式携带 launcher 从受控 `StartupContext` 读取的完整身份视图；不通过 runtime 全局 getter 隐式推导。
 
 接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（libruntime `startup::init` 沿用 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl、Handle[1] primordial SystemReset、Handle[2] init ProcessControl、Handle[3] root MemoryPool、Handle[4] 入口 ThreadControl；索引由 `shared::startup::initial` 定义，descriptor 显式引用第 4 项。内部 PoolBinding 与 Handle[3] 指向同一个 root core，不复制额度。普通进程先排列显式 grants，Building ThreadCreate 的 child-local Control 追加到同一数组并由 descriptor 引用；其余 slot 含义由具体启动协议定义，不属于通用线格式。
+`StartupContext::adopt` 先完成 StartupBlock/role/Query 校验，成功后生成仅供 runtime 消费的 `StartupAdmission`。其消费方法一次拆出 `(EntryThreadDescriptor, StartupContext)`；descriptor/control 由 libruntime 交给入口 `ThreadRegistry`，应用永远不能取得 descriptor。runtime 采用 descriptor 失败时记录诊断并 `ProcessAbort`，不调用 main；Admission 不允许静默 Drop。应用取得 Context 后必须消费 `into_parts()`，`InitialGrants` 通过 `take(index)` 或 `try_adopt(role)` 单次领取，未领取 grant 由 Drop 正常 close。
 
 ## 组装 ABI（Building 期外部通道）
 

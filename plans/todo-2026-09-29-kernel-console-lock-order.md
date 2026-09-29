@@ -40,19 +40,10 @@
 - 根因已固定：`Connection.state` 的 `CONNECTION(220)` 持有期间，`prepare_shootdown` 的一次性多 hart 诊断调用 `console_write` 获取 `CONSOLE(150)`。
 - tunnel create/attach/close 三条调用链均横跨 `prepare_shootdown`；attach 另有锁内 `set_signals` 可能通过 work-ledger 诊断输出，已一并移到锁外。
 - `prepare_shootdown` 现在只返回 active 快照；报告函数由调用方在高阶业务锁释放后调用，Lock Ladder 未放松。
-- acceptance 早期超时与 core/stress 中段锁序 panic 已分别复核：本轮 core/stress 均正常 reset；旧中段 panic 的根因是锁内诊断，已修复，不与早期 timeout 互相归因。
+- acceptance 早期超时仍未定位：`failed-acceptance-20260929-094400-19900.log:114` 是最后可靠事件；不能把 core/stress 正常 reset 写成该 timeout 已复核。两类现象仍分别记录，旧中段 panic 的根因是锁内诊断。
 
-## 调查顺序
-
-1. 固定 workload、QEMU 参数、kernel ELF 和完整串口日志，清理残留 QEMU。
-2. 对 `console_write` 的所有调用点建立持锁上下文表，标出 `Rank(220)` 的具体锁与调用链。
-3. 用低成本日志/调用探针或 panic 前后事件窗口确定第一笔违规获取；必要时使用 DEBUG-PLAYBOOK 的 A/B 或执行环窗方法。
-4. 依据第一调用链决定修复归属：
-   - 调整调用方锁外输出；
-   - 调整 console/panic 输出的锁路径；
-   - 或修正文档/测试对合法日志路径的契约。
-5. 更新受影响的 `notes/impls` 唯一拥有篇；若锁序长期契约改变，同步对应 `notes/ideas`。
-6. 执行静态检查和最小复现，再执行构建手册要求的完整验收组合。
+## 调查结果归档
+本轮调查顺序已结束；第一违规链、外层锁 owner、锁阶修复与 core/stress 结果由本节及互链 review 记录拥有。后续新的锁序缺口另立任务，不在本已关闭专题追加施工步骤。
 
 ## 本轮实施与证据
 
@@ -68,7 +59,7 @@
 - 修复不绕过锁序断言，不遗失 console/panic 输出责任，也不引入新的反向锁序。
 - 基线对照和修复后复现结果均记录，至少 core 与 stress 路线不再触发该 panic。
 - `just check`、`just clippy` 及适用的 acceptance/platform 路线通过；完整日志放在 `artifacts/dev/`。
-- 受影响的 `notes/impls`/`notes/ideas` 与 `COMPASS` 状态准确；本轮 runtime layering R9 已通过，允许关闭本记录。
+- 受影响的 `notes/impls`/`notes/ideas` 与 `COMPASS` 状态准确；本记录的锁序范围已闭合，运行时分层的 F3/F5 不再作为本记录的关闭条件。
 
 ## 关联入口
 
@@ -78,4 +69,4 @@
 
 ## 关闭声明
 
-第一违规链已修复：`CONNECTION(220)` 持有期间不再执行 console 输出或 endpoint/peer signal 通知；core、stress、完整 acceptance 和入口门均通过。本记录与运行时分层复核记录共同关闭。
+第一违规链已修复：`CONNECTION(220)` 持有期间不再执行 console 输出或 endpoint/peer signal 通知；五处 IPI warning 的外层持锁审计也已完成。core、stress、完整 acceptance 和入口门均通过。本记录的锁序范围关闭；早期 acceptance timeout 仍由运行时分层 review 的 F5 单独承接。

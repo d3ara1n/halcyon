@@ -13,7 +13,9 @@ pub use rt::thread;
 
 #[cfg(target_arch = "riscv64")]
 pub mod startup {
-    pub use libprocess::context::StartupContext;
+    pub use libprocess::context::{
+        CurrentProcessInfo, InitialGrants, StartupContext, StartupPayload,
+    };
 
     pub fn take() -> Option<StartupContext> {
         crate::rt::take_startup_context()

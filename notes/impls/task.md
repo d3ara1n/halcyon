@@ -135,6 +135,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   先切内核 satp（含全量 SFENCE.VMA）再交回 Rust——出口边界一处承担，
   终止来源无需各自记得归一（见 [execution-context.md](execution-context.md)
   「地址空间归属纪律」）；reap 先 drop 线程强引用再做离场确认。REAPABLE 是
+`Claimed` 的取消协议分两段闭合：若 PreparedThread Drop 先取得取消权，先关闭最后一份 ThreadControl 并发布 `Prepared → Abandoned`，再由 reap 认领；若 reap 已把 `Live/Abandoned` 记录转为 `Claimed`，迟到的取消只观察 `Claimed` 并返还失败，不得再次关闭 Control、释放栈或触碰 packet。reap 一旦取得 `Claimed`，cleanup owner 独占后续环境 retire、Control 释放和栈归还；任何取消请求不得越过该线性化点。
   `members 为空 && active == 0 && building_ops == 0 && mandatory_ops == 0` 的持续电平：
   线程全部离场但 Remote completion 尚未收束时不会提前发布。
   线程终止清理只推进到 REAPABLE；完整资源回收仍由管理者提交 ProcessDrain 批次。

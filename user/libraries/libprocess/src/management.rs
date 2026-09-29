@@ -228,7 +228,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         granted[grant_len] = thread_created.control;
         let block = build_birth_block(
             created.pid,
-            request.parent.parent_pid(),
+            request.parent.pid(),
             &granted[..=grant_len],
             entry,
             request.payload,
@@ -1231,6 +1231,34 @@ mod tests {
     use super::*;
     use alloc::rc::Rc;
     use core::cell::RefCell;
+
+    #[test]
+    fn birth_block_keeps_direct_parent_for_child_and_grandchild() {
+        let entry = EntryThreadDescriptor {
+            kind: 1,
+            version: 1,
+            section_len: core::mem::size_of::<EntryThreadDescriptor>() as u32,
+            control_index: 0,
+            reserved: 0,
+            stack_reservation_start: 0x1000,
+            stack_reservation_len: 0x2000,
+            usable_start: 0x1800,
+            usable_len: 0x1800,
+        };
+        for (target, parent) in [(11, 7), (12, 11)] {
+            let block = build_birth_block(
+                target,
+                erhino_shared::proc::Pid::from_raw(parent),
+                &[Handle::from_raw(1)],
+                entry,
+                b"",
+            )
+            .expect("birth block construction must succeed");
+            let header = erhino_shared::startup::validate_startup_block(&block)
+                .expect("birth block validation must succeed");
+            assert_eq!(header.parent_pid, parent);
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FakeJobState {

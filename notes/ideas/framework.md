@@ -55,7 +55,7 @@ flowchart TB
     Kernel --> Rust
 ```
 
-`libprocess` 的 context 为无 allocator 初始化副作用的基础模块；装载、构造和监督作为 `management` 功能集，才依赖 ELF、执行等知识。libruntime 对它使用关闭默认功能的 context 依赖；需要管理的 binary 显式启用 management。Cargo feature 是编译知识选择，不是 runtime 行为或权限开关；feature 被其它消费者合并启用，也不能自动启动服务或扩大授权。这样不必为一个 PID 再拆一层薄类型库，也不让 runtime 的基础依赖强制拉入进程管理的运行机制。
+`libprocess` 的 context 为无 allocator 初始化副作用的基础模块；装载、构造和监督作为 `management` 功能集，才依赖 ELF、执行等知识。libruntime 对它使用关闭默认功能的 context 依赖，并启用仅供 runtime 消费 StartupAdmission 的 `runtime` feature；需要管理的 binary 显式启用 management。Cargo feature 是编译知识选择，不是 runtime 行为或权限开关；feature 被其它消费者合并启用，也不能自动启动服务或扩大授权。这样不必为一个 PID 再拆一层薄类型库，也不让 runtime 的基础依赖强制拉入进程管理的运行机制。
 
 libthread 不依赖 libprocess、libexecution 或 libruntime；进程内线程机制只消费内核的 self 作用域与明确交付的线程环境。进程管理者在 Building 期为新进程创建挂起线程、准备首栈与出生块仍由 libprocess 拥有，不以运行期 ThreadCreate/ThreadStart 接口代替。
 
@@ -63,7 +63,7 @@ libthread 不依赖 libprocess、libexecution 或 libruntime；进程内线程�
 
 ### 启动上下文与入口方案
 
-runtime 提供 Rust `start` lang item；应用只写 `#![no_std]`、`extern crate libruntime;` 与模板 `fn main()`（返回 `()` 或 `Result<(), E: Debug>`），不写宏、别名或 `no_main`。平台 `_start` 取得入口参数，先作无堆验证，再初始化 allocator、ThreadRegistry，并采用 `EntryThreadDescriptor` 把入口线程登记为普通 ThreadRecord，采用启动能力后以 argc/argv 为零调用 rustc 生成的 main。StartupContext 放入 runtime 私有一次性槽，应用经 `libruntime::startup::take() -> Option<StartupContext>` 领取，第二次返回 None；不存在全局 `pid()`、raw `startup_handle(i)` 或 `&'static [u8]` payload，runtime 不保留可再次领取的副本，不公开 `finish` 或初始化桥。启动映像的进程寿命、StartupSeed 的唯一来源、初始能力采用/失败以及 Context/Payload/Grants/入口线程描述的交付由 [bootstrap 的接收契约](bootstrap.md#用户态接收与一次性交接) 唯一规定。
+runtime 提供 Rust `start` lang item；应用只写 `#![no_std]`、`extern crate libruntime;` 与模板 `fn main()`（返回 `()` 或 `Result<(), E: Debug>`），不写宏、别名或 `no_main`。平台 `_start` 取得入口参数，先作无堆验证，再初始化 allocator、ThreadRegistry，并消费仅供 runtime 使用的 StartupAdmission：入口 descriptor/control 交给普通 ThreadRecord，应用侧 StartupContext 不再携带 descriptor；采用启动能力后以 argc/argv 为零调用 rustc 生成的 main。StartupContext 放入 runtime 私有一次性槽，应用经 `libruntime::startup::take() -> Option<StartupContext>` 领取，第二次返回 None；应用随即消费 `into_parts()` 分别取得身份、payload 与 InitialGrants，后者只能以消费式 `take`/`try_adopt` 领取。不存在全局 `pid()`、raw `startup_handle(i)` 或 `&'static [u8]` payload，runtime 不保留可再次领取的副本，不公开 `finish` 或初始化桥。入口采用失败进入诊断 + ProcessAbort，不调用 main。启动映像的进程寿命、StartupSeed 的唯一来源、初始能力采用/失败以及 Context/Payload/Grants/入口线程描述的交付由 [bootstrap 的接收契约](bootstrap.md#用户态接收与一次性交接) 唯一规定。
 
 libkernel 提供底层稳定启动 view；libprocess::context 拥有 StartupSeed 与采用逻辑，并在充分的来源/角色证明下建立 libkernel Capability。libruntime 只在原始平台入口跨 unsafe 边界取得 Seed，不拥有第二份 Handle 表或进程身份。它在 StartupContext 就绪后构造应用参数和线程工厂，失败则进入明确的进程失败出口，不执行任何应用入口。
 

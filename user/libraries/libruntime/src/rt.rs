@@ -74,31 +74,38 @@ fn registry() -> &'static ThreadRegistry<NoEnvironment> {
 }
 
 fn adopt_entry_thread(seed: libprocess::context::StartupSeed) {
-    let mut context = match StartupContext::adopt(seed) {
-        Ok(context) => context,
+    let admission = match StartupContext::adopt(seed) {
+        Ok(admission) => admission,
         Err((_, error)) => {
             dbg::debug(format_args!("startup grant adoption failed: {:?}", error));
             unsafe { sys_process_abort() }
         }
     };
-    let descriptor = context.entry();
-    let control = context
-        .take_handle(descriptor.control_index as usize)
-        .expect("entry thread control grant is missing");
-    *STARTUP_CONTEXT.lock() = Some(context);
+    let (descriptor, context) = admission.into_parts();
+    let (process, payload, mut grants) = context.into_parts();
+    let control = match grants.take(descriptor.control_index as usize) {
+        Some(capability) => capability.into_raw(),
+        None => {
+            dbg::debug(format_args!("startup entry thread control grant is missing"));
+            unsafe { sys_process_abort() }
+        }
+    };
     let registry = registry();
     // SAFETY: StartupBlock validation proves the reservation geometry, and the
     // claimed control is the descriptor-selected unique ThreadControl owner.
-    unsafe {
-        registry
-            .adopt_entry(
-                descriptor,
-                ThreadControl::from_raw(control),
-                NoEnvironment,
-                (),
-            )
-            .expect("entry thread adoption failed");
+    let result = unsafe {
+        registry.adopt_entry(
+            descriptor,
+            ThreadControl::from_raw(control),
+            NoEnvironment,
+            (),
+        )
+    };
+    if let Err(error) = result {
+        dbg::debug(format_args!("startup entry thread adoption failed: {:?}", error));
+        unsafe { sys_process_abort() }
     }
+    *STARTUP_CONTEXT.lock() = Some(StartupContext::from_parts(process, payload, grants));
 }
 
 pub mod thread {
@@ -133,6 +140,19 @@ pub mod thread {
             ThreadFactory::new(registry(), NoEnvironment)
                 .stack_size(self.stack_bytes)
                 .spawn(function)
+        }
+
+        pub fn prepare<F, T>(
+            self,
+            function: F,
+        ) -> Result<libthread::PreparedThread<F, T, NoEnvironment>, SystemCallError>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            ThreadFactory::new(registry(), NoEnvironment)
+                .stack_size(self.stack_bytes)
+                .prepare(function)
         }
     }
 

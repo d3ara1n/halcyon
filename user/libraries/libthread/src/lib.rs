@@ -1024,6 +1024,9 @@ impl<F, T, E: ThreadEnvironment> Drop for PreparedThread<F, T, E> {
                 cleanup_integrity_failure(CleanupFault::InvalidSlot);
             }
             drop(thread);
+            // The packet owns the FnOnce payload; close its affine path before
+            // publishing the cancelled registry record so F is never left pending.
+            drop(self.packet.take());
             if self.registry.finish_cancel_prepared(self.slot).is_err() {
                 cleanup_integrity_failure(CleanupFault::InvalidSlot);
             }

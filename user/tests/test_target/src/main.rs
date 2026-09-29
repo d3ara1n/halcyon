@@ -6,7 +6,7 @@
 extern crate libruntime;
 
 use libkernel::{
-    ipc::{notification, wait_set::WaitSet},
+    ipc::{capability::Capability, notification, wait_set::WaitSet},
     preclude::*,
     shared::{
         call::SystemCallError, object::ObjectSignals, proc::ProcessDrainStatus, wait::WaitItem,
@@ -15,12 +15,13 @@ use libkernel::{
 };
 
 fn main() {
-    let mut startup = libruntime::startup::take().expect("target startup context is missing");
-    if startup.payload().as_bytes() == b"ipc-kill" {
-        ipc_kill_target(&mut startup);
+    let startup = libruntime::startup::take().expect("target startup context is missing");
+    let (_process, payload, mut grants) = startup.into_parts();
+    if payload.as_bytes() == b"ipc-kill" {
+        ipc_kill_target(&mut grants);
     }
-    if startup.payload().as_bytes() == b"retirement" {
-        retirement_target(&mut startup);
+    if payload.as_bytes() == b"retirement" {
+        retirement_target(&mut grants);
     }
     debug!("target alive");
     loop {
@@ -29,18 +30,22 @@ fn main() {
     }
 }
 
-fn ipc_kill_target(startup: &mut libruntime::startup::StartupContext) -> ! {
+fn ipc_kill_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
     let owner = startup
-        .take_handle(0)
+        .take(0)
+        .map(Capability::into_raw)
         .expect("IPC kill target missing Close owner");
     let control = startup
-        .take_handle(1)
+        .take(1)
+        .map(Capability::into_raw)
         .expect("IPC kill target missing Drain control");
     let ready = startup
-        .take_handle(2)
+        .take(2)
+        .map(Capability::into_raw)
         .expect("IPC kill target missing ready signaler");
     let done = startup
-        .take_handle(3)
+        .take(3)
+        .map(Capability::into_raw)
         .expect("IPC kill target missing Drain completion signaler");
     let close = libruntime::thread::Builder::new()
         .spawn(move || {
@@ -73,12 +78,14 @@ fn ipc_kill_target(startup: &mut libruntime::startup::StartupContext) -> ! {
     }
 }
 
-fn retirement_target(startup: &mut libruntime::startup::StartupContext) -> ! {
+fn retirement_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
     let source = startup
-        .take_handle(0)
+        .take(0)
+        .map(Capability::into_raw)
         .expect("retirement target missing observation source");
     let ready = startup
-        .take_handle(1)
+        .take(1)
+        .map(Capability::into_raw)
         .expect("retirement target missing ready signaler");
     let set = WaitSet::create(256).expect("retirement target WaitSet creation failed");
     for cookie in 0..256 {

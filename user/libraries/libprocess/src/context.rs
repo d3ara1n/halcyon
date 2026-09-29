@@ -77,7 +77,12 @@ impl CurrentProcessInfo {
 }
 
 pub struct InitialGrants {
-    slots: Vec<Option<Capability>>,
+    slots: Vec<Option<InitialGrant>>,
+}
+
+struct InitialGrant {
+    role: HandleRole,
+    capability: Capability,
 }
 
 impl InitialGrants {
@@ -90,28 +95,59 @@ impl InitialGrants {
     }
 
     pub fn take(&mut self, index: usize) -> Option<Capability> {
-        self.slots.get_mut(index).and_then(Option::take)
+        self.slots
+            .get_mut(index)
+            .and_then(Option::take)
+            .map(|grant| grant.capability)
     }
 
-    pub fn duplicate(&self, index: usize) -> Result<Option<Capability>, SystemCallError> {
+    pub fn try_adopt(&mut self, role: HandleRole) -> Option<Capability> {
         self.slots
-            .get(index)
-            .and_then(Option::as_ref)
-            .map(Capability::duplicate_all)
-            .transpose()
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|grant| grant.role == role))
+            .and_then(Option::take)
+            .map(|grant| grant.capability)
     }
 }
 
 pub struct StartupContext {
     process: CurrentProcessInfo,
     payload: StartupPayload,
-    entry: EntryThreadDescriptor,
     grants: InitialGrants,
+}
+
+#[must_use = "the runtime must consume StartupAdmission before entering application code"]
+pub struct StartupAdmission {
+    context: Option<StartupContext>,
+    entry: Option<EntryThreadDescriptor>,
+}
+
+impl StartupAdmission {
+    #[cfg(any(test, feature = "runtime"))]
+    pub fn into_parts(mut self) -> (EntryThreadDescriptor, StartupContext) {
+        (
+            self.entry.take().expect("startup admission entry already consumed"),
+            self.context
+                .take()
+                .expect("startup admission context already consumed"),
+        )
+    }
+}
+
+impl Drop for StartupAdmission {
+    fn drop(&mut self) {
+        // A validated admission must either hand its descriptor to the runtime
+        // entry registry or abort; silently dropping it would skip the entry
+        // thread's ownership handoff.
+        if self.entry.is_some() || self.context.is_some() {
+            unsafe { libkernel::sys_process_abort() }
+        }
+    }
 }
 
 impl StartupContext {
     /// Verify every entry before consuming the affine StartupSeed.
-    pub fn adopt(seed: StartupSeed) -> Result<Self, (StartupSeed, ContextError)> {
+    pub fn adopt(seed: StartupSeed) -> Result<StartupAdmission, (StartupSeed, ContextError)> {
         Self::adopt_with_query(seed, libkernel::ipc::object::query)
     }
 
@@ -121,7 +157,7 @@ impl StartupContext {
             Handle,
         )
             -> Result<erhino_shared::object::HandleDescription, SystemCallError>,
-    ) -> Result<Self, (StartupSeed, ContextError)> {
+    ) -> Result<StartupAdmission, (StartupSeed, ContextError)> {
         let count = seed.input.grant_count();
         let mut handles = Vec::new();
         if handles.try_reserve_exact(count).is_err() {
@@ -179,42 +215,63 @@ impl StartupContext {
 
         // All fallible work is complete. Capability construction only installs
         // the already-validated close responsibilities into the affine table.
-        for handle in handles {
+        for (handle, description) in handles.into_iter().zip(descriptions) {
+            let role = match description.role {
+                value if value == HandleRole::JobControl as u32 => HandleRole::JobControl,
+                value if value == HandleRole::MemoryPool as u32 => HandleRole::MemoryPool,
+                value if value == HandleRole::MemoryObject as u32 => HandleRole::MemoryObject,
+                value if value == HandleRole::ProcessBuilder as u32 => HandleRole::ProcessBuilder,
+                value if value == HandleRole::ProcessControl as u32 => HandleRole::ProcessControl,
+                value if value == HandleRole::ThreadControl as u32 => HandleRole::ThreadControl,
+                value if value == HandleRole::MailboxOwner as u32 => HandleRole::MailboxOwner,
+                value if value == HandleRole::MailboxSender as u32 => HandleRole::MailboxSender,
+                value if value == HandleRole::MailboxSenderOnce as u32 => HandleRole::MailboxSenderOnce,
+                value if value == HandleRole::NotificationOwner as u32 => HandleRole::NotificationOwner,
+                value if value == HandleRole::NotificationSignaler as u32 => HandleRole::NotificationSignaler,
+                value if value == HandleRole::TunnelInvitation as u32 => HandleRole::TunnelInvitation,
+                value if value == HandleRole::SystemResetControl as u32 => HandleRole::SystemResetControl,
+                value if value == HandleRole::LifetimeObserver as u32 => HandleRole::LifetimeObserver,
+                value if value == HandleRole::Delivery as u32 => HandleRole::Delivery,
+                value if value == HandleRole::WaitSetOwner as u32 => HandleRole::WaitSetOwner,
+                _ => unreachable!("validated startup role is not adoptable"),
+            };
             // SAFETY: the platform StartupSeed proves unique ownership of
             // every validated non-mapping entry.
-            slots.push(Some(unsafe { Capability::from_raw(handle) }));
+            slots.push(Some(InitialGrant {
+                role,
+                capability: unsafe { Capability::from_raw(handle) },
+            }));
         }
         let payload = seed.input.payload();
-        let context = Self {
+        let context = StartupContext {
             process: CurrentProcessInfo::from_header(&seed.input.header()),
             payload: StartupPayload {
                 bytes: payload.as_ptr(),
                 len: payload.len(),
             },
-            entry,
             grants: InitialGrants { slots },
         };
-        Ok(context)
+        Ok(StartupAdmission {
+            context: Some(context),
+            entry: Some(entry),
+        })
     }
 
-    pub const fn process(&self) -> CurrentProcessInfo {
-        self.process
+    pub fn into_parts(self) -> (CurrentProcessInfo, StartupPayload, InitialGrants) {
+        (self.process, self.payload, self.grants)
     }
 
-    pub fn payload(&self) -> &StartupPayload {
-        &self.payload
-    }
-
-    pub fn entry(&self) -> EntryThreadDescriptor {
-        self.entry
-    }
-
-    pub fn grants(&mut self) -> &mut InitialGrants {
-        &mut self.grants
-    }
-
-    pub fn take_handle(&mut self, index: usize) -> Option<Handle> {
-        self.grants.take(index).map(Capability::into_raw)
+    #[cfg(feature = "runtime")]
+    pub fn from_parts(
+        process: CurrentProcessInfo,
+        payload: StartupPayload,
+        grants: InitialGrants,
+    ) -> Self {
+        Self {
+            process,
+            payload,
+            grants,
+        }
     }
 }
 
@@ -332,7 +389,7 @@ mod tests {
         // SAFETY: input came from the unique test invocation of platform init.
         let seed = unsafe { StartupSeed::from_input(input) };
         let query_count = AtomicUsize::new(0);
-        let context = StartupContext::adopt_with_query(seed, |handle| {
+        let admission = StartupContext::adopt_with_query(seed, |handle| {
             query_count.fetch_add(1, Ordering::Relaxed);
             let role = if handle == handles[64] {
                 HandleRole::ThreadControl
@@ -364,10 +421,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(query_count.load(Ordering::Relaxed), 65);
-        assert_eq!(context.process().pid(), 7);
-        assert_eq!(context.process().parent_pid(), 3);
-        assert_eq!(context.payload().as_bytes(), b"payload");
-        core::mem::forget(context);
+        let (_entry, context) = admission.into_parts();
+        let (process, payload, mut grants) = context.into_parts();
+        assert_eq!(process.pid(), 7);
+        assert_eq!(process.parent_pid(), 3);
+        assert_eq!(payload.as_bytes(), b"payload");
+        assert_eq!(grants.len(), 65);
+        let sender = grants
+            .try_adopt(HandleRole::MailboxSender)
+            .expect("role adoption must consume the matching grant");
+        assert!(grants.try_adopt(HandleRole::MailboxSender).is_none());
+        core::mem::forget(sender);
+        core::mem::forget(grants);
     }
 
     #[test]

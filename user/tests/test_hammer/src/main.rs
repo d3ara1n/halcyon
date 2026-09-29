@@ -22,6 +22,7 @@ use libprocess::race::{
 };
 use libkernel::{
     ipc::{
+        capability::Capability,
         message::{send_raw, wait_message},
         notification,
         object::close,
@@ -48,14 +49,15 @@ use libthread::ThreadOutcome;
 use libthread as raw_thread;
 
 fn main() {
-    let mut startup = libruntime::startup::take().expect("hammer startup context is missing");
-    let Some(words) = race::decode_payload(startup.payload().as_bytes()) else {
+    let startup = libruntime::startup::take().expect("hammer startup context is missing");
+    let (_process, payload, mut grants) = startup.into_parts();
+    let Some(words) = race::decode_payload(payload.as_bytes()) else {
         debug!("hammer: invalid payload");
         return;
     };
     match words.first().copied().unwrap_or(0) {
-        MODE_HAMMER => hammer_mode(&mut startup),
-        MODE_TARGET => target_mode(&mut startup, &words),
+        MODE_HAMMER => hammer_mode(&mut grants),
+        MODE_TARGET => target_mode(&mut grants, &words),
         other => debug!("hammer: unknown mode {}", other),
     }
 }
@@ -81,14 +83,17 @@ fn await_gun(gun: Handle) {
     let _ = notification::take(gun, u64::MAX);
 }
 
-fn hammer_mode(startup: &mut libruntime::startup::StartupContext) {
+fn hammer_mode(startup: &mut libruntime::startup::InitialGrants) {
     let (Some(cmd_box), Some(report_box), Some(gun)) = (
         startup
-            .take_handle(HAMMER_CMD),
+            .take(HAMMER_CMD)
+            .map(Capability::into_raw),
         startup
-            .take_handle(HAMMER_REPORT),
+            .take(HAMMER_REPORT)
+            .map(Capability::into_raw),
         startup
-            .take_handle(HAMMER_GUN),
+            .take(HAMMER_GUN)
+            .map(Capability::into_raw),
     ) else {
         debug!("hammer: missing grants");
         return;
@@ -312,9 +317,10 @@ fn enumerate(control: Handle) -> (Report, alloc::vec::Vec<u64>) {
     )
 }
 
-fn target_mode(startup: &mut libruntime::startup::StartupContext, words: &[u64]) {
+fn target_mode(startup: &mut libruntime::startup::InitialGrants, words: &[u64]) {
     let Some(gun) = startup
-        .take_handle(TARGET_GUN)
+        .take(TARGET_GUN)
+        .map(Capability::into_raw)
     else {
         debug!("hammer target: missing gun");
         return;
@@ -394,11 +400,12 @@ fn thread_suite() {
 const TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
 
 fn tunnel_exit_target(
-    startup: &mut libruntime::startup::StartupContext,
+    startup: &mut libruntime::startup::InitialGrants,
     gun: Handle,
 ) -> ! {
     let invitation = startup
-        .take_handle(TARGET_INVITATION)
+        .take(TARGET_INVITATION)
+        .map(Capability::into_raw)
         .expect("Tunnel exit target missing invitation");
     let endpoint = unsafe { tunnel::attach(invitation, Placement::Anywhere) }
         .expect("Tunnel exit target attach failed");
@@ -552,43 +559,58 @@ fn runtime_registry_reclaims_after_receiver_drop() {
             .stack_size(16 * 1024)
             .spawn(move || {
                 while !worker_release.load(Ordering::Acquire) {
-                    thread::yield_now().expect("round3 registry worker yield failed");
+                    thread::yield_now().expect("round4 registry worker yield failed");
                 }
             }) {
             Ok(worker) => workers.push(worker),
             Err(SystemCallError::ReachLimit) => break,
-            Err(error) => panic!("round3 registry fill failed: {error:?}"),
+            Err(error) => panic!("round4 registry fill failed: {error:?}"),
         }
     }
     assert!(
         !workers.is_empty(),
-        "round3 registry fill did not occupy a runtime slot"
+        "round4 registry fill did not occupy a runtime slot"
     );
 
-    // Drop the observation owners before releasing the workers. This forces
-    // reap to observe both abandoned receivers and live controls.
-    let worker_count = workers.len();
-    drop(workers);
+    // Free one real slot, then prepare and drop a real packet-backed thread.
+    // The next prepare must reap the abandoned record before reserving again.
+    let worker = workers.pop().expect("round4 registry probe worker missing");
     release.store(true, Ordering::Release);
+    take_thread_result(worker.join());
 
-    for _ in 0..worker_count {
-        loop {
-            let probe = thread::Builder::new()
-                .stack_size(16 * 1024)
-                .spawn(|| ());
-            match probe {
-                Ok(worker) => {
-                    take_thread_result(worker.join());
-                    break;
-                }
-                Err(SystemCallError::ReachLimit) => {
-                    thread::yield_now().expect("round3 registry reap yield failed");
-                }
-                Err(error) => panic!("round3 registry reclaim failed: {error:?}"),
-            }
+    struct PacketDropProbe(Arc<AtomicUsize>);
+    impl Drop for PacketDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
         }
     }
-    debug!("round3 test=runtime_registry_reclaims_after_receiver_drop passed");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let packet_probe = PacketDropProbe(Arc::clone(&drops));
+    let prepared = thread::Builder::new()
+        .stack_size(16 * 1024)
+        .prepare(move || {
+            let _ = packet_probe.0.load(Ordering::Relaxed);
+        })
+        .expect("round4 real PreparedThread construction failed");
+    drop(prepared);
+
+    let mut reclaimed = false;
+    for _ in 0..(workers.len() + 4) {
+        match thread::Builder::new().stack_size(16 * 1024).prepare(|| ()) {
+            Ok(prepared) => drop(prepared),
+            Err(SystemCallError::ReachLimit) => {
+                thread::yield_now().expect("round4 reap progress yield failed");
+            }
+            Err(error) => panic!("round4 reap probe failed: {error:?}"),
+        }
+        if drops.load(Ordering::Acquire) == 1 {
+            reclaimed = true;
+            break;
+        }
+    }
+    assert!(reclaimed, "round4 reap did not destroy the prepared packet closure");
+    drop(workers);
+    debug!("round4 test=runtime_registry_real_prepared_drop_reap passed");
 }
 
 struct StormGate {

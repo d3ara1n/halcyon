@@ -13,8 +13,8 @@
 
 ## 近期顺序
 
-1. [运行时分层校正（第三轮已完成）](review-2026-09-28-runtime-layering.md#第三轮关闭声明)：R1–R9 与最终验收门均通过；后续工作按分层计划未完成项触发。
-2. [Kernel console 锁序 panic（已完成）](todo-2026-09-29-kernel-console-lock-order.md#关闭声明)：第一违规链已修复并由 core/stress/acceptance 验证。
+1. [运行时分层校正（第四轮）](review-2026-09-28-runtime-layering.md#复核固定提交-b039a1a)：代码迁移与最终验收门已通过；F3 真实 target adopt 失败证据、F5 旧 timeout 第一坏事件仍由 review 报告承接。
+2. [Kernel console 锁序](todo-2026-09-29-kernel-console-lock-order.md)：指定链路修复及五处 IPI 外层持锁审计已完成；早期 acceptance timeout 的未定位项转由运行时分层 review 的 F5 承接。
 3. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
 
 ## 可择机任务与审查

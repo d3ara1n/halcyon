@@ -159,7 +159,7 @@ StartupBlock、初始 grants 和 payload 视图是进程环境资源；入口线
 2. **准备**：语言环境建立 allocator 后，按实际 Handle 数预留全部槽位与验证工作区；拒绝 INVALID 和重复表项数值。两个不同 Handle 指向同一 object 并不构成重复。
 3. **核实**：对每个表项查询其真实 kind/role/rights，验证已知、可安全采用的非本地映射 role。不得按 object_id 数值重新打开对象，也不能要求接收后的 rights 仍含来源方此前使用的 GRANT/TRANSIT。
 4. **采用提交**：所有可失败工作结束后，一次消费 Seed，把每个初始 entry 的关闭责任安装到唯一 InitialGrants 槽，并产生 CurrentProcessInfo 和 payload 视图。该用户态提交不执行新的内核 Grant，不改变表项 identity；提交后不再分配或执行可失败 Query。
-5. **交付**：StartupContext 交给应用；runtime 不保留一份可再次领取的副本。应用可拆出只读视图和 InitialGrants，将最窄的能力交给实际消费者。
+5. **交付**：runtime 先消费只对 runtime 可见的 StartupAdmission，将 EntryThreadDescriptor 与入口 ThreadControl 交给入口 ThreadRegistry；应用只取得不含 descriptor 的 StartupContext。`StartupContext::into_parts` 消费式移交 CurrentProcessInfo、StartupPayload 与 affine InitialGrants，runtime 不保留一份可再次领取的副本。
 
 准备或核实失败返回错误和原 Seed，未建立部分 typed owner，也不关闭任意 raw 初始表项。分配失败可以在已有环境中重试；非法/重复/不支持的输入不能跳过继续调用应用，runtime 走进程失败出口，内核表项由进程收束负责。丢弃未经验证的 Seed 不能以 Drop 猜测各 raw Handle 的安全关闭方式。
 
@@ -169,8 +169,8 @@ StartupSeed 的来源保证与 HandleQuery 缺一不可：Query 核实对象属�
 
 - **CurrentProcessInfo**：可以复制的启动身份与创建关系视图，字段由启动路径形成，不通过普通构造器任意填写。它用于正确传递创建者 provenance；不证明内核认证，不等于 ProcessControl。进程管理 API 接收该上下文而不读取 runtime 全局，也不接受易混淆的裸 parent_pid 替代。
 - **StartupPayload**：只读、可 clone/共享的 opaque payload 视图；没有文件系统、服务配置或设备语义，解析这些语义的库自行负责。
-- **InitialGrants**：本进程初始非映射 Capability 的唯一槽位 owner，不可 Clone；独占 move 可以跨线程，共享并发领取需由调用方显式同步。查询槽位信息不授予关闭或消费权。
-- **StartupContext**：组合上述三者的初始交接值，可拆开；grant 部分不能因只读信息可复制而跟着复制。不存在安全的 `startup_handles() -> &'static [Handle]` 接管捷径。
+- **InitialGrants**：本进程初始非映射 Capability 的唯一槽位 owner，不可 Clone；独占 move 可以跨线程，共享并发领取需由调用方显式同步。`take(index)` 与 `try_adopt(role)` 都是消费式领取，成功后槽位不可再次取得，未领取项由 Drop 正常关闭；不存在重复读裸 Handle 的接口。
+- **StartupContext**：应用侧身份、payload 与 InitialGrants 的一次性交接值，`into_parts(self)` 消费式拆开；入口 descriptor 不属于它，而由 runtime 的一次性 StartupAdmission 消费并交给入口 ThreadRegistry。不存在安全的 `startup_handles() -> &'static [Handle]` 接管捷径。
 
 按索引领取是仅发生在用户态槽位上的原子语义：索引越界或已领取都不修改其它槽；成功取走完整 Capability 并留下 Taken 状态。随后将它转换为具体 role 的失败，返还该 Capability 给调用者，不自动放回原槽或关闭。需要预先检查 role 时使用槽描述，不将检查结果当成第二个 owner。
 

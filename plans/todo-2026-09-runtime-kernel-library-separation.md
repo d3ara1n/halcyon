@@ -242,7 +242,7 @@ stateDiagram-v2
 | 库组合 | libkernel 资源契约、libprocess context/management、独立 libthread、libruntime 程序环境；runtime 可单向组合知识库，库不反向依赖 runtime |
 | 改名与构建 | runtime 已迁到 `libraries/libruntime`，不留 alias/facade；target/共同布局位于 `user/platforms` | 已完成 |
 | 资源接口 | kernel-interface idea 与本计划 API 表已确定 value/borrow/owner、消费失败返还、分配/等待/退休区别；实现与消费者验证已完成 | 已完成 |
-| 启动 | StartupSeed 一次来源与 role 核实分开，StartupContext 分离身份/payload/grants；出生块统一只读、地址空间保活到进程结束；普通 launcher RW 是待纠正代码事实 |
+| 启动 | StartupSeed 一次来源与 role 核实分开；StartupAdmission 仅由 runtime 消费 descriptor，StartupContext 消费式分离身份/payload/affine grants；出生块统一只读、地址空间保活到进程结束；普通 launcher RW 是待纠正代码事实 | 第四轮代码迁移、check/clippy/host、两 target ELF 门与全 acceptance 已通过；真实 adopt 失败的 target 证据仍未关闭 |
 | 线程 | libthread 拥有 Registry/ThreadRecord/ResultCell/Thread/ResultReceiver；libruntime 只持实例与环境；Create→Start 两段出生；无专职 driver，协作回收；无退出码 |
 | 平台入口 | rustc main 与 runtime bridge/_start，入口线程适配与运行期 trampoline 均准备 gp、保持参数/SP；内核拥有 FP gate，当前无 TLS | Base64/D64 镜像与反汇编门已通过 |
 | 现有基座 | libexecution 已有 task/source 准入、失败保留/退避与注销/停止；FAL 和 init 已有正式退休/监督消费者。不能重新把整套基座列为缺失 |
@@ -250,9 +250,9 @@ stateDiagram-v2
 
 ### 收口与后续边界
 
-1. 本轮线程 owner、出生、结果、回收与启动采用尚待本报告完成结构检查和完整验证后收口。
-2. context、消费者、Cargo 迁移及平台入口的第二轮状态以本报告记录为准；不得沿用第一轮完成声明。
-3. 本轮 `just check`、`just clippy` 与 `just acceptance` 尚未形成证据。
+1. 本轮线程 owner、出生、结果、回收与启动采用代码迁移及最终门已通过；F3/F5 证据缺口由本报告继续拥有，未写整体完成声明。
+2. context、消费者、Cargo 迁移及平台入口的第四轮状态以本报告 F1–F7 处置记录为准；不得沿用第三轮完成声明。
+3. 本轮 `just check`、`just clippy`、host 定向测试、两 target ELF 门与 `just acceptance` 均形成 round4 证据；F3 真实 adopt 失败与 F5 第一坏事件仍未覆盖。
 
 ### 设计阶段与施工阶段裁决（2026-09）
 

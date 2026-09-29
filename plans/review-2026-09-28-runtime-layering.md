@@ -147,7 +147,7 @@ Observation 处置：ResultCell 的 Writing 中间态若为实现必需，在 ow
 - 最后 Control 责任：已 Start 的线程由 worker 在发布结果后调用 ThreadExit；Registry reap 先观察 ThreadControl DONE，再释放 record 的 Control owner，随后推进环境退休和栈 unmap。ResultReceiver 放弃结果时仅 abandon ResultCell；其 Control 引用释放后，若为已启动线程，内核已完成 DONE；PreparedThread 在 Start 前取消时从 record 取走最后 Control，Created 线程由内核发布 DONE，record 保留 `abandoned` 并由普通 reap 收束栈和环境。
 - worker 入口证据：`libthread::__libthread_worker_entry` 是唯一 worker 平台 trampoline，使用 `.option norelax` 的 `la gp, __global_pointer$` 后跳转到 packet entry；runtime `_start` 使用独立的进程入口适配段。RV64 两 target 的反汇编门均通过，未发现重复 worker trampoline 符号。
 
-## 复核（固定提交 66f4e9c）
+## 复核（固定提交 6018387）
 
 由 reviewer 只读复核，主代理转录；结论：不能关闭，下列新 Issues 由本报告继续承载处置。
 
@@ -333,3 +333,39 @@ ideas 的 reap 公共形状按已确认的 `reap(budget) -> Idle/Progress/Wait/F
 R1–R9 已按已确认 A1 清单完成。ResultCell producer 单一所有权、Prepared/Cancelling/Abandoned 生命周期、非对齐启动解析、Endpoint 白名单、StartupContext 身份/载荷/affine grants、SpawnRequest 完整身份迁移、console 锁外诊断及真实 registry Drop/reap 证据均已接通；旧 getter、裸 `parent_pid`、Endpoint 通用采用和锁内诊断路径已删除。
 
 本报告与 [kernel console 锁序记录](todo-2026-09-29-kernel-console-lock-order.md) 已互链；分层计划、framework/startup impls 的未成立完成声明和旧 `entry!` 叙述已清理。R9 全部门通过后，本轮不再保留待验收完成声明。
+
+## 复核（固定提交 b039a1a）
+
+结论：第三轮关闭声明不成立，报告保持打开。console 指定链路（tunnel create/attach/close 诊断移出 CONNECTION，Lock Ladder 未放松）认可；R1、R3、R6 代码关闭；R2、R4、R8 代码成立但真实路径证据缺失；R5、R7、R9 未关闭。
+
+| # | 级别 | 问题 | 修正方向 |
+|---|---|---|---|
+| F1 | P1 | `management.rs:234` 出生块用 `request.parent.parent_pid()`，子进程记录的是祖父；与内核 `process.rs:410` 不一致，`impls/startup.md:27` 写成正确语义 | 改用 `request.parent.pid()`；核对子代、孙代与 ProcessQuery 一致；修正文档 |
+| F2 | P2 | StartupContext 无消费式拆分，grants 只能 `&mut` 借出，违背 bootstrap.md:172 | 提供消费式 `into_parts`；明确入口 descriptor 归属 |
+| F3 | P2 | R7/R8 专项证据超出实际：libthread 取消测试用伪造 record，未构造/Drop 真实 PreparedThread；context 测试未调用 `adopt`、未验证 Seed 返还与原表项存活 | 补真实路径用例；辅助函数覆盖与所有权路径覆盖分开记录 |
+| F4 | P2 | round3 成功日志无源码指纹、dirty 状态、ELF 哈希与测试名，不能追溯到固定提交 | 日志绑定提交/dirty/构建参数/ELF 哈希与完整测试名，或登记追溯缺口 |
+| F5 | P2 | 早期 acceptance timeout 仅“未复现”，未定位；最后可靠事件为 `failed-acceptance-20260929-094400-19900.log:114`，可疑区间为 init `run()` 建 Job、映射、启动 pm | 继续定位第一坏事件，或明确保留为未关闭项；console todo:43 撤回“已复核” |
+| F6 | P3 | impls/framework.md:3 含施工完成宣告；impls/task.md:137 未写 Claimed 两段取消协议；分层计划 :245/:253/:255 状态过时；console todo 关闭后仍留“下一步”；本报告 6018387 复核节标题误为 66f4e9c | 校正当前事实，历史过程标注为历史 |
+| F7 | 观察 | work_ledger/notify_work/deferred_work/remote_call/sched 的 IPI 失败 warning 取 CONSOLE，外层调用者持锁状态未审计 | 纳入同类锁内日志审计，不宣称全核穷尽 |
+
+实施按“第三轮实施准则”执行（A1 清单先经用户确认；最终门全部通过且证据可追溯才写关闭声明）。
+
+### 第四轮处置（A1，已确认；最终门通过但仍有未关闭项）
+
+A1 已确认采用 F1–F7 清单。F2 施工中确认采用更闭合的 owner 形状：`StartupAdmission` 只由 libruntime 消费，消费方法一次性拆出 `(EntryThreadDescriptor, StartupContext)`；`StartupContext` 不含 descriptor，应用再消费 `into_parts()` 取得身份、payload 与 `InitialGrants`。`InitialGrants::take` 与 `try_adopt` 均消费槽位，未领取项由 Drop 关闭。这样 runtime/入口 Registry 与应用 Context 的责任从类型上分开，不以兼容 adapter 重新拼回完整 Context。
+
+当前处置与证据：
+
+- **F1：代码与回归证据已完成。** `management.rs` 使用 `request.parent.pid()`，`impls/startup.md` 已明确直接父 PID 语义；新增 host birth-block 测试覆盖直接子进程 `7→11` 与再下一代 `11→12` 的 parent 传递。完整 `just acceptance` 通过，入口拓扑/监督和内核 ProcessQuery 路线通过；日志未单独打印 parent 字段，因此不把日志文本夸大为独立查询快照证据。
+- **F2：代码、消费者迁移与最终门已完成。** `StartupAdmission` 的 descriptor 分拆方法只在 `libprocess` 的 `runtime` feature 下导出；入口采用失败记录诊断并 `ProcessAbort`，不调用 main。grep 已无 `take_handle`、`StartupContext` getter、`grants(&mut)` 消费者；ideas/impls/framework/startup 已同步。
+- **F3：部分关闭，保留缺口。** `test_hammer` 新增真实 `ThreadFactory::prepare` → `PreparedThread::Drop` → 满槽下一次 `prepare` 触发真实 reap，并用 packet closure Drop 计数；辅助函数证据与真实 owner 路径分开。`libprocess` host 测试覆盖非对齐 StartupBlock、全表 Query、role 消费和重复领取，但不能声称真实 `StartupContext::adopt` 失败路径：host libkernel syscall stub 会 panic，StartupInput 又是一次性全局来源，尚未有受支持 target 的失败注入。原始表项存活/Seed 返还的真实 target 证据保留为未关闭项。
+- **F4：证据绑定已建立并更新。** `artifacts/dev/runtime-layering-round4-evidence-metadata.log` 绑定 commit `b039a1a`、dirty 状态、rustc/cargo、check/host 命令、测试名与 ELF SHA-256；check/clippy/host/stress/full acceptance 日志均以 round4 前缀保留。
+- **F5：未关闭。** `failed-acceptance-20260929-094400-19900.log` 在第 114 行 `root startup ownership rollback passed` 后无更多事件，无法定位 init 建 Job、映射、启动 pm 区间的第一坏事件；console todo 已撤回“已复核”表述，保留该缺口。
+- **F6：文档与最终门已完成。** `impls/framework.md` 不再宣称施工完成；`impls/task.md` 补充 Claimed 先后两段取消协议；分层计划 :245/:253/:255、console todo 和本报告标题/历史声明已按当前事实更新。
+- **F7：静态审计完成。** `work_ledger::ring`、`notify_work`、`deferred_work::ring_owner`、`remote_call::Doorbell::ring`、`SchedDomain::wake_one` 的 IPI 失败 warning 均在账本/业务锁 guard 结束后执行；未发现 `CONNECTION` 或更高阶锁持有期间取 `CONSOLE` 的路径。本结论限于五处指定调用点，不扩大为全核穷尽。
+
+开发验证与最终门：
+
+- `just check`、`just clippy`、`cd user && cargo test -p libprocess -p libthread --target aarch64-apple-darwin` 均通过；最新日志分别为 `runtime-layering-round4-check-8.log`、`runtime-layering-round4-clippy-9.log`、`runtime-layering-round4-host-4.log`。
+- `just acceptance` 通过：`artifacts/dev/runtime-layering-round4-acceptance-3.log`；其中两 target ELF 门、stress 16/16 race matrix、core/release、sifive_u、virt-nofd、hetero 与 boot-failure 路线均由聚合脚本执行。
+- 整体仍保持打开：F3 的真实 target `StartupContext::adopt` 失败注入/原表项存活与 Seed 返还证据，以及 F5 旧 acceptance timeout 的第一坏事件仍未闭合。最终门通过不替代这两项责任证据，因此不写第四轮整体完成声明。
