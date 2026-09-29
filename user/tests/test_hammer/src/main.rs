@@ -46,7 +46,6 @@ use libkernel::{
 };
 use libruntime::thread;
 use libthread::ThreadOutcome;
-use libthread as raw_thread;
 
 fn main() {
     let startup = libruntime::startup::take().expect("hammer startup context is missing");
@@ -446,8 +445,8 @@ fn raw_spawn(
         control: Handle::INVALID,
     };
     // SAFETY: context/result live for the synchronous call; the caller owns a mapped stack.
-    unsafe { raw_thread::spawn_raw(&context, &mut result) }?;
-    unsafe { raw_thread::start_raw(result.control) }?;
+    unsafe { libkernel::thread::create(Handle::INVALID, &context, &mut result) }?;
+    unsafe { libkernel::thread::start(result.control) }?;
     assert!(
         result.tid != 0 && result.reserved == 0 && result.control.is_valid(),
         "raw ThreadCreate returned an invalid result"
@@ -551,7 +550,7 @@ fn join_publication() {
 
 fn runtime_registry_reclaims_after_receiver_drop() {
     // 每个 worker 持有独立放行标志：只放行探针 worker，其余保持存活，
-    // 保证后续准入确实处于满槽，且只能靠回收 Abandoned record 成功。
+    // 保证后续准入确实处于满槽，且只能靠回收放弃后登记的已 DONE record 成功。
     let mut workers = alloc::vec::Vec::new();
     loop {
         let hold = Arc::new(AtomicBool::new(false));
@@ -601,8 +600,8 @@ fn runtime_registry_reclaims_after_receiver_drop() {
         "round5 PreparedThread drop did not destroy its packet exactly once"
     );
 
-    // 此时 Abandoned record 占用唯一空槽，其余 worker 仍存活：
-    // 准入成功只能来自 prepare 对 Abandoned record 的回收。
+    // 此时放弃后登记的已 DONE record 占用唯一空槽，其余 worker 仍存活：
+    // 准入成功只能来自 prepare 对该 record 的回收。
     for round in 0..3 {
         let prepared = prepare_until_admitted(|| || ());
         drop(prepared);

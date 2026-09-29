@@ -1,6 +1,6 @@
 # 现有用户态分层纠正：libkernel、libprocess、libthread 与 libruntime
 
-> 状态：基线 66f4e9c 的原轮施工曾记录完成；第二轮复核正在修正线程 owner 仲裁、启动采用和入口/Unmap 失败路径。当前交付证据以 [复核报告](review-2026-09-28-runtime-layering.md) 为准，不沿用旧完成声明。
+> 状态：基线 66f4e9c 的原轮施工曾记录完成；第二轮复核正在修正线程 owner 仲裁、启动采用和入口/Unmap 失败路径。当前交付证据以 [复核报告](archived/review-2026-09-28-runtime-layering.md) 为准，不沿用旧完成声明。
 
 ## 交付快照
 
@@ -231,7 +231,7 @@ stateDiagram-v2
 ### 工作树与授权
 
 - 当前分支 `master`，本次分层迁移仍未 commit/push；工作树保留本闭包的代码与同步文档改动。
-- 基线 66f4e9c 及此前工作记录仅作为既有实现背景；本轮纠正的 P1、失败路径和接力状态由唯一 [复核报告](review-2026-09-28-runtime-layering.md) 拥有。
+- 基线 66f4e9c 及此前工作记录仅作为既有实现背景；本轮纠正的 P1、失败路径和接力状态由唯一 [复核报告](archived/review-2026-09-28-runtime-layering.md) 拥有。
 - `plans/archived/todo-2026-09-device-architecture.md` 只表示初始概念稿完成，不代表设备详细设计完成。
 
 ### 已确定，不重复选方案
@@ -250,9 +250,8 @@ stateDiagram-v2
 
 ### 收口与后续边界
 
-1. 本轮线程 owner、出生、结果、回收与启动采用代码迁移及最终门已通过；F3/F5 证据缺口由本报告继续拥有，未写整体完成声明。
-2. context、消费者、Cargo 迁移及平台入口的第四轮状态以本报告 F1–F7 处置记录为准；不得沿用第三轮完成声明。
-3. 整体收敛轮 `just check`、`just clippy`、host 测试与 `just acceptance` 全路线通过（`artifacts/dev/round5-*`）；F5 因所涉代码已替换按过期关闭。
+1. 线程 owner、出生、结果、回收与启动采用已完成，处置与证据见 [分层 review](archived/review-2026-09-28-runtime-layering.md) 整体收敛节。
+2. 整体收敛轮 `just check`、`just clippy`、host 测试与 `just acceptance` 全路线通过（`artifacts/dev/round5-*`）；F5 因所涉代码已替换按过期关闭。
 
 ### 设计阶段与施工阶段裁决（2026-09）
 
@@ -290,6 +289,6 @@ kernel/shared 的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution�
 
 后续每块设计同时核对 ideas、impls、实际导出/调用者与已有测试语义；代码若超前补齐描述，代码与目标不符则记录真实差距，不默认任一侧正确。本轮已核实 Runtime/WorkQueue/Wake、FAL NodeStore/Retirement、Process Collector/Observation、init RootSupervisor；详细路径和复用边界在用户内存 owner 记录，不需要重复整仓盘点。只有源码变化或具体新问题才重取相关证据。
 
-本计划的代码迁移、接口接线与第三轮复核已完成；普通出生块最终只读映像与 `os/kernel/src/rt.rs` 未消费的 `Termination` 约束是已登记的后续项，不阻塞本轮 R1–R9。最终证据见 [第三轮复核报告](review-2026-09-28-runtime-layering.md)。
+本计划的代码迁移、接口接线与第三轮复核已完成；普通出生块最终只读映像与 `os/kernel/src/rt.rs` 未消费的 `Termination` 约束是已登记的后续项，不阻塞本轮 R1–R9。最终证据见 [第三轮复核报告](archived/review-2026-09-28-runtime-layering.md)。
 
 交付前检查：`git diff --check`、`just check`、`just clippy`、两种用户 target 构建/ELF audit/入口反汇编与 `just acceptance` 均已通过；日志路径与失败现场见复核报告。

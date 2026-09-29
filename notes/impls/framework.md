@@ -17,11 +17,11 @@
 ## 当前启动和资源接口
 
 - `libruntime` 不公开 `finish` 或应用桥接宏；`start` lang item 接收 rustc 生成的 `main` shim，并负责将结果转换为 ThreadExit 或 ProcessAbort。
-- runtime 入口先由 `libruntime::startup::take` 一次领取 `StartupContext`；入口 descriptor 与 Control 由 runtime 转为入口 Registry record。应用随后消费 `StartupContext::into_parts()`，身份、payload 与 affine `InitialGrants` 分别移交；grant 只能按索引 `take` 或 role `try_adopt`，未领取项由 owner Drop 关闭。
+- runtime 把入口 descriptor 与 Control 转为入口 Registry record，StartupContext 放入私有一次性槽；应用经 `libruntime::startup::take` 领取一次。应用随后消费 `StartupContext::into_parts()`，身份、payload 与 affine `InitialGrants` 分别移交；grant 只能按索引 `take` 或 role `try_adopt`，未领取项由 owner Drop 关闭。
 - StartupBlock 映像保持进程寿命；入口栈 reservation/usable 几何被转换为普通 region owner，Registry 不区分入口线程和运行期线程的回收路径。
 - `ThreadRegistry::reap` 以固定槽、轮转游标和有界预算推进，不设置专职 driver。栈解除映射遇到 `ObjectBusy` 返回等待并由下一次协作推进；`PreparedThread` 在 Start 前独占未启动资源，对 Registry 不可见，Start 失败返还 self，Drop 关闭 Control 后以已 DONE record 登记；T/F 不在非用户线程 Drop。
 - Capability、Endpoint、MappedRegion 的失败/Drop 行为仍分别由 IPC/MM 实现篇拥有；跨模块组合不复制这些 owner。
 
 ## 当前验证边界
 
-host 单测、`just check`、`just clippy`、用户 ELF audit、`_start`/gp 入口反汇编门和 `just acceptance` 均已通过；F3 的真实 target adopt 失败返还证据与 F5 旧 acceptance timeout 第一坏事件仍未闭合，不能写整体完成声明。
+host 单测覆盖 ResultCell 仲裁、reap 候选扫描与启动表的校验辅助函数；adopt 失败返还 Seed 由源码结构论证（失败分支先于任何 owner 构造），不由测试观察。QEMU 验收覆盖真实启动、线程创建/放弃/回收与 race 矩阵。

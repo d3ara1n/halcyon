@@ -71,9 +71,9 @@ Context 的只读身份和 payload 可以按各自规则复制/共享，初始 g
 
 ### 线程环境与 ThreadRegistry 方案
 
-libthread 拥有线程环境契约、工厂、ThreadRegistry（槽、唯一 cleanup claim、预算版 `reap(budget) -> Idle/Progress/Wait/Failed`、seal）、ResultCell 与公开 `Thread`/`ResultReceiver<T>`；libruntime 只建立并持有唯一进程级 Registry 实例（入口线程与全部运行期线程共用，libthread 不另设私有静态实例）、提供容量配置和 Rust 环境实现，不定义任何槽或状态规则。三类 owner 的寿命划分、结果仲裁与协作式回收由 [task](task.md#用户态线程资源收束) 唯一规定。libthread 不公开可绕过 wrapper 的安全线程离场；libkernel 的 unsafe `ThreadExit()` 只由 libthread trampoline、libruntime 入口或其他受控 runtime 消费。
+libthread 拥有线程环境契约、工厂、ThreadRegistry、ResultCell 与公开 `Thread`/`ResultReceiver<T>`；libruntime 只建立并持有唯一进程级 Registry 实例（入口线程与全部运行期线程共用，libthread 不另设私有静态实例）、提供容量配置和 Rust 环境实现，不定义任何槽或状态规则。三类 owner 的寿命划分、结果仲裁与协作式回收由 [task](task.md#用户态线程资源收束) 唯一规定。libthread 不公开可绕过 wrapper 的安全线程离场；libkernel 的 unsafe `ThreadExit()` 只由 libthread trampoline、libruntime 入口或其他受控 runtime 消费。
 
-不存在专职 cleanup driver 或隐藏线程。Registry 由线程 API 的调用点协作推进：prepare 前、子线程离场前和 join 观察到 DONE 时各执行有界 reap；已使用 libexecution 的程序可以把 DONE 登记为等待来源加速回收。回收不承诺及时，积压以 Registry 容量为上界，进程终局由 ProcessDrain 收回。
+不存在专职 cleanup driver 或隐藏线程。Registry 由线程 API 的调用点协作推进有界回收，推进点见 [task 实现](../impls/task.md)；已使用 libexecution 的程序可以把 DONE 登记为等待来源加速回收。回收不承诺及时，积压以 Registry 容量为上界，进程终局由 ProcessDrain 收回。
 
 这允许 runtime 依赖线程库而不出现反向知识依赖。通用接口只描述线程生命周期，不能把某个 runtime 的私有初始化惯例藏进抽象。入口线程与运行期线程的出生授权不同，但登记后复用同一 record、结果和 cleanup 状态机，不按 TID/PID 分支。Rust profile 只有一个 `_start` 入口，由描述符一次采用强制；其他 Building 挂起线程需要其他入口契约。TLS、unwind、detach 不因此成为本次承诺。
 

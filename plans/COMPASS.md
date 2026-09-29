@@ -4,18 +4,14 @@
 
 ## 当前设计
 
-1. [现有用户态分层纠正](todo-2026-09-runtime-kernel-library-separation.md#跨会话接力断点)：接续内核契约、进程上下文、线程库与 Rust runtime 设计；先闭合线程退休前置，代码实施先于设备接线。
-2. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：从对象关系与授权继续细化，可与分层设计并行，整体闭合后再安排设备实现。
+1. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：从对象关系与授权继续细化，整体闭合后再安排设备实现。
 
-当前前置：[用户态映射 owner 的线程退休接力](todo-2026-09-14-user-memory-owner-lifecycle.md#跨会话接力断点)，在既有执行基座上闭合同进程跨线程承接与活性；其它映射扩展仍按需求触发。
-
-本轮设计审阅处置：[用户态分层与线程生命周期](review-2026-09-26-runtime-thread-design.md)，固定审阅 `d4ed354`、`67b9303`；剩余分层/Registry 契约由对应活跃计划接续。
+运行时分层与线程生命周期已完成：[运行时分层 review](archived/review-2026-09-28-runtime-layering.md)。
 
 ## 近期顺序
 
-1. [运行时分层校正（第四轮）](review-2026-09-28-runtime-layering.md#复核固定提交-b039a1a)：代码迁移与最终验收门已通过；F3 真实 target adopt 失败证据、F5 旧 timeout 第一坏事件仍由 review 报告承接。
-2. [Kernel console 锁序](todo-2026-09-29-kernel-console-lock-order.md)：指定链路修复及五处 IPI 外层持锁审计已完成；早期 acceptance timeout 的未定位项转由运行时分层 review 的 F5 承接。
-3. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
+1. [FAL midflight Copy 间歇失败](todo-2026-09-29-fal-midflight-copy-flake.md)：早于分层阶段的缺陷，`virt-release` 约 20% 失败，阻塞 acceptance；先于设备实现定位。
+2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
 
 ## 可择机任务与审查
 

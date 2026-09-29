@@ -86,7 +86,7 @@ libruntime：`_start` 入口 → StartupBlock 校验 → allocator → affine St
 
 ## 容量与预算
 
-Registry 容量是程序装配给出的并发线程上限，属于程序配置，不是库常量；槽存储在 Registry 建立时一次分配。每个 prepare 的栈、packet 与 ResultCell 走普通可失败分配，在 ThreadCreate 前完成；ThreadCreate 之后的路径不分配。ResultCell 的寿命独立于槽，按堆内存计。满槽准入前以容量为预算扫描所有 Live/Abandoned 候选，未 DONE 的 Live 和 Busy 不阻塞后续可回收项。
+Registry 容量是程序装配给出的并发线程上限，属于程序配置，不是库常量；槽存储在 Registry 建立时一次分配。每个 prepare 的栈、packet 与 ResultCell 走普通可失败分配，在 ThreadCreate 前完成；ThreadCreate 之后的路径不分配。ResultCell 的寿命独立于槽，按堆内存计。满槽准入前以容量为预算扫描所有 Live 候选（含已放弃的无 Control record），未 DONE 的 Live 和 Busy 不阻塞后续可回收项。
 
 ## 交错与失败表
 
@@ -128,12 +128,12 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 ## 施工顺序与结果
 
 1. shared ABI、内核生命周期和 bootstrap：原轮记录为完成；本轮复核未发现需要改动其 ABI。
-2. libkernel、libprocess context、libthread Registry/ResultCell/Prepared/trampoline：本轮复核发现 ownership 与取消仲裁缺口，处置见 [runtime 分层复核](review-2026-09-28-runtime-layering.md)。
+2. libkernel、libprocess context、libthread Registry/ResultCell/Prepared/trampoline：本轮复核发现 ownership 与取消仲裁缺口，处置见 [runtime 分层复核](archived/review-2026-09-28-runtime-layering.md)。
 3. libruntime 入口、heap、panic/OOM 和终局收束：本轮复核校正启动采用、入口 ABI 与 Unmap 失败 owner。
 4. 消费者迁移：本轮修订 SpawnRequest provenance 接口并检查真实消费者。
 5. 本轮完整验证尚未执行；不得沿用原轮验收通过作为当前复核证据。
 
-原轮完成声明与验收结果只代表基线 66f4e9c 之前的证据，不构成本轮完成声明；第二轮责任链修复、结构检查和验证以 [runtime 分层复核](review-2026-09-28-runtime-layering.md) 为准。
+原轮完成声明与验收结果只代表基线 66f4e9c 之前的证据，不构成本轮完成声明；第二轮责任链修复、结构检查和验证以 [runtime 分层复核](archived/review-2026-09-28-runtime-layering.md) 为准。
 
 ## 验证门
 

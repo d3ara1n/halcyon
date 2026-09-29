@@ -192,7 +192,6 @@ struct ThreadRecord<E: ThreadEnvironment> {
     control: Option<Arc<ThreadControl>>,
     environment: Arc<E>,
     residue: Arc<ResidueCell<E::Residue>>,
-    retired: bool,
 }
 
 enum SlotState<E: ThreadEnvironment> {
@@ -345,19 +344,17 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                         continue;
                     }
                     Err(error) => {
-                        self.install_claimed(index, record);
+                        self.replace_exclusive(index, SlotState::Faulted { _retained: record });
                         return ReapProgress::Failed(CleanupFault::Wait(error));
                     }
                 }
             }
-            if !record.retired {
-                if let Some(residue) = record.residue.take()
-                    && record.environment.retire(residue).is_err()
-                {
-                    self.replace_exclusive(index, SlotState::Faulted { _retained: record });
-                    return ReapProgress::Failed(CleanupFault::Retire);
-                }
-                record.retired = true;
+            // residue 的唯一消费权即退休进度：取走后 Busy 重试不会再次 retire。
+            if let Some(residue) = record.residue.take()
+                && record.environment.retire(residue).is_err()
+            {
+                self.replace_exclusive(index, SlotState::Faulted { _retained: record });
+                return ReapProgress::Failed(CleanupFault::Retire);
             }
             drop(record.control.take());
             let Some(stack) = record.stack.take() else {
@@ -433,7 +430,6 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                 control: Some(Arc::clone(&thread.control)),
                 environment: Arc::new(environment),
                 residue: Arc::new(ResidueCell::new(residue)),
-                retired: false,
             },
         );
         Ok(thread)
@@ -710,7 +706,6 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
                     control: None,
                     environment: Arc::clone(&self.environment),
                     residue,
-                    retired: false,
                 },
             );
             Err(error)
@@ -807,7 +802,6 @@ impl<F, T, E: ThreadEnvironment> PreparedThread<F, T, E> {
                 control: Some(Arc::clone(&parts.control)),
                 environment: Arc::clone(&self.environment),
                 residue: parts.residue,
-                retired: false,
             },
         );
         Ok(ResultReceiver {
@@ -837,7 +831,6 @@ impl<F, T, E: ThreadEnvironment> Drop for PreparedThread<F, T, E> {
                 control: None,
                 environment: Arc::clone(&self.environment),
                 residue: parts.residue,
-                retired: false,
             },
         );
     }
@@ -893,28 +886,6 @@ impl<T, E: ThreadEnvironment> Drop for ResultReceiver<T, E> {
 
 pub fn yield_now() -> Result<(), SystemCallError> {
     libkernel::thread::yield_now()
-}
-
-/// Raw ThreadCreate/ThreadStart escape hatches used only by integration
-/// workloads that deliberately test the kernel boundary.
-///
-/// # Safety
-///
-/// The caller owns all stack, packet and completion responsibilities.
-pub unsafe fn spawn_raw(
-    context: &ThreadStartContext,
-    result: &mut ThreadCreateResult,
-) -> Result<(), SystemCallError> {
-    // SAFETY: forwarded with the caller's ownership proof.
-    unsafe { kernel_thread::create(Handle::INVALID, context, result) }
-}
-
-/// # Safety
-///
-/// `control` must be the MANAGE-capable result of `spawn_raw`.
-pub unsafe fn start_raw(control: Handle) -> Result<(), SystemCallError> {
-    // SAFETY: forwarded with the caller's ownership proof.
-    unsafe { kernel_thread::start(control) }
 }
 
 #[cfg(test)]
@@ -996,7 +967,6 @@ mod tests {
                 control: None,
                 environment: Arc::new(NoEnvironment),
                 residue: Arc::new(ResidueCell::empty()),
-                retired: false,
             },
         );
         // The host has no stack to unmap; MissingStack proves the record was

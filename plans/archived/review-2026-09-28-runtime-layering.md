@@ -399,13 +399,17 @@ F1 代码关闭（专项测试未运行，见 G3）；F2 主体成立（见 G4�
 | ideas 只写概念、关系、保证 | task/framework/bootstrap 的 owner、寿命与保证 | ideas 中的槽状态机、步骤顺序、CAS 交错表（下沉 impls） |
 
 开放项处置：
-- G1/F3：取消用例改为其余 worker 存活、放弃一个 PreparedThread 后下一次准入必须成功；交错测试随仲裁删除而不适用。adopt 失败路径由 host 测试覆盖（全表 Query 前拒绝、晚项 Query 失败返还 Seed、重复与非法 role 拒绝）。
+- G1/F3：取消用例改为其余 worker 存活、放弃一个 PreparedThread 后下一次准入必须成功；交错测试随仲裁删除而不适用。host 测试覆盖校验辅助函数（重复、非法 role、晚项 Query 失败）；adopt 失败返还 Seed 为源码结构论证，不宣称测试观察。
 - G2/F4：不建元数据设施；证据以固定提交的干净工作树上运行的既有门为准。
 - G3：撤回 hetero 与“acceptance 含入口门”的表述；入口反汇编为独立开发证据。
 - G4：随 Admission 删除消失；安全代码无法构造 Seed，因而无法取得 descriptor。
 - G5/G6：impls 按最终代码重写，删除施工宣告。
 - F5：所涉启动代码已被整体替换，问题过期，按“关闭（未解决）”处置，不再定位；新问题另行立案的条件为新代码在 init 建 Job、映射、启动 pm 区间出现同类早期停滞。
 
-验证（本轮工作树）：libthread/libprocess host 测试、`just check`、`just clippy` 七分面、`just acceptance` 全路线通过（race 16/16）。开发期 core 路线出现一次 `test_fal` “midflight Copy progress or owner mismatch”，该用例不经过取消路径，基线 2 次与改动后 3 次定向重跑均通过，登记为间歇观察；再现时单独立案。
+验证：libthread/libprocess host 测试、`just check`、`just clippy` 七分面通过；`just acceptance` 被一项原有间歇缺陷阻塞。`virt-release` 定向各 20 次：基线 `1d869cf` 失败 4 次，本轮工作树失败 6 次与 7 次，失败全部为 `test_fal` “FAL consumer midflight Copy progress or owner mismatch”，前一事件均为首次多 hart shootdown；该用例只经 spawn/join，不经本轮删除的取消路径。缺陷早于本阶段，转由 [FAL midflight Copy 间歇失败](../todo-2026-09-29-fal-midflight-copy-flake.md) 承接，不计入本报告。
 
-状态：待提交后一次结构检查；无新发现即归档。
+## 结构复核（固定提交 0867bc2）与关闭
+
+reviewer 无 P0/P1。P2：reap 的 Wait 永久错误恢复为 Live，已改为保留 Faulted。P3：删除与 residue 消费权重复的 `retired`、删除仅转发内核的 `spawn_raw/start_raw`（hammer 直接使用 libkernel）；ideas/framework 的 reap 接口与推进细节下沉 impls，impls 与计划中的 Context 领取方向、F3/F5 旧状态、`Abandoned` 旧叙述已同步；Seed 返还改写为源码论证，host 只覆盖校验辅助函数。
+
+状态：已关闭并归档。F5 为过期关闭（未解决）；acceptance 阻塞项由独立 todo 拥有。
