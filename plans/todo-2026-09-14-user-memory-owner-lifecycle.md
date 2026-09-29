@@ -80,7 +80,7 @@ impl<E> ThreadRegistry<E> {
 }
 ```
 
-`ResultCell` 状态为 `Empty/Published/ReceiverGone`，不可复制的 producer 独占发布权，交错表见 task「结果发布」。record 只持栈 `MappedRegion`、环境 residue、`ThreadControl` 与 cleanup 进度，不含 F/T 或 packet cleanup。槽以固定锁保护并用轮转游标公平认领；`Prepared → Live` 由成功的 ThreadStart 发布，取消经 `Cancelling` 闭合最后 Control 后转 `Abandoned`；reap 只认领 Live/Abandoned，未 DONE 恢复 Live。
+`ResultCell` 状态为 `Empty/Published/ReceiverGone`，不可复制的 producer 独占发布权，交错表见 task「结果发布」。record 只持栈 `MappedRegion`、环境 residue、`ThreadControl` 与 cleanup 进度，不含 F/T 或 packet cleanup。Registry 只登记已启动或已放弃的线程，未启动资源由 PreparedThread 独占，取消与 reap 无仲裁；槽状态见 [task 实现](../notes/impls/task.md)。
 
 libruntime：`_start` 入口 → StartupBlock 校验 → allocator → affine StartupSeed → StartupContext 全表 Query/最后提交 → `ThreadRegistry` 入口线程登记 → rustc main(`0`, null)；`Ok` → ThreadExit，`Err`/panic/OOM → 日志 + ProcessAbort。应用通过一次性 startup context take 接收身份、payload 视图与 grants。
 
