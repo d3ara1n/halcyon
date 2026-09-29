@@ -19,6 +19,10 @@
 
 失败全部为同一报错。样本不足以区分两者失败率；用例只经 `spawn/join`，不经收敛中删除的取消路径。debug core/stress 路线较少复现。
 
+## 2026-09-30 复测
+
+`9c4abd7` 在两处断言失败分支加只读诊断后，`just virt-release` 0/20 失败（日志 `artifacts/flake/`，未随 Git）。代码未变而失败率由约 25% 降为 0，判定为对代码布局或宿主负载敏感的时序竞态；两处嫌疑（测试取消窗口不完整、Copy 失败进度语义）均属 Copy 语义，由 FAL 重新设计覆盖，诊断已撤回。仅当重写后仍复现且计数与 owner 正确时，再单独查多 hart shootdown。
+
 ## 可疑区间
 
 - FAL midflight Copy 的进度/owner 观察与 provider 响应的时序（`srv_fs` 在失败后报告 `provider response abandoned after commit`）。

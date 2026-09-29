@@ -4,6 +4,8 @@
 
 ## 当前设计
 
+> 部分区域处于矫正态，现有写法不作参考，见 [KNOWN_ISSUES 矫正区](../KNOWN_ISSUES.md#矫正区)。
+
 1. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：从对象关系与授权继续细化，整体闭合后再安排设备实现。
 
 运行时分层与线程生命周期已完成：[运行时分层 review](archived/review-2026-09-28-runtime-layering.md)。
