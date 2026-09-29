@@ -95,7 +95,7 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 
 线程契约由 [task](../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
 
-当前实现事实以本轮复核为准：`StartupSeed` 先无堆核验 StartupBlock，采用阶段逐项非对齐读取、预留工作区、Query 全表，全部通过后建立 Capability owner；失败保留 Seed。`ResultReceiver` Drop 只放弃结果，PreparedThread 取消由 Cancelling 槽关闭 Control 后发布 Abandoned；reap 只认领 Live/Abandoned，未 DONE 恢复 Live。
+当前实现事实以本轮复核为准：`StartupSeed` 先无堆核验 StartupBlock，采用阶段逐项非对齐读取、预留工作区、Query 全表，全部通过后建立 Capability owner；失败保留 Seed。`ResultReceiver` Drop 只放弃结果；Registry 只登记已启动或已放弃的线程，PreparedThread 放弃关闭唯一 Control 后以普通 record 登记，取消与 reap 无仲裁。
 
 ### 入口和 profile 事实门
 
@@ -242,7 +242,7 @@ stateDiagram-v2
 | 库组合 | libkernel 资源契约、libprocess context/management、独立 libthread、libruntime 程序环境；runtime 可单向组合知识库，库不反向依赖 runtime |
 | 改名与构建 | runtime 已迁到 `libraries/libruntime`，不留 alias/facade；target/共同布局位于 `user/platforms` | 已完成 |
 | 资源接口 | kernel-interface idea 与本计划 API 表已确定 value/borrow/owner、消费失败返还、分配/等待/退休区别；实现与消费者验证已完成 | 已完成 |
-| 启动 | StartupSeed 一次来源与 role 核实分开；StartupAdmission 仅由 runtime 消费 descriptor，StartupContext 消费式分离身份/payload/affine grants；出生块统一只读、地址空间保活到进程结束；普通 launcher RW 是待纠正代码事实 | 第四轮代码迁移、check/clippy/host、两 target ELF 门与全 acceptance 已通过；真实 adopt 失败的 target 证据仍未关闭 |
+| 启动 | StartupSeed 一次来源与 role 核实分开；采用结果把入口 descriptor 与 Control 直接交 runtime，StartupContext 消费式分离身份/payload/affine grants；出生块统一只读 | 整体收敛轮 check/clippy/host 与全 acceptance 通过，见 review 报告收敛节 |
 | 线程 | libthread 拥有 Registry/ThreadRecord/ResultCell/Thread/ResultReceiver；libruntime 只持实例与环境；Create→Start 两段出生；无专职 driver，协作回收；无退出码 |
 | 平台入口 | rustc main 与 runtime bridge/_start，入口线程适配与运行期 trampoline 均准备 gp、保持参数/SP；内核拥有 FP gate，当前无 TLS | Base64/D64 镜像与反汇编门已通过 |
 | 现有基座 | libexecution 已有 task/source 准入、失败保留/退避与注销/停止；FAL 和 init 已有正式退休/监督消费者。不能重新把整套基座列为缺失 |
@@ -252,7 +252,7 @@ stateDiagram-v2
 
 1. 本轮线程 owner、出生、结果、回收与启动采用代码迁移及最终门已通过；F3/F5 证据缺口由本报告继续拥有，未写整体完成声明。
 2. context、消费者、Cargo 迁移及平台入口的第四轮状态以本报告 F1–F7 处置记录为准；不得沿用第三轮完成声明。
-3. 本轮 `just check`、`just clippy`、host 定向测试、两 target ELF 门与 `just acceptance` 均形成 round4 证据；F3 真实 adopt 失败与 F5 第一坏事件仍未覆盖。
+3. 整体收敛轮 `just check`、`just clippy`、host 测试与 `just acceptance` 全路线通过（`artifacts/dev/round5-*`）；F5 因所涉代码已替换按过期关闭。
 
 ### 设计阶段与施工阶段裁决（2026-09）
 

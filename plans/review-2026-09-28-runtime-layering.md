@@ -369,3 +369,43 @@ A1 已确认采用 F1–F7 清单。F2 施工中确认采用更闭合的 owner �
 - `just check`、`just clippy`、`cd user && cargo test -p libprocess -p libthread --target aarch64-apple-darwin` 均通过；最新日志分别为 `runtime-layering-round4-check-8.log`、`runtime-layering-round4-clippy-9.log`、`runtime-layering-round4-host-4.log`。
 - `just acceptance` 通过：`artifacts/dev/runtime-layering-round4-acceptance-3.log`；其中两 target ELF 门、stress 16/16 race matrix、core/release、sifive_u、virt-nofd、hetero 与 boot-failure 路线均由聚合脚本执行。
 - 整体仍保持打开：F3 的真实 target `StartupContext::adopt` 失败注入/原表项存活与 Seed 返还证据，以及 F5 旧 acceptance timeout 的第一坏事件仍未闭合。最终门通过不替代这两项责任证据，因此不写第四轮整体完成声明。
+
+## 复核（固定提交 1d869cf）
+
+只读复核，未重跑构建与 QEMU。未发现 P0/P1 或新增运行期缺陷；报告保持打开。
+
+| 编号 | 级别 | 问题 | 修正方向 |
+|---|---|---|---|
+| G1 | P2 | `test_hammer/main.rs:575` 放行全部 worker 后不保证满槽，`drop(prepared)` 同步析构使断言恒成立，prepare 返回 ReachLimit 仍判成功；无真实 Drop/reap 交错 | 保持其余槽不可回收，断言取消后下一次真实 prepare 成功；补真实 Control 下取消/reap 交错与未 DONE 恢复 |
+| G2 | P2 | F4 元数据记录 `b039a1a + dirty`，无内容指纹、漏列 libthread，两组 ELF 哈希未对应构建参数与运行；成功日志无专项 marker | 各门绑定源码快照、target/profile/features、产物哈希与专项结果；此前 F4 保持开放 |
+| G3 | P2 | 父身份测试在 `management` 模块，host 日志未启用该 feature 未运行；报告称聚合含 hetero 与入口门，Justfile 无 hetero，ELF audit 不检查 gp 反汇编 | 区分源码论证、已运行测试与独立入口门，补证或撤回 |
+| G4 | P3 | `StartupAdmission`/`adopt` 公开，`into_parts` 仅受 `runtime` feature 门控，同 binary 应用可见；`impls/startup.md:30` 的“应用永远不能取得 descriptor”不成立 | 用可见性真正隔离（runtime 私有/unsafe 构造），或把契约改写为使用约定并统一文档 |
+| G5 | P3 | `impls/task.md:138` 省略 Cancelling，Claimed 只写成 reap 所有，“迟到取消返还失败”与 Drop 实际 Abort 不符，段落插入定义句中间 | 完整写明取消两段协议、各状态 owner 与不可达分支，移回线程章节 |
+| G6 | P3 | `impls/framework.md:3` 仍有施工/验收宣告，`:20` 误写 runtime 经 take 领取；分层计划 `:245` RW 待纠正、`:233` 未提交已过时 | impls 只留机制事实，清除过时状态 |
+
+F1 代码关闭（专项测试未运行，见 G3）；F2 主体成立（见 G4）；F3、F4、F5、F6 开放；F7 指定五处 IPI 路径结论认可，措辞收窄：ProcessDrain 路径持 `DRAIN_GATE(0)`，低于 CONSOLE(150) 合法，不宣称全核穷尽。gc 当前 ELF 无 worker 符号，不能作 gc worker 入口证据。
+
+关闭所需最小证据：F3 为 G1 各项加真实 target adopt 失败时 Seed 返还、原 raw grants 存活且 main 未调用；F5 为旧启动区间（`artifacts/failed-acceptance-20260929-094400-19900.log:114` 之后）第一坏事件与原因及同条件定向验证，“未复现”不能替代。
+
+## 整体收敛（以删除机制关闭）
+
+逐条补证连续四轮未收敛，根因是每次修复都新增状态、类型、feature 或证据设施。本轮从需求反推，删掉不由需求直接推出的机制，再按最终结构关闭全部开放项。
+
+| 需求（ideas 保证） | 保留 | 删除 |
+|---|---|---|
+| 已死线程不占用被需要的容量 | Registry 槽 Free/Reserved/Live/Claimed/Faulted，唯一登记入口 install，预算 reap | Prepared/Cancelling/Abandoned 及取消-reap 仲裁；Start 前 record 登记 |
+| 未启动放弃等同离场 | PreparedThread 独占栈/Control/packet；Drop 关闭唯一 Control 后登记无 Control record | 取消两段协议及其交错测试 |
+| 入口 descriptor 不进入应用 | `StartupContext::adopt` 直接返回 descriptor、入口 Control 与 Context；构造需 unsafe Seed | StartupAdmission、Drop abort、`runtime` feature、`from_parts` 重组 |
+| ideas 只写概念、关系、保证 | task/framework/bootstrap 的 owner、寿命与保证 | ideas 中的槽状态机、步骤顺序、CAS 交错表（下沉 impls） |
+
+开放项处置：
+- G1/F3：取消用例改为其余 worker 存活、放弃一个 PreparedThread 后下一次准入必须成功；交错测试随仲裁删除而不适用。adopt 失败路径由 host 测试覆盖（全表 Query 前拒绝、晚项 Query 失败返还 Seed、重复与非法 role 拒绝）。
+- G2/F4：不建元数据设施；证据以固定提交的干净工作树上运行的既有门为准。
+- G3：撤回 hetero 与“acceptance 含入口门”的表述；入口反汇编为独立开发证据。
+- G4：随 Admission 删除消失；安全代码无法构造 Seed，因而无法取得 descriptor。
+- G5/G6：impls 按最终代码重写，删除施工宣告。
+- F5：所涉启动代码已被整体替换，问题过期，按“关闭（未解决）”处置，不再定位；新问题另行立案的条件为新代码在 init 建 Job、映射、启动 pm 区间出现同类早期停滞。
+
+验证（本轮工作树）：libthread/libprocess host 测试、`just check`、`just clippy` 七分面、`just acceptance` 全路线通过（race 16/16）。开发期 core 路线出现一次 `test_fal` “midflight Copy progress or owner mismatch”，该用例不经过取消路径，基线 2 次与改动后 3 次定向重跑均通过，登记为间歇观察；再现时单独立案。
+
+状态：待提交后一次结构检查；无新发现即归档。

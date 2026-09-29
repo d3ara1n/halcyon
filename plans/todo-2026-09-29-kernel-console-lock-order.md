@@ -69,4 +69,4 @@
 
 ## 关闭声明
 
-第一违规链已修复：`CONNECTION(220)` 持有期间不再执行 console 输出或 endpoint/peer signal 通知；五处 IPI warning 的外层持锁审计也已完成。core、stress、完整 acceptance 和入口门均通过。本记录的锁序范围关闭；早期 acceptance timeout 仍由运行时分层 review 的 F5 单独承接。
+第一违规链已修复：`CONNECTION(220)` 持有期间不再执行 console 输出或 endpoint/peer signal 通知；五处 IPI warning 的外层持锁审计也已完成。core、stress、完整 acceptance 和入口门均通过。本记录的锁序范围关闭；早期 acceptance timeout 由运行时分层 review 的 F5 承接，已因代码替换按过期关闭。

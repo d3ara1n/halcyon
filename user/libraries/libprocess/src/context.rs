@@ -116,38 +116,19 @@ pub struct StartupContext {
     grants: InitialGrants,
 }
 
-#[must_use = "the runtime must consume StartupAdmission before entering application code"]
-pub struct StartupAdmission {
-    context: Option<StartupContext>,
-    entry: Option<EntryThreadDescriptor>,
-}
-
-impl StartupAdmission {
-    #[cfg(any(test, feature = "runtime"))]
-    pub fn into_parts(mut self) -> (EntryThreadDescriptor, StartupContext) {
-        (
-            self.entry.take().expect("startup admission entry already consumed"),
-            self.context
-                .take()
-                .expect("startup admission context already consumed"),
-        )
-    }
-}
-
-impl Drop for StartupAdmission {
-    fn drop(&mut self) {
-        // A validated admission must either hand its descriptor to the runtime
-        // entry registry or abort; silently dropping it would skip the entry
-        // thread's ownership handoff.
-        if self.entry.is_some() || self.context.is_some() {
-            unsafe { libkernel::sys_process_abort() }
-        }
-    }
+/// Result of adopting the startup block: the entry-thread descriptor and its
+/// Control go to the runtime, the context goes to the application. Reaching
+/// this value requires an unsafe `StartupSeed`, so safe code never observes
+/// the entry descriptor.
+pub struct StartupAdoption {
+    pub entry: EntryThreadDescriptor,
+    pub entry_control: Capability,
+    pub context: StartupContext,
 }
 
 impl StartupContext {
     /// Verify every entry before consuming the affine StartupSeed.
-    pub fn adopt(seed: StartupSeed) -> Result<StartupAdmission, (StartupSeed, ContextError)> {
+    pub fn adopt(seed: StartupSeed) -> Result<StartupAdoption, (StartupSeed, ContextError)> {
         Self::adopt_with_query(seed, libkernel::ipc::object::query)
     }
 
@@ -157,7 +138,7 @@ impl StartupContext {
             Handle,
         )
             -> Result<erhino_shared::object::HandleDescription, SystemCallError>,
-    ) -> Result<StartupAdmission, (StartupSeed, ContextError)> {
+    ) -> Result<StartupAdoption, (StartupSeed, ContextError)> {
         let count = seed.input.grant_count();
         let mut handles = Vec::new();
         if handles.try_reserve_exact(count).is_err() {
@@ -215,7 +196,15 @@ impl StartupContext {
 
         // All fallible work is complete. Capability construction only installs
         // the already-validated close responsibilities into the affine table.
-        for (handle, description) in handles.into_iter().zip(descriptions) {
+        let mut entry_control = None;
+        for (index, (handle, description)) in handles.into_iter().zip(descriptions).enumerate() {
+            if index == control_index {
+                // SAFETY: validated as the unique MANAGE ThreadControl entry.
+                entry_control = Some(unsafe { Capability::from_raw(handle) });
+                // The slot stays empty so grant indices keep launcher order.
+                slots.push(None);
+                continue;
+            }
             let role = match description.role {
                 value if value == HandleRole::JobControl as u32 => HandleRole::JobControl,
                 value if value == HandleRole::MemoryPool as u32 => HandleRole::MemoryPool,
@@ -251,27 +240,16 @@ impl StartupContext {
             },
             grants: InitialGrants { slots },
         };
-        Ok(StartupAdmission {
-            context: Some(context),
-            entry: Some(entry),
+        Ok(StartupAdoption {
+            entry,
+            entry_control: entry_control
+                .expect("validate_descriptions proved the entry control index"),
+            context,
         })
     }
 
     pub fn into_parts(self) -> (CurrentProcessInfo, StartupPayload, InitialGrants) {
         (self.process, self.payload, self.grants)
-    }
-
-    #[cfg(feature = "runtime")]
-    pub fn from_parts(
-        process: CurrentProcessInfo,
-        payload: StartupPayload,
-        grants: InitialGrants,
-    ) -> Self {
-        Self {
-            process,
-            payload,
-            grants,
-        }
     }
 }
 
@@ -421,12 +399,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(query_count.load(Ordering::Relaxed), 65);
-        let (_entry, context) = admission.into_parts();
-        let (process, payload, mut grants) = context.into_parts();
+        // 入口 Control 已由采用结果单独交付，不再留在应用 grants 中。
+        core::mem::forget(admission.entry_control);
+        let (process, payload, mut grants) = admission.context.into_parts();
         assert_eq!(process.pid(), 7);
         assert_eq!(process.parent_pid(), 3);
         assert_eq!(payload.as_bytes(), b"payload");
         assert_eq!(grants.len(), 65);
+        assert!(grants.take(64).is_none(), "entry control must not be exposed to the application");
         let sender = grants
             .try_adopt(HandleRole::MailboxSender)
             .expect("role adoption must consume the matching grant");

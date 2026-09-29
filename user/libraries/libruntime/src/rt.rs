@@ -74,28 +74,20 @@ fn registry() -> &'static ThreadRegistry<NoEnvironment> {
 }
 
 fn adopt_entry_thread(seed: libprocess::context::StartupSeed) {
-    let admission = match StartupContext::adopt(seed) {
-        Ok(admission) => admission,
+    let adoption = match StartupContext::adopt(seed) {
+        Ok(adoption) => adoption,
         Err((_, error)) => {
             dbg::debug(format_args!("startup grant adoption failed: {:?}", error));
             unsafe { sys_process_abort() }
         }
     };
-    let (descriptor, context) = admission.into_parts();
-    let (process, payload, mut grants) = context.into_parts();
-    let control = match grants.take(descriptor.control_index as usize) {
-        Some(capability) => capability.into_raw(),
-        None => {
-            dbg::debug(format_args!("startup entry thread control grant is missing"));
-            unsafe { sys_process_abort() }
-        }
-    };
+    let control = adoption.entry_control.into_raw();
     let registry = registry();
     // SAFETY: StartupBlock validation proves the reservation geometry, and the
     // claimed control is the descriptor-selected unique ThreadControl owner.
     let result = unsafe {
         registry.adopt_entry(
-            descriptor,
+            adoption.entry,
             ThreadControl::from_raw(control),
             NoEnvironment,
             (),
@@ -105,7 +97,7 @@ fn adopt_entry_thread(seed: libprocess::context::StartupSeed) {
         dbg::debug(format_args!("startup entry thread adoption failed: {:?}", error));
         unsafe { sys_process_abort() }
     }
-    *STARTUP_CONTEXT.lock() = Some(StartupContext::from_parts(process, payload, grants));
+    *STARTUP_CONTEXT.lock() = Some(adoption.context);
 }
 
 pub mod thread {

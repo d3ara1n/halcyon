@@ -8,7 +8,7 @@ edition = "2024"
 [dependencies]
 libkernel = { path = "../libkernel" }
 libthread = { path = "../libthread" }
-libprocess = { path = "../libprocess", features = ["runtime"] }
+libprocess = { path = "../libprocess" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 talc = "5.0"
 lock_api = "0.4"

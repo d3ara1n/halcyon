@@ -184,30 +184,29 @@ pub enum ThreadOutcome<T, E: ThreadEnvironment> {
     Incomplete,
 }
 
-#[derive(Debug)]
-struct CleanupProgress {
-    retired: bool,
-    abandoned: bool,
-    done: bool,
-}
-
+/// Resources that outlive a thread's execution. A record without a Control
+/// is already DONE: either its thread departed and was observed, or it was
+/// never started and its last Control was closed before installation.
 struct ThreadRecord<E: ThreadEnvironment> {
     stack: Option<MappedRegion>,
     control: Option<Arc<ThreadControl>>,
     environment: Arc<E>,
     residue: Arc<ResidueCell<E::Residue>>,
-    cleanup: CleanupProgress,
+    retired: bool,
 }
 
 enum SlotState<E: ThreadEnvironment> {
     Free,
+    /// Admission held by a PreparedThread; not visible to reap.
     Reserved,
-    Prepared(ThreadRecord<E>),
-    Cancelling(ThreadRecord<E>),
     Live(ThreadRecord<E>),
-    Abandoned(ThreadRecord<E>),
+    /// Exclusively owned by one reap call until it publishes the outcome.
     Claimed,
-    Faulted(ThreadRecord<E>),
+    /// Unrecoverable cleanup evidence; never reused. The record is held only
+    /// to keep its owners alive until the integrity abort that always follows.
+    Faulted {
+        _retained: ThreadRecord<E>,
+    },
 }
 
 struct RegistryInner<E: ThreadEnvironment> {
@@ -226,7 +225,6 @@ pub enum RegistryError {
     Sealed,
     Full,
     InvalidEntry,
-    InvalidSlot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +267,7 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         self.inner.lock().slots.len()
     }
 
+    /// Stop new admissions. Reservations already granted may still install.
     pub fn seal(&self) {
         self.inner.lock().sealed = true;
     }
@@ -282,16 +281,7 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
             .slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| match slot {
-                SlotState::Free => true,
-                // A faulted record owns the evidence of an unrecoverable
-                // cleanup failure and is never reused.
-                SlotState::Faulted(record) => {
-                    let _ = record.cleanup.retired;
-                    false
-                }
-                _ => false,
-            })
+            .find(|(_, slot)| matches!(slot, SlotState::Free))
         else {
             return Err(RegistryError::Full);
         };
@@ -299,191 +289,94 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         Ok(index)
     }
 
-    fn release_reserved(&self, index: usize) -> Result<(), RegistryError> {
-        let mut inner = self.inner.lock();
-        let slot = inner
-            .slots
-            .get_mut(index)
-            .ok_or(RegistryError::InvalidSlot)?;
-        if !matches!(slot, SlotState::Reserved) {
-            return Err(RegistryError::InvalidSlot);
-        }
-        *slot = SlotState::Free;
-        Ok(())
+    /// Return an admission that never acquired a stack.
+    fn release_reserved(&self, index: usize) {
+        self.replace_exclusive(index, SlotState::Free);
     }
 
-    fn retain_reserved_failure(
-        &self,
-        index: usize,
-        record: ThreadRecord<E>,
-    ) -> Result<(), RegistryError> {
-        let mut inner = self.inner.lock();
-        let slot = inner
-            .slots
-            .get_mut(index)
-            .ok_or(RegistryError::InvalidSlot)?;
-        if !matches!(slot, SlotState::Reserved) {
-            return Err(RegistryError::InvalidSlot);
-        }
-        *slot = SlotState::Faulted(record);
-        Ok(())
+    /// Turn a reservation into a record. This is the only way a record enters
+    /// the registry: started, entry, abandoned and failed threads all land here
+    /// and share one cleanup path.
+    fn install(&self, index: usize, record: ThreadRecord<E>) {
+        self.replace_exclusive(index, SlotState::Live(record));
     }
 
-    fn register(
-        &self,
-        index: usize,
-        record: ThreadRecord<E>,
-    ) -> Result<(), (RegistryError, ThreadRecord<E>)> {
+    /// Replace a slot the caller owns exclusively (Reserved or Claimed).
+    fn replace_exclusive(&self, index: usize, state: SlotState<E>) {
         let mut inner = self.inner.lock();
-        if inner.sealed {
-            return Err((RegistryError::Sealed, record));
+        match inner.slots.get_mut(index) {
+            Some(slot @ (SlotState::Reserved | SlotState::Claimed)) => *slot = state,
+            _ => cleanup_integrity_failure(CleanupFault::InvalidSlot),
         }
-        let Some(slot) = inner.slots.get_mut(index) else {
-            return Err((RegistryError::InvalidSlot, record));
-        };
-        if !matches!(slot, SlotState::Reserved) {
-            return Err((RegistryError::InvalidSlot, record));
-        }
-        *slot = SlotState::Prepared(record);
-        Ok(())
     }
 
-    fn cancel_prepared(&self, index: usize) -> Result<(), RegistryError> {
+    fn claim_next(&self) -> Option<(usize, ThreadRecord<E>)> {
         let mut inner = self.inner.lock();
-        let slot = inner
-            .slots
-            .get_mut(index)
-            .ok_or(RegistryError::InvalidSlot)?;
-        match core::mem::replace(slot, SlotState::Free) {
-            SlotState::Prepared(record) => *slot = SlotState::Cancelling(record),
-            state => {
-                *slot = state;
-                return Err(RegistryError::InvalidSlot);
+        let len = inner.slots.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            let slot = &mut inner.slots[index];
+            if matches!(slot, SlotState::Live(_)) {
+                let SlotState::Live(record) = core::mem::replace(slot, SlotState::Claimed) else {
+                    unreachable!("slot matched Live under the same guard");
+                };
+                return Some((index, record));
             }
         }
-        Ok(())
+        None
     }
 
-    fn finish_cancel_prepared(&self, index: usize) -> Result<(), RegistryError> {
-        let mut record = {
-            let mut inner = self.inner.lock();
-            let slot = inner
-                .slots
-                .get_mut(index)
-                .ok_or(RegistryError::InvalidSlot)?;
-            match core::mem::replace(slot, SlotState::Claimed) {
-                SlotState::Cancelling(record) => record,
-                state => {
-                    *slot = state;
-                    return Err(RegistryError::InvalidSlot);
-                }
-            }
-        };
-        record.cleanup.abandoned = true;
-        drop(record.control.take());
-        let mut inner = self.inner.lock();
-        let slot = inner
-            .slots
-            .get_mut(index)
-            .ok_or(RegistryError::InvalidSlot)?;
-        if !matches!(slot, SlotState::Claimed) {
-            return Err(RegistryError::InvalidSlot);
-        }
-        *slot = SlotState::Abandoned(record);
-        Ok(())
-    }
-
-    /// Reap at most `budget` completed records. It never waits for a child or
-    /// performs user code; Busy mappings remain in their slot.
+    /// Reap at most `budget` records. It never waits for a child or runs user
+    /// code; undone threads and Busy mappings return to Live.
     pub fn reap(&self, budget: usize) -> ReapProgress {
         let mut completed = 0;
         let mut saw_wait = false;
         for _ in 0..budget {
-            let Some((index, record)) = ({
-                let mut inner = self.inner.lock();
-                let len = inner.slots.len();
-                if len == 0 {
-                    break;
-                }
-                let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
-                let mut found = None;
-                for offset in 0..len {
-                    let index = (start + offset) % len;
-                    let slot = &mut inner.slots[index];
-                    let claim = match core::mem::replace(slot, SlotState::Free) {
-                        SlotState::Live(record) => Some(record),
-                        SlotState::Abandoned(record) => Some(record),
-                        state => {
-                            *slot = state;
-                            None
-                        }
-                    };
-                    if claim.is_some() {
-                        // Claimed is held exclusively by this reap call until finish_claimed
-                        // publishes Free or Faulted; reserve/cancel never accept this state.
-                        *slot = SlotState::Claimed;
-                        found = claim.map(|record| (index, record));
-                        break;
-                    }
-                }
-                found
-            }) else {
+            let Some((index, mut record)) = self.claim_next() else {
                 break;
             };
-            let mut record = record;
-            let done = match record.control.as_ref() {
-                None if record.cleanup.abandoned || record.cleanup.done => true,
-                None => false,
-                Some(control) => match libkernel::ipc::wait::wait_until(
-                    &[erhino_shared::wait::WaitItem::new(
-                        control.as_handle(),
-                        erhino_shared::object::ObjectSignals::DONE,
-                        0,
-                    )],
-                    erhino_shared::time::Deadline::at(0),
-                ) {
-                    Ok(result) => result
-                        .observed
-                        .contains(erhino_shared::object::ObjectSignals::DONE),
+            if let Some(control) = record.control.as_ref() {
+                match observe_done(control, erhino_shared::time::Deadline::at(0)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.install_claimed(index, record);
+                        saw_wait = true;
+                        continue;
+                    }
                     Err(error) => {
-                        self.restore_live(index, record);
+                        self.install_claimed(index, record);
                         return ReapProgress::Failed(CleanupFault::Wait(error));
                     }
-                },
-            };
-            if !done {
-                self.restore_live(index, record);
-                saw_wait = true;
-                continue;
+                }
             }
-            record.cleanup.done = true;
-            if !record.cleanup.retired {
+            if !record.retired {
                 if let Some(residue) = record.residue.take()
                     && record.environment.retire(residue).is_err()
                 {
-                    self.set_faulted(index, record);
+                    self.replace_exclusive(index, SlotState::Faulted { _retained: record });
                     return ReapProgress::Failed(CleanupFault::Retire);
                 }
-                record.cleanup.retired = true;
+                record.retired = true;
             }
             drop(record.control.take());
             let Some(stack) = record.stack.take() else {
-                self.set_faulted(index, record);
+                self.replace_exclusive(index, SlotState::Faulted { _retained: record });
                 return ReapProgress::Failed(CleanupFault::MissingStack);
             };
             match stack.unmap() {
                 Ok(()) => {
-                    self.finish_claimed(index);
+                    self.replace_exclusive(index, SlotState::Free);
                     completed += 1;
                 }
                 Err((stack, SystemCallError::ObjectBusy)) => {
                     record.stack = Some(stack);
-                    self.restore_live(index, record);
+                    self.install_claimed(index, record);
                     saw_wait = true;
                 }
                 Err((stack, error)) => {
                     record.stack = Some(stack);
-                    self.set_faulted(index, record);
+                    self.replace_exclusive(index, SlotState::Faulted { _retained: record });
                     return ReapProgress::Failed(CleanupFault::Unmap(error));
                 }
             }
@@ -497,49 +390,11 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         }
     }
 
-    fn restore_live(&self, index: usize, record: ThreadRecord<E>) {
-        let mut inner = self.inner.lock();
-        if let Some(slot) = inner.slots.get_mut(index) {
-            *slot = SlotState::Live(record);
-        }
-    }
-
-    fn activate_prepared(&self, index: usize) -> Result<(), RegistryError> {
-        let mut inner = self.inner.lock();
-        let slot = inner
-            .slots
-            .get_mut(index)
-            .ok_or(RegistryError::InvalidSlot)?;
-        let record = match core::mem::replace(slot, SlotState::Free) {
-            SlotState::Prepared(record) => record,
-            state => {
-                *slot = state;
-                return Err(RegistryError::InvalidSlot);
-            }
-        };
-        *slot = SlotState::Live(record);
-        Ok(())
-    }
-
-    fn set_faulted(&self, index: usize, record: ThreadRecord<E>) {
-        let mut inner = self.inner.lock();
-        if let Some(slot) = inner.slots.get_mut(index) {
-            *slot = SlotState::Faulted(record);
-        }
-    }
-
-    fn finish_claimed(&self, index: usize) {
-        let mut inner = self.inner.lock();
-        if let Some(slot) = inner.slots.get_mut(index) {
-            *slot = SlotState::Free;
-        }
+    fn install_claimed(&self, index: usize, record: ThreadRecord<E>) {
+        self.replace_exclusive(index, SlotState::Live(record));
     }
 
     /// Adopt the already-created entry thread as an ordinary record.
-    ///
-    /// `control` must be the unique child-local grant selected by the
-    /// descriptor's index. The reservation is converted into a normal region
-    /// owner, so later cleanup does not branch on thread origin.
     ///
     /// # Safety
     ///
@@ -553,39 +408,34 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         residue: E::Residue,
     ) -> Result<Thread, RegistryError> {
         let slot = self.reserve()?;
-        let stack = unsafe {
+        let stack = match unsafe {
             MappedRegion::from_reservation(
                 desc.stack_reservation_start as usize,
                 desc.stack_reservation_len as usize,
                 desc.usable_start as usize,
                 desc.usable_len as usize,
             )
-        }
-        .map_err(|_| {
-            let _ = self.release_reserved(slot);
-            RegistryError::InvalidEntry
-        })?;
+        } {
+            Ok(stack) => stack,
+            Err(_) => {
+                self.release_reserved(slot);
+                return Err(RegistryError::InvalidEntry);
+            }
+        };
         let thread = Thread {
             id: 0,
             control: Arc::new(control),
         };
-        let record = ThreadRecord {
-            stack: Some(stack),
-            control: Some(Arc::clone(&thread.control)),
-            environment: Arc::new(environment),
-            residue: Arc::new(ResidueCell::new(residue)),
-            cleanup: CleanupProgress {
+        self.install(
+            slot,
+            ThreadRecord {
+                stack: Some(stack),
+                control: Some(Arc::clone(&thread.control)),
+                environment: Arc::new(environment),
+                residue: Arc::new(ResidueCell::new(residue)),
                 retired: false,
-                abandoned: false,
-                done: false,
             },
-        };
-        if let Err((error, record)) = self.register(slot, record) {
-            unmap_record_or_abort(self, slot, record);
-            let _ = self.release_reserved(slot);
-            return Err(error);
-        }
-        self.activate_prepared(slot)?;
+        );
         Ok(thread)
     }
 }
@@ -594,7 +444,7 @@ fn registry_error_to_system(error: RegistryError) -> SystemCallError {
     match error {
         RegistryError::Sealed => SystemCallError::ObjectClosed,
         RegistryError::Full => SystemCallError::ReachLimit,
-        RegistryError::InvalidEntry | RegistryError::InvalidSlot => SystemCallError::InternalError,
+        RegistryError::InvalidEntry => SystemCallError::InternalError,
     }
 }
 
@@ -608,9 +458,10 @@ fn cleanup_integrity_failure(fault: CleanupFault) -> ! {
     unsafe { libkernel::sys_process_abort() }
 }
 
-fn reap_or_abort<E: ThreadEnvironment>(registry: &'static ThreadRegistry<E>) {
-    if let ReapProgress::Failed(fault) = registry.reap(registry.capacity()) {
-        cleanup_integrity_failure(fault);
+fn reap_or_abort<E: ThreadEnvironment>(registry: &'static ThreadRegistry<E>) -> ReapProgress {
+    match registry.reap(registry.capacity()) {
+        ReapProgress::Failed(fault) => cleanup_integrity_failure(fault),
+        progress => progress,
     }
 }
 
@@ -627,24 +478,6 @@ fn observe_done(
     Ok(result
         .observed
         .contains(erhino_shared::object::ObjectSignals::DONE))
-}
-
-fn unmap_record_or_abort<E: ThreadEnvironment>(
-    registry: &ThreadRegistry<E>,
-    slot: usize,
-    mut record: ThreadRecord<E>,
-) {
-    drop(record.control.take());
-    let Some(stack) = record.stack.take() else {
-        cleanup_integrity_failure(CleanupFault::MissingStack);
-    };
-    if let Err((stack, error)) = stack.unmap() {
-        record.stack = Some(stack);
-        if registry.retain_reserved_failure(slot, record).is_err() {
-            cleanup_integrity_failure(CleanupFault::InvalidSlot);
-        }
-        cleanup_integrity_failure(CleanupFault::Unmap(error));
-    }
 }
 
 #[derive(Clone)]
@@ -818,31 +651,31 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        // Dead threads are reclaimed before their capacity is needed: a full
+        // registry after a full-budget reap holds only live or Busy records.
         reap_or_abort(self.registry);
         let slot = match self.registry.reserve() {
             Ok(slot) => slot,
-            Err(RegistryError::Full) => match self.registry.reap(self.registry.capacity()) {
-                ReapProgress::Failed(fault) => cleanup_integrity_failure(fault),
-                ReapProgress::Idle | ReapProgress::Wait => return Err(SystemCallError::ReachLimit),
+            Err(RegistryError::Full) => match reap_or_abort(self.registry) {
                 ReapProgress::Progress { .. } => {
                     self.registry.reserve().map_err(registry_error_to_system)?
                 }
+                _ => return Err(SystemCallError::ReachLimit),
             },
             Err(error) => return Err(registry_error_to_system(error)),
         };
-        let child = self.environment.prepare().map_err(|_| {
-            let _ = self.registry.release_reserved(slot);
-            SystemCallError::OutOfMemory
-        })?;
-        let stack_bytes = self
-            .stack_bytes
-            .checked_add(PROCESS_PAGE_SIZE - 1)
-            .ok_or_else(|| {
-                let _ = self.registry.release_reserved(slot);
-                SystemCallError::IllegalArgument
-            })?
-            / PROCESS_PAGE_SIZE
-            * PROCESS_PAGE_SIZE;
+        let child = match self.environment.prepare() {
+            Ok(child) => child,
+            Err(_) => {
+                self.registry.release_reserved(slot);
+                return Err(SystemCallError::OutOfMemory);
+            }
+        };
+        let Some(stack_bytes) = self.stack_bytes.checked_add(PROCESS_PAGE_SIZE - 1) else {
+            self.registry.release_reserved(slot);
+            return Err(SystemCallError::IllegalArgument);
+        };
+        let stack_bytes = stack_bytes / PROCESS_PAGE_SIZE * PROCESS_PAGE_SIZE;
         let stack = loop {
             match MappedRegion::map_anonymous(
                 stack_bytes,
@@ -856,18 +689,36 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
                     // Another mapping publication owns the current page-table
                     // generation; yield before retrying the construction.
                     if let Err(error) = unsafe { libkernel::sys_sleep(1) } {
-                        let _ = self.registry.release_reserved(slot);
+                        self.registry.release_reserved(slot);
                         return Err(error);
                     }
                 }
                 Err(error) => {
-                    let _ = self.registry.release_reserved(slot);
+                    self.registry.release_reserved(slot);
                     return Err(error);
                 }
             }
         };
-        let (result, producer) = ResultCell::<ThreadOutcome<T, E>>::new();
         let residue = Arc::new(ResidueCell::empty());
+        // From here on the stack exists; every failure installs it as a DONE
+        // record (no Control) so the ordinary reap path owns the Unmap.
+        let fail = |stack: MappedRegion, residue, error| {
+            self.registry.install(
+                slot,
+                ThreadRecord {
+                    stack: Some(stack),
+                    control: None,
+                    environment: Arc::clone(&self.environment),
+                    residue,
+                    retired: false,
+                },
+            );
+            Err(error)
+        };
+        let Some(usable) = stack.usable() else {
+            return fail(stack, residue, SystemCallError::InternalError);
+        };
+        let (result, producer) = ResultCell::<ThreadOutcome<T, E>>::new();
         let packet = Box::new(Packet {
             entry: trampoline::<E, F, T>,
             environment: Arc::clone(&self.environment),
@@ -876,34 +727,10 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
             producer: Some(producer),
             residue: Arc::clone(&residue),
         });
-        let packet_pointer = (&*packet as *const Packet<E, F, T>) as usize;
-        let stack_pointer = match stack.usable() {
-            Some(usable) => usable.end,
-            None => {
-                drop(packet);
-                unmap_record_or_abort(
-                    self.registry,
-                    slot,
-                    ThreadRecord {
-                        stack: Some(stack),
-                        control: None,
-                        environment: Arc::clone(&self.environment),
-                        residue,
-                        cleanup: CleanupProgress {
-                            retired: false,
-                            abandoned: false,
-                            done: false,
-                        },
-                    },
-                );
-                let _ = self.registry.release_reserved(slot);
-                return Err(SystemCallError::InternalError);
-            }
-        };
         let context = ThreadStartContext {
             entry: __libthread_worker_entry as *const () as usize as u64,
-            stack_pointer: stack_pointer as u64,
-            arg1: packet_pointer as u64,
+            stack_pointer: usable.end as u64,
+            arg1: (&*packet as *const Packet<E, F, T>) as usize as u64,
             arg2: self.registry as *const ThreadRegistry<E> as usize as u64,
         };
         let mut created = ThreadCreateResult {
@@ -911,73 +738,49 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
             reserved: 0,
             control: Handle::INVALID,
         };
-        // SAFETY: all syscall pointers refer to live stack values; the stack
-        // and packet were prepared before creation.
+        // SAFETY: all syscall pointers refer to live values; the stack and
+        // packet were prepared before creation.
         if let Err(error) =
             unsafe { kernel_thread::create(Handle::INVALID, &context, &mut created) }
         {
             drop(packet);
-            unmap_record_or_abort(
-                self.registry,
-                slot,
-                ThreadRecord {
-                    stack: Some(stack),
-                    control: None,
-                    environment: Arc::clone(&self.environment),
-                    residue,
-                    cleanup: CleanupProgress {
-                        retired: false,
-                        abandoned: false,
-                        done: false,
-                    },
-                },
-            );
-            let _ = self.registry.release_reserved(slot);
-            return Err(error);
+            return fail(stack, residue, error);
         }
-        let control = unsafe { ThreadControl::from_raw(created.control) };
-        let thread = Thread {
-            id: created.tid,
-            control: Arc::new(control),
-        };
-        let record = ThreadRecord {
-            stack: Some(stack),
-            control: Some(Arc::clone(&thread.control)),
-            environment: Arc::clone(&self.environment),
-            residue,
-            cleanup: CleanupProgress {
-                retired: false,
-                abandoned: false,
-                done: false,
-            },
-        };
-        if let Err((error, record)) = self.registry.register(slot, record) {
-            drop(packet);
-            drop(thread);
-            let mut record = record;
-            drop(record.control.take());
-            unmap_record_or_abort(self.registry, slot, record);
-            let _ = self.registry.release_reserved(slot);
-            return Err(registry_error_to_system(error));
-        }
+        // SAFETY: ThreadCreate returned a fresh MANAGE-capable Control owner.
+        let control = Arc::new(unsafe { ThreadControl::from_raw(created.control) });
         Ok(PreparedThread {
-            result,
-            thread: Some(thread),
-            packet: Some(packet),
+            parts: Some(PreparedParts {
+                result,
+                id: created.tid,
+                control,
+                packet,
+                stack,
+                residue,
+            }),
+            environment: Arc::clone(&self.environment),
             registry: self.registry,
             slot,
-            started: false,
         })
     }
 }
 
-pub struct PreparedThread<F, T, E: ThreadEnvironment> {
+struct PreparedParts<F, T, E: ThreadEnvironment> {
     result: Arc<ResultCell<ThreadOutcome<T, E>>>,
-    thread: Option<Thread>,
-    packet: Option<Box<Packet<E, F, T>>>,
+    id: Tid,
+    control: Arc<ThreadControl>,
+    packet: Box<Packet<E, F, T>>,
+    stack: MappedRegion,
+    residue: Arc<ResidueCell<E::Residue>>,
+}
+
+/// A created, not yet started thread. It owns a registry reservation and all
+/// thread resources; nothing is visible to reap until start or drop installs
+/// the record.
+pub struct PreparedThread<F, T, E: ThreadEnvironment> {
+    parts: Option<PreparedParts<F, T, E>>,
+    environment: Arc<E>,
     registry: &'static ThreadRegistry<E>,
     slot: usize,
-    started: bool,
 }
 
 impl<F, T, E: ThreadEnvironment> PreparedThread<F, T, E> {
@@ -986,51 +789,57 @@ impl<F, T, E: ThreadEnvironment> PreparedThread<F, T, E> {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let packet = self.packet.take().expect("prepared packet missing");
-        let packet = Box::into_raw(packet) as usize;
-        if let Err(error) = self
-            .thread
-            .as_ref()
-            .expect("PreparedThread started twice")
-            .control
-            .start()
-        {
+        let parts = self.parts.take().expect("PreparedThread parts missing");
+        // The packet is handed to the child by address; ownership transfers
+        // only if ThreadStart succeeds.
+        let packet = Box::into_raw(parts.packet);
+        if let Err(error) = parts.control.start() {
             // SAFETY: ThreadStart rejected the Created control, so the
-            // trampoline could not have consumed this packet.
-            self.packet = Some(unsafe { Box::from_raw(packet as *mut Packet<E, F, T>) });
+            // trampoline never ran and the packet is still ours.
+            let packet = unsafe { Box::from_raw(packet) };
+            self.parts = Some(PreparedParts { packet, ..parts });
             return Err((self, error));
         }
-        if self.registry.activate_prepared(self.slot).is_err() {
-            cleanup_integrity_failure(CleanupFault::InvalidSlot);
-        }
-        let thread = self.thread.take().expect("PreparedThread started twice");
-        self.started = true;
-        let receiver = ResultReceiver {
-            result: self.result.clone(),
-            control: Arc::clone(&thread.control),
+        self.registry.install(
+            self.slot,
+            ThreadRecord {
+                stack: Some(parts.stack),
+                control: Some(Arc::clone(&parts.control)),
+                environment: Arc::clone(&self.environment),
+                residue: parts.residue,
+                retired: false,
+            },
+        );
+        Ok(ResultReceiver {
+            result: parts.result,
+            control: parts.control,
             registry: self.registry,
-            id: thread.id,
-        };
-        drop(thread);
-        Ok(receiver)
+            id: parts.id,
+        })
     }
 }
 
 impl<F, T, E: ThreadEnvironment> Drop for PreparedThread<F, T, E> {
     fn drop(&mut self) {
-        if !self.started {
-            let thread = self.thread.take();
-            if self.registry.cancel_prepared(self.slot).is_err() {
-                cleanup_integrity_failure(CleanupFault::InvalidSlot);
-            }
-            drop(thread);
-            // The packet owns the FnOnce payload; close its affine path before
-            // publishing the cancelled registry record so F is never left pending.
-            drop(self.packet.take());
-            if self.registry.finish_cancel_prepared(self.slot).is_err() {
-                cleanup_integrity_failure(CleanupFault::InvalidSlot);
-            }
-        }
+        let Some(parts) = self.parts.take() else {
+            return;
+        };
+        // F and the environment child are destroyed on the abandoning thread.
+        drop(parts.packet);
+        drop(parts.result);
+        // This is the only Control reference: closing it abandons the Created
+        // thread, and the kernel publishes DONE before Close returns.
+        drop(parts.control);
+        self.registry.install(
+            self.slot,
+            ThreadRecord {
+                stack: Some(parts.stack),
+                control: None,
+                environment: Arc::clone(&self.environment),
+                residue: parts.residue,
+                retired: false,
+            },
+        );
     }
 }
 
@@ -1111,8 +920,8 @@ pub unsafe fn start_raw(control: Handle) -> Result<(), SystemCallError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CleanupFault, CleanupProgress, NoEnvironment, ReapProgress, ResidueCell, ResultCell,
-        SlotState, ThreadRecord, ThreadRegistry,
+        CleanupFault, NoEnvironment, ReapProgress, ResidueCell, ResultCell, SlotState,
+        ThreadRecord, ThreadRegistry,
     };
     use alloc::sync::Arc;
 
@@ -1126,7 +935,6 @@ mod tests {
 
     #[test]
     fn result_cell_abandon_drops_published_value() {
-        use alloc::sync::Arc;
         use core::sync::atomic::{AtomicUsize, Ordering};
 
         struct DropProbe(Arc<AtomicUsize>);
@@ -1145,7 +953,6 @@ mod tests {
 
     #[test]
     fn result_cell_publish_races_receiver_abandon_without_double_drop() {
-        use alloc::sync::Arc;
         use core::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Barrier;
 
@@ -1173,59 +980,33 @@ mod tests {
         drop(cell.take());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
+
+    /// Reserved admissions are invisible to reap; an installed DONE record
+    /// (no Control) is claimed on the next scan wherever it sits.
     #[test]
-    fn reap_skips_prepared_until_cancel_close_is_published() {
-        let registry = ThreadRegistry::<NoEnvironment>::new(1).unwrap();
-        let slot = registry.reserve().unwrap();
-        let record = ThreadRecord {
-            stack: None,
-            control: None,
-            environment: Arc::new(NoEnvironment),
-            residue: Arc::new(ResidueCell::empty()),
-            cleanup: CleanupProgress {
-                retired: false,
-                abandoned: false,
-                done: false,
-            },
-        };
-        assert!(registry.register(slot, record).is_ok());
-
-        registry.cancel_prepared(slot).unwrap();
-        assert_eq!(registry.reap(1), ReapProgress::Idle);
-        registry.finish_cancel_prepared(slot).unwrap();
-
-        let inner = registry.inner.lock();
-        assert!(matches!(inner.slots[slot], SlotState::Abandoned(_)));
-    }
-
-    #[test]
-    fn full_budget_scan_skips_unfinished_live_for_later_abandoned_candidate() {
+    fn reap_ignores_reservations_and_finds_done_record_behind_them() {
         let registry = ThreadRegistry::<NoEnvironment>::new(2).unwrap();
-        let live_slot = registry.reserve().unwrap();
-        let abandoned_slot = registry.reserve().unwrap();
-        let record = || ThreadRecord {
-            stack: None,
-            control: None,
-            environment: Arc::new(NoEnvironment),
-            residue: Arc::new(ResidueCell::empty()),
-            cleanup: CleanupProgress {
+        let reserved = registry.reserve().unwrap();
+        let done = registry.reserve().unwrap();
+        assert_eq!(registry.reap(2), ReapProgress::Idle);
+        registry.install(
+            done,
+            ThreadRecord {
+                stack: None,
+                control: None,
+                environment: Arc::new(NoEnvironment),
+                residue: Arc::new(ResidueCell::empty()),
                 retired: false,
-                abandoned: false,
-                done: false,
             },
-        };
-        assert!(registry.register(live_slot, record()).is_ok());
-        assert!(registry.register(abandoned_slot, record()).is_ok());
-        registry.activate_prepared(live_slot).unwrap();
-        registry.cancel_prepared(abandoned_slot).unwrap();
-        registry.finish_cancel_prepared(abandoned_slot).unwrap();
-
+        );
+        // The host has no stack to unmap; MissingStack proves the record was
+        // claimed and processed, and the fault is retained as evidence.
         assert_eq!(
             registry.reap(2),
             ReapProgress::Failed(CleanupFault::MissingStack)
         );
         let inner = registry.inner.lock();
-        assert!(matches!(inner.slots[live_slot], SlotState::Live(_)));
-        assert!(matches!(inner.slots[abandoned_slot], SlotState::Faulted(_)));
+        assert!(matches!(inner.slots[reserved], SlotState::Reserved));
+        assert!(matches!(inner.slots[done], SlotState::Faulted { .. }));
     }
 }

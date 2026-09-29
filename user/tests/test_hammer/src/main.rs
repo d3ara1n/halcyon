@@ -550,32 +550,32 @@ fn join_publication() {
 }
 
 fn runtime_registry_reclaims_after_receiver_drop() {
-    let release = Arc::new(AtomicBool::new(false));
+    // 每个 worker 持有独立放行标志：只放行探针 worker，其余保持存活，
+    // 保证后续准入确实处于满槽，且只能靠回收 Abandoned record 成功。
     let mut workers = alloc::vec::Vec::new();
-
     loop {
-        let worker_release = Arc::clone(&release);
+        let hold = Arc::new(AtomicBool::new(false));
+        let worker_hold = Arc::clone(&hold);
         match thread::Builder::new()
             .stack_size(16 * 1024)
             .spawn(move || {
-                while !worker_release.load(Ordering::Acquire) {
-                    thread::yield_now().expect("round4 registry worker yield failed");
+                while !worker_hold.load(Ordering::Acquire) {
+                    thread::yield_now().expect("round5 registry worker yield failed");
                 }
             }) {
-            Ok(worker) => workers.push(worker),
+            Ok(worker) => workers.push((hold, worker)),
             Err(SystemCallError::ReachLimit) => break,
-            Err(error) => panic!("round4 registry fill failed: {error:?}"),
+            Err(error) => panic!("round5 registry fill failed: {error:?}"),
         }
     }
     assert!(
-        !workers.is_empty(),
-        "round4 registry fill did not occupy a runtime slot"
+        workers.len() >= 2,
+        "round5 registry fill needs at least two live slots"
     );
 
-    // Free one real slot, then prepare and drop a real packet-backed thread.
-    // The next prepare must reap the abandoned record before reserving again.
-    let worker = workers.pop().expect("round4 registry probe worker missing");
-    release.store(true, Ordering::Release);
+    // 释放恰好一个槽：join 等待 DONE 并协作推进回收。
+    let (hold, worker) = workers.pop().expect("round5 registry probe worker missing");
+    hold.store(true, Ordering::Release);
     take_thread_result(worker.join());
 
     struct PacketDropProbe(Arc<AtomicUsize>);
@@ -585,33 +585,61 @@ fn runtime_registry_reclaims_after_receiver_drop() {
         }
     }
     let drops = Arc::new(AtomicUsize::new(0));
-    let packet_probe = PacketDropProbe(Arc::clone(&drops));
-    let prepared = thread::Builder::new()
-        .stack_size(16 * 1024)
-        .prepare(move || {
+    // 失败的准入尝试会析构其 closure；只统计被接纳的 PreparedThread 的 Drop 增量。
+    let prepared = prepare_until_admitted(|| {
+        let packet_probe = PacketDropProbe(Arc::clone(&drops));
+        move || {
             let _ = packet_probe.0.load(Ordering::Relaxed);
-        })
-        .expect("round4 real PreparedThread construction failed");
-    drop(prepared);
-
-    let mut reclaimed = false;
-    for _ in 0..(workers.len() + 4) {
-        match thread::Builder::new().stack_size(16 * 1024).prepare(|| ()) {
-            Ok(prepared) => drop(prepared),
-            Err(SystemCallError::ReachLimit) => {
-                thread::yield_now().expect("round4 reap progress yield failed");
-            }
-            Err(error) => panic!("round4 reap probe failed: {error:?}"),
         }
-        if drops.load(Ordering::Acquire) == 1 {
-            reclaimed = true;
-            break;
+    });
+    let before = drops.load(Ordering::Acquire);
+    // 未启动的 PreparedThread Drop 在放弃者线程上析构 packet/F。
+    drop(prepared);
+    assert_eq!(
+        drops.load(Ordering::Acquire) - before,
+        1,
+        "round5 PreparedThread drop did not destroy its packet exactly once"
+    );
+
+    // 此时 Abandoned record 占用唯一空槽，其余 worker 仍存活：
+    // 准入成功只能来自 prepare 对 Abandoned record 的回收。
+    for round in 0..3 {
+        let prepared = prepare_until_admitted(|| || ());
+        drop(prepared);
+        debug!("round5 test=runtime_registry_abandoned_reclaim round={round} admitted");
+    }
+
+    for (hold, _) in &workers {
+        hold.store(true, Ordering::Release);
+    }
+    for (_, worker) in workers {
+        take_thread_result(worker.join());
+    }
+    debug!("round5 test=runtime_registry_real_prepared_drop_reap passed");
+}
+
+/// 满槽下重复准入：ReachLimit 仅允许来自栈 Unmap 暂时 Busy 的有界等待，
+/// 超过上界即判定回收失败，不再把失败当作通过。prepare 失败会消费 closure，
+/// 因此每次尝试由 `make` 重建。
+fn prepare_until_admitted<M, F>(
+    mut make: M,
+) -> libthread::PreparedThread<F, (), libthread::NoEnvironment>
+where
+    M: FnMut() -> F,
+    F: FnOnce() + Send + 'static,
+{
+    for _ in 0..64 {
+        match thread::Builder::new().stack_size(16 * 1024).prepare(make()) {
+            Ok(prepared) => return prepared,
+            Err(SystemCallError::ReachLimit) => {
+                thread::yield_now().expect("round5 reap progress yield failed");
+            }
+            Err(error) => panic!("round5 prepare failed: {error:?}"),
         }
     }
-    assert!(reclaimed, "round4 reap did not destroy the prepared packet closure");
-    drop(workers);
-    debug!("round4 test=runtime_registry_real_prepared_drop_reap passed");
+    panic!("round5 prepare never reclaimed the abandoned slot");
 }
+
 
 struct StormGate {
     release: AtomicBool,

@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 default = []
 management = ["dep:elf", "dep:libexecution"]
-runtime = []
 
 [dependencies]
 erhino_shared = { path = "../../../shared/erhino_shared" }
