@@ -43,13 +43,13 @@ use libkernel::{
     },
     sys_process_terminate, sys_sleep,
 };
+use libruntime::thread;
 use libthread::ThreadOutcome;
 use libthread as raw_thread;
-use libruntime::thread;
 
 fn main() {
     let mut startup = libruntime::startup::take().expect("hammer startup context is missing");
-    let Some(words) = race::decode_payload(startup.payload()) else {
+    let Some(words) = race::decode_payload(startup.payload().as_bytes()) else {
         debug!("hammer: invalid payload");
         return;
     };
@@ -386,6 +386,7 @@ fn thread_suite() {
     concurrent_tunnel_close();
     tunnel_close_attach();
     join_publication();
+    runtime_registry_reclaims_after_receiver_drop();
     raw_thread_storm();
     debug!("hammer target: same-address-space thread suite passed");
 }
@@ -539,6 +540,55 @@ fn join_publication() {
         dropped.load(Ordering::Acquire),
         "joined result did not destroy the published value"
     );
+}
+
+fn runtime_registry_reclaims_after_receiver_drop() {
+    let release = Arc::new(AtomicBool::new(false));
+    let mut workers = alloc::vec::Vec::new();
+
+    loop {
+        let worker_release = Arc::clone(&release);
+        match thread::Builder::new()
+            .stack_size(16 * 1024)
+            .spawn(move || {
+                while !worker_release.load(Ordering::Acquire) {
+                    thread::yield_now().expect("round3 registry worker yield failed");
+                }
+            }) {
+            Ok(worker) => workers.push(worker),
+            Err(SystemCallError::ReachLimit) => break,
+            Err(error) => panic!("round3 registry fill failed: {error:?}"),
+        }
+    }
+    assert!(
+        !workers.is_empty(),
+        "round3 registry fill did not occupy a runtime slot"
+    );
+
+    // Drop the observation owners before releasing the workers. This forces
+    // reap to observe both abandoned receivers and live controls.
+    let worker_count = workers.len();
+    drop(workers);
+    release.store(true, Ordering::Release);
+
+    for _ in 0..worker_count {
+        loop {
+            let probe = thread::Builder::new()
+                .stack_size(16 * 1024)
+                .spawn(|| ());
+            match probe {
+                Ok(worker) => {
+                    take_thread_result(worker.join());
+                    break;
+                }
+                Err(SystemCallError::ReachLimit) => {
+                    thread::yield_now().expect("round3 registry reap yield failed");
+                }
+                Err(error) => panic!("round3 registry reclaim failed: {error:?}"),
+            }
+        }
+    }
+    debug!("round3 test=runtime_registry_reclaims_after_receiver_drop passed");
 }
 
 struct StormGate {

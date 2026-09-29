@@ -16,10 +16,10 @@ use libkernel::{
 
 fn main() {
     let mut startup = libruntime::startup::take().expect("target startup context is missing");
-    if startup.payload() == b"ipc-kill" {
+    if startup.payload().as_bytes() == b"ipc-kill" {
         ipc_kill_target(&mut startup);
     }
-    if startup.payload() == b"retirement" {
+    if startup.payload().as_bytes() == b"retirement" {
         retirement_target(&mut startup);
     }
     debug!("target alive");

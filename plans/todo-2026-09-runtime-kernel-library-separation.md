@@ -264,7 +264,7 @@ stateDiagram-v2
 | Registry 容量 | 施工阶段定限额 | 由 runtime 装配者按资源模型给出，prepare 前先 reap |
 | Cargo 依赖图 | 设计阶段 | `libkernel` 不依赖上层；`libprocess::context` 只依赖 libkernel/shared；`libthread` 不依赖 libprocess/libexecution/runtime；libruntime 只组合 context、thread 与 kernel | 已完成并由 workspace check 验证 |
 | rinlib 模块归属 | 设计阶段 | call/ipc/mm/memory/time/system/debug → libkernel；process 原语 → libkernel，context/management → libprocess；thread → libthread；env/startup → libprocess::context；rt/allocator/panic/entry → libruntime |
-| 平台入口 | 设计阶段固定协议，施工阶段取证 | 平台 `_start` 先初始化 gp，再把 a0/a1 交给 libruntime；`entry!` 隐藏 binary/runtime ABI 桥；删除 ENTRY(main)/argc/argv 借位 | 已完成 |
+| 平台入口 | 设计阶段固定协议，施工阶段取证 | 平台 `_start` 先初始化 gp，再把 a0/a1 交给 libruntime；应用使用普通 `fn main()`，runtime `start` lang item 接入；不保留 `entry!`、ENTRY(main) 或 argc/argv 借位 | 已实现，待第三轮完整门复核 |
 | 消费者迁移 | 设计阶段固定责任矩阵，施工阶段逐 crate 修改 | 全部公共库、服务、驱动和验收程序已迁移；不保留旧 runtime facade/alias | 已完成 |
 | Rust 字段、模块文件、helper、默认容量 | 施工阶段 | 只要不改变上述契约，可由实现按代码结构决定；容量数值由真实装配者和资源模型给出，不能写无依据的全局常量 |
 | 编译错误、import、target 路径、linker 段 | 施工阶段 | 按依赖顺序修正并保留编译/ELF/反汇编证据，不提前在设计文档穷举 |
@@ -276,7 +276,7 @@ stateDiagram-v2
 2. libprocess::context：StartupSeed/Context/InitialGrants，独立于 management
 3. libthread：ThreadEnvironment、ThreadFactory、ThreadRegistry/ThreadRecord、ResultCell、Thread/ResultReceiver、内部 trampoline
 4. libprocess::management、librpc/librunnel/libfal/libfs/libservice 及服务消费者
-5. libruntime/platforms：_start、gp、heap、panic/OOM、`entry!` 和结果收束（Ok→ThreadExit，Err→ProcessAbort）
+5. libruntime/platforms：`_start`、gp、heap、panic/OOM、`start` lang item、入口线程与结果收束（Ok→ThreadExit，Err→ProcessAbort）
 6. 删除旧 runtime 目录、旧 target/linker/import/re-export，执行完整验证
 6. 删除 rinlib、旧 target/linker/import/re-export，执行完整验证
 ```
@@ -290,6 +290,6 @@ kernel/shared 的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution�
 
 后续每块设计同时核对 ideas、impls、实际导出/调用者与已有测试语义；代码若超前补齐描述，代码与目标不符则记录真实差距，不默认任一侧正确。本轮已核实 Runtime/WorkQueue/Wake、FAL NodeStore/Retirement、Process Collector/Observation、init RootSupervisor；详细路径和复用边界在用户内存 owner 记录，不需要重复整仓盘点。只有源码变化或具体新问题才重取相关证据。
 
-本计划施工已完成。普通出生块最终只读映像与 `os/kernel/src/rt.rs` 未消费的 `Termination` 约束仍是明确登记的范围外后续项，不阻塞本闭包交付。
+本计划的代码迁移、接口接线与第三轮复核已完成；普通出生块最终只读映像与 `os/kernel/src/rt.rs` 未消费的 `Termination` 约束是已登记的后续项，不阻塞本轮 R1–R9。最终证据见 [第三轮复核报告](review-2026-09-28-runtime-layering.md)。
 
-交付前检查：`git diff --check`、`just check`、`just clippy`、两种用户 target 构建/ELF audit/入口反汇编与 `just acceptance` 均通过；本工作树尚未提交。
+交付前检查：`git diff --check`、`just check`、`just clippy`、两种用户 target 构建/ELF audit/入口反汇编与 `just acceptance` 均已通过；日志路径与失败现场见复核报告。

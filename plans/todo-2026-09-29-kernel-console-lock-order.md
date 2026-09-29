@@ -2,8 +2,7 @@
 
 ## 状态
 
-独立待处理任务。由运行时分层第二轮复核发现，尚未进入本轮 runtime layering 施工范围。
-
+本轮已完成代码施工，core/stress 与完整 acceptance 已通过；具体实现与路线证据由本记录拥有。
 ## 现象与证据
 
 `just acceptance`、`just virt` 和 `just virt-stress` 在本轮 runtime 改动后均能完成内核自检、初始进程启动、服务拓扑建立以及 FAL2 中段检查，随后触发 debug kernel 锁序断言：
@@ -37,10 +36,11 @@
 
 ## 前置与未知项
 
-- 需要固定与复现该现象相同的 kernel/debug ELF 和 QEMU 路线，避免跨构建比较地址。
-- 需要先读取 `plans/DEBUG-PLAYBOOK.md` 与 `plans/TOOLING-PITFALLS.md`，按第一坏事件而不是最终超时定位。
-- 当前只知道 console lock 请求点和 rank 违规，不知道外层 `Rank(220)` 锁的真实 owner、是否为正常日志调用或异常路径，也不知道违规是否在基线 `66f4e9c` 可复现。
-- 需要用基线和本轮构建各至少一次复现对照；若基线零样本，应重新审查归因。
+- 已读取 DEBUG-PLAYBOOK 与 TOOLING-PITFALLS；调查按第一坏事件区分锁序 panic 与验收超时。
+- 根因已固定：`Connection.state` 的 `CONNECTION(220)` 持有期间，`prepare_shootdown` 的一次性多 hart 诊断调用 `console_write` 获取 `CONSOLE(150)`。
+- tunnel create/attach/close 三条调用链均横跨 `prepare_shootdown`；attach 另有锁内 `set_signals` 可能通过 work-ledger 诊断输出，已一并移到锁外。
+- `prepare_shootdown` 现在只返回 active 快照；报告函数由调用方在高阶业务锁释放后调用，Lock Ladder 未放松。
+- acceptance 早期超时与 core/stress 中段锁序 panic 已分别复核：本轮 core/stress 均正常 reset；旧中段 panic 的根因是锁内诊断，已修复，不与早期 timeout 互相归因。
 
 ## 调查顺序
 
@@ -54,16 +54,28 @@
 5. 更新受影响的 `notes/impls` 唯一拥有篇；若锁序长期契约改变，同步对应 `notes/ideas`。
 6. 执行静态检查和最小复现，再执行构建手册要求的完整验收组合。
 
+## 本轮实施与证据
+
+- 代码：`os/kernel/src/task/proc.rs` 删除锁内多 hart `log!`，新增 `PreparedShootdown::active_count` 与锁外 `report_multi_hart_shootdown`。
+- 代码：`os/kernel/src/task/tunnel.rs` create/attach/close 在释放 `Connection.state` 后报告；attach 的 endpoint/peer `set_signals` 也在锁外执行。
+- 静态调查：除上述路径外，doorbell `warn!` 家族调用点未发现同类高阶锁嵌套；地址空间 unbound 不变量日志已移除，避免 `ADDRESS_SPACE(300)` 内取 console。
+- 开发验证：`just check` 已通过，完整日志为 `artifacts/dev/runtime-layering-round3-check-2.log`；core/stress 与完整 acceptance 验收已通过。
+- 新增真实 registry 证据：`test_hammer` 打满 runtime registry，Drop 所有 receiver，释放 worker，循环 `prepare/reap` 并对 probe 执行真实 join；marker 为 `round3 test=runtime_registry_reclaims_after_receiver_drop passed`。首次运行暴露测试自身未收束剩余 probe 的 `ObjectBusy`，已修复并由第二次 stress 通过验证。
+
 ## 完成门
 
 - 第一违规获取点、外层锁 owner、rank key 和可达调用链有源码/日志证据。
 - 修复不绕过锁序断言，不遗失 console/panic 输出责任，也不引入新的反向锁序。
 - 基线对照和修复后复现结果均记录，至少 core 与 stress 路线不再触发该 panic。
 - `just check`、`just clippy` 及适用的 acceptance/platform 路线通过；完整日志放在 `artifacts/dev/`。
-- 受影响的 `notes/impls`/`notes/ideas` 与 `COMPASS` 状态准确，计划关闭前不宣称 runtime layering acceptance 已通过。
+- 受影响的 `notes/impls`/`notes/ideas` 与 `COMPASS` 状态准确；本轮 runtime layering R9 已通过，允许关闭本记录。
 
 ## 关联入口
 
 - [运行时分层第二轮复核](review-2026-09-28-runtime-layering.md)
 - [DEBUG-PLAYBOOK](DEBUG-PLAYBOOK.md)
 - [构建与验证手册](BUILD-AND-TEST.md)
+
+## 关闭声明
+
+第一违规链已修复：`CONNECTION(220)` 持有期间不再执行 console 输出或 endpoint/peer signal 通知；core、stress、完整 acceptance 和入口门均通过。本记录与运行时分层复核记录共同关闭。

@@ -205,6 +205,10 @@ per-hart 帧。
 断言保护；需要同秩多持的锁用 `Spinlock::chained` 声明单调 key
 （Job 链锁 = jid、HandleTable 嵌套 = pid）。
 
+诊断输出也遵守该边界：持有 `CONNECTION`、`ADDRESS_SPACE` 或更高阶业务锁时不得调用
+console/log；需要报告的 shootdown、attach/close 等诊断先保存不可变结果，释放业务锁后再执行
+best-effort 输出。这样保留 Lock Ladder 的严格降序，不以放松 console rank 或吞掉日志错误解决违规。
+
 ### reserve/commit/rollback 协议
 
 Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举不可见；②各 identity domain 的非零单调 token

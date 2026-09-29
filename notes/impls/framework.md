@@ -1,6 +1,6 @@
 # 用户态框架分层实现
 
-当前实现已完成本次运行时分层迁移。`libkernel` 拥有 RV64 ecall、错误解码、内核对象/IPC/MM/process 原语和安全资源 owner；`libthread` 拥有 `ResultCell`、固定容量 `ThreadRegistry`、线程工厂、trampoline 与协作式 reap；`libruntime` 拥有 `_start`、gp 初始化、全局 allocator、panic/OOM 处理、入口线程接管和应用入口交接。`libprocess::context` 持有 StartupBlock 的一次采用与初始 capability owner。出生块只读映射与 libprocess management feature 隔离已接通；runtime 使用基础 context 依赖。
+本轮运行时分层第三轮复核已完成，R1–R9 与最终验收门均通过。`libkernel` 拥有 RV64 ecall、错误解码、内核对象/IPC/MM/process 原语和安全资源 owner；`libthread` 拥有 `ResultCell`、固定容量 `ThreadRegistry`、线程工厂、trampoline 与协作式 reap；`libruntime` 拥有 `_start`、gp 初始化、全局 allocator、panic/OOM 处理、入口线程接管和应用入口交接。`libprocess::context` 持有 StartupBlock 的一次采用与初始 capability owner。出生块只读映像与 management feature 隔离已由复核报告和最终门取证。
 
 目标结构由 [`../ideas/framework.md`](../ideas/framework.md) 拥有，迁移范围、验证证据和历史取舍由 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md) 拥有。普通库只依赖知识 owner，不依赖 `libruntime`；用户程序显式链接 `libruntime`，由 `_start` 先完成运行时准备，再通过 `start` lang item 接收 rustc 的 `main`。
 
@@ -24,4 +24,4 @@
 
 ## 当前验证边界
 
-host 单测、`just check`、`just clippy`、用户 ELF audit、`_start`/gp 入口反汇编门和 `just acceptance` 均已通过。acceptance 覆盖 virt stress 16/16、virt core/release、sifive_u、nofd 及 panic/alloc/fatal boot-failure；QEMU DTS 工具自身的既有 warning 不影响验收判定。出生块只读保护与 management feature 隔离均已有针对性验证。
+host 单测、`just check`、`just clippy`、用户 ELF audit、`_start`/gp 入口反汇编门和 `just acceptance` 均已通过；core/stress 的早期超时与中段锁序 panic 已分别定位并关闭。

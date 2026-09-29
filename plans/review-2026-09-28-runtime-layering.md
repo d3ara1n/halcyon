@@ -256,3 +256,80 @@ ideas 的 reap 公共形状按已确认的 `reap(budget) -> Idle/Progress/Wait/F
 - 后续独立任务：[Kernel console 锁序 panic](todo-2026-09-29-kernel-console-lock-order.md)（`kernel/src/sync.rs:172`、`kernel/src/console.rs:37`）；本轮不修改 kernel，不把该外部阻塞伪装成 runtime layering 失败或通过。
 - 尚未做最终 REVIEW 结构检查、RISC-V 双 profile 的 ELF/反汇编门和 QEMU 组合结果核对。
 - commit 需用户单独授权，push 需另行授权。
+
+## 第三轮实施准则（关闭本报告的唯一依据）
+
+前两轮每次只关闭局部，根因是：按发现条目逐个修补而不核对整条责任链；以"编译/部分测试通过"代替契约证据；完成声明先于证据写入文档。本轮按以下准则施工，任何一条不满足即不得宣告完成。
+
+### A. 契约先行
+
+1. 开工前逐条列出本轮所有未关闭项（6018387 复核 Issues 1–5 与"未覆盖项"），每条写出：对应 ideas 条款、目标形状、要删除的旧路径、完成证据。清单写入本节下方"第三轮处置"，经用户确认后施工。
+2. ideas 是契约。实现发现更好的形状时先说明理由与取舍，经确认后同步 ideas 与本报告，再改代码；不得让代码与 ideas 静默分叉。
+3. 每项修复覆盖整条责任链：正常、失败、取消、退出和释放路径各有 owner。只修发现所指行而不查同类路径，视为未完成。修 Endpoint 白名单时，同时核对所有 `from_raw` 调用点；修 StartupContext 时，同时迁移全部 `parent_pid` 消费者。
+
+### B. 不留过渡
+
+4. 不保留 alias、facade、兼容参数或"暂时"的裸值路径。旧接口在同一次改动中删除，并以 grep 证明无残留。
+5. 不得用 `let _ =`、`expect`、`unwrap` 吞掉 owner 或错误；`unwrap`/`expect` 仅用于有论证的结构性不可达。
+6. 锁序、完整性检查不得放松或绕过；诊断输出一律移到锁外。
+
+### C. 证据门
+
+7. 每项关闭必须有可执行证据或明确的源码论证，二者择一，并在处置中写明。测试须捕获具体错误：
+   - 满槽：回收后 prepare 实际成功；
+   - 取消 vs reap：真实 PreparedThread Drop 与 reap 交错，以及未 DONE Live 经真实 Control 恢复；
+   - 启动采用：重复值、非法 role（含 Endpoint）、晚项 Query 失败时原表项不析构、Seed 原样返还。
+8. 日志放 `artifacts/dev/runtime-layering-round3-*.log`，须含测试名和本轮提交可追溯的构建；不得引用旧轮日志作为本轮证据。
+9. 路线事实分开记录：`just acceptance` 早期超时与 core/stress 中段锁序 panic 是两个现象，先各自定位原因，不得互相归因。
+10. 最终门：`just check`、`just clippy`、host 测试、两 target 最终 ELF 入口门（`_start`、`__libthread_worker_entry` 反汇编），`just acceptance` 全部路线通过。任一未通过，报告保持打开并如实记录。
+
+### D. 文档与声明
+
+11. impls 只描述最终代码；计划与 impls 中的完成声明在最终门全部通过后才写入，之前一律写"待验收"。
+12. 历史过程标为历史或移入档案，当前叙述不得残留 `entry!`、JoinHandle 等旧形状。
+13. 交付前按 REVIEW 手册做结构检查，结果写入本节；自查清单：旧路径 grep、同类路径排查、证据逐项对应、声明与门一致。
+
+### E. 范围
+
+14. 本轮包含：6018387 复核 Issues 1–5、未覆盖项的证据缺口、acceptance 早期超时的原因定位。console 锁序修复本身的过程由 [console 锁序 todo](todo-2026-09-29-kernel-console-lock-order.md) 记录，本报告只登记其结果与对验收的影响。
+15. 施工中发现范围外问题，另立 todo 并在本节链接，不扩大本轮，也不静默忽略。
+
+### 第三轮处置（A1，已确认并施工中）
+
+以下清单按第三轮实施准则建立，作为本轮施工边界。用户已确认，当前按清单施工。ideas 是契约；若施工中发现更好的形状，先暂停并说明取舍，获确认后同步 ideas 与本报告，再改代码。
+
+| 编号 | 对应契约与当前问题 | 目标形状 | 同次删除/迁移的旧路径 | 关闭证据 |
+|---|---|---|---|---|
+| R1 | `notes/ideas/task.md` 的 ResultCell 单生产者与结果仲裁；复核 Issue 1 | `ResultCell::new` 只交付不可 Clone 的 producer，`publish(self, value)` 消费唯一生产权；receiver abandon 与发布并发时值恰好析构一次 | 删除安全 `publish(&self)` 及可复制生产权限，不以 CAS 后置检查保护并发写入 | `result_cell_publish_races_receiver_abandon_without_double_drop`，覆盖真实并发发布/放弃与 Drop 次数；源码核对无第二生产入口 |
+| R2 | `notes/ideas/task.md` 槽状态与取消/reap 线性化；复核 Issue 2 | `Prepared/Cancelling/Abandoned` 状态完整闭合；PreparedThread Drop 与 reap 交错时只有一个认领者，未 DONE Live 恢复可继续观察，Control 关闭后才发布 Abandoned | 删除将未 DONE Created/Prepared 回写为可被错误 cancel 或 reap 的形状，删除 InvalidSlot 导致进程 abort 的正常路径 | `reap_skips_prepared_until_cancel_close_is_published`；真实 PreparedThread Drop/reap 交错、真实未 DONE Control 恢复，源码核对取消/退出/释放责任 |
+| R3 | `notes/ideas/bootstrap.md:154–166` 的原始输入对齐与按值解析；复核 Issue 3 | 启动表逐项 `read_unaligned` 或先验证真实对齐后再借用；不从格式合法推导 Rust slice 对齐 | 删除直接构造 `&[Handle]` 的未证明路径及仅靠注释的 Safety 前提 | 非对齐 StartupBlock 采用测试；源码核对所有入口解析路径共享同一不变量 |
+| R4 | `notes/ideas/bootstrap.md:154–166` 的 Seed、全表 Query、role 证明、最后提交；复核 Issue 4 | 一次来源的 affine `StartupSeed`；先验证 outer/边界/重复，再预留，再 Query 全表并核对 role，最后不可失败地提交 InitialGrants；通用采用白名单排除 `TunnelEndpoint`，入口项仍须 `ThreadControl + MANAGE` | 删除可重复 adopt、先 `Capability::from_raw` 再失败 Query、失败析构已建 owner、按数值重开对象及把 Endpoint 当通用 Capability 的路径；核对并收束全部启动 `from_raw` 调用点 | `adopts_65_grants_from_unaligned_startup_block_after_full_query` 扩展为真实 StartupBlock/Seed 流程；重复值、非法 role（含 Endpoint）、晚项 Query 失败时原表项不析构、Seed 原样返还；日志含测试名 |
+| R5 | `notes/ideas/bootstrap.md:170–175`、`framework.md:64–70` 的 StartupContext 交付；复核 Issue 5 与本轮启动上下文要求 | `CurrentProcessInfo` 可复制但不可普通构造；Context 分为身份、可 Clone 的 payload 视图、affine `InitialGrants`；一次 `startup::take()`；`SpawnRequest` 显式接收完整身份上下文而不含裸 `parent_pid` | 删除全局 `handle(index)`、`pid()`、`parent_pid()`、`&'static [u8]` getter、重复 duplicate/转移退化、裸 `SpawnRequest.parent_pid`；迁移所有消费者�� init launcher | grep 无旧公开表面/裸字段；身份/payload 借用生命周期源码论证；所有消费者编译并覆盖第二次 take 为 None |
+| R6 | 第三轮准则 B6、锁序 todo 与 `notes/ideas` 既有 Lock Ladder；本轮范围内的 console 结果登记 | 保持锁阶不变；`CONNECTION(220)`/同类高阶锁持有期间不执行 `log!`，诊断移到锁外；attach/close/prepare_shootdown 同构路径全部排查 | 删除锁内诊断输出，而非降低 rank 或绕过断言；不保留单点修补 | 锁序 todo 固定第一违规链、外层锁 owner、rank；静态检索全部锁内 `log!`；core/stress 与必要路线不再触发 panic，结果互链回本报告 |
+| R7 | 第三轮准则 C7–C10 的证据与路线事实 | 满槽回收后 `prepare` 实际成功；真实 Drop/reap 交错；启动失败责任完整；acceptance 早期超时与 core/stress 中段锁序 panic 分别定位，不互相归因 | 删除仅构造枚举/局部容器替代真实责任链的“证据”；不以加大超时掩盖早期原因 | round3 日志 `artifacts/dev/runtime-layering-round3-*.log`，含测试名与本轮构建可追溯信息；单独记录两类现象的第一坏事件和原因 |
+| R8 | 第三轮准则 D11–D13 与分层计划/impls 的文档事实 | impls 只写最终代码；最终门前完成声明改为“待验收”；清除已失效旧形状并保留历史标记；两份计划互链 | 撤回 impls 与两份计划中未成立的完成声明；清理分层计划 `:267/:279/:293` 旧叙述及 `entry!`、旧入口、ResultReceiver/JoinHandle 等失效当前叙述 | 逐篇 diff/grep；本报告与 `plans/todo-2026-09-29-kernel-console-lock-order.md` 互链；REVIEW 自查结果写入本节 |
+| R9 | 第三轮准则 C10 最终门 | 所有责任链接通后才允许关闭报告 | 在最终门通过前不写完成声明，不将旧轮日志或局部 acceptance 结论当本轮证据 | `just check`、`just clippy`、host 测试、两 target `_start`/`__libthread_worker_entry` ELF 入口门、`just acceptance` 全路线通过；失败则报告保持打开并记录 |
+
+#### 施工顺序与确认请求
+
+施工顺序：R1–R3 基础并发/输入解析与 R4–R5 启动采用/上下文迁移已进入实现；R6 锁序修复与真实 registry 证据已完成；R7 早期超时/锁序 panic 已分别定位并验证；R8 文档已收口，R9 最终门正在写入证据。任何超出 R1–R9 的问题另立 todo 并链接，不静默扩大范围。
+
+
+### 第三轮当前证据（待最终声明）
+
+- 代码检查：`just check` 通过，日志 `artifacts/dev/runtime-layering-round3-check-2.log`。
+- 静态质量：`just clippy` 通过，最终日志 `artifacts/dev/runtime-layering-round3-clippy-3.log`。
+- host：`cargo test -p libthread -p libprocess --features management --target aarch64-apple-darwin` 通过，日志 `artifacts/dev/runtime-layering-round3-host-tests.log`；包含 Endpoint 白名单拒绝用例。
+- core 路线：`just virt` 通过，日志 `artifacts/dev/runtime-layering-round3-virt-core.log`；完成 topology/FAL2 并以 Requested reset 收束，未出现早期 timeout 或 Rank(150) under Rank(220)。
+- stress 路线：新增 registry 证据后的第二次 `just virt-stress` 通过，日志 `artifacts/dev/runtime-layering-round3-virt-stress-registry-2.log`；race matrix `16/16`、Requested reset，未出现中段 console 锁序 panic。
+- 两类现象保持独立记录：本轮 core/stress 未复现早期 acceptance timeout；旧 round2 中段 panic 已由 console 锁外重排消除，不能将两者互相归因。
+- 完整聚合：新增 registry 场景修正后的 `just acceptance` 已通过，最终日志 `artifacts/dev/runtime-layering-round3-acceptance-final.log`；覆盖 shared/os/kernel/user clippy、user ELF audit、stress 16/16、core、release、sifive_u、nofd 与 boot-failure。
+- ELF 入口：当前源码构建的 `riscv64gc` debug 与默认 `riscv64imac` release 均通过 `_start`/`__libthread_worker_entry` 符号与反汇编门，日志 `artifacts/dev/runtime-layering-round3-elf-entry.log`；gc 构建日志 `artifacts/dev/runtime-layering-round3-gc-build.log`。
+- 启动失败专项：host 12 个 libprocess 测试通过，覆盖非对齐全表 Query、重复句柄、非法 role/Endpoint、晚项 Query 失败在 owner 构造前返回；`adopt_with_query` 的所有错误分支均返回原 `StartupSeed`，代码保持原表项不析构。
+- R9：`just check`、`just clippy`、host tests、core/stress、完整 `just acceptance` 和 gc/imac 两 target `_start`/`__libthread_worker_entry` 入口反汇编门全部通过。
+
+### 第三轮关闭声明
+
+R1–R9 已按已确认 A1 清单完成。ResultCell producer 单一所有权、Prepared/Cancelling/Abandoned 生命周期、非对齐启动解析、Endpoint 白名单、StartupContext 身份/载荷/affine grants、SpawnRequest 完整身份迁移、console 锁外诊断及真实 registry Drop/reap 证据均已接通；旧 getter、裸 `parent_pid`、Endpoint 通用采用和锁内诊断路径已删除。
+
+本报告与 [kernel console 锁序记录](todo-2026-09-29-kernel-console-lock-order.md) 已互链；分层计划、framework/startup impls 的未成立完成声明和旧 `entry!` 叙述已清理。R9 全部门通过后，本轮不再保留待验收完成声明。

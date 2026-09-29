@@ -1116,10 +1116,6 @@ impl AddressSpaceState {
         let bound = match self.bound_mut() {
             Ok(bound) => bound,
             Err(error) => {
-                log!(
-                    Memory,
-                    "unexpected anonymous mapping completion in an unbound address space"
-                );
                 let MemoryChangePlan {
                     backing,
                     view_owner,
@@ -1204,6 +1200,16 @@ impl core::ops::DerefMut for AddressSpaceState {
 static SHOOTDOWN_SELFTEST_STARTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static MULTI_HART_SHOOTDOWN_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn report_multi_hart_shootdown(active: u32) {
+    if active >= 2 && !MULTI_HART_SHOOTDOWN_OBSERVED.swap(true, Ordering::AcqRel) {
+        log!(
+            Memory,
+            "same-address-space multi-hart shootdown observed: {} active harts",
+            active
+        );
+    }
+}
 
 struct ShootdownSelfTestCompletion;
 
@@ -1557,6 +1563,12 @@ pub(crate) struct PreparedShootdown {
     immediate: Option<Arc<dyn crate::remote_call::Completion>>,
 }
 
+impl PreparedShootdown {
+    pub(crate) fn active_count(&self) -> u32 {
+        self.execution.active().count_ones()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrepareShootdownError {
     NotRunning,
@@ -1837,13 +1849,6 @@ impl AddressSpace {
             .snapshot_running()
             .ok_or(PrepareShootdownError::NotRunning)?;
         let active = execution.active();
-        if active.count_ones() >= 2 && !MULTI_HART_SHOOTDOWN_OBSERVED.swap(true, Ordering::AcqRel) {
-            log!(
-                Memory,
-                "same-address-space multi-hart shootdown observed: {} active harts",
-                active.count_ones()
-            );
-        }
         if active == 0 {
             return Ok(PreparedShootdown {
                 execution,
@@ -2150,6 +2155,7 @@ fn start_running_memory_change(
             return Err(map_shootdown_error(error));
         }
     };
+    report_multi_hart_shootdown(shootdown.active_count());
     if writes_map_payload {
         process
             .space
@@ -4443,8 +4449,6 @@ impl Process {
             termination: crate::sync::Spinlock::new(crate::sync::ranks::LEAF, Some(termination)),
         })
     }
-
-
     pub(crate) fn attach_thread_with_control(
         self: &Arc<Self>,
         context: ThreadStartContext,
@@ -4464,7 +4468,7 @@ impl Process {
                     context,
                     Some(control),
                 )
-                .map_err(|_| super::lifecycle::AttachFault::Oom)?;
+                    .map_err(|_| super::lifecycle::AttachFault::Oom)?;
                 let thread = Arc::try_new(thread).map_err(|_| super::lifecycle::AttachFault::Oom)?;
                 created = Some(thread.clone());
                 Ok(thread)
@@ -4479,8 +4483,6 @@ impl Process {
             created.expect("successful attach must retain created thread"),
         ))
     }
-
-
     /// 冻结进程级执行绑定（需求 + 兼容域），不可重复。
     pub(crate) fn bind_execution(
         &self,
@@ -5373,10 +5375,10 @@ pub(crate) fn launch_bootstrap(
             .expect("bootstrap execution binding must be unique");
         let (_, created_thread) = match process.attach_thread_with_control(
             ThreadStartContext {
-            entry: entry as u64,
-            stack_pointer: USER_TOP as u64,
-            arg1: block_va as u64,
-            arg2: block_len as u64,
+                entry: entry as u64,
+                stack_pointer: USER_TOP as u64,
+                arg1: block_va as u64,
+                arg2: block_len as u64,
             },
             &thread_control,
         ) {

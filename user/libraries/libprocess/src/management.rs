@@ -26,6 +26,7 @@ use libkernel::{
 pub mod job_driver;
 pub mod observation;
 pub mod supervise;
+use crate::context::CurrentProcessInfo;
 use observation::{Observation, ObservationResult, ObservationState};
 use supervise::{ProcessOperations, RealProcessOperations};
 
@@ -81,7 +82,7 @@ impl SpawnFailure {
 
 pub struct SpawnRequest<'a> {
     pub job: Handle,
-    pub parent_pid: erhino_shared::proc::Pid,
+    pub parent: CurrentProcessInfo,
     /// 本次 spawn 的 backing Pool；库复制 GRANT-only authority 并由 Bind 消费。
     pub memory_pool: Handle,
     pub image: &'a [u8],
@@ -227,7 +228,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         granted[grant_len] = thread_created.control;
         let block = build_birth_block(
             created.pid,
-            request.parent_pid,
+            request.parent.parent_pid(),
             &granted[..=grant_len],
             entry,
             request.payload,
@@ -1380,7 +1381,7 @@ mod tests {
             spawn(SpawnRequest {
                 job: Handle::INVALID,
                 memory_pool: Handle::INVALID,
-                parent_pid: erhino_shared::proc::Pid::from_raw(0),
+                parent: CurrentProcessInfo::from_parts(7, 0,),
                 image: &[],
                 payload: &[],
                 grants: &[],

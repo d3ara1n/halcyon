@@ -309,7 +309,7 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     let control = duplicate(nested.control, Rights::MANAGE | Rights::GRANT).unwrap();
     let started = crate::spawn(crate::SpawnRequest {
         memory_pool: crate::root_memory_pool(),
-        parent_pid: crate::init_pid(),
+        parent: crate::init_process_info(),
         job,
         image,
         payload: b"ipc-kill",

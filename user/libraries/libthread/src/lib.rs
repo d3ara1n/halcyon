@@ -284,6 +284,8 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
             .enumerate()
             .find(|(_, slot)| match slot {
                 SlotState::Free => true,
+                // A faulted record owns the evidence of an unrecoverable
+                // cleanup failure and is never reused.
                 SlotState::Faulted(record) => {
                     let _ = record.cleanup.retired;
                     false
@@ -417,6 +419,8 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                         }
                     };
                     if claim.is_some() {
+                        // Claimed is held exclusively by this reap call until finish_claimed
+                        // publishes Free or Faulted; reserve/cancel never accept this state.
                         *slot = SlotState::Claimed;
                         found = claim.map(|record| (index, record));
                         break;

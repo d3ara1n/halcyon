@@ -81,7 +81,8 @@ use libkernel::{
 use libprocess::{
     DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, RequiredLaunchSet,
     SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
-    SupervisionStage, SupervisionTarget, collect_process, context::StartupContext,
+    SupervisionStage, SupervisionTarget, collect_process,
+    context::{CurrentProcessInfo, StartupContext},
     enumerate_members, spawn,
 };
 use librpc::{
@@ -165,7 +166,17 @@ fn init_pid() -> Pid {
         .as_ref()
         .expect("init startup inputs are not initialized")
         .context
+        .process()
         .pid()
+}
+
+fn init_process_info() -> CurrentProcessInfo {
+    INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs are not initialized")
+        .context
+        .process()
 }
 
 fn with_init_payload<R>(f: impl FnOnce(&[u8]) -> R) -> R {
@@ -173,9 +184,9 @@ fn with_init_payload<R>(f: impl FnOnce(&[u8]) -> R) -> R {
     let startup = guard
         .as_ref()
         .expect("init startup inputs are not initialized");
-    let payload = StartupImage::from_slice(startup.context.payload());
+    let payload = *startup.context.payload();
     drop(guard);
-    f(payload.as_slice())
+    f(payload.as_bytes())
 }
 
 enum RunFailure {
@@ -475,7 +486,7 @@ fn launch_test_services(
             }
             let spawned = spawn(SpawnRequest {
                 memory_pool: root_memory_pool(),
-                parent_pid: init_pid(),
+                parent: init_process_info(),
                 job,
                 image: entry.data,
                 payload: &[],
@@ -521,7 +532,7 @@ fn launch_test_services(
                         // pm 的派生因此走铸造路径，域内收束权归 pm。
                         match spawn(SpawnRequest {
                             memory_pool: root_memory_pool(),
-                            parent_pid: init_pid(),
+                            parent: init_process_info(),
                             job: pm_domain,
                             image: entry.data,
                             payload: &[],
@@ -690,7 +701,7 @@ fn launch_secondary_fs(
         .map_err(|_| "second fs supervision admission failed")?;
     let spawned = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
-        parent_pid: init_pid(),
+        parent: init_process_info(),
         job: services,
         image,
         payload: &[],
@@ -873,7 +884,7 @@ fn launch_fal_consumer(
     ];
     let spawned = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
-        parent_pid: init_pid(),
+        parent: init_process_info(),
         job: services,
         image,
         payload: &[],
@@ -4685,7 +4696,7 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
     let result = (|| {
         let started = spawn(SpawnRequest {
             memory_pool: root_memory_pool(),
-            parent_pid: init_pid(),
+            parent: init_process_info(),
             job,
             image,
             payload: b"retirement",
@@ -4857,7 +4868,7 @@ fn test_job_kill_composition(
     };
     let running = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
-        parent_pid: init_pid(),
+        parent: init_process_info(),
         job: child,
         image,
         payload: &[],

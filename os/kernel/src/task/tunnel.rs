@@ -776,6 +776,7 @@ pub fn create(
             return Err(map_shootdown_error(error));
         }
     };
+    let shootdown_active = shootdown.active_count();
 
     let lease_range = mapping
         .as_ref()
@@ -854,6 +855,7 @@ pub fn create(
         }
     };
     drop(connection_state);
+    super::proc::report_multi_hart_shootdown(shootdown_active);
     drop(table);
     completion.install(published);
     synchronization.start();
@@ -979,6 +981,7 @@ pub fn attach(
             return Err(map_shootdown_error(error));
         }
     };
+    let shootdown_active = shootdown.active_count();
 
     let lease_range = mapping
         .as_ref()
@@ -1053,14 +1056,17 @@ pub fn attach(
             return Err(SystemCallError::ObjectBusy);
         }
     };
+    let peer = match &connection_state.sides[1 - invitation.side] {
+        SideState::Alive(peer) => peer.upgrade(),
+        _ => None,
+    };
+    drop(connection_state);
+    super::proc::report_multi_hart_shootdown(shootdown_active);
+    drop(table);
     endpoint.set_signals(ObjectSignals::PEER_ATTACHED);
-    if let SideState::Alive(peer) = &connection_state.sides[1 - invitation.side]
-        && let Some(peer) = peer.upgrade()
-    {
+    if let Some(peer) = peer {
         peer.set_signals(ObjectSignals::PEER_ATTACHED);
     }
-    drop(connection_state);
-    drop(table);
     drop(consumed); // invitation 被消费而非关闭，不执行 lifecycle callback。
     completion.install(published);
     synchronization.start();
@@ -1161,6 +1167,7 @@ pub(crate) fn close_handle(
             return Err(map_shootdown_error(error));
         }
     };
+    let shootdown_active = shootdown.active_count();
 
     let committed = thread.process.space.commit_shootdown(
         &thread.process.lifecycle,
@@ -1199,6 +1206,7 @@ pub(crate) fn close_handle(
         }
     };
     drop(connection_state);
+    super::proc::report_multi_hart_shootdown(shootdown_active);
     drop(table);
     drop(entry.into_parts()); // lifecycle 已由本事务提交，不重复调用对象 callback。
     completion.install(published);

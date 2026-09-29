@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use erhino_shared::{
     call::SystemCallError,
-    object::{Handle, HandleRole, ObjectKind, Rights},
+    object::{Handle, HandleDescription, HandleRole, ObjectKind, Rights},
     proc::Pid,
     startup::EntryThreadDescriptor,
 };
@@ -31,6 +31,7 @@ impl StartupSeed {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct StartupPayload {
     bytes: *const u8,
     len: usize,
@@ -44,6 +45,34 @@ impl StartupPayload {
         // SAFETY: the StartupSeed source keeps the validated mapping alive for
         // the process lifetime; the returned slice is tied to this borrow.
         unsafe { core::slice::from_raw_parts(self.bytes, self.len) }
+    }
+}
+
+/// Provenance supplied by the creator of the current process.
+///
+/// The private fields prevent ordinary callers from fabricating startup
+/// identity. The view is copyable because it grants no kernel authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentProcessInfo {
+    pid: Pid,
+    parent_pid: Pid,
+}
+
+impl CurrentProcessInfo {
+    pub(crate) const fn from_parts(pid: Pid, parent_pid: Pid) -> Self {
+        Self { pid, parent_pid }
+    }
+
+    fn from_header(header: &erhino_shared::startup::StartupBlockHeader) -> Self {
+        Self::from_parts(header.pid, header.parent_pid)
+    }
+
+    pub const fn pid(self) -> Pid {
+        self.pid
+    }
+
+    pub const fn parent_pid(self) -> Pid {
+        self.parent_pid
     }
 }
 
@@ -74,8 +103,7 @@ impl InitialGrants {
 }
 
 pub struct StartupContext {
-    pid: Pid,
-    parent_pid: Pid,
+    process: CurrentProcessInfo,
     payload: StartupPayload,
     entry: EntryThreadDescriptor,
     grants: InitialGrants,
@@ -127,20 +155,13 @@ impl StartupContext {
         }
         sorted_handles.extend_from_slice(&handles);
         sorted_handles.sort_unstable_by_key(|handle| handle.raw());
-        if sorted_handles.windows(2).any(|pair| pair[0] == pair[1]) {
+        if has_duplicate_handles(&sorted_handles) {
             return Err((
                 seed,
                 ContextError::InvalidGrant(SystemCallError::IllegalArgument),
             ));
         }
         let control_index = entry.control_index as usize;
-        let mut descriptions = Vec::new();
-        if descriptions.try_reserve_exact(count).is_err() {
-            return Err((
-                seed,
-                ContextError::InvalidGrant(SystemCallError::OutOfMemory),
-            ));
-        }
         let mut slots = Vec::new();
         if slots.try_reserve_exact(count).is_err() {
             return Err((
@@ -148,32 +169,12 @@ impl StartupContext {
                 ContextError::InvalidGrant(SystemCallError::OutOfMemory),
             ));
         }
-        for handle in handles.iter().copied() {
-            let description = match query(handle) {
-                Ok(description) => description,
-                Err(error) => return Err((seed, ContextError::InvalidGrant(error))),
-            };
-            descriptions.push(description);
-        }
-        for (index, description) in descriptions.iter().enumerate() {
-            let expected_kind = adoptable_kind(description.role);
-            if !description.rights.is_known()
-                || expected_kind.is_none_or(|kind| kind as u32 != description.kind)
-            {
-                return Err((
-                    seed,
-                    ContextError::InvalidGrant(SystemCallError::WrongObjectType),
-                ));
-            }
-            if index == control_index
-                && (description.role != HandleRole::ThreadControl as u32
-                    || !description.rights.contains(Rights::MANAGE))
-            {
-                return Err((
-                    seed,
-                    ContextError::InvalidGrant(SystemCallError::WrongObjectType),
-                ));
-            }
+        let descriptions = match query_descriptions(&handles, &mut query) {
+            Ok(descriptions) => descriptions,
+            Err(error) => return Err((seed, ContextError::InvalidGrant(error))),
+        };
+        if let Err(error) = validate_descriptions(&descriptions, control_index) {
+            return Err((seed, ContextError::InvalidGrant(error)));
         }
 
         // All fallible work is complete. Capability construction only installs
@@ -185,8 +186,7 @@ impl StartupContext {
         }
         let payload = seed.input.payload();
         let context = Self {
-            pid: seed.input.header().pid,
-            parent_pid: seed.input.header().parent_pid,
+            process: CurrentProcessInfo::from_header(&seed.input.header()),
             payload: StartupPayload {
                 bytes: payload.as_ptr(),
                 len: payload.len(),
@@ -197,19 +197,11 @@ impl StartupContext {
         Ok(context)
     }
 
-    pub fn pid(&self) -> Pid {
-        self.pid
+    pub const fn process(&self) -> CurrentProcessInfo {
+        self.process
     }
 
-    pub fn parent_pid(&self) -> Pid {
-        self.parent_pid
-    }
-
-    pub fn payload(&self) -> &[u8] {
-        self.payload.as_bytes()
-    }
-
-    pub fn payload_view(&self) -> &StartupPayload {
+    pub fn payload(&self) -> &StartupPayload {
         &self.payload
     }
 
@@ -223,20 +215,6 @@ impl StartupContext {
 
     pub fn take_handle(&mut self, index: usize) -> Option<Handle> {
         self.grants.take(index).map(Capability::into_raw)
-    }
-
-    pub fn take_or_duplicate_handle(
-        &mut self,
-        index: usize,
-    ) -> Result<Option<Handle>, SystemCallError> {
-        if let Some(capability) = self.grants.duplicate(index)? {
-            return Ok(Some(capability.into_raw()));
-        }
-        Ok(self.take_handle(index))
-    }
-
-    pub fn duplicate_handle(&self, index: usize) -> Result<Option<Handle>, SystemCallError> {
-        Ok(self.grants.duplicate(index)?.map(Capability::into_raw))
     }
 }
 
@@ -261,7 +239,6 @@ fn adoptable_kind(role: u32) -> Option<ObjectKind> {
         {
             ObjectKind::Notification
         }
-        value if value == HandleRole::TunnelEndpoint as u32 => ObjectKind::TunnelEndpoint,
         value if value == HandleRole::TunnelInvitation as u32 => ObjectKind::TunnelInvitation,
         value if value == HandleRole::SystemResetControl as u32 => ObjectKind::SystemReset,
         value if value == HandleRole::LifetimeObserver as u32 => ObjectKind::Lifetime,
@@ -271,16 +248,59 @@ fn adoptable_kind(role: u32) -> Option<ObjectKind> {
     })
 }
 
+fn has_duplicate_handles(handles: &[Handle]) -> bool {
+    handles.windows(2).any(|pair| pair[0] == pair[1])
+}
+
+fn query_descriptions(
+    handles: &[Handle],
+    query: &mut impl FnMut(Handle) -> Result<HandleDescription, SystemCallError>,
+) -> Result<Vec<HandleDescription>, SystemCallError> {
+    let mut descriptions = Vec::new();
+    descriptions
+        .try_reserve_exact(handles.len())
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    for handle in handles.iter().copied() {
+        descriptions.push(query(handle)?);
+    }
+    Ok(descriptions)
+}
+
+fn validate_descriptions(
+    descriptions: &[HandleDescription],
+    control_index: usize,
+) -> Result<(), SystemCallError> {
+    for (index, description) in descriptions.iter().enumerate() {
+        let expected_kind = adoptable_kind(description.role);
+        if !description.rights.is_known()
+            || expected_kind.is_none_or(|kind| kind as u32 != description.kind)
+        {
+            return Err(SystemCallError::WrongObjectType);
+        }
+        if index == control_index
+            && (description.role != HandleRole::ThreadControl as u32
+                || !description.rights.contains(Rights::MANAGE))
+        {
+            return Err(SystemCallError::WrongObjectType);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use erhino_shared::{
-        object::{HandleDescription, HandleRole, ObjectKind},
+        call::SystemCallError,
+        object::{Handle, HandleDescription, HandleRole, ObjectKind, Rights},
         startup::{EntryThreadDescriptor, build_startup_block_with_entry},
     };
 
-    use super::{StartupContext, StartupSeed};
+    use super::{
+        adoptable_kind, has_duplicate_handles, query_descriptions, validate_descriptions,
+        StartupContext, StartupSeed,
+    };
 
     #[test]
     fn adopts_65_grants_from_unaligned_startup_block_after_full_query() {
@@ -344,9 +364,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(query_count.load(Ordering::Relaxed), 65);
-        assert_eq!(context.pid(), 7);
-        assert_eq!(context.parent_pid(), 3);
-        assert_eq!(context.payload(), b"payload");
+        assert_eq!(context.process().pid(), 7);
+        assert_eq!(context.process().parent_pid(), 3);
+        assert_eq!(context.payload().as_bytes(), b"payload");
         core::mem::forget(context);
+    }
+
+    #[test]
+    fn startup_adoption_whitelist_rejects_tunnel_endpoint() {
+        assert_eq!(adoptable_kind(HandleRole::TunnelEndpoint as u32), None);
+    }
+
+    #[test]
+    fn startup_adoption_rejects_duplicate_and_invalid_roles_before_owners() {
+        let handles = [Handle::from_parts(1, 1), Handle::from_parts(1, 1)];
+        assert!(has_duplicate_handles(&handles));
+
+        let endpoint = HandleDescription {
+            object_id: 1,
+            related_object_id: 0,
+            kind: ObjectKind::TunnelEndpoint as u32,
+            role: HandleRole::TunnelEndpoint as u32,
+            rights: Rights::READ,
+            badge: 0,
+            reserved: 0,
+        };
+        assert_eq!(
+            validate_descriptions(&[endpoint], usize::MAX),
+            Err(SystemCallError::WrongObjectType)
+        );
+    }
+
+    #[test]
+    fn late_startup_query_failure_returns_before_owner_table_construction() {
+        let handles = [
+            Handle::from_parts(1, 1),
+            Handle::from_parts(2, 1),
+            Handle::from_parts(3, 1),
+        ];
+        let query_count = AtomicUsize::new(0);
+        let result = query_descriptions(&handles, &mut |handle| {
+            query_count.fetch_add(1, Ordering::Relaxed);
+            if handle == handles[2] {
+                Err(SystemCallError::ObjectClosed)
+            } else {
+                Ok(HandleDescription {
+                    object_id: handle.raw(),
+                    related_object_id: 0,
+                    kind: ObjectKind::MemoryObject as u32,
+                    role: HandleRole::MemoryObject as u32,
+                    rights: Rights::READ,
+                    badge: 0,
+                    reserved: 0,
+                })
+            }
+        });
+        assert_eq!(result, Err(SystemCallError::ObjectClosed));
+        assert_eq!(query_count.load(Ordering::Relaxed), 3);
     }
 }
