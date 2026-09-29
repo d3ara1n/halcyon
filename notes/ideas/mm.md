@@ -28,7 +28,7 @@ user_supply = free_inventory + boot_held + funded_extents
 
 精确长度不要求物理连续。普通用户 backing 由若干 extent 组成；需要连续物理区间的页表、DMA 或其他消费者必须显式请求受 order 上限约束的连续块。extent token 不允许复制或任意构造；切割消费原 token 并返回互不重叠的剩余 token，合并只接受物理相邻且所有权语义相同的 token。失败回滚、延迟 retire 与正常归还遵守同一数量守恒。
 
-普通对象只在持有固定容量 backing 时适用有界 close；进程地址空间等宽度可增长的容器以有界 drain 释放。任何解除容量上限的 backing 对象都必须先取得可恢复的 drain 生命周期，不能把无界页遍历放进最后一个引用的析构。
+资源持有的关闭与 backing 的实际退休分开。容器和大对象的释放由内核拥有稳定进度，不把任意宽度遍历放进 Close 或最终引用析构；容量由资源模型约束，不以维持同步析构为理由强迫上层组合许多小对象。
 
 ## 单一地址翻译模式
 
@@ -85,7 +85,7 @@ ledger 只在 owner、区域种类、AllocationKey、backing identity/连续 off
 
 MemoryObject 是固定长度的共享 backing identity，不是地址空间、虚拟区域或用户态分配器。Handle 的 `MAP` right 授权建立新 view，`READ`、`WRITE` 与 `EXECUTE` 分别约束 view 可请求的数据和执行权限；mapping 建立后以 ObjectView 强引用独立保活对象。对象 backing 始终唯一拥有完整 extents 与 charge，任一 view 的切割、降权或解除只变换 ObjectView 和 WritePermit，不切割或重复持有数据 backing。同一对象可以按不同地址和更窄权限映入多个进程。
 
-可由普通 Handle close 触发最终析构的 MemoryObject 必须受硬容量上限约束，长度创建后不可改变。更大的逻辑对象由用户态协议组合多个 MemoryObject；未来若需要无界对象、resize、COW、文件缓存或 pager，必须先为对象建立有界 drain 与明确的缺页及 funding 协议，不能改变既有 eager mapping 的成功语义。
+MemoryObject 的 backing 由真实使用关系保活；本地引用关闭后，内核在安全条件达成时完成退休。对象容量与映射规模由准入和实际成本决定。resize、COW、文件缓存或 pager 具有各自的内容与缺页契约，不因本地 Close 与退休分离而自动引入。
 
 ## MemoryPool 与 backing charge
 
@@ -206,6 +206,6 @@ WritePermit 的计数覆盖 reserved、published 和 retiring 三个阶段。Map
 
 状态机不遍历 view。对象只维护带溢出检查的 permit 计数；seal 完成不设专用等待槽，而是以 ObjectSignals 的 `EXECUTABLE` 电平位表达：进入 Executable 后持续为真，持 WAIT 的 Handle 经 WaitMany 观察该位，任意数量等待者复用通用等待面，无容量上限、无排队政策，重复 SealExecutable 在 Executable 上幂等成功。该形态以等待面的结构性容量取代按对象记账的完成槽，不改变「seal 状态属于对象、发起者消散后继续、最后一个 permit retire 自动完成」的契约。受控直接写同样取得临时 WritePermit，数据写入结束并完成必要的 release 后才归还。
 
-只读 view 不阻塞 seal，已有 writable 最大权限但当前不含 W 的 view也不持 permit；它日后尝试重新加 W 时必须重新取得 permit，因此在 Sealing/Executable 下失败。新代码版本通过新对象、新代次和用户态引用切换表达，不原地修改已发布代码。Handle 消散不撤销 view 或 seal；view 与 pending seal 都强持对象，最终 close 仍遵守固定 backing 容量上限。
+只读 view 不阻塞 seal，已有 writable 最大权限但当前不含 W 的 view也不持 permit；它日后尝试重新加 W 时必须重新取得 permit，因此在 Sealing/Executable 下失败。新代码版本通过新对象、新代次和用户态引用切换表达，不原地修改已发布代码。Handle 消散不撤销 view 或 seal；view 与 pending seal 保留真实使用责任，backing 通过内核退休关系安全释放。
 
 具体帧库存、页表、内核高半区、用户布局和当前调用面见 [`../impls/mm.md`](../impls/mm.md)。

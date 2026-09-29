@@ -145,7 +145,7 @@ Zircon 把 bootdata 作为显式 VMO 交给普通 userboot，由 userboot 解析
 
 这项保活由地址空间及合法 launcher/程序环境契约承担，不是将 Rust 切片随意强转为 static。公开的 StartupPayload 持有经验证的只读视图凭据，借出的字节切片绑定到该视图的借用；它可以显式 clone 并跨本进程线程共享，但不拥有原始 Handle 数组，也不拥有 backing 回收权。丢弃所有 payload 视图不提前解除映像；只有进程地址空间收束返还 backing 与计费。未来若需要启动区提前回收，必须增加真实的映射交接契约后再改变此寿命，不能让当前上下文 Drop 偷做。
 
-StartupBlock、初始 grants 和 payload 视图是进程环境资源；入口线程的执行栈与 ThreadControl 是线程资源。构建者经 Building Map 建立入口栈，ThreadCreate 把 child-local Control 安装到目标表，并将该句柄加入 StartupBlock 的 grants/Handle 数组；版本化 `EntryThreadDescriptor` 只引用对应零基索引与栈 reservation、usable 范围。子进程 runtime 以原子 once 采用该描述符，用 reservation 重建普通 region owner 并把入口线程登记为普通 ThreadRecord；第二次进入 `_start` 属于进程完整性失败，这是 Rust profile 只有一个入口的强制点。未采用前进程终止时，这些都是进程资源，由 ProcessDrain 收回，不跨地址空间运输 Rust 对象。采用后入口线程与运行期线程使用同一结果、离场和 cleanup 状态机，不按 TID/PID 分支。
+StartupBlock、初始 grants 和 payload 视图是进程环境资源；入口线程的执行栈与 ThreadControl 是线程资源。构建者经 Building Map 建立入口栈，ThreadCreate 把 child-local Control 安装到目标表，并将该句柄加入 StartupBlock 的 grants/Handle 数组；版本化 `EntryThreadDescriptor` 只引用对应零基索引与栈 reservation、usable 范围。子进程 runtime 以原子 once 采用该描述符，用 reservation 重建普通 region owner 并把入口线程登记为普通 ThreadRecord；第二次进入 `_start` 属于进程完整性失败，这是 Rust profile 只有一个入口的强制点。未采用前进程终止时，这些都是进程资源，由内核自动回收，不跨地址空间运输 Rust 对象。采用后入口线程与运行期线程使用同一结果、离场和 cleanup 状态机，不按 TID/PID 分支。
 
 进入 Rust 安全接口的原始指针接管仍是 unsafe：调用者须保证完整映像可读、长度可表示、内容稳定及上述寿命。outer 格式校验只能验证已可访问字节的布局，不能证明一个任意指针可读。平台入口适配器是该不变量的唯一生产接点，非法启动输入按程序失败收束，不把用户地址错误变成内核 panic。
 

@@ -1,10 +1,10 @@
 # 不可信创建域的内核元数据预算
 
-> 状态：独立延期能力，目标已见 `notes/ideas/{mm,object,task}.md`，本文件固定触发条件与实施顺序。当前 MetadataSponsor 是全局政策下的有界准入；资源可归属、已提交维护必成，不等于已经实现不同授权域之间的完整 DoS 隔离。此计划不阻塞现有可信创建路径的集成工作，也不承接当前已知的所有权丢失或退款缺陷。ProcessDrain 由受信任管理者履责，无须本预算提供回收激励；本计划只承担独立的资源分配与隔离需求。
+> 状态：资源预算分案，纳入[全项目重构](todo-2026-09-29-system-redesign.md)重新设计，未实施。当前 MetadataSponsor 是全局政策下的有界准入，不等于不同授权域之间的完整资源隔离。本案拥有来源、准入与退款；内核自主推进已提交工作由[维护执行分案](todo-2026-09-29-kernel-maintenance-execution.md)拥有，不再以 PM 持续调用 ProcessDrain 为前提。
 
 ## 目标与边界
 
-由独立 KernelMemoryBudget capability 资助内核 metadata、对象壳及操作/退休所需容量；与支付 page-backed storage 的 MemoryPool、只表达创建和收束域的 Job 正交。对象跨进程或跨 Job 运输后保留真实来源，最后实际责任消散才退款。
+metadata、对象壳及操作/退休承载必须具有明确的实际来源、准入与退款关系，不能与 page-backed storage 或 Job 管理关系混为一份真值。独立 KernelMemoryBudget capability 是已有候选形式，需在全项目重审中重新论证，不因写入 ideas 而冻结。对象跨进程或跨 Job 运输后保留真实来源，最后实际责任消散才退款。
 
 准入应在承诺对象或操作前发生；接受后不得因调用者不继续运行、关闭源预算句柄或全局压力而丢失必成资源。长期预算不能靠 PID、当前持有者或 Job 位置重记账，也不能把普通 MemoryPool 改成带全系统成员列表的可撤销池。
 
@@ -12,11 +12,11 @@
 
 硬触发：开放不可信 Process/对象创建域、委派独立 metadata 预算，或真实服务要求一域不能耗尽其他域的公共元数据容量。必须在开放前完成；不能用对象数量上限或自动进程回收代替隔离。按 `be6dae3` 核对，当前 `srv_pm` 持有的 `pm_domain` JobControl 只有 MANAGE|READ|WAIT，没有 CREATE；ProcessCreate 仍由可信 init 执行，故现有委托管理域并未触发不可信创建域前置。普通 Running 进程仍可按其 sponsor 限额创建被授权的对象/映射，未来一旦承诺域间额度保证，本项立即成为前置。全局 region slot 的 32 倍数值与 heap 压力观测另由[架构审计 A2/M3/M5](todo-2026-09-14-architecture-audit-findings.md)校准；独立预算不能取代字节容量证明。
 
-前置是公共对象/进程回收的职责设计、稳定 sponsor/permit 生命周期和 shared ABI 归属。公共回收采用受信任管理者职责模型，不依赖本项先实现；是否实现独立 metadata 预算由资源隔离需求决定。普通进程即使不持 ProcessControl MANAGE，运行期也能创建其被允许的对象或映射，限制 Drain authority 不能代替分配准入。当前每个新进程从全局准入建立自己的 MetadataSponsor，尚非从父级可委派预算扣除；不得把按进程限额写成创建者承担全部成本。与 [用户态映射 owner](todo-2026-09-14-user-memory-owner-lifecycle.md) 没有算法依赖；两者均未触发时，默认在当前 FAL 基础交付后先处理映射 owner，再处理本项。若不可信创建域更早触发，本项提前且不等待映射 owner 重构。
+与 capability、自动回收、UnitOfWork 和映射方案共同闭合实际成本图及生命周期。已有可信创建基线能否暂时保留全局政策，由当前交付承诺决定，不能沿用“FAL 完成后再处理”的旧排期。已接受清理的存储承载与执行机会需要保障；普通对象创建的隔离配额、CPU 调度份额和每步工作上界分别建模。普通进程即使不持管理其他进程的 authority，也能创建获授权的对象，因此限制终止权限不能代替分配准入。
 
 1. 从固定规范与多种官方系统参照取证，列出对象、Handle、等待注册、通知/继续执行/退休槽和页表 metadata 的实际成本与来源图。
 2. 明确预算 capability 的派生、绑定、关闭、对象转移与真实退款契约；确定全局安全储备与域配额的关系，以及哪些完成容量必须独立保留。共同核对预算资助者、Process/Job 回收 authority 和上级接管链；额度退出后仍有来源不等于仍有运行中的管理者，实际执行成本也不能用 metadata 或 max_work 冒充 CPU 计费。
-3. 同次设计内核/shared/rinlib、ProcessResources 绑定与真实资源管理者的授权链；创建、失败、取消、退出和最后 source 消散共同闭合。
+3. 同次设计内核、shared ABI、libkernel、进程资源绑定与真实资源管理者的授权链；创建、失败、取消、退出和最后来源消散共同闭合，不预设旧绑定与类型名称必须保留。
 4. 迁移当前 MetadataSponsor/global admission 政策，删除过渡绑定与重复真值；保留仍有独立正确性依据的结构上限。
 5. 以两个独立域的压力、跨域能力转移、源退出、最后退款和压力下退休进行验证，再开放不可信创建域。
 

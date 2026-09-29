@@ -12,7 +12,11 @@
 
 以下区域处于待矫正状态：其现有写法、结构与模式不作为新工作的参考。进入或引用这些区域前先读对应条目，按条目指定的依据工作；条目随承接任务完成而删除。
 
+全项目重审范围表示目标结构需要重新确定，不等于其中每个实现已被证明错误。代码与 impls 继续如实描述现状，不能依据目标 ideas 把未实施行为回填成事实。
+
 | 范围 | 问题 | 改用的依据 | 承接 |
 |---|---|---|---|
-| `notes/ideas/` 全体 | 大量设计决策、状态机、owner 与失败路径写入 ideas，超出线稿粒度 | [notes/README](notes/README.md) 的 ideas 定义与粒度判据，不模仿现有篇幅写法 | 后续触及相应篇的设计任务顺手清理 |
-| FAL 全栈：`user/libraries/{libfal,libfs}`、`user/services/srv_fs`、`user/tests/test_fal`、`notes/{ideas,impls}/{fal,fs}.md` | 实现质量低、重复模式与状态膨胀，待整体重新设计与重构 | 代码仅作现状事实，不作为新代码结构或写法范本 | FAL 重新设计计划（待立项） |
+| 全项目代码与当前实现说明：`os/`、`shared/`、`user/`、`notes/impls/` | 已授权无兼容约束整体重审；现有组件、接口和消费者不能作为必须保留某项机制的理由 | [系统重构总纲](plans/todo-2026-09-29-system-redesign.md) 的已确认原则及独立分案；只读盘点保留为现状事实 | 各分案设计闭合后精确登记实施范围；未完成前不作为新结构范本 |
+| capability/Close/进程回收：`os/kernel/src/task`、内核维护与内存路径、`user/libraries/{libkernel,libprocess,libexecution,libthread,libruntime,librunnel}`，以及对应 `notes/impls/` 章节 | 公共层特殊资源分流、Close 的失败/隐式等待、普通 Arc 与业务寿命混合、用户驱动 ProcessDrain；现有实现尚未遵循新的本地释放目标 | [capability](plans/todo-2026-09-28-capability-last-reference.md)、[维护执行](plans/todo-2026-09-29-kernel-maintenance-execution.md)、[自动回收](plans/todo-2026-09-29-process-automatic-reclamation.md) | 设计中，代码和 impls 待重构；逐分案实现与验证闭合后移除相应范围 |
+| `notes/ideas/` 全体 | 施工和重构期间的未审定线稿；清理、精简或局部目标改写均不代表机制已重新设计 | [系统重构总纲的审定登记](plans/todo-2026-09-29-system-redesign.md#重构设计依据与-ideas-审定登记)及所属 todo 的详细设计；未登记的 ideas 范围不作目标依据 | 各分案在计划中完成详细设计后登记可参考范围；文档清理、设计审定与代码重构分别记录 |
+| FAL 全栈：`user/libraries/{libfal,libfs}`、`user/services/srv_fs`、`user/tests/test_fal`、`notes/{ideas,impls}/{fal,fs}.md` | 实现质量低、重复模式与状态膨胀，待整体重新设计与重构 | 代码仅作现状事实，不作为新代码结构或写法范本；底层目标不以迁就现有 FAL 为前提 | [系统重构总纲](plans/todo-2026-09-29-system-redesign.md) 下 FAL/服务独立分案待闭合 |

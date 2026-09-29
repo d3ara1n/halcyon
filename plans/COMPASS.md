@@ -6,13 +6,17 @@
 
 > 部分区域处于矫正态，现有写法不作参考，见 [KNOWN_ISSUES 矫正区](../KNOWN_ISSUES.md#矫正区)。
 
-1. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：从对象关系与授权继续细化，整体闭合后再安排设备实现。
+1. [全项目重构设计总纲](todo-2026-09-29-system-redesign.md)：无兼容约束重审；按独立契约形成 ideas 与成型实施分案。
+2. [Capability 与资源释放](todo-2026-09-28-capability-last-reference.md)、[内核维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md)：共同闭合本地释放与自动收束主线。
+3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：结合全项目目标确定基础对象关系后继续。
 
 运行时分层与线程生命周期已完成：[运行时分层 review](archived/review-2026-09-28-runtime-layering.md)。
 
-## 近期顺序
+## 旧基线待办
 
-1. [FAL midflight Copy 间歇失败](todo-2026-09-29-fal-midflight-copy-flake.md)：早于分层阶段的缺陷，`virt-release` 约 20% 失败，阻塞 acceptance；先于设备实现定位。
+以下保留旧基线问题入口；新重构是否需要先处理，由目标消费者与验证需求决定，不自动作为全项目重构前置。
+
+1. [FAL midflight Copy 间歇失败](todo-2026-09-29-fal-midflight-copy-flake.md)：旧 FAL 验收基线问题，后续按相关消费者保留或替换情况承接。
 2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
 
 ## 可择机任务与审查
@@ -49,7 +53,6 @@
 | [电源管理服务](todo-2026-09-power-management-service.md) | 独立电源管理需求明确后 |
 | [内核最终架构审查](todo-2026-09-kernel-final-architecture-review.md) | 主要用户态消费者及计划所列主线前置完成后 |
 | [Halcyon std 平台层](todo-2026-09-28-halcyon-std.md) | 出现必须依赖 std 的真实第三方需求 |
-| [对象级最后 capability 引用机制](todo-2026-09-28-capability-last-reference.md) | 生命周期收敛切面提交后，先只读盘点现有“最后引用”语义 |
 
 ## 尚未立案的候选
 
