@@ -1,4 +1,3 @@
-
 //! 用户态 ELF process loader：解析映像并驱动 affine ProcessBuilder。
 //! `race` 模块是生命周期竞态矩阵验证负载（init ↔ test_hammer）的线协议。
 
@@ -82,6 +81,7 @@ impl SpawnFailure {
 
 pub struct SpawnRequest<'a> {
     pub job: Handle,
+    pub parent_pid: erhino_shared::proc::Pid,
     /// 本次 spawn 的 backing Pool；库复制 GRANT-only authority 并由 Bind 消费。
     pub memory_pool: Handle,
     pub image: &'a [u8],
@@ -195,9 +195,8 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         let entry = erhino_shared::startup::EntryThreadDescriptor {
             kind: erhino_shared::startup::ENTRY_THREAD_SECTION_KIND,
             version: erhino_shared::startup::ENTRY_THREAD_SECTION_VERSION,
-            section_len: core::mem::size_of::<
-                erhino_shared::startup::EntryThreadDescriptor,
-            >() as u32,
+            section_len: core::mem::size_of::<erhino_shared::startup::EntryThreadDescriptor>()
+                as u32,
             control_index: grant_len as u32,
             reserved: 0,
             stack_reservation_start: stack_start as u64,
@@ -228,6 +227,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         granted[grant_len] = thread_created.control;
         let block = build_birth_block(
             created.pid,
+            request.parent_pid,
             &granted[..=grant_len],
             entry,
             request.payload,
@@ -1017,10 +1017,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
     }
 }
 
-pub fn job_kill_with_policy(
-    job: Handle,
-    policy: SupervisionPolicy,
-) -> Result<(), JobKillFailure> {
+pub fn job_kill_with_policy(job: Handle, policy: SupervisionPolicy) -> Result<(), JobKillFailure> {
     let collector = JobCollector::new(job, policy).map_err(|error| {
         job_failure(
             job,
@@ -1177,32 +1174,28 @@ fn write_segments(builder: Handle, image: &elf::Elf, file: &[u8]) -> Result<(), 
 /// 也是接收进程得知自身身份的途径（它未必持有自己的 ProcessControl，
 /// 不能靠 ProcessQuery 反查）。
 ///
-/// **`parent_pid` 不作参数，由组装者身份内部推导**：它描述目标进程的
-/// 创建关系，而创建者恒为本进程——「谁创建了它」不是调用方可自由选择
-/// 的信息。参数化曾使误传 `env::parent_pid()`（目标的祖父）成为可能，
-/// 现在该错误在结构上不存在。`target_pid` 仍为参数：它来自
-/// ProcessCreate 的内核返回值，组装者无法推导。
 fn build_birth_block(
     target_pid: u64,
+    parent_pid: erhino_shared::proc::Pid,
     handles: &[Handle],
     entry: EntryThreadDescriptor,
     payload: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, SpawnError> {
     erhino_shared::startup::build_startup_block_with_entry(
-        target_pid,
-        libkernel::startup::pid(),
-        handles,
-        entry,
-        payload,
+        target_pid, parent_pid, handles, entry, payload,
     )
-        .map_err(|_| SpawnError::InvalidImage)
+    .map_err(|_| SpawnError::InvalidImage)
 }
 
 /// 出生块写入约定区：validated ELF 的映像顶之上页对齐放置——组装者
 /// 掌握映像布局（Map 由其驱动），无需查询目标布局游标；块的只读性由接收方
 /// 运行时自行遵守（见分层计划）。逐页映射，内容由创建完入口线程的调用方一次写入，
 /// 返回块基址。
-fn map_birth_block(builder: Handle, block_len: usize, image_top: usize) -> Result<usize, SpawnError> {
+fn map_birth_block(
+    builder: Handle,
+    block_len: usize,
+    image_top: usize,
+) -> Result<usize, SpawnError> {
     let base = image_top.div_ceil(PROCESS_PAGE_SIZE) * PROCESS_PAGE_SIZE;
     let end = base
         .checked_add(block_len)
@@ -1387,6 +1380,7 @@ mod tests {
             spawn(SpawnRequest {
                 job: Handle::INVALID,
                 memory_pool: Handle::INVALID,
+                parent_pid: erhino_shared::proc::Pid::from_raw(0),
                 image: &[],
                 payload: &[],
                 grants: &[],
@@ -1430,8 +1424,7 @@ mod tests {
         assert_eq!(failure.stage, SupervisionStage::WaitReapable);
         assert_eq!(failure.cause, SupervisionCause::InvalidPolicy);
 
-        let failure =
-            job_kill_with_policy(Handle::from_raw(0x2_0000_0001), policy).unwrap_err();
+        let failure = job_kill_with_policy(Handle::from_raw(0x2_0000_0001), policy).unwrap_err();
         assert_eq!(failure.job.raw(), 0x2_0000_0001);
         assert_eq!(failure.stage, JobKillStage::Seal);
         assert!(failure.collector.is_none());
@@ -1509,4 +1502,3 @@ mod tests {
         assert_eq!(state.borrow().close_successes, 2);
     }
 }
-

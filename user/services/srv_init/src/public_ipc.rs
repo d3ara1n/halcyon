@@ -17,8 +17,8 @@ use libkernel::{
     },
     time,
 };
-use libthread::ThreadOutcome;
 use libruntime::thread;
+use libthread::ThreadOutcome;
 
 const MESSAGES: usize = MAILBOX_CAPACITY * 4;
 
@@ -145,9 +145,7 @@ pub(super) fn threaded_receive() {
                 value,
                 leave: Ok(()),
             } => delivered.extend(value),
-            ThreadOutcome::Returned {
-                leave: Err(()), ..
-            }
+            ThreadOutcome::Returned { leave: Err(()), .. }
             | ThreadOutcome::EnterFailed(())
             | ThreadOutcome::Incomplete => panic!("threaded Mailbox worker did not complete"),
         }
@@ -248,7 +246,7 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     use libkernel::{
         ipc::{notification, object::duplicate, wait_set::WaitSet},
         process,
-        shared::proc::{HandleGrant, TerminationCause, ProcessState},
+        shared::proc::{HandleGrant, ProcessState, TerminationCause},
     };
     let mut sources = Vec::new();
     let monitor = WaitSet::create(2).unwrap();
@@ -311,6 +309,7 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     let control = duplicate(nested.control, Rights::MANAGE | Rights::GRANT).unwrap();
     let started = crate::spawn(crate::SpawnRequest {
         memory_pool: crate::root_memory_pool(),
+        parent_pid: crate::init_pid(),
         job,
         image,
         payload: b"ipc-kill",
@@ -394,7 +393,8 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     loop {
         match process::drain(nested.control, 128) {
             Ok(result)
-                if result.status == libkernel::shared::proc::ProcessDrainStatus::Complete as u32 =>
+                if result.status
+                    == libkernel::shared::proc::ProcessDrainStatus::Complete as u32 =>
             {
                 break;
             }

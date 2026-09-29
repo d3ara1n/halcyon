@@ -1,28 +1,18 @@
 # 现有用户态分层纠正：libkernel、libprocess、libthread 与 libruntime
 
-> 状态：本轮施工已完成。实现、Cargo、入口配置和构建资产已迁移，旧 `user/rinlib`、`ENTRY(main)`、`lang_start`、旧线程栈清理路径已删除；验证证据见文末。
+> 状态：基线 66f4e9c 的原轮施工曾记录完成；第二轮复核正在修正线程 owner 仲裁、启动采用和入口/Unmap 失败路径。当前交付证据以 [复核报告](review-2026-09-28-runtime-layering.md) 为准，不沿用旧完成声明。
 
 ## 交付快照
 
 - `libkernel`、`libthread`、`libruntime` 和 `libprocess::context` 已建立；全部公共库、服务、驱动和验收程序已切换到最终 owner。
-- `libruntime::_start` 建立 gp、初始化 heap，采用 StartupContext grants，按 EntryThreadDescriptor reservation 登记入口线程，再调用由 `libruntime::entry!(app_main)` 生成的内部 ABI 桥接；`() / Ok` 走 ThreadExit，Err/panic/OOM 走 ProcessAbort。应用不直接命名桥接符号。
+- `libruntime::_start` 建立 gp、初始化 heap，以 affine StartupSeed 采用启动 grants，按 EntryThreadDescriptor reservation 登记入口线程，再经内部链接桥以 C ABI 调用 `main(0, null)`；`() / Ok` 走 ThreadExit，Err/panic/OOM 走 ProcessAbort。
 - target/linker 已迁到 `user/platforms/`，入口为 `_start`；Base64/D64 release ELF 均通过 OSABI/entry audit 与反汇编门。
-- `ThreadRegistry` 以固定槽和预算协作 reap；`JoinHandle::Drop` 不等待，栈映射在 transient `ObjectBusy` 时让出推进机会；不保留 UserStack abandoned 或 `wait_and_release`。
+- `ThreadRegistry` 以固定槽和预算协作 reap；`ResultReceiver::Drop` 不等待，栈映射在 transient `ObjectBusy` 时让出推进机会；不保留 UserStack abandoned 或 `wait_and_release`。
 - 施工期间的重复 raw grant 调用已改为 context owner 的一次转交或 capability 派生；init 的 root Job/SystemReset/MemoryPool 责任由 supervisor 显式持有。
 
 ### 入口桥接说明
 
-应用函数不是 `libruntime::main`，也不需要手写 `__halcyon_main`。每个 binary 只写：
-
-```rust
-fn app_main() {
-    // application policy
-}
-
-libruntime::entry!(app_main);
-```
-
-`entry!` 生成的 `__halcyon_main` 是 runtime `_start` 与 binary 应用函数之间的内部链接符号。它存在的原因是 `_start` 属于 runtime crate，而应用函数属于 binary crate；Rust crate 边界需要一个稳定的 ABI 符号才能完成链接。宏隐藏该符号，统一调用 `finish`，把 `()`/`Ok(())` 转为 `ThreadExit`，把 `Err` 转为 `ProcessAbort`。应用代码不直接命名或调用这个符号。
+应用 binary 定义标准 `fn main()`，无需 runtime 入口宏。`libruntime::_start` 经同 crate 内部汇编桥初始化运行环境、采用 StartupContext，再以 C ABI 调用 rustc 生成的 `main(0, null)`；桥符号为内部链接，应用不声明、不命名。
 
 ## 两条主线与设计归属
 
@@ -41,9 +31,9 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 | runtime 依赖 | libkernel + libprocess 的 context 模块 + libthread | 领域库都可直接复用这些 owner；runtime 不批量重导出类型 |
 | 当前身份与管理 | shared 定义 Pid 等 wire 值；libprocess 定义 CurrentProcessInfo/StartupContext 等接口角色 | 启动身份是 provenance，不自动成为内核认证，不产生 ProcessControl |
 | 最小 Cargo 图 | libprocess context 默认基础功能；装载/构造/监督用显式 `management` 功能集引入 ELF/libexecution | Cargo feature 合并只能编译更多 API，不自动启动行为或授予权限 |
-| 线程 | libthread 拥有 ThreadRegistry（槽、claim、reap、seal）、ThreadRecord、ResultCell、公开 Thread/JoinHandle；libruntime 只持有 Registry 实例与环境实现 | libthread 不依赖 libprocess/libexecution/runtime；无专职 driver，协作式回收；不公开可绕过 wrapper 的安全离场；入口线程与运行期线程登记后共用状态机，不按 TID/PID 分支 |
+| 线程 | libthread 拥有 ThreadRegistry（槽、claim、reap、seal）、ThreadRecord、ResultCell、公开 Thread/ResultReceiver；libruntime 只持有 Registry 实例与环境实现 | libthread 不依赖 libprocess/libexecution/runtime；无专职 driver，协作式回收；不公开可绕过 wrapper 的安全离场；入口线程与运行期线程登记后共用状态机，不按 TID/PID 分支 |
 | 消息与 signal | Mailbox/Notification/Wait 的基础 API 在 libkernel；RPC 和事件推进各有 owner | 当前 Notification 不是 POSIX handler；默认不建立消息泵、监听线程或 root channel |
-| 程序入口 | `no_main` + 所选 runtime 的 `entry!` 适配；通用 `_start` 接受现有 a0/a1 StartupBlock 参数 | 不再用 argc/argv 槽借位；内核仍只验证 ELF entry 与执行需求 |
+| 程序入口 | 标准 `fn main()`；runtime `_start` 接受平台 a0/a1 StartupBlock 参数，内部链接桥显式以 `main(0, null)` 调用 | ELF entry 仍是 `_start`；不再用全局导出桥或入口宏；main ABI 与启动参数 ABI 分离 |
 | 启动 context | 无堆 view 校验 → allocator/Registry → once 采用 `EntryThreadDescriptor` 登记入口线程 → 显式交付应用 | 不把 env 全局变量搬家，不把 payload 伪造为无条件 static，不复制 Handle 关闭权；第二次进入 `_start` 为完整性失败 |
 | 线程环境与结果 | ThreadCreate 挂起 → 登记 record/ResultCell → ThreadStart；结果由 ResultCell 仲裁 | 不把 DONE 当成 T 已初始化；T/F 只在用户线程 Drop；TLS/unwind/detach 不在范围；具体施工见 [owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) |
 | shared 与 Rust | 删除 ExitCode、Termination/ProgramResult；shared 定义结构化 `TerminationCause` | main 返回 Err 由 libruntime 转 ProcessAbort；无任何数值退出码 |
@@ -62,8 +52,8 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 |---|---|---|
 | `libkernel` | ecall、错误解码、IPC/MM、Process/Thread 原语、时间和系统控制 | `ThreadControl` 是唯一关闭 owner；无 runtime 初始化 |
 | `libprocess::context` | StartupBlock 校验后的身份、payload、descriptor 与初始 capability owner | grants 一次采用；普通 launcher/服务按索引显式转交 |
-| `libthread` | ResultCell、ThreadRegistry、ThreadFactory/Prepared、trampoline、协作式 reap | `JoinHandle::Drop` 不等待；`enter/leave` 在用户线程，`retire` 在 DONE 后执行 |
-| `libruntime` | `_start`、gp、heap、panic/OOM、入口线程 adopt、结果收束 | `entry!(app_main)` 生成内部桥；`finish` 将 Ok/Err 收束为 ThreadExit/ProcessAbort |
+| `libthread` | ResultCell、ThreadRegistry、ThreadFactory/Prepared、trampoline、协作式 reap | `ResultReceiver::Drop` 不等待；`enter/leave` 在用户线程，`retire` 在 DONE 后执行 |
+| `libruntime` | `_start`、gp、heap、panic/OOM、入口线程 adopt、结果收束 | rustc main 经内部汇编桥按 C ABI 接收 argc=0、argv=null；runtime 入口处理返回结果 |
 | `user/platforms` | 两种 RV64 target 与共同 linker | `ENTRY(_start)`，不再借 argc/argv，不保留旧 runtime 目录 |
 
 全部公共库、服务、驱动和验收程序已经迁移；`user/rinlib`、旧 alias/facade、`lang_start`、`ENTRY(main)`、旧栈 abandoned 计数与 `wait_and_release` 已删除。
@@ -105,7 +95,7 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 
 线程契约由 [task](../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
 
-当前 `libthread::JoinHandle` 显式 `join` 才等待 DONE，Drop 不等待；ResultCell、Registry packet owner 和 reservation cleanup 已接通。当前入口已由 `libruntime::_start` 接管 a0/a1、gp、heap 和 EntryThreadDescriptor；binary 使用 no_main 与 `libruntime::entry!(app_main)`，宏生成的桥接符号仅供链接，旧 rustc main shim、lang_start 和 ENTRY(main) 已删除。
+当前实现事实以本轮复核为准：`StartupSeed` 先无堆核验 StartupBlock，采用阶段逐项非对齐读取、预留工作区、Query 全表，全部通过后建立 Capability owner；失败保留 Seed。`ResultReceiver` Drop 只放弃结果，PreparedThread 取消由 Cancelling 槽关闭 Control 后发布 Abandoned；reap 只认领 Live/Abandoned，未 DONE 恢复 Live。
 
 ### 入口和 profile 事实门
 
@@ -116,7 +106,7 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 - 用户 sp 16 字节对齐；ThreadStartContext 的入口/栈校验仍由内核完成。
 - `_start` 返回类型为 never；main 返回 Ok 调用 `ThreadExit()`，Err 调用 `ProcessAbort()`。
 
-实施前在钉住工具链下验证 `.option norelax`、`__global_pointer$`、`no_main`/宏入口和链接段。平台门：两个 target 检查最终 ELF `_start`、入口线程与运行期 trampoline 首段反汇编、gp 初始化未被 relaxation 删除、a0/a1 未破坏、SP 对齐、Base64 无 FP，旧 ENTRY(main)/lang_start 消失。
+实施前在钉住工具链下验证 `.option norelax`、`__global_pointer$`、`Rust main`/宏入口和链接段。平台门：两个 target 检查最终 ELF `_start`、入口线程与运行期 trampoline 首段反汇编、gp 初始化未被 relaxation 删除、a0/a1 未破坏、SP 对齐、Base64 无 FP，旧 ENTRY(main)/lang_start 消失。
 
 规范固定入口：[psABI v1.0 调用约定](../references/normative/riscv-psabi-v1.0/riscv-cc.adoc)、[psABI v1.0 ELF 与 relaxation](../references/normative/riscv-psabi-v1.0/riscv-elf.adoc)。
 
@@ -203,16 +193,13 @@ stateDiagram-v2
 | 跨线程读取 payload | 移交或 clone 只读视图，grant bank 仍单一 owner；dropping context 不使 payload 悬垂 | 无强制复制/Arc 回收或隐式全局 env |
 | Map/Close 期间线程终止 | 已提交内核责任不取消；调用帧/结果义务直到离场屏障，startup/adopter 不伪造成功 | libkernel 与 libthread 完成形态已落地；验证证据见当前实现与证据节 |
 
-本节是施工前的 context 接口与场景走查记录；实现已完成，最终 owner 与验证事实见“当前实现与证据”和“入口桥接说明”。
+本节原为施工前草案；与当前代码及契约不一致的实现描述，以本轮复核报告和对应 ideas/impls 为准，不作为当前完成证据。
 
 ## 实施顺序与完成状态
 
-完整第一主线已作为一个迁移闭包完成：
+基线 66f4e9c 曾将第一主线记录为迁移闭包完成。本轮复核发现线程取消仲裁、StartupSeed 全表核验/原凭据失败保留、入口桥与 Unmap owner 缺口，原完成声明撤回。第二轮处置、证据和未闭合项由唯一复核报告拥有。
 
-1. libkernel、libprocess context、libthread、libruntime 和平台资产已按依赖顺序建立。
-2. 所有 binary 已切换为 `no_main` + `libruntime::entry!` + `_start`，不保留旧 main/argc/argv 或 raw startup 全局通道。
-3. 所有公共库、服务、驱动、测试和 ELF 工具消费者已迁移；旧 runtime 目录、imports/re-export/alias/syscall 副本已删除。
-4. impls、工具和构建手册已同步；设备资源代码仍由设备专题独立拥有。
+改名同步面和既有迁移结论仍按当时提交记录追溯；不得将历史成功的构建或测试挪作本轮证据。
 
 改名同步面：workspace/manifests/Cargo.lock、.cargo config、两种 target、linker/入口、Justfile host 清单及 FP 路径、编译失败示例、所有导入、编辑器词表、当前文档。历史固定提交记录保留 rinlib。ELF 工具当前不识别 runtime 名，继续依据 ET_EXEC、入口范围与执行 profile 验证。
 
@@ -226,7 +213,7 @@ stateDiagram-v2
 
 ## 施工与交付门
 
-设计门：具体 public API/unsafe/失败表、两种启动/线程时序、context 与 management 的 Cargo 分离、固定平台证据及所有消费者迁移图均已闭合；本计划进入交付后归档准备，不再以“未进入代码施工”描述当前状态。
+本轮交付门尚未通过：线程 owner、出生、结果、回收、启动采用与真实消费者责任链必须按复核报告完成；不以基线迁移完成或旧验收结果代替。
 
 实施门：
 
@@ -235,7 +222,7 @@ stateDiagram-v2
 - StartupContext 的身份、payload 和 capability 责任分开；Seed 独占采用、重复/再次领取被拒绝；启动映像统一只读并由地址空间保活至进程结束，来源说明不冒充内核认证。
 - 栈/结果/环境/Control 到 DONE 及 Map 义务解除后才可回收，失败保留 owner；不对未初始化结果执行读取或 Drop。
 - allocator 最小路径无递归分配；main/线程返回、panic/OOM、ProcessTerminate/ProcessAbort 与上级 Drain 各有明确边界，无数值退出码残留。
-- no_main/entry! 与 `_start` 满足平台 ABI；无旧 lang_start 借位/ENTRY(main) 路径，内核不依赖用户 runtime。
+- rustc main 与 runtime bridge 与 `_start` 满足平台 ABI；无旧 lang_start 借位/ENTRY(main) 路径，内核不依赖用户 runtime。
 - 按构建手册完成依赖/feature/符号、host/compile-fail、两种用户 target 与内核入口、真实启动和退出及完整 acceptance；不临时造替代 runtime 验收体。
 - 旧代码路径和配置已删除，当前 impls 与真实源码一致，历史证据保持原事实。
 
@@ -244,7 +231,7 @@ stateDiagram-v2
 ### 工作树与授权
 
 - 当前分支 `master`，本次分层迁移仍未 commit/push；工作树保留本闭包的代码与同步文档改动。
-- 线程/终局方案、StartupBlock v3、ProcessBindExecution lease、统一输出 fault 与 ThreadControl 最后引用规则已在归档生命周期记录中完成；Registry/owner/libruntime 及全部消费者迁移已在本计划完成。
+- 基线 66f4e9c 及此前工作记录仅作为既有实现背景；本轮纠正的 P1、失败路径和接力状态由唯一 [复核报告](review-2026-09-28-runtime-layering.md) 拥有。
 - `plans/archived/todo-2026-09-device-architecture.md` 只表示初始概念稿完成，不代表设备详细设计完成。
 
 ### 已确定，不重复选方案
@@ -256,16 +243,16 @@ stateDiagram-v2
 | 改名与构建 | runtime 已迁到 `libraries/libruntime`，不留 alias/facade；target/共同布局位于 `user/platforms` | 已完成 |
 | 资源接口 | kernel-interface idea 与本计划 API 表已确定 value/borrow/owner、消费失败返还、分配/等待/退休区别；实现与消费者验证已完成 | 已完成 |
 | 启动 | StartupSeed 一次来源与 role 核实分开，StartupContext 分离身份/payload/grants；出生块统一只读、地址空间保活到进程结束；普通 launcher RW 是待纠正代码事实 |
-| 线程 | libthread 拥有 Registry/ThreadRecord/ResultCell/Thread/JoinHandle；libruntime 只持实例与环境；Create→Start 两段出生；无专职 driver，协作回收；无退出码 |
-| 平台入口 | no_main/entry!/_start，入口线程适配与运行期 trampoline 均准备 gp、保持参数/SP；内核拥有 FP gate，当前无 TLS | Base64/D64 镜像与反汇编门已通过 |
+| 线程 | libthread 拥有 Registry/ThreadRecord/ResultCell/Thread/ResultReceiver；libruntime 只持实例与环境；Create→Start 两段出生；无专职 driver，协作回收；无退出码 |
+| 平台入口 | rustc main 与 runtime bridge/_start，入口线程适配与运行期 trampoline 均准备 gp、保持参数/SP；内核拥有 FP gate，当前无 TLS | Base64/D64 镜像与反汇编门已通过 |
 | 现有基座 | libexecution 已有 task/source 准入、失败保留/退避与注销/停止；FAL 和 init 已有正式退休/监督消费者。不能重新把整套基座列为缺失 |
 | 系统定位 | 不以 POSIX 兼容为目标；多用户非刚需，未来政策归用户态；本轮不建设 TLS/unwind/自动消息泵/第二 runtime |
 
 ### 收口与后续边界
 
-1. 线程 owner、出生、结果、回收与终局原因已施工并由 [owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)记录完成。
-2. context、全部消费者、Cargo 迁移矩阵、startup 权限和入口 ABI 已接通；旧目录、alias、re-export 和入口借位已删除。
-3. 平台入口、unsafe/类型约束和失败路径已通过 Base64/D64、ELF audit、`just check`、`just clippy` 与 `just acceptance`。后续只保留普通出生块最终只读等明确范围外债务。
+1. 本轮线程 owner、出生、结果、回收与启动采用尚待本报告完成结构检查和完整验证后收口。
+2. context、消费者、Cargo 迁移及平台入口的第二轮状态以本报告记录为准；不得沿用第一轮完成声明。
+3. 本轮 `just check`、`just clippy` 与 `just acceptance` 尚未形成证据。
 
 ### 设计阶段与施工阶段裁决（2026-09）
 
@@ -287,7 +274,7 @@ stateDiagram-v2
 ```text
 1. libkernel：迁移 raw call、typed owner、NotificationSignaler、memory/process/thread 原语
 2. libprocess::context：StartupSeed/Context/InitialGrants，独立于 management
-3. libthread：ThreadEnvironment、ThreadFactory、ThreadRegistry/ThreadRecord、ResultCell、Thread/JoinHandle、内部 trampoline
+3. libthread：ThreadEnvironment、ThreadFactory、ThreadRegistry/ThreadRecord、ResultCell、Thread/ResultReceiver、内部 trampoline
 4. libprocess::management、librpc/librunnel/libfal/libfs/libservice 及服务消费者
 5. libruntime/platforms：_start、gp、heap、panic/OOM、`entry!` 和结果收束（Ok→ThreadExit，Err→ProcessAbort）
 6. 删除旧 runtime 目录、旧 target/linker/import/re-export，执行完整验证

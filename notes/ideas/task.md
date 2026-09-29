@@ -140,11 +140,11 @@ ProcessGrant 可以在内存绑定前独立完成，因为 HandleTable 属于空
 | 共享 ThreadControl | 内核 entry 与持久 DONE | 最后一个引用释放时 Close | libkernel 类型，Arc 共享 |
 | `ResultCell<T>` | 一次性结果与领取/放弃仲裁 | 结果被领取或析构，最后一个引用释放内存 | libthread |
 
-`ThreadRegistry` 的机制（固定容量槽、唯一 cleanup claim、单步 `reap_step`、seal）全部属于 libthread，只对环境类型泛型，不含任务或结果类型。所选 runtime 建立并持有一个进程级实例、提供容量与环境实现；不存在跨库登记端口或第二份槽规则。公开 `Thread` 持有共享 ThreadControl，DONE 是持久事实，观察永不失效；结果领取权 `ResultReceiver<T>` 持有 `ResultCell<T>`；它只领取结果，不是 Rust std 的 join/detach 句柄，Drop 语义是放弃结果。record 退休不影响观察与结果，未领取结果也不占 Registry 槽。
+`ThreadRegistry` 的机制（固定容量槽、唯一 cleanup claim、预算版 `reap(budget) -> Idle/Progress/Wait/Failed`、seal）全部属于 libthread，只对环境类型泛型，不含任务或结果类型。所选 runtime 建立并持有一个进程级实例、提供容量与环境实现；不存在跨库登记端口或第二份槽规则。公开 `Thread` 持有共享 ThreadControl，DONE 是持久事实，观察永不失效；结果领取权 `ResultReceiver<T>` 持有 `ResultCell<T>`；它只领取结果，不是 Rust std 的 join/detach 句柄，Drop 语义是放弃结果。record 退休不影响观察与结果，未领取结果也不占 Registry 槽。
 
 `Thread`、`ResultReceiver<T>` 与 packet 都以共享引用保活各自依赖的 Registry 核心或 ResultCell，不以裸指针或注释证明存活；Registry 实例由 runtime 持有至进程终局，局部 Registry 的销毁不能使任何观察者或运行中 packet 悬垂。环境类型本身须满足其实际共享方式（跨线程共享即 `Send + Sync + 'static`）。
 
-槽状态为 `Free → Reserved → Live → Claimed → Free`：prepare 取得 Reserved，登记转 Live，reap 转 Claimed 并在完成后才回到 Free；Claimed 与 Reserved 都不可被再次分配。准入、登记与 seal 在同一仲裁边界线性化，seal 返回后不再有新登记。
+槽状态为 `Free → Reserved → Prepared → Live → Claimed → Free`，另有 `Prepared → Abandoned → Claimed`：prepare 取得 Reserved，登记转 Prepared，ThreadStart 成功后转 Live；PreparedThread 放弃只转 Abandoned 并释放最后 Control 引用，reap 只认领 Live/Abandoned。reap 探测 Live 未 DONE 时恢复 Live，不能把 record 留在 Claimed。Claimed 与 Reserved/Prepared 都不可被再次分配。准入满槽前有界扫描全部候选，跳过 Prepared、未 DONE 的 Live 与 Busy，回收其余；准入、登记与 seal 在同一仲裁边界线性化，seal 返回后不再有新登记。
 
 ThreadControl 的 DONE 只表示成员关系已经摘除，且所有仍引用该线程结果记录的 committed System Call 已完成。可能 park 的 Map 必须登记线程级结果义务；执行容器可以在终止时放弃回复并消散，但该义务归零前不能摘除成员、发布 DONE 或允许 cleanup 解除栈。进程级 mandatory operation 仍独立保护 AddressSpace 的最终 Drain，两层计数分别回答“线程结果记录可否接管”和“进程资源可否收束”，不得合并。
 
@@ -181,7 +181,7 @@ Building 期创建的线程由构建者供栈（Building Map）；其 child-loca
 
 ### 离场与 cleanup
 
-`ThreadExit()` 不带参数：线程离场即完成。DONE 后 `reap_step` 只执行机械动作：环境 retire、释放 Control 引用、Unmap 栈、归还槽；Busy 返回 Wait，永久错误保留 record 与已完成进度（retire 已消费的残余不再重复、未完成步骤不跳过）并经 `ProcessAbort()` 进入进程完整性故障，不忽略、不降级为计数或 panic。任意用户代码（F、T、enter/leave）从不在 cleanup 中执行。
+`ThreadExit()` 不带参数：线程离场即完成。DONE 后 `reap(budget)` 只执行机械动作：环境 retire、释放 Control 引用、Unmap 栈、归还槽；Busy 返回 Wait，永久错误保留 record 与已完成进度（retire 已消费的残余不再重复、未完成步骤不跳过）并经 `ProcessAbort()` 进入进程完整性故障，不忽略、不降级为计数或 panic。任意用户代码（F、T、enter/leave）从不在 cleanup 中执行。
 
 系统没有专职 driver 线程，cleanup 为协作式推进，契约只承诺容量不被已死线程占用，不承诺及时回收：
 

@@ -14,7 +14,8 @@
 ## 近期顺序
 
 1. [运行时分层校正](review-2026-09-28-runtime-layering.md#处置与校正范围)：f519a99 独立审查的 19 项发现及入口/启动上下文设计纠正，先于分层后续工作。
-2. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
+2. [Kernel console 锁序 panic](todo-2026-09-29-kernel-console-lock-order.md)：运行时分层第二轮 acceptance 的独立内核阻塞；先固定第一违规调用链，再决定修复归属。
+3. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
 
 ## 可择机任务与审查
 

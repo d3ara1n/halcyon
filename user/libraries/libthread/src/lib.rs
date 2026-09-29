@@ -1,6 +1,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
@@ -17,9 +19,9 @@ use erhino_shared::{
     startup::EntryThreadDescriptor,
 };
 use libkernel::{
+    ThreadControl,
     mm::{MappedRegion, Placement},
     thread as kernel_thread,
-    ThreadControl,
 };
 use lock_api::Mutex;
 
@@ -39,24 +41,37 @@ pub struct ResultCell<T> {
 unsafe impl<T: Send> Send for ResultCell<T> {}
 unsafe impl<T: Send> Sync for ResultCell<T> {}
 
+pub struct ResultProducer<T> {
+    cell: Arc<ResultCell<T>>,
+}
+
+unsafe impl<T: Send> Send for ResultProducer<T> {}
+
 impl<T> ResultCell<T> {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> (Arc<Self>, ResultProducer<T>) {
+        let cell = Arc::new(Self {
             state: AtomicU8::new(EMPTY),
             value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
+        });
+        let producer = ResultProducer {
+            cell: Arc::clone(&cell),
+        };
+        (cell, producer)
     }
+}
 
+impl<T> ResultProducer<T> {
     /// Publish at most once. A receiver that was dropped wins the race and
     /// makes the producer responsible for dropping `value`.
-    pub fn publish(&self, value: T) -> Result<(), T> {
-        if self.state.load(Ordering::Acquire) != EMPTY {
+    pub fn publish(self, value: T) -> Result<(), T> {
+        if self.cell.state.load(Ordering::Acquire) != EMPTY {
             return Err(value);
         }
         // SAFETY: only this producer writes the value while the state is
         // Empty. A receiver that wins `abandon` never reads the storage.
-        unsafe { (*self.value.get()).write(value) };
+        unsafe { (*self.cell.value.get()).write(value) };
         if self
+            .cell
             .state
             .compare_exchange(EMPTY, PUBLISHED, Ordering::Release, Ordering::Acquire)
             .is_ok()
@@ -65,14 +80,21 @@ impl<T> ResultCell<T> {
         } else {
             // SAFETY: ReceiverGone is only written by the receiver and never
             // reads the value. The producer owns the failed publication.
-            Err(unsafe { (*self.value.get()).assume_init_read() })
+            Err(unsafe { (*self.cell.value.get()).assume_init_read() })
         }
     }
+}
 
+impl<T> ResultCell<T> {
     pub fn take(&self) -> Option<T> {
         if self
             .state
-            .compare_exchange(PUBLISHED, RECEIVER_GONE, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                PUBLISHED,
+                RECEIVER_GONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
             // SAFETY: Published is established with release ordering.
@@ -100,12 +122,6 @@ impl<T> ResultCell<T> {
                 return;
             }
         }
-    }
-}
-
-impl<T> Default for ResultCell<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -186,8 +202,11 @@ struct ThreadRecord<E: ThreadEnvironment> {
 enum SlotState<E: ThreadEnvironment> {
     Free,
     Reserved,
+    Prepared(ThreadRecord<E>),
+    Cancelling(ThreadRecord<E>),
     Live(ThreadRecord<E>),
-    Claimed(Option<ThreadRecord<E>>),
+    Abandoned(ThreadRecord<E>),
+    Claimed,
     Faulted(ThreadRecord<E>),
 }
 
@@ -280,11 +299,31 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
 
     fn release_reserved(&self, index: usize) -> Result<(), RegistryError> {
         let mut inner = self.inner.lock();
-        let slot = inner.slots.get_mut(index).ok_or(RegistryError::InvalidSlot)?;
+        let slot = inner
+            .slots
+            .get_mut(index)
+            .ok_or(RegistryError::InvalidSlot)?;
         if !matches!(slot, SlotState::Reserved) {
             return Err(RegistryError::InvalidSlot);
         }
         *slot = SlotState::Free;
+        Ok(())
+    }
+
+    fn retain_reserved_failure(
+        &self,
+        index: usize,
+        record: ThreadRecord<E>,
+    ) -> Result<(), RegistryError> {
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(index)
+            .ok_or(RegistryError::InvalidSlot)?;
+        if !matches!(slot, SlotState::Reserved) {
+            return Err(RegistryError::InvalidSlot);
+        }
+        *slot = SlotState::Faulted(record);
         Ok(())
     }
 
@@ -303,23 +342,52 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         if !matches!(slot, SlotState::Reserved) {
             return Err((RegistryError::InvalidSlot, record));
         }
-        *slot = SlotState::Live(record);
+        *slot = SlotState::Prepared(record);
         Ok(())
     }
 
     fn cancel_prepared(&self, index: usize) -> Result<(), RegistryError> {
-        let control = {
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(index)
+            .ok_or(RegistryError::InvalidSlot)?;
+        match core::mem::replace(slot, SlotState::Free) {
+            SlotState::Prepared(record) => *slot = SlotState::Cancelling(record),
+            state => {
+                *slot = state;
+                return Err(RegistryError::InvalidSlot);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_cancel_prepared(&self, index: usize) -> Result<(), RegistryError> {
+        let mut record = {
             let mut inner = self.inner.lock();
-            let slot = inner.slots.get_mut(index).ok_or(RegistryError::InvalidSlot)?;
-            match slot {
-                SlotState::Live(record) => {
-                    record.cleanup.abandoned = true;
-                    record.control.take()
+            let slot = inner
+                .slots
+                .get_mut(index)
+                .ok_or(RegistryError::InvalidSlot)?;
+            match core::mem::replace(slot, SlotState::Claimed) {
+                SlotState::Cancelling(record) => record,
+                state => {
+                    *slot = state;
+                    return Err(RegistryError::InvalidSlot);
                 }
-                _ => return Err(RegistryError::InvalidSlot),
             }
         };
-        drop(control);
+        record.cleanup.abandoned = true;
+        drop(record.control.take());
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(index)
+            .ok_or(RegistryError::InvalidSlot)?;
+        if !matches!(slot, SlotState::Claimed) {
+            return Err(RegistryError::InvalidSlot);
+        }
+        *slot = SlotState::Abandoned(record);
         Ok(())
     }
 
@@ -342,14 +410,14 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                     let slot = &mut inner.slots[index];
                     let claim = match core::mem::replace(slot, SlotState::Free) {
                         SlotState::Live(record) => Some(record),
-                        SlotState::Claimed(Some(record)) => Some(record),
+                        SlotState::Abandoned(record) => Some(record),
                         state => {
                             *slot = state;
                             None
                         }
                     };
                     if claim.is_some() {
-                        *slot = SlotState::Claimed(None);
+                        *slot = SlotState::Claimed;
                         found = claim.map(|record| (index, record));
                         break;
                     }
@@ -374,13 +442,13 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                         .observed
                         .contains(erhino_shared::object::ObjectSignals::DONE),
                     Err(error) => {
-                        self.restore_claimed(index, record);
+                        self.restore_live(index, record);
                         return ReapProgress::Failed(CleanupFault::Wait(error));
                     }
                 },
             };
             if !done {
-                self.restore_claimed(index, record);
+                self.restore_live(index, record);
                 saw_wait = true;
                 continue;
             }
@@ -406,7 +474,7 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                 }
                 Err((stack, SystemCallError::ObjectBusy)) => {
                     record.stack = Some(stack);
-                    self.restore_claimed(index, record);
+                    self.restore_live(index, record);
                     saw_wait = true;
                 }
                 Err((stack, error)) => {
@@ -425,11 +493,28 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         }
     }
 
-    fn restore_claimed(&self, index: usize, record: ThreadRecord<E>) {
+    fn restore_live(&self, index: usize, record: ThreadRecord<E>) {
         let mut inner = self.inner.lock();
         if let Some(slot) = inner.slots.get_mut(index) {
-            *slot = SlotState::Claimed(Some(record));
+            *slot = SlotState::Live(record);
         }
+    }
+
+    fn activate_prepared(&self, index: usize) -> Result<(), RegistryError> {
+        let mut inner = self.inner.lock();
+        let slot = inner
+            .slots
+            .get_mut(index)
+            .ok_or(RegistryError::InvalidSlot)?;
+        let record = match core::mem::replace(slot, SlotState::Free) {
+            SlotState::Prepared(record) => record,
+            state => {
+                *slot = state;
+                return Err(RegistryError::InvalidSlot);
+            }
+        };
+        *slot = SlotState::Live(record);
+        Ok(())
     }
 
     fn set_faulted(&self, index: usize, record: ThreadRecord<E>) {
@@ -491,10 +576,12 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
                 done: false,
             },
         };
-        if let Err((error, _record)) = self.register(slot, record) {
+        if let Err((error, record)) = self.register(slot, record) {
+            unmap_record_or_abort(self, slot, record);
             let _ = self.release_reserved(slot);
             return Err(error);
         }
+        self.activate_prepared(slot)?;
         Ok(thread)
     }
 }
@@ -508,14 +595,17 @@ fn registry_error_to_system(error: RegistryError) -> SystemCallError {
 }
 
 fn cleanup_integrity_failure(fault: CleanupFault) -> ! {
-    libkernel::dbg::debug(format_args!("libthread cleanup integrity failure: {:?}", fault));
+    libkernel::dbg::debug(format_args!(
+        "libthread cleanup integrity failure: {:?}",
+        fault
+    ));
     // SAFETY: cleanup lost a committed owner or an irreversible progress
     // invariant; continuing would make the process resource state unsound.
     unsafe { libkernel::sys_process_abort() }
 }
 
 fn reap_or_abort<E: ThreadEnvironment>(registry: &'static ThreadRegistry<E>) {
-    if let ReapProgress::Failed(fault) = registry.reap(1) {
+    if let ReapProgress::Failed(fault) = registry.reap(registry.capacity()) {
         cleanup_integrity_failure(fault);
     }
 }
@@ -535,8 +625,20 @@ fn observe_done(
         .contains(erhino_shared::object::ObjectSignals::DONE))
 }
 
-fn unmap_or_abort(stack: MappedRegion) {
-    if let Err((_, error)) = stack.unmap() {
+fn unmap_record_or_abort<E: ThreadEnvironment>(
+    registry: &ThreadRegistry<E>,
+    slot: usize,
+    mut record: ThreadRecord<E>,
+) {
+    drop(record.control.take());
+    let Some(stack) = record.stack.take() else {
+        cleanup_integrity_failure(CleanupFault::MissingStack);
+    };
+    if let Err((stack, error)) = stack.unmap() {
+        record.stack = Some(stack);
+        if registry.retain_reserved_failure(slot, record).is_err() {
+            cleanup_integrity_failure(CleanupFault::InvalidSlot);
+        }
         cleanup_integrity_failure(CleanupFault::Unmap(error));
     }
 }
@@ -556,10 +658,7 @@ impl Thread {
         &self.control
     }
 
-    pub fn wait(
-        &self,
-        deadline: erhino_shared::time::Deadline,
-    ) -> Result<bool, SystemCallError> {
+    pub fn wait(&self, deadline: erhino_shared::time::Deadline) -> Result<bool, SystemCallError> {
         observe_done(&self.control, deadline)
     }
 }
@@ -599,7 +698,7 @@ where
     environment: Arc<E>,
     child: Option<E::Child>,
     function: Option<F>,
-    result: Arc<ResultCell<ThreadOutcome<T, E>>>,
+    producer: Option<ResultProducer<ThreadOutcome<T, E>>>,
     residue: Arc<ResidueCell<E::Residue>>,
 }
 
@@ -613,7 +712,10 @@ where
     // arg2, and the packet is transferred exactly once after ThreadStart.
     let registry = unsafe { &*(registry as *const ThreadRegistry<E>) };
     let mut packet = unsafe { Box::from_raw(packet as *mut Packet<E, F, T>) };
-    let child = packet.child.take().expect("thread child environment consumed twice");
+    let child = packet
+        .child
+        .take()
+        .expect("thread child environment consumed twice");
     let mut residue = match packet.environment.enter(child) {
         Ok(residue) => residue,
         Err(error) => {
@@ -621,7 +723,12 @@ where
                 drop(function);
             }
             let outcome = ThreadOutcome::EnterFailed(error);
-            if let Err(outcome) = packet.result.publish(outcome) {
+            if let Err(outcome) = packet
+                .producer
+                .take()
+                .expect("thread result producer consumed twice")
+                .publish(outcome)
+            {
                 drop(outcome);
             }
             drop(packet);
@@ -630,7 +737,10 @@ where
             unsafe { libkernel::sys_thread_exit() }
         }
     };
-    let function = packet.function.take().expect("thread packet consumed twice");
+    let function = packet
+        .function
+        .take()
+        .expect("thread packet consumed twice");
     let result = function();
     let leave = packet.environment.leave(&mut residue);
     packet.residue.publish(residue);
@@ -638,7 +748,12 @@ where
         value: result,
         leave,
     };
-    if let Err(outcome) = packet.result.publish(outcome) {
+    if let Err(outcome) = packet
+        .producer
+        .take()
+        .expect("thread result producer consumed twice")
+        .publish(outcome)
+    {
         drop(outcome);
     }
     drop(packet);
@@ -691,9 +806,7 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        self.prepare(function)?
-            .start()
-            .map_err(|(_, error)| error)
+        self.prepare(function)?.start().map_err(|(_, error)| error)
     }
 
     pub fn prepare<F, T>(&self, function: F) -> Result<PreparedThread<F, T, E>, SystemCallError>
@@ -702,15 +815,21 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
         T: Send + 'static,
     {
         reap_or_abort(self.registry);
-        let slot = self
-            .registry
-            .reserve()
-            .map_err(registry_error_to_system)?;
-        let child = self.environment.prepare()
-            .map_err(|_| {
-                let _ = self.registry.release_reserved(slot);
-                SystemCallError::OutOfMemory
-            })?;
+        let slot = match self.registry.reserve() {
+            Ok(slot) => slot,
+            Err(RegistryError::Full) => match self.registry.reap(self.registry.capacity()) {
+                ReapProgress::Failed(fault) => cleanup_integrity_failure(fault),
+                ReapProgress::Idle | ReapProgress::Wait => return Err(SystemCallError::ReachLimit),
+                ReapProgress::Progress { .. } => {
+                    self.registry.reserve().map_err(registry_error_to_system)?
+                }
+            },
+            Err(error) => return Err(registry_error_to_system(error)),
+        };
+        let child = self.environment.prepare().map_err(|_| {
+            let _ = self.registry.release_reserved(slot);
+            SystemCallError::OutOfMemory
+        })?;
         let stack_bytes = self
             .stack_bytes
             .checked_add(PROCESS_PAGE_SIZE - 1)
@@ -743,14 +862,14 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
                 }
             }
         };
-        let result = Arc::new(ResultCell::<ThreadOutcome<T, E>>::new());
+        let (result, producer) = ResultCell::<ThreadOutcome<T, E>>::new();
         let residue = Arc::new(ResidueCell::empty());
         let packet = Box::new(Packet {
             entry: trampoline::<E, F, T>,
             environment: Arc::clone(&self.environment),
             child: Some(child),
             function: Some(function),
-            result: Arc::clone(&result),
+            producer: Some(producer),
             residue: Arc::clone(&residue),
         });
         let packet_pointer = (&*packet as *const Packet<E, F, T>) as usize;
@@ -758,7 +877,21 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
             Some(usable) => usable.end,
             None => {
                 drop(packet);
-                unmap_or_abort(stack);
+                unmap_record_or_abort(
+                    self.registry,
+                    slot,
+                    ThreadRecord {
+                        stack: Some(stack),
+                        control: None,
+                        environment: Arc::clone(&self.environment),
+                        residue,
+                        cleanup: CleanupProgress {
+                            retired: false,
+                            abandoned: false,
+                            done: false,
+                        },
+                    },
+                );
                 let _ = self.registry.release_reserved(slot);
                 return Err(SystemCallError::InternalError);
             }
@@ -776,9 +909,25 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
         };
         // SAFETY: all syscall pointers refer to live stack values; the stack
         // and packet were prepared before creation.
-        if let Err(error) = unsafe { kernel_thread::create(Handle::INVALID, &context, &mut created) } {
+        if let Err(error) =
+            unsafe { kernel_thread::create(Handle::INVALID, &context, &mut created) }
+        {
             drop(packet);
-            unmap_or_abort(stack);
+            unmap_record_or_abort(
+                self.registry,
+                slot,
+                ThreadRecord {
+                    stack: Some(stack),
+                    control: None,
+                    environment: Arc::clone(&self.environment),
+                    residue,
+                    cleanup: CleanupProgress {
+                        retired: false,
+                        abandoned: false,
+                        done: false,
+                    },
+                },
+            );
             let _ = self.registry.release_reserved(slot);
             return Err(error);
         }
@@ -801,8 +950,9 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
         if let Err((error, record)) = self.registry.register(slot, record) {
             drop(packet);
             drop(thread);
-            let stack = record.stack.expect("new thread record stack missing");
-            unmap_or_abort(stack);
+            let mut record = record;
+            drop(record.control.take());
+            unmap_record_or_abort(self.registry, slot, record);
             let _ = self.registry.release_reserved(slot);
             return Err(registry_error_to_system(error));
         }
@@ -846,6 +996,9 @@ impl<F, T, E: ThreadEnvironment> PreparedThread<F, T, E> {
             self.packet = Some(unsafe { Box::from_raw(packet as *mut Packet<E, F, T>) });
             return Err((self, error));
         }
+        if self.registry.activate_prepared(self.slot).is_err() {
+            cleanup_integrity_failure(CleanupFault::InvalidSlot);
+        }
         let thread = self.thread.take().expect("PreparedThread started twice");
         self.started = true;
         let receiver = ResultReceiver {
@@ -867,6 +1020,9 @@ impl<F, T, E: ThreadEnvironment> Drop for PreparedThread<F, T, E> {
                 cleanup_integrity_failure(CleanupFault::InvalidSlot);
             }
             drop(thread);
+            if self.registry.finish_cancel_prepared(self.slot).is_err() {
+                cleanup_integrity_failure(CleanupFault::InvalidSlot);
+            }
         }
     }
 }
@@ -923,7 +1079,6 @@ pub fn yield_now() -> Result<(), SystemCallError> {
     libkernel::thread::yield_now()
 }
 
-
 /// Raw ThreadCreate/ThreadStart escape hatches used only by integration
 /// workloads that deliberately test the kernel boundary.
 ///
@@ -948,21 +1103,24 @@ pub unsafe fn start_raw(control: Handle) -> Result<(), SystemCallError> {
 
 #[cfg(test)]
 mod tests {
-    use super::ResultCell;
+    use super::{
+        CleanupFault, CleanupProgress, NoEnvironment, ReapProgress, ResidueCell, ResultCell,
+        SlotState, ThreadRecord, ThreadRegistry,
+    };
+    use alloc::sync::Arc;
 
     #[test]
     fn result_cell_publishes_once() {
-        let cell = ResultCell::new();
-        assert!(cell.publish(7_u32).is_ok());
-        assert_eq!(cell.publish(9_u32), Err(9));
+        let (cell, producer) = ResultCell::new();
+        assert!(producer.publish(7_u32).is_ok());
         assert_eq!(cell.take(), Some(7));
         assert_eq!(cell.take(), None);
     }
 
     #[test]
     fn result_cell_abandon_drops_published_value() {
-        use core::sync::atomic::{AtomicUsize, Ordering};
         use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicUsize, Ordering};
 
         struct DropProbe(Arc<AtomicUsize>);
         impl Drop for DropProbe {
@@ -972,10 +1130,95 @@ mod tests {
         }
 
         let drops = Arc::new(AtomicUsize::new(0));
-        let cell = ResultCell::new();
-        assert!(cell.publish(DropProbe(Arc::clone(&drops))).is_ok());
+        let (cell, producer) = ResultCell::new();
+        assert!(producer.publish(DropProbe(Arc::clone(&drops))).is_ok());
         cell.abandon();
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn result_cell_publish_races_receiver_abandon_without_double_drop() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let (cell, producer) = ResultCell::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let receiver_cell = Arc::clone(&cell);
+        let receiver_barrier = Arc::clone(&barrier);
+        let receiver = std::thread::spawn(move || {
+            receiver_barrier.wait();
+            receiver_cell.abandon();
+        });
+        barrier.wait();
+        if let Err(value) = producer.publish(DropProbe(Arc::clone(&drops))) {
+            drop(value);
+        }
+        receiver.join().unwrap();
+        drop(cell.take());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn reap_skips_prepared_until_cancel_close_is_published() {
+        let registry = ThreadRegistry::<NoEnvironment>::new(1).unwrap();
+        let slot = registry.reserve().unwrap();
+        let record = ThreadRecord {
+            stack: None,
+            control: None,
+            environment: Arc::new(NoEnvironment),
+            residue: Arc::new(ResidueCell::empty()),
+            cleanup: CleanupProgress {
+                retired: false,
+                abandoned: false,
+                done: false,
+            },
+        };
+        assert!(registry.register(slot, record).is_ok());
+
+        registry.cancel_prepared(slot).unwrap();
+        assert_eq!(registry.reap(1), ReapProgress::Idle);
+        registry.finish_cancel_prepared(slot).unwrap();
+
+        let inner = registry.inner.lock();
+        assert!(matches!(inner.slots[slot], SlotState::Abandoned(_)));
+    }
+
+    #[test]
+    fn full_budget_scan_skips_unfinished_live_for_later_abandoned_candidate() {
+        let registry = ThreadRegistry::<NoEnvironment>::new(2).unwrap();
+        let live_slot = registry.reserve().unwrap();
+        let abandoned_slot = registry.reserve().unwrap();
+        let record = || ThreadRecord {
+            stack: None,
+            control: None,
+            environment: Arc::new(NoEnvironment),
+            residue: Arc::new(ResidueCell::empty()),
+            cleanup: CleanupProgress {
+                retired: false,
+                abandoned: false,
+                done: false,
+            },
+        };
+        assert!(registry.register(live_slot, record()).is_ok());
+        assert!(registry.register(abandoned_slot, record()).is_ok());
+        registry.activate_prepared(live_slot).unwrap();
+        registry.cancel_prepared(abandoned_slot).unwrap();
+        registry.finish_cancel_prepared(abandoned_slot).unwrap();
+
+        assert_eq!(
+            registry.reap(2),
+            ReapProgress::Failed(CleanupFault::MissingStack)
+        );
+        let inner = registry.inner.lock();
+        assert!(matches!(inner.slots[live_slot], SlotState::Live(_)));
+        assert!(matches!(inner.slots[abandoned_slot], SlotState::Faulted(_)));
+    }
 }

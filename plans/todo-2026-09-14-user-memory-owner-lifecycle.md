@@ -10,7 +10,7 @@
 2. 删除进程/线程退出码；进程终局记录结构化 `TerminationCause`。
 3. 用户态线程责任拆为 ThreadRecord（libthread Registry）、共享 ThreadControl、`ResultCell<T>` 三个 owner；任意用户代码只在用户线程执行；无专职 driver，协作式 cleanup。
 4. 入口线程经 `EntryThreadDescriptor` 一次采用，与运行期线程共用状态机。
-5. 删除 safe `thread::exit`、同步等待的 JoinHandle Drop、abandoned 计数和 `wait_and_release` 的 `expect`。
+5. 删除 safe `thread::exit`、同步等待的 ResultReceiver Drop、abandoned 计数和 `wait_and_release` 的 `expect`。
 
 非目标：TLS、unwind、detach、scoped thread、专职 reaper、及时回收承诺、多 Rust 入口、ThreadKill。
 
@@ -70,7 +70,7 @@ pub struct ThreadRegistry<E: ThreadEnvironment> { /* 固定容量槽、claim、s
 pub struct ThreadFactory<'r, E> { /* &Registry + 栈策略 */ }
 pub struct PreparedThread<'r, F, T, E> { /* Registry 槽、栈、packet、ResultCell、挂起 Control */ }
 pub struct Thread { control: Arc<ThreadControl> }
-pub struct JoinHandle<T> { cell: Arc<ResultCell<T>>, thread: Option<Thread> }
+pub struct ResultReceiver<T> { cell: Arc<ResultCell<T>>, thread: Option<Thread> }
 pub enum JoinOutcome<T> { Returned(T), Incomplete }
 
 impl<E> ThreadRegistry<E> {
@@ -80,13 +80,13 @@ impl<E> ThreadRegistry<E> {
 }
 ```
 
-`ResultCell` 状态 `Empty/Writing/Published/ReceiverGone` 与交错表见 task「结果发布」。record 字段：栈 `MappedRegion`、`Arc<ResidueCell<E::Residue>>`、环境 owner、`Arc<ThreadControl>`、packet cleanup；不含 F/T，无 vtable。槽以固定锁保护并用轮转游标公平认领，reap 只处理认领且 DONE 已观察的槽。PreparedThread 在 ThreadStart 前持有 packet/栈/Control；Start 失败返还 self，由 Drop 取消并收束未启动 packet。
+`ResultCell` 状态为 `Empty/Published/ReceiverGone`，不可复制的 producer 独占发布权，交错表见 task「结果发布」。record 只持栈 `MappedRegion`、环境 residue、`ThreadControl` 与 cleanup 进度，不含 F/T 或 packet cleanup。槽以固定锁保护并用轮转游标公平认领；`Prepared → Live` 由成功的 ThreadStart 发布，取消经 `Cancelling` 闭合最后 Control 后转 `Abandoned`；reap 只认领 Live/Abandoned，未 DONE 恢复 Live。
 
-libruntime：`_start` 入口 → StartupBlock 校验 → allocator → `ThreadRegistry` → `adopt_entry`（once）→ StartupContext → `entry!(app_main)` 生成的内部桥接；`Ok` → ThreadExit，`Err`/panic/OOM → 日志 + ProcessAbort。应用源码不直接依赖内部桥接符号。
+libruntime：`_start` 入口 → StartupBlock 校验 → allocator → affine StartupSeed → StartupContext 全表 Query/最后提交 → `ThreadRegistry` 入口线程登记 → rustc main(`0`, null)；`Ok` → ThreadExit，`Err`/panic/OOM → 日志 + ProcessAbort。应用通过一次性 startup context take 接收身份、payload 视图与 grants。
 
 ## 容量与预算
 
-Registry 容量是程序装配给出的并发线程上限，属于程序配置（由 runtime 入口宏参数或启动 payload 给出），不是库常量；槽存储在 Registry 建立时一次分配。每个 prepare 的栈、packet 与 ResultCell 走普通可失败分配，在 ThreadCreate 前完成；ThreadCreate 之后的路径不分配。ResultCell 的寿命独立于槽，按堆内存计。
+Registry 容量是程序装配给出的并发线程上限，属于程序配置，不是库常量；槽存储在 Registry 建立时一次分配。每个 prepare 的栈、packet 与 ResultCell 走普通可失败分配，在 ThreadCreate 前完成；ThreadCreate 之后的路径不分配。ResultCell 的寿命独立于槽，按堆内存计。满槽准入前以容量为预算扫描所有 Live/Abandoned 候选，未 DONE 的 Live 和 Busy 不阻塞后续可回收项。
 
 ## 交错与失败表
 
@@ -95,8 +95,8 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 | prepare 任一步失败 | 反向返还，未创建内核线程 |
 | ThreadCreate 成功、调用者放弃 PreparedThread | 关闭 Control → 内核离场并发 DONE；record 进入普通 reap；F 在放弃者线程 Drop |
 | ThreadStart 被拒（进程终止中） | 返还 PreparedThread，放弃路径同上 |
-| 子线程早于 JoinHandle 被构造即结束 | 无竞争：record 与 cell 在 Start 前已稳定 |
-| JoinHandle Drop 早于/晚于发布 | CAS 仲裁，T 恰一次在用户线程 Drop |
+| 子线程早于 ResultReceiver 被构造即结束 | 无竞争：record 与 cell 在 Start 前已稳定 |
+| ResultReceiver Drop 早于/晚于发布 | CAS 仲裁，T 恰一次在用户线程 Drop |
 | 延迟领取 | 槽已被 reap 回收，cell 仍可领取 |
 | raw ThreadExit 绕过 wrapper | DONE + Empty → Incomplete |
 | Unmap Busy | reap 返回 Wait，下次推进重试 |
@@ -121,19 +121,19 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 
 ## 消费者迁移与结果
 
-- `libruntime` 通过 `entry!(app_main)` 统一应用入口；`() / Ok(())` 走 ThreadExit，`Err`/panic/OOM 走 ProcessAbort，无数值退出码。
+- `libruntime` 通过 普通 `fn main()` 统一应用入口；`() / Ok(())` 走 ThreadExit，`Err`/panic/OOM 走 ProcessAbort，无数值退出码。
 - `libthread`、`libprocess`、服务、驱动和验收程序已迁移到 libkernel/libthread/libruntime 最终 owner；旧 safe exit、旧栈 abandoned 计数、`wait_and_release`、旧 code/reason 判定和旧 syscall 副本已删除。
 - `srv_init`、`test_hammer`、`test_target`、ELF audit 及全部真实消费者已按 `TerminationCause`、新 ThreadCreate/Start 和 StartupBlock descriptor 签名接通。
 
 ## 施工顺序与结果
 
-1. shared ABI、内核生命周期和 bootstrap：已完成。
-2. libkernel、libprocess context、libthread Registry/ResultCell/Prepared/trampoline：已完成。
-3. libruntime `_start`、gp、heap、`entry!`、panic/OOM 和终局收束：已完成。
-4. 全部消费者迁移、旧目录/入口/退出路径删除：已完成。
-5. `just check`、`just clippy`、host tests、两 target ELF 门和完整 acceptance：已完成。
+1. shared ABI、内核生命周期和 bootstrap：原轮记录为完成；本轮复核未发现需要改动其 ABI。
+2. libkernel、libprocess context、libthread Registry/ResultCell/Prepared/trampoline：本轮复核发现 ownership 与取消仲裁缺口，处置见 [runtime 分层复核](review-2026-09-28-runtime-layering.md)。
+3. libruntime 入口、heap、panic/OOM 和终局收束：本轮复核校正启动采用、入口 ABI 与 Unmap 失败 owner。
+4. 消费者迁移：本轮修订 SpawnRequest provenance 接口并检查真实消费者。
+5. 本轮完整验证尚未执行；不得沿用原轮验收通过作为当前复核证据。
 
-终局原因、ThreadCreate/ThreadStart/bootstrap/ProcessStart、ThreadRegistry/owner/libruntime 和消费者迁移均已完成；`just check`、`just clippy`、host tests、两 target ELF 门及完整 acceptance 均通过。
+原轮完成声明与验收结果只代表基线 66f4e9c 之前的证据，不构成本轮完成声明；第二轮责任链修复、结构检查和验证以 [runtime 分层复核](review-2026-09-28-runtime-layering.md) 为准。
 
 ## 验证门
 

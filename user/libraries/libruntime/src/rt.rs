@@ -6,20 +6,18 @@ use core::{alloc::Layout, panic::PanicInfo};
 use erhino_shared::mem::MemoryProtection;
 use erhino_shared::sync::spin::SimpleLock;
 use libkernel::{
-    dbg,
+    ThreadControl, dbg,
     mm::{MappedRegion, Placement},
-    startup as kernel_startup,
-    sys_process_abort, sys_thread_exit,
-    ThreadControl,
+    startup as kernel_startup, sys_process_abort, sys_thread_exit,
 };
 use libprocess::context::StartupContext;
 use libthread::{NoEnvironment, ResultReceiver, ThreadFactory, ThreadRegistry};
 use lock_api::Mutex;
-use talc::{base::binning::Binning, base::Talc, source::Source, TalcLock};
+use talc::{TalcLock, base::Talc, base::binning::Binning, source::Source};
 
 unsafe extern "C" {
     #[link_name = "main"]
-    fn rust_main() -> isize;
+    fn rust_main(argc: isize, argv: *const *const u8) -> isize;
 }
 
 trait MainOutcome {
@@ -75,8 +73,14 @@ fn registry() -> &'static ThreadRegistry<NoEnvironment> {
     registry
 }
 
-fn adopt_entry_thread() {
-    let mut context = unsafe { StartupContext::adopt() }.expect("startup grant adoption failed");
+fn adopt_entry_thread(seed: libprocess::context::StartupSeed) {
+    let mut context = match StartupContext::adopt(seed) {
+        Ok(context) => context,
+        Err((_, error)) => {
+            dbg::debug(format_args!("startup grant adoption failed: {:?}", error));
+            unsafe { sys_process_abort() }
+        }
+    };
     let descriptor = context.entry();
     let control = context
         .take_handle(descriptor.control_index as usize)
@@ -98,7 +102,7 @@ fn adopt_entry_thread() {
 }
 
 pub mod thread {
-    use super::{registry, NoEnvironment, ResultReceiver, ThreadFactory};
+    use super::{NoEnvironment, ResultReceiver, ThreadFactory, registry};
     use erhino_shared::call::SystemCallError;
     pub use libthread::yield_now;
 
@@ -118,7 +122,10 @@ pub mod thread {
             self
         }
 
-        pub fn spawn<F, T>(self, function: F) -> Result<ResultReceiver<T, NoEnvironment>, SystemCallError>
+        pub fn spawn<F, T>(
+            self,
+            function: F,
+        ) -> Result<ResultReceiver<T, NoEnvironment>, SystemCallError>
         where
             F: FnOnce() -> T + Send + 'static,
             T: Send + 'static,
@@ -177,20 +184,26 @@ unsafe impl Source for HeapSource {
             Placement::Anywhere,
         )
         .map_err(|_| ())?;
-        let usable = region.usable().ok_or(())?;
         let slot = talc.source.arena_count;
         talc.source.arenas[slot] = Some(region);
+        let usable = talc.source.arenas[slot]
+            .as_ref()
+            .and_then(MappedRegion::usable)
+            .ok_or(())?;
         // SAFETY: this is a fresh, exclusively owned mapping.
         if unsafe { talc.claim(usable.start as *mut u8, usable.end - usable.start) }.is_none() {
             let region = talc.source.arenas[slot]
                 .take()
                 .expect("heap arena token disappeared before claim");
-            let _ = region.unmap();
+            if let Err((region, _error)) = region.unmap() {
+                // Startup failure aborts the process; retain the mapping owner
+                // for ProcessDrain instead of discarding a rejected Unmap.
+                talc.source.arenas[slot] = Some(region);
+            }
             return Err(());
         }
         talc.source.arena_count += 1;
-        talc.source.next_arena_bytes =
-            arena_bytes.saturating_mul(2).min(MAX_GEOMETRIC_ARENA_BYTES);
+        talc.source.next_arena_bytes = arena_bytes.saturating_mul(2).min(MAX_GEOMETRIC_ARENA_BYTES);
         Ok(())
     }
 }
@@ -211,11 +224,12 @@ pub unsafe extern "C" fn _start(_: *const u8, _: usize) -> ! {
     )
 }
 
-#[unsafe(no_mangle)]
 unsafe extern "C" fn __libruntime_start(block: *const u8, block_len: usize) -> ! {
     // SAFETY: the platform launcher places a stable, read-only StartupBlock
     // at the a0/a1 pair consumed by the runtime entry.
-    unsafe { kernel_startup::init(block, block_len) };
+    let seed = unsafe { kernel_startup::init(block, block_len) };
+    // SAFETY: only this platform bridge receives the affine entry input.
+    let seed = unsafe { libprocess::context::StartupSeed::from_input(seed) };
     {
         let mut talc = HEAP_ALLOCATOR.lock();
         <HeapSource as Source>::acquire(
@@ -225,11 +239,11 @@ unsafe extern "C" fn __libruntime_start(block: *const u8, block_len: usize) -> !
         )
         .expect("initial heap arena allocation failed");
     }
-    adopt_entry_thread();
+    adopt_entry_thread(seed);
     // SAFETY: rustc emits the binary `main` shim. It calls the lang item
     // below, which never returns after MainOutcome::finish.
     unsafe {
-        rust_main();
+        rust_main(0, core::ptr::null());
         sys_process_abort()
     }
 }

@@ -22,6 +22,7 @@
 
 extern crate libruntime;
 
+use erhino_shared::sync::spin::SimpleLock;
 use libbudget::Budget;
 use libexecution::{
     ExecutionResource,
@@ -41,18 +42,6 @@ use libfs::{
     client::Transport as FalTransport,
     prefix::{DirectoryGrant, PrefixTable},
 };
-use libprocess::{
-    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, RequiredLaunchSet,
-    SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
-    SupervisionStage, SupervisionTarget, collect_process, enumerate_members, spawn,
-};
-use libthread::ThreadOutcome;
-use librpc::{
-    CallCause, CallError, CallPhase, Caller, FrameRejection, Outbox, OutboxResult, Request,
-    RequestContext, RpcMessageKind, RpcPrefix,
-};
-use librunnel::{ConsumerReady, blocking};
-use libservice::{client as service_client, protocol as service_protocol, record::ServiceRecord};
 use libkernel::ipc::tunnel as tunnel_sys;
 use libkernel::ipc::wait_set::WaitSet;
 use libkernel::ipc::{
@@ -61,6 +50,7 @@ use libkernel::ipc::{
     packet::Packet,
 };
 use libkernel::memory_pool::MemoryPool;
+use libkernel::shared::proc::Pid;
 #[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
 use libkernel::shared::proc::ProcessDrainStatus;
 use libkernel::time::Deadline;
@@ -81,17 +71,26 @@ use libkernel::{
         memory_object::MemoryObjectState,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
-        proc::{
-            HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
-        },
+        proc::{HandleGrant, JobMemberKind, JobState, ProcessState, TerminationCause},
         reset::{ResetAction, ResetReason},
         startup::initial,
         wait::{WaitItem, WaitReason},
     },
     system,
 };
-use libkernel::shared::proc::Pid;
-use erhino_shared::sync::spin::SimpleLock;
+use libprocess::{
+    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, RequiredLaunchSet,
+    SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
+    SupervisionStage, SupervisionTarget, collect_process, context::StartupContext,
+    enumerate_members, spawn,
+};
+use librpc::{
+    CallCause, CallError, CallPhase, Caller, FrameRejection, Outbox, OutboxResult, Request,
+    RequestContext, RpcMessageKind, RpcPrefix,
+};
+use librunnel::{ConsumerReady, blocking};
+use libservice::{client as service_client, protocol as service_protocol, record::ServiceRecord};
+use libthread::ThreadOutcome;
 use lock_api::Mutex;
 
 mod supervisor;
@@ -123,34 +122,60 @@ struct LaunchedServices {
     fs_release_second_owner: Handle,
     fs_route_second_owner: Handle,
     fs_second_scope: Handle,
-    fs_second_image: &'static [u8],
-    test_fal_image: &'static [u8],
-    target_image: Option<&'static [u8]>,
-    hammer_image: Option<&'static [u8]>,
+    fs_second_image: StartupImage,
+    test_fal_image: StartupImage,
+    target_image: Option<StartupImage>,
+    hammer_image: Option<StartupImage>,
 }
 
 struct InitStartup {
-    pid: Pid,
-    payload: &'static [u8],
+    context: StartupContext,
     root_memory_pool: Handle,
 }
 
-static INIT_STARTUP: Mutex<SimpleLock, Option<InitStartup>> = Mutex::const_new(SimpleLock::new(), None);
+#[derive(Clone, Copy)]
+struct StartupImage {
+    ptr: *const u8,
+    len: usize,
+}
+
+unsafe impl Send for StartupImage {}
+unsafe impl Sync for StartupImage {}
+
+impl StartupImage {
+    fn from_slice(bytes: &[u8]) -> Self {
+        Self {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the image points into the process-lifetime startup payload.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+static INIT_STARTUP: Mutex<SimpleLock, Option<InitStartup>> =
+    Mutex::const_new(SimpleLock::new(), None);
 
 fn init_pid() -> Pid {
     INIT_STARTUP
         .lock()
         .as_ref()
         .expect("init startup inputs are not initialized")
-        .pid
+        .context
+        .pid()
 }
 
-fn init_payload() -> &'static [u8] {
-    INIT_STARTUP
-        .lock()
+fn with_init_payload<R>(f: impl FnOnce(&[u8]) -> R) -> R {
+    let guard = INIT_STARTUP.lock();
+    let startup = guard
         .as_ref()
-        .expect("init startup inputs are not initialized")
-        .payload
+        .expect("init startup inputs are not initialized");
+    let payload = StartupImage::from_slice(startup.context.payload());
+    drop(guard);
+    f(payload.as_slice())
 }
 
 enum RunFailure {
@@ -375,210 +400,214 @@ fn launch_test_services(
     let mut manifest = RequiredLaunchSet::new(REQUIRED_IMAGES, REQUIRED_STARTED);
     let mut stage_failure = None;
     // 按需启动的验收进程直接借用启动包的只读映像，避免复制 ELF 到 init 堆。
-    let mut target_image: Option<&'static [u8]> = None;
-    let mut hammer_image: Option<&'static [u8]> = None;
-    let mut test_fal_image: Option<&'static [u8]> = None;
-    let mut fs_second_image: Option<&'static [u8]> = None;
+    let mut target_image: Option<StartupImage> = None;
+    let mut hammer_image: Option<StartupImage> = None;
+    let mut test_fal_image: Option<StartupImage> = None;
+    let mut fs_second_image: Option<StartupImage> = None;
     let mut fs_second_scope = None;
     let mut primary_provider = None;
     let mut registry_root_watch = None;
-    let result = tar::walk(init_payload(), |entry| {
-        if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
-            return;
-        }
-        if entry.name == "bin/test_hammer" {
-            // 竞态锤不是常驻服务：只留存映像，由剧本按需 spawn。
-            hammer_image = Some(entry.data);
-            return;
-        }
-        let required = required_image(entry.name);
-        if let Some(bit) = required {
-            manifest.mark_present(bit);
-        } else if entry.name != "bin/test_fp" {
-            debug!("optional initfs image ignored: {}", entry.name);
-            return;
-        }
-        if stage_failure.is_some() {
-            return;
-        }
-        if entry.name == "bin/test_fal" {
-            test_fal_image = Some(entry.data);
-            return;
-        }
-        let pm_grants = [
-            HandleGrant {
-                handle: pm_mailbox.owner,
-                rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-            },
-            HandleGrant {
-                handle: delegated_domain,
-                rights: DELEGATED_DOMAIN_RIGHTS,
-            },
-        ];
-        let fs_grants = [
-            HandleGrant {
-                handle: fs_bootstrap.peer,
-                rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-            },
-            HandleGrant {
-                handle: fs_release.owner,
-                rights: Rights::READ | Rights::WAIT,
-            },
-            HandleGrant {
-                handle: fs_route.owner,
-                rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
-            },
-            HandleGrant {
-                handle: fs_registration,
-                rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
-            },
-        ];
-        // test_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
-        let (job, grants): (Handle, &[HandleGrant]) = if entry.name == "bin/test_target" {
-            (acceptance, &[])
-        } else if entry.name == "bin/srv_pm" {
-            (services, pm_grants.as_slice())
-        } else if entry.name == "bin/srv_fs" {
-            (services, fs_grants.as_slice())
-        } else {
-            (services, &[])
-        };
-        if root.reserve_process().is_err() {
-            stage_failure = Some("process supervision admission failed");
-            return;
-        }
-        let spawned = spawn(SpawnRequest {
-            memory_pool: root_memory_pool(),
-            job,
-            image: entry.data,
-            payload: &[],
-            grants,
-            control_rights,
-        });
-        if entry.name == "bin/srv_pm"
-            && (spawned.is_ok()
-                || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
-        {
-            root.transferred(pm_mailbox.owner);
-            root.transferred(delegated_domain);
-        }
-        if entry.name == "bin/srv_fs"
-            && (spawned.is_ok()
-                || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
-        {
-            root.transferred(fs_bootstrap.peer);
-            root.transferred(fs_release.owner);
-            root.transferred(fs_route.owner);
-            root.transferred(fs_registration);
-        }
-        match spawned {
-            Ok(process) => {
-                if let Some(bit) = required {
-                    manifest.mark_started(bit);
-                }
-                debug!("started {} as pid {}", entry.name, process.pid);
-                names.register_process(process.pid, entry.name);
-                // 持久 init 保留 control：监督、等待与收束的 authority 源。
-                if entry.name == "bin/test_target" {
-                    target_image = Some(entry.data);
-                    // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
-                    // acceptance Job 枚举可见 test_target 的 pid，派生 MANAGE
-                    // control 后 kill——保留 control 在派生接管后关闭。
-                    if let Err(error) =
-                        test_derive_kill(root, acceptance, process.pid, process.control)
-                    {
-                        stage_failure = Some(error);
-                        return;
+    let result = with_init_payload(|payload| {
+        tar::walk(payload, |entry| {
+            if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
+                return;
+            }
+            if entry.name == "bin/test_hammer" {
+                // 竞态锤不是常驻服务：只留存映像，由剧本按需 spawn。
+                hammer_image = Some(StartupImage::from_slice(entry.data));
+                return;
+            }
+            let required = required_image(entry.name);
+            if let Some(bit) = required {
+                manifest.mark_present(bit);
+            } else if entry.name != "bin/test_fp" {
+                debug!("optional initfs image ignored: {}", entry.name);
+                return;
+            }
+            if stage_failure.is_some() {
+                return;
+            }
+            if entry.name == "bin/test_fal" {
+                test_fal_image = Some(StartupImage::from_slice(entry.data));
+                return;
+            }
+            let pm_grants = [
+                HandleGrant {
+                    handle: pm_mailbox.owner,
+                    rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+                },
+                HandleGrant {
+                    handle: delegated_domain,
+                    rights: DELEGATED_DOMAIN_RIGHTS,
+                },
+            ];
+            let fs_grants = [
+                HandleGrant {
+                    handle: fs_bootstrap.peer,
+                    rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                },
+                HandleGrant {
+                    handle: fs_release.owner,
+                    rights: Rights::READ | Rights::WAIT,
+                },
+                HandleGrant {
+                    handle: fs_route.owner,
+                    rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
+                },
+                HandleGrant {
+                    handle: fs_registration,
+                    rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
+                },
+            ];
+            // test_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
+            let (job, grants): (Handle, &[HandleGrant]) = if entry.name == "bin/test_target" {
+                (acceptance, &[])
+            } else if entry.name == "bin/srv_pm" {
+                (services, pm_grants.as_slice())
+            } else if entry.name == "bin/srv_fs" {
+                (services, fs_grants.as_slice())
+            } else {
+                (services, &[])
+            };
+            if root.reserve_process().is_err() {
+                stage_failure = Some("process supervision admission failed");
+                return;
+            }
+            let spawned = spawn(SpawnRequest {
+                memory_pool: root_memory_pool(),
+                parent_pid: init_pid(),
+                job,
+                image: entry.data,
+                payload: &[],
+                grants,
+                control_rights,
+            });
+            if entry.name == "bin/srv_pm"
+                && (spawned.is_ok()
+                    || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
+            {
+                root.transferred(pm_mailbox.owner);
+                root.transferred(delegated_domain);
+            }
+            if entry.name == "bin/srv_fs"
+                && (spawned.is_ok()
+                    || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
+            {
+                root.transferred(fs_bootstrap.peer);
+                root.transferred(fs_release.owner);
+                root.transferred(fs_route.owner);
+                root.transferred(fs_registration);
+            }
+            match spawned {
+                Ok(process) => {
+                    if let Some(bit) = required {
+                        manifest.mark_started(bit);
                     }
-                    // 委托域靶：control 即弃（关闭 control 永不隐式终止），
-                    // pm 的派生因此走铸造路径，域内收束权归 pm。
-                    match spawn(SpawnRequest {
-                        memory_pool: root_memory_pool(),
-                        job: pm_domain,
-                        image: entry.data,
-                        payload: &[],
-                        grants: &[],
-                        control_rights,
-                    }) {
-                        Ok(second) => {
-                            manifest.mark_started(REQUIRED_PM_TARGET);
-                            debug!("pm domain target started as pid {}", second.pid);
-                            names.register_process(second.pid, "bin/test_target@pm_domain");
-                            let _ = unsafe { close(second.control) };
-                        }
-                        Err(error) => {
-                            debug!("required pm-domain target spawn failed: {:?}", error);
-                            stage_failure = Some("required pm-domain target spawn failed");
-                        }
-                    }
-                } else if entry.name == "bin/srv_fs" {
-                    root.track_process(Supervised {
-                        pid: process.pid,
-                        control: process.control,
-                    });
-                    let prepared = (|| -> Result<_, &'static str> {
-                        let primary = accept_fs_provider(
-                            fs_bootstrap.owner,
-                            fs_release.peer,
-                            fs_route.peer,
-                            true,
-                        )?;
-                        if primary.pid != process.pid {
-                            return Err("primary provider bootstrap sender mismatch");
-                        }
-                        let directory = primary
-                            .directory
-                            .as_ref()
-                            .ok_or("primary provider omitted service directory")?;
-                        let deadline = libkernel::time::timeout_millis(10_000)
-                            .map_err(|_| "registration bootstrap deadline invalid")?;
-                        let watch = FalClient::new()
-                            .subscribe(
-                                directory,
-                                "",
-                                protocol::WatchMask::CREATE | protocol::WatchMask::DELETE,
-                                deadline,
-                            )
-                            .map_err(|_| "service directory root subscription failed")?;
-                        let authority = primary
-                            .registration_root
-                            .as_ref()
-                            .ok_or("primary provider omitted registration authority")?;
-                        let scoped =
-                            service_client::delegate_name(authority, "fs.secondary", deadline)
-                                .map_err(|_| "fs name authority delegation failed")?;
-                        let scope_handle = root
-                            .own_sender(scoped)
-                            .map_err(|_| "fs name authority ownership admission failed")?;
-                        Ok((primary, watch, scope_handle))
-                    })();
-                    let (primary, watch, scope_handle) = match prepared {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
+                    debug!("started {} as pid {}", entry.name, process.pid);
+                    names.register_process(process.pid, entry.name);
+                    // 持久 init 保留 control：监督、等待与收束的 authority 源。
+                    if entry.name == "bin/test_target" {
+                        target_image = Some(StartupImage::from_slice(entry.data));
+                        // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
+                        // acceptance Job 枚举可见 test_target 的 pid，派生 MANAGE
+                        // control 后 kill——保留 control 在派生接管后关闭。
+                        if let Err(error) =
+                            test_derive_kill(root, acceptance, process.pid, process.control)
+                        {
                             stage_failure = Some(error);
                             return;
                         }
-                    };
-                    primary_provider = Some(primary);
-                    registry_root_watch = Some(watch);
-                    fs_second_scope = Some(scope_handle);
-                    fs_second_image = Some(entry.data);
-                } else {
-                    root.track_process(Supervised {
-                        pid: process.pid,
-                        control: process.control,
-                    });
+                        // 委托域靶：control 即弃（关闭 control 永不隐式终止），
+                        // pm 的派生因此走铸造路径，域内收束权归 pm。
+                        match spawn(SpawnRequest {
+                            memory_pool: root_memory_pool(),
+                            parent_pid: init_pid(),
+                            job: pm_domain,
+                            image: entry.data,
+                            payload: &[],
+                            grants: &[],
+                            control_rights,
+                        }) {
+                            Ok(second) => {
+                                manifest.mark_started(REQUIRED_PM_TARGET);
+                                debug!("pm domain target started as pid {}", second.pid);
+                                names.register_process(second.pid, "bin/test_target@pm_domain");
+                                let _ = unsafe { close(second.control) };
+                            }
+                            Err(error) => {
+                                debug!("required pm-domain target spawn failed: {:?}", error);
+                                stage_failure = Some("required pm-domain target spawn failed");
+                            }
+                        }
+                    } else if entry.name == "bin/srv_fs" {
+                        root.track_process(Supervised {
+                            pid: process.pid,
+                            control: process.control,
+                        });
+                        let prepared = (|| -> Result<_, &'static str> {
+                            let primary = accept_fs_provider(
+                                fs_bootstrap.owner,
+                                fs_release.peer,
+                                fs_route.peer,
+                                true,
+                            )?;
+                            if primary.pid != process.pid {
+                                return Err("primary provider bootstrap sender mismatch");
+                            }
+                            let directory = primary
+                                .directory
+                                .as_ref()
+                                .ok_or("primary provider omitted service directory")?;
+                            let deadline = libkernel::time::timeout_millis(10_000)
+                                .map_err(|_| "registration bootstrap deadline invalid")?;
+                            let watch = FalClient::new()
+                                .subscribe(
+                                    directory,
+                                    "",
+                                    protocol::WatchMask::CREATE | protocol::WatchMask::DELETE,
+                                    deadline,
+                                )
+                                .map_err(|_| "service directory root subscription failed")?;
+                            let authority = primary
+                                .registration_root
+                                .as_ref()
+                                .ok_or("primary provider omitted registration authority")?;
+                            let scoped =
+                                service_client::delegate_name(authority, "fs.secondary", deadline)
+                                    .map_err(|_| "fs name authority delegation failed")?;
+                            let scope_handle = root
+                                .own_sender(scoped)
+                                .map_err(|_| "fs name authority ownership admission failed")?;
+                            Ok((primary, watch, scope_handle))
+                        })();
+                        let (primary, watch, scope_handle) = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                stage_failure = Some(error);
+                                return;
+                            }
+                        };
+                        primary_provider = Some(primary);
+                        registry_root_watch = Some(watch);
+                        fs_second_scope = Some(scope_handle);
+                        fs_second_image = Some(StartupImage::from_slice(entry.data));
+                    } else {
+                        root.track_process(Supervised {
+                            pid: process.pid,
+                            control: process.control,
+                        });
+                    }
+                }
+                Err(error) => {
+                    if required.is_some() {
+                        debug!("required service {} spawn failed: {:?}", entry.name, error);
+                        stage_failure = Some("required service spawn failed");
+                    } else {
+                        debug!("optional service {} degraded: {:?}", entry.name, error);
+                    }
                 }
             }
-            Err(error) => {
-                if required.is_some() {
-                    debug!("required service {} spawn failed: {:?}", entry.name, error);
-                    stage_failure = Some("required service spawn failed");
-                } else {
-                    debug!("optional service {} degraded: {:?}", entry.name, error);
-                }
-            }
-        }
+        })
     });
     if let Err(error) = result {
         debug!("required initfs parse failed: {:?}", error);
@@ -635,7 +664,7 @@ fn launch_secondary_fs(
     root: &mut RootSupervisor,
     services: Handle,
     names: &mut TopologyNames,
-    image: &'static [u8],
+    image: &[u8],
     grants: [Handle; 4],
 ) -> Result<(), &'static str> {
     let [bootstrap, release, route, scope] = grants;
@@ -661,6 +690,7 @@ fn launch_secondary_fs(
         .map_err(|_| "second fs supervision admission failed")?;
     let spawned = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
+        parent_pid: init_pid(),
         job: services,
         image,
         payload: &[],
@@ -782,7 +812,7 @@ fn launch_fal_consumer(
     root: &mut RootSupervisor,
     services: Handle,
     names: &mut TopologyNames,
-    image: &'static [u8],
+    image: &[u8],
     primary: &AcceptedFsProvider,
 ) -> Result<FalConsumerCoordinator, &'static str> {
     let root_grant = primary
@@ -843,6 +873,7 @@ fn launch_fal_consumer(
     ];
     let spawned = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
+        parent_pid: init_pid(),
         job: services,
         image,
         payload: &[],
@@ -1332,8 +1363,8 @@ fn exercise_open_streams(
 }
 
 fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static str> {
-    let deadline =
-        libkernel::time::timeout_millis(5_000).map_err(|_| "FAL2 cancellable RPC deadline failed")?;
+    let deadline = libkernel::time::timeout_millis(5_000)
+        .map_err(|_| "FAL2 cancellable RPC deadline failed")?;
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
         Rights::SIGNAL | Rights::TRANSIT,
@@ -1754,7 +1785,9 @@ fn stage_abandoned_reply(
         ) {
             Ok(reply) => break reply,
             Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {
-                if libkernel::time::expired(deadline).map_err(|_| "FAL2 commit probe clock failed")? {
+                if libkernel::time::expired(deadline)
+                    .map_err(|_| "FAL2 commit probe clock failed")?
+                {
                     return Err("FAL2 abandoned request did not commit");
                 }
             }
@@ -2915,7 +2948,8 @@ fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'sta
             }
             if let Err(error) = process::map(
                 created.builder,
-                libkernel::shared::proc::PROCESS_USER_TOP - libkernel::shared::proc::PROCESS_PAGE_SIZE,
+                libkernel::shared::proc::PROCESS_USER_TOP
+                    - libkernel::shared::proc::PROCESS_PAGE_SIZE,
                 libkernel::shared::proc::PROCESS_PAGE_SIZE,
                 libkernel::shared::proc::ProcessMapFlags::READ
                     | libkernel::shared::proc::ProcessMapFlags::WRITE,
@@ -2970,9 +3004,7 @@ fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) ->
             value,
             leave: Ok(()),
         } => value,
-        ThreadOutcome::Returned {
-            leave: Err(()), ..
-        }
+        ThreadOutcome::Returned { leave: Err(()), .. }
         | ThreadOutcome::EnterFailed(())
         | ThreadOutcome::Incomplete => panic!("runtime worker did not complete"),
     }
@@ -2991,10 +3023,9 @@ fn main() {
         .take_handle(initial::ROOT_MEMORY_POOL)
         .expect("init must hold root MemoryPool authority");
     *INIT_STARTUP.lock() = Some(InitStartup {
-            pid: startup.pid(),
-            payload: startup.payload(),
-            root_memory_pool,
-        });
+        context: startup,
+        root_memory_pool,
+    });
     let mut reset = Some(reset_handle);
     // 尚无服务责任时准备根承载；失败不会遗忘已启动服务。
     let mut root = loop {
@@ -3390,9 +3421,10 @@ fn test_rpc_reject_cleanup() {
                 let context = RequestContext::decode(request, PROTOCOL)
                     .map_err(|rejected| rejected.reason)
                     .expect("RPC test request context invalid");
-                let mut outbox = Outbox::prepare(context, 1, libkernel::time::Deadline::INFINITE, 1)
-                    .map_err(|failure| failure.error)
-                    .expect("RPC test Outbox preparation failed");
+                let mut outbox =
+                    Outbox::prepare(context, 1, libkernel::time::Deadline::INFINITE, 1)
+                        .map_err(|failure| failure.error)
+                        .expect("RPC test Outbox preparation failed");
                 outbox
                     .response_mut()
                     .expect("RPC test response remains owned")
@@ -3568,7 +3600,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         root,
         services,
         &mut names,
-        launched.test_fal_image,
+        launched.test_fal_image.as_slice(),
         &first_fs,
     )?;
     consumer.await_report(test_fal::report::DISCOVERY_ARMED)?;
@@ -3576,7 +3608,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         root,
         services,
         &mut names,
-        launched.fs_second_image,
+        launched.fs_second_image.as_slice(),
         [
             launched.fs_bootstrap_second_sender,
             launched.fs_release_second_owner,
@@ -3685,8 +3717,9 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     )?;
     consumer.continue_business()?;
     consumer.await_report(test_fal::report::COPY_ARMED)?;
-    notification::signal(second_fs.release, 1)
-        .map_err(|_| RunFailure::Message("secondary provider in-flight Copy release signal failed"))?;
+    notification::signal(second_fs.release, 1).map_err(|_| {
+        RunFailure::Message("secondary provider in-flight Copy release signal failed")
+    })?;
     consumer.await_report(test_fal::report::COMPLETE)?;
     let mut transport = FalTransport::new(libkernel::time::Deadline::INFINITE);
     let first_stream = libfs::resolve::resolve(
@@ -3898,7 +3931,10 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     test_writable_level();
     public_ipc::threaded_receive();
     time_checks::run();
-    public_ipc::committed_kill(acceptance, target_image.expect("IPC target image missing"));
+    public_ipc::committed_kill(
+        acceptance,
+        target_image.expect("IPC target image missing").as_slice(),
+    );
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
     let (tunnel, invitation) =
@@ -3988,7 +4024,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         Some(image) => {
             #[cfg(feature = "capacity-calibration")]
             test_bound_address_space_mixed(acceptance, image)?;
-            test_job_management(root, acceptance, image)?
+            test_job_management(root, acceptance, image.as_slice())?
         }
         None => {
             return Err(RunFailure::Message(
@@ -4010,7 +4046,9 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     // Building kill、Job 管理与服务监督收束。
     #[cfg(feature = "acceptance-stress")]
     match (target_image, hammer_image) {
-        (Some(target), Some(hammer)) => race_matrix(root, acceptance, target, hammer)?,
+        (Some(target), Some(hammer)) => {
+            race_matrix(root, acceptance, target.as_slice(), hammer.as_slice())?
+        }
         _ => {
             return Err(RunFailure::Message(
                 "race matrix acceptance images unavailable",
@@ -4490,7 +4528,8 @@ fn test_building_kill(job: Handle) {
         (Ok(_), Ok(snapshot))
             if snapshot.state == ProcessState::Dead as u32
                 && snapshot.cause == TerminationCause::Killed as u32
-                && snapshot.detail == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
+                && snapshot.detail
+                    == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
         {
             debug!(
                 "building kill passed: pid {} Dead/Killed/{:#x}",
@@ -4646,6 +4685,7 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
     let result = (|| {
         let started = spawn(SpawnRequest {
             memory_pool: root_memory_pool(),
+            parent_pid: init_pid(),
             job,
             image,
             payload: b"retirement",
@@ -4778,7 +4818,8 @@ fn test_derive_fallback(job: Handle) {
                 (Ok(_), Ok(snapshot))
                     if snapshot.state == ProcessState::Dead as u32
                         && snapshot.cause == TerminationCause::Killed as u32
-                        && snapshot.detail == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
+                        && snapshot.detail
+                            == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
                 {
                     debug!(
                         "derive fallback passed: pid {} minted control drained to Dead/Killed/{:#x}",
@@ -4816,6 +4857,7 @@ fn test_job_kill_composition(
     };
     let running = spawn(SpawnRequest {
         memory_pool: root_memory_pool(),
+        parent_pid: init_pid(),
         job: child,
         image,
         payload: &[],

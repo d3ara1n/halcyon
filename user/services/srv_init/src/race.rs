@@ -11,11 +11,6 @@ use core::sync::atomic::Ordering;
 use crate::{
     JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
 };
-use libprocess::{
-    DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned,
-    race::{self, Cmd, Report},
-    spawn,
-};
 use libkernel::ipc::message::{create, send_raw, wait_message};
 use libkernel::ipc::notification;
 use libkernel::ipc::object::{close, duplicate};
@@ -27,10 +22,15 @@ use libkernel::shared::call::SystemCallError;
 use libkernel::shared::message::HandleMove;
 use libkernel::shared::object::{Handle, ObjectSignals, Rights};
 use libkernel::shared::proc::{
-    HandleGrant, JobMemberKind, JobState, TerminationCause, ProcessState,
+    HandleGrant, JobMemberKind, JobState, ProcessState, TerminationCause,
 };
 use libkernel::shared::wait::WaitItem;
 use libkernel::sys_sleep;
+use libprocess::{
+    DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned,
+    race::{self, Cmd, Report},
+    spawn,
+};
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
 /// 分箱，天然归属，无需锤标识）。
@@ -81,6 +81,7 @@ impl RaceHammers {
             let spawned = spawn(SpawnRequest {
                 job,
                 memory_pool: crate::root_memory_pool(),
+                parent_pid: crate::init_pid(),
                 image,
                 payload: &payload,
                 grants: &grants,
@@ -191,6 +192,7 @@ fn spawn_race_target(
     let spawned = spawn(SpawnRequest {
         job,
         memory_pool: crate::root_memory_pool(),
+        parent_pid: crate::init_pid(),
         image,
         payload: &payload,
         grants: &grants,
@@ -221,6 +223,7 @@ fn spawn_tunnel_exit_target(
     match spawn(SpawnRequest {
         job,
         memory_pool: crate::root_memory_pool(),
+        parent_pid: crate::init_pid(),
         image,
         payload: &payload,
         grants: &grants,
@@ -260,10 +263,7 @@ fn drain_expect_dead(control: Handle, allowed: &[u32]) -> Option<u32> {
             return Some(snapshot.cause);
         }
     }
-    debug!(
-        "race: terminal cause {} not in allowed set",
-        snapshot.cause
-    );
+    debug!("race: terminal cause {} not in allowed set", snapshot.cause);
     None
 }
 
@@ -357,9 +357,8 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
                 break;
             }
         };
-        let kills_ok = rep_a.status == 0
-            && rep_b.status == 0
-            && (rep_a.aux0 == 0) != (rep_b.aux0 == 0);
+        let kills_ok =
+            rep_a.status == 0 && rep_b.status == 0 && (rep_a.aux0 == 0) != (rep_b.aux0 == 0);
         let allowed = [
             TerminationCause::Killed as u32,
             TerminationCause::Killed as u32,
@@ -398,14 +397,13 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let (target, gun) =
-            match spawn_race_target(job, image, race::TARGET_SUICIDE, 0) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    debug!("race kill-vs-exit: target spawn failed: {:?}", error);
-                    return false;
-                }
-            };
+        let (target, gun) = match spawn_race_target(job, image, race::TARGET_SUICIDE, 0) {
+            Ok(pair) => pair,
+            Err(error) => {
+                debug!("race kill-vs-exit: target spawn failed: {:?}", error);
+                return false;
+            }
+        };
         let moves = [HandleMove {
             handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
                 .unwrap_or(Handle::INVALID),
@@ -480,10 +478,7 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
         let report = h.report(0).map(|(report, _)| report);
-        let terminal = drain_expect_dead(
-            target.control,
-            &[TerminationCause::Killed as u32],
-        );
+        let terminal = drain_expect_dead(target.control, &[TerminationCause::Killed as u32]);
         if !sent || !matches!(report, Some(report) if report.status == 0) || terminal.is_none() {
             debug!(
                 "race spawn-vs-kill: round {} sent={} report={:?}",
@@ -520,11 +515,8 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
     // 目标主线程先退出，次线程在枪上等待；发枪后终因确定为 Completed。
     unsafe { sys_sleep(30).expect("last-thread exit-first setup sleep failed") };
     let exit_signal = notification::signal(exit_gun, 1).is_ok();
-    let exited = drain_expect_dead(
-        exit_target.control,
-        &[TerminationCause::Completed as u32],
-    )
-    .is_some();
+    let exited =
+        drain_expect_dead(exit_target.control, &[TerminationCause::Completed as u32]).is_some();
     let _ = unsafe { close(exit_target.control) };
     let _ = unsafe { close(exit_gun) };
 
@@ -550,11 +542,7 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
         }],
     );
     let killed = matches!(report, Some((report, _)) if report.status == 0)
-        && drain_expect_dead(
-            kill_target.control,
-            &[TerminationCause::Killed as u32],
-        )
-        .is_some();
+        && drain_expect_dead(kill_target.control, &[TerminationCause::Killed as u32]).is_some();
     let _ = unsafe { close(kill_target.control) };
     let _ = unsafe { close(kill_gun) };
 
@@ -574,21 +562,17 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
     let mut ok = cover_last_thread_exit_kill_outcomes(h, job, image);
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let (target, gun) = match spawn_race_target(
-            job,
-            image,
-            race::TARGET_LAST_THREAD_EXIT_RACE,
-            0,
-        ) {
-            Ok(pair) => pair,
-            Err(error) => {
-                debug!(
-                    "race last-thread-exit-vs-kill: target spawn failed: {:?}",
-                    error
-                );
-                return false;
-            }
-        };
+        let (target, gun) =
+            match spawn_race_target(job, image, race::TARGET_LAST_THREAD_EXIT_RACE, 0) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    debug!(
+                        "race last-thread-exit-vs-kill: target spawn failed: {:?}",
+                        error
+                    );
+                    return false;
+                }
+            };
         // 让目标主线程完成 raw spawn 并先行 ThreadExit，确保竞速者是末线程。
         // SAFETY: 值参数；只用于建立目标角色的前置状态。
         let _ = unsafe { sys_sleep(30) };
@@ -971,10 +955,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
             let _ = shared.load_u32(12, Ordering::Relaxed);
         }
         let _ = notification::signal(gun, 1);
-        let terminal = drain_expect_dead(
-            target.control,
-            &[TerminationCause::Completed as u32],
-        );
+        let terminal = drain_expect_dead(target.control, &[TerminationCause::Completed as u32]);
         let peer_closed = endpoint
             .events()
             .wait(ObjectSignals::PEER_CLOSED, 0)
@@ -1032,11 +1013,7 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
             rights: Rights::MANAGE,
         }];
         let sent = h.send_cmd(0, &close_cmd, &close_moves)
-            && h.send_cmd(
-                1,
-                &race_cmd(race::ACTION_KILL, 0),
-                &kill_moves,
-            );
+            && h.send_cmd(1, &race_cmd(race::ACTION_KILL, 0), &kill_moves);
         h.fire(&[0, 1]);
         let (rep_close, _) = h.report(0).unwrap_or((
             Report {
@@ -1342,6 +1319,7 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let target = match spawn(SpawnRequest {
             job,
             memory_pool: crate::root_memory_pool(),
+            parent_pid: crate::init_pid(),
             image,
             payload: &[],
             grants: &[],
@@ -1428,6 +1406,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let target = match spawn(SpawnRequest {
             job,
             memory_pool: crate::root_memory_pool(),
+            parent_pid: crate::init_pid(),
             image,
             payload: &[],
             grants: &[],

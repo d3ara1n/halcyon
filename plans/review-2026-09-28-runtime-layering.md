@@ -6,11 +6,11 @@
 
 ## Issues
 
-1. **P1｜代码内部缺陷｜JoinHandle 可在 Registry 销毁后解引用悬垂指针。** 位置：[libthread/src/lib.rs:695](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:695)、[同文件:802](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:802)。
-   `ThreadFactory::spawn/start` 返回不带 Registry 生命周期的 `JoinHandle<T>`，只保存 `*const ()`；safe 调用者可以在局部 Registry 作用域外保留 handle，其 `join/try_join/Drop` 随后解引用已经销毁的 Registry。Registry 默认析构还可能释放正在被 trampoline 使用的 packet。建议改代码：为运行中 record 和观察者建立真实保活或生命周期约束，禁止用注释替代指针存活证明。
+1. **P1｜代码内部缺陷｜ResultReceiver 可在 Registry 销毁后解引用悬垂指针。** 位置：[libthread/src/lib.rs:695](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:695)、[同文件:802](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:802)。
+   `ThreadFactory::spawn/start` 返回不带 Registry 生命周期的 `ResultReceiver<T>`，只保存 `*const ()`；safe 调用者可以在局部 Registry 作用域外保留 handle，其 `join/try_join/Drop` 随后解引用已经销毁的 Registry。Registry 默认析构还可能释放正在被 trampoline 使用的 packet。建议改代码：为运行中 record 和观察者建立真实保活或生命周期约束，禁止用注释替代指针存活证明。
 
 2. **P1｜代码内部缺陷｜线程环境 E 未约束跨线程访问和寿命。** 位置：[libthread/src/lib.rs:135](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:135)、[同文件:543](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:543)。
-   仅 `Child/Residue/Error` 要求 `Send + 'static`，E 本身没有 `Send/Sync/'static` 约束；safe spawn 却把 `Arc<E>` 放入跨线程 packet，并在子线程调用 `enter/leave`。含 `Rc<Cell<_>>` 或局部借用的 E 可以进入该路径，JoinHandle 的手写 Send 又允许异线程 reap。建议改代码：按实际共享方式约束环境类型，并保留其寿命和线程安全证明。
+   仅 `Child/Residue/Error` 要求 `Send + 'static`，E 本身没有 `Send/Sync/'static` 约束；safe spawn 却把 `Arc<E>` 放入跨线程 packet，并在子线程调用 `enter/leave`。含 `Rc<Cell<_>>` 或局部借用的 E 可以进入该路径，ResultReceiver 的手写 Send 又允许异线程 reap。建议改代码：按实际共享方式约束环境类型，并保留其寿命和线程安全证明。
 
 3. **P1｜代码≠文档｜cleanup claim 被表示为空槽，可覆盖新 record；seal 也缺少同锁线性化。** 位置：[libthread/src/lib.rs:231](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:231)、[同文件:280](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:280)。
    reap 用 `Option::take` 后释放锁，insert 把该槽视为空闲；旧 record 未 DONE 或 Unmap Busy 时直接写回原索引，覆盖并析构期间插入的新 record，新 PreparedThread 随后可能启动已释放 packet。insert 的 sealed 检查也在槽锁外，seal 返回后仍可能登记。违反 B `task.md:143` 的固定槽/唯一 claim/seal。建议改代码：保留 Reserved/Claimed 状态和稳定槽身份，将准入与 seal 放入同一仲裁边界。
@@ -30,7 +30,7 @@
 8. **P1｜代码≠文档｜永久 cleanup 错误被忽略，失败进度无法恢复。** 位置：[libthread/src/lib.rs:305](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:305)、[同文件:314](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:314)、[同文件:739](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:739)。
    Wait 错误全部归为 Wait；Unmap/retire 失败只返回 Failed，而 join/try_join/Drop 全部忽略。retire 消费 residue 后失败，恢复的 record 已失去该状态，下次可跳过退休继续释放栈。违反 B `task.md:178` 和 C 的永久错误完整性出口及保留责任。建议改代码：建立单步 cleanup 进度和失败返还形状，Busy 可重试，永久错误携责任进入明确 ProcessAbort 路径。
 
-9. **P1｜代码≠文档｜JoinHandle Drop 仍触碰 record，并可能停驻。** 位置：[libthread/src/lib.rs:747](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:747)、[libkernel/src/mm.rs:159](/Users/chien/Projects/halcyon/user/libraries/libkernel/src/mm.rs:159)。
+9. **P1｜代码≠文档｜ResultReceiver Drop 仍触碰 record，并可能停驻。** 位置：[libthread/src/lib.rs:747](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:747)、[libkernel/src/mm.rs:159](/Users/chien/Projects/halcyon/user/libraries/libkernel/src/mm.rs:159)。
    Drop 调用 reap，后者执行环境 retire、Unmap 和 Control 释放；Unmap 可能因内核退休确认停驻。因此“不等待 child”不等于 Drop 不等待。B `task.md:187` 和 C 禁止 Drop 碰 record，但 `impls/mm.md:196` 又认可 Drop reap，文档内部冲突。建议两者修正：Drop 只放弃结果和观察引用，cleanup 移至规定的显式协作调用点。
 
 10. **P1｜代码与文档都≠期望｜普通 Rust main 入口未实现，仍要求宏与链接桥。** 位置：[libruntime/src/lib.rs:10](/Users/chien/Projects/halcyon/user/libraries/libruntime/src/lib.rs:10)、[libruntime/src/rt.rs:19](/Users/chien/Projects/halcyon/user/libraries/libruntime/src/rt.rs:19)、[test_target/src/main.rs:5](/Users/chien/Projects/halcyon/user/tests/test_target/src/main.rs:5)。
@@ -43,7 +43,7 @@
    runtime 的 ENTRY_REGISTRY 只登记入口线程；所有现有 Builder 消费者使用 libthread 私有静态 Registry，两处容量均固定 64，Builder 自称 Compatibility builder。违反 B `task.md:143`、owner 计划 `:89` 和 C 的 runtime 装配责任；libthread manifest 也未接入 C 指定的 libbudget。建议改代码：接通 runtime 持有实例和环境工厂，迁移消费者、删除兼容全局，并按确认的预算契约装配容量。
 
 13. **P2｜代码≠文档｜prepare 和 wrapper 缺少规定的协作 reap。** 位置：[libthread/src/lib.rs:543](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:543)、[同文件:505](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:505)。
-   prepare 直接准备资源并 insert，wrapper 发布结果后直接 ThreadExit，两者都不 reap。保留已完成线程的 JoinHandle、推迟领取结果时，死线程占满槽就使后续 spawn ReachLimit，实际把容量变成未清理出生次数上限。违反 B `task.md:180–187` 和 C。建议改代码：准入前推进已 DONE 记录，wrapper 离场前作有界 reap，join 确认 DONE 后推进。
+   prepare 直接准备资源并 insert，wrapper 发布结果后直接 ThreadExit，两者都不 reap。保留已完成线程的 ResultReceiver、推迟领取结果时，死线程占满槽就使后续 spawn ReachLimit，实际把容量变成未清理出生次数上限。违反 B `task.md:180–187` 和 C。建议改代码：准入前推进已 DONE 记录，wrapper 离场前作有界 reap，join 确认 DONE 后推进。
 
 14. **P2｜代码≠文档｜join 的 Incomplete 契约没有落实，try_join 不确认 DONE。** 位置：[libthread/src/lib.rs:709](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:709)、[同文件:719](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:719)。
    try_join 直接领取 ResultCell，可能在线程发布结果但尚未 DONE 时返回 Returned，也把仍在运行的 Empty 解释为 Incomplete；join 确认 DONE 后遇 Empty 则 panic，返回类型为 T。违反 B `task.md:171,174`、owner 计划 `:101` 和 C。建议改代码：区分未完成观察与 DONE 后结果领取，后者返回显式 Incomplete，不 panic、不读未初始化值。
@@ -82,13 +82,13 @@
 
 ## 处置与校正范围
 
-报告由 reviewer 只读生成，主代理转录。按 AGENTS，本报告即 19 项发现的唯一修复与复核记录，不另建 todo。f519a99 在 owner 计划、分层计划中的完成声明，校正完成前不成立。
+报告由 reviewer 只读生成，主代理转录。按 AGENTS，本报告即 19 项发现的唯一修复与复核记录，runtime layering 范围内不另建 todo。f519a99 在 owner 计划、分层计划中的完成声明，校正完成前不成立；独立 kernel 验收阻塞另见 [Kernel console 锁序 panic](todo-2026-09-29-kernel-console-lock-order.md)。
 
 ### 契约来源
 
 期望设计已写入 ideas，施工以 ideas 为准：[task](../notes/ideas/task.md#用户态线程资源收束)（ResultReceiver、Registry 槽状态、packet owner、结果类型、Drop、cleanup 失败）、[framework](../notes/ideas/framework.md)（`start` lang item、`startup::take()`、唯一 Registry 实例）、[bootstrap](../notes/ideas/bootstrap.md#用户态接收与一次性交接)（Seed/Query/去重）、[execution-context](../notes/ideas/execution-context.md#用户态平台入口)（gp/norelax 适配段）。ideas 已修正；impls 与两份计划由施工同步。
 
-用户裁决：`JoinHandle<T>` 改名 `ResultReceiver<T>`，不保留旧名或 alias；本系统不提供 Rust std，不沿用 std 名以免误导同义。
+用户裁决：旧 `JoinHandle<T>` 统一改名为 `ResultReceiver<T>`，不保留旧名或 alias；本系统不提供 Rust std，不沿用 std 名以免误导同义。
 
 ### 逐项施工与完成标准
 
@@ -126,7 +126,7 @@ Observation 处置：ResultCell 的 Writing 中间态若为实现必需，在 ow
 
 ## 本轮处置证据（工作树）
 
-- 已完成线程结果/槽/cleanup 主路径：`JoinHandle`、擦除 packet owner、默认兼容 Builder 与 Drop reap 已删除；`ResultReceiver<T, E>` 共享 `ResultCell<ThreadOutcome>` 与 `ThreadControl`，`try_join(self)` 未 DONE 返回自身，DONE+Empty 返回 `Incomplete`；环境约束为 `Send + Sync + 'static`。槽使用 `Free/Reserved/Live/Claimed/Faulted`，cleanup 记录 `retired/done/abandoned`，永久错误统一经 `cleanup_integrity_failure` 进入 `ProcessAbort`。
+- 已完成线程结果/槽/cleanup 主路径：`ResultReceiver`、擦除 packet owner、默认兼容 Builder 与 Drop reap 已删除；`ResultReceiver<T, E>` 共享 `ResultCell<ThreadOutcome>` 与 `ThreadControl`，`try_join(self)` 未 DONE 返回自身，DONE+Empty 返回 `Incomplete`；环境约束为 `Send + Sync + 'static`。槽使用 `Free/Reserved/Live/Claimed/Faulted`，cleanup 记录 `retired/done/abandoned`，永久错误统一经 `cleanup_integrity_failure` 进入 `ProcessAbort`。
 - 已完成 runtime 装配：唯一 Registry 由 `libruntime` 以进程寿命 `Box::leak` 持有，所有 Builder 消费者改走 `libruntime::thread`；libthread 不再拥有隐式静态 Registry。
 - 已完成入口切换：应用 binary 删除 `no_main`、`app_main`、`entry!`、`RUNTIME_ENTRY`；普通 `fn main` 由 `#[lang = "start"]` 接入。`_start` 与 worker 使用单一 norelax gp 适配段，worker 为非泛型符号并从 packet 读取具体 trampoline。
 - 已完成启动上下文一次性表面：应用通过 `libruntime::startup::take()` 接收 `StartupContext`；duplicate 失败不再退化为转移；采用时核实入口 descriptor 所选项为带 `MANAGE` 的 `ThreadControl`；启动表采用状态不再受 64 位位图限制。
@@ -146,3 +146,113 @@ Observation 处置：ResultCell 的 Writing 中间态若为实现必需，在 ow
 - 发现 6 已补证：host 测试 `startup_grants_accept_64_plus_entry_control_and_reject_oob` 构造 65 项 grant，索引 64 可采用，索引 65 被拒；采用容器按实际 Vec 长度工作，无 64 位位图上限。
 - 最后 Control 责任：已 Start 的线程由 worker 在发布结果后调用 ThreadExit；Registry reap 先观察 ThreadControl DONE，再释放 record 的 Control owner，随后推进环境退休和栈 unmap。ResultReceiver 放弃结果时仅 abandon ResultCell；其 Control 引用释放后，若为已启动线程，内核已完成 DONE；PreparedThread 在 Start 前取消时从 record 取走最后 Control，Created 线程由内核发布 DONE，record 保留 `abandoned` 并由普通 reap 收束栈和环境。
 - worker 入口证据：`libthread::__libthread_worker_entry` 是唯一 worker 平台 trampoline，使用 `.option norelax` 的 `la gp, __global_pointer$` 后跳转到 packet entry；runtime `_start` 使用独立的进程入口适配段。RV64 两 target 的反汇编门均通过，未发现重复 worker trampoline 符号。
+
+## 复核（固定提交 66f4e9c）
+
+由 reviewer 只读复核，主代理转录；结论：不能关闭，下列新 Issues 由本报告继续承载处置。
+
+### Issues
+
+1. **P1｜代码内部缺陷｜ResultCell 的单生产者前提未由安全接口保证。** [libthread/src/lib.rs:52](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:52)：公开安全的 `publish(&self)` 配合 `Sync`，允许两个生产者都读到 Empty，随后同时写同一个 `UnsafeCell`。后置 CAS 无法保护之前的写入，失败分支还可能领取另一生产者的值。修正方向：封闭发布权限，由不可复制的 producer owner 保证唯一写者，或对存储访问实施完整仲裁。
+
+2. **P1｜代码内部缺陷｜PreparedThread 正常放弃可能 abort 整个进程。** [libthread/src/lib.rs:310](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:310)：`cancel_prepared` 只接受 Live；但 reap 探测未 DONE 的 Created 线程后，[回写为 Claimed(Some(record))](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:428)。此后 PreparedThread Drop 必然得到 InvalidSlot 并 abort，甚至不需要并发。修正方向：让未开始 cleanup 的记录恢复可取消状态，并闭合取消与正在认领之间的仲裁。
+
+3. **P1｜代码内部缺陷｜原发现 5 的对齐漏洞仍在。** [libkernel/src/startup.rs:68](/Users/chien/Projects/halcyon/user/libraries/libkernel/src/startup.rs:68)：仍直接构造 `&[Handle]`，以注释断言块基址页对齐；`init` 的 Safety 契约及格式验证没有建立这个前提，共享解析器反而明确支持 unaligned 输入。修正方向：检查实际地址对齐，或逐项 `read_unaligned`，不能从字节格式合法推导 Rust 引用对齐。
+
+4. **P1｜代码≠ideas｜原发现 7 的 StartupSeed 与采用事务未实现。** [context.rs:62](/Users/chien/Projects/halcyon/user/libraries/libprocess/src/context.rs:62)：没有 Seed 参数或消费机制，初始化后可重复调用 adopt；每项先 `Capability::from_raw`，再做可失败 Query，后续项失败会析构此前已建立的 owner。普通 grant 没有核实可安全采用的 role，只检查入口 Control 的 role/MANAGE。与 [bootstrap.md:154](/Users/chien/Projects/halcyon/notes/ideas/bootstrap.md:154) 的来源证明、全表核实、最后一次提交不符。修正方向：接通 affine Seed，先完成全部验证，再不可失败地提交 owner。
+
+5. **P2｜代码≠ideas｜原发现 12 只改了名称，没有移除旧公开表面。** [libkernel/startup.rs:86](/Users/chien/Projects/halcyon/user/libraries/libkernel/src/startup.rs:86) 的 `handle(index)` 可重复返回原始句柄，仍有全局 `pid()/parent_pid()`、公开 static payload；[StartupContext::payload](/Users/chien/Projects/halcyon/user/libraries/libprocess/src/context.rs:104) 也返回 `&'static [u8]`。与 [framework.md:66](/Users/chien/Projects/halcyon/notes/ideas/framework.md:66) 明确要求不符。修正方向：删除全局消费入口，身份与 payload 通过 context 的受控视图交付。
+
+6. **P2｜代码≠ideas｜原发现 13 的容量契约仍不成立。** [prepare:704](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:704) 只调用 `reap(1)`；reap 找到第一个 Live record 就停止选取，即使它未 DONE，而后面存在可立即回收的 DONE record。因此 reserve 仍可错误返回 Full/ReachLimit，违反 [task.md:188](/Users/chien/Projects/halcyon/notes/ideas/task.md:188)。修正方向：满槽准入前进行有界完整候选检查，区分活线程、Busy 和可回收记录。
+
+7. **P2｜代码≠ideas｜入口桥与 main ABI 尚未达到约定形状。** [rt.rs:214](/Users/chien/Projects/halcyon/user/libraries/libruntime/src/rt.rs:214) 的私有 Rust 函数仍带 `no_mangle`；已有 `artifacts/build/srv_init` 符号表显示 `__libruntime_start` 为全局 `g F`。`rust_main()` 又按无参数签名调用，未传 `main(0, null)`；反汇编显示 rustc main shim 会读取 a0/a1。修正方向：使用真实 main ABI 并显式传零参数，桥接仅保留内部链接身份。
+
+8. **P2｜代码≠ideas / 代码内部缺陷｜失败清理仍有 owner 丢弃路径。** [libthread/src/lib.rs:538](/Users/chien/Projects/halcyon/user/libraries/libthread/src/lib.rs:538) 在 Unmap 拒绝时丢弃返回的 region owner；register 失败路径在 record 的 Control 引用尚存时先尝试 Unmap。另有 [runtime heap:188](/Users/chien/Projects/halcyon/user/libraries/libruntime/src/rt.rs:188) 的 `let _ = region.unmap()`，失败后继续返回 Err，丢失 region。修正方向：先闭合 Created 放弃责任，拒绝时保留 region owner；allocator 失败路径也须明确退休或完整性失败政策。
+
+9. **P2｜处置记录≠代码｜完成记录和 impls 仍存在实质性错述。** [复核报告:147](/Users/chien/Projects/halcyon/plans/review-2026-09-28-runtime-layering.md:147) 把 reap 顺序写成先释放 Control、再 retire，代码相反；还错误断言已启动线程在 receiver 放弃时已经 DONE。[mm impl:196](/Users/chien/Projects/halcyon/notes/impls/mm.md:196) 仍称 record 持 packet、存在 `spawn_raw`；[task impl:131](/Users/chien/Projects/halcyon/notes/impls/task.md:131)、[owner 计划:83](/Users/chien/Projects/halcyon/plans/todo-2026-09-14-user-memory-owner-lifecycle.md:83)、[分层计划:8](/Users/chien/Projects/halcyon/plans/todo-2026-09-runtime-kernel-library-separation.md:8) 仍保留 ResultReceiver、Writing、packet cleanup、`entry!(app_main)` 等当前叙述。修正方向：统一更新事实并撤回尚未成立的完成声明。
+
+### Observations
+
+19 项逐项结论如下。“关闭”仅指原发现的缺陷已消除，不表示整个机制可交付。
+
+| 原项 | 复核结论 | 核实证据 |
+|---|---|---|
+| 1 Registry 生命周期 | 关闭 | Factory、Prepared、receiver 持 static Registry；runtime 保活唯一实例。 |
+| 2 seal/覆盖新 record | 关闭原缺陷 | reserve/register/seal 共用锁；Reserved、Claimed 不可重新分配。取消缺陷另见 Issue 2。 |
+| 3 E 的跨线程约束 | 关闭 | `ThreadEnvironment: Send + Sync + 'static`。 |
+| 4 DONE+Empty panic | 关闭 | join/try_join 先观察 DONE，Empty 返回 Incomplete。 |
+| 5 startup 对齐 | 未关闭 | Issue 3。 |
+| 6 64 位采用限制 | 关闭代码缺陷 | 动态 Vec 替代位图；65 项测试只验证槽容器边界。 |
+| 7 Seed/事务/角色证明 | 未关闭 | Issue 4。 |
+| 8 Prepared 放弃 | 部分关闭 | Drop 不 reap、不 Unmap，F/Child 留在放弃者线程析构；取消状态与失败 owner 路径仍有问题。 |
+| 9 永久 cleanup 失败 | 核心路径关闭，形状有差异 | 三调用点共用私有诊断+abort 出口；失败保留 record，已消费 residue 不会重复 retire。 |
+| 10 receiver 独立 Control | 关闭 | receiver 持 Arc Control；`thread()` 克隆观察 owner。 |
+| 11 packet 析构进入 cleanup | 关闭 | record 无擦除型 packet drop；packet 归 Prepared 或 worker。 |
+| 12 全局身份/static payload | 未关闭 | Issue 5。 |
+| 13 prepare 回收能力 | 未关闭 | Issue 6。 |
+| 14 入口契约 | 部分关闭 | 普通 main、start lang item、sealed MainOutcome 已接通；桥导出和 main ABI 见 Issue 7。 |
+| 15 Compatibility Builder | 关闭 | libthread 不再装配默认环境/私有 Registry；消费者走 runtime 工厂。 |
+| 16 management 隔离 | 关闭 | default=[]；ELF/libexecution 为 management 可选依赖；runtime 普通依赖基础 context。 |
+| 17 owner 失败语义 | 未完整关闭 | ThreadControl/Capability Drop panic 仍在，未见完整处置论证；失败清理仍有 Issue 8。 |
+| 18 出生块只读 | 关闭 | `map_birth_block` 用 READ，Building Write 经物理直映射填充最终只读页。 |
+| 19 文档同步 | 未关闭 | Issue 9。 |
+
+- ResultCell 已仅有 Empty/Published/ReceiverGone；spawn/start 返回单个 receiver，try_join 在 Published 但未 DONE 时仍返还 self；正常 Returned、EnterFailed、Incomplete 不以 panic 表达。
+- `_start` 与唯一 `__libthread_worker_entry` 的已有 ELF 反汇编确认：首段建立 gp，无 Rust 序言；MainOutcome 只支持 `()`、`Result<(), E: Debug>`，Err 先诊断再 abort。
+- 本轮指定的 `reap_step -> Continue/Wait/Complete/Failed` **没有落实为该接口**，实际为 `reap(budget) -> Idle/Progress/Wait/Failed`。原发现 9 的失败出口修复成立，但不能宣称接口形状完全一致。
+- 原发现 17 中“MappedRegion Drop 会 panic”的描述本身不准确：固定源码没有 MappedRegion Drop；其显式 Unmap 失败返回 owner。这使忽略返回值的路径成为责任丢失，而非 Drop panic。
+- 源码残留检索未发现 ResultReceiver、entry!、app_main、__halcyon_main、no_main、RUNTIME_ENTRY、Writing、兼容 Builder、spawn_raw 安全出口或 runtime 公开 finish；其他领域的 `finish` 不属于该问题。上述旧词仍存在于当前计划和 impls。
+
+### 未覆盖项
+
+- 未重跑构建、host 测试或 QEMU。抽查的 `artifacts/dev/` 日志包含旧 rinlib 记录，且未找到本轮新增测试名称，不能据此独立确认固定提交全部正式门通过。
+- 65 项测试直接构造 InitialGrants，没有经过 StartupBlock、HandleQuery、StartupContext adopt 或真实 launcher，因此不是完整“64 grants+入口 Control”采用证据。
+- 已有 ELF 用于交叉核实入口与符号，但未确认其完整产物来源；两 target 全镜像审计、并发交错和错误注入仍需补证。
+
+### Summary
+
+**不能关闭报告。** 19 项中有 11 项原缺陷已消除，1 项核心失败路径修复但接口形状有差异，2 项部分关闭，5 项未关闭；另发现 ResultCell 安全接口并发写和 Prepared 取消状态导致 abort 两项 P1 缺陷。完成声明应等待代码责任链、启动采用契约和当前文档同步闭合后再复核。
+
+## 复核（固定提交 66f4e9c）
+
+本节承接固定基线后的第二轮校正。工作树原有本节内容由接手者保留；本节追加修复事实、测试证据和未闭合项。未取得用户提交授权前不创建提交，也不执行 push。
+
+### 新增 P1
+
+| Finding | 处置 |
+|---|---|
+| ResultCell producer 可复制，共享安全 `publish(&self)` 允许多个写者同时写 `MaybeUninit<T>` | `ResultCell::new` 只发出一个不可 Clone 的 `ResultProducer<T>`；`publish(self, value)` 消费 producer。worker packet 唯一持有 producer，发布权无法经安全接口复制。 |
+| reap 探测到未 DONE 后可能把 record 留在 Claimed；PreparedThread cancel 与 reap 也可同时认领 | 槽增加 `Prepared/Cancelling/Abandoned`。reap 仅认领 `Live/Abandoned`；未 DONE 恢复 Live。取消先将 Prepared 放入不可 reap 的 Cancelling，PreparedThread 释放 Thread 引用后关闭 record Control，再发布 Abandoned；Control close 完成前 reap 不会把它当作 DONE。 |
+
+### 启动采用
+
+libkernel 平台入口初始化以一次性原子门防止第二次来源；成功后返回 affine `StartupInput`，唯一平台桥以 unsafe 接点构造 `libprocess::context::StartupSeed`。句柄数组逐项 `read_unaligned`，不构造 `&[Handle]`。采用先解析 descriptor、检验索引/无效值/重复句柄并预留全部工作区，再 Query 全表；角色须与对象 kind 一致，入口项另需 ThreadControl 与 MANAGE，TunnelEndpoint 不作为通用 Capability 采用。所有查询和分配通过后才逐项 `from_raw` 建立 InitialGrants，提交阶段不再分配或 Query。失败返回 `(StartupSeed, ContextError)`，未关闭原始表项；runtime 诊断并 ProcessAbort，由 ProcessDrain 收回。
+
+应用侧不再有 runtime 全局 `handle(index)`、`pid()`、`parent_pid()` 或 `&'static [u8]` payload getter。init launcher 从存于 `StartupContext` 的受控身份/payload 视图读取 provenance，并把创建者 pid 显式传给 `SpawnRequest`。payload 借用绑定 Context，不从全局启动块 getter 逃逸。
+
+### 线程容量与失败 owner
+
+槽满时 `prepare` 执行最多 capacity 次候选推进；未 DONE 的 Live、Prepared/Cancelling 和 Unmap Busy 不阻塞之后可回收的 record。结果只在 retire 成功、Control owner 释放、Unmap 成功后归还槽；Busy 保留 record 并返回 Wait。
+
+register 失败先释放 Created 的 Thread 与 record Control，再处理栈。libthread 的 Unmap 拒绝保留原 region owner 到完整性失败收束；runtime heap 初始化的 Unmap 拒绝把 owner 放回 heap arena 槽，随后由 ProcessAbort/ProcessDrain 收束，不丢弃 region。
+
+入口桥符号改为内部链接，由同 crate naked `_start` 通过 `sym` 引用；以 C ABI 显式调用 `main(0, null)`。不再要求应用入口宏。当前消费者按标准 Rust `fn main()` 接入。
+
+### 文档与测试
+
+ideas 的 reap 公共形状按已确认的 `reap(budget) -> Idle/Progress/Wait/Failed` 记录；DONE 顺序修正为 retire 残余 → 释放 Control → Unmap → 归槽，移除“receiver 放弃时已 DONE”的断言。同步修改 task/mm/startup impls、owner 计划与分层计划，撤回基线完成声明；历史 Findings 与基线证据保留为历史，不作为第二轮通过证据。
+
+新增 host 测试：
+
+- `result_cell_publish_races_receiver_abandon_without_double_drop`：并发发布/放弃，验证值恰好 Drop 一次。
+- `reap_skips_prepared_until_cancel_close_is_published`：reap 不认领 Prepared 的取消中槽，close 完成后才出现 Abandoned。
+- `full_budget_scan_skips_unfinished_live_for_later_abandoned_candidate`：未 DONE Live 不阻塞预算扫描后续 Abandoned 候选。
+- `adopts_65_grants_from_unaligned_startup_block_after_full_query`：真实 StartupBlock builder、非对齐平台入口初始化、65 项 Query/adopt 顺序与 payload/身份视图。
+
+开发验证：`cargo test -p libthread -p libprocess --target aarch64-apple-darwin` 通过，5 个 libthread 测试与 1 个 libprocess 测试通过；`cargo check -p srv_init --target riscv64gc-unknown-none-elf`、`just check`、`just clippy` 通过。日志分别保存在 `artifacts/dev/runtime-layering-round2-host-tests.log`、`artifacts/dev/runtime-layering-round2-just-check.log`、`artifacts/dev/runtime-layering-round2-just-clippy.log`。
+
+### 未完成门
+- `just acceptance` 与单独 `just virt`/`just virt-stress` 均未通过：服务拓扑、StartupContext 采用和 FAL2 已运行到中段，随后复现内核既有锁序 panic：`kernel/src/sync.rs:172` 报 Rank(150) under Rank(220)，请求点 `kernel/src/console.rs:37`；验收脚本按无进展以 124 收束，日志为 `artifacts/dev/runtime-layering-round2-just-acceptance.log`、`artifacts/dev/runtime-layering-round2-virt-core.log`、`artifacts/dev/runtime-layering-round2-virt-stress.log`。本轮未改内核锁语义，故不能宣称 acceptance 通过。
+- 后续独立任务：[Kernel console 锁序 panic](todo-2026-09-29-kernel-console-lock-order.md)（`kernel/src/sync.rs:172`、`kernel/src/console.rs:37`）；本轮不修改 kernel，不把该外部阻塞伪装成 runtime layering 失败或通过。
+- 尚未做最终 REVIEW 结构检查、RISC-V 双 profile 的 ELF/反汇编门和 QEMU 组合结果核对。
+- commit 需用户单独授权，push 需另行授权。
