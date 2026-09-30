@@ -1,6 +1,6 @@
 # Capability 与资源释放重构
 
-状态：**设计轮次 2：全项目重审下的 capability/Close 分案，尚未实施**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
+状态：**设计轮次 4：权限模型已定稿（见“权限模型目标设计”），剩余实现设计门见该节；全项目重审下的 capability/Close 分案，尚未实施**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
 
 ## 目标与本轮边界
 
@@ -92,6 +92,98 @@
 - 不为每次 Close 铸造新的用户可见完成对象。已有对象的完成状态或确有独立用途的操作结果承担观察；观察者存在与否不影响退休活性。
 - 原 Endpoint 同时拥有通信与映射、公共 HandleRole、Lifetime/Delivery 的对象边界均须重新论证；不能仅给旧 Close 补足等待资源然后宣称完成新语义。
 
+## 权限模型目标设计（设计轮次 4，已定稿）
+
+本节是 capability 表示、rights、生命周期与提交原则的目标契约，取代上文“推荐目标结构”中 role 与 rights 表示的待决部分，以及设计轮次 3 的 facet 方案。经与 advisor 审查及跨会话收敛讨论确定；标注“用户确认”的条目为用户明确决定，其余为收敛结论。IPC 对象细节由 IPC 分案闭合，本节只定与权限模型契合的方向。
+
+### 分层与组件归属
+
+| 组件 | 拥有 | 不拥有 |
+|---|---|---|
+| `shared/erhino_shared::object` | 用户可见 ABI：`Handle`、标准 `Rights` 位、`HandleDescription`（删除 `role` 字段）、信号位 | 表、计数、对象状态 |
+| `os/capability`（由 `os/handle_table` 改名扩展，删除旧目录） | 权限纯逻辑：HandleTable、rights 子集与派生、capability 计数与最后持有判定、返还预约；等待源电平、代次、订阅与有界扫描 | 锁、Process、uaccess、调度唤醒、维护执行、对象业务状态 |
+| `os/wait_context` | 等待轮次、offer/arm/restart、唯一 outcome 与完成权 | 来源簿记 |
+| `os/kernel` | 对象业务状态机、syscall 入口所需 rights、锁、事件执行、跨 hart 交互 | 按对象种类分流的公共释放逻辑 |
+
+接缝：capability crate 不接收回调，只以纯值返回判定结果（最后持有事件、待唤醒候选），内核在锁外执行；依赖只从 kernel 指向 capability 与 shared。等待候选携带来源代次、订阅 ID 与等待 epoch，锁外 offer 按旧 epoch 仲裁。crate 可在 host target 单测。
+
+### capability = (授权对象, rights)（用户确认）
+
+- 删除 `HandleRole` 与任何公共 facet 维度。同一对象的所有 capability 语义相同，只由 rights 裁剪。
+- 拆成独立授权对象的理由只有：独立身份、独立终结条件、独立消费额度。仅 rights 不同不构成理由。多个授权对象可共享同一底层 core（队列、进程、backing）。
+- 对象类型自身决定是否可进入缓冲容器等固定运输约束，不占 rights 位。
+
+### 标准 rights（当前目标集合，非永久封闭）
+
+| 位 | 真实授权用例 |
+|---|---|
+| `DUPLICATE` | 把只读 MemoryObject 授权复制给另一本地 owner；派生 rights 为源子集 |
+| `TRANSFER` | 经消息移交一次性回复权或 MemoryObject；直接交给 Building 进程启动资源。合并原 TRANSIT/GRANT，放弃对同一 capability 单独裁剪“只能直接交付/只能排队” |
+| `WAIT` | 等待 ThreadControl DONE、接收队列 READABLE。对象可观察信号是类型事实，WAIT 是本份 capability 的观察许可，二者保留两层 |
+| `READ` | Receive 取消息、ProcessControl Query、建立只读 view |
+| `WRITE` | Send 发消息、Builder 写入待启动映像、建立可写 view |
+| `EXECUTE` | 建立可执行 view；READ 不隐含 EXECUTE |
+| `SIGNAL` | Notification 置位、Endpoint 门铃 |
+| `CREATE` | Job 中创建 Process/子 Job，Pool 派生子 Pool |
+| `MANAGE` | 由对象解释的控制操作：ProcessControl 终止、Builder 组装/映射/Start、MemoryObject seal |
+
+MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控制操作（例如“可改映射但不能 Start”）时增加标准位，不用空壳对象或 READ/WRITE 混充。Close 不要求任何 rights。
+
+### 映射授权矩阵（删除 MAP）
+
+- 分开两个问题：修改哪个地址空间、可访问哪份 backing。
+- Map 到本进程：目标授权来自当前执行上下文；源为 MemoryObject/Endpoint 时 R→READ、RW→READ|WRITE、RX→READ|EXECUTE，并受 W^X 与 seal/write-view 对象状态约束。Endpoint 不允许 EXECUTE，Invitation 不能 Map。
+- Map 到 Building 进程：Builder 需 MANAGE；有源时另按上述矩阵检查源 rights。二者互不替代。
+- 匿名 Map（含现 Builder::map）：消耗明确持有的 funding authority，不因无源而免费；不追加虚构的源 rights；匿名可执行页由 VM/装载契约决定，不因删 MAP 放宽。
+- Unmap 消费本地 mapping owner；撤销其他地址空间需目标管理授权。
+
+### 生命周期：只报告最后 capability 持有（用户确认）
+
+- 公共层只产生一个事实 `on_last_capability`。计数覆盖表内、在途与事务暂持的 authority；普通内核 Arc 与已接受操作的 use owner 不计入。
+- 成功消费与放弃是对象状态机，不是公共事件：对象在自身同步域内仲裁提交与放弃（如 Pending→Started/Aborted），锁外 hook 只执行已确定的后续动作。
+- 不可复活分类：归零无业务动作的对象可重新铸造且不发事件（ProcessControl）；归零即终结的对象永不复活，新派生得到新对象身份。不引入事件代次体系；handle slot generation 等防陈旧机制保留。
+- 删除 `close_handle`/`close_transit`、`owner`/`exiting` 参数、ThreadControl downcast、Tunnel 与 `retirement()` 分流、`close_entry_infallible`/`retire_entry` 等多入口；等待转发缩为统一等待源组件。
+- 可失败的 owner 接收接口失败时返还 owner；Drop 断言只作审计探针。计数有准入上限，接近上限时铸造返回错误，永不回绕或饱和。
+
+### Pending 启动责任与观察分离（用户确认）
+
+- ProcessBuilder 拥有 Pending 组装责任，Start 提交时移交执行容器；ProcessControl 只观察/管理。
+- TunnelInvitation 拥有 Pending 接入额度，Attach 提交时移交 Endpoint。
+- 线程：可独立委托启动时返回启动票据 + ThreadControl，票据拥有 Pending→Started/Aborted；WAIT-only Control 不阻止放弃。Building 进程内的预建线程由 ProcessBuilder 持有启动责任。
+- ThreadStart 成功返回后，子线程与 packet 的交接责任在调用线程消散后仍成立；失败返回保证未启动。
+
+### pin 与 Close：返还预约（用户确认）
+
+- 需跨锁准备的消费操作在线性化点接管 capability owner；原槽保留不可发起新操作的返还预约，不是第二份 capability。
+- Close 在表锁下撤销预约并使旧 handle 失效，不取消、不通知、不等待已接受操作。
+- 失败：预约有效且表仍接收返还则原槽恢复；否则释放。成功：消费 owner 并撤掉预约。仲裁按预约身份，不按槽下标；表退出关闭返还入口有线性化点。
+- send 附 handles 优先表外准备、短临界区整组验证/取出/入队，队列满时原 handle 不动；duplicate 不消费源，不走本协议。
+
+### 统一提交原则
+
+所有可能报告“未提交”的失败都在业务提交点前完成；提交点同时确定效果与责任归属；提交后不回滚为未提交，剩余执行由预准入 owner 保证完成。错误返回时输出未定义，预写输出本身不是提交；违规的是提交前已发布可用 handle、不可撤销效果或 committed 标记。可能 fault 的实际交付须在提交前完成，或有明确的已提交结果责任。
+
+### Attach 拆分，映射显式调用（用户确认）
+
+- Attach 只消费 Invitation 换取 Endpoint，Pending→Attached 在 connection 锁下仲裁，结果只有一个 handle。
+- 映射走通用 backing/view Map，与 MemoryObject 同一机制；view 保活 backing，不持 Endpoint capability，Endpoint 不持 lease。Close Endpoint 是普通最后持有，不撤销 view。
+- `PEER_ATTACHED` 只表示授权接入，`PEER_CLOSED` 只表示对端 Endpoint 最后 authority 消失；均不证明映射建立、访问撤销、数据冻结或业务完成。readiness 由 Map 后的协议 Start 请求表达，不新增 MAPPED/UNMAPPED 信号。
+- 需要复用旧页时分配新 backing；强制跨域撤销不在本次承诺。
+
+### 消息对象方向（细节归 IPC 分案）
+
+- 采用共享队列 core + Receive 授权对象 + 各自持不可变 badge/身份的 Send 授权对象，保留原生 fan-in；不以 Channel 全面替换。
+- Receive 最后持有关闭接收准入，内核接管队列收束；Send 不反向保活接收开放。
+- 保留内核 SendOnce，改为每份独立消费额度的对象：无 DUPLICATE、无重铸入口；成功入队与 Pending→Sent 原子化，队列满保留 Pending；最后持有仅在 Pending 时放弃。理由是限制不可信回复者最多入队一条。
+- SendOnce 显式持有所属授权域的一份 authority；已接受消息持稳定 use 责任，接收后由 Delivery/请求 owner 承接。Lifetime 观察壳独立，CLOSED 定义为该域 authority 与已接受 use 都耗尽。on_last_capability 只表示新调用授权耗尽。
+
+### 剩余设计门
+
+1. capability 实现：计数/终态提交锁序、锁外释放承载、返还预约身份及表退出仲裁、批量失败释放的结构性上界。
+2. [IPC 分案]：authority→use→终结观察责任链、SendOnce 准入、队列中 capability 环的禁止或回收、付款、队列上界、接收失败与关闭排空。环未闭合前 TRANSFER 迁移不算完成。
+3. [VM/进程分案]：统一 backing/view Map 与 funding 权限、结果交付、TLB 完成边界、mapping owner 借用安全、退出收束。
+4. 消费者迁移与验收：Runnel 改为组合 Endpoint + 独立 mapping owner 且以 Start 表达 readiness（`librunnel`、`libkernel/ipc/tunnel.rs`、`srv_fs` stream 的 PEER_ATTACHED 用法）；ThreadBuilder/Control；RPC 独立 SendOnce；shared/libkernel/服务同改；删除旧 Tunnel 特判、role、MAP 与运输双位。仓库无 BufferQueue 实现，不虚构其迁移。
+
 ## 迁移范围与删除门
 
 1. 固定目标对象/authority/使用关系，再确定类型、入口、计数和消费动作；不是先设计一个万能 hook 覆盖全部旧行为。
@@ -103,7 +195,6 @@
 
 ## 实施前设计门
 
-- role 是否仍为独立表项维度、哪些关系应成为独立对象、哪些仅属于运输/消费语义；逐项独立论证。
 - 零引用、显式 Close、成功消费、未发布回滚的语义矩阵；重新铸造资格、并发复制/关闭/Start 的线性化点和锁序。
 - 业务使用与终态观察的持有规则；Sender/Delivery/Lifetime 只是现状起点，不要求同名保留。
 - 内存映射 owner 的本地释放与显式 Unmap 屏障、可复用地址和 backing 的归还关系；完成之前不能允许不安全复用。

@@ -31,7 +31,7 @@
 | ideas 范围 | 本轮已确认内容及直接依据 | 尚未闭合的详细设计 | ideas 审定 / 代码状态 |
 |---|---|---|---|
 | `kernel.md` | 内核自主推进、用户无特殊推进调用：[维护分案](todo-2026-09-29-kernel-maintenance-execution.md) | 工作记录/队列、容量、hart 归属、份额、依赖与单步上界 | 未整篇审定；局部原则已确认 / 未实现 |
-| `object.md`、`kernel-interface.md` | 合法 Close 必成本地释放、完成操作分离：[capability 分案](todo-2026-09-28-capability-last-reference.md) | authority/观察/使用关系、role 表示、释放接入、原始与安全 API | 未整篇审定；局部原则已确认 / 未实现 |
+| `object.md`、`kernel-interface.md` | 合法 Close 必成本地释放、完成操作分离；权限模型定稿（(授权对象, rights)、九位标准 rights、最后持有事件、返还预约、Attach 拆分、`os/capability` crate）：[capability 分案权限模型节](todo-2026-09-28-capability-last-reference.md#权限模型目标设计设计轮次-4已定稿) | capability 实现锁序与预约布局；IPC 责任链与 VM 映射由各分案闭合 | 未整篇审定；局部原则已确认 / 未实现 |
 | `task.md`、`bootstrap.md`、`execution-context.md` | 终止后自动回收、PM 政策与观察：[进程分案](todo-2026-09-29-process-automatic-reclamation.md) | 进程/线程/Job/启动关系、回收根、结果交付、终态与依赖顺序 | 未整篇审定；局部原则已确认 / 未实现 |
 | `mm.md`、`tunnel.md`、`shared-memory.md` | Close 与物理退休分开；其余由本总纲的内存重审范围承接，预算见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | backing/映射 owner、区间修改、结果写回、同步与退款；内存完整分案待形成 | 未审定；清理/局部目标改写 / 未实现 |
 | `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 取消用户驱动的内核清理；相关已确认边界见 capability/维护分案 | 消息与请求模型、在途使用、订阅、取消、结果及执行接缝；完整分案待形成 | 未审定；部分清理/局部目标改写 / 未实现 |
@@ -60,7 +60,7 @@
 
 | 分案 | 唯一拥有的契约 | 依赖与当前状态 |
 |---|---|---|
-| [capability 与资源释放](todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage 分离，统一 Close，类型化释放接入，运输/消费/回滚 | 设计轮次 2；Close 已确认，具体对象模型待闭合 |
+| [capability 与资源释放](todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage 分离，统一 Close，类型化释放接入，运输/消费/回滚 | 设计轮次 4；权限模型定稿，剩余实现门与 IPC/VM 分案衔接 |
 | [内核有界维护执行](todo-2026-09-29-kernel-maintenance-execution.md) | 执行根、准入、单步预算、公平、停驻唤醒、idle 活性、批量分配/回收的共同承载 | 自主推进方向已确认；具体执行承载与调度尚未冻结 |
 | [进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 终止到资源收束的单一 owner，公共完成状态，删除 ProcessDrain 及消费者驱动 | 依赖前两案的释放/执行契约；需与地址空间释放一起闭合 |
 | 映射、backing 与资源来源重审 | allocation identity、完整释放与部分修改、同步屏障、物理/metadata 费用 | 待单独形成完整计划；不是给现有 Tunnel Close 多预留一套重试资源 |
@@ -75,6 +75,7 @@
 
 | 优先主题 | 需要重新回答的问题 | 现有耦合/风险线索与归属 |
 |---|---|---|
+| 权限模型统一 | role 与 kind 重复、rights 位随对象增长、释放多入口：已由 capability 分案定稿：删除 role/facet，(授权对象, rights) + 标准 rights + 最后持有事件 | 分案剩余设计门闭合后施工；ideas `object.md` 待按该节回填线稿 |
 | authority、持有与观察 | 创建/启动权、普通使用、最后引用、终态观察分别应保活什么？role 是独立授权关系还是表示补偿？ | ThreadControl WAIT-only 与 Created 放弃、Sender/Lifetime/Delivery；capability 分案拥有，不能把现状计数写成默认保留契约 |
 | 内存对象、映射与安全释放 | backing、映射 owner、访问借用、通信参与方应怎样组合？完整释放与部分区间修改如何分开？ | Tunnel 与本地 lease 绑定、按地址区间重建 owner；内存/IPC 分案共同闭合，不能只移走 Close 的错误返回 |
 | 操作提交、结果交付与取消 | 操作被接受、效果提交、结果可取得和安全完成分别是什么？调用线程消散后谁拥有结果？ | Map cookie/UserWriteLease/线程 join 与结果记录联动，RPC 超时与未知结果；按对应操作领域设计，不预设一种万能事务状态机 |
