@@ -5,6 +5,7 @@ members = [
     "frame_pool",
     "dtb",
     "handle_table",
+    "capability",
     "wait_context",
     "stack_layout",
     "sched_domain",

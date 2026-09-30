@@ -216,3 +216,26 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 ## 当前接力
 
 已确认消除公共资源特判、Close 必成且不等待完整退休。上一轮保留同步 Close/Tunnel 原组合的建议已被全项目重审取代；源码盘点和外部事实继续作为现状证据。接下来闭合目标对象关系及上述设计门，与维护执行和进程自动回收分案共同施工。本案没有代码实现或验收完成宣告。
+
+## 施工进度
+
+### 切面 1：`os/capability` crate（crate 就绪，未接入内核）
+
+已实施（未提交）：`os/capability` 新建并加入 os workspace，`os/handle_table` 暂留供内核编译，内核迁移时删除。
+
+- `Holders`：对象侧单原子字计数，最高位为终结封闭位；Terminal 最后释放与封闭在同一 CAS 完成，Remintable 归零无事件；准入上限默认 `u32::MAX`，只拒绝新增，释放必成。
+- `Cap<A: Authority>`：不可 Clone；`mint`/`derive`（需 DUPLICATE、子集）/`restrict`/`release -> Option<LastCapability>`；Drop 仅 debug 审计探针。
+- `CapTable`：Vacant/Occupied/Reserved/Claimed/Retired；`insert`/`commit` 失败返还 owner；`close` 对 Claimed 槽只撤销返还资格；`claim`/`commit_claim`/`restore` 按预约 id + 槽代次仲裁；`shut` 为表退出线性化点，此后拒绝安装与返还；`take_next_bounded` 有界摘出并回收 Claimed/Reserved。
+- 验证（开发证据）：`cargo test -p capability --target aarch64-apple-darwin` 12 项通过；os-host clippy `-D warnings` 通过。未运行 `just check`/QEMU（内核尚未接入）。
+
+登记债务：
+
+| 现状 | 目标 | 删除条件 |
+|---|---|---|
+| `CapTable::extract` 由调用方传入运输位 | 固定检查 `Rights::TRANSFER` | shared ABI 合并 TRANSIT/GRANT 时同步改为常量并删除参数 |
+| `os/handle_table` 与 `os/capability` 并存 | 仅 `os/capability` | 内核 HandleTable 迁移完成时删除旧 crate 与 workspace 条目 |
+| `reserve_slot` 线性扫描空槽 | 空闲链 | 沿用旧 crate 已登记的真实负载触发条件 |
+
+接入归属：本 crate 属于总纲“对象持有与释放链”，按[责任链施工方式](todo-2026-09-29-system-redesign.md#施工方式按责任链整段替换)在该链就绪后整段接入内核，不单独接入。接入条件：维护执行与进程自动回收分案闭合并产出各自 crate/契约；本链涉及对象的释放接缝（含 Tunnel 需随 VM 链拆分的部分）确定归属。
+
+待补内核拼装草图（设计产物，不写代码）：`Authority` 在各内核对象上的实现位置、`CapTable` 所在锁及与 space/对象锁的单向顺序、`LastCapability` 的锁外执行点与维护承载、`claim`/`restore` 在 ProcessStart 等消费者中的调用点、进程退出 `shut` + `take_next_bounded` 与自动回收的衔接。
