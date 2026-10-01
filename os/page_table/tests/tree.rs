@@ -26,12 +26,14 @@ struct Counters {
 
 struct MockFrames {
     tables: Vec<[Pte; ENTRIES]>,
+    adopted: Vec<Option<TableOwner>>,
 }
 
 impl MockFrames {
     fn new() -> Self {
         Self {
             tables: vec![[Pte::invalid(); ENTRIES]; TABLE_CAPACITY],
+            adopted: (0..TABLE_CAPACITY).map(|_| None).collect(),
         }
     }
 }
@@ -91,6 +93,16 @@ impl TableFrameMemory for MockFrames {
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES] {
         &mut self.tables[frame.0]
+    }
+
+    fn adopt(&mut self, owner: TableOwner) {
+        let slot = &mut self.adopted[owner.frame.0];
+        assert!(slot.is_none(), "frame adopted twice");
+        *slot = Some(owner);
+    }
+
+    fn reclaim(&mut self, frame: FrameNumber) -> TableOwner {
+        self.adopted[frame.0].take().expect("reclaimed unadopted frame")
     }
 }
 

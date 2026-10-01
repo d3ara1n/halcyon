@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
 
+use crate::ordmap::OrdMap;
+
 use crate::{
     AddressRange, ObjectId, ObjectViewAuthorization, PAGE_SIZE, PageRange, RangeError, WritePermit,
 };
@@ -326,6 +328,9 @@ impl Region {
     }
 }
 
+/// 结果租约校验产物：分段投影与参与快照的 (起点, key)。
+type LeaseValidation = (Vec<UserWriteSegment>, Vec<(usize, RegionKey)>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserWriteSegment {
     pub region: RegionKey,
@@ -387,11 +392,11 @@ pub enum FaultClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangeStage {
+    /// 可取消的准备 owner。
     Reserved,
+    /// 不可撤销的已提交责任（账本与 PTE 发布绑定于同一协议）。
     Committed,
-    Published,
-    Synchronized,
-    Retired,
+    /// 同步完成证明已发放，退休游标推进中。
     Retiring,
 }
 
@@ -445,7 +450,7 @@ struct RetireTemplate {
 
 #[derive(Debug)]
 struct ValidatedPlan {
-    remove: Vec<RegionKey>,
+    remove: Vec<(usize, RegionKey)>,
     replacements: Vec<RegionTemplate>,
     retiring: Vec<RetireTemplate>,
     translations: Vec<TranslationIntent>,
@@ -457,7 +462,7 @@ struct ValidatedPlan {
 #[must_use = "validated changes must be reserved or discarded"]
 pub struct ValidatedChange {
     plan: ValidatedPlan,
-    snapshot: Vec<RegionKey>,
+    snapshot: Vec<(usize, RegionKey)>,
     lease: Option<(AddressRange, Vec<UserWriteSegment>)>,
     permits: Vec<PermitRequirement>,
     growth: usize,
@@ -480,7 +485,7 @@ impl ValidatedChange {
 
 #[derive(Debug)]
 struct PreparedPlan {
-    remove: Vec<RegionKey>,
+    remove: Vec<(usize, RegionKey)>,
     replacements: Vec<Region>,
     retiring: Vec<RetiringFragment>,
     object_region_deltas: Vec<ObjectRegionDelta>,
@@ -603,10 +608,7 @@ macro_rules! change_token {
 }
 
 change_token!(CommittedChange);
-change_token!(PublishedChange);
-change_token!(SynchronizedChange);
 change_token!(RetiringChange);
-change_token!(RetiredChange);
 
 #[derive(Debug)]
 pub struct RetireBatch {
@@ -653,7 +655,7 @@ struct TransactionRecord {
 pub struct MemorySpace {
     bounds: PageRange,
     limits: Limits,
-    regions: Vec<Region>,
+    regions: OrdMap<usize, Region>,
     transactions: Vec<TransactionRecord>,
     next_allocation: u64,
     next_region: u64,
@@ -679,9 +681,9 @@ impl MemorySpace {
         {
             return Err(ChangeError::BadLimits);
         }
-        let mut regions = Vec::new();
+        let mut regions = OrdMap::new();
         regions
-            .try_reserve_exact(limits.max_regions)
+            .grow(limits.max_regions)
             .map_err(|_| ChangeError::AllocationFailed)?;
         let mut transactions = Vec::new();
         transactions
@@ -712,14 +714,15 @@ impl MemorySpace {
     }
 
     pub fn regions(&self) -> impl Iterator<Item = RegionView> + '_ {
-        self.regions.iter().map(Region::view)
+        self.regions.iter().map(|(_, region)| Region::view(region))
     }
 
     pub fn fault_class(&self, address: usize) -> FaultClass {
         let Some(region) = self
             .regions
-            .iter()
-            .find(|region| region.range.address_range().contains_address(address))
+            .floor(&address)
+            .map(|(_, region)| region)
+            .filter(|region| region.range.address_range().contains_address(address))
         else {
             return FaultClass::Free;
         };
@@ -768,11 +771,7 @@ impl MemorySpace {
         {
             return Err(ChangeError::Busy);
         }
-        if self
-            .regions
-            .iter()
-            .any(|region| region.range.overlaps(reservation))
-        {
+        if self.regions_overlap(reservation) {
             return Err(ChangeError::Conflict);
         }
         let usable = PageRange::new(reservation.start() + guard_before, usable_bytes)?;
@@ -916,12 +915,12 @@ impl MemorySpace {
         let mut removes_translation = false;
 
         for index in indices {
-            let region = &self.regions[index];
+            let region = self.region_at(index);
             let cut = region
                 .range
                 .intersection(request.range)
                 .expect("covered region intersects request");
-            remove.push(region.key);
+            remove.push((region.range.start(), region.key));
             if region.range.start() < cut.start() {
                 replacements.push(template_from_region(
                     region,
@@ -978,7 +977,7 @@ impl MemorySpace {
         self.ensure_no_transaction_conflict(request.range, None)?;
         let indices = self.covered_indices(request.range, request.authority, true)?;
         for &index in &indices {
-            let RegionKind::Mapping { maximum, .. } = self.regions[index].kind else {
+            let RegionKind::Mapping { maximum, .. } = self.region_at(index).kind else {
                 return Err(ChangeError::Guard);
             };
             if !maximum.permits(request.protection) {
@@ -988,14 +987,14 @@ impl MemorySpace {
 
         let all_same = indices.iter().all(|&index| {
             matches!(
-                self.regions[index].kind,
+                self.region_at(index).kind,
                 RegionKind::Mapping { current, .. } if current == request.protection
             )
         });
         if all_same {
             let snapshot = indices
                 .iter()
-                .map(|&index| self.regions[index].key)
+                .map(|&index| (index, self.region_at(index).key))
                 .collect();
             return Ok(ValidatedChange {
                 plan: ValidatedPlan {
@@ -1042,12 +1041,12 @@ impl MemorySpace {
         let first_index = *indices.first().expect("coverage is nonempty");
         let last_index = *indices.last().expect("coverage is nonempty");
         for &index in &indices {
-            let region = &self.regions[index];
+            let region = self.region_at(index);
             let cut = region
                 .range
                 .intersection(request.range)
                 .expect("covered region intersects request");
-            remove.push(region.key);
+            remove.push((region.range.start(), region.key));
             if region.range.start() < cut.start() {
                 replacements.push(template_from_region(
                     region,
@@ -1076,35 +1075,33 @@ impl MemorySpace {
             }
         }
 
-        if first_index > 0 {
-            let neighbor = &self.regions[first_index - 1];
-            if neighbor.permit.is_none()
-                && templates_compatible_region(
-                    neighbor,
-                    replacements
-                        .iter()
-                        .min_by_key(|region| region.range.start())
-                        .expect("protect produces replacements"),
-                )
-            {
-                remove.push(neighbor.key);
-                replacements.push(template_from_region(neighbor, neighbor.range, None)?);
-            }
+        if let Some((_, neighbor)) = first_index
+            .checked_sub(1)
+            .and_then(|probe| self.regions.floor(&probe))
+            && neighbor.permit.is_none()
+            && templates_compatible_region(
+                neighbor,
+                replacements
+                    .iter()
+                    .min_by_key(|region| region.range.start())
+                    .expect("protect produces replacements"),
+            )
+        {
+            remove.push((neighbor.range.start(), neighbor.key));
+            replacements.push(template_from_region(neighbor, neighbor.range, None)?);
         }
-        if last_index + 1 < self.regions.len() {
-            let neighbor = &self.regions[last_index + 1];
-            if neighbor.permit.is_none()
-                && templates_compatible_region(
-                    neighbor,
-                    replacements
-                        .iter()
-                        .max_by_key(|region| region.range.end())
-                        .expect("protect produces replacements"),
-                )
-            {
-                remove.push(neighbor.key);
-                replacements.push(template_from_region(neighbor, neighbor.range, None)?);
-            }
+        if let Some((_, neighbor)) = self.regions.after(&last_index)
+            && neighbor.permit.is_none()
+            && templates_compatible_region(
+                neighbor,
+                replacements
+                    .iter()
+                    .max_by_key(|region| region.range.end())
+                    .expect("protect produces replacements"),
+            )
+        {
+            remove.push((neighbor.range.start(), neighbor.key));
+            replacements.push(template_from_region(neighbor, neighbor.range, None)?);
         }
 
         normalize_templates(&mut replacements)?;
@@ -1154,6 +1151,7 @@ impl MemorySpace {
         let materialized = match self.materialize_reservation(&validated, permits) {
             Ok(materialized) => materialized,
             Err((error, permits)) => {
+                self.regions.unreserve(validated.plan.replacements.len());
                 return Err(ReserveFailure {
                     error,
                     validated,
@@ -1237,15 +1235,16 @@ impl MemorySpace {
         {
             return Err(ChangeError::KeyExhausted);
         }
-        let reserved_growth = self
-            .reserved_growth
+        self.reserved_growth
             .checked_add(validated.growth)
             .ok_or(ChangeError::RegionLimit)?;
-        self.regions
-            .try_reserve(reserved_growth)
-            .map_err(|_| ChangeError::AllocationFailed)?;
         self.transactions
             .try_reserve(1)
+            .map_err(|_| ChangeError::AllocationFailed)?;
+        // 最后一个可失败步骤：额度由 commit 消费或 rollback 撤销；
+        // materialize 失败时由 reserve 撤销。
+        self.regions
+            .reserve(validated.plan.replacements.len())
             .map_err(|_| ChangeError::AllocationFailed)?;
         Ok(())
     }
@@ -1391,6 +1390,7 @@ impl MemorySpace {
         let index = self.transaction_index(prepared.key, ChangeStage::Reserved);
         let record = self.transactions.remove(index);
         self.reserved_growth -= record.reserved_growth;
+        self.regions.unreserve(prepared.plan.replacements.len());
         let mut permits = prepared.permits;
         for region in prepared.plan.replacements {
             if let Some(permit) = region.permit {
@@ -1405,20 +1405,22 @@ impl MemorySpace {
         let index = self.transaction_index(prepared.key, ChangeStage::Reserved);
         let mut retiring_permits = prepared.plan.retiring_permits;
 
-        for key in &prepared.plan.remove {
-            let region_index = self
+        for &(start, key) in &prepared.plan.remove {
+            let region = self
                 .regions
-                .iter()
-                .position(|region| region.key == *key)
+                .remove(&start)
                 .expect("validated region key changed before Commit");
-            let region = self.regions.remove(region_index);
+            assert_eq!(
+                region.key, key,
+                "validated region key changed before Commit"
+            );
             if let Some(permit) = region.permit {
                 retiring_permits.push(permit);
             }
         }
-        self.regions.extend(prepared.plan.replacements);
-        self.regions
-            .sort_unstable_by_key(|region| region.range.start());
+        for region in prepared.plan.replacements {
+            self.regions.insert(region.range.start(), region);
+        }
 
         let record = &mut self.transactions[index];
         self.reserved_growth -= record.reserved_growth;
@@ -1435,34 +1437,15 @@ impl MemorySpace {
         })
     }
 
-    pub fn publish(&mut self, committed: CommittedChange) -> PublishedChange {
+    /// 全部所需确认到齐后调用：消费已提交责任，产出同步完成证明
+    /// （[`RetireBatch`] 写明可释放的具体资源）与退休记录。
+    pub fn synchronize(&mut self, committed: CommittedChange) -> (RetiringChange, RetireBatch) {
         self.advance(
             committed.0.key,
             ChangeStage::Committed,
-            ChangeStage::Published,
-        );
-        PublishedChange(committed.0)
-    }
-
-    pub fn synchronize(&mut self, published: PublishedChange) -> SynchronizedChange {
-        self.advance(
-            published.0.key,
-            ChangeStage::Published,
-            ChangeStage::Synchronized,
-        );
-        SynchronizedChange(published.0)
-    }
-
-    pub fn begin_retire(
-        &mut self,
-        synchronized: SynchronizedChange,
-    ) -> (RetiringChange, RetireBatch) {
-        self.advance(
-            synchronized.0.key,
-            ChangeStage::Synchronized,
             ChangeStage::Retiring,
         );
-        let mut payload = synchronized.0;
+        let mut payload = committed.0;
         let batch = RetireBatch {
             fragments: core::mem::take(&mut payload.retiring),
             permits: core::mem::take(&mut payload.retiring_permits),
@@ -1470,21 +1453,13 @@ impl MemorySpace {
         (RetiringChange(payload), batch)
     }
 
-    pub fn finish_retire(
-        &mut self,
-        retiring: RetiringChange,
-        batch: &RetireBatch,
-    ) -> RetiredChange {
+    /// 最后一项退休资源已真实归还后收口；batch 非空为结构性错误。
+    pub fn complete(&mut self, retiring: RetiringChange, batch: &RetireBatch) {
         assert!(
             batch.is_empty(),
-            "memory change cannot leave Retiring with live retire owners"
+            "memory change cannot complete with live retire owners"
         );
-        self.advance(retiring.0.key, ChangeStage::Retiring, ChangeStage::Retired);
-        RetiredChange(retiring.0)
-    }
-
-    pub fn complete(&mut self, retired: RetiredChange) {
-        let index = self.transaction_index(retired.0.key, ChangeStage::Retired);
+        let index = self.transaction_index(retiring.0.key, ChangeStage::Retiring);
         self.transactions.remove(index);
     }
 
@@ -1495,7 +1470,8 @@ impl MemorySpace {
             self.transactions.is_empty(),
             "memory-space regions cannot drain with live transactions"
         );
-        let region = self.regions.pop()?;
+        let start = self.regions.first()?.0;
+        let region = self.regions.remove(&start).expect("first region exists");
         let view = region.view();
         Some((
             RetiringFragment {
@@ -1520,45 +1496,46 @@ impl MemorySpace {
         Ok(())
     }
 
+    /// 首次适配：按起点有序遍历 region（每步 O(log n)），事务足迹数受
+    /// `max_transactions` 约束，逐候选复检。不再拷贝并排序全表。
     fn find_hole(&self, bytes: usize) -> Result<PageRange, ChangeError> {
-        let obstacle_capacity = self
-            .regions
-            .len()
-            .checked_add(self.transactions.len())
-            .ok_or(ChangeError::RegionLimit)?;
-        let mut obstacles = Vec::new();
-        obstacles
-            .try_reserve_exact(obstacle_capacity)
-            .map_err(|_| ChangeError::AllocationFailed)?;
-        obstacles.extend(self.regions.iter().map(|region| region.range));
-        obstacles.extend(self.transactions.iter().map(|record| record.footprint));
-        obstacles.sort_unstable_by_key(|range| range.start());
-
         let mut cursor = self.bounds.start();
-        for obstacle in obstacles {
-            if obstacle.end() <= cursor {
+        let mut regions = self
+            .regions
+            .iter()
+            .map(|(_, region)| region.range)
+            .peekable();
+        loop {
+            let end = cursor
+                .checked_add(bytes)
+                .ok_or(ChangeError::Range(RangeError::Overflow))?;
+            if end > self.bounds.end() {
+                return Err(ChangeError::Conflict);
+            }
+            while regions.peek().is_some_and(|range| range.end() <= cursor) {
+                regions.next();
+            }
+            let candidate = PageRange::new(cursor, bytes)?;
+            if let Some(range) = regions.peek().filter(|range| range.overlaps(candidate)) {
+                cursor = range.end();
                 continue;
             }
-            if obstacle.start() > cursor && obstacle.start() - cursor >= bytes {
-                return PageRange::new(cursor, bytes).map_err(Into::into);
+            if let Some(blocker) = self
+                .transactions
+                .iter()
+                .filter(|record| record.footprint.overlaps(candidate))
+                .map(|record| record.footprint.end())
+                .max()
+            {
+                cursor = blocker;
+                continue;
             }
-            cursor = cursor.max(obstacle.end());
-        }
-        let end = cursor
-            .checked_add(bytes)
-            .ok_or(ChangeError::Range(RangeError::Overflow))?;
-        if end <= self.bounds.end() {
-            PageRange::new(cursor, bytes).map_err(Into::into)
-        } else {
-            Err(ChangeError::Conflict)
+            return Ok(candidate);
         }
     }
 
     fn range_empty(&self, range: PageRange) -> bool {
-        !self
-            .regions
-            .iter()
-            .any(|region| region.range.overlaps(range))
+        !self.regions_overlap(range)
             && !self
                 .transactions
                 .iter()
@@ -1573,7 +1550,11 @@ impl MemorySpace {
     ) -> Result<Vec<usize>, ChangeError> {
         let mut indices = Vec::new();
         let mut cursor = range.start();
-        for (index, region) in self.regions.iter().enumerate() {
+        for (index, region) in self.regions.iter_from(
+            self.regions
+                .floor(&range.start())
+                .map_or(range.start(), |(k, _)| k),
+        ) {
             if region.range.end() <= cursor {
                 continue;
             }
@@ -1608,7 +1589,7 @@ impl MemorySpace {
         &self,
         range: AddressRange,
         mutation: PageRange,
-    ) -> Result<(Vec<UserWriteSegment>, Vec<RegionKey>), ChangeError> {
+    ) -> Result<LeaseValidation, ChangeError> {
         if range.bytes() > self.limits.max_lease_bytes {
             return Err(ChangeError::LeaseTooLarge);
         }
@@ -1619,7 +1600,11 @@ impl MemorySpace {
         let mut segments = Vec::new();
         let mut keys = Vec::new();
         let mut cursor = range.start();
-        for region in &self.regions {
+        for (_, region) in self.regions.iter_from(
+            self.regions
+                .floor(&range.start())
+                .map_or(range.start(), |(k, _)| k),
+        ) {
             if region.range.end() <= cursor {
                 continue;
             }
@@ -1653,7 +1638,7 @@ impl MemorySpace {
                     .checked_add(cursor - region.range.start())
                     .ok_or(ChangeError::BackingOutOfRange)?,
             });
-            keys.push(region.key);
+            keys.push((region.range.start(), region.key));
             cursor = segment_end;
             if cursor == range.end() {
                 return Ok((segments, keys));
@@ -1697,10 +1682,12 @@ impl MemorySpace {
         }
     }
 
-    fn snapshot_valid(&self, snapshot: &[RegionKey]) -> bool {
-        snapshot
-            .iter()
-            .all(|key| self.regions.iter().any(|region| region.key == *key))
+    fn snapshot_valid(&self, snapshot: &[(usize, RegionKey)]) -> bool {
+        snapshot.iter().all(|&(start, key)| {
+            self.regions
+                .get(&start)
+                .is_some_and(|region| region.key == key)
+        })
     }
 
     fn plan_still_valid(&self, validated: &ValidatedChange) -> bool {
@@ -1712,21 +1699,40 @@ impl MemorySpace {
         }
         if let Some((_range, segments)) = &validated.lease {
             segments.iter().all(|segment| {
-                self.regions.iter().any(|region| {
-                    region.key == segment.region
-                        && matches!(
-                            region.kind,
-                            RegionKind::Mapping {
-                                current: Protection::ReadWrite,
-                                ..
-                            }
-                        )
-                        && region.range.address_range().contains(segment.user)
-                })
+                self.regions
+                    .floor(&segment.user.start())
+                    .is_some_and(|(_, region)| {
+                        region.key == segment.region
+                            && matches!(
+                                region.kind,
+                                RegionKind::Mapping {
+                                    current: Protection::ReadWrite,
+                                    ..
+                                }
+                            )
+                            && region.range.address_range().contains(segment.user)
+                    })
             })
         } else {
             true
         }
+    }
+
+    fn region_at(&self, start: usize) -> &Region {
+        self.regions
+            .get(&start)
+            .expect("covered region start is live")
+    }
+
+    /// O(log n)：有序且不重叠，只需检查 floor(start) 与 ceil(start) 两个候选。
+    fn regions_overlap(&self, range: PageRange) -> bool {
+        self.regions
+            .floor(&range.start())
+            .is_some_and(|(_, region)| region.range.overlaps(range))
+            || self
+                .regions
+                .ceil(&range.start())
+                .is_some_and(|(_, region)| region.range.overlaps(range))
     }
 
     fn transaction_index(&self, key: ChangeKey, stage: ChangeStage) -> usize {

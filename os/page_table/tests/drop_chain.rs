@@ -25,6 +25,7 @@ struct Tables(HashMap<u64, *mut [page_table::Pte; 512]>);
 unsafe impl Send for Tables {}
 
 static TABLES: Mutex<Option<Tables>> = Mutex::new(None);
+static ADOPTED: Mutex<Option<HashMap<u64, Owner>>> = Mutex::new(None);
 
 struct Mem;
 
@@ -101,6 +102,24 @@ impl TableFrameMemory for Mem {
             .expect("accessed unheld table");
         // SAFETY: tests serialize through TABLES; TableTree is the only accessor while alive.
         unsafe { &mut **table }
+    }
+
+    fn adopt(&mut self, owner: Owner) {
+        let previous = ADOPTED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(owner.0.0 as u64, owner);
+        assert!(previous.is_none(), "frame adopted twice");
+    }
+
+    fn reclaim(&mut self, frame: FrameNumber) -> Owner {
+        ADOPTED
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|map| map.remove(&(frame.0 as u64)))
+            .expect("reclaimed unadopted frame")
     }
 }
 

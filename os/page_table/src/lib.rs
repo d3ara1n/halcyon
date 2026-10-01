@@ -193,10 +193,18 @@ pub trait TableFrameOwner {
 }
 
 /// 可回收页表树的帧访问与 owner 类型。owner 由调用方在树锁外取得后显式供给。
+///
+/// 分支表 owner 不另存于树：安装时经 [`adopt`](Self::adopt) 交由帧本身承载，
+/// 摘除时经 [`reclaim`](Self::reclaim) 凭帧号重建。帧号是表帧唯一身份，
+/// 实现须保证每个已 adopt 的帧号恰好 reclaim 一次（树结构保证调用方满足此前提）。
 pub trait TableFrameMemory {
     type FrameOwner: TableFrameOwner;
 
     fn table_mut(&mut self, frame: FrameNumber) -> &mut [Pte; ENTRIES];
+    /// 把 owner 寄存于其表帧，之后仅以帧号身份存在于 branch PTE。
+    fn adopt(&mut self, owner: Self::FrameOwner);
+    /// 凭 branch PTE 中的帧号取回先前 adopt 的 owner。
+    fn reclaim(&mut self, frame: FrameNumber) -> Self::FrameOwner;
 }
 
 /// 表帧耗尽。
@@ -494,7 +502,8 @@ pub struct TableTree<M: TableFrameMemory, const LEVELS: usize> {
     mem: M,
     root: FrameNumber,
     root_owner: Option<M::FrameOwner>,
-    owners: Vec<M::FrameOwner>,
+    /// 已 adopt 的分支表数；owner 本体由帧承载，此计数只用于收束断言。
+    branches: usize,
     shared_root: [u64; ENTRIES / 64],
     owned_root: [u64; ENTRIES / 64],
     generation: u64,
@@ -514,7 +523,7 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             mem,
             root,
             root_owner: Some(root_owner),
-            owners: Vec::new(),
+            branches: 0,
             shared_root: [0; ENTRIES / 64],
             owned_root: [0; ENTRIES / 64],
             generation: 0,
@@ -587,12 +596,6 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         if owners.len() < current.required_frames {
             return Err(PrepareFailure {
                 error: MapError::FrameExhausted,
-                owners,
-            });
-        }
-        if self.owners.try_reserve(current.required_frames).is_err() {
-            return Err(PrepareFailure {
-                error: MapError::AllocationFailed,
                 owners,
             });
         }
@@ -840,7 +843,7 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             "owned root slot remains at drain completion"
         );
         assert!(
-            self.owners.is_empty(),
+            self.branches == 0,
             "branch owner remains at drain completion"
         );
         self.root_owner
@@ -1077,17 +1080,18 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
 
     fn install_owner(&mut self, owner: M::FrameOwner) -> FrameNumber {
         let frame = owner.number();
-        self.owners.push(owner);
+        self.mem.adopt(owner);
+        self.branches += 1;
         frame
     }
 
+    /// O(1)：owner 由帧号重建，不查找。
     fn take_owner(&mut self, frame: FrameNumber) -> M::FrameOwner {
-        let index = self
-            .owners
-            .iter()
-            .position(|owner| owner.number() == frame)
+        self.branches = self
+            .branches
+            .checked_sub(1)
             .expect("branch PTE has no committed table owner");
-        self.owners.swap_remove(index)
+        self.mem.reclaim(frame)
     }
 
     fn leaf_matches(&self, entry: Pte, ppn: Ppn, flags: u64) -> bool {
@@ -1383,7 +1387,7 @@ impl<M: TableFrameMemory, const LEVELS: usize> Drop for TableTree<M, LEVELS> {
             return;
         }
         assert!(
-            self.owned_root.iter().all(|word| *word == 0) && self.owners.is_empty(),
+            self.owned_root.iter().all(|word| *word == 0) && self.branches == 0,
             "page-table tree dropped before explicit drain"
         );
     }

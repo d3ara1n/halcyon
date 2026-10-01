@@ -1,6 +1,6 @@
 # 内核有界维护执行重构
 
-状态：**内核自主推进的责任边界已确认，执行方案待细化，未实施**。用户正常调用/观察，不需要特殊 syscall、显式让出或专用用户进程来提供内核执行机会。队列布局、工作原语与份额算法尚未达到施工门。全项目范围与已确认的 Close 语义由[设计总纲](todo-2026-09-29-system-redesign.md)拥有，本案只拥有必须由内核推进的有界执行，不拥有对象业务状态。
+状态：**执行机制设计轮次 1 已定稿（见“执行机制目标设计”），纯逻辑 crate 待实施，未接入内核**。用户正常调用/观察，不需要特殊 syscall、显式让出或专用用户进程来提供内核执行机会。全项目范围与已确认的 Close 语义由[设计总纲](todo-2026-09-29-system-redesign.md)拥有，本案只拥有必须由内核推进的有界执行，不拥有对象业务状态。下文“UnitOfWork 的机制定位”至“迁移面与删除门”为前期推导，与定稿节冲突时以定稿节为准。
 
 ## 目标、边界与当前事实
 
@@ -9,6 +9,117 @@
 现有 `os/kernel/src/{deferred_work,work_ledger,remote_call,sched,trap}.rs` 与 `task/{notify_work,request,retirement}.rs` 分担预算、执行队列、依赖及收尾。`sched.rs::run` 在 pick 前推进维护，`idle` 检查待办后才睡眠；因此“没有用户线程就没有内核执行机会”不成立。当前多类 debt、ProcessDrain request 和 WaitSet 专门 actor 不作为目标结构。
 
 非目标：业务任务 executor、用户回调、文件系统政策、任意 kernel thread 框架。保留协作式执行是本轮推荐前提；若改为可抢占/可睡眠内核，必须另行闭合全套执行与锁语义，不能在本案顺手加入。
+
+## 执行机制目标设计（设计轮次 1，已定稿）
+
+经 advisor 审查一次、与 DeepAsh 两轮对抗收敛确定。标“用户确认”为用户明确决定，其余为收敛结论。本节取代下文前期推导中的候选部分。
+
+### 工作记录
+
+- **粒度**：每份独立责任一条记录，不是每对象一条。同一对象的独立责任（例如设备 CPU 映射撤销与 DMA 撤销）各有记录；动态操作在被接受时预付记录。
+- **嵌入与准入**：记录嵌在负担它的拥有体内，侵入式挂队零分配；准入点即拥有体/操作的创建或接受，不存在独立“工作槽预算”。因此 LastCapability 与 Close 发布不可能返回 OOM/Busy；级联只挂子记录，内核栈深为常数。
+- **保活**：Queued/Running/Blocked 期间队列持拥有体强根；从来源摘出、正在调用 wake 的 token 也持强根或有明确 quiescence。Done 后在锁外交还强根。
+- **Done 即终结（用户确认）**：记录 Done 后不再承载新责任，新责任用新记录；迟到 wake 遇 Done 一律忽略。与 capability 侧“归零即终结、不复活”一致。
+
+### 状态与唤醒
+
+同一队列锁拥有状态、链接与执行租约，不设独立原子态。状态：`Idle → Queued → Running{notified} → Queued | Blocked | Done`。
+
+| 事件 | 状态 | 结果 |
+|---|---|---|
+| wake | Blocked | 转 Queued 并挂接 |
+| wake | Running | 只置 notified，不入队 |
+| wake | Queued / Done | 无动作 |
+| pick | Queued | 转 Running{notified=false} |
+| finish(Ready) | Running | 转 Queued 挂队尾 |
+| finish(Blocked) | Running | notified 则 Queued，否则 Blocked |
+| finish(Done) | Running | Done，锁外清理登记并交还强根 |
+
+- Running 期间绝不直接改 Queued，防止两 hart 同时推进同一记录。notified 只在出队时清零。
+- 依赖源自持锁完成“登记 + 复检”；完成方源锁内更新谓词并摘 token，解源锁后 wake。源锁与队列锁不嵌套；step 收束不在队列锁内注销来源或调用业务代码。
+- token 携带等待代次，迟到通知不作用于新等待周期或 Done 记录。
+- 三个窗口：登记前完成由复检覆盖；登记后、提交 Blocked 前完成由 notified 覆盖；Blocked 后完成由重新入队覆盖。
+
+### 队列位置与账户公平
+
+- 全局两级队列：活跃账户环 + 每账户 Ready 记录队列，按资金账户 DRR；任意 hart 可领取。不选每 hart 队列 + 窃取：反例为 A 在 8 hart 均有工作、B 仅 1 hart，本地公平下 A 约得 15 倍 B，修正仍需全局记账。
+- 摘取时预扣有界授予额度，返回后按实际占用结算差额；超出转为账户欠账下轮偿还。在途误差上界 = 在途数 × 单原子上界。
+- 账户有 Running/Blocked 记录时账本保持存活，不因 Ready 暂空重置欠账。
+- 选账户有界：每次仲裁只推进有界个账户，进度延续到下一安全点，不在锁内循环。
+- 持锁内只做摘挂、预扣、状态转换；禁止 step、分配、析构级联、IPI 发送、依赖源查询与其他锁等待。IPI 解锁后发，队列非空是真值；idle 登记后复检。
+- 性能：全局锁按批次争用（锁内常数时间 / 批次执行时间）。真实负载下持锁或等锁时间超过测量阈值时，改为每 hart 本地队列 + 全局账户虚拟时间；crate 的仲裁接口为纯值，不绑定锁结构，替换只改内核存储。
+
+### 队列锁（用户确认）
+
+在 `os/kernel/src/sync.rs` 新增 ticket 原始锁（`next`/`serving` 两计数，FIFO），外层容器复用现有关本地中断与 rank ladder 断言；不做 crate。等锁上界：每 hart 至多一个待获取请求，最多排在 H−1 个短临界区之后。现有 `RawSpinlock`（CAS，无公平）不能给出该界；其余锁按需迁移（timer、remote 优先），全量退场另立锁替换记录承接。
+
+### 结构上界与时间目标分离
+
+- 三层契约：①到达本地检查点的最大间隔（本案以单步结构上界约束）；②从发布/到期到确认/通知的排队与服务延迟；③线程实际运行延迟。固定版本 SBI 与特权规范只要求有界、未给数值，故 timer 精度推不出②，TLB 协议推不出确认时限；`QUANTUM_NS` 不作依据。
+- ②③的数值是系统政策参数，待定标；无平台 WCET 时只承诺结构性有限步与条件性时间界，QEMU 测量不称 WCET，不宣称硬实时。
+- 成本：公平账本统一按实际占用时间（平台 time tick）结算；领域原语只提供结构上界（单原子最大规模、循环层数、锁链、潜在析构），共享原语由唯一实现拥有其上界。执行器不认识原语类型，无换算系数。每原子动作边界检查预算，允许超出一个原子，超出入欠账。
+- timer/remote 为每 hart 定位短服务：每次摘有限项、提交仲裁与唤醒，不为每个 timer 建记录；仲裁引出的长清理交给已拥有该责任的记录。未处理完保持 pending，下一检查点继续；不得 arm 到已过期时刻造成中断风暴。
+
+### 维护份额：每 hart 两类别有界时间轮转
+
+- 每 hart 在 U（本 hart 兼容域可运行用户线程，内部保留域 FIFO）与 M（全局维护，内部账户 DRR）间轮转；不向域 FIFO 塞假线程。
+- 有符号余额：实际执行全额扣减，轮到该类加 q；余额 > 0 才开始执行，到检查边界完整扣账，余额 ≤ 0 不再启动下一原子，故负余额下界 −δ。δ 覆盖最后一次检查到停止之间的完整不可抢占尾段（含应归账锁等待、退场）。负债保留，不在独占区间清零；空闲不积攒正信用。qM、qU 均 > 0。
+- 余额非正而跳过是仲裁推进，不是“无工作”：保留仲裁进度，不因此 WFI，不在 run 入口重置轮次；连续空仲裁照常服务 pending，开销计入开销边界。
+- 保证：双方持续有工作时 S_M ≥ qM/(qM+qU)·A − E，S_U 对称；A 为扣除调度与紧急服务后的可分配时间，E 来自一轮相位差、原子超出与计时误差。最大连续占用约 q + δ。无用户线程的 hart 可全借给 M。只保证类别份额，不证明单线程期限；M 只有不可并行工作时不承诺所有 hart 的总保底。
+- **紧急服务与份额（用户确认）**：U/M 份额只针对扣除紧急服务后的剩余 CPU；紧急服务容量由 timer、remote 各自 owner 用到达准入约束。
+- **qM/qU（用户确认）**：待定标政策参数，不在计划冻结数值；进程回收接入后用真实负载定标。
+- 仲裁点：`run()` 处理完线程离场、pick 之前；连续 M 每批回到此点。`trap.rs` Completed→Resume 与 SSIP Resume 也须在统一返回边界结算当前类别，额度耗尽且另类可运行则转回 `run`。返回用户前 arm 线程量子、类别剩余额度、最近期限中最早者；trap/Resume 不重发额度。syscall 内核时间归 U，维护成本不归无关线程。
+
+### 纯逻辑 crate 与内核分工
+
+新建 `os/` 纯逻辑 crate 替换 `os/work_debt`（其全局固定槽与 `FairBudget` 固定类别顺序不保留）：
+
+| crate（纯值、host 单测） | 内核 |
+|---|---|
+| 记录状态机 `transition(State, Event) -> (State, Action)`，含 notified 与等待代次 | 记录存储、侵入式链接、强根、ticket 锁 |
+| 账户 DRR：选账户（有界推进）、预扣、结算、欠账 | 调用各类型 step、门铃 IPI |
+| 两类别轮转器：有符号余额、选类、计费 | 接入 `sched::run/idle`、trap 返回边界、timer arm |
+
+不接收回调、不反向依赖内核。step 契约 `step -> { cost, Ready | Blocked(依赖已登记) | Done }` 由内核侧定义。
+
+### 剩余设计门与 owner
+
+1. **本案（crate 实施时闭合）**：crate 类型与 host 单测；内核拼装草图（记录嵌入位置、锁序、强根转交、事件执行点）。
+2. **调度与预算**：qM/qU 及②③响应目标定标，平台 δ 取证；owner 本案，触发为进程回收接入后。
+3. **进程与 VM 分案**：地址空间整体退休、退款、大分配准备发布屏障；需改写的非有界原语——退休 step 遍历全部 views（`task/proc.rs:1341`）、整段清零（`frame.rs:846`）、Handle 阶段依赖（`task/proc.rs:4177`）。timer 一次排空（`sched.rs:333`）与 remote 最后确认直接 complete（`remote_call.rs:330`）由本链接入时改写。
+
+### 内核拼装草图（设计产物，未写代码）
+
+**记录嵌入**
+
+| 拥有体 | 记录 | 准入点 |
+|---|---|---|
+| 每个可终结对象（Receive 队列、MemoryObject backing、订阅集合等） | `retire: WorkRecord` | 对象创建成功即存在 |
+| Process | 唯一回收记录，覆盖构造失败、终止与最终收束 | 进程创建 |
+| 地址空间 | 整体退休记录（屏障达成后独占） | 地址空间创建 |
+| 大分配准备对象 | 准备记录，取消切换到回滚阶段 | 操作被接受时（可拒绝） |
+| 设备绑定（MMIO/IRQ/DMA） | 各自独立记录 | 绑定建立时 |
+
+`WorkRecord` = `maintenance::Record` + 侵入式链接 + 所属账户引用。拥有体实现内核 trait `Work { fn step(&self, grant) -> (cost, Outcome) }`；队列持 `Arc<dyn Work>` 作为强根，由 Queued/Running/Blocked 期间持有，Done 后锁外 drop。
+
+**全局队列与账户**：一个 `MaintenanceQueue`（ticket 锁），内含活跃账户环；每个账户（Job 级资金账户）带 `maintenance::Ledger` 与 Ready 记录链。账户只要有在途记录就挂在环上或由在途记录强持。每 hart 一个 `maintenance::Rotor`，hart 私有，无锁。
+
+**锁序**：新增 `ranks::MAINTENANCE`，置于全部业务/对象锁之后、`HEAP` 之前（约 660）。约束：持 MAINTENANCE 时不取任何其他锁（含 HEAP，因挂接零分配）；发布方可在业务锁内调用 publish（MAINTENANCE 为内层叶），但 IPI 在解开全部锁后发送。依赖源锁与 MAINTENANCE 不嵌套：源锁内只摘 token，解源锁后再 wake。
+
+**事件执行点**
+
+| 事件 | 位置 | 动作 |
+|---|---|---|
+| LastCapability | `CapTable` 锁外、调用 Close 的 syscall 返回前 | 对象 retire 记录 publish；Close 返回时责任已可达 |
+| 表退出 | 进程回收记录的 step 内 | `shut` 后 `take_next_bounded`，摘出 cap 锁外 release，额度不足时剩余 cap 留在记录游标 |
+| 级联 | 父 step 内 | 只 publish 子记录，不递归 step |
+| 依赖完成（TLB 确认、对端退休） | 完成方解源锁后 | `wake(ticket)` |
+| 选类与执行 | `sched::run` 离场处理后、pick 前 | `rotor.choose`；M 则锁内 visit→pick，锁外 step，锁内 finish+settle |
+| 返回边界结算 | `trap.rs` Completed/SSIP Resume 前 | `rotor.charge(U, elapsed)`，额度耗尽且 M 可运行则转 Requeue |
+| idle | `sched::idle` | 登记 idle 后复检全局队列非空；仅 Blocked 时可 WFI |
+| timer/remote | 每批之间、run 循环顶 | 摘有限项；未完保持 pending，arm 到下一检查点 |
+
+**仍待其他分案的接缝**：Process 回收 step 的阶段划分（进程分案）；地址空间整体退休与退款（VM/进程分案）；capability `Authority` 落在哪些对象上及 CapTable 锁位置（capability 拼装草图）。
 
 ## UnitOfWork 的机制定位
 
@@ -25,7 +136,8 @@
 仍需保留实际约束：物理资源与 metadata 准入、authority 和付款边界、在途责任存量，以及每一步不可抢占工作的结构上界。UnitOfWork 不消除成本，也不能把内部仍做完整遍历的函数包装成一个合格 step。
 
 如果某个底层动作本身不能分步且没有可接受的执行上界，需要改写原语、转成发起/完成协议，或明确重审执行模型；不能以它位于维护队列中为理由接受任意长执行。
-## 推荐执行形状
+
+## 推荐执行形状（前期推导）
 
 ### 稳定责任与三个推进结果
 
@@ -136,4 +248,6 @@ PM 持有监督和终止政策，发起终止并观察资源收束；内核持�
 
 ## 接力
 
-内核自主推进方向已确认。下一步闭合施工前设计门，与 capability 释放和进程自动回收共同接通；用户态不提供特殊推进调用。具体工作表示、份额和队列仍待定型，ideas 的清理不能替代这些设计。仅把旧债务改名，或只增加一个外层 executor，不满足本案目标。
+执行机制设计轮次 1 已定稿（见“执行机制目标设计”）。`os/maintenance` crate 已实施（未提交，未接入内核）：`record`（状态机含 notified 与等待代次）、`account`（账户 DRR：访问/预扣/结算/欠账）、`rotor`（两类别有符号余额轮转）。开发证据：`cargo test -p maintenance --target aarch64-apple-darwin` 16 项通过，clippy `-D warnings` 通过；未运行 `just check`/QEMU。
+
+内核拼装草图已写入“执行机制目标设计”节。下一步：进入进程自动回收分案，闭合草图中留给进程/VM/capability 的接缝。按责任链施工方式，crate 不单独接入内核，待对象持有与释放链整体就绪后一次接入，删除 `os/work_debt` 与 `deferred_work/work_ledger/notify_work/request/retirement` 旧路径；ticket 锁随本链接入一并加入 `sync.rs`。

@@ -179,7 +179,7 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 
 ### 剩余设计门
 
-1. capability 实现：计数/终态提交锁序、锁外释放承载、返还预约身份及表退出仲裁、批量失败释放的结构性上界。
+1. ~~capability 实现~~：已由“施工进度/内核拼装草图”闭合。
 2. [IPC 分案]：authority→use→终结观察责任链、SendOnce 准入、队列中 capability 环的禁止或回收、付款、队列上界、接收失败与关闭排空。环未闭合前 TRANSFER 迁移不算完成。
 3. [VM/进程分案]：统一 backing/view Map 与 funding 权限、结果交付、TLB 完成边界、mapping owner 借用安全、退出收束。
 4. 消费者迁移与验收：Runnel 改为组合 Endpoint + 独立 mapping owner 且以 Start 表达 readiness（`librunnel`、`libkernel/ipc/tunnel.rs`、`srv_fs` stream 的 PEER_ATTACHED 用法）；ThreadBuilder/Control；RPC 独立 SendOnce；shared/libkernel/服务同改；删除旧 Tunnel 特判、role、MAP 与运输双位。仓库无 BufferQueue 实现，不虚构其迁移。
@@ -238,4 +238,31 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 
 接入归属：本 crate 属于总纲“对象持有与释放链”，按[责任链施工方式](todo-2026-09-29-system-redesign.md#施工方式按责任链整段替换)在该链就绪后整段接入内核，不单独接入。接入条件：维护执行与进程自动回收分案闭合并产出各自 crate/契约；本链涉及对象的释放接缝（含 Tunnel 需随 VM 链拆分的部分）确定归属。
 
-待补内核拼装草图（设计产物，不写代码）：`Authority` 在各内核对象上的实现位置、`CapTable` 所在锁及与 space/对象锁的单向顺序、`LastCapability` 的锁外执行点与维护承载、`claim`/`restore` 在 ProcessStart 等消费者中的调用点、进程退出 `shut` + `take_next_bounded` 与自动回收的衔接。
+### 内核拼装草图（设计产物，未写代码）
+
+闭合剩余设计门 1；执行承载见[维护执行拼装草图](todo-2026-09-29-kernel-maintenance-execution.md)，进程衔接见[回收结构定稿](todo-2026-09-29-process-automatic-reclamation.md)。
+
+**Authority 落点**：每个授权对象（Receive/Send/SendOnce、Notification、MemoryObject、Endpoint/Invitation、ProcessBuilder/ProcessControl、ThreadControl/启动票据、Job、Pool）在对象本体内嵌一个 `Holders`，`impl Authority for Arc<Obj>`。表元素为 `Cap<ObjectRef>`（`Arc<dyn KernelObject>`，`KernelObject: Authority`）。删除 `CapabilityRef` 的 ThreadControl downcast Drop、`HandleRole`、`PendingClose`。ZeroPolicy 按类型固定：ProcessControl 为 Remintable，其余 Terminal。
+
+**KernelObject 与 Work 正交**：`KernelObject` 只表示“可经 Handle 引用的对象”，契约收窄为身份/kind、rights 上限、`Holders`、`on_last_capability` 与等待源；删除 role、`close_handle`/`close_transit`、`retirement()`。维护执行的 `Work` 不依附 KernelObject：AddressSpace、内存事务、设备绑定等无 handle 的内部 owner 只实现 Work；有长工作的 Handle 对象两者都实现，由 `on_last_capability` 发布其内嵌记录；归零即有界结束的对象只实现 KernelObject。等待源/订阅部分的重构归 IPC 与等待分案。
+
+**锁与锁序**：`CapTable` 置于 `Process.handles: Spinlock`（rank `HANDLE_TABLE`；跨进程直接交付沿 pid 递增 chained，沿用现规则）。`Holders` 为原子字，无锁。表锁内只做槽位变更与 `Cap` 摘出/放入；`release` 及其 `LastCapability` 后续动作一律在表锁外；表锁内不取对象业务锁、不取 `MAINTENANCE`。单向序：对象锁 → `MAINTENANCE`（publish 时表锁已放开）。
+
+**LastCapability 执行点与承载**：调用方在全部锁外调用 `obj.on_last_capability()`：只做对象自身同步域内的有界仲裁（Pending→Aborted、关闭接收准入等），需后续工作则 publish 对象内嵌的 `retire` 记录。记录出生内嵌、publish 零分配，故 Close 必成。普通内核 `Arc` 末端 drop 只释放存储，不展开长链；有子项的对象由记录 step 收尾。
+
+**消费者调用点**
+
+| 操作 | 表锁内 | 表锁外 |
+|---|---|---|
+| Close | `close(handle)` 摘 `Cap` 或撤销 Claimed 预约 | `release()`→事件→`on_last_capability` |
+| Duplicate | `get` + `derive` + `insert`；准入失败返还 owner | 无 |
+| Send 附 handle | 表外准备后短临界区：整组 `extract`（检 TRANSFER）→ 入队；队列满整组原样不动 | 无（入队即转移，不经 release） |
+| Receive 安装 | `reserve(n)` → 用户输出写成功后 `commit`，失败 `rollback` | `commit` 失败返还的 `Cap` 逐个 release |
+| ProcessStart / ThreadStart | `claim` 接管 Builder/票据 owner | 提交成功 `commit_claim`，失败 `restore`；`Released(事件)` 锁外执行 |
+| 进程退出 | 回收记录 ReleaseHandles step：首次 `shut`，每步 `take_next_bounded(cursor, grant)` | 摘出 `Cap` 锁外 release；不等待事件引出的对象 Done |
+
+**批量释放上界**：退出摘取扫描量受授予额度约束，`cursor` 存于进程记录跨 step 延续；单次摘出至多一份 `Cap`，其 release + `on_last_capability` 为结构常数（仅仲裁与 publish）。Send/Receive 整组失败释放以 `MESSAGE_HANDLE_MAX`（8）为结构上界，在 syscall 内直接完成。
+
+**线性化点**：Close 与 claim 在表锁内竞争，先到者胜；claim 后 Close 只撤销返还资格，已接受操作照常完成。`shut` 为表退出线性化点，之后 `restore` 一律 `Released`，Receive `commit` 一律失败返还。Remintable 铸造与归零均为 `Holders` CAS 且无事件；Terminal 封闭位与最后释放同一 CAS，封闭后 `mint` 失败。
+
+剩余设计门 1 由本草图闭合；各对象 `Work::step` 由所属分案（IPC/VM/进程）实现。

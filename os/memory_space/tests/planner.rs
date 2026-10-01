@@ -73,14 +73,11 @@ fn complete_prepared(
     prepared: memory_space::PreparedChange,
 ) -> Vec<memory_space::RetiringFragment> {
     let committed = space.commit(prepared);
-    let published = space.publish(committed);
-    let synchronized = space.synchronize(published);
-    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let (retiring, mut batch) = space.synchronize(committed);
     let fragments = batch.fragments().to_vec();
     while batch.pop_fragment().is_some() {}
     while batch.pop_permit().is_some() {}
-    let retired = space.finish_retire(retiring, &batch);
-    space.complete(retired);
+    space.complete(retiring, &batch);
     fragments
 }
 
@@ -560,13 +557,10 @@ fn user_write_lease_pins_exact_projection_until_commit_or_rollback() {
             })
             .is_ok()
     );
-    let published = space.publish(committed);
-    let synchronized = space.synchronize(published);
-    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let (retiring, mut batch) = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     while batch.pop_permit().is_some() {}
-    let retired = space.finish_retire(retiring, &batch);
-    space.complete(retired);
+    space.complete(retiring, &batch);
 }
 
 #[test]
@@ -725,11 +719,9 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = space.commit(prepared);
     assert_eq!(object.permit_count(), 1);
-    let published = space.publish(committed);
     assert_eq!(object.permit_count(), 1);
-    let synchronized = space.synchronize(published);
     assert_eq!(object.permit_count(), 1);
-    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let (retiring, mut batch) = space.synchronize(committed);
     let fragment = batch.pop_fragment().expect("object fragment must retire");
     assert_eq!(
         fragment.backing_retire,
@@ -741,10 +733,9 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
         "last permit retire must publish the seal"
     );
     assert!(batch.is_empty());
-    let retired = space.finish_retire(retiring, &batch);
     assert_eq!(object.state(), ExecutableState::Executable);
     assert_eq!(object.permit_count(), 0);
-    space.complete(retired);
+    space.complete(retiring, &batch);
     assert!(object.authorize_view(Protection::ReadExecute).is_ok());
     assert_eq!(
         object.authorize_view(Protection::ReadWrite),
@@ -799,15 +790,12 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
     let permits = object.reserve_replacement_writes(requirement).unwrap();
     let prepared = space.reserve(validated, permits).unwrap();
     let committed = space.commit(prepared);
-    let published = space.publish(committed);
-    let synchronized = space.synchronize(published);
-    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let (retiring, mut batch) = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     let old = batch.pop_permit().expect("old writable permit must retire");
     assert!(!object.retire_write(old));
     assert!(batch.is_empty());
-    let retired = space.finish_retire(retiring, &batch);
-    space.complete(retired);
+    space.complete(retiring, &batch);
     assert_eq!(object.state(), ExecutableState::Sealing);
     assert_eq!(object.permit_count(), 2);
 
@@ -836,17 +824,14 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
     assert!(validated.permit_requirements().is_empty());
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = space.commit(prepared);
-    let published = space.publish(committed);
-    let synchronized = space.synchronize(published);
-    let (retiring, mut batch) = space.begin_retire(synchronized);
+    let (retiring, mut batch) = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     let mut sealed = false;
     while let Some(permit) = batch.pop_permit() {
         sealed |= object.retire_write(permit);
     }
     assert!(sealed);
-    let retired = space.finish_retire(retiring, &batch);
-    space.complete(retired);
+    space.complete(retiring, &batch);
     assert_eq!(object.state(), ExecutableState::Executable);
     assert_eq!(object.permit_count(), 0);
 }
@@ -1102,12 +1087,9 @@ fn translation_intents_follow_typed_change_stages() {
     ));
     let committed = space.commit(prepared);
     assert_eq!(space.transaction_count(), 1);
-    let published = space.publish(committed);
-    let synchronized = space.synchronize(published);
-    let (retiring, batch) = space.begin_retire(synchronized);
+    let (retiring, batch) = space.synchronize(committed);
     assert!(batch.is_empty());
-    let retired = space.finish_retire(retiring, &batch);
-    space.complete(retired);
+    space.complete(retiring, &batch);
     assert_eq!(space.transaction_count(), 0);
 }
 
@@ -1326,7 +1308,7 @@ fn drain_one_removes_exactly_one_region_without_allocation() {
 }
 
 #[test]
-#[should_panic(expected = "memory change cannot leave Retiring with live retire owners")]
+#[should_panic(expected = "memory change cannot complete with live retire owners")]
 fn retiring_stage_cannot_complete_with_live_owners() {
     let mut space = space();
     let layout = commit_map(
@@ -1350,9 +1332,7 @@ fn retiring_stage_cannot_complete_with_live_owners() {
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = space.commit(prepared);
-    let published = space.publish(committed);
-    let synchronized = space.synchronize(published);
-    let (retiring, batch) = space.begin_retire(synchronized);
+    let (retiring, batch) = space.synchronize(committed);
     assert!(!batch.is_empty());
-    let _ = space.finish_retire(retiring, &batch);
+    space.complete(retiring, &batch);
 }

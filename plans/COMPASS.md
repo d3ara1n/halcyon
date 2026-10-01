@@ -8,7 +8,9 @@
 
 1. [全项目重构设计总纲](todo-2026-09-29-system-redesign.md)：无兼容约束重审；按独立契约形成 ideas 与成型实施分案。
 2. [Capability 与资源释放](todo-2026-09-28-capability-last-reference.md)、[内核维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md)：共同闭合本地释放与自动收束主线。
-3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：结合全项目目标确定基础对象关系后继续。
+3. [内存管理与地址空间重构](todo-2026-10-01-memory-redesign.md)：地址空间整体退休与 view/backing 归还是上一条主线的前置。
+   - **下阶段入口**：[对象持有与释放链内核整体接入](todo-2026-10-01-object-chain-kernel-integration.md)；其后 [锁优化与无锁化评估](todo-2026-10-01-lock-performance.md)。
+4. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：结合全项目目标确定基础对象关系后继续。
 
 运行时分层与线程生命周期已完成：[运行时分层 review](archived/review-2026-09-28-runtime-layering.md)。
 

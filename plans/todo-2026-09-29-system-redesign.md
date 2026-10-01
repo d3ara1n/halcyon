@@ -30,9 +30,9 @@
 
 | ideas 范围 | 本轮已确认内容及直接依据 | 尚未闭合的详细设计 | ideas 审定 / 代码状态 |
 |---|---|---|---|
-| `kernel.md` | 内核自主推进、用户无特殊推进调用：[维护分案](todo-2026-09-29-kernel-maintenance-execution.md) | 工作记录/队列、容量、hart 归属、份额、依赖与单步上界 | 未整篇审定；局部原则已确认 / 未实现 |
+| `kernel.md` | 内核自主推进、用户无特殊推进调用：[维护分案](todo-2026-09-29-kernel-maintenance-execution.md) | 执行机制已定稿：[维护分案定稿节](todo-2026-09-29-kernel-maintenance-execution.md#执行机制目标设计设计轮次-1已定稿)；剩余 qM/qU 与响应目标定标、内核拼装草图 | 未整篇审定；局部原则已确认 / 未实现 |
 | `object.md`、`kernel-interface.md` | 合法 Close 必成本地释放、完成操作分离；权限模型定稿（(授权对象, rights)、九位标准 rights、最后持有事件、返还预约、Attach 拆分、`os/capability` crate）：[capability 分案权限模型节](todo-2026-09-28-capability-last-reference.md#权限模型目标设计设计轮次-4已定稿) | capability 实现锁序与预约布局；IPC 责任链与 VM 映射由各分案闭合 | 未整篇审定；局部原则已确认 / 未实现 |
-| `task.md`、`bootstrap.md`、`execution-context.md` | 终止后自动回收、PM 政策与观察：[进程分案](todo-2026-09-29-process-automatic-reclamation.md) | 进程/线程/Job/启动关系、回收根、结果交付、终态与依赖顺序 | 未整篇审定；局部原则已确认 / 未实现 |
+| `task.md`、`bootstrap.md`、`execution-context.md` | 终止后自动回收、PM 政策与观察：[进程分案](todo-2026-09-29-process-automatic-reclamation.md) | 回收根、阶段、终态屏障与发布顺序已定稿；剩余进程出生准入/Start 仲裁、Job、资金账户及 VM 接缝 | 未整篇审定；局部原则已确认 / 未实现 |
 | `mm.md`、`tunnel.md`、`shared-memory.md` | Close 与物理退休分开；其余由本总纲的内存重审范围承接，预算见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | backing/映射 owner、区间修改、结果写回、同步与退款；内存完整分案待形成 | 未审定；清理/局部目标改写 / 未实现 |
 | `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 取消用户驱动的内核清理；相关已确认边界见 capability/维护分案 | 消息与请求模型、在途使用、订阅、取消、结果及执行接缝；完整分案待形成 | 未审定；部分清理/局部目标改写 / 未实现 |
 | `framework.md`、`runnel.md`、`buffer-queue.md` | 上层不承担内核退休推进；相关边界见 capability/维护分案 | 业务任务、线程语言资源、数据面与完成、库边界；完整分案待形成 | 未审定；部分清理/局部目标改写 / 未实现 |
@@ -51,7 +51,7 @@
 - N 个独立能力的终结、分散 backing 的归还、映射撤销与跨 hart 确认具有真实成本。整棵所有权树摘除可以很短，逐个终结不同 owner 的总工作未必能变成常数。
 - 分配也有相同问题：清零、建页表、发布映射均随规模增长。普通分配允许准入失败，已接受释放不能因缺少清理承载失败；二者不能分别建立互不相干的推进框架。
 - 优先消除无谓遍历与事务：维护可直接摘除的拥有链；完整释放不重新做任意区间切割规划；进程失去执行资格后用整地址空间退休入口；相同域的翻译失效可以合并；引用级联改为非递归交接。批量释放必须保留共享对象与资金来源，不能把它们整体重置。
-- 无法消掉的宽度由内核分批推进，具体方案由[有界维护执行计划](todo-2026-09-29-kernel-maintenance-execution.md)拥有。内核自主推进、无需用户逐批 syscall 的责任边界已确认；协作式内核中的工作记录、队列、执行份额和原语上界仍待详细设计闭合。
+- 无法消掉的宽度由内核分批推进，具体方案由[有界维护执行计划](todo-2026-09-29-kernel-maintenance-execution.md)拥有。内核自主推进、无需用户逐批 syscall 的责任边界已确认；工作记录、队列、执行份额已在该计划定稿；原语上界改写由进程与 VM 分案承接。
 - 现有 `sched.rs::run/idle` 已证明没有 runnable 用户线程也能执行维护；但现有各 debt 分类与游标不是目标布局。最终执行入口还必须在连续维护时服务 pending timer/remote 等来源，不能只依赖返回用户态或实际 WFI。
 
 不以“把所有工作交给后台”代替结构审视。新增一个常驻 kernel thread 或引入内核抢占，会改变整个执行模型，应按独立理由决策；它们不会让 N 项工作本身消失。
@@ -61,7 +61,7 @@
 | 分案 | 唯一拥有的契约 | 依赖与当前状态 |
 |---|---|---|
 | [capability 与资源释放](todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage 分离，统一 Close，类型化释放接入，运输/消费/回滚 | 设计轮次 4；权限模型定稿，剩余实现门与 IPC/VM 分案衔接 |
-| [内核有界维护执行](todo-2026-09-29-kernel-maintenance-execution.md) | 执行根、准入、单步预算、公平、停驻唤醒、idle 活性、批量分配/回收的共同承载 | 自主推进方向已确认；具体执行承载与调度尚未冻结 |
+| [内核有界维护执行](todo-2026-09-29-kernel-maintenance-execution.md) | 执行根、准入、单步预算、公平、停驻唤醒、idle 活性、批量分配/回收的共同承载 | 设计轮次 1 定稿；纯逻辑 crate 待实施 |
 | [进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 终止到资源收束的单一 owner，公共完成状态，删除 ProcessDrain 及消费者驱动 | 依赖前两案的释放/执行契约；需与地址空间释放一起闭合 |
 | 映射、backing 与资源来源重审 | allocation identity、完整释放与部分修改、同步屏障、物理/metadata 费用 | 待单独形成完整计划；不是给现有 Tunnel Close 多预留一套重试资源 |
 | IPC、等待与服务调用重审 | 消息/能力运输、请求与回复责任、订阅与终态观察 | 待按独立需求重新定形；当前 Mailbox/Delivery/Lifetime/WaitSet 名称均非保留承诺 |
@@ -98,6 +98,17 @@
 
 未决问题必须留在本分案的设计门，并阻止依赖它的实施。用户要求的是确定后完整成型的 todo；当前记录不以篇幅或条目数量冒充已施工就绪。
 
+## 设计推进方式（用户确认）
+
+各分案沿用以下流程，新会话从本节与所属分案直接接手，不需用户重复交代。
+
+- **收敛优先**：目标是逐步收敛，而非逐步补全。设计越补越复杂、越难控制，视为方向错误的信号，回退换方向，不继续补洞。成品应简约且覆盖面广。
+- **泛化吸收特例**：用机制包含特例，不为特例开分支。其他机制面只作参考；与本案对不上时，可推翻或与本案一起提升为统一机制（先例：权限阶段删除 facet，Tunnel Attach 拆为授权移交 + 显式 Map）。
+- **推进顺序**：读代码形成现状事实与候选方案 → 写入计划前必要时咨询一次 advisor（一个决策只问一次）→ 与另一会话逐轮对抗收敛，每轮只收敛一两个点，取舍由主会话判断 → 仅在改变用户已确认决定、外部语义或明显取舍代价时报用户确认（用户确认：主会话判断更优即可直接定稿）→ 定稿写入所属 todo，区分“用户确认”与“收敛结论”，剩余设计门尽量少并指定 owner。
+- **授权**：本重构范围内设计写入、crate 实现与验证无需逐步批准；提交、push 等仍按 AGENTS 授权规则。
+- **交接**：分案完成或中断时同步本篇 ideas 审定登记、责任链表与 COMPASS 入口；未完成事项写入所属分案接力。
+- **下一机制面**：按责任链表的依赖选择。当前为对象持有与释放链：维护执行 → 进程自动回收 → 补 capability 内核拼装草图 → 整链接入。
+
 ## 施工方式：按责任链整段替换
 
 用户已确认：不逐块替换旧内核，也不等全部完成再一次性重写。施工单位是责任链——链上各机制设计闭合、纯逻辑 crate 就绪后，一次重写该链在内核中的全部代码并删除旧路径，不为适配未重构机制编写 adapter；链与链之间不做半迁移。
@@ -108,8 +119,8 @@
 
 | 责任链 | 组成 | 就绪状态 |
 |---|---|---|
-| 对象持有与释放 | [capability](todo-2026-09-28-capability-last-reference.md#施工进度)、[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | capability crate 就绪未接入；维护执行、进程回收设计中 |
-| 内存 | backing/view Map/Unmap、funding、Tunnel Attach 拆分 | 分案待立 |
+| 对象持有与释放 | [capability](todo-2026-09-28-capability-last-reference.md#施工进度)、[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | capability crate 就绪未接入；维护执行设计定稿、`os/maintenance` crate 就绪未接入；进程回收结构定稿（轮次 1），各 owner 剩余门未闭合 |
+| 内存 | [内存重构](todo-2026-10-01-memory-redesign.md)：backing/view Map/Unmap、funding、Tunnel Attach 拆分 | 设计轮次 2 定稿，crate 侧收尾、vm 拼装草图已写；**内核编译自 page_table owner 改动起中断（用户确认），随本链与 vm 整体重写恢复** |
 | IPC | Receive/Send/SendOnce、Delivery/Lifetime、等待源 | 分案待立 |
 
 本表只登记组成与就绪状态，进度与证据归各分案。
