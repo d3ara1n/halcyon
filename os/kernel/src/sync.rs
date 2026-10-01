@@ -74,6 +74,9 @@ pub mod ranks {
     /// Remote Call 固定槽；Commit 可在 AddressSpace → lifecycle 内发布。
     /// 目标执行与完成回调均在锁外。
     pub const REMOTE_CALL: Rank = Rank(650);
+    /// 维护执行全局队列（ticket 锁）：业务/对象锁之后的内层叶锁。持有期间
+    /// 不取任何其他锁（含 HEAP，挂接零分配）；IPI 在解开全部锁后发送。
+    pub const MAINTENANCE: Rank = Rank(660);
     /// talc 堆锁（RankedRawSpinlock 类型级注入；几乎被全部容器锁内
     /// 获取，故置顶）。
     pub const HEAP: Rank = Rank(900);
@@ -240,7 +243,18 @@ pub fn restore_interrupts(state: InterruptState) {
     }
 }
 
-/// CAS 自旋原语（无中断语义、无 ladder）。内存序由原子语义背书：
+/// 原始互斥原语接口：[`Lock`] 容器只依赖获取/释放/尝试三项，中断与 ladder
+/// 语义由容器统一承担。
+pub trait RawLock {
+    /// 自旋直到获取。
+    fn acquire(&self);
+    /// 释放。仅允许持有者调用。
+    fn release(&self);
+    /// 尝试获取，成功返回 true。
+    fn try_lock(&self) -> bool;
+}
+
+/// CAS 自旋原语（无中断语义、无 ladder、无公平）。内存序由原子语义背书：
 /// acquire 成功路径 Acquire、release Release，跨核临界区可见性不依赖
 /// 手写栅栏。
 pub struct RawSpinlock {
@@ -253,8 +267,9 @@ impl RawSpinlock {
             locked: AtomicU32::new(0),
         }
     }
+}
 
-    /// 自旋直到获取。
+impl RawLock for RawSpinlock {
     fn acquire(&self) {
         while self
             .locked
@@ -265,15 +280,60 @@ impl RawSpinlock {
         }
     }
 
-    /// 释放。仅允许持有者调用。
     fn release(&self) {
         self.locked.store(0, Ordering::Release);
     }
 
-    /// 尝试获取，成功返回 true。
     fn try_lock(&self) -> bool {
         self.locked
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+/// FIFO ticket 原语：`next` 发号、`serving` 叫号。等锁上界：获取期间关本地
+/// 中断且协作式内核每 hart 至多一个待获取请求，故至多排在 H−1 个短临界区
+/// 之后（维护执行分案）。计数按 u32 回绕：同时在途票数 ≤ H 远小于 2^32，
+/// 相等比较不受回绕影响。
+pub struct RawTicketLock {
+    next: AtomicU32,
+    serving: AtomicU32,
+}
+
+impl RawTicketLock {
+    pub const fn new() -> Self {
+        Self {
+            next: AtomicU32::new(0),
+            serving: AtomicU32::new(0),
+        }
+    }
+}
+
+impl RawLock for RawTicketLock {
+    fn acquire(&self) {
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        while self.serving.load(Ordering::Acquire) != ticket {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn release(&self) {
+        // 仅持有者写 serving，读改写无竞争；Release 发布临界区写入。
+        let current = self.serving.load(Ordering::Relaxed);
+        self.serving
+            .store(current.wrapping_add(1), Ordering::Release);
+    }
+
+    fn try_lock(&self) -> bool {
+        // 只在无人排队时取号：next == serving 时 CAS next 前进一格。
+        let serving = self.serving.load(Ordering::Relaxed);
+        self.next
+            .compare_exchange(
+                serving,
+                serving.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
     }
 }
@@ -320,41 +380,55 @@ unsafe impl<const RANK: u32> lock_api::RawMutex for RankedRawSpinlock<RANK> {
     }
 }
 
-/// 内核自旋锁容器：获取期间关本地中断，并以实例级 rank 参与 ladder
-/// 断言。
-pub struct Spinlock<T> {
-    raw: RawSpinlock,
+/// 内核锁容器：获取期间关本地中断，并以实例级 rank 参与 ladder 断言；
+/// 互斥原语由 `R` 决定。
+pub struct Lock<R: RawLock, T> {
+    raw: R,
     rank: Rank,
     chain_key: u64,
     data: UnsafeCell<T>,
 }
 
-/// SAFETY: 数据仅能在持有锁（本 hart 关中断 + 自旋互斥）时访问。
-unsafe impl<T: Send> Sync for Spinlock<T> {}
-unsafe impl<T: Send> Send for Spinlock<T> {}
+/// 无公平 CAS 自旋锁，现有锁默认使用。
+pub type Spinlock<T> = Lock<RawSpinlock, T>;
+/// FIFO ticket 锁：需要等锁上界的共享点使用（维护队列，timer/remote 待迁移）。
+pub type TicketSpinlock<T> = Lock<RawTicketLock, T>;
+pub type SpinlockGuard<'a, T> = LockGuard<'a, RawSpinlock, T>;
+pub type TicketSpinlockGuard<'a, T> = LockGuard<'a, RawTicketLock, T>;
 
-/// [`Spinlock`] 的守卫，drop 时弹出 ladder、释放锁并恢复中断状态。
-pub struct SpinlockGuard<'a, T> {
-    lock: &'a Spinlock<T>,
+/// SAFETY: 数据仅能在持有锁（本 hart 关中断 + 互斥）时访问。
+unsafe impl<R: RawLock + Sync, T: Send> Sync for Lock<R, T> {}
+unsafe impl<R: RawLock + Send, T: Send> Send for Lock<R, T> {}
+
+/// [`Lock`] 的守卫，drop 时弹出 ladder、释放锁并恢复中断状态。
+pub struct LockGuard<'a, R: RawLock, T> {
+    lock: &'a Lock<R, T>,
     state: InterruptState,
 }
 
-impl<T> Spinlock<T> {
+impl<T> Lock<RawSpinlock, T> {
     pub const fn new(rank: Rank, value: T) -> Self {
-        Self {
-            raw: RawSpinlock::new(),
-            rank,
-            chain_key: 0,
-            data: UnsafeCell::new(value),
-        }
+        Self::with_raw(RawSpinlock::new(), rank, 0, value)
     }
 
     /// 链式锁：同秩多把沿 `chain_key` 严格递增获取（Job 链锁 = jid、
     /// HandleTable caller→child = pid）。非链式锁（key 为零）同秩连持
     /// 即断言违规。
     pub const fn chained(rank: Rank, chain_key: u64, value: T) -> Self {
+        Self::with_raw(RawSpinlock::new(), rank, chain_key, value)
+    }
+}
+
+impl<T> Lock<RawTicketLock, T> {
+    pub const fn new(rank: Rank, value: T) -> Self {
+        Self::with_raw(RawTicketLock::new(), rank, 0, value)
+    }
+}
+
+impl<R: RawLock, T> Lock<R, T> {
+    const fn with_raw(raw: R, rank: Rank, chain_key: u64, value: T) -> Self {
         Self {
-            raw: RawSpinlock::new(),
+            raw,
             rank,
             chain_key,
             data: UnsafeCell::new(value),
@@ -367,9 +441,9 @@ impl<T> Spinlock<T> {
         unsafe { &mut *self.data.get() }
     }
 
-    /// 获取锁：关本地中断后自旋等待，成功即压入 ladder。
+    /// 获取锁：关本地中断后等待，成功即压入 ladder。
     #[track_caller]
-    pub fn lock(&self) -> SpinlockGuard<'_, T> {
+    pub fn lock(&self) -> LockGuard<'_, R, T> {
         let state = disable_interrupts();
         self.raw.acquire();
         ladder::push(
@@ -377,12 +451,12 @@ impl<T> Spinlock<T> {
             self.chain_key,
             Some(core::panic::Location::caller()),
         );
-        SpinlockGuard { lock: self, state }
+        LockGuard { lock: self, state }
     }
 
-    /// 尝试获取锁，失败返回 `None`（同样关中断，drop 时恢复）。
+    /// 尝试获取锁，失败返回 `None`（同样关中断，失败立即恢复）。
     #[track_caller]
-    pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
+    pub fn try_lock(&self) -> Option<LockGuard<'_, R, T>> {
         let state = disable_interrupts();
         if self.raw.try_lock() {
             ladder::push(
@@ -390,7 +464,7 @@ impl<T> Spinlock<T> {
                 self.chain_key,
                 Some(core::panic::Location::caller()),
             );
-            Some(SpinlockGuard { lock: self, state })
+            Some(LockGuard { lock: self, state })
         } else {
             restore_interrupts(state);
             None
@@ -398,7 +472,7 @@ impl<T> Spinlock<T> {
     }
 }
 
-impl<T> Deref for SpinlockGuard<'_, T> {
+impl<R: RawLock, T> Deref for LockGuard<'_, R, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -407,14 +481,14 @@ impl<T> Deref for SpinlockGuard<'_, T> {
     }
 }
 
-impl<T> DerefMut for SpinlockGuard<'_, T> {
+impl<R: RawLock, T> DerefMut for LockGuard<'_, R, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: 持有锁，独占访问。
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
-impl<T> Drop for SpinlockGuard<'_, T> {
+impl<R: RawLock, T> Drop for LockGuard<'_, R, T> {
     fn drop(&mut self) {
         ladder::pop();
         self.lock.raw.release();
@@ -422,7 +496,7 @@ impl<T> Drop for SpinlockGuard<'_, T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Spinlock<T> {
+impl<R: RawLock, T: fmt::Debug> fmt::Debug for Lock<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.try_lock() {
             Some(guard) => guard.fmt(f),

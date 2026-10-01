@@ -348,3 +348,10 @@ fn execute_fence(request: FenceRequest) {
         );
     }
 }
+
+/// 内嵌运输目标侧：执行 fence 并记录本 hart 已同步代次（vm::remote 使用）。
+pub(crate) fn synchronize_remote(fence: crate::vm::remote::Fence) {
+    fence_local(fence.instruction_epoch != 0);
+    let local = &LOCAL_EPOCHS[hart::current().slot()];
+    publish_local(local, fence.space_identity, fence.translation_epoch, fence.instruction_epoch);
+}

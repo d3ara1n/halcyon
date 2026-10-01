@@ -1,6 +1,7 @@
 //! 任务模型（notes/impls/task.md）：进程/线程/生命周期与 ELF 装载。
 //! 未 Dead Process core 的生命周期根是 Job 直接成员表；不存在全局进程表。
 
+pub(crate) mod cap;
 pub mod delivery;
 pub mod handle;
 pub mod job;

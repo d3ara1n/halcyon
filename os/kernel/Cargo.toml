@@ -20,6 +20,8 @@ stack_layout = { path = "../stack_layout" }
 remote_call = { path = "../remote_call" }
 runtime_gate = { path = "../runtime_gate" }
 memory_space = { path = "../memory_space" }
+maintenance = { path = "../maintenance" }
+capability = { path = "../capability" }
 memory_supply = { path = "../memory_supply" }
 memory_pool = { path = "../memory_pool" }
 funded_frame = { path = "../funded_frame" }

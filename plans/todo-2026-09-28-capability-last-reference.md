@@ -1,6 +1,6 @@
 # Capability 与资源释放重构
 
-状态：**设计轮次 4：权限模型已定稿（见“权限模型目标设计”），剩余实现设计门见该节；全项目重审下的 capability/Close 分案，尚未实施**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
+状态：**设计轮次 4：权限模型已定稿（见“权限模型目标设计”），角色即对象类型（设计轮次 4，Mailbox/Notification 拆分与 ReplyObservation）已定稿；剩余实现设计门见该节；施工进度由[内核整体接入](todo-2026-10-01-object-chain-kernel-integration.md)承载，尚未验收**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
 
 ## 目标与本轮边界
 
@@ -124,7 +124,7 @@
 | `WRITE` | Send 发消息、Builder 写入待启动映像、建立可写 view |
 | `EXECUTE` | 建立可执行 view；READ 不隐含 EXECUTE |
 | `SIGNAL` | Notification 置位、Endpoint 门铃 |
-| `CREATE` | Job 中创建 Process/子 Job，Pool 派生子 Pool |
+| `CREATE` | Job 中创建 Process/子 Job；Pool 上表示创建由本 Pool 付款的资源（ProcessCreate、派生子 Pool） |
 | `MANAGE` | 由对象解释的控制操作：ProcessControl 终止、Builder 组装/映射/Start、MemoryObject seal |
 
 MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控制操作（例如“可改映射但不能 Start”）时增加标准位，不用空壳对象或 READ/WRITE 混充。Close 不要求任何 rights。
@@ -244,6 +244,26 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 
 **Authority 落点**：每个授权对象（Receive/Send/SendOnce、Notification、MemoryObject、Endpoint/Invitation、ProcessBuilder/ProcessControl、ThreadControl/启动票据、Job、Pool）在对象本体内嵌一个 `Holders`，`impl Authority for Arc<Obj>`。表元素为 `Cap<ObjectRef>`（`Arc<dyn KernelObject>`，`KernelObject: Authority`）。删除 `CapabilityRef` 的 ThreadControl downcast Drop、`HandleRole`、`PendingClose`。ZeroPolicy 按类型固定：ProcessControl 为 Remintable，其余 Terminal。
 
+**角色即对象类型（用户确认）**：不同角色一律表达为不同对象类型，不在 capability 上附加 role；rights 只裁剪同一对象的授权。判据：两类 capability 需要不同的最后持有语义或消费语义时，必须是不同对象类型。
+- Mailbox：`MailboxReceiver`、`MailboxSender`、`MailboxOnceSender` 三个对象类型共享 `MailboxCore`，各自内嵌 Terminal `Holders`。最后 Receiver 消失 → 邮箱关闭（发送侧 PEER_CLOSED）；badge 属于 Sender/OnceSender 对象。
+- **no-senders**：可清除电平，按 `MailboxCore` 聚合全部 badge 的 Sender 与 Pending OnceSender（表内、transit、claim 暂持均计入）；Receiver 仍可 mint 新 Sender。mint 与归零 hook 都在 core 锁内更新计数并重算电平，迟到的归零不覆盖新 mint。Lifetime.CLOSED 仍按 authority + use 判定，不等于 Sender 计数归零。
+- **两层线性化**：`CapTable.claim` 只仲裁发送 handle 的 Close/Move 与操作接管；`MailboxCore` 锁仲裁 queue.open 与入队。入队成功与 OnceSender `Pending → Sent` 同一 core 临界区完成；Receiver shut 先到则发送失败、不消耗额度；入队先到则为已接受消息，按既定退休责任收束。OnceSender 业务状态由 core 锁保护，无对象锁↔core 锁双序。
+- `MailboxOnceSender`（设计轮次 4，用户确认采用观察壳）：每次派生铸造新对象，不授予 DUPLICATE；“一次性”不做成 rights 位。出生时与一个 `ReplyObservation` 观察对象配对，由派生调用者持有其 capability；结果以持久电平 + 结果查询表达 `Sent | Abandoned`，**不向普通队列注入放弃消息**，因而无满箱、无完成队列与预付额度政策。
+  - 发送：`claim → commit_claim` move 消费；core 锁内入队并转 Sent，置观察电平。
+  - 失败：restore 走 `CapTable` 既有协议；返还资格已撤销则返回 `LastCapability`，锁外转 Abandoned；否则恢复原 handle，不置 Abandoned。随消息 move 的 capability 整体恢复或按各自资格收束。
+  - 放弃：最后 capability 消失仍 Pending → core 锁内转 Abandoned 并置观察电平；本地 Close 与 transit 释放走同一路径。无分配、不阻塞。
+  - armed：authority 成功发布才承担放弃可见性；构造/安装失败只退款，不产生 Abandoned。
+  - 身份：每份 OnceSender 有稳定对象身份，`sender_context_id` 承载该身份，RPC 比较语义同步调整；父授权域 Lifetime 为另一内部关系。
+  - 能力边界：承诺“每次已发生的最后释放恰好一次转 Abandoned”；最后 cap 处于不可达 capability 环时不归零，不承诺最终可见，归 TRANSFER 门。
+  - 观察壳寿命（LoneCrane 确认定稿）：关闭 `ReplyObservation` 只放弃观察，不取消发送、不触发 Abandoned、不等待 OnceSender；已登记等待/订阅按通用等待源 use 规则处理，不设例外。
+  - 持有方向为 DAG：OnceSender 持 `Arc<ReplyObservation>`（结果发布端，只保活存储，不计入其 Holders、不提供 mint 资格）；ReplyObservation 只存 OnceSender 数值身份、结果与等待源，不持 OnceSender、MailboxCore 或父 Sender。观察存储最迟随 OnceSender 释放，成本出生准入。
+  - Sent 只表示消息已被邮箱接纳入队，不表示已读、Delivery 完成或业务成功；Sent 与 Abandoned 互斥且终态不可变，Receiver 后续关闭不改写。RPC 仍独立等回复内容。
+  - 观察壳 rights 仅 READ/WAIT（及 DUPLICATE/TRANSFER），无设置结果或取消权限；未完成时 Query 返回 Pending。业务仲裁只在 core 锁，core→观察源锁单向，Query/注销不反取 core 锁；通知扫描由既有 Work 锁外推进。
+  - OnceSender cap + Observation cap + armed 按一次发布协议提交；任一半安装失败按未发布准备回滚，不产生 Abandoned。
+- Notification：`NotificationOwner`（取走待决位）与 `NotificationSignaler`（提交待决位）为两个对象类型，共享 core。signal 与 Owner shut 同一 core 锁，shut 后拒绝迟到 signal；Signaler 只保活 core，不保活 Owner 权能；不新增 no-signalers。
+- 其余单角色对象（Job、Pool、MemoryObject、ProcessBuilder/Control、ThreadControl、Endpoint/Invitation、Lifetime、Delivery、WaitSet、SystemReset）直接删 role。
+- 新增角色 = 新增对象类型与 `ObjectKind`，由创建/派生操作产生；Duplicate 永远同对象、rights 取子集。`HandleDescription` 删除 role 字段，`ObjectKind` 即角色。
+
 **KernelObject 与 Work 正交**：`KernelObject` 只表示“可经 Handle 引用的对象”，契约收窄为身份/kind、rights 上限、`Holders`、`on_last_capability` 与等待源；删除 role、`close_handle`/`close_transit`、`retirement()`。维护执行的 `Work` 不依附 KernelObject：AddressSpace、内存事务、设备绑定等无 handle 的内部 owner 只实现 Work；有长工作的 Handle 对象两者都实现，由 `on_last_capability` 发布其内嵌记录；归零即有界结束的对象只实现 KernelObject。等待源/订阅部分的重构归 IPC 与等待分案。
 
 **锁与锁序**：`CapTable` 置于 `Process.handles: Spinlock`（rank `HANDLE_TABLE`；跨进程直接交付沿 pid 递增 chained，沿用现规则）。`Holders` 为原子字，无锁。表锁内只做槽位变更与 `Cap` 摘出/放入；`release` 及其 `LastCapability` 后续动作一律在表锁外；表锁内不取对象业务锁、不取 `MAINTENANCE`。单向序：对象锁 → `MAINTENANCE`（publish 时表锁已放开）。
@@ -266,3 +286,13 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 **线性化点**：Close 与 claim 在表锁内竞争，先到者胜；claim 后 Close 只撤销返还资格，已接受操作照常完成。`shut` 为表退出线性化点，之后 `restore` 一律 `Released`，Receive `commit` 一律失败返还。Remintable 铸造与归零均为 `Holders` CAS 且无事件；Terminal 封闭位与最后释放同一 CAS，封闭后 `mint` 失败。
 
 剩余设计门 1 由本草图闭合；各对象 `Work::step` 由所属分案（IPC/VM/进程）实现。
+
+## 本链 Tunnel/Mailbox 收敛结论（2026-10，LoneCrane 对抗）
+
+Tunnel 拆分并入对象持有与释放链。
+
+- **Endpoint 事件**：删除 0x60–0x63 的 lease 调用。DATA 为可合并提示，无序号；Notify 只置对端 DATA，AcknowledgeData 只清本端 DATA，均需 SIGNAL right；不开放 PEER_CLOSED/CLOSED/PEER_ATTACHED 的任意置清；最后关闭状态压过迟到 Notify。用户协议保留“探 → ack → acquire 重探 → 登记/复检/停驻”。
+- **Attach**：维持一 handle（只返回 Endpoint）；通用 Map 以 Endpoint 为 backing 授权来源，不导出第二个 MemoryObject handle。
+- **Runnel 失败**：Guest/初始化失败承载为完整 owner 集合 {Endpoint, 已建立 View}，Create 失败另含未交付 Invitation。库内自动收束：先激活完整 Unmap（内核持有推进，不要求等物理退款），再 Close Endpoint，只返回错误；删除 `InitFailure<Endpoint>`/`CreateFailure` 回传 owner。readiness 以 Start 表达，PEER_ATTACHED 只表示授权接入；`srv_fs` stream 的 attached gate 改等 Start。
+- **Mailbox 关闭**：Send 与 shut 同一 core 锁下判定；已出队 ReceiveTxn 是稳定 owner，强持 core/use、Message（含 delivery）、cap-table 预约与结果保护，Close 不取消；closed 后 rollback 直接交有界退休不重入队。close 在锁内 shut、发布 CLOSED 电平与等待者通知、publish 内嵌 retire Work；Work 每步摘一条消息（上界 MESSAGE_HANDLE_MAX 个 handle + 一次 delivery 公共释放 + payload/VecDeque 归还），锁外经公共释放入口（覆盖普通对象最终析构）只 publish 不展开。`queue.empty && receiving==none` 前 Blocked；该 Done 只是本地队列/接收责任结束，不代表所指对象已退休。
+- **TRANSFER 门保留**：队列中 capability 环未闭合，TRANSFER 标为待闭合；IPC 分案唯一记录登记环的允许路径、资金归属与最终禁止或回收条件。本链不宣称 TRANSFER 全链完成。

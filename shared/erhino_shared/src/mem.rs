@@ -43,8 +43,9 @@ impl MemoryPlacement {
 
 /// `MemoryMap` 的固定宽请求。所有长度按字节表达，由内核向页边界取整。
 ///
-/// backing 来源由 `source` 声明：`INVALID` 为匿名页，否则是具 `MAP` 的
-/// MemoryObject Handle。对象来源不重新分配数据页，只验证 rights、对象内页
+/// backing 来源由 `source` 声明：`INVALID` 为匿名页，否则是 MemoryObject
+/// 或 TunnelEndpoint Handle，按 R→READ、RW→READ|WRITE、RX→READ|EXECUTE 检查
+/// （Endpoint 不允许 EXECUTE）。对象来源不重新分配数据页，只验证 rights、对象内页
 /// 对齐 offset 与范围。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +58,7 @@ pub struct MemoryMapRequest {
     pub result_address: u64,
     /// 调用者生成的非零提交标识。
     pub cookie: u64,
-    /// backing 来源：零为匿名页，否则为 MemoryObject Handle 的原值。
+    /// backing 来源：零为匿名页，否则为 MemoryObject/TunnelEndpoint Handle 的原值。
     pub source: u64,
     /// 对象来源的对象内起始偏移（字节，页对齐）；匿名来源必须为零。
     pub source_offset: u64,

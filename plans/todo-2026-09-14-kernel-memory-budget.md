@@ -23,3 +23,16 @@ metadata、对象壳及操作/退休承载必须具有明确的实际来源、�
 ## 完成门
 
 每个元数据和必成执行责任有可验证的预算来源与寿命；一域无法通过合法创建请求占用另一域已保证的完成容量；capability 运输不丢失或放大额度。共享 ABI、所有真实创建者和退出路径共同迁移，适当 host/clippy/QEMU 组合通过。持久契约更新 notes，完成后归档本计划。
+
+## 对象持有与释放链所需的账户形状（收敛结论，2026-10 与 LoneCrane 对抗 8 轮、advisor 一次）
+
+本节只定本链接入所需的最小形状，不闭合本案的域隔离完成门。
+
+- **Pool 即资金账户与维护公平域**：`MemoryPool = {页 credit, metadata 槽计数, maintenance Ledger}`。只有受权 Pool 派生（消耗父 Pool 页额度与 metadata）创建新份额；ProcessCreate 与资源准入只引用既有 Pool，不新建账户。Pool 自身 metadata 由父 Pool 资助，root 静态，无 Account→Pool→Permit→Account 环。
+- **metadata 授权**：派生时页与 metadata 预算分别划拨；ProcessCreate 需 Pool capability 的 `CREATE` right（Pool 上 CREATE 解释为“创建由本 Pool 付款的资源”，含派生子 Pool），Shell/Body 账户在创建时确定，`bind_memory` 不再改来源。不新增 FUND 位：当前只有 Pool 一个付款对象，“可付款不可派生”也无真实委托用例；触发条件见 [capability 标准 rights](todo-2026-09-28-capability-last-reference.md#标准-rights当前目标集合非永久封闭)。原 MetadataSponsor 各类计数并入 Pool，process-core permit 删除。
+- **metadata 计量**：按活对象槽额度计量（字段 Drop 退槽），不宣称字节先归还后退款。
+- **退款语义**：每份资源 owner 物理释放后消费自己唯一的 charge；账户 Arc 消散不是退款证明。
+- **Pool 寿命**：Close Pool capability 只撤外部授权；charge、permit、已接纳 Work、child 均强持 Pool；销毁条件为无 owner 强持（不是 `in_flight=0`）。维护队列未 Done 强持 Work，finish 先 settle 再锁外释放 Work/账户根；Pool 自身收尾 Work 记父账户；Ready 链由全局维护根摘除。
+- **欠账政策**：欠账不因销毁丢失——子 Pool 销毁时剩余负 deficit 以独立 debt transfer 并入父 Ledger（MAINTENANCE 锁下一次完成，不调用 `settle`、不动 `in_flight`、不伪造 grant）。公平只在现存 Pool 域之间成立；接受派生新域可绕开父域欠账，不引入层级调度。
+- **无欠账**仅指物理与 metadata 不透支；维护 deficit 允许为负。
+- `MemoryPool::drop` 向父链退款的深度上界（JOB/Pool 深度 32）计入原子成本，或逐级转交记录，施工时择一并写明。

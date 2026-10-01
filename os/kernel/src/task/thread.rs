@@ -35,6 +35,8 @@ static RESULT_OBLIGATION_DELAY_OBSERVED: AtomicBool = AtomicBool::new(false);
 
 /// 线程离场的独立观察壳。Handle close 只消散观察权，不影响执行线程。
 pub(crate) struct ThreadControl {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     wait: crate::sync::Spinlock<ObjectWaitState>,
     thread: crate::sync::Spinlock<Option<Weak<super::proc::Thread>>>,
@@ -44,6 +46,7 @@ pub(crate) struct ThreadControl {
 impl ThreadControl {
     pub(crate) fn new() -> Result<Arc<Self>, erhino_shared::call::SystemCallError> {
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new()
                 .ok_or(erhino_shared::call::SystemCallError::ReachLimit)?,
             wait: crate::sync::Spinlock::new(
@@ -218,6 +221,10 @@ impl Drop for ThreadResultObligation {
 }
 
 impl KernelObject for ThreadControl {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn complete_waiter_drain(
         &self,
         reservation: super::notify_work::Reservation,
@@ -237,12 +244,12 @@ impl KernelObject for ThreadControl {
         ObjectKind::ThreadControl
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::ThreadControl).then_some(CONTROL_MAX_RIGHTS)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(CONTROL_MAX_RIGHTS)
     }
 
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::ThreadControl).then_some(ObjectSignals::DONE)
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::DONE)
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -264,14 +271,6 @@ impl KernelObject for ThreadControl {
     fn unsubscribe(&self, id: u64) {
         let retired = self.wait.lock().unsubscribe(id);
         drop(retired);
-    }
-
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::ThreadControl);
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::ThreadControl);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -417,8 +416,7 @@ pub(crate) fn start(caller: &super::Thread, handle: erhino_shared::object::Handl
         let entry = table
             .get(handle, Rights::MANAGE)
             .map_err(super::handle::map_error)?;
-        if *entry.role() != HandleRole::ThreadControl
-            || entry.object().kind() != ObjectKind::ThreadControl
+        if entry.object().kind() != ObjectKind::ThreadControl
         {
             return Err(SystemCallError::WrongObjectType);
         }

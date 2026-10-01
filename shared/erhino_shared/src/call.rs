@@ -1,8 +1,5 @@
 use num_derive::{FromPrimitive, ToPrimitive};
 
-/// 单次资源收束的内核工作政策上限；对象仍可请求更小预算。
-pub const DRAIN_WORK_MAX: u32 = 256;
-
 /// Predefined system call errors
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
@@ -117,7 +114,8 @@ pub enum SystemCall {
     ProcessAbort = 0x23,
     /// 从已有 JobControl 创建子 JobControl。
     JobCreate = 0x11,
-    /// 在 Job 内创建空的 Building process，返回 affine ProcessBuilder。
+    /// 在 Job（CREATE）内以 MemoryPool（CREATE）付款创建 Building process，
+    /// 返回 affine ProcessBuilder；付款账户出生即定，不再改绑。
     ProcessCreate = 0x12,
     /// 为 Building process 映射 anonymous zero pages。
     ProcessMap = 0x13,
@@ -129,14 +127,10 @@ pub enum SystemCall {
     ThreadCreate = 0x1d,
     /// 为 Building process 安装 grants 并输出目标侧句柄值。
     ProcessGrant = 0x1e,
-    /// 以具 GRANT authority 的 MemoryPool 一次性绑定 Building process。
-    ProcessBindMemory = 0x1f,
     /// 读 ProcessControl 的固定宽生命周期快照。
     ProcessQuery = 0x16,
     /// 持 MANAGE authority 的非等待幂等终止请求；a1=0 首次接受，1 已终止中。
     ProcessKill = 0x17,
-    /// REAPABLE/Dead 上推进有界资源收束批次。
-    ProcessDrain = 0x18,
     /// 封闭 Job 及其后代的创建/启动口（幂等）。
     JobSeal = 0x19,
     /// 读 JobControl 的固定宽生命周期快照。
@@ -220,14 +214,15 @@ pub enum SystemCall {
     MemoryObjectSeal = 0x57,
 
     // -----Tunnel-----
-    /// 创建有界共享映射、Endpoint 和一次性 Invitation。
+    /// 以付款 MemoryPool 创建共享 backing、本端 Endpoint 与一次性 Invitation；
+    /// 不建立映射，映射经 MemoryMap 以 Endpoint 为 backing 来源。
     TunnelCreate = 0x60,
-    /// 原子消费 Invitation 并建立对端 Endpoint。
+    /// 原子消费 Invitation，只返回对端 Endpoint 一个 Handle。
     TunnelAttach = 0x61,
-    /// 向对端 Endpoint 发布 DATA 提示。
-    TunnelNotify = 0x62,
-    /// 在协议无进展点确认本端 DATA 提示。
-    TunnelAcknowledgeData = 0x63,
+    /// 置对端 DATA 提示（SIGNAL）；可合并，最后关闭状态压过迟到通知。
+    EndpointNotify = 0x62,
+    /// 清本端 DATA 提示（SIGNAL）；调用者确认后须重探共享状态。
+    EndpointAcknowledgeData = 0x63,
 }
 
 #[cfg(test)]

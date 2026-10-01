@@ -10,7 +10,7 @@
 
 use core::{
     arch::asm,
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -300,7 +300,7 @@ pub(crate) fn register_wait_timeout(
     );
     let token = timers.try_register(expires_at, context).map_err(|_| ())?;
     drop(timers);
-    arm_earliest();
+    arm_or_pend();
     Ok(token)
 }
 
@@ -315,25 +315,61 @@ pub(crate) fn unregister_wait_timeout(token: timer_queue::TimerToken) {
 /// 调度量子同样从公共时钟几何取得，不能截断平台频率。
 const QUANTUM_NS: u64 = 10_000_000;
 
-/// 把本 hart 定时器设到期限队列最早到期点（队列空则不动）。
-fn arm_earliest() {
-    let timers = timers().lock();
-    if let Some(expires_at) = timers.peek_expires_at() {
+/// 每次服务至多处理的到期项数（qT）。待定标政策参数，见维护执行分案；
+/// 剩余到期项留作本 hart pending，由调度循环下一轮继续服务。
+const TIMER_SERVICE_BATCH: usize = 16;
+
+/// 本 hart 存在已到期但尚未服务的期限项。只由所属 hart 读写；参与
+/// run/idle/arm 决策：有 pending 时不 WFI，不把已过期堆顶装填进硬件。
+static HART_TIMER_PENDING: [AtomicBool; hart::HART_NUM_LIMIT] =
+    [const { AtomicBool::new(false) }; hart::HART_NUM_LIMIT];
+
+#[inline]
+fn timer_pending() -> &'static AtomicBool {
+    &HART_TIMER_PENDING[hart::current().slot()]
+}
+
+/// 统一装填入口：堆顶已到期 → 标 pending（不装填，避免中断风暴）；
+/// 堆顶在未来 → 返回该期限供装填；队列空返回 None。
+fn earliest_future() -> Option<u64> {
+    let earliest = timers().lock().peek_expires_at()?;
+    match crate::clock::now_ticks() {
+        Ok(now) if earliest <= now => {
+            timer_pending().store(true, Ordering::Relaxed);
+            None
+        }
+        _ => Some(earliest),
+    }
+}
+
+/// 把本 hart 定时器设到最早的未来到期点；已到期项转为 pending。
+fn arm_or_pend() {
+    if let Some(expires_at) = earliest_future() {
         sbi::require(sbi::set_timer(expires_at), "TIME.set_timer");
     }
 }
 
-/// 弹出本 hart 全部已到期项后，在锁外以 token 通知 context。弹出与
-/// 注销竞争时只有成功退休 token 的路径参与 Timeout outcome 仲裁。
-fn wake_expired() {
+/// 有界服务本 hart 到期项：至多 qT 项，锁外以 token 通知 context。弹出与
+/// 注销竞争时只有成功退休 token 的路径参与 Timeout outcome 仲裁。仍有
+/// 到期项时保留 pending，由调度循环下一轮继续，不在此排空。
+fn service_expired() {
+    let pending = timer_pending();
+    pending.store(false, Ordering::Relaxed);
     let Ok(now) = crate::clock::now_ticks() else {
         crate::runtime_stop::check();
         return;
     };
-    loop {
+    for _ in 0..TIMER_SERVICE_BATCH {
         let due = timers().lock().pop_expired(now);
-        let Some((token, context)) = due else { break };
+        let Some((token, context)) = due else { return };
         context.expire(token);
+    }
+    if timers()
+        .lock()
+        .peek_expires_at()
+        .is_some_and(|at| at <= now)
+    {
+        pending.store(true, Ordering::Relaxed);
     }
 }
 
@@ -353,7 +389,15 @@ pub fn enqueue(t: AdmittedThread) {
 /// trap 出口 Requeue 轮转。
 pub fn on_timer() {
     sbi::require(sbi::set_timer(DISARM), "TIME.set_timer");
-    wake_expired();
+    service_expired();
+}
+
+/// 维护队列门铃：提醒全部域的空闲 hart（合并、失败均安全：idle 前复检）。
+pub(crate) fn wake_idle_harts() {
+    let table = domains();
+    for domain in table.domains.iter().flatten() {
+        domain.wake_one();
+    }
 }
 
 /// 本 hart 所属域是否有就绪线程（SSIP 分支判断是否值得切走）。
@@ -375,11 +419,16 @@ pub fn run() -> ! {
     let me_domain = current_domain();
     loop {
         crate::runtime_stop::check();
+        if timer_pending().load(Ordering::Relaxed) {
+            service_expired();
+        }
         // idle 唤醒、门铃合并或先前 IPI 失败后，Pending 槽仍由安全点补消费。
         deferred_work::drain_current();
         crate::task::notify_work::drain_current();
         // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
         // SFENCE.VMA）：循环体结构性只运行于内核页表下。
+        // 用户/维护轮转仲裁：维护类每次至多消耗一份轮转预算。
+        crate::maintenance::service(me_domain.has_ready());
         let Some(t) = me_domain.pick() else {
             idle();
             continue;
@@ -493,7 +542,8 @@ fn arm_quantum() {
             unreachable!("runtime stop did not park after clock epoch exhaustion");
         }
     };
-    let earliest = timers().lock().peek_expires_at();
+    // 已到期堆顶不装填（转 pending，由调度循环服务）；量子本身即后续检查机会。
+    let earliest = earliest_future();
     sbi::require(
         sbi::set_timer(earliest.unwrap_or(quantum).min(quantum)),
         "TIME.set_timer",
@@ -521,15 +571,22 @@ fn idle() {
     domain.idle_mask.fetch_or(bit, Ordering::SeqCst);
     // 入队与登记 idle 的交错由双重检查闭合；work debt 的 Pending 电平同样
     // 禁止 owner 带债入睡，即使对应门铃曾失败或被合并。
-    if domain.has_ready() || deferred_work::has_current() || crate::task::notify_work::has_current()
+    if domain.has_ready()
+        || timer_pending().load(Ordering::Relaxed)
+        || crate::maintenance::has_ready()
+        || deferred_work::has_current()
+        || crate::task::notify_work::has_current()
     {
         domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
         return;
     }
 
-    let earliest = timers().lock().peek_expires_at();
-    match earliest {
+    match earliest_future() {
         Some(at) => sbi::require(sbi::set_timer(at), "TIME.set_timer"),
+        None if timer_pending().load(Ordering::Relaxed) => {
+            domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
+            return;
+        }
         None => sbi::require(sbi::set_timer(DISARM), "TIME.set_timer"),
     };
     // SAFETY: wfi 等待局部使能的中断 pending 唤醒。
@@ -541,7 +598,7 @@ fn idle() {
     if sip_stip_pending() {
         // 期限到达唤醒（回主循环前把到期线程入队）。
         sbi::require(sbi::set_timer(DISARM), "TIME.set_timer");
-        wake_expired();
+        service_expired();
     }
 }
 

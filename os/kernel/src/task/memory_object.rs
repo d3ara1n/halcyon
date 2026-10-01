@@ -271,6 +271,8 @@ pub(crate) const MAX_WRITE_VIEWS_PER_OBJECT: usize = 64;
 /// capability，因此 close 不产生终态信号，对象在最后一个引用（Handle 或 view）消散
 /// 时自然析构。
 pub struct MemoryObject {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: object::ObjectHeader,
     core: Arc<MemoryObjectCore>,
 }
@@ -278,7 +280,11 @@ pub struct MemoryObject {
 impl MemoryObject {
     fn new(core: Arc<MemoryObjectCore>) -> Result<Arc<Self>, SystemCallError> {
         let header = object::ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?;
-        Arc::try_new(Self { header, core }).map_err(|_| SystemCallError::OutOfMemory)
+        Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
+            header,
+            core,
+        }).map_err(|_| SystemCallError::OutOfMemory)
     }
 
     pub(crate) fn object_ref(this: &Arc<Self>) -> object::ObjectRef {
@@ -290,13 +296,12 @@ impl MemoryObject {
     }
 }
 
-/// MemoryObject Handle 的 rights 上限。`MAP` 与数据 rights 正交：只读 view 要求
-/// `MAP|READ`，可写 view 要求 `MAP|READ|WRITE`，执行 view 要求 `MAP|READ|EXECUTE`。
+/// MemoryObject Handle 的 rights 上限。映射授权矩阵：只读 view 要求 `READ`，
+/// 可写 view 要求 `READ|WRITE`，执行 view 要求 `READ|EXECUTE`。
 const MEMORY_OBJECT_RIGHTS: erhino_shared::object::Rights = {
     use erhino_shared::object::Rights;
     Rights::from_raw(
-        Rights::MAP.raw()
-            | Rights::READ.raw()
+        Rights::READ.raw()
             | Rights::WRITE.raw()
             | Rights::WAIT.raw()
             | Rights::MANAGE.raw()
@@ -308,6 +313,10 @@ const MEMORY_OBJECT_RIGHTS: erhino_shared::object::Rights = {
 };
 
 impl object::KernelObject for MemoryObject {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn complete_waiter_drain(
         &self,
         reservation: super::notify_work::Reservation,
@@ -331,12 +340,12 @@ impl object::KernelObject for MemoryObject {
         object::ObjectKind::MemoryObject
     }
 
-    fn allowed_rights(&self, role: object::HandleRole) -> Option<erhino_shared::object::Rights> {
-        (role == object::HandleRole::MemoryObject).then_some(MEMORY_OBJECT_RIGHTS)
+    fn allowed_rights(&self) -> Option<erhino_shared::object::Rights> {
+        Some(MEMORY_OBJECT_RIGHTS)
     }
 
-    fn allowed_signals(&self, role: object::HandleRole) -> Option<ObjectSignals> {
-        (role == object::HandleRole::MemoryObject).then_some(ObjectSignals::EXECUTABLE)
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::EXECUTABLE)
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -359,19 +368,6 @@ impl object::KernelObject for MemoryObject {
         self.core.unsubscribe(id);
     }
 
-    fn close_handle(
-        &self,
-        role: object::HandleRole,
-        _owner: &super::proc::Process,
-        _exiting: bool,
-    ) {
-        debug_assert!(role == object::HandleRole::MemoryObject);
-    }
-
-    fn close_transit(&self, role: object::HandleRole) {
-        debug_assert!(role == object::HandleRole::MemoryObject);
-    }
-
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -386,8 +382,7 @@ fn resolve(
     let entry = table
         .get(handle, required)
         .map_err(super::handle::map_error)?;
-    if *entry.role() != object::HandleRole::MemoryObject
-        || entry.object().kind() != object::ObjectKind::MemoryObject
+    if entry.object().kind() != object::ObjectKind::MemoryObject
     {
         return Err(SystemCallError::WrongObjectType);
     }
@@ -485,9 +480,9 @@ pub(crate) fn map_view(
 
     let protection = intent.protection();
     let required = match protection {
-        Protection::ReadOnly => Rights::MAP | Rights::READ,
-        Protection::ReadWrite => Rights::MAP | Rights::READ | Rights::WRITE,
-        Protection::ReadExecute => Rights::MAP | Rights::READ | Rights::EXECUTE,
+        Protection::ReadOnly => Rights::READ,
+        Protection::ReadWrite => Rights::READ | Rights::WRITE,
+        Protection::ReadExecute => Rights::READ | Rights::EXECUTE,
     };
     let object = resolve(thread, handle, required)?;
     let core = Arc::clone(object.core());

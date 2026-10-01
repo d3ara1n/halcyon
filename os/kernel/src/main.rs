@@ -34,6 +34,7 @@ mod external;
 mod frame;
 mod hart;
 mod heap;
+mod maintenance;
 mod mm;
 mod registry;
 mod remote_call;
@@ -46,6 +47,7 @@ mod syscall;
 mod task;
 mod trap;
 mod uaccess;
+mod vm;
 mod work_ledger;
 
 // 汇编布局契约：offset_of! 是唯一真值，经 const operands 注入

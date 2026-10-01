@@ -251,3 +251,10 @@ PM 持有监督和终止政策，发起终止并观察资源收束；内核持�
 执行机制设计轮次 1 已定稿（见“执行机制目标设计”）。`os/maintenance` crate 已实施（未提交，未接入内核）：`record`（状态机含 notified 与等待代次）、`account`（账户 DRR：访问/预扣/结算/欠账）、`rotor`（两类别有符号余额轮转）。开发证据：`cargo test -p maintenance --target aarch64-apple-darwin` 16 项通过，clippy `-D warnings` 通过；未运行 `just check`/QEMU。
 
 内核拼装草图已写入“执行机制目标设计”节。下一步：进入进程自动回收分案，闭合草图中留给进程/VM/capability 的接缝。按责任链施工方式，crate 不单独接入内核，待对象持有与释放链整体就绪后一次接入，删除 `os/work_debt` 与 `deferred_work/work_ledger/notify_work/request/retirement` 旧路径；ticket 锁随本链接入一并加入 `sync.rs`。
+
+## 本链接入收敛结论（2026-10，LoneCrane 对抗）
+
+- 账户即 Pool，欠账转移与公平范围见[预算分案账户形状](todo-2026-09-14-kernel-memory-budget.md#对象持有与释放链所需的账户形状收敛结论2026-10-与-lonecrane-对抗-8-轮advisor-一次)；debt transfer 为独立操作，不复用 `Ledger::settle`。
+- **timer**：所有装填路径（含 `register_wait_timeout`）共用“已到期 → hart 本地 pending，未来 → arm”入口；pending 参与 run/Resume/idle 决策：有 pending 不 WFI，返回用户前装近期 timer 作后续检查；每次服务 qT 项，不 while 排空；expire 后续清理移交既有 Work。
+- **remote**：完成事实按空间 + 事务代次唯一标记；先取 wake token 稳定根，再归还槽，锁外 wake；源登记 + 复检与 Running.notified 覆盖早到/迟到；最终析构只有界释放或 publish；零目标不造远端 ack。运输复用契约见[内存分案轮次 3](todo-2026-10-01-memory-redesign.md)。
+- 上文“施工前设计门”已由 `os/maintenance` crate、拼装草图及本节取代；剩余仅 qM/qU/qT 定标（回收接入后）。

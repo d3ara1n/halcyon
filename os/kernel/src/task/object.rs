@@ -571,6 +571,13 @@ pub trait KernelObject: Any + Send + Sync {
         None
     }
     fn header(&self) -> &ObjectHeader;
+
+    /// capability 持有计数（表内、在途与事务暂持；普通 Arc 不计入）。
+    fn holders(&self) -> &capability::Holders;
+
+    /// 最后 capability 消失（仅 Terminal 对象，锁外调用）。只执行对象同步域
+    /// 已确定的后续动作；长工作发布到内嵌 Work。
+    fn on_last_capability(&self) {}
     fn kind(&self) -> ObjectKind;
 
     fn related_id(&self) -> u64 {
@@ -586,10 +593,10 @@ pub trait KernelObject: Any + Send + Sync {
     }
 
     /// 此对象是否接受 role；接受时返回该 role 的最大 rights。
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights>;
+    fn allowed_rights(&self) -> Option<Rights>;
 
     /// role 能观察的合法电平位；None 表示对象不是可等待对象。
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals>;
+    fn allowed_signals(&self) -> Option<ObjectSignals>;
 
     /// 非等待对象不维护电平或订阅；WaitMany 在调用此前已由 rights 与
     /// allowed_signals 拒绝它们。
@@ -614,11 +621,7 @@ pub trait KernelObject: Any + Send + Sync {
         None
     }
 
-    /// Handle 从表中移除且表锁已释放后的 lifecycle 回调。
-    fn close_handle(&self, role: HandleRole, owner: &Process, exiting: bool);
 
-    /// 消息中的 transit Handle 被丢弃；只有持 TRANSIT 的 entry 可进入。
-    fn close_transit(&self, role: HandleRole);
 
     /// 在来源对象锁内推进一次已发布的 waiter 候选。通知执行器拥有预算
     /// 循环；对象只负责自己的电平、历史与订阅真值。

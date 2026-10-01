@@ -82,6 +82,16 @@ impl Ledger {
         self.deficit = self.deficit.saturating_add(diff);
     }
 
+    /// 子账户销毁时并入其剩余负 deficit（独立 debt transfer）：不动
+    /// in_flight、不伪造 grant；正信用不转移。`child` 必须已无在途。
+    pub fn absorb_debt(&mut self, child: &mut Ledger) {
+        assert!(child.is_quiescent(), "debt transfer from in-flight ledger");
+        if child.deficit < 0 {
+            self.deficit = self.deficit.saturating_add(child.deficit);
+        }
+        child.deficit = 0;
+    }
+
     /// Ready 队列变空且无在途时调用：不积攒正信用，保留欠账。
     pub fn idle(&mut self) {
         if self.deficit > 0 {
@@ -97,6 +107,20 @@ fn to_i64(v: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 销毁子账户不得抹去欠账（轮次 3 结论）；正信用不随转移放大父份额。
+    #[test]
+    fn debt_transfer_keeps_debt_drops_credit() {
+        let (mut p, mut c) = (Ledger::new(), Ledger::new());
+        let Visit::Grant(g) = c.visit(10, 10) else { panic!() };
+        c.settle(g, 100);
+        p.absorb_debt(&mut c);
+        assert_eq!((p.deficit(), p.in_flight(), c.deficit()), (-90, 0, 0));
+        let Visit::Grant(g) = c.visit(10, 4) else { panic!() };
+        c.settle(g, 0);
+        p.absorb_debt(&mut c);
+        assert_eq!(p.deficit(), -90);
+    }
 
     #[test]
     fn second_grant_waits_for_refill() {

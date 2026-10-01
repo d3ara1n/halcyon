@@ -6,7 +6,7 @@
 
 Mailbox 是具有唯一 receiver-owner 的接收队列。创建队列只交付 owner；由 owner 显式铸造发送授权，不隐含一个可调用的默认根入口。owner 不可复制，只能经直接 GRANT 安装，不能进入消息。
 
-每次铸造产生一个独立的发送授权对象，绑定目标 Mailbox 和不可变 badge。它的 sender 与 send-once 是同一对象的不同 role；duplicate、移动、rights 裁剪和 send-once 派生保持发送授权身份与 badge。重新铸造即产生新身份，即使目标队列和 badge 相同也不合并寿命。
+每次铸造产生一个独立的发送授权对象，绑定目标 Mailbox 和不可变 badge。角色由对象类型表达：MailboxReceiver、MailboxSender 与 MailboxOnceSender 是共享同一队列的不同对象类型，不在 capability 上附加 role。duplicate、移动与 rights 裁剪保持同一对象；派生 MailboxOnceSender 产生新的一次性发送对象，承接父 sender 的 badge，并配对一个 ReplyObservation，后者观察这份一次性投递权最终是已入队还是已放弃。重新铸造即产生新身份，即使目标队列和 badge 相同也不合并寿命。
 
 铸造同时交付该发送授权的 [Lifetime](object.md) 观察权。能力副本、运输中引用和调用交付责任独立于原持有进程存活；全部相关引用消散后，Lifetime 才进入 CLOSED。观察者不保活发送授权。接收服务不需要保留永不关闭的 sender 母本，也不按 PID 猜测最后一个客户端是否已退出。
 
@@ -44,7 +44,7 @@ Peek 不取得 Delivery，Discard 和队列关闭释放尚未接收的 Delivery�
 |---|---|
 | MailboxCreate | 创建唯一 receiver-owner。 |
 | MailboxMintSender | owner 原子取得一个独立 badged sender 及其 Lifetime 观察权。 |
-| MailboxMakeSendOnce | 从具 DUPLICATE 的 sender 派生同一发送授权的一次性投递权。 |
+| MailboxMakeSendOnce | 从具 DUPLICATE 的 sender 派生新的 MailboxOnceSender 及其 ReplyObservation。 |
 | Send | 验证完整输入、预留消息及 Delivery、检查期限，然后原子入箱及搬移；永不阻塞。 |
 | Peek | 观察队头 envelope 与容量，不改变队列。 |
 | Receive | 原子安装业务 entry 和 Delivery，写出完整结果后移除队头；永不阻塞。 |
@@ -52,7 +52,7 @@ Peek 不取得 Delivery，Discard 和队列关闭释放尚未接收的 Delivery�
 
 Send 要么发布整条消息并摘除全部源 entry，要么两者均未发生。失败、满箱和投递前到期都保留源能力。Receive 要么完整安装并移除队头，要么不安装且队头仍在；调用期间输出区由调用者独占，失败输出不可解释。
 
-send-once 的目标解析、入箱和消费在同一事务中完成。目标同时出现在 move 列表时，在任何摘除或入队前拒绝；成功投递才消费该 entry。内部临时引用的释放不代替业务 role 的关闭动作。
+send-once 的目标解析、入箱和消费在同一事务中完成。目标同时出现在 move 列表时，在任何摘除或入队前拒绝；成功投递才消费该 entry。内部临时引用的释放不代替对象的最后持有语义。
 
 接收预留中的队头对并发 Receive/Discard 返回 busy。满箱返回 MailboxFull，空箱返回 ObjectNotAvailable，输出或表容量不足时不出队。
 

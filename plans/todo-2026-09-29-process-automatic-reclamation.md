@@ -126,3 +126,42 @@ Job 的创建/封口/递归终止政策在全项目任务模型中可以重审�
 - 源码/ABI/用户封装/测试中无 ProcessDrain 驱动残留；impls 按最终实现回填，不预先宣称完成。
 
 依项目手册完成规定检查与必要 QEMU 组合。当前只形成设计记录，无实现验证。
+
+## 设计轮次 2 收敛结论（2026-10，advisor 一次 + LoneCrane 对抗 8 轮）
+
+闭合“剩余设计门”1、4，及 3/6 中与本案相接部分；资金账户见[预算分案账户形状](todo-2026-09-14-kernel-memory-budget.md#对象持有与释放链所需的账户形状收敛结论2026-10-与-lonecrane-对抗-8-轮advisor-一次)。
+
+### 载体：Shell 即 Control
+
+- `ProcessShell` 就是 ProcessControl 引用的 KernelObject，只含回收 WorkRecord、唯一终态真值、Job 成员身份、gate 与 `body: Option<Box<ProcessBody>>`。删除 `revive_control` 与终态快照复制（其无并发 drain 证明在自主回收下失效），不存在空 Control 槽与重铸窗口。不使用 Weak 指向 Shell。
+- 与权限模型“ProcessControl 归零可重新铸造”一致：Shell 自身不因最后 capability 消失而销毁或终止，重新铸造只为同一 Shell 发新 capability，不新建壳；铸造资格仍由对象操作决定。
+- `ProcessBody`：线程表、CapTable、`Arc<AddressSpace>`、私有 permit。外部不得强持 Body；线程/Builder/syscall 经 Shell gate 取**短** lease 访问，不跨等待或用户返回；ProcessWait/Query 只访问 Shell。
+- Shell metadata 由创建 Pool 资助，最后 strong drop 退槽；Body 的 charge 由 Shell 留持，drop Box 后退。Job 成员强持 Shell 至摘除。
+
+### 出生
+
+- 骨架前失败：只做有界局部回滚，删 Job 占位并 try_commit，无遗留责任。
+- 骨架建立后：构造者已持构造 lease，预约在 Job 锁内转为持 Shell 的成员；此后构造失败走统一 Frozen；Frozen 后只按已准入规则完成/回滚。Job.Done 覆盖已建骨架的创建。
+- Start 不持 gate 等 Builder lease：显式排除/转移自身准入，锁外停驻；Running 提交后的线程发布链由启动记录持有，Kill 与未入队线程交接有唯一完成者。
+
+### 阶段补充
+
+- Frozen 关准入后，先等短 Body lease 归零，再 ReleaseHandles/RetireSpace；异步事务获准即接管自身 VM lease/结果 owner；已有 lease 的释放路径不重入 gate。
+- 退出主动有界地从 Created/Ready/Waiting/调度容器摘线程以破 Shell→Body→Thread→Shell 环（保留 lifecycle.rs:20–24 责任，承载改为回收记录），不等 Arc 计数。
+- Thread/departure/结果记录的私有存储纳入 Settle 实际退休；独立 owner 合法存活者在实施时逐项列明。`ThreadDeparture` 的 `Weak<Process>` 改为已登记回执短期强持 Shell，完成时有界解除。
+- Settle 屏障 = Body 已拆且私有退款实际入账；Shell 不在清单内，消除“记录等自身载体退款”的自等待。
+
+### 终态与发布顺序
+
+lifecycle 锁内取不可变终因（pid、parent_pid、类型化 cause+detail；exit code 若新增须定义适用终因）→ 放锁 → 写 Shell 终态 slot（同时发布公开电平，通知扫描交 Work）→ 单 Job 锁摘成员 → 锁外 publish Job Work。
+
+### Job（闭合门 4）
+
+- 首次 effective seal 是不可逆准入：Job Work 在 Seal 时 publish，先以有界游标把 sealed 物化到子节点（父锁只护 sealed 置位与单步游标/单项摘取，不一次扫全表），再 Blocked 等成员/子表清空（登记+复检，变化 wake），未满足绝不 Done。
+- 所有使表变空的入口（Settle 摘成员、空 Job Seal、member/child reservation 回滚、child 完成摘除）调用 Job 锁内同一 `try_commit_completion`，谓词 `effective_sealed && members.empty && children.empty`（两表都含 Reserved），单调，首次满足才提交私有 finishing。
+- 父 Seal 自动收束已空子树（与 Create/Start 祖先判定同一事实）；已物化 sealed 的父 commit ChildReservation 时子出生即 sealed 并 publish；尚未被传播到的父由未越过它的游标覆盖。
+- 公开终态由 Work 设置：先发布本 Job 终态/CLOSED，再从 parent.children 摘除，锁外 wake 父 Work。删除 `CompletionCursor` 与 seal 内同步 `finish_completion`。
+
+### 交付边界
+
+本链交付本地 CapTable 释放、已触发关闭对象的有界收束与私有 ProcessBody 退休；队列中 capability 环所涉资源不冒称“本进程私有资源均退款”，见 [capability TRANSFER 门](todo-2026-09-28-capability-last-reference.md)。

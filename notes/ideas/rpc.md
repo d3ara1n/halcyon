@@ -14,7 +14,7 @@ send-once 证明一次回复的投递权，txid 负责回复关联，发送授�
 
 收到的请求和回复先由运输 owner 持有，协议提取后才形成业务 owner。畸形、迟到、重复或不匹配的回复统一关闭未提取能力及 Delivery。请求上下文保留 Delivery，直到处理、回复或拒绝责任结束；异步处理时把整个上下文交给任务。
 
-ReplyPort sender 派生的 send-once 保持同一发送授权，以 WRITE、WAIT、TRANSIT 进入请求。WAIT 允许服务在满箱时等待可写或关闭，但服务 outbox 必须有资源上限和期限，不能阻塞整个请求循环。
+ReplyPort sender 派生的 send-once 是新的一次性发送对象，配对的 ReplyObservation 由调用者持有；以 WRITE、WAIT、TRANSIT 进入请求。WAIT 允许服务在满箱时等待可写或关闭，但服务 outbox 必须有资源上限和期限，不能阻塞整个请求循环。
 
 ## 并发与回复路由
 

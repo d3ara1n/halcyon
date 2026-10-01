@@ -1116,10 +1116,22 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         assert!(level >= 1, "level-0 leaf cannot split further");
         let entry = self.mem.table_mut(frame)[idx];
         assert!(entry.is_leaf(), "only a leaf can be split");
+        let owner = prepared.take_owner();
+        self.split_mega_with(frame, idx, level, owner)
+    }
+
+    /// 以给定 owner 把 `frame[idx]` 处的大页叶拆成下一级表；不分配。
+    fn split_mega_with(
+        &mut self,
+        frame: FrameNumber,
+        idx: usize,
+        level: usize,
+        owner: M::FrameOwner,
+    ) -> FrameNumber {
+        let entry = self.mem.table_mut(frame)[idx];
         let mega_pages = pages_at(level);
         let base_ppn = entry.ppn().0 - entry.ppn().0 % mega_pages;
         let flags = entry.flags();
-        let owner = prepared.take_owner();
         let new_frame = self.install_owner(owner);
         let table = self.mem.table_mut(new_frame);
         let sub_pages = pages_at(level - 1);
@@ -1378,6 +1390,230 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
 
     fn set_shared_root(&mut self, slot: usize) {
         self.shared_root[slot / 64] |= 1u64 << (slot % 64);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// 分步发布（内存分案轮次 3）
+// ---------------------------------------------------------------------------
+
+/// 分步发布的 VA 游标：只记计划与下一 VPN，不持表帧；每步从根重走。
+/// 不重叠事务的并行安全由上层预约协议保证（共享祖先只经空表回收移除，
+/// 而空表回收要求覆盖范围内无在途预约），故不做全树代次校验。
+#[derive(Clone, Copy, Debug)]
+pub struct PublishCursor {
+    plan: TranslationPlan,
+    next: usize,
+    end: usize,
+}
+
+impl PublishCursor {
+    pub fn map(vpn: Vpn, count: usize, ppn: Ppn, flags: u64) -> Self {
+        Self { plan: TranslationPlan::Map { vpn, count, ppn, flags }, next: vpn.0, end: vpn.0 + count }
+    }
+
+    pub fn unmap(vpn: Vpn, count: usize) -> Self {
+        Self { plan: TranslationPlan::Unmap { vpn, count }, next: vpn.0, end: vpn.0 + count }
+    }
+
+    pub fn protect(vpn: Vpn, count: usize, from: u64, to: u64) -> Self {
+        Self { plan: TranslationPlan::Protect { vpn, count, from, to }, next: vpn.0, end: vpn.0 + count }
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.next >= self.end
+    }
+
+    /// 已发布到的 VPN（不含）；fault 判定“已发布 vs 未发布”用。
+    pub const fn published_until(&self) -> Vpn {
+        Vpn(self.next)
+    }
+}
+
+/// 几何最坏表页数：与当前树形状无关，可在准备期预取。
+/// Map：区间触及的每级表各一张；Unmap/Protect：两端点各至多一条大页拆分链。
+pub fn worst_case_frames<const LEVELS: usize>(cursor: &PublishCursor) -> usize {
+    match cursor.plan {
+        TranslationPlan::Map { vpn, count, .. } => {
+            let mut total = 0;
+            for level in 0..LEVELS - 1 {
+                let span = pages_at(level + 1);
+                total += (vpn.0 + count).div_ceil(span) - vpn.0 / span;
+            }
+            total
+        }
+        TranslationPlan::Unmap { .. } | TranslationPlan::Protect { .. } => 2 * (LEVELS - 1),
+    }
+}
+
+impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
+    /// 推进至多 `budget` 个槽单元；新表页从 `reserve` 取（准备期按
+    /// [`worst_case_frames`] 预取），不分配、不可失败。Unmap 只清叶，不摘空表；
+    /// 空表由上层按“最后离开者”经 [`Self::detach_empty_table`] 回收。
+    /// 返回游标是否完成。
+    pub fn publish_step(
+        &mut self,
+        cursor: &mut PublishCursor,
+        reserve: &mut Vec<M::FrameOwner>,
+        budget: usize,
+    ) -> bool {
+        let mut units = 0;
+        while !cursor.is_complete() && units < budget {
+            cursor.next = match cursor.plan {
+                TranslationPlan::Map { vpn, ppn, flags, .. } => {
+                    let ppn_cur = ppn.0 + (cursor.next - vpn.0);
+                    let level = largest_segment_level::<LEVELS>(cursor.next, ppn_cur, cursor.end);
+                    self.map_segment_from(Vpn(cursor.next), level, Ppn(ppn_cur), flags, reserve);
+                    cursor.next + pages_at(level)
+                }
+                TranslationPlan::Unmap { .. } => self.edit_slot(cursor.next, cursor.end, None, reserve),
+                TranslationPlan::Protect { from, to, .. } => {
+                    self.edit_slot(cursor.next, cursor.end, Some((from, to)), reserve)
+                }
+            };
+            units += 1;
+        }
+        cursor.is_complete()
+    }
+
+    fn map_segment_from(
+        &mut self,
+        vpn: Vpn,
+        seg_level: usize,
+        ppn: Ppn,
+        flags: u64,
+        reserve: &mut Vec<M::FrameOwner>,
+    ) {
+        let mut frame = self.root;
+        let mut level = LEVELS - 1;
+        loop {
+            let idx = vpn.index_at(level);
+            assert!(
+                level != LEVELS - 1 || !self.is_shared_root(idx),
+                "stepped Map entered a shared root slot"
+            );
+            let entry = self.mem.table_mut(frame)[idx];
+            if level == seg_level {
+                assert!(
+                    !entry.is_valid() || self.leaf_matches(entry, ppn, flags),
+                    "stepped Map hit a conflicting entry inside its reservation"
+                );
+                if frame == self.root {
+                    self.set_owned_root(idx);
+                }
+                self.mem.table_mut(frame)[idx] = Pte::leaf(ppn, flags);
+                return;
+            }
+            if entry.is_branch() {
+                frame = entry.next_frame();
+            } else if entry.is_leaf() {
+                assert!(
+                    self.leaf_matches_at(entry, level, vpn, ppn, flags),
+                    "stepped Map hit a conflicting leaf inside its reservation"
+                );
+                let owner = reserve.pop().expect("worst-case table reserve exhausted");
+                frame = self.split_mega_with(frame, idx, level, owner);
+            } else {
+                if frame == self.root {
+                    self.set_owned_root(idx);
+                }
+                let owner = reserve.pop().expect("worst-case table reserve exhausted");
+                let new_frame = self.install_owner(owner);
+                self.mem.table_mut(frame)[idx] = Pte::branch(new_frame);
+                frame = new_frame;
+            }
+            level -= 1;
+        }
+    }
+
+    /// 处理覆盖 `vpn` 的一个槽：Unmap（`protect=None`）清叶，Protect 改写
+    /// 标志；部分覆盖的大页先拆分。返回下一个待处理 VPN。
+    fn edit_slot(
+        &mut self,
+        vpn: usize,
+        end: usize,
+        protect: Option<(u64, u64)>,
+        reserve: &mut Vec<M::FrameOwner>,
+    ) -> usize {
+        let mut frame = self.root;
+        let mut level = LEVELS - 1;
+        loop {
+            let idx = Vpn(vpn).index_at(level);
+            let slot_pages = pages_at(level);
+            let slot_base = vpn - vpn % slot_pages;
+            let slot_end = slot_base + slot_pages;
+            if level == LEVELS - 1 && self.is_shared_root(idx) {
+                assert!(protect.is_none(), "stepped Protect entered a shared root slot");
+                return slot_end.min(end);
+            }
+            let entry = self.mem.table_mut(frame)[idx];
+            if !entry.is_valid() {
+                assert!(protect.is_none(), "stepped Protect lost its mapping");
+                return slot_end.min(end);
+            }
+            if entry.is_branch() {
+                frame = entry.next_frame();
+                level -= 1;
+                continue;
+            }
+            if slot_base >= vpn && slot_end <= end {
+                match protect {
+                    None => {
+                        self.mem.table_mut(frame)[idx] = Pte::invalid();
+                        if frame == self.root {
+                            self.clear_owned_root(idx);
+                        }
+                    }
+                    Some((from, to)) => {
+                        assert_eq!(entry.flags(), from, "stepped Protect flags changed");
+                        self.mem.table_mut(frame)[idx] = Pte::leaf(entry.ppn(), to);
+                    }
+                }
+                return slot_end;
+            }
+            let owner = reserve.pop().expect("worst-case table reserve exhausted");
+            frame = self.split_mega_with(frame, idx, level, owner);
+            level -= 1;
+        }
+    }
+
+    /// 若覆盖 `vpn` 的第 `level` 级表（0 = 叶表）存在且全空，摘除其父 PTE
+    /// 并交出 owner；否则返回 None。扫描固定 ENTRIES 项，有界。调用方须在
+    /// 空间锁内确认无其他预约与该表范围相交，并在取新 epoch、收齐 fence 后
+    /// 才释放返回的帧。
+    pub fn detach_empty_table(&mut self, vpn: Vpn, level: usize) -> Option<M::FrameOwner> {
+        assert!(level < LEVELS - 1, "root table is not detachable");
+        let mut frame = self.root;
+        let mut cur = LEVELS - 1;
+        loop {
+            let idx = vpn.index_at(cur);
+            if cur == LEVELS - 1 && self.is_shared_root(idx) {
+                return None;
+            }
+            let entry = self.mem.table_mut(frame)[idx];
+            if !entry.is_branch() {
+                return None;
+            }
+            let child = entry.next_frame();
+            if cur - 1 == level {
+                if self.mem.table_mut(child).iter().any(|pte| pte.is_valid()) {
+                    return None;
+                }
+                self.mem.table_mut(frame)[idx] = Pte::invalid();
+                if frame == self.root {
+                    self.clear_owned_root(idx);
+                }
+                return Some(self.take_owner(child));
+            }
+            frame = child;
+            cur -= 1;
+        }
+    }
+
+    /// 已 adopt 的分支表数（与上层 TableCharge 守恒断言用）。
+    pub const fn branch_count(&self) -> usize {
+        self.branches
     }
 }
 

@@ -286,6 +286,7 @@ pub struct RegionView {
 }
 
 #[derive(Debug)]
+#[derive(Clone, Copy)]
 enum RegionKind {
     Guard,
     Mapping {
@@ -388,6 +389,10 @@ pub enum FaultClass {
     Free,
     Guard,
     Mapping { protection: Protection },
+    /// 地址落在已提交、账本仍在分步推进的事务区间：调用者不得据此投递
+    /// fault，应按 `target`（该事务承诺的终态权限，Unmap 为 None）判定：
+    /// 终态允许则锁外让出后重试，否则正常投递。
+    Publishing { target: Option<Protection> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +579,10 @@ impl ReserveFailure {
 #[derive(Debug)]
 struct ChangePayload {
     key: ChangeKey,
+    /// 分步 ledger 推进：先逐个摘旧节点，再逐个插替换节点；游标耗尽前
+    /// 账本处于过渡态，由事务区间记录解释（见 [`FaultClass::Publishing`]）。
+    remove: Vec<(usize, RegionKey)>,
+    replacements: Vec<Region>,
     translations: Vec<TranslationIntent>,
     retiring: Vec<RetiringFragment>,
     retiring_object_capacity: usize,
@@ -649,6 +658,10 @@ struct TransactionRecord {
     lease: Option<AddressRange>,
     stage: ChangeStage,
     reserved_growth: usize,
+    /// Committed 且 ledger 游标未耗尽。
+    ledger_pending: bool,
+    /// 事务承诺的终态权限（fault 在过渡期按此判定）。
+    target: Option<Protection>,
 }
 
 #[derive(Debug)]
@@ -709,6 +722,15 @@ impl MemorySpace {
         self.regions.len()
     }
 
+    /// 最后离开者判定：是否仍有在途事务（任一阶段）的 footprint 与 `range`
+    /// 相交。调用者在同一空间锁内先 `complete`/`rollback` 自己的记录再查询，
+    /// 检查与摘表之间不放锁。
+    pub fn span_reserved(&self, range: AddressRange) -> bool {
+        self.transactions
+            .iter()
+            .any(|record| record.footprint.address_range().overlaps(range))
+    }
+
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
     }
@@ -718,6 +740,18 @@ impl MemorySpace {
     }
 
     pub fn fault_class(&self, address: usize) -> FaultClass {
+        if self.transactions.iter().any(|t| {
+            t.stage == ChangeStage::Committed
+                && t.ledger_pending
+                && t.footprint.address_range().contains_address(address)
+        }) {
+            let target = self
+                .transactions
+                .iter()
+                .find(|t| t.footprint.address_range().contains_address(address))
+                .and_then(|t| t.target);
+            return FaultClass::Publishing { target };
+        }
         let Some(region) = self
             .regions
             .floor(&address)
@@ -952,6 +986,17 @@ impl MemorySpace {
         let permits = permit_requirements(&replacements)?;
         let growth = replacements.len().saturating_sub(remove.len());
         self.check_projected_regions(growth)?;
+        // footprint = 实际被替换节点的跨度：两个写者不会在提交后争同一节点。
+        // 端点已物化（见 split_at_boundaries）时恰好等于请求区间。
+        let footprint = PageRange::from_bounds(
+            remove.iter().map(|&(start, _)| start).min().unwrap_or(request.range.start()),
+            remove
+                .iter()
+                .map(|&(start, _)| self.region_at(start).range.end())
+                .max()
+                .unwrap_or(request.range.end()),
+        )?;
+        self.ensure_no_transaction_conflict(footprint, None)?;
         let snapshot = remove.clone();
         Ok(ValidatedChange {
             plan: ValidatedPlan {
@@ -959,7 +1004,7 @@ impl MemorySpace {
                 replacements,
                 retiring,
                 translations,
-                footprint: request.range,
+                footprint,
                 result_layout: None,
             },
             snapshot,
@@ -1172,6 +1217,11 @@ impl MemorySpace {
             result_layout,
             ..
         } = plan;
+        let target = translations.iter().find_map(|intent| match *intent {
+            TranslationIntent::Install { protection, .. } => Some(protection),
+            TranslationIntent::Protect { to, .. } => Some(to),
+            TranslationIntent::Remove { .. } => None,
+        });
         let key = self.mint_change_key();
         let lease = lease.map(|(range, segments)| UserWriteLease {
             range,
@@ -1183,6 +1233,8 @@ impl MemorySpace {
             lease: lease.as_ref().map(UserWriteLease::range),
             stage: ChangeStage::Reserved,
             reserved_growth: growth,
+            ledger_pending: false,
+            target,
         });
         self.reserved_growth += growth;
         Ok(PreparedChange {
@@ -1386,6 +1438,59 @@ impl MemorySpace {
         })
     }
 
+    /// 准备期端点物化：把跨越 `range` 端点的 Region 按同权限切开（语义中性），
+    /// 使随后事务的 footprint 恰好等于请求区间，不同 VA 的写者不再共享节点。
+    /// 被其他事务 footprint 覆盖的节点不切（返回 Busy）；带写许可的节点不切
+    /// （切分需要额外许可），其事务 footprint 扩展为整节点。切分形状在失败时
+    /// 保留，不合并。
+    pub fn split_at_boundaries(&mut self, range: PageRange) -> Result<(), ChangeError> {
+        for edge in [range.start(), range.end()] {
+            let Some((start, region)) = self.regions.floor(&edge) else {
+                continue;
+            };
+            if !(start < edge && edge < region.range.end()) || region.permit.is_some() {
+                continue;
+            }
+            if self.transactions.iter().any(|t| t.footprint.overlaps(region.range)) {
+                return Err(ChangeError::Busy);
+            }
+            self.check_projected_regions(1)?;
+            self.regions
+                .reserve(2)
+                .map_err(|_| ChangeError::AllocationFailed)?;
+            let old = self.regions.remove(&start).expect("floor region exists");
+            let old_kind = old.kind;
+            let left = PageRange::from_bounds(old.range.start(), edge)?;
+            let right = PageRange::from_bounds(edge, old.range.end())?;
+            let shift = |kind: RegionKind, bytes: usize| match kind {
+                RegionKind::Guard => RegionKind::Guard,
+                RegionKind::Mapping { backing, current, maximum } => RegionKind::Mapping {
+                    backing: backing.shifted(bytes).expect("split inside backing range"),
+                    current,
+                    maximum,
+                },
+            };
+            let (lk, rk) = (self.mint_region_key(), self.mint_region_key());
+            self.regions.insert(left.start(), Region {
+                key: lk,
+                allocation: old.allocation,
+                range: left,
+                owner: old.owner,
+                kind: old_kind,
+                permit: None,
+            });
+            self.regions.insert(right.start(), Region {
+                key: rk,
+                allocation: old.allocation,
+                range: right,
+                owner: old.owner,
+                kind: shift(old_kind, edge - old.range.start()),
+                permit: None,
+            });
+        }
+        Ok(())
+    }
+
     pub fn rollback(&mut self, prepared: PreparedChange) -> Vec<WritePermit> {
         let index = self.transaction_index(prepared.key, ChangeStage::Reserved);
         let record = self.transactions.remove(index);
@@ -1400,41 +1505,63 @@ impl MemorySpace {
         permits
     }
 
-    /// 不可失败的账本 Commit。调用方必须先经 UserWriteLease 发布 payload/cookie。
+    /// 不可失败的责任 Commit：只移交责任，不改账本。调用方必须先经
+    /// UserWriteLease 发布 payload/cookie。账本随后经 [`Self::commit_step`]
+    /// 分步推进；结果租约保留到 [`Self::complete`]（最后写回之后）。
     pub fn commit(&mut self, prepared: PreparedChange) -> CommittedChange {
         let index = self.transaction_index(prepared.key, ChangeStage::Reserved);
-        let mut retiring_permits = prepared.plan.retiring_permits;
-
-        for &(start, key) in &prepared.plan.remove {
-            let region = self
-                .regions
-                .remove(&start)
-                .expect("validated region key changed before Commit");
-            assert_eq!(
-                region.key, key,
-                "validated region key changed before Commit"
-            );
-            if let Some(permit) = region.permit {
-                retiring_permits.push(permit);
-            }
-        }
-        for region in prepared.plan.replacements {
-            self.regions.insert(region.range.start(), region);
-        }
-
         let record = &mut self.transactions[index];
-        self.reserved_growth -= record.reserved_growth;
-        record.reserved_growth = 0;
-        record.lease = None;
         record.stage = ChangeStage::Committed;
+        record.ledger_pending =
+            !(prepared.plan.remove.is_empty() && prepared.plan.replacements.is_empty());
         CommittedChange(ChangePayload {
             key: prepared.key,
+            remove: prepared.plan.remove,
+            replacements: prepared.plan.replacements,
             translations: prepared.plan.translations,
             retiring: prepared.plan.retiring,
             retiring_object_capacity: prepared.plan.retiring_object_capacity,
-            retiring_permits,
+            retiring_permits: prepared.plan.retiring_permits,
             result_layout: prepared.plan.result_layout,
         })
+    }
+
+    /// 有界推进账本：至多 `budget` 个节点操作（摘一个旧节点或插一个替换
+    /// 节点各计 1，节点归还与移出的写许可随该操作计入）。返回账本是否已到
+    /// 终态。不分配：替换节点槽已在 reserve 预取，旧节点槽归还 free。
+    pub fn commit_step(&mut self, committed: &mut CommittedChange, budget: usize) -> bool {
+        assert!(budget > 0, "ledger step budget must be nonzero");
+        let index = self.transaction_index(committed.0.key, ChangeStage::Committed);
+        let payload = &mut committed.0;
+        let mut spent = 0;
+        while spent < budget {
+            if let Some((start, key)) = payload.remove.pop() {
+                let region = self
+                    .regions
+                    .remove(&start)
+                    .expect("committed region removed by another writer");
+                assert_eq!(region.key, key, "committed region replaced by another writer");
+                if let Some(permit) = region.permit {
+                    payload.retiring_permits.push(permit);
+                }
+            } else if let Some(region) = payload.replacements.pop() {
+                self.regions.insert(region.range.start(), region);
+                self.reserved_growth -= usize::from(self.transactions[index].reserved_growth > 0);
+                let record = &mut self.transactions[index];
+                record.reserved_growth = record.reserved_growth.saturating_sub(1);
+            } else {
+                break;
+            }
+            spent += 1;
+        }
+        let done = payload.remove.is_empty() && payload.replacements.is_empty();
+        if done {
+            let record = &mut self.transactions[index];
+            self.reserved_growth -= record.reserved_growth;
+            record.reserved_growth = 0;
+            record.ledger_pending = false;
+        }
+        done
     }
 
     /// 全部所需确认到齐后调用：消费已提交责任，产出同步完成证明
@@ -1444,6 +1571,10 @@ impl MemorySpace {
             committed.0.key,
             ChangeStage::Committed,
             ChangeStage::Retiring,
+        );
+        assert!(
+            committed.0.remove.is_empty() && committed.0.replacements.is_empty(),
+            "synchronize before ledger steps finished"
         );
         let mut payload = committed.0;
         let batch = RetireBatch {
@@ -1472,6 +1603,33 @@ impl MemorySpace {
         );
         let start = self.regions.first()?.0;
         let region = self.regions.remove(&start).expect("first region exists");
+        let view = region.view();
+        Some((
+            RetiringFragment {
+                key: view.key,
+                allocation: view.allocation,
+                range: view.range,
+                owner: view.owner,
+                kind: view.kind,
+                backing_retire: BackingRetire::Release,
+            },
+            region.permit,
+        ))
+    }
+
+    /// 完整 owner 释放：每次摘除 `allocation` 的一个 region，只释放不分配，
+    /// 不受请求上限约束；调用者持游标反复调用直至 None。
+    pub fn release_allocation_step(
+        &mut self,
+        allocation: AllocationKey,
+        cursor: &mut usize,
+    ) -> Option<(RetiringFragment, Option<WritePermit>)> {
+        let (start, _) = self
+            .regions
+            .iter_from(*cursor)
+            .find(|(_, region)| region.allocation == allocation)?;
+        *cursor = start;
+        let region = self.regions.remove(&start).expect("found region exists");
         let view = region.view();
         Some((
             RetiringFragment {

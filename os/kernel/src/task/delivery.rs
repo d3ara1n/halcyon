@@ -10,6 +10,8 @@ use core::any::Any;
 use erhino_shared::{call::SystemCallError, object::Rights};
 
 pub struct Delivery {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     sender: ObjectRef,
     _permit: IpcPermit,
@@ -21,6 +23,7 @@ impl Delivery {
         sponsor: &Arc<MetadataSponsor>,
     ) -> Result<ObjectRef, SystemCallError> {
         let object = Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             sender,
             _permit: MetadataSponsor::reserve_ipc(sponsor, super::resources::IpcClass::Delivery)?,
@@ -31,6 +34,10 @@ impl Delivery {
 }
 
 impl KernelObject for Delivery {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -40,14 +47,12 @@ impl KernelObject for Delivery {
     fn related_id(&self) -> u64 {
         self.sender.header().koid()
     }
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::Delivery).then_some(Rights::TRANSIT | Rights::GRANT)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::TRANSIT | Rights::GRANT)
     }
-    fn allowed_signals(&self, _: HandleRole) -> Option<erhino_shared::object::ObjectSignals> {
+    fn allowed_signals(&self) -> Option<erhino_shared::object::ObjectSignals> {
         None
     }
-    fn close_handle(&self, _: HandleRole, _: &Process, _: bool) {}
-    fn close_transit(&self, _: HandleRole) {}
     fn as_any(&self) -> &dyn Any {
         self
     }

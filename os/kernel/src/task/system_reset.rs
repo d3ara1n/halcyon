@@ -19,6 +19,8 @@ use super::{
 };
 
 pub struct SystemReset {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     in_flight: AtomicBool,
 }
@@ -26,6 +28,7 @@ pub struct SystemReset {
 impl SystemReset {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::new(),
             in_flight: AtomicBool::new(false),
         })
@@ -48,6 +51,10 @@ impl SystemReset {
 }
 
 impl KernelObject for SystemReset {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -56,21 +63,12 @@ impl KernelObject for SystemReset {
         ObjectKind::SystemReset
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::SystemResetControl)
-            .then_some(Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
     }
 
-    fn allowed_signals(&self, _role: HandleRole) -> Option<ObjectSignals> {
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
         None
-    }
-
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::SystemResetControl);
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::SystemResetControl);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -91,8 +89,7 @@ pub fn request(
         let entry = table
             .get(handle, Rights::MANAGE)
             .map_err(super::handle::map_error)?;
-        if *entry.role() != HandleRole::SystemResetControl
-            || entry.object().kind() != ObjectKind::SystemReset
+        if entry.object().kind() != ObjectKind::SystemReset
         {
             return Err(SystemCallError::WrongObjectType);
         }

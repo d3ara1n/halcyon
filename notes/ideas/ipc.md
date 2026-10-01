@@ -1,6 +1,6 @@
 # 进程间通信
 
-IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信对象只经进程本地 Handle 操作，role、rights 与对象状态共同决定合法行为；PID 是 provenance，不是通信地址或 authority。一次等待与持久观察由 [WaitMany / WaitSet](wait.md) 统一完成。
+IPC 建立在[对象、Capability 与 Handle](object.md)模型上。每个通信对象只经进程本地 Handle 操作，对象类型、rights 与对象状态共同决定合法行为；不同角色是不同对象类型；PID 是 provenance，不是通信地址或 authority。一次等待与持久观察由 [WaitMany / WaitSet](wait.md) 统一完成。
 
 ## 三个面
 

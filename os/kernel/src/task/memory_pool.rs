@@ -26,9 +26,13 @@ static ROOT: crate::sync::Spinlock<Option<Arc<MemoryPool>>> =
     crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
 
 pub struct MemoryPool {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     inner: crate::sync::Spinlock<PoolInner>,
     _permit: PoolCorePermit,
+    /// 维护公平域：资金账户即 Pool（预算分案账户形状）。Work 记录强持该账户。
+    maintenance: Arc<crate::maintenance::Account>,
 }
 
 enum PoolInner {
@@ -68,6 +72,7 @@ impl MemoryPool {
             .expect("platform user supply cannot create the root Pool");
         let total = state.snapshot().total;
         let pool = Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header,
             inner: crate::sync::Spinlock::new(
                 crate::sync::ranks::MEMORY_POOL,
@@ -77,6 +82,8 @@ impl MemoryPool {
                 },
             ),
             _permit: permit,
+            maintenance: Arc::try_new(crate::maintenance::Account::new())
+                .expect("root Pool maintenance account allocation failed"),
         })
         .expect("root Pool allocation failed");
 
@@ -338,6 +345,7 @@ impl MemoryPool {
             }
         };
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header,
             inner: crate::sync::Spinlock::new(
                 crate::sync::ranks::MEMORY_POOL,
@@ -347,8 +355,15 @@ impl MemoryPool {
                 }),
             ),
             _permit: permit,
+            maintenance: Arc::try_new(crate::maintenance::Account::new())
+                .map_err(|_| SystemCallError::OutOfMemory)?,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
+    }
+
+    /// 本 Pool 的维护账户（Work 记录准入用）。
+    pub(crate) fn maintenance_account(&self) -> &Arc<crate::maintenance::Account> {
+        &self.maintenance
     }
 
     pub(crate) fn object_ref(pool: &Arc<Self>) -> ObjectRef {
@@ -478,6 +493,8 @@ impl Drop for MemoryPool {
                             .into_parent_credit()
                             .expect("child Pool state is quiescent")
                             .expect("child Pool lost parent credit");
+                        // 欠账不因销毁丢失：剩余维护 deficit 并入父账户。
+                        parent.maintenance.absorb_debt(&self.maintenance);
                         Self::active_state_mut(&mut parent.inner.lock())
                             .return_delegation(credit)
                             .unwrap_or_else(|error| {
@@ -532,6 +549,11 @@ impl Drop for PreparedMemoryCharge {
 }
 
 impl MemoryCharge {
+    /// 该 charge 是否来自 `pool`（同源校验，按对象身份）。
+    pub(crate) fn is_from(&self, pool: &MemoryPool) -> bool {
+        core::ptr::eq(Arc::as_ptr(&self.pool), pool)
+    }
+
     pub(crate) fn pages(&self) -> usize {
         usize::try_from(
             self.credit
@@ -599,6 +621,10 @@ impl Drop for MemoryCharge {
 }
 
 impl KernelObject for MemoryPool {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -607,22 +633,14 @@ impl KernelObject for MemoryPool {
         ObjectKind::MemoryPool
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::MemoryPool).then_some(
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(
             Rights::CREATE | Rights::READ | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
         )
     }
 
-    fn allowed_signals(&self, _role: HandleRole) -> Option<erhino_shared::object::ObjectSignals> {
+    fn allowed_signals(&self) -> Option<erhino_shared::object::ObjectSignals> {
         None
-    }
-
-    fn close_handle(&self, role: HandleRole, _owner: &super::proc::Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::MemoryPool);
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::MemoryPool);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -679,7 +697,7 @@ fn resolve(
     let entry = table
         .get(handle, required)
         .map_err(super::handle::map_error)?;
-    if *entry.role() != HandleRole::MemoryPool || entry.object().kind() != ObjectKind::MemoryPool {
+    if entry.object().kind() != ObjectKind::MemoryPool {
         return Err(SystemCallError::WrongObjectType);
     }
     let rights = entry.rights();

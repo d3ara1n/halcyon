@@ -63,6 +63,8 @@ enum PeerNotice {
 }
 
 pub struct Endpoint {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     connection: Arc<Connection>,
     side: usize,
@@ -81,6 +83,7 @@ impl Endpoint {
         metadata: super::resources::EndpointPermit,
     ) -> Result<Arc<Self>, SystemCallError> {
         let endpoint = Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             connection,
             side,
@@ -173,6 +176,10 @@ fn publish_peer_notice(notice: Option<PeerNotice>) {
 }
 
 impl KernelObject for Endpoint {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn complete_waiter_drain(
         &self,
         reservation: super::notify_work::Reservation,
@@ -192,13 +199,12 @@ impl KernelObject for Endpoint {
         ObjectKind::TunnelEndpoint
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::TunnelEndpoint)
-            .then_some(Rights::WAIT | Rights::SIGNAL | Rights::MANAGE)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::WAIT | Rights::SIGNAL | Rights::MANAGE)
     }
 
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::TunnelEndpoint).then_some(
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(
             ObjectSignals::DATA
                 | ObjectSignals::PEER_ATTACHED
                 | ObjectSignals::PEER_CLOSED
@@ -227,21 +233,14 @@ impl KernelObject for Endpoint {
         drop(retired);
     }
 
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::TunnelEndpoint);
-        unreachable!("Tunnel Endpoint close must consume its mapping lease transaction")
-    }
-
-    fn close_transit(&self, _role: HandleRole) {
-        unreachable!("Tunnel Endpoint cannot enter transit")
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
 pub struct Invitation {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     connection: Arc<Connection>,
     side: usize,
@@ -256,6 +255,7 @@ impl Invitation {
         metadata: super::resources::InvitationPermit,
     ) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             connection,
             side,
@@ -299,6 +299,10 @@ impl Invitation {
 }
 
 impl KernelObject for Invitation {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -307,22 +311,15 @@ impl KernelObject for Invitation {
         ObjectKind::TunnelInvitation
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::TunnelInvitation)
-            .then_some(Rights::MAP | Rights::TRANSIT | Rights::GRANT)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::TRANSIT | Rights::GRANT)
     }
 
-    fn allowed_signals(&self, _role: HandleRole) -> Option<ObjectSignals> {
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
         None
     }
 
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::TunnelInvitation);
-        self.abandon();
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::TunnelInvitation);
+    fn on_last_capability(&self) {
         self.abandon();
     }
 
@@ -705,7 +702,7 @@ pub fn create(
         handle::entry(
             Invitation::object_ref(&invitation),
             HandleRole::TunnelInvitation,
-            Rights::MAP | Rights::TRANSIT | Rights::GRANT,
+            Rights::TRANSIT | Rights::GRANT,
         )
         .map_err(handle::map_error)?,
     );
@@ -877,10 +874,9 @@ pub fn attach(
     let mut table = thread.process.handles.lock();
     let object = {
         let entry = table
-            .get(invitation_handle, Rights::MAP)
+            .get(invitation_handle, Rights::NONE)
             .map_err(handle::map_error)?;
-        if *entry.role() != HandleRole::TunnelInvitation
-            || entry.object().kind() != ObjectKind::TunnelInvitation
+        if entry.object().kind() != ObjectKind::TunnelInvitation
         {
             return Err(SystemCallError::WrongObjectType);
         }
@@ -1080,8 +1076,7 @@ pub(crate) fn close_handle(
     let mut table = thread.process.handles.lock();
     let object = {
         let entry = table.get(handle, Rights::NONE).map_err(handle::map_error)?;
-        if *entry.role() != HandleRole::TunnelEndpoint
-            || entry.object().kind() != ObjectKind::TunnelEndpoint
+        if entry.object().kind() != ObjectKind::TunnelEndpoint
         {
             return Err(SystemCallError::WrongObjectType);
         }
@@ -1254,8 +1249,7 @@ fn resolve_endpoint(
 ) -> Result<ObjectRef, SystemCallError> {
     let table = thread.process.handles.lock();
     let entry = table.get(handle, rights).map_err(handle::map_error)?;
-    if *entry.role() != HandleRole::TunnelEndpoint
-        || entry.object().kind() != ObjectKind::TunnelEndpoint
+    if entry.object().kind() != ObjectKind::TunnelEndpoint
     {
         return Err(SystemCallError::WrongObjectType);
     }

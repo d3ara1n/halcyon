@@ -72,7 +72,7 @@ fn complete_prepared(
     space: &mut MemorySpace,
     prepared: memory_space::PreparedChange,
 ) -> Vec<memory_space::RetiringFragment> {
-    let committed = space.commit(prepared);
+    let committed = commit_all(space, prepared);
     let (retiring, mut batch) = space.synchronize(committed);
     let fragments = batch.fragments().to_vec();
     while batch.pop_fragment().is_some() {}
@@ -547,8 +547,21 @@ fn user_write_lease_pins_exact_projection_until_commit_or_rollback() {
     });
     let validated = space.validate_map(request).unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    let committed = space.commit(prepared);
-    // Commit releases the lease; the result slot is no longer needed by the transaction.
+    let committed = commit_all(&mut space, prepared);
+    // 结果租约跨 commit 保留，直到 complete（最后写回之后）才释放。
+    assert_eq!(
+        space
+            .validate_unmap(UnmapRequest {
+                range: first_page,
+                authority: RegionOwner::AddressSpace,
+            })
+            .unwrap_err(),
+        ChangeError::Busy
+    );
+    let (retiring, mut batch) = space.synchronize(committed);
+    while batch.pop_fragment().is_some() {}
+    while batch.pop_permit().is_some() {}
+    space.complete(retiring, &batch);
     assert!(
         space
             .validate_unmap(UnmapRequest {
@@ -557,10 +570,6 @@ fn user_write_lease_pins_exact_projection_until_commit_or_rollback() {
             })
             .is_ok()
     );
-    let (retiring, mut batch) = space.synchronize(committed);
-    while batch.pop_fragment().is_some() {}
-    while batch.pop_permit().is_some() {}
-    space.complete(retiring, &batch);
 }
 
 #[test]
@@ -717,7 +726,7 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
         })
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    let committed = space.commit(prepared);
+    let committed = commit_all(&mut space, prepared);
     assert_eq!(object.permit_count(), 1);
     assert_eq!(object.permit_count(), 1);
     assert_eq!(object.permit_count(), 1);
@@ -789,7 +798,7 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
     );
     let permits = object.reserve_replacement_writes(requirement).unwrap();
     let prepared = space.reserve(validated, permits).unwrap();
-    let committed = space.commit(prepared);
+    let committed = commit_all(&mut space, prepared);
     let (retiring, mut batch) = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     let old = batch.pop_permit().expect("old writable permit must retire");
@@ -823,7 +832,7 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
         .unwrap();
     assert!(validated.permit_requirements().is_empty());
     let prepared = reserve_no_permits(&mut space, validated);
-    let committed = space.commit(prepared);
+    let committed = commit_all(&mut space, prepared);
     let (retiring, mut batch) = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     let mut sealed = false;
@@ -1085,7 +1094,7 @@ fn translation_intents_follow_typed_change_stages() {
         prepared.translation_intents(),
         [TranslationIntent::Install { range, .. }] if *range == PageRange::new(BASE, PAGE_SIZE).unwrap()
     ));
-    let committed = space.commit(prepared);
+    let committed = commit_all(&mut space, prepared);
     assert_eq!(space.transaction_count(), 1);
     let (retiring, batch) = space.synchronize(committed);
     assert!(batch.is_empty());
@@ -1331,8 +1340,91 @@ fn retiring_stage_cannot_complete_with_live_owners() {
         })
         .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    let committed = space.commit(prepared);
+    let committed = commit_all(&mut space, prepared);
     let (retiring, batch) = space.synchronize(committed);
     assert!(!batch.is_empty());
     space.complete(retiring, &batch);
+}
+
+#[test]
+fn disjoint_unmaps_inside_one_region_never_share_a_node() {
+    let mut space = space();
+    commit_map(
+        &mut space,
+        anonymous_map(1, BASE, 8, 0, 0, Protection::ReadWrite, Protection::ReadWrite, RegionOwner::AddressSpace),
+    );
+    let a = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
+    let b = PageRange::new(BASE + 5 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    // 未物化：两段 Unmap 的 footprint 覆盖同一节点，第二个准入即 Busy，不会提交后 Stale。
+    let va = space.validate_unmap(UnmapRequest { range: a, authority: RegionOwner::AddressSpace }).unwrap();
+    let pa = reserve_no_permits(&mut space, va);
+    assert_eq!(
+        space.validate_unmap(UnmapRequest { range: b, authority: RegionOwner::AddressSpace }).unwrap_err(),
+        ChangeError::Busy
+    );
+    complete_prepared(&mut space, pa);
+    // 物化端点后：两段并行准入、按任意顺序提交均成立。
+    space.split_at_boundaries(b).unwrap();
+    let c = PageRange::new(BASE + 3 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    space.split_at_boundaries(c).unwrap();
+    let vb = space.validate_unmap(UnmapRequest { range: b, authority: RegionOwner::AddressSpace }).unwrap();
+    let vc = space.validate_unmap(UnmapRequest { range: c, authority: RegionOwner::AddressSpace }).unwrap();
+    let pb = reserve_no_permits(&mut space, vb);
+    let pc = reserve_no_permits(&mut space, vc);
+    complete_prepared(&mut space, pb);
+    complete_prepared(&mut space, pc);
+    assert_eq!(space.transaction_count(), 0);
+}
+
+fn commit_all(
+    space: &mut MemorySpace,
+    prepared: memory_space::PreparedChange,
+) -> memory_space::CommittedChange {
+    let mut committed = space.commit(prepared);
+    while !space.commit_step(&mut committed, 1) {}
+    committed
+}
+
+#[test]
+fn stepwise_commit_marks_range_publishing_until_ledger_done() {
+    let mut space = space();
+    commit_map(
+        &mut space,
+        anonymous_map(1, BASE, 4, 0, 0, Protection::ReadWrite, Protection::ReadWrite,
+            RegionOwner::AddressSpace),
+    );
+    let validated = space
+        .validate_unmap(UnmapRequest {
+            range: PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap(),
+            authority: RegionOwner::AddressSpace,
+        })
+        .unwrap();
+    let prepared = reserve_no_permits(&mut space, validated);
+    let mut committed = space.commit(prepared);
+    assert!(!space.commit_step(&mut committed, 1));
+    assert_eq!(space.fault_class(BASE + PAGE_SIZE), memory_space::FaultClass::Publishing { target: None });
+    while !space.commit_step(&mut committed, 1) {}
+    assert_eq!(space.fault_class(BASE + PAGE_SIZE), memory_space::FaultClass::Free);
+    let (retiring, mut batch) = space.synchronize(committed);
+    while batch.pop_fragment().is_some() {}
+    while batch.pop_permit().is_some() {}
+    space.complete(retiring, &batch);
+}
+
+#[test]
+fn owner_release_cursor_removes_every_fragment_without_allocation() {
+    let mut space = space();
+    commit_map(
+        &mut space,
+        anonymous_map(1, BASE + PAGE_SIZE, 4, 1, 1, Protection::ReadWrite, Protection::ReadWrite,
+            RegionOwner::AddressSpace),
+    );
+    let allocation = region_allocation(&space);
+    let mut cursor = 0;
+    let mut n = 0;
+    while space.release_allocation_step(allocation, &mut cursor).is_some() {
+        n += 1;
+    }
+    assert_eq!(n, 3);
+    assert_eq!(space.region_count(), 0);
 }

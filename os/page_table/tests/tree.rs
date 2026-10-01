@@ -764,3 +764,63 @@ fn second_unmap_after_first_publish_is_detected_as_stale() {
     drop(second);
     drop(first_outcome);
 }
+
+// ---- 游标分步发布（内存分案轮次 3）----
+
+fn step_all(tree: &mut Tree, cursor: &mut page_table::PublishCursor, reserve: &mut Vec<TableOwner>) {
+    while !tree.publish_step(cursor, reserve, 1) {}
+}
+
+#[test]
+fn disjoint_cursors_publish_interleaved_without_stale() {
+    let counters = Rc::new(Counters::default());
+    let mut tree = tree(&counters);
+    let rw = flags::V | flags::R | flags::W;
+    let mut a = page_table::PublishCursor::map(Vpn(0), 8, Ppn(0x1000), rw);
+    let mut b = page_table::PublishCursor::map(Vpn(16), 8, Ppn(0x2000), rw);
+    let mut ra = supply(&counters, page_table::worst_case_frames::<3>(&a)).unwrap();
+    let mut rb = supply(&counters, page_table::worst_case_frames::<3>(&b)).unwrap();
+    loop {
+        let da = tree.publish_step(&mut a, &mut ra, 1);
+        let db = tree.publish_step(&mut b, &mut rb, 1);
+        if da && db {
+            break;
+        }
+    }
+    assert_eq!(tree.translate(Vpn(3)).unwrap().ppn, Ppn(0x1003));
+    assert_eq!(tree.translate(Vpn(20)).unwrap().ppn, Ppn(0x2004));
+    drop((ra, rb));
+    let mut u = page_table::PublishCursor::unmap(Vpn(0), 24);
+    let mut none = Vec::new();
+    step_all(&mut tree, &mut u, &mut none);
+    assert!(tree.translate(Vpn(3)).is_none());
+}
+
+#[test]
+fn stepwise_protect_and_detach_empty_tables() {
+    let counters = Rc::new(Counters::default());
+    let mut tree = tree(&counters);
+    let rw = flags::V | flags::R | flags::W;
+    let ro = flags::V | flags::R;
+    let mut m = page_table::PublishCursor::map(Vpn(0), 4, Ppn(0x10), rw);
+    let mut r = supply(&counters, page_table::worst_case_frames::<3>(&m)).unwrap();
+    step_all(&mut tree, &mut m, &mut r);
+    drop(r);
+    let mut p = page_table::PublishCursor::protect(Vpn(0), 4, rw, ro);
+    let mut none = Vec::new();
+    step_all(&mut tree, &mut p, &mut none);
+    assert_eq!(tree.translate(Vpn(2)).unwrap().flags, ro);
+    let mut u = page_table::PublishCursor::unmap(Vpn(0), 4);
+    step_all(&mut tree, &mut u, &mut none);
+    // 固定批次退休：逐张摘空表（叶表→中间表），每次交出恰好一个 owner。
+    let live = counters.live.get();
+    let mut retired = 0;
+    for level in 0..2 {
+        if let Some(owner) = tree.detach_empty_table(Vpn(0), level) {
+            drop(owner);
+            retired += 1;
+        }
+    }
+    assert_eq!(retired, 2);
+    assert_eq!(counters.live.get(), live - 2);
+}

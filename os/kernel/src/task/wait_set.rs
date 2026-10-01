@@ -330,6 +330,8 @@ impl SetState {
 }
 
 pub struct WaitSet {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     state: Spinlock<SetState>,
     sponsor: Arc<MetadataSponsor>,
@@ -348,6 +350,7 @@ impl WaitSet {
         let metadata = MetadataSponsor::reserve_kernel_wait(sponsor)?;
         let (reply, reply_plan) = super::wait::prepare_kernel(0, metadata)?;
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: Spinlock::new(
                 crate::sync::ranks::WAIT_SET,
@@ -500,6 +503,10 @@ impl Drop for Operation {
 }
 
 impl KernelObject for WaitSet {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn retirement(&self) -> Option<&dyn super::retirement::RetirementTarget> {
         Some(self)
     }
@@ -509,13 +516,11 @@ impl KernelObject for WaitSet {
     fn kind(&self) -> ObjectKind {
         ObjectKind::WaitSet
     }
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::WaitSetOwner)
-            .then_some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
     }
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::WaitSetOwner)
-            .then_some(ObjectSignals::READABLE | ObjectSignals::CLOSED)
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::READABLE | ObjectSignals::CLOSED)
     }
     fn signals(&self) -> ObjectSignals {
         self.state.lock().wait.signals()
@@ -534,12 +539,6 @@ impl KernelObject for WaitSet {
     fn unsubscribe(&self, id: u64) {
         let retired = self.state.lock().wait.unsubscribe(id);
         drop(retired);
-    }
-    fn close_handle(&self, _: HandleRole, _: &Process, _: bool) {
-        unreachable!("WaitSet owner must submit its prepaid retirement")
-    }
-    fn close_transit(&self, _: HandleRole) {
-        unreachable!("WaitSet owner cannot enter messages")
     }
     fn advance_waiter(&self) -> super::object::WaitAdvance {
         self.state.lock().wait.advance_waiter()
@@ -741,7 +740,7 @@ fn resolve(thread: &Thread, handle: Handle, rights: Rights) -> Result<ObjectRef,
     let entry = table
         .get(handle, rights)
         .map_err(super::handle::map_error)?;
-    if *entry.role() != HandleRole::WaitSetOwner || entry.object().kind() != ObjectKind::WaitSet {
+    if entry.object().kind() != ObjectKind::WaitSet {
         return Err(SystemCallError::WrongObjectType);
     }
     Ok(entry.object().as_object().clone())

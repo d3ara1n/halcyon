@@ -145,3 +145,49 @@
 - **整空间退休（Work）**：进程回收 RetireSpace 阶段 publish `space.retire`。step：关闭执行入口与修改准入 → 等在途事务/访问租约归零（Blocked）→ 收齐离场确认 → 全部已接纳 hart 全量 fence 并收 ack → 拿整体 RetireGrant 后按游标拆 View/use/表页并退款 → Done 唤醒进程记录。
 - **fault 路径**：短暂进入空间锁读 ledger（`fault_class`）；命中扩权中区间本地 SFENCE.VMA 重试，命中撤销中区间按已撤销投递 fault。
 - **入口握手**：dispatch/Resume 锁外同步所见 epoch，gate 内复检入口仍开、epoch 未变才登记执行租约；先登记后装 satp。
+
+## 设计轮次 3 收敛结论：本链 VM 接缝（2026-10，advisor 一次 + LoneCrane 对抗）
+
+闭合本案剩余门 1 与进程分案门 2。仅设计结论；K 取值与每步成本证明在施工门完成。
+
+### 表帧 charge
+
+- 同一空间表页来自固定空间账户，同源校验在不可失败 `adopt` 之前。准备页为自带 charge 的 `FundedTableFrame`；`adopt` 将 charge 并入空间 `TableCharge: Option<AllocatedCredit>`，owner 只剩帧号。
+- `reclaim` 是所有权移交：产出（物理 claim + 恰好一页 credit）的 affine owner，TLB 安全且锁外放帧后才退款；最后一页 take，其余 split(1)；与 `branches` 守恒断言。在途已摘出 owner 计入 Space.Done。root 由空间独立持完整帧，内核共享子树不进 TableCharge。
+
+### 结果租约
+
+准备阶段取得可回滚的空间访问 + 范围保护（复用 `ensure_no_transaction_conflict` 双向冲突），commit 原样移交、无空窗（删除 commit 清 lease）；最后一次写回后释放，不等 Space.Done。可取消 Wait 不跨等待持租约，获胜后写结果须短暂取保护并复检；退出/取消胜则不写。
+
+### 分步修改（统一协议）
+
+- 事务区间记录 `{txn, 阶段, 新旧计划}` 是过渡期真值，fault/查询先查它；ledger 与 PTE 均按段分步，每步成对推进一个可观察切片，OrdMap remove/insert、节点归还、移出 permit 计入单步成本。
+- 写者互斥：prepare 在空间锁内用预取节点把 Region 在请求端点切开（同权限切分语义中性），footprint = 实际替换节点集合；预约覆盖节点禁止后台合并/重切；预约、冲突复检与端点物化同一保护协议。切分节点 metadata/写 use 在可见时移交空间，rollback 不合并、不退占用中的 permit。提交后不再 Stale。
+- 游标只持 VA 与事务身份，每步从根重走；删除全树 generation 校验。
+- 请求上限只用于可失败、需分配的部分修改（依据准备期预取资源）；完整释放与整空间退休沿原 owner 游标逐段撤账，不受上限，只释放不分配。
+
+### 空表回收：最后离开者接管
+
+- 覆盖范围完全在本事务预约内的空表，本事务在取 epoch 前摘除。
+- 预约边界表（每连续片段每层至多 2 张）在事务结束发布或回滚时于空间锁内“检查其他预约 → 摘父 PTE → 移除自身预约”一次完成：空且无其他预约相交才摘；自身不计阻塞者；持续被占用时由下一个离开者或整空间退休兜底。
+- 摘表后取新 epoch、fence 完成才放帧，不复用旧 epoch。废弃 `preflight_unmap_range` 的精确容量假设。
+- 承载时点：可失败部分修改在发布预约前取得 ChangeWork、边界候选容量与内嵌同步运输；rollback 由同一记录继承并走同一路径。完整释放所需 Work、K 槽退休批次与同步承载随原资源 owner 出生/增长准入，释放只激活；整空间退休用出生内嵌记录。
+- 固定容量批次：每批摘表 → 新 epoch → 覆盖本批 fence → 收 ack → 放帧退款 → 复用槽，批间不做可失败准入；`PreparedTranslation.retired` 的 Vec 只留给可失败部分修改。
+
+### 同步 epoch
+
+- epoch 在该事务（或本段）最后一次 PTE store 后于空间 gate 下取得，last-store → epoch 发布 → FenceRequest 可消费有真实可见顺序；责任提交 ID 与同步 epoch 分离。
+- 覆盖对象在同一进入 gate 下确定：此前进入者由本批 fence 或离场清除证明覆盖，之后进入者按新 epoch 同步，不用早于发布的 active 快照。
+- 零目标与 remote 同一谓词“发布已 armed ∧ required mask 完成”；Building 空集合来自准入证明。RW→RX 两段各取 epoch，第一段确认到齐才加 X。
+
+### fault
+
+先按 R/W/X 对照事务记录中该阶段承诺权限：不允许即正常投递；允许但 PTE 未发布则锁外让出/停驻等发布依赖；已发布但本地翻译陈旧则 sfence 重试；绝不锁内循环。
+
+### remote 运输复用
+
+每目标最终 ack = fence 完成 ∧ 该目标槽已归还到本 Work 内嵌保留态。顺序：持稳定 completion token → fence → 归还槽 → 最后访问旧批次后 release ack → 最后者锁外 wake。批次身份含 epoch，最后 ack 后不再读写旧槽；所有目标结束前 notified 等唤醒不触发复用。`os/remote_call` 的 finish→Empty 与 generation 封顶 Retired 随本链改写为内嵌可复用生命周期。
+
+### Tunnel 退出 VM
+
+通用 Map 直接接受 Endpoint capability 作 backing 授权，上限为 Endpoint/Invitation 已确认的 backing authority；View 只持 backing use，不强持 Endpoint。

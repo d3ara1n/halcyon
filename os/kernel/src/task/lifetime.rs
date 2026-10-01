@@ -18,6 +18,8 @@ use erhino_shared::{
 };
 
 pub struct Lifetime {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     observed: u64,
     wait: Spinlock<ObjectWaitState>,
@@ -32,6 +34,7 @@ impl LifetimeOwner {
         sponsor: &Arc<MetadataSponsor>,
     ) -> Result<(Self, ObjectRef), SystemCallError> {
         let state = Arc::try_new(Lifetime {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             observed,
             wait: Spinlock::new(
@@ -59,6 +62,10 @@ impl Drop for LifetimeOwner {
 }
 
 impl KernelObject for Lifetime {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -68,12 +75,11 @@ impl KernelObject for Lifetime {
     fn related_id(&self) -> u64 {
         self.observed
     }
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::LifetimeObserver)
-            .then_some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
     }
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::LifetimeObserver).then_some(ObjectSignals::CLOSED)
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::CLOSED)
     }
     fn signals(&self) -> ObjectSignals {
         self.wait.lock().signals()
@@ -93,8 +99,6 @@ impl KernelObject for Lifetime {
         let retired = self.wait.lock().unsubscribe(id);
         drop(retired);
     }
-    fn close_handle(&self, _: HandleRole, _: &Process, _: bool) {}
-    fn close_transit(&self, _: HandleRole) {}
     fn advance_waiter(&self) -> super::object::WaitAdvance {
         self.wait.lock().advance_waiter()
     }

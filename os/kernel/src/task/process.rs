@@ -50,6 +50,8 @@ struct BuilderState {
 }
 
 pub struct ProcessBuilder {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     _metadata: super::resources::BuilderPermit,
     state: crate::sync::Spinlock<BuilderState>,
@@ -58,6 +60,7 @@ pub struct ProcessBuilder {
 impl ProcessBuilder {
     fn new(process: Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             _metadata: super::resources::MetadataSponsor::reserve_builder(
                 process.resources.metadata(),
             )?,
@@ -114,6 +117,10 @@ impl ProcessBuilder {
 }
 
 impl KernelObject for ProcessBuilder {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn header(&self) -> &ObjectHeader {
         &self.header
     }
@@ -122,23 +129,17 @@ impl KernelObject for ProcessBuilder {
         ObjectKind::ProcessBuilder
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::ProcessBuilder).then_some(
-            Rights::MAP | Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(
+            Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
         )
     }
 
-    fn allowed_signals(&self, _role: HandleRole) -> Option<ObjectSignals> {
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
         None
     }
 
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::ProcessBuilder);
-        self.abort();
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::ProcessBuilder);
+    fn on_last_capability(&self) {
         self.abort();
     }
 
@@ -164,6 +165,8 @@ struct ControlState {
 }
 
 pub struct ProcessControl {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     _metadata: super::resources::ControlPermit,
     state: crate::sync::Spinlock<ControlState>,
@@ -172,6 +175,7 @@ pub struct ProcessControl {
 impl ProcessControl {
     pub(crate) fn new(core: &Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Remintable),
             _metadata: super::resources::MetadataSponsor::reserve_control(
                 core.resources.metadata(),
             )?,
@@ -298,6 +302,10 @@ impl ProcessControl {
 }
 
 impl KernelObject for ProcessControl {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn complete_waiter_drain(
         &self,
         reservation: super::notify_work::Reservation,
@@ -317,13 +325,12 @@ impl KernelObject for ProcessControl {
         ObjectKind::ProcessControl
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::ProcessControl).then_some(CONTROL_MAX_RIGHTS)
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(CONTROL_MAX_RIGHTS)
     }
 
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::ProcessControl)
-            .then_some(ObjectSignals::REAPABLE | ObjectSignals::CLOSED)
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::REAPABLE | ObjectSignals::CLOSED)
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -347,15 +354,6 @@ impl KernelObject for ProcessControl {
         drop(retired);
     }
 
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::ProcessControl);
-        // 关闭 control 只消散管理 authority，不终止目标进程。
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::ProcessControl);
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -375,7 +373,7 @@ pub fn create(
         let entry = table
             .get(job, Rights::CREATE)
             .map_err(super::handle::map_error)?;
-        if *entry.role() != HandleRole::JobControl || entry.object().kind() != ObjectKind::Job {
+        if entry.object().kind() != ObjectKind::Job {
             return Err(SystemCallError::WrongObjectType);
         }
         Job::concrete(entry.object())?
@@ -420,7 +418,7 @@ fn create_staged(
         super::handle::entry(
             ProcessBuilder::object_ref(&builder),
             HandleRole::ProcessBuilder,
-            Rights::MAP | Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
+            Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
         )
         .expect("ProcessBuilder rights were validated statically"),
     );
@@ -544,8 +542,7 @@ pub fn bind_memory(
         let entry = table
             .get(pool_handle, Rights::GRANT)
             .map_err(super::handle::map_error)?;
-        if *entry.role() != HandleRole::MemoryPool
-            || entry.object().kind() != ObjectKind::MemoryPool
+        if entry.object().kind() != ObjectKind::MemoryPool
         {
             return Err(SystemCallError::WrongObjectType);
         }
@@ -650,7 +647,7 @@ pub fn map(
     if len == 0 || len / super::proc::PAGE_SIZE > MAX_MAP_PAGES {
         return Err(SystemCallError::IllegalArgument);
     }
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MAP)?;
+    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
     let process = concrete_builder(&builder_object)?.process()?;
     let _lease = BuildingLease::begin(process.clone())?;
     let (pool, sponsor) = {
@@ -1226,8 +1223,7 @@ fn resolve_builder(
     let entry = table
         .get(handle, rights)
         .map_err(super::handle::map_error)?;
-    if *entry.role() != HandleRole::ProcessBuilder
-        || entry.object().kind() != ObjectKind::ProcessBuilder
+    if entry.object().kind() != ObjectKind::ProcessBuilder
     {
         return Err(SystemCallError::WrongObjectType);
     }
@@ -1243,8 +1239,7 @@ fn resolve_control(
     let entry = table
         .get(handle, rights)
         .map_err(super::handle::map_error)?;
-    if *entry.role() != HandleRole::ProcessControl
-        || entry.object().kind() != ObjectKind::ProcessControl
+    if entry.object().kind() != ObjectKind::ProcessControl
     {
         return Err(SystemCallError::WrongObjectType);
     }

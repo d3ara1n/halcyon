@@ -51,14 +51,15 @@ impl Rights {
     pub const TRANSIT: Self = Self(1 << 4);
     pub const DUPLICATE: Self = Self(1 << 5);
     pub const MANAGE: Self = Self(1 << 6);
-    pub const MAP: Self = Self(1 << 7);
+    // bit 7 保留（原 MAP，已删除：映射授权按 READ/WRITE/EXECUTE 矩阵检查）。
     /// 允许 ProcessStart 等直接跨 HandleTable grant，不进入对象容器。
     pub const GRANT: Self = Self(1 << 8);
-    /// 允许在 Job 等创建域内构造新对象。
+    /// 允许在创建域内构造新对象：Job 中创建 Process/子 Job；Pool 上表示
+    /// 创建由本 Pool 付款的资源（ProcessCreate、派生子 Pool、TunnelCreate）。
     pub const CREATE: Self = Self(1 << 9);
-    /// 允许把对象内容映射为可执行页；与 READ/WRITE/MAP 正交。
+    /// 允许把对象内容映射为可执行页；与 READ/WRITE 正交。
     pub const EXECUTE: Self = Self(1 << 10);
-    pub const KNOWN: Self = Self((1 << 11) - 1);
+    pub const KNOWN: Self = Self(((1 << 11) - 1) & !(1 << 7));
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -214,7 +215,8 @@ impl Not for ObjectSignals {
     }
 }
 
-/// 公开的对象/role 判别不依赖 Rust enum 内存布局。
+/// 公开的对象类型判别，不依赖 Rust enum 内存布局。角色由对象类型表达：
+/// 不同最后持有语义或消费语义的 capability 是不同类型，不另附 role。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ObjectKind {
@@ -224,8 +226,8 @@ pub enum ObjectKind {
     ProcessBuilder = 4,
     ProcessControl = 5,
     ThreadControl = 6,
-    Mailbox = 7,
-    Notification = 8,
+    MailboxReceiver = 7,
+    NotificationOwner = 8,
     TunnelEndpoint = 9,
     TunnelInvitation = 10,
     SystemReset = 11,
@@ -233,28 +235,9 @@ pub enum ObjectKind {
     Lifetime = 13,
     Delivery = 14,
     WaitSet = 15,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum HandleRole {
-    JobControl = 1,
-    MemoryPool = 2,
-    MemoryObject = 3,
-    ProcessBuilder = 4,
-    ProcessControl = 5,
-    ThreadControl = 6,
-    MailboxOwner = 7,
-    MailboxSender = 8,
-    MailboxSenderOnce = 9,
-    NotificationOwner = 10,
-    NotificationSignaler = 11,
-    TunnelEndpoint = 12,
-    TunnelInvitation = 13,
-    SystemResetControl = 14,
-    LifetimeObserver = 15,
-    Delivery = 16,
-    WaitSetOwner = 17,
+    MailboxOnceSender = 16,
+    NotificationSignaler = 17,
+    ReplyObservation = 18,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +246,7 @@ pub struct HandleDescription {
     pub object_id: u64,
     pub related_object_id: u64,
     pub kind: u32,
-    pub role: u32,
+    pub reserved0: u32,
     pub rights: Rights,
     pub badge: u64,
     pub reserved: u64,
@@ -309,7 +292,8 @@ mod tests {
     fn rights_wire_bits_are_stable_and_known() {
         assert_eq!(Rights::CREATE.raw(), 1 << 9);
         assert_eq!(Rights::EXECUTE.raw(), 1 << 10);
-        assert_eq!(Rights::KNOWN.raw(), (1 << 11) - 1);
+        assert_eq!(Rights::KNOWN.raw(), ((1 << 11) - 1) & !(1 << 7));
+        assert!(!Rights::from_raw(1 << 7).is_known(), "retired MAP bit stays reserved");
         assert!(Rights::EXECUTE.is_known());
         assert!(!Rights::from_raw(1 << 11).is_known());
     }

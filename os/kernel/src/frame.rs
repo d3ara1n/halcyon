@@ -716,6 +716,35 @@ impl FundedTableFrame {
     }
 }
 
+impl FundedTableFrame {
+    /// 准备页的 charge 是否来自 `pool`。
+    pub(crate) fn charge_pool_is(&self, pool: &MemoryPool) -> bool {
+        self.inner.credit().is_from(pool)
+    }
+
+    /// 寄存：物理帧身份移交 branch PTE（帧号即唯一身份），charge 移交调用者
+    /// 的空间聚合账。不归还任何一方。
+    pub(crate) fn into_adopted(self) -> (FrameNumber, MemoryCharge) {
+        let frame = self.frame();
+        let (mut claim, charge) = self.inner.into_single();
+        // 物理所有权转为帧号承载，不经 Drop 归还库存。
+        claim.geometry.take();
+        (frame, charge)
+    }
+
+    /// 取回：凭 branch PTE 帧号与恰好一页 charge 重建完整 affine owner。
+    /// 调用者保证该帧号先前经 [`Self::into_adopted`] 寄存且只取回一次。
+    pub(crate) fn from_adopted(frame: FrameNumber, charge: MemoryCharge) -> Self {
+        assert_eq!(charge.pages(), 1, "table frame reclaim must carry exactly one page");
+        let geometry = ExtentGeometry::new(frame, 1).expect("invalid adopted table frame");
+        let mut claim = ClaimedUserExtent::new(geometry);
+        claim.cleared = true;
+        Self {
+            inner: funded_frame::Funded::from_single(claim, charge),
+        }
+    }
+}
+
 pub(crate) fn fund_user_table_frame(
     pool: &Arc<MemoryPool>,
 ) -> Result<FundedTableFrame, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {

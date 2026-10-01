@@ -161,6 +161,8 @@ impl CompletionCursor {
 }
 
 pub struct Job {
+    /// capability 持有计数（ZeroPolicy 按类型固定）。
+    holders: capability::Holders,
     header: ObjectHeader,
     /// 全局单调不复用；root 是首个分配者，恒为 1。
     jid: JobId,
@@ -262,6 +264,7 @@ impl Job {
             let jid = alloc_jid().expect("root Job identity exhausted");
             *root = Some(
                 Arc::try_new(Self {
+                    holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
                     header: ObjectHeader::new(),
                     jid,
                     parent_jid: 0,
@@ -293,6 +296,7 @@ impl Job {
         parent: &Arc<Self>,
     ) -> Result<Arc<Self>, SystemCallError> {
         Arc::try_new(Self {
+            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             jid,
             parent_jid,
@@ -590,6 +594,10 @@ impl Job {
 }
 
 impl KernelObject for Job {
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+
     fn complete_waiter_drain(
         &self,
         reservation: super::notify_work::Reservation,
@@ -609,8 +617,8 @@ impl KernelObject for Job {
         ObjectKind::Job
     }
 
-    fn allowed_rights(&self, role: HandleRole) -> Option<Rights> {
-        (role == HandleRole::JobControl).then_some(
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(
             Rights::CREATE
                 | Rights::MANAGE
                 | Rights::READ
@@ -621,8 +629,8 @@ impl KernelObject for Job {
         )
     }
 
-    fn allowed_signals(&self, role: HandleRole) -> Option<ObjectSignals> {
-        (role == HandleRole::JobControl).then_some(ObjectSignals::CLOSED)
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::CLOSED)
     }
 
     fn signals(&self) -> ObjectSignals {
@@ -646,15 +654,6 @@ impl KernelObject for Job {
         drop(retired);
     }
 
-    fn close_handle(&self, role: HandleRole, _owner: &Process, _exiting: bool) {
-        debug_assert!(role == HandleRole::JobControl);
-        // JobControl 丢失只消散 authority，不隐式终止成员（所有权图见模块注释）。
-    }
-
-    fn close_transit(&self, role: HandleRole) {
-        debug_assert!(role == HandleRole::JobControl);
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -671,7 +670,7 @@ fn resolve_job_control(
     let entry = table
         .get(handle, rights)
         .map_err(super::handle::map_error)?;
-    if *entry.role() != HandleRole::JobControl || entry.object().kind() != ObjectKind::Job {
+    if entry.object().kind() != ObjectKind::Job {
         return Err(SystemCallError::WrongObjectType);
     }
     let source_rights = entry.rights();
@@ -697,7 +696,7 @@ pub fn create(
         let entry = table
             .get(parent, Rights::CREATE)
             .map_err(super::handle::map_error)?;
-        if *entry.role() != HandleRole::JobControl || entry.object().kind() != ObjectKind::Job {
+        if entry.object().kind() != ObjectKind::Job {
             return Err(SystemCallError::WrongObjectType);
         }
         if !rights.is_subset_of(entry.rights()) {

@@ -287,6 +287,28 @@ where
         let right = self.split_off(left_pages)?;
         Ok((self, right))
     }
+
+    /// 拆成物理 claim 与 credit 两个独立 owner（所有权移交，不归还任何一方）。
+    /// 调用者此后分别承担两份责任，可经 [`Self::from_single`] 重新配对。
+    pub fn into_single(mut self) -> (P, C) {
+        let claim = self.claims[0].take().expect("funded extent slot is empty");
+        let credit = self.credit.take().expect("merged funded donor has no credit");
+        self.claim_count = 0;
+        self.pages = 0;
+        (claim, credit)
+    }
+
+    /// 由单一物理 claim 与恰好等页数的 credit 重建 owner。
+    pub fn from_single(claim: P, credit: C) -> Self {
+        let pages = claim.pages();
+        assert!(pages > 0, "funded claim must own pages");
+        Self {
+            claims: [Some(claim)],
+            claim_count: 1,
+            pages,
+            credit: Some(credit),
+        }
+    }
 }
 
 /// 普通资金化事务的结果类型。

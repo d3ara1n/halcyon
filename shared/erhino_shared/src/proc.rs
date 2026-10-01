@@ -202,26 +202,6 @@ impl ProcessFaultCode {
     }
 }
 
-/// ProcessDrain 输出。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C, align(8))]
-pub struct ProcessDrainResult {
-    pub work_done: u32,
-    pub status: u32,
-    pub reserved: u64,
-}
-
-/// Drain 批次状态判别值（`ProcessDrainResult::status`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ProcessDrainStatus {
-    More = 0,
-    Complete = 1,
-}
-
-/// 单次 Drain 的工作上界（内核封顶；work unit 由内核定义）。
-pub const PROCESS_DRAIN_MAX: u32 = crate::call::DRAIN_WORK_MAX;
-
 /// JobId(u64) type；全局单调不复用，与 Pid 分立空间，root 恒为 1。
 pub type JobId = u64;
 
@@ -285,11 +265,9 @@ const _: () = {
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
     assert!(core::mem::size_of::<ProcessSnapshot>() == 48);
     assert!(core::mem::size_of::<ThreadCreateResult>() == 16);
-    assert!(core::mem::size_of::<ProcessDrainResult>() == 16);
     assert!(core::mem::size_of::<ProcessState>() == 4);
     assert!(core::mem::size_of::<TerminationCause>() == 4);
     assert!(core::mem::size_of::<TerminationDetail>() == 16);
-    assert!(core::mem::size_of::<ProcessDrainStatus>() == 4);
     assert!(core::mem::size_of::<JobSnapshot>() == 40);
     assert!(core::mem::size_of::<JobState>() == 4);
     assert!(core::mem::size_of::<JobMemberKind>() == 4);
