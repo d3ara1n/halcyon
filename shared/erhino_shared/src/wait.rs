@@ -1,56 +1,26 @@
-//! 统一对象等待 ABI。
+//! 单对象纯电平等待 ABI；多对象集合及成员 cookie 由 wait_set 拥有。
 
 use crate::{
     object::{Handle, ObjectSignals},
     time::Deadline,
 };
 
-/// WaitMany 的完整输入；用户地址使用固定宽字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
-pub struct WaitManyRequest {
-    pub items: u64,
-    pub count: u32,
-    pub reserved: u32,
-    pub result: u64,
+pub struct WaitOneRequest {
+    pub handle: Handle,
+    pub signals: ObjectSignals,
     pub deadline: Deadline,
 }
 
-/// 单次 WaitMany 的最大观察项数。
-pub const WAIT_MANY_MAX: usize = 64;
-
-/// 调用者不透明的等待关联值。
+/// 集合成员的调用者命名空间；单对象等待不附带 cookie。
 pub type WaitCookie = u64;
 
-/// 一个对象等待项。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C, align(8))]
-pub struct WaitItem {
-    pub handle: Handle,
-    pub signals: ObjectSignals,
-    pub cookie: WaitCookie,
-    pub reserved: u64,
-}
-
-impl WaitItem {
-    pub const fn new(handle: Handle, signals: ObjectSignals, cookie: WaitCookie) -> Self {
-        Self {
-            handle,
-            signals,
-            cookie,
-            reserved: 0,
-        }
-    }
-}
-
-/// WaitMany 的完成原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum WaitReason {
     Signaled = 0,
     Closed = 1,
-    Cancelled = 2,
-    /// 超时，无任何观察项完成；此时 `item_index` 为 `u32::MAX`。
     Timeout = 3,
 }
 
@@ -59,35 +29,33 @@ impl WaitReason {
         match raw {
             0 => Some(Self::Signaled),
             1 => Some(Self::Closed),
-            2 => Some(Self::Cancelled),
             3 => Some(Self::Timeout),
             _ => None,
         }
     }
 }
 
-/// WaitMany 的唯一完成结果。
+/// 单对象返回的解释。Kernel 通过 a1 返当前电平，NONE 唯一表示到期；
+/// CLOSED 在关闭时总附加，不依赖调用者是否在兴趣 mask 中写入该位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct WaitResult {
-    pub cookie: WaitCookie,
     pub observed: ObjectSignals,
-    pub item_index: u32,
     pub reason: u32,
-    pub reserved: u64,
+    pub reserved: u32,
 }
 
 impl WaitResult {
-    pub const fn new(
-        cookie: WaitCookie,
-        observed: ObjectSignals,
-        item_index: u32,
-        reason: WaitReason,
-    ) -> Self {
+    pub const fn from_observed(observed: ObjectSignals) -> Self {
+        let reason = if observed.contains(ObjectSignals::CLOSED) {
+            WaitReason::Closed
+        } else if observed.raw() == 0 {
+            WaitReason::Timeout
+        } else {
+            WaitReason::Signaled
+        };
         Self {
-            cookie,
             observed,
-            item_index,
             reason: reason as u32,
             reserved: 0,
         }
@@ -95,9 +63,7 @@ impl WaitResult {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<WaitManyRequest>() == 40);
-    assert!(core::mem::size_of::<WaitItem>() == 32);
-    assert!(core::mem::align_of::<WaitItem>() == 8);
-    assert!(core::mem::size_of::<WaitResult>() == 32);
-    assert!(core::mem::align_of::<WaitResult>() == 8);
+    assert!(core::mem::size_of::<WaitOneRequest>() == 32);
+    assert!(core::mem::align_of::<WaitOneRequest>() == 8);
+    assert!(core::mem::size_of::<WaitResult>() == 16);
 };

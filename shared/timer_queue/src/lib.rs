@@ -1,595 +1,514 @@
 #![no_std]
 
-//! 可取消期限的索引最小堆。
-//!
-//! 每一项由稳定 token 标识。token 包含拥有者 hart slot、arena 槽位与
-//! generation；槽位复用时 generation 前进，旧 token 幂等失效。
+//! 侵入式期限 AVL 树。节点出生时预付，登记/取消/到期弹出不分配；
+//! 节点身份即稳定地址，不存在 arena token 或 generation。所有树访问由
+//! 外部队列锁串行化，载荷由到期/取消方移出锁后处理。
 
-extern crate alloc;
+use core::{
+    cell::UnsafeCell,
+    marker::PhantomPinned,
+    pin::Pin,
+    ptr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use alloc::vec::Vec;
+const DETACHED: usize = usize::MAX;
 
-const OWNER_BITS: u32 = 8;
-const SLOT_BITS: u32 = 28;
-const GENERATION_BITS: u32 = 27;
-const OWNER_MASK: u64 = (1 << OWNER_BITS) - 1;
-const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
-const GENERATION_MASK: u64 = (1 << GENERATION_BITS) - 1;
-const GENERATION_MAX: u32 = GENERATION_MASK as u32;
+struct Links<T> {
+    parent: *const TimerNode<T>,
+    left: *const TimerNode<T>,
+    right: *const TimerNode<T>,
+    height: u16,
+    deadline: u64,
+    value: Option<T>,
+}
 
-/// 稳定的期限注册标识。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimerToken(u64);
+pub struct TimerNode<T> {
+    owner: AtomicUsize,
+    links: UnsafeCell<Links<T>>,
+    _pin: PhantomPinned,
+}
 
-impl TimerToken {
-    /// 不透明 token 使用低 63 位，高位供单字 registration 控制状态使用。
-    pub const RAW_MASK: u64 = (1u64 << (OWNER_BITS + SLOT_BITS + GENERATION_BITS)) - 1;
-
-    /// token 的原始稳定表示；供原子 registration 状态保存。
-    pub const fn raw(self) -> u64 {
-        self.0
+impl<T> TimerNode<T> {
+    pub const fn new() -> Self {
+        Self {
+            owner: AtomicUsize::new(DETACHED),
+            links: UnsafeCell::new(Links {
+                parent: ptr::null(),
+                left: ptr::null(),
+                right: ptr::null(),
+                height: 1,
+                deadline: 0,
+                value: None,
+            }),
+            _pin: PhantomPinned,
+        }
     }
 
-    /// 从先前由 [`Self::raw`] 取得的值恢复 token。
-    ///
-    /// 调用方只能传入既有 token，不能包含 RAW_MASK 之外的控制位。
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    pub const fn owner_slot(self) -> usize {
-        (self.0 & OWNER_MASK) as usize
-    }
-
-    fn slot(self) -> usize {
-        (((self.0 >> OWNER_BITS) & SLOT_MASK) as usize) - 1
-    }
-
-    fn generation(self) -> u32 {
-        (self.0 >> (OWNER_BITS + SLOT_BITS)) as u32
-    }
-
-    fn new(owner_slot: usize, slot: usize, generation: u32) -> Self {
-        debug_assert!(owner_slot <= OWNER_MASK as usize);
-        debug_assert!(slot < SLOT_MASK as usize);
-        debug_assert!(generation != 0 && generation <= GENERATION_MAX);
-        Self(
-            ((generation as u64) << (OWNER_BITS + SLOT_BITS))
-                | (((slot as u64) + 1) << OWNER_BITS)
-                | owner_slot as u64,
-        )
+    /// 仅用于选择需要锁住的 owner 队列；加锁后取消仍须复检。
+    pub fn owner_slot(&self) -> Option<usize> {
+        match self.owner.load(Ordering::Acquire) {
+            DETACHED => None,
+            owner => Some(owner),
+        }
     }
 }
 
-/// 注册失败：增长预留未能完成，队列语义状态保持不变。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AllocationFailed;
-
-enum SlotState<T> {
-    Vacant {
-        next: Option<usize>,
-    },
-    Occupied {
-        expires_at: u64,
-        value: T,
-        heap_index: usize,
-    },
-    Parked {
-        value: T,
-    },
-    Retired,
+impl<T> Default for TimerNode<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
-struct Slot<T> {
-    generation: u32,
-    state: SlotState<T>,
+impl<T> Drop for TimerNode<T> {
+    fn drop(&mut self) {
+        assert!(
+            self.owner_slot().is_none() && self.links.get_mut().value.is_none(),
+            "registered timer node was released"
+        );
+    }
 }
+// SAFETY: 链与载荷只在唯一 owner 队列锁下访问，owner 是队列选择用的原子字段。
+unsafe impl<T: Send> Send for TimerNode<T> {}
+unsafe impl<T: Send> Sync for TimerNode<T> {}
 
-/// 纯逻辑、可取消的期限队列。
-///
-/// 注册、注销与到期弹出都是 O(log n)，堆顶读取为 O(1)。注册在任何
-/// 语义状态变更前预留所需 arena 与 heap 容量，因此 OOM 不留 live entry。
 pub struct TimerQueue<T> {
-    owner_slot: Option<usize>,
-    arena: Vec<Slot<T>>,
-    free_head: Option<usize>,
-    heap: Vec<usize>,
-    live: usize,
+    owner_slot: usize,
+    root: *const TimerNode<T>,
+    first: *const TimerNode<T>,
+    len: usize,
 }
+// SAFETY: root 指向 pin 节点，全部树操作由外部锁串行化；未挂节点时可移动队列。
+unsafe impl<T: Send> Send for TimerQueue<T> {}
 
 impl<T> TimerQueue<T> {
-    /// 建立已绑定到一个 hart slot 的队列。
-    pub const fn new(owner_slot: usize) -> Self {
-        assert!(owner_slot <= OWNER_MASK as usize);
-        Self {
-            owner_slot: Some(owner_slot),
-            arena: Vec::new(),
-            free_head: None,
-            heap: Vec::new(),
-            live: 0,
-        }
-    }
-
-    /// 建立尚待绑定的静态队列。只允许其所属 hart 首次使用时绑定。
     pub const fn unbound() -> Self {
         Self {
-            owner_slot: None,
-            arena: Vec::new(),
-            free_head: None,
-            heap: Vec::new(),
-            live: 0,
+            owner_slot: DETACHED,
+            root: ptr::null(),
+            first: ptr::null(),
+            len: 0,
         }
     }
 
-    /// 绑定静态队列的所属 hart。重复绑定只接受同一 owner。
     pub fn bind_owner(&mut self, owner_slot: usize) -> bool {
-        if owner_slot > OWNER_MASK as usize {
-            return false;
+        assert!(owner_slot != DETACHED, "invalid timer owner");
+        if self.owner_slot == DETACHED {
+            assert!(self.is_empty(), "unbound timer queue retained nodes");
+            self.owner_slot = owner_slot;
         }
-        match self.owner_slot {
-            Some(owner) => owner == owner_slot,
-            None => {
-                self.owner_slot = Some(owner_slot);
-                true
-            }
-        }
+        self.owner_slot == owner_slot
     }
 
-    /// 注册一项相对调用者不透明的值。
-    pub fn try_register(
-        &mut self,
-        expires_at: u64,
-        value: T,
-    ) -> Result<TimerToken, AllocationFailed> {
-        let Some(owner_slot) = self.owner_slot else {
-            return Err(AllocationFailed);
-        };
-        // 所有可能增长均在变更 free 链、arena 和 heap 前完成。
-        let required = self.live.checked_add(1).ok_or(AllocationFailed)?;
-        self.heap
-            .try_reserve(required - self.heap.len())
-            .map_err(|_| AllocationFailed)?;
-        if self.free_head.is_none() {
-            self.arena.try_reserve(1).map_err(|_| AllocationFailed)?;
-            if self.arena.len() >= SLOT_MASK as usize {
-                return Err(AllocationFailed);
-            }
-        }
-
-        let (slot, generation) = match self.free_head {
-            Some(index) => {
-                let entry = &mut self.arena[index];
-                let SlotState::Vacant { next } = entry.state else {
-                    unreachable!("timer free list names a non-vacant slot")
-                };
-                self.free_head = next;
-                (index, entry.generation)
-            }
-            None => {
-                let index = self.arena.len();
-                self.arena.push(Slot {
-                    generation: 1,
-                    state: SlotState::Retired,
-                });
-                (index, 1)
-            }
-        };
-        let heap_index = self.heap.len();
-        self.arena[slot].state = SlotState::Occupied {
-            expires_at,
-            value,
-            heap_index,
-        };
-        self.heap.push(slot);
-        self.live += 1;
-        self.sift_up(heap_index);
-        Ok(TimerToken::new(owner_slot, slot, generation))
-    }
-
-    /// 幂等注销：旧 generation、已弹出或错误 owner queue 的 token 返回 None。
-    pub fn cancel(&mut self, token: TimerToken) -> Option<T> {
-        if self.owner_slot != Some(token.owner_slot()) {
-            return None;
-        }
-        let slot = self.valid_slot(token)?;
-        match self.arena[slot].state {
-            SlotState::Occupied { heap_index, .. } => Some(self.remove_heap_index(heap_index)),
-            SlotState::Parked { .. } => {
-                let SlotState::Parked { value } =
-                    core::mem::replace(&mut self.arena[slot].state, SlotState::Retired)
-                else {
-                    unreachable!()
-                };
-                self.live -= 1;
-                self.recycle(slot);
-                Some(value)
-            }
-            SlotState::Vacant { .. } | SlotState::Retired => None,
+    pub const fn new(owner_slot: usize) -> Self {
+        assert!(owner_slot != DETACHED);
+        Self {
+            owner_slot,
+            root: ptr::null(),
+            first: ptr::null(),
+            len: 0,
         }
     }
 
-    /// 修改既有登记的载荷，不改变期限、堆位置或 token 代次。
-    /// 调用方可先预付槽位，再在外部操作提交后绑定正式身份。
-    pub fn value_mut(&mut self, token: TimerToken) -> Option<&mut T> {
-        if self.owner_slot != Some(token.owner_slot()) {
-            return None;
-        }
-        let slot = self.valid_slot(token)?;
-        match &mut self.arena[slot].state {
-            SlotState::Occupied { value, .. } | SlotState::Parked { value } => Some(value),
-            SlotState::Vacant { .. } | SlotState::Retired => None,
-        }
-    }
-
-    /// 改期复用既有 arena 与堆槽，不分配、不改变 token generation。
-    pub fn reschedule(&mut self, token: TimerToken, deadline: u64) -> bool {
-        if self.owner_slot != Some(token.owner_slot()) {
-            return false;
-        }
-        let Some(slot) = self.valid_slot(token) else {
-            return false;
-        };
-        if matches!(self.arena[slot].state, SlotState::Parked { .. }) {
-            let SlotState::Parked { value } =
-                core::mem::replace(&mut self.arena[slot].state, SlotState::Retired)
-            else {
-                unreachable!()
-            };
-            let index = self.heap.len();
-            self.arena[slot].state = SlotState::Occupied {
-                expires_at: deadline,
-                value,
-                heap_index: index,
-            };
-            self.heap.push(slot);
-            self.sift_up(index);
-            return true;
-        }
-        let (old, index) = match &mut self.arena[slot].state {
-            SlotState::Occupied {
-                expires_at,
-                heap_index,
-                ..
-            } => {
-                let old = *expires_at;
-                *expires_at = deadline;
-                (old, *heap_index)
-            }
-            SlotState::Vacant { .. } | SlotState::Retired | SlotState::Parked { .. } => {
-                return false;
-            }
-        };
-        if deadline < old {
-            self.sift_up(index)
-        } else if deadline > old {
-            self.sift_down(index)
-        }
-        true
-    }
-
-    /// 暂停但保留 token、值与未来恢复所需堆容量，generation 不前进。
-    pub fn park(&mut self, token: TimerToken) -> bool {
-        if self.owner_slot != Some(token.owner_slot()) {
-            return false;
-        }
-        let Some(slot) = self.valid_slot(token) else {
-            return false;
-        };
-        let index = match self.arena[slot].state {
-            SlotState::Occupied { heap_index, .. } => heap_index,
-            SlotState::Parked { .. } => return true,
-            SlotState::Vacant { .. } | SlotState::Retired => return false,
-        };
-        let removed = self.detach_heap_index(index);
-        debug_assert_eq!(removed, slot);
-        let SlotState::Occupied { value, .. } =
-            core::mem::replace(&mut self.arena[slot].state, SlotState::Retired)
-        else {
-            unreachable!()
-        };
-        self.arena[slot].state = SlotState::Parked { value };
-        true
-    }
-
-    /// 同时取得最早项的 token、期限和值；可改期后继续持有预付槽。
-    pub fn peek(&self) -> Option<(TimerToken, u64, &T)> {
-        let slot = *self.heap.first()?;
-        let SlotState::Occupied {
-            expires_at, value, ..
-        } = &self.arena[slot].state
-        else {
-            unreachable!("timer heap points to inactive slot")
-        };
-        Some((
-            TimerToken::new(self.owner_slot?, slot, self.arena[slot].generation),
-            *expires_at,
-            value,
-        ))
-    }
-
-    /// 读取最早到期点；不移除。
-    pub fn peek_expires_at(&self) -> Option<u64> {
-        self.heap.first().map(|slot| self.expires_at(*slot))
-    }
-
-    /// 弹出一项到期值。token 的 owner 必须与本队列的结构性绑定一致。
-    pub fn pop_expired(&mut self, now: u64) -> Option<(TimerToken, T)> {
-        let owner_slot = self.owner_slot?;
-        let slot = *self.heap.first()?;
-        if self.expires_at(slot) > now {
-            return None;
-        }
-        let generation = self.arena[slot].generation;
-        let value = self.remove_heap_index(0);
-        Some((TimerToken::new(owner_slot, slot, generation), value))
-    }
-
-    pub fn len(&self) -> usize {
-        self.live
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.live == 0
-    }
-
-    fn valid_slot(&self, token: TimerToken) -> Option<usize> {
-        let slot = token.slot();
-        let entry = self.arena.get(slot)?;
-        (token.generation() != 0 && entry.generation == token.generation()).then_some(slot)
-    }
-
-    fn expires_at(&self, slot: usize) -> u64 {
-        match self.arena[slot].state {
-            SlotState::Occupied { expires_at, .. } => expires_at,
-            SlotState::Vacant { .. } | SlotState::Retired | SlotState::Parked { .. } => {
-                unreachable!("heap names a non-live timer slot")
-            }
-        }
-    }
-
-    fn set_heap_index(&mut self, slot: usize, heap_index: usize) {
-        match &mut self.arena[slot].state {
-            SlotState::Occupied {
-                heap_index: current,
-                ..
-            } => *current = heap_index,
-            SlotState::Vacant { .. } | SlotState::Retired | SlotState::Parked { .. } => {
-                unreachable!("heap names a non-live timer slot")
-            }
-        }
-    }
-
-    fn detach_heap_index(&mut self, heap_index: usize) -> usize {
-        let slot = self.heap.swap_remove(heap_index);
-        if heap_index < self.heap.len() {
-            let replacement = self.heap[heap_index];
-            self.set_heap_index(replacement, heap_index);
-            if heap_index > 0
-                && self.expires_at(replacement) < self.expires_at(self.heap[(heap_index - 1) / 2])
-            {
-                self.sift_up(heap_index);
+    /// # Safety
+    /// 共享路由域内 owner_slot 唯一；私有 actor 只向所属队列传节点。
+    /// 节点保持 pin/存活直至 cancel/pop_expired。
+    /// 登记/取消/弹出必须在相应队列的同一锁下执行；未挂节点的初始化由
+    /// 唯一执行 owner 控制。载荷通常持线程强根与等待 epoch，保证队列可达性。
+    pub unsafe fn register(&mut self, node: Pin<&TimerNode<T>>, deadline: u64, value: T) {
+        assert!(self.owner_slot != DETACHED, "unbound timer registration");
+        let node = node.get_ref() as *const TimerNode<T>;
+        assert!(
+            unsafe { (*node).owner_slot().is_none() },
+            "timer registered twice"
+        );
+        let mut parent = ptr::null();
+        let mut current = self.root;
+        while !current.is_null() {
+            parent = current;
+            // SAFETY: 树节点按登记契约保持存活，调用者持队列锁。
+            let links = unsafe { &*(*current).links.get() };
+            current = if (deadline, node as usize) < (links.deadline, current as usize) {
+                links.left
             } else {
-                self.sift_down(heap_index);
+                links.right
+            };
+        }
+        {
+            let links = unsafe { &mut *(*node).links.get() };
+            assert!(links.value.is_none(), "unlinked timer retained payload");
+            links.parent = parent;
+            links.left = ptr::null();
+            links.right = ptr::null();
+            links.height = 1;
+            links.deadline = deadline;
+            links.value = Some(value);
+        }
+        if parent.is_null() {
+            self.root = node;
+        } else {
+            let links = unsafe { &mut *(*parent).links.get() };
+            if (deadline, node as usize) < (links.deadline, parent as usize) {
+                links.left = node;
+            } else {
+                links.right = node;
             }
         }
-        slot
+        self.len = self.len.checked_add(1).expect("timer node count exhausted");
+        if self.first.is_null()
+            || (deadline, node as usize)
+                < unsafe { ((*(*self.first).links.get()).deadline, self.first as usize) }
+        {
+            self.first = node;
+        }
+        unsafe {
+            (*node).owner.store(self.owner_slot, Ordering::Release);
+            self.rebalance(parent);
+        }
     }
 
-    fn remove_heap_index(&mut self, heap_index: usize) -> T {
-        let slot = self.detach_heap_index(heap_index);
-        self.live -= 1;
-        let state = core::mem::replace(&mut self.arena[slot].state, SlotState::Retired);
-        let SlotState::Occupied { value, .. } = state else {
-            unreachable!("removed timer slot was not live")
+    /// # Safety
+    /// 调用者根据路由域或私有 owner 选到正确队列；同域队列的 slot 唯一。
+    /// 全部操作持同一队列锁，节点的 pin storage 仍存活。
+    /// 外部旧事件必须先按等待 epoch 仲裁，不能凭旧期限取消新轮登记。
+    pub unsafe fn cancel(&mut self, node: Pin<&TimerNode<T>>) -> Option<T> {
+        // SAFETY: 继承节点/队列同步域契约，无额外目标访问。
+        unsafe { self.cancel_if(node, |_| true) }
+    }
+
+    /// # Safety
+    /// 同 cancel；predicate 在队列锁内只检查载荷身份，不触及其他同步域。
+    /// 内核用它复检等待 epoch，拒绝旧到期提示对复用节点的取消。
+    pub unsafe fn cancel_if(
+        &mut self,
+        node: Pin<&TimerNode<T>>,
+        predicate: impl FnOnce(&T) -> bool,
+    ) -> Option<T> {
+        let node = node.get_ref() as *const TimerNode<T>;
+        if unsafe { (*node).owner_slot() } != Some(self.owner_slot) {
+            return None;
+        }
+        let accepted = {
+            let links = unsafe { &*(*node).links.get() };
+            predicate(links.value.as_ref().expect("registered timer lost payload"))
         };
-        self.recycle(slot);
+        if !accepted {
+            return None;
+        }
+        Some(unsafe { self.remove(node) })
+    }
+
+    pub fn peek_expires_at(&self) -> Option<u64> {
+        let node = self.first;
+        if node.is_null() {
+            None
+        } else {
+            Some(unsafe { (*(*node).links.get()).deadline })
+        }
+    }
+
+    pub fn peek(&self) -> Option<(u64, &T)> {
+        if self.first.is_null() {
+            None
+        } else {
+            // SAFETY: first 是队列锁内更新的最小值缓存，登记契约保持节点存活。
+            let links = unsafe { &*(*self.first).links.get() };
+            Some((
+                links.deadline,
+                links.value.as_ref().expect("timer minimum lost payload"),
+            ))
+        }
+    }
+
+    /// 锁内彻底摘链、移出载荷；返回后不再持节点借用，允许线程重用内嵌节点。
+    pub fn pop_expired(&mut self, now: u64) -> Option<T> {
+        let node = self.first;
+        if node.is_null() || unsafe { (*(*node).links.get()).deadline > now } {
+            return None;
+        }
+        Some(unsafe { self.remove(node) })
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    unsafe fn minimum(mut node: *const TimerNode<T>) -> *const TimerNode<T> {
+        // SAFETY: 只跟随登记契约下的树边，持同一队列锁。
+        while !node.is_null() && !unsafe { (*(*node).links.get()).left }.is_null() {
+            node = unsafe { (*(*node).links.get()).left };
+        }
+        node
+    }
+
+    unsafe fn height(node: *const TimerNode<T>) -> u16 {
+        if node.is_null() {
+            0
+        } else {
+            unsafe { (*(*node).links.get()).height }
+        }
+    }
+
+    unsafe fn update_height(node: *const TimerNode<T>) {
+        let (left, right) = unsafe { ((*(*node).links.get()).left, (*(*node).links.get()).right) };
+        unsafe {
+            (*(*node).links.get()).height = 1 + Self::height(left).max(Self::height(right));
+        }
+    }
+
+    unsafe fn balance(node: *const TimerNode<T>) -> i32 {
+        unsafe {
+            i32::from(Self::height((*(*node).links.get()).left))
+                - i32::from(Self::height((*(*node).links.get()).right))
+        }
+    }
+
+    unsafe fn replace(&mut self, old: *const TimerNode<T>, new: *const TimerNode<T>) {
+        let parent = unsafe { (*(*old).links.get()).parent };
+        if parent.is_null() {
+            self.root = new;
+        } else if unsafe { (*(*parent).links.get()).left == old } {
+            unsafe {
+                (*(*parent).links.get()).left = new;
+            }
+        } else {
+            assert!(
+                unsafe { (*(*parent).links.get()).right == old },
+                "timer parent lost child"
+            );
+            unsafe {
+                (*(*parent).links.get()).right = new;
+            }
+        }
+        if !new.is_null() {
+            unsafe {
+                (*(*new).links.get()).parent = parent;
+            }
+        }
+    }
+
+    unsafe fn rotate_left(&mut self, old: *const TimerNode<T>) -> *const TimerNode<T> {
+        let new = unsafe { (*(*old).links.get()).right };
+        assert!(!new.is_null(), "left timer rotation without right child");
+        let middle = unsafe { (*(*new).links.get()).left };
+        unsafe {
+            self.replace(old, new);
+            (*(*new).links.get()).left = old;
+            (*(*old).links.get()).parent = new;
+            (*(*old).links.get()).right = middle;
+            if !middle.is_null() {
+                (*(*middle).links.get()).parent = old;
+            }
+            Self::update_height(old);
+            Self::update_height(new);
+        }
+        new
+    }
+
+    unsafe fn rotate_right(&mut self, old: *const TimerNode<T>) -> *const TimerNode<T> {
+        let new = unsafe { (*(*old).links.get()).left };
+        assert!(!new.is_null(), "right timer rotation without left child");
+        let middle = unsafe { (*(*new).links.get()).right };
+        unsafe {
+            self.replace(old, new);
+            (*(*new).links.get()).right = old;
+            (*(*old).links.get()).parent = new;
+            (*(*old).links.get()).left = middle;
+            if !middle.is_null() {
+                (*(*middle).links.get()).parent = old;
+            }
+            Self::update_height(old);
+            Self::update_height(new);
+        }
+        new
+    }
+
+    unsafe fn rebalance(&mut self, mut node: *const TimerNode<T>) {
+        // SAFETY: 每步沿父链上升，AVL 高度 O(log n)，旋转不移动节点/载荷。
+        while !node.is_null() {
+            unsafe {
+                Self::update_height(node);
+            }
+            let mut root = node;
+            if unsafe { Self::balance(node) } > 1 {
+                let left = unsafe { (*(*node).links.get()).left };
+                if unsafe { Self::balance(left) } < 0 {
+                    unsafe {
+                        self.rotate_left(left);
+                    }
+                }
+                root = unsafe { self.rotate_right(node) };
+            } else if unsafe { Self::balance(node) } < -1 {
+                let right = unsafe { (*(*node).links.get()).right };
+                if unsafe { Self::balance(right) } > 0 {
+                    unsafe {
+                        self.rotate_right(right);
+                    }
+                }
+                root = unsafe { self.rotate_left(node) };
+            }
+            node = unsafe { (*(*root).links.get()).parent };
+        }
+    }
+
+    unsafe fn remove(&mut self, node: *const TimerNode<T>) -> T {
+        let (left, right) = unsafe { ((*(*node).links.get()).left, (*(*node).links.get()).right) };
+        let repair;
+        if left.is_null() || right.is_null() {
+            repair = unsafe { (*(*node).links.get()).parent };
+            unsafe {
+                self.replace(node, if left.is_null() { right } else { left });
+            }
+        } else {
+            let successor = unsafe { Self::minimum(right) };
+            let previous_parent = unsafe { (*(*successor).links.get()).parent };
+            if previous_parent == node {
+                repair = successor;
+            } else {
+                repair = previous_parent;
+                let child = unsafe { (*(*successor).links.get()).right };
+                unsafe {
+                    self.replace(successor, child);
+                    (*(*successor).links.get()).right = right;
+                    (*(*right).links.get()).parent = successor;
+                }
+            }
+            unsafe {
+                self.replace(node, successor);
+                (*(*successor).links.get()).left = left;
+                (*(*left).links.get()).parent = successor;
+            }
+        }
+        self.len -= 1;
+        unsafe {
+            self.rebalance(repair);
+        }
+        if self.first == node {
+            self.first = unsafe { Self::minimum(self.root) };
+        }
+        let value = {
+            let links = unsafe { &mut *(*node).links.get() };
+            links.parent = ptr::null();
+            links.left = ptr::null();
+            links.right = ptr::null();
+            links.height = 1;
+            links.value.take().expect("timer node lost payload")
+        };
+        unsafe {
+            (*node).owner.store(DETACHED, Ordering::Release);
+        }
         value
     }
+}
 
-    fn recycle(&mut self, slot: usize) {
-        let entry = &mut self.arena[slot];
-        if entry.generation == GENERATION_MAX {
-            entry.state = SlotState::Retired;
-            return;
-        }
-        entry.generation += 1;
-        entry.state = SlotState::Vacant {
-            next: self.free_head,
-        };
-        self.free_head = Some(slot);
-    }
-
-    fn sift_up(&mut self, mut child: usize) {
-        while child > 0 {
-            let parent = (child - 1) / 2;
-            if self.expires_at(self.heap[parent]) <= self.expires_at(self.heap[child]) {
-                break;
-            }
-            self.heap.swap(parent, child);
-            self.set_heap_index(self.heap[parent], parent);
-            self.set_heap_index(self.heap[child], child);
-            child = parent;
-        }
-    }
-
-    fn sift_down(&mut self, mut parent: usize) {
-        loop {
-            let left = parent * 2 + 1;
-            if left >= self.heap.len() {
-                return;
-            }
-            let right = left + 1;
-            let child = if right < self.heap.len()
-                && self.expires_at(self.heap[right]) < self.expires_at(self.heap[left])
-            {
-                right
-            } else {
-                left
-            };
-            if self.expires_at(self.heap[parent]) <= self.expires_at(self.heap[child]) {
-                return;
-            }
-            self.heap.swap(parent, child);
-            self.set_heap_index(self.heap[parent], parent);
-            self.set_heap_index(self.heap[child], child);
-            parent = child;
-        }
+impl<T> Drop for TimerQueue<T> {
+    fn drop(&mut self) {
+        assert!(
+            self.root.is_null() && self.len == 0,
+            "timer queue released with nodes attached"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
-
+    extern crate alloc;
     use super::*;
+    use alloc::{boxed::Box, vec::Vec};
 
-    #[test]
-    fn binding_prepaid_payload_preserves_deadline_and_rejects_stale_tokens() {
-        let mut queue = TimerQueue::new(0);
-        let token = queue.try_register(10, 0).unwrap();
-        assert!(queue.park(token));
-        *queue.value_mut(token).unwrap() = 42;
-        assert!(queue.reschedule(token, 20));
-        assert_eq!(queue.peek(), Some((token, 20, &42)));
-        assert_eq!(queue.cancel(token), Some(42));
-        let next = queue.try_register(30, 7).unwrap();
-        assert!(queue.value_mut(token).is_none());
-        assert_eq!(queue.value_mut(next), Some(&mut 7));
+    // 检查 AVL 的独立平衡不变量，防止退化造成无界线性内核推进。
+    fn invariant<T>(queue: &TimerQueue<T>) {
+        unsafe fn visit<T>(node: *const TimerNode<T>, parent: *const TimerNode<T>) -> (u16, usize) {
+            if node.is_null() {
+                return (0, 0);
+            }
+            let links = unsafe { &*(*node).links.get() };
+            assert_eq!(links.parent, parent);
+            let (lh, ln) = unsafe { visit(links.left, node) };
+            let (rh, rn) = unsafe { visit(links.right, node) };
+            assert!(lh.abs_diff(rh) <= 1, "timer tree lost AVL balance");
+            assert_eq!(links.height, 1 + lh.max(rh));
+            (links.height, 1 + ln + rn)
+        }
+        let (_, count) = unsafe { visit(queue.root, ptr::null()) };
+        assert_eq!(count, queue.len());
     }
 
     #[test]
-    fn parked_entries_keep_prepaid_capacity_and_allow_finite_maximum() {
+    fn cancellation_preserves_addresses_and_sorted_expiry() {
+        let nodes: Vec<_> = (0..128).map(|_| Box::pin(TimerNode::new())).collect();
         let mut queue = TimerQueue::new(0);
-        let mut tokens = std::vec::Vec::new();
-        for value in 0..100 {
-            let token = queue.try_register(value, value).unwrap();
-            assert!(queue.park(token));
-            tokens.push(token);
+        // SAFETY: 所有 pin 节点保持存活到弹出/取消，队列单线程独占。
+        for (id, node) in nodes.iter().enumerate() {
+            unsafe {
+                queue.register(node.as_ref(), (id * 37 % 128) as u64, id);
+            }
+            invariant(&queue);
         }
-        assert_eq!(queue.len(), 100);
-        assert_eq!(queue.peek_expires_at(), None);
-        let capacity = queue.heap.capacity();
-        for token in &tokens {
-            assert!(queue.reschedule(*token, u64::MAX));
+        let mut expected = Vec::new();
+        for (id, node) in nodes.iter().enumerate() {
+            if id % 3 == 0 {
+                assert_eq!(unsafe { queue.cancel(node.as_ref()) }, Some(id));
+                invariant(&queue);
+            } else {
+                expected.push((id * 37 % 128, id));
+            }
         }
-        assert_eq!(queue.heap.capacity(), capacity);
-        assert_eq!(queue.pop_expired(u64::MAX).unwrap().1, 0);
-        for token in tokens.into_iter().skip(1) {
-            assert!(queue.cancel(token).is_some());
+        expected.sort_unstable();
+        for (deadline, id) in expected {
+            assert_eq!(queue.peek_expires_at(), Some(deadline as u64));
+            assert_eq!(queue.pop_expired(deadline as u64), Some(id));
+            invariant(&queue);
         }
         assert!(queue.is_empty());
     }
 
     #[test]
-    fn prepaid_reschedule_keeps_token_and_heap_order() {
-        let mut queue = TimerQueue::new(0);
-        let first = queue.try_register(20, 1).unwrap();
-        let second = queue.try_register(30, 2).unwrap();
-        assert!(queue.reschedule(second, 10));
-        assert_eq!(queue.peek(), Some((second, 10, &2)));
-        assert!(queue.reschedule(second, 40));
-        assert_eq!(queue.peek(), Some((first, 20, &1)));
-        assert!(queue.reschedule(first, u64::MAX));
-        assert_eq!(queue.cancel(first), Some(1));
-        assert!(!queue.reschedule(first, 0));
-        assert_eq!(queue.pop_expired(40), Some((second, 2)));
+    fn expiry_detaches_before_reuse_and_wrong_owner_cannot_cancel() {
+        let node = Box::pin(TimerNode::new());
+        let mut first = TimerQueue::new(0);
+        let mut second = TimerQueue::new(1);
+        unsafe {
+            first.register(node.as_ref(), 10, 7);
+        }
+        assert_eq!(unsafe { second.cancel(node.as_ref()) }, None);
+        assert_eq!(first.pop_expired(9), None);
+        let old_delivery = first.pop_expired(10);
+        assert_eq!(node.owner_slot(), None);
+        unsafe {
+            second.register(node.as_ref(), 20, 8);
+        }
+        assert_eq!(unsafe { first.cancel(node.as_ref()) }, None);
+        assert_eq!(old_delivery, Some(7));
+        assert_eq!(second.pop_expired(20), Some(8));
+        assert_eq!(unsafe { second.cancel(node.as_ref()) }, None);
+        unsafe {
+            second.register(node.as_ref(), 30, 9);
+        }
+        assert_eq!(
+            unsafe { second.cancel_if(node.as_ref(), |identity| *identity == 8) },
+            None
+        );
+        assert_eq!(second.pop_expired(30), Some(9));
     }
 
     #[test]
-    fn unordered_registration_pops_in_expiry_order() {
-        let mut queue = TimerQueue::new(2);
-        queue.try_register(30, 'c').unwrap();
-        queue.try_register(10, 'a').unwrap();
-        queue.try_register(20, 'b').unwrap();
-        assert_eq!(queue.peek_expires_at(), Some(10));
-        assert_eq!(queue.pop_expired(9), None);
-        assert_eq!(queue.pop_expired(10).map(|(_, value)| value), Some('a'));
-        assert_eq!(queue.pop_expired(20).map(|(_, value)| value), Some('b'));
-        assert_eq!(queue.pop_expired(30).map(|(_, value)| value), Some('c'));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn equal_expiry_and_cancel_at_every_heap_position() {
-        let mut queue = TimerQueue::new(1);
-        let first = queue.try_register(10, 1).unwrap();
-        let middle = queue.try_register(10, 2).unwrap();
-        let last = queue.try_register(10, 3).unwrap();
-        assert_eq!(queue.cancel(first), Some(1));
-        assert_eq!(queue.cancel(last), Some(3));
-        assert_eq!(queue.cancel(middle), Some(2));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn reused_slot_invalidates_old_generation() {
+    fn equal_deadlines_keep_all_nodes_and_each_cancel_is_local() {
+        let nodes: Vec<_> = (0..80).map(|_| Box::pin(TimerNode::new())).collect();
         let mut queue = TimerQueue::new(3);
-        let old = queue.try_register(1, 7).unwrap();
-        assert_eq!(queue.cancel(old), Some(7));
-        let new = queue.try_register(2, 8).unwrap();
-        assert_ne!(old, new);
-        assert_eq!(queue.cancel(old), None);
-        assert_eq!(queue.cancel(new), Some(8));
-    }
-
-    #[test]
-    fn cancellation_is_idempotent_and_does_not_touch_other_entries() {
-        let mut queue = TimerQueue::new(4);
-        let cancelled = queue.try_register(1, 1).unwrap();
-        queue.try_register(2, 2).unwrap();
-        assert_eq!(queue.cancel(cancelled), Some(1));
-        assert_eq!(queue.cancel(cancelled), None);
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue.pop_expired(2).map(|(_, value)| value), Some(2));
-    }
-
-    #[test]
-    fn owner_binding_rejects_wrong_queue_and_cross_queue_token() {
-        let mut owner_one = TimerQueue::new(1);
-        let mut owner_two = TimerQueue::<char>::new(2);
-        let token = owner_one.try_register(10, 'a').unwrap();
-        assert_eq!(owner_two.cancel(token), None);
-        assert_eq!(owner_one.len(), 1);
-        assert_eq!(owner_one.cancel(token), Some('a'));
-
-        let mut unbound = TimerQueue::<()>::unbound();
-        assert!(unbound.bind_owner(3));
-        assert!(unbound.bind_owner(3));
-        assert!(!unbound.bind_owner(4));
-    }
-
-    #[test]
-    fn middle_removal_restores_heap_after_sifting_in_both_directions() {
-        let mut upward = TimerQueue::new(5);
-        let _ = upward.try_register(1, 1).unwrap();
-        let _ = upward.try_register(50, 50).unwrap();
-        let _ = upward.try_register(2, 2).unwrap();
-        let middle = upward.try_register(60, 60).unwrap();
-        let _ = upward.try_register(70, 70).unwrap();
-        let _ = upward.try_register(3, 3).unwrap();
-        let _ = upward.try_register(4, 4).unwrap();
-        assert_eq!(upward.cancel(middle), Some(60));
-        assert_eq!(
-            (0..6)
-                .filter_map(|_| upward.pop_expired(u64::MAX).map(|(_, value)| value))
-                .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 50, 70]
-        );
-
-        let mut downward = TimerQueue::new(6);
-        let _ = downward.try_register(1, 1).unwrap();
-        let middle = downward.try_register(50, 50).unwrap();
-        let _ = downward.try_register(2, 2).unwrap();
-        let _ = downward.try_register(60, 60).unwrap();
-        let _ = downward.try_register(70, 70).unwrap();
-        let _ = downward.try_register(3, 3).unwrap();
-        let _ = downward.try_register(100, 100).unwrap();
-        assert_eq!(downward.cancel(middle), Some(50));
-        assert_eq!(
-            (0..6)
-                .filter_map(|_| downward.pop_expired(u64::MAX).map(|(_, value)| value))
-                .collect::<Vec<_>>(),
-            [1, 2, 3, 60, 70, 100]
-        );
+        for (id, node) in nodes.iter().enumerate() {
+            unsafe {
+                queue.register(node.as_ref(), 50, id);
+            }
+        }
+        let mut seen = [false; 80];
+        while let Some(id) = queue.pop_expired(50) {
+            assert!(!seen[id]);
+            seen[id] = true;
+            invariant(&queue);
+        }
+        assert!(seen.into_iter().all(|seen| seen));
     }
 }

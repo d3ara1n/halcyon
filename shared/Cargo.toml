@@ -7,5 +7,6 @@ members = [
     "ordered_table",
     "timer_queue",
     "metadata_admission",
+    "funded_storage",
 ]
 resolver = "2"

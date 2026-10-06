@@ -14,8 +14,8 @@ use erhino_shared::{
 
 use super::{
     Thread,
-    object::{HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef},
-    proc::Process,
+    object::{KernelObject, ObjectHeader, ObjectKind, ObjectRef},
+    resources::MetadataCharge,
 };
 
 pub struct SystemReset {
@@ -23,15 +23,21 @@ pub struct SystemReset {
     holders: capability::Holders,
     header: ObjectHeader,
     in_flight: AtomicBool,
+    _metadata: MetadataCharge,
 }
 
 impl SystemReset {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn try_new(
+        pool: &Arc<super::memory_pool::MemoryPool>,
+    ) -> Result<Arc<Self>, SystemCallError> {
+        let metadata = MetadataCharge::arc::<Self>(pool)?;
+        Arc::try_new(Self {
             holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::new(),
             in_flight: AtomicBool::new(false),
+            _metadata: metadata,
         })
+        .map_err(|_| SystemCallError::OutOfMemory)
     }
 
     pub fn object_ref(this: &Arc<Self>) -> ObjectRef {
@@ -84,18 +90,9 @@ pub fn request(
 ) -> Result<(), SystemCallError> {
     let action = ResetAction::try_from(action_raw).map_err(|_| SystemCallError::IllegalArgument)?;
     let reason = ResetReason::try_from(reason_raw).map_err(|_| SystemCallError::IllegalArgument)?;
-    let object = {
-        let table = thread.process.handles.lock();
-        let entry = table
-            .get(handle, Rights::MANAGE)
-            .map_err(super::handle::map_error)?;
-        if entry.object().kind() != ObjectKind::SystemReset
-        {
-            return Err(SystemCallError::WrongObjectType);
-        }
-        entry.object().clone()
-    };
-    let reset = object
+    let authority = super::handle::Authorization::accept(thread, handle, Rights::MANAGE)?;
+    let reset = authority
+        .object()
         .as_any()
         .downcast_ref::<SystemReset>()
         .ok_or(SystemCallError::WrongObjectType)?;
@@ -110,11 +107,11 @@ pub fn request(
         crate::frame::free_frames()
     );
     crate::heap::log_snapshot("reset");
+    crate::maintenance::log_costs();
     log!(
         Task,
-        "metadata reset usage {:?} peaks {:?}",
-        crate::task::resources::admission_usage(),
-        crate::task::resources::admission_peak()
+        "root metadata reset {:?}",
+        crate::task::memory_pool::MemoryPool::root_metadata_snapshot()
     );
     let result = crate::sbi::system_reset(platform_action, platform_reason);
     reset.finish_failed();

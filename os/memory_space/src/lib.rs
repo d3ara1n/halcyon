@@ -11,25 +11,26 @@ extern crate alloc;
 
 mod backing;
 mod object;
-// ledger 迁移（内存分案下一步）消费剩余查询；在此之前仅 backing 与单测使用。
-#[allow(dead_code)]
 mod ordmap;
 mod range;
 mod space;
 
 pub use backing::{
     BackingError, NodeReserve, RangeUse, ReleaseCursor, ReleaseStep, SegmentMap, SegmentOwner,
+    SegmentStorage,
 };
 pub use object::{
     ExecutableState, MemoryObjectState, ObjectError, ObjectId, ObjectViewAuthorization,
     SealOutcome, WritePermit,
 };
+pub use ordmap::{OrdMap, OrdMapStorage, ReserveFailed};
 pub use range::{AddressRange, PAGE_SIZE, PageRange, RangeError};
 pub use space::{
-    AllocationKey, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeError,
-    CommittedChange, FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest,
-    MapResultLayout, MemorySpace, ObjectRegionDelta, PermitRequirement, PreparedChange,
-    ProtectRequest, Protection, RegionKey, RegionKindView, RegionOwner, RegionView, ReserveFailure,
-    RetireBatch, RetiringChange, RetiringFragment, TranslationIntent, UnmapRequest, UserWriteLease,
-    UserWriteLeaseRequest, UserWriteProjection, UserWriteSegment, ValidatedChange,
+    AllocationKey, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeCapacity,
+    ChangeError, ChangeKey, ChangeRequest, ChangeStorage, CommittedChange, FaultClass, LeaseKey,
+    Limits, MapBacking, MapPlacement, MapRequest, MapResultLayout, MemorySpace, PermitRequirement,
+    PreparedChange, ProtectRequest, Protection, RegionKey, RegionKindView, RegionOwner,
+    RegionStorage, RegionView, ReserveFailure, RetiringChange, RetiringFragment, RollbackStep,
+    SpaceCreateError, TranslationIntent, UnmapRequest, UserWriteLease, UserWriteLeaseRequest,
+    UserWriteSegment, ValidatedChange,
 };

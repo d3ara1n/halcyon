@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 erhino_shared = { path = "../../shared/erhino_shared" }
+funded_storage = { path = "../../shared/funded_storage" }

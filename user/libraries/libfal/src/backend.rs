@@ -123,7 +123,7 @@ struct Entry {
     _charge: Charge,
 }
 struct Directory {
-    entries: OrderedTable<Entry, String>,
+    entries: OrderedTable<Entry, (), String>,
 }
 enum Body<C> {
     Directory(Directory),
@@ -172,7 +172,11 @@ impl<C: Capability> Payload for MemoryNode<C> {
             Body::Directory(directory) => {
                 let mut work_done = 0;
                 while work_done < budget {
-                    let Some((_, entry)) = directory.entries.pop_first() else {
+                    let Some((_, entry)) = directory
+                        .entries
+                        .pop_first()
+                        .map(ordered_table::PreparedEntry::into_parts)
+                    else {
                         break;
                     };
                     context.unlink(entry.node);
@@ -257,7 +261,7 @@ enum Intent<C> {
         source_next: u64,
         destination_next: u64,
         source_name: String,
-        entry: PreparedEntry<Entry, String>,
+        entry: PreparedEntry<Entry, (), String>,
         ancestor: Option<NodeRef>,
         checked: bool,
     },
@@ -266,7 +270,7 @@ enum Intent<C> {
         version: u64,
         next_version: u64,
         node: PreparedNode<MemoryNode<C>>,
-        entry: PreparedEntry<Entry, String>,
+        entry: PreparedEntry<Entry, (), String>,
     },
     Delete {
         parent: NodeRef,
@@ -670,7 +674,7 @@ impl<C: Capability> MemoryBackend<C> {
                 .map_err(|_| SystemCallError::QuotaExceeded)?;
             let charge = access.account().acquire(
                 FalResource::Bytes,
-                position.name.len() + PreparedEntry::<Entry, String>::allocation_bytes(),
+                position.name.len() + PreparedEntry::<Entry, (), String>::allocation_bytes(),
             )?;
             // 候选尚未入表，身份在节点准备完成后确定，不能因此延后名字存储预留。
             let entry = directory
@@ -682,10 +686,13 @@ impl<C: Capability> MemoryBackend<C> {
                         slot: Some(slot),
                         _charge: charge,
                     },
+                    &libbudget::AllocatorBacked,
                 )
                 .map_err(|error| match error {
                     ordered_table::InsertError::Limit(_) => SystemCallError::QuotaExceeded,
-                    ordered_table::InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+                    ordered_table::InsertError::Storage(error, _) => {
+                        libbudget::allocator_error(error)
+                    }
                 })?;
             Ok((parent.version, next_version, next_epoch, entry))
         })();
@@ -1012,7 +1019,7 @@ impl<C: Capability> MemoryBackend<C> {
         }
         let charge = destination.account().acquire(
             FalResource::Bytes,
-            final_name.len() + PreparedEntry::<Entry, String>::allocation_bytes(),
+            final_name.len() + PreparedEntry::<Entry, (), String>::allocation_bytes(),
         )?;
         let entry = directory
             .entries
@@ -1023,10 +1030,11 @@ impl<C: Capability> MemoryBackend<C> {
                     slot: None,
                     _charge: charge,
                 },
+                &libbudget::AllocatorBacked,
             )
             .map_err(|error| match error {
                 ordered_table::InsertError::Limit(_) => SystemCallError::QuotaExceeded,
-                ordered_table::InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+                ordered_table::InsertError::Storage(error, _) => libbudget::allocator_error(error),
             })?;
         let ancestor = if self
             .nodes
@@ -1163,6 +1171,7 @@ impl<C: Capability> MemoryBackend<C> {
                 let mut removed = directory
                     .entries
                     .remove_by(source_name.as_str())
+                    .map(ordered_table::PreparedEntry::into_value)
                     .expect("move source entry disappeared");
                 entry.value_mut().slot = removed.slot.take();
                 source_node.version = source_next;
@@ -1215,7 +1224,10 @@ impl<C: Capability> MemoryBackend<C> {
                 let Body::Directory(directory) = &mut parent.body else {
                     unreachable!()
                 };
-                let _ = directory.entries.remove_by(name.as_str());
+                let _ = directory
+                    .entries
+                    .remove_by(name.as_str())
+                    .map(ordered_table::PreparedEntry::into_value);
                 parent.version = next_version;
                 self.nodes.unlink(&target);
                 let target_node = self
@@ -1522,8 +1534,8 @@ mod tests {
             Ok(HandleDescription {
                 object_id: 1,
                 related_object_id: 1,
-                kind: 0,
-                role: erhino_shared::object::HandleRole::MailboxSender as u32,
+                kind: erhino_shared::object::ObjectKind::MailboxSender as u32,
+                reserved0: 0,
                 rights: Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
                 badge: 0,
                 reserved: 0,

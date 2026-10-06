@@ -28,3 +28,13 @@ pub fn take(handle: Handle, mask: u64) -> Result<u64, SystemCallError> {
     unsafe { sys_notification_take(handle, mask, &mut output)? };
     Ok(output)
 }
+
+/// 独立只读关闭观察权；派生与丢弃都不改变 Notification 业务寿命。
+pub fn observe(source: Handle) -> Result<super::capability::Capability, SystemCallError> {
+    let mut output = Handle::INVALID;
+    // SAFETY: 固定宽输出在调用期间有效；成功后交付新观察表项的唯一 owner。
+    unsafe {
+        crate::call::sys_notification_observe(source, &mut output)?;
+    }
+    Ok(super::capability::Capability::owned(output))
+}

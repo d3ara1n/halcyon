@@ -12,8 +12,10 @@ pub struct SharedMemory<'a> {
 
 impl<'a> SharedMemory<'a> {
     /// # Safety
-    /// 完整 RW 映射须在 'a 内存活；访问后端仅对正常一致性 RAM 成立。
-    pub(crate) unsafe fn new(base: usize, bytes: usize) -> Self {
+    /// base 必须至少 8 字节对齐，base..base+bytes 不溢出且是完整 RW 的普通 RAM 映射。
+    /// 调用者必须保留映射 owner，并保证返回值的整个 'a 内映射不被解除或降权；
+    /// 本类型不取得映射所有权，仅提供并发访问边界，不支持 MMIO。
+    pub unsafe fn new(base: usize, bytes: usize) -> Self {
         Self {
             base,
             bytes,

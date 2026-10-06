@@ -1,4 +1,4 @@
-//! 非映射对象能力 owner；Handle 数值不复制关闭责任，运输权限由 role/rights 决定。
+//! 对象 capability owner；Handle 数值不复制关闭责任，运输权限由类型和 rights 决定。
 
 use alloc::vec::Vec;
 use erhino_shared::{
@@ -13,10 +13,8 @@ pub struct Capability {
 
 impl Capability {
     /// # Safety
-    /// 调用者须独占合法非映射 entry 的关闭责任，不能是依赖 MappingLease 的
-    /// Tunnel Endpoint。Mailbox/Notification/WaitSet 等 affine owner 可以由
-    /// 正式构造或 GRANT 转入；Close 允许等待已预付的内核退休，但不等待用户观察者。
-    /// 本类型不授予 TRANSIT/GRANT，也不令 affine role 变成可复制。
+    /// 调用者须独占合法 entry 的关闭责任。普通 View 另持 MapToken，Close 只释放
+    /// capability；本类型不增加 TRANSIT/GRANT，也不令 affine 类型变成可复制。
     pub unsafe fn from_raw(handle: Handle) -> Self {
         Self {
             handle: Some(handle),

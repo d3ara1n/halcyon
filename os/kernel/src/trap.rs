@@ -11,7 +11,7 @@
 //! scause 按 `(is_interrupt, code)` 分发（TRAP-004 收口）：只有中断 1/5
 //! 进入 SSIP/STIP，只有异常 8 是 U ecall；其余用户同步异常一律终止进程。
 
-use crate::{context::UserContext, deferred_work, hart, sbi, sched, syscall};
+use crate::{context::UserContext, hart, sbi, sched, syscall};
 
 /// trap 处理出口，汇编经 a0 返回给调度循环（0 保留给 Resume）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,19 +69,26 @@ unsafe extern "C" fn handle_user_trap(
     // SAFETY: 锚指向当前线程现场，本 hart 独占（模块契约）。
     let frame = unsafe { &mut *frame };
     let thread = hart::current().current_thread();
+    crate::maintenance::end_user();
     // Pending 电平是 Remote Call 真值；任意用户 trap 都是有界消费安全点。
-    deferred_work::drain_current();
+    crate::vm::remote::drain_current(crate::vm::remote::SAFE_POINT_BATCH);
 
     // 终止吸收：kill 先行冻结终因后，目标线程在任何 trap 入口都不再
     // 返回用户态（IPI 到达、量子耗尽、异常均在此汇合）。
     if let Some(t) = thread
-        && t.process.lifecycle.is_terminating()
+        && t.process.is_frozen()
     {
+        // remote 已在计时区间外完成；早退同样把 Switch 离场尾段归 U。
+        crate::maintenance::begin_user();
         return Outcome::Killed as usize;
     }
 
     let is_interrupt = scause >> 63 == 1;
     let code = scause & !(1 << 63);
+    // syscall 与用户 fault 的业务处理归 U；timer/remote 紧急服务不归 U/M。
+    if !is_interrupt {
+        crate::maintenance::begin_user();
+    }
 
     let outcome = match (is_interrupt, code) {
         (false, U_ECALL) => {
@@ -123,17 +130,14 @@ unsafe extern "C" fn handle_user_trap(
             );
             if let Some(t) = thread {
                 let fault = erhino_shared::proc::ProcessFaultCode::from_scause(code);
-                let todo = t.process.lifecycle.request_termination(
+                t.process.freeze_and_seal(
                     erhino_shared::proc::TerminationCause::Faulted,
                     erhino_shared::proc::TerminationDetail::fault(
                         t.member().tid(),
                         fault,
                         stval as u64,
                     ),
-                    Some(t.member()),
                 );
-                let process = t.process.clone();
-                crate::task::process::run_termination_todo(&process, todo);
             }
             Outcome::Killed as usize
         }
@@ -145,15 +149,29 @@ unsafe extern "C" fn handle_user_trap(
     crate::runtime_stop::check();
     // handler 的业务 guard 已全部释放；统一交付输出复检失败的终止待办。
     if let Some(t) = thread {
-        t.finish_output_termination();
+        t.publish_output_fault();
     }
+    crate::maintenance::end_user();
     // 业务 guard 已释放，统一推进两段式通知；剩余 pending 再发布门铃。
-    deferred_work::drain_current();
-    crate::task::notify_work::drain_current();
+    crate::vm::remote::drain_current(crate::vm::remote::SAFE_POINT_BATCH);
     crate::heap::sample();
-    if thread.is_some_and(|t| t.process.lifecycle.is_terminating()) {
+    let outcome = if thread.is_some_and(|t| t.process.is_frozen()) {
         Outcome::Killed as usize
+    } else if outcome == Outcome::Resume as usize {
+        if sched::quantum_expired() || !crate::maintenance::resume_user() {
+            Outcome::Requeue as usize
+        } else {
+            // 原轮费用/机会均未重发；重装也保留 dispatch 的线程绝对期限。
+            crate::maintenance::begin_user();
+            sched::rearm_quantum(crate::maintenance::user_deadline());
+            outcome
+        }
     } else {
         outcome
+    };
+    // Resume 延续原类别余额；Switch 的 VM/成员离场尾段由 run 关闭此区间。
+    if outcome != Outcome::Resume as usize {
+        crate::maintenance::begin_user();
     }
+    outcome
 }

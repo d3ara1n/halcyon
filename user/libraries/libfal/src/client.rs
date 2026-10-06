@@ -5,15 +5,17 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     time::Deadline,
-    wait::{WaitItem, WaitReason},
+    wait::WaitReason,
+    wait_set::{MemberRequest, ReadyRecord},
 };
-use librpc::{CallCause, CallError, CallOperation, CallPhase, Caller, Reply, Request as RpcRequest};
 use libkernel::ipc::{
     capability::Capability,
     message::{MailboxSender, SenderAdoptFailure},
     notification,
     object::duplicate,
-    wait::wait_until,
+};
+use librpc::{
+    CallCause, CallError, CallOperation, CallPhase, Caller, Reply, Request as RpcRequest,
 };
 
 use crate::protocol::{self, Request, Response, Status};
@@ -98,6 +100,9 @@ pub enum SubscriptionEvent {
 }
 
 pub struct Subscription {
+    wait: libkernel::ipc::wait_set::WaitSet,
+    notification_token: u64,
+    provider_token: u64,
     grant: MailboxSender,
     owner: Capability,
     info: protocol::SubscriptionInfo,
@@ -117,23 +122,61 @@ impl Subscription {
         protocol::WatchMask::from_raw(bits).ok_or(SystemCallError::InternalError)
     }
 
-    pub fn wait(&self, deadline: Deadline) -> Result<SubscriptionEvent, SystemCallError> {
-        let items = [
-            WaitItem::new(
-                self.owner.as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                0,
-            ),
-            WaitItem::new(self.grant.as_handle(), ObjectSignals::CLOSED, 1),
-        ];
-        let result = wait_until(&items, deadline)?;
-        if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
-            return Err(SystemCallError::DeadlineExpired);
+    /// 此 Subscription 拥有唯一集合接收者；陈旧电平与最终超时都复核实际来源。
+    pub fn wait(&mut self, deadline: Deadline) -> Result<SubscriptionEvent, SystemCallError> {
+        let mut expired = false;
+        loop {
+            let mut records = [ReadyRecord {
+                token: 0,
+                cookie: 0,
+                observed: ObjectSignals::NONE,
+                reason: 0,
+                reserved: 0,
+            }; 2];
+            let count = match self.wait.receive_into(&mut records) {
+                Ok(count) => count,
+                Err(SystemCallError::ObjectNotAvailable) => 0,
+                Err(error) => return Err(error),
+            };
+            for record in &records[..count] {
+                if record.cookie == 1 && record.token == self.provider_token {
+                    return Ok(SubscriptionEvent::ProviderClosed);
+                }
+                if record.cookie == 0 && record.token == self.notification_token {
+                    if WaitReason::from_u32(record.reason) == Some(WaitReason::Closed)
+                        || record.observed.intersects(ObjectSignals::CLOSED)
+                    {
+                        return Ok(SubscriptionEvent::ProviderClosed);
+                    }
+                    let bits = match self.take() {
+                        Ok(bits) => bits,
+                        Err(SystemCallError::ObjectNotAvailable) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if !bits.is_empty() {
+                        return Ok(SubscriptionEvent::Events(bits));
+                    }
+                }
+            }
+            if expired {
+                match self.take() {
+                    Ok(bits) if !bits.is_empty() => return Ok(SubscriptionEvent::Events(bits)),
+                    Ok(_) | Err(SystemCallError::ObjectNotAvailable) => {}
+                    Err(SystemCallError::ObjectClosed) => {
+                        return Ok(SubscriptionEvent::ProviderClosed);
+                    }
+                    Err(error) => return Err(error),
+                }
+                if libkernel::ipc::wait::probe(self.grant.as_handle(), ObjectSignals::CLOSED)?
+                    .intersects(ObjectSignals::CLOSED)
+                {
+                    return Ok(SubscriptionEvent::ProviderClosed);
+                }
+                return Err(SystemCallError::DeadlineExpired);
+            }
+            expired =
+                WaitReason::from_u32(self.wait.wait(deadline)?.reason) == Some(WaitReason::Timeout);
         }
-        if result.cookie == 1 || result.observed.intersects(ObjectSignals::CLOSED) {
-            return Ok(SubscriptionEvent::ProviderClosed);
-        }
-        self.take().map(SubscriptionEvent::Events)
     }
 }
 
@@ -206,7 +249,9 @@ impl Client {
                 }
             }
             if let Err(cause) = operation.wait_ready() {
-                let error = operation.abort(cause).expect("waiting call remains pending");
+                let error = operation
+                    .abort(cause)
+                    .expect("waiting call remains pending");
                 return Err(Self::classify_transport(error));
             }
         }
@@ -423,7 +468,7 @@ impl Client {
             .map_err(|SenderAdoptFailure { .. }| ClientError::Protocol)?;
         let event = notification::create(
             Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT,
+            Rights::SIGNAL | Rights::TRANSIT,
         )
         .map_err(ClientError::System)?;
         // SAFETY: NotificationCreate returned two fresh affine entries owned by this call.
@@ -433,7 +478,7 @@ impl Client {
         let request = Request::Subscribe { path, mask };
         let op = request.op();
         let mut rpc = Self::encode(&request, deadline)?;
-        rpc.push(signaler, Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT)
+        rpc.push(signaler, Rights::SIGNAL | Rights::TRANSIT)
             .map_err(|failure| ClientError::System(failure.error))?;
         let reply = self.finish_call(grant, op, deadline, rpc, None)?;
         let (_, Response::Subscription(info)) =
@@ -449,7 +494,25 @@ impl Client {
         {
             return Err(ClientError::Protocol);
         }
+        let wait = libkernel::ipc::wait_set::WaitSet::create(2).map_err(ClientError::System)?;
+        let notification_token = wait
+            .register(MemberRequest::new(
+                owner.as_handle(),
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                0,
+            ))
+            .map_err(ClientError::System)?;
+        let provider_token = wait
+            .register(MemberRequest::new(
+                grant_copy.as_handle(),
+                ObjectSignals::CLOSED,
+                1,
+            ))
+            .map_err(ClientError::System)?;
         Ok(Subscription {
+            wait,
+            notification_token,
+            provider_token,
             grant: grant_copy,
             owner,
             info,

@@ -102,7 +102,9 @@ impl TableFrameMemory for MockFrames {
     }
 
     fn reclaim(&mut self, frame: FrameNumber) -> TableOwner {
-        self.adopted[frame.0].take().expect("reclaimed unadopted frame")
+        self.adopted[frame.0]
+            .take()
+            .expect("reclaimed unadopted frame")
     }
 }
 
@@ -767,8 +769,12 @@ fn second_unmap_after_first_publish_is_detected_as_stale() {
 
 // ---- 游标分步发布（内存分案轮次 3）----
 
-fn step_all(tree: &mut Tree, cursor: &mut page_table::PublishCursor, reserve: &mut Vec<TableOwner>) {
-    while !tree.publish_step(cursor, reserve, 1) {}
+fn step_all(
+    tree: &mut Tree,
+    cursor: &mut page_table::PublishCursor,
+    reserve: &mut Vec<TableOwner>,
+) {
+    while !tree.publish_step(cursor, &mut core::iter::from_fn(|| reserve.pop()), 1) {}
 }
 
 #[test]
@@ -781,8 +787,8 @@ fn disjoint_cursors_publish_interleaved_without_stale() {
     let mut ra = supply(&counters, page_table::worst_case_frames::<3>(&a)).unwrap();
     let mut rb = supply(&counters, page_table::worst_case_frames::<3>(&b)).unwrap();
     loop {
-        let da = tree.publish_step(&mut a, &mut ra, 1);
-        let db = tree.publish_step(&mut b, &mut rb, 1);
+        let da = tree.publish_step(&mut a, &mut core::iter::from_fn(|| ra.pop()), 1);
+        let db = tree.publish_step(&mut b, &mut core::iter::from_fn(|| rb.pop()), 1);
         if da && db {
             break;
         }

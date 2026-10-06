@@ -58,23 +58,15 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::ProcessTerminate => {
-            let process = thread.process.clone();
-            let todo = thread.process.lifecycle.request_termination(
-                TerminationCause::Terminated,
-                TerminationDetail::NONE,
-                Some(thread.member()),
-            );
-            task::process::run_termination_todo(&process, todo);
+            thread
+                .process
+                .freeze_and_seal(TerminationCause::Terminated, TerminationDetail::NONE);
             Outcome::Killed
         }
         SystemCall::ProcessAbort => {
-            let process = thread.process.clone();
-            let todo = thread.process.lifecycle.request_termination(
-                TerminationCause::Aborted,
-                TerminationDetail::NONE,
-                Some(thread.member()),
-            );
-            task::process::run_termination_todo(&process, todo);
+            thread
+                .process
+                .freeze_and_seal(TerminationCause::Aborted, TerminationDetail::NONE);
             Outcome::Killed
         }
         SystemCall::ThreadExit => {
@@ -125,8 +117,9 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 task::job::create(
                     thread,
                     Handle::from_raw(frame.x[10]),
-                    Rights::from_raw(frame.x[11]),
-                    frame.x[12] as usize,
+                    Handle::from_raw(frame.x[11]),
+                    Rights::from_raw(frame.x[12]),
+                    frame.x[13] as usize,
                 )
                 .map(|_| 0),
             );
@@ -138,38 +131,31 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 task::process::create(
                     thread,
                     Handle::from_raw(frame.x[10]),
-                    Rights::from_raw(frame.x[11]),
-                    frame.x[12] as usize,
-                )
-                .map(|_| 0),
-            );
-            Outcome::Completed
-        }
-        SystemCall::ProcessBindMemory => {
-            respond_result(
-                frame,
-                task::process::bind_memory(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
                     Handle::from_raw(frame.x[11]),
+                    Rights::from_raw(frame.x[12]),
+                    frame.x[13] as usize,
                 )
                 .map(|_| 0),
             );
             Outcome::Completed
         }
         SystemCall::ProcessMap => {
-            respond_result(
-                frame,
-                task::process::map(
-                    thread,
-                    Handle::from_raw(frame.x[10]),
-                    frame.x[11] as usize,
-                    frame.x[12] as usize,
-                    ProcessMapFlags::from_raw(frame.x[13] as u32),
-                )
-                .map(|_| 0),
-            );
-            Outcome::Completed
+            match task::process::map(
+                thread,
+                Handle::from_raw(frame.x[10]),
+                frame.x[11] as usize,
+                frame.x[12] as usize,
+                ProcessMapFlags::from_raw(frame.x[13] as u32),
+            ) {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
         }
         SystemCall::ProcessWrite => {
             respond_result(
@@ -186,12 +172,16 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::ProcessStart => {
-            respond_result(
-                frame,
-                task::process::start(thread, Handle::from_raw(frame.x[10]))
-                    .map(|_| 0),
-            );
-            Outcome::Completed
+            match task::process::start(thread, Handle::from_raw(frame.x[10])) {
+                Ok(plan) => {
+                    sched::park_request_wait(plan);
+                    Outcome::Wait
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
         }
         SystemCall::ProcessGrant => {
             respond_result(
@@ -227,27 +217,6 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 }
                 // 自杀式调用不返回用户态；终因已在 lifecycle 冻结。
                 Ok(task::process::KillOutcome::TerminatedCaller) => Outcome::Killed,
-                Err(error) => {
-                    respond_error(frame, error);
-                    Outcome::Completed
-                }
-            }
-        }
-        SystemCall::ProcessDrain => {
-            match task::process::drain(
-                thread,
-                Handle::from_raw(frame.x[10]),
-                frame.x[11] as u32,
-                frame.x[12] as usize,
-            ) {
-                Ok(task::process::DrainStart::Ready) => {
-                    respond_ok(frame, 0);
-                    Outcome::Completed
-                }
-                Ok(task::process::DrainStart::Wait(plan)) => {
-                    sched::park_request_wait(plan);
-                    Outcome::Wait
-                }
                 Err(error) => {
                     respond_error(frame, error);
                     Outcome::Completed
@@ -300,7 +269,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::MemoryMap => match task::proc::memory_map(thread, a0) {
+        SystemCall::MemoryMap => match crate::vm::operation::memory_map(thread, a0) {
             Ok(plan) => {
                 sched::park_request_wait(plan);
                 Outcome::Wait
@@ -311,7 +280,11 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
         },
         SystemCall::MemoryUnmap => {
-            match task::proc::memory_unmap(thread, frame.x[10], frame.x[11]) {
+            match crate::vm::operation::memory_unmap(
+                thread,
+                frame.x[10] as usize,
+                frame.x[11] as usize,
+            ) {
                 Ok(plan) => {
                     sched::park_request_wait(plan);
                     Outcome::Wait
@@ -323,8 +296,12 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             }
         }
         SystemCall::MemoryProtect => {
-            match task::proc::memory_protect(thread, frame.x[10], frame.x[11], frame.x[12] as usize)
-            {
+            match crate::vm::operation::memory_protect(
+                thread,
+                frame.x[10] as usize,
+                frame.x[11] as usize,
+                frame.x[12] as usize,
+            ) {
                 Ok(plan) => {
                     sched::park_request_wait(plan);
                     Outcome::Wait
@@ -379,9 +356,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 task::memory_pool::derive(
                     thread,
                     Handle::from_raw(frame.x[10]),
-                    frame.x[11],
-                    Rights::from_raw(frame.x[12]),
-                    frame.x[13] as usize,
+                    frame.x[11] as usize,
+                    frame.x[12] as usize,
                 )
                 .map(|_| 0),
             );
@@ -390,9 +366,14 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         SystemCall::Sleep => {
             let plan = (|| {
                 let deadline = {
-                    let mut space = thread.process.space.lock();
+                    let body = thread
+                        .process
+                        .lease_body()
+                        .ok_or(SystemCallError::ObjectClosed)?;
+                    let mut vm = body.vm.space.lock();
+                    let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
                     // SAFETY: Deadline 仅含固定宽整数，sleep_plan 验证判别和值域。
-                    unsafe { uaccess::read_user_value(&mut space, a0) }?
+                    unsafe { uaccess::read_user_value(space, a0) }?
                 };
                 wait::sleep_plan(deadline)
             })();
@@ -407,20 +388,13 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 }
             }
         }
-        SystemCall::HandleClose => match handle::close(thread, Handle::from_raw(frame.x[10])) {
-            Ok(handle::HandleCloseStart::Ready) => {
-                respond_ok(frame, 0);
-                Outcome::Completed
-            }
-            Ok(handle::HandleCloseStart::Wait(plan)) => {
-                sched::park_request_wait(plan);
-                Outcome::Wait
-            }
-            Err(error) => {
-                respond_error(frame, error);
-                Outcome::Completed
-            }
-        },
+        SystemCall::HandleClose => {
+            respond_result(
+                frame,
+                handle::close(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
+            );
+            Outcome::Completed
+        }
         SystemCall::HandleDuplicate => {
             respond_result(
                 frame,
@@ -434,9 +408,9 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::WaitMany => match wait::prepare(thread, a0) {
-            Ok(wait::WaitStart::Ready) => {
-                respond_ok(frame, 0);
+        SystemCall::WaitOne => match wait::prepare(thread, a0) {
+            Ok(wait::WaitStart::Ready(signals)) => {
+                respond_ok(frame, signals.raw() as usize);
                 Outcome::Completed
             }
             Ok(wait::WaitStart::Park(plan)) => {
@@ -465,6 +439,14 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             respond_result(
                 frame,
                 notification::signal(thread, Handle::from_raw(frame.x[10]), frame.x[11]).map(|_| 0),
+            );
+            Outcome::Completed
+        }
+        SystemCall::NotificationObserve => {
+            respond_result(
+                frame,
+                notification::observe(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
+                    .map(|_| 0),
             );
             Outcome::Completed
         }
@@ -507,14 +489,6 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::WaitSetRearm => {
-            respond_result(
-                frame,
-                task::wait_set::rearm(thread, Handle::from_raw(frame.x[10]), frame.x[11])
-                    .map(|generation| generation as usize),
-            );
-            Outcome::Completed
-        }
         SystemCall::WaitSetReceive => {
             respond_result(
                 frame,
@@ -546,11 +520,8 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::MonotonicNow => {
-            let result = crate::clock::now().and_then(|snapshot| {
-                let mut space = thread.process.space.lock();
-                // SAFETY: ClockSnapshot 无 padding，完整初始化，失败没有业务副作用。
-                unsafe { uaccess::deliver_output(thread, &mut space, a0, &snapshot) }
-            });
+            let result =
+                crate::clock::now().and_then(|snapshot| uaccess::write_user(thread, a0, &snapshot));
             respond_result(frame, result.map(|_| 0));
             Outcome::Completed
         }
@@ -637,53 +608,25 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             Outcome::Completed
         }
         SystemCall::TunnelCreate => {
-            let request = {
-                let mut space = thread.process.space.lock();
-                // SAFETY: 固定宽 ABI 请求先完整拷入，用户地址经 uaccess 校验。
-                unsafe { uaccess::read_user_value(&mut space, a0) }
-            };
-            match request
-                .map_err(SystemCallError::from)
-                .and_then(|request| crate::task::tunnel::create(thread, request))
-            {
-                Ok(plan) => {
-                    sched::park_request_wait(plan);
-                    Outcome::Wait
-                }
-                Err(error) => {
-                    respond_error(frame, error);
-                    Outcome::Completed
-                }
-            }
+            respond_result(frame, task::tunnel::create(thread, a0).map(|_| 0));
+            Outcome::Completed
         }
         SystemCall::TunnelAttach => {
-            let request = {
-                let mut space = thread.process.space.lock();
-                // SAFETY: 同 Create，先取得固定宽快照，再解释授权与几何。
-                unsafe { uaccess::read_user_value(&mut space, a0) }
-            };
-            match request
-                .map_err(SystemCallError::from)
-                .and_then(|request| crate::task::tunnel::attach(thread, request))
-            {
-                Ok(plan) => {
-                    sched::park_request_wait(plan);
-                    Outcome::Wait
-                }
-                Err(error) => {
-                    respond_error(frame, error);
-                    Outcome::Completed
-                }
-            }
+            respond_result(
+                frame,
+                task::tunnel::attach(thread, Handle::from_raw(frame.x[10]))
+                    .map(|handle| handle.raw() as usize),
+            );
+            Outcome::Completed
         }
-        SystemCall::TunnelNotify => {
+        SystemCall::EndpointNotify => {
             respond_result(
                 frame,
                 crate::task::tunnel::notify(thread, Handle::from_raw(frame.x[10])).map(|_| 0),
             );
             Outcome::Completed
         }
-        SystemCall::TunnelAcknowledgeData => {
+        SystemCall::EndpointAcknowledgeData => {
             respond_result(
                 frame,
                 crate::task::tunnel::acknowledge_data(thread, Handle::from_raw(frame.x[10]))
@@ -696,7 +639,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
     // 异 hart kill）则线程不回用户态——收束确定性提前一个 syscall，
     // 不依赖 sret 边界的 IPI 吸收时序。Wait 在此保留；trap 尾段仍可将
     // 它吸收为 Killed。调度循环统一取走意图，Park 安装或 Killed 放弃。
-    if outcome == Outcome::Completed && thread.process.lifecycle.is_terminating() {
+    if outcome == Outcome::Completed && thread.process.is_frozen() {
         return Outcome::Killed;
     }
     outcome
@@ -714,19 +657,37 @@ fn debug_print(frame: &mut UserContext, thread: &Thread) {
         respond_error(frame, SystemCallError::MemoryNotAccessible);
         return;
     }
-    let mut buf = alloc::vec::Vec::new();
-    if buf.try_reserve_exact(len).is_err() {
-        respond_error(frame, SystemCallError::OutOfMemory);
+    let pool = thread.process.funding_pool();
+    let mut buf = match task::resources::MetadataBuffer::try_empty(
+        len,
+        &task::resources::MetadataFunding(&pool),
+    ) {
+        Ok(buf) => buf,
+        Err(error) => {
+            respond_error(frame, task::resources::map_storage_error(error));
+            return;
+        }
+    };
+    for _ in 0..len {
+        buf.push(0);
+    }
+    let copied = (|| {
+        let body = thread
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let mut vm = body.vm.space.lock();
+        uaccess::copy_from_user(
+            vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?,
+            &mut buf,
+            ptr,
+        )
+        .map_err(SystemCallError::from)
+    })();
+    if let Err(error) = copied {
+        respond_error(frame, error);
         return;
     }
-    buf.resize(len, 0);
-    let mut space = thread.process.space.lock();
-    if let Err(e) = uaccess::copy_from_user(&mut space, &mut buf, ptr) {
-        drop(space);
-        respond_error(frame, e.into());
-        return;
-    }
-    drop(space);
     match core::str::from_utf8(&buf) {
         Ok(msg) => crate::console::log_tagged(
             "Debug",

@@ -1,37 +1,29 @@
 # Runnel 实现
 
-Runnel 在 `user/libraries/librunnel/src/lib.rs` 实现 RNL2 单工 SPSC 字节流；布局方向见 [`../ideas/runnel.md`](../ideas/runnel.md)。内核只解释 Tunnel 几何、映射及生命周期。
+[`librunnel`](../../user/libraries/librunnel/src/lib.rs) 实现单工 SPSC 字节流。内核只提供 Tunnel 授权/事件与普通 View，机制见 [tunnel](tunnel.md)；页内格式、进展与双侧 Start 由本库拥有。
 
 ## 布局与角色
 
-控制块固定 128 B：RNL2 magic、版本/header 长度、规范化总长度、动态 capacity、u64 head/tail、u32 EOF/flags；数据区是映射的剩余全部字节。create 在交出 Invitation 前初始化并 release 发布 magic，attach acquire 后验证必要字段并冻结本地容量，忽略保留字节。RNL1 与固定 CAP 已删除。
+控制块为 128 B：RNL2 magic、版本 3/header 长度、规范化总长度、capacity、u64 head/tail、u32 EOF、0x2c producer Start、0x30 consumer Start，其余 76 字节保留。create 在发送 Invitation 前初始化完整头，再 release 发布 magic；attach acquire 验证版本、几何、游标与 Start 位型并冻结容量。每个角色的映射和协议验证成功后 release 发布本方 Start，随后 Notify；该事实独立于内核 PEER_ATTACHED。
 
-私有 `Transport` 是协议算法与承载之间的正式边界；guest 的 `Guest` 持 `Option<libkernel::ipc::tunnel::Endpoint>`，host 测试用固定宽原子控制字段及 AtomicU8 数据存储。`Channel` 持冻结容量与不可逆终态，关闭错误由显式 `close(self)` 报告；`ProducerCore`/`ConsumerCore` 持角色累计进度、最近接受的对端进度和独立物理 cursor。
+私有 Transport 是协议与承载的边界。Guest 独占 MappedEndpoint（Endpoint capability + 普通 MappedRegion），host 使用固定宽原子控制字段与 AtomicU8 数据。Channel 持冻结容量与不可逆终态；角色保存累计 u64 进度、对端 shadow 和独立物理 cursor。角色不能重建，游标按实际复制长度模 capacity 前进，wrapping 差值只验证容量内的合法进展。复制至多两段，随后 release 发布 HEAD/TAIL；对端 acquire 后取得数据/可写范围。首次 EOF 冻结最终 HEAD；回落、终点改变或非法进展均 Broken。
 
-角色从零建立且不能重建。物理 cursor 只按实际复制长度模 capacity 推进；累计 u64 只用于 wrapping 差值和合法前进量检查，不用于物理寻址。每次复制至多两段，先完成数据访问再 release 发布本方进度，对端 acquire 后取得可用范围。首次 acquire EOF 后取得 head 并冻结最终值；EOF 回落、最终 head 改变或非法进度均 Broken。
+## owner 与失败
 
-## owner、门铃与错误
+Producer/Consumer::create 接受 Pool、字节数和 Placement，先出生授权，再普通 Map，最后协议初始化。attach 接受 Invitation、约定字节数和 Placement，先接入、再映射、再初始化。Create 的映射失败保留 Endpoint/Invitation；Attach 未消费时失败返还 Invitation，已接入后的 Map 失败保留 Endpoint；协议初始化失败返还完整 MappedEndpoint。执行者据当前剩余责任清理，不能把 Attach 失败一概当作邀请未消费。
 
-公开 guest 接口在 `blocking` 模块：安全 `Producer/Consumer::create` 接受字节长度和 `libkernel::mm::Placement` 并返回 typed Invitation；安全 `attach` 消费 typed Invitation。内核未消费的 Attach 失败保留 Invitation，已消费后的协议验证失败以 `InitFailure<Endpoint>` 返还本地映射 owner；异常几何清理由 libkernel 的 EndpointCleanup 保留。Create 成功后输出校验失败以 `CreateFailure::Published` 返还已发布的 Endpoint/EndpointCleanup 和 Invitation，init 的 root 预备清理槽保留 owner 并按预算重试；内核提交前错误仍只返回错误码。私有 Channel/ProducerCore/ConsumerCore 构造也以 InitFailure 返还 Transport，不在初始化失败时进入运行期 Broken/关闭路径。原始 Tunnel ABI 仍由刻意内核自检调用，typed 安全入口是 Runnel 唯一构造路径。Producer/Consumer 独占 Endpoint，不导出 Handle 或共享 slice。共享访问通过 [`Tunnel owner`](tunnel.md) 借出的 `SharedMemory`，仅临时借用映射，不创建自引用结构。
+MappedEndpoint 的字段私有。memory() 只在持完整 RW View 时返回生命周期绑定的 SharedMemory，不创建自引用或普通共享 slice。close 先 Unmap 再 Close，失败保存尚未结算责任，返回 owner 只供继续清理；Unmap 已成功后不会再允许 memory()。Drop 分别尝试一次，失败的空间责任仍由进程自动回收持有，不无限重试。
 
-所有公开数据操作在正进展后通知，finish 在 EOF 发布后通知；Invited 期 ObjectNotAvailable 不代表 Closed，attach 首次检查取得已经发布的数据。无进展时 acknowledge → 重查 → WaitMany(DATA|PEER_CLOSED|CLOSED)，不做边沿省略。
+IoError 包含错误与已完成字节数。Notify 失败不撤回已发布数据，Invited 时 ObjectNotAvailable 不代表 Closed。协议/等待错误固定终态，随后所有操作先拒绝，Runtime 注销观察后才消费 owner。Producer 的 Started 快速返回也必须先过终态检查。
 
-`IoError` 报告协议/系统错误和已完成字节数；批量操作累计整次调用进度，通知失败不能撤回已发布的数据。首次协议/等待错误只进入不可逆终态，不在 Runtime 来源注销前关闭 Endpoint；后续数据访问先拒绝。执行 owner 注销观察后调用 `close(self)`，关闭失败返还完整角色与系统错误；Consumer 的 `wait_peer_closed(&mut self, timeout)` 通过内部事件能力观察终态并停止后续数据访问。Drop 的最终兜底由 libkernel owner 完成，不无限重试。
+## 进展与等待
 
-## 执行接入
+Producer 区分 Writable、Started 与 EofConsumed。可写空间不证明对端 Start；空环可在接入前写入，attach 后 acquire 读取已有数据。Consumer 区分 Readable（含首次 peer_started 标志）、Started 与 EofDrained。它先 acquire HEAD，再 acquire producer Start，防止首数据与 Start 并发时消耗旧快照却丢失首次事件；仅真实 Start 观察提交本地 start_observed。
 
-`wait_plan` 返回不透明的 `libexecution::SourcePlan` 值，描述当前角色的等待信号，不分配 Box，也不导出 Endpoint Handle。Runtime 完成登记、generation 过滤、重 arm 与注销，角色通过 `poll` 执行 acknowledge 和状态重查。
+无进展时 acknowledge DATA，再完整复检协议条件，最后等 DATA/PEER_CLOSED/CLOSED。Start 字段在每次复检中 acquire 读取，不订阅内核 PEER_ATTACHED，也不把数据量视作接入事件。wait_plan 返回 SourcePlan 值，由 libexecution 负责登记与注销；Runtime以持久成员保持来源token/任务身份，Assembly独占WaitSet接收。正式fs/pm/RootSupervisor装配与同步Caller均按该来源/续体契约接入；停止时先注销观察、等待回执收束再消费owner。
 
-Producer 创建端在观察到内核 PEER_ATTACHED 前把它纳入 `wait_plan`，`poll` 首次报告 PeerAttached，之后不再登记该持久电平；附着端构造时已知建立事实，保持原有 DATA 等待。Producer 还区分 Writable 与 EOF 后的 EofConsumed；可写空间本身不证明对端建立。Consumer 区分 Readable、PeerAttached 与 EofDrained；两种创建端角色均可用只读 `peer_attached()` 查询**内核**建立事实。Consumer 的有效可读数据可推进 RNL2 的 `peer_established`，但不能代替内核 PEER_ATTACHED 来允许 FAL Start：创建端在内核事件实际到达前仍订阅该电平；附着端成功 Attach 后构造时已知事实。Readable 的 `peer_attached` 标志只在本次同时收到内核电平时为真；数据已读尽后才收到建立事件仍返回 PeerAttached，调用者据此撤销旧来源并按新计划登记。已确认后不再订阅持久 PEER_ATTACHED 电平。所有入口先检查终态，不访问已关闭映射。
+批量读写对各次等待传递同一个绝对 Deadline；超时携带累计进度，仍可明确清理或继续非阻塞推进。所有 I/O 在终态后不访问共享内存。host协议核心与目标端普通映射共用协议条件；RV64映射/跨进程观测及平台组合的证据边界由对象链记录拥有。
 
-pm 使用安全 Producer::attach；init 使用 Consumer::create 并以 typed Packet 转移 Invitation。init 的 RootSupervisor 持有数据面 Runtime、Consumer 和缓冲，建立失败的 Endpoint/Invitation 也进入预备清理槽。数据停止在注销回执后关闭角色；异常 pm 退出由 init 收束进程。实现责任详见 [runtime.md](runtime.md)。
+## 实际消费者与限制
 
-srv_init 自检与 test_hammer 保留 libkernel 原始 Tunnel ABI 的刻意内核契约验证。`Producer::write_all_until` 与 `Consumer::read_exact_or_eof_until` 向每次底层 WaitMany 传入同一个绝对 Deadline，超时以 `RunnelError::TimedOut` 返回已完成字节数，角色仍可显式关闭或继续非阻塞操作；原阻塞入口传无限期以保持现有 init↔pm 消费者行为。未知 WaitReason 作为内部错误终止流，不能误当作普通唤醒。正式 FAL 客户端使用有限期入口并在进入业务前核验自身期限；`test_fal` 已通过正式 A/B provider 验证 Open/Attach/Start、冻结读、Write/Finish 与双端 Copy。
-
-## 验证
-
-host 测试覆盖一页/多页/最大容量、空满和分段、u64::MAX 邻域的实际字节传输、畸形布局、几何 shadow、非法游标/EOF、不可逆 Broken、通知失败的读写进度与错误后保持映射至显式 close、关闭失败保留、双线程流传输、创建端建立信号优先于 Writable 且只报告一次、Consumer 数据先于内核建立事件可见但仍保留该观察，以及两种角色超时保留进度与后续可推进。libkernel host 测试验证异常 Create 输出的两种 owner 返还形状。
-
-真实 init↔pm 使用三页映射和 65536 B 数据，容量 12160 B，验证完整模式、EOF、背压与对端关闭。Tunnel geometry/多 extent/close/Attach/drain 与独立 guest 非合作字节改写由 [`tunnel.md`](tunnel.md) 的验证入口负责；FAL Open/Attach/流完成和 Copy 的正式消费者由 `test_fal` 及 init 的监督剧本共同拥有。
-
-本专题组合验证与交付证据见 [`数据面档案`](../../plans/archived/todo-2026-09-memory-object-data-plane.md)。
+libfs 从 StreamOffer.tunnel_bytes 建立 View；srv_fs 从第五份出生 grant 获得 Pool[CREATE] 付款，协议 Started 才推进其流就绪；init/pm 数据面同样显式创建/接入/映射。真实压力消费者通过Endpoint/Invitation、独立View、持久Runtime/Caller及Job DONE监督推进；失败值携带尚未收束的owner，由当前装配负责注销/清理，进程退出的空间责任由内核自动退休兜底。测试与运行证据、延期与接续见[对象链计划](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)。

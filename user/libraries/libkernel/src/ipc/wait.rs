@@ -1,21 +1,30 @@
-//! WaitMany 的安全封装；相对便利入口归到唯一绝对核心。
+//! 单对象等待的安全封装；多对象由显式 WaitSet 聚合。
 
-use crate::{call::sys_wait_many, time::Deadline};
+use crate::{call::sys_wait_one, time::Deadline};
 use erhino_shared::{
     call::SystemCallError,
-    object::ObjectSignals,
-    wait::{WaitItem, WaitReason, WaitResult},
+    object::{Handle, ObjectSignals},
+    wait::WaitResult,
 };
 
-/// 相对毫秒便利入口，零表示无限；只在入口转换一次。
-pub fn wait_many(items: &[WaitItem], timeout_ms: u64) -> Result<WaitResult, SystemCallError> {
-    wait_until(items, crate::time::timeout_millis(timeout_ms)?)
+/// 相对毫秒只在入口转换一次，零表示无限。
+pub fn wait_one(
+    handle: Handle,
+    signals: ObjectSignals,
+    timeout_ms: u64,
+) -> Result<WaitResult, SystemCallError> {
+    wait_until(handle, signals, crate::time::timeout_millis(timeout_ms)?)
 }
 
-/// 多阶段操作共享同一绝对期限，不从本次等待时刻重新计时。
-pub fn wait_until(items: &[WaitItem], deadline: Deadline) -> Result<WaitResult, SystemCallError> {
-    let mut output = WaitResult::new(0, ObjectSignals::NONE, 0, WaitReason::Signaled);
-    // SAFETY: 输入及输出在阻塞 syscall 完成前保持有效。
-    unsafe { sys_wait_many(items, &mut output, deadline)? };
-    Ok(output)
+pub fn wait_until(
+    handle: Handle,
+    signals: ObjectSignals,
+    deadline: Deadline,
+) -> Result<WaitResult, SystemCallError> {
+    sys_wait_one(handle, signals, deadline).map(WaitResult::from_observed)
+}
+
+/// 非阻塞重读真实来源；用于最终超时裁决，不能用空 WaitSet 候选批替代。
+pub fn probe(handle: Handle, signals: ObjectSignals) -> Result<ObjectSignals, SystemCallError> {
+    wait_until(handle, signals, Deadline::at(0)).map(|result| result.observed)
 }

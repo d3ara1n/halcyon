@@ -145,3 +145,13 @@ pub fn after_ns(duration_ns: u64) -> Result<u64, SystemCallError> {
     let deadline = now()?.after_ns(duration_ns).map_err(map_error)?;
     deadline_ticks(deadline)?.ok_or(SystemCallError::InternalError)
 }
+
+/// 持续时间复用 Geometry 的唯一向上取整；不采样当前时刻，不引入起点。
+pub(crate) fn duration_ticks(ns: u64) -> Result<u64, SystemCallError> {
+    let geometry = geometry();
+    let end = geometry
+        .deadline_ticks(Deadline::at(ns))
+        .map_err(map_error)?
+        .ok_or(SystemCallError::InternalError)?;
+    Ok(end - geometry.origin_ticks())
+}

@@ -7,16 +7,16 @@ use erhino_shared::{
     memory_object::{MemoryObjectCreateRequest, MemoryObjectSnapshot},
     memory_pool::MemoryPoolSnapshot,
     message::{HandleMove, MailboxBadge, MessageHeader, SendHeader},
-    object::{Handle, HandleDescription, HandlePair, Rights, SenderResult},
+    object::{Handle, HandleDescription, HandlePair, ObjectSignals, Rights, SenderResult},
     proc::{
-        HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult,
-        ProcessDrainResult, ProcessMapFlags, ProcessSnapshot, ThreadCreateResult,
-        ThreadStartContext,
+        HandleGrant, JobEnumerateResult, JobSnapshot, ProcessCreateResult, ProcessMapFlags,
+        ProcessSnapshot, ThreadCreateResult, ThreadStartContext,
     },
     reset::{ResetAction, ResetReason},
     time::{ClockSnapshot, Deadline},
-    tunnel::{TunnelAttachRequest, TunnelCreateRequest},
-    wait::{WaitItem, WaitManyRequest, WaitResult},
+    tunnel::TunnelCreateRequest,
+    wait::WaitOneRequest,
+    wait_set::MemberRequest,
 };
 use num_traits::FromPrimitive;
 
@@ -163,16 +163,15 @@ pub(crate) unsafe fn sys_memory_pool_query(
 
 pub(crate) unsafe fn sys_memory_pool_derive(
     parent: Handle,
-    pages: u64,
-    rights: Rights,
+    request: &erhino_shared::memory_pool::MemoryPoolDeriveRequest,
     output: &mut Handle,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::MemoryPoolDerive,
         parent.raw() as usize,
-        pages as usize,
-        rights.raw() as usize,
+        request as *const erhino_shared::memory_pool::MemoryPoolDeriveRequest as usize,
         output as *mut Handle as usize,
+        0,
     )
     .map(|_| ())
 }
@@ -228,15 +227,16 @@ pub unsafe fn sys_process_abort() -> ! {
 
 pub unsafe fn sys_job_create(
     parent: Handle,
+    pool: Handle,
     rights: Rights,
     output: &mut Handle,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::JobCreate,
         parent.raw() as usize,
+        pool.raw() as usize,
         rights.raw() as usize,
         output as *mut Handle as usize,
-        0,
     )
     .map(|_| ())
 }
@@ -301,26 +301,16 @@ pub unsafe fn sys_job_derive(
 
 pub unsafe fn sys_process_create(
     job: Handle,
+    pool: Handle,
     control_rights: Rights,
     output: &mut ProcessCreateResult,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ProcessCreate,
         job.raw() as usize,
+        pool.raw() as usize,
         control_rights.raw() as usize,
         output as *mut ProcessCreateResult as usize,
-        0,
-    )
-    .map(|_| ())
-}
-
-pub unsafe fn sys_process_bind_memory(builder: Handle, pool: Handle) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::ProcessBindMemory,
-        builder.raw() as usize,
-        pool.raw() as usize,
-        0,
-        0,
     )
     .map(|_| ())
 }
@@ -340,28 +330,7 @@ pub unsafe fn sys_process_query(
 }
 
 pub unsafe fn sys_process_kill(control: Handle) -> SystemCallResult<usize> {
-    sys_call(
-        SystemCall::ProcessKill,
-        control.raw() as usize,
-        0,
-        0,
-        0,
-    )
-}
-
-pub unsafe fn sys_process_drain(
-    control: Handle,
-    max_work: u32,
-    output: &mut ProcessDrainResult,
-) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::ProcessDrain,
-        control.raw() as usize,
-        max_work as usize,
-        output as *mut ProcessDrainResult as usize,
-        0,
-    )
-    .map(|_| ())
+    sys_call(SystemCall::ProcessKill, control.raw() as usize, 0, 0, 0)
 }
 
 pub unsafe fn sys_process_map(
@@ -396,20 +365,10 @@ pub unsafe fn sys_process_write(
 }
 
 pub unsafe fn sys_process_start(builder: Handle) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::ProcessStart,
-        builder.raw() as usize,
-        0,
-        0,
-        0,
-    )
-    .map(|_| ())
+    sys_call(SystemCall::ProcessStart, builder.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
-pub unsafe fn sys_process_bind_execution(
-    builder: Handle,
-    profile: u32,
-) -> SystemCallResult<()> {
+pub unsafe fn sys_process_bind_execution(builder: Handle, profile: u32) -> SystemCallResult<()> {
     sys_call(
         SystemCall::ProcessBindExecution,
         builder.raw() as usize,
@@ -452,10 +411,9 @@ pub unsafe fn sys_process_grant(
 
 /// # Safety
 ///
-/// `control` must be a live ThreadControl entry with MANAGE authority owned
-/// by the caller.
-pub unsafe fn sys_thread_start(control: Handle) -> SystemCallResult<()> {
-    sys_call(SystemCall::ThreadStart, control.raw() as usize, 0, 0, 0).map(|_| ())
+/// `ticket` 必须是调用方持有的有效 ThreadStartTicket。
+pub unsafe fn sys_thread_start(ticket: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::ThreadStart, ticket.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
 /// # Safety
@@ -470,17 +428,7 @@ pub unsafe fn sys_thread_yield() -> SystemCallResult<()> {
 /// # Safety
 /// 调用者须先交付线程结果与环境责任，不能再依赖当前栈或线程局部对象。
 pub unsafe fn sys_thread_exit() -> ! {
-    let _ = unsafe {
-        raw_call(
-            SystemCall::ThreadExit as usize,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let _ = unsafe { raw_call(SystemCall::ThreadExit as usize, 0, 0, 0, 0, 0, 0) };
     panic!("ThreadExit unexpectedly returned")
 }
 
@@ -495,24 +443,18 @@ pub(crate) unsafe fn sys_tunnel_create(request: &TunnelCreateRequest) -> SystemC
     .map(|_| ())
 }
 
-pub(crate) unsafe fn sys_tunnel_attach(request: &TunnelAttachRequest) -> SystemCallResult<()> {
-    sys_call(
-        SystemCall::TunnelAttach,
-        request as *const _ as usize,
-        0,
-        0,
-        0,
-    )
-    .map(|_| ())
+pub(crate) unsafe fn sys_tunnel_attach(invitation: Handle) -> SystemCallResult<Handle> {
+    sys_call(SystemCall::TunnelAttach, invitation.raw() as usize, 0, 0, 0)
+        .map(|raw| Handle::from_raw(raw as u64))
 }
 
 pub unsafe fn sys_tunnel_notify(endpoint: Handle) -> SystemCallResult<()> {
-    sys_call(SystemCall::TunnelNotify, endpoint.raw() as usize, 0, 0, 0).map(|_| ())
+    sys_call(SystemCall::EndpointNotify, endpoint.raw() as usize, 0, 0, 0).map(|_| ())
 }
 
 pub unsafe fn sys_tunnel_acknowledge_data(endpoint: Handle) -> SystemCallResult<()> {
     sys_call(
-        SystemCall::TunnelAcknowledgeData,
+        SystemCall::EndpointAcknowledgeData,
         endpoint.raw() as usize,
         0,
         0,
@@ -615,13 +557,13 @@ pub unsafe fn sys_discard(mailbox: Handle) -> SystemCallResult<()> {
 pub unsafe fn sys_mailbox_make_send_once(
     source: Handle,
     rights: Rights,
-    output: &mut Handle,
+    output: &mut HandlePair,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::MailboxMakeSendOnce,
         source.raw() as usize,
         rights.raw() as usize,
-        output as *mut Handle as usize,
+        output as *mut HandlePair as usize,
         0,
     )
     .map(|_| ())
@@ -657,26 +599,25 @@ pub(crate) unsafe fn sys_handle_query(
     .map(|_| ())
 }
 
-pub unsafe fn sys_wait_many(
-    items: &[WaitItem],
-    result: &mut WaitResult,
+pub(crate) fn sys_wait_one(
+    handle: Handle,
+    signals: ObjectSignals,
     deadline: Deadline,
-) -> SystemCallResult<()> {
-    let request = WaitManyRequest {
-        items: items.as_ptr() as u64,
-        count: u32::try_from(items.len()).map_err(|_| SystemCallError::IllegalArgument)?,
-        reserved: 0,
-        result: result as *mut WaitResult as u64,
+) -> SystemCallResult<ObjectSignals> {
+    let request = WaitOneRequest {
+        handle,
+        signals,
         deadline,
     };
+    // 栈上的固定 ABI 请求在同步入口复制期间有效；无用户输出缓冲。
     sys_call(
-        SystemCall::WaitMany,
-        &request as *const WaitManyRequest as usize,
+        SystemCall::WaitOne,
+        &request as *const WaitOneRequest as usize,
         0,
         0,
         0,
     )
-    .map(|_| ())
+    .map(|signals| ObjectSignals::from_raw(signals as u64))
 }
 
 pub(crate) unsafe fn sys_monotonic_now(output: &mut ClockSnapshot) -> SystemCallResult<()> {
@@ -710,6 +651,20 @@ pub unsafe fn sys_notification_signal(handle: Handle, bits: u64) -> SystemCallRe
         SystemCall::NotificationSignal,
         handle.raw() as usize,
         bits as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub unsafe fn sys_notification_observe(
+    source: Handle,
+    output: &mut Handle,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::NotificationObserve,
+        source.raw() as usize,
+        output as *mut Handle as usize,
         0,
         0,
     )
@@ -769,28 +724,17 @@ pub(crate) unsafe fn sys_wait_set_create(
 
 pub(crate) unsafe fn sys_wait_set_register(
     set: Handle,
-    item: &WaitItem,
+    item: &MemberRequest,
     output: &mut u64,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::WaitSetRegister,
         set.raw() as usize,
-        item as *const WaitItem as usize,
+        item as *const MemberRequest as usize,
         output as *mut u64 as usize,
         0,
     )
     .map(|_| ())
-}
-
-pub(crate) unsafe fn sys_wait_set_rearm(set: Handle, token: u64) -> SystemCallResult<u64> {
-    sys_call(
-        SystemCall::WaitSetRearm,
-        set.raw() as usize,
-        token as usize,
-        0,
-        0,
-    )
-    .map(|generation| generation as u64)
 }
 
 pub(crate) unsafe fn sys_wait_set_remove(set: Handle, token: u64) -> SystemCallResult<()> {

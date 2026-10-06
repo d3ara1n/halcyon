@@ -8,7 +8,7 @@
 //! 索引为 [`OrdMap`]（arena AVL，按段起点），定位 O(log 段数)；节点经
 //! [`SegmentMap::reserve`] 预取，切段与摘段不分配。
 
-use crate::ordmap::OrdMap;
+use crate::ordmap::{OrdMap, OrdMapStorage, ReserveFailed};
 
 /// 段 owner：真实物理 extent 与资金凭证。切分必须同时切物理与 charge，守恒。
 pub trait SegmentOwner: Sized {
@@ -19,7 +19,9 @@ pub trait SegmentOwner: Sized {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackingError {
     /// 预取节点失败（OOM）。
-    NoMemory,
+    NodeLimit,
+    /// 候选容量已被竞争越过；旧/未用存储须锁外重备，不接受新的 use。
+    CapacityChanged,
     /// 预取的节点不足以完成本次切界。
     ReserveExhausted,
     /// 区间为空、越界或未对齐到现有段集合。
@@ -28,6 +30,8 @@ pub enum BackingError {
     ForeignUse,
     /// 已开始最终收束，不再接受新 use。
     Retiring,
+    /// 覆盖段的 use 计数到达表示上限；失败不改变切界或已有引用。
+    UseLimit,
 }
 
 /// 切段节点的预取额度；只能由同一 map 消费。
@@ -43,7 +47,7 @@ impl NodeReserve {
     }
 }
 
-/// 覆盖 `[lo,hi)` 逻辑页的业务 use；不可复制，只能经 [`SegmentMap::begin_release`] 消费。
+/// 覆盖 `[lo,hi)` 逻辑页的业务 use；不可复制，由 map 拆分或开始释放。
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "a range use must be released through its segment map"]
 pub struct RangeUse {
@@ -84,15 +88,39 @@ struct Segment<O> {
     owner: O,
 }
 
+pub struct SegmentStorage<O, C> {
+    index: OrdMapStorage<u64, Segment<O>, C>,
+}
+impl<O, C> SegmentStorage<O, C> {
+    pub const fn new() -> Self {
+        Self {
+            index: OrdMapStorage::new(),
+        }
+    }
+    pub fn try_empty<F: funded_storage::Funding<Charge = C>>(
+        capacity: usize,
+        payer: &F,
+    ) -> Result<Self, funded_storage::StorageError<F::Error>> {
+        Ok(Self {
+            index: OrdMapStorage::try_empty(capacity, payer)?,
+        })
+    }
+}
+impl<O, C> Default for SegmentStorage<O, C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 单个 Backing 的段集合，按段起点索引。
-pub struct SegmentMap<O> {
+pub struct SegmentMap<O, C> {
     id: u64,
-    segs: OrdMap<u64, Segment<O>>,
+    segs: OrdMap<u64, Segment<O>, C>,
     pages: u64,
     retiring: bool,
 }
 
-impl<O: SegmentOwner> SegmentMap<O> {
+impl<O: SegmentOwner, C> SegmentMap<O, C> {
     /// `id` 由调用方保证在 use 可能交叉的范围内唯一。
     pub fn new(id: u64) -> Self {
         Self {
@@ -111,11 +139,39 @@ impl<O: SegmentOwner> SegmentMap<O> {
         self.segs.len()
     }
 
+    /// 来源同步域内借用包含逻辑页的物理/资金 owner；不交出其所有权。
+    /// 调用者持 RangeUse 才能让解析出的地址跨同步域使用。
+    pub fn segment_at(&self, page: u64) -> Option<(u64, u64, &O)> {
+        let (start, segment) = self.segs.floor(&page)?;
+        (page < segment.end).then_some((start, segment.end, &segment.owner))
+    }
+
     /// 预取 `nodes` 个切段节点。只在准备阶段调用。
-    pub fn reserve(&mut self, nodes: usize) -> Result<NodeReserve, BackingError> {
+    pub fn growth_capacity(&self, nodes: usize) -> Result<usize, BackingError> {
+        self.segs.growth_capacity(nodes).map_err(reserve_error)
+    }
+    pub fn storage_capacity(&self, nodes: usize) -> Result<usize, BackingError> {
+        self.segs.storage_capacity(nodes).map_err(reserve_error)
+    }
+    pub fn take_empty_storage(&mut self) -> SegmentStorage<O, C> {
+        SegmentStorage {
+            index: self.segs.take_empty_storage(),
+        }
+    }
+    pub fn storage_idle(&self) -> bool {
+        self.segs.is_empty() && self.segs.reserved() == 0
+    }
+    pub fn is_retiring(&self) -> bool {
+        self.retiring
+    }
+    pub fn reserve(
+        &mut self,
+        nodes: usize,
+        prepared: &mut SegmentStorage<O, C>,
+    ) -> Result<NodeReserve, BackingError> {
         self.segs
-            .reserve(nodes)
-            .map_err(|_| BackingError::NoMemory)?;
+            .reserve(nodes, &mut prepared.index)
+            .map_err(reserve_error)?;
         Ok(NodeReserve {
             map: self.id,
             credits: nodes,
@@ -134,21 +190,26 @@ impl<O: SegmentOwner> SegmentMap<O> {
         pages: u64,
         owner: O,
         reserve: &mut NodeReserve,
-    ) -> Result<(), BackingError> {
-        if pages == 0 {
-            return Err(BackingError::InvalidRange);
+    ) -> Result<(), (BackingError, O)> {
+        if self.retiring {
+            return Err((BackingError::Retiring, owner));
         }
-        Self::spend(self.id, reserve)?;
+        let Some(end) = self.pages.checked_add(pages).filter(|_| pages != 0) else {
+            return Err((BackingError::InvalidRange, owner));
+        };
+        if let Err(error) = Self::spend(self.id, reserve) {
+            return Err((error, owner));
+        }
         let start = self.pages;
         self.segs.insert(
             start,
             Segment {
-                end: start + pages,
+                end,
                 uses: 0,
                 owner,
             },
         );
-        self.pages += pages;
+        self.pages = end;
         Ok(())
     }
 
@@ -166,9 +227,10 @@ impl<O: SegmentOwner> SegmentMap<O> {
         if self.retiring {
             return Err(BackingError::Retiring);
         }
-        if lo >= hi || hi > self.pages || !self.covered(lo, hi) {
+        if lo >= hi || hi > self.pages {
             return Err(BackingError::InvalidRange);
         }
+        self.check_acquire(lo, hi)?;
         let need = usize::from(self.needs_cut(lo)) + usize::from(self.needs_cut(hi));
         if reserve.credits < need {
             return Err(BackingError::ReserveExhausted);
@@ -191,10 +253,45 @@ impl<O: SegmentOwner> SegmentMap<O> {
         })
     }
 
+    /// 一份既有 use 在内部点拆为两份，各段 use 不增不减；至多切一个物理段。
+    /// 准备失败返还原 use 与未消费 reserve，终结后仍允许已受理责任拆分/释放。
+    pub fn split_use(
+        &mut self,
+        range_use: RangeUse,
+        at: u64,
+        reserve: &mut NodeReserve,
+    ) -> Result<(RangeUse, RangeUse), (BackingError, RangeUse)> {
+        if range_use.map != self.id || reserve.map != self.id {
+            return Err((BackingError::ForeignUse, range_use));
+        }
+        if at <= range_use.lo || at >= range_use.hi {
+            return Err((BackingError::InvalidRange, range_use));
+        }
+        if self.needs_cut(at) && reserve.credits == 0 {
+            return Err((BackingError::ReserveExhausted, range_use));
+        }
+        self.cut(at, reserve);
+        Ok((
+            RangeUse {
+                map: self.id,
+                lo: range_use.lo,
+                hi: at,
+            },
+            RangeUse {
+                map: self.id,
+                lo: at,
+                hi: range_use.hi,
+            },
+        ))
+    }
+
     /// 开始释放一个 use；之后逐步 [`Self::release_step`]。
-    pub fn begin_release(&mut self, range_use: RangeUse) -> Result<ReleaseCursor, BackingError> {
+    pub fn begin_release(
+        &mut self,
+        range_use: RangeUse,
+    ) -> Result<ReleaseCursor, (BackingError, RangeUse)> {
         if range_use.map != self.id {
-            return Err(BackingError::ForeignUse);
+            return Err((BackingError::ForeignUse, range_use));
         }
         Ok(ReleaseCursor {
             map: self.id,
@@ -205,7 +302,7 @@ impl<O: SegmentOwner> SegmentMap<O> {
 
     /// 处理一个段；不分配，O(log 段数)。
     pub fn release_step(&mut self, cursor: &mut ReleaseCursor) -> ReleaseStep<O> {
-        debug_assert_eq!(cursor.map, self.id);
+        assert_eq!(cursor.map, self.id, "foreign backing release cursor");
         if cursor.next >= cursor.hi {
             return ReleaseStep::Done;
         }
@@ -214,7 +311,10 @@ impl<O: SegmentOwner> SegmentMap<O> {
             .segs
             .get_mut(&start)
             .expect("live use boundaries are materialized while the use exists");
-        debug_assert!(seg.end <= cursor.hi && seg.uses > 0);
+        assert!(
+            seg.end <= cursor.hi && seg.uses > 0,
+            "invalid backing release ownership"
+        );
         cursor.next = seg.end;
         seg.uses -= 1;
         if seg.uses > 0 {
@@ -238,25 +338,31 @@ impl<O: SegmentOwner> SegmentMap<O> {
         self.segs.is_empty()
     }
 
-    /// `[lo,hi)` 完全由连续的存活段覆盖（不含已摘出空洞）。
-    fn covered(&self, lo: u64, hi: u64) -> bool {
+    /// 准备检查完全覆盖和逐段计数上限，任何切界/计数变更之前完成。
+    fn check_acquire(&self, lo: u64, hi: u64) -> Result<(), BackingError> {
         let Some((start, seg)) = self.segs.floor(&lo) else {
-            return false;
+            return Err(BackingError::InvalidRange);
         };
         if seg.end <= lo {
-            return false;
+            return Err(BackingError::InvalidRange);
+        }
+        if seg.uses == u32::MAX {
+            return Err(BackingError::UseLimit);
         }
         let (mut key, mut end) = (start, seg.end);
         while end < hi {
             match self.segs.after(&key) {
                 Some((next, seg)) if next == end => {
+                    if seg.uses == u32::MAX {
+                        return Err(BackingError::UseLimit);
+                    }
                     key = next;
                     end = seg.end;
                 }
-                _ => return false,
+                _ => return Err(BackingError::InvalidRange),
             }
         }
-        true
+        Ok(())
     }
 
     fn needs_cut(&self, at: u64) -> bool {
@@ -277,9 +383,7 @@ impl<O: SegmentOwner> SegmentMap<O> {
         Self::spend(self.id, reserve).expect("credits were checked before cutting");
         let seg = self.segs.remove(&start).expect("segment present");
         // remove 归还的槽即刻供左半复用：free 已有该槽，re-reserve 不分配。
-        self.segs
-            .reserve(1)
-            .expect("slot just returned to free list");
+        self.segs.reserve_recycled(1);
         let (left, right) = seg.owner.split_at(at - start);
         self.segs.insert(
             start,
@@ -309,5 +413,65 @@ impl<O: SegmentOwner> SegmentMap<O> {
         }
         reserve.credits -= 1;
         Ok(())
+    }
+}
+
+fn reserve_error(error: ReserveFailed) -> BackingError {
+    match error {
+        ReserveFailed::Overflow => BackingError::NodeLimit,
+        ReserveFailed::CapacityChanged => BackingError::CapacityChanged,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct TestFunding;
+    impl funded_storage::Funding for TestFunding {
+        type Charge = ();
+        type Error = ();
+        fn charge(&self, _: core::alloc::Layout) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct Ext(u64);
+    impl SegmentOwner for Ext {
+        fn split_at(self, pages: u64) -> (Self, Self) {
+            assert!(pages > 0 && pages < self.0);
+            (Self(pages), Self(self.0 - pages))
+        }
+    }
+
+    #[test]
+    fn existing_credit_survives_rejected_candidate_without_allocating() {
+        let mut map = SegmentMap::new(1);
+        let mut storage = SegmentStorage::try_empty(2, &TestFunding).unwrap();
+        let mut reserve = map.reserve(2, &mut storage).unwrap();
+        assert!(map.push_extent(10, Ext(10), &mut reserve).is_ok());
+        let whole = map.acquire(0, 10, &mut reserve).unwrap();
+        let capacity = map.segs.storage_capacities();
+        assert!(matches!(
+            map.reserve(8, &mut storage),
+            Err(BackingError::CapacityChanged)
+        ));
+        assert!(matches!(
+            map.reserve(usize::MAX, &mut storage),
+            Err(BackingError::NodeLimit)
+        ));
+        let (left, right) = map.split_use(whole, 4, &mut reserve).unwrap();
+        assert_eq!(map.segs.storage_capacities(), capacity);
+        for (part, expected) in [(left, 4), (right, 6)] {
+            let mut cursor = map.begin_release(part).unwrap();
+            match map.release_step(&mut cursor) {
+                ReleaseStep::Detached {
+                    owner: Ext(pages), ..
+                } => assert_eq!(pages, expected),
+                _ => panic!("split use did not refund its unique extent"),
+            }
+            assert!(matches!(map.release_step(&mut cursor), ReleaseStep::Done));
+        }
+        assert_eq!(map.segs.storage_capacities(), capacity);
+        assert!(map.is_empty());
     }
 }

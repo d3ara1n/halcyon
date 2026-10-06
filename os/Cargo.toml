@@ -6,7 +6,6 @@ members = [
     "dtb",
     "handle_table",
     "capability",
-    "wait_context",
     "stack_layout",
     "sched_domain",
     "ready_queue",
@@ -16,7 +15,6 @@ members = [
     "memory_supply",
     "memory_pool",
     "funded_frame",
-    "work_debt",
     "maintenance",
 ]
 resolver = "2"

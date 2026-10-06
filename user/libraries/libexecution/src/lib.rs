@@ -1,10 +1,13 @@
 #![no_std]
+#![feature(allocator_api)]
 
 //! 有界任务推进、观察来源、期限、唤醒、停止与退休。
 
 extern crate alloc;
 
+pub mod assembly;
 pub mod runtime;
+pub mod source;
 pub mod wake;
 pub mod work_queue;
 

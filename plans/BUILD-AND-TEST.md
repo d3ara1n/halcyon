@@ -38,7 +38,7 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 | 命令 | 覆盖与用途 |
 |---|---|
 | `just virt` | 日常 debug core：确定性内存、IPC、Tunnel、Job、监督与 reset |
-| `just virt-stress` | core 加 control/Tunnel 重复压力、`max_work=1` Drain 与完整 16/16 竞态矩阵 |
+| `just virt-stress` | core 加 control/Tunnel 重复压力、非空 WaitSet 进程自动退休与完整 16/16 竞态矩阵 |
 | `just virt-release` | release core，覆盖优化代码生成和 trap 寄存器保持 |
 | `just sifive_u` | 128MiB 与非零 boot hart 等板级差异，运行 core |
 | `just virt-nofd` | 无 F/D、无兼容浮点域的 core 路线 |
@@ -52,11 +52,13 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 
 常规路线经 `tools/qemu-throttle.sh` 和 `tools/qemu-acceptance.sh`。默认 `THROTTLE=50`，stress 同样节流，不作为全速性能基准；GDB 与全速专项诊断用 `THROTTLE=100`。节流只限制宿主资源占用，全速也仍经过路线的日志、锚点与超时判定。
 
-各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 默认 420 秒，因为竞态矩阵和 FAL 资源/退出组合持续增加；sifive_u 默认 120 秒，因为 128MiB/五 hart 路线在完整 FAL core workload 下需要更长的 QEMU 仿真预算。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
+各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 默认 420 秒，因为竞态矩阵和 FAL 资源/退出组合持续增加；sifive_u 默认 120 秒，因为 128MiB/五 hart 路线在完整 FAL core workload 下需要更长的 QEMU 仿真预算。异构域的 Base64 系统负载固定在单 hart，`VIRT_HETERO_TIMEOUT` 独立预留完整 core 收束所需的仿真时间。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
 
 超时负责收割异常停滞，不是性能目标。默认值依据对应 workload 在相同节流条件下的近期正常耗时留出宽裕余量；验收面或运行成本变化时重校。正常运行经常接近上限时，先确认运行身份和进展，再调整 recipe 与文档，不能把基础设施截断当成内核挂死，也不能用放宽超时掩盖缺失业务锚点。调查已定位的早期卡死时可临时收紧。
 
 判定依据 workload 身份、完整业务收束和显式 reset 锚点，不能用矩阵中途超时宣称内核失败。`virt-boot-failure` 同样节流，由 `tools/check-boot-failure.py` 独立判定预期故障、限制 GDB 时间并回收进程组，完整日志在 `artifacts/boot-failure/`。
+
+验收脚本只要求当前实际消费者与仍在调用的自检锚点；已删除机制的自检、日志与容量路线同步删除，不保留兼容锚点或为使旧门通过重建机制。路线通过证明该 workload 的当前可观察行为；内部交错、失败退款和付款保证的验证缺口由所属工作记录承载，不以旧锚点缺失代替风险判断。
 
 所有路线通过、失败、中断或超时后，都要确认本次启动的进程已清理。手动启动 QEMU/GDB 也由启动者负责清理，不干扰其他任务的进程。
 

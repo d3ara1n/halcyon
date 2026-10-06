@@ -1,10 +1,9 @@
-//! 监督状态机：REAPABLE/CLOSED 已观察后的收束（Drain → Verify → Close）
+//! 监督状态机：DONE 已观察后的收束（DONE → Verify → Close）
 //! 由单一 [`Collector`] 机器拥有；同步门面 [`collect_process`] 与执行核心
 //! 任务 [`SuperviseTask`] 共用同一状态机，不另写第二套循环。
 //!
-//! 观察到 CLOSED 不等于收束完成：终态发布后成员摘除与祖先传播仍可能
-//! 跨批继续，Drain Complete 才是关闭 control 的前置。对象繁忙按绝对
-//! 期限重试（REAPABLE 是持久电平，不能靠重新观察重试）。
+//! DONE 在内核完成退休和退款后发布。机器再验证 Dead 快照并关闭 Control；
+//! 查询或关闭失败保留原机器与 owner，按同一个绝对期限接续，不主动驱动回收。
 
 use super::observation::{Observation, ObservationResult, ObservationSlot, ObservationState};
 use super::{
@@ -26,11 +25,6 @@ pub trait ProcessOperations: Clone + core::fmt::Debug {
         control: erhino_shared::object::Handle,
         signals: ObjectSignals,
     ) -> Result<ObservationResult, SystemCallError>;
-    fn drain(
-        &self,
-        control: erhino_shared::object::Handle,
-        max_work: u32,
-    ) -> Result<erhino_shared::proc::ProcessDrainResult, SystemCallError>;
     fn query(
         &self,
         control: erhino_shared::object::Handle,
@@ -47,9 +41,8 @@ impl ProcessOperations for RealProcessOperations {
         control: erhino_shared::object::Handle,
         signals: ObjectSignals,
     ) -> Result<ObservationResult, SystemCallError> {
-        use erhino_shared::wait::{WaitItem, WaitReason};
-        let result =
-            libkernel::ipc::wait::wait_until(&[WaitItem::new(control, signals, 0)], Deadline::at(0))?;
+        use erhino_shared::wait::WaitReason;
+        let result = libkernel::ipc::wait::wait_until(control, signals, Deadline::at(0))?;
         Ok(
             if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
                 ObservationResult::TimedOut
@@ -57,13 +50,6 @@ impl ProcessOperations for RealProcessOperations {
                 ObservationResult::Ready(result.observed)
             },
         )
-    }
-    fn drain(
-        &self,
-        control: erhino_shared::object::Handle,
-        max_work: u32,
-    ) -> Result<erhino_shared::proc::ProcessDrainResult, SystemCallError> {
-        process::drain(control, max_work)
     }
     fn query(
         &self,
@@ -100,7 +86,6 @@ pub struct CollectorFailure<O: ProcessOperations = RealProcessOperations> {
 #[derive(Debug)]
 enum Phase {
     Waiting,
-    Draining,
     Verifying,
     Closing,
 }
@@ -116,7 +101,6 @@ pub struct Collector<O: ProcessOperations = RealProcessOperations> {
     snapshot: Option<erhino_shared::proc::ProcessSnapshot>,
     observation: ObservationState,
     retry_at: Option<u64>,
-    drain_remaining: u32,
     query_remaining: u32,
     ops: O,
 }
@@ -137,7 +121,6 @@ impl<O: ProcessOperations> Collector<O> {
             snapshot: None,
             observation: ObservationState::default(),
             retry_at: None,
-            drain_remaining: policy.drain_attempts,
             query_remaining: policy.query_attempts,
             ops,
         }
@@ -157,8 +140,7 @@ impl<O: ProcessOperations> Collector<O> {
 
     pub fn stage(&self) -> SupervisionStage {
         match self.phase {
-            Phase::Waiting => SupervisionStage::WaitReapable,
-            Phase::Draining => SupervisionStage::Drain,
+            Phase::Waiting => SupervisionStage::WaitDone,
             Phase::Verifying => SupervisionStage::VerifyDead,
             Phase::Closing => SupervisionStage::Close,
         }
@@ -208,7 +190,6 @@ impl<O: ProcessOperations> Collector<O> {
     /// 管理者明确给原机器续作额度；历史进度与正在关闭的快照不回退。
     pub fn replenish(&mut self, policy: SupervisionPolicy) {
         self.policy = policy;
-        self.drain_remaining = policy.drain_attempts;
         self.query_remaining = policy.query_attempts;
         self.observation.renew();
     }
@@ -223,7 +204,7 @@ impl<O: ProcessOperations> Collector<O> {
             return Err(SupervisionCause::System(SystemCallError::IllegalArgument));
         }
         if self.observation.accept(request, result, now)? {
-            self.phase = Phase::Draining;
+            self.phase = Phase::Verifying;
         }
         Ok(())
     }
@@ -245,7 +226,7 @@ impl<O: ProcessOperations> Collector<O> {
                 let new_attempt = self.observation.pending().is_none();
                 match self.observation.request(
                     self.control(),
-                    ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
+                    ObjectSignals::DONE,
                     now_ns,
                     self.policy,
                 ) {
@@ -256,35 +237,11 @@ impl<O: ProcessOperations> Collector<O> {
                         }
                         StepOutcome::Observe(request, self)
                     }
-                    Err(cause) => self.escalate(SupervisionStage::WaitReapable, cause),
+                    Err(cause) => self.escalate(SupervisionStage::WaitDone, cause),
                 }
             }
-            Phase::Draining => self.step_drain(now_ns),
             Phase::Verifying => self.step_verify(now_ns),
             Phase::Closing => self.step_close(),
-        }
-    }
-
-    fn step_drain(mut self, now_ns: u64) -> StepOutcome<O> {
-        if self.drain_remaining == 0 {
-            return self.escalate(SupervisionStage::Drain, SupervisionCause::Timeout);
-        }
-        self.drain_remaining -= 1;
-        self.progress.drain_attempts = self.progress.drain_attempts.saturating_add(1);
-        match self.ops.drain(self.control(), self.policy.drain_work) {
-            Ok(result) => {
-                self.progress.work_done = self.progress.work_done.saturating_add(result.work_done);
-                if result.status == erhino_shared::proc::ProcessDrainStatus::Complete as u32 {
-                    self.phase = Phase::Verifying;
-                }
-                StepOutcome::Continue(self)
-            }
-            Err(SystemCallError::ObjectBusy) => {
-                let at = self.retry_ns(now_ns);
-                self.retry_at = Some(at);
-                StepOutcome::RetryAt(at, self)
-            }
-            Err(error) => self.escalate(SupervisionStage::Drain, SupervisionCause::System(error)),
         }
     }
 
@@ -325,7 +282,7 @@ impl<O: ProcessOperations> Collector<O> {
     fn step_close(self) -> StepOutcome<O> {
         let snapshot = self.snapshot.expect("closing collector lost its snapshot");
         let control = self.control();
-        // SAFETY: 完整 Drain/Query 已验证 ProcessControl role 与稳定终态；
+        // SAFETY: DONE/Query 已验证稳定 ProcessControl 终态 与稳定终态；
         // 关闭的只有 control 本身，不涉及 Endpoint。
         if let Err(error) = self.ops.close(control) {
             return self.escalate(SupervisionStage::Close, SupervisionCause::System(error));
@@ -351,7 +308,7 @@ pub trait SuperviseSink<O: ProcessOperations = RealProcessOperations> {
     fn supervised(&mut self, result: SuperviseResult<O>);
 }
 
-/// 执行核心上的常驻监督任务：观察 REAPABLE/CLOSED，就绪后驱动
+/// 执行核心上的常驻监督任务：观察 DONE/CLOSED，就绪后驱动
 /// [`Collector`]，每 advance 一次有界内核调用，繁忙经任务期限重试。
 pub struct SuperviseTask<O: ProcessOperations = RealProcessOperations> {
     machine: Option<Collector<O>>,
@@ -429,7 +386,7 @@ impl<O: ProcessOperations, W: SuperviseSink<O>> Task<W> for SuperviseTask<O> {
                     .machine
                     .take()
                     .expect("failed collector remains owned")
-                    .fail(SupervisionStage::WaitReapable, cause);
+                    .fail(SupervisionStage::WaitDone, cause);
                 return Ok(self.deliver(world, Err(failure)));
             }
         }
@@ -513,11 +470,10 @@ mod tests {
     use super::*;
     use alloc::rc::Rc;
     use core::cell::RefCell;
-    use erhino_shared::proc::{ProcessDrainResult, ProcessDrainStatus};
 
     #[derive(Debug, Default)]
     struct FakeState {
-        drain_calls: usize,
+        query_calls: usize,
         close_failures: usize,
         close_successes: usize,
     }
@@ -533,27 +489,16 @@ mod tests {
         ) -> Result<ObservationResult, SystemCallError> {
             Ok(ObservationResult::Ready(signals))
         }
-        fn drain(
-            &self,
-            _control: erhino_shared::object::Handle,
-            _max_work: u32,
-        ) -> Result<ProcessDrainResult, SystemCallError> {
-            let mut state = self.0.borrow_mut();
-            state.drain_calls += 1;
-            if state.drain_calls == 1 {
-                return Err(SystemCallError::ObjectBusy);
-            }
-            Ok(ProcessDrainResult {
-                work_done: 1,
-                status: ProcessDrainStatus::Complete as u32,
-                reserved: 0,
-            })
-        }
 
         fn query(
             &self,
             _control: erhino_shared::object::Handle,
         ) -> Result<erhino_shared::proc::ProcessSnapshot, SystemCallError> {
+            let mut state = self.0.borrow_mut();
+            state.query_calls += 1;
+            if state.query_calls == 1 {
+                return Err(SystemCallError::ObjectBusy);
+            }
             Ok(erhino_shared::proc::ProcessSnapshot {
                 pid: 7,
                 parent_pid: 0,
@@ -578,7 +523,7 @@ mod tests {
     #[test]
     fn collector_busy_and_close_failure_preserve_machine() {
         let state = Rc::new(RefCell::new(FakeState {
-            drain_calls: 0,
+            query_calls: 0,
             close_failures: 1,
             close_successes: 0,
         }));
@@ -591,33 +536,25 @@ mod tests {
         let collector = match collector.step(0) {
             StepOutcome::Observe(request, mut collector) => {
                 collector
-                    .observe(
-                        request,
-                        ObservationResult::Ready(ObjectSignals::REAPABLE),
-                        1,
-                    )
+                    .observe(request, ObservationResult::Ready(ObjectSignals::DONE), 1)
                     .unwrap();
                 collector
             }
-            _ => panic!("unobserved process must not drain"),
+            _ => panic!("unobserved process must not verify"),
         };
         let collector = match collector.step(0) {
             StepOutcome::RetryAt(_, collector) => collector,
-            _ => panic!("first drain must report Busy"),
+            _ => panic!("first query must report Busy"),
         };
         let collector = match collector.step(100_000_000) {
             StepOutcome::Continue(collector) => collector,
-            _ => panic!("second drain must complete"),
+            _ => panic!("second query must complete"),
         };
         let failure = collector.fail_current(SupervisionCause::System(SystemCallError::ClockRange));
-        assert_eq!(failure.stage, SupervisionStage::VerifyDead);
+        assert_eq!(failure.stage, SupervisionStage::Close);
         assert_eq!(failure.progress.wait_attempts, 1);
-        assert_eq!(failure.progress.work_done, 1);
+        assert_eq!(failure.progress.query_attempts, 2);
         let collector = match failure.collector.step(100_000_000) {
-            StepOutcome::Continue(collector) => collector,
-            _ => panic!("query must advance to close"),
-        };
-        let collector = match collector.step(100_000_000) {
             StepOutcome::Escalate(failure) => {
                 assert_eq!(failure.stage, SupervisionStage::Close);
                 failure.collector

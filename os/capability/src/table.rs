@@ -8,13 +8,13 @@
 //! [`CapTable::restore`] 仅在资格仍有效且表未关闭时恢复原槽，否则释放。
 //! 仲裁依据预约身份与槽代次，不依据槽下标。
 
-use alloc::vec::Vec;
 use erhino_shared::object::{Handle, Rights};
+use funded_storage::{Buffer, Funding, StorageError};
 
 use crate::{Authority, HoldersError};
 
-/// 单进程 Handle 槽位上限。
-pub const DEFAULT_HANDLE_LIMIT: usize = 65_536;
+/// Handle 的 ABI 槽位宽度；实际保留容量同时受付款额度与分配约束。
+pub const DEFAULT_HANDLE_LIMIT: usize = u32::MAX as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableError {
@@ -27,6 +27,7 @@ pub enum TableError {
     ReachLimit,
     BadReservation,
     AllocationFailed,
+    FundingDenied,
     /// 表已关闭（进程退出），不再接受安装或返还。
     Closed,
     /// 对象已终结，不能再铸造 authority。
@@ -39,6 +40,14 @@ impl From<HoldersError> for TableError {
             HoldersError::Sealed => Self::Sealed,
             HoldersError::ReachLimit => Self::ReachLimit,
         }
+    }
+}
+
+fn storage_error<E>(error: StorageError<E>) -> TableError {
+    match error {
+        StorageError::Funding(_) => TableError::FundingDenied,
+        StorageError::Allocation => TableError::AllocationFailed,
+        StorageError::Layout => TableError::ReachLimit,
     }
 }
 
@@ -89,30 +98,32 @@ impl<A: Authority> Cap<A> {
 
     /// 移交时裁剪 rights：只能收窄，不改变计数。
     pub fn restrict(mut self, rights: Rights) -> Result<Self, (Self, TableError)> {
+        if let Err(error) = self.attenuate(rights) {
+            return Err((self, error));
+        }
+        Ok(self)
+    }
+
+    /// 已接管事务在业务提交后原位裁剪，不重铸 authority 或分配新容器。
+    pub fn attenuate(&mut self, rights: Rights) -> Result<(), TableError> {
         if !rights.is_known() || !rights.is_subset_of(self.rights) {
-            return Err((self, TableError::RightsDenied));
+            return Err(TableError::RightsDenied);
         }
         self.rights = rights;
-        Ok(self)
+        Ok(())
     }
 
     /// 放弃这份 authority。表内关闭、在途丢弃、事务释放与进程回收都经此处。
     pub fn release(mut self) -> Option<LastCapability<A>> {
         let object = self.object.take().expect("capability already released");
-        object
-            .holders()
-            .release()
-            .then_some(LastCapability(object))
+        object.holders().release().then_some(LastCapability(object))
     }
 }
 
 impl<A: Authority> Drop for Cap<A> {
     fn drop(&mut self) {
         // 审计探针：authority 必须显式 release 或移交。
-        debug_assert!(
-            self.object.is_none(),
-            "capability dropped without release"
-        );
+        debug_assert!(self.object.is_none(), "capability dropped without release");
     }
 }
 
@@ -150,15 +161,26 @@ pub enum TakeNext<A: Authority> {
 /// 一批尚未对进程可见的槽位。
 #[must_use = "a reservation must be committed or rolled back"]
 #[derive(Debug)]
-pub struct Reservation {
+pub struct Reservation<A: Authority, C> {
     token: u64,
-    handles: Vec<Handle>,
+    handles: Buffer<Handle, C>,
+    releases: Buffer<LastCapability<A>, C>,
 }
 
-impl Reservation {
+impl<A: Authority, C> Reservation<A, C> {
     pub fn handles(&self) -> &[Handle] {
         &self.handles
     }
+}
+
+/// 对象已提交后，返还资格丢失只能交出释放事件，不能推翻对象提交。
+#[derive(Debug)]
+pub enum Commit<A: Authority, C> {
+    Installed(Buffer<Handle, C>),
+    Released {
+        handles: Buffer<Handle, C>,
+        events: Buffer<LastCapability<A>, C>,
+    },
 }
 
 #[derive(Debug)]
@@ -177,24 +199,34 @@ struct Slot<A: Authority> {
 }
 
 #[derive(Debug)]
-pub struct CapTable<A: Authority> {
-    slots: Vec<Slot<A>>,
+pub struct CapTable<A: Authority, C> {
+    slots: Buffer<Slot<A>, C>,
     limit: usize,
     occupied: usize,
     next_token: u64,
     closed: bool,
 }
 
-impl<A: Authority> CapTable<A> {
-    pub fn try_new() -> Result<Self, TableError> {
-        Self::try_with_limit(DEFAULT_HANDLE_LIMIT)
+impl<A: Authority, C> Drop for CapTable<A, C> {
+    fn drop(&mut self) {
+        if self.occupied == 0 {
+            // 计数包含 Occupied/Claimed；归零证明没有槽内 authority。
+            // 剩余状态只有整数，不重跑已由 bounded 清理履行的责任。
+            self.slots.forget_values();
+        }
+    }
+}
+
+impl<A: Authority, C> CapTable<A, C> {
+    pub fn try_new<F: Funding<Charge = C>>(payer: &F) -> Result<Self, TableError> {
+        Self::try_with_limit(DEFAULT_HANDLE_LIMIT, payer)
     }
 
-    pub fn try_with_limit(limit: usize) -> Result<Self, TableError> {
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(1)
-            .map_err(|_| TableError::AllocationFailed)?;
+    pub fn try_with_limit<F: Funding<Charge = C>>(
+        limit: usize,
+        payer: &F,
+    ) -> Result<Self, TableError> {
+        let mut slots = Buffer::try_empty(1, payer).map_err(storage_error)?;
         // slot 0 永远无效。
         slots.push(Slot {
             generation: 0,
@@ -223,6 +255,9 @@ impl<A: Authority> CapTable<A> {
 
     /// 校验 rights 并借用 capability。
     pub fn get(&self, handle: Handle, required: Rights) -> Result<&Cap<A>, TableError> {
+        if self.closed {
+            return Err(TableError::Closed);
+        }
         let index = self.index(handle)?;
         match &self.slots[index].state {
             SlotState::Occupied(cap) if cap.rights.contains(required) => Ok(cap),
@@ -233,11 +268,15 @@ impl<A: Authority> CapTable<A> {
     }
 
     /// 立即安装。失败时返还 owner。
-    pub fn insert(&mut self, cap: Cap<A>) -> Result<Handle, (Cap<A>, TableError)> {
+    pub fn insert<F: Funding<Charge = C>>(
+        &mut self,
+        cap: Cap<A>,
+        payer: &F,
+    ) -> Result<Handle, (Cap<A>, TableError)> {
         if self.closed {
             return Err((cap, TableError::Closed));
         }
-        match self.reserve_slot(0) {
+        match self.reserve_slot(0, payer) {
             Ok(handle) => {
                 self.slots[handle.slot() as usize].state = SlotState::Occupied(cap);
                 self.occupied += 1;
@@ -308,17 +347,19 @@ impl<A: Authority> CapTable<A> {
     }
 
     /// 预留一批不可见槽位；失败不留下部分预留。
-    pub fn reserve(&mut self, count: usize) -> Result<Reservation, TableError> {
+    pub fn reserve<F: Funding<Charge = C>>(
+        &mut self,
+        count: usize,
+        payer: &F,
+    ) -> Result<Reservation<A, C>, TableError> {
         if self.closed {
             return Err(TableError::Closed);
         }
         let token = self.token()?;
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(count)
-            .map_err(|_| TableError::AllocationFailed)?;
+        let mut handles = Buffer::try_empty(count, payer).map_err(storage_error)?;
+        let releases = Buffer::try_empty(count, payer).map_err(storage_error)?;
         for _ in 0..count {
-            match self.reserve_slot(token) {
+            match self.reserve_slot(token, payer) {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     self.rollback_handles(&handles, token);
@@ -326,52 +367,69 @@ impl<A: Authority> CapTable<A> {
                 }
             }
         }
-        Ok(Reservation { token, handles })
+        Ok(Reservation {
+            token,
+            handles,
+            releases,
+        })
     }
 
-    /// 公开预留槽。数量不符时返还全部 capability 并撤销预留。
-    pub fn commit(
+    /// 公开预留槽；shut 后使用预约时预备的空间返还释放事件，提交不分配。
+    /// 数量/预约结构错误才返回 Err；shut 是正常的返还资格撤销。
+    pub fn commit<I: IntoIterator<Item = Cap<A>>>(
         &mut self,
-        reservation: Reservation,
-        caps: Vec<Cap<A>>,
-    ) -> Result<Vec<Handle>, (Vec<Cap<A>>, TableError)> {
-        let valid = reservation.handles.len() == caps.len()
-            && reservation
-                .handles
-                .iter()
-                .all(|h| self.is_reserved(*h, reservation.token));
-        if !valid || self.closed {
+        mut reservation: Reservation<A, C>,
+        caps: I,
+    ) -> Result<Commit<A, C>, (I::IntoIter, TableError)>
+    where
+        I::IntoIter: ExactSizeIterator,
+    {
+        let caps = caps.into_iter();
+        if reservation.handles.len() != caps.len() {
             self.rollback_handles(&reservation.handles, reservation.token);
-            let error = if valid {
-                TableError::Closed
-            } else {
-                TableError::BadReservation
-            };
-            return Err((caps, error));
+            return Err((caps, TableError::BadReservation));
+        }
+        if self.closed {
+            self.rollback_handles(&reservation.handles, reservation.token);
+            for cap in caps {
+                if let Some(event) = cap.release() {
+                    reservation.releases.push(event);
+                }
+            }
+            return Ok(Commit::Released {
+                handles: reservation.handles,
+                events: reservation.releases,
+            });
+        }
+        let valid = reservation
+            .handles
+            .iter()
+            .all(|h| self.is_reserved(*h, reservation.token));
+        if !valid {
+            self.rollback_handles(&reservation.handles, reservation.token);
+            return Err((caps, TableError::BadReservation));
         }
         for (handle, cap) in reservation.handles.iter().zip(caps) {
             self.slots[handle.slot() as usize].state = SlotState::Occupied(cap);
             self.occupied += 1;
         }
-        Ok(reservation.handles)
+        Ok(Commit::Installed(reservation.handles))
     }
 
     /// 撤销预留；代次前进，暂存数值永不复活。
-    pub fn rollback(&mut self, reservation: Reservation) {
+    pub fn rollback(&mut self, reservation: Reservation<A, C>) {
         self.rollback_handles(&reservation.handles, reservation.token);
     }
 
     /// 原子校验并摘出一批待移交的 capability（源需 `transfer` 位，rights 收窄）。
-    /// 任一校验失败表保持不变。`transfer` 由调用方传入，直到 shared ABI 迁移
-    /// 把 TRANSIT/GRANT 合并为 TRANSFER（见 capability 分案 ABI 迁移门）。
-    pub fn extract(
+    /// 任一校验失败表保持不变。`transfer` 由调用方根据运输/装配操作传入。
+    pub fn extract<F: Funding<Charge = C>>(
         &mut self,
         items: &[(Handle, Rights)],
         transfer: Rights,
-    ) -> Result<Vec<Cap<A>>, TableError> {
-        let mut out = Vec::new();
-        out.try_reserve_exact(items.len())
-            .map_err(|_| TableError::AllocationFailed)?;
+        payer: &F,
+    ) -> Result<Buffer<Cap<A>, C>, TableError> {
+        let mut out = Buffer::try_empty(items.len(), payer).map_err(storage_error)?;
         for (i, (handle, rights)) in items.iter().enumerate() {
             if items[..i].iter().any(|(prior, _)| prior == handle) {
                 return Err(TableError::DuplicateHandle);
@@ -446,7 +504,11 @@ impl<A: Authority> CapTable<A> {
     }
 
     /// 空槽线性扫描（已知简化）：满表前每次 O(n)；真实负载出现时改为空闲链。
-    fn reserve_slot(&mut self, token: u64) -> Result<Handle, TableError> {
+    fn reserve_slot<F: Funding<Charge = C>>(
+        &mut self,
+        token: u64,
+        payer: &F,
+    ) -> Result<Handle, TableError> {
         if let Some(index) =
             (1..self.slots.len()).find(|&i| matches!(self.slots[i].state, SlotState::Vacant))
         {
@@ -457,9 +519,20 @@ impl<A: Authority> CapTable<A> {
         if self.slots.len() > self.limit {
             return Err(TableError::ReachLimit);
         }
-        self.slots
-            .try_reserve(1)
-            .map_err(|_| TableError::AllocationFailed)?;
+        if self.slots.len() == self.slots.capacity() {
+            let target = self
+                .slots
+                .capacity()
+                .saturating_mul(2)
+                .max(self.slots.len() + 1)
+                .min(self.limit.saturating_add(1));
+            let mut prepared = Buffer::try_empty(target, payer).map_err(storage_error)?;
+            self.slots
+                .replace_storage(&mut prepared)
+                .expect("prepared handle slots fit current data");
+            // 已摘出的旧空存储完整释放；外层 HANDLE_TABLE 的秩允许短 Pool 退款边。
+            drop(prepared);
+        }
         let index = self.slots.len();
         self.slots.push(Slot {
             generation: 1,

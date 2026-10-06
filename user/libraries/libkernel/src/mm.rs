@@ -99,7 +99,36 @@ impl MappedRegion {
         protection: MemoryProtection,
         placement: Placement,
     ) -> Result<Self, SystemCallError> {
-        let source = object.handle().raw();
+        Self::map_source(
+            object.handle(),
+            object_offset,
+            bytes,
+            guard_before,
+            guard_after,
+            protection,
+            placement,
+        )
+    }
+
+    pub fn map_endpoint(
+        endpoint: &crate::ipc::tunnel::Endpoint,
+        bytes: usize,
+        protection: MemoryProtection,
+        placement: Placement,
+    ) -> Result<Self, SystemCallError> {
+        Self::map_source(endpoint.handle(), 0, bytes, 0, 0, protection, placement)
+    }
+
+    fn map_source(
+        source: erhino_shared::object::Handle,
+        object_offset: usize,
+        bytes: usize,
+        guard_before: usize,
+        guard_after: usize,
+        protection: MemoryProtection,
+        placement: Placement,
+    ) -> Result<Self, SystemCallError> {
+        let source = source.raw();
         Self::map(
             |result_address, cookie, address, placement_raw| {
                 Ok(MemoryMapRequest::new_object_view(

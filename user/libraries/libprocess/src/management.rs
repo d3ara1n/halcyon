@@ -12,16 +12,13 @@ use erhino_shared::{
     object::{Handle, ObjectSignals, Rights},
     proc::{
         ExecutionProfile, HandleGrant, JOB_ENUMERATE_MAX, JobMemberKind, JobState,
-        PROCESS_DRAIN_MAX, PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE,
-        PROCESS_USER_TOP, ProcessMapFlags, ProcessSnapshot, ThreadStartContext,
+        PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
+        ProcessMapFlags, ProcessSnapshot, ThreadStartContext,
     },
     startup::{EntryThreadDescriptor, StartupBlockHeader},
     time::Deadline,
 };
-use libkernel::{
-    ipc::object::{close, duplicate},
-    process,
-};
+use libkernel::process;
 
 pub mod job_driver;
 pub mod observation;
@@ -34,7 +31,7 @@ pub use supervise::{
     Collector, SUPERVISE_SOURCE, StepOutcome, SuperviseResult, SuperviseSink, SuperviseTask,
 };
 
-const MAX_MAP_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
+const MAX_MAP_BYTES: usize = erhino_shared::proc::PROCESS_MAP_MAX_BYTES;
 const MAX_WRITE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +63,7 @@ pub enum GrantOutcome {
 pub struct SpawnFailure {
     pub error: SpawnError,
     pub grants: GrantOutcome,
-    /// None 表示无需清理或 abandon/drain/close 已全部完成。
+    /// None 表示无需清理或 abandon/DONE/close 已全部完成。
     pub cleanup_error: Option<SystemCallError>,
 }
 
@@ -83,7 +80,7 @@ impl SpawnFailure {
 pub struct SpawnRequest<'a> {
     pub job: Handle,
     pub parent: CurrentProcessInfo,
-    /// 本次 spawn 的 backing Pool；库复制 GRANT-only authority 并由 Bind 消费。
+    /// 本次 spawn 的付款 Pool，创建要求 CREATE；调用不消费该 capability。
     pub memory_pool: Handle,
     pub image: &'a [u8],
     pub payload: &'a [u8],
@@ -165,18 +162,12 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
         return Err(SpawnFailure::retained(SpawnError::TooManyGrants));
     }
 
-    let created = process::create(request.job, request.control_rights)
+    let created = process::create(request.job, request.memory_pool, request.control_rights)
         .map_err(|error| SpawnFailure::retained(SpawnError::System(error)))?;
     let builder = created.builder;
 
     let mut grants_consumed = false;
     let result: Result<Spawned, SpawnError> = (|| {
-        let binding_pool = duplicate(request.memory_pool, Rights::GRANT)?;
-        if let Err(error) = process::bind_memory(builder, binding_pool) {
-            // Bind 失败契约保留 pool Handle。
-            let _ = unsafe { close(binding_pool) };
-            return Err(error.into());
-        }
         map_plan(builder, &image)?;
         write_segments(builder, &image, request.image)?;
         let (stack_start, stack_len) = map_stack(builder)?;
@@ -223,9 +214,26 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             tid: 0,
             reserved: 0,
             control: Handle::INVALID,
+            start: Handle::INVALID,
         };
         process::thread_create(builder, &descriptor, &mut thread_created)?;
-        granted[grant_len] = thread_created.control;
+        assert!(
+            !thread_created.start.is_valid(),
+            "Building thread returned a start ticket"
+        );
+        // ThreadCreate 的 Control 属于调用者表；跨进程出生块必须写 child-local 表项。
+        // SAFETY: ThreadCreate 刚交付唯一新表项，本函数完整接管失败关闭责任。
+        let control =
+            unsafe { libkernel::ipc::capability::Capability::from_raw(thread_created.control) };
+        process::grant(
+            builder,
+            &[erhino_shared::proc::HandleGrant {
+                handle: control.as_handle(),
+                rights: Rights::WAIT | Rights::DUPLICATE | Rights::GRANT | Rights::TRANSIT,
+            }],
+            &mut granted[grant_len..=grant_len],
+        )?;
+        let _ = control.into_raw(); // Grant 已消费调用者表项，责任由 child 表持有。
         let block = build_birth_block(
             created.pid,
             request.parent.pid(),
@@ -262,7 +270,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
 }
 
 /// 派生监督所需的成员/子域 control rights：kill+drain 需 MANAGE，等
-/// REAPABLE/CLOSED 需 WAIT，终态查询需 READ。调用者的 JobControl 必须
+/// DONE/CLOSED 需 WAIT，终态查询需 READ。调用者的 JobControl 必须
 /// 持其超集，否则派生返回 RightsDenied。
 pub const DERIVED_CONTROL_RIGHTS: Rights =
     Rights::from_raw(Rights::READ.raw() | Rights::WAIT.raw() | Rights::MANAGE.raw());
@@ -271,8 +279,6 @@ pub const DERIVED_CONTROL_RIGHTS: Rights =
 pub struct SupervisionPolicy {
     pub wait_timeout_ms: u64,
     pub wait_attempts: u32,
-    pub drain_work: u32,
-    pub drain_attempts: u32,
     pub query_attempts: u32,
     pub enumerate_stalls: u32,
 }
@@ -280,8 +286,6 @@ pub struct SupervisionPolicy {
 pub const DEFAULT_SUPERVISION_POLICY: SupervisionPolicy = SupervisionPolicy {
     wait_timeout_ms: 100,
     wait_attempts: 100,
-    drain_work: PROCESS_DRAIN_MAX,
-    drain_attempts: 64,
     query_attempts: 4,
     enumerate_stalls: 32,
 };
@@ -313,8 +317,7 @@ impl SupervisionTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionStage {
-    WaitReapable,
-    Drain,
+    WaitDone,
     VerifyDead,
     Close,
 }
@@ -335,12 +338,10 @@ pub enum SupervisionCause {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SupervisionProgress {
     pub wait_attempts: u32,
-    pub drain_attempts: u32,
-    pub work_done: u32,
     pub query_attempts: u32,
 }
 
-/// 失败继续持有完整 Process 机器，包含观察、Drain、Verify 或 Closing 阶段。
+/// 失败继续持有完整 Process 机器，包含观察、Verify 或 Closing 阶段。
 pub type SupervisionFailure = supervise::CollectorFailure;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,7 +351,7 @@ pub struct CollectedProcess {
     pub progress: SupervisionProgress,
 }
 
-/// 有限预算地等待、Drain 并核验一个 Process；成功后关闭 control，失败原样返还
+/// 有限预算地等待实际 DONE 并核验一个 Process；成功后关闭 control，失败原样返还
 /// authority 与进度，调用者可重试、handoff 或升级到所属 Job。
 #[expect(
     clippy::result_large_err,
@@ -362,10 +363,7 @@ pub fn collect_process(
 ) -> Result<CollectedProcess, SupervisionFailure> {
     let machine = Collector::new(target, policy);
     if !valid_policy(policy) {
-        return Err(machine.fail(
-            SupervisionStage::WaitReapable,
-            SupervisionCause::InvalidPolicy,
-        ));
+        return Err(machine.fail(SupervisionStage::WaitDone, SupervisionCause::InvalidPolicy));
     }
     collect_remaining(machine)
 }
@@ -432,7 +430,7 @@ pub enum JobKillCause {
 pub struct JobKillProgress {
     pub members_collected: u32,
     pub children_collected: u32,
-    pub process_work: u32,
+    pub process_queries: u32,
 }
 
 #[must_use = "failed JobKill retains the reported child/process authority"]
@@ -618,13 +616,7 @@ impl ProcessOperations for RealJobOperations {
     ) -> Result<ObservationResult, SystemCallError> {
         RealProcessOperations.probe(control, signals)
     }
-    fn drain(
-        &self,
-        control: Handle,
-        work: u32,
-    ) -> Result<erhino_shared::proc::ProcessDrainResult, SystemCallError> {
-        RealProcessOperations.drain(control, work)
-    }
+
     fn query(&self, control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
         RealProcessOperations.query(control)
     }
@@ -688,9 +680,9 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
     pub fn progress(&self) -> JobKillProgress {
         let mut progress = self.progress;
         if let Some(process) = self.frames.last().and_then(|frame| frame.process.as_ref()) {
-            progress.process_work = progress
-                .process_work
-                .saturating_add(process.progress().work_done);
+            progress.process_queries = progress
+                .process_queries
+                .saturating_add(process.progress().query_attempts);
         }
         progress
     }
@@ -713,7 +705,7 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                 frame
                     .process
                     .as_ref()
-                    .map_or(SupervisionStage::WaitReapable, Collector::stage),
+                    .map_or(SupervisionStage::WaitDone, Collector::stage),
             ),
             JobPhase::Children => JobKillStage::EnumerateChildren,
             JobPhase::DeriveChild => JobKillStage::DeriveChild,
@@ -875,10 +867,10 @@ impl<O: JobOperations + Clone + core::fmt::Debug> JobCollector<O> {
                     StepOutcome::Done(collected) => {
                         self.progress.members_collected =
                             self.progress.members_collected.saturating_add(1);
-                        self.progress.process_work = self
+                        self.progress.process_queries = self
                             .progress
-                            .process_work
-                            .saturating_add(collected.progress.work_done);
+                            .process_queries
+                            .saturating_add(collected.progress.query_attempts);
                         self.frames[i].page.position += 1;
                         self.frames[i].phase = JobPhase::DeriveMember;
                         Ok(JobCollectorEvent::Progress)
@@ -1072,9 +1064,6 @@ pub fn collect_job_remaining(mut collector: JobCollector) -> Result<(), JobKillF
 fn valid_policy(policy: SupervisionPolicy) -> bool {
     policy.wait_timeout_ms != 0
         && policy.wait_attempts != 0
-        && policy.drain_work != 0
-        && policy.drain_work <= PROCESS_DRAIN_MAX
-        && policy.drain_attempts != 0
         && policy.query_attempts != 0
         && policy.enumerate_stalls != 0
 }
@@ -1235,25 +1224,20 @@ mod tests {
     #[test]
     fn birth_block_keeps_direct_parent_for_child_and_grandchild() {
         let entry = EntryThreadDescriptor {
-            kind: 1,
-            version: 1,
+            kind: erhino_shared::startup::ENTRY_THREAD_SECTION_KIND,
+            version: erhino_shared::startup::ENTRY_THREAD_SECTION_VERSION,
             section_len: core::mem::size_of::<EntryThreadDescriptor>() as u32,
             control_index: 0,
             reserved: 0,
             stack_reservation_start: 0x1000,
             stack_reservation_len: 0x2000,
-            usable_start: 0x1800,
-            usable_len: 0x1800,
+            usable_start: 0x2000,
+            usable_len: 0x1000,
         };
         for (target, parent) in [(11, 7), (12, 11)] {
-            let block = build_birth_block(
-                target,
-                erhino_shared::proc::Pid::from_raw(parent),
-                &[Handle::from_raw(1)],
-                entry,
-                b"",
-            )
-            .expect("birth block construction must succeed");
+            let block =
+                build_birth_block(target, parent, &[Handle::from_raw(0x100000001)], entry, b"")
+                    .expect("birth block construction must succeed");
             let header = erhino_shared::startup::validate_startup_block(&block)
                 .expect("birth block validation must succeed");
             assert_eq!(header.parent_pid, parent);
@@ -1265,7 +1249,7 @@ mod tests {
         close_failures: usize,
         close_successes: usize,
         member: bool,
-        drain_calls: usize,
+        query_calls: usize,
     }
 
     #[derive(Debug, Clone)]
@@ -1360,29 +1344,13 @@ mod tests {
         ) -> Result<ObservationResult, SystemCallError> {
             Ok(ObservationResult::Ready(signals))
         }
-        fn drain(
-            &self,
-            _control: Handle,
-            _work: u32,
-        ) -> Result<erhino_shared::proc::ProcessDrainResult, SystemCallError> {
-            let mut state = self.state.borrow_mut();
-            assert!(state.member);
-            state.drain_calls += 1;
-            match state.drain_calls {
-                1 => Ok(erhino_shared::proc::ProcessDrainResult {
-                    work_done: 3,
-                    status: erhino_shared::proc::ProcessDrainStatus::More as u32,
-                    reserved: 0,
-                }),
-                2 => Err(SystemCallError::InternalError),
-                _ => Ok(erhino_shared::proc::ProcessDrainResult {
-                    work_done: 2,
-                    status: erhino_shared::proc::ProcessDrainStatus::Complete as u32,
-                    reserved: 0,
-                }),
-            }
-        }
+
         fn query(&self, _control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
+            let mut state = self.state.borrow_mut();
+            state.query_calls += 1;
+            if state.member && state.query_calls == 1 {
+                return Err(SystemCallError::InternalError);
+            }
             Ok(ProcessSnapshot {
                 pid: 7,
                 parent_pid: 0,
@@ -1450,7 +1418,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure.collector.pid(), 7);
         assert_eq!(failure.collector.wait_control().raw(), 0x1_0000_0001);
-        assert_eq!(failure.stage, SupervisionStage::WaitReapable);
+        assert_eq!(failure.stage, SupervisionStage::WaitDone);
         assert_eq!(failure.cause, SupervisionCause::InvalidPolicy);
 
         let failure = job_kill_with_policy(Handle::from_raw(0x2_0000_0001), policy).unwrap_err();
@@ -1460,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn job_failure_reports_current_process_work_without_double_counting_recovery() {
+    fn job_failure_reports_current_process_queries_without_double_counting_recovery() {
         let state = Rc::new(RefCell::new(FakeJobState {
             member: true,
             ..FakeJobState::default()
@@ -1485,15 +1453,15 @@ mod tests {
                     failed = true;
                     assert_eq!(
                         error.stage,
-                        JobKillStage::CollectMember(SupervisionStage::Drain)
+                        JobKillStage::CollectMember(SupervisionStage::VerifyDead)
                     );
-                    assert_eq!(error.progress.process_work, 3);
-                    assert_eq!(collector.progress().process_work, 3);
+                    assert_eq!(error.progress.process_queries, 1);
+                    assert_eq!(collector.progress().process_queries, 1);
                 }
             }
         }
         assert!(failed);
-        assert_eq!(collector.progress().process_work, 5);
+        assert_eq!(collector.progress().process_queries, 2);
         assert_eq!(collector.progress().members_collected, 1);
     }
 

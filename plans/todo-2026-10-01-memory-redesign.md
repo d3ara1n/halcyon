@@ -1,6 +1,6 @@
 # 内存管理与地址空间重构
 
-状态：**设计轮次 1 已定稿（见“目标设计”），剩余设计门待闭合；未实施**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有 backing/view/地址空间的结构、事务与退休、分页模式扩展及其模块边界；资金形式与预算交界见[预算分案](todo-2026-09-14-kernel-memory-budget.md)。首个范围为对象持有与释放链所需部分：地址空间整体退休、view/backing 归还、已提交修改的独立推进（见[进程回收定稿](todo-2026-09-29-process-automatic-reclamation.md#回收结构目标设计设计轮次-1已定稿)剩余门）。
+状态：**对象链所需backing/view/地址空间整体退休、已提交修改独立推进与真实消费者已实施交付；后续范围按本篇保留，实施与验证见[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有 backing/view/地址空间的结构、事务与退休、分页模式扩展及其模块边界；资金形式与预算交界见[预算分案](todo-2026-09-14-kernel-memory-budget.md)。下方现状事实是设计时旧基线，不代表当前模块面貌。
 
 ## 现状事实（当前分支只读盘点）
 

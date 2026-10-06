@@ -1,6 +1,6 @@
 # 进程终止后的自动资源回收
 
-状态：**回收结构设计轮次 1 已定稿（见“回收结构目标设计”），各 owner 剩余门未闭合，禁止直接施工**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有进程终止至资源收束的责任，不拥有各对象的清理算法。下文“推荐目标状态与 owner”起为前期推导，与定稿节冲突时以定稿节为准。
+状态：**本链自动回收已实施交付；最终轮次及各owner契约为依据，实施/组合验证由[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有进程终止至资源收束的责任，不拥有各对象的清理算法。现状盘点及“推荐目标状态与 owner”为设计时基线/前期推导，不是当前代码；与定稿节冲突时以定稿节为准。
 
 ## 目标与现状
 
@@ -142,6 +142,7 @@ Job 的创建/封口/递归终止政策在全项目任务模型中可以重审�
 
 - 骨架前失败：只做有界局部回滚，删 Job 占位并 try_commit，无遗留责任。
 - 骨架建立后：构造者已持构造 lease，预约在 Job 锁内转为持 Shell 的成员；此后构造失败走统一 Frozen；Frozen 后只按已准入规则完成/回滚。Job.Done 覆盖已建骨架的创建。
+- 施工接线中将构造 lease 明确落在 Shell gate 的 `construction_pending`：Job 成员提交与 Body 安装之间仍保留该 lease；Frozen 拒绝后续安装，构造者锁外回滚 Box 并解除 lease，回收 Work 在来源锁复检后方可 Settle，不能将暂时空的 Body 当作已退款。
 - Start 不持 gate 等 Builder lease：显式排除/转移自身准入，锁外停驻；Running 提交后的线程发布链由启动记录持有，Kill 与未入队线程交接有唯一完成者。
 
 ### 阶段补充
@@ -150,6 +151,29 @@ Job 的创建/封口/递归终止政策在全项目任务模型中可以重审�
 - 退出主动有界地从 Created/Ready/Waiting/调度容器摘线程以破 Shell→Body→Thread→Shell 环（保留 lifecycle.rs:20–24 责任，承载改为回收记录），不等 Arc 计数。
 - Thread/departure/结果记录的私有存储纳入 Settle 实际退休；独立 owner 合法存活者在实施时逐项列明。`ThreadDeparture` 的 `Weak<Process>` 改为已登记回执短期强持 Shell，完成时有界解除。
 - Settle 屏障 = Body 已拆且私有退款实际入账；Shell 不在清单内，消除“记录等自身载体退款”的自等待。
+
+### Shell 与 VM 进入门锁序（本链接入收敛）
+
+- Shell gate 沿用 `LIFECYCLE` 秩，只仲裁 Body/运行准入、Frozen 和 lease 计数；VM gate 为 `ADDRESS_SPACE` 秩，只仲裁入口开放、active 和曾接纳 hart。两锁不嵌套，不在 Shell gate 内取 VM gate。
+- dispatch 先在 Shell gate 取得运行准入并放锁，再在 VM gate 检查入口、同步当前 epoch 并登记 active；入口已关则回 Shell gate 归还准入，不能进入用户态。
+- 终止先在 Shell gate 冻结并放锁，再在 VM gate 关闭入口并取 active 快照，原样移交出生内嵌的 `RetireWork`；VM gate 是进入与封口的胜负点。此前登记的 hart 由离场清除或快照对应的 fence 覆盖，此后试图登记的 dispatcher 必被拒。离场先切内核 root、发布访问，再在 VM gate 注销 active，最后在 Shell gate 归还准入并按需唤醒回收 Work。若确需同时持锁，只允许 VM(300) → LIFECYCLE(600)，但本协议无需嵌套。
+- `RetireWork` 只在入口已封、active 归零、在途事务及访问租约清空后激活；对封口时保存的 active 快照一次全量 fence 并收齐 ack/归还运输槽，才开始摘 View/use 与页表并退款。不能在激活时重读 active 代替原快照，也不能在 drain 期间把屏障推给 `RetireSink`。
+
+### 成员回执与 Body 唯一所有权（2026-10 施工收敛）
+
+- `Box<ProcessBody>` 一直留在 Shell gate 下，直到已登记成员回执 `member_count=0`、外部短 Body lease、回执短访问与运行准入全为零，且独占退休已完成，才 `take_body`、锁外 drop。ThreadDeparture 不拥有独立成员表，也不跨等待长期持 Body lease。
+- Shell gate 的 `member_count` 是未结算 ThreadDeparture 的唯一真值；成员出生/登记在 gate 内增加，ThreadDeparture 摘成员后在 gate 内递减，任一归零转换取出预登记的回收唤醒票据并在锁外 wake。Body.members 的物理槽占用（含预留）仅供容量和稳定身份管理，不作为回收完成判断。
+- Frozen 关闭外部 syscall/Builder 的**新** Body 准入；已登记回执每步可取一份短 receipt access，修改 Body.members 后立即归还，不重新申请已封闭的外部权限。Shell gate 与成员表锁允许 Shell(600) → Members(610) 的出生原子登记，VM(300) 与 Shell(600) 仍不嵌套。
+- Frozen 后有界摘 Created/Ready/Waiting/调度容器责任；回收 Work 等外部短 lease、运行准入与 `member_count` 归零（arm 后在来源锁内复检），再置独占退休标志，逐步 ReleaseHandles/RetireSpace；此间 Box 留在 Shell，只有回收 Work 可短取字段。退休结束、回执短访问已退出后取 Body 并锁外析构，确认私有退款才发布 Dead。
+- ThreadDeparture 完成时先摘 Body 成员，归还 receipt access，再在 Shell gate 减 `member_count` 并锁外 wake；最后解除它对 Shell 的强持。最后 drop 不展开 Shell 的回收工作。
+- **Ready 发布闸门修正**：Frozen → WaitIngress → SweepMembers/Ready → WaitShell。原“先扫再等 external”会漏掉持有 Frozen 前短 lease、尚未入队的 Start。Shell 上一个原子 gate word 同时承载 Frozen bit 与 external/Ready 发布在途计数；Start 的 external lease 覆盖 Created→Ready 和实际入队，Waiting 唤醒在成员锁内以 CAS(`!Frozen`, +1) 登记发布或见 Frozen 后直接交回收，实际入队后才减计数。登记用 Acquire、入队后的递减用 Release、Frozen 置位用 AcqRel、WaitIngress 读零用 Acquire；减到零且已 Frozen 者在锁外 wake 已 arm 并复检的回收 Work。入队所需 Ready admission 必须在 CAS 前预留，登记后不得失败或等待；每线程同一时刻最多一份发布，溢出视结构错误。
+- **出生预约修正**：ThreadCreate 在准备期经 Job 链与 Shell 门受理成员预约，构造、用户输出失败则由仿射预约回滚。输出完成后已预付的成员提交在表锁外必成，Frozen/Seal 不取消先受理的预约；Body external lease 贯穿提交/票据 arm，使 WaitIngress 在预约结算后才扫描。表 shut 后的 capability 公开返回最后持有事件走正常放弃，不增加 Building 无票据的反向结算路径，具体安装预约由 capability 分案拥有。
+- 仅在成员状态锁内检查 Frozen 并置 Ready、锁外随后入队仍有窗口；共享 ingress 字覆盖此窗口。被 Frozen 拒绝的 Waiting 唤醒在同一成员锁内转待摘/请求离场回执，不能入队；SweepMembers 持相同锁逐槽摘，赢者唯一。已经入队被调度运行的线程由运行准入和离场回执归 WaitShell，不要求 SweepReady 再摘。
+
+### Job 完成资金与权限（2026-10 施工收敛）
+
+- JobCreate 接受 `parent JobControl[CREATE]` 与明确的 `Pool[CREATE]`；Job 本体 metadata 和出生即内嵌的完成 Work 从该 Pool 准入，WorkRecord 关联其维护 Account，Job 在完成前持续强持该 Pool。root Job 由 boot 的 root Pool 出资；ProcessCreate 仍独立要求自己的 Pool capability，Job 不提供隐式资金。
+- Seal 只切断创建/启动准入并发布有界 Job Work；Process Dead 摘成员与 child Job 完成后各自尝试提交 Job 完成，完成判定和唯一发布责任同 JobInner 锁内仲裁，锁外 Work 发布 CLOSED 并逐层摘父表。创建 Pool 与父 Job Pool 不要求同源，关 Pool capability 不撤销已准入责任。
 
 ### 终态与发布顺序
 

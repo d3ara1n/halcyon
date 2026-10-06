@@ -10,10 +10,11 @@ use erhino_shared::{
     call::SystemCallError,
     message::{HandleMove, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX},
     object::{
-        Handle, HandleDescription, HandlePair, HandleRole, ObjectSignals, Rights, SenderResult,
+        Handle, HandleDescription, HandlePair, ObjectKind, ObjectSignals, Rights, SenderResult,
     },
     time::Deadline,
-    wait::{WaitItem, WaitReason},
+    wait::WaitReason,
+    wait_set::MemberRequest,
 };
 
 #[derive(Debug)]
@@ -188,7 +189,7 @@ impl MailboxSender {
         owner: Capability,
     ) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
         let adopt = owner.description().and_then(|description| {
-            if description.role != HandleRole::MailboxSender as u32 {
+            if description.kind != ObjectKind::MailboxSender as u32 {
                 return Err(SystemCallError::WrongObjectType);
             }
             Ok(description)
@@ -241,7 +242,7 @@ impl SendOnce {
         owner: Capability,
     ) -> Result<(Self, HandleDescription), SenderAdoptFailure> {
         let adopt = owner.description().and_then(|description| {
-            if description.role != HandleRole::MailboxSenderOnce as u32 {
+            if description.kind != ObjectKind::MailboxOnceSender as u32 {
                 return Err(SystemCallError::WrongObjectType);
             }
             Ok(description)
@@ -290,7 +291,7 @@ impl Mailbox {
         owner: Capability,
     ) -> Result<(Self, HandleDescription), MailboxAdoptFailure> {
         let adopt = owner.description().and_then(|description| {
-            if description.role != HandleRole::MailboxOwner as u32 {
+            if description.kind != ObjectKind::MailboxReceiver as u32 {
                 return Err(SystemCallError::WrongObjectType);
             }
             Ok(description)
@@ -338,7 +339,7 @@ impl Mailbox {
         set: &super::wait_set::WaitSet,
         cookie: u64,
     ) -> Result<u64, SystemCallError> {
-        set.register(WaitItem::new(
+        set.register(MemberRequest::new(
             self.as_handle(),
             ObjectSignals::READABLE | ObjectSignals::CLOSED,
             cookie,
@@ -384,7 +385,7 @@ pub fn create(owner_rights: Rights, sender_rights: Rights) -> Result<HandlePair,
 
 /// 不附带能力的普通发送，不接受会消费另一 owner 的 send-once。
 pub fn send(mailbox: Handle, kind: u64, payload: &[u8]) -> Result<(), SystemCallError> {
-    if super::object::query(mailbox)?.role != HandleRole::MailboxSender as u32 {
+    if super::object::query(mailbox)?.kind != ObjectKind::MailboxSender as u32 {
         return Err(SystemCallError::WrongObjectType);
     }
     // SAFETY: 没有 move，目标普通 sender 不被消费。
@@ -474,16 +475,28 @@ pub fn discard(mailbox: Handle) -> Result<(), SystemCallError> {
     unsafe { sys_discard(mailbox) }
 }
 
-pub fn make_send_once(source: Handle, rights: Rights) -> Result<Handle, SystemCallError> {
-    let mut output = Handle::INVALID;
-    // SAFETY: 新派生项的原始消费责任完整交付调用者。
+pub fn make_send_once(source: Handle, rights: Rights) -> Result<HandlePair, SystemCallError> {
+    let mut output = HandlePair {
+        owner: Handle::INVALID,
+        peer: Handle::INVALID,
+    };
+    // SAFETY: 完整两项输出在同步调用期间有效，两个 capability 都交付调用者。
     unsafe { sys_mailbox_make_send_once(source, rights, &mut output) }?;
     Ok(output)
 }
 
-pub fn send_once(source: &MailboxSender, rights: Rights) -> Result<SendOnce, SystemCallError> {
-    let handle = make_send_once(source.as_handle(), rights)?;
-    Ok(SendOnce::derived(Capability::owned(handle)))
+#[derive(Debug)]
+pub struct ReplyPermit {
+    pub reply: SendOnce,
+    pub observation: Capability,
+}
+
+pub fn send_once(source: &MailboxSender, rights: Rights) -> Result<ReplyPermit, SystemCallError> {
+    let pair = make_send_once(source.as_handle(), rights)?;
+    Ok(ReplyPermit {
+        reply: SendOnce::derived(Capability::owned(pair.owner)),
+        observation: Capability::owned(pair.peer),
+    })
 }
 
 pub fn mint_sender(
@@ -514,11 +527,8 @@ pub fn wait_message_until(
             return Err(SystemCallError::DeadlineExpired);
         }
         let result = super::wait::wait_until(
-            &[WaitItem::new(
-                mailbox,
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                0,
-            )],
+            mailbox,
+            ObjectSignals::READABLE | ObjectSignals::CLOSED,
             deadline,
         )?;
         if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {

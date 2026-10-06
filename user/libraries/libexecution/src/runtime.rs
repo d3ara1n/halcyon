@@ -1,21 +1,25 @@
-//! 单 actor 执行运行体：独占观察集合，拥有来源登记寿命、迟到事件过滤、
+//! 单 actor 执行运行体：持有来源登记寿命、迟到事件过滤、
 //! 期限唤醒与公平任务推进。任务经 [`Requests`] 声明运行体请求，
-//! advance 返回后统一应用；业务不手工编排 token、rearm 或事件队列。
+//! advance 返回后统一应用；Assembly 独占集合接收，业务只声明登记/注销和推进。
 
-use crate::ExecutionResource;
-use crate::work_queue::{InsertFailure, WorkQueue};
-use alloc::vec::Vec;
+use crate::work_queue::{FinalizingStep, InsertFailure, WorkQueue};
+use crate::{
+    ExecutionResource,
+    source::{Registration, SourceOps},
+};
+use alloc::{boxed::Box, vec::Vec};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals},
     time::Deadline,
-    wait::WaitItem,
-    wait_set::{RECEIVE_MAX, ReadyRecord},
+    wait::WaitReason,
+    wait_set::{MemberRequest, ReadyRecord},
 };
 use libbudget::{AccountView, Charge};
 use ordered_table::OrderedTable;
-use timer_queue::{TimerQueue, TimerToken};
+use timer_queue::{TimerNode, TimerQueue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -35,11 +39,14 @@ pub type SourceKind = u64;
 
 /// 运行体签发的来源身份；对任务是不透明值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceId(u64);
+pub struct SourceId {
+    token: u64,
+    task: u64,
+}
 
 impl SourceId {
     pub fn token(self) -> u64 {
-        self.0
+        self.token
     }
 }
 
@@ -55,27 +62,11 @@ impl SourcePlan {
     }
 }
 
-/// 运行体依赖的观察与时间环境；真实实现是内核 WaitSet，host 测试用替身。
-pub trait SourceOps {
-    fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError>;
-    fn rearm(&self, token: u64) -> Result<u64, SystemCallError>;
-    fn remove_source(&self, token: u64) -> Result<(), SystemCallError>;
-    fn receive_into(&self, records: &mut [ReadyRecord]) -> Result<usize, SystemCallError>;
-    fn wait(&self, deadline: Deadline) -> Result<(), SystemCallError>;
-    fn now_ns(&self) -> Result<u64, SystemCallError>;
-}
-
-/// 可整体关闭的观察集合；真实实现即内核 WaitSet 的普通关闭。
-pub trait SourceSet: SourceOps + Sized {
-    fn close_set(self) -> Result<(), (Self, SystemCallError)>;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceEvent {
     pub source: SourceId,
     pub kind: SourceKind,
     pub observed: ObjectSignals,
-    pub error: u32,
 }
 
 /// 任务 advance 内可见的输入：已投递来源事件与期限命中。
@@ -139,7 +130,6 @@ enum RequestOperation<T> {
 struct PendingGate {
     task: u64,
     step: Step,
-    has_pending: bool,
     refused: bool,
     rejection: Option<SystemCallError>,
 }
@@ -147,8 +137,6 @@ struct PendingGate {
 enum SourceRequest {
     /// 登记意图统一为值计划，cookie 由运行体注入任务身份。
     Register { plan: SourcePlan, kind: SourceKind },
-    /// 重新武装一个仍需观察的来源；不声明即保持解除。
-    Rearm { source: SourceId },
     /// 撤销登记并释放其输入额度。
     Remove { source: SourceId },
 }
@@ -178,11 +166,11 @@ impl<T> Requests<T> {
         signals: ObjectSignals,
         kind: SourceKind,
     ) -> Result<(), SystemCallError> {
-        self.arm_source(SourcePlan::new(handle, signals), kind)
+        self.register(SourcePlan::new(handle, signals), kind)
             .map_err(|_| SystemCallError::ReachLimit)
     }
 
-    pub fn arm_source(&mut self, plan: SourcePlan, kind: SourceKind) -> Result<(), SourcePlan> {
+    pub fn register(&mut self, plan: SourcePlan, kind: SourceKind) -> Result<(), SourcePlan> {
         if self.operations.len() == REQUEST_CAPACITY {
             return Err(plan);
         }
@@ -191,15 +179,6 @@ impl<T> Requests<T> {
                 plan,
                 kind,
             }));
-        Ok(())
-    }
-
-    pub fn rearm(&mut self, source: SourceId) -> Result<(), SystemCallError> {
-        if self.operations.len() == REQUEST_CAPACITY {
-            return Err(SystemCallError::ReachLimit);
-        }
-        self.operations
-            .push(RequestOperation::Source(SourceRequest::Rearm { source }));
         Ok(())
     }
 
@@ -229,17 +208,19 @@ impl<T> Requests<T> {
 pub struct SourceEntry {
     task: u64,
     kind: SourceKind,
-    generation: u64,
-    armed: bool,
     removing: bool,
     input_index: usize,
     input_queued: bool,
     input_previous: u64,
     input_next: u64,
-    retire_timer: TimerToken,
-    pending: Option<SourceEvent>,
+    retire_timer: Pin<Box<TimerNode<u64>>>,
+    pending: Option<ObjectSignals>,
     _charge: Charge,
 }
+
+const SOURCE_INPUT_BYTES: usize =
+    ordered_table::PreparedEntry::<SourceEntry, ()>::allocation_bytes()
+        + core::mem::size_of::<TimerNode<u64>>();
 
 static RETIRED_CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
@@ -290,33 +271,23 @@ pub trait Task<W>: Sized {
 
 pub struct Runtime<T, S: SourceOps> {
     queue: WorkQueue<T>,
-    sources: OrderedTable<SourceEntry>,
-    set: Option<S>,
+    sources: OrderedTable<SourceEntry, ()>,
+    set: Registration<S>,
     account: AccountView<ExecutionResource>,
-    records: Vec<ReadyRecord>,
     scratch: Vec<SourceEvent>,
     phase: u8,
-    retire_cursor: Option<u64>,
     maintenance_phase: u8,
-    retire_phase: bool,
     retire_timers: TimerQueue<u64>,
     clock_now: u64,
-    source_ready: bool,
     pending_gate: Option<PendingGate>,
     requests: Requests<T>,
     _input_charge: Charge,
 }
 
 impl<T, S: SourceOps> Runtime<T, S> {
-    /// 接收、scratch 与唯一请求缓冲的预付存储。
     fn fixed_input_bytes(source_limit: usize) -> Result<usize, SystemCallError> {
-        RECEIVE_MAX
-            .checked_mul(core::mem::size_of::<ReadyRecord>())
-            .and_then(|bytes| {
-                source_limit
-                    .checked_mul(core::mem::size_of::<SourceEvent>())
-                    .and_then(|scratch| bytes.checked_add(scratch))
-            })
+        source_limit
+            .checked_mul(core::mem::size_of::<SourceEvent>())
             .and_then(|bytes| {
                 REQUEST_CAPACITY
                     .checked_mul(core::mem::size_of::<RequestOperation<T>>())
@@ -330,88 +301,61 @@ impl<T, S: SourceOps> Runtime<T, S> {
         Self::fixed_input_bytes(source_limit)?
             .checked_add(
                 source_limit
-                    .checked_mul(
-                        core::mem::size_of::<SourceEntry>() + core::mem::size_of::<ReadyRecord>(),
-                    )
+                    .checked_mul(SOURCE_INPUT_BYTES)
                     .ok_or(SystemCallError::ReachLimit)?,
             )
             .ok_or(SystemCallError::ReachLimit)
     }
 
     pub fn new(
-        set: S,
+        set: Registration<S>,
         task_limit: usize,
         source_limit: usize,
         account: &AccountView<ExecutionResource>,
     ) -> Result<Self, SystemCallError> {
-        Self::try_new(set, task_limit, source_limit, account).map_err(|(set, error)| {
-            drop(set);
-            error
-        })
-    }
-
-    pub fn try_new(
-        set: S,
-        task_limit: usize,
-        source_limit: usize,
-        account: &AccountView<ExecutionResource>,
-    ) -> Result<Self, (S, SystemCallError)> {
         if task_limit == 0 || source_limit == 0 {
-            return Err((set, SystemCallError::IllegalArgument));
+            return Err(SystemCallError::IllegalArgument);
         }
-        let prepared = (|| -> Result<_, SystemCallError> {
-            let input_charge = account.acquire(
-                ExecutionResource::InputBytes,
-                Self::fixed_input_bytes(source_limit)?,
-            )?;
-            let requests = Requests::new()?;
-            let mut records = Vec::new();
-            records
-                .try_reserve_exact(RECEIVE_MAX)
-                .map_err(|_| SystemCallError::OutOfMemory)?;
-            records.resize(
-                RECEIVE_MAX,
-                ReadyRecord {
-                    token: 0,
-                    arm_generation: 0,
-                    cookie: 0,
-                    observed: ObjectSignals::NONE,
-                    reason: 0,
-                    error: 0,
-                },
-            );
-            let mut scratch: Vec<SourceEvent> = Vec::new();
-            scratch
-                .try_reserve_exact(source_limit)
-                .map_err(|_| SystemCallError::OutOfMemory)?;
-            let queue = WorkQueue::new(task_limit)?;
-            Ok((input_charge, requests, records, scratch, queue))
-        })();
-        let (input_charge, requests, records, scratch, queue) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return Err((set, error)),
-        };
+        if set.failed() {
+            return Err(SystemCallError::ObjectClosed);
+        }
+        let input_charge = account.acquire(
+            ExecutionResource::InputBytes,
+            Self::fixed_input_bytes(source_limit)?,
+        )?;
+        let requests = Requests::new()?;
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(source_limit)
+            .map_err(|_| SystemCallError::OutOfMemory)?;
+        let queue = WorkQueue::new(task_limit)?;
         Ok(Self {
-            set: Some(set),
+            set,
             queue,
             sources: OrderedTable::new(source_limit),
             account: account.clone(),
-            records,
             scratch,
             phase: 0,
-            retire_cursor: None,
             maintenance_phase: 0,
-            retire_phase: false,
             retire_timers: TimerQueue::new(0),
             clock_now: 0,
-            source_ready: false,
             pending_gate: None,
             requests,
             _input_charge: input_charge,
         })
     }
 
+    pub(crate) fn binding(&self) -> &Registration<S> {
+        &self.set
+    }
+
     pub fn spawn(&mut self, task: T, max_sources: usize) -> Result<u64, InsertFailure<T>> {
+        if self.set.failed() {
+            return Err(InsertFailure {
+                task,
+                error: SystemCallError::ObjectClosed,
+            });
+        }
         self.queue.insert(task, max_sources, &self.account)
     }
 
@@ -456,6 +400,12 @@ impl<T, S: SourceOps> Runtime<T, S> {
     where
         T: Task<W, Family = T>,
     {
+        if self.set.failed() {
+            return Err(TaskFailure {
+                task: 0,
+                error: SystemCallError::ObjectClosed,
+            });
+        }
         if max_work == 0 {
             return Err(TaskFailure {
                 task: 0,
@@ -472,14 +422,13 @@ impl<T, S: SourceOps> Runtime<T, S> {
                 0 => {
                     let now = self
                         .set
-                        .as_ref()
-                        .expect("runtime set already closed")
+                        .set()
                         .now_ns()
                         .map_err(|error| TaskFailure { task: 0, error })?;
                     self.clock_now = now;
                     self.queue.expire(now, budget)
                 }
-                1 => self.receive(world, budget)?,
+                1 => self.retire(world, budget),
                 _ => self
                     .advance_one(world, budget)?
                     .map_or(0, |advance| advance.work_done),
@@ -493,20 +442,12 @@ impl<T, S: SourceOps> Runtime<T, S> {
     pub fn drive_state(&self) -> DriveState {
         if self.queue.is_empty() && self.sources.is_empty() && self.pending_gate.is_none() {
             DriveState::Drained
-        } else if self.queue.has_ready()
-            || self.pending_gate.is_some()
-            || self.source_ready
-            || self.maintenance_ready()
+        } else if self.queue.has_ready() || self.pending_gate.is_some() || self.maintenance_ready()
         {
             DriveState::Runnable
         } else {
             DriveState::Waiting(self.next_deadline())
         }
-    }
-
-    /// 外层组合等待获得集合就绪后调用；事件仍由本运行体独占接收。
-    pub fn notified(&mut self) {
-        self.source_ready = true;
     }
 
     /// 错误任务保留原输入、来源和额度；其他任务继续推进。
@@ -516,31 +457,6 @@ impl<T, S: SourceOps> Runtime<T, S> {
         retry_at: Option<u64>,
     ) -> Result<(), SystemCallError> {
         self.queue.defer(id, retry_at)
-    }
-
-    /// 同步门面仍使用与外层组合驱动相同的状态与绝对等待。
-    pub fn run<W>(&mut self, world: &mut W, max_work: usize) -> Result<(), TaskFailure>
-    where
-        T: Task<W, Family = T>,
-    {
-        loop {
-            if self.drive_state() == DriveState::Drained {
-                return Ok(());
-            }
-            self.turn(world, max_work)?;
-            match self.drive_state() {
-                DriveState::Drained => return Ok(()),
-                DriveState::Runnable => {}
-                DriveState::Waiting(deadline) => {
-                    self.set
-                        .as_ref()
-                        .expect("runtime set already closed")
-                        .wait(deadline)
-                        .map_err(|error| TaskFailure { task: 0, error })?;
-                    self.notified();
-                }
-            }
-        }
     }
 
     fn maintenance_ready(&self) -> bool {
@@ -571,6 +487,12 @@ impl<T, S: SourceOps> Runtime<T, S> {
     where
         T: Task<W, Family = T>,
     {
+        if self.set.failed() {
+            return Err(TaskFailure {
+                task: 0,
+                error: SystemCallError::ObjectClosed,
+            });
+        }
         if max_work == 0 {
             return Err(TaskFailure {
                 task: 0,
@@ -592,82 +514,64 @@ impl<T, S: SourceOps> Runtime<T, S> {
     /// 任务清空且来源已全部退休后收束观察集合；失败原样返还运行体。
     #[expect(
         clippy::result_large_err,
-        reason = "关闭失败返还仍拥有任务的运行时，错误路径不分配"
+        reason = "关闭失败返还仍拥有任务的运行体，错误路径不分配"
     )]
-    pub fn close(mut self) -> Result<(), (Self, SystemCallError)>
-    where
-        S: SourceSet,
-    {
+    pub fn close(self) -> Result<(), (Self, SystemCallError)> {
         if self.pending_gate.is_some() || !self.queue.is_empty() || !self.sources.is_empty() {
             return Err((self, SystemCallError::ObjectBusy));
         }
-        let set = self.set.take().expect("runtime set already closed");
-        match set.close_set() {
-            Ok(()) => Ok(()),
-            Err((set, error)) => {
-                self.set = Some(set);
-                Err((self, error))
-            }
-        }
+        Ok(())
     }
 
-    fn receive<W>(&mut self, world: &mut W, budget: usize) -> Result<usize, TaskFailure>
+    fn retire<W>(&mut self, world: &mut W, budget: usize) -> usize
     where
         T: Task<W, Family = T>,
     {
-        let phase = self.maintenance_phase;
-        self.maintenance_phase = (self.maintenance_phase + 1) % 3;
-        if phase == 1 {
-            return Ok(self.retry_removals(world, budget));
-        }
-        if phase == 2 {
-            return Ok(usize::from(self.queue.retire_one()));
-        }
-        let capacity = budget.min(RECEIVE_MAX);
-        let count = match self
-            .set
-            .as_ref()
-            .expect("runtime set already closed")
-            .receive_into(&mut self.records[..capacity])
-        {
-            Ok(count) => count,
-            Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => 0,
-            Err(error) => return Err(TaskFailure { task: 0, error }),
-        };
-        self.source_ready = count == capacity;
         let mut used = 0;
-        for index in 0..count {
-            let record = self.records[index];
-            self.route(record);
-            // 丢弃旧代次同样消费一个接收工作单位。
+        while used < budget {
+            let mut progressed = false;
+            for _ in 0..2 {
+                self.maintenance_phase ^= 1;
+                if self.maintenance_phase == 0 {
+                    match self.queue.finalize_one() {
+                        FinalizingStep::Idle => continue,
+                        FinalizingStep::Source(token) => self.begin_remove(token),
+                        FinalizingStep::Progress => {}
+                    }
+                } else {
+                    let Some((at, &token)) = self.retire_timers.peek() else {
+                        continue;
+                    };
+                    if at > self.clock_now {
+                        continue;
+                    }
+                    let _ = self.drop_source(world, token);
+                }
+                progressed = true;
+                break;
+            }
+            if !progressed {
+                break;
+            }
             used += 1;
         }
-        Ok(used)
+        used
     }
 
-    /// 按令牌路由就绪记录：迟到代次丢弃，当前代次写入预付槽并唤醒任务。
-    fn route(&mut self, record: ReadyRecord) -> bool {
+    /// Assembly 交付纯电平提示；cookie 是全局任务身份，token 在同一集合不复用。
+    pub fn feed(&mut self, record: ReadyRecord) -> bool {
         let Some(entry) = self.sources.get_mut(record.token) else {
             return false;
         };
-        if entry.removing {
+        if entry.removing || entry.task != record.cookie || record.reserved != 0 {
             return false;
         }
-        if entry.generation != record.arm_generation {
-            return false;
-        }
-        if entry.pending.is_some() {
-            // 不变量防御：预付槽未消费时不应收到当前代次记录。保持解除，
-            // 消费后的重新武装会原子重观察电平，不覆盖未消费事实。
-            return false;
-        }
-        entry.pending = Some(SourceEvent {
-            source: SourceId(record.token),
-            kind: entry.kind,
-            observed: record.observed,
-            error: record.error,
-        });
-        entry.armed = false;
+        let observed = match WaitReason::from_u32(record.reason) {
+            Some(WaitReason::Signaled) => record.observed,
+            Some(WaitReason::Closed) => record.observed | ObjectSignals::CLOSED,
+            _ => return false,
+        };
+        entry.pending = Some(entry.pending.unwrap_or(ObjectSignals::NONE) | observed);
         let task = entry.task;
         self.enqueue_input(record.token, false);
         self.queue
@@ -753,46 +657,18 @@ impl<T, S: SourceOps> Runtime<T, S> {
             return None;
         }
         self.unlink_input(token);
-        self.sources
+        let entry = self
+            .sources
             .get_mut(token)
-            .expect("queued source remains owned")
-            .pending
-            .take()
-    }
-
-    /// 新退休来源的发现与已登记退休公平轮转；每次探查也计费。
-    fn retry_removals<W>(&mut self, world: &mut W, budget: usize) -> usize
-    where
-        T: Task<W, Family = T>,
-    {
-        let mut used = 0;
-        while used < budget {
-            self.retire_phase = !self.retire_phase;
-            if self.retire_phase && self.queue.has_unmarked_sources() {
-                let next = self
-                    .sources
-                    .next_after(self.retire_cursor.as_ref())
-                    .or_else(|| self.sources.next_after(None))
-                    .map(|(&token, entry)| (token, entry.task, entry.removing));
-                if let Some((token, task, removing)) = next {
-                    self.retire_cursor = Some(token);
-                    if !removing && self.queue.is_finalizing(task) {
-                        self.begin_remove(token);
-                    }
-                }
-                used += 1;
-                continue;
-            }
-            let Some((_, at, &token)) = self.retire_timers.peek() else {
-                break;
-            };
-            if at > self.clock_now {
-                break;
-            }
-            let _ = self.drop_source(world, token);
-            used += 1;
-        }
-        used
+            .expect("queued source remains owned");
+        entry.pending.take().map(|observed| SourceEvent {
+            source: SourceId {
+                token,
+                task: entry.task,
+            },
+            kind: entry.kind,
+            observed,
+        })
     }
 
     /// 从活动输入槽摘除，保留独立退休记录与额度直到真实注销成功。
@@ -806,20 +682,25 @@ impl<T, S: SourceOps> Runtime<T, S> {
         }
         entry.removing = true;
         entry.pending = None;
-        entry.armed = false;
         let task = entry.task;
         let index = entry.input_index;
-        let timer = entry.retire_timer;
         if let Some(moved) = self.queue.detach_source(task, index) {
             self.sources
                 .get_mut(moved)
                 .expect("moved source must remain owned")
                 .input_index = index;
         }
-        assert!(
-            self.retire_timers.reschedule(timer, self.clock_now),
-            "source retirement timer must exist"
-        );
+        let node = self
+            .sources
+            .get(token)
+            .expect("retiring source lost storage")
+            .retire_timer
+            .as_ref();
+        // SAFETY: actor 独占 runtime，节点 Box pin 在来源出生时预付，取消后再注册。
+        unsafe {
+            self.retire_timers.cancel(node);
+            self.retire_timers.register(node, self.clock_now, token);
+        }
     }
 
     /// 一次注销；失败只改期该来源自己的预付槽，不影响其他来源。
@@ -831,39 +712,51 @@ impl<T, S: SourceOps> Runtime<T, S> {
             return Ok(());
         }
         self.begin_remove(token);
-        let result = self
-            .set
-            .as_ref()
-            .expect("runtime set already closed")
-            .remove_source(token);
+        let result = self.set.set().remove_source(token);
         match result {
             Ok(()) | Err(SystemCallError::ObjectNotFound) => {
                 let entry = self
                     .sources
                     .remove(token)
+                    .map(ordered_table::PreparedEntry::into_value)
                     .expect("retiring source must remain owned");
-                self.retire_timers.cancel(entry.retire_timer);
+                // SAFETY: entry 已摘但 Box 节点仍存活，队列由本 actor 独占。
+                unsafe {
+                    self.retire_timers.cancel(entry.retire_timer.as_ref());
+                }
                 self.queue.source_retired(entry.task);
                 self.queue
                     .get_task_mut(entry.task)
                     .expect("source task must remain owned")
-                    .unregistered(world, entry.kind, SourceId(token));
+                    .unregistered(
+                        world,
+                        entry.kind,
+                        SourceId {
+                            token,
+                            task: entry.task,
+                        },
+                    );
                 self.queue
                     .schedule(entry.task)
                     .expect("source task must remain owned");
                 Ok(())
             }
             Err(error) => {
-                let timer = self
+                let node = self
                     .sources
                     .get(token)
                     .expect("failed source must remain owned")
-                    .retire_timer;
-                assert!(
-                    self.retire_timers
-                        .reschedule(timer, self.clock_now.saturating_add(1_000_000)),
-                    "source retirement timer must exist"
-                );
+                    .retire_timer
+                    .as_ref();
+                // SAFETY: actor 独占，来源记录保持 Box 存活，取消/注册不分配。
+                unsafe {
+                    self.retire_timers.cancel(node);
+                    self.retire_timers.register(
+                        node,
+                        self.clock_now.saturating_add(1_000_000),
+                        token,
+                    );
+                }
                 RETIRED_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
                 Err(error)
             }
@@ -889,8 +782,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         }
         let now = self
             .set
-            .as_ref()
-            .expect("runtime set already closed")
+            .set()
             .now_ns()
             .map_err(|error| TaskFailure { task: 0, error })?;
         self.clock_now = now;
@@ -933,7 +825,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
                     entry.pending.is_none(),
                     "pending source input restored twice"
                 );
-                entry.pending = Some(event);
+                entry.pending = Some(event.observed);
                 self.enqueue_input(event.source.token(), true);
             }
         }
@@ -942,12 +834,15 @@ impl<T, S: SourceOps> Runtime<T, S> {
         }
         let has_pending = self.queue.slot(id).is_some_and(|slot| slot.input_head != 0) || timed_out;
         let deadline = self.task_deadline::<W>(id);
+        let updated = self.queue.update_deadline(id, deadline);
+        let result = match (result, updated) {
+            (Ok(advance), Ok(())) => Ok(advance),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
         let mut advance = match result {
             Ok(advance) if advance.work_done <= budget => advance,
             result => {
                 let error = result.err().unwrap_or(SystemCallError::InternalError);
-                // 即使进入失败 Gate/Hold，也保留任务当前的业务期限。
-                let _ = self.queue.update_deadline(id, deadline);
                 if self.requests.operations.is_empty() {
                     self.queue
                         .schedule(id)
@@ -956,7 +851,6 @@ impl<T, S: SourceOps> Runtime<T, S> {
                     self.pending_gate = Some(PendingGate {
                         task: id,
                         step: Step::Runnable,
-                        has_pending,
                         refused: false,
                         rejection: Some(error),
                     });
@@ -969,7 +863,6 @@ impl<T, S: SourceOps> Runtime<T, S> {
             self.pending_gate = Some(PendingGate {
                 task: id,
                 step: advance.step,
-                has_pending,
                 refused: false,
                 rejection: None,
             });
@@ -1006,27 +899,27 @@ impl<T, S: SourceOps> Runtime<T, S> {
         T: Task<W, Family = T>,
     {
         let source = match request {
-            SourceRequest::Rearm { source } | SourceRequest::Remove { source } => source,
+            SourceRequest::Remove { source } => source,
             _ => return false,
         };
+        if source.task != task {
+            self.queue
+                .get_task_mut(task)
+                .expect("source requester remains owned")
+                .refused(
+                    world,
+                    RequestFailure::Source {
+                        kind: 0,
+                        error: SystemCallError::ObjectNotFound,
+                    },
+                );
+            return true;
+        }
         let Some(entry) = self.sources.get(source.token()) else {
             return false;
         };
-        if entry.task == task {
-            return false;
-        }
-        let kind = entry.kind;
-        self.queue
-            .get_task_mut(task)
-            .expect("requesting task remains owned")
-            .refused(
-                world,
-                RequestFailure::Source {
-                    kind,
-                    error: SystemCallError::ObjectNotFound,
-                },
-            );
-        true
+        assert_eq!(entry.task, task, "source identity changed owner");
+        false
     }
 
     fn reject_operation<W>(
@@ -1069,12 +962,6 @@ impl<T, S: SourceOps> Runtime<T, S> {
                 }
                 let (kind, notify) = match request {
                     SourceRequest::Register { kind, .. } => (kind, true),
-                    SourceRequest::Rearm { source } => (
-                        self.sources
-                            .get(source.token())
-                            .map_or(0, |entry| entry.kind),
-                        true,
-                    ),
                     SourceRequest::Remove { source } => {
                         let _ = self.drop_source(world, source.token());
                         (0, false)
@@ -1100,8 +987,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
     {
         let now = self
             .set
-            .as_ref()
-            .expect("runtime set remains owned")
+            .set()
             .now_ns()
             .map_err(|error| TaskFailure { task: 0, error })?;
         self.clock_now = now;
@@ -1116,6 +1002,13 @@ impl<T, S: SourceOps> Runtime<T, S> {
                 gate.refused = true;
             }
         }
+        let deadline = self.task_deadline::<W>(gate.task);
+        if let Err(error) = self.queue.update_deadline(gate.task, deadline) {
+            gate.rejection = Some(error);
+            let task = gate.task;
+            self.pending_gate = Some(gate);
+            return Err(TaskFailure { task, error });
+        }
         if !self.requests.operations.is_empty() {
             self.pending_gate = Some(gate);
             return Ok(Some(Advance {
@@ -1129,11 +1022,10 @@ impl<T, S: SourceOps> Runtime<T, S> {
             gate.step
         };
         let deadline = self.task_deadline::<W>(gate.task);
-        let has_pending = gate.has_pending
-            || self
-                .queue
-                .slot(gate.task)
-                .is_some_and(|slot| slot.timed_out);
+        let has_pending = self
+            .queue
+            .slot(gate.task)
+            .is_some_and(|slot| slot.input_head != 0 || slot.timed_out);
         self.queue
             .finish_advance(gate.task, deadline, step, has_pending)
             .map_err(|error| TaskFailure {
@@ -1213,23 +1105,6 @@ impl<T, S: SourceOps> Runtime<T, S> {
                                 );
                             true
                         }
-                        SourceRequest::Rearm { source } => {
-                            let kind = self
-                                .sources
-                                .get(source.token())
-                                .map_or(0, |entry| entry.kind);
-                            self.queue
-                                .get_task_mut(task)
-                                .expect("requesting task disappeared before Complete refusal")
-                                .refused(
-                                    world,
-                                    RequestFailure::Source {
-                                        kind,
-                                        error: SystemCallError::IllegalArgument,
-                                    },
-                                );
-                            true
-                        }
                     };
                 }
                 match request {
@@ -1251,22 +1126,6 @@ impl<T, S: SourceOps> Runtime<T, S> {
                             }
                         }
                     }
-                    SourceRequest::Rearm { source } => {
-                        let kind = self
-                            .sources
-                            .get(source.token())
-                            .map_or(0, |entry| entry.kind);
-                        match self.rearm_source(source.token()) {
-                            Ok(()) => false,
-                            Err(error) => {
-                                self.queue
-                                    .get_task_mut(task)
-                                    .expect("requesting task disappeared before Gate refusal")
-                                    .refused(world, RequestFailure::Source { kind, error });
-                                true
-                            }
-                        }
-                    }
                     SourceRequest::Remove { source } => {
                         let _ = self.drop_source(world, source.token());
                         false
@@ -1280,8 +1139,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         &mut self,
         task: u64,
         kind: SourceKind,
-        generation: u64,
-    ) -> Result<ordered_table::PreparedEntry<SourceEntry>, SystemCallError> {
+    ) -> Result<ordered_table::PreparedEntry<SourceEntry, ()>, SystemCallError> {
         let slot = self
             .queue
             .slot(task)
@@ -1290,23 +1148,15 @@ impl<T, S: SourceOps> Runtime<T, S> {
             return Err(SystemCallError::ReachLimit);
         }
         let input_index = slot.sources.len();
-        let charge = self.account.acquire(
-            ExecutionResource::InputBytes,
-            core::mem::size_of::<SourceEntry>() + core::mem::size_of::<ReadyRecord>(),
-        )?;
-        let retire_timer = self
-            .retire_timers
-            .try_register(0, 0)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
-        assert!(
-            self.retire_timers.park(retire_timer),
-            "new source timer must exist"
+        let charge = self
+            .account
+            .acquire(ExecutionResource::InputBytes, SOURCE_INPUT_BYTES)?;
+        let retire_timer = Box::into_pin(
+            Box::try_new(TimerNode::new()).map_err(|_| SystemCallError::OutOfMemory)?,
         );
         let entry = SourceEntry {
             task,
             kind,
-            generation,
-            armed: true,
             removing: false,
             input_index,
             input_queued: false,
@@ -1316,21 +1166,20 @@ impl<T, S: SourceOps> Runtime<T, S> {
             pending: None,
             _charge: charge,
         };
-        self.sources.prepare_insert(0, entry).map_err(|failure| {
-            let (entry, error) = match failure {
-                ordered_table::InsertError::Limit(entry) => (entry, SystemCallError::ReachLimit),
-                ordered_table::InsertError::Allocation(entry) => {
-                    (entry, SystemCallError::OutOfMemory)
-                }
-            };
-            self.retire_timers.cancel(entry.retire_timer);
-            error
-        })
-    }
-
-    fn cancel_prepared_source(&mut self, prepared: ordered_table::PreparedEntry<SourceEntry>) {
-        self.retire_timers
-            .cancel(prepared.into_value().retire_timer);
+        self.sources
+            .prepare_insert(0, entry, &libbudget::AllocatorBacked)
+            .map_err(|failure| {
+                let (entry, error) = match failure {
+                    ordered_table::InsertError::Limit(entry) => {
+                        (entry, SystemCallError::ReachLimit)
+                    }
+                    ordered_table::InsertError::Storage(error, entry) => {
+                        (entry, libbudget::allocator_error(error))
+                    }
+                };
+                drop(entry);
+                error
+            })
     }
 
     fn add_source(
@@ -1339,19 +1188,18 @@ impl<T, S: SourceOps> Runtime<T, S> {
         plan: SourcePlan,
         kind: SourceKind,
     ) -> Result<SourceId, SystemCallError> {
-        if !self.queue.accepts_sources(task) {
+        if self.set.failed() || !self.queue.accepts_sources(task) {
             return Err(SystemCallError::ObjectClosed);
         }
-        let prepared = self.prepare_source(task, kind, 1)?;
+        let prepared = self.prepare_source(task, kind)?;
         match self
             .set
-            .as_ref()
-            .expect("runtime set already closed")
-            .register_item(WaitItem::new(plan.handle, plan.signals, task))
+            .set()
+            .register_item(MemberRequest::new(plan.handle, plan.signals, task))
         {
-            Ok(token) => self.adopt_entry(task, token, prepared),
+            Ok(token) => Ok(self.adopt_entry(task, token, prepared)),
             Err(error) => {
-                self.cancel_prepared_source(prepared);
+                drop(prepared);
                 Err(error)
             }
         }
@@ -1361,125 +1209,43 @@ impl<T, S: SourceOps> Runtime<T, S> {
         &mut self,
         task: u64,
         token: u64,
-        mut prepared: ordered_table::PreparedEntry<SourceEntry>,
-    ) -> Result<SourceId, SystemCallError> {
-        *self
-            .retire_timers
-            .value_mut(prepared.value_mut().retire_timer)
-            .expect("prepared source timer must exist") = token;
+        prepared: ordered_table::PreparedEntry<SourceEntry, ()>,
+    ) -> SourceId {
         self.sources.insert_prepared(prepared.with_key(token));
         self.queue
             .slot(task)
             .expect("prepared source task disappeared")
             .sources
             .push(token);
-        Ok(SourceId(token))
-    }
-
-    fn rearm_source(&mut self, token: u64) -> Result<(), SystemCallError> {
-        let entry = self
-            .sources
-            .get(token)
-            .ok_or(SystemCallError::ObjectNotFound)?;
-        if entry.armed || entry.removing || entry.pending.is_some() {
-            return Ok(());
-        }
-        match self
-            .set
-            .as_ref()
-            .expect("runtime set already closed")
-            .rearm(token)
-        {
-            Ok(generation) => {
-                let entry = self
-                    .sources
-                    .get_mut(token)
-                    .expect("rearm entry disappeared");
-                entry.generation = generation;
-                entry.armed = true;
-                Ok(())
-            }
-            Err(error) => {
-                // 武装失败作为来源错误事件投递，任务决定退休或降级。
-                let entry = self
-                    .sources
-                    .get_mut(token)
-                    .expect("rearm entry disappeared");
-                let task = entry.task;
-                if entry.pending.is_none() {
-                    let source = SourceId(token);
-                    let kind = entry.kind;
-                    entry.pending = Some(SourceEvent {
-                        source,
-                        kind,
-                        observed: ObjectSignals::NONE,
-                        error: error as u32,
-                    });
-                }
-                self.enqueue_input(token, false);
-                self.queue
-                    .schedule(task)
-                    .expect("rearm-failure task must remain owned");
-                Ok(())
-            }
-        }
+        SourceId { token, task }
     }
 }
 
 impl<T, S: SourceOps> Drop for Runtime<T, S> {
     fn drop(&mut self) {
-        // 非空放弃即缺陷信号：任务 owner 各自 Drop 有界收束，来源额度随表
-        // 析构释放；内核登记由集合 Drop 的一次关闭兜底（进程边界接管）。
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-impl<T> Runtime<T, libkernel::ipc::wait_set::WaitSet> {
-    /// 仅借出集合观察目标，不转移接收、登记或关闭权。
-    pub fn wait_item(&self, cookie: u64) -> WaitItem {
-        WaitItem::new(
-            self.set
-                .as_ref()
-                .expect("runtime set already closed")
-                .handle(),
-            ObjectSignals::READABLE | ObjectSignals::CLOSED,
-            cookie,
-        )
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-impl SourceOps for libkernel::ipc::wait_set::WaitSet {
-    fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError> {
-        libkernel::ipc::wait_set::WaitSet::register(self, item)
-    }
-    fn rearm(&self, token: u64) -> Result<u64, SystemCallError> {
-        libkernel::ipc::wait_set::WaitSet::rearm(self, token)
-    }
-    fn remove_source(&self, token: u64) -> Result<(), SystemCallError> {
-        libkernel::ipc::wait_set::WaitSet::remove(self, token)
-    }
-    fn receive_into(&self, records: &mut [ReadyRecord]) -> Result<usize, SystemCallError> {
-        libkernel::ipc::wait_set::WaitSet::receive_into(self, records)
-    }
-    fn wait(&self, deadline: Deadline) -> Result<(), SystemCallError> {
-        libkernel::ipc::wait_set::WaitSet::wait(self, deadline).map(|_| ())
-    }
-    fn now_ns(&self) -> Result<u64, SystemCallError> {
-        libkernel::time::snapshot().map(|snapshot| snapshot.now_ns)
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-impl SourceSet for libkernel::ipc::wait_set::WaitSet {
-    fn close_set(self) -> Result<(), (Self, SystemCallError)> {
-        libkernel::ipc::wait_set::WaitSet::close(self)
+        // 先解除侵入式 timer 对节点的访问，再允许来源表释放各自 pin Box。
+        while self.retire_timers.pop_expired(u64::MAX).is_some() {}
+        // 非空放弃是装配误用，整个接收装配 fail-closed；业务失败必须由原运行体退休。
+        if !self.queue.is_empty() || !self.sources.is_empty() || self.pending_gate.is_some() {
+            self.set.invalidate();
+        }
+        while let Some((&token, _)) = self.sources.next_after(None) {
+            if let Err(error) = self.set.set().remove_source(token)
+                && error != SystemCallError::ObjectNotFound
+            {
+                RETIRED_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+            self.sources
+                .remove(token)
+                .map(ordered_table::PreparedEntry::into_value);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assembly::Assembly;
     use alloc::{collections::BTreeMap, collections::VecDeque, rc::Rc, vec};
     use core::cell::{Cell, RefCell};
 
@@ -1490,70 +1256,42 @@ mod tests {
 
     struct FakeInner {
         next_token: u64,
-        generations: BTreeMap<u64, u64>,
-        consumed: BTreeMap<u64, bool>,
-        queued: BTreeMap<u64, bool>,
+        members: BTreeMap<u64, u64>,
         delivered: VecDeque<ReadyRecord>,
         remove_busy: usize,
         waits: Vec<Deadline>,
-        rearms: Vec<u64>,
         removes: Vec<u64>,
         registered: Vec<(Handle, ObjectSignals, u64)>,
+        persistent: bool,
     }
-
     impl FakeShared {
         fn fire_at(&self, token: u64, observed: ObjectSignals, shift: i64) {
             let mut inner = self.inner.borrow_mut();
-            let generation = *inner.generations.get(&token).expect("fired unknown token");
-            let generation = (generation as i64 + shift).max(0) as u64;
+            let cookie = inner.members[&token].wrapping_add_signed(shift);
             inner.delivered.push_back(ReadyRecord {
                 token,
-                arm_generation: generation,
-                cookie: 0,
+                cookie,
                 observed,
-                reason: 1,
-                error: 0,
+                reason: 0,
+                reserved: 0,
             });
-            if shift == 0 {
-                inner.queued.insert(token, true);
-            }
         }
-
-        fn generation(&self, token: u64) -> u64 {
-            *self
-                .inner
-                .borrow()
-                .generations
-                .get(&token)
-                .expect("unknown token")
-        }
-
-        fn rearms(&self) -> Vec<u64> {
-            self.inner.borrow().rearms.clone()
-        }
-
         fn removes(&self) -> Vec<u64> {
             self.inner.borrow().removes.clone()
         }
-
         fn registered(&self) -> Vec<(Handle, ObjectSignals, u64)> {
             self.inner.borrow().registered.clone()
         }
-
         fn waits(&self) -> Vec<Deadline> {
             self.inner.borrow().waits.clone()
         }
-
         fn set_remove_busy(&self, attempts: usize) {
             self.inner.borrow_mut().remove_busy = attempts;
         }
     }
-
-    /// 观察集合替身：脚本化就绪记录、可控时钟与调用记录。
     struct FakeSet {
         shared: Rc<FakeShared>,
     }
-
     impl FakeSet {
         fn new(shared: &Rc<FakeShared>) -> Self {
             Self {
@@ -1561,141 +1299,104 @@ mod tests {
             }
         }
     }
-
     fn fake_shared() -> Rc<FakeShared> {
         Rc::new(FakeShared {
             inner: RefCell::new(FakeInner {
                 next_token: 1,
-                generations: BTreeMap::new(),
-                consumed: BTreeMap::new(),
-                queued: BTreeMap::new(),
+                members: BTreeMap::new(),
                 delivered: VecDeque::new(),
                 remove_busy: 0,
                 waits: Vec::new(),
-                rearms: Vec::new(),
                 removes: Vec::new(),
                 registered: Vec::new(),
+                persistent: false,
             }),
             now: Cell::new(0),
         })
     }
-
     impl SourceOps for FakeSet {
-        fn register_item(&self, item: WaitItem) -> Result<u64, SystemCallError> {
+        fn register_item(&self, item: MemberRequest) -> Result<u64, SystemCallError> {
             let mut inner = self.shared.inner.borrow_mut();
             let token = inner.next_token;
             inner.next_token += 1;
-            inner.generations.insert(token, 1);
-            inner.consumed.insert(token, false);
-            inner.queued.insert(token, false);
+            inner.members.insert(token, item.cookie);
             inner
                 .registered
                 .push((item.handle, item.signals, item.cookie));
             Ok(token)
         }
-        fn rearm(&self, token: u64) -> Result<u64, SystemCallError> {
-            let mut inner = self.shared.inner.borrow_mut();
-            if inner.queued.get(&token).copied().unwrap_or(false)
-                || !inner.consumed.get(&token).copied().unwrap_or(false)
-            {
-                return Err(SystemCallError::ObjectBusy);
-            }
-            let generation = inner
-                .generations
-                .get_mut(&token)
-                .ok_or(SystemCallError::ObjectNotFound)?;
-            *generation += 1;
-            let current = *generation;
-            inner.consumed.insert(token, false);
-            inner.queued.insert(token, false);
-            inner.rearms.push(token);
-            Ok(current)
-        }
         fn remove_source(&self, token: u64) -> Result<(), SystemCallError> {
             let mut inner = self.shared.inner.borrow_mut();
-            if inner.remove_busy != 0 {
+            if inner.remove_busy > 0 {
                 inner.remove_busy -= 1;
                 return Err(SystemCallError::ObjectBusy);
             }
-            inner.generations.remove(&token);
-            inner.consumed.remove(&token);
-            inner.queued.remove(&token);
+            inner
+                .members
+                .remove(&token)
+                .ok_or(SystemCallError::ObjectNotFound)?;
             inner.removes.push(token);
             Ok(())
         }
         fn receive_into(&self, records: &mut [ReadyRecord]) -> Result<usize, SystemCallError> {
             let mut inner = self.shared.inner.borrow_mut();
+            if inner.persistent && inner.delivered.is_empty() {
+                let members: Vec<_> = inner
+                    .members
+                    .iter()
+                    .map(|(&token, &cookie)| (token, cookie))
+                    .collect();
+                for (token, cookie) in members {
+                    inner.delivered.push_back(ReadyRecord {
+                        token,
+                        cookie,
+                        observed: ObjectSignals::READABLE,
+                        reason: 0,
+                        reserved: 0,
+                    });
+                }
+            }
             let mut count = 0;
-            while count < records.len() {
+            for slot in records {
                 let Some(record) = inner.delivered.pop_front() else {
                     break;
                 };
-                records[count] = record;
-                if inner.generations.get(&record.token) == Some(&record.arm_generation) {
-                    inner.consumed.insert(record.token, true);
-                    inner.queued.insert(record.token, false);
-                }
+                *slot = record;
                 count += 1;
             }
             Ok(count)
         }
         fn wait(&self, deadline: Deadline) -> Result<(), SystemCallError> {
             self.shared.inner.borrow_mut().waits.push(deadline);
-            if let Ok(Some(at)) = deadline.instant() {
-                self.shared.now.set(at);
+            if deadline != Deadline::INFINITE {
+                self.shared
+                    .now
+                    .set(deadline.instant().unwrap().expect("finite deadline"));
             }
             Ok(())
         }
         fn now_ns(&self) -> Result<u64, SystemCallError> {
             Ok(self.shared.now.get())
         }
-    }
-
-    #[test]
-    fn fake_waitset_models_consumption_and_busy_removal() {
-        let shared = fake_shared();
-        let set = FakeSet::new(&shared);
-        let token = set
-            .register_item(WaitItem::new(
-                Handle::from_parts(9, 1),
-                ObjectSignals::READABLE,
-                0,
-            ))
-            .unwrap();
-        assert_eq!(set.rearm(token), Err(SystemCallError::ObjectBusy));
-        let mut records = [ReadyRecord {
-            token: 0,
-            arm_generation: 0,
-            cookie: 0,
-            observed: ObjectSignals::NONE,
-            reason: 0,
-            error: 0,
-        }];
-        assert_eq!(set.receive_into(&mut records).unwrap(), 0);
-        assert_eq!(set.rearm(token), Err(SystemCallError::ObjectBusy));
-        shared.fire_at(token, ObjectSignals::READABLE, 0);
-        assert_eq!(set.receive_into(&mut records).unwrap(), 1);
-        assert_eq!(set.rearm(token).unwrap(), 2);
-        shared.set_remove_busy(1);
-        assert_eq!(set.remove_source(token), Err(SystemCallError::ObjectBusy));
-        assert_eq!(shared.generation(token), 2);
-        assert_eq!(set.remove_source(token), Ok(()));
+        fn close_set(self) -> Result<(), (Self, SystemCallError)> {
+            self.shared.inner.borrow_mut().members.clear();
+            self.shared.inner.borrow_mut().delivered.clear();
+            Ok(())
+        }
     }
 
     #[test]
     fn input_preserves_unconsumed_events_and_timeout() {
         let events = [
             SourceEvent {
-                source: SourceId(1),
+                source: SourceId { token: 1, task: 9 },
                 kind: 1,
                 observed: ObjectSignals::READABLE,
-                error: 0,
             },
             SourceEvent {
-                source: SourceId(2),
+                source: SourceId { token: 2, task: 9 },
                 kind: 2,
                 observed: ObjectSignals::CLOSED,
-                error: 7,
             },
         ];
         let mut input = Input {
@@ -1704,17 +1405,17 @@ mod tests {
             timed_out: true,
             now_ns: 0,
         };
-        assert_eq!(input.pull().unwrap().source, SourceId(1));
+        assert_eq!(input.pull().unwrap().source, SourceId { token: 1, task: 9 });
         assert!(input.has_pending());
         assert!(input.take_timeout());
-        assert_eq!(input.pull().unwrap().source, SourceId(2));
+        assert_eq!(input.pull().unwrap().source, SourceId { token: 2, task: 9 });
         assert!(!input.has_pending());
     }
 
     #[derive(Default)]
     struct World {
         order: Vec<u64>,
-        events: Vec<(SourceKind, ObjectSignals, u32)>,
+        events: Vec<(SourceKind, ObjectSignals)>,
         refusals: Vec<SystemCallError>,
     }
 
@@ -1766,32 +1467,33 @@ mod tests {
     #[test]
     fn constructor_refusal_returns_source_set_and_refunds_budget() {
         let shared = fake_shared();
-        let funding = account();
-        let (set, error) = match Runtime::<ToyTask, FakeSet>::try_new(
-            FakeSet::new(&shared),
-            0,
-            1,
-            &funding,
-        ) {
-            Ok(_) => panic!("zero task capacity was admitted"),
+        let budget = Budget::new(&[8, 1], 1).unwrap();
+        let tiny = budget
+            .account(&[8, 1])
+            .unwrap()
+            .view(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
+            .unwrap();
+        let before = tiny.usage(ExecutionResource::InputBytes);
+        let (set, error) = match Assembly::new(FakeSet::new(&shared), &tiny) {
+            Ok(_) => panic!("insufficient receive budget accepted"),
             Err(failure) => failure,
         };
-        assert_eq!(error, SystemCallError::IllegalArgument);
+        assert_eq!(error, SystemCallError::QuotaExceeded);
         assert!(Rc::ptr_eq(&set.shared, &shared));
-        set.close_set().map_err(|(_, error)| error).unwrap();
-        assert_eq!(funding.usage(ExecutionResource::Task).0, 0);
-        assert_eq!(funding.usage(ExecutionResource::InputBytes).0, 0);
+        assert_eq!(tiny.usage(ExecutionResource::InputBytes), before);
     }
 
     #[test]
     fn yielding_tasks_alternate_fairly() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<ToyTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 4, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 8, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(ToyTask { turns: 2 }, 0).unwrap();
         rt.spawn(ToyTask { turns: 2 }, 0).unwrap();
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         let first = world.order[0];
         let second = world.order[1];
         assert_eq!(world.order, vec![first, second, first, second]);
@@ -1839,8 +1541,10 @@ mod tests {
     #[test]
     fn deadline_wakes_parked_task() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<WaitingTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 4, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 8, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(
             WaitingTask {
@@ -1851,12 +1555,18 @@ mod tests {
         )
         .unwrap();
         // 首轮覆盖三个工作面：任务登记期限并停驻。
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         assert!(!rt.has_ready());
         shared.now.set(20);
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
         assert!(rt.has_ready());
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert!(rt.is_empty());
     }
 
@@ -1898,10 +1608,15 @@ mod tests {
     #[test]
     fn invalid_deadline_is_reported_without_dropping_task() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<InvalidDeadlineTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
         let mut world = World::default();
         let id = rt.spawn(InvalidDeadlineTask, 0).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         assert_eq!(
             rt.turn(&mut world, 3).unwrap_err(),
             TaskFailure {
@@ -1961,15 +1676,17 @@ mod tests {
     #[test]
     fn stopping_task_can_park_until_cleanup_deadline() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<StopWaitTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(StopWaitTask { stopping: false }, 0).unwrap();
         rt.seal();
         rt.shutdown_turn(&mut world, 1).unwrap();
         assert!(!rt.is_empty());
         shared.now.set(20);
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert!(rt.is_empty());
     }
 
@@ -2008,13 +1725,8 @@ mod tests {
                 });
             }
             while let Some(event) = input.pull() {
-                world.events.push((event.kind, event.observed, event.error));
+                world.events.push((event.kind, event.observed));
                 self.events_seen += 1;
-                if self.events_seen < self.complete_after {
-                    requests
-                        .rearm(event.source)
-                        .expect("source request capacity");
-                }
             }
             if self.events_seen >= self.complete_after {
                 return Ok(Advance {
@@ -2039,15 +1751,22 @@ mod tests {
         fn stop(&mut self, _world: &mut World) {}
     }
 
-    fn source_runtime(shared: &Rc<FakeShared>) -> Runtime<SourceTask, FakeSet> {
-        Runtime::new(FakeSet::new(shared), 4, 8, &account()).unwrap()
+    fn source_runtime(
+        shared: &Rc<FakeShared>,
+    ) -> (Runtime<SourceTask, FakeSet>, Assembly<FakeSet>) {
+        let assembly = Assembly::new(FakeSet::new(shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+        let runtime = Runtime::new(assembly.bind().unwrap(), 4, 8, &account()).unwrap();
+        (runtime, assembly)
     }
 
     #[test]
     fn source_limit_refusal_returns_task_and_refunds_slot() {
         let shared = fake_shared();
         let funding = account();
-        let mut rt = Runtime::new(FakeSet::new(&shared), 2, 1, &funding).unwrap();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 1, &funding).unwrap();
         let baseline_task = funding.usage(ExecutionResource::Task);
         let baseline_input = funding.usage(ExecutionResource::InputBytes);
         let mut world = World::default();
@@ -2061,7 +1780,7 @@ mod tests {
             0,
         )
         .unwrap();
-        rt.run(&mut world, 3).unwrap();
+        assembly.run(&mut rt, &mut world, 3).unwrap();
         assert_eq!(world.refusals, [SystemCallError::ReachLimit]);
         assert!(shared.registered().is_empty());
         assert_eq!(rt.pending_sources(), 0);
@@ -2071,9 +1790,9 @@ mod tests {
     }
 
     #[test]
-    fn source_routes_events_and_rearms() {
+    fn persistent_source_routes_multiple_prompts() {
         let shared = fake_shared();
-        let mut rt = source_runtime(&shared);
+        let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
         rt.spawn(
             SourceTask {
@@ -2086,8 +1805,14 @@ mod tests {
         )
         .unwrap();
         // 首轮覆盖三个工作面：任务登记来源并停驻。
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         // Gate 下一工作面提交来源登记。
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         let registered = shared.registered();
         assert_eq!(registered.len(), 1);
@@ -2096,13 +1821,15 @@ mod tests {
         // 第一次事件投递后任务请求 rearm；第二次事件后完成并撤销来源。
         shared.fire_at(token, ObjectSignals::READABLE, 0);
         for _ in 0..4 {
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 3).unwrap();
         }
         assert_eq!(world.events.len(), 1);
         assert_eq!(world.events[0].0, 7);
-        assert!(shared.rearms().contains(&token));
         shared.fire_at(token, ObjectSignals::CLOSED, 0);
-        rt.run(&mut world, 3).unwrap();
+        assembly.run(&mut rt, &mut world, 3).unwrap();
         assert_eq!(world.events.len(), 2);
         assert!(rt.is_empty());
         assert!(shared.removes().contains(&token));
@@ -2111,7 +1838,7 @@ mod tests {
     #[test]
     fn completed_task_waits_for_busy_source_retirement() {
         let shared = fake_shared();
-        let mut rt = source_runtime(&shared);
+        let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
         rt.spawn(
             SourceTask {
@@ -2123,23 +1850,35 @@ mod tests {
             1,
         )
         .unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         shared.fire_at(1, ObjectSignals::READABLE, 0);
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         assert_eq!(rt.pending_sources(), 1);
         shared.set_remove_busy(1);
-        rt.run(&mut world, 3).unwrap();
+        assembly.run(&mut rt, &mut world, 3).unwrap();
         assert_eq!(rt.pending_sources(), 0, "removes={:?}", shared.removes());
         assert!(rt.is_empty());
         assert!(shared.waits().contains(&Deadline::at(1_000_000)));
     }
 
     #[test]
-    fn stale_generation_records_are_dropped() {
+    fn stale_cookie_records_are_dropped() {
         let shared = fake_shared();
-        let mut rt = source_runtime(&shared);
+        let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
         rt.spawn(
             SourceTask {
@@ -2151,9 +1890,18 @@ mod tests {
             2,
         )
         .unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         shared.fire_at(1, ObjectSignals::READABLE, -1);
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         assert_eq!(world.events.len(), 0);
         assert!(!rt.has_ready());
@@ -2226,8 +1974,10 @@ mod tests {
     fn gate_spawn_applies_and_refusal_is_reported() {
         // 任务表容量 2：父 + 首个子任务占满，第二个派生被表限拒绝。
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<Spawner, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 2, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 8, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(
             Spawner {
@@ -2238,7 +1988,7 @@ mod tests {
             0,
         )
         .unwrap();
-        rt.run(&mut world, 3).unwrap();
+        assembly.run(&mut rt, &mut world, 3).unwrap();
         assert!(rt.is_empty());
         assert_eq!(world.refusals.len(), 1);
         assert!(matches!(world.refusals[0], SystemCallError::ReachLimit));
@@ -2247,8 +1997,10 @@ mod tests {
     #[test]
     fn max_work_one_advances_gate_one_operation_at_a_time() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<Spawner, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 4, 4, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 4, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(
             Spawner {
@@ -2261,18 +2013,45 @@ mod tests {
         .unwrap();
         // 期限、输入、任务三个工作面各占一次推进；第四次才结算
         // 第一个 spawn，不能在一次 max_work=1 中批量应用两个请求。
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
         assert!(rt.has_pending_gate());
         assert_eq!(rt.pending_tasks(), 1);
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
         assert_eq!(rt.pending_tasks(), 2);
         assert!(rt.has_pending_gate());
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 1).unwrap();
         assert_eq!(rt.pending_tasks(), 3);
         assert!(!rt.has_pending_gate());
@@ -2281,22 +2060,27 @@ mod tests {
     #[test]
     fn finalizing_task_is_not_requeued_by_shutdown() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<ToyTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        for &record in assembly.receive(64).unwrap() {
+            rt.feed(record);
+        }
         rt.turn(&mut world, 3).unwrap();
         assert!(!rt.has_ready());
         rt.seal();
         rt.shutdown_turn(&mut world, 1).unwrap();
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert!(rt.is_empty());
     }
 
     #[test]
     fn max_work_one_allows_ready_task_and_source_retirement_to_progress() {
         let shared = fake_shared();
-        let mut rt: Runtime<SourceTask, FakeSet> = source_runtime(&shared);
+        let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
         rt.spawn(
             SourceTask {
@@ -2319,11 +2103,17 @@ mod tests {
         )
         .unwrap();
         for _ in 0..20 {
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 1).unwrap();
         }
         shared.fire_at(1, ObjectSignals::READABLE, 0);
         shared.fire_at(2, ObjectSignals::READABLE, 0);
         for _ in 0..100 {
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 1).unwrap();
             if rt.is_empty() {
                 break;
@@ -2332,13 +2122,6 @@ mod tests {
         assert_eq!(world.events.len(), 2);
         assert!(rt.is_empty());
         assert_eq!(rt.pending_sources(), 0);
-    }
-
-    impl SourceSet for FakeSet {
-        fn close_set(self) -> Result<(), (Self, SystemCallError)> {
-            assert!(self.shared.inner.borrow().generations.is_empty());
-            Ok(())
-        }
     }
 
     #[derive(Debug)]
@@ -2375,8 +2158,7 @@ mod tests {
                             *registered = true;
                         }
                         while let Some(event) = input.pull() {
-                            world.events.push((event.kind, event.observed, event.error));
-                            requests.rearm(event.source)?;
+                            world.events.push((event.kind, event.observed));
                         }
                         Step::Parked
                     }
@@ -2411,9 +2193,11 @@ mod tests {
     #[test]
     fn persistent_source_gate_retirement_and_stop_refund_with_one_work_unit() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let account = account();
         let mut rt: Runtime<MixedTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 8, 8, &account).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 8, 8, &account).unwrap();
         let baseline = account.usage(ExecutionResource::InputBytes).0;
         let mut world = World::default();
         rt.spawn(
@@ -2428,10 +2212,13 @@ mod tests {
         for _ in 0..360 {
             let armed = {
                 let inner = shared.inner.borrow();
-                inner.generations.contains_key(&1) && !inner.consumed[&1] && !inner.queued[&1]
+                inner.members.contains_key(&1)
             };
             if armed {
                 shared.fire_at(1, ObjectSignals::READABLE, 0);
+            }
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
             }
             assert_eq!(rt.turn(&mut world, 1).unwrap(), 1);
         }
@@ -2449,7 +2236,7 @@ mod tests {
         shared.set_remove_busy(1);
         rt.seal();
         rt.shutdown_turn(&mut world, 1).unwrap();
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert!(rt.is_empty());
         assert_eq!(rt.pending_sources(), 0);
         assert_eq!(rt.retire_timers.len(), 0);
@@ -2458,34 +2245,6 @@ mod tests {
         assert!(shared.waits().contains(&Deadline::at(1_000_000)));
         assert!(rt.close().is_ok());
         assert_eq!(account.usage(ExecutionResource::InputBytes).0, 0);
-    }
-
-    #[test]
-    fn receive_consumes_only_returned_records() {
-        let shared = fake_shared();
-        let set = FakeSet::new(&shared);
-        for n in 1..=2 {
-            set.register_item(WaitItem::new(
-                Handle::from_raw(n),
-                ObjectSignals::READABLE,
-                n,
-            ))
-            .unwrap();
-            shared.fire_at(n, ObjectSignals::READABLE, 0);
-        }
-        let mut out = [ReadyRecord {
-            token: 0,
-            arm_generation: 0,
-            cookie: 0,
-            observed: ObjectSignals::NONE,
-            reason: 0,
-            error: 0,
-        }];
-        assert_eq!(set.receive_into(&mut out).unwrap(), 1);
-        assert!(set.rearm(1).is_ok());
-        assert_eq!(set.rearm(2), Err(SystemCallError::ObjectBusy));
-        assert_eq!(set.receive_into(&mut out).unwrap(), 1);
-        assert!(set.rearm(2).is_ok());
     }
 
     #[derive(Debug)]
@@ -2534,7 +2293,9 @@ mod tests {
     #[test]
     fn unconsumed_input_returns_to_the_front_without_scanning_all_sources() {
         let shared = fake_shared();
-        let mut rt = Runtime::new(FakeSet::new(&shared), 1, 2, &account()).unwrap();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &account()).unwrap();
         let mut world = World::default();
         rt.spawn(
             PartialTask {
@@ -2546,11 +2307,17 @@ mod tests {
         )
         .unwrap();
         for _ in 0..30 {
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 1).unwrap();
         }
         shared.fire_at(1, ObjectSignals::READABLE, 0);
         shared.fire_at(2, ObjectSignals::READABLE, 0);
         for _ in 0..160 {
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 1).unwrap();
         }
         assert_eq!(world.order, [1, 2]);
@@ -2561,7 +2328,9 @@ mod tests {
     #[test]
     fn removing_one_source_does_not_erase_another_sources_retry() {
         let shared = fake_shared();
-        let mut rt = Runtime::new(FakeSet::new(&shared), 1, 2, &account()).unwrap();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &account()).unwrap();
         let mut world = World::default();
         let task = rt.spawn(ToyTask { turns: 1 }, 2).unwrap();
         let first = rt
@@ -2585,7 +2354,7 @@ mod tests {
         );
         assert!(rt.drop_source(&mut world, second.token()).is_ok());
         assert_eq!(rt.next_deadline(), Deadline::at(1_000_000));
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert!(rt.close().is_ok());
         assert!(shared.waits().contains(&Deadline::at(1_000_000)));
     }
@@ -2631,14 +2400,16 @@ mod tests {
     #[test]
     fn failed_task_retains_state_while_healthy_task_runs_and_retry_is_not_timeout() {
         let shared = fake_shared();
-        let mut rt = Runtime::new(FakeSet::new(&shared), 2, 2, &account()).unwrap();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
         let mut world = World::default();
         let failed = rt.spawn(FaultTask::Failing(false), 0).unwrap();
         let healthy = rt.spawn(FaultTask::Healthy, 0).unwrap();
         let failure = rt.turn(&mut world, 3).unwrap_err();
         assert_eq!(failure.task, failed);
         rt.defer_failed_task(failed, Some(50)).unwrap();
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert_eq!(world.order, [healthy, failed]);
         assert!(rt.close().is_ok());
     }
@@ -2708,14 +2479,22 @@ mod tests {
     fn failed_gate_preserves_business_deadline_across_hold_and_execution_retry() {
         for retry in [60, 10] {
             let shared = fake_shared();
-            let mut rt = Runtime::new(FakeSet::new(&shared), 1, 1, &account()).unwrap();
+            let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+                .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+            let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
             let mut world = World::default();
             let id = rt.spawn(DeadlineGateTask { phase: 0 }, 1).unwrap();
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 3).unwrap();
             rt.wake(id).unwrap();
             assert_eq!(rt.turn(&mut world, 3).unwrap_err().task, id);
             rt.defer_failed_task(id, None).unwrap();
             for _ in 0..12 {
+                for &record in assembly.receive(64).unwrap() {
+                    rt.feed(record);
+                }
                 rt.turn(&mut world, 1).unwrap();
             }
             assert_eq!(rt.next_deadline(), Deadline::at(50));
@@ -2724,6 +2503,9 @@ mod tests {
             rt.defer_failed_task(id, Some(retry)).unwrap();
             if retry < 50 {
                 shared.now.set(100);
+                for &record in assembly.receive(64).unwrap() {
+                    rt.feed(record);
+                }
                 rt.turn(&mut world, 1).unwrap();
                 assert!(rt.has_ready(), "execution retry is due first");
                 assert!(
@@ -2731,7 +2513,7 @@ mod tests {
                     "business timer has not been popped yet"
                 );
             }
-            rt.run(&mut world, 1).unwrap();
+            assembly.run(&mut rt, &mut world, 1).unwrap();
             assert!(rt.close().is_ok());
         }
     }
@@ -2777,7 +2559,7 @@ mod tests {
             }
             if let Some(source) = world.source {
                 self.done = true;
-                requests.rearm(source)?;
+
                 requests.remove(source)?;
                 if self.mode == 2 {
                     return Err(SystemCallError::InternalError);
@@ -2822,7 +2604,9 @@ mod tests {
     fn foreign_source_is_rejected_in_normal_complete_and_failed_gates() {
         for mode in 0..3 {
             let shared = fake_shared();
-            let mut rt = Runtime::new(FakeSet::new(&shared), 2, 2, &account()).unwrap();
+            let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+                .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+            let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
             let mut world = SourceOwnershipWorld::default();
             rt.spawn(
                 SourceOwnershipTask {
@@ -2847,14 +2631,13 @@ mod tests {
             for _ in 0..80 {
                 let _ = rt.turn(&mut world, 1);
             }
-            assert_eq!(world.denied, 2);
+            assert_eq!(world.denied, 1);
             assert_eq!(world.removed, 0);
             assert_eq!(rt.pending_sources(), 1);
-            assert!(shared.rearms().is_empty());
             assert!(shared.removes().is_empty());
             rt.seal();
             rt.shutdown_turn(&mut world, 1).unwrap();
-            rt.run(&mut world, 1).unwrap();
+            assembly.run(&mut rt, &mut world, 1).unwrap();
             assert_eq!(world.removed, 1);
             assert!(rt.close().is_ok());
         }
@@ -2962,7 +2745,9 @@ mod tests {
         let view = account
             .view(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
             .unwrap();
-        let mut rt = Runtime::new(FakeSet::new(&shared), 1, 4, &view).unwrap();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &self::account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 4, &view).unwrap();
         let mut world = MultiSourceWorld::default();
         rt.spawn(
             MultiSourceTask {
@@ -2976,6 +2761,9 @@ mod tests {
             if world.owner_closed && rt.is_empty() {
                 break;
             }
+            for &record in assembly.receive(64).unwrap() {
+                rt.feed(record);
+            }
             rt.turn(&mut world, 1).unwrap();
         }
         assert_eq!(world.registered, 4);
@@ -2986,83 +2774,13 @@ mod tests {
         assert!(rt.close().is_ok());
     }
 
-    #[derive(Debug)]
-    struct PlanTask {
-        adopted: bool,
-    }
-
-    impl Task<World> for PlanTask {
-        type Family = PlanTask;
-
-        fn advance(
-            &mut self,
-            _id: u64,
-            _world: &mut World,
-            requests: &mut Requests<Self>,
-            input: &mut Input<'_>,
-            _budget: usize,
-        ) -> Result<Advance, SystemCallError> {
-            if !self.adopted {
-                requests
-                    .arm_source(
-                        SourcePlan::new(Handle::from_parts(5, 1), ObjectSignals::DATA),
-                        9,
-                    )
-                    .unwrap_or_else(|_| panic!("source request capacity"));
-                self.adopted = true;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Parked,
-                });
-            }
-            if input.pull().is_some() {
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
-            Ok(Advance {
-                work_done: 1,
-                step: Step::Parked,
-            })
-        }
-        fn refused(&mut self, _world: &mut World, failure: RequestFailure<Self>) {
-            let error = match failure {
-                RequestFailure::Spawn { error, .. }
-                | RequestFailure::Source { error, .. }
-                | RequestFailure::Wake { error, .. } => error,
-            };
-            panic!("PlanTask Gate request failed: {error:?}")
-        }
-        fn stop(&mut self, _world: &mut World) {}
-    }
-
-    #[test]
-    fn arm_plan_adopts_initial_generation() {
-        let shared = fake_shared();
-        let mut rt: Runtime<PlanTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 4, 8, &account()).unwrap();
-        let mut world = World::default();
-        rt.spawn(PlanTask { adopted: false }, 2).unwrap();
-        rt.turn(&mut world, 3).unwrap();
-        rt.turn(&mut world, 3).unwrap();
-        let token = 1;
-        // 新登记直接采用 WaitSet 的初始代次，不对未消费记录错误 rearm。
-        assert_eq!(shared.generation(token), 1);
-        // 旧代次记录被丢弃，当前代次记录正常投递。
-        shared.fire_at(token, ObjectSignals::DATA, -1);
-        rt.turn(&mut world, 3).unwrap();
-        assert!(!rt.is_empty());
-        shared.fire_at(token, ObjectSignals::DATA, 0);
-        rt.run(&mut world, 3).unwrap();
-        assert!(rt.is_empty());
-    }
-
     #[test]
     fn seal_rejects_spawn_and_stop_next_advances() {
         let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &self::account())
+            .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<ToyTask, FakeSet> =
-            Runtime::new(FakeSet::new(&shared), 4, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 8, &self::account()).unwrap();
         let mut world = World::default();
         rt.spawn(ToyTask { turns: 100 }, 0).unwrap();
         rt.seal();
@@ -3075,7 +2793,309 @@ mod tests {
         ));
         rt.shutdown_turn(&mut world, 1).unwrap();
         // stop 意图使 ToyTask 下一次 advance Complete。
-        rt.run(&mut world, 1).unwrap();
+        assembly.run(&mut rt, &mut world, 1).unwrap();
         assert!(rt.is_empty());
+    }
+    #[test]
+    fn one_receive_routes_two_runtimes_without_nested_sources() {
+        let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut first = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let mut second = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let mut a = World::default();
+        let mut b = World::default();
+        for rt in [&mut first, &mut second] {
+            rt.spawn(
+                SourceTask {
+                    handle: Handle::from_parts(3, 1),
+                    requested: false,
+                    events_seen: 0,
+                    complete_after: 1,
+                },
+                1,
+            )
+            .unwrap();
+        }
+        for _ in 0..6 {
+            first.turn(&mut a, 3).unwrap();
+            second.turn(&mut b, 3).unwrap();
+        }
+        assert_eq!(shared.registered().len(), 2);
+        shared.fire_at(1, ObjectSignals::READABLE, 0);
+        shared.fire_at(2, ObjectSignals::CLOSED, 0);
+        let records = assembly.receive(64).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(first.feed(records[0]));
+        assert!(!second.feed(records[0]));
+        assert!(!first.feed(records[1]));
+        assert!(second.feed(records[1]));
+        for _ in 0..12 {
+            first.turn(&mut a, 3).unwrap();
+            second.turn(&mut b, 3).unwrap();
+        }
+        assert_eq!(a.events, [(7, ObjectSignals::READABLE)]);
+        assert_eq!(b.events, [(7, ObjectSignals::CLOSED)]);
+        assert!(first.is_empty() && second.is_empty());
+        assert!(first.close().is_ok());
+        assert!(second.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+
+    #[test]
+    fn repeated_level_hints_merge_in_one_prepaid_input() {
+        let shared = fake_shared();
+        let (mut rt, mut assembly) = source_runtime(&shared);
+        let mut world = World::default();
+        rt.spawn(
+            SourceTask {
+                handle: Handle::from_parts(3, 1),
+                requested: false,
+                events_seen: 0,
+                complete_after: 1,
+            },
+            1,
+        )
+        .unwrap();
+        for _ in 0..6 {
+            rt.turn(&mut world, 3).unwrap();
+        }
+        shared.fire_at(1, ObjectSignals::READABLE, 0);
+        shared.fire_at(1, ObjectSignals::CLOSED, 0);
+        for &record in assembly.receive(64).unwrap() {
+            assert!(rt.feed(record));
+        }
+        for _ in 0..12 {
+            rt.turn(&mut world, 3).unwrap();
+        }
+        assert_eq!(
+            world.events,
+            [(7, ObjectSignals::READABLE | ObjectSignals::CLOSED)]
+        );
+        assert!(rt.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+
+    #[test]
+    fn abandoning_live_runtime_invalidates_shared_assembly() {
+        let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let healthy: Runtime<SourceTask, FakeSet> =
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let mut world = World::default();
+        rt.spawn(
+            SourceTask {
+                handle: Handle::from_parts(3, 1),
+                requested: false,
+                events_seen: 0,
+                complete_after: 1,
+            },
+            1,
+        )
+        .unwrap();
+        for _ in 0..6 {
+            rt.turn(&mut world, 3).unwrap();
+        }
+        drop(rt);
+        assert!(assembly.is_failed());
+        assert_eq!(
+            assembly.receive(64).unwrap_err(),
+            SystemCallError::ObjectClosed
+        );
+        assert_eq!(shared.removes(), [1]);
+        assert!(healthy.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+    #[derive(Debug)]
+    struct CancelDeadlineTask {
+        phase: u8,
+        callback_cancel: bool,
+    }
+    impl Task<World> for CancelDeadlineTask {
+        type Family = Self;
+        fn advance(
+            &mut self,
+            _: u64,
+            _: &mut World,
+            requests: &mut Requests<Self>,
+            input: &mut Input<'_>,
+            _: usize,
+        ) -> Result<Advance, SystemCallError> {
+            assert!(
+                !input.take_timeout(),
+                "cancelled deadline produced a timeout"
+            );
+            match self.phase {
+                0 => {
+                    self.phase = 1;
+                    Ok(Advance {
+                        work_done: 1,
+                        step: Step::Parked,
+                    })
+                }
+                1 => {
+                    self.phase = 2;
+                    requests.add_source(Handle::from_raw(8), ObjectSignals::READABLE, 8)?;
+                    requests.add_source(Handle::from_raw(9), ObjectSignals::READABLE, 9)?;
+                    Ok(Advance {
+                        work_done: 1,
+                        step: Step::Runnable,
+                    })
+                }
+                _ => Ok(Advance {
+                    work_done: 1,
+                    step: Step::Complete,
+                }),
+            }
+        }
+        fn deadline(&self) -> Deadline {
+            if self.phase < 2 || (self.callback_cancel && self.phase == 2) {
+                Deadline::at(50)
+            } else {
+                Deadline::INFINITE
+            }
+        }
+        fn registered(&mut self, _: &mut World, _: SourceKind, _: SourceId) {
+            if self.callback_cancel {
+                self.phase = 3;
+            }
+        }
+        fn refused(&mut self, _: &mut World, _: RequestFailure<Self>) {
+            panic!("unexpected refusal");
+        }
+        fn stop(&mut self, _: &mut World) {}
+    }
+    #[test]
+    fn successful_gate_and_callbacks_cancel_deadline_before_later_clock_sample() {
+        for callback_cancel in [false, true] {
+            let shared = fake_shared();
+            let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+                .unwrap_or_else(|_| panic!("assembly failed"));
+            let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &account()).unwrap();
+            let mut world = World::default();
+            let id = rt
+                .spawn(
+                    CancelDeadlineTask {
+                        phase: 0,
+                        callback_cancel,
+                    },
+                    2,
+                )
+                .unwrap();
+            rt.turn(&mut world, 3).unwrap();
+            shared.now.set(20);
+            rt.wake(id).unwrap();
+            while !rt.has_pending_gate() {
+                rt.turn(&mut world, 1).unwrap();
+            }
+            if callback_cancel {
+                while rt.get_task_mut(id).unwrap().phase < 3 {
+                    rt.turn(&mut world, 1).unwrap();
+                }
+                assert!(rt.has_pending_gate());
+            }
+            shared.now.set(60);
+            assembly.run(&mut rt, &mut world, 1).unwrap();
+            assert!(rt.close().is_ok());
+            assert!(assembly.close().is_ok());
+        }
+    }
+
+    #[test]
+    fn older_task_retires_under_continuous_new_completion() {
+        let shared = fake_shared();
+        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 4, 2, &account()).unwrap();
+        let old = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        let later = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        rt.queue.begin_finalizing(later);
+        rt.queue.finalize_one();
+        rt.queue.begin_finalizing(old);
+        let mut newcomers = Vec::new();
+        for _ in 0..4 {
+            let id = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+            newcomers.push(id);
+            rt.queue.begin_finalizing(id);
+            rt.queue.finalize_one();
+            if rt.queue.slot(old).is_none() {
+                break;
+            }
+        }
+        assert!(
+            rt.queue.slot(old).is_none(),
+            "new completions starved the older owner"
+        );
+        while !rt.is_empty() {
+            rt.queue.finalize_one();
+        }
+        assert!(rt.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+
+    #[test]
+    fn always_ready_receive_keeps_task_quantum() {
+        let shared = fake_shared();
+        let (mut rt, mut assembly) = source_runtime(&shared);
+        let mut world = World::default();
+        let id = rt
+            .spawn(
+                SourceTask {
+                    handle: Handle::from_parts(3, 1),
+                    requested: false,
+                    events_seen: 0,
+                    complete_after: 100,
+                },
+                1,
+            )
+            .unwrap();
+        for _ in 0..6 {
+            rt.turn(&mut world, 3).unwrap();
+        }
+        shared.inner.borrow_mut().persistent = true;
+        for _ in 0..12 {
+            for &record in assembly.receive(1).unwrap() {
+                rt.feed(record);
+            }
+            rt.turn(&mut world, 1).unwrap();
+        }
+        assert!(
+            !world.events.is_empty(),
+            "persistent Receive starved task advancement"
+        );
+        rt.queue.begin_finalizing(id);
+        for _ in 0..20 {
+            rt.turn(&mut world, 1).unwrap();
+        }
+        assert!(rt.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+
+    #[test]
+    fn failed_assembly_rejects_admission_and_stop_callbacks() {
+        let shared = fake_shared();
+        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let id = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        drop(assembly);
+        let failure = rt.spawn(ToyTask { turns: 9 }, 0).unwrap_err();
+        assert_eq!(failure.error, SystemCallError::ObjectClosed);
+        assert_eq!(failure.task.turns, 9);
+        rt.seal();
+        let mut world = World::default();
+        assert_eq!(
+            rt.shutdown_turn(&mut world, 1).unwrap_err().error,
+            SystemCallError::ObjectClosed
+        );
+        assert_eq!(rt.get_task_mut(id).unwrap().turns, 1);
+        assert_eq!(
+            rt.shutdown_turn(&mut world, 2).unwrap_err().error,
+            SystemCallError::ObjectClosed
+        );
+        assert_eq!(rt.get_task_mut(id).unwrap().turns, 1);
+        assert!(world.order.is_empty(), "failed assembly ran business stop");
     }
 }

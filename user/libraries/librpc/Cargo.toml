@@ -6,6 +6,7 @@ description = "Generic RPC framing over mailbox messages"
 edition = "2024"
 
 [dependencies]
+libbudget = { path = "../libbudget" }
 monotonic_id = { path = "../../../shared/monotonic_id" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 

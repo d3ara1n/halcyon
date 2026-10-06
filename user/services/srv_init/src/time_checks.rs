@@ -13,12 +13,12 @@ use libkernel::{
         call::SystemCallError,
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{ObjectSignals, Rights},
-        wait::{WaitItem, WaitReason},
+        wait::WaitReason,
     },
     time::{self, Deadline, Duration},
 };
-use libthread::ThreadOutcome;
 use libruntime::thread;
+use libthread::ThreadOutcome;
 
 pub(super) fn run() {
     let start = time::snapshot().unwrap();
@@ -34,22 +34,17 @@ pub(super) fn run() {
     );
     let event =
         notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL).unwrap();
-    let items = [WaitItem::new(event.owner, ObjectSignals::READABLE, 17)];
-    let empty = wait_until(&items, Deadline::at(0)).unwrap();
-    assert_eq!(
-        (empty.reason, empty.item_index),
-        (WaitReason::Timeout as u32, u32::MAX)
-    );
+    let empty = wait_until(event.owner, ObjectSignals::READABLE, Deadline::at(0)).unwrap();
+    assert_eq!(empty.reason, WaitReason::Timeout as u32);
     notification::signal(event.peer, 1).unwrap();
-    let ready = wait_until(&items, Deadline::at(0)).unwrap();
-    assert_eq!(
-        (ready.reason, ready.item_index, ready.cookie),
-        (WaitReason::Signaled as u32, 0, 17)
-    );
+    let ready = wait_until(event.owner, ObjectSignals::READABLE, Deadline::at(0)).unwrap();
+    assert_eq!(ready.reason, WaitReason::Signaled as u32);
+    assert!(ready.observed.intersects(ObjectSignals::READABLE));
     notification::take(event.owner, u64::MAX).unwrap();
     assert_eq!(
         wait_until(
-            &items,
+            event.owner,
+            ObjectSignals::READABLE,
             Deadline {
                 kind: 1,
                 reserved: 1,
@@ -60,7 +55,7 @@ pub(super) fn run() {
     );
     if let Some(outside) = start.max_deadline_ns.checked_add(1) {
         assert_eq!(
-            wait_until(&items, Deadline::at(outside)),
+            wait_until(event.owner, ObjectSignals::READABLE, Deadline::at(outside)),
             Err(SystemCallError::ClockRange)
         );
     }
@@ -72,7 +67,9 @@ pub(super) fn run() {
         "absolute Sleep returned before its deadline"
     );
     assert_eq!(
-        wait_until(&items, deadline).unwrap().reason,
+        wait_until(event.owner, ObjectSignals::READABLE, deadline)
+            .unwrap()
+            .reason,
         WaitReason::Timeout as u32,
         "delayed call restarted an expired absolute wait"
     );
@@ -98,8 +95,14 @@ fn delivery_deadline() {
     for index in 0..MAILBOX_CAPACITY {
         message::send(inbox.peer, index as u64, &[]).unwrap();
     }
-    let once = message::make_send_once(inbox.peer, Rights::WRITE | Rights::WAIT).unwrap();
-    let moved = message::make_send_once(inbox.peer, Rights::WRITE | Rights::TRANSIT).unwrap();
+    let once_pair = message::make_send_once(inbox.peer, Rights::WRITE | Rights::WAIT).unwrap();
+    let once = once_pair.owner;
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+    unsafe { libkernel::ipc::object::close(once_pair.peer) }.expect("reply observer close failed");
+    let moved_pair = message::make_send_once(inbox.peer, Rights::WRITE | Rights::TRANSIT).unwrap();
+    let moved = moved_pair.owner;
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+    unsafe { libkernel::ipc::object::close(moved_pair.peer) }.expect("reply observer close failed");
     let moves = [HandleMove {
         handle: moved,
         rights: Rights::WRITE,
@@ -109,7 +112,7 @@ fn delivery_deadline() {
         unsafe { message::send_raw_until(once, 91, &[9], &moves, deadline) },
         Err(SystemCallError::MailboxFull)
     );
-    let wait = wait_until(&[WaitItem::new(once, ObjectSignals::WRITABLE, 0)], deadline).unwrap();
+    let wait = wait_until(once, ObjectSignals::WRITABLE, deadline).unwrap();
     assert_eq!(
         wait.reason,
         WaitReason::Timeout as u32,
@@ -199,10 +202,7 @@ fn causal_reads() {
     for worker in workers {
         assert!(matches!(
             worker.join(),
-            ThreadOutcome::Returned {
-                leave: Ok(()),
-                ..
-            }
+            ThreadOutcome::Returned { leave: Ok(()), .. }
         ));
     }
     assert!(time::snapshot().unwrap().now_ns >= high.load(Ordering::Acquire));

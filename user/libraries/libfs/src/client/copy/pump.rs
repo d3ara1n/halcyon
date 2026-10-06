@@ -4,6 +4,7 @@ use erhino_shared::{
     object::{Handle, ObjectSignals},
 };
 use libbudget::Budget;
+use libexecution::assembly::Assembly;
 use libexecution::{
     ExecutionResource,
     runtime::{
@@ -37,29 +38,38 @@ pub struct PumpSummary {
     pub fault: Option<PumpFault>,
 }
 
+enum WaitOwner {
+    Raw(WaitSet),
+    Ready(Assembly<WaitSet>),
+}
+impl WaitOwner {
+    fn close(self) -> Result<(), (Self, SystemCallError)> {
+        match self {
+            Self::Raw(set) => set.close().map_err(|(set, error)| (Self::Raw(set), error)),
+            Self::Ready(assembly) => assembly
+                .close()
+                .map_err(|(assembly, error)| (Self::Ready(assembly), error)),
+        }
+    }
+}
+
 pub struct PumpRunFailure {
     pub summary: PumpSummary,
     runtime: Option<Runtime<PumpTask, WaitSet>>,
-    set: Option<WaitSet>,
+    wait: Option<WaitOwner>,
     snapshot: Option<PumpSnapshot>,
 }
 
 impl PumpRunFailure {
-    // Runtime 关闭失败时需原样返还持有 WaitSet 的 owner。
+    // 失败持有任务/登记与唯一接收 owner；先清空 Runtime，再关闭实际集合。
     #[allow(clippy::result_large_err)]
     pub fn retry_cleanup(
         mut self,
         source: &mut Stream,
         target: &mut Stream,
     ) -> Result<PumpSummary, Self> {
-        if let Some(set) = self.set.take()
-            && let Err((set, _)) = set.close()
-        {
-            self.set = Some(set);
-            return Err(self);
-        }
         let Some(mut runtime) = self.runtime.take() else {
-            return Ok(self.summary);
+            return self.finish_wait();
         };
         if runtime.drive_state() != DriveState::Drained {
             let Some(snapshot) = self.snapshot.take() else {
@@ -84,7 +94,7 @@ impl PumpRunFailure {
             }
         }
         match runtime.close() {
-            Ok(()) => Ok(self.summary),
+            Ok(()) => self.finish_wait(),
             Err((runtime, error)) => {
                 self.summary.fault = Some(PumpFault::System(error));
                 self.runtime = Some(runtime);
@@ -92,6 +102,19 @@ impl PumpRunFailure {
                 Err(self)
             }
         }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "集合关闭失败保留原 Pump cleanup owner，不能为清理新增分配"
+    )]
+    fn finish_wait(mut self) -> Result<PumpSummary, Self> {
+        if let Some(wait) = self.wait.take()
+            && let Err((wait, _)) = wait.close()
+        {
+            self.wait = Some(wait);
+            return Err(self);
+        }
+        Ok(self.summary)
     }
 }
 
@@ -163,7 +186,6 @@ struct PumpTask {
     sources: [Option<SourceId>; 5],
     requested: [bool; 5],
     removing: [bool; 5],
-    armed: [bool; 5],
     stopping: bool,
     deadline: libkernel::time::Deadline,
 }
@@ -174,7 +196,6 @@ impl PumpTask {
             sources: [None; 5],
             requested: [false; 5],
             removing: [false; 5],
-            armed: [false; 5],
             stopping: false,
             deadline,
         }
@@ -262,17 +283,13 @@ impl Task<PumpWorld<'_>> for PumpTask {
             if world.outcome.is_some() {
                 continue;
             }
-            if let Some(index) = Self::index(event.kind) {
-                self.armed[index] = false;
-            }
             match event.kind {
                 CANCEL => world.outcome = Some(PumpFault::Cancelled),
                 SOURCE_CLOSED | TARGET_CLOSED | SOURCE_DATA | TARGET_DATA => {
                     let source = event.kind == SOURCE_CLOSED || event.kind == SOURCE_DATA;
-                    let terminal = event.error != 0
-                        || event
-                            .observed
-                            .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
+                    let terminal = event
+                        .observed
+                        .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
                     if source {
                         let reader = world
                             .source
@@ -332,7 +349,7 @@ impl Task<PumpWorld<'_>> for PumpTask {
                         return Ok(self.retire(requests, expected));
                     }
                 };
-                if requests.arm_source(plan, kind).is_ok() {
+                if requests.register(plan, kind).is_ok() {
                     self.requested[index] = true;
                 }
             }
@@ -361,17 +378,6 @@ impl Task<PumpWorld<'_>> for PumpTask {
             world.sent += n;
             world.target_bytes += n as u64;
             if n == 0 {
-                if let Some(source) = self.sources[1]
-                    && !self.armed[1]
-                {
-                    if requests.rearm(source).is_err() {
-                        return Ok(Advance {
-                            work_done: 1,
-                            step: Step::Runnable,
-                        });
-                    }
-                    self.armed[1] = true;
-                }
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -412,23 +418,10 @@ impl Task<PumpWorld<'_>> for PumpTask {
                 world.drained = true;
                 Ok(self.retire(requests, expected))
             }
-            Ok(false) => {
-                if let Some(source) = self.sources[0]
-                    && !self.armed[0]
-                {
-                    if requests.rearm(source).is_err() {
-                        return Ok(Advance {
-                            work_done: 1,
-                            step: Step::Runnable,
-                        });
-                    }
-                    self.armed[0] = true;
-                }
-                Ok(Advance {
-                    work_done: 1,
-                    step: Step::Parked,
-                })
-            }
+            Ok(false) => Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            }),
             Err(error) => {
                 world.outcome = Some(PumpFault::Source(error));
                 Ok(self.retire(requests, expected))
@@ -442,7 +435,6 @@ impl Task<PumpWorld<'_>> for PumpTask {
                 if let Some(index) = Self::index(kind) {
                     self.requested[index] = false;
                     self.removing[index] = false;
-                    self.armed[index] = false;
                 }
                 world.outcome.get_or_insert(PumpFault::System(error));
             }
@@ -459,7 +451,6 @@ impl Task<PumpWorld<'_>> for PumpTask {
         if let Some(index) = Self::index(kind) {
             self.requested[index] = false;
             self.sources[index] = Some(source);
-            self.armed[index] = true;
         } else {
             world.outcome = Some(PumpFault::System(SystemCallError::InternalError));
         }
@@ -471,7 +462,6 @@ impl Task<PumpWorld<'_>> for PumpTask {
         {
             self.sources[index] = None;
             self.removing[index] = false;
-            self.armed[index] = false;
         } else {
             world.outcome = Some(PumpFault::System(SystemCallError::InternalError));
         }
@@ -495,7 +485,7 @@ fn preparation_fault(error: SystemCallError) -> PumpRunFailure {
             fault: Some(PumpFault::System(error)),
         },
         runtime: None,
-        set: None,
+        wait: None,
         snapshot: None,
     }
 }
@@ -508,8 +498,11 @@ pub fn run_pump(
     deadline: libkernel::time::Deadline,
 ) -> Result<PumpSummary, PumpRunFailure> {
     let source_limit = if cancel.is_some() { 5 } else { 4 };
-    let input =
-        Runtime::<PumpTask, WaitSet>::input_budget(source_limit).map_err(preparation_fault)?;
+    let input = Runtime::<PumpTask, WaitSet>::input_budget(source_limit)
+        .map_err(preparation_fault)?
+        .checked_add(Assembly::<WaitSet>::input_budget().map_err(preparation_fault)?)
+        .ok_or(SystemCallError::ReachLimit)
+        .map_err(preparation_fault)?;
     let limits = [1, input];
     let budget = Budget::new(&limits, 1).map_err(preparation_fault)?;
     let account = budget.account(&limits).map_err(preparation_fault)?;
@@ -525,22 +518,38 @@ pub fn run_pump(
         .view::<ExecutionResource>(&[task_slot, input_slot])
         .map_err(preparation_fault)?;
     let set = WaitSet::create(source_limit).map_err(preparation_fault)?;
-    let mut runtime = match Runtime::<PumpTask, WaitSet>::try_new(set, 1, source_limit, &execution)
-    {
-        Ok(runtime) => runtime,
+    let mut assembly = match Assembly::new(set, &execution) {
+        Ok(assembly) => assembly,
         Err((set, error)) => {
             let mut failure = preparation_fault(error);
             if let Err((set, _)) = set.close() {
-                failure.set = Some(set);
+                failure.wait = Some(WaitOwner::Raw(set));
             }
             return Err(failure);
         }
     };
+    let registration = assembly.bind().map_err(preparation_fault)?;
+    let mut runtime =
+        match Runtime::<PumpTask, WaitSet>::new(registration, 1, source_limit, &execution) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let mut failure = preparation_fault(error);
+                if let Err((assembly, _)) = assembly.close() {
+                    failure.wait = Some(WaitOwner::Ready(assembly));
+                }
+                return Err(failure);
+            }
+        };
     if let Err(failure) = runtime.spawn(PumpTask::new(deadline), source_limit) {
         let mut error = preparation_fault(failure.error);
         if let Err((runtime, close_error)) = runtime.close() {
             error.summary.fault = Some(PumpFault::System(close_error));
             error.runtime = Some(runtime);
+            error.wait = Some(WaitOwner::Ready(assembly));
+            return Err(error);
+        }
+        if let Err((assembly, _)) = assembly.close() {
+            error.wait = Some(WaitOwner::Ready(assembly));
         }
         return Err(error);
     }
@@ -556,7 +565,7 @@ pub fn run_pump(
         outcome: None,
         drained: false,
     };
-    if let Err(failure) = runtime.run(&mut world, 1) {
+    if let Err(failure) = assembly.run(&mut runtime, &mut world, 1) {
         world
             .outcome
             .get_or_insert(PumpFault::System(failure.error));
@@ -575,33 +584,35 @@ pub fn run_pump(
             summary,
             snapshot: Some(world.snapshot()),
             runtime: Some(runtime),
-            set: None,
+            wait: Some(WaitOwner::Ready(assembly)),
         });
     }
-    match runtime.close() {
-        Ok(())
-            if execution.usage(ExecutionResource::Task).0 == 0
-                && execution.usage(ExecutionResource::InputBytes).0 == 0 =>
-        {
-            Ok(summary)
-        }
-        Ok(()) => Err(PumpRunFailure {
-            summary: PumpSummary {
-                fault: Some(PumpFault::System(SystemCallError::InternalError)),
-                ..summary
-            },
-            runtime: None,
-            set: None,
-            snapshot: None,
-        }),
-        Err((runtime, error)) => Err(PumpRunFailure {
+    if let Err((runtime, error)) = runtime.close() {
+        return Err(PumpRunFailure {
             summary: PumpSummary {
                 fault: Some(PumpFault::System(error)),
                 ..summary
             },
             runtime: Some(runtime),
-            set: None,
+            wait: Some(WaitOwner::Ready(assembly)),
             snapshot: None,
-        }),
+        });
     }
+    if let Err((assembly, error)) = assembly.close() {
+        return Err(PumpRunFailure {
+            summary: PumpSummary {
+                fault: Some(PumpFault::System(error)),
+                ..summary
+            },
+            runtime: None,
+            wait: Some(WaitOwner::Ready(assembly)),
+            snapshot: None,
+        });
+    }
+    if execution.usage(ExecutionResource::Task).0 != 0
+        || execution.usage(ExecutionResource::InputBytes).0 != 0
+    {
+        return Err(preparation_fault(SystemCallError::InternalError));
+    }
+    Ok(summary)
 }

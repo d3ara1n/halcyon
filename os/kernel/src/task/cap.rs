@@ -17,7 +17,7 @@ impl capability::Authority for ObjectAuthority {
 }
 
 pub(crate) type Cap = capability::Cap<ObjectAuthority>;
-pub(crate) type CapTable = capability::CapTable<ObjectAuthority>;
+pub(crate) type CapTable = capability::CapTable<ObjectAuthority, super::resources::MetadataCharge>;
 
 /// 表锁外投递最后持有事件。
 pub(crate) fn deliver(last: Option<capability::LastCapability<ObjectAuthority>>) {

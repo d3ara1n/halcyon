@@ -14,9 +14,9 @@ MEMORY_SCRIPT := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"memory.x"
 # compile
 RUSTFLAGS_OS := "-Clinker=riscv64-elf-ld"
 RUSTFLAGS_USER := ""
-# 用户态验收负载只允许 core/stress/capacity；profile 选择停留在 srv_init，不进入内核 ABI。
+# 用户态验收负载只允许 core/stress；profile 选择停留在 srv_init，不进入内核 ABI。
 ACCEPTANCE_WORKLOAD := env_var_or_default("ERHINO_ACCEPTANCE_WORKLOAD", "core")
-INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else if ACCEPTANCE_WORKLOAD == "capacity" { "--features srv_init/capacity-calibration" } else { "" }
+INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else { "" }
 
 TARGET_DIR := invocation_directory()/"artifacts"
 KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
@@ -52,8 +52,7 @@ THROTTLE := env_var_or_default("THROTTLE", "50")
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "90")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "420")
-VIRT_CAPACITY_TIMEOUT := env_var_or_default("VIRT_CAPACITY_TIMEOUT", "180")
-VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "40")
+VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "90")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "90")
 SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "120")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
@@ -133,7 +132,7 @@ build_user: artifact_dir
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ACCEPTANCE_WORKLOAD}}" in
-        core|stress|capacity) ;;
+        core|stress) ;;
         *) echo "Unknown acceptance workload: {{ACCEPTANCE_WORKLOAD}}" >&2; exit 2 ;;
     esac
     cd user
@@ -181,13 +180,9 @@ run_qemu_dump_dtb:
 virt:
     @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_TIMEOUT}} -smp cores=4
 
-# 完整 debug 压力线：core 的全部语义再加重复压力、最小预算 Drain 与 16/16 竞态矩阵。
+# 完整 debug 压力线：core 的全部语义再加重复压力、自动退休与 16/16 竞态矩阵。
 virt-stress:
     @ERHINO_ACCEPTANCE_WORKLOAD=stress QEMU_ACCEPTANCE_PROFILE=stress just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_STRESS_TIMEOUT}} -smp cores=4
-
-# 真实 ProcessCreate → ProcessBindMemory 容量校准，保留全部 Bound AddressSpace。
-virt-capacity:
-    @ERHINO_ACCEPTANCE_WORKLOAD=capacity QEMU_ACCEPTANCE_PROFILE=capacity just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_CAPACITY_TIMEOUT}} -smp cores=4
 
 # 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
 # Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 验收

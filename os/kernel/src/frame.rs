@@ -5,7 +5,7 @@
 //! 内核永久占用与 boot-held 区间，再从补集中保留库存元数据；只有最终补集
 //! 发布为空闲。
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 
 use frame_pool::{ArenaMetadata, ExtentGeometry, FramePool, MAX_ARENAS, metadata_bytes};
 use funded_frame::{
@@ -534,86 +534,6 @@ impl QuotaSource for PoolQuota<'_> {
 type UserFundedInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, MAX_FUNDED_EXTENTS>;
 type UserFundedExtentInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent, 1>;
 
-/// 固定长度、不可分解的对象数据 backing。
-///
-/// 与匿名 backing 的区别只在生命周期语义：对象 backing 由创建者绑定池一次付清，
-/// view 的切割、降权与解除都不切数据 backing，因此这里不暴露 split/merge。
-///
-/// **堆化常驻形态**：对象 core 是常驻对象，因此这里持堆上的单 extent owner
-/// 序列，而不内联固定 `MAX_FUNDED_EXTENTS` 槽的定长 funding 结果。定长容器
-/// 只适合做一次性的 funding 事务结果（栈上短暂存在）；把它嵌进常驻对象会使
-/// 每个对象无论实际几个 extent 都占满整份槽位，且构造路径逐层复制整个
-/// 本体——这是栈帧审计的直接成因。funding 结果在获取后立即堆化。
-#[must_use = "object backing must remain owned until the memory object is destroyed"]
-pub(crate) struct ObjectBacking {
-    extents: Vec<FundedExtent>,
-    pages: usize,
-}
-
-impl ObjectBacking {
-    pub(crate) fn pages(&self) -> usize {
-        self.pages
-    }
-
-    /// 对象内页区间到物理 span 的投影，追加写入 `spans`。
-    ///
-    /// view 与 Tunnel 共用有界多 extent translation 组装路径；单页是退化几何。
-    /// 越界由调用方在 Validate 阶段排除。
-    pub(crate) fn project(
-        &self,
-        offset_pages: usize,
-        length_pages: usize,
-        spans: &mut Vec<(FrameNumber, usize)>,
-    ) {
-        let end = offset_pages
-            .checked_add(length_pages)
-            .expect("object projection range overflows");
-        assert!(
-            end <= self.pages,
-            "object projection exceeds funded geometry"
-        );
-        if length_pages == 0 {
-            return;
-        }
-        let mut cursor = 0usize;
-        for extent in &self.extents {
-            let extent_start = cursor;
-            let extent_pages = extent.pages();
-            cursor += extent_pages;
-            if extent_start >= end || cursor <= offset_pages {
-                continue;
-            }
-            let skip = offset_pages.saturating_sub(extent_start);
-            let take = cursor.min(end) - (extent_start + skip);
-            spans.push((extent.base() + skip, take));
-        }
-    }
-
-    /// 投影所需的 span 上限。
-    pub(crate) fn projection_capacity(&self) -> usize {
-        self.extents.len()
-    }
-}
-
-/// 取得固定长度、零态的对象 backing；由创建进程绑定池支付。
-///
-/// 与匿名 backing 走同一条 funding 路径：定长事务结果在返回前立即堆化为常驻
-/// extent 列表，定长容器不进入常驻对象（见 `ObjectBacking` 的形态说明）。
-#[inline(never)]
-pub(crate) fn fund_object_backing(
-    pool: &Arc<MemoryPool>,
-    pages: usize,
-    limits: FundingLimits,
-) -> Result<ObjectBacking, funded_frame::FundError<memory_pool::PoolError, UserClaimError>> {
-    let funded = fund_user_frames(pool, pages, limits)?;
-    let pages = funded.pages();
-    let mut extents = Vec::new();
-    funded
-        .into_extents(&mut extents)
-        .map_err(|()| funded_frame::FundError::Physical(UserClaimError::OutOfMemory))?;
-    Ok(ObjectBacking { extents, pages })
-}
-
 /// 单一物理 extent 的资金化 owner；自然析构先归还物理 extent，再退 Pool charge。
 pub(crate) struct FundedExtent {
     inner: UserFundedExtentInner,
@@ -642,12 +562,23 @@ impl FundedExtent {
     }
 }
 
+impl memory_space::SegmentOwner for FundedExtent {
+    fn split_at(self, pages: u64) -> (Self, Self) {
+        // 段页数来自 usize 物理库存；内部切点由 SegmentMap 校验严格包含。
+        self.split_at(usize::try_from(pages).expect("segment split exceeds physical address width"))
+    }
+}
+
 /// 普通 user supply 的资金化 backing；仅在 funding 事务中暂存多 extent owner。
 pub(crate) struct FundedFrames {
     inner: UserFundedInner,
 }
 
 impl FundedFrames {
+    pub(crate) fn charge_pool_is(&self, pool: &MemoryPool) -> bool {
+        self.inner.credit().is_from(pool)
+    }
+
     pub(crate) fn pages(&self) -> usize {
         self.inner.pages()
     }
@@ -662,15 +593,18 @@ impl FundedFrames {
             .map(|claim| (claim.geometry().base(), claim.geometry().count()))
     }
 
-    pub(crate) fn into_extents(self, extents: &mut Vec<FundedExtent>) -> Result<(), ()> {
+    /// 输出数组由调用者预付；抽取自身有界声明时不分配临时容器。
+    pub(crate) fn into_extents<C>(
+        self,
+        extents: &mut funded_storage::Buffer<FundedExtent, C>,
+    ) -> Result<(), ()> {
         let mut inner = self.inner;
-        extents
-            .try_reserve_exact(inner.extent_count())
-            .map_err(|_| ())?;
+        if extents.capacity() - extents.len() < inner.extent_count() {
+            return Err(());
+        }
         while inner.extent_count() != 0 {
-            let extent = inner
-                .split_first()
-                .expect("funded extent extraction failed");
+            // credit 分解仍可能拒绝；已输出及剩余 owner 由调用方/inner 锁外回收。
+            let extent = inner.split_first().map_err(|_| ())?;
             extents.push(FundedExtent { inner: extent });
         }
         Ok(())
@@ -700,6 +634,12 @@ type UserFundedTableInner = funded_frame::Funded<MemoryCharge, ClaimedUserExtent
 /// 64-extents backing 内联进每个 Unbound shell 与 Bind 调用栈。
 pub(crate) struct FundedTableFrame {
     inner: UserFundedTableInner,
+}
+
+impl page_table::TableFrameOwner for FundedTableFrame {
+    fn number(&self) -> FrameNumber {
+        self.frame()
+    }
 }
 
 impl FundedTableFrame {
@@ -735,7 +675,11 @@ impl FundedTableFrame {
     /// 取回：凭 branch PTE 帧号与恰好一页 charge 重建完整 affine owner。
     /// 调用者保证该帧号先前经 [`Self::into_adopted`] 寄存且只取回一次。
     pub(crate) fn from_adopted(frame: FrameNumber, charge: MemoryCharge) -> Self {
-        assert_eq!(charge.pages(), 1, "table frame reclaim must carry exactly one page");
+        assert_eq!(
+            charge.pages(),
+            1,
+            "table frame reclaim must carry exactly one page"
+        );
         let geometry = ExtentGeometry::new(frame, 1).expect("invalid adopted table frame");
         let mut claim = ClaimedUserExtent::new(geometry);
         claim.cleared = true;
@@ -934,4 +878,14 @@ pub fn consumed_heap_chunks() -> usize {
         .as_ref()
         .expect("system supply not initialized")
         .consumed_heap_chunks()
+}
+
+pub(crate) fn heap_capacity_bytes() -> usize {
+    SYSTEM_SUPPLY
+        .lock()
+        .as_ref()
+        .expect("system supply not initialized")
+        .heap_ranges()
+        .map(|range| range.len())
+        .sum()
 }

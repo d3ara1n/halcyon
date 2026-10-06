@@ -2,6 +2,8 @@
 
 方向见 [`../ideas/mm.md`](../ideas/mm.md)。当前实现分八层：启动物理供给规划、帧库存、MemoryPool 额度与准入、资金化帧取得 broker、用户地址空间纯逻辑规划器、可 host 测试的页表、内核地址空间与启动协议、现有用户地址空间接入；本篇是内存实现事实的唯一拥有者。
 
+[`vm/`](../../os/kernel/src/vm/mod.rs)由真实Process/Builder/bootstrap/Tunnel消费，用户runtime/监督已接当前契约。页/metadata双维Pool、独立对象、动态保留容量与计划scratch均接实际付款owner；私有容量先释放/退款才发布对应完成屏障。下文描述现有owner与推进路径，内部失败/交错、完整维护原子及最终交付门由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。
+
 ## 启动物理供给与系统储备
 
 `os/dtb::memory` 先以 DTSpec status 规则接纳 memory 与 reserved-memory：缺省/`okay` 可用，合法不可用状态跳过，未知或非单一 NUL 字符串拒绝；RAM tuple 经 checked 页对齐、排序与重叠拒绝后才形成固定容量 `PlatformMemory`。动态 reservation 与 `reusable` 在 owner 机制存在前保持 fail closed。
@@ -14,7 +16,7 @@
 
 当前 system 子预算分别为：FramePool 树 metadata 每个 managed frame 精确 2 字节，再加固定 2048 项 `ArenaMetadata` 后整页上取整；内核 heap 为 16 个各 1 MiB 的 tickets；现有 Commit 后 completion、rollback、drain 与 remote-call 路径不分配物理页，故 recovery 为 0。`SystemSupply` 分离不可变 Range 快照与 `Option<Ticket>` owner，消费后 `heap_ranges`/`recovery_ranges` 仍可查询原规划，`consumed_*` 与 `remaining_*` 独立报告状态，查询不能复活 ticket。后者不是永久假设：任何新增 recovery 页消费者必须先给出并发上界、提高独立 ticket 数并补 exhaustion 测试，不能从普通 heap 或 user inventory 借页。
 
-`FramePoolMetadata` 的区间清零后直接成为 FramePool 两个外置 metadata 切片，并随库存永久保留。全部 `HeapChunkTicket` 在全局 allocator 首次使用前由启动线程预清零；Talc `SystemSource::acquire` 在 HEAP 锁内只从 `SYSTEM_SUPPLY` O(1) pop 一个 ticket 并 claim，不进入 FramePool、不扫描区间、不执行 memset。heap ticket 一经消费便永久归堆，耗尽只导致普通 metadata OOM；固定物理容量不替代后续 MetadataSponsor/KernelMemoryBudget 的对象级 admission。`RecoveryTicket` 与 heap 没有公共消费类型，当前数组容量为零。
+`FramePoolMetadata` 的区间清零后直接成为 FramePool 两个外置 metadata 切片，并随库存永久保留。全部 `HeapChunkTicket` 在全局 allocator 首次使用前由启动线程预清零；Talc `SystemSource::acquire` 在 HEAP 锁内只从 `SYSTEM_SUPPLY` O(1) pop 一个 ticket，邻接最近arena时extend，否则独立claim。Source保存本实例最近返回的end与已转交ticket映射末端，不resize/truncate、不合并物理空洞；避免把相邻1MiB供给永久分割成无法容纳1MiB请求的独立arena。不进入 FramePool、不扫描、不执行 memset。ticket消费永久归堆，耗尽或真实碎片导致普通 metadata OOM；固定供给不替代对象级 admission。`RecoveryTicket` 与 heap 没有公共消费类型，当前数组容量为零。
 
 FramePool 先把完整 managed RAM 注册为 unavailable，只发布 planner 给出的 user-free。DTB、cold bootstrap 与 BootPackage 等 boot-held 页在 owner 生命周期结束且 transition 映射退休后经 `release_range` 回投同一 user inventory；permanent 与 system 页从不经过该入口。启动日志分别断言：
 
@@ -57,7 +59,7 @@ pub(crate) struct BootHeldExtent {
 
 库存步骤上界只取决于 `MAX_ARENAS` 与地址位宽；单 extent 归还只沿一棵树上行，任意区间的 canonical block 数同样由地址位宽和 DT region 数限制。清零与返回帧数线性，但在 POOL 锁外执行，也不存在随全局碎片数增长的扫描。
 
-`BootHeldExtent` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 owner 并产生两个精确相邻 owner，Drop 将仍拥有的启动区间结构性有界回投库存。用户页表以来源 Pool 的 funded owner 直接保存 affine owner，不把 owner 拆成裸帧号后通过 unsafe 重建；funded owner 析构先归还物理页，再退来源 Pool charge。ProcessDrain 不再保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
+`BootHeldExtent` 不可复制或由安全代码任意构造；只暴露只读几何，`split_at` 消费原 owner 并产生两个精确相邻 owner，Drop 将仍拥有的启动区间结构性有界回投库存。用户页表以来源 Pool 的 funded owner 直接保存 affine owner，不把 owner 拆成裸帧号后通过 unsafe 重建；funded owner 析构先归还物理页，再退来源 Pool charge。自动退休不保存帧池扫描游标：owner 从拥有结构摘下与下一 work unit 的实际归还分开计费，页表 owner 通过通用 drain cursor 进入同一路径。
 
 ## 物理供给验证
 
@@ -67,7 +69,7 @@ FramePool host 用例覆盖库存结构、极端几何、失败原子性、部�
 
 `os/kernel/src/frame.rs` 在平台账本首次发布完成时冻结一次性 `RootPoolSeed`，其页数严格等于当时 `user-free + boot-held`；后续 boot-held 回投只改变物理库存，不改变 root 总额度。heap 可用后，`task/memory_pool.rs` 消费 seed 铸造唯一 root core，并由内核全局 anchor 持有到本次启动结束。启动日志同时打印帧分类和 root 页数，可直接核对这一闭包。
 
-`os/memory_pool` 是 `no_std`、禁止 unsafe 的四项额度状态机，恒保持：
+`os/memory_pool::LedgerState` 是 `no_std`、禁止 unsafe 的单维额度状态机；内核的页与 metadata 各持一份，分别恒保持：
 
 ```text
 total = available + reserved + allocated + delegated
@@ -75,18 +77,17 @@ total = available + reserved + allocated + delegated
 
 charge 与 delegation 使用不同的线性 reservation/credit 类型，所有转换均作 checked arithmetic。每个状态实例另有 crate 内原子铸造、外部不可伪造的 `OwnerKey`；ABI Pool identity 只作稳定诊断身份，即使调用者重复提供相同 identity，token 也不能跨实例提交。child 在 Prepared 阶段消费唯一 delegation reservation；Commit 将 parent `reserved → delegated`，并把 delegated credit 内嵌进 child state。只有消费 fully-available child 才能取出 parent credit，因此不存在 child 仍可继续派生而额度已提前归父的安全 API。深度上限唯一来自 shared ABI 常量，当前为 32。
 
-`metadata_admission` 提供固定容量 `Counter/Permit/SponsoredPermit`，单个 permit 可以原子预付多个 slots，失败和析构精确退款。`task/resources.rs` 在 `ProcessResources` 中持不可转授的 `MetadataSponsor`，其全局 slot 同时是 Process core permit，随 core 真实析构退款；ProcessBuilder、ProcessControl、Pool core 与 Bound AddressSpace 各自持按真实对象寿命退款的 sponsor+global permit，终态 Control 壳或已转移 Pool core 不因 creator Dead 提前退款。root Pool core 使用只占全局 slot 的 primordial permit。当前全局 sponsor、Builder、Control、Pool core 与 AddressSpace 壳上限均为 4096；每 sponsor 最多一个 Builder、一个 Control、1024 个 Pool core 与一个 Bound AddressSpace。Bound AddressSpace 另以 `AddressSpacePermit` 一次预付 4096 个 Region slots 和 4 个 planner transaction slots；全局分别为 131072 与 128，故条件性政策最多同时准入 32 个预留完整 planner 容量的 Bound AddressSpace。`MemorySpace::new` 在 Bind 前用 fallible Vec 预留同等实际存储，失败不发布 Bound；slot 数并非按 live fragment 逐项扣除，也不保证 32 张账本及其它 metadata 同时有足够 heap 字节。顺序、并发与混合工作集的校准结果见[架构审计 A2/M3/M5](../../plans/todo-2026-09-14-architecture-audit-findings.md)；32 不承诺任意负载下的物理容量。ProcessResources 另以原子 reservation 串行化同一 shell 的竞争 Bind，不形成资源第二真值。
+`task/resources.rs::MetadataCharge` 独占 metadata allocated credit并强持真实付款Pool；`payer()`用于同一对象后续存储政策，不复制财务真值。成本以RV64自然字宽槽计，Arc含控制头、值对齐/padding；内嵌Work/Frame/WaitQueue/节点只计宿主一次，独立Arc/Box/数组各持自己的费用。root初始metadata来自完整system heap几何，扣启动已分配空间与root Pool/Account固定成本；子Pool和独立Account分别由父付款，Account自持charge，不形成自身付款环。值销毁退live槽，外部Weak可能继续保留分配块；这不是堆字节硬隔离或分配成功保证，普通分配始终fallible。region/transaction数组、Job/Views/WaitSet树节点、Pinned Member、Job链临时数组、Operation/账本存储头及全部动态计划scratch已按容量付款；独立对象/Source/Work、Shell/Thread、VM/Views/Backing与真实消息数组也出生付款。固定大小cap发布批次使用栈数组；ProcessWrite/Grant、WaitSet接收和Message输入/运输scratch用MetadataBuffer，按执行者Pool取得费用。具体owner和终态边界由对象、任务与事务章节拥有。
 
-Counter 在成功 acquire 时更新原子峰值；Ready 前无并发时重置观测基线。运行中峰值包括失败事务已取得而后退款的短暂额度，不等于同时存活的 Bound 对象数。
+内核 MemoryPool 以 Prepared/Committing/Active 表达表项发布。PoolDerive 请求显式给两维预算与 rights，一维可为零、整体零拒绝；两维在同一 Pool 锁内预约，第二维失败退第一维。Prepared 分配/输出失败退两份预约；锁外必成 commit 一起转 delegation，child 强持 parent。最后 Pool core 引用消散时逐锁归还两份 parent credit；维护 Account 可由执行器继续保活，最后 Account 析构才向父 Account 转剩余维护欠账。自身和 Account 的父付款分别随字段/独立值析构退款。父链深度由同一 ABI 常量限制，不遍历子列表。Query/Derive 使用 Authorization 接受非消费授权并持短 BodyLease；发布采用表预约→锁外输出→锁外必成资金提交→表 commit。Create/Map 等显式来源使用 CREATE，来源表项不因调用被消费。
 
-当前 `MAX_ADMITTED_BOUND_ADDRESS_SPACES=32` 是 Region/planner metadata 的条件性准入上限，不是 heap bytes 预算。`BindMemory` 的实际 `MemorySpace`、root table 和 PoolBinding 仍逐项 fallible；Map/Unmap/Protect 在 Commit 前按具体计划预留 backing、页表、metadata、Remote 与 work debt，Commit 后由 AddressSpace owner 和 completion debt 完成。Process 构造时预留 termination、drain waiter、request 与 finalization debt，退出使用同一有界 drain。
+### 已付款保留存储
 
-`MemorySpace::entry_sizes()` 提供目标架构上两个私有 ledger 条目的大小，启动日志按当前限额计算最少预留字节。RV64 上 Region 为 96 字节、transaction 为 64 字节，单张完整 ledger 的两组 Vec 元素至少占 393472 字节；32 张至少占 12591104 字节，未计入 Vec/allocator、AddressSpace 壳与其它对象开销。布局数值随源码重新编译取得，不作为额外硬编码的准入上限。
-切片 6A 建立的三类操作准入已接入公开内存事务：backing slice 为全局 32768 / 每 sponsor 4096，MemoryChange、内存 WaitContext 与 Remote completion 各为全局 128 / 每 sponsor 4。`MemoryOperationPermits` 在提交前按 change → wait → remote 顺序取得三类 owner，任一中途失败由 RAII 回滚；拆分后 `MemoryChangePermit` 与 `RemoteCompletionPermit` 随 `MemoryChangeCompletion` 保活，`MemoryWaitPermit` 随 `WaitContext` 保活，均只在最终 Complete 后由真实对象寿命退款。公开 MemoryMap/Unmap/Protect 与 Tunnel Create/Attach/Close 还会在 Commit 前预留固定 work-debt 槽；任一准入、WaitContext、Remote 槽或 completion 分配失败都发生在 Commit 前。普通 anonymous backing 的 slice permit 随每个 live/retiring extent owner 保活（见下节）。
+[`shared/funded_storage`](../../shared/funded_storage/src/lib.rs) 拥有固定布局的 Buffer/OwnedBox 和唯一付款凭证。Funding 只针对 Layout 返回 charge，不拥有业务身份/授权；内核 MetadataFunding 在领域选定的 Pool 扣槽，无隐式全局源。Buffer固定 `Box<[MaybeUninit<T>]>` 只暴露初始化前缀/有界写入，不隐式增长/缩容；clear/pop只改逻辑内容，存储及 charge继续保留。IntoIter持剩余初始化区间、分配和凭证，部分消费不提前退费。OwnedBox失败返原值，解构先释放Box再退分配charge；into_pin利用固定Box地址稳定，安全Pin接口不能取回!Unpin目标owner，移动pin容器不移动目标，析构先运行值的detach再退款。零字节布局无需分配账。
 
-内核 `MemoryPool` 对象以 `Prepared → Committing → Active` 表达 Handle 发布事务。Prepared owner 在任何发布前失败时析构并回滚 parent reservation；Commit 后 child state 内嵌 credit、同时强持 parent，最后一个 core 引用消散时消费 child state、逐把锁把额度归父。`MemoryPoolQuery` 要求 READ，`MemoryPoolDerive` 要求 CREATE；child rights 必须是来源 rights 与 Pool 最大 rights 的子集，GRANT 同时用于 ProcessBindMemory 的 consume-on-success authority。init 的出生块固定安装同一 root core 的完整管理 Handle；内部 PoolBinding 与用户 Handle 共享 core，不复制额度。libkernel `MemoryPool` 是带 Drop close 的 affine owner，显式 `into_handle` 才把 authority 移回通用传输面。
+Buffer.clear对无需Rust析构的类型直接清初始化长度，其他类型仍运行slice析构；显式forget_values按mem::forget语义结束初始化值，但保留allocation与付款owner。CapTable在occupied=0（包括无Claimed）、Members在count=0（每entry=None）时先忘初始化前缀，随后bulkfree已空槽数组；没有用业务CLOSED跳过活authority。OrdMap的K限定Copy、remove已take所有V，len=0后同样忘空节点前缀，双数组的allocation与费用照常释放。ChangeStorage记录无Rust Drop，affine业务许可仍由取消/退休入口逐项收束；纯记录bulkfree不能替代业务退款。
 
-14 项 Pool host debug/release 用例覆盖守恒、并发、rollback、split/merge、wrong-owner、重复 identity、深度与 parent credit 消费；8 项 admission 用例覆盖单槽/批量全局与本地耗尽、部分失败退款、精确批量退款和 sponsor 强保活。启动自检另穿过 ProcessBuilder/ProcessControl、MemoryChange/Wait/Remote 组合准入与 backing slice 的本地耗尽或退款，以及 Pool 的错误 kind/role/rights、真实 sponsor exhaustion、Handle 输出预留失败、Prepared rollback、Commit、多引用、child-funded owner 来源保活与最后引用退款；debug `virt` core 已通过，既有阶段基线的 stress/release/sifive_u 完整 acceptance 结论不因本批改写。
+增长备已付空块，持领域门复核后 replace_storage 搬移值、不析构/分配/退费；旧空块保持同一种owner，带出高阶锁释放。旧/新来源分别付款，同时保留的峰值必须可负担。CapTable允许HANDLE_TABLE→Pool短边，Members在Job/Shell/Members门外准备/析构，Ready/Backing/VM ledger同样持owner。`ordered_table::OrderedTable<V,C,K>`的AVL链持OwnedBox<Node,C>，prepare显式payer，remove/pop返完整PreparedEntry；旋转/插入/摘除不退款，into_value/into_parts在外层才释放节点。Kernel的Job/Views/WaitSet全为MetadataCharge，未用候选由原操作到锁外清理。Buffer的显式try_reserve/try_reserve_exact要求caller提供Funding，只在门外准备；失败保原块，truncate/clear不退保留容量。操作scratch持同类owner，阶段转换不分配或析构付款。
 
 ## 资金化帧取得 broker
 
@@ -94,9 +95,50 @@ Counter 在成功 acquire 时更新原子峰值；Ready 前无并发时重置观
 
 内核 `task/memory_pool.rs` 的 `PreparedMemoryCharge` 与 `MemoryCharge` 把纯逻辑 `ChargeReservation/AllocatedCredit` 接回来源 Pool core：前者析构回滚 reserved，后者强持 Pool 并在最后析构时退 allocated。`frame.rs` 的 `ClaimedUserExtent` 只在 POOL 锁内摘取 geometry，锁外清零；通用 `FundedFrames` 内部不可见的 `funded_frame::Funded` 按 extents 在前、charge 在后的字段顺序析构，且不提供可提前拆散两侧 owner 的公共入口。AddressSpace 页表帧（root 与中间表同形）使用单页/单 extent 的专用 `FundedTableFrame`，避免把 64-extents 通用存储内联进空壳与 Bind 调用栈。BootPackage 则由不可伪造的 `BootHeldExtent` 表达未入库存的启动 owner，payload 经 root charge 转成可同步 split 的 `BootFundedExtent`；普通 broker 仍无绕过清零的 generic adopt。system tickets 继续由 `SystemSupply` 的独立类型拥有。
 
-AddressSpace root、中间页表、普通 anonymous backing 与有界多页 Tunnel backing 均经 funded frame broker 接入来源 Pool charge；内核启动自检复用正式 funding 入口与 broker 来源端口，不保留通用 raw adapter。匿名 backing 的多 extent owner 与页表投影共用锁外 funding seam，BackingSlicePermit 随每个 live/retiring extent owner 保活，Unmap 在 Commit 前按有界切分预算预留新 slice permits；Tunnel 返回正式多页映射几何，内部持有同一资金化 owner。bootstrap 先把 `BootHeldExtent` 与 root charge 合成同时强持两侧的 `BootFundedExtent`，再由地址空间于任何 ledger/PTE 发布前回填 prefix、以 `BootBorrowed` 只读投影完成可失败映射，最后无分配地把 owner 本体装入 backing；因此 quota 或映射失败时外层 owner 始终覆盖全部借用期。payload backing split 同步切割 boot-held 物理 owner 与 charge；ProcessDrain 在 AddressSpace 锁内只摘 `BootFundedExtent`/`PoolBinding`，调用层锁外先归物理后退额度。通用 backing 不向 generic broker 增加任意拆包。12 项 broker host debug/release 用例覆盖 quota/库存失败、非法 claim、extent 上限、清零前放弃、提交、跨 extent split/merge、wrong-owner、失败 owner 保全、析构顺序与双方程恢复；内核启动自检继续验证真实锁与 RAII 接线。
+AnySpace 的 root、中间页表、匿名与 Tunnel backing 使用同一 broker 来源 Pool。FundedTableFrame 实现 page_table::TableFrameOwner，TableTree 持唯一根和分支 owner。普通物理片段与 BootFundedExtent 都进入 SegmentMap；bootstrap 不保留独立 immutable lease 或 ObjectBacking 旁路。Unmap/整空间退休在 VM 锁内摘 owner，锁外按物理→额度顺序退款。
+## 分段 backing 与逐段退款
+
+`PhysicalExtent` 区分普通 FundedExtent 与保留内容的 BootFundedExtent；两者都提供守恒切分、物理投影和同源退款，SegmentMap 与 View 生命周期不按来源分叉。
+
+[memory_space::SegmentMap](../../os/memory_space/src/backing.rs) 按逻辑页起点索引物理/资金 owner，段保存 end 与覆盖 use 数。NodeReserve 在准备期预取节点；acquire 先验证连续覆盖/计数/端点额度，再切段增 use。RangeUse 不可复制，split_use 至多物化一个内部切界且不改变段 use 数；失败返原 token，append 失败返物理 owner，错误 map 的 begin_release 也返原 use。begin_retire 只关新 acquire/append，已有 use 继续拆分或释放。
+
+每次 release_step 处理一个段，仅零 use 段移交真实 owner，其他 View 仍覆盖的页继续保留。segment_at 只在 map 同步域内借单段 owner，跨锁保活仍须 RangeUse。`OrdMap<K,V,C>` 的 nodes/free 是两份固定 Buffer，`OrdMapStorage` 同时完成付款/分配后才一起发布；所需容量来自 nodes.len、未兑现预约和回收槽。候选不足不接受新额度；swap 后旧空块返外层，remove/unreserve只退逻辑槽。切段以 reserve_recycled 复用刚摘出的槽，insert/remove/切分提交均不分配。
+
+[vm/backing.rs](../../os/kernel/src/vm/backing.rs) 把 funded frames 分成 FundedExtent，并核对付款 Pool 与原 charge 同源；SegmentOwner 的切分同时拆物理 claim/credit，不退款、不取 Pool 锁。Backing 的 BACKING 锁在 ADDRESS_SPACE/VM_VIEWS 之后。初始索引容量由创建 Pool 付款，后续共享索引增长由触发操作的 Pool 付款；锁外备双数组、锁内复核/换块/预约，旧块锁外释放。最终段及预约均为空时，关闭准入并摘空存储，释放容量后才推进完成；core/观察 Arc 继续存活不推迟该退款。物理解析只返回一个连续段，不把多 extent 当连续。
+
+完整域 BackingOwner 独占 root use，public MemoryObject/Connection 放弃它时，原位关 acquire 准入并把 root 游标交给 backing 出生内嵌的唯一 Work。每步摘一段，锁外放物理/退 credit；仍被 View 覆盖的段保留给 View 自己的责任。创建失败尚无外部 use 时，释放原 funding 批，其 extent 数已有结构上界。
+
+Backing::fund 拥有匿名/MemoryObject/bootstrap 的 funding 准备；固定 64 extent 批次只存在于该调用链，不随大 VM 请求准备值传播。普通 BackingUse 只有 Arc<Backing>/RangeUse，不包含 Work、完成观察或等待锁。它由准备/事务/View owner 显式接管；retire 产生普通值型 BackingRelease，由已有事务/空间 Work 每次调用 step 处理一段，锁外退款后返回进展。完成后才允许销毁游标；直接丢弃尚有责任的 use/游标触发结构断言。BackingSplit 仅预取一个段节点，切分既有 use 不再分配记录。
+
+## 实物 View 索引与退休组合
+
+[vm/views.rs](../../os/kernel/src/vm/views.rs) 拥有每空间真实 use 和写许可来源；MemorySpace 拥有几何/权限/预约。两者不是可互相替换的副本，实物索引允许更细的等价切界。Body 出生 Views，ChangeWork/RetireWork 直接使用它，没有 RetireSink callback 或子退款执行器。
+
+PreparedView在ledger预约保护下锁外预付View与ObjectSource节点，最终准入后、首个有效PTE store前插入。commit借mut候选，仅移出需要的节点；重复ObjectSource仍在Preparation，VM锁外释放。prepare错误返原use，cancel取回未提交use，由同一操作回滚，不在Drop派生任务。ViewBoundary在VM锁外预付索引/物理切段准备，提交门复检两端是否需要切界，包括准备时None；缺同源候选保持ledger原样。commit重定位当前view，已成端点或实物消失时不消费候选，未用节点/credit由Operation锁外清理。已物化等价切界失败后不必合并。hold_writes先复用来源，缺失才锁外付节点并复检；最后来源节点也摘出锁外退款。
+
+ViewRetirement 同时保存精确 next 和当前 BackingRelease：每步取 next 对应的一项或推进一个物理段，不用“找不到条目”猜完成。游标结束后才取下一项、归还相应 WritePermit。父 Work 在自己的预算中完成退款，不登记 backing 子任务、不因 backing 释放而 Blocked。
+
+ObjectSource 按 ObjectId 强持 MemoryObjectCore，分别记录实物 view 和本空间 permit 份数；两者都为零才摘来源。只读 View 也保留原授权状态，使原 maximum=RW 的映射降权后可按相同对象状态重新申请写许可。切界增 view 份数，退休减 view 份数；permit 取消/退休在锁外调用来源。全对象计数仍只由 MemoryObjectState 拥有。对象适配见 [memory-object.md](memory-object.md)。
+
+ChangeWork/RetireWork把阶段移到唯一执行owner后在父状态锁外推进，Advancing防止观察者误判完成；两个独立Arc出生付款，末字段[`completion.rs`](../../os/kernel/src/vm/completion.rs)承接最后退款回执。全部先行私有字段析构、宿主费归还后才交回访问lease并交付完成。整空间须确认Views/许可索引空、根表和charge释放；父回收不强持待完成的RetireWork，激活后Body只保留VM/Views。Views Drop禁止无界清空尚有资源的索引。普通事务与永久封口保留各自协议。
+
+公开 MemoryMap/MemoryUnmap/MemoryProtect 由 [vm/operation.rs](../../os/kernel/src/vm/operation.rs) 接入：首份资源前出生 Operation/ChangeWork 和空间访问 lease，收集来源许可、ledger 预约、实物 use/切界节点、PTE 游标与表帧。未提交 Drop 把 Preparation 移交原记录 Rollback，逐项取消/退款；未挂入Views的许可用object+后缀起点标识，先直接取消后缀再经Views取消已挂入部分，所有几何/token/实际容量持续由同一失败根持有；部分取得的表帧直接存进操作，不在返回错误时集中析构。Map 在来源 capability 接管期间取得独立 use，按真实连续 PPN 分段构造 Install，不把整个 backing 当连续。
+
+Map 的 guard 参数是字节数、向上按页取整；结果槽由 UserWriteLease 预约。当前调用线程在 VM 锁内先经 SUM 写 payload 前缀，再以对齐 u64 release store 发布 committed cookie；之后 Views 安装、ledger Commit 和记录发布必成，不再异步写用户缓冲。成功调用通过已有单来源线程续体等待私有 DONE 并返回单位值，Caller 冻结只撤回复权。尚未提交的错误由原记录继续回滚，不依赖调用者重试。
+
+修改已有范围时，先在 VM 锁外准备两端实物候选与已付款 ledger 存储；回 VM 门核对真实容量、范围预约和两端候选，再先切实物、后切 ledger 并捕获快照。纯容量竞争退出门重采样，几何/来源变动则拒绝，ledger 原样。后续失败只能留下比几何更细的等价实物切界，不能让 ledger 比实物更细而破坏 drain 的精确游标。回滚或数据退休后还负责最后空表；Process/Builder/bootstrap/Tunnel 已消费同一空间/backing；完整预算由[对象链工作记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)承接。
+
+## 空表的最后离开者
+
+普通修改在叶 PTE fence 后释放旧 use/许可及未用表帧，但保留自身预约。TableCleanup 自底向上按预算扫描范围内部，忽略本事务而保护其他预约；固定批次满就发布新的 epoch/fence，确认并归还全部运输槽后，锁外释放该批表帧，再继续扫描。内部扫描不靠只检查两个端点代替。
+
+最终边界复查和 ledger complete 在同一 VM 临界区完成，固定批次可容纳两端的所有层级。这样两个相邻事务不能先各自跳过对方、再分别退出而漏掉空表。最低层不存在时仍检查更高层，不把“不存在”与“非空”混为停止条件。被摘边界表同样保持到额外 fence 完成，操作 DONE 晚于真实表帧/credit 归还。
+
+准备失败的 Rollback 也在撤预约的同一临界区复查边界；若摘到了表，原 ChangeWork 先 fence 再退表，不增设清理执行器。结果 lease 对应的页仍实际映射且在事务期间禁止失效，因此不会成为另一个无 PTE 的空表责任。保持预约期间，新大页映射不能抢占尚未处理的空分支；放行前该分支已摘或由相邻真实映射持有。
 
 ## 页表模式选择
+
+新 AnySpace 出生会核对 funded root 属于其付款 Pool、ledger 不跨用户地址域，并通过 mm::install_kernel_top_level 安装内核 direct-map/stack-window 的共享根项。TableTree 将这些根标记为借用，用户页表整空间 drain 不回收内核下级表；独立根表本体与 charge 在完成屏障之后释放。
 
 单模式（全系统同一 satp 模式）是共享内核映射的结构性上限而非妥协：内存物理上同一份，异模式 hart 各持平行映射树，反而割裂调度域（进程不可跨模式迁移）——多模式无收益。**当前实现固定 Sv39**（`os/kernel/src/mm.rs` 与上下文汇编按三级页表组装）；启动期按 DTB `mmu-type` 自动选式是后续工作——需要先完成模式常量贯穿（satp 组装、地址宽度断言）再打开选式，且选式应取全体 Application hart 的最小硬件上限与内核支持集的交集，不支持交集则拒绝启动。
 
@@ -120,7 +162,7 @@ Map 仍把连续 VPN/PPN 区间切成最大可行 mega 段。preflight 只读遍
 
 Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为目标区间部分覆盖的现有 mega 计数：完整覆盖直接改叶，部分覆盖逐级精确预留；普通 4 KiB Unmap 因而预留零帧。Unmap 对未映射洞保持宽松，Protect 则要求区间完整映射且当前 flags 全部匹配。split 后 512 个子项保持原物理连续性和 flags；Unmap Publish 自底向上剪除新空的 owned 分支并返回 owner，内核把它们随 `PublishedChange` 保活到 Remote ack 后，确认前不归还。
 
-页表 drain 使用 `DrainCursor<LEVELS>` 保存层级无关的固定宽遍历状态；每个 `step_drain` 至多摘一个 owned 分支 owner，调用方锁外析构后再推进。owned 槽与分支 ledger 清空后，`finish_drain` 才交出 root owner。`TableTree::Drop` 不遍历 PTE，只接受已 drain 的常数终态；未 drain 树析构立即拒绝。当前 AddressSpace 的 Building/bootstrap、Running 公开映射与 Tunnel ObjectView 均已接入 owner-aware API，并通过来源 Pool 在 AddressSpace 锁外供给 funded table owner；Running/Tunnel 以 `table_transaction_active` 独占 Prepared 到 Commit/rollback 的树代次，避免两个非重叠 ledger 事务因共享页表路径而形成 stale Prepared。
+页表 drain 使用 `DrainCursor<LEVELS>` 保存层级无关的固定宽遍历状态；每个 `step_drain` 至多摘一个 owned 分支 owner，调用方锁外析构后再推进。owned 槽与分支 ledger 清空后，`finish_drain` 才交出 root owner。`TableTree::Drop` 不遍历 PTE，只接受已 drain 的常数终态；未 drain 树析构立即拒绝。AnySpace 的 Building/bootstrap、Running 与 Endpoint 来源 Map 共用 owner-aware API；表页由来源 Pool 在 VM 锁外供给。PublishCursor 在每次 VM 锁内分批推进，不对在途操作保存会被相邻事务失效的旧 Prepared 树快照。
 
 ### 测试集（host）
 
@@ -128,18 +170,19 @@ Unmap 与 Protect 递归携带当前表的真实覆盖基址。preflight 只为�
 
 ## 用户地址空间纯逻辑规划器（os/memory_space crate）
 
-`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 且不依赖其它 crate 的内部规划模块。它只拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、物理帧、用户指针、hart 或内核对象。内核 `AddressSpaceState` 已把该 planner 与匿名 `OwnedBacking`、MemoryObject view、reservation-aware `TableTree` 组合为同一事务；Building/bootstrap、Running 公开映射与对象 lease 共用该 seam。planner 不带泛型 owner：对象 region 只存 `ObjectId + offset`，物理 backing 归对象 core，切割 view 不切数据 backing。
+`os/memory_space` 是 `no_std + alloc`、禁止 unsafe 的内部规划模块，使用 `funded_storage` 取得类型化容量 owner，不认识内核付款政策。它拥有页对齐半开区间、区域账本、backing view、权限、owner、事务阶段和 MemoryObject 写许可状态，不访问页表、用户指针、hart 或内核对象。内核 AnySpace 把该 planner 与 funded TableTree、实物 Views/Backing 组合；Building/bootstrap、Running 与对象 lease 共用该 seam。`MemorySpace<C>` 的泛型仅为存储 charge，对象 region 仍只存 ObjectId/offset，物理与资金 owner 由 SegmentMap/内核 Backing 持有。
 
-`MemorySpace` 在构造时一次性预留区域与在途事务的硬容量。有序 ledger 中每个 fragment 持唯一 `RegionKey`，同一次 Map 的 guard 与 mapping 共享 `AllocationKey`；fragment 另持 `AddressSpace`/lease owner、匿名 backing identity 或 `ObjectId + offset` view，以及当前/最大权限。`Anywhere` 在 ledger 与在途事务之间选 first-fit 完整空洞；`FixedEmpty` 不覆盖旧区域。Unmap 严格要求请求区间连续覆盖且 owner 一致，完整 reservation、usable-only、guard-only 与 mapping 中段都按精确交集切割；Protect 同样消费旧 key，只有 owner、种类、AllocationKey、连续 backing 与权限全部兼容的相邻 fragment 才合并。fault lookup 只返回 free、guard 或 eager mapping。
+`MemorySpace<C>` 构造时按 Limits 支付 region 双数组与固定 transaction Buffer；逻辑 max_regions/max_transactions 拥有准入真值。替换期间旧节点、新节点与预约同时存活，region 候选按实际需求锁外准备、锁内复核，不能用逻辑上限或 clear 代替储存成本。Reserve 失败返回原 ValidatedChange，调用者借出的 WritePermit Buffer 不变；内核 Operation 锁外补齐 RegionStorage 后再试。每个 fragment 持唯一 RegionKey，同次 Map 的 guard/mapping 共享 AllocationKey；owner、backing identity、当前/最大权限只由 ledger 拥有。Anywhere 选择完整 first-fit 空洞，FixedEmpty 不覆盖旧区域；Unmap 要求连续覆盖与同 owner，Protect 只合并 allocation/backing/权限等一致且不含 writable 对象的相邻片段。整空间 drain 清空所有值与事务后，AnySpace 锁外销毁私有容量再完成。
 
-变更由不可复制的类型状态表达：`ValidatedChange → PreparedChange → CommittedChange → PublishedChange → SynchronizedChange → RetiringChange → RetiredChange`。Validate 可以分配规划元数据但不改 ledger；kernel adapter 在同一 AddressSpace 临界区按 permit requirement 冻结对象 core 来源，强引用随 plan/prepared/rollback owner 穿过锁外准备窗口。Reserve 复检 region snapshot、真实范围冲突、UserWriteLease pin 与 WritePermit multiset，并预留 Commit 所需的 fragment、retire permit 和事务容量。rollback 只存在于 Commit 前并归还全部 permit。Commit 是不可失败的 ledger 线性化点，不再分配；其后的 Publish、Synchronize、BeginRetire、FinishRetire 与 Complete 也不返回可恢复错误，错配 token 视为内核所有权不变量破坏。Reserve 另把 object fragment 变化聚合为按 ObjectId 排序的 `ObjectRegionDelta { retiring, replacement }`。内核 AddressSpace 以有容量上限的 fallible AVL 持 per-object view owner；每次 object Map 都在 Commit 前以 `PreparedEntry` 分配候选节点，Commit 按当时表状态复用或安装并线性更新 `region_count`。因此 Complete 后并发 retire 即使摘除最后 owner，Commit 仍可用预付节点重建，不冻结易失的 Existing 判定。Retire 与 ProcessDrain 根据 O(1) 计数摘最后 owner，不扫描 live ledger，也不在 Commit 后追加来源容器。`begin_retire` 只把 retire owner 移入显式 `RetireBatch` 并进入 Retiring；`finish_retire` 拒绝仍含 fragment 或 permit 的 batch，故 ledger 只有在全部真实 owner 已逐项退休后才能进入 Retired。内核 AddressSpace 层按 translation intent 在 Commit 前准备真实表帧和 leaf 投影，Commit 后发布 PTE 与 ledger。
+`ChangeRequest` 由调用者稳定持有；`validation_capacity` 只采样目标几何、guard、实际 lease 投影和可写对象模板数，不预约或 mint。调用者在领域门外给 Funding 准备 `ChangeStorage<C>`：一份付费 OwnedBox 存储头持全部 typed Buffer，空候选不分配。Validate 在同一账本借用下复检容量并填槽，成功把存储头移入 `ValidatedChange<C>`；失败不取走 owner。coverage 借不可变 OrdMap 的首/末 key 与数量迭代，没有 key Vec；模板原地排序/压缩，无归一化副本。普通 remove 兼作身份快照，no-op Protect 保留独立快照，结果 lease 直接按 segments 的 RegionKey/几何/RW 复核。
 
-`UserWriteLease` 把非页对齐结果区间投影为固定上限的 writable backing segments，并以 RegionKey pin 到 Commit 或 rollback；与结果范围或变更 footprint 相交的其它在途事务返回 Busy。MemoryObject 状态独立实现 `Mutable → Sealing → Executable`：writable replacement 必须携带不可复制 `WritePermit`，permit 从 Reserve 覆盖到 retiring fragment 完成 Synchronize 后交给 Retire；最后一个 permit 退出计数时完成 seal，无人在等待也不回退状态。公共对象的 `EXECUTABLE` 电平与 WaitMany 等待面属于切片 7 的对象层，planner 只保证状态单向推进。
+阶段 owner 为 `ValidatedChange<C> → PreparedChange<C> → CommittedChange<C> → RetiringChange<C>`，始终移动同一存储头。已验证 token 在门外按归并后的实际模板/退片段/旧许可数准备物化数组；Reserve 最终复核 snapshot、冲突、permit multiset、身份序列和 arena 余量，全部足额后仅填槽/mint。供给许可数组始终由 caller 持有，成功把许可逐份移入 Region，错误保持 caller 数组和原 validated owner。Commit 只不可失败地交付责任，ledger 由 commit_step 分批发布；synchronize 的单一 RetiringChange 同时持同步证明与旧片段/许可，逐单位移出退休。complete 要求两类退休 owner 均空，注销事务并返回存储头供门外释放；rollback 撤预约后亦返回存储头，caller 按 RollbackStep 一次移出一个 Region/可选许可取消，再释放实物容量。完成/回滚返回的存储在 affine 元素已收束后可复用，清旧普通退休描述，不重复退休。
 
-`os/work_debt` 是 `no_std`、禁止 unsafe 的固定容量纯逻辑队列。每张表有稳定 `TableId`，跨表 cancel/publish/requeue/finish 在定位 slot 前拒绝并返还 affine owner；generation 耗尽永久退休。全局槽可在尚未知 owner hart 时 Reserve；最终 Remote ack 所在 hart 在 Publish 时成为 owner，槽进入该 hart 的 FIFO。Remote completion 正运行于同一次 `drain_current` 安全点，Remote drain 返回后会立即观察新 Pending，初次发布无需冗余 self-IPI；每个安全点最多推进固定步数，预算耗尽的未完成项回到同一 FIFO 尾部并重新敲 owner，Finish 后代次递增再复用。Pending 电平而非 IPI 边沿是真值：敲门失败只记录告警，scheduler idle 的双重检查禁止仍有 Pending 的 hart 入睡。Remote completion 本身只把 `PublishedSpaceChange` 转成持有 ledger token、table cursor、backing cursor 与 `RetireBatch` 的 `RetiringSpaceChange` 并发布 debt；safe point 每步最多摘一个 table owner/outcome、一个 backing extent、一个 object fragment 或一个 WritePermit，owner 都在 AddressSpace 锁外析构。最后一步依次 FinishRetire/Complete ledger、完成 Tunnel sink、兑销 mandatory operation、释放线程结果义务并唤醒 WaitContext；completion 与三类 metadata permit 随 work-debt 最后强引用一同消散。
+Views/Backing 按真实 fragment 和 permit 责任处理实物；ledger 不另维护 ObjectRegionDelta 或第二个退休批次。实际 PTE 储备与游标在提交前准备并付费，发布只借调用者 FrameOwner Iterator，不要求特定容器或进入帧来源。存储头、所有数组与旧/新换块峰值各按实际 layout/capacity 付款，空但保留的块不提前退款。
 
-host debug/release 共 19 项 planner 测试，覆盖区间溢出与对齐、容量和 backing 边界、Anywhere/FixedEmpty、双 guard、四类精确 Unmap、AllocationKey 保持与 RegionKey 消费、同 allocation 合并与跨 allocation 拒绝、owner/权限上限、object offset、UserWriteLease projection/Busy/rollback、非重叠并行事务、stale 与 permit mismatch 失败原子、显式 Retiring 阶段、live retire owner 禁止 Complete、seal/permit 逐项 retire、逐区域 drain，以及 2000 步确定性 shadow model 的逐页覆盖与 fragment 不重叠。`os/work_debt` 的 7 项 host 测试另覆盖全局容量回滚、owner FIFO 隔离、最小预算下多批重排与公平性、重复/缺失门铃下 Pending 电平、rearm、取消风暴与代次复用。通知/Finish 以及 MemoryChange/Unpublished/Termination 队列在各自 16 步安全点预算内为后置责任保留最低推进额度，主队列 turn 以扣除后的预算为硬界，不能侵占保留步。两 crate 的 clippy `-D warnings`、`just check`、默认 core 与 stress QEMU 验收均通过；stress 覆盖最小预算 Drain、Tunnel exit 与完整竞态矩阵。
+`UserWriteLease<'a>` 是 PreparedChange 内结果投影的借用，非页对齐地址区间的 writable segments 和 RegionKey 由同一付费存储头持有；事务记录保留结果范围至 rollback 或 complete，冲突事务返回 Busy。MemoryObjectState 单向 Mutable → Sealing → Executable：新写授权只在 Mutable 接受，既有 writable 区间的切分/缩小允许 replacement；总许可数仍为唯一真值。对象方法借 caller 门外预付的输出 Buffer，计数/容量全部检查后才追加许可，不在对象门内分配临时数组。取消或 TLB 同步后的退休逐份归还许可，最后一份退出后完成 seal，无人等待也不回退。公共 EXECUTABLE 电平由 [memory-object.md](memory-object.md) 的对象适配拥有。
 
+planner 用例覆盖地址/guard/权限、预约、切界、对象授权、逐片段退休以及只忽略自身的空表末项检查。页表用例覆盖 owner 投影、分步发布与 drain；运输/维护的跨 hart 组合不由纯层测试代替。旧 work_debt 表与对应消费者已删除。
 ## 内核地址空间与启动协议
 
 ### 链接与线性偏移
@@ -161,7 +204,7 @@ pub fn virt_to_phys(va: usize) -> usize { va - KERNEL_VA_BASE }
 - **布局**：每槽 `[槽底 guard | formal (stack_size − emergency) | emergency guard | emergency]`，步长 `stack_size + 2×guard`。formal sp 从 emergency guard 洞下方起；emergency 占槽顶、fatal 路径专用，独立 guard 使其溢出不再踩入 formal。物理侧按槽连续打包 `stack_size` 字节（formal+emergency 相邻），guard 纯虚拟不占帧——这是 Linux `CONFIG_VMAP_STACK` 同构：物理页同时存在于直映射别名中，但内核只经 sp/窗口 VA 引用栈，**禁止经 phys_to_virt 触碰栈内存**；该禁律由 debug 断言兜底（`phys_to_virt` 拒绝栈物理打包区，release 构建无检查）。qemu/virt 与 sifive_u 每槽均为 `0x40000`（256KiB，含 4KiB emergency）；8 槽占 2MiB，sifive_u 的 128MiB DRAM 成本为 1.56%。guard 洞为 `0x3000`，ELF audit 默认直接从 ELF 的 `STACK_GUARD` 派生 12KiB 上限，不保留独立的经验阈值或未经论证的扣减余量。显式 `--max-frame` 只能收紧、不能超过 guard。定长 `MAX_FUNDED_EXTENTS` 容器只作一次性 funding 事务结果、不进入常驻对象；调用链累计栈占用与单帧跳跃是不同约束，两平台运行栈仍由 guard fault 与 acceptance 共同验证。
 - **建表**：mm init 内、satp 发布前，静态子表（1 中间 + 若干叶表，不入帧池）按 `layout.mappings` 逐页映射（RW、不可执行——`flags::KERNEL_STACK` 无 X）、guard 洞置 invalid；所有 hart 与全部用户表共享同一子树。
 - **地址转换**：`virt_to_phys` 是全函数（直映射线性算术 + `layout.translate` 互逆）；`phys_to_virt` 只对 admitted direct-map range 成立，并在 debug 构建拒绝 `no-map`、范围外地址和栈物理打包区。同一栈物理页同时有直映射别名与窗口 VA，PA→VA 无唯一逆；SBI ecall 传 PA 前仍须经 `virt_to_phys`（console 缓冲在栈上即依赖此）。
-- **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；正常 ProcessDrain 在有界 Root 阶段逐槽剥离共享顶层项后才归还 root，`AddressSpace::drop` 只作未完成构造/回滚的防御兜底。
+- **用户表拷贝**：栈窗口槽随直映射槽一起拷入用户 root（trap 在用户 satp 下即取调度栈指针）；整空间自动退休在有界 Root 阶段逐槽剥离共享顶层项后才归还 root，`AddressSpace::drop` 只作未完成构造/回滚的防御兜底。
 - **bootstrap 边界**：cold-bootstrap 使用链接脚本固定的 32KiB 临时栈；它没有 formal/emergency 双窗口与独立 guard，但过渡表只按 4KiB 映射启动实际需要的内核镜像与 DTB 页，不再用 1GiB 叶掩盖栈越界或 `no-map`。全员 Online 后先撤销 bootstrap 临时叶再整体回投该区，单函数帧仍受同一 ELF audit 上限约束。
 
 ### 启动：PA 执行 → 高半区
@@ -183,30 +226,30 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 
 
 任意用户页表共享内核高半区与栈窗口，用户 trap 不切 satp；`stvec` 恒指共同内核入口。用户上下文存于内核对象，`sscratch` 存本 hart 陷阱锚。内核稳态 SUM=0，只有 user-copy guard 可以临时直访用户 VA。
 
+### 用户内存访问
+
+[`uaccess.rs`](../../os/kernel/src/uaccess.rs) 的直接拷贝接收 `AnySpace`，调用者持 VM 空间锁；[`AnySpace::check_range`](../../os/kernel/src/vm/space.rs) 检查溢出、用户上界与逐页 U/R/W 权限，使用 `TableTree::translate`，随后在 `SumGuard` 内直访用户 VA，不创建另一套页表遍历。空拷贝无访问；非空经 RV64 LB/SB 循环，不为合法 VA 0 构造 Rust 指针引用。提交 cookie 用对齐 SD 与 FENCE RW,W 实现 release 写，不依赖 AtomicU64::from_ptr 的 non-null 假设。跨空间结果交付使用同一 translate 预检，再逐页经物理直映射写入；输入、输出沿用单次用户访问长度上限。
+
+安全定宽 `write_user` 仅开放显式 ABI 输出类型白名单，其完整对象表示必须无 padding；任意 `T` 的输入/输出 helper 为 unsafe，由调用者论证位型有效与对象表示可读。输出失败只在 [`Thread`](../../os/kernel/src/task/process/thread.rs) 保存首次 UserAccess fault；trap 的 syscall 业务锁全部退出后调用 `publish_output_fault`，再经 Shell 冻结/VM 封口，不在空间锁内重入终止路径。所有现存用户访问使用 AnySpace，初始映像的 put_initial 只在 Building VM lease 内允许填充最终 RO/RX 页。
+
 ## 用户地址空间
 
-`Process.space` 是稳定 `AddressSpace` 外壳：单调不复用的 identity、translation/instruction epoch 和内部 `AddressSpaceState::{Unbound, Bound}` 锁分离。Unbound 不持 ledger、页表或页额度；一次性 ProcessBindMemory 发布的 Bound 状态持完整 `PoolBinding`、`MemorySpace` ledger 与 `TableTree`。Bind 在锁外从绑定 Pool 取得 funded root，并将唯一 root owner 移交给 `TableTree`；`PoolBinding` 只表达绑定 authority、资源来源与 metadata sponsor，不与树重复持有 root。Bound 内的 ledger 是全部用户区域的 VA 真值；anonymous 区域由 `OwnedBacking(BackingId + logical page offset + affine extent owner)` 持有，对象区域由地址空间持有的 per-object view owner（对象 core 强引用 + `ObjectViewPermit`）引用对象的固定 backing，PTE 只是投影；object-owned lease（当前只有 Tunnel）另持 `ObjectMappingLease` 作为撤销凭据，进程自有 view 以账本区间与 AddressSpace authority 为真值，不铸造第二份身份。对象映射按对象几何投影出的物理 span 序列逐段准备 translation，表页按段独立预算，与匿名多 extent 映射同形；单页 view 仅是同一投影的退化情况；Tunnel 也使用有界多页几何。view 越界以 `ObjectViewAuthorization` 携带的对象固定长度为准。Remote Call 只引用外壳身份与 epoch。Running 变更在 Commit 前快照 lifecycle execution gate，准备 planner/backing 或 WritePermit/PTE/WaitContext、三类 metadata permit、deferred-work 槽和全部 Remote 目标槽；`commit_shootdown` 在 AddressSpace 锁内先检查 translation epoch 及本次需推进的 instruction epoch，耗尽则在 ledger/PTE 修改前拒绝；发布闭包之后，`publish_epochs` 经 `advance_epoch` 的 checked CAS 前进，依靠同锁串行发布保证预检仍成立，不回绕写零。Commit 在 `ADDRESS_SPACE → LIFECYCLE` 下复检 active sequence、发布 ledger/PTE/epoch 并登记 mandatory operation，锁外敲门铃。最后 ack 只进入 Retiring 并发布 work debt；owner hart 在后续 trap/scheduler 安全点逐批退休资源，最终 Complete 才解除外部义务。
+Body强持已付款VmShell、Views和出生待激活RetireWork；后者在激活时把唯一保留根交执行器，父回收只观察独立完成事实。VmShell锁拥有AnySpace、entry/access/Building门、active集合、epoch和访问租约。AnySpace ledger是VA真值，TableTree是物理PTE/root owner，Views是仿射backing use/对象许可索引。门控制的执行owner先取稳定satp/epoch，锁外本地同步，回门复检后才记active；切回supervisor satp后退出active。RunPermit先交回VM强根，再发布Shell运行计数归零；VmAccessLease在同VM门内先交回本强根再发布access计数归零。父Body/退休责任在非零计数时保活VM，同门复检使quiescent也证明贷款强根已交回，不能只靠先减计数、稍后drop字段。
 
-低半区 `[0, 2^38)` 完全归用户；Bind 构造 root 时通过 `attach_shared_root` 挂入内核高半区顶层项（含栈窗口槽），PTE 安装与 shared 位登记同一调用完成。ELF、StartupBlock 和首线程栈只在 Bound 后由 Building 组装事务建立。Building 期 `image_end` 是已成功提交的低地址映像区上界：只由不进入固定主栈窗口的映射推进，单调增加；它用于约束 StartupBlock/出生块的放置，不是 ELF 文件长度，也不是 Running heap top。用户态 loader 的 `image_top` 是独立的 ELF 规划结果，供 loader 计算出生块基址；二者都不得把固定主栈窗口 `[USER_TOP - STACK_SIZE, USER_TOP)` 当作映像区。首线程栈仍是 launcher 在 `2^38 - 8MiB` 建立的启动资源；内核只为 primordial init 执行同构 bootstrap 映射。ASID 恒 0，地址空间切换与 Remote Call 第一版均执行保守全量 `sfence.vma`。
+低半区由 PROCESS_USER_TOP 定义；空空间出生就付 root，挂入内核 shared 高半区项，没有 Unbound/BindMemory。ELF、块与栈只在 Building 准入内建立；公开 stack/heap 均为普通 Map。ASID 恒 0，切换与修改保守使用全量 sfence.vma；取指变更另 fence.i。几何规划、页表发布和实物索引由同一 VM 锁协调，退款与对象状态锁在外。
 
-- `MemoryMap = 0x50` 接受 80 字节固定宽 request，`source` 字段声明 backing 来源（零为 anonymous，否则为具 `MAP` 的 MemoryObject Handle 与页对齐 `source_offset`）；anonymous 来源开放 Anywhere/FixedEmpty 与 R/RW，对象来源另按 Handle rights 允许 RX。64 字节 result 含 usable/reservation 几何、三项零保留字段及偏移 56 的末字段 committed cookie；libkernel mapping cookie 来自非零单调 allocator，最大值发行后永久返回 ReachLimit，不回绕复用。Reserve 以 `UserWriteLease` pin 已存在的 RW 结果槽并保存物理投影；所有资源准备完成后先写 payload，execution gate 内以 release store 发布调用者的非零 cookie，再不可失败提交 ledger/PTE。成功返回前 Remote ack 已完成，Commit 后不再 uaccess；cookie 为零时 payload 无语义。
-- `MemoryUnmap = 0x51` 对普通 AddressSpace owner 执行严格全覆盖与精确区间切割；空洞、guard/mapping 种类违约或 lease owner 拒绝整笔请求。Unmap 与 Protect 都是两段式：Validate 在 AddressSpace 锁内定几何、冻结对象来源强引用，并报告 `WritePermit` 多重集与 writable replacement 的继承属性；permit 在 AddressSpace 锁外向冻结来源取得后重入 Reserve——对象状态锁秩低于 AddressSpace。既有 writable view 被部分撤销或降权时，存活片段取得只延续原写范围的后继 permit，因此 Sealing 可继续收缩；原只读范围升权仍被拒绝。Unmap 的页表投影按完整连续请求聚合成一个 Remove，Guard 区间自然为空。匿名 `OwnedBacking` 以 `reserved_extent_growth` 统计全部在途事务尚未兑现的最坏 Vec 增长；Remote ack 后每步只切下一个 owner，替换 extent 时把旧 metadata permit 回收到同一 continuation，只有双 survivor 的净增长才永久消费预付 permit。物理 owner 随后在 AddressSpace 锁外归还；Protect 的旧视图仍被新 ledger 完整覆盖时以 `BackingRetire::Retain` 跳过 backing 释放。
-- `MemoryProtect = 0x52` 只在创建时最大权限内改变 mapping；公开匿名 Map 不接受 RX，RW 区不能转 RX。RX object Map 与涉及执行权限的 Protect 变更都由 MemoryChange 的真实 Install/Protect 意图推进 instruction epoch 并触发 `FENCE.I`；删除或普通数据映射只需地址翻译同步。
-- `libkernel::MappedRegion` 不可复制，记录 reservation 与可选 usable 子区间；完整 Unmap 消费 token，部分 Unmap 返回左右至多两个 mapping/reservation-only fragment。`libruntime` 的全局 talc allocator 持固定 64 槽 arena inventory，以 64KiB 起步并几何增长到 16MiB，不在 acquire 路径为 arena 元数据递归分配。`Extend`、sbrk wrapper 与 Running heap transaction 已删除。
-- `libthread::ThreadFactory` 用 anonymous `MappedRegion` 建立 `[低 guard | usable | 高 guard]`，usable 大小按页上取整，sp 取 usable.end。`spawn` 在提交前建立栈和 closure packet，失败先释放 Created 的最后 Control 引用，再交普通 cleanup；成功后 Registry record 持有 ThreadControl、完整 reservation 和环境 residue，packet 由 PreparedThread 或 worker 独立持有。Registry reap 先执行 residue retire，再释放 record 的 Control 引用，随后以预算推进 unmap；`ResultReceiver::Drop` 不等待、不执行 reap，只放弃结果引用。Unmap 的 transient `ObjectBusy` 保留 record 等待下一次推进，旧栈 owner 的 abandoned 计数和 `stack_cleanup_snapshot` 已删除；不存在 `libthread::spawn_raw` 资源逃生口。
-- owned anonymous、ELF、bootstrap stack、StartupBlock 与公开 Map 页均由 `OwnedBacking.extents` 持有。Running anonymous、object view 与 Building `ProcessMap` 共用同一个事务核：先精确 preflight，锁外取得 funded table owners 与来源侧 affine 资源，再在锁内复检并不可失败 publish；root owner 已归 `TableTree` 持有。固定主栈映射不推进 `image_end`。
-- bootstrap StartupBlock prefix 是 owned backing；opaque payload 页由 boot-held token 直接转为 root-funded immutable lease backing，不经历“先回库存再取出”的窗口，地址空间销毁时在锁外同时归还物理 extent 与 charge；initial ELF 复制完成后 package prefix 页对齐前缀回投帧池；
-- ProcessMap/Write 只服务精确 Building 且已 Bound 的 process；Map 创建 anonymous zero pages并使用最终权限，拒绝 write-only/W+X。Building Map 同样采用 plan → 锁外 table funding → complete/commit；成功提交后才推进 `image_end`，固定主栈映射不改变该游标。Write 经已发布 PTE 的物理直映射回填 backing；Unbound 返回 ObjectNotAvailable，Running 发布后不再存在该写入口；
-- ProcessDrain 对 Unbound shell 直接完成；Bound 先逐区域清空 ledger，再逐 extent 归还 backings，最后收束页表与 PoolBinding。lifecycle 的 Building/mandatory operation 屏障分别保证截止前组装提交资格与 REAPABLE 前无公开在途 `PublishedChange/RetiringChange`；已进入终止的 committed 事务仍由原 work debt 完成，发起线程消散不改变所有权。
-- MemoryObject 与 Tunnel 的 object-backed mapping 共用 `ObjectViewAuthorization`/`WritePermit` 和 AddressSpace 事务核；本篇拥有 backing、ledger、远端确认和锁外 retire 的通用机制。匿名与对象来源、Running 与 Building authority、结果 cookie 与 view 发布已在内核 reservation 字段中汇合，但调用点仍分别编排准备、失败与提交，不能据此宣称整个深模块接口已收口。MemoryObject 公共对象接入见 [`memory-object.md`](memory-object.md)，Tunnel 的 Connection、Endpoint、Invitation 和 detached close 编排见 [`tunnel.md`](tunnel.md)。
+- MemoryMap 请求的来源零值为匿名，否则是 MemoryObject/Endpoint authority；目标权限按 READ/WRITE/EXECUTE 校验，Endpoint 无 EXECUTE。Map 结果 cookie 最后 release 发布，之后无可失败用户写回。Guard 单位为字节。
+- MemoryUnmap/Protect 预约精确范围，先准备物化实物边界，再细分 ledger；来源许可与退款节点在提交前取得。已提交内容由 ChangeWork 分批发布/fence、退片段和空表，不要求调用者活着。RO View 保留其对象授权来源，合法再升权仍经对象状态校验。
+- Map 的公开入口、ProcessMap 与 bootstrap 共用 Operation。在首份资源前出生 ChangeWork；失败 Drop 把准备包移交该记录 Rollback，范围/表页/use/permit 都有归还 owner。成功直接由同一记录发布与退休，不为每 use 再出生子 Work。
+- ProcessStart 关闭 Building 修改，启动记录等访问租约与 VM 操作清零后开放 entry；整空间退休等入口封闭、active、访问租约，再逐区域/实物 use/表帧释放。最终根表与实际资金结算后才可释放 Body。
+- Tunnel Close/Attach 不改 VA/PTE。Connection root 与普通 Endpoint View 由 BackingUse 独立保活；映射使用 MappedRegion token 显式 Unmap，进程退出使用相同 RetireWork 收束。
+- libkernel MappedRegion 保存完整 reservation 与可选 usable 区间，部分 Unmap 返回左右残片；libruntime allocator 与 libthread 栈是其实际消费者，退出等 ThreadControl DONE 后才允许释放栈。
 
 ### 事务完成责任
 
-`MemoryChangePlan` / `MemoryChangeReservation` / `PreparedMemoryChange` / `PublishedSpaceChange` / `RetiringSpaceChange` 是同一组合事务的阶段 owner：Validate/Reserve 可以返回完整失败责任；Commit 只消费预付 ledger/PTE/backing/view/epoch/Remote/work 凭据；Remote 最后确认把唯一 completion 发布到 owner hart；Retire 逐项释放真实 owner后才 Complete ledger。
+Operation的Prep以PreparationPlan持candidate/validated/reserved唯一owner和已付PTE游标/储备、boundary、caller许可数组、来源use。Prepared View失败返use，不另造补偿Work。ChangeWork完成数据退休后在VM门复查末项、释放范围预约；已摘空表仍经附加fence/退款。Outcome::Done只结束推进，最后执行/发布/wake强根消散后，末字段才退宿主费、归还访问资格并发布DONE。Operation.submit发布前取得返回的观察来源，避免完成并销毁先于取得来源。回滚同样在撤预约前复查边界，不遗漏上层空分支。RetireWork最后退款只提交Shell来源的内部完成事实；Body销毁后父回收再发布Process DONE。独立观察来源可由真实观察loan继续付费存活，不保活私有执行宿主。
 
-完成尾段拆为 `CompletionFinalization`：mandatory operation、线程结果义务与 WaitContext 各占独立步骤。对象通知只发布预付 debt，waiter offer/cleanup 在后续安全点逐项推进；最后 Arc、WritePermit、view owner、table/backing owner 都在所属业务锁外释放。`UnpublishedBound` 使用出生时预付的独立 debt 槽，显式 rollback 发布有界 ProcessDrain 责任；Drop 只断言 token 已被 publish/rollback 消费。
-
-Tunnel 显式 close 仍经完整 MemoryChange、Remote ack 和 peer notice；REAPABLE detached close 不再建立第二笔 Unmap 或取得 funding，逻辑 close 后由 ProcessDrain 整体收束 ledger/PTE/view。当前结构与验证边界见 [`地址空间事务与启动纵向档案`](../../plans/archived/todo-2026-09-memory-transaction-state-machine.md)。
+vm::remote 使用每 hart 的侵入式 FIFO 收件链与内嵌 Batch，发布前由操作取得全体目标 slots。ack 和槽归还都完成后才允许相关帧退款；最后 ack 用预先 arm 的 WakeToken 唤醒原 Work。每 hart LocalEpoch 只由所属 hart 更新，属于运输与执行门的同步事实，不是 active 集合。来源 Hint 与 DONE 只促使重试，结果通过普通等待续体交付寄存器值；没有 ThreadResultObligation、WaitContext 或异步用户输出指针。
 
 ## 架构边界
 

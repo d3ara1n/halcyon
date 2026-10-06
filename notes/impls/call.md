@@ -1,31 +1,29 @@
 # 内核调用实现
 
-方向见 [`../ideas/call.md`](../ideas/call.md)。系统调用 ABI 为 a7 调用号、a0–a5 参数，返回 a0 错误码与 a1 值。
+方向见 [call idea](../ideas/call.md)。系统调用 ABI 为 a7 调用号、a0–a5 参数，返回 a0 错误码与 a1 值。真实分发使用 Shell/Body、持久续体、普通 View/许可根与单次 capability 运输；任务进度与验收证据由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。
 
-## 同步调用
+## 同步调用与输出错误
 
-同步 handler 在一次 trap 内完成：结果写入 UserContext、sepc 前进 4，dispatcher 返回 Resume。输入/输出地址在操作前按需预校验，已成功操作的最终固定宽或多段写回使用 `uaccess::deliver_output/deliver_bytes`；若同进程另一线程在两次 AddressSpace 临界区之间拆除输出映射，复检失败以发起 tid 和失败用户 VA 冻结 `Faulted(UserAccess)`，trap 在业务锁释放后执行终止待办，不把已发生副作用报告为可重试成功。提交前尚能回滚的槽位/队头由其 owner 无损归还。
+同步 handler 在 trap 中操作保存的 UserContext，sepc 前进 4，返回 Completed/Resume。异步完成续体先 detach 并取走唯一 Entry，再在 set_result 推进 sepc 4 并写返回值；未就绪重停驻和退出 detach 都不推进 PC。输入和输出经当前 AnySpace 的 translate 前置校验与受保护 SUM 直访；已发生副作用的最终输出使用 uaccess::deliver_output/deliver_bytes。复检失败只在当前执行 owner 的 Thread 中登记 output_fault/失败地址；业务锁全释放后，trap 调 publish_output_fault 冻结 UserAccess 终因并执行退出，不能把已成功业务报成可重试成功。
 
-`deliver_output` 失败时在持业务锁的范围内只冻结 Fault 终因，唯一 TerminationTodo 移入当前 Thread 的固定 `output_termination` 槽（MEMORY_COMPLETION 秩）。handler 返回后全部业务 guard 已释放，trap 尾段经 `finish_output_termination` 执行 IPI、termination debt 与通知；执行容器保持 Thread 存活，未交付待办禁止随 Thread 析构。随后生命周期检查将出口改为 Killed，不再返回用户态。其它 hart 的并发终止同样由最终出口检查吸收。
+提交前还能回滚的表槽、队头和 VM 准备由各自 owner 归还。DebugPrint 的有界 SUM 读取先由执行者 Pool 付款 MetadataBuffer，复制/输出结束后归还；metadata拒绝与allocator OOM分别返回，临时存储不隐式占用未付款堆。SystemReset 是终局同步调用，固定宽参数与 capability 校验后进入单次平台调用；后端拒绝或异常返回才写错误。权限与 SBI 映射由 [internals.md](internals.md) 拥有。
 
-`SystemReset` 是终局同步调用：dispatcher 完成固定宽参数与 capability 校验后进入单次平台调用；成功按契约不返回，后端拒绝或异常返回才写入 syscall 错误并恢复调用线程。对象、SBI 映射与错误语义见 [`internals.md`](internals.md)「idle 与系统复位」。
+## 等待与已提交操作
 
-## 异步调用
+WaitPlan 位于 sched::HART_WAIT_PLANS 的 per-hart 内联槽，交接不分配。执行点离开 VM/hart 现场后才安装 Thread 内嵌节点与续体；Waiting 的唯一执行 owner 在成员槽中。来源只按 epoch 提示 pending，调度续体每次复检一次，正常返回与 Frozen 退出共用 detach。机制分别由 [task.md](task.md) 与 [ipc.md](ipc.md) 拥有。
 
-dispatcher 把 `WaitPlan` 移入 `sched::HART_WAIT_PLANS` 的固定 per-hart 内联槽并返回 Wait，意图交接不分配。调度循环在 `clear_context` 后对所有 Switch 出口统一取走意图：Park 在清 active 后把 `AdmittedThread` 整体交给 `WaitContext`；Killed 在清 active 后放弃未安装计划；Requeue 必须无意图。普通 WaitMany/Sleep 在安装时创建 Context；Commit 后必成的内核事务在 Commit 前预构造不含线程的 Installing Context，使 Remote completion 可安全早到并 Deferred。线程与全寿命调度准入只在离开执行点后移入 Context。
+WaitOne 返回当前电平/关闭/到期；Sleep 使用绝对期限。内部 VM 完成计划仅持私有 DONE 来源并标记返回单位值 a1=0，不携带异步用户输出指针。早到完成由安装后复检观察；线程冻结可以放弃回复，不取消独立 Work 已接管的发布/回滚/退款。
 
-WaitPlan、WaitContext、TimeoutRegistration、订阅清理与 rejected-park 竞态由 [`ipc.md`](ipc.md) 唯一记录。调用层当前有三种交付：WaitMany 写回观察结果或错误，Sleep 在相对超时到达时写回成功，内核事务 action 在业务 Complete 后写回已承诺的结果。终止 Abandoned 不交付结果；若业务结果先于 rejected park 到达，安装者仍以 Abandoned 放弃回复权，业务事务本身已经独立收束。
+## VM 真实消费者
 
-dispatcher 的 Wait 出口不提前改为 Killed，终止竞态由等待安装路径吸收。
+公开 MemoryMap/MemoryUnmap/MemoryProtect 分发到 [vm/operation.rs](../../os/kernel/src/vm/operation.rs)。Operation 出生并付款维护宿主/数组/完成来源，取得 VM access 后才受理业务资源；失败移交同记录 Rollback，成功进入 Publishing/fence/直接退休/空表清理。Outcome::Done只结束推进，最后live宿主销毁/退款和访问强根交回后才通知独立来源；持久等待续体复检观察，不造请求专用容器或逐use子任务。
 
-## Remote Call
+Map 按共享 ABI 解释 guard 字节数，结果槽由 UserWriteLease 预约。调用线程在自己的用户页表下、持 VM 锁写 payload 前缀，再 atomic release store committed cookie，随后 Views/ledger 的责任 Commit 必成，不再 uaccess。PTE/ledger 发布在 Work 中按预算推进；数据与空表退款都完成后才通知成功。准备错误可以先返回，已经接管的回滚责任仍自主执行，并用 VM access 防止空间提前退出。
 
-`os/remote_call` 是 `no_std`、禁止 unsafe 的固定槽纯逻辑核心。内核为每个 admitted hart 配置 4 个槽；槽状态按 `Empty → Reserved → Pending → Taken → Empty/Retired` 单向转换，reservation 与 finish token 均不可复制并携带 `TableId`，跨表错误在定位 slot 前拒绝且原样返还 owner；generation 在复用前前进，耗尽时永久退休以拒绝 ABA。Reserve 容量不足不发布请求；Commit 前取消精确归还；Pending 电平是工作真值，门铃合并、重复或单次失败都不丢请求。host 测试覆盖固定目标容量与回滚、目标隔离、门铃电平、完成乱序、有界 take、跨表 owner 返还和 generation 永久退休。
+ProcessCreate使用a0=Job、a1=Pool、a2=control rights、a3=结果地址；Control权限按显式请求校验类型上限，Builder固定MANAGE|GRANT|TRANSIT且不可复制；ProcessMap与ProcessStart返回内部完成计划。Builder/bootstrap复用统一操作链，Start的完成回执不携Body指针并阻止Frozen领先私有宿主退款。Tunnel的Endpoint来源通过普通Map，Create/Attach不持映射。具体责任与验证边界由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。
 
-内核 `remote_call` adapter 用 `REMOTE_CALL` 锁秩（650）包装全局固定表。`ReservedBatch` 在业务 Commit 前一次取得完整目标集合；admitted slot mask 在 registry 安装时以 release 发布为不可变原子快照，Reserve 可在业务锁内无锁验证目标，slot→raw hartid 展开仍只在锁外门铃边界读取 registry。`publish` 只在 `ADDRESS_SPACE → LIFECYCLE → REMOTE_CALL` 正序内发布请求并返回 affine `Doorbell`，调用者释放业务锁后才执行 `FENCE RW,RW` 和 SBI IPI。Remote Call 门铃失败返回失败位图并保留 Pending，不把已 Commit 业务改写成错误。目标在用户 trap 入口/出口和调度循环安全点每次最多处理 4 项，动作及最后完成回调均在槽锁外执行。
+## Fence 运输
 
-当前首个动作是地址翻译同步。请求携带稳定 AddressSpace identity、translation/instruction epoch 与失效范围；ASID 恒 0 的第一版保守执行本 hart 全量 `SFENCE.VMA`，instruction epoch 非零时再执行 `FENCE.I`，随后以 release RMW 确认。最后确认者通过同一原子 release sequence 的 acquire 侧调用业务 `Completion`；槽在动作与确认之后才复用。每 hart 另记最近完成的 identity/epoch，它不是 active 集合，只服务 execution gate 的 enter/leave 复检。
+[vm/remote.rs](../../os/kernel/src/vm/remote.rs) 的 Transport 随 ChangeWork/RetireWork 出生，每目标 hart 一个可复用槽。PTE/epoch 发布后将槽加入目标 FIFO 收件链，不分配、不竞争全局容量；FIFO 避免持续新批次插队使早期事务饥饿。目标在安全点按预算取槽，执行本地翻译/指令同步、归还槽，再 release ack；最后 ack 方锁外唤醒 owner，之后不再访问旧批次。最终确认包含“fence 完成且槽已归还”，零目标使用同一完成谓词立即唤醒。
 
-Process lifecycle 的 active 位图仍是执行成员唯一真值，并以单调 execution sequence 拒绝 active 离开后恢复同值的 ABA。dispatch 在 gate 外同步 epoch、gate 内复检后才登记 active；Requeue/Park/Killed 先在锁外消费 Pending，再在 gate 内确认已达当前 epoch 后清 active。AddressSpace 稳定外壳已提供 `prepare_shootdown → commit_shootdown → ShootdownSynchronization::start`：Reserve 快照 active 并预留全部槽，Commit 以 `ADDRESS_SPACE → LIFECYCLE` 复检、发布 PTE 闭包与新 epoch，锁外才 ring；空目标集锁外直接完成。启动探针分别验证全部 admitted hart 的运输/fence/ack，以及 primordial process active snapshot 下的真实 epoch shootdown；virt debug/release 与 sifive_u 均出现完成锚点并通过 10/10 竞态矩阵。
-
-真实 MemoryChange 消费者包括公开 `MemoryMap/MemoryUnmap/MemoryProtect`、TunnelCreate/Attach 和显式 Endpoint HandleClose。它们在 Commit 前准备 planner/backing 或 WritePermit/PTE reservation、无 Thread 的 WaitContext 与 Remote slots；Commit 同步发布 PTE/ledger/epoch 并登记 lifecycle mandatory operation；最后 ack 的 completion 推进 `PublishedChange → Synchronize → Retire → Complete`，再解除 mandatory 屏障并交付已承诺结果。Map 另以 `UserWriteLease` 固定 64 字节结果槽的物理投影，先写 payload，再以末字段 release cookie 作为不可逆提交承诺，之后不再 uaccess。Tunnel Close 的 retire sink 在确认后归还 WritePermit、发布 CLOSED/PEER_CLOSED；发起线程若同时终止只放弃回复权，不撤销事务，REAPABLE 严格等待 mandatory operation 归零。
+发布者释放全部业务锁后发门铃；门铃失败不丢FIFO pending，idle双检禁止带待收槽WFI。active/epoch属于VmShell，enter/leave与当前epoch复检协作；它与Shell冻结gate分别拥有事实。Work实际host与transport按布局一起付款，运输是宿主字段，不保留平行固定全局槽表、ReservedBatch或旧请求消费者。

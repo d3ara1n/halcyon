@@ -2,7 +2,7 @@
 //!
 //! 设计见 plans/todo-2026-10-01-memory-redesign.md 设计轮次 3：
 //! - 同一空间表页全部来自固定空间账户；同源校验在不可失败的 `adopt` 之前
-//!   （准备期 [`TableMem::check_source`]）。
+//!   （AnySpace 准备期检查 owner 账户）。
 //! - `reclaim` 是所有权移交，不是退款：返回物理帧 + 恰好一页 charge 的完整
 //!   affine owner，由调用者在 TLB 安全条件满足、锁外放帧后才退款。
 //! - 聚合账 `Option<MemoryCharge>` 表示 0/N 页；页数与 `TableTree` 分支数守恒。
@@ -11,11 +11,7 @@
 use funded_frame::QuotaCredit;
 use page_table::{FrameNumber, TableFrameMemory};
 
-use crate::{
-    frame::FundedTableFrame,
-    mm,
-    task::memory_pool::{MemoryCharge, MemoryPool},
-};
+use crate::{frame::FundedTableFrame, mm, task::memory_pool::MemoryCharge};
 
 /// 一个地址空间的表帧访问与聚合 charge（TableCharge）。
 pub(crate) struct TableMem {
@@ -25,16 +21,6 @@ pub(crate) struct TableMem {
 impl TableMem {
     pub(crate) const fn new() -> Self {
         Self { charge: None }
-    }
-
-    /// 当前仍由表树持有的分支表页数（不含已摘出待释放的在途 owner）。
-    pub(crate) fn held_pages(&self) -> usize {
-        self.charge.as_ref().map_or(0, MemoryCharge::pages)
-    }
-
-    /// 准备期同源校验：准备页必须来自本空间账户，否则拒绝（可失败阶段）。
-    pub(crate) fn check_source(&self, account: &MemoryPool, frame: &FundedTableFrame) -> bool {
-        frame.charge_pool_is(account)
     }
 }
 
@@ -62,7 +48,10 @@ impl TableFrameMemory for TableMem {
     }
 
     fn reclaim(&mut self, frame: FrameNumber) -> FundedTableFrame {
-        let total = self.charge.as_mut().expect("reclaim with empty table charge");
+        let total = self
+            .charge
+            .as_mut()
+            .expect("reclaim with empty table charge");
         let one = if total.pages() == 1 {
             self.charge.take().expect("table charge present")
         } else {

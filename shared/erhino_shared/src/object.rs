@@ -128,11 +128,10 @@ impl ObjectSignals {
     pub const READABLE: Self = Self(1 << 0);
     pub const WRITABLE: Self = Self(1 << 1);
     pub const DATA: Self = Self(1 << 2);
-    pub const REAPABLE: Self = Self(1 << 3);
     pub const DONE: Self = Self(1 << 4);
     /// MemoryObject 已进入 Executable 终态：可建立读执行 view。置位后永不清除。
     pub const EXECUTABLE: Self = Self(1 << 5);
-    /// 对端已建立映射且尚未关闭，不表示页内协议或业务 Start 已完成。
+    /// 对端 Endpoint 已接入且尚未关闭；普通 Map 与页内协议 Start 分别提交。
     pub const PEER_ATTACHED: Self = Self(1 << 6);
     pub const PEER_CLOSED: Self = Self(1 << 62);
     pub const CLOSED: Self = Self(1 << 63);
@@ -140,7 +139,6 @@ impl ObjectSignals {
         Self::READABLE,
         Self::WRITABLE,
         Self::DATA,
-        Self::REAPABLE,
         Self::DONE,
         Self::EXECUTABLE,
         Self::PEER_ATTACHED,
@@ -238,6 +236,8 @@ pub enum ObjectKind {
     MailboxOnceSender = 16,
     NotificationSignaler = 17,
     ReplyObservation = 18,
+    ThreadStartTicket = 19,
+    NotificationObservation = 20,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +293,10 @@ mod tests {
         assert_eq!(Rights::CREATE.raw(), 1 << 9);
         assert_eq!(Rights::EXECUTE.raw(), 1 << 10);
         assert_eq!(Rights::KNOWN.raw(), ((1 << 11) - 1) & !(1 << 7));
-        assert!(!Rights::from_raw(1 << 7).is_known(), "retired MAP bit stays reserved");
+        assert!(
+            !Rights::from_raw(1 << 7).is_known(),
+            "retired MAP bit stays reserved"
+        );
         assert!(Rights::EXECUTE.is_known());
         assert!(!Rights::from_raw(1 << 11).is_known());
     }

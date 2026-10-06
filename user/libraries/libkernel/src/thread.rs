@@ -25,10 +25,10 @@ pub unsafe fn create(
 ///
 /// # Safety
 ///
-/// `control` must be a MANAGE-capable ThreadControl entry owned by the caller.
-pub unsafe fn start(control: Handle) -> Result<(), SystemCallError> {
+/// `ticket` 必须是调用方持有的 ThreadStartTicket 启动权。
+pub unsafe fn start(ticket: Handle) -> Result<(), SystemCallError> {
     // SAFETY: forwarded to the syscall wrapper.
-    unsafe { super::call::sys_thread_start(control) }
+    unsafe { super::call::sys_thread_start(ticket) }
 }
 
 pub fn yield_now() -> Result<(), SystemCallError> {

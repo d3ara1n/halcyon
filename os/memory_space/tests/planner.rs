@@ -3,10 +3,12 @@
 use memory_space::{
     AddressRange, AllocationKey, AnonymousClass, BackingId, BackingView, ChangeError,
     ExecutableState, FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest,
-    MemoryObjectState, MemorySpace, ObjectError, ObjectId, ObjectRegionDelta, PAGE_SIZE, PageRange,
+    MemoryObjectState, MemorySpace as RawMemorySpace, ObjectError, ObjectId, PAGE_SIZE, PageRange,
     ProtectRequest, Protection, RangeError, RegionKindView, RegionOwner, SealOutcome,
     TranslationIntent, UnmapRequest, UserWriteLeaseRequest, ValidatedChange,
 };
+
+type MemorySpace = RawMemorySpace<()>;
 
 const BASE: usize = 0x1000_0000;
 const SPACE_BYTES: usize = 64 * PAGE_SIZE;
@@ -22,7 +24,12 @@ fn limits() -> Limits {
 }
 
 fn space() -> MemorySpace {
-    MemorySpace::new(PageRange::new(BASE, SPACE_BYTES).unwrap(), limits()).unwrap()
+    MemorySpace::new(
+        PageRange::new(BASE, SPACE_BYTES).unwrap(),
+        limits(),
+        &TestFunding,
+    )
+    .unwrap()
 }
 
 fn backing(id: u64) -> BackingId {
@@ -62,27 +69,27 @@ fn anonymous_map(
 
 fn reserve_no_permits(
     space: &mut MemorySpace,
-    validated: ValidatedChange,
-) -> memory_space::PreparedChange {
+    validated: ValidatedChange<()>,
+) -> memory_space::PreparedChange<()> {
     assert!(validated.permit_requirements().is_empty());
-    space.reserve(validated, Vec::new()).unwrap()
+    reserve_change(space, validated, &mut funded_storage::Buffer::new()).unwrap()
 }
 
 fn complete_prepared(
     space: &mut MemorySpace,
-    prepared: memory_space::PreparedChange,
+    prepared: memory_space::PreparedChange<()>,
 ) -> Vec<memory_space::RetiringFragment> {
     let committed = commit_all(space, prepared);
-    let (retiring, mut batch) = space.synchronize(committed);
+    let mut batch = space.synchronize(committed);
     let fragments = batch.fragments().to_vec();
     while batch.pop_fragment().is_some() {}
     while batch.pop_permit().is_some() {}
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
     fragments
 }
 
 fn commit_map(space: &mut MemorySpace, request: MapRequest) -> memory_space::MapResultLayout {
-    let validated = space.validate_map(request).unwrap();
+    let validated = validate(space, memory_space::ChangeRequest::Map(request)).unwrap();
     let layout = validated.map_result().unwrap();
     let prepared = reserve_no_permits(space, validated);
     let batch = complete_prepared(space, prepared);
@@ -92,6 +99,55 @@ fn commit_map(space: &mut MemorySpace, request: MapRequest) -> memory_space::Map
 
 fn region_allocation(space: &MemorySpace) -> AllocationKey {
     space.regions().next().unwrap().allocation
+}
+
+#[test]
+fn table_cleanup_ignores_only_its_owner_and_keeps_range_reserved_until_complete() {
+    let mut space = space();
+    let make = |id, at| {
+        anonymous_map(
+            id,
+            at,
+            1,
+            0,
+            0,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        )
+    };
+    let first = validate(&space, memory_space::ChangeRequest::Map(make(1, BASE))).unwrap();
+    let first = reserve_no_permits(&mut space, first);
+    let committed = commit_all(&mut space, first);
+    let batch = space.synchronize(committed);
+    let table = AddressRange::new(BASE, SPACE_BYTES).unwrap();
+    assert!(space.span_reserved(table));
+    assert!(!space.span_reserved_by_other(batch.key(), table));
+    let second = validate(
+        &space,
+        memory_space::ChangeRequest::Map(make(2, BASE + 2 * PAGE_SIZE)),
+    )
+    .unwrap();
+    let second = reserve_no_permits(&mut space, second);
+    assert!(space.span_reserved_by_other(batch.key(), table));
+    assert!(space.span_reserved_by_other(second.key(), table));
+    assert_eq!(
+        space.prepared_footprint(&second),
+        PageRange::new(BASE + 2 * PAGE_SIZE, PAGE_SIZE).unwrap()
+    );
+    discard_no_permits(space.rollback(second));
+    assert!(!space.span_reserved_by_other(batch.key(), table));
+    let unmap = UnmapRequest {
+        range: PageRange::new(BASE, PAGE_SIZE).unwrap(),
+        authority: RegionOwner::AddressSpace,
+    };
+    assert!(matches!(
+        validate(&space, memory_space::ChangeRequest::Unmap(unmap)),
+        Err(ChangeError::Busy)
+    ));
+    drop(space.complete(batch));
+    assert!(!space.span_reserved(table));
+    assert!(validate(&space, memory_space::ChangeRequest::Unmap(unmap)).is_ok());
 }
 
 #[test]
@@ -182,8 +238,9 @@ fn anywhere_is_first_fit_and_fixed_empty_never_replaces() {
     assert_eq!(first.usable.start(), BASE);
     assert_eq!(second.usable.start(), BASE + 2 * PAGE_SIZE);
 
-    let error = space
-        .validate_map(anonymous_map(
+    let error = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             3,
             BASE,
             1,
@@ -192,8 +249,9 @@ fn anywhere_is_first_fit_and_fixed_empty_never_replaces() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap_err();
+        )),
+    )
+    .unwrap_err();
     assert_eq!(error, ChangeError::Conflict);
 }
 
@@ -214,12 +272,14 @@ fn exact_unmap_covers_full_usable_guard_and_middle_cases() {
             RegionOwner::AddressSpace,
         ),
     );
-    let validated = full
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &full,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: layout.reservation,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut full, validated);
     let batch = complete_prepared(&mut full, prepared);
     assert_eq!(full.region_count(), 0);
@@ -241,12 +301,14 @@ fn exact_unmap_covers_full_usable_guard_and_middle_cases() {
         ),
     );
     let allocation = region_allocation(&usable);
-    let validated = usable
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &usable,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: layout.usable,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut usable, validated);
     complete_prepared(&mut usable, prepared);
     let regions: Vec<_> = usable.regions().collect();
@@ -274,12 +336,14 @@ fn exact_unmap_covers_full_usable_guard_and_middle_cases() {
         ),
     );
     let lower_guard = PageRange::new(layout.reservation.start(), PAGE_SIZE).unwrap();
-    let validated = guard
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &guard,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: lower_guard,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut guard, validated);
     assert!(prepared.translation_intents().is_empty());
     complete_prepared(&mut guard, prepared);
@@ -312,12 +376,14 @@ fn exact_unmap_covers_full_usable_guard_and_middle_cases() {
         .unwrap()
         .key;
     let cut = PageRange::new(layout.usable.start() + PAGE_SIZE, PAGE_SIZE).unwrap();
-    let validated = middle
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &middle,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: cut,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut middle, validated);
     let batch = complete_prepared(&mut middle, prepared);
     let regions: Vec<_> = middle.regions().collect();
@@ -346,13 +412,15 @@ fn protect_splits_then_recoalesces_only_within_allocation() {
     );
     let allocation = region_allocation(&space);
     let middle = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
-    let validated = space
-        .validate_protect(ProtectRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Protect(ProtectRequest {
             range: middle,
             protection: Protection::ReadOnly,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let retired = complete_prepared(&mut space, prepared);
     assert_eq!(retired.len(), 1);
@@ -362,13 +430,15 @@ fn protect_splits_then_recoalesces_only_within_allocation() {
     );
     assert_eq!(space.region_count(), 3);
 
-    let validated = space
-        .validate_protect(ProtectRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Protect(ProtectRequest {
             range: middle,
             protection: Protection::ReadWrite,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let retired = complete_prepared(&mut space, prepared);
     assert_eq!(retired.len(), 1);
@@ -418,41 +488,49 @@ fn protection_ceiling_guard_and_lease_authority_are_enforced() {
         ),
     );
     assert_eq!(
-        space
-            .validate_unmap(UnmapRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
                 range: layout.usable,
                 authority: RegionOwner::AddressSpace,
             })
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::OwnerDenied
     );
     assert_eq!(
-        space
-            .validate_protect(ProtectRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Protect(ProtectRequest {
                 range: layout.usable,
                 protection: Protection::ReadWrite,
                 authority: RegionOwner::Lease(lease),
             })
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::PermissionDenied
     );
     let guard = PageRange::new(layout.reservation.start(), PAGE_SIZE).unwrap();
     assert_eq!(
-        space
-            .validate_protect(ProtectRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Protect(ProtectRequest {
                 range: guard,
                 protection: Protection::ReadOnly,
                 authority: RegionOwner::Lease(lease),
             })
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::Guard
     );
-    let validated = space
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: layout.usable,
             authority: RegionOwner::Lease(lease),
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     complete_prepared(&mut space, prepared);
 }
@@ -500,36 +578,37 @@ fn user_write_lease_pins_exact_projection_until_commit_or_rollback() {
     request.result = Some(UserWriteLeaseRequest {
         range: result_range,
     });
-    let validated = space.validate_map(request).unwrap();
+    let validated = validate(&space, memory_space::ChangeRequest::Map(request)).unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let lease = prepared.user_write_lease().unwrap();
     assert_eq!(lease.range(), result_range);
-    assert_eq!(lease.projection().segments().len(), 2);
-    assert_eq!(
-        lease.projection().segments()[0].backing_offset,
-        PAGE_SIZE - 16
-    );
-    assert_eq!(lease.projection().segments()[1].backing_offset, 0);
+    assert_eq!(lease.segments().len(), 2);
+    assert_eq!(lease.segments()[0].backing_offset, PAGE_SIZE - 16);
+    assert_eq!(lease.segments()[1].backing_offset, 0);
 
     let first_page = PageRange::new(BASE, PAGE_SIZE).unwrap();
     assert_eq!(
-        space
-            .validate_unmap(UnmapRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
                 range: first_page,
                 authority: RegionOwner::AddressSpace,
             })
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::Busy
     );
-    assert!(space.rollback(prepared).is_empty());
+    discard_no_permits(space.rollback(prepared));
     assert_eq!(space.transaction_count(), 0);
     assert!(
-        space
-            .validate_unmap(UnmapRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
                 range: first_page,
                 authority: RegionOwner::AddressSpace,
             })
-            .is_ok()
+        )
+        .is_ok()
     );
 
     let mut request = anonymous_map(
@@ -545,38 +624,43 @@ fn user_write_lease_pins_exact_projection_until_commit_or_rollback() {
     request.result = Some(UserWriteLeaseRequest {
         range: result_range,
     });
-    let validated = space.validate_map(request).unwrap();
+    let validated = validate(&space, memory_space::ChangeRequest::Map(request)).unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = commit_all(&mut space, prepared);
     // 结果租约跨 commit 保留，直到 complete（最后写回之后）才释放。
     assert_eq!(
-        space
-            .validate_unmap(UnmapRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
                 range: first_page,
                 authority: RegionOwner::AddressSpace,
             })
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::Busy
     );
-    let (retiring, mut batch) = space.synchronize(committed);
+    let mut batch = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     while batch.pop_permit().is_some() {}
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
     assert!(
-        space
-            .validate_unmap(UnmapRequest {
+        validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
                 range: first_page,
                 authority: RegionOwner::AddressSpace,
             })
-            .is_ok()
+        )
+        .is_ok()
     );
 }
 
 #[test]
 fn nonoverlapping_transactions_coexist_and_overlaps_are_busy() {
     let mut space = space();
-    let first = space
-        .validate_map(anonymous_map(
+    let first = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             1,
             BASE,
             1,
@@ -585,10 +669,12 @@ fn nonoverlapping_transactions_coexist_and_overlaps_are_busy() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap();
-    let second = space
-        .validate_map(anonymous_map(
+        )),
+    )
+    .unwrap();
+    let second = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             2,
             BASE + 2 * PAGE_SIZE,
             1,
@@ -597,14 +683,16 @@ fn nonoverlapping_transactions_coexist_and_overlaps_are_busy() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap();
+        )),
+    )
+    .unwrap();
     let first = reserve_no_permits(&mut space, first);
     let second = reserve_no_permits(&mut space, second);
     assert_eq!(space.transaction_count(), 2);
     assert_eq!(
-        space
-            .validate_map(anonymous_map(
+        validate(
+            &space,
+            memory_space::ChangeRequest::Map(anonymous_map(
                 3,
                 BASE,
                 1,
@@ -614,7 +702,8 @@ fn nonoverlapping_transactions_coexist_and_overlaps_are_busy() {
                 Protection::ReadOnly,
                 RegionOwner::AddressSpace,
             ))
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::Busy
     );
     complete_prepared(&mut space, second);
@@ -626,8 +715,9 @@ fn nonoverlapping_transactions_coexist_and_overlaps_are_busy() {
 #[test]
 fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
     let mut space = space();
-    let stale = space
-        .validate_map(anonymous_map(
+    let stale = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             1,
             BASE,
             1,
@@ -636,8 +726,9 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap();
+        )),
+    )
+    .unwrap();
     commit_map(
         &mut space,
         anonymous_map(
@@ -651,15 +742,17 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
             RegionOwner::AddressSpace,
         ),
     );
-    let failure = space.reserve(stale, Vec::new()).unwrap_err();
+    let failure =
+        reserve_change(&mut space, stale, &mut funded_storage::Buffer::new()).unwrap_err();
     assert_eq!(failure.error, ChangeError::Stale);
     assert_eq!(space.region_count(), 1);
     assert_eq!(space.transaction_count(), 0);
 
     let object_id = ObjectId::new(9).unwrap();
     let object = MemoryObjectState::new(object_id, PAGE_SIZE, 4);
-    let validated = space
-        .validate_map(MapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Map(MapRequest {
             bytes: PAGE_SIZE,
             guard_before: 0,
             guard_after: 0,
@@ -674,10 +767,12 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
                 offset: 0,
             },
             result: None,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     assert_eq!(validated.permit_requirements()[0].count(), 1);
-    let failure = space.reserve(validated, Vec::new()).unwrap_err();
+    let failure =
+        reserve_change(&mut space, validated, &mut funded_storage::Buffer::new()).unwrap_err();
     assert_eq!(failure.error, ChangeError::PermitMismatch);
     assert_eq!(space.region_count(), 1);
     assert_eq!(space.transaction_count(), 0);
@@ -688,8 +783,9 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
     let mut space = space();
     let object_id = ObjectId::new(1).unwrap();
     let mut object = MemoryObjectState::new(object_id, 4 * PAGE_SIZE, 8);
-    let validated = space
-        .validate_map(MapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Map(MapRequest {
             bytes: 2 * PAGE_SIZE,
             guard_before: 0,
             guard_after: 0,
@@ -702,10 +798,11 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
                 offset: PAGE_SIZE,
             },
             result: None,
-        })
-        .unwrap();
-    let permits = object.reserve_writes(1).unwrap();
-    let prepared = space.reserve(validated, permits).unwrap();
+        }),
+    )
+    .unwrap();
+    let mut permits = reserve_writes(&mut object, 1).unwrap();
+    let prepared = reserve_change(&mut space, validated, &mut permits).unwrap();
     let region_key = prepared
         .mapped_region_key()
         .expect("object Map must publish one usable region identity");
@@ -717,20 +814,25 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
     );
     assert_eq!(object.seal(), SealOutcome::Pending);
     assert_eq!(object.state(), ExecutableState::Sealing);
-    assert_eq!(object.reserve_writes(1), Err(ObjectError::PermitDenied));
+    assert!(matches!(
+        reserve_writes(&mut object, 1),
+        Err(ObjectError::PermitDenied)
+    ));
 
-    let validated = space
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: PageRange::new(BASE, 2 * PAGE_SIZE).unwrap(),
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = commit_all(&mut space, prepared);
     assert_eq!(object.permit_count(), 1);
     assert_eq!(object.permit_count(), 1);
     assert_eq!(object.permit_count(), 1);
-    let (retiring, mut batch) = space.synchronize(committed);
+    let mut batch = space.synchronize(committed);
     let fragment = batch.pop_fragment().expect("object fragment must retire");
     assert_eq!(
         fragment.backing_retire,
@@ -744,7 +846,7 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
     assert!(batch.is_empty());
     assert_eq!(object.state(), ExecutableState::Executable);
     assert_eq!(object.permit_count(), 0);
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
     assert!(object.authorize_view(Protection::ReadExecute).is_ok());
     assert_eq!(
         object.authorize_view(Protection::ReadWrite),
@@ -757,8 +859,9 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
     let mut space = space();
     let object_id = ObjectId::new(21).unwrap();
     let mut object = MemoryObjectState::new(object_id, 3 * PAGE_SIZE, 8);
-    let validated = space
-        .validate_map(MapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Map(MapRequest {
             bytes: 3 * PAGE_SIZE,
             guard_before: 0,
             guard_after: 0,
@@ -771,76 +874,86 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
                 offset: 0,
             },
             result: None,
-        })
-        .unwrap();
-    let prepared = space
-        .reserve(validated, object.reserve_writes(1).unwrap())
-        .unwrap();
+        }),
+    )
+    .unwrap();
+    let prepared = reserve_change(
+        &mut space,
+        validated,
+        &mut reserve_writes(&mut object, 1).unwrap(),
+    )
+    .unwrap();
     complete_prepared(&mut space, prepared);
     assert_eq!(object.seal(), SealOutcome::Pending);
 
     let middle = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
-    let validated = space
-        .validate_protect(ProtectRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Protect(ProtectRequest {
             range: middle,
             protection: Protection::ReadOnly,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let requirement = validated.permit_requirements()[0];
     assert_eq!(requirement.object(), object_id);
     assert_eq!(requirement.count(), 2);
     assert_eq!(requirement.new_writes(), 0);
     let mut other = MemoryObjectState::new(ObjectId::new(22).unwrap(), PAGE_SIZE, 8);
-    assert_eq!(
-        other.reserve_replacement_writes(requirement),
+    assert!(matches!(
+        reserve_replacement_writes(&mut other, requirement),
         Err(ObjectError::PermitDenied)
-    );
-    let permits = object.reserve_replacement_writes(requirement).unwrap();
-    let prepared = space.reserve(validated, permits).unwrap();
+    ));
+    let mut permits = reserve_replacement_writes(&mut object, requirement).unwrap();
+    let prepared = reserve_change(&mut space, validated, &mut permits).unwrap();
     let committed = commit_all(&mut space, prepared);
-    let (retiring, mut batch) = space.synchronize(committed);
+    let mut batch = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     let old = batch.pop_permit().expect("old writable permit must retire");
     assert!(!object.retire_write(old));
     assert!(batch.is_empty());
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
     assert_eq!(object.state(), ExecutableState::Sealing);
     assert_eq!(object.permit_count(), 2);
 
-    let validated = space
-        .validate_protect(ProtectRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Protect(ProtectRequest {
             range: middle,
             protection: Protection::ReadWrite,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let requirement = validated.permit_requirements()[0];
     assert_eq!(requirement.count(), 1);
     assert_eq!(requirement.new_writes(), 1);
-    assert_eq!(
-        object.reserve_replacement_writes(requirement),
+    assert!(matches!(
+        reserve_replacement_writes(&mut object, requirement),
         Err(ObjectError::PermitDenied)
-    );
+    ));
 
-    let validated = space
-        .validate_protect(ProtectRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Protect(ProtectRequest {
             range: PageRange::new(BASE, 3 * PAGE_SIZE).unwrap(),
             protection: Protection::ReadOnly,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     assert!(validated.permit_requirements().is_empty());
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = commit_all(&mut space, prepared);
-    let (retiring, mut batch) = space.synchronize(committed);
+    let mut batch = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     let mut sealed = false;
     while let Some(permit) = batch.pop_permit() {
         sealed |= object.retire_write(permit);
     }
     assert!(sealed);
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
     assert_eq!(object.state(), ExecutableState::Executable);
     assert_eq!(object.permit_count(), 0);
 }
@@ -850,8 +963,9 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
     let mut first_space = space();
     let object_id = ObjectId::new(12).unwrap();
     let mut object = MemoryObjectState::new(object_id, PAGE_SIZE, 4);
-    let validated = first_space
-        .validate_map(MapRequest {
+    let validated = validate(
+        &first_space,
+        memory_space::ChangeRequest::Map(MapRequest {
             bytes: PAGE_SIZE,
             guard_before: 0,
             guard_after: 0,
@@ -864,16 +978,17 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
                 offset: 0,
             },
             result: None,
-        })
-        .unwrap();
-    let permits = object.reserve_writes(1).unwrap();
-    let prepared = first_space.reserve(validated, permits).unwrap();
+        }),
+    )
+    .unwrap();
+    let mut permits = reserve_writes(&mut object, 1).unwrap();
+    let prepared = reserve_change(&mut first_space, validated, &mut permits).unwrap();
     assert_eq!(object.seal(), SealOutcome::Pending);
-    let permits = first_space.rollback(prepared);
-    let permit = permits
-        .into_iter()
-        .next()
-        .expect("rollback must return the reserved permit");
+    let mut storage = first_space.rollback(prepared);
+    let permit = match storage.rollback_step() {
+        memory_space::RollbackStep::Permit(permit) => permit,
+        _ => panic!("rollback must return the reserved permit"),
+    };
     assert!(
         object.cancel_write(permit),
         "cancelling the last permit must publish the seal"
@@ -885,8 +1000,9 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
     let mut second_space = space();
     let mutable_id = ObjectId::new(13).unwrap();
     let mut executable = MemoryObjectState::new(mutable_id, PAGE_SIZE, 4);
-    let validated = second_space
-        .validate_map(MapRequest {
+    let validated = validate(
+        &second_space,
+        memory_space::ChangeRequest::Map(MapRequest {
             bytes: PAGE_SIZE,
             guard_before: 0,
             guard_after: 0,
@@ -899,20 +1015,26 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
                 offset: 0,
             },
             result: None,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut second_space, validated);
     complete_prepared(&mut second_space, prepared);
     assert_eq!(executable.seal(), SealOutcome::Published);
-    let validated = second_space
-        .validate_protect(ProtectRequest {
+    let validated = validate(
+        &second_space,
+        memory_space::ChangeRequest::Protect(ProtectRequest {
             range: PageRange::new(BASE, PAGE_SIZE).unwrap(),
             protection: Protection::ReadWrite,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     assert_eq!(validated.permit_requirements()[0].object(), mutable_id);
-    assert_eq!(executable.reserve_writes(1), Err(ObjectError::PermitDenied));
+    assert!(matches!(
+        reserve_writes(&mut executable, 1),
+        Err(ObjectError::PermitDenied)
+    ));
 }
 
 /// seal 不保存等待者：发起者消散不撤销状态转换，重复 seal 在任一阶段都幂等。
@@ -920,14 +1042,11 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
 fn seal_progresses_without_a_waiter_and_is_idempotent() {
     let object_id = ObjectId::new(2).unwrap();
     let mut object = MemoryObjectState::new(object_id, PAGE_SIZE, 2);
-    let permits = object.reserve_writes(1).unwrap();
+    let mut permits = reserve_writes(&mut object, 1).unwrap();
     assert_eq!(object.seal(), SealOutcome::Pending);
     assert_eq!(object.seal(), SealOutcome::Pending);
     assert_eq!(object.state(), ExecutableState::Sealing);
-    let permit = permits
-        .into_iter()
-        .next()
-        .expect("reserved permit must exist");
+    let permit = permits.pop().expect("reserved permit must exist");
     assert!(
         object.retire_write(permit),
         "last permit retire must publish the seal"
@@ -941,8 +1060,9 @@ fn object_view_offsets_follow_exact_middle_split() {
     let mut space = space();
     let object_id = ObjectId::new(3).unwrap();
     let object = MemoryObjectState::new(object_id, 8 * PAGE_SIZE, 2);
-    let validated = space
-        .validate_map(MapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Map(MapRequest {
             bytes: 3 * PAGE_SIZE,
             guard_before: 0,
             guard_after: 0,
@@ -955,34 +1075,21 @@ fn object_view_offsets_follow_exact_middle_split() {
                 offset: PAGE_SIZE,
             },
             result: None,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    assert_eq!(
-        prepared.object_region_deltas(),
-        &[ObjectRegionDelta {
-            object: object_id,
-            retiring: 0,
-            replacement: 1,
-        }]
-    );
     complete_prepared(&mut space, prepared);
     let cut = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
-    let validated = space
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: cut,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
-    assert_eq!(
-        prepared.object_region_deltas(),
-        &[ObjectRegionDelta {
-            object: object_id,
-            retiring: 1,
-            replacement: 2,
-        }]
-    );
     let batch = complete_prepared(&mut space, prepared);
     let regions: Vec<_> = space.regions().collect();
     assert_eq!(regions.len(), 2);
@@ -1011,11 +1118,16 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
     let mut tight_limits = limits();
     tight_limits.max_regions = 2;
     tight_limits.max_pages_per_change = 2;
-    let page_limited =
-        MemorySpace::new(PageRange::new(BASE, SPACE_BYTES).unwrap(), tight_limits).unwrap();
+    let page_limited = MemorySpace::new(
+        PageRange::new(BASE, SPACE_BYTES).unwrap(),
+        tight_limits,
+        &TestFunding,
+    )
+    .unwrap();
     assert_eq!(
-        page_limited
-            .validate_map(anonymous_map(
+        validate(
+            &page_limited,
+            memory_space::ChangeRequest::Map(anonymous_map(
                 1,
                 BASE + PAGE_SIZE,
                 1,
@@ -1025,17 +1137,23 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
                 Protection::ReadOnly,
                 RegionOwner::AddressSpace,
             ))
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::PageLimit
     );
     assert_eq!(page_limited.region_count(), 0);
 
     tight_limits.max_pages_per_change = 8;
-    let region_limited =
-        MemorySpace::new(PageRange::new(BASE, SPACE_BYTES).unwrap(), tight_limits).unwrap();
+    let region_limited = MemorySpace::new(
+        PageRange::new(BASE, SPACE_BYTES).unwrap(),
+        tight_limits,
+        &TestFunding,
+    )
+    .unwrap();
     assert_eq!(
-        region_limited
-            .validate_map(anonymous_map(
+        validate(
+            &region_limited,
+            memory_space::ChangeRequest::Map(anonymous_map(
                 2,
                 BASE + PAGE_SIZE,
                 1,
@@ -1045,7 +1163,8 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
                 Protection::ReadOnly,
                 RegionOwner::AddressSpace,
             ))
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::RegionLimit
     );
 
@@ -1053,8 +1172,9 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
     let object_id = ObjectId::new(4).unwrap();
     let object = MemoryObjectState::new(object_id, 2 * PAGE_SIZE, 2);
     assert_eq!(
-        normal
-            .validate_map(MapRequest {
+        validate(
+            &normal,
+            memory_space::ChangeRequest::Map(MapRequest {
                 bytes: 2 * PAGE_SIZE,
                 guard_before: 0,
                 guard_after: 0,
@@ -1068,7 +1188,8 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
                 },
                 result: None,
             })
-            .unwrap_err(),
+        )
+        .unwrap_err(),
         ChangeError::BackingOutOfRange
     );
     assert_eq!(normal.region_count(), 0);
@@ -1077,8 +1198,9 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
 #[test]
 fn translation_intents_follow_typed_change_stages() {
     let mut space = space();
-    let validated = space
-        .validate_map(anonymous_map(
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             1,
             BASE,
             1,
@@ -1087,8 +1209,9 @@ fn translation_intents_follow_typed_change_stages() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap();
+        )),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     assert!(matches!(
         prepared.translation_intents(),
@@ -1096,9 +1219,9 @@ fn translation_intents_follow_typed_change_stages() {
     ));
     let committed = commit_all(&mut space, prepared);
     assert_eq!(space.transaction_count(), 1);
-    let (retiring, batch) = space.synchronize(committed);
+    let batch = space.synchronize(committed);
     assert!(batch.is_empty());
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
     assert_eq!(space.transaction_count(), 0);
 }
 
@@ -1126,9 +1249,15 @@ fn range_geometry_is_checked_and_page_covering_is_exact() {
 fn transaction_and_lease_capacity_limits_are_explicit() {
     let mut bounded = limits();
     bounded.max_transactions = 1;
-    let mut space = MemorySpace::new(PageRange::new(BASE, SPACE_BYTES).unwrap(), bounded).unwrap();
-    let first = space
-        .validate_map(anonymous_map(
+    let mut space = MemorySpace::new(
+        PageRange::new(BASE, SPACE_BYTES).unwrap(),
+        bounded,
+        &TestFunding,
+    )
+    .unwrap();
+    let first = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             1,
             BASE,
             1,
@@ -1137,10 +1266,12 @@ fn transaction_and_lease_capacity_limits_are_explicit() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap();
-    let second = space
-        .validate_map(anonymous_map(
+        )),
+    )
+    .unwrap();
+    let second = validate(
+        &space,
+        memory_space::ChangeRequest::Map(anonymous_map(
             2,
             BASE + 2 * PAGE_SIZE,
             1,
@@ -1149,17 +1280,23 @@ fn transaction_and_lease_capacity_limits_are_explicit() {
             Protection::ReadOnly,
             Protection::ReadOnly,
             RegionOwner::AddressSpace,
-        ))
-        .unwrap();
+        )),
+    )
+    .unwrap();
     let first = reserve_no_permits(&mut space, first);
-    let failure = space.reserve(second, Vec::new()).unwrap_err();
+    let failure =
+        reserve_change(&mut space, second, &mut funded_storage::Buffer::new()).unwrap_err();
     assert_eq!(failure.error, ChangeError::TransactionLimit);
-    assert!(space.rollback(first).is_empty());
+    discard_no_permits(space.rollback(first));
 
     let mut lease_bounded = limits();
     lease_bounded.max_lease_segments = 1;
-    let mut space =
-        MemorySpace::new(PageRange::new(BASE, SPACE_BYTES).unwrap(), lease_bounded).unwrap();
+    let mut space = MemorySpace::new(
+        PageRange::new(BASE, SPACE_BYTES).unwrap(),
+        lease_bounded,
+        &TestFunding,
+    )
+    .unwrap();
     commit_map(
         &mut space,
         anonymous_map(
@@ -1200,7 +1337,7 @@ fn transaction_and_lease_capacity_limits_are_explicit() {
         range: AddressRange::new(BASE + PAGE_SIZE - 16, 32).unwrap(),
     });
     assert_eq!(
-        space.validate_map(request).unwrap_err(),
+        validate(&space, memory_space::ChangeRequest::Map(request)).unwrap_err(),
         ChangeError::LeaseTooLarge
     );
 
@@ -1218,7 +1355,7 @@ fn transaction_and_lease_capacity_limits_are_explicit() {
         range: AddressRange::new(BASE, 129).unwrap(),
     });
     assert_eq!(
-        space.validate_map(request).unwrap_err(),
+        validate(&space, memory_space::ChangeRequest::Map(request)).unwrap_err(),
         ChangeError::LeaseTooLarge
     );
 }
@@ -1240,16 +1377,19 @@ fn deterministic_model_preserves_coverage_and_nonoverlap() {
         let range = PageRange::new(BASE + start * PAGE_SIZE, pages * PAGE_SIZE).unwrap();
         if state & (1 << 63) == 0 {
             let expected = occupied[start..start + pages].iter().all(|page| !*page);
-            let result = space.validate_map(anonymous_map(
-                identity,
-                range.start(),
-                pages,
-                0,
-                0,
-                Protection::ReadOnly,
-                Protection::ReadOnly,
-                RegionOwner::AddressSpace,
-            ));
+            let result = validate(
+                &space,
+                memory_space::ChangeRequest::Map(anonymous_map(
+                    identity,
+                    range.start(),
+                    pages,
+                    0,
+                    0,
+                    Protection::ReadOnly,
+                    Protection::ReadOnly,
+                    RegionOwner::AddressSpace,
+                )),
+            );
             identity += 1;
             if expected {
                 let prepared = reserve_no_permits(&mut space, result.unwrap());
@@ -1260,10 +1400,13 @@ fn deterministic_model_preserves_coverage_and_nonoverlap() {
             }
         } else {
             let expected = occupied[start..start + pages].iter().all(|page| *page);
-            let result = space.validate_unmap(UnmapRequest {
-                range,
-                authority: RegionOwner::AddressSpace,
-            });
+            let result = validate(
+                &space,
+                memory_space::ChangeRequest::Unmap(UnmapRequest {
+                    range,
+                    authority: RegionOwner::AddressSpace,
+                }),
+            );
             if expected {
                 let prepared = reserve_no_permits(&mut space, result.unwrap());
                 complete_prepared(&mut space, prepared);
@@ -1333,17 +1476,19 @@ fn retiring_stage_cannot_complete_with_live_owners() {
             RegionOwner::AddressSpace,
         ),
     );
-    let validated = space
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: layout.usable,
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let committed = commit_all(&mut space, prepared);
-    let (retiring, batch) = space.synchronize(committed);
+    let batch = space.synchronize(committed);
     assert!(!batch.is_empty());
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
 }
 
 #[test]
@@ -1351,24 +1496,61 @@ fn disjoint_unmaps_inside_one_region_never_share_a_node() {
     let mut space = space();
     commit_map(
         &mut space,
-        anonymous_map(1, BASE, 8, 0, 0, Protection::ReadWrite, Protection::ReadWrite, RegionOwner::AddressSpace),
+        anonymous_map(
+            1,
+            BASE,
+            8,
+            0,
+            0,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        ),
     );
     let a = PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap();
     let b = PageRange::new(BASE + 5 * PAGE_SIZE, PAGE_SIZE).unwrap();
     // 未物化：两段 Unmap 的 footprint 覆盖同一节点，第二个准入即 Busy，不会提交后 Stale。
-    let va = space.validate_unmap(UnmapRequest { range: a, authority: RegionOwner::AddressSpace }).unwrap();
+    let va = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
+            range: a,
+            authority: RegionOwner::AddressSpace,
+        }),
+    )
+    .unwrap();
     let pa = reserve_no_permits(&mut space, va);
     assert_eq!(
-        space.validate_unmap(UnmapRequest { range: b, authority: RegionOwner::AddressSpace }).unwrap_err(),
+        validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
+                range: b,
+                authority: RegionOwner::AddressSpace
+            })
+        )
+        .unwrap_err(),
         ChangeError::Busy
     );
     complete_prepared(&mut space, pa);
     // 物化端点后：两段并行准入、按任意顺序提交均成立。
-    space.split_at_boundaries(b).unwrap();
+    split_boundaries(&mut space, b).unwrap();
     let c = PageRange::new(BASE + 3 * PAGE_SIZE, PAGE_SIZE).unwrap();
-    space.split_at_boundaries(c).unwrap();
-    let vb = space.validate_unmap(UnmapRequest { range: b, authority: RegionOwner::AddressSpace }).unwrap();
-    let vc = space.validate_unmap(UnmapRequest { range: c, authority: RegionOwner::AddressSpace }).unwrap();
+    split_boundaries(&mut space, c).unwrap();
+    let vb = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
+            range: b,
+            authority: RegionOwner::AddressSpace,
+        }),
+    )
+    .unwrap();
+    let vc = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
+            range: c,
+            authority: RegionOwner::AddressSpace,
+        }),
+    )
+    .unwrap();
     let pb = reserve_no_permits(&mut space, vb);
     let pc = reserve_no_permits(&mut space, vc);
     complete_prepared(&mut space, pb);
@@ -1378,8 +1560,8 @@ fn disjoint_unmaps_inside_one_region_never_share_a_node() {
 
 fn commit_all(
     space: &mut MemorySpace,
-    prepared: memory_space::PreparedChange,
-) -> memory_space::CommittedChange {
+    prepared: memory_space::PreparedChange<()>,
+) -> memory_space::CommittedChange<()> {
     let mut committed = space.commit(prepared);
     while !space.commit_step(&mut committed, 1) {}
     committed
@@ -1390,25 +1572,41 @@ fn stepwise_commit_marks_range_publishing_until_ledger_done() {
     let mut space = space();
     commit_map(
         &mut space,
-        anonymous_map(1, BASE, 4, 0, 0, Protection::ReadWrite, Protection::ReadWrite,
-            RegionOwner::AddressSpace),
+        anonymous_map(
+            1,
+            BASE,
+            4,
+            0,
+            0,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        ),
     );
-    let validated = space
-        .validate_unmap(UnmapRequest {
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
             range: PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap(),
             authority: RegionOwner::AddressSpace,
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     let prepared = reserve_no_permits(&mut space, validated);
     let mut committed = space.commit(prepared);
     assert!(!space.commit_step(&mut committed, 1));
-    assert_eq!(space.fault_class(BASE + PAGE_SIZE), memory_space::FaultClass::Publishing { target: None });
+    assert_eq!(
+        space.fault_class(BASE + PAGE_SIZE),
+        memory_space::FaultClass::Publishing { target: None }
+    );
     while !space.commit_step(&mut committed, 1) {}
-    assert_eq!(space.fault_class(BASE + PAGE_SIZE), memory_space::FaultClass::Free);
-    let (retiring, mut batch) = space.synchronize(committed);
+    assert_eq!(
+        space.fault_class(BASE + PAGE_SIZE),
+        memory_space::FaultClass::Free
+    );
+    let mut batch = space.synchronize(committed);
     while batch.pop_fragment().is_some() {}
     while batch.pop_permit().is_some() {}
-    space.complete(retiring, &batch);
+    drop(space.complete(batch));
 }
 
 #[test]
@@ -1416,15 +1614,200 @@ fn owner_release_cursor_removes_every_fragment_without_allocation() {
     let mut space = space();
     commit_map(
         &mut space,
-        anonymous_map(1, BASE + PAGE_SIZE, 4, 1, 1, Protection::ReadWrite, Protection::ReadWrite,
-            RegionOwner::AddressSpace),
+        anonymous_map(
+            1,
+            BASE + PAGE_SIZE,
+            4,
+            1,
+            1,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        ),
     );
     let allocation = region_allocation(&space);
     let mut cursor = 0;
     let mut n = 0;
-    while space.release_allocation_step(allocation, &mut cursor).is_some() {
+    while space
+        .release_allocation_step(allocation, &mut cursor)
+        .is_some()
+    {
         n += 1;
     }
     assert_eq!(n, 3);
+    assert_eq!(space.region_count(), 0);
+}
+
+struct TestFunding;
+impl funded_storage::Funding for TestFunding {
+    type Charge = ();
+    type Error = ();
+    fn charge(&self, _: core::alloc::Layout) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+// 正式失败值原样返预约计划/许可 owner，测试辅助不再给它另建分配层。
+#[allow(clippy::result_large_err)]
+fn reserve_change(
+    space: &mut MemorySpace,
+    mut change: memory_space::ValidatedChange<()>,
+    permits: &mut funded_storage::Buffer<memory_space::WritePermit, ()>,
+) -> Result<memory_space::PreparedChange<()>, memory_space::ReserveFailure<()>> {
+    change.prepare_reservation(&TestFunding).unwrap();
+    let capacity = space.change_storage_capacity(&change).unwrap();
+    let mut storage = memory_space::RegionStorage::try_empty(capacity, &TestFunding).unwrap();
+    space.reserve(change, permits, &mut storage)
+}
+fn split_boundaries(
+    space: &mut MemorySpace,
+    range: PageRange,
+) -> Result<(), memory_space::ChangeError> {
+    let capacity = space.storage_capacity(4)?;
+    let mut storage = memory_space::RegionStorage::try_empty(capacity, &TestFunding).unwrap();
+    space.split_at_boundaries(range, &mut storage)
+}
+
+// 复用正式阶段接口与显式模型 Funding；测试不保留旧 Vec API。
+fn validate(
+    space: &MemorySpace,
+    request: memory_space::ChangeRequest,
+) -> Result<memory_space::ValidatedChange<()>, ChangeError> {
+    let capacity = space.validation_capacity(&request)?;
+    let mut storage = memory_space::ChangeStorage::default();
+    storage.prepare_validation(capacity, &TestFunding).unwrap();
+    space.validate(&request, &mut storage)
+}
+
+fn reserve_writes(
+    object: &mut MemoryObjectState,
+    count: usize,
+) -> Result<funded_storage::Buffer<memory_space::WritePermit, ()>, ObjectError> {
+    let mut output = funded_storage::Buffer::try_empty(count, &TestFunding).unwrap();
+    object.reserve_writes(count, &mut output)?;
+    Ok(output)
+}
+
+fn reserve_replacement_writes(
+    object: &mut MemoryObjectState,
+    requirement: memory_space::PermitRequirement,
+) -> Result<funded_storage::Buffer<memory_space::WritePermit, ()>, ObjectError> {
+    let mut output = funded_storage::Buffer::try_empty(requirement.count(), &TestFunding).unwrap();
+    object.reserve_replacement_writes(requirement, &mut output)?;
+    Ok(output)
+}
+
+fn discard_no_permits(mut storage: memory_space::ChangeStorage<()>) {
+    loop {
+        match storage.rollback_step() {
+            memory_space::RollbackStep::Progress => {}
+            memory_space::RollbackStep::Permit(_) => {
+                panic!("rollback unexpectedly returned a permit")
+            }
+            memory_space::RollbackStep::Done => break,
+        }
+    }
+}
+
+#[test]
+fn completed_storage_reuses_capacity_with_caller_owned_permit_buffer() {
+    let mut space = space();
+    let mut object = MemoryObjectState::new(ObjectId::new(101).unwrap(), PAGE_SIZE, 4);
+    let mut storage = memory_space::ChangeStorage::default();
+    let mut permits = funded_storage::Buffer::try_empty(1, &TestFunding).unwrap();
+    for at in [BASE, BASE + 2 * PAGE_SIZE] {
+        let request = memory_space::ChangeRequest::Map(MapRequest {
+            bytes: PAGE_SIZE,
+            guard_before: 0,
+            guard_after: 0,
+            placement: MapPlacement::FixedEmpty { usable_start: at },
+            current: Protection::ReadWrite,
+            maximum: Protection::ReadWrite,
+            owner: RegionOwner::AddressSpace,
+            backing: MapBacking::Object {
+                authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
+                offset: 0,
+            },
+            result: None,
+        });
+        storage
+            .prepare_validation(space.validation_capacity(&request).unwrap(), &TestFunding)
+            .unwrap();
+        let validated = space.validate(&request, &mut storage).unwrap();
+        object.reserve_writes(1, &mut permits).unwrap();
+        let prepared = reserve_change(&mut space, validated, &mut permits).unwrap();
+        assert!(permits.is_empty());
+        let committed = commit_all(&mut space, prepared);
+        let retiring = space.synchronize(committed);
+        assert!(retiring.is_empty());
+        storage = space.complete(retiring);
+    }
+    assert_eq!(object.permit_count(), 2);
+    assert_eq!(space.region_count(), 2);
+    for at in [BASE, BASE + 2 * PAGE_SIZE] {
+        let validated = validate(
+            &space,
+            memory_space::ChangeRequest::Unmap(UnmapRequest {
+                range: PageRange::new(at, PAGE_SIZE).unwrap(),
+                authority: RegionOwner::AddressSpace,
+            }),
+        )
+        .unwrap();
+        let prepared = reserve_no_permits(&mut space, validated);
+        let committed = commit_all(&mut space, prepared);
+        let mut retiring = space.synchronize(committed);
+        while retiring.pop_fragment().is_some() {}
+        while let Some(permit) = retiring.pop_permit() {
+            object.retire_write(permit);
+        }
+        drop(space.complete(retiring));
+    }
+    assert_eq!(object.permit_count(), 0);
+}
+
+#[test]
+fn rollback_storage_does_not_republish_aborted_retirement_fragments() {
+    let mut space = space();
+    commit_map(
+        &mut space,
+        anonymous_map(
+            102,
+            BASE,
+            1,
+            0,
+            0,
+            Protection::ReadOnly,
+            Protection::ReadOnly,
+            RegionOwner::AddressSpace,
+        ),
+    );
+    let request = memory_space::ChangeRequest::Unmap(UnmapRequest {
+        range: PageRange::new(BASE, PAGE_SIZE).unwrap(),
+        authority: RegionOwner::AddressSpace,
+    });
+    let validated = validate(&space, request).unwrap();
+    let prepared = reserve_no_permits(&mut space, validated);
+    let mut storage = space.rollback(prepared);
+    assert!(matches!(
+        storage.rollback_step(),
+        memory_space::RollbackStep::Done
+    ));
+    assert_eq!(space.region_count(), 1);
+    let request = memory_space::ChangeRequest::Unmap(UnmapRequest {
+        range: PageRange::new(BASE, PAGE_SIZE).unwrap(),
+        authority: RegionOwner::AddressSpace,
+    });
+    storage
+        .prepare_validation(space.validation_capacity(&request).unwrap(), &TestFunding)
+        .unwrap();
+    let validated = space.validate(&request, &mut storage).unwrap();
+    let prepared = reserve_no_permits(&mut space, validated);
+    let committed = commit_all(&mut space, prepared);
+    let mut retiring = space.synchronize(committed);
+    assert_eq!(retiring.fragments().len(), 1);
+    let fragment = retiring.pop_fragment().unwrap();
+    assert_eq!(fragment.range, PageRange::new(BASE, PAGE_SIZE).unwrap());
+    assert!(retiring.is_empty());
+    drop(space.complete(retiring));
     assert_eq!(space.region_count(), 0);
 }

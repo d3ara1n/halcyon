@@ -18,10 +18,6 @@ use libfs::{
     prefix::{DirectoryGrant, PrefixTable},
     resolve,
 };
-use libthread::ThreadOutcome;
-use librpc::{CallCause, CallPhase, RpcMessageKind, RpcPrefix};
-use librunnel::blocking;
-use libservice::record::ServiceRecord;
 use libkernel::{
     ipc::{
         capability::Capability,
@@ -36,10 +32,14 @@ use libkernel::{
     shared::{
         message::MAILBOX_CAPACITY,
         object::{Handle, ObjectSignals, Rights},
-        wait::{WaitItem, WaitReason},
+        wait::WaitReason,
     },
     time,
 };
+use librpc::{CallCause, CallPhase, RpcMessageKind, RpcPrefix};
+use librunnel::blocking;
+use libservice::record::ServiceRecord;
+use libthread::ThreadOutcome;
 use test_fal::{command, report, startup};
 
 fn startup_capability(
@@ -83,7 +83,7 @@ fn send_unawaited_request(
     let reply = message::send_once(reply_sender, reply_rights)
         .map_err(|_| "FAL consumer unawaited reply authority failed")?;
     packet
-        .push_front(reply.into_capability(), reply_rights)
+        .push_front(reply.reply.into_capability(), reply_rights)
         .map_err(|_| "FAL consumer unawaited reply attachment failed")?;
     packet
         .try_send(grant, deadline)
@@ -150,15 +150,25 @@ fn exercise_affine_take(
         .lifetime
         .close()
         .map_err(|_| "FAL consumer abandoned Take reply lifetime close failed")?;
-    let empty = client
-        .call(
+    let empty = loop {
+        match client.call(
             grant,
             &Request::Read {
                 path: "probe-affine-handle",
             },
             deadline,
-        )
-        .map_err(|_| "FAL consumer emptied affine Handle read failed")?;
+        ) {
+            Ok(reply) => break reply,
+            Err(libfal::client::ClientError::Status(protocol::Status::Busy)) => {
+                // Take 回复入箱与 provider 的预留收束是两个调度步；
+                // 与前面的重取共用绝对期限，不假定看到回复时门已经开放。
+                if time::expired(deadline).map_err(|_| "FAL consumer empty Handle clock failed")? {
+                    return Err("FAL consumer emptied affine Handle remained busy");
+                }
+            }
+            Err(_) => return Err("FAL consumer emptied affine Handle read failed"),
+        }
+    };
     let (_, Response::Value(empty_value)) = protocol::decode_response(&empty.payload)
         .map_err(|_| "FAL consumer emptied affine Handle reply invalid")?
     else {
@@ -185,7 +195,7 @@ fn exercise_property_watch(
     grant: &MailboxSender,
     deadline: time::Deadline,
 ) -> Result<(), &'static str> {
-    let root_watch = client
+    let mut root_watch = client
         .subscribe(
             grant,
             "",
@@ -237,7 +247,7 @@ fn exercise_property_watch(
     client
         .unsubscribe(&root_watch, deadline)
         .map_err(|_| "FAL consumer root Watch cancellation failed")?;
-    let property_watch = client
+    let mut property_watch = client
         .subscribe(
             grant,
             "consumer-watch-property",
@@ -283,7 +293,7 @@ fn exercise_property_watch(
         .unsubscribe(&property_watch, deadline)
         .map_err(|_| "FAL consumer property Watch cancellation failed")?;
     drop(property_watch);
-    let delete_watch = client
+    let mut delete_watch = client
         .subscribe(
             grant,
             "consumer-watch-property",
@@ -390,9 +400,9 @@ fn exercise_resource_quota_recovery(
         Some(1),
         deadline,
     ) {
-        Err(libfs::client::StreamOpenFailure::Call(
-            libfal::client::ClientError::Status(protocol::Status::Quota),
-        )) => {}
+        Err(libfs::client::StreamOpenFailure::Call(libfal::client::ClientError::Status(
+            protocol::Status::Quota,
+        ))) => {}
         Ok(stream) => {
             stream
                 .close()
@@ -436,7 +446,10 @@ fn exercise_resource_quota_recovery(
     if watches.is_empty() {
         return Err("FAL consumer Watch quota setup failed");
     }
-    debug!("FAL2 Watch quota saturated at {} subscriptions", watches.len());
+    debug!(
+        "FAL2 Watch quota saturated at {} subscriptions",
+        watches.len()
+    );
     for watch in watches {
         client
             .unsubscribe(&watch, deadline)
@@ -819,7 +832,7 @@ fn exercise_prestart_eof(
         .map_err(|_| "FAL consumer pre-Start control role invalid")?;
     let invitation = libkernel::ipc::invitation::Invitation::from_capability(invitation_owner)
         .map_err(|_| "FAL consumer pre-Start Invitation role invalid")?;
-    let mut producer = blocking::Producer::attach(invitation, Placement::Anywhere)
+    let mut producer = blocking::Producer::attach(invitation, 3 * 4096, Placement::Anywhere)
         .map_err(|_| "FAL consumer pre-Start Attach failed")?;
     producer
         .finish()
@@ -866,7 +879,10 @@ fn exercise_prestart_eof(
                 )
                 .map_err(|_| "FAL consumer pre-Start retry sleep failed")?;
             }
-            Err(_) => return Err("FAL consumer pre-Start Start failed"),
+            Err(error) => {
+                debug!("pre-Start EOF Start request failed: {:?}", error);
+                return Err("FAL consumer pre-Start Start failed");
+            }
         }
     }
     let reply = client
@@ -992,10 +1008,7 @@ fn exercise_create_uncertainty(
     ) {
         return Err("FAL consumer local Create encoding was classified as unknown");
     }
-    for explicit_abort in [
-        true,
-        false,
-    ] {
+    for explicit_abort in [true, false] {
         let request = Request::Create {
             name: "probe-stream",
             kind: NodeKind::Stream,
@@ -1009,10 +1022,7 @@ fn exercise_create_uncertainty(
             if operation.phase() == Some(CallPhase::Sent) {
                 break;
             }
-            if !matches!(
-                operation.advance(),
-                Ok(ClientProgress::Pending)
-            ) {
+            if !matches!(operation.advance(), Ok(ClientProgress::Pending)) {
                 return Err("FAL consumer Create did not enter sent phase");
             }
             if operation.phase() == Some(CallPhase::Unsent) {
@@ -1035,7 +1045,13 @@ fn exercise_create_uncertainty(
         drop(operation);
         // 已存在节点只会返回 Conflict；后续 Lookup 必须使用新的回复端口。
         let lookup = client
-            .call(parent, &Request::Lookup { path: "probe-stream" }, deadline)
+            .call(
+                parent,
+                &Request::Lookup {
+                    path: "probe-stream",
+                },
+                deadline,
+            )
             .map_err(|_| "FAL consumer late Create reply polluted the next call")?;
         let (_, Response::Node(_)) = protocol::decode_response(&lookup.payload)
             .map_err(|_| "FAL consumer uncertain Create lookup invalid")?
@@ -1087,7 +1103,7 @@ fn exercise_stream_contents(
         bytes.push((index % 251) as u8);
     }
     let mut client = Client::new();
-    let watch = client
+    let mut watch = client
         .subscribe(
             position.anchor.endpoint(),
             &position.rel,
@@ -1107,7 +1123,9 @@ fn exercise_stream_contents(
     write
         .write_until(&bytes, deadline)
         .map_err(|_| "FAL consumer stream Write failed")?;
-    write.end_write().map_err(|_| "FAL consumer stream EOF failed")?;
+    write
+        .end_write()
+        .map_err(|_| "FAL consumer stream EOF failed")?;
     let info = transport
         .finish_stream(&write, deadline)
         .map_err(|_| "FAL consumer stream Write Finish failed")?;
@@ -1127,14 +1145,19 @@ fn exercise_stream_contents(
     client
         .unsubscribe(&watch, deadline)
         .map_err(|_| "FAL consumer stream Watch release failed")?;
-    write.close().map_err(|_| "FAL consumer stream Write close failed")?;
+    write
+        .close()
+        .map_err(|_| "FAL consumer stream Write close failed")?;
 
     let mut verify = transport
         .open_stream(position, protocol::StreamDirection::Read, 9, None, deadline)
         .map_err(|_| "FAL consumer stream verify Open failed")?;
     let patch = b"live";
     for (offset, value) in [
-        (9 + bytes.len() as u64 - patch.len() as u64, patch.as_slice()),
+        (
+            9 + bytes.len() as u64 - patch.len() as u64,
+            patch.as_slice(),
+        ),
         (9 + bytes.len() as u64 + 256, b"grow".as_slice()),
     ] {
         let reply = client
@@ -1191,7 +1214,9 @@ fn exercise_stream_contents(
     {
         return Err("FAL consumer stream verify result invalid");
     }
-    verify.close().map_err(|_| "FAL consumer stream verify close failed")?;
+    verify
+        .close()
+        .map_err(|_| "FAL consumer stream verify close failed")?;
     client
         .call(
             position.anchor.endpoint(),
@@ -1204,7 +1229,13 @@ fn exercise_stream_contents(
         )
         .map_err(|_| "FAL consumer stream patch restore failed")?;
     let mut empty = transport
-        .open_stream(position, protocol::StreamDirection::Read, 9, Some(0), deadline)
+        .open_stream(
+            position,
+            protocol::StreamDirection::Read,
+            9,
+            Some(0),
+            deadline,
+        )
         .map_err(|_| "FAL consumer empty stream Open failed")?;
     if transport
         .read_stream_until(&mut empty, &mut tail, deadline)
@@ -1219,7 +1250,9 @@ fn exercise_stream_contents(
     if info.outcome != protocol::Status::Ok || info.accepted != 0 || info.transported != 0 {
         return Err("FAL consumer empty stream result invalid");
     }
-    empty.close().map_err(|_| "FAL consumer empty stream close failed")?;
+    empty
+        .close()
+        .map_err(|_| "FAL consumer empty stream close failed")?;
     Ok(())
 }
 
@@ -1403,17 +1436,9 @@ fn exercise_abandoned_open_reply(
     reply_owner
         .close()
         .map_err(|_| "FAL consumer Open reply owner close failed")?;
-    let observed = wait::wait_until(
-        &[WaitItem::new(
-            reply.lifetime.as_handle(),
-            ObjectSignals::CLOSED,
-            1,
-        )],
-        deadline,
-    )
-    .map_err(|_| "FAL consumer Open reply lifetime wait failed")?;
-    if observed.item_index != 0
-        || !observed.observed.contains(ObjectSignals::CLOSED)
+    let observed = wait::wait_until(reply.lifetime.as_handle(), ObjectSignals::CLOSED, deadline)
+        .map_err(|_| "FAL consumer Open reply lifetime wait failed")?;
+    if !observed.observed.contains(ObjectSignals::CLOSED)
         || !matches!(
             WaitReason::from_u32(observed.reason),
             Some(WaitReason::Closed | WaitReason::Signaled)
@@ -1866,7 +1891,14 @@ fn exercise_copy_after_progress_cancel(
     let watcher = libruntime::thread::Builder::new()
         .spawn(move || -> Result<(), SystemCallError> {
             let mut observer_client = Client::new();
+            let started = time::Instant::now()?.as_nanos();
+            let mut attempts = 0u64;
+            debug!(
+                "midflight cancellation watcher started: now_ns={}, deadline_ns={}",
+                started, deadline.at_ns
+            );
             loop {
+                attempts += 1;
                 match observer_client.call(
                     observer.endpoint(),
                     &Request::Lookup {
@@ -1884,7 +1916,29 @@ fn exercise_copy_after_progress_cancel(
                         }
                     }
                     Err(libfal::client::ClientError::Status(protocol::Status::NotFound)) => {}
-                    Err(_) => return Err(SystemCallError::InternalError),
+                    Err(error) => {
+                        let now = time::Instant::now()?.as_nanos();
+                        debug!(
+                            "midflight cancellation lookup failed: attempts={}, started_ns={}, now_ns={}, deadline_ns={}",
+                            attempts, started, now, deadline.at_ns
+                        );
+                        match &error {
+                            libfal::client::ClientError::Transport(call) => debug!(
+                                "midflight cancellation transport failed: phase={:?}, cause={:?}",
+                                call.phase, call.cause
+                            ),
+                            libfal::client::ClientError::System(cause) => debug!(
+                                "midflight cancellation syscall failed: {cause:?}"
+                            ),
+                            libfal::client::ClientError::Status(status) => debug!(
+                                "midflight cancellation provider rejected: {status:?}"
+                            ),
+                            libfal::client::ClientError::Protocol => debug!(
+                                "midflight cancellation provider protocol invalid"
+                            ),
+                        }
+                        return Err(SystemCallError::InternalError);
+                    }
                 }
                 if time::expired(deadline)? {
                     return Err(SystemCallError::DeadlineExpired);
@@ -1903,8 +1957,7 @@ fn exercise_copy_after_progress_cancel(
         deadline,
         cancel: Some(&cancel),
     });
-    take_thread_result(watcher.join())
-        .map_err(|_| "FAL consumer midflight watcher join failed")?;
+    take_thread_result(watcher.join()).map_err(|_| "FAL consumer midflight watcher join failed")?;
     let Err(mut result) = result else {
         return Err("FAL consumer midflight Copy ignored cancellation");
     };
@@ -2075,8 +2128,7 @@ fn exercise_copy_during_provider_shutdown(
         deadline,
         cancel: None,
     });
-    take_thread_result(watcher.join())
-        .map_err(|_| "FAL consumer midflight watcher join failed")?;
+    take_thread_result(watcher.join()).map_err(|_| "FAL consumer midflight watcher join failed")?;
     let Err(mut result) = result else {
         return Err("FAL consumer midflight Copy ignored provider shutdown");
     };
@@ -2158,7 +2210,7 @@ fn run(startup: &mut libruntime::startup::InitialGrants) -> Result<(), &'static 
     {
         return Err("FAL consumer primary root invalid");
     }
-    let watch = client
+    let mut watch = client
         .subscribe(
             &directory,
             "",
@@ -2226,11 +2278,8 @@ fn run(startup: &mut libruntime::startup::InitialGrants) -> Result<(), &'static 
     let continue_deadline =
         time::timeout_millis(240_000).map_err(|_| "FAL consumer business deadline invalid")?;
     let ready = wait::wait_until(
-        &[WaitItem::new(
-            command_owner.as_handle(),
-            ObjectSignals::READABLE | ObjectSignals::CLOSED,
-            1,
-        )],
+        command_owner.as_handle(),
+        ObjectSignals::READABLE | ObjectSignals::CLOSED,
         continue_deadline,
     )
     .map_err(|_| "FAL consumer continuation wait failed")?;
@@ -2549,11 +2598,8 @@ fn run(startup: &mut libruntime::startup::InitialGrants) -> Result<(), &'static 
     let shutdown_deadline =
         time::timeout_millis(120_000).map_err(|_| "FAL consumer shutdown deadline invalid")?;
     let ready = wait::wait_until(
-        &[WaitItem::new(
-            command_owner.as_handle(),
-            ObjectSignals::READABLE | ObjectSignals::CLOSED,
-            1,
-        )],
+        command_owner.as_handle(),
+        ObjectSignals::READABLE | ObjectSignals::CLOSED,
         shutdown_deadline,
     )
     .map_err(|_| "FAL consumer shutdown command wait failed")?;
@@ -2565,11 +2611,8 @@ fn run(startup: &mut libruntime::startup::InitialGrants) -> Result<(), &'static 
         return Err("FAL consumer shutdown command missing");
     }
     let observed = wait::wait_until(
-        &[WaitItem::new(
-            shutdown_grant.as_handle(),
-            ObjectSignals::CLOSED,
-            1,
-        )],
+        shutdown_grant.as_handle(),
+        ObjectSignals::CLOSED,
         shutdown_deadline,
     )
     .map_err(|_| "FAL consumer provider close wait failed")?;
@@ -2578,7 +2621,9 @@ fn run(startup: &mut libruntime::startup::InitialGrants) -> Result<(), &'static 
     }
     if let Err(ClientCallFailure::Unsent(mut failure)) = client.call_classified(
         &shutdown_grant,
-        &Request::Lookup { path: "probe-stream" },
+        &Request::Lookup {
+            path: "probe-stream",
+        },
         shutdown_deadline,
         None,
     ) {
@@ -2601,9 +2646,7 @@ fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) ->
             value,
             leave: Ok(()),
         } => value,
-        ThreadOutcome::Returned {
-            leave: Err(()), ..
-        }
+        ThreadOutcome::Returned { leave: Err(()), .. }
         | ThreadOutcome::EnterFailed(())
         | ThreadOutcome::Incomplete => panic!("runtime worker did not complete"),
     }

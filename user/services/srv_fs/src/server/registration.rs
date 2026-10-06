@@ -402,12 +402,10 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
         while let Some(event) = input.pull() {
             match event.kind {
                 KIND_REGISTRATION_LIFETIME => {
-                    control_closed |=
-                        event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED);
+                    control_closed |= event.observed.intersects(ObjectSignals::CLOSED);
                 }
                 KIND_REGISTRATION_ENDPOINT => {
-                    endpoint_closed |=
-                        event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED);
+                    endpoint_closed |= event.observed.intersects(ObjectSignals::CLOSED);
                 }
                 _ => {
                     if let Some(outbox) = self.outbox.as_mut() {

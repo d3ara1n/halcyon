@@ -13,6 +13,8 @@
 
 extern crate libruntime;
 
+use libexecution::assembly::Assembly;
+
 use libbudget::Budget;
 use libexecution::{
     ExecutionResource,
@@ -21,9 +23,6 @@ use libexecution::{
         Task,
     },
 };
-use libprocess::job_driver::JobDriver;
-use libprocess::{DEFAULT_SUPERVISION_POLICY, JobCollector};
-use librunnel::blocking;
 use libkernel::{
     ipc::{
         invitation::Invitation,
@@ -40,6 +39,9 @@ use libkernel::{
     },
     sys_process_abort,
 };
+use libprocess::job_driver::JobDriver;
+use libprocess::{DEFAULT_SUPERVISION_POLICY, JobCollector};
+use librunnel::blocking;
 
 const STREAM_LEN: usize = 65536;
 /// 与 init 约定的流控验证消息号（见 init 的 WRITABLE_WAKE_* 常量）。
@@ -122,19 +124,11 @@ impl Task<PmWorld> for MailboxTask {
                 step: Step::Parked,
             });
         }
-        let mut source = None;
-        while let Some(event) = input.pull() {
-            if event.error != 0 {
-                self.failed = true;
-                world.fail();
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
-            source = Some(event.source);
+        let mut ready = false;
+        while input.pull().is_some() {
+            ready = true;
         }
-        let Some(source) = source else {
+        if !ready {
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -144,7 +138,7 @@ impl Task<PmWorld> for MailboxTask {
             Ok(()) => (),
             Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => {
                 // 虚假唤醒：保持登记继续停驻。
-                requests.rearm(source)?;
+
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -255,7 +249,7 @@ impl Task<PmWorld> for MailboxTask {
                 step: Step::Complete,
             });
         }
-        requests.rearm(source)?;
+
         Ok(Advance {
             work_done: 1,
             step: Step::Parked,
@@ -367,7 +361,11 @@ impl Task<PmWorld> for StreamTask {
                 .invitation
                 .take()
                 .expect("stream task lost its invitation");
-            match blocking::Producer::attach(invitation, libkernel::mm::Placement::Anywhere) {
+            match blocking::Producer::attach(
+                invitation,
+                3 * 4096,
+                libkernel::mm::Placement::Anywhere,
+            ) {
                 Ok(producer) => {
                     self.producer = Some(producer);
                     debug!("tunnel attached");
@@ -399,20 +397,11 @@ impl Task<PmWorld> for StreamTask {
             .as_mut()
             .expect("stream task lost its producer");
         // 事件先经 poll 重查（含 acknowledge 与终态判定）。
-        let mut event_source = None;
         while let Some(event) = input.pull() {
             if event.kind != KIND_STREAM {
                 continue;
             }
-            event_source = Some(event.source);
-            if event.error != 0 {
-                debug!("stream source failed: error={}", event.error);
-                world.fail();
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
+
             match producer.poll(event.observed) {
                 Ok(Some(condition)) => {
                     if matches!(condition, librunnel::ProducerReady::EofConsumed) {
@@ -429,9 +418,6 @@ impl Task<PmWorld> for StreamTask {
                     });
                 }
             }
-        }
-        if let Some(source) = event_source {
-            self.source = Some(source);
         }
         // 校验模式写入：i%251+1，跨回绕分批，每批落页即通知。
         let mut work = 0;
@@ -474,9 +460,7 @@ impl Task<PmWorld> for StreamTask {
             });
         }
         // 未写满：按当前条件登记或重新武装。
-        if let Some(source) = self.source {
-            requests.rearm(source)?;
-        } else {
+        if self.source.is_none() {
             let plan = match producer.wait_plan() {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -489,7 +473,7 @@ impl Task<PmWorld> for StreamTask {
                 }
             };
             requests
-                .arm_source(plan, KIND_STREAM)
+                .register(plan, KIND_STREAM)
                 .map_err(|_| SystemCallError::ReachLimit)?;
         }
         Ok(Advance {
@@ -624,13 +608,7 @@ impl Task<PmWorld> for FlowTask {
             if event.kind != KIND_WRITABLE {
                 continue;
             }
-            if event.error != 0 {
-                world.fail();
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
+
             if !event.observed.intersects(ObjectSignals::WRITABLE) {
                 world.fail();
                 return Ok(Advance {
@@ -677,7 +655,7 @@ impl Task<PmWorld> for FlowTask {
                     .expect("spurious wake signal failed");
                 }
                 self.woke = true;
-                requests.rearm(source)?;
+
                 Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -888,7 +866,15 @@ fn main() {
         .view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
         .expect("pm: execution budget binding");
     let set = WaitSet::create(64).expect("pm: wait set");
-    let mut runtime = Runtime::<PmTask, WaitSet>::new(set, 16, 16, &account).expect("pm: runtime");
+    let mut assembly = Assembly::new(set, &account)
+        .unwrap_or_else(|(_, error)| panic!("pm: assembly failed: {error:?}"));
+    let mut runtime = Runtime::<PmTask, WaitSet>::new(
+        assembly.bind().expect("pm: registration"),
+        16,
+        16,
+        &account,
+    )
+    .expect("pm: runtime");
 
     let mut world = PmWorld {
         mailbox,
@@ -906,6 +892,9 @@ fn main() {
 
     let mut stopping = false;
     loop {
+        for &record in assembly.receive(64).expect("pm: receive sources") {
+            runtime.feed(record);
+        }
         if world.fatal {
             exit_failed();
         }
@@ -935,12 +924,10 @@ fn main() {
                 if world.domain_done && !stopping {
                     continue;
                 }
-                if let Err(error) = libkernel::ipc::wait::wait_until(&[runtime.wait_item(0)], deadline)
-                {
+                if let Err(error) = assembly.wait(deadline) {
                     debug!("pm: runtime wait failed: {:?}", error);
                     exit_failed();
                 }
-                runtime.notified();
             }
         }
     }
@@ -960,6 +947,9 @@ fn main() {
         world.mailbox_stopped && !world.mailbox_registered,
         "active mailbox stop must finish unregistering its source"
     );
+    assembly
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("pm: assembly close failed: {error:?}"));
     assert_eq!(account.usage(ExecutionResource::Task).0, 0);
     assert_eq!(account.usage(ExecutionResource::InputBytes).0, 0);
     debug!("pm: active mailbox stop and refund passed");

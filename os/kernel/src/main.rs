@@ -3,7 +3,7 @@
 //! 架构与内部机制见 `notes/`。
 
 #![no_std]
-#![feature(lang_items, alloc_error_handler, allocator_api)]
+#![feature(lang_items, alloc_error_handler, allocator_api, const_type_name)]
 #![allow(internal_features)]
 
 extern crate alloc;
@@ -29,7 +29,6 @@ mod boot;
 mod clock;
 mod context;
 mod csr;
-mod deferred_work;
 mod external;
 mod frame;
 mod hart;
@@ -37,7 +36,6 @@ mod heap;
 mod maintenance;
 mod mm;
 mod registry;
-mod remote_call;
 mod rt;
 mod runtime_stop;
 mod sbi;
@@ -48,7 +46,6 @@ mod task;
 mod trap;
 mod uaccess;
 mod vm;
-mod work_ledger;
 
 // 汇编布局契约：offset_of! 是唯一真值，经 const operands 注入
 // assembly.asm（见 abi::asm 常量表）。

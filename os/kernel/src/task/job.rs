@@ -15,21 +15,21 @@
 //! lifecycle 线性化（锁序允许方向）。JobInner 锁内只改成员/子表与
 //! sealed/dead 位，不出游取锁、不做 uaccess；CLOSED 发布与完成传播在
 //! 锁外执行（对象 wait 锁不与 JobInner 锁嵌套），传播沿父链逐级
-//! 「放子锁、取父锁」，单步有界（延迟触发安全：sealed ⇒ 无新成员，
-//! 判定幂等）。
+//! 「放子锁、取父锁」，每层由该 Job 的出生 Work 接管，单步有界
+//! （延迟触发安全：sealed ⇒ 无新成员，判定幂等）。
 //!
 //! 成员/子表是按 ID 有序的 fallible AVL：ID 在 owner 锁内分配并与占位
 //! 插入同临界区，查找、提交、回滚和完成摘除均不分配且受树高硬界约束；
 //! 枚举按 ID 单调分页，遇未决占位即终止本批（屏障窗口只存在于创建方的
 //! 单个 syscall 内，枚举方重试不活锁）。
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 
-use ordered_table::{InsertError, OrderedTable};
+use super::resources::{MetadataCharge, MetadataFunding, map_storage_error};
+use funded_storage::Buffer;
+use maintenance::record::Outcome;
+use ordered_table::{InsertError, OrderedTable, PreparedEntry};
 
 use erhino_shared::{
     call::SystemCallError,
@@ -38,16 +38,25 @@ use erhino_shared::{
         JOB_ENUMERATE_MAX, JobEnumerateResult, JobId, JobMemberKind, JobSnapshot, JobState, Pid,
     },
 };
+/// Job 的完整业务授权，由 Job 域拥有；不可借用 ProcessControl 的掩码。
+pub(crate) const JOB_RIGHTS: Rights = Rights::from_raw(
+    Rights::CREATE.raw()
+        | Rights::MANAGE.raw()
+        | Rights::READ.raw()
+        | Rights::WAIT.raw()
+        | Rights::DUPLICATE.raw()
+        | Rights::TRANSIT.raw()
+        | Rights::GRANT.raw(),
+);
 
 use super::{
     Thread,
-    object::{
-        HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
-        SubscribeResult,
-    },
-    proc::Process,
-    wait::{Subscription, schedule_waiters},
+    memory_pool::MemoryPool,
+    object::{KernelObject, ObjectHeader, ObjectKind, ObjectRef},
+    process::shell::ProcessShell,
+    wait_source::{ObservationSource, SignalSource},
 };
+use crate::maintenance::{self as mt, Work, WorkRecord};
 
 /// Job 层级深度硬上限（含 root）。
 pub(crate) const JOB_DEPTH_MAX: usize = 32;
@@ -55,20 +64,20 @@ pub(crate) const JOB_DEPTH_MAX: usize = 32;
 /// 的比较次数封成常量；容量耗尽在创建口返回 ReachLimit。
 const JOB_DIRECT_ENTRY_LIMIT: usize = 65_536;
 
-fn table_insert_error<V>(error: InsertError<V>) -> SystemCallError {
+fn table_insert_error<V>(error: InsertError<V, SystemCallError>) -> SystemCallError {
     match error {
         InsertError::Limit(_) => SystemCallError::ReachLimit,
-        InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+        InsertError::Storage(error, _) => map_storage_error(error),
     }
 }
 
-/// 内核侧成员表条目：事务 marker 或强持的 Process core。
+/// 内核侧成员表条目：事务 marker 或强持的稳定 ProcessShell。
 #[derive(Clone)]
 pub(crate) enum MemberEntry {
     /// 事务预留：Create 提交前占位，对枚举与派生查找不可见（屏障条目）。
     Reserved { token: u64 },
     /// 未 Dead 的 Process core（Building 起，Dead 发布时移除）。
-    Process(Arc<Process>),
+    Process(Arc<ProcessShell>),
 }
 
 /// 内核侧 Job 层级条目：事务 marker 或强持的 child Job。
@@ -83,9 +92,9 @@ enum ChildEntry {
 
 pub(crate) struct JobInner {
     /// 直接 child Jobs（按 JobId 升序；含事务占位）。
-    children: OrderedTable<ChildEntry>,
+    children: OrderedTable<ChildEntry, MetadataCharge>,
     /// 直接成员（按 Pid 升序；含事务占位）。
-    members: OrderedTable<MemberEntry>,
+    members: OrderedTable<MemberEntry, MetadataCharge>,
     /// 封口位：创建/启动提交点沿父链上行检查。
     sealed: bool,
     /// 完成位：sealed && 两表空时一次置位；此后两表恒空。
@@ -104,62 +113,6 @@ impl JobInner {
     }
 }
 
-/// Job 完成传播的持久游标。
-///
-/// 一个游标只保留当前待发布/待摘除的 Job 强引用；每次 `advance` 最多
-/// 完成一次发布或一次父成员摘除，ProcessDrain 可在预算边界安全暂停。
-pub(crate) struct CompletionCursor {
-    child: Arc<Job>,
-    published: bool,
-}
-
-impl CompletionCursor {
-    fn new(child: Arc<Job>) -> Self {
-        Self {
-            child,
-            published: false,
-        }
-    }
-
-    /// 推进一步，返回本条祖先链是否已完全收束。
-    pub(crate) fn advance(&mut self) -> bool {
-        if !self.published {
-            self.child.publish_closed();
-            self.published = true;
-            return false;
-        }
-
-        let Some(parent) = self
-            .child
-            .parent
-            .as_ref()
-            .map(|weak| weak.upgrade().expect("ancestor jobs outlive their members"))
-        else {
-            return true;
-        };
-        let (removed, parent_completed) = {
-            let mut state = parent.state.lock();
-            let removed = state
-                .children
-                .remove(self.child.jid)
-                .expect("job child disappeared before ancestor removal");
-            let completed = state.complete_if_ready();
-            (removed, completed)
-        };
-        assert!(
-            matches!(removed, ChildEntry::Job(_)),
-            "job child entry kind changed"
-        );
-        drop(removed);
-        if !parent_completed {
-            return true;
-        }
-        self.child = parent;
-        self.published = false;
-        false
-    }
-}
-
 pub struct Job {
     /// capability 持有计数（ZeroPolicy 按类型固定）。
     holders: capability::Holders,
@@ -169,8 +122,11 @@ pub struct Job {
     /// 创建时冻结的父 JobId（root 为 0）；不依赖 weak 父的存活。
     parent_jid: JobId,
     parent: Option<Weak<Job>>,
+    _pool: Arc<MemoryPool>,
+    record: WorkRecord,
     state: crate::sync::Spinlock<JobInner>,
-    wait: crate::sync::Spinlock<ObjectWaitState>,
+    source: Arc<SignalSource>,
+    _metadata: super::resources::MetadataCharge,
 }
 
 /// root Job 的内核 static anchor（强持至本次启动结束）。
@@ -217,17 +173,15 @@ pub(crate) struct ChildReservation {
 /// 自 owner 向上收集祖先链并反转为 root-first（锁按此序获取）。
 /// 祖先 weak 升级失败意味着该祖先已完成释放——完成的 Job 必然
 /// sealed，创建/启动按 ObjectClosed 拒绝（永不错指新对象）。
-fn collect_chain(owner: &Arc<Job>) -> Result<Vec<Arc<Job>>, SystemCallError> {
-    let mut upward = Vec::new();
+fn collect_chain(owner: &Arc<Job>) -> Result<Buffer<Arc<Job>, MetadataCharge>, SystemCallError> {
+    let mut upward = Buffer::try_empty(JOB_DEPTH_MAX, &MetadataFunding(&owner._pool))
+        .map_err(map_storage_error)?;
     let mut current = owner.clone();
     loop {
-        upward
-            .try_reserve(1)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
-        upward.push(current.clone());
-        if upward.len() > JOB_DEPTH_MAX {
+        if upward.len() == JOB_DEPTH_MAX {
             return Err(SystemCallError::IllegalArgument);
         }
+        upward.push(current.clone());
         let Some(parent) = current.parent.as_ref() else {
             break;
         };
@@ -243,11 +197,10 @@ fn collect_chain(owner: &Arc<Job>) -> Result<Vec<Arc<Job>>, SystemCallError> {
 /// 先父后子锁住整条链（守卫按 root→owner 顺序持有）。
 fn lock_chain(
     chain: &[Arc<Job>],
-) -> Result<Vec<crate::sync::SpinlockGuard<'_, JobInner>>, SystemCallError> {
-    let mut guards = Vec::new();
-    guards
-        .try_reserve(chain.len())
-        .map_err(|_| SystemCallError::OutOfMemory)?;
+) -> Result<Buffer<crate::sync::SpinlockGuard<'_, JobInner>, MetadataCharge>, SystemCallError> {
+    let pool = &chain.last().expect("chain always contains the owner")._pool;
+    let mut guards =
+        Buffer::try_empty(chain.len(), &MetadataFunding(pool)).map_err(map_storage_error)?;
     for job in chain {
         guards.push(job.state.lock());
     }
@@ -258,9 +211,11 @@ impl Job {
     /// root Job：内核 static anchor 强持至本次启动结束；boot 交给 init 的
     /// Handle 只是 authority，不是生命周期根。完成发 CLOSED 但不移除
     /// 不释放（boot 生命周期）。
-    pub fn root() -> Arc<Self> {
+    pub fn root(pool: &Arc<MemoryPool>) -> Arc<Self> {
         let mut root = ROOT.lock();
         if root.is_none() {
+            let metadata = super::resources::MetadataCharge::arc::<Self>(pool)
+                .expect("root Job metadata funding failed");
             let jid = alloc_jid().expect("root Job identity exhausted");
             *root = Some(
                 Arc::try_new(Self {
@@ -269,6 +224,8 @@ impl Job {
                     jid,
                     parent_jid: 0,
                     parent: None,
+                    _pool: pool.clone(),
+                    record: WorkRecord::new(pool.maintenance_account().clone()),
                     state: crate::sync::Spinlock::chained(
                         crate::sync::ranks::JOB_INNER,
                         jid,
@@ -279,10 +236,9 @@ impl Job {
                             dead: false,
                         },
                     ),
-                    wait: crate::sync::Spinlock::new(
-                        crate::sync::ranks::OBJECT_WAIT,
-                        ObjectWaitState::new(ObjectSignals::NONE),
-                    ),
+                    source: SignalSource::try_new(pool.clone())
+                        .expect("root Job source allocation failed"),
+                    _metadata: metadata,
                 })
                 .expect("root Job allocation failed"),
             );
@@ -294,13 +250,18 @@ impl Job {
         jid: JobId,
         parent_jid: JobId,
         parent: &Arc<Self>,
+        pool: Arc<MemoryPool>,
     ) -> Result<Arc<Self>, SystemCallError> {
+        let account = pool.maintenance_account().clone();
+        let metadata = super::resources::MetadataCharge::arc::<Self>(&pool)?;
         Arc::try_new(Self {
             holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             jid,
             parent_jid,
             parent: Some(Arc::downgrade(parent)),
+            _pool: pool.clone(),
+            record: WorkRecord::new(account),
             state: crate::sync::Spinlock::chained(
                 crate::sync::ranks::JOB_INNER,
                 jid,
@@ -311,10 +272,8 @@ impl Job {
                     dead: false,
                 },
             ),
-            wait: crate::sync::Spinlock::new(
-                crate::sync::ranks::OBJECT_WAIT,
-                ObjectWaitState::new(ObjectSignals::NONE),
-            ),
+            source: SignalSource::try_new(pool)?,
+            _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)
     }
@@ -336,6 +295,12 @@ impl Job {
     pub(crate) fn gate_reserve_member(
         self: &Arc<Self>,
     ) -> Result<(Pid, MemberReservation), SystemCallError> {
+        let mut prepared = PreparedEntry::try_new(
+            0,
+            MemberEntry::Reserved { token: 0 },
+            &MetadataFunding(&self._pool),
+        )
+        .map_err(table_insert_error)?;
         let chain = collect_chain(self)?;
         let mut guards = lock_chain(&chain)?;
         if guards.iter().any(|state| state.sealed) {
@@ -344,10 +309,11 @@ impl Job {
         let token = next_member_token()?;
         let pid = alloc_pid().ok_or(SystemCallError::ReachLimit)?;
         let owner = guards.last_mut().expect("chain always contains the owner");
-        owner
-            .members
-            .try_insert(pid, MemberEntry::Reserved { token })
-            .map_err(table_insert_error)?;
+        if !owner.members.has_room() {
+            return Err(SystemCallError::ReachLimit);
+        }
+        *prepared.value_mut() = MemberEntry::Reserved { token };
+        owner.members.insert_prepared(prepared.with_key(pid));
         Ok((pid, MemberReservation { pid, token }))
     }
 
@@ -356,6 +322,12 @@ impl Job {
     pub(crate) fn gate_reserve_child(
         self: &Arc<Self>,
     ) -> Result<(JobId, ChildReservation), SystemCallError> {
+        let mut prepared = PreparedEntry::try_new(
+            0,
+            ChildEntry::Reserved { token: 0 },
+            &MetadataFunding(&self._pool),
+        )
+        .map_err(table_insert_error)?;
         let chain = collect_chain(self)?;
         if chain.len() >= JOB_DEPTH_MAX {
             return Err(SystemCallError::IllegalArgument);
@@ -367,34 +339,16 @@ impl Job {
         let token = next_member_token()?;
         let jid = alloc_jid().ok_or(SystemCallError::ReachLimit)?;
         let owner = guards.last_mut().expect("chain always contains the owner");
-        owner
-            .children
-            .try_insert(jid, ChildEntry::Reserved { token })
-            .map_err(table_insert_error)?;
+        if !owner.children.has_room() {
+            return Err(SystemCallError::ReachLimit);
+        }
+        *prepared.value_mut() = ChildEntry::Reserved { token };
+        owner.children.insert_prepared(prepared.with_key(jid));
         Ok((jid, ChildReservation { jid, token }))
     }
 
-    /// 预留成员表条目（bootstrap 路径：pid 由调用方持有；启动期单线程、
-    /// 无 seal 可能，不走链锁闸门）。syscall 路径一律走
-    /// [`Self::gate_reserve_member`]。
-    pub(crate) fn reserve_member(&self, pid: Pid) -> Result<MemberReservation, SystemCallError> {
-        let token = next_member_token()?;
-        let mut state = self.state.lock();
-        state
-            .members
-            .try_insert(pid, MemberEntry::Reserved { token })
-            .map_err(table_insert_error)?;
-        Ok(MemberReservation { pid, token })
-    }
-
-    /// 在 Job owner 锁内发布成员并执行调用方的不可失败外部提交。调用方可先持
-    /// 更外层的 HandleTable 锁，使 capability 与 Job 枚举在释放任一锁前同时可见。
-    pub(crate) fn commit_member_with<R>(
-        &self,
-        reservation: MemberReservation,
-        process: Arc<Process>,
-        commit: impl FnOnce() -> R,
-    ) -> R {
+    /// 骨架与构造 lease 已出生，Job 接管生命周期根；capability 表锁不参与提交。
+    pub(crate) fn commit_member(&self, reservation: MemberReservation, process: Arc<ProcessShell>) {
         let mut state = self.state.lock();
         let entry = state
             .members
@@ -405,20 +359,25 @@ impl Job {
             "job member reservation token changed"
         );
         *entry = MemberEntry::Process(process);
-        commit()
     }
 
-    pub(crate) fn rollback_member(&self, reservation: MemberReservation) {
-        let removed = self
-            .state
-            .lock()
-            .members
-            .remove(reservation.pid)
-            .expect("job member reservation disappeared");
+    pub(crate) fn rollback_member(self: &Arc<Self>, reservation: MemberReservation) {
+        let (removed, completed) = {
+            let mut state = self.state.lock();
+            let removed = state
+                .members
+                .remove(reservation.pid)
+                .expect("job member reservation disappeared");
+            (removed, state.complete_if_ready())
+        };
         assert!(
-            matches!(removed, MemberEntry::Reserved { token } if token == reservation.token),
+            matches!(removed.value(), MemberEntry::Reserved { token } if *token == reservation.token),
             "job member reservation token changed"
         );
+        drop(removed);
+        if completed {
+            self.publish_completion();
+        }
     }
 
     fn commit_child(&self, reservation: ChildReservation, job: Arc<Job>) {
@@ -434,20 +393,26 @@ impl Job {
         *entry = ChildEntry::Job(job);
     }
 
-    fn rollback_child(&self, reservation: ChildReservation) {
-        let removed = self
-            .state
-            .lock()
-            .children
-            .remove(reservation.jid)
-            .expect("job child reservation disappeared");
+    fn rollback_child(self: &Arc<Self>, reservation: ChildReservation) {
+        let (removed, completed) = {
+            let mut state = self.state.lock();
+            let removed = state
+                .children
+                .remove(reservation.jid)
+                .expect("job child reservation disappeared");
+            (removed, state.complete_if_ready())
+        };
         assert!(
-            matches!(removed, ChildEntry::Reserved { token } if token == reservation.token),
+            matches!(removed.value(), ChildEntry::Reserved { token } if *token == reservation.token),
             "job child reservation token changed"
         );
+        drop(removed);
+        if completed {
+            self.publish_completion();
+        }
     }
 
-    /// JobSeal：O(1) 置位（幂等，不扫表）；已空则完成并返回传播游标。
+    /// JobSeal：O(1) 置位（幂等，不扫表）；已空则发布独立完成责任。
     /// 已 Dead 的 Job 上是幂等无操作。
     fn seal(self: &Arc<Self>) {
         let completed = {
@@ -459,14 +424,12 @@ impl Job {
             state.complete_if_ready()
         };
         if completed {
-            self.finish_completion();
+            self.publish_completion();
         }
     }
 
-    /// 摘除成员（Dead 发布点调用）。完成判定与 JobInner 锁内线性化；若
-    /// Job 因此满足 sealed && 空，返回持有祖先传播责任的游标，交由
-    /// ProcessDrain 按统一预算推进。
-    pub(crate) fn remove_member(self: &Arc<Self>, pid: Pid) -> Option<CompletionCursor> {
+    /// Dead 发布后摘除成员；满足完成条件时该 Job 自身接管后续传播。
+    pub(crate) fn remove_member(self: &Arc<Self>, pid: Pid) {
         let (removed, completed) = {
             let mut state = self.state.lock();
             let removed = state
@@ -477,15 +440,17 @@ impl Job {
             (removed, completed)
         };
         assert!(
-            matches!(removed, MemberEntry::Process(_)),
+            matches!(removed.value(), MemberEntry::Process(_)),
             "job process entry kind changed"
         );
         drop(removed);
-        completed.then(|| CompletionCursor::new(self.clone()))
+        if completed {
+            self.publish_completion();
+        }
     }
 
     /// 按 Pid 查直接成员（仅可见 Process 条目；占位对派生不可见）。
-    pub(crate) fn member_process(&self, pid: Pid) -> Option<Arc<Process>> {
+    pub(crate) fn member_process(&self, pid: Pid) -> Option<Arc<ProcessShell>> {
         let state = self.state.lock();
         state.members.get(pid).and_then(|entry| match entry {
             MemberEntry::Process(process) => Some(process.clone()),
@@ -549,64 +514,102 @@ impl Job {
 
     /// CLOSED 发布（对象 wait 锁，不与 JobInner 锁嵌套；零分配完成交付）。
     fn publish_closed(&self) {
-        self.wait
-            .lock()
-            .update(ObjectSignals::NONE, ObjectSignals::CLOSED);
-        schedule_waiters(&self.wait);
+        self.source.publish(ObjectSignals::CLOSED, true);
     }
 
-    /// 完成收尾（JobInner 锁外）：发布自身 CLOSED，再沿父链传播——逐级
-    /// 「放子锁、取父锁」移除与再判定，单步有界。root 无父仅发布。
-    /// 父必先于子存活（子在其 children 表内直到本调用移除），升级失败
-    /// 即所有权图违约。
-    fn finish_completion(self: &Arc<Self>) {
-        let mut cursor = CompletionCursor::new(self.clone());
-        while !cursor.advance() {}
+    /// `dead` 同 JobInner 锁内唯一置位；唯一完成者在该锁外发布记录。
+    fn publish_completion(self: &Arc<Self>) {
+        let root: Arc<dyn Work> = self.clone();
+        mt::publish(root);
+        mt::kick();
     }
 
-    /// ProcessStart 提交闸门：链锁内上行检查祖先未 sealed，并在同一
-    /// 临界区完成 lifecycle 的 Building → Running 线性化（lifecycle 锁
-    /// 嵌套于链锁内，锁序规范允许方向）。失败（seal 先到或进程已
-    /// 终止）返回 ObjectClosed，调用方整体回滚。
-    /// ProcessStart 提交闸门：链锁内「上行检查祖先 seal + Building →
-    /// Running（含预育提取）」（活体门、计数一致性与 Created 提取在
-    /// begin_running 锁内原子完成；lifecycle 锁嵌套于链锁内，锁序
-    /// Job 链锁 → lifecycle 锁）。expected 是调用方读取的成员计数；并发 attach 插队报 ObjectBusy
-    /// （调用方以新计数重试）。
+    /// ProcessStart：Job 链 Seal 校验 → Shell gate 成员计数复核/Running
+    /// 提交；返回短 ingress 准入供锁外逐槽发布 Ready。
     pub(crate) fn start_commit_gate(
-        process: &Arc<Process>,
+        process: &Arc<ProcessShell>,
         expected: usize,
-    ) -> Result<Option<Arc<crate::task::Thread>>, SystemCallError> {
-        let job = process.job();
+    ) -> Result<super::process::shell::BodyLease, SystemCallError> {
+        let job = process.job.upgrade().expect("process Job lost its member");
         let chain = collect_chain(&job)?;
         let guards = lock_chain(&chain)?;
         if guards.iter().any(|state| state.sealed) {
             return Err(SystemCallError::ObjectClosed);
         }
-        match process.lifecycle.begin_running(expected) {
-            Ok(head) => Ok(head),
-            Err(super::lifecycle::BeginFault::Closed) => Err(SystemCallError::ObjectClosed),
-            Err(super::lifecycle::BeginFault::StaleCount | super::lifecycle::BeginFault::Busy) => {
-                Err(SystemCallError::ObjectBusy)
+        process.begin_running(expected)
+    }
+
+    /// ThreadCreate 在准备期接受创建责任；后续 Seal/Frozen 不撤销该仿射预约。
+    pub(crate) fn reserve_thread<'a>(
+        process: &'a Arc<ProcessShell>,
+        body: &'a super::process::shell::BodyLease,
+    ) -> Result<super::process::shell::MemberReservation<'a>, SystemCallError> {
+        let job = process.job.upgrade().expect("process Job lost its member");
+        let chain = collect_chain(&job)?;
+        let mut prepared = super::process::members::MemberStorage::new();
+        loop {
+            let result = {
+                let guards = lock_chain(&chain)?;
+                if guards.iter().any(|state| state.sealed) {
+                    Err(SystemCallError::ObjectClosed)
+                } else {
+                    process.reserve_member(body, &mut prepared)
+                }
+            };
+            if !matches!(result, Err(SystemCallError::ObjectBusy)) {
+                return result;
             }
+            // 此处全部 Job/Shell/Members 锁已退出。初次失败要求真正准备容量；
+            // 后续候选严格大于快照容量，竞争失败证明其他方已装更大块。
+            // 容量不缩小，次数由自然字宽限制，不按抢占时序自旋。
+            drop(prepared);
+            prepared = body.members.prepare_storage(process.pool())?;
         }
+    }
+}
+
+impl Work for Job {
+    fn record(&self) -> &WorkRecord {
+        &self.record
+    }
+
+    fn step(&self) -> Outcome {
+        let completed_parent = self.parent.as_ref().and_then(|parent| {
+            let parent = parent.upgrade().expect("ancestor job lost its child");
+            let (removed, completed) = {
+                let mut state = parent.state.lock();
+                let removed = state
+                    .children
+                    .remove(self.jid)
+                    .expect("job child disappeared before ancestor removal");
+                let completed = state.complete_if_ready();
+                (removed, completed)
+            };
+            match removed.value() {
+                ChildEntry::Job(child) => {
+                    assert!(
+                        core::ptr::eq(Arc::as_ptr(child), self),
+                        "job child entry changed"
+                    )
+                }
+                ChildEntry::Reserved { .. } => panic!("job child remained reserved"),
+            }
+            // WorkRecord 仍强持本 Job，完整节点及付款只在父门外释放。
+            drop(removed);
+            completed.then_some(parent)
+        });
+        // CLOSED 观察者可依赖父枚举已移除自己；父责任不先于本层完成信号。
+        self.publish_closed();
+        if let Some(parent) = completed_parent {
+            parent.publish_completion();
+        }
+        Outcome::Done
     }
 }
 
 impl KernelObject for Job {
     fn holders(&self) -> &capability::Holders {
         &self.holders
-    }
-
-    fn complete_waiter_drain(
-        &self,
-        reservation: super::notify_work::Reservation,
-    ) -> super::notify_work::Completion {
-        self.wait.lock().complete_notification(reservation)
-    }
-
-    fn advance_waiter(&self) -> super::object::WaitAdvance {
-        self.wait.lock().advance_waiter()
     }
 
     fn header(&self) -> &ObjectHeader {
@@ -618,40 +621,15 @@ impl KernelObject for Job {
     }
 
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(
-            Rights::CREATE
-                | Rights::MANAGE
-                | Rights::READ
-                | Rights::WAIT
-                | Rights::DUPLICATE
-                | Rights::TRANSIT
-                | Rights::GRANT,
-        )
+        Some(JOB_RIGHTS)
     }
 
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::CLOSED)
     }
 
-    fn signals(&self) -> ObjectSignals {
-        self.wait.lock().signals()
-    }
-
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.wait.lock().subscribe(subscription)
-    }
-
-    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
-        self.wait.lock().rearm_observer(id)
-    }
-
-    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
-        self.wait.lock().cancel_observer(id)
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        let retired = self.wait.lock().unsubscribe(id);
-        drop(retired);
+    fn wait_source(&self) -> Option<Arc<dyn ObservationSource>> {
+        Some(self.source.clone())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -659,22 +637,26 @@ impl KernelObject for Job {
     }
 }
 
-/// 解析 JobControl Handle（rights 前置校验 + 类型/role 核对）；
+/// 解析 JobControl capability（rights 前置校验 + 对象类型核对）；
 /// 返回 (Job, 该 Handle 的 rights)——派生权的「源 rights」基准。
 fn resolve_job_control(
     thread: &Thread,
     handle: Handle,
     rights: Rights,
 ) -> Result<(Arc<Job>, Rights), SystemCallError> {
-    let table = thread.process.handles.lock();
+    let body = thread
+        .process
+        .lease_body()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    let table = body.handles.lock();
     let entry = table
         .get(handle, rights)
         .map_err(super::handle::map_error)?;
-    if entry.object().kind() != ObjectKind::Job {
+    if entry.object().0.kind() != ObjectKind::Job {
         return Err(SystemCallError::WrongObjectType);
     }
     let source_rights = entry.rights();
-    Ok((Job::concrete(entry.object())?, source_rights))
+    Ok((Job::concrete(&entry.object().0)?, source_rights))
 }
 
 fn parse_member_kind(kind_raw: u64) -> Result<JobMemberKind, SystemCallError> {
@@ -688,43 +670,53 @@ fn parse_member_kind(kind_raw: u64) -> Result<JobMemberKind, SystemCallError> {
 pub fn create(
     thread: &Thread,
     parent: Handle,
+    pool: Handle,
     rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let parent = {
-        let table = thread.process.handles.lock();
-        let entry = table
+    let (parent, pool) = {
+        let body = thread
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let table = body.handles.lock();
+        let parent_cap = table
             .get(parent, Rights::CREATE)
             .map_err(super::handle::map_error)?;
-        if entry.object().kind() != ObjectKind::Job {
-            return Err(SystemCallError::WrongObjectType);
-        }
-        if !rights.is_subset_of(entry.rights()) {
+        if !rights.is_subset_of(parent_cap.rights()) {
             return Err(SystemCallError::RightsDenied);
         }
-        Job::concrete(entry.object())?
+        let parent = super::handle::resolve(&table, parent, Rights::CREATE, ObjectKind::Job)?;
+        let pool = super::handle::resolve(&table, pool, Rights::CREATE, ObjectKind::MemoryPool)?;
+        (Job::concrete(&parent)?, MemoryPool::concrete(&pool)?)
     };
     // 创建口闸门（链锁线性化）：占位先于一切可失败构造插入，失败路径
     // 统一回滚（capability 可见前完成不可失败的层级提交）。
     let (jid, reservation) = parent.gate_reserve_child()?;
-    let child = match Job::child(jid, parent.jid, &parent) {
+    let child = match Job::child(jid, parent.jid, &parent, pool) {
         Ok(child) => child,
         Err(error) => {
             parent.rollback_child(reservation);
             return Err(error);
         }
     };
-    let entry = match super::handle::entry(Job::object_ref(&child), HandleRole::JobControl, rights)
-    {
-        Ok(entry) => entry,
+    let cap = match super::handle::mint(Job::object_ref(&child), rights) {
+        Ok(cap) => cap,
         Err(error) => {
             parent.rollback_child(reservation);
-            return Err(super::handle::map_error(error));
+            return Err(error);
         }
     };
-    super::handle::install_one(thread, entry, output, || {
-        parent.commit_child(reservation, child);
-    })
+    let caps = [cap];
+    super::handle::install(
+        thread,
+        caps,
+        |handles| crate::uaccess::write_user(thread, output, &handles[0]),
+        || {
+            parent.commit_child(reservation, child);
+        },
+    )
+    .map(|_| ())
     .inspect_err(|_| {
         parent.rollback_child(reservation);
     })
@@ -742,11 +734,7 @@ pub fn seal(thread: &Thread, control: Handle) -> Result<(), SystemCallError> {
 pub fn query(thread: &Thread, control: Handle, output: usize) -> Result<(), SystemCallError> {
     let (job, _) = resolve_job_control(thread, control, Rights::READ)?;
     let snapshot = job.snapshot();
-    let mut space = thread.process.space.lock();
-    space.check_range(output, core::mem::size_of::<JobSnapshot>(), true)?;
-    // SAFETY: JobSnapshot 字段与 reserved 全部初始化，结构无 padding；
-    // 复检失败即杀本进程（deliver_output）。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &snapshot) }
+    crate::uaccess::write_user(thread, output, &snapshot)
 }
 
 /// JobEnumerate(control, kind, cursor, buf, buf_len, out)：READ；单调 ID
@@ -766,8 +754,13 @@ pub fn enumerate(
     }
     let (job, _) = resolve_job_control(thread, control, Rights::READ)?;
     let cap = buf_len.min(JOB_ENUMERATE_MAX);
+    let body = thread
+        .process
+        .lease_body()
+        .ok_or(SystemCallError::ObjectClosed)?;
     {
-        let mut space = thread.process.space.lock();
+        let mut vm = body.vm.space.lock();
+        let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
         space.check_range(buf, cap * core::mem::size_of::<u64>(), true)?;
         space.check_range(output, core::mem::size_of::<JobEnumerateResult>(), true)?;
     }
@@ -778,7 +771,8 @@ pub fn enumerate(
         actual: actual as u32,
         more: u32::from(more),
     };
-    let mut space = thread.process.space.lock();
+    let mut vm = body.vm.space.lock();
+    let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
     // SAFETY: ids[..actual] 是已初始化的 u64 切片；区间已在前面校验。
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -786,10 +780,10 @@ pub fn enumerate(
             actual * core::mem::size_of::<u64>(),
         )
     };
-    crate::uaccess::deliver_bytes(thread, &mut space, buf, bytes)?;
+    crate::uaccess::deliver_bytes(thread, space, buf, bytes)?;
     // SAFETY: JobEnumerateResult 字段全部初始化，无 padding；复检失败
     // 即杀本进程（deliver_output）。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
+    unsafe { crate::uaccess::deliver_output(thread, space, output, &result) }
 }
 
 /// JobDerive(control, kind, id, rights, out)：MANAGE；在直接成员域内按
@@ -810,27 +804,24 @@ pub fn derive(
     if !rights.is_known() || !rights.is_subset_of(source_rights) {
         return Err(SystemCallError::RightsDenied);
     }
-    let entry = match kind {
+    let object = match kind {
         JobMemberKind::ChildJobs => {
             let child = job.child_job(id).ok_or(SystemCallError::ObjectNotFound)?;
-            super::handle::entry(Job::object_ref(&child), HandleRole::JobControl, rights)
-                .map_err(super::handle::map_error)?
+            Job::object_ref(&child)
         }
         JobMemberKind::MemberProcesses => {
             let process = job
                 .member_process(id)
                 .ok_or(SystemCallError::ObjectNotFound)?;
-            // 单一 shell 身份：存活 shell 复用同一对象；消散后从 core
-            // 铸造并在铸造点重放已达成的电平（REAPABLE），派生兜底由此
-            // 接上 drain 入口。
-            let shell = process.revive_control()?;
-            super::handle::entry(
-                super::process::ProcessControl::object_ref(&shell),
-                HandleRole::ProcessControl,
-                rights,
-            )
-            .map_err(super::handle::map_error)?
+            ProcessShell::object_ref(&process)
         }
     };
-    super::handle::install_one(thread, entry, output, || {})
+    let caps = [super::handle::mint(object, rights)?];
+    super::handle::install(
+        thread,
+        caps,
+        |handles| crate::uaccess::write_user(thread, output, &handles[0]),
+        || {},
+    )
+    .map(|_| ())
 }

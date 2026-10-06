@@ -7,12 +7,12 @@ use erhino_shared::{
 };
 use libbudget::Charge;
 use libexecution::runtime::{Advance, Input, RequestFailure, Requests, SourceId, SourceKind, Step};
-use librpc::{Outbox, OutboxResult};
 use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender},
     notification,
 };
+use librpc::{Outbox, OutboxResult};
 
 use crate::{
     authority::AccessSnapshot,
@@ -116,7 +116,6 @@ pub struct Retirement {
     source: Option<SourceId>,
     requested: bool,
     removing: bool,
-    rearm_needed: bool,
     stopping: bool,
 }
 
@@ -129,7 +128,6 @@ impl Retirement {
             source: None,
             requested: false,
             removing: false,
-            rearm_needed: false,
             stopping: false,
         }
     }
@@ -147,12 +145,11 @@ impl Retirement {
             if event.kind != self.source_kind {
                 continue;
             }
-            if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+            if event.observed.intersects(ObjectSignals::CLOSED) {
                 report_failure();
                 self.stopping = true;
             } else if event.observed.intersects(ObjectSignals::READABLE) {
                 signaled = true;
-                self.rearm_needed = true;
             }
         }
         if signaled {
@@ -201,16 +198,7 @@ impl Retirement {
                 step: Step::Runnable,
             });
         }
-        if self.rearm_needed
-            && let Some(source) = self.source
-        {
-            requests.rearm(source)?;
-            self.rearm_needed = false;
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
-        }
+
         Ok(Advance {
             work_done: 1,
             step: Step::Parked,
@@ -240,7 +228,6 @@ impl Retirement {
             self.source = None;
             self.requested = false;
             self.removing = false;
-            self.rearm_needed = false;
         }
     }
 
@@ -409,7 +396,7 @@ impl Grant {
                     outbox.observe(event);
                 }
             } else if event.kind == self.lifetime_kind
-                && (event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED))
+                && (event.observed.intersects(ObjectSignals::CLOSED))
             {
                 self.stopping = true;
             }
@@ -676,6 +663,7 @@ pub struct Watch {
     registration_error: Option<protocol::Status>,
     reply_kind: SourceKind,
     owner_kind: SourceKind,
+    observation: Option<Capability>,
 }
 
 impl Watch {
@@ -700,6 +688,7 @@ impl Watch {
             registration_error: None,
             reply_kind,
             owner_kind,
+            observation: None,
         }
     }
 
@@ -771,7 +760,7 @@ impl Watch {
                     outbox.observe(event);
                 }
             } else if event.kind == self.owner_kind
-                && (event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED))
+                && (event.observed.intersects(ObjectSignals::CLOSED))
             {
                 self.stopping = true;
             }
@@ -788,8 +777,14 @@ impl Watch {
                     .signaler
                     .as_ref()
                     .expect("Watch signaler missing before registration");
+                if self.observation.is_none() {
+                    self.observation = Some(notification::observe(signaler.as_handle())?);
+                }
                 requests.add_source(
-                    signaler.as_handle(),
+                    self.observation
+                        .as_ref()
+                        .expect("Watch observation missing")
+                        .as_handle(),
                     ObjectSignals::CLOSED,
                     self.owner_kind,
                 )?;

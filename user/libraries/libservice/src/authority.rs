@@ -60,7 +60,7 @@ impl Authority {
 }
 
 pub struct PreparedAuthority {
-    entry: PreparedEntry<Authority>,
+    entry: PreparedEntry<Authority, ()>,
 }
 
 pub struct InstallFailure {
@@ -70,7 +70,7 @@ pub struct InstallFailure {
 
 /// 注册 authority 的唯一索引。key 必须取 Mailbox sender context identity。
 pub struct AuthorityTable {
-    entries: OrderedTable<Authority>,
+    entries: OrderedTable<Authority, ()>,
     slots: Arc<Counter>,
     sealed: bool,
 }
@@ -136,7 +136,7 @@ impl AuthorityTable {
             AuthorityScope::ExactName(name) => name.len(),
         };
         let bytes = name_bytes
-            .checked_add(PreparedEntry::<Authority>::allocation_bytes())
+            .checked_add(PreparedEntry::<Authority, ()>::allocation_bytes())
             .ok_or(AuthorityError::Resource(SystemCallError::ReachLimit))?;
         let bytes_charge = account.acquire(ServiceResource::Bytes, bytes)?;
         let authority = Authority {
@@ -149,7 +149,7 @@ impl AuthorityTable {
         };
         let entry = self
             .entries
-            .prepare_insert_candidate(0, authority)
+            .prepare_insert_candidate(0, authority, &libbudget::AllocatorBacked)
             .map_err(map_insert_error)?;
         Ok(PreparedAuthority { entry })
     }
@@ -211,6 +211,7 @@ impl AuthorityTable {
     pub fn remove(&mut self, identity: u64) -> Result<(), AuthorityError> {
         self.entries
             .remove(identity)
+            .map(ordered_table::PreparedEntry::into_value)
             .map(drop)
             .ok_or(AuthorityError::NotFound)
     }
@@ -229,7 +230,13 @@ impl AuthorityTable {
             return 0;
         }
         let mut retired = 0;
-        while retired < budget && self.entries.pop_first().is_some() {
+        while retired < budget
+            && self
+                .entries
+                .pop_first()
+                .map(ordered_table::PreparedEntry::into_parts)
+                .is_some()
+        {
             retired += 1;
         }
         retired
@@ -240,10 +247,12 @@ impl AuthorityTable {
     }
 }
 
-fn map_insert_error(error: InsertError<Authority>) -> AuthorityError {
+fn map_insert_error(error: InsertError<Authority, core::convert::Infallible>) -> AuthorityError {
     match error {
         InsertError::Limit(_) => AuthorityError::Resource(SystemCallError::QuotaExceeded),
-        InsertError::Allocation(_) => AuthorityError::Resource(SystemCallError::OutOfMemory),
+        InsertError::Storage(error, _) => {
+            AuthorityError::Resource(libbudget::allocator_error(error))
+        }
     }
 }
 

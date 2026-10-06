@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+funded_storage = { path = "../../shared/funded_storage" }
 erhino_shared = { path = "../../shared/erhino_shared" }
 dtb = { path = "../dtb" }
 lock_api = "0.4"
@@ -14,7 +15,6 @@ elf = { path = "../../shared/elf" }
 sched_domain = { path = "../sched_domain" }
 ready_queue = { path = "../ready_queue" }
 handle_table = { path = "../handle_table" }
-wait_context = { path = "../wait_context" }
 timer_queue = { path = "../../shared/timer_queue" }
 stack_layout = { path = "../stack_layout" }
 remote_call = { path = "../remote_call" }
@@ -25,8 +25,6 @@ capability = { path = "../capability" }
 memory_supply = { path = "../memory_supply" }
 memory_pool = { path = "../memory_pool" }
 funded_frame = { path = "../funded_frame" }
-metadata_admission = { path = "../../shared/metadata_admission" }
 monotonic_id = { path = "../../shared/monotonic_id" }
 ordered_table = { path = "../../shared/ordered_table" }
-work_debt = { path = "../work_debt" }
 num-traits = { version = "0.2", default-features = false }

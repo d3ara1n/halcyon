@@ -6,16 +6,16 @@ use libfal::{
     node::{NodeAttributes, NodeKind},
     protocol::{self, Expected, Request, ResolvePolicy, Response, Status},
 };
-use librunnel::blocking::{self, Consumer, Producer};
 use libkernel::{
     ipc::{
         capability::Capability,
         invitation::{Invitation, InvitationFailure},
         message::{MailboxSender, SenderAdoptFailure},
-        tunnel::{Endpoint, EndpointCleanup},
+        tunnel::Endpoint,
     },
     mm::Placement,
 };
+use librunnel::blocking::{self, Consumer, Producer};
 
 use crate::{
     prefix::DirectoryGrant,
@@ -78,8 +78,8 @@ pub enum AttachError {
 pub struct AttachOwners {
     pub error: AttachError,
     pub invitation: Option<Invitation>,
-    pub endpoint: Option<Endpoint>,
-    pub cleanup: Option<EndpointCleanup>,
+    pub endpoint: Option<librunnel::MappedEndpoint>,
+    pub unmapped_endpoint: Option<Endpoint>,
 }
 
 fn client_error_has_owner(error: &libfal::client::ClientError) -> bool {
@@ -107,7 +107,7 @@ impl StreamOpenFailure {
                 control.is_some()
                     || failure.invitation.is_some()
                     || failure.endpoint.is_some()
-                    || failure.cleanup.is_some()
+                    || failure.unmapped_endpoint.is_some()
             }
             Self::Start { stream, error } => {
                 stream.control.is_some() || stream.role.is_some() || client_error_has_owner(error)
@@ -136,10 +136,10 @@ impl StreamOpenFailure {
                     failure.endpoint = Some(value);
                     first.get_or_insert(error);
                 }
-                if let Some(value) = failure.cleanup.take()
+                if let Some(value) = failure.unmapped_endpoint.take()
                     && let Err((value, error)) = value.close()
                 {
-                    failure.cleanup = Some(value);
+                    failure.unmapped_endpoint = Some(value);
                     first.get_or_insert(error);
                 }
                 if let Some(value) = failure.invitation.take()
@@ -461,37 +461,35 @@ impl Transport {
         };
         let attachment = match direction {
             protocol::StreamDirection::Read => {
-                Consumer::attach(invitation, Placement::Anywhere).map(StreamRole::Reader)
+                Consumer::attach(invitation, offer.tunnel_bytes as usize, Placement::Anywhere)
+                    .map(StreamRole::Reader)
             }
             protocol::StreamDirection::Write => {
-                Producer::attach(invitation, Placement::Anywhere).map(StreamRole::Writer)
+                Producer::attach(invitation, offer.tunnel_bytes as usize, Placement::Anywhere)
+                    .map(StreamRole::Writer)
             }
         };
         let role = match attachment {
             Ok(role) => role,
             Err(failure) => {
                 let failure = match failure {
-                    blocking::AttachFailure::Tunnel(
-                        libkernel::ipc::invitation::AttachFailure::Unconsumed { invitation, error },
-                    ) => AttachOwners {
-                        error: AttachError::System(error),
-                        invitation: Some(invitation),
+                    blocking::AttachFailure::Tunnel(failure) => AttachOwners {
+                        error: AttachError::System(failure.error),
+                        invitation: Some(failure.invitation),
                         endpoint: None,
-                        cleanup: None,
+                        unmapped_endpoint: None,
                     },
-                    blocking::AttachFailure::Tunnel(
-                        libkernel::ipc::invitation::AttachFailure::Consumed { cleanup, error },
-                    ) => AttachOwners {
-                        error: AttachError::System(error),
+                    blocking::AttachFailure::Map(failure) => AttachOwners {
+                        error: AttachError::System(failure.error),
                         invitation: None,
                         endpoint: None,
-                        cleanup,
+                        unmapped_endpoint: Some(failure.endpoint),
                     },
                     blocking::AttachFailure::Protocol(failure) => AttachOwners {
                         error: AttachError::Protocol(failure.error),
                         invitation: None,
                         endpoint: Some(failure.owner),
-                        cleanup: None,
+                        unmapped_endpoint: None,
                     },
                 };
                 return Err(StreamOpenFailure::Attach {

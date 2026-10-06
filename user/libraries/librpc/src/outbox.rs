@@ -31,7 +31,6 @@ pub struct Outbox {
     source_writable: bool,
     requested: bool,
     removing: bool,
-    rearm_needed: bool,
     operation_retry: bool,
     stage: OutboundStage,
     result: Option<OutboxResult>,
@@ -67,7 +66,6 @@ impl Outbox {
             source_writable: false,
             requested: false,
             removing: false,
-            rearm_needed: false,
             operation_retry: false,
             stage: OutboundStage::Ready,
             result: None,
@@ -121,7 +119,7 @@ impl Outbox {
             return;
         }
         if let Some(source) = self.source {
-            // 空邮箱的 WRITABLE 会立即消耗一次性观察；切换前只等 CLOSED。
+            // 持久 WRITABLE 只在发送受阻时需要；保持来源掩码与业务条件一致。
             if matches!(self.stage, OutboundStage::WaitingWritable) && !self.source_writable {
                 if requests.remove(source).is_ok() {
                     self.removing = true;
@@ -131,19 +129,11 @@ impl Outbox {
                 }
                 return;
             }
-            if self.rearm_needed {
-                if requests.rearm(source).is_ok() {
-                    self.rearm_needed = false;
-                    self.operation_retry = false;
-                } else {
-                    self.operation_retry = true;
-                }
-            }
             return;
         }
         if let Some(response) = self.response.as_ref()
             && requests
-                .arm_source(
+                .register(
                     SourcePlan::new(
                         response
                             .reply_handle()
@@ -160,7 +150,6 @@ impl Outbox {
         {
             self.requested = true;
             self.source_writable = matches!(self.stage, OutboundStage::WaitingWritable);
-            self.rearm_needed = false;
             self.operation_retry = false;
         } else {
             self.operation_retry = true;
@@ -181,7 +170,6 @@ impl Outbox {
             }
             Err(SystemCallError::MailboxFull) => {
                 self.stage.blocked();
-                self.rearm_needed = true;
             }
             Err(error) => self.complete(OutboxResult::Abandoned(cause(error))),
         }
@@ -191,11 +179,7 @@ impl Outbox {
         if event.kind != self.source_kind {
             return;
         }
-        if event.error != 0 {
-            self.complete(OutboxResult::Abandoned(CallCause::System(
-                SystemCallError::from_u32(event.error).unwrap_or(SystemCallError::InternalError),
-            )));
-        } else if event.observed.intersects(ObjectSignals::CLOSED) {
+        if event.observed.intersects(ObjectSignals::CLOSED) {
             self.complete(OutboxResult::Abandoned(CallCause::ServiceClosed));
         } else if event.observed.intersects(ObjectSignals::WRITABLE) {
             self.stage.writable();
@@ -243,6 +227,9 @@ impl Outbox {
             if self.result.is_none() {
                 self.ensure_registration(requests);
                 self.attempt_send();
+                // 发送受阻会改变所需掩码；最小预算也须交出旧登记撤销责任，
+                // 不能以CLOSED-only来源停驻等待尚未登记的WRITABLE。
+                self.ensure_registration(requests);
             }
             self.declare_remove(requests);
         }
@@ -252,7 +239,6 @@ impl Outbox {
                 Step::Complete
             } else if self.operation_retry
                 || self.result.is_some()
-                || self.rearm_needed
                 || self.requested
                 || self.removing
             {

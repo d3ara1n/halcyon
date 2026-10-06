@@ -1393,7 +1393,6 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // 分步发布（内存分案轮次 3）
 // ---------------------------------------------------------------------------
@@ -1410,15 +1409,37 @@ pub struct PublishCursor {
 
 impl PublishCursor {
     pub fn map(vpn: Vpn, count: usize, ppn: Ppn, flags: u64) -> Self {
-        Self { plan: TranslationPlan::Map { vpn, count, ppn, flags }, next: vpn.0, end: vpn.0 + count }
+        Self {
+            plan: TranslationPlan::Map {
+                vpn,
+                count,
+                ppn,
+                flags,
+            },
+            next: vpn.0,
+            end: vpn.0 + count,
+        }
     }
 
     pub fn unmap(vpn: Vpn, count: usize) -> Self {
-        Self { plan: TranslationPlan::Unmap { vpn, count }, next: vpn.0, end: vpn.0 + count }
+        Self {
+            plan: TranslationPlan::Unmap { vpn, count },
+            next: vpn.0,
+            end: vpn.0 + count,
+        }
     }
 
     pub fn protect(vpn: Vpn, count: usize, from: u64, to: u64) -> Self {
-        Self { plan: TranslationPlan::Protect { vpn, count, from, to }, next: vpn.0, end: vpn.0 + count }
+        Self {
+            plan: TranslationPlan::Protect {
+                vpn,
+                count,
+                from,
+                to,
+            },
+            next: vpn.0,
+            end: vpn.0 + count,
+        }
     }
 
     pub const fn is_complete(&self) -> bool {
@@ -1448,26 +1469,30 @@ pub fn worst_case_frames<const LEVELS: usize>(cursor: &PublishCursor) -> usize {
 }
 
 impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
-    /// 推进至多 `budget` 个槽单元；新表页从 `reserve` 取（准备期按
+    /// 推进至多 `budget` 个槽单元；新表页从调用者持有的 `reserve` 迭代器取（准备期按
     /// [`worst_case_frames`] 预取），不分配、不可失败。Unmap 只清叶，不摘空表；
     /// 空表由上层按“最后离开者”经 [`Self::detach_empty_table`] 回收。
     /// 返回游标是否完成。
     pub fn publish_step(
         &mut self,
         cursor: &mut PublishCursor,
-        reserve: &mut Vec<M::FrameOwner>,
+        reserve: &mut impl Iterator<Item = M::FrameOwner>,
         budget: usize,
     ) -> bool {
         let mut units = 0;
         while !cursor.is_complete() && units < budget {
             cursor.next = match cursor.plan {
-                TranslationPlan::Map { vpn, ppn, flags, .. } => {
+                TranslationPlan::Map {
+                    vpn, ppn, flags, ..
+                } => {
                     let ppn_cur = ppn.0 + (cursor.next - vpn.0);
                     let level = largest_segment_level::<LEVELS>(cursor.next, ppn_cur, cursor.end);
                     self.map_segment_from(Vpn(cursor.next), level, Ppn(ppn_cur), flags, reserve);
                     cursor.next + pages_at(level)
                 }
-                TranslationPlan::Unmap { .. } => self.edit_slot(cursor.next, cursor.end, None, reserve),
+                TranslationPlan::Unmap { .. } => {
+                    self.edit_slot(cursor.next, cursor.end, None, reserve)
+                }
                 TranslationPlan::Protect { from, to, .. } => {
                     self.edit_slot(cursor.next, cursor.end, Some((from, to)), reserve)
                 }
@@ -1483,7 +1508,7 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         seg_level: usize,
         ppn: Ppn,
         flags: u64,
-        reserve: &mut Vec<M::FrameOwner>,
+        reserve: &mut impl Iterator<Item = M::FrameOwner>,
     ) {
         let mut frame = self.root;
         let mut level = LEVELS - 1;
@@ -1512,13 +1537,13 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
                     self.leaf_matches_at(entry, level, vpn, ppn, flags),
                     "stepped Map hit a conflicting leaf inside its reservation"
                 );
-                let owner = reserve.pop().expect("worst-case table reserve exhausted");
+                let owner = reserve.next().expect("worst-case table reserve exhausted");
                 frame = self.split_mega_with(frame, idx, level, owner);
             } else {
                 if frame == self.root {
                     self.set_owned_root(idx);
                 }
-                let owner = reserve.pop().expect("worst-case table reserve exhausted");
+                let owner = reserve.next().expect("worst-case table reserve exhausted");
                 let new_frame = self.install_owner(owner);
                 self.mem.table_mut(frame)[idx] = Pte::branch(new_frame);
                 frame = new_frame;
@@ -1534,7 +1559,7 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         vpn: usize,
         end: usize,
         protect: Option<(u64, u64)>,
-        reserve: &mut Vec<M::FrameOwner>,
+        reserve: &mut impl Iterator<Item = M::FrameOwner>,
     ) -> usize {
         let mut frame = self.root;
         let mut level = LEVELS - 1;
@@ -1544,7 +1569,10 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
             let slot_base = vpn - vpn % slot_pages;
             let slot_end = slot_base + slot_pages;
             if level == LEVELS - 1 && self.is_shared_root(idx) {
-                assert!(protect.is_none(), "stepped Protect entered a shared root slot");
+                assert!(
+                    protect.is_none(),
+                    "stepped Protect entered a shared root slot"
+                );
                 return slot_end.min(end);
             }
             let entry = self.mem.table_mut(frame)[idx];
@@ -1572,7 +1600,7 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
                 }
                 return slot_end;
             }
-            let owner = reserve.pop().expect("worst-case table reserve exhausted");
+            let owner = reserve.next().expect("worst-case table reserve exhausted");
             frame = self.split_mega_with(frame, idx, level, owner);
             level -= 1;
         }

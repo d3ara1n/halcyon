@@ -1,14 +1,14 @@
 //! init 的长期责任 owner。脚本只借用；阶段失败不销毁运行体、世界或未交付结果。
 //! Job 与 Batch 各两槽承接原操作及 services 兜底；Read 保留单一数据面阶段。
-//! 六个等待目标来自这些责任及空闲集合，满足 WaitMany 的 ABI 上界。
+//! 等待目标来自这些责任及空闲集合，由持久来源与 Assembly 统一登记、接收。
 
 use super::*;
 use alloc::vec::Vec;
+use libexecution::assembly::Assembly;
 use libexecution::runtime::{DriveState, TaskFailure};
-use libprocess::{Collector, job_driver::JobDriver};
 use libkernel::shared::time::Deadline;
+use libprocess::{Collector, job_driver::JobDriver};
 
-const ROOT_WAIT_TARGETS: usize = 6;
 const ROOT_JOB_SLOTS: usize = 2;
 
 fn later(now: u64) -> u64 {
@@ -200,11 +200,11 @@ struct CapabilityEntry {
 }
 
 pub(super) struct RootSupervisor {
-    idle: WaitSet,
+    assembly: Assembly<WaitSet>,
     capabilities: Vec<CapabilityEntry>,
     capability_cursor: usize,
-    endpoint_cleanup: Cleanup<libkernel::ipc::tunnel::Endpoint>,
-    endpoint_create_cleanup: Cleanup<libkernel::ipc::tunnel::EndpointCleanup>,
+    endpoint_cleanup: Cleanup<librunnel::MappedEndpoint>,
+    endpoint_create_cleanup: Cleanup<libkernel::ipc::tunnel::Endpoint>,
     capability_cleanup: Cleanup<Capability>,
     services: Option<Handle>,
     jobs: [Option<JobDuty>; ROOT_JOB_SLOTS],
@@ -236,13 +236,35 @@ fn can_drive<T>(rt: &Runtime<T, WaitSet>, now: u64) -> bool {
     }
 }
 
-fn runtime<T>(capacity: usize, sources: usize) -> Result<Runtime<T, WaitSet>, SystemCallError> {
+fn fold_wait<T>(
+    rt: Option<&Runtime<T, WaitSet>>,
+    disposition: &Disposition,
+    complete: bool,
+) -> (bool, Option<u64>) {
+    if disposition.held || disposition.retry.is_some() || complete {
+        return (false, disposition.retry);
+    }
+    match rt.map(Runtime::drive_state) {
+        Some(DriveState::Runnable | DriveState::Drained) => (true, None),
+        Some(DriveState::Waiting(deadline)) => (
+            false,
+            deadline.instant().expect("runtime deadline validated"),
+        ),
+        None => (false, None),
+    }
+}
+
+fn runtime<T>(
+    assembly: &Assembly<WaitSet>,
+    capacity: usize,
+    sources: usize,
+) -> Result<Runtime<T, WaitSet>, SystemCallError> {
     let bytes = Runtime::<T, WaitSet>::input_budget(sources)?;
     let budget = Budget::new(&[capacity, bytes], 1)?;
     let account = budget.account(&[capacity, bytes])?;
     let account =
         account.view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])?;
-    Runtime::new(WaitSet::create(sources)?, capacity, sources, &account)
+    Runtime::new(assembly.bind()?, capacity, sources, &account)
 }
 
 /// 关闭失败把原运行体放回原槽；该操作不需要申请新的错误承载。
@@ -274,9 +296,19 @@ where
 impl RootSupervisor {
     /// 必须在创建 services/启动任何子进程之前完成。
     pub(super) fn prepare(reset: &mut Option<Handle>) -> Result<Self, SystemCallError> {
-        let idle = WaitSet::create(1)?;
+        let bytes = Assembly::<WaitSet>::input_budget()?;
+        let budget = Budget::new(&[0, bytes], 1)?;
+        let account = budget
+            .account(&[0, bytes])?
+            .view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])?;
+        // query/members 的 ABI 表示为 u32；只取表示上界，运行体额度承担实际政策。
+        let set = WaitSet::create(u32::MAX as usize)?;
+        let assembly = Assembly::new(set, &account).map_err(|(set, error)| {
+            drop(set);
+            error
+        })?;
         Ok(Self {
-            idle,
+            assembly,
             capabilities: Vec::new(),
             capability_cursor: 0,
             endpoint_cleanup: Cleanup::empty(),
@@ -295,7 +327,9 @@ impl RootSupervisor {
     }
 
     pub(super) fn take_reset(&mut self) -> Handle {
-        self.reset.take().expect("root supervisor reset authority missing")
+        self.reset
+            .take()
+            .expect("root supervisor reset authority missing")
     }
     fn reserve_capabilities<const N: usize>(&mut self) -> Result<[usize; N], SystemCallError> {
         self.capabilities
@@ -336,10 +370,11 @@ impl RootSupervisor {
     pub(super) fn create_job(
         &mut self,
         parent: Handle,
+        pool: Handle,
         rights: Rights,
     ) -> Result<Handle, SystemCallError> {
         let [slot] = self.reserve_capabilities()?;
-        match process::create_job(parent, rights) {
+        match process::create_job(parent, pool, rights) {
             Ok(handle) => {
                 self.adopt(slot, handle);
                 Ok(handle)
@@ -560,7 +595,7 @@ impl RootSupervisor {
             .expect("standby duty remains owned");
         duty.active = false;
         // 服务尚未启动时完成根 frame、运行体和任务准入；兜底激活不重新分配承载。
-        Self::prepare_job(duty)
+        Self::prepare_job(duty, &self.assembly)
     }
     pub(super) fn reserve_process(&mut self) -> Result<(), SystemCallError> {
         self.processes
@@ -677,7 +712,7 @@ impl RootSupervisor {
     }
     pub(super) fn retain_transport(
         &mut self,
-        endpoint: libkernel::ipc::tunnel::Endpoint,
+        endpoint: librunnel::MappedEndpoint,
         invitation: libkernel::ipc::invitation::Invitation,
     ) {
         assert!(
@@ -690,15 +725,13 @@ impl RootSupervisor {
     pub(super) fn retain_failed_create(
         &mut self,
         endpoint: Option<libkernel::ipc::tunnel::Endpoint>,
-        cleanup: Option<libkernel::ipc::tunnel::EndpointCleanup>,
         invitation: Option<libkernel::ipc::invitation::Invitation>,
     ) {
         assert!(
             self.endpoint_cleanup.owner.is_none() && self.endpoint_create_cleanup.owner.is_none(),
             "stream setup has one endpoint"
         );
-        self.endpoint_cleanup.owner = endpoint;
-        self.endpoint_create_cleanup.owner = cleanup;
+        self.endpoint_create_cleanup.owner = endpoint;
         if let Some(invitation) = invitation {
             self.retain_capability(invitation.into_capability());
         }
@@ -814,7 +847,7 @@ impl RootSupervisor {
     /// 一台运行体被策略错误停驻时，另一台批次仍完成，并恢复原 Job 机器。
     pub(super) fn verify_failure_isolation(&mut self, parent: Handle) -> Result<(), &'static str> {
         let child = self
-            .create_job(parent, JOB_FULL_RIGHTS)
+            .create_job(parent, crate::root_memory_pool(), JOB_FULL_RIGHTS)
             .map_err(|_| "root isolation Job create failed")?;
         let index = self.begin_job(child, None);
         let duty = self.jobs[index]
@@ -881,7 +914,8 @@ impl RootSupervisor {
         results
             .try_reserve_exact(2)
             .map_err(|_| "handoff output preparation failed")?;
-        let test_runtime = runtime(1, 2).map_err(|_| "handoff runtime preparation failed")?;
+        let test_runtime =
+            runtime(&self.assembly, 1, 2).map_err(|_| "handoff runtime preparation failed")?;
         incoming.push(self.processes.pop().expect("two controls were verified"));
         incoming.push(self.processes.pop().expect("two controls were verified"));
         let index = self.begin_batch(incoming, None);
@@ -1004,17 +1038,17 @@ impl RootSupervisor {
         Ok(())
     }
 
-    fn prepare_job(duty: &mut JobDuty) -> Result<(), SystemCallError> {
+    fn prepare_job(
+        duty: &mut JobDuty,
+        assembly: &Assembly<WaitSet>,
+    ) -> Result<(), SystemCallError> {
         if duty.pending.is_none() && duty.runtime.is_none() {
             duty.pending = Some(JobTask {
-                driver: JobDriver::new(JobCollector::new(
-                    duty.root,
-                    DEFAULT_SUPERVISION_POLICY,
-                )?),
+                driver: JobDriver::new(JobCollector::new(duty.root, DEFAULT_SUPERVISION_POLICY)?),
             });
         }
         if duty.runtime.is_none() {
-            duty.runtime = Some(runtime(1, 1)?);
+            duty.runtime = Some(runtime(assembly, 1, 1)?);
         }
         let rt = duty.runtime.as_mut().expect("job runtime remains owned");
         if let Some(task) = duty.pending.take()
@@ -1026,11 +1060,16 @@ impl RootSupervisor {
         Ok(())
     }
 
-    fn step_job(duty: &mut JobDuty, now: u64, failing: bool) -> Result<(), SystemCallError> {
+    fn step_job(
+        duty: &mut JobDuty,
+        now: u64,
+        failing: bool,
+        assembly: &Assembly<WaitSet>,
+    ) -> Result<(), SystemCallError> {
         if !duty.active || duty.complete || !duty.disposition.ready(now) {
             return Ok(());
         }
-        Self::prepare_job(duty)?;
+        Self::prepare_job(duty, assembly)?;
         let rt = duty.runtime.as_mut().expect("job runtime remains owned");
         if failing && let Some(id) = duty.failed_task {
             let retry = duty.world.failure.is_some_and(|error| match error.cause {
@@ -1067,7 +1106,12 @@ impl RootSupervisor {
         Ok(())
     }
 
-    fn step_batch(duty: &mut BatchDuty, now: u64, failing: bool) -> Result<(), SystemCallError> {
+    fn step_batch(
+        duty: &mut BatchDuty,
+        now: u64,
+        failing: bool,
+        assembly: &Assembly<WaitSet>,
+    ) -> Result<(), SystemCallError> {
         if duty.complete || !duty.disposition.ready(now) {
             return Ok(());
         }
@@ -1076,7 +1120,7 @@ impl RootSupervisor {
                 .results
                 .try_reserve_exact(duty.capacity)
                 .map_err(|_| SystemCallError::OutOfMemory)?;
-            duty.runtime = Some(runtime(duty.capacity, duty.capacity)?);
+            duty.runtime = Some(runtime(assembly, duty.capacity, duty.capacity)?);
         }
         let rt = duty.runtime.as_mut().expect("batch runtime remains owned");
         if duty.pending.is_none()
@@ -1157,9 +1201,9 @@ impl RootSupervisor {
                     .as_ref()
                     .expect("all results succeeded");
                 debug!(
-                    "pid {} supervised: work={}, state={}, reason={}, detail0={}",
+                    "pid {} supervised: queries={}, state={}, reason={}, detail0={}",
                     done.pid,
-                    done.progress.work_done,
+                    done.progress.query_attempts,
                     done.snapshot.state,
                     done.snapshot.cause,
                     done.snapshot.detail.word0
@@ -1174,7 +1218,12 @@ impl RootSupervisor {
         Ok(())
     }
 
-    fn step_read(duty: &mut ReadDuty, now: u64, failing: bool) -> Result<(), SystemCallError> {
+    fn step_read(
+        duty: &mut ReadDuty,
+        now: u64,
+        failing: bool,
+        assembly: &Assembly<WaitSet>,
+    ) -> Result<(), SystemCallError> {
         if !duty.disposition.ready(now) {
             return Ok(());
         }
@@ -1189,7 +1238,7 @@ impl RootSupervisor {
             duty.world.buffer.resize(STREAM_LEN + 1, 0);
         }
         if duty.runtime.is_none() {
-            duty.runtime = Some(runtime(1, 2)?);
+            duty.runtime = Some(runtime(assembly, 1, 2)?);
         }
         let rt = duty.runtime.as_mut().expect("read runtime remains owned");
         if let Some(task) = duty.pending.take()
@@ -1221,6 +1270,21 @@ impl RootSupervisor {
     }
 
     fn turn_and_wait(&mut self, awaited: Option<Await>) -> Result<(), SystemCallError> {
+        for &record in self.assembly.receive(64)? {
+            for duty in self.jobs.iter_mut().flatten() {
+                if let Some(rt) = duty.runtime.as_mut() {
+                    rt.feed(record);
+                }
+            }
+            for duty in self.batches.iter_mut().flatten() {
+                if let Some(rt) = duty.runtime.as_mut() {
+                    rt.feed(record);
+                }
+            }
+            if let Some(rt) = self.read.as_mut().and_then(|duty| duty.runtime.as_mut()) {
+                rt.feed(record);
+            }
+        }
         let now = libkernel::time::snapshot()?.now_ns;
         // 五个运行体槽持续轮转；每轮各至多一个工作单位。
         for _ in 0..5 {
@@ -1229,7 +1293,7 @@ impl RootSupervisor {
             match index {
                 0 | 1 => {
                     if let Some(duty) = &mut self.jobs[index]
-                        && let Err(error) = Self::step_job(duty, now, self.failing)
+                        && let Err(error) = Self::step_job(duty, now, self.failing, &self.assembly)
                     {
                         duty.error = Some(error);
                         duty.disposition.fail(error, now);
@@ -1237,7 +1301,8 @@ impl RootSupervisor {
                 }
                 2 | 3 => {
                     if let Some(duty) = &mut self.batches[index - 2]
-                        && let Err(error) = Self::step_batch(duty, now, self.failing)
+                        && let Err(error) =
+                            Self::step_batch(duty, now, self.failing, &self.assembly)
                     {
                         duty.error = Some(error);
                         duty.disposition.fail(error, now);
@@ -1245,7 +1310,7 @@ impl RootSupervisor {
                 }
                 _ => {
                     if let Some(duty) = &mut self.read
-                        && let Err(error) = Self::step_read(duty, now, self.failing)
+                        && let Err(error) = Self::step_read(duty, now, self.failing, &self.assembly)
                     {
                         duty.error = Some(error);
                         duty.disposition.fail(error, now);
@@ -1254,9 +1319,9 @@ impl RootSupervisor {
             }
         }
         self.endpoint_cleanup
-            .step(now, libkernel::ipc::tunnel::Endpoint::close);
+            .step(now, librunnel::MappedEndpoint::close);
         self.endpoint_create_cleanup
-            .step(now, libkernel::ipc::tunnel::EndpointCleanup::close);
+            .step(now, libkernel::ipc::tunnel::Endpoint::close);
         self.capability_cleanup.step(now, Capability::close);
         if self.failing {
             for index in 0..ROOT_JOB_SLOTS {
@@ -1331,9 +1396,6 @@ impl RootSupervisor {
                 }
             }
         }
-        let mut items =
-            [WaitItem::new(self.idle.handle(), ObjectSignals::READABLE, 0); ROOT_WAIT_TARGETS];
-        let mut count = 1;
         let mut deadline = None;
         let mut runnable = self.endpoint_cleanup.runnable()
             || self.endpoint_create_cleanup.runnable()
@@ -1365,43 +1427,39 @@ impl RootSupervisor {
                 runnable = true;
             }
         }
-        macro_rules! waiting {
-            ($duty:expr, $cookie:expr) => {
-                if let Some(duty) = $duty {
-                    if let Some(at) = duty.disposition.retry {
-                        deadline = Some(deadline.map_or(at, |old: u64| old.min(at)));
-                    }
-                    if !duty.disposition.held
-                        && duty.disposition.retry.is_none()
-                        && !duty.complete
-                        && let Some(rt) = &duty.runtime
-                    {
-                        match rt.drive_state() {
-                            DriveState::Runnable => runnable = true,
-                            DriveState::Waiting(at) => {
-                                if let Some(at) = at.instant().expect("runtime deadline validated")
-                                {
-                                    deadline = Some(deadline.map_or(at, |old: u64| old.min(at)));
-                                }
-                                items[count] = rt.wait_item($cookie);
-                                count += 1;
-                            }
-                            DriveState::Drained => runnable = true,
-                        }
-                    }
-                }
-            };
-        }
-        waiting!(self.jobs[0].as_ref().filter(|duty| duty.active), 1);
-        waiting!(self.jobs[1].as_ref().filter(|duty| duty.active), 2);
-        for duty in self.batches.iter().flatten() {
-            if let Some(at) = duty.admission_retry {
+        let waits = [
+            self.jobs[0]
+                .as_ref()
+                .filter(|duty| duty.active)
+                .map(|d| fold_wait(d.runtime.as_ref(), &d.disposition, d.complete)),
+            self.jobs[1]
+                .as_ref()
+                .filter(|duty| duty.active)
+                .map(|d| fold_wait(d.runtime.as_ref(), &d.disposition, d.complete)),
+            self.batches[0]
+                .as_ref()
+                .map(|d| fold_wait(d.runtime.as_ref(), &d.disposition, d.complete)),
+            self.batches[1]
+                .as_ref()
+                .map(|d| fold_wait(d.runtime.as_ref(), &d.disposition, d.complete)),
+            self.read
+                .as_ref()
+                .map(|d| fold_wait(d.runtime.as_ref(), &d.disposition, d.complete)),
+        ];
+        for (ready, at) in waits.into_iter().flatten() {
+            runnable |= ready;
+            if let Some(at) = at {
                 deadline = Some(deadline.map_or(at, |old: u64| old.min(at)));
             }
         }
-        waiting!(self.batches[0].as_ref(), 3);
-        waiting!(self.batches[1].as_ref(), 4);
-        waiting!(self.read.as_ref(), 5);
+        for at in self
+            .batches
+            .iter()
+            .flatten()
+            .filter_map(|duty| duty.admission_retry)
+        {
+            deadline = Some(deadline.map_or(at, |old: u64| old.min(at)));
+        }
         // 只向正在等待的脚本阶段返回结果；其他已完成槽不妨碍组合停驻。
         let outcome = match awaited {
             Some(Await::Job(index)) => self.jobs[index]
@@ -1419,34 +1477,8 @@ impl RootSupervisor {
         if runnable || outcome {
             return Ok(());
         }
-        let result = libkernel::ipc::wait::wait_until(
-            &items[..count],
-            deadline.map_or(Deadline::INFINITE, Deadline::at),
-        )?;
-        match result.cookie {
-            1 | 2 => {
-                if let Some(rt) = self.jobs[result.cookie as usize - 1]
-                    .as_mut()
-                    .and_then(|d| d.runtime.as_mut())
-                {
-                    rt.notified();
-                }
-            }
-            3 | 4 => {
-                if let Some(rt) = self.batches[result.cookie as usize - 3]
-                    .as_mut()
-                    .and_then(|d| d.runtime.as_mut())
-                {
-                    rt.notified();
-                }
-            }
-            5 => {
-                if let Some(rt) = self.read.as_mut().and_then(|d| d.runtime.as_mut()) {
-                    rt.notified();
-                }
-            }
-            _ => {}
-        }
+        self.assembly
+            .wait(deadline.map_or(Deadline::INFINITE, Deadline::at))?;
         Ok(())
     }
 

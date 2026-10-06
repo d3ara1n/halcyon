@@ -55,7 +55,7 @@ affine 属性只能通过 `Take`。`PreparedTake` 先预付空 Blob、取出原�
 
 ## F3c Watch
 
-F3c 发布 `Subscribe`、`QuerySubscription` 与 `Unsubscribe`。客户端 `Subscription` 独占 Notification owner，并复制一份 grant 使用引用；provider 消费具备 `SIGNAL | WAIT | TRANSIT` 的 signaler。每项订阅由独立 Runtime task 拥有 signaler、Watch/WaitSource charge、被观察 `NodeRef`、回复 Outbox 和来源注销责任。任务先登记 signaler 的 `CLOSED` 来源，登记回调再按原 AccessSnapshot 重新解析路径、确认稳定 NodeId 与当前 WATCH 权限，并在同一推进点安装记录和取得节点版本；安装后的事件可早于 Subscribe 回复，安装前变化则由回复代次显式体现，不形成丢失窗口。
+F3c 发布 `Subscribe`、`QuerySubscription` 与 `Unsubscribe`。客户端 `Subscription` 独占 Notification owner 和扁平集合接收权，并复制一份 grant 使用引用；wait 以可变借用串行接收，陈旧 READABLE 的 NotAvailable 重试，到期重读实际 bits 与 grant CLOSED；provider 消费具备 `SIGNAL | TRANSIT` 的 signaler。每项订阅由独立 Runtime task 拥有 signaler、Watch/WaitSource charge、被观察 `NodeRef`、回复 Outbox 和来源注销责任。任务先从 signaler 派生只读 NotificationObservation，再登记其 `CLOSED` 来源，登记回调再按原 AccessSnapshot 重新解析路径、确认稳定 NodeId 与当前 WATCH 权限，并在同一推进点安装记录和取得节点版本；安装后的事件可早于 Subscribe 回复，安装前变化则由回复代次显式体现，不形成丢失窗口。
 
 provider-local Watch 表配置上限为 24，`libfal::watch::WakeBatch` 在 Runtime 单步请求容量不足时保留未发出的唤醒游标；表以单调 subscription id 寻址，同时保存内核 sender context，Query/Unsubscribe 必须由原 grant context 发起。目录直接成员 Create/Delete/Move 及 Registry Ready/Drain 产生可见提交效果；属性和成功 Take 产生 MODIFY，被观察节点 Delete 产生 `DELETE | TERMINATED`。每项订阅按 OR 合并位，一次提交最多唤醒每个 Watch task 一次；signal syscall 只由该任务执行。
 
@@ -93,7 +93,7 @@ Open 固定体现在可携 `expected_identity`（零为无条件，非零为本�
 
 `libfs::client::copy` 持目标父 DirectoryGrant、单组件名字、provider object id 与 Create `NodeInfo` 构成 CreatedTarget；Create 是独占的，`libfal::Client::call_classified` 将本地编码/准备失败、未投递、已投递未知和服务明确拒绝分开，Unknown 保留目标 locator，不自动重试。CreatedTarget 写 Open 以 NodeInfo.identity 作条件；显式 `delete_if_current` 先 Lookup 当前身份与版本，再条件 Delete，替代者或并发版本变化均不删除，普通失败不自动删部分目标。
 
-Copy 在源和目标先后 Open 后，以 `libexecution::Runtime` 一条任务推进两个 RNL2 角色，一轮至多 1024 字节；每端一个数据来源与只看 CLOSED/PEER_CLOSED 的终态来源，可选取消来源，总上限五个。数据电平只在需要读/写且未武装时 rearm，终态来源在对端背压期间也保持可观察；来源均注销后才交还 Stream owner。Runtime 的本地 Budget/ExecutionResource 预付 Task 与按五来源推导的 InputBytes，正常关闭检查双额度归零；关闭失败保留 WaitSet、Task 与缓冲快照，由 CopyFailure 在仍持双端流时续作有界退休。数据 EOF 仅结束搬运，随后源 Finish 确认，目标才发 EOF 并等待目标 Finish；字节搬运、两端 accepted/transported 完全一致且两端 Completed 才交付 CopySuccess。失败先尝试分别关闭两端数据角色，再为源/目标各自建立 control Cancel；清理期限为有限上界且不晚于传入业务期限。任一调用失败时 CopyFailure 仍携源/目标 Stream、CreatedTarget 或已送出 Create 的 Unknown locator，不将 Drop 当退款证明。
+Copy 在源和目标先后 Open 后，以 `libexecution::Runtime` 一条任务推进两个 RNL2 角色，一轮至多 1024 字节；每端一个数据来源与只看 CLOSED/PEER_CLOSED 的终态来源，可选取消来源，总上限五个。数据来源持久登记，在需要读/写时重查当前电平，终态来源在对端背压期间也保持可观察；来源均注销后才交还 Stream owner。Runtime 的本地 Budget/ExecutionResource 预付 Task 与按五来源推导的 InputBytes，正常关闭检查双额度归零；关闭失败保留 WaitSet、Task 与缓冲快照，由 CopyFailure 在仍持双端流时续作有界退休。数据 EOF 仅结束搬运，随后源 Finish 确认，目标才发 EOF 并等待目标 Finish；字节搬运、两端 accepted/transported 完全一致且两端 Completed 才交付 CopySuccess。失败先尝试分别关闭两端数据角色，再为源/目标各自建立 control Cancel；清理期限为有限上界且不晚于传入业务期限。任一调用失败时 CopyFailure 仍携源/目标 Stream、CreatedTarget 或已送出 Create 的 Unknown locator，不将 Drop 当退款证明。
 
 `test_fal` 使用正式 A/B 执行跨环、同 provider、空源、创建冲突、预取消、进度后取消、条件清理及不误删替代者等 Copy 场景。`CopyFailure` 不自动 Delete；清理先分别尝试解除两端数据角色，再为源/目标各自建立 control Cancel，两个取消请求拥有独立 owner，避免一端等待阻止另一端停止。自动失败清理使用有限期限，不延长原业务成功期限。取消 RPC 错误按源/目标保留 typed CallOwner，关闭失败返回原 owner 供显式重试，不能因另一端关闭成功报告全部清理成功。消费者另验证已投递 Create 的回复隔离、完成操作终态和 provider CLOSED 后的新请求未投递；init 保留监督/注册控制剧本，普通写入/回读/Watch 由 `test_fal` 负责。
 新增资源验证先占满正式 StreamTable/Watch 配额，核对 `Quota` 拒绝、owner 释放与重新准入；在途 Copy 在目标已接受至少 4 KiB 后向 init 报告 armed，由 init 释放 B provider，消费者核对部分进度、失败边界和目标 owner 可取回。

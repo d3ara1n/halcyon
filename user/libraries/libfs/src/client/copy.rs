@@ -1,10 +1,7 @@
 use super::*;
 use core::num::NonZeroU64;
 use erhino_shared::call::SystemCallError;
-use erhino_shared::{
-    object::ObjectSignals,
-    wait::{WaitItem, WaitReason},
-};
+use erhino_shared::{object::ObjectSignals, wait::WaitReason};
 use libfal::{
     authority::FalRights,
     client::{Client, ClientCallFailure, ClientError, ClientOperation, ClientProgress},
@@ -298,22 +295,17 @@ fn cancellation_observed(cancel: Option<&Capability>) -> Result<bool, SystemCall
     };
     let now = libkernel::time::Instant::now()?.as_nanos();
     match libkernel::ipc::wait::wait_until(
-        &[WaitItem::new(
-            cancel.as_handle(),
-            ObjectSignals::READABLE | ObjectSignals::CLOSED,
-            0,
-        )],
+        cancel.as_handle(),
+        ObjectSignals::READABLE | ObjectSignals::CLOSED,
         libkernel::time::Deadline::at(now),
     ) {
         Ok(result) => {
             let reason =
                 WaitReason::from_u32(result.reason).ok_or(SystemCallError::InternalError)?;
-            Ok(matches!(
-                reason,
-                WaitReason::Signaled | WaitReason::Closed | WaitReason::Cancelled
-            ) && result
-                .observed
-                .intersects(ObjectSignals::READABLE | ObjectSignals::CLOSED))
+            Ok(matches!(reason, WaitReason::Signaled | WaitReason::Closed)
+                && result
+                    .observed
+                    .intersects(ObjectSignals::READABLE | ObjectSignals::CLOSED))
         }
         Err(SystemCallError::DeadlineExpired) => Ok(false),
         Err(error) => Err(error),
@@ -350,14 +342,18 @@ fn finish_cancel(
             Ok(ClientProgress::Pending) => {
                 if let Err(cause) = operation.wait_ready() {
                     return Err(ClientError::Transport(
-                        operation.abort(cause).expect("waiting cancellation remains pending"),
+                        operation
+                            .abort(cause)
+                            .expect("waiting cancellation remains pending"),
                     ));
                 }
                 step = operation.advance();
             }
             Err(cause) => {
                 return Err(ClientError::Transport(
-                    operation.abort(cause).expect("failed cancellation remains pending"),
+                    operation
+                        .abort(cause)
+                        .expect("failed cancellation remains pending"),
                 ));
             }
         }
@@ -492,14 +488,16 @@ impl CopyFailure {
                 && self.target_result.is_none()
                 && self.cleanup_errors[1].is_none());
         let deadline = if needs_cancel {
-            let limit = libkernel::time::timeout_millis(5_000)
-                .map_err(CopyCleanupError::Deadline)?;
-            let limit_ns = limit.instant().map_err(|_| {
-                CopyCleanupError::Deadline(SystemCallError::IllegalArgument)
-            })?.expect("finite cleanup deadline");
-            match deadline.instant().map_err(|_| {
-                CopyCleanupError::Deadline(SystemCallError::IllegalArgument)
-            })? {
+            let limit =
+                libkernel::time::timeout_millis(5_000).map_err(CopyCleanupError::Deadline)?;
+            let limit_ns = limit
+                .instant()
+                .map_err(|_| CopyCleanupError::Deadline(SystemCallError::IllegalArgument))?
+                .expect("finite cleanup deadline");
+            match deadline
+                .instant()
+                .map_err(|_| CopyCleanupError::Deadline(SystemCallError::IllegalArgument))?
+            {
                 Some(requested) => libkernel::time::Deadline::at(requested.min(limit_ns)),
                 None => limit,
             }
@@ -508,41 +506,61 @@ impl CopyFailure {
         };
         let mut source_client = Client::new();
         let mut target_client = Client::new();
-        let source_cancel = self.source.as_ref().filter(|_| {
-            self.source_result.is_none() && self.cleanup_errors[0].is_none()
-        }).map(|stream| {
-            stream.control_sender().ok_or(ClientCallFailure::NoRequest(ClientError::Protocol))
-                .and_then(|control| source_client.begin_call(
-                    control, &Request::CancelStream, deadline, None,
-                ))
-        });
-        let target_cancel = self.destination.as_ref().filter(|_| {
-            self.target_result.is_none() && self.cleanup_errors[1].is_none()
-        }).map(|stream| {
-            stream.control_sender().ok_or(ClientCallFailure::NoRequest(ClientError::Protocol))
-                .and_then(|control| target_client.begin_call(
-                    control, &Request::CancelStream, deadline, None,
-                ))
-        });
+        let source_cancel = self
+            .source
+            .as_ref()
+            .filter(|_| self.source_result.is_none() && self.cleanup_errors[0].is_none())
+            .map(|stream| {
+                stream
+                    .control_sender()
+                    .ok_or(ClientCallFailure::NoRequest(ClientError::Protocol))
+                    .and_then(|control| {
+                        source_client.begin_call(control, &Request::CancelStream, deadline, None)
+                    })
+            });
+        let target_cancel = self
+            .destination
+            .as_ref()
+            .filter(|_| self.target_result.is_none() && self.cleanup_errors[1].is_none())
+            .map(|stream| {
+                stream
+                    .control_sender()
+                    .ok_or(ClientCallFailure::NoRequest(ClientError::Protocol))
+                    .and_then(|control| {
+                        target_client.begin_call(control, &Request::CancelStream, deadline, None)
+                    })
+            });
         let mut source_cancel = source_cancel;
         let mut target_cancel = target_cancel;
-        let source_step = source_cancel.as_mut().and_then(|result| result.as_mut().ok())
+        let source_step = source_cancel
+            .as_mut()
+            .and_then(|result| result.as_mut().ok())
             .map(|operation| operation.advance());
-        let target_step = target_cancel.as_mut().and_then(|result| result.as_mut().ok())
+        let target_step = target_cancel
+            .as_mut()
+            .and_then(|result| result.as_mut().ok())
             .map(|operation| operation.advance());
-        for (index, (attempt, step)) in [
-            (source_cancel, source_step),
-            (target_cancel, target_step),
-        ].into_iter().enumerate() {
+        for (index, (attempt, step)) in [(source_cancel, source_step), (target_cancel, target_step)]
+            .into_iter()
+            .enumerate()
+        {
             let Some(result) = attempt else { continue };
             let outcome = match result {
                 Ok(mut operation) => finish_cancel(
                     &mut operation,
                     step.expect("prepared cancellation has an initial step"),
                     if index == 0 {
-                        self.source.as_ref().expect("source cancellation prepared").offer.identity
+                        self.source
+                            .as_ref()
+                            .expect("source cancellation prepared")
+                            .offer
+                            .identity
                     } else {
-                        self.destination.as_ref().expect("target cancellation prepared").offer.identity
+                        self.destination
+                            .as_ref()
+                            .expect("target cancellation prepared")
+                            .offer
+                            .identity
                     },
                 ),
                 Err(error) => Err(error.into_error()),
@@ -610,7 +628,8 @@ impl Transport {
         macro_rules! fail {
             ($cause:expr) => {{
                 state.cause = $cause;
-                let cleanup_deadline = libkernel::time::timeout_millis(5_000).unwrap_or(request.deadline);
+                let cleanup_deadline =
+                    libkernel::time::timeout_millis(5_000).unwrap_or(request.deadline);
                 let _ = state.retry_cleanup(cleanup_deadline);
                 return Err(state);
             }};

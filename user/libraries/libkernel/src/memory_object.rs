@@ -66,7 +66,7 @@ impl MemoryObject {
         Ok(snapshot)
     }
 
-    /// 单向发布对象为可执行。幂等；完成经 WaitMany 观察 `EXECUTABLE` 电平。
+    /// 单向发布对象为可执行。幂等；完成经等待来源观察 `EXECUTABLE` 电平。
     pub fn seal(&self) -> Result<(), SystemCallError> {
         // SAFETY: 值参数由内核完整校验。
         unsafe { crate::call::sys_memory_object_seal(self.handle) }

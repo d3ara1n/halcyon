@@ -1,14 +1,13 @@
 //! BootPackage bootstrap：验证固定 envelope，只装载唯一 initial ELF，并把
-//! opaque payload 作为 StartupBlock 的只读 borrowed backing 交给 init。
+//! opaque payload 作为 StartupBlock 的资金化只读 View 交给 init。
 
-use erhino_shared::{
-    boot::{BootPackage, validate_boot_package},
-    object::Rights,
-};
+use erhino_shared::boot::{BootPackage, validate_boot_package};
 
-use crate::{frame, mm, sched, task};
+use crate::{frame, mm, task};
 
-const PAGE_SIZE: usize = task::proc::PAGE_SIZE;
+mod bootstrap;
+
+const PAGE_SIZE: usize = erhino_shared::proc::PROCESS_PAGE_SIZE;
 
 /// 在 DT 声明的最大窗口内验证 envelope，返回应保留的实际总长。
 /// 调用点位于正式直映射启用后、帧池注册前。
@@ -24,9 +23,6 @@ pub fn load(address: usize, length: usize) {
         package.header.total_len as usize, length,
         "BootPackage runtime length differs from inspected envelope"
     );
-    let payload_pa = address
-        .checked_add(package.header.payload_off as usize)
-        .expect("BootPackage payload physical address overflow");
     let payload_len = package.payload.len();
     let reserved_pages = length.div_ceil(PAGE_SIZE);
     let payload_offset_pages = package.header.payload_off as usize / PAGE_SIZE;
@@ -50,79 +46,19 @@ pub fn load(address: usize, length: usize) {
         },
     )
     .expect("BootPackage initial ELF admission failed");
-    task::resources::init();
     crate::clock::selftest::run();
-    task::resources::self_test();
-    task::proc::building_cutoff_selftest();
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
-    task::thread::capability_lifecycle_selftest(&root_pool);
     frame::selftest::run(&root_pool);
-    task::tunnel::selftest::run(&root_pool);
-    task::wait_set::selftest::continuation::run(&root_pool);
-    task::mailbox::selftest::run(&root_pool);
-    task::wait::selftest::time_install(&root_pool);
-    let pid = task::alloc_pid().expect("initial process identity exhausted");
-    assert_eq!(pid, 1, "initial process must receive PID 1");
-    let root_job = task::job::Job::root();
-    let spawned = task::spawn_from_elf(
-        pid,
-        0,
-        root_job.clone(),
-        &image,
+    bootstrap::publish(
+        image,
         package.initial_elf,
-        root_pool.clone(),
-    )
-    .expect("initial process image cannot be constructed");
-    let root_control = task::handle::entry(
-        task::job::Job::object_ref(&root_job),
-        task::object::HandleRole::JobControl,
-        Rights::CREATE
-            | Rights::MANAGE
-            | Rights::READ
-            | Rights::WAIT
-            | Rights::DUPLICATE
-            | Rights::TRANSIT
-            | Rights::GRANT,
-    )
-    .expect("root JobControl rights are invalid");
-    let system_reset = task::system_reset::SystemReset::new();
-    let reset_control = task::handle::entry(
-        task::system_reset::SystemReset::object_ref(&system_reset),
-        task::object::HandleRole::SystemResetControl,
-        Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
-    )
-    .expect("SystemReset rights are invalid");
-    let thread = task::launch_bootstrap(
-        spawned,
+        prefix_held,
         payload_held,
-        package.payload,
-        alloc::vec![root_control, reset_control],
+        payload_len,
+        root_pool,
     )
-    .expect("initial process cannot be launched");
-    task::memory_pool::MemoryPool::syscall_self_test(
-        &thread,
-        &root_pool,
-        task::job::Job::object_ref(&root_job),
-    );
-
-    // initial ELF 与 StartupBlock prefix 均已复制完成；prefix owner 在此首次回投。
-    // payload owner 已由 init AddressSpace 的 primordial funded backing 接管。
-    drop(prefix_held);
-    log!(
-        Memory,
-        "BootPackage prefix reclaim [{:#x}, {:#x})",
-        address,
-        payload_pa
-    );
-
-    sched::enqueue(thread);
-    log!(
-        Boot,
-        "initial process pid {} started (payload {} bytes)",
-        pid,
-        payload_len
-    );
+    .expect("initial process construction cannot be admitted");
 }
 
 fn view(address: usize, length: usize) -> BootPackage<'static> {

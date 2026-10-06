@@ -209,7 +209,7 @@ unsafe impl Source for HeapSource {
                 .expect("heap arena token disappeared before claim");
             if let Err((region, _error)) = region.unmap() {
                 // Startup failure aborts the process; retain the mapping owner
-                // for ProcessDrain instead of discarding a rejected Unmap.
+                // for automatic process retirement instead of discarding a rejected Unmap.
                 talc.source.arenas[slot] = Some(region);
             }
             return Err(());

@@ -3,6 +3,8 @@
 //! Runtime 拥有 WaitSet、来源登记、期限唤醒和退休；本模块只拥有
 //! PendingCall、txid 路由、回复存储及其运输 owner。
 
+use alloc::boxed::Box;
+use core::pin::Pin;
 use erhino_shared::{
     call::SystemCallError,
     object::{ObjectSignals, Rights},
@@ -11,12 +13,12 @@ use erhino_shared::{
 use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
-use ordered_table::OrderedTable;
 use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
 };
-use timer_queue::{TimerQueue, TimerToken};
+use ordered_table::OrderedTable;
+use timer_queue::{TimerNode, TimerQueue};
 
 use crate::{
     RpcPrefix,
@@ -27,6 +29,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceRole {
     Writable,
+    Abandoned,
     Closed,
 }
 
@@ -41,7 +44,6 @@ struct SourceState {
     source: Option<SourceId>,
     requested: bool,
     removing: bool,
-    rearm_needed: bool,
 }
 
 struct PendingCall {
@@ -49,10 +51,11 @@ struct PendingCall {
     deadline: Deadline,
     protocol: u64,
     request: Option<Request>,
+    observation: Option<Capability>,
     result: Option<Result<Reply, CallError>>,
     storage: Option<MessageStorage>,
-    timer: Option<TimerToken>,
-    writable: SourceState,
+    timer: Option<Pin<Box<TimerNode<u64>>>>,
+    progress: SourceState,
     closed: SourceState,
     stage: OutboundStage,
     queued: bool,
@@ -86,8 +89,8 @@ pub struct Dispatcher {
     reply_source: Option<SourceId>,
     reply_requested: bool,
     reply_removing: bool,
-    pending: OrderedTable<PendingCall>,
-    bindings: OrderedTable<SourceBinding>,
+    pending: OrderedTable<PendingCall, ()>,
+    bindings: OrderedTable<SourceBinding, ()>,
     deadlines: TimerQueue<u64>,
     completed_head: u64,
     completed_tail: u64,
@@ -98,10 +101,16 @@ pub struct Dispatcher {
     retiring: Sweep,
     wake_pending: bool,
     phase: u8,
-    reply_rearm_needed: bool,
     next_source_key: u64,
     sealed: bool,
     fault: Option<SystemCallError>,
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        // 先解除全部 timer 链接，再允许 PendingCall 字段释放各自 pin Box。
+        while self.deadlines.pop_expired(u64::MAX).is_some() {}
+    }
 }
 
 impl Dispatcher {
@@ -136,13 +145,16 @@ impl Dispatcher {
             retiring: Sweep::default(),
             wake_pending: false,
             phase: 0,
-            reply_rearm_needed: false,
             next_source_key: 2,
             sealed: false,
             fault: None,
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "准入失败原样返还 service 与 Request，失败收束不新增分配"
+    )]
     pub fn begin(
         &mut self,
         service: Capability,
@@ -153,6 +165,10 @@ impl Dispatcher {
     }
 
     /// 提交调用并在完成进入 FIFO 后请求唤醒指定 Runtime 任务。
+    #[expect(
+        clippy::result_large_err,
+        reason = "准入失败原样返还 service 与 Request，失败收束不新增分配"
+    )]
     pub fn begin_for(
         &mut self,
         service: Capability,
@@ -228,7 +244,7 @@ impl Dispatcher {
                 });
             }
         };
-        let writable_key = match self.allocate_source_key() {
+        let progress_key = match self.allocate_source_key() {
             Ok(key) => key,
             Err(error) => {
                 return Err(StartFailure {
@@ -244,22 +260,21 @@ impl Dispatcher {
             deadline,
             protocol: request.protocol(),
             request: Some(request),
+            observation: None,
             result: None,
             storage: Some(storage),
             timer: None,
-            writable: SourceState {
-                key: writable_key,
+            progress: SourceState {
+                key: progress_key,
                 source: None,
                 requested: false,
                 removing: false,
-                rearm_needed: false,
             },
             closed: SourceState {
                 key: closed_key,
                 source: None,
                 requested: false,
                 removing: false,
-                rearm_needed: false,
             },
             stage: OutboundStage::Ready,
             queued: false,
@@ -269,23 +284,31 @@ impl Dispatcher {
             next: 0,
         };
         if let Some(at) = expires_at {
-            pending.timer = match self.deadlines.try_register(at, txid) {
-                Ok(timer) => Some(timer),
+            let node = match Box::try_new(TimerNode::new()) {
+                Ok(node) => Box::into_pin(node),
                 Err(_) => {
                     return self
                         .start_failure(pending, CallCause::System(SystemCallError::OutOfMemory));
                 }
             };
+            // SAFETY: Dispatcher 独占期限树，pin Box 随 PendingCall 存活，取消后才释放。
+            unsafe {
+                self.deadlines.register(node.as_ref(), at, txid);
+            }
+            pending.timer = Some(node);
         }
-        let prepared = match self.pending.prepare_insert(txid, pending) {
+        let prepared = match self
+            .pending
+            .prepare_insert(txid, pending, &libbudget::AllocatorBacked)
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 let (error, pending) = match error {
                     ordered_table::InsertError::Limit(value) => {
                         (SystemCallError::ReachLimit, value)
                     }
-                    ordered_table::InsertError::Allocation(value) => {
-                        (SystemCallError::OutOfMemory, value)
+                    ordered_table::InsertError::Storage(error, value) => {
+                        (libbudget::allocator_error(error), value)
                     }
                 };
                 return self.start_failure(pending, cause(error));
@@ -297,28 +320,36 @@ impl Dispatcher {
                 txid,
                 role: SourceRole::Closed,
             },
+            &libbudget::AllocatorBacked,
         ) {
             return self.start_failure(
                 prepared.into_value(),
                 cause(match error {
                     ordered_table::InsertError::Limit(_) => SystemCallError::ReachLimit,
-                    ordered_table::InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+                    ordered_table::InsertError::Storage(error, _) => {
+                        libbudget::allocator_error(error)
+                    }
                 }),
             );
         }
         if let Err(error) = self.bindings.try_insert(
-            writable_key,
+            progress_key,
             SourceBinding {
                 txid,
                 role: SourceRole::Writable,
             },
+            &libbudget::AllocatorBacked,
         ) {
-            self.bindings.remove(closed_key);
+            self.bindings
+                .remove(closed_key)
+                .map(ordered_table::PreparedEntry::into_value);
             return self.start_failure(
                 prepared.into_value(),
                 cause(match error {
                     ordered_table::InsertError::Limit(_) => SystemCallError::ReachLimit,
-                    ordered_table::InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+                    ordered_table::InsertError::Storage(error, _) => {
+                        libbudget::allocator_error(error)
+                    }
                 }),
             );
         }
@@ -328,13 +359,20 @@ impl Dispatcher {
         Ok(txid)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "准入失败原样返还 service 与 Request，失败收束不新增分配"
+    )]
     fn start_failure(
         &mut self,
         mut pending: PendingCall,
         cause: CallCause,
     ) -> Result<u64, StartFailure> {
         if let Some(timer) = pending.timer.take() {
-            self.deadlines.cancel(timer);
+            // SAFETY: 本 actor 独占队列，尚持节点 Box，取消之后才 drop。
+            unsafe {
+                self.deadlines.cancel(timer.as_ref());
+            }
         }
         let request = pending
             .request
@@ -353,7 +391,7 @@ impl Dispatcher {
     }
 
     fn clean(pending: &PendingCall) -> bool {
-        [(&pending.writable), (&pending.closed)]
+        [(&pending.progress), (&pending.closed)]
             .into_iter()
             .all(|source| source.source.is_none() && !source.requested && !source.removing)
     }
@@ -422,7 +460,10 @@ impl Dispatcher {
             }),
         };
         if let Some(timer) = pending.timer.take() {
-            self.deadlines.cancel(timer);
+            // SAFETY: 本 actor 独占队列，尚持节点 Box，取消之后才 drop。
+            unsafe {
+                self.deadlines.cancel(timer.as_ref());
+            }
         }
         pending.storage = None;
         pending.result = Some(result);
@@ -451,6 +492,13 @@ impl Dispatcher {
                     .get_mut(txid)
                     .expect("published RPC disappeared");
                 assert!(pending.stage.sent(), "RPC published from invalid stage");
+                pending.observation = Some(
+                    pending
+                        .request
+                        .as_mut()
+                        .expect("published RPC lost request")
+                        .take_observation(),
+                );
                 pending.request = None;
                 self.removals.request();
             }
@@ -463,9 +511,6 @@ impl Dispatcher {
                         .blocked(),
                     "RPC blocked from invalid stage"
                 );
-                if let Some(pending) = self.pending.get_mut(txid) {
-                    pending.writable.rearm_needed = true;
-                }
                 self.registrations.request();
             }
             Err(error) => self.complete(txid, Err(cause(error))),
@@ -530,17 +575,13 @@ impl Dispatcher {
         if state.removing {
             return false;
         }
-        if let Some(source) = state.source {
-            if state.rearm_needed && requests.rearm(source).is_ok() {
-                state.rearm_needed = false;
-                return true;
-            }
+        if state.source.is_some() {
             return false;
         }
         if state.requested {
             return false;
         }
-        if requests.arm_source(plan, state.key).is_ok() {
+        if requests.register(plan, state.key).is_ok() {
             state.requested = true;
             true
         } else {
@@ -563,7 +604,7 @@ impl Dispatcher {
         }
     }
 
-    fn next_candidate(pending: &OrderedTable<PendingCall>, sweep: &mut Sweep) -> Option<u64> {
+    fn next_candidate(pending: &OrderedTable<PendingCall, ()>, sweep: &mut Sweep) -> Option<u64> {
         let next = if sweep.active {
             pending
                 .next_after((sweep.cursor != 0).then_some(&sweep.cursor))
@@ -581,7 +622,7 @@ impl Dispatcher {
         let ready = self.pending.get(txid).is_some_and(|pending| {
             pending.stage.can_attempt()
                 && pending.closed.source.is_some()
-                && pending.writable.source.is_some()
+                && pending.progress.source.is_some()
                 && self.reply_source.is_some()
         });
         if ready && !self.sealed {
@@ -596,7 +637,7 @@ impl Dispatcher {
         }
         if self.reply_source.is_none() && !self.reply_requested && !self.reply_removing {
             if requests
-                .arm_source(
+                .register(
                     SourcePlan::new(
                         self.owner.as_handle(),
                         ObjectSignals::READABLE | ObjectSignals::CLOSED,
@@ -606,16 +647,6 @@ impl Dispatcher {
                 .is_ok()
             {
                 self.reply_requested = true;
-            } else {
-                self.registrations.request();
-            }
-            return;
-        }
-        if self.reply_rearm_needed {
-            if let Some(source) = self.reply_source
-                && requests.rearm(source).is_ok()
-            {
-                self.reply_rearm_needed = false;
             } else {
                 self.registrations.request();
             }
@@ -639,16 +670,32 @@ impl Dispatcher {
         let declared_writable = pending.request.is_some()
             && Self::declare_source(
                 requests,
-                &mut pending.writable,
+                &mut pending.progress,
                 SourcePlan::new(
                     pending.service.as_handle(),
                     ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
                 ),
             );
+        let declared_observation = pending.observation.is_some()
+            && self
+                .bindings
+                .get(pending.progress.key)
+                .is_some_and(|binding| binding.role == SourceRole::Abandoned)
+            && Self::declare_source(
+                requests,
+                &mut pending.progress,
+                SourcePlan::new(
+                    pending
+                        .observation
+                        .as_ref()
+                        .expect("sent RPC lost observer")
+                        .as_handle(),
+                    ObjectSignals::PEER_CLOSED,
+                ),
+            );
         let incomplete = pending.result.is_none()
-            && (pending.closed.source.is_none()
-                || (pending.request.is_some() && pending.writable.source.is_none()));
-        if declared_closed || declared_writable || incomplete {
+            && (pending.closed.source.is_none() || pending.progress.source.is_none());
+        if declared_closed || declared_writable || declared_observation || incomplete {
             self.registrations.request();
         }
     }
@@ -668,8 +715,13 @@ impl Dispatcher {
                 .pending
                 .get_mut(txid)
                 .expect("removal candidate disappeared");
-            let remove_writable = (pending.request.is_none() || pending.result.is_some())
-                && Self::declare_remove(requests, &mut pending.writable);
+            let old_writable = pending.request.is_none()
+                && self
+                    .bindings
+                    .get(pending.progress.key)
+                    .is_some_and(|binding| binding.role == SourceRole::Writable);
+            let remove_writable = (old_writable || pending.result.is_some())
+                && Self::declare_remove(requests, &mut pending.progress);
             let remove_closed =
                 pending.result.is_some() && Self::declare_remove(requests, &mut pending.closed);
             let needs_retry = pending.result.is_some() && !Self::clean(pending);
@@ -687,34 +739,30 @@ impl Dispatcher {
 
     fn process_event(&mut self, event: SourceEvent) -> Result<usize, SystemCallError> {
         if event.kind == self.reply_key {
-            if event.error != 0 {
-                self.fault = Some(
-                    SystemCallError::from_u32(event.error)
-                        .unwrap_or(SystemCallError::InternalError),
-                );
-                self.begin_stop();
-                return Ok(1);
-            }
             if event.observed.intersects(ObjectSignals::CLOSED) {
                 self.fault = Some(SystemCallError::ObjectClosed);
                 self.begin_stop();
                 return Ok(1);
             }
             let used = self.receive_replies(1)?;
-            self.reply_rearm_needed = true;
             return Ok(used.max(1));
         }
         let Some(binding) = self.bindings.get(event.kind).copied() else {
             return Ok(1);
         };
-        if event.error != 0 {
-            self.complete(
-                binding.txid,
-                Err(CallCause::System(
-                    SystemCallError::from_u32(event.error)
-                        .unwrap_or(SystemCallError::InternalError),
-                )),
-            );
+        let Some(pending) = self.pending.get(binding.txid) else {
+            return Ok(1);
+        };
+        let source = match binding.role {
+            SourceRole::Closed => pending.closed.source,
+            SourceRole::Writable | SourceRole::Abandoned => pending.progress.source,
+        };
+        if source != Some(event.source) {
+            return Ok(1);
+        }
+        if binding.role == SourceRole::Abandoned {
+            // ABANDONED 与 SENT 互斥，不会覆盖已经提交的合法回复。
+            self.complete(binding.txid, Err(CallCause::ServiceClosed));
             return Ok(1);
         }
         if event.observed.intersects(ObjectSignals::CLOSED) || binding.role == SourceRole::Closed {
@@ -768,9 +816,7 @@ impl Dispatcher {
             || self.stopping.active
             || self.retiring.active
             || self.wake_pending
-            || (!self.sealed
-                && (self.reply_rearm_needed
-                    || (self.reply_source.is_none() && !self.reply_requested)))
+            || (!self.sealed && (self.reply_source.is_none() && !self.reply_requested))
     }
 
     /// 仅终结本地等待；已投递请求不会被服务端撤回。
@@ -798,9 +844,16 @@ impl Dispatcher {
         if !self.pending.get(txid).is_some_and(|pending| pending.queued) {
             return None;
         }
-        let mut pending = self.pending.remove(txid)?;
-        self.bindings.remove(pending.writable.key);
-        self.bindings.remove(pending.closed.key);
+        let mut pending = self
+            .pending
+            .remove(txid)
+            .map(ordered_table::PreparedEntry::into_value)?;
+        self.bindings
+            .remove(pending.progress.key)
+            .map(ordered_table::PreparedEntry::into_value);
+        self.bindings
+            .remove(pending.closed.key)
+            .map(ordered_table::PreparedEntry::into_value);
         if pending.previous == 0 {
             self.completed_head = pending.next;
         } else {
@@ -856,7 +909,7 @@ impl Dispatcher {
                 }
                 1 => {
                     let timed_out = input.take_timeout();
-                    if let Some((_, txid)) = self.deadlines.pop_expired(input.now_ns()) {
+                    if let Some(txid) = self.deadlines.pop_expired(input.now_ns()) {
                         if let Some(pending) = self.pending.get_mut(txid) {
                             pending.timer = None;
                         }
@@ -908,7 +961,9 @@ impl Dispatcher {
                 };
                 if let Some(pending) = self.pending.get_mut(binding.txid) {
                     match binding.role {
-                        SourceRole::Writable => pending.writable.requested = false,
+                        SourceRole::Writable | SourceRole::Abandoned => {
+                            pending.progress.requested = false
+                        }
                         SourceRole::Closed => pending.closed.requested = false,
                     }
                 }
@@ -944,7 +999,7 @@ impl Dispatcher {
         };
         if let Some(pending) = self.pending.get_mut(binding.txid) {
             let state = match binding.role {
-                SourceRole::Writable => &mut pending.writable,
+                SourceRole::Writable | SourceRole::Abandoned => &mut pending.progress,
                 SourceRole::Closed => &mut pending.closed,
             };
             state.requested = false;
@@ -967,14 +1022,29 @@ impl Dispatcher {
         };
         if let Some(pending) = self.pending.get_mut(binding.txid) {
             let state = match binding.role {
-                SourceRole::Writable => &mut pending.writable,
+                SourceRole::Writable | SourceRole::Abandoned => &mut pending.progress,
                 SourceRole::Closed => &mut pending.closed,
             };
             state.source = None;
             state.requested = false;
             state.removing = false;
         }
-        self.bindings.remove(kind);
+        let reuse = binding.role == SourceRole::Writable
+            && self
+                .pending
+                .get(binding.txid)
+                .is_some_and(|pending| pending.observation.is_some() && pending.result.is_none());
+        if reuse {
+            self.bindings
+                .get_mut(kind)
+                .expect("RPC transition lost binding")
+                .role = SourceRole::Abandoned;
+            self.registrations.request();
+        } else {
+            self.bindings
+                .remove(kind)
+                .map(ordered_table::PreparedEntry::into_value);
+        }
         self.queue_completion(binding.txid);
         self.retiring.request();
     }

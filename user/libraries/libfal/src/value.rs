@@ -573,23 +573,23 @@ impl<C: Capability> StoredValue<C> {
                 {
                     return Err(ValueError::Capability(SystemCallError::RightsDenied));
                 }
-                use erhino_shared::object::HandleRole;
+                use erhino_shared::object::ObjectKind;
                 let valid = match field.policy.protocol {
                     Protocol::Opaque => true,
                     Protocol::Directory => {
-                        description.role == HandleRole::MailboxSender as u32
+                        description.kind == ObjectKind::MailboxSender as u32
                             && field
                                 .policy
                                 .transport
                                 .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
                     }
                     Protocol::Mailbox => {
-                        description.role == HandleRole::MailboxSender as u32
-                            || (description.role == HandleRole::MailboxSenderOnce as u32
+                        description.kind == ObjectKind::MailboxSender as u32
+                            || (description.kind == ObjectKind::MailboxOnceSender as u32
                                 && field.policy.mode == ExportMode::Affine)
                     }
                     Protocol::Notification => {
-                        description.role == HandleRole::NotificationSignaler as u32
+                        description.kind == ObjectKind::NotificationSignaler as u32
                     }
                 };
                 if !valid {
@@ -807,13 +807,13 @@ pub fn rebase_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use erhino_shared::object::{HandleDescription, HandleRole};
+    use erhino_shared::object::{HandleDescription, ObjectKind};
     use libbudget::{Budget, Taxonomy};
 
     #[derive(Debug, Clone)]
     struct TestCapability {
         id: u64,
-        role: HandleRole,
+        kind: ObjectKind,
         rights: Rights,
     }
 
@@ -822,8 +822,8 @@ mod tests {
             Ok(HandleDescription {
                 object_id: self.id,
                 related_object_id: 1,
-                kind: 0,
-                role: self.role as u32,
+                kind: self.kind as u32,
+                reserved0: 0,
                 rights: self.rights,
                 badge: 0,
                 reserved: 0,
@@ -839,7 +839,7 @@ mod tests {
             }
             Ok(Self {
                 id: self.id,
-                role: self.role,
+                kind: self.kind,
                 rights,
             })
         }
@@ -894,7 +894,7 @@ mod tests {
     fn capability() -> TestCapability {
         TestCapability {
             id: 7,
-            role: HandleRole::MailboxSender,
+            kind: ObjectKind::MailboxSender,
             rights: Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
         }
     }

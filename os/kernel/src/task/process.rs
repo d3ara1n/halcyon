@@ -1,707 +1,160 @@
-//! 用户态 process builder 与贯穿全生命周期的 ProcessControl 对象。
+//! 进程创建与组装：Shell 持生命周期，Body 只通过短租约访问，Builder 持构造授权。
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use core::any::Any;
+pub(crate) mod body;
+pub(crate) mod builder;
+pub(crate) mod departure;
+pub(crate) mod members;
+pub(crate) mod reclaim;
+pub(crate) mod shell;
+pub mod thread;
+pub(crate) mod ticket;
 
-use erhino_shared::{
-    call::SystemCallError,
-    object::{Handle, ObjectSignals, Rights},
-    proc::{
-        ExecutionProfile, HandleGrant, PROCESS_DRAIN_MAX, PROCESS_MAX_GRANTS, Pid,
-        ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus, ProcessMapFlags,
-        ProcessSnapshot, ProcessState, TerminationCause, TerminationDetail, ThreadCreateResult,
-        ThreadStartContext,
-    },
-};
-
+use super::resources::{MetadataBuffer, MetadataFunding, map_storage_error};
 use super::{
     Thread,
+    handle::{self, Authorization, Invocation},
     job::Job,
-    lifecycle::TerminationTodo,
-    object::{
-        HandleRole, KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState,
-        SubscribeResult,
-    },
-    proc::{Process, ThreadAttachError},
-    thread::{self, ThreadControl},
-    wait::{Subscription, finish_offered},
+    memory_pool::MemoryPool,
 };
-use wait_context::OfferResult;
+use alloc::sync::Arc;
+use builder::ProcessBuilder;
+use erhino_shared::{
+    call::SystemCallError,
+    object::{Handle, Rights},
+    proc::{
+        ExecutionProfile, HandleGrant, PROCESS_MAX_GRANTS, ProcessCreateResult, ProcessMapFlags,
+        TerminationCause, TerminationDetail, ThreadStartContext,
+    },
+};
+use shell::ProcessShell;
 
-const MAX_MAP_PAGES: usize = 256;
-
-/// ProcessControl 最大 rights（control_rights 请求的校验基准）。
-const CONTROL_MAX_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::WAIT.raw()
-        | Rights::MANAGE.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
-);
-
-struct BuilderState {
-    /// weak：builder 不是 core 的生命周期根（Job 成员表才是）；
-    /// Dead 后 core 释放即失效。
-    process: Option<alloc::sync::Weak<Process>>,
-}
-
-pub struct ProcessBuilder {
-    /// capability 持有计数（ZeroPolicy 按类型固定）。
-    holders: capability::Holders,
-    header: ObjectHeader,
-    _metadata: super::resources::BuilderPermit,
-    state: crate::sync::Spinlock<BuilderState>,
-}
-
-impl ProcessBuilder {
-    fn new(process: Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
-        Arc::try_new(Self {
-            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
-            _metadata: super::resources::MetadataSponsor::reserve_builder(
-                process.resources.metadata(),
-            )?,
-            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
-            state: crate::sync::Spinlock::new(
-                crate::sync::ranks::OBJECT_WAIT,
-                BuilderState {
-                    process: Some(Arc::downgrade(&process)),
-                },
-            ),
-        })
-        .map_err(|_| SystemCallError::OutOfMemory)
-    }
-
-    fn object_ref(builder: &Arc<Self>) -> ObjectRef {
-        builder.clone()
-    }
-
-    /// weak 升级；目标已 Dead（core 释放）时返回 ObjectClosed。
-    fn process(&self) -> Result<Arc<Process>, SystemCallError> {
-        self.state
-            .lock()
-            .process
-            .as_ref()
-            .and_then(alloc::sync::Weak::upgrade)
-            .ok_or(SystemCallError::ObjectClosed)
-    }
-
-    fn consume(&self) {
-        self.state
-            .lock()
-            .process
-            .take()
-            .expect("ProcessBuilder consumed twice");
-    }
-
-    /// 最后 builder authority 消散（close_handle/close_transit）：Building →
-    /// Terminating(Abandoned, 0)，幂等竞争首因。
-    fn abort(&self) {
-        let Some(process) = self
-            .state
-            .lock()
-            .process
-            .take()
-            .and_then(|weak| weak.upgrade())
-        else {
-            return;
-        };
-        let todo = process
-            .lifecycle
-            .request_termination(TerminationCause::Abandoned, TerminationDetail::NONE, None);
-        run_termination_todo(&process, todo);
-    }
-}
-
-impl KernelObject for ProcessBuilder {
-    fn holders(&self) -> &capability::Holders {
-        &self.holders
-    }
-
-    fn header(&self) -> &ObjectHeader {
-        &self.header
-    }
-
-    fn kind(&self) -> ObjectKind {
-        ObjectKind::ProcessBuilder
-    }
-
-    fn allowed_rights(&self) -> Option<Rights> {
-        Some(
-            Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
-        )
-    }
-
-    fn allowed_signals(&self) -> Option<ObjectSignals> {
-        None
-    }
-
-    fn on_last_capability(&self) {
-        self.abort();
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// Dead 冻结快照：core 释放后 shell 仍可应答 Query。
-struct DeadSnapshot {
-    pid: u64,
-    parent_pid: u64,
-    cause: TerminationCause,
-    detail: TerminationDetail,
-}
-
-struct ControlState {
-    wait: ObjectWaitState,
-    core: Weak<Process>,
-    /// REAPABLE 后保活 ProcessDrain 的终段游标；在最终 Done 才释放。
-    drain_owner: Option<Arc<Process>>,
-    dead: Option<DeadSnapshot>,
-}
-
-pub struct ProcessControl {
-    /// capability 持有计数（ZeroPolicy 按类型固定）。
-    holders: capability::Holders,
-    header: ObjectHeader,
-    _metadata: super::resources::ControlPermit,
-    state: crate::sync::Spinlock<ControlState>,
-}
-
-impl ProcessControl {
-    pub(crate) fn new(core: &Arc<Process>) -> Result<Arc<Self>, SystemCallError> {
-        Arc::try_new(Self {
-            holders: capability::Holders::new(capability::ZeroPolicy::Remintable),
-            _metadata: super::resources::MetadataSponsor::reserve_control(
-                core.resources.metadata(),
-            )?,
-            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
-            state: crate::sync::Spinlock::new(
-                crate::sync::ranks::OBJECT_WAIT,
-                ControlState {
-                    wait: ObjectWaitState::new(ObjectSignals::NONE),
-                    core: Arc::downgrade(core),
-                    drain_owner: None,
-                    dead: None,
-                },
-            ),
-        })
-        .map_err(|_| SystemCallError::OutOfMemory)
-    }
-
-    pub(crate) fn object_ref(control: &Arc<Self>) -> ObjectRef {
-        control.clone()
-    }
-
-    fn core(&self) -> Weak<Process> {
-        self.state.lock().core.clone()
-    }
-
-    /// 固定宽快照。dead 未冻结时 core 必仍被 Job 成员表强持
-    /// （Dead 发布先冻结快照再摘成员），upgrade 必须成功。
-    fn snapshot(&self) -> ProcessSnapshot {
-        let state = self.state.lock();
-        if let Some(dead) = &state.dead {
-            return ProcessSnapshot {
-                pid: dead.pid,
-                parent_pid: dead.parent_pid,
-                state: ProcessState::Dead as u32,
-                cause: dead.cause as u32,
-                detail: dead.detail,
-                reserved: 0,
-            };
-        }
-        let core = state
-            .core
-            .upgrade()
-            .expect("live control core must be held by its job");
-        let (state_, cause, detail) = core.lifecycle.snapshot();
-        ProcessSnapshot {
-            pid: core.pid,
-            parent_pid: core.parent,
-            state: state_ as u32,
-            cause: cause as u32,
-            detail,
-            reserved: 0,
-        }
-    }
-
-    /// REAPABLE 电平：线程与 active hart 均已离场（core 侧锁外调用）。
-    /// 持续电平——直至最终批次 publish_dead 清除。完成者逐个经
-    /// 「锁内 take 一个 → 锁外 finish」循环交付，不分配（OOM 安全）。
-    pub fn publish_reapable(&self) {
-        {
-            let mut state = self.state.lock();
-            if state.dead.is_none() {
-                if state.drain_owner.is_none() {
-                    state.drain_owner = Some(
-                        state
-                            .core
-                            .upgrade()
-                            .expect("REAPABLE control must retain its process core"),
-                    );
-                }
-                state
-                    .wait
-                    .update(ObjectSignals::NONE, ObjectSignals::REAPABLE);
-            }
-        }
-        let pending = {
-            let mut state = self.state.lock();
-            state.wait.take_notification()
-        };
-        if let Some((reservation, target)) = pending {
-            reservation.publish(target);
-        }
-    }
-
-    /// Dead 发布：冻结终态快照、清 REAPABLE、置 CLOSED（收束完成点调用）。
-    /// 同样不分配。
-    pub fn publish_dead(
-        &self,
-        pid: u64,
-        parent_pid: u64,
-        cause: TerminationCause,
-        detail: TerminationDetail,
-    ) {
-        {
-            let mut state = self.state.lock();
-            if state.dead.is_none() {
-                state.dead = Some(DeadSnapshot {
-                    pid,
-                    parent_pid,
-                    cause,
-                    detail,
-                });
-                state
-                    .wait
-                    .update(ObjectSignals::REAPABLE, ObjectSignals::CLOSED);
-            }
-        }
-        let pending = {
-            let mut state = self.state.lock();
-            state.wait.take_notification()
-        };
-        if let Some((reservation, target)) = pending {
-            reservation.publish(target);
-        }
-    }
-
-    /// shell 终态是否已冻结。
-    pub fn is_dead(&self) -> bool {
-        self.state.lock().dead.is_some()
-    }
-
-    pub(crate) fn take_drain_owner(&self) -> Option<Arc<Process>> {
-        self.state.lock().drain_owner.take()
-    }
-}
-
-impl KernelObject for ProcessControl {
-    fn holders(&self) -> &capability::Holders {
-        &self.holders
-    }
-
-    fn complete_waiter_drain(
-        &self,
-        reservation: super::notify_work::Reservation,
-    ) -> super::notify_work::Completion {
-        self.state.lock().wait.complete_notification(reservation)
-    }
-
-    fn advance_waiter(&self) -> super::object::WaitAdvance {
-        self.state.lock().wait.advance_waiter()
-    }
-
-    fn header(&self) -> &ObjectHeader {
-        &self.header
-    }
-
-    fn kind(&self) -> ObjectKind {
-        ObjectKind::ProcessControl
-    }
-
-    fn allowed_rights(&self) -> Option<Rights> {
-        Some(CONTROL_MAX_RIGHTS)
-    }
-
-    fn allowed_signals(&self) -> Option<ObjectSignals> {
-        Some(ObjectSignals::REAPABLE | ObjectSignals::CLOSED)
-    }
-
-    fn signals(&self) -> ObjectSignals {
-        self.state.lock().wait.signals()
-    }
-
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.state.lock().wait.subscribe(subscription)
-    }
-
-    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
-        self.state.lock().wait.rearm_observer(id)
-    }
-
-    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
-        self.state.lock().wait.cancel_observer(id)
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        let retired = self.state.lock().wait.unsubscribe(id);
-        drop(retired);
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-pub fn create(
-    thread: &Thread,
-    job: Handle,
-    control_rights: Rights,
-    output: usize,
-) -> Result<(), SystemCallError> {
-    if !control_rights.is_known() || !control_rights.is_subset_of(CONTROL_MAX_RIGHTS) {
-        return Err(SystemCallError::RightsDenied);
-    }
-    let job = {
-        let table = thread.process.handles.lock();
-        let entry = table
-            .get(job, Rights::CREATE)
-            .map_err(super::handle::map_error)?;
-        if entry.object().kind() != ObjectKind::Job {
-            return Err(SystemCallError::WrongObjectType);
-        }
-        Job::concrete(entry.object())?
-    };
-    // 创建口闸门（链锁线性化）：链锁内上行检查祖先 seal、锁内分配 Pid
-    // 并插入成员占位；后续可失败构造统一由外层回滚占位。
-    let (pid, member_reservation) = job.gate_reserve_member()?;
-    let staged = create_staged(
-        thread,
-        &job,
-        pid,
-        control_rights,
-        output,
-        member_reservation,
-    );
-    if staged.is_err() {
-        job.rollback_member(member_reservation);
-    }
-    staged
-}
-
-fn create_staged(
-    thread: &Thread,
+/// Shell 骨架先进入 Job；此后的任何失败均从 Frozen 进入同一回收记录。
+pub(crate) fn construct(
     job: &Arc<Job>,
-    pid: Pid,
-    control_rights: Rights,
-    output: usize,
-    member_reservation: super::job::MemberReservation,
-) -> Result<(), SystemCallError> {
-    let resources = super::resources::ProcessResources::try_new()?;
-    let process = Arc::try_new(
-        Process::new(pid, thread.process.pid, Arc::downgrade(job), resources)
-            .map_err(SystemCallError::from)?,
-    )
-    .map_err(|_| SystemCallError::OutOfMemory)?;
-    let builder = ProcessBuilder::new(process.clone())?;
-    let control = ProcessControl::new(&process)?;
-    process.set_control(Arc::downgrade(&control));
-    let token = super::handle::transaction_token()?;
-    let mut entries = super::handle::PendingEntries::try_new(2)?;
-    entries.push(
-        super::handle::entry(
-            ProcessBuilder::object_ref(&builder),
-            HandleRole::ProcessBuilder,
-            Rights::WRITE | Rights::MANAGE | Rights::TRANSIT | Rights::GRANT,
-        )
-        .expect("ProcessBuilder rights were validated statically"),
-    );
-    entries.push(
-        super::handle::entry(
-            ProcessControl::object_ref(&control),
-            HandleRole::ProcessControl,
-            control_rights,
-        )
-        .expect("ProcessControl rights were validated before construction"),
-    );
-    let mut table = thread.process.handles.lock();
-    let reservation = match table.reserve(2, token) {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            drop(table);
-            entries.close(&thread.process, false);
-            return Err(super::handle::map_error(error));
-        }
-    };
-    let result = ProcessCreateResult {
-        builder: reservation.handles()[0],
-        control: reservation.handles()[1],
-        pid,
-        reserved: 0,
-    };
-    let mut space = thread.process.space.lock();
-    if let Err(error) = space.check_range(output, core::mem::size_of::<ProcessCreateResult>(), true)
+    pool: &Arc<MemoryPool>,
+    parent: u64,
+) -> Result<Arc<ProcessShell>, SystemCallError> {
+    let (pid, reservation) = job.gate_reserve_member()?;
+    let (shell, construction) = match ProcessShell::try_new(pid, parent, Arc::downgrade(job), pool)
     {
-        drop(space);
-        table
-            .rollback(reservation)
-            .expect("ProcessCreate reservation must remain owned");
-        drop(table);
-        entries.close(&thread.process, false);
-        return Err(error.into());
-    }
-    // SAFETY: ProcessCreateResult 无 padding；复检失败即杀本进程
-    // （deliver_output），未提交的预留随进程消亡。
-    if let Err(error) =
-        unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
-    {
-        drop(space);
-        table
-            .rollback(reservation)
-            .expect("ProcessCreate reservation must remain owned");
-        drop(table);
-        entries.close(&thread.process, false);
-        return Err(error);
-    }
-    drop(space);
-    let prepared = match table.prepare_commit(reservation, entries.take()) {
-        Ok(prepared) => prepared,
-        Err(failure) => {
-            let error = failure.error;
-            drop(table);
-            super::handle::PendingEntries::from_vec(failure.into_entries())
-                .close(&thread.process, false);
-            return Err(super::handle::map_error(error));
-        }
-    };
-    // 提交序（F4）：caller HandleTable 已在外层持有，再取 Job owner 锁；成员
-    // 替换与 capability commit 在释放任一锁前同时完成。枚举派生与新 handle
-    // 因而都不可能观察到另一侧尚未提交的 child。
-    process.mark_job_member_committed();
-    job.commit_member_with(member_reservation, process, || {
-        table.commit_prepared(prepared);
-    });
-    Ok(())
-}
-
-/// 为 Unbound shell 准备完整 BoundAddressSpace。全部可失败工作发生在发布前；
-/// owner 析构同时回滚 metadata permit、root frame 与 Pool charge。
-fn prepare_memory_binding(
-    process: &Arc<Process>,
-    pool: Arc<super::memory_pool::MemoryPool>,
-) -> Result<alloc::boxed::Box<super::proc::BoundAddressSpace>, SystemCallError> {
-    let binding = super::resources::PoolBinding::prepare(pool, process.resources.metadata())?;
-    super::proc::BoundAddressSpace::new(binding).map_err(SystemCallError::from)
-}
-
-/// Bootstrap 复用普通 Bind 的资源准备与 Unbound→Bound 提交语义；唯一差异是 root
-/// Pool authority 来自 primordial owner，不经过用户 Handle pin。
-pub(crate) fn bind_memory_internal(
-    process: &Arc<Process>,
-    pool: Arc<super::memory_pool::MemoryPool>,
-) -> Result<(), SystemCallError> {
-    let bound = prepare_memory_binding(process, pool)?;
-    process
-        .space
-        .lock()
-        .bind(bound)
-        .map_err(|_| SystemCallError::ObjectNotAvailable)
-}
-
-/// ProcessBindMemory(builder, pool)：登记获胜的 Building operation。builder 只作受保护
-/// authority，pool entry 成功时被消费；Bound 发布与逻辑消费在同一双锁提交段完成。
-pub fn bind_memory(
-    thread: &Thread,
-    builder_handle: Handle,
-    pool_handle: Handle,
-) -> Result<(), SystemCallError> {
-    if builder_handle == pool_handle {
-        return Err(SystemCallError::IllegalArgument);
-    }
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let process = concrete_builder(&builder_object)?.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    if process.space.lock().is_bound() {
-        return Err(SystemCallError::ObjectNotAvailable);
-    }
-    let _bind_reservation = process.resources.try_reserve_binding()?;
-    // 与前一竞争者释放 reservation 后再判一次，保证串行重复 Bind 不消耗额度。
-    if process.space.lock().is_bound() {
-        return Err(SystemCallError::ObjectNotAvailable);
-    }
-
-    let pin_token = super::handle::transaction_token()?;
-    let (pool, pool_rights) = {
-        let mut table = thread.process.handles.lock();
-        let entry = table
-            .get(pool_handle, Rights::GRANT)
-            .map_err(super::handle::map_error)?;
-        if entry.object().kind() != ObjectKind::MemoryPool
-        {
-            return Err(SystemCallError::WrongObjectType);
-        }
-        let pool = super::memory_pool::MemoryPool::concrete(entry.object())?;
-        let rights = entry.rights();
-        table
-            .pin_transfer(
-                builder_handle,
-                Rights::MANAGE,
-                &[(pool_handle, rights)],
-                pin_token,
-            )
-            .map_err(super::handle::map_error)?;
-        (pool, rights)
-    };
-
-    let mut moved = Vec::new();
-    if moved.try_reserve_exact(1).is_err() {
-        thread.process.handles.lock().unpin(pin_token);
-        return Err(SystemCallError::OutOfMemory);
-    }
-    let bound = match prepare_memory_binding(&process, pool) {
-        Ok(bound) => bound,
+        Ok(value) => value,
         Err(error) => {
-            thread.process.handles.lock().unpin(pin_token);
+            job.rollback_member(reservation);
             return Err(error);
         }
     };
-
-    {
-        // HANDLE_TABLE → ADDRESS_SPACE 符合 Lock Ladder。两 entry 均处于 Pinned，
-        // 因而其它线程只能观察 ObjectBusy，不能越过提交点消费或关闭。
-        let mut table = thread.process.handles.lock();
-        let mut space = process.space.lock();
-        if space.is_bound() {
-            drop(space);
-            table.unpin(pin_token);
-            return Err(SystemCallError::ObjectNotAvailable);
-        }
-        space
-            .bind(bound)
-            .unwrap_or_else(|_| unreachable!("Unbound bind precheck changed under one lock"));
-        table.commit_pinned_transfer(
-            pin_token,
-            builder_handle,
-            &[(pool_handle, pool_rights)],
-            &mut moved,
-        );
-    }
-    let pool_entry = moved
-        .pop()
-        .expect("BindMemory committed Pool entry missing");
-    super::handle::close_entry_infallible(pool_entry, &thread.process, false);
-    crate::heap::log_snapshot("bind");
-    log!(
-        Task,
-        "metadata bind usage {:?} peaks {:?}",
-        super::resources::admission_usage(),
-        super::resources::admission_peak()
-    );
-    Ok(())
-}
-
-struct BuildingLease {
-    process: Arc<Process>,
-    active: bool,
-}
-
-impl BuildingLease {
-    fn begin(process: Arc<Process>) -> Result<Self, SystemCallError> {
-        if !process.lifecycle.enter_building_op() {
-            return Err(SystemCallError::ObjectClosed);
-        }
-        Ok(Self {
-            process,
-            active: true,
+    job.commit_member(reservation, shell.clone());
+    let result = (|| {
+        let space = crate::vm::space::AnySpace::empty(pool.clone())?;
+        let handles = handle::ProcessCapTable::try_new(&super::resources::MetadataFunding(pool))
+            .map_err(handle::map_error)?;
+        let body = body::ProcessBody::try_new(space, pool, handles, shell.source.clone())?;
+        let body =
+            funded_storage::OwnedBox::try_new(body, &super::resources::MetadataFunding(pool))
+                .map_err(|(error, body)| {
+                    drop(body);
+                    super::resources::map_storage_error(error)
+                })?;
+        construction.install_body(body).map_err(|body| {
+            // 尚未安装的 Body 必为空；唯一 root 表及准入存储可有界局部退款。
+            drop(body);
+            SystemCallError::ObjectClosed
         })
+    })();
+    if result.is_err() {
+        shell.freeze_and_seal(TerminationCause::Aborted, TerminationDetail::NONE);
     }
-
-
-    /// begin_running 已在 lifecycle 线性化点消费 Building 操作登记。
-    fn commit_running(mut self) {
-        self.active = false;
-    }
+    drop(construction);
+    result.map(|()| shell)
 }
 
-impl Drop for BuildingLease {
-    fn drop(&mut self) {
-        if self.active && self.process.lifecycle.leave_building_op() {
-            self.process.publish_reapable();
-        }
+pub fn create(
+    caller: &Thread,
+    job_handle: Handle,
+    pool_handle: Handle,
+    rights: Rights,
+    output: usize,
+) -> Result<(), SystemCallError> {
+    if !rights.is_known() || !rights.is_subset_of(shell::CONTROL_RIGHTS) {
+        return Err(SystemCallError::RightsDenied);
     }
+    let job_authority = Authorization::accept(caller, job_handle, Rights::CREATE)?;
+    let job = Job::concrete(job_authority.object())?;
+    let pool_authority = Authorization::accept(caller, pool_handle, Rights::CREATE)?;
+    let pool = MemoryPool::concrete(pool_authority.object())?;
+    let shell = construct(&job, &pool, caller.process.pid)?;
+    let result = (|| {
+        let builder = ProcessBuilder::try_new(shell.clone())?;
+        let builder_cap = handle::mint(ProcessBuilder::object_ref(&builder), builder::RIGHTS)?;
+        let control_cap = match handle::mint(ProcessShell::object_ref(&shell), rights) {
+            Ok(cap) => cap,
+            Err(error) => {
+                handle::release_all([builder_cap]);
+                return Err(error);
+            }
+        };
+        let caps = [builder_cap, control_cap];
+        handle::install(
+            caller,
+            caps,
+            |handles| {
+                crate::uaccess::write_user(
+                    caller,
+                    output,
+                    &ProcessCreateResult {
+                        builder: handles[0],
+                        control: handles[1],
+                        pid: shell.pid,
+                        reserved: 0,
+                    },
+                )
+            },
+            || builder.arm(),
+        )
+        .map(|_| ())
+    })();
+    if result.is_err() {
+        shell.freeze_and_seal(TerminationCause::Aborted, TerminationDetail::NONE);
+    }
+    result
+}
+
+fn builder(
+    caller: &Thread,
+    handle: Handle,
+) -> Result<(Authorization, Arc<ProcessBuilder>), SystemCallError> {
+    let authority = Authorization::accept(caller, handle, Rights::MANAGE)?;
+    let builder = ProcessBuilder::concrete(authority.object())?;
+    Ok((authority, builder))
 }
 
 pub fn map(
-    thread: &Thread,
-    builder_handle: Handle,
-    target: usize,
-    len: usize,
-    permissions: ProcessMapFlags,
-) -> Result<(), SystemCallError> {
-    if len == 0 || len / super::proc::PAGE_SIZE > MAX_MAP_PAGES {
+    caller: &Thread,
+    handle: Handle,
+    address: usize,
+    bytes: usize,
+    flags: ProcessMapFlags,
+) -> Result<super::wait::WaitPlan, SystemCallError> {
+    if bytes == 0 || bytes > erhino_shared::proc::PROCESS_MAP_MAX_BYTES || !flags.is_known() {
         return Err(SystemCallError::IllegalArgument);
     }
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let process = concrete_builder(&builder_object)?.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    let (pool, sponsor) = {
-        let mut space = process.space.lock();
-        space.bound().map_err(SystemCallError::from)?;
-        space
-            .validate_building_anonymous(target, len, permissions)
-            .map_err(SystemCallError::from)?;
-        let bound = space.bound().map_err(SystemCallError::from)?;
-        (Arc::clone(bound.pool()), Arc::clone(bound.sponsor()))
+    let protection = match flags.raw() {
+        1 => memory_space::Protection::ReadOnly,
+        3 => memory_space::Protection::ReadWrite,
+        5 => memory_space::Protection::ReadExecute,
+        _ => return Err(SystemCallError::IllegalArgument),
     };
-    let prepared =
-        super::proc::PreparedBacking::allocate(len / super::proc::PAGE_SIZE, &pool, &sponsor)
-            .map_err(SystemCallError::from)?;
-    let plan_result = {
-        let mut space = process.space.lock();
-        space.plan_building_mapping(target, len, permissions, prepared)
-    };
-    let plan = match plan_result {
-        Ok(plan) => plan,
-        Err(super::proc::BackingPlanFailure::Prepared(error, backing)) => {
-            drop(backing);
-            return Err(SystemCallError::from(error));
-        }
-        Err(super::proc::BackingPlanFailure::Owned(error, backing)) => {
-            drop(backing);
-            return Err(SystemCallError::from(error));
-        }
-    };
-    let funded = match super::proc::fund_table_preflights(&pool, plan.preflights()) {
-        Ok(funded) => funded,
-        Err(error) => {
-            let reclaimed = process.space.lock().rollback_memory_change_plan(plan);
-            drop(reclaimed);
-            return Err(SystemCallError::from(error));
-        }
-    };
-    let released = {
-        let result = process.space.lock().complete_bound_mapping(plan, funded);
-        match result {
-            Ok(released) => released,
-            Err((error, reclaimed)) => {
-                drop(reclaimed);
-                return Err(SystemCallError::from(error));
-            }
-        }
-    };
-    drop(released);
-    Ok(())
+    let (_authority, builder) = builder(caller, handle)?;
+    let target = builder.process()?;
+    let body = target
+        .lease_building()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    crate::vm::operation::initial_map(&body, address, bytes, protection, None)
 }
 
 pub fn write(
-    thread: &Thread,
-    builder_handle: Handle,
+    caller: &Thread,
+    handle: Handle,
     target: usize,
     source: usize,
     len: usize,
@@ -709,244 +162,161 @@ pub fn write(
     if len > crate::uaccess::MAX_USER_ACCESS {
         return Err(SystemCallError::IllegalArgument);
     }
-    let builder_object = resolve_builder(thread, builder_handle, Rights::WRITE)?;
-    let process = concrete_builder(&builder_object)?.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    (|| {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| SystemCallError::OutOfMemory)?;
-        bytes.resize(len, 0);
-        crate::uaccess::copy_from_user(&mut thread.process.space.lock(), &mut bytes, source)?;
-        process
-            .space
-            .lock()
-            .write_building(target, &bytes)
-            .map_err(SystemCallError::from)
-    })()
-}
-
-/// ThreadCreate(builder, descriptor)：组装者向 Building process 附入
-/// 线程（线程是组装资源）。内核零资源分配——栈与出生块由组装者经
-/// Map/Write 供给；本调用只创建执行基底并插入预育表（Created）。
-/// 无观察壳：组装不是协作，组装者在 Start 之后不再观察内部状态。
-pub fn create_thread(
-    thread: &Thread,
-    builder_handle: Handle,
-    descriptor_ptr: usize,
-    result_ptr: usize,
-) -> Result<(), SystemCallError> {
-    let descriptor = unsafe {
-        crate::uaccess::read_user_value::<ThreadStartContext>(
-            &mut thread.process.space.lock(),
-            descriptor_ptr,
-        )?
-    };
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let builder = &concrete_builder(&builder_object)?;
-    let process = builder.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    if !process.space.lock().is_bound() || !process.is_execution_bound() {
-        return Err(SystemCallError::ObjectNotAvailable);
+    let (_authority, builder) = builder(caller, handle)?;
+    let target_process = builder.process()?;
+    let body = target_process
+        .lease_building()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    let pool = caller.process.funding_pool();
+    let mut bytes =
+        MetadataBuffer::try_empty(len, &MetadataFunding(&pool)).map_err(map_storage_error)?;
+    for _ in 0..len {
+        bytes.push(0);
     }
-    let control = ThreadControl::new()?;
-    let ready_batch = process
-        .domain()
-        .reserve_ready(1)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    let object = ThreadControl::object_ref(&control);
-    let entry = super::handle::entry(
-        object,
-        HandleRole::ThreadControl,
-        thread::CONTROL_MAX_RIGHTS,
-    )
-    .map_err(super::handle::map_error)?;
-    let token = super::handle::transaction_token()?;
-    let mut target_table = process.handles.lock();
-    let reservation = target_table
-        .reserve(1, token)
-        .map_err(super::handle::map_error)?;
-    let target_handle = reservation.handles()[0];
-    drop(target_table);
-    let (tid, created) = match process.attach_thread_with_control(descriptor, &control) {
-        Ok(value) => value,
-        Err(error) => {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("ThreadCreate target reservation must remain owned");
-            return Err(match error {
-                ThreadAttachError::Context(error) => SystemCallError::from(error),
-                ThreadAttachError::Closed => SystemCallError::ObjectClosed,
-                ThreadAttachError::Limit => SystemCallError::ReachLimit,
-                ThreadAttachError::Oom => SystemCallError::OutOfMemory,
-            });
-        }
-    };
-    control.bind_thread(&created);
-    created.install_ready_batch(ready_batch);
-    process
-        .handles
-        .lock()
-        .commit(reservation, alloc::vec![entry])
-        .expect("ThreadCreate target reservation must remain owned");
-    let result = ThreadCreateResult {
-        tid,
-        reserved: 0,
-        control: target_handle,
-    };
-    let mut space = thread.process.space.lock();
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, result_ptr, &result) }.map(|_| ())
+    {
+        let caller_body = caller
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let mut vm = caller_body.vm.space.lock();
+        crate::uaccess::copy_from_user(
+            vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?,
+            &mut bytes,
+            source,
+        )?;
+    }
+    crate::vm::operation::initial_write(&body, target, &bytes)
 }
 
-/// ProcessGrant(builder, grants_ptr, count, out_values)：组装者把 grants
-/// 从本表移入目标 Building process 的 HandleTable 并输出目标侧句柄值
-/// （组装者将其写入出生块后经 ProcessWrite 交付）。pin 事务保证输出
-/// 失败无损还原；成功即目标表可见。
+pub fn create_thread(
+    caller: &Thread,
+    handle: Handle,
+    input: usize,
+    output: usize,
+) -> Result<(), SystemCallError> {
+    let context: ThreadStartContext = {
+        let body = caller
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let mut vm = body.vm.space.lock();
+        // SAFETY: 四个 u64，任意位型有效；目标空间随后验证 entry/sp。
+        unsafe {
+            crate::uaccess::read_user_value(
+                vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?,
+                input,
+            )
+        }?
+    };
+    let (_authority, builder) = builder(caller, handle)?;
+    super::thread::create_in(caller, &builder.process()?, context, output, true)
+}
+
 pub fn grant(
-    thread: &Thread,
-    builder_handle: Handle,
-    grants_ptr: usize,
+    caller: &Thread,
+    handle: Handle,
+    input: usize,
     count: usize,
-    out_values: usize,
+    output: usize,
 ) -> Result<(), SystemCallError> {
     if count == 0 || count > PROCESS_MAX_GRANTS {
         return Err(SystemCallError::IllegalArgument);
     }
-    let mut grants = Vec::new();
-    grants
-        .try_reserve_exact(count)
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    grants.resize(
-        count,
-        HandleGrant {
+    output
+        .checked_add(count * core::mem::size_of::<Handle>())
+        .ok_or(SystemCallError::IllegalArgument)?;
+    let (_authority, builder) = builder(caller, handle)?;
+    let target = builder.process()?;
+    let body = target
+        .lease_building()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    let pool = caller.process.funding_pool();
+    let funding = MetadataFunding(&pool);
+    let mut grants = MetadataBuffer::try_empty(count, &funding).map_err(map_storage_error)?;
+    for _ in 0..count {
+        grants.push(HandleGrant {
             handle: Handle::INVALID,
             rights: Rights::NONE,
-        },
-    );
+        });
+    }
     {
-        let mut caller_space = thread.process.space.lock();
-        let grant_bytes = unsafe {
+        let caller_body = caller
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let mut vm = caller_body.vm.space.lock();
+        // SAFETY: HandleGrant 是两个整数 newtype，完整覆盖后再验证 rights。
+        let bytes = unsafe {
             core::slice::from_raw_parts_mut(
                 grants.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of_val(grants.as_slice()),
+                core::mem::size_of_val(&*grants),
             )
         };
-        crate::uaccess::copy_from_user(&mut caller_space, grant_bytes, grants_ptr)?;
+        crate::uaccess::copy_from_user(
+            vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?,
+            bytes,
+            input,
+        )?;
     }
-    let mut grant_pairs = Vec::new();
-    grant_pairs
-        .try_reserve_exact(grants.len())
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-    for grant in &grants {
-        grant_pairs.push((grant.handle, grant.rights));
+    let mut claimed = MetadataBuffer::try_empty(count, &funding).map_err(map_storage_error)?;
+    let mut caps = MetadataBuffer::try_empty(count, &funding).map_err(map_storage_error)?;
+    for grant in grants.iter() {
+        let claim = Invocation::claim(caller, grant.handle, Rights::GRANT)?;
+        if !grant.rights.is_known() || !grant.rights.is_subset_of(claim.cap().rights()) {
+            return Err(SystemCallError::RightsDenied);
+        }
+        claimed.push(claim);
     }
-
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let builder = &concrete_builder(&builder_object)?;
-    let process = builder.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    (|| {
-        // 调用者表 pin：原子验证并翻转（失败零副作用）。
-        let pin_token = super::handle::transaction_token()?;
-        let target_token = super::handle::transaction_token()?;
-        {
-            let mut caller_table = thread.process.handles.lock();
-            caller_table
-                .pin_transfer(builder_handle, Rights::MANAGE, &grant_pairs, pin_token)
-                .map_err(super::handle::map_error)?;
+    let reservation = body
+        .handles
+        .lock()
+        .reserve(count, &super::resources::MetadataFunding(target.pool()))
+        .map_err(handle::map_error)?;
+    for (index, value) in reservation.handles().iter().enumerate() {
+        if let Err(error) = crate::uaccess::write_user(
+            caller,
+            output + index * core::mem::size_of::<Handle>(),
+            value,
+        ) {
+            body.handles.lock().rollback(reservation);
+            return Err(error);
         }
-        // 提取前完成全部可失败步骤：目标预留 + 提交缓冲预留——此后
-        // 的失败路径（交付失败）只需无损还原 pin 与预留，不存在
-        // 「条目已离开调用者表」的中间态。
-        let reservation = match process
-            .handles
-            .lock()
-            .reserve(grant_pairs.len(), target_token)
-        {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                thread.process.handles.lock().unpin(pin_token);
-                return Err(super::handle::map_error(error));
-            }
-        };
-        let mut moved = Vec::new();
-        if moved.try_reserve_exact(grant_pairs.len()).is_err() {
-            process
-                .handles
-                .lock()
-                .rollback(reservation)
-                .expect("ProcessGrant reservation must remain owned");
-            thread.process.handles.lock().unpin(pin_token);
-            return Err(SystemCallError::OutOfMemory);
-        }
-        // 句柄值交付：复检失败即杀调用进程（deliver_output 已冻结终因
-        // 并组装 todo，分发出口终止检查收束），此处只做无损还原。
-        {
-            let mut caller_space = thread.process.space.lock();
-            for (index, value) in reservation.handles().iter().enumerate() {
-                let dst = out_values + index * core::mem::size_of::<Handle>();
-                // SAFETY: Handle 为无 padding 的 u64 newtype。
-                let deliver = unsafe {
-                    crate::uaccess::deliver_output(thread, &mut caller_space, dst, value)
-                };
-                if let Err(error) = deliver {
-                    drop(caller_space);
-                    process
-                        .handles
-                        .lock()
-                        .rollback(reservation)
-                        .expect("ProcessGrant reservation must remain owned");
-                    thread.process.handles.lock().unpin(pin_token);
-                    return Err(error);
-                }
+    }
+    // 输出完成后必成；失败前不收窄原 authority，逐个 claim 的 Drop 自动恢复。
+    for (claim, grant) in claimed.iter_mut().zip(grants.iter()) {
+        let mut cap = claim.take_for_transfer();
+        cap.attenuate(grant.rights)
+            .expect("validated grant rights changed");
+        claim.commit_transfer();
+        caps.push(cap);
+    }
+    let committed = body.handles.lock().commit(reservation, caps);
+    match committed {
+        Ok(capability::Commit::Installed(_)) => {}
+        Ok(capability::Commit::Released { events, .. }) => {
+            for event in events {
+                super::cap::deliver(Some(event));
             }
         }
-        // 提交区：pinned 已验证、容量已预留、值已交付——以下不可失败。
-        {
-            let mut caller_table = thread.process.handles.lock();
-            caller_table.commit_pinned_transfer(
-                pin_token,
-                builder_handle,
-                &grant_pairs,
-                &mut moved,
-            );
+        Err((caps, _)) => {
+            handle::release_all(caps);
+            unreachable!("owned grant reservation changed");
         }
-        process
-            .handles
-            .lock()
-            .commit(reservation, moved)
-            .expect("ProcessGrant reservation count matches entries");
-        Ok(())
-    })()
+    }
+    Ok(())
 }
 
-/// ProcessStart(builder)：活体门（已附线程 ≥1）→ Building →
-/// Running → execution binding 冻结 → Created 线程整体入册（转 Ready）。
-/// 唯一首次发布 runnable 的提交点；builder 在此消费。
-pub fn start(thread: &Thread, builder_handle: Handle) -> Result<(), SystemCallError> {
-
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let builder = &concrete_builder(&builder_object)?;
-    let process = builder.process()?;
-    let lease = BuildingLease::begin(process.clone())?;
-    if !process.space.lock().is_bound() {
-        return Err(SystemCallError::ObjectNotAvailable);
-    }
-    match start_created_members(thread, builder_handle, builder, &process) {
-        Ok(()) => {
-            lease.commit_running();
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+pub fn start(caller: &Thread, handle: Handle) -> Result<super::wait::WaitPlan, SystemCallError> {
+    let mut authority = Invocation::claim(caller, handle, Rights::MANAGE)?;
+    let builder = ProcessBuilder::concrete(authority.object())?;
+    let plan = builder.start()?;
+    authority.consume();
+    Ok(plan)
 }
 
 pub fn bind_execution(
-    thread: &Thread,
-    builder_handle: Handle,
+    caller: &Thread,
+    handle: Handle,
     profile: usize,
 ) -> Result<(), SystemCallError> {
     let requirement = match profile {
@@ -954,307 +324,52 @@ pub fn bind_execution(
         value if value == ExecutionProfile::D64 as usize => elf::IsaRequirement::D64,
         _ => return Err(SystemCallError::IllegalArgument),
     };
-    let builder_object = resolve_builder(thread, builder_handle, Rights::MANAGE)?;
-    let builder = concrete_builder(&builder_object)?;
-    let process = builder.process()?;
-    let _lease = BuildingLease::begin(process.clone())?;
-    if !process.space.lock().is_bound() {
-        return Err(SystemCallError::ObjectClosed);
-    }
-    let domain = crate::sched::resolve_domain(requirement).ok_or(SystemCallError::NotSupported)?;
-    process.bind_execution(requirement, domain)
+    let (_authority, builder) = builder(caller, handle)?;
+    let target = builder.process()?;
+    bind_initial_execution(&target, requirement)
 }
 
-fn start_created_members(
-    thread: &Thread,
-    builder_handle: Handle,
-    builder: &ProcessBuilder,
-    process: &Arc<Process>,
+pub(crate) fn bind_initial_execution(
+    target: &Arc<ProcessShell>,
+    requirement: elf::IsaRequirement,
 ) -> Result<(), SystemCallError> {
-    if !process.is_execution_bound() {
+    let domain = crate::sched::resolve_domain(requirement).ok_or(SystemCallError::NotSupported)?;
+    let body = target
+        .lease_building()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    let mut binding = body.execution.lock();
+    if binding.is_some() {
         return Err(SystemCallError::ObjectNotAvailable);
     }
-    // 可失败段：读取成员计数与提交 pin。计数读点与 gate
-    // 判点之间存在并发 attach 窗口——begin_running 以 expected 拒绝
-    // 插队（ObjectBusy），组装者以新计数重试。
-    let count = process.lifecycle.member_count();
-    if count == 0 {
-        return Err(SystemCallError::ObjectNotAvailable); // 活体门：从未活过
-    }
-    // 提交前最后的可失败步骤：调用者表内原子 pin builder。
-    let pin_token = super::handle::transaction_token()?;
-    {
-        let mut caller_table = thread.process.handles.lock();
-        if let Err(error) = caller_table.pin_consume(builder_handle, Rights::MANAGE, pin_token) {
-            return Err(super::handle::map_error(error));
-        }
-    }
-    // 提交线性化点：链锁内「上行检查祖先 seal + Building → Running
-    // （含预育提取）」——活体门、计数一致性与 Created 强引用交出在
-    // 同一 lifecycle 锁内原子完成，消除 gate 后、入队前的 kill 游标
-    // 窗口。失败则无损 unpin 后回滚就绪预留。
-    let head = match super::job::Job::start_commit_gate(process, count) {
-        Ok(head) => head,
-        Err(error) => {
-            thread.process.handles.lock().unpin(pin_token);
-            return Err(error);
-        }
-    };
-
-    // 提交区：容量已预留、槽位已 pin、线程已交出——以下全部不可失败。
-    // requirement 与兼容域在此合为单一 execution binding；线程随后只经
-    // 所属域的类队列出现。
-    let builder_entry = thread
-        .process
-        .handles
-        .lock()
-        .commit_pinned_consume(pin_token, builder_handle);
-    builder.consume();
-    super::handle::close_entry_infallible(builder_entry, &thread.process, false);
-    let mut current = head;
-    while let Some(created) = current {
-        current = created.take_publish_next();
-        created.publish_ready();
-    }
+    *binding = Some(domain);
+    drop(binding);
+    *body.requirement.lock() = Some(requirement);
     Ok(())
 }
 
-/// 终止待办的锁外执行（IPI、等待取消、REAPABLE 发布）。任何容器路径都
-/// 只到达 REAPABLE；Dead 仅由 ProcessDrain 的 Complete 分支发布。
-/// 等待取消走锁外游标：每次只持一个 weak context，零分配——摘取与
-/// 自然完成的竞争由单 outcome 仲裁，胜者负责线程消散与离场确认。
-pub(crate) fn run_termination_todo(process: &Arc<Process>, todo: TerminationTodo) {
-    if !todo.started {
-        return;
-    }
-    if todo.ipi_slots != 0 {
-        let failed = crate::registry::try_ipi_slots(todo.ipi_slots);
-        if failed != 0 {
-            warn!(
-                Task,
-                "Termination doorbell failed for hart slot mask {failed:#x}; termination remains published"
-            );
-        }
-    }
-    let reservation = process.take_termination_reservation();
-    if todo.reapable {
-        drop(reservation);
-        process.publish_reapable();
-        return;
-    }
-    let slots = process.lifecycle.termination_slot_count();
-    if slots == 0 {
-        // 仅有 active 执行点时由其 trap departure 发布 REAPABLE，无需空债务。
-        drop(reservation);
-        return;
-    }
-    crate::deferred_work::publish_termination(reservation, process.clone(), slots);
+pub fn query(caller: &Thread, handle: Handle, output: usize) -> Result<(), SystemCallError> {
+    let authority = Authorization::accept(caller, handle, Rights::READ)?;
+    let shell = ProcessShell::concrete(authority.object())?;
+    crate::uaccess::write_user(caller, output, &shell.snapshot())
 }
 
-/// termination debt 每步只检查一个稳定成员槽；空槽同样诚实计费。
-pub(crate) fn advance_termination_cleanup(
-    process: &Arc<Process>,
-    cursor: &mut usize,
-    slots: usize,
-    budget: usize,
-) -> (usize, bool) {
-    let mut used = 0;
-    while used < budget && *cursor < slots {
-        let index = *cursor;
-        *cursor += 1;
-        used += 1;
-        match process.lifecycle.take_termination_slot(index) {
-            super::lifecycle::TerminationSlot::Vacant => {}
-            super::lifecycle::TerminationSlot::Waiting(weak) => {
-                if let Some(context) = weak.upgrade()
-                    && context.abandon() == OfferResult::Complete
-                {
-                    finish_offered(context);
-                }
-            }
-            super::lifecycle::TerminationSlot::Created(thread) => {
-                thread.finish_created_departure();
-                drop(thread);
-            }
-        }
-    }
-    let complete = *cursor == slots;
-    if complete && process.lifecycle.is_reapable() {
-        process.publish_reapable();
-    }
-    (used, complete)
-}
-
-/// 线程级结果义务归零后的离场确认。正常末线程在 lifecycle 线性化点铸造
-/// 进程终局；已有进程级终止则只协助 REAPABLE 发布。
-pub fn confirm_departure(
-    process: &Arc<Process>,
-    member: super::lifecycle::MemberKey,
-) {
-    let (termination, reapable) = process.lifecycle.thread_departed(member);
-    if let Some(todo) = termination {
-        run_termination_todo(process, todo);
-    } else if reapable {
-        process.publish_reapable();
-    }
-}
-
-/// ProcessQuery(control) -> 固定宽快照。
-pub fn query(thread: &Thread, control: Handle, output: usize) -> Result<(), SystemCallError> {
-    let object = resolve_control(thread, control, Rights::READ)?;
-    let control = concrete_control(&object)?;
-    let snapshot = control.snapshot();
-    let mut space = thread.process.space.lock();
-    space.check_range(output, core::mem::size_of::<ProcessSnapshot>(), true)?;
-    // SAFETY: ProcessSnapshot 字段与 reserved 全部初始化，结构无 padding；
-    // 复检失败即杀本进程（deliver_output）。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &snapshot) }
-}
-
-/// ProcessKill 出口：自杀式调用已冻结终因，不返回用户态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
     Accepted,
     AlreadyTerminating,
     TerminatedCaller,
 }
-
-pub fn kill(thread: &Thread, control: Handle) -> Result<KillOutcome, SystemCallError> {
-    let object = resolve_control(thread, control, Rights::MANAGE)?;
-    let control = concrete_control(&object)?;
-    let Some(process) = control.core().upgrade() else {
-        return Ok(KillOutcome::AlreadyTerminating);
-    };
-    if process.pid == thread.process.pid {
-        let todo = process.lifecycle.request_termination(
-            TerminationCause::Killed,
-            TerminationDetail::PROCESS_CONTROL_KILL,
-            Some(thread.member()),
-        );
-        run_termination_todo(&process, todo);
-        return Ok(KillOutcome::TerminatedCaller);
-    }
-    let todo = process
-        .lifecycle
-        .request_termination(TerminationCause::Killed, TerminationDetail::PROCESS_CONTROL_KILL, None);
-    let first = todo.started;
-    run_termination_todo(&process, todo);
-    Ok(if first {
+pub fn kill(caller: &Thread, handle: Handle) -> Result<KillOutcome, SystemCallError> {
+    let authority = Authorization::accept(caller, handle, Rights::MANAGE)?;
+    let shell = ProcessShell::concrete(authority.object())?;
+    let first = shell.freeze_and_seal(
+        TerminationCause::Killed,
+        TerminationDetail::PROCESS_CONTROL_KILL,
+    );
+    Ok(if Arc::ptr_eq(&shell, &caller.process) {
+        KillOutcome::TerminatedCaller
+    } else if first {
         KillOutcome::Accepted
     } else {
         KillOutcome::AlreadyTerminating
     })
-}
-
-/// ProcessDrain(control, max_work)：REAPABLE/Dead 上推进固定预算收束。
-/// PublishDead 阶段发布 Dead/CLOSED；后续 Job 成员摘除与祖先传播可能跨预算
-/// 继续。Complete 表示 ProcessDrain 的全部持久收束责任已完成；此后 core
-/// 只剩空资源壳（root 帧已释放），最后 Arc 何时 drop 不影响 Dead 语义。
-pub enum DrainStart {
-    Ready,
-    Wait(super::wait::WaitPlan),
-}
-
-pub fn drain(
-    thread: &Thread,
-    control: Handle,
-    max_work: u32,
-    output: usize,
-) -> Result<DrainStart, SystemCallError> {
-    if max_work == 0 {
-        return Err(SystemCallError::IllegalArgument);
-    }
-    // 输出先验证（P2-1）：坏指针在推进任何资源副作用之前拒绝，
-    // 不消耗 drain_gate 预算，也不把批次做一半才报错。
-    {
-        let mut space = thread.process.space.lock();
-        space.check_range(output, core::mem::size_of::<ProcessDrainResult>(), true)?;
-    }
-    let object = resolve_control(thread, control, Rights::MANAGE)?;
-    let control = concrete_control(&object)?;
-    let dead_result = || ProcessDrainResult {
-        work_done: 0,
-        status: ProcessDrainStatus::Complete as u32,
-        reserved: 0,
-    };
-    let Some(process) = control.core().upgrade() else {
-        return write_drain_result(thread, output, dead_result()).map(|_| DrainStart::Ready);
-    };
-    if !control.is_dead() && !control.signals().contains(ObjectSignals::REAPABLE) {
-        return Err(SystemCallError::ObjectNotAvailable);
-    }
-    let budget = (max_work as usize).min(PROCESS_DRAIN_MAX as usize);
-    let caller = thread.process.clone();
-    let result = thread.result_obligation();
-    let request =
-        super::request::DrainRequest::acquire(
-            &process,
-            control,
-            caller,
-            thread.member().tid(),
-            result,
-            output,
-            budget,
-        )?;
-    process
-        .drain_executor
-        .begin(&process, request)
-        .map(DrainStart::Wait)
-}
-
-fn write_drain_result(
-    thread: &Thread,
-    output: usize,
-    result: ProcessDrainResult,
-) -> Result<(), SystemCallError> {
-    let mut space = thread.process.space.lock();
-    // deliver_output 在同一锁内完成最终 StoreAccess 复检与失败收束；不在此处
-    // 做一次会绕过统一交付策略的旁路检查。
-    // SAFETY: ProcessDrainResult 字段与 reserved 全部初始化，无 padding。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &result) }
-}
-
-fn resolve_builder(
-    thread: &Thread,
-    handle: Handle,
-    rights: Rights,
-) -> Result<ObjectRef, SystemCallError> {
-    let table = thread.process.handles.lock();
-    let entry = table
-        .get(handle, rights)
-        .map_err(super::handle::map_error)?;
-    if entry.object().kind() != ObjectKind::ProcessBuilder
-    {
-        return Err(SystemCallError::WrongObjectType);
-    }
-    Ok(entry.object().as_object().clone())
-}
-
-fn resolve_control(
-    thread: &Thread,
-    handle: Handle,
-    rights: Rights,
-) -> Result<ObjectRef, SystemCallError> {
-    let table = thread.process.handles.lock();
-    let entry = table
-        .get(handle, rights)
-        .map_err(super::handle::map_error)?;
-    if entry.object().kind() != ObjectKind::ProcessControl
-    {
-        return Err(SystemCallError::WrongObjectType);
-    }
-    Ok(entry.object().as_object().clone())
-}
-
-fn concrete_builder(object: &ObjectRef) -> Result<&ProcessBuilder, SystemCallError> {
-    object
-        .as_any()
-        .downcast_ref::<ProcessBuilder>()
-        .ok_or(SystemCallError::WrongObjectType)
-}
-
-fn concrete_control(object: &ObjectRef) -> Result<Arc<ProcessControl>, SystemCallError> {
-    let any: Arc<dyn Any + Send + Sync> = object.clone();
-    any.downcast::<ProcessControl>()
-        .map_err(|_| SystemCallError::WrongObjectType)
 }

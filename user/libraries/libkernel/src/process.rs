@@ -2,9 +2,8 @@
 
 use crate::call::{
     sys_job_create, sys_job_derive, sys_job_enumerate, sys_job_query, sys_job_seal,
-    sys_process_bind_execution, sys_process_bind_memory, sys_process_create, sys_process_drain,
-    sys_process_grant, sys_process_kill, sys_process_map, sys_process_query, sys_process_start,
-    sys_process_write, sys_thread_create,
+    sys_process_bind_execution, sys_process_create, sys_process_grant, sys_process_kill,
+    sys_process_map, sys_process_query, sys_process_start, sys_process_write, sys_thread_create,
 };
 use crate::ipc::object::close;
 use erhino_shared::{
@@ -12,16 +11,15 @@ use erhino_shared::{
     object::{Handle, Rights},
     proc::{
         HandleGrant, JOB_ENUMERATE_MAX, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
-        PROCESS_DRAIN_MAX, ProcessCreateResult, ProcessDrainResult, ProcessDrainStatus,
-        ProcessMapFlags, ProcessSnapshot, TerminationDetail, ThreadCreateResult,
-        ThreadStartContext,
+        ProcessCreateResult, ProcessMapFlags, ProcessSnapshot, TerminationDetail,
+        ThreadCreateResult, ThreadStartContext,
     },
 };
 
-pub fn create_job(parent: Handle, rights: Rights) -> Result<Handle, SystemCallError> {
+pub fn create_job(parent: Handle, pool: Handle, rights: Rights) -> Result<Handle, SystemCallError> {
     let mut output = Handle::INVALID;
     // SAFETY: output 在 syscall 期间有效且可写。
-    unsafe { sys_job_create(parent, rights, &mut output)? };
+    unsafe { sys_job_create(parent, pool, rights, &mut output)? };
     Ok(output)
 }
 
@@ -39,15 +37,16 @@ pub fn create_job(parent: Handle, rights: Rights) -> Result<Handle, SystemCallEr
 /// ```
 pub unsafe fn abandon_to_completion(created: ProcessCreateResult) -> Result<(), SystemCallError> {
     let builder_result = unsafe { close(created.builder) };
-    let drain_result = drain_to_completion(created.control);
+    let done_result = wait_done(created.control);
     let control_result = unsafe { close(created.control) };
     builder_result?;
-    drain_result?;
+    done_result?;
     control_result
 }
 
 /// JobSeal：MANAGE；幂等封口——该 Job 及全部后代的创建/启动口永久
-/// 关闭（后续创建/启动返回 ObjectClosed）。
+/// 关闭（后续创建/启动返回 ObjectClosed）。返回只证明封口已提交；
+/// 等待 CLOSED 才证明本 Job 完成且从父表移除。
 pub fn seal_job(control: Handle) -> Result<(), SystemCallError> {
     // SAFETY: 值参数由内核完整校验。
     unsafe { sys_job_seal(control) }
@@ -128,7 +127,13 @@ pub fn derive_job(
 
 /// ProcessCreate：Building process + affine ProcessBuilder + ProcessControl
 /// 同一事务交付；control_rights 显式请求并被校验为最大 rights 子集。
-pub fn create(job: Handle, control_rights: Rights) -> Result<ProcessCreateResult, SystemCallError> {
+/// 返回唯一Builder（MANAGE|GRANT|TRANSIT）及按显式rights铸造的Control。
+/// Builder运输/授予失败返原owner；Start成功消费启动权，随后由Kernel持责任。
+pub fn create(
+    job: Handle,
+    pool: Handle,
+    control_rights: Rights,
+) -> Result<ProcessCreateResult, SystemCallError> {
     let mut output = ProcessCreateResult {
         builder: Handle::INVALID,
         control: Handle::INVALID,
@@ -136,15 +141,8 @@ pub fn create(job: Handle, control_rights: Rights) -> Result<ProcessCreateResult
         reserved: 0,
     };
     // SAFETY: output 在 syscall 期间有效且可写。
-    unsafe { sys_process_create(job, control_rights, &mut output)? };
+    unsafe { sys_process_create(job, pool, control_rights, &mut output)? };
     Ok(output)
-}
-
-/// 一次性把 MemoryPool authority 移交给 Building process。成功消费 pool Handle；
-/// 失败保留 pool Handle，调用方仍负责其关闭或重试。
-pub fn bind_memory(builder: Handle, pool: Handle) -> Result<(), SystemCallError> {
-    // SAFETY: 两个 Handle 值由内核按 role/rights 与 affine 状态完整校验。
-    unsafe { sys_process_bind_memory(builder, pool) }
 }
 
 pub fn map(
@@ -217,7 +215,7 @@ pub fn query(control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
 }
 
 fn validate_snapshot(snapshot: &ProcessSnapshot) -> Result<(), SystemCallError> {
-    use erhino_shared::proc::{ProcessFaultCode, TerminationCause, ProcessState};
+    use erhino_shared::proc::{ProcessFaultCode, ProcessState, TerminationCause};
     if snapshot.reserved != 0 {
         return Err(SystemCallError::InternalError);
     }
@@ -238,7 +236,10 @@ fn validate_snapshot(snapshot: &ProcessSnapshot) -> Result<(), SystemCallError> 
             || x == TerminationCause::Completed as u32
             || x == TerminationCause::Terminated as u32
             || x == TerminationCause::Aborted as u32
-            || x == TerminationCause::Abandoned as u32 => snapshot.detail == TerminationDetail::NONE,
+            || x == TerminationCause::Abandoned as u32 =>
+        {
+            snapshot.detail == TerminationDetail::NONE
+        }
         x if x == TerminationCause::Killed as u32 => {
             snapshot.detail == TerminationDetail::PROCESS_CONTROL_KILL
         }
@@ -273,39 +274,20 @@ pub fn kill(control: Handle) -> Result<KillOutcome, SystemCallError> {
     }
 }
 
-/// ProcessDrain：REAPABLE/Dead 上推进固定预算收束批次（MANAGE）。
-/// 未知 status 判别值拒绝（不当作 More 无限循环）；More + 0 work
-/// （无进展，内核违约）与超预算 work_done 同样拒绝。
-pub fn drain(control: Handle, max_work: u32) -> Result<ProcessDrainResult, SystemCallError> {
-    let mut result = ProcessDrainResult {
-        work_done: 0,
-        status: 0,
-        reserved: 0,
-    };
-    // SAFETY: result 在 syscall 期间有效且可写。
-    unsafe { sys_process_drain(control, max_work, &mut result)? };
-    if result.reserved != 0 || result.status > ProcessDrainStatus::Complete as u32 {
-        return Err(SystemCallError::InternalError);
-    }
-    let effective_max = max_work.min(PROCESS_DRAIN_MAX);
-    if result.work_done > effective_max {
-        return Err(SystemCallError::InternalError);
-    }
-    if result.status == ProcessDrainStatus::More as u32 && result.work_done == 0 {
-        return Err(SystemCallError::InternalError);
-    }
-    Ok(result)
-}
-
-/// Drain 至 Complete（管理者循环用；步进用裸 [`drain`]）。
-pub fn drain_to_completion(control: Handle) -> Result<u32, SystemCallError> {
-    let mut total = 0u32;
-    loop {
-        let result = drain(control, erhino_shared::proc::PROCESS_DRAIN_MAX)?;
-        total = total.saturating_add(result.work_done);
-        if result.status == ProcessDrainStatus::Complete as u32 {
-            return Ok(total);
-        }
+/// 显式等实际 Body 退款后的 DONE；进程回收由内核自主推进。
+pub fn wait_done(control: Handle) -> Result<(), SystemCallError> {
+    let result = crate::ipc::wait::wait_until(
+        control,
+        erhino_shared::object::ObjectSignals::DONE,
+        crate::time::Deadline::INFINITE,
+    )?;
+    if result
+        .observed
+        .contains(erhino_shared::object::ObjectSignals::DONE)
+    {
+        Ok(())
+    } else {
+        Err(SystemCallError::ObjectClosed)
     }
 }
 

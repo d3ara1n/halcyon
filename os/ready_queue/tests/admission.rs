@@ -1,10 +1,73 @@
-use ready_queue::{Admission, Admitted, ReadyQueue, ReserveError};
+use ready_queue::{Admission, Admitted, ReadyQueue, ReadyStorage, ReserveError, Scan};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
     collections::VecDeque,
     sync::{Arc, Barrier, Mutex},
 };
+
+struct TestFunding {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    limit: usize,
+}
+struct TestCharge {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+impl Drop for TestCharge {
+    fn drop(&mut self) {
+        let previous = self
+            .live
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        assert!(previous >= self.bytes);
+    }
+}
+impl funded_storage::Funding for TestFunding {
+    type Charge = TestCharge;
+    type Error = ();
+    fn charge(&self, layout: Layout) -> Result<TestCharge, ()> {
+        self.live
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |live| {
+                    live.checked_add(layout.size())
+                        .filter(|next| *next <= self.limit)
+                },
+            )
+            .map_err(|_| ())?;
+        Ok(TestCharge {
+            live: self.live.clone(),
+            bytes: layout.size(),
+        })
+    }
+}
+fn funding() -> TestFunding {
+    TestFunding {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        limit: usize::MAX,
+    }
+}
+fn reserve<T>(
+    queue: &mut ReadyQueue<T, TestCharge>,
+    count: usize,
+    funds: &TestFunding,
+) -> Result<Admission, ReserveError> {
+    let mut prepared = ReadyStorage::new();
+    loop {
+        match queue.reserve(count, &mut prepared) {
+            Err(ReserveError::CapacityChanged) => (),
+            other => return other,
+        }
+        let required = queue.growth_capacity(count)?;
+        drop(prepared);
+        prepared = ReadyStorage::try_empty(required, funds).map_err(|error| match error {
+            funded_storage::StorageError::Allocation => ReserveError::AllocationFailed,
+            funded_storage::StorageError::Layout => ReserveError::CapacityOverflow,
+            funded_storage::StorageError::Funding(()) => panic!("unlimited test funding denied"),
+        })?;
+    }
+}
 
 // 只观察当前测试线程，避免并行测试和测试框架的分配污染提交段探针。
 thread_local! {
@@ -76,9 +139,10 @@ fn without_allocation<R>(f: impl FnOnce() -> R) -> R {
 
 #[test]
 fn pending_batches_are_invisible_and_partial_cancellation_is_exact() {
+    let funds = funding();
     let mut queue = ReadyQueue::try_new().unwrap();
-    let mut first = queue.reserve(4).unwrap();
-    let second = queue.reserve(7).unwrap();
+    let mut first = reserve(&mut queue, 4, &funds).unwrap();
+    let second = reserve(&mut queue, 7, &funds).unwrap();
     assert!(queue.is_empty());
     assert_eq!(queue.outstanding(), 11);
     without_allocation(|| queue.enqueue(first.admit(1)));
@@ -95,8 +159,9 @@ fn pending_batches_are_invisible_and_partial_cancellation_is_exact() {
 
 #[test]
 fn waiting_and_running_capacity_survives_new_births_and_all_wake_paths() {
+    let funds = funding();
     let mut queue = ReadyQueue::try_new().unwrap();
-    let mut old = queue.reserve(8).unwrap();
+    let mut old = reserve(&mut queue, 8, &funds).unwrap();
     for id in 0..8 {
         without_allocation(|| queue.enqueue(old.admit(id)));
     }
@@ -104,7 +169,7 @@ fn waiting_and_running_capacity_survives_new_births_and_all_wake_paths() {
     while let Some(thread) = without_allocation(|| queue.pick()) {
         waiting.push(thread);
     }
-    let mut new = queue.reserve(8).unwrap();
+    let mut new = reserve(&mut queue, 8, &funds).unwrap();
     assert!(queue.capacity() >= 16);
     let capacity = queue.capacity();
     without_allocation(|| {
@@ -131,14 +196,57 @@ fn waiting_and_running_capacity_survives_new_births_and_all_wake_paths() {
 }
 
 #[test]
+fn bounded_scan_preserves_fifo_and_returns_admission_to_the_owner() {
+    let funds = funding();
+    let mut queue = ReadyQueue::try_new().unwrap();
+    let mut batch = reserve(&mut queue, 4, &funds).unwrap();
+    for id in 1..=4 {
+        queue.enqueue(batch.admit(id));
+    }
+    assert!(matches!(
+        without_allocation(|| queue.scan_front_if(|id| id % 2 == 0)),
+        Scan::Retained
+    ));
+    let even = match without_allocation(|| queue.scan_front_if(|id| id % 2 == 0)) {
+        Scan::Taken(thread) => thread,
+        _ => panic!("matching thread was not detached"),
+    };
+    assert_eq!(*even, 2);
+    assert_eq!(queue.outstanding(), 4);
+    without_allocation(|| drop(even));
+    assert!(matches!(
+        without_allocation(|| queue.scan_front_if(|id| id % 2 == 0)),
+        Scan::Retained
+    ));
+    let even = match without_allocation(|| queue.scan_front_if(|id| id % 2 == 0)) {
+        Scan::Taken(thread) => thread,
+        _ => panic!("second matching thread was not detached"),
+    };
+    assert_eq!(*even, 4);
+    without_allocation(|| drop(even));
+    assert_eq!(queue.outstanding(), 2);
+    assert_eq!(*without_allocation(|| queue.pick().unwrap()), 1);
+    assert_eq!(*without_allocation(|| queue.pick().unwrap()), 3);
+    assert!(matches!(
+        without_allocation(|| queue.scan_front_if(|_| true)),
+        Scan::Empty
+    ));
+    assert_eq!(queue.outstanding(), 0);
+}
+
+#[test]
 fn failed_admission_does_not_borrow_waiters_capacity_or_publish_a_prefix() {
-    let mut queue = ReadyQueue::<usize>::try_new().unwrap();
-    assert!(matches!(queue.reserve(0), Err(ReserveError::Empty)));
-    let mut batch = queue.reserve(8).unwrap();
+    let funds = funding();
+    let mut queue = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    assert!(matches!(
+        reserve(&mut queue, 0, &funds),
+        Err(ReserveError::Empty)
+    ));
+    let mut batch = reserve(&mut queue, 8, &funds).unwrap();
     let waiting = batch.admit(1);
     drop(batch);
     let before = queue.capacity();
-    let (result, attempts) = observe(true, || queue.reserve(before + 1));
+    let (result, attempts) = observe(true, || reserve(&mut queue, before + 1, &funds));
     assert!(matches!(result, Err(ReserveError::AllocationFailed)));
     assert!(attempts > 0);
     assert_eq!(queue.outstanding(), 1);
@@ -151,16 +259,17 @@ fn failed_admission_does_not_borrow_waiters_capacity_or_publish_a_prefix() {
 
 #[test]
 fn initial_metadata_failure_is_fallible() {
-    let (result, _) = observe(true, ReadyQueue::<usize>::try_new);
+    let (result, _) = observe(true, ReadyQueue::<usize, TestCharge>::try_new);
     assert!(matches!(result, Err(ReserveError::AllocationFailed)));
 }
 
 #[test]
 fn impossible_storage_request_preserves_existing_admission() {
-    let mut queue = ReadyQueue::<usize>::try_new().unwrap();
-    let batch = queue.reserve(1).unwrap();
+    let funds = funding();
+    let mut queue = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    let batch = reserve(&mut queue, 1, &funds).unwrap();
     assert!(matches!(
-        queue.reserve(usize::MAX),
+        reserve(&mut queue, usize::MAX, &funds),
         Err(ReserveError::CapacityOverflow)
     ));
     assert_eq!(queue.outstanding(), 1);
@@ -170,9 +279,10 @@ fn impossible_storage_request_preserves_existing_admission() {
 
 #[test]
 fn foreign_queue_rejects_owner_without_losing_capacity() {
-    let mut first = ReadyQueue::<usize>::try_new().unwrap();
-    let mut second = ReadyQueue::try_new().unwrap();
-    let mut batch = first.reserve(1).unwrap();
+    let funds = funding();
+    let mut first = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    let mut second = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    let mut batch = reserve(&mut first, 1, &funds).unwrap();
     let owner = batch.admit(42);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| second.enqueue(owner)));
     assert!(result.is_err());
@@ -182,6 +292,7 @@ fn foreign_queue_rejects_owner_without_losing_capacity() {
 
 #[test]
 fn deterministic_container_model_preserves_fifo_and_lifetime_accounting() {
+    let funds = funding();
     let mut queue = ReadyQueue::try_new().unwrap();
     let mut expected = VecDeque::new();
     let mut pending: Vec<Admission> = Vec::new();
@@ -194,7 +305,7 @@ fn deterministic_container_model_preserves_fifo_and_lifetime_accounting() {
         random ^= random << 5;
         match random % 7 {
             0 if queue.outstanding() < 128 => {
-                pending.push(queue.reserve(1 + (random as usize % 4)).unwrap());
+                pending.push(reserve(&mut queue, 1 + (random as usize % 4), &funds).unwrap());
             }
             1 => {
                 if let Some(mut batch) = pending.pop() {
@@ -246,8 +357,9 @@ fn deterministic_container_model_preserves_fifo_and_lifetime_accounting() {
 
 #[test]
 fn remote_departures_can_race_new_admission_without_taking_queue_lock() {
+    let funds = funding();
     let mut queue = ReadyQueue::try_new().unwrap();
-    let mut batch = queue.reserve(64).unwrap();
+    let mut batch = reserve(&mut queue, 64, &funds).unwrap();
     let groups: Vec<Vec<_>> = (0..4)
         .map(|_| (0..16).map(|i| batch.admit(i)).collect())
         .collect();
@@ -267,7 +379,7 @@ fn remote_departures_can_race_new_admission_without_taking_queue_lock() {
         for step in 0..16 {
             barrier.wait();
             let mut queue = queue.lock().unwrap();
-            let mut birth = queue.reserve(1).unwrap();
+            let mut birth = reserve(&mut queue, 1, &funds).unwrap();
             without_allocation(|| queue.enqueue(birth.admit(100 + step)));
             // 持 Ready 锁等待远端退款，验证离场不反取该锁。
             barrier.wait();
@@ -281,5 +393,110 @@ fn remote_departures_can_race_new_admission_without_taking_queue_lock() {
             drop(thread);
         }
     });
+    assert_eq!(queue.outstanding(), 0);
+}
+
+#[test]
+fn prepared_growth_keeps_old_payment_and_all_inflight_credits_until_release() {
+    let funds = funding();
+    let mut queue = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    let mut batch = reserve(&mut queue, 5, &funds).unwrap();
+    let waiting = batch.admit(42);
+    drop(batch);
+    let old_capacity = queue.capacity();
+    let slot = std::mem::size_of::<Option<Admitted<usize>>>();
+    assert_eq!(
+        funds.live.load(std::sync::atomic::Ordering::Relaxed),
+        old_capacity * slot
+    );
+    let count = old_capacity + 1;
+    let target = queue.growth_capacity(count).unwrap();
+    let mut prepared = ReadyStorage::try_empty(target, &funds).unwrap();
+    let new = without_allocation(|| queue.reserve(count, &mut prepared).unwrap());
+    assert!(prepared.is_empty());
+    assert_eq!(prepared.capacity(), old_capacity);
+    assert_eq!(queue.outstanding(), count + 1);
+    assert_eq!(
+        funds.live.load(std::sync::atomic::Ordering::Relaxed),
+        (old_capacity + target) * slot
+    );
+    drop(prepared);
+    assert_eq!(
+        funds.live.load(std::sync::atomic::Ordering::Relaxed),
+        target * slot
+    );
+    without_allocation(|| {
+        drop(new);
+        queue.enqueue(waiting);
+        drop(queue.pick().unwrap());
+    });
+    assert_eq!(queue.outstanding(), 0);
+    assert_eq!(
+        funds.live.load(std::sync::atomic::Ordering::Relaxed),
+        target * slot
+    );
+    drop(queue);
+    assert_eq!(funds.live.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn unprepared_and_denied_growth_do_not_publish_or_allocate() {
+    let funds = funding();
+    let mut queue = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    let mut old = reserve(&mut queue, 1, &funds).unwrap();
+    let waiting = old.admit(7);
+    let before = queue.capacity();
+    let mut none = ReadyStorage::new();
+    assert!(matches!(
+        without_allocation(|| queue.reserve(1, &mut none)),
+        Err(ReserveError::CapacityChanged)
+    ));
+    assert_eq!(queue.capacity(), before);
+    assert_eq!(queue.outstanding(), 1);
+    let denied = TestFunding {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        limit: 0,
+    };
+    let (result, attempts) = observe(false, || {
+        ReadyStorage::<usize, TestCharge>::try_empty(queue.growth_capacity(1).unwrap(), &denied)
+    });
+    assert!(matches!(
+        result,
+        Err(funded_storage::StorageError::Funding(()))
+    ));
+    assert_eq!(attempts, 0);
+    assert_eq!(queue.outstanding(), 1);
+    without_allocation(|| {
+        queue.enqueue(waiting);
+        drop(queue.pick().unwrap());
+    });
+}
+
+#[test]
+fn ring_wrap_growth_and_full_scan_keep_fifo_without_reallocating() {
+    let funds = funding();
+    let mut queue = ReadyQueue::<usize, TestCharge>::try_new().unwrap();
+    let mut admission = reserve(&mut queue, 4, &funds).unwrap();
+    for id in 0..4 {
+        queue.enqueue(admission.admit(id));
+    }
+    for _ in 0..3 {
+        without_allocation(|| {
+            let owner = queue.pick().unwrap();
+            queue.enqueue(owner);
+        });
+    }
+    let head_order = [3, 0, 1, 2];
+    for _ in 0..4 {
+        assert!(matches!(
+            without_allocation(|| queue.scan_front_if(|_| false)),
+            Scan::Retained
+        ));
+    }
+    let pending = reserve(&mut queue, 1, &funds).unwrap();
+    drop(pending);
+    for expected in head_order {
+        assert_eq!(*without_allocation(|| queue.pick().unwrap()), expected);
+    }
     assert_eq!(queue.outstanding(), 0);
 }

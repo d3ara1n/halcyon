@@ -5,12 +5,13 @@ use alloc::{rc::Rc, string::String};
 use erhino_shared::{
     call::SystemCallError,
     message::PAYLOAD_MAX,
-    object::{Handle, HandleRole, ObjectSignals, Rights},
+    object::{Handle, ObjectKind, ObjectSignals, Rights},
     time::Deadline,
 };
 use libbudget::{AccountView, Budget, Charge, Taxonomy};
 use libexecution::{
     ExecutionResource,
+    assembly::Assembly,
     runtime::{
         Advance, DriveState, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step,
         Task,
@@ -38,21 +39,20 @@ use libfal::{
     },
     watch::{self, ControlError, Effect, Effects, WakeBatch},
 };
-use librpc::dispatcher::{Completion, Dispatcher};
-use librpc::{CallCause, CallError, Outbox, OutboxResult, Request as RpcRequest, RequestContext};
-use libservice::{
-    protocol as service_protocol,
-    registry::{Registry, RegistryError},
-    resource::ServiceResource,
-};
 use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
     notification,
     object::{duplicate, query},
     packet::Packet,
-    wait::wait_until,
     wait_set::WaitSet,
+};
+use librpc::dispatcher::{Completion, Dispatcher};
+use librpc::{CallCause, CallError, Outbox, OutboxResult, Request as RpcRequest, RequestContext};
+use libservice::{
+    protocol as service_protocol,
+    registry::{Registry, RegistryError},
+    resource::ServiceResource,
 };
 
 mod authority;
@@ -570,6 +570,7 @@ struct RegistrationControl {
 }
 
 struct World<B = ServiceBackend> {
+    pool: Capability,
     provider: provider::State<B>,
     route_mailbox: Handle,
     dispatch_intent: Option<DispatchIntent>,
@@ -773,9 +774,7 @@ impl<B: RuntimeBackend> Task<World<B>> for ReleaseTask {
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
         while let Some(event) = input.pull() {
-            if event.error != 0 {
-                world.failed = true;
-            } else if event.observed.intersects(ObjectSignals::READABLE) {
+            if event.observed.intersects(ObjectSignals::READABLE) {
                 let owner = self.owner.as_ref().expect("release source lost its owner");
                 notification::take(owner.as_handle(), 1)?;
                 self.released = true;
@@ -910,7 +909,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
         }
         let mut ready = false;
         while let Some(event) = input.pull() {
-            if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+            if event.observed.intersects(ObjectSignals::CLOSED) {
                 self.stopping = true;
             } else {
                 ready = true;
@@ -931,7 +930,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
         match self.buffer.receive(world.route_mailbox) {
             Ok(()) => {}
             Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => {
-                requests.rearm(self.source.expect("route source remains registered"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -943,7 +941,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
         let context = match RequestContext::decode(message, route::ID) {
             Ok(context) => context,
             Err(_) => {
-                requests.rearm(self.source.expect("route source remains registered"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -962,7 +959,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
                 1,
             )
             .map_err(|_| SystemCallError::ReachLimit)?;
-        requests.rearm(self.source.expect("route source remains registered"))?;
+
         Ok(Advance {
             work_done: 1,
             step: Step::Parked,
@@ -1205,7 +1202,7 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                     outbox.observe(event);
                 }
             } else if event.kind == KIND_MAILBOX {
-                if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+                if event.observed.intersects(ObjectSignals::CLOSED) {
                     world.failed = true;
                     self.stopping = true;
                 } else {
@@ -1257,7 +1254,7 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
             }
             self.refusal = None;
             self.refusal_deadline = Deadline::INFINITE;
-            requests.rearm(self.source.expect("provider source remains registered"))?;
+
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -1275,7 +1272,7 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
         }
         if self.gate_pending {
             self.gate_pending = false;
-            requests.rearm(self.source.expect("provider source remains registered"))?;
+
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -1302,7 +1299,6 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
         match self.buffer.receive(world.provider.mailbox.as_handle()) {
             Ok(()) => {}
             Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => {
-                requests.rearm(self.source.expect("provider source remains registered"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -1314,7 +1310,6 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
         let mut context = match RequestContext::decode(message, protocol::ID) {
             Ok(context) => context,
             Err(_) => {
-                requests.rearm(self.source.expect("provider source remains registered"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -1338,7 +1333,6 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                 {
                     (header, request)
                 } else {
-                    requests.rearm(self.source.expect("provider source remains registered"))?;
                     return Ok(Advance {
                         work_done: 1,
                         step: Step::Parked,
@@ -1346,7 +1340,6 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                 }
             }
             Err(_) => {
-                requests.rearm(self.source.expect("provider source remains registered"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -1361,10 +1354,16 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                 | protocol::Request::CancelStream
         ) {
             let identity = context.envelope.sender_context_id;
-            let session_end = world.streams.get(identity)
+            let session_end = world
+                .streams
+                .get(identity)
                 .and_then(|entry| entry.session_deadline.instant().ok().flatten())
                 .unwrap_or(input.now_ns().saturating_add(5_000_000_000));
-            let reply_end = header.deadline.instant().ok().flatten()
+            let reply_end = header
+                .deadline
+                .instant()
+                .ok()
+                .flatten()
                 .unwrap_or(u64::MAX)
                 .min(session_end);
             let reply_deadline = Deadline::at(reply_end);
@@ -1376,8 +1375,10 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
             ) {
                 Ok(outbox) => outbox,
                 Err(_) => {
-                    requests.rearm(self.source.expect("provider source remains registered"))?;
-                    return Ok(Advance { work_done: 1, step: Step::Parked });
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Parked,
+                    });
                 }
             };
             let task = ServiceTask::StreamControl(StreamControlTask::new(
@@ -1390,7 +1391,10 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                 Ok(()) => self.gate_pending = true,
                 Err(task) => self.queued = Some((task.into_fal_pending(), 1)),
             }
-            return Ok(Advance { work_done: 1, step: Step::Runnable });
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
         }
         let Some(access) = world
             .provider
@@ -1399,7 +1403,6 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
             .expect("grant table missing during request admission")
             .snapshot(context.envelope.sender_context_id)
         else {
-            requests.rearm(self.source.expect("provider source remains registered"))?;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -1429,9 +1432,10 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                     stream_protocol,
                     tunnel_bytes,
                 });
-            let reply_end = input.now_ns().saturating_add(5_000_000_000).min(
-                header.deadline.instant().ok().flatten().unwrap_or(u64::MAX),
-            );
+            let reply_end = input
+                .now_ns()
+                .saturating_add(5_000_000_000)
+                .min(header.deadline.instant().ok().flatten().unwrap_or(u64::MAX));
             let reply_deadline = Deadline::at(reply_end);
             let outbox = match Outbox::prepare(
                 context,
@@ -1441,16 +1445,27 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
             ) {
                 Ok(outbox) => outbox,
                 Err(_) => {
-                    requests.rearm(self.source.expect("provider source remains registered"))?;
-                    return Ok(Advance { work_done: 1, step: Step::Parked });
+                    return Ok(Advance {
+                        work_done: 1,
+                        step: Step::Parked,
+                    });
                 }
             };
-            let task = ServiceTask::Stream(StreamTask::new(outbox, header, reply_deadline, access, args));
+            let task = ServiceTask::Stream(StreamTask::new(
+                outbox,
+                header,
+                reply_deadline,
+                access,
+                args,
+            ));
             match requests.spawn(task, 3) {
                 Ok(()) => self.gate_pending = true,
                 Err(task) => self.queued = Some((task.into_fal_pending(), 3)),
             }
-            return Ok(Advance { work_done: 1, step: Step::Runnable });
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
         }
         let mut read_failure = None;
         let read_snapshot = if let protocol::Request::Read { path } = request {
@@ -1483,8 +1498,8 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                 let description = capability
                     .description()
                     .map_err(|_| protocol::Status::Internal)?;
-                let required = Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT;
-                if description.role != HandleRole::NotificationSignaler as u32
+                let required = Rights::SIGNAL | Rights::TRANSIT;
+                if description.kind != ObjectKind::NotificationSignaler as u32
                     || !description.rights.contains(required)
                 {
                     return Err(protocol::Status::Invalid);
@@ -1768,7 +1783,6 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
         ) {
             Ok(outbox) => outbox,
             Err(_) => {
-                requests.rearm(self.source.expect("provider source remains registered"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -3199,7 +3213,9 @@ impl ReadTask {
                 }
             }
             Err(CallError { cause, .. }) => Err(match cause {
-                CallCause::Timeout | CallCause::Cancelled | CallCause::Shutdown => protocol::Status::Cancelled,
+                CallCause::Timeout | CallCause::Cancelled | CallCause::Shutdown => {
+                    protocol::Status::Cancelled
+                }
                 CallCause::ServiceClosed => protocol::Status::GrantRevoked,
                 CallCause::System(error) => export_status(error),
                 CallCause::Frame(_) => protocol::Status::Internal,
@@ -3578,7 +3594,9 @@ impl DelegateTask {
                 }
             }
             Err(CallError { cause, .. }) => match cause {
-                CallCause::Timeout | CallCause::Cancelled | CallCause::Shutdown => protocol::Status::Cancelled,
+                CallCause::Timeout | CallCause::Cancelled | CallCause::Shutdown => {
+                    protocol::Status::Cancelled
+                }
                 CallCause::ServiceClosed => protocol::Status::GrantRevoked,
                 CallCause::Frame(_) | CallCause::System(_) => protocol::Status::Internal,
             },
@@ -3910,10 +3928,9 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
                     outbox.observe(event);
                 }
             } else if event.kind == KIND_REGISTRATION {
-                if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+                if event.observed.intersects(ObjectSignals::CLOSED) {
                     libkernel::debug!(
-                        "RegistrationControl terminal event: error={}, signals={:#x}",
-                        event.error,
+                        "RegistrationControl terminal event: signals={:#x}",
                         event.observed.raw()
                     );
                     world.failed = true;
@@ -3965,7 +3982,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
                 return Ok(advance);
             }
             self.refusal = None;
-            requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -3985,7 +4002,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         }
         if self.gate_pending {
             self.gate_pending = false;
-            requests.rearm(self.source.expect("RegistrationControl source missing"))?;
+
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -4023,7 +4040,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         match self.buffer.receive(handle) {
             Ok(()) => {}
             Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => {
-                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -4035,7 +4051,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         let mut context = match RequestContext::decode(message, service_protocol::ID) {
             Ok(context) => context,
             Err(_) => {
-                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -4045,7 +4060,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         let (header, decoded) = match service_protocol::decode_request(&context.payload) {
             Ok(parsed) => parsed,
             Err(_) => {
-                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -4053,7 +4067,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
             }
         };
         if context.handles.remaining() != service_protocol::request_capability_count(header.op) {
-            requests.rearm(self.source.expect("RegistrationControl source missing"))?;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Parked,
@@ -4126,7 +4139,6 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         ) {
             Ok(outbox) => outbox,
             Err(_) => {
-                requests.rearm(self.source.expect("RegistrationControl source missing"))?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -5075,12 +5087,13 @@ pub(super) fn run(
     route_mailbox: Handle,
     release: Handle,
     registration: Handle,
+    pool: Capability,
 ) {
     let registration_role = query(registration)
         .expect("provider registration endpoint query failed")
-        .role;
+        .kind;
     let registration_endpoint = match registration_role {
-        role if role == HandleRole::MailboxOwner as u32 => {
+        role if role == ObjectKind::MailboxReceiver as u32 => {
             // SAFETY: StartupBlock transfers the unique RegistrationControl Mailbox owner to provider A.
             let capability = unsafe { Capability::from_raw(registration) };
             let (mailbox, _) = Mailbox::from_capability(capability)
@@ -5088,7 +5101,7 @@ pub(super) fn run(
                 .expect("provider registration Mailbox has an invalid role");
             RegistrationEndpoint::Authority(mailbox)
         }
-        role if role == HandleRole::MailboxSender as u32 => {
+        role if role == ObjectKind::MailboxSender as u32 => {
             // SAFETY: StartupBlock transfers the unique RegistrationControl sender to provider B.
             let capability = unsafe { Capability::from_raw(registration) };
             let (sender, _) = MailboxSender::from_capability(capability)
@@ -5105,6 +5118,7 @@ pub(super) fn run(
         route_mailbox,
         release,
         registration_endpoint,
+        pool,
         move |account, service_account, wake| {
             let backend = ServiceBackend::new(account, service_account, wake, has_registry)?;
             let registry_root = backend.registry_root();
@@ -5119,6 +5133,7 @@ fn run_with_backend<B, F>(
     route_mailbox: Handle,
     release: Handle,
     registration_endpoint: RegistrationEndpoint,
+    pool: Capability,
     backend_factory: F,
 ) where
     B: RuntimeBackend,
@@ -5135,7 +5150,9 @@ fn run_with_backend<B, F>(
     let task_limit = TASK_LIMIT;
     let source_limit = SOURCE_LIMIT;
     let input_bytes = Runtime::<ServiceTask<B>, WaitSet>::input_budget(source_limit)
-        .expect("provider Runtime input budget calculation failed");
+        .expect("provider Runtime input budget calculation failed")
+        .checked_add(Assembly::<WaitSet>::input_budget().expect("provider receive budget"))
+        .expect("provider input budget overflow");
     let execution_layout = [0, 1];
     let fal_layout = [2, 3, 4, 5, 6, 7, 8, 9, 10];
     let service_layout = [11, 12, 13, 14];
@@ -5254,9 +5271,15 @@ fn run_with_backend<B, F>(
         .map_err(|failure| failure.error)
         .expect("Registry root grant preparation failed");
     let set = WaitSet::create(source_limit).expect("provider Runtime WaitSet creation failed");
-    let mut runtime =
-        Runtime::<ServiceTask<B>, WaitSet>::new(set, task_limit, source_limit, &execution_account)
-            .expect("provider Runtime creation failed");
+    let mut assembly = Assembly::new(set, &execution_account)
+        .unwrap_or_else(|(_, error)| panic!("provider assembly failed: {error:?}"));
+    let mut runtime = Runtime::<ServiceTask<B>, WaitSet>::new(
+        assembly.bind().expect("provider registration"),
+        task_limit,
+        source_limit,
+        &execution_account,
+    )
+    .expect("provider Runtime creation failed");
     let retire_task = runtime
         .spawn(
             ProviderTask::Retire(RetireTask::new(retire_owner)).into(),
@@ -5321,6 +5344,7 @@ fn run_with_backend<B, F>(
         .try_reserve_exact(REGISTRATION_LIMIT)
         .expect("registration control table allocation failed");
     let mut world = World {
+        pool,
         provider: provider::State {
             mailbox,
             backend: Some(backend),
@@ -5359,6 +5383,9 @@ fn run_with_backend<B, F>(
     let mut registration_root_published = !registration_authority;
     let mut ready_published = false;
     loop {
+        for &record in assembly.receive(64).expect("provider receive sources") {
+            runtime.feed(record);
+        }
         assert!(!world.failed, "provider Runtime entered a fatal state");
         if world.stop && !sealing {
             world
@@ -5490,9 +5517,9 @@ fn run_with_backend<B, F>(
             DriveState::Drained => break,
             DriveState::Runnable => {}
             DriveState::Waiting(deadline) => {
-                wait_until(&[runtime.wait_item(0)], deadline)
+                assembly
+                    .wait(deadline)
                     .expect("provider Runtime wait failed");
-                runtime.notified();
             }
         }
     }
@@ -5500,6 +5527,9 @@ fn run_with_backend<B, F>(
         .close()
         .map_err(|(_, error)| error)
         .expect("provider Runtime close failed");
+    assembly
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("provider assembly close failed: {error:?}"));
     assert!(
         dispatch_bindings.is_empty() && world.dispatch_intent.is_none(),
         "provider dispatch owners remained after shutdown"
@@ -5508,7 +5538,10 @@ fn run_with_backend<B, F>(
         world.provider.watches.is_empty(),
         "provider Watch records remained after Runtime shutdown"
     );
-    assert!(world.streams.is_empty(), "provider Stream records remained after Runtime shutdown");
+    assert!(
+        world.streams.is_empty(),
+        "provider Stream records remained after Runtime shutdown"
+    );
     libkernel::debug!("fs provider shutdown: Runtime closed");
     world
         .provider

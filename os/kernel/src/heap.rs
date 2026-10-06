@@ -2,11 +2,13 @@
 //!
 //! talc 经 [`SystemSource`] 按需消费启动期隔离并预清零的固定 system tickets。
 //! `Source::acquire` 在 allocator 忙碌时执行，因此该路径只做 O(1) ticket pop 与
-//! claim，不进入 user FramePool、不扫描区间，也不执行大块清零。ticket 用尽后普通
+//! 相邻 arena extend/独立 claim，不进入 user FramePool、不扫描区间，也不执行清零。ticket 用尽后普通
 //! metadata 分配明确 OOM；recovery 子预算不能作为回退。
 
 use core::{
     alloc::Layout,
+    num::NonZeroUsize,
+    ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -22,7 +24,20 @@ use crate::{
     sync::{RankedRawSpinlock, ranks},
 };
 
-struct SystemSource;
+struct SystemSource {
+    /// 上次成功claim/extend返回的当前end；由Talc锁独占，保存地址使Source自然Send。
+    heap_end: Option<NonZeroUsize>,
+    /// 已转交ticket的未裁齐映射末端；相邻判断不遗漏Talc未claim的对齐尾部。
+    donated_end: usize,
+}
+impl SystemSource {
+    const fn new() -> Self {
+        Self {
+            heap_end: None,
+            donated_end: 0,
+        }
+    }
+}
 
 static SOURCE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static LAST_FAILED_LAYOUT_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -85,12 +100,31 @@ unsafe impl Source for SystemSource {
         };
         let range = ticket.range();
         let base = mm::phys_to_virt(range.start());
-        // SAFETY: ticket 表达该预清零连续区间的唯一所有权；成功 claim 后消费
-        // ticket，把所有权永久转移给不支持归还的全局堆。
-        if unsafe { talc.claim(base as *mut u8, range.len()) }.is_none() {
-            record_source_failure(layout);
-            return Err(());
-        }
+        let end = mm::phys_to_virt(range.end());
+        let heap_end = if let Some(previous) = talc
+            .source
+            .heap_end
+            .filter(|_| talc.source.donated_end == base)
+        {
+            // SAFETY: previous是本Talc最近返回且从未truncate/resize的当前arena end。
+            // old end到donated_end仅是已独占ticket的对齐尾部，新ticket紧邻且预清零；
+            // 整段由同一SystemSource永久独占，没有跨越未授权物理空洞。
+            let previous =
+                NonNull::new(previous.get() as *mut u8).expect("saved heap end is nonzero");
+            unsafe { talc.extend(previous, end as *mut u8) }
+        } else {
+            // SAFETY: ticket表达预清零连续区间的唯一所有权，与既有arena不交叠。
+            // 非相邻区间单独claim，不合并空洞；成功后所有权永久转交全局堆。
+            match unsafe { talc.claim(base as *mut u8, range.len()) } {
+                Some(end) => end,
+                None => {
+                    record_source_failure(layout);
+                    return Err(());
+                }
+            }
+        };
+        talc.source.heap_end = NonZeroUsize::new(heap_end.as_ptr() as usize);
+        talc.source.donated_end = end;
         let _ = ticket.into_range();
         Ok(())
     }
@@ -100,11 +134,15 @@ unsafe impl Source for SystemSource {
 /// 内存源只接物理隔离的 system heap tickets。
 #[global_allocator]
 static HEAP: TalcLock<RankedRawSpinlock<{ ranks::HEAP.0 }>, SystemSource, DefaultBinning> =
-    TalcLock::new(SystemSource);
+    TalcLock::new(SystemSource::new());
 
 pub(crate) fn sample() {
     let counters = *HEAP.lock().counters();
     record_counters(&counters);
+}
+
+pub(crate) fn allocated_bytes() -> usize {
+    HEAP.lock().counters().allocated_bytes
 }
 
 pub(crate) fn reset_peaks() {

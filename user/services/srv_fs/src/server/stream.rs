@@ -1,15 +1,12 @@
 use super::*;
 use alloc::sync::Arc;
+use libkernel::{
+    ipc::{invitation::Invitation, tunnel::Endpoint},
+    mm::Placement,
+};
 use librunnel::blocking;
 use metadata_admission::{Counter, Permit};
 use ordered_table::{InsertError, OrderedTable, PreparedEntry};
-use libkernel::{
-    ipc::{
-        invitation::Invitation,
-        tunnel::{Endpoint, EndpointCleanup},
-    },
-    mm::Placement,
-};
 
 pub(super) enum StreamRole {
     Producer(blocking::Producer),
@@ -17,6 +14,10 @@ pub(super) enum StreamRole {
 }
 
 impl StreamRole {
+    #[expect(
+        clippy::result_large_err,
+        reason = "流关闭失败必须返回完整角色和映射 owner，不在清理期间分配"
+    )]
     pub(super) fn close(self) -> Result<(), (Self, SystemCallError)> {
         match self {
             Self::Producer(role) => role
@@ -35,8 +36,8 @@ pub(super) struct StreamEntry {
     pub access: AccessSnapshot,
     pub direction: protocol::StreamDirection,
     pub role: Option<StreamRole>,
-    pub failed_endpoint: Option<Endpoint>,
-    pub failed_cleanup: Option<EndpointCleanup>,
+    pub failed_endpoint: Option<librunnel::MappedEndpoint>,
+    pub unmapped_endpoint: Option<Endpoint>,
     pub invitation: Option<Invitation>,
     pub sender: Option<MailboxSender>,
     pub lifetime: Option<Capability>,
@@ -98,7 +99,7 @@ impl StreamEntry {
 }
 
 pub(super) struct StreamTable {
-    entries: OrderedTable<StreamEntry>,
+    entries: OrderedTable<StreamEntry, ()>,
     slots: Arc<Counter>,
 }
 
@@ -118,20 +119,20 @@ impl StreamTable {
     pub(super) fn prepare(
         &self,
         entry: StreamEntry,
-    ) -> Result<PreparedEntry<StreamEntry>, (protocol::Status, StreamEntry)> {
+    ) -> Result<PreparedEntry<StreamEntry, ()>, (protocol::Status, StreamEntry)> {
         self.entries
-            .prepare_insert(0, entry)
+            .prepare_insert(0, entry, &libbudget::AllocatorBacked)
             .map_err(|error| match error {
                 InsertError::Limit(entry) => (protocol::Status::Quota, entry),
-                InsertError::Allocation(entry) => (protocol::Status::Resource, entry),
+                InsertError::Storage(_, entry) => (protocol::Status::Resource, entry),
             })
     }
 
     pub(super) fn install(
         &mut self,
         identity: u64,
-        entry: PreparedEntry<StreamEntry>,
-    ) -> Result<(), (protocol::Status, PreparedEntry<StreamEntry>)> {
+        entry: PreparedEntry<StreamEntry, ()>,
+    ) -> Result<(), (protocol::Status, PreparedEntry<StreamEntry, ()>)> {
         if identity == 0 || self.entries.get(identity).is_some() {
             return Err((protocol::Status::Invalid, entry));
         }
@@ -148,7 +149,9 @@ impl StreamTable {
     }
 
     pub(super) fn remove(&mut self, identity: u64) -> Option<StreamEntry> {
-        self.entries.remove(identity)
+        self.entries
+            .remove(identity)
+            .map(ordered_table::PreparedEntry::into_value)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -173,7 +176,7 @@ pub(super) struct StreamTask {
     reply_deadline: Deadline,
     access: Option<AccessSnapshot>,
     args: Option<Result<OpenArgs, protocol::Status>>,
-    pending: Option<PreparedEntry<StreamEntry>>,
+    pending: Option<PreparedEntry<StreamEntry, ()>>,
     identity: Option<u64>,
     lifetime_source: Option<SourceId>,
     data_source: Option<SourceId>,
@@ -322,7 +325,7 @@ impl StreamTask {
             .account()
             .acquire(
                 FalResource::Bytes,
-                PreparedEntry::<StreamEntry>::allocation_bytes(),
+                PreparedEntry::<StreamEntry, ()>::allocation_bytes(),
             )
             .map_err(stream_status)?;
         let lifetime_charge = access
@@ -347,7 +350,7 @@ impl StreamTask {
             direction: args.direction,
             role: None,
             failed_endpoint: None,
-            failed_cleanup: None,
+            unmapped_endpoint: None,
             invitation: None,
             sender: None,
             lifetime: None,
@@ -406,11 +409,13 @@ impl StreamTask {
         let entry = self.entry_mut().ok_or(protocol::Status::Internal)?;
         let created = match entry.direction {
             protocol::StreamDirection::Read => blocking::Producer::create(
+                world.pool.as_handle(),
                 3 * erhino_shared::proc::PROCESS_PAGE_SIZE,
                 Placement::Anywhere,
             )
             .map(|(role, invitation)| (StreamRole::Producer(role), invitation)),
             protocol::StreamDirection::Write => blocking::Consumer::create(
+                world.pool.as_handle(),
                 3 * erhino_shared::proc::PROCESS_PAGE_SIZE,
                 Placement::Anywhere,
             )
@@ -425,15 +430,21 @@ impl StreamTask {
             Err(librunnel::blocking::CreateFailure::Tunnel(
                 libkernel::ipc::invitation::CreateFailure::Published {
                     endpoint,
-                    cleanup,
                     invitation,
                     ..
                 },
             )) => {
-                entry.failed_endpoint = endpoint;
-                entry.failed_cleanup = cleanup;
+                entry.unmapped_endpoint = endpoint;
                 entry.invitation = invitation;
                 Err(protocol::Status::Internal)
+            }
+            Err(librunnel::blocking::CreateFailure::Map {
+                failure,
+                invitation,
+            }) => {
+                entry.unmapped_endpoint = Some(failure.endpoint);
+                entry.invitation = Some(invitation);
+                Err(stream_status(failure.error))
             }
             Err(librunnel::blocking::CreateFailure::Protocol {
                 endpoint,
@@ -462,7 +473,7 @@ impl StreamTask {
                 .as_handle();
             let plan = libexecution::runtime::SourcePlan::new(handle, ObjectSignals::CLOSED);
             requests
-                .arm_source(plan, KIND_STREAM_LIFETIME)
+                .register(plan, KIND_STREAM_LIFETIME)
                 .map_err(|_| protocol::Status::Quota)?;
             self.lifetime_requested = true;
         }
@@ -477,7 +488,7 @@ impl StreamTask {
             }
             .map_err(|_| protocol::Status::Internal)?;
             requests
-                .arm_source(plan, KIND_STREAM_DATA)
+                .register(plan, KIND_STREAM_DATA)
                 .map_err(|_| protocol::Status::Quota)?;
             self.data_requested = true;
         }
@@ -552,9 +563,15 @@ impl StreamTask {
                 .invitation
                 .take()
                 .ok_or(SystemCallError::InternalError)?;
-            if let Err(failure) =
-                output.push(invitation.into_capability(), Rights::MAP | Rights::TRANSIT)
-            {
+            if let Err(failure) = output.push(
+                invitation.into_capability(),
+                Rights::READ
+                    | Rights::WRITE
+                    | Rights::SIGNAL
+                    | Rights::WAIT
+                    | Rights::MANAGE
+                    | Rights::TRANSIT,
+            ) {
                 self.returned.push(failure.capability);
                 return Err(failure.error);
             }
@@ -857,10 +874,10 @@ impl StreamTask {
                 step: Step::Parked,
             };
         }
-        if let Some(owner) = entry.failed_cleanup.take()
+        if let Some(owner) = entry.unmapped_endpoint.take()
             && let Err((owner, _)) = owner.close()
         {
-            entry.failed_cleanup = Some(owner);
+            entry.unmapped_endpoint = Some(owner);
             self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
@@ -943,10 +960,10 @@ impl StreamTask {
                 step: Step::Parked,
             };
         }
-        if let Some(owner) = entry.failed_cleanup.take()
+        if let Some(owner) = entry.unmapped_endpoint.take()
             && let Err((owner, _)) = owner.close()
         {
-            entry.failed_cleanup = Some(owner);
+            entry.unmapped_endpoint = Some(owner);
             self.retry_deadline = libkernel::time::timeout_millis(10).ok();
             return Advance {
                 work_done: 1,
@@ -1045,18 +1062,11 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
                     }
                 }
                 KIND_STREAM_LIFETIME => {
-                    if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+                    if event.observed.intersects(ObjectSignals::CLOSED) {
                         self.retiring = true;
                     }
                 }
                 KIND_STREAM_DATA => {
-                    if event.observed.intersects(ObjectSignals::PEER_ATTACHED)
-                        && let Some(source) = self.data_source
-                        && !self.data_removing
-                        && requests.remove(source).is_ok()
-                    {
-                        self.data_removing = true;
-                    }
                     let entry = if let Some(identity) = self.identity {
                         world.streams.get_mut(identity)
                     } else {
@@ -1069,10 +1079,9 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
                                 protocol::StreamReason::PeerClosed,
                             );
                         }
-                        let terminal_observed = event.error != 0
-                            || event
-                                .observed
-                                .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
+                        let terminal_observed = event
+                            .observed
+                            .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);
                         match entry.role.as_mut() {
                             Some(StreamRole::Producer(role)) => {
                                 if entry.finished
@@ -1320,7 +1329,7 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
             };
             match plan {
                 Ok(plan) => {
-                    if requests.arm_source(plan, KIND_STREAM_DATA).is_ok() {
+                    if requests.register(plan, KIND_STREAM_DATA).is_ok() {
                         self.data_requested = true;
                         return Ok(Advance {
                             work_done: 1,
@@ -1340,15 +1349,6 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
                     });
                 }
             }
-        }
-        if let Some(source) = self.data_source
-            && !self.data_removing
-            && requests.rearm(source).is_err()
-        {
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
         }
         Ok(Advance {
             work_done: 1,
@@ -1583,8 +1583,8 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamControlTask {
                     }
                     protocol::Op::Start if entry.state == protocol::StreamState::Offered => {
                         let attached = match entry.role.as_ref() {
-                            Some(StreamRole::Producer(role)) => role.peer_attached(),
-                            Some(StreamRole::Consumer(role)) => role.peer_attached(),
+                            Some(StreamRole::Producer(role)) => role.peer_started(),
+                            Some(StreamRole::Consumer(role)) => role.peer_started(),
                             None => false,
                         };
                         if attached {

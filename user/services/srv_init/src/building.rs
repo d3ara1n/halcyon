@@ -1,15 +1,11 @@
-use crate::SUPERVISOR_RIGHTS;
+use libkernel::process;
 use libkernel::shared::{
     call::SystemCallError,
     object::{Handle, Rights},
     proc::{
-        ExecutionProfile, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult, ProcessMapFlags,
-        ThreadCreateResult, ThreadStartContext,
+        ExecutionProfile, PROCESS_PAGE_SIZE, PROCESS_USER_TOP, ProcessCreateResult,
+        ProcessMapFlags, ThreadCreateResult, ThreadStartContext,
     },
-};
-use libkernel::{
-    ipc::object::{close, duplicate},
-    process,
 };
 
 /// 入口页指令：`j .`（`0x0000006f`，JAL x0,0 自我跳转）。不用 wfi——
@@ -18,14 +14,12 @@ use libkernel::{
 const SPIN_FOREVER: [u8; 4] = [0x6f, 0x00, 0x00, 0x00];
 
 /// 手工 Building：入口页（自旋）+ 栈顶页 + 首线程。失败时自行收束 builder/control。
-pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, SystemCallError> {
-    let created = process::create(job, SUPERVISOR_RIGHTS)?;
+pub(crate) fn build_spin_building(
+    job: Handle,
+    control_rights: Rights,
+) -> Result<ProcessCreateResult, SystemCallError> {
+    let created = process::create(job, crate::root_memory_pool(), control_rights)?;
     let built = (|| {
-        let pool = duplicate(crate::root_memory_pool(), Rights::GRANT)?;
-        if let Err(error) = process::bind_memory(created.builder, pool) {
-            let _ = unsafe { close(pool) };
-            return Err(error);
-        }
         process::map(
             created.builder,
             0x1000,
@@ -44,6 +38,7 @@ pub(crate) fn build_spin_building(job: Handle) -> Result<ProcessCreateResult, Sy
             tid: 0,
             reserved: 0,
             control: Handle::INVALID,
+            start: Handle::INVALID,
         };
         process::thread_create(
             created.builder,

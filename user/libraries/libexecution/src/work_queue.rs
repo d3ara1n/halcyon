@@ -2,12 +2,13 @@
 //! 来源登记、事件路由与推进驱动见 [`crate::runtime`]。
 
 use crate::{ExecutionResource, runtime::Task};
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use erhino_shared::{call::SystemCallError, time::Deadline};
 use libbudget::{AccountView, Charge};
 use ordered_table::OrderedTable;
-use timer_queue::{TimerQueue, TimerToken};
+use timer_queue::{TimerNode, TimerQueue};
 
 static NEXT_TASK: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 static ABANDONED_TASKS: AtomicUsize = AtomicUsize::new(0);
@@ -28,23 +29,24 @@ pub(crate) struct Slot<T> {
     pub(crate) queued: bool,
     pub(crate) stopping: bool,
     pub(crate) lifecycle: Lifecycle,
-    pub(crate) timer: TimerToken,
+    timer: Pin<Box<TimerNode<Wake>>>,
     pub(crate) timed_out: bool,
     deadline_value: Option<u64>,
     deadline_pending: bool,
-    retry_timer: TimerToken,
+    retry_timer: Pin<Box<TimerNode<Wake>>>,
     suspended: bool,
     pub(crate) _task_charge: Charge,
 }
 
 /// 任务表与公平 ready FIFO 的内部算法；公开驱动面见 [`crate::runtime::Runtime`]。
 pub(crate) struct WorkQueue<T> {
-    tasks: OrderedTable<Slot<T>>,
+    tasks: OrderedTable<Slot<T>, ()>,
     head: u64,
     tail: u64,
     sealed: bool,
     stop_cursor: u64,
-    retire_cursor: u64,
+    finalizing_head: u64,
+    finalizing_tail: u64,
     unmarked_sources: usize,
     retire_ready: usize,
     timers: TimerQueue<Wake>,
@@ -57,6 +59,13 @@ enum Wake {
 }
 
 #[derive(Debug)]
+pub(crate) enum FinalizingStep {
+    Idle,
+    Progress,
+    Source(u64),
+}
+
+#[derive(Debug)]
 pub struct InsertFailure<T> {
     pub error: SystemCallError,
     pub task: T,
@@ -66,7 +75,6 @@ pub struct InsertFailure<T> {
 pub(crate) enum Lifecycle {
     Active,
     Finalizing,
-    Retiring,
 }
 
 impl<T> WorkQueue<T> {
@@ -80,7 +88,8 @@ impl<T> WorkQueue<T> {
             tail: 0,
             sealed: false,
             stop_cursor: 0,
-            retire_cursor: 0,
+            finalizing_head: 0,
+            finalizing_tail: 0,
             unmarked_sources: 0,
             retire_ready: 0,
             timers: TimerQueue::new(0),
@@ -105,8 +114,14 @@ impl<T> WorkQueue<T> {
             Ok(prepared) => prepared,
             Err(error) => return Err(InsertFailure { error, task }),
         };
-        let timer = match self.timers.try_register(0, Wake::Deadline(id)) {
-            Ok(timer) => timer,
+        let nodes = (|| {
+            Ok::<_, alloc::alloc::AllocError>((
+                Box::into_pin(Box::try_new(TimerNode::new())?),
+                Box::into_pin(Box::try_new(TimerNode::new())?),
+            ))
+        })();
+        let (timer, retry_timer) = match nodes {
+            Ok(nodes) => nodes,
             Err(_) => {
                 return Err(InsertFailure {
                     error: SystemCallError::OutOfMemory,
@@ -114,22 +129,8 @@ impl<T> WorkQueue<T> {
                 });
             }
         };
-        assert!(self.timers.park(timer), "new task timer must exist");
-        let retry_timer = match self.timers.try_register(0, Wake::Retry(id)) {
-            Ok(token) => token,
-            Err(_) => {
-                self.timers.cancel(timer);
-                return Err(InsertFailure {
-                    error: SystemCallError::OutOfMemory,
-                    task,
-                });
-            }
-        };
-        assert!(self.timers.park(retry_timer), "new retry timer must exist");
         let mut sources = Vec::new();
         if sources.try_reserve_exact(max_sources).is_err() {
-            let _ = self.timers.cancel(timer);
-            let _ = self.timers.cancel(retry_timer);
             return Err(InsertFailure {
                 error: SystemCallError::OutOfMemory,
                 task,
@@ -155,17 +156,18 @@ impl<T> WorkQueue<T> {
             suspended: false,
             _task_charge: task_charge,
         };
-        let prepared = match self.tasks.prepare_insert(id, slot) {
+        let prepared = match self
+            .tasks
+            .prepare_insert(id, slot, &libbudget::AllocatorBacked)
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 let (error, slot) = match error {
                     ordered_table::InsertError::Limit(slot) => (SystemCallError::ReachLimit, slot),
-                    ordered_table::InsertError::Allocation(slot) => {
-                        (SystemCallError::OutOfMemory, slot)
+                    ordered_table::InsertError::Storage(error, slot) => {
+                        (libbudget::allocator_error(error), slot)
                     }
                 };
-                let _ = self.timers.cancel(timer);
-                let _ = self.timers.cancel(retry_timer);
                 return Err(InsertFailure {
                     error,
                     task: slot.task,
@@ -276,19 +278,15 @@ impl<T> WorkQueue<T> {
     pub(crate) fn expire(&mut self, now: u64, budget: usize) -> usize {
         let mut used = 0;
         while used < budget {
-            let Some((token, at, &wake)) = self.timers.peek() else {
+            let Some(wake) = self.timers.pop_expired(now) else {
                 break;
             };
-            if at > now {
-                break;
-            }
             let id = match wake {
                 Wake::Deadline(id) => {
                     self.mature_deadline(id, now);
                     id
                 }
                 Wake::Retry(id) => {
-                    assert!(self.timers.park(token), "expired retry timer disappeared");
                     self.tasks
                         .get_mut(id)
                         .expect("retry task disappeared")
@@ -307,10 +305,10 @@ impl<T> WorkQueue<T> {
     pub(crate) fn mature_deadline(&mut self, id: u64, now: u64) {
         let slot = self.tasks.get_mut(id).expect("deadline task remains owned");
         if slot.deadline_pending && slot.deadline_value.is_some_and(|at| at <= now) {
-            assert!(
-                self.timers.park(slot.timer),
-                "pending deadline timer remains owned"
-            );
+            // SAFETY: actor 独占队列，任务的 pin 节点保持存活；已弹出则取消幂等。
+            unsafe {
+                self.timers.cancel(slot.timer.as_ref());
+            }
             slot.deadline_pending = false;
             slot.timed_out = true;
         }
@@ -324,13 +322,14 @@ impl<T> WorkQueue<T> {
             .get_mut(id)
             .ok_or(SystemCallError::ObjectNotFound)?;
         slot.suspended = true;
-        assert!(
-            match retry_at {
-                Some(at) => self.timers.reschedule(slot.retry_timer, at),
-                None => self.timers.park(slot.retry_timer),
-            },
-            "task retry timer must remain owned"
-        );
+        // SAFETY: 任务出生预付两个独立 pin 节点，actor 独占修改与复用。
+        unsafe {
+            self.timers.cancel(slot.retry_timer.as_ref());
+            if let Some(at) = retry_at {
+                self.timers
+                    .register(slot.retry_timer.as_ref(), at, Wake::Retry(id));
+            }
+        }
         Ok(())
     }
 
@@ -347,12 +346,6 @@ impl<T> WorkQueue<T> {
         self.tasks
             .get(id)
             .is_some_and(|slot| slot.lifecycle == Lifecycle::Active)
-    }
-
-    pub(crate) fn is_finalizing(&self, id: u64) -> bool {
-        self.tasks.get(id).is_some_and(|slot| {
-            matches!(slot.lifecycle, Lifecycle::Finalizing | Lifecycle::Retiring)
-        })
     }
 
     pub(crate) fn has_retire_ready(&self) -> bool {
@@ -407,7 +400,10 @@ impl<T> WorkQueue<T> {
             .get_mut(id)
             .ok_or(SystemCallError::ObjectNotFound)?;
         slot.suspended = false;
-        self.timers.park(slot.retry_timer);
+        // SAFETY: 任务仍持有自己的 pin 节点，取消后才允许记录退休。
+        unsafe {
+            self.timers.cancel(slot.retry_timer.as_ref());
+        }
         if !slot.stopping {
             slot.stopping = true;
             slot.task.stop(world);
@@ -452,41 +448,80 @@ impl<T> WorkQueue<T> {
         if slot.sources.is_empty() && slot.retiring_sources == 0 {
             self.retire_ready += 1;
         }
+        self.push_finalizing(id);
     }
 
-    /// 每次至多检查一个任务。仅在确有可退休任务时扫描，游标跨轮保留。
-    pub(crate) fn retire_one(&mut self) -> bool {
-        if self.retire_ready == 0 {
-            return false;
+    fn push_finalizing(&mut self, id: u64) {
+        let tail = self.finalizing_tail;
+        let slot = self.tasks.get_mut(id).expect("finalizing task lost owner");
+        assert!(
+            slot.lifecycle == Lifecycle::Finalizing && !slot.queued,
+            "invalid finalizing membership"
+        );
+        slot.previous = tail;
+        slot.next = 0;
+        if tail == 0 {
+            self.finalizing_head = id;
+        } else {
+            self.tasks
+                .get_mut(tail)
+                .expect("finalizing tail lost owner")
+                .next = id;
+        }
+        self.finalizing_tail = id;
+    }
+    fn pop_finalizing(&mut self) -> Option<u64> {
+        let id = self.finalizing_head;
+        if id == 0 {
+            return None;
+        }
+        let slot = self.tasks.get_mut(id).expect("finalizing head lost owner");
+        let next = slot.next;
+        slot.previous = 0;
+        slot.next = 0;
+        self.finalizing_head = next;
+        if next == 0 {
+            self.finalizing_tail = 0;
+        } else {
+            self.tasks
+                .get_mut(next)
+                .expect("finalizing successor lost owner")
+                .previous = 0;
+        }
+        Some(id)
+    }
+
+    /// 新 Finalizing 追加尾部；每次头项同时推进来源发现或任务退休，不能交错跳过。
+    pub(crate) fn finalize_one(&mut self) -> FinalizingStep {
+        if self.unmarked_sources == 0 && self.retire_ready == 0 {
+            return FinalizingStep::Idle;
         }
         let id = self
-            .tasks
-            .next_after(Some(&self.retire_cursor))
-            .or_else(|| self.tasks.next_after(None))
-            .map(|(&id, _)| id)
-            .expect("retirement count requires an owned task");
-        self.retire_cursor = id;
-        let slot = self
-            .tasks
-            .get(id)
-            .expect("retirement cursor must name a task");
-        if slot.lifecycle != Lifecycle::Finalizing
-            || !slot.sources.is_empty()
-            || slot.retiring_sources != 0
-        {
-            return false;
+            .pop_finalizing()
+            .expect("finalizing work requires an owned task");
+        let slot = self.tasks.get(id).expect("finalizing candidate lost owner");
+        if let Some(&token) = slot.sources.first() {
+            self.push_finalizing(id);
+            return FinalizingStep::Source(token);
         }
-        self.unschedule(id);
+        if slot.retiring_sources != 0 {
+            self.push_finalizing(id);
+            return FinalizingStep::Progress;
+        }
         let slot = self
             .tasks
             .get_mut(id)
             .expect("retiring task must remain owned");
-        slot.lifecycle = Lifecycle::Retiring;
-        let _ = self.timers.cancel(slot.timer);
-        let _ = self.timers.cancel(slot.retry_timer);
-        let _ = self.tasks.remove(id);
+        // SAFETY: actor 独占；两份 pin timer 先摘，再移出实际任务存储。
+        unsafe {
+            self.timers.cancel(slot.timer.as_ref());
+            self.timers.cancel(slot.retry_timer.as_ref());
+        }
+        self.tasks
+            .remove(id)
+            .map(ordered_table::PreparedEntry::into_value);
         self.retire_ready -= 1;
-        true
+        FinalizingStep::Progress
     }
 
     /// 业务期限独立于 ready/Hold/Gate；同一已投递期限不会被重复武装。
@@ -503,13 +538,14 @@ impl<T> WorkQueue<T> {
         if slot.deadline_value == deadline {
             return Ok(());
         }
-        assert!(
-            match deadline {
-                Some(at) => self.timers.reschedule(slot.timer, at),
-                None => self.timers.park(slot.timer),
-            },
-            "live task timer remains owned"
-        );
+        // SAFETY: 该任务 pin 节点在记录退休前存活，取消/登记在同一 actor。
+        unsafe {
+            self.timers.cancel(slot.timer.as_ref());
+            if let Some(at) = deadline {
+                self.timers
+                    .register(slot.timer.as_ref(), at, Wake::Deadline(id));
+            }
+        }
         slot.deadline_value = deadline;
         slot.deadline_pending = deadline.is_some();
         Ok(())
@@ -523,8 +559,6 @@ impl<T> WorkQueue<T> {
         step: crate::runtime::Step,
         has_pending: bool,
     ) -> Result<(), SystemCallError> {
-        let slot = self.tasks.get(id).expect("advanced task disappeared");
-        let timer = slot.timer;
         if step != crate::runtime::Step::Complete
             && let Err(error) = self.update_deadline(id, deadline)
         {
@@ -536,7 +570,11 @@ impl<T> WorkQueue<T> {
             crate::runtime::Step::Complete => {
                 // Complete 只是业务完成提议；来源与 Gate 清理完成后才退休。
                 self.begin_finalizing(id);
-                let _ = self.timers.cancel(timer);
+                let slot = self.tasks.get(id).expect("advanced task disappeared");
+                // SAFETY: Finalizing 记录仍存活；解除期限节点后才可退休。
+                unsafe {
+                    self.timers.cancel(slot.timer.as_ref());
+                }
             }
             crate::runtime::Step::Runnable => {
                 self.schedule(id).expect("yielding task must remain owned")
@@ -554,9 +592,10 @@ impl<T> WorkQueue<T> {
 
 impl<T> Drop for WorkQueue<T> {
     fn drop(&mut self) {
+        while self.timers.pop_expired(u64::MAX).is_some() {}
         if !self.tasks.is_empty() {
             // 非空放弃是缺陷信号：任务 owner 在各自 Drop 中有界收束，
-            // 内核 handle 由进程边界（ProcessDrain/进程退出）接管。
+            // 内核 handle 由进程自动退休边界接管。
             ABANDONED_TASKS.fetch_add(self.tasks.len(), Ordering::Relaxed);
         }
         // 逐槽正常析构；不在放弃路径做递归推进或无界等待。

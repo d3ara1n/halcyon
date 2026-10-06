@@ -122,7 +122,7 @@ struct Record<P> {
 }
 
 pub struct PreparedNode<P> {
-    entry: PreparedEntry<Record<P>>,
+    entry: PreparedEntry<Record<P>, ()>,
     reference: NodeRef,
 }
 impl<P> PreparedNode<P> {
@@ -132,7 +132,7 @@ impl<P> PreparedNode<P> {
 }
 
 pub struct NodeStore<P> {
-    records: ManuallyDrop<OrderedTable<Record<P>>>,
+    records: ManuallyDrop<OrderedTable<Record<P>, ()>>,
     slots: Arc<Counter>,
     retire: Rc<RetireQueue>,
     current: Option<NodeId>,
@@ -221,7 +221,7 @@ impl<P> NodeStore<P> {
             let node_charge = account.acquire(FalResource::Node, 1)?;
             let storage_charge = account.acquire(
                 FalResource::Bytes,
-                PreparedEntry::<Record<P>>::allocation_bytes() + core::mem::size_of::<Lease>(),
+                PreparedEntry::<Record<P>, ()>::allocation_bytes() + core::mem::size_of::<Lease>(),
             )?;
             let id = NodeId(NEXT_NODE.allocate().ok_or(SystemCallError::ReachLimit)?);
             let lease = Rc::try_new(Lease {
@@ -250,15 +250,18 @@ impl<P> NodeStore<P> {
             _node_charge: node_charge,
             _storage_charge: storage_charge,
         };
-        match self.records.prepare_insert(reference.id().raw(), record) {
+        match self
+            .records
+            .prepare_insert(reference.id().raw(), record, &libbudget::AllocatorBacked)
+        {
             Ok(entry) => Ok(PreparedNode { entry, reference }),
             Err(error) => {
                 let (error, record) = match error {
                     ordered_table::InsertError::Limit(record) => {
                         (SystemCallError::QuotaExceeded, record)
                     }
-                    ordered_table::InsertError::Allocation(record) => {
-                        (SystemCallError::OutOfMemory, record)
+                    ordered_table::InsertError::Storage(error, record) => {
+                        (libbudget::allocator_error(error), record)
                     }
                 };
                 Err(PrepareFailure {
@@ -395,7 +398,11 @@ impl<P: Payload> NodeStore<P> {
         }
         let mut work_done = progress.work_done;
         if progress.done && work_done < budget {
-            let record = self.records.remove(id.raw()).expect("retired node missing");
+            let record = self
+                .records
+                .remove(id.raw())
+                .map(ordered_table::PreparedEntry::into_value)
+                .expect("retired node missing");
             record.lease.resident.set(false);
             drop(record);
             self.current = None;

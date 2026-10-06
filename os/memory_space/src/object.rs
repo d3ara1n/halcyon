@@ -1,5 +1,3 @@
-use alloc::vec::Vec;
-
 use crate::{PermitRequirement, Protection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,7 +26,7 @@ pub enum ObjectError {
     PermitDenied,
     PermitLimit,
     PermitOverflow,
-    AllocationFailed,
+    CapacityChanged,
 }
 
 /// `seal` 的结果。状态机不保存等待者：完成事实以 `Published` 报告一次，
@@ -147,29 +145,35 @@ impl MemoryObjectState {
         })
     }
 
-    pub fn reserve_writes(&mut self, count: usize) -> Result<Vec<WritePermit>, ObjectError> {
-        self.reserve_write_count(count, count)
+    pub fn reserve_writes<C>(
+        &mut self,
+        count: usize,
+        output: &mut funded_storage::Buffer<WritePermit, C>,
+    ) -> Result<(), ObjectError> {
+        self.reserve_write_count(count, count, output)
     }
 
     /// 消费 planner 产生的 replacement 需求。调用方不能自行声明 successor 属性；
     /// 对象身份仍在状态锁内复核。
-    pub fn reserve_replacement_writes(
+    pub fn reserve_replacement_writes<C>(
         &mut self,
         requirement: PermitRequirement,
-    ) -> Result<Vec<WritePermit>, ObjectError> {
+        output: &mut funded_storage::Buffer<WritePermit, C>,
+    ) -> Result<(), ObjectError> {
         if requirement.object() != self.object {
             return Err(ObjectError::PermitDenied);
         }
-        self.reserve_write_count(requirement.count(), requirement.new_writes())
+        self.reserve_write_count(requirement.count(), requirement.new_writes(), output)
     }
 
-    fn reserve_write_count(
+    fn reserve_write_count<C>(
         &mut self,
         count: usize,
         new_writes: usize,
-    ) -> Result<Vec<WritePermit>, ObjectError> {
+        output: &mut funded_storage::Buffer<WritePermit, C>,
+    ) -> Result<(), ObjectError> {
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if new_writes > count {
             return Err(ObjectError::PermitOverflow);
@@ -189,17 +193,16 @@ impl MemoryObjectState {
             return Err(ObjectError::PermitLimit);
         }
 
-        let mut permits = Vec::new();
-        permits
-            .try_reserve_exact(count)
-            .map_err(|_| ObjectError::AllocationFailed)?;
+        if output.capacity() - output.len() < count {
+            return Err(ObjectError::CapacityChanged);
+        }
         for _ in 0..count {
-            permits.push(WritePermit {
+            output.push(WritePermit {
                 object: self.object,
             });
         }
         self.permits = new_count;
-        Ok(permits)
+        Ok(())
     }
 
     /// 放弃尚未提交的写许可。返回 true 表示本次释放使 Sealing 完成。

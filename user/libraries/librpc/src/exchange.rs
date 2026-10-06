@@ -7,7 +7,7 @@ use crate::{
 use erhino_shared::{
     call::SystemCallError,
     message::{MESSAGE_HANDLE_MAX, MessageHeader, PAYLOAD_MAX},
-    object::{Handle, HandleRole, Rights},
+    object::{Handle, ObjectKind, Rights},
     time::Deadline,
 };
 use libkernel::ipc::{
@@ -111,7 +111,7 @@ pub struct Request {
     pub(crate) txid: u64,
     protocol: u64,
     packet: Option<Packet>,
-    reply_attached: bool,
+    observation: Option<Capability>,
 }
 
 impl Request {
@@ -127,14 +127,14 @@ impl Request {
             txid,
             protocol,
             packet: Some(Packet::new(protocol, &payload[..PREFIX_LEN + body.len()])?),
-            reply_attached: false,
+            observation: None,
         })
     }
     pub fn txid(&self) -> u64 {
         self.txid
     }
     pub(crate) fn new_attempt(&mut self) -> Result<(), SystemCallError> {
-        if self.reply_attached {
+        if self.observation.is_some() {
             return Err(SystemCallError::ObjectBusy);
         }
         let packet = self.packet.as_mut().ok_or(SystemCallError::ObjectBusy)?;
@@ -155,7 +155,7 @@ impl Request {
                 });
             }
         };
-        if self.reply_attached || packet.handle_count() >= MESSAGE_HANDLE_MAX - 1 {
+        if self.observation.is_some() || packet.handle_count() >= MESSAGE_HANDLE_MAX - 1 {
             return Err(PushFailure {
                 error: SystemCallError::IllegalArgument,
                 capability,
@@ -164,28 +164,34 @@ impl Request {
         packet.push(capability, rights)
     }
     pub(crate) fn attach_reply(&mut self, source: &MailboxSender) -> Result<(), SystemCallError> {
-        if self.reply_attached {
+        if self.observation.is_some() {
             return Err(SystemCallError::ObjectBusy);
         }
         let packet = self.packet.as_mut().ok_or(SystemCallError::ObjectBusy)?;
         let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
-        let reply = send_once(source, rights)?;
+        let permit = send_once(source, rights)?;
         packet
-            .push_front(reply.into_capability(), rights)
+            .push_front(permit.reply.into_capability(), rights)
             .map_err(|failure| failure.error)?;
-        self.reply_attached = true;
+        self.observation = Some(permit.observation);
         Ok(())
     }
     /// 撤回随附的 send-once 回复授权并完整返还 owner；未附或已投递时返回 None。
     pub fn detach_reply(&mut self) -> Option<Capability> {
-        if !self.reply_attached {
-            return None;
-        }
-        self.reply_attached = false;
+        // 观察权是尚未移交回复额度的唯一标记；发送成功后已交给 Sent owner。
+        drop(self.observation.take()?);
         self.packet
             .as_mut()
             .and_then(Packet::pop_front)
             .map(|(capability, _)| capability)
+    }
+    pub(crate) fn observation(&self) -> Option<&Capability> {
+        self.observation.as_ref()
+    }
+    pub(crate) fn take_observation(&mut self) -> Capability {
+        self.observation
+            .take()
+            .expect("prepared request lost reply observer")
     }
     /// 消费式投递：成功后 Packet 已移交；失败完整返还，可重试或拆解回收。
     pub(crate) fn try_send(
@@ -281,7 +287,7 @@ impl RequestContext {
             }
             let reply = message.handles.get(0).map_err(RequestRejection::System)?;
             let description = reply.description().map_err(RequestRejection::System)?;
-            if description.role != HandleRole::MailboxSenderOnce as u32
+            if description.kind != ObjectKind::MailboxOnceSender as u32
                 || !description.rights.contains(Rights::WRITE | Rights::WAIT)
             {
                 return Err(RequestRejection::ReplyRole);

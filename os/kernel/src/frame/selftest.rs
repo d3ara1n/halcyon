@@ -131,12 +131,18 @@ fn check_split(root: &Arc<MemoryPool>, right_first: bool) {
         },
     )
     .expect("four-page split fixture requires a contiguous extent");
-    let mut extents = Vec::new();
+    let mut extents = funded_storage::Buffer::try_empty(
+        funded.extent_count(),
+        &crate::task::resources::MetadataFunding(root),
+    )
+    .expect("split fixture storage funding failed");
     funded
         .into_extents(&mut extents)
         .expect("split fixture storage failed");
     assert_eq!(extents.len(), 1);
     let extent = extents.pop().expect("split fixture lost its extent");
+    // 本测试随后核对物理页 credit；数组实物先独立释放，不能逻辑清空即退费用。
+    drop(extents);
     let (left, right) = extent.split_at(1);
     assert_eq!(left.pages(), 1);
     assert_eq!(right.pages(), 3);

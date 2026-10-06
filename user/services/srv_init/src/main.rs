@@ -9,14 +9,14 @@
 //!    （跨回绕、到达移交唤醒）并校验；与 pm 协作验证发送侧流控唤醒；
 //! 4. Job 管理面验收：封口与完成传播、派生兑底、递归 JobKill 组合、
 //!    seal 闸门与枚举收敛；acceptance 域用完即收；
-//! 5. 监督闭环：全部服务等 REAPABLE|CLOSED → Drain 至 Complete → 终态
+//! 5. 监督闭环：全部服务等 DONE → 核验终态 → 关闭观察权
 //!    快照 → close；pm_domain 由 pm 自行收束，未收束时 init 兜底；
 //! 6. 等 pm 退出后的 PEER_CLOSED 终态位，关闭本端（帧归还）；
 //! 7. 验证系统复位 capability 的负路径，由 init 显式提交 Shutdown；平台拒绝时
 //!    保持 root supervisor 稳态等待。
 //!
 //! 默认构建运行确定性的 core 验收；`acceptance-stress` feature 在同一用户态
-//! 编排器中追加重复压力、最小预算 Drain 与完整竞态矩阵。内核不感知该档位。
+//! 编排器中追加重复压力、自动回收与完整竞态矩阵。内核不感知该档位。
 
 #![no_std]
 
@@ -42,7 +42,6 @@ use libfs::{
     client::Transport as FalTransport,
     prefix::{DirectoryGrant, PrefixTable},
 };
-use libkernel::ipc::tunnel as tunnel_sys;
 use libkernel::ipc::wait_set::WaitSet;
 use libkernel::ipc::{
     capability::Capability,
@@ -51,15 +50,13 @@ use libkernel::ipc::{
 };
 use libkernel::memory_pool::MemoryPool;
 use libkernel::shared::proc::Pid;
-#[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
-use libkernel::shared::proc::ProcessDrainStatus;
 use libkernel::time::Deadline;
 use libkernel::{
     ipc::{
         message::{create, discard, make_send_once, mint_sender, receive, send_raw, wait_message},
         notification,
         object::{close, duplicate},
-        wait::wait_many,
+        wait::wait_until,
     },
     memory_object::MemoryObject,
     mm::{MappedRegion, Placement},
@@ -74,7 +71,8 @@ use libkernel::{
         proc::{HandleGrant, JobMemberKind, JobState, ProcessState, TerminationCause},
         reset::{ResetAction, ResetReason},
         startup::initial,
-        wait::{WaitItem, WaitReason},
+        wait::WaitReason,
+        wait_set::MemberRequest,
     },
     system,
 };
@@ -273,13 +271,12 @@ fn exit_reason_name(reason: u32) -> &'static str {
 }
 
 /// 服务 ProcessControl 的监督基准权利：init 保留 control 用于查询、等待、
-/// 终止与受保护收束，并可复制/运输/转授。
+/// 终止与受保护收束，并可复制/直接转授。
 const SUPERVISOR_RIGHTS: Rights = Rights::from_raw(
     Rights::READ.raw()
         | Rights::WAIT.raw()
         | Rights::MANAGE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
         | Rights::GRANT.raw(),
 );
 
@@ -315,21 +312,8 @@ const CANCELLATION_PROBES: usize = if cfg!(feature = "acceptance-stress") {
 const TUNNEL_STRESS: usize = 64;
 #[cfg(feature = "acceptance-stress")]
 const ACCEPTANCE_WORKLOAD: &str = "stress";
-#[cfg(feature = "capacity-calibration")]
-const ACCEPTANCE_WORKLOAD: &str = "capacity";
-#[cfg(all(
-    not(feature = "acceptance-stress"),
-    not(feature = "capacity-calibration")
-))]
+#[cfg(not(feature = "acceptance-stress"))]
 const ACCEPTANCE_WORKLOAD: &str = "core";
-#[cfg(feature = "capacity-calibration")]
-// init 自身已经占用一个 Bound AddressSpace；本轮再保留 31 个，达到全局
-// 32 个的现行准入上限后，再尝试第 33 个。
-const CAPACITY_ADDITIONAL_ADDRESS_SPACES: usize = 31;
-#[cfg(feature = "capacity-calibration")]
-const CAPACITY_CONCURRENT_WORKERS: usize = 4;
-#[cfg(feature = "capacity-calibration")]
-const CAPACITY_CONCURRENT_PER_WORKER: usize = 8;
 
 const REQUIRED_FS: u64 = 1 << 0;
 const REQUIRED_PM: u64 = 1 << 1;
@@ -451,6 +435,17 @@ fn launch_test_services(
                     rights: DELEGATED_DOMAIN_RIGHTS,
                 },
             ];
+            let fs_pool_grant = if entry.name == "bin/srv_fs" {
+                match root.duplicate(root_memory_pool(), Rights::CREATE | Rights::GRANT) {
+                    Ok(pool) => pool,
+                    Err(_) => {
+                        stage_failure = Some("provider Pool grant failed");
+                        return;
+                    }
+                }
+            } else {
+                Handle::INVALID
+            };
             let fs_grants = [
                 HandleGrant {
                     handle: fs_bootstrap.peer,
@@ -467,6 +462,10 @@ fn launch_test_services(
                 HandleGrant {
                     handle: fs_registration,
                     rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
+                },
+                HandleGrant {
+                    handle: fs_pool_grant,
+                    rights: Rights::CREATE,
                 },
             ];
             // test_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
@@ -507,6 +506,7 @@ fn launch_test_services(
                 root.transferred(fs_release.owner);
                 root.transferred(fs_route.owner);
                 root.transferred(fs_registration);
+                root.transferred(fs_pool_grant);
             }
             match spawned {
                 Ok(process) => {
@@ -678,6 +678,9 @@ fn launch_secondary_fs(
     grants: [Handle; 4],
 ) -> Result<(), &'static str> {
     let [bootstrap, release, route, scope] = grants;
+    let fs_pool_grant = root
+        .duplicate(root_memory_pool(), Rights::CREATE | Rights::GRANT)
+        .map_err(|_| "second provider Pool grant failed")?;
     let grants = [
         HandleGrant {
             handle: bootstrap,
@@ -694,6 +697,10 @@ fn launch_secondary_fs(
         HandleGrant {
             handle: scope,
             rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+        },
+        HandleGrant {
+            handle: fs_pool_grant,
+            rights: Rights::CREATE,
         },
     ];
     root.reserve_process()
@@ -738,6 +745,15 @@ impl FalConsumerCoordinator {
     fn await_report(&self, expected: u64) -> Result<(), &'static str> {
         let deadline = libkernel::time::timeout_millis(120_000)
             .map_err(|_| "FAL consumer phase deadline invalid")?;
+        let set = WaitSet::create(2).map_err(|_| "FAL consumer phase set failed")?;
+        set.register(MemberRequest::new(
+            self.report_owner,
+            ObjectSignals::READABLE | ObjectSignals::CLOSED,
+            1,
+        ))
+        .map_err(|_| "FAL consumer report registration failed")?;
+        set.register(MemberRequest::new(self.control, ObjectSignals::DONE, 2))
+            .map_err(|_| "FAL consumer terminal registration failed")?;
         let mut terminal = None;
         loop {
             let bits = match notification::take(self.report_owner, u64::MAX) {
@@ -746,38 +762,33 @@ impl FalConsumerCoordinator {
                 Err(_) => return Err("FAL consumer phase report take failed"),
             };
             if bits != 0 {
-                if bits == expected {
-                    return Ok(());
-                }
-                return Err("FAL consumer phase report out of order");
+                return if bits == expected {
+                    Ok(())
+                } else {
+                    Err("FAL consumer phase report out of order")
+                };
             }
             if let Some(reason) = terminal {
                 return Err(reason);
             }
-            let result = libkernel::ipc::wait::wait_until(
-                &[
-                    WaitItem::new(
-                        self.report_owner,
-                        ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                        1,
-                    ),
-                    WaitItem::new(
-                        self.control,
-                        ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-                        2,
-                    ),
-                ],
-                deadline,
-            )
-            .map_err(|_| "FAL consumer phase wait failed")?;
+            for record in set
+                .receive(2)
+                .map_err(|_| "FAL consumer phase receive failed")?
+            {
+                if record.cookie == 2 {
+                    terminal = Some("FAL consumer exited before phase report");
+                } else if record.observed.intersects(ObjectSignals::CLOSED) {
+                    terminal = Some("FAL consumer phase channel closed");
+                }
+            }
+            if terminal.is_some() {
+                continue;
+            }
+            let result = set
+                .wait(deadline)
+                .map_err(|_| "FAL consumer phase wait failed")?;
             if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
                 terminal = Some("FAL consumer phase timed out");
-            } else if result.item_index == 1 {
-                terminal = Some("FAL consumer exited before phase report");
-            } else if result.observed.intersects(ObjectSignals::CLOSED) {
-                terminal = Some("FAL consumer phase channel closed");
-            } else if WaitReason::from_u32(result.reason) != Some(WaitReason::Signaled) {
-                terminal = Some("FAL consumer phase wait cancelled");
             }
         }
     }
@@ -795,15 +806,8 @@ impl FalConsumerCoordinator {
     fn finish(self, root: &mut RootSupervisor) -> Result<(), &'static str> {
         let deadline = libkernel::time::timeout_millis(120_000)
             .map_err(|_| "FAL consumer exit deadline invalid")?;
-        let result = libkernel::ipc::wait::wait_until(
-            &[WaitItem::new(
-                self.control,
-                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-                1,
-            )],
-            deadline,
-        )
-        .map_err(|_| "FAL consumer exit wait failed")?;
+        let result = libkernel::ipc::wait::wait_until(self.control, ObjectSignals::DONE, deadline)
+            .map_err(|_| "FAL consumer exit wait failed")?;
         if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
             return Err("FAL consumer exit timed out");
         }
@@ -1079,7 +1083,7 @@ fn confirm_primary_fs_ready(provider: &AcceptedFsProvider) -> Result<(), &'stati
 fn discover_registered_fs(
     directory: &MailboxSender,
     primary_mailbox: u64,
-    root_watch: &libfal::client::Subscription,
+    root_watch: &mut libfal::client::Subscription,
 ) -> Result<(MailboxSender, u64, u64, libfal::client::Subscription), &'static str> {
     let deadline = libkernel::time::Deadline::INFINITE;
     let mut client = FalClient::new();
@@ -1431,15 +1435,31 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
         .map_err(|_| "FAL2 cancellable RPC sent mailbox failed")?;
     let request = librpc::Request::new(protocol::ID, b"cancel")
         .map_err(|_| "FAL2 cancellable RPC second request failed")?;
-    let second = caller.call_cancelable(
+    notification::take(cancel.as_handle(), u64::MAX)
+        .map_err(|_| "FAL2 cancellation reset failed")?;
+    let mut operation = librpc::CallOperation::new(
+        &mut caller,
         root.sender(sent.peer),
         deadline,
         request,
         Some(cancel.as_handle()),
-    );
-    let Err(mut second) = second else {
-        return Err("FAL2 cancellable RPC did not preserve sent uncertainty");
-    };
+    )
+    .map_err(|_| "FAL2 cancellable RPC preparation failed")?;
+    if operation
+        .advance()
+        .map_err(|_| "FAL2 cancellable RPC send failed")?
+        .is_some()
+        || operation.phase() != Some(librpc::CallPhase::Sent)
+    {
+        return Err("FAL2 cancellable RPC did not enter Sent");
+    }
+    // 取消在真实运输提交后发布；不再以预先有信号的空 mailbox 偶然进入 Sent。
+    notification::signal(event.peer, 1).map_err(|_| "FAL2 sent cancellation signal failed")?;
+    let cause = operation
+        .wait_ready()
+        .expect_err("sent cancellation was ignored");
+    let mut second = operation.abort(cause).expect("Sent operation lost owner");
+    drop(operation);
     if second.phase != librpc::CallPhase::Sent
         || second.cause != librpc::CallCause::Cancelled
         || !second.has_unretired_owners()
@@ -1745,7 +1765,7 @@ fn send_raw_fal_request(
     let reply_rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
     let reply = send_once(reply_sender, reply_rights)?;
     packet
-        .push_front(reply.into_capability(), reply_rights)
+        .push_front(reply.reply.into_capability(), reply_rights)
         .map_err(|failure| failure.error)?;
     packet
         .try_send(grant, send_deadline)
@@ -1829,172 +1849,6 @@ fn finish_abandoned_reply(root: &mut RootSupervisor, reply: Handle) -> Result<()
         return Err("FAL2 abandoned response was unexpectedly delivered");
     }
     root.close_control(reply)
-}
-
-#[cfg(feature = "acceptance-stress")]
-fn stress_fal2_admission(
-    root: &mut RootSupervisor,
-    grant: &MailboxSender,
-    authority: &MailboxSender,
-) -> Result<(), &'static str> {
-    const REQUESTS: usize = 150;
-    let mut replies = alloc::vec::Vec::new();
-    replies
-        .try_reserve_exact(REQUESTS)
-        .map_err(|_| "FAL2 admission probe reply storage exhausted")?;
-    for index in 0..REQUESTS {
-        let reply = root
-            .create_mailbox(
-                Rights::READ | Rights::WAIT | Rights::MANAGE,
-                Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
-            )
-            .map_err(|_| "FAL2 admission probe mailbox creation failed")?;
-        for filler in 0..MAILBOX_CAPACITY {
-            root.sender(reply.peer)
-                .send(0x4641_4c32_5052_4553 + filler as u64, &[])
-                .map_err(|_| "FAL2 admission probe mailbox fill failed")?;
-        }
-        match send_raw_fal_request(
-            grant,
-            root.sender(reply.peer),
-            &FalRequest::Lookup {
-                path: "pressure-missing",
-            },
-            0x5052_4553_5300_0000 + index as u64,
-            libkernel::time::timeout_millis(10_000)
-                .map_err(|_| "FAL2 admission probe send deadline invalid")?,
-        ) {
-            Ok(()) => replies.push(reply),
-            Err(SystemCallError::MailboxFull | SystemCallError::DeadlineExpired) => {
-                debug!("FAL2 admission send backpressure at request {}", index);
-                for _ in 0..MAILBOX_CAPACITY {
-                    discard(reply.owner)
-                        .map_err(|_| "FAL2 admission unsent filler discard failed")?;
-                }
-                root.close_control(reply.peer)?;
-                root.close_control(reply.owner)?;
-                break;
-            }
-            Err(error) => {
-                debug!(
-                    "FAL2 admission raw send failed: index={}, error={:?}",
-                    index, error
-                );
-                return Err("FAL2 admission probe send failed");
-            }
-        }
-        if index % 8 == 7 {
-            libkernel::time::sleep_until(
-                libkernel::time::timeout_millis(100)
-                    .map_err(|_| "FAL2 admission pacing deadline invalid")?,
-            )
-            .map_err(|_| "FAL2 admission pacing failed")?;
-        }
-    }
-    libkernel::time::sleep_until(
-        libkernel::time::timeout_millis(2_000)
-            .map_err(|_| "FAL2 admission probe settling deadline invalid")?,
-    )
-    .map_err(|_| "FAL2 admission probe settle failed")?;
-    let deadline = libkernel::time::timeout_millis(5_000)
-        .map_err(|_| "Registry admission probe deadline invalid")?;
-    let request = service_protocol::Request::QueryName {
-        name: "fs.secondary",
-    };
-    let mut payload = alloc::vec![0; service_protocol::HEADER_LEN
-        + request
-            .encoded_len()
-            .ok_or("Registry admission probe size invalid")?];
-    let used = service_protocol::encode_request(&request, deadline, &mut payload)
-        .ok_or("Registry admission probe encoding failed")?;
-    let rpc = Request::new(service_protocol::ID, &payload[..used])
-        .map_err(|_| "Registry admission probe RPC invalid")?;
-    let reply = Caller::new()
-        .call(authority, deadline, rpc)
-        .map_err(|_| "Registry admission probe call failed")?;
-    let (header, _) = service_protocol::decode_response(&reply.payload)
-        .map_err(|_| "Registry admission probe reply invalid")?;
-    if header.op != service_protocol::Op::QueryName
-        || header.status != service_protocol::Status::Quota
-        || !reply.handles.is_empty()
-    {
-        return Err("Registry admission probe did not reject saturated task pool");
-    }
-    let receive_deadline = libkernel::time::timeout_millis(30_000)
-        .map_err(|_| "FAL2 admission probe receive deadline invalid")?;
-    for reply in &replies {
-        for _ in 0..MAILBOX_CAPACITY {
-            discard(reply.owner).map_err(|_| "FAL2 admission probe filler discard failed")?;
-        }
-    }
-    let mut quota = 0;
-    for (index, mailbox) in replies.into_iter().enumerate() {
-        let reply = libkernel::ipc::message::wait_message_until(mailbox.owner, receive_deadline)
-            .map_err(|_| "FAL2 admission probe response missing")?;
-        if reply.header.kind != protocol::ID || !reply.handles.is_empty() {
-            return Err("FAL2 admission probe response layout invalid");
-        }
-        let prefix = RpcPrefix::decode(&reply.payload)
-            .map_err(|_| "FAL2 admission probe RPC prefix invalid")?;
-        if prefix.kind != RpcMessageKind::Response
-            || prefix.txid != 0x5052_4553_5300_0000 + index as u64
-        {
-            return Err("FAL2 admission probe RPC reply kind invalid");
-        }
-        let (header, FalResponse::Empty) =
-            protocol::decode_response(&reply.payload[librpc::PREFIX_LEN..])
-                .map_err(|_| "FAL2 admission probe response invalid")?
-        else {
-            return Err("FAL2 admission probe response shape invalid");
-        };
-        match header.status {
-            protocol::Status::Quota => quota += 1,
-            protocol::Status::NotFound => {}
-            _ => return Err("FAL2 admission probe unexpected status"),
-        }
-        root.close_control(mailbox.peer)?;
-        root.close_control(mailbox.owner)?;
-    }
-    if quota == 0 {
-        return Err("FAL2 admission probe did not reach request quota");
-    }
-    if !matches!(
-        FalClient::new().call(
-            grant,
-            &FalRequest::Lookup {
-                path: "pressure-cleared"
-            },
-            libkernel::time::timeout_millis(5_000)
-                .map_err(|_| "FAL2 admission recovery deadline invalid")?,
-        ),
-        Err(libfal::client::ClientError::Status(
-            protocol::Status::NotFound
-        ))
-    ) {
-        return Err("FAL2 admission probe did not recover");
-    }
-    let deadline = libkernel::time::timeout_millis(5_000)
-        .map_err(|_| "Registry admission recovery deadline invalid")?;
-    let used = service_protocol::encode_request(&request, deadline, &mut payload)
-        .ok_or("Registry admission recovery encoding failed")?;
-    let rpc = Request::new(service_protocol::ID, &payload[..used])
-        .map_err(|_| "Registry admission recovery RPC invalid")?;
-    let reply = Caller::new()
-        .call(authority, deadline, rpc)
-        .map_err(|_| "Registry admission recovery call failed")?;
-    let (header, _) = service_protocol::decode_response(&reply.payload)
-        .map_err(|_| "Registry admission recovery reply invalid")?;
-    if header.op != service_protocol::Op::QueryName
-        || header.status != service_protocol::Status::NotFound
-        || !reply.handles.is_empty()
-    {
-        return Err("Registry admission probe did not recover");
-    }
-    debug!(
-        "FAL2 admission pressure passed: requests={}, quota={}",
-        REQUESTS, quota
-    );
-    Ok(())
 }
 
 struct StalledDelegate {
@@ -2119,7 +1973,7 @@ fn send_raw_registration_request(
     let reply_rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
     let reply = send_once(reply_sender, reply_rights)?;
     packet
-        .push_front(reply.into_capability(), reply_rights)
+        .push_front(reply.reply.into_capability(), reply_rights)
         .map_err(|failure| failure.error)?;
     packet
         .try_send(authority, deadline)
@@ -2239,7 +2093,7 @@ fn probe_registration_reply_boundaries(
             return Err("registration abandoned establishment retained its name");
         }
     }
-    let watch = FalClient::new()
+    let mut watch = FalClient::new()
         .subscribe(
             directory,
             "",
@@ -2346,7 +2200,7 @@ fn probe_registration_endpoint_retirement(
 ) -> Result<(), &'static str> {
     let deadline = libkernel::time::timeout_millis(10_000)
         .map_err(|_| "registration endpoint probe deadline invalid")?;
-    let watch = FalClient::new()
+    let mut watch = FalClient::new()
         .subscribe(
             directory,
             "",
@@ -2507,13 +2361,10 @@ fn reply_to_cancelled_delegate(
     packet
         .try_reply(reply, deadline)
         .map_err(|_| "cancelled Derive late reply was not accepted")?;
-    let observed = wait_many(
-        &[WaitItem::new(
-            lifetime.as_handle(),
-            ObjectSignals::CLOSED,
-            0,
-        )],
-        5_000,
+    let observed = wait_until(
+        lifetime.as_handle(),
+        ObjectSignals::CLOSED,
+        libkernel::time::timeout_millis(5_000).unwrap(),
     )
     .map_err(|_| "cancelled Derive late capability was not released")?;
     if !observed.observed.contains(ObjectSignals::CLOSED) {
@@ -2634,377 +2485,45 @@ fn root_pool_allocated() -> Result<u64, SystemCallError> {
 }
 
 #[cfg(not(feature = "acceptance-stress"))]
-fn test_process_memory_binding(job: Handle) -> Result<(), &'static str> {
+fn test_process_funding(job: Handle) -> Result<(), &'static str> {
     let baseline = root_pool_allocated().map_err(|_| "root Pool query failed")?;
-    let created = process::create(job, SUPERVISOR_RIGHTS).map_err(|_| "shell create failed")?;
-    let result = (|| {
-        if root_pool_allocated()? != baseline {
-            return Err(SystemCallError::InternalError);
+    let wrong_kind = duplicate(job, Rights::CREATE).map_err(|_| "Job duplicate failed")?;
+    let rejected = process::create(job, wrong_kind, SUPERVISOR_RIGHTS);
+    let _ = unsafe { close(wrong_kind) };
+    if !matches!(rejected, Err(SystemCallError::WrongObjectType)) {
+        if let Ok(created) = rejected {
+            let _ = unsafe { process::abandon_to_completion(created) };
         }
-        if process::map(
-            created.builder,
-            0x1000,
-            libkernel::shared::proc::PROCESS_PAGE_SIZE,
-            libkernel::shared::proc::ProcessMapFlags::READ,
-        ) != Err(SystemCallError::ObjectNotAvailable)
-        {
-            return Err(SystemCallError::InternalError);
+        return Err("ProcessCreate accepted non-Pool funding authority");
+    }
+    let no_create =
+        duplicate(root_memory_pool(), Rights::READ).map_err(|_| "Pool duplicate failed")?;
+    let denied = process::create(job, no_create, SUPERVISOR_RIGHTS);
+    let _ = unsafe { close(no_create) };
+    if !matches!(denied, Err(SystemCallError::RightsDenied)) {
+        if let Ok(created) = denied {
+            let _ = unsafe { process::abandon_to_completion(created) };
         }
-        if process::bind_memory(created.builder, created.builder)
-            != Err(SystemCallError::IllegalArgument)
-        {
-            return Err(SystemCallError::InternalError);
-        }
-
-        let wrong_kind = duplicate(job, Rights::GRANT)?;
-        let wrong_result = process::bind_memory(created.builder, wrong_kind);
-        let _ = unsafe { close(wrong_kind) };
-        if wrong_result != Err(SystemCallError::WrongObjectType) {
-            return Err(SystemCallError::InternalError);
-        }
-        let no_grant = duplicate(root_memory_pool(), Rights::READ)?;
-        let rights_result = process::bind_memory(created.builder, no_grant);
-        let _ = unsafe { close(no_grant) };
-        if rights_result != Err(SystemCallError::RightsDenied) {
-            return Err(SystemCallError::InternalError);
-        }
-
-        let binding = duplicate(root_memory_pool(), Rights::GRANT)?;
-        process::bind_memory(created.builder, binding)?;
-        if root_pool_allocated()? != baseline + 1 {
-            return Err(SystemCallError::InternalError);
-        }
-        let repeat = duplicate(root_memory_pool(), Rights::GRANT)?;
-        let repeat_result = process::bind_memory(created.builder, repeat);
-        let _ = unsafe { close(repeat) };
-        if repeat_result != Err(SystemCallError::ObjectNotAvailable) {
-            return Err(SystemCallError::InternalError);
-        }
-        Ok(())
-    })();
-
+        return Err("ProcessCreate accepted Pool without CREATE");
+    }
+    let created = process::create(job, root_memory_pool(), SUPERVISOR_RIGHTS)
+        .map_err(|_| "funded process create failed")?;
+    let result = process::map(
+        created.builder,
+        0x1000,
+        libkernel::shared::proc::PROCESS_PAGE_SIZE,
+        libkernel::shared::proc::ProcessMapFlags::READ,
+    );
+    // 创建不消费付款 authority；创建后的 Building 可直接映射。
+    let pool_alive = root_pool_allocated().is_ok();
     let cleanup = unsafe { process::abandon_to_completion(created) };
-    if result.is_err() || cleanup.is_err() {
-        return Err("BindMemory contract or cleanup failed");
+    if result.is_err() || !pool_alive || cleanup.is_err() {
+        return Err("ProcessCreate funding or cleanup failed");
     }
     if root_pool_allocated().map_err(|_| "root Pool final query failed")? != baseline {
-        return Err("BindMemory Pool charge did not refund");
+        return Err("ProcessCreate charge did not refund");
     }
-    debug!("process shell and memory binding acceptance passed");
-    Ok(())
-}
-
-#[cfg(feature = "capacity-calibration")]
-fn test_bound_address_space_capacity(job: Handle) -> Result<(), &'static str> {
-    let baseline = root_pool_allocated().map_err(|_| "capacity Pool baseline query failed")?;
-    let mut retained: [Option<libkernel::shared::proc::ProcessCreateResult>;
-        CAPACITY_ADDITIONAL_ADDRESS_SPACES] = [None; CAPACITY_ADDITIONAL_ADDRESS_SPACES];
-
-    let result = (|| {
-        for (index, slot) in retained.iter_mut().enumerate() {
-            let created = process::create(job, SUPERVISOR_RIGHTS)
-                .map_err(|_| SystemCallError::InternalError)?;
-            let pool = match duplicate(root_memory_pool(), Rights::GRANT) {
-                Ok(pool) => pool,
-                Err(error) => {
-                    let _ = unsafe { process::abandon_to_completion(created) };
-                    return Err(error);
-                }
-            };
-            match process::bind_memory(created.builder, pool) {
-                Ok(()) => {
-                    if let Err(error) = process::map(
-                        created.builder,
-                        0x1000,
-                        libkernel::shared::proc::PROCESS_PAGE_SIZE,
-                        libkernel::shared::proc::ProcessMapFlags::READ
-                            | libkernel::shared::proc::ProcessMapFlags::EXECUTE,
-                    ) {
-                        let _ = unsafe { process::abandon_to_completion(created) };
-                        return Err(error);
-                    }
-                    if let Err(error) = process::map(
-                        created.builder,
-                        libkernel::shared::proc::PROCESS_USER_TOP
-                            - libkernel::shared::proc::PROCESS_PAGE_SIZE,
-                        libkernel::shared::proc::PROCESS_PAGE_SIZE,
-                        libkernel::shared::proc::ProcessMapFlags::READ
-                            | libkernel::shared::proc::ProcessMapFlags::WRITE,
-                    ) {
-                        let _ = unsafe { process::abandon_to_completion(created) };
-                        return Err(error);
-                    }
-                    *slot = Some(created);
-                    debug!(
-                        "capacity calibration retained {} mapped additional Bound AddressSpace(s), total={}, pool_allocated={}",
-                        index + 1,
-                        index + 2,
-                        root_pool_allocated().map_err(|_| SystemCallError::InternalError)?
-                    );
-                }
-                Err(error) => {
-                    let _ = unsafe { close(pool) };
-                    let _ = unsafe { process::abandon_to_completion(created) };
-                    return Err(error);
-                }
-            }
-        }
-
-        let extra =
-            process::create(job, SUPERVISOR_RIGHTS).map_err(|_| SystemCallError::InternalError)?;
-        let extra_pool = match duplicate(root_memory_pool(), Rights::GRANT) {
-            Ok(pool) => pool,
-            Err(error) => {
-                let _ = unsafe { process::abandon_to_completion(extra) };
-                return Err(error);
-            }
-        };
-        match process::bind_memory(extra.builder, extra_pool) {
-            Err(SystemCallError::ReachLimit) => {
-                let _ = unsafe { close(extra_pool) };
-                let _ = unsafe { process::abandon_to_completion(extra) };
-                debug!("capacity calibration rejected 33rd bound address space: ReachLimit");
-                Ok(())
-            }
-            Err(error) => {
-                debug!(
-                    "capacity calibration rejected 33rd bound address space with unexpected error: {:?}",
-                    error
-                );
-                let _ = unsafe { close(extra_pool) };
-                let _ = unsafe { process::abandon_to_completion(extra) };
-                Err(SystemCallError::InternalError)
-            }
-            Ok(()) => {
-                let _ = unsafe { process::abandon_to_completion(extra) };
-                Err(SystemCallError::InternalError)
-            }
-        }
-    })();
-
-    let mut cleanup_error = false;
-    for created in retained.iter_mut().filter_map(Option::take) {
-        if unsafe { process::abandon_to_completion(created) }.is_err() {
-            cleanup_error = true;
-        }
-    }
-    if result.is_err() || cleanup_error {
-        return Err("capacity calibration construction or cleanup failed");
-    }
-    if root_pool_allocated().map_err(|_| "capacity Pool final query failed")? != baseline {
-        return Err("capacity calibration Pool charge did not refund");
-    }
-    debug!("capacity calibration passed: 32 bound address spaces");
-    Ok(())
-}
-
-#[cfg(feature = "capacity-calibration")]
-fn test_bound_address_space_concurrency(job: Handle) -> Result<(), &'static str> {
-    type WorkerResult = (
-        [Option<libkernel::shared::proc::ProcessCreateResult>; CAPACITY_CONCURRENT_PER_WORKER],
-        usize,
-        usize,
-        usize,
-    );
-
-    let ready = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
-    let go = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let mut workers: [Option<libthread::ResultReceiver<WorkerResult, libthread::NoEnvironment>>;
-        CAPACITY_CONCURRENT_WORKERS] = core::array::from_fn(|_| None);
-    for slot in &mut workers {
-        let ready = ready.clone();
-        let launch_go = go.clone();
-        let pool = root_memory_pool();
-        *slot = match libruntime::thread::Builder::new()
-            .stack_size(64 * 1024)
-            .spawn(move || {
-                ready.fetch_add(1, core::sync::atomic::Ordering::Release);
-                while !launch_go.load(core::sync::atomic::Ordering::Acquire) {
-                    core::hint::spin_loop();
-                }
-                let mut entries = [None; CAPACITY_CONCURRENT_PER_WORKER];
-                let mut successes = 0;
-                let mut limit_failures = 0;
-                let mut unexpected_failures = 0;
-                for entry in &mut entries {
-                    let created = match process::create(job, SUPERVISOR_RIGHTS) {
-                        Ok(created) => created,
-                        Err(_) => {
-                            unexpected_failures += 1;
-                            break;
-                        }
-                    };
-                    let binding = match duplicate(pool, Rights::GRANT) {
-                        Ok(binding) => binding,
-                        Err(_) => {
-                            let _ = unsafe { process::abandon_to_completion(created) };
-                            unexpected_failures += 1;
-                            break;
-                        }
-                    };
-                    match process::bind_memory(created.builder, binding) {
-                        Ok(()) => {
-                            *entry = Some(created);
-                            successes += 1;
-                        }
-                        Err(SystemCallError::ReachLimit) => {
-                            let _ = unsafe { close(binding) };
-                            let _ = unsafe { process::abandon_to_completion(created) };
-                            limit_failures += 1;
-                            break;
-                        }
-                        Err(_) => {
-                            let _ = unsafe { close(binding) };
-                            let _ = unsafe { process::abandon_to_completion(created) };
-                            unexpected_failures += 1;
-                            break;
-                        }
-                    }
-                }
-                (entries, successes, limit_failures, unexpected_failures)
-            }) {
-            Ok(worker) => Some(worker),
-            Err(_) => {
-                go.store(true, core::sync::atomic::Ordering::Release);
-                for worker in workers.iter_mut().filter_map(Option::take) {
-                    let (entries, _, _, _) = take_thread_result(worker.join());
-                    for created in entries.into_iter().flatten() {
-                        let _ = unsafe { process::abandon_to_completion(created) };
-                    }
-                }
-                return Err("capacity concurrent worker spawn failed");
-            }
-        };
-    }
-    while ready.load(core::sync::atomic::Ordering::Acquire) != CAPACITY_CONCURRENT_WORKERS {
-        core::hint::spin_loop();
-    }
-    go.store(true, core::sync::atomic::Ordering::Release);
-
-    let mut results: [Option<WorkerResult>; CAPACITY_CONCURRENT_WORKERS] =
-        core::array::from_fn(|_| None);
-    for (worker, result) in workers.iter_mut().zip(results.iter_mut()) {
-        let worker = worker
-            .take()
-            .ok_or("capacity concurrent worker handle missing")?;
-        *result = Some(take_thread_result(worker.join()));
-    }
-
-    let mut successes = 0;
-    let mut limit_failures = 0;
-    let mut unexpected_failures = 0;
-    let mut cleanup_error = false;
-    for result in results.into_iter().flatten() {
-        let (entries, worker_successes, worker_limit_failures, worker_unexpected_failures) = result;
-        successes += worker_successes;
-        limit_failures += worker_limit_failures;
-        unexpected_failures += worker_unexpected_failures;
-        for created in entries.into_iter().flatten() {
-            if unsafe { process::abandon_to_completion(created) }.is_err() {
-                cleanup_error = true;
-            }
-        }
-    }
-    if successes != CAPACITY_ADDITIONAL_ADDRESS_SPACES
-        || limit_failures == 0
-        || unexpected_failures != 0
-        || cleanup_error
-    {
-        return Err("capacity concurrent create/bind or cleanup failed");
-    }
-    debug!(
-        "capacity calibration concurrent passed: {} additional Bound AddressSpace(s), {} ReachLimit rejection(s)",
-        successes, limit_failures
-    );
-    Ok(())
-}
-
-#[cfg(feature = "capacity-calibration")]
-fn test_bound_address_space_mixed(job: Handle, image: &[u8]) -> Result<(), &'static str> {
-    const MIXED_BOUND: usize = 8;
-    let mut retained: [Option<libkernel::shared::proc::ProcessCreateResult>; MIXED_BOUND] =
-        [None; MIXED_BOUND];
-    let result = (|| {
-        for slot in &mut retained {
-            let created = process::create(job, SUPERVISOR_RIGHTS)
-                .map_err(|_| "mixed process create failed")?;
-            let pool = match duplicate(root_memory_pool(), Rights::GRANT) {
-                Ok(pool) => pool,
-                Err(_) => {
-                    let _ = unsafe { process::abandon_to_completion(created) };
-                    return Err("mixed memory Pool duplicate failed");
-                }
-            };
-            if let Err(error) = process::bind_memory(created.builder, pool) {
-                let _ = unsafe { close(pool) };
-                let _ = unsafe { process::abandon_to_completion(created) };
-                return Err(match error {
-                    SystemCallError::ReachLimit => "mixed BindMemory reached the limit",
-                    _ => "mixed BindMemory failed",
-                });
-            }
-            if let Err(error) = process::map(
-                created.builder,
-                0x1000,
-                libkernel::shared::proc::PROCESS_PAGE_SIZE,
-                libkernel::shared::proc::ProcessMapFlags::READ
-                    | libkernel::shared::proc::ProcessMapFlags::EXECUTE,
-            ) {
-                let _ = unsafe { process::abandon_to_completion(created) };
-                return Err(match error {
-                    SystemCallError::ReachLimit => "mixed ProcessMap reached the limit",
-                    _ => "mixed ProcessMap failed",
-                });
-            }
-            if let Err(error) = process::map(
-                created.builder,
-                libkernel::shared::proc::PROCESS_USER_TOP
-                    - libkernel::shared::proc::PROCESS_PAGE_SIZE,
-                libkernel::shared::proc::PROCESS_PAGE_SIZE,
-                libkernel::shared::proc::ProcessMapFlags::READ
-                    | libkernel::shared::proc::ProcessMapFlags::WRITE,
-            ) {
-                let _ = unsafe { process::abandon_to_completion(created) };
-                return Err(match error {
-                    SystemCallError::ReachLimit => "mixed stack ProcessMap reached the limit",
-                    _ => "mixed stack ProcessMap failed",
-                });
-            }
-            *slot = Some(created);
-        }
-        let pool_before = root_pool_allocated().map_err(|_| "mixed Pool baseline query failed")?;
-        test_memory_mapping()?;
-        let pool_after = root_pool_allocated().map_err(|_| "mixed Pool final query failed")?;
-        debug!(
-            "capacity calibration mixed mapping Pool charge: before={}, after={}",
-            pool_before, pool_after
-        );
-        if pool_after > pool_before {
-            return Err("mixed memory mapping increased the Pool charge");
-        }
-        test_drain_minimum_budget(job, image)?;
-        Ok(())
-    })();
-
-    let mut cleanup_error = false;
-    for created in retained.iter_mut().filter_map(Option::take) {
-        if unsafe { process::abandon_to_completion(created) }.is_err() {
-            cleanup_error = true;
-        }
-    }
-    if let Err(error) = result {
-        debug!("capacity calibration mixed workload failed: {}", error);
-    }
-    if cleanup_error {
-        debug!("capacity calibration mixed cleanup failed");
-    }
-    if result.is_err() || cleanup_error {
-        return Err("mixed Bound AddressSpace workload or cleanup failed");
-    }
-    debug!(
-        "capacity calibration mixed passed: {} resident Bound AddressSpace(s), mapping and drain workload",
-        MIXED_BOUND
-    );
+    debug!("process creation funding acceptance passed");
     Ok(())
 }
 
@@ -3054,7 +2573,7 @@ fn main() {
             }
         }
     };
-    let services = match root.create_job(root_job, JOB_FULL_RIGHTS) {
+    let services = match root.create_job(root_job, root_memory_pool, JOB_FULL_RIGHTS) {
         Ok(job) => job,
         Err(error) => {
             debug!("services job create failed: {:?}", error);
@@ -3101,8 +2620,7 @@ fn submit_shutdown(root_job: Handle, reset: Handle, root: RootSupervisor) -> ! {
     }
 }
 
-/// 小集合收束辅助：对保留 control 的服务 kill → 等待收束 → Drain →
-/// close（验收线 1 的派生接管路径复用）。
+/// 小集合收束辅助：对保留 control 的服务 kill → 等 DONE → 核验终态 → close。
 fn kill_and_supervise(
     root: &mut RootSupervisor,
     _job: Handle,
@@ -3115,10 +2633,7 @@ fn kill_and_supervise(
 }
 
 fn test_memory_mapping() -> Result<(), &'static str> {
-    #[cfg(all(
-        not(feature = "acceptance-stress"),
-        not(feature = "capacity-calibration")
-    ))]
+    #[cfg(not(feature = "acceptance-stress"))]
     let pool_baseline = root_pool_allocated().map_err(|_| "memory Pool baseline query failed")?;
     let page = libkernel::shared::proc::PROCESS_PAGE_SIZE;
     let region = MappedRegion::map_anonymous(
@@ -3330,13 +2845,10 @@ fn test_memory_mapping() -> Result<(), &'static str> {
             return Err("mutable object admitted an RX view");
         }
     }
-    let no_execute_handle = duplicate(executable.handle(), Rights::MAP | Rights::READ)
+    let no_execute_handle = duplicate(executable.handle(), Rights::READ)
         .map_err(|_| "non-execute object capability derive failed")?;
-    let rx_handle = duplicate(
-        executable.handle(),
-        Rights::MAP | Rights::READ | Rights::EXECUTE,
-    )
-    .map_err(|_| "execute object capability derive failed")?;
+    let rx_handle = duplicate(executable.handle(), Rights::READ | Rights::EXECUTE)
+        .map_err(|_| "execute object capability derive failed")?;
     // SAFETY: duplicate 返回两个新 Handle，本作用域分别建立唯一 typed owner。
     let no_execute = unsafe { MemoryObject::from_handle(no_execute_handle) };
     let executable_view = unsafe { MemoryObject::from_handle(rx_handle) };
@@ -3375,10 +2887,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     executable_view.close();
     no_execute.close();
     rx.unmap().map_err(|_| "authorized RX view Unmap failed")?;
-    #[cfg(all(
-        not(feature = "acceptance-stress"),
-        not(feature = "capacity-calibration")
-    ))]
+    #[cfg(not(feature = "acceptance-stress"))]
     if root_pool_allocated().map_err(|_| "memory Pool final query failed")? != pool_baseline {
         return Err("MemoryObject backing Pool charge did not refund");
     }
@@ -3555,21 +3064,29 @@ fn run_rpc_outbox(outbox: Outbox) -> OutboxResult {
         .view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
         .expect("RPC Outbox account binding failed");
     let set = WaitSet::create(4).expect("RPC Outbox WaitSet creation failed");
-    let mut runtime = Runtime::<RpcOutboxTask, WaitSet>::new(set, 1, 1, &account)
-        .expect("RPC Outbox Runtime creation failed");
+    let mut assembly = libexecution::assembly::Assembly::new(set, &account)
+        .map_err(|(_, error)| error)
+        .expect("RPC Outbox Assembly creation failed");
+    let mut runtime =
+        Runtime::<RpcOutboxTask, WaitSet>::new(assembly.bind().unwrap(), 1, 1, &account)
+            .expect("RPC Outbox Runtime creation failed");
     runtime
         .spawn(RpcOutboxTask { outbox }, 1)
         .map_err(|failure| failure.error)
         .expect("RPC Outbox task admission failed");
     let mut world = RpcOutboxWorld::default();
-    runtime
-        .run(&mut world, 1)
+    assembly
+        .run(&mut runtime, &mut world, 1)
         .expect("RPC Outbox Runtime failed");
     let result = world.result.expect("RPC Outbox lost terminal result");
     runtime
         .close()
         .map_err(|(_, error)| error)
         .expect("RPC Outbox Runtime close failed");
+    assembly
+        .close()
+        .map_err(|(_, error)| error)
+        .expect("RPC Outbox Assembly close failed");
     assert_eq!(
         account.usage(ExecutionResource::Task).0,
         0,
@@ -3588,16 +3105,12 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     debug!("acceptance workload: {}", ACCEPTANCE_WORKLOAD);
     test_memory_mapping()?;
     #[cfg(not(feature = "acceptance-stress"))]
-    test_process_memory_binding(services)?;
-    #[cfg(feature = "capacity-calibration")]
-    test_bound_address_space_capacity(services)?;
-    #[cfg(feature = "capacity-calibration")]
-    test_bound_address_space_concurrency(services)?;
+    test_process_funding(services)?;
     let pm_domain = root
-        .create_job(services, JOB_FULL_RIGHTS)
+        .create_job(services, root_memory_pool(), JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
     let acceptance = root
-        .create_job(services, JOB_FULL_RIGHTS)
+        .create_job(services, root_memory_pool(), JOB_FULL_RIGHTS)
         .map_err(|_| "acceptance job create failed")?;
     root.verify_startup_capture()?;
     let mut names = TopologyNames::new();
@@ -3606,10 +3119,12 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     names.register_job(pm_domain, "pm_domain");
     names.register_job(acceptance, "acceptance");
     names.register_process(init_pid() as u64, "init");
+    public_ipc::shared_sender();
+    test_pool_budget();
     let launched = launch_test_services(root, services, pm_domain, acceptance, &mut names)?;
     let pm_mailbox = launched.pm_mailbox;
     let mut first_fs = launched.first_fs;
-    let registry_root_watch = launched.registry_root_watch;
+    let mut registry_root_watch = launched.registry_root_watch;
     confirm_primary_fs_ready(&first_fs)?;
     let consumer = launch_fal_consumer(
         root,
@@ -3649,7 +3164,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         "primary provider root identity missing",
     ))?;
     let (discovered, sender_identity, mailbox_identity, registry_shutdown_watch) =
-        discover_registered_fs(directory, primary_mailbox, &registry_root_watch)
+        discover_registered_fs(directory, primary_mailbox, &mut registry_root_watch)
             .map_err(RunFailure::Message)?;
     second_fs.grant = Some(discovered);
     second_fs.sender_identity = Some(sender_identity);
@@ -3842,18 +3357,6 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     .map_err(RunFailure::Message)?;
     debug!("FAL2 registration endpoint retirement probe passed");
     #[cfg(feature = "acceptance-stress")]
-    stress_fal2_admission(
-        root,
-        &first_grant,
-        first_fs
-            .registration_root
-            .as_ref()
-            .ok_or(RunFailure::Message(
-                "registration root missing during stress",
-            ))?,
-    )
-    .map_err(RunFailure::Message)?;
-    #[cfg(feature = "acceptance-stress")]
     cancel_stalled_delegate_while_provider_runs(root, first_fs.route, &first_grant)
         .map_err(RunFailure::Message)?;
     let stalled = stage_stalled_delegate(root, first_fs.route, &first_grant)?;
@@ -3886,7 +3389,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     let hammer_image = launched.hammer_image;
 
     // 运行时拓扑快照（调试参考）：此刻服务在域内运行，验收自测尚未
-    // 展开；Drv之类短寿命服务可能已 REAPABLE 待收。
+    // 展开；短寿命服务可能已自动完成退休。
     debug!("topology: runtime snapshot after service launch");
     dump_topology(root_job, &names, 0);
     let pair = create(
@@ -3897,7 +3400,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
 
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+        Rights::SIGNAL | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("notification create failed");
     let moves = [HandleMove {
@@ -3905,7 +3408,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         rights: Rights::SIGNAL,
     }];
 
-    // —— 同步消息 + Handle move + Notification/WaitMany 快路径 ——
+    // —— 同步消息 + Handle move + Notification 单来源快路径 ——
     match unsafe { send_raw(pair.peer, 114, &[5u8, 1u8, 4u8], &moves) } {
         Ok(()) => match receive(pair.owner) {
             Ok(message) => {
@@ -3919,12 +3422,15 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
                     .expect("notification slot missing")
                     .as_handle();
                 notification::signal(moved, 0x5).expect("notification signal failed");
-                let result =
-                    wait_many(&[WaitItem::new(event.owner, ObjectSignals::READABLE, 7)], 0)
-                        .expect("notification wait failed");
+                let _result = wait_until(
+                    event.owner,
+                    ObjectSignals::READABLE,
+                    libkernel::time::timeout_millis(0).unwrap(),
+                )
+                .expect("notification wait failed");
                 let bits =
                     notification::take(event.owner, u64::MAX).expect("notification take failed");
-                debug!("notification: cookie={}, bits={:#x}", result.cookie, bits);
+                debug!("notification: bits={:#x}", bits);
             }
             Err(e) => debug!("receive failed: {:?}", e),
         },
@@ -3934,6 +3440,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     let _ = unsafe { close(pair.peer) };
     let _ = unsafe { close(pair.owner) };
 
+    test_tunnel_failure_owners();
     test_tunnel_geometry();
     test_capability_badges_and_affine_owners();
     #[cfg(feature = "acceptance-stress")]
@@ -3952,44 +3459,56 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     );
 
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
-    let (tunnel, invitation) =
-        match blocking::Consumer::create(TUNNEL_BYTES, libkernel::mm::Placement::Anywhere) {
-            Ok((consumer, invitation)) => (consumer, invitation),
-            Err(blocking::CreateFailure::Tunnel(
-                libkernel::ipc::invitation::CreateFailure::System(error),
-            )) => {
-                debug!("tunnel create failed: {:?}", error);
-                return Err(RunFailure::Message("tunnel create failed"));
-            }
-            Err(blocking::CreateFailure::Tunnel(
-                libkernel::ipc::invitation::CreateFailure::Published {
-                    endpoint,
-                    cleanup,
-                    invitation,
-                    error,
-                },
-            )) => {
-                root.retain_failed_create(endpoint, cleanup, invitation);
-                debug!("tunnel create output invalid: {:?}", error);
-                return Err(RunFailure::Message("tunnel create output invalid"));
-            }
-            Err(blocking::CreateFailure::Protocol {
+    let (tunnel, invitation) = match blocking::Consumer::create(
+        root_memory_pool(),
+        TUNNEL_BYTES,
+        libkernel::mm::Placement::Anywhere,
+    ) {
+        Ok((consumer, invitation)) => (consumer, invitation),
+        Err(blocking::CreateFailure::Tunnel(
+            libkernel::ipc::invitation::CreateFailure::System(error),
+        )) => {
+            debug!("tunnel create failed: {:?}", error);
+            return Err(RunFailure::Message("tunnel create failed"));
+        }
+        Err(blocking::CreateFailure::Tunnel(
+            libkernel::ipc::invitation::CreateFailure::Published {
                 endpoint,
                 invitation,
                 error,
-            }) => {
-                root.retain_transport(endpoint, invitation);
-                debug!("tunnel protocol init failed: {:?}", error);
-                return Err(RunFailure::Message("tunnel init failed"));
-            }
-        };
+            },
+        )) => {
+            root.retain_failed_create(endpoint, invitation);
+            debug!("tunnel create output invalid: {:?}", error);
+            return Err(RunFailure::Message("tunnel create output invalid"));
+        }
+        Err(blocking::CreateFailure::Map {
+            failure,
+            invitation,
+        }) => {
+            root.retain_failed_create(Some(failure.endpoint), Some(invitation));
+            return Err(RunFailure::Message("tunnel mapping failed"));
+        }
+        Err(blocking::CreateFailure::Protocol {
+            endpoint,
+            invitation,
+            error,
+        }) => {
+            root.retain_transport(endpoint, invitation);
+            debug!("tunnel protocol init failed: {:?}", error);
+            return Err(RunFailure::Message("tunnel init failed"));
+        }
+    };
     root.start_read(tunnel, alloc::vec::Vec::new());
     debug!("tunnel created");
     // 生产侧以 typed Packet 转移 Invitation：失败完整返还 owner，
     // 不再以裸 HandleMove 表达（原失败路径承载直接丢失）。
     let mut packet =
         Packet::new(514, &[]).map_err(|_| "tunnel invitation packet allocation failed")?;
-    if let Err(failure) = packet.push(invitation.into_capability(), Rights::MAP) {
+    if let Err(failure) = packet.push(
+        invitation.into_capability(),
+        Rights::READ | Rights::WRITE | Rights::WAIT | Rights::SIGNAL | Rights::MANAGE,
+    ) {
         root.retain_capability(failure.capability);
         return Err(RunFailure::Message("tunnel invitation push failed"));
     }
@@ -4030,17 +3549,13 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     test_writable_wake(root, pm_mailbox)?;
     root.close_control(pm_mailbox)?;
 
-    // —— live kill 正路径：Building 目标的确定性 kill/drain/终态验证 ——
+    // —— live kill 正路径：Building 目标的确定性 Kill/自动退休/终态验证 ——
     test_building_kill(acceptance);
 
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image {
-        Some(image) => {
-            #[cfg(feature = "capacity-calibration")]
-            test_bound_address_space_mixed(acceptance, image)?;
-            test_job_management(root, acceptance, image.as_slice())?
-        }
+        Some(image) => test_job_management(root, acceptance, image.as_slice())?,
         None => {
             return Err(RunFailure::Message(
                 "job management acceptance image unavailable",
@@ -4079,13 +3594,13 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     debug!("acceptance domain collected");
     root.close_control(acceptance)?;
 
-    // —— 监督闭环：等待全部服务 REAPABLE/CLOSED，Drain 至 Complete，
-    // 查询稳定终态后释放 control。对象 close 回调（含 pm 隧道端点的
-    // PEER_CLOSED 发布）发生在 Drain 期间——监督先于对端终态等待。 ——
+    // —— 监督闭环：等待全部服务 DONE 后，核验终态并关闭观察权，
+    // 查询稳定终态后释放 control。pm 隧道端点在进程自动退休时关闭并
+    // 发布 PEER_CLOSED；先完成服务监督，再观察对端终态。 ——
     root.collect_services()?;
     debug!("all services supervised to completion");
 
-    // —— 事件面：对端终态位（Drain 已置位，电平等待立即返回）——
+    // —— 事件面：自动退休已发布对端终态，电平等待立即返回 ——
     let peer_closed = wait_supervision_signal(
         root.read_world()
             .tunnel
@@ -4297,19 +3812,11 @@ impl Task<ReadWorld> for StreamReadTask {
                 continue;
             }
             source = Some(event.source);
-            if event.error != 0 {
-                debug!("stream read source failed: error={}", event.error);
-                world.failed = true;
-                return Ok(Advance {
-                    work_done: 1,
-                    step: Step::Complete,
-                });
-            }
+
             match tunnel.poll(event.observed) {
-                Ok(Some(ConsumerReady::PeerAttached))
+                Ok(Some(ConsumerReady::Started))
                 | Ok(Some(ConsumerReady::Readable {
-                    peer_attached: true,
-                    ..
+                    peer_started: true, ..
                 })) => replace_source = true,
                 Ok(Some(ConsumerReady::EofDrained)) => {
                     return Ok(Advance {
@@ -4373,12 +3880,11 @@ impl Task<ReadWorld> for StreamReadTask {
             }
         }
         if replace_source {
-            let source = source.expect("PeerAttached event lost its source");
+            let source = source.expect("Started event lost its source");
             requests.remove(source)?;
             self.source = None;
         } else if let Some(source) = source {
             self.source = Some(source);
-            requests.rearm(source)?;
         }
         if self.source.is_none() {
             let plan = match tunnel.wait_plan() {
@@ -4393,7 +3899,7 @@ impl Task<ReadWorld> for StreamReadTask {
                 }
             };
             requests
-                .arm_source(plan, KIND_STREAM_READ)
+                .register(plan, KIND_STREAM_READ)
                 .map_err(|_| SystemCallError::ReachLimit)?;
         }
         Ok(Advance {
@@ -4516,10 +4022,10 @@ impl SuperviseSink for SupervisorWorld {
 }
 
 /// Building 目标的确定性 kill：Create 后未 Start，kill 冻结终因
-/// (Killed, code)，builder 关闭的 abandonment 竞争不覆盖；Drain 至
-/// Complete 后 shell 快照应稳定报 Dead/Killed/code。
+/// (Killed, code)，builder 关闭的 abandonment 竞争不覆盖；自动退休完成后
+/// shell 快照应稳定报 Dead/Killed/code。
 fn test_building_kill(job: Handle) {
-    let created = match process::create(job, SUPERVISOR_RIGHTS) {
+    let created = match process::create(job, root_memory_pool(), SUPERVISOR_RIGHTS) {
         Ok(created) => created,
         Err(error) => {
             debug!("building kill: create failed: {:?}", error);
@@ -4537,7 +4043,11 @@ fn test_building_kill(job: Handle) {
         return;
     }
     let _ = unsafe { close(created.builder) };
-    let drained = process::drain_to_completion(created.control);
+    let drained = wait_until(
+        created.control,
+        ObjectSignals::DONE,
+        libkernel::time::Deadline::INFINITE,
+    );
     let snapshot = process::query(created.control);
     match (drained, snapshot) {
         (Ok(_), Ok(snapshot))
@@ -4595,19 +4105,41 @@ fn test_derive_kill(
     match derived {
         Ok(control) => {
             let _ = unsafe { close(retained) };
-            process::kill(control).expect("derived-control kill must be accepted");
             let mut exhausted = DEFAULT_SUPERVISION_POLICY;
-            exhausted.drain_work = 1;
-            exhausted.drain_attempts = 1;
+            exhausted.query_attempts = 0;
             let failure = collect_process(SupervisionTarget::new(pid, control), exhausted)
-                .expect_err("one work unit must not complete process drain");
-            assert_eq!(failure.stage, SupervisionStage::Drain);
-            assert_eq!(failure.cause, SupervisionCause::Timeout);
-            assert_eq!(failure.progress.drain_attempts, 1);
+                .expect_err("invalid query policy must retain supervision authority");
+            assert_eq!(failure.stage, SupervisionStage::WaitDone);
+            assert_eq!(failure.cause, SupervisionCause::InvalidPolicy);
+            assert_eq!(failure.progress.query_attempts, 0);
             debug!(
-                "supervision budget exhaustion retained authority: pid={}, work={}",
-                pid, failure.progress.work_done
+                "supervision policy rejection retained authority: pid={}, queries={}",
+                pid, failure.progress.query_attempts
             );
+            let mut machine = failure.collector;
+            let mut finite = DEFAULT_SUPERVISION_POLICY;
+            finite.wait_timeout_ms = 1;
+            finite.wait_attempts = 1;
+            machine.replenish(finite);
+            let failure = libprocess::collect_remaining(machine)
+                .expect_err("live target must exhaust its finite DONE wait");
+            assert_eq!(failure.stage, SupervisionStage::WaitDone);
+            assert_eq!(failure.cause, SupervisionCause::Timeout);
+            assert_eq!(failure.progress.wait_attempts, 1);
+            assert_eq!(failure.progress.query_attempts, 0);
+            assert_eq!(
+                process::query(failure.collector.wait_control())
+                    .unwrap()
+                    .pid,
+                pid
+            );
+            debug!(
+                "supervision budget exhaustion retained authority: pid={}, waits={}, queries={}",
+                pid, failure.progress.wait_attempts, failure.progress.query_attempts
+            );
+            // 超时交回同一机器和 authority；Kill 后续作不重建完成责任。
+            process::kill(failure.collector.wait_control())
+                .expect("derived-control kill must be accepted");
             let mut machine = failure.collector;
             machine.replenish(DEFAULT_SUPERVISION_POLICY);
             let collected = root.collect_machine(machine)?;
@@ -4617,9 +4149,9 @@ fn test_derive_kill(
                 libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
             );
             debug!(
-                "pid {} supervised: work={}, state={}, cause={}, detail={}",
+                "pid {} supervised: queries={}, state={}, cause={}, detail={}",
                 pid,
-                collected.progress.work_done,
+                collected.progress.query_attempts,
                 collected.snapshot.state,
                 collected.snapshot.cause,
                 collected.snapshot.detail.word0
@@ -4657,7 +4189,7 @@ fn test_job_management(
     enumerate_convergence(job);
     #[cfg(feature = "acceptance-stress")]
     {
-        test_drain_minimum_budget(job, image)
+        test_automatic_retirement(job, image)
     }
     #[cfg(not(feature = "acceptance-stress"))]
     {
@@ -4665,27 +4197,25 @@ fn test_job_management(
     }
 }
 
-/// 含 child Handle 的 REAPABLE 进程以 `max_work=1` 收束。More 必须由
-/// libkernel 拒绝零进展；这里逐批推进至 Complete，覆盖 pending close 的
-/// 扫描/关闭分离边界。
-#[cfg(any(feature = "acceptance-stress", feature = "capacity-calibration"))]
-fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static str> {
+/// 含大量 WaitSet 成员的进程退出后，观察 DONE 核验独立退休完成。
+#[cfg(feature = "acceptance-stress")]
+fn test_automatic_retirement(job: Handle, image: &[u8]) -> Result<(), &'static str> {
     let marker = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
         Rights::SIGNAL | Rights::TRANSIT,
     )
     .map_err(|error| {
         debug!(
-            "drain minimum-budget acceptance failed: notification create {:?}",
+            "automatic retirement acceptance failed: notification create {:?}",
             error
         );
-        "drain minimum-budget notification create failed"
+        "automatic retirement notification create failed"
     })?;
     let ready = notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT)
         .map_err(|_| {
         let _ = unsafe { close(marker.owner) };
         let _ = unsafe { close(marker.peer) };
-        "drain minimum-budget ready creation failed"
+        "automatic retirement ready creation failed"
     })?;
     let grants = [
         HandleGrant {
@@ -4708,76 +4238,73 @@ fn test_drain_minimum_budget(job: Handle, image: &[u8]) -> Result<(), &'static s
             control_rights: SUPERVISOR_RIGHTS,
         })
         .map_err(|error| {
-            debug!("drain minimum-budget acceptance failed: spawn {:?}", error);
+            debug!("automatic retirement acceptance failed: spawn {:?}", error);
             let _ = unsafe { close(marker.owner) };
             let _ = unsafe { close(ready.peer) };
-            "drain minimum-budget spawn failed"
+            "automatic retirement spawn failed"
         })?;
-        wait_many(&[WaitItem::new(ready.owner, ObjectSignals::READABLE, 0)], 0).map_err(|_| {
+        wait_until(
+            ready.owner,
+            ObjectSignals::READABLE,
+            libkernel::time::timeout_millis(0).unwrap(),
+        )
+        .map_err(|_| {
             let _ = process::kill(started.control);
             let _ = unsafe { close(started.control) };
-            "drain minimum-budget target readiness failed"
+            "automatic retirement target readiness failed"
         })?;
         if let Err(error) = process::kill(started.control) {
-            debug!("drain minimum-budget acceptance failed: kill {:?}", error);
+            debug!("automatic retirement acceptance failed: kill {:?}", error);
             let _ = unsafe { close(started.control) };
-            return Err("drain minimum-budget kill failed");
+            return Err("automatic retirement kill failed");
         }
-        if let Err(error) = wait_many(
-            &[WaitItem::new(
-                started.control,
-                ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-                0,
-            )],
-            0,
+        if let Err(error) = wait_until(
+            started.control,
+            ObjectSignals::DONE,
+            libkernel::time::timeout_millis(0).unwrap(),
         ) {
-            debug!("drain minimum-budget acceptance failed: wait {:?}", error);
+            debug!("automatic retirement acceptance failed: wait {:?}", error);
             let _ = unsafe { close(started.control) };
-            return Err("drain minimum-budget wait failed");
+            return Err("automatic retirement wait failed");
         }
-        let mut batches = 0usize;
-        let drained = loop {
-            batches += 1;
-            if batches > 16_384 {
-                break Err(SystemCallError::InternalError);
-            }
-            match process::drain(started.control, 1) {
-                Ok(result) if result.work_done > 1 => break Err(SystemCallError::InternalError),
-                Ok(result) if result.status == ProcessDrainStatus::Complete as u32 => break Ok(()),
-                Ok(result) if result.work_done == 1 => continue,
-                Ok(_) => break Err(SystemCallError::InternalError),
-                Err(error) => break Err(error),
-            }
-        };
-        debug!(
-            "drain minimum-budget acceptance {}: {} batches, retired WaitSet with 256 registrations",
-            if drained.is_ok() { "passed" } else { "failed" },
-            batches
-        );
-        let _ = unsafe { close(started.control) };
-        drained.map_err(|_| "drain minimum-budget did not complete")
+        let snapshot =
+            process::query(started.control).map_err(|_| "automatic retirement snapshot failed")?;
+        let passed = snapshot.state == ProcessState::Dead as u32
+            && snapshot.cause == TerminationCause::Killed as u32;
+        // SAFETY: 当前函数持有唯一父方观察表项；DONE 已确认内核独立收束。
+        unsafe { close(started.control) }
+            .map_err(|_| "automatic retirement control close failed")?;
+        if !passed {
+            return Err("automatic retirement terminal snapshot incorrect");
+        }
+        debug!("automatic retirement acceptance passed: retired WaitSet with 256 registrations");
+        Ok(())
     })();
     let _ = unsafe { close(ready.owner) };
     let _ = unsafe { close(marker.peer) };
     result
 }
 
-/// 验收线 2：封口与完成传播——空 child Job seal 后 CLOSED 电平可等待、
+/// 验收线 2：封口与异步完成传播——空 child Job seal 后等待 CLOSED、
 /// 快照转 Dead；重复 seal 幂管；完成后从 root 子表移除（枚举收敛）。
 fn test_job_seal_completion(job: Handle) {
-    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
+    let Ok(child) = process::create_job(job, root_memory_pool(), JOB_FULL_RIGHTS) else {
         debug!("job seal completion FAILED: job create failed");
         return;
     };
     let sealed = process::seal_job(child);
-    let waited = wait_many(&[WaitItem::new(child, ObjectSignals::CLOSED, 0)], 0);
+    let waited = wait_until(
+        child,
+        ObjectSignals::CLOSED,
+        libkernel::time::timeout_millis(5_000).unwrap(),
+    );
     let snapshot = process::query_job(child);
     // 幂管：Dead 上重复 seal 成功且不改变状态。
     let resealed = process::seal_job(child);
     let resnapshot = process::query_job(child);
     let children = enumerate_members(job, JobMemberKind::ChildJobs);
     let passed = sealed.is_ok()
-        && waited.is_ok()
+        && matches!(waited, Ok(result) if result.observed.intersects(ObjectSignals::CLOSED))
         && matches!(&snapshot, Ok(s) if s.state == JobState::Dead as u32)
         && resealed.is_ok()
         && matches!(&resnapshot, Ok(s) if s.state == JobState::Dead as u32)
@@ -4798,24 +4325,14 @@ fn test_job_seal_completion(job: Handle) {
     let _ = unsafe { close(child) };
 }
 
-/// 验收线 3：派生兑底——control 全消散的 REAPABLE 进程经枚举+派生接管，
-/// drain 至 Complete。铸造的新 shell 必须重放 REAPABLE，否则 drain
-/// 入口直接拒绝——本场景即验证该重放。
+/// Control 全消散不取消仍由 Builder 持有的组装；Job 枚举和派生接管终止。
 fn test_derive_fallback(job: Handle) {
-    let Ok(created) = process::create(job, SUPERVISOR_RIGHTS) else {
+    let Ok(created) = process::create(job, root_memory_pool(), SUPERVISOR_RIGHTS) else {
         debug!("derive fallback FAILED: create failed");
         return;
     };
     let pid = created.pid;
-    if let Err(error) = process::kill(created.control) {
-        debug!("derive fallback FAILED: kill {:?}", error);
-        let _ = unsafe { close(created.builder) };
-        let _ = unsafe { close(created.control) };
-        return;
-    }
-    // 终因已冻结为 Killed；builder 关闭的 abandonment 竞争不覆盖。
-    let _ = unsafe { close(created.builder) };
-    // control 消散：无人收束，只能靠枚举+派生接管。
+    // SAFETY: 原 Control 在本函数独占，Builder 仍稳定持有组装责任。
     let _ = unsafe { close(created.control) };
     let members = enumerate_members(job, JobMemberKind::MemberProcesses);
     let visible = matches!(&members, Ok(list) if list.contains(&pid));
@@ -4827,7 +4344,14 @@ fn test_derive_fallback(job: Handle) {
     );
     match minted {
         Ok(control) => {
-            let drained = process::drain_to_completion(control);
+            process::kill(control).expect("derived Control failed to stop Building target");
+            // SAFETY: 冻结后退还唯一 Builder，自动退休不依赖其继续调用。
+            let _ = unsafe { close(created.builder) };
+            let drained = wait_until(
+                control,
+                ObjectSignals::DONE,
+                libkernel::time::Deadline::INFINITE,
+            );
             let snapshot = process::query(control);
             match (drained, snapshot) {
                 (Ok(_), Ok(snapshot))
@@ -4837,18 +4361,20 @@ fn test_derive_fallback(job: Handle) {
                             == libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL =>
                 {
                     debug!(
-                        "derive fallback passed: pid {} minted control drained to Dead/Killed/{:#x}",
+                        "derive fallback passed: pid {} minted control completed at Dead/Killed/{:#x}",
                         pid, snapshot.detail.word0
                     );
                 }
                 (drained, snapshot) => debug!(
-                    "derive fallback FAILED: visible={} drain={:?} snapshot={:?}",
+                    "derive fallback FAILED: visible={} completion={:?} snapshot={:?}",
                     visible, drained, snapshot
                 ),
             }
             let _ = unsafe { close(control) };
         }
         Err(error) => {
+            // SAFETY: 派生失败仍须放弃本函数拥有的 Builder。
+            let _ = unsafe { close(created.builder) };
             debug!(
                 "derive fallback FAILED: visible={} derive={:?}",
                 visible, error
@@ -4859,14 +4385,14 @@ fn test_derive_fallback(job: Handle) {
 
 /// 递归 JobKill 组合：child Job 内一个 Running 成员（Waiting 取消路径）
 /// 以及一个 Building 成员，两者 control 均消散——libprocess::job_kill 一把
-/// 收束（seal → 枚举 → 派生 kill → drain → 等 CLOSED 全链，派生走铸造
+/// 收束（seal → 枚举 → 派生 kill → 等 DONE → 等 CLOSED 全链，派生走铸造
 /// 路径）。
 fn test_job_kill_composition(
     root: &mut RootSupervisor,
     job: Handle,
     image: &[u8],
 ) -> Result<(), &'static str> {
-    let Ok(child) = root.create_job(job, JOB_FULL_RIGHTS) else {
+    let Ok(child) = root.create_job(job, root_memory_pool(), JOB_FULL_RIGHTS) else {
         debug!("job kill composition FAILED: job create failed");
         return Err("job kill composition job create failed");
     };
@@ -4879,7 +4405,7 @@ fn test_job_kill_composition(
         grants: &[],
         control_rights: SUPERVISOR_RIGHTS,
     });
-    let building = process::create(child, SUPERVISOR_RIGHTS);
+    let building = process::create(child, root_memory_pool(), SUPERVISOR_RIGHTS);
     match (running, building) {
         (Ok(running), Ok(building)) => {
             let running_pid = running.pid;
@@ -4925,12 +4451,12 @@ fn test_job_kill_composition(
 /// ObjectClosed（链锁内上行检查，两种线性化顺序的另一侧）；随后
 /// kill/drain 收束，Job 因 sealed+空完成并发布 CLOSED。
 fn seal_before_start(job: Handle) {
-    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
+    let Ok(child) = process::create_job(job, root_memory_pool(), JOB_FULL_RIGHTS) else {
         debug!("seal gate (start) FAILED: job create failed");
         return;
     };
     // 手工构建可启动的 Building：入口页（自旋）+ 栈顶页（失败自清理）。
-    let Ok(created) = build_spin_building(child) else {
+    let Ok(created) = build_spin_building(child, SUPERVISOR_RIGHTS) else {
         debug!("seal gate (start) FAILED: building");
         let _ = unsafe { close(child) };
         return;
@@ -4940,10 +4466,18 @@ fn seal_before_start(job: Handle) {
     let gated = matches!(started, Err(SystemCallError::ObjectClosed));
     // 收束：kill → drain → sealed+空完成 → CLOSED。
     let _ = process::kill(created.control);
-    let _ = process::drain_to_completion(created.control);
+    let _ = wait_until(
+        created.control,
+        ObjectSignals::DONE,
+        libkernel::time::Deadline::INFINITE,
+    );
     let _ = unsafe { close(created.control) };
     let _ = unsafe { close(created.builder) };
-    let waited = wait_many(&[WaitItem::new(child, ObjectSignals::CLOSED, 0)], 0);
+    let waited = wait_until(
+        child,
+        ObjectSignals::CLOSED,
+        libkernel::time::timeout_millis(0).unwrap(),
+    );
     let snapshot = process::query_job(child);
     let passed = sealed.is_ok()
         && gated
@@ -4961,14 +4495,18 @@ fn seal_before_start(job: Handle) {
 /// seal 先于 Create：封口后成员/子 Job 创建口永久关闭（ObjectClosed）；
 /// 空封口立即完成并发布 CLOSED。
 fn seal_before_create(job: Handle) {
-    let Ok(child) = process::create_job(job, JOB_FULL_RIGHTS) else {
+    let Ok(child) = process::create_job(job, root_memory_pool(), JOB_FULL_RIGHTS) else {
         debug!("seal gate (create) FAILED: job create failed");
         return;
     };
     let sealed = process::seal_job(child);
-    let waited = wait_many(&[WaitItem::new(child, ObjectSignals::CLOSED, 0)], 0);
-    let member = process::create(child, SUPERVISOR_RIGHTS);
-    let subjob = process::create_job(child, JOB_FULL_RIGHTS);
+    let waited = wait_until(
+        child,
+        ObjectSignals::CLOSED,
+        libkernel::time::timeout_millis(0).unwrap(),
+    );
+    let member = process::create(child, root_memory_pool(), SUPERVISOR_RIGHTS);
+    let subjob = process::create_job(child, root_memory_pool(), JOB_FULL_RIGHTS);
     let passed = sealed.is_ok()
         && waited.is_ok()
         && matches!(member, Err(SystemCallError::ObjectClosed))
@@ -4991,7 +4529,7 @@ fn enumerate_convergence(job: Handle) {
     let mut ok = true;
     let mut previous = 0u64;
     for round in 0..4u64 {
-        let Ok(created) = process::create(job, SUPERVISOR_RIGHTS) else {
+        let Ok(created) = process::create(job, root_memory_pool(), SUPERVISOR_RIGHTS) else {
             ok = false;
             debug!(
                 "enumerate convergence FAILED: create failed at round {}",
@@ -5015,7 +4553,11 @@ fn enumerate_convergence(job: Handle) {
             continue;
         }
         let _ = unsafe { close(created.builder) };
-        if let Err(error) = process::drain_to_completion(created.control) {
+        if let Err(error) = wait_until(
+            created.control,
+            ObjectSignals::DONE,
+            libkernel::time::Deadline::INFINITE,
+        ) {
             ok = false;
             debug!("enumerate convergence FAILED: drain {:?}", error);
         }
@@ -5092,7 +4634,10 @@ fn test_capability_badges_and_affine_owners() {
         assert_eq!(message.header.sender_pid, init_pid() as u64);
         assert_eq!(message.header.sender_badge, badge);
     }
-    let once = make_send_once(badged, Rights::WRITE).expect("badged send-once mint failed");
+    let once_pair = make_send_once(badged, Rights::WRITE).expect("badged send-once mint failed");
+    let once = once_pair.owner;
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+    unsafe { libkernel::ipc::object::close(once_pair.peer) }.expect("reply observer close failed");
     unsafe { send_raw(once, 887, &[], &[]) }.expect("badged send-once send failed");
     let message = receive(mailbox.owner).expect("badged send-once receive failed");
     assert_eq!(message.header.sender_badge, BADGE);
@@ -5182,12 +4727,15 @@ fn test_wait_set_retirement() {
     let mut tokens = alloc::vec::Vec::new();
     for cookie in 0..64 {
         tokens.push(
-            set.register(WaitItem::new(event.owner, ObjectSignals::READABLE, cookie))
-                .expect("WaitSet retirement registration failed"),
+            set.register(MemberRequest::new(
+                event.owner,
+                ObjectSignals::READABLE,
+                cookie,
+            ))
+            .expect("WaitSet retirement registration failed"),
         );
     }
     set.remove(tokens[0]).expect("WaitSet removal failed");
-    assert_eq!(set.rearm(tokens[0]), Err(SystemCallError::ObjectNotFound));
     assert_eq!(set.remove(tokens[0]), Err(SystemCallError::ObjectNotFound));
     notification::signal(event.peer, 1).expect("WaitSet notification signal failed");
     set.wait(Deadline::INFINITE)
@@ -5200,51 +4748,69 @@ fn test_wait_set_retirement() {
     unsafe { close(event.peer) }.expect("WaitSet source signaler close failed");
 
     let event = notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
-        .expect("WaitSet rearm notification create failed");
-    let set = WaitSet::create(1).expect("WaitSet rearm create failed");
+        .expect("persistent WaitSet source create failed");
+    let set = WaitSet::create(1).expect("persistent WaitSet create failed");
     let token = set
-        .register(WaitItem::new(event.owner, ObjectSignals::READABLE, 4))
-        .expect("WaitSet rearm registration failed");
-    let mut generation = 0;
+        .register(MemberRequest::new(event.owner, ObjectSignals::READABLE, 4))
+        .unwrap();
     for _ in 0..16 {
-        notification::signal(event.peer, 1).expect("WaitSet rearm signal failed");
-        set.wait(Deadline::INFINITE)
-            .expect("WaitSet rearm wait failed");
-        let records = set.receive(1).expect("WaitSet rearm receive failed");
-        assert_eq!(records[0].token, token);
-        assert!(records[0].arm_generation > generation);
-        notification::take(event.owner, 1).expect("WaitSet rearm source reset failed");
-        let next = set.rearm(token).expect("WaitSet next arm failed");
-        assert!(next > records[0].arm_generation);
-        assert_eq!(set.receive(1), Err(SystemCallError::ObjectNotAvailable));
-        generation = records[0].arm_generation;
+        notification::signal(event.peer, 1).unwrap();
+        set.wait(Deadline::INFINITE).unwrap();
+        let records = set.receive(1).unwrap();
+        assert_eq!((records[0].token, records[0].cookie), (token, 4));
+        // 未消费来源时持续返回同一电平；消费后旧提示必须重查并淘汰。
+        assert_eq!(set.receive(1).unwrap()[0].token, token);
+        notification::take(event.owner, 1).unwrap();
+        assert!(set.receive(1).unwrap().is_empty());
     }
-    set.close()
-        .unwrap_or_else(|(_, error)| panic!("rearmed WaitSet close failed: {error:?}"));
-    unsafe { close(event.owner) }.expect("WaitSet rearm owner close failed");
-    unsafe { close(event.peer) }.expect("WaitSet rearm signaler close failed");
+    set.remove(token).unwrap();
+    let replacement = set
+        .register(MemberRequest::new(event.owner, ObjectSignals::READABLE, 5))
+        .unwrap();
+    assert_ne!(replacement, token);
+    notification::signal(event.peer, 1).unwrap();
+    set.wait(Deadline::INFINITE).unwrap();
+    assert_eq!(set.receive(1).unwrap()[0].token, replacement);
+    drop(set);
+    // SAFETY: 本地集合 owner 已提交退休，两个剩余来源表项均属于本函数。
+    unsafe { close(event.owner) }.unwrap();
+    unsafe { close(event.peer) }.unwrap();
 
-    let set = WaitSet::create(4).expect("self-observing WaitSet create failed");
-    set.register(WaitItem::new(set.handle(), ObjectSignals::READABLE, 1))
-        .expect("WaitSet self-observation failed");
-    set.close()
-        .unwrap_or_else(|(_, error)| panic!("self-observing WaitSet close failed: {error:?}"));
-
-    let first = WaitSet::create(4).expect("cross-observing first WaitSet create failed");
-    let second = WaitSet::create(4).expect("cross-observing second WaitSet create failed");
-    first
-        .register(WaitItem::new(second.handle(), ObjectSignals::READABLE, 2))
-        .expect("first WaitSet cross-observation failed");
-    second
-        .register(WaitItem::new(first.handle(), ObjectSignals::READABLE, 3))
-        .expect("second WaitSet cross-observation failed");
+    let first = WaitSet::create(4).unwrap();
+    let second = WaitSet::create(4).unwrap();
+    assert_eq!(
+        first.register(MemberRequest::new(
+            first.handle(),
+            ObjectSignals::READABLE,
+            1
+        )),
+        Err(SystemCallError::WrongObjectType)
+    );
+    assert_eq!(
+        first.register(MemberRequest::new(
+            second.handle(),
+            ObjectSignals::READABLE,
+            2
+        )),
+        Err(SystemCallError::WrongObjectType)
+    );
+    assert_eq!(
+        second.register(MemberRequest::new(
+            first.handle(),
+            ObjectSignals::READABLE,
+            3
+        )),
+        Err(SystemCallError::WrongObjectType)
+    );
     first
         .close()
-        .unwrap_or_else(|(_, error)| panic!("first cross-observing close failed: {error:?}"));
+        .unwrap_or_else(|(_, error)| panic!("first flat WaitSet close failed: {error:?}"));
     second
         .close()
-        .unwrap_or_else(|(_, error)| panic!("second cross-observing close failed: {error:?}"));
-    debug!("WaitSet nonempty, self and cross retirement passed");
+        .unwrap_or_else(|(_, error)| panic!("second flat WaitSet close failed: {error:?}"));
+    debug!(
+        "WaitSet persistent levels, stale removal, nonempty retirement and nested rejection passed"
+    );
 }
 
 /// 一次性投递权：本地、转移、失败保留与原 sender 独立性。
@@ -5254,16 +4820,25 @@ fn test_send_once() {
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once mailbox create failed");
-    let once = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+    let once_pair = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("make send once failed");
+    let once = once_pair.owner;
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+    unsafe { libkernel::ipc::object::close(once_pair.peer) }.expect("reply observer close failed");
     unsafe { send_raw(once, 900, &[1], &[]) }.expect("send once failed");
     assert!(matches!(
         unsafe { send_raw(once, 901, &[], &[]) },
         Err(SystemCallError::StaleHandle)
     ));
 
-    let once = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+    let once_pair = make_send_once(mailbox.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("transferred send-once mint failed");
+
+    let once = once_pair.owner;
+
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+
+    unsafe { libkernel::ipc::object::close(once_pair.peer) }.expect("reply observer close failed");
     let moves = [HandleMove {
         handle: once,
         rights: Rights::WRITE,
@@ -5297,8 +4872,11 @@ fn test_send_once() {
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once full mailbox create failed");
-    let once = make_send_once(full.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+    let once_pair = make_send_once(full.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("send-once full mint failed");
+    let once = once_pair.owner;
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+    unsafe { libkernel::ipc::object::close(once_pair.peer) }.expect("reply observer close failed");
     for _ in 0..MAILBOX_CAPACITY {
         unsafe { send_raw(full.peer, 0, &[], &[]) }.expect("send-once full fill failed");
     }
@@ -5325,8 +4903,11 @@ fn test_send_once() {
         Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
     )
     .expect("send-once both mailbox create failed");
-    let once = make_send_once(both.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+    let once_pair = make_send_once(both.peer, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
         .expect("send-once both mint failed");
+    let once = once_pair.owner;
+    // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+    unsafe { libkernel::ipc::object::close(once_pair.peer) }.expect("reply observer close failed");
     assert!(matches!(
         make_send_once(once, Rights::WRITE),
         Err(SystemCallError::RightsDenied)
@@ -5360,9 +4941,10 @@ fn test_writable_level() {
         Rights::WRITE | Rights::WAIT,
     )
     .expect("writable mailbox create failed");
-    let result = wait_many(
-        &[WaitItem::new(mailbox.peer, ObjectSignals::WRITABLE, 1)],
-        0,
+    let result = wait_until(
+        mailbox.peer,
+        ObjectSignals::WRITABLE,
+        libkernel::time::timeout_millis(0).unwrap(),
     )
     .expect("empty mailbox must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
@@ -5371,9 +4953,10 @@ fn test_writable_level() {
         unsafe { send_raw(mailbox.peer, 0, &[], &[]) }.expect("writable fill failed");
     }
     discard(mailbox.owner).expect("writable make-room failed");
-    let result = wait_many(
-        &[WaitItem::new(mailbox.peer, ObjectSignals::WRITABLE, 2)],
-        0,
+    let result = wait_until(
+        mailbox.peer,
+        ObjectSignals::WRITABLE,
+        libkernel::time::timeout_millis(0).unwrap(),
     )
     .expect("mailbox below capacity must be writable");
     assert!(result.observed.intersects(ObjectSignals::WRITABLE));
@@ -5430,11 +5013,8 @@ fn test_writable_wake(root: &mut RootSupervisor, pm_mailbox: Handle) -> Result<(
 
     // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
     let deadline = libkernel::time::timeout_millis(5_000).map_err(|_| "wake deadline failed")?;
-    let done_wait = libkernel::ipc::wait::wait_until(
-        &[WaitItem::new(done.owner, ObjectSignals::READABLE, 0)],
-        deadline,
-    )
-    .map_err(|_| "wake notification wait failed")?;
+    let done_wait = libkernel::ipc::wait::wait_until(done.owner, ObjectSignals::READABLE, deadline)
+        .map_err(|_| "wake notification wait failed")?;
     if WaitReason::from_u32(done_wait.reason) == Some(WaitReason::Timeout) {
         return Err("pm writable wake confirmation timed out");
     }
@@ -5444,11 +5024,8 @@ fn test_writable_wake(root: &mut RootSupervisor, pm_mailbox: Handle) -> Result<(
     // 队列：15 × FILL + TAIL。逐条校验，末尾必然是被唤醒后补发的 TAIL。
     for index in 0..MAILBOX_CAPACITY {
         let ready = libkernel::ipc::wait::wait_until(
-            &[WaitItem::new(
-                target.owner,
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                0,
-            )],
+            target.owner,
+            ObjectSignals::READABLE | ObjectSignals::CLOSED,
             deadline,
         )
         .map_err(|_| "writable tail wait failed")?;
@@ -5559,13 +5136,334 @@ fn stress_control_plane() {
     );
 }
 
+/// 双维预算源自父账户；关闭外部授权不丢失子树与已付存储的退款责任。
+fn test_pool_budget() {
+    use erhino_shared::memory_pool::MemoryPoolBudget;
+    use libkernel::memory_pool::MemoryPool;
+    let rights = Rights::CREATE | Rights::READ | Rights::DUPLICATE;
+    let root = duplicate(root_memory_pool(), rights).unwrap();
+    // SAFETY: duplicate 返回一份唯一 raw owner，交 typed 管理。
+    let funding = unsafe { MemoryPool::from_handle(root) };
+    let supply = funding.query().unwrap();
+    // 测试域独立记账；调用者表增长等合法成本不属于本域，不以全局 Root 当退款基线。
+    let root = funding
+        .derive(
+            MemoryPoolBudget {
+                pages: 1,
+                metadata: supply.metadata.available / 4,
+            },
+            rights,
+        )
+        .unwrap();
+    let before = root.query().unwrap();
+    assert!(matches!(
+        root.derive(MemoryPoolBudget::default(), rights),
+        Err(SystemCallError::IllegalArgument)
+    ));
+    let pages = root
+        .derive(
+            MemoryPoolBudget {
+                pages: 1,
+                metadata: 0,
+            },
+            rights,
+        )
+        .unwrap();
+    let snapshot = pages.query().unwrap();
+    assert!(matches!(
+        pages.derive(
+            MemoryPoolBudget {
+                pages: 1,
+                metadata: 1
+            },
+            rights
+        ),
+        Err(SystemCallError::QuotaExceeded)
+    ));
+    assert_eq!(
+        pages.query().unwrap(),
+        snapshot,
+        "failed second dimension retained page reservation"
+    );
+    // 非空对象必须支付出生存储；页供给充足也不能隐式借用调用者 metadata。
+    let page_owner = pages.into_handle();
+    assert!(matches!(
+        libkernel::ipc::invitation::Invitation::create(page_owner, 4096),
+        Err(libkernel::ipc::invitation::CreateFailure::System(
+            SystemCallError::QuotaExceeded
+        ))
+    ));
+    // SAFETY: Create 只接受 Pool 授权，不消费该表项；raw 使用已结束，恢复唯一 owner。
+    let pages = unsafe { MemoryPool::from_handle(page_owner) };
+    assert_eq!(
+        pages.query().unwrap(),
+        snapshot,
+        "metadata-denied birth retained page or metadata credit"
+    );
+    pages.close();
+    assert_eq!(
+        root.query().unwrap(),
+        before,
+        "page-only Pool retained parent metadata charge"
+    );
+    // 额度从实际供给取一部分，只检查守恒，不复制内核结构大小或旧对象个数限额。
+    let budget = before.metadata.available / 4;
+    assert!(budget > 0);
+    let child = root
+        .derive(
+            MemoryPoolBudget {
+                pages: 0,
+                metadata: budget,
+            },
+            rights,
+        )
+        .unwrap();
+    let child_snapshot = child.query().unwrap();
+    assert_eq!(child_snapshot.total, 0);
+    assert_eq!(child_snapshot.metadata.available, budget);
+    let grand = child
+        .derive(
+            MemoryPoolBudget {
+                pages: 0,
+                metadata: 1,
+            },
+            rights,
+        )
+        .unwrap();
+    assert!(
+        child.query().unwrap().metadata.allocated > 0,
+        "grandchild stored no parent-paid metadata"
+    );
+    child.close();
+    assert_eq!(
+        root.query().unwrap().metadata.delegated,
+        before.metadata.delegated + budget
+    );
+    assert_eq!(
+        grand.query().unwrap().metadata.available,
+        1,
+        "parent Handle close revoked child budget"
+    );
+    grand.close();
+    assert_eq!(
+        root.query().unwrap(),
+        before,
+        "Pool tree lost page or metadata credit"
+    );
+    // 最大资金父链通过真实 API 释放；不复制内核 header 的私有布局。
+    let payer = root
+        .derive(
+            MemoryPoolBudget {
+                pages: 1,
+                metadata: budget,
+            },
+            rights,
+        )
+        .unwrap();
+    let baseline = payer.query().unwrap();
+    let mut last: Option<MemoryPool> = None;
+    for _ in baseline.depth..erhino_shared::memory_pool::MEMORY_POOL_MAX_DEPTH {
+        let parent = last.as_ref().unwrap_or(&payer);
+        let snapshot = parent.query().unwrap();
+        let mut metadata = snapshot.metadata.available;
+        let child = loop {
+            match parent.derive(MemoryPoolBudget { pages: 1, metadata }, rights) {
+                Ok(child) => break child,
+                Err(SystemCallError::QuotaExceeded) => {
+                    assert_eq!(
+                        parent.query().unwrap(),
+                        snapshot,
+                        "rejected Pool birth retained credit"
+                    );
+                    metadata = metadata
+                        .checked_sub(1)
+                        .expect("Pool birth could not reserve storage");
+                }
+                Err(error) => panic!("maximum Pool chain preparation failed: {error:?}"),
+            }
+        };
+        if let Some(old) = last.replace(child) {
+            old.close();
+        }
+    }
+    let leaf = last.unwrap();
+    assert_eq!(
+        leaf.query().unwrap().depth,
+        erhino_shared::memory_pool::MEMORY_POOL_MAX_DEPTH
+    );
+    let depth_before = leaf.query().unwrap();
+    assert!(matches!(
+        leaf.derive(
+            MemoryPoolBudget {
+                pages: 0,
+                metadata: 1
+            },
+            rights
+        ),
+        Err(SystemCallError::ReachLimit)
+    ));
+    assert_eq!(leaf.query().unwrap(), depth_before);
+    let raw = leaf.into_handle();
+    let (endpoint, invitation, _) =
+        libkernel::ipc::invitation::Invitation::create(raw, 4096).unwrap();
+    // 普通 View 是独立的真实 use；两端和Pool cap都先关，再由Unmap最后解脱。
+    let mapping = libkernel::mm::MappedRegion::map_endpoint(
+        &endpoint,
+        4096,
+        libkernel::shared::mem::MemoryProtection::ReadWrite,
+        libkernel::mm::Placement::Anywhere,
+    )
+    .unwrap();
+    // SAFETY: Create 未消费 Pool 表项，raw 调用结束后恢复唯一 owner。
+    let leaf = unsafe { MemoryPool::from_handle(raw) };
+    leaf.close();
+    invitation.close().unwrap();
+    endpoint.close().unwrap();
+    assert_ne!(
+        payer.query().unwrap(),
+        baseline,
+        "live View lost its funding chain before retirement"
+    );
+    mapping.unmap().unwrap();
+    // 真实 Backing 退休记录是最后 payer，最终父链在 M 段解脱。
+    let deadline = libkernel::time::timeout_millis(5_000).unwrap();
+    while payer.query().unwrap() != baseline {
+        assert!(
+            !libkernel::time::expired(deadline).unwrap(),
+            "maximum Pool chain retained credit after Close"
+        );
+        libkernel::time::sleep_until(libkernel::time::timeout_millis(1).unwrap()).unwrap();
+    }
+    payer.close();
+    debug!(
+        "Pool metadata budget checks passed: dual rollback, no implicit quota, parent close, complete refund, maximum chain"
+    );
+}
+
+/// 真实失败保存 owner；最后事件授权关闭不撤销已接受的普通 View。
+fn test_tunnel_failure_owners() {
+    use libkernel::{
+        ipc::invitation::{CreateFailure, Invitation},
+        memory_pool::MemoryPool,
+        mm::{MappedRegion, Placement},
+        shared::mem::MemoryProtection,
+    };
+    let parent = duplicate(
+        root_memory_pool(),
+        Rights::CREATE | Rights::READ | Rights::DUPLICATE,
+    )
+    .unwrap();
+    // SAFETY: duplicate 新建唯一 raw owner，交给 typed Pool 管理。
+    let parent = unsafe { MemoryPool::from_handle(parent) };
+    // 子域承担 Tunnel 存储；其余供给留给调用者域的 View/操作增长，不复制内核布局成本。
+    let metadata = parent.query().unwrap().metadata.available / 2;
+    let child = parent
+        .derive(
+            erhino_shared::memory_pool::MemoryPoolBudget { pages: 4, metadata },
+            Rights::CREATE | Rights::READ | Rights::DUPLICATE,
+        )
+        .unwrap()
+        .into_handle();
+    let observation = duplicate(child, Rights::READ).unwrap();
+    // SAFETY: 独立只读查询 owner；付款授权 child 由本函数在末尾关闭。
+    let pool = unsafe { MemoryPool::from_handle(observation) };
+    assert!(matches!(
+        Invitation::create(child, 0),
+        Err(CreateFailure::System(SystemCallError::IllegalArgument))
+    ));
+    assert!(matches!(
+        Invitation::create(child, 5 * 4096),
+        Err(CreateFailure::System(SystemCallError::QuotaExceeded))
+    ));
+    assert_eq!(
+        pool.query().unwrap().allocated,
+        0,
+        "failed Tunnel retained page charge"
+    );
+    let (endpoint, invitation, bytes) = Invitation::create(child, 4096).unwrap();
+    let occupied = MappedRegion::map_anonymous(
+        bytes,
+        0,
+        0,
+        MemoryProtection::ReadWrite,
+        Placement::Anywhere,
+    )
+    .unwrap();
+    let address = occupied.usable().unwrap().start;
+    let failure = librunnel::MappedEndpoint::map(
+        endpoint,
+        bytes,
+        Placement::FixedEmpty {
+            usable_start: address,
+        },
+    )
+    .expect_err("Tunnel Map replaced an occupied range");
+    assert_eq!(failure.error, SystemCallError::AddressConflict);
+    occupied.unmap().unwrap();
+    let endpoint = failure.endpoint;
+    let mapping = MappedRegion::map_endpoint(
+        &endpoint,
+        bytes,
+        MemoryProtection::ReadWrite,
+        Placement::FixedEmpty {
+            usable_start: address,
+        },
+    )
+    .unwrap();
+    {
+        // SAFETY: 唯一 MappedRegion 持有已发布的 RW 页；本作用域不解除映射。
+        let memory = unsafe { libkernel::shared_memory::SharedMemory::new(address, bytes) };
+        memory.store_u64(0, 0x5120_fade, core::sync::atomic::Ordering::Release);
+    }
+    endpoint.close().unwrap();
+    let failure = invitation
+        .attach()
+        .expect_err("Attach accepted a closed creator");
+    assert_eq!(failure.error, SystemCallError::ObjectClosed);
+    failure.invitation.close().unwrap();
+    assert_eq!(
+        pool.query().unwrap().allocated,
+        1,
+        "Endpoint Close revoked a live View"
+    );
+    {
+        // SAFETY: 两端授权已关，但 mapping 独立持 use；它在本次访问后才消费。
+        let memory = unsafe { libkernel::shared_memory::SharedMemory::new(address, bytes) };
+        assert_eq!(
+            memory.load_u64(0, core::sync::atomic::Ordering::Acquire),
+            0x5120_fade
+        );
+    }
+    mapping.unmap().unwrap();
+    let deadline = libkernel::time::timeout_millis(5_000).unwrap();
+    // root 放弃由出生记录自主推进；页退款须同时越过 root 与 View 两份退休责任。
+    while {
+        let snapshot = pool.query().unwrap();
+        snapshot.allocated != 0 || snapshot.metadata.allocated != 0
+    } {
+        assert!(
+            !libkernel::time::expired(deadline).unwrap(),
+            "Tunnel View retirement did not refund"
+        );
+        libkernel::time::sleep_until(libkernel::time::timeout_millis(1).unwrap()).unwrap();
+    }
+    unsafe { close(child) }.unwrap();
+    pool.close();
+    debug!(
+        "Tunnel failure owner checks passed: quota rollback, Map conflict, Attach rejection, independent View refund"
+    );
+}
+
 /// 实际 Running 调用链验证取整、双端不同 VA、完整共享范围与关闭后存活端。
 fn test_tunnel_geometry() {
     use core::sync::atomic::Ordering;
     use libkernel::mm::Placement;
-    for bytes in [1, 4096, 4097, 8192, 12288, 512 * 4096] {
-        let (creator, invitation) =
-            tunnel_sys::create(bytes, Placement::Anywhere).expect("Tunnel geometry Create failed");
+    for bytes in [1usize, 4096, 4097, 8192, 12288, 512 * 4096] {
+        let (endpoint, invitation, mapped_bytes) =
+            libkernel::ipc::invitation::Invitation::create(root_memory_pool(), bytes)
+                .expect("Tunnel geometry Create failed");
+        let creator = librunnel::MappedEndpoint::map(endpoint, mapped_bytes, Placement::Anywhere)
+            .expect("Tunnel geometry Map failed");
         let geometry = creator.geometry();
         assert_eq!(geometry.bytes(), bytes.div_ceil(4096) * 4096);
         for page in 0..geometry.bytes() / 4096 {
@@ -5573,8 +5471,9 @@ fn test_tunnel_geometry() {
                 .memory()
                 .store_u64(page * 4096, page as u64 + 1, Ordering::Release);
         }
-        let peer = unsafe { tunnel_sys::attach(invitation, Placement::Anywhere) }
-            .expect("Tunnel geometry Attach failed");
+        let endpoint = invitation.attach().expect("Tunnel geometry Attach failed");
+        let peer = librunnel::MappedEndpoint::map(endpoint, mapped_bytes, Placement::Anywhere)
+            .expect("Tunnel geometry peer Map failed");
         assert_ne!(geometry.base(), peer.geometry().base());
         assert_eq!(geometry.bytes(), peer.geometry().bytes());
         for page in 0..geometry.bytes() / 4096 {
@@ -5612,35 +5511,41 @@ fn test_tunnel_geometry() {
 
 #[cfg(feature = "acceptance-stress")]
 fn test_tunnel_lifecycle() {
+    use libkernel::ipc::invitation::Invitation;
     for _ in 0..TUNNEL_STRESS {
-        let (abandoned, invitation) =
-            tunnel_sys::create(TUNNEL_BYTES, libkernel::mm::Placement::Anywhere)
-                .expect("lifecycle tunnel create failed");
-        assert!(matches!(
-            wait_many(&[WaitItem::new(invitation, ObjectSignals::CLOSED, 0)], 0,),
-            Err(SystemCallError::RightsDenied)
-        ));
-        // SAFETY: 本轮独占、未运输的 Invitation。
-        unsafe { close(invitation) }.expect("invitation close failed");
-        let result = abandoned
-            .events()
-            .wait(ObjectSignals::PEER_CLOSED, 0)
-            .expect("abandoned invitation wait failed");
-        assert!(result.observed.intersects(ObjectSignals::PEER_CLOSED));
-        abandoned.close().expect("lifecycle endpoint close failed");
-
-        let (creator_closed, invitation) =
-            tunnel_sys::create(TUNNEL_BYTES, libkernel::mm::Placement::Anywhere)
-                .expect("closed-creator tunnel create failed");
-        creator_closed
+        let (abandoned, invitation, _) = Invitation::create(root_memory_pool(), TUNNEL_BYTES)
+            .expect("lifecycle Tunnel create failed");
+        // SAFETY: 只借未消费的Invitation验证其不提供等待来源，不取得第二owner；
+        // WAIT模板位约束Attach后Endpoint，不能把它当成Invitation自己的观察来源。
+        assert_eq!(
+            wait_until(
+                unsafe { invitation.raw_handle() },
+                ObjectSignals::CLOSED,
+                Deadline::at(0)
+            ),
+            Err(SystemCallError::WrongObjectType)
+        );
+        invitation.close().expect("Invitation close failed");
+        assert!(
+            abandoned
+                .events()
+                .wait(ObjectSignals::PEER_CLOSED, 0)
+                .unwrap()
+                .observed
+                .intersects(ObjectSignals::PEER_CLOSED)
+        );
+        abandoned.close().expect("lifecycle Endpoint close failed");
+        let (creator, invitation, _) =
+            Invitation::create(root_memory_pool(), TUNNEL_BYTES).unwrap();
+        creator.close().unwrap();
+        let failure = invitation
+            .attach()
+            .expect_err("Attach accepted a closed creator");
+        assert_eq!(failure.error, SystemCallError::ObjectClosed);
+        failure
+            .invitation
             .close()
-            .expect("creator endpoint close failed");
-        assert!(matches!(
-            unsafe { tunnel_sys::attach(invitation, libkernel::mm::Placement::Anywhere) },
-            Err(SystemCallError::ObjectClosed)
-        ));
-        // SAFETY: Attach 失败未消费本轮的 Invitation。
-        unsafe { close(invitation) }.expect("closed invitation close failed");
+            .expect("failed Attach lost Invitation owner");
     }
-    debug!("tunnel lifecycle stress passed: {} rounds", TUNNEL_STRESS);
+    debug!("Tunnel abandonment and closed-creator Attach checks passed");
 }

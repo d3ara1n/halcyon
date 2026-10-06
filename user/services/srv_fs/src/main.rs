@@ -30,9 +30,7 @@ fn startup_sender(
     index: usize,
     missing: &'static str,
 ) -> MailboxSender {
-    let capability = startup
-        .take(index)
-        .expect(missing);
+    let capability = startup.take(index).expect(missing);
     MailboxSender::from_capability(capability)
         .map(|(sender, _)| sender)
         .map_err(|failure| failure.error)
@@ -46,7 +44,8 @@ fn main() {
     let release = startup_handle(&mut grants, 1, "provider release owner is missing");
     let route = startup_handle(&mut grants, 2, "provider route mailbox owner is missing");
     let registration = startup_handle(&mut grants, 3, "provider registration endpoint is missing");
+    let pool = grants.take(4).expect("provider funding Pool is missing");
     let mailbox = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
         .expect("provider mailbox creation failed");
-    server::run(mailbox, bootstrap, route, release, registration);
+    server::run(mailbox, bootstrap, route, release, registration, pool);
 }

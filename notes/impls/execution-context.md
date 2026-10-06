@@ -6,7 +6,7 @@
 
 cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期 fatal vector，不占用正式 `HartSlot(0)`。boot hart 以固件 raw hartid 查找正式 slot；secondary 通过 HSM opaque 取得 `HartBootRecord` PA，从 Bare 经永久 PA 前导与 identity/高半区别名过渡页表进入高半区。
 
-两条路径在 formal entry 汇合，统一建立 gp、tp、sscratch、正式 stack、satp、CSR 和 stvec。过渡表在 cold boot 建成后只读；全体启动记录以 Release 发布后才发 HSM start。`os/runtime_gate` 将全局状态限制为 `Preparing -> Ready | Failed`：HSM 错误、formal CSR 拒绝或 Online 超时先以 Release 广播 Failed，晚到 secondary 以 Acquire 观察后停驻；只有全体 admitted hart Online、调度域和初始任务就绪后才发布 Ready 并进入调度循环。
+两条路径在 formal entry 汇合，统一建立 gp、tp、sscratch、正式 stack、satp、CSR 和 stvec。过渡表在 cold boot 建成后只读；全体启动记录以 Release 发布后才发 HSM start。`os/runtime_gate` 将全局状态限制为 `Preparing -> Ready | Failed`：HSM 错误、formal CSR 拒绝或 Online 超时先以 Release 广播 Failed，晚到 secondary 以 Acquire 观察后停驻；只有全体 admitted hart Online、调度域和 primordial Bootstrap Work 准入后才发布 Ready 并进入调度循环。ELF/初始 VM 装载由该维护记录分批完成；异步装载失败使用既有 runtime_stop 全 hart 停驻，不回退 Ready gate。
 
 `rt.rs` 的 panic、fatal trap、`fatal_msg` 和高半区 bootstrap fatal 在任何诊断前统一调用 `registry::publish_failed`。它只对 Preparing 执行 Release CAS；Failed 幂等，Ready 保持不变，错误终段不再次 panic，不取 registry 锁、不分配、不读取 tp。分配失败经 panic handler 进入同一终段。GATE 位于 `_start_high` 清零的普通 BSS；高半区 Rust 入口可访问，Bare PA fatal 不访问该状态，未 Online 的 secondary 由 boot 的 Online 超时收束。
 
@@ -20,7 +20,7 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 普通 Ready、termination、Remote 与 deferred-work IPI 都只作已发布业务真值的门铃，发送 API 返回失败 slot mask；失败不撤销 Pending/Ready、不伪造完成，也不在发送者上 panic。
 
-`os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessBindExecution 解析平铺的 execution profile，选择最弱兼容域，并在首次 ThreadCreate 前以单个 `AtomicUsize` 一次冻结 requirement 与域 index；ProcessStart 只验证该 binding；零值只表示未绑定，不会与 Base64 混淆。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
+`os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessBindExecution 解析平铺的 execution profile，选择最弱兼容域，并在 Building 短租约内冻结 Body 的 requirement/domain；ThreadCreate 拷取不变的域与 FP 档位，ProcessStart 验证需求存在。重复 BindExecution 返回 ObjectNotAvailable。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
 
 ## ABI 档位与 UserContext
 
@@ -47,14 +47,14 @@ fatal 首帧保存在独立 FatalFrame，递归 guard 防止诊断故障覆盖�
 
 ## 地址空间归属纪律
 
-用户 trap 的 Resume 热路径继续使用当前用户 root；非 Resume 出口在恢复调度循环现场前统一装载 `KERNEL_SATP` 并执行本地全量 SFENCE.VMA。只有完成该步骤后，Rust 调度侧才清 active 位、reap 或发布 park。因此 REAPABLE 的 active=0 保证没有 hart 仍使用目标用户 root。
+用户 trap 的 Resume 热路径继续使用当前用户 root；非 Resume 出口在恢复调度循环现场前统一装载 `KERNEL_SATP` 并执行本地全量 SFENCE.VMA。只有完成该步骤后，Rust 调度侧才清 active 位、reap 或发布 park。VM active=0 因而只在没有 hart 仍使用目标用户 root 后成立，空间退休另等访问与结果责任。
 
-这一约束针对目标线程离场和调度侧 teardown barrier。`ProcessDrain` 是管理进程发起的普通 Completed syscall，可以在管理者自己的用户 root 激活时执行；所有用户 root 共享内核高半区，内核通过目标 AddressSpace 对象、页表映射接口和物理直映射访问并收束目标资源，不依赖目标用户映射。Drain 只在目标 REAPABLE 后准入。
+进程资源由 Shell/RetireWork 自动推进，不存在 ProcessDrain syscall。维护在内核安全点以目标 AnySpace、表帧映射和物理直映射收束；Shell 先冻结入口，VM 记录持 active 快照并等退出/fence、访问租约与实际退款。细节见 [mm](mm.md) 与 [task](task.md)。
 
 UserContext、FpState、HartLocal、FatalFrame 与 SchedulerFrame 的布局由 Rust `offset_of!` 生成常量注入汇编，调度现场总大小保持 16-byte 对齐。
 
 ## 用户访问与指令发布
 
-内核稳态 SUM=0；uaccess 在持 AddressSpace 锁并完成范围验证后临时开启 SUM。同步 syscall 输出使用 `deliver_output`，复检失败冻结调用进程 Fault；异步 WaitMany 结果尽力写回，失败经错误通道交付。
+内核稳态 SUM=0；uaccess 在持 AddressSpace 锁并完成范围验证后临时开启 SUM。同步 syscall 输出使用 `deliver_output`，复检失败记录 output_fault，锁外冻结调用进程 Fault；VM 与 Start 完成计划只返回寄存器单位值，不保留异步用户输出指针。
 
 ProcessWrite 只在 Building 阶段经物理直映射写 backing。调度器 Acquire 取得发布线程后，由 AddressSpace 事务根据真实 Install/Protect 意图推进 instruction epoch；远端同步或 `_ret_to_user` 的统一地址空间切换出口执行本地 `fence.i`，Resume 不再依赖调度器重复补发。已发布 executable page 没有普通写入口。

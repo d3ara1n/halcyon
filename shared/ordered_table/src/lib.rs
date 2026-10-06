@@ -1,5 +1,5 @@
 #![no_std]
-#![feature(allocator_api)]
+#![forbid(unsafe_code)]
 
 //! 带容量上限和可失败节点准备的 AVL 有序表。
 //!
@@ -8,22 +8,24 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use core::{borrow::Borrow, cmp::Ordering};
+use funded_storage::{Funding, OwnedBox, StorageError};
 
-type Link<V, K = u64> = Option<Box<Node<V, K>>>;
+type NodeOwner<V, K, C> = OwnedBox<Node<V, K, C>, C>;
+type Link<V, K, C> = Option<NodeOwner<V, K, C>>;
+type Removal<V, K, C> = (Link<V, K, C>, Option<PreparedEntry<V, C, K>>);
 
-struct Node<V, K> {
+struct Node<V, K, C> {
     key: K,
     value: V,
     height: u8,
-    left: Link<V, K>,
-    right: Link<V, K>,
+    left: Link<V, K, C>,
+    right: Link<V, K, C>,
 }
 
-pub struct PreparedEntry<V, K = u64>(Box<Node<V, K>>);
+pub struct PreparedEntry<V, C, K = u64>(NodeOwner<V, K, C>);
 
-impl<V, K> PreparedEntry<V, K> {
+impl<V, C, K> PreparedEntry<V, C, K> {
     pub fn key(&self) -> K
     where
         K: Copy,
@@ -42,31 +44,66 @@ impl<V, K> PreparedEntry<V, K> {
     }
 
     pub const fn allocation_bytes() -> usize {
-        core::mem::size_of::<Node<V, K>>()
+        core::mem::size_of::<Node<V, K, C>>()
     }
 
     pub fn value_mut(&mut self) -> &mut V {
         &mut self.0.value
     }
 
+    /// 完整节点带出外层锁后才解构；释放分配再退付款。
+    pub fn into_parts(self) -> (K, V) {
+        let Node {
+            key,
+            value,
+            left,
+            right,
+            ..
+        } = self.0.into_inner();
+        assert!(
+            left.is_none() && right.is_none(),
+            "detached entry retained tree links"
+        );
+        (key, value)
+    }
     pub fn into_value(self) -> V {
-        let Node { value, .. } = *self.0;
-        value
+        self.into_parts().1
+    }
+    pub fn value(&self) -> &V {
+        &self.0.value
+    }
+    pub fn try_new<F: Funding<Charge = C>>(
+        key: K,
+        value: V,
+        payer: &F,
+    ) -> Result<Self, InsertError<V, F::Error>> {
+        OwnedBox::try_new(
+            Node {
+                key,
+                value,
+                height: 1,
+                left: None,
+                right: None,
+            },
+            payer,
+        )
+        .map(Self)
+        .map_err(|(error, node)| InsertError::Storage(error, node.value))
     }
 }
 
-pub enum InsertError<V> {
+pub enum InsertError<V, E> {
     Limit(V),
-    Allocation(V),
+    Storage(StorageError<E>, V),
 }
 
-pub struct OrderedTable<V, K = u64> {
-    root: Link<V, K>,
+pub struct OrderedTable<V, C, K = u64> {
+    root: Link<V, K, C>,
     len: usize,
     limit: usize,
 }
 
-impl<V, K: Ord> OrderedTable<V, K> {
+impl<V, C, K: Ord> OrderedTable<V, C, K> {
     pub const fn new(limit: usize) -> Self {
         assert!(limit > 0);
         Self {
@@ -80,35 +117,45 @@ impl<V, K: Ord> OrderedTable<V, K> {
         self.len == 0
     }
 
+    pub fn has_room(&self) -> bool {
+        self.len < self.limit
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
 
-    pub fn prepare_insert(&self, key: K, value: V) -> Result<PreparedEntry<V, K>, InsertError<V>> {
+    pub fn prepare_insert<F: Funding<Charge = C>>(
+        &self,
+        key: K,
+        value: V,
+        payer: &F,
+    ) -> Result<PreparedEntry<V, C, K>, InsertError<V, F::Error>> {
         if self.len == self.limit {
             return Err(InsertError::Limit(value));
         }
         if self.get_by(&key).is_some() {
             unreachable!("ordered table key prepared twice");
         }
-        allocate_entry(key, value)
+        PreparedEntry::try_new(key, value, payer)
     }
 
     /// 为 Commit 时才确定“复用现项或插入新项”的事务准备候选节点。
     /// key 当前存在时即使表已满也允许准备：若该项在 Commit 前被移除，
     /// 空出的同一容量正好供候选插入；若仍存在，调用方丢弃候选即可。
-    pub fn prepare_insert_candidate(
+    pub fn prepare_insert_candidate<F: Funding<Charge = C>>(
         &self,
         key: K,
         value: V,
-    ) -> Result<PreparedEntry<V, K>, InsertError<V>> {
+        payer: &F,
+    ) -> Result<PreparedEntry<V, C, K>, InsertError<V, F::Error>> {
         if self.get_by(&key).is_none() && self.len == self.limit {
             return Err(InsertError::Limit(value));
         }
-        allocate_entry(key, value)
+        PreparedEntry::try_new(key, value, payer)
     }
 
-    pub fn insert_prepared(&mut self, entry: PreparedEntry<V, K>) {
+    pub fn insert_prepared(&mut self, entry: PreparedEntry<V, C, K>) {
         assert!(
             self.len < self.limit,
             "ordered table capacity changed after preparation"
@@ -121,14 +168,49 @@ impl<V, K: Ord> OrderedTable<V, K> {
         self.len += 1;
     }
 
-    pub fn try_insert(&mut self, key: K, value: V) -> Result<(), InsertError<V>> {
-        let entry = self.prepare_insert(key, value)?;
+    pub fn try_insert<F: Funding<Charge = C>>(
+        &mut self,
+        key: K,
+        value: V,
+        payer: &F,
+    ) -> Result<(), InsertError<V, F::Error>> {
+        let entry = self.prepare_insert(key, value, payer)?;
         self.insert_prepared(entry);
         Ok(())
     }
 
     pub fn contains_key(&self, key: K) -> bool {
         self.get_by(&key).is_some()
+    }
+
+    /// 最大的 <= key 项；不扫描前驱链，查询成本由 AVL 高度界定。
+    pub fn floor(&self, key: &K) -> Option<(&K, &V)> {
+        let mut node = self.root.as_deref();
+        let mut found = None;
+        while let Some(current) = node {
+            if current.key <= *key {
+                found = Some((&current.key, &current.value));
+                node = current.right.as_deref();
+            } else {
+                node = current.left.as_deref();
+            }
+        }
+        found
+    }
+
+    /// 最小的 >= key 项，供已删左端片段的退休游标重取当前最小值。
+    pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)> {
+        let mut node = self.root.as_deref();
+        let mut found = None;
+        while let Some(current) = node {
+            if current.key >= *key {
+                found = Some((&current.key, &current.value));
+                node = current.left.as_deref();
+            } else {
+                node = current.right.as_deref();
+            }
+        }
+        found
     }
 
     pub fn get(&self, key: K) -> Option<&V> {
@@ -169,11 +251,11 @@ impl<V, K: Ord> OrderedTable<V, K> {
         None
     }
 
-    pub fn remove(&mut self, key: K) -> Option<V> {
+    pub fn remove(&mut self, key: K) -> Option<PreparedEntry<V, C, K>> {
         self.remove_by(&key)
     }
 
-    pub fn remove_by<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<V>
+    pub fn remove_by<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<PreparedEntry<V, C, K>>
     where
         K: Borrow<Q>,
     {
@@ -204,17 +286,17 @@ impl<V, K: Ord> OrderedTable<V, K> {
     }
 
     /// 提取最小项和原始 key，不复制、不分配；适合有界容器退休。
-    pub fn pop_first(&mut self) -> Option<(K, V)> {
+    pub fn pop_first(&mut self) -> Option<PreparedEntry<V, C, K>> {
         let root = self.root.take()?;
-        let (root, minimum) = take_min(root);
+        let (root, mut minimum) = take_min(root);
         self.root = root;
         self.len -= 1;
-        let Node { key, value, .. } = *minimum;
-        Some((key, value))
+        minimum.height = 1;
+        Some(PreparedEntry(minimum))
     }
 
     pub fn count_matching(&self, predicate: impl Fn(&V) -> bool) -> usize {
-        fn count<V, K>(node: &Link<V, K>, predicate: &impl Fn(&V) -> bool) -> usize {
+        fn count<V, K, C>(node: &Link<V, K, C>, predicate: &impl Fn(&V) -> bool) -> usize {
             let Some(node) = node else { return 0 };
             count(&node.left, predicate)
                 + usize::from(predicate(&node.value))
@@ -232,8 +314,8 @@ impl<V, K: Ord> OrderedTable<V, K> {
     where
         K: Copy,
     {
-        fn scan<V, K: Ord + Copy>(
-            node: &Link<V, K>,
+        fn scan<V, K: Ord + Copy, C>(
+            node: &Link<V, K, C>,
             visible: &impl Fn(&V) -> bool,
             cursor: K,
             out: &mut [K],
@@ -260,31 +342,15 @@ impl<V, K: Ord> OrderedTable<V, K> {
     }
 }
 
-fn allocate_entry<V, K>(key: K, value: V) -> Result<PreparedEntry<V, K>, InsertError<V>> {
-    let mut allocation = match Box::<Node<V, K>>::try_new_uninit() {
-        Ok(allocation) => allocation,
-        Err(_) => return Err(InsertError::Allocation(value)),
-    };
-    allocation.write(Node {
-        key,
-        value,
-        height: 1,
-        left: None,
-        right: None,
-    });
-    // allocation 已在上方完整初始化，且没有引用逃逸。
-    Ok(PreparedEntry(unsafe { allocation.assume_init() }))
-}
-
-fn height<V, K>(node: &Link<V, K>) -> u8 {
+fn height<V, K, C>(node: &Link<V, K, C>) -> u8 {
     node.as_ref().map_or(0, |node| node.height)
 }
 
-fn update_height<V, K>(node: &mut Node<V, K>) {
+fn update_height<V, K, C>(node: &mut Node<V, K, C>) {
     node.height = 1 + height(&node.left).max(height(&node.right));
 }
 
-fn rotate_left<V, K>(mut root: Box<Node<V, K>>) -> Box<Node<V, K>> {
+fn rotate_left<V, K, C>(mut root: NodeOwner<V, K, C>) -> NodeOwner<V, K, C> {
     let mut pivot = root.right.take().expect("AVL left rotation lost pivot");
     root.right = pivot.left.take();
     update_height(&mut root);
@@ -293,7 +359,7 @@ fn rotate_left<V, K>(mut root: Box<Node<V, K>>) -> Box<Node<V, K>> {
     pivot
 }
 
-fn rotate_right<V, K>(mut root: Box<Node<V, K>>) -> Box<Node<V, K>> {
+fn rotate_right<V, K, C>(mut root: NodeOwner<V, K, C>) -> NodeOwner<V, K, C> {
     let mut pivot = root.left.take().expect("AVL right rotation lost pivot");
     root.left = pivot.right.take();
     update_height(&mut root);
@@ -302,7 +368,7 @@ fn rotate_right<V, K>(mut root: Box<Node<V, K>>) -> Box<Node<V, K>> {
     pivot
 }
 
-fn rebalance<V, K>(mut node: Box<Node<V, K>>) -> Box<Node<V, K>> {
+fn rebalance<V, K, C>(mut node: NodeOwner<V, K, C>) -> NodeOwner<V, K, C> {
     update_height(&mut node);
     let balance = i16::from(height(&node.left)) - i16::from(height(&node.right));
     if balance > 1 {
@@ -322,7 +388,7 @@ fn rebalance<V, K>(mut node: Box<Node<V, K>>) -> Box<Node<V, K>> {
     node
 }
 
-fn insert_node<V, K: Ord>(root: Link<V, K>, node: Box<Node<V, K>>) -> Box<Node<V, K>> {
+fn insert_node<V, K: Ord, C>(root: Link<V, K, C>, node: NodeOwner<V, K, C>) -> NodeOwner<V, K, C> {
     let Some(mut root) = root else { return node };
     match node.key.cmp(&root.key) {
         Ordering::Less => root.left = Some(insert_node(root.left.take(), node)),
@@ -332,7 +398,7 @@ fn insert_node<V, K: Ord>(root: Link<V, K>, node: Box<Node<V, K>>) -> Box<Node<V
     rebalance(root)
 }
 
-fn take_min<V, K>(mut node: Box<Node<V, K>>) -> (Link<V, K>, Box<Node<V, K>>) {
+fn take_min<V, K, C>(mut node: NodeOwner<V, K, C>) -> (Link<V, K, C>, NodeOwner<V, K, C>) {
     let Some(left) = node.left.take() else {
         return (node.right.take(), node);
     };
@@ -341,10 +407,10 @@ fn take_min<V, K>(mut node: Box<Node<V, K>>) -> (Link<V, K>, Box<Node<V, K>>) {
     (Some(rebalance(node)), minimum)
 }
 
-fn remove_node<V, K: Borrow<Q>, Q: Ord + ?Sized>(
-    root: Link<V, K>,
+fn remove_node<V, K: Borrow<Q>, Q: Ord + ?Sized, C>(
+    root: Link<V, K, C>,
     key: &Q,
-) -> (Link<V, K>, Option<V>) {
+) -> Removal<V, K, C> {
     let Some(mut root) = root else {
         return (None, None);
     };
@@ -360,17 +426,18 @@ fn remove_node<V, K: Borrow<Q>, Q: Ord + ?Sized>(
             (Some(rebalance(root)), removed)
         }
         Ordering::Equal => {
-            let Node {
-                value, left, right, ..
-            } = *root;
+            let left = root.left.take();
+            let right = root.right.take();
+            root.height = 1;
+            let removed = PreparedEntry(root);
             match (left, right) {
-                (None, right) => (right, Some(value)),
-                (left, None) => (left, Some(value)),
+                (None, right) => (right, Some(removed)),
+                (left, None) => (left, Some(removed)),
                 (Some(left), Some(right)) => {
                     let (right, mut successor) = take_min(right);
                     successor.left = Some(left);
                     successor.right = right;
-                    (Some(rebalance(successor)), Some(value))
+                    (Some(rebalance(successor)), Some(removed))
                 }
             }
         }
@@ -380,8 +447,108 @@ fn remove_node<V, K: Borrow<Q>, Q: Ord + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
+    use core::cell::Cell;
 
-    fn assert_avl<V>(node: &Link<V>) -> (usize, u8) {
+    struct Charge(Rc<Cell<usize>>);
+    impl Drop for Charge {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
+        }
+    }
+    struct Meter {
+        live: Rc<Cell<usize>>,
+        deny: Cell<bool>,
+    }
+    impl Funding for Meter {
+        type Charge = Charge;
+        type Error = ();
+        fn charge(&self, _: core::alloc::Layout) -> Result<Charge, ()> {
+            if self.deny.get() {
+                return Err(());
+            }
+            self.live.set(self.live.get() + 1);
+            Ok(Charge(self.live.clone()))
+        }
+    }
+
+    #[test]
+    fn rejected_funding_returns_input_without_publishing_or_charging() {
+        let payer = Meter {
+            live: Default::default(),
+            deny: Cell::new(true),
+        };
+        let mut table = OrderedTable::<u64, Charge>::new(4);
+        assert!(matches!(
+            table.try_insert(1, 7, &payer),
+            Err(InsertError::Storage(StorageError::Funding(()), 7))
+        ));
+        assert!(table.is_empty());
+        assert_eq!(payer.live.get(), 0);
+    }
+
+    #[test]
+    fn two_child_removal_and_cross_table_move_keep_each_allocation_owner() {
+        let payer = Meter {
+            live: Default::default(),
+            deny: Cell::new(false),
+        };
+        let mut table = OrderedTable::new(8);
+        for key in [4, 2, 6, 1, 3, 5, 7] {
+            table
+                .try_insert(key, key, &payer)
+                .unwrap_or_else(|_| panic!("paid insert failed"));
+        }
+        let removed = table.remove(4).expect("paid root missing");
+        assert_eq!(removed.key(), 4);
+        assert_eq!(*removed.value(), 4);
+        assert_eq!(payer.live.get(), 7);
+        for key in [1, 2, 3, 5, 6, 7] {
+            assert_eq!(table.get(key), Some(&key));
+        }
+        drop(removed);
+        assert_eq!(payer.live.get(), 6);
+        let first = table.pop_first().expect("paid minimum missing");
+        assert_eq!(first.key(), 1);
+        assert_eq!(payer.live.get(), 6);
+        let mut other = OrderedTable::new(2);
+        other.insert_prepared(first.with_key(9));
+        assert_eq!(payer.live.get(), 6);
+        assert_eq!(other.get(9), Some(&1));
+        drop(table);
+        assert_eq!(payer.live.get(), 1);
+        drop(other);
+        assert_eq!(payer.live.get(), 0);
+    }
+    struct HeapFunding;
+    impl Funding for HeapFunding {
+        type Charge = ();
+        type Error = ();
+        fn charge(&self, _: core::alloc::Layout) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounds_include_exact_keys_and_skip_deleted_gaps() {
+        let mut table = OrderedTable::new(4);
+        for key in [40, 10, 30, 20] {
+            table
+                .try_insert(key, key, &HeapFunding)
+                .unwrap_or_else(|_| panic!());
+        }
+        assert_eq!(table.floor(&0), None);
+        assert_eq!(table.lower_bound(&50), None);
+        assert_eq!(table.floor(&20), Some((&20, &20)));
+        assert_eq!(table.lower_bound(&20), Some((&20, &20)));
+        table.remove(20).map(PreparedEntry::into_value);
+        assert_eq!(table.floor(&20), Some((&10, &10)));
+        assert_eq!(table.lower_bound(&20), Some((&30, &30)));
+        assert_eq!(table.floor(&29), Some((&10, &10)));
+        assert_eq!(table.lower_bound(&31), Some((&40, &40)));
+    }
+
+    fn assert_avl<V>(node: &Link<V, u64, ()>) -> (usize, u8) {
         let Some(node) = node else { return (0, 0) };
         let (left_len, left_height) = assert_avl(&node.left);
         let (right_len, right_height) = assert_avl(&node.right);
@@ -401,7 +568,9 @@ mod tests {
         const COUNT: usize = 1024;
         let mut table = OrderedTable::new(COUNT);
         for key in 0..COUNT as u64 {
-            table.try_insert(key, key * 3).unwrap_or_else(|_| panic!());
+            table
+                .try_insert(key, key * 3, &HeapFunding)
+                .unwrap_or_else(|_| panic!());
         }
         assert_eq!(assert_avl(&table.root).0, COUNT);
         for key in 0..COUNT as u64 {
@@ -409,7 +578,10 @@ mod tests {
         }
         for step in 0..COUNT as u64 {
             let key = (step * 683) % COUNT as u64;
-            assert_eq!(table.remove(key), Some(key * 3));
+            assert_eq!(
+                table.remove(key).map(PreparedEntry::into_value),
+                Some(key * 3)
+            );
             assert_eq!(assert_avl(&table.root).0, COUNT - step as usize - 1);
         }
         assert!(table.is_empty());
@@ -418,15 +590,15 @@ mod tests {
     #[test]
     fn owned_names_support_borrowed_lookup_cursor_and_removal() {
         use alloc::string::String;
-        let mut table = OrderedTable::<u64, String>::new(4);
+        let mut table = OrderedTable::<u64, (), String>::new(4);
         table
-            .try_insert(String::from("beta"), 2)
+            .try_insert(String::from("beta"), 2, &HeapFunding)
             .unwrap_or_else(|_| panic!());
         table
-            .try_insert(String::from("alpha"), 1)
+            .try_insert(String::from("alpha"), 1, &HeapFunding)
             .unwrap_or_else(|_| panic!());
         table
-            .try_insert(String::from("gamma"), 3)
+            .try_insert(String::from("gamma"), 3, &HeapFunding)
             .unwrap_or_else(|_| panic!());
         assert_eq!(table.get_by("beta"), Some(&2));
         assert_eq!(
@@ -442,17 +614,24 @@ mod tests {
             Some(("gamma", 3))
         );
         *table.get_mut_by("beta").unwrap() = 20;
-        assert_eq!(table.remove_by("beta"), Some(20));
+        assert_eq!(
+            table.remove_by("beta").map(PreparedEntry::into_value),
+            Some(20)
+        );
         assert_eq!(table.get_by("beta"), None);
     }
 
     #[test]
     fn prepared_entry_returns_value_and_limit_returns_input() {
         let mut table = OrderedTable::new(1);
-        let prepared = table.prepare_insert(7, 70).unwrap_or_else(|_| panic!());
+        let prepared = table
+            .prepare_insert(7, 70, &HeapFunding)
+            .unwrap_or_else(|_| panic!());
         assert_eq!(prepared.into_value(), 70);
-        table.try_insert(8, 80).unwrap_or_else(|_| panic!());
-        match table.try_insert(9, 90) {
+        table
+            .try_insert(8, 80, &HeapFunding)
+            .unwrap_or_else(|_| panic!());
+        match table.try_insert(9, 90, &HeapFunding) {
             Err(InsertError::Limit(value)) => assert_eq!(value, 90),
             _ => panic!("capacity exhaustion returned the wrong result"),
         }
@@ -461,16 +640,18 @@ mod tests {
     #[test]
     fn existing_candidate_survives_full_table_removal_race() {
         let mut table = OrderedTable::new(1);
-        table.try_insert(7, 70).unwrap_or_else(|_| panic!());
-        let candidate = table
-            .prepare_insert_candidate(7, 71)
+        table
+            .try_insert(7, 70, &HeapFunding)
             .unwrap_or_else(|_| panic!());
-        assert_eq!(table.remove(7), Some(70));
+        let candidate = table
+            .prepare_insert_candidate(7, 71, &HeapFunding)
+            .unwrap_or_else(|_| panic!());
+        assert_eq!(table.remove(7).map(PreparedEntry::into_value), Some(70));
         table.insert_prepared(candidate);
         assert_eq!(table.get(7), Some(&71));
 
         let redundant = table
-            .prepare_insert_candidate(7, 72)
+            .prepare_insert_candidate(7, 72, &HeapFunding)
             .unwrap_or_else(|_| panic!());
         assert_eq!(redundant.into_value(), 72);
         assert_eq!(table.get(7), Some(&71));
@@ -480,7 +661,9 @@ mod tests {
     fn visible_scan_stops_at_transaction_barrier_and_resumes_by_cursor() {
         let mut table = OrderedTable::new(4);
         for (key, visible) in [(1, true), (2, true), (3, false), (4, true)] {
-            table.try_insert(key, visible).unwrap_or_else(|_| panic!());
+            table
+                .try_insert(key, visible, &HeapFunding)
+                .unwrap_or_else(|_| panic!());
         }
         let mut out = [0; 4];
         assert_eq!(table.scan_visible(|value| *value, 0, &mut out), (2, true));

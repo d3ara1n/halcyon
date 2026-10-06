@@ -4,19 +4,17 @@ use erhino_shared::{
     object::{Handle, ObjectSignals},
     proc::{
         JOB_ENUMERATE_MAX, JobEnumerateResult, JobMemberKind, JobSnapshot, JobState,
-        ProcessDrainResult, ProcessDrainStatus, ProcessSnapshot, ProcessState,
+        ProcessSnapshot, ProcessState,
     },
     time::Deadline,
-    wait::WaitItem,
-    wait_set::ReadyRecord,
+    wait_set::{MemberRequest, ReadyRecord},
 };
 use libbudget::Budget;
 use libexecution::{
     ExecutionResource,
-    runtime::{
-        Advance, Input, RequestFailure, Requests, Runtime, SourceOps, SourceSet, Step, Task,
-    },
+    runtime::{Advance, Input, RequestFailure, Requests, Runtime, Step, Task},
 };
+use libexecution::{assembly::Assembly, source::SourceOps};
 use libprocess::{
     DEFAULT_SUPERVISION_POLICY, JobCollector, JobCollectorEvent, JobKillCause, JobKillStage,
     JobOperations, SupervisionStage, observation::ObservationResult, supervise::ProcessOperations,
@@ -97,12 +95,10 @@ impl Drop for AllocationFailure {
 
 struct EmptySources;
 impl SourceOps for EmptySources {
-    fn register_item(&self, _: WaitItem) -> Result<u64, SystemCallError> {
+    fn register_item(&self, _: MemberRequest) -> Result<u64, SystemCallError> {
         unreachable!()
     }
-    fn rearm(&self, _: u64) -> Result<u64, SystemCallError> {
-        unreachable!()
-    }
+
     fn remove_source(&self, _: u64) -> Result<(), SystemCallError> {
         unreachable!()
     }
@@ -115,8 +111,7 @@ impl SourceOps for EmptySources {
     fn now_ns(&self) -> Result<u64, SystemCallError> {
         Ok(0)
     }
-}
-impl SourceSet for EmptySources {
+
     fn close_set(self) -> Result<(), (Self, SystemCallError)> {
         Ok(())
     }
@@ -164,13 +159,17 @@ impl Task<SpawnWorld> for SpawnTask {
 
 #[test]
 fn prepaid_gate_returns_spawn_owner_and_retires_without_fresh_allocation() {
-    let bytes = Runtime::<SpawnTask, EmptySources>::input_budget(1).unwrap();
+    let bytes = Runtime::<SpawnTask, EmptySources>::input_budget(1).unwrap()
+        + Assembly::<EmptySources>::input_budget().unwrap();
     let budget = Budget::new(&[2, bytes], 1).unwrap();
     let account = budget.account(&[2, bytes]).unwrap();
     let account = account
         .view(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
         .unwrap();
-    let mut runtime = Runtime::new(EmptySources, 2, 1, &account).unwrap();
+    let assembly = Assembly::new(EmptySources, &account)
+        .map_err(|(_, error)| error)
+        .unwrap();
+    let mut runtime = Runtime::new(assembly.bind().unwrap(), 2, 1, &account).unwrap();
     runtime.spawn(SpawnTask { submitted: false }, 0).unwrap();
     let mut world = SpawnWorld::default();
     let mut error = None;
@@ -193,6 +192,7 @@ fn prepaid_gate_returns_spawn_owner_and_retires_without_fresh_allocation() {
     assert!(runtime.is_empty());
     assert_eq!(account.usage(ExecutionResource::Task).0, 0);
     assert!(runtime.close().is_ok());
+    assert!(assembly.close().is_ok());
     assert_eq!(account.usage(ExecutionResource::InputBytes).0, 0);
 }
 
@@ -203,7 +203,6 @@ struct State {
     children: BTreeMap<u64, Vec<u64>>,
     closed_processes: BTreeSet<u64>,
     closed_jobs: BTreeSet<u64>,
-    drains: BTreeMap<u64, usize>,
     derives: BTreeMap<u64, usize>,
     enumerated: Vec<(u64, JobMemberKind, u64)>,
     stalls: usize,
@@ -226,15 +225,7 @@ impl ProcessOperations for Environment {
     ) -> Result<ObservationResult, SystemCallError> {
         Ok(ObservationResult::Ready(signals))
     }
-    fn drain(&self, control: Handle, _: u32) -> Result<ProcessDrainResult, SystemCallError> {
-        let pid = control.raw() - PROCESS_BASE;
-        *self.0.borrow_mut().drains.entry(pid).or_default() += 1;
-        Ok(ProcessDrainResult {
-            work_done: 3,
-            status: ProcessDrainStatus::Complete as u32,
-            reserved: 0,
-        })
-    }
+
     fn query(&self, control: Handle) -> Result<ProcessSnapshot, SystemCallError> {
         Ok(ProcessSnapshot {
             pid: control.raw() - PROCESS_BASE,
@@ -472,9 +463,8 @@ fn multiple_pages_preserve_progress_through_stalls_missing_entries_and_nested_cl
     );
     let state = state.borrow();
     assert_eq!(collector.progress().members_collected as u64, count + 1);
-    assert_eq!(collector.progress().process_work as u64, (count + 1) * 3);
+    assert_eq!(collector.progress().process_queries as u64, count + 1);
     assert_eq!(collector.progress().children_collected as u64, count);
-    assert!(state.drains.values().all(|n| *n == 1));
     assert!(state.derives.values().all(|n| *n == 1));
     assert_eq!(
         state

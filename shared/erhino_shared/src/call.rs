@@ -112,10 +112,12 @@ pub enum SystemCall {
     ProcessTerminate = 0x10,
     /// 当前进程的 runtime 报告完整性失败，终因 Aborted。
     ProcessAbort = 0x23,
-    /// 从已有 JobControl 创建子 JobControl。
+    /// 从已有 JobControl 创建子 JobControl；a0=parent Job[CREATE]，
+    /// a1=付款 Pool[CREATE]，a2=rights，a3=输出 Handle 地址。
     JobCreate = 0x11,
     /// 在 Job（CREATE）内以 MemoryPool（CREATE）付款创建 Building process，
-    /// 返回 affine ProcessBuilder；付款账户出生即定，不再改绑。
+    /// a0=Job，a1=Pool，a2=control rights，a3=ProcessCreateResult 输出地址。
+    /// 返回 affine ProcessBuilder；付款账户出生即定，不再改绑，两份源 capability 不消费。
     ProcessCreate = 0x12,
     /// 为 Building process 映射 anonymous zero pages。
     ProcessMap = 0x13,
@@ -157,13 +159,15 @@ pub enum SystemCall {
     /// 裁剪 rights 后复制 Handle。
     HandleDuplicate = 0x31,
     /// 等待任一对象电平命中。
-    WaitMany = 0x32,
+    WaitOne = 0x32,
     /// 创建 Notification owner/signaler 对。
     NotificationCreate = 0x33,
     /// 向 Notification OR 提交待决位。
     NotificationSignal = 0x34,
     /// 原子取走 Notification 待决位。
     NotificationTake = 0x35,
+    /// 从 Notification Owner/Signaler 派生只观察 Owner 关闭的能力。
+    NotificationObserve = 0x3d,
     /// 无 capability 的公共单调时钟快照。
     MonotonicNow = 0x36,
     /// 查询本进程 Handle 的对象、role、rights 和关联身份。
@@ -172,8 +176,6 @@ pub enum SystemCall {
     WaitSetCreate = 0x38,
     /// 注册一个来源并交付不复用的 token。
     WaitSetRegister = 0x39,
-    /// 为已消费的 registration 建立新 arm 周期。
-    WaitSetRearm = 0x3a,
     /// 原子接收有界 ready 批次。
     WaitSetReceive = 0x3b,
     /// 撤销 token 的后续 ready 交付并启动源清理。

@@ -1,11 +1,11 @@
 //! 锁原语（见 notes/impls/internals.md「锁原语」、notes/impls/task.md
 //! 「锁序契约」）。
 //!
-//! - [`RawSpinlock`]：CAS 自旋原语（无中断语义、无 ladder），是
-//!   [`Spinlock`] 与 [`RankedRawSpinlock`] 的内部实现。
+//! - [`RawTicketLock`]：唯一 FIFO 自旋原语；本地 IRQ 屏蔽与严格锁序
+//!   配合，等待者不能被新请求无限插队。
 //! - [`RankedRawSpinlock`]：带类型级锁序秩的原语，实现 `lock_api::RawMutex`
 //!   供 talc 等库构造路径注入（TalcLock 控制实例化，秩无法以实例状态
-//!   携带）；trait 路径参与 ladder 断言。
+//!   携带）；trait 路径也关闭 IRQ 并参与 ladder 断言。
 //! - [`Spinlock<T>`]：内核自用容器，获取期间额外关闭本地中断——
 //!   中断处理路径若触碰本 hart 持有的锁会同核死锁，关中断是正确性
 //!   要求；并以实例级 rank 与链段 key 参与 Lock Ladder 断言。
@@ -41,7 +41,7 @@ pub mod ranks {
     /// HandleTable：caller→child 嵌套沿 pid 递增（chained）。
     pub const HANDLE_TABLE: Rank = Rank(100);
     /// 无嵌套边的自由段：CONSOLE、REGISTRY、ROOT anchor、就绪队列、
-    /// per-hart 期限表、WaitContext 的 thread/registrations。
+    /// per-hart 期限表及 Thread 等待 epoch 的注册节点。
     pub const LEAF: Rank = Rank(150);
     /// Job 链锁：先父后子沿 jid 递增（chained），≤32 把同持。
     pub const JOB_INNER: Rank = Rank(200);
@@ -55,20 +55,24 @@ pub mod ranks {
     pub const MEMORY_OBJECT: Rank = Rank(250);
     /// 用户地址空间（页表树/帧/外部映射/drain 阶段）。
     pub const ADDRESS_SPACE: Rank = Rank(300);
+    /// 空间的实物 View/写许可索引；从 VM 向 backing 单向获取。
+    pub const VM_VIEWS: Rank = Rank(325);
+    /// backing 段索引；空间解析可取此锁，帧/资金退款在释放两锁后进行。
+    pub const BACKING: Rank = Rank(350);
     /// Notification 状态锁（唯一以 space 为外层的对象锁边）。
     pub const NOTIFICATION: Rank = Rank(400);
     /// 对象电平/壳锁：Job.wait、ProcessControl、Endpoint/Invitation、
     /// ProcessBuilder、Process.control 回指槽。
     pub const OBJECT_WAIT: Rank = Rank(500);
-    /// 进程生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入）。
+    /// Shell 准入/回执真值；可在 Job 链锁内进入，不嵌套 VM 锁。
     pub const LIFECYCLE: Rank = Rank(600);
+    /// Body 线程稳定槽：出生登记允许 Shell → Members 单向锁边。
+    pub const PROCESS_MEMBERS: Rank = Rank(610);
     /// 授权对象最后消散的单向寿命发布，不反向访问业务容器。
-    pub const LIFETIME: Rank = Rank(620);
     /// 持久就绪集合；来源和此目标状态锁不得嵌套。
     pub const WAIT_SET: Rank = Rank(550);
     /// Commit 后完成槽：只在 lifecycle gate 内填充一次，完成方锁外取走后
     /// 才进入 AddressSpace 收束。
-    pub const MEMORY_COMPLETION: Rank = Rank(625);
     /// Commit 后特权 work debt 的固定槽；取出后才进入业务容器锁。
     pub const WORK_DEBT: Rank = Rank(640);
     /// Remote Call 固定槽；Commit 可在 AddressSpace → lifecycle 内发布。
@@ -254,43 +258,6 @@ pub trait RawLock {
     fn try_lock(&self) -> bool;
 }
 
-/// CAS 自旋原语（无中断语义、无 ladder、无公平）。内存序由原子语义背书：
-/// acquire 成功路径 Acquire、release Release，跨核临界区可见性不依赖
-/// 手写栅栏。
-pub struct RawSpinlock {
-    locked: AtomicU32,
-}
-
-impl RawSpinlock {
-    pub const fn new() -> Self {
-        Self {
-            locked: AtomicU32::new(0),
-        }
-    }
-}
-
-impl RawLock for RawSpinlock {
-    fn acquire(&self) {
-        while self
-            .locked
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn release(&self) {
-        self.locked.store(0, Ordering::Release);
-    }
-
-    fn try_lock(&self) -> bool {
-        self.locked
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    }
-}
-
 /// FIFO ticket 原语：`next` 发号、`serving` 叫号。等锁上界：获取期间关本地
 /// 中断且协作式内核每 hart 至多一个待获取请求，故至多排在 H−1 个短临界区
 /// 之后（维护执行分案）。计数按 u32 回绕：同时在途票数 ≤ H 远小于 2^32，
@@ -326,7 +293,9 @@ impl RawLock for RawTicketLock {
 
     fn try_lock(&self) -> bool {
         // 只在无人排队时取号：next == serving 时 CAS next 前进一格。
-        let serving = self.serving.load(Ordering::Relaxed);
+        // 获取前 owner 对 serving 的 Release；next 的 CAS 只预留票号，
+        // 不能替代对临界区写入的 Acquire。
+        let serving = self.serving.load(Ordering::Acquire);
         self.next
             .compare_exchange(
                 serving,
@@ -342,41 +311,61 @@ impl RawLock for RawTicketLock {
 /// 构造路径注入（锁实例由库控制构造，秩只能走 const 泛型）。trait
 /// 路径参与 ladder 断言。
 pub struct RankedRawSpinlock<const RANK: u32> {
-    raw: RawSpinlock,
+    raw: RawTicketLock,
+    interrupt: UnsafeCell<InterruptState>,
 }
+
+// SAFETY: interrupt 只由当前票的持有者读写；等待者先关本地 IRQ，
+// 同 hart 不重入；RawMutex GuardNoSend 保证在原 hart 归还。
+unsafe impl<const RANK: u32> Sync for RankedRawSpinlock<RANK> {}
 
 impl<const RANK: u32> RankedRawSpinlock<RANK> {
     pub const fn new() -> Self {
         Self {
-            raw: RawSpinlock::new(),
+            raw: RawTicketLock::new(),
+            interrupt: UnsafeCell::new(InterruptState {
+                sie_was_enabled: false,
+            }),
         }
     }
 }
 
+// SAFETY: FIFO 票提供唯一 owner，Acquire/Release 发布数据，trait 的
+// unlock 仅由持票 owner 调用；中断状态由同一 owner 保存/恢复。
 unsafe impl<const RANK: u32> lock_api::RawMutex for RankedRawSpinlock<RANK> {
     const INIT: Self = Self::new();
     type GuardMarker = lock_api::GuardNoSend;
 
     #[inline]
     fn lock(&self) {
+        let state = disable_interrupts();
         self.raw.acquire();
+        // SAFETY: 已取当前票，仅持有者可访问中断保存槽。
+        unsafe { *self.interrupt.get() = state };
         ladder::push(Rank(RANK), 0, None);
     }
 
     #[inline]
     fn try_lock(&self) -> bool {
+        let state = disable_interrupts();
         if self.raw.try_lock() {
+            // SAFETY: 取票成功，本 hart 唯一持有。
+            unsafe { *self.interrupt.get() = state };
             ladder::push(Rank(RANK), 0, None);
             true
         } else {
+            restore_interrupts(state);
             false
         }
     }
 
     #[inline]
     unsafe fn unlock(&self) {
+        // SAFETY: trait 要求当前 owner；此槽在发放下一票前读取完成。
+        let state = unsafe { *self.interrupt.get() };
         ladder::pop();
         self.raw.release();
+        restore_interrupts(state);
     }
 }
 
@@ -389,12 +378,9 @@ pub struct Lock<R: RawLock, T> {
     data: UnsafeCell<T>,
 }
 
-/// 无公平 CAS 自旋锁，现有锁默认使用。
-pub type Spinlock<T> = Lock<RawSpinlock, T>;
-/// FIFO ticket 锁：需要等锁上界的共享点使用（维护队列，timer/remote 待迁移）。
-pub type TicketSpinlock<T> = Lock<RawTicketLock, T>;
-pub type SpinlockGuard<'a, T> = LockGuard<'a, RawSpinlock, T>;
-pub type TicketSpinlockGuard<'a, T> = LockGuard<'a, RawTicketLock, T>;
+/// 内核共享同步统一 FIFO；链式 rank 与 IRQ 规则由容器拥有。
+pub type Spinlock<T> = Lock<RawTicketLock, T>;
+pub type SpinlockGuard<'a, T> = LockGuard<'a, RawTicketLock, T>;
 
 /// SAFETY: 数据仅能在持有锁（本 hart 关中断 + 互斥）时访问。
 unsafe impl<R: RawLock + Sync, T: Send> Sync for Lock<R, T> {}
@@ -406,22 +392,16 @@ pub struct LockGuard<'a, R: RawLock, T> {
     state: InterruptState,
 }
 
-impl<T> Lock<RawSpinlock, T> {
+impl<T> Lock<RawTicketLock, T> {
     pub const fn new(rank: Rank, value: T) -> Self {
-        Self::with_raw(RawSpinlock::new(), rank, 0, value)
+        Self::with_raw(RawTicketLock::new(), rank, 0, value)
     }
 
     /// 链式锁：同秩多把沿 `chain_key` 严格递增获取（Job 链锁 = jid、
     /// HandleTable caller→child = pid）。非链式锁（key 为零）同秩连持
     /// 即断言违规。
     pub const fn chained(rank: Rank, chain_key: u64, value: T) -> Self {
-        Self::with_raw(RawSpinlock::new(), rank, chain_key, value)
-    }
-}
-
-impl<T> Lock<RawTicketLock, T> {
-    pub const fn new(rank: Rank, value: T) -> Self {
-        Self::with_raw(RawTicketLock::new(), rank, 0, value)
+        Self::with_raw(RawTicketLock::new(), rank, chain_key, value)
     }
 }
 

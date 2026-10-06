@@ -14,6 +14,27 @@ use core::marker::PhantomData;
 use erhino_shared::call::SystemCallError;
 use metadata_admission::{Counter, Permit, SponsoredPermit};
 
+/// 使用可执行程序选择的allocator供给；本层不追加逐分配软额度。
+/// 底层heap页与领域Charge分别拥有付款，不代表Kernel metadata已付款。
+pub struct AllocatorBacked;
+impl funded_storage::Funding for AllocatorBacked {
+    type Charge = ();
+    type Error = core::convert::Infallible;
+    fn charge(&self, _: core::alloc::Layout) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+pub fn allocator_error(
+    error: funded_storage::StorageError<core::convert::Infallible>,
+) -> SystemCallError {
+    match error {
+        funded_storage::StorageError::Allocation => SystemCallError::OutOfMemory,
+        funded_storage::StorageError::Layout => SystemCallError::ReachLimit,
+        funded_storage::StorageError::Funding(never) => match never {},
+    }
+}
+
 /// 领域资源分类：把领域枚举映射到领域视图中的有限槽位。
 pub trait Taxonomy {
     const COUNT: usize;

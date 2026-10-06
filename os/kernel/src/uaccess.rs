@@ -1,204 +1,219 @@
-//! 用户内存边界：内核触碰用户 VA 的唯一通道（notes/impls/internals.md「地址空间」）。
-//!
-//! 职责集中于此，任何 syscall 不得自行拼装校验 + SUM + 裸指针：
-//! - 区间合法：不溢出、不出用户半区、单次不超限长；
-//! - 逐页权限：U 必备，读需 R、写需 W（此前只验「有映射」，读 X-only 页
-//!   会在 S 态 fault 的缺口由此闭合）；
-//! - SUM guard 收编，调用方无感知。
-//!
-//! 复检语义：每次访问在当次持有的 space 锁内重新校验（check 与拷贝
-//! 同一临界区），不存在 TOCTOU 窗口；多线程下同进程线程可在两次
-//! space 锁之间拆除输出页——复检失败不是编程错误，syscall 输出交付
-//! 统一走 [`deliver_output`]（冻结 store-access 终因并杀调用进程）。
+//! 用户访问：空间锁内 translate 预检与受保护 SUM 直访；跨空间交付使用同一页表翻译。
 
-use crate::mm::SumGuard;
-use crate::task::Thread;
-use crate::task::proc::{AddressSpaceState, PAGE_SIZE};
+use crate::{mm::SumGuard, task::Thread, vm::space::AnySpace};
+use erhino_shared::{call::SystemCallError, proc::PROCESS_PAGE_SIZE};
 
-/// 单次访问上限（防恶意长度；Debug 消息与初期 IPC 载荷远小于此）。
 pub const MAX_USER_ACCESS: usize = 1 << 20;
 
-/// 用户内存访问失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessError {
-    /// 区间溢出 / 越出用户半区 / 超过限长。
     BadRange,
-    /// 区间内有页未映射。
     NotMapped,
-    /// 权限不足（缺 U，或方向位不符）。
     Permission,
 }
 
-impl From<AccessError> for erhino_shared::call::SystemCallError {
-    fn from(e: AccessError) -> Self {
-        use erhino_shared::call::SystemCallError;
-        match e {
-            AccessError::BadRange | AccessError::NotMapped | AccessError::Permission => {
-                SystemCallError::MemoryNotAccessible
-            }
-        }
+impl From<AccessError> for SystemCallError {
+    fn from(_: AccessError) -> Self {
+        Self::MemoryNotAccessible
     }
 }
 
-/// 从用户内存拷入内核（src 为用户 VA，dst 为内核缓冲）。
-pub fn copy_from_user(
-    space: &mut AddressSpaceState,
-    dst: &mut [u8],
-    src: usize,
-) -> Result<(), AccessError> {
+pub fn copy_from_user(space: &mut AnySpace, dst: &mut [u8], src: usize) -> Result<(), AccessError> {
+    if dst.is_empty() {
+        return Ok(());
+    }
     if dst.len() > MAX_USER_ACCESS {
         return Err(AccessError::BadRange);
     }
     space.check_range(src, dst.len(), false)?;
-    // SAFETY: 区间已逐页校验（U+R、用户半区内、未超限）；持 space 锁期间
-    // 无并发映射变更，guard 存活期不重入调度。
+    // SAFETY: 调用方在空间锁内持有 space，translate 已逐页确认 U|R；
+    // guard 内不调度，目标为独占内核缓冲。
     let _sum = unsafe { SumGuard::open() };
-    // SAFETY: 同上；src..src+len 可解引用且目标缓冲独占。
-    unsafe {
-        core::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len());
-    }
+    unsafe { copy_bytes(src, dst.as_mut_ptr() as usize, dst.len()) };
     Ok(())
 }
 
-/// 读取一个无 padding 且任意位型均有效的定宽 ABI 值。
+/// 用户 VA 0 可以是有效映射，不能经 Rust 要求 non-null 的指针原语访问。
+/// 按 RV64I LB/SB（固定 ISA v20250508，「Load and Store Instructions」）直访。
 ///
 /// # Safety
-/// `T` 必须是纯整数/整数 newtype 组成的 ABI 类型；任何字节组合都必须有效。
-pub unsafe fn read_user_value<T: Copy>(
-    space: &mut AddressSpaceState,
-    src: usize,
-) -> Result<T, AccessError> {
+/// 调用者已校验并稳定映射、开启 SUM，输入/输出区间不重叠且长度有结构上界。
+unsafe fn copy_bytes(src: usize, dst: usize, count: usize) {
+    // SAFETY: 上述契约保证每一步均可访问；汇编不创建地址为零的 Rust 引用，
+    // 默认 memory effect 防止编译器跨越访问重排，三个游标只在本调用中消耗。
+    unsafe {
+        core::arch::asm!(
+            "beqz {count}, 3f",
+            "2:",
+            "lb {byte}, 0({src})",
+            "sb {byte}, 0({dst})",
+            "addi {src}, {src}, 1",
+            "addi {dst}, {dst}, 1",
+            "addi {count}, {count}, -1",
+            "bnez {count}, 2b",
+            "3:",
+            src = inout(reg) src => _,
+            dst = inout(reg) dst => _,
+            count = inout(reg) count => _,
+            byte = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+/// # Safety
+/// T 任意位型均有效，且读取期间调用者持有空间锁。
+pub unsafe fn read_user_value<T: Copy>(space: &mut AnySpace, src: usize) -> Result<T, AccessError> {
     let mut value = core::mem::MaybeUninit::<T>::uninit();
-    // SAFETY: MaybeUninit 的整段存储可作为待写字节；成功后全部字节已初始化。
+    // SAFETY: 未初始化存储可作为待写字节；成功读取覆盖所有字节。
     let bytes = unsafe {
         core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
     };
     copy_from_user(space, bytes, src)?;
-    // SAFETY: 调用方保证任意位型对 T 有效，且 copy_from_user 已写满全部字节。
+    // SAFETY: 调用者保证任意位型有效，全部字节已写入。
     Ok(unsafe { value.assume_init() })
 }
 
-/// 写出一个不含未初始化 padding 的定宽 ABI 值。
-///
-/// # Safety
-/// `T` 的对象表示不得包含 padding 或其它未初始化字节。
-pub unsafe fn write_user_value<T: Copy>(
-    space: &mut AddressSpaceState,
-    dst: usize,
-    value: &T,
-) -> Result<(), AccessError> {
-    // SAFETY: 调用方保证 T 的完整对象表示均已初始化。
-    let bytes = unsafe {
-        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
-    };
-    copy_to_user(space, dst, bytes)
+pub fn copy_to_user(space: &mut AnySpace, dst: usize, src: &[u8]) -> Result<(), AccessError> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if src.len() > MAX_USER_ACCESS {
+        return Err(AccessError::BadRange);
+    }
+    space.check_range(dst, src.len(), true)?;
+    // SAFETY: 空间锁排除映射变更，已逐页确认 U|W；guard 内不调度。
+    let _sum = unsafe { SumGuard::open() };
+    unsafe { copy_bytes(src.as_ptr() as usize, dst, src.len()) };
+    Ok(())
 }
 
-/// 交付 syscall 输出：写回当次复检，失败即冻结 (Fault, StoreAccess)
-/// 终止调用进程。
-///
-/// 复检失败唯一成因是同进程线程在两次 space 锁之间经另一笔地址空间
-/// 事务拆除了输出页——等价于一次由内核代为检出的
-/// store access fault：用户可触发的 fault 杀进程，绝不 panic 内核；
-/// 副作用已发生的歧义由进程死亡清理兑底。调用方把 Err 向上传播
-/// 即可；当前线程持有预付的待办交接槽，trap 在业务锁释放后交付终止，
-/// 再将出口改写为 Killed，线程不回用户态。
-///
-/// # Safety
-/// `T` 的对象表示不得包含 padding 或其它未初始化字节（同
-/// [`write_user_value`]）。
-pub unsafe fn deliver_output<T: Copy>(
+/// 固定结果槽的发布字；调用者持空间锁和账本 UserWriteLease，payload 已先写完。
+pub(crate) fn publish_u64(space: &mut AnySpace, dst: usize, value: u64) -> Result<(), AccessError> {
+    if !dst.is_multiple_of(core::mem::align_of::<u64>()) {
+        return Err(AccessError::BadRange);
+    }
+    space.check_range(dst, core::mem::size_of::<u64>(), true)?;
+    // SAFETY: 对齐/翻译/同空间锁保证 U|W 稳定；此字段 ABI 规定仅原子访问。
+    let _sum = unsafe { SumGuard::open() };
+    // SAFETY: 不能为合法用户 VA 0 构造 AtomicU64 引用。RVWMO 的 release
+    // store 以 FENCE RW,W + 对齐 SD 实现，其他条件由上述校验和空间锁保证。
+    unsafe {
+        core::arch::asm!(
+            "fence rw, w",
+            "sd {value}, 0({dst})",
+            value = in(reg) value,
+            dst = in(reg) dst,
+            options(nostack),
+        );
+    }
+    Ok(())
+}
+
+/// 固定 ABI 输出的封闭白名单；安全写回不能接受任意 Rust T。
+mod output {
+    pub trait Sealed {}
+    macro_rules! values {
+        ($($ty:ty),* $(,)?) => { $(impl Sealed for $ty {})* };
+    }
+    // 各类型为 repr(C)/透明的整数布局，共享 ABI 的大小/对齐断言覆盖 padding。
+    values!(
+        u32,
+        u64,
+        erhino_shared::wait_set::ReadyRecord,
+        erhino_shared::object::Handle,
+        erhino_shared::object::HandlePair,
+        erhino_shared::object::HandleDescription,
+        erhino_shared::object::SenderResult,
+        erhino_shared::message::MessageHeader,
+        erhino_shared::message::ReceiveResult,
+        erhino_shared::memory_object::MemoryObjectSnapshot,
+        erhino_shared::mem::MemoryMapResult,
+        erhino_shared::proc::ThreadCreateResult,
+        erhino_shared::proc::ProcessCreateResult,
+        erhino_shared::proc::ProcessSnapshot,
+        erhino_shared::proc::JobSnapshot,
+        erhino_shared::tunnel::TunnelCreateResult,
+        erhino_shared::memory_pool::MemoryPoolSnapshot,
+        erhino_shared::time::ClockSnapshot,
+    );
+}
+
+/// 当前执行线程的安全定宽输出；Frozen 后不准入新的 syscall 输出。
+pub fn write_user<T: Copy + output::Sealed>(
     thread: &Thread,
-    space: &mut AddressSpaceState,
     dst: usize,
     value: &T,
-) -> Result<(), erhino_shared::call::SystemCallError> {
-    // SAFETY: 调用方保证 T 的完整对象表示均已初始化。
+) -> Result<(), SystemCallError> {
+    let body = thread
+        .process
+        .lease_body()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    let mut vm = body.vm.space.lock();
+    let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
+    // SAFETY: Sealed 只开放已验证无 padding 的固定 ABI 类型，持 VM 空间锁。
+    unsafe { deliver_output(thread, space, dst, value) }
+}
+
+/// # Safety
+/// T 的完整对象表示已初始化且无 padding；调用者持有空间锁。
+pub unsafe fn deliver_output<T: Copy>(
+    thread: &Thread,
+    space: &mut AnySpace,
+    dst: usize,
+    value: &T,
+) -> Result<(), SystemCallError> {
+    // SAFETY: 同调用者契约。
     let bytes = unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
     };
     deliver_bytes(thread, space, dst, bytes)
 }
 
-/// 多段输出共享同一失败规则；返回错误只用于调用方回滚尚未提交的事务。
+/// 副作用后的输出复检失败记录到执行线程，由 trap 在业务锁退出后冻结。
 pub fn deliver_bytes(
     thread: &Thread,
-    space: &mut AddressSpaceState,
+    space: &mut AnySpace,
     dst: usize,
     bytes: &[u8],
-) -> Result<(), erhino_shared::call::SystemCallError> {
+) -> Result<(), SystemCallError> {
     copy_to_user(space, dst, bytes).map_err(|error| {
-        let todo = fault_output(&thread.process, thread.member().tid(), dst, Some(thread.member()));
-        // 业务锁可能仍在调用方栈上；trap 在锁释放后交付终止待办。
-        thread.defer_output_termination(todo);
+        thread.defer_output_fault(dst);
         error.into()
     })
 }
 
-pub fn fault_output(
-    process: &alloc::sync::Arc<crate::task::proc::Process>,
-    tid: erhino_shared::proc::Tid,
-    dst: usize,
-    exiting: Option<crate::task::lifecycle::MemberKey>,
-) -> crate::task::lifecycle::TerminationTodo {
-    process.lifecycle.request_termination(
-        erhino_shared::proc::TerminationCause::Faulted,
-        erhino_shared::proc::TerminationDetail::fault(
-            tid,
-            erhino_shared::proc::ProcessFaultCode::UserAccess,
-            dst as u64,
-        ),
-        exiting,
-    )
+/// 仅供持 Building 准入的映像构造者；最终 RX 页在首次执行前可初始化。
+pub(crate) fn put_initial(space: &mut AnySpace, dst: usize, src: &[u8]) -> Result<(), AccessError> {
+    put_indirect(space, dst, src, false)
 }
 
-/// 从内核拷入用户内存（dst 为用户 VA，src 为内核缓冲）。
-pub fn copy_to_user(
-    space: &mut AddressSpaceState,
+fn put_indirect(
+    space: &mut AnySpace,
     dst: usize,
     src: &[u8],
+    writable: bool,
 ) -> Result<(), AccessError> {
     if src.len() > MAX_USER_ACCESS {
         return Err(AccessError::BadRange);
     }
-    space.check_range(dst, src.len(), true)?;
-    // SAFETY: 区间已逐页校验（U+W）；其余同 copy_from_user。
-    let _sum = unsafe { SumGuard::open() };
-    // SAFETY: 同上。
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
-    }
-    Ok(())
-}
-
-/// 跨地址空间拷入用户缓冲：完成方上下文目标空间**未激活**（调度循环/
-/// 异核唤醒路径，SUM 直访不可用），逐页 translate 后经直映射写入。
-/// 校验与拷贝同持 `space` 锁，无 TOCTOU；页间边界由逐页循环消除。
-pub fn put_user_indirect(
-    space: &mut AddressSpaceState,
-    dst: usize,
-    src: &[u8],
-) -> Result<(), AccessError> {
-    if src.len() > MAX_USER_ACCESS {
-        return Err(AccessError::BadRange);
-    }
-    space.check_range(dst, src.len(), true)?;
-    let mut off = 0;
-    while off < src.len() {
-        let va = dst + off;
-        let in_page = va % PAGE_SIZE;
-        let n = (PAGE_SIZE - in_page).min(src.len() - off);
+    space.check_range(dst, src.len(), writable)?;
+    let mut offset = 0;
+    while offset < src.len() {
+        let va = dst + offset;
+        let in_page = va % PROCESS_PAGE_SIZE;
+        let count = (PROCESS_PAGE_SIZE - in_page).min(src.len() - offset);
         let pa = space.page_pa(va).ok_or(AccessError::NotMapped)?;
-        // SAFETY: 页已校验含 U|W；pa 来自该页 translate，直映射区间
-        // [pa+in_page, pa+in_page+n) 不出页且与 src 不重叠。
+        // SAFETY: 空间锁稳定译址；check_range 确认 U|W 或尚未执行的 Building 页 U|R，
+        // 内核输入缓冲与用户帧互不重叠。
         unsafe {
             core::ptr::copy_nonoverlapping(
-                src[off..].as_ptr(),
+                src[offset..].as_ptr(),
                 crate::mm::phys_to_virt(pa + in_page) as *mut u8,
-                n,
+                count,
             );
         }
-        off += n;
+        offset += count;
     }
     Ok(())
 }

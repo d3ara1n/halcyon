@@ -1,39 +1,28 @@
-//! 公共 MemoryObject 与 Tunnel 的统一对象 core。
-//!
-//! `MemoryObjectCore` 同时持：ObjectBacking（固定长度、堆化多 extent 的资金化
-//! backing）、MemoryObjectState（Mutable → Sealing → Executable 状态机，内含对象身份
-//! 与固定长度）、对象自身的等待面与 metadata owner（sponsor 强引用 + backing permit）。
-//!
-//! 对象身份从内核对象身份序列（`object::try_mint_koid`）铸造后交给状态机保管，不在
-//! core 上另存一份——身份、长度与可执行状态同属对象的逻辑状态，单一真值点避免二者
-//! 失步。
-//!
-//! 等待面按信号归属分层：`EXECUTABLE` 是对象自身的电平，与状态机共用同一把对象锁；
-//! Tunnel 的 `DATA`/`PEER_CLOSED`/`CLOSED` 属于 Endpoint 关系状态，由 Endpoint 各自
-//! 拥有，不进入 core。
+//! MemoryObject/Tunnel 的 seal 与 backing core。普通 Arc/观察 loan 只保活状态，
+//! 物理使用由 BackingOwner 的 root use 和各 View 的 BackingUse 独立持有。
 
-use alloc::{sync::Arc, vec::Vec};
-
-use memory_space::{
-    ExecutableState, MemoryObjectState, ObjectError, ObjectId, ObjectViewAuthorization,
-    PermitRequirement, Protection, SealOutcome, WritePermit,
+use super::{
+    handle::{self, Authorization},
+    memory_pool::MemoryPool,
+    object::{self, KernelObject, ObjectHeader, ObjectKind},
+    wait_source::{Hint, ObservationSource, Snapshot, Step, WaitNode, WaitQueue},
 };
-
 use crate::{
-    frame::{self, ObjectBacking},
-    sync::Spinlock,
-    task::{
-        memory_pool::MemoryPool,
-        object::{self, ObjectWaitState, SubscribeResult},
-        resources::{ConnectionPermit, MetadataSponsor, ObjectBackingPermit},
-        wait::Subscription,
-    },
+    frame,
+    maintenance::{self as mt, Work, WorkRecord},
+    sync::{Spinlock, ranks},
+    vm::backing::{Backing, BackingOwner},
 };
-
+use alloc::sync::Arc;
+use core::{any::Any, pin::Pin};
 use erhino_shared::{
     call::SystemCallError,
     memory_object::{MemoryObjectSnapshot, MemoryObjectState as AbiObjectState},
-    object::ObjectSignals,
+    object::{Handle, ObjectSignals, Rights},
+};
+use memory_space::{
+    ExecutableState, MemoryObjectState, ObjectError, ObjectId, ObjectViewAuthorization, PAGE_SIZE,
+    PermitRequirement, Protection, SealOutcome, WritePermit,
 };
 
 fn mint_object_id() -> Result<ObjectId, SystemCallError> {
@@ -41,495 +30,331 @@ fn mint_object_id() -> Result<ObjectId, SystemCallError> {
     ObjectId::new(koid).ok_or(SystemCallError::InternalError)
 }
 
-/// 把资金化失败分类为系统调用错误：额度不足与物理/metadata 不足不同，
-/// 结构硬上限也单独区分，不得统一折成 `OutOfMemory`。
-fn map_fund_error(
-    error: funded_frame::FundError<memory_pool::PoolError, frame::UserClaimError>,
-) -> SystemCallError {
-    match error {
-        funded_frame::FundError::Quota(memory_pool::PoolError::QuotaExceeded) => {
-            SystemCallError::QuotaExceeded
-        }
-        funded_frame::FundError::Quota(_) => SystemCallError::OutOfMemory,
-        funded_frame::FundError::PageLimit | funded_frame::FundError::ExtentLimit => {
-            SystemCallError::ReachLimit
-        }
-        funded_frame::FundError::ZeroPages
-        | funded_frame::FundError::InvalidClaim
-        | funded_frame::FundError::Physical(_) => SystemCallError::OutOfMemory,
-    }
-}
-
 pub(crate) fn map_object_error(error: ObjectError) -> SystemCallError {
     match error {
-        ObjectError::AllocationFailed => SystemCallError::OutOfMemory,
-        ObjectError::PermitLimit => SystemCallError::ReachLimit,
+        ObjectError::CapacityChanged => SystemCallError::ReachLimit,
+        ObjectError::PermitLimit | ObjectError::PermitOverflow => SystemCallError::ReachLimit,
         ObjectError::ViewDenied | ObjectError::PermitDenied => SystemCallError::ObjectBusy,
-        ObjectError::PermitOverflow => SystemCallError::InternalError,
     }
 }
 
-/// 状态机与等待面共用同一把对象锁：可执行发布与 `EXECUTABLE` 电平必须原子推进。
-struct CoreState {
-    machine: MemoryObjectState,
-    wait: ObjectWaitState,
-}
-
-/// 公共 MemoryObject 与 Tunnel Connection 的统一 core。
-///
-/// 持有对象身份、backing、状态机、对象电平与 metadata 生命周期 owner。状态经
-/// `MEMORY_OBJECT` 锁秩包裹；任何 view 事务都在 AddressSpace 锁外与它交互。
 pub(crate) struct MemoryObjectCore {
-    pub(crate) backing: ObjectBacking,
-    state: Spinlock<CoreState>,
-    _sponsor: Arc<MetadataSponsor>,
-    _backing_permit: ObjectBackingPermit,
+    backing: Arc<Backing>,
+    state: Spinlock<MemoryObjectState>,
+    source: WaitQueue,
+    /// 来源 Work 使用稳定存储身份，不铸造 capability 或业务 use。
+    this: Spinlock<alloc::sync::Weak<Self>>,
+    _metadata: super::resources::MetadataCharge,
 }
 
 impl MemoryObjectCore {
-    fn new(
-        pool: &Arc<MemoryPool>,
-        sponsor: &Arc<MetadataSponsor>,
+    /// 准备返回两种不同 owner：共享状态 Arc 与仅一份完整 backing use。
+    pub(crate) fn new(
+        pool: Arc<MemoryPool>,
         pages: usize,
-        permit_limit: usize,
-    ) -> Result<Self, SystemCallError> {
-        let backing_permit = MetadataSponsor::reserve_object_backing(sponsor)?;
+    ) -> Result<(Arc<Self>, BackingOwner), SystemCallError> {
+        if pages == 0 || pages as u64 > erhino_shared::memory_object::MEMORY_OBJECT_MAX_PAGES {
+            return Err(SystemCallError::ReachLimit);
+        }
+        let bytes = pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(SystemCallError::IllegalArgument)?;
         let identity = mint_object_id()?;
-        let backing = frame::fund_object_backing(
-            pool,
+        let owner = Backing::fund(
+            pool.clone(),
             pages,
             funded_frame::Limits {
-                max_pages: pages,
+                max_pages: erhino_shared::memory_object::MEMORY_OBJECT_MAX_PAGES as usize,
                 max_extents: frame::MAX_FUNDED_EXTENTS,
             },
-        )
-        .map_err(map_fund_error)?;
-        let object_bytes = backing.pages() * super::proc::PAGE_SIZE;
-        Ok(Self {
-            backing,
+        )?;
+        let metadata = super::resources::MetadataCharge::arc::<Self>(&pool)?;
+        let core = Arc::try_new(Self {
+            backing: owner.backing().clone(),
+            // 并发可写 view 不决定单步工作量；每份许可有实际准备存储，保留计数表示上限。
             state: Spinlock::new(
-                crate::sync::ranks::MEMORY_OBJECT,
-                CoreState {
-                    machine: MemoryObjectState::new(identity, object_bytes, permit_limit),
-                    wait: ObjectWaitState::new(ObjectSignals::NONE),
-                },
+                ranks::MEMORY_OBJECT,
+                MemoryObjectState::new(identity, bytes, usize::MAX),
             ),
-            _sponsor: Arc::clone(sponsor),
-            _backing_permit: backing_permit,
+            source: WaitQueue::new(pool.maintenance_account().clone()),
+            this: Spinlock::new(ranks::LEAF, alloc::sync::Weak::new()),
+            _metadata: metadata,
         })
-    }
-
-    /// 公共 MemoryObject：长度由调用者声明，permit 上限跟随可同时存在的 view 数。
-    pub(crate) fn new_public(
-        pool: &Arc<MemoryPool>,
-        sponsor: &Arc<MetadataSponsor>,
-        pages: usize,
-    ) -> Result<Arc<Self>, SystemCallError> {
-        let core = Self::new(pool, sponsor, pages, MAX_WRITE_VIEWS_PER_OBJECT)?;
-        Arc::try_new(core).map_err(|_| SystemCallError::OutOfMemory)
-    }
-
-    /// Tunnel 两端共用可变对象 core，最多两个可写 view；资金来源与公共对象一致。
-    pub(crate) fn new_tunnel_connection(
-        pool: &Arc<MemoryPool>,
-        sponsor: &Arc<MetadataSponsor>,
-        pages: usize,
-    ) -> Result<(Self, ConnectionPermit), SystemCallError> {
-        let connection_permit = MetadataSponsor::reserve_connection(sponsor)?;
-        let core = Self::new(pool, sponsor, pages, 2)?;
-        Ok((core, connection_permit))
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+        *core.this.lock() = Arc::downgrade(&core);
+        Ok((core, owner))
     }
 
     pub(crate) fn identity(&self) -> ObjectId {
-        self.state.lock().machine.object()
+        self.state.lock().object()
     }
-
-    /// 在对象锁内取得 view 准入；含 W 的 view 还必须取得等量 [`WritePermit`]。
+    /// 在来源 capability 尚受表锁保护时取得独立 use；由 VM 操作持有到提交/回滚。
+    pub(crate) fn acquire_use(
+        &self,
+        offset: usize,
+        bytes: usize,
+        storage: &mut crate::vm::backing::BackingStorage,
+    ) -> Result<Option<crate::vm::backing::BackingUse>, SystemCallError> {
+        if !offset.is_multiple_of(PAGE_SIZE) || !bytes.is_multiple_of(PAGE_SIZE) || bytes == 0 {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let lo = (offset / PAGE_SIZE) as u64;
+        let hi = lo
+            .checked_add((bytes / PAGE_SIZE) as u64)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        self.backing.acquire(lo, hi, storage)
+    }
+    pub(crate) fn prepare_use(
+        &self,
+        pool: &Arc<MemoryPool>,
+    ) -> Result<crate::vm::backing::BackingStorage, SystemCallError> {
+        self.backing.prepare_storage(2, pool)
+    }
     pub(crate) fn authorize_view(
         &self,
         maximum: Protection,
     ) -> Result<ObjectViewAuthorization, ObjectError> {
-        self.state.lock().machine.authorize_view(maximum)
+        self.state.lock().authorize_view(maximum)
     }
 
-    /// view 准入与写许可在同一次加锁内取得，与 seal 在对象锁上线性化。
-    pub(crate) fn authorize_write_view(
+    pub(crate) fn reserve_replacement_writes<C>(
         &self,
-        maximum: Protection,
-    ) -> Result<(ObjectViewAuthorization, Vec<WritePermit>), ObjectError> {
-        let mut state = self.state.lock();
-        let authorization = state.machine.authorize_view(maximum)?;
-        let permits = state.machine.reserve_writes(1)?;
-        Ok((authorization, permits))
-    }
-
-    /// 放弃尚未提交的写许可；Commit 前的回滚路径专用。permit 可逐个归还——
-    /// Unmap/Protect 的预留失败路径会按来源逐个退还。
-    pub(crate) fn cancel_writes(&self, permits: Vec<WritePermit>) {
-        for permit in permits {
-            self.cancel_write(permit);
-        }
+        requirement: PermitRequirement,
+        output: &mut funded_storage::Buffer<WritePermit, C>,
+    ) -> Result<(), ObjectError> {
+        self.state
+            .lock()
+            .reserve_replacement_writes(requirement, output)
     }
 
     pub(crate) fn cancel_write(&self, permit: WritePermit) {
-        let published = self.state.lock().machine.cancel_write(permit);
-        self.finish_seal(published);
+        let notify = {
+            let mut state = self.state.lock();
+            let published = state.cancel_write(permit);
+            self.publish_locked(published)
+        };
+        if notify {
+            self.kick();
+        }
     }
-
-    /// 为既有 view 的重排预留写许可；successor 属性来自 planner 的不可构造需求。
-    pub(crate) fn reserve_replacement_writes(
-        &self,
-        requirement: PermitRequirement,
-    ) -> Result<Vec<WritePermit>, ObjectError> {
-        self.state
-            .lock()
-            .machine
-            .reserve_replacement_writes(requirement)
-    }
-
-    /// 地址翻译确认后退役单个写许可；最后一个 permit 的退役发布 `EXECUTABLE`。
-    /// 退役路径不得失败，因此按 permit 逐个归还，不构造中间容器。
     pub(crate) fn retire_write(&self, permit: WritePermit) {
-        let published = self.state.lock().machine.retire_write(permit);
-        self.finish_seal(published);
+        let notify = {
+            let mut state = self.state.lock();
+            let published = state.retire_write(permit);
+            self.publish_locked(published)
+        };
+        if notify {
+            self.kick();
+        }
     }
-
-    /// 单向请求可执行发布。返回 true 表示已进入 Executable 终态。
     pub(crate) fn seal(&self) -> bool {
-        let outcome = self.state.lock().machine.seal();
-        let published = outcome == SealOutcome::Published;
-        self.finish_seal(published);
+        let (published, notify) = {
+            let mut state = self.state.lock();
+            let published = state.seal() == SealOutcome::Published;
+            (published, self.publish_locked(published))
+        };
+        if notify {
+            self.kick();
+        }
         published
     }
-
+    /// 调用者持 MEMORY_OBJECT；machine 与公开电平同域提交。
+    fn publish_locked(&self, published: bool) -> bool {
+        if !published {
+            return false;
+        }
+        // SAFETY: core 位于稳定 Arc，所有来源链与 machine 操作受同一锁保护。
+        unsafe { self.source.update(ObjectSignals::EXECUTABLE, false) }
+    }
+    fn kick(&self) {
+        let root: Arc<dyn Work> = self
+            .this
+            .lock()
+            .upgrade()
+            .expect("live memory object lost source root");
+        mt::publish(root);
+        mt::kick();
+    }
     pub(crate) fn snapshot(&self) -> MemoryObjectSnapshot {
         let state = self.state.lock();
-        let abi = match state.machine.state() {
+        let abi = match state.state() {
             ExecutableState::Mutable => AbiObjectState::Mutable,
             ExecutableState::Sealing => AbiObjectState::Sealing,
             ExecutableState::Executable => AbiObjectState::Executable,
         };
         MemoryObjectSnapshot {
-            identity: state.machine.object().get(),
-            bytes: state.machine.object_bytes() as u64,
-            write_views: state.machine.permit_count() as u64,
+            identity: state.object().get(),
+            bytes: state.object_bytes() as u64,
+            write_views: state.permit_count() as u64,
             state: abi as u32,
             reserved0: 0,
             reserved: [0; 4],
         }
     }
+}
 
-    pub(crate) fn signals(&self) -> ObjectSignals {
-        self.state.lock().wait.signals()
+impl ObservationSource for MemoryObjectCore {
+    fn snapshot(&self) -> Snapshot {
+        let _state = self.state.lock();
+        // SAFETY: 持该来源唯一同步域。
+        unsafe { self.source.snapshot() }
     }
-
-    pub(crate) fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.state.lock().wait.subscribe(subscription)
+    unsafe fn attach(&self, node: Pin<&WaitNode>, interest: ObjectSignals, hint: Hint) {
+        let _state = self.state.lock();
+        // SAFETY: 调用者保证 pin 节点/loan 至 detach 返回，来源锁串行链操作。
+        unsafe { self.source.attach(node, interest, hint) }
     }
-
-    pub(crate) fn rearm_observer(&self, id: u64) -> Result<object::ObserverRearm, SystemCallError> {
-        self.state.lock().wait.rearm_observer(id)
+    unsafe fn detach(&self, node: Pin<&WaitNode>) -> Hint {
+        let _state = self.state.lock();
+        // SAFETY: 同挂链契约；返还凭据不含节点借用。
+        unsafe { self.source.detach(node) }
     }
-
-    pub(crate) fn cancel_observer(&self, id: u64) -> Option<object::CancelledObservation> {
-        self.state.lock().wait.cancel_observer(id)
+}
+impl Work for MemoryObjectCore {
+    fn record(&self) -> &WorkRecord {
+        self.source.record()
     }
-
-    pub(crate) fn unsubscribe(&self, id: u64) {
-        let retired = self.state.lock().wait.unsubscribe(id);
-        drop(retired);
-    }
-
-    /// 发布 `EXECUTABLE` 电平并在对象锁外完成等待者。电平置位后持续为真，
-    /// 因此发起 seal 的线程消散不影响已完成的状态转换。
-    fn finish_seal(&self, published: bool) {
-        if !published {
-            return;
-        }
-        self.state
-            .lock()
-            .wait
-            .update(ObjectSignals::NONE, ObjectSignals::EXECUTABLE);
-        let pending = {
-            let mut state = self.state.lock();
-            state.wait.take_notification()
+    fn step(&self) -> maintenance::record::Outcome {
+        let step = {
+            let _state = self.state.lock();
+            // SAFETY: 每步检查一个来源候选，只复制在途身份/强目标。
+            unsafe { self.source.step() }
         };
-        if let Some((reservation, target)) = pending {
-            reservation.publish(target);
+        match step {
+            Step::Idle => maintenance::record::Outcome::Idle,
+            Step::Progress => maintenance::record::Outcome::Ready,
+            Step::Hint(delivery) => {
+                delivery.send();
+                maintenance::record::Outcome::Ready
+            }
         }
     }
 }
 
-/// 单个对象可同时存在的可写 view 上限。它与 ObjectView admission 一起给协作式
-/// 退役路径明确的工作上界，不是对象总 view 数上限。
-pub(crate) const MAX_WRITE_VIEWS_PER_OBJECT: usize = 64;
-
-/// 公共 MemoryObject 的用户可见对象壳。
-///
-/// 它不持有独立状态：身份、长度、可执行状态与等待面都在 core 上，壳只提供 Handle
-/// 类型、rights 上限与可观察电平。MemoryObject 没有 owner role——全部 Handle 是同一
-/// capability，因此 close 不产生终态信号，对象在最后一个引用（Handle 或 view）消散
-/// 时自然析构。
 pub struct MemoryObject {
-    /// capability 持有计数（ZeroPolicy 按类型固定）。
     holders: capability::Holders,
-    header: object::ObjectHeader,
+    header: ObjectHeader,
     core: Arc<MemoryObjectCore>,
+    owner: Spinlock<Option<BackingOwner>>,
+    _metadata: super::resources::MetadataCharge,
 }
-
 impl MemoryObject {
-    fn new(core: Arc<MemoryObjectCore>) -> Result<Arc<Self>, SystemCallError> {
-        let header = object::ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?;
+    fn new(core: Arc<MemoryObjectCore>, owner: BackingOwner) -> Result<Arc<Self>, SystemCallError> {
+        let metadata = super::resources::MetadataCharge::arc::<Self>(core._metadata.payer())?;
         Arc::try_new(Self {
             holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
-            header,
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             core,
-        }).map_err(|_| SystemCallError::OutOfMemory)
+            owner: Spinlock::new(ranks::LEAF, Some(owner)),
+            _metadata: metadata,
+        })
+        .map_err(|_| SystemCallError::OutOfMemory)
     }
-
-    pub(crate) fn object_ref(this: &Arc<Self>) -> object::ObjectRef {
-        this.clone()
-    }
-
     pub(crate) fn core(&self) -> &Arc<MemoryObjectCore> {
         &self.core
     }
 }
+const MEMORY_OBJECT_RIGHTS: Rights = Rights::from_raw(
+    Rights::READ.raw()
+        | Rights::WRITE.raw()
+        | Rights::WAIT.raw()
+        | Rights::MANAGE.raw()
+        | Rights::DUPLICATE.raw()
+        | Rights::TRANSIT.raw()
+        | Rights::GRANT.raw()
+        | Rights::EXECUTE.raw(),
+);
 
-/// MemoryObject Handle 的 rights 上限。映射授权矩阵：只读 view 要求 `READ`，
-/// 可写 view 要求 `READ|WRITE`，执行 view 要求 `READ|EXECUTE`。
-const MEMORY_OBJECT_RIGHTS: erhino_shared::object::Rights = {
-    use erhino_shared::object::Rights;
-    Rights::from_raw(
-        Rights::READ.raw()
-            | Rights::WRITE.raw()
-            | Rights::WAIT.raw()
-            | Rights::MANAGE.raw()
-            | Rights::DUPLICATE.raw()
-            | Rights::TRANSIT.raw()
-            | Rights::GRANT.raw()
-            | Rights::EXECUTE.raw(),
-    )
-};
-
-impl object::KernelObject for MemoryObject {
+impl KernelObject for MemoryObject {
     fn holders(&self) -> &capability::Holders {
         &self.holders
     }
-
-    fn complete_waiter_drain(
-        &self,
-        reservation: super::notify_work::Reservation,
-    ) -> super::notify_work::Completion {
-        self.core
-            .state
-            .lock()
-            .wait
-            .complete_notification(reservation)
-    }
-
-    fn advance_waiter(&self) -> object::WaitAdvance {
-        self.core.state.lock().wait.advance_waiter()
-    }
-
-    fn header(&self) -> &object::ObjectHeader {
+    fn header(&self) -> &ObjectHeader {
         &self.header
     }
-
-    fn kind(&self) -> object::ObjectKind {
-        object::ObjectKind::MemoryObject
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::MemoryObject
     }
-
-    fn allowed_rights(&self) -> Option<erhino_shared::object::Rights> {
+    fn related_id(&self) -> u64 {
+        self.core.identity().get()
+    }
+    fn allowed_rights(&self) -> Option<Rights> {
         Some(MEMORY_OBJECT_RIGHTS)
     }
-
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::EXECUTABLE)
     }
 
-    fn signals(&self) -> ObjectSignals {
-        self.core.signals()
+    fn wait_source(&self) -> Option<Arc<dyn ObservationSource>> {
+        Some(self.core.clone())
     }
-
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.core.subscribe(subscription)
+    fn on_last_capability(&self) {
+        let owner = self.owner.lock().take();
+        if let Some(owner) = owner {
+            drop(owner);
+        }
     }
-
-    fn rearm_observer(&self, id: u64) -> Result<object::ObserverRearm, SystemCallError> {
-        self.core.rearm_observer(id)
-    }
-
-    fn cancel_observer(&self, id: u64) -> Option<object::CancelledObservation> {
-        self.core.cancel_observer(id)
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        self.core.unsubscribe(id);
-    }
-
-    fn as_any(&self) -> &dyn core::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
 fn resolve(
     thread: &super::Thread,
-    handle: erhino_shared::object::Handle,
-    required: erhino_shared::object::Rights,
-) -> Result<Arc<MemoryObject>, SystemCallError> {
-    let table = thread.process.handles.lock();
-    let entry = table
-        .get(handle, required)
-        .map_err(super::handle::map_error)?;
-    if entry.object().kind() != object::ObjectKind::MemoryObject
-    {
-        return Err(SystemCallError::WrongObjectType);
-    }
-    let any: Arc<dyn core::any::Any + Send + Sync> = entry.object().as_object().clone();
-    any.downcast::<MemoryObject>()
-        .map_err(|_| SystemCallError::WrongObjectType)
+    handle: Handle,
+    rights: Rights,
+) -> Result<(Authorization, Arc<MemoryObjectCore>), SystemCallError> {
+    let invocation = Authorization::accept(thread, handle, rights)?;
+    let object = invocation
+        .object()
+        .as_any()
+        .downcast_ref::<MemoryObject>()
+        .ok_or(SystemCallError::WrongObjectType)?;
+    let core = object.core.clone();
+    Ok((invocation, core))
 }
 
-/// 从当前进程绑定池创建固定长度对象，并把完整 rights 的 Handle 写出。
 pub fn create(thread: &super::Thread, request_ptr: usize) -> Result<(), SystemCallError> {
     use erhino_shared::memory_object::{MEMORY_OBJECT_MAX_PAGES, MemoryObjectCreateRequest};
-
-    let (request, pool, sponsor) = {
-        let mut space = thread.process.space.lock();
-        // SAFETY: MemoryObjectCreateRequest 只含整数且无 padding，任意位型均有效。
-        let request: MemoryObjectCreateRequest =
-            unsafe { crate::uaccess::read_user_value(&mut space, request_ptr) }?;
-        let bound = space.bound()?;
-        (
-            request,
-            Arc::clone(bound.pool()),
-            Arc::clone(bound.sponsor()),
-        )
+    let request: MemoryObjectCreateRequest = {
+        let body = thread
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let mut vm = body.vm.space.lock();
+        let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
+        // SAFETY: 固定宽请求仅整数且无 padding，随后验证值和保留字段。
+        unsafe { crate::uaccess::read_user_value(space, request_ptr) }?
     };
-    if request.reserved != [0; 2] {
+    if request.reserved != [0; 2] || request.bytes == 0 {
         return Err(SystemCallError::IllegalArgument);
     }
-    let bytes = usize::try_from(request.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
-    if bytes == 0 {
-        return Err(SystemCallError::IllegalArgument);
-    }
-    let pages = bytes.div_ceil(super::proc::PAGE_SIZE);
-    // 可由普通 Handle close 触发最终析构的对象必须受硬容量上限约束。
-    if u64::try_from(pages).map_err(|_| SystemCallError::IllegalArgument)? > MEMORY_OBJECT_MAX_PAGES
-    {
+    let pages = request.bytes.div_ceil(PAGE_SIZE as u64);
+    if pages > MEMORY_OBJECT_MAX_PAGES {
         return Err(SystemCallError::ReachLimit);
     }
-    let result_address =
+    let output =
         usize::try_from(request.result_address).map_err(|_| SystemCallError::IllegalArgument)?;
-
-    let core = MemoryObjectCore::new_public(&pool, &sponsor, pages)?;
-    let object = MemoryObject::new(core)?;
-    let entry = super::handle::entry(
-        MemoryObject::object_ref(&object),
-        object::HandleRole::MemoryObject,
-        MEMORY_OBJECT_RIGHTS,
+    let (core, owner) = MemoryObjectCore::new(thread.process.funding_pool(), pages as usize)?;
+    let object = MemoryObject::new(core, owner)?;
+    let cap = handle::mint(object, MEMORY_OBJECT_RIGHTS)?;
+    let caps = [cap];
+    handle::install(
+        thread,
+        caps,
+        |handles| crate::uaccess::write_user(thread, output, &handles[0]),
+        || {},
     )
-    .map_err(super::handle::map_error)?;
-    super::handle::install_one(thread, entry, result_address, || {})
+    .map(|_| ())
 }
 
-/// 读固定宽对象快照。identity 只作诊断。
-pub fn query(
-    thread: &super::Thread,
-    handle: erhino_shared::object::Handle,
-    output: usize,
-) -> Result<(), SystemCallError> {
-    use erhino_shared::{memory_object::MemoryObjectSnapshot, object::Rights};
-
-    let object = resolve(thread, handle, Rights::READ)?;
-    let snapshot = object.core.snapshot();
-    let mut space = thread.process.space.lock();
-    space.check_range(output, core::mem::size_of::<MemoryObjectSnapshot>(), true)?;
-    // SAFETY: MemoryObjectSnapshot 无 padding；check_range 已验证当前可写范围。
-    unsafe { crate::uaccess::deliver_output(thread, &mut space, output, &snapshot) }
+pub fn query(thread: &super::Thread, handle: Handle, output: usize) -> Result<(), SystemCallError> {
+    let (_authority, core) = resolve(thread, handle, Rights::READ)?;
+    crate::uaccess::write_user(thread, output, &core.snapshot())
 }
 
-/// 单向发布对象为可执行。要求 `MANAGE`；在 Executable 上幂等成功。等待完成经
-/// WaitMany 观察 `EXECUTABLE` 电平，本调用不阻塞也不登记等待者。
-pub fn seal(
-    thread: &super::Thread,
-    handle: erhino_shared::object::Handle,
-) -> Result<(), SystemCallError> {
-    use erhino_shared::object::Rights;
-
-    let object = resolve(thread, handle, Rights::MANAGE)?;
-    object.core.seal();
+pub fn seal(thread: &super::Thread, handle: Handle) -> Result<(), SystemCallError> {
+    let (_authority, core) = resolve(thread, handle, Rights::MANAGE)?;
+    core.seal();
     Ok(())
-}
-
-/// 为当前 Running process 建立公共 MemoryObject 的 view。
-///
-/// rights 与 view 权限正交：只读 view 要求 `MAP|READ`，可写 view 追加 `WRITE`，
-/// 读执行 view 追加 `EXECUTE`。view 由地址空间拥有（普通 `MemoryUnmap` 可撤销），
-/// 并以强引用独立保活对象——Handle 先关闭不影响已建立的 view。
-pub(crate) fn map_view(
-    thread: &super::Thread,
-    process: Arc<super::proc::Process>,
-    intent: super::proc::MapIntent,
-    handle: erhino_shared::object::Handle,
-    offset: usize,
-    sponsor: &Arc<MetadataSponsor>,
-) -> Result<super::wait::WaitPlan, SystemCallError> {
-    use erhino_shared::object::Rights;
-
-    let protection = intent.protection();
-    let required = match protection {
-        Protection::ReadOnly => Rights::READ,
-        Protection::ReadWrite => Rights::READ | Rights::WRITE,
-        Protection::ReadExecute => Rights::READ | Rights::EXECUTE,
-    };
-    let object = resolve(thread, handle, required)?;
-    let core = Arc::clone(object.core());
-
-    // 含 W 的 view 与 seal 在对象锁上线性化；只读/读执行 view 不取 permit。
-    let (authorization, permits) = if protection == Protection::ReadWrite {
-        core.authorize_write_view(protection)
-            .map_err(map_object_error)?
-    } else {
-        (
-            core.authorize_view(protection).map_err(map_object_error)?,
-            Vec::new(),
-        )
-    };
-
-    let map_result = (|| {
-        let pages = authorization
-            .view_pages(offset, intent.bytes(), super::proc::PAGE_SIZE)
-            .ok_or(SystemCallError::IllegalArgument)?;
-        let mut spans = Vec::new();
-        spans
-            .try_reserve_exact(core.backing.projection_capacity())
-            .map_err(|_| SystemCallError::OutOfMemory)?;
-        core.backing
-            .project(offset / super::proc::PAGE_SIZE, pages, &mut spans);
-        let view_owner = super::proc::PreparedObjectView::new(Arc::clone(&core), sponsor)
-            .map_err(SystemCallError::from)?;
-        Ok((spans, view_owner))
-    })();
-    let (spans, view_owner) = match map_result {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            core.cancel_writes(permits);
-            return Err(error);
-        }
-    };
-
-    let plan_result = {
-        let mut space = process.space.lock();
-        space.plan_object_map(&intent, offset, &spans, authorization, permits, view_owner)
-    };
-    let plan = match plan_result {
-        Ok(plan) => plan,
-        Err(failure) => {
-            core.cancel_writes(failure.permits);
-            return Err(SystemCallError::from(failure.error));
-        }
-    };
-    super::proc::finish_running_map(thread, process, plan)
 }

@@ -12,15 +12,15 @@ use core::{
 };
 use erhino_shared::{
     call::SystemCallError,
-    object::{Handle, HandleRole, Rights},
+    object::{Handle, ObjectKind, Rights},
 };
 use libbudget::{AccountView, Charge};
-use metadata_admission::{Counter, Permit};
-use ordered_table::{OrderedTable, PreparedEntry};
 use libkernel::ipc::{
     capability::Capability,
     message::{Mailbox, MailboxSender, MintedSender},
 };
+use metadata_admission::{Counter, Permit};
+use ordered_table::{OrderedTable, PreparedEntry};
 
 static ABANDONED: AtomicUsize = AtomicUsize::new(0);
 
@@ -60,7 +60,7 @@ struct GrantState {
 
 pub struct PreparedGrant {
     context: u64,
-    state: PreparedEntry<GrantState>,
+    state: PreparedEntry<GrantState, ()>,
     sender: MailboxSender,
     lifetime: Capability,
 }
@@ -114,7 +114,7 @@ pub struct GrantAdoptFailure {
 }
 
 pub struct GrantTable {
-    grants: ManuallyDrop<OrderedTable<GrantState>>,
+    grants: ManuallyDrop<OrderedTable<GrantState, ()>>,
     slots: Arc<Counter>,
     mailbox_id: u64,
     sealed: bool,
@@ -197,7 +197,7 @@ impl GrantTable {
             let observer_charge = account.acquire(FalResource::WaitSource, 1)?;
             let storage_charge = account.acquire(
                 FalResource::Bytes,
-                PreparedEntry::<GrantState>::allocation_bytes(),
+                PreparedEntry::<GrantState, ()>::allocation_bytes(),
             )?;
             Ok((slot, grant_charge, observer_charge, storage_charge))
         })();
@@ -243,15 +243,18 @@ impl GrantTable {
             _observer_charge: observer_charge,
             _storage_charge: storage_charge,
         };
-        let state = match self.grants.prepare_insert(context, state) {
+        let state = match self
+            .grants
+            .prepare_insert(context, state, &libbudget::AllocatorBacked)
+        {
             Ok(state) => state,
             Err(error) => {
                 let (error, state) = match error {
                     ordered_table::InsertError::Limit(state) => {
                         (SystemCallError::QuotaExceeded, state)
                     }
-                    ordered_table::InsertError::Allocation(state) => {
-                        (SystemCallError::OutOfMemory, state)
+                    ordered_table::InsertError::Storage(error, state) => {
+                        (libbudget::allocator_error(error), state)
                     }
                 };
                 return Err(GrantAdoptFailure {
@@ -344,7 +347,7 @@ impl GrantTable {
     /// Move 的收到能力必须实际指向本表已登记 sender，不能只按 badge 认领。
     pub fn validate_received(&self, capability: &Capability) -> Result<AccessSnapshot, GrantError> {
         let description = capability.description().map_err(GrantError::Transport)?;
-        if description.role != HandleRole::MailboxSender as u32
+        if description.kind != ObjectKind::MailboxSender as u32
             || !description.rights.contains(Rights::WRITE)
         {
             return Err(GrantError::WrongRole);
@@ -366,7 +369,10 @@ impl GrantTable {
 
     /// Runtime 已确认来源注销后移除授权状态；observer 仍由对应 task 独占。
     pub fn remove(&mut self, context: u64) -> bool {
-        self.grants.remove(context).is_some()
+        self.grants
+            .remove(context)
+            .map(ordered_table::PreparedEntry::into_value)
+            .is_some()
     }
 
     pub fn seal(&mut self) {

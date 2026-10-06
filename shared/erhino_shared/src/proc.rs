@@ -56,6 +56,8 @@ pub enum ExecutionProfile {
 }
 
 /// ProcessCreate 输出：Builder 与 Control 原子安装，同一事务交付。
+/// Builder持MANAGE|GRANT|TRANSIT、不可DUPLICATE；成功移交仍是同一启动authority。
+/// 未消费的最后Builder释放则Aborted；Control权限为调用者请求的类型上限子集。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct ProcessCreateResult {
@@ -69,6 +71,8 @@ pub struct ProcessCreateResult {
 pub const PROCESS_MAX_THREADS: usize = 1024;
 /// 单次 ProcessGrant 的结构上界；约束内核短路径与用户态启动块容量。
 pub const PROCESS_MAX_GRANTS: usize = 64;
+/// 单次组装映射的准备/清零工作上界；loader 按此分片。
+pub const PROCESS_MAP_MAX_BYTES: usize = 256 * PROCESS_PAGE_SIZE;
 
 /// ProcessGrant 的 grant 项；目标 rights 只能收窄。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,17 +99,19 @@ const _: () = {
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
 };
 
-/// ThreadCreate 同步输出；control 是目标表内的 ThreadControl handle。
+/// ThreadCreate 同步输出：control 仅观察 DONE，start 持 Pending 启动责任。
+/// Building 进程的预建线程由 ProcessBuilder 启动，start 为 INVALID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct ThreadCreateResult {
     pub tid: Tid,
     pub reserved: u32,
     pub control: Handle,
+    pub start: Handle,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<ThreadCreateResult>() == 16);
+    assert!(core::mem::size_of::<ThreadCreateResult>() == 24);
     assert!(core::mem::align_of::<ThreadCreateResult>() == 8);
 };
 
@@ -209,7 +215,8 @@ pub type JobId = u64;
 pub const JOB_ENUMERATE_MAX: usize = 128;
 
 /// JobControl 固定宽状态快照。计数是非精确近似值（不构成协议依据；
-/// 正确性走 CLOSED 等待与枚举收敛）。
+/// 正确性走 CLOSED 等待）。CLOSED 发布时本 Job 已从父 Job 子表移除；
+/// 单独的 Dead 快照不替代这一异步屏障。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub struct JobSnapshot {
@@ -224,8 +231,8 @@ pub struct JobSnapshot {
 }
 
 /// Job 生命周期状态判别值（`JobSnapshot::state`）。
-/// Open 即使空也存活；Seal 只封创建；完成 = 自身 sealed && 成员空，
-/// 完成即 Dead/CLOSED。
+/// Open 即使空也存活；Seal 封创建/启动；自身 sealed 且成员/子表空时为 Dead，
+/// 从父表异步移除后发布 CLOSED。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum JobState {
@@ -264,7 +271,7 @@ const _: () = {
     assert!(core::mem::size_of::<HandleGrant>() == 16);
     assert!(core::mem::size_of::<ThreadStartContext>() == 32);
     assert!(core::mem::size_of::<ProcessSnapshot>() == 48);
-    assert!(core::mem::size_of::<ThreadCreateResult>() == 16);
+    assert!(core::mem::size_of::<ThreadCreateResult>() == 24);
     assert!(core::mem::size_of::<ProcessState>() == 4);
     assert!(core::mem::size_of::<TerminationCause>() == 4);
     assert!(core::mem::size_of::<TerminationDetail>() == 16);

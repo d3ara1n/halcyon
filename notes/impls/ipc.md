@@ -1,73 +1,73 @@
 # IPC 对象实现
 
-公共对象、消息、观察与内核退休前置已完成。ABI 位于 `shared/erhino_shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/libraries/libkernel/src/ipc/`。施工证据见 [公共前置档案](../../plans/archived/todo-2026-09-13-public-ipc-wait-prerequisites.md)。公共时间、运输/RPC/服务执行和 FAL 业务仍未全部完成，不能把本前置完成视为总体交付。
+ABI 位于 `shared/erhino_shared/src/{object,message,wait,wait_set,call}.rs`，内核位于 `os/kernel/src/task/`，用户封装位于 `user/libraries/libkernel/src/ipc/`。CapTable、Mailbox、Process、Tunnel、单来源续体、扁平 WaitSet 与实际 runtime/监督已接同一契约。接续与验证边界由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。
 
 ## Handle 与对象身份
 
-`os/handle_table` 保存 generation slot、object、role、rights。目标槽先 reserve，失败 rollback 推进 generation；准备后的 commit 不分配。消息移动要求 TRANSIT，Building direct grant 要求 GRANT；请求权限必须属于源 entry 与目标 role 的权限交集。所有最后引用及 close callback 在表锁外交接。
+[`os/capability`](../../os/capability/src/table.rs) 保存 generation slot、authority 与 rights，kind 从具体对象查询，没有独立 role。安装在表内 reserve 后放锁写回/必成提交出生，再回表 commit；shut 撤销返还资格时返回最后持有事件，锁外交付正常放弃。事件批次容量在 reserve 准备，commit 不分配。消息移动要求 TRANSIT，直接 grant 要求 GRANT；所有业务释放动作在表锁外交接。
 
-`ObjectHeader` 使用不回绕 KOID。HandleQuery 只描述已有对象的 kind、role、rights、badge 与关联身份，不按身份打开对象或授予权限。Mailbox/Notification/WaitSet owner 不可 DUPLICATE/TRANSIT，但可按明确 GRANT 权限直接移交；Tunnel Endpoint 依赖本地 VM lease，不可作为非映射 Capability 运输。
+ObjectHeader 使用不回绕 KOID。HandleQuery 描述已有对象的 kind、rights、signals 与关联身份，不按身份打开对象或授予权限。Notification Owner 为 READ/WAIT/MANAGE/GRANT，Signaler 为 SIGNAL/TRANSIT/GRANT/DUPLICATE；Signaler 不可等待。NotificationObserve 从 Owner READ 或 Signaler SIGNAL 派生只读 NotificationObservation，权限为 WAIT/DUPLICATE/TRANSIT/GRANT，只观察 CLOSED。三种对象共享同一个 core、WaitQueue 和 Work；观察引用不增加业务 authority，关闭观察权不关闭 Owner，观察壳保留派生调用者付款 Pool。
 
 libkernel `Capability` 拥有合法非映射 entry，适用于叶对象和 affine owner；包装不自动授予 TRANSIT/GRANT。`into_raw` 移交唯一责任，失败 close 返还 owner；Drop 使用 `close_object_owner`，允许等待预付的内核退休，返回错误报告不变量破坏，不静默丢弃责任。WaitSet 的 `create_with_rights` 支持显式 GRANT，默认 `create` 权限仍为 READ/WAIT/MANAGE；`into_capability` 消耗原 owner，不复制关闭责任。
+
+`os/capability::CapTable<A,C>` 的槽数组、安装句柄和释放事件数组均持固定布局存储及 charge；金融政策由调用方传入，内核选择该表所属进程的默认 Pool。增长期间新旧块同时收费，搬移保留所有槽编号与代次，旧空块完整释放；逻辑 remove/rollback 不缩容量。metadata 失败映射 QuotaExceeded，分配失败为 OutOfMemory，提交只使用已准备容量。最后事件锁外投递；句柄输出 buffer 可继续存活并持付款到最后使用结束。Handle 的槽宽度来自 ABI u32，实际可达容量另受 metadata 供给约束；无单独旧 64k 限额。源码及金融 owner 见 [`table.rs`](../../os/capability/src/table.rs)、[`handle.rs`](../../os/kernel/src/task/handle.rs)；共用存储与退款顺序由 [`mm.md`](mm.md#已付款保留存储) 拥有。
 
 ## Mailbox 与交付
 
 MailboxCreate 只交付 owner。MintSender 要求 owner MANAGE，原子创建独立 MailboxSender 和对应 LifetimeObserver。sender 的 KOID/badge 不可变，并强持目标队列；duplicate、once 派生和 move 保持该上下文。MessageHeader 的 PID 是来源信息，badge/context ID 是目标发送授权；内核生成，不由 payload 声明。
 
-Lifetime 只记录被观察的 sender KOID，不反向保活授权。最后 sender 引用释放时发布 CLOSED。每条 Message 的 affine Delivery 强持发送上下文；排队、接收预留、已安装接收能力均保留这项责任。Delivery 的 role 仅允许 TRANSIT/GRANT，不可 DUPLICATE。
+唯一 MailboxReceiver 的 ObjectHeader 是 core header，不另铸造接收角色 KOID；Sender 的 related_id 因而对应 Receiver 的真实对象身份。Receiver/各发送对象的 Holders 与计数仍独立，core 不作为第二个 capability 对象公开。
 
-队列上限为 16，每条最多 8 项业务 transit 加 1 项 Delivery。`MailboxState::publish` 从完整状态推导信号：READABLE 当且仅当队列非空且无 receiving，WRITABLE 的占用包含 receiving 占位；关闭冻结 CLOSED 并清除可读/可写。预留期间 Peek/Discard/另一 Receive 返回 Busy。
+[`Lifetime`](../../os/kernel/src/task/lifetime.rs) 用同一 OBJECT_WAIT 域保存 authority/use 计数、电平与侵入式节点；计数双零永久 CLOSED。一个 Sender 持一份 LifetimeOwner，派生 OnceSender 独立取得父域 authority；最后 Sender capability、Once 的 Sent/Abandoned 各归还其 authority。每次准备 Delivery 取得一份仿射 LifetimeUse，失败退回，成功随排队/接收预留/接收 capability 转移。临时 Arc/观察 loan 不计入业务计数，Lifetime 只记录 sender KOID，不反向持发送对象。
 
-Send 按 HandleTable → Mailbox 锁阶准备 moves、Delivery、消息及容量，在同一提交内检查原 Deadline；失败保留 moves/once，成功才消费。Receive 初检输出后预留队头与目标槽，`finish_receive` 复制成功后原子交付；复检写回失败以发起 tid/失败 VA 冻结 `Faulted(UserAccess)`，同时退款表槽与队头，锁外通知。owner 已关闭时拒绝回插并锁外关闭 transit，成功复制则交付已经独立预留的消息。部分写入不发布权限，调用者已进入终止而不能在用户态重试。Discard/owner close 的队列析构在源锁外，fanout 有固定容量界限。
+[`Delivery`](../../os/kernel/src/task/delivery.rs) 保存 use lease、数值 sender_context_id 与付款 Pool；最后 capability 在自身 LEAF 锁下取出 lease，锁外归还。业务 use 不依赖 Delivery 存储最终 Drop；未发布出生的 Drop 也退同一 lease。只允许 TRANSIT/GRANT，不可 DUPLICATE。Lifetime 及 ReplyObservation 的观察来源只提示等待 owner，不代摘节点；ReplyObservation 的 DONE/PEER_CLOSED 分别对应 Sent/Abandoned，Once 在 MAILBOX 锁内选定终态，持有操作 authority 的执行者在锁外发布。
+
+队列上限为16，每条最多8项业务transit加1项Delivery。MailboxCore出生时付款并初始化固定`Buffer<Option<Message>>`环；head/len与receiving占位拥有容量真值，enqueue/rollback/pop不分配或扩容。消息本体内嵌槽，payload/handles独立付款；handle数组在发送时预留Delivery槽，接收只push，不另分配。header原始move字节、验证数组、Invocation/rights scratch由发送者Pool付款，成功运输payload/handles保留原payer至consume/discard/shut；临时scratch随本次owner释放。MAILBOX同步域拥有缓冲和WaitQueue：READABLE当且仅当队列非空且无receiving，WRITABLE占用包含receiving，PEER_CLOSED表示可投递Sender/Pending OnceSender为零；关闭冻结CLOSED。出生SenderCount负责计数与失败回滚，Once在准备提交时入计数、Sent/Abandoned时退出；预留期间Peek/Discard/另一Receive返回Busy。
+
+[`handle.rs::Authorization`](../../os/kernel/src/task/handle.rs) 校验 Occupied 槽并持调用者 BodyLease、对象存储与 rights 快照，不抽取 Cap，也不新增 capability 计数。普通 Send 在表锁释放前取得 LifetimeUse，MakeSendOnce 在表内取得独立父域 authority；锁边为 HANDLE_TABLE → OBJECT_WAIT，凭证取得不发布、不回到表锁。Close 先到则拒绝接受，接受先到则 Close 只终结新调用资格，已取得 use/派生 owner 独立收束。普通 Query/WAIT 可与 Send 使用同一表项，不要求 DUPLICATE。
+
+`Invocation` 只用于 Once 的消费和消息移交：持接管 Cap 与返还 ticket。Send 依当前 ABI 按 header/payload/moves/count/length 复制输入，拒绝重复 move 及 sender 自移交；每项 transit 先保存完整 authority，在 core 准入/预留队列/原 Deadline 检查都成功后才原位裁剪 rights 并入队。失败返原槽/原权限；Close/shut 撤预约则锁外放弃，不能复活已关闭槽。成功接管的 Once 先发布 Sent 再消费原 authority。入队、用户写回、安装和最后持有事件都在表锁外。
+
+Receive 接受非消费 READ 并持 BodyLease，core 的 receiving token 仲裁唯一取队头事务。事务独立持有已摘出的 Message/Delivery；最后 Receiver Close 可以关闭 core，但不取走事务 owner。预留目标表槽后，在 VM 锁内通过受保护 SUM 复制输出。写回失败按原 tid/失败 VA 冻结 UserAccess，撤表预约；core 未关闭时回插队头，已关闭时锁外释放消息。成功复制后表 commit，随后完成出队。进程表 shut 撤销新槽公开时锁外释放返回事件，不能回滚已复制消息。Close 只关准入并激活出生 Work，Work 交替扫描一个来源候选和释放一条仍在队列的消息（至多九份 authority），引用/门铃均锁外执行；事务中消息的收束归唯一 Receive owner。
 
 libkernel `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
-libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 role 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
+libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 kind 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。MakeSendOnce 输出完整 HandlePair；`send_once` 返回 ReplyPermit，分别持 typed SendOnce 与 ReplyObservation capability。Request 持观察权，Packet 运输回复权；发送后观察权移交 Sent owner。raw 夹具显式关闭不用的观察表项。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
 
 ## 通知与等待
 
-Notification 保存 OR pending bits；READABLE 表示非零，Take 消费指定位。各对象的 `ObjectWaitState` 在源锁内记录 inactive→active 完整快照与 serial。通知与终态退休共用 `select_snapshot`，按未见且相关的最小 serial 选择，不按 signal 位序；无候选时当前 CLOSED 是终态 fallback。
+[`capability::signal`](../../os/capability/src/signal.rs) 拥有纯电平侵入式链。稳定节点由等待 owner 提供，挂接/摘除与电平、扫描游标受来源同一同步域保护；删除当前节点会前移游标，轮次边界隔开活动中新增节点，更新只请求后续轮次而不重置游标。每步检查一个节点或移动一次边界，短暂电平不锁存为完成；来源不代摘等待节点。
 
-立即命中/拒绝安装、取消、扫描和 unsubscribe 都交出完整 retired Subscription。`WaitAdvance::finish` 在来源锁外释放引用及执行跨对象工作。CLOSED 下 Complete/Deferred/Lost 均摘来源槽，不依赖观察者消费事件来断开来源自环。
+[`wait_source.rs`](../../os/kernel/src/task/wait_source.rs) 的 WaitQueue 随来源 core 内嵌 WorkRecord；chain 的 UnsafeCell 由 core 业务锁保护，core Arc 与 pin 节点保持地址稳定。节点只存目标 Weak 与等待 epoch/成员身份，owner 通过 ObservationSource 强持观察存储到 detach 返回。来源锁内只 upgrade 并复制 Delivery（强目标/身份，无节点借用）；解锁后 hint，不写结果或清理节点。维护重复活动与强根结算见 [`internals.md`](internals.md)。
 
-`os/wait_context` 仲裁 Installing/Armed/Finishing/Done 与 outcome。WaitIdentity/WeakWaitIdentity 捕获不可回绕 epoch，lifecycle、source、timer、内存完成和请求取消都使用捕获身份。持久完成在 Done 前冻结 `(epoch,outcome)`，目标缓存按代次发布，旧回调不读取重置后的隐式当前 outcome。
+[`NotificationCore`](../../os/kernel/src/task/notification.rs) 在 NOTIFICATION 锁下保存 OR pending bits 与 closed，并更新同域电平；READABLE 表示非零，Take 消费指定位。core 强持付款 Pool，记录关联其 Account；最后 Owner authority 关闭准入/清位并激活来源 Work。Work 每步处理一个候选，临时强目标带出锁后才提示，无工作回 Idle。旧 ObjectWaitState/serial/ObserverSink 不参与 Notification 的新来源。
 
-每 hart `TimerQueue` 使用 arena、索引最小堆和包含 owner/slot/generation 的稳定 token。单字 TimeoutRegistration 在 Unregistered/Token/Closed 仲裁退休责任；对象完成/错误/终止/到期只有赢家注销 token。跨 hart 删除在 owner queue 锁下进行，锁外释放 Context，owner 在下次装填点更新 timer。
+SignalSource是无消息缓冲的已付款终态观察宿主，OBJECT_WAIT唯一拥有公开电平/节点链和独立内部完成状态，内嵌WorkRecord。Shell、ThreadControl、Job、ReplyObservation使用它；业务终态发布不反取业务锁。单一内部维护消费者先arm再在同域登记/复检WakeToken；complete_internal只提交内部退款事实并锁外唤醒，不更新公开电平。Process退休借Shell既有来源存储，内部退休结束与公开Process DONE是两个事实，避免额外私有Source晚于Body屏障退款。ThreadDeparture最后退款后持DONE来源直接发布，不因Control消散跳过。Tunnel在Connection同步域使用同一WaitQueue；来源及观察引用不强持待退款的privateWork。
+
+[`wait.rs`](../../os/kernel/src/task/wait.rs) 的 WaitOne 复制固定输入，在表锁内解析 WAIT 存储引用、锁外取得来源 loan 与快照；输入兴趣必须非空且属于对象允许 mask。a1 返回当前匹配电平，关闭总附 CLOSED，NONE 表示到期；无异步用户输出指针。libkernel 从返回电平构造 WaitResult，Mailbox/Endpoint/WaitSet 的单对象便利等待使用该入口。线程续体/唯一 detach 由 [`task.md`](task.md) 拥有；timer 节点由 [`time.md`](time.md) 拥有。
 
 ## WaitSet 与内核退休
 
-WaitSet ABI 只有 Create/Register/Rearm/Receive/Remove 和 READABLE/CLOSED。one-shot 消费后 Rearm，在源锁内重查电平；正常 rearm 不重新分配完成存储。Remove 立即使 token/未消费 ready 失效，物理退休由内核继续。
+[`wait_set.rs`](../../os/kernel/src/task/wait_set.rs) 只接受真实来源，按 ObjectKind 拒绝 WaitSet 成员。ABI 为 Create/Register/Receive/Remove，没有 Rearm。MemberRequest 拥有 handle/signals/cookie，ReadyRecord 是 token/cookie/observed/reason，无 arm_generation/历史错误结果。
 
-Create 预付唯一 retirement actor、普通 Close 回复与资源；Register 预付来源订阅、ready 和可复用 finish。Register/Rearm 登记 operations，跨来源工作锁外返回；actor 仅在 operations=0、cycle Done、source_id=0 时删除 registration。
+Member位于`Pin<OwnedBox<Member,MetadataCharge>>`，唯一拥有稳定WaitNode与来源loan；Pinned Member和Registration树节点由集合Pool分别按布局付款，挂链前在所有集合锁外准备完整owner。Add锁外attach、回锁复检close/容量后发布；失败带完整候选出锁，Member先detach、再释放分配/退两份费用。新增成员进候选队列覆盖初始电平/安装窗口；token单调不复用。写回失败走Remove，Remove/Close获同表项者独占detach。
 
-普通非空 Close 按 HandleTable → WaitSet → Lifecycle 提交 CLOSED/mandatory，摘 owner 后锁外发布 actor。成功回复表示自身退休完成；调用者终止或未安装 plan 只取消回复，不撤销 actor。CLOSED 的观察与私有 completion 分离，自观察/交叉观察不形成清理等待环。
+候选是表项内双向token链，hint同集合锁挂队尾。Receive以receiving串行化，先在锁外用接收者Pool付款候选/ReadyRecord两个scratch数组；锁内取有界一批，锁外查来源，回锁验证token仍在。满足者回队尾并返回，查询中的新提示不会被不满足结果清掉。批次先取完再重入队，永久就绪成员本批至多一次；输出失败不消费电平，满足项继续在队尾。候选/输出数组实际capacity费用随各自owner释放。
 
-`task/retirement.rs` 的预付 WorkDebt 强根独占对象推进。progress 和 completion 是独立 dependency：actor 监听前者，ProcessDrain/unpublished 监听后者。Blocked 不轮询、不计 runnable，早到 WakeToken 锁存；槽/Pending 更新在同一队列锁中，backend/source/最后引用交接在锁外。
+最后capability锁外close，集合锁内关准入/发布CLOSED，出生Work强持core并交替自摘一成员/扫描一观察候选。摘出的完整节点和Pinned Member均到集合锁外detach、释放、退款，不依赖调用者续调。观察loan仍可查询CLOSED/自摘，不代摘线程节点。WaitSet Arc宿主、内嵌Work/节点、独立Member/索引均按实际布局付款；core及观察loan的存储费用随last-live结束，逻辑Close不提前退款。
 
-## ProcessDrain 继续
+libexecution 的持久来源/Assembly 已接当前 ABI，源码与 owner 由 [framework](framework.md#libexecution-的执行与扁平装配) 拥有。正式消费者与验收编排边界见 [runtime](runtime.md)；init/test 使用持久成员、Process DONE 与独立 Endpoint/View，不保留旧集合/Drain/Tunnel 接口。
 
-Process 出生预付 reusable drain_waiter。`request.rs::DrainExecutor` 持有 `DrainRequest`、请求债务和可复用 `WaitContext`；请求捕获 Process/Control、输出、一次截断预算、累计 work 和 affine drain_active，暂停不重新解析 Handle、不重置预算。More 必须有正工作；内部零工作 Blocked 停驻同一请求。等待层不再推进 DrainRequest，只通过 `WaitOperation` 提供取消接缝。
+## 退出与预算
 
-finish 首轮/恢复共用 StepResult。依赖按 context+epoch 登记/取消；新轮已停驻时旧取消仍拒绝。队列归还容量/Pending、请求/依赖退役后才 Done，锁外交付 admitted thread 或 Departure。ProcessDrain 与异步 WaitMany 的间接结果写回失败都以原发起 tid 和失败用户 VA 冻结 `Faulted(UserAccess)`，不向可继续运行的线程交付普通错误。同步输出经 `uaccess::deliver_output/deliver_bytes` 先冻结首因并缓存终止待办，待业务锁全部释放后由 trap 执行。
+ProcessDrain syscall/request 不存在；进程 Frozen 后回收记录自主完成实际 Body 退款，再发布 Shell DONE。显式等待使用 WaitOne 或持久 WaitSet；capability Close 不隐式等待。退出执行 owner 唯一 detach 来源、清停时节点，再发布 ThreadDeparture，不保留异步用户输出义务。
 
-Job 摘除前转交预付 Finalization 强根。后台与 Native 共用 drain_gate/游标；Native active 时后台停驻，DrainRequest Drop 先清 active 再通知。Caller/Control 消散不丢终段传播，完成后才释放根。
+Mailbox/Lifetime/Delivery、Notification/观察壳、WaitSet和SignalSource均出生时先在原付款Pool取得实际Arc布局费用，再分配；末字段强持payer并在全部先行成员销毁后归还费用。消息固定环与独立payload/handles/运输scratch各自付款，运输不改变原payer。只为保活的_pool字段已由charge取代，业务身份、authority/use和financial存活分别计。QuotaExceeded与OutOfMemory分开，拒绝/写回失败沿原owner退款。Pool Account承接维护执行，来源候选、VM片段、消息清理每step有结构上界；Account最终析构计量及运行注入覆盖的限制由工作记录拥有。
 
-## 预算与准入
+## 验证设施
 
-notification/finish/retirement 共用控制安全点 16 步，对进入时已有 runnable 的后类保留最低进度。运行中才出现的类别不保证同轮完成；下一安全点按实际 pending 参与预算。deferred memory/unpublished/termination/finalization 另共用独立 16 步，不合称全局单一 16。
+[`srv_init/public_ipc.rs`](../../user/services/srv_init/src/public_ipc.rs) 使用真实用户线程验证同槽 Sender 的 Send/Query/WAIT、接收竞争与背压、transit/Once/Delivery/Lifetime 收束，以及已提交等待的调用者退出。[`srv_init/time_checks.rs`](../../user/services/srv_init/src/time_checks.rs) 使用实际 syscall 验证绝对期限、过期优先级、取消观察和已提交投递的保留。
 
-20 类 admission 分开对象、消息交付、注册与等待责任；真实 heap 分配仍 fallible。finish 物理槽分区 Thread 8192/Kernel 8320/Persistent 8192，注册不能借用清理预留。固定槽与计数分别验证，不把计数等同驻留字节或跨表并发库存。
+capability 的 signal host 用例验证插入边界、删除扫描游标、瞬态电平与关闭提示；table host 用例验证消费 claim/restore、Close/shut、rights 和持有数。内部安装、迟到提示、写回撤销及实际 metadata 付款的证据边界由[对象链工作记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。历史自检和运行结果不作为当前实现说明，当前源码不保留旧 actor/Drain 自检。
 
-## 验证证据
-
-- `wait_set/selftest.rs`：旧回调、Closed seen/迟到安装、通知/退休先行历史、反位序多 interest、终态 Deferred、operations 门、来源 reset × Remove/Close、两种三类压力和实际固定槽退款。
-- `retirement/selftest.rs`：Taken/业务完成/槽交回/新责任的排列，未安装 Close 取消、ticket 早晚 wake、actor 最后根、actor/Kernel finish/Object 构造耗尽退款。
-- `task/selftest.rs` 与 `wait_set/selftest/continuation.rs`：真实空间/域准入/等待安装/终止债务；Native parked 2/8 后恢复恰剩余 6；兄弟撤输出页冻结 UserAccess；复用新轮也 parked，旧 epoch 不取消新依赖；所有 Pool/metadata/control/deferred/actor 退款。Ready 前夹具不执行用户指令或证明远端 shootdown。
-- `mailbox/selftest.rs`：预留 Busy/精确电平、真实撤页后 partial header、发起 tid/失败 VA 与队头/表槽回滚、完整 payload/业务及 Delivery KOID 保持、Lifetime 实装通知、full/closed-owner 失败与退款。
-- `srv_init/public_ipc.rs`：真实双用户接收线程，确定性 FIFO 交接及 forced Full 后自由竞争，64 条 4096-byte payload/独立授权，不丢不重、单接收者顺序、once/Delivery/Lifetime 收束；非空转换 Drop；两跨进程 CLOSED 提交后 kill，两个目标精确终因和 Pool charge 退款。
-- 外部只读 GDB `artifacts/check/public-ipc-exit-gdb.log`：生产 Kill(0x131) 前 active 非零、三成员、mandatory=1；随后进入已安装 Waiting 取消，epoch=1、reusable=false/KernelResult0（Close 回复）。另 hart 用户 PC 与 actor 同时存在；只证明本次窗口，不把所有用户运行都标为 exact-window。ELF/SHA256 保留于同目录。
-- 最终日志 `artifacts/check/public-ipc-final-{core,sifive,release,nofd,boot-failure,clippy,host,shared-host}.log`：正常 core/平台/release/nofd、三种 Failed 全 hart 停驻、七面 lint、140+23 host 测试通过。普通路线 required anchors 包含全部新增公共自检与用户组合。
-
-完整 stress 的先前 300s Tunnel 墙钟敏感截断与概率 15/16 判定缺口已完成首轮验收收口：确定性终因覆盖、运行身份和阶段观测已接入；历史现场与未来重开条件见 [`验收时间敏感归档`](../../plans/archived/ref-2026-09-acceptance-timing-flake.md)。本前置不把历史偶发现象当作当前 correctness 缺陷；若未来复现归档触发条件，必须重新立案并保留完整身份与进度证据。本前置纳入 `task/fal-service-capabilities` 的混合集成基线，提交定位见 FAL 总计划交接节；不完成时间/执行/FAL。
-
-Tunnel/Endpoint/backing 的机制见 [tunnel.md](tunnel.md) 与 [mm.md](mm.md)，Runnel 数据布局见 [runnel.md](runnel.md)，ProcessDrain 业务游标与 Job 生命周期见 [task.md](task.md)。
+Tunnel/Endpoint/backing 的机制见 [tunnel.md](tunnel.md) 与 [mm.md](mm.md)，Runnel 数据布局见 [runnel.md](runnel.md)，Process 自动回收与 Job 生命周期见 [task.md](task.md)。

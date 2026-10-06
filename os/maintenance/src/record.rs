@@ -14,6 +14,8 @@ pub enum State {
 /// step 返回的推进结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
+    /// 本轮无工作，记录保留出生承载以便以后再次激活。
+    Idle,
     /// 仍有可执行步骤。
     Ready,
     /// 依赖已在来源侧登记并复检未就绪。
@@ -57,21 +59,29 @@ impl Default for Record {
 
 impl Record {
     pub const fn new() -> Self {
-        Self { state: State::Idle, wait: 0 }
+        Self {
+            state: State::Idle,
+            wait: 0,
+        }
     }
 
     pub const fn state(&self) -> State {
         self.state
     }
 
-    /// 责任成立：Idle → Queued。每条记录只发布一次。
-    pub fn publish(&mut self) -> Result<Action, TransitionError> {
+    /// 责任成立；正在运行时仅标记下一轮，不交出重复执行权。
+    pub fn activate(&mut self) -> Result<Action, TransitionError> {
         match self.state {
             State::Idle => {
                 self.state = State::Queued;
                 Ok(Action::Link)
             }
-            _ => Err(TransitionError::Invalid),
+            State::Queued => Ok(Action::None),
+            State::Running { .. } => {
+                self.state = State::Running { notified: true };
+                Ok(Action::None)
+            }
+            State::Blocked | State::Done => Err(TransitionError::Invalid),
         }
     }
 
@@ -122,6 +132,14 @@ impl Record {
             return Err(TransitionError::Invalid);
         };
         Ok(match outcome {
+            Outcome::Idle if notified => {
+                self.state = State::Queued;
+                Action::Link
+            }
+            Outcome::Idle => {
+                self.state = State::Idle;
+                Action::Retire
+            }
             Outcome::Ready => {
                 self.state = State::Queued;
                 Action::Link
@@ -148,7 +166,7 @@ mod tests {
 
     fn running() -> Record {
         let mut r = Record::new();
-        assert_eq!(r.publish(), Ok(Action::Link));
+        assert_eq!(r.activate(), Ok(Action::Link));
         r.pick().unwrap();
         r
     }
@@ -199,7 +217,7 @@ mod tests {
         let t = r.arm().unwrap();
         assert_eq!(r.finish(Outcome::Done), Ok(Action::Retire));
         assert_eq!(r.wake(t), Action::None);
-        assert_eq!(r.publish(), Err(TransitionError::Invalid));
+        assert_eq!(r.activate(), Err(TransitionError::Invalid));
         assert_eq!(r.pick(), Err(TransitionError::Invalid));
     }
 
@@ -207,5 +225,32 @@ mod tests {
     fn running_is_never_picked_twice() {
         let mut r = running();
         assert_eq!(r.pick(), Err(TransitionError::Invalid));
+    }
+
+    #[test]
+    fn update_before_idle_finish_keeps_the_next_scan_reachable() {
+        let mut record = running();
+        assert_eq!(record.activate(), Ok(Action::None));
+        assert_eq!(record.pick(), Err(TransitionError::Invalid));
+        assert_eq!(record.finish(Outcome::Idle), Ok(Action::Link));
+        assert_eq!(record.activate(), Ok(Action::None));
+        record.pick().unwrap();
+        assert_eq!(record.finish(Outcome::Idle), Ok(Action::Retire));
+        assert_eq!(record.state(), State::Idle);
+        assert_eq!(record.activate(), Ok(Action::Link));
+    }
+
+    #[test]
+    fn stale_dependency_after_idle_does_not_wake_a_new_activity() {
+        let mut record = running();
+        let old = record.arm().unwrap();
+        assert_eq!(record.finish(Outcome::Idle), Ok(Action::Retire));
+        assert_eq!(record.wake(old), Action::None);
+        record.activate().unwrap();
+        record.pick().unwrap();
+        let current = record.arm().unwrap();
+        assert_eq!(record.finish(Outcome::Blocked), Ok(Action::None));
+        assert_eq!(record.wake(old), Action::None);
+        assert_eq!(record.wake(current), Action::Link);
     }
 }

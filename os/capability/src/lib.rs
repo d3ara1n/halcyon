@@ -9,10 +9,13 @@
 extern crate alloc;
 
 mod holders;
+pub mod signal;
 mod table;
 
 pub use holders::{Holders, HoldersError, ZeroPolicy};
-pub use table::{Cap, CapTable, ClaimTicket, LastCapability, Restore, TableError, TakeNext};
+pub use table::{
+    Cap, CapTable, ClaimTicket, Commit, LastCapability, Restore, TableError, TakeNext,
+};
 
 /// 可被 capability 持有的授权对象。实现者通常是内核对象引用（`Arc<dyn ..>`）。
 ///

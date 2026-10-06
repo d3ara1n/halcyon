@@ -6,6 +6,7 @@
 //! slot 0；协议层（FAL、pm、driver……）的 header 紧随前缀，不构成双层
 //! 信封。消息 `kind` 字段承载协议标识，供单邮箱多路分发。
 
+#![cfg_attr(target_arch = "riscv64", feature(allocator_api))]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;

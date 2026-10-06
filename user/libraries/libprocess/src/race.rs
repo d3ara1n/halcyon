@@ -54,9 +54,10 @@ pub const ACTION_EXIT: u64 = 0;
 pub const ACTION_KILL: u64 = 1;
 pub const ACTION_START: u64 = 2;
 pub const ACTION_CREATE: u64 = 3;
+/// Create 两指令的消息携带 Job[CREATE]、Pool[CREATE]，依次占两个槽。
 pub const ACTION_CREATE_ABANDON: u64 = 4;
 pub const ACTION_SEAL: u64 = 5;
-pub const ACTION_DRAIN: u64 = 6;
+pub const ACTION_OBSERVE_TERMINAL: u64 = 6;
 pub const ACTION_CLOSE: u64 = 7;
 pub const ACTION_ENUMERATE: u64 = 9;
 
@@ -86,7 +87,7 @@ pub struct Report {
     pub status: i64,
     /// CREATE*/DRAIN：work_done；KILL*：0。
     pub aux0: u64,
-    /// DRAIN：ProcessDrainStatus 判别值。
+    /// OBSERVE_TERMINAL：只读终态观察，无工作计数。
     pub aux1: u64,
 }
 

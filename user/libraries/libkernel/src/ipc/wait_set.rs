@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
-    wait::{WaitItem, WaitResult},
-    wait_set::{RECEIVE_MAX, ReadyRecord},
+    wait::WaitResult,
+    wait_set::{MemberRequest, RECEIVE_MAX, ReadyRecord},
 };
 
 static ABANDONED: AtomicUsize = AtomicUsize::new(0);
@@ -40,16 +40,11 @@ impl WaitSet {
         )
     }
 
-    pub fn register(&self, item: WaitItem) -> Result<u64, SystemCallError> {
+    pub fn register(&self, item: MemberRequest) -> Result<u64, SystemCallError> {
         let mut token = 0;
         // SAFETY: 输入和输出在调用复制期间有效，注册只取得观察授权。
         unsafe { call::sys_wait_set_register(self.handle(), &item, &mut token) }?;
         Ok(token)
-    }
-
-    pub fn rearm(&self, token: u64) -> Result<u64, SystemCallError> {
-        // SAFETY: owner 存活，token 是值，错误身份由内核拒绝。
-        unsafe { call::sys_wait_set_rearm(self.handle(), token) }
     }
 
     pub fn remove(&self, token: u64) -> Result<(), SystemCallError> {
@@ -69,11 +64,10 @@ impl WaitSet {
             capacity,
             ReadyRecord {
                 token: 0,
-                arm_generation: 0,
                 cookie: 0,
                 observed: ObjectSignals::NONE,
                 reason: 0,
-                error: 0,
+                reserved: 0,
             },
         );
         let count = self.receive_into(&mut records)?;
@@ -96,11 +90,8 @@ impl WaitSet {
 
     pub fn wait(&self, deadline: Deadline) -> Result<WaitResult, SystemCallError> {
         super::wait::wait_until(
-            &[WaitItem::new(
-                self.handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                0,
-            )],
+            self.handle(),
+            ObjectSignals::READABLE | ObjectSignals::CLOSED,
             deadline,
         )
     }

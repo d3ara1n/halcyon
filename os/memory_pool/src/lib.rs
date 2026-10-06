@@ -1,7 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! MemoryPool 四项守恒状态机。
+//! MemoryPool 的单维守恒账本；页与 metadata 各持一份同形状态。
 //!
 //! 本 crate 只拥有额度算术和线性 token，不分配物理帧、不持内核对象引用，
 //! 也不决定 capability policy。内核适配层负责用 RAII 把 token 连回来源 core。
@@ -102,12 +102,12 @@ impl<T> TokenError<T> {
 pub struct ChargeReservation {
     owner_key: OwnerKey,
     owner: PoolId,
-    pages: u64,
+    units: u64,
 }
 
 impl ChargeReservation {
-    pub const fn pages(&self) -> u64 {
-        self.pages
+    pub const fn units(&self) -> u64 {
+        self.units
     }
 }
 
@@ -117,7 +117,7 @@ pub struct DelegationReservation {
     parent_key: OwnerKey,
     parent: PoolId,
     child_depth: u32,
-    pages: u64,
+    units: u64,
 }
 
 impl DelegationReservation {
@@ -129,8 +129,8 @@ impl DelegationReservation {
         self.child_depth
     }
 
-    pub const fn pages(&self) -> u64 {
-        self.pages
+    pub const fn units(&self) -> u64 {
+        self.units
     }
 }
 
@@ -139,8 +139,8 @@ impl DelegationReservation {
 pub struct PreparedChild {
     parent_key: OwnerKey,
     parent: PoolId,
-    pages: u64,
-    state: PoolState,
+    units: u64,
+    state: LedgerState,
 }
 
 #[derive(Debug)]
@@ -148,7 +148,7 @@ pub struct PreparedChild {
 pub struct AllocatedCredit {
     owner_key: OwnerKey,
     owner: PoolId,
-    pages: u64,
+    units: u64,
 }
 
 impl AllocatedCredit {
@@ -156,22 +156,22 @@ impl AllocatedCredit {
         self.owner
     }
 
-    pub const fn pages(&self) -> u64 {
-        self.pages
+    pub const fn units(&self) -> u64 {
+        self.units
     }
 
-    pub fn split(&mut self, pages: u64) -> Result<Self, PoolError> {
-        if pages == 0 {
+    pub fn split(&mut self, units: u64) -> Result<Self, PoolError> {
+        if units == 0 {
             return Err(PoolError::ZeroAmount);
         }
-        if pages >= self.pages {
+        if units >= self.units {
             return Err(PoolError::InvalidSplit);
         }
-        self.pages -= pages;
+        self.units -= units;
         Ok(Self {
             owner_key: self.owner_key,
             owner: self.owner,
-            pages,
+            units,
         })
     }
 
@@ -179,10 +179,10 @@ impl AllocatedCredit {
         if self.owner_key != other.owner_key {
             return Err(TokenError::new(PoolError::WrongOwner, other));
         }
-        let Some(pages) = self.pages.checked_add(other.pages) else {
+        let Some(units) = self.units.checked_add(other.units) else {
             return Err(TokenError::new(PoolError::ArithmeticOverflow, other));
         };
-        self.pages = pages;
+        self.units = units;
         Ok(())
     }
 }
@@ -192,7 +192,7 @@ impl AllocatedCredit {
 pub struct DelegatedCredit {
     parent_key: OwnerKey,
     parent: PoolId,
-    pages: u64,
+    units: u64,
 }
 
 impl DelegatedCredit {
@@ -200,13 +200,13 @@ impl DelegatedCredit {
         self.parent
     }
 
-    pub const fn pages(&self) -> u64 {
-        self.pages
+    pub const fn units(&self) -> u64 {
+        self.units
     }
 }
 
 #[derive(Debug)]
-pub struct PoolState {
+pub struct LedgerState {
     owner_key: OwnerKey,
     identity: PoolId,
     parent_identity: Option<PoolId>,
@@ -220,11 +220,8 @@ pub struct PoolState {
     parent_credit: Option<DelegatedCredit>,
 }
 
-impl PoolState {
+impl LedgerState {
     pub fn root(identity: PoolId, total: u64) -> Result<Self, PoolError> {
-        if total == 0 {
-            return Err(PoolError::ZeroAmount);
-        }
         Ok(Self {
             owner_key: mint_owner_key()?,
             identity,
@@ -246,7 +243,6 @@ impl PoolState {
         if identity == reservation.parent
             || reservation.child_depth <= 1
             || reservation.child_depth > MAX_DEPTH
-            || reservation.pages == 0
         {
             return Err(TokenError::new(PoolError::InvalidTopology, reservation));
         }
@@ -259,8 +255,8 @@ impl PoolState {
             identity,
             parent_identity: Some(reservation.parent),
             depth: reservation.child_depth,
-            total: reservation.pages,
-            available: reservation.pages,
+            total: reservation.units,
+            available: reservation.units,
             reserved: 0,
             allocated: 0,
             delegated: 0,
@@ -269,7 +265,7 @@ impl PoolState {
         Ok(PreparedChild {
             parent_key: reservation.parent_key,
             parent: reservation.parent,
-            pages: reservation.pages,
+            units: reservation.units,
             state,
         })
     }
@@ -300,25 +296,28 @@ impl PoolState {
             && self.delegated == 0
     }
 
-    pub fn reserve_charge(&mut self, pages: u64) -> Result<ChargeReservation, PoolError> {
-        self.reserve(pages)?;
+    pub fn reserve_charge(&mut self, units: u64) -> Result<ChargeReservation, PoolError> {
+        if units == 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+        self.reserve(units)?;
         Ok(ChargeReservation {
             owner_key: self.owner_key,
             owner: self.identity,
-            pages,
+            units,
         })
     }
 
-    pub fn reserve_delegation(&mut self, pages: u64) -> Result<DelegationReservation, PoolError> {
+    pub fn reserve_delegation(&mut self, units: u64) -> Result<DelegationReservation, PoolError> {
         if self.depth >= MAX_DEPTH {
             return Err(PoolError::DepthLimit);
         }
-        self.reserve(pages)?;
+        self.reserve(units)?;
         Ok(DelegationReservation {
             parent_key: self.owner_key,
             parent: self.identity,
             child_depth: self.depth + 1,
-            pages,
+            units,
         })
     }
 
@@ -326,7 +325,7 @@ impl PoolState {
         &mut self,
         reservation: ChargeReservation,
     ) -> Result<(), TokenError<ChargeReservation>> {
-        self.rollback(reservation.owner_key, reservation.owner, reservation.pages)
+        self.rollback(reservation.owner_key, reservation.owner, reservation.units)
             .map_err(|error| TokenError::new(error, reservation))
     }
 
@@ -337,7 +336,7 @@ impl PoolState {
         self.rollback(
             reservation.parent_key,
             reservation.parent,
-            reservation.pages,
+            reservation.units,
         )
         .map_err(|error| TokenError::new(error, reservation))
     }
@@ -349,7 +348,7 @@ impl PoolState {
         if let Err(error) = self.commit_reserved(
             reservation.owner_key,
             reservation.owner,
-            reservation.pages,
+            reservation.units,
             Account::Allocated,
         ) {
             return Err(TokenError::new(error, reservation));
@@ -357,7 +356,7 @@ impl PoolState {
         Ok(AllocatedCredit {
             owner_key: self.owner_key,
             owner: self.identity,
-            pages: reservation.pages,
+            units: reservation.units,
         })
     }
 
@@ -368,11 +367,11 @@ impl PoolState {
     pub fn commit_child(
         &mut self,
         mut prepared: PreparedChild,
-    ) -> Result<PoolState, TokenError<PreparedChild>> {
+    ) -> Result<LedgerState, TokenError<PreparedChild>> {
         if let Err(error) = self.commit_reserved(
             prepared.parent_key,
             prepared.parent,
-            prepared.pages,
+            prepared.units,
             Account::Delegated,
         ) {
             return Err(TokenError::new(error, prepared));
@@ -380,7 +379,7 @@ impl PoolState {
         prepared.state.parent_credit = Some(DelegatedCredit {
             parent_key: self.owner_key,
             parent: self.identity,
-            pages: prepared.pages,
+            units: prepared.units,
         });
         Ok(prepared.state)
     }
@@ -393,7 +392,7 @@ impl PoolState {
         &mut self,
         prepared: PreparedChild,
     ) -> Result<(), TokenError<PreparedChild>> {
-        self.rollback(prepared.parent_key, prepared.parent, prepared.pages)
+        self.rollback(prepared.parent_key, prepared.parent, prepared.units)
             .map_err(|error| TokenError::new(error, prepared))
     }
 
@@ -405,7 +404,7 @@ impl PoolState {
         }
         let topology_valid = match (self.parent_identity, self.parent_credit.as_ref()) {
             (None, None) => true,
-            (Some(parent), Some(credit)) => credit.parent == parent && credit.pages == self.total,
+            (Some(parent), Some(credit)) => credit.parent == parent && credit.units == self.total,
             (None, Some(_)) | (Some(_), None) => false,
         };
         if !topology_valid {
@@ -421,7 +420,7 @@ impl PoolState {
         self.return_credit(
             credit.owner_key,
             credit.owner,
-            credit.pages,
+            credit.units,
             Account::Allocated,
         )
         .map_err(|error| TokenError::new(error, credit))
@@ -434,24 +433,21 @@ impl PoolState {
         self.return_credit(
             credit.parent_key,
             credit.parent,
-            credit.pages,
+            credit.units,
             Account::Delegated,
         )
         .map_err(|error| TokenError::new(error, credit))
     }
 
-    fn reserve(&mut self, pages: u64) -> Result<(), PoolError> {
-        if pages == 0 {
-            return Err(PoolError::ZeroAmount);
-        }
-        if self.available < pages {
+    fn reserve(&mut self, units: u64) -> Result<(), PoolError> {
+        if self.available < units {
             return Err(PoolError::QuotaExceeded);
         }
         let reserved = self
             .reserved
-            .checked_add(pages)
+            .checked_add(units)
             .ok_or(PoolError::ArithmeticOverflow)?;
-        self.available -= pages;
+        self.available -= units;
         self.reserved = reserved;
         Ok(())
     }
@@ -460,20 +456,20 @@ impl PoolState {
         &mut self,
         owner_key: OwnerKey,
         owner: PoolId,
-        pages: u64,
+        units: u64,
     ) -> Result<(), PoolError> {
-        self.validate_credit(owner_key, owner, pages)?;
-        if self.reserved < pages {
+        self.validate_credit(owner_key, owner)?;
+        if self.reserved < units {
             return Err(PoolError::InvariantViolation);
         }
         let available = self
             .available
-            .checked_add(pages)
+            .checked_add(units)
             .ok_or(PoolError::ArithmeticOverflow)?;
         if available > self.total {
             return Err(PoolError::InvariantViolation);
         }
-        self.reserved -= pages;
+        self.reserved -= units;
         self.available = available;
         Ok(())
     }
@@ -482,11 +478,11 @@ impl PoolState {
         &mut self,
         owner_key: OwnerKey,
         owner: PoolId,
-        pages: u64,
+        units: u64,
         account: Account,
     ) -> Result<(), PoolError> {
-        self.validate_credit(owner_key, owner, pages)?;
-        if self.reserved < pages {
+        self.validate_credit(owner_key, owner)?;
+        if self.reserved < units {
             return Err(PoolError::InvariantViolation);
         }
         let destination = match account {
@@ -494,9 +490,9 @@ impl PoolState {
             Account::Delegated => &mut self.delegated,
         };
         let value = destination
-            .checked_add(pages)
+            .checked_add(units)
             .ok_or(PoolError::ArithmeticOverflow)?;
-        self.reserved -= pages;
+        self.reserved -= units;
         *destination = value;
         Ok(())
     }
@@ -505,40 +501,32 @@ impl PoolState {
         &mut self,
         owner_key: OwnerKey,
         owner: PoolId,
-        pages: u64,
+        units: u64,
         account: Account,
     ) -> Result<(), PoolError> {
-        self.validate_credit(owner_key, owner, pages)?;
+        self.validate_credit(owner_key, owner)?;
         let source = match account {
             Account::Allocated => &mut self.allocated,
             Account::Delegated => &mut self.delegated,
         };
-        if *source < pages {
+        if *source < units {
             return Err(PoolError::InvariantViolation);
         }
         let available = self
             .available
-            .checked_add(pages)
+            .checked_add(units)
             .ok_or(PoolError::ArithmeticOverflow)?;
         if available > self.total {
             return Err(PoolError::InvariantViolation);
         }
-        *source -= pages;
+        *source -= units;
         self.available = available;
         Ok(())
     }
 
-    fn validate_credit(
-        &self,
-        owner_key: OwnerKey,
-        owner: PoolId,
-        pages: u64,
-    ) -> Result<(), PoolError> {
+    fn validate_credit(&self, owner_key: OwnerKey, owner: PoolId) -> Result<(), PoolError> {
         if owner_key != self.owner_key || owner != self.identity {
             return Err(PoolError::WrongOwner);
-        }
-        if pages == 0 {
-            return Err(PoolError::ZeroAmount);
         }
         Ok(())
     }

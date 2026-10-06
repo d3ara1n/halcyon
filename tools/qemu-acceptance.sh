@@ -53,12 +53,10 @@ meta="artifacts/.qemu-acceptance-${run_id}.meta"
 
 required=(
     "funded frame self-test passed: full-range zeroing, split, rollback, and source refund"
-    "WaitSet deterministic interleaving checks passed:"
-    "Waiting continuation checks passed:"
-    "Mailbox ownership checks passed:"
     "Clock state checks passed:"
-    "Time wait installation checks passed:"
     "public time deadline checks passed:"
+    "shared Sender concurrent Send/Query/WAIT passed:"
+    "Pool metadata budget checks passed:"
     "threaded mailbox receive contention passed:"
     "committed IPC caller kill passed:"
     "acceptance domain collected"
@@ -74,8 +72,7 @@ required=(
     "RPC rejected reply cleanup passed"
     "required service topology complete:"
     "supervision budget exhaustion retained authority:"
-    "Tunnel failure rollback and inventory checks passed"
-    "Tunnel multi-page geometry and projection checks passed"
+    "Tunnel failure owner checks passed:"
     "Tunnel Running geometry checks passed: six lengths"
     "RNL2 multi-page stream passed: bytes=65536, capacity=12160"
     "FAL2 Open control and terminal cases passed after 16384 bytes"
@@ -114,19 +111,11 @@ case "$profile" in
     stress)
         required+=(
             "acceptance workload: stress"
-            "drain minimum-budget acceptance passed"
-            "retired WaitSet with 256 registrations"
+            "automatic retirement acceptance passed: retired WaitSet with 256 registrations"
+            "control-plane stress passed:"
+            "Tunnel abandonment and closed-creator Attach checks passed"
             "Tunnel close/Attach failure matrix passed: 24 rounds"
             "race matrix acceptance passed: 16/16 scenarios passed"
-        )
-        ;;
-    capacity)
-        required+=(
-            "acceptance workload: capacity"
-            "capacity calibration passed: 32 bound address spaces"
-            "capacity calibration rejected 33rd bound address space: ReachLimit"
-            "capacity calibration concurrent passed: 31 additional Bound AddressSpace(s)"
-            "capacity calibration mixed passed: 8 resident Bound AddressSpace(s)"
         )
         ;;
     hetero)
@@ -170,6 +159,7 @@ terminal=(
     "system reset failed:"
     "acceptance failed"
     "Kernel panicking"
+    "Panicking in "
     "Panicking: no information available."
 )
 

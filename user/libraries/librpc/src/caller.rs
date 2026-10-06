@@ -5,11 +5,12 @@ use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     time::Deadline,
-    wait::{WaitItem, WaitReason},
+    wait::WaitReason,
+    wait_set::{MemberRequest, ReadyRecord},
 };
 use libkernel::ipc::{
     message::{Mailbox, MailboxSender},
-    wait::wait_until,
+    wait_set::WaitSet,
 };
 
 struct ReplyPort {
@@ -73,7 +74,7 @@ pub struct Caller {
 
 enum OperationState {
     Unsent(Request),
-    Sent,
+    Sent(libkernel::ipc::capability::Capability),
     Completed,
 }
 
@@ -82,10 +83,139 @@ pub struct CallOperation<'a> {
     caller: &'a mut Caller,
     service: &'a MailboxSender,
     deadline: Deadline,
-    cancel: Option<Handle>,
+    wait: Option<CallWait>,
     state: OperationState,
     protocol: u64,
     txid: u64,
+}
+
+/// 每个调用在发送前出生一个真实扁平集合，跨分步推进持有接收权。
+struct CallWait {
+    set: WaitSet,
+    reply: u64,
+    service: Option<u64>,
+    cancel: Option<(u64, Handle)>,
+    observation: u64,
+}
+
+impl CallWait {
+    fn new(
+        reply: Handle,
+        service: Handle,
+        cancel: Option<Handle>,
+        observation: Handle,
+    ) -> Result<Self, SystemCallError> {
+        // 发送后只替换一次 service 掩码，额外一槽覆盖正在摘除的旧成员。
+        let set = WaitSet::create(5)?;
+        let reply = set.register(MemberRequest::new(
+            reply,
+            ObjectSignals::READABLE | ObjectSignals::CLOSED,
+            0,
+        ))?;
+        let service = set.register(MemberRequest::new(
+            service,
+            ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+            1,
+        ))?;
+        let cancel = match cancel {
+            Some(handle) => Some((
+                set.register(MemberRequest::new(
+                    handle,
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                    2,
+                ))?,
+                handle,
+            )),
+            None => None,
+        };
+        let observation = set.register(MemberRequest::new(
+            observation,
+            ObjectSignals::PEER_CLOSED,
+            3,
+        ))?;
+        Ok(Self {
+            set,
+            reply,
+            service: Some(service),
+            cancel,
+            observation,
+        })
+    }
+
+    fn sent(&mut self, service: Handle) -> Result<(), SystemCallError> {
+        let old = self.service.expect("unsent call lost service member");
+        self.set.remove(old)?;
+        self.service = None;
+        self.service = Some(self.set.register(MemberRequest::new(
+            service,
+            ObjectSignals::CLOSED,
+            1,
+        ))?);
+        Ok(())
+    }
+
+    fn receive(&self, sent: bool) -> Result<Option<(u64, ObjectSignals)>, SystemCallError> {
+        let mut records = [ReadyRecord {
+            token: 0,
+            cookie: 0,
+            observed: ObjectSignals::NONE,
+            reason: 0,
+            reserved: 0,
+        }; 4];
+        let count = match self.set.receive_into(&mut records) {
+            Ok(count) => count,
+            Err(SystemCallError::ObjectNotAvailable) => 0,
+            Err(error) => return Err(error),
+        };
+        let mut selected: Option<(u64, ObjectSignals)> = None;
+        for record in &records[..count] {
+            let current = match record.cookie {
+                0 => sent && record.token == self.reply,
+                1 => self.service == Some(record.token),
+                2 => self.cancel.is_some_and(|(token, _)| token == record.token),
+                3 => sent && record.token == self.observation,
+                _ => false,
+            };
+            if !current || record.reserved != 0 {
+                continue;
+            }
+            let signals = match WaitReason::from_u32(record.reason) {
+                Some(WaitReason::Signaled) => record.observed,
+                Some(WaitReason::Closed) => record.observed | ObjectSignals::CLOSED,
+                _ => return Err(SystemCallError::InternalError),
+            };
+            let priority = |cookie| match (sent, cookie) {
+                (true, 0) | (false, 2) => 0,
+                (true, 2) | (false, 1) => 1,
+                _ => 2,
+            };
+            if selected.is_none_or(|(cookie, _)| priority(record.cookie) < priority(cookie)) {
+                selected = Some((record.cookie, signals));
+            }
+        }
+        Ok(selected)
+    }
+
+    fn ready(&self, sent: bool) -> Result<bool, CallCause> {
+        let Some((cookie, observed)) = self.receive(sent).map_err(cause)? else {
+            return Ok(false);
+        };
+        if cookie == 2 {
+            return Err(CallCause::Cancelled);
+        }
+        if cookie == 3 || observed.intersects(ObjectSignals::CLOSED) {
+            return Err(CallCause::ServiceClosed);
+        }
+        Ok(true)
+    }
+    fn cancelled(&self) -> Result<bool, CallCause> {
+        let Some((_, handle)) = self.cancel else {
+            return Ok(false);
+        };
+        libkernel::ipc::wait::probe(handle, ObjectSignals::READABLE | ObjectSignals::CLOSED)
+            .map(|signals| signals.intersects(ObjectSignals::READABLE | ObjectSignals::CLOSED))
+            .map_err(cause)
+    }
 }
 
 impl Caller {
@@ -123,12 +253,16 @@ impl Caller {
                 Ok(None) => {}
                 Err(cause) => {
                     // advance 只在返回回复时进入完成态，错误必然仍有待收束操作。
-                    return Err(operation.abort(cause).expect("pending call cannot be completed"));
+                    return Err(operation
+                        .abort(cause)
+                        .expect("pending call cannot be completed"));
                 }
             }
             if let Err(cause) = operation.wait_ready() {
                 // wait_ready 只在未完成态调用。
-                return Err(operation.abort(cause).expect("pending call cannot be completed"));
+                return Err(operation
+                    .abort(cause)
+                    .expect("pending call cannot be completed"));
             }
         }
     }
@@ -149,18 +283,33 @@ impl<'a> CallOperation<'a> {
                 return Err(SystemCallError::RightsDenied);
             }
             caller.ensure_port()?;
-            request.attach_reply(&caller.port.as_ref().expect("ReplyPort just created").sender)
+            request.attach_reply(&caller.port.as_ref().expect("ReplyPort just created").sender)?;
+            CallWait::new(
+                caller
+                    .port
+                    .as_ref()
+                    .expect("ReplyPort just created")
+                    .owner
+                    .as_handle(),
+                service.as_handle(),
+                cancel,
+                request
+                    .observation()
+                    .expect("reply preparation lost observer")
+                    .as_handle(),
+            )
         })();
-        if let Err(error) = setup {
-            return Err(CallError::unsent(cause(error), request));
-        }
+        let wait = match setup {
+            Ok(wait) => wait,
+            Err(error) => return Err(CallError::unsent(cause(error), request)),
+        };
         let protocol = request.protocol();
         let txid = request.txid();
         Ok(Self {
             caller,
             service,
             deadline,
-            cancel,
+            wait: Some(wait),
             state: OperationState::Unsent(request),
             protocol,
             txid,
@@ -168,10 +317,24 @@ impl<'a> CallOperation<'a> {
     }
 
     pub fn advance(&mut self) -> Result<Option<Reply>, CallCause> {
+        if matches!(self.state, OperationState::Unsent(_))
+            && self
+                .wait
+                .as_ref()
+                .expect("live call lost wait owner")
+                .cancelled()?
+        {
+            return Err(CallCause::Cancelled);
+        }
         if let OperationState::Unsent(request) = &mut self.state {
             match request.try_send(self.service, self.deadline) {
                 Ok(()) => {
-                    self.state = OperationState::Sent;
+                    self.state = OperationState::Sent(request.take_observation());
+                    self.wait
+                        .as_mut()
+                        .expect("live call lost wait owner")
+                        .sent(self.service.as_handle())
+                        .map_err(cause)?;
                     return Ok(None);
                 }
                 Err(SystemCallError::MailboxFull) => return Ok(None),
@@ -190,6 +353,7 @@ impl<'a> CallOperation<'a> {
             Ok(message) => {
                 let reply = Reply::accept(message, self.protocol, self.txid, self.deadline)?;
                 self.state = OperationState::Completed;
+                drop(self.wait.take());
                 Ok(Some(reply))
             }
             Err(SystemCallError::ObjectNotAvailable | SystemCallError::ObjectBusy) => Ok(None),
@@ -197,71 +361,79 @@ impl<'a> CallOperation<'a> {
         }
     }
 
+    fn ready_at_deadline(&self) -> Result<bool, CallCause> {
+        let wait = self.wait.as_ref().expect("live call lost wait owner");
+        let probe = |handle, signals| libkernel::ipc::wait::probe(handle, signals).map_err(cause);
+        if let OperationState::Sent(observation) = &self.state {
+            let port = self.caller.port.as_ref().expect("sent call lost ReplyPort");
+            let reply = probe(
+                port.owner.as_handle(),
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+            )?;
+            if reply.intersects(ObjectSignals::READABLE) {
+                return Ok(true);
+            }
+            if reply.intersects(ObjectSignals::CLOSED) {
+                return Err(CallCause::ServiceClosed);
+            }
+            if wait.cancelled()? {
+                return Err(CallCause::Cancelled);
+            }
+            if probe(self.service.as_handle(), ObjectSignals::CLOSED)?
+                .intersects(ObjectSignals::CLOSED)
+                || probe(observation.as_handle(), ObjectSignals::PEER_CLOSED)?
+                    .intersects(ObjectSignals::PEER_CLOSED)
+            {
+                return Err(CallCause::ServiceClosed);
+            }
+            Ok(false)
+        } else {
+            if wait.cancelled()? {
+                return Err(CallCause::Cancelled);
+            }
+            let service = probe(
+                self.service.as_handle(),
+                ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+            )?;
+            if service.intersects(ObjectSignals::CLOSED) {
+                return Err(CallCause::ServiceClosed);
+            }
+            Ok(service.intersects(ObjectSignals::WRITABLE))
+        }
+    }
+
     pub fn wait_ready(&self) -> Result<(), CallCause> {
         if matches!(self.state, OperationState::Completed) {
             return Err(CallCause::System(SystemCallError::ObjectBusy));
         }
-        let result = if matches!(self.state, OperationState::Sent) {
-            let items = [
-                WaitItem::new(
-                    self.caller
-                        .port
-                        .as_ref()
-                        .ok_or(CallCause::System(SystemCallError::ObjectClosed))?
-                        .owner
-                        .as_handle(),
-                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                    0,
-                ),
-                WaitItem::new(self.service.as_handle(), ObjectSignals::CLOSED, 1),
-                WaitItem::new(
-                    self.cancel.unwrap_or(self.service.as_handle()),
-                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                    2,
-                ),
-            ];
-            wait_until(&items[..if self.cancel.is_some() { 3 } else { 2 }], self.deadline)
-        } else {
-            let items = [
-                WaitItem::new(
-                    self.service.as_handle(),
-                    ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
-                    0,
-                ),
-                WaitItem::new(
-                    self.cancel.unwrap_or(self.service.as_handle()),
-                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                    1,
-                ),
-            ];
-            wait_until(&items[..if self.cancel.is_some() { 2 } else { 1 }], self.deadline)
+        let wait = self.wait.as_ref().expect("live call lost wait owner");
+        loop {
+            if wait.ready(matches!(self.state, OperationState::Sent(_)))? {
+                return Ok(());
+            }
+            let result = wait.set.wait(self.deadline).map_err(cause)?;
+            match WaitReason::from_u32(result.reason) {
+                Some(WaitReason::Timeout) => {
+                    // 超时边界仍取一次当前来源；就绪提示不能被延后调度翻成超时。
+                    if self.ready_at_deadline()? {
+                        return Ok(());
+                    }
+                    return Err(CallCause::Timeout);
+                }
+                Some(WaitReason::Signaled) => {}
+                Some(WaitReason::Closed) => {
+                    return Err(CallCause::System(SystemCallError::ObjectClosed));
+                }
+                None => return Err(CallCause::System(SystemCallError::InternalError)),
+            }
         }
-        .map_err(cause)?;
-        let reason = WaitReason::from_u32(result.reason)
-            .ok_or(CallCause::System(SystemCallError::InternalError))?;
-        if reason == WaitReason::Timeout {
-            return Err(CallCause::Timeout);
-        }
-        if reason == WaitReason::Cancelled {
-            return Err(CallCause::Cancelled);
-        }
-        let cancel_index = if matches!(self.state, OperationState::Sent) { 2 } else { 1 };
-        if self.cancel.is_some()
-            && result.item_index == cancel_index
-            && result.observed.intersects(ObjectSignals::READABLE | ObjectSignals::CLOSED)
-        {
-            return Err(CallCause::Cancelled);
-        }
-        if result.observed.intersects(ObjectSignals::CLOSED) {
-            return Err(CallCause::ServiceClosed);
-        }
-        Ok(())
     }
 
     pub fn abort(&mut self, cause: CallCause) -> Option<CallError> {
+        drop(self.wait.take());
         match core::mem::replace(&mut self.state, OperationState::Completed) {
             OperationState::Unsent(request) => Some(CallError::unsent(cause, request)),
-            OperationState::Sent => {
+            OperationState::Sent(_) => {
                 let cleanup = self.caller.port.take().map(ReplyCleanup::new);
                 Some(CallError::sent_with_cleanup(cause, cleanup))
             }
@@ -272,7 +444,7 @@ impl<'a> CallOperation<'a> {
     pub fn phase(&self) -> Option<crate::exchange::CallPhase> {
         match self.state {
             OperationState::Unsent(_) => Some(crate::exchange::CallPhase::Unsent),
-            OperationState::Sent => Some(crate::exchange::CallPhase::Sent),
+            OperationState::Sent(_) => Some(crate::exchange::CallPhase::Sent),
             OperationState::Completed => None,
         }
     }
@@ -280,7 +452,8 @@ impl<'a> CallOperation<'a> {
 
 impl Drop for CallOperation<'_> {
     fn drop(&mut self) {
-        if matches!(self.state, OperationState::Sent) {
+        drop(self.wait.take());
+        if matches!(self.state, OperationState::Sent(_)) {
             // 放弃后旧回复端口不得再被后续调用复用。
             drop(self.caller.port.take());
         }

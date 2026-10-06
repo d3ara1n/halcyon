@@ -1,0 +1,110 @@
+//! 已登记线程离场回执：执行 owner 结束后的 Body 成员摘除与 Shell 强持。
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use erhino_shared::call::SystemCallError;
+use maintenance::record::Outcome;
+
+use crate::{
+    maintenance::{self as mt, Work, WorkRecord},
+    sync::{Spinlock, ranks},
+};
+
+use super::{super::thread::ThreadControl, members::MemberKey, shell::ProcessShell};
+
+struct DepartureState {
+    requested: bool,
+}
+
+pub(crate) struct ThreadDeparture {
+    record: WorkRecord,
+    state: Spinlock<DepartureState>,
+    release: DepartureRelease,
+}
+
+struct DepartureRelease {
+    metadata: Option<super::super::resources::MetadataCharge>,
+    shell: Arc<ProcessShell>,
+    member: MemberKey,
+    done_source: Option<Arc<super::super::wait_source::SignalSource>>,
+    completed: AtomicBool,
+}
+
+impl Drop for DepartureRelease {
+    fn drop(&mut self) {
+        drop(self.metadata.take());
+        if self.completed.load(Ordering::Acquire) {
+            if let Some(source) = &self.done_source {
+                source.publish(erhino_shared::object::ObjectSignals::DONE, false);
+            }
+            // Thread/Departure 私有宿主已退款，最后离场才解除父进程资金屏障。
+            self.shell.member_departed();
+        }
+    }
+}
+
+impl ThreadDeparture {
+    /// 成员提交前出生；提交后由 Shell 的 member_count 与此强持共同保活。
+    pub(crate) fn try_new(
+        shell: &Arc<ProcessShell>,
+        member: MemberKey,
+        control: Option<&Arc<ThreadControl>>,
+    ) -> Result<Arc<Self>, SystemCallError> {
+        let pool = shell.funding_pool();
+        let account = pool.maintenance_account().clone();
+        let metadata = super::super::resources::MetadataCharge::arc::<Self>(&pool)?;
+        let departure = Arc::try_new(Self {
+            record: WorkRecord::new(account),
+            state: Spinlock::new(ranks::LEAF, DepartureState { requested: false }),
+            release: DepartureRelease {
+                metadata: Some(metadata),
+                shell: shell.clone(),
+                member,
+                done_source: control.map(|control| control.done_source()),
+                completed: AtomicBool::new(false),
+            },
+        })
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+        Ok(departure)
+    }
+
+    pub(crate) fn request(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock();
+            if state.requested {
+                return;
+            }
+            state.requested = true;
+        }
+        let root: Arc<dyn Work> = self.clone();
+        mt::publish(root);
+        mt::kick();
+    }
+}
+
+impl Work for ThreadDeparture {
+    fn record(&self) -> &WorkRecord {
+        &self.record
+    }
+
+    fn step(&self) -> Outcome {
+        {
+            let state = self.state.lock();
+            assert!(state.requested, "unrequested thread departure scheduled");
+            assert!(
+                !self.release.completed.load(Ordering::Acquire),
+                "thread departure completed twice"
+            );
+        }
+        let receipt = self
+            .release
+            .shell
+            .lease_receipt()
+            .expect("registered departure lost Body");
+        receipt.members.depart(self.release.member);
+        drop(receipt);
+        self.release.completed.store(true, Ordering::Release);
+        Outcome::Done
+    }
+}

@@ -3,7 +3,9 @@
 use core::mem::ManuallyDrop;
 use erhino_shared::{
     call::SystemCallError,
-    memory_pool::{MEMORY_POOL_MAX_DEPTH, MemoryPoolSnapshot},
+    memory_pool::{
+        MEMORY_POOL_MAX_DEPTH, MemoryPoolBudget, MemoryPoolDeriveRequest, MemoryPoolSnapshot,
+    },
     object::{Handle, Rights},
 };
 
@@ -29,17 +31,7 @@ impl MemoryPool {
     }
 
     pub fn query(&self) -> Result<MemoryPoolSnapshot, SystemCallError> {
-        let mut snapshot = MemoryPoolSnapshot {
-            identity: 0,
-            parent_identity: 0,
-            total: 0,
-            available: 0,
-            reserved: 0,
-            allocated: 0,
-            delegated: 0,
-            depth: 0,
-            reserved0: 0,
-        };
+        let mut snapshot = MemoryPoolSnapshot::default();
         // SAFETY: snapshot 在 syscall 期间有效且可写。
         unsafe { crate::call::sys_memory_pool_query(self.handle, &mut snapshot)? };
         if snapshot.identity == 0
@@ -55,11 +47,20 @@ impl MemoryPool {
         Ok(snapshot)
     }
 
-    pub fn derive(&self, pages: u64, rights: Rights) -> Result<Self, SystemCallError> {
+    pub fn derive(
+        &self,
+        budget: MemoryPoolBudget,
+        rights: Rights,
+    ) -> Result<Self, SystemCallError> {
         let mut child = Handle::INVALID;
+        let request = MemoryPoolDeriveRequest {
+            budget,
+            rights,
+            reserved: 0,
+        };
         // SAFETY: child 在 syscall 期间有效且可写；内核完整校验值参数。
         unsafe {
-            crate::call::sys_memory_pool_derive(self.handle, pages, rights, &mut child)?;
+            crate::call::sys_memory_pool_derive(self.handle, &request, &mut child)?;
         }
         if !child.is_valid() {
             return Err(SystemCallError::InternalError);

@@ -12,8 +12,7 @@ use libkernel::{
     shared::{
         call::SystemCallError,
         message::{HandleMove, MAILBOX_CAPACITY, PAYLOAD_MAX},
-        object::{Handle, HandleRole, ObjectSignals, Rights},
-        wait::WaitItem,
+        object::{Handle, ObjectKind, ObjectSignals, Rights},
     },
     time,
 };
@@ -21,6 +20,102 @@ use libruntime::thread;
 use libthread::ThreadOutcome;
 
 const MESSAGES: usize = MAILBOX_CAPACITY * 4;
+
+/// WRITE 可反复使用且不依赖 DUPLICATE；同一表项的 Query/WAIT 不被普通 Send 排斥。
+pub(super) fn shared_sender() {
+    use libkernel::{ipc::wait_set::WaitSet, shared::wait_set::MemberRequest};
+    const PER_WORKER: usize = MAILBOX_CAPACITY * 2;
+    let inbox = create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::WRITE).unwrap();
+    let sender = mint_sender(inbox.owner, 42, Rights::WRITE | Rights::WAIT).unwrap();
+    let sender_id = query(sender.sender).unwrap().object_id;
+    // SAFETY: 默认 peer 未交给消费者；所有线程共享的是另一份无 DUPLICATE 的表项。
+    unsafe { close(inbox.peer) }.unwrap();
+    let deadline = time::timeout_millis(30_000).unwrap();
+    let go = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+    for index in 0..2 {
+        let go = go.clone();
+        let handle = sender.sender;
+        workers.push(
+            thread::Builder::new()
+                .spawn(move || {
+                    let set = WaitSet::create(1).unwrap();
+                    while !go.load(Ordering::Acquire) {
+                        thread::yield_now().unwrap();
+                    }
+                    for sequence in 0..PER_WORKER {
+                        let description = query(handle).expect("shared Sender query failed");
+                        assert_eq!(description.rights, Rights::WRITE | Rights::WAIT);
+                        let token = set
+                            .register(MemberRequest::new(handle, ObjectSignals::WRITABLE, 0))
+                            .expect("shared Sender registration failed");
+                        // 零期限探测允许此刻满箱；只要求授权入口不因别人的普通 Send 返回 Busy。
+                        wait_until(
+                            handle,
+                            ObjectSignals::WRITABLE,
+                            time::timeout_millis(0).unwrap(),
+                        )
+                        .expect("shared Sender wait probe failed");
+                        set.remove(token).unwrap();
+                        let kind = (index * PER_WORKER + sequence) as u64;
+                        let payload = vec![index as u8; PAYLOAD_MAX];
+                        loop {
+                            // SAFETY: 普通发送无移交，父线程在全部 join 之前保留唯一表项。
+                            match unsafe { send_raw(handle, kind, &payload, &[]) } {
+                                Ok(()) => break,
+                                Err(SystemCallError::MailboxFull) => {
+                                    wait_writable(handle, deadline)
+                                }
+                                Err(error) => panic!("shared Sender send failed: {error:?}"),
+                            }
+                        }
+                    }
+                })
+                .unwrap(),
+        );
+    }
+    go.store(true, Ordering::Release);
+    let mut seen = [false; PER_WORKER * 2];
+    for _ in 0..seen.len() {
+        let message = wait_message_until(inbox.owner, deadline).unwrap();
+        let index = message.header.kind as usize;
+        assert!(
+            index < seen.len() && !seen[index],
+            "shared Sender message lost or duplicated"
+        );
+        assert_eq!(message.header.sender_badge, 42);
+        assert_eq!(message.header.sender_context_id, sender_id);
+        assert_eq!(
+            message
+                .delivery
+                .into_capability()
+                .description()
+                .unwrap()
+                .related_object_id,
+            sender_id
+        );
+        assert_eq!(
+            message.payload,
+            vec![(index / PER_WORKER) as u8; PAYLOAD_MAX]
+        );
+        seen[index] = true;
+    }
+    for worker in workers {
+        assert!(
+            matches!(worker.join(), ThreadOutcome::Returned { leave: Ok(()), .. }),
+            "shared Sender worker did not finish"
+        );
+    }
+    // SAFETY: 所有线程已 join，所有 Message/Delivery 已释放。
+    unsafe { close(sender.sender) }.unwrap();
+    let observed = wait_until(sender.lifetime, ObjectSignals::CLOSED, deadline).unwrap();
+    assert!(observed.observed.intersects(ObjectSignals::CLOSED));
+    unsafe { close(sender.lifetime) }.unwrap();
+    unsafe { close(inbox.owner) }.unwrap();
+    debug!(
+        "shared Sender concurrent Send/Query/WAIT passed: no duplicate authority, complete delivery"
+    );
+}
 
 pub(super) fn threaded_receive() {
     let inbox = create(
@@ -87,8 +182,12 @@ pub(super) fn threaded_receive() {
         )
         .expect("threaded sender mint failed");
         lifetimes.push(sender.lifetime);
-        let moved = make_send_once(sender.sender, Rights::WRITE | Rights::TRANSIT)
+        let moved_pair = make_send_once(sender.sender, Rights::WRITE | Rights::TRANSIT)
             .expect("threaded transit sender derivation failed");
+        let moved = moved_pair.owner;
+        // SAFETY: 本夹具不观察回复终态，关闭本次派生的独立观察表项。
+        unsafe { libkernel::ipc::object::close(moved_pair.peer) }
+            .expect("reply observer close failed");
         let moves = [HandleMove {
             handle: moved,
             rights: Rights::WRITE,
@@ -105,8 +204,8 @@ pub(super) fn threaded_receive() {
                 "gated traffic failed to reach full backpressure"
             );
             assert_eq!(
-                query(moved).unwrap().role,
-                HandleRole::MailboxSenderOnce as u32
+                query(moved).unwrap().kind,
+                ObjectKind::MailboxOnceSender as u32
             );
             full_hits += 1;
             concurrent.store(true, Ordering::Release);
@@ -168,11 +267,7 @@ pub(super) fn threaded_receive() {
         "threaded Mailbox retained an unconsumed queue head"
     );
     for lifetime in lifetimes {
-        let result = wait_until(
-            &[WaitItem::new(lifetime, ObjectSignals::CLOSED, 0)],
-            deadline,
-        )
-        .unwrap();
+        let result = wait_until(lifetime, ObjectSignals::CLOSED, deadline).unwrap();
         assert!(
             result.observed.intersects(ObjectSignals::CLOSED),
             "threaded Delivery retained its sender"
@@ -190,11 +285,8 @@ pub(super) fn threaded_receive() {
 }
 
 fn wait_writable(sender: Handle, deadline: time::Deadline) {
-    let result = wait_until(
-        &[WaitItem::new(sender, ObjectSignals::WRITABLE, 0)],
-        deadline,
-    )
-    .expect("threaded Mailbox backpressure wait failed");
+    let result = wait_until(sender, ObjectSignals::WRITABLE, deadline)
+        .expect("threaded Mailbox backpressure wait failed");
     assert!(
         result.observed.intersects(ObjectSignals::WRITABLE) && !time::expired(deadline).unwrap(),
         "threaded Mailbox retry exceeded its original deadline"
@@ -226,9 +318,10 @@ fn inspect(mut message: libkernel::ipc::message::ReceivedMessage, seen: &mut Vec
         .take(0)
         .expect("threaded Mailbox transit capability missing");
     let description = capability.description().unwrap();
-    assert_eq!(description.object_id, message.header.sender_context_id);
+    // 本消息由普通 Sender 发出，附带的是另一次派生的 OnceSender，身份各自独立。
+    assert_ne!(description.object_id, message.header.sender_context_id);
     assert_eq!(description.badge, index + 1);
-    assert_eq!(description.role, HandleRole::MailboxSenderOnce as u32);
+    assert_eq!(description.kind, ObjectKind::MailboxOnceSender as u32);
     assert_eq!(description.rights, Rights::WRITE);
     assert_eq!(
         message
@@ -237,21 +330,24 @@ fn inspect(mut message: libkernel::ipc::message::ReceivedMessage, seen: &mut Vec
             .description()
             .unwrap()
             .related_object_id,
-        description.object_id
+        message.header.sender_context_id
     );
     seen.push(index as usize);
 }
 
-pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8]) {
+pub(super) fn committed_kill(job: Handle, image: &[u8]) {
     use libkernel::{
         ipc::{notification, object::duplicate, wait_set::WaitSet},
         process,
-        shared::proc::{HandleGrant, ProcessState, TerminationCause},
+        shared::{
+            proc::{HandleGrant, ProcessState, TerminationCause},
+            wait_set::MemberRequest,
+        },
     };
+    let baseline = crate::root_pool_allocated().unwrap();
     let mut sources = Vec::new();
-    let monitor = WaitSet::create(2).unwrap();
     let mut owners = Vec::new();
-    for cookie in 0..2 {
+    for _ in 0..2 {
         let source =
             notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)
                 .unwrap();
@@ -261,35 +357,17 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
         )
         .unwrap();
         for entry in 0..1024 {
-            set.register(WaitItem::new(source.owner, ObjectSignals::READABLE, entry))
-                .unwrap();
-        }
-        monitor
-            .register(WaitItem::new(set.handle(), ObjectSignals::CLOSED, cookie))
+            set.register(MemberRequest::new(
+                source.owner,
+                ObjectSignals::READABLE,
+                entry,
+            ))
             .unwrap();
+        }
         owners.push(set.into_capability().into_raw());
         sources.push(source);
     }
-    let dropped = WaitSet::create(1).unwrap();
-    let drop_source =
-        notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL).unwrap();
-    dropped
-        .register(WaitItem::new(drop_source.owner, ObjectSignals::READABLE, 7))
-        .unwrap();
-    let stale = dropped.handle();
-    drop(dropped.into_capability());
-    assert_eq!(
-        query(stale),
-        Err(SystemCallError::StaleHandle),
-        "converted WaitSet capability Drop retained its owner"
-    );
-    // SAFETY: 转换后的非空集合已由 Drop 等到内核退休，不再观察此来源。
-    unsafe { close(drop_source.peer) }.unwrap();
-    unsafe { close(drop_source.owner) }.unwrap();
-    let baseline = crate::root_pool_allocated().unwrap();
-    let nested = process::create(job, crate::SUPERVISOR_RIGHTS).unwrap();
-    let pool = duplicate(crate::root_memory_pool(), Rights::GRANT).unwrap();
-    process::bind_memory(nested.builder, pool).unwrap();
+    let nested = process::create(job, crate::root_memory_pool(), crate::SUPERVISOR_RIGHTS).unwrap();
     process::grant(
         nested.builder,
         &[HandleGrant {
@@ -300,13 +378,13 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     )
     .unwrap();
     process::kill(nested.control).unwrap();
-    // SAFETY: Building builder 不再组装，Kill 已冻结终因，关闭仅退还该 affine owner。
+    // SAFETY: Kill 后停止组装，退还唯一 Builder；不改变已冻结终因。
     unsafe { close(nested.builder) }.unwrap();
     let ready =
         notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
-    let drain_done =
+    let done =
         notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
-    let control = duplicate(nested.control, Rights::MANAGE | Rights::GRANT).unwrap();
+    let control = duplicate(nested.control, Rights::READ | Rights::WAIT | Rights::GRANT).unwrap();
     let started = crate::spawn(crate::SpawnRequest {
         memory_pool: crate::root_memory_pool(),
         parent: crate::init_process_info(),
@@ -320,14 +398,14 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
             },
             HandleGrant {
                 handle: control,
-                rights: Rights::MANAGE,
+                rights: Rights::READ | Rights::WAIT,
             },
             HandleGrant {
                 handle: ready.peer,
                 rights: Rights::SIGNAL,
             },
             HandleGrant {
-                handle: drain_done.peer,
+                handle: done.peer,
                 rights: Rights::SIGNAL,
             },
         ],
@@ -335,109 +413,25 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     })
     .expect("committed IPC kill target spawn failed");
     let deadline = time::timeout_millis(30_000).unwrap();
-    wait_until(
-        &[WaitItem::new(ready.owner, ObjectSignals::READABLE, 0)],
-        deadline,
-    )
-    .unwrap();
-    // 同 authority 的探针优先观察 ObjectBusy；若目标 Drain 在探针前已完成，
-    // 也接受该合法竞态。精确的 active/parked 取消窗口由内核确定性夹具覆盖；
-    // 这里证明真实用户线程退出与管理者接管的组合。
-    loop {
-        match process::drain(nested.control, 1) {
-            Err(SystemCallError::ObjectBusy) => {
-                let done = wait_until(
-                    &[WaitItem::new(drain_done.owner, ObjectSignals::READABLE, 0)],
-                    time::Deadline::at(0),
-                )
-                .unwrap();
-                assert!(
-                    !done.observed.intersects(ObjectSignals::READABLE),
-                    "ownership probe observed a Drain that had already returned"
-                );
-                break;
-            }
-            Ok(result) => {
-                if result.status == libkernel::shared::proc::ProcessDrainStatus::Complete as u32 {
-                    debug!("committed IPC ownership probe observed target completion");
-                    break;
-                }
-            }
-            Err(error) => panic!("committed IPC ownership probe failed: {error:?}"),
-        }
-        thread::yield_now().expect("IPC ownership probe yield failed");
-        assert!(
-            !time::expired(deadline).unwrap(),
-            "committed IPC Drain never exposed its active owner"
-        );
-    }
+    wait_until(ready.owner, ObjectSignals::READABLE, deadline).unwrap();
+    // 子线程将关闭非空集合；Kill 可落在关闭提交前后，两者都必须由内核稳定持有退休责任。
     process::kill(started.control).unwrap();
-    wait_until(
-        &[WaitItem::new(
-            started.control,
-            ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-            0,
-        )],
-        deadline,
-    )
-    .unwrap();
-    process::drain_to_completion(started.control).unwrap();
-    let snapshot = process::query(started.control).unwrap();
-    assert_eq!(snapshot.state, ProcessState::Dead as u32);
-    assert_eq!(snapshot.cause, TerminationCause::Killed as u32);
-    assert_eq!(
-        snapshot.detail,
-        libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
-    );
-    // 捕获请求被 kill 时目标可能已自然结束；否则由原 control 接同一游标收口。
-    loop {
-        match process::drain(nested.control, 128) {
-            Ok(result)
-                if result.status
-                    == libkernel::shared::proc::ProcessDrainStatus::Complete as u32 =>
-            {
-                break;
-            }
-            Ok(_) => (),
-            Err(SystemCallError::ObjectBusy) => {
-                thread::yield_now().expect("IPC retirement yield failed");
-            }
-            Err(error) => panic!("committed IPC target retirement failed: {error:?}"),
-        }
+    for control in [started.control, nested.control] {
+        let observed = wait_until(control, ObjectSignals::DONE, deadline).unwrap();
         assert!(
-            !time::expired(deadline).unwrap(),
-            "captured Native cancellation retained its batch"
+            observed.observed.intersects(ObjectSignals::DONE),
+            "IPC process retirement timed out"
+        );
+        let snapshot = process::query(control).unwrap();
+        assert_eq!(snapshot.state, ProcessState::Dead as u32);
+        assert_eq!(snapshot.cause, TerminationCause::Killed as u32);
+        assert_eq!(
+            snapshot.detail,
+            libkernel::shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
         );
     }
-    let snapshot = process::query(nested.control).unwrap();
-    assert_eq!(
-        (snapshot.state, snapshot.cause, snapshot.detail.word0),
-        (
-            ProcessState::Dead as u32,
-            TerminationCause::Killed as u32,
-            1
-        ),
-        "builder close changed the nested target's frozen terminal result"
-    );
-    let mut closed = 0;
-    while closed != 3 {
-        monitor.wait(deadline).unwrap();
-        for record in monitor.receive(2).unwrap() {
-            assert!(
-                record.observed.intersects(ObjectSignals::CLOSED),
-                "IPC exit monitor lost a close commit"
-            );
-            closed |= 1 << record.cookie;
-        }
-    }
-    monitor.close().map_err(|(_, error)| error).unwrap();
-    // SAFETY: 两个进程已完整退休，monitor已关闭，不再存在这些 source/control 的用户借用。
-    for h in [
-        started.control,
-        nested.control,
-        ready.owner,
-        drain_done.owner,
-    ] {
+    // SAFETY: 进程已完成独立退休，剩余父方观察/来源表项各关闭一次。
+    for h in [started.control, nested.control, ready.owner, done.owner] {
         unsafe { close(h) }.unwrap();
     }
     for source in sources {
@@ -448,9 +442,9 @@ pub(super) fn committed_kill(job: libkernel::shared::object::Handle, image: &[u8
     assert_eq!(
         crate::root_pool_allocated().unwrap(),
         baseline,
-        "committed IPC target processes failed to refund their Pool charge"
+        "IPC process retirement failed to refund Pool charge"
     );
     debug!(
-        "committed IPC caller kill passed: captured in-flight Drain cycle, caller exit, manager takeover, Close, and target retirement"
+        "committed IPC caller kill passed: nonempty Close, caller exit, automatic target retirement and refund"
     );
 }

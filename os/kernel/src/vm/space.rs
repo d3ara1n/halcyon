@@ -7,10 +7,14 @@
 //! - 空表：只由“最后离开者”在空间锁内经 `detach_empty_table` 摘除，摘出的
 //!   owner 进入固定容量退休批次，fence 覆盖后才放帧退款。
 
+use funded_storage::Buffer;
 use page_table::{PublishCursor, TableTree};
 
 use super::table::TableMem;
-use crate::frame::FundedTableFrame;
+use crate::{
+    frame::FundedTableFrame,
+    task::resources::{MetadataCharge, MetadataFunding},
+};
 
 /// Sv39 页表级数。
 pub(crate) const LEVELS: usize = 3;
@@ -26,6 +30,43 @@ pub(crate) const RETIRE_BATCH: usize = BOUNDARY_TABLES;
 /// 每个维护 step 的单元预算（ledger 节点操作与 PTE 槽单元分别计）。
 /// 依据：使一步的最坏工作与 timer 批 qT 同量级；定标归施工门（qM）。
 pub(crate) const STEP_UNITS: usize = 16;
+
+/// 内部空表自底向上扫描；边界留给最后一次原子复查，防止相邻退休互相跳过。
+pub(crate) struct TableCleanup {
+    range: memory_space::PageRange,
+    level: usize,
+    next: usize,
+}
+impl TableCleanup {
+    pub(crate) fn new(range: memory_space::PageRange) -> Self {
+        let span = page_table::pages_at(1) * memory_space::PAGE_SIZE;
+        Self {
+            range,
+            level: 0,
+            next: range.start() / span * span,
+        }
+    }
+    pub(crate) fn range(&self) -> memory_space::PageRange {
+        self.range
+    }
+    fn take(&mut self) -> Option<(usize, usize, usize)> {
+        if self.level >= LEVELS - 1 {
+            return None;
+        }
+        let level = self.level;
+        let span = page_table::pages_at(level + 1) * memory_space::PAGE_SIZE;
+        let address = self.next;
+        self.next += span;
+        if self.next >= self.range.end() {
+            self.level += 1;
+            if self.level < LEVELS - 1 {
+                let span = page_table::pages_at(self.level + 1) * memory_space::PAGE_SIZE;
+                self.next = self.range.start() / span * span;
+            }
+        }
+        Some((address, span, level))
+    }
+}
 
 /// 固定容量退休批次：摘出的表帧在同步完成前保活，之后锁外放帧退款，
 /// 槽位复用，批间不做可失败准入。
@@ -69,19 +110,19 @@ impl RetireBatch {
 
 /// 一次已提交修改的分步进度：ledger 与 PTE 各一游标，表页储备随事务。
 pub(crate) struct ChangeProgress {
-    committed: Option<memory_space::CommittedChange>,
+    committed: Option<memory_space::CommittedChange<MetadataCharge>>,
     footprint: memory_space::PageRange,
     ledger_done: bool,
-    cursors: alloc::vec::Vec<PublishCursor>,
-    reserve: alloc::vec::Vec<FundedTableFrame>,
+    cursors: Buffer<PublishCursor, MetadataCharge>,
+    reserve: Buffer<FundedTableFrame, MetadataCharge>,
 }
 
 impl ChangeProgress {
     pub(crate) fn new(
-        committed: memory_space::CommittedChange,
+        committed: memory_space::CommittedChange<MetadataCharge>,
         footprint: memory_space::PageRange,
-        cursors: alloc::vec::Vec<PublishCursor>,
-        reserve: alloc::vec::Vec<FundedTableFrame>,
+        cursors: Buffer<PublishCursor, MetadataCharge>,
+        reserve: Buffer<FundedTableFrame, MetadataCharge>,
     ) -> Self {
         Self {
             committed: Some(committed),
@@ -101,15 +142,22 @@ impl ChangeProgress {
     /// [`STEP_UNITS`] 个槽。返回是否全部发布（随后取 epoch、发 fence）。
     pub(crate) fn step(
         &mut self,
-        ledger: &mut memory_space::MemorySpace,
+        ledger: &mut memory_space::MemorySpace<crate::task::resources::MetadataCharge>,
         tree: &mut TableTree<TableMem, LEVELS>,
     ) -> bool {
         if !self.ledger_done {
-            let committed = self.committed.as_mut().expect("change progress lost commit");
+            let committed = self
+                .committed
+                .as_mut()
+                .expect("change progress lost commit");
             self.ledger_done = ledger.commit_step(committed, STEP_UNITS);
         }
         if let Some(cursor) = self.cursors.last_mut()
-            && tree.publish_step(cursor, &mut self.reserve, STEP_UNITS)
+            && tree.publish_step(
+                cursor,
+                &mut core::iter::from_fn(|| self.reserve.pop()),
+                STEP_UNITS,
+            )
         {
             self.cursors.pop();
         }
@@ -119,44 +167,164 @@ impl ChangeProgress {
     /// 发布完成后交出已提交责任（供 synchronize）与未用表页储备（锁外退款）。
     pub(crate) fn finish(
         mut self,
-    ) -> (memory_space::CommittedChange, alloc::vec::Vec<FundedTableFrame>) {
-        assert!(self.ledger_done && self.cursors.is_empty(), "change not fully published");
+    ) -> (
+        memory_space::CommittedChange<MetadataCharge>,
+        Buffer<FundedTableFrame, MetadataCharge>,
+    ) {
+        assert!(
+            self.ledger_done && self.cursors.is_empty(),
+            "change not fully published"
+        );
         let committed = self.committed.take().expect("change progress lost commit");
         (committed, core::mem::take(&mut self.reserve))
     }
 }
 
-/// 准备阶段失败：账本已回滚，归还的写许可与已取得的表页储备交回调用者锁外释放。
-pub(crate) struct PrepareFailure {
-    pub(crate) error: memory_space::ChangeError,
-    pub(crate) permits: alloc::vec::Vec<memory_space::WritePermit>,
-    pub(crate) reserve: alloc::vec::Vec<FundedTableFrame>,
-}
-
 /// 整空间退休的一个单元结果。
 pub(crate) enum DrainUnit {
     Progress,
-    Fragment(memory_space::RetiringFragment, Option<memory_space::WritePermit>),
+    Fragment(
+        memory_space::RetiringFragment,
+        Option<memory_space::WritePermit>,
+    ),
     Table(FundedTableFrame),
     Complete,
 }
 
 /// 内核地址空间：账本、页表树与固定空间账户（表页同源）。
 pub(crate) struct AnySpace {
-    ledger: memory_space::MemorySpace,
+    ledger: memory_space::MemorySpace<crate::task::resources::MetadataCharge>,
     tree: TableTree<TableMem, LEVELS>,
     account: alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
 }
 
 impl AnySpace {
+    pub(crate) fn empty(
+        account: alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
+    ) -> Result<Self, erhino_shared::call::SystemCallError> {
+        use erhino_shared::call::SystemCallError;
+        let bounds = memory_space::PageRange::new(0, erhino_shared::proc::PROCESS_USER_TOP)
+            .expect("invalid architectural user range");
+        let ledger = memory_space::MemorySpace::new(
+            bounds,
+            memory_space::Limits {
+                max_regions: crate::task::resources::REGION_SLOTS_PER_ADDRESS_SPACE,
+                max_transactions: crate::task::resources::MEMORY_CHANGES_PER_ADDRESS_SPACE,
+                max_pages_per_change: (256 << 20) / memory_space::PAGE_SIZE,
+                max_lease_bytes: crate::uaccess::MAX_USER_ACCESS,
+                max_lease_segments: 64,
+            },
+            &crate::task::resources::MetadataFunding(&account),
+        )
+        .map_err(|error| match error {
+            memory_space::SpaceCreateError::BadLimits => SystemCallError::IllegalArgument,
+            memory_space::SpaceCreateError::Storage(error) => {
+                crate::task::resources::map_storage_error(error)
+            }
+        })?;
+        let root = crate::frame::fund_user_table_frame(&account).map_err(|error| match error {
+            funded_frame::FundError::Quota(error) => {
+                crate::task::memory_pool::map_pool_error(error)
+            }
+            _ => SystemCallError::OutOfMemory,
+        })?;
+        Ok(Self::new(ledger, root, account))
+    }
+
+    /// 与 SUM 访问同持空间锁，逐页检查用户权限，不建立第二套页表遍历。
+    pub(crate) fn check_range(
+        &mut self,
+        ptr: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<(), crate::uaccess::AccessError> {
+        use crate::uaccess::AccessError;
+        use erhino_shared::proc::{PROCESS_PAGE_SIZE, PROCESS_USER_TOP};
+        use page_table::{Vpn, flags};
+        let end = ptr.checked_add(len).ok_or(AccessError::BadRange)?;
+        if ptr >= PROCESS_USER_TOP || end > PROCESS_USER_TOP {
+            return Err(AccessError::BadRange);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let required = flags::U | if writable { flags::W } else { flags::R };
+        for vpn in ptr / PROCESS_PAGE_SIZE..=(end - 1) / PROCESS_PAGE_SIZE {
+            let mapped = self
+                .tree
+                .translate(Vpn(vpn))
+                .ok_or(AccessError::NotMapped)?;
+            if mapped.flags & required != required {
+                return Err(AccessError::Permission);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_initial_context(
+        &mut self,
+        entry: usize,
+        stack: usize,
+    ) -> Result<(), erhino_shared::call::SystemCallError> {
+        use erhino_shared::{
+            call::SystemCallError,
+            proc::{PROCESS_PAGE_SIZE, PROCESS_USER_TOP},
+        };
+        use page_table::{Vpn, flags};
+        if entry >= PROCESS_USER_TOP
+            || entry & 1 != 0
+            || stack == 0
+            || stack > PROCESS_USER_TOP
+            || !stack.is_multiple_of(16)
+        {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        for (address, required) in [
+            (entry, flags::U | flags::X),
+            (stack - 1, flags::U | flags::W),
+        ] {
+            let mapped = self
+                .tree
+                .translate(Vpn(address / PROCESS_PAGE_SIZE))
+                .ok_or(SystemCallError::MemoryNotAccessible)?;
+            if mapped.flags & required != required {
+                return Err(SystemCallError::MemoryNotAccessible);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn page_pa(&mut self, va: usize) -> Option<usize> {
+        let page = erhino_shared::proc::PROCESS_PAGE_SIZE;
+        self.tree
+            .translate(page_table::Vpn(va / page))
+            .map(|mapped| mapped.ppn.0 * page)
+    }
+
+    pub(crate) fn satp_ppn(&self) -> usize {
+        self.tree.satp_ppn()
+    }
+
     pub(crate) fn new(
-        ledger: memory_space::MemorySpace,
+        ledger: memory_space::MemorySpace<crate::task::resources::MetadataCharge>,
         root: FundedTableFrame,
         account: alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
     ) -> Self {
+        assert!(
+            root.charge_pool_is(&account),
+            "address space root funded by a different pool"
+        );
+        assert!(
+            ledger.bounds().end() <= erhino_shared::proc::PROCESS_USER_TOP,
+            "user ledger crosses the kernel address domain"
+        );
+        let mut tree = TableTree::new(TableMem::new(), root);
+        // 共享 direct-map/stack-window 根项是借用；TableTree 的 shared-root 标记
+        // 保证整空间 drain 不回收内核所有的下级表。用户树出生即具备 trap 所需映射。
+        crate::mm::install_kernel_top_level(&mut tree);
         Self {
             ledger,
-            tree: TableTree::new(TableMem::new(), root),
+            tree,
             account,
         }
     }
@@ -165,11 +333,15 @@ impl AnySpace {
         &self.account
     }
 
-    pub(crate) fn ledger(&self) -> &memory_space::MemorySpace {
+    pub(crate) fn ledger(
+        &self,
+    ) -> &memory_space::MemorySpace<crate::task::resources::MetadataCharge> {
         &self.ledger
     }
 
-    pub(crate) fn ledger_mut(&mut self) -> &mut memory_space::MemorySpace {
+    pub(crate) fn ledger_mut(
+        &mut self,
+    ) -> &mut memory_space::MemorySpace<crate::task::resources::MetadataCharge> {
         &mut self.ledger
     }
 
@@ -179,10 +351,7 @@ impl AnySpace {
     }
 
     /// 整空间退休一个固定单元：账本先逐 region 摘除，再页表逐槽清除/交出表帧。
-    pub(crate) fn drain_step(
-        &mut self,
-        cursor: &mut page_table::DrainCursor<LEVELS>,
-    ) -> DrainUnit {
+    pub(crate) fn drain_step(&mut self, cursor: &mut page_table::DrainCursor<LEVELS>) -> DrainUnit {
         if let Some((fragment, permit)) = self.ledger.drain_one() {
             return DrainUnit::Fragment(fragment, permit);
         }
@@ -196,96 +365,103 @@ impl AnySpace {
     /// drain 完成后交出 root 表帧与账户（锁外放帧退款）。
     pub(crate) fn finish_drain(
         self,
-    ) -> (FundedTableFrame, alloc::sync::Arc<crate::task::memory_pool::MemoryPool>) {
+    ) -> (
+        FundedTableFrame,
+        alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
+    ) {
         (self.tree.finish_drain(), self.account)
     }
 
-    /// 由账本 intent 推导 PTE 游标与几何最坏表页数。`resolve` 把 Install 的
-    /// backing 起点解析为物理页号（backing 层所有，调用者已持其区间使用权）。
+    /// 按实际连续物理段拆 Install 游标；未发布定义可失败，不能假定整个对象连续。
     pub(crate) fn plan_cursors(
         intents: &[memory_space::TranslationIntent],
-        mut resolve: impl FnMut(&memory_space::BackingView) -> page_table::Ppn,
-    ) -> (alloc::vec::Vec<PublishCursor>, usize) {
-        use memory_space::TranslationIntent as T;
+        payer: &MetadataFunding<'_>,
+        mut resolve: impl FnMut(&memory_space::BackingView, usize) -> Option<(page_table::Ppn, usize)>,
+    ) -> Result<(Buffer<PublishCursor, MetadataCharge>, usize), erhino_shared::call::SystemCallError>
+    {
+        use erhino_shared::call::SystemCallError;
+        use memory_space::{PAGE_SIZE, TranslationIntent as T};
         use page_table::Vpn;
-        let vpn = |r: memory_space::PageRange| Vpn(r.start() / memory_space::PAGE_SIZE);
-        let mut cursors = alloc::vec::Vec::new();
-        let mut frames = 0;
+        let mut cursors = Buffer::new();
+        let mut frames = 0usize;
         for intent in intents {
-            let cursor = match *intent {
-                T::Install { range, ref backing, protection } => PublishCursor::map(
-                    vpn(range),
-                    range.pages(),
-                    resolve(backing),
-                    protection_flags(protection),
-                ),
-                T::Remove { range } => PublishCursor::unmap(vpn(range), range.pages()),
-                T::Protect { range, from, to } => PublishCursor::protect(
-                    vpn(range),
-                    range.pages(),
-                    protection_flags(from),
-                    protection_flags(to),
-                ),
-            };
-            frames += page_table::worst_case_frames::<LEVELS>(&cursor);
-            cursors.push(cursor);
+            match *intent {
+                T::Install {
+                    range,
+                    ref backing,
+                    protection,
+                } => {
+                    let mut done = 0;
+                    while done < range.pages() {
+                        let (ppn, available) =
+                            resolve(backing, done).ok_or(SystemCallError::IllegalArgument)?;
+                        let count = available.min(range.pages() - done);
+                        if count == 0 {
+                            return Err(SystemCallError::IllegalArgument);
+                        }
+                        let cursor = PublishCursor::map(
+                            Vpn(range.start() / PAGE_SIZE + done),
+                            count,
+                            ppn,
+                            protection_flags(protection),
+                        );
+                        frames = frames
+                            .checked_add(page_table::worst_case_frames::<LEVELS>(&cursor))
+                            .ok_or(SystemCallError::ReachLimit)?;
+                        cursors
+                            .try_reserve(1, payer)
+                            .map_err(crate::task::resources::map_storage_error)?;
+                        cursors.push(cursor);
+                        done += count;
+                    }
+                }
+                T::Remove { range } | T::Protect { range, .. } => {
+                    let cursor = match *intent {
+                        T::Remove { .. } => {
+                            PublishCursor::unmap(Vpn(range.start() / PAGE_SIZE), range.pages())
+                        }
+                        T::Protect { from, to, .. } => PublishCursor::protect(
+                            Vpn(range.start() / PAGE_SIZE),
+                            range.pages(),
+                            protection_flags(from),
+                            protection_flags(to),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    frames = frames
+                        .checked_add(page_table::worst_case_frames::<LEVELS>(&cursor))
+                        .ok_or(SystemCallError::ReachLimit)?;
+                    cursors
+                        .try_reserve(1, payer)
+                        .map_err(crate::task::resources::map_storage_error)?;
+                    cursors.push(cursor);
+                }
+            }
         }
-        (cursors, frames)
+        Ok((cursors, frames))
     }
 
-    /// 锁外预取 `frames` 张同源表页（可失败，发生在预约可见之前）。
+    /// 所有已取得表帧立即落入操作 owner，失败也不在此处批量析构。
     pub(crate) fn fund_reserve(
         account: &alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
         frames: usize,
-    ) -> Result<alloc::vec::Vec<FundedTableFrame>, memory_space::ChangeError> {
-        let mut reserve = alloc::vec::Vec::new();
+        payer: &MetadataFunding<'_>,
+        reserve: &mut Buffer<FundedTableFrame, MetadataCharge>,
+    ) -> Result<(), erhino_shared::call::SystemCallError> {
         reserve
-            .try_reserve_exact(frames)
-            .map_err(|_| memory_space::ChangeError::AllocationFailed)?;
+            .try_reserve_exact(frames, payer)
+            .map_err(crate::task::resources::map_storage_error)?;
         for _ in 0..frames {
-            let frame = crate::frame::fund_user_table_frame(account)
-                .map_err(|_| memory_space::ChangeError::AllocationFailed)?;
-            reserve.push(frame);
+            reserve.push(crate::frame::fund_user_table_frame(account).map_err(
+                |error| match error {
+                    funded_frame::FundError::Quota(error) => {
+                        crate::task::memory_pool::map_pool_error(error)
+                    }
+                    _ => erhino_shared::call::SystemCallError::OutOfMemory,
+                },
+            )?);
         }
-        Ok(reserve)
-    }
-
-    /// 空间锁内：端点物化 → 预约 → 不可逆提交（只移交责任）。表页储备须已
-    /// 同源；失败时账本回滚，储备与许可原样交回。
-    pub(crate) fn prepare_and_commit(
-        &mut self,
-        validated: memory_space::ValidatedChange,
-        footprint: memory_space::PageRange,
-        permits: alloc::vec::Vec<memory_space::WritePermit>,
-        cursors: alloc::vec::Vec<PublishCursor>,
-        reserve: alloc::vec::Vec<FundedTableFrame>,
-    ) -> Result<ChangeProgress, PrepareFailure> {
-        if reserve
-            .iter()
-            .any(|frame| !self.tree_mem_source_ok(frame))
-        {
-            return Err(PrepareFailure {
-                error: memory_space::ChangeError::PermitMismatch,
-                permits,
-                reserve,
-            });
-        }
-        if let Err(error) = self.ledger.split_at_boundaries(footprint) {
-            return Err(PrepareFailure { error, permits, reserve });
-        }
-        let prepared = match self.ledger.reserve(validated, permits) {
-            Ok(prepared) => prepared,
-            Err(failure) => {
-                let (error, _validated, permits) = failure.into_parts();
-                return Err(PrepareFailure { error, permits, reserve });
-            }
-        };
-        let committed = self.ledger.commit(prepared);
-        Ok(ChangeProgress::new(committed, footprint, cursors, reserve))
-    }
-
-    fn tree_mem_source_ok(&self, frame: &FundedTableFrame) -> bool {
-        frame.charge_pool_is(&self.account)
+        Ok(())
     }
 
     /// 空间锁内推进一步已提交修改。
@@ -293,12 +469,13 @@ impl AnySpace {
         progress.step(&mut self.ledger, &mut self.tree)
     }
 
-    /// 最后离开者：自身记录已 complete/rollback 后，在同一锁内对片段两端点
-    /// 自底向上摘除未被其他预约覆盖的空表，放入固定批次。一个连续片段至多
+    /// 最后离开者：自身仍持 RetiringChange，在同一锁内忽略自己、复查其他预约，
+    /// 自底向上摘除两个端点的空表，随后立即 complete。一个连续片段至多
     /// [`BOUNDARY_TABLES`] 张，故批次（容量 K）总能容纳；返回是否摘出了表
     /// （需新 epoch 与 fence 覆盖后才放帧）。
     pub(crate) fn detach_boundary_tables(
         &mut self,
+        owner: memory_space::ChangeKey,
         range: memory_space::PageRange,
         batch: &mut RetireBatch,
     ) -> bool {
@@ -312,24 +489,48 @@ impl AnySpace {
                 let Ok(table) = memory_space::AddressRange::new(table_start, span) else {
                     break;
                 };
-                if self.ledger.span_reserved(table) {
+                if self.ledger.span_reserved_by_other(owner, table) {
                     break;
                 }
-                match self.tree.detach_empty_table(vpn, level) {
-                    Some(frame) => {
-                        batch.push(frame);
-                        detached = true;
-                    }
-                    None => break,
+                if let Some(frame) = self.tree.detach_empty_table(vpn, level) {
+                    batch.push(frame);
+                    detached = true;
                 }
             }
         }
-        debug_assert_eq!(self.tree.branch_count(), self.tree_held_pages());
         detached
     }
 
-    fn tree_held_pages(&self) -> usize {
-        self.tree.branch_count()
+    /// 每步检查固定数目的内部表跨度，批满先 fence/退款再继续；返回内部扫描已耗尽。
+    pub(crate) fn detach_interior_tables(
+        &mut self,
+        owner: memory_space::ChangeKey,
+        cursor: &mut TableCleanup,
+        batch: &mut RetireBatch,
+    ) -> bool {
+        for _ in 0..STEP_UNITS {
+            if batch.is_full() {
+                return false;
+            }
+            let Some((address, span, level)) = cursor.take() else {
+                return true;
+            };
+            if address <= cursor.range.start() || address + span >= cursor.range.end() {
+                continue;
+            }
+            let range =
+                memory_space::AddressRange::new(address, span).expect("table span overflow");
+            if self.ledger.span_reserved_by_other(owner, range) {
+                continue;
+            }
+            if let Some(frame) = self
+                .tree
+                .detach_empty_table(page_table::Vpn(address / memory_space::PAGE_SIZE), level)
+            {
+                batch.push(frame);
+            }
+        }
+        false
     }
 }
 

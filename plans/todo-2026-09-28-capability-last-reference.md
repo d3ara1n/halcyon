@@ -1,6 +1,6 @@
 # Capability 与资源释放重构
 
-状态：**设计轮次 4：权限模型已定稿（见“权限模型目标设计”），角色即对象类型（设计轮次 4，Mailbox/Notification 拆分与 ReplyObservation）已定稿；剩余实现设计门见该节；施工进度由[内核整体接入](todo-2026-10-01-object-chain-kernel-integration.md)承载，尚未验收**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
+状态：**设计轮次 4：权限模型已定稿（见“权限模型目标设计”），角色即对象类型（设计轮次 4，Mailbox/Notification 拆分与 ReplyObservation）已定稿；剩余实现设计门见该节；施工进度由[内核整体接入](archived/todo-2026-10-01-object-chain-kernel-integration.md)承载，约定范围已实施交付**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
 
 ## 目标与本轮边界
 
@@ -247,7 +247,7 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 **角色即对象类型（用户确认）**：不同角色一律表达为不同对象类型，不在 capability 上附加 role；rights 只裁剪同一对象的授权。判据：两类 capability 需要不同的最后持有语义或消费语义时，必须是不同对象类型。
 - Mailbox：`MailboxReceiver`、`MailboxSender`、`MailboxOnceSender` 三个对象类型共享 `MailboxCore`，各自内嵌 Terminal `Holders`。最后 Receiver 消失 → 邮箱关闭（发送侧 PEER_CLOSED）；badge 属于 Sender/OnceSender 对象。
 - **no-senders**：可清除电平，按 `MailboxCore` 聚合全部 badge 的 Sender 与 Pending OnceSender（表内、transit、claim 暂持均计入）；Receiver 仍可 mint 新 Sender。mint 与归零 hook 都在 core 锁内更新计数并重算电平，迟到的归零不覆盖新 mint。Lifetime.CLOSED 仍按 authority + use 判定，不等于 Sender 计数归零。
-- **两层线性化**：`CapTable.claim` 只仲裁发送 handle 的 Close/Move 与操作接管；`MailboxCore` 锁仲裁 queue.open 与入队。入队成功与 OnceSender `Pending → Sent` 同一 core 临界区完成；Receiver shut 先到则发送失败、不消耗额度；入队先到则为已接受消息，按既定退休责任收束。OnceSender 业务状态由 core 锁保护，无对象锁↔core 锁双序。
+- **两层线性化**：普通 Sender 在表锁下接受 WRITE 并取得 LifetimeUse，不抽取 capability；OnceSender 与附带移交的 handle 使用 `CapTable.claim` 仲裁 Close/Move 与消费接管。`MailboxCore` 锁仲裁 queue.open 与入队。入队成功与 OnceSender `Pending → Sent` 同一 core 临界区完成；Receiver shut 先到则发送失败、不消耗额度；入队先到则为已接受消息，按既定退休责任收束。OnceSender 业务状态由 core 锁保护，无对象锁↔core 锁双序。
 - `MailboxOnceSender`（设计轮次 4，用户确认采用观察壳）：每次派生铸造新对象，不授予 DUPLICATE；“一次性”不做成 rights 位。出生时与一个 `ReplyObservation` 观察对象配对，由派生调用者持有其 capability；结果以持久电平 + 结果查询表达 `Sent | Abandoned`，**不向普通队列注入放弃消息**，因而无满箱、无完成队列与预付额度政策。
   - 发送：`claim → commit_claim` move 消费；core 锁内入队并转 Sent，置观察电平。
   - 失败：restore 走 `CapTable` 既有协议；返还资格已撤销则返回 `LastCapability`，锁外转 Abandoned；否则恢复原 handle，不置 Abandoned。随消息 move 的 capability 整体恢复或按各自资格收束。
@@ -266,7 +266,9 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 
 **KernelObject 与 Work 正交**：`KernelObject` 只表示“可经 Handle 引用的对象”，契约收窄为身份/kind、rights 上限、`Holders`、`on_last_capability` 与等待源；删除 role、`close_handle`/`close_transit`、`retirement()`。维护执行的 `Work` 不依附 KernelObject：AddressSpace、内存事务、设备绑定等无 handle 的内部 owner 只实现 Work；有长工作的 Handle 对象两者都实现，由 `on_last_capability` 发布其内嵌记录；归零即有界结束的对象只实现 KernelObject。等待源/订阅部分的重构归 IPC 与等待分案。
 
-**锁与锁序**：`CapTable` 置于 `Process.handles: Spinlock`（rank `HANDLE_TABLE`；跨进程直接交付沿 pid 递增 chained，沿用现规则）。`Holders` 为原子字，无锁。表锁内只做槽位变更与 `Cap` 摘出/放入；`release` 及其 `LastCapability` 后续动作一律在表锁外；表锁内不取对象业务锁、不取 `MAINTENANCE`。单向序：对象锁 → `MAINTENANCE`（publish 时表锁已放开）。
+**锁与锁序（授权接受轮次修正）**：`CapTable` 置于 `Process.handles: Spinlock`（rank `HANDLE_TABLE`；跨进程直接交付沿 pid 递增 chained，沿用现规则）。`Holders` 为原子字，无锁。非消费操作在 Occupied 槽下校验 rights 并借存储；需要跨 Close 保持责任时，在释放表锁前取得独立领域凭证。允许的短锁边为 HANDLE_TABLE(100) → MEMORY_OBJECT(250)/BACKING(350) 的映射准入，以及 → OBJECT_WAIT(500) 的 LifetimeUse/派生 authority；这些入口无表回调、无用户访问、无维护发布，不能泛化为任意业务动作。入队、提交、安装、uaccess、`release` 与 `LastCapability` 后续动作均在表锁外。对象锁 → `MAINTENANCE` 的发布边仍只发生于表锁已释放后。消费操作保留 claim/返还预约；非消费操作不得用临时抽取或隐式 DUPLICATE 表达。施工与验证由[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md#授权接受轮次非消费操作与消费-claim-分离)承载。
+
+**安装预约闭合（2026-10 施工依已确认原则收敛）**：表锁内只 reserve 后立即放锁；用户输出在 VM 下完成，失败回表 rollback 并在锁外释放未 arm 的 capability。准备期已在各 owner 下受理、预付的对象出生随后在全部表锁外必成提交并 arm，再回表 commit 预约。此时若 shut 已取消返还资格，commit 返回 `Released` 与最后持有事件，在表锁外执行对象正常放弃路径，不能返回业务失败后反向撤销出生。事件批次空间在 reserve 时预取，commit/release 不分配；`BadReservation` 只表示数量/身份的结构错误。ThreadCreate 的成员预约须在准备期经过 Job→Shell 受理；Frozen/Seal 之后只关闭新准入，不取消既有预约，其 Body lease 贯穿兑现。Building 无独立票据的预建线程仍由 Builder 承担启动/放弃责任，不引入特殊反向结算。
 
 **LastCapability 执行点与承载**：调用方在全部锁外调用 `obj.on_last_capability()`：只做对象自身同步域内的有界仲裁（Pending→Aborted、关闭接收准入等），需后续工作则 publish 对象内嵌的 `retire` 记录。记录出生内嵌、publish 零分配，故 Close 必成。普通内核 `Arc` 末端 drop 只释放存储，不展开长链；有子项的对象由记录 step 收尾。
 

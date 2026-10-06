@@ -6,7 +6,7 @@
 // 以「终因组合合法 + Dead 收束 + 无泄漏」为强断言，终因胜负分布只作
 // 观察报告（证明锤进了窗口，不作通过条件）。
 
-use core::sync::atomic::Ordering;
+use core::{cell::Cell, sync::atomic::Ordering};
 
 use crate::{
     JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
@@ -14,8 +14,7 @@ use crate::{
 use libkernel::ipc::message::{create, send_raw, wait_message};
 use libkernel::ipc::notification;
 use libkernel::ipc::object::{close, duplicate};
-use libkernel::ipc::tunnel as tunnel_sys;
-use libkernel::ipc::wait::wait_many;
+use libkernel::ipc::wait::wait_until;
 use libkernel::preclude::*;
 use libkernel::process;
 use libkernel::shared::call::SystemCallError;
@@ -24,13 +23,24 @@ use libkernel::shared::object::{Handle, ObjectSignals, Rights};
 use libkernel::shared::proc::{
     HandleGrant, JobMemberKind, JobState, ProcessState, TerminationCause,
 };
-use libkernel::shared::wait::WaitItem;
+
 use libkernel::sys_sleep;
 use libprocess::{
     DERIVED_CONTROL_RIGHTS, SpawnRequest, Spawned,
     race::{self, Cmd, Report},
     spawn,
 };
+
+// 竞态Control会通过有缓冲指令运输；出生时取得该许可，不能在Duplicate时增权。
+const RACE_CONTROL_RIGHTS: Rights =
+    Rights::from_raw(SUPERVISOR_RIGHTS.raw() | Rights::TRANSIT.raw());
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandState {
+    Idle,
+    Pending,
+    Failed,
+}
 
 /// 竞态锤编队：两执行器 + 每锤独立指令箱/回执箱/发令枪（回执按锤
 /// 分箱，天然归属，无需锤标识）。
@@ -40,6 +50,7 @@ struct RaceHammers {
     report: [Handle; 2],
     controls: [Handle; 2],
     pids: [u64; 2],
+    report_pending: [Cell<CommandState>; 2],
 }
 
 impl RaceHammers {
@@ -50,6 +61,7 @@ impl RaceHammers {
             report: [Handle::INVALID; 2],
             controls: [Handle::INVALID; 2],
             pids: [0; 2],
+            report_pending: [Cell::new(CommandState::Idle), Cell::new(CommandState::Idle)],
         };
         for i in 0..2 {
             let cmd_pair = create(
@@ -99,15 +111,62 @@ impl RaceHammers {
     }
 
     fn send_cmd(&self, hammer: usize, cmd: &Cmd, moves: &[HandleMove]) -> bool {
-        unsafe {
+        if self.report_pending[hammer].get() != CommandState::Idle {
+            return false;
+        }
+        if matches!(
+            cmd.action,
+            race::ACTION_CREATE | race::ACTION_CREATE_ABANDON
+        ) {
+            if moves.len() != 1 {
+                return false;
+            }
+            let Ok(pool) = duplicate(crate::root_memory_pool(), Rights::CREATE | Rights::TRANSIT)
+            else {
+                return false;
+            };
+            let funding = HandleMove {
+                handle: pool,
+                rights: Rights::CREATE,
+            };
+            let result = unsafe {
+                send_raw(
+                    self.cmd[hammer],
+                    race::MSG_CMD,
+                    &race::encode_cmd(cmd),
+                    &[moves[0], funding],
+                )
+            };
+            if result.is_err() {
+                let _ = unsafe { close(pool) };
+            }
+            self.report_pending[hammer].set(if result.is_ok() {
+                CommandState::Pending
+            } else {
+                CommandState::Idle
+            });
+            return result.is_ok();
+        }
+        let result = unsafe {
             send_raw(
                 self.cmd[hammer],
                 race::MSG_CMD,
                 &race::encode_cmd(cmd),
                 moves,
             )
+        };
+        self.report_pending[hammer].set(if result.is_ok() {
+            CommandState::Pending
+        } else {
+            CommandState::Idle
+        });
+        if let Err(error) = result {
+            debug!(
+                "race command send failed: hammer={}, action={}, error={:?}",
+                hammer, cmd.action, error
+            );
         }
-        .is_ok()
+        result.is_ok()
     }
 
     fn fire(&self, hammers: &[usize]) {
@@ -117,7 +176,22 @@ impl RaceHammers {
     }
 
     fn report(&self, hammer: usize) -> Option<(Report, alloc::vec::Vec<u64>)> {
-        let message = wait_message(self.report[hammer]).ok()?;
+        if self.report_pending[hammer].get() != CommandState::Pending {
+            return None;
+        }
+        let message = match wait_message(self.report[hammer]) {
+            Ok(message) => message,
+            Err(error) => {
+                // 失败可能保留旧消息；隔离此锤到监督退出，禁止下一指令复用回执。
+                self.report_pending[hammer].set(CommandState::Failed);
+                debug!(
+                    "race report receive failed: hammer={}, error={:?}",
+                    hammer, error
+                );
+                return None;
+            }
+        };
+        self.report_pending[hammer].set(CommandState::Idle);
         if message.header.kind != race::MSG_REPORT {
             return None;
         }
@@ -146,9 +220,14 @@ impl RaceHammers {
                 token: 0,
                 aux: 0,
             };
-            let _ = self.send_cmd(i, &exit, &[]);
-            self.fire(&[i]);
-            let _ = self.report(i);
+            if self.send_cmd(i, &exit, &[]) {
+                self.fire(&[i]);
+                if self.report(i).is_none() {
+                    let _ = process::kill(self.controls[i]);
+                }
+            } else {
+                let _ = process::kill(self.controls[i]);
+            }
             let _ = unsafe { close(self.cmd[i]) };
             let _ = unsafe { close(self.report[i]) };
             let _ = unsafe { close(self.guns[i]) };
@@ -185,10 +264,23 @@ fn spawn_race_target(
     let gun_pair =
         notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
     let payload = race::encode_payload(&[race::MODE_TARGET, subrole, code]);
-    let grants = [HandleGrant {
+    let mut grants = alloc::vec![HandleGrant {
         handle: gun_pair.owner,
-        rights: Rights::READ | Rights::WAIT,
+        rights: Rights::READ | Rights::WAIT
     }];
+    let pool_grant = if subrole == race::TARGET_THREAD_SUITE {
+        let pool = duplicate(
+            crate::root_memory_pool(),
+            Rights::CREATE | Rights::READ | Rights::GRANT,
+        )?;
+        grants.push(HandleGrant {
+            handle: pool,
+            rights: Rights::CREATE | Rights::READ,
+        });
+        Some(pool)
+    } else {
+        None
+    };
     let spawned = spawn(SpawnRequest {
         job,
         memory_pool: crate::root_memory_pool(),
@@ -196,9 +288,17 @@ fn spawn_race_target(
         image,
         payload: &payload,
         grants: &grants,
-        control_rights: SUPERVISOR_RIGHTS,
+        control_rights: RACE_CONTROL_RIGHTS,
     })
-    .map_err(|_| SystemCallError::Unknown)?;
+    .map_err(|failure| {
+        if failure.grants == libprocess::GrantOutcome::Retained
+            && let Some(pool) = pool_grant
+        {
+            // SAFETY: 未移交的新增付款表项仍由该工厂持有。
+            let _ = unsafe { close(pool) };
+        }
+        SystemCallError::Unknown
+    })?;
     Ok((spawned, gun_pair.peer))
 }
 
@@ -206,6 +306,7 @@ fn spawn_tunnel_exit_target(
     job: Handle,
     image: &[u8],
     invitation: Handle,
+    mapped_bytes: usize,
 ) -> Result<(Spawned, Handle), SystemCallError> {
     let gun_pair =
         notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
@@ -216,10 +317,15 @@ fn spawn_tunnel_exit_target(
         },
         HandleGrant {
             handle: invitation,
-            rights: Rights::MAP,
+            // affine Attach 消费 MANAGE；派生 Endpoint 的 View 需要共享读写。
+            rights: Rights::READ | Rights::WRITE | Rights::MANAGE,
         },
     ];
-    let payload = race::encode_payload(&[race::MODE_TARGET, race::TARGET_TUNNEL_EXIT]);
+    let payload = race::encode_payload(&[
+        race::MODE_TARGET,
+        race::TARGET_TUNNEL_EXIT,
+        mapped_bytes as u64,
+    ]);
     match spawn(SpawnRequest {
         job,
         memory_pool: crate::root_memory_pool(),
@@ -227,7 +333,7 @@ fn spawn_tunnel_exit_target(
         image,
         payload: &payload,
         grants: &grants,
-        control_rights: SUPERVISOR_RIGHTS,
+        control_rights: RACE_CONTROL_RIGHTS,
     }) {
         Ok(spawned) => Ok((spawned, gun_pair.peer)),
         Err(_) => {
@@ -240,15 +346,11 @@ fn spawn_tunnel_exit_target(
 }
 
 /// 收束到 Dead 后断言终因在允许集合内；返回实际终因，违约返回 None。
-/// 先等 REAPABLE|CLOSED 电平
-/// （ProcessDrain 仅在 REAPABLE/Dead 上适用，kill 后线程退出路径是
+/// 先等 DONE 电平
+/// （自动退休 仅在 终态/Dead 上适用，kill 后线程退出路径是
 /// 异步的，不能立即 drain）。
-fn drain_expect_dead(control: Handle, allowed: &[u32]) -> Option<u32> {
-    if !await_reapable(control) {
-        return None;
-    }
-    if let Err(error) = process::drain_to_completion(control) {
-        debug!("race: drain failed: {:?}", error);
+fn observe_dead(control: Handle, allowed: &[u32]) -> Option<u32> {
+    if !await_done(control) {
         return None;
     }
     let Ok(snapshot) = process::query(control) else {
@@ -267,40 +369,41 @@ fn drain_expect_dead(control: Handle, allowed: &[u32]) -> Option<u32> {
     None
 }
 
-/// 等 REAPABLE|CLOSED 电平。
-fn await_reapable(control: Handle) -> bool {
-    let items = [WaitItem::new(
+/// DONE 表示自动退休已完成，调用者只观察，不承担推进责任。
+fn await_done(control: Handle) -> bool {
+    match wait_until(
         control,
-        ObjectSignals::REAPABLE | ObjectSignals::CLOSED,
-        0,
-    )];
-    match wait_many(&items, 0) {
+        ObjectSignals::DONE,
+        libkernel::time::Deadline::INFINITE,
+    ) {
         Ok(_) => true,
         Err(error) => {
-            debug!("race: reapable wait failed: {:?}", error);
+            debug!("race: completion wait failed: {:?}", error);
             false
         }
     }
 }
 
-/// 派生兜底收束（REAPABLE 无主靶）：枚举+派生+drain，断言同
-/// [`drain_expect_dead`]。
-fn derive_and_reap(job: Handle, pid: u64, allowed: &[u32]) -> Option<u32> {
-    let control = match process::derive_job(
+/// 观察仍在Job内的对象；DONE后已移除成员同样表示收束完成。
+/// pid来自已成功创建的同域靶，不能把历史墓碑作为派生前置。
+fn observe_member_completion(job: Handle, pid: u64, allowed: &[u32]) -> bool {
+    match process::derive_job(
         job,
         JobMemberKind::MemberProcesses,
         pid,
         DERIVED_CONTROL_RIGHTS,
     ) {
-        Ok(handle) => handle,
+        Ok(control) => {
+            let completed = observe_dead(control, allowed).is_some();
+            let _ = unsafe { close(control) };
+            completed
+        }
+        Err(SystemCallError::ObjectNotFound) => true,
         Err(error) => {
             debug!("race: derive pid {} failed: {:?}", pid, error);
-            return None;
+            false
         }
-    };
-    let cause = drain_expect_dead(control, allowed);
-    let _ = unsafe { close(control) };
-    cause
+    }
 }
 
 /// 靶枪与锤枪连发（fire 顺序无关紧要：电平语义不丢令，窗口差只是一个
@@ -363,7 +466,7 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             TerminationCause::Killed as u32,
             TerminationCause::Killed as u32,
         ];
-        let terminal = drain_expect_dead(target.control, &allowed);
+        let terminal = observe_dead(target.control, &allowed);
         if terminal != Some(TerminationCause::Killed as u32) {
             ok = false;
         } else if rep_a.aux0 == 0 {
@@ -428,7 +531,7 @@ fn race_kill_exit(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             TerminationCause::Completed as u32,
             TerminationCause::Killed as u32,
         ];
-        let terminal = drain_expect_dead(target.control, &allowed);
+        let terminal = observe_dead(target.control, &allowed);
         match terminal {
             Some(cause) if cause == TerminationCause::Completed as u32 => dist[0] += 1,
             Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
@@ -478,7 +581,7 @@ fn race_thread_spawn_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         let sent = h.send_cmd(0, &kill, &moves);
         fire_race(h, gun, &[0]);
         let report = h.report(0).map(|(report, _)| report);
-        let terminal = drain_expect_dead(target.control, &[TerminationCause::Killed as u32]);
+        let terminal = observe_dead(target.control, &[TerminationCause::Killed as u32]);
         if !sent || !matches!(report, Some(report) if report.status == 0) || terminal.is_none() {
             debug!(
                 "race spawn-vs-kill: round {} sent={} report={:?}",
@@ -515,8 +618,7 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
     // 目标主线程先退出，次线程在枪上等待；发枪后终因确定为 Completed。
     unsafe { sys_sleep(30).expect("last-thread exit-first setup sleep failed") };
     let exit_signal = notification::signal(exit_gun, 1).is_ok();
-    let exited =
-        drain_expect_dead(exit_target.control, &[TerminationCause::Completed as u32]).is_some();
+    let exited = observe_dead(exit_target.control, &[TerminationCause::Completed as u32]).is_some();
     let _ = unsafe { close(exit_target.control) };
     let _ = unsafe { close(exit_gun) };
 
@@ -542,7 +644,7 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
         }],
     );
     let killed = matches!(report, Some((report, _)) if report.status == 0)
-        && drain_expect_dead(kill_target.control, &[TerminationCause::Killed as u32]).is_some();
+        && observe_dead(kill_target.control, &[TerminationCause::Killed as u32]).is_some();
     let _ = unsafe { close(kill_target.control) };
     let _ = unsafe { close(kill_gun) };
 
@@ -600,7 +702,7 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
             TerminationCause::Completed as u32,
             TerminationCause::Killed as u32,
         ];
-        match drain_expect_dead(target.control, &allowed) {
+        match observe_dead(target.control, &allowed) {
             Some(cause) if cause == TerminationCause::Completed as u32 => dist[0] += 1,
             Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
             _ => ok = false,
@@ -666,7 +768,7 @@ fn race_kill_fault(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             TerminationCause::Faulted as u32,
             TerminationCause::Killed as u32,
         ];
-        let terminal = drain_expect_dead(target.control, &allowed);
+        let terminal = observe_dead(target.control, &allowed);
         match terminal {
             Some(cause) if cause == TerminationCause::Faulted as u32 => dist[0] += 1,
             Some(cause) if cause == TerminationCause::Killed as u32 => dist[1] += 1,
@@ -697,7 +799,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let created = match build_spin_building(job) {
+        let created = match build_spin_building(job, RACE_CONTROL_RIGHTS) {
             Ok(created) => created,
             Err(error) => {
                 debug!("race kill-vs-start: building failed: {:?}", error);
@@ -707,7 +809,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
         // builder 不可 duplicate（无 DUPLICATE 位）：原件经消息移交。
         let start_moves = [HandleMove {
             handle: created.builder,
-            rights: Rights::MAP | Rights::WRITE | Rights::MANAGE,
+            rights: Rights::MANAGE,
         }];
         let kill_moves = [HandleMove {
             handle: duplicate(created.control, Rights::MANAGE | Rights::TRANSIT)
@@ -716,7 +818,18 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
         }];
         let start_cmd = race_cmd(race::ACTION_START, 0);
         let kill_cmd = race_cmd(race::ACTION_KILL, 0);
-        let sent = h.send_cmd(0, &start_cmd, &start_moves) && h.send_cmd(1, &kill_cmd, &kill_moves);
+        let start_sent = h.send_cmd(0, &start_cmd, &start_moves);
+        let kill_sent = h.send_cmd(1, &kill_cmd, &kill_moves);
+        let sent = start_sent && kill_sent;
+        if !start_sent {
+            let _ = unsafe { close(created.builder) };
+        }
+        if !kill_sent && kill_moves[0].handle.is_valid() {
+            let _ = unsafe { close(kill_moves[0].handle) };
+        }
+        if !sent {
+            let _ = process::kill(created.control);
+        }
         h.fire(&[0, 1]);
         let (rep_start, _) = h.report(0).unwrap_or((
             Report {
@@ -738,7 +851,7 @@ fn race_kill_start(h: &RaceHammers, job: Handle) -> bool {
         let start_side_ok = rep_start.status == 0 || rep_start.status == closed;
         let kill_side_ok = rep_kill.status == 0;
         let allowed = [TerminationCause::Killed as u32];
-        let terminal = drain_expect_dead(created.control, &allowed);
+        let terminal = observe_dead(created.control, &allowed);
         match rep_start.status {
             0 => dist[0] += 1,
             status if status == closed => dist[1] += 1,
@@ -798,7 +911,7 @@ fn race_kill_park(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         };
         fire_race(h, gun, &[]);
         let allowed = [TerminationCause::Killed as u32];
-        let terminal = drain_expect_dead(target.control, &allowed);
+        let terminal = observe_dead(target.control, &allowed);
         if rep.status != 0 || terminal.is_none() {
             debug!(
                 "race kill-vs-park: round {} rep={:#x} terminal={}",
@@ -845,7 +958,7 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
         fire_race(h, gun, &[0]);
         let report = h.report(0).map(|(report, _)| report);
         let allowed = [TerminationCause::Killed as u32];
-        let terminal = drain_expect_dead(target.control, &allowed);
+        let terminal = observe_dead(target.control, &allowed);
         if !sent || report.is_none_or(|report| report.status != 0) || terminal.is_none() {
             debug!(
                 "race memory-vs-kill: round {} sent={} report={:?} terminal={}",
@@ -867,7 +980,7 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 }
 
 /// guard fault 必须只冻结目标进程为 Fault/LoadAccess；其 guarded mapping 由
-/// ProcessDrain 收束，init 与内核继续运行。
+/// 自动退休 收束，init 与内核继续运行。
 fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
     let (target, gun) = match spawn_race_target(job, image, race::TARGET_GUARD_FAULT, 0) {
         Ok(pair) => pair,
@@ -878,7 +991,7 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
     };
     let _ = notification::signal(gun, 1);
     let allowed = [TerminationCause::Faulted as u32];
-    let terminal = drain_expect_dead(target.control, &allowed);
+    let terminal = observe_dead(target.control, &allowed);
     let ok = terminal.is_some();
     debug!(
         "memory guard fault {}",
@@ -902,7 +1015,7 @@ fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
     };
     let _ = notification::signal(gun, 1);
     let allowed = [TerminationCause::Completed as u32];
-    let terminal = drain_expect_dead(target.control, &allowed);
+    let terminal = observe_dead(target.control, &allowed);
     let ok = terminal.is_some();
     debug!(
         "thread memory suite {}",
@@ -919,25 +1032,41 @@ const RACE_TUNNEL_ROUNDS: usize = 16;
 fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..RACE_TUNNEL_ROUNDS {
-        let (endpoint, invitation) =
-            match tunnel_sys::create(3 * 4096, libkernel::mm::Placement::Anywhere) {
-                Ok(pair) => pair,
+        let (endpoint_owner, invitation_owner, bytes) =
+            match libkernel::ipc::invitation::Invitation::create(
+                crate::root_memory_pool(),
+                3 * 4096,
+            ) {
+                Ok(created) => created,
                 Err(error) => {
                     debug!("Tunnel exit stress create failed: {:?}", error);
                     return false;
                 }
             };
-        let shared = endpoint.memory();
-        let request = 0x7475_6e6e_656c_0000 | (round as u64 + 1);
-        shared.store_u64(0, request, Ordering::Release);
-        let (target, gun) = match spawn_tunnel_exit_target(job, image, invitation) {
-            Ok(target) => target,
-            Err(error) => {
-                debug!("Tunnel exit stress target spawn failed: {:?}", error);
-                let _ = endpoint.close();
+        let endpoint = match librunnel::MappedEndpoint::map(
+            endpoint_owner,
+            bytes,
+            libkernel::mm::Placement::Anywhere,
+        ) {
+            Ok(mapping) => mapping,
+            Err(failure) => {
+                debug!("Tunnel exit stress Map failed: {:?}", failure.error);
                 return false;
             }
         };
+        let invitation = invitation_owner.into_capability().into_raw();
+        let shared = endpoint.memory();
+        let request = 0x7475_6e6e_656c_0000 | (round as u64 + 1);
+        shared.store_u64(0, request, Ordering::Release);
+        let (target, gun) =
+            match spawn_tunnel_exit_target(job, image, invitation, endpoint.geometry().bytes()) {
+                Ok(target) => target,
+                Err(error) => {
+                    debug!("Tunnel exit stress target spawn failed: {:?}", error);
+                    let _ = endpoint.close();
+                    return false;
+                }
+            };
         let expected = request ^ RACE_TUNNEL_RESPONSE_MASK;
         let mut published = false;
         for _ in 0..100 {
@@ -955,7 +1084,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
             let _ = shared.load_u32(12, Ordering::Relaxed);
         }
         let _ = notification::signal(gun, 1);
-        let terminal = drain_expect_dead(target.control, &[TerminationCause::Completed as u32]);
+        let terminal = observe_dead(target.control, &[TerminationCause::Completed as u32]);
         let peer_closed = endpoint
             .events()
             .wait(ObjectSignals::PEER_CLOSED, 0)
@@ -985,13 +1114,13 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
 }
 
 /// kill vs abandonment：锤 kill 与锤 close builder 同刻——终因冻结的
-/// 先到者胜（Killed 或 Abandoned），不出现混合。奇数轮 close 延迟
+/// 先到者胜（Killed 或 Aborted），不出现混合。奇数轮 close 延迟
 /// 1ms：kill 先冻结终因，观察 Killed 胜出侧（close 后到只协助收束）。
 fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut dist = [0usize; 2];
     for round in 0..4u64 {
-        let created = match build_spin_building(job) {
+        let created = match build_spin_building(job, RACE_CONTROL_RIGHTS) {
             Ok(created) => created,
             Err(error) => {
                 debug!("race kill-vs-abandon: building failed: {:?}", error);
@@ -1012,8 +1141,18 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
                 .unwrap_or(Handle::INVALID),
             rights: Rights::MANAGE,
         }];
-        let sent = h.send_cmd(0, &close_cmd, &close_moves)
-            && h.send_cmd(1, &race_cmd(race::ACTION_KILL, 0), &kill_moves);
+        let close_sent = h.send_cmd(0, &close_cmd, &close_moves);
+        let kill_sent = h.send_cmd(1, &race_cmd(race::ACTION_KILL, 0), &kill_moves);
+        let sent = close_sent && kill_sent;
+        if !close_sent {
+            let _ = unsafe { close(created.builder) };
+        }
+        if !kill_sent && kill_moves[0].handle.is_valid() {
+            let _ = unsafe { close(kill_moves[0].handle) };
+        }
+        if !sent {
+            let _ = process::kill(created.control);
+        }
         h.fire(&[0, 1]);
         let (rep_close, _) = h.report(0).unwrap_or((
             Report {
@@ -1033,9 +1172,9 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
         ));
         let allowed = [
             TerminationCause::Killed as u32,
-            TerminationCause::Abandoned as u32,
+            TerminationCause::Aborted as u32,
         ];
-        let terminal = drain_expect_dead(created.control, &allowed);
+        let terminal = observe_dead(created.control, &allowed);
         match terminal {
             Some(cause) if cause == TerminationCause::Killed as u32 => dist[0] += 1,
             Some(_) => dist[1] += 1,
@@ -1055,7 +1194,7 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
         let _ = unsafe { close(created.control) };
     }
     debug!(
-        "race kill-vs-abandon {} (killed {}/{} abandoned)",
+        "race kill-vs-abandon {} (killed {}/{} aborted)",
         if ok { "passed" } else { "FAILED" },
         dist[0],
         dist[1]
@@ -1063,9 +1202,9 @@ fn race_kill_abandon(h: &RaceHammers, job: Handle) -> bool {
     ok
 }
 
-/// 并发 Create + 枚举：双锤同刻 Create-即弃（abandonment 自灭到
-/// REAPABLE），第三发枚举全量——断言无漏项（多核 ID 乱序窗口）、严格
-/// 升序、恰好 = 新建 8 + 双锤；随后派生兜底收束全部无主靶。
+/// 双锤并发Create-即弃，枚举当前成员严格升序且只含已知身份。
+/// 自动退休可能已移除新建PID；尚可派生者观察Aborted/DONE，已移除者按
+/// Job在DONE后摘成员的合同成立，不要求保留历史墓碑。
 fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
     let mut ok = true;
     let mut pids = alloc::vec::Vec::new();
@@ -1146,24 +1285,44 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
         return false;
     }
     let sorted = ids.windows(2).all(|pair| pair[0] < pair[1]);
-    let all_present = pids.iter().all(|pid| ids.contains(pid));
+    let known = ids
+        .iter()
+        .all(|pid| pids.contains(pid) || h.pids.contains(pid));
     let hammers_present = ids.contains(&h.pids[0]) && ids.contains(&h.pids[1]);
     let expected_len = pids.len() + 2;
-    if !sorted || !all_present || !hammers_present || ids.len() != expected_len {
+    if !sorted || !known || !hammers_present || ids.len() > expected_len {
         debug!(
             "race create-vs-enumerate: sorted={} present={} hammers={} len={} expected={}",
             sorted,
-            all_present,
+            known,
             hammers_present,
             ids.len(),
             expected_len
         );
         ok = false;
     }
-    let abandoned = [TerminationCause::Abandoned as u32];
+    let aborted = [TerminationCause::Aborted as u32];
     for pid in &pids {
-        if derive_and_reap(job, *pid, &abandoned).is_none() {
-            ok = false;
+        match process::derive_job(
+            job,
+            JobMemberKind::MemberProcesses,
+            *pid,
+            DERIVED_CONTROL_RIGHTS,
+        ) {
+            Ok(control) => {
+                if observe_dead(control, &aborted).is_none() {
+                    ok = false;
+                }
+                let _ = unsafe { close(control) };
+            }
+            Err(SystemCallError::ObjectNotFound) => {} // DONE之后成员已经移除。
+            Err(error) => {
+                debug!(
+                    "race create-vs-enumerate: derive pid {} failed: {:?}",
+                    pid, error
+                );
+                ok = false;
+            }
         }
     }
     debug!(
@@ -1179,7 +1338,7 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
 /// 创建口永久关闭——首轮 create 与 seal 竞争（任意结果），后续轮必
 /// ObjectClosed；残留 Building 由 job_kill 收束，child 完成 Dead。
 fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> bool {
-    let child = match root.create_job(job, JOB_FULL_RIGHTS) {
+    let child = match root.create_job(job, crate::root_memory_pool(), JOB_FULL_RIGHTS) {
         Ok(handle) => handle,
         Err(error) => {
             debug!("race seal-vs-create: child job failed: {:?}", error);
@@ -1310,11 +1469,9 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
     ok
 }
 
-/// 双 Drain 并发：REAPABLE 靶上双锤同刻 drain——单批互斥以 ObjectBusy
-/// 仲裁，两批都成功或一让一进，最终 Dead；init 收束至 Complete。
+/// 双终态观察：DONE之后两锤并发只读Query，两者均须成功且状态为Dead。
 fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
-    let busy = SystemCallError::ObjectBusy as i64;
     for round in 0..2u64 {
         let target = match spawn(SpawnRequest {
             job,
@@ -1323,7 +1480,7 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             image,
             payload: &[],
             grants: &[],
-            control_rights: SUPERVISOR_RIGHTS,
+            control_rights: RACE_CONTROL_RIGHTS,
         }) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -1336,24 +1493,24 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             let _ = unsafe { close(target.control) };
             return false;
         }
-        // 竞争点在双 drain 本身：先等 REAPABLE 再同刻发双 drain。
-        if !await_reapable(target.control) {
+        // 竞争点在双终态观察 本身：先等 终态 再同刻发双终态观察。
+        if !await_done(target.control) {
             let _ = unsafe { close(target.control) };
             return false;
         }
         let moves = [
             HandleMove {
-                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                handle: duplicate(target.control, Rights::READ | Rights::TRANSIT)
                     .unwrap_or(Handle::INVALID),
-                rights: Rights::MANAGE,
+                rights: Rights::READ,
             },
             HandleMove {
-                handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
+                handle: duplicate(target.control, Rights::READ | Rights::TRANSIT)
                     .unwrap_or(Handle::INVALID),
-                rights: Rights::MANAGE,
+                rights: Rights::READ,
             },
         ];
-        let drain = race_cmd(race::ACTION_DRAIN, 0);
+        let drain = race_cmd(race::ACTION_OBSERVE_TERMINAL, 0);
         let sent = h.send_cmd(0, &drain, &[moves[0]]) && h.send_cmd(1, &drain, &[moves[1]]);
         h.fire(&[0, 1]);
         let (rep_a, _) = h.report(0).unwrap_or((
@@ -1372,11 +1529,9 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             },
             alloc::vec::Vec::new(),
         ));
-        let legal = (rep_a.status == 0 || rep_a.status == busy)
-            && (rep_b.status == 0 || rep_b.status == busy)
-            && (rep_a.status == 0 || rep_b.status == 0);
+        let legal = rep_a.status == 0 && rep_b.status == 0;
         let allowed = [TerminationCause::Killed as u32];
-        let terminal = drain_expect_dead(target.control, &allowed);
+        let terminal = observe_dead(target.control, &allowed);
         if !sent || !legal || terminal.is_none() {
             debug!(
                 "race drain-vs-drain: round {} sent={} rep={:#x}/{:#x} terminal={}",
@@ -1397,9 +1552,8 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     ok
 }
 
-/// 最后 control 消散：control 原件随 KILL 指令移交锤（kill 后即
-/// close），init 不留任何权——REAPABLE 无主窗口只能经枚举+派生兜底
-/// 接管，drain 至 Dead。
+/// 最后Control随KILL移交锤并释放；仍在Job则派生观察DONE，
+/// 已从Job移除则已完成私有回收，不依赖保留Control或历史墓碑。
 fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..2u64 {
@@ -1410,7 +1564,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             image,
             payload: &[],
             grants: &[],
-            control_rights: SUPERVISOR_RIGHTS,
+            control_rights: RACE_CONTROL_RIGHTS,
         }) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -1432,13 +1586,11 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             }
         };
         let allowed = [TerminationCause::Killed as u32];
-        let terminal = derive_and_reap(job, pid, &allowed);
-        if rep.status != 0 || terminal.is_none() {
+        let terminal = observe_member_completion(job, pid, &allowed);
+        if rep.status != 0 || !terminal {
             debug!(
                 "race last-control: round {} rep={:#x} terminal={}",
-                round,
-                rep.status,
-                terminal.is_some()
+                round, rep.status, terminal
             );
             ok = false;
         }

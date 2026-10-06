@@ -26,6 +26,7 @@
 ## 公共机制有独立归属
 
 通用记账由 `libbudget` 独立拥有。一个非领域化 `Account` 表示唯一付款身份；`BudgetSlot` 由具体预算布局签发，`AccountView<K>` 只把同一身份绑定到该布局的领域资源类别，跨布局绑定会被拒绝，视图克隆不新建账户、分配映射或额度。需要共同上限的类别绑定同一个实际额度；节点数、任务数和字节等不同单位分别约束。长期 owner 保存非泛型 Charge，包括零单位占用也持续保活账户名额；退款跟随实际释放或已提交的占用缩减。底层 `Counter`、`Permit` 与组合扣账原语仍由 shared 的 `metadata_admission` 唯一拥有。
+`AllocatorBacked`也由libbudget拥有：用户共享容器显式选择该Funding策略，表示本层不追加逐分配软额度，由程序选定allocator供给。既有领域Charge仍约束其业务占用；该策略不宣称Kernel metadata已付款，不选择libruntime或allocator实现。需要严格逐存储收费时由领域选择字节类别并接AccountView，不能以单位默认值冒充该合同。
 
 通用执行由 `libexecution` 独立拥有，包括任务推进、观察来源、期限与唤醒。执行定义自己的资源类别并消费执行领域账户视图，不借用 FAL 或服务的枚举和裸槽位；非服务消费者可直接使用该库。
 

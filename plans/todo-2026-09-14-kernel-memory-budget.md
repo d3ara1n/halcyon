@@ -1,6 +1,6 @@
 # 不可信创建域的内核元数据预算
 
-> 状态：资源预算分案，纳入[全项目重构](todo-2026-09-29-system-redesign.md)重新设计，未实施。当前 MetadataSponsor 是全局政策下的有界准入，不等于不同授权域之间的完整资源隔离。本案拥有来源、准入与退款；内核自主推进已提交工作由[维护执行分案](todo-2026-09-29-kernel-maintenance-execution.md)拥有，不再以 PM 持续调用 ProcessDrain 为前提。
+> 状态：对象链范围的Pool双维账本、独立值/容量/scratch实际付款与退款屏障已实施交付，见[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)。下文旧MetadataSponsor与KernelMemoryBudget候选为设计时基线，以“实际来源与metadata容量账本”定稿为准。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有来源、准入与退款；内核自主推进由[维护执行分案](todo-2026-09-29-kernel-maintenance-execution.md)拥有。
 
 ## 目标与边界
 
@@ -29,10 +29,24 @@ metadata、对象壳及操作/退休承载必须具有明确的实际来源、�
 本节只定本链接入所需的最小形状，不闭合本案的域隔离完成门。
 
 - **Pool 即资金账户与维护公平域**：`MemoryPool = {页 credit, metadata 槽计数, maintenance Ledger}`。只有受权 Pool 派生（消耗父 Pool 页额度与 metadata）创建新份额；ProcessCreate 与资源准入只引用既有 Pool，不新建账户。Pool 自身 metadata 由父 Pool 资助，root 静态，无 Account→Pool→Permit→Account 环。
-- **metadata 授权**：派生时页与 metadata 预算分别划拨；ProcessCreate 需 Pool capability 的 `CREATE` right（Pool 上 CREATE 解释为“创建由本 Pool 付款的资源”，含派生子 Pool），Shell/Body 账户在创建时确定，`bind_memory` 不再改来源。不新增 FUND 位：当前只有 Pool 一个付款对象，“可付款不可派生”也无真实委托用例；触发条件见 [capability 标准 rights](todo-2026-09-28-capability-last-reference.md#标准-rights当前目标集合非永久封闭)。原 MetadataSponsor 各类计数并入 Pool，process-core permit 删除。
+- **metadata 授权**：派生时页与 metadata 预算分别划拨；ProcessCreate 与 JobCreate 均需显式 Pool capability 的 `CREATE` right（Pool 上 CREATE 解释为“创建由本 Pool 付款的资源”，含派生子 Pool）。Shell/Body 账户在 ProcessCreate 确定，`bind_memory` 不再改来源；Job 本体与内嵌完成 Work 的出生准入、WorkRecord 账户来自 JobCreate 传入的 Pool，Job 终身强持，不从 parent Job 或调用进程继承，也不要求与 parent Pool 有血缘。root Job 由 boot 的 root Pool 付款。此处 JobCreate 补入 Pool 是 2026-10 对象链施工依已确认付款 authority 原则闭合，不引入新 rights。不新增 FUND 位：当前只有 Pool 一个付款对象，“可付款不可派生”也无真实委托用例；触发条件见 [capability 标准 rights](todo-2026-09-28-capability-last-reference.md#标准-rights当前目标集合非永久封闭)。原 MetadataSponsor 各类计数并入 Pool，process-core permit 删除。
 - **metadata 计量**：按活对象槽额度计量（字段 Drop 退槽），不宣称字节先归还后退款。
 - **退款语义**：每份资源 owner 物理释放后消费自己唯一的 charge；账户 Arc 消散不是退款证明。
 - **Pool 寿命**：Close Pool capability 只撤外部授权；charge、permit、已接纳 Work、child 均强持 Pool；销毁条件为无 owner 强持（不是 `in_flight=0`）。维护队列未 Done 强持 Work，finish 先 settle 再锁外释放 Work/账户根；Pool 自身收尾 Work 记父账户；Ready 链由全局维护根摘除。
 - **欠账政策**：欠账不因销毁丢失——子 Pool 销毁时剩余负 deficit 以独立 debt transfer 并入父 Ledger（MAINTENANCE 锁下一次完成，不调用 `settle`、不动 `in_flight`、不伪造 grant）。公平只在现存 Pool 域之间成立；接受派生新域可绕开父域欠账，不引入层级调度。
 - **无欠账**仅指物理与 metadata 不透支；维护 deficit 允许为负。
 - `MemoryPool::drop` 向父链退款的深度上界（JOB/Pool 深度 32）计入原子成本，或逐级转交记录，施工时择一并写明。
+
+## 付款接入设计轮次：统一容量槽与双维派生
+
+本轮承接对象链已接通的目标结构，施工只记入[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)。旧 global/per-sponsor 多类 Counter 不作为目标限额依据。原“各类计数并入 Pool”收敛为统一 metadata 容量账本：各存储形状按其实际分配布局折算自然字宽槽，不再为每个角色复制一组限额、账户和 ABI 枚举。该槽是 live 值/保留容量的成本单位，不是对象身份数或可兑现的堆字节保证。
+
+- Pool 同时拥有 page 和 metadata 两本同形守恒账本，`total=available+reserved+allocated+delegated`。纯 `memory_pool` 拥有通用额度算术及不可复制 token，内核区分页 charge 与 metadata charge。每本账本都有不可复用 owner key，诊断 PoolId 相同也不能跨维度提交。
+- PoolDerive 固定宽请求显式给出两维额度和 child rights；任一维可以为零，整体为零拒绝。页和 metadata 同次预约、准备、输出、commit；第二维或后续准备失败撤回前面的预约。无隐式 metadata 默认额度或旧 pages-only 路径。
+- root metadata 初始供给来自实际规划的 system heap 几何，扣除初始化时已占用和 root Pool/Account 的固定布局。账本不提供 allocator 成功承诺；所有实际存储仍须在提交前分配成功。后续域间硬容量/Weak 尾部/allocator 碎片隔离由本案完整完成门另行闭合。
+- 独立对象按值与控制头布局计费，保留的数组/arena/表槽按容量布局计费，内嵌 Work/WaitNode/timer 包含在宿主布局中。对象退款随值销毁；Arc 外部 Weak 可能继续保留原分配块，不能宣称这时所有堆字节都已归还。存储容量 owner 不能按逻辑 `len` 提前退款。退款字段置于其覆盖的资源字段之后。
+- 子 Pool 本体与独立 Arc<Account> 分别由父 metadata 付款。Account 自己持 charge，避免 Pool 析构后执行器仍持 Account 时提前退款；root 仅有 boot 固定供给特例。账本自身不持本 Pool 的 charge，避免环。
+- Pool Close 只关外部授权；charge、资源及已接纳 Work 保留既定付款。传输不换账；新接收表容量与新 View/事务存储由产生这些责任的目标域付款。共享 backing 因外域操作新增的存储由引发增长的操作付款，原物理来源不变。
+- 父链采用既有深度 32 的逐锁同步归还：每层固定结清页/metadata 委派与独立维护负债，不遍历子列表、不增生逐对象 Work。维护尾部析构成本仍属维护计量闭合项。
+
+自然顺序：先贯通双维账本/ABI/实际 Pool 管理者，删除旧 PoolCore Counter；随后接实际容器容量 owner，再接独立对象与出生/提交/回滚/退休链。独立账户基础可按自身守恒契约验证，但不能把尚未收费的对象/节点描述为已完成 metadata 付款。旧模块和中间编译错误不通过补 adapter 维持。

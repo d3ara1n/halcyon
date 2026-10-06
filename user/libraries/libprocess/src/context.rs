@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use erhino_shared::{
     call::SystemCallError,
-    object::{Handle, HandleDescription, HandleRole, ObjectKind, Rights},
+    object::{Handle, HandleDescription, ObjectKind, Rights},
     proc::Pid,
     startup::EntryThreadDescriptor,
 };
@@ -81,7 +81,7 @@ pub struct InitialGrants {
 }
 
 struct InitialGrant {
-    role: HandleRole,
+    kind: ObjectKind,
     capability: Capability,
 }
 
@@ -101,10 +101,10 @@ impl InitialGrants {
             .map(|grant| grant.capability)
     }
 
-    pub fn try_adopt(&mut self, role: HandleRole) -> Option<Capability> {
+    pub fn try_adopt(&mut self, kind: ObjectKind) -> Option<Capability> {
         self.slots
             .iter_mut()
-            .find(|slot| slot.as_ref().is_some_and(|grant| grant.role == role))
+            .find(|slot| slot.as_ref().is_some_and(|grant| grant.kind == kind))
             .and_then(Option::take)
             .map(|grant| grant.capability)
     }
@@ -199,35 +199,18 @@ impl StartupContext {
         let mut entry_control = None;
         for (index, (handle, description)) in handles.into_iter().zip(descriptions).enumerate() {
             if index == control_index {
-                // SAFETY: validated as the unique MANAGE ThreadControl entry.
+                // SAFETY: 已验证这是唯一的 WAIT ThreadControl 观察 owner。
                 entry_control = Some(unsafe { Capability::from_raw(handle) });
                 // The slot stays empty so grant indices keep launcher order.
                 slots.push(None);
                 continue;
             }
-            let role = match description.role {
-                value if value == HandleRole::JobControl as u32 => HandleRole::JobControl,
-                value if value == HandleRole::MemoryPool as u32 => HandleRole::MemoryPool,
-                value if value == HandleRole::MemoryObject as u32 => HandleRole::MemoryObject,
-                value if value == HandleRole::ProcessBuilder as u32 => HandleRole::ProcessBuilder,
-                value if value == HandleRole::ProcessControl as u32 => HandleRole::ProcessControl,
-                value if value == HandleRole::ThreadControl as u32 => HandleRole::ThreadControl,
-                value if value == HandleRole::MailboxOwner as u32 => HandleRole::MailboxOwner,
-                value if value == HandleRole::MailboxSender as u32 => HandleRole::MailboxSender,
-                value if value == HandleRole::MailboxSenderOnce as u32 => HandleRole::MailboxSenderOnce,
-                value if value == HandleRole::NotificationOwner as u32 => HandleRole::NotificationOwner,
-                value if value == HandleRole::NotificationSignaler as u32 => HandleRole::NotificationSignaler,
-                value if value == HandleRole::TunnelInvitation as u32 => HandleRole::TunnelInvitation,
-                value if value == HandleRole::SystemResetControl as u32 => HandleRole::SystemResetControl,
-                value if value == HandleRole::LifetimeObserver as u32 => HandleRole::LifetimeObserver,
-                value if value == HandleRole::Delivery as u32 => HandleRole::Delivery,
-                value if value == HandleRole::WaitSetOwner as u32 => HandleRole::WaitSetOwner,
-                _ => unreachable!("validated startup role is not adoptable"),
-            };
+            let kind =
+                adoptable_kind(description.kind).expect("validated startup kind is not adoptable");
             // SAFETY: the platform StartupSeed proves unique ownership of
             // every validated non-mapping entry.
             slots.push(Some(InitialGrant {
-                role,
+                kind,
                 capability: unsafe { Capability::from_raw(handle) },
             }));
         }
@@ -253,32 +236,27 @@ impl StartupContext {
     }
 }
 
-fn adoptable_kind(role: u32) -> Option<ObjectKind> {
-    Some(match role {
-        value if value == HandleRole::JobControl as u32 => ObjectKind::Job,
-        value if value == HandleRole::MemoryPool as u32 => ObjectKind::MemoryPool,
-        value if value == HandleRole::MemoryObject as u32 => ObjectKind::MemoryObject,
-        value if value == HandleRole::ProcessBuilder as u32 => ObjectKind::ProcessBuilder,
-        value if value == HandleRole::ProcessControl as u32 => ObjectKind::ProcessControl,
-        value if value == HandleRole::ThreadControl as u32 => ObjectKind::ThreadControl,
-        value if value == HandleRole::MailboxOwner as u32 => ObjectKind::Mailbox,
-        value
-            if value == HandleRole::MailboxSender as u32
-                || value == HandleRole::MailboxSenderOnce as u32 =>
-        {
-            ObjectKind::MailboxSender
+fn adoptable_kind(kind: u32) -> Option<ObjectKind> {
+    Some(match kind {
+        value if value == ObjectKind::Job as u32 => ObjectKind::Job,
+        value if value == ObjectKind::MemoryPool as u32 => ObjectKind::MemoryPool,
+        value if value == ObjectKind::MemoryObject as u32 => ObjectKind::MemoryObject,
+        value if value == ObjectKind::ProcessBuilder as u32 => ObjectKind::ProcessBuilder,
+        value if value == ObjectKind::ProcessControl as u32 => ObjectKind::ProcessControl,
+        value if value == ObjectKind::ThreadControl as u32 => ObjectKind::ThreadControl,
+        value if value == ObjectKind::MailboxReceiver as u32 => ObjectKind::MailboxReceiver,
+        value if value == ObjectKind::MailboxSender as u32 => ObjectKind::MailboxSender,
+        value if value == ObjectKind::MailboxOnceSender as u32 => ObjectKind::MailboxOnceSender,
+        value if value == ObjectKind::NotificationOwner as u32 => ObjectKind::NotificationOwner,
+        value if value == ObjectKind::NotificationSignaler as u32 => {
+            ObjectKind::NotificationSignaler
         }
-        value
-            if value == HandleRole::NotificationOwner as u32
-                || value == HandleRole::NotificationSignaler as u32 =>
-        {
-            ObjectKind::Notification
-        }
-        value if value == HandleRole::TunnelInvitation as u32 => ObjectKind::TunnelInvitation,
-        value if value == HandleRole::SystemResetControl as u32 => ObjectKind::SystemReset,
-        value if value == HandleRole::LifetimeObserver as u32 => ObjectKind::Lifetime,
-        value if value == HandleRole::Delivery as u32 => ObjectKind::Delivery,
-        value if value == HandleRole::WaitSetOwner as u32 => ObjectKind::WaitSet,
+        value if value == ObjectKind::TunnelInvitation as u32 => ObjectKind::TunnelInvitation,
+        value if value == ObjectKind::SystemReset as u32 => ObjectKind::SystemReset,
+        value if value == ObjectKind::Lifetime as u32 => ObjectKind::Lifetime,
+        value if value == ObjectKind::Delivery as u32 => ObjectKind::Delivery,
+        value if value == ObjectKind::WaitSet as u32 => ObjectKind::WaitSet,
+        value if value == ObjectKind::ReplyObservation as u32 => ObjectKind::ReplyObservation,
         _ => return None,
     })
 }
@@ -306,15 +284,15 @@ fn validate_descriptions(
     control_index: usize,
 ) -> Result<(), SystemCallError> {
     for (index, description) in descriptions.iter().enumerate() {
-        let expected_kind = adoptable_kind(description.role);
         if !description.rights.is_known()
-            || expected_kind.is_none_or(|kind| kind as u32 != description.kind)
+            || description.reserved0 != 0
+            || adoptable_kind(description.kind).is_none()
         {
             return Err(SystemCallError::WrongObjectType);
         }
         if index == control_index
-            && (description.role != HandleRole::ThreadControl as u32
-                || !description.rights.contains(Rights::MANAGE))
+            && (description.kind != ObjectKind::ThreadControl as u32
+                || !description.rights.contains(Rights::WAIT))
         {
             return Err(SystemCallError::WrongObjectType);
         }
@@ -328,13 +306,13 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use erhino_shared::{
         call::SystemCallError,
-        object::{Handle, HandleDescription, HandleRole, ObjectKind, Rights},
+        object::{Handle, HandleDescription, ObjectKind, Rights},
         startup::{EntryThreadDescriptor, build_startup_block_with_entry},
     };
 
     use super::{
-        adoptable_kind, has_duplicate_handles, query_descriptions, validate_descriptions,
-        StartupContext, StartupSeed,
+        StartupContext, StartupSeed, adoptable_kind, has_duplicate_handles, query_descriptions,
+        validate_descriptions,
     };
 
     #[test]
@@ -369,26 +347,20 @@ mod tests {
         let query_count = AtomicUsize::new(0);
         let admission = StartupContext::adopt_with_query(seed, |handle| {
             query_count.fetch_add(1, Ordering::Relaxed);
-            let role = if handle == handles[64] {
-                HandleRole::ThreadControl
+            let kind = if handle == handles[64] {
+                ObjectKind::ThreadControl
             } else if handle == handles[0] {
-                HandleRole::MailboxSender
+                ObjectKind::MailboxSender
             } else {
-                HandleRole::MemoryObject
+                ObjectKind::MemoryObject
             };
             Ok(HandleDescription {
                 object_id: handle.raw(),
                 related_object_id: 0,
-                kind: if handle == handles[64] {
-                    ObjectKind::ThreadControl as u32
-                } else if handle == handles[0] {
-                    ObjectKind::MailboxSender as u32
-                } else {
-                    ObjectKind::MemoryObject as u32
-                },
-                role: role as u32,
+                kind: kind as u32,
+                reserved0: 0,
                 rights: if handle == handles[64] {
-                    erhino_shared::object::Rights::MANAGE
+                    erhino_shared::object::Rights::WAIT
                 } else {
                     erhino_shared::object::Rights::READ
                 },
@@ -406,22 +378,26 @@ mod tests {
         assert_eq!(process.parent_pid(), 3);
         assert_eq!(payload.as_bytes(), b"payload");
         assert_eq!(grants.len(), 65);
-        assert!(grants.take(64).is_none(), "entry control must not be exposed to the application");
+        assert!(
+            grants.take(64).is_none(),
+            "entry control must not be exposed to the application"
+        );
         let sender = grants
-            .try_adopt(HandleRole::MailboxSender)
-            .expect("role adoption must consume the matching grant");
-        assert!(grants.try_adopt(HandleRole::MailboxSender).is_none());
+            .try_adopt(ObjectKind::MailboxSender)
+            .expect("kind adoption must consume the matching grant");
+        assert!(grants.try_adopt(ObjectKind::MailboxSender).is_none());
         core::mem::forget(sender);
         core::mem::forget(grants);
     }
 
     #[test]
     fn startup_adoption_whitelist_rejects_tunnel_endpoint() {
-        assert_eq!(adoptable_kind(HandleRole::TunnelEndpoint as u32), None);
+        assert_eq!(adoptable_kind(ObjectKind::TunnelEndpoint as u32), None);
+        assert_eq!(adoptable_kind(ObjectKind::ThreadStartTicket as u32), None);
     }
 
     #[test]
-    fn startup_adoption_rejects_duplicate_and_invalid_roles_before_owners() {
+    fn startup_adoption_rejects_duplicate_and_invalid_kinds_before_owners() {
         let handles = [Handle::from_parts(1, 1), Handle::from_parts(1, 1)];
         assert!(has_duplicate_handles(&handles));
 
@@ -429,7 +405,7 @@ mod tests {
             object_id: 1,
             related_object_id: 0,
             kind: ObjectKind::TunnelEndpoint as u32,
-            role: HandleRole::TunnelEndpoint as u32,
+            reserved0: 0,
             rights: Rights::READ,
             badge: 0,
             reserved: 0,
@@ -457,7 +433,7 @@ mod tests {
                     object_id: handle.raw(),
                     related_object_id: 0,
                     kind: ObjectKind::MemoryObject as u32,
-                    role: HandleRole::MemoryObject as u32,
+                    reserved0: 0,
                     rights: Rights::READ,
                     badge: 0,
                     reserved: 0,

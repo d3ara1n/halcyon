@@ -1,115 +1,118 @@
-//! affine Invitation：提交失败保留邀请，成功后只能持有 Endpoint/清理责任。
+//! 接入授权的 affine owner；Attach 与内存映射分别提交。
 
 use super::{capability::Capability, tunnel::Endpoint};
-use crate::mm::Placement;
-use erhino_shared::{
-    call::SystemCallError,
-    object::HandleRole,
-    tunnel::{TunnelAttachRequest, TunnelEndpointResult},
-};
+use erhino_shared::{call::SystemCallError, object::Handle};
 
 #[derive(Debug)]
+#[must_use = "an Invitation must be transferred, attached, or closed"]
 pub struct Invitation {
-    owner: Capability,
+    handle: Option<Handle>,
 }
-
+#[derive(Debug)]
+pub enum CreateFailure {
+    System(SystemCallError),
+    Published {
+        error: SystemCallError,
+        endpoint: Option<Endpoint>,
+        invitation: Option<Invitation>,
+    },
+}
 #[derive(Debug)]
 pub struct InvitationFailure {
     pub owner: Capability,
     pub error: SystemCallError,
 }
-
 #[derive(Debug)]
-pub enum CreateFailure {
-    System(SystemCallError),
-    Published {
-        endpoint: Option<Endpoint>,
-        cleanup: Option<super::tunnel::EndpointCleanup>,
-        invitation: Option<Invitation>,
-        error: SystemCallError,
-    },
+pub struct AttachFailure {
+    pub error: SystemCallError,
+    pub invitation: Invitation,
 }
-
-#[derive(Debug)]
-pub enum AttachFailure {
-    Unconsumed {
-        invitation: Invitation,
-        error: SystemCallError,
-    },
-    Consumed {
-        cleanup: Option<super::tunnel::EndpointCleanup>,
-        error: SystemCallError,
-    },
-}
-
 impl Invitation {
-    pub fn create(bytes: usize, placement: Placement) -> Result<(Endpoint, Self), CreateFailure> {
-        let (endpoint, handle) =
-            super::tunnel::create_owned(bytes, placement).map_err(|failure| {
-                if failure.endpoint.is_none()
-                    && failure.cleanup.is_none()
-                    && failure.invitation.is_none()
-                {
+    pub fn create(pool: Handle, bytes: usize) -> Result<(Endpoint, Self, usize), CreateFailure> {
+        super::tunnel::create_owned(pool, bytes)
+            .map(|(endpoint, invitation, bytes)| {
+                (
+                    endpoint,
+                    Self {
+                        handle: Some(invitation),
+                    },
+                    bytes,
+                )
+            })
+            .map_err(|failure| {
+                if failure.endpoint.is_none() && failure.invitation.is_none() {
                     CreateFailure::System(failure.error)
                 } else {
                     CreateFailure::Published {
-                        endpoint: failure.endpoint,
-                        cleanup: failure.cleanup,
-                        invitation: failure.invitation.map(|handle| Self {
-                            owner: Capability::owned(handle),
-                        }),
                         error: failure.error,
+                        endpoint: failure.endpoint,
+                        invitation: failure.invitation.map(|handle| Self {
+                            handle: Some(handle),
+                        }),
                     }
                 }
-            })?;
-        Ok((
-            endpoint,
-            Self {
-                owner: Capability::owned(handle),
-            },
-        ))
+            })
     }
-
-    pub fn from_capability(owner: Capability) -> Result<Self, InvitationFailure> {
-        let checked = owner.description().and_then(|description| {
-            if description.role != HandleRole::TunnelInvitation as u32 {
-                return Err(SystemCallError::WrongObjectType);
+    pub fn from_capability(capability: Capability) -> Result<Self, InvitationFailure> {
+        match capability.description() {
+            Ok(description)
+                if description.kind
+                    == erhino_shared::object::ObjectKind::TunnelInvitation as u32 => {}
+            Ok(_) => {
+                return Err(InvitationFailure {
+                    owner: capability,
+                    error: SystemCallError::WrongObjectType,
+                });
             }
-            Ok(())
-        });
-        match checked {
-            Ok(()) => Ok(Self { owner }),
-            Err(error) => Err(InvitationFailure { owner, error }),
+            Err(error) => {
+                return Err(InvitationFailure {
+                    owner: capability,
+                    error,
+                });
+            }
         }
+        let raw = capability.into_raw();
+        Ok(Self { handle: Some(raw) })
     }
-    pub fn into_capability(self) -> Capability {
-        self.owner
+    pub fn into_capability(mut self) -> Capability {
+        let raw = self.handle.take().expect("Invitation already consumed");
+        // SAFETY: 通过 self 消费表项唯一 owner。
+        unsafe { Capability::from_raw(raw) }
     }
-
-    pub fn close(self) -> Result<(), (Self, SystemCallError)> {
-        self.owner
-            .close()
-            .map_err(|(owner, error)| (Self { owner }, error))
-    }
-    pub fn attach(self, policy: Placement) -> Result<Endpoint, AttachFailure> {
-        let mut output = TunnelEndpointResult::empty();
-        let (address, policy) = super::tunnel::placement(policy);
-        let request = TunnelAttachRequest::new(
-            self.owner.as_handle(),
-            address,
-            core::ptr::addr_of_mut!(output) as u64,
-            policy,
-        );
-        // SAFETY: owner 独占 Invitation，输入输出在包括内核挂起的调用期间有效。
-        if let Err(error) = unsafe { crate::call::sys_tunnel_attach(&request) } {
-            return Err(AttachFailure::Unconsumed {
-                invitation: self,
+    pub fn attach(mut self) -> Result<Endpoint, AttachFailure> {
+        // SAFETY: 本 owner 独占接入权；成功后从自己移走旧句柄。
+        match unsafe { super::tunnel::attach(self.handle.expect("Invitation already consumed")) } {
+            Ok(endpoint) => {
+                self.handle = None;
+                Ok(endpoint)
+            }
+            Err(error) => Err(AttachFailure {
                 error,
-            });
+                invitation: self,
+            }),
         }
-        let mut owner = self.owner;
-        owner.transferred();
-        Endpoint::from_result_owned(output)
-            .map_err(|(cleanup, error)| AttachFailure::Consumed { cleanup, error })
+    }
+    pub fn close(mut self) -> Result<(), (Self, SystemCallError)> {
+        // SAFETY: self 唯一拥有接入权，关闭不操作另一侧的 View。
+        match unsafe { super::object::close(self.handle.expect("Invitation already consumed")) } {
+            Ok(()) => {
+                self.handle = None;
+                Ok(())
+            }
+            Err(error) => Err((self, error)),
+        }
+    }
+    /// # Safety
+    /// 不得消费或重新拥有返回的借用句柄。
+    pub unsafe fn raw_handle(&self) -> Handle {
+        self.handle.expect("Invitation already consumed")
+    }
+}
+impl Drop for Invitation {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // SAFETY: 未移交邀请的唯一 owner 释放该表项。
+            let _ = unsafe { super::object::close(handle) };
+        }
     }
 }

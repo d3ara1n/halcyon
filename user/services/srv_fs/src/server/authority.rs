@@ -1,6 +1,6 @@
 use super::*;
-use libservice::authority::PreparedAuthority;
 use libkernel::ipc::message::MintedSender;
+use libservice::authority::PreparedAuthority;
 
 pub(super) enum AuthorityPublication {
     Root,
@@ -90,7 +90,7 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
     ) -> Result<Advance, SystemCallError> {
         while let Some(event) = input.pull() {
             if event.kind == KIND_AUTHORITY_LIFETIME {
-                if event.error != 0 || event.observed.intersects(ObjectSignals::CLOSED) {
+                if event.observed.intersects(ObjectSignals::CLOSED) {
                     self.stopping = true;
                 }
             } else if let Some(outbox) = self.outbox.as_mut() {

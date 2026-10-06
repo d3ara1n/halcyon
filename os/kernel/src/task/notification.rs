@@ -1,49 +1,80 @@
-//! Notification：显式消费的 OR 位集合。角色即对象类型（capability 分案设计轮次 4）：
-//! - [`NotificationOwner`]：取走待决位、观察 READABLE；最后一份 capability 消失即关闭；
-//! - [`NotificationSignaler`]：提交待决位；只保活 core，不保活 Owner 权能。
-//! signal 与 Owner shut 在同一 core 锁下判定，shut 后拒绝迟到 signal。
+//! Notification Owner/Signaler；来源只维护电平并由出生 Work 有界发重试提示。
 
-use alloc::sync::Arc;
-use core::any::Any;
-
+use alloc::sync::{Arc, Weak};
+use core::{any::Any, pin::Pin};
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, HandlePair, ObjectSignals, Rights},
 };
-
-use crate::sync::Spinlock;
+use maintenance::record::Outcome;
 
 use super::{
-    Thread,
-    object::{KernelObject, ObjectHeader, ObjectKind, ObjectRef, ObjectWaitState, SubscribeResult},
-    wait::Subscription,
+    Thread, handle,
+    object::{KernelObject, ObjectHeader, ObjectKind},
+    wait_source::{Hint, ObservationSource, Snapshot, Step, WaitNode, WaitQueue},
+};
+use crate::{
+    maintenance::{self as mt, Work, WorkRecord},
+    sync::{Spinlock, ranks},
 };
 
 struct CoreState {
-    wait: ObjectWaitState,
     pending: u64,
     closed: bool,
 }
-
-/// Owner 与 Signaler 共享的同步域。
 struct NotificationCore {
     state: Spinlock<CoreState>,
+    source: WaitQueue,
+    this: Spinlock<Weak<Self>>,
+    _metadata: super::resources::MetadataCharge,
 }
 
 impl NotificationCore {
+    fn new(pool: Arc<super::memory_pool::MemoryPool>) -> Result<Arc<Self>, SystemCallError> {
+        let metadata = super::resources::MetadataCharge::arc::<Self>(&pool)?;
+        let account = pool.maintenance_account().clone();
+        let core = Arc::try_new(Self {
+            state: Spinlock::new(
+                ranks::NOTIFICATION,
+                CoreState {
+                    pending: 0,
+                    closed: false,
+                },
+            ),
+            source: WaitQueue::new(account),
+            this: Spinlock::new(ranks::LEAF, Weak::new()),
+            _metadata: metadata,
+        })
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+        *core.this.lock() = Arc::downgrade(&core);
+        Ok(core)
+    }
+
+    fn root(&self) -> Arc<dyn Work> {
+        self.this
+            .lock()
+            .upgrade()
+            .expect("notification source lost its core")
+    }
+
     fn signal(&self, bits: u64) -> Result<(), SystemCallError> {
         if bits == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        {
+        let root = self.root();
+        let changed = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(SystemCallError::ObjectClosed);
             }
             state.pending |= bits;
-            state.wait.update(ObjectSignals::NONE, ObjectSignals::READABLE);
+            // SAFETY: core 出生后地址稳定；电平与业务位同受 NOTIFICATION 锁保护。
+            unsafe { self.source.update(ObjectSignals::READABLE, false) }
+        };
+        if changed {
+            mt::publish(root);
+            mt::kick();
         }
-        self.finish_waiters();
         Ok(())
     }
 
@@ -51,38 +82,88 @@ impl NotificationCore {
         if mask == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err(SystemCallError::ObjectClosed);
-        }
-        let taken = state.pending & mask;
-        if taken == 0 {
-            return Err(SystemCallError::ObjectNotAvailable);
-        }
-        state.pending &= !taken;
-        if state.pending == 0 {
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::NONE);
+        let root = self.root();
+        let (taken, changed) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Err(SystemCallError::ObjectClosed);
+            }
+            let taken = state.pending & mask;
+            if taken == 0 {
+                return Err(SystemCallError::ObjectNotAvailable);
+            }
+            state.pending &= !taken;
+            let level = if state.pending == 0 {
+                ObjectSignals::NONE
+            } else {
+                ObjectSignals::READABLE
+            };
+            // SAFETY: 同一稳定 core/来源同步域，不接触等待目标。
+            (taken, unsafe { self.source.update(level, false) })
+        };
+        if changed {
+            mt::publish(root);
+            mt::kick();
         }
         Ok(taken)
     }
 
     fn shut(&self) {
-        {
+        let root = self.root();
+        let changed = {
             let mut state = self.state.lock();
             if state.closed {
                 return;
             }
             state.closed = true;
             state.pending = 0;
-            state.wait.update(ObjectSignals::READABLE, ObjectSignals::CLOSED);
+            // SAFETY: core pin 稳定，持业务锁；关闭也只提交扫描责任。
+            unsafe { self.source.update(ObjectSignals::CLOSED, true) }
+        };
+        if changed {
+            mt::publish(root);
+            mt::kick();
         }
-        self.finish_waiters();
     }
+}
 
-    fn finish_waiters(&self) {
-        let pending = self.state.lock().wait.take_notification();
-        if let Some((reservation, target)) = pending {
-            reservation.publish(target);
+impl ObservationSource for NotificationCore {
+    fn snapshot(&self) -> Snapshot {
+        let _state = self.state.lock();
+        // SAFETY: core 稳定、持来源业务锁。
+        unsafe { self.source.snapshot() }
+    }
+    unsafe fn attach(&self, node: Pin<&WaitNode>, interest: ObjectSignals, hint: Hint) {
+        let _state = self.state.lock();
+        // SAFETY: 外层 ObservationSource::attach 契约给出节点寿命；持来源业务锁。
+        unsafe {
+            self.source.attach(node, interest, hint);
+        }
+    }
+    unsafe fn detach(&self, node: Pin<&WaitNode>) -> Hint {
+        let _state = self.state.lock();
+        // SAFETY: 外层保证来自本来源，owner 保持 storage 至返回；同业务锁摘链。
+        unsafe { self.source.detach(node) }
+    }
+}
+
+impl Work for NotificationCore {
+    fn record(&self) -> &WorkRecord {
+        self.source.record()
+    }
+    fn step(&self) -> Outcome {
+        let next = {
+            let _state = self.state.lock();
+            // SAFETY: 持稳定 core 的来源锁；在锁内复制强在途凭证，无节点借用出锁。
+            unsafe { self.source.step() }
+        };
+        match next {
+            Step::Idle => Outcome::Idle,
+            Step::Progress => Outcome::Ready,
+            Step::Hint(delivery) => {
+                delivery.send();
+                Outcome::Ready
+            }
         }
     }
 }
@@ -91,16 +172,21 @@ pub struct NotificationOwner {
     holders: capability::Holders,
     header: ObjectHeader,
     core: Arc<NotificationCore>,
+    _metadata: super::resources::MetadataCharge,
 }
-
 pub struct NotificationSignaler {
     holders: capability::Holders,
     header: ObjectHeader,
     core: Arc<NotificationCore>,
+    _metadata: super::resources::MetadataCharge,
 }
-
-/// 两个对象共用的等待委托（只有 Owner 承载等待源）。
-macro_rules! common_object {
+pub struct NotificationObservation {
+    holders: capability::Holders,
+    header: ObjectHeader,
+    core: Arc<NotificationCore>,
+    _metadata: super::resources::MetadataCharge,
+}
+macro_rules! identity {
     () => {
         fn holders(&self) -> &capability::Holders {
             &self.holders
@@ -113,97 +199,116 @@ macro_rules! common_object {
         }
     };
 }
-
 impl KernelObject for NotificationOwner {
-    common_object!();
-
+    identity!();
     fn kind(&self) -> ObjectKind {
         ObjectKind::NotificationOwner
     }
-
     fn allowed_rights(&self) -> Option<Rights> {
         Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
     }
-
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::READABLE | ObjectSignals::CLOSED)
     }
 
-    fn signals(&self) -> ObjectSignals {
-        self.core.state.lock().wait.signals()
+    fn wait_source(&self) -> Option<Arc<dyn ObservationSource>> {
+        Some(self.core.clone())
     }
-
-    fn subscribe(&self, subscription: Subscription) -> SubscribeResult {
-        self.core.state.lock().wait.subscribe(subscription)
-    }
-
-    fn rearm_observer(&self, id: u64) -> Result<super::object::ObserverRearm, SystemCallError> {
-        self.core.state.lock().wait.rearm_observer(id)
-    }
-
-    fn cancel_observer(&self, id: u64) -> Option<super::object::CancelledObservation> {
-        self.core.state.lock().wait.cancel_observer(id)
-    }
-
-    fn unsubscribe(&self, id: u64) {
-        let retired = self.core.state.lock().wait.unsubscribe(id);
-        drop(retired);
-    }
-
-    fn advance_waiter(&self) -> super::object::WaitAdvance {
-        self.core.state.lock().wait.advance_waiter()
-    }
-
-    fn complete_waiter_drain(
-        &self,
-        reservation: super::notify_work::Reservation,
-    ) -> super::notify_work::Completion {
-        self.core.state.lock().wait.complete_notification(reservation)
-    }
-
     fn on_last_capability(&self) {
         self.core.shut();
     }
 }
-
 impl KernelObject for NotificationSignaler {
-    common_object!();
-
+    identity!();
     fn kind(&self) -> ObjectKind {
         ObjectKind::NotificationSignaler
     }
-
     fn allowed_rights(&self) -> Option<Rights> {
         Some(Rights::SIGNAL | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE)
     }
-
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         None
     }
 }
+impl KernelObject for NotificationObservation {
+    identity!();
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::NotificationObservation
+    }
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+    }
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::CLOSED)
+    }
+    fn wait_source(&self) -> Option<Arc<dyn ObservationSource>> {
+        Some(self.core.clone())
+    }
+}
 
-fn new_pair() -> Result<(Arc<NotificationOwner>, Arc<NotificationSignaler>), SystemCallError> {
-    let core = Arc::try_new(NotificationCore {
-        state: Spinlock::new(
-            crate::sync::ranks::NOTIFICATION,
-            CoreState {
-                wait: ObjectWaitState::new(ObjectSignals::NONE),
-                pending: 0,
-                closed: false,
-            },
-        ),
+pub fn observe(thread: &Thread, source: Handle, output: usize) -> Result<(), SystemCallError> {
+    let authority = super::handle::Authorization::accept(thread, source, Rights::NONE)?;
+    let core = if let Some(owner) = authority
+        .object()
+        .as_any()
+        .downcast_ref::<NotificationOwner>()
+    {
+        if !authority.rights().contains(Rights::READ) {
+            return Err(SystemCallError::RightsDenied);
+        }
+        owner.core.clone()
+    } else if let Some(signaler) = authority
+        .object()
+        .as_any()
+        .downcast_ref::<NotificationSignaler>()
+    {
+        if !authority.rights().contains(Rights::SIGNAL) {
+            return Err(SystemCallError::RightsDenied);
+        }
+        signaler.core.clone()
+    } else {
+        return Err(SystemCallError::WrongObjectType);
+    };
+    let pool = thread.process.funding_pool();
+    let metadata = super::resources::MetadataCharge::arc::<NotificationObservation>(&pool)?;
+    let observation = Arc::try_new(NotificationObservation {
+        holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
+        header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
+        core,
+        _metadata: metadata,
     })
     .map_err(|_| SystemCallError::OutOfMemory)?;
+    let caps = [handle::mint(
+        observation,
+        Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+    )?];
+    handle::install(
+        thread,
+        caps,
+        |handles| crate::uaccess::write_user(thread, output, &handles[0]),
+        || {},
+    )
+    .map(|_| ())
+}
+
+fn new_pair(
+    pool: Arc<super::memory_pool::MemoryPool>,
+) -> Result<(Arc<NotificationOwner>, Arc<NotificationSignaler>), SystemCallError> {
+    let core = NotificationCore::new(pool.clone())?;
+    let metadata = super::resources::MetadataCharge::arc::<NotificationOwner>(&pool)?;
     let owner = Arc::try_new(NotificationOwner {
         holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
         header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
         core: core.clone(),
+        _metadata: metadata,
     })
     .map_err(|_| SystemCallError::OutOfMemory)?;
+    let metadata = super::resources::MetadataCharge::arc::<NotificationSignaler>(&pool)?;
     let signaler = Arc::try_new(NotificationSignaler {
         holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
         header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
         core,
+        _metadata: metadata,
     })
     .map_err(|_| SystemCallError::OutOfMemory)?;
     Ok((owner, signaler))
@@ -215,63 +320,71 @@ pub fn create(
     signaler_rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let (owner, signaler) = new_pair()?;
-    let owner_ref: ObjectRef = owner;
-    let signaler_ref: ObjectRef = signaler;
-    let owner_cap = super::handle::mint(owner_ref, owner_rights)?;
-    let signaler_cap = match super::handle::mint(signaler_ref, signaler_rights) {
+    let (owner, signaler) = new_pair(thread.process.funding_pool())?;
+    let owner_cap = super::handle::mint(owner, owner_rights)?;
+    let signaler_cap = match super::handle::mint(signaler, signaler_rights) {
         Ok(cap) => cap,
         Err(error) => {
             super::handle::release_all([owner_cap]);
             return Err(error);
         }
     };
-    let mut caps = alloc::vec::Vec::new();
-    if caps.try_reserve_exact(2).is_err() {
-        super::handle::release_all([owner_cap, signaler_cap]);
-        return Err(SystemCallError::OutOfMemory);
-    }
-    caps.push(owner_cap);
-    caps.push(signaler_cap);
+    let caps = [owner_cap, signaler_cap];
     super::handle::install(
         thread,
         caps,
         |handles| {
-            let pair = HandlePair::new(handles[0], handles[1]);
-            crate::uaccess::write_user(thread, output, &pair)
+            crate::uaccess::write_user(
+                thread,
+                output,
+                &HandlePair {
+                    owner: handles[0],
+                    peer: handles[1],
+                },
+            )
         },
         || {},
     )
     .map(|_| ())
 }
 
+fn resolve<T: Any + Send + Sync>(
+    thread: &Thread,
+    handle: Handle,
+    rights: Rights,
+    kind: ObjectKind,
+) -> Result<Arc<T>, SystemCallError> {
+    let object = {
+        let body = thread
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let table = body.handles.lock();
+        super::handle::resolve(&table, handle, rights, kind)?
+    };
+    let any: Arc<dyn Any + Send + Sync> = object;
+    any.downcast::<T>()
+        .map_err(|_| SystemCallError::WrongObjectType)
+}
+
 pub fn signal(thread: &Thread, handle: Handle, bits: u64) -> Result<(), SystemCallError> {
-    let object = super::handle::resolve(
-        &thread.process.handles.lock(),
+    resolve::<NotificationSignaler>(
+        thread,
         handle,
         Rights::SIGNAL,
         ObjectKind::NotificationSignaler,
-    )?;
-    let signaler = object
-        .as_any()
-        .downcast_ref::<NotificationSignaler>()
-        .ok_or(SystemCallError::WrongObjectType)?;
-    signaler.core.signal(bits)
+    )?
+    .core
+    .signal(bits)
 }
-
-pub fn take(thread: &Thread, handle: Handle, mask: u64, output: usize) -> Result<(), SystemCallError> {
-    let object = super::handle::resolve(
-        &thread.process.handles.lock(),
-        handle,
-        Rights::READ,
-        ObjectKind::NotificationOwner,
-    )?;
-    let owner = object
-        .as_any()
-        .downcast_ref::<NotificationOwner>()
-        .ok_or(SystemCallError::WrongObjectType)?;
-    crate::uaccess::check_user_output::<u64>(thread, output)?;
+pub fn take(
+    thread: &Thread,
+    handle: Handle,
+    mask: u64,
+    output: usize,
+) -> Result<(), SystemCallError> {
+    let owner =
+        resolve::<NotificationOwner>(thread, handle, Rights::READ, ObjectKind::NotificationOwner)?;
     let taken = owner.core.take(mask)?;
-    // 已消费的位写回失败终止发起进程（uaccess 契约）。
     crate::uaccess::write_user(thread, output, &taken)
 }

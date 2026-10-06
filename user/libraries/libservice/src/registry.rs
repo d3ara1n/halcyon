@@ -9,7 +9,7 @@ use crate::{
 use alloc::{string::String, sync::Arc, vec::Vec};
 use erhino_shared::{
     call::SystemCallError,
-    object::{HandleRole, Rights},
+    object::{ObjectKind, Rights},
     time::Deadline,
 };
 use libbudget::{AccountView, Charge};
@@ -70,8 +70,8 @@ fn registry_authority_error(error: AuthorityError) -> RegistryError {
 }
 
 type PreparedRegistration<C> = (
-    PreparedEntry<NameBinding, String>,
-    PreparedEntry<Registration<C>>,
+    PreparedEntry<NameBinding, (), String>,
+    PreparedEntry<Registration<C>, ()>,
 );
 
 #[derive(Debug)]
@@ -100,7 +100,7 @@ struct Registration<C> {
     endpoint: Option<C>,
     prepared_node: Option<PreparedNode<Projection>>,
     node: Option<NodeRef>,
-    retire_entry: Option<PreparedEntry<()>>,
+    retire_entry: Option<PreparedEntry<(), ()>>,
     control_alive: bool,
     endpoint_observed: bool,
     _slot: Permit,
@@ -148,9 +148,9 @@ impl Payload for Projection {
 pub struct Registry<C> {
     nodes: NodeStore<Projection>,
     root: Option<NodeRef>,
-    names: OrderedTable<NameBinding, String>,
-    registrations: OrderedTable<Registration<C>>,
-    draining: OrderedTable<()>,
+    names: OrderedTable<NameBinding, (), String>,
+    registrations: OrderedTable<Registration<C>, ()>,
+    draining: OrderedTable<(), ()>,
     authorities: AuthorityTable,
     observed_authorities: usize,
     registration_slots: Arc<Counter>,
@@ -302,7 +302,7 @@ impl<C: Capability> Registry<C> {
         };
         match endpoint.description() {
             Ok(description)
-                if description.role == HandleRole::MailboxSender as u32
+                if description.kind == ObjectKind::MailboxSender as u32
                     && policy.transport.is_subset_of(description.rights) =>
             {
                 // 真实 endpoint role/rights 已在任何资源预留前冻结验证。
@@ -368,14 +368,14 @@ impl<C: Capability> Registry<C> {
                 .len()
                 .checked_add(record.len())
                 .and_then(|bytes| {
-                    bytes.checked_add(PreparedEntry::<Registration<C>>::allocation_bytes())
+                    bytes.checked_add(PreparedEntry::<Registration<C>, ()>::allocation_bytes())
                 })
-                .and_then(|bytes| bytes.checked_add(PreparedEntry::<()>::allocation_bytes()))
+                .and_then(|bytes| bytes.checked_add(PreparedEntry::<(), ()>::allocation_bytes()))
                 .ok_or(RegistryError::Resource(SystemCallError::ReachLimit))?;
             let bytes_charge = service_account.acquire(ServiceResource::Bytes, bytes)?;
             let name_charge = service_account.acquire(
                 ServiceResource::Bytes,
-                index_name.len() + PreparedEntry::<NameBinding, String>::allocation_bytes(),
+                index_name.len() + PreparedEntry::<NameBinding, (), String>::allocation_bytes(),
             )?;
             let prepared_node = self
                 .nodes
@@ -389,13 +389,13 @@ impl<C: Capability> Registry<C> {
                 .map_err(|failure| RegistryError::Resource(failure.error))?;
             let retire_entry = self
                 .draining
-                .prepare_insert(instance, ())
+                .prepare_insert(instance, (), &libbudget::AllocatorBacked)
                 .map_err(|error| match error {
                     InsertError::Limit(()) => {
                         RegistryError::Resource(SystemCallError::QuotaExceeded)
                     }
-                    InsertError::Allocation(()) => {
-                        RegistryError::Resource(SystemCallError::OutOfMemory)
+                    InsertError::Storage(error, ()) => {
+                        RegistryError::Resource(libbudget::allocator_error(error))
                     }
                 })?;
             let binding = NameBinding {
@@ -653,6 +653,7 @@ impl<C: Capability> Registry<C> {
         let binding = self
             .names
             .remove_by(actual_name)
+            .map(ordered_table::PreparedEntry::into_value)
             .ok_or(RegistryError::NotFound)?;
         assert_eq!(
             binding.instance, instance,
@@ -752,7 +753,9 @@ impl<C: Capability> Registry<C> {
         };
         registration.control_alive = false;
         if registration.state == State::Terminal {
-            self.registrations.remove(instance);
+            self.registrations
+                .remove(instance)
+                .map(ordered_table::PreparedEntry::into_value);
         }
     }
 
@@ -790,6 +793,7 @@ impl<C: Capability> Registry<C> {
             }
             self.draining
                 .remove(instance)
+                .map(ordered_table::PreparedEntry::into_value)
                 .expect("retired registration missing retirement index");
             work_done += 1;
             if !self
@@ -798,7 +802,9 @@ impl<C: Capability> Registry<C> {
                 .expect("retired registration disappeared")
                 .control_alive
             {
-                self.registrations.remove(instance);
+                self.registrations
+                    .remove(instance)
+                    .map(ordered_table::PreparedEntry::into_value);
             }
         }
         Ok(work_done)
@@ -1033,7 +1039,11 @@ impl<C: Capability> Backend<C> for Registry<C> {
             return;
         }
         self.sealed = true;
-        while let Some((_name, binding)) = self.names.pop_first() {
+        while let Some((_name, binding)) = self
+            .names
+            .pop_first()
+            .map(ordered_table::PreparedEntry::into_parts)
+        {
             let retire_entry = {
                 let registration = self
                     .registrations
@@ -1131,9 +1141,24 @@ impl<C: Capability> Backend<C> for Registry<C> {
         if !self.sealed || !self.is_empty() {
             return Err(self);
         }
-        while self.registrations.pop_first().is_some() {}
-        while self.names.pop_first().is_some() {}
-        while self.draining.pop_first().is_some() {}
+        while self
+            .registrations
+            .pop_first()
+            .map(ordered_table::PreparedEntry::into_parts)
+            .is_some()
+        {}
+        while self
+            .names
+            .pop_first()
+            .map(ordered_table::PreparedEntry::into_parts)
+            .is_some()
+        {}
+        while self
+            .draining
+            .pop_first()
+            .map(ordered_table::PreparedEntry::into_parts)
+            .is_some()
+        {}
         Ok(())
     }
 }
@@ -1147,20 +1172,21 @@ fn copy_name(name: &str) -> Result<String, RegistryError> {
 }
 
 fn prepare_entry<V, K: Ord>(
-    table: &OrderedTable<V, K>,
+    table: &OrderedTable<V, (), K>,
     key: K,
     value: V,
-) -> Result<PreparedEntry<V, K>, (RegistryError, V)> {
+) -> Result<PreparedEntry<V, (), K>, (RegistryError, V)> {
     table
-        .prepare_insert(key, value)
+        .prepare_insert(key, value, &libbudget::AllocatorBacked)
         .map_err(|error| match error {
             InsertError::Limit(value) => (
                 RegistryError::Resource(SystemCallError::QuotaExceeded),
                 value,
             ),
-            InsertError::Allocation(value) => {
-                (RegistryError::Resource(SystemCallError::OutOfMemory), value)
-            }
+            InsertError::Storage(error, value) => (
+                RegistryError::Resource(libbudget::allocator_error(error)),
+                value,
+            ),
         })
 }
 
@@ -1168,7 +1194,7 @@ fn prepare_entry<V, K: Ord>(
 mod tests {
     use super::*;
     use alloc::rc::Rc;
-    use erhino_shared::object::{HandleDescription, HandleRole};
+    use erhino_shared::object::{HandleDescription, ObjectKind};
     use libbudget::{Budget, Taxonomy};
     use libexecution::wake::Wake;
 
@@ -1184,8 +1210,8 @@ mod tests {
             Ok(HandleDescription {
                 object_id: self.id,
                 related_object_id: self.mailbox,
-                kind: 0,
-                role: HandleRole::MailboxSender as u32,
+                kind: ObjectKind::MailboxSender as u32,
+                reserved0: 0,
                 rights: self.rights,
                 badge: 0,
                 reserved: 0,

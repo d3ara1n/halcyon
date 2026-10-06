@@ -24,10 +24,10 @@ impl NotificationWake {
     > {
         use erhino_shared::{
             call::SystemCallError,
-            object::{HandleRole, Rights},
+            object::{ObjectKind, Rights},
         };
         let checked = signaler.description().and_then(|description| {
-            if bit == 0 || description.role != HandleRole::NotificationSignaler as u32 {
+            if bit == 0 || description.kind != ObjectKind::NotificationSignaler as u32 {
                 return Err(SystemCallError::WrongObjectType);
             }
             if !description.rights.contains(Rights::SIGNAL) {

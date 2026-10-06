@@ -198,14 +198,7 @@ impl ObservationSlot {
                 continue;
             }
             if self.result.is_none() {
-                self.result = Some(if event.error != 0 {
-                    ObservationResult::SourceError(
-                        num_traits::FromPrimitive::from_u32(event.error)
-                            .unwrap_or(SystemCallError::Unknown),
-                    )
-                } else {
-                    ObservationResult::Ready(event.observed)
-                });
+                self.result = Some(ObservationResult::Ready(event.observed));
             }
         }
         // 到期事实由统一绝对时钟决定；迟到 timeout 不跨轮消费新请求。
@@ -243,9 +236,10 @@ impl ObservationSlot {
 
 /// 同步驱动只负责等待，机器仍验证同一个请求、期限和结果。
 pub fn wait(request: Observation) -> Result<(u64, ObservationResult), SystemCallError> {
-    use erhino_shared::wait::{WaitItem, WaitReason};
+    use erhino_shared::wait::WaitReason;
     let result = match libkernel::ipc::wait::wait_until(
-        &[WaitItem::new(request.control, request.signals, request.id)],
+        request.control,
+        request.signals,
         request.deadline,
     ) {
         Ok(result) if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) => {

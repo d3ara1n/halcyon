@@ -14,12 +14,12 @@ use core::{
 use erhino_shared::{
     call::SystemCallError,
     mem::MemoryProtection,
-    object::Handle,
+    object::{Handle, ObjectSignals},
     proc::{PROCESS_PAGE_SIZE, ThreadCreateResult, ThreadStartContext, Tid},
     startup::EntryThreadDescriptor,
 };
 use libkernel::{
-    ThreadControl,
+    ThreadControl, ThreadStartTicket,
     mm::{MappedRegion, Placement},
     thread as kernel_thread,
 };
@@ -465,12 +465,8 @@ fn observe_done(
     control: &ThreadControl,
     deadline: erhino_shared::time::Deadline,
 ) -> Result<bool, SystemCallError> {
-    let item = erhino_shared::wait::WaitItem::new(
-        control.as_handle(),
-        erhino_shared::object::ObjectSignals::DONE,
-        0,
-    );
-    let result = libkernel::ipc::wait::wait_until(core::slice::from_ref(&item), deadline)?;
+    let result =
+        libkernel::ipc::wait::wait_until(control.as_handle(), ObjectSignals::DONE, deadline)?;
     Ok(result
         .observed
         .contains(erhino_shared::object::ObjectSignals::DONE))
@@ -732,6 +728,7 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
             tid: 0,
             reserved: 0,
             control: Handle::INVALID,
+            start: Handle::INVALID,
         };
         // SAFETY: all syscall pointers refer to live values; the stack and
         // packet were prepared before creation.
@@ -741,13 +738,15 @@ impl<E: ThreadEnvironment> ThreadFactory<E> {
             drop(packet);
             return fail(stack, residue, error);
         }
-        // SAFETY: ThreadCreate returned a fresh MANAGE-capable Control owner.
+        // SAFETY: ThreadCreate 返回两份独立的新 capability owner。
         let control = Arc::new(unsafe { ThreadControl::from_raw(created.control) });
+        let ticket = unsafe { ThreadStartTicket::from_raw(created.start) };
         Ok(PreparedThread {
             parts: Some(PreparedParts {
                 result,
                 id: created.tid,
                 control,
+                ticket,
                 packet,
                 stack,
                 residue,
@@ -763,6 +762,7 @@ struct PreparedParts<F, T, E: ThreadEnvironment> {
     result: Arc<ResultCell<ThreadOutcome<T, E>>>,
     id: Tid,
     control: Arc<ThreadControl>,
+    ticket: ThreadStartTicket,
     packet: Box<Packet<E, F, T>>,
     stack: MappedRegion,
     residue: Arc<ResidueCell<E::Residue>>,
@@ -779,22 +779,27 @@ pub struct PreparedThread<F, T, E: ThreadEnvironment> {
 }
 
 impl<F, T, E: ThreadEnvironment> PreparedThread<F, T, E> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "失败返还已预付线程资源 owner，错误路径不再分配"
+    )]
     pub fn start(mut self) -> Result<ResultReceiver<T, E>, (Self, SystemCallError)>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let parts = self.parts.take().expect("PreparedThread parts missing");
+        let mut parts = self.parts.take().expect("PreparedThread parts missing");
         // The packet is handed to the child by address; ownership transfers
         // only if ThreadStart succeeds.
         let packet = Box::into_raw(parts.packet);
-        if let Err(error) = parts.control.start() {
+        if let Err(error) = parts.ticket.start() {
             // SAFETY: ThreadStart rejected the Created control, so the
             // trampoline never ran and the packet is still ours.
             let packet = unsafe { Box::from_raw(packet) };
             self.parts = Some(PreparedParts { packet, ..parts });
             return Err((self, error));
         }
+        drop(parts.ticket);
         self.registry.install(
             self.slot,
             ThreadRecord {
@@ -821,14 +826,13 @@ impl<F, T, E: ThreadEnvironment> Drop for PreparedThread<F, T, E> {
         // F and the environment child are destroyed on the abandoning thread.
         drop(parts.packet);
         drop(parts.result);
-        // This is the only Control reference: closing it abandons the Created
-        // thread, and the kernel publishes DONE before Close returns.
-        drop(parts.control);
+        // 启动票据的最后持有放弃 Pending；Control 仅供观察。
+        drop(parts.ticket);
         self.registry.install(
             self.slot,
             ThreadRecord {
                 stack: Some(parts.stack),
-                control: None,
+                control: Some(parts.control),
                 environment: Arc::clone(&self.environment),
                 residue: parts.residue,
             },

@@ -184,7 +184,8 @@ fn bring_up_runtime() -> ! {
     let (addr, len) = crate::rt::boot_package_region()
         .expect("BootPackage unavailable; initial process cannot start");
     boot::load(addr, len);
-    let (region_bytes, transaction_bytes) = memory_space::MemorySpace::entry_sizes();
+    let (region_bytes, transaction_bytes) =
+        memory_space::MemorySpace::<crate::task::resources::MetadataCharge>::entry_sizes();
     log!(
         Heap,
         "ledger entries: region {} x {}, transaction {} x {}; minimum storage {} bytes",
@@ -196,16 +197,13 @@ fn bring_up_runtime() -> ! {
             + transaction_bytes * crate::task::resources::MEMORY_CHANGES_PER_ADDRESS_SPACE
     );
     heap::reset_peaks();
-    crate::task::resources::reset_admission_peaks();
     heap::log_snapshot("ready");
     log!(
         Task,
-        "metadata ready usage {:?} peaks {:?}",
-        crate::task::resources::admission_usage(),
-        crate::task::resources::admission_peak()
+        "root metadata ready {:?}",
+        crate::task::memory_pool::MemoryPool::root_metadata_snapshot()
     );
     registry::publish_ready();
-    crate::remote_call::selftest();
     crate::sched::run()
 }
 

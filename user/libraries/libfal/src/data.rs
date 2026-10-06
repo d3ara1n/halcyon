@@ -21,14 +21,14 @@ struct Block {
 }
 
 pub struct Data {
-    blocks: ManuallyDrop<OrderedTable<Block>>,
+    blocks: ManuallyDrop<OrderedTable<Block, ()>>,
     slots: Arc<Counter>,
     length: u64,
     version: u64,
 }
 
 pub struct PreparedWrite {
-    blocks: Vec<PreparedEntry<Block>>,
+    blocks: Vec<PreparedEntry<Block, ()>>,
     expected_version: u64,
     next_version: u64,
     length: u64,
@@ -107,7 +107,7 @@ impl Data {
             let size = (BLOCK_BYTES - within).min(input.len() - done);
             let charge = account.acquire(
                 FalResource::Bytes,
-                BLOCK_BYTES + PreparedEntry::<Block>::allocation_bytes(),
+                BLOCK_BYTES + PreparedEntry::<Block, ()>::allocation_bytes(),
             )?;
             let old = self.blocks.get(key);
             let slot = if old.is_none() {
@@ -133,10 +133,12 @@ impl Data {
             };
             blocks.push(
                 self.blocks
-                    .prepare_insert_candidate(key, block)
+                    .prepare_insert_candidate(key, block, &libbudget::AllocatorBacked)
                     .map_err(|error| match error {
                         ordered_table::InsertError::Limit(_) => SystemCallError::QuotaExceeded,
-                        ordered_table::InsertError::Allocation(_) => SystemCallError::OutOfMemory,
+                        ordered_table::InsertError::Storage(error, _) => {
+                            libbudget::allocator_error(error)
+                        }
                     })?,
             );
             done += size;
@@ -163,7 +165,11 @@ impl Data {
         );
         for mut block in write.blocks {
             let key = block.key();
-            if let Some(mut old) = self.blocks.remove(key) {
+            if let Some(mut old) = self
+                .blocks
+                .remove(key)
+                .map(ordered_table::PreparedEntry::into_value)
+            {
                 block.value_mut().slot = old.slot.take();
             }
             self.blocks.insert_prepared(block);
@@ -178,7 +184,10 @@ impl Data {
             let Some((&key, _)) = self.blocks.next_after::<u64>(None) else {
                 break;
             };
-            let _ = self.blocks.remove(key);
+            let _ = self
+                .blocks
+                .remove(key)
+                .map(ordered_table::PreparedEntry::into_value);
             done += 1;
         }
         if self.blocks.is_empty() {

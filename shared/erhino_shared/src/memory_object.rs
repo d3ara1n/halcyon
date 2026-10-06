@@ -4,8 +4,8 @@
 //! 单向的可执行发布（`SealExecutable`）改变它可授予的 view 权限；view 的建立、
 //! 降权与解除属于内存映射 interface，不在本模块。
 
-/// 单个对象的硬容量上限（页）。可由普通 Handle close 触发最终析构的对象必须受
-/// 硬上限约束，因此更大的逻辑对象由用户态协议组合多个对象表达。
+/// 当前一次同步创建允许处理的最大页数，限制资金化准备与初始清零工作。
+/// Close 只移交预付退休记录，不遍历对象长度；此值不作为释放路径的边界依据。
 pub const MEMORY_OBJECT_MAX_PAGES: u64 = 512;
 
 /// `MemoryObjectCreate` 的固定宽请求。
@@ -101,7 +101,10 @@ mod tests {
 
     #[test]
     fn state_rejects_unknown_values() {
-        assert_eq!(MemoryObjectState::from_raw(0), Some(MemoryObjectState::Mutable));
+        assert_eq!(
+            MemoryObjectState::from_raw(0),
+            Some(MemoryObjectState::Mutable)
+        );
         assert_eq!(
             MemoryObjectState::from_raw(2),
             Some(MemoryObjectState::Executable)

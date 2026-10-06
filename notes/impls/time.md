@@ -8,6 +8,10 @@
 
 `os/kernel/src/sbi.rs::read_time` 使用 `fence rw,i; rdtime; fence i,rw`，asm 不使用 nomem/readonly/pure：固定 Zicsr「CSR Access Ordering」把 CSR read 归 I，内存 acquire 不替代 R→I 排序，CSR 后发布也有显式 I→RW 排序。GeometryCell 唯一 boot 写入，release/acquire 发布 geometry 与 origin，之后只读。
 
+[`shared/timer_queue`](../../shared/timer_queue/src/lib.rs) 使用侵入式 AVL 树，节点地址稳定，期限相等时以节点地址区分。登记/取消/弹出不分配，沿树高修复 parent/height；first 是同一队列同步域维护的最小值缓存，peek 为 O(1)。owner_slot 只定位队列，cancel_if 锁内复检载荷 epoch；到期先彻底摘链/清 owner 再交载荷，没有 arena token/generation。
+
+Thread 出生内嵌 TimerNode，per-hart 队列载荷为强 Thread/epoch；service_expired 锁外只提示，不提交 Timeout。执行 owner detach 注销 timer，旧消息不能取消新 epoch。Thread HintTarget 已接成员 pending/epoch，正常续体/Frozen reap 共用注销入口；旧 wait_context/request 的 token 消费未删除，内核不能构建。用户态 WorkQueue（deadline/retry）、Runtime 来源退休与 RPC Dispatcher 各自出生预付 pin Box，取消/到期后才 drop，容器析构先排空 timer 再释放节点。Runtime 预算与实际 charge 共用包含独立 timer 存储的来源字节数。
+
 `clock/selftest.rs` 使用独立 ClockState 和编排的 raw 样本，验证 origin/skew、已采旧值迟到发布、真正回退、不可逆失败、epoch 末端与并发失败复检，不污染正式 STATE。Ready 前启动调用已接入，正常验收要求 Clock state anchor；这些不是实际多 hart 弱序的全面验证。
 
 本轮证据：shared host 的 Deadline 编码、低频/极频/接近硬件末端和取整边界通过；virt core 的隔离状态检查与既有消费者通过，七面 lint 通过。日志 `artifacts/check/time-{shared-host,clock-core,clock-clippy}.log`。rustc 为 `c54751567b19c4ceb08b0412d83529c2568cba8b`，LLVM 23.1.0；debug 实际反汇编 `time-read-time-disassembly.log` 确认 `fence rw,i / rdtime / fence i,rw`，不是仅凭 asm 文本推断。artifact 被 Git 忽略，异机须重跑。
