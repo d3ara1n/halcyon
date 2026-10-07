@@ -42,7 +42,11 @@ impl Holders {
     }
 
     pub const fn with_limit(policy: ZeroPolicy, limit: u64) -> Self {
-        let limit = if limit > COUNT_MASK { COUNT_MASK } else { limit };
+        let limit = if limit > COUNT_MASK {
+            COUNT_MASK
+        } else {
+            limit
+        };
         Self {
             state: AtomicU64::new(0),
             policy,

@@ -10,7 +10,7 @@ use crate::{
 use alloc::sync::Arc;
 use erhino_shared::call::SystemCallError;
 use memory_space::{
-    BackingRetire, BackingView, PAGE_SIZE, PageRange, RegionKindView, RetiringFragment, WritePermit,
+    BackingRetire, BackingView, PAGE_SIZE, RegionKindView, RetiringFragment, WritePermit,
 };
 use ordered_table::{InsertError, OrderedTable, PreparedEntry};
 
@@ -100,12 +100,19 @@ impl Views {
     /// 调用者先在 ledger 预约对应区间；失败原样返 use，由同一操作回滚。
     pub(crate) fn prepare_map(
         &self,
-        range: PageRange,
-        origin: BackingView,
+        intent: memory_space::TranslationIntent,
         usage: BackingUse,
         object: Option<Arc<MemoryObjectCore>>,
         pool: &Arc<crate::task::memory_pool::MemoryPool>,
     ) -> Result<PreparedView, (SystemCallError, BackingUse)> {
+        let (range, origin, has_writes) = match intent {
+            memory_space::TranslationIntent::Install {
+                range,
+                backing,
+                protection,
+            } => (range, backing, protection.writable()),
+            _ => return Err((SystemCallError::IllegalArgument, usage)),
+        };
         let (lo, hi) = usage.range();
         if hi - lo != range.pages() as u64 || origin.offset() as u64 != lo * PAGE_SIZE as u64 {
             return Err((SystemCallError::IllegalArgument, usage));
@@ -139,7 +146,20 @@ impl Views {
                 view.usage.take().expect("failed preparation lost use"),
             )
         })?;
-        let object = if let Some(object) = object {
+        let object = if let Some(object) = object.filter(|object| {
+            if has_writes {
+                // 此接口只在原 Operation 已接管 ledger 预约后调用；其写许可
+                // 在提交/回滚移交前不会归还，来源不能被别的 View 退休摘走。
+                let identity = object.identity();
+                let state = self.state.lock();
+                let source = state.sources.get(identity.get());
+                assert!(
+                    source.is_some_and(|source| source.permits != 0),
+                    "writable map lost its reserved source"
+                );
+            }
+            !has_writes
+        }) {
             let id = object.identity().get();
             let candidate = {
                 PreparedEntry::try_new(
@@ -191,8 +211,8 @@ impl Views {
                 "view commit overlaps successor"
             );
         }
-        if let Some(candidate) = prepared.object.as_ref() {
-            if let Some(owner) = state.sources.get_mut(candidate.key()) {
+        if let Some(identity) = node.value_mut().origin.object() {
+            if let Some(owner) = state.sources.get_mut(identity.get()) {
                 owner.views = owner
                     .views
                     .checked_add(1)

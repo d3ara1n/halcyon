@@ -214,7 +214,7 @@ impl Work for MemoryObjectCore {
     fn record(&self) -> &WorkRecord {
         self.source.record()
     }
-    fn step(&self) -> maintenance::record::Outcome {
+    fn step(self: Arc<Self>) -> maintenance::record::Outcome {
         let step = {
             let _state = self.state.lock();
             // SAFETY: 每步检查一个来源候选，只复制在途身份/强目标。

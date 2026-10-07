@@ -178,12 +178,9 @@ pub(super) struct StreamTask {
     args: Option<Result<OpenArgs, protocol::Status>>,
     pending: Option<PreparedEntry<StreamEntry, ()>>,
     identity: Option<u64>,
-    lifetime_source: Option<SourceId>,
-    data_source: Option<SourceId>,
-    lifetime_requested: bool,
-    data_requested: bool,
-    lifetime_removing: bool,
-    data_removing: bool,
+    lifetime_source: SourceRegistration,
+    data_source: SourceRegistration,
+
     returned: Vec<Capability>,
     wakes: Option<WakeBatch>,
     prepared: bool,
@@ -217,12 +214,9 @@ impl StreamTask {
             args: Some(args),
             pending: None,
             identity: None,
-            lifetime_source: None,
-            data_source: None,
-            lifetime_requested: false,
-            data_requested: false,
-            lifetime_removing: false,
-            data_removing: false,
+            lifetime_source: SourceRegistration::new(),
+            data_source: SourceRegistration::new(),
+
             returned: Vec::new(),
             wakes: None,
             prepared: false,
@@ -465,19 +459,18 @@ impl StreamTask {
         &mut self,
         requests: &mut Requests<ServiceTask<B>>,
     ) -> Result<(), protocol::Status> {
-        if !self.lifetime_requested && self.lifetime_source.is_none() {
+        if !self.lifetime_source.is_installing() && self.lifetime_source.source().is_none() {
             let handle = self
                 .entry_mut()
                 .and_then(|entry| entry.lifetime.as_ref())
                 .ok_or(protocol::Status::Internal)?
                 .as_handle();
             let plan = libexecution::runtime::SourcePlan::new(handle, ObjectSignals::CLOSED);
-            requests
-                .register(plan, KIND_STREAM_LIFETIME)
+            self.lifetime_source
+                .install(requests, plan, KIND_STREAM_LIFETIME)
                 .map_err(|_| protocol::Status::Quota)?;
-            self.lifetime_requested = true;
         }
-        if !self.data_requested && self.data_source.is_none() {
+        if !self.data_source.is_installing() && self.data_source.source().is_none() {
             let role = self
                 .entry_mut()
                 .and_then(|entry| entry.role.as_mut())
@@ -487,16 +480,15 @@ impl StreamTask {
                 StreamRole::Consumer(role) => role.wait_plan(),
             }
             .map_err(|_| protocol::Status::Internal)?;
-            requests
-                .register(plan, KIND_STREAM_DATA)
+            self.data_source
+                .install(requests, plan, KIND_STREAM_DATA)
                 .map_err(|_| protocol::Status::Quota)?;
-            self.data_requested = true;
         }
         Ok(())
     }
 
     fn sources_ready(&self) -> bool {
-        self.lifetime_source.is_some() && self.data_source.is_some()
+        self.lifetime_source.source().is_some() && self.data_source.source().is_some()
     }
 
     fn install<B: RuntimeBackend>(&mut self, world: &mut World<B>) -> Result<(), protocol::Status> {
@@ -826,16 +818,14 @@ impl StreamTask {
             }
             entry.wake_sent = true;
         }
-        if let Some(source) = self.data_source {
-            if !self.data_removing && requests.remove(source).is_ok() {
-                self.data_removing = true;
-            }
+        if self.data_source.source().is_some() {
+            let _ = self.data_source.remove(requests);
             return Advance {
                 work_done: 1,
                 step: Step::Runnable,
             };
         }
-        if self.data_requested {
+        if self.data_source.is_installing() {
             return Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -897,25 +887,13 @@ impl StreamTask {
         requests: &mut Requests<ServiceTask<B>>,
     ) -> Advance {
         self.retiring = true;
-        for (source, removing) in [
-            (self.data_source, &mut self.data_removing),
-            (self.lifetime_source, &mut self.lifetime_removing),
-        ] {
-            if let Some(source) = source
-                && !*removing
-                && requests.remove(source).is_ok()
-            {
-                *removing = true;
-            }
+        for source in [&mut self.data_source, &mut self.lifetime_source] {
+            let _ = source.remove(requests);
         }
-        if self.data_source.is_some()
-            || self.data_requested
-            || self.lifetime_source.is_some()
-            || self.lifetime_requested
-        {
+        if !self.data_source.is_empty() || !self.lifetime_source.is_empty() {
             return Advance {
                 work_done: 1,
-                step: Step::Runnable,
+                step: Step::Parked,
             };
         }
         if let Some(owner) = self.returned.pop()
@@ -1318,9 +1296,9 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
         if let Some(identity) = self.identity
             && let Some(entry) = world.streams.get_mut(identity)
             && entry.role.is_some()
-            && self.data_source.is_none()
-            && !self.data_requested
-            && !self.data_removing
+            && self.data_source.source().is_none()
+            && !self.data_source.is_installing()
+            && !self.data_source.is_removing()
         {
             let plan = match entry.role.as_mut() {
                 Some(StreamRole::Producer(role)) => role.wait_plan(),
@@ -1329,8 +1307,11 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
             };
             match plan {
                 Ok(plan) => {
-                    if requests.register(plan, KIND_STREAM_DATA).is_ok() {
-                        self.data_requested = true;
+                    if self
+                        .data_source
+                        .install(requests, plan, KIND_STREAM_DATA)
+                        .is_ok()
+                    {
                         return Ok(Advance {
                             work_done: 1,
                             step: Step::Runnable,
@@ -1357,6 +1338,11 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
     }
 
     fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<Self::Family>) {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.lifetime_source.refused(*kind);
+            self.data_source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Source {
                 kind: KIND_REPLY, ..
@@ -1367,14 +1353,8 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
             }
             RequestFailure::Source { kind, error } => {
                 match kind {
-                    KIND_STREAM_LIFETIME => {
-                        self.lifetime_requested = false;
-                        self.lifetime_removing = false;
-                    }
-                    KIND_STREAM_DATA => {
-                        self.data_requested = false;
-                        self.data_removing = false;
-                    }
+                    KIND_STREAM_LIFETIME => {}
+                    KIND_STREAM_DATA => {}
                     _ => world.failed = true,
                 }
                 self.failure = stream_status(error);
@@ -1410,12 +1390,10 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
                 }
             }
             KIND_STREAM_LIFETIME => {
-                self.lifetime_requested = false;
-                self.lifetime_source = Some(source);
+                self.lifetime_source.registered(kind, source);
             }
             KIND_STREAM_DATA => {
-                self.data_requested = false;
-                self.data_source = Some(source);
+                self.data_source.registered(kind, source);
             }
             _ => world.failed = true,
         }
@@ -1428,10 +1406,8 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
                     outbox.unregistered(world, kind, source);
                 }
             }
-            KIND_STREAM_LIFETIME if self.lifetime_source == Some(source) => {
-                self.lifetime_requested = false;
-                self.lifetime_source = None;
-                self.lifetime_removing = false;
+            KIND_STREAM_LIFETIME if self.lifetime_source.source() == Some(source) => {
+                self.lifetime_source.unregistered(source);
                 if let Some(entry) = self.pending.as_mut().map(PreparedEntry::value_mut) {
                     entry.lifetime_charge = None;
                 } else if let Some(identity) = self.identity
@@ -1440,10 +1416,8 @@ impl<B: RuntimeBackend> Task<World<B>> for StreamTask {
                     entry.lifetime_charge = None;
                 }
             }
-            KIND_STREAM_DATA if self.data_source == Some(source) => {
-                self.data_requested = false;
-                self.data_source = None;
-                self.data_removing = false;
+            KIND_STREAM_DATA if self.data_source.source() == Some(source) => {
+                self.data_source.unregistered(source);
                 let retiring = self.retiring || self.failure != protocol::Status::Ok;
                 if let Some(entry) = self.pending.as_mut().map(PreparedEntry::value_mut) {
                     if retiring || entry.state == protocol::StreamState::Terminal {

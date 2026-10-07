@@ -509,11 +509,16 @@ fn finish(
                 .as_mut()
                 .ok_or(SystemCallError::ObjectClosed)?
                 .ledger_mut();
-            ledger.reserve(
+            let result = ledger.reserve(
                 operation.prep.plan.take_validated(),
                 &mut operation.prep.permits,
                 &mut operation.prep.region_storage,
-            )
+            );
+            if let Ok(prepared) = &result {
+                vm.dependencies
+                    .push((prepared.key(), operation.completion_source()));
+            }
+            result
         };
         match reserved {
             Ok(prepared) => break prepared,
@@ -575,12 +580,12 @@ fn finish(
         .clone();
     AnySpace::fund_reserve(&pool, frames, &funding, &mut operation.prep.frames)?;
     let layout = prepared.map_result();
-    if let Some(layout) = layout {
-        let origin = prepared
+    if layout.is_some() {
+        let intent = prepared
             .translation_intents()
             .iter()
             .find_map(|intent| match *intent {
-                memory_space::TranslationIntent::Install { backing, .. } => Some(backing),
+                memory_space::TranslationIntent::Install { .. } => Some(*intent),
                 _ => None,
             })
             .expect("map reservation has no install intent");
@@ -591,7 +596,7 @@ fn finish(
             .expect("map preparation has no backing use");
         match body
             .views
-            .prepare_map(layout.usable, origin, usage, source, operation.pool())
+            .prepare_map(intent, usage, source, operation.pool())
         {
             Ok(view) => operation.prep.view = Some(view),
             Err((error, usage)) => {

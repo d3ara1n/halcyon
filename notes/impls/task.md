@@ -60,7 +60,7 @@ Frozen 与外部访问/Ready 发布共用 Shell 原子 ingress 字；Start 的�
 
 root Job 由内核 static anchor 强持；parent 强持 children，child 弱持 parent；Job 成员表强持未 Dead 的 Shell，Shell 弱持 Job。
 
-ProcessCreate 同时要求 Job[CREATE]、Pool[CREATE]，不消费两份来源 authority。Job 链门预留 pid/成员，Shell 与构造 lease 出生后先发布骨架；随后 fallible 构造 ledger、funded root、VM、Views、成员与 cap 表，安装唯一 Body。任一失败冻结 Shell，由既有回收记录处理；未装 Body 的空空间可以局部退款。Job 预约回滚若使 sealed 空 Job 完成，会锁外启动 Job 完成记录。
+ProcessCreate同时要求Job[CREATE]、Pool[CREATE]，不消费来源authority。Job链门预留pid/成员，Shell与构造lease出生后发布骨架；随后fallible构造ledger、funded root、VM、Views、成员/cap表并安装唯一Body。失败冻结Shell，由既有回收记录收束；未装Body空空间可局部退款。封口后的最后预约回滚交回依赖并唤醒已发布的Job Work。
 
 Builder 与 Control 在调用者表预约后，先锁外写 ProcessCreateResult，再 arm Builder，最后表 commit；输出失败冻结新 Shell。进程从出生即付款固定，无 Unbound/BindMemory。组装顺序为 Create → Map/Write/Grant/BindExecution → ThreadCreate → Start；所有目标访问持短 Building BodyLease，不跨异步等待。
 
@@ -84,7 +84,8 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   任一祖先 sealed → ObjectClosed；JobCreate 超深度 32 → IllegalArgument。
   祖先 weak 升级失败即「祖先已完成释放 ⟹ 曾 sealed」，同样 ObjectClosed。
   祖先Arc链以JOB_DEPTH_MAX固定Buffer准备、守卫数组按实际链长Buffer准备，两者由当前Job Pool按布局付款，不在门内分配。守卫析构先解全部链锁，再退数组charge，随后释放祖先链；Start/Create失败不留下临时付款。
-- **JobSeal**：O(1)置位、不扫表；sealed且两表空时在JobInner唯一置dead，再锁外发布内嵌Work。Work一次只从父表摘自己的完整节点，门外释放后发布本Job CLOSED，再把因本次移除而完成的父Job交给父Work，不同步遍历整链。CLOSED保证父枚举已移除本Job，单独Dead快照只保证本Job已sealed且两表空；根Job无父表，仍发布自身完成。JobInner拥有责任出生，WorkRecord拥有排队/运行/Done，不另设完成阶段锁。Job强持明确Pool/Account，root用root Pool。成员/子节点及链临时存储已付款，Job本体与独立观察/维护宿主也在分配前按实际live-layout准入；公开header与私有执行宿主各按自身最后存活owner和完成责任退费，不把Source内嵌字段重复收费。
+- **JobSeal**：JobInner以Open/Sealing{cursor}/Waiting{token}/Dead拥有封口状态；首次Seal同锁置Sealing并发布出生内嵌Work，锁外kick。每步至多扫描一个直接child项，锁外对子调用seal/publish；不递归step。已受理ChildReservation提交时在父锁内读封口、门外让新child出生即seal，游标越过占位不丢责任。扫描结束但成员/child未空则同锁arm并保存WakeToken，最后依赖释放在门外wake。
+  child完成先从父表摘完整节点并增closing_children，门外退款并发布child CLOSED，再回父锁减计数；父不得在该在途窗口发布Dead/CLOSED。完成Job无等待凭证，两表与在途计数均空；根无父表仍发布自身CLOSED。CLOSED保证父枚举已移除本Job。Job强持明确Pool/Account，节点、链临时存储与公开/私有宿主各按实际布局付款、按最后owner退款。root/child统一Remintable，Close只退authority，父表/root anchor与显式封口决定生命周期。
 - **JobEnumerate**：游标分页（cursor = 上批最后返回条目 ID）；遇未决
   事务占位即终止本批（屏障：next_cursor 严格小于占位 ID，占位不计
   actual 但计入 more）；契约 `more=1 ⇒ actual ≥ 1 ∨ next_cursor ==
@@ -95,7 +96,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
   member ProcessControl）；请求 rights ⊆ 源 Handle rights ∩ 目标角色
   allowed_rights，超集 RightsDenied；目标不在直接成员表（含已完成
   移表）ObjectNotFound。派生 ProcessControl 复用存活 shell（单一
-  shell 身份，电平不分叉）；内核直接复用成员表内的 ProcessShell，不再从旧 core 重铸 Control。Job 树收束是用户态政策，公共 `JobCollector` 仍用单一
+  shell身份，电平不分叉）；内核直接复用表内ProcessShell。关闭最后child capability不会撤销父MANAGE的重新派生资格。内核负责后代封口传播与空子树自动收束；杀成员、预算与失败政策由用户态JobCollector拥有，仍用单一
   显式 frame stack 逐层 seal、分页枚举、派生 kill、Process 收束与 CLOSED
   观察；`job_kill` 是消费同一机器的同步门面。默认 policy 给出观察期限、
   重试次数与工作量上限；失败按值返还原 Job/Process 机器，保持阶段、
@@ -112,7 +113,7 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
 
 [`ProcessBuilder`](../../os/kernel/src/task/process/builder.rs) 的阶段为 Prepared/Pending/Starting/Publishing/Started/Aborted。Builder固定MANAGE|GRANT|TRANSIT，无DUPLICATE；Create铸造和类型上限使用所属module唯一常量。缓冲运输成功移动同一authority、失败返原owner，接收端可仅保留MANAGE。Pending最后authority消散以Aborted冻结Shell；已提交Start由Work继续持责任。Start 在 Job 链门确认未 seal、执行需求已绑定、有 Created 且无外部 Body 借用/成员预约，提交 Running 并关闭 Building VM 准入；成功后消费 Builder authority，独立内嵌 Work 接管。Work 通过 VM 的 arm/复检等待既有访问 lease（包括失败准备的回滚）清零，才开放 entry。Frozen 会取走 startup waiter 并唤醒该记录。
 
-首个 Ready 发布前冻结成员槽终点与 tid 上界，每步只取一槽的旧 Created，经短 ingress 发布预付 ReadyBatch。已运行线程新建的 Pending 或复用槽的新 tid 不会被此批启动。Start 提交时把门内已接受的 BodyLease 转为不携带 Body 指针的 WorkReceipt，只保留已提交责任的 ingress；实际数据每步另借短 BodyLease。所有槽交接完或 Frozen 后，step 清 Shell 强根并结束执行；最后 Builder 引用消散，末字段先退宿主费、再归还 WorkReceipt、最后发布私有启动 DONE。因此 Frozen 不能在启动宿主实际退款前越过 WaitIngress。Starting 时最后持有消散只记 abandoned：未提交失败时冻结，已提交启动由记录完成。
+首个 Ready 发布前冻结成员槽终点与 tid 上界，每步只取一槽的旧 Created，经短 ingress 发布预付 ReadyBatch。已运行线程新建的 Pending 或复用槽的新 tid 不会被此批启动。Start 提交时把门内已接受的 BodyLease 转为不携带 Body 指针的 WorkReceipt，只保留已提交责任的 ingress；实际数据每步另借短 BodyLease。所有槽交接完或 Frozen 后，step 清 Shell 强根并结束执行；最后 Builder 引用消散，末字段先退宿主费、再归还 WorkReceipt、最后发布私有启动 DONE。因此 Frozen 不能在启动宿主实际退款前越过 WaitIngress。Start调用期间唯一authority由Invocation持有；未提交失败回Pending，由Invocation恢复/释放决定后续放弃，已提交启动由记录完成。
 
 [`ThreadDeparture`](../../os/kernel/src/task/process/departure.rs) 是出生付款的独立 Work。reap/Created 放弃先标记离场责任，Thread 的末字段在现场、等待节点、Ready 资格销毁及宿主退款后才请求该记录。step 短借 Body 摘成员并归还访问，不提前解除 Shell 回执计数。Departure 最后引用消散时，末字段先退宿主费、发布 ThreadControl DONE，再 member_departed；父回收因此不能领先 Thread/Departure 私有费用。完成来源由回执直接强持，不依赖 Control 升级；未提交出生销毁只退款，不发布成员离场。VM/Start 不保留异步用户输出责任，访问租约和退款 owner 分别证明空间退休安全。
 
@@ -131,32 +132,34 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
 bootstrap 期（tp 未建立，单核）使用专用帧，formal entry 汇合点切换至
 per-hart 帧。
 
-秩分配（数字唯一真值在 `sync::ranks`，此处列序即序）：
+秩与数值唯一真值在[sync::ranks](../../os/kernel/src/sync.rs)，下表按获取顺序列实际owner：
 
-| rank | 锁 | 链段 key |
+| rank | 锁 | 同秩key/边界 |
 |---|---|---|
-| DRAIN_GATE | 收束批次仲裁，一次性覆盖最广，恒最先 | — |
-| DRAIN_CURSOR | HandleTable 收束游标与 pending close | — |
-| HANDLE_TABLE | caller→child 嵌套 | pid 递增 |
-| LEAF | CONSOLE、REGISTRY、ROOT anchor、各域就绪队列、per-hart TimerQueue、WaitContext 两锁；Remote Reserve 所需 admitted mask 已是安装后不可变的原子快照，不进入该锁 | — |
-| JOB_INNER | Job 链锁（≤32 把同持） | jid 递增 |
-| MAILBOX / CONNECTION | IPC 对象状态锁 | — |
-| MEMORY_OBJECT | MemoryObject 可执行状态与 affine WritePermit 账目；permit 在进入 AddressSpace 前移出此锁，Retire 也在 AddressSpace 锁外归还 | — |
-| ADDRESS_SPACE | 用户地址空间 | — |
-| NOTIFICATION | 唯一以 space 为外层的对象锁边 | — |
-| OBJECT_WAIT | Job.wait、ProcessControl、Endpoint、ProcessBuilder、Process.control 回指槽 | — |
-| LIFECYCLE | 生命周期顶级锁（从不出游；被链锁/对象壳在锁内进入） | — |
-| MEMORY_COMPLETION | Commit gate 内填充一次的 PublishedChange 槽、Thread 输出失败终止待办槽 | — |
-| REMOTE_CALL | 固定 hart 请求槽；只在 AddressSpace/Lifecycle Commit 内短发布 | — |
-| HEAP | talc（RankedRawSpinlock 类型级注入；几乎被全部容器锁内获取，故置顶） | — |
-| POOL | 物理帧池（HEAP 与空间锁的内层） | — |
+| DRAIN_GATE | 启动SupplyInputs仲裁 | 启动期输入 |
+| DRAIN_CURSOR | Shell回收阶段 | 移出阶段后锁外推进 |
+| HANDLE_TABLE | capability表 | caller→child按pid递增 |
+| LEAF | console、registry、root、Ready、TimerQueue、Thread等待节点 | 不嵌套来源/目标回调 |
+| JOB_INNER | Job链 | 父→子、jid递增，深度≤JOB_DEPTH_MAX |
+| MAILBOX / CONNECTION | IPC状态 | 电平提示门外执行 |
+| MEMORY_POOL | 页/metadata额度 | 父级退款逐锁、不嵌套Pool |
+| MEMORY_OBJECT | 可执行状态/WritePermit | VM/Views门外取/还 |
+| ADDRESS_SPACE | VmState、ledger/PTE与依赖索引 | — |
+| VM_VIEWS | 实物View/来源 | VM→Views→Backing |
+| BACKING | 物理段索引 | 退款在全部外层门外 |
+| NOTIFICATION | 通知电平 | space可为外层 |
+| OBJECT_WAIT | 对象Source、Builder等状态 | 回调门外 |
+| WAIT_SET | 持久集合 | 不嵌套来源锁 |
+| LIFECYCLE | Shell准入/回执 | 不嵌套VM |
+| PROCESS_MEMBERS | Body成员稳定槽 | Shell→Members |
+| WORK_DEBT | Thread预付ReadyBatch槽 | 取出后入队 |
+| REMOTE_CALL | 固定运输槽 | 发布可在VM门内，执行/回调门外 |
+| MAINTENANCE | 维护队列/Record状态 | 零分配，不取其他锁；IPI在全部门外 |
+| HEAP | talc | — |
+| SYSTEM_SUPPLY | 预清零system ticket | HEAP→O(1)票据消费 |
+| POOL | FramePool库存 | claim后门外清零 |
 
-三类锁的共同纪律「锁内不出游」不变：lifecycle 的出游动作经 TerminationTodo
-解锁后执行；对象电平发布经 `take_completer` 在锁外 `finish_offered`；close 回调在表锁释放
-后执行；drain 完成分支显式先释放 drain_gate 再让 process 强引用
-消亡（close 回调链不进 gate 持有区）。新增锁在构造点声明 rank 即受
-断言保护；需要同秩多持的锁用 `Spinlock::chained` 声明单调 key
-（Job 链锁 = jid、HandleTable 嵌套 = pid）。
+锁内只改本域状态/取待办，Frozen的VM封口与发布在Shell门外；对象提示/finish_offered、cap最后释放和业务close回调均在表/来源锁外。内部完成Source可在来源门内调用maintenance::wake提交队列状态：QUEUE门保护活跃执行根，归还必非最后引用；Idle/Done的潜在退休根由返回值带出全部领域门后销毁，kick亦在门外。VM/Backing/Members旧容量与完整PreparedEntry带出所有外层门后退款，不把Drop中的付款锁当隐含合法反向边。每把新锁在构造点声明rank；Job链和HandleTable同秩多持用chained的单调key。LockGuard显式!Send/!Sync，只能在原hart恢复IRQ与ladder；Lock<T>自身的共享能力仍按T:Send提供。
 
 诊断输出也遵守该边界：持有 `CONNECTION`、`ADDRESS_SPACE` 或更高阶业务锁时不得调用
 console/log；需要报告的 shootdown、attach/close 等诊断先保存不可变结果，释放业务锁后再执行
@@ -164,12 +167,8 @@ best-effort 输出。这样保留 Lock Ladder 的严格降序，不以放松 con
 
 ### reserve/commit/rollback 协议
 
-Job 成员表/子表与 HandleTable 槽位的 marker 事务遵循同一协议四要素：①占位条目对查找/枚举不可见；②各 identity domain 的非零单调 token
-凭据防错认，最大值发行后永久 Exhausted，不回绕；③commit/rollback 按 token 定位，结构性不可消失；HandleTable 跨 owner 发布先经
-`prepare_commit` 形成私有字段的 affine token，最终 `commit_prepared` 不返回可恢复错误；
-④marker 的提交/回滚全部在容器锁内完成，无分配失败路径。`attach_member` 的插入是另一类锁内
-try_reserve 原子操作，失败无副作用，以“失败时条目不可见”闭合。KOID、PID/JID、AddressSpace 与事务 token 共用 `monotonic_id` 的耗尽机制，但各自持独立 allocator，不合并身份域；用户可达构造在发布前返回 ReachLimit。出生块由组装者经 Write 交付，无内核回滚面。
+Job成员/子表与HandleTable槽位以非零单调token保护占位，枚举不越未决占位；每个身份域最大值只发行一次，不回绕。跨owner发布按reserve→锁外写结果→锁外必成资金/成员提交→表commit执行；Claimed authority由Invocation独占，失败restore或在表外release，业务accept/close不在表锁内调用。表被shut后，已经受理的必成责任继续交付，cap发布则返释放事件，由外层owner收束。Job预约回滚按token定位同锁摘完整节点，节点/charge在门外释放，封口Work依赖在退款后交回。KOID、PID/JID、空间与事务各自拥有单调allocator，不合并身份域。
 
 ## sleep
 
-Sleep 复用 WaitContext：ms > 0 时换算为单调 `expires_at`，线程转 Waiting；per-hart `TimerQueue` 到期弹出稳定 token并竞争 Timeout outcome，Sleep action 写回成功后 enqueue。发起 hart 是 timeout owner；对象/终止提前完成会按 token 从 owner queue 注销。跨 hart 注销只删除队列项，不远程重编程 timer。
+Sleep复用Thread等待续体与绝对Deadline；per-hart TimerQueue到期先摘节点、清owner，再锁外提示原Thread/epoch。执行owner在安全点probe并提交Timeout，来源/终止提前完成走同一detach注销timer。跨hart取消只删除匹配epoch，不远程编程timer；没有第二份WaitContext、token消费表或无主周期唤醒。

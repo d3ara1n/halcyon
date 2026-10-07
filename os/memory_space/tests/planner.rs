@@ -1568,7 +1568,7 @@ fn commit_all(
 }
 
 #[test]
-fn stepwise_commit_marks_range_publishing_until_ledger_done() {
+fn stepwise_commit_keeps_fault_dependency_until_synchronization() {
     let mut space = space();
     commit_map(
         &mut space,
@@ -1596,17 +1596,93 @@ fn stepwise_commit_marks_range_publishing_until_ledger_done() {
     assert!(!space.commit_step(&mut committed, 1));
     assert_eq!(
         space.fault_class(BASE + PAGE_SIZE),
-        memory_space::FaultClass::Publishing { target: None }
+        memory_space::FaultClass::Publishing {
+            change: committed.key(),
+            target: None
+        }
     );
     while !space.commit_step(&mut committed, 1) {}
     assert_eq!(
         space.fault_class(BASE + PAGE_SIZE),
-        memory_space::FaultClass::Free
+        memory_space::FaultClass::Publishing {
+            change: committed.key(),
+            target: None
+        }
     );
     let mut batch = space.synchronize(committed);
+    assert_eq!(
+        space.fault_class(BASE + PAGE_SIZE),
+        memory_space::FaultClass::Free
+    );
     while batch.pop_fragment().is_some() {}
     while batch.pop_permit().is_some() {}
     drop(space.complete(batch));
+}
+
+#[test]
+fn committed_map_promises_only_usable_permissions_while_publication_is_pending() {
+    for (protection, allowed) in [
+        (Protection::ReadOnly, [true, false, false]),
+        (Protection::ReadWrite, [true, true, false]),
+        (Protection::ReadExecute, [true, false, true]),
+    ] {
+        let mut space = space();
+        let validated = validate(
+            &space,
+            memory_space::ChangeRequest::Map(anonymous_map(
+                1,
+                BASE + PAGE_SIZE,
+                2,
+                1,
+                1,
+                protection,
+                protection,
+                RegionOwner::AddressSpace,
+            )),
+        )
+        .unwrap();
+        let prepared = reserve_no_permits(&mut space, validated);
+        let mut committed = space.commit(prepared);
+        for ledger_done in [false, true] {
+            if ledger_done {
+                while !space.commit_step(&mut committed, 1) {}
+            }
+            for guard in [BASE, BASE + 3 * PAGE_SIZE] {
+                assert_eq!(
+                    space.fault_class(guard),
+                    FaultClass::Publishing {
+                        change: committed.key(),
+                        target: None
+                    },
+                );
+            }
+            let FaultClass::Publishing {
+                change,
+                target: Some(target),
+            } = space.fault_class(BASE + PAGE_SIZE)
+            else {
+                panic!("usable map promise missing before synchronization");
+            };
+            assert_eq!(change, committed.key());
+            for (access, expected) in [
+                Protection::ReadOnly,
+                Protection::ReadWrite,
+                Protection::ReadExecute,
+            ]
+            .into_iter()
+            .zip(allowed)
+            {
+                assert_eq!(target.permits(access), expected);
+            }
+        }
+        let retiring = space.synchronize(committed);
+        assert!(matches!(space.fault_class(BASE), FaultClass::Guard));
+        assert!(matches!(
+            space.fault_class(BASE + PAGE_SIZE),
+            FaultClass::Mapping { protection: actual, .. } if actual == protection
+        ));
+        drop(space.complete(retiring));
+    }
 }
 
 #[test]

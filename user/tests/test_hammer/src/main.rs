@@ -11,7 +11,10 @@
 extern crate libruntime;
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use libkernel::{
     ipc::{
         capability::Capability,
@@ -24,8 +27,8 @@ use libkernel::{
     preclude::*,
     process,
     shared::{
-        call::SystemCallError,
-        mem::MemoryProtection,
+        call::{SystemCall, SystemCallError},
+        mem::{MemoryMapRequest, MemoryMapResult, MemoryPlacement, MemoryProtection},
         object::{Handle, ObjectSignals},
         proc::{
             JobMemberKind, PROCESS_MAX_THREADS, PROCESS_PAGE_SIZE, ThreadCreateResult,
@@ -394,6 +397,7 @@ fn threaded_memory_churn(gun: Handle) -> ! {
 fn thread_suite(pool: Handle) {
     debug!("hammer target: same-address-space thread suite started");
     stale_translation_reuse();
+    committed_mapping_access();
     fragmented_backing_retire();
     concurrent_tunnel_close(pool);
     tunnel_close_attach(pool);
@@ -1186,6 +1190,118 @@ fn fragmented_backing_retire() {
         "hammer target: fragmented backing retire passed: {} pages",
         PAGES
     );
+}
+
+/// 真实consumer在release cookie后访问Map尾页，不等创建者syscall返回。
+/// 允许命中尚未发布的PTE；内核必须保留原fault并等待对应事务DONE后重试。
+fn committed_mapping_access() {
+    // SDK的affine MappedRegion在DONE后交付；此ABI用例直接观察release cookie，
+    // 以真实正式syscall验证更早的已承诺访问，不给生产封装添加测试专用入口。
+    unsafe fn mapping_call(call: SystemCall, arg0: usize, arg1: usize) -> usize {
+        let error;
+        // SAFETY: 调用点分别证明Map结果槽与Unmap owner；寄存器合同与libkernel一致，
+        // 默认memory effect禁止跨cookie/用户访问重排，内核恢复a0/a1外的用户寄存器。
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a7") call as usize,
+                inlateout("a0") arg0 => error,
+                inlateout("a1") arg1 => _,
+                in("a2") 0usize,
+                in("a3") 0usize,
+                in("a4") 0usize,
+                in("a5") 0usize,
+            );
+        }
+        error
+    }
+
+    struct PublishedMap {
+        result: UnsafeCell<MemoryMapResult>,
+        returned: AtomicBool,
+    }
+    // SAFETY: cookie之外字段只由内核在release发布前写；worker只经acquire
+    // 观察cookie后读这些稳定字段，主线程只在join后解除mapping。
+    unsafe impl Sync for PublishedMap {}
+
+    const COOKIE: u64 = 0x6d61_702d_6661_756c;
+    const BYTES: usize = 260 * PROCESS_PAGE_SIZE;
+    let published = Arc::new(PublishedMap {
+        result: UnsafeCell::new(MemoryMapResult::empty()),
+        returned: AtomicBool::new(false),
+    });
+    let worker_slot = published.clone();
+    let ready = Arc::new(AtomicBool::new(false));
+    let worker_ready = ready.clone();
+    let worker = thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let output = worker_slot.result.get();
+            // SAFETY: result所在Arc地址稳定且8字节对齐，只有末尾cookie经原子访问；
+            // 此处不为并发写入中的整个结果槽创建共享引用。
+            let committed =
+                unsafe { AtomicU64::from_ptr(core::ptr::addr_of_mut!((*output).committed)) };
+            worker_ready.store(true, Ordering::Release);
+            while committed.load(Ordering::Acquire) != COOKIE {
+                core::hint::spin_loop();
+            }
+            let early = !worker_slot.returned.load(Ordering::Acquire);
+            // SAFETY: release cookie已交付完整稳定几何；已承诺RW范围直到join后才Unmap。
+            let base = unsafe { core::ptr::addr_of!((*output).usable_base).read() } as usize;
+            let last = base + BYTES - core::mem::size_of::<u64>();
+            // SAFETY: 位于已承诺usable末页；尚无PTE时应走真实fault续体。
+            assert_eq!(unsafe { (last as *const u64).read_volatile() }, 0);
+            // SAFETY: 同一范围RW，创建者仍持mapping；也覆盖写fault访问合同。
+            unsafe { (last as *mut u64).write_volatile(COOKIE) };
+            early
+        })
+        .expect("committed mapping worker spawn failed");
+    while !ready.load(Ordering::Acquire) {
+        thread::yield_now().expect("committed mapping coordinator yield failed");
+    }
+    let request = MemoryMapRequest::new(
+        BYTES as u64,
+        PROCESS_PAGE_SIZE as u64,
+        PROCESS_PAGE_SIZE as u64,
+        0,
+        published.result.get() as u64,
+        COOKIE,
+        MemoryProtection::ReadWrite,
+        MemoryPlacement::Anywhere,
+    );
+    // SAFETY: request与结果Arc覆盖整个syscall；结果cookie非零且唯一属于本槽。
+    assert_eq!(
+        unsafe { mapping_call(SystemCall::MemoryMap, &request as *const _ as usize, 0) },
+        0,
+        "committed mapping Map failed"
+    );
+    published.returned.store(true, Ordering::Release);
+    let early = take_thread_result(worker.join());
+    // SAFETY: syscall完成后结果全部稳定，worker已结束，本线程独占解除责任。
+    let result = unsafe { published.result.get().read() };
+    let base = result.usable_base as usize;
+    // SAFETY: mapping仍有效，worker已join，无并发访问。
+    assert_eq!(
+        unsafe { ((base + BYTES - 8) as *const u64).read_volatile() },
+        COOKIE
+    );
+    loop {
+        // SAFETY: 本线程拥有刚提交的完整reservation，成功前持续保留其责任。
+        match unsafe {
+            mapping_call(
+                SystemCall::MemoryUnmap,
+                result.reservation_base as usize,
+                result.reservation_bytes as usize,
+            )
+        } {
+            0 => break,
+            error if error == SystemCallError::ObjectBusy as usize => {
+                thread::yield_now().expect("committed mapping Unmap retry failed");
+            }
+            error => panic!("committed mapping Unmap failed: {error}"),
+        }
+    }
+    debug!("hammer target: committed mapping access passed: cookie before return={early}");
 }
 
 fn memory_churn() -> ! {

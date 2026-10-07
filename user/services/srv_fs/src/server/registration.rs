@@ -33,12 +33,9 @@ pub(super) struct RegistrationReplyTask {
     lifetime_charge: Option<Charge>,
     endpoint_charge: Option<Charge>,
     control: Option<RegistrationControl>,
-    lifetime_source: Option<SourceId>,
-    endpoint_source: Option<SourceId>,
-    lifetime_requested: bool,
-    endpoint_requested: bool,
-    lifetime_removing: bool,
-    endpoint_removing: bool,
+    lifetime_source: SourceRegistration,
+    endpoint_source: SourceRegistration,
+
     endpoint_released: bool,
     endpoint_retiring: bool,
     retire_wake: bool,
@@ -88,12 +85,9 @@ impl RegistrationReplyTask {
             lifetime_charge,
             endpoint_charge,
             control: None,
-            lifetime_source: None,
-            endpoint_source: None,
-            lifetime_requested: false,
-            endpoint_requested: false,
-            lifetime_removing: false,
-            endpoint_removing: false,
+            lifetime_source: SourceRegistration::new(),
+            endpoint_source: SourceRegistration::new(),
+
             endpoint_released,
             endpoint_retiring: false,
             retire_wake: false,
@@ -230,31 +224,35 @@ impl RegistrationReplyTask {
         if !outbox.is_admitted() {
             return Ok(Some(outbox.admit(requests)));
         }
-        if self.lifetime_source.is_none() && !self.lifetime_requested {
-            requests.add_source(
-                self.lifetime
-                    .as_ref()
-                    .expect("pending registration lost control Lifetime")
-                    .as_handle(),
-                ObjectSignals::CLOSED,
+        if self.lifetime_source.source().is_none() && !self.lifetime_source.is_installing() {
+            self.lifetime_source.install(
+                requests,
+                SourcePlan::new(
+                    self.lifetime
+                        .as_ref()
+                        .expect("pending registration lost control Lifetime")
+                        .as_handle(),
+                    ObjectSignals::CLOSED,
+                ),
                 KIND_REGISTRATION_LIFETIME,
             )?;
-            self.lifetime_requested = true;
             return Ok(Some(Advance {
                 work_done: 1,
                 step: Step::Runnable,
             }));
         }
-        if self.endpoint_source.is_none() && !self.endpoint_requested {
-            requests.add_source(
-                self.endpoint_observer
-                    .as_ref()
-                    .expect("pending registration lost endpoint observer")
-                    .as_handle(),
-                ObjectSignals::CLOSED,
+        if self.endpoint_source.source().is_none() && !self.endpoint_source.is_installing() {
+            self.endpoint_source.install(
+                requests,
+                SourcePlan::new(
+                    self.endpoint_observer
+                        .as_ref()
+                        .expect("pending registration lost endpoint observer")
+                        .as_handle(),
+                    ObjectSignals::CLOSED,
+                ),
                 KIND_REGISTRATION_ENDPOINT,
             )?;
-            self.endpoint_requested = true;
             return Ok(Some(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -264,7 +262,7 @@ impl RegistrationReplyTask {
     }
 
     fn install<B: RuntimeBackend>(&mut self, id: u64, world: &mut World<B>, now_ns: u64) {
-        if self.lifetime_source.is_none() || self.endpoint_source.is_none() {
+        if self.lifetime_source.source().is_none() || self.endpoint_source.source().is_none() {
             return;
         }
         let pending = self
@@ -328,16 +326,15 @@ impl RegistrationReplyTask {
     ) -> bool {
         let mut retry = false;
         if self.endpoint_retiring || self.stopping {
-            if let Some(source) = self.endpoint_source
-                && !self.endpoint_removing
-            {
-                if requests.remove(source).is_ok() {
-                    self.endpoint_removing = true;
+            if self.endpoint_source.source().is_some() && !self.endpoint_source.is_removing() {
+                if self.endpoint_source.remove(requests).is_ok() {
                 } else {
                     retry = true;
                 }
             }
-            if self.endpoint_source.is_none() && !self.endpoint_requested && !self.endpoint_released
+            if self.endpoint_source.source().is_none()
+                && !self.endpoint_source.is_installing()
+                && !self.endpoint_released
             {
                 self.endpoint_observer = None;
                 self.endpoint_charge = None;
@@ -355,16 +352,13 @@ impl RegistrationReplyTask {
             }
         }
         if self.stopping {
-            if let Some(source) = self.lifetime_source
-                && !self.lifetime_removing
-            {
-                if requests.remove(source).is_ok() {
-                    self.lifetime_removing = true;
+            if self.lifetime_source.source().is_some() && !self.lifetime_source.is_removing() {
+                if self.lifetime_source.remove(requests).is_ok() {
                 } else {
                     retry = true;
                 }
             }
-            if self.lifetime_source.is_none() && !self.lifetime_requested {
+            if self.lifetime_source.source().is_none() && !self.lifetime_source.is_installing() {
                 self.lifetime = None;
                 self.lifetime_charge = None;
             }
@@ -473,8 +467,8 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
                 return Ok(advance);
             }
             if self.pending.is_some()
-                && self.lifetime_source.is_some()
-                && self.endpoint_source.is_some()
+                && self.lifetime_source.source().is_some()
+                && self.endpoint_source.source().is_some()
             {
                 self.install(id, world, input.now_ns());
             }
@@ -557,8 +551,8 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
             && self.outbox.is_none()
             && self.pending.is_none()
             && self.endpoint_released
-            && self.lifetime_source.is_none()
-            && !self.lifetime_requested
+            && self.lifetime_source.source().is_none()
+            && !self.lifetime_source.is_installing()
             && self.lifetime.is_none()
             && wakes_done
             && !self.retire_wake;
@@ -566,10 +560,10 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
             || retry
             || !wakes_done
             || self.retire_wake
-            || self.lifetime_requested
-            || self.endpoint_requested
-            || self.lifetime_removing
-            || self.endpoint_removing
+            || self.lifetime_source.is_installing()
+            || self.endpoint_source.is_installing()
+            || self.lifetime_source.is_removing()
+            || self.endpoint_source.is_removing()
             || self
                 .outbox
                 .as_ref()
@@ -587,19 +581,22 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
     }
 
     fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.lifetime_source.refused(*kind);
+            self.endpoint_source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Source {
                 kind: KIND_REGISTRATION_LIFETIME,
                 ..
             } => {
-                self.lifetime_requested = false;
                 self.close_control(world, service_protocol::TerminalReason::ControlClosed);
             }
             RequestFailure::Source {
                 kind: KIND_REGISTRATION_ENDPOINT,
                 ..
             } => {
-                self.endpoint_requested = false;
                 self.close_control(world, service_protocol::TerminalReason::ControlClosed);
             }
             RequestFailure::Wake { .. } => self.retire_wake = true,
@@ -614,12 +611,10 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
     fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         match kind {
             KIND_REGISTRATION_LIFETIME => {
-                self.lifetime_source = Some(source);
-                self.lifetime_requested = false;
+                self.lifetime_source.registered(kind, source);
             }
             KIND_REGISTRATION_ENDPOINT => {
-                self.endpoint_source = Some(source);
-                self.endpoint_requested = false;
+                self.endpoint_source.registered(kind, source);
             }
             _ => {
                 if let Some(outbox) = self.outbox.as_mut() {
@@ -631,15 +626,11 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationReplyTask {
 
     fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         match kind {
-            KIND_REGISTRATION_LIFETIME if self.lifetime_source == Some(source) => {
-                self.lifetime_source = None;
-                self.lifetime_requested = false;
-                self.lifetime_removing = false;
+            KIND_REGISTRATION_LIFETIME if self.lifetime_source.source() == Some(source) => {
+                self.lifetime_source.unregistered(source);
             }
-            KIND_REGISTRATION_ENDPOINT if self.endpoint_source == Some(source) => {
-                self.endpoint_source = None;
-                self.endpoint_requested = false;
-                self.endpoint_removing = false;
+            KIND_REGISTRATION_ENDPOINT if self.endpoint_source.source() == Some(source) => {
+                self.endpoint_source.unregistered(source);
             }
             _ => {
                 if let Some(outbox) = self.outbox.as_mut() {

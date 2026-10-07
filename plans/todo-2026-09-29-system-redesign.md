@@ -1,12 +1,12 @@
 # 全项目重构设计总纲
 
-状态：**设计轮次 1，目标关系与独立分案正在闭合；未进入代码重构**。本记录拥有全项目重审范围、已确认原则、分案关系与设计接力，不重复定义各分案的实现契约。
+状态：**对象链约定范围已实施、独立审查修复并交付；全项目其他领域按分案继续重审**。首次交付见[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)，后续缺陷修复、C1/C2接通与机制收敛见[审查修复档案](archived/review-2026-10-07-object-chain.md)。本记录拥有全项目范围、已确认原则、分案关系及ideas参考资格，不复制实现契约或验证证据。后续优先入口见COMPASS；不能再从早期“未进入代码重构”恢复施工。
 
 ## 范围与事实
 
 用户明确允许全项目重构，不要求兼容现有 ABI、接口、运行机制、测试布局或其他组件。其他机制也可能删除或重建；它们只能作为现状事实，不能构成新设计必须保留某项负担的理由。长期系统目标、隔离与资源守恒仍须成立，不能以删状态为名丢失实际责任。
 
-基线代码：`master` / `d7d97d4c2947c4acda77bcd50794dd1c6f5b970f`。本轮已有未提交的 capability 设计记录和 COMPASS 更新；本轮不改 Rust、ABI 或测试实现。设计方向不受改动面限制，执行仍按共同契约确定切面，保留其他会话的改动。
+设计启动时基线为`master` / `d7d97d4c2947c4acda77bcd50794dd1c6f5b970f`，当时只形成capability设计和导航；该基线不代表当前实现。此后Rust、共享ABI、实际消费者与验收设施均已在对象链范围迁移。设计方向仍不受兼容限制，施工按共同契约确定切面并保留其他任务改动。
 
 ## 已确认原则
 
@@ -26,16 +26,16 @@
 
 计划中的“重构后设计”须足以确定对外语义、目标模块与类型、拥有关系、状态转换、提交点、并发和锁序、准入与工作界、失败/取消/退出/结果交付，以及迁移删除与验证。仅有概念轮廓或待办列表仍属设计中，不是成型实施方案。跨分案契约链接其唯一拥有篇，不能指向未经审定的 ideas 作为唯一依据。
 
-**当前没有任何整篇 ideas 被登记为完成本轮重设计审定。** 本会话只确认了若干跨专题原则；此前对 ideas 的编辑按“清理或局部目标改写”记录，不据此承诺其他段落正确。本轮不继续用改写 ideas 代替补全 todo。
+**当前没有任何整篇ideas被登记为完成本轮重设计审定。** 下表区分详细计划/代码进展与ideas参考资格；对象链代码已交付不自动审定ideas。本轮修复没有修改ideas，不用线稿清理替代详细计划。
 
 | ideas 范围 | 本轮已确认内容及直接依据 | 尚未闭合的详细设计 | ideas 审定 / 代码状态 |
 |---|---|---|---|
-| `kernel.md` | 内核自主推进、用户无特殊推进调用：[维护分案](todo-2026-09-29-kernel-maintenance-execution.md) | 执行机制已定稿：[维护分案定稿节](todo-2026-09-29-kernel-maintenance-execution.md#执行机制目标设计设计轮次-1已定稿)；剩余 qM/qU 与响应目标定标、内核拼装草图 | 未整篇审定；局部原则已确认 / 未实现 |
-| `object.md`、`kernel-interface.md` | 合法 Close 必成本地释放、完成操作分离；权限模型定稿（(授权对象, rights)、九位标准 rights、最后持有事件、返还预约、Attach 拆分、`os/capability` crate）：[capability 分案权限模型节](todo-2026-09-28-capability-last-reference.md#权限模型目标设计设计轮次-4已定稿) | capability 实现锁序与预约布局；IPC 责任链与 VM 映射由各分案闭合 | 未整篇审定；局部原则已确认 / 未实现 |
-| `task.md`、`bootstrap.md`、`execution-context.md` | 终止后自动回收、PM 政策与观察：[进程分案](todo-2026-09-29-process-automatic-reclamation.md) | 回收根、阶段、终态屏障与发布顺序已定稿；剩余进程出生准入/Start 仲裁、Job、资金账户及 VM 接缝 | 未整篇审定；局部原则已确认 / 未实现 |
-| `mm.md`、`tunnel.md`、`shared-memory.md` | Close 与物理退休分开；其余由本总纲的内存重审范围承接，预算见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | backing/映射 owner、区间修改、结果写回、同步与退款；内存完整分案待形成 | 未审定；清理/局部目标改写 / 未实现 |
-| `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 取消用户驱动的内核清理；相关已确认边界见 capability/维护分案 | 消息与请求模型、在途使用、订阅、取消、结果及执行接缝；完整分案待形成 | 未审定；部分清理/局部目标改写 / 未实现 |
-| `framework.md`、`runnel.md`、`buffer-queue.md` | 上层不承担内核退休推进；相关边界见 capability/维护分案 | 业务任务、线程语言资源、数据面与完成、库边界；完整分案待形成 | 未审定；部分清理/局部目标改写 / 未实现 |
+| `kernel.md` | 自主推进、费用预算与有限服务机会：[维护分案](todo-2026-09-29-kernel-maintenance-execution.md) | 可靠物理执行计量、响应目标与争用优化是条件后续，内核拼装已完成 | ideas未整篇审定 / 对象链维护范围已实现验证 |
+| `object.md`、`kernel-interface.md` | Close与完成分离、对象/rights、最后持有与返还预约：[capability分案](todo-2026-09-28-capability-last-reference.md) | 当前授权接受/安装/运输接缝已闭合；不可达环收集非当前承诺 | ideas未整篇审定 / 对象链权限范围已实现验证 |
+| `task.md`、`bootstrap.md`、`execution-context.md` | 自动回收、出生准入、Start、Job封口与授权：[进程分案](todo-2026-09-29-process-automatic-reclamation.md) | 当前进程/Job/资金/VM接缝已闭合；新设备退休和更强回收保证另行设计 | ideas未整篇审定 / 对象链任务范围已实现验证 |
+| `mm.md`、`tunnel.md`、`shared-memory.md` | backing/View、事务发布/退休、fault与退款：[内存分案](todo-2026-10-01-memory-redesign.md)；费用见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | Sv48/Sv57实际平台接通及测量/证明触发的优化 | ideas未整篇审定 / 当前Sv39对象链范围已实现验证 |
+| `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 内核消息/能力运输、取消及等待：[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)、[等待源分案](todo-2026-10-02-wait-source.md) | 更广RPC业务模型与不可达环收集若扩大承诺需独立闭合 | ideas未整篇审定 / 当前运输和等待范围已实现验证 |
+| `framework.md`、`runnel.md`、`buffer-queue.md` | Runtime来源/取消、Caller及runnel失败清理：[审查修复档案](archived/review-2026-10-07-object-chain.md) | 更广业务任务、语言运行时、数据面与FAL边界按所属分案继续 | ideas未整篇审定 / 对象链实际消费者已接通验证 |
 | `fal.md`、`fs.md`、`service.md` | 本总纲确认整体重审，不以现有 FAL 反向约束底层 | 授权、目录/属性/流、能力导出、发现/发布、provider 边界；完整分案待形成 | 未审定；清理不等于机制重设计 / 未实现 |
 | `device.md` | 特权维护与进程回收分离：[设备分案](todo-2026-09-device-system-design.md) | 资源对象、隔离事实、恢复、跨域协议及运行装配 | 未整篇审定；局部原则与候选方案 / 未实现 |
 | 其余 `notes/ideas/**` | 没有本轮重设计审定记录；旧规范证据可独立核实，不因此认可整个设计 | 由所属分案明确重审范围后补登记 | 未登记审定；不作重构目标依据 |
@@ -60,12 +60,12 @@
 
 | 分案 | 唯一拥有的契约 | 依赖与当前状态 |
 |---|---|---|
-| [capability 与资源释放](todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage 分离，统一 Close，类型化释放接入，运输/消费/回滚 | 设计轮次 4；权限模型定稿，剩余实现门与 IPC/VM 分案衔接 |
-| [内核有界维护执行](todo-2026-09-29-kernel-maintenance-execution.md) | 执行根、准入、单步预算、公平、停驻唤醒、idle 活性、批量分配/回收的共同承载 | 设计轮次 1 定稿；纯逻辑 crate 待实施 |
-| [进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 终止到资源收束的单一 owner，公共完成状态，删除 ProcessDrain 及消费者驱动 | 依赖前两案的释放/执行契约；需与地址空间释放一起闭合 |
-| 映射、backing 与资源来源重审 | allocation identity、完整释放与部分修改、同步屏障、物理/metadata 费用 | 待单独形成完整计划；不是给现有 Tunnel Close 多预留一套重试资源 |
-| IPC、等待与服务调用重审 | 消息/能力运输、请求与回复责任、订阅与终态观察 | 待按独立需求重新定形；当前 Mailbox/Delivery/Lifetime/WaitSet 名称均非保留承诺 |
-| 用户态执行、运行时与 FAL/服务重审 | 语言 owner、任务取消、业务完成、发现/授权/存储/流 | 分领域闭合后形成独立计划；不预先要求适配现有复杂核心 |
+| [capability与资源释放](todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage、Close、运输/消费/回滚 | 对象链范围已交付及审查修复；不可达环收集保持显式边界 |
+| [内核有界维护执行](todo-2026-09-29-kernel-maintenance-execution.md) | 稳定根、准入、预算/机会、公平、停驻唤醒、idle活性 | crate和内核接入已完成；精确物理计量及测量优化为独立后续 |
+| [进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 终止至收束、公共完成、删除用户驱动 | 当前Shell/Body/VM/Job责任链及C1已交付并验证 |
+| [映射/backing重审](todo-2026-10-01-memory-redesign.md) | allocation identity、完整/部分修改、同步、物理/metadata费用 | 当前Sv39链及C2已交付；其他模式实际平台接通另受触发 |
+| IPC、等待与服务调用重审 | 消息/能力运输、请求回复、订阅/终态观察 | 对象链消息与[等待源](todo-2026-10-02-wait-source.md)已交付；更广业务模型仍按独立需求论证 |
+| 用户态执行、运行时与FAL/服务重审 | 语言owner、任务取消、业务完成、发现/授权/存储/流 | 对象链实际消费者已迁移；[运行时分层](todo-2026-09-runtime-kernel-library-separation.md)及FAL领域重审另有范围 |
 
 表中尚未立案部分不构成可执行施工步骤。每份已立案计划独立说明目标、边界、当前事实、依赖、状态和删除门；公共契约只在所属分案定义。独立分案不是“单独改完一个文件就交付”，相关消费者与旧路径在责任链闭合时一并替换。
 
@@ -75,7 +75,7 @@
 
 | 优先主题 | 需要重新回答的问题 | 现有耦合/风险线索与归属 |
 |---|---|---|
-| 权限模型统一 | role 与 kind 重复、rights 位随对象增长、释放多入口：已由 capability 分案定稿：删除 role/facet，(授权对象, rights) + 标准 rights + 最后持有事件 | 分案剩余设计门闭合后施工；ideas `object.md` 待按该节回填线稿 |
+| 权限模型统一 | 对象/rights及最后持有已由capability分案定稿并接入 | 当前对象链范围已交付；ideas `object.md`未因此自动审定 |
 | authority、持有与观察 | 创建/启动权、普通使用、最后引用、终态观察分别应保活什么？role 是独立授权关系还是表示补偿？ | ThreadControl WAIT-only 与 Created 放弃、Sender/Lifetime/Delivery；capability 分案拥有，不能把现状计数写成默认保留契约 |
 | 内存对象、映射与安全释放 | backing、映射 owner、访问借用、通信参与方应怎样组合？完整释放与部分区间修改如何分开？ | Tunnel 与本地 lease 绑定、按地址区间重建 owner；内存/IPC 分案共同闭合，不能只移走 Close 的错误返回 |
 | 操作提交、结果交付与取消 | 操作被接受、效果提交、结果可取得和安全完成分别是什么？调用线程消散后谁拥有结果？ | Map cookie/UserWriteLease/线程 join 与结果记录联动，RPC 超时与未知结果；按对应操作领域设计，不预设一种万能事务状态机 |
@@ -125,19 +125,19 @@
 
 | 责任链 | 组成 | 就绪状态 |
 |---|---|---|
-| 对象持有与释放 | [capability](todo-2026-09-28-capability-last-reference.md#施工进度)、[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | capability crate 就绪未接入；维护执行设计定稿、`os/maintenance` crate 就绪未接入；进程回收结构定稿（轮次 1），各 owner 剩余门未闭合 |
-| 内存 | [内存重构](todo-2026-10-01-memory-redesign.md)：backing/view Map/Unmap、funding、Tunnel Attach 拆分 | 设计轮次 2 定稿，crate 侧收尾、vm 拼装草图已写；**内核编译自 page_table owner 改动起中断（用户确认），随本链与 vm 整体重写恢复** |
-| IPC | Receive/Send/SendOnce、Delivery/Lifetime、等待源 | 分案待立 |
+| 对象持有与释放 | [capability](todo-2026-09-28-capability-last-reference.md#当前接力)、[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 当前范围整体接入、旧路径删除及审查修复已完成；后续边界由各案当前入口拥有 |
+| 内存 | [内存重构](todo-2026-10-01-memory-redesign.md#当前范围与后续)：backing/View、Map/Unmap、funding、fault、Attach | 当前Sv39已交付并验证；原编译中断已关闭，其他分页模式实际平台接通另受触发 |
+| IPC | Receive/Send/SendOnce、Delivery/Lifetime、[等待源](todo-2026-10-02-wait-source.md) | 对象链约定消息/等待消费者已接入；更广业务重审不冒充当前链未接通 |
 
 本表只登记组成与就绪状态，进度与证据归各分案。
 
 ## 当前接力
 
-已确认必成本地 Close、完成操作分离与内核自主推进，均由所属计划持有。已纠正设计依据：施工和重构期间以 todo 中的详细目标设计为准；ideas 默认不可据以决定目标，参考资格只由本篇审定登记授予。当前仅有局部原则确认，没有整篇 ideas 完成本轮审定，也没有代码重构完成。
+对象链及其独立审查修复已收口；本总纲保持全项目剩余领域入口，不能把“无整篇ideas审定”解释为代码未实现。详细契约仍由各分案及最终修复记录拥有，ideas资格不因交付自动扩大。
 
-下一步：直接在各分案补全 authority/观察、映射/释放、操作结果以及 UnitOfWork 的成型设计，闭合关键选择和实现门；同步更新本篇审定登记。未经审定的 ideas 仅供定位旧概念，不据此补全或约束新方案。本轮不继续编辑 ideas 正文，代码和 impls 仍按实际实现描述现状。
+下一步按[性能专题](todo-2026-10-01-lock-performance.md)先取得实际争用/延迟证据再选择优化；运行时分层、启动/设备与FAL领域重审依各自范围和COMPASS顺序继续。后续若产生代码变更，须以该责任链的新固定提交/序列登记独立Review；本轮修复仍未提交。当前没有要求补做对象链旧拼装或恢复编译的接力。
 
-## 本次设计文档交付检查
+## 初次设计文档交付检查（历史，不是当前代码验收）
 
 - 重构分支：`refactor/system-redesign`，从上述基线创建；本次提交仅包含设计记录、线稿清理、审定登记及文档导航/协作规则，不包含代码或 ABI 实施。
 - 结构检查：已确认原则、候选方案与施工前未决项分别表达；ideas 的清理没有升格为设计审定，代码与 impls 没有提前改写为目标已实现。维护执行与进程回收各有独立记录，公共契约不要求调用者持续推进。

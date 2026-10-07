@@ -25,9 +25,9 @@ pub fn copy_from_user(space: &mut AnySpace, dst: &mut [u8], src: usize) -> Resul
     if dst.len() > MAX_USER_ACCESS {
         return Err(AccessError::BadRange);
     }
-    space.check_range(src, dst.len(), false)?;
+    prepare_direct_access(space, src, dst.len(), false)?;
     // SAFETY: 调用方在空间锁内持有 space，translate 已逐页确认 U|R；
-    // guard 内不调度，目标为独占内核缓冲。
+    // 已同步本地翻译，guard 内不调度，目标为独占内核缓冲。
     let _sum = unsafe { SumGuard::open() };
     unsafe { copy_bytes(src, dst.as_mut_ptr() as usize, dst.len()) };
     Ok(())
@@ -81,8 +81,8 @@ pub fn copy_to_user(space: &mut AnySpace, dst: usize, src: &[u8]) -> Result<(), 
     if src.len() > MAX_USER_ACCESS {
         return Err(AccessError::BadRange);
     }
-    space.check_range(dst, src.len(), true)?;
-    // SAFETY: 空间锁排除映射变更，已逐页确认 U|W；guard 内不调度。
+    prepare_direct_access(space, dst, src.len(), true)?;
+    // SAFETY: 空间锁排除映射变更，已逐页确认 U|W 并同步本地翻译；guard 内不调度。
     let _sum = unsafe { SumGuard::open() };
     unsafe { copy_bytes(src.as_ptr() as usize, dst, src.len()) };
     Ok(())
@@ -93,8 +93,8 @@ pub(crate) fn publish_u64(space: &mut AnySpace, dst: usize, value: u64) -> Resul
     if !dst.is_multiple_of(core::mem::align_of::<u64>()) {
         return Err(AccessError::BadRange);
     }
-    space.check_range(dst, core::mem::size_of::<u64>(), true)?;
-    // SAFETY: 对齐/翻译/同空间锁保证 U|W 稳定；此字段 ABI 规定仅原子访问。
+    prepare_direct_access(space, dst, core::mem::size_of::<u64>(), true)?;
+    // SAFETY: 对齐/本地翻译同步/同空间锁保证 U|W 稳定；此字段 ABI 规定仅原子访问。
     let _sum = unsafe { SumGuard::open() };
     // SAFETY: 不能为合法用户 VA 0 构造 AtomicU64 引用。RVWMO 的 release
     // store 以 FENCE RW,W + 对齐 SD 实现，其他条件由上述校验和空间锁保证。
@@ -107,6 +107,21 @@ pub(crate) fn publish_u64(space: &mut AnySpace, dst: usize, value: u64) -> Resul
             options(nostack),
         );
     }
+    Ok(())
+}
+
+/// 同空间 SUM 直访的共同前置；调用者持有空间锁，随后访问期间不让出执行。
+fn prepare_direct_access(
+    space: &mut AnySpace,
+    va: usize,
+    len: usize,
+    writable: bool,
+) -> Result<(), AccessError> {
+    space.check_range(va, len, writable)?;
+    // SAFETY: 当前 S 态持空间锁，SFENCE.VMA 同步本 hart 对此前 PTE 写入的观察。
+    // 事务每步可先发布 PTE 再推进最终 epoch，不能用最终 epoch 判断此处免 fence。
+    // 全量 fence 是固定一条指令；默认 memory effect 阻止编译器把直访移到它之前。
+    unsafe { core::arch::asm!("sfence.vma", options(nostack)) };
     Ok(())
 }
 

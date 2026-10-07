@@ -66,7 +66,6 @@ pub(crate) struct ProcessShell {
     pub(crate) parent_pid: Pid,
     pub(crate) job: Weak<Job>,
     pub(crate) record: WorkRecord,
-    pub(crate) self_ref: Spinlock<Weak<Self>>,
     ingress: AtomicU64,
     state: Spinlock<ShellState>,
     pub(crate) reclaim: Spinlock<ReclaimState>,
@@ -150,7 +149,6 @@ impl ProcessShell {
             parent_pid,
             job,
             record: WorkRecord::new(pool.maintenance_account().clone()),
-            self_ref: Spinlock::new(ranks::LEAF, Weak::new()),
             ingress: AtomicU64::new(0),
             state: Spinlock::new(
                 ranks::LIFECYCLE,
@@ -174,7 +172,6 @@ impl ProcessShell {
             _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        *shell.self_ref.lock() = Arc::downgrade(&shell);
         let construction = ConstructionLease {
             shell: shell.clone(),
         };
@@ -351,10 +348,10 @@ impl ProcessShell {
     fn wake(ingress: Option<WakeToken>, settle: Option<WakeToken>) {
         let ready = ingress.is_some() || settle.is_some();
         if let Some(token) = ingress {
-            mt::wake(token);
+            drop(mt::wake(token));
         }
         if let Some(token) = settle {
-            mt::wake(token);
+            drop(mt::wake(token));
         }
         if ready {
             mt::kick();
@@ -496,7 +493,7 @@ impl ProcessShell {
             (self.ready_wake(&mut state), freeze)
         };
         if let Some(wake) = wake {
-            mt::wake(wake);
+            drop(mt::wake(wake));
             mt::kick();
         }
         self.finish_freeze(freeze);
@@ -549,7 +546,7 @@ impl ProcessShell {
                 let active = vm.close_entry();
                 retire.seal_exit(active);
                 if active != 0 {
-                    let _ = crate::registry::try_ipi_slots(active);
+                    let _ = crate::runtime_stop::notify_slots(active);
                 }
             }
         }
@@ -705,7 +702,7 @@ impl ProcessShell {
             self.ready_wake(&mut state)
         };
         if let Some(wake) = wake {
-            mt::wake(wake);
+            drop(mt::wake(wake));
             mt::kick();
         }
     }
@@ -718,7 +715,7 @@ impl ProcessShell {
             self.ready_wake(&mut state)
         };
         if let Some(wake) = wake {
-            mt::wake(wake);
+            drop(mt::wake(wake));
             mt::kick();
         }
     }

@@ -19,17 +19,24 @@ use crate::{
     uaccess,
 };
 
+#[derive(Clone, Copy)]
+enum Return {
+    WaitResult,
+    KernelCompletion,
+    RetryFault { cause: usize, address: usize },
+}
+
 pub struct WaitPlan {
     source: Option<Arc<dyn ObservationSource>>,
     interest: ObjectSignals,
     expires_at: Option<u64>,
-    kernel_completion: bool,
+    returns: Return,
 }
 impl WaitPlan {
     /// 内核 Work 消费同一完成来源；节点仍由实际等待 owner 持有与摘除。
     pub(crate) fn into_completion(self) -> Arc<dyn ObservationSource> {
         assert!(
-            self.kernel_completion,
+            matches!(self.returns, Return::KernelCompletion),
             "non-completion plan used by kernel work"
         );
         self.source.expect("completion source missing")
@@ -40,7 +47,20 @@ impl WaitPlan {
             source: Some(source),
             interest: ObjectSignals::DONE,
             expires_at: None,
-            kernel_completion: true,
+            returns: Return::KernelCompletion,
+        }
+    }
+
+    pub(crate) fn retry_fault(
+        source: Arc<dyn ObservationSource>,
+        cause: usize,
+        address: usize,
+    ) -> Self {
+        Self {
+            source: Some(source),
+            interest: ObjectSignals::DONE,
+            expires_at: None,
+            returns: Return::RetryFault { cause, address },
         }
     }
 }
@@ -58,7 +78,7 @@ pub(crate) struct Entry {
     expires_at: Option<u64>,
     source_attached: bool,
     timer_prepared: bool,
-    kernel_completion: bool,
+    returns: Return,
 }
 
 impl Drop for Entry {
@@ -109,7 +129,7 @@ pub fn prepare(thread: &Thread, request_ptr: usize) -> Result<WaitStart, SystemC
         source: Some(source),
         interest: request.signals,
         expires_at: crate::clock::deadline_ticks(request.deadline)?,
-        kernel_completion: false,
+        returns: Return::WaitResult,
     };
     match probe(plan.source.as_deref(), plan.interest, plan.expires_at)? {
         Some(signals) => Ok(WaitStart::Ready(signals)),
@@ -124,7 +144,7 @@ pub fn sleep_plan(deadline: Deadline) -> Result<WaitPlan, SystemCallError> {
         expires_at: Some(
             crate::clock::deadline_ticks(deadline)?.ok_or(SystemCallError::IllegalArgument)?,
         ),
-        kernel_completion: false,
+        returns: Return::WaitResult,
     })
 }
 
@@ -191,7 +211,7 @@ pub(crate) fn install(owner: AdmittedThread, plan: WaitPlan) {
         expires_at: plan.expires_at,
         source_attached: false,
         timer_prepared: false,
-        kernel_completion: plan.kernel_completion,
+        returns: plan.returns,
     });
     let state = entry(&owner)
         .as_mut()
@@ -236,7 +256,7 @@ pub(crate) fn resume(owner: AdmittedThread, slot: usize) -> Option<AdmittedThrea
         body.members.take_pending(owner.member(), epoch);
     }
     let result = probe(state.source.as_deref(), state.interest, state.expires_at);
-    let kernel_completion = state.kernel_completion;
+    let returns = state.returns;
     match result {
         Ok(None) => {
             let shell = owner.process.clone();
@@ -254,13 +274,27 @@ pub(crate) fn resume(owner: AdmittedThread, slot: usize) -> Option<AdmittedThrea
         }
         result => {
             detach(&owner);
-            set_result(
-                &owner,
-                result.map(|signals| signals.expect("completed probe lost result")),
-            );
-            if kernel_completion {
-                // SAFETY: 当前执行 owner 独占保存现场；内部完成返回 syscall 的单位值。
-                unsafe { &mut *owner.frame_ptr() }.x[11] = 0;
+            let result = result.map(|signals| signals.expect("completed probe lost result"));
+            match returns {
+                Return::WaitResult => set_result(&owner, result),
+                Return::KernelCompletion => {
+                    set_result(&owner, result);
+                    // SAFETY: 当前执行owner独占现场，内部完成返回单位值。
+                    unsafe { &mut *owner.frame_ptr() }.x[11] = 0;
+                }
+                Return::RetryFault { cause, address } => {
+                    if result.is_err() {
+                        owner.process.freeze_and_seal(
+                            erhino_shared::proc::TerminationCause::Faulted,
+                            erhino_shared::proc::TerminationDetail::fault(
+                                owner.member().tid(),
+                                erhino_shared::proc::ProcessFaultCode::from_scause(cause),
+                                address as u64,
+                            ),
+                        );
+                    }
+                    // 原指令续体：不改sepc，不伪造syscall返回寄存器。
+                }
             }
             Some(owner)
         }

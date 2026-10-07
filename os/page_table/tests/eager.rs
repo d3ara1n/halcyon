@@ -108,6 +108,36 @@ fn selects_largest_legal_leaf_for_each_segment() {
 }
 
 #[test]
+fn rejects_invalid_geometry_and_encoding_before_allocating_or_publishing() {
+    let mut tables = Tables::new(0);
+    {
+        let mut mapper = EagerMapper::<_, 3>::new(&mut tables, FrameNumber(0));
+        for invalid in [
+            flags::V,
+            flags::V | flags::W,
+            flags::V | flags::R | (1 << 54),
+        ] {
+            assert_eq!(
+                mapper.map_range(Vpn(0), 1, Ppn(0), invalid),
+                Err(MapError::InvalidFlags)
+            );
+        }
+        for (vpn, count, ppn) in [
+            (Vpn(1 << 27), 1, Ppn(0)),
+            (Vpn(usize::MAX), 2, Ppn(0)),
+            (Vpn(0), 1, Ppn(page_table::MAX_PPN)),
+        ] {
+            assert_eq!(
+                mapper.map_range(vpn, count, ppn, flags::USER_DATA),
+                Err(MapError::OutOfRange)
+            );
+        }
+    }
+    assert_eq!(tables.tables.len(), 1);
+    assert!(tables.mapped(Vpn(0)).is_none());
+}
+
+#[test]
 fn preserves_a_matching_coarse_leaf_for_an_idempotent_subrange() {
     let mut tables = Tables::new(0);
     {

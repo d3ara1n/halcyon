@@ -29,6 +29,8 @@ pub struct Thread {
     ready_batch: Spinlock<Option<ReadyBatch>>,
     output_fault: AtomicBool,
     fault_address: AtomicUsize,
+    /// 同一翻译事实每hart最多修复一次，避免跨hart迁移使无进展重试循环。
+    fault_repair: UnsafeCell<Option<(crate::context::FaultRepair, u64)>>,
     /// 到期/取消在队列锁内摘链，载荷的 Thread 强根与 epoch 锁外交出。
     pub(crate) timer: timer_queue::TimerNode<crate::sched::TimerDelivery>,
     /// 唯一等待 owner 随 AdmittedThread 移动，提示方不访问续体或节点。
@@ -58,6 +60,35 @@ impl Drop for ThreadRelease {
 unsafe impl Sync for Thread {}
 
 impl Thread {
+    /// # Safety
+    /// 调用者是该Thread唯一执行owner；不得与另一个现场访问并发。
+    pub(crate) unsafe fn record_fault_repair(&self, repair: crate::context::FaultRepair) -> bool {
+        // SAFETY: 执行owner独占此续体，UnsafeCell未向观察者暴露。
+        let previous = unsafe { &mut *self.fault_repair.get() };
+        let bit = 1u64 << crate::hart::current().slot();
+        match previous {
+            Some((facts, attempted)) if *facts == repair => {
+                if *attempted & bit != 0 {
+                    false
+                } else {
+                    *attempted |= bit;
+                    true
+                }
+            }
+            _ => {
+                *previous = Some((repair, bit));
+                true
+            }
+        }
+    }
+
+    /// # Safety
+    /// 调用者是该Thread唯一执行owner。
+    pub(crate) unsafe fn clear_fault_repair(&self) {
+        // SAFETY: 同record_fault_repair的执行归属，不保留借用。
+        unsafe { *self.fault_repair.get() = None };
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "出生阶段分别提供稳定身份、冻结执行环境和预付责任"
@@ -90,6 +121,7 @@ impl Thread {
             ready_batch: Spinlock::new(ranks::WORK_DEBT, Some(batch)),
             output_fault: AtomicBool::new(false),
             fault_address: AtomicUsize::new(0),
+            fault_repair: UnsafeCell::new(None),
             timer: timer_queue::TimerNode::new(),
             wait_entry: UnsafeCell::new(None),
             wait_node: super::super::wait_source::WaitNode::new(),

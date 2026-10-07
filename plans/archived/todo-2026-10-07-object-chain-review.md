@@ -1,6 +1,6 @@
 # 对象链交付批次：独立 Review 与机制收敛
 
-状态：**待执行**。用户明确决定本次只准备切面完整的审查任务并提交，下次再直接并行委派多个 reviewer。本次未启动这些 reviewer，不含独立审查结论。形成报告后，修复/复核唯一入口转到 `review-2026-10-07-object-chain.md`，本计划登记报告并归档。
+状态：**已执行，审查任务归档**。固定目标为 `2aee0286dae3c3a8118f8d24f96e79a35f337c92`；五个独立 reviewer 与主代理组合审阅已完成。发现、机制收敛取舍及修复/复核的唯一入口为 [审查报告](review-2026-10-07-object-chain.md)。本篇保留当时任务范围与委派合同，不继续承载发现处置。
 
 ## 固定审查目标
 
@@ -10,18 +10,18 @@
 git log --diff-filter=A -1 --format=%H -- plans/todo-2026-10-07-object-chain-review.md
 ```
 
-下次主代理先取得上述完整哈希，记入审查报告及每份委派 context；使用独立只读 checkout/worktree 固定该树，保留其他任务工作树改动。审查准备及运行均按 [REVIEW](REVIEW.md) 与 AGENTS。
+执行协议：主代理先取得上述完整哈希，记入审查报告及每份委派 context；使用独立只读 checkout/worktree 固定该树，保留其他任务工作树改动。审查准备及运行均按 [REVIEW](../REVIEW.md) 与 AGENTS。
 
 - 内核拼装前比较基线：`253c04acc25799dd8f930ed883f1e760131924bc`。
 - 中途施工检查点：`4b6e4c14e1af7ae94cc1f5a56f46771f8e8c6f21`，当时不可编译，不是本批次完整比较起点。
 - 提交树全貌是事实；基线→目标 diff 用于定位变化，不能只读 diff 或只读已有检查点之后的变化。目标提交应包含新增生产文件、纯逻辑依赖及消费者，不漏 untracked 转新增内容。
-- 实施/验证：[交付档案](archived/todo-2026-10-01-object-chain-kernel-integration.md#最终结构检查完成条件与后续触发)。设计分案仅用于契约与取舍；`notes/impls/` 用于现状导航，与代码冲突时记录文档 finding。未审定 ideas 不作为目标真值。
+- 实施/验证：[交付档案](todo-2026-10-01-object-chain-kernel-integration.md#最终结构检查完成条件与后续触发)。设计分案仅用于契约与取舍；`notes/impls/` 用于现状导航，与代码冲突时记录文档 finding。未审定 ideas 不作为目标真值。
 
 本批次范围：角色 capability/授权与消费、Process Shell/Body/Builder/Thread/Job 自动回收、来源/消息/独立值/容器/scratch 实际付款、VM/backing/View/普通 Tunnel、持久等待/Runtime/Assembly/Caller、真实服务/监督，以及采样费用与有限服务机会。
 
 TRANSFER 环收集、可靠物理执行计量/精确 CPU 份额/WCET、terminal 诊断栈及全分配点注入没有承诺。FAL 的本次授权/运输/装配接缝纳入审查，FAL 全面重设计仍为独立任务。上述非目标不能用来忽略本次保证所必需的失败、取消、退款、活性与隔离。
 
-## 下次直接执行的方式
+## 审查执行协议
 
 1. 固定目标提交，读本计划、交付档案的最终契约/完成条件、KNOWN_ISSUES、REVIEW；记录实际可用日志和构建环境。
 2. 给 R1–R5 各委派一个 `reviewer`，使用干净上下文，`inheritConversation: false`；cwd 指向固定 checkout。五个切面可以并行，没有先审谁才能开始另一个的依赖。

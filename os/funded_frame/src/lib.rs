@@ -276,23 +276,14 @@ where
     C: QuotaCredit,
     P: PhysicalClaim,
 {
-    /// 将单一物理 extent 切成左右两个单 extent owner；失败保持原 owner 不变。
-    pub fn split_single(
-        mut self,
-        left_pages: usize,
-    ) -> Result<(Self, Self), DecomposeError<C::Error>> {
-        if left_pages == 0 || left_pages >= self.pages {
-            return Err(DecomposeError::InvalidSplit);
-        }
-        let right = self.split_off(left_pages)?;
-        Ok((self, right))
-    }
-
     /// 拆成物理 claim 与 credit 两个独立 owner（所有权移交，不归还任何一方）。
     /// 调用者此后分别承担两份责任，可经 [`Self::from_single`] 重新配对。
     pub fn into_single(mut self) -> (P, C) {
         let claim = self.claims[0].take().expect("funded extent slot is empty");
-        let credit = self.credit.take().expect("merged funded donor has no credit");
+        let credit = self
+            .credit
+            .take()
+            .expect("merged funded donor has no credit");
         self.claim_count = 0;
         self.pages = 0;
         (claim, credit)

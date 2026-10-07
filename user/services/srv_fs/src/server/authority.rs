@@ -16,9 +16,8 @@ pub(super) struct AuthorityTask {
     info: Option<service_protocol::AuthorityInfo>,
     publication: AuthorityPublication,
     outbox: Option<Outbox>,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     stopping: bool,
     encoded: bool,
 }
@@ -45,9 +44,8 @@ impl AuthorityTask {
             info: None,
             publication,
             outbox,
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             stopping: false,
             encoded: false,
         }
@@ -107,17 +105,14 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
                 outbox.stop(world);
             }
             self.sender = None;
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Runnable,
                 });
             }
-            if self.source.is_none() && !self.requested {
+            if self.source.source().is_none() && !self.source.is_installing() {
                 if self.info.take().is_some() {
                     world
                         .provider
@@ -132,16 +127,18 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
                 self.lifetime = None;
                 self.charge = None;
             }
-        } else if self.source.is_none() && !self.requested {
-            requests.add_source(
-                self.lifetime
-                    .as_ref()
-                    .expect("authority lost Lifetime")
-                    .as_handle(),
-                ObjectSignals::CLOSED,
+        } else if self.source.source().is_none() && !self.source.is_installing() {
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    self.lifetime
+                        .as_ref()
+                        .expect("authority lost Lifetime")
+                        .as_handle(),
+                    ObjectSignals::CLOSED,
+                ),
                 KIND_AUTHORITY_LIFETIME,
             )?;
-            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -194,8 +191,8 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
         Ok(Advance {
             work_done: 1,
             step: if self.stopping {
-                if self.source.is_none()
-                    && !self.requested
+                if self.source.source().is_none()
+                    && !self.source.is_installing()
                     && self.outbox.as_ref().is_none_or(Outbox::is_complete)
                 {
                     Step::Complete
@@ -209,12 +206,15 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
     }
 
     fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Source {
                 kind: KIND_AUTHORITY_LIFETIME,
                 ..
             } => {
-                self.requested = false;
                 self.stopping = true;
                 if matches!(self.publication, AuthorityPublication::Root) {
                     world.failed = true;
@@ -235,8 +235,7 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
             }
             return;
         }
-        self.source = Some(source);
-        self.requested = false;
+        self.source.registered(kind, source);
         if self.stopping {
             return;
         }
@@ -272,10 +271,8 @@ impl<B: RuntimeBackend> Task<World<B>> for AuthorityTask {
     }
 
     fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
-        if kind == KIND_AUTHORITY_LIFETIME && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        if kind == KIND_AUTHORITY_LIFETIME && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         } else if let Some(outbox) = self.outbox.as_mut() {
             outbox.unregistered(world, kind, source);
         }

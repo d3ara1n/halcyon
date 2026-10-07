@@ -7,6 +7,18 @@
 
 use crate::fp::FpState;
 
+/// 本地翻译修复的事实签名；Thread另存本组事实已修复的hart位图。
+/// 事实改变才开启下一组修复，不改变UserContext的汇编布局。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FaultRepair {
+    pub(crate) pc: u64,
+    pub(crate) address: usize,
+    pub(crate) cause: usize,
+    pub(crate) translation: page_table::Mapped,
+    pub(crate) epoch: u64,
+    pub(crate) change: Option<memory_space::ChangeKey>,
+}
+
 /// 用户持久现场：GPR、sepc 与嵌入的 FP 状态。
 ///
 /// 访问纪律：帧只在线程挂起于某 hart 期间被该 hart 访问（汇编存取、

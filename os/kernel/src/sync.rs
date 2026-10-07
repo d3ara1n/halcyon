@@ -18,6 +18,7 @@
 use core::{
     cell::UnsafeCell,
     fmt,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -33,10 +34,9 @@ pub struct Rank(pub u32);
 pub mod ranks {
     use super::Rank;
 
-    /// 收束批次仲裁：一次性覆盖最广（JobInner/lifecycle/对象/表/空间），
-    /// 恒最先获取。
+    /// 启动储备输入仲裁，先于其余领域锁。
     pub const DRAIN_GATE: Rank = Rank(0);
-    /// HandleTable 收束游标。
+    /// Shell 回收阶段；阶段移出后在锁外推进。
     pub const DRAIN_CURSOR: Rank = Rank(10);
     /// HandleTable：caller→child 嵌套沿 pid 递增（chained）。
     pub const HANDLE_TABLE: Rank = Rank(100);
@@ -71,9 +71,7 @@ pub mod ranks {
     /// 授权对象最后消散的单向寿命发布，不反向访问业务容器。
     /// 持久就绪集合；来源和此目标状态锁不得嵌套。
     pub const WAIT_SET: Rank = Rank(550);
-    /// Commit 后完成槽：只在 lifecycle gate 内填充一次，完成方锁外取走后
-    /// 才进入 AddressSpace 收束。
-    /// Commit 后特权 work debt 的固定槽；取出后才进入业务容器锁。
+    /// Thread 出生预付的 ReadyBatch 槽，取出后才进入就绪队列。
     pub const WORK_DEBT: Rank = Rank(640);
     /// Remote Call 固定槽；Commit 可在 AddressSpace → lifecycle 内发布。
     /// 目标执行与完成回调均在锁外。
@@ -386,11 +384,33 @@ pub type SpinlockGuard<'a, T> = LockGuard<'a, RawTicketLock, T>;
 unsafe impl<R: RawLock + Sync, T: Send> Sync for Lock<R, T> {}
 unsafe impl<R: RawLock + Send, T: Send> Send for Lock<R, T> {}
 
-/// [`Lock`] 的守卫，drop 时弹出 ladder、释放锁并恢复中断状态。
+/// [`Lock`] 的 hart 私有守卫，只能在取得锁的 hart 使用与析构。
+/// drop 时弹出 ladder、释放锁并恢复本地中断状态；守卫既不 Send 也不 Sync。
 pub struct LockGuard<'a, R: RawLock, T> {
     lock: &'a Lock<R, T>,
     state: InterruptState,
+    _hart_local: PhantomData<*mut ()>,
 }
+
+// 直接约束生产类型的 auto trait：若守卫错误获得 Send/Sync，probe 的类型参数
+// 将出现两个候选而不能推断。Lock 本身仍允许共享 Send 的非 Sync 载荷。
+const _: () = {
+    trait AmbiguousIfSend<A> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    trait AmbiguousIfSync<A> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    let _ = <SpinlockGuard<'static, ()> as AmbiguousIfSend<_>>::probe;
+    let _ = <SpinlockGuard<'static, ()> as AmbiguousIfSync<_>>::probe;
+    let _ = <SpinlockGuard<'static, core::cell::Cell<u64>> as AmbiguousIfSync<_>>::probe;
+    fn shared_lock<T: Send + Sync>() {}
+    let _ = shared_lock::<Spinlock<core::cell::Cell<u64>>>;
+};
 
 impl<T> Lock<RawTicketLock, T> {
     pub const fn new(rank: Rank, value: T) -> Self {
@@ -431,7 +451,11 @@ impl<R: RawLock, T> Lock<R, T> {
             self.chain_key,
             Some(core::panic::Location::caller()),
         );
-        LockGuard { lock: self, state }
+        LockGuard {
+            lock: self,
+            state,
+            _hart_local: PhantomData,
+        }
     }
 
     /// 尝试获取锁，失败返回 `None`（同样关中断，失败立即恢复）。
@@ -444,7 +468,11 @@ impl<R: RawLock, T> Lock<R, T> {
                 self.chain_key,
                 Some(core::panic::Location::caller()),
             );
-            Some(LockGuard { lock: self, state })
+            Some(LockGuard {
+                lock: self,
+                state,
+                _hart_local: PhantomData,
+            })
         } else {
             restore_interrupts(state);
             None

@@ -168,11 +168,11 @@ impl SchedDomain {
     fn wake_one(&self) {
         let mask = self.idle_mask.load(Ordering::SeqCst);
         if mask != 0 {
-            let failed = crate::registry::try_ipi_slots(mask);
+            let failed = crate::runtime_stop::notify_slots(mask);
             if failed != 0 {
                 warn!(
                     Hart,
-                    "Ready-queue doorbell failed for hart slot mask {failed:#x}; work remains queued"
+                    "Ready-queue doorbell failed for hart slot mask {failed:#x}; runtime stop requested"
                 );
             }
         }
@@ -651,7 +651,7 @@ pub(crate) fn reap(t: AdmittedThread) {
 }
 
 /// idle：在本域登记空闲位 → 双重检查就绪工作 → 按期限表 arm（无期限则卸载）
-/// → wfi。醒来（SIE=0，不 trap）清门铃后回主循环重查待办。
+/// → wfi。醒来（SIE=0，不trap）先吸收停止事实，再清门铃并复检待办。
 fn idle() {
     crate::runtime_stop::check();
     let domain = current_domain();

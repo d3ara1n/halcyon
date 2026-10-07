@@ -32,11 +32,13 @@
 
 来源持久；没有 armed/generation/Rearm、运行体接收缓存/notified/wait_item 或独立 run。Add 先付 source/输入额度、pin timer 与有序表节点，再调用实际来源注册并必成 adopt。Remove 先核 SourceId 所属任务，未知/已删项不调用共享 Remove；失败保留同一条目、额度与 timer 重试。Finalizing 等自己的来源注销成功后才归还任务；同一集合其他 Runtime 不受正常任务失败或正常 close 影响。
 
-[`WorkQueue`](../../user/libraries/libexecution/src/work_queue.rs) 使用预付任务槽和纯任务推进。Finalizing FIFO 复用原槽链指针，新完成追加尾部，每次头项同时选择一份来源注销、任务退休或等待源回执。Runtime 将它与独立来源 retry timer 交替，不再按任务/来源 key 扫描回绕；blocked 回到尾部，持续新准入不能插队。元工作计数防全部阻塞时自旋；业务期限与元重试期限分别持节点，不互相改写。成功 advance 进入 Gate 前、来源注册/拒绝/注销回调后同步任务期限，取消期限不会在后续 Gate 时制造超时。Gate 的 pending 输入从实际槽查询，无重复 has_pending 真值。
+任务侧[SourceRegistration](../../user/libraries/libexecution/src/source_registration.rs)拥有Empty/Installing(kind)/CancellingInstall(kind)/Attached(id)/RemovePending(id)/Removing(id)寿命；命令成功入Requests才迁移，拒绝保留原owner。安装中停止记取消意图，迟到registered转待Remove，Runtime继续持真实token至unregistered。它不持handle、不Clone/Copy、不Drop注销，不另建接收集合；业务仍拥有mask/终态/公平与实际对象。ObservationSlot、RPC Dispatcher/Outbox及fs/pm任务共用此值，族类型必须转发真实登记/拒绝/注销回执，输入hint不能建立登记owner。
+
+[`WorkQueue`](../../user/libraries/libexecution/src/work_queue.rs)持预付任务槽，Finalizing FIFO复用原槽链，每轮只推进一份注销/退休责任，与Runtime来源retry timer交替。阻塞项回尾部，持续新准入不能插队；元工作计数防全阻塞自旋。业务期限与执行退避共用一份`Pin<Box<TaskTimers>>`存储，其中两个节点独立登记、取消和成熟；私有不可移动投影保持地址稳定，任务归还前必须先摘两链。构造失败返原任务。成功advance进入Gate及注册/拒绝/注销回调后同步任务期限；非Gate stop/unregistered先兑现已成熟期限再回调、随后同步，Active才武装，Finalizing不重装业务timer。非法新期限保原Task与身份报错，不吞清理责任；取消未到期deadline不制造迟到timeout。
 
 非空 Runtime Drop 或接收 owner 提前 Drop 使整个装配失效；准入/推进/shutdown 在业务回调前拒绝，异常 Drop 仅清理自身登记，最后集合/进程边界接管。业务错误通过原 Runtime Hold/退休保留任务，不使用此异常路径。Framework 不建立孤儿来源队列或第二清理 actor。
 
-RootSupervisor、fs 双 Runtime 已共用各自 Assembly，pm 与同步 RPC 使用实际扁平来源；init/test 使用持久注册、Process DONE 与独立 Endpoint/View。Pump 的失败 carrier 同时保留 Runtime 与真实接收 owner，先退休任务，再关集合；生成前的原始集合与已装配集合用同一所有权枚举区分，不复制接收责任。
+RootSupervisor持一个Assembly服务多个Runtime；fs每个provider进程各持一个Assembly和一个Runtime，不跨provider共享接收集合。pm与同步RPC使用实际扁平来源，init/test使用持久注册、Process DONE与独立Endpoint/View。失败carrier保留Runtime与真实接收owner，先退休任务再关集合；原始集合与已装配集合用同一所有权枚举区分。
 
 ## 当前验证边界
 

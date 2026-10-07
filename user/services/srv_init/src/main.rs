@@ -4286,12 +4286,32 @@ fn test_automatic_retirement(job: Handle, image: &[u8]) -> Result<(), &'static s
 }
 
 /// 验收线 2：封口与异步完成传播——空 child Job seal 后等待 CLOSED、
-/// 快照转 Dead；重复 seal 幂管；完成后从 root 子表移除（枚举收敛）。
+/// 快照转Dead；最后child capability关闭后父域仍可派生；只Seal父即收束空后代。
 fn test_job_seal_completion(job: Handle) {
     let Ok(child) = process::create_job(job, root_memory_pool(), JOB_FULL_RIGHTS) else {
         debug!("job seal completion FAILED: job create failed");
         return;
     };
+    let mut grandchild = None;
+    let mut leaf = None;
+    let nested = (|| {
+        let grand = process::create_job(child, root_memory_pool(), JOB_FULL_RIGHTS)?;
+        grandchild = Some(grand);
+        leaf = Some(process::create_job(
+            grand,
+            root_memory_pool(),
+            JOB_FULL_RIGHTS,
+        )?);
+        let jid = process::query_job(grand)?.jid;
+        // 原最后cap归零：重新派生依据父MANAGE，而非子旧Holders资格。
+        unsafe { close(grand)? };
+        grandchild = None;
+        let reminted = process::derive_job(child, JobMemberKind::ChildJobs, jid, JOB_FULL_RIGHTS)?;
+        grandchild = Some(reminted);
+        unsafe { close(reminted)? };
+        grandchild = None;
+        Ok::<_, SystemCallError>(())
+    })();
     let sealed = process::seal_job(child);
     let waited = wait_until(
         child,
@@ -4299,11 +4319,14 @@ fn test_job_seal_completion(job: Handle) {
         libkernel::time::timeout_millis(5_000).unwrap(),
     );
     let snapshot = process::query_job(child);
+    let leaf_snapshot = leaf.and_then(|handle| process::query_job(handle).ok());
     // 幂管：Dead 上重复 seal 成功且不改变状态。
     let resealed = process::seal_job(child);
     let resnapshot = process::query_job(child);
     let children = enumerate_members(job, JobMemberKind::ChildJobs);
-    let passed = sealed.is_ok()
+    let passed = nested.is_ok()
+        && leaf_snapshot.is_some_and(|snapshot| snapshot.state == JobState::Dead as u32)
+        && sealed.is_ok()
         && matches!(waited, Ok(result) if result.observed.intersects(ObjectSignals::CLOSED))
         && matches!(&snapshot, Ok(s) if s.state == JobState::Dead as u32)
         && resealed.is_ok()
@@ -4321,6 +4344,9 @@ fn test_job_seal_completion(job: Handle) {
             "job seal completion FAILED: snapshot={:?} children={:?}",
             snapshot, children
         ),
+    }
+    for handle in [leaf, grandchild].into_iter().flatten() {
+        let _ = unsafe { close(handle) };
     }
     let _ = unsafe { close(child) };
 }

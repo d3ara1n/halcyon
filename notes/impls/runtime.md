@@ -50,6 +50,6 @@ Job duty 持有原机器、待准入任务、Runtime、世界与失败处置；B
 
 根按持续游标推进可工作运行体，接收一次候选批并给各运行体 feed，再用共同集合与最早期限停驻。可恢复错误退避，永久错误仍以原类型持有责任，其他运行体继续。失败脚本结束后 services 机器接管管理范围，旧 control 仍由原 duty 兑现。流建立失败的 Endpoint/Invitation 有预备清理槽；辅助 controls、mailbox/委托副本与通知由能力账本持有，内核确认 Grant/Send 消费后才兑现移交。正常关闭与失败 reset 均覆盖该账本，活动 Job 的 root 不提前关闭。
 
-pm 的 DomainTask 直接使用 JobDriver，MailboxTask/Flow/域收束共享单个 Assembly 与 Runtime，推进量子仍为每轮一项。域结束后 seal/shutdown_turn，注销来源与退休任务后检查 Task/InputBytes 归零，先关闭 Runtime 再关闭实际集合。不可恢复错误调用 ProcessAbort，由 init 的独立管理能力接管。fs 两个 provider Runtime 共用一个 Assembly，外层接收并分别 feed，两侧关闭后才能释放集合。
+pm 的 DomainTask 直接使用 JobDriver，MailboxTask/Flow/域收束共享单个 Assembly 与 Runtime，推进量子仍为每轮一项。域结束后 seal/shutdown_turn，注销来源与退休任务后检查 Task/InputBytes 归零，先关闭 Runtime 再关闭实际集合。不可恢复错误调用 ProcessAbort，由 init 的独立管理能力接管。fs每个provider进程各建自己的Assembly与单Runtime，接收、feed、任务退休与集合关闭在各自进程内收束；两个provider之间没有共享Assembly。
 
 init 的 done→腾位→TAIL 使用同一绝对期限。main/raw 中的故障隔离、正常退出、能力基线、单/多来源等待与 Tunnel 夹具使用新接口；持久源的陈旧提示和嵌套拒绝由原集合夹具承接，非空集合退出改观察自动退休。Sender 与流映射各自持实际 owner。QEMU 组合进度与仍未覆盖的运行行为由对象链工作记录拥有，不以源码接通替代完整验收。

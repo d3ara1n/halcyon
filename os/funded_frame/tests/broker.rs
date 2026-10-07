@@ -14,6 +14,7 @@ struct QuotaState {
     available: usize,
     reserved: usize,
     allocated: usize,
+    reject_split: bool,
 }
 
 #[derive(Clone)]
@@ -107,7 +108,7 @@ impl QuotaCredit for Credit {
     type Error = QuotaError;
 
     fn split(&mut self, pages: usize) -> Result<Self, Self::Error> {
-        if pages == 0 || pages >= self.pages {
+        if pages == 0 || pages >= self.pages || self.state.borrow().reject_split {
             return Err(QuotaError::Exhausted);
         }
         self.pages -= pages;
@@ -263,6 +264,7 @@ fn success_clears_every_extent_before_commit_and_restores_both_accounts() {
             available: 26,
             reserved: 0,
             allocated: 6,
+            reject_split: false,
         }
     );
     assert_eq!(
@@ -281,6 +283,7 @@ fn success_clears_every_extent_before_commit_and_restores_both_accounts() {
             available: 32,
             reserved: 0,
             allocated: 0,
+            reject_split: false,
         }
     );
     assert_eq!(inventory.state.borrow().free, 32);
@@ -441,11 +444,12 @@ fn decomposition_splits_crossing_extent_and_restores_both_accounts() {
 fn split_first_and_single_preserve_extent_ownership() {
     let (quota, inventory) = fixtures(32, &[4, 4]);
     let mut funded = fund::<_, _, 4>(&quota, &inventory, 8, LIMITS).unwrap();
-    let first = funded.split_first().unwrap();
+    let mut first = funded.split_first().unwrap();
     assert_eq!(first.pages(), 4);
     assert_eq!(funded.pages(), 4);
     assert_eq!(funded.extent_count(), 1);
-    let (left, right) = first.split_single(1).unwrap();
+    let right = first.split_off(1).unwrap();
+    let left = first;
     assert_eq!(left.pages(), 1);
     assert_eq!(right.pages(), 3);
     assert_eq!(quota.state.borrow().allocated, 8);
@@ -483,6 +487,48 @@ fn invalid_decomposition_returns_the_original_owner() {
         assert_eq!(quota.state.borrow().available, 16);
         assert_eq!(inventory.state.borrow().free, 16);
     }
+}
+
+#[test]
+fn single_extent_split_failure_keeps_claim_and_credit_until_owner_is_dropped() {
+    let (quota, inventory) = fixtures(16, &[4]);
+    let mut funded = fund::<_, _, 1>(
+        &quota,
+        &inventory,
+        4,
+        Limits {
+            max_extents: 1,
+            ..LIMITS
+        },
+    )
+    .unwrap();
+    for split in [0, 4] {
+        assert!(matches!(
+            funded.split_off(split),
+            Err(DecomposeError::InvalidSplit)
+        ));
+        assert_eq!(funded.pages(), 4);
+        assert_eq!(quota.state.borrow().allocated, 4);
+        assert_eq!(inventory.state.borrow().claimed, 4);
+    }
+    quota.state.borrow_mut().reject_split = true;
+    assert!(matches!(
+        funded.split_off(1),
+        Err(DecomposeError::Credit(QuotaError::Exhausted))
+    ));
+    assert_eq!(funded.pages(), 4);
+    assert_eq!(funded.extent_count(), 1);
+    assert_eq!(funded.claims().next().unwrap().pages(), 4);
+    assert_eq!(quota.state.borrow().allocated, 4);
+    assert_eq!(inventory.state.borrow().claimed, 4);
+    quota.state.borrow_mut().reject_split = false;
+    let right = funded.split_off(1).unwrap();
+    drop(right);
+    assert_eq!(quota.state.borrow().allocated, 1);
+    assert_eq!(inventory.state.borrow().claimed, 1);
+    drop(funded);
+    assert_eq!(quota.state.borrow().available, 16);
+    assert_eq!(inventory.state.borrow().free, 16);
 }
 
 #[test]

@@ -151,7 +151,7 @@ impl Work for NotificationCore {
     fn record(&self) -> &WorkRecord {
         self.source.record()
     }
-    fn step(&self) -> Outcome {
+    fn step(self: Arc<Self>) -> Outcome {
         let next = {
             let _state = self.state.lock();
             // SAFETY: 持稳定 core 的来源锁；在锁内复制强在途凭证，无节点借用出锁。

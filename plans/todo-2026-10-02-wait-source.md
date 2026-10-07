@@ -1,6 +1,14 @@
 # 统一等待源组件
 
-状态：**设计轮次 5 定稿（以轮次 5 为准，轮次 2–4 为推导记录）**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，是[对象持有与释放链](archived/todo-2026-10-01-object-chain-kernel-integration.md)验收的前置；实施、进度与验证由该对象链的唯一记录承接。本链消费者（ProcessShell 终态、ThreadControl、Mailbox 各类型、Notification、ReplyObservation）均需等待电平。用户裁决：纯电平、删除 WaitMany、禁止嵌套 WaitSet。IPC 分案直接复用。
+状态：**轮次5定稿及实际消费者已交付，后续内部完成通知协议按下方审查修正**。轮次2–4和最初方案保留推导，不作当前依据。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，首次实施/验证由[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)承载，后续修复见[审查修复档案](archived/review-2026-10-07-object-chain.md#通知与引用归还的最终协议设计轮次4)。ProcessShell终态、ThreadControl、Mailbox各类型、Notification、ReplyObservation及用户fault依赖均已接入。用户裁决仍为纯电平、删除WaitMany、禁止嵌套WaitSet。
+
+当前没有待接通的本链来源或清理责任；未来新来源按轮次5的稳定节点、owner自摘和付款合同接入。硬件故障/全安装交错穷举仍是验证边界，不能由已过正常路线推成全面故障证明。当前面貌由[task实现](../notes/impls/task.md)拥有。
+
+## 审查修正：内部完成来源与维护wake
+
+轮次5的普通Thread/WaitSet提示仍在全部业务门外交接。SignalSource内部完成是一个明确的短边：DONE/internal_done提交与maintenance::wake状态捕获同来源门发生，避免唯一内部等待者先完成并把最后根递归回发布者。它只改记录状态；潜在最后根及IPI由调用方带出全部领域锁后处理。QUEUE内非last保证、Work.record纯投影和来源→QUEUE锁序由[维护计划](todo-2026-09-29-kernel-maintenance-execution.md#状态与唤醒)拥有，不把这条边推广为锁内执行Hint/业务回调或最后析构。
+
+用户fault等待复用事务Completion的独立SignalSource，无每PTE actor；其捕获前释放空间锁/短loan，Frozen走原detach，DONE晚于退款/access归还，详见[内存分案fault](todo-2026-10-01-memory-redesign.md#fault)。原方案中“所有唤醒都必须在来源锁外”的绝对表述仅对普通提示适用，不覆盖上述内部记录仲裁。
 
 ## 范围与非目标
 

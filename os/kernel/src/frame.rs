@@ -553,12 +553,13 @@ impl FundedExtent {
             .base()
     }
 
-    pub(crate) fn split_at(self, left_pages: usize) -> (Self, Self) {
-        let (left, right) = self
+    pub(crate) fn split_at(mut self, left_pages: usize) -> (Self, Self) {
+        // SegmentMap 已校验严格内部切点，同源 MemoryCharge 的合法切分必成。
+        let right = self
             .inner
-            .split_single(left_pages)
+            .split_off(left_pages)
             .expect("funded extent split must be prevalidated");
-        (Self { inner: left }, Self { inner: right })
+        (self, Self { inner: right })
     }
 }
 

@@ -17,7 +17,7 @@ use libexecution::assembly::Assembly;
 
 use libbudget::Budget;
 use libexecution::{
-    ExecutionResource,
+    ExecutionResource, SourcePlan, SourceRegistration,
     runtime::{
         Advance, DriveState, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step,
         Task,
@@ -73,7 +73,7 @@ impl PmWorld {
 /// 邮箱分发任务：接收 Invitation 与流控请求，派生对应任务。
 struct MailboxTask {
     buffer: ReceiveBuffer,
-    registered: bool,
+    registration: SourceRegistration,
     failed: bool,
     stopping: bool,
 }
@@ -82,7 +82,7 @@ impl MailboxTask {
     fn new() -> Self {
         Self {
             buffer: ReceiveBuffer::new().expect("pm: receive buffer"),
-            registered: false,
+            registration: SourceRegistration::new(),
             failed: false,
             stopping: false,
         }
@@ -112,11 +112,13 @@ impl Task<PmWorld> for MailboxTask {
                 step: Step::Complete,
             });
         }
-        if !self.registered {
-            self.registered = true;
-            requests.add_source(
-                world.mailbox,
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+        if self.registration.is_empty() {
+            self.registration.install(
+                requests,
+                SourcePlan::new(
+                    world.mailbox,
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                ),
                 KIND_MAILBOX,
             )?;
             return Ok(Advance {
@@ -175,8 +177,7 @@ impl Task<PmWorld> for MailboxTask {
                             invitation: Some(invitation),
                             producer: None,
                             cancelled_invitation: None,
-                            removing: false,
-                            source: None,
+                            source: SourceRegistration::new(),
                             source_failed: None,
                             sent: 0,
                             stopping: false,
@@ -227,7 +228,7 @@ impl Task<PmWorld> for MailboxTask {
                     filled: 0,
                     verified_full: false,
                     woke: false,
-                    source: None,
+                    source: SourceRegistration::new(),
                     source_failed: None,
                     stopping: false,
                 }),
@@ -256,14 +257,16 @@ impl Task<PmWorld> for MailboxTask {
         })
     }
 
-    fn registered(&mut self, world: &mut PmWorld, kind: SourceKind, _: SourceId) {
+    fn registered(&mut self, world: &mut PmWorld, kind: SourceKind, source: SourceId) {
         if kind == KIND_MAILBOX {
             world.mailbox_registered = true;
+            self.registration.registered(kind, source);
         }
     }
-    fn unregistered(&mut self, world: &mut PmWorld, kind: SourceKind, _: SourceId) {
+    fn unregistered(&mut self, world: &mut PmWorld, kind: SourceKind, source: SourceId) {
         if kind == KIND_MAILBOX {
             world.mailbox_registered = false;
+            self.registration.unregistered(source);
         }
     }
 
@@ -274,7 +277,8 @@ impl Task<PmWorld> for MailboxTask {
                 debug!("pm task spawn refused: {:?}", error);
                 self.failed = true;
             }
-            RequestFailure::Source { error, .. } => {
+            RequestFailure::Source { kind, error } => {
+                self.registration.refused(kind);
                 debug!("pm mailbox source refused: {:?}", error);
                 self.failed = true;
             }
@@ -293,6 +297,7 @@ impl Task<PmWorld> for MailboxTask {
         );
         world.mailbox_stopped = true;
         self.stopping = true;
+        self.registration.cancel();
     }
 }
 
@@ -301,8 +306,7 @@ struct StreamTask {
     invitation: Option<Invitation>,
     producer: Option<blocking::Producer>,
     cancelled_invitation: Option<libkernel::ipc::capability::Capability>,
-    removing: bool,
-    source: Option<SourceId>,
+    source: SourceRegistration,
     source_failed: Option<SystemCallError>,
     stopping: bool,
     sent: usize,
@@ -329,11 +333,8 @@ impl Task<PmWorld> for StreamTask {
                 self.cancelled_invitation = Some(owner);
                 return Err(error);
             }
-            if let Some(source) = self.source {
-                if !self.removing {
-                    requests.remove(source)?;
-                    self.removing = true;
-                }
+            if !self.source.is_empty() {
+                self.source.remove(requests)?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Parked,
@@ -460,7 +461,7 @@ impl Task<PmWorld> for StreamTask {
             });
         }
         // 未写满：按当前条件登记或重新武装。
-        if self.source.is_none() {
+        if self.source.is_empty() {
             let plan = match producer.wait_plan() {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -472,8 +473,8 @@ impl Task<PmWorld> for StreamTask {
                     });
                 }
             };
-            requests
-                .register(plan, KIND_STREAM)
+            self.source
+                .install(requests, plan, KIND_STREAM)
                 .map_err(|_| SystemCallError::ReachLimit)?;
         }
         Ok(Advance {
@@ -484,17 +485,17 @@ impl Task<PmWorld> for StreamTask {
 
     fn registered(&mut self, _world: &mut PmWorld, kind: SourceKind, source: SourceId) {
         if kind == KIND_STREAM {
-            self.source = Some(source);
+            self.source.registered(kind, source);
         }
     }
     fn unregistered(&mut self, _world: &mut PmWorld, _kind: SourceKind, source: SourceId) {
-        if self.source == Some(source) {
-            self.source = None;
-            self.removing = false;
-        }
+        self.source.unregistered(source);
     }
 
     fn refused(&mut self, _world: &mut PmWorld, failure: RequestFailure<PmTask>) {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
         let error = match failure {
             RequestFailure::Spawn { error, .. }
             | RequestFailure::Source { error, .. }
@@ -505,6 +506,7 @@ impl Task<PmWorld> for StreamTask {
 
     fn stop(&mut self, _world: &mut PmWorld) {
         self.stopping = true;
+        self.source.cancel();
     }
 }
 
@@ -516,13 +518,23 @@ struct FlowTask {
     filled: usize,
     verified_full: bool,
     woke: bool,
-    source: Option<SourceId>,
+    source: SourceRegistration,
     source_failed: Option<SystemCallError>,
     stopping: bool,
 }
 
 impl Task<PmWorld> for FlowTask {
     type Family = PmTask;
+
+    fn registered(&mut self, _world: &mut PmWorld, kind: SourceKind, source: SourceId) {
+        if kind == KIND_WRITABLE {
+            self.source.registered(kind, source);
+        }
+    }
+
+    fn unregistered(&mut self, _world: &mut PmWorld, _kind: SourceKind, source: SourceId) {
+        self.source.unregistered(source);
+    }
 
     fn advance(
         &mut self,
@@ -593,9 +605,12 @@ impl Task<PmWorld> for FlowTask {
             )
             .expect("wake confirm signal failed");
             self.verified_full = true;
-            requests.add_source(
-                self.target.as_handle(),
-                ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    self.target.as_handle(),
+                    ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+                ),
                 KIND_WRITABLE,
             )?;
             return Ok(Advance {
@@ -624,7 +639,11 @@ impl Task<PmWorld> for FlowTask {
                 step: Step::Parked,
             });
         };
-        self.source = Some(source);
+        assert_eq!(
+            self.source.source(),
+            Some(source),
+            "flow hint changed its source owner"
+        );
         match self.target.send(WRITABLE_WAKE_TAIL, &[]) {
             Ok(()) => {
                 debug!("writable wake passed");
@@ -679,14 +698,17 @@ impl Task<PmWorld> for FlowTask {
                 debug!("flow domain spawn refused: {:?}", error);
                 world.fail();
             }
-            RequestFailure::Source { error, .. } | RequestFailure::Wake { error, .. } => {
-                self.source_failed = Some(error)
+            RequestFailure::Source { kind, error } => {
+                self.source.refused(kind);
+                self.source_failed = Some(error);
             }
+            RequestFailure::Wake { error, .. } => self.source_failed = Some(error),
         }
     }
 
     fn stop(&mut self, _world: &mut PmWorld) {
         self.stopping = true;
+        self.source.cancel();
     }
 }
 
@@ -815,7 +837,7 @@ impl Task<PmWorld> for PmTask {
             Self::Mailbox(task) => task.registered(world, kind, source),
             Self::Domain(task) => task.registered(world, kind, source),
             Self::Stream(task) => task.registered(world, kind, source),
-            _ => {}
+            Self::Flow(task) => task.registered(world, kind, source),
         }
     }
     fn unregistered(&mut self, world: &mut PmWorld, kind: SourceKind, source: SourceId) {
@@ -823,7 +845,7 @@ impl Task<PmWorld> for PmTask {
             Self::Mailbox(task) => task.unregistered(world, kind, source),
             Self::Domain(task) => task.unregistered(world, kind, source),
             Self::Stream(task) => task.unregistered(world, kind, source),
-            _ => {}
+            Self::Flow(task) => task.unregistered(world, kind, source),
         }
     }
 

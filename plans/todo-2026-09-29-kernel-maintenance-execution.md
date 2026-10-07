@@ -1,6 +1,6 @@
 # 内核有界维护执行重构
 
-状态：**本链维护能力已实施交付，以费用预算+有限服务机会的最终审定保证为准；实施与验证见[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)**。可靠物理执行计量仍为独立平台能力。用户正常调用/观察，不需要特殊 syscall、显式让出或专用用户进程来提供内核执行机会。全项目范围与已确认的 Close 语义由[设计总纲](todo-2026-09-29-system-redesign.md)拥有，本案只拥有必须由内核推进的有界执行，不拥有对象业务状态。下文“UnitOfWork 的机制定位”至“迁移面与删除门”为前期推导，与定稿节冲突时以定稿节为准。
+状态：**本链维护能力及后续稳定根/通知协议、门铃失败政策、累计栈修复已交付，以费用预算+有限服务机会的最终审定保证为准**。首次实施见[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)，后续处置与证据见[审查修复档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)。可靠物理执行计量仍为独立平台能力。用户正常调用/观察，不需要特殊syscall、显式让出或专用用户进程。全项目范围与Close语义由[设计总纲](todo-2026-09-29-system-redesign.md)拥有，本案只拥有必须由内核推进的有界执行，不拥有对象业务状态。以下已定稿协议按审查结论修正；早期拼装、UnitOfWork及施工门保留推导，不作为当前未完成接线。
 
 ## 目标、边界与重构前盘点
 
@@ -38,7 +38,7 @@
 | finish(Done) | Running | Done，锁外清理登记并交还强根 |
 
 - Running 期间绝不直接改 Queued，防止两 hart 同时推进同一记录。notified 只在出队时清零。
-- 依赖源自持锁完成“登记 + 复检”；完成方源锁内更新谓词并摘 token，解源锁后 wake。源锁与队列锁不嵌套；step 收束不在队列锁内注销来源或调用业务代码。
+- 依赖源自持锁完成登记+复检。SignalSource内部DONE/internal_done与wake状态捕获在同一来源临界区，允许OBJECT_WAIT→MAINTENANCE_QUEUE；该短边只改队列状态，Work.record为纯字段投影，不执行step/业务回调。publish合并/wake活跃记录的多余Arc在QUEUE门内借稳定执行根保证非last；Idle/Done返回潜在退休根，由调用者带出全部领域锁后drop，kick也在门外。其他来源按各自稳定根与回执合同锁外wake，不把此例外泛化为任意回调或最后析构。
 - token 携带等待代次，迟到通知不作用于新等待周期或 Done 记录。
 - 三个窗口：登记前完成由复检覆盖；登记后、提交 Blocked 前完成由 notified 覆盖；Blocked 后完成由重新入队覆盖。
 
@@ -77,7 +77,7 @@
 - 余额非正而跳过是仲裁推进，不是“无工作”：保留仲裁进度，不因此 WFI，不在 run 入口重置轮次；连续空仲裁照常服务 pending，开销计入开销边界。
 - 条件性份额：计量代表实际占用且机会门未提前封轮时，双方持续有工作满足`S_M ≥ qM/(qM+qU)·A − E`，U对称；A扣除共享选类与紧急服务，E来自相位差、原子超出与计时误差。机会先耗尽的轮次不宣称此界，改由有限机会保证无饥饿。最大连续占用的数值仍需平台δ/计量条件；无用户线程hart可全借给M，不证明单线程期限或不可并行M工作的所有hart总保底。
 - **紧急服务与份额（用户确认）**：U/M 份额只针对扣除紧急服务后的剩余 CPU；紧急服务容量由 timer、remote 各自 owner 用到达准入约束。
-- **qM/qU（用户确认）**：待定标政策参数，不在计划冻结数值；进程回收接入后用真实负载定标。
+- **qM/qU（用户确认）**：不在计划冻结数值，当前政策由execution实现拥有；后续实测可以调整，不能以其数值宣称未具备平台合同的WCET/份额保证。
 - 仲裁点：`run()` 处理完线程离场、pick 之前；连续 M 每批回到此点。`trap.rs` Completed→Resume 与 SSIP Resume 也须在统一返回边界结算当前类别，额度耗尽且另类可运行则转回 `run`。返回用户前 arm 线程量子、类别剩余额度、最近期限中最早者；trap/Resume 不重发额度。syscall 内核时间归 U，维护成本不归无关线程。
 
 ### 纯逻辑 crate 与内核分工
@@ -90,15 +90,15 @@
 | 账户 DRR：选账户（有界推进）、预扣、结算、欠账 | 调用各类型 step、门铃 IPI |
 | 两类别轮转器：有符号余额、选类、计费 | 接入 `sched::run/idle`、trap 返回边界、timer arm |
 
-不接收回调、不反向依赖内核。step 契约 `step -> { cost, Ready | Blocked(依赖已登记) | Done }` 由内核侧定义。
+不接收回调、不反向依赖内核。Work返回Idle/Ready/Blocked/Done，Blocked前依赖已登记；费用由内核执行器统一采样，纯逻辑crate不提供领域伪造cost或调用Work。
 
-### 剩余设计门与 owner
+### 早期设计门与owner（历史，接线已完成）
 
 1. **本案（crate 实施时闭合）**：crate 类型与 host 单测；内核拼装草图（记录嵌入位置、锁序、强根转交、事件执行点）。
 2. **调度与预算**：qM/qU 及②③响应目标定标，平台 δ 取证；owner 本案，触发为进程回收接入后。
 3. **进程与 VM 分案**：地址空间整体退休、退款、大分配准备发布屏障；需改写的非有界原语——退休 step 遍历全部 views（`task/proc.rs:1341`）、整段清零（`frame.rs:846`）、Handle 阶段依赖（`task/proc.rs:4177`）。timer 一次排空（`sched.rs:333`）与 remote 最后确认直接 complete（`remote_call.rs:330`）由本链接入时改写。
 
-### 内核拼装草图（设计产物，未写代码）
+### 内核拼装与当前接缝（原草图已接入）
 
 **记录嵌入**
 
@@ -110,11 +110,11 @@
 | 大分配准备对象 | 准备记录，取消切换到回滚阶段 | 操作被接受时（可拒绝） |
 | 设备绑定（MMIO/IRQ/DMA） | 各自独立记录 | 绑定建立时 |
 
-`WorkRecord` = `maintenance::Record` + 侵入式链接 + 所属账户引用。拥有体实现内核 trait `Work { fn step(&self, grant) -> (cost, Outcome) }`；队列持 `Arc<dyn Work>` 作为强根，由 Queued/Running/Blocked 期间持有，Done 后锁外 drop。
+WorkRecord包含纯Record状态、侵入式链接及所属账户。拥有体实现对象安全的`Work::step(self: Arc<Self>) -> Outcome`，执行器原根保留到finish后的锁外处理，receiver clone直接支撑arm；无需自Weak或回填root锁。Queued/Blocked根由队列/Record持有，Running根在执行器局部；潜在最后析构在finish及全部领域锁外。费用由执行器统一采样，不由Work伪报cost。
 
 **全局队列与账户**：一个 `MaintenanceQueue`（ticket 锁），内含活跃账户环；每个账户（Job 级资金账户）带 `maintenance::Ledger` 与 Ready 记录链。账户只要有在途记录就挂在环上或由在途记录强持。每 hart 一个 `maintenance::Rotor`，hart 私有，无锁。
 
-**锁序**：新增 `ranks::MAINTENANCE`，置于全部业务/对象锁之后、`HEAP` 之前（约 660）。约束：持 MAINTENANCE 时不取任何其他锁（含 HEAP，因挂接零分配）；发布方可在业务锁内调用 publish（MAINTENANCE 为内层叶），但 IPI 在解开全部锁后发送。依赖源锁与 MAINTENANCE 不嵌套：源锁内只摘 token，解源锁后再 wake。
+**锁序**：MAINTENANCE_QUEUE在业务/对象锁之后、HEAP之前，数字唯一真值在sync::ranks。持QUEUE不取其他锁、不分配、不执行潜在最后析构；发布可由业务门进入QUEUE，IPI一律在全部锁外。SignalSource内部完成允许前述来源→QUEUE短边，其余Hint/业务动作仍锁外；不能保留旧的“来源与QUEUE绝不嵌套”断言。
 
 **事件执行点**
 
@@ -123,7 +123,7 @@
 | LastCapability | `CapTable` 锁外、调用 Close 的 syscall 返回前 | 对象 retire 记录 publish；Close 返回时责任已可达 |
 | 表退出 | 进程回收记录的 step 内 | `shut` 后 `take_next_bounded`，摘出 cap 锁外 release，额度不足时剩余 cap 留在记录游标 |
 | 级联 | 父 step 内 | 只 publish 子记录，不递归 step |
-| 依赖完成（TLB 确认、对端退休） | 完成方解源锁后 | `wake(ticket)` |
+| 依赖完成 | SignalSource内部完成同来源门捕获wake；remote等沿自身锁外交接 | `wake(ticket)`返回潜在退休根；全部领域门外drop/kick |
 | 选类与执行 | `sched::run` 离场处理后、pick 前 | `rotor.choose`；M 则锁内 visit→pick，锁外 step，锁内 finish+settle |
 | 返回边界结算 | `trap.rs` Completed/SSIP Resume 前 | `rotor.charge(U, elapsed)`，额度耗尽且 M 可运行则转 Requeue |
 | idle | `sched::idle` | 登记 idle 后复检全局队列非空；仅 Blocked 时可 WFI |
@@ -260,11 +260,11 @@ PM 持有监督和终止政策，发起终止并观察资源收束；内核持�
 
 早期 `os/maintenance` crate 实施时尚未提交或接入内核：`record`（状态机含 notified 与等待代次）、`account`（账户 DRR：访问/预扣/结算/欠账）、`rotor`（两类别有符号余额轮转）。当时开发证据为 `cargo test -p maintenance --target aarch64-apple-darwin` 16 项通过，clippy `-D warnings` 通过；当时未运行 `just check`/QEMU。这不是当前接力状态。
 
-内核拼装草图写入“执行机制目标设计”节后，进程/VM/capability 的接缝、旧路径删除与 ticket 锁接入统一转由对象链施工承接。当前从该唯一记录继续；本案保留详细设计，不另存一套施工断点。
+内核拼装、进程/VM/capability接缝、旧路径删除与ticket锁均已由对象链完成；后续修复已归档。本案保留契约及条件后续，不再指向已归档施工记录继续实施。
 
 ## 本链接入收敛结论（2026-10，LoneCrane 对抗）
 
 - 账户即 Pool，欠账转移与公平范围见[预算分案账户形状](todo-2026-09-14-kernel-memory-budget.md#对象持有与释放链所需的账户形状收敛结论2026-10-与-lonecrane-对抗-8-轮advisor-一次)；debt transfer 为独立操作，不复用 `Ledger::settle`。
 - **timer**：所有装填路径（含 `register_wait_timeout`）共用“已到期 → hart 本地 pending，未来 → arm”入口；pending 参与 run/Resume/idle 决策：有 pending 不 WFI，返回用户前装近期 timer 作后续检查；每次服务 qT 项，不 while 排空；expire 后续清理移交既有 Work。
 - **remote**：完成事实按空间 + 事务代次唯一标记；先取 wake token 稳定根，再归还槽，锁外 wake；源登记 + 复检与 Running.notified 覆盖早到/迟到；最终析构只有界释放或 publish；零目标不造远端 ack。运输复用契约见[内存分案轮次 3](todo-2026-10-01-memory-redesign.md)。
-- 上文“施工前设计门”已由 `os/maintenance` crate、拼装草图及本节取代；剩余仅 qM/qU/qT 定标（回收接入后）。
+- 上文施工前设计门已由crate、内核接入及审查修复关闭；当前政策参数来自execution实现，变化须测量触发。物理CPU份额/WCET依独立平台合同，锁争用优化见[性能专题](todo-2026-10-01-lock-performance.md)，均不回退为未完成的本链接线。

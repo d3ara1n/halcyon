@@ -261,6 +261,11 @@ impl AnySpace {
         Ok(())
     }
 
+    /// 软件页表的真实发布事实；调用者持Vm空间锁。
+    pub(crate) fn translate(&mut self, vpn: page_table::Vpn) -> Option<page_table::Mapped> {
+        self.tree.translate(vpn)
+    }
+
     pub(crate) fn validate_initial_context(
         &mut self,
         entry: usize,

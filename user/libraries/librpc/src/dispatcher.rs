@@ -10,6 +10,7 @@ use erhino_shared::{
     object::{ObjectSignals, Rights},
     time::Deadline,
 };
+use libexecution::SourceRegistration;
 use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
@@ -41,9 +42,7 @@ struct SourceBinding {
 
 struct SourceState {
     key: u64,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    registration: SourceRegistration,
 }
 
 struct PendingCall {
@@ -86,9 +85,7 @@ pub struct Dispatcher {
     sender: MailboxSender,
     receiver: ReceiveBuffer,
     reply_key: u64,
-    reply_source: Option<SourceId>,
-    reply_requested: bool,
-    reply_removing: bool,
+    reply_registration: SourceRegistration,
     pending: OrderedTable<PendingCall, ()>,
     bindings: OrderedTable<SourceBinding, ()>,
     deadlines: TimerQueue<u64>,
@@ -130,9 +127,7 @@ impl Dispatcher {
             sender: minted.sender,
             receiver,
             reply_key: 1,
-            reply_source: None,
-            reply_requested: false,
-            reply_removing: false,
+            reply_registration: SourceRegistration::new(),
             pending: OrderedTable::new(limit),
             bindings: OrderedTable::new(source_limit),
             deadlines: TimerQueue::new(0),
@@ -266,15 +261,11 @@ impl Dispatcher {
             timer: None,
             progress: SourceState {
                 key: progress_key,
-                source: None,
-                requested: false,
-                removing: false,
+                registration: SourceRegistration::new(),
             },
             closed: SourceState {
                 key: closed_key,
-                source: None,
-                requested: false,
-                removing: false,
+                registration: SourceRegistration::new(),
             },
             stage: OutboundStage::Ready,
             queued: false,
@@ -393,7 +384,7 @@ impl Dispatcher {
     fn clean(pending: &PendingCall) -> bool {
         [(&pending.progress), (&pending.closed)]
             .into_iter()
-            .all(|source| source.source.is_none() && !source.requested && !source.removing)
+            .all(|source| source.registration.is_empty())
     }
 
     fn queue_completion(&mut self, txid: u64) {
@@ -467,6 +458,8 @@ impl Dispatcher {
         }
         pending.storage = None;
         pending.result = Some(result);
+        pending.progress.registration.cancel();
+        pending.closed.registration.cancel();
         self.removals.request();
         self.retiring.request();
         self.queue_completion(txid);
@@ -567,43 +560,6 @@ impl Dispatcher {
         Ok(used)
     }
 
-    fn declare_source<F>(
-        requests: &mut Requests<F>,
-        state: &mut SourceState,
-        plan: SourcePlan,
-    ) -> bool {
-        if state.removing {
-            return false;
-        }
-        if state.source.is_some() {
-            return false;
-        }
-        if state.requested {
-            return false;
-        }
-        if requests.register(plan, state.key).is_ok() {
-            state.requested = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn declare_remove<F>(requests: &mut Requests<F>, state: &mut SourceState) -> bool {
-        let Some(source) = state.source else {
-            return false;
-        };
-        if state.removing {
-            return false;
-        }
-        if requests.remove(source).is_ok() {
-            state.removing = true;
-            true
-        } else {
-            false
-        }
-    }
-
     fn next_candidate(pending: &OrderedTable<PendingCall, ()>, sweep: &mut Sweep) -> Option<u64> {
         let next = if sweep.active {
             pending
@@ -621,9 +577,9 @@ impl Dispatcher {
         };
         let ready = self.pending.get(txid).is_some_and(|pending| {
             pending.stage.can_attempt()
-                && pending.closed.source.is_some()
-                && pending.progress.source.is_some()
-                && self.reply_source.is_some()
+                && pending.closed.registration.source().is_some()
+                && pending.progress.registration.source().is_some()
+                && self.reply_registration.source().is_some()
         });
         if ready && !self.sealed {
             self.progress_send(txid);
@@ -635,19 +591,19 @@ impl Dispatcher {
             self.registrations = Sweep::default();
             return;
         }
-        if self.reply_source.is_none() && !self.reply_requested && !self.reply_removing {
-            if requests
-                .register(
+        if self.reply_registration.is_empty() {
+            if self
+                .reply_registration
+                .install(
+                    requests,
                     SourcePlan::new(
                         self.owner.as_handle(),
                         ObjectSignals::READABLE | ObjectSignals::CLOSED,
                     ),
                     self.reply_key,
                 )
-                .is_ok()
+                .is_err()
             {
-                self.reply_requested = true;
-            } else {
                 self.registrations.request();
             }
             return;
@@ -662,39 +618,52 @@ impl Dispatcher {
         if pending.result.is_some() {
             return;
         }
-        let declared_closed = Self::declare_source(
-            requests,
-            &mut pending.closed,
-            SourcePlan::new(pending.service.as_handle(), ObjectSignals::CLOSED),
-        );
-        let declared_writable = pending.request.is_some()
-            && Self::declare_source(
+        let declared_closed = pending
+            .closed
+            .registration
+            .install(
                 requests,
-                &mut pending.progress,
-                SourcePlan::new(
-                    pending.service.as_handle(),
-                    ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
-                ),
-            );
+                SourcePlan::new(pending.service.as_handle(), ObjectSignals::CLOSED),
+                pending.closed.key,
+            )
+            .unwrap_or(false);
+        let declared_writable = pending.request.is_some()
+            && pending
+                .progress
+                .registration
+                .install(
+                    requests,
+                    SourcePlan::new(
+                        pending.service.as_handle(),
+                        ObjectSignals::WRITABLE | ObjectSignals::CLOSED,
+                    ),
+                    pending.progress.key,
+                )
+                .unwrap_or(false);
         let declared_observation = pending.observation.is_some()
             && self
                 .bindings
                 .get(pending.progress.key)
                 .is_some_and(|binding| binding.role == SourceRole::Abandoned)
-            && Self::declare_source(
-                requests,
-                &mut pending.progress,
-                SourcePlan::new(
-                    pending
-                        .observation
-                        .as_ref()
-                        .expect("sent RPC lost observer")
-                        .as_handle(),
-                    ObjectSignals::PEER_CLOSED,
-                ),
-            );
+            && pending
+                .progress
+                .registration
+                .install(
+                    requests,
+                    SourcePlan::new(
+                        pending
+                            .observation
+                            .as_ref()
+                            .expect("sent RPC lost observer")
+                            .as_handle(),
+                        ObjectSignals::PEER_CLOSED,
+                    ),
+                    pending.progress.key,
+                )
+                .unwrap_or(false);
         let incomplete = pending.result.is_none()
-            && (pending.closed.source.is_none() || pending.progress.source.is_none());
+            && (pending.closed.registration.source().is_none()
+                || pending.progress.registration.source().is_none());
         if declared_closed || declared_writable || declared_observation || incomplete {
             self.registrations.request();
         }
@@ -702,12 +671,10 @@ impl Dispatcher {
 
     fn declare_removals<F>(&mut self, requests: &mut Requests<F>) {
         if self.sealed
-            && !self.reply_removing
-            && let Some(source) = self.reply_source
+            && !self.reply_registration.is_removing()
+            && self.reply_registration.source().is_some()
         {
-            if requests.remove(source).is_ok() {
-                self.reply_removing = true;
-            }
+            let _ = self.reply_registration.remove(requests);
             return;
         }
         if let Some(txid) = Self::next_candidate(&self.pending, &mut self.removals) {
@@ -721,9 +688,17 @@ impl Dispatcher {
                     .get(pending.progress.key)
                     .is_some_and(|binding| binding.role == SourceRole::Writable);
             let remove_writable = (old_writable || pending.result.is_some())
-                && Self::declare_remove(requests, &mut pending.progress);
-            let remove_closed =
-                pending.result.is_some() && Self::declare_remove(requests, &mut pending.closed);
+                && pending
+                    .progress
+                    .registration
+                    .remove(requests)
+                    .unwrap_or(false);
+            let remove_closed = pending.result.is_some()
+                && pending
+                    .closed
+                    .registration
+                    .remove(requests)
+                    .unwrap_or(false);
             let needs_retry = pending.result.is_some() && !Self::clean(pending);
             if remove_writable || remove_closed {
                 self.removals.request();
@@ -754,8 +729,8 @@ impl Dispatcher {
             return Ok(1);
         };
         let source = match binding.role {
-            SourceRole::Closed => pending.closed.source,
-            SourceRole::Writable | SourceRole::Abandoned => pending.progress.source,
+            SourceRole::Closed => pending.closed.registration.source(),
+            SourceRole::Writable | SourceRole::Abandoned => pending.progress.registration.source(),
         };
         if source != Some(event.source) {
             return Ok(1);
@@ -781,6 +756,7 @@ impl Dispatcher {
     fn begin_stop(&mut self) {
         if !self.sealed {
             self.sealed = true;
+            self.reply_registration.cancel();
             self.stopping.request();
             self.removals.request();
             self.retiring.request();
@@ -816,7 +792,9 @@ impl Dispatcher {
             || self.stopping.active
             || self.retiring.active
             || self.wake_pending
-            || (!self.sealed && (self.reply_source.is_none() && !self.reply_requested))
+            || (!self.sealed
+                && (self.reply_registration.source().is_none()
+                    && !self.reply_registration.is_installing()))
     }
 
     /// 仅终结本地等待；已投递请求不会被服务端撤回。
@@ -932,9 +910,7 @@ impl Dispatcher {
         let complete = self.sealed
             && self.pending.is_empty()
             && self.bindings.is_empty()
-            && self.reply_source.is_none()
-            && !self.reply_requested
-            && !self.reply_removing;
+            && self.reply_registration.is_empty();
         Ok(Advance {
             work_done: budget,
             step: if complete {
@@ -951,7 +927,7 @@ impl Dispatcher {
         match failure {
             RequestFailure::Source { kind, error } => {
                 if kind == self.reply_key {
-                    self.reply_requested = false;
+                    self.reply_registration.refused(kind);
                     self.fault = Some(error);
                     self.begin_stop();
                     return;
@@ -962,9 +938,11 @@ impl Dispatcher {
                 if let Some(pending) = self.pending.get_mut(binding.txid) {
                     match binding.role {
                         SourceRole::Writable | SourceRole::Abandoned => {
-                            pending.progress.requested = false
+                            pending.progress.registration.refused(kind);
                         }
-                        SourceRole::Closed => pending.closed.requested = false,
+                        SourceRole::Closed => {
+                            pending.closed.registration.refused(kind);
+                        }
                     }
                 }
                 self.complete(binding.txid, Err(CallCause::System(error)));
@@ -990,8 +968,7 @@ impl Dispatcher {
 
     pub fn registered<W>(&mut self, _world: &mut W, kind: u64, source: SourceId) {
         if kind == self.reply_key {
-            self.reply_requested = false;
-            self.reply_source = Some(source);
+            self.reply_registration.registered(kind, source);
             return;
         }
         let Some(binding) = self.bindings.get(kind).copied() else {
@@ -1002,19 +979,16 @@ impl Dispatcher {
                 SourceRole::Writable | SourceRole::Abandoned => &mut pending.progress,
                 SourceRole::Closed => &mut pending.closed,
             };
-            state.requested = false;
-            state.source = Some(source);
+            state.registration.registered(kind, source);
         }
         self.registrations.request();
         self.sends.request();
         self.removals.request();
     }
 
-    pub fn unregistered<W>(&mut self, _world: &mut W, kind: u64, _source: SourceId) {
+    pub fn unregistered<W>(&mut self, _world: &mut W, kind: u64, source: SourceId) {
         if kind == self.reply_key {
-            self.reply_source = None;
-            self.reply_requested = false;
-            self.reply_removing = false;
+            self.reply_registration.unregistered(source);
             return;
         }
         let Some(binding) = self.bindings.get(kind).copied() else {
@@ -1025,9 +999,9 @@ impl Dispatcher {
                 SourceRole::Writable | SourceRole::Abandoned => &mut pending.progress,
                 SourceRole::Closed => &mut pending.closed,
             };
-            state.source = None;
-            state.requested = false;
-            state.removing = false;
+            if !state.registration.unregistered(source) {
+                return;
+            }
         }
         let reuse = binding.role == SourceRole::Writable
             && self

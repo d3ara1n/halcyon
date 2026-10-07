@@ -426,6 +426,7 @@ pub enum FaultClass {
     /// fault，应按 `target`（该事务承诺的终态权限，Unmap 为 None）判定：
     /// 终态允许则锁外让出后重试，否则正常投递。
     Publishing {
+        change: ChangeKey,
         target: Option<Protection>,
     },
 }
@@ -812,7 +813,7 @@ struct TransactionRecord {
     /// Committed 且 ledger 游标未耗尽。
     ledger_pending: bool,
     /// 事务承诺的终态权限（fault 在过渡期按此判定）。
-    target: Option<Protection>,
+    target: Option<(PageRange, Protection)>,
 }
 
 #[derive(Debug)]
@@ -947,17 +948,20 @@ impl<C> MemorySpace<C> {
     }
 
     pub fn fault_class(&self, address: usize) -> FaultClass {
-        if self.transactions.iter().any(|t| {
+        if let Some(transaction) = self.transactions.iter().find(|t| {
             t.stage == ChangeStage::Committed
-                && t.ledger_pending
                 && t.footprint.address_range().contains_address(address)
         }) {
-            let target = self
-                .transactions
-                .iter()
-                .find(|t| t.footprint.address_range().contains_address(address))
-                .and_then(|t| t.target);
-            return FaultClass::Publishing { target };
+            let target = transaction.target.and_then(|(range, protection)| {
+                range
+                    .address_range()
+                    .contains_address(address)
+                    .then_some(protection)
+            });
+            return FaultClass::Publishing {
+                change: transaction.key,
+                target,
+            };
         }
         let Some(region) = self
             .regions
@@ -1496,8 +1500,10 @@ impl<C> MemorySpace<C> {
                 .translations
                 .iter()
                 .find_map(|intent| match *intent {
-                    TranslationIntent::Install { protection, .. } => Some(protection),
-                    TranslationIntent::Protect { to, .. } => Some(to),
+                    TranslationIntent::Install {
+                        range, protection, ..
+                    } => Some((range, protection)),
+                    TranslationIntent::Protect { to, .. } => Some((validated.plan.footprint, to)),
                     TranslationIntent::Remove { .. } => None,
                 });
         let key = self.mint_change_key();

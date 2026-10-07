@@ -56,6 +56,8 @@ VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "90")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "90")
 SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "120")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
+VIRT_IPI_FAILURE_TIMEOUT := env_var_or_default("VIRT_IPI_FAILURE_TIMEOUT", "60")
+VIRT_VM_FAULT_TIMEOUT := env_var_or_default("VIRT_VM_FAULT_TIMEOUT", VIRT_STRESS_TIMEOUT)
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -218,6 +220,30 @@ virt-boot-failure:
 run_boot_failure: make_dtb make_boot_package build_kernel
     @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
+# 真实已发布责任的门铃失败：外部GDB跳过一次IPI，核无timer目标后续醒来先停驻。
+virt-ipi-failure:
+    @ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_ipi_failure
+
+[private]
+run_ipi_failure: make_dtb make_boot_package build_kernel
+    @python3 tools/check-ipi-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_IPI_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 旁观正式线程消费者，必须命中cookie后末页未发布的真实fault等待。
+virt-vm-fault:
+    @ERHINO_ACCEPTANCE_WORKLOAD=stress just PLATFORM=qemu MODEL=virt MODE=debug run_vm_fault
+
+[private]
+run_vm_fault: make_dtb make_boot_package build_kernel
+    @QEMU_ACCEPTANCE_PROFILE=stress tools/qemu-acceptance.sh -- python3 tools/check-vm-fault.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_VM_FAULT_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 模拟入口故障、保留真实PTE/现场：核R/W/X fence及无进展修复上界。
+virt-vm-repair:
+    @ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_vm_repair
+
+[private]
+run_vm_repair: make_dtb make_boot_package build_kernel
+    @python3 tools/check-vm-repair.py --kernel "{{KERNEL_ELF}}" -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
 # 阶段收尾：静态门、完整 debug 压力、release core、平台差异及启动失败注入。
 # 每条 QEMU 由自身路线超时保护，聚合命令本身不另设跨路线总时限。
 acceptance:
@@ -227,6 +253,9 @@ acceptance:
     @just sifive_u
     @just virt-nofd
     @just virt-boot-failure
+    @just virt-ipi-failure
+    @just virt-vm-fault
+    @just virt-vm-repair
 
 # 验收脚本将完整 QEMU 输出写入临时日志，仅在结束时显示末尾摘要；失败时保留
 # 完整日志并同时打印摘要。可用 QEMU_SUMMARY_LINES 覆盖摘要行数。

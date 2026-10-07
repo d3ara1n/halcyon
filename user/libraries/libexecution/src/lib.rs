@@ -8,6 +8,7 @@ extern crate alloc;
 pub mod assembly;
 pub mod runtime;
 pub mod source;
+mod source_registration;
 pub mod wake;
 pub mod work_queue;
 
@@ -34,3 +35,4 @@ pub use runtime::{
     Advance, Input, Requests, Runtime, SourceEvent, SourceId, SourceKind, SourcePlan, Step, Task,
     TaskFailure,
 };
+pub use source_registration::SourceRegistration;

@@ -90,26 +90,47 @@ enum ChildEntry {
     Job(Arc<Job>),
 }
 
+enum JobPhase {
+    Open,
+    Sealing { cursor: JobId },
+    Waiting { token: mt::WakeToken },
+    Dead,
+}
+
 pub(crate) struct JobInner {
     /// 直接 child Jobs（按 JobId 升序；含事务占位）。
     children: OrderedTable<ChildEntry, MetadataCharge>,
     /// 直接成员（按 Pid 升序；含事务占位）。
     members: OrderedTable<MemberEntry, MetadataCharge>,
-    /// 封口位：创建/启动提交点沿父链上行检查。
-    sealed: bool,
-    /// 完成位：sealed && 两表空时一次置位；此后两表恒空。
-    dead: bool,
+    phase: JobPhase,
+    /// 父表已摘除、但 child CLOSED 尚未发布的步内责任。
+    closing_children: usize,
 }
 
 impl JobInner {
-    /// 完成判定（持锁调用）：条件满足则置 dead 并返回 true；幂等。
-    fn complete_if_ready(&mut self) -> bool {
-        if self.sealed && !self.dead && self.members.is_empty() && self.children.is_empty() {
-            self.dead = true;
-            true
-        } else {
-            false
+    fn is_sealed(&self) -> bool {
+        !matches!(self.phase, JobPhase::Open)
+    }
+
+    fn is_dead(&self) -> bool {
+        matches!(self.phase, JobPhase::Dead)
+    }
+
+    /// 完成事实同锁发布；只有 Waiting 需要取出凭证交门外唤醒。
+    /// Sealing 已有稳定 Ready/Running 根，最后依赖无需重复 publish。
+    fn complete_if_ready(&mut self) -> Option<mt::WakeToken> {
+        if self.is_sealed()
+            && !self.is_dead()
+            && self.members.is_empty()
+            && self.children.is_empty()
+            && self.closing_children == 0
+        {
+            return match core::mem::replace(&mut self.phase, JobPhase::Dead) {
+                JobPhase::Waiting { token } => Some(token),
+                _ => None,
+            };
         }
+        None
     }
 }
 
@@ -219,7 +240,7 @@ impl Job {
             let jid = alloc_jid().expect("root Job identity exhausted");
             *root = Some(
                 Arc::try_new(Self {
-                    holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
+                    holders: capability::Holders::new(capability::ZeroPolicy::Remintable),
                     header: ObjectHeader::new(),
                     jid,
                     parent_jid: 0,
@@ -232,8 +253,8 @@ impl Job {
                         JobInner {
                             children: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
                             members: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
-                            sealed: false,
-                            dead: false,
+                            phase: JobPhase::Open,
+                            closing_children: 0,
                         },
                     ),
                     source: SignalSource::try_new(pool.clone())
@@ -255,7 +276,7 @@ impl Job {
         let account = pool.maintenance_account().clone();
         let metadata = super::resources::MetadataCharge::arc::<Self>(&pool)?;
         Arc::try_new(Self {
-            holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
+            holders: capability::Holders::new(capability::ZeroPolicy::Remintable),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             jid,
             parent_jid,
@@ -268,8 +289,8 @@ impl Job {
                 JobInner {
                     children: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
                     members: OrderedTable::new(JOB_DIRECT_ENTRY_LIMIT),
-                    sealed: false,
-                    dead: false,
+                    phase: JobPhase::Open,
+                    closing_children: 0,
                 },
             ),
             source: SignalSource::try_new(pool)?,
@@ -303,7 +324,7 @@ impl Job {
         .map_err(table_insert_error)?;
         let chain = collect_chain(self)?;
         let mut guards = lock_chain(&chain)?;
-        if guards.iter().any(|state| state.sealed) {
+        if guards.iter().any(|state| state.is_sealed()) {
             return Err(SystemCallError::ObjectClosed);
         }
         let token = next_member_token()?;
@@ -333,7 +354,7 @@ impl Job {
             return Err(SystemCallError::IllegalArgument);
         }
         let mut guards = lock_chain(&chain)?;
-        if guards.iter().any(|state| state.sealed) {
+        if guards.iter().any(|state| state.is_sealed()) {
             return Err(SystemCallError::ObjectClosed);
         }
         let token = next_member_token()?;
@@ -375,22 +396,27 @@ impl Job {
             "job member reservation token changed"
         );
         drop(removed);
-        if completed {
-            self.publish_completion();
-        }
+        Self::wake_completion(completed);
     }
 
     fn commit_child(&self, reservation: ChildReservation, job: Arc<Job>) {
-        let mut state = self.state.lock();
-        let entry = state
-            .children
-            .get_mut(reservation.jid)
-            .expect("job child reservation disappeared");
-        assert!(
-            matches!(entry, ChildEntry::Reserved { token } if *token == reservation.token),
-            "job child reservation token changed"
-        );
-        *entry = ChildEntry::Job(job);
+        let sealed = {
+            let mut state = self.state.lock();
+            let entry = state
+                .children
+                .get_mut(reservation.jid)
+                .expect("job child reservation disappeared");
+            assert!(
+                matches!(entry, ChildEntry::Reserved { token } if *token == reservation.token),
+                "job child reservation token changed"
+            );
+            *entry = ChildEntry::Job(job.clone());
+            state.is_sealed()
+        };
+        // 父游标可能已跨过此预约；封口后提交的子体独立接管传播责任。
+        if sealed {
+            job.seal();
+        }
     }
 
     fn rollback_child(self: &Arc<Self>, reservation: ChildReservation) {
@@ -407,25 +433,24 @@ impl Job {
             "job child reservation token changed"
         );
         drop(removed);
-        if completed {
-            self.publish_completion();
-        }
+        Self::wake_completion(completed);
     }
 
-    /// JobSeal：O(1) 置位（幂等，不扫表）；已空则发布独立完成责任。
-    /// 已 Dead 的 Job 上是幂等无操作。
+    /// JobSeal：O(1) 接管有界后代封口责任；重复封口不重复发布。
     fn seal(self: &Arc<Self>) {
-        let completed = {
+        {
             let mut state = self.state.lock();
-            if state.dead {
+            if state.is_sealed() {
                 return;
             }
-            state.sealed = true;
-            state.complete_if_ready()
-        };
-        if completed {
-            self.publish_completion();
+            state.phase = JobPhase::Sealing { cursor: 0 };
+            let completed = state.complete_if_ready();
+            debug_assert!(completed.is_none());
+            // 初次封口与稳定根交接同锁；成员离场不能在 publish 前留下悬空责任。
+            let root: Arc<dyn Work> = self.clone();
+            mt::publish(root);
         }
+        mt::kick();
     }
 
     /// Dead 发布后摘除成员；满足完成条件时该 Job 自身接管后续传播。
@@ -444,9 +469,7 @@ impl Job {
             "job process entry kind changed"
         );
         drop(removed);
-        if completed {
-            self.publish_completion();
-        }
+        Self::wake_completion(completed);
     }
 
     /// 按 Pid 查直接成员（仅可见 Process 条目；占位对派生不可见）。
@@ -488,9 +511,9 @@ impl Job {
     /// 自然为零——完成不变量即冻结，无需独立快照结构。
     pub(crate) fn snapshot(&self) -> JobSnapshot {
         let state = self.state.lock();
-        let state_value = if state.dead {
+        let state_value = if state.is_dead() {
             JobState::Dead
-        } else if state.sealed {
+        } else if state.is_sealed() {
             JobState::Sealed
         } else {
             JobState::Open
@@ -517,11 +540,11 @@ impl Job {
         self.source.publish(ObjectSignals::CLOSED, true);
     }
 
-    /// `dead` 同 JobInner 锁内唯一置位；唯一完成者在该锁外发布记录。
-    fn publish_completion(self: &Arc<Self>) {
-        let root: Arc<dyn Work> = self.clone();
-        mt::publish(root);
-        mt::kick();
+    fn wake_completion(token: Option<mt::WakeToken>) {
+        if let Some(token) = token {
+            drop(mt::wake(token));
+            mt::kick();
+        }
     }
 
     /// ProcessStart：Job 链 Seal 校验 → Shell gate 成员计数复核/Running
@@ -533,7 +556,7 @@ impl Job {
         let job = process.job.upgrade().expect("process Job lost its member");
         let chain = collect_chain(&job)?;
         let guards = lock_chain(&chain)?;
-        if guards.iter().any(|state| state.sealed) {
+        if guards.iter().any(|state| state.is_sealed()) {
             return Err(SystemCallError::ObjectClosed);
         }
         process.begin_running(expected)
@@ -550,7 +573,7 @@ impl Job {
         loop {
             let result = {
                 let guards = lock_chain(&chain)?;
-                if guards.iter().any(|state| state.sealed) {
+                if guards.iter().any(|state| state.is_sealed()) {
                     Err(SystemCallError::ObjectClosed)
                 } else {
                     process.reserve_member(body, &mut prepared)
@@ -573,35 +596,93 @@ impl Work for Job {
         &self.record
     }
 
-    fn step(&self) -> Outcome {
-        let completed_parent = self.parent.as_ref().and_then(|parent| {
+    fn step(self: Arc<Self>) -> Outcome {
+        enum Step {
+            Child(Option<Arc<Job>>),
+            Blocked,
+            Complete,
+        }
+        let step = {
+            let mut state = self.state.lock();
+            match state.phase {
+                JobPhase::Open => unreachable!("unsealed job work was scheduled"),
+                JobPhase::Sealing { cursor } => {
+                    let next = state
+                        .children
+                        .next_after(Some(&cursor))
+                        .map(|(jid, entry)| {
+                            (
+                                *jid,
+                                match entry {
+                                    ChildEntry::Job(job) => Some(job.clone()),
+                                    ChildEntry::Reserved { .. } => None,
+                                },
+                            )
+                        });
+                    if let Some((cursor, child)) = next {
+                        state.phase = JobPhase::Sealing { cursor };
+                        Step::Child(child)
+                    } else {
+                        let completed = state.complete_if_ready();
+                        debug_assert!(completed.is_none());
+                        if state.is_dead() {
+                            Step::Complete
+                        } else {
+                            let root: Arc<dyn Work> = self.clone();
+                            let token = mt::arm(&root);
+                            state.phase = JobPhase::Waiting { token };
+                            Step::Blocked
+                        }
+                    }
+                }
+                JobPhase::Waiting { .. } => {
+                    unreachable!("job work woke without completion")
+                }
+                JobPhase::Dead => Step::Complete,
+            }
+        };
+        match step {
+            Step::Child(child) => {
+                if let Some(child) = child {
+                    child.seal();
+                }
+                return Outcome::Ready;
+            }
+            Step::Blocked => return Outcome::Blocked,
+            Step::Complete => {}
+        }
+
+        let parent = self.parent.as_ref().map(|parent| {
             let parent = parent.upgrade().expect("ancestor job lost its child");
-            let (removed, completed) = {
+            let removed = {
                 let mut state = parent.state.lock();
                 let removed = state
                     .children
                     .remove(self.jid)
                     .expect("job child disappeared before ancestor removal");
-                let completed = state.complete_if_ready();
-                (removed, completed)
+                state.closing_children += 1;
+                debug_assert!(state.closing_children <= crate::hart::HART_NUM_LIMIT);
+                removed
             };
             match removed.value() {
                 ChildEntry::Job(child) => {
-                    assert!(
-                        core::ptr::eq(Arc::as_ptr(child), self),
-                        "job child entry changed"
-                    )
+                    assert!(Arc::ptr_eq(child, &self), "job child entry changed")
                 }
                 ChildEntry::Reserved { .. } => panic!("job child remained reserved"),
             }
             // WorkRecord 仍强持本 Job，完整节点及付款只在父门外释放。
             drop(removed);
-            completed.then_some(parent)
+            parent
         });
         // CLOSED 观察者可依赖父枚举已移除自己；父责任不先于本层完成信号。
         self.publish_closed();
-        if let Some(parent) = completed_parent {
-            parent.publish_completion();
+        if let Some(parent) = parent {
+            let completed = {
+                let mut state = parent.state.lock();
+                state.closing_children -= 1;
+                state.complete_if_ready()
+            };
+            Self::wake_completion(completed);
         }
         Outcome::Done
     }

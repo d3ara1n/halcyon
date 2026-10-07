@@ -2,38 +2,14 @@
 """以外部 GDB 注入验证 Ready 前失败广播，不在内核中加入测试开关。"""
 
 import argparse
-import os
 from pathlib import Path
 import re
-import signal
 import socket
 import subprocess
 import sys
 
 
-def symbols(kernel):
-    output = subprocess.check_output(
-        ["riscv64-elf-nm", "-C", "--defined-only", str(kernel)], text=True
-    )
-    result = {}
-    for line in output.splitlines():
-        fields = line.split(maxsplit=2)
-        if len(fields) == 3:
-            result[fields[2]] = int(fields[0], 16)
-    return result
-
-
-def stop_group(process):
-    # throttle wrapper 及其 QEMU 必须一起清理，即使调试器超时。
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+from qemu_gdb import fresh_logs, symbols, stop_group
 
 
 def run_case(mode, kernel, addresses, command, logs, timeout):
@@ -124,7 +100,7 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("QEMU command is required")
-    args.logs.mkdir(parents=True, exist_ok=True)
+    args.logs = fresh_logs(args.logs)
     addresses = symbols(args.kernel)
     for mode in ("panic", "alloc", "fatal"):
         run_case(mode, args.kernel, addresses, command, args.logs, args.timeout)

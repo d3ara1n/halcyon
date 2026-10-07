@@ -1,6 +1,6 @@
 # Capability 与资源释放重构
 
-状态：**设计轮次 4：权限模型已定稿（见“权限模型目标设计”），角色即对象类型（设计轮次 4，Mailbox/Notification 拆分与 ReplyObservation）已定稿；剩余实现设计门见该节；施工进度由[内核整体接入](archived/todo-2026-10-01-object-chain-kernel-integration.md)承载，约定范围已实施交付**。用户已确认消除特殊资源特判，以及 Close 必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案，本篇不再独立决定它们的实现。
+状态：**权限模型、角色即对象类型及约定消费者已接入交付，后续Job重铸授权修复已完成**。首次实施见[内核整体接入档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)，后续处置及验证见[审查修复档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)。用户已确认消除特殊资源特判，以及Close必成、有界释放本地持有而不隐式等待完整退休。总范围由[全项目重构总纲](todo-2026-09-29-system-redesign.md)拥有；维护执行和进程回收分别立案。早期源码盘点、施工门及crate未接入记录均为历史，不是当前阻塞。
 
 ## 目标与本轮边界
 
@@ -177,7 +177,7 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 - 保留内核 SendOnce，改为每份独立消费额度的对象：无 DUPLICATE、无重铸入口；成功入队与 Pending→Sent 原子化，队列满保留 Pending；最后持有仅在 Pending 时放弃。理由是限制不可信回复者最多入队一条。
 - SendOnce 显式持有所属授权域的一份 authority；已接受消息持稳定 use 责任，接收后由 Delivery/请求 owner 承接。Lifetime 观察壳独立，CLOSED 定义为该域 authority 与已接受 use 都耗尽。on_last_capability 只表示新调用授权耗尽。
 
-### 剩余设计门
+### 设计期接缝门（历史，当前范围见下方接力）
 
 1. ~~capability 实现~~：已由“施工进度/内核拼装草图”闭合。
 2. [IPC 分案]：authority→use→终结观察责任链、SendOnce 准入、队列中 capability 环的禁止或回收、付款、队列上界、接收失败与关闭排空。环未闭合前 TRANSFER 迁移不算完成。
@@ -215,9 +215,11 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 
 ## 当前接力
 
-已确认消除公共资源特判、Close 必成且不等待完整退休。上一轮保留同步 Close/Tunnel 原组合的建议已被全项目重审取代；源码盘点和外部事实继续作为现状证据。接下来闭合目标对象关系及上述设计门，与维护执行和进程自动回收分案共同施工。本案没有代码实现或验收完成宣告。
+公共Close、capability表/claim、KernelObject、共享ABI/libkernel及实际IPC/进程消费者已整体迁移，旧handle_table、role、MAP与Tunnel lease专路已删除。Job与ProcessControl为Remintable，Job归零不消除父MANAGE派生资格；出生票据与其他Terminal对象仍按各自消费/放弃合同终结。当前实现由[task](../notes/impls/task.md)及相关impls拥有，验证见篇首两份档案，不重复旧设计门。
 
-## 施工进度
+本篇保留不可达capability环收集这一范围边界：当前合法TRANSFER及已触发关闭的有界排空已经接通，未承诺对未归零的不可达环自动收集；不把早期“TRANSFER全链待完成”当成当前正常运输未接入。若未来承诺所有不可达对象自动退款，由IPC/资金owner先闭合环的允许图、识别/回收、付款及观察语义，再建立对应唯一实施记录；完成需含消息滞留、跨域退出、迟到释放与共享资源验证。CapTable空槽搜索的性能候选保留原测量触发，不是当前正确性欠账。
+
+## 早期crate施工进度（历史）
 
 ### 切面 1：`os/capability` crate（crate 就绪，未接入内核）
 
@@ -228,21 +230,21 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 - `CapTable`：Vacant/Occupied/Reserved/Claimed/Retired；`insert`/`commit` 失败返还 owner；`close` 对 Claimed 槽只撤销返还资格；`claim`/`commit_claim`/`restore` 按预约 id + 槽代次仲裁；`shut` 为表退出线性化点，此后拒绝安装与返还；`take_next_bounded` 有界摘出并回收 Claimed/Reserved。
 - 验证（开发证据）：`cargo test -p capability --target aarch64-apple-darwin` 12 项通过；os-host clippy `-D warnings` 通过。未运行 `just check`/QEMU（内核尚未接入）。
 
-登记债务：
+当时债务与当前处置：
 
 | 现状 | 目标 | 删除条件 |
 |---|---|---|
-| `CapTable::extract` 由调用方传入运输位 | 固定检查 `Rights::TRANSFER` | shared ABI 合并 TRANSIT/GRANT 时同步改为常量并删除参数 |
-| `os/handle_table` 与 `os/capability` 并存 | 仅 `os/capability` | 内核 HandleTable 迁移完成时删除旧 crate 与 workspace 条目 |
+| `CapTable::extract` 当时由调用方传入运输位 | 固定检查 `Rights::TRANSFER` | 已随共享ABI迁移关闭，旧参数已删除 |
+| `os/handle_table` 当时与 `os/capability` 并存 | 仅 `os/capability` | 已随内核迁移删除旧crate与workspace条目 |
 | `reserve_slot` 线性扫描空槽 | 空闲链 | 沿用旧 crate 已登记的真实负载触发条件 |
 
 接入归属：本 crate 属于总纲“对象持有与释放链”，按[责任链施工方式](todo-2026-09-29-system-redesign.md#施工方式按责任链整段替换)在该链就绪后整段接入内核，不单独接入。接入条件：维护执行与进程自动回收分案闭合并产出各自 crate/契约；本链涉及对象的释放接缝（含 Tunnel 需随 VM 链拆分的部分）确定归属。
 
-### 内核拼装草图（设计产物，未写代码）
+### 内核拼装契约（原草图已接入，按后续裁决修正）
 
 闭合剩余设计门 1；执行承载见[维护执行拼装草图](todo-2026-09-29-kernel-maintenance-execution.md)，进程衔接见[回收结构定稿](todo-2026-09-29-process-automatic-reclamation.md)。
 
-**Authority 落点**：每个授权对象（Receive/Send/SendOnce、Notification、MemoryObject、Endpoint/Invitation、ProcessBuilder/ProcessControl、ThreadControl/启动票据、Job、Pool）在对象本体内嵌一个 `Holders`，`impl Authority for Arc<Obj>`。表元素为 `Cap<ObjectRef>`（`Arc<dyn KernelObject>`，`KernelObject: Authority`）。删除 `CapabilityRef` 的 ThreadControl downcast Drop、`HandleRole`、`PendingClose`。ZeroPolicy 按类型固定：ProcessControl 为 Remintable，其余 Terminal。
+**Authority落点**：授权对象拥有Holders，表元素为Cap<ObjectRef>；KernelObject只承载授权对象共同合同。删除CapabilityRef的ThreadControl downcast Drop、HandleRole与PendingClose。ZeroPolicy按业务寿命决定：ProcessControl及root/child Job为Remintable，其余类型按各自Terminal合同；Job不能因最后cap消散封闭父MANAGE的重新派生资格。
 
 **角色即对象类型（用户确认）**：不同角色一律表达为不同对象类型，不在 capability 上附加 role；rights 只裁剪同一对象的授权。判据：两类 capability 需要不同的最后持有语义或消费语义时，必须是不同对象类型。
 - Mailbox：`MailboxReceiver`、`MailboxSender`、`MailboxOnceSender` 三个对象类型共享 `MailboxCore`，各自内嵌 Terminal `Holders`。最后 Receiver 消失 → 邮箱关闭（发送侧 PEER_CLOSED）；badge 属于 Sender/OnceSender 对象。
@@ -272,7 +274,9 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 
 **LastCapability 执行点与承载**：调用方在全部锁外调用 `obj.on_last_capability()`：只做对象自身同步域内的有界仲裁（Pending→Aborted、关闭接收准入等），需后续工作则 publish 对象内嵌的 `retire` 记录。记录出生内嵌、publish 零分配，故 Close 必成。普通内核 `Arc` 末端 drop 只释放存储，不展开长链；有子项的对象由记录 step 收尾。
 
-**消费者调用点**
+**原拼装调用点概览（历史）**
+
+下表保留最初草图；其锁内/锁外切分已由上方“授权接受/安装预约”轮次取代，不作当前动作清单。当前不得在表锁内执行入队、业务提交或uaccess；实际接口和调用流以impls/代码为准。
 
 | 操作 | 表锁内 | 表锁外 |
 |---|---|---|
@@ -297,4 +301,4 @@ Tunnel 拆分并入对象持有与释放链。
 - **Attach**：维持一 handle（只返回 Endpoint）；通用 Map 以 Endpoint 为 backing 授权来源，不导出第二个 MemoryObject handle。
 - **Runnel 失败**：Guest/初始化失败承载为完整 owner 集合 {Endpoint, 已建立 View}，Create 失败另含未交付 Invitation。库内自动收束：先激活完整 Unmap（内核持有推进，不要求等物理退款），再 Close Endpoint，只返回错误；删除 `InitFailure<Endpoint>`/`CreateFailure` 回传 owner。readiness 以 Start 表达，PEER_ATTACHED 只表示授权接入；`srv_fs` stream 的 attached gate 改等 Start。
 - **Mailbox 关闭**：Send 与 shut 同一 core 锁下判定；已出队 ReceiveTxn 是稳定 owner，强持 core/use、Message（含 delivery）、cap-table 预约与结果保护，Close 不取消；closed 后 rollback 直接交有界退休不重入队。close 在锁内 shut、发布 CLOSED 电平与等待者通知、publish 内嵌 retire Work；Work 每步摘一条消息（上界 MESSAGE_HANDLE_MAX 个 handle + 一次 delivery 公共释放 + payload/VecDeque 归还），锁外经公共释放入口（覆盖普通对象最终析构）只 publish 不展开。`queue.empty && receiving==none` 前 Blocked；该 Done 只是本地队列/接收责任结束，不代表所指对象已退休。
-- **TRANSFER 门保留**：队列中 capability 环未闭合，TRANSFER 标为待闭合；IPC 分案唯一记录登记环的允许路径、资金归属与最终禁止或回收条件。本链不宣称 TRANSFER 全链完成。
+- **TRANSFER边界**：当前正常运输及已触发关闭的排空已交付；未归零的不可达capability环收集不在本链承诺内。未来扩大自动退款保证时按本篇当前接力立案，不把原“待闭合”标记误作当前消费者尚未迁移。

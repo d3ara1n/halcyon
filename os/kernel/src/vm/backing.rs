@@ -430,7 +430,7 @@ impl Work for Backing {
     fn record(&self) -> &WorkRecord {
         &self.record
     }
-    fn step(&self) -> Outcome {
+    fn step(self: Arc<Self>) -> Outcome {
         let (step, storage) = {
             let mut state = self.state.lock();
             let State { segments, root } = &mut *state;

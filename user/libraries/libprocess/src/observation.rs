@@ -6,7 +6,8 @@ use erhino_shared::{
     object::{Handle, ObjectSignals},
     time::Deadline,
 };
-use libexecution::runtime::{Input, Requests, SourceId, SourceKind};
+use libexecution::SourceRegistration;
+use libexecution::runtime::{Input, Requests, SourceId, SourceKind, SourcePlan};
 
 static NEXT_OBSERVATION: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1);
 
@@ -115,9 +116,7 @@ impl ObservationState {
 #[derive(Debug, Default)]
 pub struct ObservationSlot {
     request: Option<Observation>,
-    source: Option<SourceId>,
-    installing: bool,
-    removing: bool,
+    registration: SourceRegistration,
     result: Option<ObservationResult>,
 }
 
@@ -134,29 +133,30 @@ impl ObservationSlot {
                 Err(SystemCallError::ObjectBusy)
             };
         }
-        requests.add_source(request.control, request.signals, request.id)?;
+        self.registration.install(
+            requests,
+            SourcePlan::new(request.control, request.signals),
+            request.id,
+        )?;
         self.request = Some(request);
-        self.installing = true;
         Ok(())
     }
 
     pub fn registered(&mut self, kind: SourceKind, source: SourceId) {
         if self.request.is_some_and(|request| request.id == kind) {
-            self.source = Some(source);
-            self.installing = false;
+            self.registration.registered(kind, source);
         }
     }
 
     pub fn unregistered(&mut self, kind: SourceKind, source: SourceId) {
-        if self.request.is_some_and(|request| request.id == kind) && self.source == Some(source) {
-            self.source = None;
-            self.removing = false;
+        if self.request.is_some_and(|request| request.id == kind) {
+            self.registration.unregistered(source);
         }
     }
 
     pub fn refused(&mut self, kind: SourceKind, error: SystemCallError) {
         if self.request.is_some_and(|request| request.id == kind) {
-            self.installing = false;
+            self.registration.refused(kind);
             self.result = Some(ObservationResult::SourceError(error));
         }
     }
@@ -177,6 +177,7 @@ impl ObservationSlot {
     /// 停止仍要撤销正在等待的来源；调用方取得回执后才可交付机器。
     pub fn cancel(&mut self) {
         if self.request.is_some() {
+            self.registration.cancel();
             self.result = Some(ObservationResult::SourceError(
                 SystemCallError::ObjectClosed,
             ));
@@ -194,7 +195,7 @@ impl ObservationSlot {
             return Ok(None);
         };
         while let Some(event) = input.pull() {
-            if event.kind != request.id || self.source != Some(event.source) {
+            if event.kind != request.id || self.registration.source() != Some(event.source) {
                 continue;
             }
             if self.result.is_none() {
@@ -215,12 +216,9 @@ impl ObservationSlot {
             // 即使WaitSet记录尚未取出，也不会把已就绪来源误判为超时。
             self.result = Some(probe(request).unwrap_or_else(ObservationResult::SourceError));
         }
-        if self.result.is_some() && !self.installing {
-            if let Some(source) = self.source {
-                if !self.removing {
-                    requests.remove(source)?;
-                    self.removing = true;
-                }
+        if self.result.is_some() && !self.registration.is_installing() {
+            if self.registration.source().is_some() {
+                self.registration.remove(requests)?;
             } else {
                 let result = self
                     .result

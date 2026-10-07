@@ -24,16 +24,14 @@ pub enum ReserveFailed {
     CapacityChanged,
 }
 
-/// 两份实际分配的共同 owner；同时准备、同时发布，旧块锁外释放。
+/// 单一 arena 的实际分配 owner；空槽链内嵌节点，旧块锁外释放。
 pub struct OrdMapStorage<K, V, C> {
     nodes: Buffer<Node<K, V>, C>,
-    free: Buffer<u32, C>,
 }
 impl<K, V, C> OrdMapStorage<K, V, C> {
     pub const fn new() -> Self {
         Self {
             nodes: Buffer::new(),
-            free: Buffer::new(),
         }
     }
     pub fn try_empty<F: Funding<Charge = C>>(
@@ -44,11 +42,10 @@ impl<K, V, C> OrdMapStorage<K, V, C> {
             return Err(StorageError::Layout);
         }
         let nodes = Buffer::try_empty(capacity, payer)?;
-        let free = Buffer::try_empty(capacity, payer)?;
-        Ok(Self { nodes, free })
+        Ok(Self { nodes })
     }
     pub fn capacity(&self) -> usize {
-        self.nodes.capacity().min(self.free.capacity())
+        self.nodes.capacity()
     }
 }
 impl<K, V, C> Default for OrdMapStorage<K, V, C> {
@@ -75,7 +72,8 @@ impl<'a, K: Ord + Copy, V, C> Iterator for Iter<'a, K, V, C> {
 
 pub struct OrdMap<K: Copy, V, C> {
     nodes: Buffer<Node<K, V>, C>,
-    free: Buffer<u32, C>,
+    /// 空节点的 left 为后继；数目由 nodes.len() - len 唯一推导。
+    free_head: u32,
     /// 已承诺给尚未插入的条目的空闲槽数。
     reserved: usize,
     root: u32,
@@ -102,7 +100,7 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
     pub const fn new() -> Self {
         Self {
             nodes: Buffer::new(),
-            free: Buffer::new(),
+            free_head: NIL,
             reserved: 0,
             root: NIL,
             len: 0,
@@ -122,24 +120,22 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
         self.reserved
     }
 
-    /// 已摘除条目返还逻辑槽；容量与两份付款 owner 仍原样保留。
+    /// 已摘除条目返还逻辑槽；容量与其付款 owner 仍原样保留。
     pub(crate) fn reserve_recycled(&mut self, n: usize) {
-        let common = self.nodes.capacity().min(self.free.capacity());
-        let spare = self.free.len() + (common - self.nodes.len());
+        let spare = self.capacity() - self.len;
         assert!(
-            n <= self.free.len() && self.reserved <= spare && n <= spare - self.reserved,
+            n <= self.free_slots() && self.reserved <= spare && n <= spare - self.reserved,
             "recycled reservation exceeds guaranteed storage"
         );
         self.reserved += n;
     }
 
-    #[cfg(test)]
-    pub(crate) fn storage_capacities(&self) -> (usize, usize) {
-        (self.nodes.capacity(), self.free.capacity())
+    fn free_slots(&self) -> usize {
+        self.nodes.len() - self.len
     }
 
     pub fn capacity(&self) -> usize {
-        self.nodes.capacity().min(self.free.capacity())
+        self.nodes.capacity()
     }
 
     fn required(&self, n: usize) -> Result<usize, ReserveFailed> {
@@ -147,7 +143,7 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
             .reserved
             .checked_add(n)
             .ok_or(ReserveFailed::Overflow)?;
-        let append = need.saturating_sub(self.free.len());
+        let append = need.saturating_sub(self.free_slots());
         self.nodes
             .len()
             .checked_add(append)
@@ -183,7 +179,7 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
         }
     }
 
-    /// 同次换两块，不分配、不退费；prepared 交回旧空分配。
+    /// 换 arena 不改变索引与空链，不分配、不退费；prepared 交回旧空分配。
     pub fn install_storage(
         &mut self,
         prepared: &mut OrdMapStorage<K, V, C>,
@@ -192,16 +188,12 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
             return Err(ReserveFailed::CapacityChanged);
         }
         assert!(
-            prepared.nodes.is_empty() && prepared.free.is_empty(),
+            prepared.nodes.is_empty(),
             "prepared index storage contains data"
         );
-        // 两边均已完整准备；len/free/预约关系保证第二步不会在第一步之后失败。
         self.nodes
             .replace_storage(&mut prepared.nodes)
             .expect("prepared arena fits live nodes");
-        self.free
-            .replace_storage(&mut prepared.free)
-            .expect("prepared free slots fit logical credits");
         Ok(())
     }
 
@@ -233,9 +225,9 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
         );
         self.nodes.forget_values();
         let nodes = core::mem::take(&mut self.nodes);
-        let free = core::mem::take(&mut self.free);
+        self.free_head = NIL;
         self.root = NIL;
-        OrdMapStorage { nodes, free }
+        OrdMapStorage { nodes }
     }
 
     /// 自 `start`（含）起的有序迭代；每步 O(log n)，总工作量随实际遍历条目数。
@@ -273,22 +265,22 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
             right: NIL,
             height: 1,
         };
-        let slot = match self.free.pop() {
-            Some(slot) => {
-                self.nodes[slot as usize] = fresh;
-                slot
-            }
-            None => {
-                debug_assert!(self.nodes.len() < self.nodes.capacity());
-                self.nodes.push(fresh);
-                (self.nodes.len() - 1) as u32
-            }
+        let slot = if self.free_head != NIL {
+            let slot = self.free_head;
+            debug_assert!(self.nodes[slot as usize].value.is_none());
+            self.free_head = self.nodes[slot as usize].left;
+            self.nodes[slot as usize] = fresh;
+            slot
+        } else {
+            debug_assert!(self.nodes.len() < self.nodes.capacity());
+            self.nodes.push(fresh);
+            (self.nodes.len() - 1) as u32
         };
         self.root = self.insert_at(self.root, slot);
         self.len += 1;
     }
 
-    /// 删除并返回键对应的值；槽归还 free（不释放存储）。
+    /// 删除并返回键对应的值；空槽入 arena 空链，不释放存储。
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let mut removed = NIL;
         self.root = self.remove_at(self.root, key, &mut removed);
@@ -297,8 +289,8 @@ impl<K: Ord + Copy, V, C> OrdMap<K, V, C> {
         }
         self.len -= 1;
         let value = self.nodes[removed as usize].value.take();
-        debug_assert!(self.free.len() < self.free.capacity());
-        self.free.push(removed);
+        self.nodes[removed as usize].left = self.free_head;
+        self.free_head = removed;
         value
     }
 
@@ -570,18 +562,18 @@ mod tests {
     }
 
     #[test]
-    fn second_buffer_funding_failure_returns_first_charge_without_publication() {
+    fn storage_funding_failure_does_not_publish_charge_or_capacity() {
         let payer = Meter {
             live: Default::default(),
             calls: Default::default(),
-            deny: Some(2),
+            deny: Some(1),
         };
         let map = OrdMap::<u64, (), Charge>::new();
         assert!(matches!(
             OrdMapStorage::<u64, (), Charge>::try_empty(8, &payer),
             Err(StorageError::Funding(()))
         ));
-        assert_eq!(payer.calls.get(), 2);
+        assert_eq!(payer.calls.get(), 1);
         assert_eq!(payer.live.get(), 0);
         assert_eq!((map.capacity(), map.reserved(), map.len()), (0, 0, 0));
     }
@@ -620,17 +612,17 @@ mod tests {
         }
         let mut larger = OrdMapStorage::try_empty(12, &payer).unwrap();
         map.reserve(8, &mut larger).unwrap();
-        assert_eq!(payer.live.get(), 4);
-        drop(larger); // 原两块仅在外层释放时退款。
         assert_eq!(payer.live.get(), 2);
+        drop(larger); // 原 arena 仅在外层释放时退款。
+        assert_eq!(payer.live.get(), 1);
         for key in 0..4 {
             map.remove(&key);
         }
         map.unreserve(8);
-        assert_eq!(payer.live.get(), 2); // 空逻辑索引仍保有实际容量。
+        assert_eq!(payer.live.get(), 1); // 空逻辑索引仍保有实际容量。
         let retired = map.take_empty_storage();
         drop(map);
-        assert_eq!(payer.live.get(), 2);
+        assert_eq!(payer.live.get(), 1);
         drop(retired);
         assert_eq!(payer.live.get(), 0);
     }
@@ -656,16 +648,16 @@ mod tests {
     fn reserved_inserts_do_not_grow_storage() {
         let mut map = OrdMap::<u64, u64, ()>::new();
         reserve(&mut map, 64).unwrap();
-        let cap = (map.nodes.capacity(), map.free.capacity());
+        let cap = map.capacity();
         for k in (0..64).rev() {
             map.insert(k * 3, k);
         }
-        assert_eq!((map.nodes.capacity(), map.free.capacity()), cap);
+        assert_eq!(map.capacity(), cap);
         assert_eq!(map.reserved(), 0);
         for k in 0..32 {
             assert_eq!(map.remove(&(k * 3)), Some(k));
         }
-        assert_eq!((map.nodes.capacity(), map.free.capacity()), cap);
+        assert_eq!(map.capacity(), cap);
     }
 
     #[test]
@@ -673,21 +665,21 @@ mod tests {
         let mut map = OrdMap::<u64, (), ()>::new();
         reserve(&mut map, 8).unwrap();
         reserve(&mut map, 8).unwrap();
-        let capacity = (map.nodes.capacity(), map.free.capacity());
+        let capacity = map.capacity();
         for key in 0..16 {
             map.insert(key, ());
         }
-        assert_eq!((map.nodes.capacity(), map.free.capacity()), capacity);
+        assert_eq!(map.capacity(), capacity);
         for key in 0..8 {
             map.remove(&key);
         }
         reserve(&mut map, 8).unwrap();
         reserve(&mut map, 8).unwrap();
-        let capacity = (map.nodes.capacity(), map.free.capacity());
+        let capacity = map.capacity();
         for key in 16..32 {
             map.insert(key, ());
         }
-        assert_eq!((map.nodes.capacity(), map.free.capacity()), capacity);
+        assert_eq!(map.capacity(), capacity);
         assert_eq!(map.len(), 24);
     }
 
@@ -695,9 +687,10 @@ mod tests {
     fn reservation_failure_does_not_publish_credit_or_skip_free_storage() {
         let mut map = OrdMap::<u64, (), ()>::new();
         reserve(&mut map, 2).unwrap();
+        let initial_capacity = map.capacity();
         assert!(reserve(&mut map, usize::MAX).is_err());
         assert_eq!(map.reserved(), 2);
-        assert_eq!(map.nodes.capacity(), map.free.capacity());
+        assert_eq!(map.capacity(), initial_capacity);
         let mut stale = OrdMapStorage::new();
         assert_eq!(
             map.reserve(8, &mut stale),
@@ -707,11 +700,11 @@ mod tests {
         for key in 0..2 {
             map.insert(key, ());
         }
-        let capacity = map.free.capacity();
+        let capacity = map.capacity();
         for key in 0..2 {
             map.remove(&key);
         }
-        assert_eq!(map.free.capacity(), capacity);
+        assert_eq!(map.capacity(), capacity);
     }
 
     #[test]

@@ -255,7 +255,7 @@ impl Work for Endpoint {
     fn record(&self) -> &WorkRecord {
         self.source.record()
     }
-    fn step(&self) -> maintenance::record::Outcome {
+    fn step(self: Arc<Self>) -> maintenance::record::Outcome {
         let step = {
             let _state = self.connection.state.lock();
             // SAFETY: 单候选扫描在来源域内完成，回调锁外运行。

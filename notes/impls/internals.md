@@ -37,23 +37,25 @@ DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只�
 
 **每个唤醒必须有主人，无主的周期性唤醒（保险 timer、心跳）不存在。** hart 敢睡，当且仅当「自己的期限已上闹钟，或别人的请求会按门铃」：
 
-- **timer = 自己的确定到期点**：时间片或当前等待的 Timeout 登记在发起 hart 的索引最小堆；登记、arm 与到期弹出由 owner hart 完成，跨 hart 提前完成只按稳定 token 注销，不远程重编程 timer。
-- **IPI = 他方的请求**：门铃语义（SBI `send_ipi` 无载荷，仅置目标核 SSIP）。发请求的一方必然醒着——睡着的一方发不出请求，逻辑上排除全员睡死。
+- **timer = 自己的确定到期点**：Thread出生内嵌稳定pin节点，per-hart侵入AVL按期限/地址排序，载荷持Thread/epoch。到期先摘链再门外提示，由执行owner复检完成；跨hart取消只摘匹配epoch，不远程编程timer。
+- **IPI = 他方的请求**：SBI只置SSIP，Ready/Pending电平拥有真实责任。发送成功与合并门铃下由idle登记/复检握手保证重新读电平；规范允许发送失败，失败进入下述不可恢复停止政策，不能只凭发送方尚醒就推导目标一定推进。
 - **设备中断 = 设备的请求**：主人是设备（中断接入后生效）。
 
-唤醒后的行为统一：清中断源 → 查自己管辖的待办（调度域就绪队列、TimerQueue、跨核请求），有事做事，无事回睡。
+正常唤醒后清中断源，读取调度域Ready、期限与运输Pending；无工作回睡。若runtime_stop已requested，先进入停止检查，不再挑选工作。
 
 ### idle 与系统复位
 
 idle 只表达「当前 hart 暂无可运行线程」：hart 在所属调度域登记 idle 位，双重检查 Ready 后进入 WFI；入队方据 idle 位选择 IPI 目标。idle 位是调度唤醒路由状态，不参与整机生命周期推断。Sleep 与有限 WaitMany 的唤醒主人仍是 per-hart TimerQueue entry。
 
-整机终局只能由 `SystemReset` 对象触发。该对象是无等待叶子对象；primordial capability 由 bootstrap 交给 init，成功操作要求 Handle 的 `MANAGE` right。syscall 解析 eRhino 自有 `ResetAction::{Shutdown, Reboot}` 与 `ResetReason::{Requested, SystemFailure}`，显式映射为 SBI SRST 的 shutdown/cold reboot 和 no reason/system failure，不暴露或透传 SBI 编码。
+显式平台终局由SystemReset对象触发；内部不可恢复clock/门铃故障由runtime_stop协作停驻。SystemReset是无等待叶子对象，bootstrap交primordial capability给init，调用要求MANAGE；自有ResetAction/ResetReason显式映射SRST，不透传SBI编码。
 
 对象内 `in_flight` 原子门保证全系统同一时刻至多一个平台请求；竞争返回 `ObjectBusy`。SBI `NOT_SUPPORTED` 映射为 `NotSupported`，其余后端拒绝及规范所称成功调用的异常返回映射为 `InternalError`；失败会释放门，内核不以永久停放伪装 reset 成功。
 
 ### IPI 门铃与 remote call
 
-IPI 仍只有门铃语义：`send_ipi` 置目标 SSIP，不携带载荷。Remote Call 参数位于每 hart 固定全局槽，Pending 电平才是工作真值；目标在 trap 与调度安全点有界消费，普通调度/终止门铃与 Remote Call 共用 SSIP 但互不伪造待办。当前首个动作是 AddressSpace epoch fence，详见 [`call.md`](call.md)「Remote Call」。
+IPI只置目标SSIP，不携载荷；[vm/remote.rs](../../os/kernel/src/vm/remote.rs)的每hart固定槽与Pending电平拥有运输责任，目标在trap/调度安全点有界消费。Ready、maintenance、Freeze与remote通知共用runtime_stop::notify_slots：先发布责任，raw发送失败则Release request，不在可能持锁的调用栈中park；停止广播自身使用raw发送避免递归。
+
+runtime_stop的REQUESTED是不可逆全局事实，继续运行的U有有限硬件quantum，M/syscall有结构性工作界；主循环、trap锁外与U准入边界Acquire复检。无期限WFI本身不执行责任，后续任意唤醒先check再调度。若平台持续不能送门铃，允许该hart保持WFI，不把PARKED当全admitted完成barrier，不等它参与退款。首个STOPPED转换者只报告一次，已进入检查的hartRust park；终态资源留至重启，不保证撤销既发设备/DMA。
 
 ## tp 寄存器
 
@@ -94,7 +96,7 @@ bootstrap、HartId/HartSlot、现代 DT capability、共同 trap、CSR、UserCon
 分层管理三种语义不同的资源：
 
 - 物理供给（os/memory_supply，固定 workspace planner）：启动期按 permanent、boot-held、system、user-free 分类；FramePool metadata、16×1 MiB heap chunks 与当前为零的 recovery 子预算以不同 ticket 类型隔离，失败不发布部分计划。
-- 用户帧库存（os/frame_pool，外置元数据分级 order 树）：只发布 planner 的 user-free 与生命周期结束的 user boot-held；claim、split、coalesce、指定区间和归还的库存步骤由固定 arena 数与地址位宽限定。普通页由私有 claim 保活，在 POOL 锁外清零并提交来源 Pool charge 后才发布 funded owner；页表直接持有 funded owner，保留内容的启动 reservation 由 `BootHeldExtent` 经唯一 unsafe adopt 接管、消费式切分并在最后析构时回投。设计细节见 [`mm.md`](mm.md)「帧库存」。
+- 用户帧库存（os/frame_pool，外置元数据分级order树）：只发布user-free与生命周期结束的boot-held；步骤由固定arena数与地址位宽限定。普通claim锁外清零后commit来源Pool charge；页表root持funded owner，中间表adopt/reclaim把PTE物理身份与空间聚合charge配对；保留内容的BootHeldExtent只从验证后的启动移交点adopt。具体所有权与退款由[mm.md](mm.md)拥有。
 - 内核堆（talc）：管任意尺寸小对象；`SystemSource` 在 allocator 忙碌时只从独立 `SYSTEM_SUPPLY` O(1) 消费一个启动期预清零的heap ticket，相邻最近arena时extend、非相邻则独立claim，end仅在allocator锁下更新；不扫描/清零，不进入用户FramePool或recovery，完整供给契约由[mm](mm.md)拥有。Talc 找不到可用块且无法再取得 ticket 时普通 metadata 分配 OOM；对象级 admission 是独立机制。启用 talc `counters` 后，Ready 建立采样基线，用户 trap 出口、成功 Bind 与获得 SystemReset authority 的 reset 前读取 claimed/allocated/available/fragment 计数并更新原子采样极值；复制快照并释放 HEAP 锁后才读独立的 system ticket 计数并写日志。`chunks` 是已永久 claim 的数量，不等于耗尽的堆；采样极值不覆盖单次 syscall 内短暂峰值。`source_failures` 与布局只记 SystemSource 取不到 ticket 或 claim 失败的请求；这些计数和 aggregate available 均不提供 allocator 最大连续可分配块。
 
 三层的碎片域、锁与失败边界彼此独立。planner 使 FramePool metadata 和堆供血都不再反向依赖用户库存，从物理所有权上消除“库存元数据由自身供血”及 HEAP→POOL 的运行时环。
@@ -114,8 +116,8 @@ per-hart Execution唯一持有Rotor与U起点；政策量子U10ms/M2ms、账户1
 
 Account最后析构先take父强根，收束自身metadata/付款Pool、旧欠账移交和等锁；M区间的实际清理时间直接charge父Ledger，同QUEUE与父在途grant线性化，不补信用/伪造grant。父保活使其析构在本层测量终点后独立发生。每hart独立原子M类别事实与累计已归父cleanup，Dtor不重借Execution；grant用其始末差扣除已经直接计入父的时间，M批仍计完整区间。非M清理不向M账本注入新费用，U dispatch中的清理由U区间涵盖；明确排除的紧急/仲裁开销沿共享边界。结束采样后的固定记账/解锁、Account T析构后的Arc弱尾deallocation为显式共享尾部。成本诊断仅发布编译器静态类型名字和原子最大值，不分配/保活Work；观测最大值不证明WCET或账户公平。
 
-Work 使用出生内嵌 Record，依赖通过 arm→登记→复检转交 WakeToken。来源 Work 的 Step 只选一个候选，Hint target 与业务回调锁外执行；状态恒由来源电平/执行 owner 保留。旧固定 DebtLedger、request/deferred、notify_work 与 wait_context 已删除，transport FIFO 收件归 vm::remote，具体 VM owner 由 [mm](mm.md) 拥有。
+Work使用出生内嵌Record，step接收Arc<Self>：执行器原根保留到finish结算后的门外析构，receiver clone支撑领域arm；receiver Drop不是最后引用。Blocked根在Record字段，Running根在执行器局部。依赖经arm→登记→复检转WakeToken。publish合并通知及wake活跃记录的多余Arc在QUEUE门内归还：Queued/Running/Blocked的执行根由同一门保护，此处只执行非最后引用计数。wake对Idle/Done返回潜在退休根，调用方带出全部领域门后销毁，kick亦在门外。Work::record只借稳定内嵌字段，不取业务锁、分配或回调。Job的有界封口、Change/Retire/Builder/Shell共用该协议，不需要自Weak升级锁。运输FIFO由vm::remote拥有，VM领域owner见[mm](mm.md)。
 
 完整M原子包含队列领取、step、finish、最后执行根析构、Account父归账与settlement。业务数量由各Work的有限单元界定；AVL/slot容器依实际付款容量计高阶成本，Bootstrap准备还包含独立heap gap搜索与页/metadata准入。空私有数组收束先清业务值、最后只释放真实allocation；多份消息authority依次释放，费用和父根析构计入当前原子，量子不是执行时长上界。源码入口见[maintenance](../../os/kernel/src/maintenance.rs)、[reclaim](../../os/kernel/src/task/process/reclaim.rs)及[ChangeWork](../../os/kernel/src/vm/change.rs)。
 
-完成回执可以在锁外同步唤醒并释放下一宿主，当前关系为Change→Builder→Shell和Retire→Shell；Shell在DropBody前已取走退休来源，最后析构不再返回Retire。来源的私有wait_done只由Shell使用，VM start/quiescence分别登记Builder/Shell。合法wake入队后，其强根仍可能被另一hart消耗至Done，参数减引用不能仅凭入队断言不是最后引用；只有调用栈上的同对象Arc覆盖该减引用时才成立。各宿主费用、access/ingress回执和DONE的顺序由[task](task.md)、[mm](mm.md)拥有；格式化/冷诊断不承担业务进展。
+完成回执的内部DONE/internal_done与wake状态提交在同一SignalSource门内完成，等待者不能先观察新完成事实、finish并释放执行根，随后才让发布者归还其凭证。只由Shell使用的私有wait_done保存单一依赖责任；来源门内没有Hint或业务回调，返回的潜在退休根与kick都在门外处理。VM start/quiescence分别登记Builder/Shell；它们可在状态门外承担真实最后析构，不凭持有VmShell Arc推断保活其他宿主。Shell在DropBody前已取走退休来源，最后析构不再返回Retire。宿主费用、access/ingress回执和DONE的顺序由[task](task.md)、[mm](mm.md)拥有；格式化/冷诊断不承担业务进展。

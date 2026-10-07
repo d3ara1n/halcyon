@@ -3,6 +3,7 @@
 pub(crate) mod backing;
 pub(crate) mod change;
 mod completion;
+pub(crate) mod fault;
 pub(crate) mod operation;
 pub(crate) mod remote;
 pub(crate) mod retire;

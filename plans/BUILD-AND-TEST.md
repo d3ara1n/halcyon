@@ -44,7 +44,10 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 | `just virt-nofd` | 无 F/D、无兼容浮点域的 core 路线 |
 | `just virt-hetero` | 异构调度域契约；涉及调度域时额外运行 |
 | `just virt-boot-failure` | 外部 GDB 对正式 debug binary 注入 Ready 前 panic/alloc/fatal，确认所有 hart 在 Failed 后停驻 |
-| `just acceptance` | 闭包收尾聚合：先 clippy，再 debug stress、release core、sifive_u core、nofd、boot-failure |
+| `just virt-ipi-failure` | 外部GDB跳过真实已发布责任的一次SBI IPI并返回FAILED；核无timer WFI目标在后续真实广播唤醒后先停驻，确认稳定停止事实 |
+| `just virt-vm-fault` | 旁观正式 stress 的 Map 发布窗口，取得真实用户 fault→RetryFault 证据后 detach，再由原验收器核完整负载及退款 |
+| `just virt-vm-repair` | 外部GDB保留真实PTE与用户现场，分别注入R/W/X入口故障及重复故障；核实际SFENCE/FENCE.I、原寄存器与pc重试、无进展终止界 |
+| `just acceptance` | 闭包收尾聚合：先 clippy，再 debug stress、release core、sifive_u core、nofd、boot-failure、IPI failure、VM fault、VM repair |
 
 施工中可以复用上述路线查找集成错误，结果只作为开发证据。机制闭包收尾按实际影响执行 `just check`、`just clippy` 与必要路线；跨机制组合收尾使用 `just acceptance`，涉及调度域再加 hetero。文档等不改变执行行为的工作按影响核验，不运行无关的代码验收。
 
@@ -52,11 +55,15 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 
 常规路线经 `tools/qemu-throttle.sh` 和 `tools/qemu-acceptance.sh`。默认 `THROTTLE=50`，stress 同样节流，不作为全速性能基准；GDB 与全速专项诊断用 `THROTTLE=100`。节流只限制宿主资源占用，全速也仍经过路线的日志、锚点与超时判定。
 
-各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 默认 420 秒，因为竞态矩阵和 FAL 资源/退出组合持续增加；sifive_u 默认 120 秒，因为 128MiB/五 hart 路线在完整 FAL core workload 下需要更长的 QEMU 仿真预算。异构域的 Base64 系统负载固定在单 hart，`VIRT_HETERO_TIMEOUT` 独立预留完整 core 收束所需的仿真时间。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
+各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT`、`VIRT_IPI_FAILURE_TIMEOUT`、`VIRT_VM_FAULT_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 默认 420 秒，因为竞态矩阵和 FAL 资源/退出组合持续增加；VM fault复用相同正式stress负载，默认继承其预算，旁观与detach后运行共用一个总期限。sifive_u 默认 120 秒，因为 128MiB/五 hart 路线在完整 FAL core workload 下需要更长的 QEMU 仿真预算。异构域的 Base64 系统负载固定在单 hart，`VIRT_HETERO_TIMEOUT` 独立预留完整 core 收束所需的仿真时间。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
 
 超时负责收割异常停滞，不是性能目标。默认值依据对应 workload 在相同节流条件下的近期正常耗时留出宽裕余量；验收面或运行成本变化时重校。正常运行经常接近上限时，先确认运行身份和进展，再调整 recipe 与文档，不能把基础设施截断当成内核挂死，也不能用放宽超时掩盖缺失业务锚点。调查已定位的早期卡死时可临时收紧。
 
 判定依据 workload 身份、完整业务收束和显式 reset 锚点，不能用矩阵中途超时宣称内核失败。`virt-boot-failure` 同样节流，由 `tools/check-boot-failure.py` 独立判定预期故障、限制 GDB 时间并回收进程组，完整日志在 `artifacts/boot-failure/`。
+
+GDB专项路线在各自artifacts目录下使用时间戳与进程号创建独立日志，保留ELF hash、注入位置和原始观察。共同工具[qemu_gdb.py](../tools/qemu_gdb.py)按ELF PT_LOAD换算物理地址，并用QEMU的物理内存远程包读取跨hart全局事实，读取后恢复原模式；不依赖所选hart当前satp。VM repair中的异常原因/地址由诊断器注入，证明修复分支及现场合同，不宣称复现真实硬件TLB缓存陈旧；VM fault则要求正式消费者产生真实发布窗口故障。GDB停顿不作为计时、WCET或调度公平性证据。
+
+M累计栈工具从固定ELF重建CFI与动态目标，源码语义前提须人工核实后由[固定证书](../tools/maintenance-stack-certificate.json)绑定；没有证书、未知site/CFI/业务环或源码变化均不签发上界。本轮推导、命令和拒签负向证据由[对象链修复档案](archived/review-2026-10-07-object-chain.md#新elf累计栈与拒签证据)拥有；证书不是对未来构建的自动许可。
 
 验收脚本只要求当前实际消费者与仍在调用的自检锚点；已删除机制的自检、日志与容量路线同步删除，不保留兼容锚点或为使旧门通过重建机制。路线通过证明该 workload 的当前可观察行为；内部交错、失败退款和付款保证的验证缺口由所属工作记录承载，不以旧锚点缺失代替风险判断。
 

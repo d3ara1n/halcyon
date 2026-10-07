@@ -29,11 +29,10 @@ pub(crate) struct Slot<T> {
     pub(crate) queued: bool,
     pub(crate) stopping: bool,
     pub(crate) lifecycle: Lifecycle,
-    timer: Pin<Box<TimerNode<Wake>>>,
+    timers: Pin<Box<TaskTimers>>,
     pub(crate) timed_out: bool,
     deadline_value: Option<u64>,
     deadline_pending: bool,
-    retry_timer: Pin<Box<TimerNode<Wake>>>,
     suspended: bool,
     pub(crate) _task_charge: Charge,
 }
@@ -56,6 +55,24 @@ pub(crate) struct WorkQueue<T> {
 enum Wake {
     Deadline(u64),
     Retry(u64),
+}
+
+/// 两个独立期限共享稳定宿主，节点自身分别登记/取消。
+struct TaskTimers {
+    deadline: TimerNode<Wake>,
+    retry: TimerNode<Wake>,
+}
+
+impl TaskTimers {
+    fn deadline(self: Pin<&Self>) -> Pin<&TimerNode<Wake>> {
+        // SAFETY: 私有字段不移动，宿主整体pin至两节点都注销后才析构。
+        unsafe { self.map_unchecked(|timers| &timers.deadline) }
+    }
+
+    fn retry(self: Pin<&Self>) -> Pin<&TimerNode<Wake>> {
+        // SAFETY: 同deadline；投影不暴露可移动字段的可变引用。
+        unsafe { self.map_unchecked(|timers| &timers.retry) }
+    }
 }
 
 #[derive(Debug)]
@@ -114,14 +131,11 @@ impl<T> WorkQueue<T> {
             Ok(prepared) => prepared,
             Err(error) => return Err(InsertFailure { error, task }),
         };
-        let nodes = (|| {
-            Ok::<_, alloc::alloc::AllocError>((
-                Box::into_pin(Box::try_new(TimerNode::new())?),
-                Box::into_pin(Box::try_new(TimerNode::new())?),
-            ))
-        })();
-        let (timer, retry_timer) = match nodes {
-            Ok(nodes) => nodes,
+        let timers = match Box::try_new(TaskTimers {
+            deadline: TimerNode::new(),
+            retry: TimerNode::new(),
+        }) {
+            Ok(timers) => Box::into_pin(timers),
             Err(_) => {
                 return Err(InsertFailure {
                     error: SystemCallError::OutOfMemory,
@@ -148,11 +162,10 @@ impl<T> WorkQueue<T> {
             queued: false,
             stopping: false,
             lifecycle: Lifecycle::Active,
-            timer,
+            timers,
             timed_out: false,
             deadline_value: None,
             deadline_pending: false,
-            retry_timer,
             suspended: false,
             _task_charge: task_charge,
         };
@@ -307,7 +320,7 @@ impl<T> WorkQueue<T> {
         if slot.deadline_pending && slot.deadline_value.is_some_and(|at| at <= now) {
             // SAFETY: actor 独占队列，任务的 pin 节点保持存活；已弹出则取消幂等。
             unsafe {
-                self.timers.cancel(slot.timer.as_ref());
+                self.timers.cancel(slot.timers.as_ref().deadline());
             }
             slot.deadline_pending = false;
             slot.timed_out = true;
@@ -324,10 +337,10 @@ impl<T> WorkQueue<T> {
         slot.suspended = true;
         // SAFETY: 任务出生预付两个独立 pin 节点，actor 独占修改与复用。
         unsafe {
-            self.timers.cancel(slot.retry_timer.as_ref());
+            self.timers.cancel(slot.timers.as_ref().retry());
             if let Some(at) = retry_at {
                 self.timers
-                    .register(slot.retry_timer.as_ref(), at, Wake::Retry(id));
+                    .register(slot.timers.as_ref().retry(), at, Wake::Retry(id));
             }
         }
         Ok(())
@@ -384,7 +397,12 @@ impl<T> WorkQueue<T> {
         }
     }
 
-    pub(crate) fn stop<W>(&mut self, id: u64, world: &mut W) -> Result<(), SystemCallError>
+    pub(crate) fn stop<W>(
+        &mut self,
+        id: u64,
+        world: &mut W,
+        now: u64,
+    ) -> Result<(), SystemCallError>
     where
         T: Task<W>,
     {
@@ -395,6 +413,7 @@ impl<T> WorkQueue<T> {
         {
             return Ok(());
         }
+        self.mature_deadline(id, now);
         let slot = self
             .tasks
             .get_mut(id)
@@ -402,22 +421,33 @@ impl<T> WorkQueue<T> {
         slot.suspended = false;
         // SAFETY: 任务仍持有自己的 pin 节点，取消后才允许记录退休。
         unsafe {
-            self.timers.cancel(slot.retry_timer.as_ref());
+            self.timers.cancel(slot.timers.as_ref().retry());
         }
         if !slot.stopping {
             slot.stopping = true;
             slot.task.stop(world);
         }
-        self.schedule(id)
+        let deadline = slot
+            .task
+            .deadline()
+            .instant()
+            .map_err(|_| SystemCallError::IllegalArgument);
+        // 非法新期限也不能丢失原任务；先恢复执行资格，再交付错误。
+        self.schedule(id)?;
+        self.update_deadline(id, deadline)
     }
 
     /// Seal 后每步只发出一个停止意图，任务自身仍通过 advance 按预算退休。
-    pub(crate) fn stop_next<W>(&mut self, world: &mut W) -> Result<bool, SystemCallError>
+    pub(crate) fn stop_next<W>(
+        &mut self,
+        world: &mut W,
+        now: u64,
+    ) -> Result<bool, (u64, SystemCallError)>
     where
         T: Task<W>,
     {
         if !self.sealed {
-            return Err(SystemCallError::ObjectNotAvailable);
+            return Err((0, SystemCallError::ObjectNotAvailable));
         }
         let mut ids = [0];
         if self
@@ -430,7 +460,7 @@ impl<T> WorkQueue<T> {
         }
         let id = ids[0];
         self.stop_cursor = id;
-        self.stop(id, world)?;
+        self.stop(id, world, now).map_err(|error| (id, error))?;
         Ok(true)
     }
 
@@ -514,8 +544,8 @@ impl<T> WorkQueue<T> {
             .expect("retiring task must remain owned");
         // SAFETY: actor 独占；两份 pin timer 先摘，再移出实际任务存储。
         unsafe {
-            self.timers.cancel(slot.timer.as_ref());
-            self.timers.cancel(slot.retry_timer.as_ref());
+            self.timers.cancel(slot.timers.as_ref().deadline());
+            self.timers.cancel(slot.timers.as_ref().retry());
         }
         self.tasks
             .remove(id)
@@ -540,10 +570,10 @@ impl<T> WorkQueue<T> {
         }
         // SAFETY: 该任务 pin 节点在记录退休前存活，取消/登记在同一 actor。
         unsafe {
-            self.timers.cancel(slot.timer.as_ref());
+            self.timers.cancel(slot.timers.as_ref().deadline());
             if let Some(at) = deadline {
                 self.timers
-                    .register(slot.timer.as_ref(), at, Wake::Deadline(id));
+                    .register(slot.timers.as_ref().deadline(), at, Wake::Deadline(id));
             }
         }
         slot.deadline_value = deadline;
@@ -573,7 +603,7 @@ impl<T> WorkQueue<T> {
                 let slot = self.tasks.get(id).expect("advanced task disappeared");
                 // SAFETY: Finalizing 记录仍存活；解除期限节点后才可退休。
                 unsafe {
-                    self.timers.cancel(slot.timer.as_ref());
+                    self.timers.cancel(slot.timers.as_ref().deadline());
                 }
             }
             crate::runtime::Step::Runnable => {

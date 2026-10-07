@@ -11,7 +11,7 @@
 //! 3. `Draining` 每步摘除固定数量的账本/页表单元，锁外释放固定批次；
 //!    完成后交出 root 与账户。不对已隔离的空间重复发送 fence。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use erhino_shared::call::SystemCallError;
 use maintenance::record::Outcome;
@@ -52,7 +52,6 @@ enum Phase {
 
 pub(crate) struct RetireWork {
     record: WorkRecord,
-    this: Spinlock<Weak<RetireWork>>,
     shell: Arc<VmShell>,
     views: Arc<Views>,
     transport: Transport,
@@ -72,7 +71,6 @@ impl RetireWork {
         let metadata = crate::task::resources::MetadataCharge::arc::<Self>(&pool)?;
         let work = Arc::try_new(Self {
             record: WorkRecord::new(pool.maintenance_account().clone()),
-            this: Spinlock::new(ranks::LEAF, Weak::new()),
             shell,
             views,
             transport: Transport::new(),
@@ -86,7 +84,6 @@ impl RetireWork {
             completion: super::completion::Completion::new(metadata, None, source, true),
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        *work.this.lock() = Arc::downgrade(&work);
         Ok(work)
     }
 
@@ -132,13 +129,6 @@ impl RetireWork {
         mt::kick();
     }
 
-    fn root(&self) -> Arc<dyn Work> {
-        self.this
-            .lock()
-            .upgrade()
-            .expect("retire work stepped after release")
-    }
-
     fn step_fence(&self, phase: &mut Phase, root: &Arc<dyn Work>) -> Outcome {
         let mask = match phase {
             Phase::ReadyToFence(mask) => *mask,
@@ -155,7 +145,7 @@ impl RetireWork {
         let token = mt::arm(root);
         *phase = Phase::Fencing;
         if let Some(token) = self.transport.publish(mask, fence, token) {
-            mt::wake(token);
+            drop(mt::wake(token));
         }
         Outcome::Blocked
     }
@@ -242,8 +232,8 @@ impl Work for RetireWork {
         &self.record
     }
 
-    fn step(&self) -> Outcome {
-        let root = self.root();
+    fn step(self: Arc<Self>) -> Outcome {
+        let root: Arc<dyn Work> = self.clone();
         let mut phase = {
             let mut state = self.state.lock();
             core::mem::replace(&mut state.phase, Phase::Advancing)

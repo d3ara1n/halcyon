@@ -12,7 +12,7 @@
 //! 锁序：change 状态（LEAF）→ 空间（ADDRESS_SPACE）→ 收件链（REMOTE_CALL）
 //! → 维护队列（MAINTENANCE）；arm/wake 不在空间锁内调用。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use erhino_shared::call::SystemCallError;
@@ -61,6 +61,28 @@ pub(crate) struct VmState {
     start_waiter: Option<WakeToken>,
     /// 退休等待依赖；只有两种租约都离场时才摘取并在锁外唤醒。
     quiescence_waiter: Option<WakeToken>,
+    /// 同一纯层预约的观察依赖；容量取唯一 ledger 限额，来源不持 Work。
+    pub(crate) dependencies: Buffer<
+        (
+            memory_space::ChangeKey,
+            Arc<dyn crate::task::wait_source::ObservationSource>,
+        ),
+        MetadataCharge,
+    >,
+}
+
+impl VmState {
+    pub(crate) fn remove_dependency(
+        &mut self,
+        key: memory_space::ChangeKey,
+    ) -> Arc<dyn crate::task::wait_source::ObservationSource> {
+        let index = self
+            .dependencies
+            .iter()
+            .position(|(id, _)| *id == key)
+            .expect("change reservation lost its completion dependency");
+        self.dependencies.remove(index).1
+    }
 }
 
 /// 访问与修改责任的不可复制持有；提交后由独立 Work 接管至真实完成。
@@ -94,7 +116,7 @@ impl Drop for VmAccessLease {
             (wake, start)
         };
         for wake in [wake, start].into_iter().flatten() {
-            mt::wake(wake);
+            drop(mt::wake(wake));
             mt::kick();
         }
     }
@@ -109,6 +131,11 @@ impl VmShell {
         let metadata = MetadataCharge::arc::<Self>(pool)?;
         let identity = NEXT_VM_ID.allocate().ok_or(SystemCallError::ReachLimit)?;
         let satp = (8usize << 60) | space.satp_ppn();
+        let dependencies = Buffer::try_empty(
+            space.ledger().limits().max_transactions,
+            &crate::task::resources::MetadataFunding(pool),
+        )
+        .map_err(crate::task::resources::map_storage_error)?;
         Arc::try_new(Self {
             identity,
             satp,
@@ -125,6 +152,7 @@ impl VmShell {
                     building_open: true,
                     start_waiter: None,
                     quiescence_waiter: None,
+                    dependencies,
                 },
             ),
             _metadata: metadata,
@@ -192,7 +220,7 @@ impl VmShell {
             }
         };
         if let Some(wake) = wake {
-            mt::wake(wake);
+            drop(mt::wake(wake));
             mt::kick();
         }
     }
@@ -207,7 +235,7 @@ impl VmShell {
         let start = vm.start_waiter.take();
         drop(vm);
         if let Some(start) = start {
-            mt::wake(start);
+            drop(mt::wake(start));
             mt::kick();
         }
         active
@@ -244,6 +272,10 @@ impl VmShell {
             "wait before space was frozen"
         );
         if vm.active == 0 && vm.access_leases == 0 {
+            assert!(
+                vm.dependencies.is_empty(),
+                "quiescent VM retained change dependencies"
+            );
             return Some(token);
         }
         assert!(
@@ -343,6 +375,10 @@ pub(crate) struct Operation {
     submitted: bool,
 }
 impl Operation {
+    pub(crate) fn completion_source(&self) -> Arc<dyn crate::task::wait_source::ObservationSource> {
+        self.work.completion.source()
+    }
+
     pub(crate) fn pool(&self) -> &Arc<MemoryPool> {
         self.work.completion.payer()
     }
@@ -441,7 +477,6 @@ struct Cleanup {
 
 pub(crate) struct ChangeWork {
     record: WorkRecord,
-    this: Spinlock<Weak<ChangeWork>>,
     shell: Arc<VmShell>,
     views: Arc<Views>,
     /// 出生时准入的内嵌运输与固定表帧批次（批间复用，不做可失败准入）。
@@ -464,7 +499,6 @@ impl ChangeWork {
         let source = crate::task::wait_source::SignalSource::try_new(pool.clone())?;
         let work = Arc::try_new(Self {
             record: WorkRecord::new(pool.maintenance_account().clone()),
-            this: Spinlock::new(ranks::LEAF, Weak::new()),
             shell,
             views,
             transport: Transport::new(),
@@ -478,7 +512,6 @@ impl ChangeWork {
             completion: super::completion::Completion::new(metadata, Some(access), source, false),
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        *work.this.lock() = Arc::downgrade(&work);
         Ok(work)
     }
 
@@ -494,13 +527,6 @@ impl ChangeWork {
         let root: Arc<dyn Work> = self.clone();
         mt::publish(root);
         mt::kick();
-    }
-
-    fn root(&self) -> Arc<dyn Work> {
-        self.this
-            .lock()
-            .upgrade()
-            .expect("change work stepped after release")
     }
 
     pub(crate) fn wait_plan(&self) -> crate::task::wait::WaitPlan {
@@ -523,11 +549,14 @@ impl ChangeWork {
                 let mut vm = self.shell.space.lock();
                 let space = vm.space.as_mut().expect("rollback lost live space");
                 let range = space.ledger().prepared_footprint(&prepared);
+                let key = prepared.key();
                 space.detach_boundary_tables(prepared.key(), range, tables);
                 let storage = space.ledger_mut().rollback(prepared);
+                let dependency = vm.remove_dependency(key);
                 let notice =
                     (!tables.is_empty()).then(|| (self.shell.advance_translation(), vm.active));
                 drop(vm);
+                drop(dependency);
                 prep.plan = PreparationPlan::Candidate(storage);
                 if let Some((fence, mask)) = notice {
                     let Phase::Rollback(prep) = core::mem::replace(phase, Phase::Advancing) else {
@@ -536,7 +565,7 @@ impl ChangeWork {
                     *phase = Phase::RollbackFence(prep);
                     let wake = mt::arm(root);
                     if let Some(wake) = self.transport.publish(mask, fence, wake) {
-                        mt::wake(wake);
+                        drop(mt::wake(wake));
                     }
                     return Outcome::Blocked;
                 }
@@ -610,7 +639,7 @@ impl ChangeWork {
         };
         let wake = mt::arm(root);
         if let Some(wake) = self.transport.publish(mask, fence, wake) {
-            mt::wake(wake);
+            drop(mt::wake(wake));
         }
         Outcome::Blocked
     }
@@ -698,6 +727,7 @@ impl ChangeWork {
             unreachable!()
         };
         let mut vm = self.shell.space.lock();
+        let mut dependency = None;
         let space = vm.space.as_mut().expect("table cleanup on retired space");
         let owner = cleanup
             .retiring
@@ -721,8 +751,10 @@ impl ChangeWork {
                     .ledger_mut()
                     .complete(cleanup.retiring.take().expect("cleanup completed twice")),
             );
+            dependency = Some(vm.remove_dependency(owner));
             if tables.is_empty() {
                 drop(vm);
+                drop(dependency);
                 *phase = Phase::Done;
                 return Outcome::Done;
             }
@@ -734,13 +766,14 @@ impl ChangeWork {
         let fence = self.shell.advance_translation();
         let mask = vm.active;
         drop(vm);
+        drop(dependency);
         let Phase::Cleaning(cleanup) = core::mem::replace(phase, Phase::Advancing) else {
             unreachable!()
         };
         *phase = Phase::TableFence(cleanup);
         let wake = mt::arm(root);
         if let Some(wake) = self.transport.publish(mask, fence, wake) {
-            mt::wake(wake);
+            drop(mt::wake(wake));
         }
         Outcome::Blocked
     }
@@ -775,8 +808,8 @@ impl Work for ChangeWork {
         &self.record
     }
 
-    fn step(&self) -> Outcome {
-        let root = self.root();
+    fn step(self: Arc<Self>) -> Outcome {
+        let root: Arc<dyn Work> = self.clone();
         let (mut phase, mut tables) = {
             let mut state = self.state.lock();
             (

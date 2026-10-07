@@ -450,7 +450,7 @@ mod tests {
         let mut reserve = map.reserve(2, &mut storage).unwrap();
         assert!(map.push_extent(10, Ext(10), &mut reserve).is_ok());
         let whole = map.acquire(0, 10, &mut reserve).unwrap();
-        let capacity = map.segs.storage_capacities();
+        let capacity = map.segs.capacity();
         assert!(matches!(
             map.reserve(8, &mut storage),
             Err(BackingError::CapacityChanged)
@@ -460,7 +460,7 @@ mod tests {
             Err(BackingError::NodeLimit)
         ));
         let (left, right) = map.split_use(whole, 4, &mut reserve).unwrap();
-        assert_eq!(map.segs.storage_capacities(), capacity);
+        assert_eq!(map.segs.capacity(), capacity);
         for (part, expected) in [(left, 4), (right, 6)] {
             let mut cursor = map.begin_release(part).unwrap();
             match map.release_step(&mut cursor) {
@@ -471,7 +471,7 @@ mod tests {
             }
             assert!(matches!(map.release_step(&mut cursor), ReleaseStep::Done));
         }
-        assert_eq!(map.segs.storage_capacities(), capacity);
+        assert_eq!(map.segs.capacity(), capacity);
         assert!(map.is_empty());
     }
 }

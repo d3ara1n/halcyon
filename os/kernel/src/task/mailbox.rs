@@ -417,7 +417,7 @@ impl Work for MailboxCore {
     fn record(&self) -> &WorkRecord {
         self.source.record()
     }
-    fn step(&self) -> Outcome {
+    fn step(self: Arc<Self>) -> Outcome {
         let (retired, step) = {
             let mut state = self.state.lock();
             if state.closed && state.cleanup_turn && !state.queue.is_empty() {

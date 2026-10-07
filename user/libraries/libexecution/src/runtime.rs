@@ -223,6 +223,7 @@ const SOURCE_INPUT_BYTES: usize =
         + core::mem::size_of::<TimerNode<u64>>();
 
 static RETIRED_CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
+const SOURCE_RETIRE_RETRY_NS: u64 = 1_000_000;
 
 pub fn retired_cleanup_failures() -> usize {
     RETIRED_CLEANUP_FAILURES.load(Ordering::Relaxed)
@@ -428,7 +429,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
                     self.clock_now = now;
                     self.queue.expire(now, budget)
                 }
-                1 => self.retire(world, budget),
+                1 => self.retire(world, budget)?,
                 _ => self
                     .advance_one(world, budget)?
                     .map_or(0, |advance| advance.work_done),
@@ -499,10 +500,16 @@ impl<T, S: SourceOps> Runtime<T, S> {
                 error: SystemCallError::IllegalArgument,
             });
         }
+        let now = self
+            .set
+            .set()
+            .now_ns()
+            .map_err(|error| TaskFailure { task: 0, error })?;
+        self.clock_now = now;
         let stopped = usize::from(
             self.queue
-                .stop_next(world)
-                .map_err(|error| TaskFailure { task: 0, error })?,
+                .stop_next(world, now)
+                .map_err(|(task, error)| TaskFailure { task, error })?,
         );
         if stopped == max_work {
             return Ok(stopped);
@@ -523,7 +530,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         Ok(())
     }
 
-    fn retire<W>(&mut self, world: &mut W, budget: usize) -> usize
+    fn retire<W>(&mut self, world: &mut W, budget: usize) -> Result<usize, TaskFailure>
     where
         T: Task<W, Family = T>,
     {
@@ -545,7 +552,18 @@ impl<T, S: SourceOps> Runtime<T, S> {
                     if at > self.clock_now {
                         continue;
                     }
-                    let _ = self.drop_source(world, token);
+                    let task = self
+                        .sources
+                        .get(token)
+                        .expect("retiring source remains owned")
+                        .task;
+                    if let Err(error) = self.drop_source(world, token)
+                        && self.sources.get(token).is_none()
+                    {
+                        // 来源已真实退休：此时错误属于回调修改后的任务期限，
+                        // 不能伪装成仍需重试的内核 Remove，也不能吞掉原任务身份。
+                        return Err(TaskFailure { task, error });
+                    }
                 }
                 progressed = true;
                 break;
@@ -555,7 +573,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
             }
             used += 1;
         }
-        used
+        Ok(used)
     }
 
     /// Assembly 交付纯电平提示；cookie 是全局任务身份，token 在同一集合不复用。
@@ -715,6 +733,27 @@ impl<T, S: SourceOps> Runtime<T, S> {
         let result = self.set.set().remove_source(token);
         match result {
             Ok(()) | Err(SystemCallError::ObjectNotFound) => {
+                let task = self
+                    .sources
+                    .get(token)
+                    .expect("removing source remains owned")
+                    .task;
+                let callback_at = if self.queue.accepts_sources(task) {
+                    match self.set.set().now_ns() {
+                        Ok(now) => {
+                            self.clock_now = now;
+                            Some(now)
+                        }
+                        Err(error) => {
+                            // 内核成员已移除，用户态责任仍保留；下次 Remove 的
+                            // ObjectNotFound 会继续此处，回执只在取样成功后交付一次。
+                            self.retry_source_removal(token);
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
                 let entry = self
                     .sources
                     .remove(token)
@@ -725,6 +764,9 @@ impl<T, S: SourceOps> Runtime<T, S> {
                     self.retire_timers.cancel(entry.retire_timer.as_ref());
                 }
                 self.queue.source_retired(entry.task);
+                if let Some(now) = callback_at {
+                    self.queue.mature_deadline(entry.task, now);
+                }
                 self.queue
                     .get_task_mut(entry.task)
                     .expect("source task must remain owned")
@@ -739,28 +781,36 @@ impl<T, S: SourceOps> Runtime<T, S> {
                 self.queue
                     .schedule(entry.task)
                     .expect("source task must remain owned");
+                if self.queue.accepts_sources(entry.task) {
+                    let deadline = self.task_deadline::<W>(entry.task);
+                    self.queue.update_deadline(entry.task, deadline)?;
+                }
                 Ok(())
             }
             Err(error) => {
-                let node = self
-                    .sources
-                    .get(token)
-                    .expect("failed source must remain owned")
-                    .retire_timer
-                    .as_ref();
-                // SAFETY: actor 独占，来源记录保持 Box 存活，取消/注册不分配。
-                unsafe {
-                    self.retire_timers.cancel(node);
-                    self.retire_timers.register(
-                        node,
-                        self.clock_now.saturating_add(1_000_000),
-                        token,
-                    );
-                }
-                RETIRED_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+                self.retry_source_removal(token);
                 Err(error)
             }
         }
+    }
+
+    fn retry_source_removal(&mut self, token: u64) {
+        let node = self
+            .sources
+            .get(token)
+            .expect("failed source must remain owned")
+            .retire_timer
+            .as_ref();
+        // SAFETY: actor 独占，来源记录保持 Box 存活，取消/注册不分配。
+        unsafe {
+            self.retire_timers.cancel(node);
+            self.retire_timers.register(
+                node,
+                self.clock_now.saturating_add(SOURCE_RETIRE_RETRY_NS),
+                token,
+            );
+        }
+        RETIRED_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 
     fn advance_one<W>(
@@ -3003,6 +3053,166 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CallbackDeadlineTask {
+        registration: crate::SourceRegistration,
+        deadline: Deadline,
+        cancel_to: Deadline,
+    }
+
+    impl Task<Vec<bool>> for CallbackDeadlineTask {
+        type Family = Self;
+
+        fn advance(
+            &mut self,
+            _: u64,
+            timeouts: &mut Vec<bool>,
+            requests: &mut Requests<Self>,
+            input: &mut Input<'_>,
+            _: usize,
+        ) -> Result<Advance, SystemCallError> {
+            timeouts.push(input.take_timeout());
+            if self.deadline == Deadline::INFINITE {
+                self.registration.remove(requests)?;
+            } else {
+                self.registration.install(
+                    requests,
+                    SourcePlan::new(Handle::from_raw(8), ObjectSignals::READABLE),
+                    8,
+                )?;
+            }
+            Ok(Advance {
+                work_done: 1,
+                step: if self.deadline == Deadline::INFINITE && self.registration.is_empty() {
+                    Step::Complete
+                } else {
+                    Step::Parked
+                },
+            })
+        }
+
+        fn registered(&mut self, _: &mut Vec<bool>, kind: SourceKind, source: SourceId) {
+            self.registration.registered(kind, source);
+        }
+
+        fn unregistered(&mut self, _: &mut Vec<bool>, _: SourceKind, source: SourceId) {
+            assert!(self.registration.unregistered(source));
+            self.deadline = self.cancel_to;
+        }
+
+        fn stop(&mut self, _: &mut Vec<bool>) {
+            self.deadline = self.cancel_to;
+            self.registration.cancel();
+        }
+
+        fn deadline(&self) -> Deadline {
+            self.deadline
+        }
+
+        fn refused(&mut self, _: &mut Vec<bool>, _: RequestFailure<Self>) {
+            panic!("unexpected callback deadline refusal");
+        }
+    }
+
+    #[test]
+    fn non_gate_callbacks_cancel_only_unmatured_deadlines() {
+        for stop in [false, true] {
+            for cancel_at in [20, 3_000_000] {
+                let shared = fake_shared();
+                let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+                    .unwrap_or_else(|_| panic!("assembly failed"));
+                let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+                let mut timeouts = Vec::new();
+                let id = rt
+                    .spawn(
+                        CallbackDeadlineTask {
+                            registration: crate::SourceRegistration::new(),
+                            deadline: Deadline::at(2_000_000),
+                            cancel_to: Deadline::INFINITE,
+                        },
+                        1,
+                    )
+                    .unwrap();
+                while rt.pending_sources() == 0 || rt.has_pending_gate() {
+                    rt.turn(&mut timeouts, 1).unwrap();
+                }
+                shared.now.set(cancel_at);
+                if stop {
+                    rt.seal();
+                    rt.shutdown_turn(&mut timeouts, 1).unwrap();
+                } else {
+                    let source = rt.get_task_mut(id).unwrap().registration.source().unwrap();
+                    shared.set_remove_busy(1);
+                    assert_eq!(
+                        rt.drop_source(&mut timeouts, source.token()),
+                        Err(SystemCallError::ObjectBusy)
+                    );
+                    shared.now.set(cancel_at + SOURCE_RETIRE_RETRY_NS);
+                    while rt.pending_sources() != 0 {
+                        rt.turn(&mut timeouts, 1).unwrap();
+                    }
+                }
+                shared.now.set(5_000_000);
+                assembly.run(&mut rt, &mut timeouts, 1).unwrap();
+                assert_eq!(
+                    timeouts.iter().filter(|&&timeout| timeout).count(),
+                    usize::from(cancel_at >= 2_000_000),
+                    "only a deadline matured before its cancellation may be delivered"
+                );
+                assert!(rt.close().is_ok());
+                assert!(assembly.close().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_retirement_callback_deadline_preserves_and_identifies_the_task() {
+        let shared = fake_shared();
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+        let mut timeouts = Vec::new();
+        let id = rt
+            .spawn(
+                CallbackDeadlineTask {
+                    registration: crate::SourceRegistration::new(),
+                    deadline: Deadline::at(2_000_000),
+                    cancel_to: Deadline {
+                        kind: 99,
+                        reserved: 0,
+                        at_ns: 0,
+                    },
+                },
+                1,
+            )
+            .unwrap();
+        while rt.pending_sources() == 0 || rt.has_pending_gate() {
+            rt.turn(&mut timeouts, 1).unwrap();
+        }
+        let source = rt.get_task_mut(id).unwrap().registration.source().unwrap();
+        shared.set_remove_busy(1);
+        assert_eq!(
+            rt.drop_source(&mut timeouts, source.token()),
+            Err(SystemCallError::ObjectBusy)
+        );
+        shared.now.set(SOURCE_RETIRE_RETRY_NS);
+        let failure = loop {
+            if let Err(failure) = rt.turn(&mut timeouts, 1) {
+                break failure;
+            }
+        };
+        assert_eq!(failure.task, id);
+        assert_eq!(failure.error, SystemCallError::IllegalArgument);
+        assert_eq!(rt.pending_sources(), 0);
+        assert_eq!(rt.pending_tasks(), 1);
+        let task = rt.get_task_mut(id).unwrap();
+        assert!(task.registration.is_empty());
+        task.deadline = Deadline::INFINITE;
+        assembly.run(&mut rt, &mut timeouts, 1).unwrap();
+        assert!(rt.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+
     #[test]
     fn older_task_retires_under_continuous_new_completion() {
         let shared = fake_shared();
@@ -3097,5 +3307,79 @@ mod tests {
         );
         assert_eq!(rt.get_task_mut(id).unwrap().turns, 1);
         assert!(world.order.is_empty(), "failed assembly ran business stop");
+    }
+
+    #[test]
+    fn registration_cancelled_before_install_receipt_is_retired_before_task_drop() {
+        let shared = fake_shared();
+        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+        let mut timeouts = Vec::new();
+        let id = rt
+            .spawn(
+                CallbackDeadlineTask {
+                    registration: crate::SourceRegistration::new(),
+                    deadline: Deadline::at(2_000_000),
+                    cancel_to: Deadline::INFINITE,
+                },
+                1,
+            )
+            .unwrap();
+        while !rt.has_pending_gate() {
+            rt.turn(&mut timeouts, 1).unwrap();
+        }
+        assert_eq!(rt.pending_sources(), 0);
+        rt.seal();
+        rt.shutdown_turn(&mut timeouts, 1).unwrap();
+        assert!(rt.get_task_mut(id).unwrap().registration.is_installing());
+        while rt.pending_tasks() != 0 {
+            rt.shutdown_turn(&mut timeouts, 1).unwrap();
+        }
+        assert_eq!(rt.pending_sources(), 0);
+        assert!(rt.close().is_ok());
+        assert!(assembly.close().is_ok());
+    }
+
+    #[test]
+    fn old_retirement_receipt_cannot_clear_a_reinstalled_source() {
+        let shared = fake_shared();
+        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+            .unwrap_or_else(|_| panic!("assembly failed"));
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+        let mut timeouts = Vec::new();
+        let id = rt
+            .spawn(
+                CallbackDeadlineTask {
+                    registration: crate::SourceRegistration::new(),
+                    deadline: Deadline::at(2_000_000),
+                    cancel_to: Deadline::at(2_000_000),
+                },
+                1,
+            )
+            .unwrap();
+        while rt.pending_sources() == 0 || rt.has_pending_gate() {
+            rt.turn(&mut timeouts, 1).unwrap();
+        }
+        let old = rt.get_task_mut(id).unwrap().registration.source().unwrap();
+        rt.drop_source(&mut timeouts, old.token()).unwrap();
+        while rt.pending_sources() == 0 || rt.has_pending_gate() {
+            rt.turn(&mut timeouts, 1).unwrap();
+        }
+        let current = rt.get_task_mut(id).unwrap().registration.source().unwrap();
+        assert_ne!(old, current);
+        assert!(!rt.get_task_mut(id).unwrap().registration.unregistered(old));
+        assert_eq!(
+            rt.get_task_mut(id).unwrap().registration.source(),
+            Some(current)
+        );
+        rt.get_task_mut(id).unwrap().cancel_to = Deadline::INFINITE;
+        rt.seal();
+        while rt.pending_tasks() != 0 {
+            rt.shutdown_turn(&mut timeouts, 1).unwrap();
+        }
+        assert_eq!(rt.pending_sources(), 0);
+        assert!(rt.close().is_ok());
+        assert!(assembly.close().is_ok());
     }
 }

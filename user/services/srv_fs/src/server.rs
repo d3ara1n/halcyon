@@ -10,7 +10,7 @@ use erhino_shared::{
 };
 use libbudget::{AccountView, Budget, Charge, Taxonomy};
 use libexecution::{
-    ExecutionResource,
+    ExecutionResource, SourcePlan, SourceRegistration,
     assembly::Assembly,
     runtime::{
         Advance, DriveState, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step,
@@ -744,9 +744,8 @@ impl<B: RuntimeBackend> Task<World<B>> for RetireTask {
 
 struct ReleaseTask {
     owner: Option<Capability>,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     released: bool,
 }
 
@@ -754,9 +753,8 @@ impl ReleaseTask {
     fn new(owner: Capability) -> Self {
         Self {
             owner: Some(owner),
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             released: false,
         }
     }
@@ -784,13 +782,10 @@ impl<B: RuntimeBackend> Task<World<B>> for ReleaseTask {
             }
         }
         if self.released {
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
             }
-            if self.source.is_none() && !self.requested {
+            if self.source.source().is_none() && !self.source.is_installing() {
                 let owner = self.owner.take().expect("release owner already closed");
                 owner.close().map_err(|(_, error)| error)?;
                 return Ok(Advance {
@@ -803,16 +798,18 @@ impl<B: RuntimeBackend> Task<World<B>> for ReleaseTask {
                 step: Step::Parked,
             });
         }
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                self.owner
-                    .as_ref()
-                    .expect("release task lost its owner")
-                    .as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+        if self.source.source().is_none() && !self.source.is_installing() {
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    self.owner
+                        .as_ref()
+                        .expect("release task lost its owner")
+                        .as_handle(),
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                ),
                 KIND_RELEASE,
             )?;
-            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -825,21 +822,22 @@ impl<B: RuntimeBackend> Task<World<B>> for ReleaseTask {
     }
 
     fn refused(&mut self, world: &mut World<B>, _failure: RequestFailure<ServiceTask<B>>) {
+        if let RequestFailure::Source { kind, .. } = &_failure {
+            self.source.refused(*kind);
+        }
+
         world.failed = true;
     }
 
     fn registered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_RELEASE {
-            self.requested = false;
-            self.source = Some(source);
+            self.source.registered(kind, source);
         }
     }
 
     fn unregistered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
-        if kind == KIND_RELEASE && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        if kind == KIND_RELEASE && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         }
     }
 
@@ -850,9 +848,8 @@ impl<B: RuntimeBackend> Task<World<B>> for ReleaseTask {
 
 struct RouteIngress {
     buffer: ReceiveBuffer,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     stopping: bool,
 }
 
@@ -860,9 +857,8 @@ impl RouteIngress {
     fn new() -> Self {
         Self {
             buffer: ReceiveBuffer::new().expect("route receive buffer creation failed"),
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             stopping: false,
         }
     }
@@ -880,28 +876,27 @@ impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
         if self.stopping {
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
             }
             return Ok(Advance {
                 work_done: 1,
-                step: if self.source.is_none() && !self.requested {
+                step: if self.source.source().is_none() && !self.source.is_installing() {
                     Step::Complete
                 } else {
                     Step::Parked
                 },
             });
         }
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                world.route_mailbox,
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+        if self.source.source().is_none() && !self.source.is_installing() {
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    world.route_mailbox,
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                ),
                 KIND_ROUTE,
             )?;
-            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -967,21 +962,22 @@ impl<B: RuntimeBackend> Task<World<B>> for RouteIngress {
     }
 
     fn refused(&mut self, world: &mut World<B>, _failure: RequestFailure<ServiceTask<B>>) {
+        if let RequestFailure::Source { kind, .. } = &_failure {
+            self.source.refused(*kind);
+        }
+
         world.failed = true;
     }
 
     fn registered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_ROUTE {
-            self.requested = false;
-            self.source = Some(source);
+            self.source.registered(kind, source);
         }
     }
 
     fn unregistered(&mut self, _world: &mut World<B>, kind: SourceKind, source: SourceId) {
-        if kind == KIND_ROUTE && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        if kind == KIND_ROUTE && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         }
     }
 
@@ -1121,9 +1117,8 @@ impl<B: RuntimeBackend> PendingFalTask<B> {
 
 struct Ingress<B: RuntimeBackend> {
     buffer: ReceiveBuffer,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     stopping: bool,
     gate_pending: bool,
     queued: Option<(PendingFalTask<B>, usize)>,
@@ -1135,9 +1130,8 @@ impl<B: RuntimeBackend> Ingress<B> {
     fn new() -> Self {
         Self {
             buffer: ReceiveBuffer::new().expect("provider receive buffer creation failed"),
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             stopping: false,
             gate_pending: false,
             queued: None,
@@ -1219,11 +1213,8 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
         }
         if self.stopping {
             self.queued = None;
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
             }
             if let Some(outbox) = self.refusal.as_mut() {
                 outbox.stop(world);
@@ -1236,7 +1227,10 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
             }
             return Ok(Advance {
                 work_done: 1,
-                step: if self.source.is_none() && !self.requested && !self.gate_pending {
+                step: if self.source.source().is_none()
+                    && !self.source.is_installing()
+                    && !self.gate_pending
+                {
                     Step::Complete
                 } else {
                     Step::Parked
@@ -1278,13 +1272,15 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
                 step: Step::Parked,
             });
         }
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                world.provider.mailbox.as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+        if self.source.source().is_none() && !self.source.is_installing() {
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    world.provider.mailbox.as_handle(),
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                ),
                 KIND_MAILBOX,
             )?;
-            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -1840,6 +1836,10 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
     }
 
     fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Spawn { task, error } => self.reject_task(task, error, world),
             failure @ RequestFailure::Source {
@@ -1856,8 +1856,7 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
     }
     fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_MAILBOX {
-            self.requested = false;
-            self.source = Some(source);
+            self.source.registered(kind, source);
         } else if kind == KIND_REPLY
             && let Some(outbox) = self.refusal.as_mut()
         {
@@ -1865,10 +1864,8 @@ impl<B: RuntimeBackend> Task<World<B>> for Ingress<B> {
         }
     }
     fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
-        if kind == KIND_MAILBOX && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        if kind == KIND_MAILBOX && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         } else if kind == KIND_REPLY
             && let Some(outbox) = self.refusal.as_mut()
         {
@@ -3847,9 +3844,8 @@ impl PendingRegistrationTask {
 
 struct RegistrationIngress {
     buffer: ReceiveBuffer,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     stopping: bool,
     gate_pending: bool,
     queued: Option<(PendingRegistrationTask, usize)>,
@@ -3861,12 +3857,12 @@ impl RegistrationIngress {
         Self {
             buffer: ReceiveBuffer::new()
                 .expect("RegistrationControl receive buffer creation failed"),
-            source: None,
-            requested: false,
+            source: SourceRegistration::new(),
+
             gate_pending: false,
             queued: None,
             refusal: None,
-            removing: false,
+
             stopping: false,
         }
     }
@@ -3949,11 +3945,8 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         }
         if self.stopping {
             self.queued = None;
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
             }
             if let Some(outbox) = self.refusal.as_mut() {
                 outbox.stop(world);
@@ -3965,7 +3958,10 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
             }
             return Ok(Advance {
                 work_done: 1,
-                step: if self.source.is_none() && !self.requested && !self.gate_pending {
+                step: if self.source.source().is_none()
+                    && !self.source.is_installing()
+                    && !self.gate_pending
+                {
                     Step::Complete
                 } else {
                     Step::Parked
@@ -4015,13 +4011,15 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
                 step: Step::Complete,
             });
         };
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                mailbox.as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+        if self.source.source().is_none() && !self.source.is_installing() {
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    mailbox.as_handle(),
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                ),
                 KIND_REGISTRATION,
             )?;
-            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -4363,6 +4361,10 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
     }
 
     fn refused(&mut self, world: &mut World<B>, failure: RequestFailure<ServiceTask<B>>) {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Spawn { task, error } => self.reject_task(task, error, world),
             failure @ RequestFailure::Source {
@@ -4392,8 +4394,7 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
     }
     fn registered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
         if kind == KIND_REGISTRATION {
-            self.source = Some(source);
-            self.requested = false;
+            self.source.registered(kind, source);
         } else if kind == KIND_REPLY
             && let Some(outbox) = self.refusal.as_mut()
         {
@@ -4401,10 +4402,8 @@ impl<B: RuntimeBackend> Task<World<B>> for RegistrationIngress {
         }
     }
     fn unregistered(&mut self, world: &mut World<B>, kind: SourceKind, source: SourceId) {
-        if kind == KIND_REGISTRATION && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        if kind == KIND_REGISTRATION && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         } else if kind == KIND_REPLY
             && let Some(outbox) = self.refusal.as_mut()
         {

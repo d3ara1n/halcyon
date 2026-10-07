@@ -134,13 +134,10 @@ fn map(
     ppn: Ppn,
     flags: u64,
 ) -> Result<(), MapError> {
-    let preflight = tree.preflight_map(vpn, count, ppn, flags)?;
-    let prepared = tree
-        .prepare(preflight, supply(preflight.required_frames()))
-        .map_err(|failure| failure.error)?;
-    let outcome = tree.publish(prepared);
-    assert!(outcome.unused.is_empty());
-    assert!(outcome.retired.is_empty());
+    let mut cursor = page_table::PublishCursor::map(vpn, count, ppn, flags);
+    let mut reserve = supply(page_table::worst_case_frames::<3>(&cursor));
+    while !tree.publish_step(&mut cursor, &mut core::iter::from_fn(|| reserve.pop()), 1) {}
+    drop(reserve);
     Ok(())
 }
 

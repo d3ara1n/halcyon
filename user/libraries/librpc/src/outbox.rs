@@ -1,6 +1,7 @@
 //! 入站请求的有界回复投递与退休。
 
 use erhino_shared::{call::SystemCallError, object::ObjectSignals, time::Deadline};
+use libexecution::SourceRegistration;
 use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
@@ -27,10 +28,8 @@ pub struct Outbox {
     response: Option<PreparedResponse>,
     deadline: Deadline,
     source_kind: u64,
-    source: Option<SourceId>,
+    registration: SourceRegistration,
     source_writable: bool,
-    requested: bool,
-    removing: bool,
     operation_retry: bool,
     stage: OutboundStage,
     result: Option<OutboxResult>,
@@ -62,10 +61,8 @@ impl Outbox {
             response: Some(response),
             deadline,
             source_kind,
-            source: None,
+            registration: SourceRegistration::new(),
             source_writable: false,
-            requested: false,
-            removing: false,
             operation_retry: false,
             stage: OutboundStage::Ready,
             result: None,
@@ -97,43 +94,36 @@ impl Outbox {
         if self.result.is_none() {
             self.stage.finish();
             self.result = Some(result);
+            self.registration.cancel();
         }
     }
 
     fn declare_remove<F>(&mut self, requests: &mut Requests<F>) {
-        if self.result.is_some()
-            && let Some(source) = self.source
-            && !self.removing
-        {
-            if requests.remove(source).is_ok() {
-                self.removing = true;
-                self.operation_retry = false;
-            } else {
-                self.operation_retry = true;
-            }
+        if self.result.is_some() && !self.registration.is_removing() {
+            self.operation_retry = self.registration.remove(requests).is_err();
         }
     }
 
     fn ensure_registration<F>(&mut self, requests: &mut Requests<F>) {
-        if self.result.is_some() || self.requested || self.removing {
+        if self.result.is_some()
+            || self.registration.is_installing()
+            || self.registration.is_removing()
+        {
             return;
         }
-        if let Some(source) = self.source {
+        if self.registration.source().is_some() {
             // 持久 WRITABLE 只在发送受阻时需要；保持来源掩码与业务条件一致。
             if matches!(self.stage, OutboundStage::WaitingWritable) && !self.source_writable {
-                if requests.remove(source).is_ok() {
-                    self.removing = true;
-                    self.operation_retry = false;
-                } else {
-                    self.operation_retry = true;
-                }
+                self.operation_retry = self.registration.remove(requests).is_err();
                 return;
             }
             return;
         }
         if let Some(response) = self.response.as_ref()
-            && requests
-                .register(
+            && self
+                .registration
+                .install(
+                    requests,
                     SourcePlan::new(
                         response
                             .reply_handle()
@@ -148,7 +138,6 @@ impl Outbox {
                 )
                 .is_ok()
         {
-            self.requested = true;
             self.source_writable = matches!(self.stage, OutboundStage::WaitingWritable);
             self.operation_retry = false;
         } else {
@@ -157,7 +146,10 @@ impl Outbox {
     }
 
     fn attempt_send(&mut self) {
-        if self.result.is_some() || !self.stage.can_attempt() || self.source.is_none() {
+        if self.result.is_some()
+            || !self.stage.can_attempt()
+            || self.registration.source().is_none()
+        {
             return;
         }
         let Some(response) = self.response.as_mut() else {
@@ -193,11 +185,11 @@ impl Outbox {
     }
 
     pub fn is_admitted(&self) -> bool {
-        self.source.is_some() && self.result.is_none()
+        self.registration.source().is_some() && self.result.is_none()
     }
 
     pub fn is_complete(&self) -> bool {
-        self.result.is_some() && self.source.is_none() && !self.requested && !self.removing
+        self.result.is_some() && self.registration.is_empty()
     }
 
     /// 业务 Commit 前只完成来源准入，不发送尚未编码的回复。
@@ -206,7 +198,8 @@ impl Outbox {
         self.ensure_registration(requests);
         Advance {
             work_done: 1,
-            step: if self.is_admitted() || self.operation_retry || self.requested {
+            step: if self.is_admitted() || self.operation_retry || self.registration.is_installing()
+            {
                 Step::Runnable
             } else {
                 Step::Parked
@@ -239,8 +232,8 @@ impl Outbox {
                 Step::Complete
             } else if self.operation_retry
                 || self.result.is_some()
-                || self.requested
-                || self.removing
+                || self.registration.is_installing()
+                || self.registration.is_removing()
             {
                 Step::Runnable
             } else {
@@ -266,24 +259,20 @@ impl Outbox {
 
     pub fn registered<W>(&mut self, _world: &mut W, kind: u64, source: SourceId) {
         if kind == self.source_kind {
-            self.requested = false;
-            self.source = Some(source);
+            self.registration.registered(kind, source);
         }
     }
 
     pub fn unregistered<W>(&mut self, _world: &mut W, kind: u64, source: SourceId) {
-        if kind == self.source_kind && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
+        if kind == self.source_kind && self.registration.unregistered(source) {
             self.source_writable = false;
-            self.removing = false;
         }
     }
 
     pub fn refused<W, F>(&mut self, _world: &mut W, failure: RequestFailure<F>) {
         match failure {
             RequestFailure::Source { kind, error } if kind == self.source_kind => {
-                self.requested = false;
+                self.registration.refused(kind);
                 self.complete(OutboxResult::Abandoned(cause(error)));
             }
             RequestFailure::Wake { error, .. } => {

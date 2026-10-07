@@ -1,6 +1,12 @@
 # 内存管理与地址空间重构
 
-状态：**对象链所需backing/view/地址空间整体退休、已提交修改独立推进与真实消费者已实施交付；后续范围按本篇保留，实施与验证见[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有 backing/view/地址空间的结构、事务与退休、分页模式扩展及其模块边界；资金形式与预算交界见[预算分案](todo-2026-09-14-kernel-memory-budget.md)。下方现状事实是设计时旧基线，不代表当前模块面貌。
+状态：**对象链所需backing/view/地址空间整体退休、已提交修改独立推进与真实消费者已交付，后续独立审查修复及用户fault接入已完成**。首次实施见[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)，后续处置与证据见[审查修复档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有backing/view/地址空间结构、事务与退休、分页模式扩展及模块边界；资金与预算交界见[预算分案](todo-2026-09-14-kernel-memory-budget.md)。下方旧基线、早期接力及拼装草图保留历史，不作为当前施工入口；设计冲突以末尾定稿及审查修正为准。
+
+## 当前范围与后续
+
+当前生产路线为Sv39，VM已独立接入，`adopt/reclaim`、PublishCursor、backing/View、退款及用户fault均有实际消费者；原编译中断、旧模块删除和ABI迁移已关闭。OrdMap只持一个arena，运行期页表不再保留preflight/PreparedTranslation旁路。当前代码面貌由[mm实现](../notes/impls/mm.md)拥有，不把下面早期组件表当成现状。
+
+本篇保留的独立后续是Sv48/Sv57真实平台及相应用户布局接通，触发为出现支持该模式的实际调度域/平台，完成需模式分发、共享内核映射、fault/退休及跨hart组合共同验证。gap索引、表帧精确预付和退休fence精简均是有测量/证明前置的优化候选，分别见[性能专题](todo-2026-10-01-lock-performance.md)与[本轮未采纳项](archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)，不阻塞当前Sv39合同。当前不再安排“重写内核恢复编译”。
 
 ## 现状事实（当前分支只读盘点）
 
@@ -108,7 +114,7 @@
 2. **预算分案**：账户凭证的计量形式与物理页/metadata 是否可兑换。
 3. **维护执行**：VM Work 的 step 计费接入，无新增机制。
 
-## 接力
+## 早期crate接力（历史，已由内核接入与审查修复承接）
 
 设计轮次 2 已闭合 backing 区间持有/退款与整空间退出屏障。
 
@@ -119,7 +125,7 @@
 - `page_table` 表帧 owner 改为帧承载（用户确认方案 C）：`TableFrameMemory` 新增 `adopt(owner)`/`reclaim(frame)`，树不再存 owner Vec，`take_owner` 由线性扫描变 O(1)；只保留 `branches` 计数供收束断言。host 30 项通过。否决：A 每表旁置 512 项 owner 数组（嵌入式内存成本翻倍）；B 帧池每帧元数据（为单一需求新建全局子系统、复制资金真值）。
 - **内核编译中断（用户确认 C1）**：内核 `TableMem` 未实现 `adopt/reclaim`，`just check` 失败（E0046）。不加临时 adapter；目标形状为表帧 owner = 帧号 + 所属空间账户，退款经空间账户完成，于内核 `vm` 重写时一并落地。恢复条件：对象持有与释放链 + `vm` 整体重写完成。期间验证仅 host 单测，后续各面重构以此形状为基准。
 
-### 组件状态总表（换会话先读）
+### 早期组件状态表（历史，不用于当前接手）
 
 | 组件 | 状态 | 说明 |
 |---|---|---|
@@ -133,9 +139,9 @@
 | 内核 `deferred_work`/`work_ledger`/`notify_work`/`request`/`retirement`、`os/work_debt` | 待删除 | 随对象持有与释放链接入删除 |
 | 用户态 `libkernel` mm/tunnel、`libprocess` Collector、ABI（`Rights::MAP`、Tunnel 0x60–0x63、ProcessDrain） | 待连带修改 | 随 ABI 同步面一次修改 |
 
-下一步：本阶段 crate 侧已收尾，内核 `vm` 拼装草图见下节。接续顺序：进入性能专题（锁优化/无锁化评估，用户要求在本阶段后讨论）；随后按责任链施工方式与对象持有与释放链一起整体重写内核，恢复编译。
+当时接续顺序为crate完成后整体接入vm并恢复编译；该步骤已经完成。当前接手只看篇首范围/后续及最终定稿，不重复本段施工。
 
-### 内核 vm 拼装草图（设计产物，未写代码）
+### 早期内核vm拼装草图（历史，以后续定稿和当前实现为准）
 
 - **模块**：`os/kernel/src/vm/` 从 `task/proc.rs` 拆出：`space.rs`（`AddressSpace` 实际 owner）、`change.rs`（事务执行与 Work）、`retire.rs`（整空间退休 Work）、`fault.rs`、`syscall.rs`（Map/Unmap/Protect 授权后进入）。Process 只持 `Arc<AddressSpace>`，不认识内部。
 - **分页模式分发**：`enum AnySpace { Sv39(Space<Sv39>), Sv48(Space<Sv48>), Sv57(Space<Sv57>) }`，在 syscall/fault/退休入口一次 match，往下单态化。模式在进程创建时按所属调度域 hart 能力（DTB `mmu-type`）选定；内核高半区按模式各备一份共享子树，不随用户根退休。
@@ -182,7 +188,9 @@
 
 ### fault
 
-先按 R/W/X 对照事务记录中该阶段承诺权限：不允许即正常投递；允许但 PTE 未发布则锁外让出/停驻等发布依赖；已发布但本地翻译陈旧则 sfence 重试；绝不锁内循环。
+先按R/W/X对照Committed整个窗口的事务终态目标权限：不允许即正常投递，guard/Unmap目标为None。允许但PTE未发布则捕获已有Completion来源，释放VM锁与Body短loan后停驻；已发布则SFENCE，X另FENCE.I，保持原pc/GPR重试，绝不锁内循环。Thread签名包含PTE、epoch、事务身份和已尝试hart位图，同组事实每hart只修复一次，无进展则正常终止；A/D由页表发布预置。
+
+依赖索引由max_transactions预付，登记/摘除与纯层预约的取得/释放同VM锁仲裁，索引不持被等待的Change/Retire Work。摘索引前ledger/PTE已是终态，之前捕获的来源继续到真实退款/access归还后DONE；Frozen等待者先detach离场，内核S态fault不进入DONE等待。SUM读/写/cookie另在同VM锁内translate后SFENCE再直访，不依赖尚未前进的epoch。完整寿命、验证边界见[审查修复档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)。
 
 ### remote 运输复用
 

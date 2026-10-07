@@ -187,7 +187,7 @@ impl SignalSource {
 
     /// 调用者已结束业务事实的仲裁；不持高于 OBJECT_WAIT 的业务锁。
     pub(crate) fn publish(self: &Arc<Self>, signals: ObjectSignals, closed: bool) {
-        let (activate, wake) = {
+        let (activate, woke, retired) = {
             let mut guard = self.state.lock();
             // SAFETY: 来源稳定存储、本来源同步域；电平与链同域提交。
             let activate = unsafe { self.queue.update(signals, closed) };
@@ -196,10 +196,14 @@ impl SignalSource {
             } else {
                 None
             };
-            (activate, wake)
+            let woke = wake.is_some();
+            // DONE仍在来源门内，等待者不能先读新电平、finish并释放执行根。
+            // wake只提交队列状态/归还非最后引用，潜在退休根移到门外销毁。
+            let retired = wake.and_then(mt::wake);
+            (activate, woke, retired)
         };
-        if let Some(wake) = wake {
-            mt::wake(wake);
+        drop(retired);
+        if woke {
             mt::kick();
         }
         if activate {
@@ -230,14 +234,15 @@ impl SignalSource {
 
     /// 内部退款里程碑与公开电平分别提交；复用持久观察宿主，不提前公开业务 DONE。
     pub(crate) fn complete_internal(&self) {
-        let wake = {
+        let (woke, retired) = {
             let mut guard = self.state.lock();
             assert!(!guard.internal_done, "internal completion published twice");
             guard.internal_done = true;
-            guard.waiter.take()
+            let wake = guard.waiter.take();
+            (wake.is_some(), wake.and_then(mt::wake))
         };
-        if let Some(wake) = wake {
-            mt::wake(wake);
+        drop(retired);
+        if woke {
             mt::kick();
         }
     }
@@ -268,7 +273,7 @@ impl Work for SignalSource {
         self.queue.record()
     }
 
-    fn step(&self) -> maintenance::record::Outcome {
+    fn step(self: Arc<Self>) -> maintenance::record::Outcome {
         let step = {
             let _guard = self.state.lock();
             // SAFETY: 来源域内只检查一个候选并复制在途凭证。

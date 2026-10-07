@@ -172,7 +172,7 @@ impl Work for Lifetime {
     fn record(&self) -> &WorkRecord {
         self.source.record()
     }
-    fn step(&self) -> maintenance::record::Outcome {
+    fn step(self: Arc<Self>) -> maintenance::record::Outcome {
         let step = {
             let _state = self.state.lock();
             // SAFETY: 持来源唯一同步域，每步复制一个无节点借用的凭据。

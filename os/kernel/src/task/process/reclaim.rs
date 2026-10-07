@@ -58,13 +58,6 @@ impl ProcessShell {
         mt::kick();
     }
 
-    fn root(&self) -> Arc<Self> {
-        self.self_ref
-            .lock()
-            .upgrade()
-            .expect("process work stepped after release")
-    }
-
     fn step_wait_ingress(&self, root: &Arc<dyn Work>) -> Outcome {
         let token = mt::arm(root);
         if let Some(token) = self.wait_ingress(token) {
@@ -235,15 +228,14 @@ impl Work for ProcessShell {
         &self.record
     }
 
-    fn step(&self) -> Outcome {
-        let shell = self.root();
-        let root: Arc<dyn Work> = shell.clone();
+    fn step(self: Arc<Self>) -> Outcome {
+        let root: Arc<dyn Work> = self.clone();
         let phase = self.reclaim.lock().phase;
         match phase {
             Phase::Idle => unreachable!("unpublished process work was scheduled"),
             Phase::WaitIngress => self.step_wait_ingress(&root),
-            Phase::SweepMembers(cursor) => self.step_sweep_members(&shell, cursor),
-            Phase::SweepReady(remaining) => self.step_sweep_ready(&shell, remaining),
+            Phase::SweepMembers(cursor) => self.step_sweep_members(&self, cursor),
+            Phase::SweepReady(remaining) => self.step_sweep_ready(&self, remaining),
             Phase::WaitShell => self.step_wait_shell(&root),
             Phase::BeginRetire => self.step_begin_retire(),
             Phase::ReleaseHandles(cursor) => self.step_release_handles(cursor),

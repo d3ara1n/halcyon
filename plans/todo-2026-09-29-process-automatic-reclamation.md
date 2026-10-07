@@ -1,6 +1,6 @@
 # 进程终止后的自动资源回收
 
-状态：**本链自动回收已实施交付；最终轮次及各owner契约为依据，实施/组合验证由[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有**。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有进程终止至资源收束的责任，不拥有各对象的清理算法。现状盘点及“推荐目标状态与 owner”为设计时基线/前期推导，不是当前代码；与定稿节冲突时以定稿节为准。
+状态：**本链自动回收及后续Job管理权/后代封口修复已交付**。首次实施/组合验证由[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有，后续修复、C1接通及实际证据见[审查修复档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有进程终止至资源收束的责任，不拥有各对象清理算法。现状盘点及“推荐目标状态与owner”为历史；以最终轮次、下方修正后的Job合同和[task实现](../notes/impls/task.md)分别核目标与现状，不重复启动旧设计门。不可达capability环收集、设备/DMA退休不是当前私有资源回收承诺；新增能力由对应owner另行闭合。
 
 ## 目标与现状
 
@@ -182,9 +182,10 @@ lifecycle 锁内取不可变终因（pid、parent_pid、类型化 cause+detail�
 ### Job（闭合门 4）
 
 - 首次 effective seal 是不可逆准入：Job Work 在 Seal 时 publish，先以有界游标把 sealed 物化到子节点（父锁只护 sealed 置位与单步游标/单项摘取，不一次扫全表），再 Blocked 等成员/子表清空（登记+复检，变化 wake），未满足绝不 Done。
-- 所有使表变空的入口（Settle 摘成员、空 Job Seal、member/child reservation 回滚、child 完成摘除）调用 Job 锁内同一 `try_commit_completion`，谓词 `effective_sealed && members.empty && children.empty`（两表都含 Reserved），单调，首次满足才提交私有 finishing。
+- 所有使表变空的入口（Settle摘成员、空Job Seal、member/child reservation回滚、child完成）调用Job锁内同一完成判定，谓词为effective_sealed、members/children均空且closing_children为0；两表包括Reserved，计数覆盖已经摘父表但尚未发布CLOSED的child。首次满足转Dead，Waiting凭证带出门外wake，Sealing已有稳定执行根。
 - 父 Seal 自动收束已空子树（与 Create/Start 祖先判定同一事实）；已物化 sealed 的父 commit ChildReservation 时子出生即 sealed 并 publish；尚未被传播到的父由未越过它的游标覆盖。
-- 公开终态由 Work 设置：先发布本 Job 终态/CLOSED，再从 parent.children 摘除，锁外 wake 父 Work。删除 `CompletionCursor` 与 seal 内同步 `finish_completion`。
+- 公开终态由Work发布：先从parent.children摘完整节点并增closing_children，门外退款及发布child CLOSED，再回父锁减计数并判断父完成，锁外wake父Work；根无父表。CLOSED保证父表已无本Job，父不得越过在途child先完成。该顺序取代早期“先CLOSED再摘父表”；删除CompletionCursor和seal内同步finish_completion。
+- root/child统一Remintable，关闭最后capability只放弃本地授权；父MANAGE仍可对尚在直接成员表中的child重新派生。显式Seal、父表/root anchor及有界Work决定Job业务寿命，不能用Terminal封闭位代替这一责任链。
 
 ### 交付边界
 

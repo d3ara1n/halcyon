@@ -9,7 +9,7 @@
 //!   SchedulerFrame 返回调度循环，由其处置当前线程。
 //!
 //! scause 按 `(is_interrupt, code)` 分发（TRAP-004 收口）：只有中断 1/5
-//! 进入 SSIP/STIP，只有异常 8 是 U ecall；其余用户同步异常一律终止进程。
+//! 进入 SSIP/STIP，异常8为U ecall，12/13/15按VM发布依赖判定；其余同步异常终止进程。
 
 use crate::{context::UserContext, hart, sbi, sched, syscall};
 
@@ -92,6 +92,10 @@ unsafe extern "C" fn handle_user_trap(
 
     let outcome = match (is_interrupt, code) {
         (false, U_ECALL) => {
+            if let Some(thread) = thread {
+                // SAFETY: 当前trap执行owner独占现场，成功进入另一指令清旧修复续体。
+                unsafe { thread.clear_fault_repair() };
+            }
             let Some(t) = thread else {
                 unreachable!("no current thread on ecall")
             };
@@ -117,8 +121,19 @@ unsafe extern "C" fn handle_user_trap(
             }
         }
         (false, _) => {
-            // 用户态同步异常一律终止进程（notes/impls/task.md「生命周期」）；
-            // 不以裸编号匹配中断语义（TRAP-004）。终因经稳定编码冻结。
+            if let Some(thread) = thread {
+                // SAFETY: 当前trap持该Thread的唯一执行现场；非page-fault不进入修复。
+                match unsafe { crate::vm::fault::handle(thread, frame.sepc, code, stval) } {
+                    crate::vm::fault::Action::Retry => {
+                        return finish(Some(thread), Outcome::Resume as usize);
+                    }
+                    crate::vm::fault::Action::Wait(plan) => {
+                        sched::park_request_wait(plan);
+                        return finish(Some(thread), Outcome::Park as usize);
+                    }
+                    crate::vm::fault::Action::Terminate => {}
+                }
+            }
             let pid = thread.map(|t| t.process.pid).unwrap_or(0);
             warn!(
                 Task,
@@ -146,6 +161,11 @@ unsafe extern "C" fn handle_user_trap(
             panic!("unexpected interrupt in user trap: code={other:#x} stval={stval:#x}");
         }
     };
+    finish(thread, outcome)
+}
+
+/// 所有trap出口共享业务锁外的两段通知、费用关闭与量子复检。
+fn finish(thread: Option<&crate::task::Thread>, outcome: usize) -> usize {
     crate::runtime_stop::check();
     // handler 的业务 guard 已全部释放；统一交付输出复检失败的终止待办。
     if let Some(t) = thread {

@@ -142,7 +142,7 @@ impl Transport {
 /// 发布者解开全部业务锁后发送门铃；槽链 Pending 电平是失败时的后备真值。
 pub(crate) fn kick(mask: u64) {
     if mask != 0 {
-        let _ = crate::registry::try_ipi_slots(mask);
+        let _ = crate::runtime_stop::notify_slots(mask);
     }
 }
 
@@ -181,7 +181,7 @@ pub(crate) fn drain_current(limit: usize) -> usize {
             // SAFETY: 唯一最后 ack 方。
             let token = unsafe { (*owner.wake.get()).take() };
             if let Some(token) = token {
-                maintenance::wake(token);
+                drop(maintenance::wake(token));
                 maintenance::kick();
             }
         }

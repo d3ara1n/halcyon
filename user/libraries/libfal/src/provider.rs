@@ -1,4 +1,5 @@
 use alloc::string::String;
+use libexecution::{SourcePlan, SourceRegistration};
 
 use erhino_shared::{
     call::SystemCallError,
@@ -113,9 +114,8 @@ pub struct Retirement {
     owner: Capability,
     source_kind: SourceKind,
     signal_bit: u64,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     stopping: bool,
 }
 
@@ -125,9 +125,8 @@ impl Retirement {
             owner,
             source_kind,
             signal_bit,
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             stopping: false,
         }
     }
@@ -166,17 +165,14 @@ impl Retirement {
             });
         }
         if self.stopping && state.backend_is_empty() {
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Runnable,
                 });
             }
-            if self.source.is_none() && !self.requested {
+            if self.source.source().is_none() && !self.source.is_installing() {
                 state.close_backend()?;
                 libkernel::debug!("FAL provider shutdown: backend retired");
                 return Ok(Advance {
@@ -186,13 +182,15 @@ impl Retirement {
             }
         }
 
-        if self.source.is_none() && !self.requested {
-            requests.add_source(
-                self.owner.as_handle(),
-                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+        if self.source.source().is_none() && !self.source.is_installing() {
+            self.source.install(
+                requests,
+                SourcePlan::new(
+                    self.owner.as_handle(),
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                ),
                 self.source_kind,
             )?;
-            self.requested = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,
@@ -206,10 +204,13 @@ impl Retirement {
     }
 
     pub fn refused<F>(&mut self, failure: RequestFailure<F>) -> bool {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
+
         if let RequestFailure::Source { kind, .. } = failure
             && kind == self.source_kind
         {
-            self.requested = false;
             return true;
         }
         false
@@ -217,17 +218,14 @@ impl Retirement {
 
     pub fn registered<B>(&mut self, state: &mut State<B>, kind: SourceKind, source: SourceId) {
         if kind == self.source_kind {
-            self.requested = false;
-            self.source = Some(source);
+            self.source.registered(kind, source);
             state.retire_ready = true;
         }
     }
 
     pub fn unregistered(&mut self, kind: SourceKind, source: SourceId) {
-        if kind == self.source_kind && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        if kind == self.source_kind && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         }
     }
 
@@ -259,9 +257,8 @@ pub struct Grant {
     observer: Option<GrantObserver>,
     publication: GrantPublication,
     outbox: Option<Outbox>,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     stopping: bool,
     reply_kind: SourceKind,
     lifetime_kind: SourceKind,
@@ -275,9 +272,8 @@ impl Grant {
             observer: None,
             publication: GrantPublication::Root,
             outbox: None,
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             stopping: false,
             reply_kind: 0,
             lifetime_kind,
@@ -301,9 +297,8 @@ impl Grant {
                 encoded: false,
             },
             outbox: Some(outbox),
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             stopping: false,
             reply_kind,
             lifetime_kind,
@@ -418,25 +413,22 @@ impl Grant {
                 self.outbox = None;
                 *sender = None;
             }
-            if self.prepared.is_some() && !self.requested {
+            if self.prepared.is_some() && !self.source.is_installing() {
                 self.prepared = None;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Complete,
                 });
             }
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Runnable,
                 });
             }
-            if self.source.is_none()
-                && !self.requested
+            if self.source.source().is_none()
+                && !self.source.is_installing()
                 && let Some(observer) = self.observer.take()
             {
                 let retire_task = host.provider().retire_task;
@@ -477,17 +469,16 @@ impl Grant {
                 step: Step::Runnable,
             });
         }
-        if !self.requested {
+        if !self.source.is_installing() {
             let prepared = self
                 .prepared
                 .as_ref()
                 .expect("grant installation lost prepared owner");
-            requests.add_source(
-                prepared.lifetime_handle(),
-                ObjectSignals::CLOSED,
+            self.source.install(
+                requests,
+                SourcePlan::new(prepared.lifetime_handle(), ObjectSignals::CLOSED),
                 self.lifetime_kind,
             )?;
-            self.requested = true;
         }
         Ok(Advance {
             work_done: 1,
@@ -500,9 +491,12 @@ impl Grant {
         H: Host<B>,
         B: ProviderBackend<Capability>,
     {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Source { kind, .. } if kind == self.lifetime_kind => {
-                self.requested = false;
                 self.stopping = true;
                 if !host.stopping() {
                     host.fail();
@@ -530,8 +524,7 @@ impl Grant {
         if kind != self.lifetime_kind {
             return;
         }
-        self.requested = false;
-        self.source = Some(source);
+        self.source.registered(kind, source);
         let prepared = self
             .prepared
             .take()
@@ -562,10 +555,8 @@ impl Grant {
             if let Some(outbox) = self.outbox.as_mut() {
                 outbox.unregistered(host, kind, source);
             }
-        } else if kind == self.lifetime_kind && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        } else if kind == self.lifetime_kind && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         }
     }
 
@@ -653,9 +644,8 @@ pub struct Watch {
     outbox: Option<Outbox>,
     info: Option<protocol::SubscriptionInfo>,
     task_id: Option<u64>,
-    source: Option<SourceId>,
-    requested: bool,
-    removing: bool,
+    source: SourceRegistration,
+
     encoded: bool,
     recorded: bool,
     stopping: bool,
@@ -678,9 +668,8 @@ impl Watch {
             outbox: Some(outbox),
             info: None,
             task_id: None,
-            source: None,
-            requested: false,
-            removing: false,
+            source: SourceRegistration::new(),
+
             encoded: false,
             recorded: false,
             stopping: false,
@@ -771,7 +760,7 @@ impl Watch {
             outbox.timed_out();
         }
         if !self.stopping && self.info.is_none() && self.registration_error.is_none() {
-            if self.source.is_none() && !self.requested {
+            if self.source.source().is_none() && !self.source.is_installing() {
                 let signaler = self
                     .owner
                     .signaler
@@ -780,15 +769,17 @@ impl Watch {
                 if self.observation.is_none() {
                     self.observation = Some(notification::observe(signaler.as_handle())?);
                 }
-                requests.add_source(
-                    self.observation
-                        .as_ref()
-                        .expect("Watch observation missing")
-                        .as_handle(),
-                    ObjectSignals::CLOSED,
+                self.source.install(
+                    requests,
+                    SourcePlan::new(
+                        self.observation
+                            .as_ref()
+                            .expect("Watch observation missing")
+                            .as_handle(),
+                        ObjectSignals::CLOSED,
+                    ),
                     self.owner_kind,
                 )?;
-                self.requested = true;
             }
             return Ok(Advance {
                 work_done: 1,
@@ -833,17 +824,14 @@ impl Watch {
                 self.record_outbox(host)?;
                 self.outbox = None;
             }
-            if let Some(source) = self.source
-                && !self.removing
-            {
-                requests.remove(source)?;
-                self.removing = true;
+            if self.source.source().is_some() && !self.source.is_removing() {
+                self.source.remove(requests)?;
                 return Ok(Advance {
                     work_done: 1,
                     step: Step::Runnable,
                 });
             }
-            if self.source.is_none() && !self.requested {
+            if self.source.source().is_none() && !self.source.is_installing() {
                 self.close_signaler()?;
                 return Ok(Advance {
                     work_done: 1,
@@ -931,9 +919,12 @@ impl Watch {
         H: Host<B>,
         B: ProviderBackend<Capability>,
     {
+        if let RequestFailure::Source { kind, .. } = &failure {
+            self.source.refused(*kind);
+        }
+
         match failure {
             RequestFailure::Source { kind, error } if kind == self.owner_kind => {
-                self.requested = false;
                 self.registration_error = Some(match error {
                     SystemCallError::ObjectClosed | SystemCallError::StaleHandle => {
                         protocol::Status::Cancelled
@@ -965,8 +956,7 @@ impl Watch {
         if kind != self.owner_kind {
             return;
         }
-        self.requested = false;
-        self.source = Some(source);
+        self.source.registered(kind, source);
         let generation = {
             let backend = host
                 .provider()
@@ -1003,10 +993,8 @@ impl Watch {
             if let Some(outbox) = self.outbox.as_mut() {
                 outbox.unregistered(host, kind, source);
             }
-        } else if kind == self.owner_kind && self.source == Some(source) {
-            self.source = None;
-            self.requested = false;
-            self.removing = false;
+        } else if kind == self.owner_kind && self.source.source() == Some(source) {
+            self.source.unregistered(source);
         }
     }
 

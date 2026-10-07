@@ -73,14 +73,16 @@ impl<C: Capability> Binding<C> {
             .duplicate(Rights::WRITE | Rights::WAIT)
             .map_err(BackendError::Resource)?;
         let mut consumed = String::new();
-        consumed
-            .try_reserve_exact(self.name.len())
-            .map_err(|_| BackendError::Resource(erhino_shared::call::SystemCallError::OutOfMemory))?;
+        consumed.try_reserve_exact(self.name.len()).map_err(|_| {
+            BackendError::Resource(erhino_shared::call::SystemCallError::OutOfMemory)
+        })?;
         consumed.push_str(&self.name);
         let mut remaining_owned = String::new();
         remaining_owned
             .try_reserve_exact(remaining.len())
-            .map_err(|_| BackendError::Resource(erhino_shared::call::SystemCallError::OutOfMemory))?;
+            .map_err(|_| {
+                BackendError::Resource(erhino_shared::call::SystemCallError::OutOfMemory)
+            })?;
         remaining_owned.push_str(remaining);
         Ok(Some(LookupResult::DelegationBoundary {
             target,

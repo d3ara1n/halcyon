@@ -81,6 +81,7 @@
 | OpenSBI HiFive Unleashed 平台 | `implementations/opensbi-v1.9/docs/platform/sifive_fu540.md` |
 | QEMU `virt` 机器 | `implementations/qemu-v11.1.0/riscv/virt.rst` |
 | QEMU `sifive_u` 机器 | `implementations/qemu-v11.1.0/riscv/sifive_u.rst` |
+| QEMU 11.1.2 GDB远程协议、物理内存与TCG断点 | [固定gdb.rst](https://github.com/qemu/qemu/blob/v11.1.2/docs/system/gdb.rst)「Examining physical memory」与「Breakpoint and Watchpoint support」；专项脚本使用`Qqemu.PhyMemMode:1/0`，TCG支持无限硬件断点 |
 | Linux RISC-V trap 指令用法检索（非设计依据） | `implementations/linux-riscv-818bebeb/arch/riscv/kernel/entry.S` |
 | Linux secondary/CSR 指令用法检索（非设计依据） | `implementations/linux-riscv-818bebeb/arch/riscv/kernel/head.S`、`cpu_ops_sbi.c`、`smpboot.c` |
 | Linux 局部 FPU 汇编及 ABI 构建用法检索（非设计依据） | `implementations/linux-riscv-818bebeb/arch/riscv/Makefile`、`kernel/fpu.S`、`include/asm/switch_to.h` |

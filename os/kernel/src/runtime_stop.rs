@@ -7,6 +7,16 @@ static REQUESTED: AtomicBool = AtomicBool::new(false);
 /// 固定的物理停驻证据，不承担对象退休或用户结果责任。
 static PARKED: AtomicU64 = AtomicU64::new(0);
 
+/// 已发布责任的门铃。平台失败是运行终态，由后续锁外安全点吸收；
+/// 不在发送方可能持锁的调用栈中park，也不依赖停驻传播收到IPI ack。
+pub(crate) fn notify_slots(mask: u64) -> u64 {
+    let failed = crate::registry::try_ipi_slots(mask);
+    if failed != 0 {
+        request();
+    }
+    failed
+}
+
 pub(crate) fn check() {
     if (REQUESTED.load(Ordering::Acquire) || crate::clock::is_failed())
         && !STOPPED.swap(true, Ordering::AcqRel)

@@ -7,7 +7,8 @@
 //!   记录链；有 Ready 记录的账户挂在全局账户环上。
 //! - 锁：全局一把 `ranks::MAINTENANCE` ticket 锁，叶锁，持有时不取其他锁、
 //!   不分配（挂接全部为侵入式链接）。记录状态、链接与账本只在该锁下访问。
-//! - 依赖：源锁内只摘 [`WakeToken`]，解源锁后 [`wake`]。
+//! - 依赖：来源门内可用[`wake`]提交状态；返回的潜在最后根带出全部门后销毁，
+//!   [`kick`]也在门外，不在来源/队列门内运行业务或Hint回调。
 
 use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
@@ -15,7 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use maintenance::{
     account::{Grant, Ledger, Visit},
-    record::{Action, Outcome, Record, WaitTicket},
+    record::{Action, Outcome, Record, State, WaitTicket},
     rotor::{Choice, Class, Rotor},
 };
 
@@ -35,8 +36,9 @@ pub(crate) trait Work: Send + Sync {
     fn cost_name(&self) -> &'static &'static str {
         &const { core::any::type_name::<Self>() }
     }
+    /// 只返回地址稳定的内嵌记录，不取业务锁、不分配、不回调；可在QUEUE门内调用。
     fn record(&self) -> &WorkRecord;
-    fn step(&self) -> Outcome;
+    fn step(self: Arc<Self>) -> Outcome;
 }
 
 /// 内嵌于拥有体的工作记录：状态机 + 侵入式 Ready 链接 + 所属账户。
@@ -49,7 +51,7 @@ struct RecordInner {
     state: Record,
     /// Ready 链后继；同时是 Queued 期间的强根。
     next: Option<Arc<dyn Work>>,
-    /// Running/Blocked 期间的强根（Queued 时由前驱 next 或账户 head 持有）。
+    /// Blocked 期间的强根；Running 根由执行器局部持有。
     root: Option<Arc<dyn Work>>,
 }
 
@@ -193,7 +195,7 @@ impl Work for Placeholder {
     fn record(&self) -> &WorkRecord {
         unreachable!()
     }
-    fn step(&self) -> Outcome {
+    fn step(self: Arc<Self>) -> Outcome {
         unreachable!()
     }
 }
@@ -224,7 +226,7 @@ static QUEUE: Spinlock<Queue> = Spinlock::new(
     },
 );
 
-/// 依赖完成方持有的唤醒凭证；源锁内摘取，解源锁后 [`wake`]。
+/// 依赖完成方持有的唤醒凭证；来源门内可提交[`wake`]，潜在退休根必须门外释放。
 pub(crate) struct WakeToken {
     work: Arc<dyn Work>,
     ticket: WaitTicket,
@@ -256,26 +258,43 @@ pub(crate) fn publish(work: Arc<dyn Work>) {
     if action == Action::Link {
         link(&mut q, work);
     } else {
-        drop(q);
+        // Queued/Running的执行根只在同一锁下finish；此处Arc递减必非最后引用。
+        // 先解锁会允许另一hart完成并释放根，把完整宿主析构带回通知调用栈。
         drop(work);
+        drop(q);
     }
 }
 
-/// 依赖完成：按凭证代次唤醒；陈旧或重复凭证无效。凭证在锁外 drop。
-pub(crate) fn wake(token: WakeToken) {
+/// 依赖完成：活跃凭证在根受保护时归还。Idle/Done的潜在最后根交还调用者。
+/// 可以在来源锁内提交状态；返回值必须带出全部领域锁后销毁。
+#[must_use = "retired work roots must be dropped outside every domain lock"]
+pub(crate) fn wake(token: WakeToken) -> Option<Arc<dyn Work>> {
     let WakeToken { work, ticket } = token;
     let mut q = QUEUE.lock();
     // SAFETY: 持全局锁。
     let inner = unsafe { work.record().inner() };
-    if inner.state.wake(ticket) == Action::Link {
+    let action = inner.state.wake(ticket);
+    let active = matches!(
+        inner.state.state(),
+        State::Queued | State::Running { .. } | State::Blocked
+    );
+    if action == Action::Link {
         let root = inner.root.take().expect("blocked record without root");
         link(&mut q, root);
     }
-    drop(q);
-    drop(work);
+    if active {
+        // 当前执行根受QUEUE锁保护，非最后Arc Drop只做有界引用计数。
+        drop(work);
+        drop(q);
+        None
+    } else {
+        // 不在这里运行潜在最后析构：调用者可能仍持来源锁。
+        drop(q);
+        Some(work)
+    }
 }
 
-/// 解开全部锁后提醒空闲 hart 有维护工作（合并、失败均安全：idle 前复检）。
+/// 解开全部锁后提醒空闲hart：合并由idle前复检闭合，发送失败进入runtime_stop。
 pub(crate) fn kick() {
     crate::sched::wake_idle_harts();
 }
@@ -450,7 +469,8 @@ fn advance_one(quantum: u64) -> bool {
     let cleanup_before = costs.cleanup_ticks.load(Ordering::Relaxed);
     let cost_name = work.cost_name();
     let started = execution_ticks();
-    let outcome = work.step();
+    // 调用根由本执行原根保活，其析构不是最后引用；finish 后才释放执行原根。
+    let outcome = work.clone().step();
     let account = work.record().account.clone();
     let mut q = QUEUE.lock();
     // SAFETY: 持全局锁；裸指针指向 `work` 内嵌记录，`work` 在本函数内存活，
@@ -524,6 +544,8 @@ fn advance_one(quantum: u64) -> bool {
 struct Execution {
     rotor: Rotor,
     user_started: Option<u64>,
+    /// Geometry在本次boot内不可变，策略常量只在执行器出生时换算。
+    account_quantum: u64,
 }
 struct HartRotor(UnsafeCell<Option<Execution>>);
 // SAFETY: 每项只被所属 hart 在调度循环/trap 返回边界访问。
@@ -600,6 +622,7 @@ fn execution() -> &'static mut Execution {
             execution_duration(MAINTENANCE_QUANTUM_NS),
         ),
         user_started: None,
+        account_quantum: execution_duration(ACCOUNT_QUANTUM_NS),
     })
 }
 
@@ -692,17 +715,10 @@ pub(crate) fn service(user_ready: bool) -> Choice {
         // 只发布只读类别事实；Dtor 不借 ROTORS 的独占执行状态。
         costs.in_maintenance.store(true, Ordering::Relaxed);
         let started = execution_ticks();
-        let account_quantum = execution_duration(ACCOUNT_QUANTUM_NS);
-        let atomic_started = execution_ticks();
-        let _ = advance_one(account_quantum);
-        record_max(
-            &costs.atomic_max,
-            execution_ticks().saturating_sub(atomic_started),
-        );
-        state.rotor.charge(
-            Class::Maintenance,
-            execution_ticks().saturating_sub(started),
-        );
+        let _ = advance_one(state.account_quantum);
+        let actual = execution_ticks().saturating_sub(started);
+        record_max(&costs.atomic_max, actual);
+        state.rotor.charge(Class::Maintenance, actual);
         costs.in_maintenance.store(false, Ordering::Relaxed);
     }
     choice

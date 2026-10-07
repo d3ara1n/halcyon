@@ -12,10 +12,7 @@ use crate::{
     },
     vm::operation,
 };
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use core::{alloc::Layout, pin::Pin};
 use erhino_shared::{
     call::SystemCallError,
@@ -63,7 +60,6 @@ struct Loader {
 }
 struct Bootstrap {
     record: WorkRecord,
-    this: Spinlock<Weak<Self>>,
     shell: Arc<ProcessShell>,
     control: Arc<task::thread::ThreadControl>,
     _pool: Arc<task::memory_pool::MemoryPool>,
@@ -201,7 +197,6 @@ pub(crate) fn publish(
         builder.arm();
         let work = Arc::try_new(Bootstrap {
             record: WorkRecord::new(pool.maintenance_account().clone()),
-            this: Spinlock::new(ranks::LEAF, Weak::new()),
             shell: shell.clone(),
             control,
             _pool: pool,
@@ -227,7 +222,6 @@ pub(crate) fn publish(
             _metadata: metadata,
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        *work.this.lock() = Arc::downgrade(&work);
         mt::publish(work);
         mt::kick();
         Ok(())
@@ -242,13 +236,9 @@ pub(crate) fn publish(
 }
 
 impl Bootstrap {
-    fn advance(&self, loader: &mut Loader) -> Result<Outcome, SystemCallError> {
+    fn advance(self: &Arc<Self>, loader: &mut Loader) -> Result<Outcome, SystemCallError> {
         if let Some(source) = loader.waiting.as_ref() {
-            let root = self
-                .this
-                .lock()
-                .upgrade()
-                .expect("bootstrap lost work owner");
+            let root = self.clone();
             let work: Arc<dyn Work> = root.clone();
             let token = mt::arm(&work);
             *self.wake.lock() = Some((loader.epoch, token));
@@ -483,7 +473,7 @@ impl Work for Bootstrap {
     fn record(&self) -> &WorkRecord {
         &self.record
     }
-    fn step(&self) -> Outcome {
+    fn step(self: Arc<Self>) -> Outcome {
         let mut loader = self.loader.lock().take().expect("bootstrap stepped twice");
         // Start 提交后不再借 Building Body；DONE 只等同一启动记录的完成。
         let outcome = if matches!(loader.phase, Phase::Done) && loader.waiting.is_none() {
@@ -529,7 +519,7 @@ impl HintTarget for Bootstrap {
             }
         };
         if let Some(token) = token {
-            mt::wake(token);
+            drop(mt::wake(token));
             mt::kick();
         }
     }

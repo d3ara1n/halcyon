@@ -6,20 +6,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use erhino_shared::call::SystemCallError;
 use maintenance::record::Outcome;
 
-use crate::{
-    maintenance::{self as mt, Work, WorkRecord},
-    sync::{Spinlock, ranks},
-};
+use crate::maintenance::{self as mt, Work, WorkRecord};
 
 use super::{super::thread::ThreadControl, members::MemberKey, shell::ProcessShell};
 
-struct DepartureState {
-    requested: bool,
-}
-
 pub(crate) struct ThreadDeparture {
     record: WorkRecord,
-    state: Spinlock<DepartureState>,
     release: DepartureRelease,
 }
 
@@ -56,7 +48,6 @@ impl ThreadDeparture {
         let metadata = super::super::resources::MetadataCharge::arc::<Self>(&pool)?;
         let departure = Arc::try_new(Self {
             record: WorkRecord::new(account),
-            state: Spinlock::new(ranks::LEAF, DepartureState { requested: false }),
             release: DepartureRelease {
                 metadata: Some(metadata),
                 shell: shell.clone(),
@@ -69,14 +60,8 @@ impl ThreadDeparture {
         Ok(departure)
     }
 
+    /// ThreadRelease 的最后字段 Drop 单次转交已提交成员的离场责任。
     pub(crate) fn request(self: &Arc<Self>) {
-        {
-            let mut state = self.state.lock();
-            if state.requested {
-                return;
-            }
-            state.requested = true;
-        }
         let root: Arc<dyn Work> = self.clone();
         mt::publish(root);
         mt::kick();
@@ -88,15 +73,11 @@ impl Work for ThreadDeparture {
         &self.record
     }
 
-    fn step(&self) -> Outcome {
-        {
-            let state = self.state.lock();
-            assert!(state.requested, "unrequested thread departure scheduled");
-            assert!(
-                !self.release.completed.load(Ordering::Acquire),
-                "thread departure completed twice"
-            );
-        }
+    fn step(self: Arc<Self>) -> Outcome {
+        assert!(
+            !self.release.completed.load(Ordering::Acquire),
+            "thread departure completed twice"
+        );
         let receipt = self
             .release
             .shell

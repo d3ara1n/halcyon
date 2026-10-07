@@ -1,6 +1,6 @@
 //! 构造票据：最后 Pending authority 消散或显式 Abort 统一冻结 Shell。
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::any::Any;
 use erhino_shared::{
     call::SystemCallError,
@@ -37,7 +37,6 @@ enum Phase {
 struct State {
     phase: Phase,
     shell: Option<Arc<ProcessShell>>,
-    abandoned: bool,
     cursor: usize,
     end: usize,
     tid_ceiling: erhino_shared::proc::Tid,
@@ -49,7 +48,6 @@ pub(crate) struct ProcessBuilder {
     process_id: u64,
     state: Spinlock<State>,
     record: WorkRecord,
-    this: Spinlock<Weak<Self>>,
     completion: BuilderCompletion,
 }
 
@@ -73,7 +71,6 @@ impl ProcessBuilder {
         let metadata = super::super::resources::MetadataCharge::arc::<Self>(&pool)?;
         let builder = Arc::try_new(Self {
             record: WorkRecord::new(pool.maintenance_account().clone()),
-            this: Spinlock::new(ranks::LEAF, Weak::new()),
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
             process_id: shell.header.koid(),
@@ -82,7 +79,6 @@ impl ProcessBuilder {
                 State {
                     phase: Phase::Prepared,
                     shell: Some(shell),
-                    abandoned: false,
                     cursor: 0,
                     end: 0,
                     tid_ceiling: 0,
@@ -95,7 +91,6 @@ impl ProcessBuilder {
             },
         })
         .map_err(|_| SystemCallError::OutOfMemory)?;
-        *builder.this.lock() = Arc::downgrade(&builder);
         Ok(builder)
     }
 
@@ -157,22 +152,15 @@ impl ProcessBuilder {
                 Ok(wait)
             }
             Err(error) => {
-                let abandoned = {
+                {
                     let mut state = self.state.lock();
                     assert!(
                         state.phase == Phase::Starting,
                         "builder start phase changed"
                     );
-                    if state.abandoned {
-                        state.phase = Phase::Aborted;
-                        state.shell.take()
-                    } else {
-                        state.phase = Phase::Pending;
-                        None
-                    }
-                };
-                if let Some(shell) = abandoned {
-                    shell.freeze_and_seal(TerminationCause::Aborted, TerminationDetail::NONE);
+                    // Invocation 的消费 authority 仍在；失败先恢复 Pending，
+                    // 随后的 restore/release 唯一决定继续持有还是放弃。
+                    state.phase = Phase::Pending;
                 }
                 Err(error)
             }
@@ -211,10 +199,6 @@ impl KernelObject for ProcessBuilder {
                     state.phase = Phase::Aborted;
                     state.shell.take()
                 }
-                Phase::Starting => {
-                    state.abandoned = true;
-                    None
-                }
                 Phase::Prepared => {
                     state.phase = Phase::Aborted;
                     let retained = state.shell.take();
@@ -222,7 +206,8 @@ impl KernelObject for ProcessBuilder {
                     drop(retained);
                     return;
                 }
-                Phase::Publishing | Phase::Started | Phase::Aborted => None,
+                // Starting 成功返回时 Work 已接管；authority 的最后消散不撤销它。
+                Phase::Starting | Phase::Publishing | Phase::Started | Phase::Aborted => None,
             }
         };
         if let Some(shell) = shell {
@@ -236,7 +221,7 @@ impl Work for ProcessBuilder {
         &self.record
     }
 
-    fn step(&self) -> Outcome {
+    fn step(self: Arc<Self>) -> Outcome {
         let (phase, shell, cursor, end, tid_ceiling) = {
             let state = self.state.lock();
             (
@@ -250,7 +235,7 @@ impl Work for ProcessBuilder {
         if let Some(body) = shell.lease_body() {
             match phase {
                 Phase::Starting => {
-                    let root: Arc<dyn Work> = self.this.lock().upgrade().expect("start lost owner");
+                    let root: Arc<dyn Work> = self.clone();
                     let token = mt::arm(&root);
                     match body.vm.wait_start(token) {
                         None => return Outcome::Blocked,
