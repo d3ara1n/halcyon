@@ -36,7 +36,7 @@
 | `mm.md`、`tunnel.md`、`shared-memory.md` | backing/View、事务发布/退休、fault与退款：[内存分案](todo-2026-10-01-memory-redesign.md)；费用见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | Sv48/Sv57实际平台接通及测量/证明触发的优化 | ideas未整篇审定 / 当前Sv39对象链范围已实现验证 |
 | `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 内核消息/能力运输、取消及等待：[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)、[等待源分案](todo-2026-10-02-wait-source.md) | 更广RPC业务模型与不可达环收集若扩大承诺需独立闭合 | ideas未整篇审定 / 当前运输和等待范围已实现验证 |
 | `framework.md`、`runnel.md`、`buffer-queue.md` | Runtime来源/取消、Caller及runnel失败清理：[审查修复档案](archived/review-2026-10-07-object-chain.md) | 更广业务任务、语言运行时、数据面与FAL边界按所属分案继续 | ideas未整篇审定 / 对象链实际消费者已接通验证 |
-| `fal.md`、`fs.md`、`service.md` | 本总纲确认整体重审，不以现有 FAL 反向约束底层 | 授权、目录/属性/流、能力导出、发现/发布、provider 边界；完整分案待形成 | 未审定；清理不等于机制重设计 / 未实现 |
+| `fal.md`、`fs.md`、`service.md` | 整体重审，不以现有 FAL 反向约束底层：[FAL/服务分案](todo-2026-10-07-fal-service-redesign.md)、[正式服务装配分案](todo-2026-10-07-service-assembly.md) | 授权、目录/属性/流、能力导出、发现/发布、provider 及正式装配边界；两案仅登记范围，详细设计未闭合 | 未审定；立案不等于机制重设计 / 未实现 |
 | `device.md` | 特权维护与进程回收分离：[设备分案](todo-2026-09-device-system-design.md) | 资源对象、隔离事实、恢复、跨域协议及运行装配 | 未整篇审定；局部原则与候选方案 / 未实现 |
 | 其余 `notes/ideas/**` | 没有本轮重设计审定记录；旧规范证据可独立核实，不因此认可整个设计 | 由所属分案明确重审范围后补登记 | 未登记审定；不作重构目标依据 |
 
@@ -65,25 +65,45 @@
 | [进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 终止至收束、公共完成、删除用户驱动 | 当前Shell/Body/VM/Job责任链及C1已交付并验证 |
 | [映射/backing重审](todo-2026-10-01-memory-redesign.md) | allocation identity、完整/部分修改、同步、物理/metadata费用 | 当前Sv39链及C2已交付；其他模式实际平台接通另受触发 |
 | IPC、等待与服务调用重审 | 消息/能力运输、请求回复、订阅/终态观察 | 对象链消息与[等待源](todo-2026-10-02-wait-source.md)已交付；更广业务模型仍按独立需求论证 |
-| 用户态执行、运行时与FAL/服务重审 | 语言owner、任务取消、业务完成、发现/授权/存储/流 | 对象链实际消费者已迁移；[运行时分层](todo-2026-09-runtime-kernel-library-separation.md)及FAL领域重审另有范围 |
+| 用户态执行与运行时 | 语言owner、线程结果、任务取消、来源登记 | [运行时分层](todo-2026-09-runtime-kernel-library-separation.md)已完成；对象链实际消费者及SourceRegistration已收敛，更广需求按明确触发接续 |
+| [FAL/文件系统与服务发布发现](todo-2026-10-07-fal-service-redesign.md) | 路径/节点、目录/属性/流、授权导出、发布发现与provider边界 | 已立案，待详细设计；消费已交付对象链，不默认保留旧FAL组合 |
+| [正式服务装配与监督](todo-2026-10-07-service-assembly.md) | 启动依赖、就绪、授权交付、监督恢复及停止接点 | 已立案，待详细设计；发布发现、设备供应与全系统停止分别链接所属计划 |
+| [设备体系](todo-2026-09-device-system-design.md) | 设备关系、资源authority、驱动协议、硬件隔离与运行装配 | 组织层已细化，详细D1—D6未闭合；可与FAL并行设计 |
 
 表中尚未立案部分不构成可执行施工步骤。每份已立案计划独立说明目标、边界、当前事实、依赖、状态和删除门；公共契约只在所属分案定义。独立分案不是“单独改完一个文件就交付”，相关消费者与旧路径在责任链闭合时一并替换。
 
-## 优先重设计项：不以线稿清理代替设计审查
+## 剩余切面与接续顺序
 
-下列项是后续设计切入点，并非已经证明每项都必须删除。当前记录中沿用旧名字的例子只用于定位现状；最终按独立需求决定保留、合并或替换。
+2026-10-07按`refactor/system-redesign` / `f174d8e`核对。下表拥有后续切面的划分和相对排期；详细契约、进度与证据仍由各案拥有。后续会话先从本表接手，只有新需求、代码事实或验证证据改变判断时才重排，并同步记录依据。全项目仍可重审不等于已交付机制需要重新施工。
 
-| 优先主题 | 需要重新回答的问题 | 现有耦合/风险线索与归属 |
+| 切面 | 需要重新闭合的内容 | 状态与唯一入口 |
 |---|---|---|
-| 权限模型统一 | 对象/rights及最后持有已由capability分案定稿并接入 | 当前对象链范围已交付；ideas `object.md`未因此自动审定 |
-| authority、持有与观察 | 创建/启动权、普通使用、最后引用、终态观察分别应保活什么？role 是独立授权关系还是表示补偿？ | ThreadControl WAIT-only 与 Created 放弃、Sender/Lifetime/Delivery；capability 分案拥有，不能把现状计数写成默认保留契约 |
-| 内存对象、映射与安全释放 | backing、映射 owner、访问借用、通信参与方应怎样组合？完整释放与部分区间修改如何分开？ | Tunnel 与本地 lease 绑定、按地址区间重建 owner；内存/IPC 分案共同闭合，不能只移走 Close 的错误返回 |
-| 操作提交、结果交付与取消 | 操作被接受、效果提交、结果可取得和安全完成分别是什么？调用线程消散后谁拥有结果？ | Map cookie/UserWriteLease/线程 join 与结果记录联动，RPC 超时与未知结果；按对应操作领域设计，不预设一种万能事务状态机 |
-| IPC、RPC 与服务授权 | 原始消息、请求/回复、授权上下文、在途保活分别需要哪些对象？能力导出是否应触发隐藏的远端派生调用？ | Mailbox/SendOnce/Delivery/Lifetime 与 FAL grant/export 组合；重新论证对象边界，不能仅因现有 FAL 消费它们而保留 |
-| 等待与用户态执行 | 登记、取消消费、来源退休、迟到事件隔离分别由谁完成？业务任务真正需要哪些状态？ | RPC/Runtime 来源回执、注销重试、FAL 多组 requested/removing 状态；删除机械清理负担，同时保留真实业务取消和结果责任 |
-| 资源来源、准入与维护成本 | 内存、metadata、执行记录和 CPU 时间由谁负担？资源跨域转移、来源退出后如何保持真实归属？ | 现有全局 MetadataSponsor 与独立预算缺口；由[预算计划](todo-2026-09-14-kernel-memory-budget.md)承接，预算形式也需重审，自动回收不等于资源隔离 |
+| FAL/文件系统与服务发布发现 | 路径与节点身份、授权/能力导出、目录/属性/流、provider、操作提交与结果/取消 | 近期首要重设计入口：[FAL/服务分案](todo-2026-10-07-fal-service-redesign.md)。当前Read中的下游Derive及Record携带endpoint是论证线索，不预判必须删除 |
+| 正式服务装配与监督 | 启动依赖、就绪、发布交付、失效/重启/重连、上级接管、停止接点 | [服务装配分案](todo-2026-10-07-service-assembly.md)待详细设计；通用关系可先论证，设备特有接线等待设备契约；全系统停止由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有 |
+| 设备/驱动与平台资源 | 实例/分配范围/绑定/租约/session、MMIO/IRQ/DMA、供应依赖、硬件静止与恢复 | [设备分案](todo-2026-09-device-system-design.md#当前进度与接力)从详细D1继续，可与FAL并行；[保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md)及[设备/中断承接](todo-2026-08-26-review-carryover.md)为相关前置 |
+| 不可信域资源硬隔离 | 已有额度付款之外的域间硬容量、Weak尾部与allocator碎片隔离；CPU份额另行建模 | [预算分案](todo-2026-09-14-kernel-memory-budget.md)拥有；Pool页/metadata双维付款已交付，不能再把MetadataSponsor迁移当缺口；开放不可信创建域或承诺硬隔离前触发 |
+| RPC/用户态执行与数据面 | 真实业务需要的事务owner/ReplyPort归还设计、BufferQueue及DMA消费者接点 | 定向或条件后续。SourceRegistration已收敛；Caller/Dispatcher统一候选本轮未采纳，重开条件见[审查档案](archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)。没有依据整体重做执行层，数据面随正式消费者接通 |
+| 性能、分页模式与其他平台能力 | 锁/ASID/定向shootdown、精确CPU计量、Sv48/Sv57和新执行档位 | 分别按[性能专题](todo-2026-10-01-lock-performance.md)、[内存完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)、执行需求触发；不因存在扩展方向撤销当前有限保证 |
 
-任务/Job/启动、设备及服务部署关系仍在全项目重审范围，不能因它们未列为本轮优先切入点而默认冻结。先闭合资源/操作/结果的基础关系，再校正用户态库、执行与 FAL 的组合；必要时由真实场景反向修正基础机制。
+对象链的持有/释放、维护、自动回收、当前Sv39、消息/等待和运行时分层已有交付及相应验证。ideas未整篇审定、历史Review尚待核定和未来能力未建设分别表示不同事实，均不能自动解释为这些当前能力没有接通。
+
+## 近期轻量收口与本轮整理
+
+用户在七天持续重构后希望先处理可独立结束的轻量工作。本轮明确只修订文档，不修改源码（包括源码注释），不执行代码Review、性能观测或实现验收。以下三项按文档范围收口：出生块描述校正、fixture记录校准、后续局部Review范围安排；不启动FAL、设备或资源隔离的新一轮施工。
+
+| 工作 | 范围、收口产物与边界 | 当前处置 / owner |
+|---|---|---|
+| 主线登记与过时接力纠正 | 固定上述切面、建立缺失的两份范围记录，修正分层/出生块和设备的失效前置；核对本地链接与diff | 本轮已处理；本总纲拥有整理结果，COMPASS只留入口 |
+| 旧Review范围归并 | 逐份保留固定目标，区分被替换机制、现存消费者和新目标；输出范围矩阵，不把未审查标成通过 | 本轮已在[总体Review入口](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)建立12份范围矩阵；实际Review未执行，当前`ac9d7d9`的独立Review仍单独有效 |
+| 普通出生块文档校正 | 准确描述READ映射、Building Write初始化与地址空间持有，删除impls中的目标追踪/验证宣告 | 本轮文档部分已完成，见[startup](../notes/impls/startup.md#用户态公共-loader)；源码注释残留只在[分层记录](todo-2026-09-runtime-kernel-library-separation.md#kernel-与-shared-的施工边界)登记，待以后获准维护源码时处理 |
+| 验收fixture记录校准 | 更新现存映像、当前三类启动自检及脚本声明；旧ProcessDrain/WaitSet/Tunnel自检与原运行结果归于历史，未知等价覆盖仍保留未知 | [fixture清理记录](todo-2026-09-23-acceptance-fixture-cleanup.md)的本轮文档范围已完成；未删除测试，未执行代码审查或新验收 |
+| 后续局部Review范围安排 | 选择纯时间换算/Deadline编码，登记固定候选目标、契约、排除项和完成产物；本轮只修订计划 | [时间Review计划](todo-2026-09-13-monotonic-time-rpc-deadline-review.md#后续轻量候选本轮仅安排)已登记；实际Review仍待后续启动，性能专题本轮未执行 |
+
+本轮还核对了Sv39与hart兼容责任链，结果写入[内存计划](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)。本次只读代码核查和文档整理不构成新一轮实现验收，不宣告历史间歇性Copy缺陷或待执行Review已关闭。
+
+文档归属校正：ideas向前表达粗粒度目标关系，impls回头描述当前代码，不承载设计裁决、质量评价或完成宣告；详细设计、已确认选择、实施差距和工作状态由计划拥有。当前固定Sv39是实现事实，不能据此推导本计划体系中已确认的按空间/域选模式目标被撤销或必须重新裁决。对应[内存计划](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)与impls已按此纠正。
+
+首轮文档检查覆盖15份Markdown、92个新增本地链接及目标标题和代码围栏。本轮追加三项文档工作与归属校正后，最终检查覆盖19份Markdown中的101个新增本地链接及目标标题，代码围栏配对和`git diff --check`均通过；没有代码变更，未执行代码Review、编译、单测或QEMU。旧Review、硬隔离与模式扩展等未完成工作仍由各唯一记录承载。
 
 ## 成型方案的门槛
 
@@ -135,7 +155,7 @@
 
 对象链及其独立审查修复已收口；本总纲保持全项目剩余领域入口，不能把“无整篇ideas审定”解释为代码未实现。详细契约仍由各分案及最终修复记录拥有，ideas资格不因交付自动扩大。
 
-本轮修复已提交为`ac9d7d9364770a69c8135e918d512069980c06bb`，对应[固定提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)已登记待执行。性能工作按[专题](todo-2026-10-01-lock-performance.md)先取得争用/延迟证据再选择优化；启动/设备与FAL领域重审依各自范围和COMPASS顺序继续。当前没有要求补做对象链旧拼装或恢复编译的接力。
+本轮修复已提交为`ac9d7d9364770a69c8135e918d512069980c06bb`，对应[固定提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)已登记待执行。近期先按[轻量收口队列](#近期轻量收口与本轮整理)择项，主线范围与接续顺序由[剩余切面表](#剩余切面与接续顺序)固定；FAL、服务装配、设备与硬隔离均不再依赖会话口头分类。当前没有要求补做对象链旧拼装或恢复编译的接力。
 
 ## 初次设计文档交付检查（历史，不是当前代码验收）
 

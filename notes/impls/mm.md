@@ -140,9 +140,9 @@ Map 的 guard 参数是字节数、向上按页取整；结果槽由 UserWriteLe
 
 新 AnySpace 出生会核对 funded root 属于其付款 Pool、ledger 不跨用户地址域，并通过 mm::install_kernel_top_level 安装内核 direct-map/stack-window 的共享根项。TableTree 将这些根标记为借用，用户页表整空间 drain 不回收内核下级表；独立根表本体与 charge 在完成屏障之后释放。
 
-单模式（全系统同一 satp 模式）是共享内核映射的结构性上限而非妥协：内存物理上同一份，异模式 hart 各持平行映射树，反而割裂调度域（进程不可跨模式迁移）——多模式无收益。**当前实现固定 Sv39**（`os/kernel/src/mm.rs` 与上下文汇编按三级页表组装）；启动期按 DTB `mmu-type` 自动选式是后续工作——需要先完成模式常量贯穿（satp 组装、地址宽度断言）再打开选式，且选式应取全体 Application hart 的最小硬件上限与内核支持集的交集，不支持交集则拒绝启动。
+**当前全系统固定Sv39**：`os/kernel/src/mm.rs`、用户`vm/space.rs::LEVELS=3`及上下文汇编使用同一模式；用户根共享该模式的内核direct-map/stack-window项。DTB的Sv48/Sv57表示hart声明的硬件能力上限，不触发运行期模式分发，也不进入当前ISA调度域签名。无分页的Bare hart在registry准入前被排除。
 
-内核支持集由编译期决定，当前只有 Sv39。
+纯页表层可参数化3/4/5级；当前内核没有对应的运行期模式选择与分发路径。目标设计和后续工作见[内存计划](../../plans/todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)。
 
 ## 页表纯逻辑（os/page_table crate）
 

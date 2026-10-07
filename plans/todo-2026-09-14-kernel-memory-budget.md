@@ -2,6 +2,16 @@
 
 > 状态：对象链范围的Pool双维账本、独立值/容量/scratch实际付款与退款屏障已实施交付，见[对象链唯一记录](archived/todo-2026-10-01-object-chain-kernel-integration.md)。下文旧MetadataSponsor与KernelMemoryBudget候选为设计时基线，以“实际来源与metadata容量账本”定稿为准。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有来源、准入与退款；内核自主推进由[维护执行分案](todo-2026-09-29-kernel-maintenance-execution.md)拥有。
 
+## 当前接力：硬隔离完成门
+
+2026-10-07校准：页/metadata双维Pool派生、实际容量/scratch付款与退款已交付；下方旧MetadataSponsor、global Counter及数值校准迁移不再是施工任务。现存边界是live metadata槽不保证堆字节硬隔离或allocator成功，外部Weak尾部和碎片容量尚未形成域间保证。实现见[mm](../notes/impls/mm.md#memorypool-额度与-metadata-准入)。
+
+开放不可信创建域或承诺独立域硬容量前，先按当前Pool/allocator/授权消费者重新核对触发事实，闭合本案的域隔离完成门；不能沿用旧提交中“可信init独占创建”的快照证明今天仍未触发。本次只纠正计划范围，没有重新审计全部创建者或宣布硬隔离完成。CPU份额与精确执行计量由执行/调度领域拥有，不以metadata额度代替。
+
+## 早期设计与触发判断（历史）
+
+以下“目标与边界”至“完成门”保留原设计讨论和固定提交判断；形式、类型与现状以末尾付款接入定稿及上述当前接力为准。
+
 ## 目标与边界
 
 metadata、对象壳及操作/退休承载必须具有明确的实际来源、准入与退款关系，不能与 page-backed storage 或 Job 管理关系混为一份真值。独立 KernelMemoryBudget capability 是已有候选形式，需在全项目重审中重新论证，不因写入 ideas 而冻结。对象跨进程或跨 Job 运输后保留真实来源，最后实际责任消散才退款。

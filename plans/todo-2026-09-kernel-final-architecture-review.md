@@ -2,9 +2,9 @@
 
 ## 性质
 
-这是一次**内核主线完成后的全局结构审查与重构计划**。A–E 修复复核已经归档，本计划仍等待下列数据面与主要消费者触发条件，不阻塞多页 Tunnel、Runnel v2 或后续用户态服务实现。
+本记录拥有**全局架构收口的条件性Review与旧固定Review范围归并**。2026-10-07校准：对象链、当前Sv39和运行时分层已经交付，不再等待旧ProcessBindMemory、rinlib或ProcessDrain迁移；FAL、正式服务装配及设备仍按独立分案继续。本记录不替代当前`ac9d7d9`的[固定提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)，也不要求先完成一次全项目Review才能开始新领域设计。
 
-当前阶段只登记观察对象，不提前判定其最终去留。原因是只有内核主线、shared ABI、rinlib 与主要用户态消费者共同完成后，才能从全局视角判断某个机制究竟是长期基础、必要的阶段性边界，还是 A→B 迁移中遗留的 C/D/E/F。
+全局收口需在选定交付范围和实际消费者形成后，判断机制的长期职责、共同变化的边界和迁移残留。早期数据面固定提交及观察保留历史，不将旧对象名和阶段前置当作当前代码事实；近期可独立进行下文的旧Review范围归并。
 
 ## 已登记提交范围
 
@@ -27,20 +27,20 @@
 
 ## 触发条件
 
-满足以下条件后执行：
+全局架构Review的执行条件：
 
-- MemoryPool、funded frame、ProcessBindMemory、bootstrap、页表 owner 生命周期、deferred retire、匿名 backing、公共 MemoryObject、多页 Tunnel 与 Runnel v2 的内核/ABI 主线均已完成；
-- 相关 shared ABI 与 rinlib 封装已同步，主要用户态服务和验收负载已迁移到最终接口；
-- 当前自然序没有更高优先级的架构前置缺口；
-- 执行前建立该主线最终提交范围与完整验证基线。
+- 明确本次要审查的系统能力范围及其实际消费者；范围内公开契约、owner、失败收束和验证基线已经形成。FAL/设备未交付的目标不得记为现状。
+- shared ABI、libkernel及相关库/服务/验收消费者已在选定范围同步；当前已完成的对象链不再重复列为待施工前置。
+- 建立固定提交或提交序列，说明相对已有Review的增量和未覆盖边界，避免审查浮动HEAD或重复findings。
+- 不以旧多页Tunnel、ProcessBindMemory、rinlib等名称作为必须恢复的技术前提。近期局部Review及范围归并不等待全系统能力完成。
 
 ## 审查范围
 
 ### 结构与所有权
 
-- Process、AddressSpace、MemoryPool、MemoryObject、ObjectBacking、ObjectView、Tunnel Connection/Endpoint/Invitation 的最终类型图；
-- frame、quota、charge、metadata permit、Handle、WritePermit、WaitContext、Remote completion 和 work debt 的唯一 owner 与退款终点；
-- Lock Ladder、锁外 funding、Commit 后零分配和 deferred retire 的统一协议；
+- 当前ProcessShell/Body、VmShell、MemoryPool、MemoryObjectCore、Backing/View、Tunnel Connection/Endpoint/Invitation的实际类型关系；历史ObjectBacking/ObjectView按固定目标追溯，不假定仍存在；
+- frame、quota、charge、metadata容量、Handle、WritePermit、线程续体、Remote completion和维护Work的唯一owner与退款终点；
+- Lock Ladder、锁外funding、提交后必成与自主维护退休的统一责任链；
 - anonymous、object、Tunnel、boot-held backing 是否共享正确的机制、并保留必要的生命周期差异。
 
 ### 迁移残留
@@ -49,7 +49,7 @@
 
 - raw frame allocation 与 transitional adapter；
 - 单页、单 PA、单 translation 特化路径；
-- `BackingPlanFailure`、重复 Map validation、分散的 backing permit 传递等迁移接线；
+- 重复的Map validation、来源/许可传递和仅服务迁移阶段的存储或分支；旧`BackingPlanFailure`等只在对应历史提交中追溯；
 - 仅为某个阶段或验收 workload 存在的字段、常量和分支；
 - 重复的 owner/permit/charge 真值；
 - 兼容层、旧 ABI、旧注释、旧实现文档和计划中的过时事实；
@@ -86,11 +86,11 @@
 
 ## 执行顺序
 
-1. 冻结最终设计：类型图、所有权图、锁阶、失败边界和 ABI 归属；
+1. 固定审查目标与能力范围，重建该目标上的类型图、所有权、锁阶、失败边界和ABI归属；
 2. 建立全仓符号与调用图，标记每个阶段引入的机制；
 3. 生成残留矩阵，明确 A、B、C/D/E/F 关系；
 4. 先删除重复真值和旧旁路，再统一最终 owner/transaction seam；
-5. 迁移内核、shared、rinlib、服务和测试调用点；
+5. findings要求实施时，由唯一报告承接内核、shared、libkernel、相关库/服务和测试调用点迁移；
 6. 删除旧类型、字段、adapter、兼容分支与过时文档；
 7. 做第二次全仓残留搜索，确认 C/D/E/F 不再被引用；
 8. 运行 host debug/release、clippy、`just check`、virt core/stress/release、异构路线、sifive_u 与完整 acceptance；
@@ -103,13 +103,36 @@
 - 所有生产路径不存在未登记的 raw allocation、单页特化或旧 ABI 旁路；
 - 每个保留的阶段机制都有最终职责，不再靠“过渡”“以后删除”解释存在；
 - 每个删除项已从代码、测试、注释、notes 和 plans 清除，或已转入唯一的另案计划；
-- 内核、shared、rinlib、服务和验收负载均使用统一最终接口；
+- 选定范围内的内核、shared、libkernel、相关库/服务和验收负载使用一致接口；
 - 完整验证矩阵通过，且资源守恒、错误分类、锁阶和 Commit 后零分配均有可观察证据；
 - Review 结论写入归档文档，后续不再重复把已删除的 C/D/E/F 引回主线。
 
-## 当前观察登记
+## 旧 Review 范围归并
 
-以下不是当前阶段的定论，只是未来 review 必须重新取证的候选观察点：
+2026-10-07按`refactor/system-redesign` / `f174d8e`核定COMPASS中12份旧Review的范围。此次只读计划整理保留原固定目标，不是独立代码Review，不宣告原提交无缺陷，也不把后续修复当成原提交通过。各旧计划保留证据，本节拥有其当前适用范围和分流；尚未执行的原计划不因归并自动归档。
+
+| 原计划 / 固定目标 | 当前可核实事实 | 后续分流 |
+|---|---|---|
+| [容量校准](todo-2026-09-25-capacity-calibration-review.md) / `3dd7c4f` | 内核旧MetadataSponsor/Counter容量政策与virt-capacity已替换/移除；shared metadata_admission仍被用户libbudget/FAL/服务使用 | 不能对当前内核重跑旧容量路线；原提交计量审查保留历史，当前硬隔离由预算分案拥有。用户Counter原语若审查，须单独固定实际消费者范围 |
+| [FAL集成基线](todo-2026-09-13-fal-integration-baseline-review.md) / `d22b9d7` | FAL/消息消费者仍在，ProcessDrain与旧退休驱动已删除 | FAL部分交FAL重设计现状审计，消息部分与消息运输去重；原退休目标只作历史追溯 |
+| [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) / `c6e0a84` | ClockGeometry/Deadline、时钟采样和期限消费者仍在；运行期停止已叠加对象链修复 | 可选现存纯时间边界做局部只读Review；覆盖runtime_stop时须纳入后续固定修复序列，不沿用原目标冒充当前结论 |
+| [库存来源与自检](todo-2026-09-frame-source-selftest-review.md) / `606b59d` | BootHeldExtent、frame/selftest和库存/供给机制仍有正式消费者 | 保留独立来源/自检审查价值；执行前固定与后续funded owner变化有关的增量 |
+| [设计审查后续内存](todo-2026-09-design-audit-followup-review.md) / `4b27ce6`、`8aa7bc2` | instruction epoch、MemoryObjectCore与许可仍在，VM外围已重写为Operation/Change/Backing/Views | 当前VM发现归对象链/内存记录；不重建旧live-view或PreparedTranslation，仅按未覆盖契约选择增量 |
+| [消息运输](todo-2026-09-14-message-transport-review.md) / `3060dd8` | Packet、MailboxSender/SendOnce及真实消息消费者仍在，封装归属已迁至libkernel，内部持有/运输协议有后续变化 | 保留消息语义审查，执行前划开已审对象链机制与仍未审的用户封装/消费者 |
+| [流运输与Runnel](todo-2026-09-14-stream-transport-review.md) / `a2aabed` | typed Producer/Consumer和fs/pm/init/test消费者仍在；映射owner及失败清理有后续收敛 | 保留流语义/跨层共享访问审查，纳入后续固定映射与清理变更，不能只审旧快照推断当前安全 |
+| [公共操作所有权](todo-2026-09-18-public-operation-ownership-review.md) / `8e0467a` | DebtLedger、FairBudget、RetirementTicket及旧work_ledger/ProcessDrain机制已删除，替代物为自主维护和稳定Work根 | 对当前代码的施工适用范围已消失；旧计划仅保留历史目标，不自动标为通过。替代机制由对象链Review承接 |
+| [执行/RPC/Outbox](todo-2026-09-15-runtime-admission-review.md) / `a3891b0`至`4e18e5e` | libsrv已迁为libexecution，Dispatcher/Outbox仍在；SourceRegistration及期限/退休由对象链收敛 | 从现存业务/结果责任选增量，不重复提出已删除的来源相位布尔组合；与当前对象链Review去重 |
+| [库知识归属与命名](todo-2026-09-21-library-knowledge-ownership-review.md) / `96ee03b` | libbudget/libexecution及libraries组织仍在，其上已叠加libkernel/libthread/libruntime分层 | 可做当前依赖/命名的局部只读核对；原提交与分层后目标分别固定，不重开已完成迁移 |
+| [FAL库基线](todo-2026-09-21-fal-library-baseline-review.md) / `dfcf7a3` | GrantTable、Watch、Move/Copy及provider有现存消费者，仍处矫正区 | 作为FAL分案现状证据与独立契约反例输入，不先将旧实现“修到合格”再重设计 |
+| [FAL注册发现设计](todo-2026-09-21-fal-service-design-review.md) / `1000270`，实现对照`dda8a5b` | libservice registry/authority、srv_fs注册实现仍在，属于FAL/服务接点 | 交FAL/服务分案审计发布、授权与失效关系；正式装配政策交服务装配分案，不重复定义 |
+
+当前`ac9d7d9`的独立Review继续由其唯一计划执行，本表不吞并它。后续选定局部审查时，在对应计划写清固定目标、仍有效的契约、相对已有审查的增量及排除项；发现问题后按REVIEW手册形成唯一报告，不在本表登记第二套findings。实际执行历史Review或取消其排期须明确记录，不能由“机制被替换”推导出“原提交审查通过”。
+
+本次归并产物是上述范围矩阵。后续局部Review优先候选已选为[纯时间换算与Deadline编码](todo-2026-09-13-monotonic-time-rpc-deadline-review.md#后续轻量候选本轮仅安排)，具体固定目标和排除项在所属计划登记；本轮仅完成安排，没有执行Review。库存来源/自检、库依赖/命名仍是未选择的候选，不额外启动任务。全面代码Review、FAL重设计、DMA接入及锁改造不作为轻量任务承诺。
+
+## 早期观察登记（历史）
+
+以下保留早期基线中的观察点，不描述当前源码。后续审查先按固定提交核定机制是否存在；其中`proc.rs`、ObjectBacking、rinlib及旧metadata等已由对象链替换，不能据此重新安排旧结构修复：
 
 - `os/kernel/src/task/tunnel.rs` 已贯通多页 Tunnel、MemoryObjectCore/ObjectBacking 多 extent 投影与完整 lease 退役，rinlib owner/RNL2/现有消费者已同步；未来按最终提交范围复核是否还存在阶段性特化或重复 authority；
 - `os/kernel/src/task/proc.rs` 当前存在 `BackingPlanFailure`、重复 Map validation 与 `backing_permits` 多层传递；需在最终 MemoryObject/backing planner 完成后判断哪些应统一；

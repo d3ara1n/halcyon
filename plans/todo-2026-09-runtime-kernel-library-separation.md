@@ -1,6 +1,6 @@
 # 现有用户态分层纠正：libkernel、libprocess、libthread 与 libruntime
 
-> 状态：基线 66f4e9c 的原轮施工曾记录完成；第二轮复核正在修正线程 owner 仲裁、启动采用和入口/Unmap 失败路径。当前交付证据以 [复核报告](archived/review-2026-09-28-runtime-layering.md) 为准，不沿用旧完成声明。
+> 状态：**分层迁移及整体收敛已完成**；线程owner、启动采用、入口/Unmap失败路径及真实消费者已接通，最终处置和验证由[复核档案](archived/review-2026-09-28-runtime-layering.md)拥有。2026-10-07核定：普通出生块已READ映射，内核rust_start也已无Termination约束；这两项不再作为待实施工作。下文施工轮次保留历史，当前后续边界见末节。
 
 ## 交付快照
 
@@ -282,13 +282,13 @@ stateDiagram-v2
 
 #### Kernel 与 shared 的施工边界
 
-kernel/shared 的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution、TerminationCause、删除 ExitCode/ProcessExit/ProcessAttach/ThreadSpawn、挂起线程离场发布 DONE）已由[归档生命周期记录](archived/todo-2026-09-28-lifecycle-convergence.md)完成。范围外后续：普通出生块最终只读，复用 `write_building`；`os/kernel/src/rt.rs` 删除未消费的 `Termination` 约束。
+kernel/shared的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution、TerminationCause、删除ExitCode/ProcessExit/ProcessAttach/ThreadSpawn、挂起线程离场发布DONE）已由[生命周期档案](archived/todo-2026-09-28-lifecycle-convergence.md)完成。2026-10-07按`f174d8e`核对，`libprocess::management::map_birth_block`使用READ映射，内容由Building写入路径初始化；`os/kernel/src/rt.rs::rust_start<T: 'static>`无Termination约束。原两项后续已被当前实现覆盖，不另开代码迁移。出生块当前映射与初始化流程已回填[startup实现](../notes/impls/startup.md#用户态公共-loader)。源码注释仍说只读性由接收方自行遵守，此残留继续由本节记录：目标是与READ映射事实一致的注释，触发为后续获准的该处源码维护，删除条件是过时叙述清除并核对diff；本轮仅修订文档，不修改源码注释。
 设备 D1 的对象关系与 authority 可并行设计，入口见 [设备接力](todo-2026-09-device-system-design.md#当前进度与接力)；不要因本计划推进而登记设备 API、MMIO/IRQ/DMA 或驱动已完成。
 
 ### 取证与验证状态
 
 后续每块设计同时核对 ideas、impls、实际导出/调用者与已有测试语义；代码若超前补齐描述，代码与目标不符则记录真实差距，不默认任一侧正确。本轮已核实 Runtime/WorkQueue/Wake、FAL NodeStore/Retirement、Process Collector/Observation、init RootSupervisor；详细路径和复用边界在用户内存 owner 记录，不需要重复整仓盘点。只有源码变化或具体新问题才重取相关证据。
 
-本计划的代码迁移、接口接线与第三轮复核已完成；普通出生块最终只读映像与 `os/kernel/src/rt.rs` 未消费的 `Termination` 约束是已登记的后续项，不阻塞本轮 R1–R9。最终证据见 [第三轮复核报告](archived/review-2026-09-28-runtime-layering.md)。
+本计划的代码迁移、接口接线与复核已完成；普通出生块只读及内核未消费Termination约束的原后续也已由当前代码覆盖。本轮出生块文档校正已完成，源码注释残留按上节保留，不作为未实现能力，也不在本次文档任务中处理。第三轮交付证据见[复核档案](archived/review-2026-09-28-runtime-layering.md)；此后的对象链变更由其[审查修复档案](archived/review-2026-10-07-object-chain.md)拥有。
 
 交付前检查：`git diff --check`、`just check`、`just clippy`、两种用户 target 构建/ELF audit/入口反汇编与 `just acceptance` 均已通过；日志路径与失败现场见复核报告。

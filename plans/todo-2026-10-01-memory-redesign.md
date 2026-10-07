@@ -6,9 +6,30 @@
 
 当前生产路线为Sv39，VM已独立接入，`adopt/reclaim`、PublishCursor、backing/View、退款及用户fault均有实际消费者；原编译中断、旧模块删除和ABI迁移已关闭。OrdMap只持一个arena，运行期页表不再保留preflight/PreparedTranslation旁路。当前代码面貌由[mm实现](../notes/impls/mm.md)拥有，不把下面早期组件表当成现状。
 
-本篇保留的独立后续是Sv48/Sv57真实平台及相应用户布局接通，触发为出现支持该模式的实际调度域/平台，完成需模式分发、共享内核映射、fault/退休及跨hart组合共同验证。gap索引、表帧精确预付和退休fence精简均是有测量/证明前置的优化候选，分别见[性能专题](todo-2026-10-01-lock-performance.md)与[本轮未采纳项](archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)，不阻塞当前Sv39合同。当前不再安排“重写内核恢复编译”。
+本篇保留的独立后续是实际平台/用户布局需要Sv48/Sv57时的接通，完成需分页模式策略、satp与地址布局、共享内核映射、fault/退休及跨hart组合共同验证。当前实现固定Sv39，原按空间/域选模式的已确认目标仍由本计划拥有；impls对当前单模式的描述不改变目标，也不构成方向冲突。不能凭纯层支持或DTB声明把多模式记为已实现。gap索引、表帧精确预付和退休fence精简均是有测量/证明前置的优化候选，分别见[性能专题](todo-2026-10-01-lock-performance.md)与[本轮未采纳项](archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)，不阻塞当前Sv39合同。当前不再安排“重写内核恢复编译”。
 
-## 现状事实（当前分支只读盘点）
+## 完成边界与 hart 兼容性复核
+
+2026-10-07按`refactor/system-redesign` / `f174d8e`核对代码及既有交付证据；本节记录当前完成边界和未决后续，不新增实现验收结论。
+
+**当前Sv39责任链已经交付。** 物理库存/来源付款、backing/View、Map/Unmap/Protect准备与不可逆提交、分步PTE发布、跨hart确认、表页/物理页退休退款、进程整体地址空间回收及用户R/W/X fault等待/修复均有正式消费者。完成屏障晚于相应实际退款，提交后的推进不依赖调用者继续运行。实现唯一视图见[mm](../notes/impls/mm.md)，后续修复及验证边界由[审查档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)拥有；其中记录memory_space/page_table host用例、正式静态门、完整acceptance和hetero通过，真实发布fault与模拟修复诊断分别提供证据。当前`ac9d7d9`的[独立Review](todo-2026-10-07-object-chain-convergence-review.md)尚待执行，不能宣称代码已被证明无缺陷。
+
+**执行兼容性已有结构性接通，当前只承诺Base64/D64。** `os/dtb/src/cpu.rs::parse`冻结每hart的status、RV64基线、F/D/Q/V及mmu-type；`os/kernel/src/main.rs`排除Bare hart并发布能力；`os/sched_domain`按执行需求兼容集合分域。`task/process.rs::bind_initial_execution`为进程一次选择兼容域，无兼容域返回NotSupported；线程出生继承冻结domain，ReadyBatch核对域身份，enqueue按线程域入队，各hart的run只从本域pick。`libprocess`从ELF需求选择profile；Q/V/F-only/TSO等未支持用户需求显式拒绝，不静默降级。这条保证依赖可信平台声明及程序正确声明实际执行需求，不包含探测任意虚假固件/程序声明。
+
+**MMU兼容当前依靠共同Sv39模式。** DTB解析接受Bare/Sv39/Sv48/Sv57；Bare不进入Application hart集合，其余准入hart执行同一Sv39内核和用户空间。固定ISA规定支持Sv48必须支持Sv39、支持Sv57必须支持Sv48，见[supervisor规范](../references/normative/riscv-isa-v20250508/src/supervisor.adoc)的Sv48/Sv57章节，因此不同mmu-type上限当前不导致Sv39进程落到不支持Sv39的准入hart。`sched_domain::HartCapabilities`只持ISA状态能力，没有MMU模式字段；`mm.rs`的satp和`vm/space.rs::LEVELS=3`仍固定Sv39。按hart上限为各进程选择Sv48/Sv57并约束调度的能力尚未接通，不能把ISA分域等同于该能力。
+
+尚未覆盖的承诺与下一步：
+
+| 后续 | 当前事实、触发与完成标准 | owner |
+|---|---|---|
+| 更宽分页模式及模式策略 | 原“结构前提/轮次1”的按空间/域选择与多份内核树属于已确认目标，当前实现仅Sv39，差距是尚未接通。实际需要使用Sv48/Sv57前，按该目标补足详细接口与模式/布局/调度/同步及平台验证；若新证据要求改变目标，再记录设计选择。不能从impls的现状描述推导目标被撤销或必须重新裁决 | 本案；跨hart执行接点见[execution-context实现](../notes/impls/execution-context.md) |
+| 不可信域硬容量隔离 | 双维Pool实际付款已交付；live metadata槽不是堆字节硬隔离或分配成功保证，Weak尾部和allocator碎片仍可能占用堆。开放不可信创建域或承诺域间硬容量前闭合 | [预算分案](todo-2026-09-14-kernel-memory-budget.md) |
+| 设备/DMA与动态保留区 | 当前一般RAM/静态保留区有事实来源；动态/reusable保留区fail closed，DMA静止与设备撤销不属于现有VM完成保证。正式设备/DMA接入前设计和验证 | [设备分案](todo-2026-09-device-system-design.md)、[保留区生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) |
+| 更强性能与证明 | ASID/定向shootdown、减少预付表帧、精确物理CPU计量与WCET没有当前完整承诺；真实芯片微架构及全分配点失败注入未覆盖 | [性能专题](todo-2026-10-01-lock-performance.md)及相应机制计划 |
+
+本次不重新启动内存总重构。当前Sv39可继续承载已约定系统工作；扩展能力必须按上表补足前提，不能用“当前完备”掩盖未来保证，也不能用未来未建设否定当前责任链已收口。
+
+## 设计启动时的现状事实（历史，不用于当前接手）
 
 - 地址空间、事务 owner、view owner、shootdown、drain 阶段与 Map syscall 入口均在 `os/kernel/src/task/proc.rs`（5475 行），与 Process 混合；无独立 VM 模块。
 - `os/page_table::TableTree<M, LEVELS>` 对 Sv39/48/57 与表帧来源泛型、host 可测；上层 `proc.rs:46` 固定 `LEVELS = 3`，`mm.rs:9` 固定 Sv39。

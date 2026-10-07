@@ -62,7 +62,9 @@ VM/backing退款由[`mm.md`](mm.md)拥有，生命周期与启动门由[`task.md
 
 `shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/libraries/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 以 Job/Pool CREATE authority 依次驱动 Create → 分块 ProcessMap/ProcessWrite → Grant → 映射按最终长度计算的出生区 → Building ThreadCreate → Grant Control 取得 child-local 句柄 → 追加 grants → 单次 Write 完整出生块 → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 `libprocess` 的观察/关闭收束链执行 builder close → 等 DONE → 核验 Dead → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
 
-当前 `libprocess::map_birth_block`（`user/libraries/libprocess/src/management.rs`）使用 READ 映射出生块，ThreadCreate 后通过 Building Write 一次填充；平台入口以一次性 StartupInput 建立 affine `StartupSeed`；`libprocess::context::StartupContext::adopt(seed)` 先验证格式、索引和句柄去重，再 Query 全表核实可采用 role，最后提交 Capability owners。失败返回原 Seed，不析构原始 grant。入口 descriptor 的 Control 被转给 `libthread::ThreadRegistry`，普通 grant 由 runtime startup API 显式转交。内核 `vm::operation::initial_write` 在 Building 门保护下允许初始化最终只读页。统一只读/进程寿命映像及 owner 责任见 [bootstrap 接收契约](../ideas/bootstrap.md#用户态接收与一次性交接)；相关历史证据不能证明当前新内核与正式装配已完整组合通过。出生块从映射建立起即为只读的目标契约仍由复核记录跟踪，Building Write 不改变最终运行权限。
+`libprocess::map_birth_block`（`user/libraries/libprocess/src/management.rs`）将出生块放在validated ELF映像顶之上的页对齐位置，以READ权限分块映射；ThreadCreate后，launcher通过Building Write一次填充包含入口Control的完整块。内核`vm::operation::initial_write`在Building门保护下初始化这些页，不给接收进程增加WRITE映射权限。
+
+平台入口以一次性StartupInput建立affine `StartupSeed`；`libprocess::context::StartupContext::adopt(seed)`先验证格式、索引和句柄去重，再Query全表核实可采用role，最后提交Capability owners。失败返回原Seed，不析构原始grant。入口descriptor的Control被转给`libthread::ThreadRegistry`，普通grant由runtime startup API显式转交。出生映像随目标地址空间持有，回收由[mm](mm.md)的View/地址空间退休路径承担。
 
 ## init/pm 当前政策
 

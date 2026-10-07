@@ -22,6 +22,8 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 `os/sched_domain` 按执行需求满足签名划分域，`sched::DomainTable` 在全员 Online 后构造并冻结，为每个稳定域分配非零 index，hart→域映射保存在 `by_slot`。ProcessBindExecution 解析平铺的 execution profile，选择最弱兼容域，并在 Building 短租约内冻结 Body 的 requirement/domain；ThreadCreate 拷取不变的域与 FP 档位，ProcessStart 验证需求存在。重复 BindExecution 返回 ObjectNotAvailable。ELF requirement 到 profile 的映射由用户态 loader 完成。enqueue/pick 只访问已绑定域的调度类。
 
+当前域签名只覆盖Base64/D64的ISA状态需求；`HartCapabilities`没有MMU模式字段。全系统内核/用户空间固定Sv39，Bare hart不准入，Sv48/Sv57声明不使进程使用更宽模式；分页实现见[mm](mm.md#页表模式选择)，扩展边界由[内存计划](../../plans/todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)拥有。
+
 ## ABI 档位与 UserContext
 
 内核按 RV64IMAC/LP64 整数 ABI 构建，不在普通 Rust 路径使用 F/D/V；内核稳态 FS/VS=Off。用户 requirement 来自 ELF flags 与 `Tag_RISCV_arch`：
@@ -43,7 +45,7 @@ formal stvec 指向共同 direct-mode 入口，sscratch 在正式环境中恒指
 
 fatal 首帧保存在独立 FatalFrame，递归 guard 防止诊断故障覆盖证据。CSR 由 formal entry、内核稳态和 pre-sret 三个边界集中设置；未知/WPRI 位不整写。用户出口在最后一个内核 LR/SC 后用 dummy SC 清 reservation。
 
-`scause` 按 interrupt/code 分发；U ecall 是 exception 8，其它用户同步异常冻结 Fault 终因并终止进程，不 panic 内核。
+`scause`按interrupt/code分发；U ecall是exception 8。用户instruction/load/store page-fault（12/13/15）先经`vm::fault`对照目标R/W/X与事务发布事实，允许未发布时等待原事务完成，允许且已发布时执行有进展约束的本地翻译/指令同步后重试原pc；拒绝或重复无进展才冻结Fault。其它用户同步异常按真实fault终止进程，不panic内核。完整依赖、重试和退出责任由[mm](mm.md)拥有。
 
 ## 地址空间归属纪律
 

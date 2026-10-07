@@ -1,73 +1,56 @@
 # 验收 fixture 与启动期自检逐步清理
 
-> 状态：进行中；启动包映像已零复制借用，首批清理和验收判定收敛已验证。消费者矩阵已核对；`test_target`/`test_hammer` 的独立覆盖尚无等价替代，暂不删除。
+> 状态：**本轮文档校准完成，未删除fixture或自检**。2026-10-07以`refactor/system-redesign` / `f174d8e`核对现存装配、调用入口和脚本锚点；原首批清理与验证保留历史。`test_target`/`test_hammer`仍有独立进程与竞态消费者，本轮未建立等价替代覆盖，也未执行代码Review或新验收。
 
-## 目标
+## 目标与边界
 
-逐步审查并清理 `test_target`、`test_hammer`、内核启动期自检和服务内验收残留，减少启动期资源消耗、启动包体积、验收拓扑和长期维护面。删除须核对原覆盖契约；已有正式消费者或更小的既有验收路径能够观察目标行为时可直接清理，独立失败窗口尚无替代观察点时暂留。不能用删除 anchor 冒充验证完成，不把测试编入内核或变成正式成员作为长期目标。
+逐步整理`test_target`、`test_hammer`、内核启动期自检和服务内验收残留，减少不必要的资源消耗与维护面。删除前必须核定原覆盖契约、正式替代观察点及受影响装配；不能用删除锚点代替验证完成。
 
-## 当前事实
+本轮只校正文档中的现存路径、机制名称、装配和覆盖描述，保留未知项。未调整FAL、进程生命周期或验收实现，未清理`artifacts/`、修改脚本、添加替代测试或运行QEMU。局部代码Review另按其固定计划执行。
 
-- `user/tests/test_target` 当前被 `srv_init` 启动并保留映像；core acceptance 使用它做 Job 枚举、派生 MANAGE control、kill/supervision、IPC committed-kill 和 Job 管理验证；stress race matrix 也复用其映像。
-- `user/tests/test_hammer` 是 stress-only 竞态矩阵的并发创建/收束靶子；init 在 stress 配置下借用并检查其映像存在。
-- `srv_init` 原先将两份 ELF 复制进 init 堆，以便在启动包遍历结束后重复 spawn；现改为借用启动包只读切片，sifive_u 原 `Heap allocation error, layout = 5001400` 已消除，完整 acceptance 通过。
-- `Justfile`、`user/Cargo.toml`、BootPackage 装配、RequiredLaunchSet、acceptance anchor 和 plans/notes 均可能持有这些 fixture 的重复真值，清理时必须统一收口。
-- 内核堆自检在 `frame::init` 后主动分配 8192 个 `u32`，迫使全局堆领取不可退回的 system ticket；后续正式启动本身使用该堆，QEMU 验收不依赖自检锚点。
-- `srv_pm` 启动前的两次 `sys_sleep` 共延迟 40 ms，只验证 Sleep 唤醒；init 的公共时间验收已通过同一底层调用检查绝对期限及唤醒。
-- 竞态测试指令中的 `entry`/`sp` 一直为零，hammer 侧 START 固定使用 Base64 profile；两个字段不提供任何竞态观察。
+## 当前消费者与装配
 
-## 非目标
+以下是源码与脚本所声明的观察点，不表示本轮已运行或重新审定这些测试。
 
-- 不在本记录中改动 FAL provider、Registry、Dispatcher 或进程生命周期机制。
-- 不为了让某个平台 acceptance 通过而删除其测试覆盖；先建立替代覆盖和独立证据。
-- 不直接清理 `artifacts/` 历史日志；仅在源码与计划不再引用旧路径后按构建规则处理生成物。
-
-## 施工顺序
-
-1. **盘点消费者与覆盖契约**：列出每个 fixture 的正常、失败、取消、跨域、监督和资源收束覆盖，标明唯一 owner、启动条件、stress/core/platform 分面和可替代的正式消费者。
-2. **评估替代路径**：优先复用现有真实服务或更小的已有验收进程；若无法保持独立观察点，保留 fixture 并压缩其映像保留方式，记录理由，不引入测试专用新服务。
-3. **删除或缩减单一 fixture**：同步移除 Cargo/Justfile/BootPackage/RequiredLaunchSet/init retention/acceptance anchor/文档引用；删除后不得留下第二套启动清单或隐式路径。
-4. **分层验证**：先包级构建与 host 检查，再 core、stress、sifive_u、virt-nofd、boot-failure 等受影响路线；逐项核对原覆盖契约和最终账户归零。
-5. **结构收口**：更新 COMPASS 与本记录状态，关闭已删除 fixture 条目；若替代路径不足，记录为保留项而不是强行删除。
-
-## 已实施
-
-- `shared/tar::walk` 显式保留输入 slice 生命周期；`srv_init` 的 `target_image`/`hammer_image` 直接借用启动包切片，不再复制 ELF 到 init 堆。
-- 当前不删除两个 binary：`test_target` 仍支撑 Job/IPC/监督验收，`test_hammer` 仍支撑 stress race matrix；删除前必须完成消费者矩阵和替代覆盖审计。
-- 首批清理：移除内核堆启动自检及入口、仅供自检使用的 `frame::remaining_heap_chunks` 包装、`srv_pm` 的两次启动 Sleep；竞态指令由 5 个 word 缩为 3 个，删除两侧无效字段与冗余 START helper。
-
-## 消费者与覆盖审计
-
-| 映像 / 装配 owner | 现有独立观察点 | 删除或替代条件 |
+| 对象 / 装配owner | 当前行为与观察点 | 后续删除或替代的前提 |
 |---|---|---|
-| `test_target` / `srv_init::launch_test_services` | core 首实例进入 acceptance Job，验证枚举、派生 control、kill 与预算耗尽后的监督续接；同一映像在 pm_domain 中以无保留 control 的成员验证 pm 派生接管。`public_ipc::committed_kill` 用其 `ipc-kill` 模式制造跨线程 Close/Drain 与外部 Kill；Job 组合使用普通模式和 `retirement` 模式的 256 项 WaitSet。stress 矩阵中的双 Drain 与最后 control 消散另需独立进程。 | 只有替代进程保留相同的 Job 归属、启动 payload、独立控制权消散、IPC 并发与退休窗口，且 core/stress 锚点仍能分别判定时才删；复用服务进程的正常退出不等价。 |
-| `test_hammer` / `srv_init::race_matrix` | stress-only 双锤通过 Mailbox/Notification 同刻执行 syscall；同一映像的 TARGET 模式提供自灭、fault、park、线程与映射 churn、Tunnel 退出等独立地址空间。16 个场景均使用双锤或该映像的 TARGET 模式；双 Drain/最后 control 还额外使用 `test_target`。 | 必须维持双执行点和独立地址空间的竞争/故障窗口，以及 16/16 逐场景断言和收束；改为 init 内串行调用或常驻服务不等价。 |
+| `test_target` / `srv_init::launch_test_services`及按需spawn | 首实例进入acceptance Job；同一映像在pm_domain中启动另一个成员，供枚举、派生管理能力、kill与监督接管使用。`public_ipc::committed_kill`通过独立进程制造非空Close提交后的调用者消散和自动回收；stress的`test_automatic_retirement`以`retirement` payload创建256项WaitSet，Kill后观察DONE与Dead/Killed快照 | 保留独立Job归属、能力与进程消散窗口、IPC并发和非空WaitSet退休观察；复用服务的普通退出不能直接充当替代证据 |
+| `test_hammer` / `srv_init::race` | 仅stress打包。HAMMER模式提供两个独立指令/回执Mailbox与Notification发令枪；TARGET模式提供独立地址空间的退出、fault、线程/映射和Tunnel等剧本。init负责竞态编排及终态、收束断言，脚本要求16/16锚点 | 先建立相同独立执行点、地址空间、故障/竞争窗口和逐场景收束证据；不能以init内串行调用替换 |
 
-启动包只按 workload 装入映像：`test_target` 始终由 `Justfile::make_initfs` 打包，并在 `RequiredLaunchSet` 中要求存在且成功启动首实例及 pm_domain 实例；`test_hammer` 仅在 stress 打包，在 init 中只保留映像、不作为常驻服务 spawn，stress 配置单独要求它存在。两个 `target_image`/`hammer_image` 切片借用 init 的只读 StartupBlock payload；该 backing 由 init 地址空间的 root PoolBinding 支付，随地址空间退休归还，不是可提前回收的 init 堆副本。`tools/qemu-acceptance.sh` 检查 committed-kill、监督预算续接等 core 锚点，以及 stress 16/16、256 项 WaitSet 与 Tunnel close/Attach 锚点；单个 Job 子项目前多为仅记日志，不能把聚合通过误述为每个子项都被脚本独立断言。
+`Justfile`始终打包`test_target`，仅在stress打包`test_hammer`。`srv_init`以`RequiredLaunchSet`检查必需映像及首批启动；hammer只保留映像，由竞态剧本按需spawn。`target_image`/`hammer_image`通过`StartupImage::from_slice`借用init只读启动payload，不复制到init堆。payload由当前backing/View与init地址空间持有并随退休回收；不再使用旧root PoolBinding描述。
 
-验收判定收敛：`test_derive_kill` 的枚举/派生失败仍用保留 control 收束靶进程，但最后返回错误，不再将降级当作通过；`tools/qemu-acceptance.sh` 把 Job 子项既有的 ` FAILED` 日志判为失败。两个 fixture 的独立进程与并发覆盖保持不变。
+`tools/qemu-acceptance.sh`在公共部分要求committed IPC caller kill、监督和相关退款锚点；stress另要求256注册自动退休、control/Tunnel压力与16/16竞态矩阵。脚本拒绝`acceptance failed`及` FAILED`日志。Job子项并非每项都有单独的required锚点，不把聚合通过表述为每个内部子项均被独立断言。
 
-## 下一批自检审查结论
+相关事实入口：`Justfile::make_initfs`、`srv_init/src/{main,public_ipc,race}.rs`、`test_target/src/main.rs`、`test_hammer/src/main.rs`、`tools/qemu-acceptance.sh`。启动与映像持有的当前实现视图见[startup](../notes/impls/startup.md)。
 
-- **时钟回退**：`os/kernel/src/clock/selftest.rs` 验证 origin 偏斜、单调水印、延迟旧样本、不可逆 `ClockRange` 闩锁、epoch 末端和嵌套并发失败；真实生产消费者是 `clock::is_failed()` → `runtime_stop` 的全 hart 停驻。`srv_init::time_checks` 只能观察健康时钟、参数溢出和跨线程单调，不能注入 tick 回退，保留。
-- **WaitSet 交错**：`os/kernel/src/task/wait_set/selftest.rs` 及 `continuation.rs` 直接编排 stale completion、closed-seen、late install、rearm/retirement、actor window、ticket wake、Native parked/cancel/stale epoch 和三类压力退款。用户态现有 256 注册退休与 drain 只覆盖正常收割路径，不能在内核内部步骤间插桩，保留。
-- **Tunnel 堆耗尽**：`os/kernel/src/task/tunnel/selftest.rs` 的 `HeapPressure` 使用真实 allocator 验证 `NoFrame`/`OutOfMemory` 和退款；同时覆盖 admission、Remote、Quota、输出页撤销的失败收束。stress 的 close/Attach 竞态、碎片 backing 退休和 Running 几何没有等价的堆耗尽或中途撤销覆盖，保留。
-- **可重审子项**：Tunnel selftest 中与堆耗尽无关的部分参数错误矩阵理论上可迁入正式用户态 Running 路径，但当前没有对应用户态覆盖。只有新增参数矩阵、独立错误断言和资源归零证据后，才可删除该子窗口；不得借此删除整个 Tunnel selftest。
+## 当前启动期自检
 
-## 首批验证
+`os/kernel/src/boot.rs`在bootstrap发布前依次调用以下三项。这里登记调用与断言内容，不新增保留/删除的质量结论。
 
-- `just check`、`just clippy` 七个分面和 `git diff --check` 通过；删除自检后暴露的死代码包装已清除，再次检查通过。
-- `just virt`、`just virt-stress`、`just virt-release`、`just sifive_u`、`just virt-nofd` 均完成既有验收，stress 竞态矩阵为 16/16；sifive_u 以明确 reset 失败后的预期收割结束。
-- `just virt-boot-failure` 的 panic、alloc、fatal 三种注入均确认四 hart 在 Failed 后停驻。各 QEMU/GDB 进程已退出；本批未运行与改动无关的 host 纯逻辑测试，亦未重复执行已通过的聚合路线。
-- 判定收敛后 `bash -n tools/qemu-acceptance.sh`、七面 `just clippy` 与完整 `just acceptance` 通过，debug stress 16/16、release core、sifive_u、virt-nofd 和 boot-failure 原有锚点保持；没有单独注入 Job 子项失败日志的自动化用例。
+| 自检 / owner | 源码中的观察点 | 当前文档处置 |
+|---|---|---|
+| `clock::selftest::run` / `os/kernel/src/clock/selftest.rs` | 隔离ClockState的origin偏斜、单调水印、延迟样本、不可逆ClockRange、epoch末端及嵌套失败；失败实例不污染平台时钟 | 按隔离样本描述，不再把它写成直接注入平台时钟并验证全hart停驻 |
+| `MemoryPool::self_test` / `os/kernel/src/task/memory_pool.rs` | prepared子Pool回滚、delegation提交、funded owner保活来源、最后释放后的credit/库存归还，以及额度不足的错误与退款 | 补入原记录遗漏的现存自检；本轮未核定与host/用户态测试的等价覆盖 |
+| `frame::selftest::run` / `os/kernel/src/frame/selftest.rs` | 全范围清零、funding失败、extent分割与两种释放顺序、回滚及来源退款 | 补入现存funded frame自检；源码来源与历史Review入口见[库存来源计划](todo-2026-09-frame-source-selftest-review.md) |
 
-## 完成门
+原记录中的`task/wait_set/selftest.rs`、`task/tunnel/selftest.rs`及其旧continuation、HeapPressure细目已不对应当前源码，不能继续列为待保留的现存自检。原“时钟回退、WaitSet交错、Tunnel堆耗尽”的保留判断属于旧实现基线；本轮只撤下失效的当前描述，没有追查其删除过程或判定新机制是否等价覆盖。当前机制与已有验证边界由[对象链档案](archived/review-2026-10-07-object-chain.md)拥有；若后续审查产生具体覆盖缺口，由该次唯一报告承接，不凭路径消失认定覆盖完成或缺失。
 
-- 每个被删除或保留的 fixture 都有唯一理由、owner、替代覆盖或保留条件。
-- 删除后无旧 binary、旧启动清单、旧 anchor、旧文档真值残留；启动包和 init 堆占用可核对。
-- core/stress 及所有受影响平台路线通过，验收日志不再依赖已删除 fixture 的 anchor。
-- 生成物和临时进程按项目规则清理；工作树中的清理范围可独立审查。
+## 已实施清理与历史证据
 
-## 下一步
+本节保留原批次事实，不作为2026-10-07重新执行的证据。
 
-保留两个 binary 和上述三类启动期 selftest。下一次只在有独立替代证据时重审：Tunnel 参数错误子矩阵需先补正式用户态 Running 覆盖；WaitSet continuation 需先补 parked/cancel/stale-epoch 的 stress 断言；时钟回退需有可控且不污染平台 `ClockState` 的正式注入入口。零复制借用已解除平台内存阻塞，但不替代 fixture 生命周期清理。
+- `shared/tar::walk`保留输入slice生命周期，init的target/hammer ELF改为借用启动payload；原sifive_u复制映像导致的`Heap allocation error, layout = 5001400`在该批解除。
+- 首批删除内核堆启动自检及仅供其使用的`frame::remaining_heap_chunks`、`srv_pm`两次共40 ms的启动Sleep；竞态指令由5个word缩为3个，移除无效entry/sp字段与冗余START helper。旧system ticket等成本模型只用于追溯该批，不描述当前堆付款。
+- `test_derive_kill`枚举/派生失败仍保留control进行收束，但返回失败；脚本将Job子项的` FAILED`判为失败。
+- 原批次`just check`、七面`just clippy`、`git diff --check`通过；virt core/stress/release、sifive_u、virt-nofd通过，stress 16/16。sifive_u在明确reset失败后按既有方式收割。
+- 原boot-failure的panic/alloc/fatal注入确认四hart停驻。验收判定收敛后`bash -n tools/qemu-acceptance.sh`、七面clippy与完整acceptance通过；没有单独注入Job失败日志的自动化用例。这些均为历史运行结果。
+
+## 后续代码清理的完成门
+
+后续代码任务先固定一个fixture或自检及独立覆盖契约，再核定替代观察点。需要删除时，同步Cargo、Justfile、BootPackage、RequiredLaunchSet、init映像持有、脚本锚点和文档；验证按实际受影响路线选择，不为文档修改运行实现验收。独立失败窗口无替代时保留，保留原因和重审条件写在本记录；不为删测试另造专用服务。
+
+本轮完成门为：现状表能对应当前源码入口和脚本声明，旧机制/旧结果明确归于历史，未核定的等价覆盖保留未知，且没有代码变更、测试删除或新运行结论。上述文档范围已完成。
+
+## 当前接力
+
+本轮到此结束，不自动开始代码清理或Review。后续获准处理fixture时，从上表选定单一对象并先核定覆盖；获准执行库存/时间Review时从对应固定计划接手。`test_target`、`test_hammer`及三类现存自检的代码保持当前状态。

@@ -111,7 +111,7 @@ Registry 容量是程序装配给出的并发线程上限，属于程序配置�
 - `ProcessStart` 已改为 Create 时每线程预留 ReadyBatch，bootstrap 也复用单线程 Create/Ready admission，不再有普通路径的 Start 承接 Vec。
 - `user/libraries/libprocess/src/lib.rs` 的 `Spawned.control` 仍是监督用 ProcessControl；ThreadCreate 的 child-local ThreadControl 加入出生块 grants 数组，descriptor 只引用索引，runtime 负责入口 owner 转交。
 - StartupBlock v3/入口 section v2 已落地：包含 grants 数组索引、stack reservation、usable 范围及 kind/version/len；普通 launcher 在 ThreadCreate(Building) 后一次写完整块。
-- ThreadRegistry/owner、ResultCell、PreparedThread、入口 adopt 和运行时入口已施工完成。普通出生块最终只读映像仍是分层计划登记的范围外后续工作，不影响本次 owner 交付。
+- ThreadRegistry/owner、ResultCell、PreparedThread、入口adopt和运行时入口已施工完成。普通出生块最终只读映像现也已由`libprocess::management::map_birth_block`的READ映射实现，2026-10-07复核及注释后续见[分层记录](todo-2026-09-runtime-kernel-library-separation.md#kernel-与-shared-的施工边界)，不再登记为待建设能力。
 
 ### ProcessStart 发布结构裁决
 

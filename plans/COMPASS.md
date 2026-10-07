@@ -6,14 +6,12 @@
 
 > 部分区域处于矫正态，现有写法不作参考，见 [KNOWN_ISSUES 矫正区](../KNOWN_ISSUES.md#矫正区)。
 
-1. [全项目重构设计总纲](todo-2026-09-29-system-redesign.md)：无兼容约束重审；按独立契约形成 ideas 与成型实施分案。
-2. [Capability 与资源释放](todo-2026-09-28-capability-last-reference.md)、[内核维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md)：共同闭合本地释放与自动收束主线。
-3. [内存管理与地址空间重构](todo-2026-10-01-memory-redesign.md)：地址空间整体退休与 view/backing 归还是上一条主线的前置。
-   - [对象链修复与收敛提交后Review](todo-2026-10-07-object-chain-convergence-review.md)，已登记固定代码提交，待独立审查。
-   - [锁优化与无锁化评估](todo-2026-10-01-lock-performance.md)，以测量触发。前序[对象链独立审查与修复档案](archived/review-2026-10-07-object-chain.md)保留固定目标、收敛取舍及验证边界；独立平台能力触发见[对象链交付档案](archived/todo-2026-10-01-object-chain-kernel-integration.md#最终结构检查完成条件与后续触发)。
-4. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：结合全项目目标确定基础对象关系后继续。
+1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。轻量任务及本轮文档范围见[收口记录](todo-2026-09-29-system-redesign.md#近期轻量收口与本轮整理)，后续代码/Review按各自记录接手；主线设计入口如下。
+2. [FAL/文件系统与服务发布发现](todo-2026-10-07-fal-service-redesign.md)：近期首要重设计入口。
+3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：可与FAL并行设计。
+4. [正式服务装配与监督](todo-2026-10-07-service-assembly.md)：通用装配关系可先设计，设备特有接线按设备前置。
 
-运行时分层与线程生命周期已完成：[运行时分层 review](archived/review-2026-09-28-runtime-layering.md)。
+对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。当前后续入口为[对象链收敛提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)、[旧Review范围归并](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)及测量触发的[锁评估](todo-2026-10-01-lock-performance.md)。
 
 ## 旧基线待办
 
@@ -24,7 +22,7 @@
 
 ## 可择机任务与审查
 
-以下不表示自然顺序，也不阻塞新的系统能力。架构审计剩余发现可随时择机复核；容量计量暂缓，待真实故障、消费者或明确的硬容量承诺再重开。Review 材料待 reviewer 汇总现有档案与 findings，形成明确范围、优先级和唯一入口的总体 Review 任务；FAL 固定提交审查计划也由该任务纳入。
+以下不表示自然顺序，也不阻塞新的系统能力。架构审计剩余发现可择机复核；旧固定提交Review先从[范围归并入口](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)核定现存机制与历史目标，不按下面清单串行重跑，也不把机制被替换当作审查通过。Pool付款已交付，更强硬容量承诺按预算计划触发。
 
 | 类型 | 入口 |
 |---|---|
@@ -48,7 +46,7 @@
 
 | 任务 | 排期条件 |
 |---|---|
-| [内核 metadata 预算](todo-2026-09-14-kernel-memory-budget.md) | 不可信创建域或独立预算隔离需求；M2 核实结论可提前调整 |
+| [不可信域metadata硬隔离](todo-2026-09-14-kernel-memory-budget.md) | 开放不可信创建域或承诺独立硬容量隔离前；已有双维Pool付款不重做 |
 | [FAL 扩展操作](todo-2026-09-fal-extended-operations.md) | 范围外操作出现真实消费者 |
 | [平台保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) | 正式设备/DMA 接入前 |
 | [设备与中断审查承接](todo-2026-08-26-review-carryover.md) | 设备/中断设计开始 |
@@ -66,7 +64,6 @@
 | CPU 预约对象 | 不可信执行域接入 | [task](../notes/ideas/task.md) |
 | fence.i 代码代次优化 | 计时手段可用且开销实测可见 | [task 实现](../notes/impls/task.md) |
 | affinity / 跨域迁移 ABI | 真实多域硬件或放置需求 | [execution-context](../notes/ideas/execution-context.md) |
-| initfs manifest / 服务编排 | 正式服务编排需求 | [bootstrap](../notes/ideas/bootstrap.md) |
 | ld-erhino 动态链接 | 明确动态链接需求 | [bootstrap](../notes/ideas/bootstrap.md) |
 | F-only/Q/V/TSO 档位 | 真实需求 | [execution-context 实现](../notes/impls/execution-context.md) |
 | TLS ABI | TLS 需求 | [task 实现](../notes/impls/task.md) |
