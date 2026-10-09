@@ -1,5 +1,6 @@
 [package]
 name = "test_fal"
+authors = ["Dearain (d3ara1n@outlook.com)"]
 version = "0.1.0"
 edition = "2024"
 description = "FAL acceptance consumer"

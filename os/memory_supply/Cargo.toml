@@ -1,4 +1,5 @@
 [package]
 name = "memory_supply"
+authors = ["Dearain (d3ara1n@outlook.com)"]
 version = "0.1.0"
 edition = "2024"

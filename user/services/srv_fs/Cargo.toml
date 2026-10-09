@@ -1,7 +1,7 @@
 [package]
 name = "srv_fs"
 version = "0.1.0"
-authors = ["Chien Zhang (d3ara1n@outlook.com)"]
+authors = ["Dearain (d3ara1n@outlook.com)"]
 description = "Filesystem service: in-memory FAL provider and acceptance workload"
 edition = "2024"
 
