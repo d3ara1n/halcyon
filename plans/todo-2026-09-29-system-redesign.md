@@ -36,7 +36,7 @@
 | `mm.md`、`tunnel.md`、`shared-memory.md` | backing/View、事务发布/退休、fault与退款：[内存分案](todo-2026-10-01-memory-redesign.md)；费用见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | Sv48/Sv57实际平台接通及测量/证明触发的优化 | ideas未整篇审定 / 当前Sv39对象链范围已实现验证 |
 | `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 内核消息/能力运输、取消及等待：[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)、[等待源分案](todo-2026-10-02-wait-source.md) | 更广RPC业务模型与不可达环收集若扩大承诺需独立闭合 | ideas未整篇审定 / 当前运输和等待范围已实现验证 |
 | `framework.md`、`runnel.md`、`buffer-queue.md` | Runtime来源/取消、Caller及runnel失败清理：[审查修复档案](archived/review-2026-10-07-object-chain.md) | 更广业务任务、语言运行时、数据面与FAL边界按所属分案继续 | ideas未整篇审定 / 对象链实际消费者已接通验证 |
-| `fal.md`、`fs.md`、`service.md` | 整体重审：[OAL/fs/服务目录改造计划](todo-2026-10-07-fal-service-redesign.md)、[正式服务装配分案](todo-2026-10-07-service-assembly.md) | OAL/fs/服务目录的 D0 方案已成稿，待设计 Review；P1—P4 未开始；正式装配仍独立设计 | ideas未审定 / 本轮目标未实现 |
+| `fal.md`、`fs.md`、`service.md` | 整体重审：[OAL/fs/服务目录改造计划](todo-2026-10-07-fal-service-redesign.md)、[正式服务装配分案](todo-2026-10-07-service-assembly.md) | 现行 OAL/fs/service 目标、详细协议、D0 结论及迁移由唯一改造计划拥有；按该记录接手，不采用历史讨论初稿 | ideas未审定 / 本轮目标未实现 |
 | `device.md` | 特权维护与进程回收分离：[设备分案](todo-2026-09-device-system-design.md) | 资源对象、隔离事实、恢复、跨域协议及运行装配 | 未整篇审定；局部原则与候选方案 / 未实现 |
 | 其余 `notes/ideas/**` | 没有本轮重设计审定记录；旧规范证据可独立核实，不因此认可整个设计 | 由所属分案明确重审范围后补登记 | 未登记审定；不作重构目标依据 |
 
@@ -66,7 +66,7 @@
 | [映射/backing重审](todo-2026-10-01-memory-redesign.md) | allocation identity、完整/部分修改、同步、物理/metadata费用 | 当前Sv39链及C2已交付；其他模式实际平台接通另受触发 |
 | IPC、等待与服务调用重审 | 消息/能力运输、请求回复、订阅/终态观察 | 对象链消息与[等待源](todo-2026-10-02-wait-source.md)已交付；更广业务模型仍按独立需求论证 |
 | 用户态执行与运行时 | 语言owner、线程结果、任务取消、来源登记 | [运行时分层](todo-2026-09-runtime-kernel-library-separation.md)已完成；对象链实际消费者及SourceRegistration已收敛，更广需求按明确触发接续 |
-| [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md) | OAL 发现协议、fs 文件协议、服务目录注册取得与 provider 组合 | 详细方案已成稿，先做设计 Review、修订与复核，通过后再进入成组迁移；历史轮次仅供追溯，不重开单向视图模型 |
+| [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md) | OAL 发现与入口分层、fs 文件协议、独立服务目录 provider 与注册取得 | 按唯一计划的完整目标、D0 结论、源码迁移及验证门成组实施；代码就绪状态不由本表重复维护 |
 | [正式服务装配与监督](todo-2026-10-07-service-assembly.md) | 启动依赖、就绪、授权交付、监督恢复及停止接点 | 已立案，待详细设计；发布发现、设备供应与全系统停止分别链接所属计划 |
 | [设备体系](todo-2026-09-device-system-design.md) | 设备关系、资源authority、驱动协议、硬件隔离与运行装配 | 组织层已细化，详细D1—D6未闭合；可与FAL并行设计 |
 
@@ -78,7 +78,7 @@
 
 | 切面 | 需要重新闭合的内容 | 状态与唯一入口 |
 |---|---|---|
-| 对象抽象、文件系统与系统视图 | provider 生成的动态摘要、共同路径与各领域操作；旧 FAL 的整体拆分 | 近期首要入口：[OAL/fs/服务目录改造计划](todo-2026-10-07-fal-service-redesign.md#当前接力)。详细方案已成稿，下一步先做设计 Review；P1—P4 代码重构未开始 |
+| 对象抽象、文件系统与系统视图 | provider 动态视图、共同目录使用与领域操作；旧 FAL 整体拆分 | 近期首要入口：[OAL/fs/服务目录改造计划](todo-2026-10-07-fal-service-redesign.md#当前接力)，按其设计状态与 P1—P4 接手 |
 | 正式服务装配与监督 | 启动依赖、就绪、发布交付、失效/重启/重连、上级接管、停止接点 | [服务装配分案](todo-2026-10-07-service-assembly.md)待详细设计；通用关系可先论证，设备特有接线等待设备契约；全系统停止由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有 |
 | 设备/驱动与平台资源 | 实例/分配范围/绑定/租约/session、MMIO/IRQ/DMA、供应依赖、硬件静止与恢复 | [设备分案](todo-2026-09-device-system-design.md#当前进度与接力)从详细D1继续，可与FAL并行；[保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md)及[设备/中断承接](todo-2026-08-26-review-carryover.md)为相关前置 |
 | 不可信域资源硬隔离 | 已有额度付款之外的域间硬容量、Weak尾部与allocator碎片隔离；CPU份额另行建模 | [预算分案](todo-2026-09-14-kernel-memory-budget.md)拥有；Pool页/metadata双维付款已交付，不能再把MetadataSponsor迁移当缺口；开放不可信创建域或承诺硬隔离前触发 |

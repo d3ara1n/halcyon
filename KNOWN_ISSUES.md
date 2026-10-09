@@ -18,4 +18,4 @@
 |---|---|---|---|
 | 全项目代码与当前实现说明：`os/`、`shared/`、`user/`、`notes/impls/` | 已授权无兼容约束整体重审；现有组件、接口和消费者不能作为必须保留某项机制的理由 | [系统重构总纲](plans/todo-2026-09-29-system-redesign.md) 的已确认原则及独立分案；只读盘点保留为现状事实 | 各分案设计闭合后精确登记实施范围；未完成前不作为新结构范本 |
 | `notes/ideas/` 全体 | 施工和重构期间的未审定线稿；清理、精简或局部目标改写均不代表机制已重新设计 | [系统重构总纲的审定登记](plans/todo-2026-09-29-system-redesign.md#重构设计依据与-ideas-审定登记)及所属 todo 的详细设计；未登记的 ideas 范围不作目标依据 | 各分案在计划中完成详细设计后登记可参考范围；文档清理、设计审定与代码重构分别记录 |
-| FAL 与服务目录：`user/libraries/{libfal,libfs,libservice}`、`srv_fs`、`srv_init` 中对应调用、`user/tests/test_fal`、`notes/{ideas,impls}/{fal,fs,service}.md` | 文件、发现与服务表达耦合，重复模式与状态膨胀，待整体拆分重构 | 代码仅作现状事实，不作为新结构范本；以[OAL/fs/服务目录改造计划](plans/todo-2026-10-07-fal-service-redesign.md)的 D0 详细设计与源码迁移表为依据 | D0 方案已成稿，下一步先做设计 Review；P1—P4 代码迁移及验收未开始；服务装配仍由其独立分案拥有 |
+| FAL 与服务目录：`user/libraries/{libfal,libfs,libservice}`、`srv_fs`、`srv_init` 中对应调用、`user/tests/test_fal`、`notes/{ideas,impls}/{fal,fs,service}.md` | 文件、发现与服务表达耦合，重复模式与状态膨胀，待整体拆分重构 | 代码仅作现状事实；唯一目标、协议和源码迁移依据为[OAL/fs/服务目录改造计划](plans/todo-2026-10-07-fal-service-redesign.md)，历史讨论不作施工依据 | 设计状态与接力见该记录；代码矫正范围保留到 P1—P4 迁移/验收完成，正式服务装配仍由独立分案拥有 |
