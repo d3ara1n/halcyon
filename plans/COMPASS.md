@@ -7,7 +7,7 @@
 > 部分区域处于矫正态，现有写法不作参考，见 [KNOWN_ISSUES 矫正区](../KNOWN_ISSUES.md#矫正区)。
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。轻量任务及本轮文档范围见[收口记录](todo-2026-09-29-system-redesign.md#近期轻量收口与本轮整理)，后续代码/Review按各自记录接手；主线设计入口如下。
-2. [FAL/文件系统与服务发布发现](todo-2026-10-07-fal-service-redesign.md)：近期首要重设计入口。
+2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：近期首要改造入口。
 3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：可与FAL并行设计。
 4. [正式服务装配与监督](todo-2026-10-07-service-assembly.md)：通用装配关系可先设计，设备特有接线按设备前置。
 
