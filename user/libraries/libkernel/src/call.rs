@@ -631,6 +631,8 @@ pub(crate) unsafe fn sys_monotonic_now(output: &mut ClockSnapshot) -> SystemCall
     .map(|_| ())
 }
 
+/// # Safety
+/// output 须在同步调用期间独占、有效且可写；成功后调用者承担两个新表项的关闭责任。
 pub unsafe fn sys_notification_create(
     owner_rights: Rights,
     signaler_rights: Rights,
@@ -646,6 +648,8 @@ pub unsafe fn sys_notification_create(
     .map(|_| ())
 }
 
+/// # Safety
+/// 调用者保证借用表项的有效寿命；本调用不移交表项的关闭责任。
 pub unsafe fn sys_notification_signal(handle: Handle, bits: u64) -> SystemCallResult<()> {
     sys_call(
         SystemCall::NotificationSignal,
@@ -657,20 +661,25 @@ pub unsafe fn sys_notification_signal(handle: Handle, bits: u64) -> SystemCallRe
     .map(|_| ())
 }
 
-pub unsafe fn sys_notification_observe(
+/// # Safety
+/// output 须有效且独占可写；成功后调用者承担新观察表项的唯一关闭责任。
+pub unsafe fn sys_notification_mint_observer(
     source: Handle,
+    rights: Rights,
     output: &mut Handle,
 ) -> SystemCallResult<()> {
     sys_call(
-        SystemCall::NotificationObserve,
+        SystemCall::NotificationMintObserver,
         source.raw() as usize,
+        rights.raw() as usize,
         output as *mut Handle as usize,
-        0,
         0,
     )
     .map(|_| ())
 }
 
+/// # Safety
+/// output 须有效且独占可写；调用者保持 owner 借用，消费提交不会因写回失败回滚。
 pub unsafe fn sys_notification_take(
     handle: Handle,
     mask: u64,

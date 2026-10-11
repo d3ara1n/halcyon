@@ -442,11 +442,16 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
-        SystemCall::NotificationObserve => {
+        SystemCall::NotificationMintObserver => {
             respond_result(
                 frame,
-                notification::observe(thread, Handle::from_raw(frame.x[10]), frame.x[11] as usize)
-                    .map(|_| 0),
+                notification::mint_observer(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
             );
             Outcome::Completed
         }

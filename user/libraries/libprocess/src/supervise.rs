@@ -360,7 +360,7 @@ impl<O: ProcessOperations, W: SuperviseSink<O>> Task<W> for SuperviseTask<O> {
         &mut self,
         _id: u64,
         world: &mut W,
-        requests: &mut Requests<Self>,
+        requests: &mut Requests<'_, Self>,
         input: &mut Input<'_>,
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {

@@ -2,7 +2,8 @@
 
 use erhino_shared::call::SystemCallError;
 
-use crate::{Requests, SourceId, SourceKind, SourcePlan};
+use crate::{ExecutionResource, Requests, SourceFunding, SourceId, SourceKind, SourcePlan};
+use libbudget::AccountView;
 
 #[derive(Debug, Default)]
 enum Phase {
@@ -20,12 +21,26 @@ enum Phase {
 #[derive(Debug, Default)]
 pub struct SourceRegistration {
     phase: Phase,
+    funding: SourceFunding,
 }
 
 impl SourceRegistration {
     pub const fn new() -> Self {
         Self {
             phase: Phase::Empty,
+            funding: SourceFunding::Task,
+        }
+    }
+
+    pub fn funded(view: AccountView<ExecutionResource>) -> Self {
+        Self::with_funding(SourceFunding::Bound(view))
+    }
+
+    /// 只在逻辑观察出生时选择；相位复位不更换该绑定。
+    pub fn with_funding(funding: SourceFunding) -> Self {
+        Self {
+            phase: Phase::Empty,
+            funding,
         }
     }
 
@@ -56,7 +71,7 @@ impl SourceRegistration {
     /// 命令入队拒绝保持Empty；已有责任则不重复安装。
     pub fn install<T>(
         &mut self,
-        requests: &mut Requests<T>,
+        requests: &mut Requests<'_, T>,
         plan: SourcePlan,
         kind: SourceKind,
     ) -> Result<bool, SystemCallError> {
@@ -65,9 +80,11 @@ impl SourceRegistration {
         }
         // SourcePlan只含借用handle/掩码描述，没有关闭权或付款owner；
         // 拒绝不改变相位，业务仍持原handle，按原add_source合同报告容量错误。
-        requests
-            .register(plan, kind)
-            .map_err(|_| SystemCallError::ReachLimit)?;
+        match &self.funding {
+            SourceFunding::Task => requests.register(plan, kind),
+            SourceFunding::Bound(view) => requests.register_bound(plan, kind, view),
+        }
+        .map_err(|_| SystemCallError::ReachLimit)?;
         self.phase = Phase::Installing(kind);
         Ok(true)
     }
@@ -85,7 +102,7 @@ impl SourceRegistration {
     }
 
     /// 安装未完成时保留取消责任；有token时只在命令入队成功后转Removing。
-    pub fn remove<T>(&mut self, requests: &mut Requests<T>) -> Result<bool, SystemCallError> {
+    pub fn remove<T>(&mut self, requests: &mut Requests<'_, T>) -> Result<bool, SystemCallError> {
         match self.phase {
             Phase::Attached(source) | Phase::RemovePending(source) => {
                 requests.remove(source)?;

@@ -1,0 +1,11 @@
+[package]
+name = "liboal"
+version = "0.1.0"
+authors = ["Dearain (d3ara1n@outlook.com)"]
+description = "Object Abstraction Layer: directory discovery and boundary expressions"
+edition = "2024"
+
+[dependencies]
+librpc = { path = "../librpc" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libkernel = { path = "../libkernel" }

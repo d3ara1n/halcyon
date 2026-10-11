@@ -6,7 +6,7 @@ pub trait Wake {
 
 #[cfg(target_arch = "riscv64")]
 pub struct NotificationWake {
-    signaler: libkernel::ipc::capability::Capability,
+    signaler: libkernel::ipc::notification::NotificationSignaler,
     bit: u64,
 }
 
@@ -22,23 +22,17 @@ impl NotificationWake {
             erhino_shared::call::SystemCallError,
         ),
     > {
-        use erhino_shared::{
-            call::SystemCallError,
-            object::{ObjectKind, Rights},
-        };
-        let checked = signaler.description().and_then(|description| {
-            if bit == 0 || description.kind != ObjectKind::NotificationSignaler as u32 {
-                return Err(SystemCallError::WrongObjectType);
-            }
-            if !description.rights.contains(Rights::SIGNAL) {
-                return Err(SystemCallError::RightsDenied);
-            }
-            Ok(())
-        });
-        match checked {
-            Ok(()) => Ok(Self { signaler, bit }),
-            Err(error) => Err((signaler, error)),
+        use erhino_shared::{call::SystemCallError, object::Rights};
+        let (signaler, description) =
+            libkernel::ipc::notification::NotificationSignaler::from_capability(signaler)
+                .map_err(|failure| (failure.owner, failure.error))?;
+        if bit == 0 {
+            return Err((signaler.into_capability(), SystemCallError::IllegalArgument));
         }
+        if !description.rights.contains(Rights::SIGNAL) {
+            return Err((signaler.into_capability(), SystemCallError::RightsDenied));
+        }
+        Ok(Self { signaler, bit })
     }
 }
 
@@ -46,7 +40,7 @@ impl NotificationWake {
 impl Wake for NotificationWake {
     fn publish(&self) {
         // 接收 owner 先关闭只会终止执行域；不能在析构中重建已经停止的任务。
-        match libkernel::ipc::notification::signal(self.signaler.as_handle(), self.bit) {
+        match self.signaler.signal(self.bit) {
             Ok(()) | Err(erhino_shared::call::SystemCallError::ObjectClosed) => (),
             Err(error) => panic!("retirement notification invariant violated: {error:?}"),
         }

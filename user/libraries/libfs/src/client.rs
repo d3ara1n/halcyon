@@ -1,776 +1,659 @@
-//! FAL2 Namespace walking 的正式同步运输适配器。
-
-use alloc::{string::String, sync::Arc, vec::Vec};
-use libfal::{
-    client::{Client, Subscription},
-    node::{NodeAttributes, NodeKind},
-    protocol::{self, Expected, Request, ResolvePolicy, Response, Status},
-};
-use libkernel::{
-    ipc::{
-        capability::Capability,
-        invitation::{Invitation, InvitationFailure},
-        message::{MailboxSender, SenderAdoptFailure},
-        tunnel::Endpoint,
-    },
-    mm::Placement,
-};
-use librunnel::blocking::{self, Consumer, Producer};
-
+//! 文件客户端直接发领域路径请求，只有明确未提交 Boundary 才使用同一 walk 接续。
 use crate::{
-    prefix::DirectoryGrant,
-    resolve::{LookupOutcome, NodeSummary, Position, WalkTransport},
+    FsRights,
+    node::NodeKind,
+    protocol::{
+        self, IoEnd, IoResult, OpenOptions, Request, Response, Status, StreamInfo, StreamOffer,
+        WatchInfo,
+    },
+    value::{FromProperty, Value},
 };
-
-mod copy;
-pub use copy::{
-    CopyCause, CopyCleanupError, CopyFailure, CopyRequest, CopySuccess, CreatedTarget,
-    TargetCreationFailure, TargetLocator,
+use alloc::{string::String, sync::Arc, vec::Vec};
+use erhino_shared::{
+    call::SystemCallError,
+    object::{ObjectKind, Rights},
+    time::Deadline,
 };
-
-pub type Grant = DirectoryGrant<Arc<MailboxSender>>;
-
-struct OpenTarget<'a> {
-    parent: &'a Grant,
-    path: &'a str,
-    expected_identity: core::num::NonZeroU64,
-    cancel: Option<erhino_shared::object::Handle>,
-}
-
-pub struct Transport {
-    client: Client,
-    deadline: libkernel::time::Deadline,
-}
-
-enum StreamRole {
-    Reader(Consumer),
-    Writer(Producer),
-}
-
-pub struct Stream {
-    control: Option<MailboxSender>,
-    role: Option<StreamRole>,
-    offer: protocol::StreamOffer,
-}
-
-pub enum StreamOpenFailure {
-    Call(libfal::client::ClientError),
-    InvalidReply {
-        owners: [Option<Capability>; 2],
-    },
-    Attach {
-        control: Option<MailboxSender>,
-        failure: AttachOwners,
-    },
-    Start {
-        stream: Stream,
-        error: libfal::client::ClientError,
-    },
-}
-
+use libkernel::ipc::{
+    capability::{Capability, HandleSet},
+    message::{MailboxSender, SenderAdoptFailure},
+};
+use liboal::{FollowBudget, FollowLimits, LocalError, Namespace, walk::Walk};
+use librpc::{CallError, Caller, Request as RpcRequest};
+pub mod copy;
+mod watch;
 #[derive(Debug)]
-pub enum AttachError {
-    System(erhino_shared::call::SystemCallError),
-    Protocol(librunnel::RunnelError),
+pub enum ClientError {
+    Local(LocalError),
+    Transport(CallError),
+    System(SystemCallError),
+    Status(Status),
+    Protocol,
+    Adopt(SenderAdoptFailure),
 }
-
-#[derive(Debug)]
-pub struct AttachOwners {
-    pub error: AttachError,
-    pub invitation: Option<Invitation>,
-    pub endpoint: Option<librunnel::MappedEndpoint>,
-    pub unmapped_endpoint: Option<Endpoint>,
-}
-
-fn client_error_has_owner(error: &libfal::client::ClientError) -> bool {
-    match error {
-        libfal::client::ClientError::Transport(error) => error.has_unretired_owners(),
-        _ => false,
+impl From<LocalError> for ClientError {
+    fn from(e: LocalError) -> Self {
+        Self::Local(e)
     }
 }
-
-fn retry_client_error(
-    error: &mut libfal::client::ClientError,
-) -> Result<(), erhino_shared::call::SystemCallError> {
-    if let libfal::client::ClientError::Transport(error) = error {
-        error.retry_cleanup()?;
-    }
-    Ok(())
-}
-
-impl StreamOpenFailure {
-    pub fn has_unretired_owners(&self) -> bool {
-        match self {
-            Self::Call(error) => client_error_has_owner(error),
-            Self::InvalidReply { owners } => owners.iter().any(Option::is_some),
-            Self::Attach { control, failure } => {
-                control.is_some()
-                    || failure.invitation.is_some()
-                    || failure.endpoint.is_some()
-                    || failure.unmapped_endpoint.is_some()
-            }
-            Self::Start { stream, error } => {
-                stream.control.is_some() || stream.role.is_some() || client_error_has_owner(error)
-            }
-        }
-    }
-
-    pub fn retry_cleanup(&mut self) -> Result<(), erhino_shared::call::SystemCallError> {
-        let mut first = None;
-        match self {
-            Self::Call(error) => return retry_client_error(error),
-            Self::InvalidReply { owners } => {
-                for owner in owners.iter_mut() {
-                    if let Some(value) = owner.take()
-                        && let Err((value, error)) = value.close()
-                    {
-                        *owner = Some(value);
-                        first.get_or_insert(error);
-                    }
-                }
-            }
-            Self::Attach { control, failure } => {
-                if let Some(value) = failure.endpoint.take()
-                    && let Err((value, error)) = value.close()
-                {
-                    failure.endpoint = Some(value);
-                    first.get_or_insert(error);
-                }
-                if let Some(value) = failure.unmapped_endpoint.take()
-                    && let Err((value, error)) = value.close()
-                {
-                    failure.unmapped_endpoint = Some(value);
-                    first.get_or_insert(error);
-                }
-                if let Some(value) = failure.invitation.take()
-                    && let Err((value, error)) = value.close()
-                {
-                    failure.invitation = Some(value);
-                    first.get_or_insert(error);
-                }
-                if let Some(value) = control.take()
-                    && let Err((value, error)) = value.close()
-                {
-                    *control = Some(value);
-                    first.get_or_insert(error);
-                }
-            }
-            Self::Start { stream, error } => {
-                if let Err(error) = stream.close_owned() {
-                    first.get_or_insert(error);
-                }
-                if let Err(error) = retry_client_error(error) {
-                    first.get_or_insert(error);
-                }
-            }
-        }
-        first.map_or(Ok(()), Err)
+impl From<SystemCallError> for ClientError {
+    fn from(e: SystemCallError) -> Self {
+        Self::System(e)
     }
 }
-
-pub enum StreamReadFailure {
-    EmptyBuffer,
-    Transport(librunnel::IoError),
-    Control(libfal::client::ClientError),
-    Business(protocol::StreamInfo),
+pub struct Io {
+    pub count: u64,
+    pub end: IoEnd,
+    pub cause: Status,
+    pub data: Vec<u8>,
 }
-
-impl Stream {
-    pub const fn offer(&self) -> protocol::StreamOffer {
-        self.offer
+pub struct Offer {
+    pub info: StreamOffer,
+    pub control: MailboxSender,
+    pub invitation: Capability,
+}
+pub struct Watch {
+    pub info: WatchInfo,
+    pub control: WatchControl,
+}
+pub struct WatchControl {
+    pub sender: MailboxSender,
+    pub waiter: libkernel::ipc::notification::NotificationObserver,
+}
+impl WatchControl {
+    pub fn query(&self, caller: &mut Caller, deadline: Deadline) -> Result<WatchInfo, ClientError> {
+        self.request(caller, Request::QueryWatch, deadline)
     }
-
-    pub fn control_sender(&self) -> Option<&MailboxSender> {
-        self.control.as_ref()
-    }
-
-    fn reader_mut(&mut self) -> Option<&mut Consumer> {
-        match self.role.as_mut() {
-            Some(StreamRole::Reader(role)) => Some(role),
-            _ => None,
-        }
-    }
-
-    fn writer_mut(&mut self) -> Option<&mut Producer> {
-        match self.role.as_mut() {
-            Some(StreamRole::Writer(role)) => Some(role),
-            _ => None,
-        }
-    }
-
-    fn read_until(
-        &mut self,
-        buffer: &mut [u8],
-        deadline: libkernel::time::Deadline,
-    ) -> Result<usize, librunnel::IoError> {
-        match self.role.as_mut() {
-            Some(StreamRole::Reader(role)) => role.read_exact_or_eof_until(buffer, deadline),
-            _ => Err(librunnel::IoError {
-                error: librunnel::RunnelError::BadFormat,
-                completed: 0,
-            }),
-        }
-    }
-
-    pub fn write_until(
-        &mut self,
-        bytes: &[u8],
-        deadline: libkernel::time::Deadline,
-    ) -> Result<(), librunnel::IoError> {
-        match self.role.as_mut() {
-            Some(StreamRole::Writer(role)) => role.write_all_until(bytes, deadline),
-            _ => Err(librunnel::IoError {
-                error: librunnel::RunnelError::BadFormat,
-                completed: 0,
-            }),
-        }
-    }
-
-    pub fn end_write(&mut self) -> Result<(), librunnel::IoError> {
-        match self.role.as_mut() {
-            Some(StreamRole::Writer(role)) => role.finish(),
-            _ => Err(librunnel::IoError {
-                error: librunnel::RunnelError::BadFormat,
-                completed: 0,
-            }),
-        }
-    }
-
-    fn control_call(
+    pub fn ack(
         &self,
-        client: &mut Client,
-        request: &Request<'_>,
-        deadline: libkernel::time::Deadline,
-    ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
-        self.control_call_cancelable(client, request, deadline, None)
+        caller: &mut Caller,
+        sequence: u64,
+        deadline: Deadline,
+    ) -> Result<WatchInfo, ClientError> {
+        self.request(caller, Request::AckWatch { sequence }, deadline)
     }
-
-    fn control_call_cancelable(
+    pub fn cancel(
         &self,
-        client: &mut Client,
-        request: &Request<'_>,
-        deadline: libkernel::time::Deadline,
-        cancel: Option<erhino_shared::object::Handle>,
-    ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
-        let control = self
-            .control
-            .as_ref()
-            .ok_or(libfal::client::ClientError::Protocol)?;
-        let reply = client.call_cancelable(control, request, deadline, cancel)?;
-        let (_, Response::StreamInfo(info)) = protocol::decode_response(&reply.payload)
-            .map_err(|_| libfal::client::ClientError::Protocol)?
-        else {
-            return Err(libfal::client::ClientError::Protocol);
-        };
-        if info.identity != self.offer.identity {
-            return Err(libfal::client::ClientError::Protocol);
-        }
-        Ok(info)
+        caller: &mut Caller,
+        deadline: Deadline,
+    ) -> Result<WatchInfo, ClientError> {
+        self.request(caller, Request::CancelWatch, deadline)
     }
-
-    pub fn close_data(&mut self) -> Result<(), erhino_shared::call::SystemCallError> {
-        if let Some(role) = self.role.take() {
-            let result = match role {
-                StreamRole::Reader(role) => role
-                    .close()
-                    .map_err(|(role, error)| (StreamRole::Reader(role), error)),
-                StreamRole::Writer(role) => role
-                    .close()
-                    .map_err(|(role, error)| (StreamRole::Writer(role), error)),
-            };
-            if let Err((role, error)) = result {
-                self.role = Some(role);
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    // 失败必须原样返还 affine owner，不能在错误路径再依赖分配。
-    #[allow(clippy::result_large_err)]
-    pub fn close(mut self) -> Result<(), (Self, erhino_shared::call::SystemCallError)> {
-        if let Err(error) = self.close_owned() {
-            return Err((self, error));
-        }
-        Ok(())
-    }
-
-    fn close_owned(&mut self) -> Result<(), erhino_shared::call::SystemCallError> {
-        self.close_data()?;
-        if let Some(control) = self.control.take()
-            && let Err((control, error)) = control.close()
+    fn request(
+        &self,
+        caller: &mut Caller,
+        request: Request<'_>,
+        deadline: Deadline,
+    ) -> Result<WatchInfo, ClientError> {
+        let reply = call(caller, &self.sender, &request, deadline, None)?;
+        match protocol::decode_response(&reply.payload, &request, deadline, slots(&reply.handles))
+            .map_err(|_| ClientError::Protocol)?
         {
-            self.control = Some(control);
-            return Err(error);
+            Response::Watch(info) => Ok(info),
+            Response::Error(status) => Err(ClientError::Status(status)),
+            _ => Err(ClientError::Protocol),
         }
-        Ok(())
     }
 }
-
-impl Transport {
-    pub const fn new(deadline: libkernel::time::Deadline) -> Self {
+pub struct Client<'a> {
+    namespace: &'a Namespace,
+    caller: &'a mut Caller,
+    limits: FollowLimits,
+}
+impl<'a> Client<'a> {
+    pub fn new(namespace: &'a Namespace, caller: &'a mut Caller, limits: FollowLimits) -> Self {
         Self {
-            client: Client::new(),
+            namespace,
+            caller,
+            limits,
+        }
+    }
+    fn path<R>(
+        &mut self,
+        path: &str,
+        request: &Request<'_>,
+        deadline: Deadline,
+        input: Option<&MailboxSender>,
+        decode: impl for<'r> FnOnce(Response<'r>, &mut HandleSet) -> Result<R, ClientError>,
+    ) -> Result<R, ClientError> {
+        let budget = self.limits.start(libkernel::time::snapshot()?, deadline)?;
+        self.path_budget(path, request, budget, input, decode)
+            .map(|(value, _)| value)
+    }
+    fn path_budget<R>(
+        &mut self,
+        path: &str,
+        prototype: &Request<'_>,
+        budget: FollowBudget,
+        input: Option<&MailboxSender>,
+        decode: impl for<'r> FnOnce(Response<'r>, &mut HandleSet) -> Result<R, ClientError>,
+    ) -> Result<(R, FollowBudget), ClientError> {
+        let mut walk = Walk::new(self.namespace, path, "/", budget)?;
+        loop {
+            walk.before_call(libkernel::time::snapshot()?.now_ns)?;
+            let deadline = walk.budget().deadline();
+            let (entry, path) = walk.target()?;
+            let request = retarget(prototype, path)?;
+            let mut reply = call(self.caller, entry, &request, deadline, input)?;
+            let response = protocol::decode_response(
+                &reply.payload,
+                &request,
+                deadline,
+                slots(&reply.handles),
+            )
+            .map_err(|_| ClientError::Protocol)?;
+            match response {
+                Response::Boundary(boundary) => {
+                    let next = if boundary.capability_count() == 1 {
+                        Some(
+                            Arc::try_new(sender(&mut reply.handles, 0)?)
+                                .map_err(|_| ClientError::System(SystemCallError::OutOfMemory))?,
+                        )
+                    } else {
+                        None
+                    };
+                    walk.follow(boundary, next, libkernel::time::snapshot()?.now_ns)?;
+                }
+                Response::Error(status) => return Err(ClientError::Status(status)),
+                response => {
+                    let value = decode(response, &mut reply.handles)?;
+                    return Ok((value, walk.into_budget()));
+                }
+            }
+        }
+    }
+    pub fn get<T: FromProperty>(
+        &mut self,
+        path: &str,
+        deadline: Deadline,
+    ) -> Result<T, ClientError> {
+        self.path(
+            path,
+            &Request::Get { path: "" },
             deadline,
-        }
-    }
-
-    fn call_deadline(
-        &self,
-        session: libkernel::time::Deadline,
-    ) -> Result<libkernel::time::Deadline, libfal::client::ClientError> {
-        let session_end = session
-            .instant()
-            .map_err(|_| libfal::client::ClientError::Protocol)?
-            .ok_or(libfal::client::ClientError::Protocol)?;
-        let own_end = self
-            .deadline
-            .instant()
-            .map_err(|_| libfal::client::ClientError::Protocol)?
-            .unwrap_or(u64::MAX);
-        let now = libkernel::time::Instant::now()
-            .map_err(libfal::client::ClientError::System)?
-            .as_nanos();
-        Ok(libkernel::time::Deadline::at(
-            session_end
-                .min(own_end)
-                .min(now.saturating_add(5_000_000_000)),
-        ))
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn open_stream(
-        &mut self,
-        position: &Position<Grant>,
-        direction: protocol::StreamDirection,
-        offset: u64,
-        length: Option<u64>,
-        session_deadline: libkernel::time::Deadline,
-    ) -> Result<Stream, StreamOpenFailure> {
-        self.open_stream_with_cancel(position, direction, offset, length, session_deadline, None)
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn open_stream_with_cancel(
-        &mut self,
-        position: &Position<Grant>,
-        direction: protocol::StreamDirection,
-        offset: u64,
-        length: Option<u64>,
-        session_deadline: libkernel::time::Deadline,
-        cancel: Option<erhino_shared::object::Handle>,
-    ) -> Result<Stream, StreamOpenFailure> {
-        if position.info.kind != NodeKind::Stream {
-            return Err(StreamOpenFailure::Call(
-                libfal::client::ClientError::Status(Status::Invalid),
-            ));
-        }
-        let expected_identity = core::num::NonZeroU64::new(position.info.identity).ok_or(
-            StreamOpenFailure::Call(libfal::client::ClientError::Protocol),
-        )?;
-        self.open_stream_at(
-            OpenTarget {
-                parent: &position.anchor,
-                path: &position.rel,
-                expected_identity,
-                cancel,
+            None,
+            |r, _| match r {
+                Response::Value(value) => value.get().map_err(ClientError::Status),
+                _ => Err(ClientError::Protocol),
             },
-            direction,
-            offset,
-            length,
-            session_deadline,
         )
     }
-
-    #[allow(clippy::result_large_err)]
-    fn open_stream_at(
-        &mut self,
-        target: OpenTarget<'_>,
-        direction: protocol::StreamDirection,
-        offset: u64,
-        length: Option<u64>,
-        session_deadline: libkernel::time::Deadline,
-    ) -> Result<Stream, StreamOpenFailure> {
-        let deadline = self
-            .call_deadline(session_deadline)
-            .map_err(StreamOpenFailure::Call)?;
-        let request = Request::Open {
-            path: target.path,
-            expected_identity: Some(target.expected_identity),
-            direction,
-            offset,
-            length,
-            session_deadline,
-            stream_protocol: protocol::RNL2_PROTOCOL,
-            tunnel_bytes: 0,
-        };
-        let mut reply = self
-            .client
-            .call_cancelable(target.parent.endpoint(), &request, deadline, target.cancel)
-            .map_err(StreamOpenFailure::Call)?;
-        let (_, Response::StreamOffer(offer)) =
-            protocol::decode_response(&reply.payload).map_err(|_| {
-                StreamOpenFailure::InvalidReply {
-                    owners: [reply.handles.take(0).ok(), reply.handles.take(1).ok()],
-                }
-            })?
-        else {
-            return Err(StreamOpenFailure::InvalidReply {
-                owners: [reply.handles.take(0).ok(), reply.handles.take(1).ok()],
-            });
-        };
-        let control_owner = reply
-            .handles
-            .take(0)
-            .map_err(|_| StreamOpenFailure::InvalidReply {
-                owners: [None, reply.handles.take(1).ok()],
-            })?;
-        let invitation_owner = match reply.handles.take(1) {
-            Ok(owner) => owner,
-            Err(_) => {
-                return Err(StreamOpenFailure::InvalidReply {
-                    owners: [Some(control_owner), None],
-                });
-            }
-        };
-        let (control, description) = match MailboxSender::from_capability(control_owner) {
-            Ok(control) => control,
-            Err(SenderAdoptFailure { owner, .. }) => {
-                return Err(StreamOpenFailure::InvalidReply {
-                    owners: [Some(owner), Some(invitation_owner)],
-                });
-            }
-        };
-        if description.object_id != offer.identity
-            || offer.direction != direction
-            || offer.start != offset
-            || (direction == protocol::StreamDirection::Read && offer.read_end < offset)
-            || offer.tunnel_bytes as usize != 3 * erhino_shared::proc::PROCESS_PAGE_SIZE
-        {
-            return Err(StreamOpenFailure::InvalidReply {
-                owners: [Some(control.into_capability()), Some(invitation_owner)],
-            });
-        }
-        let invitation = match Invitation::from_capability(invitation_owner) {
-            Ok(invitation) => invitation,
-            Err(InvitationFailure { owner, .. }) => {
-                return Err(StreamOpenFailure::InvalidReply {
-                    owners: [Some(control.into_capability()), Some(owner)],
-                });
-            }
-        };
-        let attachment = match direction {
-            protocol::StreamDirection::Read => {
-                Consumer::attach(invitation, offer.tunnel_bytes as usize, Placement::Anywhere)
-                    .map(StreamRole::Reader)
-            }
-            protocol::StreamDirection::Write => {
-                Producer::attach(invitation, offer.tunnel_bytes as usize, Placement::Anywhere)
-                    .map(StreamRole::Writer)
-            }
-        };
-        let role = match attachment {
-            Ok(role) => role,
-            Err(failure) => {
-                let failure = match failure {
-                    blocking::AttachFailure::Tunnel(failure) => AttachOwners {
-                        error: AttachError::System(failure.error),
-                        invitation: Some(failure.invitation),
-                        endpoint: None,
-                        unmapped_endpoint: None,
-                    },
-                    blocking::AttachFailure::Map(failure) => AttachOwners {
-                        error: AttachError::System(failure.error),
-                        invitation: None,
-                        endpoint: None,
-                        unmapped_endpoint: Some(failure.endpoint),
-                    },
-                    blocking::AttachFailure::Protocol(failure) => AttachOwners {
-                        error: AttachError::Protocol(failure.error),
-                        invitation: None,
-                        endpoint: Some(failure.owner),
-                        unmapped_endpoint: None,
-                    },
-                };
-                return Err(StreamOpenFailure::Attach {
-                    control: Some(control),
-                    failure,
-                });
-            }
-        };
-        let stream = Stream {
-            control: Some(control),
-            role: Some(role),
-            offer,
-        };
-        loop {
-            let now = match libkernel::time::Instant::now() {
-                Ok(now) => now,
-                Err(error) => {
-                    return Err(StreamOpenFailure::Start {
-                        stream,
-                        error: libfal::client::ClientError::System(error),
-                    });
-                }
-            };
-            if !offer
-                .offer_deadline
-                .instant()
-                .ok()
-                .flatten()
-                .is_some_and(|end| now.as_nanos() < end)
-            {
-                return Err(StreamOpenFailure::Start {
-                    stream,
-                    error: libfal::client::ClientError::Status(Status::Cancelled),
-                });
-            }
-            match stream.control_call_cancelable(
-                &mut self.client,
-                &Request::Start,
-                deadline,
-                target.cancel,
-            ) {
-                Ok(info) if info.state == protocol::StreamState::Active => return Ok(stream),
-                Ok(_) => {
-                    return Err(StreamOpenFailure::Start {
-                        stream,
-                        error: libfal::client::ClientError::Protocol,
-                    });
-                }
-                Err(libfal::client::ClientError::Status(Status::Busy)) => {
-                    match stream.control_call_cancelable(
-                        &mut self.client,
-                        &Request::QueryStream,
-                        deadline,
-                        target.cancel,
-                    ) {
-                        Ok(info) if info.state == protocol::StreamState::Offered => continue,
-                        Ok(info) if info.state == protocol::StreamState::Active => {
-                            return Ok(stream);
-                        }
-                        Ok(_) => {
-                            return Err(StreamOpenFailure::Start {
-                                stream,
-                                error: libfal::client::ClientError::Status(Status::Cancelled),
-                            });
-                        }
-                        Err(error) => return Err(StreamOpenFailure::Start { stream, error }),
-                    }
-                }
-                Err(error) => return Err(StreamOpenFailure::Start { stream, error }),
-            }
-        }
+    pub fn get_value(&mut self, path: &str, deadline: Deadline) -> Result<Vec<u8>, ClientError> {
+        self.path(
+            path,
+            &Request::Get { path: "" },
+            deadline,
+            None,
+            |r, _| match r {
+                Response::Value(value) => copy(value.as_bytes()),
+                _ => Err(ClientError::Protocol),
+            },
+        )
     }
-
-    pub fn query_stream(
+    pub fn set(
         &mut self,
-        stream: &Stream,
-        deadline: libkernel::time::Deadline,
-    ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
-        stream.control_call(&mut self.client, &Request::QueryStream, deadline)
+        path: &str,
+        value: Value<'_>,
+        deadline: Deadline,
+    ) -> Result<(), ClientError> {
+        let mut bytes = [0u8; protocol::BODY_MAX];
+        let used = value.encode(&mut bytes).map_err(ClientError::Status)?;
+        self.set_value(path, &bytes[..used], deadline)
     }
-
-    pub fn read_stream_until(
+    pub fn set_value(
         &mut self,
-        stream: &mut Stream,
-        buffer: &mut [u8],
-        deadline: libkernel::time::Deadline,
-    ) -> Result<usize, StreamReadFailure> {
-        if buffer.is_empty() {
-            return Err(StreamReadFailure::EmptyBuffer);
-        }
-        let read = stream
-            .read_until(buffer, deadline)
-            .map_err(StreamReadFailure::Transport)?;
-        if read != 0 {
-            return Ok(read);
-        }
-        let info = self
-            .finish_stream(stream, deadline)
-            .map_err(StreamReadFailure::Control)?;
-        if info.outcome != Status::Ok || info.reason != protocol::StreamReason::Completed {
-            return Err(StreamReadFailure::Business(info));
-        }
-        Ok(0)
+        path: &str,
+        value: &[u8],
+        deadline: Deadline,
+    ) -> Result<(), ClientError> {
+        self.path(
+            path,
+            &Request::Set { path: "", value },
+            deadline,
+            None,
+            empty,
+        )
     }
-
-    pub fn finish_stream(
+    pub fn create(
         &mut self,
-        stream: &Stream,
-        deadline: libkernel::time::Deadline,
-    ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
-        stream.control_call(&mut self.client, &Request::FinishStream, deadline)
-    }
-
-    fn finish_stream_cancelable(
-        &mut self,
-        stream: &Stream,
-        deadline: libkernel::time::Deadline,
-        cancel: Option<erhino_shared::object::Handle>,
-    ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
-        stream.control_call_cancelable(&mut self.client, &Request::FinishStream, deadline, cancel)
-    }
-
-    pub fn cancel_stream(
-        &mut self,
-        stream: &Stream,
-        deadline: libkernel::time::Deadline,
-    ) -> Result<protocol::StreamInfo, libfal::client::ClientError> {
-        stream.control_call(&mut self.client, &Request::CancelStream, deadline)
-    }
-
-    pub fn move_entry(
-        &mut self,
-        source: &Grant,
-        source_parent: &str,
-        source_name: &str,
-        destination: &Grant,
-        destination_name: &str,
-        expected: Expected,
-    ) -> Result<(), Status> {
-        self.client
-            .move_entry(
-                source.endpoint(),
-                destination.endpoint(),
-                libfal::client::MoveEntry {
-                    source_parent,
-                    source_name,
-                    destination_name,
-                    expected,
-                },
-                self.deadline,
-            )
-            .map_err(|error| match error {
-                libfal::client::ClientError::Status(status) => status,
-                _ => Status::Internal,
-            })
-    }
-
-    pub fn copy_property(
-        &mut self,
-        source: &Grant,
-        source_path: &str,
-        destination: &Grant,
-        destination_name: &str,
-        rights: libfal::authority::FalRights,
-    ) -> Result<(), Status> {
-        self.client
-            .copy_property(
-                source.endpoint(),
-                source_path,
-                destination.endpoint(),
-                destination_name,
+        path: &str,
+        kind: NodeKind,
+        rights: FsRights,
+        initial: &[u8],
+        deadline: Deadline,
+    ) -> Result<(), ClientError> {
+        self.path(
+            path,
+            &Request::Create {
+                path: "",
+                kind,
                 rights,
-                self.deadline,
-            )
-            .map_err(|error| match error {
-                libfal::client::ClientError::Status(status) => status,
-                _ => Status::Internal,
-            })
+                initial,
+            },
+            deadline,
+            None,
+            empty,
+        )
     }
-
-    pub fn subscribe(
+    pub fn remove(&mut self, path: &str, deadline: Deadline) -> Result<(), ClientError> {
+        self.path(path, &Request::Remove { path: "" }, deadline, None, empty)
+    }
+    pub fn read_at(
         &mut self,
-        grant: &Grant,
         path: &str,
-        mask: protocol::WatchMask,
-    ) -> Result<Subscription, Status> {
-        self.client
-            .subscribe(grant.endpoint(), path, mask, self.deadline)
-            .map_err(|error| match error {
-                libfal::client::ClientError::Status(status) => status,
-                _ => Status::Internal,
-            })
+        offset: u64,
+        count: u32,
+        deadline: Deadline,
+    ) -> Result<Io, ClientError> {
+        self.path(
+            path,
+            &Request::ReadAt {
+                path: "",
+                offset,
+                count,
+            },
+            deadline,
+            None,
+            io,
+        )
     }
-
-    pub fn query_subscription(
+    pub fn write_at(
         &mut self,
-        subscription: &Subscription,
-    ) -> Result<protocol::SubscriptionInfo, Status> {
-        self.client
-            .query_subscription(subscription, self.deadline)
-            .map_err(|error| match error {
-                libfal::client::ClientError::Status(status) => status,
-                _ => Status::Internal,
-            })
+        path: &str,
+        offset: u64,
+        data: &[u8],
+        deadline: Deadline,
+    ) -> Result<Io, ClientError> {
+        self.path(
+            path,
+            &Request::WriteAt {
+                path: "",
+                offset,
+                data,
+            },
+            deadline,
+            None,
+            io,
+        )
     }
-
-    pub fn unsubscribe(&mut self, subscription: &Subscription) -> Result<(), Status> {
-        self.client
-            .unsubscribe(subscription, self.deadline)
-            .map_err(|error| match error {
-                libfal::client::ClientError::Status(status) => status,
-                _ => Status::Internal,
-            })
+    pub fn read_link(&mut self, path: &str, deadline: Deadline) -> Result<String, ClientError> {
+        self.path(
+            path,
+            &Request::ReadLink { path: "" },
+            deadline,
+            None,
+            |r, _| match r {
+                Response::LinkTarget(s) => {
+                    let mut text = String::new();
+                    text.try_reserve_exact(s.len())
+                        .map_err(|_| ClientError::System(SystemCallError::OutOfMemory))?;
+                    text.push_str(s);
+                    Ok(text)
+                }
+                _ => Err(ClientError::Protocol),
+            },
+        )
+    }
+    pub fn set_length(
+        &mut self,
+        path: &str,
+        length: u64,
+        deadline: Deadline,
+    ) -> Result<(), ClientError> {
+        self.path(
+            path,
+            &Request::SetLength { path: "", length },
+            deadline,
+            None,
+            empty,
+        )
+    }
+    pub fn sync(&mut self, path: &str, deadline: Deadline) -> Result<(), ClientError> {
+        self.path(path, &Request::Sync { path: "" }, deadline, None, empty)
+    }
+    pub fn derive_directory(
+        &mut self,
+        path: &str,
+        rights: FsRights,
+        sender_transport: Rights,
+        output_transport: Rights,
+        deadline: Deadline,
+    ) -> Result<MailboxSender, ClientError> {
+        self.path(
+            path,
+            &Request::DeriveDirectory {
+                path: "",
+                rights,
+                sender_transport,
+                output_transport,
+            },
+            deadline,
+            None,
+            |r, handles| match r {
+                Response::Empty => issued_sender(handles, sender_transport),
+                _ => Err(ClientError::Protocol),
+            },
+        )
+    }
+    pub fn rename(
+        &mut self,
+        source: &str,
+        destination: &str,
+        replace: bool,
+        deadline: Deadline,
+    ) -> Result<(), ClientError> {
+        let mut budget = self.limits.start(libkernel::time::snapshot()?, deadline)?;
+        let destination = liboal::view::normalize(destination, "/", &mut budget)?;
+        let (parent, name) = destination
+            .rsplit_once('/')
+            .ok_or(LocalError::InvalidPath)?;
+        liboal::path::validate_name(name)
+            .map_err(|_| ClientError::Local(LocalError::InvalidPath))?;
+        let requested = Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE;
+        let target = Request::DeriveDirectory {
+            path: "",
+            rights: FsRights::CREATE
+                | if replace {
+                    FsRights::REMOVE
+                } else {
+                    FsRights::NONE
+                },
+            sender_transport: requested,
+            output_transport: Rights::NONE,
+        };
+        let (grant, budget) = self.path_budget(
+            if parent.is_empty() { "/" } else { parent },
+            &target,
+            budget,
+            None,
+            |r, handles| match r {
+                Response::Empty => issued_sender(handles, requested),
+                _ => Err(ClientError::Protocol),
+            },
+        )?;
+        self.path_budget(
+            source,
+            &Request::Rename {
+                source: "",
+                destination_name: name,
+                replace,
+            },
+            budget,
+            Some(&grant),
+            empty,
+        )
+        .map(|(value, _)| value)
+    }
+    pub fn open(
+        &mut self,
+        path: &str,
+        options: OpenOptions,
+        deadline: Deadline,
+    ) -> Result<Offer, ClientError> {
+        self.path(
+            path,
+            &Request::Open { path: "", options },
+            deadline,
+            None,
+            offer,
+        )
+    }
+    pub fn create_open(
+        &mut self,
+        path: &str,
+        options: OpenOptions,
+        rights: FsRights,
+        deadline: Deadline,
+    ) -> Result<Offer, ClientError> {
+        self.path(
+            path,
+            &Request::CreateOpen {
+                path: "",
+                options,
+                rights,
+            },
+            deadline,
+            None,
+            offer,
+        )
+    }
+    pub fn watch(
+        &mut self,
+        path: &str,
+        mask: u64,
+        deadline: Deadline,
+    ) -> Result<Watch, ClientError> {
+        self.path(
+            path,
+            &Request::Watch { path: "", mask },
+            deadline,
+            None,
+            |r, handles| match r {
+                Response::Watch(info) => {
+                    let control_description = handles.get(0)?.description()?;
+                    let observer_description = handles.get(1)?.description()?;
+                    if control_description.kind != ObjectKind::MailboxSender as u32
+                        || !control_description
+                            .rights
+                            .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+                        || observer_description.kind != ObjectKind::NotificationObserver as u32
+                        || !observer_description
+                            .rights
+                            .contains(Rights::WAIT | Rights::TRANSIT)
+                    {
+                        return Err(ClientError::Protocol);
+                    }
+                    let control = sender(handles, 0)?;
+                    let (waiter, desc) =
+                        libkernel::ipc::notification::NotificationObserver::from_capability(
+                            handles.take(1)?,
+                        )
+                        .map_err(|f| ClientError::System(f.error))?;
+                    if !desc.rights.contains(Rights::WAIT | Rights::TRANSIT) {
+                        return Err(ClientError::Protocol);
+                    }
+                    Ok(Watch {
+                        info,
+                        control: WatchControl {
+                            sender: control,
+                            waiter,
+                        },
+                    })
+                }
+                _ => Err(ClientError::Protocol),
+            },
+        )
     }
 }
-
-fn summary(info: protocol::NodeInfo, value: Vec<u8>) -> NodeSummary {
-    NodeSummary {
-        identity: info.identity,
-        version: info.version,
-        kind: info.kind,
-        rights: info.rights,
-        attributes: NodeAttributes::NONE,
-        size: info.size,
-        value,
-    }
+fn copy(bytes: &[u8]) -> Result<Vec<u8>, ClientError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    out.extend_from_slice(bytes);
+    Ok(out)
 }
-
-impl WalkTransport for Transport {
-    type Endpoint = Arc<MailboxSender>;
-
-    fn lookup(
-        &mut self,
-        dir: &Grant,
-        policy: ResolvePolicy,
-        path: &str,
-    ) -> Result<LookupOutcome<Grant>, Status> {
-        let mut reply = self
-            .client
-            .call(dir.endpoint(), &Request::Lookup { path }, self.deadline)
-            .map_err(|error| match error {
-                libfal::client::ClientError::Status(status) => status,
-                _ => Status::Internal,
-            })?;
-        let (_, response) =
-            protocol::decode_response(&reply.payload).map_err(|_| Status::Internal)?;
-        match response {
-            Response::Node(info) => Ok(LookupOutcome::Found(summary(info, Vec::new()))),
-            Response::Delegate {
-                node: _,
-                consumed,
-                remaining,
-            } => {
-                let capability = reply.handles.take(0).map_err(|_| Status::Internal)?;
-                let (sender, _) = MailboxSender::from_capability(capability)
-                    .map_err(|SenderAdoptFailure { .. }| Status::Internal)?;
-                Ok(LookupOutcome::Delegate {
-                    dir: DirectoryGrant::new(Arc::new(sender)),
-                    consumed: String::from(consumed),
-                    remaining: String::from(remaining),
-                })
-            }
-            Response::LinkBoundary {
-                node,
-                consumed: _,
-                target,
-                remaining,
-            } if policy == ResolvePolicy::NoFollowFinal && remaining.is_empty() => Ok(
-                LookupOutcome::Found(summary(node, target.as_bytes().to_vec())),
-            ),
-            Response::LinkBoundary {
-                consumed,
-                target,
-                remaining,
-                ..
-            } => Ok(LookupOutcome::Link {
-                consumed: String::from(consumed),
-                target: String::from(target),
-                remaining: String::from(remaining),
-            }),
-            _ => Err(Status::Internal),
+fn slots(handles: &HandleSet) -> u64 {
+    let mut value = 0;
+    for i in 0..handles.len() {
+        if handles.get(i).is_ok() {
+            value |= 1u64 << i;
         }
+    }
+    value
+}
+fn sender(handles: &mut HandleSet, index: usize) -> Result<MailboxSender, ClientError> {
+    let cap = handles.take(index)?;
+    let (sender, desc) = MailboxSender::from_capability(cap).map_err(ClientError::Adopt)?;
+    if !desc
+        .rights
+        .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+    {
+        return Err(ClientError::Protocol);
+    }
+    Ok(sender)
+}
+fn issued_sender(handles: &mut HandleSet, requested: Rights) -> Result<MailboxSender, ClientError> {
+    // 槽数已由领域响应校验；先核实际角色和完整运输上限再转移 owner。
+    let description = handles.get(0)?.description()?;
+    if description.kind != ObjectKind::MailboxSender as u32 || description.rights != requested {
+        return Err(ClientError::Protocol);
+    }
+    sender(handles, 0)
+}
+fn empty(r: Response<'_>, _: &mut HandleSet) -> Result<(), ClientError> {
+    if matches!(r, Response::Empty) {
+        Ok(())
+    } else {
+        Err(ClientError::Protocol)
+    }
+}
+fn io(r: Response<'_>, _: &mut HandleSet) -> Result<Io, ClientError> {
+    let Response::Io(IoResult {
+        count,
+        end,
+        cause,
+        data,
+    }) = r
+    else {
+        return Err(ClientError::Protocol);
+    };
+    Ok(Io {
+        count,
+        end,
+        cause,
+        data: copy(data)?,
+    })
+}
+fn offer(r: Response<'_>, handles: &mut HandleSet) -> Result<Offer, ClientError> {
+    let Response::Offer(info) = r else {
+        return Err(ClientError::Protocol);
+    };
+    let control = sender(handles, 0)?;
+    let invitation = handles.take(1)?;
+    let desc = invitation.description()?;
+    if desc.kind != ObjectKind::TunnelInvitation as u32 {
+        return Err(ClientError::Protocol);
+    }
+    Ok(Offer {
+        info,
+        control,
+        invitation,
+    })
+}
+fn call(
+    caller: &mut Caller,
+    entry: &MailboxSender,
+    request: &Request<'_>,
+    deadline: Deadline,
+    input: Option<&MailboxSender>,
+) -> Result<librpc::Reply, ClientError> {
+    let rpc = rpc_request(request, deadline, input)?;
+    caller
+        .call(entry, deadline, rpc)
+        .map_err(ClientError::Transport)
+}
+fn rpc_request(
+    request: &Request<'_>,
+    deadline: Deadline,
+    input: Option<&MailboxSender>,
+) -> Result<RpcRequest, ClientError> {
+    let len = protocol::HEADER_LEN + request.body_len().map_err(ClientError::Status)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| ClientError::System(SystemCallError::OutOfMemory))?;
+    bytes.resize(len, 0);
+    let used =
+        protocol::encode_request(request, deadline, &mut bytes).map_err(ClientError::Status)?;
+    let mut rpc = RpcRequest::new(protocol::ID, &bytes[..used])?;
+    if let Some(input) = input {
+        let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let handle = libkernel::ipc::object::duplicate(input.as_handle(), rights)?; // SAFETY: duplicate 为本函数交付唯一新handle，Packet失败仍返还cap owner。
+        let cap = unsafe { Capability::from_raw(handle) };
+        rpc.push(cap, rights)
+            .map_err(|e| ClientError::System(e.error))?;
+    }
+    Ok(rpc)
+}
+fn retarget<'a>(r: &'a Request<'_>, path: &'a str) -> Result<Request<'a>, ClientError> {
+    Ok(match r {
+        Request::Get { .. } => Request::Get { path },
+        Request::Set { value, .. } => Request::Set { path, value },
+        Request::ReadAt { offset, count, .. } => Request::ReadAt {
+            path,
+            offset: *offset,
+            count: *count,
+        },
+        Request::WriteAt { offset, data, .. } => Request::WriteAt {
+            path,
+            offset: *offset,
+            data,
+        },
+        Request::Open { options, .. } => Request::Open {
+            path,
+            options: *options,
+        },
+        Request::CreateOpen {
+            options, rights, ..
+        } => Request::CreateOpen {
+            path,
+            options: *options,
+            rights: *rights,
+        },
+        Request::Create {
+            kind,
+            rights,
+            initial,
+            ..
+        } => Request::Create {
+            path,
+            kind: *kind,
+            rights: *rights,
+            initial,
+        },
+        Request::Remove { .. } => Request::Remove { path },
+        Request::Rename {
+            destination_name,
+            replace,
+            ..
+        } => Request::Rename {
+            source: path,
+            destination_name,
+            replace: *replace,
+        },
+        Request::ReadLink { .. } => Request::ReadLink { path },
+        Request::SetLength { length, .. } => Request::SetLength {
+            path,
+            length: *length,
+        },
+        Request::Sync { .. } => Request::Sync { path },
+        Request::DeriveDirectory {
+            rights,
+            sender_transport,
+            output_transport,
+            ..
+        } => Request::DeriveDirectory {
+            path,
+            rights: *rights,
+            sender_transport: *sender_transport,
+            output_transport: *output_transport,
+        },
+        Request::Watch { mask, .. } => Request::Watch { path, mask: *mask },
+        _ => return Err(ClientError::Protocol),
+    })
+}
+pub fn stream_control(
+    caller: &mut Caller,
+    sender: &MailboxSender,
+    request: &Request<'_>,
+    deadline: Deadline,
+) -> Result<StreamInfo, ClientError> {
+    let reply = call(caller, sender, request, deadline, None)?;
+    match protocol::decode_response(&reply.payload, request, deadline, slots(&reply.handles))
+        .map_err(|_| ClientError::Protocol)?
+    {
+        Response::Stream(info) => Ok(info),
+        Response::Error(e) => Err(ClientError::Status(e)),
+        _ => Err(ClientError::Protocol),
     }
 }

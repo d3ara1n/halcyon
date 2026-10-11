@@ -1,40 +1,54 @@
-//! Notification：显式消费的 OR 累积事件对象。
+//! Notification 的消费、发送与只读观察能力；等待仍使用共同 handle 借用接口。
 
+use super::capability::{Capability, capability_role};
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, HandlePair, Rights},
 };
 
-use crate::call::{sys_notification_create, sys_notification_signal, sys_notification_take};
+capability_role!(NotificationOwner, NotificationOwner, Rights::NONE);
+capability_role!(NotificationSignaler, NotificationSignaler, Rights::NONE);
+capability_role!(NotificationObserver, NotificationObserver, Rights::WAIT);
+
+#[derive(Debug)]
+pub struct NotificationPair {
+    pub owner: NotificationOwner,
+    pub peer: NotificationSignaler,
+}
 
 pub fn create(
     owner_rights: Rights,
     signaler_rights: Rights,
-) -> Result<HandlePair, SystemCallError> {
+) -> Result<NotificationPair, SystemCallError> {
     let mut output = HandlePair::new(Handle::INVALID, Handle::INVALID);
-    // SAFETY: output 在 ecall 期间有效且可写。
-    unsafe { sys_notification_create(owner_rights, signaler_rights, &mut output)? };
-    Ok(output)
+    // SAFETY: 固定两项输出有效；成功时唯一关闭责任移交两个 typed owner。
+    unsafe { crate::call::sys_notification_create(owner_rights, signaler_rights, &mut output)? };
+    Ok(NotificationPair {
+        owner: NotificationOwner::from_minted(Capability::owned(output.owner)),
+        peer: NotificationSignaler::from_minted(Capability::owned(output.peer)),
+    })
 }
 
-pub fn signal(handle: Handle, bits: u64) -> Result<(), SystemCallError> {
-    // SAFETY: 参数均为值。
-    unsafe { sys_notification_signal(handle, bits) }
-}
-
-pub fn take(handle: Handle, mask: u64) -> Result<u64, SystemCallError> {
-    let mut output = 0;
-    // SAFETY: output 在 ecall 期间有效且可写。
-    unsafe { sys_notification_take(handle, mask, &mut output)? };
-    Ok(output)
-}
-
-/// 独立只读关闭观察权；派生与丢弃都不改变 Notification 业务寿命。
-pub fn observe(source: Handle) -> Result<super::capability::Capability, SystemCallError> {
-    let mut output = Handle::INVALID;
-    // SAFETY: 固定宽输出在调用期间有效；成功后交付新观察表项的唯一 owner。
-    unsafe {
-        crate::call::sys_notification_observe(source, &mut output)?;
+impl NotificationOwner {
+    pub fn take(&self, mask: u64) -> Result<u64, SystemCallError> {
+        let mut output = 0;
+        // SAFETY: output 同步调用期间有效，消费权限由内核检查。
+        unsafe { crate::call::sys_notification_take(self.as_handle(), mask, &mut output)? };
+        Ok(output)
     }
-    Ok(super::capability::Capability::owned(output))
+    pub fn mint_observer(&self, rights: Rights) -> Result<NotificationObserver, SystemCallError> {
+        let mut output = Handle::INVALID;
+        // SAFETY: 有效的单项输出；成功工厂保证角色和 WAIT，直接移交新 owner。
+        unsafe {
+            crate::call::sys_notification_mint_observer(self.as_handle(), rights, &mut output)?
+        };
+        Ok(NotificationObserver::from_minted(Capability::owned(output)))
+    }
+}
+
+impl NotificationSignaler {
+    pub fn signal(&self, bits: u64) -> Result<(), SystemCallError> {
+        // SAFETY: 参数为值，实际 SIGNAL 授权由内核检查。
+        unsafe { crate::call::sys_notification_signal(self.as_handle(), bits) }
+    }
 }

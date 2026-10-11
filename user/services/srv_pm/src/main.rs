@@ -34,7 +34,7 @@ use libkernel::{
     shared::{
         call::SystemCallError,
         message::MAILBOX_CAPACITY,
-        object::{Handle, ObjectSignals},
+        object::{Handle, ObjectSignals, Rights},
         time::Deadline,
     },
     sys_process_abort,
@@ -96,7 +96,7 @@ impl Task<PmWorld> for MailboxTask {
         &mut self,
         _id: u64,
         world: &mut PmWorld,
-        requests: &mut Requests<PmTask>,
+        requests: &mut Requests<'_, PmTask>,
         input: &mut Input<'_>,
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -172,7 +172,7 @@ impl Task<PmWorld> for MailboxTask {
             let owner = message.handles.take(0).expect("pm Invitation slot missing");
             match Invitation::from_capability(owner) {
                 Ok(invitation) => {
-                    if let Err(task) = requests.spawn(
+                    if let Err(task) = requests.spawn(libexecution::TaskSubmission::new(
                         PmTask::Stream(StreamTask {
                             invitation: Some(invitation),
                             producer: None,
@@ -183,7 +183,8 @@ impl Task<PmWorld> for MailboxTask {
                             stopping: false,
                         }),
                         2,
-                    ) {
+                        requests.task_funding().clone(),
+                    )) {
                         drop(task);
                         world.fail();
                         self.failed = true;
@@ -220,7 +221,20 @@ impl Task<PmWorld> for MailboxTask {
             };
             let done = message.handles.take(1).expect("pm completion slot missing");
             let spin = message.handles.take(2).expect("pm wake slot missing");
-            if let Err(task) = requests.spawn(
+            let (done, done_description) =
+                notification::NotificationSignaler::from_capability(done).map_err(|f| f.error)?;
+            let (spin, spin_description) =
+                notification::NotificationSignaler::from_capability(spin).map_err(|f| f.error)?;
+            if !done_description.rights.contains(Rights::SIGNAL)
+                || !spin_description.rights.contains(Rights::SIGNAL)
+            {
+                world.fail();
+                return Ok(Advance {
+                    work_done: 1,
+                    step: Step::Complete,
+                });
+            }
+            if let Err(task) = requests.spawn(libexecution::TaskSubmission::new(
                 PmTask::Flow(FlowTask {
                     target,
                     done: Some(done),
@@ -233,7 +247,8 @@ impl Task<PmWorld> for MailboxTask {
                     stopping: false,
                 }),
                 2,
-            ) {
+                requests.task_funding().clone(),
+            )) {
                 drop(task);
                 world.fail();
                 self.failed = true;
@@ -272,8 +287,8 @@ impl Task<PmWorld> for MailboxTask {
 
     fn refused(&mut self, world: &mut PmWorld, failure: RequestFailure<PmTask>) {
         match failure {
-            RequestFailure::Spawn { task, error } => {
-                drop(task);
+            RequestFailure::Spawn { submission, error } => {
+                drop(submission);
                 debug!("pm task spawn refused: {:?}", error);
                 self.failed = true;
             }
@@ -319,7 +334,7 @@ impl Task<PmWorld> for StreamTask {
         &mut self,
         _id: u64,
         world: &mut PmWorld,
-        requests: &mut Requests<PmTask>,
+        requests: &mut Requests<'_, PmTask>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -513,8 +528,8 @@ impl Task<PmWorld> for StreamTask {
 /// 流控任务：填满目标邮箱、确认后在 WRITABLE 上停驻，腾位唤醒补发末尾。
 struct FlowTask {
     target: MailboxSender,
-    done: Option<libkernel::ipc::capability::Capability>,
-    spin: Option<libkernel::ipc::capability::Capability>,
+    done: Option<notification::NotificationSignaler>,
+    spin: Option<notification::NotificationSignaler>,
     filled: usize,
     verified_full: bool,
     woke: bool,
@@ -540,7 +555,7 @@ impl Task<PmWorld> for FlowTask {
         &mut self,
         _id: u64,
         world: &mut PmWorld,
-        requests: &mut Requests<PmTask>,
+        requests: &mut Requests<'_, PmTask>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -596,14 +611,11 @@ impl Task<PmWorld> for FlowTask {
                 self.target.send(WRITABLE_WAKE_FILL, &[]),
                 Err(SystemCallError::MailboxFull)
             ));
-            notification::signal(
-                self.done
-                    .as_ref()
-                    .expect("flow completion owner missing")
-                    .as_handle(),
-                1,
-            )
-            .expect("wake confirm signal failed");
+            self.done
+                .as_ref()
+                .expect("flow completion owner missing")
+                .signal(1)
+                .expect("wake confirm signal failed");
             self.verified_full = true;
             self.source.install(
                 requests,
@@ -649,10 +661,11 @@ impl Task<PmWorld> for FlowTask {
                 debug!("writable wake passed");
                 // 流控完成后进入委托域收束：保持原脚本顺序，避免与
                 // init 装载域成员并发（域封口过早会拒绝后续 spawn）。
-                if let Err(task) = requests.spawn(
+                if let Err(task) = requests.spawn(libexecution::TaskSubmission::new(
                     PmTask::Domain(DomainTask::new(DEFAULT_SUPERVISION_POLICY)),
                     2,
-                ) {
+                    requests.task_funding().clone(),
+                )) {
                     drop(task);
                     world.fail();
                 }
@@ -664,14 +677,11 @@ impl Task<PmWorld> for FlowTask {
             Err(SystemCallError::MailboxFull) => {
                 // 醒来后再撞满箱即为虚假唤醒（唤醒必须由腾位引起）。
                 if self.woke {
-                    notification::signal(
-                        self.spin
-                            .as_ref()
-                            .expect("flow wake owner missing")
-                            .as_handle(),
-                        1,
-                    )
-                    .expect("spurious wake signal failed");
+                    self.spin
+                        .as_ref()
+                        .expect("flow wake owner missing")
+                        .signal(1)
+                        .expect("spurious wake signal failed");
                 }
                 self.woke = true;
 
@@ -693,8 +703,8 @@ impl Task<PmWorld> for FlowTask {
 
     fn refused(&mut self, world: &mut PmWorld, failure: RequestFailure<PmTask>) {
         match failure {
-            RequestFailure::Spawn { task, error } => {
-                drop(task);
+            RequestFailure::Spawn { submission, error } => {
+                drop(submission);
                 debug!("flow domain spawn refused: {:?}", error);
                 world.fail();
             }
@@ -735,7 +745,7 @@ impl Task<PmWorld> for DomainTask {
         &mut self,
         _id: u64,
         world: &mut PmWorld,
-        requests: &mut Requests<PmTask>,
+        requests: &mut Requests<'_, PmTask>,
         input: &mut Input<'_>,
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -811,7 +821,7 @@ impl Task<PmWorld> for PmTask {
         &mut self,
         id: u64,
         world: &mut PmWorld,
-        requests: &mut Requests<PmTask>,
+        requests: &mut Requests<'_, PmTask>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -907,7 +917,11 @@ fn main() {
         mailbox_registered: false,
         mailbox_stopped: false,
     };
-    if let Err(failure) = runtime.spawn(PmTask::Mailbox(MailboxTask::new()), 2) {
+    if let Err(failure) = runtime.spawn(libexecution::TaskSubmission::new(
+        PmTask::Mailbox(MailboxTask::new()),
+        2,
+        account.clone(),
+    )) {
         debug!("pm: mailbox task refused: {:?}", failure.error);
         unsafe { sys_process_abort() }
     }

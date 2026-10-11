@@ -1,7 +1,7 @@
 //! 稳定任务记录与公平 ready FIFO；任务额度在公开前准备。
 //! 来源登记、事件路由与推进驱动见 [`crate::runtime`]。
 
-use crate::{ExecutionResource, runtime::Task};
+use crate::{ExecutionResource, TaskSubmission, runtime::Task};
 use alloc::{boxed::Box, vec::Vec};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +19,7 @@ pub fn abandoned_tasks() -> usize {
 
 pub(crate) struct Slot<T> {
     pub(crate) task: T,
+    pub(crate) funding: AccountView<ExecutionResource>,
     pub(crate) sources: Vec<u64>,
     pub(crate) max_sources: usize,
     pub(crate) retiring_sources: usize,
@@ -85,7 +86,7 @@ pub(crate) enum FinalizingStep {
 #[derive(Debug)]
 pub struct InsertFailure<T> {
     pub error: SystemCallError,
-    pub task: T,
+    pub submission: TaskSubmission<T>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,21 +116,25 @@ impl<T> WorkQueue<T> {
 
     pub(crate) fn insert(
         &mut self,
-        task: T,
-        max_sources: usize,
-        account: &AccountView<ExecutionResource>,
+        submission: TaskSubmission<T>,
     ) -> Result<u64, InsertFailure<T>> {
+        let (task, max_sources, funding) = submission.into_parts();
         let prepare = (|| {
             if self.sealed {
                 return Err(SystemCallError::ObjectClosed);
             }
             let id = NEXT_TASK.allocate().ok_or(SystemCallError::ReachLimit)?;
-            let task_charge = account.acquire(ExecutionResource::Task, 1)?;
+            let task_charge = funding.acquire(ExecutionResource::Task, 1)?;
             Ok((id, task_charge))
         })();
         let (id, task_charge) = match prepare {
             Ok(prepared) => prepared,
-            Err(error) => return Err(InsertFailure { error, task }),
+            Err(error) => {
+                return Err(InsertFailure {
+                    error,
+                    submission: TaskSubmission::new(task, max_sources, funding),
+                });
+            }
         };
         let timers = match Box::try_new(TaskTimers {
             deadline: TimerNode::new(),
@@ -139,7 +144,7 @@ impl<T> WorkQueue<T> {
             Err(_) => {
                 return Err(InsertFailure {
                     error: SystemCallError::OutOfMemory,
-                    task,
+                    submission: TaskSubmission::new(task, max_sources, funding),
                 });
             }
         };
@@ -147,11 +152,12 @@ impl<T> WorkQueue<T> {
         if sources.try_reserve_exact(max_sources).is_err() {
             return Err(InsertFailure {
                 error: SystemCallError::OutOfMemory,
-                task,
+                submission: TaskSubmission::new(task, max_sources, funding),
             });
         }
         let slot = Slot {
             task,
+            funding,
             sources,
             max_sources,
             retiring_sources: 0,
@@ -183,7 +189,7 @@ impl<T> WorkQueue<T> {
                 };
                 return Err(InsertFailure {
                     error,
-                    task: slot.task,
+                    submission: TaskSubmission::new(slot.task, slot.max_sources, slot.funding),
                 });
             }
         };

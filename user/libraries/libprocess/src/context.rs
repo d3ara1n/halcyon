@@ -251,12 +251,15 @@ fn adoptable_kind(kind: u32) -> Option<ObjectKind> {
         value if value == ObjectKind::NotificationSignaler as u32 => {
             ObjectKind::NotificationSignaler
         }
+        value if value == ObjectKind::NotificationObserver as u32 => {
+            ObjectKind::NotificationObserver
+        }
         value if value == ObjectKind::TunnelInvitation as u32 => ObjectKind::TunnelInvitation,
         value if value == ObjectKind::SystemReset as u32 => ObjectKind::SystemReset,
-        value if value == ObjectKind::Lifetime as u32 => ObjectKind::Lifetime,
+        value if value == ObjectKind::LifetimeObserver as u32 => ObjectKind::LifetimeObserver,
         value if value == ObjectKind::Delivery as u32 => ObjectKind::Delivery,
         value if value == ObjectKind::WaitSet as u32 => ObjectKind::WaitSet,
-        value if value == ObjectKind::ReplyObservation as u32 => ObjectKind::ReplyObservation,
+        value if value == ObjectKind::ReplyObserver as u32 => ObjectKind::ReplyObserver,
         _ => return None,
     })
 }

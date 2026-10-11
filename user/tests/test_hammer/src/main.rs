@@ -75,20 +75,25 @@ fn take_thread_result<T>(outcome: ThreadOutcome<T, libthread::NoEnvironment>) ->
 }
 
 /// 等发令枪 READABLE（电平不丢令）并清位转脉冲，使多轮复用同一把枪。
-fn await_gun(gun: Handle) {
+fn await_gun(gun: &notification::NotificationOwner) {
     let _ = wait_until(
-        gun,
+        gun.as_handle(),
         ObjectSignals::READABLE,
         libkernel::time::Deadline::INFINITE,
     );
-    let _ = notification::take(gun, u64::MAX);
+    let _ = gun.take(u64::MAX);
 }
 
 fn hammer_mode(startup: &mut libruntime::startup::InitialGrants) {
     let (Some(cmd_box), Some(report_box), Some(gun)) = (
         startup.take(HAMMER_CMD).map(Capability::into_raw),
         startup.take(HAMMER_REPORT).map(Capability::into_raw),
-        startup.take(HAMMER_GUN).map(Capability::into_raw),
+        startup.take(HAMMER_GUN).map(|cap| {
+            notification::NotificationOwner::from_capability(cap)
+                .map_err(|f| f.error)
+                .expect("hammer gun role invalid")
+                .0
+        }),
     ) else {
         debug!("hammer: missing grants");
         return;
@@ -122,7 +127,7 @@ fn hammer_mode(startup: &mut libruntime::startup::InitialGrants) {
             };
             return;
         }
-        await_gun(gun);
+        await_gun(&gun);
         // 时序变体：aux > 0 时醒后先延迟再打，把窗口让给对侧先行
         // （线协议见 race::Cmd::aux）。延迟失败不判定——窗口密度本就是
         // 尽力而为，断言全在 init。
@@ -318,7 +323,12 @@ fn enumerate(control: Handle) -> (Report, alloc::vec::Vec<u64>) {
 }
 
 fn target_mode(startup: &mut libruntime::startup::InitialGrants, words: &[u64]) {
-    let Some(gun) = startup.take(TARGET_GUN).map(Capability::into_raw) else {
+    let Some(gun) = startup.take(TARGET_GUN).map(|cap| {
+        notification::NotificationOwner::from_capability(cap)
+            .map_err(|f| f.error)
+            .expect("target gun role invalid")
+            .0
+    }) else {
         debug!("hammer target: missing gun");
         return;
     };
@@ -342,7 +352,7 @@ fn target_mode(startup: &mut libruntime::startup::InitialGrants, words: &[u64]) 
                 .expect("Tunnel mapped bytes are missing") as usize,
         );
     }
-    await_gun(gun);
+    await_gun(&gun);
     match role {
         TARGET_SUICIDE => {
             debug!("hammer target: terminating");
@@ -378,7 +388,7 @@ const THREAD_TUNNEL_VA: usize = 0x2000_0000;
 const OLD_TRANSLATION_VALUE: u64 = 0x6f6c_642d_7472_616e;
 const NEW_TRANSLATION_VALUE: u64 = 0x6e65_772d_7472_616e;
 
-fn threaded_memory_churn(gun: Handle) -> ! {
+fn threaded_memory_churn(gun: notification::NotificationOwner) -> ! {
     let _worker = thread::Builder::new()
         .stack_size(128 * 1024)
         .spawn(|| memory_churn())
@@ -388,7 +398,7 @@ fn threaded_memory_churn(gun: Handle) -> ! {
         .spawn(|| large_memory_churn())
         .expect("memory churn blocker spawn failed");
     debug!("hammer target: threaded public memory churn started");
-    await_gun(gun);
+    await_gun(&gun);
     loop {
         thread::yield_now().expect("memory churn coordinator yield failed");
     }
@@ -414,7 +424,7 @@ const TUNNEL_RESPONSE_MASK: u64 = 0xa5a5_5a5a_f0f0_0f0f;
 
 fn tunnel_exit_target(
     startup: &mut libruntime::startup::InitialGrants,
-    gun: Handle,
+    gun: notification::NotificationOwner,
     bytes: usize,
 ) -> ! {
     let invitation = startup
@@ -445,7 +455,7 @@ fn tunnel_exit_target(
     }
     core::mem::forget(mapping); // 明确让进程回收接管 VM/View 和 Endpoint，而非用户 Drop。
     let _ = wait_until(
-        gun,
+        gun.as_handle(),
         ObjectSignals::READABLE,
         libkernel::time::Deadline::INFINITE,
     );
@@ -508,13 +518,13 @@ extern "C" fn parked_thread_entry(_arg1: usize, _arg2: usize) -> ! {
     }
 }
 
-fn thread_spawn_race(gun: Handle) -> ! {
+fn thread_spawn_race(gun: notification::NotificationOwner) -> ! {
     let stack = raw_stack(PROCESS_PAGE_SIZE);
     let stack_pointer = stack
         .usable()
         .expect("raw spawn stack has no usable page")
         .end;
-    await_gun(gun);
+    await_gun(&gun);
     if let Ok(result) = raw_spawn(parked_thread_entry, stack_pointer, 0, 0) {
         unsafe { close(result.control) }.expect("spawn-race ThreadControl close failed");
     }
@@ -528,11 +538,16 @@ extern "C" fn last_thread_exit_entry(gun: usize, _token: usize) -> ! {
     // 让创建者主线程先完成 ThreadExit；随后再消费电平枪进入末线程竞速。
     // SAFETY: 值参数；sleep 后仍由 Notification 电平保存发令。
     unsafe { sys_sleep(20).expect("last secondary setup sleep failed") };
-    await_gun(Handle::from_raw(gun as u64));
+    // SAFETY: 原始出生参数独占移交枪的关闭责任；创建者已转出 typed owner。
+    let cap = unsafe { Capability::from_raw(Handle::from_raw(gun as u64)) };
+    let (gun, _) = notification::NotificationOwner::from_capability(cap)
+        .map_err(|f| f.error)
+        .expect("secondary gun role invalid");
+    await_gun(&gun);
     unsafe { libkernel::sys_thread_exit() }
 }
 
-fn last_thread_exit_target(gun: Handle, token: u64) -> ! {
+fn last_thread_exit_target(gun: notification::NotificationOwner, token: u64) -> ! {
     let stack = raw_stack(PROCESS_PAGE_SIZE);
     let stack_pointer = stack
         .usable()
@@ -541,7 +556,7 @@ fn last_thread_exit_target(gun: Handle, token: u64) -> ! {
     let result = raw_spawn(
         last_thread_exit_entry,
         stack_pointer,
-        gun.raw() as usize,
+        gun.into_raw().raw() as usize,
         token as usize,
     )
     .expect("last-thread raw spawn failed");

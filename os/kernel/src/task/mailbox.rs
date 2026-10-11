@@ -6,11 +6,11 @@
 //! - [`MailboxSender`]：可复制发送授权，绑定不可变 badge；按 core 聚合计入 no-senders。
 //! - [`MailboxOnceSender`]：每次派生铸造新对象，不可复制；move 消费；armed 后最后释放
 //!   仍 Pending 即在 core 锁内转 Abandoned。
-//! - [`ReplyObservation`]：OnceSender 出生配对的观察壳，DONE=Sent、PEER_CLOSED=Abandoned，
+//! - [`ReplyObserver`]：OnceSender 出生配对的观察壳，DONE=Sent、PEER_CLOSED=Abandoned，
 //!   终态互斥不可变。OnceSender 单向强持它（只保活存储），它不持 OnceSender/core。
 //!
 //! 表锁只接管/返还 authority；业务在表锁外。MAILBOX 仲裁后锁外发布
-//! ReplyObservation/Lifetime 终态与门铃，来源扫描不反向取业务锁。
+//! ReplyObserver/Lifetime 终态与门铃，来源扫描不反向取业务锁。
 
 use alloc::sync::Arc;
 use core::{
@@ -577,7 +577,7 @@ pub struct MailboxOnceSender {
     header: ObjectHeader,
     badge: MailboxBadge,
     core: Arc<MailboxCore>,
-    observation: Arc<ReplyObservation>,
+    observation: Arc<ReplyObserver>,
     state: AtomicU8,
     parent_authority: LifetimeOwner,
     _metadata: super::resources::MetadataCharge,
@@ -657,7 +657,7 @@ enum ReplyResult {
 
 /// OnceSender 结果的观察壳：只存 OnceSender 数值身份、结果与等待源。
 /// 只可 READ/WAIT（及 DUPLICATE/TRANSIT/GRANT），无设置结果或取消发送的权限。
-pub struct ReplyObservation {
+pub struct ReplyObserver {
     holders: capability::Holders,
     header: ObjectHeader,
     once_id: AtomicU64Cell,
@@ -669,7 +669,7 @@ pub struct ReplyObservation {
 /// 出生后写入一次的 OnceSender 身份（构造顺序：观察壳先于 OnceSender）。
 struct AtomicU64Cell(core::sync::atomic::AtomicU64);
 
-impl ReplyObservation {
+impl ReplyObserver {
     fn new(pool: Arc<MemoryPool>) -> Result<Arc<Self>, SystemCallError> {
         let metadata = super::resources::MetadataCharge::arc::<Self>(&pool)?;
         Arc::try_new(Self {
@@ -695,7 +695,7 @@ impl ReplyObservation {
     }
 }
 
-impl KernelObject for ReplyObservation {
+impl KernelObject for ReplyObserver {
     fn holders(&self) -> &capability::Holders {
         &self.holders
     }
@@ -703,7 +703,7 @@ impl KernelObject for ReplyObservation {
         &self.header
     }
     fn kind(&self) -> ObjectKind {
-        ObjectKind::ReplyObservation
+        ObjectKind::ReplyObserver
     }
     fn related_id(&self) -> u64 {
         self.once_id.0.load(Ordering::Relaxed)
@@ -828,7 +828,7 @@ pub fn mint_sender(
     .map(|_| ())
 }
 
-/// 从具 DUPLICATE 的 MailboxSender 派生新的 MailboxOnceSender 与配对 ReplyObservation。
+/// 从具 DUPLICATE 的 MailboxSender 派生新的 MailboxOnceSender 与配对 ReplyObserver。
 /// 输出 HandlePair{first: once, second: observation}。二者与 armed 按一次发布协议提交。
 pub fn make_send_once(
     thread: &Thread,
@@ -858,7 +858,7 @@ pub fn make_send_once(
         .ok_or(SystemCallError::WrongObjectType)?;
     let core = sender.core.clone();
     let badge = sender.badge;
-    let observation = ReplyObservation::new(thread.process.funding_pool())?;
+    let observation = ReplyObserver::new(thread.process.funding_pool())?;
     let metadata =
         super::resources::MetadataCharge::arc::<MailboxOnceSender>(&thread.process.funding_pool())?;
     let once = Arc::try_new(MailboxOnceSender {

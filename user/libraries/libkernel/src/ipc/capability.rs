@@ -11,6 +11,81 @@ pub struct Capability {
     handle: Option<Handle>,
 }
 
+/// 角色转换失败时完整保留唯一关闭责任。
+#[derive(Debug)]
+pub struct RoleAdoptFailure {
+    pub owner: Capability,
+    pub error: SystemCallError,
+}
+
+// 只生成各领域的静态角色 owner，不引入可擦除领域的公共 Observer 类型。
+macro_rules! capability_role {
+    ($name:ident, $kind:ident, $required:expr) => {
+        #[derive(Debug)]
+        pub struct $name {
+            capability: $crate::ipc::capability::Capability,
+        }
+        impl $name {
+            pub fn from_capability(
+                owner: $crate::ipc::capability::Capability,
+            ) -> Result<
+                (Self, erhino_shared::object::HandleDescription),
+                $crate::ipc::capability::RoleAdoptFailure,
+            > {
+                use erhino_shared::{call::SystemCallError, object::ObjectKind};
+                let checked = owner.description().and_then(|description| {
+                    if description.kind != ObjectKind::$kind as u32 {
+                        return Err(SystemCallError::WrongObjectType);
+                    }
+                    if !description.rights.contains($required) {
+                        return Err(SystemCallError::RightsDenied);
+                    }
+                    Ok(description)
+                });
+                match checked {
+                    Ok(description) => Ok((Self { capability: owner }, description)),
+                    Err(error) => Err($crate::ipc::capability::RoleAdoptFailure { owner, error }),
+                }
+            }
+            pub(crate) fn from_minted(capability: $crate::ipc::capability::Capability) -> Self {
+                Self { capability }
+            }
+            pub fn as_handle(&self) -> erhino_shared::object::Handle {
+                self.capability.as_handle()
+            }
+            pub fn description(
+                &self,
+            ) -> Result<
+                erhino_shared::object::HandleDescription,
+                erhino_shared::call::SystemCallError,
+            > {
+                self.capability.description()
+            }
+            pub fn into_capability(self) -> $crate::ipc::capability::Capability {
+                self.capability
+            }
+            pub fn into_raw(self) -> erhino_shared::object::Handle {
+                self.capability.into_raw()
+            }
+            pub fn duplicate(
+                &self,
+                rights: erhino_shared::object::Rights,
+            ) -> Result<Self, erhino_shared::call::SystemCallError> {
+                if !rights.contains($required) {
+                    return Err(erhino_shared::call::SystemCallError::RightsDenied);
+                }
+                self.capability.duplicate(rights).map(Self::from_minted)
+            }
+            pub fn close(self) -> Result<(), (Self, erhino_shared::call::SystemCallError)> {
+                self.capability
+                    .close()
+                    .map_err(|(capability, error)| (Self { capability }, error))
+            }
+        }
+    };
+}
+pub(crate) use capability_role;
+
 impl Capability {
     /// # Safety
     /// 调用者须独占合法 entry 的关闭责任。普通 View 另持 MapToken，Close 只释放

@@ -6,10 +6,14 @@ pub enum ServiceResource {
     Registration,
     Bytes,
     WaitSource,
+    Access,
+    Request,
+    Outbox,
+    Watch,
 }
 
 impl Taxonomy for ServiceResource {
-    const COUNT: usize = 4;
+    const COUNT: usize = 8;
 
     fn slot(self) -> usize {
         match self {
@@ -17,6 +21,10 @@ impl Taxonomy for ServiceResource {
             Self::Registration => 1,
             Self::Bytes => 2,
             Self::WaitSource => 3,
+            Self::Access => 4,
+            Self::Request => 5,
+            Self::Outbox => 6,
+            Self::Watch => 7,
         }
     }
 }

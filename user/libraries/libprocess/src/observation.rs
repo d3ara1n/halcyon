@@ -124,7 +124,7 @@ impl ObservationSlot {
     pub fn begin<T>(
         &mut self,
         request: Observation,
-        requests: &mut Requests<T>,
+        requests: &mut Requests<'_, T>,
     ) -> Result<(), SystemCallError> {
         if self.request.is_some() {
             return if self.request == Some(request) {
@@ -187,7 +187,7 @@ impl ObservationSlot {
     pub fn poll<T>(
         &mut self,
         input: &mut Input<'_>,
-        requests: &mut Requests<T>,
+        requests: &mut Requests<'_, T>,
         now: u64,
         probe: impl FnOnce(Observation) -> Result<ObservationResult, SystemCallError>,
     ) -> Result<Option<(Observation, ObservationResult)>, SystemCallError> {

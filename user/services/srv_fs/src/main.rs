@@ -1,6 +1,7 @@
-//! FAL2 内存 provider 的正式进程装配。
+//! 内存文件 provider 的进程装配。
 
 #![no_std]
+#![feature(allocator_api)]
 
 extern crate libruntime;
 
@@ -39,7 +40,14 @@ fn startup_sender(
 
 fn main() {
     let startup = libruntime::startup::take().expect("provider startup context is missing");
-    let (_process, _payload, mut grants) = startup.into_parts();
+    let (process, payload, mut grants) = startup.into_parts();
+    let instance = match payload.as_bytes() {
+        b"" => server::Instance::Primary,
+        b"secondary" => server::Instance::Secondary {
+            parent_pid: process.parent_pid(),
+        },
+        _ => panic!("provider instance role invalid"),
+    };
     let bootstrap = startup_sender(&mut grants, 0, "provider bootstrap sender is missing");
     let release = startup_handle(&mut grants, 1, "provider release owner is missing");
     let route = startup_handle(&mut grants, 2, "provider route mailbox owner is missing");
@@ -47,5 +55,13 @@ fn main() {
     let pool = grants.take(4).expect("provider funding Pool is missing");
     let mailbox = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
         .expect("provider mailbox creation failed");
-    server::run(mailbox, bootstrap, route, release, registration, pool);
+    server::run(
+        mailbox,
+        bootstrap,
+        route,
+        release,
+        registration,
+        pool,
+        instance,
+    );
 }

@@ -9,7 +9,7 @@
 ### 领域名称
 
 - 单个普通领域词使用完整英文单词：`libkernel`、`libruntime`、`libprocess`、`libthread`、`libservice`、`libdriver`、`libdevice`、`libbudget`、`libexecution`。
-- 多词领域使用业界公认且在本项目中含义唯一的缩写：Remote Procedure Call → `librpc`，File System → `libfs`，File Abstraction Layer → `libfal`。
+- 多词领域使用业界公认且在本项目中含义唯一的缩写：Remote Procedure Call → `librpc`，File System → `libfs`，Object Abstraction Layer → `liboal`。OAL 拥有通用目录发现、开放面貌及入口接续的表达；领域操作由各领域库拥有。原 File Abstraction Layer 已删除，迁移与验证由[改造计划](../plans/todo-2026-10-07-fal-service-redesign.md)承接。
 - 正式专名保持正式拼写：Runnel → `librunnel`。Rust 程序环境由 `libkernel`、`libthread` 和 `libruntime` 分层拥有，分别位于 `user/libraries/`；不保留旧名 alias 或 facade。
 - 用户程序使用 `#![no_std]`，提供模板 `fn main()` 或 `fn main() -> Result<(), E: Debug>`；`libruntime` 通过 `start` lang item 接收 rustc 生成的入口 shim。应用不实现或调用 runtime 私有桥接符号。
 - 单词过长时，只能使用已有、通行且不会与其他领域冲突的缩写；不得仅为省字符临时截短。缩写一旦成为公开组件名，应在本篇或相应方向文档中记录其展开与领域含义。

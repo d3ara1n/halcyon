@@ -111,7 +111,7 @@ pub struct Request {
     pub(crate) txid: u64,
     protocol: u64,
     packet: Option<Packet>,
-    observation: Option<Capability>,
+    observation: Option<libkernel::ipc::message::ReplyObserver>,
 }
 
 impl Request {
@@ -185,10 +185,10 @@ impl Request {
             .and_then(Packet::pop_front)
             .map(|(capability, _)| capability)
     }
-    pub(crate) fn observation(&self) -> Option<&Capability> {
+    pub(crate) fn observation(&self) -> Option<&libkernel::ipc::message::ReplyObserver> {
         self.observation.as_ref()
     }
-    pub(crate) fn take_observation(&mut self) -> Capability {
+    pub(crate) fn take_observation(&mut self) -> libkernel::ipc::message::ReplyObserver {
         self.observation
             .take()
             .expect("prepared request lost reply observer")
@@ -323,6 +323,10 @@ impl RequestContext {
     /// 交付责任保持到请求处理与回复责任终结；由调用方决定何时移交或关闭。
     pub fn delivery(&self) -> &Delivery {
         &self.delivery
+    }
+    /// 已把操作移交给独立责任 owner 时，可结束入口 use 并继续保管回复权。
+    pub fn finish_delivery(&mut self) -> Result<(), SystemCallError> {
+        self.delivery.finish()
     }
     fn take_reply(&mut self) -> Option<SendOnce> {
         self.reply.take()

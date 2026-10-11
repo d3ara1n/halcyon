@@ -8,10 +8,12 @@
 
 Runtime/WorkQueue/Assembly 的来源、Gate、公平性与退休机制由 [framework](framework.md#libexecution-的执行与扁平装配) 唯一描述；本篇拥有实际运行体装配、付款视图和业务收束。运行体只借用 Registration，集合接收、停驻和关闭由 Assembly 持有。
 
+RPC 的固定/每调用来源付款和 Outbox 绑定由[通用 RPC 实现](rpc.md#当前嵌入与边界)拥有。init 的 Job/Batch/Read duty 在实际提交出生前准备并持有 execution view；初始化失败仍由原 duty 承接 owner，之后重试复用原 view，客户端 duty 在 Dispatcher 构造前即冻结共享资金。
+
 `libbudget` 在 metadata_admission::Permit/SponsoredPermit 上建立 Budget/Account、带身份 BudgetSlot、AccountView<K> 与 Charge。Account 是付款身份，视图只绑定分类；跨 Budget 的槽被拒绝，克隆不重置额度。零单位 Charge 仍持账户，shrink_to 在实际占用缩小时立即返还本地与 sponsor/global 两层额度。
 用户树显式选择libbudget::AllocatorBacked（C=()）：本层不新增逐分配软额度，使用可执行程序选择的allocator，既有领域Charge仍在业务记录中，混合布局计算用当前节点allocation_bytes。它不新开户、不替用户选择运行时、不证明Kernel metadata已付款；Task、Source InputBytes、FAL/Service费用与退款owner保持各自业务合同，逐heap字节保留/Weak尾部不由此声称覆盖。Runtime Source InputBytes包含实际AVL节点布局与独立timer值布局。
 
-Runtime 消费 AccountView<ExecutionResource>，不借 FAL 分类或裸槽位。srv_fs 的 FAL 与执行视图共享同一个 Account；grant 派生保留同一付款身份。FAL Take 用 shrink_to 把已移交属性的 Bytes charge 缩到空值实际占用。
+Runtime 仅从显式 TaskSubmission 取得任务付款，构造 view 只支付固定基础设施，不借领域分类或裸槽位。srv_fs 的可信发行接口同时借用领域与 execution 两份 view，校验 account_id 相同并在角色、控制及 Request 中冻结；当前 boot 仍配置一个 Account，多账户实际装配由所属工作记录承接。grant 派生与控制终态壳保留同一配对，FAL Take 用 shrink_to 把已移交属性的 Bytes charge 缩到空值实际占用。
 登记和实际注销分别经 `Task::registered`、`Task::unregistered` 交付回执。任务不必等第一条来源事件才能取得 SourceId，因而首次等待超时也能撤销观察；机器在注销回执后才兑现被观察 owner 的关闭。
 
 ## 组合等待与失败隔离
@@ -24,9 +26,9 @@ Runtime.close 在任务、来源或 Gate 未清空时返还原运行体；Assemb
 
 ## 资源退休消费者与复用边界
 
-执行器不提供任意资源 Drop 的必成提交入口；Runtime.spawn 失败返还任务。Pump 动态准备 Assembly 与 Runtime，失败 carrier 持同一个真实集合的 Raw/Ready 所有权枚举、任务与缓冲快照；先退休任务和来源，再关接收 owner。源/目标各 DATA 与终态来源，加可选取消，共五项，由实际类型大小推导 InputBytes，不另建接收缓冲。
+执行器不提供任意资源 Drop 的必成提交入口；Runtime.spawn 和 Requests.spawn 失败返还完整 task/max_sources/funding 提交物。原任务之外仍存活的领域 payload 继续由其领域 Charge owner 持有，不随 Slot 退休提前退款。
 
-FAL 是正式退休消费者：`libfal/store.rs` 的 NodeRef Drop 在最后 pin/link 消失时，把已有 Lease 链入 RetireQueue 并调用 `libexecution::wake::Wake`，发布不新分配；payload 一直由 NodeStore 记录持有。`retire_step` 取出 payload 推进一步，无论返回成功或错误先放回记录，完成后才删除并释放计费。`libfal/provider.rs::Retirement` 已接上持久 Notification source、take、backend 预算清理、停止后的空表检查与注销回执。完整节点语义归 [FAL 实现](fal.md)。
+文件 backing 是正式退休消费者：`libfs/store.rs` 的 NodeRef Drop 在最后 pin/link 消失时，把已有 Lease 链入 RetireQueue 并调用 `libexecution::wake::Wake`，发布不新分配；payload 一直由 NodeStore 记录持有。`retire_step` 取出 payload 推进一步，无论返回成功或错误先放回记录，完成后才删除并释放计费。`srv_fs/server/lifecycle.rs::Retire` 持 typed NotificationOwner、持久来源登记与实际注销回执，以 backing 真实待退休项判断立即可推进，不以存活根尚未清空表示 runnable；停止后 Empty 保持推进至来源注销。NotificationWake 持 typed Signaler，未知 Capability 经一次角色转换及返回描述的 SIGNAL 校验采用。完整节点与请求责任归 [文件实现](fs.md)。
 
 这条路径使用 Rc/Cell/RefCell，属于 provider 单线程节点/链接生命周期；不是跨 OS 线程的任意 cleanup 队列。非空 NodeStore Drop 记录 abandoned 并保留表，WorkQueue 非空 Drop 记录 abandoned 后销毁任务；这些不是运行体被丢弃后仍有推进者的证明。NotificationWake 把 ObjectClosed 当可结束发布处理，也不能单独证明该责任另有接收者。
 

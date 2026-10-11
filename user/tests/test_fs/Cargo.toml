@@ -1,0 +1,17 @@
+[package]
+name = "test_fs"
+authors = ["Dearain (d3ara1n@outlook.com)"]
+version = "0.1.0"
+edition = "2024"
+description = "File system acceptance consumer"
+
+[dependencies]
+srv_fs = { path = "../../services/srv_fs" }
+libkernel = { path = "../../libraries/libkernel" }
+liboal = { path = "../../libraries/liboal" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libservice = { path = "../../libraries/libservice" }
+libfs = { path = "../../libraries/libfs" }
+librpc = { path = "../../libraries/librpc" }
+librunnel = { path = "../../libraries/librunnel" }
+libruntime = { path = "../../libraries/libruntime" }

@@ -1,5 +1,6 @@
 //! Mailbox 控制面；正式运输通过 Packet，原始 move 仅在显式 unsafe 边界使用。
 
+use super::capability::capability_role;
 use super::capability::{Capability, HandleSet};
 use crate::call::{
     sys_discard, sys_mailbox_create, sys_mailbox_make_send_once, sys_mailbox_mint_sender, sys_peek,
@@ -23,6 +24,16 @@ pub struct Delivery {
 }
 
 impl Delivery {
+    /// 领域已接管准入操作后结束运输 use；失败仍由本 owner 保管并可重试。
+    pub fn finish(&mut self) -> Result<(), SystemCallError> {
+        let Some(handle) = self.handle else {
+            return Ok(());
+        };
+        // SAFETY: 此 Delivery 独占表项；仅在 Close 成功后清空 owner。
+        unsafe { super::object::close(handle) }?;
+        self.handle = None;
+        Ok(())
+    }
     pub fn into_capability(mut self) -> Capability {
         Capability::owned(self.handle.take().expect("Delivery already consumed"))
     }
@@ -282,8 +293,11 @@ impl SendOnce {
 
 pub struct MintedSender {
     pub sender: MailboxSender,
-    pub lifetime: Capability,
+    pub lifetime: LifetimeObserver,
 }
+
+capability_role!(LifetimeObserver, LifetimeObserver, Rights::WAIT);
+capability_role!(ReplyObserver, ReplyObserver, Rights::WAIT);
 
 impl Mailbox {
     /// 将 StartupBlock 或消息转入的唯一 Mailbox owner 收编为 typed owner。
@@ -326,7 +340,7 @@ impl Mailbox {
         let minted = mint_sender(self.as_handle(), badge, rights)?;
         Ok(MintedSender {
             sender: MailboxSender::from_minted(Capability::owned(minted.sender)),
-            lifetime: Capability::owned(minted.lifetime),
+            lifetime: LifetimeObserver::from_minted(Capability::owned(minted.lifetime)),
         })
     }
 
@@ -488,14 +502,14 @@ pub fn make_send_once(source: Handle, rights: Rights) -> Result<HandlePair, Syst
 #[derive(Debug)]
 pub struct ReplyPermit {
     pub reply: SendOnce,
-    pub observation: Capability,
+    pub observation: ReplyObserver,
 }
 
 pub fn send_once(source: &MailboxSender, rights: Rights) -> Result<ReplyPermit, SystemCallError> {
     let pair = make_send_once(source.as_handle(), rights)?;
     Ok(ReplyPermit {
         reply: SendOnce::derived(Capability::owned(pair.owner)),
-        observation: Capability::owned(pair.peer),
+        observation: ReplyObserver::from_minted(Capability::owned(pair.peer)),
     })
 }
 

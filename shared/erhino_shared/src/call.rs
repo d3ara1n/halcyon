@@ -167,7 +167,7 @@ pub enum SystemCall {
     /// 原子取走 Notification 待决位。
     NotificationTake = 0x35,
     /// 从 Notification Owner/Signaler 派生只观察 Owner 关闭的能力。
-    NotificationObserve = 0x3d,
+    NotificationMintObserver = 0x3d,
     /// 无 capability 的公共单调时钟快照。
     MonotonicNow = 0x36,
     /// 查询本进程 Handle 的对象、role、rights 和关联身份。

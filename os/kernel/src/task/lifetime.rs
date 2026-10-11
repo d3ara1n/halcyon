@@ -196,7 +196,7 @@ impl KernelObject for Lifetime {
         &self.header
     }
     fn kind(&self) -> ObjectKind {
-        ObjectKind::Lifetime
+        ObjectKind::LifetimeObserver
     }
     fn related_id(&self) -> u64 {
         self.observed

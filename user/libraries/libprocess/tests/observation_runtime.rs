@@ -174,8 +174,10 @@ fn runtime(
 ) -> (
     Runtime<SuperviseTask<Environment>, Environment>,
     Assembly<Environment>,
+    libbudget::AccountView<ExecutionResource>,
 ) {
-    let bytes = Runtime::<SuperviseTask<Environment>, Environment>::input_budget(1).unwrap()
+    let bytes = Runtime::<SuperviseTask<Environment>, Environment>::fixed_input_budget(1).unwrap()
+        + Runtime::<SuperviseTask<Environment>, Environment>::source_input_budget(1).unwrap()
         + Assembly::<Environment>::input_budget().unwrap();
     let budget = Budget::new(&[1, bytes], 1).unwrap();
     let account = budget.account(&[1, bytes]).unwrap();
@@ -186,7 +188,7 @@ fn runtime(
         .map_err(|(_, error)| error)
         .unwrap();
     let runtime = Runtime::new(assembly.bind().unwrap(), 1, 1, &account).unwrap();
-    (runtime, assembly)
+    (runtime, assembly, account)
 }
 fn task(env: &Environment) -> SuperviseTask<Environment> {
     let policy = libprocess::SupervisionPolicy {
@@ -207,9 +209,16 @@ fn observation_retirement_precedes_query_and_close_failure_resumes_original_phas
         close_busy: 1,
         ..State::default()
     })));
-    let (mut rt, mut assembly) = runtime(&env);
+    let (mut rt, mut assembly, account) = runtime(&env);
     let mut world = World::default();
-    assert!(rt.spawn(task(&env), 1).is_ok());
+    assert!(
+        rt.spawn(libexecution::TaskSubmission::new(
+            task(&env),
+            1,
+            account.clone()
+        ))
+        .is_ok()
+    );
     assembly.run(&mut rt, &mut world, 1).unwrap();
     assert!(rt.close().is_ok());
     assert!(assembly.close().is_ok());
@@ -217,10 +226,14 @@ fn observation_retirement_precedes_query_and_close_failure_resumes_original_phas
     assert_eq!(failure.stage, SupervisionStage::Close);
     assert_eq!(env.0.borrow().queries, 1);
     assert!(env.0.borrow().wait_calls >= 2);
-    let (mut rt, mut assembly) = runtime(&env);
+    let (mut rt, mut assembly, account) = runtime(&env);
     assert!(
-        rt.spawn(SuperviseTask::from_collector(failure.collector), 1)
-            .is_ok()
+        rt.spawn(libexecution::TaskSubmission::new(
+            SuperviseTask::from_collector(failure.collector),
+            1,
+            account.clone()
+        ))
+        .is_ok()
     );
     assembly.run(&mut rt, &mut world, 1).unwrap();
     assert!(world.results.pop().unwrap().outcome.is_ok());
@@ -240,9 +253,16 @@ fn timeout_and_registration_error_return_owned_waiting_machine_without_query() {
             register_error,
             ..State::default()
         })));
-        let (mut rt, mut assembly) = runtime(&env);
+        let (mut rt, mut assembly, account) = runtime(&env);
         let mut world = World::default();
-        assert!(rt.spawn(task(&env), 1).is_ok());
+        assert!(
+            rt.spawn(libexecution::TaskSubmission::new(
+                task(&env),
+                1,
+                account.clone()
+            ))
+            .is_ok()
+        );
         assembly.run(&mut rt, &mut world, 1).unwrap();
         let failure = world.results.pop().unwrap().outcome.err().unwrap();
         assert_eq!(failure.collector.pid(), 7);
@@ -263,9 +283,16 @@ fn repeated_query_busy_consumes_timeout_and_waits_for_each_retry() {
         query_busy: 2,
         ..State::default()
     })));
-    let (mut rt, mut assembly) = runtime(&env);
+    let (mut rt, mut assembly, account) = runtime(&env);
     let mut world = World::default();
-    assert!(rt.spawn(task(&env), 1).is_ok());
+    assert!(
+        rt.spawn(libexecution::TaskSubmission::new(
+            task(&env),
+            1,
+            account.clone()
+        ))
+        .is_ok()
+    );
     assembly.run(&mut rt, &mut world, 1).unwrap();
     assert!(world.results.pop().unwrap().outcome.is_ok());
     assert_eq!(env.0.borrow().queries, 3);
@@ -282,9 +309,16 @@ fn real_ready_wins_at_deadline_without_a_delivered_hint_and_after_late_cleanup()
         remove_busy: 1,
         ..State::default()
     })));
-    let (mut rt, mut assembly) = runtime(&env);
+    let (mut rt, mut assembly, account) = runtime(&env);
     let mut world = World::default();
-    assert!(rt.spawn(task(&env), 1).is_ok());
+    assert!(
+        rt.spawn(libexecution::TaskSubmission::new(
+            task(&env),
+            1,
+            account.clone()
+        ))
+        .is_ok()
+    );
     assembly.run(&mut rt, &mut world, 1).unwrap();
     assert!(world.results.pop().unwrap().outcome.is_ok());
     assert!(

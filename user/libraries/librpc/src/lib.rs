@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod bytes;
 mod outbound;
 
 /// 前缀字节数。
@@ -149,6 +150,8 @@ pub mod dispatcher;
 pub mod exchange;
 #[cfg(target_arch = "riscv64")]
 pub mod outbox;
+#[cfg(target_arch = "riscv64")]
+pub mod subscription;
 #[cfg(target_arch = "riscv64")]
 pub use caller::{CallOperation, Caller, ReplyCleanup};
 #[cfg(target_arch = "riscv64")]

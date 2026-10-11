@@ -791,6 +791,26 @@ pub mod blocking {
             libexecution::runtime::SourcePlan::new(item.handle, item.signals)
         }
 
+        /// 只等真实端点终态，不推进共享流内容或发布 DATA。
+        pub fn wait_closed_until(&self, deadline: Deadline) -> Result<(), RunnelError> {
+            let result = self
+                .core
+                .channel
+                .transport
+                .endpoint()
+                .events()
+                .wait_until(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED, deadline)
+                .map_err(RunnelError::Syscall)?;
+            if result
+                .observed
+                .intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)
+            {
+                Ok(())
+            } else {
+                Err(RunnelError::TimedOut)
+            }
+        }
+
         /// 唤醒后重查：观察信号合成类型化条件；终态经 IoError 报告。
         pub fn poll(&mut self, observed: ObjectSignals) -> Result<Option<ProducerReady>, IoError> {
             let terminal = observed.intersects(ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED);

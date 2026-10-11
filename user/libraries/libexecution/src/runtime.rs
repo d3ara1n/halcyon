@@ -4,7 +4,7 @@
 
 use crate::work_queue::{FinalizingStep, InsertFailure, WorkQueue};
 use crate::{
-    ExecutionResource,
+    ExecutionResource, TaskSubmission,
     source::{Registration, SourceOps},
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -101,7 +101,7 @@ impl Input<'_> {
 /// 运行体在 Gate 应用请求时同步返还的失败；派生失败携带完整任务 owner。
 pub enum RequestFailure<T> {
     Spawn {
-        task: T,
+        submission: TaskSubmission<T>,
         error: SystemCallError,
     },
     Source {
@@ -115,14 +115,31 @@ pub enum RequestFailure<T> {
 }
 
 /// 任务在 advance 内声明的运行体请求；advance 返回后按序应用。
-pub struct Requests<T> {
+/// 仅借用当前 advance 的账户和 Runtime 暂存区，业务不能复制或重建作用域。
+///
+/// ```compile_fail
+/// use libexecution::runtime::Requests;
+/// fn make<T>() -> Requests<'static, T> { Requests::default() }
+/// ```
+///
+/// ```compile_fail
+/// use libexecution::runtime::Requests;
+/// fn retain<'a, T>(requests: Requests<'a, T>) -> Requests<'static, T> { requests }
+/// ```
+pub struct Requests<'a, T> {
+    funding: &'a AccountView<ExecutionResource>,
+    operations: &'a mut Vec<RequestOperation<T>>,
+}
+
+/// Runtime 独占暂存区；借用 Requests 结束后才由 Gate 消费拥有付款快照的命令。
+struct CommandBuffer<T> {
     operations: Vec<RequestOperation<T>>,
 }
 
 const REQUEST_CAPACITY: usize = 16;
 
 enum RequestOperation<T> {
-    Spawn { task: T, max_sources: usize },
+    Spawn { submission: TaskSubmission<T> },
     Source(SourceRequest),
     Wake { task: u64 },
 }
@@ -136,12 +153,16 @@ struct PendingGate {
 
 enum SourceRequest {
     /// 登记意图统一为值计划，cookie 由运行体注入任务身份。
-    Register { plan: SourcePlan, kind: SourceKind },
+    Register {
+        plan: SourcePlan,
+        kind: SourceKind,
+        funding: AccountView<ExecutionResource>,
+    },
     /// 撤销登记并释放其输入额度。
     Remove { source: SourceId },
 }
 
-impl<T> Requests<T> {
+impl<T> CommandBuffer<T> {
     fn new() -> Result<Self, SystemCallError> {
         let mut operations = Vec::new();
         operations
@@ -150,13 +171,32 @@ impl<T> Requests<T> {
         Ok(Self { operations })
     }
 
-    /// 请求派生新任务；准入失败在本次 Gate 收尾时同步返还给父任务。
-    pub fn spawn(&mut self, task: T, max_sources: usize) -> Result<(), T> {
-        if self.operations.len() == REQUEST_CAPACITY {
-            return Err(task);
+    fn pop_front(&mut self) -> Option<RequestOperation<T>> {
+        (!self.operations.is_empty()).then(|| self.operations.remove(0))
+    }
+}
+
+impl<'a, T> Requests<'a, T> {
+    fn new(
+        funding: &'a AccountView<ExecutionResource>,
+        operations: &'a mut Vec<RequestOperation<T>>,
+    ) -> Self {
+        Self {
+            funding,
+            operations,
         }
-        self.operations
-            .push(RequestOperation::Spawn { task, max_sources });
+    }
+
+    pub fn task_funding(&self) -> &AccountView<ExecutionResource> {
+        self.funding
+    }
+
+    /// 请求派生新任务；准入失败在本次 Gate 收尾时同步返还给父任务。
+    pub fn spawn(&mut self, submission: TaskSubmission<T>) -> Result<(), TaskSubmission<T>> {
+        if self.operations.len() == REQUEST_CAPACITY {
+            return Err(submission);
+        }
+        self.operations.push(RequestOperation::Spawn { submission });
         Ok(())
     }
 
@@ -171,6 +211,25 @@ impl<T> Requests<T> {
     }
 
     pub fn register(&mut self, plan: SourcePlan, kind: SourceKind) -> Result<(), SourcePlan> {
+        let funding = self.funding.clone();
+        self.register_with_funding(plan, kind, funding)
+    }
+
+    pub(crate) fn register_bound(
+        &mut self,
+        plan: SourcePlan,
+        kind: SourceKind,
+        funding: &AccountView<ExecutionResource>,
+    ) -> Result<(), SourcePlan> {
+        self.register_with_funding(plan, kind, funding.clone())
+    }
+
+    fn register_with_funding(
+        &mut self,
+        plan: SourcePlan,
+        kind: SourceKind,
+        funding: AccountView<ExecutionResource>,
+    ) -> Result<(), SourcePlan> {
         if self.operations.len() == REQUEST_CAPACITY {
             return Err(plan);
         }
@@ -178,6 +237,7 @@ impl<T> Requests<T> {
             .push(RequestOperation::Source(SourceRequest::Register {
                 plan,
                 kind,
+                funding,
             }));
         Ok(())
     }
@@ -199,10 +259,6 @@ impl<T> Requests<T> {
         self.operations.push(RequestOperation::Wake { task });
         Ok(())
     }
-
-    fn pop_front(&mut self) -> Option<RequestOperation<T>> {
-        (!self.operations.is_empty()).then(|| self.operations.remove(0))
-    }
 }
 
 pub struct SourceEntry {
@@ -223,7 +279,8 @@ const SOURCE_INPUT_BYTES: usize =
         + core::mem::size_of::<TimerNode<u64>>();
 
 static RETIRED_CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
-const SOURCE_RETIRE_RETRY_NS: u64 = 1_000_000;
+/// 协作维护遇暂不能兑现的关闭/注销时的重试间隔；避免立即重复空推进。
+pub const CLEANUP_RETRY_NS: u64 = 1_000_000;
 
 pub fn retired_cleanup_failures() -> usize {
     RETIRED_CLEANUP_FAILURES.load(Ordering::Relaxed)
@@ -254,7 +311,7 @@ pub trait Task<W>: Sized {
         &mut self,
         id: u64,
         world: &mut W,
-        requests: &mut Requests<Self::Family>,
+        requests: &mut Requests<'_, Self::Family>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError>;
@@ -274,19 +331,18 @@ pub struct Runtime<T, S: SourceOps> {
     queue: WorkQueue<T>,
     sources: OrderedTable<SourceEntry, ()>,
     set: Registration<S>,
-    account: AccountView<ExecutionResource>,
     scratch: Vec<SourceEvent>,
     phase: u8,
     maintenance_phase: u8,
     retire_timers: TimerQueue<u64>,
     clock_now: u64,
     pending_gate: Option<PendingGate>,
-    requests: Requests<T>,
+    commands: CommandBuffer<T>,
     _input_charge: Charge,
 }
 
 impl<T, S: SourceOps> Runtime<T, S> {
-    fn fixed_input_bytes(source_limit: usize) -> Result<usize, SystemCallError> {
+    pub fn fixed_input_budget(source_limit: usize) -> Result<usize, SystemCallError> {
         source_limit
             .checked_mul(core::mem::size_of::<SourceEvent>())
             .and_then(|bytes| {
@@ -297,14 +353,10 @@ impl<T, S: SourceOps> Runtime<T, S> {
             .ok_or(SystemCallError::ReachLimit)
     }
 
-    /// 计算固定存储与全部可准入来源的输入额度，供装配者建立账户。
-    pub fn input_budget(source_limit: usize) -> Result<usize, SystemCallError> {
-        Self::fixed_input_bytes(source_limit)?
-            .checked_add(
-                source_limit
-                    .checked_mul(SOURCE_INPUT_BYTES)
-                    .ok_or(SystemCallError::ReachLimit)?,
-            )
+    /// 同时保留的来源（含退休记录）输入口径，不包含固定共享设施。
+    pub fn source_input_budget(count: usize) -> Result<usize, SystemCallError> {
+        count
+            .checked_mul(SOURCE_INPUT_BYTES)
             .ok_or(SystemCallError::ReachLimit)
     }
 
@@ -312,7 +364,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         set: Registration<S>,
         task_limit: usize,
         source_limit: usize,
-        account: &AccountView<ExecutionResource>,
+        infrastructure: &AccountView<ExecutionResource>,
     ) -> Result<Self, SystemCallError> {
         if task_limit == 0 || source_limit == 0 {
             return Err(SystemCallError::IllegalArgument);
@@ -320,11 +372,11 @@ impl<T, S: SourceOps> Runtime<T, S> {
         if set.failed() {
             return Err(SystemCallError::ObjectClosed);
         }
-        let input_charge = account.acquire(
+        let input_charge = infrastructure.acquire(
             ExecutionResource::InputBytes,
-            Self::fixed_input_bytes(source_limit)?,
+            Self::fixed_input_budget(source_limit)?,
         )?;
-        let requests = Requests::new()?;
+        let commands = CommandBuffer::new()?;
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(source_limit)
@@ -334,14 +386,13 @@ impl<T, S: SourceOps> Runtime<T, S> {
             set,
             queue,
             sources: OrderedTable::new(source_limit),
-            account: account.clone(),
             scratch,
             phase: 0,
             maintenance_phase: 0,
             retire_timers: TimerQueue::new(0),
             clock_now: 0,
             pending_gate: None,
-            requests,
+            commands,
             _input_charge: input_charge,
         })
     }
@@ -350,14 +401,14 @@ impl<T, S: SourceOps> Runtime<T, S> {
         &self.set
     }
 
-    pub fn spawn(&mut self, task: T, max_sources: usize) -> Result<u64, InsertFailure<T>> {
+    pub fn spawn(&mut self, submission: TaskSubmission<T>) -> Result<u64, InsertFailure<T>> {
         if self.set.failed() {
             return Err(InsertFailure {
-                task,
+                submission,
                 error: SystemCallError::ObjectClosed,
             });
         }
-        self.queue.insert(task, max_sources, &self.account)
+        self.queue.insert(submission)
     }
 
     pub fn get_task_mut(&mut self, id: u64) -> Option<&mut T> {
@@ -806,7 +857,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
             self.retire_timers.cancel(node);
             self.retire_timers.register(
                 node,
-                self.clock_now.saturating_add(SOURCE_RETIRE_RETRY_NS),
+                self.clock_now.saturating_add(CLEANUP_RETRY_NS),
                 token,
             );
         }
@@ -862,8 +913,10 @@ impl<T, S: SourceOps> Runtime<T, S> {
             now_ns: now,
         };
         let result = {
-            let task = &mut self.queue.slot(id).expect("ready task remains owned").task;
-            task.advance(id, world, &mut self.requests, &mut input, budget)
+            let slot = self.queue.slot(id).expect("ready task remains owned");
+            let mut requests = Requests::new(&slot.funding, &mut self.commands.operations);
+            slot.task
+                .advance(id, world, &mut requests, &mut input, budget)
         };
         let consumed = input.cursor;
         let timed_out = input.timed_out;
@@ -893,7 +946,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
             Ok(advance) if advance.work_done <= budget => advance,
             result => {
                 let error = result.err().unwrap_or(SystemCallError::InternalError);
-                if self.requests.operations.is_empty() {
+                if self.commands.operations.is_empty() {
                     self.queue
                         .schedule(id)
                         .expect("failed task must remain owned");
@@ -909,7 +962,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
             }
         };
         advance.work_done = advance.work_done.max(1);
-        if !self.requests.operations.is_empty() {
+        if !self.commands.operations.is_empty() {
             self.pending_gate = Some(PendingGate {
                 task: id,
                 step: advance.step,
@@ -982,17 +1035,11 @@ impl<T, S: SourceOps> Runtime<T, S> {
         T: Task<W, Family = T>,
     {
         match operation {
-            RequestOperation::Spawn { task: spawned, .. } => {
+            RequestOperation::Spawn { submission } => {
                 self.queue
                     .get_task_mut(task)
                     .expect("requesting task disappeared while rejecting requests")
-                    .refused(
-                        world,
-                        RequestFailure::Spawn {
-                            task: spawned,
-                            error,
-                        },
-                    );
+                    .refused(world, RequestFailure::Spawn { submission, error });
             }
             RequestOperation::Wake { task: target } => {
                 self.queue
@@ -1043,7 +1090,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         self.clock_now = now;
         let mut gate = self.pending_gate.take().expect("gate remains owned");
         self.queue.mature_deadline(gate.task, now);
-        if let Some(operation) = self.requests.pop_front() {
+        if let Some(operation) = self.commands.pop_front() {
             if let Some(error) = gate.rejection {
                 self.reject_operation(gate.task, world, operation, error);
                 gate.refused = true;
@@ -1059,7 +1106,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
             self.pending_gate = Some(gate);
             return Err(TaskFailure { task, error });
         }
-        if !self.requests.operations.is_empty() {
+        if !self.commands.operations.is_empty() {
             self.pending_gate = Some(gate);
             return Ok(Some(Advance {
                 work_done: 1,
@@ -1096,10 +1143,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         T: Task<W, Family = T>,
     {
         match operation {
-            RequestOperation::Spawn {
-                task: spawned,
-                max_sources,
-            } => match self.queue.insert(spawned, max_sources, &self.account) {
+            RequestOperation::Spawn { submission } => match self.queue.insert(submission) {
                 Ok(_) => false,
                 Err(failure) => {
                     self.queue
@@ -1108,7 +1152,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
                         .refused(
                             world,
                             RequestFailure::Spawn {
-                                task: failure.task,
+                                submission: failure.submission,
                                 error: failure.error,
                             },
                         );
@@ -1158,24 +1202,26 @@ impl<T, S: SourceOps> Runtime<T, S> {
                     };
                 }
                 match request {
-                    SourceRequest::Register { plan, kind } => {
-                        match self.add_source(task, plan, kind) {
-                            Ok(source) => {
-                                self.queue
-                                    .get_task_mut(task)
-                                    .expect("registered task must exist")
-                                    .registered(world, kind, source);
-                                false
-                            }
-                            Err(error) => {
-                                self.queue
-                                    .get_task_mut(task)
-                                    .expect("source task remains owned")
-                                    .refused(world, RequestFailure::Source { kind, error });
-                                true
-                            }
+                    SourceRequest::Register {
+                        plan,
+                        kind,
+                        funding,
+                    } => match self.add_source(task, plan, kind, &funding) {
+                        Ok(source) => {
+                            self.queue
+                                .get_task_mut(task)
+                                .expect("registered task must exist")
+                                .registered(world, kind, source);
+                            false
                         }
-                    }
+                        Err(error) => {
+                            self.queue
+                                .get_task_mut(task)
+                                .expect("source task remains owned")
+                                .refused(world, RequestFailure::Source { kind, error });
+                            true
+                        }
+                    },
                     SourceRequest::Remove { source } => {
                         let _ = self.drop_source(world, source.token());
                         false
@@ -1189,6 +1235,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
         &mut self,
         task: u64,
         kind: SourceKind,
+        funding: &AccountView<ExecutionResource>,
     ) -> Result<ordered_table::PreparedEntry<SourceEntry, ()>, SystemCallError> {
         let slot = self
             .queue
@@ -1198,9 +1245,7 @@ impl<T, S: SourceOps> Runtime<T, S> {
             return Err(SystemCallError::ReachLimit);
         }
         let input_index = slot.sources.len();
-        let charge = self
-            .account
-            .acquire(ExecutionResource::InputBytes, SOURCE_INPUT_BYTES)?;
+        let charge = funding.acquire(ExecutionResource::InputBytes, SOURCE_INPUT_BYTES)?;
         let retire_timer = Box::into_pin(
             Box::try_new(TimerNode::new()).map_err(|_| SystemCallError::OutOfMemory)?,
         );
@@ -1237,11 +1282,12 @@ impl<T, S: SourceOps> Runtime<T, S> {
         task: u64,
         plan: SourcePlan,
         kind: SourceKind,
+        funding: &AccountView<ExecutionResource>,
     ) -> Result<SourceId, SystemCallError> {
         if self.set.failed() || !self.queue.accepts_sources(task) {
             return Err(SystemCallError::ObjectClosed);
         }
-        let prepared = self.prepare_source(task, kind)?;
+        let prepared = self.prepare_source(task, kind, funding)?;
         match self
             .set
             .set()
@@ -1295,6 +1341,7 @@ impl<T, S: SourceOps> Drop for Runtime<T, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("runtime_funding_tests.rs");
     use crate::assembly::Assembly;
     use alloc::{collections::BTreeMap, collections::VecDeque, rc::Rc, vec};
     use core::cell::{Cell, RefCell};
@@ -1302,6 +1349,9 @@ mod tests {
     struct FakeShared {
         inner: RefCell<FakeInner>,
         now: Cell<u64>,
+        clock_error: Cell<Option<SystemCallError>>,
+        register_error: Cell<Option<SystemCallError>>,
+        remove_clock_error: Cell<bool>,
     }
 
     struct FakeInner {
@@ -1362,10 +1412,16 @@ mod tests {
                 persistent: false,
             }),
             now: Cell::new(0),
+            clock_error: Cell::new(None),
+            register_error: Cell::new(None),
+            remove_clock_error: Cell::new(false),
         })
     }
     impl SourceOps for FakeSet {
         fn register_item(&self, item: MemberRequest) -> Result<u64, SystemCallError> {
+            if let Some(error) = self.shared.register_error.take() {
+                return Err(error);
+            }
             let mut inner = self.shared.inner.borrow_mut();
             let token = inner.next_token;
             inner.next_token += 1;
@@ -1386,6 +1442,11 @@ mod tests {
                 .remove(&token)
                 .ok_or(SystemCallError::ObjectNotFound)?;
             inner.removes.push(token);
+            if self.shared.remove_clock_error.replace(false) {
+                self.shared
+                    .clock_error
+                    .set(Some(SystemCallError::InternalError));
+            }
             Ok(())
         }
         fn receive_into(&self, records: &mut [ReadyRecord]) -> Result<usize, SystemCallError> {
@@ -1426,6 +1487,9 @@ mod tests {
             Ok(())
         }
         fn now_ns(&self) -> Result<u64, SystemCallError> {
+            if let Some(error) = self.shared.clock_error.get() {
+                return Err(error);
+            }
             Ok(self.shared.now.get())
         }
         fn close_set(self) -> Result<(), (Self, SystemCallError)> {
@@ -1481,7 +1545,7 @@ mod tests {
             &mut self,
             id: u64,
             world: &mut World,
-            _requests: &mut Requests<Self>,
+            _requests: &mut Requests<'_, Self>,
             _input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -1535,14 +1599,25 @@ mod tests {
 
     #[test]
     fn yielding_tasks_alternate_fairly() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<ToyTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 4, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 8, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(ToyTask { turns: 2 }, 0).unwrap();
-        rt.spawn(ToyTask { turns: 2 }, 0).unwrap();
+        rt.spawn(TaskSubmission::new(
+            ToyTask { turns: 2 },
+            0,
+            submission_funding.clone(),
+        ))
+        .unwrap();
+        rt.spawn(TaskSubmission::new(
+            ToyTask { turns: 2 },
+            0,
+            submission_funding.clone(),
+        ))
+        .unwrap();
         assembly.run(&mut rt, &mut world, 1).unwrap();
         let first = world.order[0];
         let second = world.order[1];
@@ -1563,7 +1638,7 @@ mod tests {
             &mut self,
             _id: u64,
             _world: &mut World,
-            _requests: &mut Requests<Self>,
+            _requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -1590,19 +1665,21 @@ mod tests {
 
     #[test]
     fn deadline_wakes_parked_task() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<WaitingTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 4, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 8, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             WaitingTask {
                 deadline_at: 20,
                 armed: false,
             },
             0,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         // 首轮覆盖三个工作面：任务登记期限并停驻。
         for &record in assembly.receive(64).unwrap() {
@@ -1630,7 +1707,7 @@ mod tests {
             &mut self,
             _id: u64,
             _world: &mut World,
-            _requests: &mut Requests<Self>,
+            _requests: &mut Requests<'_, Self>,
             _input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -1657,13 +1734,20 @@ mod tests {
 
     #[test]
     fn invalid_deadline_is_reported_without_dropping_task() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<InvalidDeadlineTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &submission_funding).unwrap();
         let mut world = World::default();
-        let id = rt.spawn(InvalidDeadlineTask, 0).unwrap();
+        let id = rt
+            .spawn(TaskSubmission::new(
+                InvalidDeadlineTask,
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap();
         for &record in assembly.receive(64).unwrap() {
             rt.feed(record);
         }
@@ -1690,7 +1774,7 @@ mod tests {
             &mut self,
             _id: u64,
             _world: &mut World,
-            _requests: &mut Requests<Self>,
+            _requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -1725,13 +1809,19 @@ mod tests {
 
     #[test]
     fn stopping_task_can_park_until_cleanup_deadline() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<StopWaitTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(StopWaitTask { stopping: false }, 0).unwrap();
+        rt.spawn(TaskSubmission::new(
+            StopWaitTask { stopping: false },
+            0,
+            submission_funding.clone(),
+        ))
+        .unwrap();
         rt.seal();
         rt.shutdown_turn(&mut world, 1).unwrap();
         assert!(!rt.is_empty());
@@ -1756,7 +1846,7 @@ mod tests {
             &mut self,
             _id: u64,
             world: &mut World,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -1820,7 +1910,7 @@ mod tests {
         let baseline_task = funding.usage(ExecutionResource::Task);
         let baseline_input = funding.usage(ExecutionResource::InputBytes);
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(3, 1),
                 requested: false,
@@ -1828,7 +1918,8 @@ mod tests {
                 complete_after: 1,
             },
             0,
-        )
+            funding.clone(),
+        ))
         .unwrap();
         assembly.run(&mut rt, &mut world, 3).unwrap();
         assert_eq!(world.refusals, [SystemCallError::ReachLimit]);
@@ -1841,10 +1932,11 @@ mod tests {
 
     #[test]
     fn persistent_source_routes_multiple_prompts() {
+        let submission_funding = self::account();
         let shared = fake_shared();
         let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(3, 1),
                 requested: false,
@@ -1852,7 +1944,8 @@ mod tests {
                 complete_after: 2,
             },
             2,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         // 首轮覆盖三个工作面：任务登记来源并停驻。
         for &record in assembly.receive(64).unwrap() {
@@ -1887,10 +1980,11 @@ mod tests {
 
     #[test]
     fn completed_task_waits_for_busy_source_retirement() {
+        let submission_funding = self::account();
         let shared = fake_shared();
         let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(8, 1),
                 requested: false,
@@ -1898,7 +1992,8 @@ mod tests {
                 complete_after: 1,
             },
             1,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         for &record in assembly.receive(64).unwrap() {
             rt.feed(record);
@@ -1927,10 +2022,11 @@ mod tests {
 
     #[test]
     fn stale_cookie_records_are_dropped() {
+        let submission_funding = self::account();
         let shared = fake_shared();
         let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(4, 1),
                 requested: false,
@@ -1938,7 +2034,8 @@ mod tests {
                 complete_after: 1,
             },
             2,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         for &record in assembly.receive(64).unwrap() {
             rt.feed(record);
@@ -1971,7 +2068,7 @@ mod tests {
             &mut self,
             _id: u64,
             _world: &mut World,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             _input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -1984,24 +2081,26 @@ mod tests {
             if !self.spawned {
                 self.spawned = true;
                 requests
-                    .spawn(
+                    .spawn(TaskSubmission::new(
                         Spawner {
                             spawned: true,
                             leaf: true,
                             refused: false,
                         },
                         0,
-                    )
+                        requests.task_funding().clone(),
+                    ))
                     .expect("spawn request capacity");
                 requests
-                    .spawn(
+                    .spawn(TaskSubmission::new(
                         Spawner {
                             spawned: true,
                             leaf: true,
                             refused: false,
                         },
                         0,
-                    )
+                        requests.task_funding().clone(),
+                    ))
                     .expect("spawn request capacity");
             }
             Ok(Advance {
@@ -2010,10 +2109,10 @@ mod tests {
             })
         }
         fn refused(&mut self, world: &mut World, failure: RequestFailure<Self>) {
-            let RequestFailure::Spawn { task, error } = failure else {
+            let RequestFailure::Spawn { submission, error } = failure else {
                 panic!("Spawner only submits spawn requests")
             };
-            let _ = task;
+            let _ = submission;
             world.refusals.push(error);
             self.refused = true;
         }
@@ -2022,21 +2121,23 @@ mod tests {
 
     #[test]
     fn gate_spawn_applies_and_refusal_is_reported() {
+        let submission_funding = self::account();
         // 任务表容量 2：父 + 首个子任务占满，第二个派生被表限拒绝。
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<Spawner, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 2, 8, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 8, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             Spawner {
                 spawned: false,
                 leaf: false,
                 refused: false,
             },
             0,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         assembly.run(&mut rt, &mut world, 3).unwrap();
         assert!(rt.is_empty());
@@ -2046,20 +2147,22 @@ mod tests {
 
     #[test]
     fn max_work_one_advances_gate_one_operation_at_a_time() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<Spawner, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 4, 4, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 4, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             Spawner {
                 spawned: false,
                 leaf: false,
                 refused: false,
             },
             0,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         // 期限、输入、任务三个工作面各占一次推进；第四次才结算
         // 第一个 spawn，不能在一次 max_work=1 中批量应用两个请求。
@@ -2109,13 +2212,19 @@ mod tests {
 
     #[test]
     fn finalizing_task_is_not_requeued_by_shutdown() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<ToyTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        rt.spawn(TaskSubmission::new(
+            ToyTask { turns: 1 },
+            0,
+            submission_funding.clone(),
+        ))
+        .unwrap();
         for &record in assembly.receive(64).unwrap() {
             rt.feed(record);
         }
@@ -2129,10 +2238,11 @@ mod tests {
 
     #[test]
     fn max_work_one_allows_ready_task_and_source_retirement_to_progress() {
+        let submission_funding = self::account();
         let shared = fake_shared();
         let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(10, 1),
                 requested: false,
@@ -2140,9 +2250,10 @@ mod tests {
                 complete_after: 1,
             },
             1,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(11, 1),
                 requested: false,
@@ -2150,7 +2261,8 @@ mod tests {
                 complete_after: 1,
             },
             1,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         for _ in 0..20 {
             for &record in assembly.receive(64).unwrap() {
@@ -2187,7 +2299,7 @@ mod tests {
             &mut self,
             id: u64,
             world: &mut World,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -2215,10 +2327,18 @@ mod tests {
                 }
                 Self::Parent => {
                     requests
-                        .spawn(Self::Child, 0)
+                        .spawn(TaskSubmission::new(
+                            Self::Child,
+                            0,
+                            requests.task_funding().clone(),
+                        ))
                         .expect("prepaid request capacity");
                     requests
-                        .spawn(Self::Child, 0)
+                        .spawn(TaskSubmission::new(
+                            Self::Child,
+                            0,
+                            requests.task_funding().clone(),
+                        ))
                         .expect("prepaid request capacity");
                     *self = Self::Child;
                     Step::Complete
@@ -2250,15 +2370,17 @@ mod tests {
             Runtime::new(assembly.bind().unwrap(), 8, 8, &account).unwrap();
         let baseline = account.usage(ExecutionResource::InputBytes).0;
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             MixedTask::Source {
                 registered: false,
                 stopping: false,
             },
             1,
-        )
+            account.clone(),
+        ))
         .unwrap();
-        rt.spawn(MixedTask::Parent, 0).unwrap();
+        rt.spawn(TaskSubmission::new(MixedTask::Parent, 0, account.clone()))
+            .unwrap();
         for _ in 0..360 {
             let armed = {
                 let inner = shared.inner.borrow();
@@ -2309,7 +2431,7 @@ mod tests {
             &mut self,
             _id: u64,
             world: &mut World,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _budget: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -2342,19 +2464,21 @@ mod tests {
 
     #[test]
     fn unconsumed_input_returns_to_the_front_without_scanning_all_sources() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             PartialTask {
                 armed: false,
                 skip: true,
                 seen: 0,
             },
             2,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         for _ in 0..30 {
             for &record in assembly.receive(64).unwrap() {
@@ -2377,17 +2501,25 @@ mod tests {
 
     #[test]
     fn removing_one_source_does_not_erase_another_sources_retry() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &submission_funding).unwrap();
         let mut world = World::default();
-        let task = rt.spawn(ToyTask { turns: 1 }, 2).unwrap();
+        let task = rt
+            .spawn(TaskSubmission::new(
+                ToyTask { turns: 1 },
+                2,
+                submission_funding.clone(),
+            ))
+            .unwrap();
         let first = rt
             .add_source(
                 task,
                 SourcePlan::new(Handle::from_raw(1), ObjectSignals::READABLE),
                 1,
+                &submission_funding,
             )
             .unwrap();
         let second = rt
@@ -2395,6 +2527,7 @@ mod tests {
                 task,
                 SourcePlan::new(Handle::from_raw(2), ObjectSignals::READABLE),
                 2,
+                &submission_funding,
             )
             .unwrap();
         shared.set_remove_busy(1);
@@ -2420,7 +2553,7 @@ mod tests {
             &mut self,
             id: u64,
             world: &mut World,
-            _: &mut Requests<Self>,
+            _: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -2449,13 +2582,26 @@ mod tests {
 
     #[test]
     fn failed_task_retains_state_while_healthy_task_runs_and_retry_is_not_timeout() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &submission_funding).unwrap();
         let mut world = World::default();
-        let failed = rt.spawn(FaultTask::Failing(false), 0).unwrap();
-        let healthy = rt.spawn(FaultTask::Healthy, 0).unwrap();
+        let failed = rt
+            .spawn(TaskSubmission::new(
+                FaultTask::Failing(false),
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap();
+        let healthy = rt
+            .spawn(TaskSubmission::new(
+                FaultTask::Healthy,
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap();
         let failure = rt.turn(&mut world, 3).unwrap_err();
         assert_eq!(failure.task, failed);
         rt.defer_failed_task(failed, Some(50)).unwrap();
@@ -2474,7 +2620,7 @@ mod tests {
             &mut self,
             _: u64,
             _: &mut World,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -2527,13 +2673,20 @@ mod tests {
     }
     #[test]
     fn failed_gate_preserves_business_deadline_across_hold_and_execution_retry() {
+        let submission_funding = self::account();
         for retry in [60, 10] {
             let shared = fake_shared();
-            let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
                 .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
-            let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+            let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &submission_funding).unwrap();
             let mut world = World::default();
-            let id = rt.spawn(DeadlineGateTask { phase: 0 }, 1).unwrap();
+            let id = rt
+                .spawn(TaskSubmission::new(
+                    DeadlineGateTask { phase: 0 },
+                    1,
+                    submission_funding.clone(),
+                ))
+                .unwrap();
             for &record in assembly.receive(64).unwrap() {
                 rt.feed(record);
             }
@@ -2587,7 +2740,7 @@ mod tests {
             &mut self,
             _: u64,
             world: &mut SourceOwnershipWorld,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             _: &mut Input<'_>,
             _: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -2652,13 +2805,14 @@ mod tests {
     }
     #[test]
     fn foreign_source_is_rejected_in_normal_complete_and_failed_gates() {
+        let submission_funding = self::account();
         for mode in 0..3 {
             let shared = fake_shared();
-            let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
                 .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
-            let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+            let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &submission_funding).unwrap();
             let mut world = SourceOwnershipWorld::default();
-            rt.spawn(
+            rt.spawn(TaskSubmission::new(
                 SourceOwnershipTask {
                     owner: true,
                     started: false,
@@ -2666,9 +2820,10 @@ mod tests {
                     mode,
                 },
                 1,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
-            rt.spawn(
+            rt.spawn(TaskSubmission::new(
                 SourceOwnershipTask {
                     owner: false,
                     started: false,
@@ -2676,7 +2831,8 @@ mod tests {
                     mode,
                 },
                 0,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
             for _ in 0..80 {
                 let _ = rt.turn(&mut world, 1);
@@ -2712,7 +2868,7 @@ mod tests {
             &mut self,
             _: u64,
             world: &mut MultiSourceWorld,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             _: &mut Input<'_>,
             _: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -2788,7 +2944,8 @@ mod tests {
     #[test]
     fn four_sources_retire_before_their_owner_closes() {
         let shared = fake_shared();
-        let input_bytes = Runtime::<MultiSourceTask, FakeSet>::input_budget(4).unwrap();
+        let input_bytes = Runtime::<MultiSourceTask, FakeSet>::fixed_input_budget(4).unwrap()
+            + Runtime::<MultiSourceTask, FakeSet>::source_input_budget(4).unwrap();
         let limits = [8, input_bytes];
         let budget = Budget::new(&limits, 1).unwrap();
         let account = budget.account(&limits).unwrap();
@@ -2799,13 +2956,14 @@ mod tests {
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 4, &view).unwrap();
         let mut world = MultiSourceWorld::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             MultiSourceTask {
                 phase: 0,
                 sources: [None; 4],
             },
             4,
-        )
+            view.clone(),
+        ))
         .unwrap_or_else(|_| panic!("four-source task admission failed"));
         for _ in 0..80 {
             if world.owner_closed && rt.is_empty() {
@@ -2826,16 +2984,26 @@ mod tests {
 
     #[test]
     fn seal_rejects_spawn_and_stop_next_advances() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &self::account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|(_, error)| panic!("assembly failed: {error:?}"));
         let mut rt: Runtime<ToyTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 4, 8, &self::account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 4, 8, &submission_funding).unwrap();
         let mut world = World::default();
-        rt.spawn(ToyTask { turns: 100 }, 0).unwrap();
+        rt.spawn(TaskSubmission::new(
+            ToyTask { turns: 100 },
+            0,
+            submission_funding.clone(),
+        ))
+        .unwrap();
         rt.seal();
         assert!(matches!(
-            rt.spawn(ToyTask { turns: 1 }, 0),
+            rt.spawn(TaskSubmission::new(
+                ToyTask { turns: 1 },
+                0,
+                submission_funding.clone()
+            )),
             Err(InsertFailure {
                 error: SystemCallError::ObjectClosed,
                 ..
@@ -2848,15 +3016,16 @@ mod tests {
     }
     #[test]
     fn one_receive_routes_two_runtimes_without_nested_sources() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut first = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
-        let mut second = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let mut first = Runtime::new(assembly.bind().unwrap(), 2, 2, &self::account()).unwrap();
+        let mut second = Runtime::new(assembly.bind().unwrap(), 2, 2, &self::account()).unwrap();
         let mut a = World::default();
         let mut b = World::default();
         for rt in [&mut first, &mut second] {
-            rt.spawn(
+            rt.spawn(TaskSubmission::new(
                 SourceTask {
                     handle: Handle::from_parts(3, 1),
                     requested: false,
@@ -2864,7 +3033,8 @@ mod tests {
                     complete_after: 1,
                 },
                 1,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
         }
         for _ in 0..6 {
@@ -2894,10 +3064,11 @@ mod tests {
 
     #[test]
     fn repeated_level_hints_merge_in_one_prepaid_input() {
+        let submission_funding = self::account();
         let shared = fake_shared();
         let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(3, 1),
                 requested: false,
@@ -2905,7 +3076,8 @@ mod tests {
                 complete_after: 1,
             },
             1,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         for _ in 0..6 {
             rt.turn(&mut world, 3).unwrap();
@@ -2928,14 +3100,15 @@ mod tests {
 
     #[test]
     fn abandoning_live_runtime_invalidates_shared_assembly() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &self::account()).unwrap();
         let healthy: Runtime<SourceTask, FakeSet> =
-            Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
+            Runtime::new(assembly.bind().unwrap(), 2, 2, &self::account()).unwrap();
         let mut world = World::default();
-        rt.spawn(
+        rt.spawn(TaskSubmission::new(
             SourceTask {
                 handle: Handle::from_parts(3, 1),
                 requested: false,
@@ -2943,7 +3116,8 @@ mod tests {
                 complete_after: 1,
             },
             1,
-        )
+            submission_funding.clone(),
+        ))
         .unwrap();
         for _ in 0..6 {
             rt.turn(&mut world, 3).unwrap();
@@ -2969,7 +3143,7 @@ mod tests {
             &mut self,
             _: u64,
             _: &mut World,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -3019,20 +3193,22 @@ mod tests {
     }
     #[test]
     fn successful_gate_and_callbacks_cancel_deadline_before_later_clock_sample() {
+        let submission_funding = self::account();
         for callback_cancel in [false, true] {
             let shared = fake_shared();
-            let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+            let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
                 .unwrap_or_else(|_| panic!("assembly failed"));
-            let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &account()).unwrap();
+            let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 2, &submission_funding).unwrap();
             let mut world = World::default();
             let id = rt
-                .spawn(
+                .spawn(TaskSubmission::new(
                     CancelDeadlineTask {
                         phase: 0,
                         callback_cancel,
                     },
                     2,
-                )
+                    submission_funding.clone(),
+                ))
                 .unwrap();
             rt.turn(&mut world, 3).unwrap();
             shared.now.set(20);
@@ -3067,7 +3243,7 @@ mod tests {
             &mut self,
             _: u64,
             timeouts: &mut Vec<bool>,
-            requests: &mut Requests<Self>,
+            requests: &mut Requests<'_, Self>,
             input: &mut Input<'_>,
             _: usize,
         ) -> Result<Advance, SystemCallError> {
@@ -3116,22 +3292,25 @@ mod tests {
 
     #[test]
     fn non_gate_callbacks_cancel_only_unmatured_deadlines() {
+        let submission_funding = self::account();
         for stop in [false, true] {
             for cancel_at in [20, 3_000_000] {
                 let shared = fake_shared();
-                let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+                let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
                     .unwrap_or_else(|_| panic!("assembly failed"));
-                let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+                let mut rt =
+                    Runtime::new(assembly.bind().unwrap(), 1, 1, &submission_funding).unwrap();
                 let mut timeouts = Vec::new();
                 let id = rt
-                    .spawn(
+                    .spawn(TaskSubmission::new(
                         CallbackDeadlineTask {
                             registration: crate::SourceRegistration::new(),
                             deadline: Deadline::at(2_000_000),
                             cancel_to: Deadline::INFINITE,
                         },
                         1,
-                    )
+                        submission_funding.clone(),
+                    ))
                     .unwrap();
                 while rt.pending_sources() == 0 || rt.has_pending_gate() {
                     rt.turn(&mut timeouts, 1).unwrap();
@@ -3147,7 +3326,7 @@ mod tests {
                         rt.drop_source(&mut timeouts, source.token()),
                         Err(SystemCallError::ObjectBusy)
                     );
-                    shared.now.set(cancel_at + SOURCE_RETIRE_RETRY_NS);
+                    shared.now.set(cancel_at + CLEANUP_RETRY_NS);
                     while rt.pending_sources() != 0 {
                         rt.turn(&mut timeouts, 1).unwrap();
                     }
@@ -3167,13 +3346,14 @@ mod tests {
 
     #[test]
     fn invalid_retirement_callback_deadline_preserves_and_identifies_the_task() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let mut assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let mut assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &submission_funding).unwrap();
         let mut timeouts = Vec::new();
         let id = rt
-            .spawn(
+            .spawn(TaskSubmission::new(
                 CallbackDeadlineTask {
                     registration: crate::SourceRegistration::new(),
                     deadline: Deadline::at(2_000_000),
@@ -3184,7 +3364,8 @@ mod tests {
                     },
                 },
                 1,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
         while rt.pending_sources() == 0 || rt.has_pending_gate() {
             rt.turn(&mut timeouts, 1).unwrap();
@@ -3195,7 +3376,7 @@ mod tests {
             rt.drop_source(&mut timeouts, source.token()),
             Err(SystemCallError::ObjectBusy)
         );
-        shared.now.set(SOURCE_RETIRE_RETRY_NS);
+        shared.now.set(CLEANUP_RETRY_NS);
         let failure = loop {
             if let Err(failure) = rt.turn(&mut timeouts, 1) {
                 break failure;
@@ -3215,18 +3396,37 @@ mod tests {
 
     #[test]
     fn older_task_retires_under_continuous_new_completion() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 4, 2, &account()).unwrap();
-        let old = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
-        let later = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 4, 2, &submission_funding).unwrap();
+        let old = rt
+            .spawn(TaskSubmission::new(
+                ToyTask { turns: 1 },
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap();
+        let later = rt
+            .spawn(TaskSubmission::new(
+                ToyTask { turns: 1 },
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap();
         rt.queue.begin_finalizing(later);
         rt.queue.finalize_one();
         rt.queue.begin_finalizing(old);
         let mut newcomers = Vec::new();
         for _ in 0..4 {
-            let id = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+            let id = rt
+                .spawn(TaskSubmission::new(
+                    ToyTask { turns: 1 },
+                    0,
+                    submission_funding.clone(),
+                ))
+                .unwrap();
             newcomers.push(id);
             rt.queue.begin_finalizing(id);
             rt.queue.finalize_one();
@@ -3247,11 +3447,12 @@ mod tests {
 
     #[test]
     fn always_ready_receive_keeps_task_quantum() {
+        let submission_funding = self::account();
         let shared = fake_shared();
         let (mut rt, mut assembly) = source_runtime(&shared);
         let mut world = World::default();
         let id = rt
-            .spawn(
+            .spawn(TaskSubmission::new(
                 SourceTask {
                     handle: Handle::from_parts(3, 1),
                     requested: false,
@@ -3259,7 +3460,8 @@ mod tests {
                     complete_after: 100,
                 },
                 1,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
         for _ in 0..6 {
             rt.turn(&mut world, 3).unwrap();
@@ -3285,15 +3487,28 @@ mod tests {
 
     #[test]
     fn failed_assembly_rejects_admission_and_stop_callbacks() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &account()).unwrap();
-        let id = rt.spawn(ToyTask { turns: 1 }, 0).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 2, 2, &submission_funding).unwrap();
+        let id = rt
+            .spawn(TaskSubmission::new(
+                ToyTask { turns: 1 },
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap();
         drop(assembly);
-        let failure = rt.spawn(ToyTask { turns: 9 }, 0).unwrap_err();
+        let failure = rt
+            .spawn(TaskSubmission::new(
+                ToyTask { turns: 9 },
+                0,
+                submission_funding.clone(),
+            ))
+            .unwrap_err();
         assert_eq!(failure.error, SystemCallError::ObjectClosed);
-        assert_eq!(failure.task.turns, 9);
+        assert_eq!(failure.submission.into_parts().0.turns, 9);
         rt.seal();
         let mut world = World::default();
         assert_eq!(
@@ -3311,20 +3526,22 @@ mod tests {
 
     #[test]
     fn registration_cancelled_before_install_receipt_is_retired_before_task_drop() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &submission_funding).unwrap();
         let mut timeouts = Vec::new();
         let id = rt
-            .spawn(
+            .spawn(TaskSubmission::new(
                 CallbackDeadlineTask {
                     registration: crate::SourceRegistration::new(),
                     deadline: Deadline::at(2_000_000),
                     cancel_to: Deadline::INFINITE,
                 },
                 1,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
         while !rt.has_pending_gate() {
             rt.turn(&mut timeouts, 1).unwrap();
@@ -3343,20 +3560,22 @@ mod tests {
 
     #[test]
     fn old_retirement_receipt_cannot_clear_a_reinstalled_source() {
+        let submission_funding = self::account();
         let shared = fake_shared();
-        let assembly = Assembly::new(FakeSet::new(&shared), &account())
+        let assembly = Assembly::new(FakeSet::new(&shared), &submission_funding)
             .unwrap_or_else(|_| panic!("assembly failed"));
-        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &account()).unwrap();
+        let mut rt = Runtime::new(assembly.bind().unwrap(), 1, 1, &submission_funding).unwrap();
         let mut timeouts = Vec::new();
         let id = rt
-            .spawn(
+            .spawn(TaskSubmission::new(
                 CallbackDeadlineTask {
                     registration: crate::SourceRegistration::new(),
                     deadline: Deadline::at(2_000_000),
                     cancel_to: Deadline::at(2_000_000),
                 },
                 1,
-            )
+                submission_funding.clone(),
+            ))
             .unwrap();
         while rt.pending_sources() == 0 || rt.has_pending_gate() {
             rt.turn(&mut timeouts, 1).unwrap();

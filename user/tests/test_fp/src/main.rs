@@ -152,10 +152,22 @@ fn check_fcsr_across_trap(round: u64) {
         asm!("frcsr {frm}", frm = lateout(reg) frm, options(nomem, nostack));
         asm!("fsrmi 0", options(nomem, nostack)); // 恢复 RNE
     }
-    expect(recheck.to_bits() == rtz.to_bits(), round, "RTZ rounding preserved");
-    expect((frm >> 5) & 0x7 == 1, round, "fcsr.frm still RTZ after trap");
+    expect(
+        recheck.to_bits() == rtz.to_bits(),
+        round,
+        "RTZ rounding preserved",
+    );
+    expect(
+        (frm >> 5) & 0x7 == 1,
+        round,
+        "fcsr.frm still RTZ after trap",
+    );
     let back = fdiv(black_box(5.0f64), black_box(7.0));
-    expect(back.to_bits() == rne.to_bits(), round, "fdiv.d back under RNE");
+    expect(
+        back.to_bits() == rne.to_bits(),
+        round,
+        "fdiv.d back under RNE",
+    );
 }
 
 fn expect(condition: bool, round: u64, what: &str) {

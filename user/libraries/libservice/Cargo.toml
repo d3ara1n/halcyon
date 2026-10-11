@@ -6,7 +6,7 @@ description = "Service registration, discovery records, and lifecycle control"
 edition = "2024"
 
 [dependencies]
-libfal = { path = "../libfal" }
+liboal = { path = "../liboal" }
 librpc = { path = "../librpc" }
 libbudget = { path = "../libbudget" }
 libexecution = { path = "../libexecution" }
@@ -15,8 +15,4 @@ ordered_table = { path = "../../../shared/ordered_table" }
 metadata_admission = { path = "../../../shared/metadata_admission" }
 monotonic_id = { path = "../../../shared/monotonic_id" }
 
-[dev-dependencies]
-libfal = { path = "../libfal", features = ["test-support"] }
-
-[target.'cfg(target_arch = "riscv64")'.dependencies]
 libkernel = { path = "../libkernel" }

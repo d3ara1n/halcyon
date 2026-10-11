@@ -94,7 +94,10 @@ fn adopt_entry_thread(seed: libprocess::context::StartupSeed) {
         )
     };
     if let Err(error) = result {
-        dbg::debug(format_args!("startup entry thread adoption failed: {:?}", error));
+        dbg::debug(format_args!(
+            "startup entry thread adoption failed: {:?}",
+            error
+        ));
         unsafe { sys_process_abort() }
     }
     *STARTUP_CONTEXT.lock() = Some(adoption.context);

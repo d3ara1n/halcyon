@@ -74,7 +74,7 @@ pub struct Caller {
 
 enum OperationState {
     Unsent(Request),
-    Sent(libkernel::ipc::capability::Capability),
+    Sent(libkernel::ipc::message::ReplyObserver),
     Completed,
 }
 

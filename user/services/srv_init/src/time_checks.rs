@@ -34,16 +34,26 @@ pub(super) fn run() {
     );
     let event =
         notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL).unwrap();
-    let empty = wait_until(event.owner, ObjectSignals::READABLE, Deadline::at(0)).unwrap();
+    let empty = wait_until(
+        event.owner.as_handle(),
+        ObjectSignals::READABLE,
+        Deadline::at(0),
+    )
+    .unwrap();
     assert_eq!(empty.reason, WaitReason::Timeout as u32);
-    notification::signal(event.peer, 1).unwrap();
-    let ready = wait_until(event.owner, ObjectSignals::READABLE, Deadline::at(0)).unwrap();
+    event.peer.signal(1).unwrap();
+    let ready = wait_until(
+        event.owner.as_handle(),
+        ObjectSignals::READABLE,
+        Deadline::at(0),
+    )
+    .unwrap();
     assert_eq!(ready.reason, WaitReason::Signaled as u32);
     assert!(ready.observed.intersects(ObjectSignals::READABLE));
-    notification::take(event.owner, u64::MAX).unwrap();
+    event.owner.take(u64::MAX).unwrap();
     assert_eq!(
         wait_until(
-            event.owner,
+            event.owner.as_handle(),
             ObjectSignals::READABLE,
             Deadline {
                 kind: 1,
@@ -55,7 +65,11 @@ pub(super) fn run() {
     );
     if let Some(outside) = start.max_deadline_ns.checked_add(1) {
         assert_eq!(
-            wait_until(event.owner, ObjectSignals::READABLE, Deadline::at(outside)),
+            wait_until(
+                event.owner.as_handle(),
+                ObjectSignals::READABLE,
+                Deadline::at(outside)
+            ),
             Err(SystemCallError::ClockRange)
         );
     }
@@ -67,14 +81,14 @@ pub(super) fn run() {
         "absolute Sleep returned before its deadline"
     );
     assert_eq!(
-        wait_until(event.owner, ObjectSignals::READABLE, deadline)
+        wait_until(event.owner.as_handle(), ObjectSignals::READABLE, deadline)
             .unwrap()
             .reason,
         WaitReason::Timeout as u32,
         "delayed call restarted an expired absolute wait"
     );
-    unsafe { close(event.peer) }.unwrap();
-    unsafe { close(event.owner) }.unwrap();
+    event.peer.close().unwrap();
+    event.owner.close().unwrap();
     delivery_deadline();
     causal_reads();
     assert!(

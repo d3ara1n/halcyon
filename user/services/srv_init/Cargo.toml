@@ -17,7 +17,7 @@ erhino_shared = { path = "../../../shared/erhino_shared" }
 librunnel = { path = "../../libraries/librunnel" }
 librpc = { path = "../../libraries/librpc" }
 libprocess = { path = "../../libraries/libprocess", features = ["management"] }
-libfal = { path = "../../libraries/libfal" }
+liboal = { path = "../../libraries/liboal" }
 libfs = { path = "../../libraries/libfs" }
 libservice = { path = "../../libraries/libservice" }
 libbudget = { path = "../../libraries/libbudget" }
@@ -25,5 +25,6 @@ libexecution = { path = "../../libraries/libexecution" }
 libruntime = { path = "../../libraries/libruntime" }
 libthread = { path = "../../libraries/libthread" }
 lock_api = "0.4"
-test_fal = { path = "../../tests/test_fal" }
+test_fs = { path = "../../tests/test_fs" }
+srv_fs = { path = "../srv_fs" }
 tar = { path = "../../../shared/tar" }

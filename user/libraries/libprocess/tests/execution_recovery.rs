@@ -125,6 +125,8 @@ struct SpawnWorld {
     refused: Option<SystemCallError>,
     returned: bool,
     advanced: usize,
+    returned_funding: Option<u64>,
+    returned_max_sources: Option<usize>,
 }
 impl Task<SpawnWorld> for SpawnTask {
     type Family = Self;
@@ -132,14 +134,18 @@ impl Task<SpawnWorld> for SpawnTask {
         &mut self,
         _: u64,
         world: &mut SpawnWorld,
-        requests: &mut Requests<Self>,
+        requests: &mut Requests<'_, Self>,
         _: &mut Input<'_>,
         _: usize,
     ) -> Result<Advance, SystemCallError> {
         world.advanced += 1;
         if !self.submitted {
             requests
-                .spawn(SpawnTask { submitted: false }, 0)
+                .spawn(libexecution::TaskSubmission::new(
+                    SpawnTask { submitted: false },
+                    0,
+                    requests.task_funding().clone(),
+                ))
                 .map_err(|_| SystemCallError::ReachLimit)?;
             self.submitted = true;
         }
@@ -149,8 +155,11 @@ impl Task<SpawnWorld> for SpawnTask {
         })
     }
     fn refused(&mut self, world: &mut SpawnWorld, failure: RequestFailure<Self>) {
-        if let RequestFailure::Spawn { task, error } = failure {
+        if let RequestFailure::Spawn { submission, error } = failure {
             world.refused = Some(error);
+            world.returned_funding = Some(submission.funding().account_id());
+            let (task, max_sources, _) = submission.into_parts();
+            world.returned_max_sources = Some(max_sources);
             world.returned = !task.submitted;
         }
     }
@@ -159,7 +168,8 @@ impl Task<SpawnWorld> for SpawnTask {
 
 #[test]
 fn prepaid_gate_returns_spawn_owner_and_retires_without_fresh_allocation() {
-    let bytes = Runtime::<SpawnTask, EmptySources>::input_budget(1).unwrap()
+    let bytes = Runtime::<SpawnTask, EmptySources>::fixed_input_budget(1).unwrap()
+        + Runtime::<SpawnTask, EmptySources>::source_input_budget(1).unwrap()
         + Assembly::<EmptySources>::input_budget().unwrap();
     let budget = Budget::new(&[2, bytes], 1).unwrap();
     let account = budget.account(&[2, bytes]).unwrap();
@@ -170,7 +180,13 @@ fn prepaid_gate_returns_spawn_owner_and_retires_without_fresh_allocation() {
         .map_err(|(_, error)| error)
         .unwrap();
     let mut runtime = Runtime::new(assembly.bind().unwrap(), 2, 1, &account).unwrap();
-    runtime.spawn(SpawnTask { submitted: false }, 0).unwrap();
+    runtime
+        .spawn(libexecution::TaskSubmission::new(
+            SpawnTask { submitted: false },
+            0,
+            account.clone(),
+        ))
+        .unwrap();
     let mut world = SpawnWorld::default();
     let mut error = None;
     {
@@ -188,6 +204,8 @@ fn prepaid_gate_returns_spawn_owner_and_retires_without_fresh_allocation() {
     assert_eq!(error, None);
     assert_eq!(world.refused, Some(SystemCallError::OutOfMemory));
     assert!(world.returned);
+    assert_eq!(world.returned_funding, Some(account.account_id()));
+    assert_eq!(world.returned_max_sources, Some(0));
     assert_eq!(world.advanced, 2);
     assert!(runtime.is_empty());
     assert_eq!(account.usage(ExecutionResource::Task).0, 0);

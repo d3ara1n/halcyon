@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod assembly;
+mod funding;
 pub mod runtime;
 pub mod source;
 mod source_registration;
@@ -31,6 +32,7 @@ impl Taxonomy for ExecutionResource {
     }
 }
 
+pub use funding::{SourceFunding, TaskSubmission};
 pub use runtime::{
     Advance, Input, Requests, Runtime, SourceEvent, SourceId, SourceKind, SourcePlan, Step, Task,
     TaskFailure,

@@ -8,7 +8,7 @@
 
 - `shared/erhino_shared` 拥有调用号、固定宽 ABI、对象角色、rights、请求/结果布局和共享校验。
 - `user/libraries/libkernel` 拥有 `call`、IPC/MM、MemoryObject/MemoryPool、Process/Thread 原语、时间和系统控制；`ThreadControl` 是唯一关闭 owner。
-- `user/libraries/libprocess::context` 解析并采用启动 grants；StartupContext 只保留进程身份、payload 和 affine InitialGrants，入口 descriptor 经 StartupAdoption 交由 libruntime/ThreadRegistry；高层进程装载/监督仍归 `libprocess`。
+- `user/libraries/libprocess::context` 解析并采用启动 grants，adoptable_kind 接纳 LifetimeObserver、ReplyObserver 与 NotificationObserver（13/18/20）；StartupContext 只保留进程身份、payload 和 affine InitialGrants，入口 descriptor 经 StartupAdoption 交由 libruntime/ThreadRegistry。应用消费 InitialGrants 后在各领域 typed 转换边界核角色和所需权利，错误保留原 Capability；高层进程装载/监督仍归 `libprocess`。
 - `user/libraries/libthread` 的 `ResultReceiver::Drop` 只放弃结果引用，不等待或触碰 record；显式 `join` 才观察 DONE。结果发布有独立状态字，线程退出不再提供安全逃生路径。
 - `user/libraries/libruntime` 的 `_start` 保持 a0/a1，建立 gp，初始化 heap，采用入口 ThreadControl 并按 reservation 建立普通 `MappedRegion` owner；`start` lang item 将 `()`/`Result<(), E: Debug>` 分别收束为 ThreadExit/ProcessAbort，panic/OOM 也由 runtime 调用 ProcessAbort。
 - 所有服务、驱动和验收程序均为普通 `fn main`，显式依赖 runtime/thread/kernel owner；不存在旧目录、旧 alias 或 facade。
@@ -30,11 +30,13 @@
 
 [`Runtime`](../../user/libraries/libexecution/src/runtime.rs) 拥有任务、来源、请求 Gate、预付输入 FIFO 与来源退休 timer。任务 ID 进程内单调不复用，用作 cookie 命名空间；SourceId 为 token/task。同一集合 token 不复用，feed 同时核本表 token/cookie，未知、已删、退休或迟到记录丢弃。SourceEntry.pending 只存合并电平，交付时重建当前身份/种类；重复提示不移动 FIFO 或另分配输入。CLOSED reason 规范化为 CLOSED 提示，业务重查来源状态，不保留历史 rearm 错误。
 
-来源持久；没有 armed/generation/Rearm、运行体接收缓存/notified/wait_item 或独立 run。Add 先付 source/输入额度、pin timer 与有序表节点，再调用实际来源注册并必成 adopt。Remove 先核 SourceId 所属任务，未知/已删项不调用共享 Remove；失败保留同一条目、额度与 timer 重试。Finalizing 等自己的来源注销成功后才归还任务；同一集合其他 Runtime 不受正常任务失败或正常 close 影响。
+来源持久；没有 armed/generation/Rearm、运行体接收缓存/notified/wait_item 或独立 run。Add 先从登记命令拥有的 execution view 取得原 source/input 费用，再准备 pin timer 与有序表节点、调用实际来源注册并必成 adopt。SourceEntry 只保有实际 Charge，不存 payer id 或重新查询当前任务的付款。Remove 先核 SourceId 所属任务，付款相同不扩大注销权限；未知/已删项不调用共享 Remove，失败保留同一条目、原额度与 timer 重试，不重新 acquire。Finalizing 等自己的来源注销成功后才归还 Task Charge；同一集合其他 Runtime 不受正常任务失败或正常 close 影响。
 
-任务侧[SourceRegistration](../../user/libraries/libexecution/src/source_registration.rs)拥有Empty/Installing(kind)/CancellingInstall(kind)/Attached(id)/RemovePending(id)/Removing(id)寿命；命令成功入Requests才迁移，拒绝保留原owner。安装中停止记取消意图，迟到registered转待Remove，Runtime继续持真实token至unregistered。它不持handle、不Clone/Copy、不Drop注销，不另建接收集合；业务仍拥有mask/终态/公平与实际对象。ObservationSlot、RPC Dispatcher/Outbox及fs/pm任务共用此值，族类型必须转发真实登记/拒绝/注销回执，输入hint不能建立登记owner。
+任务侧[SourceRegistration](../../user/libraries/libexecution/src/source_registration.rs)拥有Empty/Installing(kind)/CancellingInstall(kind)/Attached(id)/RemovePending(id)/Removing(id)寿命；命令成功入Requests才迁移，拒绝保留原owner。出生资金为 SourceFunding::Task 或 Bound(view)：Task 在 advance 暂存登记时解析当前 Slot 的不可变 view，funded/with_funding 在出生时绑定具体 view；phase 复位不清绑定，也没有 set_payer。安装中停止记取消意图，迟到registered转待Remove，Runtime继续持真实token至unregistered。它不持handle、不Clone/Copy、不Drop注销，不另建接收集合；业务仍拥有mask/终态/公平与实际对象。ObservationSlot、RPC Dispatcher/Outbox及fs/pm任务共用此值，族类型必须转发真实登记/拒绝/注销回执，输入hint不能建立登记owner。
 
-[`WorkQueue`](../../user/libraries/libexecution/src/work_queue.rs)持预付任务槽，Finalizing FIFO复用原槽链，每轮只推进一份注销/退休责任，与Runtime来源retry timer交替。阻塞项回尾部，持续新准入不能插队；元工作计数防全阻塞自旋。业务期限与执行退避共用一份`Pin<Box<TaskTimers>>`存储，其中两个节点独立登记、取消和成熟；私有不可移动投影保持地址稳定，任务归还前必须先摘两链。构造失败返原任务。成功advance进入Gate及注册/拒绝/注销回调后同步任务期限；非Gate stop/unregistered先兑现已成熟期限再回调、随后同步，Active才武装，Finalizing不重装业务timer。非法新期限保原Task与身份报错，不吞清理责任；取消未到期deadline不制造迟到timeout。
+[`WorkQueue`](../../user/libraries/libexecution/src/work_queue.rs)接收 [TaskSubmission](../../user/libraries/libexecution/src/funding.rs) 的 task/max_sources/不可变 execution view，Task=1 由该 view 扣账；失败完整返还原提交物。Slot 持同一 view 与实际 Task Charge，Finalizing FIFO复用原槽链，每轮只推进一份注销/退休责任，与Runtime来源retry timer交替。阻塞项回尾部，持续新准入不能插队；元工作计数防全阻塞自旋。业务期限与执行退避共用一份`Pin<Box<TaskTimers>>`存储，其中两个节点独立登记、取消和成熟；私有不可移动投影保持地址稳定，任务归还前必须先摘两链。成功advance进入Gate及注册/拒绝/注销回调后同步任务期限；非Gate stop/unregistered先兑现已成熟期限再回调、随后同步，Active才武装，Finalizing不重装业务timer。非法新期限保原Task与身份报错，不吞清理责任；取消未到期deadline不制造迟到timeout。
+
+Runtime 构造的 sponsor 只支付固定基础设施，fixed_input_budget 与 source_input_budget 分别计算固定存储和同时存活来源的现有 InputBytes 口径，checked 溢出返回错误。Runtime 独占私有 CommandBuffer；Requests<'a,T> 只在当前 advance 内借用 Slot 的非可选资金与暂存区，不可默认构造、复制或逃逸寿命。暂存 Spawn 拥有完整 TaskSubmission，Register 拥有已解析 view，advance 结束后 Gate 才消费；refused/registered/unregistered/stop 无 Requests，不能提交命令或读取 scope 付款。
 
 非空 Runtime Drop 或接收 owner 提前 Drop 使整个装配失效；准入/推进/shutdown 在业务回调前拒绝，异常 Drop 仅清理自身登记，最后集合/进程边界接管。业务错误通过原 Runtime Hold/退休保留任务，不使用此异常路径。Framework 不建立孤儿来源队列或第二清理 actor。
 

@@ -1,10 +1,10 @@
 //! 入站请求的有界回复投递与退休。
 
 use erhino_shared::{call::SystemCallError, object::ObjectSignals, time::Deadline};
-use libexecution::SourceRegistration;
 use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
+use libexecution::{SourceFunding, SourceRegistration};
 
 use crate::{
     exchange::{CallCause, PreparedResponse, RequestContext, ResponseFailure, cause},
@@ -45,6 +45,7 @@ impl Outbox {
         capacity: usize,
         deadline: Deadline,
         source_kind: u64,
+        funding: &SourceFunding,
     ) -> Result<Self, ResponseFailure> {
         if deadline.instant().is_err() {
             return Err(ResponseFailure {
@@ -53,15 +54,25 @@ impl Outbox {
             });
         }
         let response = PreparedResponse::new(context, capacity)?;
-        Ok(Self::from_prepared(response, deadline, source_kind))
+        Ok(Self::from_prepared(
+            response,
+            deadline,
+            source_kind,
+            funding,
+        ))
     }
 
-    pub fn from_prepared(response: PreparedResponse, deadline: Deadline, source_kind: u64) -> Self {
+    pub fn from_prepared(
+        response: PreparedResponse,
+        deadline: Deadline,
+        source_kind: u64,
+        funding: &SourceFunding,
+    ) -> Self {
         Self {
             response: Some(response),
             deadline,
             source_kind,
-            registration: SourceRegistration::new(),
+            registration: SourceRegistration::with_funding(funding.clone()),
             source_writable: false,
             operation_retry: false,
             stage: OutboundStage::Ready,
@@ -98,13 +109,13 @@ impl Outbox {
         }
     }
 
-    fn declare_remove<F>(&mut self, requests: &mut Requests<F>) {
+    fn declare_remove<F>(&mut self, requests: &mut Requests<'_, F>) {
         if self.result.is_some() && !self.registration.is_removing() {
             self.operation_retry = self.registration.remove(requests).is_err();
         }
     }
 
-    fn ensure_registration<F>(&mut self, requests: &mut Requests<F>) {
+    fn ensure_registration<F>(&mut self, requests: &mut Requests<'_, F>) {
         if self.result.is_some()
             || self.registration.is_installing()
             || self.registration.is_removing()
@@ -193,7 +204,7 @@ impl Outbox {
     }
 
     /// 业务 Commit 前只完成来源准入，不发送尚未编码的回复。
-    pub fn admit<F>(&mut self, requests: &mut Requests<F>) -> Advance {
+    pub fn admit<F>(&mut self, requests: &mut Requests<'_, F>) -> Advance {
         self.operation_retry = false;
         self.ensure_registration(requests);
         Advance {
@@ -209,7 +220,7 @@ impl Outbox {
 
     pub fn drive<F>(
         &mut self,
-        requests: &mut Requests<F>,
+        requests: &mut Requests<'_, F>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
         if budget == 0 {
@@ -244,7 +255,7 @@ impl Outbox {
 
     pub fn advance<F>(
         &mut self,
-        requests: &mut Requests<F>,
+        requests: &mut Requests<'_, F>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {

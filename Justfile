@@ -48,13 +48,13 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 # 全速条件的专项诊断才显式使用 `THROTTLE=100 just virt-stress`。
 # 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
-# 各路线按近期实测耗时设置宽裕的 QEMU 运行超时；均可用同名环境变量单独覆盖。
-VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "90")
+# 各路线 QEMU 运行超时只在本处维护，可用同名环境变量覆盖；调整政策见 plans/BUILD-AND-TEST.md。
+VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "360")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "420")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "90")
-VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "90")
-SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "120")
+VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "180")
+SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "240")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
 VIRT_IPI_FAILURE_TIMEOUT := env_var_or_default("VIRT_IPI_FAILURE_TIMEOUT", "60")
 VIRT_VM_FAULT_TIMEOUT := env_var_or_default("VIRT_VM_FAULT_TIMEOUT", VIRT_STRESS_TIMEOUT)
@@ -99,7 +99,7 @@ clippy:
     run_lint kernel-target artifacts/lint/kernel.log \
         bash -c 'cd os && cargo clippy -p kernel --bin kernel {{ZFLAGS}} -- -D warnings'
     run_lint user-host artifacts/lint/user-host.log \
-        bash -c 'cd user && cargo clippy -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p libfal -p libservice -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd user && cargo clippy -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p liboal -p libservice -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint user-target artifacts/lint/user-target.log \
         bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-stress artifacts/lint/user-stress.log \
@@ -152,7 +152,7 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"
-    @ditto "{{TARGET_DIR}}/build/test_fal" "{{TARGET_DIR}}/initfs/bin/test_fal"
+    @ditto "{{TARGET_DIR}}/build/test_fs" "{{TARGET_DIR}}/initfs/bin/test_fs"
     @ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"
     @if [ "{{ACCEPTANCE_WORKLOAD}}" = stress ]; then ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"; fi
     @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done

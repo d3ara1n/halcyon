@@ -12,7 +12,6 @@ use crate::{
     JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
 };
 use libkernel::ipc::message::{create, send_raw, wait_message};
-use libkernel::ipc::notification;
 use libkernel::ipc::object::{close, duplicate};
 use libkernel::ipc::wait::wait_until;
 use libkernel::preclude::*;
@@ -73,8 +72,18 @@ impl RaceHammers {
                 Rights::READ | Rights::WAIT | Rights::MANAGE,
                 Rights::WRITE | Rights::WAIT | Rights::GRANT | Rights::DUPLICATE,
             )?;
-            let gun_pair =
-                notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
+            let gun_pair = {
+                let mut pair =
+                    libkernel::shared::object::HandlePair::new(Handle::INVALID, Handle::INVALID); /* SAFETY: ABI 夹具独占有效输出及新表项关闭责任。 */
+                unsafe {
+                    libkernel::sys_notification_create(
+                        Rights::READ | Rights::WAIT | Rights::GRANT,
+                        Rights::SIGNAL,
+                        &mut pair,
+                    )
+                }
+                .map(|()| pair)
+            }?;
             let grants = [
                 HandleGrant {
                     handle: cmd_pair.owner,
@@ -171,7 +180,7 @@ impl RaceHammers {
 
     fn fire(&self, hammers: &[usize]) {
         for &i in hammers {
-            let _ = notification::signal(self.guns[i], 1);
+            let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(self.guns[i], 1) };
         }
     }
 
@@ -261,8 +270,17 @@ fn spawn_race_target(
     subrole: u64,
     code: u64,
 ) -> Result<(Spawned, Handle), SystemCallError> {
-    let gun_pair =
-        notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
+    let gun_pair = {
+        let mut pair = libkernel::shared::object::HandlePair::new(Handle::INVALID, Handle::INVALID); /* SAFETY: ABI 夹具独占有效输出及新表项关闭责任。 */
+        unsafe {
+            libkernel::sys_notification_create(
+                Rights::READ | Rights::WAIT | Rights::GRANT,
+                Rights::SIGNAL,
+                &mut pair,
+            )
+        }
+        .map(|()| pair)
+    }?;
     let payload = race::encode_payload(&[race::MODE_TARGET, subrole, code]);
     let mut grants = alloc::vec![HandleGrant {
         handle: gun_pair.owner,
@@ -308,8 +326,17 @@ fn spawn_tunnel_exit_target(
     invitation: Handle,
     mapped_bytes: usize,
 ) -> Result<(Spawned, Handle), SystemCallError> {
-    let gun_pair =
-        notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)?;
+    let gun_pair = {
+        let mut pair = libkernel::shared::object::HandlePair::new(Handle::INVALID, Handle::INVALID); /* SAFETY: ABI 夹具独占有效输出及新表项关闭责任。 */
+        unsafe {
+            libkernel::sys_notification_create(
+                Rights::READ | Rights::WAIT | Rights::GRANT,
+                Rights::SIGNAL,
+                &mut pair,
+            )
+        }
+        .map(|()| pair)
+    }?;
     let grants = [
         HandleGrant {
             handle: gun_pair.owner,
@@ -409,7 +436,7 @@ fn observe_member_completion(job: Handle, pid: u64, allowed: &[u32]) -> bool {
 /// 靶枪与锤枪连发（fire 顺序无关紧要：电平语义不丢令，窗口差只是一个
 /// ecall）。
 fn fire_race(h: &RaceHammers, target_gun: Handle, hammers: &[usize]) {
-    let _ = notification::signal(target_gun, 1);
+    let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(target_gun, 1) };
     h.fire(hammers);
 }
 
@@ -617,7 +644,7 @@ fn cover_last_thread_exit_kill_outcomes(h: &RaceHammers, job: Handle, image: &[u
         };
     // 目标主线程先退出，次线程在枪上等待；发枪后终因确定为 Completed。
     unsafe { sys_sleep(30).expect("last-thread exit-first setup sleep failed") };
-    let exit_signal = notification::signal(exit_gun, 1).is_ok();
+    let exit_signal = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(exit_gun, 1) }.is_ok();
     let exited = observe_dead(exit_target.control, &[TerminationCause::Completed as u32]).is_some();
     let _ = unsafe { close(exit_target.control) };
     let _ = unsafe { close(exit_gun) };
@@ -693,7 +720,7 @@ fn race_last_thread_exit_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> boo
             h.fire(&[0]);
             // SAFETY: kill 先行窗口；signal 失败表示 owner 已随终止关闭，同样合法。
             let _ = unsafe { sys_sleep(1) };
-            let _ = notification::signal(gun, 1);
+            let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(gun, 1) };
         } else {
             fire_race(h, gun, &[0]);
         }
@@ -989,7 +1016,7 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
             return false;
         }
     };
-    let _ = notification::signal(gun, 1);
+    let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(gun, 1) };
     let allowed = [TerminationCause::Faulted as u32];
     let terminal = observe_dead(target.control, &allowed);
     let ok = terminal.is_some();
@@ -1013,7 +1040,7 @@ fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
             return false;
         }
     };
-    let _ = notification::signal(gun, 1);
+    let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(gun, 1) };
     let allowed = [TerminationCause::Completed as u32];
     let terminal = observe_dead(target.control, &allowed);
     let ok = terminal.is_some();
@@ -1083,7 +1110,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
             let _ = shared.load_u64(8, Ordering::Acquire);
             let _ = shared.load_u32(12, Ordering::Relaxed);
         }
-        let _ = notification::signal(gun, 1);
+        let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(gun, 1) };
         let terminal = observe_dead(target.control, &[TerminationCause::Completed as u32]);
         let peer_closed = endpoint
             .events()

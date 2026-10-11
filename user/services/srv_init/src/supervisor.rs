@@ -4,10 +4,14 @@
 
 use super::*;
 use alloc::vec::Vec;
+use libbudget::AccountView;
+use libexecution::TaskSubmission;
 use libexecution::assembly::Assembly;
 use libexecution::runtime::{DriveState, TaskFailure};
 use libkernel::shared::time::Deadline;
 use libprocess::{Collector, job_driver::JobDriver};
+
+mod funding;
 
 const ROOT_JOB_SLOTS: usize = 2;
 
@@ -68,7 +72,7 @@ impl Task<JobWorld> for JobTask {
         &mut self,
         _id: u64,
         world: &mut JobWorld,
-        requests: &mut Requests<Self>,
+        requests: &mut Requests<'_, Self>,
         input: &mut Input<'_>,
         _budget: usize,
     ) -> Result<Advance, SystemCallError> {
@@ -101,6 +105,7 @@ impl Task<JobWorld> for JobTask {
 }
 
 struct JobDuty {
+    funding: Option<AccountView<ExecutionResource>>,
     active: bool,
     root: Handle,
     pending: Option<JobTask>,
@@ -112,6 +117,7 @@ struct JobDuty {
     failed_task: Option<u64>,
 }
 struct BatchDuty {
+    funding: Option<AccountView<ExecutionResource>>,
     incoming: Vec<Supervised>,
     one: Option<Supervised>,
     pending: Option<SuperviseTask>,
@@ -125,7 +131,11 @@ struct BatchDuty {
     complete: bool,
 }
 struct ReadDuty {
-    pending: Option<InitTask>,
+    funding: Option<AccountView<ExecutionResource>>,
+    pending: Vec<InitTask>,
+    client_count: usize,
+    client_sources: usize,
+    rpc_sources: usize,
     runtime: Option<Runtime<InitTask, WaitSet>>,
     world: ReadWorld,
     disposition: Disposition,
@@ -163,12 +173,16 @@ impl<T> Cleanup<T> {
 enum RootCapability {
     Plain(Capability),
     Sender(MailboxSender),
+    NotificationOwner(notification::NotificationOwner),
+    NotificationSignaler(notification::NotificationSignaler),
 }
 impl RootCapability {
     fn handle(&self) -> Handle {
         match self {
             Self::Plain(owner) => owner.as_handle(),
             Self::Sender(owner) => owner.as_handle(),
+            Self::NotificationOwner(owner) => owner.as_handle(),
+            Self::NotificationSignaler(owner) => owner.as_handle(),
         }
     }
     fn transferred(self) {
@@ -178,6 +192,12 @@ impl RootCapability {
             }
             Self::Sender(owner) => {
                 owner.into_capability().into_raw();
+            }
+            Self::NotificationOwner(owner) => {
+                owner.into_raw();
+            }
+            Self::NotificationSignaler(owner) => {
+                owner.into_raw();
             }
         }
     }
@@ -189,6 +209,12 @@ impl RootCapability {
             Self::Sender(owner) => owner
                 .close()
                 .map_err(|(owner, error)| (Self::Sender(owner), error)),
+            Self::NotificationOwner(owner) => owner
+                .close()
+                .map_err(|(owner, error)| (Self::NotificationOwner(owner), error)),
+            Self::NotificationSignaler(owner) => owner
+                .close()
+                .map_err(|(owner, error)| (Self::NotificationSignaler(owner), error)),
         }
     }
 }
@@ -222,6 +248,13 @@ enum Await {
     Job(usize),
     Batch(usize),
     Read,
+    ClientSnapshot,
+    ClientCycle(u64),
+    CopyProgress(usize, u64),
+    CopySent(usize, bool),
+    RpcParked,
+    RpcReply,
+    LateReply,
 }
 
 fn can_drive<T>(rt: &Runtime<T, WaitSet>, now: u64) -> bool {
@@ -254,17 +287,34 @@ fn fold_wait<T>(
     }
 }
 
+/// duty 在实际提交出生前准备一次付款；失败重试继续借用原 view。
+fn prepare_funding<T>(
+    slot: &mut Option<AccountView<ExecutionResource>>,
+    capacity: usize,
+    sources: usize,
+) -> Result<AccountView<ExecutionResource>, SystemCallError> {
+    if let Some(funding) = slot {
+        return Ok(funding.clone());
+    }
+    let bytes = Runtime::<T, WaitSet>::fixed_input_budget(sources)?
+        .checked_add(Runtime::<T, WaitSet>::source_input_budget(sources)?)
+        .ok_or(SystemCallError::ReachLimit)?;
+    let budget = Budget::new(&[capacity, bytes], 1)?;
+    let account = budget.account(&[capacity, bytes])?;
+    let account = account.view::<ExecutionResource>(&[
+        budget.slot(0).ok_or(SystemCallError::IllegalArgument)?,
+        budget.slot(1).ok_or(SystemCallError::IllegalArgument)?,
+    ])?;
+    *slot = Some(account.clone());
+    Ok(account)
+}
 fn runtime<T>(
     assembly: &Assembly<WaitSet>,
     capacity: usize,
     sources: usize,
+    funding: &AccountView<ExecutionResource>,
 ) -> Result<Runtime<T, WaitSet>, SystemCallError> {
-    let bytes = Runtime::<T, WaitSet>::input_budget(sources)?;
-    let budget = Budget::new(&[capacity, bytes], 1)?;
-    let account = budget.account(&[capacity, bytes])?;
-    let account =
-        account.view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])?;
-    Runtime::new(assembly.bind()?, capacity, sources, &account)
+    Runtime::new(assembly.bind()?, capacity, sources, funding)
 }
 
 /// 关闭失败把原运行体放回原槽；该操作不需要申请新的错误承载。
@@ -439,13 +489,6 @@ impl RootSupervisor {
         }
     }
 
-    pub(super) fn own_sender(&mut self, sender: MailboxSender) -> Result<Handle, SystemCallError> {
-        let [slot] = self.reserve_capabilities()?;
-        let handle = sender.as_handle();
-        self.capabilities[slot].owner = Some(RootCapability::Sender(sender));
-        Ok(handle)
-    }
-
     pub(super) fn create_mailbox(
         &mut self,
         owner: Rights,
@@ -481,7 +524,55 @@ impl RootSupervisor {
         owner: Rights,
         signaler: Rights,
     ) -> Result<libkernel::shared::object::HandlePair, SystemCallError> {
-        self.create_pair(|| notification::create(owner, signaler))
+        let slots: [usize; 2] = self.reserve_capabilities()?;
+        match notification::create(owner, signaler) {
+            Ok(pair) => {
+                let handles = libkernel::shared::object::HandlePair::new(
+                    pair.owner.as_handle(),
+                    pair.peer.as_handle(),
+                );
+                self.capabilities[slots[0]].reserved = false;
+                self.capabilities[slots[0]].owner =
+                    Some(RootCapability::NotificationOwner(pair.owner));
+                self.capabilities[slots[1]].reserved = false;
+                self.capabilities[slots[1]].owner =
+                    Some(RootCapability::NotificationSignaler(pair.peer));
+                Ok(handles)
+            }
+            Err(error) => {
+                for slot in slots {
+                    self.capabilities[slot].reserved = false;
+                }
+                Err(error)
+            }
+        }
+    }
+    pub(super) fn notification_owner(&self, handle: Handle) -> &notification::NotificationOwner {
+        self.capabilities
+            .iter()
+            .find_map(|entry| match &entry.owner {
+                Some(RootCapability::NotificationOwner(owner)) if owner.as_handle() == handle => {
+                    Some(owner)
+                }
+                _ => None,
+            })
+            .expect("notification owner remains in the root ledger")
+    }
+    pub(super) fn notification_signaler(
+        &self,
+        handle: Handle,
+    ) -> &notification::NotificationSignaler {
+        self.capabilities
+            .iter()
+            .find_map(|entry| match &entry.owner {
+                Some(RootCapability::NotificationSignaler(owner))
+                    if owner.as_handle() == handle =>
+                {
+                    Some(owner)
+                }
+                _ => None,
+            })
+            .expect("notification signaler remains in the root ledger")
     }
     pub(super) fn sender(&self, handle: Handle) -> &MailboxSender {
         self.capabilities
@@ -629,6 +720,7 @@ impl RootSupervisor {
             .position(Option::is_none)
             .expect("root job slots cover the original operation and services escalation");
         self.jobs[index] = Some(JobDuty {
+            funding: None,
             active: true,
             root,
             pending: machine.map(|machine| JobTask {
@@ -745,6 +837,7 @@ impl RootSupervisor {
             .expect("batch slots cover the original batch and service handoff");
         let capacity = incoming.len() + usize::from(one.is_some());
         self.batches[index] = Some(BatchDuty {
+            funding: None,
             incoming,
             one,
             pending: None,
@@ -914,8 +1007,11 @@ impl RootSupervisor {
         results
             .try_reserve_exact(2)
             .map_err(|_| "handoff output preparation failed")?;
-        let test_runtime =
-            runtime(&self.assembly, 1, 2).map_err(|_| "handoff runtime preparation failed")?;
+        let mut test_funding = None;
+        let test_view = prepare_funding::<SuperviseTask>(&mut test_funding, 1, 2)
+            .map_err(|_| "handoff funding preparation failed")?;
+        let test_runtime = runtime(&self.assembly, 1, 2, &test_view)
+            .map_err(|_| "handoff runtime preparation failed")?;
         incoming.push(self.processes.pop().expect("two controls were verified"));
         incoming.push(self.processes.pop().expect("two controls were verified"));
         let index = self.begin_batch(incoming, None);
@@ -923,6 +1019,7 @@ impl RootSupervisor {
             .as_mut()
             .expect("handoff batch remains owned");
         duty.runtime = Some(test_runtime);
+        duty.funding = test_funding;
         duty.world.results = results;
         let target = duty.incoming.pop().expect("handoff input remains owned");
         let policy = libprocess::SupervisionPolicy {
@@ -989,23 +1086,354 @@ impl RootSupervisor {
     pub(super) fn start_read(&mut self, tunnel: blocking::Consumer, buffer: Vec<u8>) {
         assert!(self.read.is_none(), "read duty must not be overwritten");
         self.read = Some(ReadDuty {
-            pending: Some(InitTask::StreamRead(StreamReadTask {
+            funding: None,
+            pending: alloc::vec![InitTask::StreamRead(StreamReadTask {
                 source: None,
                 arm_failed: None,
                 stopping: false,
                 removing: false,
-            })),
+            })],
+            client_count: 1,
+            client_sources: 2,
+            rpc_sources: 0,
             runtime: None,
             world: ReadWorld {
                 tunnel: Some(tunnel),
                 buffer,
                 filled: 0,
                 failed: false,
+                ..ReadWorld::default()
             },
             disposition: Disposition::default(),
             error: None,
             complete: false,
         });
+    }
+    fn start_client(
+        &mut self,
+        pending: InitTask,
+        inflight: usize,
+        client_sources: usize,
+    ) -> Result<(), &'static str> {
+        let mut clients = Vec::new();
+        clients
+            .try_reserve_exact(1)
+            .map_err(|_| "client preparation failed")?;
+        clients.push(pending);
+        self.start_clients(clients, inflight, client_sources, ReadWorld::default(), None)
+    }
+    fn start_clients(
+        &mut self,
+        pending: Vec<InitTask>,
+        inflight: usize,
+        client_sources: usize,
+        mut world: ReadWorld,
+        mut funding: Option<AccountView<ExecutionResource>>,
+    ) -> Result<(), &'static str> {
+        assert!(self.read.is_none(), "client duty must not be overwritten");
+        let rpc_sources = librpc::dispatcher::Dispatcher::source_capacity(inflight)
+            .map_err(|_| "client source capacity invalid")?;
+        let client_count = pending.len();
+        let sources = rpc_sources
+            .checked_add(
+                client_sources
+                    .checked_mul(client_count)
+                    .ok_or("client source capacity overflow")?,
+            )
+            .ok_or("client source capacity overflow")?;
+        let view = prepare_funding::<InitTask>(&mut funding, client_count + 1, sources)
+            .map_err(|_| "client funding preparation failed")?;
+        let rpc = librpc::dispatcher::Dispatcher::new(inflight, &view)
+            .map_err(|_| "client transport preparation failed")?;
+        world
+            .client_tasks
+            .try_reserve_exact(client_count)
+            .map_err(|_| "client identity storage failed")?;
+        world.rpc = Some(rpc);
+        self.read = Some(ReadDuty {
+            funding,
+            pending,
+            client_count,
+            client_sources,
+            rpc_sources,
+            runtime: None,
+            world,
+            disposition: Disposition::default(),
+            error: None,
+            complete: false,
+        });
+        Ok(())
+    }
+    pub(super) fn start_copies(
+        &mut self,
+        copies: Vec<libfs::client::copy::CopyTask>,
+    ) -> Result<(), &'static str> {
+        use libfs::client::copy::CopyTask;
+        let count = copies.len();
+        if count == 0 {
+            return Err("Copy batch is empty");
+        }
+        let mut world = ReadWorld::default();
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(count)
+            .map_err(|_| "Copy task storage failed")?;
+        world
+            .copies
+            .try_reserve_exact(count)
+            .map_err(|_| "Copy observation storage failed")?;
+        for (slot, task) in copies.into_iter().enumerate() {
+            world.copies.push(crate::CopyObservation {
+                outcome: None,
+                progress: task.progress(),
+                done: false,
+                hold: false,
+            });
+            pending.push(InitTask::Copy {
+                task: alloc::boxed::Box::try_new(task)
+                    .map_err(|_| "Copy task preparation failed")?,
+                slot,
+            });
+        }
+        self.start_clients(pending, count, CopyTask::source_capacity(), world, None)
+    }
+    pub(super) fn await_copy_progress(
+        &mut self,
+        slot: usize,
+        transported: u64,
+    ) -> Result<(), &'static str> {
+        loop {
+            self.turn_and_wait(Some(Await::CopyProgress(slot, transported)))
+                .map_err(|_| "Copy progress wait failed")?;
+            if self
+                .read
+                .as_ref()
+                .is_some_and(|d| d.error.is_some() || d.world.failed || d.complete)
+            {
+                return Err("Copy duty stopped before progress");
+            }
+            let world = self.read_world();
+            if matches!(world.copies[slot].progress, libfs::client::copy::Progress::Stream(p) if p.transported >= transported)
+            {
+                return Ok(());
+            }
+            if world.copies[slot].outcome.is_some() {
+                return Err("Copy ended before requested progress");
+            }
+        }
+    }
+    pub(super) fn await_copy_sent(
+        &mut self,
+        slot: usize,
+        creation: bool,
+    ) -> Result<(), &'static str> {
+        loop {
+            self.turn_and_wait(Some(Await::CopySent(slot, creation)))
+                .map_err(|_| "Copy send wait failed")?;
+            if self
+                .read
+                .as_ref()
+                .is_some_and(|d| d.error.is_some() || d.world.failed || d.complete)
+            {
+                return Err("Copy duty stopped before send");
+            }
+            let duty = self.read.as_mut().expect("Copy duty remains owned");
+            if let Some(&id) = duty.world.client_tasks.get(slot)
+                && let Some(InitTask::Copy { task, .. }) =
+                    duty.runtime.as_mut().and_then(|rt| rt.get_task_mut(id))
+                && task.call_phase(
+                    duty.world
+                        .rpc
+                        .as_ref()
+                        .expect("Copy transport remains owned"),
+                ) == Some(librpc::CallPhase::Sent)
+                && (!creation || task.creation() == libfs::client::copy::Creation::Unknown)
+            {
+                return Ok(());
+            }
+            if duty.world.copies[slot].outcome.is_some() {
+                return Err("Copy ended before send window");
+            }
+        }
+    }
+    pub(super) fn set_copy_hold(&mut self, slot: usize, hold: bool) -> Result<(), &'static str> {
+        let duty = self.read.as_mut().expect("Copy duty remains owned");
+        duty.world.copies[slot].hold = hold;
+        if let Some(&id) = duty.world.client_tasks.get(slot) {
+            duty.runtime
+                .as_mut()
+                .expect("Copy runtime remains owned")
+                .wake(id)
+                .map_err(|_| "Copy continuation wake failed")?;
+        }
+        Ok(())
+    }
+    pub(super) fn await_copy_late_reply(&mut self) -> Result<(), &'static str> {
+        loop {
+            self.turn_and_wait(Some(Await::LateReply))
+                .map_err(|_| "Copy late reply wait failed")?;
+            let duty = self.read.as_ref().expect("Copy duty remains owned");
+            if duty.error.is_some() || duty.world.failed || duty.complete {
+                return Err("Copy duty stopped before late reply");
+            }
+            if duty.world.ignored_rpc_replies != 0 {
+                return Ok(());
+            }
+            if duty.world.copies.iter().all(|copy| copy.outcome.is_some()) {
+                return Err("Copy ended without observed late reply");
+            }
+        }
+    }
+    pub(super) fn cancel_copy(&mut self, slot: usize) -> Result<(), &'static str> {
+        let duty = self.read.as_mut().expect("Copy duty remains owned");
+        let id = duty.world.client_tasks[slot];
+        let runtime = duty.runtime.as_mut().expect("Copy runtime remains owned");
+        match runtime
+            .get_task_mut(id)
+            .expect("Copy task remains admitted")
+        {
+            InitTask::Copy { task, .. } => task.cancel(
+                duty.world
+                    .rpc
+                    .as_mut()
+                    .expect("Copy transport remains owned"),
+            ),
+            _ => unreachable!("Copy task changed family role"),
+        }
+        duty.world.copies[slot].hold = false;
+        runtime
+            .wake(id)
+            .map_err(|_| "Copy cancellation wake failed")
+    }
+    pub(super) fn seal_copy_transport(&mut self) -> Result<(), &'static str> {
+        let duty = self.read.as_mut().expect("Copy duty remains owned");
+        duty.world.rpc_sealed = true;
+        duty.world.rpc_parked = false;
+        duty.world
+            .rpc
+            .as_mut()
+            .expect("Copy transport remains owned")
+            .stop(&mut ());
+        duty.runtime
+            .as_mut()
+            .expect("Copy runtime remains owned")
+            .wake(
+                duty.world
+                    .rpc_task
+                    .expect("Copy transport remains admitted"),
+            )
+            .map_err(|_| "Copy transport stop wake failed")?;
+        loop {
+            self.turn_and_wait(Some(Await::RpcParked))
+                .map_err(|_| "Copy transport retirement wait failed")?;
+            if self
+                .read
+                .as_ref()
+                .is_some_and(|d| d.error.is_some() || d.world.failed || d.complete)
+            {
+                return Err("Copy transport stopped before retirement barrier");
+            }
+            if self.read_world().rpc_parked {
+                return Ok(());
+            }
+        }
+    }
+    pub(super) fn start_fs_watch(
+        &mut self,
+        watch: libfs::client::Watch,
+        deadline: Deadline,
+    ) -> Result<(), &'static str> {
+        use librpc::subscription::ConsumerTask;
+        let task = alloc::boxed::Box::try_new(ConsumerTask::new(watch, deadline))
+            .map_err(|_| "file consumer preparation failed")?;
+        self.start_client(
+            InitTask::FsWatch(task),
+            ConsumerTask::<libfs::client::Watch>::inflight_capacity(),
+            ConsumerTask::<libfs::client::Watch>::source_capacity(),
+        )
+    }
+    pub(super) fn start_service_watch(
+        &mut self,
+        watch: libservice::client::Watch,
+        deadline: Deadline,
+    ) -> Result<(), &'static str> {
+        use librpc::subscription::ConsumerTask;
+        let task = alloc::boxed::Box::try_new(ConsumerTask::new(watch, deadline))
+            .map_err(|_| "service consumer preparation failed")?;
+        self.start_client(
+            InitTask::ServiceWatch(task),
+            ConsumerTask::<libservice::client::Watch>::inflight_capacity(),
+            ConsumerTask::<libservice::client::Watch>::source_capacity(),
+        )
+    }
+    pub(super) fn await_client_snapshot(&mut self) -> Result<(), &'static str> {
+        loop {
+            self.turn_and_wait(Some(Await::ClientSnapshot))
+                .map_err(|_| "client supervision wait failed")?;
+            let duty = self.read.as_ref().expect("client duty remains owned");
+            if duty.error.is_some() || duty.world.failed || duty.complete {
+                return Err("client subscription stopped before snapshot");
+            }
+            if duty.world.fs_snapshot.is_some() || duty.world.service_snapshot.is_some() {
+                assert!(
+                    duty.world.source_detached,
+                    "watch source remained attached during recheck"
+                );
+                return Ok(());
+            }
+        }
+    }
+    pub(super) fn acknowledge_client_snapshot(&mut self) -> Result<(), &'static str> {
+        let duty = self.read.as_mut().expect("client duty remains owned");
+        let id = duty
+            .world
+            .client_tasks
+            .first()
+            .copied()
+            .expect("client task remains admitted");
+        let runtime = duty.runtime.as_mut().expect("client runtime remains owned");
+        match runtime.get_task_mut(id).expect("client task remains owned") {
+            InitTask::FsWatch(task) => task.acknowledge_read(),
+            InitTask::ServiceWatch(task) => task.acknowledge_read(),
+            _ => unreachable!("client task changed family role"),
+        }
+        .map_err(|_| "client recheck acknowledgement failed")?;
+        duty.world.fs_snapshot = None;
+        duty.world.service_snapshot = None;
+        runtime
+            .wake(id)
+            .map_err(|_| "client continuation wake failed")
+    }
+    pub(super) fn await_client_cycle(&mut self, cycle: u64) -> Result<(), &'static str> {
+        loop {
+            self.turn_and_wait(Some(Await::ClientCycle(cycle)))
+                .map_err(|_| "client cycle wait failed")?;
+            let duty = self.read.as_ref().expect("client duty remains owned");
+            if duty.error.is_some() || duty.world.failed || duty.complete {
+                return Err("client subscription stopped before cycle");
+            }
+            if duty.world.client_cycles >= cycle && duty.world.client_armed {
+                return Ok(());
+            }
+        }
+    }
+    pub(super) fn stop_client(&mut self) -> Result<(), &'static str> {
+        let duty = self.read.as_mut().expect("client duty remains owned");
+        let id = duty
+            .world
+            .client_tasks
+            .first()
+            .copied()
+            .expect("client task remains admitted");
+        let rt = duty.runtime.as_mut().expect("client runtime remains owned");
+        match rt.get_task_mut(id).expect("client task remains owned") {
+            InitTask::FsWatch(task) => task.stop(),
+            InitTask::ServiceWatch(task) => task.stop(),
+            _ => unreachable!("client task changed family role"),
+        }
+        rt.wake(id).map_err(|_| "client stop wake failed")?;
+        self.await_read()?;
+        self.close_read()
     }
     pub(super) fn read_world(&mut self) -> &mut ReadWorld {
         &mut self.read.as_mut().expect("read duty remains owned").world
@@ -1042,19 +1470,20 @@ impl RootSupervisor {
         duty: &mut JobDuty,
         assembly: &Assembly<WaitSet>,
     ) -> Result<(), SystemCallError> {
+        let funding = prepare_funding::<JobTask>(&mut duty.funding, 1, 1)?;
         if duty.pending.is_none() && duty.runtime.is_none() {
             duty.pending = Some(JobTask {
                 driver: JobDriver::new(JobCollector::new(duty.root, DEFAULT_SUPERVISION_POLICY)?),
             });
         }
         if duty.runtime.is_none() {
-            duty.runtime = Some(runtime(assembly, 1, 1)?);
+            duty.runtime = Some(runtime(assembly, 1, 1, &funding)?);
         }
         let rt = duty.runtime.as_mut().expect("job runtime remains owned");
         if let Some(task) = duty.pending.take()
-            && let Err(failure) = rt.spawn(task, 1)
+            && let Err(failure) = rt.spawn(TaskSubmission::new(task, 1, funding))
         {
-            duty.pending = Some(failure.task);
+            duty.pending = Some(failure.submission.into_parts().0);
             return Err(failure.error);
         }
         Ok(())
@@ -1115,12 +1544,14 @@ impl RootSupervisor {
         if duty.complete || !duty.disposition.ready(now) {
             return Ok(());
         }
+        let funding =
+            prepare_funding::<SuperviseTask>(&mut duty.funding, duty.capacity, duty.capacity)?;
         if duty.runtime.is_none() {
             duty.world
                 .results
                 .try_reserve_exact(duty.capacity)
                 .map_err(|_| SystemCallError::OutOfMemory)?;
-            duty.runtime = Some(runtime(assembly, duty.capacity, duty.capacity)?);
+            duty.runtime = Some(runtime(assembly, duty.capacity, duty.capacity, &funding)?);
         }
         let rt = duty.runtime.as_mut().expect("batch runtime remains owned");
         if duty.pending.is_none()
@@ -1134,10 +1565,10 @@ impl RootSupervisor {
         if duty.admission_retry.is_none_or(|at| now >= at)
             && let Some(task) = duty.pending.take()
         {
-            match rt.spawn(task, 1) {
+            match rt.spawn(TaskSubmission::new(task, 1, funding)) {
                 Ok(_) => duty.admission_retry = None,
                 Err(failure) => {
-                    duty.pending = Some(failure.task);
+                    duty.pending = Some(failure.submission.into_parts().0);
                     duty.error.get_or_insert(failure.error);
                     duty.admission_retry = Some(later(now));
                 }
@@ -1218,6 +1649,23 @@ impl RootSupervisor {
         Ok(())
     }
 
+    fn abandon_clients(duty: &mut ReadDuty) -> Result<(), SystemCallError> {
+        for pending in &mut duty.pending {
+            match pending {
+                InitTask::FsWatch(task) => task.abandon_unadmitted()?,
+                InitTask::ServiceWatch(task) => task.abandon_unadmitted()?,
+                InitTask::Copy { task, slot } => {
+                    task.abandon_unadmitted()?;
+                    duty.world.copies[*slot].done = true;
+                    duty.world.copies[*slot].outcome = task.outcome();
+                }
+                _ => unreachable!("unadmitted client changed family role"),
+            }
+        }
+        duty.pending.clear();
+        duty.world.client_quiescent = duty.world.copies.iter().all(|copy| copy.done);
+        Ok(())
+    }
     fn step_read(
         duty: &mut ReadDuty,
         now: u64,
@@ -1230,22 +1678,81 @@ impl RootSupervisor {
         if duty.complete {
             return Ok(());
         }
-        if duty.world.buffer.is_empty() && !failing {
+        if failing && duty.runtime.is_none() && duty.world.rpc.is_some() {
+            Self::abandon_clients(duty)?;
+            // 尚无在途调用和来源；原生角色关闭即完成这一未准入运行体的收束。
+            drop(duty.world.rpc.take());
+            duty.world.client_quiescent = true;
+            duty.world.rpc_complete = true;
+            duty.complete = true;
+            return Ok(());
+        }
+        if duty.world.rpc.is_none() && duty.world.buffer.is_empty() && !failing {
             duty.world
                 .buffer
                 .try_reserve_exact(STREAM_LEN + 1)
                 .map_err(|_| SystemCallError::OutOfMemory)?;
             duty.world.buffer.resize(STREAM_LEN + 1, 0);
         }
+        if duty.world.client_tasks.capacity() < duty.client_count {
+            duty.world
+                .client_tasks
+                .try_reserve_exact(duty.client_count)
+                .map_err(|_| SystemCallError::OutOfMemory)?;
+        }
+        let sources = duty
+            .rpc_sources
+            .checked_add(
+                duty.client_sources
+                    .checked_mul(duty.client_count)
+                    .ok_or(SystemCallError::ReachLimit)?,
+            )
+            .ok_or(SystemCallError::ReachLimit)?;
+        let funding = prepare_funding::<InitTask>(
+            &mut duty.funding,
+            duty.client_count + usize::from(duty.world.rpc.is_some()),
+            sources,
+        )?;
         if duty.runtime.is_none() {
-            duty.runtime = Some(runtime(assembly, 1, 2)?);
+            duty.runtime = Some(runtime(
+                assembly,
+                duty.client_count + usize::from(duty.world.rpc.is_some()),
+                sources,
+                &funding,
+            )?);
+        }
+        if failing && !duty.pending.is_empty() && duty.world.rpc.is_some() {
+            Self::abandon_clients(duty)?;
+            duty.world
+                .rpc
+                .as_mut()
+                .expect("client transport remains owned")
+                .stop(&mut ());
         }
         let rt = duty.runtime.as_mut().expect("read runtime remains owned");
-        if let Some(task) = duty.pending.take()
-            && let Err(failure) = rt.spawn(task, 2)
-        {
-            duty.pending = Some(failure.task);
-            return Err(failure.error);
+        if duty.world.rpc.is_some() && duty.world.rpc_task.is_none() {
+            duty.world.rpc_task = Some(
+                rt.spawn(TaskSubmission::new(
+                    InitTask::Rpc {
+                        deadline: Deadline::INFINITE,
+                    },
+                    duty.rpc_sources,
+                    funding.clone(),
+                ))
+                .map_err(|failure| failure.error)?,
+            );
+        }
+        if !duty.pending.is_empty() {
+            let task = duty.pending.remove(0);
+            match rt.spawn(TaskSubmission::new(task, duty.client_sources, funding)) {
+                Ok(id) => {
+                    duty.world.client_tasks.push(id);
+                }
+                Err(failure) => {
+                    duty.pending.insert(0, failure.submission.into_parts().0);
+                    return Err(failure.error);
+                }
+            }
         }
         let result = if failing {
             rt.seal();
@@ -1472,6 +1979,41 @@ impl RootSupervisor {
                 .read
                 .as_ref()
                 .is_some_and(|d| d.complete || d.error.is_some() || d.world.failed),
+            Some(Await::ClientSnapshot) => self.read.as_ref().is_some_and(|d| {
+                d.complete
+                    || d.error.is_some()
+                    || d.world.failed
+                    || d.world.fs_snapshot.is_some()
+                    || d.world.service_snapshot.is_some()
+            }),
+            Some(Await::ClientCycle(cycle)) => self.read.as_ref().is_some_and(|d| {
+                d.complete
+                    || d.error.is_some()
+                    || d.world.failed
+                    || (d.world.client_cycles >= cycle && d.world.client_armed)
+            }),
+            Some(Await::CopyProgress(slot, count)) => self.read.as_ref().is_some_and(|d| {
+                d.complete || d.error.is_some() || d.world.copies[slot].outcome.is_some()
+                    || matches!(d.world.copies[slot].progress, libfs::client::copy::Progress::Stream(p) if p.transported >= count)
+            }),
+            Some(Await::CopySent(slot, creation)) => self.read.as_mut().is_some_and(|d| {
+                d.complete || d.error.is_some() || d.world.copies[slot].outcome.is_some()
+                || d.world.client_tasks.get(slot).copied().is_some_and(|id| {
+                    matches!(d.runtime.as_mut().and_then(|rt| rt.get_task_mut(id)), Some(InitTask::Copy {task,..})
+                        if task.call_phase(d.world.rpc.as_ref().expect("Copy transport remains owned")) == Some(librpc::CallPhase::Sent)
+                        && (!creation || task.creation() == libfs::client::copy::Creation::Unknown))
+                })
+            }),
+            Some(Await::RpcParked) => self.read.as_ref().is_some_and(|d| {
+                d.complete || d.error.is_some() || (d.world.rpc_sealed && d.world.rpc_parked)
+            }),
+            Some(Await::RpcReply) => self.read.as_ref().is_some_and(|d| {
+                d.complete || d.error.is_some() || d.world.failed
+                    || d.world.rpc.as_ref().is_some_and(librpc::dispatcher::Dispatcher::has_completed)
+            }),
+            Some(Await::LateReply) => self.read.as_ref().is_some_and(|d| {
+                d.complete || d.error.is_some() || d.world.ignored_rpc_replies != 0 || d.world.copies.iter().all(|copy| copy.outcome.is_some())
+            }),
             None => false,
         };
         if runnable || outcome {

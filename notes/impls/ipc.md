@@ -6,7 +6,7 @@ ABI 位于 `shared/erhino_shared/src/{object,message,wait,wait_set,call}.rs`，�
 
 [`os/capability`](../../os/capability/src/table.rs) 保存 generation slot、authority 与 rights，kind 从具体对象查询，没有独立 role。安装在表内 reserve 后放锁写回/必成提交出生，再回表 commit；shut 撤销返还资格时返回最后持有事件，锁外交付正常放弃。事件批次容量在 reserve 准备，commit 不分配。消息移动要求 TRANSIT，直接 grant 要求 GRANT；所有业务释放动作在表锁外交接。
 
-ObjectHeader 使用不回绕 KOID。HandleQuery 描述已有对象的 kind、rights、signals 与关联身份，不按身份打开对象或授予权限。Notification Owner 为 READ/WAIT/MANAGE/GRANT，Signaler 为 SIGNAL/TRANSIT/GRANT/DUPLICATE；Signaler 不可等待。NotificationObserve 从 Owner READ 或 Signaler SIGNAL 派生只读 NotificationObservation，权限为 WAIT/DUPLICATE/TRANSIT/GRANT，只观察 CLOSED。三种对象共享同一个 core、WaitQueue 和 Work；观察引用不增加业务 authority，关闭观察权不关闭 Owner，观察壳保留派生调用者付款 Pool。
+ObjectHeader 使用不回绕 KOID。HandleQuery 返回已有对象的 kind、rights、object_id、related_object_id、badge 与 reserved，不包含 signals 或 allowed_signals，也不按身份打开对象或授予权限。NotificationCore 持唯一 Owner/source header，Owner 自关联，Signaler 与 NotificationObserver 各持独立 header、关联同一 core KOID。Owner 上限 READ/WAIT/MANAGE/GRANT，Signaler 上限 SIGNAL/WAIT/TRANSIT/GRANT/DUPLICATE，Observer 上限 WAIT/DUPLICATE/TRANSIT/GRANT；Owner 与 Observer 观察 READABLE/CLOSED，Signaler 只观察 CLOSED。NotificationMintObserver(0x3d) 只接受 Owner[MANAGE]，输出必须含 WAIT 且不超 Observer 上限，不消费输入 Owner。三角色共享 core、WaitQueue 和 Work；Signaler、Observer 与等待 loan 都不增加 Owner 业务 holders，最后 Owner 关闭、清位，其他引用只保活观察存储。Observer 实际 Arc 壳由派生调用者 Pool 付款，沿共同 handle install 预约/锁外写回/commit；失败释放未交付 owner 和费用，已经接受后允许交付 CLOSED 观察角色。
 
 libkernel `Capability` 拥有合法非映射 entry，适用于叶对象和 affine owner；包装不自动授予 TRANSIT/GRANT。`into_raw` 移交唯一责任，失败 close 返还 owner；Drop 使用 `close_object_owner`，允许等待预付的内核退休，返回错误报告不变量破坏，不静默丢弃责任。WaitSet 的 `create_with_rights` 支持显式 GRANT，默认 `create` 权限仍为 READ/WAIT/MANAGE；`into_capability` 消耗原 owner，不复制关闭责任。
 
@@ -20,7 +20,7 @@ MailboxCreate 只交付 owner。MintSender 要求 owner MANAGE，原子创建独
 
 [`Lifetime`](../../os/kernel/src/task/lifetime.rs) 用同一 OBJECT_WAIT 域保存 authority/use 计数、电平与侵入式节点；计数双零永久 CLOSED。一个 Sender 持一份 LifetimeOwner，派生 OnceSender 独立取得父域 authority；最后 Sender capability、Once 的 Sent/Abandoned 各归还其 authority。每次准备 Delivery 取得一份仿射 LifetimeUse，失败退回，成功随排队/接收预留/接收 capability 转移。临时 Arc/观察 loan 不计入业务计数，Lifetime 只记录 sender KOID，不反向持发送对象。
 
-[`Delivery`](../../os/kernel/src/task/delivery.rs) 保存 use lease、数值 sender_context_id 与付款 Pool；最后 capability 在自身 LEAF 锁下取出 lease，锁外归还。业务 use 不依赖 Delivery 存储最终 Drop；未发布出生的 Drop 也退同一 lease。只允许 TRANSIT/GRANT，不可 DUPLICATE。Lifetime 及 ReplyObservation 的观察来源只提示等待 owner，不代摘节点；ReplyObservation 的 DONE/PEER_CLOSED 分别对应 Sent/Abandoned，Once 在 MAILBOX 锁内选定终态，持有操作 authority 的执行者在锁外发布。
+[`Delivery`](../../os/kernel/src/task/delivery.rs) 保存 use lease、数值 sender_context_id 与付款 Pool；最后 capability 在自身 LEAF 锁下取出 lease，锁外归还。业务 use 不依赖 Delivery 存储最终 Drop；未发布出生的 Drop 也退同一 lease。用户态 Delivery::finish 消费式关闭其唯一表项，只有成功后清空 owner；已移交领域责任的操作可以据此结束入口 use 并独立保管回复权，关闭失败不丢原 Delivery。只允许 TRANSIT/GRANT，不可 DUPLICATE。Lifetime 及 ReplyObserver 的观察来源只提示等待 owner，不代摘节点；ReplyObserver 的 DONE/PEER_CLOSED 分别对应 Sent/Abandoned，Once 在 MAILBOX 锁内选定终态，持有操作 authority 的执行者在锁外发布。
 
 队列上限为16，每条最多8项业务transit加1项Delivery。MailboxCore出生时付款并初始化固定`Buffer<Option<Message>>`环；head/len与receiving占位拥有容量真值，enqueue/rollback/pop不分配或扩容。消息本体内嵌槽，payload/handles独立付款；handle数组在发送时预留Delivery槽，接收只push，不另分配。header原始move字节、验证数组、Invocation/rights scratch由发送者Pool付款，成功运输payload/handles保留原payer至consume/discard/shut；临时scratch随本次owner释放。MAILBOX同步域拥有缓冲和WaitQueue：READABLE当且仅当队列非空且无receiving，WRITABLE占用包含receiving，PEER_CLOSED表示可投递Sender/Pending OnceSender为零；关闭冻结CLOSED。出生SenderCount负责计数与失败回滚，Once在准备提交时入计数、Sent/Abandoned时退出；预留期间Peek/Discard/另一Receive返回Busy。
 
@@ -32,7 +32,7 @@ Receive 接受非消费 READ 并持 BodyLease，core 的 receiving token 仲裁�
 
 libkernel `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
-libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 kind 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。MakeSendOnce 输出完整 HandlePair；`send_once` 返回 ReplyPermit，分别持 typed SendOnce 与 ReplyObservation capability。Request 持观察权，Packet 运输回复权；发送后观察权移交 Sent owner。raw 夹具显式关闭不用的观察表项。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
+libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 kind 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。MakeSendOnce 输出完整 HandlePair；`send_once` 返回 ReplyPermit，分别持 typed SendOnce 与 ReplyObserver；`MintedSender.lifetime` 持 LifetimeObserver。三个公开 Observer 的数字 kind 保持 13/18/20，内部 Lifetime/LifetimeOwner/LifetimeUse 不改名。Notification 工厂返回 typed Owner/Signaler，Owner 提供 take/mint_observer、Signaler 提供 signal；未知能力唯一转换边界 Query 一次，observer 必须 WAIT，返回描述供领域额外授权检查。所有角色独占 Capability，无隐式 Clone，duplicate 经真实裁剪调用，close 失败完整返还 owner；显式 into_capability/into_raw 移交责任。安全层没有裸 Handle 的 Notification signal/take/observe 函数，正式原始夹具使用带 SAFETY 的 sys_notification_*。Request 持观察权，Packet 运输回复权；发送后观察权移交 Sent owner。raw 夹具显式关闭不用的观察表项。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
 
 ## 通知与等待
 
@@ -42,7 +42,7 @@ libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型�
 
 [`NotificationCore`](../../os/kernel/src/task/notification.rs) 在 NOTIFICATION 锁下保存 OR pending bits 与 closed，并更新同域电平；READABLE 表示非零，Take 消费指定位。core 强持付款 Pool，记录关联其 Account；最后 Owner authority 关闭准入/清位并激活来源 Work。Work 每步处理一个候选，临时强目标带出锁后才提示，无工作回 Idle。旧 ObjectWaitState/serial/ObserverSink 不参与 Notification 的新来源。
 
-SignalSource是无消息缓冲的已付款终态观察宿主，OBJECT_WAIT唯一拥有公开电平/节点链和独立内部完成状态，内嵌WorkRecord。Shell、ThreadControl、Job、ReplyObservation使用它；业务终态发布不反取业务锁。单一内部维护消费者先arm再在同域登记/复检WakeToken；complete_internal只提交内部退款事实并锁外唤醒，不更新公开电平。Process退休借Shell既有来源存储，内部退休结束与公开Process DONE是两个事实，避免额外私有Source晚于Body屏障退款。ThreadDeparture最后退款后持DONE来源直接发布，不因Control消散跳过。Tunnel在Connection同步域使用同一WaitQueue；来源及观察引用不强持待退款的privateWork。
+SignalSource是无消息缓冲的已付款终态观察宿主，OBJECT_WAIT唯一拥有公开电平/节点链和独立内部完成状态，内嵌WorkRecord。Shell、ThreadControl、Job、ReplyObserver使用它；业务终态发布不反取业务锁。单一内部维护消费者先arm再在同域登记/复检WakeToken；complete_internal只提交内部退款事实并锁外唤醒，不更新公开电平。Process退休借Shell既有来源存储，内部退休结束与公开Process DONE是两个事实，避免额外私有Source晚于Body屏障退款。ThreadDeparture最后退款后持DONE来源直接发布，不因Control消散跳过。Tunnel在Connection同步域使用同一WaitQueue；来源及观察引用不强持待退款的privateWork。
 
 [`wait.rs`](../../os/kernel/src/task/wait.rs) 的 WaitOne 复制固定输入，在表锁内解析 WAIT 存储引用、锁外取得来源 loan 与快照；输入兴趣必须非空且属于对象允许 mask。a1 返回当前匹配电平，关闭总附 CLOSED，NONE 表示到期；无异步用户输出指针。libkernel 从返回电平构造 WaitResult，Mailbox/Endpoint/WaitSet 的单对象便利等待使用该入口。线程续体/唯一 detach 由 [`task.md`](task.md) 拥有；timer 节点由 [`time.md`](time.md) 拥有。
 

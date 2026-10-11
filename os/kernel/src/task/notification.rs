@@ -1,4 +1,4 @@
-//! Notification Owner/Signaler；来源只维护电平并由出生 Work 有界发重试提示。
+//! Notification 的消费、发送与观察角色共享电平来源及出生 Work。
 
 use alloc::sync::{Arc, Weak};
 use core::{any::Any, pin::Pin};
@@ -23,6 +23,7 @@ struct CoreState {
     closed: bool,
 }
 struct NotificationCore {
+    header: ObjectHeader,
     state: Spinlock<CoreState>,
     source: WaitQueue,
     this: Spinlock<Weak<Self>>,
@@ -34,6 +35,7 @@ impl NotificationCore {
         let metadata = super::resources::MetadataCharge::arc::<Self>(&pool)?;
         let account = pool.maintenance_account().clone();
         let core = Arc::try_new(Self {
+            header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
             state: Spinlock::new(
                 ranks::NOTIFICATION,
                 CoreState {
@@ -170,7 +172,6 @@ impl Work for NotificationCore {
 
 pub struct NotificationOwner {
     holders: capability::Holders,
-    header: ObjectHeader,
     core: Arc<NotificationCore>,
     _metadata: super::resources::MetadataCharge,
 }
@@ -180,7 +181,7 @@ pub struct NotificationSignaler {
     core: Arc<NotificationCore>,
     _metadata: super::resources::MetadataCharge,
 }
-pub struct NotificationObservation {
+pub struct NotificationObserver {
     holders: capability::Holders,
     header: ObjectHeader,
     core: Arc<NotificationCore>,
@@ -197,10 +198,24 @@ macro_rules! identity {
         fn as_any(&self) -> &dyn Any {
             self
         }
+        fn related_id(&self) -> u64 {
+            self.core.header.koid()
+        }
     };
 }
 impl KernelObject for NotificationOwner {
-    identity!();
+    fn holders(&self) -> &capability::Holders {
+        &self.holders
+    }
+    fn header(&self) -> &ObjectHeader {
+        &self.core.header
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn related_id(&self) -> u64 {
+        self.core.header.koid()
+    }
     fn kind(&self) -> ObjectKind {
         ObjectKind::NotificationOwner
     }
@@ -224,19 +239,7 @@ impl KernelObject for NotificationSignaler {
         ObjectKind::NotificationSignaler
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::SIGNAL | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE)
-    }
-    fn allowed_signals(&self) -> Option<ObjectSignals> {
-        None
-    }
-}
-impl KernelObject for NotificationObservation {
-    identity!();
-    fn kind(&self) -> ObjectKind {
-        ObjectKind::NotificationObservation
-    }
-    fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::CLOSED)
@@ -245,43 +248,50 @@ impl KernelObject for NotificationObservation {
         Some(self.core.clone())
     }
 }
+impl KernelObject for NotificationObserver {
+    identity!();
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::NotificationObserver
+    }
+    fn allowed_rights(&self) -> Option<Rights> {
+        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+    }
+    fn allowed_signals(&self) -> Option<ObjectSignals> {
+        Some(ObjectSignals::READABLE | ObjectSignals::CLOSED)
+    }
+    fn wait_source(&self) -> Option<Arc<dyn ObservationSource>> {
+        Some(self.core.clone())
+    }
+}
 
-pub fn observe(thread: &Thread, source: Handle, output: usize) -> Result<(), SystemCallError> {
-    let authority = super::handle::Authorization::accept(thread, source, Rights::NONE)?;
-    let core = if let Some(owner) = authority
+pub fn mint_observer(
+    thread: &Thread,
+    source: Handle,
+    rights: Rights,
+    output: usize,
+) -> Result<(), SystemCallError> {
+    let authority = super::handle::Authorization::accept(thread, source, Rights::MANAGE)?;
+    let owner = authority
         .object()
         .as_any()
         .downcast_ref::<NotificationOwner>()
+        .ok_or(SystemCallError::WrongObjectType)?;
+    if !rights.contains(Rights::WAIT)
+        || !rights.is_subset_of(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
     {
-        if !authority.rights().contains(Rights::READ) {
-            return Err(SystemCallError::RightsDenied);
-        }
-        owner.core.clone()
-    } else if let Some(signaler) = authority
-        .object()
-        .as_any()
-        .downcast_ref::<NotificationSignaler>()
-    {
-        if !authority.rights().contains(Rights::SIGNAL) {
-            return Err(SystemCallError::RightsDenied);
-        }
-        signaler.core.clone()
-    } else {
-        return Err(SystemCallError::WrongObjectType);
-    };
+        return Err(SystemCallError::RightsDenied);
+    }
+    let core = owner.core.clone();
     let pool = thread.process.funding_pool();
-    let metadata = super::resources::MetadataCharge::arc::<NotificationObservation>(&pool)?;
-    let observation = Arc::try_new(NotificationObservation {
+    let metadata = super::resources::MetadataCharge::arc::<NotificationObserver>(&pool)?;
+    let observation = Arc::try_new(NotificationObserver {
         holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
         header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
         core,
         _metadata: metadata,
     })
     .map_err(|_| SystemCallError::OutOfMemory)?;
-    let caps = [handle::mint(
-        observation,
-        Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
-    )?];
+    let caps = [handle::mint(observation, rights)?];
     handle::install(
         thread,
         caps,
@@ -298,7 +308,6 @@ fn new_pair(
     let metadata = super::resources::MetadataCharge::arc::<NotificationOwner>(&pool)?;
     let owner = Arc::try_new(NotificationOwner {
         holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
-        header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
         core: core.clone(),
         _metadata: metadata,
     })

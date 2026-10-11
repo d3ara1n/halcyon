@@ -4,20 +4,19 @@
 //! PendingCall、txid 路由、回复存储及其运输 owner。
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::pin::Pin;
 use erhino_shared::{
     call::SystemCallError,
     object::{ObjectSignals, Rights},
     time::Deadline,
 };
-use libexecution::SourceRegistration;
+use libbudget::AccountView;
 use libexecution::runtime::{
     Advance, Input, RequestFailure, Requests, SourceEvent, SourceId, SourcePlan, Step,
 };
-use libkernel::ipc::{
-    capability::Capability,
-    message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
-};
+use libexecution::{ExecutionResource, SourceRegistration};
+use libkernel::ipc::message::{Mailbox, MailboxSender, MessageStorage, ReceiveBuffer};
 use ordered_table::OrderedTable;
 use timer_queue::{TimerNode, TimerQueue};
 
@@ -46,11 +45,11 @@ struct SourceState {
 }
 
 struct PendingCall {
-    service: MailboxSender,
+    service: ServiceOwner,
     deadline: Deadline,
     protocol: u64,
     request: Option<Request>,
-    observation: Option<Capability>,
+    observation: Option<libkernel::ipc::message::ReplyObserver>,
     result: Option<Result<Reply, CallError>>,
     storage: Option<MessageStorage>,
     timer: Option<Pin<Box<TimerNode<u64>>>>,
@@ -66,14 +65,42 @@ struct PendingCall {
 
 #[derive(Debug)]
 pub struct Completion {
-    pub service: Capability,
+    pub service: ServiceOwner,
     pub result: Result<Reply, CallError>,
 }
 
 #[derive(Debug)]
 pub struct StartFailure {
-    pub service: Capability,
+    pub service: ServiceOwner,
     pub error: CallError,
+}
+
+/// 调用持有的真实 sender owner；共享只保活同一表项，不派生内核权限。
+#[derive(Debug)]
+pub enum ServiceOwner {
+    Owned(MailboxSender),
+    Shared(Arc<MailboxSender>),
+}
+impl ServiceOwner {
+    pub fn sender(&self) -> &MailboxSender {
+        match self {
+            Self::Owned(sender) => sender,
+            Self::Shared(sender) => sender,
+        }
+    }
+    /// 独占调用的完成沿同一 txid 原样返还独占角色。
+    pub fn into_owned(self) -> Result<MailboxSender, Arc<MailboxSender>> {
+        match self {
+            Self::Owned(sender) => Ok(sender),
+            Self::Shared(sender) => Err(sender),
+        }
+    }
+}
+impl core::ops::Deref for ServiceOwner {
+    type Target = MailboxSender;
+    fn deref(&self) -> &MailboxSender {
+        self.sender()
+    }
 }
 
 /// 多 in-flight RPC 的协议任务。
@@ -101,6 +128,7 @@ pub struct Dispatcher {
     next_source_key: u64,
     sealed: bool,
     fault: Option<SystemCallError>,
+    ignored_replies: u64,
 }
 
 impl Drop for Dispatcher {
@@ -111,11 +139,26 @@ impl Drop for Dispatcher {
 }
 
 impl Dispatcher {
-    pub fn new(limit: usize) -> Result<Self, SystemCallError> {
+    /// Runtime 准入的来源上界：共享回复一项，每个在途调用至多两项。
+    /// limit 不含任何领域任务或其观察来源。
+    pub const fn source_capacity(limit: usize) -> Result<usize, SystemCallError> {
         if limit == 0 {
             return Err(SystemCallError::IllegalArgument);
         }
-        let source_limit = limit.checked_mul(2).ok_or(SystemCallError::ReachLimit)?;
+        match limit.checked_mul(2) {
+            Some(value) => match value.checked_add(1) {
+                Some(capacity) => Ok(capacity),
+                None => Err(SystemCallError::ReachLimit),
+            },
+            None => Err(SystemCallError::ReachLimit),
+        }
+    }
+    pub fn new(
+        limit: usize,
+        shared: &AccountView<ExecutionResource>,
+    ) -> Result<Self, SystemCallError> {
+        // source_capacity 已保证至少含一项回复来源。
+        let source_limit = Self::source_capacity(limit)? - 1;
         let receiver = ReceiveBuffer::new()?;
         let owner = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)?;
         let minted = owner.mint(
@@ -127,7 +170,7 @@ impl Dispatcher {
             sender: minted.sender,
             receiver,
             reply_key: 1,
-            reply_registration: SourceRegistration::new(),
+            reply_registration: SourceRegistration::funded(shared.clone()),
             pending: OrderedTable::new(limit),
             bindings: OrderedTable::new(source_limit),
             deadlines: TimerQueue::new(0),
@@ -143,6 +186,7 @@ impl Dispatcher {
             next_source_key: 2,
             sealed: false,
             fault: None,
+            ignored_replies: 0,
         })
     }
 
@@ -152,11 +196,12 @@ impl Dispatcher {
     )]
     pub fn begin(
         &mut self,
-        service: Capability,
+        service: ServiceOwner,
         deadline: Deadline,
         request: Request,
+        funding: &AccountView<ExecutionResource>,
     ) -> Result<u64, StartFailure> {
-        self.begin_for(service, deadline, request, None)
+        self.begin_for(service, deadline, request, None, funding)
     }
 
     /// 提交调用并在完成进入 FIFO 后请求唤醒指定 Runtime 任务。
@@ -166,10 +211,11 @@ impl Dispatcher {
     )]
     pub fn begin_for(
         &mut self,
-        service: Capability,
+        service: ServiceOwner,
         deadline: Deadline,
         mut request: Request,
         waiter: Option<u64>,
+        funding: &AccountView<ExecutionResource>,
     ) -> Result<u64, StartFailure> {
         let early = (|| {
             if self.sealed {
@@ -188,24 +234,24 @@ impl Dispatcher {
             });
         }
 
-        let (service, description) = match MailboxSender::from_capability(service) {
-            Ok(adopted) => adopted,
-            Err(failure) => {
+        let description = match service.description() {
+            Ok(description) => description,
+            Err(error) => {
                 return Err(StartFailure {
-                    service: failure.owner,
-                    error: CallError::unsent(cause(failure.error), request),
+                    service,
+                    error: CallError::unsent(cause(error), request),
                 });
             }
         };
         if !description.rights.contains(Rights::WRITE | Rights::WAIT) {
             return Err(StartFailure {
-                service: service.into_capability(),
+                service,
                 error: CallError::unsent(CallCause::System(SystemCallError::RightsDenied), request),
             });
         }
         if let Err(error) = request.attach_reply(&self.sender) {
             return Err(StartFailure {
-                service: service.into_capability(),
+                service,
                 error: CallError::unsent(cause(error), request),
             });
         }
@@ -213,7 +259,7 @@ impl Dispatcher {
             Ok(storage) => storage,
             Err(error) => {
                 return Err(StartFailure {
-                    service: service.into_capability(),
+                    service,
                     error: CallError::unsent(cause(error), request),
                 });
             }
@@ -222,7 +268,7 @@ impl Dispatcher {
             Ok(expires_at) => expires_at,
             Err(_) => {
                 return Err(StartFailure {
-                    service: service.into_capability(),
+                    service,
                     error: CallError::unsent(
                         CallCause::System(SystemCallError::IllegalArgument),
                         request,
@@ -234,7 +280,7 @@ impl Dispatcher {
             Ok(key) => key,
             Err(error) => {
                 return Err(StartFailure {
-                    service: service.into_capability(),
+                    service,
                     error: CallError::unsent(cause(error), request),
                 });
             }
@@ -243,7 +289,7 @@ impl Dispatcher {
             Ok(key) => key,
             Err(error) => {
                 return Err(StartFailure {
-                    service: service.into_capability(),
+                    service,
                     error: CallError::unsent(cause(error), request),
                 });
             }
@@ -261,11 +307,11 @@ impl Dispatcher {
             timer: None,
             progress: SourceState {
                 key: progress_key,
-                registration: SourceRegistration::new(),
+                registration: SourceRegistration::funded(funding.clone()),
             },
             closed: SourceState {
                 key: closed_key,
-                registration: SourceRegistration::new(),
+                registration: SourceRegistration::funded(funding.clone()),
             },
             stage: OutboundStage::Ready,
             queued: false,
@@ -370,7 +416,7 @@ impl Dispatcher {
             .take()
             .expect("unsent call lost its request");
         Err(StartFailure {
-            service: pending.service.into_capability(),
+            service: pending.service,
             error: CallError::unsent(cause, request),
         })
     }
@@ -414,7 +460,7 @@ impl Dispatcher {
         self.completed_tail = txid;
     }
 
-    fn wake_completion<F>(&mut self, requests: &mut Requests<F>) {
+    fn wake_completion<F>(&mut self, requests: &mut Requests<'_, F>) {
         self.wake_pending = false;
         let mut txid = self.completed_head;
         while txid != 0 {
@@ -554,6 +600,8 @@ impl Dispatcher {
             };
             if let Some((txid, result)) = accepted {
                 self.complete(txid, result);
+            } else {
+                self.ignored_replies = self.ignored_replies.saturating_add(1);
             }
             self.receiver.discard();
         }
@@ -586,7 +634,7 @@ impl Dispatcher {
         }
     }
 
-    fn declare_registrations<F>(&mut self, requests: &mut Requests<F>) {
+    fn declare_registrations<F>(&mut self, requests: &mut Requests<'_, F>) {
         if self.sealed {
             self.registrations = Sweep::default();
             return;
@@ -669,7 +717,7 @@ impl Dispatcher {
         }
     }
 
-    fn declare_removals<F>(&mut self, requests: &mut Requests<F>) {
+    fn declare_removals<F>(&mut self, requests: &mut Requests<'_, F>) {
         if self.sealed
             && !self.reply_registration.is_removing()
             && self.reply_registration.source().is_some()
@@ -780,7 +828,13 @@ impl Dispatcher {
             self.retiring = Sweep::default();
             return;
         }
-        if let Some(txid) = Self::next_candidate(&self.pending, &mut self.retiring) {
+        if let Some(txid) = Self::next_candidate(&self.pending, &mut self.retiring)
+            && self
+                .pending
+                .get(txid)
+                .is_some_and(|pending| pending.waiter.is_none())
+        {
+            // 活任务继续领取自己的终结结果；失败 wake 回执才撤销其领取责任。
             drop(self.take(txid));
         }
     }
@@ -817,6 +871,22 @@ impl Dispatcher {
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
+    /// 未对应活调用的实际回复数；用于诊断迟到或无效响应，不参与路由决策。
+    pub fn ignored_reply_count(&self) -> u64 {
+        self.ignored_replies
+    }
+    /// 活调用的投递相位；终结后由 take 领取结果，不把终结当作仍在途。
+    pub fn call_phase(&self, txid: u64) -> Option<crate::CallPhase> {
+        let pending = self.pending.get(txid)?;
+        if pending.result.is_some() {
+            return None;
+        }
+        Some(if pending.request.is_some() {
+            crate::CallPhase::Unsent
+        } else {
+            crate::CallPhase::Sent
+        })
+    }
 
     pub fn take(&mut self, txid: u64) -> Option<Completion> {
         if !self.pending.get(txid).is_some_and(|pending| pending.queued) {
@@ -849,7 +919,7 @@ impl Dispatcher {
                 .previous = pending.previous;
         }
         Some(Completion {
-            service: pending.service.into_capability(),
+            service: pending.service,
             result: pending
                 .result
                 .take()
@@ -869,7 +939,7 @@ impl Dispatcher {
 impl Dispatcher {
     pub fn advance<F>(
         &mut self,
-        requests: &mut Requests<F>,
+        requests: &mut Requests<'_, F>,
         input: &mut Input<'_>,
         budget: usize,
     ) -> Result<Advance, SystemCallError> {

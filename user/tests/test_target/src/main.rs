@@ -39,12 +39,36 @@ fn ipc_kill_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
         .expect("IPC kill target missing observed process control");
     let ready = startup
         .take(2)
-        .map(Capability::into_raw)
+        .map(|cap| {
+            notification::NotificationSignaler::from_capability(cap)
+                .map_err(|f| f.error)
+                .expect("target ready role invalid")
+                .0
+        })
         .expect("IPC kill target missing ready signaler");
     let done = startup
         .take(3)
-        .map(Capability::into_raw)
+        .map(|cap| {
+            notification::NotificationSignaler::from_capability(cap)
+                .map_err(|f| f.error)
+                .expect("target completion role invalid")
+                .0
+        })
         .expect("IPC kill target missing observed completion signaler");
+    let (notification_observer, description) = notification::NotificationObserver::from_capability(
+        startup
+            .take(4)
+            .expect("IPC target missing startup observer"),
+    )
+    .map_err(|f| f.error)
+    .expect("IPC startup observer role invalid");
+    assert_eq!(
+        description.related_object_id,
+        ready
+            .description()
+            .expect("target ready identity query failed")
+            .related_object_id
+    );
     let close = libruntime::thread::Builder::new()
         .spawn(move || {
             // SAFETY: startup 转入的 owner 只有本线程承担关闭责任。
@@ -55,10 +79,20 @@ fn ipc_kill_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
     let observer = libruntime::thread::Builder::new()
         .spawn(move || {
             libkernel::process::wait_done(control).expect("IPC target completion wait failed");
-            notification::signal(done, 1).expect("IPC target completion signal failed");
+            done.signal(1).expect("IPC target completion signal failed");
         })
         .expect("IPC observation thread spawn failed");
-    notification::signal(ready, 1).expect("IPC target active publication failed");
+    ready
+        .signal(1)
+        .expect("IPC target active publication failed");
+    let observed = libkernel::ipc::wait::wait_until(
+        notification_observer.as_handle(),
+        ObjectSignals::READABLE,
+        libkernel::time::timeout_millis(5_000).expect("startup observer deadline failed"),
+    )
+    .expect("startup observer wait failed");
+    assert!(observed.observed.intersects(ObjectSignals::READABLE));
+    libkernel::debug!("Notification observer startup grant passed");
     // 两个 ResultReceiver 与未返回线程由正式进程退出路径接管；主线程进入用户 spin，
     // 外部 Kill 允许与 Close/observation 的自然完成或取消竞速，精确 Waiting 窗口由 GDB 取证。
     loop {
@@ -68,22 +102,45 @@ fn ipc_kill_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
 }
 
 fn retirement_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
-    let source = startup
-        .take(0)
-        .map(Capability::into_raw)
-        .expect("retirement target missing observation source");
+    let (source, source_description) = notification::NotificationOwner::from_capability(
+        startup
+            .take(0)
+            .expect("retirement target missing observation source"),
+    )
+    .map_err(|f| f.error)
+    .expect("retirement source role invalid");
+    let (notification_observer, description) = notification::NotificationObserver::from_capability(
+        startup
+            .take(2)
+            .expect("retirement target missing startup observer"),
+    )
+    .map_err(|f| f.error)
+    .expect("retirement observer role invalid");
+    assert_eq!(description.related_object_id, source_description.object_id);
     let ready = startup
         .take(1)
-        .map(Capability::into_raw)
+        .map(|cap| {
+            notification::NotificationSignaler::from_capability(cap)
+                .map_err(|f| f.error)
+                .expect("retirement ready role invalid")
+                .0
+        })
         .expect("retirement target missing ready signaler");
     let set = WaitSet::create(256).expect("retirement target WaitSet creation failed");
     for cookie in 0..256 {
-        set.register(MemberRequest::new(source, ObjectSignals::READABLE, cookie))
-            .expect("retirement target registration failed");
+        set.register(MemberRequest::new(
+            source.as_handle(),
+            ObjectSignals::READABLE,
+            cookie,
+        ))
+        .expect("retirement target registration failed");
     }
-    notification::signal(ready, 1).expect("retirement target ready publication failed");
+    libkernel::debug!("Notification observer startup grant passed");
+    ready
+        .signal(1)
+        .expect("retirement target ready publication failed");
     loop {
-        core::hint::black_box(set.handle());
+        core::hint::black_box((&source, &notification_observer, set.handle()));
         // SAFETY: 值参数；集合 owner 与来源由进程退出的正式退休路径接管。
         unsafe { sys_sleep(1000).expect("retirement target sleep failed") };
     }

@@ -230,14 +230,14 @@ pub enum ObjectKind {
     TunnelInvitation = 10,
     SystemReset = 11,
     MailboxSender = 12,
-    Lifetime = 13,
+    LifetimeObserver = 13,
     Delivery = 14,
     WaitSet = 15,
     MailboxOnceSender = 16,
     NotificationSignaler = 17,
-    ReplyObservation = 18,
+    ReplyObserver = 18,
     ThreadStartTicket = 19,
-    NotificationObservation = 20,
+    NotificationObserver = 20,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

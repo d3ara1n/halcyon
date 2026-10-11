@@ -358,7 +358,7 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
         .unwrap();
         for entry in 0..1024 {
             set.register(MemberRequest::new(
-                source.owner,
+                source.owner.as_handle(),
                 ObjectSignals::READABLE,
                 entry,
             ))
@@ -380,8 +380,15 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
     process::kill(nested.control).unwrap();
     // SAFETY: Kill 后停止组装，退还唯一 Builder；不改变已冻结终因。
     unsafe { close(nested.builder) }.unwrap();
-    let ready =
-        notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
+    let ready = notification::create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE,
+        Rights::SIGNAL | Rights::GRANT,
+    )
+    .unwrap();
+    let startup_observer = ready
+        .owner
+        .mint_observer(Rights::WAIT | Rights::GRANT)
+        .unwrap();
     let done =
         notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
     let control = duplicate(nested.control, Rights::READ | Rights::WAIT | Rights::GRANT).unwrap();
@@ -401,19 +408,23 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
                 rights: Rights::READ | Rights::WAIT,
             },
             HandleGrant {
-                handle: ready.peer,
+                handle: ready.peer.into_raw(),
                 rights: Rights::SIGNAL,
             },
             HandleGrant {
-                handle: done.peer,
+                handle: done.peer.into_raw(),
                 rights: Rights::SIGNAL,
+            },
+            HandleGrant {
+                handle: startup_observer.into_raw(),
+                rights: Rights::WAIT,
             },
         ],
         control_rights: crate::SUPERVISOR_RIGHTS,
     })
     .expect("committed IPC kill target spawn failed");
     let deadline = time::timeout_millis(30_000).unwrap();
-    wait_until(ready.owner, ObjectSignals::READABLE, deadline).unwrap();
+    wait_until(ready.owner.as_handle(), ObjectSignals::READABLE, deadline).unwrap();
     // 子线程将关闭非空集合；Kill 可落在关闭提交前后，两者都必须由内核稳定持有退休责任。
     process::kill(started.control).unwrap();
     for control in [started.control, nested.control] {
@@ -431,12 +442,14 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
         );
     }
     // SAFETY: 进程已完成独立退休，剩余父方观察/来源表项各关闭一次。
-    for h in [started.control, nested.control, ready.owner, done.owner] {
+    for h in [started.control, nested.control] {
         unsafe { close(h) }.unwrap();
     }
+    ready.owner.close().unwrap();
+    done.owner.close().unwrap();
     for source in sources {
-        unsafe { close(source.peer) }.unwrap();
-        unsafe { close(source.owner) }.unwrap();
+        source.peer.close().unwrap();
+        source.owner.close().unwrap();
     }
     assert_eq!(libkernel::ipc::wait_set::abandoned_count(), 0);
     assert_eq!(
@@ -446,5 +459,271 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
     );
     debug!(
         "committed IPC caller kill passed: nonempty Close, caller exit, automatic target retirement and refund"
+    );
+}
+
+/// N1—N5：真实角色授权、纯电平、登记保活及 IPC 运输；不合成内核对象。
+pub(super) fn notification_roles() {
+    use libkernel::{
+        ipc::{
+            message::{Mailbox, MailboxSender},
+            notification::{self, NotificationObserver},
+            packet::Packet,
+            wait_set::WaitSet,
+        },
+        shared::{time::Deadline, wait_set::MemberRequest},
+    };
+    let pair = notification::create(
+        Rights::READ | Rights::WAIT | Rights::MANAGE,
+        Rights::SIGNAL | Rights::WAIT,
+    )
+    .unwrap();
+    let owner_id = pair.owner.description().unwrap().object_id;
+    assert_eq!(
+        pair.owner.description().unwrap().related_object_id,
+        owner_id
+    );
+    assert_eq!(pair.peer.description().unwrap().related_object_id, owner_id);
+    pair.peer.signal(3).unwrap();
+    for rights in [
+        Rights::NONE,
+        Rights::TRANSIT,
+        Rights::WAIT | Rights::READ,
+        Rights::WAIT | Rights::SIGNAL,
+        Rights::WAIT | Rights::MANAGE,
+        Rights::from_raw(1 << 63),
+    ] {
+        assert_eq!(
+            pair.owner.mint_observer(rights).unwrap_err(),
+            SystemCallError::RightsDenied
+        );
+    }
+    let restricted = notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL).unwrap();
+    assert_eq!(
+        restricted.owner.mint_observer(Rights::WAIT).unwrap_err(),
+        SystemCallError::RightsDenied
+    );
+    restricted.owner.close().unwrap();
+    restricted.peer.close().unwrap();
+    // 全部 Observer 消散既不清 pending，也不结束 Owner；同时复核前面的签发拒绝。
+    let temporary = pair.owner.mint_observer(Rights::WAIT).unwrap();
+    temporary.close().unwrap();
+    assert_eq!(pair.owner.take(3).unwrap(), 3);
+    pair.peer.signal(3).unwrap();
+    let observer = pair
+        .owner
+        .mint_observer(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT)
+        .unwrap();
+    let description = observer.description().unwrap();
+    assert_eq!(description.kind, ObjectKind::NotificationObserver as u32);
+    assert_eq!(description.related_object_id, owner_id);
+    assert_ne!(description.object_id, owner_id);
+    assert_eq!(
+        pair.owner
+            .duplicate(Rights::READ | Rights::WAIT)
+            .unwrap_err(),
+        SystemCallError::RightsDenied
+    );
+    let mut output = Handle::INVALID;
+    let mut bits = 0;
+    // SAFETY: 负向 ABI 夹具只借用合法表项；输出私有，失败不接收 owner。
+    unsafe {
+        assert_eq!(
+            libkernel::sys_notification_take(observer.as_handle(), 3, &mut bits),
+            Err(SystemCallError::RightsDenied)
+        );
+        assert_eq!(
+            libkernel::sys_notification_signal(observer.as_handle(), 1),
+            Err(SystemCallError::RightsDenied)
+        );
+        assert_eq!(
+            libkernel::sys_notification_mint_observer(
+                observer.as_handle(),
+                Rights::WAIT,
+                &mut output
+            ),
+            Err(SystemCallError::RightsDenied)
+        );
+    }
+    assert_eq!(
+        wait_until(
+            pair.peer.as_handle(),
+            ObjectSignals::READABLE,
+            Deadline::at(0)
+        ),
+        Err(SystemCallError::IllegalArgument)
+    );
+    let set = WaitSet::create(2).unwrap();
+    assert_eq!(
+        set.register(MemberRequest::new(
+            pair.peer.as_handle(),
+            ObjectSignals::READABLE,
+            0
+        )),
+        Err(SystemCallError::IllegalArgument)
+    );
+    let wrong = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE).unwrap();
+    // SAFETY: Mailbox[M] 是真实错型输入；失败无输出能力。
+    assert_eq!(
+        unsafe {
+            libkernel::sys_notification_mint_observer(wrong.as_handle(), Rights::WAIT, &mut output)
+        },
+        Err(SystemCallError::WrongObjectType)
+    );
+    let first = set
+        .register(MemberRequest::new(
+            observer.as_handle(),
+            ObjectSignals::READABLE,
+            1,
+        ))
+        .unwrap();
+    let second_observer = observer.duplicate(Rights::WAIT | Rights::TRANSIT).unwrap();
+    let second = set
+        .register(MemberRequest::new(
+            second_observer.as_handle(),
+            ObjectSignals::READABLE,
+            2,
+        ))
+        .unwrap();
+    assert_ne!(first, second);
+    // 两个真实线程在同一持续电平上观察；不消费，结果来自 N2 电平合同。
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let observation = observer.duplicate(Rights::WAIT).unwrap();
+        workers.push(
+            thread::Builder::new()
+                .spawn(move || {
+                    let ready = wait_until(
+                        observation.as_handle(),
+                        ObjectSignals::READABLE,
+                        time::timeout_millis(5_000).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(ready.observed.intersects(ObjectSignals::READABLE));
+                })
+                .unwrap(),
+        );
+    }
+    for worker in workers {
+        crate::take_thread_result(worker.join());
+    }
+    let a = set.receive(1).unwrap()[0].token;
+    let b = set.receive(1).unwrap()[0].token;
+    assert_ne!(a, b, "persistent Notification members failed to rotate");
+    assert_eq!(pair.owner.take(1).unwrap(), 1);
+    assert!(
+        wait_until(
+            observer.as_handle(),
+            ObjectSignals::READABLE,
+            Deadline::at(0)
+        )
+        .unwrap()
+        .observed
+        .intersects(ObjectSignals::READABLE)
+    );
+    assert_eq!(pair.owner.take(2).unwrap(), 2);
+    assert!(set.receive(2).unwrap().is_empty());
+    pair.peer.signal(4).unwrap();
+    assert!(
+        wait_until(
+            observer.as_handle(),
+            ObjectSignals::READABLE,
+            Deadline::at(0)
+        )
+        .unwrap()
+        .observed
+        .intersects(ObjectSignals::READABLE)
+    );
+    assert_eq!(pair.owner.take(4).unwrap(), 4);
+    // 移交正式 Packet 后在唯一边界 Query：kind 和来源身份不因运输改变。
+    let inbox = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE).unwrap();
+    let minted = inbox.mint(0, Rights::WRITE).unwrap();
+    let mut packet = Packet::new(0x4e4f_5449_4659, &[]).unwrap();
+    packet
+        .push(second_observer.into_capability(), Rights::WAIT)
+        .map_err(|f| f.error)
+        .unwrap();
+    packet
+        .try_send(&minted.sender, Deadline::INFINITE)
+        .map_err(|f| f.error)
+        .unwrap();
+    let mut received = inbox.receive().unwrap();
+    let (received_observer, moved_description) =
+        NotificationObserver::from_capability(received.handles.take(0).unwrap())
+            .map_err(|f| f.error)
+            .unwrap();
+    assert_eq!(moved_description.related_object_id, owner_id);
+    assert_eq!(moved_description.rights, Rights::WAIT);
+    // 错型和缺 WAIT 转换都返还原 owner，原能力仍可 Query/关闭。
+    let failure = NotificationObserver::from_capability(
+        observer
+            .duplicate(Rights::WAIT | Rights::DUPLICATE)
+            .unwrap()
+            .into_capability()
+            .duplicate(Rights::NONE)
+            .unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, SystemCallError::RightsDenied);
+    assert_eq!(
+        failure.owner.description().unwrap().kind,
+        ObjectKind::NotificationObserver as u32
+    );
+    failure.owner.close().unwrap();
+    let wrong_sender = inbox.mint(0, Rights::WRITE).unwrap();
+    let failure =
+        NotificationObserver::from_capability(wrong_sender.sender.into_capability()).unwrap_err();
+    assert_eq!(failure.error, SystemCallError::WrongObjectType);
+    let (sender, _) = MailboxSender::from_capability(failure.owner)
+        .map_err(|f| f.error)
+        .unwrap();
+    sender.close().unwrap();
+    wrong_sender.lifetime.close().unwrap();
+    observer.close().unwrap();
+    pair.peer.signal(8).unwrap();
+    assert_eq!(pair.owner.take(8).unwrap(), 8);
+    // 原表项关闭不撤登记；最后 Owner 关闭不被 Observer、Signaler、登记 loan 延长。
+    pair.owner.close().unwrap();
+    assert!(
+        wait_until(
+            received_observer.as_handle(),
+            ObjectSignals::CLOSED,
+            time::timeout_millis(5_000).unwrap()
+        )
+        .unwrap()
+        .observed
+        .intersects(ObjectSignals::CLOSED)
+    );
+    assert!(
+        wait_until(
+            pair.peer.as_handle(),
+            ObjectSignals::CLOSED,
+            Deadline::at(0)
+        )
+        .unwrap()
+        .observed
+        .intersects(ObjectSignals::CLOSED)
+    );
+    assert_eq!(pair.peer.signal(1), Err(SystemCallError::ObjectClosed));
+    let closed = set.receive(2).unwrap();
+    assert_eq!(closed.len(), 2);
+    assert!(
+        closed
+            .iter()
+            .all(|record| record.observed.intersects(ObjectSignals::CLOSED))
+    );
+    set.remove(first).unwrap();
+    set.remove(second).unwrap();
+    set.close()
+        .unwrap_or_else(|(_, error)| panic!("Notification set close failed: {error:?}"));
+    received_observer.close().unwrap();
+    drop(received);
+    pair.peer.close().unwrap();
+    minted.sender.close().unwrap();
+    minted.lifetime.close().unwrap();
+    inbox.close().unwrap();
+    wrong.close().unwrap();
+    debug!(
+        "Notification observer roles passed: authorization, identity, levels, threads, fairness, transport and lifetime"
     );
 }

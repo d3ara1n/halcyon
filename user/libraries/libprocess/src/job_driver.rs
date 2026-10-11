@@ -50,7 +50,7 @@ impl JobDriver {
 
     pub fn advance<T>(
         &mut self,
-        requests: &mut Requests<T>,
+        requests: &mut Requests<'_, T>,
         input: &mut Input<'_>,
         now: u64,
     ) -> Result<Advance, SystemCallError> {

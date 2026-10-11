@@ -104,6 +104,14 @@ impl Budget {
         self.counters.len()
     }
 
+    /// 全局资源扣账是否全部退还；账户及视图仍可存活，本检查不封口。
+    pub fn is_empty(&self) -> bool {
+        self.counters
+            .iter()
+            .flatten()
+            .all(|counter| counter.used() == 0)
+    }
+
     pub fn slot(&self, index: usize) -> Option<BudgetSlot> {
         (index < self.counters.len()).then_some(BudgetSlot {
             budget: self.id,

@@ -2,7 +2,7 @@
 name = "srv_fs"
 version = "0.1.0"
 authors = ["Dearain (d3ara1n@outlook.com)"]
-description = "Filesystem service: in-memory FAL provider and acceptance workload"
+description = "Filesystem service: in-memory fs provider and OAL discovery"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,12 +10,12 @@ edition = "2024"
 [dependencies]
 libkernel = { path = "../../libraries/libkernel" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
-libfal = { path = "../../libraries/libfal" }
 libfs = { path = "../../libraries/libfs" }
+libservice = { path = "../../libraries/libservice" }
+liboal = { path = "../../libraries/liboal" }
 librpc = { path = "../../libraries/librpc" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
-libservice = { path = "../../libraries/libservice" }
 librunnel = { path = "../../libraries/librunnel" }
 libruntime = { path = "../../libraries/libruntime" }
 ordered_table = { path = "../../../shared/ordered_table" }

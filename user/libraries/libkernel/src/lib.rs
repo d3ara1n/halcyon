@@ -6,8 +6,9 @@ pub extern crate alloc;
 
 mod call;
 pub use call::{
-    sys_process_abort, sys_process_terminate, sys_sleep, sys_thread_exit, sys_thread_start,
-    sys_thread_yield,
+    sys_notification_create, sys_notification_mint_observer, sys_notification_signal,
+    sys_notification_take, sys_process_abort, sys_process_terminate, sys_sleep, sys_thread_exit,
+    sys_thread_start, sys_thread_yield,
 };
 pub mod dbg;
 pub mod ipc;

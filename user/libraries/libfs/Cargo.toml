@@ -2,16 +2,19 @@
 name = "libfs"
 version = "0.1.0"
 authors = ["Dearain (d3ara1n@outlook.com)"]
-description = "Client-side namespace library: prefix table, walking and symlink expansion"
+description = "File System protocols, clients and provider backing mechanisms"
 edition = "2024"
 
 [dependencies]
 erhino_shared = { path = "../../../shared/erhino_shared" }
-libfal = { path = "../libfal" }
-
-[target.'cfg(target_arch = "riscv64")'.dependencies]
-libkernel = { path = "../libkernel" }
-librunnel = { path = "../librunnel" }
+liboal = { path = "../liboal" }
 librpc = { path = "../librpc" }
 libbudget = { path = "../libbudget" }
 libexecution = { path = "../libexecution" }
+libkernel = { path = "../libkernel" }
+ordered_table = { path = "../../../shared/ordered_table" }
+metadata_admission = { path = "../../../shared/metadata_admission" }
+monotonic_id = { path = "../../../shared/monotonic_id" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+librunnel = { path = "../librunnel" }
