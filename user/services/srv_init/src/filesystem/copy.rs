@@ -197,7 +197,7 @@ pub(crate) fn exercise(
     {
         return Err("Copy Property differs from source");
     }
-    libkernel::debug!("FAL2 independent property copy passed");
+    libkernel::debug!("FS1 independent property copy passed");
     let progress = complete(
         root,
         task(&ns, SOURCE, "/secondary/init-copy-stream", Kind::Stream)?,
@@ -207,8 +207,7 @@ pub(crate) fn exercise(
         return Err("Copy final progress invalid");
     }
     contents(&mut client, "/secondary/init-copy-stream", LENGTH)?;
-    libkernel::debug!("FAL2 independent cross-provider stream Copy passed");
-    libkernel::debug!("FAL2 independent property Copy and stream ReadAt passed");
+    libkernel::debug!("FS1 independent cross-provider stream Copy passed");
 
     // 两个真实活任务共享同一无 DUP Namespace/Dispatcher；取消一个不取消另一个。
     start(
@@ -343,7 +342,7 @@ pub(crate) fn exercise(
     ) {
         return Err("pre-admission Copy cancellation attempted target");
     }
-    libkernel::debug!("FAL2 independent Copy conflict, empty and cancellation variants passed");
+    libkernel::debug!("FS1 independent Copy conflict, empty and cancellation variants passed");
 
     // 具体写会话绑定原对象；旧名字替换后任务既不重选，也不回删替代者。
     start(
@@ -381,7 +380,7 @@ pub(crate) fn exercise(
     {
         return Err("Copy modified replacement");
     }
-    libkernel::debug!("FAL2 independent exclusive target Create and pinned cleanup passed");
+    libkernel::debug!("FS1 independent exclusive target Create and pinned cleanup passed");
 
     // sealed 活 waiter：暂停领取但保持真实 Task/txid，Driver 必须保留失败完成。
     start(
@@ -520,7 +519,7 @@ pub(crate) fn exercise(
         // 未知目标留给 provider 的原 backing/停止 owner，不按名字删除它。
         remove(&mut client, "/secondary/init-copy-successor")?;
     }
-    libkernel::debug!("FAL2 independent Create uncertainty and reply isolation passed");
+    libkernel::debug!("FS1 independent Create uncertainty and reply isolation passed");
     for path in [
         SOURCE,
         PROPERTY,
@@ -576,6 +575,6 @@ pub(crate) fn finish_shutdown(
         &mut Client::new(&ns, &mut caller, limits()),
         "/init-copy-shutdown-source",
     )?;
-    libkernel::debug!("FAL2 in-flight Copy provider shutdown passed");
+    libkernel::debug!("FS1 in-flight Copy provider shutdown passed");
     Ok(())
 }

@@ -517,7 +517,7 @@ fn run(grants: &mut libruntime::startup::InitialGrants, parent_pid: u64) {
     drop(authority);
     check_basic(&namespace, &mut caller, "", &primary);
     check_basic(&namespace, &mut caller, "/provider-b", &shutdown);
-    libkernel::debug!("FAL2 independent primary and secondary bounded Open read passed");
+    libkernel::debug!("FS1 independent primary and secondary bounded Open read passed");
     stream::check_accounts(&namespace, &mut caller);
     watch::check(&namespace, &mut caller, "/tenant-b");
     watch::check_accounts(&namespace, &mut caller);
@@ -582,7 +582,7 @@ fn run(grants: &mut libruntime::startup::InitialGrants, parent_pid: u64) {
         .cancel(&mut caller, deadline())
         .expect("name subscription cancel failed");
     libkernel::debug!("SRV2 independent endpoint withdrawal passed");
-    libkernel::debug!("FAL2 independent consumer shutdown passed");
+    libkernel::debug!("FS1 independent consumer shutdown passed");
     report
         .signal(test_fs::report::PROVIDER_CLOSED)
         .expect("closed provider report failed");

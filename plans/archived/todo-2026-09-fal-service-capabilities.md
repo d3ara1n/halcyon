@@ -332,7 +332,7 @@ D0–D5 与下述结构修复已随闭包提交收口。正式服务来源拒绝
 | Registry `starting` 期限索引与 Registration 的状态/期限重复，批量 API 无生产调用 | 删索引、`starting_key`、额外 PreparedEntry/Bytes 收费和 host-only 批量 API；`expire_if_starting(instance, now)` 直接核对 Starting 与本实例期限。现有 host 覆盖 Ready 先胜、到期先胜与 seal，真实 provider timer/账户经组合验收。 |
 | 三份 `valid_name` 与控制索引中相同 minted id 的 `identity`/`instance` 重复 | `libservice::protocol::valid_name` 为 wire/authority/Registry 单一规则，控制索引只存 instance/task_id；现有无效名称 host 契约及 A/B 注册、Query、失效真实拓扑通过。 |
 
-本轮 `just check`、七面 `just clippy`、`libservice` host 17 项及完整 `just acceptance`（debug stress 16/16、release core、sifive_u、virt-nofd、boot-failure）通过；最终 Move/Take 补修后重跑了七面 clippy 与完整 acceptance，未重复与之无关的 host 测试。无遗留 QEMU/GDB 进程。fixture 的判定收敛由[验收 fixture 清理](../todo-2026-09-23-acceptance-fixture-cleanup.md#消费者与覆盖审计)记录。Read/Delegate/Request 和 Dispatcher 仍属 `srv_fs` 的真实编排，不为迁移建立新 facade。
+本轮 `just check`、七面 `just clippy`、`libservice` host 17 项及完整 `just acceptance`（debug stress 16/16、release core、sifive_u、virt-nofd、boot-failure）通过；最终 Move/Take 补修后重跑了七面 clippy 与完整 acceptance，未重复与之无关的 host 测试。无遗留 QEMU/GDB 进程。fixture 的判定收敛由[验收 fixture 清理](todo-2026-09-23-acceptance-fixture-cleanup.md#当前消费者与装配)记录。Read/Delegate/Request 和 Dispatcher 仍属 `srv_fs` 的真实编排，不为迁移建立新 facade。
 
 
 ## 9. Open 与流完成
@@ -537,4 +537,4 @@ F4 当前接线已闭合：`srv_init` 的 `launch_fal_consumer`、`launch_second
 
 本轮实现与 core/stress/virt-release/sifive_u/virt-nofd 均已通过；`just clippy`、`just build_user`、`git diff --check` 和 `bash -n tools/qemu-acceptance.sh` 通过。sifive_u 缺失 `public time deadline checks passed:` anchor 的原因已定位为 60 秒路线预算不足，默认值已调整为 120 秒并通过；考虑到 FAL 资源/退出验证继续增长，virt stress 默认值同步从 300 秒放宽为 420 秒。最终 `just acceptance` 通过，实测 `real 399.88s`。
 
-验收 fixture 的两个映像因独立覆盖暂留，后续内核自检审计由其[独立计划](../todo-2026-09-23-acceptance-fixture-cleanup.md)承接。
+验收 fixture 的两个映像因独立覆盖暂留，后续内核自检审计由其[独立计划](todo-2026-09-23-acceptance-fixture-cleanup.md)承接。

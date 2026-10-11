@@ -1032,7 +1032,7 @@ fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
 /// ThreadCreate/user-memory 8B：目标进程内部建立真实多线程，完成同 AddressSpace
 /// stale translation、Endpoint close/普通 Unmap 并发及结构化 stack/join 收束；
 /// 末线程通过 ThreadExit 被动冻结进程 Completed 终态。
-fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
+pub(crate) fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
     let (target, gun) = match spawn_race_target(job, image, race::TARGET_THREAD_SUITE, 0) {
         Ok(pair) => pair,
         Err(error) => {
@@ -1043,13 +1043,14 @@ fn thread_memory_suite(job: Handle, image: &[u8]) -> bool {
     let _ = /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */ unsafe { libkernel::sys_notification_signal(gun, 1) };
     let allowed = [TerminationCause::Completed as u32];
     let terminal = observe_dead(target.control, &allowed);
-    let ok = terminal.is_some();
+    // SAFETY: 两个句柄均由本剧本独占；目标已完成自动退休，关闭剩余控制与发令权。
+    let control_closed = unsafe { close(target.control) }.is_ok();
+    let gun_closed = unsafe { close(gun) }.is_ok();
+    let ok = terminal.is_some() && control_closed && gun_closed;
     debug!(
         "thread memory suite {}",
         if ok { "passed" } else { "FAILED" }
     );
-    let _ = unsafe { close(target.control) };
-    let _ = unsafe { close(gun) };
     ok
 }
 

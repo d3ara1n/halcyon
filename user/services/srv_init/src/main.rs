@@ -298,7 +298,9 @@ const CONTROL_STRESS: usize = 128;
 
 #[cfg(feature = "acceptance-stress")]
 const TUNNEL_STRESS: usize = 64;
-#[cfg(feature = "acceptance-stress")]
+#[cfg(feature = "acceptance-memory")]
+const ACCEPTANCE_WORKLOAD: &str = "memory";
+#[cfg(all(feature = "acceptance-stress", not(feature = "acceptance-memory")))]
 const ACCEPTANCE_WORKLOAD: &str = "stress";
 #[cfg(not(feature = "acceptance-stress"))]
 const ACCEPTANCE_WORKLOAD: &str = "core";
@@ -1075,31 +1077,31 @@ struct AcceptedFsProvider {
 
 fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static str> {
     let deadline = libkernel::time::timeout_millis(5_000)
-        .map_err(|_| "FAL2 cancellable RPC deadline failed")?;
+        .map_err(|_| "FS1 cancellable RPC deadline failed")?;
     let event = notification::create(
         Rights::READ | Rights::WAIT | Rights::MANAGE,
         Rights::SIGNAL | Rights::TRANSIT,
     )
-    .map_err(|_| "FAL2 cancellable RPC Notification failed")?;
+    .map_err(|_| "FS1 cancellable RPC Notification failed")?;
     let cancel = event.owner;
     event
         .peer
         .signal(1)
-        .map_err(|_| "FAL2 cancellable RPC signal failed")?;
+        .map_err(|_| "FS1 cancellable RPC signal failed")?;
     let blocked = root
         .create_mailbox(
             Rights::READ | Rights::WAIT | Rights::MANAGE,
             Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
         )
-        .map_err(|_| "FAL2 cancellable RPC blocked mailbox failed")?;
+        .map_err(|_| "FS1 cancellable RPC blocked mailbox failed")?;
     for index in 0..MAILBOX_CAPACITY {
         root.sender(blocked.peer)
             .send(0x4341_4e43_454c_0000 + index as u64, &[])
-            .map_err(|_| "FAL2 cancellable RPC mailbox fill failed")?;
+            .map_err(|_| "FS1 cancellable RPC mailbox fill failed")?;
     }
     let mut caller = librpc::Caller::new();
     let request = librpc::Request::new(protocol::ID, b"cancel")
-        .map_err(|_| "FAL2 cancellable RPC first request failed")?;
+        .map_err(|_| "FS1 cancellable RPC first request failed")?;
     let first = caller.call_cancelable(
         root.sender(blocked.peer),
         deadline,
@@ -1107,21 +1109,21 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
         Some(cancel.as_handle()),
     );
     let Err(mut first) = first else {
-        return Err("FAL2 cancellable RPC did not return unsent owner");
+        return Err("FS1 cancellable RPC did not return unsent owner");
     };
     if first.phase != librpc::CallPhase::Unsent
         || first.cause != librpc::CallCause::Cancelled
         || !first.has_unretired_owners()
     {
-        return Err("FAL2 cancellable RPC unsent phase invalid");
+        return Err("FS1 cancellable RPC unsent phase invalid");
     }
     drop(
         first
             .take_unsent_request()
-            .ok_or("FAL2 cancellable RPC request missing")?,
+            .ok_or("FS1 cancellable RPC request missing")?,
     );
     if first.has_unretired_owners() {
-        return Err("FAL2 cancellable RPC request owner not released");
+        return Err("FS1 cancellable RPC request owner not released");
     }
     root.close_control(blocked.owner)?;
     root.close_control(blocked.peer)?;
@@ -1131,12 +1133,12 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
             Rights::READ | Rights::WAIT | Rights::MANAGE,
             Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
         )
-        .map_err(|_| "FAL2 cancellable RPC sent mailbox failed")?;
+        .map_err(|_| "FS1 cancellable RPC sent mailbox failed")?;
     let request = librpc::Request::new(protocol::ID, b"cancel")
-        .map_err(|_| "FAL2 cancellable RPC second request failed")?;
+        .map_err(|_| "FS1 cancellable RPC second request failed")?;
     cancel
         .take(u64::MAX)
-        .map_err(|_| "FAL2 cancellation reset failed")?;
+        .map_err(|_| "FS1 cancellation reset failed")?;
     let mut operation = librpc::CallOperation::new(
         &mut caller,
         root.sender(sent.peer),
@@ -1144,20 +1146,20 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
         request,
         Some(cancel.as_handle()),
     )
-    .map_err(|_| "FAL2 cancellable RPC preparation failed")?;
+    .map_err(|_| "FS1 cancellable RPC preparation failed")?;
     if operation
         .advance()
-        .map_err(|_| "FAL2 cancellable RPC send failed")?
+        .map_err(|_| "FS1 cancellable RPC send failed")?
         .is_some()
         || operation.phase() != Some(librpc::CallPhase::Sent)
     {
-        return Err("FAL2 cancellable RPC did not enter Sent");
+        return Err("FS1 cancellable RPC did not enter Sent");
     }
     // 取消在真实运输提交后发布；不再以预先有信号的空 mailbox 偶然进入 Sent。
     event
         .peer
         .signal(1)
-        .map_err(|_| "FAL2 sent cancellation signal failed")?;
+        .map_err(|_| "FS1 sent cancellation signal failed")?;
     let cause = operation
         .wait_ready()
         .expect_err("sent cancellation was ignored");
@@ -1167,26 +1169,26 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
         || second.cause != librpc::CallCause::Cancelled
         || !second.has_unretired_owners()
     {
-        return Err("FAL2 cancellable RPC sent phase invalid");
+        return Err("FS1 cancellable RPC sent phase invalid");
     }
     second
         .retry_cleanup()
-        .map_err(|_| "FAL2 cancellable RPC reply owner close failed")?;
+        .map_err(|_| "FS1 cancellable RPC reply owner close failed")?;
     if second.has_unretired_owners() {
-        return Err("FAL2 cancellable RPC reply owner not released");
+        return Err("FS1 cancellable RPC reply owner not released");
     }
     root.close_control(sent.owner)?;
     root.close_control(sent.peer)?;
     cancel
         .close()
-        .map_err(|_| "FAL2 cancellable RPC owner close failed")?;
+        .map_err(|_| "FS1 cancellable RPC owner close failed")?;
     // SAFETY: 本函数仍独占 Notification 的信号端点。
     event
         .peer
         .close()
         .map_err(|(_, error)| error)
-        .map_err(|_| "FAL2 cancellable RPC peer close failed")?;
-    debug!("FAL2 cancellable RPC phases passed");
+        .map_err(|_| "FS1 cancellable RPC peer close failed")?;
+    debug!("FS1 cancellable RPC phases passed");
     Ok(())
 }
 
@@ -1833,6 +1835,10 @@ fn run_rpc_outbox(outbox: Outbox) -> OutboxResult {
 /// 全部测试剧本。失败只短路后续阶段，交回 main 以 services 整树收束兜底。
 fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<(), RunFailure> {
     debug!("acceptance workload: {}", ACCEPTANCE_WORKLOAD);
+    #[cfg(feature = "acceptance-memory")]
+    if ACCEPTANCE_WORKLOAD == "memory" {
+        return run_memory(root, services).map_err(RunFailure::from);
+    }
     test_memory_mapping()?;
     #[cfg(not(feature = "acceptance-stress"))]
     test_process_funding(services)?;
@@ -2266,6 +2272,32 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     dump_topology(root_job, &names, 0);
     root.close_control(pm_domain)?;
     root.verify_idle_ownership()?;
+    Ok(())
+}
+
+/// 复用完整 stress 的正式线程/映射消费者及根监督器，供发布窗口旁观路线使用。
+#[cfg(feature = "acceptance-memory")]
+fn run_memory(root: &mut RootSupervisor, services: Handle) -> Result<(), &'static str> {
+    let mut image = None;
+    with_init_payload(|payload| {
+        tar::walk(payload, |entry| {
+            if entry.name == "bin/test_hammer" {
+                image = Some(StartupImage::from_slice(entry.data));
+            }
+        })
+    })
+    .map_err(|_| "memory workload initfs parse failed")?;
+    let image = image.ok_or("memory workload hammer image missing")?;
+    let job = root
+        .create_job(services, root_memory_pool(), JOB_FULL_RIGHTS)
+        .map_err(|_| "memory workload job create failed")?;
+    if !race::thread_memory_suite(job, image.as_slice()) {
+        return Err("memory workload thread suite failed");
+    }
+    root.collect_job(job)?;
+    root.close_control(job)?;
+    root.verify_idle_ownership()?;
+    debug!("memory workload collected");
     Ok(())
 }
 

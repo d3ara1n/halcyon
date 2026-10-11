@@ -13,12 +13,6 @@
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。当前后续入口为[对象链收敛提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)、[旧Review范围归并](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)及测量触发的[锁评估](todo-2026-10-01-lock-performance.md)。
 
-## 旧基线待办
-
-以下保留旧基线问题入口；新重构是否需要先处理，由目标消费者与验证需求决定，不自动作为全项目重构前置。
-
-1. [验收 fixture 与自检清理](todo-2026-09-23-acceptance-fixture-cleanup.md)：继续逐项审查未替代的自检窗口。
-
 旧 midflight Copy 已按[机制替换证据](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置)关闭；Watch 历史未知错误继续由 [W05-04](todo-2026-10-07-fal-service-redesign.md#历史问题重新核定2026-10-11)承接，不恢复旧 Copy 施工。
 
 ## 可择机任务与审查

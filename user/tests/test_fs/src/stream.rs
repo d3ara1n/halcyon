@@ -100,7 +100,7 @@ pub(super) fn check(namespace: &Namespace, caller: &mut Caller, prefix: &str) {
         .map_err(|(_, e)| e)
         .expect("write endpoint release failed");
     drop(control);
-    libkernel::debug!("FAL2 Open control and terminal cases passed after 16384 bytes");
+    libkernel::debug!("FS1 Open control and terminal cases passed after 16384 bytes");
 
     let offer = Client::new(namespace, caller, limits())
         .open(&file, options(Direction::Read), deadline())
@@ -148,7 +148,7 @@ pub(super) fn check(namespace: &Namespace, caller: &mut Caller, prefix: &str) {
         .map_err(|(_, e)| e)
         .expect("read endpoint release failed");
     drop(offer.control);
-    libkernel::debug!("FAL2 independent stream content and frozen read passed");
+    libkernel::debug!("FS1 independent stream content and frozen read passed");
 
     let offer = Client::new(namespace, caller, limits())
         .open(&file, options(Direction::Write), deadline())
@@ -325,7 +325,7 @@ pub(super) fn check(namespace: &Namespace, caller: &mut Caller, prefix: &str) {
     assert_eq!(info.state, StreamState::Terminal);
     assert_eq!(info.reason, StreamReason::Expired);
     drop(offer.control);
-    libkernel::debug!("FAL2 independent unattached Open expired and retired");
+    libkernel::debug!("FS1 independent unattached Open expired and retired");
     let mut fs = Client::new(namespace, caller, limits());
     fs.set_length(&file, 8, deadline())
         .expect("SetLength shrink failed");

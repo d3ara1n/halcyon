@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""旁观正式stress消费者的发布窗口fault，验证实际RetryFault等待与后续整体验收。"""
+"""旁观正式线程/映射消费者的发布窗口fault，验证RetryFault与memory负载完整收束。"""
 
 import argparse
 import hashlib
@@ -75,7 +75,7 @@ quit 0
             if completed.returncode:
                 raise RuntimeError(f'GDB observer failed with {completed.returncode}: {gdb_log}')
             try:
-                # 已取得唯一所需观察就detach，正式stress余下部分在无断点下收束。
+                # 已取得唯一所需观察就detach，原线程/映射消费者在无断点下收束。
                 status = process.wait(timeout=max(0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired as error:
                 raise RuntimeError(f'guest did not finish after observer detached: {qemu_log}') from error
@@ -93,7 +93,7 @@ quit 0
         'retry_fault': hex(retry), 'gdb_exit': completed.returncode,
         'observations': [line for line in output.splitlines() if 'FAULT_WAIT ' in line or 'VM_FAULT_PASSED' in line],
         'scope': 'formal test_hammer/thread suite, release cookie then tail-page read/write before Map returns; no injected exception or kernel test switch',
-        'observer': 'detach after first RetryFault; existing acceptance wrapper checks complete workload and final refunds',
+        'observer': 'detach after first RetryFault; acceptance wrapper checks thread completion, job collection, auxiliary capability cleanup and reset',
         'limits': 'GDB pause is not timing/WCET evidence; stale permission repair and instruction-fence windows need their own evidence',
         'gdb_log': str(gdb_log), 'qemu_log': str(qemu_log),
     }

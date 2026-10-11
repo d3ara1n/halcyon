@@ -8,6 +8,7 @@ edition = "2024"
 [features]
 default = []
 acceptance-stress = []
+acceptance-memory = ["acceptance-stress"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

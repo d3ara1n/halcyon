@@ -144,8 +144,8 @@ pub(crate) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
         .remove(path, deadline())
         .expect("quota stream cleanup failed");
     libkernel::debug!("FS1 stream A/B Bytes, local/global quota and owner refund passed");
-    libkernel::debug!("FAL2 independent Open offer discarded");
-    libkernel::debug!("FAL2 resource quota saturation and recovery passed");
+    libkernel::debug!("FS1 independent Open offer discarded");
+    libkernel::debug!("FS1 resource quota saturation and recovery passed");
 }
 
 pub(crate) fn check_edges(namespace: &Namespace, caller: &mut Caller, prefix: &str) {
@@ -229,7 +229,7 @@ pub(crate) fn check_edges(namespace: &Namespace, caller: &mut Caller, prefix: &s
     Client::new(namespace, caller, limits())
         .remove(&path, deadline())
         .expect("bounded fixture cleanup failed");
-    libkernel::debug!("FAL2 independent pre-Start EOF gate passed");
+    libkernel::debug!("FS1 independent pre-Start EOF gate passed");
 }
 
 pub(crate) fn check_permissions(namespace: &Namespace, caller: &mut Caller, prefix: &str) {
@@ -312,7 +312,7 @@ pub(crate) fn check_permissions(namespace: &Namespace, caller: &mut Caller, pref
     Client::new(namespace, caller, limits())
         .remove(&path, deadline())
         .expect("rights cleanup failed");
-    libkernel::debug!("FAL2 independent Delegate and restricted Open passed");
+    libkernel::debug!("FS1 independent Delegate and restricted Open passed");
 }
 
 pub(crate) fn check_abandoned(
@@ -326,7 +326,7 @@ pub(crate) fn check_abandoned(
         abandon_one(namespace, caller, prefix, entry, attempt);
     }
     libkernel::debug!("FS1 CreateOpen committed name survives queued reply abandonment");
-    libkernel::debug!("FAL2 independent Open reply authority retired after abandonment");
+    libkernel::debug!("FS1 independent Open reply authority retired after abandonment");
 }
 fn abandon_one(
     namespace: &Namespace,
