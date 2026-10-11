@@ -27,18 +27,22 @@ Halcyon 是以 eRhino RV64 微内核为核心、包含用户态系统服务与�
 
 ## 运行与验收
 
-构建系统用 [Just](https://just.systems)，可执行名为 `just`。所有 QEMU 路线默认经
-CPU 节流与路线级超时保护（`THROTTLE=100` 全速；各超时可经同名环境变量覆盖）：
+构建系统用 [Just](https://just.systems)，可执行名为 `just`。演示入口直接运行系统，
+验收入口检查结果并带路线级超时保护；两者默认 CPU 节流（`THROTTLE=100` 全速）：
 
 ```sh
-just virt          # qemu virt：日常 core 快速验收
-just virt-stress   # qemu virt：完整压力与 16/16 竞态矩阵
-just virt-release  # release core 验收
-just virt-hetero   # 多调度域（无 F/D 的 Base64 域 + D64 域）集成验证
-just virt-nofd     # 无兼容域验证（全 Base64 拓扑）
-just sifive_u      # qemu sifive_u：板级 core 验收（hart 0 禁用）
-just acceptance    # 闭包收尾：clippy + stress + release + sifive_u + nofd + boot-failure
+just virt                 # qemu virt 演示，默认 debug
+just virt-release         # qemu virt 演示，release
+just sifive_u             # qemu sifive_u 演示，默认 release
+just acceptance-virt      # virt core 自动验收，默认 release
+just acceptance-sifive_u  # sifive_u core 自动验收，默认 release
+just virt-stress          # 完整压力与 16/16 竞态矩阵验收
+just virt-hetero          # 多调度域集成验收
+just virt-nofd            # 无兼容浮点域验收
+just acceptance           # 静态检查、core、平台和故障注入完整验收
 ```
+
+演示在终端实时显示编译与系统输出，非交互环境仅显示概要并将输出保存到 `artifacts/run/`；可用 `ERHINO_OUTPUT=live|summary` 覆盖。验收与测试始终只报告结果和日志位置，详情查日志。`sifive_u` 演示在 reset 失败后由用户 Ctrl-C 退出；自动验收使用独立入口。详见[构建与验证手册](plans/BUILD-AND-TEST.md#日志与调查)。
 
 秒级检查与仅编译内核：
 

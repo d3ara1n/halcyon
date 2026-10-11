@@ -88,7 +88,7 @@ clippy:
         else
             status=$?
             echo "Clippy failed: $label (full log: $log)" >&2
-            tail -n "${CLIPPY_SUMMARY_LINES:-120}" "$log" >&2 || true
+            # 失败细节由对应日志拥有，终端只报告结果。
             return "$status"
         fi
     }
@@ -117,16 +117,7 @@ clean:
     cargo clean --manifest-path os/Cargo.toml
 
 artifact_dir:
-    #!/usr/bin/env bash
-    if [ ! -d "artifacts" ]; then
-    	mkdir artifacts
-    fi
-    if [ ! -d "artifacts/build" ]; then
-    	mkdir artifacts/build
-    fi
-    if [ ! -d "artifacts/initfs" ]; then
-    	mkdir artifacts/initfs
-    fi
+    @mkdir -p "{{TARGET_DIR}}/build" "{{TARGET_DIR}}/initfs" "{{MODEL_DIR}}"
 
 make_dtb: artifact_dir
     @echo Selected DTS {{PLATFORM}}/{{MODEL}}.dts
@@ -140,11 +131,11 @@ build_user: artifact_dir
         *) echo "Unknown acceptance workload: {{ACCEPTANCE_WORKLOAD}}" >&2; exit 2 ;;
     esac
     cd user
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet --workspace --exclude test_fp --exclude test_hammer --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --exclude test_hammer --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     if [ "{{ACCEPTANCE_WORKLOAD}}" != core ]; then
-        RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+        RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     fi
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --quiet -p test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
     echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
@@ -167,7 +158,7 @@ make_boot_package: make_initfs
 
 build_kernel: artifact_dir
     @echo -e "\033[0;36mBuild kernel: {{PLATFORM}}/{{MODEL}}\033[0m"
-    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --quiet --bin kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
+    @cd os && CARGO_TARGET_DIR="{{KERNEL_TARGET_DIR}}" ERHINO_MEMORY_SCRIPT="{{MEMORY_SCRIPT}}" RUSTFLAGS="{{RUSTFLAGS_OS}}" cargo build --bin kernel {{RELEASE}} {{ZFLAGS}} -Z json-target-spec -Z unstable-options --artifact-dir "{{MODEL_DIR}}"
     @riscv64-elf-objcopy {{KERNEL_ELF}} -O binary {{KERNEL_BIN}}
     @python3 os/tools/audit_elf.py {{KERNEL_ELF}}
     @echo -e "\033[0;32mKernel build successfully!\033[0m"
@@ -180,68 +171,100 @@ run_qemu_dump_dtb:
     @{{QEMU_LAUNCH}} -machine dumpdtb="{{TARGET_DIR}}/dump.dtb"
     @dtc -O dts -o "{{TARGET_DIR}}/dump.dts" -I dtb "{{TARGET_DIR}}/dump.dtb"
 
-# 快速开发线：确定性 core workload。
-virt:
-    @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_TIMEOUT}} -smp cores=4
+# 演示在终端直接显示完整输出；非终端和所有测试只报告结果与日志位置。
+[private]
+output label purpose +COMMAND:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    mode="${ERHINO_OUTPUT:-auto}"
+    if [[ "{{purpose}}" == test ]]; then mode=summary; fi
+    case "$mode" in
+        auto) if [[ -t 1 ]]; then mode=live; else mode=summary; fi ;;
+        live|summary) ;;
+        *) echo "ERHINO_OUTPUT must be auto, live, or summary" >&2; exit 2 ;;
+    esac
+    if [[ "$mode" == live ]]; then exec {{COMMAND}}; fi
+    mkdir -p artifacts/run
+    log="artifacts/run/$(date +%Y%m%d-%H%M%S)-$$-{{label}}.log"
+    echo "Starting {{label}}; log: $log"
+    if {{COMMAND}} >"$log" 2>&1; then
+        if [[ "{{purpose}}" == test ]]; then result=Passed; else result=Completed; fi
+        echo "$result {{label}}; log: $log"
+    else
+        status=$?
+        echo "Failed {{label}}: exit $status; log: $log" >&2
+        exit "$status"
+    fi
 
-# 完整 debug 压力线：core 的全部语义再加重复压力、自动退休与 16/16 竞态矩阵。
+# 演示入口直接运行系统，不做验收锚点判定或自动收割。
+virt mode="debug":
+    @just output virt demo env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu -smp cores=4
+
+virt-release:
+    @just virt release
+
+# sifive_u 没有可用 shutdown 后端；演示终态由终端用户主动退出。
+sifive_u mode="release":
+    @just output sifive_u demo env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu -smp cores=5
+
+# 自动验收独立于演示入口，始终隐藏内部输出。
+acceptance-virt mode="release":
+    @just output acceptance-virt-{{mode}} test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{if mode == "release" { VIRT_RELEASE_TIMEOUT } else { VIRT_TIMEOUT }}} -smp cores=4
+
+acceptance-sifive_u mode="release":
+    @just output acceptance-sifive_u test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
+
+# 完整 debug 压力验收：core 的全部语义、自动退休与 16/16 竞态矩阵。
 virt-stress:
-    @ERHINO_ACCEPTANCE_WORKLOAD=stress QEMU_ACCEPTANCE_PROFILE=stress just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_STRESS_TIMEOUT}} -smp cores=4
+    @just output virt-stress test env ERHINO_ACCEPTANCE_WORKLOAD=stress QEMU_ACCEPTANCE_PROFILE=stress just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_STRESS_TIMEOUT}} -smp cores=4
 
-# 平台变体默认 release；传入 debug 可检查相同业务在 debug 代码下的行为。
-# 多域 eligibility 集成验证：cpu@0 声明无 F/D（内核信 DT，保守正确）→
-# Base64-only 域 {0} + D64 域 {1,2,3}。验收：域拓扑快照两行、D64 验收
-# 进程只在 FD 域运行（fp verification passed）、全负载收束后显式停机。
+# 多域验收：Base64-only 域 {0} 与 D64 域 {1,2,3}。
 virt-hetero mode="release":
+    @just output virt-hetero test just run_virt_hetero {{mode}}
+
+[private]
+run_virt_hetero mode: artifact_dir
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
     @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
     @ERHINO_ACCEPTANCE_WORKLOAD=core ERHINO_DTB=artifacts/virt-hetero.dtb QEMU_ACCEPTANCE_PROFILE=hetero just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{VIRT_HETERO_TIMEOUT}} -smp cores=4
 
-# 无兼容域验证：全部 cpu 去掉 F/D，D64 profile 的 test_fp 启动即拒绝
-# （NotSupported → init spawn 失败路径），Base64 负载照常收束。
+# 无兼容域验收：D64 test_fp 拒绝启动，Base64 负载照常收束。
 virt-nofd mode="release":
+    @just output virt-nofd test just run_virt_nofd {{mode}}
+
+[private]
+run_virt_nofd mode: artifact_dir
     @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-nofd.dts all
     @dtc -O dtb -o artifacts/virt-nofd.dtb artifacts/virt-nofd.dts
     @ERHINO_ACCEPTANCE_WORKLOAD=core ERHINO_DTB=artifacts/virt-nofd.dtb QEMU_ACCEPTANCE_PROFILE=nofd just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{VIRT_NOFD_TIMEOUT}} -smp cores=4
 
-# release 快速线：覆盖优化代码生成、trap 寄存器保持与完整 core syscall 往返；
-# 重复压力由 virt-stress 承担，阶段收尾统一走 acceptance 聚合。
-virt-release:
-    @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=release run_qemu_acceptance_bounded {{VIRT_RELEASE_TIMEOUT}} -smp cores=4
-
-# sifive_u 只覆盖板级差异并运行 core workload；无 shutdown 设备，明确 reset
-# 失败后由 allow-timeout wrapper 收割，路线超时只兜底异常停滞。
-sifive_u mode="release":
-    @ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
-
 # 外部调试器在全员 Online / Ready 前注入失败，核验 Gate 与每个 hart 停驻。
-# 无内核 feature 或运行时测试政策；使用正式 debug binary 的符号与 ABI。
 virt-boot-failure:
-    @ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_boot_failure
+    @just output virt-boot-failure test env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_boot_failure
 
 [private]
 run_boot_failure: make_dtb make_boot_package build_kernel
     @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
-# 真实已发布责任的门铃失败：外部GDB跳过一次IPI，核无timer目标后续醒来先停驻。
+# 真实已发布责任的门铃失败验收。
 virt-ipi-failure:
-    @ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_ipi_failure
+    @just output virt-ipi-failure test env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_ipi_failure
 
 [private]
 run_ipi_failure: make_dtb make_boot_package build_kernel
     @python3 tools/check-ipi-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_IPI_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
-# 只运行既有线程/映射消费者及完整收束，必须命中真实发布窗口fault等待。
+# 只运行既有线程/映射消费者及完整收束，必须命中真实发布窗口 fault 等待。
 virt-vm-fault:
-    @ERHINO_ACCEPTANCE_WORKLOAD=memory just PLATFORM=qemu MODEL=virt MODE=debug run_vm_fault
+    @just output virt-vm-fault test env ERHINO_ACCEPTANCE_WORKLOAD=memory just PLATFORM=qemu MODEL=virt MODE=debug run_vm_fault
 
 [private]
 run_vm_fault: make_dtb make_boot_package build_kernel
     @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=memory tools/qemu-acceptance.sh -- python3 tools/check-vm-fault.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_VM_FAULT_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
-# 模拟入口故障、保留真实PTE/现场：核R/W/X fence及无进展修复上界。
+# 模拟入口故障、保留真实 PTE 与用户现场的修复验收。
 virt-vm-repair:
-    @ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_vm_repair
+    @just output virt-vm-repair test env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_vm_repair
 
 [private]
 run_vm_repair: make_dtb make_boot_package build_kernel
@@ -251,29 +274,24 @@ run_vm_repair: make_dtb make_boot_package build_kernel
 acceptance-core:
     @just clippy
     @just virt-stress
-    @just virt-release
+    @just acceptance-virt
 
-# 平台差异仍携带完整 core；默认 release，单条 recipe 可显式选择 debug。
+# 平台差异仍携带完整 core；各条验收可显式选择 debug。
 acceptance-platforms:
-    @just sifive_u
+    @just acceptance-sifive_u
     @just virt-nofd
 
-# 特权失败与真实发布窗口；各自保留独立观察及收束要求。
 acceptance-faults:
     @just virt-boot-failure
     @just virt-ipi-failure
     @just virt-vm-fault
     @just virt-vm-repair
 
-# 完整收尾：组合三组，不重复执行已经包含的路线。
-# 每条 QEMU 由自身路线超时保护，聚合命令不另设总时限。
+# 完整验收只组合测试入口，不调用演示入口。
 acceptance:
     @just acceptance-core
     @just acceptance-platforms
     @just acceptance-faults
-
-# 验收脚本将完整 QEMU 输出写入临时日志，仅在结束时显示末尾摘要；失败时保留
-# 完整日志并同时打印摘要。可用 QEMU_SUMMARY_LINES 覆盖摘要行数。
 
 # 清理泄漏的孤儿 qemu（PPID=1 残留；agent 裸跑 run_qemu 后易遗漏）。
 # 默认一键清理孤儿；传参透传脚本：-l 仅列出，-y 跳过确认，-f 连有父进程的一并杀。

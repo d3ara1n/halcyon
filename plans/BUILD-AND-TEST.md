@@ -20,6 +20,8 @@ just clippy
 
 `just check` 对 os workspace 执行带 build-std 的 cargo check，包含它的实际依赖，不等于检查所有 workspace。`just clippy` 覆盖 shared/os/user host、kernel/user RISC-V、stress/memory feature 与独立 gc target 八个分面，全部使用 `-D warnings`；完整日志写入 `artifacts/lint/`。
 
+所有 QEMU 启动路线自动准备产物目录，并通过 `make_dtb` 从对应平台的 `device.dts` 重新生成 `artifacts/<PLATFORM>/<MODEL>/device.dtb`，无需手动预生成；清理产物后可直接运行 `just virt`。`virt-hetero`、`virt-nofd` 在生成变体 DTS 前同样准备目录；`ERHINO_DTB` 只选择 QEMU 加载的 DTB，不改变标准 DTB 的生成位置。
+
 ## Host 测试
 
 纯逻辑 crate 的 host 测试必须显式指定 host target，不能继承 RISC-V 默认 target 去链接 std。当前开发机命令：
@@ -38,10 +40,12 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 
 | 命令 | 覆盖与用途 |
 |---|---|
-| `just virt` | 日常 debug core：确定性内存、IPC、Tunnel、Job、监督与 reset |
+| `just virt [mode]` | 直接运行 virt 演示；默认 debug，终端实时显示编译和系统输出 |
 | `just virt-stress` | core 加 control/Tunnel 重复压力、非空 WaitSet 进程自动退休与完整 16/16 竞态矩阵 |
-| `just virt-release` | release core，覆盖优化代码生成和 trap 寄存器保持 |
-| `just sifive_u [mode]` | 128MiB 与非零 boot hart 等板级差异，完整 core；默认 release，可指定 debug |
+| `just virt-release` | `just virt release` 的演示快捷入口 |
+| `just acceptance-virt [mode]` | virt core 自动验收；默认 release，可指定 debug |
+| `just sifive_u [mode]` | 直接运行 sifive_u 演示；默认 release，终态由用户退出 |
+| `just acceptance-sifive_u [mode]` | 128MiB、非零 boot hart 等板级差异的 core 自动验收；默认 release |
 | `just virt-nofd [mode]` | 无 F/D、无兼容浮点域的完整 core；默认 release，可指定 debug |
 | `just virt-hetero [mode]` | 异构调度域及完整 core；默认 release，可指定 debug，涉及调度域时额外运行 |
 | `just virt-boot-failure` | 外部 GDB 对正式 debug binary 注入 Ready 前 panic/alloc/fatal，确认所有 hart 在 Failed 后停驻 |
@@ -53,13 +57,13 @@ workload 由用户态 `srv_init` 编译期控制，内核不感知测试政策�
 | `just acceptance-faults` | 特权失败与发布窗口：boot-failure、IPI failure、VM fault、VM repair |
 | `just acceptance` | 完整收尾：依次执行上述三组，各路线仅一次 |
 
-日常局部开发优先受影响 host 测试及 `virt-release`；需要 debug 现场用 `virt`，涉及竞争与退休用 `virt-stress`。常规跨机制回归用 `acceptance-core`；平台、DT、hart 启动/能力、资源布局变化补 `acceptance-platforms`，调度域变化再加 hetero；启动失败、IPI/停驻、VM 发布/修复、uaccess 变化补相关故障路线，跨这些机制的改动用 `acceptance-faults`。广泛系统变更及完整收尾保留 `acceptance`，不把所有组强加给每次局部修改。
+演示与自动验收是独立入口：`virt`、`virt-release`、`sifive_u` 直接运行 QEMU，不执行验收锚点判定，也不自动收割终态。日常自动验证优先受影响 host 测试及 `acceptance-virt`；需要 debug 验收用 `acceptance-virt debug`，涉及竞争与退休用 `virt-stress`。常规跨机制回归用 `acceptance-core`；平台、DT、hart 启动/能力、资源布局变化补 `acceptance-platforms`，调度域变化再加 hetero；启动失败、IPI/停驻、VM 发布/修复、uaccess 变化补相关故障路线。完整收尾保留 `acceptance`，聚合只调用测试入口，不调用演示入口。
 
 施工中路线结果只作为开发证据。机制闭包收尾按实际影响执行 `just check`、`just clippy` 与必要路线；已由聚合覆盖的检查不另行重复。平台完整业务保留，不用“板级差异”理由删去可能暴露资源/调度交错的真实消费者。文档等不改变执行行为的工作按影响核验，不运行无关的代码验收。
 
 ## 节流、超时与判定
 
-常规路线经 `tools/qemu-throttle.sh` 和 `tools/qemu-acceptance.sh`。默认 `THROTTLE=50`，stress 和自动 GDB 路线同样节流，不作为全速性能基准；需要全速的专项诊断显式设 `THROTTLE=100`。节流限制宿主执行占空比，不能由 50% 推导整条路线耗时恰好翻倍；全速也仍经过路线的日志、锚点与超时判定。
+演示经 `tools/qemu-throttle.sh` 直接运行；自动验收再由 `tools/qemu-acceptance.sh` 或专项诊断器判定。默认 `THROTTLE=50`，stress 和自动 GDB 路线同样节流，不作为全速性能基准；需要全速的专项诊断显式设 `THROTTLE=100`。节流限制宿主执行占空比，不能由 50% 推导整条路线耗时恰好翻倍。演示没有验收超时，运行到系统退出或用户中断；非交互环境需要防挂死时由调用者显式使用 `timeout`。
 
 各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT`、`VIRT_IPI_FAILURE_TIMEOUT`、`VIRT_VM_FAULT_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 为竞态矩阵和文件资源/退出组合预留较长预算。VM fault 的 memory 负载有独立预算，旁观与 detach 后收束共用总期限；聚焦负载后仍保留原预算，不把提速当作收紧防挂死期限的依据。平台路线预算同时允许显式 debug，异构域的 Base64 系统负载固定在单 hart。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
 
@@ -79,10 +83,14 @@ M累计栈工具从固定ELF重建CFI与动态目标，源码语义前提须人�
 
 该模型对应 HiFive Unleashed：hart 0 无 MMU，可运行 hart 为 1–4，DRAM 128MiB，timebase 1MHz，boot hart 不固定。内核继续运行时探测现代 SBI，不因板型历史调用 v0.1 核心 ABI，也不引入专用内核政策。
 
-模型没有可用 shutdown 后端。`just sifive_u` 遇到明确 reset 失败或 panic 终态时主动收割，再检查完整 core 锚点；终态日志触发收割不代表验收自动通过。
+该模型没有可用 shutdown 后端。`just sifive_u` 是演示，系统报告 reset 失败后仍保留现场，由用户 Ctrl-C 退出。`just acceptance-sifive_u` 遇到明确 reset 失败或 panic 终态时主动收割，再检查完整 core 锚点；收割本身不代表验收通过。
 
 ## 日志与调查
 
-长时间构建、测试和验收保存完整输出，终端只展示末尾摘要；失败必须保留完整日志、打印路径并传递真实退出码，不用 `tail` 截断后丢失错误上下文。摘要长度使用对应脚本环境变量调整，需要诊断时按日志定位原始错误。
+演示入口 `virt`、`virt-release`、`sifive_u` 在 Justfile 中按 stdout 是否 TTY 选择输出：终端直接显示编译、DTS 诊断和 QEMU 内核/用户态输出；非 TTY 将整次输出保存到 `artifacts/run/`，只显示开始、完成或失败及日志路径。演示完成仅表示运行结束，不表示自动验收通过。实时演示不额外捕获日志，需要留存时由调用者重定向或使用 `tee`。
+
+`ERHINO_OUTPUT=live just virt` 强制实时演示，`ERHINO_OUTPUT=summary just virt` 强制概要；通过管道或 `tee` 查看实时输出时需显式选择 live。该开关仅控制演示，不影响验收与测试。
+
+自动验收和测试始终隐藏内部输出，包括构建警告和 QEMU 输出；终端只报告结果、退出码和日志位置，失败详情查日志，不自动回放日志末尾。Justfile 将构建及诊断器输出保存在 `artifacts/run/`；`qemu-acceptance.sh` 独立保留失败 QEMU 日志及元数据，`QEMU_ACCEPTANCE_KEEP_LOG=1` 可额外保留成功现场。clippy 同样只报告各分面结果和日志位置。底层 `build_kernel`、`build_user`、`make_dtb`、`run_qemu` 命令保留原始输出，便于直接诊断。
 
 通过规定检查后停止；只有新改动、失败或具体未解决风险触发补测。挂起与损坏按 [DEBUG-PLAYBOOK](DEBUG-PLAYBOOK.md) 调查，工具、GDB 和汇编细节见 [TOOLING-PITFALLS](TOOLING-PITFALLS.md)。

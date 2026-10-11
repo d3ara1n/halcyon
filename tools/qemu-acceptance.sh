@@ -187,9 +187,7 @@ log_has_any() {
     return 1
 }
 
-# 后台跑并写入完整日志：失败锚点必须主动收割，否则 panic 或 reset 返回后的
-# 稳态 WFI 不会让 QEMU 自退。终端只在收束后显示摘要，避免长日志冲击会话；
-# 完整现场始终保留在失败日志中。TERM 沿 timeout → qemu-throttle → QEMU 链传播。
+# 验收始终只写日志；终端只报告判定结果，不承担演示输出。
 : > "$log"
 "$@" > "$log" 2>&1 &
 runner=$!
@@ -212,40 +210,20 @@ done
 sleep 0.2
 trap - EXIT INT TERM
 
-summary_lines="${QEMU_SUMMARY_LINES:-25}"
-show_summary() {
-    local source="$1"
-    echo "QEMU acceptance log summary (last ${summary_lines} lines):"
-    tail -n "$summary_lines" "$source" || true
-}
-
 # 失败即保留现场：无法重现的非确定性失败、锚点缺失或挂死一旦删日志就只能重跑。
 keep_log() {
     local reason="$1"
     local kept="artifacts/failed-acceptance-${run_id}.log"
     local kept_meta="artifacts/failed-acceptance-${run_id}.meta"
-    local last_progress
-    last_progress="$(grep -F 'acceptance progress:' "$log" 2>/dev/null | tail -n 1 || true)"
+    printf 'failure_reason=%s\n' "$reason" >> "$meta"
     if mv "$log" "$kept" 2>/dev/null; then
         mv "$meta" "$kept_meta" 2>/dev/null || true
-        echo "QEMU acceptance failure log kept: $kept ($reason)" >&2
-        if [[ -n "$last_progress" ]]; then
-            echo "QEMU acceptance last progress: $last_progress" >&2
-        else
-            echo "QEMU acceptance last progress: none" >&2
-        fi
-        show_summary "$kept" >&2
+        echo "QEMU acceptance failed: $reason; log: $kept" >&2
     fi
 }
 
 if [[ "$status" -ne 0 ]]; then
     if ! $allow_timeout || [[ "$status" -ne 124 ]]; then
-        echo "QEMU acceptance failed: command exited with status $status." >&2
-        if grep -Fq 'acceptance progress:' "$log" 2>/dev/null; then
-            echo "QEMU acceptance classification: failure-after-progress" >&2
-        else
-            echo "QEMU acceptance classification: failure-without-progress" >&2
-        fi
         keep_log "exit status $status"
         exit "$status"
     fi
@@ -253,7 +231,6 @@ fi
 
 for anchor in "${required[@]}"; do
     if ! log_has "$anchor"; then
-        echo "QEMU acceptance failed: missing anchor: $anchor" >&2
         keep_log "missing anchor: $anchor"
         exit 1
     fi
@@ -261,7 +238,6 @@ done
 
 for anchor in "${rejected[@]}"; do
     if log_has "$anchor"; then
-        echo "QEMU acceptance failed: observed failure anchor: $anchor" >&2
         keep_log "failure anchor: $anchor"
         exit 1
     fi
@@ -269,8 +245,9 @@ done
 
 if [[ "$status" -eq 124 ]]; then
     echo "QEMU acceptance passed (harvested after explicit reset failure)."
+else
+    echo "QEMU acceptance passed: profile $profile."
 fi
-show_summary "$log"
 if [[ "${QEMU_ACCEPTANCE_KEEP_LOG:-0}" == "1" ]]; then
     kept="artifacts/qemu-acceptance-${run_id}.log"
     kept_meta="artifacts/qemu-acceptance-${run_id}.meta"
