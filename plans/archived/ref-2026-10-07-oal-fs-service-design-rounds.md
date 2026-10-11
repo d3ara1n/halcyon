@@ -26,7 +26,7 @@
 - `libservice/src/record.rs::ServiceRecord` 经 FAL Record 携带服务 endpoint；发布记录、目录能力导出与 endpoint 可用性之间的关系尚未完成本轮重设计。
 - `libfs/src/resolve.rs` 负责路径委托、符号链接和逻辑位置；需要与节点身份、授权及 namespace 更新共同核定语义。
 - 现有 Runtime 来源登记已在[对象链审查修复](../archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)收敛为 `SourceRegistration`。不把已经删除的 requested/removing 重复表示重新登记为当前底层缺口。
-- [midflight Copy 间歇失败](../todo-2026-09-29-fal-midflight-copy-flake.md)仍无已证实根因，后续由本案的 Copy 语义和正式消费者核实承接；一次聚合通过不能消除历史间歇性证据。
+- [midflight Copy 间歇失败](todo-2026-09-29-fal-midflight-copy-flake.md)仍无已证实根因，后续由本案的 Copy 语义和正式消费者核实承接；一次聚合通过不能消除历史间歇性证据。
 - 三份旧 FAL 固定提交 Review 保留历史目标；范围归并由[总体 Review 入口](../todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)拥有，不在本案重复建立 findings 记录。
 
 ## 第一轮调查：代码事实与外部参照

@@ -406,7 +406,7 @@ F1 代码关闭（专项测试未运行，见 G3）；F2 主体成立（见 G4�
 - G5/G6：impls 按最终代码重写，删除施工宣告。
 - F5：所涉启动代码已被整体替换，问题过期，按“关闭（未解决）”处置，不再定位；新问题另行立案的条件为新代码在 init 建 Job、映射、启动 pm 区间出现同类早期停滞。
 
-验证：libthread/libprocess host 测试、`just check`、`just clippy` 七分面通过；`just acceptance` 被一项原有间歇缺陷阻塞。`virt-release` 定向各 20 次：基线 `1d869cf` 失败 4 次，本轮工作树失败 6 次与 7 次，失败全部为 `test_fal` “FAL consumer midflight Copy progress or owner mismatch”，前一事件均为首次多 hart shootdown；该用例只经 spawn/join，不经本轮删除的取消路径。缺陷早于本阶段，转由 [FAL midflight Copy 间歇失败](../todo-2026-09-29-fal-midflight-copy-flake.md) 承接，不计入本报告。
+验证：libthread/libprocess host 测试、`just check`、`just clippy` 七分面通过；`just acceptance` 被一项原有间歇缺陷阻塞。`virt-release` 定向各 20 次：基线 `1d869cf` 失败 4 次，本轮工作树失败 6 次与 7 次，失败全部为 `test_fal` “FAL consumer midflight Copy progress or owner mismatch”，前一事件均为首次多 hart shootdown；该用例只经 spawn/join，不经本轮删除的取消路径。缺陷早于本阶段，转由 [FAL midflight Copy 间歇失败](todo-2026-09-29-fal-midflight-copy-flake.md) 承接，不计入本报告。
 
 ## 结构复核（固定提交 0867bc2）与关闭
 

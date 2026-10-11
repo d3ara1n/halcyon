@@ -651,7 +651,7 @@ host 检查按受影响包选择并显式指定 host target；例如目标包建
 | 新实现的结构检查与独立代码 Review | 设计 D0 已关闭，尚无本轮 Rust 实现可审查 | P4 按 REVIEW 完成交付前结构检查；代码交付后另登记固定提交/序列的独立 Review，不能以本轮设计审查替代 |
 | 新协议与实际资源链尚未实现 | 本计划 P1—P4；本轮只整理设计 | D0 关闭后按源码迁移表接通真实两端；以完整验证矩阵和旧路径删除为完成标准 |
 | 迁移期间仍存旧路径 | 本计划 P1—P4；代码尚未改，未产生新的半重构区域 | 同一切面接通后删除对应旧实现；P4 前清零。暂停时记具体文件/责任/验证断点并同步矫正区，不创建兼容桥接 |
-| 旧 Copy 间歇失败 | [原问题记录](todo-2026-09-29-fal-midflight-copy-flake.md)独占现象与根因证据；当前根因仍未知 | 新路径若复现或涉及复用机制，属于本次 Copy 正确性闭包；交付前提供修复或旧责任链被替换且等价场景已验证的证据，在原记录说明处置，不用一次通过宣称原问题根因已解决 |
+| 旧 Copy 间歇失败 | [原问题档案](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置)独占现象与处置证据；原精确根因仍未知，旧责任链已整体替换 | 已按旧同步Copy/pump/有限轮退休/合并断言删除、真实新消费者接通及分版本验证关闭；新路径若复现由当前责任链承接，不把机制替换宣称为已定位旧根因 |
 | 设备/驱动与正式装配 | 各所属分案；不在本次实现 | 它们开始接入时使用本案协议；本案只保证扩展接点，不能宣称硬件资源或长期服务能力已交付 |
 | 范围外文件能力 | [文件扩展计划](todo-2026-09-fal-extended-operations.md)唯一登记高层跨域 Move、递归/元数据、持久化等触发与完成标准 | 本篇当前边界完整；实施不得借 Copy/Delete 隐式实现未设计的移动事务，也不重复维护该计划的延期清单 |
 
@@ -832,7 +832,7 @@ srv_fs 已确认最终只剩 main 的 run 接手断点，见 `srv_fs-migration-f
 
 ## 当前接力
 
-提交前 C01—C11 的调查、代码/文档修改及验证均由 **GrandOwl 亲自完成**；**MellowPond、RubyRaven** 仅提供先前事实与历史线索，没有编辑或测试。分支 `refactor/system-redesign`，施工基线 `4523bbf`；交付提交为 `a1ca124fdb70c1f20034f3e7d24d587f4323c98e`，[独立 Review](todo-2026-10-11-oal-fs-service-review.md)已登记、待执行。最新证据为 `artifacts/convergence3/acceptance-summary.json`：libfs43/librpc16 共59项 host、目标 lint、just check、原失败 nofd 路线、七面 clippy 与完整 just acceptance（784.55秒）通过，验收期间源码指纹不变。C10 删除下游派生与 Copy 的普通叶能力清理暂存，C11 修复聚合发现的同目录不同名字 CreateOpen 被父目录整体版本误判 Conflict，并补提交前当前授权范围和版本耗尽检查；没有串行化两个 Copy、自动重试或放宽验收。首轮 nofd 失败、host 修前确定反例及各自源指纹保留。convergence/convergence2、P4 与旧40门仅作为各自基线的历史证据，不视为当前源码重复验证。N6、映射撤销与 Bind 特定迟到交错的注入前置及两项历史未知根因仍按末节原分类保留。**用户接受上述遗留由文档承载，本轮施工结束；后续只按明确验证触发、新需求或提交后独立 Review 接续。** 主计划因仍拥有专项验证条目保留为活跃承接记录，不将未覆盖项归档为已关闭。
+提交前 C01—C11 的调查、代码/文档修改及验证均由 **GrandOwl 亲自完成**；**MellowPond、RubyRaven** 仅提供先前事实与历史线索，没有编辑或测试。分支 `refactor/system-redesign`，施工基线 `4523bbf`；交付提交为 `a1ca124fdb70c1f20034f3e7d24d587f4323c98e`，[独立 Review](todo-2026-10-11-oal-fs-service-review.md)已登记、待执行。最新证据为 `artifacts/convergence3/acceptance-summary.json`：libfs43/librpc16 共59项 host、目标 lint、just check、原失败 nofd 路线、七面 clippy 与完整 just acceptance（784.55秒）通过，验收期间源码指纹不变。C10 删除下游派生与 Copy 的普通叶能力清理暂存，C11 修复聚合发现的同目录不同名字 CreateOpen 被父目录整体版本误判 Conflict，并补提交前当前授权范围和版本耗尽检查；没有串行化两个 Copy、自动重试或放宽验收。首轮 nofd 失败、host 修前确定反例及各自源指纹保留。convergence/convergence2、P4 与旧40门仅作为各自基线的历史证据，不视为当前源码重复验证。N6、映射撤销与 Bind 特定迟到交错的注入前置及 W05-04 历史未知错误继续保留；旧 midflight Copy 已按[历史重新核定](#历史问题重新核定2026-10-11)的整体机制替换依据关闭归档，不宣称已定位旧根因。**用户接受上述遗留由文档承载，本轮施工结束；后续只按明确验证触发、新需求或提交后独立 Review 接续。** 主计划因仍拥有专项验证条目保留为活跃承接记录，不将未覆盖项归档为已关闭。
 
 恢复工作先核对工作区与本轮源码指纹，保留全部原实施和规则/工具改动。只在出现新修改、新失败或具体未解决风险时补相应验证；现有精确注入窗口不以额外普通运行冒充关闭。本轮提交已获授权并完成；后续新提交仍需单独授权。固定交付的独立 Review 按已登记计划接手，不自动开始。
 
@@ -1467,7 +1467,7 @@ sealed 活 waiter 修复由真实 Shared 调用提交后停止同 Dispatcher、�
 | independent enumeration and same-provider Move passed | 04 | 对齐分页/同域 Rename；Replace/防环未覆盖项仍保留 |
 | independent conditional Open identity and pin passed | 12 | 未承诺条件Open，协调者按最终合同核销 |
 
-旧 midflight 的处置写回其唯一[原记录](todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-新-copy-消费者承接)。本次 release 一次正常不证明历史根因已修；40次重复与完整 acceptance 是 P4 单独的验证门。没有 commit/push，工作树保留共享任务改动。
+旧 midflight 的处置写回其唯一[原记录](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-新-copy-消费者承接)。本次 release 一次正常不证明历史根因已修；40次重复与完整 acceptance 是 P4 单独的验证门。没有 commit/push，工作树保留共享任务改动。
 
 ### P4 开工与身份迁移（2026-10-11，RubyRaven）
 
@@ -1532,7 +1532,7 @@ Cargo metadata 的实际 lib/bin均名test_fs，无test_fal/libfal package；lib
 | G05-15 | 独占CreateOpen、改名后具体实例继续写与同名替代者不变运行 | 当前pin/不按名回删门核销；Unknown目标仍归provider原backing停止owner |
 | G05-16 | Exists保留原值、空目标/空进度、提交前取消/部分取消运行 | 当前变体门核销 |
 | G05-17 | 非零transported后取消、前缀内容/上界、原任务物理清理Complete、并发后继不受影响运行 | 未强迫非零目标accepted后取消，结果仍保留已确认下界；精确窗口F项，不误报最终数量 |
-| G05-18 | 在途provider停止、Created/部分进度/清理Complete和双provider收集运行 | 原记录的固定source/build fingerprint连续40release门和P4完整acceptance均已完成；历史根因未证实，最终历史处置由协调者在原记录明确裁决，不能将新门通过改写为已定位旧根因 |
+| G05-18 | 在途provider停止、Created/部分进度/清理Complete和双provider收集运行 | 固定P4 fingerprint连续40release与完整acceptance门均完成，最终C11基线另有组合证据；[旧midflight档案](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置)已按整体机制替换关闭，具体失败子条件仍未知，不将新门通过改写为已定位旧根因 |
 | G05-19 | Derive目录/领域及完整运输位、普通母关闭后child、错型Permission、受限Boundary和流权限运行；显式revoke host | 真实准入后母显式revoke交错F项；不把普通关闭等同revoke |
 | G05-20 | Open Start/Query/Finish/Cancel、满环/EOF/冻结数量及原聚合锚点运行 | 当前控制门核销，未恢复旧Lookup前置 |
 | G05-21 | 管理Root/context/Lifetime与独立付款、Bind/Unbind、共享/受限出口、suffix/循环预算、replacement及queued未知不重放运行；迟到prepare不删替代者/稳定ID host | 发送后父显式撤销/真正迟到cap/来源及Close故障F项，当前正常能力已接通 |
@@ -1728,3 +1728,20 @@ C10/C11 最终 `just acceptance` exit0，784.55秒含构建；七面 clippy、vi
 用户确认已完成代码问题与收敛处理，接受 N6、映射撤销/Bind 特定交错的验证前置及历史未知根因继续由上述唯一记录承载，宣布本轮结束并授权提交。主计划保留专项验证条目，Notification 前置保留 N6；已完成的执行付款前置归档。当前没有继续施工指令，不新建测试设施、不重复验收；提交后按 REVIEW 登记固定代码提交的独立审查，登记不等于已执行审查。
 
 交付代码与随附文档已提交为 `a1ca124fdb70c1f20034f3e7d24d587f4323c98e`，父提交为 `4523bbfe65287f6b84ab73d9f034dae1a526d38d`。[独立 Review](todo-2026-10-11-oal-fs-service-review.md)固定这一完整交付，状态为待执行；本轮没有执行独立 Review，也没有推送远端。
+
+### 历史问题重新核定（2026-10-11）
+
+用户授权本轮先扫除历史问题，或证明其存在基础已在迭代/重构中消失。调查基线 `a89b899`、交付代码 `a1ca124`，起点工作树干净；范围为旧 midflight Copy 与 W05-04，不启动独立 Review，不修改源码、时间/容量政策或验收器。主代理亲读旧断言/同步Copy与当前CopyTask、init编排和Watch准入责任链，辅助explorer仅提供旧源码/日志地图。证据汇总为 `artifacts/historical-closure/evidence.json`；当前363份源码/工具输入与最终C11验收指纹逐项一致，5份完整guest SHA也一致，没有新执行风险需要重复QEMU。
+
+| 历史条目 | 本轮事实与处置 | 未覆盖边界与接续 |
+|---|---|---|
+| 旧 midflight Copy | 19份现存失败日志均停在进度后取消场景，可以区分原 `:1919` 与更后的provider停止 `:2084`；具体原因/进度/owner子条件未知。旧同步Copy、私有pump运行体、有限轮退休和返回即检查owner的结构已整体删除，新任务持续持有txid/来源/映射至Complete；真实取消/非零目标前缀/并发隔离/停止接通，P4的40次与最终C11聚合证据分开复核。按用户允许的机制替换依据关闭并归档，详见[唯一档案](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置) | 精确原始根因未恢复，不把C11或连续成功倒推为其原因；当前映射/Bind等精确注入缺口继续沿原条目维护 |
+| W05-04 Watch准入未知Err | 原guest `failed-acceptance-20261010-142502-89420.log:169—172` 在primary Watch通过、secondary direct paths通过后，于饱和循环panic，确为准入非Quota分支；日志没有Err、count或clock。主计划1061已记录删除最多24次RPC共用一个5s期限的结构；当前 `user/tests/test_fs/src/watch.rs:242—272` 每次独立准入生成同值有限deadline，以部署WATCHES+1限制总尝试，Quota才结束，其它错误仍立即panic并报告实际Err/count/last_ns/deadline | 只能关闭“整体饱和期限被较晚请求耗尽”的候选结构，不能证明它就是原Err，也不能证明其它候选已消失。W05-04继续活跃，由本计划维护；不将未复现改写为修复 |
+
+**W05-04保留理由与当前可达范围。** Watch的实际准入基础仍存在：[Client::watch](../user/libraries/libfs/src/client.rs) 仍经真实RPC和typed输出采用，[Request的Watch准备](../user/libraries/libfs/src/provider.rs) 仍创建Notification/Observer、mint控制、准备表项并登记真实Lifetime来源，[WatchTable::prepare](../user/libraries/libfs/src/watch.rs) 仍取得Counter/Watch/Bytes/WaitSource并分配预建表项。合法额度失败应映射Quota，其他分配/运输/协议错误仍可能返回非Quota；付款分离、准入/退款与退休结构已有后续改造和正常证据，但没有原Err可选择其中哪条作为必要原因。因此不存在足以宣称“原失败全部存在基础消失”的删除证明，也没有证据将W05-04归因为内核、已修的C11或某项当前代码bug。
+
+本轮逐一重读P4固定源码的40份release guest：每份均完成三次独立Watch合同（合计120次成功标记）、无Watch panic，并完成对应Copy与双provider退款。最终C11的5份guest另各有三次Watch合同（合计15次），正常/压力/release及平台变化均继续执行；原六轮矩阵仍按其当时源码保留。此为现有运行证据复核，不是新复现矩阵，也不能用有限次成功排除低概率错误。C09非零目标accepted后取消门是后加场景，只由最终基线承担，未追加到P4的40次覆盖中。
+
+**W05-04触发与完成门。** 当前主代理/后续本计划维护者拥有唯一处置责任；任何相同panic或Watch准入非Quota反例出现时，保留现有失败分支输出的具体Err、成功count、last_ns、请求deadline，并保存实际来源/控制Lifetime退休与费用序列，首先区分单次RPC过期、其他资源/分配失败、协议/运输错误及退款顺序。对可定位的当前机制修复并以对应反例验证后关闭；若以后删除该准入责任链，则需逐项提供旧必要条件删除与保留行为消费者的证明。单纯达到更多无失败次数不构成关闭门，不恢复旧公共接口、不放宽断言或增加假provider/新测试运行体。
+
+**本轮收口。** 旧Copy条目从COMPASS待办移除，原记录归档、链接同步；W05-04原始未知及精确注入缺口继续保留。本次无源码变化，impls不改；结构检查核对关闭依据、原日志时点/阶段、旧路径搜索、分版本覆盖与导航，不将普通运行升格为故障注入。文档检查覆盖6份逻辑文档的107个当前/新增本地链接及标题锚点、当前全文代码围栏，全部通过；3份旧档案只检查本次迁移的缺陷链接，历史删除源码引用不改写。`git diff --check`通过，未commit/push。
