@@ -1,12 +1,12 @@
 # Metadata 容量观测提交后独立审查
 
-> 状态：待独立 Review。本记录只安排原固定提交的事后审查；该提交尚未包含后续容量校准。后续顺序/并发及混合负载的条件性准入证据另由[容量校准提交 Review](todo-2026-09-25-capacity-calibration-review.md) 固定对象审查，不表示任意工作集都有物理容量保证。
+> 状态：已归档；旧 Metadata Counter/Ready 堆快照机制已被当前 Pool/预算结构替代，不再单独执行。
 
 ## 固定对象
 
 - 提交：`bfe38ff244c3fa283240444ab26c0030214ccbd9`，父提交 `be6dae30e6018d93890e71f95bc0c2c00e0585cf`。
 - 范围：Talc `counters`、Ready/reset 堆快照、heap ticket 消费数、RV64 ledger 条目布局输出，以及对应 mm/internals、审计工作记录和 COMPASS 更新。
-- 未包含：分配准入、共享 ABI、独立 KernelMemoryBudget、运行中边界采样或 32 张账本验收。这些后续工作的结论与延期边界由[架构审计工作记录](todo-2026-09-14-architecture-audit-findings.md)拥有。
+- 未包含：分配准入、共享 ABI、独立 KernelMemoryBudget、运行中边界采样或 32 张账本验收。这些后续工作的结论与延期边界由[架构审计工作记录](../todo-2026-09-14-architecture-audit-findings.md)拥有。
 
 ## 审查重点
 
@@ -17,6 +17,6 @@
 
 ## 已有证据与完成门
 
-提交前 `just check`、`just clippy` 七面、virt/core 和 virt/stress 均通过；本机摘要在 `artifacts/heap-core-run.log`、`artifacts/heap-stress-run.log`，成功路线的 QEMU 原始临时日志不在 Git 中。core Ready/Reset 与 stress Reset 的采样值及缺失的 stress Ready 行由[架构审计工作记录](todo-2026-09-14-architecture-audit-findings.md#本轮核验与接力)保留。这些不是独立 Review 结论，审查应固定在上述提交，不能用后续 HEAD 替代。
+提交前 `just check`、`just clippy` 七面、virt/core 和 virt/stress 均通过；本机摘要在 `artifacts/heap-core-run.log`、`artifacts/heap-stress-run.log`，成功路线的 QEMU 原始临时日志不在 Git 中。core Ready/Reset 与 stress Reset 的采样值及缺失的 stress Ready 行由[架构审计工作记录](../todo-2026-09-14-architecture-audit-findings.md#本轮核验与接力)保留。这些不是独立 Review 结论，审查应固定在上述提交，不能用后续 HEAD 替代。
 
 独立 reviewer 完成只读审查，形成无 finding 的结论，或将发现与修复责任转入唯一 `review-*.md` 报告并在此登记入口后，本计划归档。Review 不授权新的实施、提交或推送。

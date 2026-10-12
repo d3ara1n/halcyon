@@ -1,6 +1,6 @@
 # OAL、文件与服务目录交付独立 Review
 
-状态：**已登记，待执行。** 本篇登记代码交付后的独立审查，不表示审查已经通过，也不重新启动已结束的实施。
+状态：**Review 已完成，后续证据缺口由 [FAL 服务交付 Review 报告](review-2026-10-12-fal-service-delivery.md)唯一承接。** 本登记计划归档，不复制报告 findings。
 
 ## 固定目标与范围
 
@@ -22,14 +22,14 @@
 
 ## 证据与未覆盖边界
 
-[主计划当前接力](todo-2026-10-07-fal-service-redesign.md#当前接力)拥有交付前结构检查、三轮收敛和最终验证。最终源码指纹为 `ca8ba7025a3d44a832672b4a4310b4da222969fb060430a9474f0bef3143066a`（363 项输入）；本机证据 `artifacts/convergence3/acceptance-summary.json` 记录 libfs43/librpc16 共59项 host、目标 lint、just check、七面 clippy、原失败 nofd 路线与完整 just acceptance（784.55秒）通过。源码及工具与固定提交一致；文档收口不改变上述输入。
+[主计划当前接力](../todo-2026-10-07-fal-service-redesign.md#当前接力)拥有交付前结构检查、三轮收敛和最终验证。最终源码指纹为 `ca8ba7025a3d44a832672b4a4310b4da222969fb060430a9474f0bef3143066a`（363 项输入）；本机证据 `artifacts/convergence3/acceptance-summary.json` 记录 libfs43/librpc16 共59项 host、目标 lint、just check、七面 clippy、原失败 nofd 路线与完整 just acceptance（784.55秒）通过。源码及工具与固定提交一致；文档收口不改变上述输入。
 
 C10 首轮 nofd 的真实 Conflict、修前确定失败的 host 用例与 C11 修复后证据均保留。C11 证明的是不同名字创建被整体版本误拒绝，不能据此宣称旧 midflight 或 W05-04 的历史根因已查明。早期 P4、40次连续门与前两轮收敛属于各自基线。
 
-剩余精确注入和历史未知由[主计划](todo-2026-10-07-fal-service-redesign.md)及 [Notification N6](todo-2026-10-10-notification-observer-roles.md#n6-注入前置再核2026-10-11)继续拥有，不在本篇复制债务清单。执行付款合同和完成证据见[归档前置](archived/todo-2026-10-10-execution-funding.md)。实现审计入口为 [fs](../notes/impls/fs.md)、[service](../notes/impls/service.md)、[RPC](../notes/impls/rpc.md)、[框架](../notes/impls/framework.md)与 [IPC](../notes/impls/ipc.md)，以固定提交代码为准。
+剩余精确注入和历史未知由[主计划](../todo-2026-10-07-fal-service-redesign.md)及 [Notification N6](../todo-2026-10-10-notification-observer-roles.md#n6-注入前置再核2026-10-11)继续拥有，不在本篇复制债务清单。执行付款合同和完成证据见[归档前置](todo-2026-10-10-execution-funding.md)。实现审计入口为 [fs](../../notes/impls/fs.md)、[service](../../notes/impls/service.md)、[RPC](../../notes/impls/rpc.md)、[框架](../../notes/impls/framework.md)与 [IPC](../../notes/impls/ipc.md)，以固定提交代码为准。
 
 ## 执行与报告
 
-按 [REVIEW](REVIEW.md) 使用新上下文只读审查。现有验证可直接引用，仅为新发现的具体风险追加适当检查；不得把未覆盖的精确故障窗口改记为普通运行通过。此前交付前收敛和结构检查不替代本次独立 Review。
+按 [REVIEW](../REVIEW.md) 使用新上下文只读审查。现有验证可直接引用，仅为新发现的具体风险追加适当检查；不得把未覆盖的精确故障窗口改记为普通运行通过。此前交付前收敛和结构检查不替代本次独立 Review。
 
-形成 `review-<日期>-oal-fs-service.md` 后，由报告唯一承接 findings、修复和复核；本篇登记报告入口并归档。不在报告产生前预填通过结论，也不在本轮提交后自动启动新的施工。
+已形成 [FAL 服务交付 Review 报告](review-2026-10-12-fal-service-delivery.md)。报告确认没有新的可达代码 finding，记录五项 P2 证据缺口及其既有 owner；后续证据补充和复核由报告及相关主计划承接。本登记计划已归档。

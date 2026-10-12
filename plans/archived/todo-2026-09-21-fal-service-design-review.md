@@ -1,6 +1,6 @@
 # FAL 注册发现设计固定提交 Review
 
-> 【待审设计提交】固定文档提交 `1000270ef2b54c35bc56acda10943dd94c0e7e12`（`docs(fal): 闭合注册发现设计与实施接力`），父提交 `3607f22`。该提交只修改六份文档，不交付 F3d 运行能力。F3d 已随 `dda8a5b` 完成，实现前置已满足；待排期结合该实现执行只读设计 Review，本记录不另立实施计划。
+> 已归档；注册发现设计已由当前 FAL/OAL/fs/service 计划与 Review 产物承接，不再单独执行。
 
 ## 改动概要
 
@@ -18,10 +18,10 @@
 4. Backend 与两个真实后端是否检验了正确的领域边界；Watch 剩余唤醒责任、容量成本与退出接管是否避免重复真值或隐式依赖。
 5. 方向、代码基线和任务状态是否各自真实，外部固定版本证据是否支持所引用的事实；未实现的 F3d/Open/Copy 不得被记作已验证能力。
 
-本提交没有运行代码，不能据此执行“测试全绿代码批次”的代码 Review。F3d 实现对照提交为 `dda8a5b`；审查时核对这里的设计是否被实现证据修订，对应实施与证据见 [FAL 档案](archived/todo-2026-09-fal-service-capabilities.md)。
+本提交没有运行代码，不能据此执行“测试全绿代码批次”的代码 Review。F3d 实现对照提交为 `dda8a5b`；审查时核对这里的设计是否被实现证据修订，对应实施与证据见 [FAL 档案](todo-2026-09-fal-service-capabilities.md)。
 
 ## 证据与完成门
 
 已有证据仅为六份 Markdown 的 80 个本地链接、3 个入向计划锚点、围栏及 `git diff --check`；没有新增编译、host 测试或 QEMU 证据。
 
-未来 reviewer 使用新上下文，遵循 [Review 纪律](REVIEW.md)，每条 finding 给出固定位置、违反的契约与实际影响。审查结果及 findings 进入单一 Review 报告，本计划完成后归档；本文件存在不表示 Review 已执行。
+未来 reviewer 使用新上下文，遵循 [Review 纪律](../REVIEW.md)，每条 finding 给出固定位置、违反的契约与实际影响。审查结果及 findings 进入单一 Review 报告，本计划完成后归档；本文件存在不表示 Review 已执行。

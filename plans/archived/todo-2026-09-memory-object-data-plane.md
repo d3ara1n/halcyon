@@ -1,6 +1,6 @@
 # 多页 Tunnel 与 Runnel 数据面
 
-> 切片 8/9 与切片 10 的实现及完整组合验收均已完成，本专题归档。8/9 的固定提交范围由统一架构 Review 入口登记；切片 10 已提交为 `606b59db22f071943a4bfc2c174633454e449401`，固定提交代码复核由 [`库存来源 Review`](../todo-2026-09-frame-source-selftest-review.md) 拥有。调查基线：`726fc9f`；用户已确认方案及容量/审计约束修订。
+> 切片 8/9 与切片 10 的实现及完整组合验收均已完成，本专题归档。8/9 的固定提交范围由统一架构 Review 入口登记；切片 10 已提交为 `606b59db22f071943a4bfc2c174633454e449401`，固定提交代码复核已并入 [`基础对象链 Review`](review-2026-10-12-substrate-object-chain.md)。调查基线：`726fc9f`；用户已确认方案及容量/审计约束修订。
 >
 > 方向由 `notes/ideas/{mm,object,tunnel,runnel,shared-memory}.md` 拥有；当前实现以 `notes/impls/{mm,memory-object,tunnel,runnel}.md` 与代码为准。本档案保存交付范围与验证证据，不再安排实施。
 
@@ -27,7 +27,7 @@
 
 ## 推进结论与交付范围
 
-A–E 前置已闭合，公共 MemoryObject、多 extent backing、AddressSpace 事务、Remote completion 与 ProcessDrain 均可复用，没有必须先另造内核机制的阻塞项。历史证据见 [`Review program 档案`](todo-2026-09-review-program.md)。`4b27ce6` / `8aa7bc2` 的事后复核仍由独立的 [`后续复核计划`](../todo-2026-09-design-audit-followup-review.md) 拥有，不插入本专题施工流程。
+A–E 前置已闭合，公共 MemoryObject、多 extent backing、AddressSpace 事务、Remote completion 与 ProcessDrain 均可复用，没有必须先另造内核机制的阻塞项。历史证据见 [`Review program 档案`](todo-2026-09-review-program.md)。`4b27ce6` / `8aa7bc2` 的事后复核仍由独立的 [`后续复核计划`](todo-2026-09-design-audit-followup-review.md) 拥有，不插入本专题施工流程。
 
 **切片 8/9 合为一次完整交付**：多页 Tunnel ABI、Endpoint owner、安全关闭边界、共享内存访问、RNL2、现有消费者与验证一起完成。编号保留作历史定位，内部可按依赖施工，但不交付“多页内核 + 单页协议”的过渡状态，不在中途做局部闭环或验收。
 

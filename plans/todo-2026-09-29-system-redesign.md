@@ -97,10 +97,10 @@
 | 旧Review范围归并 | 逐份保留固定目标，区分被替换机制、现存消费者和新目标；输出范围矩阵，不把未审查标成通过 | 本轮已在[总体Review入口](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)建立12份范围矩阵；实际Review未执行，当前`ac9d7d9`的独立Review仍单独有效 |
 | 普通出生块文档校正 | 准确描述READ映射、Building Write初始化与地址空间持有，删除impls中的目标追踪/验证宣告 | 本轮文档部分已完成，见[startup](../notes/impls/startup.md#用户态公共-loader)；源码注释残留只在[分层记录](todo-2026-09-runtime-kernel-library-separation.md#kernel-与-shared-的施工边界)登记，待以后获准维护源码时处理 |
 | 验收fixture记录校准 | 更新现存映像、当前三类启动自检及脚本声明；旧ProcessDrain/WaitSet/Tunnel自检与原运行结果归于历史，未知等价覆盖仍保留未知 | [fixture清理档案](archived/todo-2026-09-23-acceptance-fixture-cleanup.md)保留2026-10-07文档轮次事实；当时未删除测试、执行代码审查或新验收 |
-| 验收运行整理（2026-10-11） | 用户另行授权实施：VM fault聚焦现有线程/内存消费者，平台默认release仍跑完整业务，聚合分组，删除重复Copy汇总并统一FS1输出 | [实施与验证](archived/todo-2026-09-23-acceptance-fixture-cleanup.md#实施验证与交付检查)已完成并提交为`a06e455`；[固定交付独立Review](todo-2026-10-11-acceptance-cleanup-review.md)已登记待执行。fixture与三项自检按独立覆盖保留，后续仅按owner/消费者/成本变化重审 |
-| 后续局部Review范围安排 | 选择纯时间换算/Deadline编码，登记固定候选目标、契约、排除项和完成产物；本轮只修订计划 | [时间Review计划](todo-2026-09-13-monotonic-time-rpc-deadline-review.md#后续轻量候选本轮仅安排)已登记；实际Review仍待后续启动，性能专题本轮未执行 |
+| 验收运行整理（2026-10-11） | 用户另行授权实施：VM fault聚焦现有线程/内存消费者，平台默认release仍跑完整业务，聚合分组，删除重复Copy汇总并统一FS1输出 | [实施与验证](archived/todo-2026-09-23-acceptance-fixture-cleanup.md#实施验证与交付检查)已完成并提交为`a06e455`；验收范围已由[FAL 原始报告](archived/review-2026-10-12-fal-service-delivery.md)审查，当前有效性与条件证据见[统一报告](review-2026-10-12-consolidated.md)。fixture与三项自检按独立覆盖保留，后续仅按owner/消费者/成本变化重审 |
+| 后续局部Review范围安排 | 选择纯时间换算/Deadline编码，登记固定候选目标、契约、排除项和完成产物；本轮只修订计划 | [时间与运输原始报告](archived/review-2026-10-12-transport-time.md)已完成；后续机制替换与精确证据由[统一报告](review-2026-10-12-consolidated.md)核定，性能专题本轮未执行 |
 
-本轮还核对了Sv39与hart兼容责任链，结果写入[内存计划](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)。本次只读代码核查和文档整理不构成新一轮实现验收，不宣告历史间歇性Copy缺陷或待执行Review已关闭。
+本轮还核对了Sv39与hart兼容责任链，结果写入[内存计划](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)。本次只读代码核查和文档整理不构成新一轮实现验收；五批独立 Review 的原编号和当前有效性已由[统一报告](review-2026-10-12-consolidated.md)集中核定，后续按其设计门、精确证据触发与所属专题接续。
 
 文档归属校正：ideas向前表达粗粒度目标关系，impls回头描述当前代码，不承载设计裁决、质量评价或完成宣告；详细设计、已确认选择、实施差距和工作状态由计划拥有。当前固定Sv39是实现事实，不能据此推导本计划体系中已确认的按空间/域选模式目标被撤销或必须重新裁决。对应[内存计划](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)与impls已按此纠正。
 
@@ -156,7 +156,7 @@
 
 对象链及其独立审查修复已收口；本总纲保持全项目剩余领域入口，不能把“无整篇ideas审定”解释为代码未实现。详细契约仍由各分案及最终修复记录拥有，ideas资格不因交付自动扩大。
 
-对象链修复已提交为`ac9d7d9364770a69c8135e918d512069980c06bb`，对应[固定提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)已登记待执行。[轻量收口记录](#近期轻量收口与本轮整理)保留此前文档轮次的范围和证据；本轮已转入 FAL 机制设计，按[剩余切面表](#剩余切面与接续顺序)及 FAL 分案当前接力继续。当前没有要求补做对象链旧拼装或恢复编译的接力。
+对象链修复已提交为`ac9d7d9364770a69c8135e918d512069980c06bb`，对应[固定提交原始Review](archived/review-2026-10-12-substrate-object-chain.md)已完成；原两项P1的更正依据、当前责任与后续复核由[统一报告](review-2026-10-12-consolidated.md#已退出当前修复队列的判断)拥有，不再作为待修复导航。[轻量收口记录](#近期轻量收口与本轮整理)保留此前文档轮次的范围和证据；按[剩余切面表](#剩余切面与接续顺序)及各分案当前接力继续。当前没有要求补做对象链旧拼装或恢复编译的接力。
 
 ## 初次设计文档交付检查（历史，不是当前代码验收）
 

@@ -1,10 +1,10 @@
 # 公共操作所有权固定提交 Review
 
-> 【未来审查计划】固定审查提交 `8e0467a8231e61ad6646d0d095bdac0493c1bfb6`（`refactor(kernel): 闭合公共操作所有权与公平推进`），父提交为 `59a6d8e`。本计划在实现提交之后登记，不阻塞 FAL F0 主线；审查对象是该固定提交的完整 diff，不以当前分支后续代码替代。
+> 已归档；固定公共操作所有权机制已被对象链重构替代，不再单独执行。
 
 ## 改动概要
 
-该提交完成 [`公共操作所有权专题`](archived/todo-2026-09-14-public-operation-ownership.md) P0–P6：
+该提交完成 [`公共操作所有权专题`](todo-2026-09-14-public-operation-ownership.md) P0–P6：
 
 - 以 `DebtLedger` 统一各领域工作债务的票据、登记、停驻、唤醒、完成和退款机械协议；领域 payload、容量、取消边界与执行器保持独立。
 - 以捕获的 `WaitKey` 收束 Waiting 发布、请求 start/cancel 和 activation 复用，允许取消先赢、迟到 start 空操作，并隔离旧 epoch 回调。

@@ -1,6 +1,6 @@
 # 通用执行、RPC 与 Outbox 整体固定提交 Review
 
-> 【未来审查计划】本文件合并 Runtime/准入、Runtime 清理/Job 分页及 RPC/Outbox 的整体固定提交 Review。固定提交序列为：`a3891b00c60acc0f91e964c183bb0eea7359404f`（`feat(runtime): 闭合通用执行准入与持久监督`）→ `5de2780fe4802f2bb31ddeeafccf87737ba80cc4`（`refactor(runtime): 复用预付请求并有界分页收束 Job`）→ `e0b5c45914d5c9b25f228b1dfc7f4a384ae77375`（`feat(rpc): 接通出站运行体与 Runtime`）→ `4e18e5e`（`feat(rpc): 闭合Runtime与Outbox服务执行链`）。提交后登记，供未来对整个机制闭包进行一次独立只读审查；此前两份阶段性 Review 的历史证据合并保留于本文件。
+> 已归档；固定 Runtime/RPC/Outbox 序列已并入[执行与库边界 Review 报告](review-2026-10-12-execution-library.md)，不再单独执行。
 
 ## 范围
 
@@ -25,11 +25,11 @@
 - Host：libsrv 26，libprocess 8 个单测及 4 个 Runtime 集成测试，librunnel 17，shared workspace 全部通过。
 - `just check`、七面 clippy、core 与完整 `just acceptance` 通过。最终日志 `artifacts/acceptance-takeover-20260915-121051.log` exit 0，含 stress 16/16、release、sifive_u、nofd 及 panic/alloc/fatal 启动失败三线。
 - `.sources.json` 的 31 个改动源码哈希已核对一致；完成时无 QEMU/GDB 残留。本机 artifacts 不随 clone 交付。
-- 完整修复与复核历史见 [已归档报告](archived/review-2026-09-15-runtime-closure.md)，实现事实见 `notes/impls/runtime.md`。已关闭 findings 作为回归检查依据，不据此重复立案。
+- 完整修复与复核历史见 [已归档报告](review-2026-09-15-runtime-closure.md)，实现事实见 `notes/impls/runtime.md`。已关闭 findings 作为回归检查依据，不据此重复立案。
 
 ## 完成门
 
-未来 reviewer 使用新上下文只读核对固定提交序列，finding 必须给出位置、可达路径、影响与违反的契约。无 finding 后归档本计划；有实际 finding 时由唯一报告承载修复与复核，不复制已有问题。RPC/Outbox 的已交付范围及证据见[执行前置档案](archived/todo-2026-09-13-service-runtime-prerequisites.md)。
+未来 reviewer 使用新上下文只读核对固定提交序列，finding 必须给出位置、可达路径、影响与违反的契约。无 finding 后归档本计划；有实际 finding 时由唯一报告承载修复与复核，不复制已有问题。RPC/Outbox 的已交付范围及证据见[执行前置档案](todo-2026-09-13-service-runtime-prerequisites.md)。
 
 ## 提交后的结构审视（2026-09-15，基线 d2d83de）
 

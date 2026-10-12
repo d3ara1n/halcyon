@@ -1,6 +1,6 @@
 # 验收运行整理交付独立 Review
 
-状态：**已登记，待执行。** 本篇固定已提交交付的审查范围，不表示独立审查通过，也不重新启动清理施工。
+状态：**已并入 FAL 服务交付 Review，审查已完成。** 后续唯一报告为 [FAL 服务交付 Review 报告](review-2026-10-12-fal-service-delivery.md)；本登记计划归档，不复制 findings。
 
 ## 固定目标与范围
 
@@ -19,7 +19,7 @@
 
 ## 现有证据与边界
 
-[实施档案](archived/todo-2026-09-23-acceptance-fixture-cleanup.md#实施验证与交付检查)拥有设计、保留理由和交付前检查。本机证据在 `artifacts/acceptance-cleanup/summary.json`、`results.json`、`policy.json`、`wrapper-checks.json` 与各完整日志：
+[实施档案](todo-2026-09-23-acceptance-fixture-cleanup.md#实施验证与交付检查)拥有设计、保留理由和交付前检查。本机证据在 `artifacts/acceptance-cleanup/summary.json`、`results.json`、`policy.json`、`wrapper-checks.json` 与各完整日志：
 
 - `just check`、八面 clippy、一次完整 `just acceptance`（392.79秒含构建）、额外 release hetero（34.84秒含构建）通过。
 - 无调试器 debug stress 保留16/16矩阵；memory 实际观察发布窗口，完成目标、Job与辅助能力收束和 reset。
@@ -27,10 +27,10 @@
 - 平台实际验证为 release；显式 debug 仅核对命令展开，不算新运行。host 逻辑库未改，没有重复跑全套 host 单测；clippy 覆盖host测试目标。
 - 392.79与原留存784.55秒的比较包含构建，不是严格性能基准；GDB停顿也不构成时序或公平性证据。
 
-交付前只读结构检查不替代本篇独立 Review。既有 Watch 未知错误和精确来源/映射/迟到Bind窗口仍由[原所属计划](todo-2026-10-07-fal-service-redesign.md)拥有，不因验收优化或普通运行通过关闭。
+交付前只读结构检查不替代本篇独立 Review。既有 Watch 未知错误和精确来源/映射/迟到Bind窗口仍由[原所属计划](../todo-2026-10-07-fal-service-redesign.md)拥有，不因验收优化或普通运行通过关闭。
 
 ## 执行与报告
 
-按 [REVIEW](REVIEW.md) 使用新上下文只读审查。先核源码、覆盖映射和现有证据，仅为新发现的具体风险追加必要验证；不自动重跑所有路线。
+按 [REVIEW](../REVIEW.md) 使用新上下文只读审查。先核源码、覆盖映射和现有证据，仅为新发现的具体风险追加必要验证；不自动重跑所有路线。
 
-形成 `review-<日期>-acceptance-cleanup.md` 后，由报告唯一承接 findings、修复和复核，本篇登记报告入口并归档。登记本身不启动审查或新施工。
+验收范围已由 [FAL 服务交付 Review 报告](review-2026-10-12-fal-service-delivery.md) 合并审查。该报告没有新的可达代码 finding，记录的证据缺口由既有 owner 承接；本登记计划已归档。

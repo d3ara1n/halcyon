@@ -1,6 +1,6 @@
 # 用户态分层与线程生命周期设计审阅
 
-> 对象：`d4ed3544b20aeeddf7be6be2764d75361d7175e7`、`67b9303b814aee02764843d10eaddc1d698b006f`；基线分支 `master`，审阅开始时工作树干净。状态：**设计问题已裁决，待实施复核**。两提交均为文档变更，本报告不是实现验收。主代理亲自核对设计与关键源码，explorer 辅助调用链定位；未调用独立 reviewer。
+> 已归档；历史线程分层设计问题由运行时分层归档、对象链交付和后续统一整理承接，不再作为独立实施 Review 入口。
 
 ## 结论与范围
 
@@ -18,7 +18,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 **位置与事实**：
 
-- [task](../notes/ideas/task.md)「组装双通道」规定 Start 只发布满足 readiness 的环境；[bootstrap](../notes/ideas/bootstrap.md)「Job 与 Process capability」仍把完整交接容量、执行域和 Ready 容量准备归入启动协议。
+- [task](../../notes/ideas/task.md)「组装双通道」规定 Start 只发布满足 readiness 的环境；[bootstrap](../../notes/ideas/bootstrap.md)「Job 与 Process capability」仍把完整交接容量、执行域和 Ready 容量准备归入启动协议。
 - `os/kernel/src/task/process.rs:883` 接受 `profile`；`:919` 才 resolve_domain；`:928` 创建并 reserve staged Vec；`:942` 为全部成员 reserve_ready。`:954` 越过 Job/lifecycle 提交门后，`:962` 才 bind_execution，随后消费 Builder、publish。
 - `os/kernel/src/task/proc.rs:4471` Attach 构造 Thread 并登记 Staging；`sched.rs:118` 表明调度准入绑定目标域的实际类存储。Attach 目前不知道 Start 才收到的 profile，因而不能完整支付该准入。
 
@@ -36,9 +36,9 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 **位置与事实**：
 
-- [task](../notes/ideas/task.md)「线程」与「用户态线程资源收束」、[bootstrap](../notes/ideas/bootstrap.md)「启动映像的寿命」已承认 Attached 由构建者准备、子入口采用。
-- [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「ProcessThreadRegistry 设计裁决」「生命周期与关闭顺序」仍要求 Attached/Spawned 都在进入执行前登记同一 ThreadRecord，且 control、栈、packet、环境全部稳定。
-- [framework](../notes/ideas/framework.md)「启动上下文与入口方案」在子入口运行后才初始化 allocator/PTR。
+- [task](../../notes/ideas/task.md)「线程」与「用户态线程资源收束」、[bootstrap](../../notes/ideas/bootstrap.md)「启动映像的寿命」已承认 Attached 由构建者准备、子入口采用。
+- [用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「ProcessThreadRegistry 设计裁决」「生命周期与关闭顺序」仍要求 Attached/Spawned 都在进入执行前登记同一 ThreadRecord，且 control、栈、packet、环境全部稳定。
+- [framework](../../notes/ideas/framework.md)「启动上下文与入口方案」在子入口运行后才初始化 allocator/PTR。
 - 当前 `process.rs:733` Attach 只返回 Tid；`proc.rs:4847` 以 `None` 创建 departure control。构建期栈经 libprocess 的 Building Map 供给，现有出生块没有可直接采用的完整栈 reservation owner。
 
 **可达场景与影响**：Rust `_start` 要运行才能建立本进程 PTR，却被要求在运行前已经进入该 PTR。父进程也不能替尚未运行的子 runtime 构造任意 Rust F/T/E 对象并安全转交其内部指针。仅将 control 数值和栈顶写入 payload，不足以证明映射独占权、guard 范围和采用唯一性。
@@ -55,7 +55,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D3 · P1 · PTR 的推进者与最后执行者尚未闭合
 
-**位置与事实**：[task](../notes/ideas/task.md)「Join、期限和清理」承诺 Thread Drop 只放弃观察、记录由 PTR 保留；[framework](../notes/ideas/framework.md)「allocator、终止与平台边界」规定 main 返回只结束当前线程；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「ThreadDriver 与关闭」仍把实际执行形态、poll 时机、唤醒和最终关闭列为 TODO。
+**位置与事实**：[task](../../notes/ideas/task.md)「Join、期限和清理」承诺 Thread Drop 只放弃观察、记录由 PTR 保留；[framework](../../notes/ideas/framework.md)「allocator、终止与平台边界」规定 main 返回只结束当前线程；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「ThreadDriver 与关闭」仍把实际执行形态、poll 时机、唤醒和最终关闭列为 TODO。
 
 **可达场景与影响**：
 
@@ -73,7 +73,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D4 · P1 · 结果寿命未闭合，完整 record 类型擦除方案冻结过早
 
-**位置与事实**：[分层计划](todo-2026-09-runtime-kernel-library-separation.md)「libthread 接口稿」明确 ResultReceiver 的寿命和签名待定；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「稳定 record 的类型擦除与安全边界」却把 `Box<CleanupRecord<F,T,E>>`、vtable 析构 T 和资源/结果都结算后才退款作为已冻结方案。
+**位置与事实**：[分层计划](../todo-2026-09-runtime-kernel-library-separation.md)「libthread 接口稿」明确 ResultReceiver 的寿命和签名待定；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「稳定 record 的类型擦除与安全边界」却把 `Box<CleanupRecord<F,T,E>>`、vtable 析构 T 和资源/结果都结算后才退款作为已冻结方案。
 
 **可达场景与影响**：线程 DONE 后，使用者很久不领取 T。若 T 必须留在整个 record 内，RegistrySlot 会受未领取结果而非运行/待清理线程控制；若清理线程资源时直接释放 record，receiver 的存储寿命又不成立。“返回 stale”不能替代对已有 T 的析构和独占领取证明。结果可以先领取、资源 cleanup 尚未完成的反向交错同样存在。
 
@@ -93,7 +93,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D5 · P1 · 单步 cleanup 的有界性不能覆盖任意 Rust 析构
 
-**位置与事实**：[task](../notes/ideas/task.md)「Join、期限和清理」规定一次推进一个有界动作；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 的 vtable 同时承担 T 的 Drop、环境退休和映射/Control 清理。现有契约只要求 F/T/环境状态为 Send，不能由此推出析构有界或非阻塞。
+**位置与事实**：[task](../../notes/ideas/task.md)「Join、期限和清理」规定一次推进一个有界动作；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md) 的 vtable 同时承担 T 的 Drop、环境退休和映射/Control 清理。现有契约只要求 F/T/环境状态为 Send，不能由此推出析构有界或非阻塞。
 
 **可达场景与影响**：无人领取的 T 的 Drop 等待另一个线程的结果、获取用户锁或执行长循环；单一 driver 在这个析构上停驻，则其它 record 不能取得 cleanup/结果交付。若该结果交付又依赖同一 driver，可形成等待环。Unmap/Close 本身也可能停驻，但其内核退休完成与任意应用析构的进展前提不同。
 
@@ -107,7 +107,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D6 · P2 · PTR 的知识 owner 与实例 owner 混在一起，可收敛掉登记桥接
 
-**位置与事实**：[task](../notes/ideas/task.md)「线程环境与结果交接」规定 libthread 定义 record/state machine、抽象登记端口，具体 PTR 由 libruntime 持有；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 再定义 runtime 侧的槽、计数、ready 扫描、claim、预算和 seal。record 的状态合法性与这些 registry 规则共同构成线程生命周期。
+**位置与事实**：[task](../../notes/ideas/task.md)「线程环境与结果交接」规定 libthread 定义 record/state machine、抽象登记端口，具体 PTR 由 libruntime 持有；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md) 再定义 runtime 侧的槽、计数、ready 扫描、claim、预算和 seal。record 的状态合法性与这些 registry 规则共同构成线程生命周期。
 
 **影响**：如果“libruntime 持有”进一步变成“libruntime 实现上述通用规则”，相同线程状态会跨两个库协商。没有 Cargo 循环也会产生生命周期知识的反向耦合，替换 runtime 必须重做 registry 安全证明。
 
@@ -123,8 +123,8 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 **位置与事实**：
 
-- [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「设计完成门」保留 driver、Attach、关闭与终局的施工前设计门；「前置、触发与顺序」又称“本轮设计已完成”；「本轮设计产物与剩余门」称剩余工作属于代码实施与验证。
-- [分层计划](todo-2026-09-runtime-kernel-library-separation.md)「Kernel 与 shared 的施工边界」承认 Attach 交接可能改变 ABI，却又总结 kernel 不是独立硬前置、可建立在现有 ABI 上。现有 ABI 可供搬迁部分原语，不足以证明完整 Attached/PTR 能力可成立。
+- [用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「设计完成门」保留 driver、Attach、关闭与终局的施工前设计门；「前置、触发与顺序」又称“本轮设计已完成”；「本轮设计产物与剩余门」称剩余工作属于代码实施与验证。
+- [分层计划](../todo-2026-09-runtime-kernel-library-separation.md)「Kernel 与 shared 的施工边界」承认 Attach 交接可能改变 ABI，却又总结 kernel 不是独立硬前置、可建立在现有 ABI 上。现有 ABI 可供搬迁部分原语，不足以证明完整 Attached/PTR 能力可成立。
 - 接力仍把 `bb38eee` 和“新文件未跟踪、未提交”写成当前工作树事实，与本次两个固定提交后的基线不符。
 
 **影响**：后续会话可能把架构问题当成已授权的实现细节，先做布局和桥接，再反向补 ABI/退出政策。当前设计已决定的 main-return 语义也不同于 `user/rinlib/src/rt.rs:93` 的 ProcessExit 实现，须作为行为迁移明确验证，不能归为单纯改名。
@@ -171,7 +171,7 @@ Start 的批量发布可以消费 Attach 已形成的 owner 集合。消除临�
 
 本轮通读 device 的领域、依赖、状态、恢复和 DMA 边界，未发现需要推翻其总体切面的确定矛盾。值得保留的设计是：描述不授权、占用不等于服务 Ready、关闭 Handle 不等于撤销、进程 Dead 不证明 DMA 静默、跨资源协调留在用户态、无法证明安全则隔离而不退款。
 
-设备记录明确标为 D0/D1 组织层稿，D2—D6 未闭合，因此不将所有未设计 API 列成缺陷。继续设计必须验证：控制 authority 对派生副本/映射的完整撤销、管理者死亡后可达的上级接管、跨域预留取消、IRQ 代次与解绑、DMA backing 脱离进程寿命及硬件静默证明。这些已有唯一记录，见 [设备整体计划](todo-2026-09-device-system-design.md) 的关键未决项。
+设备记录明确标为 D0/D1 组织层稿，D2—D6 未闭合，因此不将所有未设计 API 列成缺陷。继续设计必须验证：控制 authority 对派生副本/映射的完整撤销、管理者死亡后可达的上级接管、跨域预留取消、IRQ 代次与解绑、DMA backing 脱离进程寿命及硬件静默证明。这些已有唯一记录，见 [设备整体计划](../todo-2026-09-device-system-design.md) 的关键未决项。
 
 设备模块是逻辑责任，不必各变成 crate/进程；当前 device 已明确这一点。后续不要为了对应图中的每个框创建服务，也不要以合并状态机为由消除硬件、进程、注册三个不同完成事实。
 

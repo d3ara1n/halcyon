@@ -1,6 +1,6 @@
 # FAL F1–F3c 与库重排前基线固定提交 Review
 
-> 【未来审查计划】固定审查提交 `dfcf7a349fe6d9e2836bb7c8179ff7e96c8ce20a`（`chore: 保存 FAL F1–F3c 与库重排前基线`），父提交为 `84eeed6`。本计划在基线提交后登记，只审查该提交包含的实现与声明，不将施工快照视为整体 FAL 完成交付，不阻塞当前库重排 L0。
+> 已归档；旧 FAL 库基线已被当前 OAL/fs/service 交付与 Review 替代，不再单独执行。
 
 ## 改动概要
 
@@ -26,7 +26,7 @@
 
 ## 已有证据与限制
 
-证据入口为该固定提交中的 [FAL 总计划](archived/todo-2026-09-fal-service-capabilities.md) 和 `notes/impls/{fal,rpc,runtime,startup}.md`：
+证据入口为该固定提交中的 [FAL 总计划](todo-2026-09-fal-service-capabilities.md) 和 `notes/impls/{fal,rpc,runtime,startup}.md`：
 
 - 计划记录 F3c 最近已通过 `just check`、全部用户程序 RISC-V ELF 构建、libfal host 27 项、libfs host 17 项、七面 `just clippy`、`THROTTLE=100 just virt` 与 `THROTTLE=100 just virt-release`。
 - 提交前本会话重新执行 `git diff --check`、暂存区检查与文档检查；没有重跑上述代码测试和 QEMU。既有日志仅在本机 artifacts，审查时应按计划核对，不能把文字记录替代所需复现。
@@ -35,6 +35,6 @@
 
 ## 完成门与问题归属
 
-未来 reviewer 使用新上下文只读核对固定提交与其父提交，遵循 [Review 纪律](REVIEW.md)，不以当前分支后续迁移代码替代该快照。finding 给出位置、可达性、影响与违反的契约；若需要补证，明确区分缺少证据和已证实缺陷。
+未来 reviewer 使用新上下文只读核对固定提交与其父提交，遵循 [Review 纪律](../REVIEW.md)，不以当前分支后续迁移代码替代该快照。finding 给出位置、可达性、影响与违反的契约；若需要补证，明确区分缺少证据和已证实缺陷。
 
-库归属及依赖问题已由[库重排档案](archived/todo-2026-09-21-library-knowledge-ownership.md)闭合，其固定提交由[库重排 Review](todo-2026-09-21-library-knowledge-ownership-review.md)审查；不得用后续结构反推本计划固定的旧快照无问题。该快照尚未交付的 FAL 业务已由[交付档案](archived/todo-2026-09-fal-service-capabilities.md)闭合，其他实际 finding 的证据与修复/复核入口集中登记，不直接修改代码。审查与复核完成后归档本计划；本文件的存在不表示已经执行 Review。
+库归属及依赖问题已由[库重排档案](todo-2026-09-21-library-knowledge-ownership.md)闭合，其固定提交由[库重排 Review](todo-2026-09-21-library-knowledge-ownership-review.md)审查；不得用后续结构反推本计划固定的旧快照无问题。该快照尚未交付的 FAL 业务已由[交付档案](todo-2026-09-fal-service-capabilities.md)闭合，其他实际 finding 的证据与修复/复核入口集中登记，不直接修改代码。审查与复核完成后归档本计划；本文件的存在不表示已经执行 Review。

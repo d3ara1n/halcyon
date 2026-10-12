@@ -1,6 +1,6 @@
 # 用户态库知识归属、依赖、目录与命名固定提交 Review
 
-> 【未来审查计划】固定审查提交 `96ee03b0d1641c86ed8ab05951bad6954ea84db4`（`refactor(user): 重排用户态库归属与命名`），父提交为 `2124413710bdb8a3bc8a0fa5e73d06f2839af176`。本计划在实现提交后登记，只读审查该提交形成的最终结构，不阻塞 FAL F3d。
+> 已归档；固定 `96ee03b` 已并入[执行与库边界 Review 报告](review-2026-10-12-execution-library.md)，不再单独执行。
 
 ## 改动概要
 
@@ -27,7 +27,7 @@
 
 ## 已有证据与限制
 
-实现计划及最终证据见[归档计划](archived/todo-2026-09-21-library-knowledge-ownership.md)：
+实现计划及最终证据见[归档计划](todo-2026-09-21-library-knowledge-ownership.md)：
 
 - `git diff --check`、`just check`、七面 `just clippy` 通过；Cargo metadata 无 `libsrv` / `libdrv` package 与 `user/frameworks/` 构建路径。
 - host 测试：`libbudget` 6、`libexecution` 22、`libfal` 27、`libfs` 17、`libprocess` 16，shared workspace 通过。
@@ -38,6 +38,6 @@
 
 ## 完成门与问题归属
 
-未来 reviewer 使用新上下文只读核对固定提交及其父提交，遵循 [Review 纪律](REVIEW.md)。finding 必须给出具体位置、可达性、影响和违反的契约；缺少运行证据与已证实实现缺陷应分开陈述。
+未来 reviewer 使用新上下文只读核对固定提交及其父提交，遵循 [Review 纪律](../REVIEW.md)。finding 必须给出具体位置、可达性、影响和违反的契约；缺少运行证据与已证实实现缺陷应分开陈述。
 
-F3d 服务注册/发现、`libservice` 的真实 schema/状态机、Open、流 Copy 与独立 `test_fal` 不属于该固定提交的已交付能力；后续交付证据见 [FAL 档案](archived/todo-2026-09-fal-service-capabilities.md)。审查完成后归档本计划；本文件的存在不表示 Review 已执行。
+F3d 服务注册/发现、`libservice` 的真实 schema/状态机、Open、流 Copy 与独立 `test_fal` 不属于该固定提交的已交付能力；后续交付证据见 [FAL 档案](todo-2026-09-fal-service-capabilities.md)。审查完成后归档本计划；本文件的存在不表示 Review 已执行。

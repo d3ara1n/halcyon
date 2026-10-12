@@ -1,6 +1,6 @@
 # 公共时间与期限提交后代码复核
 
-> 状态：待执行的提交后 Review；固定 `c6e0a84`，完成后归档。本文件不重复安排执行基座、FAL 或验收可靠性。
+> 状态：已归档；固定 `c6e0a84` 已并入时间与运输 Review，不再单独执行。
 
 ## 固定对象
 
@@ -33,4 +33,4 @@
 
 ## 验证
 
-本提交已有 shared 27 项、os 140 项 host、`just check`、七面 clippy、virt core/release/nofd、sifive_u core 和 runtime-stop GDB probe（PARKED `0xf`）证据。日志位于本机 `artifacts/check/time-*`，不随 Git 提交；异机必须按当前源码重跑。后续完整 stress 的概率判定与 Tunnel 墙钟敏感现场见 [只读归档](archived/ref-2026-09-acceptance-timing-flake.md)。
+本提交已有 shared 27 项、os 140 项 host、`just check`、七面 clippy、virt core/release/nofd、sifive_u core 和 runtime-stop GDB probe（PARKED `0xf`）证据。日志位于本机 `artifacts/check/time-*`，不随 Git 提交；异机必须按当前源码重跑。后续完整 stress 的概率判定与 Tunnel 墙钟敏感现场见 [只读归档](ref-2026-09-acceptance-timing-flake.md)。

@@ -31,7 +31,7 @@
 |---|---|---|
 | `clock::selftest::run` / `os/kernel/src/clock/selftest.rs` | 隔离ClockState的origin偏斜、单调水印、延迟样本、不可逆ClockRange、epoch末端及嵌套失败；失败实例不污染平台时钟 | 按隔离样本描述，不再把它写成直接注入平台时钟并验证全hart停驻 |
 | `MemoryPool::self_test` / `os/kernel/src/task/memory_pool.rs` | prepared子Pool回滚、delegation提交、funded owner保活来源、最后释放后的credit/库存归还，以及额度不足的错误与退款 | 补入原记录遗漏的现存自检；本轮未核定与host/用户态测试的等价覆盖 |
-| `frame::selftest::run` / `os/kernel/src/frame/selftest.rs` | 全范围清零、funding失败、extent分割与两种释放顺序、回滚及来源退款 | 补入现存funded frame自检；源码来源与历史Review入口见[库存来源计划](../todo-2026-09-frame-source-selftest-review.md) |
+| `frame::selftest::run` / `os/kernel/src/frame/selftest.rs` | 全范围清零、funding失败、extent分割与两种释放顺序、回滚及来源退款 | 补入现存funded frame自检；源码来源与历史Review入口见[库存来源计划](../archived/todo-2026-09-frame-source-selftest-review.md) |
 
 原记录中的`task/wait_set/selftest.rs`、`task/tunnel/selftest.rs`及其旧continuation、HeapPressure细目已不对应当前源码，不能继续列为待保留的现存自检。原“时钟回退、WaitSet交错、Tunnel堆耗尽”的保留判断属于旧实现基线；文档校准只撤下失效的描述，没有追查其删除过程或判定新机制是否等价覆盖。机制与已有验证边界由[对象链档案](review-2026-10-07-object-chain.md)拥有；若后续审查产生具体覆盖缺口，由该次唯一报告承接，不凭路径消失认定覆盖完成或缺失。
 

@@ -1,6 +1,6 @@
 # 条件性容量校准提交后独立审查
 
-> 状态：待独立 Review；本记录只安排固定提交的事后检查，不重开容量计量，也不替代交付前结构检查。
+> 状态：已归档；旧条件性容量校准路线已被当前 Pool/预算结构替代，不再单独执行。
 
 ## 固定对象
 
@@ -17,6 +17,6 @@
 
 ## 已有证据与完成门
 
-提交前 `just check`、capacity feature 的 `just clippy`、`metadata_admission` host 8 项测试、`just virt`、`just virt-stress` 与重复 `just virt-capacity` 通过；负载数值和证据边界见[架构审计记录](todo-2026-09-14-architecture-audit-findings.md)。QEMU 完整日志保存在本机忽略版本控制的 `artifacts/`，不属于固定提交的一部分。上述只是交付证据，不是独立 Review 结论。
+提交前 `just check`、capacity feature 的 `just clippy`、`metadata_admission` host 8 项测试、`just virt`、`just virt-stress` 与重复 `just virt-capacity` 通过；负载数值和证据边界见[架构审计记录](../todo-2026-09-14-architecture-audit-findings.md)。QEMU 完整日志保存在本机忽略版本控制的 `artifacts/`，不属于固定提交的一部分。上述只是交付证据，不是独立 Review 结论。
 
 独立 reviewer 以固定提交只读审查。无 finding 时记录结论并归档；有 finding 时生成唯一 `review-*.md` 报告，在此登记入口后归档本计划，修复与复核改由报告承载。Review 不授权新的实施、提交或推送。

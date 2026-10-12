@@ -1,6 +1,6 @@
 # 流运输与 Runnel 闭包未来代码 Review
 
-> 【未来审查计划】固定对象为 `a2aabed`（`feat(transport): 流运输与 Runnel 闭包——typed 角色收口与观察草稿面删除`），父提交 `a6ae767`。提交后生成，只安排已完成代码的独立只读复核，不重开二轮拆分裁决（观察/登记/取消并入通用执行闭包），不阻塞通用执行闭包设计。
+> 已归档；固定 `a2aabed` 已并入[时间与运输 Review 报告](review-2026-10-12-transport-time.md)，不再单独执行。
 
 ## 提交范围
 
@@ -28,4 +28,4 @@
 
 ## 边界与完成门
 
-本计划仅拥有 `a2aabed` 的固定提交复核；通用执行与 RPC 闭包（含 Runnel 登记接入面与三条件观察结果）的交付证据见[执行前置档案](archived/todo-2026-09-13-service-runtime-prerequisites.md)，不在本 Review 内预审。未来 reviewer 使用新上下文只读审查目标提交，核对清单各点，记录有证据的 finding 或确认无 finding；无 finding 后归档本计划，有 finding 由一份 review 报告承载修复与复核。
+本计划仅拥有 `a2aabed` 的固定提交复核；通用执行与 RPC 闭包（含 Runnel 登记接入面与三条件观察结果）的交付证据见[执行前置档案](todo-2026-09-13-service-runtime-prerequisites.md)，不在本 Review 内预审。未来 reviewer 使用新上下文只读审查目标提交，核对清单各点，记录有证据的 finding 或确认无 finding；无 finding 后归档本计划，有 finding 由一份 review 报告承载修复与复核。

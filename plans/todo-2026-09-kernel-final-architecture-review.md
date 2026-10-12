@@ -2,7 +2,7 @@
 
 ## 性质
 
-本记录拥有**全局架构收口的条件性Review与旧固定Review范围归并**。2026-10-07校准：对象链、当前Sv39和运行时分层已经交付，不再等待旧ProcessBindMemory、rinlib或ProcessDrain迁移；FAL、正式服务装配及设备仍按独立分案继续。本记录不替代当前`ac9d7d9`的[固定提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)，也不要求先完成一次全项目Review才能开始新领域设计。
+本记录拥有**全局架构收口的条件性Review与旧固定Review范围归并**。2026-10-07校准：对象链、当前Sv39和运行时分层已经交付，不再等待旧ProcessBindMemory、rinlib或ProcessDrain迁移；FAL、正式服务装配及设备仍按独立分案继续。本记录不替代[五批Review统一报告](review-2026-10-12-consolidated.md)的当前有效性与后续责任，也不要求先完成一次全项目Review才能开始新领域设计；`ac9d7d9` 原始两项P1的更正依据见该总报告，不再从历史结论启动修复。
 
 全局收口需在选定交付范围和实际消费者形成后，判断机制的长期职责、共同变化的边界和迁移残留。早期数据面固定提交及观察保留历史，不将旧对象名和阶段前置当作当前代码事实；近期可独立进行下文的旧Review范围归并。
 
@@ -23,7 +23,7 @@
 - 独立物理 cursor、u64 回绕、几何 shadow、EOF、Invited 期发布、ack→重查→wait 和部分完成错误是否组合闭合。
 - backing/metadata/work 容量是否覆盖真实最后析构与退款调用链；12KiB guard 派生审计与两平台 256KiB 栈是否有完整布局、代码生成和运行证据，不能把单帧扫描当调用链证明。
 
-切片 10 已另行完成实现与完整验收并提交为 `606b59db22f071943a4bfc2c174633454e449401`：删除 raw allocation adapter/tracker、boot-held 直接拥有几何、统一 funding 自检、完整清零与切分退款、child 来源保活。固定提交代码复核由 [`库存来源 Review`](todo-2026-09-frame-source-selftest-review.md) 独立拥有，不在本计划重复安排。证据见数据面档案及 `artifacts/frame-source/`。正式 FAL Open 与 RPC deadline 的独立能力缺口不因数据面提交而完成；Review 保持下节统一触发条件。
+切片 10 已另行完成实现与完整验收并提交为 `606b59db22f071943a4bfc2c174633454e449401`：删除 raw allocation adapter/tracker、boot-held 直接拥有几何、统一 funding 自检、完整清零与切分退款、child 来源保活。固定提交代码复核已并入[基础对象链原始Review](archived/review-2026-10-12-substrate-object-chain.md)，未确认新的 frame/source/selftest 反例；当前处置从[统一报告](review-2026-10-12-consolidated.md)接手，不在本计划重复安排。证据见数据面档案及 `artifacts/frame-source/`。正式 FAL Open 与 RPC deadline 的独立能力缺口不因数据面提交而完成。
 
 ## 触发条件
 
@@ -109,26 +109,26 @@
 
 ## 旧 Review 范围归并
 
-2026-10-07按`refactor/system-redesign` / `f174d8e`核定COMPASS中12份旧Review的范围。此次只读计划整理保留原固定目标，不是独立代码Review，不宣告原提交无缺陷，也不把后续修复当成原提交通过。各旧计划保留证据，本节拥有其当前适用范围和分流；尚未执行的原计划不因归并自动归档。
+2026-10-07按`refactor/system-redesign` / `f174d8e`核定COMPASS中12份旧Review的范围。此次只读计划整理保留原固定目标，不是独立代码Review，不宣告原提交无缺陷，也不把后续修复当作原提交通过。各旧计划保留证据，本节拥有其当时的适用范围和分流；后续若机制已被重构或固定对象已由当前报告合并审查，登记按 Review 收口计划归档，不再占用当前执行队列。
 
 | 原计划 / 固定目标 | 当前可核实事实 | 后续分流 |
 |---|---|---|
-| [容量校准](todo-2026-09-25-capacity-calibration-review.md) / `3dd7c4f` | 内核旧MetadataSponsor/Counter容量政策与virt-capacity已替换/移除；shared metadata_admission仍被用户libbudget/FAL/服务使用 | 不能对当前内核重跑旧容量路线；原提交计量审查保留历史，当前硬隔离由预算分案拥有。用户Counter原语若审查，须单独固定实际消费者范围 |
-| [FAL集成基线](todo-2026-09-13-fal-integration-baseline-review.md) / `d22b9d7` | FAL/消息消费者仍在，ProcessDrain与旧退休驱动已删除 | FAL部分交FAL重设计现状审计，消息部分与消息运输去重；原退休目标只作历史追溯 |
-| [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) / `c6e0a84` | ClockGeometry/Deadline、时钟采样和期限消费者仍在；运行期停止已叠加对象链修复 | 可选现存纯时间边界做局部只读Review；覆盖runtime_stop时须纳入后续固定修复序列，不沿用原目标冒充当前结论 |
-| [库存来源与自检](todo-2026-09-frame-source-selftest-review.md) / `606b59d` | BootHeldExtent、frame/selftest和库存/供给机制仍有正式消费者 | 保留独立来源/自检审查价值；执行前固定与后续funded owner变化有关的增量 |
-| [设计审查后续内存](todo-2026-09-design-audit-followup-review.md) / `4b27ce6`、`8aa7bc2` | instruction epoch、MemoryObjectCore与许可仍在，VM外围已重写为Operation/Change/Backing/Views | 当前VM发现归对象链/内存记录；不重建旧live-view或PreparedTranslation，仅按未覆盖契约选择增量 |
-| [消息运输](todo-2026-09-14-message-transport-review.md) / `3060dd8` | Packet、MailboxSender/SendOnce及真实消息消费者仍在，封装归属已迁至libkernel，内部持有/运输协议有后续变化 | 保留消息语义审查，执行前划开已审对象链机制与仍未审的用户封装/消费者 |
-| [流运输与Runnel](todo-2026-09-14-stream-transport-review.md) / `a2aabed` | typed Producer/Consumer和fs/pm/init/test消费者仍在；映射owner及失败清理有后续收敛 | 保留流语义/跨层共享访问审查，纳入后续固定映射与清理变更，不能只审旧快照推断当前安全 |
-| [公共操作所有权](todo-2026-09-18-public-operation-ownership-review.md) / `8e0467a` | DebtLedger、FairBudget、RetirementTicket及旧work_ledger/ProcessDrain机制已删除，替代物为自主维护和稳定Work根 | 对当前代码的施工适用范围已消失；旧计划仅保留历史目标，不自动标为通过。替代机制由对象链Review承接 |
-| [执行/RPC/Outbox](todo-2026-09-15-runtime-admission-review.md) / `a3891b0`至`4e18e5e` | libsrv已迁为libexecution，Dispatcher/Outbox仍在；SourceRegistration及期限/退休由对象链收敛 | 从现存业务/结果责任选增量，不重复提出已删除的来源相位布尔组合；与当前对象链Review去重 |
-| [库知识归属与命名](todo-2026-09-21-library-knowledge-ownership-review.md) / `96ee03b` | libbudget/libexecution及libraries组织仍在，其上已叠加libkernel/libthread/libruntime分层 | 可做当前依赖/命名的局部只读核对；原提交与分层后目标分别固定，不重开已完成迁移 |
-| [FAL库基线](todo-2026-09-21-fal-library-baseline-review.md) / `dfcf7a3` | GrantTable、Watch、Move/Copy及provider有现存消费者，仍处矫正区 | 作为FAL分案现状证据与独立契约反例输入，不先将旧实现“修到合格”再重设计 |
-| [FAL注册发现设计](todo-2026-09-21-fal-service-design-review.md) / `1000270`，实现对照`dda8a5b` | libservice registry/authority、srv_fs注册实现仍在，属于FAL/服务接点 | 交FAL/服务分案审计发布、授权与失效关系；正式装配政策交服务装配分案，不重复定义 |
+| [容量校准](archived/todo-2026-09-25-capacity-calibration-review.md) / `3dd7c4f` | 内核旧MetadataSponsor/Counter容量政策与virt-capacity已替换/移除 | 旧固定快照已归档，不再单独执行；当前硬隔离由预算分案拥有 |
+| [FAL集成基线](archived/todo-2026-09-13-fal-integration-baseline-review.md) / `d22b9d7` | FAL/消息消费者仍在，但旧集成基线已被当前 FAL/OAL/fs 交付替代 | 固定快照已归档，历史范围由当前 FAL 服务 Review 和统一整理追溯 |
+| [公共时间与期限](archived/todo-2026-09-13-monotonic-time-rpc-deadline-review.md) / `c6e0a84` | ClockGeometry/Deadline、时钟采样和期限消费者仍在 | 已并入时间与运输 Review 报告，不再单独执行旧计划 |
+| [库存来源与自检](archived/todo-2026-09-frame-source-selftest-review.md) / `606b59d` | BootHeldExtent、frame/selftest和库存/供给机制仍有正式消费者；已并入基础对象链 Review，未确认新的 frame/source/selftest 反例 | 后续只在 funded owner 或启动自检契约发生独立变化时登记增量 Review |
+| [设计审查后续内存](archived/todo-2026-09-design-audit-followup-review.md) / `4b27ce6`、`8aa7bc2` | VM外围已重写为Operation/Change/Backing/Views | 固定快照已归档，当前VM问题由对象链/内存记录承接 |
+| [消息运输](archived/todo-2026-09-14-message-transport-review.md) / `3060dd8` | Packet、MailboxSender/SendOnce及真实消息消费者仍在 | 已并入时间与运输 Review 报告 |
+| [流运输与Runnel](archived/todo-2026-09-14-stream-transport-review.md) / `a2aabed` | typed Producer/Consumer和真实消费者仍在 | 已并入时间与运输 Review 报告 |
+| [公共操作所有权](archived/todo-2026-09-18-public-operation-ownership-review.md) / `8e0467a` | DebtLedger、FairBudget、RetirementTicket及旧work_ledger/ProcessDrain已删除 | 固定快照已归档，替代机制由对象链 Review 承接 |
+| [执行/RPC/Outbox](archived/todo-2026-09-15-runtime-admission-review.md) / `a3891b0`至`4e18e5e` | libsrv已迁为libexecution，Dispatcher/Outbox仍在 | 已并入执行与库边界 Review 报告 |
+| [库知识归属与命名](archived/todo-2026-09-21-library-knowledge-ownership-review.md) / `96ee03b` | 用户态库分层已继续演进 | 已并入执行与库边界 Review 报告 |
+| [FAL库基线](archived/todo-2026-09-21-fal-library-baseline-review.md) / `dfcf7a3` | 旧 FAL 库基线已被当前 OAL/fs/service 交付替代 | 固定快照已归档 |
+| [FAL注册发现设计](archived/todo-2026-09-21-fal-service-design-review.md) / `1000270`，实现对照`dda8a5b` | 注册发现已进入当前 FAL/service 交付 | 固定设计快照已归档，正式装配政策由服务装配设计承接 |
 
-当前`ac9d7d9`的独立Review继续由其唯一计划执行，本表不吞并它。后续选定局部审查时，在对应计划写清固定目标、仍有效的契约、相对已有审查的增量及排除项；发现问题后按REVIEW手册形成唯一报告，不在本表登记第二套findings。实际执行历史Review或取消其排期须明确记录，不能由“机制被替换”推导出“原提交审查通过”。
+`ac9d7d9` 的独立Review原始事实见[历史报告](archived/review-2026-10-12-substrate-object-chain.md)，当前结论与后续责任由[统一报告](review-2026-10-12-consolidated.md)拥有，本表不重复安排。后续选定局部审查时，在对应计划写清固定目标、仍有效的契约、相对已有审查的增量及排除项；发现问题后按REVIEW手册形成独立报告，不在本表登记第二套findings。旧计划归档只表示不再执行该旧快照，不表示原提交无缺陷或已通过。
 
-本次归并产物是上述范围矩阵。后续局部Review优先候选已选为[纯时间换算与Deadline编码](todo-2026-09-13-monotonic-time-rpc-deadline-review.md#后续轻量候选本轮仅安排)，具体固定目标和排除项在所属计划登记；本轮仅完成安排，没有执行Review。库存来源/自检、库依赖/命名仍是未选择的候选，不额外启动任务。全面代码Review、FAL重设计、DMA接入及锁改造不作为轻量任务承诺。
+本次归并产物是历史范围矩阵。时间/运输、执行/RPC/库边界已分别由当前 Review 报告完成；库存来源/自检已并入基础对象链报告；旧 FAL、容量和内存后续固定快照已归档。全面代码Review、FAL重设计、DMA接入及锁改造不作为轻量任务承诺。
 
 ## 早期观察登记（历史）
 

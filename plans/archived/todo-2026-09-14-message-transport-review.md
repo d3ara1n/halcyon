@@ -1,6 +1,6 @@
 # 消息运输闭包未来代码 Review
 
-> 【未来审查计划】固定对象为 `3060dd8`（`feat(transport): 消息运输闭包——typed owner 收束与消费者迁移`），父提交 `e583d5e`。提交后生成，只安排已完成代码的独立只读复核，不审查方案，不阻塞流运输闭包或后续执行前置。
+> 已归档；固定 `3060dd8` 已并入[时间与运输 Review 报告](review-2026-10-12-transport-time.md)，不再单独执行。
 
 ## 提交范围
 
@@ -30,4 +30,4 @@
 
 ## 边界与完成门
 
-本计划仅拥有 `3060dd8` 的固定提交复核；流运输/Runnel、通用执行与 RPC 的交付证据见[执行前置档案](archived/todo-2026-09-13-service-runtime-prerequisites.md)，不在本 Review 内重审。未来 reviewer 使用新上下文只读审查目标提交，核对清单各点，记录有证据的 finding 或确认无 finding；无 finding 后归档本计划，有 finding 由一份 review 报告承载修复与复核。
+本计划仅拥有 `3060dd8` 的固定提交复核；流运输/Runnel、通用执行与 RPC 的交付证据见[执行前置档案](todo-2026-09-13-service-runtime-prerequisites.md)，不在本 Review 内重审。未来 reviewer 使用新上下文只读审查目标提交，核对清单各点，记录有证据的 finding 或确认无 finding；无 finding 后归档本计划，有 finding 由一份 review 报告承载修复与复核。

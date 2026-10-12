@@ -7,34 +7,22 @@
 > 部分区域处于矫正态，现有写法不作参考，见 [KNOWN_ISSUES 矫正区](../KNOWN_ISSUES.md#矫正区)。
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。轻量任务及本轮文档范围见[收口记录](todo-2026-09-29-system-redesign.md#近期轻量收口与本轮整理)，后续代码/Review按各自记录接手；主线设计入口如下。
-2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](todo-2026-10-11-oal-fs-service-review.md)待执行；遗留专项验证按主计划末节触发；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
+2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
 3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：可与FAL并行设计。
 4. [正式服务装配与监督](todo-2026-10-07-service-assembly.md)：通用装配关系可先设计，设备特有接线按设备前置。
 
-对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。当前后续入口为[对象链收敛提交独立Review](todo-2026-10-07-object-chain-convergence-review.md)、[旧Review范围归并](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)及测量触发的[锁评估](todo-2026-10-01-lock-performance.md)。
+对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。
 
 旧 midflight Copy 已按[机制替换证据](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置)关闭；Watch 历史未知错误继续由 [W05-04](todo-2026-10-07-fal-service-redesign.md#历史问题重新核定2026-10-11)承接，不恢复旧 Copy 施工。
 
-## 可择机任务与审查
+## Review 收口
 
-以下不表示自然顺序，也不阻塞新的系统能力。架构审计剩余发现可择机复核；旧固定提交Review先从[范围归并入口](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)核定现存机制与历史目标，不按下面清单串行重跑，也不把机制被替换当作审查通过。Pool付款已交付，更强硬容量承诺按预算计划触发。
+五批九份报告已统一核定，原报告与[分批执行记录](archived/todo-2026-10-12-review-convergence.md)保留历史；当前只使用[统一报告](review-2026-10-12-consolidated.md)的有效责任、触发条件与原编号映射。
 
 | 类型 | 入口 |
 |---|---|
+| 五批 Review 当前责任与处置 | [统一报告](review-2026-10-12-consolidated.md) |
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
-| Review | [验收运行整理交付](todo-2026-10-11-acceptance-cleanup-review.md) |
-| Review | [条件性容量校准提交](todo-2026-09-25-capacity-calibration-review.md) |
-| Review | [FAL 集成基线](todo-2026-09-13-fal-integration-baseline-review.md) |
-| Review | [公共时间与期限](todo-2026-09-13-monotonic-time-rpc-deadline-review.md) |
-| Review | [库存来源与自检](todo-2026-09-frame-source-selftest-review.md) |
-| Review | [设计审查后续内存机制](todo-2026-09-design-audit-followup-review.md) |
-| Review | [消息运输](todo-2026-09-14-message-transport-review.md) |
-| Review | [流运输与 Runnel](todo-2026-09-14-stream-transport-review.md) |
-| Review | [公共操作所有权](todo-2026-09-18-public-operation-ownership-review.md) |
-| Review | [通用执行、RPC 与 Outbox](todo-2026-09-15-runtime-admission-review.md) |
-| Review | [用户态库知识归属与命名](todo-2026-09-21-library-knowledge-ownership-review.md) |
-| Review | [FAL 库基线](todo-2026-09-21-fal-library-baseline-review.md) |
-| Review | [FAL 注册发现设计](todo-2026-09-21-fal-service-design-review.md) |
 
 ## 条件触发的计划
 

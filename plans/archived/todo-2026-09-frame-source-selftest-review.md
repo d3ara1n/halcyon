@@ -1,6 +1,6 @@
 # 库存来源与启动自检未来代码 Review
 
-> 【未来审查计划】固定对象为 `606b59db22f071943a4bfc2c174633454e449401`（`refactor(mm): 收口库存来源与正式启动自检`），父提交 `e973763`。提交后生成，只安排已完成代码的独立只读复核，不审查方案，不阻塞 FAL 后续设计或实现。
+> **Review 已并入基础对象链 Review。** 固定对象为 `606b59db22f071943a4bfc2c174633454e449401`（`refactor(mm): 收口库存来源与正式启动自检`），父提交 `e973763`。审查结论由 [基础对象链 Review 报告](review-2026-10-12-substrate-object-chain.md)唯一承接；本登记计划归档，不复制 findings。
 
 ## 提交范围
 
@@ -27,10 +27,10 @@
 - `just check`；`frame_pool` 18 项、`funded_frame` 12 项、`memory_pool` 14 项、`memory_supply` 7 项 host debug/release 均通过。
 - 默认 50% 节流 `just acceptance` 通过：七面 clippy、debug stress 16/16、release core、sifive_u core、nofd、panic/alloc/fatal 三类启动 Failed 广播。
 - debug/release 最大栈帧 `0x26f0` / `0x1250`，均低于布局派生的 12KiB 限额；每 hart 256KiB 栈不变，结束后无 QEMU/GDB 残留。
-- 完整日志 `artifacts/frame-source/`；交付记录见 [`数据面档案`](archived/todo-2026-09-memory-object-data-plane.md)。提交前默认 reviewer 对完整 diff 的只读复核无开放 finding，报告见 [`代码复核档案`](archived/review-2026-09-frame-source-selftest.md)；该记录不替代本次固定提交 Review。
+- 完整日志 `artifacts/frame-source/`；交付记录见 [`数据面档案`](todo-2026-09-memory-object-data-plane.md)。提交前默认 reviewer 对完整 diff 的只读复核无开放 finding，报告见 [`代码复核档案`](review-2026-09-frame-source-selftest.md)；该记录不替代本次固定提交 Review。
 
 ## 边界与完成门
 
 本计划仅拥有切片 10 的固定提交复核；`d00604a` 的多页 Tunnel/RNL2 仍由统一架构 Review 拥有，`4b27ce6`/`8aa7bc2` 由既有后续内存 Review 拥有，不重新安排旧 program。
 
-未来 reviewer 使用新上下文对目标提交只读审查代码，核对验证与真实调用/失败/退役路径，记录有证据的 finding 或确认无 finding。无 finding 后本计划归档；如有 finding，由一份 review 报告承载修复与复核，本计划转为该报告的导航而不重复安排同一问题。不得把未完成的正式 FAL Open、RPC deadline 或全局架构收口视为本提交已完成。
+HighHolly 已在基础对象链 Review 中核对本固定提交的 owner、funding、切分、失败退款、child source 保活和启动自检；未确认新的 frame/source/selftest 反例。不得把未完成的正式 FAL Open、RPC deadline 或全局架构收口视为本提交已完成。

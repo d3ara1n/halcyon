@@ -12,7 +12,7 @@
 
 2026-10-07按`refactor/system-redesign` / `f174d8e`核对代码及既有交付证据；本节记录当前完成边界和未决后续，不新增实现验收结论。
 
-**当前Sv39责任链已经交付。** 物理库存/来源付款、backing/View、Map/Unmap/Protect准备与不可逆提交、分步PTE发布、跨hart确认、表页/物理页退休退款、进程整体地址空间回收及用户R/W/X fault等待/修复均有正式消费者。完成屏障晚于相应实际退款，提交后的推进不依赖调用者继续运行。实现唯一视图见[mm](../notes/impls/mm.md)，后续修复及验证边界由[审查档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)拥有；其中记录memory_space/page_table host用例、正式静态门、完整acceptance和hetero通过，真实发布fault与模拟修复诊断分别提供证据。当前`ac9d7d9`的[独立Review](todo-2026-10-07-object-chain-convergence-review.md)尚待执行，不能宣称代码已被证明无缺陷。
+**当前Sv39责任链已经交付。** 物理库存/来源付款、backing/View、Map/Unmap/Protect准备与不可逆提交、分步PTE发布、跨hart确认、表页/物理页退休退款、进程整体地址空间回收及用户R/W/X fault等待/修复均有正式消费者。完成屏障晚于相应实际退款，提交后的推进不依赖调用者继续运行。实现唯一视图见[mm](../notes/impls/mm.md)，后续修复及验证边界由[审查档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)拥有；其中记录memory_space/page_table host用例、正式静态门、完整acceptance和hetero通过，真实发布fault与模拟修复诊断分别提供证据。`ac9d7d9` 的[独立原始Review](archived/review-2026-10-12-substrate-object-chain.md)已由[统一报告](review-2026-10-12-consolidated.md#已退出当前修复队列的判断)核定原两项P1的更正依据，当前设计门与验证边界按统一报告和所属专题接续；不把退出错误修复队列宣称为全项目无缺陷。
 
 **执行兼容性已有结构性接通，当前只承诺Base64/D64。** `os/dtb/src/cpu.rs::parse`冻结每hart的status、RV64基线、F/D/Q/V及mmu-type；`os/kernel/src/main.rs`排除Bare hart并发布能力；`os/sched_domain`按执行需求兼容集合分域。`task/process.rs::bind_initial_execution`为进程一次选择兼容域，无兼容域返回NotSupported；线程出生继承冻结domain，ReadyBatch核对域身份，enqueue按线程域入队，各hart的run只从本域pick。`libprocess`从ELF需求选择profile；Q/V/F-only/TSO等未支持用户需求显式拒绝，不静默降级。这条保证依赖可信平台声明及程序正确声明实际执行需求，不包含探测任意虚假固件/程序声明。
 
