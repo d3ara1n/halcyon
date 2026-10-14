@@ -37,7 +37,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 **位置与事实**：
 
 - [task](../../notes/ideas/task.md)「线程」与「用户态线程资源收束」、[bootstrap](../../notes/ideas/bootstrap.md)「启动映像的寿命」已承认 Attached 由构建者准备、子入口采用。
-- [用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「ProcessThreadRegistry 设计裁决」「生命周期与关闭顺序」仍要求 Attached/Spawned 都在进入执行前登记同一 ThreadRecord，且 control、栈、packet、环境全部稳定。
+- [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「ProcessThreadRegistry 设计裁决」「生命周期与关闭顺序」仍要求 Attached/Spawned 都在进入执行前登记同一 ThreadRecord，且 control、栈、packet、环境全部稳定。
 - [framework](../../notes/ideas/framework.md)「启动上下文与入口方案」在子入口运行后才初始化 allocator/PTR。
 - 当前 `process.rs:733` Attach 只返回 Tid；`proc.rs:4847` 以 `None` 创建 departure control。构建期栈经 libprocess 的 Building Map 供给，现有出生块没有可直接采用的完整栈 reservation owner。
 
@@ -55,7 +55,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D3 · P1 · PTR 的推进者与最后执行者尚未闭合
 
-**位置与事实**：[task](../../notes/ideas/task.md)「Join、期限和清理」承诺 Thread Drop 只放弃观察、记录由 PTR 保留；[framework](../../notes/ideas/framework.md)「allocator、终止与平台边界」规定 main 返回只结束当前线程；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「ThreadDriver 与关闭」仍把实际执行形态、poll 时机、唤醒和最终关闭列为 TODO。
+**位置与事实**：[task](../../notes/ideas/task.md)「Join、期限和清理」承诺 Thread Drop 只放弃观察、记录由 PTR 保留；[framework](../../notes/ideas/framework.md)「allocator、终止与平台边界」规定 main 返回只结束当前线程；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「ThreadDriver 与关闭」仍把实际执行形态、poll 时机、唤醒和最终关闭列为 TODO。
 
 **可达场景与影响**：
 
@@ -73,7 +73,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D4 · P1 · 结果寿命未闭合，完整 record 类型擦除方案冻结过早
 
-**位置与事实**：[分层计划](../todo-2026-09-runtime-kernel-library-separation.md)「libthread 接口稿」明确 ResultReceiver 的寿命和签名待定；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「稳定 record 的类型擦除与安全边界」却把 `Box<CleanupRecord<F,T,E>>`、vtable 析构 T 和资源/结果都结算后才退款作为已冻结方案。
+**位置与事实**：[分层计划](../todo-2026-09-runtime-kernel-library-separation.md)「libthread 接口稿」明确 ResultReceiver 的寿命和签名待定；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「稳定 record 的类型擦除与安全边界」却把 `Box<CleanupRecord<F,T,E>>`、vtable 析构 T 和资源/结果都结算后才退款作为已冻结方案。
 
 **可达场景与影响**：线程 DONE 后，使用者很久不领取 T。若 T 必须留在整个 record 内，RegistrySlot 会受未领取结果而非运行/待清理线程控制；若清理线程资源时直接释放 record，receiver 的存储寿命又不成立。“返回 stale”不能替代对已有 T 的析构和独占领取证明。结果可以先领取、资源 cleanup 尚未完成的反向交错同样存在。
 
@@ -93,7 +93,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D5 · P1 · 单步 cleanup 的有界性不能覆盖任意 Rust 析构
 
-**位置与事实**：[task](../../notes/ideas/task.md)「Join、期限和清理」规定一次推进一个有界动作；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md) 的 vtable 同时承担 T 的 Drop、环境退休和映射/Control 清理。现有契约只要求 F/T/环境状态为 Send，不能由此推出析构有界或非阻塞。
+**位置与事实**：[task](../../notes/ideas/task.md)「Join、期限和清理」规定一次推进一个有界动作；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 的 vtable 同时承担 T 的 Drop、环境退休和映射/Control 清理。现有契约只要求 F/T/环境状态为 Send，不能由此推出析构有界或非阻塞。
 
 **可达场景与影响**：无人领取的 T 的 Drop 等待另一个线程的结果、获取用户锁或执行长循环；单一 driver 在这个析构上停驻，则其它 record 不能取得 cleanup/结果交付。若该结果交付又依赖同一 driver，可形成等待环。Unmap/Close 本身也可能停驻，但其内核退休完成与任意应用析构的进展前提不同。
 
@@ -107,7 +107,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 ### D6 · P2 · PTR 的知识 owner 与实例 owner 混在一起，可收敛掉登记桥接
 
-**位置与事实**：[task](../../notes/ideas/task.md)「线程环境与结果交接」规定 libthread 定义 record/state machine、抽象登记端口，具体 PTR 由 libruntime 持有；[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md) 再定义 runtime 侧的槽、计数、ready 扫描、claim、预算和 seal。record 的状态合法性与这些 registry 规则共同构成线程生命周期。
+**位置与事实**：[task](../../notes/ideas/task.md)「线程环境与结果交接」规定 libthread 定义 record/state machine、抽象登记端口，具体 PTR 由 libruntime 持有；[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 再定义 runtime 侧的槽、计数、ready 扫描、claim、预算和 seal。record 的状态合法性与这些 registry 规则共同构成线程生命周期。
 
 **影响**：如果“libruntime 持有”进一步变成“libruntime 实现上述通用规则”，相同线程状态会跨两个库协商。没有 Cargo 循环也会产生生命周期知识的反向耦合，替换 runtime 必须重做 registry 安全证明。
 
@@ -123,7 +123,7 @@ libkernel / libprocess / libthread / libruntime 的总体知识划分成立，�
 
 **位置与事实**：
 
-- [用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)「设计完成门」保留 driver、Attach、关闭与终局的施工前设计门；「前置、触发与顺序」又称“本轮设计已完成”；「本轮设计产物与剩余门」称剩余工作属于代码实施与验证。
+- [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)「设计完成门」保留 driver、Attach、关闭与终局的施工前设计门；「前置、触发与顺序」又称“本轮设计已完成”；「本轮设计产物与剩余门」称剩余工作属于代码实施与验证。
 - [分层计划](../todo-2026-09-runtime-kernel-library-separation.md)「Kernel 与 shared 的施工边界」承认 Attach 交接可能改变 ABI，却又总结 kernel 不是独立硬前置、可建立在现有 ABI 上。现有 ABI 可供搬迁部分原语，不足以证明完整 Attached/PTR 能力可成立。
 - 接力仍把 `bb38eee` 和“新文件未跟踪、未提交”写成当前工作树事实，与本次两个固定提交后的基线不符。
 

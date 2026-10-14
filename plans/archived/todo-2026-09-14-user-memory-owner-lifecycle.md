@@ -1,6 +1,6 @@
 # 用户态映射 owner 与线程生命周期施工计划
 
-> 状态：**本轮已完成**。ThreadCreate/ThreadStart、终局原因、`libthread` Registry/ResultCell、入口线程采用、`libruntime` runtime 入口和全部消费者迁移均已接通；普通 mapping/堆 arena 的其它退休需求仍不在本轮范围。契约由 [task](../notes/ideas/task.md) 拥有，组合边界由 [framework](../notes/ideas/framework.md)、入口交接由 [bootstrap](../notes/ideas/bootstrap.md#启动映像的寿命) 拥有。验证证据见运行时分层计划和本记录末节。
+> 状态：**本轮已完成并归档**。ThreadCreate/ThreadStart、终局原因、`libthread` Registry/ResultCell、入口线程采用、`libruntime` runtime 入口和全部消费者迁移均已接通；普通 mapping/堆 arena 的其它退休需求仍不在本轮范围。契约由 [task](../../notes/ideas/task.md) 拥有，组合边界由 [framework](../../notes/ideas/framework.md)、入口交接由 [bootstrap](../../notes/ideas/bootstrap.md#启动映像的寿命) 拥有。验证证据见运行时分层计划和本记录末节。
 
 ## 目标与非目标
 
@@ -80,7 +80,7 @@ impl<E> ThreadRegistry<E> {
 }
 ```
 
-`ResultCell` 状态为 `Empty/Published/ReceiverGone`，不可复制的 producer 独占发布权，交错表见 task「结果发布」。record 只持栈 `MappedRegion`、环境 residue、`ThreadControl` 与 cleanup 进度，不含 F/T 或 packet cleanup。Registry 只登记已启动或已放弃的线程，未启动资源由 PreparedThread 独占，取消与 reap 无仲裁；槽状态见 [task 实现](../notes/impls/task.md)。
+`ResultCell` 状态为 `Empty/Published/ReceiverGone`，不可复制的 producer 独占发布权，交错表见 task「结果发布」。record 只持栈 `MappedRegion`、环境 residue、`ThreadControl` 与 cleanup 进度，不含 F/T 或 packet cleanup。Registry 只登记已启动或已放弃的线程，未启动资源由 PreparedThread 独占，取消与 reap 无仲裁；槽状态见 [task 实现](../../notes/impls/task.md)。
 
 libruntime：`_start` 入口 → StartupBlock 校验 → allocator → affine StartupSeed → StartupContext 全表 Query/最后提交 → `ThreadRegistry` 入口线程登记 → rustc main(`0`, null)；`Ok` → ThreadExit，`Err`/panic/OOM → 日志 + ProcessAbort。应用通过一次性 startup context take 接收身份、payload 视图与 grants。
 

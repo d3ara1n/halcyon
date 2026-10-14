@@ -354,6 +354,6 @@ Process 退休交棒已收口：`drain_gate` 只由 Process 内部接口持有�
 - Runnel 终态访问、完整观察/取消 owner、RPC/Runtime 组合、领域配额分类、可挂起 Close 的实际执行上下文、持续监督消费 REAPABLE：执行前置，不等待本项整体完成。
 - Delivery 独立身份与 Peek：运输闭包先审视，保留交付责任，不预设删除 ABI。
 - TimerQueue token 编码、OrderedTable 预付契约和包位置：已有包归属计划。
-- 普通 mapping/堆/线程栈 owning 接口：[独立延期计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)，不延期当前运输清理。
+- 普通 mapping/堆/线程栈 owning 接口：[独立延期计划](todo-2026-09-14-user-memory-owner-lifecycle.md)，不延期当前运输清理。
 - 不可信分配域 metadata 隔离：[KernelMemoryBudget](../todo-2026-09-14-kernel-memory-budget.md)，不用来激励 pm Drain。
 - 根监督者意外退出后没有专用自动 Drain 的事实仍保留。只有目标需要根故障恢复时才需设计相应接管/重建能力；正常 reset 可由仍存活的 init 提交。根终局与通用关机边界由 [系统关机编排计划](../todo-2026-09-system-shutdown-orchestration.md) 在承诺正式服务与终局政策前界定，不作为当前运输开工的假定缺口。

@@ -94,7 +94,7 @@
 | 工作 | 范围、收口产物与边界 | 当前处置 / owner |
 |---|---|---|
 | 主线登记与过时接力纠正 | 固定上述切面、建立缺失的两份范围记录，修正分层/出生块和设备的失效前置；核对本地链接与diff | 本轮已处理；本总纲拥有整理结果，COMPASS只留入口 |
-| 旧Review范围归并 | 逐份保留固定目标，区分被替换机制、现存消费者和新目标；输出范围矩阵，不把未审查标成通过 | 本轮已在[总体Review入口](todo-2026-09-kernel-final-architecture-review.md#旧-review-范围归并)建立12份范围矩阵；实际Review未执行，当前`ac9d7d9`的独立Review仍单独有效 |
+| 旧Review范围归并 | 逐份保留固定目标，区分被替换机制、现存消费者和新目标；输出范围矩阵，不把未审查标成通过 | 范围矩阵已建立；当前有效性与后续责任已由[统一Review报告](review-2026-10-12-consolidated.md)完成核定，原始范围仅作历史取证 |
 | 普通出生块文档校正 | 准确描述READ映射、Building Write初始化与地址空间持有，删除impls中的目标追踪/验证宣告 | 本轮文档部分已完成，见[startup](../notes/impls/startup.md#用户态公共-loader)；源码注释残留只在[分层记录](todo-2026-09-runtime-kernel-library-separation.md#kernel-与-shared-的施工边界)登记，待以后获准维护源码时处理 |
 | 验收fixture记录校准 | 更新现存映像、当前三类启动自检及脚本声明；旧ProcessDrain/WaitSet/Tunnel自检与原运行结果归于历史，未知等价覆盖仍保留未知 | [fixture清理档案](archived/todo-2026-09-23-acceptance-fixture-cleanup.md)保留2026-10-07文档轮次事实；当时未删除测试、执行代码审查或新验收 |
 | 验收运行整理（2026-10-11） | 用户另行授权实施：VM fault聚焦现有线程/内存消费者，平台默认release仍跑完整业务，聚合分组，删除重复Copy汇总并统一FS1输出 | [实施与验证](archived/todo-2026-09-23-acceptance-fixture-cleanup.md#实施验证与交付检查)已完成并提交为`a06e455`；验收范围已由[FAL 原始报告](archived/review-2026-10-12-fal-service-delivery.md)审查，当前有效性与条件证据见[统一报告](review-2026-10-12-consolidated.md)。fixture与三项自检按独立覆盖保留，后续仅按owner/消费者/成本变化重审 |

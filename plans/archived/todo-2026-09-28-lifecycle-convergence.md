@@ -1,6 +1,6 @@
 # 进程与线程生命周期收敛
 
-> 状态：已完成并归档；基线 `a592e38`。本记录拥有本轮收敛范围、删除清单、验证与结构检查；ThreadRegistry/owner 的后续实施由[用户内存 owner 计划](../todo-2026-09-14-user-memory-owner-lifecycle.md)拥有。方向归 [task](../../notes/ideas/task.md)，当前实现归 [task 实现](../../notes/impls/task.md)与[启动实现](../../notes/impls/startup.md)。
+> 状态：已完成并归档；基线 `a592e38`。本记录拥有本轮收敛范围、删除清单、验证与结构检查；ThreadRegistry/owner 的后续实施由[用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md)拥有。方向归 [task](../../notes/ideas/task.md)，当前实现归 [task 实现](../../notes/impls/task.md)与[启动实现](../../notes/impls/startup.md)。
 
 ## 承诺与边界
 

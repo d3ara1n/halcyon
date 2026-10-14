@@ -35,7 +35,7 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 | 消息与 signal | Mailbox/Notification/Wait 的基础 API 在 libkernel；RPC 和事件推进各有 owner | 当前 Notification 不是 POSIX handler；默认不建立消息泵、监听线程或 root channel |
 | 程序入口 | 标准 `fn main()`；runtime `_start` 接受平台 a0/a1 StartupBlock 参数，内部链接桥显式以 `main(0, null)` 调用 | ELF entry 仍是 `_start`；不再用全局导出桥或入口宏；main ABI 与启动参数 ABI 分离 |
 | 启动 context | 无堆 view 校验 → allocator/Registry → once 采用 `EntryThreadDescriptor` 登记入口线程 → 显式交付应用 | 不把 env 全局变量搬家，不把 payload 伪造为无条件 static，不复制 Handle 关闭权；第二次进入 `_start` 为完整性失败 |
-| 线程环境与结果 | ThreadCreate 挂起 → 登记 record/ResultCell → ThreadStart；结果由 ResultCell 仲裁 | 不把 DONE 当成 T 已初始化；T/F 只在用户线程 Drop；TLS/unwind/detach 不在范围；具体施工见 [owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) |
+| 线程环境与结果 | ThreadCreate 挂起 → 登记 record/ResultCell → ThreadStart；结果由 ResultCell 仲裁 | 不把 DONE 当成 T 已初始化；T/F 只在用户线程 Drop；TLS/unwind/detach 不在范围；具体施工见 [owner 计划](archived/todo-2026-09-14-user-memory-owner-lifecycle.md) |
 | shared 与 Rust | 删除 ExitCode、Termination/ProgramResult；shared 定义结构化 `TerminationCause` | main 返回 Err 由 libruntime 转 ProcessAbort；无任何数值退出码 |
 | 平台构建 | target JSON/ISA/共同布局到 `user/platforms/`，采用通用入口符号；runtime 提供适配 | 不让替代 runtime 依赖旧 runtime 目录或编译器 main 包装 |
 | allocator 与异常 | runtime owns global allocator/panic/OOM/入口 wrapper；libkernel 最小路径无堆 | runtime 依赖库不意味着堆初始化前可调用所有 API；main 返回 Ok 只结束入口线程，进程在末线程离场时 Completed |
@@ -93,7 +93,7 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 - Send/Receive 在 message idea 中明确为业务非阻塞；带 Deadline 不等于等待重试。分配准备、业务等待与内核退休 park 必须分别标注。
 ## libthread 接口与平台入口核实
 
-线程契约由 [task](../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
+线程契约由 [task](../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [已归档的用户内存 owner 计划](archived/todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
 
 当前实现事实以本轮复核为准：`StartupSeed` 先无堆核验 StartupBlock，采用阶段逐项非对齐读取、预留工作区、Query 全表，全部通过后建立 Capability owner；失败保留 Seed。`ResultReceiver` Drop 只放弃结果；Registry 只登记已启动或已放弃的线程，PreparedThread 放弃关闭唯一 Control 后以普通 record 登记，取消与 reap 无仲裁。
 
@@ -208,7 +208,7 @@ stateDiagram-v2
 ## 与其它专题的接点
 
 - 设备设计继续使用正确分层；runtime 可组合线程/上下文不会使 libdriver/libdevice 反向依赖 runtime，也不改变它们的授权来源。
-- [用户映射 owner](todo-2026-09-14-user-memory-owner-lifecycle.md) 的线程子集已作为本次分层硬前置完成，独占 ThreadCreate/ThreadStart、TerminationCause、Registry/ResultCell 的施工方案与验证门；其它 allocator/映射扩展仍按独立需求。
+- [用户映射 owner](archived/todo-2026-09-14-user-memory-owner-lifecycle.md) 的线程子集已作为本次分层硬前置完成，独占 ThreadCreate/ThreadStart、TerminationCause、Registry/ResultCell 的施工方案与验证门；其它 allocator/映射扩展仍按独立需求。
 - 保留区、IRQ、内核预算、关机等原计划仍各自拥有领域功能。本主线不以 ProcessTerminate 冒充其正常收束。
 
 ## 施工与交付门
@@ -228,7 +228,7 @@ stateDiagram-v2
 
 ## 跨会话接力断点
 
-### 工作树与授权
+### 历史工作树与授权（施工断点）
 
 - 当前分支 `master`，本次分层迁移仍未 commit/push；工作树保留本闭包的代码与同步文档改动。
 - 基线 66f4e9c 及此前工作记录仅作为既有实现背景；本轮纠正的 P1、失败路径和接力状态由唯一 [复核报告](archived/review-2026-09-28-runtime-layering.md) 拥有。
@@ -263,7 +263,7 @@ stateDiagram-v2
 | Registry 容量 | 施工阶段定限额 | 由 runtime 装配者按资源模型给出，prepare 前先 reap |
 | Cargo 依赖图 | 设计阶段 | `libkernel` 不依赖上层；`libprocess::context` 只依赖 libkernel/shared；`libthread` 不依赖 libprocess/libexecution/runtime；libruntime 只组合 context、thread 与 kernel | 已完成并由 workspace check 验证 |
 | rinlib 模块归属 | 设计阶段 | call/ipc/mm/memory/time/system/debug → libkernel；process 原语 → libkernel，context/management → libprocess；thread → libthread；env/startup → libprocess::context；rt/allocator/panic/entry → libruntime |
-| 平台入口 | 设计阶段固定协议，施工阶段取证 | 平台 `_start` 先初始化 gp，再把 a0/a1 交给 libruntime；应用使用普通 `fn main()`，runtime `start` lang item 接入；不保留 `entry!`、ENTRY(main) 或 argc/argv 借位 | 已实现，待第三轮完整门复核 |
+| 平台入口 | 设计阶段固定协议，施工阶段取证 | 平台 `_start` 先初始化 gp，再把 a0/a1 交给 libruntime；应用使用普通 `fn main()`，runtime `start` lang item 接入；不保留 `entry!`、ENTRY(main) 或 argc/argv 借位 | 已实现；完整门已由本计划末节记录的 `just acceptance` 通过 |
 | 消费者迁移 | 设计阶段固定责任矩阵，施工阶段逐 crate 修改 | 全部公共库、服务、驱动和验收程序已迁移；不保留旧 runtime facade/alias | 已完成 |
 | Rust 字段、模块文件、helper、默认容量 | 施工阶段 | 只要不改变上述契约，可由实现按代码结构决定；容量数值由真实装配者和资源模型给出，不能写无依据的全局常量 |
 | 编译错误、import、target 路径、linker 段 | 施工阶段 | 按依赖顺序修正并保留编译/ELF/反汇编证据，不提前在设计文档穷举 |

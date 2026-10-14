@@ -62,7 +62,7 @@ plans/ 根目录保留活跃专题计划与含未闭合 findings 的 Review 报�
 | [`todo-2026-09-15-runtime-admission-review.md`](../todo-2026-09-15-runtime-admission-review.md) | 整体固定提交 Review：`a3891b0` → `5de2780` → `e0b5c45` → `4e18e5e`，覆盖 Runtime/Job 分页/Active 停止、RPC/Outbox、真实消费者与组合验证 |
 | [`todo-2026-09-18-public-operation-ownership-review.md`](../todo-2026-09-18-public-operation-ownership-review.md) | 未来 Review：固定复核 `8e0467a` 的工作债务账本、请求代次仲裁、Process 退休交棒、两组四类公平预算及组合验证，不扩大到后续 FAL 实现 |
 | [`todo-2026-09-13-service-runtime-prerequisites.md`](todo-2026-09-13-service-runtime-prerequisites.md) | 消息运输、流运输/Runnel、通用执行/准入与 RPC/Outbox 均已完成；保留闭包交付和固定提交 Review，不再拥有下一项用户态执行施工 |
-| [`todo-2026-09-14-user-memory-owner-lifecycle.md`](../todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
+| [`todo-2026-09-14-user-memory-owner-lifecycle.md`](todo-2026-09-14-user-memory-owner-lifecycle.md) | 独立延期：执行基座和当前 FAL 基础交付后，遇到长期动态 mapping/正式 reaper 需求时统一映射、堆和栈 owner；当前运输清理不得转延期 |
 | [`todo-2026-09-14-kernel-memory-budget.md`](../todo-2026-09-14-kernel-memory-budget.md) | 独立延期：按不可信分配/创建域的 metadata 隔离需求触发，默认排 FAL 基础与映射 owner 后；不用于激励 pm Drain |
 | [`todo-2026-09-fal-extended-operations.md`](../todo-2026-09-fal-extended-operations.md) | 等真实消费者触发：递归 Copy/Delete、快照/持久性/原子替换、capability 属性 Copy、递归/可重放 Watch、append/组合 Open；不隐含在基本 FAL 完成中 |
 | [`todo-2026-09-platform-reserved-memory-lifecycle.md`](../todo-2026-09-platform-reserved-memory-lifecycle.md) | 未来规范支持：动态 `/reserved-memory` 放置、region identity/设备引用与 `reusable` 可撤回借用；须在正式设备/DMA 资源接入前完成 |

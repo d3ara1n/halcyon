@@ -47,7 +47,7 @@ FAL1、`MemFs`、slot-1 anchor、self-client、旧泵、原始 Runnel 工厂和�
 
 [扩展操作计划](../todo-2026-09-fal-extended-operations.md) 唯一承接递归操作、快照/持久性/原子替换、capability 属性 Copy、扩展 Watch、append/组合 Open。本计划不复制这些待办；新需求若触发，先修订边界与依赖，不能暗中扩大基本操作。
 
-CPU 预约、KernelMemoryBudget、设备/中断/DMA、BufferQueue、通用异步语言运行时、系统关机编排及电源管理不在本专题。开放不可信创建域前须满足 [KernelMemoryBudget](../todo-2026-09-14-kernel-memory-budget.md) 的前置；当前有界准入不等于跨域资源隔离。[映射 owner 延期项](../todo-2026-09-14-user-memory-owner-lifecycle.md) 不能承接当前 Open 必须完成的 Endpoint 关闭与退款；若现有 owner 无法闭合正常清理，须先重排前置。
+CPU 预约、KernelMemoryBudget、设备/中断/DMA、BufferQueue、通用异步语言运行时、系统关机编排及电源管理不在本专题。开放不可信创建域前须满足 [KernelMemoryBudget](../todo-2026-09-14-kernel-memory-budget.md) 的前置；当前有界准入不等于跨域资源隔离。[映射 owner 延期项](todo-2026-09-14-user-memory-owner-lifecycle.md) 不能承接当前 Open 必须完成的 Endpoint 关闭与退款；若现有 owner 无法闭合正常清理，须先重排前置。
 
 ## 3. 技术依赖与施工顺序
 
