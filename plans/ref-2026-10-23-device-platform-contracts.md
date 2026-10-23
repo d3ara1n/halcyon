@@ -48,10 +48,44 @@ USB-IF 官方来源：[USB 2.0 specification 页面](https://www.usb.org/documen
 - §9.4.3/6/7：GET_DESCRIPTOR、SET_ADDRESS、SET_CONFIGURATION。地址和配置由总线 owner 管理，不能无条件交给接口驱动。
 - §9.6.1/3/5/6、表 9-8/10/12/13：设备、配置、接口、端点描述符。配置 `wTotalLength` 覆盖所属描述符串；逐项按 `bLength` 遍历，并检查最短头、非零推进、剩余长度与类型要求。端点号为低四位，方向为 bit 7。
 - HID §4.2、§7.2.5—6、Appendix B.1：Boot Keyboard 为 interface class 3/subclass 1/protocol 1；默认 Report Protocol，首批显式 SET_PROTOCOL(0)。Boot 输入报告 8 字节：modifier、保留字节、六个 usage。ErrorRollOver 和 modifier usage 按 Usage Tables，不把错误报告当正常按键释放。
-- QEMU [dev-hid.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/usb/dev-hid.c)、[hid-core.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/input/hid-core.c)实现 `usb-kbd` 与对应控制请求。首批只承诺 boot keyboard 输入；通用 HID report descriptor、其他设备类别和打印协议另行扩展。
+- QEMU [dev-hid.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/usb/dev-hid.c)、[hid.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/input/hid.c)实现 `usb-kbd` 与对应控制请求。首批只承诺 boot keyboard 输入；通用 HID report descriptor、其他设备类别和打印协议另行扩展。原 hid-core.c 路径在固定 tag 中不存在，本轮取证已更正。
 
 ## 热插控制与证据边界
 
 固定来源：[USB 设备说明](https://github.com/qemu/qemu/blob/v11.1.0/docs/system/devices/usb.rst)、[QMP qdev schema](https://github.com/qemu/qemu/blob/v11.1.0/qapi/qdev.json)、[USB bus](https://github.com/qemu/qemu/blob/v11.1.0/hw/usb/bus.c)。固定控制器在启动时装入；运行期通过 QMP `device_add`/`device_del` 在 `xhci.0` 加减 `usb-kbd`。这验证 USB 设备热插，不声称 PCI host/function 热插已经实现。通用 `device_del` 的成功回复不自动等于删除完成，验收需观察 QMP 事件与客体登记/绑定终态，不用主机命令返回代替客体收束。
 
 最终停止还依赖 [SBI 3.0 System Reset](../references/normative/riscv-sbi-v3.0/src/ext-sys-reset.adoc)：成功 reset 不返回；失败可返回错误。Cold reboot 表示完整复位，不能以 Warm reboot 替代所需硬件复位；提交 reset 本身不证明此前已安全退款。CPU/I/O 顺序与跨 hart 页表失效按[固定 ISA 索引](../references/CONTRACTS.md#risc-v-isa-与特权架构)，不将 FENCE 当成 cache flush 或设备完成。
+
+## 施工准入补充取证
+
+本轮研究任务重新读取 xHCI 1.2b、QEMU 固定源码和版本差异；主代理另外核对本机版本、设备属性与无 IOMMU 的 DMA address space 回落。以下为资料证据，不是实际 USB/IRQ/DMA 运行结果。
+
+### 取消、停止及内存释放
+
+同一 [xHCI 1.2b 规范](https://cdrdv2-public.intel.com/625472/625472_xHCI_Rev1_2b.pdf)的约束如下，页码为印刷页码：
+
+| 动作 | 固定章节与原文要点 | 不能推导的保证 |
+|---|---|---|
+| Stop Endpoint | §4.6.9，p118–125：“If a USB IN or OUT transaction is in-flight, it shall be completed”；命令完成前写回最终 dequeue pointer/DCS，停止时生成 Stopped Transfer Event | 同节明确 “resources and bandwidth … are not released”；不能把 Stop 命令提交或单独的停止提示当成 endpoint/ring 已释放 |
+| Set TR Dequeue Pointer | §4.6.10，p125–128：仅 Error/Stopped 状态；“Invalidate any xHC TDs that may be cached”；部分 TD 剩余 TRB 不再执行 | 不等完成就复用旧 TD/地址仍无保证；正常运行状态不能任意改 dequeue |
+| Disable Slot | §4.6.4，p96：endpoint 为 Stopped 或 Running 中 Idle、相关 outstanding Transfer Events 已收到、定向命令完成；完成后 “software can free the Device Context, Transfer Ring, Stream Context Array, etc.”，随后清 DCBAA 槽 | 不满足前置是未定义行为；不能因 USB 物理拔出直接释放 |
+| R/S 清零与 HCH | §5.4.1/§5.4.1.1/§5.4.2：HCH 表示 pending pipelined transactions 完成并停止；halt 过程有 16ms 规范界。未遵守先停止 endpoint/command、收完成事件的建议，queued 工作可能丢失/中止 | 不保证 Event Ring 已空；§4.19.2 和 halt 章节记录 HCH/ER full 下事件可能被门控或丢失 |
+| BME 清零 | §4.21.2：先 halt 并确认 HCH=1，再清 Bus Master Enable | 单清 BME 不是已经结束 DMA 的证据 |
+
+CPU 对 ring 的消费和软件请求完成仍由驱动负责；硬件完成证明与软件“所有请求均成功”是两个事实。规范中没有 “HCH=1 ⇒ Event Ring empty” 的保证。
+
+### PCI DMA 与输入/删除控制
+
+- [pci.c v11.1.0](https://github.com/qemu/qemu/blob/v11.1.0/hw/pci/pci.c)：写 PCI_COMMAND 通过 `pci_set_master` 启停 bus_master_enable_region；BAR 解码受 MEMORY/IO 位控制，INTx 受 INTX_DISABLE 控制。[hcd-xhci-pci.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/usb/hcd-xhci-pci.c) 把 xhci.as 设为 pci_get_address_space，ring DMA 走该地址空间。故仅写 BAR 不会自动接通 PCI DMA。
+- 主代理读取 [pci.c v11.1.2](https://github.com/qemu/qemu/blob/v11.1.2/hw/pci/pci.c) 的 `pci_device_iommu_address_space`：有 IOMMU 使用其 get_address_space，否则 `return &address_space_memory`。结合 virt 默认无 IOMMU 与 dma-coherent 声明，支持所选模拟平台的物理地址 DMA；不由 MMIO ranges 恒等单独推导 DMA 恒等。
+- [virt.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/riscv/virt.c) 的 PCI memory ranges 在该机型 child/parent 相同，PIO 则 child=0、parent=0x03000000；运行实现仍须解析地址空间类型，不把所有 ranges 当恒等。
+- [qapi/ui.json](https://github.com/qemu/qemu/blob/v11.1.0/qapi/ui.json)、[ui/input.c](https://github.com/qemu/qemu/blob/v11.1.0/ui/input.c) 提供 `input-send-event` 和 `send-key`；前者要求 VM running 且有对应输入 handler。[hid.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/input/hid.c) 注册 INPUT_EVENT_MASK_KEY handler。状态型键盘验收应分别发送按下/释放，在两次之间等待客体 Query 观察，不能依赖短暂边沿不被合并。
+- USB [bus.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/usb/bus.c) 只挂同步 unplug；[qdev-hotplug.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/core/qdev-hotplug.c) 执行 unrealize，[qdev.c](https://github.com/qemu/qemu/blob/v11.1.0/hw/core/qdev.c) 在 finalize 发送 DEVICE_DELETED。事件与命令回复分别接收，不假设固定先后；主机 object 已删除也不证明客体 Binding 已安全 Released。
+
+### 本机 11.1.2 与固定 11.1.0 的适用性
+
+`qemu-system-riscv64 --version` 实际返回 **11.1.2**；`-device qemu-xhci,help` 确认 msi/msix、p2/p3、streams 等属性存在。两条只查询版本/属性的命令均正常退出，没有启动客体。
+
+研究任务对固定 tag 的 virt/gpex/PLIC、PCI、xHCI、USB HID/bus、QMP 输入/删除相关文件逐字节比较：virt.c 的差异为 mtimer DT 节点地址修正；hcd-xhci.c 增加 timer 的 mem_reentrancy_guard，并整理 ISO 重试。其余所检查的相关头文件、PCI/PLIC/HID/USB/QMP 路径无差异。差异见[两 tag 比较](https://github.com/qemu/qemu/compare/v11.1.0...v11.1.2)，具体源码采用 [virt.c v11.1.2](https://github.com/qemu/qemu/blob/v11.1.2/hw/riscv/virt.c)、[hcd-xhci.c v11.1.2](https://github.com/qemu/qemu/blob/v11.1.2/hw/usb/hcd-xhci.c)。
+
+以上差异未改变本案使用的 BAR、DMA 地址空间、PLIC/INTx 和 boot keyboard 合同；首批实际验收选本机 11.1.2，保留 11.1.0 取证来源及这份差异说明。ISO 非首批承诺，不将其行为差异描述为全 xHCI 等价。仍未验证真实硬件 halt 延迟、非一致缓存、恶意 DMA 隔离或实际热插运行。

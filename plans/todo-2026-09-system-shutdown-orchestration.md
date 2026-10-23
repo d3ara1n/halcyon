@@ -20,6 +20,10 @@
 
 首批所需拓扑由实际登记/Binding/激活关系和受托 Job 集合枚举，不在 init 手写每个设备的关闭序列。各 owner 已准入的清理任务推进到终态，init 观察结果，不负责逐条 pump。
 
+停止入口只交给 init 的受权管理 context，普通键盘客户端或驱动不持 SystemReset。正常重复请求返回当前阶段；停止中收到故障升级只能进入 FailureTerminal，不能另启动一条并行关机流程。装配 gate 封闭后，srv_driver 停止选择、srv_device 封来源并阻止新 Claim/子登记；正在启动/准备的记录已经属于原监督/Binding 集合，迟到成功只进入停止，不逃出收束范围。这里不要求跨进程原子广播：每个接收者的封口回执与其封口前已提交责任一起纳入等待，未回执者按失联/期限策略升级。
+
+观察已封来源的完整收束不能只取一次设备树快照。srv_device 的源停止任务持既有成员游标并计入在途 Preparing，终态只在全部绑定 Released、子来源封口和迟到准备责任闭合后给出；仅观察控制壳尚未退款不阻止硬件停止完成。init 先取得这些领域完成事实，再关闭驱动 Job，避免先杀父 provider 后等待它完成子会话的循环依赖。
+
 ### 无法证明安全的系统故障
 
 srv_device 失效、受信 DMA 主控死亡且无隔离证据、必要停止失败或管理期限耗尽，均进入 FailureTerminal。init 先封新装配、停止受影响执行、封资源新使用；保留可能仍被设备访问的 mapping/backing/charge，不假装完成 Released 或退款。srv_device 的用户态表不可用时，不重建表后继续分配。
@@ -32,6 +36,8 @@ srv_device 失效、受信 DMA 主控死亡且无隔离证据、必要停止失�
 
 观察期间 Work 停驻，不占 runnable 队列、不轮询。hint 只唤醒，在锁外 Work::step 核对终态后调用既有 `runtime_stop::request/check`，不在 hint 内停机；不遍历用户进程、不回收设备、不重建 init。这个 owner 不持初始 Process 的 live capability 或 Body 借用，不得因观察本身阻止其 DONE；持的是允许终态观察的稳定来源/壳。费用按系统启动寿命保留。
 
+观察记录在初始进程 Start 前准入，并先 attach 再检查 Shell 终态，不能等用户已开始运行后才准备节点。Bootstrap 启动完成把既有 boot 责任移交该观察记录，释放装载临时存储；Start 成功与初始进程立即 DONE 的交错不会丢终态。来源绑定已 terminal 时直接推进，同一 hint 重复只唤醒原 Work。记录计费和来源引用随 boot 生命周期，不拿初始 Process 的 ingress/receipt lease 保活它。
+
 这一目标复用[Shell 来源](../os/kernel/src/task/process/shell.rs)、[Bootstrap Work/HintTarget](../os/kernel/src/boot/bootstrap.rs)、[等待源约束](../os/kernel/src/task/wait_source.rs)和[runtime_stop](../os/kernel/src/runtime_stop.rs)，**现有代码尚未接上初始进程运行期终态观察**。现有 runtime_stop 在锁外安全点停驻并记录 PARKED，不是已经完成的全 hart 屏障；IPI 失败亦不能据此宣称所有 hart 已停。
 
 安全不依赖观察到 DONE 的速度：设备方案要求活跃 DMA mapping 的稳定 owner 保活 backing/原 charge，控制 handle 全部 Close 只封准入并形成静态有账保留，不能触发 unpin。其他 hart 在停驻传播窗口推进 init 或驱动回收也不能复用这些页。该保留无可推进工作，不伪造一项永远 runnable 的维护债务。IRQ 控制孤立则由内核按完整 claim/complete/disable 顺序封源。
@@ -43,6 +49,8 @@ srv_device 失效、受信 DMA 主控死亡且无隔离证据、必要停止失�
 设备资源实现必须先提供最后 Close 不退休活跃 DMA 的不变量，再接根观察；不能以“先停住所有 hart”替代 pin owner。boot 观察和资源机制一起纳入设备首批闭包，不另造恢复任务。实际 Job/进程停止、Reset capability 与错误保持复用已有 owner。
 
 验收至少覆盖正常有在途 I/O 的停止、叶/控制器死亡、srv_driver/srv_device 死亡、init DONE、Reset 失败和 IPI 传播失败。核对页/费用不提前复用、无新准入、旧对象不恢复；不能要求故障保持路径全部退款。QEMU 只证明所选模拟平台，真实 DMA halt/隔离另行取证。
+
+Cold reboot 路线由外部验收观察真实 QMP reset/重新启动边界后结束本次实例，不沿用 Shutdown 的进程退出判据；Reset 返回错误才走返回错误分支。init DONE/全控制 Close 路线要观察 MayBeExposed mapping 仍由稳定 owner 持有、无可运行的孤立回收债务；尚未交付地址的 Pin 准备可以安全取消，不应为了故障保留而制造无必要泄漏。具体运行入口和证据由设备主计划维护。
 
 ## 通用关机的剩余范围
 

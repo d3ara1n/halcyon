@@ -1,6 +1,6 @@
 # 正式服务装配与监督设计
 
-状态：**设备首批装配的目标已确定，通用正式服务装配仍未全部闭合，未开始代码施工**。本案承接[系统重构总纲](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)的服务装配主线，拥有正式系统的启动依赖、就绪、监督恢复与进程授权装配；发布发现协议由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，全系统停止协议由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备装配事实与供应依赖由[设备分案](todo-2026-09-device-system-design.md)拥有。
+状态：**设备首批装配已具备施工合同，通用正式服务装配仍未全部闭合，未开始代码施工**。本案承接[系统重构总纲](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)的服务装配主线，拥有正式系统的启动依赖、就绪、监督恢复与进程授权装配；发布发现协议由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，全系统停止协议由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备装配事实与供应依赖由[设备分案](todo-2026-09-device-system-design.md)拥有。
 
 ## 目标与非目标
 
@@ -43,6 +43,27 @@ init 交付受托 Job/进程控制范围、付款来源、设备 owner 派生的
 
 上述选用静态启动配置与动态设备激活，不要求先设计 initfs 编排脚本或通用 supervisor。管理记录按实际存储及预留任务付款，失败保留原 owner；授权签发/进程启动的不确定结果不能靠丢句柄当作已回滚。
 
+### 首批装配图与就绪合同
+
+首批使用编译期装配配置；启动映像集是输入，不承担运行期监督。下表的 Pool 是实际内核付款来源，用户态 libbudget 账户仅约束所属管理者的记录、任务和字节。每次进程出生前由启动者预留启动记录、就绪接点和终态观察，Process/Job 管理关系不由付款关系推导。
+
+| 运行角色 | 启动与监督 owner | 启动交付的最小权限和付款 | 对依赖者的就绪事实 |
+|---|---|---|---|
+| srv_init | kernel boot owner 观察初始 Shell DONE | 根 Job、SystemReset、根 Pool、只读启动映像/DTB、实际平台控制根 | 保有控制根与监督记录后才能启动管理基座 |
+| srv_device | init 的管理 Job；init 持 ProcessControl | 自身 Pool、私有 bootstrap sender；平台适配器持明确委托的资源控制及登记范围 | 私有接点返回 DeviceAdmin、DeviceObserver 和平台登记控制；仅表示接收与清理任务已可运行 |
+| srv_driver | init 的管理 Job；init 持 ProcessControl 与 ClaimSourceAdmin | 独立 Pool、受托驱动 Job、ClaimSource、DeviceObserver、boot 配对映像/声明来源；无 SystemReset | 已装入静态声明、挂好设备订阅、能接收 Stop；不要求 HID worker 已启动 |
+| PCI / xHCI worker | srv_driver 的驱动 Job；srv_driver 持各 ProcessControl，init 保留外层 Job | 各自 Pool、私有激活接点；BindingUse 按激活交付。PCI 额外得到限定窗口、子资源派生和子登记权；xHCI 得到受信 DMA use | 进程 bootstrap 只返回激活入口；功能就绪另等该 Binding 的 Ready |
+| HID worker | 同一驱动 Job；按已准入容量复用 | 自身 Pool、激活接点、接口 BindingUse；无物理资源根和受信 DMA 报告权限 | 每接口独立 Ready；一个接口失败不伪造其他接口终态 |
+| 正式键盘消费者 / test_device | init 的消费者 Job | 自身 Pool、DeviceObserver 与限定 FunctionAccess、结果回报接点 | 从实际 functions 取得键盘入口后消费 libhid；不由 PID 或目录出现推定 Ready |
+
+正常服务不从通用 Registry 发现自己的 bootstrap 控制入口。init 为每次启动预建独占 sender context/receiver，把 sender 通过出生块交给目标；回复身份与已保留的启动记录关联，迟到回复只能回到原记录。收到入口后同时核对目标 Process 尚未终态；后续死亡由预先安装的观察接管，不能凭一次检查保证永久存活。启动失败、就绪超时或停止先到时，记录保持 Stopping，关闭新激活，停止该实际 Process，并等待其终态；迟到入口只释放，不发布为新实例。
+
+管理者就绪后平台适配器登记 PCI host；PCI Ready 后才可能发现 xHCI；USB 接口出现才激活 HID。这些是功能供应关系，不能替代进程 Job 树。设备业务不依赖 srv_fs/Registry 就绪：必要功能出口是 Devices/functions，通过已有 OAL Namespace 绑定实际入口；可选 Registry 别名失败只影响发现别名。已有 core workload 的 fs/pm 验收装配保留原 owner，不把它们误列为本次硬件启动前置。
+
+首批不自动重启失效的 srv_device 或 DMA 主控。srv_driver 失效后，init 封旧 ClaimSource、停止受托驱动 Job；只有全部旧 Binding 已安全 Released 才允许显式管理请求创建新来源和新管理者。初次启动与接替都经过同一装配 gate；没有明确请求不循环重启。若清理需要已死主控的硬件证据，直接按关机计划升级。
+
+平台根、PCI 配置写权限和 TrustedPhysical DMA 属于系统可信基座：init、设备管理/平台适配器、认证并转交静止报告的 srv_driver、PCI provider、xHCI 主控均必须可信。不能只把 xHCI 标为可信，却把可重配 BAR/bus-master、派生 DMA 或提交可信静止事实的上游当作不可信。HID 与功能客户端的边界来自受限 USB 会话；路径、支持声明和程序自报标志不能授予上述权限。
+
 ## 设计门
 
 1. 明确首批正式长期服务及可观察能力、启动依赖、必需与可选能力；从真实需求选择静态或可配置装配。
@@ -51,7 +72,7 @@ init 交付受托 Job/进程控制范围、付款来源、设备 owner 派生的
 4. 与 FAL/服务分案核定发布发现接点，与设备分案核定驱动供应和隔离事实，与关机编排核定停止接点。各项契约只有一个拥有计划。
 5. 形成首批装配的接口、责任转换、迁移删除清单与验证门后，才进入代码施工。
 
-本案可以先设计一般服务的装配关系；设备特有接线以设备详细设计为前置，不让尚未选定的设备模型阻止无关关系的论证。
+上述设计门在设备首批范围内已由装配图、私有就绪/Unknown/监督合同及设备主计划的迁移/验证门闭合，可以随设备施工；通用正式服务继续按这些门设计，不把未来热升级、持久化和配置需求列为本次设备的前置。
 
 ## 完成门与验证边界
 

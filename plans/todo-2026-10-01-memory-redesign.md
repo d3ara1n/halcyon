@@ -37,7 +37,17 @@
 - 设备可写的 Pin 必须在 MemoryObject 原状态机中取得写许可，Sealing/Executable 拒绝新写 Pin；既有设备写许可尚存时 Seal 可以请求，但不能公布 Executable。设备只读 Pin 只需相应读取授权与 backing use。补充的是 DMA 调用接点及同步后的许可归还，不在设备层复制 W^X 状态。
 - Pin 在实际源授权仍有效时取得 use/许可，准入失败由原准备 owner 取消未提交许可并完成 use 回滚；映射提交后才交出设备地址。正常退休在可信硬件完成后归还写许可、释放 BackingUse，按原有预算推进物理归还和退款，最后发布 mapping 完成。
 - VM Unmap/Protect/进程退出只释放其 CPU view/use/写许可，不能代退 DMA 的那一份；CPU 映射降权不必等待 DMA，整个 MemoryObject 进入 Executable 必须等待所有写者。首批 MemoryObject 固定长度，不新增 shrink/decommit；未来引入时必须守住实际 use 的区间保活，不将当前没有该接口写成设备侧独立保护机制。
-- DMA control 全部消失时 mapping 静态保留原 use、写许可和费用，不创建永远 runnable 的回收工作。明确的受信 Retire 才触发实际退休；首批孤立映射等系统外部复位。由设备资源 owner 持这项责任，Process DONE 和 CPU shootdown 不成为 DMA 完成证明。
+- DMA control 全部消失时，地址可能已交付的 mapping 静态保留原 use、写许可和费用，不创建永远 runnable 的回收工作；尚未暴露地址的准备允许安全取消。明确的受信 Retire 才触发暴露后实际退休；首批孤立映射等系统外部复位。由设备资源 owner 持这项责任，Process DONE 和 CPU shootdown 不成为 DMA 完成证明。
+
+接线选择：MemoryObjectCore 增加独立设备写者准入，内部在原状态锁下调用 `MemoryObjectState::reserve_writes(1)`，持有原 core 与 affine WritePermit；不经 Views 的 CPU 来源计数，也不伪造 `PermitRequirement`。use 和写许可分步取得，中途失败交原 Pin Work 回滚，不能 Drop 尚有效的 BackingUse。归还写许可必须晚于可信硬件完成/必要平台同步；随后逐步释放 use，完成谓词只要求这一份责任退出，不要求其他合法 use 一并释放。
+
+Pin 结果与物理地址分开：Pin 只交付 mapping 能力，第一次 ReadSegments 在可能写出任何地址之前标记 MayBeExposed。此前安装失败/取消/域封口可回滚；此后输出 fault、最后 Close 或进程死亡均不能推断硬件没有取得地址。暴露边界、静态保留和 Retire 由[设备 Pin 合同](todo-2026-09-device-system-design.md#dma-pin-的提交与结果寿命)拥有。范围 use 的物理地址枚举复用 BackingUse::physical_span，每次有界，不生成另一套物理库存表。
+
+### MMIO 映射接入
+
+设备范围内将现有 BackingView/MapBacking 演进为纯值映射来源，实物 View 持 `MappingUse::Ram(BackingUse)` 或 `Mmio(MmioViewUse)`；MMIO 不伪装 Funded/Boot RAM，不取得 MemoryObject 写许可。普通 VM 几何、发布、fault、同步和退休继续共用，详见[设备 VM 接线](todo-2026-09-device-system-design.md#vm-来源发布与强制撤销)。基础页 MMIO、按 MappingId 追踪片段、每空间预付的强制退休槽和整空间退休接管必须同时落地，不能先增加 IO PTE 再补撤销责任。
+
+普通 uaccess/IPC/结果写回及初始栈/上下文的检查同时约束来源为 RAM；仍使用 translate 前置校验和 SUM 直访。MMIO 的访问由驱动专用 volatile 接口承担，不新增内核软件页表拷贝旁路，也不让 IO 页成为 DMA Pin 来源。新增映射来源须覆盖 View 切分、Protect、Unmap、失败回滚、空间退出及旧 VA 空洞再利用，不只覆盖 Map 成功路径。
 
 实施与验收并入设备计划：覆盖 Pin 与 Seal 竞争、驱动 VM 回收而设备仍持页、最后控制 Close、重复退休和费用只在物理释放后归还。当前源码事实仅支持 use/写许可的复用依据，不能据此声称 DMA owner 或上述接线已经存在。
 
