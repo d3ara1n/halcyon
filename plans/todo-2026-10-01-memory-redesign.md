@@ -29,6 +29,18 @@
 
 本次不重新启动内存总重构。当前Sv39可继续承载已约定系统工作；扩展能力必须按上表补足前提，不能用“当前完备”掩盖未来保证，也不能用未来未建设否定当前责任链已收口。
 
+## 设备 DMA 接入合同
+
+2026-10-23 为[设备首批方案](todo-2026-09-device-system-design.md#dma)确定内存接点；以下是目标接线，未实施 DMA，不改变已交付 CPU VM 的完成边界。
+
+- DMA mapping 持独立 `BackingUse(backing,[lo,hi))`，不只持 `Arc<Backing>` 或驱动 VM。现有 [MemoryObjectCore::acquire_use](../os/kernel/src/task/memory_object.rs)、[BackingUse/BackingRelease](../os/kernel/src/vm/backing.rs)提供范围保活/释放基础；页与原 charge 在最后实际 use 退出前不得退款。
+- 设备可写的 Pin 必须在 MemoryObject 原状态机中取得写许可，Sealing/Executable 拒绝新写 Pin；既有设备写许可尚存时 Seal 可以请求，但不能公布 Executable。设备只读 Pin 只需相应读取授权与 backing use。补充的是 DMA 调用接点及同步后的许可归还，不在设备层复制 W^X 状态。
+- Pin 在实际源授权仍有效时取得 use/许可，准入失败由原准备 owner 取消未提交许可并完成 use 回滚；映射提交后才交出设备地址。正常退休在可信硬件完成后归还写许可、释放 BackingUse，按原有预算推进物理归还和退款，最后发布 mapping 完成。
+- VM Unmap/Protect/进程退出只释放其 CPU view/use/写许可，不能代退 DMA 的那一份；CPU 映射降权不必等待 DMA，整个 MemoryObject 进入 Executable 必须等待所有写者。首批 MemoryObject 固定长度，不新增 shrink/decommit；未来引入时必须守住实际 use 的区间保活，不将当前没有该接口写成设备侧独立保护机制。
+- DMA control 全部消失时 mapping 静态保留原 use、写许可和费用，不创建永远 runnable 的回收工作。明确的受信 Retire 才触发实际退休；首批孤立映射等系统外部复位。由设备资源 owner 持这项责任，Process DONE 和 CPU shootdown 不成为 DMA 完成证明。
+
+实施与验收并入设备计划：覆盖 Pin 与 Seal 竞争、驱动 VM 回收而设备仍持页、最后控制 Close、重复退休和费用只在物理释放后归还。当前源码事实仅支持 use/写许可的复用依据，不能据此声称 DMA owner 或上述接线已经存在。
+
 ## 设计启动时的现状事实（历史，不用于当前接手）
 
 - 地址空间、事务 owner、view owner、shootdown、drain 阶段与 Map syscall 入口均在 `os/kernel/src/task/proc.rs`（5475 行），与 Process 混合；无独立 VM 模块。

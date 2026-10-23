@@ -1,10 +1,16 @@
 # 平台保留内存完整生命周期
 
-状态：**跨领域设计进行中，尚未进入实施**。静态 `reg`/`no-map` 事实已由现有供给链承接；动态保留区、设备引用和 `reusable` reclaim 仍是正式设备/DMA 接入前置。
+状态：**跨领域设计进行中，尚未进入实施**。静态 `reg`/`no-map` 事实已由现有供给链承接；动态保留区、设备引用和 `reusable` reclaim 是消费这些能力的设备接入前置。设备首批路线的适用范围见下节，不把未使用能力扩大为全部 DMA 的无条件前置。
 
 整体设计接点由 [设备体系细化计划](todo-2026-09-device-system-design.md) 协调；本篇继续独占平台 region、动态保留区与 reusable 的详细决策和实施记录。当前进入跨领域设计，不表示下列实施切片已获授权或前置已完成。
 
-> 【未来实施计划】承接 Devicetree Specification v0.4 的动态 `/reserved-memory`、`reusable` 与设备 `memory-region` 引用。静态 `reg`、FDT reservation block 和 `no-map` 由当前 MemoryPool 主线的供给账本切片先行闭合；本计划必须在正式设备/DMA 资源接入前完成，不把未知语义降级成永久排除区。
+> 【未来实施计划】承接 Devicetree Specification v0.4 的动态 `/reserved-memory`、`reusable` 与设备 `memory-region` 引用。静态 `reg`、FDT reservation block 和 `no-map` 由现有供给账本承接；本计划必须在设备或平台消费上述未支持能力前完成，不把未知语义降级成永久排除区。
+
+## 首批设备路线的边界
+
+2026-10-23 [设备方案](todo-2026-09-device-system-design.md#首批端到端平台路线)选择 QEMU virt PCI xHCI，DMA 使用普通固定长度 MemoryObject，由独立 backing use 保活，不使用专用 memory-region 或 reusable loan。因此该路线需要实际 IO/IRQ/DMA 根、可信平台布局及 pin 合同，不需要先实现动态保留区和借出回收。
+
+平台导入仍完整消费现有静态排除事实；出现未支持动态/reusable 描述按现有 fail-closed 边界拒绝，设备有 memory-region 依赖而无法提供对应 region 能力时拒绝绑定，不忽略属性继续使用普通 RAM。后续真实平台、设备或 firmware 需要这些能力时重新触发本篇，按下方完整门实施；本次不宣称 region/reusable 设计或实现完成。
 
 ## 外部契约
 

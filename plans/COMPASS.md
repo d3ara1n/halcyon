@@ -8,8 +8,9 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。轻量任务及本轮文档范围见[收口记录](todo-2026-09-29-system-redesign.md#近期轻量收口与本轮整理)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：可与FAL并行设计。
+3. [设备体系整体设计](todo-2026-09-device-system-design.md#当前进度与接力)：当前设计基线与后续收敛入口；装配、内存资源及故障终局按各自契约接续，施工另行授权。
 4. [正式服务装配与监督](todo-2026-10-07-service-assembly.md)：通用装配关系可先设计，设备特有接线按设备前置。
+5. [系统关机编排与设备故障终局](todo-2026-09-system-shutdown-orchestration.md#设备管理故障的接点)：设备管理故障接点随设备设计推进；正式长期服务的整体收束由本案闭合。
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。
 
@@ -32,9 +33,8 @@
 |---|---|
 | [不可信域metadata硬隔离](todo-2026-09-14-kernel-memory-budget.md) | 开放不可信创建域或承诺独立硬容量隔离前；已有双维Pool付款不重做 |
 | [FAL 扩展操作](todo-2026-09-fal-extended-operations.md) | 范围外操作出现真实消费者 |
-| [平台保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) | 正式设备/DMA 接入前 |
-| [设备与中断审查承接](todo-2026-08-26-review-carryover.md) | 设备/中断设计开始 |
-| [系统关机编排](todo-2026-09-system-shutdown-orchestration.md) | 正式长期服务需关机收束，或对外承诺优雅关机前 |
+| [平台保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) | 平台/设备消费动态保留区、memory-region 或 reusable 前 |
+| [设备与中断审查承接](todo-2026-08-26-review-carryover.md) | IRQ 实施时核对设计重审约束及运行验证门 |
 | [电源管理服务](todo-2026-09-power-management-service.md) | 独立电源管理需求明确后 |
 | [内核最终架构审查](todo-2026-09-kernel-final-architecture-review.md) | 主要用户态消费者及计划所列主线前置完成后 |
 | [Halcyon std 平台层](todo-2026-09-28-halcyon-std.md) | 出现必须依赖 std 的真实第三方需求 |

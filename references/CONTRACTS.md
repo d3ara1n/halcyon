@@ -62,6 +62,10 @@
 | NUMA distance map | `normative/devicetree-schema-v2026.06/numa-distance-map-v1.yaml` |
 | RISC-V CPU 节点、现代 `riscv,isa-base`/`riscv,isa-extensions` | `normative/riscv-dt-bindings-linux-818bebeb/cpus.yaml`、`extensions.yaml` |
 
+## 设备平台与总线
+
+本轮固定证据、具体章节和模拟器限制统一见[设备平台取证](../plans/ref-2026-10-23-device-platform-contracts.md)：PLIC 1.0.0、xHCI 1.2b、USB 2.0、HID 1.11/Usage Tables 1.4，以及 QEMU v11.1.0 virt/PCI/USB/QMP。该记录只提供外部事实，目标接口由设备计划拥有，不表示硬件接入已验收。
+
 ## Rust 语言与共享内存访问
 
 本轮取证版本：rustc `c54751567b19c4ceb08b0412d83529c2568cba8b`（1.100.0-nightly，LLVM 23.1.0）。仓库当前使用浮动 nightly，实施时须记录实际版本并核对代码生成；证据边界见 [`共享访问取证`](../plans/ref-2026-09-shared-memory-access.md)。
