@@ -86,7 +86,7 @@ OAL 是虚拟投影，不是全系统实际树。srv_device 可以拥有真实�
 | ClaimSourceAdmin | 封本来源并停止其已提交绑定；交给 init，申请角色不能解封 |
 | BindingControl | 查询/停止这一轮，发行 BindingUse、安装不透明激活观察入口和功能关联；srv_driver 持有 |
 | BindingUse | 逐名取本轮资源、观察本轮停止；驱动持有，不默认能 Claim、复位其他设备或管理来源 |
-| Provision | 本登记单元的准备/查询/停止/结果副本；仅 srv_device 持有调用角色 |
+| Provision | 本登记单元的准备/停止/结果接口；仅 srv_device 持有调用角色，backing 不可 Claim 或持其他能力 |
 
 `Claim(DeviceId,expected_epoch)` 先本地准入并提交唯一占用，再由稳定任务推进资源准备。提交前预留 Binding、控制出口、准备任务和清理跟踪；没有远程调用夹在本地提交里。提交后回复失败不回滚，责任不再依赖申请者继续调用。
 
@@ -111,7 +111,7 @@ OAL 是虚拟投影，不是全系统实际树。srv_device 可以拥有真实�
 
 每个登记单元有**一个 Provision owner**。它可组合多个供应者，内部顺序、部分失败和回滚由该具体 backing 拥有；libdevice 不设计供应 DAG、k 方事务或时钟私有操作。无可用供应时返回明确拒绝，或由匹配者在真实领域变化后再尝试，不隐式无限重试。
 
-Provision 状态为 `{closed_epoch, active: None | (epoch, Preparing|Prepared|Stopping)}`。高水位表示该 provider 的硬件轮次已安全关闭，区别于 srv_device 的占用轮次，不是重复占用表。每个已发行 Provision 入口保留小壳至入口寿命结束；NotFound 不作为安全完成，provider 消失返回 Unavailable。
+Provision 状态为 `{closed_epoch, active: None | (epoch, Preparing|Prepared|Stopping)}`。`closed_epoch` 是 backing 内部的硬件轮次高水位，区别于 srv_device 的占用轮次；e≤closed_epoch 可 O(1) 判定该轮已安全关闭，不保留逐轮历史结果。每个已发行 Provision 入口保留小壳至入口寿命结束；NotFound 不作为安全完成，provider 消失返回 Unavailable。srv_device 若在期限内未收到 Prepared/Rejected/Failed，直接调用 Stop(e) 中止并以新 epoch 重试，不另行轮询进度。
 
 | 操作/结果 | 合同 |
 |---|---|
@@ -121,7 +121,6 @@ Provision 状态为 `{closed_epoch, active: None | (epoch, Preparing|Prepared|St
 | `Prepared(e,count)` | 整表已冻结；逐索引 `GetPreparedResource(e,index)` 返回同一表项的 capability 别名及 name/type/rights/metadata；重复不重新分配业务资源 |
 | `Stop(e)` | 幂等；未有 active 的合法下一轮也能先封闭，迟到 Prepare 不再开始；已有 active 则取消准备、停止资源并保留责任。封准入不要求立刻撤掉协作停止仍需的 MMIO/IRQ |
 | `ConfirmStopped(e)` | srv_device 转交本轮受权的协作停止事实；重复无新效果，旧轮不作用于新轮。只改变停止所需证据，不自行产生 Closed，provider 仍须完成资源控制与退休 |
-| `Query(e)` | 返回 Preparing/Prepared/Stopping/Closed；e≤closed_epoch 可 O(1) 返回 Closed，不保留逐轮历史结果 |
 | `Closed(e)` | 对该轮准备效果、派生 use、在途硬件访问与实际释放条件的保证；不是仅关闭 endpoint 或超时 |
 
 调用权限限定到本实例及由 srv_device 发行的合法轮次，不接纳任意跳跃 e。准备可能改变硬件，必须从一开始归原 Binding；不能把有副作用工作提前到 Claim 提交前。
@@ -132,7 +131,7 @@ srv_device 在 Prepared 后逐项取得表，校验唯一单分量名字、capab
 
 Get 可重试的含义仅为“不重复分配业务资源”；仍产生消息、Delivery、句柄和元数据费用。首批只接纳可别名角色，没有 taken 位、归还再取或仿射转移。供应/总线 session 的独占与终态由自身协议保证，管理者保留副本不改变其合同。
 
-Stopping 时立即拒绝新 Get。晚到 Prepared/表项副本仍归旧 Binding，关闭副本并继续 Stop/Query，不能交给新驱动。Closed 后迟到别名必须已经不能重新产生使用，仍按 RPC 收尾释放运输费用。provider 死亡只结束等待，不等于效果已结束；无硬件/资源证据便保持隔离并升级故障。
+Stopping 时立即拒绝新 Get。晚到 Prepared/表项副本仍归旧 Binding，关闭副本并继续 Stop 收尾，不能交给新驱动。Closed 后迟到别名必须已经不能重新产生使用，仍按 RPC 收尾释放运输费用。provider 死亡只结束等待，不等于效果已结束；无硬件/资源证据便保持隔离并升级故障。
 
 ## 驱动发现、按需激活与设备绑定
 
@@ -150,12 +149,12 @@ init 启动管理基座并委托唯一自动选择范围；srv_driver 订阅设�
 
 1. srv_driver 选择候选并 Claim；未知结果恢复原轮或 StopClaim。资源就绪前不激活程序使用硬件。
 2. 取得 ResourcesReady 后，按声明选择可复用且有容量的进程，或用受托 Job/libprocess 启动。首批 PCI host、xHCI 各为隔离进程；HID worker 可承载多个接口，容量来自实际预算配置。
-3. 以 `Activate(BindingRef,BindingUse,identity)` 交给驱动。worker 按 BindingRef 去重；相同请求返回原激活状态，不再初始化一次。身份/入口不一致返回 Conflict。一个未完成激活有一份任务及预留状态，回复丢失由管理者 QueryActivation 恢复。
+3. 以 `Activate(BindingRef,BindingUse,identity)` 交给驱动。worker 按 BindingRef 去重；相同请求返回原激活状态，不再初始化一次。身份/入口不一致返回 Conflict。一个未完成激活有一份任务及预留状态，回复丢失由管理者重试同一 Activate 恢复（Activate 幂等，相同 BindingRef 返回原激活状态及当前阶段）。
 4. 驱动逐名解码资源、检查类型和元数据、探测/初始化。失败报告 Failed，由管理者停止原绑定；探测碰过硬件后不能当作无效果拒绝。
 5. 驱动 `Ready(function_root,description)` 交付一个 OAL 功能根。srv_driver 凭 BindingControl 安装该根及激活观察关联；同一根的重复安装幂等，不同根 Conflict。只允许 ResourcesReady 且尚未 Stop 的本轮安装；迟到 Ready 不发布，直接收尾。
 6. 按装配需要发布 Registry 或用途视图。发布不是 Binding/设备/Registry 的全局事务；必选出口失败则该能力激活失败并停止，可选出口失败只降级诊断。首批必要出口为设备 functions，Registry 是可选别名。
 
-驱动激活阶段为 Starting/Ready/Stopping/Stopped 或 Failed 诊断；它不复制设备绑定状态。Ready 只表示本次功能可受理，Stopped 报告是协作证据，硬件是否安全仍由 Provision/资源控制确认。管理者通过 BindingControl 的 `ReportStopped` 转交报告，srv_device 向原 Provision 调用 ConfirmStopped；两者按 BindingRef 幂等，停止期间仍可调用。需要将受信物理主控报告作为静止依据时，相关受托角色必须在装配时具备该证据提交权限，不能从声明/tag 中自授；无此权限的报告仅是诊断。
+驱动激活阶段为 Starting/Ready/Stopping/Terminal(ok|error)；两种终态统一，区别仅在有无错误原因，后续处理路径相同。它不复制设备绑定状态。Ready 只表示本次功能可受理，Terminal 报告是协作证据，硬件是否安全仍由 Provision/资源控制确认。ReportStopped/ConfirmStopped 报告链**只在声明了 TrustedPhysical DMA 主控角色的设备**停止路径中使用：管理者通过 BindingControl 的 `ReportStopped` 转交，srv_device 向原 Provision 调用 ConfirmStopped；两者按 BindingRef 幂等，停止期间仍可调用。非 DMA 设备的停止仅走 Provision.Stop 控制侧路径，不需要此报告链。受信物理主控角色必须在装配时具备该证据提交权限，不能从声明/tag 中自授；无此权限的报告仅是诊断。
 
 `StopActivation(ref,deadline)` 幂等，禁止该激活新业务，推进既有请求收尾；其后迟到 Activate 不重新启动同一 ref。重复记录保留至该 Binding 已 Released 且控制关系退休，容量随真实记录付款。一个进程死亡时停止其全部绑定；进程复用节省启动成本，也明确扩大故障影响范围。
 
@@ -329,6 +328,8 @@ HID 驱动校验 boot keyboard 描述并 SET_PROTOCOL(0)，消费 8 字节报告
 ## 当前进度与接力
 
 2026-10-23：在 `refactor/system-redesign`、代码核对基线 `efd29c3` 上完成当前目标方案整理，主代理承担架构选择，ClearHare 参与边界与反例检查，研究子任务核实固定平台资料。前轮身份/Claim/控制根结论已并入正文；本轮补齐登记 Unknown、Provision、冻结表、观察/激活/发布、MMIO/IRQ/DMA、首批热插与故障终局。历史讨论不再作为下一步导航。
+
+2026-10-23（方案收敛）：删除 `Provision.Query(e)` 操作，改用"期限到期→Stop(e)→新 epoch 重试"恢复模式（backing 内部仍以 `closed_epoch` O(1) 判定旧轮，不改变其状态语义）；删除 `QueryActivation`，Activate 本身幂等，重试即恢复；合并驱动激活两个终态为 `Terminal(ok|error)`（Stopped/Failed 后续处理路径相同）；明确 ReportStopped/ConfirmStopped 报告链仅适用于 TrustedPhysical DMA 主控设备，其他设备停止只走 Provision.Stop。上述均为减法收敛，未改变占用提交语义、付款责任链、resource 冻结合同或资源安全属性。
 
 **下一步继续在本篇及所属专题收敛和完善设计，再决定施工准入。** 用户本轮确认先整理提交，后续根据计划和方案继续讨论；提交是保存可追溯的设计基线，不表示全部接口已最终冻结或已授权写代码。当前所有新资源 ABI、srv_device/srv_driver、驱动库/程序与设备 Watch 均未实现；现有 trap 尚无外部设备 IRQ 接入，DTB 用户态交付亦待接线。完整能力完成必须有真实消费者和故障验证，不能用本文提交替代。
 
