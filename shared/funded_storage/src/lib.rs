@@ -1,5 +1,5 @@
 #![no_std]
-#![feature(allocator_api, box_into_inner)]
+#![feature(allocator_ext, box_into_inner)]
 
 //! 固定布局的已付款存储。付款来源由调用者选择；存储 owner 保留唯一 charge。
 //! 不隐式增长或缩容；替换只搬移现有元素，并将旧空块返给调用者锁外释放。

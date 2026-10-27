@@ -1,0 +1,14 @@
+[package]
+name = "libdriver"
+version = "0.1.0"
+edition = "2024"
+description = "Driver declarations, selection, and activation protocol"
+
+[dependencies]
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libdevice = { path = "../libdevice" }
+libkernel = { path = "../libkernel" }
+librpc = { path = "../librpc" }
+liboal = { path = "../liboal" }
+libbudget = { path = "../libbudget" }
+libexecution = { path = "../libexecution" }

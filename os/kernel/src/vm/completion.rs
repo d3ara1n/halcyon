@@ -7,6 +7,7 @@ use super::change::VmAccessLease;
 use crate::task::{resources::MetadataCharge, wait_source::SignalSource};
 
 pub(super) struct Completion {
+    pub(super) publication: Option<crate::resource::mmio::MmioPublication>,
     metadata: Option<MetadataCharge>,
     access: Option<VmAccessLease>,
     source: Arc<SignalSource>,
@@ -21,6 +22,7 @@ impl Completion {
         internal: bool,
     ) -> Self {
         Self {
+            publication: None,
             metadata: Some(metadata),
             access,
             source,
@@ -46,6 +48,9 @@ impl Drop for Completion {
         // 先退宿主费，再交回访问资格，最后发布独立观察来源的终态。
         drop(self.metadata.take());
         drop(self.access.take());
+        // Map 片段可能已经归还，但原操作的发布/回滚责任直到此处才结束。
+        // 此时不持 VM/Views 锁；资源门与等待来源均在自己的同步域内完成。
+        drop(self.publication.take());
         if self.internal {
             self.source.complete_internal();
         } else {

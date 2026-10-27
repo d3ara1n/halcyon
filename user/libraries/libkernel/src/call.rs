@@ -22,6 +22,185 @@ use num_traits::FromPrimitive;
 
 type SystemCallResult<T> = Result<T, SystemCallError>;
 
+pub(crate) fn sys_dma_create(
+    source: Handle,
+    rights: Rights,
+    control: bool,
+) -> SystemCallResult<Handle> {
+    sys_call(
+        if control {
+            SystemCall::DmaCreateControl
+        } else {
+            SystemCall::DmaCreateUse
+        },
+        source.raw() as usize,
+        rights.raw() as usize,
+        0,
+        0,
+    )
+    .map(|value| Handle::from_raw(value as u64))
+}
+pub(crate) fn sys_dma_domain_query(
+    source: Handle,
+    output: &mut erhino_shared::dma::DomainSnapshot,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::DmaDomainQuery,
+        source.raw() as usize,
+        output as *mut _ as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+pub(crate) fn sys_dma_mapping_query(
+    source: Handle,
+    output: &mut erhino_shared::dma::MappingSnapshot,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::DmaMappingQuery,
+        source.raw() as usize,
+        output as *mut _ as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+pub(crate) fn sys_dma_seal(source: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::DmaSeal, source.raw() as usize, 0, 0, 0).map(|_| ())
+}
+pub(crate) fn sys_dma_pin(
+    source: Handle,
+    request: &erhino_shared::dma::PinRequest,
+) -> SystemCallResult<Handle> {
+    sys_call(
+        SystemCall::DmaPin,
+        source.raw() as usize,
+        request as *const _ as usize,
+        0,
+        0,
+    )
+    .map(|value| Handle::from_raw(value as u64))
+}
+pub(crate) unsafe fn sys_dma_read(
+    source: Handle,
+    request: &erhino_shared::dma::ReadRequest,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::DmaReadSegments,
+        source.raw() as usize,
+        request as *const _ as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+pub(crate) fn sys_dma_retire(source: Handle, target: Handle) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::DmaRetire,
+        source.raw() as usize,
+        target.raw() as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn sys_irq_create(
+    parent: Handle,
+    scope: &erhino_shared::irq::IrqScope,
+    rights: Rights,
+    control: bool,
+) -> SystemCallResult<Handle> {
+    sys_call(
+        if control {
+            SystemCall::IrqCreateControl
+        } else {
+            SystemCall::IrqCreateUse
+        },
+        parent.raw() as usize,
+        scope as *const _ as usize,
+        rights.raw() as usize,
+        0,
+    )
+    .map(|value| Handle::from_raw(value as u64))
+}
+pub(crate) fn sys_irq_query(
+    handle: Handle,
+    output: &mut erhino_shared::irq::IrqSnapshot,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::IrqQuery,
+        handle.raw() as usize,
+        output as *mut _ as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+pub(crate) fn sys_irq_seal(handle: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::IrqSeal, handle.raw() as usize, 0, 0, 0).map(|_| ())
+}
+pub(crate) fn sys_irq_revoke(handle: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::IrqRevoke, handle.raw() as usize, 0, 0, 0).map(|_| ())
+}
+pub(crate) fn sys_irq_take(handle: Handle) -> SystemCallResult<u64> {
+    sys_call(SystemCall::IrqTake, handle.raw() as usize, 0, 0, 0).map(|value| value as u64)
+}
+pub(crate) fn sys_irq_ack(
+    handle: Handle,
+    token: erhino_shared::irq::IrqToken,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::IrqAck,
+        handle.raw() as usize,
+        token.generation as usize,
+        token.sequence as usize,
+        0,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn sys_mmio_create(
+    parent: Handle,
+    offset: usize,
+    bytes: usize,
+    rights: Rights,
+    control: bool,
+) -> SystemCallResult<Handle> {
+    sys_call(
+        if control {
+            SystemCall::MmioCreateControl
+        } else {
+            SystemCall::MmioCreateUse
+        },
+        parent.raw() as usize,
+        offset,
+        bytes,
+        rights.raw() as usize,
+    )
+    .map(|value| Handle::from_raw(value as u64))
+}
+pub(crate) fn sys_mmio_seal(source: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::MmioSeal, source.raw() as usize, 0, 0, 0).map(|_| ())
+}
+pub(crate) fn sys_mmio_revoke(source: Handle) -> SystemCallResult<()> {
+    sys_call(SystemCall::MmioRevoke, source.raw() as usize, 0, 0, 0).map(|_| ())
+}
+pub(crate) fn sys_mmio_query(
+    source: Handle,
+    output: &mut erhino_shared::mmio::MmioSnapshot,
+) -> SystemCallResult<()> {
+    sys_call(
+        SystemCall::MmioQuery,
+        source.raw() as usize,
+        output as *mut _ as usize,
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
 fn to_error(error: usize) -> SystemCallError {
     if let Some(ret) = SystemCallError::from_usize(error) {
         ret

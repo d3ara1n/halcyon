@@ -21,6 +21,8 @@ const CHUNK: usize = PAYLOAD_MAX - 256;
 const LENGTH: usize = CHUNK * 6;
 const SOURCE: &str = "/primary/init-copy-source";
 const PROPERTY: &str = "/primary/init-copy-property";
+// 整次真实Copy验收的绝对防挂死预算；不限制provider性能/租约，不随步骤续期。
+const COPY_SCENARIO_TIMEOUT_MILLIS: u64 = 20_000;
 
 fn namespace(
     primary: &MailboxSender,
@@ -54,12 +56,18 @@ fn task(
     destination: &str,
     kind: Kind,
 ) -> Result<CopyTask, &'static str> {
-    let budget = limits()
-        .start(
-            libkernel::time::snapshot().map_err(|_| "Copy clock failed")?,
-            deadline()?,
-        )
+    let clock = libkernel::time::snapshot().map_err(|_| "Copy clock failed")?;
+    let until = libkernel::time::timeout_millis(COPY_SCENARIO_TIMEOUT_MILLIS)
+        .map_err(|_| "Copy scenario deadline failed")?;
+    let budget = super::limits_with_timeout(COPY_SCENARIO_TIMEOUT_MILLIS * 1_000_000)
+        .start(clock, until)
         .map_err(|_| "Copy budget invalid")?;
+    libkernel::debug!(
+        "Copy scenario budget started: destination={}, start_ns={}, end_ns={}",
+        destination,
+        clock.now_ns,
+        budget.deadline().at_ns
+    );
     CopyTask::new(
         ns.clone(),
         source,
@@ -218,6 +226,12 @@ pub(crate) fn exercise(
         ],
     )?;
     root.await_copy_progress(0, 1)?;
+    libkernel::debug!(
+        "Copy cancellation synchronous prefix observation started: now_ns={}",
+        libkernel::time::snapshot()
+            .map_err(|_| "Copy progress clock failed")?
+            .now_ns
+    );
     // 暂不推进客户端 Copy，以正式 ReadAt 确认目标已提交非零前缀。
     // provider 独立推进；它同一次 advance 在 commit 后更新 accepted，
     // 因而后继 ReadAt 可见数据时已越过接受点，不依赖调度碰巧命中。
@@ -238,8 +252,20 @@ pub(crate) fn exercise(
             return Err("Copy destination did not accept transported prefix");
         }
     }
+    libkernel::debug!(
+        "Copy cancellation synchronous prefix observation ended: now_ns={}",
+        libkernel::time::snapshot()
+            .map_err(|_| "Copy progress clock failed")?
+            .now_ns
+    );
     root.cancel_copy(0)?;
     let outcomes = finish(root)?;
+    libkernel::debug!(
+        "Copy concurrent cancellation outcomes ready: now_ns={}",
+        libkernel::time::snapshot()
+            .map_err(|_| "Copy progress clock failed")?
+            .now_ns
+    );
     let transported = match outcomes[0].outcome {
         Some(Outcome::Failed {
             creation: Creation::Created,
@@ -258,7 +284,11 @@ pub(crate) fn exercise(
         }
     };
     if !matches!(outcomes[1].outcome, Some(Outcome::Complete { .. })) {
-        return Err("Copy cancellation affected other task");
+        libkernel::debug!(
+            "Copy concurrent task expected completion: {:?}",
+            outcomes[1].outcome
+        );
+        return Err("Copy concurrent task did not complete");
     }
     contents(&mut client, "/secondary/init-copy-concurrent", LENGTH)?;
     let prefix = client

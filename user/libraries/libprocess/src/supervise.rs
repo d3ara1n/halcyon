@@ -354,15 +354,13 @@ impl<O: ProcessOperations> SuperviseTask<O> {
     }
 }
 
-impl<O: ProcessOperations, W: SuperviseSink<O>> Task<W> for SuperviseTask<O> {
-    type Family = Self;
-    fn advance(
+impl<O: ProcessOperations> SuperviseTask<O> {
+    /// 组合进已有异构任务族；沿原 Collector/Observation 推进，不另建运行体。
+    pub fn advance_in<W: SuperviseSink<O>, F>(
         &mut self,
-        _id: u64,
         world: &mut W,
-        requests: &mut Requests<'_, Self>,
+        requests: &mut Requests<'_, F>,
         input: &mut Input<'_>,
-        _budget: usize,
     ) -> Result<Advance, SystemCallError> {
         let now = input.now_ns();
         // 观察与重试均以机器持有的绝对期限判定；到期输入每次只消费一次。
@@ -439,6 +437,19 @@ impl<O: ProcessOperations, W: SuperviseSink<O>> Task<W> for SuperviseTask<O> {
             StepOutcome::Done(done) => Ok(self.deliver(world, Ok(done))),
             StepOutcome::Escalate(failure) => Ok(self.deliver(world, Err(failure))),
         }
+    }
+}
+impl<O: ProcessOperations, W: SuperviseSink<O>> Task<W> for SuperviseTask<O> {
+    type Family = Self;
+    fn advance(
+        &mut self,
+        _id: u64,
+        world: &mut W,
+        requests: &mut Requests<'_, Self>,
+        input: &mut Input<'_>,
+        _budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        self.advance_in(world, requests, input)
     }
     fn registered(&mut self, _world: &mut W, kind: SourceKind, source: SourceId) {
         self.observation.registered(kind, source);

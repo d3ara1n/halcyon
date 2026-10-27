@@ -1,0 +1,15 @@
+[package]
+name = "test_device"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libruntime = { path = "../../libraries/libruntime" }
+libkernel = { path = "../../libraries/libkernel" }
+libdevice = { path = "../../libraries/libdevice" }
+libusb = { path = "../../libraries/libusb" }
+libhid = { path = "../../libraries/libhid" }
+liboal = { path = "../../libraries/liboal" }
+librpc = { path = "../../libraries/librpc" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libdriver = { path = "../../libraries/libdriver" }

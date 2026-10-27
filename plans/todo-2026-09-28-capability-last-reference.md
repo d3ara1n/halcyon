@@ -252,6 +252,7 @@ MANAGE 跨对象共用不相互授权。同一对象出现需独立委托的控�
 - **两层线性化**：普通 Sender 在表锁下接受 WRITE 并取得 LifetimeUse，不抽取 capability；OnceSender 与附带移交的 handle 使用 `CapTable.claim` 仲裁 Close/Move 与消费接管。`MailboxCore` 锁仲裁 queue.open 与入队。入队成功与 OnceSender `Pending → Sent` 同一 core 临界区完成；Receiver shut 先到则发送失败、不消耗额度；入队先到则为已接受消息，按既定退休责任收束。OnceSender 业务状态由 core 锁保护，无对象锁↔core 锁双序。
 - `MailboxOnceSender`（设计轮次 4，用户确认采用观察壳）：每次派生铸造新对象，不授予 DUPLICATE；“一次性”不做成 rights 位。出生时与一个 `ReplyObservation` 观察对象配对，由派生调用者持有其 capability；结果以持久电平 + 结果查询表达 `Sent | Abandoned`，**不向普通队列注入放弃消息**，因而无满箱、无完成队列与预付额度政策。
   - 发送：`claim → commit_claim` move 消费；core 锁内入队并转 Sent，置观察电平。
+  - 付款：发行 Once 即以 make_send_once 调用者进程 Pool 委托至多一次成功、ABI 有界消息的实际运输；从原 Once metadata charge 的 payer 取唯一账户，持有/移交不改变它。Send 取得独占 claim 并校验 Pending 后，同一 payer 覆盖输入复制、全部 scratch、payload/handles 和 Delivery（包括接收后尾部）；Receive 表安装仍由接收者付款。失败按原调用返还并退瞬态费用，不预付最大正文、不保证回复必成，也不承诺重试总 CPU 预算。普通 Sender 仍由实际发送进程付款。费用随存储实际寿命，不因发行者死亡提前退款；本轮实施与证据由[设备计划](todo-2026-09-device-system-design.md#设计修订once-的一次运输付款授权)拥有。
   - 失败：restore 走 `CapTable` 既有协议；返还资格已撤销则返回 `LastCapability`，锁外转 Abandoned；否则恢复原 handle，不置 Abandoned。随消息 move 的 capability 整体恢复或按各自资格收束。
   - 放弃：最后 capability 消失仍 Pending → core 锁内转 Abandoned 并置观察电平；本地 Close 与 transit 释放走同一路径。无分配、不阻塞。
   - armed：authority 成功发布才承担放弃可见性；构造/安装失败只退款，不产生 Abandoned。

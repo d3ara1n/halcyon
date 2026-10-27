@@ -13,7 +13,7 @@ BackingUse、区间切分、物理投影及逐段退款详见 [mm.md 的分段 b
 ## 公共调用与观察
 
 - MemoryObjectCreate 从当前进程的 funding Pool 取得 backing，按页取整固定长度；当前同步资金准备/清零仍受 ABI 页数上限与 funding extent 上限约束。Close 的工作量由预付退休记录界定，页数上限不再以同步析构为理由。
-- MemoryObjectQuery 在 READ authority 接管期间读取固定宽快照，identity 仅作诊断。
+- MemoryObjectQuery 在 READ authority 接管期间读取固定宽快照，identity 仅作诊断；write_permits 包含 CPU View 与 DMA 写者的独立许可。
 - MemoryObjectSeal 在 MANAGE authority 接管期间发起单向 seal，不等待；任意观察者通过 WaitOne 或显式扁平 WaitSet 观察 EXECUTABLE。
 
 Create/Query/Seal 使用 Body/AnySpace/uaccess/CapTable。Query/Seal 经 handle::Authorization 接受非消费授权并持调用者 BodyLease；core 快照与 seal 在表锁外，不抽取 capability，也不通过临时 Arc 延长 backing 的 root use。Create 的 caps/output 失败由 handle::install 的统一回滚接管。
@@ -24,13 +24,15 @@ EXECUTABLE 是唯一允许电平，普通 Close 不新增 CLOSED 信号。seal �
 
 ## View 准备与写许可
 
-MemoryObjectState 单向 Mutable → Sealing → Executable。Mutable 允许新的符合权限的 view；Sealing 拒绝新写授权，但允许既有 writable 区间切分/缩小所需的 replacement permits。最后 permit 取消或在 TLB 同步后退休，才完成 Executable 转换。任意状态拒绝超过最大 view 权限的授权。
+MemoryObjectState 单向 Mutable → Sealing → Executable。Mutable 允许新的符合权限的写者；Sealing 拒绝新写授权，但允许既有 writable CPU 区间切分/缩小所需的 replacement permits。最后 permit 取消或在所属领域同步后退休，才完成 Executable 转换。CPU View 仍按 TLB 合同收束，DMA 写者须满足受信设备完成合同；CPU 同步不能替 DMA 背书。任意状态拒绝超过最大 view 权限的授权。
 
 core 提供 ObjectViewAuthorization/WritePermit 的领域操作；当前没有独立的 PreparedObjectView 或裸 into_parts 交接层。mapper 在首份资源前出生统一 Operation/ChangeWork，借同代 handle 的存储身份到锁外，用触发调用者的 Pool 准备 Backing 双数组；这一步不接受 use。回来源表内重新核验 handle/rights/同一对象，再在 HANDLE_TABLE → MEMORY_OBJECT/BACKING 短边取得授权与独立 BackingUse，内层不收费、不析构候选、不发布维护任务。纯容量竞争退出表重采样；Close 先发生则最终接受失败，use先接受则不被随后 Close 撤销。旧/未用块由 Operation 带到所有高锁外释放；失败资源交原记录回滚，不通过 use Drop 另起任务。
 
 许可方法借caller预付的Buffer直接追加，在对象门内先检查状态、总数和剩余槽后才修改计数，不分配临时Vec。提交前用Views::hold_writes固定来源强根；准备失败以object+输出后缀先取消未挂索引的许可，挂入后经Views归还。Reserve借同一供给数组，把许可逐份移交ledger Region；失效准备通过冻结来源归还，不能回查可能变化的 live view。退休时事务/空间 Work 经 Views 直接完成本批 backing 退款，再在 VIEWS/VM/父 Work 锁外调用 retire_write。全对象 permit 数与本空间持有来源数的分工、精确 fragment 游标见 [mm.md](mm.md#实物-view-索引与退休组合)。
 
 ## 消费者边界
+
+`begin_pin` 只接受页对齐、checked 的 MemoryObject 区间，经 BackingAcquisition 保持分步取得所需的原 root use；具体内存责任见 [分段 backing](mm.md#分段-backing-与逐段退款)。`reserve_dma_write` 在原 MEMORY_OBJECT 门调用 `reserve_writes(1)`，取得与 CPU View 独立的 affine WritePermit，不伪造 replacement 或 VM 记录。设备只读方向不取得写许可；设备写方向在 Sealing/Executable 被拒绝。DMA owner 保持实际 core 与 permit，可信退休后归还，取消未暴露准备也通过原取消入口归还。地址暴露、静态保留及权限由 [设备实现](device.md#dma-稳定-pin-与地址交付)拥有。
 
 core/Create/Query/Seal 与当前进程 mapper 使用同一 backing/View 链。Tunnel Connection 在两侧都关闭前持 BackingOwner，Endpoint 的普通 View 各自持独立 BackingUse；两端授权关闭不撤销已接受 View。MemoryObjectCore 与连接的普通 Arc 只保留存储，不承担 backing 的业务寿命。
 

@@ -269,10 +269,128 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
             );
             Outcome::Completed
         }
+        SystemCall::MmioCreateControl | SystemCall::MmioCreateUse => {
+            match crate::resource::mmio::object::create(
+                thread,
+                Handle::from_raw(frame.x[10]),
+                frame.x[11] as usize,
+                frame.x[12] as usize,
+                Rights::from_raw(frame.x[13]),
+                matches!(call, SystemCall::MmioCreateControl),
+            ) {
+                Ok(pending) => {
+                    task::request::start(thread, pending);
+                    Outcome::Requeue
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
+        }
+        SystemCall::MmioSeal | SystemCall::MmioRevoke | SystemCall::MmioQuery => {
+            let handle = Handle::from_raw(frame.x[10]);
+            let result = match call {
+                SystemCall::MmioSeal => crate::resource::mmio::object::seal(thread, handle),
+                SystemCall::MmioRevoke => crate::resource::mmio::object::revoke(thread, handle),
+                _ => crate::resource::mmio::object::query(thread, handle, frame.x[11] as usize),
+            };
+            respond_result(frame, result.map(|_| 0));
+            Outcome::Completed
+        }
+        SystemCall::IrqCreateControl | SystemCall::IrqCreateUse => {
+            match crate::resource::irq::object::create(
+                thread,
+                Handle::from_raw(frame.x[10]),
+                frame.x[11] as usize,
+                Rights::from_raw(frame.x[12]),
+                matches!(call, SystemCall::IrqCreateControl),
+            ) {
+                Ok(pending) => {
+                    task::request::start(thread, pending);
+                    Outcome::Requeue
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
+        }
+        SystemCall::IrqQuery
+        | SystemCall::IrqSeal
+        | SystemCall::IrqRevoke
+        | SystemCall::IrqTake
+        | SystemCall::IrqAck => {
+            use crate::resource::irq::object as irq;
+            let handle = Handle::from_raw(frame.x[10]);
+            let result = match call {
+                SystemCall::IrqQuery => irq::query(thread, handle, frame.x[11] as usize).map(|_| 0),
+                SystemCall::IrqSeal => irq::seal(thread, handle).map(|_| 0),
+                SystemCall::IrqRevoke => irq::revoke(thread, handle).map(|_| 0),
+                SystemCall::IrqTake => irq::take(thread, handle),
+                _ => irq::ack(
+                    thread,
+                    handle,
+                    erhino_shared::irq::IrqToken {
+                        generation: frame.x[11],
+                        sequence: frame.x[12],
+                    },
+                )
+                .map(|_| 0),
+            };
+            respond_result(frame, result);
+            Outcome::Completed
+        }
+        SystemCall::DmaCreateControl
+        | SystemCall::DmaCreateUse
+        | SystemCall::DmaPin
+        | SystemCall::DmaReadSegments
+        | SystemCall::DmaRetire => {
+            use crate::resource::dma::object as dma;
+            let source = Handle::from_raw(frame.x[10]);
+            let result = match call {
+                SystemCall::DmaCreateControl | SystemCall::DmaCreateUse => dma::create(
+                    thread,
+                    source,
+                    Rights::from_raw(frame.x[11]),
+                    matches!(call, SystemCall::DmaCreateControl),
+                ),
+                SystemCall::DmaPin => dma::pin(thread, source, frame.x[11] as usize),
+                SystemCall::DmaReadSegments => {
+                    dma::read_segments(thread, source, frame.x[11] as usize)
+                }
+                _ => dma::retire(thread, source, Handle::from_raw(frame.x[11])),
+            };
+            match result {
+                Ok(pending) => {
+                    task::request::start(thread, pending);
+                    Outcome::Requeue
+                }
+                Err(error) => {
+                    respond_error(frame, error);
+                    Outcome::Completed
+                }
+            }
+        }
+        SystemCall::DmaDomainQuery | SystemCall::DmaMappingQuery | SystemCall::DmaSeal => {
+            use crate::resource::dma::object as dma;
+            let source = Handle::from_raw(frame.x[10]);
+            let result = match call {
+                SystemCall::DmaDomainQuery => {
+                    dma::query_domain(thread, source, frame.x[11] as usize)
+                }
+                SystemCall::DmaMappingQuery => {
+                    dma::query_mapping(thread, source, frame.x[11] as usize)
+                }
+                _ => dma::seal(thread, source),
+            };
+            respond_result(frame, result.map(|_| 0));
+            Outcome::Completed
+        }
         SystemCall::MemoryMap => match crate::vm::operation::memory_map(thread, a0) {
-            Ok(plan) => {
-                sched::park_request_wait(plan);
-                Outcome::Wait
+            Ok(pending) => {
+                task::request::start(thread, pending);
+                Outcome::Requeue
             }
             Err(error) => {
                 respond_error(frame, error);
@@ -711,7 +829,7 @@ fn debug_print(frame: &mut UserContext, thread: &Thread) {
     respond_ok(frame, len);
 }
 
-fn respond_result(frame: &mut UserContext, result: Result<usize, SystemCallError>) {
+pub(crate) fn respond_result(frame: &mut UserContext, result: Result<usize, SystemCallError>) {
     match result {
         Ok(value) => respond_ok(frame, value),
         Err(error) => respond_error(frame, error),

@@ -1,0 +1,14 @@
+[package]
+name = "libdevice"
+version = "0.1.0"
+edition = "2024"
+description = "Device identity, publication, binding, and provisioning"
+
+[dependencies]
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libbudget = { path = "../libbudget" }
+libexecution = { path = "../libexecution" }
+libkernel = { path = "../libkernel" }
+liboal = { path = "../liboal" }
+librpc = { path = "../librpc" }
+ordered_table = { path = "../../../shared/ordered_table" }

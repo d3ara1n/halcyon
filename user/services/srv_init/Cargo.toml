@@ -8,11 +8,25 @@ edition = "2024"
 [features]
 default = []
 acceptance-stress = []
+acceptance-device = ["dep:test_device"]
+acceptance-device-reuse = ["acceptance-device"]
+acceptance-device-retry-race = ["acceptance-device-reuse"]
+acceptance-device-candidates = ["acceptance-device-reuse"]
+acceptance-device-function-session = []
+acceptance-mmio-publication = []
+acceptance-mmio-forced = []
+acceptance-dma-races = []
+acceptance-dma-shared = []
+acceptance-dma-quota = []
+acceptance-dma-install-failure = []
+acceptance-irq-retirement = ["acceptance-device-function-session"]
+acceptance-irq-exit = []
 acceptance-memory = ["acceptance-stress"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+dtb = { path = "../../../shared/dtb" }
 libkernel = { path = "../../libraries/libkernel" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 librunnel = { path = "../../libraries/librunnel" }
@@ -21,6 +35,10 @@ libprocess = { path = "../../libraries/libprocess", features = ["management"] }
 liboal = { path = "../../libraries/liboal" }
 libfs = { path = "../../libraries/libfs" }
 libservice = { path = "../../libraries/libservice" }
+libdevice = { path = "../../libraries/libdevice" }
+libpci = { path = "../../libraries/libpci" }
+libusb = { path = "../../libraries/libusb" }
+libdriver = { path = "../../libraries/libdriver" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
 libruntime = { path = "../../libraries/libruntime" }
@@ -29,3 +47,4 @@ lock_api = "0.4"
 test_fs = { path = "../../tests/test_fs" }
 srv_fs = { path = "../srv_fs" }
 tar = { path = "../../../shared/tar" }
+test_device = { path = "../../tests/test_device", optional = true }

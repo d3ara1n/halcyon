@@ -1,8 +1,8 @@
 //! Host 测试需显式指定 `--target aarch64-apple-darwin`。
 
 use memory_space::{
-    AddressRange, AllocationKey, AnonymousClass, BackingId, BackingView, ChangeError,
-    ExecutableState, FaultClass, LeaseKey, Limits, MapBacking, MapPlacement, MapRequest,
+    AddressRange, AllocationKey, AnonymousClass, BackingId, ChangeError, ExecutableState,
+    FaultClass, LeaseKey, Limits, MapPlacement, MapRequest, MappingOrigin, MappingSource,
     MemoryObjectState, MemorySpace as RawMemorySpace, ObjectError, ObjectId, PAGE_SIZE, PageRange,
     ProtectRequest, Protection, RangeError, RegionKindView, RegionOwner, SealOutcome,
     TranslationIntent, UnmapRequest, UserWriteLeaseRequest, ValidatedChange,
@@ -55,7 +55,7 @@ fn anonymous_map(
         current,
         maximum,
         owner,
-        backing: MapBacking::Anonymous {
+        backing: MappingSource::Anonymous {
             identity: backing(identity),
             class: if maximum == Protection::ReadExecute {
                 AnonymousClass::InitialExecutable
@@ -762,7 +762,7 @@ fn stale_validation_and_permit_mismatch_have_zero_ledger_side_effects() {
             current: Protection::ReadWrite,
             maximum: Protection::ReadWrite,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
             },
@@ -793,7 +793,7 @@ fn object_write_permit_retires_only_after_synchronization_and_finishes_seal() {
             current: Protection::ReadWrite,
             maximum: Protection::ReadWrite,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: PAGE_SIZE,
             },
@@ -869,7 +869,7 @@ fn sealing_allows_writable_view_shrink_but_rejects_reenable_write() {
             current: Protection::ReadWrite,
             maximum: Protection::ReadWrite,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
             },
@@ -973,7 +973,7 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
             current: Protection::ReadWrite,
             maximum: Protection::ReadWrite,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
             },
@@ -1010,7 +1010,7 @@ fn rollback_returns_reserved_permit_and_executable_object_rejects_reenable_write
             current: Protection::ReadOnly,
             maximum: Protection::ReadWrite,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: executable.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
             },
@@ -1070,7 +1070,7 @@ fn object_view_offsets_follow_exact_middle_split() {
             current: Protection::ReadOnly,
             maximum: Protection::ReadOnly,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: object.authorize_view(Protection::ReadOnly).unwrap(),
                 offset: PAGE_SIZE,
             },
@@ -1097,7 +1097,7 @@ fn object_view_offsets_follow_exact_middle_split() {
         .iter()
         .map(|region| match region.kind {
             RegionKindView::Mapping {
-                backing: BackingView::Object { offset, .. },
+                backing: MappingOrigin::Object { offset, .. },
                 ..
             } => offset,
             _ => unreachable!(),
@@ -1107,7 +1107,7 @@ fn object_view_offsets_follow_exact_middle_split() {
     assert!(matches!(
         batch[0].kind,
         RegionKindView::Mapping {
-            backing: BackingView::Object { offset, .. },
+            backing: MappingOrigin::Object { offset, .. },
             ..
         } if offset == 2 * PAGE_SIZE
     ));
@@ -1182,7 +1182,7 @@ fn capacity_geometry_and_backing_failures_are_atomic() {
                 current: Protection::ReadOnly,
                 maximum: Protection::ReadOnly,
                 owner: RegionOwner::AddressSpace,
-                backing: MapBacking::Object {
+                backing: MappingSource::Object {
                     authorization: object.authorize_view(Protection::ReadOnly).unwrap(),
                     offset: PAGE_SIZE,
                 },
@@ -1800,7 +1800,7 @@ fn completed_storage_reuses_capacity_with_caller_owned_permit_buffer() {
             current: Protection::ReadWrite,
             maximum: Protection::ReadWrite,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Object {
+            backing: MappingSource::Object {
                 authorization: object.authorize_view(Protection::ReadWrite).unwrap(),
                 offset: 0,
             },
@@ -1885,5 +1885,212 @@ fn rollback_storage_does_not_republish_aborted_retirement_fragments() {
     assert_eq!(fragment.range, PageRange::new(BASE, PAGE_SIZE).unwrap());
     assert!(retiring.is_empty());
     drop(space.complete(retiring));
+    assert_eq!(space.region_count(), 0);
+}
+
+fn mmio_map(id: u64, start: usize, pages: usize) -> MapRequest {
+    MapRequest {
+        bytes: pages * PAGE_SIZE,
+        guard_before: 0,
+        guard_after: 0,
+        placement: MapPlacement::FixedEmpty {
+            usable_start: start,
+        },
+        current: Protection::ReadWrite,
+        maximum: Protection::ReadWrite,
+        owner: RegionOwner::AddressSpace,
+        backing: MappingSource::Mmio {
+            mapping: memory_space::MappingId::new(id).unwrap(),
+            bytes: pages * PAGE_SIZE,
+        },
+        result: None,
+    }
+}
+
+#[test]
+fn mmio_is_nonexecutable_and_cannot_back_an_output_lease() {
+    let mut space = space();
+    let mut executable = mmio_map(1, BASE, 1);
+    executable.current = Protection::ReadExecute;
+    executable.maximum = Protection::ReadExecute;
+    assert!(matches!(
+        validate(&space, memory_space::ChangeRequest::Map(executable)),
+        Err(ChangeError::PermissionDenied)
+    ));
+    let mut oversized = mmio_map(1, BASE, 1);
+    oversized.bytes = 2 * PAGE_SIZE;
+    assert!(matches!(
+        validate(&space, memory_space::ChangeRequest::Map(oversized)),
+        Err(ChangeError::BackingOutOfRange)
+    ));
+    commit_map(&mut space, mmio_map(2, BASE, 2));
+    let origin = space.origin_at(BASE + PAGE_SIZE).unwrap();
+    assert!(!origin.is_ram());
+    assert_eq!(origin.offset(), PAGE_SIZE);
+    let mut request = anonymous_map(
+        3,
+        BASE + 4 * PAGE_SIZE,
+        1,
+        0,
+        0,
+        Protection::ReadWrite,
+        Protection::ReadWrite,
+        RegionOwner::AddressSpace,
+    );
+    request.result = Some(UserWriteLeaseRequest {
+        range: AddressRange::new(BASE, 8).unwrap(),
+    });
+    assert!(matches!(
+        validate(&space, memory_space::ChangeRequest::Map(request)),
+        Err(ChangeError::LeaseInvalid)
+    ));
+}
+
+#[test]
+fn forced_mmio_remove_preserves_reused_holes_and_split_identity() {
+    let mut space = space();
+    let mapping = memory_space::MappingId::new(10).unwrap();
+    commit_map(&mut space, mmio_map(mapping.get(), BASE, 3));
+    let validated = validate(
+        &space,
+        memory_space::ChangeRequest::Unmap(UnmapRequest {
+            range: PageRange::new(BASE + PAGE_SIZE, PAGE_SIZE).unwrap(),
+            authority: RegionOwner::AddressSpace,
+        }),
+    )
+    .unwrap();
+    let prepared = reserve_no_permits(&mut space, validated);
+    complete_prepared(&mut space, prepared);
+    commit_map(
+        &mut space,
+        anonymous_map(
+            11,
+            BASE + PAGE_SIZE,
+            1,
+            0,
+            0,
+            Protection::ReadWrite,
+            Protection::ReadWrite,
+            RegionOwner::AddressSpace,
+        ),
+    );
+    assert_eq!(
+        space.origin_at(BASE + 2 * PAGE_SIZE),
+        Some(MappingOrigin::Mmio {
+            mapping,
+            offset: 2 * PAGE_SIZE,
+        })
+    );
+    let mut storage = memory_space::ChangeStorage::default();
+    storage.prepare_forced_remove(&TestFunding).unwrap();
+    space.freeze_mapping(mapping).unwrap();
+    assert!(matches!(
+        space.reserve_forced_remove(mapping, BASE + PAGE_SIZE, &mut storage),
+        Err(ChangeError::Stale)
+    ));
+    for at in [BASE, BASE + 2 * PAGE_SIZE] {
+        let prepared = space
+            .reserve_forced_remove(mapping, at, &mut storage)
+            .unwrap();
+        let committed = commit_all(&mut space, prepared);
+        let mut retiring = space.synchronize(committed);
+        let fragment = retiring.pop_fragment().unwrap();
+        assert_eq!(fragment.range, PageRange::new(at, PAGE_SIZE).unwrap());
+        assert!(matches!(fragment.kind, RegionKindView::Mapping {
+            backing: MappingOrigin::Mmio { mapping: id, .. }, ..
+        } if id == mapping));
+        assert!(retiring.is_empty());
+        storage = space.complete(retiring);
+    }
+    space.finish_mapping_retirement(mapping).unwrap();
+    assert_eq!(space.region_count(), 1);
+    assert!(space.origin_at(BASE + PAGE_SIZE).unwrap().is_ram());
+}
+
+#[test]
+fn forced_slot_remains_available_when_ordinary_transactions_are_full() {
+    let mut space = space();
+    let mapping = memory_space::MappingId::new(20).unwrap();
+    commit_map(&mut space, mmio_map(mapping.get(), BASE, 2));
+    let mut ordinary = Vec::new();
+    for i in 0..space.limits().max_transactions {
+        let validated = validate(
+            &space,
+            memory_space::ChangeRequest::Map(anonymous_map(
+                100 + i as u64,
+                BASE + (i + 4) * PAGE_SIZE,
+                1,
+                0,
+                0,
+                Protection::ReadWrite,
+                Protection::ReadWrite,
+                RegionOwner::AddressSpace,
+            )),
+        )
+        .unwrap();
+        ordinary.push(reserve_no_permits(&mut space, validated));
+    }
+    let mut storage = memory_space::ChangeStorage::default();
+    storage.prepare_forced_remove(&TestFunding).unwrap();
+    space.freeze_mapping(mapping).unwrap();
+    // 来访实物片段可以起于几何片段内部；按当前来源删除整个几何片段。
+    let prepared = space
+        .reserve_forced_remove(mapping, BASE + PAGE_SIZE, &mut storage)
+        .unwrap();
+    assert_eq!(space.transaction_count(), space.transaction_capacity());
+    assert!(matches!(
+        space.finish_mapping_retirement(mapping),
+        Err(ChangeError::Busy)
+    ));
+    complete_prepared(&mut space, prepared);
+    space.finish_mapping_retirement(mapping).unwrap();
+    for prepared in ordinary {
+        discard_no_permits(space.rollback(prepared));
+    }
+    assert_eq!(space.transaction_count(), 0);
+}
+
+#[test]
+fn freezing_mmio_blocks_late_reservations_but_allows_existing_work_to_finish() {
+    let mut space = space();
+    let mapping = memory_space::MappingId::new(30).unwrap();
+    commit_map(&mut space, mmio_map(mapping.get(), BASE, 2));
+    let request = || {
+        memory_space::ChangeRequest::Protect(ProtectRequest {
+            range: PageRange::new(BASE, PAGE_SIZE).unwrap(),
+            protection: Protection::ReadOnly,
+            authority: RegionOwner::AddressSpace,
+        })
+    };
+    let late = validate(&space, request()).unwrap();
+    let accepted = validate(&space, request()).unwrap();
+    let accepted = reserve_no_permits(&mut space, accepted);
+    space.freeze_mapping(mapping).unwrap();
+    assert!(
+        matches!(reserve_change(&mut space, late, &mut funded_storage::Buffer::new()),
+        Err(failure) if failure.error == ChangeError::Busy)
+    );
+    let mut storage = memory_space::ChangeStorage::default();
+    storage.prepare_forced_remove(&TestFunding).unwrap();
+    assert!(matches!(
+        space.reserve_forced_remove(mapping, BASE, &mut storage),
+        Err(ChangeError::Busy)
+    ));
+    complete_prepared(&mut space, accepted);
+    assert!(matches!(
+        validate(&space, request()),
+        Err(ChangeError::Busy)
+    ));
+    for at in [BASE, BASE + PAGE_SIZE] {
+        let prepared = space
+            .reserve_forced_remove(mapping, at, &mut storage)
+            .unwrap();
+        let committed = commit_all(&mut space, prepared);
+        let mut retiring = space.synchronize(committed);
+        assert!(retiring.pop_fragment().is_some());
+        assert!(retiring.is_empty());
+        storage = space.complete(retiring);
+    }
+    space.finish_mapping_retirement(mapping).unwrap();
     assert_eq!(space.region_count(), 0);
 }

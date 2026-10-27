@@ -89,6 +89,10 @@ extern "C" fn hart_formal_entry(record: &crate::registry::HartBootRecord) -> ! {
     unsafe {
         core::arch::asm!("la t0, _trap_entry", "csrw stvec, t0", options(nomem));
     }
+    if let Err(reason) = crate::resource::irq::controller::enter_hart() {
+        registry::publish_failed();
+        fatal_msg(&format_args!("PLIC hart handover failed: {reason}"));
+    }
     record.publish_online();
 
     if record.role_boot == 1 {

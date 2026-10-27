@@ -6,7 +6,7 @@
 
 ## 启动物理供给与系统储备
 
-`os/dtb::memory` 先以 DTSpec status 规则接纳 memory 与 reserved-memory：缺省/`okay` 可用，合法不可用状态跳过，未知或非单一 NUL 字符串拒绝；RAM tuple 经 checked 页对齐、排序与重叠拒绝后才形成固定容量 `PlatformMemory`。动态 reservation 与 `reusable` 在 owner 机制存在前保持 fail closed。
+`shared/dtb::memory` 先以 DTSpec status 规则接纳 memory 与 reserved-memory：缺省/`okay` 可用，合法不可用状态跳过，未知或非单一 NUL 字符串拒绝；RAM tuple 经 checked 页对齐、排序与重叠拒绝后才形成固定容量 `PlatformMemory`。动态 reservation 与 `reusable` 在 owner 机制存在前保持 fail closed。
 
 `os/memory_supply` 是 `no_std`、禁止 unsafe、零堆分配的纯逻辑规划器；`os/kernel/src/frame.rs` 在 BSS 中提供固定 workspace。输入只接受板级层已经接纳并页对齐的 managed、permanent 与 boot-held 区间，输出是借用的 `InventoryPlan` 与拥有 typed tickets 的 `SystemSupply`。workspace 在失败后可以被下一次规划覆盖；只有完整 `Ok(Plan)` 才能拆出可发布对象，因此失败不会把部分分类写入全局 FramePool 或 system ticket store。
 
@@ -108,15 +108,19 @@ AnySpace的root、中间页表、匿名与Tunnel backing使用同一broker来源
 
 完整域 BackingOwner 独占 root use，public MemoryObject/Connection 放弃它时，原位关 acquire 准入并把 root 游标交给 backing 出生内嵌的唯一 Work。每步摘一段，锁外放物理/退 credit；仍被 View 覆盖的段保留给 View 自己的责任。创建失败尚无外部 use 时，释放原 funding 批，其 extent 数已有结构上界。
 
+DMA 使用 `begin_acquire/AcquireCursor/acquire_step` 分步取得独立 use。开始只物化两端边界，每步最多增加一个实际段的引用；完整成功将前缀收束成请求全区间的 RangeUse，取消只返回真正已经增引用的前缀，交普通 ReleaseCursor 退休。已有游标在来源封口后仍可继续，外层必须保证尚未取得部分的原来源不先消失。
+
+kernel 的 BackingAcquisition 在源 capability 门内被接受，同时在 BACKING 门增加 acquisitions 责任。完整域 owner 关闭后可以封准入并登记 root release，但最终 Work 在 acquisitions 非零时返回 Idle，不递减 root use。最后 acquisition 在同 BACKING 门交还计数并发布原 Work；首次 root release 发布和 root 终态也由这把锁仲裁，避免锁外迟到 activate 重新激活 Done。门内发布只操作维护队列且调用方仍强持 backing，门铃在锁外发送。Pin 成功、取消和原线程退出都必须把游标收束为独立 BackingUse 或其已持前缀，再由原 Pin owner 逐段释放；无 Thread/VM 保活借用。
+
 Backing::fund 拥有匿名/MemoryObject/bootstrap 的 funding 准备；固定 64 extent 批次只存在于该调用链，不随大 VM 请求准备值传播。普通 BackingUse 只有 Arc<Backing>/RangeUse，不包含 Work、完成观察或等待锁。它由准备/事务/View owner 显式接管；retire 产生普通值型 BackingRelease，由已有事务/空间 Work 每次调用 step 处理一段，锁外退款后返回进展。完成后才允许销毁游标；直接丢弃尚有责任的 use/游标触发结构断言。BackingSplit 仅预取一个段节点，切分既有 use 不再分配记录。
 
 ## 实物 View 索引与退休组合
 
-[vm/views.rs](../../os/kernel/src/vm/views.rs) 拥有每空间真实 use 和写许可来源；MemorySpace 拥有几何/权限/预约。两者不是可互相替换的副本，实物索引允许更细的等价切界。Body 出生 Views，ChangeWork/RetireWork 直接使用它，没有 RetireSink callback 或子退款执行器。
+[vm/views.rs](../../os/kernel/src/vm/views.rs) 拥有每空间真实 use 和写许可来源；MemorySpace 拥有几何/权限/预约。两者不是可互相替换的副本，实物索引允许更细的等价切界。AnySpace 出生 Views，Body、ChangeWork/RetireWork 与强制退休执行者使用同一个 Arc，没有 RetireSink callback 或逐片段退款任务。
 
 PreparedView在ledger预约保护下锁外预付View与必要ObjectSource节点；本操作已持写许可时，permits保证同来源稳定存在，prepare先在Views锁外取ObjectId，再锁内核实来源，省掉同来源候选。RO Map仍备可插入节点，不能用一次查表快照省略。commit只移出必要节点，落败候选与取消的use由Operation带到锁外清理。ViewBoundary在VM锁外备索引/物理切段，提交门复检两端；缺同源候选保持ledger原样。已成端点或实物消失不消费候选，等价切界失败后无需合并。hold_writes复用已有来源，缺失才锁外付节点再复检；最后来源节点摘出后锁外退款。
 
-ViewRetirement 同时保存精确 next 和当前 BackingRelease：每步取 next 对应的一项或推进一个物理段，不用“找不到条目”猜完成。游标结束后才取下一项、归还相应 WritePermit。父 Work 在自己的预算中完成退款，不登记 backing 子任务、不因 backing 释放而 Blocked。
+View 的实物责任由 [`MappingUse`](../../os/kernel/src/vm/mapping.rs) 唯一分发：Ram 持 BackingUse，Mmio 持 MmioViewUse。ViewRetirement 同时保存精确 next 和当前 MappingRelease：RAM 每步处理一个物理段，MMIO 在已经完成翻译同步的退休步骤交回一份片段责任，不向 FramePool 归还 IO 页。游标结束后才取下一项、归还相应 WritePermit。父 Work 在自己的预算中完成退休，不登记逐 use 子任务。
 
 ObjectSource 按 ObjectId 强持 MemoryObjectCore，分别记录实物 view 和本空间 permit 份数；两者都为零才摘来源。只读 View 也保留原授权状态，使原 maximum=RW 的映射降权后可按相同对象状态重新申请写许可。切界增 view 份数，退休减 view 份数；permit 取消/退休在锁外调用来源。全对象计数仍只由 MemoryObjectState 拥有。对象适配见 [memory-object.md](memory-object.md)。
 
@@ -221,7 +225,7 @@ QEMU 以 raw binary 引导（`-kernel` 加载 ELF 会按 VMA 估算内核末端�
 
 ### secondary hart
 
-HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 transition 表，按“过渡 satp→`sfence.vma`→高半区→正式 satp→`sfence.vma`”进入 formal entry。DTB 消费后、bootstrap 全员 Online 后分别先撤销相应临时叶再回投物理页；此后 transition 表只覆盖永久 entry 设施与正式内核页，不留宽 DRAM 映射或已回投页别名。完整生命周期见 [`execution-context.md`](execution-context.md)。
+HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 transition 表，按“过渡 satp→`sfence.vma`→高半区→正式 satp→`sfence.vma`”进入 formal entry。DTB 在启动单核完成平台解析后撤销临时叶，实际原页由启动 reservation owner 保留到只读平台对象复制结束再回投；bootstrap 区在全员 Online 后撤销临时叶并回投。此后 transition 表只覆盖永久 entry 设施与正式内核页，不留宽 DRAM 映射或已回投页别名。平台对象复制与归还见 [`startup.md`](startup.md#只读平台描述)，hart 生命周期见 [`execution-context.md`](execution-context.md)。
 
 ### trap
 
@@ -229,7 +233,7 @@ HSM 唤醒入口是永久无栈 PA 前导：从 record PA 取得同一张精确 
 
 目标允许且软件PTE已有U及对应访问位时，锁内SFENCE，取指另FENCE.I，重试原指令；A/D由内核pte_flags预置，fence不承担补位。Thread执行owner保存事实签名及已修复dense-hart位图，同组事实每hart只修复一次，迁移不能抹掉已尝试历史。目标允许但尚无相应PTE时，捕获既有事务Completion来源，锁外沿原Wait epoch协议停驻至DONE。RetryFault不写返回寄存器、不加sepc；来源失败保留原cause/address，Frozen复用detach/退出。
 
-VmState出生预付的dependencies Buffer容量等于ledger.max_transactions；纯层reservation与ChangeKey→SignalSource登记同锁发生，rollback/complete释放预约时同锁摘索引，source在门外释放。索引只持独立完成来源，不持被等待的ChangeWork/RetireWork；SignalSource自身的通知Work与它们没有自持环。先前等待方仍持原source至Completion最后退款/access回执后DONE。access归零须索引空；Body最终销毁空buffer再发布完成。
+VmState出生预付的dependencies Buffer容量由ledger.transaction_capacity()提供，包含业务上限与一个专用强制事务槽；纯层reservation与ChangeKey→SignalSource登记同锁发生，rollback/complete释放预约时同锁摘索引，source在门外释放。索引只持独立完成来源，不持被等待的ChangeWork/RetireWork；SignalSource自身的通知Work与它们没有自持环。先前等待方仍持原source至Completion最后退款/access回执后DONE。access归零须索引空；Body最终销毁空buffer再发布完成。
 
 ### 用户内存访问
 
@@ -249,6 +253,30 @@ Body强持已付款VmShell、Views和出生待激活RetireWork；后者在激活
 - ProcessStart 关闭 Building 修改，启动记录等访问租约与 VM 操作清零后开放 entry；整空间退休等入口封闭、active、访问租约，再逐区域/实物 use/表帧释放。最终根表与实际资金结算后才可释放 Body。
 - Tunnel Close/Attach 不改 VA/PTE。Connection root 与普通 Endpoint View 由 BackingUse 独立保活；映射使用 MappedRegion token 显式 Unmap，进程退出使用相同 RetireWork 收束。
 - libkernel MappedRegion 保存完整 reservation 与可选 usable 区间，部分 Unmap 返回左右残片；libruntime allocator 与 libthread 栈是其实际消费者，退出等 ThreadControl DONE 后才允许释放栈。
+
+### 映射来源与 MMIO 退休原语
+
+[`memory_space::MappingSource/MappingOrigin`](../../os/memory_space/src/space.rs) 区分 Anonymous、Object 和 Mmio。来源请求中的 Object 持原对象授权，Mmio 持一次 Map 的 MappingId 与已准入长度；实际区域/翻译/退休描述保存来源身份和偏移。切分与 Protect 不更换 MappingId，移除片段保留相应偏移；MMIO 不能取得 EXECUTE 或普通结果写回 lease，也不产生 MemoryObject 写许可。
+
+MemorySpace 的业务事务上限不包含出生预付的一个强制槽；`transaction_capacity()` 是内核 dependency 容量的同一来源。`ChangeStorage::prepare_forced_remove` 预备一个完整片段删除的固定计划存储，`freeze_mapping` 关闭对应来源的新修改、切分及尚未预约的计划；已经预约的事务继续。`reserve_forced_remove` 按来访地址定位完整几何片段并核验 MappingId，不删除旧 VA 总范围，因此已被其他映射占用的空洞不受影响。它不调用付款、不新增 Region、不需要普通业务槽，仍通过原提交、同步和退休 token 移交责任。内部 ChangeKey(0) 只属于此槽，必须 complete 后才能再次使用；MappingId 的唯一发行仍由资源 owner 负责。
+
+[`page_table::LeafSize`](../../os/page_table/src/lib.rs) 是 Map 游标的显式叶粒度选择。RAM 选择 Largest，Mmio 来源选择 BasePage；最坏供给仍按触及的各级表计算。基础页来源可在任意页边界删除而不拆大页，表帧在建立映射时已付费。公共 Map 的 MmioUse 分支与 control/use ABI 接受由实际平台根派生的来源；当前平台范围见 [设备 IO 准入](device.md#平台-io-准入)。
+
+[`resource/mmio.rs`](../../os/kernel/src/resource/mmio.rs) 拥有稳定 Map 记录及其成员门。记录持 MappingId、不可变 IO 几何、弱 VM 定位、原 Map 的独立完成来源、片段完成来源与预付 FIFO 节点；根表保存状态与记录的 Weak，记录强持所属 MmioNode，不形成互持环。`Operation::prepare_mmio` 接受实际 MmioUse 的节点与准入票，按节点范围推导物理区间；原 Operation/失败 Work 已出生后才创建记录，并立即同时接管实物 use 与发布回执。唯一裸物理授权口属于平台的 unsafe root 构造。
+
+发布阶段在 VM 门外取得根成员门的 PublishGranted，VM 完成不可逆提交后再在门外转 Live/Revoking；Live 不替代原 Map 操作的完成来源。`Completion` 在原操作私有存储/费用与 VM 租约退出后交回发布回执；片段数为零和原操作结束共同决定 Detached。片段计数包括已经准入但未提交的切界准备；`MmioSplit` 准备时取得一份责任，Views 锁内提交只移动该责任，未使用的候选在门外取消。停止先于许可时拒绝发布，许可先于停止时原提交继续；输出失败走原回滚，不伪造 Live。
+
+Views 为每个 MMIO MappingId 保存一个预付链首节点，各实物 View 内含前后链接；切分/摘除在 VM_VIEWS 门内更新，不在退休时扫描全部 View，也不在该锁内进入 RESOURCE_TREE。查询链首后，强制槽按当前几何片段与 MappingId 预约 Remove，因此能覆盖实物切界比几何更细的情况；首片段退休后从同一链首继续。
+
+[`vm/forced.rs`](../../os/kernel/src/vm/forced.rs) 的 ForcedRetirement 随 VM 出生预付 Work、固定 ChangeStorage、运输、表帧退休批次和观察节点。每次 Map 预付其 FIFO 节点，Stop 幂等地移交一次；排队节点持 Map 记录、Map 只弱定位 VM。执行者取得短期 VM 访问租约，冻结一个来源，观察原 Map/既有修改的实际完成来源，再逐完整片段推进。未完成来源经 attach→probe 停驻；hint 只唤醒复检，不证明完成。普通 ChangeWork 与强制执行者共用 ChangeContext，后者使用内联单一 PTE 游标，结束一个片段后收回固定计划存储供下一片段复用。
+
+[`MmioExecutorState`](../../os/memory_space/src/mmio_executor.rs) 区分 Idle、Active、普通依赖、Fence 与 Closed；状态、队列和维护 activate/wake 在同一队列门内提交，锁序为 LEAF→MAINTENANCE，提示和潜在最后强根的释放均在门外。新队尾只激活 Idle；普通依赖只能由对应 WakeToken 唤醒；关闭可以打断普通观察但不能打断已提交 fence。迟到来源提示在非普通依赖状态不取票，最后 fence ack 是该等待的唯一唤醒方。空队列判断在同门复检，避免锁外迟到 activate 命中 Done。
+
+`VmShell::close_entry` 摘下常驻强制执行者，封 VM 入口并取得退出租约；执行者安装该租约后才在队列门内提交 closing 和相应通知。只有 closing 已提交且队列为空才允许执行者 Done；提前观察到 VM Frozen 只允许回到 Idle。已提交片段按原协议完成，尚未提交的队列和观察交整空间退休接管。执行者持末字段退出租约，待自身队列/计划/运输/费用全部退出才归还，防止 Process DONE 提前于这份 VM 私有承载的退款。记录的弱 VM 升级失败不发布 Detached；完成仍只能来自原操作与实物片段回执。
+
+根成员门内使用 [ResourceTree](device.md#层级资源树) 拥有封口及成员责任计数。MapCall 经原线程请求先逐步核验 Preparing 的祖先准入，再准备原 VM 预约/实物/PTE 存储，最后逐步检查发布许可的祖先。最终 grant 在资源门内比较 close_seq；序号变化返回 Busy，由原 Operation 回滚。普通 RAM Map 使用同一请求执行入口，Builder/bootstrap 仍直接复用准备/提交函数。首次 Detached 归还成员责任，记录或观察存储继续存活不阻止这份责任完成；节点的 capability 与清理 Work 见 [设备资源](device.md#mmio-撤销与-map-成员)。
+
+普通内核数据访问的来源依据是同一份 [`Views`](../../os/kernel/src/vm/views.rs) 实物账本。AnySpace 出生时创建它，ProcessBody 与事务/退出 owner 共享其 Arc，未创建第二张来源表。来源登记先于 PTE 发布，来源摘除晚于翻译同步；几何账本在 Protect/Unmap 的分步摘装期间暂时无区域时，原 PTE 的来源仍可核验。`check_range` 与初始上下文校验持 ADDRESS_SPACE，再短取 VM_VIEWS 检查 RAM 来源，随后用原 translate 校验 U/R/W/X；SUM、初始写入和 cookie 发布没有新增拷贝路径。
 
 ### 事务完成责任
 

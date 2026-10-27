@@ -238,6 +238,13 @@ pub enum ObjectKind {
     ReplyObserver = 18,
     ThreadStartTicket = 19,
     NotificationObserver = 20,
+    MmioControl = 21,
+    MmioUse = 22,
+    IrqControl = 23,
+    IrqUse = 24,
+    DmaDomainControl = 25,
+    DmaUse = 26,
+    DmaMapping = 27,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -108,6 +108,14 @@ pub mod thread {
     use erhino_shared::call::SystemCallError;
     pub use libthread::yield_now;
 
+    /// 推进原线程registry；Busy保留原记录，不创建另一套reaper。
+    pub fn reap(budget: usize) -> libthread::ReapProgress {
+        registry().reap(budget)
+    }
+    pub fn retained_records() -> usize {
+        registry().retained_records()
+    }
+
     pub struct Builder {
         stack_bytes: usize,
     }

@@ -110,8 +110,22 @@ pub enum AnonymousClass {
     InitialExecutable,
 }
 
+/// 一次 MMIO Map 的稳定身份。由资源 owner 单调签发，切分不换号，VA 重用不复用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MappingId(u64);
+
+impl MappingId {
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub enum MapBacking {
+pub enum MappingSource {
     Anonymous {
         identity: BackingId,
         class: AnonymousClass,
@@ -120,10 +134,12 @@ pub enum MapBacking {
         authorization: ObjectViewAuthorization,
         offset: usize,
     },
+    /// 本次 Map 已由资源 owner 准入的 IO 长度；不表示 RAM 或 MemoryObject 授权。
+    Mmio { mapping: MappingId, bytes: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackingView {
+pub enum MappingOrigin {
     Anonymous {
         identity: BackingId,
         class: AnonymousClass,
@@ -133,19 +149,36 @@ pub enum BackingView {
         object: ObjectId,
         offset: usize,
     },
+    Mmio {
+        mapping: MappingId,
+        offset: usize,
+    },
 }
 
-impl BackingView {
+impl MappingOrigin {
     pub const fn offset(self) -> usize {
         match self {
-            Self::Anonymous { offset, .. } | Self::Object { offset, .. } => offset,
+            Self::Anonymous { offset, .. }
+            | Self::Object { offset, .. }
+            | Self::Mmio { offset, .. } => offset,
         }
     }
 
     pub const fn object(self) -> Option<ObjectId> {
         match self {
-            Self::Anonymous { .. } => None,
+            Self::Anonymous { .. } | Self::Mmio { .. } => None,
             Self::Object { object, .. } => Some(object),
+        }
+    }
+
+    pub const fn is_ram(self) -> bool {
+        matches!(self, Self::Anonymous { .. } | Self::Object { .. })
+    }
+
+    pub const fn mapping(self) -> Option<MappingId> {
+        match self {
+            Self::Mmio { mapping, .. } => Some(mapping),
+            _ => None,
         }
     }
 
@@ -161,6 +194,7 @@ impl BackingView {
                 offset,
             },
             Self::Object { object, .. } => Self::Object { object, offset },
+            Self::Mmio { mapping, .. } => Self::Mmio { mapping, offset },
         })
     }
 }
@@ -194,7 +228,7 @@ pub struct MapRequest {
     pub current: Protection,
     pub maximum: Protection,
     pub owner: RegionOwner,
-    pub backing: MapBacking,
+    pub backing: MappingSource,
     pub result: Option<UserWriteLeaseRequest>,
 }
 
@@ -283,7 +317,7 @@ impl PermitRequirement {
 pub enum TranslationIntent {
     Install {
         range: PageRange,
-        backing: BackingView,
+        backing: MappingOrigin,
         protection: Protection,
     },
     Remove {
@@ -300,7 +334,7 @@ pub enum TranslationIntent {
 pub enum RegionKindView {
     Guard,
     Mapping {
-        backing: BackingView,
+        backing: MappingOrigin,
         current: Protection,
         maximum: Protection,
     },
@@ -319,7 +353,7 @@ pub struct RegionView {
 enum RegionKind {
     Guard,
     Mapping {
-        backing: BackingView,
+        backing: MappingOrigin,
         current: Protection,
         maximum: Protection,
     },
@@ -379,7 +413,7 @@ impl<C> Coverage<'_, C> {
 pub struct UserWriteSegment {
     pub region: RegionKey,
     pub user: AddressRange,
-    pub backing: BackingView,
+    pub backing: MappingOrigin,
     pub backing_offset: usize,
 }
 
@@ -451,7 +485,7 @@ enum AllocationSource {
 enum TemplateKind {
     Guard,
     Mapping {
-        backing: BackingView,
+        backing: MappingOrigin,
         current: Protection,
         maximum: Protection,
     },
@@ -471,7 +505,7 @@ impl RegionTemplate {
     fn writable_object(self) -> Option<ObjectId> {
         match self.kind {
             TemplateKind::Mapping {
-                backing: BackingView::Object { object, .. },
+                backing: MappingOrigin::Object { object, .. },
                 current: Protection::ReadWrite,
                 ..
             } => Some(object),
@@ -571,6 +605,25 @@ impl<C> core::fmt::Debug for ChangeStorage<C> {
     }
 }
 impl<C> ChangeStorage<C> {
+    /// 空间出生时预付一次完整 MMIO 片段 Remove 所需的固定承载。
+    /// 不依赖片段页数，不保存新的 Region，也不取得 MemoryObject 写许可。
+    pub fn prepare_forced_remove<F: funded_storage::Funding<Charge = C>>(
+        &mut self,
+        payer: &F,
+    ) -> Result<(), funded_storage::StorageError<F::Error>> {
+        self.prepare_validation(
+            ChangeCapacity {
+                remove: 1,
+                retiring: 1,
+                translations: 1,
+                ..ChangeCapacity::default()
+            },
+            payer,
+        )?;
+        self.data_mut().retired.try_reserve_exact(1, payer)?;
+        Ok(())
+    }
+
     fn data(&self) -> &StorageData<C> {
         self.data
             .as_deref()
@@ -826,6 +879,8 @@ pub struct MemorySpace<C> {
     next_region: u64,
     next_change: u64,
     reserved_growth: usize,
+    /// 每空间一个强制退休 owner，冻结其来源的新修改；既有预约继续原责任。
+    frozen_mapping: Option<MappingId>,
 }
 
 impl<C> MemorySpace<C> {
@@ -878,6 +933,7 @@ impl<C> MemorySpace<C> {
             || limits.max_pages_per_change == 0
             || limits.max_lease_bytes == 0
             || limits.max_lease_segments == 0
+            || limits.max_transactions.checked_add(1).is_none()
         {
             return Err(SpaceCreateError::BadLimits);
         }
@@ -887,7 +943,8 @@ impl<C> MemorySpace<C> {
         regions
             .install_storage(&mut storage)
             .expect("fresh arena fits empty index");
-        let transactions = funded_storage::Buffer::try_empty(limits.max_transactions, payer)
+        // 额外一槽只由强制退休入口使用，业务预约不能消耗。
+        let transactions = funded_storage::Buffer::try_empty(limits.max_transactions + 1, payer)
             .map_err(SpaceCreateError::Storage)?;
         Ok(Self {
             bounds,
@@ -898,6 +955,7 @@ impl<C> MemorySpace<C> {
             next_region: 1,
             next_change: 1,
             reserved_growth: 0,
+            frozen_mapping: None,
         })
     }
 
@@ -943,8 +1001,146 @@ impl<C> MemorySpace<C> {
         self.transactions.len()
     }
 
+    /// 强制退休等待已有预约的真实完成来源，包含尚未提交与退休中的责任。
+    pub fn change_at(&self, address: usize) -> Option<ChangeKey> {
+        self.transactions
+            .iter()
+            .find(|record| {
+                record.footprint.address_range().contains_address(address)
+                    || record
+                        .lease
+                        .is_some_and(|lease| lease.contains_address(address))
+            })
+            .map(|record| record.key)
+    }
+
+    /// 运行适配器的 dependency 存储与同一实际预约容量一致。
+    pub fn transaction_capacity(&self) -> usize {
+        self.limits.max_transactions + 1
+    }
+
+    pub fn freeze_mapping(&mut self, mapping: MappingId) -> Result<(), ChangeError> {
+        if self
+            .frozen_mapping
+            .is_some_and(|current| current != mapping)
+        {
+            return Err(ChangeError::Busy);
+        }
+        self.frozen_mapping = Some(mapping);
+        Ok(())
+    }
+
+    /// 调用者已封闭原来源的发布、结束全部准备/回滚并收到全部片段退休回执；
+    /// 清空门供 FIFO 下一来源使用。
+    /// 本接口不签发新的 Map 身份或重新开放原资源。
+    pub fn finish_mapping_retirement(&mut self, mapping: MappingId) -> Result<(), ChangeError> {
+        if self.frozen_mapping != Some(mapping) {
+            return Err(ChangeError::Stale);
+        }
+        if self
+            .transactions
+            .iter()
+            .any(|record| record.key == ChangeKey(0))
+        {
+            return Err(ChangeError::Busy);
+        }
+        self.frozen_mapping = None;
+        Ok(())
+    }
+
+    /// 使用出生预付槽预约包含 `address` 的完整 MMIO 几何片段。
+    /// 实物切界可以比几何更细，不要求来访 View 的起点就是几何片段起点。
+    /// MappingId 必须仍匹配，所以旧空洞上后来建立的映射不会被撤掉。
+    pub fn reserve_forced_remove(
+        &mut self,
+        mapping: MappingId,
+        address: usize,
+        storage: &mut ChangeStorage<C>,
+    ) -> Result<PreparedChange<C>, ChangeError> {
+        if self.frozen_mapping != Some(mapping) {
+            return Err(ChangeError::OwnerDenied);
+        }
+        if self
+            .transactions
+            .iter()
+            .any(|record| record.key == ChangeKey(0))
+        {
+            return Err(ChangeError::Busy);
+        }
+        let (start, region) = self
+            .regions
+            .floor(&address)
+            .filter(|(_, region)| region.range.address_range().contains_address(address))
+            .ok_or(ChangeError::Stale)?;
+        if !matches!(region.kind, RegionKind::Mapping {
+            backing: MappingOrigin::Mmio { mapping: current, .. }, ..
+        } if current == mapping)
+        {
+            return Err(ChangeError::Stale);
+        }
+        self.ensure_no_transaction_conflict(region.range, None)?;
+        let capacity = ChangeCapacity {
+            remove: 1,
+            retiring: 1,
+            translations: 1,
+            ..ChangeCapacity::default()
+        };
+        if !storage.validation_ready(capacity) || storage.data().retired.capacity() < 1 {
+            return Err(ChangeError::CapacityChanged);
+        }
+        let view = region.view();
+        storage.reset_validation();
+        let data = storage.data_mut();
+        data.remove.push((start, view.key));
+        data.translations
+            .push(TranslationIntent::Remove { range: view.range });
+        data.retired.push(RetiringFragment {
+            key: view.key,
+            allocation: view.allocation,
+            range: view.range,
+            owner: view.owner,
+            kind: view.kind,
+            backing_retire: BackingRetire::Release,
+        });
+        // 0 专属于唯一强制槽，普通 key 从 1 单调发行。槽在完整退款/complete
+        // 前不复用，旧 fault 等待持独立完成来源，不依赖再次查找此数值。
+        let key = ChangeKey(0);
+        self.transactions.push(TransactionRecord {
+            key,
+            footprint: view.range,
+            lease: None,
+            stage: ChangeStage::Reserved,
+            reserved_growth: 0,
+            ledger_pending: false,
+            target: None,
+        });
+        Ok(PreparedChange {
+            key,
+            plan: ChangePlan {
+                footprint: view.range,
+                result_layout: None,
+                lease: None,
+                growth: 0,
+                retiring_permits: 0,
+            },
+            storage: core::mem::take(storage),
+        })
+    }
+
     pub fn regions(&self) -> impl Iterator<Item = RegionView> + '_ {
         self.regions.iter().map(|(_, region)| Region::view(region))
+    }
+
+    /// 当前账本中的来源。调用者仍须核验真实 PTE，不能仅凭此结果访问物理内存。
+    pub fn origin_at(&self, address: usize) -> Option<MappingOrigin> {
+        let (_, region) = self.regions.floor(&address)?;
+        if !region.range.address_range().contains_address(address) {
+            return None;
+        }
+        match region.kind {
+            RegionKind::Mapping { backing, .. } => backing.shifted(address - region.range.start()),
+            RegionKind::Guard => None,
+        }
     }
 
     pub fn fault_class(&self, address: usize) -> FaultClass {
@@ -993,7 +1189,7 @@ impl<C> MemorySpace<C> {
                 capacity.translations = 1;
                 capacity.requirements = usize::from(
                     request.current.writable()
-                        && matches!(&request.backing, MapBacking::Object { .. }),
+                        && matches!(&request.backing, MappingSource::Object { .. }),
                 );
                 if let Some(lease) = request.result {
                     if lease.range.bytes() > self.limits.max_lease_bytes {
@@ -1028,10 +1224,10 @@ impl<C> MemorySpace<C> {
                 let last = self.region_at(covered.last);
                 capacity.requirements = usize::from(
                     first.range.start() < request.range.start()
-                        && matches!(first.kind, RegionKind::Mapping { backing: BackingView::Object { .. }, current, .. } if current.writable()),
+                        && matches!(first.kind, RegionKind::Mapping { backing: MappingOrigin::Object { .. }, current, .. } if current.writable()),
                 ) + usize::from(
                     last.range.end() > request.range.end()
-                        && matches!(last.kind, RegionKind::Mapping { backing: BackingView::Object { .. }, current, .. } if current.writable()),
+                        && matches!(last.kind, RegionKind::Mapping { backing: MappingOrigin::Object { .. }, current, .. } if current.writable()),
                 );
                 capacity.translations = usize::from(
                     covered
@@ -1076,7 +1272,7 @@ impl<C> MemorySpace<C> {
                                 matches!(
                                     self.region_at(key).kind,
                                     RegionKind::Mapping {
-                                        backing: BackingView::Object { .. },
+                                        backing: MappingOrigin::Object { .. },
                                         ..
                                     }
                                 )
@@ -1087,10 +1283,10 @@ impl<C> MemorySpace<C> {
                     };
                     capacity.requirements += usize::from(
                         first.range.start() < request.range.start()
-                            && matches!(first.kind, RegionKind::Mapping { backing: BackingView::Object { .. }, current, .. } if current.writable()),
+                            && matches!(first.kind, RegionKind::Mapping { backing: MappingOrigin::Object { .. }, current, .. } if current.writable()),
                     ) + usize::from(
                         last.range.end() > request.range.end()
-                            && matches!(last.kind, RegionKind::Mapping { backing: BackingView::Object { .. }, current, .. } if current.writable()),
+                            && matches!(last.kind, RegionKind::Mapping { backing: MappingOrigin::Object { .. }, current, .. } if current.writable()),
                     );
                     capacity.translations = changed;
                 }
@@ -1173,7 +1369,7 @@ impl<C> MemorySpace<C> {
         };
 
         let backing = match &request.backing {
-            MapBacking::Anonymous { identity, class } => {
+            MappingSource::Anonymous { identity, class } => {
                 let allowed = match class {
                     AnonymousClass::Data => request.maximum != Protection::ReadExecute,
                     AnonymousClass::InitialExecutable => request.maximum != Protection::ReadWrite,
@@ -1181,13 +1377,13 @@ impl<C> MemorySpace<C> {
                 if !allowed {
                     return Err(ChangeError::PermissionDenied);
                 }
-                BackingView::Anonymous {
+                MappingOrigin::Anonymous {
                     identity: *identity,
                     class: *class,
                     offset: 0,
                 }
             }
-            MapBacking::Object {
+            MappingSource::Object {
                 authorization,
                 offset,
             } => {
@@ -1200,9 +1396,24 @@ impl<C> MemorySpace<C> {
                 if end > authorization.object_bytes() {
                     return Err(ChangeError::BackingOutOfRange);
                 }
-                BackingView::Object {
+                MappingOrigin::Object {
                     object: authorization.object(),
                     offset: *offset,
+                }
+            }
+            MappingSource::Mmio { mapping, bytes } => {
+                if self.frozen_mapping == Some(*mapping) {
+                    return Err(ChangeError::Busy);
+                }
+                if request.maximum == Protection::ReadExecute {
+                    return Err(ChangeError::PermissionDenied);
+                }
+                if !bytes.is_multiple_of(PAGE_SIZE) || usable_bytes > *bytes {
+                    return Err(ChangeError::BackingOutOfRange);
+                }
+                MappingOrigin::Mmio {
+                    mapping: *mapping,
+                    offset: 0,
                 }
             }
         };
@@ -1479,9 +1690,8 @@ impl<C> MemorySpace<C> {
         })
     }
 
-    /// Reserve 失败必须原样归还 validated plan 与 affine permits。
-    #[allow(clippy::result_large_err)]
-    /// Reserve 失败原样归还全部 affine/付款 owner；门内不分配或析构 paid 块。
+    /// Reserve 失败原样归还 validated plan、affine permits 与付款 owner；
+    /// 门内不分配或析构 paid 块。
     #[allow(clippy::result_large_err)]
     pub fn reserve(
         &mut self,
@@ -1530,8 +1740,30 @@ impl<C> MemorySpace<C> {
         permits: &[WritePermit],
         storage: &mut RegionStorage<C>,
     ) -> Result<(), ChangeError> {
-        if self.transactions.len() >= self.limits.max_transactions {
+        let ordinary_count = self
+            .transactions
+            .iter()
+            .filter(|record| record.key != ChangeKey(0))
+            .count();
+        if ordinary_count >= self.limits.max_transactions {
             return Err(ChangeError::TransactionLimit);
+        }
+        if let Some(mapping) = self.frozen_mapping {
+            let data = validated.storage.data();
+            let touches_frozen = data.templates.iter().any(|template| {
+                matches!(template.kind, TemplateKind::Mapping { backing, .. }
+                    if backing.mapping() == Some(mapping))
+            }) || data.remove.iter().chain(data.snapshot.iter()).any(
+                |(start, _)| {
+                    self.regions.get(start).is_some_and(|region| {
+                        matches!(region.kind, RegionKind::Mapping { backing, .. }
+                        if backing.mapping() == Some(mapping))
+                    })
+                },
+            );
+            if touches_frozen {
+                return Err(ChangeError::Busy);
+            }
         }
         if !self.snapshot_valid(&validated.storage.data().remove)
             || !self.snapshot_valid(&validated.storage.data().snapshot)
@@ -1651,6 +1883,11 @@ impl<C> MemorySpace<C> {
             };
             if !(start < edge && edge < region.range.end()) || region.permit.is_some() {
                 continue;
+            }
+            if matches!(region.kind, RegionKind::Mapping { backing, .. }
+                if backing.mapping().is_some() && backing.mapping() == self.frozen_mapping)
+            {
+                return Err(ChangeError::Busy);
             }
             if self
                 .transactions
@@ -1941,6 +2178,11 @@ impl<C> MemorySpace<C> {
             if region.owner != authority {
                 return Err(ChangeError::OwnerDenied);
             }
+            if matches!(region.kind, RegionKind::Mapping { backing, .. }
+                if backing.mapping().is_some() && backing.mapping() == self.frozen_mapping)
+            {
+                return Err(ChangeError::Busy);
+            }
             if mappings_only && matches!(region.kind, RegionKind::Guard) {
                 return Err(ChangeError::Guard);
             }
@@ -1993,6 +2235,9 @@ impl<C> MemorySpace<C> {
             else {
                 return Err(ChangeError::LeaseInvalid);
             };
+            if !backing.is_ram() {
+                return Err(ChangeError::LeaseInvalid);
+            }
             let segment_end = region.range.end().min(range.end());
             let user = AddressRange::from_bounds(cursor, segment_end)?;
             if segments.len() >= self.limits.max_lease_segments {

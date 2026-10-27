@@ -107,15 +107,30 @@ impl Fixture {
     fn binding_member(&mut self, parent: &NodeRef, name: &str) -> Binding {
         // 仅建立纯 backing 的名字/记录关系，不创建或伪造能力；生产 Bind 的
         // issuer/shared 签发准入由真实 provider 消费者验证。
-        let binding = self.backend.reserve_binding(
-            FsRights::ALL, self.scope().output_transport(), &self.account,
-        ).unwrap();
+        let binding = self
+            .backend
+            .reserve_binding(
+                FsRights::ALL,
+                self.scope().output_transport(),
+                &self.account,
+            )
+            .unwrap();
         let slot = Counter::try_acquire(&self.backend.members).unwrap();
-        let entry = self.backend.prepare_member(
-            parent, name, MemberKind::Binding(binding.id()), Some(slot), &self.account,
-        ).unwrap();
+        let entry = self
+            .backend
+            .prepare_member(
+                parent,
+                name,
+                MemberKind::Binding(binding.id()),
+                Some(slot),
+                &self.account,
+            )
+            .unwrap();
         self.backend.nodes.link(&binding.reference);
-        self.backend.directory_mut(parent).members.insert_prepared(entry);
+        self.backend
+            .directory_mut(parent)
+            .members
+            .insert_prepared(entry);
         self.backend.bump(parent);
         binding
     }
@@ -126,29 +141,47 @@ fn late_unbind_cannot_remove_replacement_and_boundary_rechecks_original_id() {
     let root = f.backend.root().unwrap().clone();
     let management = f.management(root.clone());
     let original = f.binding_member(&root, "mount");
-    let Resolved::Provider { binding: selected, parent, .. } =
-        f.backend.resolve(f.scope(), "mount/value", true).unwrap() else {
-            panic!("binding fixture did not resolve a provider");
-        };
-    let stale = f.backend.prepare_unbind(&management, root.clone(), "mount").unwrap();
-    let current = f.backend.prepare_unbind(&management, root.clone(), "mount").unwrap();
-    f.backend.commit(current).unwrap_or_else(|failed| panic!("unbind failed: {:?}", failed.status));
+    let Resolved::Provider {
+        binding: selected,
+        parent,
+        ..
+    } = f.backend.resolve(f.scope(), "mount/value", true).unwrap()
+    else {
+        panic!("binding fixture did not resolve a provider");
+    };
+    let stale = f
+        .backend
+        .prepare_unbind(&management, root.clone(), "mount")
+        .unwrap();
+    let current = f
+        .backend
+        .prepare_unbind(&management, root.clone(), "mount")
+        .unwrap();
+    f.backend
+        .commit(current)
+        .unwrap_or_else(|failed| panic!("unbind failed: {:?}", failed.status));
     let replacement = f.binding_member(&root, "mount");
     assert_ne!(original.id(), replacement.id());
     let failed = f.backend.commit(stale).err().unwrap();
     assert_eq!(failed.status, Status::Conflict);
     let Resolved::Provider { binding: live, .. } =
-        f.backend.resolve(f.scope(), "mount/value", true).unwrap() else {
-            panic!("replacement fixture did not resolve a provider");
-        };
+        f.backend.resolve(f.scope(), "mount/value", true).unwrap()
+    else {
+        panic!("replacement fixture did not resolve a provider");
+    };
     assert_eq!(live.id(), replacement.id());
     assert!(matches!(
-        f.backend.check_binding_boundary(f.scope(), &selected, &parent),
+        f.backend
+            .check_binding_boundary(f.scope(), &selected, &parent),
         Err(Status::Revoked),
     ));
-    f.backend.check_binding_boundary(f.scope(), &replacement, &parent).unwrap();
-    assert!(matches!(f.backend.management_parent(&management, "mount/nested"),
-        Err(Status::CrossFilesystem)));
+    f.backend
+        .check_binding_boundary(f.scope(), &replacement, &parent)
+        .unwrap();
+    assert!(matches!(
+        f.backend.management_parent(&management, "mount/nested"),
+        Err(Status::CrossFilesystem)
+    ));
     // 同名替代仍 linked；旧 pin 最后释放前，实际 Binding Charge 不退款。
     assert_eq!(f.account.usage(FsResource::Binding).0, 2);
     drop(failed);
@@ -169,43 +202,90 @@ fn length_commit_hides_tail_busy_trimming_refunds_and_sparse_growth_never_revive
     let stream = f.create(&root, "bytes", NodeKind::Stream, &[]);
     let bytes = [0x75; crate::data::BLOCK_BYTES];
     for block in 0..3 {
-        let write = f.backend.prepare_write(f.scope(), stream.clone(),
-            (block * crate::data::BLOCK_BYTES) as u64, &bytes).unwrap();
-        f.backend.commit(write).unwrap_or_else(|failed| panic!("write failed: {:?}", failed.status));
+        let write = f
+            .backend
+            .prepare_write(
+                f.scope(),
+                stream.clone(),
+                (block * crate::data::BLOCK_BYTES) as u64,
+                &bytes,
+            )
+            .unwrap();
+        f.backend
+            .commit(write)
+            .unwrap_or_else(|failed| panic!("write failed: {:?}", failed.status));
     }
     let original_bytes = f.account.usage(FsResource::Bytes).0;
-    let stale = f.backend.prepare_write(f.scope(), stream.clone(), 0, b"old").unwrap();
-    let length = f.backend.prepare_length(f.scope(), stream.clone(), 3).unwrap();
-    f.backend.commit(length).unwrap_or_else(|failed| panic!("length failed: {:?}", failed.status));
+    let stale = f
+        .backend
+        .prepare_write(f.scope(), stream.clone(), 0, b"old")
+        .unwrap();
+    let length = f
+        .backend
+        .prepare_length(f.scope(), stream.clone(), 3)
+        .unwrap();
+    f.backend
+        .commit(length)
+        .unwrap_or_else(|failed| panic!("length failed: {:?}", failed.status));
     assert_eq!(f.backend.stream_length(&stream).unwrap(), 3);
     assert!(f.backend.stream_is_trimming(&stream).unwrap());
     let mut short = [0; 16];
-    assert_eq!(f.backend.read_at(f.scope(), &stream, 0, &mut short).unwrap(), 3);
+    assert_eq!(
+        f.backend
+            .read_at(f.scope(), &stream, 0, &mut short)
+            .unwrap(),
+        3
+    );
     assert_eq!(&short[..3], &[0x75; 3]);
-    assert!(matches!(f.backend.prepare_write(f.scope(), stream.clone(), 3, b"new"),
-        Err(Status::Busy)));
-    assert!(matches!(f.backend.prepare_length(f.scope(), stream.clone(), 4096),
-        Err(Status::Busy)));
+    assert!(matches!(
+        f.backend
+            .prepare_write(f.scope(), stream.clone(), 3, b"new"),
+        Err(Status::Busy)
+    ));
+    assert!(matches!(
+        f.backend.prepare_length(f.scope(), stream.clone(), 4096),
+        Err(Status::Busy)
+    ));
     let failed = f.backend.commit(stale).err().unwrap();
     assert_eq!(failed.status, Status::Conflict);
     drop(failed);
-    assert_eq!(f.account.usage(FsResource::Bytes).0, original_bytes,
-        "logical truncation prematurely refunded physical blocks");
+    assert_eq!(
+        f.account.usage(FsResource::Bytes).0,
+        original_bytes,
+        "logical truncation prematurely refunded physical blocks"
+    );
     assert!(f.backend.take_data_change());
     // 只推进正式维护，原 SetLength 准备/caller 已不存在；每步工作仍受预算约束。
     while f.backend.stream_is_trimming(&stream).unwrap() {
         let progress = f.backend.maintenance_step(1).unwrap();
         assert!(progress.work_done <= 1);
     }
-    assert!(f.backend.take_data_change(), "trimming completion did not wake blocked writers");
+    assert!(
+        f.backend.take_data_change(),
+        "trimming completion did not wake blocked writers"
+    );
     let trimmed_bytes = f.account.usage(FsResource::Bytes).0;
     assert!(original_bytes - trimmed_bytes >= 2 * crate::data::BLOCK_BYTES);
     let expanded = (3 * crate::data::BLOCK_BYTES) as u64;
-    let length = f.backend.prepare_length(f.scope(), stream.clone(), expanded).unwrap();
-    f.backend.commit(length).unwrap_or_else(|failed| panic!("growth failed: {:?}", failed.status));
-    assert_eq!(f.account.usage(FsResource::Bytes).0, trimmed_bytes, "sparse growth allocated holes");
+    let length = f
+        .backend
+        .prepare_length(f.scope(), stream.clone(), expanded)
+        .unwrap();
+    f.backend
+        .commit(length)
+        .unwrap_or_else(|failed| panic!("growth failed: {:?}", failed.status));
+    assert_eq!(
+        f.account.usage(FsResource::Bytes).0,
+        trimmed_bytes,
+        "sparse growth allocated holes"
+    );
     let mut output = [0xff; 3 * crate::data::BLOCK_BYTES];
-    assert_eq!(f.backend.read_at(f.scope(), &stream, 0, &mut output).unwrap(), output.len());
+    assert_eq!(
+        f.backend
+            .read_at(f.scope(), &stream, 0, &mut output)
+            .unwrap(),
+        output.len()
+    );
     assert_eq!(&output[..3], &[0x75; 3]);
     assert!(output[3..].iter().all(|byte| *byte == 0));
     drop(stream);
@@ -556,7 +636,16 @@ fn distinct_creates_prepared_in_one_directory_commit_independently() {
     let mut f = Fixture::new();
     let root = f.backend.root().unwrap().clone();
     let prepare = |name| {
-        f.backend.prepare_create(f.scope(), root.clone(), name, NodeKind::Stream, FsRights::ALL, &[]).unwrap()
+        f.backend
+            .prepare_create(
+                f.scope(),
+                root.clone(),
+                name,
+                NodeKind::Stream,
+                FsRights::ALL,
+                &[],
+            )
+            .unwrap()
     };
     let first = prepare("first");
     let second = prepare("second");
@@ -564,7 +653,9 @@ fn distinct_creates_prepared_in_one_directory_commit_independently() {
     let second_id = second.created_target().unwrap().id();
     assert_ne!(first_id, second_id);
     for pending in [first, second] {
-        f.backend.commit(pending).unwrap_or_else(|failed| panic!("independent create rejected: {:?}", failed.status));
+        f.backend
+            .commit(pending)
+            .unwrap_or_else(|failed| panic!("independent create rejected: {:?}", failed.status));
     }
     for (name, id) in [("first", first_id), ("second", second_id)] {
         let Resolved::Local(actual) = f.backend.resolve(f.scope(), name, true).unwrap() else {
@@ -583,13 +674,24 @@ fn create_rechecks_parent_scope_after_directory_move() {
     let selected = f.create(&allowed, "selected", NodeKind::Directory, &[]);
     let scope = Fixture::access(&f.account, &f.execution, allowed.clone(), FsRights::ALL);
     let destination = Fixture::access(&f.account, &f.execution, outside, FsRights::ALL);
-    let pending = f.backend.prepare_create(
-        &scope, selected, "late", NodeKind::Stream, FsRights::ALL, &[],
-    ).unwrap();
-    let movement = f.backend.prepare_rename(
-        f.scope(), allowed, "selected", &destination, "moved", false,
-    ).unwrap();
-    f.backend.commit(movement).unwrap_or_else(|failed| panic!("move failed: {:?}", failed.status));
+    let pending = f
+        .backend
+        .prepare_create(
+            &scope,
+            selected,
+            "late",
+            NodeKind::Stream,
+            FsRights::ALL,
+            &[],
+        )
+        .unwrap();
+    let movement = f
+        .backend
+        .prepare_rename(f.scope(), allowed, "selected", &destination, "moved", false)
+        .unwrap();
+    f.backend
+        .commit(movement)
+        .unwrap_or_else(|failed| panic!("move failed: {:?}", failed.status));
     let failure = f.backend.commit(pending).err().unwrap();
     assert_eq!(failure.status, Status::Permission);
     assert!(matches!(
@@ -603,18 +705,39 @@ fn independent_create_rechecks_version_exhaustion_before_commit() {
     let mut f = Fixture::new();
     let root = f.backend.root().unwrap().clone();
     f.backend.node_mut(&root).unwrap().version = u64::MAX - 1;
-    let first = f.backend.prepare_create(
-        f.scope(), root.clone(), "first", NodeKind::Stream, FsRights::ALL, &[],
-    ).unwrap();
-    let second = f.backend.prepare_create(
-        f.scope(), root, "second", NodeKind::Stream, FsRights::ALL, &[],
-    ).unwrap();
-    f.backend.commit(first).unwrap_or_else(|failed| panic!("last version create failed: {:?}", failed.status));
+    let first = f
+        .backend
+        .prepare_create(
+            f.scope(),
+            root.clone(),
+            "first",
+            NodeKind::Stream,
+            FsRights::ALL,
+            &[],
+        )
+        .unwrap();
+    let second = f
+        .backend
+        .prepare_create(
+            f.scope(),
+            root,
+            "second",
+            NodeKind::Stream,
+            FsRights::ALL,
+            &[],
+        )
+        .unwrap();
+    f.backend
+        .commit(first)
+        .unwrap_or_else(|failed| panic!("last version create failed: {:?}", failed.status));
     let failure = f.backend.commit(second).err().unwrap();
     assert_eq!(failure.status, Status::Resource);
     drop(failure);
     assert_eq!(f.account.usage(FsResource::Node).0, 2);
-    assert!(matches!(f.backend.resolve(f.scope(), "second", true), Err(Status::NotFound)));
+    assert!(matches!(
+        f.backend.resolve(f.scope(), "second", true),
+        Err(Status::NotFound)
+    ));
 }
 
 #[test]

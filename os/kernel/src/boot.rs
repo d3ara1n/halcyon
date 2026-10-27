@@ -6,8 +6,19 @@ use erhino_shared::boot::{BootPackage, validate_boot_package};
 use crate::{frame, mm, task};
 
 mod bootstrap;
+mod watch;
 
 const PAGE_SIZE: usize = erhino_shared::proc::PROCESS_PAGE_SIZE;
+
+static PLATFORM: crate::sync::Spinlock<
+    Option<(frame::DeviceTreeReservation, crate::board::io::IoRoots)>,
+> = crate::sync::Spinlock::new(crate::sync::ranks::LEAF, None);
+
+pub(crate) fn retain_platform(tree: frame::DeviceTreeReservation, io: crate::board::io::IoRoots) {
+    let mut slot = PLATFORM.lock();
+    assert!(slot.is_none(), "device tree reservation published twice");
+    *slot = Some((tree, io));
+}
 
 /// 在 DT 声明的最大窗口内验证 envelope，返回应保留的实际总长。
 /// 调用点位于正式直映射启用后、帧池注册前。
@@ -50,12 +61,17 @@ pub fn load(address: usize, length: usize) {
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
     task::memory_pool::MemoryPool::self_test(&root_pool);
     frame::selftest::run(&root_pool);
+    let (device_tree, io) = PLATFORM
+        .lock()
+        .take()
+        .expect("device tree reservation missing");
     bootstrap::publish(
         image,
         package.initial_elf,
         prefix_held,
         payload_held,
         payload_len,
+        (device_tree, io),
         root_pool,
     )
     .expect("initial process construction cannot be admitted");

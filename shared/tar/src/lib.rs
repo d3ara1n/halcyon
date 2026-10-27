@@ -1,4 +1,4 @@
-//! ustar 归档就地游标：零拷贝遍历 initfs（与 os/dtb 同范式，host 可测）。
+//! ustar 归档就地游标：零拷贝遍历 initfs（与 shared/dtb 同范式，host 可测）。
 //!
 //! 只覆盖 initfs 打包所用的 ustar 子集：普通文件与目录项、512 字节块对齐、
 //! 双全零块终止。GNU/POSIX 扩展头（typeflag 'x'/'g'/…）按格式错误处理。

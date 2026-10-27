@@ -1,7 +1,7 @@
 //! 文件领域知识、线上协议及 provider 选用的实际内存 backing。
 
 #![cfg_attr(not(test), no_std)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 extern crate alloc;
 
 pub mod authority;

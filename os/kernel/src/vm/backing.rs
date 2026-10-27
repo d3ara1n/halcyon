@@ -18,6 +18,7 @@ static NEXT_BACKING: monotonic_id::AtomicId64 = monotonic_id::AtomicId64::new(1)
 struct State {
     segments: SegmentMap<PhysicalExtent, MetadataCharge>,
     root: Option<ReleaseCursor>,
+    acquisitions: usize,
 }
 
 pub(crate) enum PhysicalExtent {
@@ -89,6 +90,33 @@ impl BackingOwner {
             .expect("backing owner already retired")
             .backing()
     }
+
+    /// 初始化尚未交给执行主体的完整域；一次只写页内数据。
+    ///
+    /// # Safety
+    /// 本域没有可运行消费者、其他写入者或可发布的映射；调用者须在任何
+    /// 消费者获准执行前结束全部初始化。此函数不能绕过已发布对象的写权限。
+    pub(crate) unsafe fn initialize_page(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), SystemCallError> {
+        let page = offset / memory_space::PAGE_SIZE;
+        let in_page = offset % memory_space::PAGE_SIZE;
+        if bytes.len() > memory_space::PAGE_SIZE - in_page {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let usage = self.usage.as_ref().ok_or(SystemCallError::ObjectClosed)?;
+        let (physical, _) = usage
+            .physical_span(page as u64)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        let destination = crate::mm::phys_to_virt(physical.0 * memory_space::PAGE_SIZE) + in_page;
+        // SAFETY: 完整域 owner 保活物理页；上方限定页内范围，调用者保证初始化独占。
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination as *mut u8, bytes.len())
+        };
+        Ok(())
+    }
 }
 impl Drop for BackingOwner {
     fn drop(&mut self) {
@@ -106,15 +134,16 @@ impl Drop for BackingOwner {
                     .begin_release(range)
                     .expect("root use changed owner"),
             );
+            // 与 acquisition 归还、root 终态同门发布，不能把可迟到的 activate 带出门。
+            let root: Arc<dyn Work> = usage.backing.clone();
+            mt::publish(root);
         }
-        let root: Arc<dyn Work> = usage.backing.clone();
-        mt::publish(root);
         mt::kick();
     }
 }
 
-/// 仿射 View 责任；准备失败也须交回准备 owner，不能以 Drop 创建新调度任务。
-#[must_use = "a backing use must be transferred to a view or retired by its operation owner"]
+/// 仿射 RAM 使用责任；View/DMA 的准备失败也交回原 owner，不以 Drop 创建新任务。
+#[must_use = "a backing use must be transferred to its consumer or retired by its operation owner"]
 pub(crate) struct BackingUse {
     backing: Arc<Backing>,
     range: Option<RangeUse>,
@@ -277,6 +306,7 @@ impl Backing {
                 State {
                     segments,
                     root: None,
+                    acquisitions: 0,
                 },
             ),
             record: WorkRecord::new(pool.maintenance_account().clone()),
@@ -319,6 +349,36 @@ impl Backing {
         Ok(Some(BackingUse {
             backing: self.clone(),
             range: Some(range),
+        }))
+    }
+
+    /// 源授权门内接受；完整域最终退休在这个游标退出前不能递减 root use。
+    pub(crate) fn begin_acquire(
+        self: &Arc<Self>,
+        lo: u64,
+        hi: u64,
+        storage: &mut BackingStorage,
+    ) -> Result<Option<BackingAcquisition>, SystemCallError> {
+        let cursor = {
+            let mut state = self.state.lock();
+            let count = state
+                .acquisitions
+                .checked_add(1)
+                .ok_or(SystemCallError::ReachLimit)?;
+            let mut reserve = match state.segments.reserve(2, storage) {
+                Ok(reserve) => reserve,
+                Err(BackingError::CapacityChanged) => return Ok(None),
+                Err(error) => return Err(map_error(error)),
+            };
+            let result = state.segments.begin_acquire(lo, hi, &mut reserve);
+            state.segments.unreserve(reserve);
+            let cursor = result.map_err(map_error)?;
+            state.acquisitions = count;
+            cursor
+        };
+        Ok(Some(BackingAcquisition {
+            backing: self.clone(),
+            cursor: Some(cursor),
         }))
     }
 
@@ -426,6 +486,59 @@ impl BackingUse {
     }
 }
 
+/// 已授权的分步取得；调用者的预付 owner 在退出/失败时归还已持前缀。
+pub(crate) struct BackingAcquisition {
+    backing: Arc<Backing>,
+    cursor: Option<memory_space::AcquireCursor>,
+}
+impl BackingAcquisition {
+    pub(crate) fn step(&mut self) -> Result<bool, SystemCallError> {
+        self.backing
+            .state
+            .lock()
+            .segments
+            .acquire_step(self.cursor.as_mut().expect("acquisition finished"))
+            .map_err(map_error)
+    }
+    /// 只返还已取得前缀；成功者必须先由 step 确认完整，取消者负责退休此前缀。
+    pub(crate) fn finish(mut self) -> Option<BackingUse> {
+        let (range, wake) = {
+            let mut state = self.backing.state.lock();
+            let range = state
+                .segments
+                .finish_acquire(self.cursor.take().expect("acquisition finished twice"));
+            assert!(
+                state.acquisitions != 0,
+                "backing acquisition count underflow"
+            );
+            state.acquisitions -= 1;
+            let wake = state.acquisitions == 0 && state.root.is_some();
+            if wake {
+                // 同 BACKING 门下 root 尚未结束；当前 acquisition 还强持 backing，
+                // publish 不可能在门内析构最后根。门铃仍在锁外发送。
+                let work: Arc<dyn Work> = self.backing.clone();
+                mt::publish(work);
+            }
+            (range, wake)
+        };
+        if wake {
+            mt::kick();
+        }
+        range.map(|range| BackingUse {
+            backing: self.backing.clone(),
+            range: Some(range),
+        })
+    }
+}
+impl Drop for BackingAcquisition {
+    fn drop(&mut self) {
+        assert!(
+            self.cursor.is_none(),
+            "backing acquisition abandoned without rollback"
+        );
+    }
+}
+
 impl Work for Backing {
     fn record(&self) -> &WorkRecord {
         &self.record
@@ -433,7 +546,10 @@ impl Work for Backing {
     fn step(self: Arc<Self>) -> Outcome {
         let (step, storage) = {
             let mut state = self.state.lock();
-            let State { segments, root } = &mut *state;
+            if state.acquisitions != 0 {
+                return Outcome::Idle;
+            }
+            let State { segments, root, .. } = &mut *state;
             let step = segments.release_step(
                 root.as_mut()
                     .expect("backing final retirement has no owner"),

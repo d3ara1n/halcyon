@@ -94,6 +94,12 @@ impl InitialGrants {
         self.slots.is_empty()
     }
 
+    /// 尚由应用拥有的实际能力数；不含已由 runtime 采用的入口线程控制槽。
+    /// 原始索引保持不变，完整启动数组的几何校验仍使用 len。
+    pub fn remaining(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
     pub fn take(&mut self, index: usize) -> Option<Capability> {
         self.slots
             .get_mut(index)
@@ -260,6 +266,13 @@ fn adoptable_kind(kind: u32) -> Option<ObjectKind> {
         value if value == ObjectKind::Delivery as u32 => ObjectKind::Delivery,
         value if value == ObjectKind::WaitSet as u32 => ObjectKind::WaitSet,
         value if value == ObjectKind::ReplyObserver as u32 => ObjectKind::ReplyObserver,
+        value if value == ObjectKind::MmioControl as u32 => ObjectKind::MmioControl,
+        value if value == ObjectKind::MmioUse as u32 => ObjectKind::MmioUse,
+        value if value == ObjectKind::IrqControl as u32 => ObjectKind::IrqControl,
+        value if value == ObjectKind::IrqUse as u32 => ObjectKind::IrqUse,
+        value if value == ObjectKind::DmaDomainControl as u32 => ObjectKind::DmaDomainControl,
+        value if value == ObjectKind::DmaUse as u32 => ObjectKind::DmaUse,
+        value if value == ObjectKind::DmaMapping as u32 => ObjectKind::DmaMapping,
         _ => return None,
     })
 }
@@ -381,6 +394,7 @@ mod tests {
         assert_eq!(process.parent_pid(), 3);
         assert_eq!(payload.as_bytes(), b"payload");
         assert_eq!(grants.len(), 65);
+        assert_eq!(grants.remaining(), 64);
         assert!(
             grants.take(64).is_none(),
             "entry control must not be exposed to the application"
@@ -389,6 +403,7 @@ mod tests {
             .try_adopt(ObjectKind::MailboxSender)
             .expect("kind adoption must consume the matching grant");
         assert!(grants.try_adopt(ObjectKind::MailboxSender).is_none());
+        assert_eq!(grants.remaining(), 63);
         core::mem::forget(sender);
         core::mem::forget(grants);
     }
@@ -397,6 +412,18 @@ mod tests {
     fn startup_adoption_whitelist_rejects_tunnel_endpoint() {
         assert_eq!(adoptable_kind(ObjectKind::TunnelEndpoint as u32), None);
         assert_eq!(adoptable_kind(ObjectKind::ThreadStartTicket as u32), None);
+    }
+
+    #[test]
+    fn startup_adoption_accepts_mmio_authority_roles() {
+        assert_eq!(
+            adoptable_kind(ObjectKind::MmioControl as u32),
+            Some(ObjectKind::MmioControl)
+        );
+        assert_eq!(
+            adoptable_kind(ObjectKind::MmioUse as u32),
+            Some(ObjectKind::MmioUse)
+        );
     }
 
     #[test]

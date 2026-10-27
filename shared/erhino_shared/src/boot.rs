@@ -99,13 +99,22 @@ pub fn validate_boot_package(
         return Err(BootPackageError::NonzeroReserved);
     }
 
-    let total = usize::try_from(header.total_len).map_err(|_| BootPackageError::GeometryOverflow)?;
-    let init_off = usize::try_from(header.init_off).map_err(|_| BootPackageError::GeometryOverflow)?;
-    let init_len = usize::try_from(header.init_len).map_err(|_| BootPackageError::GeometryOverflow)?;
-    let payload_off = usize::try_from(header.payload_off).map_err(|_| BootPackageError::GeometryOverflow)?;
-    let payload_len = usize::try_from(header.payload_len).map_err(|_| BootPackageError::GeometryOverflow)?;
-    let init_end = init_off.checked_add(init_len).ok_or(BootPackageError::GeometryOverflow)?;
-    let payload_end = payload_off.checked_add(payload_len).ok_or(BootPackageError::GeometryOverflow)?;
+    let total =
+        usize::try_from(header.total_len).map_err(|_| BootPackageError::GeometryOverflow)?;
+    let init_off =
+        usize::try_from(header.init_off).map_err(|_| BootPackageError::GeometryOverflow)?;
+    let init_len =
+        usize::try_from(header.init_len).map_err(|_| BootPackageError::GeometryOverflow)?;
+    let payload_off =
+        usize::try_from(header.payload_off).map_err(|_| BootPackageError::GeometryOverflow)?;
+    let payload_len =
+        usize::try_from(header.payload_len).map_err(|_| BootPackageError::GeometryOverflow)?;
+    let init_end = init_off
+        .checked_add(init_len)
+        .ok_or(BootPackageError::GeometryOverflow)?;
+    let payload_end = payload_off
+        .checked_add(payload_len)
+        .ok_or(BootPackageError::GeometryOverflow)?;
     let canonical_payload_off = align_up(init_end, page_size)?;
     let canonical_total = align_up(payload_end, page_size)?;
 
@@ -187,7 +196,12 @@ mod tests {
         assert_eq!(view.header.total_len as usize, bytes.len());
 
         let empty = package(b"ELF", b"");
-        assert!(validate_boot_package(&empty, PAGE).unwrap().payload.is_empty());
+        assert!(
+            validate_boot_package(&empty, PAGE)
+                .unwrap()
+                .payload
+                .is_empty()
+        );
     }
 
     #[test]
@@ -210,8 +224,7 @@ mod tests {
     fn rejects_noncanonical_offsets() {
         let mut bytes = package(b"ELF", b"archive");
         let payload_off_field = 40;
-        bytes[payload_off_field..payload_off_field + 8]
-            .copy_from_slice(&(8192u64).to_le_bytes());
+        bytes[payload_off_field..payload_off_field + 8].copy_from_slice(&(8192u64).to_le_bytes());
         assert_eq!(
             validate_boot_package(&bytes, PAGE).unwrap_err(),
             BootPackageError::NoncanonicalLayout

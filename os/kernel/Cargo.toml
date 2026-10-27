@@ -7,7 +7,7 @@ edition = "2024"
 [dependencies]
 funded_storage = { path = "../../shared/funded_storage" }
 erhino_shared = { path = "../../shared/erhino_shared" }
-dtb = { path = "../dtb" }
+dtb = { path = "../../shared/dtb" }
 lock_api = "0.4"
 talc = { version = "5", features = ["counters"] }
 page_table = { path = "../page_table" }
@@ -22,6 +22,9 @@ remote_call = { path = "../remote_call" }
 runtime_gate = { path = "../runtime_gate" }
 memory_space = { path = "../memory_space" }
 maintenance = { path = "../maintenance" }
+resource_tree = { path = "../resource_tree" }
+plic = { path = "../plic" }
+dma = { path = "../dma" }
 capability = { path = "../capability" }
 memory_supply = { path = "../memory_supply" }
 memory_pool = { path = "../memory_pool" }

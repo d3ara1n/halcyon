@@ -20,6 +20,9 @@ pub use sched_domain::HartCapabilities;
 
 use crate::hart::HART_NUM_LIMIT;
 
+pub(crate) mod io;
+pub(crate) mod irq;
+
 #[derive(Clone, Copy)]
 pub struct Cpu {
     pub hartid: usize,
@@ -67,6 +70,7 @@ struct BoardMemory {
 }
 
 pub struct BoardInfo {
+    pub(crate) io: io::IoRoots,
     cpus: [Cpu; HART_NUM_LIMIT],
     cpu_len: usize,
     memories: [MemoryRegion; MAX_MEMORY_REGIONS],
@@ -404,8 +408,16 @@ pub fn parse(fdt: &Fdt, dtb_pa: usize) -> BoardInfo {
     // 平台 RAM、FDT reservation block、静态 /reserved-memory 与直映射 admission
     // 由独立零堆阶段完成；dynamic/reusable 在对应生命周期机制落地前 fail closed。
     let memory = parse_memory(fdt, dtb_pa, boot_package);
+    let mut io = io::admit(fdt, &memory).expect("platform IO admission failed");
+    if let Some(pci) = io.mmio().first() {
+        io.irq = Some(
+            irq::admit(fdt, &memory, &cpus[..cpu_len], pci.node_offset)
+                .expect("platform IRQ admission failed"),
+        );
+    }
 
     BoardInfo {
+        io,
         cpus,
         cpu_len,
         memories: memory.memories,

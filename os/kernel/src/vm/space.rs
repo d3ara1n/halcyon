@@ -113,8 +113,37 @@ pub(crate) struct ChangeProgress {
     committed: Option<memory_space::CommittedChange<MetadataCharge>>,
     footprint: memory_space::PageRange,
     ledger_done: bool,
-    cursors: Buffer<PublishCursor, MetadataCharge>,
+    cursors: PublishCursors,
     reserve: Buffer<FundedTableFrame, MetadataCharge>,
+}
+
+enum PublishCursors {
+    Prepared(Buffer<PublishCursor, MetadataCharge>),
+    Inline(Option<PublishCursor>),
+}
+impl PublishCursors {
+    fn last_mut(&mut self) -> Option<&mut PublishCursor> {
+        match self {
+            Self::Prepared(value) => value.last_mut(),
+            Self::Inline(value) => value.as_mut(),
+        }
+    }
+    fn pop(&mut self) {
+        match self {
+            Self::Prepared(value) => {
+                value.pop();
+            }
+            Self::Inline(value) => {
+                value.take();
+            }
+        }
+    }
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Prepared(value) => value.is_empty(),
+            Self::Inline(value) => value.is_none(),
+        }
+    }
 }
 
 impl ChangeProgress {
@@ -128,8 +157,25 @@ impl ChangeProgress {
             committed: Some(committed),
             footprint,
             ledger_done: false,
-            cursors,
+            cursors: PublishCursors::Prepared(cursors),
             reserve,
+        }
+    }
+
+    /// 完整基础页 MMIO 片段删除使用 Work 内联游标，不需要拆大页供给或堆数组。
+    pub(super) fn forced_remove(
+        committed: memory_space::CommittedChange<MetadataCharge>,
+        footprint: memory_space::PageRange,
+    ) -> Self {
+        Self {
+            committed: Some(committed),
+            footprint,
+            ledger_done: false,
+            cursors: PublishCursors::Inline(Some(PublishCursor::unmap(
+                page_table::Vpn(footprint.start() / memory_space::PAGE_SIZE),
+                footprint.pages(),
+            ))),
+            reserve: Buffer::new(),
         }
     }
 
@@ -196,6 +242,8 @@ pub(crate) struct AnySpace {
     ledger: memory_space::MemorySpace<crate::task::resources::MetadataCharge>,
     tree: TableTree<TableMem, LEVELS>,
     account: alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
+    /// 同一实物来源账本；View 从 PTE 发布前保留到翻译同步后，覆盖几何账本的分步空窗。
+    views: alloc::sync::Arc<super::views::Views>,
 }
 
 impl AnySpace {
@@ -228,10 +276,11 @@ impl AnySpace {
             }
             _ => SystemCallError::OutOfMemory,
         })?;
-        Ok(Self::new(ledger, root, account))
+        let views = super::views::Views::try_new(&account)?;
+        Ok(Self::new(ledger, root, account, views))
     }
 
-    /// 与 SUM 访问同持空间锁，逐页检查用户权限，不建立第二套页表遍历。
+    /// 与 SUM 访问同持空间锁，逐页检查 RAM 来源及用户权限，不建立第二套页表遍历。
     pub(crate) fn check_range(
         &mut self,
         ptr: usize,
@@ -250,6 +299,9 @@ impl AnySpace {
         }
         let required = flags::U | if writable { flags::W } else { flags::R };
         for vpn in ptr / PROCESS_PAGE_SIZE..=(end - 1) / PROCESS_PAGE_SIZE {
+            if !self.views.is_ram_at(vpn * PROCESS_PAGE_SIZE) {
+                return Err(AccessError::Permission);
+            }
             let mapped = self
                 .tree
                 .translate(Vpn(vpn))
@@ -288,6 +340,9 @@ impl AnySpace {
             (entry, flags::U | flags::X),
             (stack - 1, flags::U | flags::W),
         ] {
+            if !self.views.is_ram_at(address) {
+                return Err(SystemCallError::MemoryNotAccessible);
+            }
             let mapped = self
                 .tree
                 .translate(Vpn(address / PROCESS_PAGE_SIZE))
@@ -314,6 +369,7 @@ impl AnySpace {
         ledger: memory_space::MemorySpace<crate::task::resources::MetadataCharge>,
         root: FundedTableFrame,
         account: alloc::sync::Arc<crate::task::memory_pool::MemoryPool>,
+        views: alloc::sync::Arc<super::views::Views>,
     ) -> Self {
         assert!(
             root.charge_pool_is(&account),
@@ -331,7 +387,12 @@ impl AnySpace {
             ledger,
             tree,
             account,
+            views,
         }
+    }
+
+    pub(crate) fn views(&self) -> &alloc::sync::Arc<super::views::Views> {
+        &self.views
     }
 
     pub(crate) fn account(&self) -> &alloc::sync::Arc<crate::task::memory_pool::MemoryPool> {
@@ -381,7 +442,7 @@ impl AnySpace {
     pub(crate) fn plan_cursors(
         intents: &[memory_space::TranslationIntent],
         payer: &MetadataFunding<'_>,
-        mut resolve: impl FnMut(&memory_space::BackingView, usize) -> Option<(page_table::Ppn, usize)>,
+        mut resolve: impl FnMut(&memory_space::MappingOrigin, usize) -> Option<(page_table::Ppn, usize)>,
     ) -> Result<(Buffer<PublishCursor, MetadataCharge>, usize), erhino_shared::call::SystemCallError>
     {
         use erhino_shared::call::SystemCallError;
@@ -409,6 +470,11 @@ impl AnySpace {
                             count,
                             ppn,
                             protection_flags(protection),
+                            if backing.is_ram() {
+                                page_table::LeafSize::Largest
+                            } else {
+                                page_table::LeafSize::BasePage
+                            },
                         );
                         frames = frames
                             .checked_add(page_table::worst_case_frames::<LEVELS>(&cursor))

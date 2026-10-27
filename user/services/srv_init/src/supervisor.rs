@@ -226,6 +226,9 @@ struct CapabilityEntry {
 }
 
 pub(super) struct RootSupervisor {
+    pub(super) drivers: Option<super::driver::Manager>,
+    pub(super) devices: Option<super::device::Manager>,
+    pub(super) device_observer: Option<super::device_supervision::Observer>,
     assembly: Assembly<WaitSet>,
     capabilities: Vec<CapabilityEntry>,
     capability_cursor: usize,
@@ -358,6 +361,9 @@ impl RootSupervisor {
             error
         })?;
         Ok(Self {
+            drivers: None,
+            devices: None,
+            device_observer: None,
             assembly,
             capabilities: Vec::new(),
             capability_cursor: 0,
@@ -376,6 +382,9 @@ impl RootSupervisor {
         })
     }
 
+    pub(super) fn reset_authority(&self) -> Option<Handle> {
+        self.reset
+    }
     pub(super) fn take_reset(&mut self) -> Handle {
         self.reset
             .take()
@@ -445,6 +454,25 @@ impl RootSupervisor {
             Ok(handle) => {
                 self.adopt(slot, handle);
                 Ok(handle)
+            }
+            Err(error) => {
+                self.capabilities[slot].reserved = false;
+                Err(error)
+            }
+        }
+    }
+    pub(super) fn derive_pool(
+        &mut self,
+        parent: Handle,
+        budget: libkernel::shared::memory_pool::MemoryPoolBudget,
+        rights: Rights,
+    ) -> Result<Handle, SystemCallError> {
+        let [slot] = self.reserve_capabilities()?;
+        match libkernel::memory_pool::derive(parent, budget, rights) {
+            Ok(child) => {
+                let child = child.into_handle();
+                self.adopt(slot, child);
+                Ok(child)
             }
             Err(error) => {
                 self.capabilities[slot].reserved = false;
@@ -938,7 +966,11 @@ impl RootSupervisor {
     }
 
     /// 一台运行体被策略错误停驻时，另一台批次仍完成，并恢复原 Job 机器。
-    pub(super) fn verify_failure_isolation(&mut self, parent: Handle) -> Result<(), &'static str> {
+    pub(super) fn verify_failure_isolation(
+        &mut self,
+        parent: Handle,
+        completed: [u64; 2],
+    ) -> Result<(), &'static str> {
         let child = self
             .create_job(parent, crate::root_memory_pool(), JOB_FULL_RIGHTS)
             .map_err(|_| "root isolation Job create failed")?;
@@ -965,7 +997,7 @@ impl RootSupervisor {
                 break;
             }
         }
-        self.verify_batch_handoff()?;
+        self.verify_batch_handoff(completed)?;
         let now = libkernel::time::snapshot()
             .map_err(|_| "root isolation clock failed")?
             .now_ns;
@@ -995,9 +1027,13 @@ impl RootSupervisor {
     }
 
     /// 使用正式运行体验证部分准入、失败结果和健康成员的独立推进。
-    pub(super) fn verify_batch_handoff(&mut self) -> Result<(), &'static str> {
-        if self.processes.len() < 2 {
-            return Err("supervision handoff requires two launched services");
+    pub(super) fn verify_batch_handoff(&mut self, completed: [u64; 2]) -> Result<(), &'static str> {
+        if completed[0] == completed[1]
+            || completed
+                .iter()
+                .any(|pid| !self.processes.iter().any(|target| target.pid == *pid))
+        {
+            return Err("supervision handoff requires two distinct retained service controls");
         }
         let mut incoming = Vec::new();
         incoming
@@ -1012,8 +1048,15 @@ impl RootSupervisor {
             .map_err(|_| "handoff funding preparation failed")?;
         let test_runtime = runtime(&self.assembly, 1, 2, &test_view)
             .map_err(|_| "handoff runtime preparation failed")?;
-        incoming.push(self.processes.pop().expect("two controls were verified"));
-        incoming.push(self.processes.pop().expect("two controls were verified"));
+        // 具体业务owner已经授权收集；不依赖ledger尾部顺序，也不接管仍持硬件责任的管理者。
+        for pid in completed {
+            let index = self
+                .processes
+                .iter()
+                .position(|target| target.pid == pid)
+                .expect("handoff control was verified");
+            incoming.push(self.processes.swap_remove(index));
+        }
         let index = self.begin_batch(incoming, None);
         let duty = self.batches[index]
             .as_mut()
@@ -1120,7 +1163,13 @@ impl RootSupervisor {
             .try_reserve_exact(1)
             .map_err(|_| "client preparation failed")?;
         clients.push(pending);
-        self.start_clients(clients, inflight, client_sources, ReadWorld::default(), None)
+        self.start_clients(
+            clients,
+            inflight,
+            client_sources,
+            ReadWorld::default(),
+            None,
+        )
     }
     fn start_clients(
         &mut self,
@@ -1831,9 +1880,9 @@ impl RootSupervisor {
             .step(now, libkernel::ipc::tunnel::Endpoint::close);
         self.capability_cleanup.step(now, Capability::close);
         if self.failing {
-            for index in 0..ROOT_JOB_SLOTS {
-                if self.jobs[index].as_ref().is_some_and(|duty| duty.complete) {
-                    self.jobs[index] = None;
+            for duty in &mut self.jobs {
+                if duty.as_ref().is_some_and(|duty| duty.complete) {
+                    *duty = None;
                 }
             }
             for duty in &mut self.batches {
@@ -2024,20 +2073,19 @@ impl RootSupervisor {
         Ok(())
     }
 
-    pub(super) fn serve_forever(self) -> ! {
-        self.serve(true)
-    }
-    pub(super) fn idle_forever(self) -> ! {
-        self.serve(false)
-    }
-
-    fn serve(mut self, failing: bool) -> ! {
-        self.failing = failing;
+    pub(super) fn serve_forever(mut self) -> ! {
+        if let Some(observer) = self.device_observer.as_ref() {
+            observer.fail("main device assembly failure");
+        }
+        if let Some(driver) = self.drivers.as_ref() {
+            driver.fault_seal();
+        }
+        self.failing = true;
         if !self.processes.is_empty() {
             let incoming = core::mem::take(&mut self.processes);
             self.begin_batch(incoming, None);
         }
-        if failing && let Some(services) = self.services {
+        if let Some(services) = self.services {
             self.begin_job(services, None);
         }
         debug!("init: persistent root supervisor owns all pending duties");

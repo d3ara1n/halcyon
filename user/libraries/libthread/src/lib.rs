@@ -326,6 +326,16 @@ impl<E: ThreadEnvironment> ThreadRegistry<E> {
         None
     }
 
+    /// 直接读取仍持有准备/执行/退休责任的原槽；不维护镜像计数。
+    pub fn retained_records(&self) -> usize {
+        self.inner
+            .lock()
+            .slots
+            .iter()
+            .filter(|slot| !matches!(slot, SlotState::Free))
+            .count()
+    }
+
     /// Reap at most `budget` records. It never waits for a child or runs user
     /// code; undone threads and Busy mappings return to Live.
     pub fn reap(&self, budget: usize) -> ReapProgress {

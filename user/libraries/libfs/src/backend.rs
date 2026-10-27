@@ -1412,7 +1412,12 @@ impl MemoryBackend {
                 self.check_directory_scope(access, parent)?;
                 self.check(access, parent, FsRights::CREATE)?;
                 // 创建只要求本名字仍空闲；其他成员变更不使预付准备失效。
-                if self.directory(parent)?.members.get_by(entry.key_ref().as_str()).is_some() {
+                if self
+                    .directory(parent)?
+                    .members
+                    .get_by(entry.key_ref().as_str())
+                    .is_some()
+                {
                     return Err(Status::Conflict);
                 }
                 self.version(parent)?;

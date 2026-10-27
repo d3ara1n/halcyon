@@ -1,5 +1,5 @@
 #![no_std]
-#![cfg_attr(target_arch = "riscv64", feature(allocator_api))]
+#![cfg_attr(target_arch = "riscv64", feature(allocator_ext))]
 extern crate alloc;
 #[cfg(target_arch = "riscv64")]
 pub mod registry;
@@ -25,7 +25,7 @@ pub mod handoff {
 
 pub mod command {
     /// 根编排的阶段预算；双向报告、命令和最终收集使用同一真值。
-    pub const PHASE_TIMEOUT_MILLIS: u64 = 120_000;
+    pub const PHASE_TIMEOUT_MILLIS: u64 = 240_000;
     pub const CONTINUE: u64 = 1;
     pub const OBSERVE_SHUTDOWN: u64 = 2;
 }

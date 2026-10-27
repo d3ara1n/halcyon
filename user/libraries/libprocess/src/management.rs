@@ -32,7 +32,9 @@ pub use supervise::{
 };
 
 const MAX_MAP_BYTES: usize = erhino_shared::proc::PROCESS_MAP_MAX_BYTES;
-const MAX_WRITE_BYTES: usize = 1 << 20;
+/// 同一loader每次ProcessWrite的最大输入；内核按实际输入从调用者Pool支付临时metadata。
+/// 组装者须在目标进程预算之外预留该同步写入峰值，不能把目标Pool预付当作调用者付款。
+pub const LOADER_WRITE_BUFFER_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnError {
@@ -142,8 +144,83 @@ impl RequiredLaunchSet {
     }
 }
 
-/// 解析静态 ET_EXEC，构造地址空间并首次发布进程。
+/// 未发布进程的affine owner；借用Control只用于准备观察，不转移关闭责任。
+#[must_use = "prepared process must be started or cancelled"]
+pub struct PreparedProcess {
+    created: Option<erhino_shared::proc::ProcessCreateResult>,
+    grants: GrantOutcome,
+}
+impl PreparedProcess {
+    pub fn pid(&self) -> u64 {
+        self.created
+            .as_ref()
+            .expect("prepared process already consumed")
+            .pid
+    }
+    pub fn control(&self) -> Handle {
+        self.created
+            .as_ref()
+            .expect("prepared process already consumed")
+            .control
+    }
+    pub fn grants(&self) -> GrantOutcome {
+        self.grants
+    }
+    /// 真实Start成功才移交Control；失败保留原GrantOutcome并沿同一取消/清理路径收束。
+    pub fn start(mut self) -> Result<Spawned, SpawnFailure> {
+        let created = self
+            .created
+            .take()
+            .expect("prepared process already consumed");
+        match process::start(created.builder) {
+            Ok(()) => Ok(Spawned {
+                pid: created.pid,
+                control: created.control,
+            }),
+            Err(error) => {
+                // SAFETY: Start失败不消费builder；本owner仍独占原Create结果。
+                let cleanup_error = unsafe { process::abandon_to_completion(created) }.err();
+                Err(SpawnFailure {
+                    error: error.into(),
+                    grants: self.grants,
+                    cleanup_error,
+                })
+            }
+        }
+    }
+    pub fn cancel(mut self) -> Result<GrantOutcome, SpawnFailure> {
+        let created = self
+            .created
+            .take()
+            .expect("prepared process already consumed");
+        // SAFETY: 从未Start，Create结果的两枚handle关闭责任唯一在本owner。
+        unsafe { process::abandon_to_completion(created) }
+            .map(|()| self.grants)
+            .map_err(|error| SpawnFailure {
+                error: error.into(),
+                grants: self.grants,
+                cleanup_error: Some(error),
+            })
+    }
+}
+impl Drop for PreparedProcess {
+    fn drop(&mut self) {
+        if let Some(created) = self.created.take() {
+            // SAFETY: 没有执行Start或已移交Control；尚存结果只能是原未发布Create。
+            if let Err(error) = unsafe { process::abandon_to_completion(created) } {
+                // 未确认清理不能静默当成功；程序环境决定完整进程的panic终局。
+                panic!("unstarted process cleanup failed: {:?}", error);
+            }
+        }
+    }
+}
+/// 普通出生仍使用同一准备/Start实现，不另建loader或启动接续。
 pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
+    prepare(request)?.start()
+}
+
+/// 解析静态ET_EXEC并完成出生块/授权组装；未调用Start，调用者可先挂观察。
+pub fn prepare(request: SpawnRequest<'_>) -> Result<PreparedProcess, SpawnFailure> {
     if !request.control_rights.contains(Rights::MANAGE) {
         return Err(SpawnFailure::retained(SpawnError::System(
             SystemCallError::RightsDenied,
@@ -163,14 +240,21 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
     }
 
     let created = process::create(request.job, request.memory_pool, request.control_rights)
+        .inspect_err(|error| libkernel::debug!("process preparation Create failed: {:?}", error))
         .map_err(|error| SpawnFailure::retained(SpawnError::System(error)))?;
     let builder = created.builder;
 
     let mut grants_consumed = false;
-    let result: Result<Spawned, SpawnError> = (|| {
-        map_plan(builder, &image)?;
-        write_segments(builder, &image, request.image)?;
-        let (stack_start, stack_len) = map_stack(builder)?;
+    let result: Result<(), SpawnError> = (|| {
+        map_plan(builder, &image).inspect_err(|error| {
+            libkernel::debug!("process preparation ELF Map failed: {:?}", error)
+        })?;
+        write_segments(builder, &image, request.image).inspect_err(|error| {
+            libkernel::debug!("process preparation ELF Write failed: {:?}", error)
+        })?;
+        let (stack_start, stack_len) = map_stack(builder).inspect_err(|error| {
+            libkernel::debug!("process preparation stack Map failed: {:?}", error)
+        })?;
 
         let profile = match image.requirement() {
             elf::IsaRequirement::Base64 => ExecutionProfile::Base64,
@@ -245,11 +329,7 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
             return Err(SpawnError::InvalidImage);
         }
         process::write(builder, block_va, &block)?;
-        process::start(builder)?;
-        Ok(Spawned {
-            pid: created.pid,
-            control: created.control,
-        })
+        Ok(())
     })();
 
     let cleanup_error = if result.is_err() {
@@ -258,15 +338,24 @@ pub fn spawn(request: SpawnRequest<'_>) -> Result<Spawned, SpawnFailure> {
     } else {
         None
     };
-    result.map_err(|error| SpawnFailure {
-        error,
-        grants: if grants_consumed {
-            GrantOutcome::Consumed
-        } else {
-            GrantOutcome::Retained
-        },
-        cleanup_error,
-    })
+    result
+        .map(|()| PreparedProcess {
+            created: Some(created),
+            grants: if grants_consumed {
+                GrantOutcome::Consumed
+            } else {
+                GrantOutcome::Retained
+            },
+        })
+        .map_err(|error| SpawnFailure {
+            error,
+            grants: if grants_consumed {
+                GrantOutcome::Consumed
+            } else {
+                GrantOutcome::Retained
+            },
+            cleanup_error,
+        })
 }
 
 /// 派生监督所需的成员/子域 control rights：kill+drain 需 MANAGE，等
@@ -1138,7 +1227,14 @@ fn map_plan(builder: Handle, image: &elf::Elf) -> Result<(), SpawnError> {
                 start + offset,
                 MAX_MAP_BYTES.min(bytes - offset),
                 permissions,
-            )?;
+            )
+            .inspect_err(|error| {
+                libkernel::debug!(
+                    "process preparation Map rejected: bytes={}, error={:?}",
+                    MAX_MAP_BYTES.min(bytes - offset),
+                    error
+                )
+            })?;
         }
     }
     Ok(())
@@ -1152,8 +1248,15 @@ fn write_segments(builder: Handle, image: &elf::Elf, file: &[u8]) -> Result<(), 
             .get(offset..offset.checked_add(filesz).ok_or(SpawnError::InvalidImage)?)
             .ok_or(SpawnError::InvalidImage)?;
         let target = usize::try_from(segment.vaddr).map_err(|_| SpawnError::InvalidImage)?;
-        for (index, chunk) in source.chunks(MAX_WRITE_BYTES).enumerate() {
-            process::write(builder, target + index * MAX_WRITE_BYTES, chunk)?;
+        for (index, chunk) in source.chunks(LOADER_WRITE_BUFFER_BYTES).enumerate() {
+            process::write(builder, target + index * LOADER_WRITE_BUFFER_BYTES, chunk)
+                .inspect_err(|error| {
+                    libkernel::debug!(
+                        "process preparation Write rejected: bytes={}, error={:?}",
+                        chunk.len(),
+                        error
+                    )
+                })?;
         }
     }
     Ok(())

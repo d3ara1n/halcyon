@@ -1,0 +1,17 @@
+[package]
+name = "srv_device"
+version = "0.1.0"
+edition = "2024"
+description = "Device registration and binding service"
+
+[dependencies]
+libruntime = { path = "../../libraries/libruntime" }
+libkernel = { path = "../../libraries/libkernel" }
+libdevice = { path = "../../libraries/libdevice" }
+libpci = { path = "../../libraries/libpci" }
+liboal = { path = "../../libraries/liboal" }
+libbudget = { path = "../../libraries/libbudget" }
+libexecution = { path = "../../libraries/libexecution" }
+librpc = { path = "../../libraries/librpc" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+ordered_table = { path = "../../../shared/ordered_table" }

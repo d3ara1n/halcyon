@@ -1,6 +1,6 @@
 //! ustar 遍历测试（host）：构造最小归档验证解析。
 
-use tar::{walk, TarError};
+use tar::{TarError, walk};
 
 /// 构造一个 ustar 头块。
 fn header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {

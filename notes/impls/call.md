@@ -14,9 +14,17 @@ WaitPlan 位于 sched::HART_WAIT_PLANS 的 per-hart 内联槽，交接不分配�
 
 WaitOne 返回当前电平/关闭/到期；Sleep 使用绝对期限。内部 VM 完成计划仅持私有 DONE 来源并标记返回单位值 a1=0，不携带异步用户输出指针。早到完成由安装后复检观察；线程冻结可以放弃回复，不取消独立 Work 已接管的发布/回滚/退款。
 
+## 分步请求
+
+[`task/request.rs`](../../os/kernel/src/task/request.rs) 拥有可让出请求的执行合同。请求按具体载荷 Layout 付款，Box 和 charge 存在 Thread 的独占请求槽；不保存 Thread/ProcessBody 强借用。syscall 先复制固定输入并移交请求，再返回 Requeue，尚不推进 sepc。调度器取得原线程执行资格，经过 Shell/VM enter 后在目标 satp 下调用一次 advance；Pending 保留请求并重新排队，Complete 释放请求后返回寄存器值，Wait 释放准备后转交独立 Work 的完成来源。
+
+目标页表与内核页表共用内核高半区及当前栈，请求期间 IRQ 关闭且不嵌套调度。每次进入和恢复内核 root 都执行全量本地 SFENCE.VMA；恢复后才 RunPermit.leave、排队或安装等待。用户输出继续在当前线程执行 owner 下使用 translate+SUM，output_fault 在业务锁释放且回到内核 root 后发布。请求未完成时不返回用户态，不通过重复执行用户 ecall 推进内部状态。
+
+Frozen reaping 在 Departure 前清空请求槽。请求的 Drop 归还未提交准备，已登记的 VM Operation 则把准备交给出生预付的回滚 Work；已提交工作不需要线程继续调用。当前消费者为普通/MMIO MemoryMap、MMIO/IRQ/DMA 子 control/use 派生及 DMA Pin/ReadSegments/Retire；资源祖先检查每轮一项，Busy 不在内核中自动重试。请求执行计入已授予的 U 类执行机会，不绕过轮转或另建内核线程。
+
 ## VM 真实消费者
 
-公开 MemoryMap/MemoryUnmap/MemoryProtect 分发到 [vm/operation.rs](../../os/kernel/src/vm/operation.rs)。Operation 出生并付款维护宿主/数组/完成来源，取得 VM access 后才受理业务资源；失败移交同记录 Rollback，成功进入 Publishing/fence/直接退休/空表清理。Outcome::Done只结束推进，最后live宿主销毁/退款和访问强根交回后才通知独立来源；持久等待续体复检观察，不造请求专用容器或逐use子任务。
+公开 MemoryMap/MemoryUnmap/MemoryProtect 分发到 [vm/operation.rs](../../os/kernel/src/vm/operation.rs)。MemoryMap 的 MapCall 在 Thread 请求槽中持准备阶段，MMIO 的祖先检查可以跨轮次；Operation 出生并付款维护宿主/数组/完成来源，取得 VM access 后才受理实物资源。失败移交同记录 Rollback，成功进入 Publishing/fence/直接退休/空表清理。Outcome::Done只结束推进，最后live宿主销毁/退款和访问强根交回后才通知独立来源；持久等待续体复检观察，不为逐 use 创建子任务。
 
 Map 按共享 ABI 解释 guard 字节数，结果槽由 UserWriteLease 预约。调用线程在自己的用户页表下、持 VM 锁写 payload 前缀，再 atomic release store committed cookie，随后 Views/ledger 的责任 Commit 必成，不再 uaccess。PTE/ledger 发布在 Work 中按预算推进；数据与空表退款都完成后才通知成功。准备错误可以先返回，已经接管的回滚责任仍自主执行，并用 VM access 防止空间提前退出。
 

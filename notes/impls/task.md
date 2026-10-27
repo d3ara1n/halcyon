@@ -141,12 +141,14 @@ per-hart 帧。
 | HANDLE_TABLE | capability表 | caller→child按pid递增 |
 | LEAF | console、registry、root、Ready、TimerQueue、Thread等待节点 | 不嵌套来源/目标回调 |
 | JOB_INNER | Job链 | 父→子、jid递增，深度≤JOB_DEPTH_MAX |
+| RESOURCE_TREE | 设备资源准入、封口和成员账本 | 单独短锁；VM、Pool、等待来源和 Work 发布均在门外 |
+| PLIC | 控制器寄存器、IRQ 消费状态与内嵌观察链 | 不嵌套资源树、VM 或 WaitSet；所有 Hint/维护发布与退款在门外 |
 | MAILBOX / CONNECTION | IPC状态 | 电平提示门外执行 |
 | MEMORY_POOL | 页/metadata额度 | 父级退款逐锁、不嵌套Pool |
 | MEMORY_OBJECT | 可执行状态/WritePermit | VM/Views门外取/还 |
 | ADDRESS_SPACE | VmState、ledger/PTE与依赖索引 | — |
 | VM_VIEWS | 实物View/来源 | VM→Views→Backing |
-| BACKING | 物理段索引 | 退款在全部外层门外 |
+| BACKING | 物理段索引、分步取得与 root 退休 | root Work 发布与终态同门，允许 BACKING→MAINTENANCE；门铃与退款在全部外层门外 |
 | NOTIFICATION | 通知电平 | space可为外层 |
 | OBJECT_WAIT | 对象Source、Builder等状态 | 回调门外 |
 | WAIT_SET | 持久集合 | 不嵌套来源锁 |

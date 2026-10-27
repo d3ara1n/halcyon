@@ -243,11 +243,26 @@ pub enum SharedRootError {
     Conflict,
 }
 
+/// 上层按映射来源选择叶粒度；基础页保证任意页边界删除无需拆大页。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafSize {
+    Largest,
+    BasePage,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TranslationPlan {
-    Map { vpn: Vpn, ppn: Ppn, flags: u64 },
+    Map {
+        vpn: Vpn,
+        ppn: Ppn,
+        flags: u64,
+        leaf_size: LeafSize,
+    },
     Unmap,
-    Protect { from: u64, to: u64 },
+    Protect {
+        from: u64,
+        to: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -695,7 +710,7 @@ pub struct PublishCursor {
 }
 
 impl PublishCursor {
-    pub fn map(vpn: Vpn, count: usize, ppn: Ppn, flags: u64) -> Self {
+    pub fn map(vpn: Vpn, count: usize, ppn: Ppn, flags: u64, leaf_size: LeafSize) -> Self {
         assert!(
             valid_leaf_flags(flags),
             "validated map has invalid leaf flags"
@@ -705,7 +720,12 @@ impl PublishCursor {
             "validated map exceeds physical encoding"
         );
         Self {
-            plan: TranslationPlan::Map { vpn, ppn, flags },
+            plan: TranslationPlan::Map {
+                vpn,
+                ppn,
+                flags,
+                leaf_size,
+            },
             next: vpn.0,
             end: vpn
                 .0
@@ -788,10 +808,18 @@ impl<M: TableFrameMemory, const LEVELS: usize> TableTree<M, LEVELS> {
         while !cursor.is_complete() && units < budget {
             cursor.next = match cursor.plan {
                 TranslationPlan::Map {
-                    vpn, ppn, flags, ..
+                    vpn,
+                    ppn,
+                    flags,
+                    leaf_size,
                 } => {
                     let ppn_cur = ppn.0 + (cursor.next - vpn.0);
-                    let level = largest_segment_level::<LEVELS>(cursor.next, ppn_cur, cursor.end);
+                    let level = match leaf_size {
+                        LeafSize::Largest => {
+                            largest_segment_level::<LEVELS>(cursor.next, ppn_cur, cursor.end)
+                        }
+                        LeafSize::BasePage => 0,
+                    };
                     self.map_segment_from(Vpn(cursor.next), level, Ppn(ppn_cur), flags, reserve);
                     cursor.next + pages_at(level)
                 }

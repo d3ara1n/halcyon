@@ -165,7 +165,7 @@ fn tree(counters: &Rc<Counters>) -> Tree {
 }
 
 fn map(tree: &mut Tree, vpn: Vpn, count: usize, ppn: Ppn, flags: u64) -> Result<(), MapError> {
-    let cursor = PublishCursor::map(vpn, count, ppn, flags);
+    let cursor = PublishCursor::map(vpn, count, ppn, flags, page_table::LeafSize::Largest);
     let reserve = supply(&tree.counters, page_table::worst_case_frames::<3>(&cursor))?;
     drop(tree.publish(cursor, reserve));
     Ok(())
@@ -191,7 +191,13 @@ fn big_unaligned_cross_table() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     let (start, count, ppn) = (65usize, 8192usize, 33usize);
-    let mut cursor = PublishCursor::map(Vpn(start), count, Ppn(ppn), flags::USER_DATA);
+    let mut cursor = PublishCursor::map(
+        Vpn(start),
+        count,
+        Ppn(ppn),
+        flags::USER_DATA,
+        page_table::LeafSize::Largest,
+    );
     let mut reserve = supply(&counters, page_table::worst_case_frames::<3>(&cursor)).unwrap();
     assert_eq!(reserve.len(), 18);
     assert!(!t.publish_step(&mut cursor, &mut core::iter::from_fn(|| reserve.pop()), 1));
@@ -380,7 +386,13 @@ fn undrained_tree_drop_is_rejected() {
     let counters = Rc::new(Counters::default());
     let root = allocate_owner(&counters).unwrap();
     let mut tree = RawTree::new(MockFrames::new(), root);
-    let mut cursor = PublishCursor::map(Vpn(1), 1, Ppn(2), flags::USER_DATA);
+    let mut cursor = PublishCursor::map(
+        Vpn(1),
+        1,
+        Ppn(2),
+        flags::USER_DATA,
+        page_table::LeafSize::Largest,
+    );
     let mut reserve = supply(&counters, page_table::worst_case_frames::<3>(&cursor)).unwrap();
     while !tree.publish_step(&mut cursor, &mut core::iter::from_fn(|| reserve.pop()), 1) {}
     drop(reserve);
@@ -409,7 +421,13 @@ fn shared_root_is_not_reclaimed() {
 fn dropped_reservation_returns_all_frames() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    let cursor = PublishCursor::map(Vpn(1), 1, Ppn(2), flags::USER_DATA);
+    let cursor = PublishCursor::map(
+        Vpn(1),
+        1,
+        Ppn(2),
+        flags::USER_DATA,
+        page_table::LeafSize::Largest,
+    );
     let reserve = supply(&counters, page_table::worst_case_frames::<3>(&cursor)).unwrap();
     assert_eq!(reserve.len(), 2);
     assert_eq!(counters.live.get(), 3);
@@ -497,8 +515,20 @@ fn detached_root_slot_can_be_reused_as_shared() {
 fn later_nonoverlapping_publish_returns_now_unused_frames() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
-    let first = PublishCursor::map(Vpn(1), 1, Ppn(101), flags::USER_DATA);
-    let second = PublishCursor::map(Vpn(2), 1, Ppn(102), flags::USER_DATA);
+    let first = PublishCursor::map(
+        Vpn(1),
+        1,
+        Ppn(101),
+        flags::USER_DATA,
+        page_table::LeafSize::Largest,
+    );
+    let second = PublishCursor::map(
+        Vpn(2),
+        1,
+        Ppn(102),
+        flags::USER_DATA,
+        page_table::LeafSize::Largest,
+    );
     let first_owners = supply(&counters, page_table::worst_case_frames::<3>(&first)).unwrap();
     let second_owners = supply(&counters, page_table::worst_case_frames::<3>(&second)).unwrap();
     assert_eq!(counters.live.get(), 5);
@@ -520,7 +550,13 @@ fn publish_never_enters_shared_root_slots() {
     t.attach_shared_root(500, &[Pte::branch(FrameNumber(0xdead))])
         .unwrap();
     for mut cursor in [
-        PublishCursor::map(vpn, 1, Ppn(1), flags::USER_DATA),
+        PublishCursor::map(
+            vpn,
+            1,
+            Ppn(1),
+            flags::USER_DATA,
+            page_table::LeafSize::Largest,
+        ),
         PublishCursor::protect(vpn, 1, flags::USER_DATA, flags::USER_CODE),
     ] {
         let mut reserve = supply(&counters, page_table::worst_case_frames::<3>(&cursor)).unwrap();
@@ -538,7 +574,13 @@ fn prefunded_cursor_rebuilds_after_an_empty_branch_is_detached() {
     let counters = Rc::new(Counters::default());
     let mut t = tree(&counters);
     map(&mut t, Vpn(0), 1, Ppn(10), flags::USER_DATA).unwrap();
-    let next = PublishCursor::map(Vpn(1), 1, Ppn(11), flags::USER_DATA);
+    let next = PublishCursor::map(
+        Vpn(1),
+        1,
+        Ppn(11),
+        flags::USER_DATA,
+        page_table::LeafSize::Largest,
+    );
     let reserve = supply(&counters, page_table::worst_case_frames::<3>(&next)).unwrap();
     unmap(&mut t, Vpn(0), 1).unwrap();
     drop(t.detach_empty_table(Vpn(0), 0).unwrap());
@@ -580,8 +622,10 @@ fn disjoint_cursors_publish_interleaved_without_stale() {
     let counters = Rc::new(Counters::default());
     let mut tree = tree(&counters);
     let rw = flags::V | flags::R | flags::W;
-    let mut a = page_table::PublishCursor::map(Vpn(0), 8, Ppn(0x1000), rw);
-    let mut b = page_table::PublishCursor::map(Vpn(16), 8, Ppn(0x2000), rw);
+    let mut a =
+        page_table::PublishCursor::map(Vpn(0), 8, Ppn(0x1000), rw, page_table::LeafSize::Largest);
+    let mut b =
+        page_table::PublishCursor::map(Vpn(16), 8, Ppn(0x2000), rw, page_table::LeafSize::Largest);
     let mut ra = supply(&counters, page_table::worst_case_frames::<3>(&a)).unwrap();
     let mut rb = supply(&counters, page_table::worst_case_frames::<3>(&b)).unwrap();
     loop {
@@ -606,7 +650,8 @@ fn stepwise_protect_and_detach_empty_tables() {
     let mut tree = tree(&counters);
     let rw = flags::V | flags::R | flags::W;
     let ro = flags::V | flags::R;
-    let mut m = page_table::PublishCursor::map(Vpn(0), 4, Ppn(0x10), rw);
+    let mut m =
+        page_table::PublishCursor::map(Vpn(0), 4, Ppn(0x10), rw, page_table::LeafSize::Largest);
     let mut r = supply(&counters, page_table::worst_case_frames::<3>(&m)).unwrap();
     step_all(&mut tree, &mut m, &mut r);
     drop(r);
@@ -627,4 +672,34 @@ fn stepwise_protect_and_detach_empty_tables() {
     }
     assert_eq!(retired, 2);
     assert_eq!(counters.live.get(), live - 2);
+}
+
+#[test]
+fn base_page_mapping_can_remove_one_page_without_allocating_split_tables() {
+    let counters = Rc::new(Counters::default());
+    let mut tree = tree(&counters);
+    // 对齐的完整 2 MiB 足以诱发大页；来源明确要求基础页时仍须逐页发布。
+    let mut cursor = PublishCursor::map(
+        Vpn(0),
+        512,
+        Ppn(0x2000),
+        flags::USER_DATA,
+        page_table::LeafSize::BasePage,
+    );
+    let mut reserve = supply(&counters, page_table::worst_case_frames::<3>(&cursor)).unwrap();
+    assert!(!tree.publish_step(&mut cursor, &mut core::iter::from_fn(|| reserve.pop()), 1));
+    assert_eq!(cursor.published_until(), Vpn(1));
+    assert!(tree.translate(Vpn(1)).is_none());
+    drop(tree.publish(cursor, reserve));
+    for vpn in [0, 255, 511] {
+        let mapped = tree.translate(Vpn(vpn)).unwrap();
+        assert_eq!(mapped.level, 0);
+        assert_eq!(mapped.ppn, Ppn(0x2000 + vpn));
+    }
+    // 强制退休的预付路径不提供任何新表帧；一旦退化成大页，这里会耗尽供给。
+    let mut remove = PublishCursor::unmap(Vpn(255), 1);
+    assert!(tree.publish_step(&mut remove, &mut core::iter::empty(), 1));
+    assert!(tree.translate(Vpn(255)).is_none());
+    assert!(tree.translate(Vpn(254)).is_some());
+    assert!(tree.translate(Vpn(256)).is_some());
 }

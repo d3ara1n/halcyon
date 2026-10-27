@@ -71,6 +71,17 @@ pub struct ReleaseCursor {
     hi: u64,
 }
 
+/// 分步取得的已持前缀；调用方须保留未取得部分的来源责任直到完成/取消。
+/// 每次只增加一个实际段的引用，取消把已取得前缀交普通释放路径。
+#[derive(Debug)]
+#[must_use = "an acquisition must be finished or its acquired prefix released"]
+pub struct AcquireCursor {
+    map: u64,
+    lo: u64,
+    next: u64,
+    hi: u64,
+}
+
 /// 单步释放结果。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReleaseStep<O> {
@@ -250,6 +261,65 @@ impl<O: SegmentOwner, C> SegmentMap<O, C> {
             map: self.id,
             lo,
             hi,
+        })
+    }
+
+    pub fn begin_acquire(
+        &mut self,
+        lo: u64,
+        hi: u64,
+        reserve: &mut NodeReserve,
+    ) -> Result<AcquireCursor, BackingError> {
+        if reserve.map != self.id {
+            return Err(BackingError::ForeignUse);
+        }
+        if self.retiring {
+            return Err(BackingError::Retiring);
+        }
+        if lo >= hi || hi > self.pages {
+            return Err(BackingError::InvalidRange);
+        }
+        let need = usize::from(self.needs_cut(lo)) + usize::from(self.needs_cut(hi));
+        if reserve.credits < need {
+            return Err(BackingError::ReserveExhausted);
+        }
+        self.cut(lo, reserve);
+        self.cut(hi, reserve);
+        Ok(AcquireCursor {
+            map: self.id,
+            lo,
+            next: lo,
+            hi,
+        })
+    }
+
+    /// 即使来源已封新准入，已接受游标仍可推进；来源 owner 由外层保持。
+    pub fn acquire_step(&mut self, cursor: &mut AcquireCursor) -> Result<bool, BackingError> {
+        if cursor.map != self.id {
+            return Err(BackingError::ForeignUse);
+        }
+        if cursor.next == cursor.hi {
+            return Ok(true);
+        }
+        let segment = self
+            .segs
+            .get_mut(&cursor.next)
+            .ok_or(BackingError::InvalidRange)?;
+        if segment.end > cursor.hi {
+            return Err(BackingError::InvalidRange);
+        }
+        segment.uses = segment.uses.checked_add(1).ok_or(BackingError::UseLimit)?;
+        cursor.next = segment.end;
+        Ok(cursor.next == cursor.hi)
+    }
+
+    /// 返回真正已增加引用的前缀；完整成功时该前缀就是原请求全部区间。
+    pub fn finish_acquire(&self, cursor: AcquireCursor) -> Option<RangeUse> {
+        assert_eq!(cursor.map, self.id, "foreign backing acquisition cursor");
+        (cursor.next != cursor.lo).then_some(RangeUse {
+            map: self.id,
+            lo: cursor.lo,
+            hi: cursor.next,
         })
     }
 

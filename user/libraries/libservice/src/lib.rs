@@ -3,7 +3,7 @@
 //! 本库拥有服务描述、注册 wire、授权与 Registry；发现读取同一 backing。
 
 #![cfg_attr(not(test), no_std)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 

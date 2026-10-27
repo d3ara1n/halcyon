@@ -26,7 +26,9 @@ pub mod initial {
     pub const SELF_PROCESS: usize = 2;
     pub const ROOT_MEMORY_POOL: usize = 3;
     pub const ENTRY_THREAD_CONTROL: usize = ROOT_MEMORY_POOL + 1;
-    pub const HANDLE_COUNT: usize = ENTRY_THREAD_CONTROL + 1;
+    pub const PLATFORM_DESCRIPTION: usize = ENTRY_THREAD_CONTROL + 1;
+    /// 固定项之后是平台描述逐项关联的真实资源根。
+    pub const BASE_HANDLE_COUNT: usize = PLATFORM_DESCRIPTION + 1;
 }
 
 /// 启动块头。其后依次是 `handle_count` 个 child-local Handle、
@@ -155,8 +157,8 @@ pub fn validate_startup_block(block: &[u8]) -> Result<StartupBlockHeader, Startu
         .iter()
         .any(|byte| *byte != 0)
         || block[descriptor_end..payload_off]
-        .iter()
-        .any(|byte| *byte != 0)
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return Err(StartupParseError::NonzeroPadding);
     }
@@ -187,7 +189,10 @@ pub fn entry_thread_descriptor(
     let descriptor_start = header.entry_descriptor_off as usize;
     let descriptor = unsafe {
         core::ptr::read_unaligned(
-            block.as_ptr().add(descriptor_start).cast::<EntryThreadDescriptor>(),
+            block
+                .as_ptr()
+                .add(descriptor_start)
+                .cast::<EntryThreadDescriptor>(),
         )
     };
     let stack_end = descriptor
@@ -206,10 +211,7 @@ pub fn entry_thread_descriptor(
     {
         return Err(StartupParseError::BadEntryThread);
     }
-    Ok((
-        descriptor,
-        &block[header.payload_off as usize..],
-    ))
+    Ok((descriptor, &block[header.payload_off as usize..]))
 }
 
 pub fn build_startup_block_with_entry(
@@ -233,7 +235,9 @@ pub fn build_startup_block_with_entry(
         payload.len(),
         entry,
     )?;
-    block.try_reserve_exact(payload.len()).map_err(|_| StartupBuildError::AllocationFailed)?;
+    block
+        .try_reserve_exact(payload.len())
+        .map_err(|_| StartupBuildError::AllocationFailed)?;
     block.extend_from_slice(payload);
     Ok(block)
 }
@@ -255,13 +259,7 @@ pub fn build_startup_prefix_with_entry(
     if payload_off < descriptor_end {
         return Err(StartupBuildError::Overflow);
     }
-    let mut block = build_startup_prefix(
-        pid,
-        parent_pid,
-        handles,
-        payload_off,
-        payload_len,
-    )?;
+    let mut block = build_startup_prefix(pid, parent_pid, handles, payload_off, payload_len)?;
     let descriptor_bytes = unsafe {
         core::slice::from_raw_parts(
             (&entry as *const EntryThreadDescriptor).cast::<u8>(),
@@ -501,7 +499,10 @@ mod tests {
         let block = build_startup_block_with_entry(2, 1, &handles, entry, b"seed")
             .expect("entry startup block must assemble");
         let header = validate_startup_block(&block).expect("entry startup block must validate");
-        assert_eq!(entry_thread_descriptor(&block, header), Ok((entry, b"seed".as_slice())));
+        assert_eq!(
+            entry_thread_descriptor(&block, header),
+            Ok((entry, b"seed".as_slice()))
+        );
         for index in [0, handles.len() as u32] {
             let mut invalid = block.clone();
             let offset = header.entry_descriptor_off as usize

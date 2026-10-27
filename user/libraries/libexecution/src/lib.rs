@@ -1,5 +1,5 @@
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 //! 有界任务推进、观察来源、期限、唤醒、停止与退休。
 

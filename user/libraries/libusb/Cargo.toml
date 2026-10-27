@@ -1,0 +1,11 @@
+[package]
+name = "libusb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libkernel = { path = "../libkernel" }
+libdevice = { path = "../libdevice" }
+librpc = { path = "../librpc" }
+libpci = { path = "../libpci" }

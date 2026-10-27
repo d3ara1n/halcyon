@@ -1,0 +1,10 @@
+[package]
+name = "resource_tree"
+authors = ["Dearain (d3ara1n@outlook.com)"]
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+funded_storage = { path = "../../shared/funded_storage" }
+ordered_table = { path = "../../shared/ordered_table" }
+monotonic_id = { path = "../../shared/monotonic_id" }

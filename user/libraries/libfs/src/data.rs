@@ -74,7 +74,10 @@ impl Data {
         }
         Ok(PreparedLength {
             expected_version: self.version,
-            next_version: self.version.checked_add(1).ok_or(SystemCallError::ReachLimit)?,
+            next_version: self
+                .version
+                .checked_add(1)
+                .ok_or(SystemCallError::ReachLimit)?,
             length,
         })
     }
@@ -82,18 +85,26 @@ impl Data {
         self.version == length.expected_version && !self.is_trimming()
     }
     pub fn commit_length(&mut self, length: PreparedLength) {
-        assert!(self.validates_length(&length), "stream length changed before validated commit");
+        assert!(
+            self.validates_length(&length),
+            "stream length changed before validated commit"
+        );
         if length.length < self.length {
             let block = length.length / BLOCK_BYTES as u64;
             let within = (length.length % BLOCK_BYTES as u64) as usize;
-            if within != 0 && let Some(last) = self.blocks.get_mut(block) {
+            if within != 0
+                && let Some(last) = self.blocks.get_mut(block)
+            {
                 // 一次提交最多清零最后保留块的尾部；增长不能复活截掉的旧字节。
                 last.bytes[within..].fill(0);
             }
             let first = block + u64::from(within != 0);
             let cursor = first.checked_sub(1);
             if self.blocks.next_after::<u64>(cursor.as_ref()).is_some() {
-                self.trimming = Some(Trimming { first_discarded_block: first, cursor });
+                self.trimming = Some(Trimming {
+                    first_discarded_block: first,
+                    cursor,
+                });
             }
         }
         self.length = length.length;
@@ -103,18 +114,29 @@ impl Data {
     pub fn trim_step(&mut self, budget: usize) -> usize {
         let mut work = 0;
         while work < budget {
-            let Some(trimming) = self.trimming.as_mut() else { break; };
+            let Some(trimming) = self.trimming.as_mut() else {
+                break;
+            };
             let Some((&key, _)) = self.blocks.next_after::<u64>(trimming.cursor.as_ref()) else {
                 self.trimming = None;
                 break;
             };
-            assert!(key >= trimming.first_discarded_block, "trimming selected a visible block");
+            assert!(
+                key >= trimming.first_discarded_block,
+                "trimming selected a visible block"
+            );
             trimming.cursor = Some(key);
-            let _ = self.blocks.remove(key).map(ordered_table::PreparedEntry::into_value);
+            let _ = self
+                .blocks
+                .remove(key)
+                .map(ordered_table::PreparedEntry::into_value);
             work += 1;
         }
-        if self.trimming.as_ref().is_some_and(|trimming|
-            self.blocks.next_after::<u64>(trimming.cursor.as_ref()).is_none()) {
+        if self.trimming.as_ref().is_some_and(|trimming| {
+            self.blocks
+                .next_after::<u64>(trimming.cursor.as_ref())
+                .is_none()
+        }) {
             self.trimming = None;
         }
         work

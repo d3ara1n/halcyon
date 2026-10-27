@@ -40,6 +40,10 @@ pub mod ranks {
     pub const DRAIN_CURSOR: Rank = Rank(10);
     /// HandleTable：caller→child 嵌套沿 pid 递增（chained）。
     pub const HANDLE_TABLE: Rank = Rank(100);
+    /// 设备资源根的准入与成员状态；门内不进入 VM、Pool 或等待来源。
+    pub const RESOURCE_TREE: Rank = Rank(125);
+    /// PLIC 寄存器、领取状态和观察链；不嵌套资源树、VM 或 WaitSet。
+    pub const PLIC: Rank = Rank(130);
     /// 无嵌套边的自由段：CONSOLE、REGISTRY、ROOT anchor、就绪队列、
     /// per-hart 期限表及 Thread 等待 epoch 的注册节点。
     pub const LEAF: Rank = Rank(150);

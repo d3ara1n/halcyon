@@ -477,6 +477,7 @@ pub fn run() -> ! {
     loop {
         crate::runtime_stop::check();
         // 内核 IRQ 关闭，持续 M 下硬件 STIP 不会进入 trap。
+        crate::resource::irq::controller::service();
         // 每安全点复检期限电平，未来项到期不依赖已有软件 pending 或先 idle。
         let _ = earliest_future();
         if timer_pending().load(Ordering::Relaxed) {
@@ -484,8 +485,8 @@ pub fn run() -> ! {
         }
         // idle 唤醒、门铃合并或先前 IPI 失败后，Pending 槽仍由安全点补消费。
         crate::vm::remote::drain_current(crate::vm::remote::SAFE_POINT_BATCH);
-        // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量
-        // SFENCE.VMA）：循环体结构性只运行于内核页表下。
+        // 非 Resume 出口已在汇编边界归一（kernel satp + 本地全量 SFENCE）。
+        // 仲裁与排队在内核 root；下方请求推进只在持运行准入的局部作用域切入用户 root。
         // 用户/维护轮转仲裁：维护类每次至多消耗一份轮转预算。
         match crate::maintenance::service(me_domain.has_ready()) {
             maintenance::rotor::Choice::Run {
@@ -543,6 +544,15 @@ pub fn run() -> ! {
             reap(t);
             continue;
         }
+        if let Some(mut request) = crate::task::request::take(&t) {
+            // SAFETY: 原线程的执行资格与 Shell/VM 运行准入都已成立，IRQ 关闭。
+            // 函数返回前恢复 kernel root + SFENCE，随后才从 active 集合离场。
+            let result = unsafe { crate::task::request::advance_in_space(&mut request, &t) };
+            t.publish_output_fault();
+            running.leave();
+            crate::task::request::settle(t, request, result, me.slot());
+            continue;
+        }
         me.set_context(t.frame_ptr(), t.satp(), Arc::as_ptr(&t), t.uses_fp());
         // 先扣本次续体/准入已用时间，硬量子按同一 U 余额的剩余值装填。
         crate::maintenance::end_user();
@@ -565,16 +575,7 @@ pub fn run() -> ! {
         match outcome {
             Outcome::Requeue => {
                 assert!(wait_plan.is_none(), "Requeue outcome carries a wait intent");
-                let transition = t
-                    .process
-                    .lease_receipt()
-                    .map(|body| body.members.requeue(&t.process, t.member(), slot));
-                match transition {
-                    Some(WakeTransition::Publish(ingress)) => {
-                        ingress.publish_admitted(t);
-                    }
-                    Some(WakeTransition::Cancelled) | None => reap(t),
-                }
+                requeue(t, slot);
             }
             Outcome::Killed => {
                 drop(wait_plan);
@@ -642,12 +643,24 @@ fn arm_user_until(quantum: u64, class_deadline: u64) {
     );
 }
 
-/// 退出 owner 先经正常 detach 摘节点，再移交 Departure；回执不持 Thread。
-/// committed Map 结果义务可延后成员摘除与 DONE，但不保留 Thread/UserContext。
+/// 退出 owner 先取消请求准备并正常 detach，再移交 Departure。
+/// 已登记 Operation 的回滚/已提交 Work 独立推进，不保留 Thread/UserContext。
 pub(crate) fn reap(t: AdmittedThread) {
+    drop(crate::task::request::take(&t));
     crate::task::wait::detach(&t);
     t.finish_created_departure();
     drop(t);
+}
+
+pub(crate) fn requeue(t: AdmittedThread, slot: usize) {
+    let transition = t
+        .process
+        .lease_receipt()
+        .map(|body| body.members.requeue(&t.process, t.member(), slot));
+    match transition {
+        Some(WakeTransition::Publish(ingress)) => ingress.publish_admitted(t),
+        _ => reap(t),
+    }
 }
 
 /// idle：在本域登记空闲位 → 双重检查就绪工作 → 按期限表 arm（无期限则卸载）
@@ -659,7 +672,8 @@ fn idle() {
     domain.idle_mask.fetch_or(bit, Ordering::SeqCst);
     // 入队与登记 idle 的交错由双重检查闭合；work debt 的 Pending 电平同样
     // 禁止 owner 带债入睡，即使对应门铃曾失败或被合并。
-    if domain.has_ready()
+    if crate::resource::irq::controller::service()
+        || domain.has_ready()
         || timer_pending().load(Ordering::Relaxed)
         || crate::maintenance::has_ready()
         || crate::vm::remote::has_current()
@@ -680,6 +694,7 @@ fn idle() {
     unsafe { asm!("wfi", options(nomem, preserves_flags)) };
     crate::runtime_stop::check();
     sbi::clear_ssip();
+    crate::resource::irq::controller::service();
     domain.idle_mask.fetch_and(!bit, Ordering::SeqCst);
 
     if sip_stip_pending() {

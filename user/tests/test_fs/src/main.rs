@@ -1,6 +1,6 @@
 //! 独立消费者：service 名字订阅/取得、OAL 发现与直接 fs 路径操作。
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 extern crate alloc;
 extern crate libruntime;
 use alloc::{sync::Arc, vec::Vec};
@@ -526,12 +526,24 @@ fn run(grants: &mut libruntime::startup::InitialGrants, parent_pid: u64) {
     quota::check_nodes(&namespace, &mut caller);
     quota::check_grants(&namespace, &mut caller);
     binding::check_capacity(&namespace, &mut caller, &management, &management_b);
+    libkernel::debug!(
+        "FS1 binding behavior scenarios started: now_ns={}",
+        libkernel::time::snapshot()
+            .expect("FS progress clock failed")
+            .now_ns
+    );
     binding::check(
         &namespace,
         &mut caller,
         &management,
         &management_b,
         &secondary_management,
+    );
+    libkernel::debug!(
+        "FS1 binding behavior scenarios completed: now_ns={}",
+        libkernel::time::snapshot()
+            .expect("FS progress clock failed")
+            .now_ns
     );
     drop(secondary_management);
     drop(management_b);

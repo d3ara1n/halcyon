@@ -36,6 +36,7 @@ pub struct Thread {
     /// 唯一等待 owner 随 AdmittedThread 移动，提示方不访问续体或节点。
     pub(crate) wait_entry: UnsafeCell<Option<super::super::wait::Entry>>,
     pub(crate) wait_node: super::super::wait_source::WaitNode,
+    pub(crate) request: Spinlock<Option<super::super::request::Pending>>,
     release: ThreadRelease,
 }
 
@@ -125,6 +126,7 @@ impl Thread {
             timer: timer_queue::TimerNode::new(),
             wait_entry: UnsafeCell::new(None),
             wait_node: super::super::wait_source::WaitNode::new(),
+            request: Spinlock::new(ranks::LEAF, None),
             release: ThreadRelease {
                 metadata: Some(metadata),
                 departure,

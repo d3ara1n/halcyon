@@ -1,7 +1,7 @@
 //! OAL 的目录发现表示与协议；不持有领域 backing 或解释领域标记。
 
 #![cfg_attr(not(test), no_std)]
-#![cfg_attr(target_arch = "riscv64", feature(allocator_api))]
+#![cfg_attr(target_arch = "riscv64", feature(allocator_ext))]
 
 extern crate alloc;
 

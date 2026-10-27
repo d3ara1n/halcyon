@@ -11,6 +11,8 @@ Usage:
     make-hetero-dts.py INPUT OUTPUT cpu [cpu ...]   # cpu = hart id, or "all"
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 import sys
 

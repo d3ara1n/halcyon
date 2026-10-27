@@ -53,7 +53,7 @@ impl MemoryObject {
         let mut snapshot = MemoryObjectSnapshot {
             identity: 0,
             bytes: 0,
-            write_views: 0,
+            write_permits: 0,
             state: 0,
             reserved0: 0,
             reserved: [0; 4],

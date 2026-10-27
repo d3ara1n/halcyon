@@ -110,6 +110,31 @@ impl MemoryObjectCore {
     ) -> Result<crate::vm::backing::BackingStorage, SystemCallError> {
         self.backing.prepare_storage(2, pool)
     }
+    pub(crate) fn begin_pin(
+        &self,
+        offset: usize,
+        bytes: usize,
+        storage: &mut crate::vm::backing::BackingStorage,
+    ) -> Result<Option<crate::vm::backing::BackingAcquisition>, SystemCallError> {
+        if bytes == 0 || !offset.is_multiple_of(PAGE_SIZE) || !bytes.is_multiple_of(PAGE_SIZE) {
+            return Err(SystemCallError::IllegalArgument);
+        }
+        let end = offset
+            .checked_add(bytes)
+            .ok_or(SystemCallError::IllegalArgument)?;
+        self.backing.begin_acquire(
+            (offset / PAGE_SIZE) as u64,
+            (end / PAGE_SIZE) as u64,
+            storage,
+        )
+    }
+    /// 独立设备写者，不借 CPU View/replacement 的计数或资格。
+    pub(crate) fn reserve_dma_write<C>(
+        &self,
+        output: &mut funded_storage::Buffer<WritePermit, C>,
+    ) -> Result<(), ObjectError> {
+        self.state.lock().reserve_writes(1, output)
+    }
     pub(crate) fn authorize_view(
         &self,
         maximum: Protection,
@@ -185,7 +210,7 @@ impl MemoryObjectCore {
         MemoryObjectSnapshot {
             identity: state.object().get(),
             bytes: state.object_bytes() as u64,
-            write_views: state.permit_count() as u64,
+            write_permits: state.permit_count() as u64,
             state: abi as u32,
             reserved0: 0,
             reserved: [0; 4],
@@ -239,6 +264,34 @@ pub struct MemoryObject {
     _metadata: super::resources::MetadataCharge,
 }
 impl MemoryObject {
+    pub(crate) fn prepare_boot(
+        pool: Arc<MemoryPool>,
+        bytes: usize,
+    ) -> Result<Arc<Self>, SystemCallError> {
+        let (core, owner) = MemoryObjectCore::new(pool, bytes.div_ceil(PAGE_SIZE))?;
+        Self::new(core, owner)
+    }
+
+    /// # Safety
+    /// 仅允许 bootstrap 在初始进程 Start 前使用；全部已铸能力仍在不可执行的
+    /// Building 进程中，没有用户映射或其他消费者。调用完成后才能 Start。
+    pub(crate) unsafe fn initialize_boot_page(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), SystemCallError> {
+        let owner = self
+            .owner
+            .lock()
+            .take()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        // SAFETY: 完整域 owner 独占保活，调用者承担 Start 前独占初始化合同。
+        // 不持 LEAF 锁进入 BACKING；此期间没有其他 capability 终结者。
+        let result = unsafe { owner.initialize_page(offset, bytes) };
+        *self.owner.lock() = Some(owner);
+        result
+    }
+
     fn new(core: Arc<MemoryObjectCore>, owner: BackingOwner) -> Result<Arc<Self>, SystemCallError> {
         let metadata = super::resources::MetadataCharge::arc::<Self>(core._metadata.payer())?;
         Arc::try_new(Self {

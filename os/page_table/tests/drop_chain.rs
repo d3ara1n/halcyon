@@ -134,7 +134,8 @@ fn map(
     ppn: Ppn,
     flags: u64,
 ) -> Result<(), MapError> {
-    let mut cursor = page_table::PublishCursor::map(vpn, count, ppn, flags);
+    let mut cursor =
+        page_table::PublishCursor::map(vpn, count, ppn, flags, page_table::LeafSize::Largest);
     let mut reserve = supply(page_table::worst_case_frames::<3>(&cursor));
     while !tree.publish_step(&mut cursor, &mut core::iter::from_fn(|| reserve.pop()), 1) {}
     drop(reserve);

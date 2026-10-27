@@ -20,7 +20,11 @@
 - `libservice` 拥有服务描述、发布授权、注册/取得、控制与生命周期；只依赖 OAL 的发现和接续表达，直接从 registry backing 生成视图，不依赖文件库或文件节点。
 - 原 `libfal` 已删除；普通文件与服务客户端直接消费各自领域协议及 OAL Namespace/walk，没有 DirectoryGrant/Position 兼容出口。
 - `librpc` 拥有请求回复、调用生命周期及带序号确认的订阅客户端会话；领域通过静态 Protocol 提供自己的编解码和快照投影，RPC 不解释文件或服务事件。`librunnel` 拥有流协议，`libprocess` 拥有进程领域能力。它们可以直接消费公共执行和记账，不反向依赖 `libservice`。
-- 驱动公共知识的正式库名是 `libdriver`，设备领域库名是 `libdevice`；当前没有真实公共驱动机制，因此不保留空库占位。
+- `libdevice` 拥有设备身份、授权/登记 backing、占用/供应轮次、冻结资源表、设备/Provision 协议、有限枚举/Watch、功能关联/OAL 投影与可组合绑定任务；当前机制及宿主接线边界见 [device 实现](../../notes/impls/device.md#用户态设备领域机制)。驱动公共知识的正式库名是 `libdriver`，不在设备库中解释驱动声明或选择程序；未实现的库不保留空占位。
+- `libpci` 拥有 PCI 平台几何、真实控制能力与 DT 的关联核验、host 资源 metadata；init 和设备平台适配器共同消费，设备登记核心只将 metadata 当不透明字节。它不拥有设备占用或自动选择。
+- `libdriver` 拥有 boot 声明/映像配对、有限 identity 选择规则、统一 Activate/Stop/观察协议及原轮激活输入/状态；srv_driver 和实际 worker 组合既有 Runtime/RPC，库不另起运行体，也不复制 srv_device 占用。`libprocess::image` 拥有 sealed MemoryObject 的只读映像与有效长度，程序启动仍消费原 loader。
+- `libusb` 拥有 USB 描述符、受限接口会话及具体 xHCI 寄存器/ring/slot/传输/停止知识；libdevice 仍只解释不透明供应。硬件由实际 xHCI worker 组合调度，不在库中创建 Runtime，也不将物理控制交给 HID。
+- `libhid` 拥有 HID boot keyboard 报告状态、功能协议、键盘 OAL 面貌和观察客户端；不解释 USB ring 或持物理控制，实际 HID 程序组合原 Runtime/RPC 消费受限 USB 会话。
 - `libkernel` 拥有用户态内核调用与资源的安全封装；`libruntime` 组合 `libprocess::context`、`libthread` 和 libkernel 完成程序环境职责，但不复制这些知识或成为其通用 facade。其它领域/机制库不得反向依赖具体 runtime，程序直接使用知识 owner 的 API；库使用 core/alloc，不选择具体 global allocator。链接只复用知识，不授予 capability，也不自动启动线程、IPC 接收器或服务。完整边界由 [framework](../../notes/ideas/framework.md) 拥有。
 
 领域知识收敛不要求把整条调用链搬到一个库。服务描述的完整性和生命周期由服务领域负责，消息投递由运输层负责。改变服务规则不应要求这些下层同步理解新的服务含义。

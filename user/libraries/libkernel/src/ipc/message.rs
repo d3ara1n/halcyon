@@ -1,4 +1,6 @@
 //! Mailbox 控制面；正式运输通过 Packet，原始 move 仅在显式 unsafe 边界使用。
+//! 普通 Sender 运输付实际发送进程 Pool；Once 的输入、消息和 Delivery 付 make_send_once 发行者 Pool。
+//! Once 失败可重试且保留原付款身份；额度不足不承诺回复必成，接收表安装仍由接收者付款。
 
 use super::capability::capability_role;
 use super::capability::{Capability, HandleSet};

@@ -1,0 +1,11 @@
+[package]
+name = "libpci"
+version = "0.1.0"
+edition = "2024"
+description = "PCI host geometry, platform authority, and function protocol"
+
+[dependencies]
+dtb = { path = "../../../shared/dtb" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libkernel = { path = "../libkernel" }
+libdevice = { path = "../libdevice" }

@@ -16,7 +16,7 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 `HartId` 保存 DT/SBI raw hartid，`HartSlot` 是按 admitted hartid 升序分配的稠密索引，`HartTopology` 保存可选 cpu-map。HartLocal、内核栈、active set 与 per-hart timer queue 都按 slot 索引；SBI 调用边界才转换回 raw hartid，IPI 的 `(mask, base)` 不接收内部 slot bitmap。
 
-`os/dtb::cpu` 在零分配 admission 中一次读取现代 `riscv,isa-base`、`riscv,isa-extensions`、`mmu-type`、status、时钟与 raw hartid，固定容量内排序并拒绝重复。status 缺省或严格 `okay` 才准入，其余 DTSpec 合法不可用状态跳过，未知/畸形值拒绝整份平台输入；能力同时强制 `q => d => f`。内核基线为 RV64IMAC、Zicsr、Zifencei、Zicntr 和系统选定页表模式；S 态 time 与 SBI TIME 共用已验证的非零 DT timebase。
+`shared/dtb::cpu` 在零分配 admission 中一次读取现代 `riscv,isa-base`、`riscv,isa-extensions`、`mmu-type`、status、时钟与 raw hartid，固定容量内排序并拒绝重复。status 缺省或严格 `okay` 才准入，其余 DTSpec 合法不可用状态跳过，未知/畸形值拒绝整份平台输入；能力同时强制 `q => d => f`。内核基线为 RV64IMAC、Zicsr、Zifencei、Zicntr 和系统选定页表模式；S 态 time 与 SBI TIME 共用已验证的非零 DT timebase。
 
 普通 Ready、termination、Remote 与 deferred-work IPI 都只作已发布业务真值的门铃，发送 API 返回失败 slot mask；失败不撤销 Pending/Ready、不伪造完成，也不在发送者上 panic。
 
@@ -45,11 +45,15 @@ formal stvec 指向共同 direct-mode 入口，sscratch 在正式环境中恒指
 
 fatal 首帧保存在独立 FatalFrame，递归 guard 防止诊断故障覆盖证据。CSR 由 formal entry、内核稳态和 pre-sret 三个边界集中设置；未知/WPRI 位不整写。用户出口在最后一个内核 LR/SC 后用 dummy SC 清 reservation。
 
+formal entry 的共同 sie 基线为 SSIE|STIE；已核定 PLIC S context 的 hart 在同一入口、stvec 建立后接管自己的 S context 并追加 SEIE，成功后才发布 Online，SIE 仍为零。全局 Ready 继续依赖全员 Online，不另设中断就绪屏障；调度入口不重复改写 context。SEIP trap 领取至多一源并返回 Requeue；调度安全点、idle 睡前和醒后也执行同一有界领取，不能仅依赖用户 trap。具体状态、完成与订阅由 [设备实现](device.md#plic-平台与中断机会)拥有。
+
 `scause`按interrupt/code分发；U ecall是exception 8。用户instruction/load/store page-fault（12/13/15）先经`vm::fault`对照目标R/W/X与事务发布事实，允许未发布时等待原事务完成，允许且已发布时执行有进展约束的本地翻译/指令同步后重试原pc；拒绝或重复无进展才冻结Fault。其它用户同步异常按真实fault终止进程，不panic内核。完整依赖、重试和退出责任由[mm](mm.md)拥有。
 
 ## 地址空间归属纪律
 
 用户 trap 的 Resume 热路径继续使用当前用户 root；非 Resume 出口在恢复调度循环现场前统一装载 `KERNEL_SATP` 并执行本地全量 SFENCE.VMA。只有完成该步骤后，Rust 调度侧才清 active 位、reap 或发布 park。VM active=0 因而只在没有 hart 仍使用目标用户 root 后成立，空间退休另等访问与结果责任。
+
+原线程的[分步请求](call.md#分步请求)也经过 Shell/VM enter；其有界推进调用在目标 root 下执行，退出调用前恢复 kernel root 并全量 SFENCE，随后才归还运行准入。调度仲裁、排队、取消及等待节点安装仍在内核 root 下进行。请求不执行用户指令，下一次真正返回用户态仍经 `_ret_to_user` 的 FENCE.I。
 
 进程资源由 Shell/RetireWork 自动推进，不存在 ProcessDrain syscall。维护在内核安全点以目标 AnySpace、表帧映射和物理直映射收束；Shell 先冻结入口，VM 记录持 active 快照并等退出/fence、访问租约与实际退款。细节见 [mm](mm.md) 与 [task](task.md)。
 

@@ -119,7 +119,7 @@ impl MappedRegion {
         Self::map_source(endpoint.handle(), 0, bytes, 0, 0, protection, placement)
     }
 
-    fn map_source(
+    pub(crate) fn map_source(
         source: erhino_shared::object::Handle,
         object_offset: usize,
         bytes: usize,

@@ -59,8 +59,8 @@ pub struct MemoryObjectSnapshot {
     pub identity: u64,
     /// 创建时冻结的对象长度（字节）。
     pub bytes: u64,
-    /// 在途可写 view 数量：覆盖 reserved、published 与 retiring 三个阶段。
-    pub write_views: u64,
+    /// 独立写许可数量：包含 CPU View 与 DMA 写者的准备、发布和退休责任。
+    pub write_permits: u64,
     /// [`MemoryObjectState`] 的原始值。
     pub state: u32,
     pub reserved0: u32,
@@ -72,9 +72,9 @@ impl MemoryObjectSnapshot {
         MemoryObjectState::from_raw(self.state)
     }
 
-    /// Executable 终态不允许任何在途可写 view。
+    /// Executable 终态不允许任何 CPU 或 DMA 在途写许可。
     pub const fn closes(&self) -> bool {
-        !matches!(self.state(), Some(MemoryObjectState::Executable)) || self.write_views == 0
+        !matches!(self.state(), Some(MemoryObjectState::Executable)) || self.write_permits == 0
     }
 }
 
@@ -93,7 +93,10 @@ mod tests {
     fn snapshot_layout_is_fixed() {
         assert_eq!(core::mem::offset_of!(MemoryObjectSnapshot, identity), 0);
         assert_eq!(core::mem::offset_of!(MemoryObjectSnapshot, bytes), 8);
-        assert_eq!(core::mem::offset_of!(MemoryObjectSnapshot, write_views), 16);
+        assert_eq!(
+            core::mem::offset_of!(MemoryObjectSnapshot, write_permits),
+            16
+        );
         assert_eq!(core::mem::offset_of!(MemoryObjectSnapshot, state), 24);
         assert_eq!(core::mem::offset_of!(MemoryObjectSnapshot, reserved0), 28);
         assert_eq!(core::mem::offset_of!(MemoryObjectSnapshot, reserved), 32);
@@ -113,11 +116,11 @@ mod tests {
     }
 
     #[test]
-    fn executable_state_cannot_retain_write_views() {
+    fn executable_state_cannot_retain_write_permits() {
         let published = MemoryObjectSnapshot {
             identity: 7,
             bytes: 4096,
-            write_views: 0,
+            write_permits: 0,
             state: MemoryObjectState::Executable as u32,
             reserved0: 0,
             reserved: [0; 4],
@@ -125,7 +128,7 @@ mod tests {
         assert!(published.closes());
         assert!(
             !MemoryObjectSnapshot {
-                write_views: 1,
+                write_permits: 1,
                 ..published
             }
             .closes()
@@ -134,7 +137,7 @@ mod tests {
         assert!(
             MemoryObjectSnapshot {
                 state: MemoryObjectState::Mutable as u32,
-                write_views: 3,
+                write_permits: 3,
                 ..published
             }
             .closes()

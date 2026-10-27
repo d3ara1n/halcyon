@@ -42,6 +42,7 @@ pub const PRE_SRET_CLEAR: usize =
 // ---- sie/sip 来源位 ----
 pub const SIE_SSIE: usize = 1 << 1;
 pub const SIE_STIE: usize = 1 << 5;
+pub const SIE_SEIE: usize = 1 << 9;
 
 // ---- senvcfg 项目拥有字段（supervisor.adoc「senvcfg」，RV64）----
 /// FIOM(bit0)、CBIE(bits 6:5)、CBCFE(bit7)、CBZE(bit8)：本内核不向用户

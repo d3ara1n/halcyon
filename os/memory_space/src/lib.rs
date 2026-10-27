@@ -10,15 +10,19 @@
 extern crate alloc;
 
 mod backing;
+mod mmio;
+mod mmio_executor;
 mod object;
 mod ordmap;
 mod range;
 mod space;
 
 pub use backing::{
-    BackingError, NodeReserve, RangeUse, ReleaseCursor, ReleaseStep, SegmentMap, SegmentOwner,
-    SegmentStorage,
+    AcquireCursor, BackingError, NodeReserve, RangeUse, ReleaseCursor, ReleaseStep, SegmentMap,
+    SegmentOwner, SegmentStorage,
 };
+pub use mmio::{MmioMapError, MmioMapPhase, MmioMapState};
+pub use mmio_executor::{MmioExecutorState, MmioIdle, MmioNotify};
 pub use object::{
     ExecutableState, MemoryObjectState, ObjectError, ObjectId, ObjectViewAuthorization,
     SealOutcome, WritePermit,
@@ -26,11 +30,11 @@ pub use object::{
 pub use ordmap::{OrdMap, OrdMapStorage, ReserveFailed};
 pub use range::{AddressRange, PAGE_SIZE, PageRange, RangeError};
 pub use space::{
-    AllocationKey, AnonymousClass, BackingId, BackingRetire, BackingView, ChangeCapacity,
-    ChangeError, ChangeKey, ChangeRequest, ChangeStorage, CommittedChange, FaultClass, LeaseKey,
-    Limits, MapBacking, MapPlacement, MapRequest, MapResultLayout, MemorySpace, PermitRequirement,
-    PreparedChange, ProtectRequest, Protection, RegionKey, RegionKindView, RegionOwner,
-    RegionStorage, RegionView, ReserveFailure, RetiringChange, RetiringFragment, RollbackStep,
-    SpaceCreateError, TranslationIntent, UnmapRequest, UserWriteLease, UserWriteLeaseRequest,
-    UserWriteSegment, ValidatedChange,
+    AllocationKey, AnonymousClass, BackingId, BackingRetire, ChangeCapacity, ChangeError,
+    ChangeKey, ChangeRequest, ChangeStorage, CommittedChange, FaultClass, LeaseKey, Limits,
+    MapPlacement, MapRequest, MapResultLayout, MappingId, MappingOrigin, MappingSource,
+    MemorySpace, PermitRequirement, PreparedChange, ProtectRequest, Protection, RegionKey,
+    RegionKindView, RegionOwner, RegionStorage, RegionView, ReserveFailure, RetiringChange,
+    RetiringFragment, RollbackStep, SpaceCreateError, TranslationIntent, UnmapRequest,
+    UserWriteLease, UserWriteLeaseRequest, UserWriteSegment, ValidatedChange,
 };

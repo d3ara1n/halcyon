@@ -8,7 +8,7 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。轻量任务及本轮文档范围见[收口记录](todo-2026-09-29-system-redesign.md#近期轻量收口与本轮整理)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [设备体系首批实施入口](todo-2026-09-device-system-design.md#当前进度与接力)：首批施工设计已闭合；按该案依赖、装配/内存/故障终局合同和验收门接续，代码施工另行授权。
+3. [设备体系首批审查交接](todo-2026-09-device-system-design.md#审查交接2026-10-27)：按当前施工checkpoint与原装配/内存/故障终局合同开展代码审查和架构收敛；待证门及实施状态由同案唯一记录承接。
 4. [正式服务装配与监督](todo-2026-10-07-service-assembly.md)：通用装配关系可先设计，设备特有接线按设备前置。
 5. [系统关机编排与设备故障终局](todo-2026-09-system-shutdown-orchestration.md#设备管理故障的接点)：设备管理故障接点随设备设计推进；正式长期服务的整体收束由本案闭合。
 

@@ -21,7 +21,7 @@ use funded_storage::Buffer;
 use maintenance::record::Outcome;
 
 use super::{
-    backing::{BackingRelease, BackingUse},
+    mapping::{MappingRelease, MappingUse},
     remote::{Fence, Transport},
     space::{AnySpace, ChangeProgress, RetireBatch, STEP_UNITS, TableCleanup},
     views::{PreparedView, ViewBoundary, ViewRetirement, Views},
@@ -41,6 +41,7 @@ pub(crate) struct VmShell {
     pub(crate) translation_epoch: AtomicU64,
     pub(crate) instruction_epoch: AtomicU64,
     pub(crate) space: Spinlock<VmState>,
+    forced: Spinlock<Option<Arc<super::forced::ForcedRetirement>>>,
     _metadata: MetadataCharge,
 }
 
@@ -131,16 +132,18 @@ impl VmShell {
         let metadata = MetadataCharge::arc::<Self>(pool)?;
         let identity = NEXT_VM_ID.allocate().ok_or(SystemCallError::ReachLimit)?;
         let satp = (8usize << 60) | space.satp_ppn();
+        let views = space.views().clone();
         let dependencies = Buffer::try_empty(
-            space.ledger().limits().max_transactions,
+            space.ledger().transaction_capacity(),
             &crate::task::resources::MetadataFunding(pool),
         )
         .map_err(crate::task::resources::map_storage_error)?;
-        Arc::try_new(Self {
+        let shell = Arc::try_new(Self {
             identity,
             satp,
             translation_epoch: AtomicU64::new(1),
             instruction_epoch: AtomicU64::new(1),
+            forced: Spinlock::new(ranks::LEAF, None),
             space: Spinlock::new(
                 ranks::ADDRESS_SPACE,
                 VmState {
@@ -157,7 +160,14 @@ impl VmShell {
             ),
             _metadata: metadata,
         })
-        .map_err(|_| SystemCallError::OutOfMemory)
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+        let forced = super::forced::ForcedRetirement::new(pool, Arc::downgrade(&shell), views)?;
+        *shell.forced.lock() = Some(forced);
+        Ok(shell)
+    }
+
+    pub(crate) fn forced(&self) -> Option<Arc<super::forced::ForcedRetirement>> {
+        self.forced.lock().clone()
     }
 
     pub(crate) const fn satp(&self) -> usize {
@@ -226,14 +236,27 @@ impl VmShell {
     }
 
     /// 进程 Frozen 后封闭执行和访问准入；返回原始 active 快照。
-    pub(crate) fn close_entry(&self) -> u64 {
+    pub(crate) fn close_entry(self: &Arc<Self>) -> u64 {
+        let forced = self.forced.lock().take();
         let mut vm = self.space.lock();
         vm.entry_open = false;
         vm.access_open = false;
         vm.building_open = false;
         let active = vm.active;
         let start = vm.start_waiter.take();
+        let lease = forced.as_ref().map(|_| {
+            vm.access_leases = vm
+                .access_leases
+                .checked_add(1)
+                .expect("VM exit lease overflow");
+            VmAccessLease {
+                shell: Some(self.clone()),
+            }
+        });
         drop(vm);
+        if let (Some(forced), Some(lease)) = (forced, lease) {
+            forced.stop(lease);
+        }
         if let Some(start) = start {
             drop(mt::wake(start));
             mt::kick();
@@ -310,12 +333,12 @@ pub(crate) struct Preparation {
     pub(crate) plan: PreparationPlan,
     pub(crate) permits: Buffer<memory_space::WritePermit, MetadataCharge>,
     pub(crate) unindexed: Option<(Arc<crate::task::memory_object::MemoryObjectCore>, usize)>,
-    pub(crate) usage: Option<BackingUse>,
+    pub(crate) usage: Option<MappingUse>,
     pub(crate) view: Option<PreparedView>,
     pub(crate) boundaries: Buffer<ViewBoundary, MetadataCharge>,
     pub(crate) frames: Buffer<FundedTableFrame, MetadataCharge>,
     pub(crate) cursors: Buffer<page_table::PublishCursor, MetadataCharge>,
-    release: Option<BackingRelease>,
+    release: Option<MappingRelease>,
 }
 
 /// 同一计划 owner 的互斥阶段；空候选也由 Candidate 表示，不并排内联三份载荷。
@@ -375,6 +398,62 @@ pub(crate) struct Operation {
     submitted: bool,
 }
 impl Operation {
+    fn attach_mmio_publication(&mut self, publication: crate::resource::mmio::MmioPublication) {
+        let work = Arc::get_mut(&mut self.work).expect("unpublished operation has another owner");
+        assert!(
+            work.completion.publication.is_none(),
+            "MMIO publication attached twice"
+        );
+        work.completion.publication = Some(publication);
+    }
+
+    pub(crate) fn prepare_mmio(
+        &mut self,
+        node: Arc<crate::resource::mmio::MmioNode>,
+        admission: &resource_tree::Admission,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<memory_space::MappingSource, SystemCallError> {
+        assert!(
+            self.prep.usage.is_none(),
+            "map operation already owns a resource"
+        );
+        let (usage, publication) = crate::resource::mmio::MmioMapping::prepare(
+            node,
+            admission,
+            &self.work.shell,
+            self.pool(),
+            offset,
+            bytes,
+            self.completion_source(),
+        )?;
+        let mapping = usage.mapping().id();
+        self.prep.usage = Some(usage.into());
+        self.attach_mmio_publication(publication);
+        Ok(memory_space::MappingSource::Mmio { mapping, bytes })
+    }
+
+    pub(crate) fn advance_publication(&mut self) -> Result<bool, SystemCallError> {
+        let work = Arc::get_mut(&mut self.work).expect("unpublished operation has another owner");
+        match work.completion.publication.as_mut() {
+            Some(publication) => publication.advance(),
+            None => Ok(true),
+        }
+    }
+
+    pub(crate) fn grant_publication(&self) -> Result<(), SystemCallError> {
+        if let Some(publication) = &self.work.completion.publication {
+            publication.grant()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_publication(&self) {
+        if let Some(publication) = &self.work.completion.publication {
+            publication.commit();
+        }
+    }
+
     pub(crate) fn completion_source(&self) -> Arc<dyn crate::task::wait_source::ObservationSource> {
         self.work.completion.source()
     }
@@ -444,7 +523,7 @@ impl Drop for Operation {
     }
 }
 
-enum Phase {
+pub(super) enum Phase {
     Idle,
     /// 阶段被唯一 Work 执行 owner 移到锁外；外部观察仍不能认为完成。
     Advancing,
@@ -465,10 +544,10 @@ enum Phase {
     Cleaning(Cleanup),
     TableFence(Cleanup),
     TableRefund(Cleanup),
-    Done,
+    Done(Option<memory_space::ChangeStorage<MetadataCharge>>),
 }
 
-struct Cleanup {
+pub(super) struct Cleanup {
     retiring: Option<memory_space::RetiringChange<MetadataCharge>>,
     storage: Option<memory_space::ChangeStorage<MetadataCharge>>,
     cursor: TableCleanup,
@@ -531,6 +610,55 @@ impl ChangeWork {
 
     pub(crate) fn wait_plan(&self) -> crate::task::wait::WaitPlan {
         crate::task::wait::WaitPlan::completion(self.completion.source())
+    }
+}
+
+/// 普通修改与预付强制退休共用同一发布、fence、View 退休和空表收束协议。
+pub(super) struct ChangeContext<'a> {
+    pub(super) shell: &'a Arc<VmShell>,
+    pub(super) views: &'a Arc<Views>,
+    pub(super) transport: &'a Transport,
+}
+
+impl ChangeContext<'_> {
+    pub(super) fn advance(
+        &self,
+        phase: &mut Phase,
+        tables: &mut RetireBatch,
+        root: &Arc<dyn Work>,
+    ) -> Outcome {
+        match phase {
+            Phase::Idle | Phase::Advancing => unreachable!("change work has no executable phase"),
+            Phase::Publishing(_) => self.step_publish(phase, root),
+            Phase::Rollback(_) => self.step_rollback(phase, tables, root),
+            Phase::RollbackFence(_) => {
+                assert!(
+                    self.transport.idle(),
+                    "VM retirement advanced before fence completion"
+                );
+                let Phase::RollbackFence(prep) = core::mem::replace(phase, Phase::Advancing) else {
+                    unreachable!()
+                };
+                *phase = Phase::Rollback(prep);
+                Outcome::Ready
+            }
+            Phase::Fencing { .. } => self.step_synchronize(phase),
+            Phase::Retiring { .. } => self.step_retire(phase),
+            Phase::Cleaning(_) => self.step_cleanup(phase, tables, root),
+            Phase::TableFence(_) => {
+                assert!(
+                    self.transport.idle(),
+                    "VM retirement advanced before fence completion"
+                );
+                let Phase::TableFence(cleanup) = core::mem::replace(phase, Phase::Advancing) else {
+                    unreachable!()
+                };
+                *phase = Phase::TableRefund(cleanup);
+                Outcome::Ready
+            }
+            Phase::TableRefund(_) => self.step_table_refund(phase, tables),
+            Phase::Done(_) => Outcome::Done,
+        }
     }
 
     fn step_rollback(
@@ -603,7 +731,7 @@ impl ChangeWork {
             } else if let Some(frame) = prep.frames.pop() {
                 drop(frame);
             } else {
-                *phase = Phase::Done;
+                *phase = Phase::Done(None);
                 return Outcome::Done;
             }
         }
@@ -645,7 +773,10 @@ impl ChangeWork {
     }
 
     fn step_synchronize(&self, phase: &mut Phase) -> Outcome {
-        debug_assert!(self.transport.idle());
+        assert!(
+            self.transport.idle(),
+            "VM retirement advanced before fence completion"
+        );
         let Phase::Fencing {
             committed,
             reserve,
@@ -755,7 +886,7 @@ impl ChangeWork {
             if tables.is_empty() {
                 drop(vm);
                 drop(dependency);
-                *phase = Phase::Done;
+                *phase = Phase::Done(cleanup.storage.take());
                 return Outcome::Done;
             }
         }
@@ -792,7 +923,7 @@ impl ChangeWork {
                         cleanup.retiring.is_none(),
                         "final table refund retained reservation"
                     );
-                    *phase = Phase::Done;
+                    *phase = Phase::Done(cleanup.storage);
                     return Outcome::Done;
                 }
                 *phase = Phase::Cleaning(cleanup);
@@ -817,34 +948,12 @@ impl Work for ChangeWork {
                 core::mem::replace(&mut state.tables, RetireBatch::new()),
             )
         };
-        let outcome = match &mut phase {
-            Phase::Idle | Phase::Advancing => unreachable!("change work has no executable phase"),
-            Phase::Publishing(_) => self.step_publish(&mut phase, &root),
-            Phase::Rollback(_) => self.step_rollback(&mut phase, &mut tables, &root),
-            Phase::RollbackFence(_) => {
-                debug_assert!(self.transport.idle());
-                let Phase::RollbackFence(prep) = core::mem::replace(&mut phase, Phase::Advancing)
-                else {
-                    unreachable!()
-                };
-                phase = Phase::Rollback(prep);
-                Outcome::Ready
-            }
-            Phase::Fencing { .. } => self.step_synchronize(&mut phase),
-            Phase::Retiring { .. } => self.step_retire(&mut phase),
-            Phase::Cleaning(_) => self.step_cleanup(&mut phase, &mut tables, &root),
-            Phase::TableFence(_) => {
-                debug_assert!(self.transport.idle());
-                let Phase::TableFence(cleanup) = core::mem::replace(&mut phase, Phase::Advancing)
-                else {
-                    unreachable!()
-                };
-                phase = Phase::TableRefund(cleanup);
-                Outcome::Ready
-            }
-            Phase::TableRefund(_) => self.step_table_refund(&mut phase, &mut tables),
-            Phase::Done => Outcome::Done,
+        let context = ChangeContext {
+            shell: &self.shell,
+            views: &self.views,
+            transport: &self.transport,
         };
+        let outcome = context.advance(&mut phase, &mut tables, &root);
         let remote = (outcome == Outcome::Blocked
             && matches!(
                 phase,

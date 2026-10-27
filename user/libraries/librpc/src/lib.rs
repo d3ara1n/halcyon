@@ -5,8 +5,10 @@
 //! 期待回复的 request 必须把裁剪后的 send-once 回复授权放在 Handle
 //! slot 0；协议层（FAL、pm、driver……）的 header 紧随前缀，不构成双层
 //! 信封。消息 `kind` 字段承载协议标识，供单邮箱多路分发。
+//! 回复 Once 同时委托发行请求者 Pool 支付本次 ABI 有界运输及 Delivery 尾部；
+//! 响应者不为未读回复继续付 Native 运输费。Quota 可放弃回复，业务提交与回复 Unsent/Unknown 仍分别判断。
 
-#![cfg_attr(target_arch = "riscv64", feature(allocator_api))]
+#![cfg_attr(target_arch = "riscv64", feature(allocator_ext))]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;

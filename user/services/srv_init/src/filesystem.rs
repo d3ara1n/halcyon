@@ -20,7 +20,10 @@ use libservice::{
     protocol as service,
 };
 pub(super) fn limits() -> FollowLimits {
-    FollowLimits::new(16, 4 * erhino_shared::message::PAYLOAD_MAX, 5_000_000_000)
+    limits_with_timeout(5_000_000_000)
+}
+fn limits_with_timeout(timeout_ns: u64) -> FollowLimits {
+    FollowLimits::new(16, 4 * erhino_shared::message::PAYLOAD_MAX, timeout_ns)
         .expect("init follow policy invalid")
 }
 pub(super) fn deadline() -> Result<Deadline, &'static str> {

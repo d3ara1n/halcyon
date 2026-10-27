@@ -1,7 +1,7 @@
 //! 内存文件 provider 的进程装配。
 
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate libruntime;
 

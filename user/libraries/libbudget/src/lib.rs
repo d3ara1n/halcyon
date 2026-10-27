@@ -1,5 +1,5 @@
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 //! 用户态公共记账：唯一付款账户、领域计费视图与随 owner 持有的扣账。
 //!

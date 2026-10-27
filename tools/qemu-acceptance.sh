@@ -79,6 +79,12 @@ required+=(
     "FS1 provider budget empty after owner retirement"
     "FS1 Copy cancellation after destination accepted prefix passed"
     "required service topology complete:"
+    "device manager ready; registry="
+    "device manager assembly ready: pid="
+    "device manager stopped; control records retired"
+    "device manager assembly stopped: source sealing and normal process completion confirmed"
+    "device discovery ready: finite enumeration, OAL root and Watch acknowledgement"
+    "device discovery stopped: source revocation observed and terminal sequence acknowledged"
     "supervision budget exhaustion retained authority:"
     "Tunnel failure owner checks passed:"
     "Tunnel Running geometry checks passed: six lengths"
@@ -113,6 +119,37 @@ case "$profile" in
             "committed mapping access passed: cookie before return=true"
             "thread memory suite passed"
             "memory workload collected"
+        )
+        ;;
+    device)
+        required+=(
+            "acceptance workload: device"
+            "DEVICE no HID worker before insertion confirmed"
+            "DEVICE press observed: round=1,"
+            "DEVICE release observed: round=1,"
+            "DEVICE disconnected and binding released: round=1,"
+            "DEVICE press observed: round=2,"
+            "DEVICE release observed: round=2,"
+            "DEVICE disconnected and binding released: round=2,"
+            "DEVICE hotplug keyboard function acceptance passed"
+            "DEVICE worker Pool refund observed: delegated_pages=0, delegated_metadata=0"
+            "xHCI INTx acknowledged: generation="
+            "xHCI IRQ source woke engine before timer"
+        )
+        ;;
+    device-reuse)
+        required+=(
+            "acceptance workload: device"
+            "DEVICE no HID worker before insertion confirmed"
+            "DEVICE shared HID process A/B confirmed: pid="
+            "DEVICE reuse A Released with old aliases retained"
+            "DEVICE reuse B after A press observed:"
+            "DEVICE shared HID process A/B/C confirmed: pid="
+            "DEVICE reuse B/C Released after process fault"
+            "DEVICE shared HID process collected exactly once"
+            "DEVICE multi-binding function acceptance passed"
+            "DEVICE worker Pool refund observed: delegated_pages=0, delegated_metadata=0"
+            "xHCI INTx acknowledged: generation="
         )
         ;;
     core)
@@ -209,6 +246,11 @@ while :; do
 done
 sleep 0.2
 trap - EXIT INT TERM
+
+# 有真实平台根的 core/stress 路线必须实际消费 MMIO；memory 专项不运行完整业务。
+if [[ "$profile" != "memory" ]] && grep -Eq 'platform description admitted: DTB [0-9]+ bytes, [1-9][0-9]* resource roots' "$log"; then
+    required+=("MMIO platform acceptance passed:" "MMIO process retirement acceptance passed:" "IRQ platform acceptance passed:" "DMA platform acceptance passed:" "DMA process retirement acceptance passed:")
+fi
 
 # 失败即保留现场：无法重现的非确定性失败、锚点缺失或挂死一旦删日志就只能重跑。
 keep_log() {

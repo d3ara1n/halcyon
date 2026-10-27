@@ -12,7 +12,7 @@ import sys
 from qemu_gdb import fresh_logs, symbols, stop_group
 
 
-def run_case(mode, kernel, addresses, command, logs, timeout):
+def run_case(mode, kernel, addresses, command, logs, timeout, boot_package=None):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -27,7 +27,7 @@ def run_case(mode, kernel, addresses, command, logs, timeout):
         "panic": "set $a1 = 0",
         "alloc": f"set $a0 = 8\nset $a1 = 8\nset $pc = {allocation:#x}",
         "fatal": "set {unsigned int}$pc = 0",
-    }[mode]
+    }.get(mode, "")
     script = f"""set pagination off
 set confirm off
 set language c
@@ -43,24 +43,37 @@ if *(unsigned char*){gate:#x} != 0
   quit 1
 end
 {injection}
-set $parked = 0
-hbreak *{park:#x}
-commands
-  silent
-  if *(unsigned char*){gate:#x} != 2
-    echo Runtime gate was not Failed before parking.\\n
-    quit 1
-  end
-  printf "PARKED thread=%d gate=2\\n", $_thread
-  set $parked = $parked + 1
-  if $parked == 4
-    detach
-    quit 0
-  end
-  continue
+python
+import gdb
+parked = set()
+failure = None
+class Parking(gdb.Breakpoint):
+    def stop(self):
+        global failure
+        state = int(gdb.parse_and_eval("*(unsigned char*){gate:#x}"))
+        if state != 2:
+            failure = "Runtime gate was not Failed before parking."
+            return True
+        number = gdb.selected_thread().num
+        if number in parked:
+            failure = "A parked hart re-entered the terminal path."
+            return True
+        parked.add(number)
+        print("PARKED thread=%d gate=2" % number)
+        return len(parked) == 4
+Parking("*{park:#x}", type=gdb.BP_HARDWARE_BREAKPOINT)
 end
 continue
+python
+if failure or len(parked) != 4:
+    raise gdb.GdbError(failure or "Incomplete failure/park evidence.")
+end
+detach
+quit 0
 """
+    if mode.startswith("platform-"):
+        import qemu_platform_funding_gdb
+        script = qemu_platform_funding_gdb.program(mode, kernel, addresses, port, logs, boot_package)
     gdb_file = logs / f"{mode}.gdb"
     gdb_file.write_text(script)
     qemu_log = logs / f"{mode}-qemu.log"
@@ -84,9 +97,14 @@ continue
         "panic": "BootPackage envelope is invalid",
         "alloc": "heap allocation error",
         "fatal": "fatal trap",
+        "platform-node": "initial process construction cannot be admitted",
+        "platform-install": "initial process construction cannot be admitted",
+        "platform-dma-retained": "initial process construction cannot be admitted",
     }[mode]
     if completed.returncode or len(parked) != 4 or len(set(parked)) != 4 or expected not in serial:
         raise RuntimeError(f"{mode}: incomplete failure/park evidence; logs: {gdb_log}, {qemu_log}")
+    if mode.startswith("platform-"):
+        qemu_platform_funding_gdb.verify(logs, mode)
     print(f"Boot failure passed: {mode}; all 4 harts parked with Gate Failed")
 
 
@@ -95,15 +113,22 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--logs", type=Path, default=Path("artifacts/boot-failure"))
     parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--platform-funding", action="store_true")
+    parser.add_argument("--funding-case", choices=("node", "install", "dma-retained", "all"), default="all")
+    parser.add_argument("--boot-package", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("QEMU command is required")
+    if args.platform_funding and args.boot_package is None:
+        parser.error("platform funding requires the actual boot package fingerprint")
     args.logs = fresh_logs(args.logs)
     addresses = symbols(args.kernel)
-    for mode in ("panic", "alloc", "fatal"):
-        run_case(mode, args.kernel, addresses, command, args.logs, args.timeout)
+    funding = (("platform-node", "platform-install", "platform-dma-retained") if args.funding_case == "all" else
+               ("platform-" + args.funding_case,))
+    for mode in (funding if args.platform_funding else ("panic", "alloc", "fatal")):
+        run_case(mode, args.kernel, addresses, command, args.logs, args.timeout, args.boot_package)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@
 
 **当前Sv39责任链已经交付。** 物理库存/来源付款、backing/View、Map/Unmap/Protect准备与不可逆提交、分步PTE发布、跨hart确认、表页/物理页退休退款、进程整体地址空间回收及用户R/W/X fault等待/修复均有正式消费者。完成屏障晚于相应实际退款，提交后的推进不依赖调用者继续运行。实现唯一视图见[mm](../notes/impls/mm.md)，后续修复及验证边界由[审查档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)拥有；其中记录memory_space/page_table host用例、正式静态门、完整acceptance和hetero通过，真实发布fault与模拟修复诊断分别提供证据。`ac9d7d9` 的[独立原始Review](archived/review-2026-10-12-substrate-object-chain.md)已由[统一报告](review-2026-10-12-consolidated.md#已退出当前修复队列的判断)核定原两项P1的更正依据，当前设计门与验证边界按统一报告和所属专题接续；不把退出错误修复队列宣称为全项目无缺陷。
 
-**执行兼容性已有结构性接通，当前只承诺Base64/D64。** `os/dtb/src/cpu.rs::parse`冻结每hart的status、RV64基线、F/D/Q/V及mmu-type；`os/kernel/src/main.rs`排除Bare hart并发布能力；`os/sched_domain`按执行需求兼容集合分域。`task/process.rs::bind_initial_execution`为进程一次选择兼容域，无兼容域返回NotSupported；线程出生继承冻结domain，ReadyBatch核对域身份，enqueue按线程域入队，各hart的run只从本域pick。`libprocess`从ELF需求选择profile；Q/V/F-only/TSO等未支持用户需求显式拒绝，不静默降级。这条保证依赖可信平台声明及程序正确声明实际执行需求，不包含探测任意虚假固件/程序声明。
+**执行兼容性已有结构性接通，当前只承诺Base64/D64。** `shared/dtb/src/cpu.rs::parse`冻结每hart的status、RV64基线、F/D/Q/V及mmu-type；`os/kernel/src/main.rs`排除Bare hart并发布能力；`os/sched_domain`按执行需求兼容集合分域。`task/process.rs::bind_initial_execution`为进程一次选择兼容域，无兼容域返回NotSupported；线程出生继承冻结domain，ReadyBatch核对域身份，enqueue按线程域入队，各hart的run只从本域pick。`libprocess`从ELF需求选择profile；Q/V/F-only/TSO等未支持用户需求显式拒绝，不静默降级。这条保证依赖可信平台声明及程序正确声明实际执行需求，不包含探测任意虚假固件/程序声明。
 
 **MMU兼容当前依靠共同Sv39模式。** DTB解析接受Bare/Sv39/Sv48/Sv57；Bare不进入Application hart集合，其余准入hart执行同一Sv39内核和用户空间。固定ISA规定支持Sv48必须支持Sv39、支持Sv57必须支持Sv48，见[supervisor规范](../references/normative/riscv-isa-v20250508/src/supervisor.adoc)的Sv48/Sv57章节，因此不同mmu-type上限当前不导致Sv39进程落到不支持Sv39的准入hart。`sched_domain::HartCapabilities`只持ISA状态能力，没有MMU模式字段；`mm.rs`的satp和`vm/space.rs::LEVELS=3`仍固定Sv39。按hart上限为各进程选择Sv48/Sv57并约束调度的能力尚未接通，不能把ISA分域等同于该能力。
 
@@ -31,7 +31,7 @@
 
 ## 设备 DMA 接入合同
 
-2026-10-23 为[设备首批方案](todo-2026-09-device-system-design.md#dma)确定内存接点；以下是目标接线，未实施 DMA，不改变已交付 CPU VM 的完成边界。
+2026-10-23 为[设备首批方案](todo-2026-09-device-system-design.md#dma)确定内存接点；当前内核已接分步 BackingAcquisition、独立 DMA BackingUse/写许可与设备退休 owner。代码事实、运行证据和仍未覆盖的硬件门由设备主计划拥有，不扩大已交付 CPU VM 的完成边界。
 
 - DMA mapping 持独立 `BackingUse(backing,[lo,hi))`，不只持 `Arc<Backing>` 或驱动 VM。现有 [MemoryObjectCore::acquire_use](../os/kernel/src/task/memory_object.rs)、[BackingUse/BackingRelease](../os/kernel/src/vm/backing.rs)提供范围保活/释放基础；页与原 charge 在最后实际 use 退出前不得退款。
 - 设备可写的 Pin 必须在 MemoryObject 原状态机中取得写许可，Sealing/Executable 拒绝新写 Pin；既有设备写许可尚存时 Seal 可以请求，但不能公布 Executable。设备只读 Pin 只需相应读取授权与 backing use。补充的是 DMA 调用接点及同步后的许可归还，不在设备层复制 W^X 状态。
@@ -39,17 +39,17 @@
 - VM Unmap/Protect/进程退出只释放其 CPU view/use/写许可，不能代退 DMA 的那一份；CPU 映射降权不必等待 DMA，整个 MemoryObject 进入 Executable 必须等待所有写者。首批 MemoryObject 固定长度，不新增 shrink/decommit；未来引入时必须守住实际 use 的区间保活，不将当前没有该接口写成设备侧独立保护机制。
 - DMA control 全部消失时，地址可能已交付的 mapping 静态保留原 use、写许可和费用，不创建永远 runnable 的回收工作；尚未暴露地址的准备允许安全取消。明确的受信 Retire 才触发暴露后实际退休；首批孤立映射等系统外部复位。由设备资源 owner 持这项责任，Process DONE 和 CPU shootdown 不成为 DMA 完成证明。
 
-接线选择：MemoryObjectCore 增加独立设备写者准入，内部在原状态锁下调用 `MemoryObjectState::reserve_writes(1)`，持有原 core 与 affine WritePermit；不经 Views 的 CPU 来源计数，也不伪造 `PermitRequirement`。use 和写许可分步取得，中途失败交原 Pin Work 回滚，不能 Drop 尚有效的 BackingUse。归还写许可必须晚于可信硬件完成/必要平台同步；随后逐步释放 use，完成谓词只要求这一份责任退出，不要求其他合法 use 一并释放。
+实际接线：MemoryObjectCore::begin_pin 在有效源授权下取得分步 BackingAcquisition，原 root use 在该准入责任退出前不被最终 Work 释放；每次只增加一个实际段引用。reserve_dma_write 在原状态锁下调用 `MemoryObjectState::reserve_writes(1)`，持有原 core 与 affine WritePermit；不经 Views 的 CPU 来源计数，也不伪造 `PermitRequirement`。共享快照字段已统一为 write_permits，包含 CPU/DMA 写者。中途失败交原 Pin Work 回滚已持前缀，不能 Drop 尚有效的 BackingUse。归还写许可必须晚于可信硬件完成/必要平台同步；随后逐步释放 use，完成谓词只要求这一份责任退出，不要求其他合法 use 一并释放。
 
 Pin 结果与物理地址分开：Pin 只交付 mapping 能力，第一次 ReadSegments 在可能写出任何地址之前标记 MayBeExposed。此前安装失败/取消/域封口可回滚；此后输出 fault、最后 Close 或进程死亡均不能推断硬件没有取得地址。暴露边界、静态保留和 Retire 由[设备 Pin 合同](todo-2026-09-device-system-design.md#dma-pin-的提交与结果寿命)拥有。范围 use 的物理地址枚举复用 BackingUse::physical_span，每次有界，不生成另一套物理库存表。
 
 ### MMIO 映射接入
 
-设备范围内将现有 BackingView/MapBacking 演进为纯值映射来源，实物 View 持 `MappingUse::Ram(BackingUse)` 或 `Mmio(MmioViewUse)`；MMIO 不伪装 Funded/Boot RAM，不取得 MemoryObject 写许可。普通 VM 几何、发布、fault、同步和退休继续共用，详见[设备 VM 接线](todo-2026-09-device-system-design.md#vm-来源发布与强制撤销)。基础页 MMIO、按 MappingId 追踪片段、每空间预付的强制退休槽和整空间退休接管必须同时落地，不能先增加 IO PTE 再补撤销责任。
+纯层原 BackingView/MapBacking 已演进为 MappingOrigin/MappingSource，包含 MMIO 身份/偏移、基础页选择及强制完整片段退休的预约原语。实物 View 已改为 `MappingUse::Ram(BackingUse)` 或 `Mmio(MmioViewUse)`，稳定 Map 记录与每空间预付 Work/FIFO 已接入 VM；MMIO 不伪装 Funded/Boot RAM，不取得 MemoryObject 写许可。普通 VM 几何、发布、fault、同步和退休共用 ChangeContext，详见[设备 VM 接线](todo-2026-09-device-system-design.md#vm-来源发布与强制撤销)。MMIO control/use、层级树的分步准入/撤销、shared/libkernel 与公共 Map 分支已接入；原线程请求持准备并在目标页表下有界推进。virt 实际平台根及 ECAM 消费者已接通，非空退休、最后 Close 和退出组合的证据及精确交错/费用故障缺口由[设备续接记录](todo-2026-09-device-system-design.md#平台-mmio-根与真实消费者续接)拥有；不把普通 RAM 回归或调度竞争当成全部跨 hart 交错证明。
 
-普通 uaccess/IPC/结果写回及初始栈/上下文的检查同时约束来源为 RAM；仍使用 translate 前置校验和 SUM 直访。MMIO 的访问由驱动专用 volatile 接口承担，不新增内核软件页表拷贝旁路，也不让 IO 页成为 DMA Pin 来源。新增映射来源须覆盖 View 切分、Protect、Unmap、失败回滚、空间退出及旧 VA 空洞再利用，不只覆盖 Map 成功路径。
+普通 uaccess/IPC/结果写回及初始栈/上下文的检查已约束实物 View 来源为 RAM，保持 translate 前置校验和 SUM 直访；该来源索引在 PTE 发布前登记、同步后退休，覆盖几何账本分步替换时的空窗。MMIO 的访问由驱动专用 volatile 接口承担，不新增内核软件页表拷贝旁路，也不让 IO 页成为 DMA Pin 来源。新增映射来源须覆盖 View 切分、Protect、Unmap、失败回滚、空间退出及旧 VA 空洞再利用，不只覆盖 Map 成功路径。
 
-实施与验收并入设备计划：覆盖 Pin 与 Seal 竞争、驱动 VM 回收而设备仍持页、最后控制 Close、重复退休和费用只在物理释放后归还。当前源码事实仅支持 use/写许可的复用依据，不能据此声称 DMA owner 或上述接线已经存在。
+实施与验收并入设备计划：现有 init/test_target 已接正常 Pin/Seal/Retire、未暴露取消、VM 退出和地址输出 fault 的保留；根终态观察与外部 GDB 路线核 reset 失败/初始进程 DONE 后的真实保留。精确 Pin/Seal 与 reader/Retire 交错、付款/OOM 故障及真实设备静止仍按设备计划的未闭合门补证，不能把物理地址读取当成已经运行硬件 DMA。
 
 ## 设计启动时的现状事实（历史，不用于当前接手）
 

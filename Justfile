@@ -14,9 +14,9 @@ MEMORY_SCRIPT := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"memory.x"
 # compile
 RUSTFLAGS_OS := "-Clinker=riscv64-elf-ld"
 RUSTFLAGS_USER := ""
-# 用户态验收负载为 core/stress/memory；profile 选择停留在 srv_init，不进入内核 ABI。
+# 用户态验收负载为 core/stress/memory/device/device-reuse；profile 选择停留在 srv_init，不进入内核 ABI。
 ACCEPTANCE_WORKLOAD := env_var_or_default("ERHINO_ACCEPTANCE_WORKLOAD", "core")
-INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "memory" { "--features srv_init/acceptance-memory" } else if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else { "" }
+INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "device-reuse" { "--features srv_init/acceptance-device-reuse" } else if ACCEPTANCE_WORKLOAD == "memory" { "--features srv_init/acceptance-memory" } else if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else if ACCEPTANCE_WORKLOAD == "device" { "--features srv_init/acceptance-device" } else { "" }
 
 TARGET_DIR := invocation_directory()/"artifacts"
 KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
@@ -41,7 +41,8 @@ BOOT_PACKAGE_ADDR := if MODEL == "virt" { "0xB0000000" } else { "0x84000000" }
 QEMU_MEMORY := if MODEL == "virt" { "1024M" } else { "128M" }
 # 与 virt DTS 声明的 Zkr 能力一致；sifive_u 不声明该扩展。
 QEMU_CPU := if MODEL == "virt" { "-cpu rv64,zkr=true" } else { "" }
-QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU
+QEMU_DEVICE := if MODEL == "virt" { "-nic none -device qemu-xhci,id=xhci,bus=pcie.0,addr=1,msi=off,msix=off" } else { "" }
+QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU+" "+QEMU_DEVICE
 # CPU 节流百分比（tools/qemu-throttle.sh）：保留为跑飞/panic 或异常忙循环时
 # 的宿主资源保护；stress 也默认节流，不把它当作全速性能基准。
 # 1-99 按比例节流；100 = 全速。默认 50。常规验证保持默认节流，只有需要固定
@@ -50,7 +51,9 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线 QEMU 运行超时只在本处维护，可用同名环境变量覆盖；调整政策见 plans/BUILD-AND-TEST.md。
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "360")
-VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "35")
+VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "70")
+# 两轮热插每轮四个30秒等待边界，加原core收束；仅防挂死，不是性能要求。
+VIRT_DEVICE_TIMEOUT := env_var_or_default("VIRT_DEVICE_TIMEOUT", "1120")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "420")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "90")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "180")
@@ -58,6 +61,7 @@ SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "240")
 VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
 VIRT_IPI_FAILURE_TIMEOUT := env_var_or_default("VIRT_IPI_FAILURE_TIMEOUT", "60")
 VIRT_VM_FAULT_TIMEOUT := env_var_or_default("VIRT_VM_FAULT_TIMEOUT", "420")
+VIRT_DMA_RETENTION_TIMEOUT := env_var_or_default("VIRT_DMA_RETENTION_TIMEOUT", "720")
 
 # gdb
 GDB_BINARY := "riscv64-elf-gdb"
@@ -92,6 +96,10 @@ clippy:
             return "$status"
         fi
     }
+    run_lint user-device artifacts/lint/user-device.log \
+        bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features acceptance-device-reuse {{ZFLAGS_USER}} -- -D warnings'
+    run_lint user-resources artifacts/lint/user-resources.log \
+        bash -c 'cd user && cargo clippy -p srv_init -p test_target --bins --features srv_init/acceptance-irq-retirement,srv_init/acceptance-irq-exit,srv_init/acceptance-mmio-publication,srv_init/acceptance-mmio-forced,srv_init/acceptance-dma-races,srv_init/acceptance-dma-shared,srv_init/acceptance-dma-quota,srv_init/acceptance-dma-install-failure {{ZFLAGS_USER}} -- -D warnings'
     run_lint shared-host artifacts/lint/shared.log \
         bash -c 'cd shared && cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint os-host artifacts/lint/os-host.log \
@@ -99,9 +107,9 @@ clippy:
     run_lint kernel-target artifacts/lint/kernel.log \
         bash -c 'cd os && cargo clippy -p kernel --bin kernel {{ZFLAGS}} -- -D warnings'
     run_lint user-host artifacts/lint/user-host.log \
-        bash -c 'cd user && cargo clippy -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p liboal -p libservice -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
+        bash -c 'cd user && cargo clippy -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p liboal -p libservice -p libdevice -p libpci -p libdriver -p libusb -p libhid -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint user-target artifacts/lint/user-target.log \
-        bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
+        bash -c 'cd user && cargo clippy --workspace --lib --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-stress artifacts/lint/user-stress.log \
         bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features acceptance-stress {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-memory artifacts/lint/user-memory.log \
@@ -127,7 +135,7 @@ build_user: artifact_dir
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ACCEPTANCE_WORKLOAD}}" in
-        core|stress|memory) ;;
+        core|stress|memory|device|device-reuse) ;;
         *) echo "Unknown acceptance workload: {{ACCEPTANCE_WORKLOAD}}" >&2; exit 2 ;;
     esac
     cd user
@@ -144,11 +152,16 @@ make_initfs: build_user
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
     @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
+    @ditto "{{TARGET_DIR}}/build/srv_device" "{{TARGET_DIR}}/initfs/bin/srv_device"
+    @ditto "{{TARGET_DIR}}/build/srv_driver" "{{TARGET_DIR}}/initfs/bin/srv_driver"
     @ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"
     @ditto "{{TARGET_DIR}}/build/test_fs" "{{TARGET_DIR}}/initfs/bin/test_fs"
+    @ditto "{{TARGET_DIR}}/build/test_device" "{{TARGET_DIR}}/initfs/bin/test_device"
     @ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"
     @if [ "{{ACCEPTANCE_WORKLOAD}}" != core ]; then ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"; fi
-    @for file in {{TARGET_DIR}}/build/drv_*; do ditto "$file" "{{TARGET_DIR}}/initfs/bin/${file##*/}"; done
+    @ditto "{{TARGET_DIR}}/build/drv_pci_generic" "{{TARGET_DIR}}/initfs/bin/drv_pci_generic"
+    @ditto "{{TARGET_DIR}}/build/drv_usb_xhci" "{{TARGET_DIR}}/initfs/bin/drv_usb_xhci"
+    @ditto "{{TARGET_DIR}}/build/drv_usb_hid" "{{TARGET_DIR}}/initfs/bin/drv_usb_hid"
     # 保留 build 目录的完整 ELF 调试信息，initfs 只承载装载所需部分。
     @for file in "{{TARGET_DIR}}/initfs"/bin/*; do riscv64-elf-strip --strip-debug "$file"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
@@ -211,6 +224,159 @@ sifive_u mode="release":
 acceptance-virt mode="release":
     @just output acceptance-virt-{{mode}} test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{if mode == "release" { VIRT_RELEASE_TIMEOUT } else { VIRT_TIMEOUT }}} -smp cores=4
 
+acceptance-device mode="release":
+    @just output acceptance-device-{{mode}} test env ERHINO_ACCEPTANCE_WORKLOAD=device QEMU_ACCEPTANCE_PROFILE=device just PLATFORM=qemu MODEL=virt MODE={{mode}} run_device_acceptance
+
+# 复用/CPU故障需要正式debug ELF类型信息，仍用同一设备客户端/QMP设施。
+acceptance-device-reuse:
+    @just output acceptance-device-reuse test env ERHINO_ACCEPTANCE_WORKLOAD=device-reuse QEMU_ACCEPTANCE_PROFILE=device-reuse just PLATFORM=qemu MODEL=virt MODE=debug run_device_acceptance_reuse
+
+acceptance-device-retry-race:
+    @just output acceptance-device-retry-race test env ERHINO_ACCEPTANCE_WORKLOAD=device-reuse QEMU_ACCEPTANCE_PROFILE=device-reuse just PLATFORM=qemu MODEL=virt MODE=debug run_device_retry_race
+
+[private]
+run_device_retry_race:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-device-retry-race" PLATFORM=qemu MODEL=virt MODE=debug run_device_acceptance_reuse false true
+
+# 显式负装配使用同一复用路线与真实PCI/HID映像，不改变正常支持声明。
+acceptance-device-candidates:
+    @just output acceptance-device-candidates test env ERHINO_ACCEPTANCE_WORKLOAD=device-reuse QEMU_ACCEPTANCE_PROFILE=device-reuse just PLATFORM=qemu MODEL=virt MODE=debug run_device_candidates
+
+[private]
+run_device_candidates:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-device-candidates" PLATFORM=qemu MODEL=virt MODE=debug run_device_acceptance_reuse true
+
+# 主线程仍在原设备客户端同步wait时，外部fault实际管理者，核独立观察和真实ColdReboot。
+acceptance-device-manager-fault manager phase="wait":
+    @just output acceptance-device-manager-fault-{{manager}}-{{phase}} test env ERHINO_ACCEPTANCE_WORKLOAD=device just PLATFORM=qemu MODEL=virt MODE=debug run_device_manager_fault {{manager}} {{phase}}
+
+[private]
+run_device_manager_fault manager phase: make_dtb make_boot_package build_kernel
+    @ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" python3 tools/check-device.py --manager-fault {{manager}} --fault-phase {{phase}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 真实受信xHCI执行者fault；原DMA观察体拒绝ColdReboot并核责任保留。
+acceptance-device-controller-fault:
+    @just output acceptance-device-controller-fault test env ERHINO_ACCEPTANCE_WORKLOAD=device just PLATFORM=qemu MODEL=virt MODE=debug run_device_controller_fault
+
+[private]
+run_device_controller_fault: make_dtb make_boot_package build_kernel
+    @ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" python3 tools/check-device.py --worker-fault Xhci --reject-reset --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 分操作核已提交业务的回复缺失，真实core装配不增加测试worker/provider。
+acceptance-device-unknown operation:
+    @just output acceptance-device-unknown-{{operation}} test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_device_unknown {{operation}}
+
+[private]
+run_device_unknown operation: make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core {{if operation == "Claim" { "" } else if operation == "GetResource" { "" } else { "tools/qemu-acceptance.sh --" }}} python3 tools/check-device.py --unknown {{operation}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 同一实际PCI function两轮授权；init复用libusb控制器承担真实硬件停止责任。
+acceptance-device-function-session:
+    @just output acceptance-device-function-session test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_device_function_config
+
+[private]
+run_device_function_config:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-device-function-session" PLATFORM=qemu MODEL=virt MODE=debug run_device_function_session
+
+[private]
+run_device_function_session: make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --function-session --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+acceptance-irq-retirement:
+    @just output acceptance-irq-retirement test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_irq_retirement_config
+
+acceptance-irq-idle:
+    @just output acceptance-irq-idle test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_irq_retirement_config true
+
+[private]
+run_irq_retirement_config idle="false":
+    @just --set INIT_FEATURES " --features srv_init/acceptance-irq-retirement" PLATFORM=qemu MODEL=virt MODE=debug run_irq_retirement {{idle}}
+
+[private]
+run_irq_retirement idle="false": make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --function-session --irq-retirement {{if idle == "true" { "--irq-idle" } else { "" }}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 单次平台时钟首因调查；原IRQ消费者，100%调试，两错误路径点，不判IRQ门完成。
+investigate-clock:
+    @just output investigate-clock test env THROTTLE=100 ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_clock_failure_config
+
+[private]
+run_clock_failure_config:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-irq-exit" PLATFORM=qemu MODEL=virt MODE=debug run_clock_failure
+
+[private]
+run_clock_failure: make_dtb make_boot_package build_kernel
+    @python3 tools/check-clock-failure.py --kernel "{{KERNEL_ELF}}" --init "{{TARGET_DIR}}/build/srv_init" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh 100 {{QEMU_LAUNCH}} -smp cores=4
+
+acceptance-irq-exit:
+    @just output acceptance-irq-exit test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_irq_exit_config
+
+[private]
+run_irq_exit_config:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-irq-exit" PLATFORM=qemu MODEL=virt MODE=debug run_irq_exit
+
+[private]
+run_irq_exit: make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --irq-exit --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 原32页MMIO消费者的许可前/后Revoke交错及独立Pool退款。
+acceptance-mmio-publication:
+    @just output acceptance-mmio-publication test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_mmio_publication_config
+
+[private]
+run_mmio_publication_config:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-mmio-publication" PLATFORM=qemu MODEL=virt MODE=debug run_mmio_publication
+
+[private]
+run_mmio_publication: make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --mmio-publication --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+acceptance-dma-races:
+    @just output acceptance-dma-races test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config
+
+acceptance-mmio-forced:
+    @just output acceptance-mmio-forced test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_mmio_forced_config
+
+[private]
+run_mmio_forced_config:
+    @just --set INIT_FEATURES " --features srv_init/acceptance-mmio-forced" PLATFORM=qemu MODEL=virt MODE=debug run_mmio_forced
+
+[private]
+run_mmio_forced: make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --mmio-forced --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+acceptance-dma-shared:
+    @just output acceptance-dma-shared test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config shared
+
+acceptance-dma-quota:
+    @just output acceptance-dma-quota test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config quota
+
+acceptance-dma-install-failure:
+    @just output acceptance-dma-install-failure test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config install-failure
+
+[private]
+run_dma_races_config scenario="races":
+    @just --set INIT_FEATURES " --features srv_init/acceptance-dma-{{scenario}}" PLATFORM=qemu MODEL=virt MODE=debug run_dma_races {{scenario}}
+
+[private]
+run_dma_races scenario="races": make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --dma-{{scenario}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+acceptance-device-reset-rejection:
+    @just output acceptance-device-reset-rejection test env ERHINO_ACCEPTANCE_WORKLOAD=device just PLATFORM=qemu MODEL=virt MODE=debug run_device_reset_rejection
+
+[private]
+run_device_reset_rejection: make_dtb make_boot_package build_kernel
+    @ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" python3 tools/check-device.py --manager-fault Device --reject-reset --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+[private]
+run_device_acceptance_reuse candidates="false" retry_race="false": make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=device-reuse tools/qemu-acceptance.sh -- python3 tools/check-device.py --reuse {{if candidates == "true" { "--candidates" } else { "" }}} {{if retry_race == "true" { "--retry-race" } else { "" }}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+[private]
+run_device_acceptance: make_dtb make_boot_package build_kernel
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=device tools/qemu-acceptance.sh -- python3 tools/check-device.py --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
 acceptance-sifive_u mode="release":
     @just output acceptance-sifive_u test env ERHINO_ACCEPTANCE_WORKLOAD=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
 
@@ -246,6 +412,13 @@ virt-boot-failure:
 run_boot_failure: make_dtb make_boot_package build_kernel
     @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
+virt-platform-funding scenario="all":
+    @just output virt-platform-funding test env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_platform_funding {{scenario}}
+
+[private]
+run_platform_funding scenario="all": make_dtb make_boot_package build_kernel
+    @python3 tools/check-boot-failure.py --platform-funding --funding-case {{scenario}} --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
 # 真实已发布责任的门铃失败验收。
 virt-ipi-failure:
     @just output virt-ipi-failure test env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_ipi_failure
@@ -270,6 +443,22 @@ virt-vm-repair:
 run_vm_repair: make_dtb make_boot_package build_kernel
     @python3 tools/check-vm-repair.py --kernel "{{KERNEL_ELF}}" -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
+# 真实 DMA 静态保留、reset 失败与 init DONE；调试器全速运行，不作为性能证据。
+virt-dma-retention:
+    @just output virt-dma-retention test env ERHINO_ACCEPTANCE_WORKLOAD=core THROTTLE=100 just PLATFORM=qemu MODEL=virt MODE=debug run_dma_retention
+
+[private]
+run_dma_retention: make_dtb make_boot_package build_kernel
+    @python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 同一实际pin/停止观察，另核一次request广播IPI失败时原DMA责任不消散。
+virt-dma-ipi-retention:
+    @just output virt-dma-ipi-retention test env ERHINO_ACCEPTANCE_WORKLOAD=core THROTTLE=100 just PLATFORM=qemu MODEL=virt MODE=debug run_dma_ipi_retention
+
+[private]
+run_dma_ipi_retention: make_dtb make_boot_package build_kernel
+    @python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}} --ipi-failure --logs artifacts/dma-ipi-retention -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
 # 常规跨机制回归：静态门、无调试器的完整 debug 压力和 release core。
 acceptance-core:
     @just clippy
@@ -286,6 +475,7 @@ acceptance-faults:
     @just virt-ipi-failure
     @just virt-vm-fault
     @just virt-vm-repair
+    @just virt-dma-retention
 
 # 完整验收只组合测试入口，不调用演示入口。
 acceptance:

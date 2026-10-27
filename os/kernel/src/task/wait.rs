@@ -11,7 +11,7 @@ use erhino_shared::{
 
 use super::{
     Thread,
-    process::members::{ParkTransition, WakeTransition},
+    process::members::ParkTransition,
     wait_source::{Hint, HintTarget, ObservationSource},
 };
 use crate::{
@@ -196,7 +196,7 @@ pub(crate) fn install(owner: AdmittedThread, plan: WaitPlan) {
             sched::reap(owner);
         } else {
             set_result(&owner, Err(SystemCallError::ReachLimit));
-            requeue(owner, slot);
+            sched::requeue(owner, slot);
         }
         return;
     };
@@ -234,7 +234,7 @@ pub(crate) fn install(owner: AdmittedThread, plan: WaitPlan) {
     }
     // 登记后复检，覆盖此前已经 ready 的来源以及登记窗口内的到期。
     if let Some(owner) = resume(owner, slot) {
-        requeue(owner, slot);
+        sched::requeue(owner, slot);
     }
 }
 
@@ -342,16 +342,5 @@ fn set_result(owner: &AdmittedThread, result: Result<ObjectSignals, SystemCallEr
             frame.x[10] = error as u64;
             frame.x[11] = 0;
         }
-    }
-}
-
-fn requeue(owner: AdmittedThread, slot: usize) {
-    let transition = owner
-        .process
-        .lease_receipt()
-        .map(|body| body.members.requeue(&owner.process, owner.member(), slot));
-    match transition {
-        Some(WakeTransition::Publish(ingress)) => ingress.publish_admitted(owner),
-        _ => sched::reap(owner),
     }
 }

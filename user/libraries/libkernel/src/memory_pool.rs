@@ -29,22 +29,12 @@ impl MemoryPool {
     pub fn into_handle(self) -> Handle {
         ManuallyDrop::new(self).handle
     }
+    pub fn as_handle(&self) -> Handle {
+        self.handle
+    }
 
     pub fn query(&self) -> Result<MemoryPoolSnapshot, SystemCallError> {
-        let mut snapshot = MemoryPoolSnapshot::default();
-        // SAFETY: snapshot 在 syscall 期间有效且可写。
-        unsafe { crate::call::sys_memory_pool_query(self.handle, &mut snapshot)? };
-        if snapshot.identity == 0
-            || snapshot.depth == 0
-            || snapshot.depth > MEMORY_POOL_MAX_DEPTH
-            || snapshot.reserved0 != 0
-            || snapshot.depth == 1 && snapshot.parent_identity != 0
-            || snapshot.depth > 1 && snapshot.parent_identity == 0
-            || !snapshot.closes()
-        {
-            return Err(SystemCallError::InternalError);
-        }
-        Ok(snapshot)
+        query(self.handle)
     }
 
     pub fn derive(
@@ -52,26 +42,54 @@ impl MemoryPool {
         budget: MemoryPoolBudget,
         rights: Rights,
     ) -> Result<Self, SystemCallError> {
-        let mut child = Handle::INVALID;
-        let request = MemoryPoolDeriveRequest {
-            budget,
-            rights,
-            reserved: 0,
-        };
-        // SAFETY: child 在 syscall 期间有效且可写；内核完整校验值参数。
-        unsafe {
-            crate::call::sys_memory_pool_derive(self.handle, &request, &mut child)?;
-        }
-        if !child.is_valid() {
-            return Err(SystemCallError::InternalError);
-        }
-        Ok(Self { handle: child })
+        derive(self.handle, budget, rights)
     }
 
     /// 关闭唯一持有的 MemoryPool leaf Handle；合法 typed owner 不存在可恢复失败。
     pub fn close(self) {
         crate::ipc::object::close_object_owner(self.into_handle());
     }
+}
+
+/// 借用其他实际owner持有的Pool entry观察余额，不创建别名或转移关闭责任。
+pub fn query(handle: Handle) -> Result<MemoryPoolSnapshot, SystemCallError> {
+    let mut snapshot = MemoryPoolSnapshot::default();
+    // SAFETY: snapshot 在同步调用期间有效且可写，内核验证原entry的类型/READ权限。
+    unsafe { crate::call::sys_memory_pool_query(handle, &mut snapshot)? };
+    if snapshot.identity == 0
+        || snapshot.depth == 0
+        || snapshot.depth > MEMORY_POOL_MAX_DEPTH
+        || snapshot.reserved0 != 0
+        || snapshot.depth == 1 && snapshot.parent_identity != 0
+        || snapshot.depth > 1 && snapshot.parent_identity == 0
+        || !snapshot.closes()
+    {
+        return Err(SystemCallError::InternalError);
+    }
+    Ok(snapshot)
+}
+
+/// 从宿主持有的通用 Pool entry 借用派生权，输出有唯一关闭责任的新 Pool。
+/// 输入身份、类型和 CREATE 权由内核核验；不构造第二份父 owner。
+pub fn derive(
+    parent: Handle,
+    budget: MemoryPoolBudget,
+    rights: Rights,
+) -> Result<MemoryPool, SystemCallError> {
+    let mut child = Handle::INVALID;
+    let request = MemoryPoolDeriveRequest {
+        budget,
+        rights,
+        reserved: 0,
+    };
+    // SAFETY: request/child 在调用期间有效，输入句柄及预算由内核完整校验。
+    unsafe {
+        crate::call::sys_memory_pool_derive(parent, &request, &mut child)?;
+    }
+    if !child.is_valid() {
+        return Err(SystemCallError::InternalError);
+    }
+    Ok(MemoryPool { handle: child })
 }
 
 impl Drop for MemoryPool {

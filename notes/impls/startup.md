@@ -26,7 +26,7 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、descrip
 
 **`parent_pid` 语义**：描述目标进程的创建关系，即目标 launcher 的当前 `CurrentProcessInfo::pid()`（创建者 PID），与 ProcessQuery 快照中的 parent_pid 同一真值；孙进程的 parent 因而是直接父进程而非祖父。`SpawnRequest` 显式携带 launcher 从受控 `StartupContext` 读取的完整身份视图；不通过 runtime 全局 getter 隐式推导。
 
-接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（libruntime `startup::init` 沿用 a0/a1 契约）。init 的出生块 Handle 顺序固定为：Handle[0] root JobControl、Handle[1] primordial SystemReset、Handle[2] init ProcessControl、Handle[3] root MemoryPool、Handle[4] 入口 ThreadControl；索引由 `shared::startup::initial` 定义，descriptor 显式引用第 4 项。Body 付款 Pool 与 Handle[3] 指向同一个 root core，不复制额度。普通进程先排列显式 grants，Building ThreadCreate 的 Control 经 Grant 得到 child-local 句柄后追加到同一数组并由 descriptor 引用；其余 slot 含义由具体启动协议定义，不属于通用线格式。
+接收进程以出生参数 arg1/arg2（块基址与字节长度）在首线程入口读取（libruntime `startup::init` 沿用 a0/a1 契约）。init 的出生块基础 Handle 顺序为：Handle[0] root JobControl、Handle[1] primordial SystemReset、Handle[2] init ProcessControl、Handle[3] root MemoryPool、Handle[4] 入口 ThreadControl、Handle[5] 只读平台描述 MemoryObject；索引由 `shared::startup::initial` 定义，descriptor 显式引用第 4 项。总数按基础项加实际平台资源记录数计算；受支持 virt 为三个 MMIO 根、一个 PCI INTx 根和一个 DMA domain 根，其余当前平台为零根。Body 付款 Pool 与 Handle[3] 指向同一个 root core，不复制额度。普通进程先排列显式 grants，Building ThreadCreate 的 Control 经 Grant 得到 child-local 句柄后追加到同一数组并由 descriptor 引用；其余 slot 含义由具体启动协议定义，不属于通用线格式。
 `StartupContext::adopt(StartupSeed)` 先完成 StartupBlock/role/Query 全表校验，失败返还 Seed 且不建立任何 owner；成功一次返回 `StartupAdoption { entry, entry_control, context }`，入口 Control 已从应用 grants 中移出。只有持 unsafe 构造的 Seed 者（libruntime 平台入口）能到达该值，libruntime 把 descriptor/control 交给入口 `ThreadRegistry`，应用只经 `startup::take()` 取得 context；任一采用失败记录诊断并 `ProcessAbort`，不调用 main。应用取得 Context 后必须消费 `into_parts()`，`InitialGrants` 通过 `take(index)` 或 `try_adopt(role)` 单次领取，未领取 grant 由 Drop 正常 close。
 
 ## 组装 ABI（Building 期外部通道）
@@ -48,19 +48,37 @@ Header 保存 magic、version、块长、pid、parent_pid、Handle 数、descrip
 
 [`boot.rs`](../../os/kernel/src/boot.rs) 验证 envelope、ELF 和物理 owner，建立 root Pool，再发布 [`boot/bootstrap.rs`](../../os/kernel/src/boot/bootstrap.rs) 的 Bootstrap 维护记录。记录保存 validated ELF、package prefix owner、payload owner、出生块与装载游标，不重新解释 program headers。
 
-Bootstrap私有Arc与SystemReset Arc都在root Pool中按实际live-layout先准入；初始Cap Vec按固定HANDLE_COUNT的实际Layout预付，commit消费分配后、发布Work前返费。Startup prefix编码器显式接收PAGE为payload_off/Vec容量，构造前按同一Layout付款，Loader持有block与其MetadataCharge，未发布失败一起收束。Bootstrap自己的header费随执行宿主最后loan释放，SystemReset公开对象费随其最后存活owner释放；这些出生费用不改StartupBlock格式、role或授权。
+Bootstrap私有Arc、SystemReset Arc及平台描述MemoryObject都在root Pool中按实际live-layout先准入；初始Cap Vec按基础项加实际资源记录数的Layout预付，commit消费分配后、发布Work前返费。Startup prefix编码器显式接收PAGE为payload_off/Vec容量，构造前按同一Layout付款，Loader持有block与其MetadataCharge，未发布失败一起收束。Bootstrap自己的header费随执行宿主最后loan释放，SystemReset公开对象费随其最后存活owner释放。
 
-1. 通过普通 construct 创建 pid 1 的 Shell/Body，绑定执行需求，创建 Builder 与入口 Control；预约五个 primordial cap 槽，用真实句柄构造出生块并提交。Job 与 cap 表提交分段，表锁内没有 Job/对象业务提交。
-2. 每步映射一个ELF run分片或栈分片，最多取VM的STEP_UNITS页；回填文件/出生块字节受同一分片字节数及uaccess上界共同约束。所有Map复用Operation/ChangeWork。记录持私有完成来源，在自身稳定WaitNode上arm/attach/复检，提示只唤醒同一维护记录；完成后唯一detach，不同步自旋推进整个映像。
+1. 通过普通 construct 创建 pid 1 的 Shell/Body，绑定执行需求，创建 Builder 与入口 Control；按实际初始图预约 cap 槽，用真实句柄构造出生块并提交。Job 与 cap 表提交分段，表锁内没有 Job/对象业务提交。
+2. 先每步复制至多一个目标页内的 DTB 字节至平台描述对象，完成后归还原 DTB reservation；随后每步映射一个ELF run分片或栈分片，最多取VM的STEP_UNITS页。回填文件/出生块字节受同一分片字节数及uaccess上界共同约束。所有Map复用Operation/ChangeWork。记录持私有完成来源，在自身稳定WaitNode上arm/attach/复检，提示只唤醒同一维护记录；完成后唯一detach，不同步自旋推进整个映像。
 3. payload的BootHeldExtent每次同样切出至多STEP_UNITS页，未移交尾段继续由Loader持有；片段与root charge合成BootFundedExtent，作为统一backing的物理owner进入普通只读View；普通页与boot页保持各自库存归还方式，View/整空间退休使用同一段游标。没有隐式lease区域。
 4. 共用成员预约、Thread/Control/Departure 与 ReadyBatch 构造入口 Created，出生参数为块址/实际字节数、sp=USER_TOP。
 5. 所有ELF字节拷贝完成后清除原始字节借用并归还package prefix；Loader从Option中取出唯一Builder，调用start后在私有锁外释放该强根。已提交启动由Builder队列根承担，Bootstrap仅持独立完成来源，等待VM静止、分批发布、Builder退费和WorkReceipt归还后的DONE。完成后detach并释放Loader/Bootstrap；保留Builder强根会阻止其last-live完成，因此等待期间没有该强边。启动错误冻结Shell并释放Loader；唯一initial无法构造属于致命错误：同步准入失败仍走Preparing→Failed，Ready后装载失败走既有runtime_stop全hart停驻。
 
+[`boot/watch.rs`](../../os/kernel/src/boot/watch.rs) 的 InitialWatch 在初始图准备期预付 Work/节点/费用，只持 Shell 的独立观察来源，不持 live capability、Body 或退出租约。Bootstrap 在 ProcessStart 前挂入它的 DONE 节点并发布；观察 Work 先 arm 再复检，正常长期运行时停驻，不轮询。装载记录完成后释放临时输入，该独立 boot owner 继续观察。实际 init DONE 后，Work 锁外 detach 并提交 runtime_stop；hint 只唤醒，不在回调内停机。DMA 稳定保留不依赖观察速度，终局不会因 init cap 表关闭而 unpin。
+
 VM/backing退款由[`mm.md`](mm.md)拥有，生命周期与启动门由[`task.md`](task.md)拥有。启动记录的分片准备也可能分配metadata，STEP_UNITS页数边界不代表完整原子时间界；源码检查、平台组合和未覆盖窗口由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)承载。
+
+### 只读平台描述
+
+[`frame::DeviceTreeReservation`](../../os/kernel/src/frame.rs) 持原始 DTB 的有效字节范围及可归还片段；片段来自 DTB 页覆盖减永久 reservation，最多为永久排除段数加一。`main` 在单核启动期撤去 transition 别名后把该 owner 交给 `boot`，正式直映射继续可读。`Bootstrap::Loader` 持 owner 到复制完成；失败析构同样只归还它实际拥有的部分，不释放永久平台保留区。
+
+[`shared::platform`](../../shared/erhino_shared/src/platform.rs) 定义 48 字节小端头、16 字节资源关联项和紧随其后的原 DTB。头含版本、有效总长、DTB 偏移/长度及记录数，记录关联资源种类、相对 blob 的节点 token 偏移与初始 Handle 索引。解析检查 canonical 几何、溢出、重复句柄槽和逐项槽位关系；同一 DT 节点可关联多个同类资源。board 的已准入 IoRoots 与 DTB owner 一起移交 boot，Bootstrap 按同一顺序写关联记录、铸造真实 MMIO/IRQ/DMA control 并安装 capability；PLIC 控制器在 registry 建立后初始化，IRQ 根只委托已核 PCI source 和 admitted target，DMA 根固定为 TrustedPhysical/Coherent。PIO 不产生记录。
+
+根的对象/节点/Work 由 root Pool 付款；全部描述、cap 槽和启动输入准备成功后才允许 Start。铸根或安装前失败先释放已铸 capabilities，再沿原 Shell/Builder 失败路径收束。记录只关联节点和真实 handle 槽，不复制物理几何；几何由 control 查询和只读 DT 对应。
+
+平台对象使用正常 root Pool funding 和 MemoryObject owner，分配页清零。初始化仅在初始进程 Building、无可运行消费者时经 `initialize_boot_page` 写入，单次范围不得跨目标页；这不是公开对象的写权限旁路。对象只交付 READ/WAIT/DUPLICATE/TRANSIT/GRANT，不交 WRITE/EXECUTE/MANAGE。用户看不到原 DTB 首尾页的其他内容；对象尾部 padding 为零，原 reservation 可在初始进程 Start 前归还。
+
+[`srv_init::platform`](../../user/services/srv_init/src/platform.rs) 用 Description::parse 严格核完整初始数组长度与逐项槽关系；[`libpci::platform`](../../user/libraries/libpci/src/platform.rs) 共同拥有只读 View、描述格式、DTB totalsize、节点 token、尾部零填充及实际 kind/rights/几何核验，供 init 和设备服务复用。后继只解码只读事实，不把初始 handle_index 当成自己的授权。共享解析器 [`shared/dtb`](../../shared/dtb/src/lib.rs) 的 `node_at_offset` 从结构块按文法推进，拒绝属性值中伪装的 BEGIN_NODE 字样。每条 MMIO 记录必须有真实 MmioControl、完整启动权限、未关闭/无成员状态，并与节点 ECAM 或 memory window 的 CPU 几何一致；拒绝 PIO、重复物理根和不支持的资源类型。IRQ 记录必须为唯一 IrqControl，初始 flags/generation 为零，source 范围与 DT 的 PCI interrupt-map 相符且 target 非空。init 将只读对象/映射与 typed 控制根保存到进程退出。失败不发布输入，已有 root owner 正常关闭，Unmap 失败时实际 View 归 VM 自动退出。DMA 记录必须为唯一 DmaDomainControl，快照的显式模式与一致性匹配支持 profile，flags/members/reserved 为零，DT host 声明 coherent。通用 `libprocess::context` 的可采用类型表包含 MMIO/IRQ control/use 和 DMA domain/use/mapping，可正常 Grant 给后继进程；它不解释平台数据。
 
 ## 用户态公共 loader
 
 `shared/elf` 是 bootstrap、用户态 launcher 与 host audit 共用的唯一静态 ELF admission。`validate` 一次检查 program-header 分类、segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，并返回私有构造的 segments/runs/image_end；调用者不再重读原始 headers。`tools/audit-user-elf.py` 只启动同 crate 的 host binary。`user/libraries/libprocess` 直接按 runs 驱动映射；SpawnRequest 显式携带来源 MemoryPool，loader 以 Job/Pool CREATE authority 依次驱动 Create → 分块 ProcessMap/ProcessWrite → Grant → 映射按最终长度计算的出生区 → Building ThreadCreate → Grant Control 取得 child-local 句柄 → 追加 grants → 单次 Write 完整出生块 → Start。SpawnRequest 的 control rights 必须含 MANAGE，使任一步失败都能统一调用 `libprocess` 的观察/关闭收束链执行 builder close → 等 DONE → 核验 Dead → control close；Grant 已提交时，`SpawnFailure.grants` 返回 Consumed，否则返回 Retained，清理链自身的异常由 `cleanup_error` 单独保留。loader 不产生资源或创建 authority，调用者必须显式持 JobControl 与 MemoryPool。
+
+[`libprocess::prepare`](../../user/libraries/libprocess/src/management.rs) 在上述出生块写入后返回 affine PreparedProcess，唯一持未启动 builder/control 和真实 GrantOutcome；借用 control 可在 Start 前完成外部 DONE 观察准入。`start(self)` 消费原准备，成功移交同一 Spawned，失败按原 builder/DONE 收束链返回 SpawnFailure；`cancel(self)` 显式收束未启动进程，Drop 仍承担未提交 Start 的清理，清理不能确认时不静默成功。普通 `spawn` 仅组合 prepare/start，不复制 ELF loader 或引入设备专用出生路径。
+
+目标映像/栈及目标句柄表由新进程 Pool 付款；调用者自己的 handle 安装、ProcessWrite 暂存和 Grant 输入缓冲仍付调用者 Pool。loader 的写入分块上界由 `LOADER_WRITE_BUFFER_BYTES` 拥有，原装配在目标预付之外按同一值计入一次串行写入临时 metadata 峰值，不能把子 Pool 已预付视为调用者仍有额度。MemoryPool 的 typed query 与借用 entry 查询复用同一解码/余额校验，不通过临时别名观察低额度现场。
 
 `libprocess::map_birth_block`（`user/libraries/libprocess/src/management.rs`）将出生块放在validated ELF映像顶之上的页对齐位置，以READ权限分块映射；ThreadCreate后，launcher通过Building Write一次填充包含入口Control的完整块。内核`vm::operation::initial_write`在Building门保护下初始化这些页，不给接收进程增加WRITE映射权限。
 
@@ -74,19 +92,25 @@ VM/backing退款由[`mm.md`](mm.md)拥有，生命周期与启动门由[`task.md
 root
 ├─ init
 └─ services
+   ├─ device_management
+   │  └─ srv_device
    ├─ pm_domain
    └─ acceptance
 ```
 
-core/stress 中，init 以 `libprocess::RequiredLaunchSet` 声明式 manifest 要求 `srv_fs`、`srv_pm`、`drv_spi_sifive`、acceptance target 和 pm-domain target 全部存在并成功启动；`test_fp` 按 execution domain 可选，stress 档另要求 hammer 映像。必选缺失/失败使整个 stage 失败并由 services JobControl 收束，不继续发布正常拓扑。memory 只要求同一启动包中的 hammer 映像，不启动文件服务或 PM。
+core/stress 中，init 以 `libprocess::RequiredLaunchSet` 声明式 manifest 要求 `srv_device`、`srv_driver`、`srv_fs`、`srv_pm`、acceptance target 和 pm-domain target 全部存在并成功启动；真实 PCI/xHCI/HID 的声明与 sealed 映像交同一 srv_driver 装配，驱动按实际设备出现而激活。`test_fp` 按 execution domain 可选，stress 档另要求 hammer 映像。必选缺失/失败使整个 stage 失败并由 services JobControl 收束，不继续发布正常拓扑。memory 只要求同一启动包中的 hammer 映像，不启动这些服务。设备管理者的 Start 前独立观察与故障终局见[设备实现](device.md#srv_device-宿主)。
 
-所有常规服务是 services 的直接成员。init 的 RootSupervisor 在子服务启动前持有长期责任槽并预备 services 的待命 Job 机器；每个 ProcessControl 在启动成功后立即进入预留账本。辅助 Job、启动 mailbox、委托副本和流控通知均先预备根能力槽再创建；脚本借用 handle，pm sender 保持 typed owner，只有内核 Grant/Send 确认消费才从账本移交。关闭失败保留原 owner，活动 Job 借用的 root 不提前关闭。Process、Job、读取与待关闭 Runtime 的失败保留原机器、世界和结果，由同一个根组合等待与推进，不能只把裸 target 放回集合重新构造。只有 DONE 已观察和 Dead 快照成立后才兑现 control。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。pm 使用正式 JobDriver 收束委托域，运行体以每轮一项推进；测试邮箱持续停驻到域完成后的 shutdown，回调确认 Active 登记实际消费 stop，最终检查注销与额度退款；不可恢复失败调用 ProcessAbort，由 init 的独立管理能力接管。具体结构与失败政策见 [runtime.md](runtime.md)。
+除设备管理者在独立 device_management 子域外，常规服务是 services 的直接成员。init 的 RootSupervisor 在子服务启动前持有长期责任槽并预备 services 的待命 Job 机器；每个 ProcessControl 在启动成功后立即进入预留账本。辅助 Job、启动 mailbox、委托副本和流控通知均先预备根能力槽再创建；脚本借用 handle，pm sender 保持 typed owner，只有内核 Grant/Send 确认消费才从账本移交。关闭失败保留原 owner，活动 Job 借用的 root 不提前关闭。Process、Job、读取与待关闭 Runtime 的失败保留原机器、世界和结果，由同一个根组合等待与推进，不能只把裸 target 放回集合重新构造。只有 DONE 已观察和 Dead 快照成立后才兑现 control。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。pm 使用正式 JobDriver 收束委托域，运行体以每轮一项推进；测试邮箱持续停驻到域完成后的 shutdown，回调确认 Active 登记实际消费 stop，最终检查注销与额度退款；不可恢复失败调用 ProcessAbort，由 init 的独立管理能力接管。具体结构与失败政策见 [runtime.md](runtime.md)。
 
 `srv_fs` 的启动接缝前三项是 init 预建的 bootstrap Mailbox sender、release Notification owner、独立文件管理 Mailbox owner；A 的第四项为 registry Mailbox owner，B 的第四项为 publication handoff inbox owner，另取得实际 Pool grant。init 以同一映像启动两个 provider，为每个实例分别创建监督槽与 ProcessControl；provider 主线程运行正式 Runtime。A 从同一 Budget 的 H/A/B 账户发行有序 A/B 文件、服务目录、发布授权及管理 sender，Lifetime 来源准入后再交 bootstrap Packet，init 采用、保管并向 test_fs 交付 B 组。B 的 exact-name 发布授权经其 inbox 单独交付；B 用单步 Register 发布普通文件入口，init 和消费者通过 A 的 WatchName→Query→GetEntry 取得该真实入口并绑定各自 Namespace，没有 PublishReady 或 ServiceRecord 文件投影。管理根与普通文件根分开接收、付款绑定及关闭，Binding 业务由实际管理协议提交。release 由 provider Runtime 观察，停止新入口/下游后先收束业务，再封运输与来源；provider 最后通过 bootstrap 返回 `ProviderReport`。所有启动 grant 消费、能力交付、release、报告及关闭均进入 RootSupervisor 原账本，失败持原 owner；启动协议由 [boot](../../user/services/srv_fs/src/server/boot.rs) 和 [init](../../user/services/srv_init/src/main.rs) 直接实现。
 
 acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域 job_kill。`srv_init` 默认编译为 core workload，运行确定性内存、IPC、Tunnel、Job、文件/服务目录及监督契约；`acceptance-stress` feature 在同一用户态编排器中追加 control/Tunnel 重复压力、非空集合自动退休与只读终态观察和完整 16/16 竞态矩阵。`acceptance-memory` 启用同一竞态模块，但只在 services 下建立一个子 Job，复用 `race::thread_memory_suite` 的 test_hammer 目标；等待 Dead/Completed，确认 control/发令权关闭，再经原 RootSupervisor 收束 Job、关闭其 authority 并核根辅助能力账本。该路径不启动其他服务，也不声明整套业务覆盖；失败仍由原 services 兜底监督持有责任。
 
-profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。initfs 镜像打包时只剥离副本的调试段，构建目录保留原 ELF；128 MiB sifive_u 上 A/B provider 与测试进程可同时装载，不减少用户程序的装载段或取消其他验收。init 在所选负载完成资源收束后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并保留 RootSupervisor 的责任与单个 Assembly 接收 owner；失败路径不重建一套临时监督器。当前不经独立电源服务转发。
+profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。initfs 镜像打包时只剥离副本的调试段，构建目录保留原 ELF；128 MiB sifive_u 上 A/B provider 与测试进程可同时装载，不减少用户程序的装载段或取消其他验收。init 在所选负载完成资源收束后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并终止 init，boot 的预付 DONE 观察提交运行停驻；实际 DMA 保留由内核稳定 owner 承担。当前不经独立电源服务转发。
+
+[`srv_init::device`](../../user/services/srv_init/src/device.rs) 为设备管理者建立独立 Job/Pool，页预算使用公共 ABI 主栈大小加运行空间，metadata 单独计量；Pool、Job、bootstrap 先进入根账本，Process 监督槽在 spawn 前预留。出生 grant 为私有 bootstrap sender、实际 Pool、只读平台描述与按描述记录同序排列的真实控制别名；原平台根 owner 继续留 init。16 字节用户态委托头只含版本和数量，槽布局由 libdevice::startup 拥有。设备服务在任何 take 前用 InitialGrants::remaining 核实际应用能力数，再逐项核实际槽和对象；remaining 从原 Option 表计算，不含 runtime 已采用的入口控制槽，len 仍表示完整数组几何。Grant 成功或已消费失败均兑现原监督账本。
+
+设备就绪消息仅接受本次独占 bootstrap context 和预期 PID；两份实际 MailboxSender 须关联消息声明的 registry incarnation，且角色 context 不同。init 查询目标仍 Running 后，发行真实观察来源并核其不能派生权限。签发无法确认时封根并交原服务监督收束，不创建替代来源。服务私有就绪等待平台 PCI host 的真实登记回执；零根平台不制造设备。init 通过观察来源订阅真实 Watch，Query 后枚举实际平台记录，核 DeviceId/incarnation、身份、名字与资源上界，Ack 旧序号并检查通知已清，再读取 OAL 根及与根委托一致的页。正常停止先封观察来源，等待 Watch 的 Revoked 通知、Query/Ack 终态并释放订阅，再封根，再关闭入口，等待 DONE 并核 Dead/Completed/NONE detail；之后原 RootSupervisor 收束进程、管理 Job 和 Pool。core/stress 在短寿命服务的批次收集验收前完成这一步，避免将仍需显式 Stop 的管理者当作会自然退出的测试进程。服务内的角色、付款与长期任务见 [device 实现](device.md#srv_device-宿主)；这条装配尚不提供驱动启动或硬件停止编排。
 
 ## 验证
 
@@ -95,5 +119,5 @@ profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，�
 - libprocess host：ELF 前置、必选映像缺失/启动失败与非法 supervision policy 在 syscall 前拒绝并返还 authority；
 - 工程静态门：`just clippy` 以 `-D warnings` 分别覆盖 shared/os/user host、kernel/user RISC-V、stress/memory feature 与独立 gc target，完整日志写入 `artifacts/lint/`；`acceptance-core` 与完整 `acceptance` 在启动 QEMU 前执行该门；
 - QEMU 常规回归：`acceptance-core` 组合静态门、无调试器 debug stress 与 release core。`virt` 提供 debug core；`virt-stress` 保留重复压力、非空 WaitSet 自动退休与 16/16 竞态矩阵；`virt-release` 覆盖优化代码生成和 trap 寄存器保持。完整 core/stress wrapper 核验 workload、必选拓扑、RPC reject cleanup、监督 authority、Tunnel 和 IPC 等实际业务锚点。
-- 平台与故障：`acceptance-platforms` 运行完整 core 的 sifive_u/nofd，默认 release，可在单条 recipe 显式选 debug；hetero 在调度域变更时额外运行。`acceptance-faults` 包含 Boot/IPI/VM fault/VM repair。VM fault 使用 memory workload，GDB 观察真实 RetryFault 后 detach，wrapper 核线程完成、Job/辅助能力收束和 reset；不再重复 FS/PM 与整套 stress。VM repair 是受限现场诊断，不声明完整业务收束。
+- 平台与故障：`acceptance-platforms` 运行完整 core 的 sifive_u/nofd，默认 release，可在单条 recipe 显式选 debug；hetero 在调度域变更时额外运行。`acceptance-faults` 包含 Boot/IPI/VM fault/VM repair/DMA retention。VM fault 使用 memory workload，GDB 观察真实 RetryFault 后 detach，wrapper 核线程完成、Job/辅助能力收束和 reset；不再重复 FS/PM 与整套 stress。VM repair 是受限现场诊断，不声明完整业务收束。
 - 完整 `acceptance` 组合上述三组，各路线只执行一次。正常 virt 必须由 QEMU 正常退出证明 shutdown 后端成功；`sifive_u` 在内核明确返回 reset 失败后主动收割，仍须满足完整 core 锚点。触发选择由[构建手册](../../plans/BUILD-AND-TEST.md)拥有；内部契约的未覆盖部分由所属计划记录。

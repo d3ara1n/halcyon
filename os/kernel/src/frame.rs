@@ -841,22 +841,67 @@ pub fn free_range(start_pa: usize, end_pa: usize) {
     });
 }
 
-/// DTB 消费完成后，先撤销 transition 临时叶，再回投未被永久 reservation
-/// 覆盖的 boot-held 片段。
-pub fn release_device_tree(board: &BoardInfo) {
+/// 原始 DTB 的唯一保留 owner。永久 reservation 不属于它的可归还部分。
+pub(crate) struct DeviceTreeReservation {
+    address: usize,
+    bytes: usize,
+    reclaim: [(usize, usize); MAX_PERMANENT_RESERVATIONS + 1],
+    count: usize,
+}
+
+impl DeviceTreeReservation {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: 启动 admission 已确认 DTB 在直映射内；可回收片段由本 owner
+        // 保留，其余被永久 reservation 保留。借用不得越过本 owner 寿命。
+        unsafe {
+            core::slice::from_raw_parts(mm::phys_to_virt(self.address) as *const u8, self.bytes)
+        }
+    }
+}
+
+impl Drop for DeviceTreeReservation {
+    fn drop(&mut self) {
+        // 上界来自平台 reservation 表；没有按 DTB 页数逐页析构。
+        for &(start, end) in &self.reclaim[..self.count] {
+            free_range(start, end);
+            log!(Memory, "device tree reclaim [{:#x}, {:#x})", start, end);
+        }
+    }
+}
+
+/// 仅由启动单核调用一次。先撤 transition 临时叶，保留内容直到启动复制完成。
+pub(crate) fn hold_device_tree(
+    board: &BoardInfo,
+    address: usize,
+    bytes: usize,
+) -> DeviceTreeReservation {
     let mut permanent = [(0usize, 0usize); MAX_PERMANENT_RESERVATIONS];
     let permanent_count = build_permanent_reservations(board, &mut permanent);
     let dtb = board.dtb_range();
+    assert!(
+        address >= dtb.start
+            && address
+                .checked_add(bytes)
+                .is_some_and(|end| end <= dtb.end()),
+        "device tree bytes exceed admitted reservation"
+    );
+    let mut held = DeviceTreeReservation {
+        address,
+        bytes,
+        reclaim: [(0, 0); MAX_PERMANENT_RESERVATIONS + 1],
+        count: 0,
+    };
     subtract(
         dtb.start,
         dtb.end(),
         &permanent[..permanent_count],
         |start, end| {
             mm::retire_transition_range(start, end);
-            free_range(start, end);
-            log!(Memory, "device tree reclaim [{:#x}, {:#x})", start, end);
+            held.reclaim[held.count] = (start, end);
+            held.count += 1;
         },
     );
+    held
 }
 
 /// 帧库存剩余空闲帧数。

@@ -215,3 +215,46 @@ fn reserve_nodes(
         memory_space::SegmentStorage::try_empty(map.storage_capacity(n)?, &TestFunding).unwrap();
     map.reserve(n, &mut storage)
 }
+
+#[test]
+fn incremental_acquire_survives_source_seal_and_keeps_only_the_requested_pages() {
+    let mut map = SegmentMap::new(19);
+    let mut reserve = reserve_nodes(&mut map, 4).unwrap();
+    for page in [100, 200, 300, 400] {
+        map.push_extent(2, Ext(page, 2), &mut reserve).unwrap();
+    }
+    map.unreserve(reserve);
+    let mut reserve = reserve_nodes(&mut map, 2).unwrap();
+    let root = map.acquire(0, 8, &mut reserve).unwrap();
+    let mut pin = map.begin_acquire(1, 7, &mut reserve).unwrap();
+    assert!(!map.acquire_step(&mut pin).unwrap());
+    map.begin_retire(); // 外层保留 root use，封口不取消已经接受的取得责任。
+    while !map.acquire_step(&mut pin).unwrap() {}
+    let pin = map.finish_acquire(pin).unwrap();
+    assert_eq!(pin.range(), (1, 7));
+    let released = drain(&mut map, root);
+    assert_eq!(released.iter().map(|(a, b, _)| b - a).sum::<u64>(), 2);
+    let released = drain(&mut map, pin);
+    assert_eq!(released.iter().map(|(a, b, _)| b - a).sum::<u64>(), 6);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn cancelled_incremental_acquire_releases_exactly_its_acquired_prefix() {
+    let mut map = SegmentMap::new(20);
+    let mut reserve = reserve_nodes(&mut map, 3).unwrap();
+    for page in [100, 200, 300] {
+        map.push_extent(2, Ext(page, 2), &mut reserve).unwrap();
+    }
+    map.unreserve(reserve);
+    let mut reserve = reserve_nodes(&mut map, 2).unwrap();
+    let root = map.acquire(0, 6, &mut reserve).unwrap();
+    let mut pin = map.begin_acquire(1, 5, &mut reserve).unwrap();
+    assert!(!map.acquire_step(&mut pin).unwrap());
+    let prefix = map.finish_acquire(pin).unwrap();
+    assert_eq!(prefix.range(), (1, 2));
+    let released = drain(&mut map, root);
+    assert_eq!(released.iter().map(|(a, b, _)| b - a).sum::<u64>(), 5);
+    assert_eq!(drain(&mut map, prefix), vec![(1, 2, Ext(101, 1))]);
+    assert!(map.is_empty());
+}

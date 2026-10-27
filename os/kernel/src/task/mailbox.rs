@@ -921,12 +921,9 @@ fn read_send_input(
     moves_ptr: usize,
     move_count: usize,
     payload_len: usize,
+    pool: &Arc<MemoryPool>,
 ) -> Result<SendInput, SystemCallError> {
-    if payload_len > PAYLOAD_MAX || move_count > MESSAGE_HANDLE_MAX {
-        return Err(SystemCallError::IllegalArgument);
-    }
-    let pool = thread.process.funding_pool();
-    let funding = MetadataFunding(&pool);
+    let funding = MetadataFunding(pool);
     let mut payload =
         MetadataBuffer::try_empty(payload_len, &funding).map_err(map_storage_error)?;
     for _ in 0..payload_len {
@@ -989,19 +986,8 @@ pub fn send(
     move_count: usize,
     payload_len: usize,
 ) -> Result<(), SystemCallError> {
-    let input = read_send_input(
-        thread,
-        header_ptr,
-        payload_ptr,
-        moves_ptr,
-        move_count,
-        payload_len,
-    )?;
-    if input
-        .moves
-        .iter()
-        .any(|(handle, _)| *handle == sender_handle)
-    {
+    // 长度上界不分配；输入的实际付款必须在取得真实发送授权后决定。
+    if payload_len > PAYLOAD_MAX || move_count > MESSAGE_HANDLE_MAX {
         return Err(SystemCallError::IllegalArgument);
     }
     let (authorization, usage) =
@@ -1025,12 +1011,17 @@ pub fn send(
         .map_or(authorization.object(), Invocation::object)
         .clone();
     let send_once = invocation.is_some();
-    let (core, badge, usage) = if let Some(usage) = usage {
+    let (core, badge, usage, pool) = if let Some(usage) = usage {
         let sender = object
             .as_any()
             .downcast_ref::<MailboxSender>()
             .expect("accepted Sender changed kind");
-        (sender.core.clone(), sender.badge, usage)
+        (
+            sender.core.clone(),
+            sender.badge,
+            usage,
+            thread.process.funding_pool(),
+        )
     } else {
         let once = object
             .as_any()
@@ -1043,9 +1034,26 @@ pub fn send(
             once.core.clone(),
             once.badge,
             once.parent_authority.accept()?,
+            // Once 的发行即委托一次有界运输；持有者不改变原付款 Pool。
+            once._metadata.payer().clone(),
         )
     };
-    let pool = thread.process.funding_pool();
+    let input = read_send_input(
+        thread,
+        header_ptr,
+        payload_ptr,
+        moves_ptr,
+        move_count,
+        payload_len,
+        &pool,
+    )?;
+    if input
+        .moves
+        .iter()
+        .any(|(handle, _)| *handle == sender_handle)
+    {
+        return Err(SystemCallError::IllegalArgument);
+    }
     let funding = MetadataFunding(&pool);
     let mut claims =
         MetadataBuffer::try_empty(input.moves.len(), &funding).map_err(map_storage_error)?;
@@ -1054,11 +1062,7 @@ pub fn send(
         MetadataBuffer::try_empty(input.moves.len() + 1, &funding).map_err(map_storage_error)?;
     let mut rights =
         MetadataBuffer::try_empty(input.moves.len(), &funding).map_err(map_storage_error)?;
-    let delivery = super::delivery::Delivery::create(
-        object.header().koid(),
-        usage,
-        thread.process.funding_pool(),
-    )?;
+    let delivery = super::delivery::Delivery::create(object.header().koid(), usage, pool.clone())?;
     let delivery = handle::mint(delivery, Rights::TRANSIT | Rights::GRANT)?;
     for (handle, wanted) in input.moves.iter() {
         match Invocation::claim(thread, *handle, Rights::TRANSIT) {

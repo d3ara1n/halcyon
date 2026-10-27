@@ -24,7 +24,7 @@ use erhino_shared::{
     object::{Handle, Rights},
 };
 use memory_space::{
-    AddressRange, AnonymousClass, ChangeError, MapBacking, MapPlacement, MapRequest, PAGE_SIZE,
+    AddressRange, AnonymousClass, ChangeError, MapPlacement, MapRequest, MappingSource, PAGE_SIZE,
     PageRange, ProtectRequest, Protection, RegionOwner, UnmapRequest, UserWriteLeaseRequest,
 };
 
@@ -101,7 +101,7 @@ pub(crate) fn initial_map(
         }
     };
     let identity = root.backing().id();
-    operation.prep.usage = Some(root.into_use());
+    operation.prep.usage = Some(root.into_use().into());
     prepare(
         body,
         &mut operation,
@@ -115,7 +115,7 @@ pub(crate) fn initial_map(
             current: protection,
             maximum: protection,
             owner: RegionOwner::AddressSpace,
-            backing: MapBacking::Anonymous {
+            backing: MappingSource::Anonymous {
                 identity,
                 class: if protection == Protection::ReadExecute {
                     AnonymousClass::InitialExecutable
@@ -144,18 +144,170 @@ pub(crate) fn initial_write(
     uaccess::put_initial(space, target, bytes).map_err(Into::into)
 }
 
-pub(crate) fn memory_map(thread: &Thread, input: usize) -> Result<WaitPlan, SystemCallError> {
+pub(crate) fn memory_map(
+    thread: &Thread,
+    input: usize,
+) -> Result<crate::task::request::Pending, SystemCallError> {
     let body = thread
         .process
         .lease_body()
         .ok_or(SystemCallError::ObjectClosed)?;
-    let (request, page_limit) = {
+    let request = {
         let mut vm = body.vm.space.lock();
         let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
-        // SAFETY: ABI 全为固定宽整数，任意位型有效，后续显式验证。
-        let request: MemoryMapRequest = unsafe { uaccess::read_user_value(space, input) }?;
-        (request, space.ledger().limits().max_pages_per_change)
+        // SAFETY: 固定整数 ABI；请求复制后不再借用用户输入缓冲。
+        unsafe { uaccess::read_user_value::<MemoryMapRequest>(space, input) }?
     };
+    crate::task::request::Pending::new(
+        MapCall {
+            request,
+            phase: Some(MapPhase::Start),
+            operation: None,
+        },
+        &thread.process.funding_pool(),
+    )
+}
+
+struct MapCall {
+    request: MemoryMapRequest,
+    phase: Option<MapPhase>,
+    operation: Option<Operation>,
+}
+enum MapPhase {
+    Start,
+    Admit(
+        Arc<crate::resource::mmio::MmioNode>,
+        resource_tree::Admission,
+    ),
+    Publish(PageRange),
+}
+impl crate::task::request::Request for MapCall {
+    fn advance(&mut self, thread: &Thread) -> Result<crate::task::request::Step, SystemCallError> {
+        match self
+            .phase
+            .take()
+            .expect("map request advanced after completion")
+        {
+            MapPhase::Start => self.start(thread),
+            MapPhase::Admit(node, admission) => self.admit(thread, node, admission),
+            MapPhase::Publish(footprint) => self.publish(thread, footprint),
+        }
+    }
+}
+impl MapCall {
+    fn start(&mut self, thread: &Thread) -> Result<crate::task::request::Step, SystemCallError> {
+        if self.request.source != 0 {
+            let protection = protection(self.request.protection as usize)?;
+            let rights = match protection {
+                Protection::ReadOnly => Rights::READ,
+                Protection::ReadWrite => Rights::READ | Rights::WRITE,
+                Protection::ReadExecute => Rights::READ | Rights::EXECUTE,
+            };
+            let (_, mmio) = Authorization::accept_with(
+                thread,
+                Handle::from_raw(self.request.source),
+                rights,
+                |object, _| {
+                    if let Some(usage) = object
+                        .as_any()
+                        .downcast_ref::<crate::resource::mmio::object::MmioUse>()
+                    {
+                        if protection == Protection::ReadExecute {
+                            return Err(SystemCallError::RightsDenied);
+                        }
+                        Ok(Some((usage.node().clone(), usage.node().begin()?)))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )?;
+            if let Some((node, admission)) = mmio {
+                self.phase = Some(MapPhase::Admit(node, admission));
+                return Ok(crate::task::request::Step::Pending);
+            }
+        }
+        let (operation, footprint) = prepare_memory_map(thread, self.request, None)?;
+        self.operation = Some(operation);
+        self.complete(thread, footprint)
+    }
+    fn admit(
+        &mut self,
+        thread: &Thread,
+        node: Arc<crate::resource::mmio::MmioNode>,
+        mut admission: resource_tree::Admission,
+    ) -> Result<crate::task::request::Step, SystemCallError> {
+        if !node.advance(&mut admission)? {
+            self.phase = Some(MapPhase::Admit(node, admission));
+        } else {
+            let (operation, footprint) =
+                prepare_memory_map(thread, self.request, Some((node, admission)))?;
+            self.operation = Some(operation);
+            self.phase = Some(MapPhase::Publish(footprint));
+        }
+        Ok(crate::task::request::Step::Pending)
+    }
+    fn publish(
+        &mut self,
+        thread: &Thread,
+        footprint: PageRange,
+    ) -> Result<crate::task::request::Step, SystemCallError> {
+        if !self
+            .operation
+            .as_mut()
+            .expect("MMIO request lost operation")
+            .advance_publication()?
+        {
+            self.phase = Some(MapPhase::Publish(footprint));
+            return Ok(crate::task::request::Step::Pending);
+        }
+        self.complete(thread, footprint)
+    }
+    fn complete(
+        &mut self,
+        thread: &Thread,
+        footprint: PageRange,
+    ) -> Result<crate::task::request::Step, SystemCallError> {
+        let body = thread
+            .process
+            .lease_body()
+            .ok_or(SystemCallError::ObjectClosed)?;
+        let operation = self.operation.take().expect("map request lost operation");
+        commit(
+            &body,
+            operation,
+            footprint,
+            Some((
+                thread,
+                number(self.request.result_address)?,
+                self.request.cookie,
+            )),
+        )
+        .map(crate::task::request::Step::Wait)
+    }
+}
+
+fn prepare_memory_map(
+    thread: &Thread,
+    request: MemoryMapRequest,
+    mmio: Option<(
+        Arc<crate::resource::mmio::MmioNode>,
+        resource_tree::Admission,
+    )>,
+) -> Result<(Operation, PageRange), SystemCallError> {
+    let body = thread
+        .process
+        .lease_body()
+        .ok_or(SystemCallError::ObjectClosed)?;
+    let page_limit = body
+        .vm
+        .space
+        .lock()
+        .space
+        .as_ref()
+        .ok_or(SystemCallError::ObjectClosed)?
+        .ledger()
+        .limits()
+        .max_pages_per_change;
     if request.reserved != [0] || request.cookie == 0 {
         return Err(SystemCallError::IllegalArgument);
     }
@@ -216,7 +368,12 @@ pub(crate) fn memory_map(thread: &Thread, input: usize) -> Result<WaitPlan, Syst
     }
     let pool = thread.process.funding_pool();
     let mut operation = Operation::new(pool.clone(), body.vm.clone(), body.views.clone())?;
-    let (backing, source) = if request.source == 0 {
+    let (backing, source) = if let Some((node, admission)) = mmio {
+        (
+            operation.prepare_mmio(node, &admission, number(request.source_offset)?, bytes)?,
+            None,
+        )
+    } else if request.source == 0 {
         if request.source_offset != 0 {
             return Err(SystemCallError::IllegalArgument);
         }
@@ -232,9 +389,9 @@ pub(crate) fn memory_map(thread: &Thread, input: usize) -> Result<WaitPlan, Syst
             },
         )?;
         let identity = root.backing().id();
-        operation.prep.usage = Some(root.into_use());
+        operation.prep.usage = Some(root.into_use().into());
         (
-            MapBacking::Anonymous {
+            MappingSource::Anonymous {
                 identity,
                 class: AnonymousClass::Data,
             },
@@ -282,9 +439,9 @@ pub(crate) fn memory_map(thread: &Thread, input: usize) -> Result<WaitPlan, Syst
             drop(core::mem::take(&mut operation.prep.backing_storage));
             operation.prep.backing_storage = core.prepare_use(&pool)?;
         };
-        operation.prep.usage = Some(usage);
+        operation.prep.usage = Some(usage.into());
         (
-            MapBacking::Object {
+            MappingSource::Object {
                 authorization,
                 offset,
             },
@@ -308,12 +465,8 @@ pub(crate) fn memory_map(thread: &Thread, input: usize) -> Result<WaitPlan, Syst
             }),
         }),
     )?;
-    finish(
-        &body,
-        operation,
-        source,
-        Some((thread, output, request.cookie)),
-    )
+    let footprint = reserve(&body, &mut operation, source)?;
+    Ok((operation, footprint))
 }
 
 pub(crate) fn memory_unmap(
@@ -463,6 +616,15 @@ fn finish(
     source: Option<Arc<MemoryObjectCore>>,
     output: Option<(&Thread, usize, u64)>,
 ) -> Result<WaitPlan, SystemCallError> {
+    let footprint = reserve(body, &mut operation, source)?;
+    commit(body, operation, footprint, output)
+}
+
+fn reserve(
+    body: &BodyLease,
+    operation: &mut Operation,
+    source: Option<Arc<MemoryObjectCore>>,
+) -> Result<PageRange, SystemCallError> {
     let funding_pool = operation.pool().clone();
     let funding = crate::task::resources::MetadataFunding(&funding_pool);
     operation
@@ -605,6 +767,18 @@ fn finish(
             }
         }
     }
+    Ok(footprint)
+}
+
+fn commit(
+    body: &BodyLease,
+    mut operation: Operation,
+    footprint: PageRange,
+    output: Option<(&Thread, usize, u64)>,
+) -> Result<WaitPlan, SystemCallError> {
+    let layout = operation.prep.plan.reserved().map_result();
+    // 资源发布许可在 VM 门外取得；先行的 Seal/Revoke 使原操作回滚。
+    operation.grant_publication()?;
     let progress = {
         let mut vm = body.vm.space.lock();
         let space = vm.space.as_mut().ok_or(SystemCallError::ObjectClosed)?;
@@ -649,6 +823,8 @@ fn finish(
             core::mem::take(&mut operation.prep.frames),
         )
     };
+    // 许可后若 Stop 已到达，仍由同一已提交操作完成发布，再交强制退休收束。
+    operation.commit_publication();
     operation.prep.boundaries.clear();
     drop(operation.prep.view.take());
     Ok(operation.submit(progress))

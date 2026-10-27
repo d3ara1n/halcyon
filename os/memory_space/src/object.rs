@@ -75,7 +75,7 @@ impl ObjectViewAuthorization {
     }
 }
 
-/// 一个 reserved/published/retiring writable view 的 affine 计数凭据。
+/// 一个准备/发布/退休阶段写者的 affine 计数凭据，CPU View 与 DMA 各持独立许可。
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "write permits must be cancelled before commit or retired after synchronization"]
 pub struct WritePermit {

@@ -12,6 +12,7 @@ pub mod memory_pool;
 pub mod notification;
 pub mod object;
 pub mod process;
+pub(crate) mod request;
 pub mod resources;
 pub mod system_reset;
 pub mod thread;

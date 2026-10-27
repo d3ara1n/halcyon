@@ -2,7 +2,7 @@
 //! 准备存储在队列锁外，reserve/enqueue/pick 由外部锁串行化；离场仅原子退 credit。
 
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 

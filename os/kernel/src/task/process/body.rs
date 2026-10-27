@@ -34,8 +34,8 @@ impl ProcessBody {
         handles: ProcessCapTable,
         source: Arc<super::super::wait_source::SignalSource>,
     ) -> Result<Self, SystemCallError> {
+        let views = space.views().clone();
         let vm = VmShell::try_new(space, pool)?;
-        let views = Views::try_new(pool)?;
         let retire = RetireWork::new(pool.clone(), vm.clone(), views.clone(), source)?;
         Ok(Self {
             vm,

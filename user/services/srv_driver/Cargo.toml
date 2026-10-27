@@ -1,0 +1,18 @@
+[package]
+name = "srv_driver"
+version = "0.1.0"
+edition = "2024"
+description = "Device driver selection, activation, and supervision"
+
+[dependencies]
+libruntime = { path = "../../libraries/libruntime" }
+libkernel = { path = "../../libraries/libkernel" }
+libdevice = { path = "../../libraries/libdevice" }
+libdriver = { path = "../../libraries/libdriver" }
+libprocess = { path = "../../libraries/libprocess", features = ["management"] }
+libbudget = { path = "../../libraries/libbudget" }
+libexecution = { path = "../../libraries/libexecution" }
+librpc = { path = "../../libraries/librpc" }
+liboal = { path = "../../libraries/liboal" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+ordered_table = { path = "../../../shared/ordered_table" }

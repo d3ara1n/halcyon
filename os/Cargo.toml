@@ -3,7 +3,6 @@ members = [
     "kernel",
     "page_table",
     "frame_pool",
-    "dtb",
     "handle_table",
     "capability",
     "stack_layout",
@@ -16,5 +15,8 @@ members = [
     "memory_pool",
     "funded_frame",
     "maintenance",
+    "resource_tree",
+    "plic",
+    "dma",
 ]
 resolver = "2"

@@ -8,8 +8,8 @@
 //! - 出口经返回值编码：Resume 装帧 sret 直接回用户态；其余恢复
 //!   SchedulerFrame 返回调度循环，由其处置当前线程。
 //!
-//! scause 按 `(is_interrupt, code)` 分发（TRAP-004 收口）：只有中断 1/5
-//! 进入 SSIP/STIP，异常8为U ecall，12/13/15按VM发布依赖判定；其余同步异常终止进程。
+//! scause 按 `(is_interrupt, code)` 分发：中断 1/5/9 进入 SSIP/STIP/SEIP，
+//! 异常8为U ecall，12/13/15按VM发布依赖判定；其余同步异常终止进程。
 
 use crate::{context::UserContext, hart, sbi, sched, syscall};
 
@@ -52,6 +52,7 @@ pub unsafe fn ret_to_user() -> Outcome {
 // scause (is_interrupt, code)：中断来源（supervisor.adoc「Supervisor Cause」）。
 const SSIP: usize = 1;
 const STIP: usize = 5;
+const SEIP: usize = 9;
 /// U ecall 是 exception 8。
 const U_ECALL: usize = 8;
 
@@ -109,6 +110,10 @@ unsafe extern "C" fn handle_user_trap(
         (true, STIP) => {
             // 量子耗尽或 sleep 期限到达：卸载定时器 → 唤醒到期 → 轮转。
             sched::on_timer();
+            Outcome::Requeue as usize
+        }
+        (true, SEIP) => {
+            crate::resource::irq::controller::service();
             Outcome::Requeue as usize
         }
         (true, SSIP) => {

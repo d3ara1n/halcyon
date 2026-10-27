@@ -705,15 +705,31 @@ pub(super) fn notification_roles() {
         .intersects(ObjectSignals::CLOSED)
     );
     assert_eq!(pair.peer.signal(1), Err(SystemCallError::ObjectClosed));
-    let closed = set.receive(2).unwrap();
-    assert_eq!(closed.len(), 2);
-    assert!(
-        closed
-            .iter()
-            .all(|record| record.observed.intersects(ObjectSignals::CLOSED))
-    );
-    set.remove(first).unwrap();
-    set.remove(second).unwrap();
+    // 来源电平已Closed不表示有界维护已把两条提示同时送入WaitSet。
+    let deadline = time::timeout_millis(5_000).unwrap();
+    let mut pending = [first, second];
+    while pending.iter().any(|&token| token != 0) {
+        let closed = set.receive(2).unwrap();
+        if closed.is_empty() {
+            assert!(
+                set.wait(deadline)
+                    .unwrap()
+                    .observed
+                    .intersects(ObjectSignals::READABLE),
+                "Notification close hints did not arrive"
+            );
+            continue;
+        }
+        for record in closed {
+            assert!(record.observed.intersects(ObjectSignals::CLOSED));
+            let index = pending
+                .iter()
+                .position(|&token| token == record.token)
+                .expect("Notification unexpected close member");
+            set.remove(record.token).unwrap();
+            pending[index] = 0;
+        }
+    }
     set.close()
         .unwrap_or_else(|(_, error)| panic!("Notification set close failed: {error:?}"));
     received_observer.close().unwrap();

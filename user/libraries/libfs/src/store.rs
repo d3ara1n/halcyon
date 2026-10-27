@@ -426,7 +426,9 @@ impl<P> NodeStore<P> {
     /// 内部维护沿实际记录顺序逐项推进；ID 不产生新业务 pin 或授权。
     pub(crate) fn next_record_id(&self, after: Option<NodeId>) -> Option<NodeId> {
         let after = after.map(NodeId::raw);
-        self.records.next_after::<u64>(after.as_ref()).map(|(&id, _)| NodeId(id))
+        self.records
+            .next_after::<u64>(after.as_ref())
+            .map(|(&id, _)| NodeId(id))
     }
     pub(crate) fn live_payload_mut(&mut self, id: NodeId) -> Option<&mut P> {
         let record = self.records.get_mut(id.raw())?;

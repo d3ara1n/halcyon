@@ -11,10 +11,13 @@ pub use call::{
     sys_thread_start, sys_thread_yield,
 };
 pub mod dbg;
+pub mod dma;
 pub mod ipc;
+pub mod irq;
 pub mod memory_object;
 pub mod memory_pool;
 pub mod mm;
+pub mod mmio;
 pub mod preclude;
 pub mod process;
 pub mod shared_memory;

@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use funded_storage::{Buffer, Funding, StorageError};
 use memory_space::{
-    AnonymousClass, BackingId, ChangeRequest, ChangeStorage, Limits, MapBacking, MapPlacement,
-    MapRequest, MemorySpace, PAGE_SIZE, Protection, RegionOwner, RegionStorage, RollbackStep,
+    AnonymousClass, BackingId, ChangeRequest, ChangeStorage, Limits, MapPlacement, MapRequest,
+    MappingSource, MemorySpace, PAGE_SIZE, Protection, RegionOwner, RegionStorage, RollbackStep,
 };
 
 #[derive(Debug, Default)]
@@ -73,7 +73,7 @@ fn request() -> ChangeRequest {
         current: Protection::ReadWrite,
         maximum: Protection::ReadWrite,
         owner: RegionOwner::AddressSpace,
-        backing: MapBacking::Anonymous {
+        backing: MappingSource::Anonymous {
             identity: BackingId::new(1).unwrap(),
             class: AnonymousClass::Data,
         },
@@ -188,6 +188,75 @@ fn partially_funded_validation_keeps_its_owner_until_caller_release() {
         drop(scratch);
         assert_eq!(facts.live.get(), baseline);
     }
+    drop(space);
+    assert_eq!(facts.live.get(), 0);
+}
+
+#[test]
+fn forced_mmio_retirement_neither_allocates_nor_refunds_under_the_gate() {
+    let facts = Rc::new(Ledger::default());
+    let payer = Payer(facts.clone());
+    let start = 0x1000_0000;
+    let mut space = MemorySpace::new(
+        memory_space::PageRange::new(start, 16 * PAGE_SIZE).unwrap(),
+        limits(),
+        &payer,
+    )
+    .unwrap();
+    let mapping = memory_space::MappingId::new(1).unwrap();
+    let request = ChangeRequest::Map(MapRequest {
+        bytes: 2 * PAGE_SIZE,
+        guard_before: 0,
+        guard_after: 0,
+        placement: MapPlacement::FixedEmpty {
+            usable_start: start,
+        },
+        current: Protection::ReadWrite,
+        maximum: Protection::ReadWrite,
+        owner: RegionOwner::AddressSpace,
+        backing: MappingSource::Mmio {
+            mapping,
+            bytes: 2 * PAGE_SIZE,
+        },
+        result: None,
+    });
+    let mut scratch = ChangeStorage::default();
+    scratch
+        .prepare_validation(space.validation_capacity(&request).unwrap(), &payer)
+        .unwrap();
+    let mut validated = space.validate(&request, &mut scratch).unwrap();
+    validated.prepare_reservation(&payer).unwrap();
+    let mut regions =
+        RegionStorage::try_empty(space.change_storage_capacity(&validated).unwrap(), &payer)
+            .unwrap();
+    let prepared = space
+        .reserve(validated, &mut Buffer::new(), &mut regions)
+        .unwrap();
+    let mut committed = space.commit(prepared);
+    while !space.commit_step(&mut committed, 1) {}
+    let retiring = space.synchronize(committed);
+    drop(space.complete(retiring));
+    drop(regions);
+    let mut forced = ChangeStorage::default();
+    forced.prepare_forced_remove(&payer).unwrap();
+    let baseline = facts.live.get();
+    facts.remaining.set(Some(0));
+    facts.gate.set(true);
+    space.freeze_mapping(mapping).unwrap();
+    let prepared = space
+        .reserve_forced_remove(mapping, start, &mut forced)
+        .unwrap();
+    let mut committed = space.commit(prepared);
+    while !space.commit_step(&mut committed, 1) {}
+    let mut retiring = space.synchronize(committed);
+    assert!(retiring.pop_fragment().is_some());
+    assert!(retiring.is_empty());
+    forced = space.complete(retiring);
+    space.finish_mapping_retirement(mapping).unwrap();
+    assert_eq!(facts.live.get(), baseline);
+    assert!(!facts.refund_in_gate.get());
+    facts.gate.set(false);
+    drop(forced);
     drop(space);
     assert_eq!(facts.live.get(), 0);
 }

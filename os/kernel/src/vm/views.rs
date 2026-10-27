@@ -1,7 +1,7 @@
 //! 每空间的实物 View/use 与写许可来源索引。几何/权限仍由 MemorySpace 拥有；
 //! 此处只保存仿射资源，并在准备期物化切界、fence 后逐项移交退休。
 
-use super::backing::{BackingRelease, BackingSplit, BackingUse};
+use super::mapping::{MappingRelease, MappingSplit, MappingUse};
 use crate::task::resources::{MetadataCharge, MetadataFunding, map_storage_error};
 use crate::{
     sync::{Spinlock, ranks},
@@ -10,7 +10,7 @@ use crate::{
 use alloc::sync::Arc;
 use erhino_shared::call::SystemCallError;
 use memory_space::{
-    BackingRetire, BackingView, PAGE_SIZE, RegionKindView, RetiringFragment, WritePermit,
+    BackingRetire, MappingOrigin, PAGE_SIZE, RegionKindView, RetiringFragment, WritePermit,
 };
 use ordered_table::{InsertError, OrderedTable, PreparedEntry};
 
@@ -18,7 +18,7 @@ use ordered_table::{InsertError, OrderedTable, PreparedEntry};
 pub(crate) struct ViewRetirement {
     fragment: RetiringFragment,
     next: usize,
-    release: Option<BackingRelease>,
+    release: Option<MappingRelease>,
 }
 impl ViewRetirement {
     pub(crate) fn new(fragment: RetiringFragment) -> Self {
@@ -32,9 +32,11 @@ impl ViewRetirement {
 
 struct View {
     end: usize,
-    origin: BackingView,
+    origin: MappingOrigin,
     /// None 只存在于未发布的预取节点/同锁切分瞬间；索引内的稳定项必须为 Some。
-    usage: Option<BackingUse>,
+    usage: Option<MappingUse>,
+    previous: Option<usize>,
+    next: Option<usize>,
 }
 struct ObjectSource {
     object: Arc<MemoryObjectCore>,
@@ -44,6 +46,7 @@ struct ObjectSource {
 struct State {
     views: OrderedTable<View, MetadataCharge, usize>,
     sources: OrderedTable<ObjectSource, MetadataCharge>,
+    mmio_heads: OrderedTable<usize, MetadataCharge>,
 }
 
 pub(crate) struct Views {
@@ -53,10 +56,11 @@ pub(crate) struct Views {
 pub(crate) struct PreparedView {
     node: Option<PreparedEntry<View, MetadataCharge, usize>>,
     object: Option<PreparedEntry<ObjectSource, MetadataCharge>>,
+    mmio_head: Option<PreparedEntry<usize, MetadataCharge>>,
 }
 impl PreparedView {
     /// 未发布节点还给同一操作的回滚阶段；取消不启动额外维护任务。
-    pub(crate) fn cancel(mut self) -> BackingUse {
+    pub(crate) fn cancel(mut self) -> MappingUse {
         self.node
             .as_mut()
             .expect("prepared view already committed")
@@ -68,7 +72,7 @@ impl PreparedView {
 }
 pub(crate) struct ViewBoundary {
     node: Option<PreparedEntry<View, MetadataCharge, usize>>,
-    split: BackingSplit,
+    split: MappingSplit,
 }
 
 fn insert_error<T>(error: InsertError<T, SystemCallError>) -> SystemCallError {
@@ -79,6 +83,19 @@ fn insert_error<T>(error: InsertError<T, SystemCallError>) -> SystemCallError {
 }
 
 impl Views {
+    pub(super) fn mmio_address(&self, mapping: memory_space::MappingId) -> Option<usize> {
+        self.state.lock().mmio_heads.get(mapping.get()).copied()
+    }
+    /// 调用者持 ADDRESS_SPACE；切分由本锁原子提交，退休在 PTE/fence 完成后才摘项。
+    /// 因而几何账本暂时摘旧/装新时，这里仍能判定已有 PTE 的真实来源。
+    pub(crate) fn is_ram_at(&self, address: usize) -> bool {
+        self.state
+            .lock()
+            .views
+            .floor(&address)
+            .is_some_and(|(_, view)| address < view.end && view.origin.is_ram())
+    }
+
     pub(crate) fn try_new(
         pool: &Arc<crate::task::memory_pool::MemoryPool>,
     ) -> Result<Arc<Self>, SystemCallError> {
@@ -90,6 +107,7 @@ impl Views {
                 State {
                     views: OrderedTable::new(usize::MAX),
                     sources: OrderedTable::new(usize::MAX),
+                    mmio_heads: OrderedTable::new(usize::MAX),
                 },
             ),
             _metadata: metadata,
@@ -101,10 +119,10 @@ impl Views {
     pub(crate) fn prepare_map(
         &self,
         intent: memory_space::TranslationIntent,
-        usage: BackingUse,
+        usage: MappingUse,
         object: Option<Arc<MemoryObjectCore>>,
         pool: &Arc<crate::task::memory_pool::MemoryPool>,
-    ) -> Result<PreparedView, (SystemCallError, BackingUse)> {
+    ) -> Result<PreparedView, (SystemCallError, MappingUse)> {
         let (range, origin, has_writes) = match intent {
             memory_space::TranslationIntent::Install {
                 range,
@@ -114,11 +132,9 @@ impl Views {
             _ => return Err((SystemCallError::IllegalArgument, usage)),
         };
         let (lo, hi) = usage.range();
-        if hi - lo != range.pages() as u64 || origin.offset() as u64 != lo * PAGE_SIZE as u64 {
-            return Err((SystemCallError::IllegalArgument, usage));
-        }
-        if let BackingView::Anonymous { identity, .. } = origin
-            && identity != usage.backing().id()
+        if !usage.matches_origin(origin)
+            || hi - lo != range.pages() as u64
+            || origin.offset() as u64 != lo * PAGE_SIZE as u64
         {
             return Err((SystemCallError::IllegalArgument, usage));
         }
@@ -132,6 +148,8 @@ impl Views {
                     end: range.end(),
                     origin,
                     usage: Some(usage),
+                    previous: None,
+                    next: None,
                 },
                 &MetadataFunding(pool),
             )
@@ -187,9 +205,26 @@ impl Views {
         } else {
             None
         };
+        let mmio_head = if let Some(mapping) = origin.mapping() {
+            match PreparedEntry::try_new(mapping.get(), range.start(), &MetadataFunding(pool)) {
+                Ok(entry) => Some(entry),
+                Err(error) => {
+                    return Err((
+                        insert_error(error),
+                        node.value_mut()
+                            .usage
+                            .take()
+                            .expect("prepared MMIO view lost use"),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         Ok(PreparedView {
             node: Some(node),
             object,
+            mmio_head,
         })
     }
 
@@ -226,6 +261,13 @@ impl Views {
                 );
             }
         }
+        if let Some(head) = prepared.mmio_head.take() {
+            assert!(
+                state.mmio_heads.get(head.key()).is_none(),
+                "MMIO mapping installed twice"
+            );
+            state.mmio_heads.insert_prepared(head);
+        }
         state.views.insert_prepared(node);
         // 重复来源候选仍在prepared内，调用者退出VM门后释放。
     }
@@ -257,8 +299,7 @@ impl Views {
                 view.usage
                     .as_ref()
                     .expect("published view has no use")
-                    .backing()
-                    .clone(),
+                    .split_source(),
             )
         };
         let node = {
@@ -268,12 +309,14 @@ impl Views {
                     end: at,
                     origin,
                     usage: None,
+                    previous: None,
+                    next: None,
                 },
                 &MetadataFunding(pool),
             )
         }
         .map_err(insert_error)?;
-        let split = backing.prepare_split(pool)?;
+        let split = backing.prepare(pool)?;
         Ok(Some(ViewBoundary {
             node: Some(node),
             split,
@@ -333,6 +376,21 @@ impl Views {
             new.end = old.end;
             new.usage = Some(right);
             old.end = at;
+            let mmio_next = if old.origin.mapping().is_some() {
+                new.previous = Some(start);
+                new.next = old.next;
+                old.next = Some(at);
+                new.next
+            } else {
+                None
+            };
+            if let Some(next) = mmio_next {
+                state
+                    .views
+                    .get_mut(next)
+                    .expect("MMIO successor disappeared")
+                    .previous = Some(at);
+            }
             if let Some(id) = node.value_mut().origin.object() {
                 let source = state
                     .sources
@@ -437,7 +495,7 @@ impl Views {
 
     pub(crate) fn is_empty(&self) -> bool {
         let state = self.state.lock();
-        state.views.is_empty() && state.sources.is_empty()
+        state.views.is_empty() && state.sources.is_empty() && state.mmio_heads.is_empty()
     }
 }
 
@@ -458,7 +516,7 @@ impl Views {
         if retirement.next == fragment.range.end() {
             return true;
         }
-        let (mut removed, source) = {
+        let (mut removed, source, mmio_head) = {
             let mut state = self.state.lock();
             let start = fragment.range.start();
             let key = retirement.next;
@@ -499,9 +557,40 @@ impl Views {
             } else {
                 None
             };
-            (removed, source)
+            let mmio_head = if let Some(mapping) = removed.value().origin.mapping() {
+                let previous = removed.value().previous;
+                let next = removed.value().next;
+                if let Some(previous) = previous {
+                    state
+                        .views
+                        .get_mut(previous)
+                        .expect("MMIO predecessor disappeared")
+                        .next = next;
+                } else if let Some(next) = next {
+                    *state
+                        .mmio_heads
+                        .get_mut(mapping.get())
+                        .expect("MMIO chain lost head") = next;
+                }
+                if let Some(next) = next {
+                    state
+                        .views
+                        .get_mut(next)
+                        .expect("MMIO successor disappeared")
+                        .previous = previous;
+                }
+                if previous.is_none() && next.is_none() {
+                    state.mmio_heads.remove(mapping.get())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (removed, source, mmio_head)
         };
         drop(source);
+        drop(mmio_head);
         // 此步只移交一份 use；后续 step 由同一事务/空间 Work 直接退款，无调度 join。
         retirement.release = Some(
             removed
@@ -524,7 +613,7 @@ impl Drop for Views {
     fn drop(&mut self) {
         let state = self.state.get_mut();
         assert!(
-            state.views.is_empty() && state.sources.is_empty(),
+            state.views.is_empty() && state.sources.is_empty() && state.mmio_heads.is_empty(),
             "view index dropped before bounded retirement"
         );
     }

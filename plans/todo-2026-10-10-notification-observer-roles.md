@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | MailboxReceiver | R/Q/M/G；READABLE、PEER_CLOSED、CLOSED | MailboxCreate，当前进程创建 | MailboxCore 的队列/WaitQueue；最后 Receiver 关闭队列。READABLE 表示可接收队头；PEER_CLOSED 表示当前可投递 sender 数为零，可因新 MintSender 消失 | core、固定环、Receiver 由创建进程 Pool 付款；等待 loan 保活 core，不计 Receiver authority |
 | MailboxSender | W/Q/D/T/G；WRITABLE、CLOSED | Receiver[M] 的 MintSender，独立 sender 身份/badge，附带 Lifetime | 与 Receiver 共用 MailboxCore 来源；CLOSED 是接收队列关闭，不是该 sender 的 Lifetime 终结。最后能力归还 sender count 和 Lifetime authority | sender/Lifetime 由派生进程 Pool 付款；队列保留原 payer；等待 core 不新增发送 authority/use |
-| MailboxOnceSender | W/Q/T/G；WRITABLE、CLOSED | Sender[D]，输出 rights 不超过源；附带 ReplyObservation | 队列来源；发送成功消费授权；放弃发布 Abandoned；结果由独立 ReplyObservation 承载 | Once、结果观察壳及来源由派生进程 Pool 付款；队列 loan 不保活 Pending 业务责任 |
+| MailboxOnceSender | W/Q/T/G；WRITABLE、CLOSED | Sender[D]，输出 rights 不超过源；附带 ReplyObservation | 队列来源；发送成功消费授权；放弃发布 Abandoned；结果由独立 ReplyObservation 承载 | Once/结果观察壳由派生进程 Pool 付款；签发同时委托该进程 Pool 支付一次 ABI 有界运输及 Delivery 尾部，失败返还不换 payer；队列 loan 不保活 Pending 业务责任 |
 | ReplyObservation | R/Q/D/T/G；DONE、PEER_CLOSED | MakeSendOnce 原子配对产生 | 独立 SignalSource；Sent→DONE，Abandoned→PEER_CLOSED，互斥且不变。关闭观察不取消 Once、不改变结果；来源通用 closed 不置位 | 壳和 SignalSource 由配对创建进程 Pool 付款；仅数值关联 Once，不反向强持发送业务 |
 | Lifetime | Q/D/T/G；CLOSED | MintSender 原子配对产生；内部 Once 派生 authority，已接受 Delivery 持 use | Lifetime 的 OBJECT_WAIT 域；authority/use 双零才永久 CLOSED。观察 capability 的持有数不计入这两个计数 | 派生进程 Pool；观察只保活域的存储，不保活 sender、消息或业务 use |
 | NotificationOwner | R/Q/M/G；READABLE、CLOSED | NotificationCreate 原子产生 Owner/Signaler | NotificationCore 的 OR pending/WaitQueue；Take 消费位；最后 Owner 关闭 core、清位并发布 CLOSED | core/两角色由创建进程 Pool 付款；core loan 不计 Owner authority |

@@ -3,8 +3,10 @@
 //! 架构与内部机制见 `notes/`。
 
 #![no_std]
-#![feature(lang_items, alloc_error_handler, allocator_api, const_type_name)]
+#![feature(lang_items, alloc_error_handler, allocator_ext, const_type_name)]
 #![allow(internal_features)]
+// 对象、VM 与资源回执的递归类型图需要更深的 auto-trait 求解，不改变运行期工作界。
+#![recursion_limit = "256"]
 
 extern crate alloc;
 
@@ -36,6 +38,7 @@ mod heap;
 mod maintenance;
 mod mm;
 mod registry;
+mod resource;
 mod rt;
 mod runtime_stop;
 mod sbi;
@@ -140,13 +143,19 @@ pub fn main() {
     frame::init(&board);
     // cpu-map 拓扑解析允许用堆，帧池/堆就绪后进行（可选属性）。
     board.load_topology(&fdt);
-    frame::release_device_tree(&board);
+    boot::retain_platform(
+        frame::hold_device_tree(&board, dtb_pa, fdt.total_size()),
+        board.io,
+    );
     clock::init(board.timebase as u64);
     if let Some((addr, len)) = board.boot_package {
         rt::set_boot_package_region(addr, len);
     }
 
     construct_registry(&board);
+    if let Some(platform) = &board.io.irq {
+        resource::irq::controller::init(platform);
+    }
     // 非返回：切换正式执行环境（gp/tp/sscratch/栈/CSR/stvec），发布 Online，
     // 经 rt::bring_up_runtime 完成启动收尾。bootstrap 环境自此废弃。
     let boot_record = registry::with_registry(|reg| {

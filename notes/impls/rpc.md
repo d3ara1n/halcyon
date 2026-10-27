@@ -55,6 +55,8 @@ WaitSet、来源登记、期限唤醒和最终退休。后续增加消费者时�
 
 Outbox prepare/from_prepared 明确取得并克隆出生 SourceFunding，CLOSED 到 WRITABLE、取消及实际注销不会更换绑定，没有 set_payer。领域 Request 以 Task 模式把来源费用交给已冻结的任务 view；未登记且尚未任务准入的纯拒绝可以由原 Ingress 的 H 作用域推进，其领域 payload owner/Charge仍由原领域值保留。同步 Caller/ReplyCleanup 不持执行来源，不增加付款字段。
 
+内核消息付款与上述执行来源费用分开：回复使用的 Once 由 make_send_once 发行进程 Pool 支付本次输入 scratch、正文、能力数组和 Delivery 存储，排队未读及接收后尾部按各自寿命保留原 payer。响应者的用户态回复缓冲、Request 与来源仍由服务自身预留付款。发行者额度不足可使 Outbox Abandoned；不能据回复 Unsent 推断业务未提交，也不承诺所有回复必成。
+
 ## 带序号确认的订阅客户端
 
 [subscription::ConsumerTask](../../user/libraries/librpc/src/subscription.rs) 拥有控制 sender、NotificationObserver、单个 SourceRegistration、捕获的领域快照及在途 Query/Ack。具体领域的 Watch 实现静态 Protocol：移交两个真实角色及初始快照、按领域协议编码/校验调用，并把快照投影为 sequence/pending/terminal；通用会话不解释事件位、路径、文件种类或服务名字，也不拥有 provider 状态。fs/service 保留独立 WatchInfo 与 Status。Query/Ack 无业务输入能力，正常回复无能力。

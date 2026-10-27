@@ -214,6 +214,45 @@ pub enum SystemCall {
     MemoryObjectQuery = 0x56,
     /// 单向发布 MemoryObject 为可执行（幂等）。
     MemoryObjectSeal = 0x57,
+    /// a0=MmioControl[CREATE], a1=页对齐 offset, a2=bytes, a3=rights；a1 返回子 control。
+    MmioCreateControl = 0x58,
+    /// 同上，返回一次绑定的 MmioUse。
+    MmioCreateUse = 0x59,
+    /// a0=MMIO control/use[READ], a1=MmioSnapshot 输出地址。
+    MmioQuery = 0x5a,
+    /// a0=MmioControl[MANAGE]；只封闭新准入。
+    MmioSeal = 0x5b,
+    /// a0=MMIO control/use[MANAGE]；提交撤销，完成另等 DONE。
+    MmioRevoke = 0x5c,
+    /// a0=control[CREATE], a1=IrqScope 地址, a2=rights；返回子 control/use。
+    IrqCreateControl = 0x70,
+    IrqCreateUse = 0x71,
+    /// a0=control/use[READ], a1=IrqSnapshot 地址。
+    IrqQuery = 0x72,
+    /// a0=control[MANAGE]，只封新派生。
+    IrqSeal = 0x73,
+    /// a0=control/use[MANAGE]，提交撤销，完成另等 DONE。
+    IrqRevoke = 0x74,
+    /// a0=use[READ|WRITE]；返回非零序号，与 Query 的固定 generation 组成 token。
+    /// 无提示返回 ObjectNotAvailable；结果在寄存器内交付，不存在消费后输出 fault。
+    IrqTake = 0x75,
+    /// a0=use[WRITE], a1=generation, a2=sequence；核完整 token 后 complete。
+    IrqAck = 0x76,
+    /// a0=DMA control[CREATE], a1=rights；返回子 control/use。
+    DmaCreateControl = 0x80,
+    DmaCreateUse = 0x81,
+    /// a0=DMA control/use[READ], a1=DomainSnapshot 输出。
+    DmaDomainQuery = 0x82,
+    /// a0=DMA control/use[MANAGE]；封新承诺，取消未暴露准备。
+    DmaSeal = 0x83,
+    /// a0=DmaUse[CREATE|方向权利], a1=PinRequest；返回 mapping，不返回地址。
+    DmaPin = 0x84,
+    /// a0=DmaMapping[READ], a1=ReadRequest；offset 必须小于 mapping.bytes。
+    DmaReadSegments = 0x85,
+    /// a0=DmaMapping[READ], a1=MappingSnapshot 输出。
+    DmaMappingQuery = 0x86,
+    /// a0=原 DmaUse/上级 control[MANAGE], a1=mapping[READ]；受信调用方保证设备静止。
+    DmaRetire = 0x87,
 
     // -----Tunnel-----
     /// 以付款 MemoryPool 创建共享 backing、本端 Endpoint 与一次性 Invitation；

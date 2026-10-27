@@ -171,7 +171,10 @@ mod tests {
             protocol::write_header(99, Status::Ok, until, body.len(), &mut writer);
             writer.bytes(body);
             let used = writer.written();
-            assert!(matches!(decode_request(&bytes[..used], 1), Err(Status::Unsupported)));
+            assert!(matches!(
+                decode_request(&bytes[..used], 1),
+                Err(Status::Unsupported)
+            ));
         }
     }
 }

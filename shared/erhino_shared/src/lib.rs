@@ -10,6 +10,8 @@ extern crate alloc;
 pub mod boot;
 /// System calls
 pub mod call;
+pub mod dma;
+pub mod irq;
 /// Memory related
 pub mod mem;
 /// MemoryObject capability
@@ -18,8 +20,11 @@ pub mod memory_object;
 pub mod memory_pool;
 /// Messaging primitives
 pub mod message;
+pub mod mmio;
 /// 内核对象、Handle、rights 与对象状态
 pub mod object;
+/// 只读平台描述及初始资源关联
+pub mod platform;
 /// Process types
 pub mod proc;
 /// 系统复位语义

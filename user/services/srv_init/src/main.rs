@@ -13,13 +13,13 @@
 //!    快照 → close；pm_domain 由 pm 自行收束，未收束时 init 兜底；
 //! 6. 等 pm 退出后的 PEER_CLOSED 终态位，关闭本端（帧归还）；
 //! 7. 验证系统复位 capability 的负路径，由 init 显式提交 Shutdown；平台拒绝时
-//!    保持 root supervisor 稳态等待。
+//!    终止 init，由 boot 的预付 DONE 观察进入不可恢复停止。
 //!
 //! 默认构建运行确定性的 core 验收；`acceptance-stress` feature 在同一用户态
 //! 编排器中追加重复压力、自动回收与完整竞态矩阵。内核不感知该档位。
 
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 extern crate libruntime;
@@ -87,7 +87,19 @@ mod supervisor;
 use supervisor::RootSupervisor;
 
 mod building;
+mod device;
+#[cfg(feature = "acceptance-device")]
+mod device_acceptance;
+mod device_supervision;
+mod dma_checks;
+mod driver;
 mod filesystem;
+#[cfg(feature = "acceptance-device-function-session")]
+mod function_checks;
+mod irq_checks;
+mod mmio_checks;
+mod once_checks;
+mod platform;
 mod public_ipc;
 #[cfg(feature = "acceptance-stress")]
 mod race;
@@ -123,6 +135,7 @@ struct InitStartup {
     process: CurrentProcessInfo,
     payload: StartupPayload,
     root_memory_pool: Handle,
+    _platform: platform::PlatformDescription,
 }
 
 #[derive(Clone, Copy)]
@@ -302,8 +315,10 @@ const TUNNEL_STRESS: usize = 64;
 const ACCEPTANCE_WORKLOAD: &str = "memory";
 #[cfg(all(feature = "acceptance-stress", not(feature = "acceptance-memory")))]
 const ACCEPTANCE_WORKLOAD: &str = "stress";
-#[cfg(not(feature = "acceptance-stress"))]
+#[cfg(all(not(feature = "acceptance-stress"), not(feature = "acceptance-device")))]
 const ACCEPTANCE_WORKLOAD: &str = "core";
+#[cfg(feature = "acceptance-device")]
+const ACCEPTANCE_WORKLOAD: &str = "device";
 
 const REQUIRED_FS: u64 = 1 << 0;
 const REQUIRED_PM: u64 = 1 << 1;
@@ -311,16 +326,26 @@ const REQUIRED_DRIVER: u64 = 1 << 2;
 const REQUIRED_TARGET: u64 = 1 << 3;
 const REQUIRED_PM_TARGET: u64 = 1 << 4;
 const REQUIRED_FS_CONSUMER: u64 = 1 << 5;
-const REQUIRED_IMAGES: u64 =
-    REQUIRED_FS | REQUIRED_PM | REQUIRED_DRIVER | REQUIRED_TARGET | REQUIRED_FS_CONSUMER;
-const REQUIRED_STARTED: u64 =
-    REQUIRED_FS | REQUIRED_PM | REQUIRED_DRIVER | REQUIRED_TARGET | REQUIRED_PM_TARGET;
+const REQUIRED_DEVICE: u64 = 1 << 6;
+const REQUIRED_IMAGES: u64 = REQUIRED_FS
+    | REQUIRED_PM
+    | REQUIRED_DRIVER
+    | REQUIRED_TARGET
+    | REQUIRED_FS_CONSUMER
+    | REQUIRED_DEVICE;
+const REQUIRED_STARTED: u64 = REQUIRED_FS
+    | REQUIRED_PM
+    | REQUIRED_DRIVER
+    | REQUIRED_TARGET
+    | REQUIRED_PM_TARGET
+    | REQUIRED_DEVICE;
 
 fn required_image(name: &str) -> Option<u64> {
     match name {
         "bin/srv_fs" => Some(REQUIRED_FS),
         "bin/srv_pm" => Some(REQUIRED_PM),
-        "bin/drv_spi_sifive" => Some(REQUIRED_DRIVER),
+        "bin/srv_device" => Some(REQUIRED_DEVICE),
+        "bin/srv_driver" => Some(REQUIRED_DRIVER),
         "bin/test_target" => Some(REQUIRED_TARGET),
         "bin/test_fs" => Some(REQUIRED_FS_CONSUMER),
         _ => None,
@@ -336,6 +361,7 @@ fn launch_test_services(
     acceptance: Handle,
     names: &mut TopologyNames,
 ) -> Result<LaunchedServices, &'static str> {
+    root.begin_device_supervision(services)?;
     let pm_mailbox = root
         .create_mailbox(
             Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
@@ -385,6 +411,10 @@ fn launch_test_services(
     let mut fs_second_scope = None;
     let mut primary_provider = None;
     let mut registry_root_watch = None;
+    let mut driver_image = None;
+    let mut pci_image = None;
+    let mut xhci_image = None;
+    let mut hid_image = None;
     let result = with_init_payload(|payload| {
         tar::walk(payload, |entry| {
             if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
@@ -395,6 +425,18 @@ fn launch_test_services(
                 hammer_image = Some(StartupImage::from_slice(entry.data));
                 return;
             }
+            if entry.name == "bin/drv_pci_generic" {
+                pci_image = Some(StartupImage::from_slice(entry.data));
+                return;
+            }
+            if entry.name == "bin/drv_usb_xhci" {
+                xhci_image = Some(StartupImage::from_slice(entry.data));
+                return;
+            }
+            if entry.name == "bin/drv_usb_hid" {
+                hid_image = Some(StartupImage::from_slice(entry.data));
+                return;
+            }
             let required = required_image(entry.name);
             if let Some(bit) = required {
                 manifest.mark_present(bit);
@@ -403,6 +445,24 @@ fn launch_test_services(
                 return;
             }
             if stage_failure.is_some() {
+                return;
+            }
+            if entry.name == "bin/srv_driver" {
+                driver_image = Some(StartupImage::from_slice(entry.data));
+                return;
+            }
+            if entry.name == "bin/srv_device" {
+                if root.devices.is_some() {
+                    stage_failure = Some("duplicate device manager image");
+                    return;
+                }
+                match device::Manager::launch(root, services, names, entry.data) {
+                    Ok(manager) => {
+                        root.devices = Some(manager);
+                        manifest.mark_started(REQUIRED_DEVICE);
+                    }
+                    Err(error) => stage_failure = Some(error),
+                }
                 return;
             }
             if entry.name == "bin/test_fs" {
@@ -602,6 +662,26 @@ fn launch_test_services(
         debug!("required initfs parse failed: {:?}", error);
         stage_failure = Some("initfs parse failed");
     }
+    if stage_failure.is_none() {
+        match (driver_image, pci_image, xhci_image, hid_image) {
+            (Some(manager), Some(pci), Some(xhci), Some(hid)) => {
+                match driver::Manager::launch(
+                    root,
+                    services,
+                    names,
+                    manager.as_slice(),
+                    [pci.as_slice(), xhci.as_slice(), hid.as_slice()],
+                ) {
+                    Ok(manager) => {
+                        root.drivers = Some(manager);
+                        manifest.mark_started(REQUIRED_DRIVER);
+                    }
+                    Err(error) => stage_failure = Some(error),
+                }
+            }
+            _ => stage_failure = Some("driver boot image pairing incomplete"),
+        }
+    }
     if let Some(failure) = stage_failure {
         debug!("required service preparation failed: {}", failure);
     }
@@ -776,6 +856,15 @@ impl FsConsumerCoordinator {
     fn await_report(&self, root: &RootSupervisor, expected: u64) -> Result<(), &'static str> {
         let deadline = libkernel::time::timeout_millis(test_fs::command::PHASE_TIMEOUT_MILLIS)
             .map_err(|_| "FS consumer phase deadline invalid")?;
+        debug!(
+            "FS consumer phase wait started: pid={}, report={}, now_ns={}, end_ns={}",
+            self.pid,
+            expected,
+            libkernel::time::snapshot()
+                .map_err(|_| "FS phase clock failed")?
+                .now_ns,
+            deadline.at_ns
+        );
         let set = WaitSet::create(2).map_err(|_| "FS consumer phase set failed")?;
         set.register(MemberRequest::new(
             self.report_owner,
@@ -793,6 +882,14 @@ impl FsConsumerCoordinator {
                 Err(_) => return Err("FS consumer phase report take failed"),
             };
             if bits != 0 {
+                debug!(
+                    "FS consumer phase report received: pid={}, report={}, now_ns={}",
+                    self.pid,
+                    bits,
+                    libkernel::time::snapshot()
+                        .map_err(|_| "FS phase clock failed")?
+                        .now_ns
+                );
                 return if bits == expected {
                     Ok(())
                 } else {
@@ -800,6 +897,15 @@ impl FsConsumerCoordinator {
                 };
             }
             if let Some(reason) = terminal {
+                debug!(
+                    "FS consumer phase ended without expected report: pid={}, report={}, now_ns={}, reason={}",
+                    self.pid,
+                    expected,
+                    libkernel::time::snapshot()
+                        .map_err(|_| "FS phase clock failed")?
+                        .now_ns,
+                    reason
+                );
                 return Err(reason);
             }
             for record in set
@@ -1209,7 +1315,24 @@ fn root_pool_allocated() -> Result<u64, SystemCallError> {
 
 #[cfg(not(feature = "acceptance-stress"))]
 fn test_process_funding(job: Handle) -> Result<(), &'static str> {
-    let baseline = root_pool_allocated().map_err(|_| "root Pool query failed")?;
+    // 独立付款域只包含本次 Building 与一页 Map；全局 Root 还可能推进其他对象的异步退款。
+    let pool = libkernel::memory_pool::derive(
+        root_memory_pool(),
+        libkernel::shared::memory_pool::MemoryPoolBudget {
+            pages: 16,
+            // 空间的区域账本、View 与预付退休记录需要 metadata；页预算不代替这些费用。
+            metadata: 1024 * 1024 / libkernel::shared::memory_pool::METADATA_SLOT_BYTES,
+        },
+        Rights::READ | Rights::CREATE | Rights::DUPLICATE,
+    )
+    .map_err(|_| "process funding Pool admission failed")?;
+    let baseline = pool
+        .query()
+        .map_err(|_| "process funding Pool query failed")?
+        .allocated;
+    if baseline != 0 {
+        return Err("process funding Pool is not empty");
+    }
     let wrong_kind = duplicate(job, Rights::CREATE).map_err(|_| "Job duplicate failed")?;
     let rejected = process::create(job, wrong_kind, SUPERVISOR_RIGHTS);
     let _ = unsafe { close(wrong_kind) };
@@ -1220,7 +1343,7 @@ fn test_process_funding(job: Handle) -> Result<(), &'static str> {
         return Err("ProcessCreate accepted non-Pool funding authority");
     }
     let no_create =
-        duplicate(root_memory_pool(), Rights::READ).map_err(|_| "Pool duplicate failed")?;
+        duplicate(pool.as_handle(), Rights::READ).map_err(|_| "Pool duplicate failed")?;
     let denied = process::create(job, no_create, SUPERVISOR_RIGHTS);
     let _ = unsafe { close(no_create) };
     if !matches!(denied, Err(SystemCallError::RightsDenied)) {
@@ -1229,8 +1352,10 @@ fn test_process_funding(job: Handle) -> Result<(), &'static str> {
         }
         return Err("ProcessCreate accepted Pool without CREATE");
     }
-    let created = process::create(job, root_memory_pool(), SUPERVISOR_RIGHTS)
-        .map_err(|_| "funded process create failed")?;
+    let created = process::create(job, pool.as_handle(), SUPERVISOR_RIGHTS).map_err(|error| {
+        debug!("Funded process creation failed: {:?}", error);
+        "funded process create failed"
+    })?;
     let result = process::map(
         created.builder,
         0x1000,
@@ -1238,12 +1363,22 @@ fn test_process_funding(job: Handle) -> Result<(), &'static str> {
         libkernel::shared::proc::ProcessMapFlags::READ,
     );
     // 创建不消费付款 authority；创建后的 Building 可直接映射。
-    let pool_alive = root_pool_allocated().is_ok();
+    let pool_alive = pool
+        .query()
+        .is_ok_and(|snapshot| snapshot.allocated > baseline);
     let cleanup = unsafe { process::abandon_to_completion(created) };
     if result.is_err() || !pool_alive || cleanup.is_err() {
         return Err("ProcessCreate funding or cleanup failed");
     }
-    if root_pool_allocated().map_err(|_| "root Pool final query failed")? != baseline {
+    let after = pool
+        .query()
+        .map_err(|_| "process funding Pool final query failed")?
+        .allocated;
+    if after != baseline {
+        debug!(
+            "ProcessCreate funding mismatch: baseline={}, after={}",
+            baseline, after
+        );
         return Err("ProcessCreate charge did not refund");
     }
     debug!("process creation funding acceptance passed");
@@ -1266,6 +1401,19 @@ fn main() {
     debug!("Hello, init!");
     let startup = libruntime::startup::take().expect("init startup context is missing");
     let (process, payload, mut grants) = startup.into_parts();
+    let platform = platform::PlatformDescription::adopt(
+        grants
+            .take(initial::PLATFORM_DESCRIPTION)
+            .expect("init must hold a platform description"),
+        &mut grants,
+    )
+    .expect("initial platform description is invalid");
+    let description = platform.description();
+    debug!(
+        "platform description admitted: DTB {} bytes, {} resource roots",
+        description.header().dtb_bytes,
+        description.header().resource_count
+    );
     let root_job = grants
         .take(initial::ROOT_JOB)
         .map(Capability::into_raw)
@@ -1282,6 +1430,7 @@ fn main() {
         process,
         payload,
         root_memory_pool,
+        _platform: platform,
     });
     let mut reset = Some(reset_handle);
     // 尚无服务责任时准备根承载；失败不会遗忘已启动服务。
@@ -1337,7 +1486,10 @@ fn submit_shutdown(root_job: Handle, reset: Handle, root: RootSupervisor) -> ! {
     match system::reset(reset, ResetAction::Shutdown, ResetReason::Requested) {
         Err(error) => {
             debug!("system reset failed: {:?}", error);
-            root.idle_forever()
+            core::hint::black_box(&root);
+            // SAFETY: reset 失败是不可恢复终局；内核稳定持 DMA 责任，
+            // 用户析构不承担硬件停止。boot 的预付 DONE 观察接管最后停驻。
+            unsafe { libkernel::sys_process_terminate() }
         }
         Ok(never) => match never {},
     }
@@ -1436,7 +1588,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     let snapshot = object.query().map_err(|_| "MemoryObject query failed")?;
     if snapshot.bytes != 4 * page as u64
         || snapshot.state() != Some(MemoryObjectState::Mutable)
-        || snapshot.write_views != 0
+        || snapshot.write_permits != 0
         || !snapshot.closes()
     {
         return Err("MemoryObject snapshot geometry or state invalid");
@@ -1465,7 +1617,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     if object
         .query()
         .map_err(|_| "MemoryObject query after Map failed")?
-        .write_views
+        .write_permits
         != 1
     {
         return Err("MemoryObject did not account its writable view");
@@ -1522,7 +1674,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     let snapshot = sealing
         .query()
         .map_err(|_| "sealing object query after downgrade failed")?;
-    if snapshot.state() != Some(MemoryObjectState::Sealing) || snapshot.write_views != 2 {
+    if snapshot.state() != Some(MemoryObjectState::Sealing) || snapshot.write_permits != 2 {
         return Err("Sealing writable successor accounting invalid");
     }
     match sealing_view.protect(
@@ -1539,7 +1691,7 @@ fn test_memory_mapping() -> Result<(), &'static str> {
     let snapshot = sealing
         .query()
         .map_err(|_| "sealing object final query failed")?;
-    if snapshot.state() != Some(MemoryObjectState::Executable) || snapshot.write_views != 0 {
+    if snapshot.state() != Some(MemoryObjectState::Executable) || snapshot.write_permits != 0 {
         return Err("Sealing did not complete after the last writable successor retired");
     }
     sealing_view
@@ -1840,6 +1992,33 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         return run_memory(root, services).map_err(RunFailure::from);
     }
     test_memory_mapping()?;
+    let ecam = INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs missing")
+        ._platform
+        .ecam_handle();
+    if let Some(ecam) = ecam {
+        mmio_checks::run(ecam).map_err(RunFailure::from)?;
+    }
+    let irq = INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs missing")
+        ._platform
+        .irq_handle();
+    if let Some(irq) = irq {
+        irq_checks::run(irq).map_err(RunFailure::from)?;
+    }
+    let dma = INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs missing")
+        ._platform
+        .dma_handle();
+    if let Some(dma) = dma {
+        dma_checks::run(dma).map_err(RunFailure::from)?;
+    }
     #[cfg(not(feature = "acceptance-stress"))]
     test_process_funding(services)?;
     let pm_domain = root
@@ -1859,13 +2038,43 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     public_ipc::notification_roles();
     test_pool_budget();
     let launched = launch_test_services(root, services, pm_domain, acceptance, &mut names)?;
+    once_checks::run(
+        root,
+        acceptance,
+        launched
+            .target_image
+            .ok_or("Once target image missing")?
+            .as_slice(),
+    )?;
+    #[cfg(feature = "acceptance-device-function-session")]
+    function_checks::run(root.devices.as_ref().ok_or("device manager unavailable")?)?;
+    #[cfg(feature = "acceptance-device")]
+    let driver_reply_backlog = {
+        let sources = root
+            .devices
+            .as_ref()
+            .ok_or("device manager bootstrap incomplete")?
+            .issue_function_source()?;
+        let drivers = root
+            .drivers
+            .as_ref()
+            .ok_or("driver assembly record missing")?
+            .observer_handle()?;
+        device_acceptance::exercise(root, acceptance, sources, drivers)?
+    };
     let pm_mailbox = launched.pm_mailbox;
     let mut first_fs = launched.first_fs;
     let registry_watch = launched.registry_root_watch;
     confirm_primary_fs_ready(&first_fs)?;
     root.verify_dispatcher_funding([
-        first_fs.directory.as_ref().ok_or("primary registry A missing")?,
-        first_fs.directory_b.as_ref().ok_or("primary registry B missing")?,
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or("primary registry A missing")?,
+        first_fs
+            .directory_b
+            .as_ref()
+            .ok_or("primary registry B missing")?,
     ])?;
     // primary 探针只借已就绪文件根，不依赖独立消费者或 secondary。
     exercise_fs_provider(
@@ -1981,7 +2190,6 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     drop(second_fs.grant.take());
     drop(second_fs.management.take());
     drop(second_fs.management_b.take());
-    root.collect_process(second_fs.pid)?;
     drop(first_fs.grant.take());
     drop(first_fs.directory.take());
     drop(first_fs.registration_root.take());
@@ -1991,7 +2199,8 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     drop(first_fs.management.take());
     drop(first_fs.management_b.take());
     release_fs_provider(root, &first_fs)?;
-    root.collect_process(first_fs.pid)?;
+    // 两个真实provider业务已经关闭；把原control一起交原批次，覆盖部分准入/失败隔离。
+    root.verify_failure_isolation(acceptance, [first_fs.pid, second_fs.pid])?;
     debug!("FS1 provider supervision reclaimed both provider processes");
     let target_image = launched.target_image;
     let hammer_image = launched.hammer_image;
@@ -2162,6 +2371,15 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     test_building_kill(acceptance);
 
     // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
+    // 真实 PCI 已独占平台 ECAM；先正常停止实际消费者，再运行会重新派生同范围的退休验收。
+    // 保留全部原场景，避免验收与业务争用同一物理范围。
+    root.stop_drivers()?;
+    #[cfg(feature = "acceptance-device")]
+    {
+        debug!("DEVICE Drivers stopped while Observer reply backlog remained unread");
+        drop(driver_reply_backlog);
+    }
+    root.stop_devices()?;
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image {
         Some(image) => test_job_management(root, acceptance, image.as_slice())?,
@@ -2174,7 +2392,6 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
 
     // 短寿命服务的线程已退出并不释放 AddressSpace；在高峰矩阵前收束已进入
     // Terminating/Dead 的成员，仍 Running 的服务继续由末尾监督闭环持有。
-    root.verify_failure_isolation(acceptance)?;
     let reclaimed = root.collect_terminated()?;
     debug!(
         "pre-race service supervision reclaimed {} process(es)",
@@ -3028,6 +3245,36 @@ fn test_job_management(
     seal_before_start(job);
     seal_before_create(job);
     enumerate_convergence(job);
+    let ecam = INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs missing")
+        ._platform
+        .ecam_handle();
+    if let Some(ecam) = ecam {
+        mmio_checks::process_retirement(ecam, job, image)?;
+    }
+    #[cfg(feature = "acceptance-irq-exit")]
+    {
+        let irq = INIT_STARTUP
+            .lock()
+            .as_ref()
+            .expect("init startup inputs missing")
+            ._platform
+            .irq_handle();
+        if let Some(irq) = irq {
+            irq_checks::process_retirement(irq, job, image)?;
+        }
+    }
+    let dma = INIT_STARTUP
+        .lock()
+        .as_ref()
+        .expect("init startup inputs missing")
+        ._platform
+        .dma_handle();
+    if let Some(dma) = dma {
+        dma_checks::process_retirement(dma, job, image)?;
+    }
     #[cfg(feature = "acceptance-stress")]
     {
         test_automatic_retirement(job, image)

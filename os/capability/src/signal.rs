@@ -286,10 +286,10 @@ mod tests {
 
     #[test]
     fn insertion_is_after_the_boundary_and_owner_rechecks_new_nodes() {
-        let mut source = Box::pin(Source::new());
+        let mut source = core::pin::pin!(Source::new());
         let a = Box::pin(Node::new());
         let b = Box::pin(Node::new());
-        // SAFETY: pin allocations stay alive through same-source remove, no concurrency.
+        // SAFETY: 来源和节点均保持 pin，直到从同一来源摘除；没有并发访问。
         unsafe {
             source.as_mut().insert(a.as_ref(), 1, 1);
         }
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn deleting_cursor_and_updating_during_scan_preserve_remaining_observers() {
-        let mut source = Box::pin(Source::new());
+        let mut source = core::pin::pin!(Source::new());
         let a = Box::pin(Node::new());
         let b = Box::pin(Node::new());
         let c = Box::pin(Node::new());
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn closed_hints_all_interests_and_transient_levels_are_not_latched() {
-        let mut source = Box::pin(Source::new());
+        let mut source = core::pin::pin!(Source::new());
         let a = Box::pin(Node::new());
         unsafe {
             source.as_mut().insert(a.as_ref(), 4, 1);

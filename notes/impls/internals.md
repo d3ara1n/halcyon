@@ -22,7 +22,7 @@ trap 进入 S 态时硬件清 SIE；内核执行到用户返回或调度出口�
 
 具体纪律：
 
-- U 态下 `sstatus.SIE` 的值被忽略；已委托且在 `sie` 中启用的来源可以陷入 S 态。S 态稳态 SIE=0，内核期间到达的来源保持 pending，返回 U 态后在规范允许的有界时间内重新 trap；`_kernel_trap` 一律致命（转储停机）。
+- U 态下 `sstatus.SIE` 的值被忽略；已委托且在 `sie` 中启用的来源可以陷入 S 态。S 态稳态 SIE=0，内核期间到达的来源由有界安全点服务；尚未消费的 pending 在返回 U 态后按规范重新 trap。S 态同步异常仍走 fatal 入口（转储停机）。
 - 内核态 timer 长路径不会「误杀」：悬置中断在 sret 后才生效，调度点照常到达。
 - 内核锁只需防跨核争用；锁原语的关中断语义在此模型下是零成本保险，保留以防纪律腐化。
 - 阻塞的表达方式是异步 syscall（见 `call.md`），不是内核睡眠——协作式定性下不存在可挂起的内核执行流。
@@ -39,9 +39,9 @@ DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只�
 
 - **timer = 自己的确定到期点**：Thread出生内嵌稳定pin节点，per-hart侵入AVL按期限/地址排序，载荷持Thread/epoch。到期先摘链再门外提示，由执行owner复检完成；跨hart取消只摘匹配epoch，不远程编程timer。
 - **IPI = 他方的请求**：SBI只置SSIP，Ready/Pending电平拥有真实责任。发送成功与合并门铃下由idle登记/复检握手保证重新读电平；规范允许发送失败，失败进入下述不可恢复停止政策，不能只凭发送方尚醒就推导目标一定推进。
-- **设备中断 = 设备的请求**：主人是设备（中断接入后生效）。
+- **设备中断 = 设备的请求**：PLIC 将已授权 source 交固定 context，内核记录领取，实际驱动负责检查硬件并 Ack；[IRQ owner](device.md#irq-使用观察与撤销)拥有消费、撤销和观察生命周期。
 
-正常唤醒后清中断源，读取调度域Ready、期限与运输Pending；无工作回睡。若runtime_stop已requested，先进入停止检查，不再挑选工作。
+正常唤醒后清 SSIP 门铃，读取调度域 Ready、期限与运输 Pending；外部 IRQ 在睡前/醒后最多 claim 一源，claim 不等于 complete。无工作回睡。若 runtime_stop 已 requested，先进入停止检查，不再挑选工作。
 
 ### idle 与系统复位
 
