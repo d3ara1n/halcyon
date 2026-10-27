@@ -28,6 +28,7 @@
 | 设备首批施工设计增量独立审查 | [固定交付 Review](todo-2026-10-23-device-implementation-design-review.md) |
 | 设备首批实现机制收敛与第二轮交付 | [收敛交付档案](archived/review-2026-10-27-device-implementation.md)；[原固定登记档案](archived/todo-2026-10-27-device-implementation-review.md) |
 | 第二轮生命周期、运输退场与观察收口 | [修复、复核及组合验证](archived/review-2026-10-27-device-lifecycle.md) |
+| 设备第二轮完整代码交付独立 Review | [固定 c5d005d 的审查登记](todo-2026-10-27-device-convergence-review.md)；单独安排，主线仍按设备计划调查 DMA＋IPI 和时钟异常 |
 
 ## 条件触发的计划
 
