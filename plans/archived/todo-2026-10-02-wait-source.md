@@ -1,14 +1,16 @@
 # 统一等待源组件
 
-状态：**轮次5定稿及实际消费者已交付，后续内部完成通知协议按下方审查修正**。轮次2–4和最初方案保留推导，不作当前依据。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，首次实施/验证由[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)承载，后续修复见[审查修复档案](archived/review-2026-10-07-object-chain.md#通知与引用归还的最终协议设计轮次4)。ProcessShell终态、ThreadControl、Mailbox各类型、Notification、ReplyObservation及用户fault依赖均已接入。用户裁决仍为纯电平、删除WaitMany、禁止嵌套WaitSet。
+> 2026-10-27 清理活跃资料时归档；本任务约定范围已交付，正文保留当时设计与过程，不能从历史施工断点恢复任务。当前入口见[系统重构总纲](../todo-2026-09-29-system-redesign.md)。
 
-当前没有待接通的本链来源或清理责任；未来新来源按轮次5的稳定节点、owner自摘和付款合同接入。硬件故障/全安装交错穷举仍是验证边界，不能由已过正常路线推成全面故障证明。当前面貌由[task实现](../notes/impls/task.md)拥有。
+状态：**轮次5定稿及实际消费者已交付，后续内部完成通知协议按下方审查修正**。轮次2–4和最初方案保留推导，不作当前依据。本案属于[全项目重构](../todo-2026-09-29-system-redesign.md)，首次实施/验证由[对象链档案](todo-2026-10-01-object-chain-kernel-integration.md)承载，后续修复见[审查修复档案](review-2026-10-07-object-chain.md#通知与引用归还的最终协议设计轮次4)。ProcessShell终态、ThreadControl、Mailbox各类型、Notification、ReplyObservation及用户fault依赖均已接入。用户裁决仍为纯电平、删除WaitMany、禁止嵌套WaitSet。
+
+当前没有待接通的本链来源或清理责任；未来新来源按轮次5的稳定节点、owner自摘和付款合同接入。硬件故障/全安装交错穷举仍是验证边界，不能由已过正常路线推成全面故障证明。当前面貌由[task实现](../../notes/impls/task.md)拥有。
 
 ## 审查修正：内部完成来源与维护wake
 
-轮次5的普通Thread/WaitSet提示仍在全部业务门外交接。SignalSource内部完成是一个明确的短边：DONE/internal_done提交与maintenance::wake状态捕获同来源门发生，避免唯一内部等待者先完成并把最后根递归回发布者。它只改记录状态；潜在最后根及IPI由调用方带出全部领域锁后处理。QUEUE内非last保证、Work.record纯投影和来源→QUEUE锁序由[维护计划](todo-2026-09-29-kernel-maintenance-execution.md#状态与唤醒)拥有，不把这条边推广为锁内执行Hint/业务回调或最后析构。
+轮次5的普通Thread/WaitSet提示仍在全部业务门外交接。SignalSource内部完成是一个明确的短边：DONE/internal_done提交与maintenance::wake状态捕获同来源门发生，避免唯一内部等待者先完成并把最后根递归回发布者。它只改记录状态；潜在最后根及IPI由调用方带出全部领域锁后处理。QUEUE内非last保证、Work.record纯投影和来源→QUEUE锁序由[维护计划](../todo-2026-09-29-kernel-maintenance-execution.md#状态与唤醒)拥有，不把这条边推广为锁内执行Hint/业务回调或最后析构。
 
-用户fault等待复用事务Completion的独立SignalSource，无每PTE actor；其捕获前释放空间锁/短loan，Frozen走原detach，DONE晚于退款/access归还，详见[内存分案fault](todo-2026-10-01-memory-redesign.md#fault)。原方案中“所有唤醒都必须在来源锁外”的绝对表述仅对普通提示适用，不覆盖上述内部记录仲裁。
+用户fault等待复用事务Completion的独立SignalSource，无每PTE actor；其捕获前释放空间锁/短loan，Frozen走原detach，DONE晚于退款/access归还，详见[内存分案fault](../todo-2026-10-01-memory-redesign.md#fault)。原方案中“所有唤醒都必须在来源锁外”的绝对表述仅对普通提示适用，不覆盖上述内部记录仲裁。
 
 ## 范围与非目标
 
@@ -179,4 +181,4 @@
 
 全仓直接 WaitMany/便利封装有 47 处调用，42 处固定单对象、5 处真实多项（srv_init supervisor/main、libfal client、librpc caller）。supervisor 的多项包含若干 Runtime 导出的 WaitSet READABLE 观察句柄，不能把这些集合再登记成一个新 WaitSet 来机械替代 WaitMany。用户态执行领域须闭合扁平来源装配和各 Runtime 的登记/事件分流责任；此接缝不恢复嵌套能力，不重复询问既定裁决。消费者位置、实施顺序与待接线范围记录在对象链入口。
 
-当前来源契约入口：ProcessShell 的 TERMINATED 用 DONE 位表示，Body/VM 退休退款完成后发布，Control 可查询稳定 Dead，不置来源通用 closed。Job 完成用 CLOSED。Notification 的三角色、Owner[MANAGE] 派生 READABLE/CLOSED Observer、Signaler 可获 WAIT(CLOSED) 及公开 LifetimeObserver/ReplyObserver 命名由 [Notification 前置](todo-2026-10-10-notification-observer-roles.md) 接管；本篇历史轮次的旧角色写法不再定义当前 ABI。ReplyObserver 的 Sent/Abandoned 仍由 DONE/PEER_CLOSED 表示，MakeSendOnce 同步交付完整 pair；通用扁平等待、来源只提示和唯一 detach 契约保持。对象链既有证据从原记录查阅，新增角色/消费者证据从 Notification 前置和其链接的主计划查阅。
+当前来源契约入口：ProcessShell 的 TERMINATED 用 DONE 位表示，Body/VM 退休退款完成后发布，Control 可查询稳定 Dead，不置来源通用 closed。Job 完成用 CLOSED。Notification 的三角色、Owner[MANAGE] 派生 READABLE/CLOSED Observer、Signaler 可获 WAIT(CLOSED) 及公开 LifetimeObserver/ReplyObserver 命名由 [Notification 前置](../todo-2026-10-10-notification-observer-roles.md) 接管；本篇历史轮次的旧角色写法不再定义当前 ABI。ReplyObserver 的 Sent/Abandoned 仍由 DONE/PEER_CLOSED 表示，MakeSendOnce 同步交付完整 pair；通用扁平等待、来源只提示和唯一 detach 契约保持。对象链既有证据从原记录查阅，新增角色/消费者证据从 Notification 前置和其链接的主计划查阅。

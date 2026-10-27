@@ -55,7 +55,7 @@
 
 - **合法 WaitSet Remove 的真实 Busy/Quota 注入不适用。** [WaitSet::remove](../os/kernel/src/task/wait_set.rs)（250—260）有锁摘 token、锁外 Drop/kick，不分配且没有 Busy/Quota 分支；未知 token 为 ObjectNotFound，Runtime 按已退休处理。通用 SourceOps 的失败保 owner/回执/费用已有 host 边界；不能要求当前内核制造不存在的资源拒绝。对应 FAL F-01、执行 E-02 的这一部分退出；真实映射撤销失败与异步回执组合仍归 E03。
 - **独占、合法、非映射 Handle/Delivery Close 的资源性失败不适用。** [FAL 主计划再核](todo-2026-10-07-fal-service-redesign.md#提交前机制收敛)第 1674—1678 行、C08/C10 已区分叶能力 Close 与映射 Unmap。旧 close-retry 暂存删除不能被旧报告恢复为施工要求；错误 raw handle 与进程已经退出是另一失败合同。
-- **Copy 的非零目标 accepted 后取消已有实现及运行记录。** 当前[正式消费者](../user/services/srv_init/src/filesystem/copy.rs)经真实 ReadAt 确认非零前缀，再取消并核最终前缀、并发隔离和退款；验收器仍要求对应锚点。[主计划第二轮验证与第三轮最终收口](todo-2026-10-07-fal-service-redesign.md#第三轮最终收口)记录最终 C10/C11 聚合覆盖该门，原证据路径为 `artifacts/convergence3/acceptance-summary.json`。该原始产物当前不在工作区，运行结果按已交付工作记录取证，未重新逐 guest 验证。FAL F-05 中“未接通/未运行”的表述不适用于其主固定目标 `a1ca124`；不因此宣称所有取消交错已覆盖。坏帧/Delivery 特定失败仍归 E04。
+- **Copy 的非零目标 accepted 后取消已有实现及运行记录。** 当前[正式消费者](../user/services/srv_init/src/filesystem/copy.rs)经真实 ReadAt 确认非零前缀，再取消并核最终前缀、并发隔离和退款；验收器仍要求对应锚点。[主计划第二轮验证与第三轮最终收口](archived/ref-2026-10-27-oal-fs-delivery-history.md#第三轮最终收口)记录最终 C10/C11 聚合覆盖该门，原证据路径为 `artifacts/convergence3/acceptance-summary.json`。该原始产物当前不在工作区，运行结果按已交付工作记录取证，未重新逐 guest 验证。FAL F-05 中“未接通/未运行”的表述不适用于其主固定目标 `a1ca124`；不因此宣称所有取消交错已覆盖。坏帧/Delivery 特定失败仍归 E04。
 - **普通 RPC queued/sent unknown、迟到旧 txid 和 sealed live waiter 不能笼统记成“没有组合证据”。** 当前消费者/主计划已有实际场景；旧执行 E-01、运输 E-03 仅保留尚未定位到证据的精确 Wake 拒绝、异常输出及平台边界，见 E04/E07。后续不能为了重验已覆盖部分扩大任务。
 
 ## 仍影响未来施工的设计闭合责任
@@ -64,7 +64,7 @@ D01—D09 下方保留 2026-10-12 核定时的问题、触发与关闭门；当�
 
 ### 设备首批施工准入后的范围复核
 
-本轮设备设计以 `e6d11a1` 为接手基线收敛，当前目标见[设备施工准入](todo-2026-09-device-system-design.md#施工准入核对)。固定基线独立 Review 的原始问题及针对性复核见[设备审查档案](archived/review-2026-10-23-device-system-design.md)；该档案的 D01—D04 是另一组编号，不能与本报告同号条目混淆。以下只更新设计责任，不表示代码交付：
+本轮设备设计以 `e6d11a1` 为接手基线收敛，当前目标见[设备施工准入](archived/ref-2026-10-27-device-delivery-history.md#施工准入核对)。固定基线独立 Review 的原始问题及针对性复核见[设备审查档案](archived/review-2026-10-23-device-system-design.md)；该档案的 D01—D04 是另一组编号，不能与本报告同号条目混淆。以下只更新设计责任，不表示代码交付：
 
 | 本报告责任 | 当前范围处置与依据 | 剩余触发 |
 |---|---|---|
@@ -74,7 +74,7 @@ D01—D09 下方保留 2026-10-12 核定时的问题、触发与关闭门；当�
 | D05 | [保留区首批边界](todo-2026-09-platform-reserved-memory-lifecycle.md#首批设备路线的边界)确认所选路线只用普通固定长度 MemoryObject，不消费动态 region | 本条原能力尚未触发，不能登记为已实现或完整设计关闭 |
 | D06 | 普通 RAM DMA 的 use/写许可/实际退休由[内存接点](todo-2026-10-01-memory-redesign.md#设备-dma-接入合同)闭合；reusable 与可撤回 loan 未纳入首批 | 原 reusable 设计门保留，真实消费者出现前闭合 |
 | D07 / D08 | [设备系统终局](todo-2026-09-system-shutdown-orchestration.md#设备管理故障的接点)给出准入封闭、完整责任集合、父子停止、Cold reset 错误与 boot 根观察 | 通用持久化服务 drain/flush 等原范围继续由关机案承接 |
-| D09 | [实际迁移面](todo-2026-09-device-system-design.md#实际迁移面与删除门)及[验收判据](todo-2026-09-device-system-design.md#验收门与可观察判据)已对应所选首批能力 | 未来扩大承诺按各案补门；当前门仍待代码实现及运行验证 |
+| D09 | [实际迁移面](archived/ref-2026-10-27-device-delivery-history.md#实际迁移面与删除门)及[验收判据](todo-2026-09-device-system-design.md#验收门与可观察判据)已对应所选首批能力 | 未来扩大承诺按各案补门；当前门仍待代码实现及运行验证 |
 
 因此不再以旧 D0/D1 或“维护基座未闭合”阻止首批设备施工，也不关闭本报告全部未来责任。E01—E07 的既有能力精确证据缺口未因本轮设计获得新的运行证据。
 

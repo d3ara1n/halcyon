@@ -45,7 +45,7 @@ DBCN 名称中的 Debug Console 仅表示 SBI 扩展类别，在 eRhino 中只�
 
 ### idle 与系统复位
 
-idle 只表达「当前 hart 暂无可运行线程」：hart 在所属调度域登记 idle 位，双重检查 Ready 后进入 WFI；入队方据 idle 位选择 IPI 目标。idle 位是调度唤醒路由状态，不参与整机生命周期推断。Sleep 与有限 WaitMany 的唤醒主人仍是 per-hart TimerQueue entry。
+idle 只表达「当前 hart 暂无可运行线程」：hart 在所属调度域登记 idle 位，双重检查 Ready 后进入 WFI；入队方据 idle 位选择 IPI 目标。idle 位是调度唤醒路由状态，不参与整机生命周期推断。Sleep 与有限 WaitOne 的唤醒主人仍是 per-hart TimerQueue entry。
 
 显式平台终局由SystemReset对象触发；内部不可恢复clock/门铃故障由runtime_stop协作停驻。SystemReset是无等待叶子对象，bootstrap交primordial capability给init，调用要求MANAGE；自有ResetAction/ResetReason显式映射SRST，不透传SBI编码。
 

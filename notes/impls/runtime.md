@@ -11,9 +11,9 @@ Runtime/WorkQueue/Assembly 的来源、Gate、公平性与退休机制由 [frame
 RPC 的固定/每调用来源付款和 Outbox 绑定由[通用 RPC 实现](rpc.md#当前嵌入与边界)拥有。init 的 Job/Batch/Read duty 在实际提交出生前准备并持有 execution view；初始化失败仍由原 duty 承接 owner，之后重试复用原 view，客户端 duty 在 Dispatcher 构造前即冻结共享资金。
 
 `libbudget` 在 metadata_admission::Permit/SponsoredPermit 上建立 Budget/Account、带身份 BudgetSlot、AccountView<K> 与 Charge。Account 是付款身份，视图只绑定分类；跨 Budget 的槽被拒绝，克隆不重置额度。零单位 Charge 仍持账户，shrink_to 在实际占用缩小时立即返还本地与 sponsor/global 两层额度。
-用户树显式选择libbudget::AllocatorBacked（C=()）：本层不新增逐分配软额度，使用可执行程序选择的allocator，既有领域Charge仍在业务记录中，混合布局计算用当前节点allocation_bytes。它不新开户、不替用户选择运行时、不证明Kernel metadata已付款；Task、Source InputBytes、FAL/Service费用与退款owner保持各自业务合同，逐heap字节保留/Weak尾部不由此声称覆盖。Runtime Source InputBytes包含实际AVL节点布局与独立timer值布局。
+用户树显式选择libbudget::AllocatorBacked（C=()）：本层不新增逐分配软额度，使用可执行程序选择的allocator，既有领域Charge仍在业务记录中，混合布局计算用当前节点allocation_bytes。它不新开户、不替用户选择运行时、不证明Kernel metadata已付款；Task、Source InputBytes、文件/服务费用与退款owner保持各自业务合同，逐heap字节保留/Weak尾部不由此声称覆盖。Runtime Source InputBytes包含实际AVL节点布局与独立timer值布局。
 
-Runtime 仅从显式 TaskSubmission 取得任务付款，构造 view 只支付固定基础设施，不借领域分类或裸槽位。srv_fs 的可信发行接口同时借用领域与 execution 两份 view，校验 account_id 相同并在角色、控制及 Request 中冻结；当前 boot 仍配置一个 Account，多账户实际装配由所属工作记录承接。grant 派生与控制终态壳保留同一配对，FAL Take 用 shrink_to 把已移交属性的 Bytes charge 缩到空值实际占用。
+Runtime 仅从显式 TaskSubmission 取得任务付款，构造 view 只支付固定基础设施，不借领域分类或裸槽位。srv_fs 的可信发行接口同时借用领域与 execution 两份 view，校验 account_id 相同并在角色、控制及 Request 中冻结；[boot 装配](../../user/services/srv_fs/src/server/boot.rs) 在同一 Budget 下为宿主和各业务入口创建独立 Account，入口配额由 deployment 提供。grant 派生与控制终态壳保留原领域/执行付款配对。
 登记和实际注销分别经 `Task::registered`、`Task::unregistered` 交付回执。任务不必等第一条来源事件才能取得 SourceId，因而首次等待超时也能撤销观察；机器在注销回执后才兑现被观察 owner 的关闭。
 
 ## 组合等待与失败隔离

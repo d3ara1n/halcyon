@@ -1,5 +1,7 @@
 # 旧内核设计考古（27b8c98）
 
+> 旧固定提交的实现考古，2026-10-27 移出活跃目录；不作为当前实现或新设计依据。
+
 > 用途：重写时的「按需参考档案」，不是照抄蓝本；同时是逐模块重写 notes/ 的底稿。
 > 证据来源：`git show 27b8c98:os/kernel/src/**` 第一手源码 + `artifacts/erhino_kernel` 反汇编实证（boot 契约）+ shared/ ABI（未被删除，即事实）。所有行级 bug/教训引用见 `plans/archived/review-2026-07-code-review.md` 与 `plans/archived/review-2026-08-mm-map-bug.md`，本文只记设计、不复述根因。
 > 一句话总览：**这是一个「协作式内核 + 抢占式用户态」的设计**——内核态全程关中断、无内核线程切换，所有调度转折点都在用户 trap 返回路径上；多 hart 共享一个全局进程/线程环，各 hart 从环上抢线程。

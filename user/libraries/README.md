@@ -1,6 +1,6 @@
 # 用户态库的知识归属与依赖
 
-本目录按领域组织可组合的用户态库。全部 Rust 组件先遵守 [`user/README.md`](../README.md) 的统一身份与命名规则；新增库、调整公共类型、修改依赖或组装服务前，再按本篇判断知识归属。领域设计由 [notes/ideas/framework.md](../../notes/ideas/framework.md) 及其链接的专题文档拥有；本轮迁移过程与验证见[库知识归属、依赖、目录与命名档案](../../plans/archived/todo-2026-09-21-library-knowledge-ownership.md)。
+本目录按领域组织可组合的用户态库。全部 Rust 组件先遵守 [`user/README.md`](../README.md) 的统一身份与命名规则；新增库、调整公共类型、修改依赖或组装服务前，再按本篇判断知识归属。领域详细设计从 [COMPASS](../../plans/COMPASS.md) 定位所属计划，[framework 线稿](../../notes/ideas/framework.md) 仅说明模块关系；迁移过程与验证见[库知识归属、依赖、目录与命名档案](../../plans/archived/todo-2026-09-21-library-knowledge-ownership.md)。
 
 ## 按领域组织
 

@@ -13,9 +13,9 @@
 - 正式专名保持正式拼写：Runnel → `librunnel`。Rust 程序环境由 `libkernel`、`libthread` 和 `libruntime` 分层拥有，分别位于 `user/libraries/`；不保留旧名 alias 或 facade。
 - 用户程序使用 `#![no_std]`，提供模板 `fn main()` 或 `fn main() -> Result<(), E: Debug>`；`libruntime` 通过 `start` lang item 接收 rustc 生成的入口 shim。应用不实现或调用 runtime 私有桥接符号。
 - 单词过长时，只能使用已有、通行且不会与其他领域冲突的缩写；不得仅为省字符临时截短。缩写一旦成为公开组件名，应在本篇或相应方向文档中记录其展开与领域含义。
-- acronym 在 Rust 标识符中使用小写；文档正文仍按正式写法书写，如 RPC、FAL、FS。
+- acronym 在 Rust 标识符中使用小写；文档正文仍按正式写法书写，如 RPC、OAL、FS。
 
-`lib` 是库身份前缀，不是缩写许可。单词 `service`、`driver`、`device` 不因前面已有 `lib` 而缩成 `srv`、`drv`、`dev`；因此未来服务与驱动公共库分别使用 `libservice`、`libdriver`，不使用 `libsrv`、`libdrv`。
+`lib` 是库身份前缀，不是缩写许可。单词 `service`、`driver`、`device` 不因前面已有 `lib` 而缩成 `srv`、`drv`、`dev`；因此服务与驱动公共库分别使用 `libservice`、`libdriver`，不使用 `libsrv`、`libdrv`。
 
 ### 二进制角色前缀
 
@@ -24,7 +24,7 @@
 | 角色 | 格式 | 示例 |
 |---|---|---|
 | 系统服务 | `srv_<domain>` | `srv_init`、`srv_fs`、`srv_pm`、未来的 `srv_process` |
-| 用户态驱动 | `drv_<domain>` | `drv_spi_sifive` |
+| 用户态驱动 | `drv_<domain>` | `drv_pci_generic`、`drv_usb_xhci`、`drv_usb_hid` |
 | 验收进程 | `test_<domain-or-scenario>` | `test_fp`、`test_hammer`、`test_target` |
 
 `srv`、`drv`、`test` 在这里表示二进制运行角色，只能作为带下划线的前缀使用；它们不能替代库的领域名称。库是否包含管理接口、客户端接口或服务端接口，不改变其 `lib<domain>` 身份。

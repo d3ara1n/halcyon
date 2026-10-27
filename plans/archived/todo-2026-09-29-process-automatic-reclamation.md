@@ -1,6 +1,8 @@
 # 进程终止后的自动资源回收
 
-状态：**本链自动回收及后续Job管理权/后代封口修复已交付**。首次实施/组合验证由[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有，后续修复、C1接通及实际证据见[审查修复档案](archived/review-2026-10-07-object-chain.md#最终复核与交付)。本案属于[全项目重构](todo-2026-09-29-system-redesign.md)，拥有进程终止至资源收束的责任，不拥有各对象清理算法。现状盘点及“推荐目标状态与owner”为历史；以最终轮次、下方修正后的Job合同和[task实现](../notes/impls/task.md)分别核目标与现状，不重复启动旧设计门。不可达capability环收集、设备/DMA退休不是当前私有资源回收承诺；新增能力由对应owner另行闭合。
+> 2026-10-27 清理活跃资料时归档；本任务约定范围已交付，正文保留当时设计与过程，不能从历史施工断点恢复任务。当前入口见[系统重构总纲](../todo-2026-09-29-system-redesign.md)。
+
+状态：**本链自动回收及后续Job管理权/后代封口修复已交付**。首次实施/组合验证由[对象链档案](todo-2026-10-01-object-chain-kernel-integration.md)拥有，后续修复、C1接通及实际证据见[审查修复档案](review-2026-10-07-object-chain.md#最终复核与交付)。本案属于[全项目重构](../todo-2026-09-29-system-redesign.md)，拥有进程终止至资源收束的责任，不拥有各对象清理算法。现状盘点及“推荐目标状态与owner”为历史；以最终轮次、下方修正后的Job合同和[task实现](../../notes/impls/task.md)分别核目标与现状，不重复启动旧设计门。不可达capability环收集、设备/DMA退休不是当前私有资源回收承诺；新增能力由对应owner另行闭合。
 
 ## 目标与现状
 
@@ -12,7 +14,7 @@ ProcessControl 的查询/终态观察可独立存活；关闭 Control 不等于�
 
 ## 回收结构目标设计（设计轮次 1，已定稿）
 
-经 advisor 审查一次、与 DeepAsh 一轮收敛确定，执行承载为[维护执行定稿](todo-2026-09-29-kernel-maintenance-execution.md#执行机制目标设计设计轮次-1已定稿)。标“用户确认”为用户明确决定，其余为收敛结论。
+经 advisor 审查一次、与 DeepAsh 一轮收敛确定，执行承载为[维护执行定稿](../todo-2026-09-29-kernel-maintenance-execution.md#执行机制目标设计设计轮次-1已定稿)。标“用户确认”为用户明确决定，其余为收敛结论。
 
 ### 现状事实（当前分支核对）
 
@@ -84,7 +86,7 @@ ReleaseHandles 与 RetireSpace 无固有先后，实现按串行推进；反例�
 ## 出生、活性与终局并发
 
 - 进程创建成功前取得稳定回收记录和实际承载；构造中途失败由准备 owner 进入相同的必要子集，不再依赖另一个管理进程补清理。
-- 一旦终止决定不可逆，回收 owner 保持可达。未到停止访问条件时按明确依赖停驻，条件完成后由内核唤醒；没有用户线程时仍由[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)推进。
+- 一旦终止决定不可逆，回收 owner 保持可达。未到停止访问条件时按明确依赖停驻，条件完成后由内核唤醒；没有用户线程时仍由[维护执行](../todo-2026-09-29-kernel-maintenance-execution.md)推进。
 - 正常退出、Kill、fault 等在同一终止 gate 仲裁唯一首因；迟到请求不重置进度，不创建第二份回收 owner。
 - 与创建、Start、能力转移、内存修改的胜负点必须逐项列出；终止只能拒绝尚未获提交资格的操作，已提交结果不能丢失或伪装成失败。
 - 不在进程或 HandleTable 锁内调用可跨对象展开的释放；摘取与锁外执行按公共释放契约交接。
@@ -108,7 +110,7 @@ Job 的创建/封口/递归终止政策在全项目任务模型中可以重审�
 
 ## 依赖与施工门
 
-依赖 [capability 释放](todo-2026-09-28-capability-last-reference.md) 和[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)，并需映射重构给出完整地址空间退休的原语。施工前必须进一步固定：
+依赖 [capability 释放](todo-2026-09-28-capability-last-reference.md) 和[维护执行](../todo-2026-09-29-kernel-maintenance-execution.md)，并需映射重构给出完整地址空间退休的原语。施工前必须进一步固定：
 
 - Process core、Control 与回收记录的具体持有图及准入来源；消除现有 managed/unpublished/finalization 多驱动后唯一执行根的位置。
 - 各阶段依赖列表、锁序、允许并行的操作、最终终态与 Job 成员摘除的线性化关系。
@@ -129,7 +131,7 @@ Job 的创建/封口/递归终止政策在全项目任务模型中可以重审�
 
 ## 设计轮次 2 收敛结论（2026-10，advisor 一次 + LoneCrane 对抗 8 轮）
 
-闭合“剩余设计门”1、4，及 3/6 中与本案相接部分；资金账户见[预算分案账户形状](todo-2026-09-14-kernel-memory-budget.md#对象持有与释放链所需的账户形状收敛结论2026-10-与-lonecrane-对抗-8-轮advisor-一次)。
+闭合“剩余设计门”1、4，及 3/6 中与本案相接部分；资金账户见[预算分案账户形状](../todo-2026-09-14-kernel-memory-budget.md#对象持有与释放链所需的账户形状收敛结论2026-10-与-lonecrane-对抗-8-轮advisor-一次)。
 
 ### 载体：Shell 即 Control
 

@@ -22,6 +22,12 @@ just clippy
 
 所有 QEMU 启动路线自动准备产物目录，并通过 `make_dtb` 从对应平台的 `device.dts` 重新生成 `artifacts/<PLATFORM>/<MODEL>/device.dtb`，无需手动预生成；清理产物后可直接运行 `just virt`。`virt-hetero`、`virt-nofd` 在生成变体 DTS 前同样准备目录；`ERHINO_DTB` 只选择 QEMU 加载的 DTB，不改变标准 DTB 的生成位置。
 
+## 清理构建产物
+
+`just clean-preview` 列出将清理的目录，`just clean`（或 `just c`）执行清理。唯一清单由 [clean-build.py](../tools/clean-build.py) 拥有：三个 workspace 的默认 target、平台 Cargo 缓存、导出的程序/内核/DTB、initfs 和启动包；不按环境变量扩展到仓库外。
+
+运行日志、失败现场、调查快照和验证证据留在 `artifacts/` 各自目录，普通清理不删除它们。确需移除证据时先明确具体目录及其引用，单独执行，不以删除整个 artifacts 代替构建清理。清理应在没有构建、QEMU 或调试任务使用这些产物时进行；重新构建会恢复清单中的产物。
+
 ## Host 测试
 
 纯逻辑 crate 的 host 测试必须显式指定 host target，不能继承 RISC-V 默认 target 去链接 std。当前开发机命令：

@@ -1,53 +1,16 @@
 # Notification 观察角色与统一等待契约
 
-状态：**三角色、共享 ABI、typed owner 与实际消费者迁移已落地；check/clippy/host 通过，core/stress 已取得实际运行证据，N6 注入窗口与专项结构检查收口见末节。** 用户已选择 provider 持有消费责任、向客户端交付只读就绪观察能力的 A 方向，并授权内核重构。本案属于 [OAL/fs/service Watch](todo-2026-10-07-fal-service-redesign.md) 的交付闭包，独立拥有通用内核前置；不以当前代码/开发证据宣告主计划交付。
+状态：三角色、共享 ABI、typed owner 与实际消费者已经接通并交付。本篇保留目标合同与 N6 精确失败/费用窗口的唯一承接；原设计盘点、迁移清单与逐轮验证见[历史快照](archived/ref-2026-10-27-notification-plan-history.md)。
 
 ## 当前接力与范围
 
-- 设计 owner：GrandOwl；协调及主计划 owner：MellowPond；实施 owner：RubyRaven。
-- 盘点基线：`refactor/system-redesign` / `4523bbfe65287f6b84ab73d9f034dae1a526d38d`，加当前未提交的 OAL/fs/service 迁移。其他会话的工作树改动保留。本篇现状表来自源码，不能把整项目矫正区的现状当作目标正确性的依据。
-- 已确认方向：Owner 消费/关闭，Signaler 发送并直接观察接收端关闭，唯一 NotificationObserver 只读观察 READABLE/CLOSED。用户确认的是 A 的责任分配；以下派生 API、命名与类型收敛是据此形成、已由 MellowPond 全文复核通过的详细设计。
-- 本案拥有：Notification 三角色、相关公开观察角色命名、派生授权、共享 ABI、libkernel 类型与真实调用点、Wait/WaitSet 接入、付款和存储保活、通用验证。
-- 主计划拥有：fs/service Watch 请求/回复槽位及运输权限、sequence/pending、Query/Ack/Cancel、控制 Lifetime、终态与业务退款、正式 Watch 消费者及组合验收。本案只声明接入条件，不复制这些协议。
-- 非目标：共享通知接收端协议、badged signaler、逐事件队列、泛型公共 Observer、任意对象的统一观察派生 syscall、WaitMany/嵌套 WaitSet、全对象业务寿命重写、按观察者转移原对象付款、不可信域 metadata 硬隔离。
-- 当前接力：通用三角色、ABI/typed与IPC/Startup/退出消费者及专项结构检查已收口；fs/service同步与异步Watch、流及Copy已由主计划接通，P4完整聚合已通过，N7跨平台/release证据见末节。N6精确失败/费用注入仍按唯一条目保留owner、触发与完成门，不把普通运行升格为N6注入通过；本篇不另排已完成施工，本轮实施结束，代码提交由主计划固定；本篇只继续承接N6，未闭合前不归档。
+本案拥有 Notification 三角色、观察角色命名、派生授权、共享 ABI、libkernel 类型、Wait/WaitSet 接入与付款/保活。fs/service Watch 的业务协议、sequence/pending、Query/Ack/Cancel、控制 Lifetime 和业务退款由[OAL/fs 计划](todo-2026-10-07-fal-service-redesign.md)拥有。
 
-## 设计盘点基线
+Owner 消费/关闭、Signaler 发送并可观察关闭、Observer 只读观察 READABLE/CLOSED 的分工已经确定。通用接线与 N7 跨平台/release 证据已收口，fs/service 的同步与异步 Watch、流及 Copy 已接通；当前唯一后续是 N6，不继续旧迁移。后续由承担本计划的实施者维护证据。
 
-本表中的 rights 是对象上限，实际 capability 还须持相应权限。缩写：R=READ，W=WRITE，Q=WAIT，S=SIGNAL，M=MANAGE，D=DUPLICATE，T=TRANSIT，G=GRANT，C=CREATE，X=EXECUTE。`CLOSED` 强制终止等待与业务信号的区别见后文。
+非目标是共享通知接收端协议、badged signaler、逐事件队列、泛型公共 Observer、任意对象统一派生接口、多对象一次性等待/嵌套 WaitSet，以及不可信域 metadata 硬隔离。
 
-### 可等待对象及 Notification 相邻角色
-
-| 当前公开 kind / 角色 | rights 上限；合法 signals | 创建或派生授权 | 来源、业务终态与最后能力 | 付款及观察保活 |
-|---|---|---|---|---|
-| MailboxReceiver | R/Q/M/G；READABLE、PEER_CLOSED、CLOSED | MailboxCreate，当前进程创建 | MailboxCore 的队列/WaitQueue；最后 Receiver 关闭队列。READABLE 表示可接收队头；PEER_CLOSED 表示当前可投递 sender 数为零，可因新 MintSender 消失 | core、固定环、Receiver 由创建进程 Pool 付款；等待 loan 保活 core，不计 Receiver authority |
-| MailboxSender | W/Q/D/T/G；WRITABLE、CLOSED | Receiver[M] 的 MintSender，独立 sender 身份/badge，附带 Lifetime | 与 Receiver 共用 MailboxCore 来源；CLOSED 是接收队列关闭，不是该 sender 的 Lifetime 终结。最后能力归还 sender count 和 Lifetime authority | sender/Lifetime 由派生进程 Pool 付款；队列保留原 payer；等待 core 不新增发送 authority/use |
-| MailboxOnceSender | W/Q/T/G；WRITABLE、CLOSED | Sender[D]，输出 rights 不超过源；附带 ReplyObservation | 队列来源；发送成功消费授权；放弃发布 Abandoned；结果由独立 ReplyObservation 承载 | Once/结果观察壳由派生进程 Pool 付款；签发同时委托该进程 Pool 支付一次 ABI 有界运输及 Delivery 尾部，失败返还不换 payer；队列 loan 不保活 Pending 业务责任 |
-| ReplyObservation | R/Q/D/T/G；DONE、PEER_CLOSED | MakeSendOnce 原子配对产生 | 独立 SignalSource；Sent→DONE，Abandoned→PEER_CLOSED，互斥且不变。关闭观察不取消 Once、不改变结果；来源通用 closed 不置位 | 壳和 SignalSource 由配对创建进程 Pool 付款；仅数值关联 Once，不反向强持发送业务 |
-| Lifetime | Q/D/T/G；CLOSED | MintSender 原子配对产生；内部 Once 派生 authority，已接受 Delivery 持 use | Lifetime 的 OBJECT_WAIT 域；authority/use 双零才永久 CLOSED。观察 capability 的持有数不计入这两个计数 | 派生进程 Pool；观察只保活域的存储，不保活 sender、消息或业务 use |
-| NotificationOwner | R/Q/M/G；READABLE、CLOSED | NotificationCreate 原子产生 Owner/Signaler | NotificationCore 的 OR pending/WaitQueue；Take 消费位；最后 Owner 关闭 core、清位并发布 CLOSED | core/两角色由创建进程 Pool 付款；core loan 不计 Owner authority |
-| NotificationSignaler（当前不可等待） | S/D/T/G；无 | 与 Owner 配对创建 | OR 置位；最后 Signaler 无关闭 core 的 hook | 角色及 core 强引用只保活存储，不延长 Owner 业务寿命 |
-| NotificationObservation | Q/D/T/G；仅 CLOSED | Owner[R] 或 Signaler[S] 的 NotificationObserve | 同一 NotificationCore；纯观察，不 Take、不关闭 core | 观察壳由派生进程 Pool 付款；core 保留创建 payer，观察强持 core |
-| ProcessControl / ProcessShell | R/Q/M/D/T/G；DONE | ProcessCreate 的 Job[C]+Pool[C]；JobDerive 按领域权限派生 | Shell 的 SignalSource；Body/VM 退休屏障后 DONE，非来源 closed；关闭 Control 不杀进程 | 所选进程 Pool 支付 Shell/来源等；等待只保活观察来源，不能保活 Body 私有资源 |
-| ThreadControl | Q/D/T/G；DONE | ThreadCreate 随线程产生，与 affine ThreadStartTicket 分开 | SignalSource；执行离场及相关访问/结果责任收束后 DONE；关闭观察壳不承担启动或停止线程 | 线程所属进程 Pool；Control 不强持执行 Thread，来源保留真实费用 |
-| Job | C/M/R/Q/D/T/G；CLOSED | JobCreate 的 parent Job[C]+Pool[C]；JobDerive | SignalSource；封口后的域收束发布 CLOSED；丢弃控制能力不等于 Seal/关闭整个域 | 创建时指定 Pool；观察来源与 Job 业务所有权分开，源存储付费到释放 |
-| MemoryObject | R/W/Q/M/D/T/G/X；EXECUTABLE | MemoryObjectCreate 使用调用进程 funding Pool，无输入 Pool capability；Seal 需 M | MemoryObjectCore/WaitQueue；完成封存后 EXECUTABLE。最后 capability 归还 backing owner，观察引用不代替 backing 使用授权 | 调用进程 Pool 支付 core、backing 及对象壳；source loan 保活 core 的观察存储，实际 backing 退休按内存契约 |
-| TunnelEndpoint | R/W/Q/S/M；DATA、PEER_ATTACHED、PEER_CLOSED、CLOSED | TunnelCreate 要 Pool[C]；另一侧 Attach 消费 Invitation[M]，输出权限取邀请与 Endpoint 上限交集 | Endpoint 的来源受 Connection 同步域保护；最后 Endpoint 关闭本侧、通知对侧；两侧都关才交还 backing owner | Create 指定 Pool 支付 backing/Connection/首侧；Attach 调用进程 Pool 支付新 Endpoint/WaitQueue；来源强引用不等于 Endpoint authority，不反向保留 private retirement Work |
-| WaitSet | R/Q/M/G；READABLE、CLOSED | WaitSetCreate；Register/Remove 要 M，Receive 要 R | 集合来源；候选队列决定 READABLE，Receive 逐源复查；最后 capability 关闭准入并自主分批拆成员 | 集合 Pool 支付 core/成员/索引，Receive 调用者 Pool 支付 scratch；成员 loan 保活来源至 detach；WaitSet 不得作另一集合的成员 |
-
-源码入口：[mailbox](../os/kernel/src/task/mailbox.rs)、[lifetime](../os/kernel/src/task/lifetime.rs)、[notification](../os/kernel/src/task/notification.rs)、[shell](../os/kernel/src/task/process/shell.rs)、[thread](../os/kernel/src/task/thread.rs)、[job](../os/kernel/src/task/job.rs)、[memory_object](../os/kernel/src/task/memory_object.rs)、[tunnel](../os/kernel/src/task/tunnel.rs)、[wait_set](../os/kernel/src/task/wait_set.rs)。关键定位：Mailbox roles 474/538/604/698，Lifetime 191，Notification 202/221/233，ProcessShell 903，ThreadControl 61，Job 691，MemoryObject 268，Endpoint 202，WaitSet 424。行号是本次盘点位置，施工以符号为准。
-
-全仓 `impl KernelObject` 盘点还覆盖 MemoryPool、ProcessBuilder、ThreadStartTicket、TunnelInvitation、Delivery、SystemReset：它们当前 `allowed_signals` 为 None，不纳入等待角色改造。Delivery 虽不可等待，却持 LifetimeUse；不能把不可等待误写为没有业务寿命责任。
-
-`CLOSED` 表示来源不可逆关闭，WaitOne/WaitSet 在 `Snapshot.closed` 时强制附加该位，不要求 interest 含 CLOSED。`PEER_CLOSED` 仍是领域电平：Mailbox 的无 sender 可消失；ReplyObserver 的 Abandoned 不可变；Endpoint 对端关闭不可逆且可能与本端 DATA/CLOSED 共存。DONE/EXECUTABLE 也是各自业务屏障，不据名字改写成来源关闭。ProcessBuilder 等的内核内部完成来源不因此成为用户可等待对象。
-
-### 已确认的实现缺口与资料偏差
-
-1. 当前 Notification Owner 无 DUP/T，Signaler 无 Q，Observation 只能看 CLOSED，确实无法交付 Watch 要求的可运输 READABLE 观察角色。service provider 目前给 Owner 请求 DUP/T，真实建立失败。
-2. `notification::observe` 没有现行业务调用者；现存调用链是 shared 调用号→syscall dispatch→内核实现及 libkernel raw/safe 封装。没有独立的 Owner→CLOSED-only 授权消费者需要保留。
-3. 当前 HandleDescription 不含 signals 或 allowed_signals；`notes/impls/ipc.md` 对该字段的描述有偏差。本文不据文档假设存在权限查询能力。本案采用静态角色集合，不增加该字段；实施时修正实际说明。
-4. `libprocess::context::adoptable_kind` 未包含当前 kind 20。Observer 保留 GRANT 能力就必须接通启动交付的收编，不能只验 IPC。
-5. 主计划已承接 Watch Ack 的空 Take 幂等问题、永久 Signal 错误重试及最终维护唤醒；本案不另建一份修复清单或以通用角色完成关闭这些条目。
+下表缩写：R=READ、Q=WAIT、S=SIGNAL、M=MANAGE、D=DUPLICATE、T=TRANSIT、G=GRANT。来源的 CLOSED 是不可逆关闭；领域 PEER_CLOSED、DONE 与 EXECUTABLE 按各自业务事实解释，不因名字相近合并。
 
 ## 统一角色模型与收敛选择
 
@@ -126,7 +89,7 @@ Signal 和 Take 继续在同一个 NOTIFICATION 同步域线性化；Owner Close
 
 `KernelObject::allowed_signals` 继续由角色给出静态集合，`wait_source` 返回同一 core 的 ObservationSource。WaitOne 和 WaitSetRegister 都先验证 handle 的 WAIT、非空合法 interest 及其属于 allowed_signals，再取得 source loan。Signaler 的 READABLE 请求在此被拒；Observer 的 READABLE/CLOSED 走普通路径，不能在 WaitSet 加 Notification kind 特判。
 
-沿用[等待源分案的轮次5](todo-2026-10-02-wait-source.md#设计轮次-5轮次-4-定向修正用户裁决禁止嵌套-waitset)：来源只提示，节点 owner 自摘，扁平集合，当前电平复查，无 Rearm/事件结果队列。本案替代该计划末节关于“Signaler 不可等待、Observe 仅 CLOSED”的角色约定，不改其通用等待机制。
+沿用[等待源分案的轮次5](archived/todo-2026-10-02-wait-source.md#设计轮次-5轮次-4-定向修正用户裁决禁止嵌套-waitset)：来源只提示，节点 owner 自摘，扁平集合，当前电平复查，无 Rearm/事件结果队列。本案替代该计划末节关于“Signaler 不可等待、Observe 仅 CLOSED”的角色约定，不改其通用等待机制。
 
 ### Take、复查与不丢持续就绪
 
@@ -173,34 +136,9 @@ Owner 唯一消费角色不等于只有一个执行线程可以调用它。provi
 - 不提供公开安全的“已验证”构造器绕过 kind 检查。工厂内部构造限制在 crate；确有原始边界时使用已有 unsafe raw 调用并写明 ownership。
 - `call::sys_notification_*` 保留 ABI raw 层，用于正式底层夹具及明确原始边界。安全 `ipc::notification` 只保留 typed 工厂/角色操作，删除旧裸 HandlePair 工厂形状及接受裸 Handle 的 signal/take/observe 函数；普通生产消费者整体迁移到 typed API，低层验收显式使用 raw 层。
 
-### 实际迁移清单
-
-下表按本轮 rg/源码结果登记；实施前再次枚举确认同期主计划新增消费者，不能只改直接出现旧 enum 名的文件。
-
-| 位置 | 迁移责任 |
-|---|---|
-| `shared/erhino_shared/src/{object,call}.rs` | 三个公开 kind 改名，0x3d 改名/参数合同，合法 rights/signals 注释；编号与结构布局断言同步 |
-| `os/kernel/src/{syscall.rs,task/notification.rs}` | MintObserver、Owner MANAGE、输出 WAIT/子集校验、三角色静态集合、共同来源与身份、实际付款/回滚 |
-| `os/kernel/src/task/{lifetime,mailbox}.rs` | Lifetime 的公开 kind 改名；Reply 壳及 kind 改名，保留内部 Lifetime 与结果/计数语义 |
-| `os/kernel/src/task/{object,wait,wait_set}.rs` | 核对统一授权/来源入口；仅在确有重复校验缺陷时共用修复，不加观察角色分流；保留扁平限制 |
-| `user/libraries/libkernel/src/{call.rs,ipc/notification.rs,ipc/message.rs,ipc.rs}` | raw ABI、typed Notification/两个配对 Observer、公共出口；完整失败 owner |
-| `user/libraries/libprocess/src/context.rs` | `adoptable_kind` 的 kind13/18 改名和 kind20 接入；不把本案扩大为所有未使用 kind 的收编重构 |
-| `user/libraries/librpc/src/{exchange,caller,dispatcher}.rs` | Request/OperationState/Sent 对 ReplyObserver 的所有权接力；wait 引用不改变结果/取消语义 |
-| `user/libraries/libexecution/src/wake.rs` | NotificationWake 持 typed Signaler；接纳未知 Capability 时只通过 typed 转换 Query 一次，并使用其返回描述验证 SIGNAL，不再重复 kind 查询。保留 bit 非零、关闭处理等执行领域政策，不把“正确 kind”误当作已获 SIGNAL |
-| `user/libraries/libfs/src/grant.rs` | Prepared/已安装 grant 的 LifetimeObserver 类型及交接，清理回执先于关闭/退款 |
-| `user/libraries/libservice/src/{root,provider}.rs` | LifetimeObserver 持有与来源；Watch 的 Notification typed 接入按主计划分工 |
-| `user/services/srv_fs/src/server/{boot,lifecycle,family,services}.rs`、`server.rs` | 出生/退休通知 typed 持有、能力容器边界及实际 Lifetime 来源 |
-| `user/services/srv_init/src/{main,supervisor,filesystem,public_ipc,time_checks,race}.rs` | 普通通知创建/消费与监督交付迁移；保留原始 ABI 夹具用途，改用明确 raw 层；补 NotificationObserver 的启动交付 |
-| `user/services/srv_pm/src/main.rs`、`user/tests/{test_fal,test_target,test_hammer}/src/main.rs` | 正式通知消费者/验收目标迁移；测试端使用实际新角色，不伪造能力。test_fal 随主计划 P4 改名 test_fs，届时按新路径与新组件名接续，不保留旧名兼容消费者 |
-| `user/libraries/{libfs,libservice}/src/{client,provider,watch}.rs` 的实际存在文件及主计划新建 Watch 文件 | provider 使用 Owner[M] 铸造真实 Observer；客户端唯一转换边界；不在本案重定义领域消息结构 |
-| `notes/impls/{ipc,task,framework,runtime,fs,service}.md` 及实际引用篇 | 实施后按机制拥有篇更新当前面貌、命名和付款；修正 HandleDescription 字段误述；不提前回填目标行为 |
-| 活跃等待源/对象链计划中的当前入口 | 链接本案接管的角色契约；保留历史轮次/归档当时名称，不批量重写历史证据 |
-
-`libprocess::management/supervise/observation` 的 Observation 表示用户态等待请求/结果，不是 ReplyObservation capability，不做同词批量改名。`LifetimeOwner/LifetimeUse`、内部 `Lifetime` 同样保留。libexecution 的通用 SourceRegistration 不需认识 fs/service、Observer 子类或业务 Ack。
-
 ## 消费者与验证门
 
-验证按[构建手册](BUILD-AND-TEST.md)执行；下表拥有验证合同，实际实施证据由末节工作记录拥有。优先扩展现有 srv_init/public_ipc、time_checks、race 和正式 srv_fs/test_fal 路线（test_fal 随主计划 P4 改名 test_fs 后按新名接续），不新增专用测试服务、临时消费者或模拟内核。
+验证按[构建手册](BUILD-AND-TEST.md)执行；下表拥有验证合同，实际实施证据由末节工作记录拥有。优先扩展现有 srv_init/public_ipc、time_checks、race 和正式 srv_fs/test_fs 路线，不新增专用测试服务、临时消费者或模拟内核。
 
 | 门 | 独立契约与要捕获的错误 | 验证边界 |
 |---|---|---|
@@ -217,104 +155,18 @@ Owner 唯一消费角色不等于只有一个执行线程可以调用它。provi
 
 持续就绪活性、并发安装和所有失败窗口不能仅由一次 QEMU 通过推定。无法通过现有设施运行的内部窗口记录精确 owner、审计证据和未覆盖部分；不得将“设计上应当成立”列为执行通过。
 
-## 施工顺序、删除门与完成条件
+## 证据与当前限制
 
-1. **已完成设计复核与依赖对齐**：MellowPond 全文复核通过，主计划已链接本案并将 Watch 槽 1 定为 NotificationObserver；两篇各持唯一契约。
-2. 同一责任链迁移 shared 名称/ABI、kernel 三角色/派生/身份、libkernel owned 类型及全部实际消费者。编辑可按依赖顺序，不能把中间编译通过当作阶段交付；不留旧 Observe、旧 Observer kind alias 或假 Waiter。
-3. 将 NotificationObserver 接入已有 Wait/WaitSet、IPC、启动交付和 Watch；保留 Mailbox/Lifetime/Reply 的原业务语义，完成 owned 类型传递及失败清理。
-4. 按 N1—N8 验证并执行[交付前结构检查](REVIEW.md)，更新当前 impls、本篇与主计划各自证据；主计划独有的 Ack/终态/维护问题在该计划关闭。
-5. 核对资源/权限/正常失败/取消退出、旧路径删除、真实消费者及文档。通用前置可按自身 N1—N7 独立说明完成，但主计划仍以 N8 及完整 Watch 合同为门；不得把“内核有新角色”报告为系统 Watch 已完成。
+N1—N5 的真实角色、就绪、运输、Startup 和 Owner 退出已运行；持续就绪与注册交错另有 host/源码依据，不外推所有调度。N7 的公共 IPC/时间/等待/进程/内存及 stress 矩阵随下游完整组合取得证据，N8 的 fs/service 同步与异步 Watch 由主计划拥有。原开发轮 core/stress 的退出 1 保留为旧锚点失败，后续 P4 组合成功不覆盖改写原结果。
 
-删除门：代码中不再有旧 `NotificationObserve`、公开 `NotificationObservation`/`ReplyObservation`/`ObjectKind::Lifetime`、从 Signaler 派生关闭壳、Owner DUP/T 的 Watch 伪路径；内部 Lifetime 及历史档案不在删除范围。不存在用动态 signals mask、控制 sender 可写、定时轮询或回调消息来冒充只读就绪角色的替代出口。
-
-## 设计移交时的证据与未完成事项
-
-已完成：源码盘点、现有等待/付款合同核对、三角色及公共命名设计、ABI/typed 迁移和验证门起草；MellowPond 已全文复核通过并完成主计划链接与 Watch 槽位对齐。设计交 RubyRaven 实施。
-
-文档检查：本篇 15 个本地链接及标题锚点核对通过，围栏与行尾空白检查通过；现状表已与独立只读盘点交叉核对，并亲读修正 MemoryObject/Tunnel 的付款入口。没有运行编译、host 测试或 QEMU。
-
-设计移交时未完成：代码迁移、实现结构检查、所有 N1—N8 执行证据、impls 实现回填；当前状态从后续实施记录接手。现有 OAL/fs/service 未提交改动及 Watch 接线进度继续由主计划承载；原通知方案待裁决阻塞已解除，按本前置依赖恢复施工。没有本案新增的临时实现或未登记兼容结构。
-
-本案不改变硬件/寄存器调用约定，使用现有 shared syscall 编码、uaccess 和等待基础合同。已阅读[外部契约索引](../references/CONTRACTS.md)；此前 QNX/seL4/Zircon 对照仅是设计参考，不充当本案已完成的固定版本外部契约取证，也不据此新增硬件假设。
-
-### 实施工作记录：角色迁移与开发证据（2026-10-10，RubyRaven）
-
-**基线与范围。** HEAD/分支仍为 4523bbf / refactor/system-redesign，前三批及第四批的 staged git mv/dirty 改动完整保留。本轮先完成主计划 R04 六项及 OOM 清理记录，再实施本案；没有 commit/stash/reset/push，严格 QEMU 脚本未改。实施前重新枚举的 inventory 为 artifacts/service-p3-batch4/notification-consumers-baseline.txt 与 observer-owner-fields-baseline.txt；raw/旧名/删除侧复核存 artifacts/notification-observer/。实际工具链 rustc 1.100.0-nightly c54751567b19c4ceb08b0412d83529c2568cba8b / host aarch64-apple-darwin，LLVM 23.1.0（toolchain.txt）。
-
-**成组迁移。**
-
-| 切面 | 当前源码与责任 |
-|---|---|
-| shared/kernel | 三个公开 kind 在 13/18/20 原位改名；0x3d 改 MintObserver，参数为 Owner/M、完整 u64 rights、输出指针。Owner header 移入 core，三角色 related_id 指同一 core 身份；Signaler 可获 WAIT，只看 CLOSED，Observer 看 READABLE/CLOSED。来源仍只有原 WaitQueue/Work/NOTIFICATION 锁，WaitOne/WaitSet 无新特判 |
-| mint/失败 | Authorization 接受 MANAGE，核 Owner kind 及输出必需 WAIT/静态子集；表锁外 clone core，不加 Owner holders/use。调用进程 Pool 支付实际 Observer Arc，KOID/分配/额度失败沿局部 owner 退回；handle::install 预约、锁外输出、必成 commit，写回失败 rollback/release_all，不清原 pending、不复活已 CLOSED core |
-| libkernel | 五个独立 named typed owner：NotificationOwner/Signaler/Observer、LifetimeObserver、ReplyObserver。private capability_role 宏生成静态 role owner 的相同采用/转换/close 责任，无公共泛型 Observer 类型；unknown Capability 的 from_capability Query 一次，失败 RoleAdoptFailure 返原 owner，Observer 必需 WAIT；from_minted 限 crate，工厂不重复 Query，无 Clone |
-| ABI 夹具出口 | call 模块保持私有，按 libkernel 既有 root 导出惯例只公开四个 sys_notification_*，全部 unsafe fn，均写 # Safety 的借用、有效输出及成功后唯一关闭责任；安全 notification 模块只提供 typed 工厂/角色方法，没有裸 Handle signal/take/observe |
-| 真实消费者 | RPC Request/OperationState::Sent/Dispatcher 持 ReplyObserver；fs Grant/服务 Root/Request 持 LifetimeObserver；NotificationWake 用 typed Signaler，采用描述同次检查 SIGNAL 与非零 bit；srv_fs Release/Retire 持 typed Owner；init RootSupervisor ledger 保存实际两个角色，生产驱动只借 ledger 中 typed owner；pm、独立消费者、target/hammer 采用真实通知角色 |
-| IPC/启动/退出 | libprocess::context 接纳 kind20；现有 public_ipc 正式线程/Packet 用例覆盖 Observer 运输，现有 test_target 与自动退休用例覆盖带 GRANT 的 kind20 Startup 收编。退休源 Owner 直接授予子进程，父方只留 Observer/Signaler；真实 Kill/DONE 后两者看 CLOSED，Signaler Signal=ObjectClosed，不依赖子进程续调 |
-| 文档/业务接缝 | ipc/framework/runtime 实现篇回填身份、静态集合、typed/付款及真实退休 owner；活跃 wait-source 当前入口链接本案，不批改历史轮次。service Watch provider 持 Owner[MANAGE] 铸造真实 Observer，客户端 typed 采用，领域控制运输与 N8 证据由主计划记录 |
-
-**删除清单。** 本案没有删除整个新文件或引入兼容 adapter。删除旧 Observe 的 Owner[READ]/Signaler[SIGNAL] 两出口、旧 CLOSED-only 壳、旧自由函数 signal/take/observe 与裸 HandlePair 的安全工厂结果，全部实际消费者同步迁移。Lifetime/Reply 旧公开名删除，内部 Lifetime/LifetimeOwner/LifetimeUse 与 libprocess Observation 保持。删除侧精确账见 migration-numstat-final.txt（共享 ABI、kernel、libkernel 及此前未修改的 typed owner 消费文件）；主计划已 dirty 的 main/fs/service 及旧 FAL 删除统计不冒充本案新增删除量。
-
-```sh
-rg -n 'NotificationObserve\b|NotificationObservation\b|ReplyObservation\b|ObjectKind::Lifetime\b' shared os user
-```
-
-退出 1，deleted-names.txt 为 0 行；使用词边界避免将新 NotificationObserver 误匹配为旧调用名。raw-call-sites.txt 逐调用记录仅 libkernel 工厂/声明/导出及明确的 main/public_ipc/race ABI 夹具。对 libraries 排除 libkernel，再加 srv_fs/srv_pm/drivers/test_fal/test_target/test_hammer 与 init 的 supervisor/filesystem/time_checks 检索 sys_notification_* 为零；生产通知消费者没有 raw 调用。main 的裸别名/StaleHandle、transit、Owner 负向、MailboxFull 和持久 WaitSet，race 的发令枪属既有明确原始夹具；每处都有 SAFETY，不加安全裸 handle facade。
-
-**验证命令与退出码。** 下列日志前缀统一 artifacts/notification-observer/；host 与自定义 RV64 分开。
-
-```sh
-just check
-just clippy
-just --command bash -c 'cd user && cargo check --workspace --bins --exclude test_fp --features srv_init/acceptance-stress --target platforms/riscv64imac-unknown-erhino-elf.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem'
-just --command bash -c 'cd user && cargo test -p libkernel -p librpc -p libprocess -p libexecution -p libfs -p libservice --target aarch64-apple-darwin'
-just --command bash -c 'cd os && cargo test --workspace --exclude kernel --target aarch64-apple-darwin'
-just --command bash -c 'cd shared && cargo test --workspace --target aarch64-apple-darwin'
-just --command bash -c 'cd user && cargo clippy --workspace --bins --exclude test_fp --features srv_init/acceptance-stress --target platforms/riscv64imac-unknown-erhino-elf.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem -- -D warnings'
-just virt
-just virt-stress
-```
-
-| 证据 | 日志 / 退出码 / 边界 |
-|---|---|
-| kernel check | kernel-check.log，0；user Rust type migration 不改变此后 kernel 代码 |
-| 七分面 lint | clippy2.log 与 artifacts/lint/，0，shared/os/user host、kernel/user target、stress、独立gc；初次误公开全 call 导致无关 raw API 缺 Safety 的 clippy1 失败已修为只导出四个明确接口，不加 lint allow，失败保留 |
-| RV64 workspace stress check | user-check6.log，0；编译断点中的 types/import/fixture 语法失败日志保留，不用 adapter |
-| 受影响 host | user-host-tests.log，0：execution33/fs23/kernel6/process4/rpc16/service11，另既有 process 文档用例2；os-host-tests.log/shared-host-tests.log 均0。没有 fake Kernel role 或新测试服务 |
-| 最后夹具补证 | N4 增加“全部 Observer 已关闭仍保留原 pending/Owner”真实断言后，user-target-final-fixture.log 0；只补受影响 target lint 和 virt2，不重跑未受影响的通过项 |
-| core | virt1.log / virt2.log 均1；guest分别 artifacts/failed-acceptance-20261010-092956-28815.log / failed-acceptance-20261010-093610-33881.log。guest实际新角色/业务和reset完成；严格验证器缺旧FAL2 Open control and terminal cases passed after 16384 bytes，属主计划 G05-20 的 init exercise_open_streams/StreamControl，不能把命令1写成通过 |
-| stress | virt-stress1.log，1；guest artifacts/failed-acceptance-20261010-093106-30013.log 已完成新角色、Startup/Owner退出、256登记自动退休、16/16竞态矩阵和reset；同一 G05-20 锚点使严格路线失败，脚本未改、不放宽、不重建旧协议 |
-
-**N1—N7 按门的证据边界。** 下表中的实际锚点来自上述完整 guest，core-anchors.txt/stress-anchors.txt 为检索摘要；单次 schedule 不冒充所有内部交错。
-
-| 门 | 实际运行证据 | 仅源码/编译/host | 缺口 |
-|---|---|---|---|
-| N1 | core/stress 的 Notification observer roles passed：缺M、输出缺WAIT/越权/未知位、Observer无Take/Signal/Mint、Signaler非法READABLE的WaitOne/WaitSet、Mailbox[M]错型、identity及负向后pending存活；既有 capability badge/affine owner用例核Owner运输拒绝 | 静态三集合与通用 WAIT 校验，源码无WaitSet角色特判，root四raw接口unsafe | 未单独注入Close先于接受的每个失败时点；属于共同解析和N6窗口 |
-| N2 | 同一锚点：两个真实用户线程与两个Observer、预先置位后登记、部分Take仍READABLE、全清后Receive空、新Signal再次可见、不消费观察 | capability signal host既有轮次/插入边界/瞬态电平测试全部通过 | 任意线程排序不能由一次实际运行穷尽；没有承诺逐事件日志 |
-| N3 | 同一锚点两个持续成员Receive(1)轮转、清空后撤候选、cap关闭后来源loan仍看CLOSED、Remove/集合Close；WaitSet persistent levels...锚点及stress256登记/16矩阵 | 共同候选复查/hint/唯一detach无代码特判；existing signal/table/Runtime host | 查询中hint精确内部窗口由既有host+源码支撑，未用GDB单次暂停作公平或计时证明 |
-| N4 | core新夹具核全部Observer关闭不清pending/不终止Owner；Observer/Signaler/loan存活时最后OwnerClose仍CLOSED。stress Notification observer process exit passed，子进程Owner经真正Kill/DONE自主关闭，父方Observer/Signaler仍活，Signal=ObjectClosed | Owner Terminal holders与存储Arc/loan分离；Take关闭竞争返回ObjectClosed分支核源码 | Take已接受后与最后Close插入的精确窗口未单独强迫；普通已关闭表项只返回共同解析错误 |
-| N5 | core Packet运输及Duplicate裁剪、错型采用返owner/缺WAIT拒绝；stress pid21 Notification observer startup grant passed，kind20经真实ProcessGrant/StartupContext交付并与Owner源身份配对 | Adopt失败完整Cap返还；from_minted crate-only，无公开已验证构造/Clone；context kind20实际迁移 | 公共IPC kill夹具的post-ready日志可被正常Kill竞争省略，不据此声称缺执行；stress用例先完成采用/身份检查再发布ready，已有确定锚点 |
-| N6 | 当前运行的负向签发后pending/Owner正常，以及邻接IPC退出/退款锚点；不能据此推定全部mint费用失败门通过 | 亲读Authorization/MetadataCharge/Arc.try_new/KOID/handle.install：源接受不增holder，观察壳由调用者实际付款；reserve失败release_all，写回失败rollback/release_all，Frozen commit沿最后事件释放，core最后引用/来源Work前不提前退款 | 未注入mint-specific QuotaExceeded/OutOfMemory/KOID耗尽、输出fault/安装Frozen、接受后Close窗口，也未单独测观察壳/source费用逐项退款。现有公共Pool/IPC设施没有可直接复用的这些观察mint时点；不在init自己制造output fault，不新建故障服务。owner RubyRaven/协调MellowPond；稳定隔离故障或正式Pool饱和设施出现、或相关故障暴露时，用真实子进程/原设施补证，失败保原业务、全部实际owner释放后退款为标准 |
-| N7 | 原core/stress shared Sender、Once/Delivery/Lifetime、threaded Receive、public time、committed IPC kill、WaitSet、监督/Job、Tunnel/内存及16/16矩阵均继续运行至reset；P4完整acceptance3另已通过debug stress/release/sifive_u/nofd及Boot/IPI/VM故障路线，证据见末节 | typed只改独立观察owner/公开命名，内部Lifetime计数/Reply结果及相邻等待实现不变；check/clippy/host均通过 | 跨平台/release/完整聚合缺口已补齐；N6精确mint费用/失败时点仍按本篇唯一条目保留，不由这些路线代替 |
-
-**三类覆盖与交付边界。** 已实际跑到：Notification typed/真实IPC/Startup与Owner退出、service WatchName Query→重读/GetEntry/Ack/旧Ack/Replace/Withdraw与两个provider退休；已编译但没有对应新行为运行：fs Watch客户端 typed采用（provider仍Unsupported）、其他已编码但未接通领域请求。流/Copy/Bind与G05能力继续由主计划唯一登记，本案不核销。现有正式Watch消费者同步调用：等待WaitOne已返回后才发Query等RPC，没有持续Observer登记跨在途RPC，也没有新增异步Watch runtime；未来/第五批实际异步客户端须按主计划保留在途责任并暂移来源，不用纯电平重复Receive冒充业务工作。
-
-没有本案新建容器：core原WaitQueue/Work单份；每次Mint只新增真实Observer Arc及共同handle预约。用户typed壳内嵌Capability、不分配；消息/WaitSet已有独立prepare容量/资金owner不变。本轮格式化触及的boot/startup/tar无关差异已逐hunk撤回，不reset其他任务。本篇专项辅助review与主实施者REVIEW核对完成后追加结果；N6执行缺口不冒称已测，不归档，不登记整个系统Watch完成。
-
-**交付前结构检查。** 主实施者按 REVIEW 核对 ABI 两侧、静态角色与权限/输出完整mask、唯一core header与related_id、Authorization/BodyLease不增业务holders、源码锁序/每step一候选、实际付款与所有安装失败owner、五named typed采用/复制/close及RPC/启动交接、旧出口零匹配和当前impls。未发现本案需要代码修复的可达缺陷；没有新增通用wrapper/动态mask/WaitSet特判/原地Observer遍历/Kernel线程或双ABI。专项只读辅助review（sub-7，134s）独立核对Notification、五角色边界、付款/install回滚、RPC/Lifetime持有、Wake和kind20采用，结论无有证据支持的可达缺陷；它未重跑测试，未把stress纳入其报告，实际stress证据由主实施者上述记录承担。该辅助审查不是固定提交的独立Review，不替代本次主实施者检查或N6补证。
-
-业务检查发现的WatchControl原账户付款遗漏 W04-01只登记在主计划，属于下一批Watch剩余；不扩进通用Notification前置，也不将service开发锚点写成N8全合同交付。N6未注入时点已列owner/触发/验证门，本案保持活跃、不归档。工具进程检查确认本轮QEMU/throttle/acceptance全部结束，无保留常驻进程；git diff --check通过，本轮新增文档链接/锚点与表格另核对。
-
-### P4 下游聚合证据回填（2026-10-11）
-
-主计划已接通fs/service同步与异步Watch、流及Copy、可信domain/execution付款、A/B控制及终态壳；原W04-01遗漏已沿主计划通用付款与W04-02真实多账户闭合。test_fal已改为test_fs，目录/package/target/crate/启动/initfs同步，无别名；以上原批次记录保留当时证据，不继续作为当前施工入口。
-
-`just acceptance`第三轮完整exit0，784.97s含构建与全部路线；主证据 artifacts/p4/acceptance3.log/.exit/.elapsed、acceptance3-summary.json。debug stress/release/nofd和VM fault完整stress正常reset，sifive_u完整core后reset accepted→明确reset failed、按原allow-timeout规则收割，required/rejected均0。Notification真实角色、相邻IPC/等待/监督/退款锚点随正式负载回归；stress16/16及256登记保留。Boot panic/alloc/fatal的4hart Gate Failed、真实SBI IPI失败后的稳定停驻、VM发布真实RetryFault和外部模拟repair R/W/X/repeat/uaccess均通过；路径与边界由[主计划P4聚合记录](todo-2026-10-07-fal-service-redesign.md#p4-锚点裁决实施与聚合验收2026-10-11)及结构化证据拥有，不复制注入设计。
-
-N7原“跨平台/release/完整acceptance未执行”缺口现已补齐。N6 mint-specific Quota/allocator/KOID/输出fault/Frozen/接受后Close及观察壳逐项费用没有新增精确注入，仍保留原唯一owner、触发与完成门；公共VM/Boot故障不能替代该窗口。主计划已完成P4交付前结构检查、旧路径删除及impls回填，专项无新增可达finding；本篇N6未闭合前不归档。所有本次工具进程已退出，无常驻QEMU/GDB，未commit/push。
+完整命令、版本和各门限制见[逐门证据](archived/ref-2026-10-27-notification-plan-history.md#实施工作记录角色迁移与开发证据2026-10-10rubyraven)与[后续聚合](archived/ref-2026-10-27-notification-plan-history.md#p4-下游聚合证据回填2026-10-11)。本次文档整理没有补跑这些路线。
 
 ### N6 注入前置再核（2026-10-11）
 
-GrandOwl 在主计划提交前收敛中亲读 notification::mint_observer、handle::install/close、既有 init public_ipc/Pool 场景、test_target 与 tools/check-*。Mint 的 metadata/observer 壳付款固定为 thread.process.funding_pool；现有 test_pool_budget 的可指定 Pool 负向是 Invitation 创建，不能把它当成 Notification mint 的费用证明。test_target 现有入口用于 IPC kill 与退休，不含隔离的 mint 失败/费用观测场景；现有 GDB 工具分别固定 Boot/IPI/VM 故障点，没有 observer MetadataCharge、allocator、KOID、handle reserve/install 或 uaccess 写回点。
+N6 尚未覆盖 mint-specific QuotaExceeded、OutOfMemory、KOID 耗尽、输出 fault/安装 Frozen、接受后 Close 及观察壳/source 费用逐项退款。负向权限检查后 pending/Owner 正常，或其他 Pool/IPC 的退出退款，均不能替代这些时点。
 
-N6 精确窗口仍保留，不靠在 init 主进程耗尽资源或制造输出 fault 来补证。具体前置是：在现有隔离目标/正式注入设施上准备可控的 Mint 失败点、付款域及释放后的费用观察，能区分 observer 壳、core、handle 元数据、WaitSet source 与待维护引用；各接受/失败点恢复后继续观察原 Owner/pending（进程已被真实 fault 终止则按进程退出契约核 owner 收束），最终按实际物理退出核退款。该设施出现或相关真实故障暴露时补证；本案不新增测试专用服务、内核测试 ABI 或全局 KOID 耗尽。合法普通 owner 的 Handle Close 当前不分配、Claimed 也必成，其资源性失败假设不适用；不能用伪造 stale handle 的错误替代 mint 并发接受/源关闭窗口。当前复核由 GrandOwl 记录，后续 N6 仍由本案承接，不向信息协作代理派发编辑。
+Mint 的观察壳费用来自调用进程 funding Pool；普通可指定 Pool 的 Invitation 负向测试不证明它的付款行为。2026-10-11 的设施核对没有得到隔离的观察派生失败/逐项费用接点，原调查仅作为当时依据，不据旧工具清单否定未来设施。
+
+触发条件为已有隔离目标/正式设施能控制 Mint 失败并观察实际费用，或出现相关真实故障。触发后区分 observer 壳、core、handle metadata、WaitSet source 与维护引用，分别观察失败后原 Owner/pending 及真实释放后的退款；若进程因真实 fault 终止，按退出合同观察收束。当前不在 init 主进程制造输出 fault、不耗尽全局 KOID，也不为补证另建测试服务或内核测试 ABI。
+
+合法普通 owner 的 Handle Close 不分配且 Claimed 也可关闭，不能用 stale handle 错误代替并发接受/源关闭窗口。本篇在 N6 闭合前保持活跃，不把普通组合成功写作精确注入完成。

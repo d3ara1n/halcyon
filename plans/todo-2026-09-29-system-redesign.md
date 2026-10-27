@@ -31,12 +31,12 @@
 | ideas 范围 | 本轮已确认内容及直接依据 | 尚未闭合的详细设计 | ideas 审定 / 代码状态 |
 |---|---|---|---|
 | `kernel.md` | 自主推进、费用预算与有限服务机会：[维护分案](todo-2026-09-29-kernel-maintenance-execution.md) | 可靠物理执行计量、响应目标与争用优化是条件后续，内核拼装已完成 | ideas未整篇审定 / 对象链维护范围已实现验证 |
-| `object.md`、`kernel-interface.md` | Close与完成分离、对象/rights、最后持有与返还预约：[capability分案](todo-2026-09-28-capability-last-reference.md) | 当前授权接受/安装/运输接缝已闭合；不可达环收集非当前承诺 | ideas未整篇审定 / 对象链权限范围已实现验证 |
-| `task.md`、`bootstrap.md`、`execution-context.md` | 自动回收、出生准入、Start、Job封口与授权：[进程分案](todo-2026-09-29-process-automatic-reclamation.md) | 当前进程/Job/资金/VM接缝已闭合；新设备退休和更强回收保证另行设计 | ideas未整篇审定 / 对象链任务范围已实现验证 |
+| `object.md`、`kernel-interface.md` | Close与完成分离、对象/rights、最后持有与返还预约：[capability分案](archived/todo-2026-09-28-capability-last-reference.md) | 当前授权接受/安装/运输接缝已闭合；不可达环收集非当前承诺 | ideas未整篇审定 / 对象链权限范围已实现验证 |
+| `task.md`、`bootstrap.md`、`execution-context.md` | 自动回收、出生准入、Start、Job封口与授权：[进程分案](archived/todo-2026-09-29-process-automatic-reclamation.md) | 当前进程/Job/资金/VM接缝已闭合；新设备退休和更强回收保证另行设计 | ideas未整篇审定 / 对象链任务范围已实现验证 |
 | `mm.md`、`tunnel.md`、`shared-memory.md` | backing/View、事务发布/退休、fault与退款：[内存分案](todo-2026-10-01-memory-redesign.md)；费用见[预算分案](todo-2026-09-14-kernel-memory-budget.md) | Sv48/Sv57实际平台接通及测量/证明触发的优化 | ideas未整篇审定 / 当前Sv39对象链范围已实现验证 |
-| `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 内核消息/能力运输、取消及等待：[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)、[等待源分案](todo-2026-10-02-wait-source.md) | 更广RPC业务模型与不可达环收集若扩大承诺需独立闭合 | ideas未整篇审定 / 当前运输和等待范围已实现验证 |
-| `framework.md`、`runnel.md`、`buffer-queue.md` | Runtime来源/取消、Caller及runnel失败清理：[审查修复档案](archived/review-2026-10-07-object-chain.md) | 更广业务任务、语言运行时、数据面与FAL边界按所属分案继续 | ideas未整篇审定 / 对象链实际消费者已接通验证 |
-| `fal.md`、`fs.md`、`service.md` | 整体重审：[OAL/fs/服务目录改造计划](todo-2026-10-07-fal-service-redesign.md)、[正式服务装配分案](todo-2026-10-07-service-assembly.md) | OAL/fs/service 实施交付已结束；专项验证触发与证据由唯一改造计划拥有，正式服务装配仍由独立分案设计 | ideas未审定 / 本轮实现与收敛已验证交付 |
+| `ipc.md`、`message.md`、`rpc.md`、`signal.md`、`wait.md`、`call.md` | 内核消息/能力运输、取消及等待：[对象链档案](archived/todo-2026-10-01-object-chain-kernel-integration.md)、[等待源分案](archived/todo-2026-10-02-wait-source.md) | 更广RPC业务模型与不可达环收集若扩大承诺需独立闭合 | ideas未整篇审定 / 当前运输和等待范围已实现验证 |
+| `framework.md`、`runnel.md`、`buffer-queue.md` | Runtime来源/取消、Caller及runnel失败清理：[审查修复档案](archived/review-2026-10-07-object-chain.md) | 更广业务任务、语言运行时、数据面与文件领域边界按所属分案继续 | ideas未整篇审定 / 对象链实际消费者已接通验证 |
+| `oal.md`、`fs.md`、`service.md` | 整体重审：[OAL/fs/服务目录改造计划](todo-2026-10-07-fal-service-redesign.md)、[正式服务装配分案](todo-2026-10-07-service-assembly.md) | OAL/fs/service 实施交付已结束；专项验证触发与证据由唯一改造计划拥有，正式服务装配仍由独立分案设计 | ideas未审定 / 本轮实现与收敛已验证交付 |
 | `device.md` | 用户态设备/绑定、驱动管理、OAL 视图及资源控制：[设备第二轮设计](todo-2026-09-device-system-design.md#第二轮收敛设计2026-10-27) | 首批及第二轮详细设计已闭合；扩展按各自条件触发，旧线稿不替代 | ideas 未整篇审定 / 真实设备链与第二轮收敛已实施并完成所选验证，首批独立验收门仍开放 |
 | 其余 `notes/ideas/**` | 没有本轮重设计审定记录；旧规范证据可独立核实，不因此认可整个设计 | 由所属分案明确重审范围后补登记 | 未登记审定；不作重构目标依据 |
 
@@ -52,7 +52,7 @@
 - 分配也有相同问题：清零、建页表、发布映射均随规模增长。普通分配允许准入失败，已接受释放不能因缺少清理承载失败；二者不能分别建立互不相干的推进框架。
 - 优先消除无谓遍历与事务：维护可直接摘除的拥有链；完整释放不重新做任意区间切割规划；进程失去执行资格后用整地址空间退休入口；相同域的翻译失效可以合并；引用级联改为非递归交接。批量释放必须保留共享对象与资金来源，不能把它们整体重置。
 - 无法消掉的宽度由内核分批推进，具体方案由[有界维护执行计划](todo-2026-09-29-kernel-maintenance-execution.md)拥有。内核自主推进、无需用户逐批 syscall 的责任边界已确认；工作记录、队列、执行份额已在该计划定稿；原语上界改写由进程与 VM 分案承接。
-- 现有 `sched.rs::run/idle` 已证明没有 runnable 用户线程也能执行维护；但现有各 debt 分类与游标不是目标布局。最终执行入口还必须在连续维护时服务 pending timer/remote 等来源，不能只依赖返回用户态或实际 WFI。
+- `sched::run/idle` 在无 runnable 用户线程时也推进维护，并在连续维护之间服务 timer/remote；当前结构与边界由 [internals](../notes/impls/internals.md) 描述，不恢复旧 debt 分类或用户驱动回收。
 
 不以“把所有工作交给后台”代替结构审视。新增一个常驻 kernel thread 或引入内核抢占，会改变整个执行模型，应按独立理由决策；它们不会让 N 项工作本身消失。
 
@@ -60,15 +60,15 @@
 
 | 分案 | 唯一拥有的契约 | 依赖与当前状态 |
 |---|---|---|
-| [capability与资源释放](todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage、Close、运输/消费/回滚 | 对象链范围已交付及审查修复；不可达环收集保持显式边界 |
+| [capability与资源释放](archived/todo-2026-09-28-capability-last-reference.md) | authority/reference/use/storage、Close、运输/消费/回滚 | 对象链范围已交付及审查修复；不可达环收集保持显式边界 |
 | [内核有界维护执行](todo-2026-09-29-kernel-maintenance-execution.md) | 稳定根、准入、预算/机会、公平、停驻唤醒、idle活性 | crate和内核接入已完成；精确物理计量及测量优化为独立后续 |
-| [进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 终止至收束、公共完成、删除用户驱动 | 当前Shell/Body/VM/Job责任链及C1已交付并验证 |
+| [进程自动回收](archived/todo-2026-09-29-process-automatic-reclamation.md) | 终止至收束、公共完成、删除用户驱动 | 当前Shell/Body/VM/Job责任链及C1已交付并验证 |
 | [映射/backing重审](todo-2026-10-01-memory-redesign.md) | allocation identity、完整/部分修改、同步、物理/metadata费用 | 当前Sv39链及C2已交付；其他模式实际平台接通另受触发 |
-| IPC、等待与服务调用重审 | 消息/能力运输、请求回复、订阅/终态观察 | 对象链消息与[等待源](todo-2026-10-02-wait-source.md)已交付；更广业务模型仍按独立需求论证 |
-| 用户态执行与运行时 | 语言owner、线程结果、任务取消、来源登记 | [运行时分层](todo-2026-09-runtime-kernel-library-separation.md)已完成；对象链实际消费者及SourceRegistration已收敛，更广需求按明确触发接续 |
+| IPC、等待与服务调用重审 | 消息/能力运输、请求回复、订阅/终态观察 | 对象链消息与[等待源](archived/todo-2026-10-02-wait-source.md)已交付；更广业务模型仍按独立需求论证 |
+| 用户态执行与运行时 | 语言owner、线程结果、任务取消、来源登记 | [运行时分层](archived/todo-2026-09-runtime-kernel-library-separation.md)已完成；对象链实际消费者及SourceRegistration已收敛，更广需求按明确触发接续 |
 | [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md) | OAL 发现与入口分层、fs 文件协议、独立服务目录 provider 与注册取得 | 本轮实施结束；后续按记录中的验证触发、新能力需求或提交后独立审查接续，不继续旧迁移施工 |
 | [正式服务装配与监督](todo-2026-10-07-service-assembly.md) | 启动依赖、就绪、授权交付、监督恢复及停止接点 | 设备持续监督与分步装配已实施；通用正式服务装配及恢复按实际需求继续设计 |
-| [设备体系](todo-2026-09-device-system-design.md) | 设备关系、资源authority、驱动协议、硬件隔离与运行装配 | PCI/xHCI/USB 键盘真实消费者已接通，第二轮控制链与持续监督已收敛；DMA＋IPI 已补证关闭，独立时钟异常延期，当前状态由唯一收口表承接 |
+| [设备体系](todo-2026-09-device-system-design.md) | 设备关系、资源authority、驱动协议、硬件隔离与运行装配 | PCI/xHCI/USB 键盘真实消费者已接通，第二轮控制链与持续监督已收敛；DMA＋IPI 已补证关闭，历史时钟异常仅观察，当前状态由唯一收口表承接 |
 
 表中尚未立案部分不构成可执行施工步骤。每份已立案计划独立说明目标、边界、当前事实、依赖、状态和删除门；公共契约只在所属分案定义。独立分案不是“单独改完一个文件就交付”，相关消费者与旧路径在责任链闭合时一并替换。
 
@@ -80,22 +80,26 @@
 |---|---|---|
 | 对象抽象、文件系统与系统视图 | provider 动态视图、共同目录使用与领域操作；旧 FAL 整体拆分 | [OAL/fs/服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)已交付；遗留专项验证按原记录触发，正式服务装配由独立分案承接 |
 | 正式服务装配与监督 | 启动依赖、就绪、发布交付、失效/重启/重连、上级接管、停止接点 | [服务装配分案](todo-2026-10-07-service-assembly.md#当前接力)的设备持续监督已实施；通用正式服务仍待需求与设计闭合，全系统停止由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有 |
-| 设备/驱动与平台资源 | 实例/绑定、资源/session、MMIO/IRQ/DMA、供应依赖、硬件静止与故障终局 | 从[首批剩余验收门](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)接续；不重复第二轮迁移。[保留内存](todo-2026-09-platform-reserved-memory-lifecycle.md)按实际能力触发，[IRQ 重审](todo-2026-08-26-review-carryover.md)约束验证 |
+| 设备/驱动与平台资源 | 实例/绑定、资源/session、MMIO/IRQ/DMA、供应依赖、硬件静止与故障终局 | 从[首批剩余验收门](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)接续；不重复第二轮迁移。[保留内存](todo-2026-09-platform-reserved-memory-lifecycle.md)按实际能力触发，[IRQ 重审](archived/todo-2026-08-26-review-carryover.md)约束验证 |
 | 不可信域资源硬隔离 | 已有额度付款之外的域间硬容量、Weak尾部与allocator碎片隔离；CPU份额另行建模 | [预算分案](todo-2026-09-14-kernel-memory-budget.md)拥有；Pool页/metadata双维付款已交付，不能再把MetadataSponsor迁移当缺口；开放不可信创建域或承诺硬隔离前触发 |
 | RPC/用户态执行与数据面 | 真实业务需要的事务owner/ReplyPort归还设计、BufferQueue及DMA消费者接点 | 定向或条件后续。SourceRegistration已收敛；Caller/Dispatcher统一候选本轮未采纳，重开条件见[审查档案](archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)。没有依据整体重做执行层，数据面随正式消费者接通 |
 | 性能、分页模式与其他平台能力 | 锁/ASID/定向shootdown、精确CPU计量、Sv48/Sv57和新执行档位 | 分别按[性能专题](todo-2026-10-01-lock-performance.md)、[内存完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)、执行需求触发；不因存在扩展方向撤销当前有限保证 |
 
 对象链的持有/释放、维护、自动回收、当前Sv39、消息/等待和运行时分层已有交付及相应验证。ideas未整篇审定、历史Review尚待核定和未来能力未建设分别表示不同事实，均不能自动解释为这些当前能力没有接通。
 
+### 不可达能力环的范围边界
+
+当前合法 TRANSFER 和已触发关闭对象的有界排空已经交付，未承诺对未归零的不可达 capability 环自动退款。若未来扩大这一保证，由 IPC/资金 owner 先闭合允许图、识别/回收、付款和观察语义，再建立唯一实施记录；完成需覆盖消息滞留、跨域退出、迟到释放和共享资源。CapTable 空槽搜索只按锁/性能计划的实际测量触发，不属于当前正确性欠账。此处承接已完成 capability 计划的条件后续，不恢复旧迁移。
+
 ## 近期轻量收口与本轮整理
 
-用户在七天持续重构后希望先处理可独立结束的轻量工作。本轮明确只修订文档，不修改源码（包括源码注释），不执行代码Review、性能观测或实现验收。以下三项按文档范围收口：出生块描述校正、fixture记录校准、后续局部Review范围安排；不启动FAL、设备或资源隔离的新一轮施工。
+本节保留 2026-10-07 至 10-12 的已结束整理事项；当时授权边界不约束后续任务。当前清理范围见[活跃资料清理](#活跃资料清理2026-10-27)。
 
 | 工作 | 范围、收口产物与边界 | 当前处置 / owner |
 |---|---|---|
 | 主线登记与过时接力纠正 | 固定上述切面、建立缺失的两份范围记录，修正分层/出生块和设备的失效前置；核对本地链接与diff | 本轮已处理；本总纲拥有整理结果，COMPASS只留入口 |
 | 旧Review范围归并 | 逐份保留固定目标，区分被替换机制、现存消费者和新目标；输出范围矩阵，不把未审查标成通过 | 范围矩阵已建立；当前有效性与后续责任已由[统一Review报告](review-2026-10-12-consolidated.md)完成核定，原始范围仅作历史取证 |
-| 普通出生块文档校正 | 准确描述READ映射、Building Write初始化与地址空间持有，删除impls中的目标追踪/验证宣告 | 本轮文档部分已完成，见[startup](../notes/impls/startup.md#用户态公共-loader)；源码注释残留只在[分层记录](todo-2026-09-runtime-kernel-library-separation.md#kernel-与-shared-的施工边界)登记，待以后获准维护源码时处理 |
+| 普通出生块文档校正 | 准确描述READ映射、Building Write初始化与地址空间持有，删除impls中的目标追踪/验证宣告 | 文档已完成，见[startup](../notes/impls/startup.md#用户态公共-loader)；当前分步 loader 已使用 READ 映射，旧注释残留已不在现有装载路径，分层记录随本轮清理归档 |
 | 验收fixture记录校准 | 更新现存映像、当前三类启动自检及脚本声明；旧ProcessDrain/WaitSet/Tunnel自检与原运行结果归于历史，未知等价覆盖仍保留未知 | [fixture清理档案](archived/todo-2026-09-23-acceptance-fixture-cleanup.md)保留2026-10-07文档轮次事实；当时未删除测试、执行代码审查或新验收 |
 | 验收运行整理（2026-10-11） | 用户另行授权实施：VM fault聚焦现有线程/内存消费者，平台默认release仍跑完整业务，聚合分组，删除重复Copy汇总并统一FS1输出 | [实施与验证](archived/todo-2026-09-23-acceptance-fixture-cleanup.md#实施验证与交付检查)已完成并提交为`a06e455`；验收范围已由[FAL 原始报告](archived/review-2026-10-12-fal-service-delivery.md)审查，当前有效性与条件证据见[统一报告](review-2026-10-12-consolidated.md)。fixture与三项自检按独立覆盖保留，后续仅按owner/消费者/成本变化重审 |
 | 后续局部Review范围安排 | 选择纯时间换算/Deadline编码，登记固定候选目标、契约、排除项和完成产物；本轮只修订计划 | [时间与运输原始报告](archived/review-2026-10-12-transport-time.md)已完成；后续机制替换与精确证据由[统一报告](review-2026-10-12-consolidated.md)核定，性能专题本轮未执行 |
@@ -146,9 +150,9 @@
 
 | 责任链 | 组成 | 就绪状态 |
 |---|---|---|
-| 对象持有与释放 | [capability](todo-2026-09-28-capability-last-reference.md#当前接力)、[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](todo-2026-09-29-process-automatic-reclamation.md) | 当前范围整体接入、旧路径删除及审查修复已完成；后续边界由各案当前入口拥有 |
+| 对象持有与释放 | [capability](archived/todo-2026-09-28-capability-last-reference.md#当前接力)、[维护执行](todo-2026-09-29-kernel-maintenance-execution.md)、[进程自动回收](archived/todo-2026-09-29-process-automatic-reclamation.md) | 当前范围整体接入、旧路径删除及审查修复已完成；后续边界由各案当前入口拥有 |
 | 内存 | [内存重构](todo-2026-10-01-memory-redesign.md#当前范围与后续)：backing/View、Map/Unmap、funding、fault、Attach | 当前Sv39已交付并验证；原编译中断已关闭，其他分页模式实际平台接通另受触发 |
-| IPC | Receive/Send/SendOnce、Delivery/Lifetime、[等待源](todo-2026-10-02-wait-source.md) | 对象链约定消息/等待消费者已接入；更广业务重审不冒充当前链未接通 |
+| IPC | Receive/Send/SendOnce、Delivery/Lifetime、[等待源](archived/todo-2026-10-02-wait-source.md) | 对象链约定消息/等待消费者已接入；更广业务重审不冒充当前链未接通 |
 
 本表只登记组成与就绪状态，进度与证据归各分案。
 
@@ -158,7 +162,7 @@
 
 对象链修复已提交为`ac9d7d9364770a69c8135e918d512069980c06bb`，对应[固定提交原始Review](archived/review-2026-10-12-substrate-object-chain.md)已完成；原两项P1的更正依据、当前责任与后续复核由[统一报告](review-2026-10-12-consolidated.md#已退出当前修复队列的判断)拥有，不再作为待修复导航。[轻量收口记录](#近期轻量收口与本轮整理)保留此前文档轮次的范围和证据；按[剩余切面表](#剩余切面与接续顺序)及各分案当前接力继续。当前没有要求补做对象链旧拼装或恢复编译的接力。
 
-设备第二轮及生命周期收口已统一保存交付，DMA＋IPI 组合取证已完成，独立时钟异常按用户决定延期；当前状态与判据由[设备交付接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)拥有。代码独立 Review 仍按固定交付另行安排，不把已完成的设备/监督迁移或组合取证恢复为待办。
+设备第二轮及生命周期收口已统一保存交付，DMA＋IPI 组合取证已完成，历史时钟异常按用户决定仅观察；当前状态与判据由[设备交付接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)拥有。代码独立 Review 仍按固定交付另行安排，不把已完成的设备/监督迁移或组合取证恢复为待办。
 
 ## 初次设计文档交付检查（历史，不是当前代码验收）
 
@@ -167,3 +171,27 @@
 - 验证：文档差异空白检查与本次改动的本地链接核对通过；未运行编译、单测或 QEMU，本次不提供实现验收证据。
 - 尚未交付：具体对象模型、执行记录/队列、调度份额、VM 与结果交付方案仍在各分案设计门中。本次是可接力的设计记录提交，不代表这些分案或全项目重构已经完成。
 - 本次为纯设计文档交付，完成上述文档检查即可，不登记提交后独立 Review；后续代码实施交付按 REVIEW 手册处理。
+
+## 活跃资料清理（2026-10-27）
+
+用户授权清理活跃文档与确定的代码周边残留；已有 `plans/archived/` 不读取、不整理。基线 `956685b`，工作树原有时钟调查及历史偶发异常观察的四份文档改动继续保留。范围包括旧 rinlib/驱动占位描述、未使用构建变量、已完成计划归档、设备与 OAL/fs 工作记录的历史过程分离，以及当前导航和引用同步；产品机制、ABI、测试场景与构建缓存不在改动范围。
+
+本轮线稿同步以已确认的 OAL/fs/服务目录目标及设备第二轮目标为依据，只校正已经被替换的 FAL、服务发布和设备模块关系，移出状态机、失败细节与进度记录；不产生新的设计选择，不据此扩大整篇 ideas 的重设计审定范围。详细契约仍由各专题计划拥有，当前实现由代码与 impls 拥有。
+
+完成门：活跃入口不再指向已结束的施工；保留所有未完成责任、触发条件、验证限制与实际合同；新增归档保留本轮整理前记录，已有档案保持原样；机械改动不改变执行语义，核对文档链接、构建入口与实际 diff。
+
+本轮已完成：两份大型活跃计划分别从 2108/1749 行收敛为 717/620 行，整理前完整记录存入本轮新建的交付历史快照。运行时分层、capability、进程自动回收、等待源、IRQ 设计承接五份已完成计划及旧内核考古移出活跃目录；不可达能力环的条件后续由本总纲接住。原有 archived 文件未读取或修改。
+
+活跃说明已删除旧 FAL 线稿与过渡实现入口，OAL、文件、服务、设备线稿只保留已定稿的模块关系；同步预算线稿、库文档与原始指令中的旧 rinlib/驱动占位/单账户描述。代码侧只修注释、删除两个无消费者的 Justfile GDB 变量和两个未跟踪空目录；正式测试、诊断工具、参考规范和构建缓存保留。设备部署期限、资源视图边界与独立证据限制、F/N6/Bind 条件门、历史异常观察规则和待执行 Review 均继续有唯一入口。
+
+首轮检查（续接前）：核定摘出的历史段落与保留合同，验证活跃 Markdown 的本地路径及可检查锚点；既有档案只检查路径存在，不读取正文/内部锚点。本轮新档案校验相对链接，历史缺失的本机 artifacts 只报告缺失、不补造。源码非注释内容比对一致，首轮 Justfile 差异仅两项未使用变量；shell 语法、just 构建入口 dry-run 与 diff 空白检查通过。首轮没有执行构建、host 单测或 QEMU，也未提交；后续修改和最终验证见下节。
+
+### 清理续接与提交（2026-10-27）
+
+用户授权继续校正剩余线稿、分离维护/内存/Notification/预算计划中的旧过程，修正默认构建清理入口并提交本会话改动。线稿同步依据当前 WaitOne/WaitSet、等待续体、事务自带 remote 运输、Notification 三角色及 Runnel 双侧 Start 的已定合同；不新增 API 或改变业务保证。BufferQueue 保留记录/缓冲交接方向，旧字段布局作为未重新审定草稿归档，不据文档清理宣告已经实现。清理入口在隔离夹具验证，不删除本机真实缓存或证据。
+
+续接已完成：维护、内存、Notification 与预算计划分离旧过程并保留条件后续；IPC/RPC、Runnel、BufferQueue、等待和内存线稿按已有目标校正，整理前内容存入本轮新快照。内存的 Sv48/Sv57、硬容量隔离、设备独立静止及完成点优化边界继续由专题计划拥有。已结束任务移出活跃目录，现存未闭合门未因此关闭。
+
+默认 `just clean` 改为按 `tools/clean-build.py` 的明确清单清理三个 workspace 缓存和导出产物，新增 `just clean-preview`；日志、调查现场与验证证据保留。父目录若经符号链接重定向，在任何删除前拒绝；清单叶节点为符号链接时只移除链接。独立临时仓库夹具已覆盖预览不写入、全部预期产物删除、证据与源码保留、重复清理、叶链接目标保留，以及仓库内外父链接拒绝；夹具已清除，真实缓存未删除。
+
+最终结构检查确认：未修改既有 archived 文件；内核/共享源码与原脚本只有注释调整，执行行为变化限于已授权的构建清理入口。活跃 Markdown 路径及可检查锚点、Python 语法、shell 语法、just 构建/清理入口 dry-run 与 diff 空白检查通过。历史本机 artifacts 有七处链接目标缺失，保留原引用，不补造证据；既有档案内部锚点按用户边界未读取。证据在 `artifacts/repository-cleanup/validation.json`、`clean-verification.json` 与 `just-dry-run.log`。本次整理未运行 Cargo 检查、Rust 单测或 QEMU；前述时钟调查属于独立已记录证据。按用户授权提交本会话改动，本次为普通维护，不新增独立 Review 登记。

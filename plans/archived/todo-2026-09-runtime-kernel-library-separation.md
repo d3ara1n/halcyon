@@ -1,6 +1,8 @@
 # 现有用户态分层纠正：libkernel、libprocess、libthread 与 libruntime
 
-> 状态：**分层迁移及整体收敛已完成**；线程owner、启动采用、入口/Unmap失败路径及真实消费者已接通，最终处置和验证由[复核档案](archived/review-2026-09-28-runtime-layering.md)拥有。2026-10-07核定：普通出生块已READ映射，内核rust_start也已无Termination约束；这两项不再作为待实施工作。下文施工轮次保留历史，当前后续边界见末节。
+> 2026-10-27 清理活跃资料时归档；本任务约定范围已交付，正文保留当时设计与过程，不能从历史施工断点恢复任务。当前入口见[系统重构总纲](../todo-2026-09-29-system-redesign.md)。原出生块注释残留已不在现有 loader；当前 preparation.rs 的出生块映射使用 READ，构造与映射由分步装载承担，不再保留旧注释待办。
+
+> 状态：**分层迁移及整体收敛已完成**；线程owner、启动采用、入口/Unmap失败路径及真实消费者已接通，最终处置和验证由[复核档案](review-2026-09-28-runtime-layering.md)拥有。2026-10-07核定：普通出生块已READ映射，内核rust_start也已无Termination约束；这两项不再作为待实施工作。下文施工轮次保留历史，当前后续边界见末节。
 
 ## 交付快照
 
@@ -17,9 +19,9 @@
 ## 两条主线与设计归属
 
 1. 本计划纠正已经实现的用户态结构：抽出 libkernel、建立 libthread、形成中立进程上下文，将 rinlib 的语言环境改名迁至 `user/libraries/libruntime`，分离平台构建资产并接通所有现有消费者。
-2. [设备整体设计](todo-2026-09-device-system-design.md) 拥有设备领域、特权资源、驱动/总线/功能协议与真实消费者。两项设计可并行校正；设备资源代码接线以前一条迁移闭包完成为前置。
+2. [设备整体设计](../todo-2026-09-device-system-design.md) 拥有设备领域、特权资源、驱动/总线/功能协议与真实消费者。两项设计可并行校正；设备资源代码接线以前一条迁移闭包完成为前置。
 
-长期知识由 [framework](../notes/ideas/framework.md)、[task](../notes/ideas/task.md)、[mm](../notes/ideas/mm.md) 分别拥有；当前事实由 [framework impl](../notes/impls/framework.md) 记录。本计划只拥有证据、决定过程、尚需细化的接口、实施顺序和验证。
+长期知识由 [framework](../../notes/ideas/framework.md)、[task](../../notes/ideas/task.md)、[mm](../../notes/ideas/mm.md) 分别拥有；当前事实由 [framework impl](../../notes/impls/framework.md) 记录。本计划只拥有证据、决定过程、尚需细化的接口、实施顺序和验证。
 
 ## 已定方向与本轮修正
 
@@ -35,7 +37,7 @@ runtime 并非不能有依赖，正确约束是通用知识不能反向依赖具
 | 消息与 signal | Mailbox/Notification/Wait 的基础 API 在 libkernel；RPC 和事件推进各有 owner | 当前 Notification 不是 POSIX handler；默认不建立消息泵、监听线程或 root channel |
 | 程序入口 | 标准 `fn main()`；runtime `_start` 接受平台 a0/a1 StartupBlock 参数，内部链接桥显式以 `main(0, null)` 调用 | ELF entry 仍是 `_start`；不再用全局导出桥或入口宏；main ABI 与启动参数 ABI 分离 |
 | 启动 context | 无堆 view 校验 → allocator/Registry → once 采用 `EntryThreadDescriptor` 登记入口线程 → 显式交付应用 | 不把 env 全局变量搬家，不把 payload 伪造为无条件 static，不复制 Handle 关闭权；第二次进入 `_start` 为完整性失败 |
-| 线程环境与结果 | ThreadCreate 挂起 → 登记 record/ResultCell → ThreadStart；结果由 ResultCell 仲裁 | 不把 DONE 当成 T 已初始化；T/F 只在用户线程 Drop；TLS/unwind/detach 不在范围；具体施工见 [owner 计划](archived/todo-2026-09-14-user-memory-owner-lifecycle.md) |
+| 线程环境与结果 | ThreadCreate 挂起 → 登记 record/ResultCell → ThreadStart；结果由 ResultCell 仲裁 | 不把 DONE 当成 T 已初始化；T/F 只在用户线程 Drop；TLS/unwind/detach 不在范围；具体施工见 [owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) |
 | shared 与 Rust | 删除 ExitCode、Termination/ProgramResult；shared 定义结构化 `TerminationCause` | main 返回 Err 由 libruntime 转 ProcessAbort；无任何数值退出码 |
 | 平台构建 | target JSON/ISA/共同布局到 `user/platforms/`，采用通用入口符号；runtime 提供适配 | 不让替代 runtime 依赖旧 runtime 目录或编译器 main 包装 |
 | allocator 与异常 | runtime owns global allocator/panic/OOM/入口 wrapper；libkernel 最小路径无堆 | runtime 依赖库不意味着堆初始化前可调用所有 API；main 返回 Ok 只结束入口线程，进程在末线程离场时 Completed |
@@ -62,7 +64,7 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 
 ## libkernel 接口与资源契约核对
 
-本轮把公共出口、owner 和失败形状细化到下面的 API 面。长期语义由 [kernel-interface](../notes/ideas/kernel-interface.md) 拥有，具体 Rust 模块组织由源码与实现篇核对。表中保留设计依据和实际 owner；不为尚未设计设备预留调用号。
+本轮把公共出口、owner 和失败形状细化到下面的 API 面。长期语义由 [kernel-interface](../../notes/ideas/kernel-interface.md) 拥有，具体 Rust 模块组织由源码与实现篇核对。表中保留设计依据和实际 owner；不为尚未设计设备预留调用号。
 
 | 目标模块/出口 | 类型与调用形状 | 资源、失败与停驻 | 当前来源 |
 |---|---|---|---|
@@ -93,7 +95,7 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 - Send/Receive 在 message idea 中明确为业务非阻塞；带 Deadline 不等于等待重试。分配准备、业务等待与内核退休 park 必须分别标注。
 ## libthread 接口与平台入口核实
 
-线程契约由 [task](../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [已归档的用户内存 owner 计划](archived/todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
+线程契约由 [task](../../notes/ideas/task.md#用户态线程资源收束) 拥有；类型草案、ResultCell 交错表、内核改动点、施工顺序与验证门由 [已归档的用户内存 owner 计划](todo-2026-09-14-user-memory-owner-lifecycle.md) 唯一拥有。本节只保留分层迁移需要的入口事实。
 
 当前实现事实以本轮复核为准：`StartupSeed` 先无堆核验 StartupBlock，采用阶段逐项非对齐读取、预留工作区、Query 全表，全部通过后建立 Capability owner；失败保留 Seed。`ResultReceiver` Drop 只放弃结果；Registry 只登记已启动或已放弃的线程，PreparedThread 放弃关闭唯一 Control 后以普通 record 登记，取消与 reap 无仲裁。
 
@@ -108,11 +110,11 @@ host tests、`just check`、`just clippy`、Base64/D64 release ELF audit/入口�
 
 实施前在钉住工具链下验证 `.option norelax`、`__global_pointer$`、`Rust main`/宏入口和链接段。平台门：两个 target 检查最终 ELF `_start`、入口线程与运行期 trampoline 首段反汇编、gp 初始化未被 relaxation 删除、a0/a1 未破坏、SP 对齐、Base64 无 FP，旧 ENTRY(main)/lang_start 消失。
 
-规范固定入口：[psABI v1.0 调用约定](../references/normative/riscv-psabi-v1.0/riscv-cc.adoc)、[psABI v1.0 ELF 与 relaxation](../references/normative/riscv-psabi-v1.0/riscv-elf.adoc)。
+规范固定入口：[psABI v1.0 调用约定](../../references/normative/riscv-psabi-v1.0/riscv-cc.adoc)、[psABI v1.0 ELF 与 relaxation](../../references/normative/riscv-psabi-v1.0/riscv-elf.adoc)。
 
 ## libprocess::context 接口契约稿
 
-具体时序与寿命的唯一契约见 [bootstrap 接收章节](../notes/ideas/bootstrap.md#用户态接收与一次性交接)。context 的这些 API 不依赖 management/ELF/libexecution/libthread/runtime；采用阶段需要 alloc，但不安装 allocator。
+具体时序与寿命的唯一契约见 [bootstrap 接收章节](../../notes/ideas/bootstrap.md#用户态接收与一次性交接)。context 的这些 API 不依赖 management/ELF/libexecution/libthread/runtime；采用阶段需要 alloc，但不安装 allocator。
 
 ```rust
 // 接口轮廓；不是可编译代码，错误内部字段与实现布局不在这里冻结。
@@ -203,12 +205,12 @@ stateDiagram-v2
 
 改名同步面：workspace/manifests/Cargo.lock、.cargo config、两种 target、linker/入口、Justfile host 清单及 FP 路径、编译失败示例、所有导入、编辑器词表、当前文档。历史固定提交记录保留 rinlib。ELF 工具当前不识别 runtime 名，继续依据 ET_EXEC、入口范围与执行 profile 验证。
 
-不新增第二个 runtime、通用 std facade、TLS、unwind、detach、自动消息泵或专职 cleanup driver；线程回收为协作式，契约见 [task](../notes/ideas/task.md#离场与-cleanup)。
+不新增第二个 runtime、通用 std facade、TLS、unwind、detach、自动消息泵或专职 cleanup driver；线程回收为协作式，契约见 [task](../../notes/ideas/task.md#离场与-cleanup)。
 
 ## 与其它专题的接点
 
 - 设备设计继续使用正确分层；runtime 可组合线程/上下文不会使 libdriver/libdevice 反向依赖 runtime，也不改变它们的授权来源。
-- [用户映射 owner](archived/todo-2026-09-14-user-memory-owner-lifecycle.md) 的线程子集已作为本次分层硬前置完成，独占 ThreadCreate/ThreadStart、TerminationCause、Registry/ResultCell 的施工方案与验证门；其它 allocator/映射扩展仍按独立需求。
+- [用户映射 owner](todo-2026-09-14-user-memory-owner-lifecycle.md) 的线程子集已作为本次分层硬前置完成，独占 ThreadCreate/ThreadStart、TerminationCause、Registry/ResultCell 的施工方案与验证门；其它 allocator/映射扩展仍按独立需求。
 - 保留区、IRQ、内核预算、关机等原计划仍各自拥有领域功能。本主线不以 ProcessTerminate 冒充其正常收束。
 
 ## 施工与交付门
@@ -231,7 +233,7 @@ stateDiagram-v2
 ### 历史工作树与授权（施工断点）
 
 - 当前分支 `master`，本次分层迁移仍未 commit/push；工作树保留本闭包的代码与同步文档改动。
-- 基线 66f4e9c 及此前工作记录仅作为既有实现背景；本轮纠正的 P1、失败路径和接力状态由唯一 [复核报告](archived/review-2026-09-28-runtime-layering.md) 拥有。
+- 基线 66f4e9c 及此前工作记录仅作为既有实现背景；本轮纠正的 P1、失败路径和接力状态由唯一 [复核报告](review-2026-09-28-runtime-layering.md) 拥有。
 - `plans/archived/todo-2026-09-device-architecture.md` 只表示初始概念稿完成，不代表设备详细设计完成。
 
 ### 已确定，不重复选方案
@@ -250,7 +252,7 @@ stateDiagram-v2
 
 ### 收口与后续边界
 
-1. 线程 owner、出生、结果、回收与启动采用已完成，处置与证据见 [分层 review](archived/review-2026-09-28-runtime-layering.md) 整体收敛节。
+1. 线程 owner、出生、结果、回收与启动采用已完成，处置与证据见 [分层 review](review-2026-09-28-runtime-layering.md) 整体收敛节。
 2. 整体收敛轮 `just check`、`just clippy`、host 测试与 `just acceptance` 全路线通过（`artifacts/dev/round5-*`）；F5 因所涉代码已替换按过期关闭。
 
 ### 设计阶段与施工阶段裁决（2026-09）
@@ -282,13 +284,13 @@ stateDiagram-v2
 
 #### Kernel 与 shared 的施工边界
 
-kernel/shared的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution、TerminationCause、删除ExitCode/ProcessExit/ProcessAttach/ThreadSpawn、挂起线程离场发布DONE）已由[生命周期档案](archived/todo-2026-09-28-lifecycle-convergence.md)完成。2026-10-07按`f174d8e`核对，`libprocess::management::map_birth_block`使用READ映射，内容由Building写入路径初始化；`os/kernel/src/rt.rs::rust_start<T: 'static>`无Termination约束。原两项后续已被当前实现覆盖，不另开代码迁移。出生块当前映射与初始化流程已回填[startup实现](../notes/impls/startup.md#用户态公共-loader)。源码注释仍说只读性由接收方自行遵守，此残留继续由本节记录：目标是与READ映射事实一致的注释，触发为后续获准的该处源码维护，删除条件是过时叙述清除并核对diff；本轮仅修订文档，不修改源码注释。
-设备 D1 的对象关系与 authority 可并行设计，入口见 [设备接力](todo-2026-09-device-system-design.md#当前进度与接力)；不要因本计划推进而登记设备 API、MMIO/IRQ/DMA 或驱动已完成。
+kernel/shared的同步改动（ThreadCreate/ThreadStart、ProcessBindExecution、TerminationCause、删除ExitCode/ProcessExit/ProcessAttach/ThreadSpawn、挂起线程离场发布DONE）已由[生命周期档案](todo-2026-09-28-lifecycle-convergence.md)完成。2026-10-07按`f174d8e`核对，`libprocess::management::map_birth_block`使用READ映射，内容由Building写入路径初始化；`os/kernel/src/rt.rs::rust_start<T: 'static>`无Termination约束。原两项后续已被当前实现覆盖，不另开代码迁移。出生块当前映射与初始化流程已回填[startup实现](../../notes/impls/startup.md#用户态公共-loader)。源码注释仍说只读性由接收方自行遵守，此残留继续由本节记录：目标是与READ映射事实一致的注释，触发为后续获准的该处源码维护，删除条件是过时叙述清除并核对diff；本轮仅修订文档，不修改源码注释。
+设备 D1 的对象关系与 authority 可并行设计，入口见 [设备接力](../todo-2026-09-device-system-design.md#当前进度与接力)；不要因本计划推进而登记设备 API、MMIO/IRQ/DMA 或驱动已完成。
 
 ### 取证与验证状态
 
 后续每块设计同时核对 ideas、impls、实际导出/调用者与已有测试语义；代码若超前补齐描述，代码与目标不符则记录真实差距，不默认任一侧正确。本轮已核实 Runtime/WorkQueue/Wake、FAL NodeStore/Retirement、Process Collector/Observation、init RootSupervisor；详细路径和复用边界在用户内存 owner 记录，不需要重复整仓盘点。只有源码变化或具体新问题才重取相关证据。
 
-本计划的代码迁移、接口接线与复核已完成；普通出生块只读及内核未消费Termination约束的原后续也已由当前代码覆盖。本轮出生块文档校正已完成，源码注释残留按上节保留，不作为未实现能力，也不在本次文档任务中处理。第三轮交付证据见[复核档案](archived/review-2026-09-28-runtime-layering.md)；此后的对象链变更由其[审查修复档案](archived/review-2026-10-07-object-chain.md)拥有。
+本计划的代码迁移、接口接线与复核已完成；普通出生块只读及内核未消费Termination约束的原后续也已由当前代码覆盖。本轮出生块文档校正已完成，源码注释残留按上节保留，不作为未实现能力，也不在本次文档任务中处理。第三轮交付证据见[复核档案](review-2026-09-28-runtime-layering.md)；此后的对象链变更由其[审查修复档案](review-2026-10-07-object-chain.md)拥有。
 
 交付前检查：`git diff --check`、`just check`、`just clippy`、两种用户 target 构建/ELF audit/入口反汇编与 `just acceptance` 均已通过；日志路径与失败现场见复核报告。

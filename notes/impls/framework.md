@@ -2,7 +2,7 @@
 
 `libkernel` 拥有 RV64 ecall、错误解码、内核对象/IPC/MM/process 原语和安全资源 owner；`libthread` 拥有 `ResultCell`、固定容量 `ThreadRegistry`、线程工厂、trampoline 与协作式 reap；`libruntime` 拥有 `_start`、gp 初始化、全局 allocator、panic/OOM 处理、入口线程接管和应用入口交接。`libprocess::context` 负责 StartupSeed 校验与 StartupContext/InitialGrants 采用；入口 descriptor 与 Control 经 StartupAdoption 交给 runtime，不进入应用 Context。
 
-目标职责以[分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md)的已确认契约为准；执行装配契约与接续由[对象链计划](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。普通库只依赖知识 owner，不依赖 `libruntime`；用户程序显式链接 `libruntime`，由 `_start` 先完成运行时准备，再通过 `start` lang item 接收 rustc 的 `main`。
+目标职责以[分层计划](../../plans/archived/todo-2026-09-runtime-kernel-library-separation.md)的已确认契约为准；执行装配契约与接续由[对象链计划](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。普通库只依赖知识 owner，不依赖 `libruntime`；用户程序显式链接 `libruntime`，由 `_start` 先完成运行时准备，再通过 `start` lang item 接收 rustc 的 `main`。
 
 ## 当前职责分布
 

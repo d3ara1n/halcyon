@@ -24,7 +24,7 @@ Job 表达进程的创建和管理关系。管理者持 capability 组织成员�
 
 进程回收具有稳定的内核拥有体，覆盖停止执行、已接受操作、能力释放、地址空间退休与终态形成。对外只提供意图提交和明确的完成观察，不要求用户逐批驱动 ProcessDrain。
 
-内核可以分批执行总量较大的回收。其执行与唤醒由 [kernel](kernel.md) 的内部维护承担，进程只拥有自身的进度和依赖。具体阶段、屏障及迁移由[自动回收计划](../../plans/todo-2026-09-29-process-automatic-reclamation.md)拥有。
+内核可以分批执行总量较大的回收。其执行与唤醒由 [kernel](kernel.md) 的内部维护承担，进程只拥有自身的进度和依赖。具体阶段、屏障及迁移由[自动回收计划](../../plans/archived/todo-2026-09-29-process-automatic-reclamation.md)拥有。
 
 ## 线程：执行单元
 

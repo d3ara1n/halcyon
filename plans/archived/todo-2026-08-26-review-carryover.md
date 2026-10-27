@@ -1,14 +1,16 @@
 # review 未闭合承接项收拢
 
+> 2026-10-27 清理活跃资料时归档；本任务约定范围已交付，正文保留当时设计与过程，不能从历史施工断点恢复任务。当前入口见[系统重构总纲](../todo-2026-09-29-system-redesign.md)。原设计重审已完成，IRQ 的实现与运行门由设备计划唯一收口表承接，不另留前置任务。
+
 > 已归档 review 的调查结论不随归档消失。本文件只保留仍未触发或未完成的承接项；完成项由对应实施档案和 notes 记录。
 
 ## 设备/中断接入重审
 
-来源：[`archived/review-2026-08-ipc.md`](archived/review-2026-08-ipc.md)。
+来源：[`archived/review-2026-08-ipc.md`](review-2026-08-ipc.md)。
 
 - [x] 设备与中断设计前重审静默谓词、IRQ 唤醒主人和对象订阅所有权；2026-10-23 设计核对见下文。代码接入与运行证明仍由设备实施验收承担，不能将本项勾选解释为 IRQ 已实现。
 
-触发：设备/中断接入设计开始。核对[现有调度 idle](../os/kernel/src/sched.rs)、[观察源与 Hint](../os/kernel/src/task/wait_source.rs)后，将以下要求写入[设备 IRQ 合同](todo-2026-09-device-system-design.md#irq)：
+触发：设备/中断接入设计开始。核对[现有调度 idle](../../os/kernel/src/sched.rs)、[观察源与 Hint](../../os/kernel/src/task/wait_source.rs)后，将以下要求写入[设备 IRQ 合同](../todo-2026-09-device-system-design.md#irq)：
 
 - idle 在 SIE=0 下 WFI，外部唤醒不会自动进入 trap；run 安全点、睡前复检和醒后须接同一个有界外部 IRQ 领取原语，不能只加 SEIP trap 分支。
 - 硬件来源按实际 hart/context 交付，IRQ use 保存 in-service/代次，WaitSet 持观察节点并负责 detach，source 仅经 Weak HintTarget 提示；不得保存线程/地址空间强根作为永久订阅。

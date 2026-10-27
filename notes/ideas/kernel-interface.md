@@ -34,4 +34,4 @@ libkernel 提供对象授权、内存与映射、任务原语、IPC、等待、�
 
 Process/Thread 控制能力只表达管理和观察，不隐含用户栈或业务结果的所有权。进程终止后的回收由内核自动完成；监督封装不再提供维持回收活性的 Drain 循环。
 
-实现方案及 ABI 迁移由[capability 与释放计划](../../plans/todo-2026-09-28-capability-last-reference.md)和相应领域分案拥有；[framework 实现](../impls/framework.md)描述实际代码。
+实现方案及 ABI 迁移由[capability 与释放计划](../../plans/archived/todo-2026-09-28-capability-last-reference.md)和相应领域分案拥有；[framework 实现](../impls/framework.md)描述实际代码。

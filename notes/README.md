@@ -29,7 +29,7 @@
 | 内存所有权、地址空间与映射 | [mm](ideas/mm.md) | [mm](impls/mm.md) |
 | 系统调用与 remote call | [call](ideas/call.md) | [call](impls/call.md) |
 | IPC 总览与消息控制面 | [ipc](ideas/ipc.md)、[message](ideas/message.md) | [IPC 对象](impls/ipc.md) |
-| ObjectSignals、WaitMany 与持久 WaitSet | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |
+| ObjectSignals、WaitOne 与持久 WaitSet | [wait](ideas/wait.md) | [IPC 对象](impls/ipc.md) |
 | 公共单调时间与绝对期限 | [time](ideas/time.md) | [time](impls/time.md) |
 | Notification | [signal](ideas/signal.md) | [IPC 对象](impls/ipc.md) |
 | Tunnel 与共享内存 | [tunnel](ideas/tunnel.md)、[shared-memory](ideas/shared-memory.md) | [Tunnel](impls/tunnel.md) |
@@ -39,7 +39,8 @@
 | 服务进程与用户态框架 | [service](ideas/service.md)、[framework](ideas/framework.md) | [service](impls/service.md)、[startup](impls/startup.md)、[runtime](impls/runtime.md)、[rpc](impls/rpc.md) |
 | 用户态库组合与可替换 Rust runtime | [framework](ideas/framework.md) | [framework](impls/framework.md) |
 | 用户态内核接口、安全 owner 与失败交付 | [kernel-interface](ideas/kernel-interface.md) | [framework](impls/framework.md)、对应对象实现篇 |
-| 文件领域、开放发现接续、流与 Copy | [fs](ideas/fs.md)、[fal](ideas/fal.md) | [fs](impls/fs.md)、[原 FAL 边界](impls/fal.md) |
+| 开放发现与命名空间 | [oal](ideas/oal.md) | [fs 中的 OAL 接续](impls/fs.md) |
+| 文件领域、流与 Copy | [fs](ideas/fs.md) | [fs](impls/fs.md) |
 | 设备声明、发现/PnP、驱动接管、租约与资源机制 | [device](ideas/device.md) | [资源内部机制](impls/device.md)、[MMIO/VM 接线](impls/mm.md#映射来源与-mmio-退休原语) |
 
 应用层构想不属于系统契约，单独位于 [`ideas/applications/`](ideas/applications/)；当前包含机器人 [ECS](ideas/applications/ecs.md)。

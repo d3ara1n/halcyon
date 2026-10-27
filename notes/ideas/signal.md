@@ -1,17 +1,19 @@
 # Notification
 
-Notification 是按位 OR 合并、由消费者显式取走的独立对象。它适合无负载、允许合并的通知；需要身份、次数、顺序或数据时使用消息，需要高频共享状态时使用 Tunnel 协议。
+Notification 表达按位 OR 合并的通知状态。需要事件身份、次数、顺序或负载时，使用消息或相应数据协议；就绪通知本身不承诺逐事件保存。
 
-## 角色与待决位
+## 三种角色
 
-创建者获得唯一 owner Handle。owner 不可 duplicate 或 TRANSIT，可在目标进程 Building 期直接 GRANT；owner 关闭使对象进入 CLOSED。获授权的 signaler 可按 rights duplicate、TRANSIT 或 GRANT，并提交位掩码。
+- Owner 持有消费与关闭责任，并可凭管理权签发只读 Observer。
+- Signaler 提交通知位；获得等待权时可以观察接收端关闭。
+- Observer 只观察 READABLE/CLOSED，不取得 Signal、Take 或关闭业务的权力。
 
-待决位按 OR 累积，重复提交同一位不会计数。存在任意待决位时对象的 READABLE 电平为真。
+这些能力指向同一通知状态，但各自的能力寿命不同。最后 Owner 关闭结束业务，观察者、发送者和已有等待登记可以继续保留观察存储；存储仍在不代表业务仍开放。
 
-## 消费
+## 观察与消费
 
-消费者先用 WaitMany 观察 READABLE，再调用 NotificationTake 原子取得并清除所选位；未选择的位继续保留。WaitMany 从不改变待决位，因此多个等待者可以同时被唤醒，最终由 Take 协调消费竞争。
+WaitOne 观察一个对象，持久 WaitSet 汇集多个来源。观察不清除待决位；Owner 的 Take 才消费所选通知位。通知只提示业务重新读取自己的权威状态，不能替代业务查询或确认。
 
-Notification 不是广播队列：一个消费者取走某位后，其他消费者不再看到该位。需要每订阅者可靠通知时，provider 必须为每个订阅关系持有独立 Notification signaler，或使用可重放日志。
+需要每订阅者独立确认时，由 provider 为订阅关系组合相应通知与业务控制。Observer 的消散不自动等同于业务订阅取消，具体关系由所属协议定义。
 
-ObjectSignals、WaitMany、WaitSet 与取消的通用契约见 [wait](wait.md)，绝对期限见 [time](time.md)。持久注册也只观察 READABLE/CLOSED，NotificationTake 仍是唯一的位消费入口。
+角色、签发、付款、等待与关闭合同由 [Notification 计划](../../plans/todo-2026-10-10-notification-observer-roles.md)拥有，通用观察关系见 [wait](wait.md)。

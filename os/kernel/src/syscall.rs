@@ -768,7 +768,7 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
     outcome
 }
 
-/// Debug(ptr, len)：读用户内存打印（rinlib debug! 的观测通道，测试用）。
+/// Debug(ptr, len)：读用户内存打印（libkernel debug! 的观测通道，测试用）。
 /// 纯透传零策略：拷入内核堆后以 Debug 话题、pid 与 debug 等级色输出；
 /// 要自定义格式/颜色的用户态自己拼进消息字符串。正式的用户态输出
 /// 是未来的 console 服务（设备租借 + IPC），不经过内核日志。

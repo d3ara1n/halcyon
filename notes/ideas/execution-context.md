@@ -54,4 +54,4 @@ RISC-V psABI 要求标准过程入口和过程执行中 SP 保持 128 bit 对齐
 
 Base64 使用 RV64IMAC/LP64，FS 关闭；D64 使用相应支持 F/D 的执行需求与 LP64D，FPR/fcsr 是内核拥有的持久线程状态。语言环境不改变 thread/hart 的 profile，也不以父线程的浮点寄存器内容代替新线程初态。当前 ELF admission 拒绝 PT_TLS，不提供 TLS 或动态链接；将来支持 TLS 须同时闭合 ELF 模板、每线程 TCB、tp、初始化/析构及所有入口路径。
 
-当前源码、固定规范位置及反汇编/链接验证门见 [分层计划](../../plans/todo-2026-09-runtime-kernel-library-separation.md)。本节定义目标入口；不表示当前用户镜像已从 ENTRY(main) 迁到 `_start`。
+当前源码、固定规范位置及反汇编/链接验证门见 [分层计划](../../plans/archived/todo-2026-09-runtime-kernel-library-separation.md)。本节定义目标入口；不表示当前用户镜像已从 ENTRY(main) 迁到 `_start`。

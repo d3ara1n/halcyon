@@ -63,10 +63,6 @@ VIRT_IPI_FAILURE_TIMEOUT := env_var_or_default("VIRT_IPI_FAILURE_TIMEOUT", "60")
 VIRT_VM_FAULT_TIMEOUT := env_var_or_default("VIRT_VM_FAULT_TIMEOUT", "420")
 VIRT_DMA_RETENTION_TIMEOUT := env_var_or_default("VIRT_DMA_RETENTION_TIMEOUT", "720")
 
-# gdb
-GDB_BINARY := "riscv64-elf-gdb"
-GDB_TARGET := KERNEL_ELF
-
 alias b := build_kernel
 alias c := clean
 
@@ -118,11 +114,10 @@ clippy:
         bash -c 'cd user && cargo clippy -p test_fp --bin test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{ZFLAGS_USER}} -- -D warnings'
 
 clean:
-    #!/usr/bin/env bash
-    if [ -d "artifacts" ]; then
-    	rm -r artifacts
-    fi
-    cargo clean --manifest-path os/Cargo.toml
+    @python3 tools/clean-build.py
+
+clean-preview:
+    @python3 tools/clean-build.py --dry-run
 
 artifact_dir:
     @mkdir -p "{{TARGET_DIR}}/build" "{{TARGET_DIR}}/initfs" "{{MODEL_DIR}}"
