@@ -1,8 +1,8 @@
 # 设备体系设计：领域模型、驱动管理与资源收束
 
-> 状态：**首批施工已形成代码审查检查点，闭包未交付，当前停止连续施工与验收。** 本篇继续作为唯一活跃设计、实施与未完成责任记录；用户已授权主代理整理提交及本地Review登记，push未授权。当前方案取代[早期讨论快照](archived/ref-2026-10-23-device-design-rounds.md)中的候选和待选方向。服务装配、平台保留内存、系统终局仍由各自计划拥有；当前范围、事实与开放项见[审查交接](#审查交接2026-10-27)。
+> 状态：**首批施工检查点已提交，闭包未交付，当前转独立代码审查。** 本篇继续作为唯一活跃设计、实施与未完成责任记录；固定对象和审查范围见[实现 Review 计划](todo-2026-10-27-device-implementation-review.md)，未 push。当前方案取代[早期讨论快照](archived/ref-2026-10-23-device-design-rounds.md)中的候选和待选方向。服务装配、平台保留内存、系统终局仍由各自计划拥有；当前范围、事实与开放项见[审查交接](#审查交接2026-10-27)。
 
-新会话从[审查交接（2026-10-27）](#审查交接2026-10-27)接手，先读固定检查点与[唯一收口表](#当前唯一收口表2026-10-26)，再按正式Review计划开展只读审查。正文拥有详细合同；2026-10-25施工接手及后续历史轮次只保留当时事实，不从其“下一步”自动恢复施工。
+新会话从[实现 Review 计划](todo-2026-10-27-device-implementation-review.md)和[审查交接（2026-10-27）](#审查交接2026-10-27)接手，先读固定检查点与[唯一收口表](#当前唯一收口表2026-10-26)，再开展只读审查。正文拥有详细合同；2026-10-25施工接手及后续历史轮次只保留当时事实，不从其“下一步”自动恢复施工。
 
 ## 目标与范围
 
@@ -944,16 +944,16 @@ QEMU_ACCEPTANCE_KEEP_LOG=1 just acceptance-virt
 
 ### 审查交接（2026-10-27）
 
-用户决定结束当前连续施工，转新会话进行代码审查和架构收敛。本节是当前接手入口；范围/合同仍由本计划正文、[装配](todo-2026-10-07-service-assembly.md)、[故障终局](todo-2026-09-system-shutdown-orchestration.md)与[固定平台取证](ref-2026-10-23-device-platform-contracts.md)拥有，不复制方案或重新列历史任务。
+用户决定结束当前连续施工，转新会话进行代码审查和架构收敛。施工检查点为 `f3337ebd789a79c8cad23c419b690b702e8f96bb`，正式[Review 计划](todo-2026-10-27-device-implementation-review.md)固定对比基线与审查切面。本节是当前事实接手入口；范围/合同仍由本计划正文、[装配](todo-2026-10-07-service-assembly.md)、[故障终局](todo-2026-09-system-shutdown-orchestration.md)与[固定平台取证](ref-2026-10-23-device-platform-contracts.md)拥有，不复制方案或重新列历史任务。
 
 - **当前承诺与实际接通**：virt/PLIC、真实PCI→xHCI→USB boot keyboard运行期热插，正式Devices/FunctionAccess/OAL应用、同进程多Binding、正常停止与故障保留链均有真实消费者。只读现状入口为[device impl](../notes/impls/device.md)，再按链接读mm/call/ipc/startup；复合USB接口未覆盖，不能以直接端口多设备证据代替。
 - **已有验证及版本**：下方已关闭表与“成形自查与集中验证记录”拥有原路径。`just check`、host三workspace、十面Clippy/stress及release/platforms/faults分段通过，原聚合124/续跑0保留；聚合源码937项基线不冒充最终树再跑。后续定向消费者/工具按各轮冻结记录，最新MMIO第十二轮完整core/两窗/最终账通过，运行时944项无差分。最后IPI诊断改动只有离线检查，未运行第六轮。
 - **开放项**：DMA+IPI组合缺同call失败返回/消费与后续原广播的完整关联；全hart idle/PCI观察未取得合格共同快照，原轮询推进只有待核假设；独立clock异常只有一次实际失败与一次不同环境未复现。具体owner/最小判据/原证据均在下方唯一表，不能因工具困难删除门或升级成已证产品bug。
 - **发现分类**：真实产品接线问题（逐hart PLIC接管、未暴露取消、真实父轮释放/后代服务寿命、逐轮function与BME、USB重Prepare存在性/无描述符停止、Once付款等）已按相应记录实现并取证；test_target Set单次wait即析构是已修fixture缺陷；近期DWARF/多ELF/缓存/退休地址及异常留存属于工具问题，最后IPI纯诊断修正未跑。现无另行确认而尚未修的产品机制缺陷清单，不表示独立Review不会发现缺陷。失败原样保留，不把工具或fixture错误记成产品错误。
-- **审查重点**：先沿Registry/Binding Work的授权与父子释放、ProcessTask/Managed/ActivationSlot的不同寿命、可信硬件停止与exposed DMA保留、Once付款及各层费用尾部、init出生前观察/正常撤防/唯一终局、VM Forced/IRQ有界推进检查唯一owner和重复状态。已有结构检查是输入而非独立Review替代；详细切面由主代理的[Review正文草稿](../artifacts/device-closing/device-implementation-review-draft.md)准备，固定代码提交后按[REVIEW](REVIEW.md)另登记，不用此处基线HEAD伪称最终提交。
-- **工作树与归属**：施工起点HEAD为549a9e78400f9e59f3bdf516ef4d54f101846178；最终tracked/untracked状态、存在文件哈希、删除项及可供主代理核准的路径清单见[交接快照](../artifacts/device-closing/review-handoff/snapshot.json)。原DTB迁移、工具链allocator_ext/lint适配及验收修正属于已接受基线；[libfs邻接核验](../artifacts/device-closing/handoff-adjacent-scope.json)五文件纯fmt、lib.rs仅feature替换+fmt，未发现需排除的其他任务遗留，不回退原改动。根目录临时25行GDB索引已[原字节移入证据目录](../artifacts/device-closing/handoff-evidence-relocation.json)，不入源码提交；artifacts本机证据不冒充仓库发布内容。
+- **审查重点**：先沿Registry/Binding Work的授权与父子释放、ProcessTask/Managed/ActivationSlot的不同寿命、可信硬件停止与exposed DMA保留、Once付款及各层费用尾部、init出生前观察/正常撤防/唯一终局、VM Forced/IRQ有界推进检查唯一owner和重复状态。已有结构检查是输入而非独立Review替代；详细切面、已知证据与报告接力由[固定实现 Review](todo-2026-10-27-device-implementation-review.md)登记，不把待证项或审查登记称为已交付。
+- **工作树与归属**：施工起点HEAD为549a9e78400f9e59f3bdf516ef4d54f101846178；实施者提交前tracked/untracked状态、文件哈希、删除项及291路径清单见[交接快照](../artifacts/device-closing/review-handoff/snapshot.json)。主代理核对清单后，仅额外移除三个新增Cargo.toml末尾空行；[暂存核验](../artifacts/device-closing/precommit-verification.json)记录此无语义差异，最终实现身份以施工提交为准。原DTB迁移、工具链allocator_ext/lint适配及验收修正属于已接受基线；[libfs邻接核验](../artifacts/device-closing/handoff-adjacent-scope.json)五文件纯fmt、lib.rs仅feature替换+fmt，未发现其他任务遗留。根目录临时25行GDB索引已[原字节移入证据目录](../artifacts/device-closing/handoff-evidence-relocation.json)，未入源码提交；artifacts本机证据不冒充仓库发布内容。
 
-COMPASS指向本交接，KNOWN_ISSUES继续保留矫正区；impls只校准当前机制事实，不写任务完成。用户授权commit与本地Review计划由主代理执行；实施者收尾后停止写入，不新运行、不stage/commit/push、不归档。后续新会话先只读审查固定checkpoint，形成报告后由其唯一承接findings及修复；本计划仍承接原未完成能力和证据。
+COMPASS指向固定实现Review与本交接，KNOWN_ISSUES继续保留矫正区；impls只校准当前机制事实，不写任务完成。本次授权的施工检查点提交与本地Review登记已落实，未push；施工与运行均已停止，首批闭包不归档。新会话先只读审查固定提交，形成报告后由其唯一承接findings及修复；本计划仍承接原未完成能力和证据。
 
 ### 当前唯一收口表（2026-10-26）
 
@@ -994,7 +994,7 @@ COMPASS指向本交接，KNOWN_ISSUES继续保留矫正区；impls只校准当�
 | IRQ直接已park退出与含Line成员Set随宿主退出 | [IRQ第六轮原观察](../artifacts/irq-exit/20261026T100635.591971Z-41077/evidence.json)PID28/source32/gen6 Waiting/epoch2、原Line loan/节点链；PID29/gen7实际Running但cap slot4/gen1/rights69持WaitSet KOID19019，唯一Member实际挂原Line。两者Kill后各同generation原Line空链/Idle/强根回原两owner，[客体405–409](../artifacts/qemu-acceptance-20261026-180630-41066.log)Pool19003/19011两维全零及scopeDONE，整轮core/shutdown通过。第四/第五轮WaitOne最小证据仍复用，旧整体失败不改写；不代表Set宿主Waiting/所有等待形态或强公平 |
 | IRQ持续事件有界推进/普通任务服务机会 | 监督已亲读原248/250/276/455及真实接线，按下方“IRQ持续事件证据映射”的结构+host+集成组合审定关闭独立差额：单claim/单Line节点锁外Delivery、SEIP Requeue→原安全点→M单advance_one→有限机会rotor、正式xHCI 16事件/more→Runnable，加PLIC/signal/rotor既有host和真实READABLE业务进展/连续Take-Ack/退出证据。7相关源文件与既有验证版本一致；未执行任意高频/同hart指定比例/无限时长压力，不宣称其运行通过。原持续事件合同保留，全idle共同快照与外部唤醒仍单列 |
 
-当前收口方式：停止继续施工和运行，按[审查交接](#审查交接2026-10-27)固定检查点，由主代理完成已授权的commit及本地Review登记；push未授权。已有结构检查、`just check`/host、十面Clippy与分段聚合证据按各自版本复用，不为交接重跑；最后IPI小改仅离线检查，后续运行门仍开放。新会话先只读审查，发现确证问题再由唯一报告承接修复与必要验证，不自动串起验收。两待证及时钟异常未闭合前不归档，不宣告首批完整交付；历史轮次的原失败/授权表述保留当时边界。
+当前收口方式：施工检查点已提交，按[固定实现 Review](todo-2026-10-27-device-implementation-review.md)与[审查交接](#审查交接2026-10-27)进入新上下文审查，未push。已有结构检查、`just check`/host、十面Clippy与分段聚合证据按各自版本复用，不为交接重跑；最后IPI小改仅离线检查，后续运行门仍开放。新会话先只读审查，发现确证问题再由唯一报告承接修复与必要验证，不自动串起验收。两待证及时钟异常未闭合前不归档，不宣告首批完整交付；历史轮次的原失败/授权表述保留当时边界。
 
 #### 成形自查与集中验证记录
 
