@@ -61,11 +61,19 @@ impl Adapter {
     pub fn has_host(&self) -> bool {
         self.host.is_some()
     }
-    pub fn command(&mut self, command: ProvisionCommand) -> Result<Progress, Error> {
+    pub fn command(
+        &mut self,
+        command: ProvisionCommand,
+        signal: Option<Capability>,
+    ) -> Result<Progress, Error> {
         let epoch = command.epoch();
         match command {
             ProvisionCommand::Prepare(_) => {
-                if self.provision.prepare(epoch)? == provision::Prepare::Started {
+                if self
+                    .provision
+                    .prepare(epoch, signal.ok_or(Error::Invalid)?)?
+                    == provision::Prepare::Started
+                {
                     match Collecting::reserve(
                         LIMITS,
                         protocol::RESOURCE_HEADER_LEN,
@@ -82,12 +90,12 @@ impl Adapter {
                     }
                 }
             }
-            ProvisionCommand::Stop(_) => {
-                self.provision.stop(epoch)?;
+            ProvisionCommand::Stop {
+                consumer_quiescent, ..
+            } => {
+                self.provision.stop(epoch, consumer_quiescent)?;
             }
-            ProvisionCommand::ConfirmStopped(_) => {
-                self.provision.confirm_stopped(epoch)?;
-            }
+            ProvisionCommand::Query(_) => {}
             ProvisionCommand::Get { .. } => return Err(Error::Invalid),
         }
         Ok(self.progress(epoch))
@@ -213,7 +221,7 @@ impl Adapter {
         }
         // 原轮消费者报告覆盖最后一次 ECAM 访问及仍需其资源的后代硬件清理；
         // 后续服务只保留不再触碰这些资源的软件收尾。资源 DONE 仍须独立观察。
-        if !active.stopped_report {
+        if !active.consumer_quiescent {
             return Ok(step(Step::Parked));
         }
         if self.retiring < self.children.len() {
@@ -342,6 +350,7 @@ impl PlatformTask {
                 identity: HOST_IDENTITY,
                 limits: LIMITS,
                 claimable: true,
+                stop_requirement: libdevice::binding::StopRequirement::ConsumerQuiescence,
             }
             .encode(deadline, &mut bytes)
             .unwrap_or_else(|e| fatal(e));

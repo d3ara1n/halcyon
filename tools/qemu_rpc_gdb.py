@@ -7,7 +7,7 @@ import subprocess
 
 import qemu_gdb as debug
 
-OPERATIONS = ("Claim", "Prepare", "ProvisionGet", "GetResource", "Activate", "Master")
+OPERATIONS = ("Claim", "Prepare", "ProvisionGet", "GetResource", "Activate", "QueryUse", "Master")
 
 
 def start(kernel, port, operation):
@@ -86,14 +86,17 @@ def eligible(kind, payload, caps):
     detail={{'txid':txid,'kind':kind,'opcode':op,'caps':caps}}
     if OPERATION=='Claim' and kind==device and op==6 and caps==1 and len(body)==36 and u32(body,32)==1:
         detail.update(incarnation=u64(body),device=u64(body,8),epoch=u64(body,16),claimant_context=u64(body,24))
-    elif OPERATION=='Prepare' and kind==provision and op==1 and caps==0 and len(body)==16 and u32(body,8)==2 and u32(body,12)==4:
-        detail.update(epoch=u64(body),resource_count=u32(body,12))
+    elif OPERATION=='Prepare' and kind==provision and op==1 and caps==0 and len(body)==16 and (u32(body,8),u32(body,12)) in ((1,0),(2,4)):
+        # 首次Prepare已接纳即由原Provision持责；后续Prepared从Query读取，不重发Prepare。
+        detail.update(epoch=u64(body),progress=u32(body,8),resource_count=u32(body,12))
     elif OPERATION=='ProvisionGet' and kind==provision and op==2 and caps==1 and len(body)>=44 and u32(body,8)==0 and resource(body[8:])=='ecam':
         detail.update(epoch=u64(body),resource='ecam',index=0)
     elif OPERATION=='GetResource' and kind==device and op==10 and caps==1 and resource(body)=='ecam':
         detail.update(resource='ecam',index=0)
     elif OPERATION=='Activate' and kind==activate and op==1 and caps==1 and len(body)>=56 and u32(body,32)==1 and u32(body,36)==0:
         detail.update(incarnation=u64(body),device=u64(body,8),epoch=u64(body,16),activation_sequence=u64(body,24))
+    elif OPERATION=='QueryUse' and kind==device and op==26 and caps==0 and len(body)==44 and (u32(body,32),u32(body,36),u32(body,40))==(2,1,3):
+        detail.update(incarnation=u64(body),device=u64(body,8),epoch=u64(body,16))
     elif OPERATION=='Master' and kind==master and op==1 and caps==0 and not body:
         pass
     else:return None
@@ -121,6 +124,7 @@ class Select(gdb.Breakpoint):
             raw_header=user_memory(satp,header,header_size)
             expected_kind={{
                 'Claim':0x4445564943450001,'GetResource':0x4445564943450001,
+                'QueryUse':0x4445564943450001,
                 'Prepare':0x50524f5649530001,'ProvisionGet':0x50524f5649530001,
                 'Activate':int.from_bytes(b'DRVACT01','little'),
                 'Master':int.from_bytes(b'PCIFUNC1','little')

@@ -1,7 +1,6 @@
 //! 有界入站 RPC；统一激活/观察由 libdriver 持有，xHCI 仅解释本领域供应。
 use super::*;
 use alloc::vec::Vec;
-use libdriver::worker::Activate;
 use libkernel::ipc::message::ReceivedMessage;
 use librpc::{exchange::RequestContext, outbox::Outbox};
 pub(super) struct Request {
@@ -10,7 +9,6 @@ pub(super) struct Request {
     wire: Vec<u8>,
     header: protocol::Header,
     handles: usize,
-    activation: Option<Activate>,
     outbox: Outbox,
     done: bool,
     control_request: bool,
@@ -42,16 +40,13 @@ impl Request {
         let handles = context.handles.remaining();
         let control_request = (kind == protocol::ID
             && world.control.is_manager_context(who)
-            && protocol::Command::decode(&wire, handles)
-                .is_ok_and(|(_, command)| matches!(command, protocol::Command::Stop { .. })))
+            && protocol::Command::decode(&wire, handles).is_ok_and(|(_, command)| {
+                matches!(command, protocol::Command::QueryActivationResult { .. })
+            }))
             || (kind == device::PROVISION_ID
                 && world.host.is_provider_context(who)
                 && device::ProvisionCommand::decode(&wire, handles).is_ok_and(|(_, command)| {
-                    matches!(
-                        command,
-                        device::ProvisionCommand::Stop(_)
-                            | device::ProvisionCommand::ConfirmStopped(_)
-                    )
+                    matches!(command, device::ProvisionCommand::Stop { .. })
                 }));
         let outbox = Outbox::prepare(
             context,
@@ -67,7 +62,6 @@ impl Request {
             wire,
             header,
             handles,
-            activation: None,
             outbox,
             done: false,
             control_request,
@@ -99,48 +93,42 @@ impl Request {
     }
     fn activate(
         &mut self,
-        id: u64,
+        _id: u64,
         world: &mut World,
         requests: &mut Requests<'_, Family>,
     ) -> Result<(), Error> {
-        if self.activation.is_none() {
-            if !world.control.is_manager_context(self.context) {
-                return Err(Error::Permission);
-            }
-            let (_, command) = protocol::Command::decode(&self.wire, self.handles)?;
-            if world.slot.is_none() {
-                world.slot = Some(ActivationSlot::new(&world.control, command.reference())?);
-            }
-            self.activation = Some(Activate::adopt(
-                &world.control,
-                world.slot.as_ref().ok_or(Error::NotReady)?,
-                self.context,
-                &self.wire,
-                self.handles,
-                &mut self.outbox,
-            )?);
+        if !world.control.is_manager_context(self.context) {
+            return Err(Error::Permission);
         }
-        let activation = self.activation.as_mut().ok_or(Error::Invalid)?;
-        let complete = activation.advance(
-            world.slot.as_mut().ok_or(Error::NotReady)?,
-            &mut world.rpc,
-            id,
-            self.header.deadline,
-            &world.funding,
-        )?;
-        world.rpc_dirty = true;
-        if complete {
-            requests.wake(world.engine)?;
-            world.slot.as_ref().ok_or(Error::NotReady)?.receipt(
-                &mut self.outbox,
-                self.header.op,
-                "usb",
-                &[],
-            )?;
-            self.done = true;
+        let command = world
+            .control
+            .command(self.context, &self.wire, self.handles)?;
+        if world.slot.is_none() && matches!(command, protocol::Command::Activate { .. }) {
+            world.slot = Some(ActivationSlot::new(&world.control, command.reference())?);
         }
+        let slot = world.slot.as_mut().ok_or(Error::NotFound)?;
+        match command {
+            protocol::Command::Activate { .. } => {
+                if slot.accept_activation(
+                    &world.control,
+                    self.context,
+                    &self.wire,
+                    self.handles,
+                    &mut self.outbox,
+                )? {
+                    requests.wake(world.engine)?;
+                    requests.wake(world.lifecycle)?;
+                }
+            }
+            protocol::Command::QueryActivationResult { reference } => {
+                slot.query_result(reference)?
+            }
+        }
+        slot.receipt(&mut self.outbox, self.header.op, "usb", &[])?;
+        self.done = true;
         Ok(())
     }
+
     fn discover(&mut self, world: &World) -> Result<(), Error> {
         use liboal::protocol::{self as oal, Response, Status};
         let result = (|| {
@@ -155,7 +143,7 @@ impl Request {
             if !world
                 .slot
                 .as_ref()
-                .and_then(|slot| slot.activation.as_ref())
+                .and_then(|slot| slot.activation())
                 .is_some_and(|a| a.snapshot().phase == protocol::Phase::Ready)
             {
                 return Err(Status::Revoked);
@@ -225,11 +213,17 @@ impl Request {
         let open = world
             .slot
             .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
+            .and_then(|slot| slot.activation())
             .is_some_and(|a| a.snapshot().phase == protocol::Phase::Ready);
+        let signal = if matches!(command, device::ProvisionCommand::Prepare(_)) {
+            Some(self.outbox.response_mut()?.parts()?.0.handles.take(1)?)
+        } else {
+            None
+        };
         let progress = world.host.command(
             self.context,
             command,
+            signal,
             self.header.deadline,
             &world.control.mailbox,
             open,
@@ -244,12 +238,20 @@ impl Request {
         let open = world
             .slot
             .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
+            .and_then(|slot| slot.activation())
             .is_some_and(|a| a.snapshot().phase == protocol::Phase::Ready);
-        let progress = world
-            .host
-            .transfer(self.context, command, header.deadline, open)?;
-        requests.wake(world.engine)?;
+        let completion = if command.handles() != 0 {
+            Some(self.outbox.response_mut()?.parts()?.0.handles.take(1)?)
+        } else {
+            None
+        };
+        let progress =
+            world
+                .host
+                .transfer(self.context, command, completion, header.deadline, open)?;
+        if !matches!(command, libusb::protocol::Command::Query { .. }) {
+            requests.wake(world.engine)?;
+        }
         let mut bytes = [0; libusb::protocol::Progress::BYTES];
         let used = progress.encode(command.sequence(), &mut bytes)?;
         self.response(None, &bytes[..used])
@@ -269,11 +271,6 @@ impl Request {
         }
         if !self.done {
             if self.outbox.result().is_some() {
-                if let Some(activation) = &mut self.activation
-                    && !activation.retire(&mut world.rpc)
-                {
-                    return Ok(step(Step::Parked));
-                }
                 self.done = true;
             } else if !self.outbox.is_admitted() {
                 return Ok(self.outbox.admit(requests));

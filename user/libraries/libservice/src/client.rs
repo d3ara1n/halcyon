@@ -10,7 +10,7 @@ use libkernel::ipc::{
     message::{MailboxSender, SenderAdoptFailure},
 };
 use liboal::{FollowLimits, LocalError, Namespace, walk::Walk};
-use librpc::{CallError, Caller, Request as RpcRequest};
+use librpc::{CallError, Exchange, Request as RpcRequest};
 mod watch;
 #[derive(Debug)]
 pub enum ClientError {
@@ -49,7 +49,7 @@ pub struct Watch {
 }
 pub struct Publisher<'a> {
     pub sender: &'a MailboxSender,
-    pub caller: &'a mut Caller,
+    pub caller: &'a mut dyn Exchange,
 }
 impl Publisher<'_> {
     pub fn delegate_name(
@@ -109,21 +109,21 @@ impl Publisher<'_> {
 impl RegistrationControl {
     pub fn query(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         deadline: Deadline,
     ) -> Result<RegistrationInfo, ClientError> {
         self.request(caller, Request::QueryRegistration, deadline)
     }
     pub fn withdraw(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         deadline: Deadline,
     ) -> Result<RegistrationInfo, ClientError> {
         self.request(caller, Request::Withdraw, deadline)
     }
     fn request(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         request: Request<'_>,
         deadline: Deadline,
     ) -> Result<RegistrationInfo, ClientError> {
@@ -136,12 +136,16 @@ impl RegistrationControl {
     }
 }
 impl WatchControl {
-    pub fn query(&self, caller: &mut Caller, deadline: Deadline) -> Result<WatchInfo, ClientError> {
+    pub fn query(
+        &self,
+        caller: &mut dyn Exchange,
+        deadline: Deadline,
+    ) -> Result<WatchInfo, ClientError> {
         self.request(caller, Request::QueryWatch, deadline)
     }
     pub fn ack(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         sequence: u64,
         deadline: Deadline,
     ) -> Result<WatchInfo, ClientError> {
@@ -149,14 +153,14 @@ impl WatchControl {
     }
     pub fn cancel(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         deadline: Deadline,
     ) -> Result<WatchInfo, ClientError> {
         self.request(caller, Request::CancelWatch, deadline)
     }
     fn request(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         request: Request<'_>,
         deadline: Deadline,
     ) -> Result<WatchInfo, ClientError> {
@@ -170,11 +174,15 @@ impl WatchControl {
 }
 pub struct Client<'a> {
     namespace: &'a Namespace,
-    caller: &'a mut Caller,
+    caller: &'a mut dyn Exchange,
     limits: FollowLimits,
 }
 impl<'a> Client<'a> {
-    pub fn new(namespace: &'a Namespace, caller: &'a mut Caller, limits: FollowLimits) -> Self {
+    pub fn new(
+        namespace: &'a Namespace,
+        caller: &'a mut dyn Exchange,
+        limits: FollowLimits,
+    ) -> Self {
         Self {
             namespace,
             caller,
@@ -300,7 +308,7 @@ fn decode<'a>(
     protocol::decode_response(bytes, request, deadline, handles).map_err(|_| ClientError::Protocol)
 }
 fn call(
-    caller: &mut Caller,
+    caller: &mut dyn Exchange,
     sender: &MailboxSender,
     request: &Request<'_>,
     deadline: Deadline,

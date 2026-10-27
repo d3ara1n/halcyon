@@ -12,16 +12,23 @@ def program(mode, kernel, addresses, port, logs, boot_package):
     retained = mode == "platform-dma-retained"
     source, line = (("kernel/src/resource/mmio/node.rs", 120) if construction else
                     (("kernel/src/resource/dma/mod.rs", 197) if retained else ("kernel/src/boot/bootstrap.rs", 271)))
+    root_birth_line = None
+    if retained:
+        root_lines = Path("os/kernel/src/resource/dma/mod.rs").read_text().splitlines()
+        line = next(i for i, text in enumerate(root_lines, 1) if "let retained = match self::entry(id.get(), node.clone(), pool)" in text)
+        root_birth_line = next(i for i, text in enumerate(root_lines, 1) if "let entry = prepared(pool)?;" in text)
     error_line = 214 if construction else (266 if retained else 278)
     allocator = addresses["__rustc::__rust_alloc"]
     code = subprocess.check_output([
         "riscv64-elf-gdb", "-q", "-nx", "--batch", str(kernel), "-ex", "set language c",
         "-ex", f"info line {source}:{line}",
+        *(["-ex", f"info line {source}:{root_birth_line}"] if retained else []),
         "-ex", f"info line kernel/src/boot/bootstrap.rs:{error_line}",
         "-ex", f"disassemble /r {allocator:#x},{allocator+52:#x}",
     ], text=True, stderr=subprocess.STDOUT)
     (logs / f"{mode}-code.log").write_text(code)
     point = int(re.search(rf"Line {line} .*starts at address (0x[0-9a-f]+)", code)[1], 16)
+    birth_point = int(re.search(rf"Line {root_birth_line} .*starts at address (0x[0-9a-f]+)", code)[1], 16) if retained else 0
     error_point = int(re.search(rf"Line {error_line} .*starts at address (0x[0-9a-f]+)", code)[1], 16)
     if not re.search(rf"{allocator:#x}[^\n]*addi\s+sp,sp,-32", code):
         raise RuntimeError("platform allocator does not match the verified unexecuted prologue")
@@ -325,31 +332,31 @@ def retained_candidate(frames,gate):
         if check['rejection'] is None:check['rejection']='observation-error'
         check['error']={{'stage':check['stage'],'message':str(error)}}
         save();raise
-def reclaim(address,stage):
-    record=root_snapshot(address,stage)
-    fields=record['fields']
-    require(fields['state.data.value.tree.nodes.len']['canonical']==1 and
-            fields['state.data.value.mappings.len']['canonical']==0,'retained-entry root has unexpected responsibility')
-    require(fields['state.data.value.reclaim_head']['canonical']==facts['node_id'],'original root reclaim does not contain the dropped Node')
-    member=record['member']
-    require(member is not None,'original root tree lost its unfinished storage')
-    require(member['sealed'] and member['finished'] and member['dropped'],'last Node Drop did not finish the original tree member')
-    require(fields['record.inner.value.state.state']['canonical']=='Queued','original Root Work is not retained in the maintenance queue')
 checkpoint=gdb.Breakpoint('*{point:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
 allocation=gdb.Breakpoint('*{allocator:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
 error=gdb.Breakpoint('*{error_point:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
 kick=gdb.Breakpoint('*{addresses['kernel::maintenance::kick']:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
 parking=gdb.Breakpoint('*{addresses['kernel::hart::park']:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
 root_return=None;root_return_pc=None
+birth=gdb.Breakpoint('*{birth_point:#x}',type=gdb.BP_HARDWARE_BREAKPOINT) if retained else None
+if birth is not None:birth.silent=True
 allocation.enabled=False;error.enabled=False;kick.enabled=False;parking.enabled=False
 for breakpoint in (checkpoint,allocation,error,kick,parking):breakpoint.silent=True
 while len(parked)<4:
     gdb.execute('continue',to_string=True)
     frame=gdb.newest_frame();frames=stack();pc=int(gdb.parse_and_eval('$pc'))&((1<<64)-1)
     gate=int(gdb.Value({addresses['kernel::registry::GATE']}).cast(gdb.lookup_type('u8').pointer()).dereference())
+    if birth is not None and pc=={birth_point}:
+        require(gate==0,'DMA root birth is not before Ready')
+        pool=arc(frame.read_var('pool'))
+        facts['before_root_birth']=snapshot();save();birth.enabled=False
+        continue
     if root_return is not None and pc==root_return_pc:
         facts['root_returned']=True;save();root_return.enabled=False
         require(injected,'DMA root returned without the selected allocation; candidate checks retained')
+        facts['after_root_return']=snapshot();save()
+        require(facts['after_root_return']==facts['before_root_birth'],'unpublished DMA root birth did not refund locally')
+        facts['root_birth_refunded']=True;save()
         continue
     if pc=={point}:
         require(gate==0,'platform funding checkpoint is not before Ready')
@@ -424,7 +431,7 @@ while len(parked)<4:
         else:actual=str(frame.read_var('error'))
         require(actual.endswith('OutOfMemory') if construction or retained else actual.endswith('AllocationFailed'),'unexpected actual platform error: '+actual)
         current=snapshot()
-        if not retained:require(current==baseline,'local construction/reservation charge did not return to its original owner')
+        require(current==(facts['before_root_birth'] if retained else baseline),'local construction/reservation charge did not return to its original owner')
         if not construction and not retained:require(int(body_table(frame)['occupied'])==0,'batch failure installed a capability')
         facts['actual_error']=actual;facts['after']=current
         if retained:facts['error_observation']['stage']='recorded'
@@ -436,16 +443,7 @@ while len(parked)<4:
             if retained and in_source(caller,'resource/dma/mod.rs','::drop'):
                 node=fresh(int(caller.read_var('self')),'kernel::resource::dma::Node')
                 address=int(arc(node['root']).address)
-                facts['last_drop']={{'node_address':hex(int(node.address)),'node_id':int(pointer(node['id'])),
-                    'root_address':hex(address),'expected_root':hex(retained_root),'expected_node_id':facts['node_id']}}
-                facts['observation_stage']='last Node Drop identity';save()
-                require(address==retained_root,'last Node Drop published a different Root')
-                require(facts['last_drop']['node_id']==facts['node_id'],'last Node Drop has a different NodeId')
-                reclaim(address,'last Node Drop')
-                nodes[address]=DMA_ROOT
-                facts['root_drop_observed']=True
-                print('PLATFORM_DMA_LAST_NODE_DROP original Root Work queued with reclaim member')
-                break
+                require(address!=retained_root,'unpublished empty DMA root incorrectly queued normal reclaim Work')
             kind=next((name for path,name in NODE_TYPES if in_source(caller,path,'::notify')),None)
             if kind is not None:
                 address=int(arc(caller.read_var('self')).address)
@@ -464,10 +462,9 @@ while len(parked)<4:
         parked.add(number);print('PARKED thread=%d gate=2'%number)
         facts['parked']=sorted(parked);save()
         if not construction:
-            require(len(nodes)==facts['cap_count']-6+(1 if retained else 0),'not all real platform root cleanup owners were observed')
+            require(len(nodes)==facts['cap_count']-6,'not all real platform root cleanup owners were observed')
             if retained:
-                require(facts.get('root_drop_observed'),'specific retained-entry last Node Drop was not observed')
-                reclaim(retained_root,'park thread '+str(number))
+                require(facts.get('root_birth_refunded'),'unpublished DMA root was not refunded before boot failure')
             facts['queued_roots']=[]
             for address,kind in nodes.items():
                 record=work_snapshot(address,kind,'park thread '+str(number))

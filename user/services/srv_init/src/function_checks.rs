@@ -1,5 +1,8 @@
 //! 原资源验收中的真实控制器消费者；两轮能力身份与硬件责任均由原Binding承担。
-use super::device::{Manager, call_until};
+use super::{
+    RootSupervisor,
+    device::{Manager, call_until},
+};
 use alloc::sync::Arc;
 use erhino_shared::{
     object::{ObjectSignals, Rights},
@@ -21,6 +24,7 @@ use libkernel::{
     mmio::MmioControl,
     time,
 };
+use librpc::Exchange;
 use libusb::xhci::{Controller, Inputs, Progress};
 
 // 验收防挂死界覆盖一次完整真实控制器轮次，不改变硬件halt/reset限值。
@@ -37,9 +41,10 @@ fn now(end: Deadline) -> Result<u64, &'static str> {
     }
     Ok(now)
 }
-fn pause(end: Deadline) -> Result<(), &'static str> {
+fn pause(root: &mut RootSupervisor, end: Deadline) -> Result<(), &'static str> {
     let at = now(end)?.saturating_add(1_000_000).min(end.at_ns);
-    time::sleep_until(Deadline { at_ns: at, ..end }).map_err(|_| "function check sleep failed")
+    root.sleep_until(Deadline { at_ns: at, ..end })
+        .map_err(|_| "function check sleep failed")
 }
 fn checked(
     reply: &librpc::Reply,
@@ -79,13 +84,14 @@ fn empty(
     Ok(())
 }
 fn watch(
+    root: &mut RootSupervisor,
     sender: &MailboxSender,
     command: Command<'_>,
     manager: &Manager,
     op: u16,
     end: Deadline,
 ) -> Result<Watch, &'static str> {
-    let reply = call_until(sender, command, end)?;
+    let reply = call_until(root, sender, command, end)?;
     if reply.sender_pid != manager.pid() {
         return Err("function check Watch sender mismatch");
     }
@@ -99,8 +105,14 @@ fn watch(
     )
     .map_err(|_| "function check Watch adoption failed")
 }
-fn wait_change(watch: &Watch, pid: u64, sequence: u64, end: Deadline) -> Result<(), &'static str> {
-    let reply = call_until(watch.control(), Command::AckWatch { sequence }, end)?;
+fn wait_change(
+    root: &mut RootSupervisor,
+    watch: &Watch,
+    pid: u64,
+    sequence: u64,
+    end: Deadline,
+) -> Result<(), &'static str> {
+    let reply = call_until(root, watch.control(), Command::AckWatch { sequence }, end)?;
     if reply.sender_pid != pid {
         return Err("function check Watch ack sender mismatch");
     }
@@ -109,7 +121,8 @@ fn wait_change(watch: &Watch, pid: u64, sequence: u64, end: Deadline) -> Result<
         return Err("function check Watch unexpectedly terminal");
     }
     if info.pending == 0 {
-        let result = wait::wait_until(watch.observer().as_handle(), ObjectSignals::READABLE, end)
+        let result = root
+            .wait_until(watch.observer().as_handle(), ObjectSignals::READABLE, end)
             .map_err(|_| "function check Watch wait failed")?;
         if !result.observed.contains(ObjectSignals::READABLE) {
             return Err("function check Watch notification missing");
@@ -117,8 +130,13 @@ fn wait_change(watch: &Watch, pid: u64, sequence: u64, end: Deadline) -> Result<
     }
     Ok(())
 }
-fn sequence(watch: &Watch, pid: u64, end: Deadline) -> Result<u64, &'static str> {
-    let reply = call_until(watch.control(), Command::QueryWatch, end)?;
+fn sequence(
+    root: &mut RootSupervisor,
+    watch: &Watch,
+    pid: u64,
+    end: Deadline,
+) -> Result<u64, &'static str> {
+    let reply = call_until(root, watch.control(), Command::QueryWatch, end)?;
     if reply.sender_pid != pid {
         return Err("function check Watch query sender mismatch");
     }
@@ -126,10 +144,11 @@ fn sequence(watch: &Watch, pid: u64, end: Deadline) -> Result<u64, &'static str>
         .map_err(|_| "function check Watch query invalid")?
         .sequence)
 }
-fn discover(manager: &Manager) -> Result<DeviceId, &'static str> {
+fn discover(root: &mut RootSupervisor, manager: &Manager) -> Result<DeviceId, &'static str> {
     let end = deadline()?;
     let observer = manager.observer()?;
     let watch = watch(
+        root,
         observer,
         Command::WatchScope { scope: Scope::Root },
         manager,
@@ -137,11 +156,12 @@ fn discover(manager: &Manager) -> Result<DeviceId, &'static str> {
         end,
     )?;
     loop {
-        let seq = sequence(&watch, manager.pid(), end)?;
+        let seq = sequence(root, &watch, manager.pid(), end)?;
         let (mut after, mut scan_end) = (0, 0);
         loop {
             now(end)?;
             let reply = call_until(
+                root,
                 observer,
                 Command::Enumerate {
                     scope: Scope::Root,
@@ -158,7 +178,7 @@ fn discover(manager: &Manager) -> Result<DeviceId, &'static str> {
             let Some(id) = scan.device else {
                 break;
             };
-            let reply = call_until(observer, Command::QueryDevice { id }, end)?;
+            let reply = call_until(root, observer, Command::QueryDevice { id }, end)?;
             if reply.sender_pid != manager.pid() {
                 return Err("function check discovery sender mismatch");
             }
@@ -174,16 +194,17 @@ fn discover(manager: &Manager) -> Result<DeviceId, &'static str> {
                 Err(_) => return Err("function check device description failed"),
             }
         }
-        wait_change(&watch, manager.pid(), seq, end)?;
+        wait_change(root, &watch, manager.pid(), seq, end)?;
     }
 }
 fn phase(
+    root: &mut RootSupervisor,
     control: &MailboxSender,
     manager: &Manager,
     reference: BindingRef,
     end: Deadline,
 ) -> Result<Phase, &'static str> {
-    let reply = call_until(control, Command::QueryBinding, end)?;
+    let reply = call_until(root, control, Command::QueryBinding, end)?;
     let snapshot = protocol::decode_snapshot(checked(&reply, manager.pid(), 8, None, 0)?)
         .map_err(|_| "function check binding snapshot invalid")?;
     if snapshot.reference != reference {
@@ -192,6 +213,7 @@ fn phase(
     Ok(snapshot.phase)
 }
 fn wait_phase(
+    root: &mut RootSupervisor,
     control: &MailboxSender,
     watch: &Watch,
     manager: &Manager,
@@ -201,8 +223,8 @@ fn wait_phase(
 ) -> Result<(), &'static str> {
     loop {
         now(end)?;
-        let seq = sequence(watch, manager.pid(), end)?;
-        let current = phase(control, manager, reference, end)?;
+        let seq = sequence(root, watch, manager.pid(), end)?;
+        let current = phase(root, control, manager, reference, end)?;
         if current == desired {
             return Ok(());
         }
@@ -211,10 +233,11 @@ fn wait_phase(
         {
             return Err("function check binding stopped prematurely");
         }
-        wait_change(watch, manager.pid(), seq, end)?;
+        wait_change(root, watch, manager.pid(), seq, end)?;
     }
 }
 fn master(
+    root: &mut RootSupervisor,
     sender: &MailboxSender,
     provider: &mut Option<u64>,
     end: Deadline,
@@ -229,7 +252,7 @@ fn master(
     .map_err(|_| "function check master encoding failed")?;
     let request = librpc::Request::new(libpci::function::ID, &bytes[..used])
         .map_err(|_| "function check master request failed")?;
-    let reply = librpc::Caller::new()
+    let reply = root
         .call(sender, end, request)
         .map_err(|_| "function check master outcome unknown")?;
     let (header, body) =
@@ -269,16 +292,16 @@ fn command_address(info: libpci::function::FunctionInfo) -> Result<u64, &'static
     )
     .ok_or("function check ECAM address overflow")
 }
-pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
-    let id = discover(manager)?;
-    let (source, admin) = manager.controller_source(id)?;
-    let mut old: Option<(BindingRef, Arc<MailboxSender>, MailboxSender)> = None;
+pub(super) fn run(root: &mut RootSupervisor, manager: &Manager) -> Result<(), &'static str> {
+    let id = discover(root, manager)?;
+    let (source, admin) = manager.controller_source(root, id)?;
+    let mut old: Option<(BindingRef, Arc<MailboxSender>, MailboxSender, MailboxSender)> = None;
     let mut provider = None;
     #[cfg(feature = "acceptance-irq-retirement")]
     let mut irq_tail: Option<(libkernel::irq::IrqUse, erhino_shared::irq::IrqToken)> = None;
     for round in 1..=2 {
         let end = deadline()?;
-        let reply = call_until(&source, Command::QueryDevice { id }, end)?;
+        let reply = call_until(root, &source, Command::QueryDevice { id }, end)?;
         if reply.sender_pid != manager.pid() {
             return Err("function check query sender mismatch");
         }
@@ -289,7 +312,7 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
         }
         let reference = BindingRef::new(id, info.epoch.ok_or("function check missing epoch")?)
             .map_err(|_| "function check invalid ref")?;
-        let mut reply = call_until(&source, Command::Claim { reference }, end)?;
+        let mut reply = call_until(root, &source, Command::Claim { reference }, end)?;
         let snapshot = protocol::decode_snapshot(checked(&reply, manager.pid(), 6, None, 1)?)
             .map_err(|_| "function check Claim invalid")?;
         if snapshot.reference != reference {
@@ -302,8 +325,9 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
                 .map_err(|_| "function check Control missing")?,
         )
         .map_err(|_| "function check Control role invalid")?;
-        let binding_watch = watch(&control, Command::WatchBinding, manager, 16, end)?;
+        let binding_watch = watch(root, &control, Command::WatchBinding, manager, 16, end)?;
         wait_phase(
+            root,
             &control,
             &binding_watch,
             manager,
@@ -312,15 +336,24 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             end,
         )?;
         empty(
-            &call_until(&control, Command::IssueRegistrar, end)?,
+            &call_until(root, &control, Command::IssueRegistrar, end)?,
             manager.pid(),
             20,
             Some(Error::Permission),
         )?;
         let mut inputs = Inputs::new();
+        let mut issued = call_until(root, &control, Command::IssueUse, end)?;
+        checked(&issued, manager.pid(), 9, None, 1)?;
+        let (usage, _) = MailboxSender::from_capability(
+            issued
+                .handles
+                .take(0)
+                .map_err(|_| "function check Use missing")?,
+        )
+        .map_err(|_| "function check Use role invalid")?;
         let mut dma_observer = None;
         for (index, name) in libpci::function::RESOURCES.iter().enumerate() {
-            let reply = call_until(&control, Command::GetResource { name }, end)?;
+            let reply = call_until(root, &usage, Command::GetResource { name }, end)?;
             let body = checked(&reply, manager.pid(), 10, None, 1)?;
             let entry = Entry::decode(body, protocol::HEADER_LEN, reply.handles.len())
                 .map_err(|_| "function check resource invalid")?;
@@ -376,13 +409,14 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             .description()
             .map_err(|_| "function check function identity failed")?
             .object_id;
-        if let Some((old_ref, old_function, old_control)) = &old {
+        if let Some((old_ref, old_function, old_control, old_use)) = &old {
             if reference.epoch() <= old_ref.epoch() {
                 return Err("function check epoch did not advance");
             }
             empty(
                 &call_until(
-                    old_control,
+                    root,
+                    old_use,
                     Command::GetResource {
                         name: "pci-function",
                     },
@@ -392,7 +426,7 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
                 10,
                 Some(Error::Closed),
             )?;
-            if phase(old_control, manager, *old_ref, end)? != Phase::Released {
+            if phase(root, old_control, manager, *old_ref, end)? != Phase::Released {
                 return Err("function check old control revived");
             }
             if old_function
@@ -403,7 +437,7 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             {
                 return Err("function check context reused");
             }
-            if master(old_function, &mut provider, end)? != Some(Error::Permission) {
+            if master(root, old_function, &mut provider, end)? != Some(Error::Permission) {
                 return Err("function check old context accepted new Prepared");
             }
             debug!(
@@ -422,9 +456,9 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
                 .step(now(end)?)
                 .map_err(|_| "function check controller start failed")?
             {
-                Progress::Starting => pause(end)?,
+                Progress::Starting => pause(root, end)?,
                 Progress::EnableMaster => {
-                    if master(&controller.function, &mut provider, end)?.is_some() {
+                    if master(root, &controller.function, &mut provider, end)?.is_some() {
                         return Err("function check new context rejected");
                     }
                     controller
@@ -476,15 +510,15 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
                 info.scope.targets.trailing_zeros(),
                 info.generation
             );
-            let observed =
-                wait::wait_until(controller.interrupt.handle(), ObjectSignals::READABLE, end)
-                    .map_err(|_| "IRQ real insertion wait failed")?;
+            let observed = root
+                .wait_until(controller.interrupt.handle(), ObjectSignals::READABLE, end)
+                .map_err(|_| "IRQ real insertion wait failed")?;
             if !observed.observed.contains(ObjectSignals::READABLE) {
                 return Err("IRQ insertion notification missing");
             }
             // 本消费者尚未Take/Ack：真实READABLE保持期间，让另一正式actor处理原查询。
             // 这证明持续电平下的实际业务推进，不把一次等待调用当作已park证据。
-            let reply = call_until(&control, Command::QueryBinding, end)?;
+            let reply = call_until(root, &control, Command::QueryBinding, end)?;
             let snapshot = protocol::decode_snapshot(checked(
                 &reply,
                 manager.pid(),
@@ -560,15 +594,15 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             }
         }
         empty(
-            &call_until(&control, Command::StopBinding, end)?,
+            &call_until(root, &control, Command::StopBinding, end)?,
             manager.pid(),
             11,
             None,
         )?;
         loop {
-            match master(&controller.function, &mut provider, end)? {
+            match master(root, &controller.function, &mut provider, end)? {
                 Some(Error::Closed) => break,
-                None => pause(end)?,
+                None => pause(root, end)?,
                 _ => return Err("function check stopped function returned unexpected status"),
             }
         }
@@ -587,12 +621,13 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
                 .step(now(end)?)
                 .map_err(|_| "function check controller stop failed")?
             {
-                Progress::Stopping => pause(end)?,
+                Progress::Stopping => pause(root, end)?,
                 Progress::Closed => break,
                 _ => return Err("function check unexpected controller stop phase"),
             }
         }
-        let result = wait::wait_until(dma.handle(), ObjectSignals::DONE, end)
+        let result = root
+            .wait_until(dma.handle(), ObjectSignals::DONE, end)
             .map_err(|_| "function check DMA completion wait failed")?;
         if !result.observed.contains(ObjectSignals::DONE)
             || dma
@@ -604,7 +639,7 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             return Err("function check DMA did not retire");
         }
         let retained = controller.function.clone();
-        // SAFETY: Controller原Closed已证明HCH/残事件/四份DMA DONE；ReportStopped尚未发，上级仍持MMIO。
+        // SAFETY: Controller原Closed已证明HCH/残事件/四份DMA DONE；ReportQuiescent尚未发，上级仍持MMIO。
         unsafe { controller.unmap() }.map_err(|_| "function check controller unmap failed")?;
         debug!(
             "function session hardware stopped: round={}, device={}, epoch={}, dma_members=0, unmapped=true",
@@ -613,12 +648,13 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             reference.epoch()
         );
         empty(
-            &call_until(&control, Command::ReportStopped, end)?,
+            &call_until(root, &usage, Command::ReportQuiescent, end)?,
             manager.pid(),
             12,
             None,
         )?;
         wait_phase(
+            root,
             &control,
             &binding_watch,
             manager,
@@ -634,18 +670,18 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             context
         );
         if round == 1 {
-            old = Some((reference, retained, control));
+            old = Some((reference, retained, control, usage));
         }
     }
     let end = deadline()?;
     empty(
-        &call_until(&admin, Command::SealSource, end)?,
+        &call_until(root, &admin, Command::SealSource, end)?,
         manager.pid(),
         2,
         None,
     )?;
     loop {
-        let reply = call_until(&admin, Command::QuerySourceStop, end)?;
+        let reply = call_until(root, &admin, Command::QuerySourceStop, end)?;
         if reply.sender_pid != manager.pid() {
             return Err("function check source query sender mismatch");
         }
@@ -653,11 +689,14 @@ pub(super) fn run(manager: &Manager) -> Result<(), &'static str> {
             .map_err(|_| "function check source closure invalid")?
         {
             SourceStop::Closed => break,
-            SourceStop::Stopping => pause(end)?,
+            SourceStop::Stopping => pause(root, end)?,
             SourceStop::Open => return Err("function check source reopened"),
         }
     }
-    if let Some((_, function, control)) = old {
+    if let Some((_, function, control, usage)) = old {
+        usage
+            .close()
+            .map_err(|_| "function check old Use close failed")?;
         Arc::try_unwrap(function)
             .map_err(|_| "function check unexpected function owner")?
             .close()

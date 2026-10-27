@@ -1,8 +1,8 @@
 # 设备体系设计：领域模型、驱动管理与资源收束
 
-> 状态：**首批施工检查点已提交，闭包未交付，当前转独立代码审查。** 本篇继续作为唯一活跃设计、实施与未完成责任记录；固定对象和审查范围见[实现 Review 计划](todo-2026-10-27-device-implementation-review.md)，未 push。当前方案取代[早期讨论快照](archived/ref-2026-10-23-device-design-rounds.md)中的候选和待选方向。服务装配、平台保留内存、系统终局仍由各自计划拥有；当前范围、事实与开放项见[审查交接](#审查交接2026-10-27)。
+> 状态：**第二轮机制收敛、生命周期收口及所选组合验证已完成，本次统一保存代码交付；首批完整闭包仍有独立门未关闭。** 本篇拥有详细目标、实施与原开放验收门；第二轮发现、处置与验证见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)及[生命周期收口档案](archived/review-2026-10-27-device-lifecycle.md)，原固定对象见[登记档案](archived/todo-2026-10-27-device-implementation-review.md)。当前交付与后续安排见[提交与调查接力](#第二轮提交与调查接力)。服务装配、平台保留内存和系统终局仍由各自计划拥有；首轮检查点与证据边界见[历史审查交接](#审查交接2026-10-27)。
 
-新会话从[实现 Review 计划](todo-2026-10-27-device-implementation-review.md)和[审查交接（2026-10-27）](#审查交接2026-10-27)接手，先读固定检查点与[唯一收口表](#当前唯一收口表2026-10-26)，再开展只读审查。正文拥有详细合同；2026-10-25施工接手及后续历史轮次只保留当时事实，不从其“下一步”自动恢复施工。
+第二轮已实施合同及原验证由[机制收敛档案](archived/review-2026-10-27-device-implementation.md)保存；其后的[生命周期与观察收口](archived/review-2026-10-27-device-lifecycle.md)已完成修复、复核及所选组合验证，该档案保存增量目标和证据。[唯一收口表](#当前唯一收口表2026-10-26)继续维护DMA＋IPI待证与独立时钟异常，原全hart idle门已在替代结构下关闭。impls按当前代码回填；历史施工与审查交接段保留当时事实，不从其中的旧目标恢复施工。
 
 ## 目标与范围
 
@@ -13,6 +13,199 @@
 首批使用启动映像集提供驱动声明与可执行映像。磁盘仓库格式、安装、更新和来源认证按用户要求延期；不因此延期运行期按需激活。首批不实现通用 HID、外置 USB hub、PCI bridge/PCI 热插、MSI、IOMMU、非一致 DMA、动态保留区/reusable、透明管理者恢复。它们不能被静默当成已支持能力；具体触发与完成门见文末。
 
 遵守 less is more：只有设备实例、一次绑定及所属领域的实际资源/会话；不建通用 Lease、ClaimScope、第二个 HAL/DAL 发现框架、驱动 Runtime、通用分布式事务或持久恢复账本。已有 OAL、RPC、执行、等待、进程与预算机制继续按其合同使用。
+
+## 第二轮收敛设计（2026-10-27）
+
+本轮由用户授权继续审查与重构设计。以下是主代理依据实际代码、架构咨询及责任链推演作出的目标裁决，当前已按此实施；代码、验证与剩余边界由[机制收敛报告](archived/review-2026-10-27-device-implementation.md)承接，原验收门的当前关闭/开放状态由本篇唯一收口表维护。没有增加复合USB、IOMMU、透明重启或通用驱动框架的承诺。
+
+### 本轮选择与适用边界
+
+选用“稳定逐轮 owner＋完整状态观察＋原轮 Use 直接提交受限静止事实”。srv_driver 继续拥有选择、进程关联与故障政策；srv_device 不识别程序、PID 或 libdriver 的激活阶段。停止的唯一业务入口为原 Binding 的 Stop/StopClaim/来源封口，驱动按原 Binding 观察结束访问，不再需要管理者逐层重发 StopActivation。
+
+采用直连的依据是：可以在已有 BindingUse 的认证 context 上增加一项冻结的窄权限，不需要新参与者登记、报告对象、恢复账本或第三个协调者。原来 `Activation snapshot→Managed→ReportStopped` 的转述链因此消失；`Binding→Provision` 的供应协调仍由设备领域拥有。普通硬件报告不能因进程终态被合成。
+
+| 比较项 | 保留协调者转述 | 本轮选用结构 |
+|---|---|---|
+| 停止传播 | Binding Stop 后还向 worker 发 Stop，再查询激活状态 | 原轮 Binding Watch 交完整快照，驱动据此停止 |
+| 静止事实 | 管理者核声明、读 snapshot、发 ReportStopped | 已授权的 Use context 直接报告自身原轮，管理者不解释硬件证据 |
+| 供应进展 | 重复 Prepare/Stop 读状态，单独 ConfirmStopped | 原 provider 保存状态并通知；Stop 带单调的消费者静止事实 |
+| 能力发行 | 每次 IssueUse/IssueRegistrar 可新建角色，Unknown 只能保守停止 | 一个 Binding 的逻辑消费角色和子登记来源固定，重复请求恢复原别名 |
+| 生命周期 | RPC 请求内首次准备，Instance/Engine 在旁等待 | 逐轮实例拥有准备资格与实际执行；RPC 只读写该实例 |
+
+这些差异允许改变现有用户态协议；相关生产者、消费者和验收一起迁移，不保留兼容命令。共享内核 ABI、DMA 安全模型、MMIO 强制退休、IRQ token 契约不因此修改。
+
+### 1. 稳定记录与阶段持有
+
+Registry/Seat 仍是设备存在和当前占用的唯一真值。Binding 的任务在 Claim 提交前准入，持有供应调用、冻结表、暴露事实和释放责任。当前业务事实与运输 txid 分开：Query 不形成业务阶段，不保存 Query 结束后回跳的 resume；已提交的意图、完成事实和尚缺条件决定下一动作。
+
+| owner | 必须保存的阶段资源 | 退休提交点 |
+|---|---|---|
+| Binding 业务部分 | Provision、Collecting/Frozen、原轮观察、单一供应调用及停止期限 | provider 明确 Closed、真实依赖 Binding 已 Released、原调用已脱离后，Registry 同 actor 提交 Released |
+| 驱动逐激活实例 | 冻结的 Use/Registrar 身份、唯一首次核验、Binding 观察、实际 Engine 与本轮 IO | 无访问效果的拒绝完成本地收尾；已开始访问者先停止并收束实际 IO，再等原 Binding Released |
+| Provision | 一个 active epoch 的准备/停止效果、冻结输出、进度通知出口 | 实际供应资源与迟到硬件责任安全结束，更新 closed_epoch |
+| 终态回执 | 固定原轮身份、只读结果、旧角色/Lifetime、已接请求与实际存储费用 | 最后对应角色和已接运输退休；不阻止业务 Released |
+| ProcessTask | 稳定 InstanceId、进程/Pool、启动与 DONE、从 runs 推导的关联 | 全部绑定安全脱离后收集；不等待外部旧功能别名永久消失 |
+
+Binding 在 Released 后消耗式移出并释放业务 Box，原任务可继续承载紧凑回执和真实 Lifetime；不能只切 enum 而保留完整 Work/provider。终态接口只操作本回执，拒绝 Get/新派生/新功能安装；Query/重复 Stop 仍针对原轮。只有仍会用于范围/授权查询的独立对象保留 Registry 身份引用，回执不为已结束业务额外保留来源/设备引用。费用按实际释放的存储退款，尾部记录仍有独立数量/字节上限。
+
+驱动的首次 Activate 在任何远端核验前完成本地认证、冻结输入、预付实例/任务/观察容量，并原子登记唯一 Preparing owner。Preparing 已承担接纳后的责任，但没有访问硬件的许可。原 BindingUse 的首次权威核验和 Watch 安装均由它持有，只有确认原轮 ResourcesReady、观察承载已可用后才开始 Get/IO。并发重复请求只引用该 owner，不各自发首次查询；输入/入口身份不一致返回 Conflict。
+
+核验拒绝、超时或 Stop 先到时，原 Preparing 永久关闭提交资格；取消/退休查询和所有已接请求后进入拒绝回执，不需要先造 Activation 才能退休。若从未取得/使用资源，不为本地退场等待一个伪造的“成功激活”；已经发生 IO 的记录必须走正常停止。记录从索引摘除前须排除其旧查询再提交的可能；所有重入 Activate 都重新核原 Use，中央已经停止的旧轮不能复活。未被接受的请求只释放自身候选，不改变已存在实例。
+
+### 2. BindingUse 与子 Registrar 是原轮出口
+
+一个 Binding 对应一个逻辑消费 owner；capability 别名可供该 owner 内部委派，不能解释成多个独立的静止报告者。`IssueUse` 首次成功把一个固定 context 和母本归入原 Binding；重复调用返回同一身份别名，不能再发行第二个独立 Use。必要角色/执行存储在首次提交前预付，未提交失败不设置已发行；提交后回复丢失可按原 Control 恢复。
+
+真实 GetResource 只接受该原轮 Use；Control 保留管理、查询和零资源能力的发现投影，不再直接取得硬件资源。这样资源出口与消费报告指向同一逻辑消费角色。自行消费硬件的 init 验收也必须先取得 Use，不能保留测试特权分支。原 Use 的内部别名和派生访问由同一可信消费 owner 负责，报告必须覆盖全部委派访问。
+
+`IssueRegistrar` 同样为一个父 Binding 固定一对 Registrar/SourceAdmin。其范围、父轮和来源权限由原 Control 与 CHILD_REGISTER 派生，重复只交原别名；一个 Registrar 可按原 publication_seq 发布许多子实例，不需要每次请求发行新来源。通用 GrantSource 的任意派生不据此变成可恢复事务。
+
+Stopping 后只允许恢复已经存在的原轮出口，且它们的新使用门已经关闭；不得首次发行 Use 或 Registrar。Released 后关闭母本，不再取得新别名；已在途和外部别名按原身份退休。母本不与服务记录组成递归强引用环；子来源仍用 BindingRef 数字关系，既有实际来源/设备引用负责其存储寿命。
+
+这改变原“每次 IssueUse 独立发行”的用户态语义，迁移全部实际调用者。多 Binding 进程复用继续按各自 BindingRef/context 隔离，不把同进程的 Use 合并。
+
+### 3. 停止要求与受限报告
+
+登记增加不可变的 `StopRequirement`，由真实供应 owner 在受权 Register 时声明，重复 Register 必须相同：
+
+- `ProviderOwned`：供应者能独立终止已交付会话的实际访问并证明安全；普通 USB 接口使用此形态。
+- `ConsumerQuiescence`：供应停止需要原消费 owner 先结束直接访问；平台 PCI host 和 PCI xHCI 使用此形态。
+
+停止要求不再从 Frozen 中“是否出现 DmaUse/DmaDomainControl”猜测。它描述供应安全条件，不授予报告权；声明错误的 provider 仍违反自己作出的 Closed 承诺。新平台或总线必须按真实停止能力选形态，不能靠隐藏 DMA 于另一种 capability 来改变责任。
+
+`ConsumerQuiescence` 的 IssueUse 要求原 ClaimSource 具有 REPORT_STOPPED 的委派权限，否则拒绝发行；服务在该固定 Use 角色上记录 `REPORT_QUIESCENT` 操作权。受信驱动的选择和这项权限的交付由已认证装配/srv_driver 决定，驱动声明、payload、PID 均不能自授。ProviderOwned 的 Use 没有这项权利；HID 不取得物理停止报告权。
+
+首次对实际 BindingUse 的核验回复同时包含服务端保存的停止要求与该角色操作掩码，worker 在任何 IO 前核对所需报告权限；这是已认证接口的角色描述，不由程序配置猜测。后续每次报告仍检查服务端真实 context/权限，客户端缓存不能授权。Binding Watch 只携原轮业务状态，不把操作权当成全局可转让字段。
+
+`ReportQuiescent` 使用实际 Use context 定位原 Binding，无任意目标参数。只在原 Binding 已 Stopping 时接纳，原轮内幂等、单向；来源封口不撤掉已承担清理的报告权限。Released 旧角色仅返回本轮已经结束，不作用于后来 epoch。报告的含义是“该消费 owner 及其委派访问已经永久结束”；typed API 为 unsafe 证据边界，不能由 Terminal/CPU DONE/关闭句柄自动调用。
+
+Binding 在同 actor 封 Get 后仍可依据自己的不可逆 `resources_exposed=false` 证明消费访问从未产生，无需等待不存在的 worker 报告。该位在真实资源别名离开唯一出口前置位，回复缺失不能清回 false。消费代码若能实际证明本地未访问硬件或已经完成停止，即使 Get 运输结果 Unknown 也可提交真实报告；不能仅凭“未收到成功回复”推导这一事实。
+
+### 4. 观察返回完整状态，运输不制造业务阶段
+
+Binding Watch 的 Query/Ack 回复原子配对 `{sequence, pending, terminal_reason, BindingSnapshot}`。建立时固定 BindingRef 并持原 Shared Binding，因此 Released 后读它的终态回执，不跟随后来的 Seat。Scope Watch 仍只提供范围变化信息，枚举按原弱一致合同；不把一棵树塞进快照。
+
+使用现有 librpc::subscription::Protocol 的类型化 Snapshot。Binding 与 Activation 的快照进入宿主已有的有版本缓存后即可 Ack 该序号并唤醒所属 owner，不必等后续 RPC/功能发布完成才确认“已消费”；通知不是要求逐项执行的命令队列。版本不能倒退，停止/终态不能被旧快照覆盖，首个失败理由不被后来普通更新清除。
+
+保留既有 Subscription 任务作为独立等待/运输 owner；先去掉它与 Managed 间的 reading/changed 往返。它们的源/txid 有实际用途，不为减少任务数强迫多个 ConsumerTask 共享一个会被全部 drain 的 Input。Managed 消费缓存事实，公共 Drivers 视图直接投影这些事实及选择/进程关联，不另写一套生命周期阶段。
+
+worker 的 Binding 观察同样独立于硬件 RPC，先于资源访问成立。用户来源失效、Stop 和 Released 都沿此通道；普通生命周期不再 1ms/2ms Query。订阅建立失败时不得开始 IO，已经在 IO 的观察失败转本地停止/明确故障，绝对期限仍负责升级。QueryBinding 保留显式检查和有限 Unknown 恢复，不承载正常常态轮询。
+
+### 5. Activate 接纳、观察与结果分离
+
+worker 管理入口只接受：
+
+| 操作 | 输入与提交语义 | 回复 |
+|---|---|---|
+| Activate | 原 BindingRef、固定 identity、Use、可选原 Registrar；认证成功并预付唯一 Preparing owner 后接纳 | 原轮接纳快照与观察入口；不等待硬件 Ready |
+| QueryActivationResult | 原 BindingRef；仅真实 WorkerControl manager context 可调用，不再携 Use/Registrar | 原实例状态；Ready 时配对同一个功能根、名字和描述 |
+| 公开激活 Observe/Watch/Ack | 原观察 context，零业务 capability 输入 | 有序状态快照；不授予功能能力 |
+
+移除独立 StopActivation 命令。正常停止、取消未知 Activate 和替换实现都先提交原 Binding Stop；worker 从绑定观察和首次核验收束，不由管理者再发第二种停止命令。实例自主失败时立即封新业务并发布带首个错误原因的 Stopping 快照，管理者据此立即提交原 Binding Stop，不等 Terminal 或静止报告；实例继续持有原 IO 与子供应清理，访问永久结束后才报告 Quiescent，实际本地清理完成后发布 Terminal。管理者失效由 init 原 SourceAdmin/Job 的故障政策收束。这样不会让父实例等子清理完成才公布错误、子又等父 Binding Stop 的通知环。
+
+Ready 的 function capability 只能经 WorkerControl 的结果出口交管理者；公开激活观察不得借机取得功能，Devices/FunctionAccess 的授权门仍在。管理者按原轮取得一次功能结果并幂等安装，Ready→Stopping 交错时丢弃迟到根，不发布。普通 Starting/Stopping/Terminal 和静止进展直接读 Snapshot，不重新 Activate。
+
+Activate 的 Unknown 恢复只针对同一原轮和冻结输入。决定取消时只停止原 Binding，不用恢复回执才能停止。没有取得观察入口时可按同一 Activate 恢复；Stop 后迟到 Activate 的本地/远端核验永久阻止新 IO。RPC 的取消与结果注销先完成，才归还该运输的预留。
+
+### 6. Provision 采用通知和单调停止意图
+
+每个 Binding Work 在 Claim 准入时预付一对 Notification 和一个本地等待来源。Work 持 Owner 并先挂好等待，provider 只取得 SIGNAL 角色；Prepare(e, signaler) 在准备效果之前固定该轮通知身份。同 e 重复 Prepare 必须指向同一通知对象，不换 sink；closed_epoch 仍封住迟到 Prepare，不保留无限历史。
+
+provider 在 Preparing→Prepared、失败、停止进展成为可读事实及 Closed 的提交点发提示。Work 在准备查询前排空自身通知，再读取 `QueryProvision(e)` 的完整进度；查询在途来的新提示留作下一次读取。通知可合并、不是事实或计数；snapshot/closed_epoch 才是判据。首次 Prepare 回复可以直接带现有进度，后续无变化时不重发 Prepare。
+
+`StopProvision(e, consumer_quiescent)` 把停止意图与已有消费静止事实一次提交：phase 单向进入 Stopping，true 只能累积，后来 false 不能撤回；true 可随第一次 Stop 到达。停止要求为 ProviderOwned 时 provider 自行收束；ConsumerQuiescence 要求 true 或已独立取得足够硬件证据后才完成。它仍拥有 Prepare 自身效果、真实子责任、IRQ/MMIO/DMA 退休。
+
+移除 ConfirmStopped 以及中央 stop_acknowledged→confirmed 的专用串行握手。中央先发 false 以尽快封供应，后来取得真实报告时再发 true；回复缺失读取同轮进度或在原绝对期限内重提同一单调意图，不新建轮次。明确 Closed 才进入中央依赖释放检查；Unavailable/NotFound/超时从不变成 Closed。通知失败关闭观察或触发明确故障，不能因此释放硬件。
+
+NotificationSignaler 的最后关闭不关闭接收 Owner 的电平，不能用通知 CLOSED 充当 provider 死亡检测。继续保留既有 Provision 入口 Lifetime/供应进程监督和准备、停止的绝对期限。排空提示后的 Query 若失败，必须有限恢复或进入明确故障，不能假设以后还有一条提示而永久 Parked。
+
+Prepare/Stop 的通知出口来自唯一调用者 Work，无动态 Watch 注册、Ack RPC 或任意多观察者表。实际 provider 的普通准备/停止进度仍按其既有 Runtime 推进；所有输出副本和效果继续归同一原轮。外部别名与迟到运输不能使新轮采用旧结果。
+
+### 7. USB 完成通知与必要轮询分开
+
+原 USB session 保留单 seq、输入和结果的合同。HID 在第一条 Transfer 前创建并挂好本 session 的通知 Owner；第一条 Transfer(seq=1, request, signaler) 在实际提交 TD 前把通知身份连同原请求保存。重复同 seq 核输入和通知身份；后续 seq 沿同一通知，不重复建来源。若第一条操作是 Cancel，同样交该通知以封该 seq；Query 不创建请求或改变通知身份。
+
+Controller 的真实结果写入 `current.result` 后发提示。HID 排空提示后 Query 原 seq；结果已先完成也必须可读。下一 seq 只在旧结果已取得后提交，沿原规则确认旧结果；旧提示最多引起一次新查询，不能确认后来结果。Stop/取消/断开既结束接纳，也产生可查询终态并提示。
+
+通知 Owner 消散或 signal 失败只说明客户端观察不可达，不能释放 TD。实际 TD/地址/结果仍由原 session/Controller 持有，沿 Provision.Stop 和原硬件命令收束。只读 Query 不无条件唤醒硬件 Engine。
+
+xHCI 需要读 CNR/HCRST/HCH、reset/枚举阶段尚无可用事件的推进，保留按具体硬件条件和绝对期限安排的轮询。进入稳定运行后靠 IRQ/请求/真实资源 DONE 推进，不把全部 Engine 永久挂在一个 1ms 节拍上。各 Stage 的唤醒来源须在迁移时逐项核定，不能先删 timer 再补偶然唤醒。
+
+### 8. 三条端到端责任轨迹
+
+| 轨迹 | 业务推进与最终 owner | Unknown/失败边界 |
+|---|---|---|
+| 正常停止 | Control.Stop 封中央 Get 并发布 Stopping；Work 向 provider 提交 Stop(false)，worker 从原 Watch 停自身及下游 IO；可信 worker 以原 Use 报告；Work 提交 Stop(true)；provider 结束实际资源并公布 Closed；Registry 核实际依赖后 Released；worker/Managed 脱离，ProcessTask 收集 | 任一等待仅以对应 owner 的真实完成事实推进；期限到界进入原故障政策，不先归还 DMA |
+| Activate 已接纳、回复丢失 | worker 的 Preparing owner 仍持首次核验/观察；管理者可以同输入恢复，也可直接 StopClaim；迟到核验见 Stopping 不 Get，已访问者正常停止并报告；原 Binding 独立持供应责任 | 不另签 Use/Registrar、不换 epoch；未取得回执不是无消费者证明。原调用/旧请求必须脱离后才丢相关记录 |
+| 父已停止访问、子尚未 Released | 父 Engine 停新业务但保留供应协议服务；子硬件/会话由真实 provider 完成 Closed，中央释放子轮；父只有结束子清理仍需的父资源访问后才可报告，报告不必等子软件 Binding Released；中央父轮仍按实际依赖门等待，父进程关联保留到父 Released | 自主失败先公布 Stopping/错误以传播停止；不等父进程 DONE 才释放子、不因父 Terminal 杀父进程；静态拓扑子节点不自动变为供应依赖 |
+
+当 ProviderOwned 的 HID 子消费者死亡时，xHCI 的 session owner 仍能取消/停止 TD，中央按供应安全释放，不要求死 HID 的报告。可信 xHCI/PCI 实际 owner 死亡而无硬件静止证明时，保持 DMA pin/写许可及原故障终局，不新增透明恢复。
+
+来源树和设备树的准入、撤出及真实依赖谓词暂保留为单一真值。当前按两类关系推导的释放集合有独立语义；为少扫几次而增加永久供应 DAG、镜像成员表或第二份计数不构成本轮收敛。通知负责唤醒已有父任务，最终释放仍在同一 actor 原谓词复核。
+
+### 9. 付款、容量与有界执行
+
+| 承载 | 准入点及付款者 | 结构容量与释放 |
+|---|---|---|
+| 中央 Binding | Claim 前，原来源 domain/execution 账户；内核对象另付所在进程 Pool | 一份业务 owner、一份供应通知/等待、最多一条在途供应 RPC，外加按 Limits 预付的资源表；Released 释放业务存储 |
+| 稳定 Use / 子来源 | 首次发行前，原 Binding 来源账户 | 每 Binding 一个 Use、至多一对子 Registrar/Admin；母本随停止/释放规则关闭，旧运输照寿命付款 |
+| Binding/Activation Watch | 发行前由原调用角色账户准入 | 每订阅一等待来源、一 RPC 槽和有界快照；管理者每 Binding 至多两种订阅，worker 每激活一 Binding 订阅 |
+| 驱动实例 | Activate 接纳前，worker 原实例与执行预算 | 一份 Preparing/Engine owner、业务 RPC 与绑定观察各自有承载；报告在业务调用已脱离后可复用其槽，绝不抢未退休 txid |
+| USB 通知 | 第一条请求提交前，HID 付 Owner/来源，provider 付存储与接收句柄 | 每真实 session 一份通知身份，TD/结果容量沿原配置；无按键时不增加周期请求 |
+| 终态回执 | 原准入预留覆盖，原 owner 继续付款 | 按实际小记录、角色、Lifetime、已接请求计费；不凭逻辑 Released 提前退款 |
+
+生产者的 signal/Query/Stop 失败不丢已提交 owner。预留的是控制/清理执行、存储和有限在途槽，不能宣称底层物理堆或所有 Receive 安装必成；运输失败以原有限收尾或明确故障处理，禁止为成功率无限重发。公开观察流量不能借报告/停止角色占控制预留；报告认证必须在选择付款账户前完成。
+
+任务每步只做一个协议提交、一次有界资源推进或一个记录处理；通知、业务和退出均回到现有 Runtime 公平推进。库不另建执行器。用户态仍以 actor 单一所有权为主；本轮不新增跨线程共享状态或内核锁阶。
+
+### 10. 实施顺序、删除门与验证
+
+两条责任链已按以下顺序完成一致性迁移。这里保留范围及删除门，后续接手以当前唯一收口表为准：
+
+1. **设备逐轮控制链**：同步 libdevice/libdriver/libusb 协议与类型；重构中央 Binding/固定出口/完整 Watch；接 provider 通知与单调 Stop；接驱动 Preparing owner、Binding 观察、直接报告、结果取得；接 srv_driver 事实推进及真实消费者。旧 StopActivation、ConfirmStopped、Control 直接 Get/报告、按快照重发 Activate、周期生命周期/USB 查询和重复 Describe 已删除。`srv_init::function_checks` 使用原 Use Get/Report，并保留旧 Use 验证关闭，不把新 Control 的 Permission 当成旧轮失效证据。
+2. **装配监督链**：由[服务装配的第二轮设计](todo-2026-10-07-service-assembly.md#第二轮持续监督设计2026-10-27)拥有；阻塞等待、loader 与原 root 已接通，双线程协调已删除。
+
+C5 的 DMA 未发布空根构造回退按内核独立契约实施：末次 retained 条目失败时，趁唯一局部 owner 仍持 Node，在锁内 seal/finish/remove 该零成员单根、锁外释放；Node Drop 见已无记录不发布 Root Work。仅适用于未发布空根，真实派生树和已暴露 Mapping 的维护/保留不改。
+
+验证以可观察合同为依据：同轮重复发行身份不变；Preparing 拒绝及迟到查询不复活；两个 Binding 不能互报；普通 Use 拒报告；来源 Seal 后 Watch 仍交最终快照；旧 Ack 不清新变化；Prepare/Stop/Activate/结果回复缺失仍归原轮；父子停止无循环；无输入 USB 不重复发请求且完成早于等待不丢；旧入口尾部不持供应 owner；公开压力不挤占清理执行。复用现有 host 协议/Registry 测试、真实 PCI/xHCI/HID 与 A/B/C 消费者。
+
+正式实施仍执行规定的 check/clippy 与必要设备/故障/退款组合。全 hart idle 门在常态工作已静默后重新取同一时点与真实唤醒证据；DMA＋IPI 和时钟异常不因本设计关闭。原 Describe/Get、线程 ACK/join、未发布根异步退休等机制专属门，只有旧路径已删除且替代合同有证据时才登记被替代。
+
+### 外部机制对照及适用限制
+
+- [Genode Foundations 26.05：异步通知](https://genode.org/documentation/genode-foundations/26.05/architecture/Inter-component_communication.html) 明确 signal 可合并、无 payload，处理次数不能当事件次数，需要另读当前状态；[session 寿命](https://genode.org/documentation/genode-foundations/26.05/architecture/Recursive_system_structure.html) 由 server 拥有 RPC 对象身份。这里用于核对“owner 保存结果、通知只提示”，不移植其销毁 server 等同关闭 session 的政策。
+- [Linux 6.12 devres](https://www.kernel.org/doc/html/v6.12/driver-api/driver-model/devres.html) 明确 managed resources 只负责 freeing，其他检查仍归驱动；[v6.12 dd.c](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/base/dd.c?h=v6.12) 的 device_remove 先于 device_unbind_cleanup/devres_release_all。它支持软件释放与硬件停止分别论证，不支持用 Drop 推导 DMA 静止。
+- [Fuchsia driver dispatcher](https://fuchsia.dev/fuchsia-src/concepts/drivers/driver-dispatcher-and-threads) 与 [C++ driver rubric](https://fuchsia.dev/fuchsia-src/development/drivers/developer_guide/cpp-rubric) 分别描述 dispatcher 停止顺序与无法确认设备停止时保留 pin。两者为 2026-10-27 取回的滚动页面，且 DriverBase/DriverBase2 命名跨页不同，仅作非规范对照，不作为本项目固定硬件合同或子设备停止顺序的证据。
+
+### 本轮设计检查与接力
+
+对新目标的限定接口检查覆盖唯一 Use 直接报告、Preparing 拒绝/Unknown/父子收束，以及 Provision/USB 通知的先完成后等待、回复缺失和跨轮寿命。发现自主失败若等到本地清理后才公布 Terminal，可能阻断子停止传播；已修订为立即公布 Stopping/首错，管理者立即 Stop 原 Binding，再等实际清理。主代理核对了 PCI 现有先 Withdraw 子登记再等待供应的路径，以及 ConsumerQuiescence 的真实报告等待条件。通知生产者消散不等于接收 Owner CLOSED 的边界亦已明确。
+
+上述限定设计检查在施工前完成，随后实现与所选运行验证已完成，证据见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。协议两侧与实际消费者已同步，不保留旧 wire 兼容层。ideas 本轮未重写，不能把旧线稿当作本目标的额外来源；原开放验收门继续按[唯一收口表](#当前唯一收口表2026-10-26)处理。
+
+### 第二轮交付后整理
+
+用户在第二轮交付后授权整理代码、完善文档和计划。整理时基线为 `refactor/system-redesign` / `a5a1a789`，当时未提交或 push；归档报告和原验收指纹保持当时事实，不把整理后的代码冒充原路线的逐字节版本。当前交付状态由下节拥有。
+
+- 代码：root RPC 的推进、就绪检查和等待错误统一交原 CallOperation::abort；准备失败与 Start 失败共用取消后的 Collector 交接；Image 的逐页清理复用同一个保留失败 owner 的 Unmap 函数。通用等待基础设施失败直接进入 root 故障终局，不再借用 loader 命名入口。没有增加状态、协议或 owner。
+- 接口与实现说明：补齐 Preparation 完成/首错/取消/Drop、GrantOutcome 的消费语义和 ImageView 的读取寿命；startup、runtime、rpc 按实际类型、接点和失败责任回填。修正旧出生块写法、Job 拓扑及“尚无驱动启动”的过时说明。
+- 计划：当前第二轮接点与首轮历史交接明确分开；服务装配和系统总纲不再登记已完成的线程替换、loader 迁移或驱动接线。原 DMA＋IPI 及独立时钟异常仍只由本篇唯一收口表承接。
+- 验证：`just check`、全部十个 clippy 分面、user 格式检查、libprocess/librpc 的 21 项 host 测试及 debug core 回归均退出 0。日志见 `artifacts/refactor/tidy-{check,clippy,fmt,host,core}.log`，core 实际入口为[本轮运行](../artifacts/run/20261027-175453-50937-acceptance-virt-debug.log)。host 仅覆盖其可执行的纯逻辑，分步装载与根调用通过目标编译、源码等价核对和真实 core 检查；未重复全部设备故障组合，也不扩大原验收声明。
+
+本轮源码指纹与原交付的六文件差异见[整理版本](../artifacts/refactor/tidy-source-version.json)。交付前核对三条 RPC 错误分支仍使用原 cause/投递阶段，取消仍先保留 GrantOutcome 再交原 Collector，Unmap 失败仍放回原映射；文档链接、标题锚点和 diff 空白按本次修改检查。无需新增平行任务；未来固定提交的独立审查覆盖第二轮完整改动及本次整理。
+
+### 第二轮提交与调查接力
+
+本次代码交付统一包含第二轮设备控制链、持续监督及分步 ELF/loader/Image、未发布 DMA 空根局部回滚、后续生命周期与观察收口，以及实际消费者、验收工具和说明回填。代码基线为 `a5a1a7893872e73d410eecb38b7ea21aed7d1616`；固定提交在提交后的独立 Review 登记中记录。两份归档报告中的“尚未提交”保留归档时的历史事实，不作为当前接力状态。
+
+最近版本已通过 `just check`、十分面 Clippy、137项相关 host 测试及 core/reuse/candidates/QueryUse/GetResource/Master 六条真实路线，具体证据与精确交错未动态注入的边界见[生命周期交付档案](archived/review-2026-10-27-device-lifecycle.md#最终组合验证与交付边界)。提交整理已核源码与该版本指纹一致，不重复运行已通过路线；较早第二轮平台/监督/IRQ 证据按原档案的版本和覆盖边界复用，不冒充本轮逐项重跑。
+
+用户已确认后续主线转入剩余问题调查，按以下顺序接续：
+
+1. **DMA 保留＋IPI 失败组合**：从[唯一收口表](#当前唯一收口表2026-10-26)的原第五轮断点开始，先核当前产物及已修正诊断脚本，再取同次 InitialWatch DONE、同一真实 IPI call 的失败返回/消费、后续原广播及同组 Mapping/Backing 跨四 hart 停驻保留。保持 selector/WFI 和原映射集合判据；证据缺口不自动升级为产品缺陷，不另开重复计划。
+2. **独立平台时钟异常**：按[有限首因调查方案](#实际时钟失败的有限首因调查方案)接续，明确本次要区分的假设和有限观察窗口。历史未复现不算修复；本项不与 DMA＋IPI 的成败互相替代。
+
+调查前读取 DEBUG-PLAYBOOK，涉及 GDB/平台再读 TOOLING-PITFALLS。独立代码 Review 单独登记固定交付，不替代上述取证，也不重复已结束的设备迁移、全 hart idle 验收或线程监督改造。通用长期服务/持久化关机及其他扩展仍按各自触发条件设计。
 
 ## 领域、运行角色与 OAL
 
@@ -87,8 +280,8 @@ OAL 是虚拟投影，不是全系统实际树。srv_device 可以拥有真实�
 | FunctionAccess | 在明确设备范围取得已发布功能入口；不含 Claim、BindingUse 或资源表；可与观察权装在同一 sender context |
 | ClaimSource | 在已授权范围 Claim/StopClaim、恢复本主体原轮控制；由 srv_driver 持有 |
 | ClaimSourceAdmin | 封本来源并停止其已提交绑定；交给 init，申请角色不能解封 |
-| BindingControl | 查询/停止这一轮，发行 BindingUse、安装不透明激活观察入口和功能关联；srv_driver 持有 |
-| BindingUse | 逐名取本轮资源、观察本轮停止；驱动持有，不默认能 Claim、复位其他设备或管理来源 |
+| BindingControl | 查询/停止这一轮，取得固定原轮 Use/子 Registrar、安装不透明激活观察入口和功能关联；srv_driver 持有 |
+| BindingUse | 逐名取本轮资源、观察本轮停止；只有按第二轮停止要求明确授权的角色可报告原轮消费静止，不含 Claim、来源管理或其他轮权限 |
 | Provision | 本登记单元的准备/停止/结果接口；仅 srv_device 持有调用角色；该接口不附带 Claim、其他 BindingControl 或来源管理权 |
 
 这些是领域权利集合，不要求每个角色另造 mailbox。provider 以内核认证 sender_context_id 查本地不可伪造的授权、范围和付款绑定；payload 里的角色名、PID、DeviceId 都不能替代该绑定。DeviceAdmin 可签发缩小范围的观察/功能/登记/Claim 来源，派生不能扩权；首批授权范围为已存在祖先及其后代，来源被封或祖先 Withdraw 后禁止新的业务取得，旧停止/观察控制仍可收尾。来源签发 Unknown 的装配收束由服务计划拥有，不恢复丢失结果后无条件再签发。
@@ -124,12 +317,12 @@ Provision 状态为 `{closed_epoch, active: None | (epoch, Preparing|Prepared|St
 
 | 操作/结果 | 合同 |
 |---|---|
-| `Prepare(e)` | Binding 已提交后调用；只建立一份 active 准备。相同 e 返回原进度/结果，旧已关闭轮返回 Closed，前轮未关闭不得准备下一轮 |
+| `Prepare(e,signaler)` | Binding 已提交后调用，按第二轮通知合同固定本轮结果提示出口；只建立一份 active，相同 e/输入恢复原进度，旧轮 Closed，不越过未关闭前轮 |
 | `Rejected(e,reason)` | 没有遗留效果，provider 已将 closed_epoch 推至 e；可以安全收束该轮 |
 | `Failed(e,reason)` | 可能有供应/硬件效果，转 Stopping；不能据失败直接释放 |
 | `Prepared(e,count)` | 整表已冻结；逐索引 `GetPreparedResource(e,index)` 返回同一表项的 capability 别名及 name/type/rights/metadata；重复不重新分配业务资源 |
-| `Stop(e)` | 幂等；无 active 时可先封闭经认证调用者发行且 e>closed_epoch 的轮次，迟到 Prepare 不再开始；已有相同 e 则取消准备、停止资源并保留责任，存在另一 active 时拒绝越轮。封准入不要求立刻撤掉协作停止仍需的 MMIO/IRQ |
-| `ConfirmStopped(e)` | 本轮消费者侧访问责任已结束或从未产生：srv_device 转交受权的原轮协作事实，或在原 Binding 已 Stopping、Get 门已封且资源能力从未交出时由原 Work 确认。重复无新效果，旧轮不作用于新轮。只改变消费者停止证据，不自行产生 Closed；provider 自己 Prepare 的硬件效果、子责任、资源控制与退休仍全部由它负责 |
+| `StopProvision(e,consumer_quiescent)` | 幂等且意图单调；无 active 时封住迟到 Prepare，已有相同轮停止自身效果，另一 active 拒绝越轮；消费者静止 true 只累积，独立 ConfirmStopped 删除，详见第二轮合同 |
+| `QueryProvision(e)` | 读取原轮进度与已接纳静止事实，不新建准备、不推进硬件；Closed 仍由实际 owner 提交，常态变化靠原通知 |
 | `Closed(e)` | 对该轮准备效果、派生 use、在途硬件访问与实际释放条件的保证；不是仅关闭 endpoint 或超时 |
 
 调用权限限定到本实例的 srv_device 调用 context；普通驱动与 payload 中的角色标志不能发行 Provision 轮次。无 active 时，Prepare 接受该已授权发行者的 e>closed_epoch，先把 closed_epoch 推至 e−1（未曾准备的跳过轮均关闭），再建立 active(e)；有 active 时只接受相同 e，其他新轮返回 Busy。srv_device 只为本地已提交 Binding 发 Prepare，先收到旧 active 的 Closed 才发送下一轮；公开 Claim/StopClaim 的未来轮校验仍由 srv_device 强制。这样空闲取消不会卡住后续准备，旧在途 Prepare 也不能越过高水位复活。准备可能改变硬件，必须从一开始归原 Binding；不能把有副作用工作提前到 Claim 提交前。
@@ -163,13 +356,13 @@ init 启动管理基座并委托唯一自动选择范围；srv_driver 订阅设�
 5. 驱动 `Ready(function_root,description)` 交付一个 OAL 功能根。srv_driver 凭 BindingControl 安装该根及激活观察关联；同一根的重复安装幂等，不同根 Conflict。只允许 ResourcesReady 且尚未 Stop 的本轮安装；迟到 Ready 不发布，直接收尾。
 6. 按装配需要发布 Registry 或用途视图。发布不是 Binding/设备/Registry 的全局事务；必选出口失败则该能力激活失败并停止，可选出口失败只降级诊断。首批必要出口为设备 functions，Registry 是可选别名。
 
-驱动激活阶段为 Starting/Ready/Stopping/Terminal(ok|error)；两种终态统一，区别仅在有无错误原因，后续处理路径相同。它不复制设备绑定状态。Ready 只表示本次功能可受理，Terminal 报告是协作证据，硬件是否安全仍由 Provision/资源控制确认。ReportStopped/ConfirmStopped 报告链**只在声明了 TrustedPhysical DMA 主控角色的设备**停止路径中使用：管理者通过 BindingControl 的 `ReportStopped` 转交，srv_device 向原 Provision 调用 ConfirmStopped；两者按 BindingRef 幂等，停止期间仍可调用。非 DMA 设备的停止仅走 Provision.Stop 控制侧路径，不需要此报告链。受信物理主控角色必须在装配时具备该证据提交权限，不能从声明/tag 中自授；无此权限的报告仅是诊断。
+驱动公开激活阶段为 Starting/Ready/Stopping/Terminal(ok|error)，其底层准备 owner 和拒绝回执按第二轮阶段持有合同区分。Ready 只表示功能可受理，Terminal 不证明硬件安全。停止要求、Use 窄权限及 ReportQuiescent 由[第二轮收敛设计](#第二轮收敛设计2026-10-27)唯一定义，取代管理者转述 ReportStopped 与独立 ConfirmStopped；不从声明/tag 或资源类型自授报告权。
 
-`StopActivation(ref,deadline)` 幂等，禁止该激活新业务，推进既有请求收尾；其后迟到 Activate 不重新启动同一 ref。重复记录保留至该 Binding 已 Released 且控制关系退休，容量随真实记录付款。一个进程死亡时停止其全部绑定；进程复用节省启动成本，也明确扩大故障影响范围。
+停止统一提交原 Binding，不另发行 StopActivation。逐激活 owner 消费原轮观察收束；有访问效果的业务等真实 Released，拒绝准备与终态回执分别按第二轮合同退休。进程死亡停止其全部绑定，复用节省启动成本也扩大故障影响范围。
 
-Activate 本地接受后即可返回 Starting 和该激活的观察入口，不把一条 RPC 长期扣作 Ready 的唯一交付渠道。管理者先订阅、再重复同一 Activate 读取阶段/Ready 根，按观察序号确认；复用 librpc 序号订阅和 NotificationObserver，保留同一 BindingUse，不重新取得另一轮。libdevice 只保存不透明观察入口，不解释 libdriver 阶段。worker 接受时把请求任务链接到该激活记录，并观察 BindingUse 的停止；管理者失联也不能留下无 owner 的初始化。
+Activate 接纳后返回 Starting 和原观察入口；状态由有序快照读取，Ready 功能根由受管理入口认证的 QueryActivationResult 取得，不为观察进展重复运输 Use/Registrar。libdevice 只保存不透明激活观察入口，不解释 libdriver 阶段。worker 的原轮 owner 在开始 IO 前完成 Binding 核验和观察接线；具体提交、Unknown 与拒绝边界由第二轮合同拥有。
 
-终态记录在 Binding 已安全 Released、全部已接请求/观察任务及导出控制关系退休后才能回收。回收后迟到的 Activate 必须先查询所附 BindingUse 的实际阶段；Closed/Stopping 拒绝，新数值 ref 或 payload 不能重建使用权。查询在途任务也先持原记录，不能出现“旧查询成功回复尚在途，记录已删后重新激活”的窗口。只有已认证可信主控明确报告本轮硬件静止，管理者才转交 ReportStopped；Starting/Ready/Terminal(ok|error) 本身均不是这个报告。
+有访问效果的实例与无效果的拒绝准备分别按第二轮合同进入终态承载；最终回收仍须原请求/观察任务和导出关系全部退休。回收后迟到 Activate 必须重新核实际 Use；旧查询的提交资格在摘记录前永久关闭，数值 ref 不能复活使用权。硬件静止只由有权且持实际证据的原轮 Use 报告，任何公开激活阶段本身都不构成该报告。
 
 停止首先封本地 Get、卸下功能边并通知相关 provider 停止准入，同时发起可选 Registry Withdraw；远端撤名失败不阻塞硬件停止。已取得的 session 由实际 provider 拒绝/收束，删目录不会撤销它。消费者重连必须显式取得新入口，不能把同路径新设备当作旧会话延续。
 
@@ -261,7 +454,7 @@ trap 每次最多 claim 一个 source，不分配、不做用户 RPC。内核记
 
 正常 `Retire(mapping)` 可由创建它的受信 DmaUse 角色提交，或由其上级 control 提交；前者不能退休另一 use 的映射。因而 xHCI 可以在运行期间回收已完成的 transfer 缓冲，不必逐次调用 PCI provider。`Seal(domain)` 只阻止新 Pin/使用，不自动证明旧 DMA 消失。libkernel 的安全 wrapper 不把 Drop 包装成完成，提交可信物理 DMA 退休是显式、须论证的边界。根 control 可封全部派生，binding 子 control 只作用于自己的映射。无 IOMMU 时根不能凭空撤销物理写能力；缺少 quiescence 证据保持 pin，系统故障复位，不谎报 Revoke 已完成。
 
-TrustedPhysical 下，已由装配准入为可信主控的驱动可提供本轮硬件静止报告；报告经实际激活入口认证、绑定到 BindingRef，按上述 ReportStopped→ConfirmStopped 转交，不能由 payload 的可信标志自授资格。PCI Provision 依据该报告、已封口 DmaDomain 的所有 mapping 退休完成和自身 bus-master/IRQ/MMIO 收束确认 Closed，不自行解释 xHCI 寄存器。DmaDomain 提供 Idle/终态观察，只有已封口且无活动映射才成立，不能将瞬时映射数为零当成域停止。驱动报告后永久关闭本轮提交；这是可信基座合同，不能推广为不可信驱动说 stopped 就安全。驱动死亡或报告缺失时没有替代证据，走保留与故障终局。
+TrustedPhysical 下，已由装配准入为可信主控的驱动通过第二轮合同规定的原 Use 窄权限报告本轮静止，不能由 payload 的可信标志自授资格。PCI Provision 依据中央转交的单调消费静止事实、已封口 DmaDomain 的所有 mapping 退休完成和自身 bus-master/IRQ/MMIO 收束确认 Closed，不自行解释 xHCI 寄存器。DmaDomain 提供 Idle/终态观察，只有已封口且无活动映射才成立，不能将瞬时映射数为零当成域停止。驱动报告后永久关闭本轮提交；这是可信基座合同，不能推广为不可信驱动说 stopped 就安全。驱动死亡或报告缺失时没有替代证据，走保留与故障终局。
 
 首批用固定长度 MemoryObject 页构造 ring/数据，CPU View 仍可 Unmap/降权，DMA 的独立 use 保证实际页不释放，设备写许可保证对象不能提前变为 Executable；不禁止与 DMA 安全无关的 VM 操作。CPU 与设备并发访问按驱动协议划分所有权并使用适当屏障。页级 pin 不代表整片物理连续，返回 SG 段。xHCI 小 ring/DCBAA/context 使用满足规范对齐与边界的页内区域，数据跨 64 KiB 按 TRB 分段。不另建 raw 虚拟地址转物理地址的旁路。
 
@@ -375,7 +568,7 @@ USB Provision 创建**已限定设备/接口及端点的会话**，表就绪前�
 
 USB 请求通过所属协议提交 Setup/端点、方向、长度、数据 owner 和期限；host 校验接收范围并承担从提交至硬件完成/取消的责任。首批小控制/键盘报告走有界消息，host 自己的稳定 DMA 缓冲承接硬件，叶驱动不 pin 自己的任意页。请求取消可能与完成竞态，回复 Unknown 不释放 host 缓冲；session.Stop 阻止新请求，按 xHCI endpoint/slot 命令和完成事件收束旧请求。拔出只是物理事实，DMA transfer/event ring 不因设备消失立即释放。
 
-首批每个接口会话至多一个未确认请求，`Transfer(seq, request)` 在预付任务/缓冲就绪后提交，再写 TD/doorbell；相同 seq 和输入重试返回原进度/结果，不发第二个 USB 事务，输入不同 Conflict。完成结果保留至客户端提交下一 seq，下一 seq 同时确认前一结果；前一请求尚活跃则 Busy。`Cancel(seq)` 可先封尚未开始的当前轮，已开始则进入真实 endpoint 取消；旧 seq 不影响后续。取消 Unknown 时继续原 seq 或停止整个会话，不能丢 DMA 缓冲后重发。seq 不回绕，记录/结果字节和 host 缓冲均在接受前付款；session.Stop 负责最后未确认结果及在途责任。此限制来自首批串行 boot 控制/键盘轮询需求，未来并行传输另以实际队列容量扩展，不预建通用事务日志。
+首批每个接口会话至多一个未确认请求，`Transfer(seq, request)` 在预付任务/缓冲就绪后提交，再写 TD/doorbell；相同 seq 和输入重试返回原进度/结果，不发第二个 USB 事务，输入不同 Conflict。首 seq 的 Transfer 或 Cancel 还必须携带同一完成 Signaler，Query 不携能力；通知身份、提交和读取遵守[第二轮完成通知合同](#7-usb-完成通知与必要轮询分开)。完成结果保留至客户端提交下一 seq，下一 seq 同时确认前一结果；前一请求尚活跃则 Busy。`Cancel(seq)` 可先封尚未开始的当前轮，已开始则进入真实 endpoint 取消；旧 seq 不影响后续。取消 Unknown 时继续原 seq 或停止整个会话，不能丢 DMA 缓冲后重发。seq 不回绕，记录/结果字节和 host 缓冲均在接受前付款；session.Stop 负责最后未确认结果及在途责任。此限制来自首批串行 boot 控制/键盘请求需求，未来并行传输另以实际队列容量扩展，不预建通用事务日志。
 
 接口控制请求首批只开放该接口的 HID SET_PROTOCOL 和所需只读描述/状态读取，逐项检查 recipient、wIndex、方向与长度；不把任意 class request 都放行。SET_ADDRESS/SET_CONFIGURATION/SET_INTERFACE、设备复位、其他接口和端点访问由 USB owner 拒绝或自行管理。共享 EP0 由 host 串行仲裁，取消某接口请求时保留其他接口已接受请求的 owner，不让叶驱动操作 endpoint ring。
 
@@ -478,6 +671,10 @@ HID 驱动校验 boot keyboard 描述并 SET_PROTOCOL(0)，消费 8 字节报告
 | 仿射资源 | 目录当前仅可别名角色；libdevice 与资源 owner | 第一项必须转移且不能别名的真实资源出现时设计，不用 Taken 位提前承担不存在的寿命 |
 
 ## 当前进度与接力
+
+第二轮设备控制链、root 持续监督与分步装配已完成，原首批闭包仍保留 DMA＋IPI 组合证据缺口和独立时钟异常；当前入口为[唯一收口表](#当前唯一收口表2026-10-26)。本轮整理及补充验证见[交付后整理](#第二轮交付后整理)。
+
+> 下方首轮施工、交接及审查交接保留当时事实与授权，不是当前施工指令；其中旧接口、旧工作树状态和“下一步”不再生效。当前目标以第二轮收敛设计为准，原验收证据及剩余门只由唯一收口表维护。
 
 本轮代码实施从 `refactor/system-redesign` / `549a9e7` 的干净工作树开始。用户已授权按完善后的方案落地，范围为本篇首批设备闭包，依次接通启动事实/特权资源、设备领域、驱动管理装配、真实 PCI/xHCI/HID 与验收。独立设计增量 Review 仍按原登记排期，不将其记为已完成；提交和 push 均未获本轮授权。
 
@@ -944,36 +1141,36 @@ QEMU_ACCEPTANCE_KEEP_LOG=1 just acceptance-virt
 
 ### 审查交接（2026-10-27）
 
-用户决定结束当前连续施工，转新会话进行代码审查和架构收敛。施工检查点为 `f3337ebd789a79c8cad23c419b690b702e8f96bb`，正式[Review 计划](todo-2026-10-27-device-implementation-review.md)固定对比基线与审查切面。本节是当前事实接手入口；范围/合同仍由本计划正文、[装配](todo-2026-10-07-service-assembly.md)、[故障终局](todo-2026-09-system-shutdown-orchestration.md)与[固定平台取证](ref-2026-10-23-device-platform-contracts.md)拥有，不复制方案或重新列历史任务。
+本节保留首轮转审查时的交接事实。施工检查点为 `f3337ebd789a79c8cad23c419b690b702e8f96bb`，原[Review 登记](archived/todo-2026-10-27-device-implementation-review.md)固定了对比基线与切面；该审查与后续第二轮处置已在[收敛档案](archived/review-2026-10-27-device-implementation.md)结束。以下清单描述该固定检查点，不代表当前开放门或再次提交授权。
 
 - **当前承诺与实际接通**：virt/PLIC、真实PCI→xHCI→USB boot keyboard运行期热插，正式Devices/FunctionAccess/OAL应用、同进程多Binding、正常停止与故障保留链均有真实消费者。只读现状入口为[device impl](../notes/impls/device.md)，再按链接读mm/call/ipc/startup；复合USB接口未覆盖，不能以直接端口多设备证据代替。
 - **已有验证及版本**：下方已关闭表与“成形自查与集中验证记录”拥有原路径。`just check`、host三workspace、十面Clippy/stress及release/platforms/faults分段通过，原聚合124/续跑0保留；聚合源码937项基线不冒充最终树再跑。后续定向消费者/工具按各轮冻结记录，最新MMIO第十二轮完整core/两窗/最终账通过，运行时944项无差分。最后IPI诊断改动只有离线检查，未运行第六轮。
 - **开放项**：DMA+IPI组合缺同call失败返回/消费与后续原广播的完整关联；全hart idle/PCI观察未取得合格共同快照，原轮询推进只有待核假设；独立clock异常只有一次实际失败与一次不同环境未复现。具体owner/最小判据/原证据均在下方唯一表，不能因工具困难删除门或升级成已证产品bug。
 - **发现分类**：真实产品接线问题（逐hart PLIC接管、未暴露取消、真实父轮释放/后代服务寿命、逐轮function与BME、USB重Prepare存在性/无描述符停止、Once付款等）已按相应记录实现并取证；test_target Set单次wait即析构是已修fixture缺陷；近期DWARF/多ELF/缓存/退休地址及异常留存属于工具问题，最后IPI纯诊断修正未跑。现无另行确认而尚未修的产品机制缺陷清单，不表示独立Review不会发现缺陷。失败原样保留，不把工具或fixture错误记成产品错误。
-- **审查重点**：先沿Registry/Binding Work的授权与父子释放、ProcessTask/Managed/ActivationSlot的不同寿命、可信硬件停止与exposed DMA保留、Once付款及各层费用尾部、init出生前观察/正常撤防/唯一终局、VM Forced/IRQ有界推进检查唯一owner和重复状态。已有结构检查是输入而非独立Review替代；详细切面、已知证据与报告接力由[固定实现 Review](todo-2026-10-27-device-implementation-review.md)登记，不把待证项或审查登记称为已交付。
+- **审查重点**：先沿Registry/Binding Work的授权与父子释放、ProcessTask/Managed/ActivationSlot的不同寿命、可信硬件停止与exposed DMA保留、Once付款及各层费用尾部、init出生前观察/正常撤防/唯一终局、VM Forced/IRQ有界推进检查唯一owner和重复状态。已有结构检查是输入而非独立Review替代；详细切面、已知证据与报告接力由[固定实现 Review](archived/todo-2026-10-27-device-implementation-review.md)登记，不把待证项或审查登记称为已交付。
 - **工作树与归属**：施工起点HEAD为549a9e78400f9e59f3bdf516ef4d54f101846178；实施者提交前tracked/untracked状态、文件哈希、删除项及291路径清单见[交接快照](../artifacts/device-closing/review-handoff/snapshot.json)。主代理核对清单后，仅额外移除三个新增Cargo.toml末尾空行；[暂存核验](../artifacts/device-closing/precommit-verification.json)记录此无语义差异，最终实现身份以施工提交为准。原DTB迁移、工具链allocator_ext/lint适配及验收修正属于已接受基线；[libfs邻接核验](../artifacts/device-closing/handoff-adjacent-scope.json)五文件纯fmt、lib.rs仅feature替换+fmt，未发现其他任务遗留。根目录临时25行GDB索引已[原字节移入证据目录](../artifacts/device-closing/handoff-evidence-relocation.json)，未入源码提交；artifacts本机证据不冒充仓库发布内容。
 
-COMPASS指向固定实现Review与本交接，KNOWN_ISSUES继续保留矫正区；impls只校准当前机制事实，不写任务完成。本次授权的施工检查点提交与本地Review登记已落实，未push；施工与运行均已停止，首批闭包不归档。新会话先只读审查固定提交，形成报告后由其唯一承接findings及修复；本计划仍承接原未完成能力和证据。
+上述施工检查点提交与本地 Review 登记已经落实，未 push，保留为历史追溯。当前导航由 COMPASS 指向第二轮交付及原剩余门；不能从本节恢复旧的线程协调、撤防或全 hart idle 待办。
 
 ### 当前唯一收口表（2026-10-26）
 
 本表拥有当前剩余门与证据分类；前文各轮施工/失败记录保留事实与路径，不再从历史“尚未接入”重复产生施工任务。原验收合同仍由正文拥有。待证项不是已证缺陷，不能用常规成功或另一个操作的证据替代。
 
-**独立异常记录：实际平台时钟失败，根因未定。** IRQ第三轮platform clock failed及原143主动收割保留，旧首因值不可恢复。一次THROTTLE100/冷启动/仅两错误点调查正常而未命中，仅not-reproduced；多项环境差异不能单项归因或宣布修复。该异常继续单列，不无限阻塞其他独立工作；后续只按明确单项安排，GDB使用100，若再现终局即收割留证，不机械增时或多轮追。下方两组门不由本例关闭/重算。
+**独立异常记录：实际平台时钟失败，根因未定。** IRQ第三轮platform clock failed及原143主动收割保留，旧首因值不可恢复。一次THROTTLE100/冷启动/仅两错误点调查正常而未命中，仅not-reproduced；多项环境差异不能单项归因或宣布修复。该异常继续单列，不无限阻塞其他独立工作；后续只按明确单项安排，GDB使用100，若再现终局即收割留证，不机械增时或多轮追。下方剩余门不由本例关闭/重算。
 
 **已实现，待集中证据。**
 
 | 门 / 独立合同 | 原 owner 与最小验证边界 | 已有证据、剩余判据 |
 |---|---|---|
-| 全hart idle/PCI观察 | scheduler原current/PC/队列/timer；PCI原Engine | 八轮采样均未证共同idle；实际Pending期间current可为空，所以完整PC/队列门不降。有限PCI完成→同advance下一submit工具未运行。集中时先取原input时间/next_poll进展，再核一次共同快照、真实插入/pending/claim/Take及timer共现；不改guest状态凑门 |
-| DMA保留与IPI失败组合 | 内核稳定Mapping/Backing owner、原停止/IPI协议 | third缺失败返回、第四轮资格未知各自保留。第五轮exit1，[原GDB](../artifacts/dma-ipi-retention/20261027T020938.232656Z-2391/gdb.log)到实际IPI ecall，但首候选诊断RuntimeError导致资格/注入/消费/InitialDONE/四park均未完成，不能反推第四轮。最后纯诊断修正已通过[离线生成/反例](../artifacts/device-closing/dma-ipi-fifth-offline/validation.json)，先保存标量、分别记录帧查询异常、原错先锁定且不重复采栈，必需门未改；修正版未运行，不计资格通过。当前转审查交接，不第六轮/idle或放宽selector/WFI |
+| DMA保留与IPI失败组合 | 内核稳定Mapping/Backing owner、原停止/IPI协议 | third缺失败返回、第四轮资格未知各自保留。第五轮exit1，[原GDB](../artifacts/dma-ipi-retention/20261027T020938.232656Z-2391/gdb.log)到实际IPI ecall，但首候选诊断RuntimeError导致资格/注入/消费/InitialDONE/四park均未完成，不能反推第四轮。最后纯诊断修正已通过[离线生成/反例](../artifacts/device-closing/dma-ipi-fifth-offline/validation.json)，先保存标量、分别记录帧查询异常、原错先锁定且不重复采栈，必需门未改；修正版未运行。后续明确启动此门时，沿原实际 InitialWatch DONE、同 call 失败返回/消费、后续原广播及同组 mapping 跨四 hart 停驻完成取证；不放宽 selector/WFI，不以第二轮普通通过替代。 |
 
-**尚有明确代码责任。** 当前未确认待修的产品机制缺陷；集中取证所需有限编排/工具仍可按上表接线，未编译/未运行不得记通过。若自查或首轮发现可达错误，直接在本表增加位置、触发、违反合同与修复/复核证据，不把工具猜测转成防御层。impls、当前摘要、最终检查记录的同步属本次收口责任。
+**审查代码责任。** 第二轮目标已写入本篇与服务装配计划，一致性重构、所选组合验证及交付前结构检查已完成；确认缺陷、设计处置和验证证据见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)，本表不复制 findings。全 hart idle 门已在替代结构下通过并移入下表；DMA＋IPI 与独立时钟异常继续开放，首批整体闭包尚未交付。
 
 **已通过，可复用。**
 
 | 已关闭门 | 原证据入口与限制 |
 |---|---|
+| 全 hart idle 与真实 IRQ 唤醒（第二轮结构） | `THROTTLE=100 just acceptance-irq-idle` 退出 0，[入口](../artifacts/run/20261027-142222-48689-acceptance-irq-idle.log)、[原共同快照与 IRQ 证据](../artifacts/device-function/20261027T062229.574930Z-49086/evidence.json)。第六次共同取样四 hart 同时 idle_mask=15、current=0、ready_len=0、remote_head=0、timer_pending=false，maintenance_ready=0，PC 位于原 post-check/WFI 合格点；保留未来 timer。QMP 插入前 source33/gen5 无 pending，插入后同源 pending 且 hart0 SIP.SEIP，随后同源 claim；timer_coincident=false。两轮真实 Take/Ack、旧 token Closed/新代拒旧 token 与完整 core 收口通过。旧八轮事实保留；不声称已证明旧失败的唯一根因。已删除的 PCI 周期 Query 专属探针不再作为前置。  统一root后再次退出0：[新版入口](../artifacts/run/20261027-161721-99758-acceptance-irq-idle.log)、[共同快照](../artifacts/device-function/20261027T081730.356125Z-245/evidence.json)，verified=true；仍为四hart current=0/idle_mask=15，ready/remote/timer_pending/maintenance为空，同source33/gen5由pending=false到真实插入后pending/claim，无timer共现，完整core通过。 |
 | 平台供应、真实PCI/USB/HID、单键盘热插与多Binding进程复用 | 上文正常release、observer-reuse-third及原A/B/C证据；直接端口多设备不代表复合USB接口 |
 | 运行期监督/最早Start/Stopping、HID及真实主控死亡、reset拒绝保留 | 各角色原fault与三阶段DMA日志；不宣称死亡后硬件静止或全额退款 |
 | Resources/Drivers公开投影与管理余量、Once发行者运输付款 | once-drivers-release-first、真实跨Pool/未读/Delivery/发行者死亡及积压下Control；非全局堆硬隔离 |
@@ -989,12 +1186,18 @@ COMPASS指向固定实现Review与本交接，KNOWN_ISSUES继续保留矫正区�
 | Seal提示未达不授予新Claim | [定向host](../artifacts/device-closing/retry-seal-host.log)exit0，在实际Registry owner的Seal/SourceStop Closed后，新claim及late commit均Closed；静态亲核Retry只删本地runs/置dirty、不写来源或authority，实际srv_device Claim→Work提交同actor必经Registry.claim/commit_claim source门。未实测RPC提示延迟，不将其当新的必过门；提示不承担授权，成功Retry只重置纯记录 |
 | Retry迟到记录保护 | [第四轮原观察](../artifacts/device-retry/20261026T123128.086138Z-73093/evidence.json)/[完整正常收口](../artifacts/qemu-acceptance-20261026-203038-73077.log)：两begin同原Rc/ref/impl、先352 reset、迟到353 current=None/NotFound、同Tid7/registry槽2 Live→Free及exit0；直接运行仅removed-record。监督亲核原强Rc防ABA/独立ref-impl快照、commit同actor身份→settled→字段→remove、Manager唯一replacement/rollback、新Rc准入和Outbox结束跳过commit，结合既有fallback证据审定闭合原717合同。其余拒绝分支为源码责任证明，不写成直接运行通过，不新增每枝QEMU |
 | root构造与Building整批安装指定分配失败 | root-funding-first的两原观察/指纹/账见下节；局部构造/预约付款回退及无cap交付、Gate Failed/四park、安装后五份Node Work保持Queued成立。不是五根全额退款；retained-entry特定Root Work证据见下一行 |
-| DMA root retained-entry指定分配失败及稳定接管 | [第八轮原观察](../artifacts/boot-failure/20261026T115952.260274Z-67134/platform-dma-retained-evidence.json)、[最终版本/独立清理](../artifacts/device-closing/root-retained-eighth-final-version.json)，仅retained、THROTTLE100、exit0。真实104/8及原Pool1 payer/精确OutOfMemory，同Root最后Node5 Drop后member sealed/finished/dropped、原Root Work Queued；首park及四不同hart逐次head/tail raw=`01000000000000000500000000000000`且fresh=5，Work raw03/fresh Queued、Root票号2/2/维护12/12、tree1/mappings0，全集合五项owner Queued。metadata64061→64074→64010/页4保持只证局部回退，停驻不能宣称五根全退；不重写旧第七轮失败/原head缺失或归因动态Type |
+| DMA未发布root retained-entry失败局部回滚（第二轮替代） | `THROTTLE=100 just virt-platform-funding dma-retained`退出0，[入口](../artifacts/run/20261027-135625-37995-virt-platform-funding.log)、[原账证据](../artifacts/boot-failure/20261027T055629.589219Z-38357/platform-dma-retained-evidence.json)：verified/root_birth_refunded=true，真实OutOfMemory，原Pool的pages allocated=4、metadata allocated=63936构造前后相同，未发布零成员根不排正常Root Work。四hart Gate Failed时仅原先三MMIO/一IRQ owner待清理。首轮Queued专属证据保留于下方历史记录，不再要求已删除路径；不关闭已暴露DMA＋IPI或整批全额退款。 |
 | DMA晚期安装指定分配失败 | [dma-install-second指纹/原观察](../artifacts/dma-install-failure/20261026T071054.289613Z-82520/evidence.json)，完整ReadyUnexposed后指定releases Buffer16B失败，先前handles Buffer已实付；实际OutOfMemory/无cap无暴露，原Work members/write归零、独立Pool最后全零及core/shutdown通过。不称物理堆耗尽，acquire_step非空前缀OOM本不可达 |
 | IRQ直接已park退出与含Line成员Set随宿主退出 | [IRQ第六轮原观察](../artifacts/irq-exit/20261026T100635.591971Z-41077/evidence.json)PID28/source32/gen6 Waiting/epoch2、原Line loan/节点链；PID29/gen7实际Running但cap slot4/gen1/rights69持WaitSet KOID19019，唯一Member实际挂原Line。两者Kill后各同generation原Line空链/Idle/强根回原两owner，[客体405–409](../artifacts/qemu-acceptance-20261026-180630-41066.log)Pool19003/19011两维全零及scopeDONE，整轮core/shutdown通过。第四/第五轮WaitOne最小证据仍复用，旧整体失败不改写；不代表Set宿主Waiting/所有等待形态或强公平 |
 | IRQ持续事件有界推进/普通任务服务机会 | 监督已亲读原248/250/276/455及真实接线，按下方“IRQ持续事件证据映射”的结构+host+集成组合审定关闭独立差额：单claim/单Line节点锁外Delivery、SEIP Requeue→原安全点→M单advance_one→有限机会rotor、正式xHCI 16事件/more→Runnable，加PLIC/signal/rotor既有host和真实READABLE业务进展/连续Take-Ack/退出证据。7相关源文件与既有验证版本一致；未执行任意高频/同hart指定比例/无限时长压力，不宣称其运行通过。原持续事件合同保留，全idle共同快照与外部唤醒仍单列 |
 
-当前收口方式：施工检查点已提交，按[固定实现 Review](todo-2026-10-27-device-implementation-review.md)与[审查交接](#审查交接2026-10-27)进入新上下文审查，未push。已有结构检查、`just check`/host、十面Clippy与分段聚合证据按各自版本复用，不为交接重跑；最后IPI小改仅离线检查，后续运行门仍开放。新会话先只读审查，发现确证问题再由唯一报告承接修复与必要验证，不自动串起验收。两待证及时钟异常未闭合前不归档，不宣告首批完整交付；历史轮次的原失败/授权表述保留当时边界。
+当前收口方式：第二轮设备控制链、root持续监督及生命周期增量已经完成，按[提交与调查接力](#第二轮提交与调查接力)统一保存交付并转入剩余问题调查。原 DMA＋IPI 组合与独立时钟异常继续由本表承接；已关闭的全 hart idle 门见上表。历史失败保留原样，不从机制收敛推导首批全部验收交付。
+
+#### 未发布DMA根的首轮历史证据
+
+第二轮用局部回滚替代了下述正常Root Work接管；以下保留当时事实，不能据此恢复旧验证门。
+
+[第八轮原观察](../artifacts/boot-failure/20261026T115952.260274Z-67134/platform-dma-retained-evidence.json)、[最终版本/独立清理](../artifacts/device-closing/root-retained-eighth-final-version.json)，仅retained、THROTTLE100、exit0。真实104/8及原Pool1 payer/精确OutOfMemory，同Root最后Node5 Drop后member sealed/finished/dropped、原Root Work Queued；首park及四不同hart逐次head/tail raw=`01000000000000000500000000000000`且fresh=5，Work raw03/fresh Queued、Root票号2/2/维护12/12、tree1/mappings0，全集合五项owner Queued。metadata64061→64074→64010/页4保持只证局部回退，停驻不能宣称五根全退；不重写旧第七轮失败/原head缺失或归因动态Type
 
 #### 成形自查与集中验证记录
 

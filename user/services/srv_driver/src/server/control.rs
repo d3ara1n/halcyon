@@ -161,9 +161,7 @@ impl Request {
         let request = librpc::Request::new(libdevice::protocol::ID, &wire[..used])?;
         let txid = match world.call(id, world.claim.clone(), request, deadline) {
             Ok(txid) => txid,
-            Err(mut error) => {
-                drop(error.take_unsent_request());
-                error.retry_cleanup()?;
+            Err(_) => {
                 return Err(Error::Unavailable);
             }
         };
@@ -270,11 +268,7 @@ impl Request {
                             Ok(())
                         }
                     }
-                    Err(mut error) => {
-                        drop(error.take_unsent_request());
-                        error.retry_cleanup()?;
-                        Err(Error::Unavailable)
-                    }
+                    Err(_) => Err(Error::Unavailable),
                 };
                 if self.outbox.result().is_none() {
                     if result.is_ok() {

@@ -1,13 +1,15 @@
 //! init 的驱动装配记录；映像/政策/来源管理和执行域由原 RootSupervisor 持有。
 use super::{
-    JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, TopologyNames,
-    init_process_info, root_memory_pool,
+    JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, TopologyNames, init_process_info,
+    root_memory_pool,
 };
 use alloc::vec::Vec;
+#[cfg(feature = "acceptance-device-retry-race")]
+use erhino_shared::object::ObjectSignals;
 use erhino_shared::{
     memory_pool::MemoryPoolBudget,
-    object::{Handle, ObjectSignals, Rights},
-    proc::{HandleGrant, ProcessState, TerminationCause, TerminationDetail},
+    object::{Handle, Rights},
+    proc::HandleGrant,
 };
 use libdevice::{protocol::Command, registry::SourceStop};
 use libdriver::{
@@ -15,16 +17,14 @@ use libdriver::{
     protocol,
 };
 use libkernel::{
-    ipc::{
-        message::{MailboxSender, wait_message_until},
-        object, wait,
-    },
+    ipc::{message::MailboxSender, object},
     process,
 };
 use libprocess::{
     GrantOutcome, SpawnRequest,
     image::{IMAGE_RIGHTS, Image},
 };
+use librpc::Exchange;
 const POOL: Rights = Rights::from_raw(
     Rights::READ.raw() | Rights::CREATE.raw() | Rights::DUPLICATE.raw() | Rights::GRANT.raw(),
 );
@@ -37,13 +37,11 @@ const ENTRY: Rights = Rights::from_raw(
 );
 pub(super) struct Manager {
     pid: u64,
-    control: Handle,
     job: Handle,
     worker_job: Handle,
     pool: Handle,
     entry: Option<MailboxSender>,
     observer: Option<MailboxSender>,
-    admin: Option<MailboxSender>,
     images: Vec<Image>,
     registry_pid: u64,
 }
@@ -56,7 +54,7 @@ impl Manager {
             .ok_or("driver observer missing")
     }
     #[cfg(feature = "acceptance-device")]
-    pub(super) fn query(&self) -> Result<(bool, u64), &'static str> {
+    pub(super) fn query(&self, root: &mut RootSupervisor) -> Result<(bool, u64), &'static str> {
         let deadline =
             libkernel::time::timeout_millis(5_000).map_err(|_| "Drivers query deadline failed")?;
         let mut wire = [0; protocol::HEADER_LEN];
@@ -67,7 +65,7 @@ impl Manager {
         }
         .encode(&[], &mut wire)
         .map_err(|_| "Drivers query encoding failed")?;
-        let reply = librpc::Caller::new()
+        let reply = root
             .call(
                 self.entry.as_ref().ok_or("Drivers Control missing")?,
                 deadline,
@@ -101,10 +99,12 @@ impl Manager {
     #[cfg(feature = "acceptance-device")]
     pub(super) fn retry(
         &self,
+        root: &mut RootSupervisor,
         device: libdevice::identity::DeviceId,
         deadline: erhino_shared::time::Deadline,
     ) -> Result<Option<libdevice::Error>, &'static str> {
         Self::retry_on(
+            root,
             self.entry.as_ref().ok_or("Drivers Control missing")?,
             self.pid,
             device,
@@ -113,6 +113,7 @@ impl Manager {
     }
     #[cfg(feature = "acceptance-device")]
     fn retry_on(
+        root: &mut dyn Exchange,
         entry: &MailboxSender,
         pid: u64,
         device: libdevice::identity::DeviceId,
@@ -122,7 +123,7 @@ impl Manager {
         let used = protocol::encode_manager_retry(device, deadline, &mut wire)
             .map_err(|_| "Drivers Retry encoding failed")?;
         // 非幂等政策：运输失败只报告，不在此重发；调用者先观察实际结果再作新的决定。
-        let reply = librpc::Caller::new()
+        let reply = root
             .call(
                 entry,
                 deadline,
@@ -144,6 +145,7 @@ impl Manager {
     #[cfg(feature = "acceptance-device-retry-race")]
     pub(super) fn retry_concurrent(
         &self,
+        root: &mut RootSupervisor,
         device: libdevice::identity::DeviceId,
         deadline: erhino_shared::time::Deadline,
     ) -> Result<(), &'static str> {
@@ -166,19 +168,29 @@ impl Manager {
         }
         let pid = self.pid;
         let records = libruntime::thread::retained_records();
-        // 此点主线与尚未撤防的设备观察线程都必须存活；第三项只能属于本次Caller。
-        if records != 2 {
-            return Err(
-                "Drivers concurrent Caller requires only main and the live device observer",
-            );
+        // 此点只有root主线程；新增项只能属于本次并发Caller。
+        if records != 1 {
+            return Err("Drivers concurrent Caller requires only the main thread");
         }
         let worker = libruntime::thread::Builder::new()
-            .spawn(move || Self::retry_on(&entry, pid, device, deadline))
+            .spawn(move || {
+                Self::retry_on(&mut librpc::Caller::new(), &entry, pid, device, deadline)
+            })
             .map_err(|_| "Drivers concurrent Caller thread admission failed")?;
         let caller_id = worker.id();
         // 两条均为显式非幂等操作；没有成功/Unknown后重发，也没有产品调度闸门。
-        let main_result = self.retry(device, deadline);
-        let worker_result = worker.join();
+        let main_result = self.retry(root, device, deadline);
+        let thread = worker.thread();
+        let done = root
+            .wait_until(thread.control().as_handle(), ObjectSignals::DONE, deadline)
+            .map_err(|_| "Drivers concurrent Caller wait failed")?;
+        if !done.observed.contains(ObjectSignals::DONE) {
+            return Err("Drivers concurrent Caller timed out");
+        }
+        let worker_result = worker
+            .try_join()
+            .unwrap_or_else(|_| panic!("observed thread DONE disappeared"));
+        drop(thread);
         let worker_result = match worker_result {
             libthread::ThreadOutcome::Returned {
                 value,
@@ -201,8 +213,12 @@ impl Manager {
             {
                 return Err("Drivers concurrent Caller thread record remains");
             }
-            libkernel::thread::yield_now()
-                .map_err(|_| "Drivers concurrent Caller retirement yield failed")?;
+            let retry = libkernel::time::timeout_millis(1)
+                .map_err(|_| "Drivers concurrent Caller retirement clock failed")?;
+            root.sleep_until(erhino_shared::time::Deadline::at(
+                retry.at_ns.min(end.at_ns),
+            ))
+            .map_err(|_| "Drivers concurrent Caller retirement wait failed")?;
         }
         let main_result = main_result?;
         let worker_result = worker_result?;
@@ -228,14 +244,6 @@ impl Manager {
             pages: snapshot.delegated,
             metadata: snapshot.metadata.delegated,
         })
-    }
-    pub(super) fn fault_seal(&self) {
-        if let Err(error) = self.seal() {
-            libkernel::debug!(
-                "driver fault source seal unconfirmed: {}; resources remain retained",
-                error
-            );
-        }
     }
     pub fn launch(
         root: &mut RootSupervisor,
@@ -291,9 +299,18 @@ impl Manager {
         images
             .try_reserve_exact(3 + usize::from(cfg!(feature = "acceptance-device-candidates")))
             .map_err(|_| "driver image record failed")?;
-        images.push(Image::copy(pci_image).map_err(|_| "PCI readonly image failed")?);
-        images.push(Image::copy(xhci_image).map_err(|_| "xHCI readonly image failed")?);
-        images.push(Image::copy(hid_image).map_err(|_| "HID readonly image failed")?);
+        images.push(
+            root.copy_image(pci_image)
+                .map_err(|_| "PCI readonly image failed")?,
+        );
+        images.push(
+            root.copy_image(xhci_image)
+                .map_err(|_| "xHCI readonly image failed")?,
+        );
+        images.push(
+            root.copy_image(hid_image)
+                .map_err(|_| "HID readonly image failed")?,
+        );
         let mut declarations = alloc::vec![
             Declaration {
                 key: "pci-generic",
@@ -335,7 +352,7 @@ impl Manager {
             // 负装配只用于显式验收：真实PCI映像不支持USB identity，必须在任何硬件使用前拒绝。
             // 它不取得物理/子登记授权；真实HID仍是唯一实际支持实现，正常声明不变。
             images.push(
-                Image::copy(pci_image)
+                root.copy_image(pci_image)
                     .map_err(|_| "incompatible candidate readonly image failed")?,
             );
             declarations.push(Declaration {
@@ -362,19 +379,24 @@ impl Manager {
             .map_err(|_| "driver supervision admission failed")?;
         let device = root
             .devices
-            .as_ref()
+            .take()
             .ok_or("device manager unavailable for driver delegation")?;
-        let (claim, admin) = device.issue_driver_source()?;
+        let issued = device.issue_driver_source(root);
         let registry_pid = device.pid();
+        root.devices = Some(device);
+        let (claim, admin) = issued?;
+        root.attach_manager_source(
+            super::device_supervision::Manager::Driver,
+            admin,
+            registry_pid,
+        )?;
         let mut manager = Self {
             pid: 0,
-            control: Handle::INVALID,
             job,
             worker_job,
             pool,
             entry: None,
             observer: None,
-            admin: Some(admin),
             images,
             registry_pid,
         };
@@ -415,7 +437,7 @@ impl Manager {
                     rights: IMAGE_RIGHTS,
                 });
             }
-            let prepared = libprocess::prepare(SpawnRequest {
+            let prepared = root.prepare_process(SpawnRequest {
                 job,
                 parent: init_process_info(),
                 memory_pool: pool,
@@ -433,33 +455,14 @@ impl Manager {
                 libkernel::debug!("driver manager preparation failed: {:?}", failure);
                 "driver manager preparation failed"
             })?;
-            root.device_observer
-                .as_ref()
-                .ok_or("driver observation missing")?
-                .register(
-                    super::device_supervision::Manager::Driver,
-                    &prepared,
-                    Some((
-                        manager
-                            .admin
-                            .as_ref()
-                            .ok_or("driver source admin missing")?,
-                        registry_pid,
-                    )),
-                )?;
-            let spawned = prepared
-                .start()
-                .map_err(|_| "driver manager Start failed")?;
+            let spawned =
+                root.start_manager(super::device_supervision::Manager::Driver, prepared)?;
             manager.pid = spawned.pid;
-            manager.control = spawned.control;
-            root.track_process(Supervised {
-                pid: spawned.pid,
-                control: spawned.control,
-            });
             names.register_process(spawned.pid, "srv_driver");
             let deadline = libkernel::time::timeout_millis(5_000)
                 .map_err(|_| "driver ready deadline failed")?;
-            let mut ready = wait_message_until(bootstrap.owner, deadline)
+            let mut ready = root
+                .receive_until(bootstrap.owner, deadline)
                 .map_err(|_| "driver readiness failed")?;
             if ready.header.kind != protocol::BOOT_READY
                 || ready.header.sender_pid != spawned.pid
@@ -505,23 +508,27 @@ impl Manager {
         })();
         if let Err(error) = result {
             // 已发行来源不重签。记录由根保留；失败终局先封原来源，CPU 死亡不算物理完成。
-            let _ = manager.seal();
+            let _ = manager.seal(root);
             root.drivers = Some(manager);
             return Err(error);
         }
         Ok(manager)
     }
-    fn seal(&self) -> Result<(), &'static str> {
+    fn seal(&self, root: &mut RootSupervisor) -> Result<(), &'static str> {
         let deadline = libkernel::time::timeout_millis(5_000)
             .map_err(|_| "driver fault seal deadline failed")?;
-        self.seal_until(deadline)
+        self.seal_until(root, deadline)
     }
-    fn seal_until(&self, deadline: erhino_shared::time::Deadline) -> Result<(), &'static str> {
-        let admin = self
-            .admin
-            .as_ref()
-            .ok_or("driver source administration missing")?;
-        let reply = super::device::call_until(admin, Command::SealSource, deadline)?;
+    fn seal_until(
+        &self,
+        root: &mut RootSupervisor,
+        deadline: erhino_shared::time::Deadline,
+    ) -> Result<(), &'static str> {
+        let reply = root.manager_source_call(
+            super::device_supervision::Manager::Driver,
+            Command::SealSource,
+            deadline,
+        )?;
         let (header, body) = libdevice::protocol::Header::decode(&reply.payload)
             .map_err(|_| "driver seal reply invalid")?;
         if reply.sender_pid != self.registry_pid
@@ -543,11 +550,8 @@ impl Manager {
         // 不随Query刷新，也不改变硬件halt/reset或任何安全完成判据。
         let deadline = libkernel::time::timeout_millis(4 * 10_000)
             .map_err(|_| "driver stop deadline failed")?;
-        let deadline = root
-            .device_observer
-            .as_mut()
-            .ok_or("driver observation missing")?
-            .stopping(super::device_supervision::Manager::Driver, deadline)?;
+        let deadline =
+            root.manager_stopping(super::device_supervision::Manager::Driver, deadline)?;
         process::seal_job(self.worker_job).map_err(|_| "driver worker JobSeal failed")?;
         process::seal_job(self.job).map_err(|_| "driver manager JobSeal failed")?;
         libkernel::debug!(
@@ -565,7 +569,7 @@ impl Manager {
         }
         .encode(&[], &mut bytes)
         .map_err(|_| "driver stop encoding failed")?;
-        let result = librpc::Caller::new()
+        let result = root
             .call(
                 entry,
                 deadline,
@@ -574,7 +578,7 @@ impl Manager {
             )
             .map_err(|_| "driver stop RPC unconfirmed");
         // 私有 Stop 先接管选择，随后封来源纳入未知 Claim；即使 Stop 回复 Unknown 也须封。
-        self.seal_until(deadline)?;
+        self.seal_until(root, deadline)?;
         let reply = result?;
         let (header, body) =
             protocol::Header::decode(&reply.payload).map_err(|_| "driver stop reply invalid")?;
@@ -587,8 +591,8 @@ impl Manager {
             return Err("driver stop reply mismatch");
         }
         loop {
-            let reply = super::device::call_until(
-                self.admin.as_ref().ok_or("driver SourceAdmin missing")?,
+            let reply = root.manager_source_call(
+                super::device_supervision::Manager::Driver,
                 Command::QuerySourceStop,
                 deadline,
             )?;
@@ -599,12 +603,7 @@ impl Manager {
                 .map_err(|_| "driver source completion invalid")?
             {
                 SourceStop::Closed => {
-                    let observer = root
-                        .device_observer
-                        .as_ref()
-                        .ok_or("driver observation missing")?;
-                    observer.source_closed(super::device_supervision::Manager::Driver)?;
-                    observer.release_admin(super::device_supervision::Manager::Driver, deadline)?;
+                    root.manager_source_closed(super::device_supervision::Manager::Driver)?;
                     libkernel::debug!(
                         "driver assembly source Closed: now_ns={}",
                         libkernel::time::snapshot()
@@ -627,48 +626,20 @@ impl Manager {
                     }
                     let retry = libkernel::time::timeout_millis(1)
                         .map_err(|_| "driver retry clock failed")?;
-                    libkernel::time::sleep_until(erhino_shared::time::Deadline::at(
+                    root.sleep_until(erhino_shared::time::Deadline::at(
                         retry.at_ns.min(deadline.at_ns),
                     ))
                     .map_err(|_| "driver stop retry failed")?;
                 }
             }
         }
-        let done = wait::wait_until(self.control, ObjectSignals::DONE, deadline)
-            .map_err(|_| "driver manager stop timed out")?;
-        if !done.observed.contains(ObjectSignals::DONE) {
-            libkernel::debug!(
-                "driver manager still pending after source Closed: {:?}",
-                process::query(self.control)
-            );
-            return Err("driver manager stop timed out");
-        }
-        libkernel::debug!(
-            "driver assembly manager DONE observed: now_ns={}",
-            libkernel::time::snapshot()
-                .map_err(|_| "driver stop clock failed")?
-                .now_ns
-        );
-        let state = process::query(self.control).map_err(|_| "driver terminal query failed")?;
-        if state.state != ProcessState::Dead as u32
-            || state.cause != TerminationCause::Completed as u32
-            || state.detail != TerminationDetail::NONE
-        {
-            return Err("driver manager did not complete normally");
-        }
-        root.device_observer
-            .as_ref()
-            .ok_or("driver observation missing")?
-            .disarm(super::device_supervision::Manager::Driver, deadline)?;
-        // 此后由原RootSupervisor的独立监督/收集期限持有，不能计入上面的40s等待覆盖。
-        root.collect_process(self.pid)?;
+        root.collect_manager(super::device_supervision::Manager::Driver)?;
         root.collect_job(self.worker_job)?;
         root.close_control(self.worker_job)?;
         root.collect_job(self.job)?;
         root.close_control(self.job)?;
         self.entry = None;
         self.observer = None;
-        self.admin = None;
         self.images.clear();
         #[cfg(feature = "acceptance-device")]
         super::device_acceptance::verify_worker_pool_refund(self.pool)?;

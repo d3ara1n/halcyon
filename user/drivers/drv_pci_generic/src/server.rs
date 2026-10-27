@@ -31,15 +31,15 @@ use engine::Engine;
 const REQUESTS: usize = 8;
 // 原管理者Stop与中央Provision停止各有一条独立控制通道；普通客户端不占这两份额度。
 const CONTROL_REQUESTS: usize = 2;
-const ROOT_TASKS: usize = 3;
+const ROOT_TASKS: usize = 4;
 const REQUEST_SOURCES: usize = 2;
-const CALLS: usize = REQUESTS + 1;
+const CALLS: usize = 3;
 const RPC_SOURCES: usize = match Dispatcher::source_capacity(CALLS) {
     Ok(n) => n,
     Err(_) => panic!("PCI RPC capacity overflow"),
 };
 const TASKS: usize = REQUESTS + CONTROL_REQUESTS + ROOT_TASKS;
-const ROOT_SOURCES: usize = RPC_SOURCES + 1 + SLOT_SOURCES;
+const ROOT_SOURCES: usize = RPC_SOURCES + 3 + SLOT_SOURCES;
 const SOURCES: usize = ROOT_SOURCES + (REQUESTS + CONTROL_REQUESTS) * REQUEST_SOURCES;
 fn step(step: Step) -> Advance {
     Advance { work_done: 1, step }
@@ -62,19 +62,13 @@ struct World {
     rpc: Dispatcher,
     transport: u64,
     engine: u64,
+    lifecycle: u64,
     rpc_dirty: bool,
     _pool: Capability,
 }
-impl World {
-    fn changed(&mut self) -> Result<(), SystemCallError> {
-        if let Some(slot) = self.slot.as_ref() {
-            slot.changed().unwrap_or_else(|e| fatal(e));
-        }
-        Ok(())
-    }
-}
 enum Family {
     Engine(Engine),
+    Binding(Box<libdriver::binding::BindingTask>),
     Ingress(Box<Ingress>),
     Request(Box<request::Request>),
     Transport { deadline: Deadline },
@@ -90,7 +84,41 @@ impl Task<World> for Family {
         budget: usize,
     ) -> Result<Advance, SystemCallError> {
         match self {
-            Self::Engine(task) => task.advance(id, world, requests, input),
+            Self::Engine(task) => {
+                let before = world
+                    .slot
+                    .as_ref()
+                    .and_then(|slot| slot.activation())
+                    .map(|a| a.snapshot());
+                let result = task.advance(id, world, requests, input)?;
+                let after = world
+                    .slot
+                    .as_ref()
+                    .and_then(|slot| slot.activation())
+                    .map(|a| a.snapshot());
+                if before != after
+                    && let Some(task) = world.slot.as_ref().and_then(ActivationSlot::lifecycle_task)
+                {
+                    requests.wake(task)?;
+                }
+                Ok(result)
+            }
+            Self::Binding(task) => {
+                let Some(slot) = world.slot.as_mut() else {
+                    return Ok(step(Step::Parked));
+                };
+                Ok(task
+                    .advance(
+                        slot,
+                        id,
+                        world.engine,
+                        world.transport,
+                        &mut world.rpc,
+                        requests,
+                        input,
+                    )
+                    .unwrap_or_else(|error| fatal(error)))
+            }
             Self::Ingress(task) => task.advance(world, requests, input),
             Self::Request(task) => task.advance(id, world, requests, input),
             Self::Transport { deadline } => {
@@ -102,11 +130,13 @@ impl Task<World> for Family {
     }
     fn registered(&mut self, world: &mut World, kind: u64, id: SourceId) {
         match self {
-            Self::Engine(_) => {
+            Self::Engine(task) => {
+                task.registered(kind, id);
                 if let Some(slot) = world.slot.as_mut() {
                     slot.registered(kind, id);
                 }
             }
+            Self::Binding(task) => task.registered(kind, id),
             Self::Ingress(t) => t.source.registered(kind, id),
             Self::Request(t) => t.registered(kind, id),
             Self::Transport { .. } => world.rpc.registered(&mut (), kind, id),
@@ -114,11 +144,13 @@ impl Task<World> for Family {
     }
     fn unregistered(&mut self, world: &mut World, kind: u64, id: SourceId) {
         match self {
-            Self::Engine(_) => {
+            Self::Engine(task) => {
+                task.unregistered(id);
                 if let Some(slot) = world.slot.as_mut() {
                     slot.unregistered(id);
                 }
             }
+            Self::Binding(task) => task.unregistered(id),
             Self::Ingress(t) => {
                 t.source.unregistered(id);
             }
@@ -127,7 +159,9 @@ impl Task<World> for Family {
         }
     }
     fn refused(&mut self, world: &mut World, failure: libexecution::runtime::RequestFailure<Self>) {
-        if matches!(self, Self::Transport { .. }) {
+        if let Self::Binding(task) = self {
+            task.refused(failure).unwrap_or_else(|error| fatal(error));
+        } else if matches!(self, Self::Transport { .. }) {
             world.rpc.refused(&mut (), failure);
         } else if matches!(self, Self::Ingress(_)) {
             match failure {
@@ -144,6 +178,7 @@ impl Task<World> for Family {
     fn deadline(&self) -> Deadline {
         match self {
             Self::Engine(t) => t.deadline(),
+            Self::Binding(t) => t.deadline(),
             Self::Request(t) => t.deadline(),
             Self::Transport { deadline } => *deadline,
             _ => Deadline::INFINITE,
@@ -266,6 +301,7 @@ pub(super) fn run(bootstrap: MailboxSender, pool: Capability) {
         rpc: Dispatcher::new(CALLS, &funding).expect("PCI dispatcher failed"),
         transport: 0,
         engine: 0,
+        lifecycle: 0,
         rpc_dirty: false,
         requests: request_funding,
         management: management_funding,
@@ -310,10 +346,20 @@ pub(super) fn run(bootstrap: MailboxSender, pool: Capability) {
     world.engine = runtime
         .spawn(TaskSubmission::new(
             Family::Engine(Engine::new()),
-            SLOT_SOURCES,
+            SLOT_SOURCES + 1,
             funding.clone(),
         ))
         .unwrap_or_else(|f| panic!("PCI engine failed: {:?}", f.error));
+    world.lifecycle = runtime
+        .spawn(TaskSubmission::new(
+            Family::Binding(
+                Box::try_new(libdriver::binding::BindingTask::new())
+                    .expect("driver binding allocation failed"),
+            ),
+            1,
+            funding.clone(),
+        ))
+        .unwrap_or_else(|failure| panic!("driver binding task failed: {:?}", failure.error));
     runtime
         .spawn(TaskSubmission::new(
             Family::Ingress(

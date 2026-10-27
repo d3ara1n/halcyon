@@ -94,8 +94,7 @@ struct Run {
     phase: protocol::Phase,
     binding_watch: u64,
     activation_watch: u64,
-    binding_changed: bool,
-    activation_changed: bool,
+    binding_status: Option<libdevice::watch::Info>,
     activation_status: Option<protocol::Snapshot>,
     watchers_stopping: bool,
 }

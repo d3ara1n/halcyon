@@ -19,9 +19,11 @@ pub struct Info {
     pub sequence: u64,
     pub pending: u64,
     pub reason: Reason,
+    /// Scope 观察不携带绑定；Binding 观察与序号在同一 actor 中取样。
+    pub binding: Option<crate::binding::Snapshot>,
 }
 impl Info {
-    pub const ENCODED_LEN: usize = 24;
+    pub const ENCODED_LEN: usize = 60;
     pub fn terminal(self) -> bool {
         self.reason != Reason::Active
     }
@@ -33,8 +35,13 @@ impl Info {
         w.u64(self.sequence);
         w.u64(self.pending);
         w.u32(self.reason as u32);
-        w.u32(0);
-        Ok(w.written())
+        w.u32(u32::from(self.binding.is_some()));
+        if let Some(binding) = self.binding {
+            crate::protocol::encode_snapshot(binding, &mut out[24..Self::ENCODED_LEN])?;
+        } else {
+            out[24..Self::ENCODED_LEN].fill(0);
+        }
+        Ok(Self::ENCODED_LEN)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes);
@@ -48,8 +55,17 @@ impl Info {
             4 => Reason::Exhausted,
             _ => return Err(Error::Invalid),
         };
-        if r.u32()? != 0
-            || sequence == 0
+        let binding = match r.u32()? {
+            0 => {
+                if r.bytes(36)?.iter().any(|byte| *byte != 0) {
+                    return Err(Error::Invalid);
+                }
+                None
+            }
+            1 => Some(crate::protocol::decode_snapshot(r.bytes(36)?)?),
+            _ => return Err(Error::Invalid),
+        };
+        if sequence == 0
             || pending & !(INITIAL | CHANGED | TERMINAL) != 0
             || (reason == Reason::Active && (sequence == u64::MAX || pending & TERMINAL != 0))
             || (reason != Reason::Active && pending != 0 && pending & TERMINAL == 0)
@@ -63,6 +79,7 @@ impl Info {
             sequence,
             pending,
             reason,
+            binding,
         })
     }
 }
@@ -74,6 +91,7 @@ impl Sequence {
             sequence: 1,
             pending: INITIAL,
             reason: Reason::Active,
+            binding: None,
         })
     }
     pub(crate) fn info(self) -> Info {
@@ -127,6 +145,7 @@ mod tests {
             sequence: u64::MAX - 1,
             pending: 0,
             reason: Reason::Active,
+            binding: None,
         });
         state.change();
         let terminal = state.info();
@@ -139,5 +158,31 @@ mod tests {
         terminal.encode(&mut bytes).unwrap();
         assert_eq!(Info::decode(&bytes).unwrap(), terminal);
         assert_eq!(state.ack(u64::MAX).unwrap().pending, 0);
+    }
+
+    #[test]
+    fn binding_watch_pairs_the_original_round_and_terminal_snapshot() {
+        use crate::{
+            binding::{Phase, Snapshot, Subject},
+            identity::{BindingRef, DeviceId},
+        };
+        let reference = BindingRef::new(DeviceId::new(8, 3).unwrap(), 9).unwrap();
+        let info = Info {
+            sequence: 5,
+            pending: TERMINAL,
+            reason: Reason::Released,
+            binding: Some(Snapshot {
+                reference,
+                subject: Subject::from_authenticated_context(27).unwrap(),
+                phase: Phase::Released,
+            }),
+        };
+        let mut bytes = [0; Info::ENCODED_LEN];
+        assert_eq!(info.encode(&mut bytes).unwrap(), 60);
+        assert_eq!(&bytes[24..32], &8u64.to_le_bytes());
+        assert_eq!(&bytes[40..48], &9u64.to_le_bytes());
+        assert_eq!(Info::decode(&bytes).unwrap(), info);
+        bytes[20..24].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(Info::decode(&bytes), Err(Error::Invalid));
     }
 }

@@ -46,7 +46,7 @@ pub(super) fn run(
         .map_err(|_| "Once ready grant failed")?;
     root.reserve_process()
         .map_err(|_| "Once issuer supervision failed")?;
-    let started = spawn(SpawnRequest {
+    let started = root.spawn_process(SpawnRequest {
         memory_pool: pool,
         parent: init_process_info(),
         job,
@@ -77,9 +77,10 @@ pub(super) fn run(
     });
     let deadline =
         libkernel::time::timeout_millis(30_000).map_err(|_| "Once test deadline failed")?;
-    libkernel::ipc::wait::wait_until(ready.owner.as_handle(), ObjectSignals::READABLE, deadline)
+    root.wait_until(ready.owner.as_handle(), ObjectSignals::READABLE, deadline)
         .map_err(|_| "Once issuer did not finish handoff")?;
-    let mut message = libkernel::ipc::message::wait_message_until(inbox.as_handle(), deadline)
+    let mut message = root
+        .receive_until(inbox.as_handle(), deadline)
         .map_err(|_| "Once issuer handoff failed")?;
     assert_eq!(message.header.kind, u64::from_le_bytes(*b"ONCEPAY1"));
     assert_eq!(message.handles.remaining(), 4);
@@ -248,7 +249,7 @@ pub(super) fn run(
         if libkernel::time::expired(deadline).map_err(|_| "Once refund clock failed")? {
             return Err("Once issuer charge remained after actual retirement");
         }
-        libkernel::time::sleep_until(
+        root.sleep_until(
             libkernel::time::timeout_millis(1).map_err(|_| "Once refund timer failed")?,
         )
         .map_err(|_| "Once refund wait failed")?;

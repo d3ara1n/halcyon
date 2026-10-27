@@ -6,7 +6,7 @@
 
 `RpcPrefix` 是 16 字节 little-endian 头：版本、message kind（Request/Response/Oneway）、reserved 与非零 txid。解码拒绝未知版本/kind、非零 reserved 和零 txid。
 
-期待回复的 Request 在 Handle slot 0 放置裁剪为 `WRITE | TRANSIT` 的 send-once；内核只运输该 capability，不理解 txid 或 request/response。`sender_pid` 只提供来源信息，immutable badge 承载服务端铸造的 session/grant 上下文。
+期待回复的 Request 在 Handle slot 0 放置裁剪为 `WRITE | WAIT | TRANSIT` 的 send-once；内核只运输该 capability，不理解 txid 或 request/response。`sender_pid` 只提供来源信息，immutable badge 承载服务端铸造的 session/grant 上下文。
 
 ## 同步 Caller
 
@@ -19,7 +19,11 @@
 
 同步驱动在 ServiceClosed、Wait/Receive 错误、timeout 和外部取消时废弃当前 ReplyPort；可进入 transit 的 role 都是固定上界叶 close（Tunnel Endpoint 不具 TRANSIT），reject cleanup 不建立新的异步 owner。`CallOperation::advance` 只做一次非阻塞发送或回复尝试；`wait_ready` 按未发送/已发送分别观察 service writable 或 ReplyPort，并观察 service close/cancel。成功接收回复进入 `Completed`，完成操作不能再次推进；`abort` 按阶段返还原 Request 或 ReplyCleanup。已发送操作被显式 abort 或直接 Drop 时都会隔离旧 ReplyPort，迟到回复不能进入下一调用。`CallError` 的互斥 owner 是 `Unsent(Request)`、`Reply(ReplyCleanup)` 或 None：发送前拒绝保留原请求；发送后未确认按 Sent 返回未知，关闭失败保留 typed owner 供 `retry_cleanup`。RPC 不自动重试可能有副作用的已投递请求。
 
-分步接口由 `librpc::CallOperation` 直接提供；init 的 cancellable RPC 消费可观察阶段、非阻塞推进、等待、abort 和完成回复。文件客户端直接组合 Caller 与领域编码，Copy 和 Watch 的异步操作组合 Dispatcher；不存在旧 `libfal::ClientOperation` 包装层。`caller.rs` 仅在 RISC-V 目标编译，正式消费者覆盖未投递/已投递取消、迟到回复隔离与结果领取；host framing/OutboundStage 测试不替代真实运输行为。
+分步接口由 [`CallOperation`](../../user/libraries/librpc/src/caller.rs) 直接提供。普通 `new` 使用 CallWait；`new_composed` 只准备原调用 owner，不创建私有 WaitSet。`poll_ready` 按实际电平和原期限判定，`wait_sources` 返回 reply/service/cancel/reply-observer 的有界计划，未用位置为 INVALID。宿主借用这些真实对象，必须实际注销来源后才能完成、abort 或丢弃操作；操作持有期间原 Caller 不能开始第二个调用。
+
+顺序 OAL、文件、服务客户端依赖 `Exchange` 的 call/call_cancelable 合同，复用原 Request/Reply 和领域编解码。普通 Caller 自己等待；init 通过[根装配接点](runtime.md#顺序装配的等待与推进)推进原 CallOperation，任务不回调根顺序入口。无 DUP 来源仍借用原 sender，不复制权限。Copy 和 Watch 的异步操作继续组合 Dispatcher。
+
+`caller.rs` 仅在 RISC-V 目标编译，真实运输行为由目标消费者观察；host framing/OutboundStage 测试不替代目标运行。已投递操作的错误保持 Sent/Unknown，任何宿主的等待方式都不能把它改判为未提交。
 
 ## 异步出站任务
 
@@ -44,7 +48,7 @@ Dispatcher 的 new 明确借用共享 reply 的 sponsor H 并以 SourceRegistrat
 
 `begin/begin_for` 接受 `ServiceOwner`：`Owned(MailboxSender)` 保管独占 typed 角色，`Shared(Arc<MailboxSender>)` 保活同一表项；共享不派生 handle，也不要求 DUPLICATE。准入仍核 WRITE|WAIT；准入失败和完成原样返还输入 owner 变体，实际来源退出前不能领取完成。Watch 直接恢复独占 sender，派生调用的临时独占 sender 随完成值在解码后释放；均不为普通叶 Close 另建关闭重试槽。CopyTask 的路径调用持 Shared，实际 Namespace 入口无 DUPLICATE；控制会话仍独占提交。call_phase 只观察活调用的投递阶段，ignored_reply_count 记录实际未对应活调用的回复，不参与路由或业务判断。
 
-Dispatcher 停止时保留仍有 waiter 的完成结果，原任务通过同一 txid 领取；失败 wake 回执撤销 waiter 后，由停止退休扫描收束。外层正常停机先让业务任务清理至 Complete，再停止 Dispatcher，避免把活任务所持领取责任交给完成 FIFO 的丢弃路径。
+Dispatcher 停止时保留仍有 waiter 的完成结果，原任务通过同一 txid 领取；失败 wake 回执撤销 waiter 后，由停止退休扫描收束。完成只携未发送的 Request 或 Sent 错误，不返回同步 Caller 的 ReplyCleanup；业务消费者无须为它建立回复口清理重试状态。外层正常停机先让业务任务清理至 Complete，再停止 Dispatcher，避免把活任务所持领取责任交给完成 FIFO 的丢弃路径。
 
 Dispatcher 保留协议状态、PendingCall、回复存储、期限和运输 owner；Runtime 仍拥有
 WaitSet、来源登记、期限唤醒和最终退休。后续增加消费者时复用这一嵌入边界，不恢复
@@ -61,7 +65,7 @@ Outbox prepare/from_prepared 明确取得并克隆出生 SourceFunding，CLOSED 
 
 [subscription::ConsumerTask](../../user/libraries/librpc/src/subscription.rs) 拥有控制 sender、NotificationObserver、单个 SourceRegistration、捕获的领域快照及在途 Query/Ack。具体领域的 Watch 实现静态 Protocol：移交两个真实角色及初始快照、按领域协议编码/校验调用，并把快照投影为 sequence/pending/terminal；通用会话不解释事件位、路径、文件种类或服务名字，也不拥有 provider 状态。fs/service 保留独立 WatchInfo 与 Status。Query/Ack 无业务输入能力，正常回复无能力。
 
-会话依次经过 Listening→Removing→Query/InFlight→Reading→Ack/InFlight。READABLE 锁存后先实际注销通知来源，再发 Query；Reading 保管原序号并停驻，应用完成真实重查后 acknowledge_read 才发 Ack。Ack 完成后按返回 pending 重新监听，来源登记重新检查当前电平，终态且无待确认事件转 Retiring。在途时不重复登记持续就绪的来源；来源采用 Task 付款，PendingCall 从当前任务视图冻结 Bound 付款。
+会话直接以初始完整快照进入 Reading；Reading 保管原序号并停驻，消费者采用快照（fs/service 还须完成实际重查）后 acknowledge_read 才发 Ack。Ack 若返回 pending 的更新快照，直接再次进入 Reading，不重新安装来源或 Query；没有待确认变化才进入 Listening，终态且无待确认变化转 Retiring。监听期 READABLE 锁存后先实际注销通知来源，再发 Query 并交付快照。宿主在调用 advance 后采用快照并确认时，须保持 Runnable 或显式唤醒以提交下一次 Ack；每次 advance 只推进一个动作，不循环追逐更新。在途时不重复登记持续就绪的来源；来源采用 Task 付款，PendingCall 从当前任务视图冻结 Bound 付款。
 
 取消、期限或 CLOSED 只冻结停止意图：已有 txid 继续由 Dispatcher 交付完成，恢复独占控制后注销通知来源，再释放两个角色。Dispatcher 返还 CallError 前已收束调用来源；未发送 Request 的 Packet 与两个非映射角色均沿 typed Drop 必成关闭，客户任务不另存 CallError 或本地 Close 重试状态。真实来源未收到 unregistered 前仍持有观察角色。准入前 abandon_unadmitted 不发 RPC、不建来源。该类型不创建 Runtime/Assembly；宿主将客户和唯一 Dispatcher 放在同一装配内，并保留客户任务至共享运输来源真正退出。
 

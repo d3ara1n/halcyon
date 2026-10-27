@@ -75,6 +75,7 @@ fn request(seq: u64, parent: Option<DeviceId>, name: &str, claimable: bool) -> R
         name,
         identity: b"immutable identity",
         claimable,
+        stop_requirement: libdevice::binding::StopRequirement::ProviderOwned,
         limits: Limits {
             entries: 4,
             text_bytes: 256,

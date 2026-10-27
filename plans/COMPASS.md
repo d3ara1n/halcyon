@@ -8,9 +8,9 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。轻量任务及本轮文档范围见[收口记录](todo-2026-09-29-system-redesign.md#近期轻量收口与本轮整理)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [设备首批实现检查点 Review](todo-2026-10-27-device-implementation-review.md)：从固定提交开展代码审查和架构收敛；当前事实、待证门及实施状态由[设备审查交接](todo-2026-09-device-system-design.md#审查交接2026-10-27)唯一承接。
-4. [正式服务装配与监督](todo-2026-10-07-service-assembly.md)：通用装配关系可先设计，设备特有接线按设备前置。
-5. [系统关机编排与设备故障终局](todo-2026-09-system-shutdown-orchestration.md#设备管理故障的接点)：设备管理故障接点随设备设计推进；正式长期服务的整体收束由本案闭合。
+3. [设备提交后的调查接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)：下一主线先调查 DMA＋IPI 组合，再处理独立时钟异常；原判据与证据由[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)拥有。
+4. [正式服务装配](todo-2026-10-07-service-assembly.md#当前接力)：通用正式服务的装配与恢复按实际需求继续设计；设备持续监督、等待与 loader 迁移不再作为待办。
+5. [系统关机编排](todo-2026-09-system-shutdown-orchestration.md)：正式长期服务的整体收束由本案闭合，设备管理故障接点作为已有实现接入。
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。
 
@@ -26,7 +26,8 @@
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
 | 设备体系设计基线审查档案 | [原发现与修订复核](archived/review-2026-10-23-device-system-design.md)；后续增量与施工入口见设备主计划 |
 | 设备首批施工设计增量独立审查 | [固定交付 Review](todo-2026-10-23-device-implementation-design-review.md) |
-| 设备首批实现检查点代码与架构审查 | [固定实现 Review](todo-2026-10-27-device-implementation-review.md)；保留两待证与独立时钟异常，不恢复连续取证 |
+| 设备首批实现机制收敛与第二轮交付 | [收敛交付档案](archived/review-2026-10-27-device-implementation.md)；[原固定登记档案](archived/todo-2026-10-27-device-implementation-review.md) |
+| 第二轮生命周期、运输退场与观察收口 | [修复、复核及组合验证](archived/review-2026-10-27-device-lifecycle.md) |
 
 ## 条件触发的计划
 

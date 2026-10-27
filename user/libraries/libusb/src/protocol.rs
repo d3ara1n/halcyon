@@ -74,6 +74,9 @@ pub enum Command {
     Cancel { sequence: u64 },
 }
 impl Command {
+    pub fn handles(self) -> usize {
+        usize::from(self.sequence() == 1 && !matches!(self, Self::Query { .. }))
+    }
     pub fn sequence(self) -> u64 {
         match self {
             Self::Transfer { sequence, .. }
@@ -111,7 +114,7 @@ impl Command {
     }
     pub fn decode(bytes: &[u8], handles: usize) -> Result<(Header, Self), Error> {
         let (header, body) = Header::decode(bytes)?;
-        if header.error.is_some() || handles != 0 {
+        if header.error.is_some() {
             return Err(Error::Invalid);
         }
         let mut r = Reader::new(body);
@@ -133,6 +136,9 @@ impl Command {
             _ => return Err(Error::Unsupported),
         };
         r.finish()?;
+        if handles != command.handles() {
+            return Err(Error::Invalid);
+        }
         Ok((header, command))
     }
 }

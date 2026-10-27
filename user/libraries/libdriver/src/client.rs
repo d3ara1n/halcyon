@@ -10,7 +10,7 @@ use librpc::subscription::{Failure, Protocol, SnapshotState};
 
 pub struct Receipt {
     pub snapshot: Snapshot,
-    pub observation: MailboxSender,
+    pub observation: Option<MailboxSender>,
     pub function: Option<MailboxSender>,
     pub description: Vec<u8>,
     pub name: String,
@@ -37,12 +37,12 @@ impl Receipt {
         let function_name = reader.text32()?;
         let description_bytes = reader.bytes32()?;
         reader.finish()?;
-        if snapshot.phase != Phase::Ready
+        if (op != 2 || snapshot.phase != Phase::Ready)
             && (!description_bytes.is_empty() || !function_name.is_empty())
         {
             return Err(Error::Invalid);
         }
-        if snapshot.phase == Phase::Ready {
+        if op == 2 && snapshot.phase == Phase::Ready {
             liboal::path::validate_name(function_name).map_err(|_| Error::Invalid)?;
         }
         let mut name = String::new();
@@ -57,20 +57,22 @@ impl Receipt {
         if snapshot.reference != expected {
             return Err(Error::StaleEpoch);
         }
-        let expected_handles = 1 + usize::from(snapshot.phase == Phase::Ready);
+        let expected_handles =
+            usize::from(op == 1) + usize::from(op == 2 && snapshot.phase == Phase::Ready);
         if reply.handles.remaining() != expected_handles {
             return Err(Error::Invalid);
         }
-        let (observation, entry_description) =
-            MailboxSender::from_capability(reply.handles.take(0)?)
+        let mut entry = |index| -> Result<MailboxSender, Error> {
+            let (entry, description) = MailboxSender::from_capability(reply.handles.take(index)?)
                 .map_err(|failure| Error::from(failure.error))?;
-        if entry_description.related_object_id != worker_mailbox {
-            return Err(Error::Permission);
-        }
-        let function = if snapshot.phase == Phase::Ready {
-            let (entry, _) = MailboxSender::from_capability(reply.handles.take(1)?)
-                .map_err(|failure| Error::from(failure.error))?;
-            Some(entry)
+            if description.related_object_id != worker_mailbox {
+                return Err(Error::Permission);
+            }
+            Ok(entry)
+        };
+        let observation = if op == 1 { Some(entry(0)?) } else { None };
+        let function = if op == 2 && snapshot.phase == Phase::Ready {
+            Some(entry(0)?)
         } else {
             None
         };

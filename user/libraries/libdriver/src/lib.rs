@@ -3,6 +3,8 @@
 #![cfg_attr(target_arch = "riscv64", feature(allocator_ext))]
 extern crate alloc;
 pub mod activation;
+#[cfg(target_arch = "riscv64")]
+pub mod binding;
 pub mod boot;
 #[cfg(target_arch = "riscv64")]
 pub mod client;

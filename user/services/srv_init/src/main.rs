@@ -526,7 +526,7 @@ fn launch_test_services(
                 stage_failure = Some("process supervision admission failed");
                 return;
             }
-            let spawned = spawn(SpawnRequest {
+            let spawned = root.spawn_process(SpawnRequest {
                 memory_pool: root_memory_pool(),
                 parent: init_process_info(),
                 job,
@@ -573,7 +573,7 @@ fn launch_test_services(
                         }
                         // 委托域靶：control 即弃（关闭 control 永不隐式终止），
                         // pm 的派生因此走铸造路径，域内收束权归 pm。
-                        match spawn(SpawnRequest {
+                        match root.spawn_process(SpawnRequest {
                             memory_pool: root_memory_pool(),
                             parent: init_process_info(),
                             job: pm_domain,
@@ -599,8 +599,12 @@ fn launch_test_services(
                             control: process.control,
                         });
                         let prepared = (|| -> Result<_, &'static str> {
-                            let primary =
-                                accept_fs_provider(fs_bootstrap.owner, fs_release.peer, true)?;
+                            let primary = accept_fs_provider(
+                                root,
+                                fs_bootstrap.owner,
+                                fs_release.peer,
+                                true,
+                            )?;
                             if primary.pid != process.pid {
                                 return Err("primary provider bootstrap sender mismatch");
                             }
@@ -610,15 +614,15 @@ fn launch_test_services(
                                 .ok_or("primary provider omitted service directory")?;
                             let deadline = libkernel::time::timeout_millis(10_000)
                                 .map_err(|_| "registration bootstrap deadline invalid")?;
-                            let watch = name_watch(directory)?;
+                            let watch = name_watch(root, directory)?;
                             let authority = primary
                                 .registration_root
                                 .as_ref()
                                 .ok_or("primary provider omitted registration authority")?;
-                            let mut caller = librpc::Caller::new();
+
                             let scoped = service_client::Publisher {
                                 sender: authority,
-                                caller: &mut caller,
+                                caller: root,
                             }
                             .delegate_name(
                                 "fs.secondary",
@@ -773,7 +777,7 @@ fn launch_secondary_fs(
     ];
     root.reserve_process()
         .map_err(|_| "second fs supervision admission failed")?;
-    let spawned = spawn(SpawnRequest {
+    let spawned = root.spawn_process(SpawnRequest {
         memory_pool: root_memory_pool(),
         parent: init_process_info(),
         job: services,
@@ -853,7 +857,7 @@ impl FsConsumerCoordinator {
             .map_err(|_| "management handoff delivery failed")?;
         Ok(())
     }
-    fn await_report(&self, root: &RootSupervisor, expected: u64) -> Result<(), &'static str> {
+    fn await_report(&self, root: &mut RootSupervisor, expected: u64) -> Result<(), &'static str> {
         let deadline = libkernel::time::timeout_millis(test_fs::command::PHASE_TIMEOUT_MILLIS)
             .map_err(|_| "FS consumer phase deadline invalid")?;
         debug!(
@@ -865,15 +869,6 @@ impl FsConsumerCoordinator {
                 .now_ns,
             deadline.at_ns
         );
-        let set = WaitSet::create(2).map_err(|_| "FS consumer phase set failed")?;
-        set.register(MemberRequest::new(
-            self.report_owner,
-            ObjectSignals::READABLE | ObjectSignals::CLOSED,
-            1,
-        ))
-        .map_err(|_| "FS consumer report registration failed")?;
-        set.register(MemberRequest::new(self.control, ObjectSignals::DONE, 2))
-            .map_err(|_| "FS consumer terminal registration failed")?;
         let mut terminal = None;
         loop {
             let bits = match root.notification_owner(self.report_owner).take(u64::MAX) {
@@ -908,23 +903,23 @@ impl FsConsumerCoordinator {
                 );
                 return Err(reason);
             }
-            for record in set
-                .receive(2)
-                .map_err(|_| "FS consumer phase receive failed")?
-            {
-                if record.cookie == 2 {
-                    terminal = Some("FS consumer exited before phase report");
-                } else if record.observed.intersects(ObjectSignals::CLOSED) {
-                    terminal = Some("FS consumer phase channel closed");
-                }
-            }
-            if terminal.is_some() {
-                continue;
-            }
-            let result = set
-                .wait(deadline)
+            let observed = root
+                .wait_sources(
+                    &[
+                        (
+                            self.report_owner,
+                            ObjectSignals::READABLE | ObjectSignals::CLOSED,
+                        ),
+                        (self.control, ObjectSignals::DONE),
+                    ],
+                    deadline,
+                )
                 .map_err(|_| "FS consumer phase wait failed")?;
-            if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
+            if observed[1].contains(ObjectSignals::DONE) {
+                terminal = Some("FS consumer exited before phase report");
+            } else if observed[0].contains(ObjectSignals::CLOSED) {
+                terminal = Some("FS consumer phase channel closed");
+            } else if observed.iter().all(|signals| signals.raw() == 0) {
                 terminal = Some("FS consumer phase timed out");
             }
         }
@@ -945,7 +940,8 @@ impl FsConsumerCoordinator {
     fn finish(self, root: &mut RootSupervisor) -> Result<(), &'static str> {
         let deadline = libkernel::time::timeout_millis(test_fs::command::PHASE_TIMEOUT_MILLIS)
             .map_err(|_| "FS consumer exit deadline invalid")?;
-        let result = libkernel::ipc::wait::wait_until(self.control, ObjectSignals::DONE, deadline)
+        let result = root
+            .wait_until(self.control, ObjectSignals::DONE, deadline)
             .map_err(|_| "FS consumer exit wait failed")?;
         if WaitReason::from_u32(result.reason) == Some(WaitReason::Timeout) {
             return Err("FS consumer exit timed out");
@@ -977,13 +973,13 @@ fn launch_fs_consumer(
         .directory
         .as_ref()
         .ok_or("FS consumer service directory missing")?;
-    let mut caller = librpc::Caller::new();
+
     let authority = libservice::client::Publisher {
         sender: primary
             .registration_root
             .as_ref()
             .ok_or("publication root missing")?,
-        caller: &mut caller,
+        caller: root,
     }
     .delegate_name(
         "init.registry-probe",
@@ -996,7 +992,7 @@ fn launch_fs_consumer(
             .registration_root_b
             .as_ref()
             .ok_or("consumer B publication root missing")?,
-        caller: &mut caller,
+        caller: root,
     }
     .delegate_name(
         "init.registry-probe",
@@ -1092,7 +1088,7 @@ fn launch_fs_consumer(
             rights: directory_b_rights & !Rights::GRANT,
         },
     ];
-    let spawned = spawn(SpawnRequest {
+    let spawned = root.spawn_process(SpawnRequest {
         memory_pool: root_memory_pool(),
         parent: init_process_info(),
         job: services,
@@ -1267,7 +1263,7 @@ fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static st
         .signal(1)
         .map_err(|_| "FS1 sent cancellation signal failed")?;
     let cause = operation
-        .wait_ready()
+        .poll_ready()
         .expect_err("sent cancellation was ignored");
     let mut second = operation.abort(cause).expect("Sent operation lost owner");
     drop(operation);
@@ -2047,14 +2043,21 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
             .as_slice(),
     )?;
     #[cfg(feature = "acceptance-device-function-session")]
-    function_checks::run(root.devices.as_ref().ok_or("device manager unavailable")?)?;
+    {
+        let manager = root.devices.take().ok_or("device manager unavailable")?;
+        let result = function_checks::run(root, &manager);
+        root.devices = Some(manager);
+        result?;
+    }
     #[cfg(feature = "acceptance-device")]
     let driver_reply_backlog = {
-        let sources = root
+        let manager = root
             .devices
-            .as_ref()
-            .ok_or("device manager bootstrap incomplete")?
-            .issue_function_source()?;
+            .take()
+            .ok_or("device manager bootstrap incomplete")?;
+        let sources = manager.issue_function_source(root);
+        root.devices = Some(manager);
+        let sources = sources?;
         let drivers = root
             .drivers
             .as_ref()
@@ -2065,7 +2068,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     let pm_mailbox = launched.pm_mailbox;
     let mut first_fs = launched.first_fs;
     let registry_watch = launched.registry_root_watch;
-    confirm_primary_fs_ready(&first_fs)?;
+    confirm_primary_fs_ready(root, &first_fs)?;
     root.verify_dispatcher_funding([
         first_fs
             .directory
@@ -2093,7 +2096,8 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
             .ok_or("publication root missing")?,
         first_fs.grant.as_ref().ok_or("primary file root missing")?,
     )?;
-    test_fs::registry::queued_control(
+    filesystem::registry::queued_control(
+        root,
         first_fs
             .directory
             .as_ref()
@@ -2125,6 +2129,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         launched.fs_second_scope,
     )?;
     let mut second_fs = accept_fs_provider(
+        root,
         launched.fs_bootstrap_second,
         launched.fs_release_second,
         false,
@@ -2137,12 +2142,13 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         .mailbox_identity
         .ok_or("primary file mailbox identity missing")?;
     let (entry, sender_identity, mailbox_identity) =
-        discover_registered_fs(directory, primary_mailbox, &registry_watch)?;
+        discover_registered_fs(root, directory, primary_mailbox, &registry_watch)?;
     second_fs.grant = Some(entry);
     second_fs.sender_identity = Some(sender_identity);
     second_fs.mailbox_identity = Some(mailbox_identity);
     consumer.await_report(root, test_fs::report::SECONDARY_DISCOVERED)?;
     exercise_fs_basic(
+        root,
         second_fs
             .grant
             .as_ref()
@@ -2185,7 +2191,7 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     consumer.await_report(root, test_fs::report::PROVIDER_CLOSED)?;
     consumer.finish(root)?;
     collect_fs_provider(root, &second_fs)?;
-    observe_withdrawal(directory, &registry_watch)?;
+    observe_withdrawal(root, directory, &registry_watch)?;
     drop(registry_watch);
     drop(second_fs.grant.take());
     drop(second_fs.management.take());
@@ -2204,6 +2210,15 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     debug!("FS1 provider supervision reclaimed both provider processes");
     let target_image = launched.target_image;
     let hammer_image = launched.hammer_image;
+
+    // 设备和文件消费者已完成，先履行两管理者的正常停止责任；独立内核ABI自检随后执行。
+    root.stop_drivers()?;
+    #[cfg(feature = "acceptance-device")]
+    {
+        debug!("DEVICE Drivers stopped while Observer reply backlog remained unread");
+        drop(driver_reply_backlog);
+    }
+    root.stop_devices()?;
 
     // 运行时拓扑快照（调试参考）：此刻服务在域内运行，验收自测尚未
     // 展开；短寿命服务可能已自动完成退休。
@@ -2370,16 +2385,6 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     // —— live kill 正路径：Building 目标的确定性 Kill/自动退休/终态验证 ——
     test_building_kill(acceptance);
 
-    // —— Job 管理面验收（step 5）：封口与完成传播、派生兑底、递归
-    // 真实 PCI 已独占平台 ECAM；先正常停止实际消费者，再运行会重新派生同范围的退休验收。
-    // 保留全部原场景，避免验收与业务争用同一物理范围。
-    root.stop_drivers()?;
-    #[cfg(feature = "acceptance-device")]
-    {
-        debug!("DEVICE Drivers stopped while Observer reply backlog remained unread");
-        drop(driver_reply_backlog);
-    }
-    root.stop_devices()?;
     // JobKill 组合与 seal 闸门可行子集 ——
     match target_image {
         Some(image) => test_job_management(root, acceptance, image.as_slice())?,
@@ -3179,8 +3184,39 @@ fn test_derive_kill(
             finite.wait_timeout_ms = 1;
             finite.wait_attempts = 1;
             machine.replenish(finite);
-            let failure = libprocess::collect_remaining(machine)
-                .expect_err("live target must exhaust its finite DONE wait");
+            let failure = loop {
+                let now = libkernel::time::snapshot()
+                    .expect("finite collection clock failed")
+                    .now_ns;
+                match machine.step(now) {
+                    libprocess::StepOutcome::Continue(next) => machine = next,
+                    libprocess::StepOutcome::RetryAt(at, next) => {
+                        root.sleep_until(libkernel::shared::time::Deadline::at(at))
+                            .expect("finite collection retry wait failed");
+                        machine = next;
+                    }
+                    libprocess::StepOutcome::Observe(request, mut next) => {
+                        let observed = root
+                            .wait_until(request.control, request.signals, request.deadline)
+                            .expect("finite collection observation failed");
+                        let now = libkernel::time::snapshot()
+                            .expect("finite collection clock failed")
+                            .now_ns;
+                        let result = if observed.observed.raw() == 0 {
+                            libprocess::observation::ObservationResult::TimedOut
+                        } else {
+                            libprocess::observation::ObservationResult::Ready(observed.observed)
+                        };
+                        next.observe(request, result, now)
+                            .expect("finite collection observation rejected");
+                        machine = next;
+                    }
+                    libprocess::StepOutcome::Escalate(failure) => break failure,
+                    libprocess::StepOutcome::Done(_) => {
+                        panic!("live target unexpectedly completed")
+                    }
+                }
+            };
             assert_eq!(failure.stage, SupervisionStage::WaitDone);
             assert_eq!(failure.cause, SupervisionCause::Timeout);
             assert_eq!(failure.progress.wait_attempts, 1);

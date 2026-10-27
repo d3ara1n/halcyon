@@ -19,7 +19,7 @@ use libkernel::ipc::{
     message::{MailboxSender, SenderAdoptFailure},
 };
 use liboal::{FollowBudget, FollowLimits, LocalError, Namespace, walk::Walk};
-use librpc::{CallError, Caller, Request as RpcRequest};
+use librpc::{CallError, Exchange, Request as RpcRequest};
 pub mod copy;
 mod watch;
 #[derive(Debug)]
@@ -61,12 +61,16 @@ pub struct WatchControl {
     pub waiter: libkernel::ipc::notification::NotificationObserver,
 }
 impl WatchControl {
-    pub fn query(&self, caller: &mut Caller, deadline: Deadline) -> Result<WatchInfo, ClientError> {
+    pub fn query(
+        &self,
+        caller: &mut dyn Exchange,
+        deadline: Deadline,
+    ) -> Result<WatchInfo, ClientError> {
         self.request(caller, Request::QueryWatch, deadline)
     }
     pub fn ack(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         sequence: u64,
         deadline: Deadline,
     ) -> Result<WatchInfo, ClientError> {
@@ -74,14 +78,14 @@ impl WatchControl {
     }
     pub fn cancel(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         deadline: Deadline,
     ) -> Result<WatchInfo, ClientError> {
         self.request(caller, Request::CancelWatch, deadline)
     }
     fn request(
         &self,
-        caller: &mut Caller,
+        caller: &mut dyn Exchange,
         request: Request<'_>,
         deadline: Deadline,
     ) -> Result<WatchInfo, ClientError> {
@@ -97,11 +101,15 @@ impl WatchControl {
 }
 pub struct Client<'a> {
     namespace: &'a Namespace,
-    caller: &'a mut Caller,
+    caller: &'a mut dyn Exchange,
     limits: FollowLimits,
 }
 impl<'a> Client<'a> {
-    pub fn new(namespace: &'a Namespace, caller: &'a mut Caller, limits: FollowLimits) -> Self {
+    pub fn new(
+        namespace: &'a Namespace,
+        caller: &'a mut dyn Exchange,
+        limits: FollowLimits,
+    ) -> Self {
         Self {
             namespace,
             caller,
@@ -541,7 +549,7 @@ fn offer(r: Response<'_>, handles: &mut HandleSet) -> Result<Offer, ClientError>
     })
 }
 fn call(
-    caller: &mut Caller,
+    caller: &mut dyn Exchange,
     entry: &MailboxSender,
     request: &Request<'_>,
     deadline: Deadline,
@@ -643,7 +651,7 @@ fn retarget<'a>(r: &'a Request<'_>, path: &'a str) -> Result<Request<'a>, Client
     })
 }
 pub fn stream_control(
-    caller: &mut Caller,
+    caller: &mut dyn Exchange,
     sender: &MailboxSender,
     request: &Request<'_>,
     deadline: Deadline,

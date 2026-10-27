@@ -46,6 +46,7 @@
 | RISC-V ELF header、relocation、section、program header | `riscv-elf.adoc` |
 | 汇总入口 | `riscv-abi.adoc` |
 | DWARF 寄存器编号 | `riscv-dwarf.adoc` |
+| ELF build attributes 的 vendor/Tag_File 长度字段 | [ARM aaelf32 固定 2025Q4](https://github.com/ARM-software/abi-aa/blob/daa7a94ca55973736c0e434a67a6e4bbcd35d7fa/aaelf32/aaelf32.rst)「Build Attributes / Syntactic structure」及 sub-subsection 段；布局参照，不声称 RISC-V psABI 对 ARM 规范有规范性引用 |
 
 ## Devicetree
 

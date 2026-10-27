@@ -52,7 +52,7 @@ fn attributes() -> Vec<u8> {
     data.extend_from_slice(&(subsection_size as u32).to_le_bytes());
     data.push(5); // Tag_RISCV_arch
     data.extend_from_slice(arch);
-    let len = data.len() as u32;
+    let len = (data.len() - 1) as u32;
     data[1..5].copy_from_slice(&len.to_le_bytes());
     data
 }
@@ -113,6 +113,32 @@ fn validate_test(image: &[u8]) -> Result<elf::Elf, ElfError> {
             image_limit: IMAGE_LIMIT,
         },
     )
+}
+
+#[test]
+fn incremental_validation_keeps_failed_admission_terminal() {
+    let image = build_elf(0, &[Header::load(0, 0, 64, 64, PF_R | PF_W | PF_X)]);
+    let mut validation = elf::Validation::new(
+        &image,
+        LoadLimits {
+            page_size: PAGE_SIZE,
+            image_limit: IMAGE_LIMIT,
+        },
+    )
+    .unwrap();
+    // 每个header独立推进，页权限检查的拒绝不能被下一次advance跳过。
+    assert_eq!(validation.advance(), Ok(None));
+    let error = loop {
+        match validation.advance() {
+            Err(error) => break error,
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("write-execute image was admitted"),
+        }
+    };
+    assert_eq!(error, ElfError::WriteExecutePage);
+    for _ in 0..3 {
+        assert_eq!(validation.advance(), Err(error));
+    }
 }
 
 #[test]

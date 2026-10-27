@@ -159,6 +159,7 @@ pub enum Command<'a> {
         identity: &'a [u8],
         limits: Limits,
         claimable: bool,
+        stop_requirement: crate::binding::StopRequirement,
     },
     WithdrawPublication {
         seq: u64,
@@ -178,7 +179,7 @@ pub enum Command<'a> {
         name: &'a str,
     },
     StopBinding,
-    ReportStopped,
+    ReportQuiescent,
     WithdrawDevice,
     Enumerate {
         scope: Scope,
@@ -210,6 +211,7 @@ pub enum Command<'a> {
         reference: BindingRef,
     },
     QuerySourceStop,
+    QueryUse,
 }
 impl Command<'_> {
     pub fn op(&self) -> u16 {
@@ -225,7 +227,7 @@ impl Command<'_> {
             Self::IssueUse => 9,
             Self::GetResource { .. } => 10,
             Self::StopBinding => 11,
-            Self::ReportStopped => 12,
+            Self::ReportQuiescent => 12,
             Self::WithdrawDevice => 13,
             Self::Enumerate { .. } => 14,
             Self::WatchScope { .. } => 15,
@@ -239,6 +241,7 @@ impl Command<'_> {
             Self::InstallActivation { .. } => 23,
             Self::GetActivation { .. } => 24,
             Self::QuerySourceStop => 25,
+            Self::QueryUse => 26,
         }
     }
     pub fn handles(&self) -> usize {
@@ -253,7 +256,7 @@ impl Command<'_> {
             Self::Register { name, identity, .. } => {
                 // 登记后的完整观察回复也必须能交付，不能只让较短的 Register 入站通过。
                 add_text(DEVICE_FIXED_LEN, name.as_bytes(), identity)?;
-                add_text(44, name.as_bytes(), identity)?
+                add_text(48, name.as_bytes(), identity)?
             }
             Self::WithdrawPublication { .. } => 8,
             Self::QueryDevice { .. } => 16,
@@ -294,6 +297,7 @@ impl Command<'_> {
                 identity,
                 limits,
                 claimable,
+                stop_requirement,
             } => {
                 if seq == 0 {
                     return Err(Error::Invalid);
@@ -304,6 +308,7 @@ impl Command<'_> {
                 w.u32(limits.entries);
                 w.u32(limits.text_bytes);
                 w.u32(u32::from(claimable));
+                w.u32(stop_requirement as u32);
                 w.bytes32(n.as_bytes());
                 w.bytes32(identity);
             }
@@ -406,6 +411,7 @@ impl<'a> Command<'a> {
                     parent,
                     limits,
                     claimable,
+                    stop_requirement: crate::binding::StopRequirement::from_raw(r.u32()?)?,
                     name: name(&mut r)?,
                     identity: r.bytes32()?,
                 }
@@ -432,7 +438,7 @@ impl<'a> Command<'a> {
                 name: name(&mut r)?,
             },
             11 => Self::StopBinding,
-            12 => Self::ReportStopped,
+            12 => Self::ReportQuiescent,
             13 => Self::WithdrawDevice,
             14 => Self::Enumerate {
                 scope: read_optional_id(&mut r)?.map_or(Scope::Root, Scope::Subtree),
@@ -472,6 +478,7 @@ impl<'a> Command<'a> {
                 reference: BindingRef::decode(&mut r)?,
             },
             25 => Self::QuerySourceStop,
+            26 => Self::QueryUse,
             _ => return Err(Error::Unsupported),
         };
         r.finish()?;
@@ -772,25 +779,63 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, Error> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UseInfo {
+    pub binding: Snapshot,
+    pub stop_requirement: crate::binding::StopRequirement,
+    pub access: crate::binding::UseAccess,
+}
+impl UseInfo {
+    pub const BYTES: usize = 44;
+    pub fn encode(self, out: &mut [u8]) -> Result<usize, Error> {
+        if out.len() < Self::BYTES {
+            return Err(Error::Invalid);
+        }
+        encode_snapshot(self.binding, &mut out[..36])?;
+        let mut w = Writer::new(&mut out[36..Self::BYTES]);
+        w.u32(self.stop_requirement as u32);
+        w.u32(self.access.raw());
+        Ok(Self::BYTES)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(bytes);
+        let binding = decode_snapshot(r.bytes(36)?)?;
+        let stop_requirement = crate::binding::StopRequirement::from_raw(r.u32()?)?;
+        let access = crate::binding::UseAccess::from_raw(r.u32()?)?;
+        r.finish()?;
+        Ok(Self {
+            binding,
+            stop_requirement,
+            access,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProvisionCommand {
     Prepare(u64),
-    Get { epoch: u64, index: u32 },
-    Stop(u64),
-    ConfirmStopped(u64),
+    Get {
+        epoch: u64,
+        index: u32,
+    },
+    Stop {
+        epoch: u64,
+        consumer_quiescent: bool,
+    },
+    Query(u64),
 }
 impl ProvisionCommand {
     pub fn op(self) -> u16 {
         match self {
             Self::Prepare(_) => 1,
             Self::Get { .. } => 2,
-            Self::Stop(_) => 3,
-            Self::ConfirmStopped(_) => 4,
+            Self::Stop { .. } => 3,
+            Self::Query(_) => 4,
         }
     }
     pub fn epoch(self) -> u64 {
         match self {
-            Self::Prepare(e) | Self::Stop(e) | Self::ConfirmStopped(e) => e,
-            Self::Get { epoch, .. } => epoch,
+            Self::Prepare(e) | Self::Query(e) => e,
+            Self::Get { epoch, .. } | Self::Stop { epoch, .. } => epoch,
         }
     }
     pub fn encode(self, deadline: Deadline, out: &mut [u8]) -> Result<usize, Error> {
@@ -803,6 +848,12 @@ impl ProvisionCommand {
         if let Self::Get { index, .. } = self {
             w.u32(index);
         }
+        if let Self::Stop {
+            consumer_quiescent, ..
+        } = self
+        {
+            w.u32(u32::from(consumer_quiescent));
+        }
         let len = w.written();
         Header {
             op: self.op(),
@@ -813,7 +864,7 @@ impl ProvisionCommand {
     }
     pub fn decode(bytes: &[u8], handle_count: usize) -> Result<(Header, Self), Error> {
         let (header, body) = Header::decode(bytes)?;
-        if header.error.is_some() || handle_count != 0 {
+        if header.error.is_some() || handle_count != usize::from(header.op == 1) {
             return Err(Error::Invalid);
         }
         let mut r = Reader::new(body);
@@ -827,8 +878,15 @@ impl ProvisionCommand {
                 epoch,
                 index: r.u32()?,
             },
-            3 => Self::Stop(epoch),
-            4 => Self::ConfirmStopped(epoch),
+            3 => Self::Stop {
+                epoch,
+                consumer_quiescent: match r.u32()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Invalid),
+                },
+            },
+            4 => Self::Query(epoch),
             _ => return Err(Error::Unsupported),
         };
         r.finish()?;
@@ -851,7 +909,7 @@ impl Progress {
         }
         match (command, self) {
             (ProvisionCommand::Get { .. }, _) => Err(Error::Invalid),
-            (ProvisionCommand::Prepare(_), _) => Ok(self),
+            (ProvisionCommand::Prepare(_) | ProvisionCommand::Query(_), _) => Ok(self),
             (_, Self::Stopping | Self::Closed | Self::Failed(_)) => Ok(self),
             _ => Err(Error::Invalid),
         }

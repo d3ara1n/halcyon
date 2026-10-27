@@ -1,5 +1,6 @@
 //! init 的正式文件/服务消费者与启动交付核对。
 pub(super) mod copy;
+pub(super) mod registry;
 use super::{AcceptedFsProvider, RootSupervisor};
 use alloc::sync::Arc;
 use erhino_shared::{
@@ -7,14 +8,9 @@ use erhino_shared::{
     time::Deadline,
 };
 use libfs::{FsRights, client::Client, node::NodeKind, value::Value};
-use libkernel::ipc::{
-    capability::Capability,
-    message::{MailboxSender, wait_message},
-    object::duplicate,
-    wait::wait_until,
-};
+use libkernel::ipc::{capability::Capability, message::MailboxSender, object::duplicate};
 use liboal::{FollowLimits, Namespace};
-use librpc::Caller;
+use librpc::Exchange;
 use libservice::{
     client::{Client as Services, Watch},
     protocol as service,
@@ -46,10 +42,12 @@ pub(super) fn namespace(sender: &MailboxSender) -> Result<Namespace, &'static st
         .map_err(|_| "namespace binding failed")?;
     Ok(namespace)
 }
-pub(super) fn name_watch(directory: &MailboxSender) -> Result<Watch, &'static str> {
+pub(super) fn name_watch(
+    root: &mut RootSupervisor,
+    directory: &MailboxSender,
+) -> Result<Watch, &'static str> {
     let namespace = namespace(directory)?;
-    let mut caller = Caller::new();
-    let watch = Services::new(&namespace, &mut caller, limits())
+    let watch = Services::new(&namespace, root, limits())
         .watch_name("/", "fs.secondary", deadline()?)
         .map_err(|error| {
             libkernel::debug!("service name subscription failed: {:?}", error);
@@ -57,15 +55,16 @@ pub(super) fn name_watch(directory: &MailboxSender) -> Result<Watch, &'static st
         })?;
     let initial = watch
         .control
-        .query(&mut caller, deadline()?)
+        .query(root, deadline()?)
         .map_err(|_| "service initial query failed")?;
     watch
         .control
-        .ack(&mut caller, initial.sequence, deadline()?)
+        .ack(root, initial.sequence, deadline()?)
         .map_err(|_| "service initial ack failed")?;
     Ok(watch)
 }
 pub(super) fn accept_fs_provider(
+    root: &mut RootSupervisor,
     bootstrap: Handle,
     release: Handle,
     primary: bool,
@@ -86,8 +85,9 @@ pub(super) fn accept_fs_provider(
         release,
     };
     loop {
-        let mut message =
-            wait_message(bootstrap).map_err(|_| "provider bootstrap receive failed")?;
+        let mut message = root
+            .receive_until(bootstrap, Deadline::INFINITE)
+            .map_err(|_| "provider bootstrap receive failed")?;
         if result.pid == 0 {
             result.pid = message.header.sender_pid;
         }
@@ -197,8 +197,13 @@ pub(super) fn accept_fs_provider(
     }
     Ok(result)
 }
-pub(super) fn confirm_primary_fs_ready(provider: &AcceptedFsProvider) -> Result<(), &'static str> {
-    let message = wait_message(provider.bootstrap).map_err(|_| "provider ready receive failed")?;
+pub(super) fn confirm_primary_fs_ready(
+    root: &mut RootSupervisor,
+    provider: &AcceptedFsProvider,
+) -> Result<(), &'static str> {
+    let message = root
+        .receive_until(provider.bootstrap, Deadline::INFINITE)
+        .map_err(|_| "provider ready receive failed")?;
     if message.header.sender_pid != provider.pid
         || message.header.kind != libfs::protocol::PROVIDER_READY_KIND
         || !message.handles.is_empty()
@@ -209,20 +214,18 @@ pub(super) fn confirm_primary_fs_ready(provider: &AcceptedFsProvider) -> Result<
     Ok(())
 }
 pub(super) fn discover_registered_fs(
+    root: &mut RootSupervisor,
     directory: &MailboxSender,
     primary_mailbox: u64,
     watch: &Watch,
 ) -> Result<(MailboxSender, u64, u64), &'static str> {
     let namespace = namespace(directory)?;
-    let mut caller = Caller::new();
     loop {
         let observed = watch
             .control
-            .query(&mut caller, deadline()?)
+            .query(root, deadline()?)
             .map_err(|_| "service watch query failed")?;
-        match Services::new(&namespace, &mut caller, limits())
-            .get_entry("/fs.secondary", deadline()?)
-        {
+        match Services::new(&namespace, root, limits()).get_entry("/fs.secondary", deadline()?) {
             Ok(entry) => {
                 if !entry.descriptors.iter().any(|d| {
                     d.id == libfs::protocol::ID
@@ -243,7 +246,7 @@ pub(super) fn discover_registered_fs(
                 }
                 watch
                     .control
-                    .ack(&mut caller, observed.sequence, deadline()?)
+                    .ack(root, observed.sequence, deadline()?)
                     .map_err(|_| "service discovery ack failed")?;
                 libkernel::debug!("SRV2 init WatchName Query GetEntry passed");
                 return Ok((
@@ -255,9 +258,9 @@ pub(super) fn discover_registered_fs(
             Err(libservice::client::ClientError::Status(service::Status::NotFound)) => {
                 watch
                     .control
-                    .ack(&mut caller, observed.sequence, deadline()?)
+                    .ack(root, observed.sequence, deadline()?)
                     .map_err(|_| "service absent ack failed")?;
-                wait_until(
+                root.wait_until(
                     watch.control.waiter.as_handle(),
                     ObjectSignals::READABLE,
                     deadline()?,
@@ -268,7 +271,7 @@ pub(super) fn discover_registered_fs(
         }
     }
 }
-fn prepare_probe(namespace: &Namespace, caller: &mut Caller) -> Result<(), &'static str> {
+fn prepare_probe(namespace: &Namespace, caller: &mut dyn Exchange) -> Result<(), &'static str> {
     let mut bytes = [0; 20];
     let used = Value::Unsigned64(73)
         .encode(&mut bytes)
@@ -300,11 +303,13 @@ fn prepare_probe(namespace: &Namespace, caller: &mut Caller) -> Result<(), &'sta
     }
     Ok(())
 }
-pub(super) fn exercise_fs_basic(sender: &MailboxSender) -> Result<(), &'static str> {
+pub(super) fn exercise_fs_basic(
+    root: &mut RootSupervisor,
+    sender: &MailboxSender,
+) -> Result<(), &'static str> {
     let namespace = namespace(sender)?;
-    let mut caller = Caller::new();
-    prepare_probe(&namespace, &mut caller)?;
-    Client::new(&namespace, &mut caller, limits())
+    prepare_probe(&namespace, root)?;
+    Client::new(&namespace, root, limits())
         .remove("/init-probe", deadline()?)
         .map_err(|_| "init property removal failed")?;
     libkernel::debug!("FS1 init direct file paths passed");
@@ -315,9 +320,8 @@ pub(super) fn exercise_fs_provider(
     sender: &MailboxSender,
 ) -> Result<(), &'static str> {
     let namespace = namespace(sender)?;
-    let mut caller = Caller::new();
-    prepare_probe(&namespace, &mut caller)?;
-    let watch = Client::new(&namespace, &mut caller, limits())
+    prepare_probe(&namespace, root)?;
+    let watch = Client::new(&namespace, root, limits())
         .watch(
             "/init-probe",
             libfs::protocol::WATCH_MODIFY | libfs::protocol::WATCH_UNBOUND,
@@ -330,7 +334,7 @@ pub(super) fn exercise_fs_provider(
         .read_world()
         .fs_snapshot
         .expect("file snapshot remains owned");
-    if Client::new(&namespace, &mut caller, limits())
+    if Client::new(&namespace, root, limits())
         .get::<u64>("/init-probe", deadline()?)
         .map_err(|_| "initial watch recheck failed")?
         != 91
@@ -339,7 +343,7 @@ pub(super) fn exercise_fs_provider(
     }
     root.acknowledge_client_snapshot()?;
     root.await_client_cycle(1)?;
-    Client::new(&namespace, &mut caller, limits())
+    Client::new(&namespace, root, limits())
         .set("/init-probe", Value::Unsigned64(92), deadline()?)
         .map_err(|_| "async watched property set failed")?;
     root.await_client_snapshot()?;
@@ -353,10 +357,10 @@ pub(super) fn exercise_fs_provider(
         return Err("async file change snapshot invalid");
     }
     // 重查在途期间再提交变化；确认 captured old sequence 后必须再次重查。
-    Client::new(&namespace, &mut caller, limits())
+    Client::new(&namespace, root, limits())
         .set("/init-probe", Value::Unsigned64(93), deadline()?)
         .map_err(|_| "in-flight watched property set failed")?;
-    if Client::new(&namespace, &mut caller, limits())
+    if Client::new(&namespace, root, limits())
         .get::<u64>("/init-probe", deadline()?)
         .map_err(|_| "async property recheck failed")?
         != 93
@@ -372,12 +376,12 @@ pub(super) fn exercise_fs_provider(
     if newer.sequence <= observed.sequence || newer.pending & libfs::protocol::WATCH_MODIFY == 0 {
         return Err("async old ack lost newer change");
     }
-    Client::new(&namespace, &mut caller, limits())
+    Client::new(&namespace, root, limits())
         .get::<u64>("/init-probe", deadline()?)
         .map_err(|_| "newer property recheck failed")?;
     root.acknowledge_client_snapshot()?;
     root.await_client_cycle(3)?;
-    Client::new(&namespace, &mut caller, limits())
+    Client::new(&namespace, root, limits())
         .remove("/init-probe", deadline()?)
         .map_err(|_| "init property removal failed")?;
     root.await_client_snapshot()?;
@@ -387,7 +391,7 @@ pub(super) fn exercise_fs_provider(
             .fs_snapshot
             .expect("retirement snapshot remains owned");
         if !matches!(
-            Client::new(&namespace, &mut caller, limits()).get_value("/init-probe", deadline()?),
+            Client::new(&namespace, root, limits()).get_value("/init-probe", deadline()?),
             Err(libfs::client::ClientError::Status(
                 libfs::protocol::Status::NotFound
             ))
@@ -415,10 +419,9 @@ pub(super) fn exercise_async_name_watch(
     const NAME: &str = "init.async-watch";
     const PATH: &str = "/init.async-watch";
     let namespace = namespace(directory)?;
-    let mut caller = Caller::new();
     let scoped = libservice::client::Publisher {
         sender: authority,
-        caller: &mut caller,
+        caller: root,
     }
     .delegate_name(
         NAME,
@@ -426,13 +429,13 @@ pub(super) fn exercise_async_name_watch(
         deadline()?,
     )
     .map_err(|_| "async name delegation failed")?;
-    let watch = Services::new(&namespace, &mut caller, limits())
+    let watch = Services::new(&namespace, root, limits())
         .watch_name("/", NAME, deadline()?)
         .map_err(|_| "async name subscription failed")?;
     root.start_service_watch(watch, deadline()?)?;
     root.await_client_snapshot()?;
     if !matches!(
-        Services::new(&namespace, &mut caller, limits()).get_entry(PATH, deadline()?),
+        Services::new(&namespace, root, limits()).get_entry(PATH, deadline()?),
         Err(libservice::client::ClientError::Status(
             service::Status::NotFound
         ))
@@ -449,7 +452,7 @@ pub(super) fn exercise_async_name_watch(
     }];
     let (_, control) = libservice::client::Publisher {
         sender: &scoped,
-        caller: &mut caller,
+        caller: root,
     }
     .register(
         NAME,
@@ -471,13 +474,13 @@ pub(super) fn exercise_async_name_watch(
     {
         return Err("async registration hint missing");
     }
-    Services::new(&namespace, &mut caller, limits())
+    Services::new(&namespace, root, limits())
         .get_entry(PATH, deadline()?)
         .map_err(|_| "async registered entry recheck failed")?;
     root.acknowledge_client_snapshot()?;
     root.await_client_cycle(2)?;
     let withdrawn = control
-        .withdraw(&mut caller, deadline()?)
+        .withdraw(root, deadline()?)
         .map_err(|_| "async name withdrawal failed")?;
     if withdrawn.state != service::State::Withdrawn || withdrawn.reason != service::Reason::Explicit
     {
@@ -495,7 +498,7 @@ pub(super) fn exercise_async_name_watch(
         return Err("async withdrawal hint missing");
     }
     if !matches!(
-        Services::new(&namespace, &mut caller, limits()).get_entry(PATH, deadline()?),
+        Services::new(&namespace, root, limits()).get_entry(PATH, deadline()?),
         Err(libservice::client::ClientError::Status(
             service::Status::NotFound
         ))
@@ -511,35 +514,33 @@ pub(super) fn exercise_async_name_watch(
     Ok(())
 }
 pub(super) fn observe_withdrawal(
+    root: &mut RootSupervisor,
     directory: &MailboxSender,
     watch: &Watch,
 ) -> Result<(), &'static str> {
     let namespace = namespace(directory)?;
-    let mut caller = Caller::new();
     loop {
         let observed = watch
             .control
-            .query(&mut caller, deadline()?)
+            .query(root, deadline()?)
             .map_err(|_| "withdrawal watch query failed")?;
-        match Services::new(&namespace, &mut caller, limits())
-            .get_entry("/fs.secondary", deadline()?)
-        {
+        match Services::new(&namespace, root, limits()).get_entry("/fs.secondary", deadline()?) {
             Err(libservice::client::ClientError::Status(service::Status::NotFound)) => {
                 if observed.pending & service::WITHDRAWN == 0 {
                     return Err("withdrawal event missing");
                 }
                 watch
                     .control
-                    .ack(&mut caller, observed.sequence, deadline()?)
+                    .ack(root, observed.sequence, deadline()?)
                     .map_err(|_| "withdrawal ack failed")?;
                 break;
             }
             Ok(_) => {
                 watch
                     .control
-                    .ack(&mut caller, observed.sequence, deadline()?)
+                    .ack(root, observed.sequence, deadline()?)
                     .map_err(|_| "old entry ack failed")?;
-                wait_until(
+                root.wait_until(
                     watch.control.waiter.as_handle(),
                     ObjectSignals::READABLE,
                     deadline()?,
@@ -551,7 +552,7 @@ pub(super) fn observe_withdrawal(
     }
     watch
         .control
-        .cancel(&mut caller, deadline()?)
+        .cancel(root, deadline()?)
         .map_err(|_| "withdrawal subscription cancel failed")?;
     libkernel::debug!("SRV2 init endpoint withdrawal passed");
     Ok(())
@@ -560,8 +561,9 @@ pub(super) fn collect_fs_provider(
     root: &mut RootSupervisor,
     provider: &AcceptedFsProvider,
 ) -> Result<(), &'static str> {
-    let message =
-        wait_message(provider.bootstrap).map_err(|_| "provider stopped receive failed")?;
+    let message = root
+        .receive_until(provider.bootstrap, Deadline::INFINITE)
+        .map_err(|_| "provider stopped receive failed")?;
     if message.header.sender_pid != provider.pid
         || message.header.kind != libfs::protocol::PROVIDER_STOPPED_KIND
         || !message.handles.is_empty()

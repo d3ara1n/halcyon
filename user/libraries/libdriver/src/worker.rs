@@ -1,9 +1,10 @@
 //! 进程管理入口与逐Binding激活；程序组合原Runtime，库不创建运行体。
 use crate::{
-    activation::Activation,
+    activation::{Activation, Lifecycle},
     protocol::{self, Phase, Snapshot},
 };
-use alloc::{sync::Arc, vec::Vec};
+
+use alloc::sync::Arc;
 use erhino_shared::{
     call::SystemCallError,
     object::{ObjectSignals, Rights},
@@ -21,10 +22,7 @@ use libkernel::ipc::{
     notification::{self, NotificationOwner, NotificationSignaler},
     object,
 };
-use librpc::{
-    dispatcher::{Dispatcher, ServiceOwner},
-    outbox::Outbox,
-};
+use librpc::outbox::Outbox;
 pub const TRANSPORT: Rights = Rights::from_raw(
     Rights::WRITE.raw()
         | Rights::WAIT.raw()
@@ -86,6 +84,34 @@ impl WorkerControl {
     pub fn is_manager_context(&self, context: u64) -> bool {
         context == self.context
     }
+    pub fn command<'a>(
+        &self,
+        context: u64,
+        wire: &'a [u8],
+        handles: usize,
+    ) -> Result<protocol::Command<'a>, Error> {
+        if !self.is_manager_context(context) {
+            return Err(Error::Permission);
+        }
+        let (_, command) = protocol::Command::decode(wire, handles)?;
+        if let protocol::Command::Activate {
+            reference,
+            identity,
+            registrar,
+        } = command
+            && (identity != self.identity || registrar != self.child_registrar)
+        {
+            libkernel::debug!(
+                "driver activation input rejected before resource acquisition: device={}, epoch={}, identity_match={}, registrar_match={}",
+                reference.device().serial(),
+                reference.epoch(),
+                identity == self.identity,
+                registrar == self.child_registrar
+            );
+            return Err(Error::Permission);
+        }
+        Ok(command)
+    }
 }
 pub const OBSERVERS: usize = 8;
 const LIFE: u64 = 0x1000;
@@ -140,7 +166,7 @@ struct Observer {
 /// 原ref、活跃额度与独立导出身份；Released后仅保留付费终态，不复用旧context。
 pub struct ActivationSlot {
     reference: BindingRef,
-    pub activation: Option<Activation>,
+    pub(crate) activation: Option<Activation>,
     function: Option<MailboxSender>,
     function_identity: EndpointIdentity,
     function_life: Observed,
@@ -149,6 +175,7 @@ pub struct ActivationSlot {
     observation_life: Observed,
     observers: [Option<Observer>; OBSERVERS],
     active: Option<Charge>,
+    lifecycle: Lifecycle,
 }
 impl ActivationSlot {
     pub fn new(worker: &WorkerControl, reference: BindingRef) -> Result<Self, Error> {
@@ -170,7 +197,142 @@ impl ActivationSlot {
             observation_life: Observed::new(observation.lifetime),
             observers: [const { None }; OBSERVERS],
             active: Some(active),
+            lifecycle: Lifecycle::Pending,
         })
+    }
+    /// 同 actor 的接纳点；首次输入由实例保存，消息不持远端准备查询。
+    pub fn accept_activation(
+        &mut self,
+        worker: &WorkerControl,
+        context: u64,
+        wire: &[u8],
+        handles: usize,
+        outbox: &mut Outbox,
+    ) -> Result<bool, Error> {
+        let command = worker.command(context, wire, handles)?;
+        if command.reference() != self.reference {
+            return Err(Error::Conflict);
+        }
+        let protocol::Command::Activate {
+            reference,
+            identity,
+            registrar,
+        } = command
+        else {
+            return Err(Error::Invalid);
+        };
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        let (request, _) = outbox.response_mut()?.parts()?;
+        let mut sender = |index| -> Result<alloc::sync::Arc<MailboxSender>, Error> {
+            let (entry, description) = MailboxSender::from_capability(request.handles.take(index)?)
+                .map_err(|failure| failure.error)?;
+            if !description.rights.contains(TRANSPORT) {
+                return Err(Error::Permission);
+            }
+            alloc::sync::Arc::try_new(entry).map_err(|_| Error::Resource)
+        };
+        let usage = sender(1)?;
+        let registrar = if registrar { Some(sender(2)?) } else { None };
+        if let Some(registrar) = &registrar {
+            let a = EndpointIdentity::from_description(&usage.description()?)?;
+            let b = EndpointIdentity::from_description(&registrar.description()?)?;
+            if a == b || a.mailbox != b.mailbox {
+                return Err(Error::Permission);
+            }
+        }
+        if let Some(activation) = &self.activation {
+            activation.same_input(reference, identity, &usage, registrar.as_deref())?;
+            Ok(false)
+        } else {
+            self.activation = Some(Activation::prepare(reference, identity, usage, registrar)?);
+            Ok(true)
+        }
+    }
+    /// 认证由 WorkerControl 完成；结果读取不接纳输入、不改变阶段、不通知执行任务。
+    pub fn query_result(&self, reference: BindingRef) -> Result<(), Error> {
+        if reference != self.reference {
+            return Err(Error::Conflict);
+        }
+        self.activation.as_ref().ok_or(Error::NotFound).map(|_| ())
+    }
+    pub fn activation(&self) -> Option<&Activation> {
+        self.activation.as_ref()
+    }
+    pub fn io_ready(&self) -> bool {
+        self.lifecycle.io_ready()
+    }
+    pub fn lifecycle_task(&self) -> Option<u64> {
+        self.lifecycle.task()
+    }
+    pub(crate) fn attach_lifecycle(&mut self, task: u64) {
+        self.lifecycle.attach(task);
+    }
+    pub(crate) fn allow_io(&mut self) -> Result<(), Error> {
+        assert!(
+            self.active() && self.activation.is_some(),
+            "inactive activation admitted IO"
+        );
+        self.lifecycle.allow_io()
+    }
+    pub(crate) fn retire_lifecycle(&mut self) {
+        if !self.io_ready() {
+            self.retire_preparing_access();
+        }
+        self.lifecycle.retire();
+    }
+    pub fn ready(&mut self) -> Result<(), Error> {
+        self.activation.as_mut().ok_or(Error::NotReady)?.ready()?;
+        self.changed()
+    }
+    pub fn stop(&mut self) -> Result<(), Error> {
+        let activation = self.activation.as_mut().ok_or(Error::NotReady)?;
+        if matches!(activation.snapshot().phase, Phase::Starting | Phase::Ready) {
+            activation.stop();
+            self.changed()?;
+        }
+        Ok(())
+    }
+    pub fn fail(&mut self, error: Error) -> Result<(), Error> {
+        self.activation.as_mut().ok_or(Error::NotReady)?.fail(error);
+        self.changed()
+    }
+    pub fn terminal(&mut self, error: Option<Error>) -> Result<(), Error> {
+        self.activation
+            .as_mut()
+            .ok_or(Error::NotReady)?
+            .terminal(error);
+        self.changed()
+    }
+    /// # Safety
+    /// 原 Engine 已永久停止本轮及其委派访问，全部在途硬件责任已结束。
+    pub unsafe fn consumer_stopped(&mut self) -> Result<(), Error> {
+        // SAFETY: 由实际 Engine 按本方法的同一证据合同提交。
+        unsafe {
+            self.activation
+                .as_mut()
+                .ok_or(Error::NotReady)?
+                .consumer_stopped()?;
+        }
+        self.changed()
+    }
+    /// 未获 IO 许可的准备失败，原生命周期任务仍负责在途查询和观察注销。
+    pub fn reject_preparing(&mut self, error: Error) -> Result<(), Error> {
+        assert!(!self.io_ready(), "active driver rejected as preparation");
+        if let Some(activation) = self.activation.as_mut() {
+            activation.terminal(Some(error));
+        }
+        self.active = None;
+        self.function = None;
+        self.observation = None;
+        self.changed()
+    }
+    pub(crate) fn retire_preparing_access(&mut self) {
+        assert!(!self.io_ready(), "active driver retired as preparation");
+        if let Some(activation) = self.activation.as_mut() {
+            activation.retire_unstarted_access();
+        }
     }
     pub fn reference(&self) -> BindingRef {
         self.reference
@@ -233,8 +395,7 @@ impl ActivationSlot {
         description: &[u8],
     ) -> Result<(), Error> {
         let status = self.activation.as_ref().ok_or(Error::NotReady)?.snapshot();
-        let observation = self.observation.as_ref().ok_or(Error::Closed)?;
-        let ready = status.phase == Phase::Ready;
+        let ready = op == 2 && status.phase == Phase::Ready;
         let mut body = [0; protocol::BODY_MAX];
         let used = protocol::encode_receipt(
             status,
@@ -243,9 +404,14 @@ impl ActivationSlot {
             &mut body,
         )?;
         let response = outbox.response_mut()?;
-        response
-            .push(alias(observation)?, TRANSPORT)
-            .map_err(|f| f.error)?;
+        if op == 1 {
+            response
+                .push(
+                    alias(self.observation.as_ref().ok_or(Error::Closed)?)?,
+                    TRANSPORT,
+                )
+                .map_err(|failure| failure.error)?;
+        }
         if ready {
             response
                 .push(
@@ -398,174 +564,9 @@ impl ActivationSlot {
     }
     pub fn tail_done(&self) -> bool {
         !self.active()
+            && self.lifecycle.retired()
             && self.function_life.done()
             && self.observation_life.done()
             && self.observers.iter().all(Option::is_none)
-    }
-}
-pub struct Activate {
-    reference: BindingRef,
-    identity: Vec<u8>,
-    usage: Arc<MailboxSender>,
-    registrar: Option<Arc<MailboxSender>>,
-    stop: bool,
-    query: Option<u64>,
-}
-impl Activate {
-    pub fn adopt(
-        worker: &WorkerControl,
-        slot: &ActivationSlot,
-        context: u64,
-        wire: &[u8],
-        handles: usize,
-        outbox: &mut Outbox,
-    ) -> Result<Self, Error> {
-        if !worker.is_manager_context(context) {
-            return Err(Error::Permission);
-        }
-        let (_, command) = protocol::Command::decode(wire, handles)?;
-        let reference = command.reference();
-        if reference != slot.reference() {
-            return Err(Error::Conflict);
-        }
-        if !slot.active() && slot.activation.is_none() {
-            return Err(Error::Closed);
-        }
-        let stop = matches!(command, protocol::Command::Stop { .. });
-        let (identity, has_registrar) = match command {
-            protocol::Command::Activate {
-                identity,
-                registrar,
-                ..
-            } => (identity, registrar),
-            _ => (&[][..], false),
-        };
-        if !stop && (identity != worker.identity || has_registrar != worker.child_registrar) {
-            libkernel::debug!(
-                "driver activation input rejected before resource acquisition: device={}, epoch={}, identity_match={}, registrar_match={}",
-                reference.device().serial(),
-                reference.epoch(),
-                identity == worker.identity,
-                has_registrar == worker.child_registrar
-            );
-            return Err(Error::Permission);
-        }
-        let mut frozen = Vec::new();
-        frozen
-            .try_reserve_exact(identity.len())
-            .map_err(|_| Error::Resource)?;
-        frozen.extend_from_slice(identity);
-        let (request, _) = outbox.response_mut()?.parts()?;
-        let mut sender = |index| -> Result<Arc<MailboxSender>, Error> {
-            let (entry, description) = MailboxSender::from_capability(request.handles.take(index)?)
-                .map_err(|f| f.error)?;
-            if !description.rights.contains(TRANSPORT) {
-                return Err(Error::Permission);
-            }
-            Arc::try_new(entry).map_err(|_| Error::Resource)
-        };
-        let usage = sender(1)?;
-        let registrar = if has_registrar {
-            Some(sender(2)?)
-        } else {
-            None
-        };
-        if let Some(registrar) = &registrar {
-            let a = EndpointIdentity::from_description(&usage.description()?)?;
-            let b = EndpointIdentity::from_description(&registrar.description()?)?;
-            if a == b || a.mailbox != b.mailbox {
-                return Err(Error::Permission);
-            }
-        }
-        Ok(Self {
-            reference,
-            identity: frozen,
-            usage,
-            registrar,
-            stop,
-            query: None,
-        })
-    }
-    pub fn advance(
-        &mut self,
-        slot: &mut ActivationSlot,
-        rpc: &mut Dispatcher,
-        task: u64,
-        deadline: Deadline,
-        funding: &libbudget::AccountView<libexecution::ExecutionResource>,
-    ) -> Result<bool, Error> {
-        if self.reference != slot.reference() {
-            return Err(Error::Conflict);
-        }
-        if let Some(txid) = self.query {
-            let Some(result) = rpc.take(txid) else {
-                return Ok(false);
-            };
-            self.query = None;
-            let reply = result.result.map_err(|_| Error::Unavailable)?;
-            let (header, body) = libdevice::protocol::Header::decode(&reply.payload)?;
-            if header.op != 8 || reply.handles.remaining() != 0 {
-                return Err(Error::Invalid);
-            }
-            if let Some(error) = header.error {
-                return Err(error);
-            }
-            let snapshot = libdevice::protocol::decode_snapshot(body)?;
-            if slot.activation.is_none() {
-                if !slot.active() {
-                    return Err(Error::Closed);
-                }
-                slot.activation = Some(if self.stop {
-                    Activation::cancel(self.reference, self.usage.clone(), snapshot)?
-                } else {
-                    Activation::prepare(
-                        self.reference,
-                        &self.identity,
-                        self.usage.clone(),
-                        self.registrar.clone(),
-                        snapshot,
-                    )?
-                });
-            }
-        }
-        if let Some(activation) = slot.activation.as_mut() {
-            if self.stop {
-                if activation.reference() != self.reference || !activation.same_use(&self.usage)? {
-                    return Err(Error::Permission);
-                }
-                activation.stop();
-            } else {
-                activation.same_input(
-                    self.reference,
-                    &self.identity,
-                    &self.usage,
-                    self.registrar.as_deref(),
-                )?;
-            }
-            slot.changed()?;
-            return Ok(true);
-        }
-        let mut bytes = [0; libdevice::protocol::HEADER_LEN];
-        let used = libdevice::protocol::Command::QueryBinding.encode(deadline, &mut bytes)?;
-        self.query = Some(
-            rpc.begin_for(
-                ServiceOwner::Shared(self.usage.clone()),
-                deadline,
-                librpc::Request::new(libdevice::protocol::ID, &bytes[..used])?,
-                Some(task),
-                funding,
-            )
-            .map_err(|_| Error::Unavailable)?,
-        );
-        Ok(false)
-    }
-    pub fn retire(&mut self, rpc: &mut Dispatcher) -> bool {
-        if let Some(txid) = self.query {
-            if rpc.take(txid).is_none() {
-                return false;
-            }
-            self.query = None;
-        }
-        true
     }
 }

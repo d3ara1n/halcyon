@@ -169,22 +169,26 @@ impl Node {
             });
         // SAFETY: 未发布且已完整初始化。
         let root = unsafe { storage.assume_init() };
+        // 出生期间只有局部 owner：尚无能力、成员或子节点，失败不提交正常退休 Work。
+        let rollback = || {
+            let entry = {
+                let mut state = root.state.lock();
+                state.tree.seal(id).expect("DMA root missing");
+                state
+                    .tree
+                    .finish(id)
+                    .expect("unpublished DMA root has members");
+                state
+                    .tree
+                    .remove_finished(id)
+                    .expect("DMA root not finished")
+            };
+            drop(entry);
+        };
         let node = match Self::new(root.clone(), id, pool) {
             Ok(node) => node,
             Err(error) => {
-                let entry = {
-                    let mut state = root.state.lock();
-                    state.tree.seal(id).expect("DMA root missing");
-                    state
-                        .tree
-                        .finish(id)
-                        .expect("unpublished DMA root has members");
-                    state
-                        .tree
-                        .remove_finished(id)
-                        .expect("DMA root not finished")
-                };
-                drop(entry);
+                rollback();
                 return Err(error);
             }
         };
@@ -194,7 +198,14 @@ impl Node {
             .value_mut(id)
             .expect("DMA root missing")
             .node = Arc::downgrade(&node);
-        let retained = self::entry(id.get(), node.clone(), pool)?;
+        let retained = match self::entry(id.get(), node.clone(), pool) {
+            Ok(retained) => retained,
+            Err(error) => {
+                // 最后 Node 在移除空根以后才析构，Drop 不会再排入根回收队列。
+                rollback();
+                return Err(error);
+            }
+        };
         NODES.lock().insert_prepared(retained);
         Ok(node)
     }

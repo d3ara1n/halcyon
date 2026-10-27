@@ -30,18 +30,19 @@ const REQUESTS: usize = 8;
 const CONTROL_REQUESTS: usize = 1;
 const ROOT_TASKS: usize = 2;
 const INSTANCES: usize = 32;
-const INSTANCE_SOURCES: usize = SLOT_SOURCES + keyboard::WATCHES;
+const INSTANCE_SOURCES: usize = SLOT_SOURCES + keyboard::WATCHES + 1;
 const ACTIVE: usize = 2;
 const REQUEST_SOURCES: usize = 2;
-const CALLS: usize = REQUESTS + ACTIVE;
+const CALLS: usize = ACTIVE * 3;
 const RPC_SOURCES: usize = match Dispatcher::source_capacity(CALLS) {
     Ok(n) => n,
     Err(_) => panic!("HID RPC capacity overflow"),
 };
-const TASKS: usize = REQUESTS + CONTROL_REQUESTS + ROOT_TASKS + INSTANCES;
+const TASKS: usize = REQUESTS + CONTROL_REQUESTS + ROOT_TASKS + INSTANCES * 2;
 const ROOT_SOURCES: usize = RPC_SOURCES + 1;
-const SOURCES: usize =
-    ROOT_SOURCES + (REQUESTS + CONTROL_REQUESTS) * REQUEST_SOURCES + INSTANCES * INSTANCE_SOURCES;
+const SOURCES: usize = ROOT_SOURCES
+    + (REQUESTS + CONTROL_REQUESTS) * REQUEST_SOURCES
+    + INSTANCES * (INSTANCE_SOURCES + 1);
 fn step(step: Step) -> Advance {
     Advance { work_done: 1, step }
 }
@@ -108,7 +109,7 @@ impl World {
             task: 0,
         }))
         .map_err(|_| Error::Resource)?;
-        let task = Engine::new(instance.clone());
+        let task = Engine::new(instance.clone())?;
         requests
             .spawn(TaskSubmission::new(
                 Family::Engine(task),
@@ -123,6 +124,7 @@ impl World {
 
 enum Family {
     Engine(Engine),
+    Binding(Box<libdriver::binding::BindingTask>, InstanceRef),
     Ingress(Box<Ingress>),
     Request(Box<request::Request>),
     Transport { deadline: Deadline },
@@ -139,6 +141,21 @@ impl Task<World> for Family {
     ) -> Result<Advance, SystemCallError> {
         match self {
             Self::Engine(task) => task.advance(id, world, requests, input),
+            Self::Binding(task, instance) => {
+                let mut state = instance.borrow_mut();
+                let engine = state.task;
+                Ok(task
+                    .advance(
+                        &mut state.slot,
+                        id,
+                        engine,
+                        world.transport,
+                        &mut world.rpc,
+                        requests,
+                        input,
+                    )
+                    .unwrap_or_else(|error| fatal(error)))
+            }
             Self::Ingress(task) => task.advance(world, requests, input),
             Self::Request(task) => task.advance(id, world, requests, input),
             Self::Transport { deadline } => {
@@ -151,6 +168,7 @@ impl Task<World> for Family {
     fn registered(&mut self, world: &mut World, kind: u64, id: SourceId) {
         match self {
             Self::Engine(task) => task.registered(kind, id),
+            Self::Binding(task, _) => task.registered(kind, id),
             Self::Ingress(t) => t.source.registered(kind, id),
             Self::Request(t) => t.registered(kind, id),
             Self::Transport { .. } => world.rpc.registered(&mut (), kind, id),
@@ -159,6 +177,7 @@ impl Task<World> for Family {
     fn unregistered(&mut self, world: &mut World, kind: u64, id: SourceId) {
         match self {
             Self::Engine(task) => task.unregistered(id),
+            Self::Binding(task, _) => task.unregistered(id),
             Self::Ingress(t) => {
                 t.source.unregistered(id);
             }
@@ -179,7 +198,9 @@ impl Task<World> for Family {
             // 已准入不可复用的实例任务可在最后Delivery退休后先完成；迟到通知不产生完成事实。
             return;
         }
-        if matches!(self, Self::Transport { .. }) {
+        if let Self::Binding(task, _) = self {
+            task.refused(failure).unwrap_or_else(|error| fatal(error));
+        } else if matches!(self, Self::Transport { .. }) {
             world.rpc.refused(&mut (), failure);
         } else if matches!(self, Self::Ingress(_)) {
             match failure {
@@ -196,6 +217,7 @@ impl Task<World> for Family {
     fn deadline(&self) -> Deadline {
         match self {
             Self::Engine(t) => t.deadline(),
+            Self::Binding(t, _) => t.deadline(),
             Self::Request(t) => t.deadline(),
             Self::Transport { deadline } => *deadline,
             _ => Deadline::INFINITE,
@@ -290,7 +312,7 @@ pub(super) fn run(bootstrap: MailboxSender, pool: Capability, capacity: u32) {
         Runtime::<Family, WaitSet>::source_input_budget(CONTROL_REQUESTS * REQUEST_SOURCES)
             .expect("HID control inputs invalid");
     let instance_input =
-        Runtime::<Family, WaitSet>::source_input_budget(INSTANCES * INSTANCE_SOURCES)
+        Runtime::<Family, WaitSet>::source_input_budget(INSTANCES * (INSTANCE_SOURCES + 1))
             .expect("HID instance inputs invalid");
     let input = root_input
         .checked_add(request_input)
@@ -321,7 +343,7 @@ pub(super) fn run(bootstrap: MailboxSender, pool: Capability, capacity: u32) {
     let mut world = World {
         control: state,
         instances,
-        instance_funding: view(INSTANCES, instance_input),
+        instance_funding: view(INSTANCES * 2, instance_input),
         funding: funding.clone(),
         rpc: Dispatcher::new(CALLS, &funding).expect("HID dispatcher failed"),
         transport: 0,

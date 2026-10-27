@@ -4,6 +4,47 @@ use core::num::NonZeroU64;
 
 use crate::{Error, identity::BindingRef};
 
+/// 供应者登记时声明的停止前提；不从能力种类推断，也不直接授予报告权限。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StopRequirement {
+    ProviderOwned = 0,
+    ConsumerQuiescence = 1,
+}
+impl StopRequirement {
+    pub fn from_raw(raw: u32) -> Result<Self, Error> {
+        match raw {
+            0 => Ok(Self::ProviderOwned),
+            1 => Ok(Self::ConsumerQuiescence),
+            _ => Err(Error::Invalid),
+        }
+    }
+}
+
+/// 由服务端原 Use context 冻结的操作权，不能由设备声明或请求正文自授。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UseAccess(u32);
+impl UseAccess {
+    pub const RESOURCES: Self = Self(1);
+    pub const REPORT_QUIESCENT: Self = Self(2);
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub fn from_raw(raw: u32) -> Result<Self, Error> {
+        if raw & !3 != 0 || raw & 1 == 0 {
+            Err(Error::Invalid)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Preparing,

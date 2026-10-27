@@ -1,7 +1,7 @@
 //! 设备管理者的真实启动与停止装配；init 保留根管理、独立 Job/Pool 及进程监督。
 use super::{
-    JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, TopologyNames,
-    init_process_info, root_memory_pool,
+    JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, TopologyNames, init_process_info,
+    root_memory_pool,
 };
 use alloc::vec::Vec;
 use erhino_shared::proc::HandleGrant;
@@ -21,13 +21,11 @@ use libdevice::{
 };
 use libkernel::{
     debug,
-    ipc::{
-        message::{MailboxSender, wait_message_until},
-        object, wait,
-    },
+    ipc::{message::MailboxSender, object, wait},
     process,
 };
 use libprocess::{GrantOutcome, SpawnRequest};
+use librpc::Exchange;
 
 const DEADLINE_MS: u64 = 5_000;
 const POOL_RIGHTS: Rights = Rights::from_raw(
@@ -35,24 +33,24 @@ const POOL_RIGHTS: Rights = Rights::from_raw(
 );
 pub(super) struct Manager {
     pid: u64,
-    control: Handle,
     job: Handle,
     pool: Handle,
     root: Option<MailboxSender>,
-    admin: Option<MailboxSender>,
     observer: Option<MailboxSender>,
     observer_admin: Option<MailboxSender>,
     watch: Option<libdevice::client::Watch>,
 }
 pub(super) fn call(
+    root: &mut dyn Exchange,
     sender: &MailboxSender,
     command: Command<'_>,
 ) -> Result<librpc::exchange::Reply, &'static str> {
     let deadline = libkernel::time::timeout_millis(DEADLINE_MS)
         .map_err(|_| "device request deadline failed")?;
-    call_until(sender, command, deadline)
+    call_until(root, sender, command, deadline)
 }
 pub(super) fn call_until(
+    root: &mut dyn Exchange,
     sender: &MailboxSender,
     command: Command<'_>,
     deadline: erhino_shared::time::Deadline,
@@ -63,15 +61,13 @@ pub(super) fn call_until(
         .map_err(|_| "device request encoding failed")?;
     let request = librpc::Request::new(protocol::ID, &bytes[..used])
         .map_err(|_| "device request preparation failed")?;
-    librpc::Caller::new()
-        .call(sender, deadline, request)
-        .map_err(|error| {
-            debug!(
-                "device management RPC failed: phase={:?}, cause={:?}",
-                error.phase, error.cause
-            );
-            "device management RPC unavailable"
-        })
+    root.call(sender, deadline, request).map_err(|error| {
+        debug!(
+            "device management RPC failed: phase={:?}, cause={:?}",
+            error.phase, error.cause
+        );
+        "device management RPC unavailable"
+    })
 }
 fn empty(
     reply: &librpc::exchange::Reply,
@@ -112,8 +108,10 @@ impl Manager {
     }
     pub(super) fn issue_driver_source(
         &self,
+        root: &mut RootSupervisor,
     ) -> Result<(MailboxSender, MailboxSender), &'static str> {
         self.issue_source(
+            root,
             Scope::Root,
             Access::OBSERVE
                 .union(Access::CLAIM)
@@ -124,15 +122,18 @@ impl Manager {
     #[cfg(feature = "acceptance-device")]
     pub(super) fn issue_function_source(
         &self,
+        root: &mut RootSupervisor,
     ) -> Result<(MailboxSender, MailboxSender), &'static str> {
-        self.issue_source(Scope::Root, Access::OBSERVE.union(Access::FUNCTIONS))
+        self.issue_source(root, Scope::Root, Access::OBSERVE.union(Access::FUNCTIONS))
     }
     #[cfg(feature = "acceptance-device-function-session")]
     pub(super) fn controller_source(
         &self,
+        root: &mut RootSupervisor,
         id: libdevice::identity::DeviceId,
     ) -> Result<(MailboxSender, MailboxSender), &'static str> {
         self.issue_source(
+            root,
             Scope::Subtree(id),
             Access::OBSERVE
                 .union(Access::CLAIM)
@@ -145,11 +146,13 @@ impl Manager {
     }
     fn issue_source(
         &self,
+        root: &mut RootSupervisor,
         scope: Scope,
         access: Access,
     ) -> Result<(MailboxSender, MailboxSender), &'static str> {
         let result = (|| {
             let mut reply = call(
+                root,
                 self.root.as_ref().ok_or("device root entry closed")?,
                 Command::IssueSource { scope, access },
             )?;
@@ -188,8 +191,12 @@ impl Manager {
         })();
         if result.is_err() {
             // 非幂等签发 Unknown 封原根，不以另发来源掩盖可能已提交的权利。
-            if let Some(admin) = &self.admin {
-                let _ = call(admin, Command::SealSource);
+            if let Ok(end) = libkernel::time::timeout_millis(DEADLINE_MS) {
+                let _ = root.manager_source_call(
+                    super::device_supervision::Manager::Device,
+                    Command::SealSource,
+                    end,
+                );
             }
         }
         result
@@ -271,7 +278,7 @@ impl Manager {
         }
         let payload = Delegation::encode(grants.len() - startup::ROOT_BASE)
             .map_err(|_| "device platform configuration invalid")?;
-        let prepared = libprocess::prepare(SpawnRequest {
+        let prepared = root.prepare_process(SpawnRequest {
             job,
             parent: init_process_info(),
             memory_pool: pool,
@@ -294,21 +301,12 @@ impl Manager {
             );
             "device manager spawn failed"
         })?;
-        root.device_observer
-            .as_ref()
-            .ok_or("device observation missing")?
-            .register(super::device_supervision::Manager::Device, &prepared, None)?;
-        let spawned = prepared
-            .start()
-            .map_err(|_| "device manager Start failed")?;
-        root.track_process(Supervised {
-            pid: spawned.pid,
-            control: spawned.control,
-        });
+        let spawned = root.start_manager(super::device_supervision::Manager::Device, prepared)?;
         names.register_process(spawned.pid, "srv_device");
         let deadline = libkernel::time::timeout_millis(DEADLINE_MS)
             .map_err(|_| "device startup deadline failed")?;
-        let mut ready = wait_message_until(bootstrap.owner, deadline)
+        let mut ready = root
+            .receive_until(bootstrap.owner, deadline)
             .map_err(|_| "device manager readiness failed")?;
         if ready.header.kind != protocol::BOOT_READY
             || ready.header.sender_context_id != expected
@@ -351,14 +349,11 @@ impl Manager {
         {
             return Err("device root roles share one context");
         }
-        root.device_observer
-            .as_ref()
-            .ok_or("device observation missing")?
-            .attach_admin(
-                super::device_supervision::Manager::Device,
-                &admin,
-                spawned.pid,
-            )?;
+        root.attach_manager_source(
+            super::device_supervision::Manager::Device,
+            admin,
+            spawned.pid,
+        )?;
         let state =
             process::query(spawned.control).map_err(|_| "device process readiness query failed")?;
         if state.state != ProcessState::Running as u32
@@ -372,6 +367,7 @@ impl Manager {
         // 根观察角色是正式装配出口；签发 Unknown 时封旧根，不另发行第二份替代来源。
         let observer_result = (|| {
             let mut reply = call(
+                root,
                 &root_entry,
                 Command::IssueSource {
                     scope: Scope::Root,
@@ -403,6 +399,7 @@ impl Manager {
                 incarnation,
             )?;
             let denied = call(
+                root,
                 &observer,
                 Command::IssueSource {
                     scope: Scope::Root,
@@ -411,12 +408,16 @@ impl Manager {
             )?;
             empty(&denied, spawned.pid, 1, Some(Error::Permission))?;
             let watch = libdevice::client::Watch::from_reply(
-                call(&observer, Command::WatchScope { scope: Scope::Root })?,
+                call(root, &observer, Command::WatchScope { scope: Scope::Root })?,
                 incarnation,
                 15,
             )
             .map_err(|_| "device Watch adoption failed")?;
-            let rejected = call(watch.control(), Command::WatchScope { scope: Scope::Root })?;
+            let rejected = call(
+                root,
+                watch.control(),
+                Command::WatchScope { scope: Scope::Root },
+            )?;
             if !matches!(
                 libdevice::client::Watch::from_reply(rejected, incarnation, 15),
                 Err(Error::Permission)
@@ -424,7 +425,7 @@ impl Manager {
                 return Err("device Watch control acquired subscription authority");
             }
             let first = libdevice::client::Watch::decode_reply(
-                &call(watch.control(), Command::QueryWatch)?,
+                &call(root, watch.control(), Command::QueryWatch)?,
                 17,
             )
             .map_err(|_| "device Watch query failed")?;
@@ -432,6 +433,7 @@ impl Manager {
                 return Err("device Watch missed initial state");
             }
             let page = call(
+                root,
                 &observer,
                 Command::Enumerate {
                     scope: Scope::Root,
@@ -454,7 +456,7 @@ impl Manager {
                 if id.incarnation() != incarnation {
                     return Err("platform device registry identity mismatch");
                 }
-                let reply = call(&observer, Command::QueryDevice { id })?;
+                let reply = call(root, &observer, Command::QueryDevice { id })?;
                 let info = protocol::decode_device(&reply.payload, id, reply.handles.remaining())
                     .map_err(|_| "platform device description invalid")?;
                 if !info.present
@@ -468,6 +470,7 @@ impl Manager {
             }
             let acknowledged = libdevice::client::Watch::decode_reply(
                 &call(
+                    root,
                     watch.control(),
                     Command::AckWatch {
                         sequence: first.sequence,
@@ -482,7 +485,7 @@ impl Manager {
             {
                 return Err("device Watch acknowledgement retained notification");
             }
-            check_discovery(&observer, expected_host)?;
+            check_discovery(root, &observer, expected_host)?;
             debug!(
                 "device discovery ready: finite enumeration, OAL root and Watch acknowledgement"
             );
@@ -491,7 +494,13 @@ impl Manager {
         let (observer, observer_admin, watch) = match observer_result {
             Ok(roles) => roles,
             Err(error) => {
-                let sealed = call(&admin, Command::SealSource)
+                let sealed = root
+                    .manager_source_call(
+                        super::device_supervision::Manager::Device,
+                        Command::SealSource,
+                        libkernel::time::timeout_millis(DEADLINE_MS)
+                            .map_err(|_| "device seal deadline failed")?,
+                    )
                     .and_then(|reply| empty(&reply, spawned.pid, 2, None));
                 if sealed.is_err() {
                     debug!("device assembly source closure is unconfirmed");
@@ -505,11 +514,9 @@ impl Manager {
         );
         Ok(Self {
             pid: spawned.pid,
-            control: spawned.control,
             job,
             pool,
             root: Some(root_entry),
-            admin: Some(admin),
             observer: Some(observer),
             observer_admin: Some(observer_admin),
             watch: Some(watch),
@@ -518,18 +525,9 @@ impl Manager {
     pub fn stop(&mut self, root: &mut RootSupervisor) -> Result<(), &'static str> {
         let deadline =
             libkernel::time::timeout_millis(40_000).map_err(|_| "device stop deadline failed")?;
-        let deadline = root
-            .device_observer
-            .as_mut()
-            .ok_or("device observation missing")?
-            .stopping(super::device_supervision::Manager::Device, deadline)?;
-        let Self {
-            pid,
-            control,
-            job,
-            pool,
-            ..
-        } = *self;
+        let deadline =
+            root.manager_stopping(super::device_supervision::Manager::Device, deadline)?;
+        let Self { pid, job, pool, .. } = *self;
         process::seal_job(job).map_err(|_| "device assembly JobSeal failed")?;
         if let Some(watch) = self.watch.as_ref() {
             let observer_admin = self
@@ -537,22 +535,23 @@ impl Manager {
                 .as_ref()
                 .ok_or("device observer administration missing")?;
             empty(
-                &call_until(observer_admin, Command::SealSource, deadline)?,
+                &call_until(root, observer_admin, Command::SealSource, deadline)?,
                 pid,
                 2,
                 None,
             )?;
-            let notified = wait::wait_until(
-                watch.observer().as_handle(),
-                ObjectSignals::READABLE,
-                deadline,
-            )
-            .map_err(|_| "device Watch terminal notification failed")?;
+            let notified = root
+                .wait_until(
+                    watch.observer().as_handle(),
+                    ObjectSignals::READABLE,
+                    deadline,
+                )
+                .map_err(|_| "device Watch terminal notification failed")?;
             if !notified.observed.contains(ObjectSignals::READABLE) {
                 return Err("device Watch terminal notification missing");
             }
             let terminal = libdevice::client::Watch::decode_reply(
-                &call_until(watch.control(), Command::QueryWatch, deadline)?,
+                &call_until(root, watch.control(), Command::QueryWatch, deadline)?,
                 17,
             )
             .map_err(|_| "device Watch terminal query failed")?;
@@ -561,6 +560,7 @@ impl Manager {
             }
             let acknowledged = libdevice::client::Watch::decode_reply(
                 &call_until(
+                    root,
                     watch.control(),
                     Command::AckWatch {
                         sequence: terminal.sequence,
@@ -580,19 +580,23 @@ impl Manager {
         }
         self.observer = None;
         self.observer_admin = None;
-        let admin = self
-            .admin
-            .as_ref()
-            .ok_or("device root administration missing")?;
         empty(
-            &call_until(admin, Command::SealSource, deadline)?,
+            &root.manager_source_call(
+                super::device_supervision::Manager::Device,
+                Command::SealSource,
+                deadline,
+            )?,
             pid,
             2,
             None,
         )?;
         let source_deadline = deadline;
         loop {
-            let reply = call_until(admin, Command::QuerySourceStop, source_deadline)?;
+            let reply = root.manager_source_call(
+                super::device_supervision::Manager::Device,
+                Command::QuerySourceStop,
+                source_deadline,
+            )?;
             if reply.sender_pid != pid {
                 return Err("device source stop reply identity mismatch");
             }
@@ -611,42 +615,16 @@ impl Manager {
                     }
                     let retry = libkernel::time::timeout_millis(1)
                         .map_err(|_| "device source retry deadline failed")?;
-                    libkernel::time::sleep_until(erhino_shared::time::Deadline::at(
+                    root.sleep_until(erhino_shared::time::Deadline::at(
                         retry.at_ns.min(source_deadline.at_ns),
                     ))
                     .map_err(|_| "device source retry sleep failed")?;
                 }
             }
         }
-        let observer = root
-            .device_observer
-            .as_ref()
-            .ok_or("device observation missing")?;
-        observer.source_closed(super::device_supervision::Manager::Device)?;
-        observer.release_admin(super::device_supervision::Manager::Device, deadline)?;
+        root.manager_source_closed(super::device_supervision::Manager::Device)?;
         self.root = None;
-        self.admin = None;
-        let done = wait::wait_until(control, ObjectSignals::DONE, deadline)
-            .map_err(|_| "device shutdown wait failed")?;
-        if !done.observed.contains(ObjectSignals::DONE) {
-            return Err("device manager shutdown timed out");
-        }
-        let state = process::query(control).map_err(|_| "device terminal query failed")?;
-        if state.state != ProcessState::Dead as u32
-            || state.cause != TerminationCause::Completed as u32
-            || state.detail != TerminationDetail::NONE
-        {
-            debug!(
-                "device manager terminal failure: state={}, cause={}, detail={:?}",
-                state.state, state.cause, state.detail
-            );
-            return Err("device manager did not complete normally");
-        }
-        root.device_observer
-            .as_ref()
-            .ok_or("device observation missing")?
-            .disarm(super::device_supervision::Manager::Device, deadline)?;
-        root.collect_process(pid)?;
+        root.collect_manager(super::device_supervision::Manager::Device)?;
         root.collect_job(job)?;
         root.close_control(job)?;
         root.close_control(pool)?;
@@ -665,10 +643,7 @@ impl RootSupervisor {
             .ok_or("device assembly record missing")?;
         match device.stop(self) {
             Ok(()) => {
-                self.device_observer
-                    .as_mut()
-                    .ok_or("device observation missing")?
-                    .join()?;
+                self.finish_device_supervision()?;
                 Ok(())
             }
             Err(error) => {
@@ -679,7 +654,11 @@ impl RootSupervisor {
     }
 }
 
-fn check_discovery(observer: &MailboxSender, has_host: bool) -> Result<(), &'static str> {
+fn check_discovery(
+    root: &mut RootSupervisor,
+    observer: &MailboxSender,
+    has_host: bool,
+) -> Result<(), &'static str> {
     use liboal::protocol as oal;
     for command in [
         oal::Request::Lookup { path: "" },
@@ -696,7 +675,7 @@ fn check_discovery(observer: &MailboxSender, has_host: bool) -> Result<(), &'sta
             .map_err(|_| "device OAL encoding failed")?;
         let request = librpc::Request::new(oal::ID, &bytes[..used])
             .map_err(|_| "device OAL request failed")?;
-        let reply = librpc::Caller::new()
+        let reply = root
             .call(observer, deadline, request)
             .map_err(|_| "device OAL transport failed")?;
         if reply.handles.remaining() != 0 {

@@ -9,7 +9,6 @@ use libdevice::{
 enum Next {
     Claim,
     WatchBinding,
-    QueryBinding,
     WaitResources,
     IssueUse,
     IssueRegistrar,
@@ -21,8 +20,7 @@ enum Next {
     InstallFunction,
     Running,
     StopBinding,
-    StopActivation,
-    ReportStopped,
+    ActivationResult,
     WaitReleased,
     Detach,
     Retire,
@@ -31,7 +29,6 @@ pub(super) struct Managed {
     run: Rc<RefCell<Run>>,
     identity: Vec<u8>,
     next: Next,
-    resume: Next,
     call: Option<(u64, Next)>,
     control: Option<Arc<MailboxSender>>,
     usage: Option<Arc<MailboxSender>>,
@@ -43,11 +40,7 @@ pub(super) struct Managed {
     function_description: Vec<u8>,
     stop_sent: bool,
     activation_sent: bool,
-    activation_stop_sent: bool,
-    reported: bool,
     phase_end: Deadline,
-    cleanup: Option<librpc::CallError>,
-    retry_at: Option<u64>,
 }
 impl Managed {
     fn process(&self, world: &World<'_>) -> Option<Rc<RefCell<worker::Record>>> {
@@ -65,7 +58,6 @@ impl Managed {
             run,
             identity: frozen,
             next: Next::Claim,
-            resume: Next::WaitResources,
             call: None,
             control: None,
             usage: None,
@@ -77,25 +69,16 @@ impl Managed {
             function_description: Vec::new(),
             stop_sent: false,
             activation_sent: false,
-            activation_stop_sent: false,
-            reported: false,
             phase_end: Deadline::INFINITE,
-            cleanup: None,
-            retry_at: None,
         })
     }
     pub fn stop(&mut self) {
         self.run.borrow_mut().stop_requested = true;
     }
     pub fn deadline(&self) -> Deadline {
-        self.retry_at.map_or(self.phase_end, |at| {
-            self.phase_end
-                .instant()
-                .expect("driver phase deadline invalid")
-                .map_or(Deadline::at(at), |end| Deadline::at(at.min(end)))
-        })
+        self.phase_end
     }
-    fn failed_call(&mut self, mut error: librpc::CallError, txid: Option<u64>) {
+    fn failed_call(&mut self, error: librpc::CallError, txid: Option<u64>) {
         libkernel::debug!(
             "driver RPC failed: operation={:?}, device={}, epoch={}, txid={:?}, phase={:?}, cause={:?}",
             self.next,
@@ -114,8 +97,7 @@ impl Managed {
             librpc::CallCause::Frame(_) => Error::Invalid,
             _ => Error::Unavailable,
         };
-        drop(error.take_unsent_request());
-        self.cleanup = error.has_unretired_owners().then_some(error);
+        // Dispatcher 完成已退休观察来源；未发送请求由 error 的 typed owner 关闭。
         self.run.borrow_mut().fail(cause);
         self.next = if self.control.is_some() {
             Next::WaitReleased
@@ -147,28 +129,6 @@ impl Managed {
             return Err(error);
         }
         Ok(body)
-    }
-    fn acknowledge_binding(
-        &mut self,
-        requests: &mut Requests<'_, Family>,
-    ) -> Result<(), SystemCallError> {
-        let mut run = self.run.borrow_mut();
-        run.binding_changed = false;
-        if run.binding_watch != 0 {
-            requests.wake(run.binding_watch)?;
-        }
-        Ok(())
-    }
-    fn acknowledge_activation(
-        &mut self,
-        requests: &mut Requests<'_, Family>,
-    ) -> Result<(), SystemCallError> {
-        let mut run = self.run.borrow_mut();
-        run.activation_changed = false;
-        if run.activation_watch != 0 {
-            requests.wake(run.activation_watch)?;
-        }
-        Ok(())
     }
     fn consume(
         &mut self,
@@ -203,50 +163,6 @@ impl Managed {
                     .map_err(|_| Error::Quota)?;
                 self.next = Next::WaitResources;
             }
-            Next::QueryBinding => {
-                let snapshot = device::decode_snapshot(Self::device_result(
-                    &reply,
-                    Command::QueryBinding.op(),
-                )?)?;
-                if snapshot.reference != reference || reply.handles.remaining() != 0 {
-                    return Err(Error::Invalid);
-                }
-                self.acknowledge_binding(requests)?;
-                match snapshot.phase {
-                    BindingPhase::Preparing => {
-                        self.next = if self.run.borrow().stop_requested {
-                            Next::StopBinding
-                        } else {
-                            Next::WaitResources
-                        }
-                    }
-                    BindingPhase::ResourcesReady => {
-                        self.next = if self.run.borrow().stop_requested {
-                            Next::StopBinding
-                        } else if self.resume == Next::WaitResources {
-                            Next::IssueUse
-                        } else {
-                            self.resume
-                        }
-                    }
-                    BindingPhase::Stopping => {
-                        self.run.borrow_mut().stop_requested = true;
-                        self.next = Next::WaitReleased;
-                        self.retry_at = libkernel::time::timeout_millis(1)?
-                            .instant()
-                            .map_err(|_| Error::Invalid)?;
-                    }
-                    BindingPhase::Released => {
-                        libkernel::debug!(
-                            "driver binding Released: device={}",
-                            reference.device().serial()
-                        );
-                        self.run.borrow_mut().released = true;
-                        self.phase_end = Deadline::INFINITE;
-                        self.next = Next::Detach;
-                    }
-                }
-            }
             Next::IssueUse => {
                 if !Self::device_result(&reply, Command::IssueUse.op())?.is_empty()
                     || reply.handles.remaining() != 1
@@ -277,59 +193,53 @@ impl Managed {
                 self.registrar_admin = Some(admin);
                 self.next = Next::Spawn;
             }
-            Next::Activate | Next::StopActivation => {
-                let process = self.process(world).ok_or(Error::Unavailable)?;
-                let mailbox = process.borrow().mailbox;
+            Next::Activate | Next::ActivationResult => {
+                let mailbox = self
+                    .process(world)
+                    .ok_or(Error::Unavailable)?
+                    .borrow()
+                    .mailbox;
                 let receipt = libdriver::client::Receipt::decode(
                     reply,
                     reference,
                     mailbox,
                     if step == Next::Activate { 1 } else { 2 },
                 )?;
-                if let Some(observation) = &self.observation {
-                    if observation.description()?.object_id
-                        != receipt.observation.description()?.object_id
-                    {
+                if let Some(observation) = receipt.observation {
+                    if self.observation.as_ref().is_some_and(|old| {
+                        old.description().is_ok_and(|d| {
+                            observation
+                                .description()
+                                .is_ok_and(|new| d.object_id != new.object_id)
+                        })
+                    }) {
                         return Err(Error::Conflict);
                     }
-                } else {
                     self.observation =
-                        Some(Arc::try_new(receipt.observation).map_err(|_| Error::Resource)?);
+                        Some(Arc::try_new(observation).map_err(|_| Error::Resource)?);
                 }
-                self.run.borrow_mut().activation_status = Some(receipt.snapshot);
-                if receipt.snapshot.phase == protocol::Phase::Ready
-                    && !self.run.borrow().stop_requested
+                let mut run = self.run.borrow_mut();
+                if run
+                    .activation_status
+                    .is_none_or(|old| receipt.snapshot.sequence >= old.sequence)
                 {
+                    run.activation_status = Some(receipt.snapshot);
+                }
+                if receipt.snapshot.phase == protocol::Phase::Ready && !run.stop_requested {
                     self.function = receipt
                         .function
                         .map(|entry| Arc::try_new(entry).map_err(|_| Error::Resource))
                         .transpose()?;
                     self.function_name = receipt.name;
                     self.function_description = receipt.description;
-                    self.next = if self.run.borrow().activation_watch == 0 {
-                        Next::WatchActivation
-                    } else {
-                        Next::InstallActivation
-                    };
-                } else {
-                    if step == Next::StopActivation {
-                        self.activation_stop_sent = true;
-                    }
-                    if receipt.snapshot.phase == protocol::Phase::Terminal {
-                        if let Some(error) = receipt.snapshot.error {
-                            self.run.borrow_mut().fail(error);
-                        }
-                        self.run.borrow_mut().stop_requested = true;
-                    }
-                    self.next = if self.run.borrow().activation_watch == 0 {
-                        Next::WatchActivation
-                    } else if self.run.borrow().stop_requested {
-                        Next::WaitReleased
-                    } else {
-                        Next::Running
-                    };
                 }
-                self.acknowledge_activation(requests)?;
+                self.next = if step == Next::Activate {
+                    Next::WatchActivation
+                } else if self.function.is_some() && !run.stop_requested {
+                    Next::InstallActivation
+                } else {
+                    Next::Running
+                };
             }
             Next::WatchActivation => {
                 let observation = alias(self.observation.as_ref().ok_or(Error::NotReady)?)?;
@@ -381,19 +291,7 @@ impl Managed {
                 {
                     return Err(Error::Invalid);
                 }
-                self.run.borrow_mut().phase = protocol::Phase::Ready;
-                self.phase_end = Deadline::INFINITE;
                 self.next = Next::Running;
-                libkernel::debug!(
-                    "driver activation ready: device={}, worker={}, now_ns={}",
-                    reference.device().serial(),
-                    self.process(world)
-                        .ok_or(Error::Unavailable)?
-                        .borrow()
-                        .pid
-                        .ok_or(Error::Unavailable)?,
-                    libkernel::time::snapshot()?.now_ns
-                );
             }
             Next::StopBinding => {
                 if !Self::device_result(&reply, Command::StopBinding.op())?.is_empty()
@@ -404,16 +302,106 @@ impl Managed {
                 self.stop_sent = true;
                 self.next = Next::WaitReleased;
             }
-            Next::ReportStopped => {
-                if !Self::device_result(&reply, Command::ReportStopped.op())?.is_empty()
-                    || reply.handles.remaining() != 0
-                {
-                    return Err(Error::Invalid);
-                }
-                self.reported = true;
-                self.next = Next::WaitReleased;
-            }
             _ => return Err(Error::Invalid),
+        }
+        Ok(())
+    }
+    /// 观察事实和单调意图是阶段的唯一输入；RPC 回复只推进对应操作。
+    fn reconcile(&mut self, world: &World<'_>, now: u64) -> Result<(), SystemCallError> {
+        let mut run = self.run.borrow_mut();
+        run.stop_requested |= world.stopping;
+        if let Some(snapshot) = run.binding_status.and_then(|info| info.binding) {
+            match snapshot.phase {
+                BindingPhase::Stopping => {
+                    run.stop_requested = true;
+                    self.stop_sent = true;
+                }
+                BindingPhase::Released if !run.released => {
+                    libkernel::debug!("driver binding Released: device={}", run.device.serial());
+                    run.released = true;
+                    run.stop_requested = true;
+                }
+                BindingPhase::ResourcesReady if self.next == Next::WaitResources => {
+                    self.next = Next::IssueUse;
+                }
+                _ => {}
+            }
+        }
+        if !run.released
+            && let Some(status) = run.activation_status
+            && matches!(
+                status.phase,
+                protocol::Phase::Stopping | protocol::Phase::Terminal
+            )
+        {
+            if let Some(error) = status.error {
+                run.fail(error);
+            }
+            run.stop_requested = true;
+        }
+        if !run.released
+            && self
+                .phase_end
+                .instant()
+                .expect("driver phase deadline invalid")
+                .is_some_and(|end| now >= end)
+        {
+            if run.phase == protocol::Phase::Stopping {
+                fatal(Error::Unavailable);
+            }
+            libkernel::debug!(
+                "driver stage deadline expired: device={}, stage={:?}, now_ns={}, end_ns={:?}",
+                run.device.serial(),
+                self.next,
+                now,
+                self.phase_end.instant()
+            );
+            run.fail(Error::NotReady);
+        }
+        if run.released {
+            self.phase_end = Deadline::INFINITE;
+            if self.call.is_none() && self.next != Next::Retire {
+                self.next = Next::Detach;
+            }
+        } else if run.stop_requested {
+            if run.phase != protocol::Phase::Stopping {
+                run.phase = protocol::Phase::Stopping;
+                self.phase_end = Deadline::at(
+                    now.checked_add(30_000_000_000)
+                        .ok_or(SystemCallError::ClockRange)?,
+                );
+            }
+            // Claim 回包后必须先接通原轮观察；停止不能跳过唯一 Released 出口。
+            if self.call.is_none() && self.control.is_some() && self.next != Next::WatchBinding {
+                self.next = if self.stop_sent {
+                    Next::WaitReleased
+                } else {
+                    Next::StopBinding
+                };
+            }
+        } else if self.next == Next::Running {
+            if self.function.is_some() && run.phase != protocol::Phase::Ready {
+                run.phase = protocol::Phase::Ready;
+                self.phase_end = Deadline::INFINITE;
+                let reference = run.reference;
+                drop(run);
+                libkernel::debug!(
+                    "driver activation ready: device={}, worker={}, now_ns={}",
+                    reference.device().serial(),
+                    self.process(world)
+                        .and_then(|record| record.borrow().pid)
+                        .expect("installed driver process missing"),
+                    now
+                );
+                return Ok(());
+            }
+            if self.function.is_none()
+                && run
+                    .activation_status
+                    .is_some_and(|status| status.phase == protocol::Phase::Ready)
+            {
+                self.next = Next::ActivationResult;
+            }
         }
         Ok(())
     }
@@ -425,26 +413,8 @@ impl Managed {
         input: &mut Input<'_>,
     ) -> Result<Advance, SystemCallError> {
         self.run.borrow_mut().task = id;
-        let mut phase_expired = false;
-        let was_stopping = self.run.borrow().phase == protocol::Phase::Stopping;
         while input.pull().is_some() {}
-        if input.take_timeout() {
-            phase_expired = self
-                .phase_end
-                .instant()
-                .expect("driver phase deadline invalid")
-                .is_some_and(|at| at <= input.now_ns());
-            if phase_expired && !was_stopping {
-                libkernel::debug!(
-                    "driver stage deadline expired: device={}, stage={:?}, now_ns={}, end_ns={:?}",
-                    self.run.borrow().device.serial(),
-                    self.next,
-                    input.now_ns(),
-                    self.phase_end.instant()
-                );
-                self.run.borrow_mut().fail(Error::NotReady);
-            }
-        }
+        input.take_timeout();
         if self.phase_end == Deadline::INFINITE && self.next == Next::Claim {
             // Claim到具名功能安装的共同准备窗口；实测debug出生/协议工作约10s，留运输/调度余量。
             self.phase_end = libkernel::time::timeout_millis(20_000)?;
@@ -455,16 +425,7 @@ impl Managed {
                 self.phase_end.instant()
             );
         }
-        if world.stopping {
-            self.run.borrow_mut().stop_requested = true;
-        }
-        if self.run.borrow().stop_requested
-            && self.run.borrow().phase != protocol::Phase::Stopping
-            && !self.run.borrow().released
-        {
-            self.run.borrow_mut().phase = protocol::Phase::Stopping;
-            self.phase_end = libkernel::time::timeout_millis(30_000)?;
-        }
+        self.reconcile(world, input.now_ns())?;
         if let Some(process) = self.process(world) {
             let record = process.borrow();
             if (!record.accepting || record.dead || record.error.is_some())
@@ -479,11 +440,10 @@ impl Managed {
                     .trusted_physical;
                 if record.dead && trusted && self.activation_sent {
                     libkernel::debug!(
-                        "trusted physical worker DONE without Binding release: pid={}, device={}, epoch={}, reported={}",
+                        "trusted physical worker DONE without Binding release: pid={}, device={}, epoch={}",
                         record.pid.unwrap_or(0),
                         self.run.borrow().device.serial(),
-                        self.run.borrow().reference.epoch(),
-                        self.reported
+                        self.run.borrow().reference.epoch()
                     );
                     fatal(Error::Unavailable);
                 }
@@ -496,27 +456,10 @@ impl Managed {
                 }
             }
         }
-        if let Some(error) = self.cleanup.as_mut() {
-            if self.retry_at.is_some_and(|at| input.now_ns() < at) {
-                return Ok(advance(Step::Parked));
-            }
-            if error.retry_cleanup().is_err() {
-                self.retry_at = Some(
-                    input
-                        .now_ns()
-                        .checked_add(1_000_000)
-                        .ok_or(SystemCallError::ClockRange)?,
-                );
-                return Ok(advance(Step::Parked));
-            }
-            self.cleanup = None;
-            self.retry_at = None;
-        }
+        self.reconcile(world, input.now_ns())?;
         if let Some((txid, step)) = self.call {
             let Some(completion) = world.rpc.take(txid) else {
-                if phase_expired && was_stopping {
-                    fatal(Error::Unavailable);
-                }
+                // 停止与期限已由 reconcile 统一处理，原调用继续兑现运输退休。
                 return Ok(advance(Step::Parked));
             };
             self.call = None;
@@ -546,12 +489,7 @@ impl Managed {
                             step,
                             error
                         );
-                        if self.control.is_none()
-                            || matches!(
-                                step,
-                                Next::QueryBinding | Next::ReportStopped | Next::StopBinding
-                            )
-                        {
+                        if self.control.is_none() || matches!(step, Next::StopBinding) {
                             fatal(error);
                         }
                         self.run.borrow_mut().fail(error);
@@ -559,63 +497,14 @@ impl Managed {
                     }
                 }
                 Err(error) => {
-                    // 原调用已由 Dispatcher 退休；仍需兑现返还的 reply owner，不重签任何能力。
+                    // 原调用及观察来源已由 Dispatcher 退休，不重签任何能力。
                     self.failed_call(error, Some(txid));
                 }
             }
+            self.reconcile(world, input.now_ns())?;
             return Ok(advance(Step::Runnable));
         }
-        if phase_expired && was_stopping && !self.run.borrow().released {
-            fatal(Error::Unavailable);
-        }
-        if self.control.is_some()
-            && self.run.borrow().binding_changed
-            && self.next != Next::QueryBinding
-        {
-            self.resume = self.next;
-            self.next = Next::QueryBinding;
-        } else if self.control.is_some()
-            && self.run.borrow().stop_requested
-            && !self.run.borrow().released
-        {
-            if !self.stop_sent {
-                self.next = Next::StopBinding;
-            } else if self.process(world).is_some_and(|process| {
-                let record = process.borrow();
-                record.entry.is_some() && !record.dead
-            }) && !self.activation_stop_sent
-            {
-                self.next = Next::StopActivation;
-            } else {
-                let run = self.run.borrow();
-                let trusted = world
-                    .catalog
-                    .records()
-                    .nth(run.implementation)
-                    .expect("driver implementation missing")
-                    .unwrap_or_else(|error| fatal(error))
-                    .trusted_physical;
-                if trusted
-                    && !self.reported
-                    && run
-                        .activation_status
-                        .is_some_and(|status| status.consumer_stopped)
-                {
-                    self.next = Next::ReportStopped;
-                } else if run.activation_changed
-                    && self
-                        .process(world)
-                        .is_some_and(|process| !process.borrow().dead)
-                {
-                    self.next = Next::StopActivation;
-                }
-            }
-        } else if !self.run.borrow().released
-            && self.run.borrow().activation_changed
-            && self.observation.is_some()
-        {
-            self.next = Next::Activate;
-        }
+        // 此后只按已协调的操作推进，不再从旧回复回写生命周期。
         if self.run.borrow().stop_requested && self.control.is_none() && self.next == Next::Claim {
             self.next = Next::Retire;
         }
@@ -623,16 +512,7 @@ impl Managed {
             Next::WaitResources | Next::Running => {
                 return Ok(advance(Step::Parked));
             }
-            Next::WaitReleased => {
-                // 来源封口可先终结 Binding Watch；原 Control 的完成观察仍由本任务推进，
-                // 不能依赖已经退休的通知或外部再次 Stop 来发现 Released。
-                if self.retry_at.is_some_and(|at| input.now_ns() < at) {
-                    return Ok(advance(Step::Parked));
-                }
-                self.retry_at = None;
-                self.resume = Next::WaitReleased;
-                self.next = Next::QueryBinding;
-            }
+            Next::WaitReleased => return Ok(advance(Step::Parked)),
             Next::Spawn => {
                 match worker::associate(world, requests, &self.run) {
                     Ok(_) => self.next = Next::WaitBoot,
@@ -650,7 +530,7 @@ impl Managed {
                     .is_some_and(|process| process.borrow().ready());
                 if ready {
                     self.next = if self.run.borrow().stop_requested {
-                        Next::StopActivation
+                        Next::StopBinding
                     } else {
                         Next::Activate
                     };
@@ -696,7 +576,6 @@ impl Managed {
             Next::Retire => {
                 if self.control.is_some()
                     || self.call.is_some()
-                    || self.cleanup.is_some()
                     || self.usage.is_some()
                     || self.observation.is_some()
                     || self.run.borrow().process.is_some()
@@ -765,7 +644,7 @@ impl Managed {
             );
         }
         let (target, mut request) = match self.next {
-            Next::Activate | Next::StopActivation => {
+            Next::Activate | Next::ActivationResult => {
                 let command = if self.next == Next::Activate {
                     protocol::Command::Activate {
                         reference,
@@ -773,20 +652,22 @@ impl Managed {
                         registrar: self.registrar.is_some(),
                     }
                 } else {
-                    protocol::Command::Stop { reference }
+                    protocol::Command::QueryActivationResult { reference }
                 };
                 let used = command
                     .encode(deadline, &mut bytes)
                     .unwrap_or_else(|error| fatal(error));
                 let mut request = Request::new(protocol::ID, &bytes[..used])?;
-                request
-                    .push(
-                        alias(self.usage.as_ref().expect("driver BindingUse missing"))
-                            .unwrap_or_else(|error| fatal(error))
-                            .into_capability(),
-                        TRANSPORT,
-                    )
-                    .map_err(|failure| failure.error)?;
+                if self.next == Next::Activate {
+                    request
+                        .push(
+                            alias(self.usage.as_ref().expect("driver BindingUse missing"))
+                                .unwrap_or_else(|error| fatal(error))
+                                .into_capability(),
+                            TRANSPORT,
+                        )
+                        .map_err(|failure| failure.error)?;
+                }
                 if self.next == Next::Activate
                     && let Some(registrar) = &self.registrar
                 {
@@ -799,7 +680,7 @@ impl Managed {
                         )
                         .map_err(|failure| failure.error)?;
                 }
-                self.activation_sent = true;
+                self.activation_sent |= self.next == Next::Activate;
                 (
                     self.process(world)
                         .and_then(|process| process.borrow().entry.clone())
@@ -823,7 +704,6 @@ impl Managed {
                 let command = match step {
                     Next::Claim => Command::Claim { reference },
                     Next::WatchBinding => Command::WatchBinding,
-                    Next::QueryBinding => Command::QueryBinding,
                     Next::IssueUse => Command::IssueUse,
                     Next::IssueRegistrar => Command::IssueRegistrar,
                     Next::InstallActivation => Command::InstallActivation {
@@ -834,7 +714,6 @@ impl Managed {
                         description: &self.function_description,
                     },
                     Next::StopBinding => Command::StopBinding,
-                    Next::ReportStopped => Command::ReportStopped,
                     _ => return Err(SystemCallError::InternalError),
                 };
                 let used = command

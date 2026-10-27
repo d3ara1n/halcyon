@@ -1,6 +1,6 @@
 # 正式服务装配与监督设计
 
-状态：**设备首批装配已获实施授权；平台供应、两管理者私有启动/持续监督、真实PCI/xHCI/HID、单键盘热插、多Binding复用和管理者故障终局已有设备计划列明的组合证据；首批候选及精确费用/Unknown等门仍未完成，通用正式服务装配尚未全部闭合**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备施工与全部证据由[设备分案](todo-2026-09-device-system-design.md#当前进度与接力)统一记录。
+状态：**设备第二轮持续监督已实施并通过所选组合验证；通用正式服务装配仍待后续设计，原设备独立门未全部关闭**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；已实现合同见[第二轮持续监督设计](#第二轮持续监督设计2026-10-27)，本轮实现、证据与边界见[机制收敛报告](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，原设备开放门见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)。
 
 ## 目标与非目标
 
@@ -10,13 +10,13 @@
 
 ## 当前事实与前置
 
-原装配盘点基线：2026-10-07，`refactor/system-redesign` / `f174d8e`；设备施工从 `549a9e7` 继续，当前未提交实现及验证由设备主计划拥有。当前启动与监督事实见 [startup 实现](../notes/impls/startup.md)、[task 实现](../notes/impls/task.md)、[framework 实现](../notes/impls/framework.md)。
+原装配盘点基线为`f174d8e`，首批设备施工为`549a9e7..f3337eb`；第二轮在其上替换独立线程及重复握手，当前实现由root同一Assembly持续推进。启动与监督事实见[startup实现](../notes/impls/startup.md)、[设备实现](../notes/impls/device.md)、[framework实现](../notes/impls/framework.md)。
 
 - `srv_init` 的固定 workload、RequiredLaunchSet、RootSupervisor 与已有 pm/fs 消费者承担验收装配和真实监督责任；不能把它们当成没有可用基座。
 - 对象链、自动回收、Job 封口、进程出生/执行绑定、来源登记及运行时分层已完成相应交付。本案不恢复 ProcessDrain 或用户必须持续驱动的内核回收。
 - 当前已有 Registry/服务记录；发布成功、服务就绪、endpoint 可用和进程存活之间的正式系统协议尚未完成本轮详细设计。
 - 设备的实例、受权使用/绑定、供应依赖和硬件安全责任已按首批范围定稿。virt 的三个 MMIO 根、PCI INTx 根和 DMA 根已交付 init，实际管理者委托及非空消费者已接通。设备驱动装配不能仅凭进程 DONE 推断 DMA 已静止。
-- srv_device由init的独立Job/Pool和ProcessControl监督记录承载；真实私有bootstrap核context/PID及入口关联，发行受限观察并接枚举/OAL/Watch。平台委托、真实供应及依赖者已接，两管理者Start前准入/运行期/Stopping观察和唯一故障终局亦已接。正常停止按原来源Closed、监督admin副本关闭确认、真实Completed及原Job/进程/Pool收集交接；具体范围与未覆盖门见[设备主记录](todo-2026-09-device-system-design.md#当前进度与接力)。
+- srv_device由init的独立Job/Pool及root管理记录承载；真实私有bootstrap核context/PID及入口关联，发行受限观察并接枚举/OAL/Watch。两管理者的DONE来源先于Start，运行期/Stopping观察与唯一故障终局均由root推进。正常停止由同一owner确认来源Closed、关闭原admin、核真实Completed、注销来源并交原Collector，无admin副本/ACK或撤防握手；具体边界见设备唯一收口表。
 - boot 已在初始进程启动前接入独立 DONE 观察；init 的最终 reset 被拒绝时自终止，由该观察触发 runtime stop。已暴露 DMA 的实际 pin 与写许可继续保留，相关证据见设备主计划；这不替代设备 halt 或正常停止编排。
 - 关机编排与电源管理已有独立记录；本案只确定服务的停止入口及其与监督的交接，不复制全系统关机状态机。
 
@@ -62,17 +62,17 @@ srv_driver私有Ready精确交两个sender及两个真实Mailbox KOID：Control�
 
 正常服务不从通用 Registry 发现自己的 bootstrap 控制入口。init 为每次启动预建独占 sender context/receiver，把 sender 通过出生块交给目标；回复身份与已保留的启动记录关联，迟到回复只能回到原记录。收到入口后同时核对目标 Process 尚未终态；后续死亡由预先安装的观察接管，不能凭一次检查保证永久存活。启动失败、就绪超时或停止先到时，记录保持 Stopping，关闭新激活，停止该实际 Process，并等待其终态；迟到入口只释放，不发布为新实例。
 
-管理者就绪后平台适配器登记 PCI host；PCI Ready 后才可能发现 xHCI；USB 接口出现才激活 HID。这些是功能供应关系，不能替代进程 Job 树。设备业务不依赖 srv_fs/Registry 就绪：必要功能出口是 Devices/functions，通过已有 OAL Namespace 绑定实际入口；可选 Registry 别名失败只影响发现别名。已有 core workload 的 fs/pm 验收装配保留原 owner，不把它们误列为本次硬件启动前置。
+平台适配器先登记 PCI host，srv_device 的私有就绪等待真实登记回执；srv_driver 随后观察并激活 PCI，PCI Ready 后才可能发现 xHCI，USB 接口出现才激活 HID。这些是功能供应关系，不能替代进程 Job 树。设备业务不依赖 srv_fs/Registry 就绪：必要功能出口是 Devices/functions，通过已有 OAL Namespace 绑定实际入口；可选 Registry 别名失败只影响发现别名。已有 core workload 的 fs/pm 验收装配保留原 owner，不把它们误列为本次硬件启动前置。
 
 首批不自动重启失效的 srv_device 或 DMA 主控。srv_driver 失效后，init 封旧 ClaimSource、停止受托驱动 Job；只有全部旧 Binding 已安全 Released 才允许显式管理请求创建新来源和新管理者。初次启动与接替都经过同一装配 gate；没有明确请求不循环重启。若清理需要已死主控的硬件证据，直接按关机计划升级。
 
-PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_driver 凭 BindingControl 调用 IssueRegistrar 取得，随同一 Activate 显式交付；不属于 Provision 冻结硬件表。srv_driver 在运输前将 Registrar/SourceAdmin 纳入原激活记录，SourceAdmin 留该记录，init 外层来源管理覆盖其死亡后的封口。HID/普通叶角色没有该 grant。签发 Unknown 时停止原轮，父轮失效阻止所有可能已发行子来源继续登记；不重签替代授权。激活重试使用同一能力身份，迟到/停止请求及父子清理遵守设备计划的统一合同。
+PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_driver 凭 BindingControl 调用 IssueRegistrar 取得，随同一 Activate 显式交付；不属于 Provision 冻结硬件表。这对子 Registrar/SourceAdmin 固定为原轮出口，Unknown 可恢复同一身份，或停止原轮；不新签替代来源。SourceAdmin 仍留管理记录，init 外层来源管理覆盖其死亡后的封口；HID/普通叶角色不取得该 grant。迟到/停止请求与父子清理按设备第二轮合同。
 
-平台根、PCI 配置写权限和 TrustedPhysical DMA 属于系统可信基座：init、设备管理/平台适配器、认证并转交静止报告的 srv_driver、PCI provider、xHCI 主控均必须可信。不能只把 xHCI 标为可信，却把可重配 BAR/bus-master、派生 DMA 或提交可信静止事实的上游当作不可信。HID 与功能客户端的边界来自受限 USB 会话；路径、支持声明和程序自报标志不能授予上述权限。
+平台根、PCI 配置写权限和 TrustedPhysical DMA 属于系统可信基座：init、设备管理/平台适配器、选择受信实现并委派报告权的 srv_driver、PCI provider、xHCI 主控均必须可信。直接报告缩短转交链，不缩小这些实际权限的可信边界。不能只把 xHCI 标为可信，却把可重配 BAR/bus-master、派生 DMA 或委派报告权的上游当作不可信。HID 与功能客户端的边界来自受限 USB 会话；路径、支持声明和程序自报标志不能授予上述权限。
 
 ## 设计门
 
-消费者停止证据沿原 Binding/Provision 传递。PCI host 的 DMA control 使 PCI provider 属于受信物理供应链：它须在后代安全收束、最后一次 ECAM/配置访问结束后报告，不等待自身 Released。管理者认证该原轮事实后转交 ReportStopped，平台收到 ConfirmStopped 后仍独立完成资源退休。未曾交付资源且原 Binding 已 Stopping 时，srv_device 原 Work 可根据唯一资源出口的不可逆交付事实确认未产生消费者访问；晚到 Activate/Use 无法越过已封 Get 门。未知激活和进程死亡不清除已暴露事实，证据不足沿故障终局保留，不追加并行监督协议。
+消费者停止与供应安全按[设备第二轮合同](todo-2026-09-device-system-design.md#第二轮收敛设计2026-10-27)传递：可信消费 owner 经原轮 Use 直接报告，Binding 将单调静止事实交原 Provision；srv_driver 不再转述。PCI host 在后代硬件责任、最后一次 ECAM/配置访问结束后报告，不等自身 Released，供应仍独立完成资源退休。未暴露内生证明、Unknown 与进程死亡不等于安全、证据不足进入故障终局的边界保留。
 
 1. 明确首批正式长期服务及可观察能力、启动依赖、必需与可选能力；从真实需求选择静态或可配置装配。
 2. 分开画进程/Job 管理、付款 Pool、授权交付与服务供应关系。确定上级退出、失联和权限消散后的接管责任。
@@ -86,12 +86,73 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 设计交付须能依据计划实现选定装配，明确正常、失败、取消、退出、恢复和停止责任。系统能力交付须有真实长期服务接入、替换范围内的旧装配路径删除，并在相应平台验证启动、就绪、故障恢复和停止组合；不能仅用一次验收 workload 跑完宣称正式编排已完成。
 
-本案通用正式装配方案仍未闭合；设备首批的进程分工、静态来源、授权和失败政策已有上文目标，不代表一般服务热升级、持久化停止或配置脚本已设计完成。现有同进程 fs/registry 装配由 OAL/fs/服务目录计划接通，本案不要求提前拆出 srv_service。设备施工的代码、开发验证与未覆盖项只在设备主计划记录；已接通的管理宿主启动/停止不代表平台供应、驱动接入或完整运行期故障监督已完成。
+本案通用正式装配方案仍未闭合；设备首批的进程分工、静态来源、授权和持续监督已有实现与所选验证，不代表一般服务热升级、持久化停止或配置脚本已设计完成。现有同进程fs/registry装配由发布分案接通，不要求提前拆出srv_service。第二轮实施证据由机制收敛报告归档，设备原独立门仍由主计划维护。
 
 ## 当前接力
 
-设备首批继续按本篇装配合同和[设备主计划当前交接点](todo-2026-09-device-system-design.md#当前交接点2026-10-25)实施。真实平台/驱动接入、两管理者持续故障观察及只读Drivers已接，下一施工为主计划拥有的有限候选/显式Retry与精确费用/Unknown等剩余门；不重做已过装配基线。通用正式服务继续闭合本篇设计门，仓库格式/安装更新保持延期；不恢复双轨匹配、透明继承旧来源或由srv_device启动驱动。
+第二轮两条责任链已完成本次迁移，不再重做独立线程替换或loader分步化。设备原剩余门从其唯一收口表接续；本案在正式长期服务、恢复或持久化停止提出实际需求时，按上述设计门闭合通用装配。仓库格式/安装更新、透明重启、通用manifest继续延期，不恢复双轨匹配或由srv_device启动驱动。
 
 ## 首批设备的持续监督接线
 
-具体采用init内一条libruntime用户线程及独立WaitSet；原RootSupervisor账本/Assembly仍单主线程owner，不共享可变账本或新增通用supervisor。libprocess的同一loader提供未启动准备owner与Start，观察必须在Start前挂好；普通spawn组合二者。两管理者的缩权Control、正常停止意图/期限、真实Completed及SourceStop::Closed交接各属于同一固定记录。srv_device根admin监督副本先明确关闭并确认，主线才关最后root/admin；失败不得由消费Manager析构丢责任。具体已定契约及实现证据由[设备主记录](todo-2026-09-device-system-design.md#init设备管理者的独立观察与终局施工合同)拥有。
+首轮固定检查点采用独立观察线程与WaitSet，和主线程通过停止/关闭/撤防确认协调；该形态已由第二轮替换。原合同与运行证据保留在[首批历史记录](todo-2026-09-device-system-design.md#init设备管理者的独立观察与终局施工合同)，当前合同由下节拥有。
+
+## 第二轮持续监督设计（2026-10-27）
+
+本轮一致性重构已完成：同一loader、ELF验证及Image构造、实际装配等待和持续管理观察已接入root，旧线程已删除，所选运行验证与结构检查通过。施工过程与验证证据保存在[收敛交付档案](archived/review-2026-10-27-device-implementation.md)。选择 RootSupervisor 作为唯一监督事实和终局权限 owner，装配仍可顺序表达，但所有依赖等待都通过明确的 root 提交/等待接点推进全部责任。既有 Process/Job/Pool、Runtime/Assembly、RPC调用owner与 collector 继续复用，不建立 supervisor 服务或通用工作流。
+
+### 已接通的装配范围
+
+[`RootSupervisor::turn_and_wait`](../user/services/srv_init/src/supervisor.rs) 持一份 Assembly，分流 Job、Batch、Read、管理者观察及装配等待的来源，每轮推进各自有限工作，再汇总可运行状态、最早期限和本次等待结果。顺序装配在等待外部结果期间继续推进这些责任。
+
+范围以“两管理者开始受监督后仍可达”为界，当前接点如下。首轮 `f3337eb` 的阻塞路径盘点与迁移过程保留在收敛档案，不再用旧源码行号描述当前实现。
+
+| 实际路径 | 当前源码 | 接入方式 |
+|---|---|---|
+| 两管理者 bootstrap 等待、设备管理 RPC | [device.rs](../user/services/srv_init/src/device.rs)、[driver.rs](../user/services/srv_init/src/driver.rs) | root 的 receive/wait 与 Exchange；原 CallOperation 的来源进入统一等待槽 |
+| 来源停止查询、DONE 与管理能力关闭 | [device_supervision.rs](../user/services/srv_init/src/device_supervision.rs) | 同一管理记录确认来源 Closed 与实际 DONE，注销后交原 Collector |
+| srv_fs 就绪、发布及注册队列探针 | [filesystem.rs](../user/services/srv_init/src/filesystem.rs)、[registry.rs](../user/services/srv_init/src/filesystem/registry.rs) | 顺序 RPC 用 Exchange；Copy/Watch 保留原 Dispatcher；待领取回复通过 root 观察实际就绪 |
+| 报告、进程与验收阶段等待 | [supervisor/waiting.rs](../user/services/srv_init/src/supervisor/waiting.rs)、[main.rs](../user/services/srv_init/src/main.rs) | 实际来源与绝对期限进入 root；有限 Collector 同样通过 root 等待，独立 ABI 自检在管理者收集后运行 |
+| ELF 装载与映像构造 | [supervisor/loading.rs](../user/services/srv_init/src/supervisor/loading.rs) | 同一 Preparation/ImageCopy 每轮推进一步；失败显式交回原收集账本 |
+| 显式并发 Retry 的测试线程 | [driver.rs](../user/services/srv_init/src/driver.rs) | 保留并发调用用途；主线程通过 root 等实际 ThreadControl DONE，再 try_join 领取结果 |
+
+表内范围包括当前默认 workload 中的验收代码，它们在管理者运行期间执行，不能因名字带 test 就排除活性影响。未来新增 root 路径同样不得直接 Caller::call、独立 WaitSet::wait 或 sleep 到外部响应；普通领域库的同步 API 可供其它调用者保留，root 使用对应分步入口，不往通用 Caller 注入 pump 回调。
+
+### 唯一控制记录与调度
+
+root 在启动任何管理者前预付固定两份 ManagerRecord、DONE/就绪观察容量、控制运输槽及故障收束存储。ManagerRecord 持本实例的 ProcessControl、实际 SourceAdmin、单调停止意图/期限及真实 DONE 快照；Job/Pool关闭权复用root原能力账本，领域装配记录只保留该实例的借用关联和私有就绪/入口。不存在第二套Shared/Record、监督admin副本或新Job/Pool账本。
+
+实际 ProcessControl 在 Start 前挂入 root 的持续 DONE 来源；同一 owner 管能力关闭与来源 detach，不需向另一线程交还 capability。服务私有入口仍核真实 context/PID/Process；srv_device 的 SourceAdmin 在私有就绪后纳入同一记录，之前由原 Process/Job/reset 负责故障兜底。
+
+在原 root 循环中增加有明确类型的管理/装配 duty，加入统一 receive/feed、期限汇总及轮转，不另起相互嵌套的 wait 循环。每轮所有活 duty 获至多一个有界推进机会，管理 DONE 与故障判断在普通装配动作前处理；持续业务 ready 不能饿死管理观察。知道故障后封新装配并只推进原终局责任，不能返回业务脚本。
+
+顺序包装只做“提交操作→保存返回标识→await 该结果”，await 仍推进所有 duty；业务结果由实际任务保存，不以回调修改被等待栈。任务的调用/回复、来源注销和取消均有稳定 owner；一个 await 失败不销毁其它已提交责任。
+
+### Loader 的必要前置
+
+libprocess 以显式 `Preparation` 持有同一个 loader；普通 prepare/spawn 循环驱动，root 每轮推进一步。同步入口与分步入口共用验证、映射、写入及取消责任，不能把完整同步 prepare 包在 Task::advance 中当作有界推进。
+
+准备 owner 持真实 Building 进程、稳定映像输入/游标、尚未消费的 grants、已经发生的 GrantOutcome 和失败清理责任。ELF 验证/规划分步遍历，映像/出生块复制按页推进；Map每步仅一笔，上界直接采用现有ABI `PROCESS_MAP_MAX_BYTES`，其它步骤各为固定出生操作。复制页粒度来自现有VM几何，不以任意大映像大小作为一次step的上界。Image::copy沿同一“未sealed构造owner→逐页映入/写/解除→seal”寿命拆分；构造和转交方不映入整份只读映像，实际读取者另持有限寿命的view。
+
+施工修正依据：每次ProcessMap创建独立backing与region，逐页Map会把8MiB主栈从8笔放大成2048笔，真实装配在Start前即耗尽原metadata预算。Map的分步单位因此取原ABI单次上界，保留结构工作界，避免以扩大Pool预算维持映射对象膨胀；不新增内核异步Map协议。这改变内部批粒度，不改变出生、权限或取消合同。
+
+现有顺序OAL/文件/服务客户端通过RPC的显式Exchange接口使用宿主调用入口：普通Caller保留同步行为，root使用原CallOperation的分步推进与实际来源，来源挂入原Assembly。该接口仅表达请求/回复运输，不携带supervisor类型或pump回调；root自身拥有明确推进循环。无DUP来源仍以原借用存活，不为接入调度复制权限，不另建一套领域编解码。
+
+Create 前预留准备与取消责任；所有可失败步骤保留原 Building owner。失败/取消交原 Process 取消与 collector 机制，不能遗忘已消费 grants 或把请求停止当全部退款。Start 仍只消费完整 PreparedProcess，并必须在 DONE 来源建立之后执行。封口后的迟到 Start 由原 Job/Process 门拒绝。
+
+分步装配已覆盖 root 上的实际启动调用者，是持续监督的前置约束。它保证每次用户态推进有结构工作界，不承诺确定墙钟延迟；内核平台/时钟故障仍按原终局处理。后续批量优化须依据实际装配成本，并保持明确的单步成本界。
+
+### 正常停止与故障
+
+正常停止先在同一 ManagerRecord 提交意图/绝对期限，再封相应 Job/来源并发管理 Stop。来源 Closed 通过现有 QuerySourceStop 的原谓词确定；这里可保留仅在收束期间的有限、定时任务重查，不能使用阻塞 sleep，也不为两个来源另造长期观察账本。整个系统运行稳定时没有这项周期工作。
+
+root 取得真实来源 Closed 后，关闭自己已经无用的 admin/入口；收到 DONE 必须核 Completed 且无异常 detail，随后实际 detach 来源、交原 collector、关闭控制与 Pool。DONE 先到时保留快照等待原来源证明或期限；不把顺序差异当失败，也不从 DONE 反推安全。不存在 release_admin/disarm/ack/join 的线程间协议。
+
+故障终局仍按关机计划：同一个 root owner 不可逆封装配，持唯一 Job/平台 Seal/reset authority，有限尝试来源封口和执行收集，然后 Reboot/SystemFailure；reset 拒绝终止 init，由 boot DONE 停驻。不存在两个线程争 Terminal，也不等待无静止证明的 DMA 或全额退款。终局 RPC/观察使用原绝对升级期限的较早界，不能伪造 collector 已超时。
+
+### 费用、删除门与验收
+
+管理记录、DONE/就绪/故障来源和有限控制调用槽来自 root 预付账户，容量由实际两管理者及并存装配操作推导；普通请求不能占控制清理预留。loader 的页面暂存按真实容量付款，其阶段结束才退；角色和等待来源全部退休后再关最后控制。没有后台监督线程的栈、ThreadControl 或 changed/ack Notification 费用。
+
+上表的等待与装载已接回 root，device_supervision 的独立线程、Shared 锁、双 Notification、终局抢占、admin ACK、撤防及 join/reap 已删除。后续新增装配路径须遵守同一接入约束，不能恢复独立观察者来补偿主线的阻塞等待。
+
+验证覆盖正常两管理者收束；另一业务等 RPC/报告/进程结果时管理者死亡；Start 后最早死亡；Stopping 中异常；完整 source Closed 与 Completed 的两种先后；loader 尚有大量页未处理时死亡观察仍推进；reset 拒绝后 init DONE 与原 DMA 保留。复用原故障消费者和现有执行测试，停止旧线程专属 ACK/join 窗口的复测，保留等价的责任合同。check/clippy、正式组合及证据版本按构建手册执行，本轮实现已覆盖相应正常与故障路线，具体证据和未覆盖边界见机制收敛报告，不外推任意交错。

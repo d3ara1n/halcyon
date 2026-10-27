@@ -115,15 +115,16 @@ impl Worker {
         );
         log_birth_pool("parent", world.pool.as_handle());
         log_birth_pool("child", pool.as_handle());
+        let image = world
+            .images
+            .get(implementation)
+            .ok_or(Error::Invalid)?
+            .map()?;
         let result = libprocess::spawn(SpawnRequest {
             job: world.job.as_handle(),
             parent: world.process,
             memory_pool: pool.as_handle(),
-            image: world
-                .images
-                .get(implementation)
-                .ok_or(Error::Invalid)?
-                .bytes(),
+            image: image.bytes(),
             payload: &configuration,
             grants: &grants,
             control_rights: Rights::READ | Rights::WAIT | Rights::MANAGE,

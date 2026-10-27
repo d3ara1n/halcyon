@@ -14,7 +14,7 @@ use libusb::{
     protocol as usb,
     xhci::{Controller, Inputs, Interface},
 };
-const RECORDS: usize = 32;
+pub(super) const RECORDS: usize = 32;
 pub(super) const LIMITS: Limits = Limits {
     entries: 1,
     text_bytes: ("usb-interface".len() + Keyboard::BYTES) as u32,
@@ -32,6 +32,7 @@ pub(super) struct InterfaceSupply {
     pub context: u64,
     pub provider: Option<Arc<MailboxSender>>,
     life: LifetimeObserver,
+    source: SourceRegistration,
     pub device: Option<DeviceId>,
     pub control: Option<MailboxSender>,
     pub withdrawn: bool,
@@ -42,6 +43,7 @@ pub(super) struct InterfaceSupply {
     session: Option<Arc<MailboxSender>>,
     session_context: u64,
     current: Option<Transfer>,
+    completion: Option<(u64, libkernel::ipc::notification::NotificationSignaler)>,
 }
 pub(super) struct Host {
     pub inputs: Option<Inputs>,
@@ -52,7 +54,6 @@ pub(super) struct Host {
     _storage: Charge,
     _account: Arc<libbudget::Account>,
     _budget: Arc<Budget>,
-    gc: usize,
 }
 impl Host {
     pub fn is_provider_context(&self, context: u64) -> bool {
@@ -98,7 +99,6 @@ impl Host {
             _storage: charge,
             _account: account,
             _budget: budget,
-            gc: 0,
         })
     }
     pub fn discover(&mut self, interface: Interface, mailbox: &Mailbox) -> Result<(), Error> {
@@ -124,6 +124,7 @@ impl Host {
             context,
             provider: Some(provider),
             life: minted.lifetime,
+            source: SourceRegistration::new(),
             device: None,
             control: None,
             withdrawn: false,
@@ -134,6 +135,7 @@ impl Host {
             session: None,
             session_context: 0,
             current: None,
+            completion: None,
         });
         Ok(())
     }
@@ -147,6 +149,7 @@ impl Host {
         &mut self,
         context: u64,
         command: ProvisionCommand,
+        signal: Option<Capability>,
         deadline: Deadline,
         mailbox: &Mailbox,
         open: bool,
@@ -157,10 +160,14 @@ impl Host {
         match command {
             ProvisionCommand::Prepare(_) => {
                 if !open && record.provision.active().is_none() {
-                    record.provision.stop(epoch)?;
+                    record.provision.stop(epoch, false)?;
                     return Ok(Progress::Closed);
                 }
-                if record.provision.prepare(epoch)? == provision::Prepare::Started {
+                if record
+                    .provision
+                    .prepare(epoch, signal.ok_or(Error::Invalid)?)?
+                    == provision::Prepare::Started
+                {
                     let prepared = (|| {
                         let mut table = Collecting::reserve(
                             LIMITS,
@@ -179,6 +186,7 @@ impl Host {
                             record.session = Some(sender);
                             record.session_context = session_context;
                             record.current = None;
+                            record.completion = None;
                             record.end = deadline;
                         }
                         Err(error) => {
@@ -188,23 +196,25 @@ impl Host {
                     }
                 }
                 if !open {
-                    record.provision.stop(epoch)?;
+                    record.provision.stop(epoch, false)?;
                     record.end = deadline;
                 }
             }
-            ProvisionCommand::Stop(_) => {
+            ProvisionCommand::Stop {
+                consumer_quiescent, ..
+            } => {
                 let stopping = record
                     .provision
                     .active()
                     .is_some_and(|a| a.phase == provision::Phase::Stopping);
-                record.provision.stop(epoch)?;
+                record.provision.stop(epoch, consumer_quiescent)?;
                 if !stopping {
                     record
                         .log_stopping(epoch, self.controller.as_ref().ok_or(Error::Unavailable)?)?;
                     record.end = deadline;
                 }
             }
-            ProvisionCommand::ConfirmStopped(_) => record.provision.confirm_stopped(epoch)?,
+            ProvisionCommand::Query(_) => {}
             ProvisionCommand::Get { .. } => return Err(Error::Invalid),
         }
         Ok(record.progress(epoch))
@@ -233,6 +243,7 @@ impl Host {
         &mut self,
         context: u64,
         command: usb::Command,
+        completion: Option<Capability>,
         deadline: Deadline,
         open: bool,
     ) -> Result<usb::Progress, Error> {
@@ -245,6 +256,27 @@ impl Host {
             return Ok(usb::Progress::Closed);
         }
         let sequence = command.sequence();
+        if let Some(capability) = completion {
+            let (signal, description) =
+                libkernel::ipc::notification::NotificationSignaler::from_capability(capability)
+                    .map_err(|failure| Error::from(failure.error))?;
+            if !description
+                .rights
+                .contains(erhino_shared::object::Rights::SIGNAL)
+            {
+                return Err(Error::Permission);
+            }
+            if let Some((identity, _)) = record.completion.as_ref() {
+                if *identity != description.object_id {
+                    return Err(Error::Conflict);
+                }
+            } else {
+                record.completion = Some((description.object_id, signal));
+            }
+        }
+        if !matches!(command, usb::Command::Query { .. }) && record.completion.is_none() {
+            return Err(Error::Invalid);
+        }
         if let Some(current) = record.current.as_ref() {
             if sequence < current.sequence {
                 return Err(Error::Closed);
@@ -290,6 +322,7 @@ impl Host {
                     end: None,
                     result: Some(usb::Progress::Cancelled),
                 });
+                record.completed()?;
                 Ok(usb::Progress::Cancelled)
             }
             usb::Command::Transfer { request, .. } => {
@@ -316,7 +349,7 @@ impl Host {
                 continue;
             };
             if !open && active.phase != provision::Phase::Stopping {
-                record.provision.stop(active.epoch)?;
+                record.provision.stop(active.epoch, false)?;
                 record.log_stopping(active.epoch, controller)?;
                 record.end = operation_end()?;
                 active = record.provision.active().ok_or(Error::Closed)?;
@@ -377,8 +410,10 @@ impl Host {
                         Err(Error::Closed) => usb::Progress::Cancelled,
                         Err(error) => return Err(error),
                     });
+                    record.completed()?;
                 } else if current.end.is_some_and(|end| now >= end) {
                     controller.usb_cancel(record.connection, operation_end()?)?;
+                    current.end = None;
                 }
             }
             if active.phase == provision::Phase::Stopping {
@@ -388,6 +423,8 @@ impl Host {
                     record.collecting = None;
                     record.session = None;
                     record.current = None;
+                    record.completed()?;
+                    record.completion = None;
                     record.provision.finish(active.epoch)?;
                     libkernel::debug!(
                         "USB interface supply closed: connection={}, epoch={}",
@@ -397,22 +434,58 @@ impl Host {
                 }
             }
         }
-        // 每轮只观察一个旧来源；真实Registry/Binding/Delivery关系退休后才移除观察壳。
-        if !self.records.is_empty() {
-            self.gc %= self.records.len();
-            let record = &self.records[self.gc];
-            if record.withdrawn
-                && record.provision.active().is_none()
-                && record.provider.is_none()
-                && wait::probe(record.life.as_handle(), ObjectSignals::CLOSED)?
-                    .contains(ObjectSignals::CLOSED)
-            {
-                self.records.remove(self.gc);
-            } else {
-                self.gc += 1;
+        Ok(())
+    }
+    pub fn registered(&mut self, kind: u64, id: SourceId) {
+        for record in &mut self.records {
+            if record.publication.checked_add(0x2000) == Some(kind) {
+                record.source.registered(kind, id);
+                return;
             }
         }
-        Ok(())
+    }
+    pub fn unregistered(&mut self, id: SourceId) {
+        for record in &mut self.records {
+            record.source.unregistered(id);
+        }
+    }
+    /// 旧供应出口的尾部靠实际 Lifetime 唤醒，不等待下一次 USB 输入才回收。
+    pub fn retire_sources(
+        &mut self,
+        requests: &mut Requests<'_, Family>,
+    ) -> Result<bool, SystemCallError> {
+        for index in 0..self.records.len() {
+            let record = &mut self.records[index];
+            if !record.withdrawn || record.provision.active().is_some() || record.provider.is_some()
+            {
+                continue;
+            }
+            if wait::probe(record.life.as_handle(), ObjectSignals::CLOSED)?
+                .contains(ObjectSignals::CLOSED)
+            {
+                record.source.remove(requests)?;
+                if record.source.is_empty() {
+                    self.records.remove(index);
+                }
+                return Ok(true);
+            }
+            if record.source.is_empty() {
+                let kind = record
+                    .publication
+                    .checked_add(0x2000)
+                    .ok_or(SystemCallError::ReachLimit)?;
+                record.source.install(
+                    requests,
+                    SourcePlan::new(record.life.as_handle(), ObjectSignals::CLOSED),
+                    kind,
+                )?;
+                return Ok(true);
+            }
+            if record.source.is_installing() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     pub fn connection_in_use(&self, connection: u64) -> bool {
         self.records
@@ -422,8 +495,25 @@ impl Host {
     pub fn has_open_provisions(&self) -> bool {
         self.records.iter().any(|r| r.provision.active().is_some())
     }
+    pub fn transfer_deadline(&self) -> Option<u64> {
+        self.records
+            .iter()
+            .filter_map(|record| record.current.as_ref())
+            .filter(|transfer| transfer.result.is_none())
+            .filter_map(|transfer| transfer.end)
+            .min()
+    }
 }
 impl InterfaceSupply {
+    fn completed(&self) -> Result<(), Error> {
+        if let Some((_, signal)) = &self.completion {
+            match signal.signal(1) {
+                Ok(()) | Err(SystemCallError::ObjectClosed) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
     fn log_stopping(&self, epoch: u64, controller: &Controller) -> Result<(), Error> {
         libkernel::debug!(
             "USB interface stopping: connection={}, epoch={}, descriptor_ready={}",

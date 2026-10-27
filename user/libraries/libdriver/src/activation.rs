@@ -9,6 +9,52 @@ use libdevice::{
 };
 use libkernel::ipc::message::MailboxSender;
 
+/// 逐轮 IO 准入与执行身份；退场后不再提供任何可唤醒任务。
+#[cfg(any(target_arch = "riscv64", test))]
+pub(crate) enum Lifecycle {
+    Pending,
+    Preparing(u64),
+    Active(u64),
+    Retired,
+}
+#[cfg(any(target_arch = "riscv64", test))]
+impl Lifecycle {
+    pub(crate) fn task(&self) -> Option<u64> {
+        match *self {
+            Self::Preparing(task) | Self::Active(task) => Some(task),
+            Self::Pending | Self::Retired => None,
+        }
+    }
+    pub(crate) fn attach(&mut self, task: u64) {
+        assert_ne!(task, 0, "activation lifecycle identity missing");
+        match *self {
+            Self::Pending => *self = Self::Preparing(task),
+            Self::Preparing(old) | Self::Active(old) => {
+                assert_eq!(old, task, "activation lifecycle changed");
+            }
+            Self::Retired => panic!("retired activation lifecycle resumed"),
+        }
+    }
+    pub(crate) fn allow_io(&mut self) -> Result<(), Error> {
+        match *self {
+            Self::Preparing(task) => *self = Self::Active(task),
+            Self::Active(_) => {}
+            Self::Pending => return Err(Error::NotReady),
+            Self::Retired => return Err(Error::Closed),
+        }
+        Ok(())
+    }
+    pub(crate) fn io_ready(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+    pub(crate) fn retire(&mut self) {
+        *self = Self::Retired;
+    }
+    pub(crate) fn retired(&self) -> bool {
+        matches!(self, Self::Retired)
+    }
+}
+
 pub struct Activation {
     reference: BindingRef,
     usage: Option<Arc<MailboxSender>>,
@@ -21,46 +67,18 @@ pub struct Activation {
     consumer_stopped: bool,
     sequence: u64,
 }
+
 impl Activation {
-    /// caller 已通过所附真实 BindingUse 的 RPC 取得 snapshot，任务/记录/输入存储已预付。
+    /// 本地接纳冻结输入；独立绑定观察完成核验以前，宿主不得据 Starting 开始 IO。
     pub fn prepare(
         reference: BindingRef,
         identity: &[u8],
         usage: Arc<MailboxSender>,
         registrar: Option<Arc<MailboxSender>>,
-        snapshot: BindingSnapshot,
     ) -> Result<Self, Error> {
-        if snapshot.reference != reference
-            || snapshot.phase != BindingPhase::ResourcesReady
-            || identity.is_empty()
-        {
-            return Err(Error::Closed);
+        if identity.is_empty() {
+            return Err(Error::Invalid);
         }
-        Self::new(reference, identity, usage, registrar, Phase::Starting)
-    }
-    /// Stop 先到时仍持真实 use 观察原轮；后续 Activate 不得恢复业务。
-    pub fn cancel(
-        reference: BindingRef,
-        usage: Arc<MailboxSender>,
-        snapshot: BindingSnapshot,
-    ) -> Result<Self, Error> {
-        if snapshot.reference != reference
-            || !matches!(
-                snapshot.phase,
-                BindingPhase::ResourcesReady | BindingPhase::Stopping
-            )
-        {
-            return Err(Error::Closed);
-        }
-        Self::new(reference, &[], usage, None, Phase::Stopping)
-    }
-    fn new(
-        reference: BindingRef,
-        identity: &[u8],
-        usage: Arc<MailboxSender>,
-        registrar: Option<Arc<MailboxSender>>,
-        phase: Phase,
-    ) -> Result<Self, Error> {
         let use_identity = EndpointIdentity::from_description(&usage.description()?)?;
         let registrar_identity = registrar
             .as_ref()
@@ -83,7 +101,7 @@ impl Activation {
             identity: frozen,
             use_identity,
             registrar_identity,
-            phase,
+            phase: Phase::Starting,
             error: None,
             consumer_stopped: false,
             sequence: 1,
@@ -94,9 +112,6 @@ impl Activation {
     }
     pub fn usage(&self) -> Result<&Arc<MailboxSender>, Error> {
         self.usage.as_ref().ok_or(Error::Closed)
-    }
-    pub fn same_use(&self, usage: &MailboxSender) -> Result<bool, Error> {
-        Ok(self.use_identity == EndpointIdentity::from_description(&usage.description()?)?)
     }
     pub fn retire_access(&mut self, snapshot: BindingSnapshot) -> Result<(), Error> {
         if snapshot.reference != self.reference
@@ -109,6 +124,17 @@ impl Activation {
         self.registrar = None;
         Ok(())
     }
+    /// 仅供逐轮 Preparing owner：没有获得 IO 许可，且所有核验/观察运输已脱离。
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn retire_unstarted_access(&mut self) {
+        assert_eq!(
+            self.phase,
+            Phase::Terminal,
+            "unstarted activation is not terminal"
+        );
+        self.usage = None;
+        self.registrar = None;
+    }
     pub fn registrar(&self) -> Option<&Arc<MailboxSender>> {
         self.registrar.as_ref()
     }
@@ -120,10 +146,6 @@ impl Activation {
         registrar: Option<&MailboxSender>,
     ) -> Result<(), Error> {
         let candidate = EndpointIdentity::from_description(&usage.description()?)?;
-        if self.identity.is_empty() && reference == self.reference && candidate == self.use_identity
-        {
-            return Err(Error::Closed);
-        }
         let registrar = registrar
             .map(|entry| {
                 entry
@@ -182,11 +204,22 @@ impl Activation {
             self.changed();
         }
     }
+    /// 自主失败立即传播停止及首错；后续硬件清理不能阻挡管理者提交 Binding Stop。
+    pub fn fail(&mut self, error: Error) {
+        if self.phase == Phase::Terminal {
+            return;
+        }
+        self.stop();
+        if self.error.is_none() {
+            self.error = Some(error);
+            self.changed();
+        }
+    }
     /// 本地激活工作已结束；硬件停止事实须在此前记录，终态不再追加可观察事实。
     pub fn terminal(&mut self, error: Option<Error>) {
         if self.phase != Phase::Terminal {
             self.phase = Phase::Terminal;
-            self.error = error;
+            self.error = self.error.or(error);
             self.changed();
         }
     }
@@ -205,5 +238,35 @@ impl Activation {
             self.changed();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_receipt_has_no_execution_identity_or_io_permission() {
+        let mut lifecycle = Lifecycle::Pending;
+        assert_eq!(lifecycle.allow_io(), Err(Error::NotReady));
+        lifecycle.attach(7);
+        assert_eq!(lifecycle.task(), Some(7));
+        lifecycle.allow_io().unwrap();
+        assert!(lifecycle.io_ready());
+        lifecycle.retire();
+        assert_eq!(lifecycle.task(), None);
+        assert!(!lifecycle.io_ready());
+        assert!(lifecycle.retired());
+        assert_eq!(lifecycle.allow_io(), Err(Error::Closed));
+    }
+
+    #[test]
+    fn rejected_preparation_cannot_be_reopened_by_a_late_completion() {
+        let mut lifecycle = Lifecycle::Pending;
+        lifecycle.attach(9);
+        assert!(!lifecycle.io_ready());
+        lifecycle.retire();
+        assert_eq!(lifecycle.allow_io(), Err(Error::Closed));
+        assert_eq!(lifecycle.task(), None);
     }
 }

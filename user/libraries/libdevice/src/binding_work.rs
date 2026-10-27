@@ -9,35 +9,39 @@ use crate::{
     registry::Registry,
     resource::{Collecting, DeviceResource, Entry, Frozen},
 };
-use alloc::{rc::Rc, sync::Arc};
+use alloc::{boxed::Box, rc::Rc, sync::Arc};
 use core::cell::RefCell;
-use erhino_shared::{object::Rights, time::Deadline};
+use erhino_shared::{
+    object::{ObjectSignals, Rights},
+    time::Deadline,
+};
 use libbudget::Charge;
-use libexecution::runtime::{Advance, Input, Requests, Step};
-use libkernel::ipc::{capability::Capability, message::MailboxSender};
+use libexecution::{
+    SourceRegistration,
+    runtime::{Advance, Input, Requests, SourceId, SourcePlan, Step},
+};
+use libkernel::ipc::{
+    capability::Capability,
+    message::MailboxSender,
+    notification::{self, NotificationPair},
+};
 use librpc::{
     Request,
     dispatcher::{Dispatcher, ServiceOwner},
-    exchange::{CallError, CallOwner},
+    exchange::CallError,
 };
 
 pub type Backing = Registry<Arc<MailboxSender>>;
 
-/// 部署 owner 提供实际期限和重查间隔；这些参数不作为硬件完成证据。
+/// 部署 owner 提供准备与停止绝对期限；这些参数不作为硬件完成证据。
 #[derive(Clone, Copy)]
 pub struct Policy {
     pub prepare_ns: u64,
     pub stop_ns: u64,
-    pub retry_ns: u64,
 }
 impl Policy {
     fn validate(self) -> Result<(), Error> {
-        if self.prepare_ns == 0
-            || self.stop_ns == 0
-            || self.retry_ns == 0
-            || self.retry_ns > self.prepare_ns
-            || self.retry_ns > self.stop_ns
-        {
+        if self.prepare_ns == 0 || self.stop_ns == 0 {
             Err(Error::Invalid)
         } else {
             Ok(())
@@ -52,10 +56,12 @@ struct Shared {
     released: Option<Snapshot>,
     reported: bool,
     can_report: bool,
-    dma_report: bool,
+    requirement: crate::binding::StopRequirement,
     // 唯一资源出口可能交出能力的不可逆事实；关闭别名/回复丢失不能清除。
     resources_exposed: bool,
     fault: Option<Error>,
+    use_entry: Option<MailboxSender>,
+    registrar: Option<(MailboxSender, MailboxSender)>,
     _unit: Charge,
     _bytes: Charge,
 }
@@ -65,6 +71,35 @@ struct Shared {
 #[derive(Clone)]
 pub struct Binding(Rc<RefCell<Shared>>);
 impl Binding {
+    pub fn use_entry(&self) -> Result<Option<Capability>, Error> {
+        self.0
+            .borrow()
+            .use_entry
+            .as_ref()
+            .map(sender_alias)
+            .transpose()
+    }
+    pub fn install_use(&self, sender: MailboxSender) {
+        let mut core = self.0.borrow_mut();
+        assert!(core.use_entry.is_none(), "binding use already committed");
+        core.use_entry = Some(sender);
+    }
+    pub fn registrar(&self) -> Result<Option<(MailboxSender, MailboxSender)>, Error> {
+        self.0
+            .borrow()
+            .registrar
+            .as_ref()
+            .map(|(a, b)| Ok((sender_copy(a)?, sender_copy(b)?)))
+            .transpose()
+    }
+    pub fn install_registrar(&self, entries: (MailboxSender, MailboxSender)) {
+        let mut core = self.0.borrow_mut();
+        assert!(
+            core.registrar.is_none(),
+            "binding registrar already committed"
+        );
+        core.registrar = Some(entries);
+    }
     pub fn snapshot(&self, registry: &Backing) -> Result<Snapshot, Error> {
         let core = self.0.borrow();
         if let Some(released) = core.released {
@@ -86,11 +121,34 @@ impl Binding {
         }
         Ok(core.task)
     }
-    pub fn report_stopped(&self) -> Result<u64, Error> {
-        let mut core = self.0.borrow_mut();
-        if !core.can_report || !core.dma_report {
+    pub fn use_access(&self) -> Result<crate::binding::UseAccess, Error> {
+        use crate::binding::{StopRequirement, UseAccess};
+        let core = self.0.borrow();
+        if core.requirement == StopRequirement::ConsumerQuiescence {
+            if !core.can_report {
+                return Err(Error::Permission);
+            }
+            Ok(UseAccess::RESOURCES.union(UseAccess::REPORT_QUIESCENT))
+        } else {
+            Ok(UseAccess::RESOURCES)
+        }
+    }
+    pub fn stop_requirement(&self) -> crate::binding::StopRequirement {
+        self.0.borrow().requirement
+    }
+    pub fn report_quiescent(&self, registry: &Backing) -> Result<u64, Error> {
+        if !self
+            .use_access()?
+            .contains(crate::binding::UseAccess::REPORT_QUIESCENT)
+        {
             return Err(Error::Permission);
         }
+        match self.snapshot(registry)?.phase {
+            Phase::Stopping => {}
+            Phase::Released => return Err(Error::Closed),
+            _ => return Err(Error::NotReady),
+        }
+        let mut core = self.0.borrow_mut();
         core.reported = true;
         Ok(core.task)
     }
@@ -155,58 +213,46 @@ impl Binding {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Next {
-    Prepare,
-    Get(u32),
-    Ready,
-    Stop,
-    Confirm,
-    Release,
-    Released,
+/// 业务执行部分只活到 Released；旧角色尾部不再持供应能力或 RPC 状态。
+struct Business {
+    collecting: Option<Collecting<Capability>>,
+    provider: Arc<MailboxSender>,
+    signal: NotificationPair,
+    source: SourceRegistration,
+    policy: Policy,
+    call: Option<(u64, ProvisionCommand)>,
+    prepare_end: u64,
+    stop_end: Option<u64>,
+    prepare_sent: bool,
+    stop_sent: Option<bool>,
+    progress: Option<Progress>,
+    next_get: Option<u32>,
+    query_due: bool,
+    wake_transport: bool,
+    _storage: Charge,
 }
 
 pub struct Work {
     binding: Binding,
-    collecting: Option<Collecting<Capability>>,
-    provider: Arc<MailboxSender>,
     funding: Funding,
-    policy: Policy,
-    next: Next,
-    call: Option<(u64, ProvisionCommand)>,
-    cleanup: Option<CallError>,
-    prepared_count: u32,
-    prepare_end: u64,
-    stop_end: Option<u64>,
-    retry_at: Option<u64>,
-    wake_transport: bool,
-    confirmed: bool,
-    stop_acknowledged: bool,
+    business: Option<Box<Business>>,
     committed: bool,
     retired: bool,
-    _storage: Charge,
 }
 impl core::fmt::Debug for Work {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let shared = self.binding.0.borrow();
+        let core = self.binding.0.borrow();
         f.debug_struct("Work")
-            .field("reference", &shared.reference)
-            .field("task", &shared.task)
-            .field("next", &self.next)
-            .field("call", &self.call)
-            .field("stop_end", &self.stop_end)
-            .field("retry_at", &self.retry_at)
-            .field("confirmed", &self.confirmed)
-            .field("stop_acknowledged", &self.stop_acknowledged)
-            .field("reported", &shared.reported)
-            .field("resources_exposed", &shared.resources_exposed)
-            .field("fault", &shared.fault)
+            .field("reference", &core.reference)
+            .field("task", &core.task)
+            .field("released", &core.released)
+            .field("reported", &core.reported)
+            .field("resources_exposed", &core.resources_exposed)
+            .field("fault", &core.fault)
             .finish()
     }
 }
 impl Work {
-    /// 所有表存储、任务本体和 Binding 记录费用均在 Claim 提交前准备。
-    /// 宿主还须把包含本 Work 的 TaskSubmission 成功准入到实际 Runtime。
     pub fn prepare(
         registry: &Backing,
         source: u64,
@@ -223,65 +269,83 @@ impl Work {
         )?;
         let storage = funding
             .domain()
-            .acquire(DeviceResource::Bytes, core::mem::size_of::<Self>())?;
+            .acquire(DeviceResource::Bytes, core::mem::size_of::<Business>())?;
         let unit = funding.domain().acquire(DeviceResource::Binding, 1)?;
-        let bytes = funding
-            .domain()
-            .acquire(DeviceResource::Bytes, core::mem::size_of::<Shared>())?;
-        let shared = Rc::try_new(RefCell::new(Shared {
-            reference,
-            source,
-            task: 0,
-            resources: None,
-            released: None,
-            reported: false,
-            can_report: registry.report_authorized(source, reference).is_ok(),
-            dma_report: false,
-            resources_exposed: false,
-            fault: None,
-            _unit: unit,
-            _bytes: bytes,
-        }))
-        .map_err(|_| Error::Resource)?;
-        Ok(Self {
-            binding: Binding(shared),
+        let bytes = funding.domain().acquire(
+            DeviceResource::Bytes,
+            core::mem::size_of::<Shared>() + core::mem::size_of::<Self>(),
+        )?;
+        let signal = notification::create(
+            Rights::READ | Rights::WAIT,
+            Rights::SIGNAL | Rights::DUPLICATE | Rights::TRANSIT,
+        )?;
+        let binding = Binding(
+            Rc::try_new(RefCell::new(Shared {
+                reference,
+                source,
+                task: 0,
+                resources: None,
+                released: None,
+                reported: false,
+                can_report: registry.report_authorized(source, reference).is_ok(),
+                requirement: registry.stop_requirement(reference.device())?,
+                resources_exposed: false,
+                fault: None,
+                use_entry: None,
+                registrar: None,
+                _unit: unit,
+                _bytes: bytes,
+            }))
+            .map_err(|_| Error::Resource)?,
+        );
+        let business = Box::try_new(Business {
             collecting: Some(collecting),
             provider: registry.provision(reference.device())?.clone(),
-            funding,
+            signal,
+            source: SourceRegistration::new(),
             policy,
-            next: Next::Prepare,
             call: None,
-            cleanup: None,
-            prepared_count: 0,
             prepare_end: 0,
             stop_end: None,
-            retry_at: None,
+            prepare_sent: false,
+            stop_sent: None,
+            progress: None,
+            next_get: None,
+            query_due: false,
             wake_transport: false,
-            confirmed: false,
-            stop_acknowledged: false,
+            _storage: storage,
+        })
+        .map_err(|_| Error::Resource)?;
+        Ok(Self {
+            binding,
+            funding,
+            business: Some(business),
             committed: false,
             retired: false,
-            _storage: storage,
         })
     }
     pub fn funding(&self) -> &Funding {
         &self.funding
     }
-    /// 仅放入尚未链接的控制表候选；commit 返回 Created 前不得发布对应 sender。
     pub fn prepared_binding(&self) -> Binding {
         self.binding.clone()
     }
-    /// 仅实际 Runtime 任务 advance 中调用；Existing 的候选不得开始 Prepare。
+    pub fn binding(&self) -> Result<Binding, Error> {
+        if !self.committed || self.retired {
+            return Err(Error::NotReady);
+        }
+        Ok(self.binding.clone())
+    }
     pub fn commit(&mut self, task: u64, now: u64, registry: &mut Backing) -> Result<Commit, Error> {
         if self.committed || task == 0 {
             return Err(Error::Invalid);
         }
+        let business = self.business.as_mut().ok_or(Error::NotReady)?;
         let end = now
-            .checked_add(self.policy.prepare_ns)
+            .checked_add(business.policy.prepare_ns)
             .ok_or(Error::Exhausted)?;
         let core = self.binding.0.borrow();
-        let source = core.source;
-        let reference = core.reference;
+        let (source, reference) = (core.source, core.reference);
         drop(core);
         registry.retain_source(source)?;
         if let Err(error) = registry.retain_device(reference.device()) {
@@ -291,7 +355,7 @@ impl Work {
         let result = registry.commit_claim(source, reference, task);
         if matches!(result, Ok(Commit::Created(_))) {
             self.binding.0.borrow_mut().task = task;
-            self.prepare_end = end;
+            business.prepare_end = end;
             self.committed = true;
         } else {
             registry.release_device(reference.device())?;
@@ -299,49 +363,57 @@ impl Work {
         }
         result
     }
-    /// Created 提交后安装进控制表；最后一个角色/在途请求退休时应丢该别名并唤醒原任务。
-    pub fn binding(&self) -> Result<Binding, Error> {
-        if !self.committed || self.retired {
-            return Err(Error::NotReady);
+    pub fn registered(&mut self, kind: u64, id: SourceId) {
+        if kind == 5
+            && let Some(business) = self.business.as_mut()
+        {
+            business.source.registered(kind, id);
         }
-        Ok(self.binding.clone())
+    }
+    pub fn unregistered(&mut self, id: SourceId) {
+        if let Some(business) = self.business.as_mut() {
+            business.source.unregistered(id);
+        }
+    }
+    pub fn observe(&mut self, event: libexecution::runtime::SourceEvent) {
+        if event.kind == 5
+            && let Some(business) = self.business.as_mut()
+        {
+            business.query_due = true;
+        }
     }
     pub fn deadline(&self) -> Deadline {
-        // 在途调用的期限由 Dispatcher 持有；空闲重查仍必须独立保有阶段期限。
-        let phase_end = if !self.committed
-            || self.retired
-            || self.has_fault()
-            || self.call.is_some()
-            || matches!(self.next, Next::Ready | Next::Released)
-        {
-            None
-        } else {
-            Some(self.stop_end.unwrap_or(self.prepare_end))
+        let Some(business) = &self.business else {
+            return Deadline::INFINITE;
         };
-        crate::timing::deadline(self.retry_at, phase_end).map_or(Deadline::INFINITE, Deadline::at)
+        if self.has_fault() || !self.committed || business.call.is_some() {
+            return Deadline::INFINITE;
+        }
+        if let Some(end) = business.stop_end {
+            Deadline::at(end)
+        } else if self.binding.0.borrow().resources.is_none() {
+            Deadline::at(business.prepare_end)
+        } else {
+            Deadline::INFINITE
+        }
     }
     pub fn has_fault(&self) -> bool {
         self.binding.0.borrow().fault.is_some()
     }
-    /// Runtime 已接受 Wake 意图但 transport 任务无法被唤醒时，宿主转交这一失败。
     pub fn transport_wake_failed(&mut self) {
         self.fault(Error::Unavailable);
     }
-    fn fault(&mut self, error: Error) {
+    fn fault(&self, error: Error) {
         self.binding.0.borrow_mut().fault.get_or_insert(error);
-        self.retry_at = None;
-    }
-    fn schedule(&mut self, now: u64) {
-        self.retry_at = now.checked_add(self.policy.retry_ns);
-        if self.retry_at.is_none() {
-            self.fault(Error::Exhausted);
-        }
     }
     fn stop(&mut self, now: u64, registry: &mut Backing) -> Result<(), Error> {
-        let core = self.binding.0.borrow();
-        registry.stop_claim(core.source, core.reference)?;
-        drop(core);
-        if self.stop_end.is_none() {
+        self.binding.stop(registry)?;
+        let business = self.business.as_mut().ok_or(Error::Closed)?;
+        if business.stop_end.is_none() {
+            business.stop_end = Some(
+                now.checked_add(business.policy.stop_ns)
+                    .ok_or(Error::Exhausted)?,
+            );
             let core = self.binding.0.borrow();
             libkernel::debug!(
                 "device Binding stopping: reference={:?}, resources_exposed={}, reported={}",
@@ -349,39 +421,8 @@ impl Work {
                 core.resources_exposed,
                 core.reported
             );
-            drop(core);
-            self.stop_end = Some(
-                now.checked_add(self.policy.stop_ns)
-                    .ok_or(Error::Exhausted)?,
-            );
         }
-        if !matches!(self.next, Next::Release | Next::Released) {
-            self.next = Next::Stop;
-            self.retry_at = None;
-        }
-        Ok(())
-    }
-    fn closed(&mut self, now: u64, registry: &mut Backing) -> Result<(), Error> {
-        self.stop(now, registry)?;
-        // 调用结果只在 Dispatcher 已退休原调用来源后取走；不存在本任务的另一条在途调用。
-        self.next = Next::Release;
-        self.retry_at = None;
-        self.finish_release(registry)
-    }
-    fn finish_release(&mut self, registry: &mut Backing) -> Result<(), Error> {
-        let reference = self.binding.0.borrow().reference;
-        let released = match registry.release_binding(reference) {
-            Ok(released) => released,
-            Err(Error::Busy) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let mut core = self.binding.0.borrow_mut();
-        core.released = Some(released);
-        core.resources = None;
-        drop(core);
-        self.collecting = None;
-        self.next = Next::Released;
-        self.retry_at = None;
+        business.next_get = None;
         Ok(())
     }
     fn consume(
@@ -393,109 +434,55 @@ impl Work {
     ) -> Result<(), Error> {
         let reference = self.binding.0.borrow().reference;
         let stopping = registry.binding_snapshot(reference)?.phase == Phase::Stopping;
-        match command {
-            ProvisionCommand::Get { epoch, index } => {
-                if stopping {
-                    return self.stop(now, registry);
-                }
-                let entry = protocol::decode_resource(
-                    &reply.payload,
-                    epoch,
-                    index,
-                    reply.handles.remaining(),
-                )?;
-                let capability = reply.handles.take(0).map_err(|_| Error::Invalid)?;
-                entry.descriptor.check_handle(&capability.description()?)?;
-                self.collecting
+        if let ProvisionCommand::Get { epoch, index } = command {
+            if stopping {
+                return self.stop(now, registry);
+            }
+            let entry =
+                protocol::decode_resource(&reply.payload, epoch, index, reply.handles.remaining())?;
+            let capability = reply.handles.take(0)?;
+            entry.descriptor.check_handle(&capability.description()?)?;
+            let business = self.business.as_mut().ok_or(Error::Closed)?;
+            business
+                .collecting
+                .as_mut()
+                .ok_or(Error::NotReady)?
+                .push(&entry, capability)?;
+            business.next_get = Some(index.checked_add(1).ok_or(Error::Exhausted)?);
+            return Ok(());
+        }
+        let progress = Progress::decode(&reply.payload, command, reply.handles.remaining())?;
+        let business = self.business.as_mut().ok_or(Error::Closed)?;
+        if let ProvisionCommand::Stop {
+            consumer_quiescent, ..
+        } = command
+        {
+            business.stop_sent = Some(business.stop_sent.unwrap_or(false) || consumer_quiescent);
+        }
+        business.progress = Some(progress);
+        match progress {
+            Progress::Closed | Progress::Rejected(_) | Progress::Stopping | Progress::Failed(_) => {
+                self.stop(now, registry)?
+            }
+            Progress::Prepared(count)
+                if !stopping
+                    && self.binding.0.borrow().resources.is_none()
+                    && business.next_get.is_none() =>
+            {
+                business
+                    .collecting
                     .as_mut()
                     .ok_or(Error::NotReady)?
-                    .push(&entry, capability)?;
-                let next = index.checked_add(1).ok_or(Error::Exhausted)?;
-                if next == self.prepared_count {
-                    self.publish(registry)?;
-                } else {
-                    self.next = Next::Get(next);
-                }
+                    .prepared(count)?;
+                business.next_get = Some(0);
             }
-            _ => {
-                let progress =
-                    Progress::decode(&reply.payload, command, reply.handles.remaining())?;
-                if matches!(command, ProvisionCommand::Stop(_)) {
-                    self.stop_acknowledged = true;
-                }
-                // Closed 是原 owner 的明确安全承诺；领域错误 Closed 不走此分支。
-                match progress {
-                    Progress::Closed | Progress::Rejected(_) => self.closed(now, registry)?,
-                    Progress::Failed(_) => {
-                        if matches!(command, ProvisionCommand::Prepare(_)) {
-                            self.stop(now, registry)?;
-                        } else {
-                            self.schedule(now);
-                            self.next = Next::Stop;
-                        }
-                    }
-                    Progress::Prepared(count)
-                        if matches!(command, ProvisionCommand::Prepare(_)) && !stopping =>
-                    {
-                        self.collecting
-                            .as_mut()
-                            .ok_or(Error::NotReady)?
-                            .prepared(count)?;
-                        self.prepared_count = count;
-                        if count == 0 {
-                            self.publish(registry)?;
-                        } else {
-                            self.next = Next::Get(0);
-                        }
-                    }
-                    Progress::Preparing
-                        if matches!(command, ProvisionCommand::Prepare(_)) && !stopping =>
-                    {
-                        self.next = Next::Prepare;
-                        self.schedule(now);
-                    }
-                    Progress::Stopping | Progress::Prepared(_) | Progress::Preparing => {
-                        self.stop(now, registry)?;
-                        if matches!(command, ProvisionCommand::ConfirmStopped(_)) {
-                            self.confirmed = true;
-                        }
-                        self.schedule(now);
-                    }
-                }
-            }
+            _ => {}
         }
-        Ok(())
-    }
-    fn publish(&mut self, registry: &mut Backing) -> Result<(), Error> {
-        let collecting = self.collecting.take().ok_or(Error::NotReady)?;
-        let frozen = match collecting.finish() {
-            Ok(frozen) => frozen,
-            Err(collecting) => {
-                self.collecting = Some(collecting);
-                return Err(Error::NotReady);
-            }
-        };
-        let reference = self.binding.0.borrow().reference;
-        // 即便准入在收表期间关闭，也保留整表别名直至原供应实际 Closed。
-        let mut core = self.binding.0.borrow_mut();
-        core.dma_report = (0..frozen.len()).any(|index| {
-            frozen.at(index).is_some_and(|item| {
-                matches!(
-                    item.descriptor.kind,
-                    erhino_shared::object::ObjectKind::DmaUse
-                        | erhino_shared::object::ObjectKind::DmaDomainControl
-                )
-            })
-        });
-        core.resources = Some(frozen);
-        drop(core);
-        registry.resources_ready(reference)?;
-        self.next = Next::Ready;
         Ok(())
     }
     fn transport_error(
         &mut self,
-        mut error: CallError,
+        error: CallError,
         txid: u64,
         command: ProvisionCommand,
         now: u64,
@@ -509,23 +496,17 @@ impl Work {
             error.phase,
             error.cause
         );
-        if matches!(error.owner, CallOwner::Unsent(_)) {
-            drop(error.take_unsent_request());
-        }
-        if error.has_unretired_owners() {
-            self.cleanup = Some(error);
-        }
+        // Dispatcher 在交付前退休观察来源；未发送请求随 error 关闭，无回复口清理债务。
+        // 失败不转为 Closed。首次提交/取资源未知仍由同轮 Stop 收束，停止或观察失联升级监督。
         if matches!(
             command,
-            ProvisionCommand::Stop(_) | ProvisionCommand::ConfirmStopped(_)
+            ProvisionCommand::Stop { .. } | ProvisionCommand::Query(_)
         ) {
             self.fault(Error::Unavailable);
         } else if let Err(error) = self.stop(now, registry) {
             self.fault(error);
         }
     }
-    /// 一次只推进一项业务动作；运输/来源注销仍由原 Dispatcher/Runtime 拥有。
-    /// 已提交后的失败以 fault 保留责任，宿主必须升级管理故障，不能丢弃本 Work 当回滚。
     pub fn advance<F>(
         &mut self,
         registry: &mut Backing,
@@ -534,188 +515,223 @@ impl Work {
         requests: &mut Requests<'_, F>,
         input: &mut Input<'_>,
     ) -> Advance {
+        match self.drive(registry, dispatcher, transport_task, requests, input) {
+            Ok(next) => step(next),
+            Err(error) => {
+                self.fault(error);
+                step(Step::Parked)
+            }
+        }
+    }
+    fn drive<F>(
+        &mut self,
+        registry: &mut Backing,
+        dispatcher: &mut Dispatcher,
+        transport_task: u64,
+        requests: &mut Requests<'_, F>,
+        input: &mut Input<'_>,
+    ) -> Result<Step, Error> {
         let now = input.now_ns();
-        while input.pull().is_some() {}
+        while let Some(event) = input.pull() {
+            self.observe(event);
+        }
         input.take_timeout();
         if !self.committed || self.retired {
-            return step(Step::Complete);
+            return Ok(Step::Complete);
         }
-        if self.wake_transport {
-            if requests.wake(transport_task).is_err() {
-                return step(Step::Runnable);
+        let Some(business) = self.business.as_mut() else {
+            if Rc::strong_count(&self.binding.0) > 1 {
+                return Ok(Step::Parked);
             }
-            self.wake_transport = false;
+            self.retired = true;
+            return Ok(Step::Complete);
+        };
+        if business.wake_transport {
+            requests.wake(transport_task)?;
+            business.wake_transport = false;
         }
-        if let Some(error) = self.cleanup.as_mut() {
-            if error.retry_cleanup().is_err() {
-                self.schedule(now);
-                return step(Step::Parked);
-            }
-            self.cleanup = None;
-        }
-        if let Some((txid, command)) = self.call {
+        if let Some((txid, command)) = business.call {
             if let Some(completion) = dispatcher.take(txid) {
-                self.call = None;
+                business.call = None;
                 match completion.result {
                     Ok(reply) => {
                         if let Err(error) = self.consume(command, reply, now, registry) {
                             if matches!(
                                 command,
-                                ProvisionCommand::Stop(_) | ProvisionCommand::ConfirmStopped(_)
+                                ProvisionCommand::Stop { .. } | ProvisionCommand::Query(_)
                             ) {
-                                self.fault(error);
-                            } else if let Err(error) = self.stop(now, registry) {
-                                self.fault(error);
+                                return Err(error);
                             }
+                            self.stop(now, registry)?;
                         }
                     }
                     Err(error) => self.transport_error(error, txid, command, now, registry),
                 }
-                return step(Step::Runnable);
+                return Ok(Step::Runnable);
             }
             let reference = self.binding.0.borrow().reference;
-            if registry
-                .binding_snapshot(reference)
-                .is_ok_and(|s| s.phase == Phase::Stopping)
-                && !matches!(
+            if registry.binding_snapshot(reference)?.phase == Phase::Stopping
+                && matches!(
                     command,
-                    ProvisionCommand::Stop(_) | ProvisionCommand::ConfirmStopped(_)
+                    ProvisionCommand::Prepare(_) | ProvisionCommand::Get { .. }
                 )
                 && dispatcher.cancel(txid)
             {
-                self.wake_transport = true;
-                return step(Step::Runnable);
+                business.wake_transport = true;
+                return Ok(Step::Runnable);
             }
-            return step(Step::Parked);
+            return Ok(Step::Parked);
         }
         if self.has_fault() {
-            return step(Step::Parked);
-        }
-        if matches!(self.next, Next::Released) {
-            if Rc::strong_count(&self.binding.0) > 1 {
-                return step(Step::Parked);
-            }
-            let core = self.binding.0.borrow();
-            let result = registry
-                .release_device(core.reference.device())
-                .and_then(|()| registry.release_source(core.source));
-            drop(core);
-            if let Err(error) = result {
-                self.fault(error);
-                return step(Step::Parked);
-            }
-            self.retired = true;
-            return step(Step::Complete);
+            return Ok(Step::Parked);
         }
         let reference = self.binding.0.borrow().reference;
-        match registry.binding_snapshot(reference) {
-            Ok(snapshot)
-                if snapshot.phase == Phase::Stopping
-                    && !matches!(self.next, Next::Stop | Next::Confirm | Next::Release) =>
-            {
-                if let Err(error) = self.stop(now, registry) {
-                    self.fault(error);
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                self.fault(error);
-                return step(Step::Parked);
-            }
+        let snapshot = self.binding.snapshot(registry)?;
+        if snapshot.phase == Phase::Stopping {
+            self.stop(now, registry)?;
         }
-        if matches!(self.next, Next::Ready) {
-            return step(Step::Parked);
-        }
-        if matches!(self.next, Next::Release) {
-            if let Err(error) = self.finish_release(registry) {
-                self.fault(error);
-            } else if matches!(self.next, Next::Released) {
-                return step(Step::Runnable);
-            } else if self.stop_end.is_some_and(|end| now >= end) {
-                self.fault(Error::Unavailable);
-            }
-            // 自身供应安全事实已保存；只等待原维护在依赖变化时唤醒，不再调用供应者。
-            return step(Step::Parked);
-        }
-        let consumer_finished = {
-            let core = self.binding.0.borrow();
-            // 内生证明不借用外部硬件报告权限，也不依赖收表完成后的 dma_report。
-            // Stop 已提交后 Get 门永久关闭；未曾交付资源则迟到激活不能产生访问。
-            core.reported
-                || (!core.resources_exposed
-                    && registry
-                        .binding_snapshot(core.reference)
-                        .is_ok_and(|snapshot| snapshot.phase == Phase::Stopping))
-        };
-        let report_ready = matches!(self.next, Next::Stop)
-            && self.stop_acknowledged
-            && consumer_finished
-            && !self.confirmed;
-        match crate::timing::gate(
-            now,
-            self.retry_at,
-            Some(self.stop_end.unwrap_or(self.prepare_end)),
-            report_ready,
+        let business = self.business.as_mut().ok_or(Error::Closed)?;
+        if matches!(
+            business.progress,
+            Some(Progress::Closed | Progress::Rejected(_))
         ) {
-            crate::timing::Gate::Waiting => return step(Step::Parked),
-            crate::timing::Gate::Expired if self.stop_end.is_some() => {
-                self.fault(Error::Unavailable);
-                return step(Step::Parked);
+            if snapshot.phase != Phase::Released {
+                let released = match registry.release_binding(reference) {
+                    Ok(released) => released,
+                    Err(Error::Busy) if business.stop_end.is_none_or(|end| now < end) => {
+                        return Ok(Step::Parked);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut core = self.binding.0.borrow_mut();
+                core.released = Some(released);
+                core.resources = None;
+                core.use_entry = None;
+                core.registrar = None;
             }
-            crate::timing::Gate::Expired => {
-                if let Err(error) = self.stop(now, registry) {
-                    self.fault(error);
-                    return step(Step::Parked);
-                }
+            business.source.remove(requests)?;
+            if !business.source.is_empty() {
+                return Ok(Step::Parked);
             }
-            crate::timing::Gate::Due => {}
+            let source = self.binding.0.borrow().source;
+            registry.release_device(reference.device())?;
+            registry.release_source(source)?;
+            self.business = None;
+            return Ok(Step::Runnable);
         }
-        self.retry_at = None;
-        if report_ready {
-            self.next = Next::Confirm;
+        if business.stop_end.is_some_and(|end| now >= end) {
+            return Err(Error::Unavailable);
         }
-        let command = match self.next {
-            Next::Prepare => ProvisionCommand::Prepare(reference.epoch()),
-            Next::Get(index) => ProvisionCommand::Get {
-                epoch: reference.epoch(),
-                index,
+        if business.stop_end.is_none()
+            && now >= business.prepare_end
+            && self.binding.0.borrow().resources.is_none()
+        {
+            self.stop(now, registry)?;
+            return Ok(Step::Runnable);
+        }
+        let business = self.business.as_mut().ok_or(Error::Closed)?;
+        // 在 Prepare 及其可能的同步完成之前先安装等待来源。
+        if business.source.is_empty() {
+            business.source.install(
+                requests,
+                SourcePlan::new(business.signal.owner.as_handle(), ObjectSignals::READABLE),
+                5,
+            )?;
+            return Ok(Step::Runnable);
+        }
+        if business.source.source().is_none() {
+            return Ok(Step::Runnable);
+        }
+        let quiescent = {
+            let core = self.binding.0.borrow();
+            core.reported || !core.resources_exposed
+        };
+        let epoch = reference.epoch();
+        let command = if business.stop_end.is_some()
+            && (business.stop_sent.is_none() || (quiescent && business.stop_sent == Some(false)))
+        {
+            ProvisionCommand::Stop {
+                epoch,
+                consumer_quiescent: quiescent,
+            }
+        } else if business.stop_end.is_none() && !business.prepare_sent {
+            ProvisionCommand::Prepare(epoch)
+        } else if let Some(index) = business.next_get {
+            let Some(Progress::Prepared(count)) = business.progress else {
+                return Err(Error::Invalid);
+            };
+            if index == count {
+                let collecting = business.collecting.take().ok_or(Error::NotReady)?;
+                let frozen = collecting.finish().map_err(|_| Error::NotReady)?;
+                self.binding.0.borrow_mut().resources = Some(frozen);
+                registry.resources_ready(reference)?;
+                business.next_get = None;
+                return Ok(Step::Runnable);
+            }
+            ProvisionCommand::Get { epoch, index }
+        } else if business.query_due {
+            // 先消费提示；查询期间提交的后续提示仍在内核 Owner 上等待下一轮读取。
+            match business.signal.owner.take(u64::MAX) {
+                Ok(_) | Err(erhino_shared::call::SystemCallError::ObjectNotAvailable) => {}
+                Err(error) => return Err(error.into()),
+            }
+            business.query_due = false;
+            ProvisionCommand::Query(epoch)
+        } else {
+            return Ok(Step::Parked);
+        };
+        let deadline = Deadline::at(business.stop_end.unwrap_or(
+            if self.binding.0.borrow().resources.is_some() {
+                now.checked_add(business.policy.prepare_ns)
+                    .ok_or(Error::Exhausted)?
+            } else {
+                business.prepare_end
             },
-            Next::Stop => ProvisionCommand::Stop(reference.epoch()),
-            Next::Confirm => ProvisionCommand::ConfirmStopped(reference.epoch()),
-            Next::Ready | Next::Release | Next::Released => return step(Step::Parked),
-        };
-        let deadline = Deadline::at(self.stop_end.unwrap_or(self.prepare_end));
+        ));
         let mut bytes = [0; protocol::HEADER_LEN + 12];
-        let request = command.encode(deadline, &mut bytes).and_then(|used| {
-            Request::new(protocol::PROVISION_ID, &bytes[..used]).map_err(Error::from)
-        });
-        let request = match request {
-            Ok(request) => request,
-            Err(error) => {
-                self.fault(error);
-                return step(Step::Parked);
-            }
-        };
-        let task = self.binding.0.borrow().task;
+        let used = command.encode(deadline, &mut bytes)?;
+        let mut request = Request::new(protocol::PROVISION_ID, &bytes[..used])?;
+        if matches!(command, ProvisionCommand::Prepare(_)) {
+            let handle = libkernel::ipc::object::duplicate(
+                business.signal.peer.as_handle(),
+                Rights::SIGNAL | Rights::TRANSIT,
+            )?;
+            // SAFETY: duplicate 返回的新 entry 只移交这次请求，供应者仅得 SIGNAL。
+            request
+                .push(unsafe { Capability::from_raw(handle) }, Rights::SIGNAL)
+                .map_err(|failure| Error::from(failure.error))?;
+            business.prepare_sent = true;
+        }
         match dispatcher.begin_for(
-            ServiceOwner::Shared(self.provider.clone()),
+            ServiceOwner::Shared(business.provider.clone()),
             deadline,
             request,
-            Some(task),
+            Some(self.binding.task()),
             self.funding.execution(),
         ) {
             Ok(txid) => {
-                self.call = Some((txid, command));
-                self.wake_transport = true;
-                step(Step::Runnable)
+                business.call = Some((txid, command));
+                business.wake_transport = true;
             }
-            Err(failure) => {
-                self.transport_error(failure.error, 0, command, now, registry);
-                step(Step::Runnable)
-            }
+            Err(failure) => self.transport_error(failure.error, 0, command, now, registry),
         }
+        Ok(Step::Runnable)
     }
 }
 fn step(step: Step) -> Advance {
     Advance { work_done: 1, step }
+}
+
+fn sender_alias(sender: &MailboxSender) -> Result<Capability, Error> {
+    let handle = libkernel::ipc::object::duplicate(
+        sender.as_handle(),
+        Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+    )?;
+    // SAFETY: 新 entry 的唯一关闭责任移交给返回值。
+    Ok(unsafe { Capability::from_raw(handle) })
+}
+fn sender_copy(sender: &MailboxSender) -> Result<MailboxSender, Error> {
+    MailboxSender::from_capability(sender_alias(sender)?)
+        .map(|(sender, _)| sender)
+        .map_err(|failure| failure.error.into())
 }

@@ -150,6 +150,7 @@ struct Device<C> {
     name: String,
     identity: Vec<u8>,
     limits: Limits,
+    stop_requirement: binding::StopRequirement,
     endpoint: EndpointIdentity,
     provision: C,
     seat: Option<Seat>,
@@ -170,6 +171,7 @@ pub struct Registration<'a> {
     pub identity: &'a [u8],
     pub limits: Limits,
     pub claimable: bool,
+    pub stop_requirement: binding::StopRequirement,
     pub endpoint: EndpointIdentity,
 }
 
@@ -687,6 +689,7 @@ impl<C> Registry<C> {
             || d.identity != request.identity
             || d.limits != request.limits
             || d.seat.is_some() != request.claimable
+            || d.stop_requirement != request.stop_requirement
             || d.endpoint != request.endpoint
         {
             return Err(Error::Conflict);
@@ -750,6 +753,7 @@ impl<C> Registry<C> {
             name,
             identity,
             limits: request.limits,
+            stop_requirement: request.stop_requirement,
             endpoint: request.endpoint,
             provision,
             seat: request.claimable.then(|| Seat::new(id)),
@@ -782,6 +786,7 @@ impl<C> Registry<C> {
             identity: &d.identity,
             limits: d.limits,
             claimable: d.seat.is_some(),
+            stop_requirement: d.stop_requirement,
             endpoint: d.endpoint,
         };
         if d.id.incarnation() != self.incarnation {
@@ -888,6 +893,9 @@ impl<C> Registry<C> {
     }
     pub fn limits(&self, id: DeviceId) -> Result<Limits, Error> {
         Ok(self.device(id)?.limits)
+    }
+    pub fn stop_requirement(&self, id: DeviceId) -> Result<binding::StopRequirement, Error> {
+        Ok(self.device(id)?.stop_requirement)
     }
     /// 已认证的本轮控制/准备任务使用；公开观察仍走 query 的范围门。
     pub fn binding_snapshot(&self, reference: BindingRef) -> Result<binding::Snapshot, Error> {

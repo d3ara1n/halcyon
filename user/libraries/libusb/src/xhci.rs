@@ -45,6 +45,9 @@ impl Inputs {
             return Err(Error::Invalid);
         }
         if let Some(error) = header.error {
+            if !body.is_empty() || reply.handles.remaining() != 0 {
+                return Err(Error::Invalid);
+            }
             return Err(error);
         }
         let entry = Entry::decode(body, registry::HEADER_LEN, reply.handles.remaining())?;
@@ -183,6 +186,7 @@ pub struct Controller {
     usb_cursor: usize,
     command_cursor: usize,
     scan_port: u8,
+    scan_remaining: u8,
     next_connection: u64,
 }
 impl Controller {
@@ -278,6 +282,7 @@ impl Controller {
             usb_cursor: 0,
             command_cursor: 0,
             scan_port: 0,
+            scan_remaining: ports,
             next_connection: 0,
         })
     }

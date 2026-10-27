@@ -72,8 +72,7 @@ impl Manager {
             phase: protocol::Phase::Starting,
             binding_watch: 0,
             activation_watch: 0,
-            binding_changed: false,
-            activation_changed: false,
+            binding_status: None,
             activation_status: None,
             watchers_stopping: false,
         };

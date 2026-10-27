@@ -155,7 +155,7 @@ pub mod outbox;
 #[cfg(target_arch = "riscv64")]
 pub mod subscription;
 #[cfg(target_arch = "riscv64")]
-pub use caller::{CallOperation, Caller, ReplyCleanup};
+pub use caller::{CallOperation, Caller, Exchange, ReplyCleanup};
 #[cfg(target_arch = "riscv64")]
 pub use exchange::{
     CallCause, CallError, CallPhase, FrameRejection, PreparedResponse, Reply, Request,

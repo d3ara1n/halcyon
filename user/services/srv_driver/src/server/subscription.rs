@@ -1,4 +1,4 @@
-//! 两种领域观察直接组合既有 RPC ConsumerTask；原 Managed 完成实际读取后才 Ack。
+//! 两种领域观察交完整快照到原 Run；缓存提交后即可确认序号。
 use super::*;
 use librpc::subscription::ConsumerTask;
 enum Watched {
@@ -8,21 +8,18 @@ enum Watched {
 pub(super) struct Subscription {
     run: Rc<RefCell<Run>>,
     watched: Watched,
-    reading: bool,
 }
 impl Subscription {
     pub fn binding(run: Rc<RefCell<Run>>, watch: libdevice::client::Watch) -> Self {
         Self {
             run,
             watched: Watched::Binding(ConsumerTask::new(watch, Deadline::INFINITE)),
-            reading: false,
         }
     }
     pub fn activation(run: Rc<RefCell<Run>>, watch: libdriver::client::Watch) -> Self {
         Self {
             run,
             watched: Watched::Activation(ConsumerTask::new(watch, Deadline::INFINITE)),
-            reading: false,
         }
     }
     pub fn registered(&mut self, kind: u64, id: SourceId) {
@@ -66,18 +63,6 @@ impl Subscription {
         } else {
             run.binding_watch = id;
         }
-        let changed = if activation {
-            run.activation_changed
-        } else {
-            run.binding_changed
-        };
-        if self.reading && !changed {
-            match &mut self.watched {
-                Watched::Binding(task) => task.acknowledge_read()?,
-                Watched::Activation(task) => task.acknowledge_read()?,
-            }
-            self.reading = false;
-        }
         drop(run);
         let result = match &mut self.watched {
             Watched::Binding(task) => {
@@ -88,27 +73,46 @@ impl Subscription {
             }
         };
         let mut run = self.run.borrow_mut();
-        let available = match &self.watched {
-            Watched::Binding(task) => task.snapshot().is_some(),
+        let available = match &mut self.watched {
+            Watched::Binding(task) => {
+                if let Some(info) = task.snapshot() {
+                    if info
+                        .binding
+                        .is_none_or(|snapshot| snapshot.reference != run.reference)
+                    {
+                        fatal(Error::StaleEpoch);
+                    }
+                    if run
+                        .binding_status
+                        .is_none_or(|old| info.sequence >= old.sequence)
+                    {
+                        run.binding_status = Some(info);
+                    }
+                    task.acknowledge_read()?;
+                    true
+                } else {
+                    false
+                }
+            }
             Watched::Activation(task) => {
                 if let Some(snapshot) = task.snapshot() {
                     if snapshot.reference != run.reference {
                         fatal(Error::StaleEpoch);
                     }
-                    run.activation_status = Some(snapshot);
+                    if run
+                        .activation_status
+                        .is_none_or(|old| snapshot.sequence >= old.sequence)
+                    {
+                        run.activation_status = Some(snapshot);
+                    }
+                    task.acknowledge_read()?;
                     true
                 } else {
                     false
                 }
             }
         };
-        if available && !self.reading {
-            if activation {
-                run.activation_changed = true;
-            } else {
-                run.binding_changed = true;
-            }
-            self.reading = true;
+        if available {
             requests.wake(run.task)?;
         }
         let failed = match &self.watched {
@@ -151,6 +155,10 @@ impl Subscription {
             }
             requests.wake(run.task)?;
         }
-        Ok(result)
+        Ok(if available {
+            advance(Step::Runnable)
+        } else {
+            result
+        })
     }
 }

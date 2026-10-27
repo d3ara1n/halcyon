@@ -75,12 +75,20 @@ impl Host {
             _budget: budget,
         })
     }
-    pub fn adopt(
-        &mut self,
-        index: usize,
-        described: libdevice::resource::Descriptor,
-        mut reply: librpc::Reply,
-    ) -> Result<(), Error> {
+    pub fn retirement_wait(&self) -> Option<erhino_shared::object::Handle> {
+        let child = self.child.as_ref()?;
+        let active = child.provision.active()?;
+        if active.phase != provision::Phase::Stopping || !active.consumer_quiescent {
+            return None;
+        }
+        match child.retired {
+            0 => child.irq.as_ref().map(|control| control.handle()),
+            1 => child.mmio.as_ref().map(|control| control.handle()),
+            2 => child.dma.as_ref().map(|control| control.handle()),
+            _ => None,
+        }
+    }
+    pub fn adopt(&mut self, index: usize, mut reply: librpc::Reply) -> Result<(), Error> {
         let (header, body) = device::Header::decode(&reply.payload)?;
         if header.op != 10 {
             return Err(Error::Invalid);
@@ -92,7 +100,7 @@ impl Host {
             return Err(e);
         }
         let entry = Entry::decode(body, device::HEADER_LEN, reply.handles.remaining())?;
-        if entry.name != HOST_RESOURCES[index] || entry.descriptor != described {
+        if entry.name != HOST_RESOURCES[index] {
             return Err(Error::Conflict);
         }
         let info = HostInfo::decode(entry.metadata)?;
@@ -196,13 +204,18 @@ impl Host {
     pub fn command(
         &mut self,
         command: ProvisionCommand,
+        signal: Option<Capability>,
         mailbox: &Mailbox,
     ) -> Result<Progress, Error> {
         let child = self.child.as_mut().ok_or(Error::NotFound)?;
         let epoch = command.epoch();
         match command {
             ProvisionCommand::Prepare(_) => {
-                if child.provision.prepare(epoch)? == provision::Prepare::Started {
+                if child
+                    .provision
+                    .prepare(epoch, signal.ok_or(Error::Invalid)?)?
+                    == provision::Prepare::Started
+                {
                     match Collecting::reserve(LIMITS, device::RESOURCE_HEADER_LEN, &self.funding) {
                         Ok(mut table) => {
                             table.prepared(4)?;
@@ -225,12 +238,12 @@ impl Host {
                     }
                 }
             }
-            ProvisionCommand::Stop(_) => {
-                child.provision.stop(epoch)?;
+            ProvisionCommand::Stop {
+                consumer_quiescent, ..
+            } => {
+                child.provision.stop(epoch, consumer_quiescent)?;
             }
-            ProvisionCommand::ConfirmStopped(_) => {
-                child.provision.confirm_stopped(epoch)?;
-            }
+            ProvisionCommand::Query(_) => {}
             ProvisionCommand::Get { .. } => return Err(Error::Invalid),
         }
         Ok(self.progress(epoch))
@@ -456,7 +469,7 @@ impl Host {
             return Ok(true);
         }
         // 即使已清 BME 也不能推导既往 DMA 安全；仅在真实 xHCI 静止报告后撤资源。
-        if !active.stopped_report {
+        if !active.consumer_quiescent {
             return Ok(false);
         }
         if child.retired == 0 {

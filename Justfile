@@ -162,8 +162,8 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/drv_pci_generic" "{{TARGET_DIR}}/initfs/bin/drv_pci_generic"
     @ditto "{{TARGET_DIR}}/build/drv_usb_xhci" "{{TARGET_DIR}}/initfs/bin/drv_usb_xhci"
     @ditto "{{TARGET_DIR}}/build/drv_usb_hid" "{{TARGET_DIR}}/initfs/bin/drv_usb_hid"
-    # 保留 build 目录的完整 ELF 调试信息，initfs 只承载装载所需部分。
-    @for file in "{{TARGET_DIR}}/initfs"/bin/*; do riscv64-elf-strip --strip-debug "$file"; done
+    # 调试器使用 build 目录的完整 ELF；initfs 不携带装载器不消费的符号表。
+    @for file in "{{TARGET_DIR}}/initfs"/bin/*; do riscv64-elf-strip --strip-all "$file"; done
     @cd "{{TARGET_DIR}}/initfs" && find . -type f | sed 's|^\./||' | sort | COPYFILE_DISABLE=1 tar --format=ustar -cvf "{{INIT_PAYLOAD}}" -T -
 
 make_boot_package: make_initfs
@@ -246,7 +246,7 @@ acceptance-device-candidates:
 run_device_candidates:
     @just --set INIT_FEATURES " --features srv_init/acceptance-device-candidates" PLATFORM=qemu MODEL=virt MODE=debug run_device_acceptance_reuse true
 
-# 主线程仍在原设备客户端同步wait时，外部fault实际管理者，核独立观察和真实ColdReboot。
+# 在业务等待、Start、装载或停止边界fault实际管理者，核root持续观察与真实ColdReboot。
 acceptance-device-manager-fault manager phase="wait":
     @just output acceptance-device-manager-fault-{{manager}}-{{phase}} test env ERHINO_ACCEPTANCE_WORKLOAD=device just PLATFORM=qemu MODEL=virt MODE=debug run_device_manager_fault {{manager}} {{phase}}
 
@@ -268,7 +268,7 @@ acceptance-device-unknown operation:
 
 [private]
 run_device_unknown operation: make_dtb make_boot_package build_kernel
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core {{if operation == "Claim" { "" } else if operation == "GetResource" { "" } else { "tools/qemu-acceptance.sh --" }}} python3 tools/check-device.py --unknown {{operation}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core {{if operation == "Claim" { "" } else { "tools/qemu-acceptance.sh --" }}} python3 tools/check-device.py --unknown {{operation}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
 
 # 同一实际PCI function两轮授权；init复用libusb控制器承担真实硬件停止责任。
 acceptance-device-function-session:

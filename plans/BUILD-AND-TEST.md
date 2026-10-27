@@ -48,10 +48,10 @@ workload（core/stress/memory/device/device-reuse）由用户态 `srv_init` 编�
 | `just acceptance-device [mode]` | 正式 Devices/FunctionAccess/OAL 键盘客户端：无键盘启动、两轮同端口 QMP 热插、客体确认按下/释放、主机删除与客体 Seat 释放分别确认、IRQ Take/Ack 和实际 worker Pool 退款；随后保留 core 全部业务 |
 | `just acceptance-device-reuse` | 正式 debug ELF/GDB 外部用户 fault：A/B 同 HID PID、停 A 保旧 function/Watch、B 继续输入、C 复用、CPU 故障后 B/C 原 Seat Released 与单次进程收集；以本轮 controller Ready 为插入门，不声称 idle |
 | `just acceptance-device-candidates` | 同一debug复用/QMP路线的显式负装配：真实PCI映像在原固定identity/角色门明确Permission且无物理/子登记授权，等原轮Closed/Released/Detach，在同DeviceId新epoch接真实HID及输入；正常声明和原工作集不变 |
-| `just acceptance-device-manager-fault Device/Driver [wait/start/stopping]` | 同一 debug 设备装配和外部 GDB：长同步 wait、预装真实 Start 门后的首 ecall、正常停止意图中的指定管理者 fault；核唯一封口终局及 QMP guest RESET，不以 reset 证明硬件停止或退款 |
+| `just acceptance-device-manager-fault Device/Driver [wait/start/stopping/loading]` | 同一debug装配和外部GDB：root业务等待、Start后首ecall、正常停止中的指定管理者fault。loading仅Driver：核实际test_target首段/首页指纹、剩余复制及未完成子进程未Start即进入终局。均核唯一封口与QMP guest RESET，不以reset证明硬件停止或退款 |
 | `just acceptance-device-reset-rejection` | 真实 xHCI 已交付环地址后使 srv_device fault，拒绝真实 ColdReboot/SystemFailure；复用原 DMA 观察体核 init DONE/四 hart 停驻后同一组 pin/backing/write 许可仍保留，不能据此断言设备 DMA 静止 |
 | `just acceptance-device-controller-fault` | 同一正式debug装配中使实际xHCI PID在真实trap入口fault，核原ProcessTask DONE与Managed受信主控故障、外层唯一终局；拒绝ColdReboot后核实际非空exposed DMA集合跨init DONE/四hart停驻保留，不以CPU完成补静止或Retire |
-| `just acceptance-device-unknown Claim/Prepare/ProvisionGet/GetResource/Activate/Master` | 同一debug core装配，GDB仅令一份真实成功回复的运输Send期限At0，核真实Once/context、DeadlineExpired及原请求Sent错误；Claim/GetResource走原唯一故障终局，其余核原轮停止或Master原context/绝对期限恢复及完整core收尾。不声称回复入队后丢失 |
+| `just acceptance-device-unknown Claim/Prepare/ProvisionGet/GetResource/Activate/QueryUse/Master` | 同一debug core装配，GDB仅令一份真实成功回复的运输Send期限At0，核真实Once/context、DeadlineExpired及原请求Sent错误。Claim走唯一故障终局；Prepare核首次Preparing/Prepared接纳回复；GetResource要求暴露位保持true、PCI未开始ECAM访问、原Use报告后安全释放；QueryUse核激活接纳后的首次权限核验失败，须无资源暴露/硬件访问并退原轮。其余核原轮停止或Master原context/绝对期限恢复及完整core收尾。不声称回复入队后丢失 |
 | `just acceptance-device-function-session` | 显式仅自动PCI的debug core装配；init缩权Claim真实xHCI两轮并复用libusb完成Run/停止/DMA DONE，旧function跨新Prepared核Permission、实际Stop传播后核Closed；只读GDB观察真实认证context与ECAM BME，不新增产品操作 |
 | `just acceptance-irq-retirement` | 同一真实Controller两轮QMP插入/Take，保留旧token跨原provider Revoke；只读核complete先于disable、旧use Closed、新代已taken时旧token拒绝且原新token恰一次complete，随后完整core收束 |
 | `just acceptance-irq-idle` | 上述真实消费者增量：插入前必须取得同一四hart idle/队列/maintenance/remote/期限快照，暂停时QMP真实插入，恢复后核同源claim/Take；记录timer共现，不把全停或Waiting日志当idle证据 |
@@ -64,7 +64,7 @@ workload（core/stress/memory/device/device-reuse）由用户态 `srv_init` 编�
 | `just acceptance-dma-shared` | 同一MemoryObject的两份实际Pin共享完整Backing/SG，逐份DONE/关闭、写许可2→1→0与子metadata归还；父root仍在不退物理页，最后父对象/CPU/Control关闭后核独立Pool零和原父RAM退款 |
 | `just acceptance-dma-quota` | 原test_target以真实Notification owner耗尽独立Pool metadata，核原Pin明确Quota、释放压力后同Use恢复及最终原账零；不代表精确失败前缀或allocator OOM |
 | `just acceptance-dma-install-failure` | 原test_target的Pin完整取得use/write并ReadyUnexposed后，外部GDB在最终句柄安装的releases Buffer真实allocator入口注入一次null；核实际OutOfMemory、无handle/地址暴露、原Work收束及独立Pool最终零。指定分配失败不代表真实堆耗尽 |
-| `just virt-platform-funding` | 复用原boot失败设施，分别在首MMIO根Node构造和全批Building cap表预约的真实未执行分配入口指定失败；核局部原账回退/无能力逃逸、真实boot错误及四hart Gate Failed停驻。安装后原root清理Work仍排队时只记稳定责任保留，不称完整退款 |
+| `just virt-platform-funding` | 复用原boot失败设施，分别在首MMIO根Node构造、DMA未发布空根retained条目和全批Building cap表预约的真实未执行分配入口指定失败；DMA模式核出生前后原账相同且不排正常Root Work，其余模式按实际owner区别局部退款与稳定清理接管；均核无能力逃逸、真实boot错误及四hart Gate Failed停驻 |
 | `just acceptance-sifive_u [mode]` | 128MiB、非零 boot hart 等板级差异的 core 自动验收；默认 release |
 | `just virt-nofd [mode]` | 无 F/D、无兼容浮点域的完整 core；默认 release，可指定 debug |
 | `just virt-hetero [mode]` | 异构调度域及完整 core；默认 release，可指定 debug，涉及调度域时额外运行 |

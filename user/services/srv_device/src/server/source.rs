@@ -10,6 +10,8 @@ pub(super) struct Source {
     ids: SourceIds,
     issuer: Option<u64>,
     binding: Option<libdevice::identity::BindingRef>,
+    binding_owner: Option<Binding>,
+    recovered: bool,
     scope: Scope,
     access: Access,
     use_sender: Option<MailboxSender>,
@@ -65,6 +67,14 @@ impl Source {
         let bytes = funding
             .domain()
             .acquire(DeviceResource::Bytes, core::mem::size_of::<Self>())?;
+        let binding_owner = binding
+            .map(
+                |reference| match &world.existing_binding(reference).ok_or(Error::Closed)?.kind {
+                    RoleKind::Binding(binding) => Ok(binding.clone()),
+                    _ => Err(Error::Permission),
+                },
+            )
+            .transpose()?;
         let use_role = world.mailbox.mint(0, TRANSPORT)?;
         let admin_role = world.mailbox.mint(0, TRANSPORT)?;
         let ids = SourceIds {
@@ -75,6 +85,8 @@ impl Source {
             ids,
             issuer,
             binding,
+            binding_owner,
+            recovered: false,
             scope,
             access,
             use_sender: Some(use_role.sender),
@@ -136,6 +148,36 @@ impl Source {
             return Ok(false);
         }
         if !self.committed {
+            // 并发重复发行在同一 actor 提交点恢复赢家，不另造子来源。
+            if let Some(binding) = &self.binding_owner
+                && let Some((a, b)) = binding.registrar()?
+            {
+                self.use_sender = Some(a);
+                self.admin_sender = Some(b);
+                self.use_life.closed = true;
+                self.admin_life.closed = true;
+                self.recovered = true;
+                self.committed = true;
+                self.binding_owner = None;
+                return Ok(true);
+            }
+            let mothers = self
+                .binding_owner
+                .as_ref()
+                .map(|_| {
+                    let a = MailboxSender::from_capability(alias(
+                        self.use_sender.as_ref().ok_or(Error::Closed)?,
+                    )?)
+                    .map_err(|failure| Error::from(failure.error))?
+                    .0;
+                    let b = MailboxSender::from_capability(alias(
+                        self.admin_sender.as_ref().ok_or(Error::Closed)?,
+                    )?)
+                    .map_err(|failure| Error::from(failure.error))?
+                    .0;
+                    Ok::<_, Error>((a, b))
+                })
+                .transpose()?;
             match self.issuer {
                 Some(issuer) => {
                     if let Some(reference) = self.binding {
@@ -157,6 +199,9 @@ impl Source {
                     .bootstrap(self.ids, id, self.funding.clone())?,
             }
             self.committed = true;
+            if let Some(binding) = self.binding_owner.take() {
+                binding.install_registrar(mothers.expect("child source mothers missing"));
+            }
         }
         Ok(true)
     }
@@ -188,6 +233,17 @@ impl Source {
                     Step::Complete
                 } else {
                     Step::Runnable
+                },
+            ));
+        }
+        if self.recovered {
+            self.use_life.drive(requests)?;
+            self.admin_life.drive(requests)?;
+            return Ok(step(
+                if self.use_life.source.is_empty() && self.admin_life.source.is_empty() {
+                    Step::Complete
+                } else {
+                    Step::Parked
                 },
             ));
         }

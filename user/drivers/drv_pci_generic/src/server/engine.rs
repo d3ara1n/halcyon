@@ -1,17 +1,15 @@
 //! 原激活按预算取得资源、扫描 ECAM、登记真实 function，停止后保留清理服务。
 use super::*;
-use libdevice::{binding::Phase as BindingPhase, identity::DeviceId};
+use libdevice::identity::DeviceId;
 use libpci::{
     config::{Address, XHCI_IDENTITY},
     host::HOST_RESOURCES,
 };
 #[derive(Clone, Copy)]
 enum Call {
-    Describe(usize, Deadline),
-    Get(usize, libdevice::resource::Descriptor),
+    Get(usize),
     Register,
     Withdraw,
-    Query,
 }
 pub(super) struct Engine {
     pending: Option<(u64, Call)>,
@@ -19,7 +17,8 @@ pub(super) struct Engine {
     scan: u16,
     enumerated: bool,
     withdrawn: bool,
-    next_poll: Deadline,
+    retirement: SourceRegistration,
+    waiting: Option<erhino_shared::object::Handle>,
 }
 impl Engine {
     pub fn new() -> Self {
@@ -29,11 +28,48 @@ impl Engine {
             scan: 0,
             enumerated: false,
             withdrawn: false,
-            next_poll: Deadline::INFINITE,
+            retirement: SourceRegistration::new(),
+            waiting: None,
         }
     }
     pub fn deadline(&self) -> Deadline {
-        self.next_poll
+        Deadline::INFINITE
+    }
+    pub fn registered(&mut self, kind: u64, id: SourceId) {
+        if kind == 7 {
+            self.retirement.registered(kind, id);
+        }
+    }
+    pub fn unregistered(&mut self, id: SourceId) {
+        self.retirement.unregistered(id);
+    }
+    fn wait_retirement(
+        &mut self,
+        world: &World,
+        requests: &mut Requests<'_, Family>,
+    ) -> Result<Advance, SystemCallError> {
+        let waiting = world.host.retirement_wait();
+        if waiting != self.waiting {
+            self.retirement.remove(requests)?;
+            if !self.retirement.is_empty() {
+                return Ok(step(Step::Parked));
+            }
+            self.waiting = waiting;
+        }
+        if let Some(handle) = waiting {
+            if self.retirement.is_empty() {
+                self.retirement.install(
+                    requests,
+                    SourcePlan::new(handle, ObjectSignals::DONE),
+                    7,
+                )?;
+                return Ok(step(Step::Runnable));
+            }
+            if self.retirement.is_installing() {
+                return Ok(step(Step::Runnable));
+            }
+        }
+        Ok(step(Step::Parked))
     }
     fn begin(
         &mut self,
@@ -85,6 +121,32 @@ impl Engine {
         requests: &mut Requests<'_, Family>,
         input: &mut Input<'_>,
     ) -> Result<Advance, SystemCallError> {
+        match self.drive(id, world, requests, input) {
+            Ok(advance) => Ok(advance),
+            Err(error) => {
+                let slot = world.slot.as_mut().unwrap_or_else(|| fatal(error));
+                if !matches!(
+                    slot.activation()
+                        .ok_or(Error::NotReady)
+                        .unwrap_or_else(|e| fatal(e))
+                        .snapshot()
+                        .phase,
+                    protocol::Phase::Starting | protocol::Phase::Ready
+                ) {
+                    fatal(error);
+                }
+                slot.fail(error).unwrap_or_else(|e| fatal(e));
+                Ok(step(Step::Runnable))
+            }
+        }
+    }
+    fn drive(
+        &mut self,
+        id: u64,
+        world: &mut World,
+        requests: &mut Requests<'_, Family>,
+        input: &mut Input<'_>,
+    ) -> Result<Advance, Error> {
         while let Some(event) = input.pull() {
             if let Some(slot) = &mut world.slot {
                 slot.event(event);
@@ -96,11 +158,10 @@ impl Engine {
             return Ok(step(Step::Runnable));
         }
         input.take_timeout();
-        let Some(_a) = world
-            .slot
-            .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
-        else {
+        if world.slot.as_ref().is_none_or(|slot| !slot.io_ready()) {
+            return Ok(step(Step::Parked));
+        }
+        let Some(_a) = world.slot.as_ref().and_then(|slot| slot.activation()) else {
             return Ok(step(Step::Parked));
         };
         if let Some((txid, kind)) = self.pending {
@@ -109,74 +170,21 @@ impl Engine {
             };
             self.pending = None;
             // Unknown 保留原 Provision/Binding 责任并由外层故障封口，不换轮或制造安全结果。
-            let mut reply = result.result.unwrap_or_else(|error| {
+            let mut reply = result.result.map_err(|error| {
                 libkernel::debug!(
                     "PCI RPC failed: txid={}, phase={:?}, cause={:?}; original binding retained",
                     txid,
                     error.phase,
                     error.cause
                 );
-                fatal(Error::Unavailable)
-            });
+                Error::Unavailable
+            })?;
             match kind {
-                Call::Describe(index, deadline) => {
-                    if reply.handles.remaining() != 0 {
-                        fatal(Error::Invalid);
-                    }
-                    let request = liboal::protocol::Request::Lookup {
-                        path: HOST_RESOURCES[index],
-                    };
-                    match liboal::protocol::decode_response(&reply.payload, &request, deadline, 0)
-                        .unwrap_or_else(|_| fatal(Error::Invalid))
-                    {
-                        liboal::protocol::Response::Found(info) => {
-                            let info = libdevice::resource::oal::Info::decode(info)
-                                .unwrap_or_else(|_| fatal(Error::Invalid));
-                            let activation = world
-                                .slot
-                                .as_ref()
-                                .and_then(|s| s.activation.as_ref())
-                                .expect("PCI activation missing");
-                            if info.reference != activation.reference() {
-                                fatal(Error::StaleEpoch);
-                            }
-                            let descriptor =
-                                info.descriptor.unwrap_or_else(|| fatal(Error::Invalid));
-                            if !matches!(
-                                activation.snapshot().phase,
-                                protocol::Phase::Stopping | protocol::Phase::Terminal
-                            ) {
-                                let usage = activation.usage().unwrap_or_else(|e| fatal(e)).clone();
-                                self.begin(
-                                    id,
-                                    world,
-                                    usage,
-                                    device::Command::GetResource {
-                                        name: HOST_RESOURCES[index],
-                                    },
-                                    Call::Get(index, descriptor),
-                                )
-                                .unwrap_or_else(|e| fatal(e));
-                                return Ok(step(Step::Parked));
-                            }
-                        }
-                        liboal::protocol::Response::Error(liboal::protocol::Status::Revoked) => {
-                            world
-                                .slot
-                                .as_mut()
-                                .and_then(|s| s.activation.as_mut())
-                                .expect("PCI activation missing")
-                                .stop();
-                            world.changed()?;
-                        }
-                        _ => fatal(Error::Invalid),
-                    }
-                }
-                Call::Get(index, descriptor) => match world.host.adopt(index, descriptor, reply) {
+                Call::Get(index) => match world.host.adopt(index, reply) {
                     Ok(()) => {
                         self.next_resource = index + 1;
                         libkernel::debug!(
-                            "PCI resource Describe/Get matched: {}",
+                            "PCI resource acquired and verified: {}",
                             HOST_RESOURCES[index]
                         );
                     }
@@ -184,28 +192,30 @@ impl Engine {
                         world
                             .slot
                             .as_mut()
-                            .and_then(|s| s.activation.as_mut())
                             .expect("PCI activation missing")
-                            .stop();
-                        world.changed()?;
+                            .stop()?;
                     }
-                    Err(error) => fatal(error),
+                    Err(error) => return Err(error),
                 },
                 Call::Register => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
+                    let (header, body) = device::Header::decode(&reply.payload)?;
+                    if header.op == 3
+                        && header.error == Some(Error::Closed)
+                        && body.is_empty()
+                        && reply.handles.remaining() == 0
+                    {
+                        world.slot.as_mut().ok_or(Error::NotReady)?.stop()?;
+                        return Ok(step(Step::Runnable));
+                    }
                     if header.op != 3 || header.error.is_some() || reply.handles.remaining() != 1 {
-                        fatal(header.error.unwrap_or(Error::Invalid));
+                        return Err(header.error.unwrap_or(Error::Invalid));
                     }
                     let child = world
                         .host
                         .child
                         .as_mut()
                         .expect("PCI registered function missing");
-                    child.device = Some(
-                        DeviceId::decode(&mut librpc::bytes::Reader::new(body))
-                            .unwrap_or_else(|e| fatal(e)),
-                    );
+                    child.device = Some(DeviceId::decode(&mut librpc::bytes::Reader::new(body))?);
                     child.control = Some(
                         MailboxSender::from_capability(reply.handles.take(0)?)
                             .map_err(|f| f.error)?
@@ -220,77 +230,28 @@ impl Engine {
                     );
                 }
                 Call::Withdraw => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
+                    let (header, body) = device::Header::decode(&reply.payload)?;
                     if header.op != 4
                         || header.error.is_some()
                         || !body.is_empty()
                         || reply.handles.remaining() != 0
                     {
-                        fatal(header.error.unwrap_or(Error::Invalid));
+                        return Err(header.error.unwrap_or(Error::Invalid));
                     }
                     self.withdrawn = true;
-                }
-                Call::Query => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
-                    if header.op != 8 || header.error.is_some() || reply.handles.remaining() != 0 {
-                        fatal(header.error.unwrap_or(Error::Invalid));
-                    }
-                    let state = device::decode_snapshot(body).unwrap_or_else(|e| fatal(e));
-                    let activation = world
-                        .slot
-                        .as_mut()
-                        .and_then(|slot| slot.activation.as_mut())
-                        .expect("PCI activation missing");
-                    if state.reference != activation.reference() {
-                        fatal(Error::StaleEpoch);
-                    }
-                    if state.phase == BindingPhase::Released
-                        && activation.snapshot().phase == protocol::Phase::Terminal
-                    {
-                        world
-                            .slot
-                            .as_mut()
-                            .expect("PCI slot missing")
-                            .release(state)
-                            .unwrap_or_else(|e| fatal(e));
-                    } else if matches!(state.phase, BindingPhase::Stopping | BindingPhase::Released)
-                    {
-                        activation.stop();
-                        world.changed()?;
-                    }
                 }
             }
         }
         if world.slot.as_ref().is_some_and(|slot| {
-            slot.activation
-                .as_ref()
+            slot.activation()
                 .is_some_and(|a| a.snapshot().phase == protocol::Phase::Terminal)
         }) {
-            if !world.slot.as_ref().is_some_and(ActivationSlot::active) {
-                self.next_poll = Deadline::INFINITE;
-                return Ok(step(Step::Parked));
-            }
-            if self.next_poll == Deadline::INFINITE || libkernel::time::expired(self.next_poll)? {
-                let usage = world
-                    .slot
-                    .as_ref()
-                    .and_then(|s| s.activation.as_ref())
-                    .expect("PCI activation missing")
-                    .usage()
-                    .unwrap_or_else(|e| fatal(e))
-                    .clone();
-                self.next_poll = libkernel::time::timeout_millis(1)?;
-                self.begin(id, world, usage, device::Command::QueryBinding, Call::Query)
-                    .unwrap_or_else(|e| fatal(e));
-            }
-            return Ok(step(Step::Parked));
+            return self.wait_retirement(world, requests).map_err(Error::from);
         }
         let stopping = world
             .slot
             .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
+            .and_then(|slot| slot.activation())
             .expect("PCI activation missing")
             .snapshot()
             .phase
@@ -306,7 +267,7 @@ impl Engine {
                 let registrar = world
                     .slot
                     .as_ref()
-                    .and_then(|slot| slot.activation.as_ref())
+                    .and_then(|slot| slot.activation())
                     .and_then(|a| a.registrar())
                     .ok_or(SystemCallError::InternalError)?
                     .clone();
@@ -316,70 +277,50 @@ impl Engine {
                     registrar,
                     device::Command::WithdrawPublication { seq: 1 },
                     Call::Withdraw,
-                )
-                .unwrap_or_else(|e| fatal(e));
+                )?;
                 return Ok(step(Step::Parked));
             }
-            if world.host.advance().unwrap_or_else(|e| fatal(e)) {
+            if world.host.advance()? {
                 return Ok(step(Step::Runnable));
             }
             if world.host.hardware_idle() {
-                world.host.unmap().unwrap_or_else(|e| fatal(e));
-                let activation = world
-                    .slot
-                    .as_mut()
-                    .and_then(|slot| slot.activation.as_mut())
-                    .expect("PCI activation missing");
+                world.host.unmap()?;
+                let slot = world.slot.as_mut().expect("PCI activation missing");
                 // SAFETY: 所有子供应已实际 Closed（含 xHCI halt/DMA/IRQ/MMIO）；扫描与配置
                 // 在此分支永久关闭，ECAM 已解除。保留入口仅拒迟到请求/交付已有软件结果。
                 unsafe {
-                    activation.consumer_stopped().unwrap_or_else(|e| fatal(e));
+                    slot.consumer_stopped()?;
                 }
-                activation.terminal(None);
-                world.changed()?;
+                slot.terminal(None)?;
                 libkernel::debug!(
                     "PCI consumer stopped: ECAM unmapped; child hardware responsibility closed"
                 );
-                self.next_poll = Deadline::INFINITE;
                 return Ok(step(Step::Runnable));
             }
-            self.next_poll = libkernel::time::timeout_millis(1)?;
-            return Ok(step(Step::Parked));
+            return self.wait_retirement(world, requests).map_err(Error::from);
         }
         if self.next_resource < 4 {
             let index = self.next_resource;
             let target = world
                 .slot
                 .as_ref()
-                .and_then(|slot| slot.activation.as_ref())
+                .and_then(|slot| slot.activation())
                 .expect("PCI activation missing")
-                .usage()
-                .unwrap_or_else(|e| fatal(e))
+                .usage()?
                 .clone();
-            let deadline = libkernel::time::timeout_millis(5_000)?;
-            let mut wire = [0; liboal::protocol::HEADER_LEN + liboal::protocol::BODY_MAX];
-            let used = liboal::protocol::encode_request(
-                &liboal::protocol::Request::Lookup {
-                    path: HOST_RESOURCES[index],
-                },
-                deadline,
-                &mut wire,
-            )
-            .unwrap_or_else(|_| fatal(Error::Invalid));
-            let request = librpc::Request::new(liboal::protocol::ID, &wire[..used])?;
-            self.send(
+            self.begin(
                 id,
                 world,
                 target,
-                deadline,
-                request,
-                Call::Describe(index, deadline),
-            )
-            .unwrap_or_else(|e| fatal(e));
+                device::Command::GetResource {
+                    name: HOST_RESOURCES[index],
+                },
+                Call::Get(index),
+            )?;
             return Ok(step(Step::Parked));
         }
         if world.host.ecam.is_none() {
-            world.host.map().unwrap_or_else(|e| fatal(e));
+            world.host.map()?;
             libkernel::debug!("PCI host resources acquired; ECAM mapped");
             return Ok(step(Step::Runnable));
         }
@@ -397,9 +338,7 @@ impl Engine {
                     .as_ref()
                     .expect("PCI ECAM missing")
                     .function(address)
-            }
-            .unwrap_or_else(|e| fatal(e.into()))
-            {
+            }? {
                 libkernel::debug!(
                     "PCI function: bus=0 slot={} fn={} vendor={:04x} device={:04x} class={:06x}",
                     address.slot,
@@ -409,13 +348,10 @@ impl Engine {
                     function.class
                 );
                 if function.header & 0x7f == 1 {
-                    fatal(Error::Unsupported);
+                    return Err(Error::Unsupported);
                 }
                 if function.identity() == XHCI_IDENTITY {
-                    world
-                        .host
-                        .discovered(function, &world.control.mailbox)
-                        .unwrap_or_else(|e| fatal(e));
+                    world.host.discovered(function, &world.control.mailbox)?;
                 }
             }
             return Ok(step(Step::Runnable));
@@ -430,14 +366,14 @@ impl Engine {
                 let registrar = world
                     .slot
                     .as_ref()
-                    .and_then(|slot| slot.activation.as_ref())
+                    .and_then(|slot| slot.activation())
                     .and_then(|a| a.registrar())
                     .ok_or(SystemCallError::InternalError)?
                     .clone();
                 let parent = world
                     .slot
                     .as_ref()
-                    .and_then(|slot| slot.activation.as_ref())
+                    .and_then(|slot| slot.activation())
                     .expect("PCI activation missing")
                     .reference()
                     .device();
@@ -452,40 +388,23 @@ impl Engine {
                         identity: XHCI_IDENTITY,
                         limits: supply::LIMITS,
                         claimable: true,
+                        stop_requirement: libdevice::binding::StopRequirement::ConsumerQuiescence,
                     },
                     Call::Register,
-                )
-                .unwrap_or_else(|e| fatal(e));
+                )?;
                 return Ok(step(Step::Parked));
             }
             self.enumerated = true;
             world
                 .slot
                 .as_mut()
-                .and_then(|slot| slot.activation.as_mut())
                 .expect("PCI activation missing")
-                .ready()
-                .unwrap_or_else(|e| fatal(e));
-            world.changed()?;
+                .ready()?;
             libkernel::debug!("PCI activation ready; bus 0 enumeration complete");
         }
-        if world.host.advance().unwrap_or_else(|e| fatal(e)) {
+        if world.host.advance()? {
             return Ok(step(Step::Runnable));
         }
-        if self.next_poll == Deadline::INFINITE || libkernel::time::expired(self.next_poll)? {
-            let usage = world
-                .slot
-                .as_ref()
-                .and_then(|slot| slot.activation.as_ref())
-                .expect("PCI activation missing")
-                .usage()
-                .unwrap_or_else(|e| fatal(e))
-                .clone();
-            self.next_poll = libkernel::time::timeout_millis(1)?;
-            self.begin(id, world, usage, device::Command::QueryBinding, Call::Query)
-                .unwrap_or_else(|e| fatal(e));
-        }
-        let _ = requests;
-        Ok(step(Step::Parked))
+        self.wait_retirement(world, requests).map_err(Error::from)
     }
 }

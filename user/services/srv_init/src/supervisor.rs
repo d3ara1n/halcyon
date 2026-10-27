@@ -12,6 +12,9 @@ use libkernel::shared::time::Deadline;
 use libprocess::{Collector, job_driver::JobDriver};
 
 mod funding;
+mod loading;
+mod rpc;
+mod waiting;
 
 const ROOT_JOB_SLOTS: usize = 2;
 
@@ -228,8 +231,10 @@ struct CapabilityEntry {
 pub(super) struct RootSupervisor {
     pub(super) drivers: Option<super::driver::Manager>,
     pub(super) devices: Option<super::device::Manager>,
-    pub(super) device_observer: Option<super::device_supervision::Observer>,
-    assembly: Assembly<WaitSet>,
+    pub(super) device_supervisor: Option<super::device_supervision::Supervisor>,
+    pub(super) assembly: Assembly<WaitSet>,
+    waiting: waiting::WaitDuty,
+    caller: Option<librpc::Caller>,
     capabilities: Vec<CapabilityEntry>,
     capability_cursor: usize,
     endpoint_cleanup: Cleanup<librunnel::MappedEndpoint>,
@@ -247,7 +252,12 @@ pub(super) struct RootSupervisor {
 }
 
 #[derive(Clone, Copy)]
-enum Await {
+pub(super) enum Await {
+    ManagerStarted(super::device_supervision::Manager),
+    ManagerDone(super::device_supervision::Manager),
+    ManagerDetached(super::device_supervision::Manager),
+    Turn,
+    AssemblyWait,
     Job(usize),
     Batch(usize),
     Read,
@@ -291,7 +301,7 @@ fn fold_wait<T>(
 }
 
 /// duty 在实际提交出生前准备一次付款；失败重试继续借用原 view。
-fn prepare_funding<T>(
+pub(super) fn prepare_funding<T>(
     slot: &mut Option<AccountView<ExecutionResource>>,
     capacity: usize,
     sources: usize,
@@ -360,11 +370,14 @@ impl RootSupervisor {
             drop(set);
             error
         })?;
+        let waiting = waiting::WaitDuty::new(&assembly)?;
         Ok(Self {
             drivers: None,
             devices: None,
-            device_observer: None,
+            device_supervisor: None,
             assembly,
+            waiting,
+            caller: Some(librpc::Caller::new()),
             capabilities: Vec::new(),
             capability_cursor: 0,
             endpoint_cleanup: Cleanup::empty(),
@@ -1825,8 +1838,12 @@ impl RootSupervisor {
         Ok(())
     }
 
-    fn turn_and_wait(&mut self, awaited: Option<Await>) -> Result<(), SystemCallError> {
+    pub(super) fn turn_and_wait(&mut self, awaited: Option<Await>) -> Result<(), SystemCallError> {
         for &record in self.assembly.receive(64)? {
+            if let Some(managers) = &mut self.device_supervisor {
+                managers.feed(record);
+            }
+            self.waiting.feed(record);
             for duty in self.jobs.iter_mut().flatten() {
                 if let Some(rt) = duty.runtime.as_mut() {
                     rt.feed(record);
@@ -1842,6 +1859,18 @@ impl RootSupervisor {
             }
         }
         let now = libkernel::time::snapshot()?.now_ns;
+        // 管理者DONE和故障先于装配/业务推进；这里只有一个终局owner。
+        let failure = self
+            .device_supervisor
+            .as_mut()
+            .and_then(|managers| match managers.step() {
+                Ok(()) => managers.failure(),
+                Err(_) => Some("manager observation infrastructure failed"),
+            });
+        if let Some(reason) = failure {
+            self.device_failure(reason);
+        }
+        self.waiting.step(now)?;
         // 五个运行体槽持续轮转；每轮各至多一个工作单位。
         for _ in 0..5 {
             let index = self.cursor;
@@ -1953,9 +1982,23 @@ impl RootSupervisor {
             }
         }
         let mut deadline = None;
-        let mut runnable = self.endpoint_cleanup.runnable()
+        let (waiting_runnable, waiting_deadline) = self.waiting.state();
+        deadline = waiting_deadline.or(deadline);
+        let mut runnable = waiting_runnable
+            || self.endpoint_cleanup.runnable()
             || self.endpoint_create_cleanup.runnable()
             || self.capability_cleanup.runnable();
+        if let Some(managers) = &self.device_supervisor {
+            match managers.state() {
+                DriveState::Runnable => runnable = true,
+                DriveState::Waiting(end) => {
+                    if let Some(at) = end.instant().expect("manager deadline valid") {
+                        deadline = Some(deadline.map_or(at, |old| old.min(at)));
+                    }
+                }
+                DriveState::Drained => {}
+            }
+        }
         for at in [
             self.endpoint_cleanup.disposition.retry,
             self.endpoint_create_cleanup.disposition.retry,
@@ -2018,6 +2061,11 @@ impl RootSupervisor {
         }
         // 只向正在等待的脚本阶段返回结果；其他已完成槽不妨碍组合停驻。
         let outcome = match awaited {
+            Some(Await::ManagerStarted(role)) => self.device_supervisor.as_ref().is_some_and(|s| s.started(role)),
+            Some(Await::ManagerDone(role)) => self.device_supervisor.as_ref().is_some_and(|s| s.done(role)),
+            Some(Await::ManagerDetached(role)) => self.device_supervisor.as_ref().is_some_and(|s| s.detached(role)),
+            Some(Await::Turn) => true,
+            Some(Await::AssemblyWait) => self.waiting.complete(),
             Some(Await::Job(index)) => self.jobs[index]
                 .as_ref()
                 .is_some_and(|d| d.complete || d.error.is_some()),
@@ -2074,11 +2122,8 @@ impl RootSupervisor {
     }
 
     pub(super) fn serve_forever(mut self) -> ! {
-        if let Some(observer) = self.device_observer.as_ref() {
-            observer.fail("main device assembly failure");
-        }
-        if let Some(driver) = self.drivers.as_ref() {
-            driver.fault_seal();
+        if self.device_supervisor.is_some() {
+            self.device_failure("main device assembly failure");
         }
         self.failing = true;
         if !self.processes.is_empty() {

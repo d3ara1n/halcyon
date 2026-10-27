@@ -65,7 +65,6 @@ const ROLES: usize = DEVICES + BINDINGS + USES + WATCHES;
 const POLICY: binding_work::Policy = binding_work::Policy {
     prepare_ns: 5_000_000_000,
     stop_ns: 20_000_000_000,
-    retry_ns: 1_000_000,
 };
 pub(super) const TRANSPORT: Rights = Rights::from_raw(
     Rights::WRITE.raw()

@@ -88,19 +88,22 @@ pub enum Command<'a> {
         identity: &'a [u8],
         registrar: bool,
     },
-    /// 始终随附原 BindingUse，Stop 先于 Activate 到达时也能认证并观察原轮。
-    Stop { reference: BindingRef },
+    QueryActivationResult {
+        reference: BindingRef,
+    },
 }
 impl Command<'_> {
     pub fn op(self) -> u16 {
         match self {
             Self::Activate { .. } => 1,
-            Self::Stop { .. } => 2,
+            Self::QueryActivationResult { .. } => 2,
         }
     }
     pub fn reference(self) -> BindingRef {
         match self {
-            Self::Activate { reference, .. } | Self::Stop { reference } => reference,
+            Self::Activate { reference, .. } | Self::QueryActivationResult { reference } => {
+                reference
+            }
         }
     }
     pub fn handles(self) -> usize {
@@ -108,7 +111,8 @@ impl Command<'_> {
             Self::Activate {
                 registrar: true, ..
             } => 2,
-            _ => 1,
+            Self::Activate { .. } => 1,
+            Self::QueryActivationResult { .. } => 0,
         }
     }
     pub fn encode(self, deadline: Deadline, out: &mut [u8]) -> Result<usize, Error> {
@@ -159,7 +163,7 @@ impl Command<'_> {
                     registrar,
                 }
             }
-            2 => Command::Stop { reference },
+            2 => Command::QueryActivationResult { reference },
             _ => return Err(Error::Unsupported),
         };
         reader.finish()?;

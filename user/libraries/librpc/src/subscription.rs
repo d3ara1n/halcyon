@@ -55,7 +55,7 @@ pub enum Failure<S> {
 }
 
 /// 宿主把本任务与既有 Dispatcher 放在同一 Runtime；本类型不创建运行体。
-/// snapshot 暂存的序号在 actual state 重查完成后才可 acknowledge_read。
+/// snapshot 暂存的序号在消费者采用后才可 acknowledge_read；初始和 Ack 快照同样交付。
 pub struct ConsumerTask<P: Protocol> {
     control: Option<MailboxSender>,
     observer: Option<NotificationObserver>,
@@ -80,9 +80,9 @@ impl<P: Protocol> ConsumerTask<P> {
             control: Some(control),
             observer: Some(observer),
             source: SourceRegistration::new(),
-            phase: Phase::Listening,
+            phase: Phase::Reading(snapshot),
             deadline,
-            pending: P::observation(&snapshot).pending,
+            pending: false,
             stopping: false,
             failure: None,
             cycles: 0,
@@ -216,7 +216,9 @@ impl<P: Protocol> ConsumerTask<P> {
                             self.cycles = self.cycles.saturating_add(1);
                             let state = P::observation(&info);
                             self.pending = state.pending;
-                            self.phase = if state.terminal && !state.pending {
+                            self.phase = if state.pending {
+                                Phase::Reading(info)
+                            } else if state.terminal {
                                 Phase::Retiring
                             } else {
                                 Phase::Listening
@@ -337,7 +339,12 @@ impl<P: Protocol> ConsumerTask<P> {
     }
     /// 任务尚未准入时只关闭原角色，不发送 RPC，也不制造来源责任。
     pub fn abandon_unadmitted(&mut self) -> Result<(), SystemCallError> {
-        if !self.source.is_empty() || !matches!(self.phase, Phase::Listening | Phase::Retiring) {
+        if !self.source.is_empty()
+            || !matches!(
+                self.phase,
+                Phase::Reading(_) | Phase::Listening | Phase::Retiring
+            )
+        {
             return Err(SystemCallError::ObjectBusy);
         }
         self.stopping = true;

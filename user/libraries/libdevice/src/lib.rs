@@ -21,8 +21,6 @@ pub mod publication;
 pub mod registry;
 pub mod resource;
 pub mod startup;
-#[cfg(any(test, target_arch = "riscv64"))]
-mod timing;
 pub mod watch;
 
 /// 领域错误；运输层的 Unsent/Unknown 仍由 librpc 保持。

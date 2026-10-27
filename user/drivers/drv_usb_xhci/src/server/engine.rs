@@ -6,7 +6,6 @@ use libusb::xhci::{Controller, Progress};
 enum Call {
     Get(usize),
     Master(Deadline),
-    Query,
     Register(u64),
     Withdraw(u64),
 }
@@ -69,7 +68,7 @@ impl Engine {
         let target = world
             .slot
             .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
+            .and_then(|slot| slot.activation())
             .ok_or(Error::NotReady)?
             .usage()
             .unwrap_or_else(|e| fatal(e))
@@ -100,7 +99,7 @@ impl Engine {
         let reference = world
             .slot
             .as_ref()
-            .and_then(|s| s.activation.as_ref())
+            .and_then(|s| s.activation())
             .ok_or(Error::NotReady)?
             .reference();
         libkernel::debug!(
@@ -154,7 +153,7 @@ impl Engine {
                     world
                         .slot
                         .as_ref()
-                        .and_then(|slot| slot.activation.as_ref())
+                        .and_then(|slot| slot.activation())
                         .ok_or(Error::NotReady)?
                         .reference()
                         .device(),
@@ -163,6 +162,7 @@ impl Engine {
                 identity: libusb::descriptor::BOOT_KEYBOARD_IDENTITY,
                 limits: supply::LIMITS,
                 claimable: true,
+                stop_requirement: libdevice::binding::StopRequirement::ProviderOwned,
             }
         };
         let used = command.encode(deadline, &mut bytes)?;
@@ -178,7 +178,7 @@ impl Engine {
         let target = world
             .slot
             .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
+            .and_then(|slot| slot.activation())
             .and_then(|a| a.registrar())
             .ok_or(Error::Permission)?
             .clone();
@@ -243,6 +243,32 @@ impl Engine {
         requests: &mut Requests<'_, Family>,
         input: &mut Input<'_>,
     ) -> Result<Advance, SystemCallError> {
+        match self.drive(id, world, requests, input) {
+            Ok(advance) => Ok(advance),
+            Err(error) => {
+                let slot = world.slot.as_mut().unwrap_or_else(|| fatal(error));
+                if !matches!(
+                    slot.activation()
+                        .ok_or(Error::NotReady)
+                        .unwrap_or_else(|e| fatal(e))
+                        .snapshot()
+                        .phase,
+                    protocol::Phase::Starting | protocol::Phase::Ready
+                ) {
+                    fatal(error);
+                }
+                slot.fail(error).unwrap_or_else(|e| fatal(e));
+                Ok(step(Step::Runnable))
+            }
+        }
+    }
+    fn drive(
+        &mut self,
+        id: u64,
+        world: &mut World,
+        requests: &mut Requests<'_, Family>,
+        input: &mut Input<'_>,
+    ) -> Result<Advance, Error> {
         let mut irq_hint = false;
         while let Some(event) = input.pull() {
             if let Some(slot) = &mut world.slot {
@@ -257,27 +283,38 @@ impl Engine {
         {
             return Ok(step(Step::Runnable));
         }
+        if world.host.retire_sources(requests)? {
+            return Ok(step(Step::Runnable));
+        }
         let timed = input.take_timeout();
+        if world.slot.as_ref().is_none_or(|slot| !slot.io_ready()) {
+            return Ok(step(Step::Parked));
+        }
         if irq_hint && !timed {
             libkernel::debug!("xHCI IRQ source woke engine before timer");
         }
-        let Some(activation) = world
-            .slot
-            .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
-        else {
+        let Some(activation) = world.slot.as_ref().and_then(|slot| slot.activation()) else {
             return Ok(step(Step::Parked));
         };
-        let mut stopping = activation.snapshot().phase == protocol::Phase::Stopping;
+        let stopping = activation.snapshot().phase == protocol::Phase::Stopping;
         let running = world
             .host
             .controller
             .as_ref()
             .is_some_and(Controller::running);
-        let mut more =
-            Self::hardware(world, input.now_ns(), !stopping).unwrap_or_else(|e| fatal(e));
-        if running && (timed || self.next_poll == Deadline::INFINITE) {
-            self.next_poll = libkernel::time::timeout_millis(1)?;
+        let mut more = Self::hardware(world, input.now_ns(), !stopping)?;
+        if running {
+            let due = world
+                .host
+                .controller
+                .as_ref()
+                .and_then(|controller| controller.usb_deadline(input.now_ns()));
+            self.next_poll = due
+                .into_iter()
+                .chain(world.host.transfer_deadline())
+                .min()
+                .map_or(Deadline::INFINITE, Deadline::at);
+            more |= due.is_some_and(|at| at <= input.now_ns());
         }
         if let Some((tx, operation)) = self.pending {
             let Some(result) = world.rpc.take(tx) else {
@@ -286,7 +323,7 @@ impl Engine {
             self.pending = None;
             let mut reply = match result.result {
                 Ok(reply) => reply,
-                Err(mut error) if matches!(operation, Call::Master(_)) => {
+                Err(error) if matches!(operation, Call::Master(_)) => {
                     libkernel::debug!(
                         "xHCI EnableMaster reply failed: txid={}, phase={:?}, cause={:?}; original controller retained",
                         tx,
@@ -294,27 +331,22 @@ impl Engine {
                         error.cause
                     );
                     if error.phase != librpc::CallPhase::Sent {
-                        fatal(Error::Unavailable);
+                        return Err(Error::Unavailable);
                     }
                     let recoverable = matches!(
                         error.cause,
                         librpc::CallCause::ServiceClosed | librpc::CallCause::Timeout
                     );
-                    drop(error.take_unsent_request());
-                    error
-                        .retry_cleanup()
-                        .unwrap_or_else(|_| fatal(Error::Unavailable));
                     // 本次RPC注销后只复用原function及绝对期限；停止先到则沿原硬件清理，
                     // 不重新配置Controller、派生DMA域或以另一轮掩盖BME的未知效果。
                     if !stopping {
                         if !recoverable {
-                            fatal(Error::Unavailable);
+                            return Err(Error::Unavailable);
                         }
                         let Call::Master(deadline) = operation else {
                             unreachable!("Master failure lost original deadline");
                         };
-                        self.master(id, world, deadline)
-                            .unwrap_or_else(|e| fatal(e));
+                        self.master(id, world, deadline)?;
                     }
                     return Ok(step(if stopping {
                         Step::Runnable
@@ -324,76 +356,75 @@ impl Engine {
                 }
                 Err(_) => fatal(Error::Unavailable),
             };
+            if matches!(operation, Call::Master(_) | Call::Register(_)) {
+                let (header, body) = device::Header::decode(&reply.payload)?;
+                let expected = if matches!(operation, Call::Master(_)) {
+                    1
+                } else {
+                    3
+                };
+                if header.op != expected {
+                    return Err(Error::Invalid);
+                }
+                if header.error == Some(Error::Closed) {
+                    if !body.is_empty() || reply.handles.remaining() != 0 {
+                        return Err(Error::Invalid);
+                    }
+                    if let Call::Register(connection) = operation {
+                        let record = world
+                            .host
+                            .records
+                            .iter_mut()
+                            .find(|record| record.connection == connection)
+                            .ok_or(Error::NotFound)?;
+                        // 明确拒绝未发布登记，关闭本地出口；真实 USB 清理由原 Controller 继续持有。
+                        record.provider = None;
+                        record.withdrawn = true;
+                    }
+                    world.slot.as_mut().ok_or(Error::NotReady)?.stop()?;
+                    return Ok(step(Step::Runnable));
+                }
+            }
             match operation {
                 Call::Get(index) => {
-                    world
+                    match world
                         .host
                         .inputs
                         .as_mut()
                         .ok_or(SystemCallError::InternalError)?
                         .adopt(index, reply)
-                        .unwrap_or_else(|e| fatal(e));
-                    self.next_resource = index + 1;
+                    {
+                        Ok(()) => self.next_resource = index + 1,
+                        Err(Error::Closed) => {
+                            // 供应封新取得不表示硬件清理失败；原已取得输入仍交停止 owner。
+                            world.slot.as_mut().ok_or(Error::NotReady)?.stop()?;
+                            return Ok(step(Step::Runnable));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Call::Master(_) => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
+                    let (header, body) = device::Header::decode(&reply.payload)?;
                     if header.op != 1
                         || header.error.is_some()
                         || !body.is_empty()
                         || reply.handles.remaining() != 0
                     {
-                        fatal(header.error.unwrap_or(Error::Invalid));
+                        return Err(header.error.unwrap_or(Error::Invalid));
                     }
                     world
                         .host
                         .controller
                         .as_mut()
                         .ok_or(SystemCallError::InternalError)?
-                        .master_enabled()
-                        .unwrap_or_else(|e| fatal(e));
-                }
-                Call::Query => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
-                    if header.op != 8 || header.error.is_some() || reply.handles.remaining() != 0 {
-                        fatal(header.error.unwrap_or(Error::Invalid));
-                    }
-                    let snapshot = device::decode_snapshot(body).unwrap_or_else(|e| fatal(e));
-                    let activation = world
-                        .slot
-                        .as_mut()
-                        .and_then(|slot| slot.activation.as_mut())
-                        .ok_or(SystemCallError::InternalError)?;
-                    if snapshot.reference != activation.reference() {
-                        fatal(Error::StaleEpoch);
-                    }
-                    if snapshot.phase == libdevice::binding::Phase::Released
-                        && activation.snapshot().phase == protocol::Phase::Terminal
-                    {
-                        world
-                            .slot
-                            .as_mut()
-                            .ok_or(SystemCallError::InternalError)?
-                            .release(snapshot)
-                            .unwrap_or_else(|e| fatal(e));
-                    } else if matches!(
-                        snapshot.phase,
-                        libdevice::binding::Phase::Stopping | libdevice::binding::Phase::Released
-                    ) {
-                        activation.stop();
-                        world.changed()?;
-                        stopping = true;
-                    }
+                        .master_enabled()?;
                 }
                 Call::Register(connection) => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
+                    let (header, body) = device::Header::decode(&reply.payload)?;
                     if header.op != 3 || header.error.is_some() || reply.handles.remaining() != 1 {
-                        fatal(header.error.unwrap_or(Error::Invalid));
+                        return Err(header.error.unwrap_or(Error::Invalid));
                     }
-                    let device = DeviceId::decode(&mut librpc::bytes::Reader::new(body))
-                        .unwrap_or_else(|e| fatal(e));
+                    let device = DeviceId::decode(&mut librpc::bytes::Reader::new(body))?;
                     let record = world
                         .host
                         .records
@@ -415,14 +446,13 @@ impl Engine {
                     );
                 }
                 Call::Withdraw(connection) => {
-                    let (header, body) =
-                        device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
+                    let (header, body) = device::Header::decode(&reply.payload)?;
                     if header.op != 4
                         || header.error.is_some()
                         || !body.is_empty()
                         || reply.handles.remaining() != 0
                     {
-                        fatal(header.error.unwrap_or(Error::Invalid));
+                        return Err(header.error.unwrap_or(Error::Invalid));
                     }
                     let record = world
                         .host
@@ -437,19 +467,10 @@ impl Engine {
             }
         }
         if world.slot.as_ref().is_some_and(|slot| {
-            slot.activation
-                .as_ref()
+            slot.activation()
                 .is_some_and(|a| a.snapshot().phase == protocol::Phase::Terminal)
         }) {
-            if !world.slot.as_ref().is_some_and(ActivationSlot::active) {
-                self.next_poll = Deadline::INFINITE;
-                return Ok(step(Step::Parked));
-            }
-            if timed || self.next_poll == Deadline::INFINITE {
-                self.next_poll = libkernel::time::timeout_millis(1)?;
-                self.device(id, world, device::Command::QueryBinding, Call::Query)
-                    .unwrap_or_else(|e| fatal(e));
-            }
+            self.next_poll = Deadline::INFINITE;
             return Ok(step(Step::Parked));
         }
         if stopping {
@@ -460,8 +481,7 @@ impl Engine {
                 .find(|r| r.device.is_some() && !r.withdrawn)
                 .map(|r| r.connection)
             {
-                self.publication(id, world, connection, true)
-                    .unwrap_or_else(|e| fatal(e));
+                self.publication(id, world, connection, true)?;
                 return Ok(step(Step::Parked));
             }
             let provisions_open = world.host.has_open_provisions();
@@ -471,10 +491,9 @@ impl Engine {
                 }
                 // SAFETY: 同一owner已收完全部USB端点/slot/TD/command责任；中央软件壳仍可继续查询。
                 unsafe {
-                    controller.begin_stop().unwrap_or_else(|e| fatal(e));
+                    controller.begin_stop()?;
                 }
-                if controller.step(input.now_ns()).unwrap_or_else(|e| fatal(e)) != Progress::Closed
-                {
+                if controller.step(input.now_ns())? != Progress::Closed {
                     self.next_poll = libkernel::time::timeout_millis(1)?;
                     return Ok(step(Step::Parked));
                 }
@@ -490,21 +509,16 @@ impl Engine {
                 // SAFETY: HCH/残事件/逐页DMA DONE已成立；父PCI仍等原轮静止报告才撤MMIO。
                 if let Err((controller, error)) = unsafe { controller.unmap() } {
                     world.host.controller = Some(controller);
-                    fatal(error.into());
+                    return Err(error.into());
                 }
             }
             world.host.inputs = None;
-            let activation = world
-                .slot
-                .as_mut()
-                .and_then(|slot| slot.activation.as_mut())
-                .ok_or(SystemCallError::InternalError)?;
+            let slot = world.slot.as_mut().ok_or(SystemCallError::InternalError)?;
             // SAFETY: 本轮硬件/USB子清理均结束，入口只保留迟到拒绝/既有软件结果。
             unsafe {
-                activation.consumer_stopped().unwrap_or_else(|e| fatal(e));
+                slot.consumer_stopped()?;
             }
-            activation.terminal(None);
-            world.changed()?;
+            slot.terminal(None)?;
             self.next_poll = Deadline::INFINITE;
             libkernel::debug!(
                 "xHCI consumer stopped: HCH, event drain, DMA DONE and register unmap confirmed"
@@ -520,21 +534,17 @@ impl Engine {
                     name: libpci::function::RESOURCES[index],
                 },
                 Call::Get(index),
-            )
-            .unwrap_or_else(|e| fatal(e));
+            )?;
             return Ok(step(Step::Parked));
         }
         if world.host.controller.is_none() {
-            world.host.controller = Some(
-                Controller::adopt(
-                    world
-                        .host
-                        .inputs
-                        .take()
-                        .ok_or(SystemCallError::InternalError)?,
-                )
-                .unwrap_or_else(|e| fatal(e)),
-            );
+            world.host.controller = Some(Controller::adopt(
+                world
+                    .host
+                    .inputs
+                    .take()
+                    .ok_or(SystemCallError::InternalError)?,
+            )?);
             libkernel::debug!("xHCI PCI resources acquired; registers mapped");
             return Ok(step(Step::Runnable));
         }
@@ -557,10 +567,9 @@ impl Engine {
         if self.source.is_installing() {
             return Ok(step(Step::Runnable));
         }
-        match controller.step(input.now_ns()).unwrap_or_else(|e| fatal(e)) {
+        match controller.step(input.now_ns())? {
             Progress::EnableMaster => {
-                self.master(id, world, operation_end()?)
-                    .unwrap_or_else(|e| fatal(e));
+                self.master(id, world, operation_end()?)?;
                 return Ok(step(Step::Parked));
             }
             Progress::Starting => {
@@ -568,15 +577,15 @@ impl Engine {
                 return Ok(step(Step::Parked));
             }
             Progress::Ready => {}
-            _ => fatal(Error::Invalid),
+            _ => return Err(Error::Invalid),
         }
         if !running {
-            more |= Self::hardware(world, input.now_ns(), true).unwrap_or_else(|e| fatal(e));
+            more |= Self::hardware(world, input.now_ns(), true)?;
         }
         if world
             .slot
             .as_ref()
-            .and_then(|slot| slot.activation.as_ref())
+            .and_then(|slot| slot.activation())
             .ok_or(SystemCallError::InternalError)?
             .snapshot()
             .phase
@@ -585,11 +594,8 @@ impl Engine {
             world
                 .slot
                 .as_mut()
-                .and_then(|slot| slot.activation.as_mut())
                 .ok_or(SystemCallError::InternalError)?
-                .ready()
-                .unwrap_or_else(|e| fatal(e));
-            world.changed()?;
+                .ready()?;
             libkernel::debug!(
                 "xHCI activation ready: controller running with coherent rings and INTx"
             );
@@ -603,16 +609,14 @@ impl Engine {
                     .controller
                     .as_ref()
                     .ok_or(SystemCallError::InternalError)?
-                    .connection_present(record.connection)
-                    .unwrap_or_else(|e| fatal(e))
+                    .connection_present(record.connection)?
             {
                 withdraw = Some(record.connection);
                 break;
             }
         }
         if let Some(connection) = withdraw {
-            self.publication(id, world, connection, true)
-                .unwrap_or_else(|e| fatal(e));
+            self.publication(id, world, connection, true)?;
             return Ok(step(Step::Parked));
         }
         let mut discovered = None;
@@ -623,7 +627,7 @@ impl Engine {
             .ok_or(SystemCallError::InternalError)?
             .interfaces()
         {
-            let interface = interface.unwrap_or_else(|e| fatal(e));
+            let interface = interface?;
             if interface.ready
                 && interface.present
                 && !world.host.records.iter().any(|r| {
@@ -635,20 +639,21 @@ impl Engine {
             }
         }
         if let Some(interface) = discovered {
-            world
-                .host
-                .discover(interface, &world.control.mailbox)
-                .unwrap_or_else(|e| fatal(e));
-            self.publication(id, world, interface.connection, false)
-                .unwrap_or_else(|e| fatal(e));
+            world.host.discover(interface, &world.control.mailbox)?;
+            self.publication(id, world, interface.connection, false)?;
             return Ok(step(Step::Parked));
         }
-        // 本轮始终有固定定时推进，不将业务重查时间反复后移；RPC完成亦会唤醒原任务。
-        if timed || self.next_poll == Deadline::INFINITE {
-            self.next_poll = libkernel::time::timeout_millis(1)?;
-            self.device(id, world, device::Command::QueryBinding, Call::Query)
-                .unwrap_or_else(|e| fatal(e));
-        }
+        let due = world
+            .host
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.usb_deadline(input.now_ns()));
+        self.next_poll = due
+            .into_iter()
+            .chain(world.host.transfer_deadline())
+            .min()
+            .map_or(Deadline::INFINITE, Deadline::at);
+        more |= due.is_some_and(|at| at <= input.now_ns());
         Ok(step(if more { Step::Runnable } else { Step::Parked }))
     }
 }

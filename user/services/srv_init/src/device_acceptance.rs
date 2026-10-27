@@ -2,7 +2,7 @@
 use super::*;
 use alloc::vec::Vec;
 use libkernel::ipc::message::Mailbox;
-use libkernel::ipc::{object, wait};
+use libkernel::ipc::object;
 pub(super) fn exercise(
     root: &mut RootSupervisor,
     job: Handle,
@@ -58,7 +58,7 @@ pub(super) fn exercise(
     if grants.len() != test_device::GRANTS {
         return Err("device client startup slot mismatch");
     }
-    let spawned = spawn(SpawnRequest {
+    let spawned = root.spawn_process(SpawnRequest {
         memory_pool: root_memory_pool(),
         parent: init_process_info(),
         job,
@@ -89,7 +89,7 @@ pub(super) fn exercise(
             "device client synchronous wait entered: pid={}, deadline={}",
             spawned.pid, deadline.at_ns
         );
-        wait::wait_until(spawned.control, ObjectSignals::DONE, deadline)
+        root.wait_until(spawned.control, ObjectSignals::DONE, deadline)
             .map_err(|_| "device client did not finish")?;
         let snapshot =
             process::query(spawned.control).map_err(|_| "device client status unavailable")?;
@@ -104,6 +104,7 @@ pub(super) fn exercise(
     let policy = if result.is_ok() {
         (|| {
             let reply = device::call(
+                root,
                 &source,
                 libdevice::protocol::Command::Enumerate {
                     scope: libdevice::registry::Scope::Root,
@@ -119,15 +120,18 @@ pub(super) fn exercise(
             let page = libdevice::protocol::decode_scan(body, 0, 0)
                 .map_err(|_| "Drivers policy scan invalid")?;
             let device = page.device.ok_or("Drivers policy live PCI host missing")?;
-            let result = root
+            let drivers = root
                 .drivers
-                .as_ref()
-                .ok_or("Drivers policy manager missing")?
-                .retry(
-                    device,
-                    libkernel::time::timeout_millis(5_000)
-                        .map_err(|_| "Drivers Retry deadline failed")?,
-                )?;
+                .take()
+                .ok_or("Drivers policy manager missing")?;
+            let result = drivers.retry(
+                root,
+                device,
+                libkernel::time::timeout_millis(5_000)
+                    .map_err(|_| "Drivers Retry deadline failed")?,
+            );
+            root.drivers = Some(drivers);
+            let result = result?;
             if result != Some(libdevice::Error::Busy) {
                 return Err("Drivers Retry reset an active binding");
             }
@@ -145,7 +149,7 @@ pub(super) fn exercise(
         Ok(())
     };
     // 同一原来源收束；客户端失败/Grant已消费不再另发来源替代。
-    let sealed = device::call(&admin, libdevice::protocol::Command::SealSource);
+    let sealed = device::call(root, &admin, libdevice::protocol::Command::SealSource);
     result?;
     sealed?;
     policy?;
@@ -158,95 +162,102 @@ pub(super) fn exercise(
             return Err("Drivers backlog message invalid");
         }
     }
-    root.drivers
-        .as_ref()
-        .ok_or("Drivers manager missing")?
-        .query()?;
+    let drivers = root.drivers.take().ok_or("Drivers manager missing")?;
+    let result = drivers.query(root);
+    root.drivers = Some(drivers);
+    result?;
     debug!("DEVICE Drivers Control query passed with unread Observer replies");
     Ok(backlog)
 }
 
 #[cfg(feature = "acceptance-device-reuse")]
 fn retry_terminal(
-    root: &RootSupervisor,
+    root: &mut RootSupervisor,
     source: &libkernel::ipc::message::MailboxSender,
 ) -> Result<(), &'static str> {
     use libdevice::{Error, protocol::Command, registry::Scope};
     let drivers = root
         .drivers
-        .as_ref()
+        .take()
         .ok_or("Drivers policy manager missing")?;
-    let end = libkernel::time::timeout_millis(30_000)
-        .map_err(|_| "Drivers Retry fixture deadline failed")?;
-    // 客户端已关闭旧功能/Watch并已收集；先观察原HID Pool委托真实返还，
-    // 不把allocated_pages=0或CPU DONE当作可再出生的额度。
-    loop {
-        let delegated = drivers.worker_delegation()?;
-        let unit = libdriver::boot::WORKER_POOL;
-        if delegated.pages == unit.pages * 2 && delegated.metadata == unit.metadata * 2 {
-            break;
+    let result = (|| {
+        let end = libkernel::time::timeout_millis(30_000)
+            .map_err(|_| "Drivers Retry fixture deadline failed")?;
+        // 客户端已关闭旧功能/Watch并已收集；先观察原HID Pool委托真实返还，
+        // 不把allocated_pages=0或CPU DONE当作可再出生的额度。
+        loop {
+            let delegated = drivers.worker_delegation()?;
+            let unit = libdriver::boot::WORKER_POOL;
+            if delegated.pages == unit.pages * 2 && delegated.metadata == unit.metadata * 2 {
+                break;
+            }
+            let now = libkernel::time::snapshot()
+                .map_err(|_| "Drivers Retry clock failed")?
+                .now_ns;
+            if now >= end.at_ns {
+                return Err("retired HID Pool delegation did not refund");
+            }
+            root.sleep_until(erhino_shared::time::Deadline::at(
+                end.at_ns.min(now.saturating_add(10_000_000)),
+            ))
+            .map_err(|_| "Drivers Retry refund wait failed")?;
         }
-        let now = libkernel::time::snapshot()
-            .map_err(|_| "Drivers Retry clock failed")?
-            .now_ns;
-        if now >= end.at_ns {
-            return Err("retired HID Pool delegation did not refund");
-        }
-        libkernel::time::sleep_until(erhino_shared::time::Deadline::at(
-            end.at_ns.min(now.saturating_add(10_000_000)),
-        ))
-        .map_err(|_| "Drivers Retry refund wait failed")?;
-    }
-    let mut selected = None;
-    let (mut after, mut scan_end) = (0, 0);
-    loop {
-        let reply = device::call_until(
-            source,
-            Command::Enumerate {
-                scope: Scope::Root,
-                after,
-                end: scan_end,
-            },
-            end,
-        )?;
-        let (header, body) = libdevice::protocol::Header::decode(&reply.payload)
-            .map_err(|_| "Drivers Retry page invalid")?;
-        if header.op != 14 || header.error.is_some() || reply.handles.remaining() != 0 {
-            return Err("Drivers Retry page rejected");
-        }
-        let page = libdevice::protocol::decode_scan(body, after, scan_end)
-            .map_err(|_| "Drivers Retry scan invalid")?;
-        after = page.next;
-        scan_end = page.end;
-        let Some(id) = page.device else { break };
-        let reply = device::call_until(source, Command::QueryDevice { id }, end)?;
-        let info =
-            match libdevice::protocol::decode_device(&reply.payload, id, reply.handles.remaining())
-            {
+        let mut selected = None;
+        let (mut after, mut scan_end) = (0, 0);
+        loop {
+            let reply = device::call_until(
+                root,
+                source,
+                Command::Enumerate {
+                    scope: Scope::Root,
+                    after,
+                    end: scan_end,
+                },
+                end,
+            )?;
+            let (header, body) = libdevice::protocol::Header::decode(&reply.payload)
+                .map_err(|_| "Drivers Retry page invalid")?;
+            if header.op != 14 || header.error.is_some() || reply.handles.remaining() != 0 {
+                return Err("Drivers Retry page rejected");
+            }
+            let page = libdevice::protocol::decode_scan(body, after, scan_end)
+                .map_err(|_| "Drivers Retry scan invalid")?;
+            after = page.next;
+            scan_end = page.end;
+            let Some(id) = page.device else { break };
+            let reply = device::call_until(root, source, Command::QueryDevice { id }, end)?;
+            let info = match libdevice::protocol::decode_device(
+                &reply.payload,
+                id,
+                reply.handles.remaining(),
+            ) {
                 Ok(info) => info,
                 Err(Error::StaleInstance | Error::NotFound) => continue,
                 Err(_) => return Err("Drivers Retry device query failed"),
             };
-        if info.present
-            && info.binding.is_none()
-            && info.identity == libusb::descriptor::BOOT_KEYBOARD_IDENTITY
-        {
-            selected = Some(id);
+            if info.present
+                && info.binding.is_none()
+                && info.identity == libusb::descriptor::BOOT_KEYBOARD_IDENTITY
+            {
+                selected = Some(id);
+            }
         }
-    }
-    let id = selected.ok_or("Drivers Retry terminal keyboard missing")?;
-    // 只发一次非幂等政策操作；Unknown不重发，取样本身也不保证后续Claim成功。
-    #[cfg(feature = "acceptance-device-retry-race")]
-    drivers.retry_concurrent(id, end)?;
-    #[cfg(not(feature = "acceptance-device-retry-race"))]
-    if drivers.retry(id, end)?.is_some() {
-        return Err("Drivers Retry rejected the released detached terminal selection");
-    }
-    debug!(
-        "DEVICE Drivers Control Retry reset terminal selection: serial={}",
-        id.serial()
-    );
-    Ok(())
+        let id = selected.ok_or("Drivers Retry terminal keyboard missing")?;
+        // 只发一次非幂等政策操作；Unknown不重发，取样本身也不保证后续Claim成功。
+        #[cfg(feature = "acceptance-device-retry-race")]
+        drivers.retry_concurrent(root, id, end)?;
+        #[cfg(not(feature = "acceptance-device-retry-race"))]
+        if drivers.retry(root, id, end)?.is_some() {
+            return Err("Drivers Retry rejected the released detached terminal selection");
+        }
+        debug!(
+            "DEVICE Drivers Control Retry reset terminal selection: serial={}",
+            id.serial()
+        );
+        Ok(())
+    })();
+    root.drivers = Some(drivers);
+    result
 }
 
 /// 此路线唯一外部客户端已经退出，物理Binding/进程/Job也已收集；核实际子Pool信用返还。

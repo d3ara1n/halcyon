@@ -5,18 +5,28 @@ use libusb::protocol::{self as usb, Command, Progress, Transfer};
 enum Call {
     Resource,
     Usb(Command),
-    Binding,
 }
 pub(super) struct Engine {
     instance: InstanceRef,
     pending: Option<(u64, Call)>,
     session: Option<Arc<MailboxSender>>,
     command: Command,
-    next_poll: Deadline,
+    lifecycle: Option<Box<libdriver::binding::BindingTask>>,
+    observed_sequence: u64,
+    completion: Option<libkernel::ipc::notification::NotificationPair>,
+    completion_source: SourceRegistration,
+    completion_pending: bool,
+    cancel_sent: bool,
 }
 impl Engine {
-    pub fn new(instance: InstanceRef) -> Self {
-        Self {
+    pub fn new(instance: InstanceRef) -> Result<Self, Error> {
+        let completion = libkernel::ipc::notification::create(
+            erhino_shared::object::Rights::READ | erhino_shared::object::Rights::WAIT,
+            erhino_shared::object::Rights::SIGNAL
+                | erhino_shared::object::Rights::DUPLICATE
+                | erhino_shared::object::Rights::TRANSIT,
+        )?;
+        Ok(Self {
             instance,
             pending: None,
             session: None,
@@ -24,25 +34,33 @@ impl Engine {
                 sequence: 1,
                 request: Transfer::BootProtocol,
             },
-            next_poll: Deadline::INFINITE,
-        }
+            lifecycle: Some(
+                Box::try_new(libdriver::binding::BindingTask::new())
+                    .map_err(|_| Error::Resource)?,
+            ),
+            observed_sequence: 0,
+            completion: Some(completion),
+            completion_source: SourceRegistration::new(),
+            completion_pending: false,
+            cancel_sent: false,
+        })
     }
     pub fn registered(&mut self, kind: u64, id: SourceId) {
+        if kind == 9 {
+            self.completion_source.registered(kind, id);
+        }
         let mut state = self.instance.borrow_mut();
         state.slot.registered(kind, id);
         state.keys.registered(kind, id);
     }
     pub fn unregistered(&mut self, id: SourceId) {
+        self.completion_source.unregistered(id);
         let mut state = self.instance.borrow_mut();
         state.slot.unregistered(id);
         state.keys.unregistered(id);
     }
     pub fn deadline(&self) -> Deadline {
-        if self.pending.is_some() {
-            Deadline::INFINITE
-        } else {
-            self.next_poll
-        }
+        Deadline::INFINITE
     }
     fn begin(
         &mut self,
@@ -54,12 +72,30 @@ impl Engine {
         call: Call,
     ) -> Result<(), Error> {
         let end = libkernel::time::timeout_millis(5_000)?;
+        let mut request = librpc::Request::new(kind, wire)?;
+        if let Call::Usb(command) = call
+            && command.handles() != 0
+        {
+            let rights = erhino_shared::object::Rights::SIGNAL;
+            let handle = object::duplicate(
+                self.completion
+                    .as_ref()
+                    .ok_or(Error::Closed)?
+                    .peer
+                    .as_handle(),
+                rights | erhino_shared::object::Rights::TRANSIT,
+            )?;
+            // SAFETY: 新 entry 的唯一关闭责任移入这次原 seq 请求。
+            request
+                .push(unsafe { Capability::from_raw(handle) }, rights)
+                .map_err(|failure| failure.error)?;
+        }
         let tx = world
             .rpc
             .begin_for(
                 ServiceOwner::Shared(target),
                 end,
-                librpc::Request::new(kind, wire)?,
+                request,
                 Some(id),
                 &world.funding,
             )
@@ -69,21 +105,18 @@ impl Engine {
         Ok(())
     }
     fn terminal(&mut self, state: &mut Instance, error: Option<Error>) -> Result<(), Error> {
-        let activation = state.slot.activation.as_mut().ok_or(Error::NotReady)?;
-        activation.stop();
+        state.slot.stop()?;
         if error.is_none() {
             // SAFETY: 仅由原seq明确Complete/Cancelled/Progress::Closed，或从未取得session的
             // 分支调用；HID无物理能力且不再提交USB访问。错误/Unknown不产生这个证明。
             unsafe {
-                activation.consumer_stopped()?;
+                state.slot.consumer_stopped()?;
             }
         }
-        activation.terminal(error);
+        state.slot.terminal(error)?;
         self.session = None;
         state.keys.state.disconnect()?;
         state.keys.changed()?;
-        state.slot.changed().unwrap_or_else(|e| fatal(e));
-        self.next_poll = Deadline::INFINITE;
         if let Some(error) = error {
             libkernel::debug!(
                 "HID interface failed: {:?}; original provider retains unsettled transfer responsibility",
@@ -106,7 +139,27 @@ impl Engine {
         let instance = self.instance.clone();
         let mut state = instance.borrow_mut();
         state.task = id;
+        if let Some(lifecycle) = self.lifecycle.take() {
+            requests
+                .spawn(TaskSubmission::new(
+                    Family::Binding(lifecycle, instance.clone()),
+                    1,
+                    world.instance_funding.clone(),
+                ))
+                .map_err(|_| SystemCallError::OutOfMemory)?;
+        }
+        let sequence = state
+            .slot
+            .activation()
+            .map_or(0, |activation| activation.snapshot().sequence);
+        if sequence != self.observed_sequence
+            && let Some(task) = state.slot.lifecycle_task()
+        {
+            self.observed_sequence = sequence;
+            requests.wake(task)?;
+        }
         while let Some(event) = input.pull() {
+            self.completion_pending |= event.kind == 9;
             state.slot.event(event);
             state.keys.event(event);
         }
@@ -115,16 +168,30 @@ impl Engine {
         if pending {
             return Ok(step(Step::Runnable));
         }
-        if state.slot.activation.is_some() && state.slot.tail_done() && state.keys.is_empty() {
+        if state
+            .slot
+            .activation()
+            .is_some_and(|activation| activation.snapshot().phase == protocol::Phase::Terminal)
+            || !state.slot.active()
+        {
+            self.completion_source.remove(requests)?;
+            if self.completion_source.is_empty() {
+                self.completion = None;
+            }
+        }
+        if state.slot.tail_done() && state.keys.is_empty() && self.completion_source.is_empty() {
             world
                 .instances
                 .retain(|entry| !Rc::ptr_eq(entry, &instance));
             return Ok(step(Step::Complete));
         }
-        let Some(activation) = state.slot.activation.as_ref() else {
+        if !state.slot.io_ready() {
+            return Ok(step(Step::Parked));
+        }
+        let Some(activation) = state.slot.activation() else {
             return Ok(step(Step::Parked));
         };
-        let mut stopping = activation.snapshot().phase == protocol::Phase::Stopping;
+        let stopping = activation.snapshot().phase == protocol::Phase::Stopping;
         if let Some((tx, call)) = self.pending {
             let Some(completion) = world.rpc.take(tx) else {
                 return Ok(step(Step::Parked));
@@ -132,9 +199,10 @@ impl Engine {
             self.pending = None;
             match completion.result {
                 Err(_) => {
-                    // 原USB seq未换轮；只读查询/运输Unknown仍回原会话，原父停止负责最终封口。
-                    self.next_poll = libkernel::time::timeout_millis(2)?;
-                    return Ok(step(Step::Parked));
+                    // Unknown 不合成安全完成；本地封口并交原 provider 停止 TD。
+                    self.terminal(&mut state, Some(Error::Unavailable))
+                        .unwrap_or_else(|error| fatal(error));
+                    return Ok(step(Step::Runnable));
                 }
                 Ok(mut reply) => match call {
                     Call::Resource => {
@@ -183,38 +251,6 @@ impl Engine {
                         );
                         libkernel::debug!("HID acquired restricted USB interface session");
                     }
-                    Call::Binding => {
-                        let (header, body) =
-                            device::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
-                        if header.op != 8
-                            || header.error.is_some()
-                            || reply.handles.remaining() != 0
-                        {
-                            fatal(header.error.unwrap_or(Error::Invalid));
-                        }
-                        let snapshot = device::decode_snapshot(body).unwrap_or_else(|e| fatal(e));
-                        let activation = state
-                            .slot
-                            .activation
-                            .as_mut()
-                            .ok_or(SystemCallError::InternalError)?;
-                        if snapshot.reference != activation.reference() {
-                            fatal(Error::StaleEpoch);
-                        }
-                        if snapshot.phase == libdevice::binding::Phase::Released
-                            && activation.snapshot().phase == protocol::Phase::Terminal
-                        {
-                            state.slot.release(snapshot).unwrap_or_else(|e| fatal(e));
-                        } else if matches!(
-                            snapshot.phase,
-                            libdevice::binding::Phase::Stopping
-                                | libdevice::binding::Phase::Released
-                        ) {
-                            activation.stop();
-                            state.slot.changed().unwrap_or_else(|e| fatal(e));
-                            stopping = true;
-                        }
-                    }
                     Call::Usb(command) => {
                         let (header, body) =
                             usb::Header::decode(&reply.payload).unwrap_or_else(|e| fatal(e));
@@ -248,14 +284,7 @@ impl Engine {
                                         fatal(Error::Invalid);
                                     }
                                     if !stopping {
-                                        state
-                                            .slot
-                                            .activation
-                                            .as_mut()
-                                            .ok_or(SystemCallError::InternalError)?
-                                            .ready()
-                                            .unwrap_or_else(|e| fatal(e));
-                                        state.slot.changed().unwrap_or_else(|e| fatal(e));
+                                        state.slot.ready().unwrap_or_else(|e| fatal(e));
                                         libkernel::debug!(
                                             "HID activation ready: boot protocol confirmed"
                                         );
@@ -278,6 +307,7 @@ impl Engine {
                                     self.terminal(&mut state, None).unwrap_or_else(|e| fatal(e));
                                     return Ok(step(Step::Runnable));
                                 }
+                                self.cancel_sent = false;
                                 self.command = Command::Transfer {
                                     sequence: command
                                         .sequence()
@@ -290,38 +320,13 @@ impl Engine {
                     }
                 },
             }
-            if !stopping {
-                self.next_poll = libkernel::time::timeout_millis(2)?;
-                return Ok(step(Step::Parked));
-            }
+            return Ok(step(Step::Runnable));
         }
         if state
             .slot
-            .activation
-            .as_ref()
+            .activation()
             .is_some_and(|a| a.snapshot().phase == protocol::Phase::Terminal)
         {
-            if !state.slot.active() {
-                self.next_poll = Deadline::INFINITE;
-                return Ok(step(Step::Parked));
-            }
-            if self.next_poll == Deadline::INFINITE || libkernel::time::expired(self.next_poll)? {
-                let usage = state
-                    .slot
-                    .activation
-                    .as_ref()
-                    .ok_or(SystemCallError::InternalError)?
-                    .usage()
-                    .unwrap_or_else(|e| fatal(e))
-                    .clone();
-                let mut wire = [0; device::HEADER_LEN];
-                let used = device::Command::QueryBinding
-                    .encode(operation_end()?, &mut wire)
-                    .unwrap_or_else(|e| fatal(e));
-                self.begin(id, world, usage, device::ID, &wire[..used], Call::Binding)
-                    .unwrap_or_else(|e| fatal(e));
-                self.next_poll = libkernel::time::timeout_millis(2)?;
-            }
             return Ok(step(Step::Parked));
         }
         if stopping && self.session.is_none() {
@@ -337,8 +342,7 @@ impl Engine {
             .unwrap_or_else(|e| fatal(e));
             let usage = state
                 .slot
-                .activation
-                .as_ref()
+                .activation()
                 .ok_or(SystemCallError::InternalError)?
                 .usage()
                 .unwrap_or_else(|e| fatal(e))
@@ -346,13 +350,48 @@ impl Engine {
             self.begin(id, world, usage, device::ID, &wire[..used], Call::Resource)
                 .unwrap_or_else(|e| fatal(e));
         } else {
-            let command = if stopping {
+            if self.completion_source.is_empty() {
+                self.completion_source.install(
+                    requests,
+                    SourcePlan::new(
+                        self.completion
+                            .as_ref()
+                            .ok_or(SystemCallError::ObjectClosed)?
+                            .owner
+                            .as_handle(),
+                        ObjectSignals::READABLE,
+                    ),
+                    9,
+                )?;
+                return Ok(step(Step::Runnable));
+            }
+            if self.completion_source.source().is_none() {
+                return Ok(step(Step::Runnable));
+            }
+            let command = if stopping && !self.cancel_sent {
+                self.cancel_sent = true;
                 Command::Cancel {
                     sequence: self.command.sequence(),
                 }
             } else {
                 self.command
             };
+            if matches!(command, Command::Query { .. }) {
+                if !self.completion_pending {
+                    return Ok(step(Step::Parked));
+                }
+                match self
+                    .completion
+                    .as_ref()
+                    .ok_or(SystemCallError::ObjectClosed)?
+                    .owner
+                    .take(u64::MAX)
+                {
+                    Ok(_) | Err(SystemCallError::ObjectNotAvailable) => {}
+                    Err(error) => return Err(error),
+                }
+                self.completion_pending = false;
+            }
             let mut wire = [0; usb::HEADER_LEN + 12];
             // Interrupt IN可持续NAK，RPC回复期限与该已提交TD的寿命分别建模。
             let end = if command.sequence() == 1 || stopping {
@@ -374,7 +413,6 @@ impl Engine {
             )
             .unwrap_or_else(|e| fatal(e));
         }
-        self.next_poll = libkernel::time::timeout_millis(2)?;
         Ok(step(Step::Parked))
     }
 }

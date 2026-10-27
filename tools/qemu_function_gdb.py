@@ -9,7 +9,6 @@ import subprocess
 import qemu_gdb as debug
 import qemu_irq_gdb as irq_probe
 import qemu_irq_idle_gdb as idle_probe
-import qemu_pci_poll_gdb as pci_probe
 
 
 def start(kernel, port, address_file, irq_target=None, irq_idle=False):
@@ -23,9 +22,6 @@ def start(kernel, port, address_file, irq_target=None, irq_idle=False):
         "irq_idle_requested": irq_idle,
     }
     evidence = logs / "evidence.json"
-    poll_code = ""
-    if irq_idle:
-        poll_code, facts["pci_query_probe"] = pci_probe.program()
     evidence.write_text(json.dumps(facts, indent=2) + "\n")
     symbols = debug.symbols(kernel)
     delivery = "<kernel::task::delivery::Delivery>::create"
@@ -101,7 +97,7 @@ class Select(gdb.Breakpoint):
             caps=u32(header,header_offsets['handle_count'])
             body=payload[48:]
             if kind==PROVISION:
-                if provider==pid and shape==2 and op==1 and error==0 and caps==0 and len(body)==16 and u64(body)==2 and u32(body,8)==2 and u32(body,12)==4:
+                if provider==pid and shape==2 and op in (1,4) and error==0 and caps==0 and len(body)==16 and u64(body)==2 and u32(body,8)==2 and u32(body,12)==4:
                     active[thread]={{'prepared':True,'pid':pid,'txid':txid}}
                     delivery_break.enabled=True
                 return False
@@ -192,7 +188,6 @@ delivery_break=Delivery({json.dumps("'"+delivery+"'")},type=gdb.BP_HARDWARE_BREA
 delivery_break.enabled=False
 {irq_probe.CODE if irq_target is not None else ""}
 {idle_probe.CODE if irq_idle else ""}
-{poll_code}
 try:
     while not complete:
         resumed=irq_idle_continue() if IRQ_IDLE_READY is not None else gdb.execute('continue',to_string=True)
@@ -205,7 +200,6 @@ try:
             irq_idle_pending=False
             irq_idle_snapshot()
             if failure is not None:raise gdb.GdbError(failure)
-            irq_poll_arm()
         elif not complete:raise gdb.GdbError('function session evidence incomplete')
 finally:
     if failure is not None:facts['probe_failure']=failure

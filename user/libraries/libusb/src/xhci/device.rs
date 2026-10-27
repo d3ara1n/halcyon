@@ -685,6 +685,46 @@ impl Device {
     }
 }
 impl Controller {
+    /// 稳态传输由 IRQ 驱动；只有枚举、端口复位和退休阶段保留有限推进。
+    pub fn usb_deadline(&self, now: u64) -> Option<u64> {
+        if self.scan_remaining != 0 && self.usb.iter().any(Option::is_none) {
+            return Some(now);
+        }
+        self.usb
+            .iter()
+            .flatten()
+            .filter_map(|device| {
+                let end = device.stop_end.unwrap_or(device.end);
+                match device.stage {
+                    Stage::Ready | Stage::Closed => None,
+                    Stage::WaitEnable
+                    | Stage::WaitAddress
+                    | Stage::WaitEvaluate
+                    | Stage::WaitConfigure
+                    | Stage::WaitStopEndpoint(_)
+                    | Stage::WaitRewind(_)
+                    | Stage::WaitDisable => Some(end),
+                    Stage::WaitDescriptor8
+                    | Stage::WaitDeviceDescriptor
+                    | Stage::WaitConfigHeader
+                    | Stage::WaitConfig
+                    | Stage::WaitSetConfig
+                    | Stage::WaitStoppedTransfer(_)
+                        if device
+                            .transfer
+                            .as_ref()
+                            .is_none_or(|transfer| transfer.result.is_none()) =>
+                    {
+                        Some(end)
+                    }
+                    Stage::WaitReset | Stage::Allocate(_) | Stage::Retire(_) => {
+                        Some(now.saturating_add(1_000_000).min(end))
+                    }
+                    _ => Some(now),
+                }
+            })
+            .min()
+    }
     /// 有限连接先同步停止意图；一次只推进一个物理动作，命令准入独立公平于忙等游标。
     pub fn usb_step(
         &mut self,
@@ -699,7 +739,14 @@ impl Controller {
         if self.phase != Phase::Ready {
             return Err(Error::NotReady);
         }
-        if allow_new && let Some(index) = self.usb.iter().position(Option::is_none) {
+        if !allow_new {
+            self.scan_remaining = 0;
+        }
+        if allow_new
+            && self.scan_remaining != 0
+            && let Some(index) = self.usb.iter().position(Option::is_none)
+        {
+            self.scan_remaining -= 1;
             self.scan_port = self.scan_port % self.ports + 1;
             if self.port(self.scan_port)? & 1 != 0
                 && !self.usb.iter().flatten().any(|d| d.port == self.scan_port)
@@ -762,6 +809,7 @@ impl Controller {
     }
     pub fn usb_event(&mut self, event: Event) -> Result<(), Error> {
         if let Event::Port(port) = event {
+            self.scan_remaining = self.ports;
             let value = self.port(port)?;
             // CSC可合并断开/重插；原连接已经被观察撤出后，不以当前CCS=1复活旧身份。
             if value & (1 << 17) != 0 {

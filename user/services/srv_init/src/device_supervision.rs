@@ -1,26 +1,26 @@
-//! init内固定两管理者的持续观察；原RootSupervisor账本不跨线程。
+//! root独占两管理者的DONE观察、正常停止事实与唯一故障终局。
+use super::supervisor::{Await, RootSupervisor};
 use alloc::{sync::Arc, vec::Vec};
-use core::mem;
 use erhino_shared::{
     call::SystemCallError,
     object::{Handle, ObjectSignals, Rights},
     proc::{ProcessSnapshot, ProcessState, TerminationCause, TerminationDetail},
     time::Deadline,
-    wait_set::{MemberRequest, ReadyRecord},
+};
+use libbudget::AccountView;
+use libexecution::{
+    ExecutionResource, Runtime, SourceRegistration, TaskSubmission,
+    assembly::Assembly,
+    runtime::{
+        Advance, Input, RequestFailure, Requests, SourceId, SourceKind, SourcePlan, Step, Task,
+    },
 };
 use libkernel::{
-    ipc::{
-        capability::Capability,
-        message::MailboxSender,
-        notification::{self, NotificationOwner, NotificationSignaler},
-        object, wait,
-        wait_set::WaitSet,
-    },
+    ipc::{capability::Capability, message::MailboxSender, object, wait, wait_set::WaitSet},
     process,
 };
 use libprocess::{JobCollector, JobCollectorEvent, SupervisionPolicy};
-use lock_api::Mutex;
-type Lock = erhino_shared::sync::spin::SimpleLock;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Manager {
     Device,
@@ -34,45 +34,9 @@ impl Manager {
         }
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Gate {
-    Running,
-    Stopping,
-    FailureTerminal,
-}
-struct Stopping {
-    deadline: Deadline,
-    source_closed: bool,
-}
 struct SourceAdmin {
-    entry: MailboxSender,
+    entry: Arc<MailboxSender>,
     server: u64,
-}
-enum Admin {
-    Absent,
-    Held(SourceAdmin),
-    Closing,
-    Released,
-}
-struct Record {
-    pid: u64,
-    control: Option<Capability>,
-    token: Option<u64>,
-    stopping: Option<Stopping>,
-    done: Option<ProcessSnapshot>,
-    admin: Admin,
-    disarm: bool,
-    retired: bool,
-}
-impl Record {
-    fn finished(&self) -> bool {
-        self.retired
-    }
-}
-struct Shared {
-    gate: Gate,
-    records: [Option<Record>; 2],
-    terminal: Option<Terminal>,
 }
 struct Terminal {
     job: Capability,
@@ -84,11 +48,6 @@ fn owned_alias(handle: Handle, rights: Rights) -> Result<Capability, SystemCallE
     let raw = object::duplicate(handle, rights)?;
     // SAFETY: duplicate创建的新entry关闭责任唯一交给本owner。
     Ok(unsafe { Capability::from_raw(raw) })
-}
-fn admin_alias(sender: &MailboxSender, server: u64) -> Result<SourceAdmin, SystemCallError> {
-    let cap = owned_alias(sender.as_handle(), Rights::WRITE | Rights::WAIT)?;
-    let (entry, _) = MailboxSender::from_capability(cap).map_err(|e| e.error)?;
-    Ok(SourceAdmin { entry, server })
 }
 impl Terminal {
     fn prepare(job: Handle, reset: Handle) -> Result<Self, SystemCallError> {
@@ -167,6 +126,7 @@ impl Terminal {
         let deadline = libkernel::time::timeout_millis(5_000).unwrap_or(Deadline::at(0));
         for admin in admins.iter().flatten() {
             let sealed = super::device::call_until(
+                &mut librpc::Caller::new(),
                 &admin.entry,
                 libdevice::protocol::Command::SealSource,
                 deadline,
@@ -284,535 +244,496 @@ impl Terminal {
         }
     }
 }
-fn terminal(shared: &Arc<Mutex<Lock, Shared>>, reason: &str) -> ! {
-    let (owner, admins) = {
-        let mut state = shared.lock();
-        state.gate = Gate::FailureTerminal;
-        let owner = state.terminal.take();
-        let admins = core::array::from_fn(|i| {
-            state.records[i].as_mut().and_then(|record| {
-                match mem::replace(&mut record.admin, Admin::Closing) {
-                    Admin::Held(admin) => Some(admin),
-                    other => {
-                        record.admin = other;
-                        None
-                    }
-                }
-            })
-        });
-        (owner, admins)
-    };
-    if let Some(owner) = owner {
-        owner.run(admins, reason)
-    }
-    // SAFETY: 终局authority已由另一线程接管；不发送第二次reset，也不提前杀死其整个进程。
-    // 此失败线程不再返回用户业务，其未析构cap由进程终局统一关闭。
-    unsafe { libkernel::thread::exit() }
+enum ProcessOwner {
+    Building(libprocess::PreparedProcess),
+    Running(Capability),
 }
-pub(super) struct Observer {
-    shared: Arc<Mutex<Lock, Shared>>,
-    set: Option<Arc<WaitSet>>,
-    changed: Option<NotificationSignaler>,
-    acknowledged: Option<NotificationOwner>,
-    thread: Option<libthread::ResultReceiver<(), libthread::NoEnvironment>>,
-}
-impl Observer {
-    pub fn prepare(job: Handle, reset: Handle) -> Result<Self, SystemCallError> {
-        let authority = Terminal::prepare(job, reset)?;
-        let shared = Arc::try_new(Mutex::new(Shared {
-            gate: Gate::Running,
-            records: [None, None],
-            terminal: Some(authority),
-        }))
-        .map_err(|_| SystemCallError::OutOfMemory)?;
-        let set = Arc::try_new(WaitSet::create(3)?).map_err(|_| SystemCallError::OutOfMemory)?;
-        let changed =
-            notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)?;
-        let ack =
-            notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)?;
-        let token = set.register(MemberRequest::new(
-            changed.owner.as_handle(),
-            ObjectSignals::READABLE,
-            0,
-        ))?;
-        let state = shared.clone();
-        let set_thread = set.clone();
-        // spawn为最后一个可失败准备动作；Err时没有观察用户代码执行，不遗留隐式监督线程。
-        let thread = libruntime::thread::Builder::new()
-            .spawn(move || observe(state, set_thread, changed.owner, token, ack.peer))?;
-        Ok(Self {
-            shared,
-            set: Some(set),
-            changed: Some(changed.peer),
-            acknowledged: Some(ack.owner),
-            thread: Some(thread),
-        })
+impl ProcessOwner {
+    fn control(&self) -> Handle {
+        match self {
+            Self::Building(prepared) => prepared.control(),
+            Self::Running(control) => control.as_handle(),
+        }
     }
-    pub fn register(
-        &self,
-        manager: Manager,
-        prepared: &libprocess::PreparedProcess,
-        admin: Option<(&MailboxSender, u64)>,
-    ) -> Result<(), &'static str> {
-        let control = owned_alias(prepared.control(), Rights::READ | Rights::WAIT)
-            .map_err(|_| "manager DONE authority preparation failed")?;
-        let handle = control.as_handle();
-        let admin = admin
-            .map(|(sender, server)| admin_alias(sender, server))
-            .transpose()
-            .map_err(|_| "manager source administration preparation failed")?
-            .map_or(Admin::Absent, Admin::Held);
-        {
-            let mut state = self.shared.lock();
-            if state.gate != Gate::Running || state.records[manager.index()].is_some() {
-                return Err("device assembly admission closed");
-            }
-            state.records[manager.index()] = Some(Record {
-                pid: prepared.pid(),
-                control: Some(control),
-                token: None,
-                stopping: None,
-                done: None,
-                admin,
-                disarm: false,
-                retired: false,
+}
+struct Record {
+    pid: u64,
+    process: Option<ProcessOwner>,
+    admin: Option<SourceAdmin>,
+    stopping: Option<Deadline>,
+    source_closed: bool,
+    done: Option<ProcessSnapshot>,
+    detach: bool,
+    detached: bool,
+}
+impl Record {
+    fn new() -> Self {
+        Self {
+            pid: 0,
+            process: None,
+            admin: None,
+            stopping: None,
+            source_closed: false,
+            done: None,
+            detach: false,
+            detached: false,
+        }
+    }
+    fn started(&self) -> bool {
+        matches!(self.process, Some(ProcessOwner::Running(_)))
+    }
+}
+struct World {
+    records: [Record; 2],
+    failure: Option<&'static str>,
+}
+struct ManagerTask {
+    role: Manager,
+    source: SourceRegistration,
+    ready: bool,
+    deadline: Deadline,
+}
+impl Task<World> for ManagerTask {
+    type Family = Self;
+    fn advance(
+        &mut self,
+        _id: u64,
+        world: &mut World,
+        requests: &mut Requests<'_, Self>,
+        input: &mut Input<'_>,
+        _budget: usize,
+    ) -> Result<Advance, SystemCallError> {
+        let record = &mut world.records[self.role.index()];
+        while let Some(event) = input.pull() {
+            self.ready |= event.observed.contains(ObjectSignals::DONE);
+        }
+        input.take_timeout();
+        self.deadline = record.stopping.unwrap_or(Deadline::INFINITE);
+        let Some(owner) = &mut record.process else {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Parked,
+            });
+        };
+        let control = owner.control();
+        if record.detach {
+            self.deadline = Deadline::INFINITE;
+            self.source.remove(requests)?;
+            record.detached = self.source.is_empty();
+            return Ok(Advance {
+                work_done: 1,
+                step: if record.detached {
+                    Step::Complete
+                } else {
+                    Step::Runnable
+                },
             });
         }
-        // 记录先接管cap，注册不持gate锁；Building立即终止也只会留下持续DONE电平。
-        let token = self
-            .set
-            .as_ref()
-            .ok_or("device observation set unavailable")?
-            .register(MemberRequest::new(
-                handle,
-                ObjectSignals::DONE,
-                manager.index() as u64 + 1,
-            ))
-            .map_err(|_| "manager DONE registration failed")?;
-        let mut state = self.shared.lock();
-        let record = state.records[manager.index()]
-            .as_mut()
-            .ok_or("manager observation record missing")?;
-        record.token = Some(token);
-        if state.gate == Gate::FailureTerminal {
-            return Err("device assembly failed during registration");
+        if self.source.is_empty() {
+            self.source
+                .install(requests, SourcePlan::new(control, ObjectSignals::DONE), 1)?;
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
         }
-        drop(state);
-        libkernel::debug!(
-            "device observer admitted before Start: role={:?}, pid={}, token={}",
-            manager,
-            prepared.pid(),
-            token
-        );
-        self.signal()
-    }
-    pub fn attach_admin(
-        &self,
-        manager: Manager,
-        sender: &MailboxSender,
-        server: u64,
-    ) -> Result<(), &'static str> {
-        let admin = admin_alias(sender, server)
-            .map_err(|_| "manager source observation authority failed")?;
-        let mut state = self.shared.lock();
-        if state.gate == Gate::FailureTerminal {
-            return Err("device assembly already failed");
+        if self.source.is_installing() {
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
         }
-        let record = state.records[manager.index()]
-            .as_mut()
-            .ok_or("manager observation record missing")?;
-        if !matches!(record.admin, Admin::Absent) {
-            return Err("manager source administration already installed");
-        }
-        record.admin = Admin::Held(admin);
-        drop(state);
-        self.signal()
-    }
-    fn signal(&self) -> Result<(), &'static str> {
-        match self.changed.as_ref() {
-            Some(changed) => changed
-                .signal(1)
-                .map_err(|_| "device observation notification failed"),
-            None => Ok(()),
-        }
-    }
-    pub fn stopping(
-        &mut self,
-        manager: Manager,
-        deadline: Deadline,
-    ) -> Result<Deadline, &'static str> {
-        let mut state = self.shared.lock();
-        if state.gate == Gate::FailureTerminal {
-            return Err("device assembly already failed");
-        }
-        state.gate = Gate::Stopping;
-        let record = state.records[manager.index()]
-            .as_mut()
-            .ok_or("manager observation record missing")?;
-        let end = record
-            .stopping
-            .get_or_insert(Stopping {
-                deadline,
-                source_closed: false,
-            })
-            .deadline;
-        // 全部manager已发布后封正常新装配；观察线程最终唯一关闭WaitSet。
-        self.set = None;
-        drop(state);
-        libkernel::debug!(
-            "device observer normal stop intent: role={:?}, deadline={}",
-            manager,
-            end.at_ns
-        );
-        self.signal()?;
-        Ok(end)
-    }
-    pub fn source_closed(&self, manager: Manager) -> Result<(), &'static str> {
-        let mut state = self.shared.lock();
-        let record = state.records[manager.index()]
-            .as_mut()
-            .ok_or("manager observation record missing")?;
-        record
-            .stopping
-            .as_mut()
-            .ok_or("manager stop intent missing")?
-            .source_closed = true;
-        drop(state);
-        self.signal()
-    }
-    fn await_state(
-        &self,
-        manager: Manager,
-        deadline: Deadline,
-        predicate: fn(&Record) -> bool,
-    ) -> Result<(), &'static str> {
-        let acknowledged = self
-            .acknowledged
-            .as_ref()
-            .ok_or("device observer already joined")?;
-        loop {
-            match acknowledged.take(u64::MAX) {
-                Ok(_) | Err(SystemCallError::ObjectNotAvailable) => {}
-                Err(_) => return Err("device observation acknowledgement failed"),
-            }
-            {
-                let state = self.shared.lock();
-                if state.gate == Gate::FailureTerminal {
-                    return Err("device assembly already failed");
-                }
-                if state.records[manager.index()]
-                    .as_ref()
-                    .is_some_and(predicate)
-                {
-                    return Ok(());
-                }
-            }
-            let result =
-                wait::wait_until(acknowledged.as_handle(), ObjectSignals::READABLE, deadline)
-                    .map_err(|_| "device observation acknowledgement wait failed")?;
-            if !result.observed.contains(ObjectSignals::READABLE) {
-                return Err("device observation handover timed out");
-            }
-        }
-    }
-    pub fn release_admin(&self, manager: Manager, deadline: Deadline) -> Result<(), &'static str> {
-        self.signal()?;
-        self.await_state(manager, deadline, |record| {
-            matches!(record.admin, Admin::Released)
-        })
-    }
-    pub fn disarm(&self, manager: Manager, deadline: Deadline) -> Result<(), &'static str> {
-        let mut state = self.shared.lock();
-        let record = state.records[manager.index()]
-            .as_mut()
-            .ok_or("manager observation record missing")?;
-        record.disarm = true;
-        drop(state);
-        self.signal()?;
-        self.await_state(manager, deadline, Record::finished)
-    }
-    pub fn join(&mut self) -> Result<(), &'static str> {
-        let thread = self.thread.take().ok_or("device observer already joined")?;
-        match thread.join() {
-            libthread::ThreadOutcome::Returned {
-                value: (),
-                leave: Ok(()),
-            } => {}
-            _ => return Err("device observer did not finish normally"),
-        }
-        self.changed = None;
-        self.acknowledged = None;
-        // 本程序此点的其他派生线程均已join；main自身的原entry记录仍Live。
-        // 不能仅用join的一次reap把Busy栈或Control尾部写成已经返还。
-        let deadline = libkernel::time::timeout_millis(5_000)
-            .map_err(|_| "device observer retirement clock failed")?;
-        while libruntime::thread::retained_records() != 1 {
-            let count = libruntime::thread::retained_records();
-            if matches!(
-                libruntime::thread::reap(count),
-                libthread::ReapProgress::Failed(_)
-            ) {
-                return Err("device observer thread registry failed");
-            }
-            if libkernel::time::expired(deadline)
-                .map_err(|_| "device observer retirement clock failed")?
-            {
-                return Err("device observer thread records remain retained");
-            }
-            libkernel::thread::yield_now()
-                .map_err(|_| "device observer retirement yield failed")?;
-        }
-        libkernel::debug!(
-            "device observer normal retirement: manager sources/capabilities closed; thread registry retains main only"
-        );
-        Ok(())
-    }
-    pub fn fail(&self, reason: &str) -> ! {
-        let _ = self.signal();
-        terminal(&self.shared, reason)
-    }
-}
-fn observe(
-    shared: Arc<Mutex<Lock, Shared>>,
-    set: Arc<WaitSet>,
-    changed: NotificationOwner,
-    change_token: u64,
-    ack: NotificationSignaler,
-) {
-    let result = observe_inner(&shared, &set, &changed, &ack, change_token);
-    if let Err(reason) = result {
-        terminal(&shared, reason);
-    }
-    if set.remove(change_token).is_err() {
-        terminal(&shared, "device observer control removal failed");
-    }
-    drop(changed);
-    match Arc::try_unwrap(set) {
-        Ok(set) => {
-            if let Err((_set, _)) = set.close() {
-                terminal(&shared, "device observer WaitSet close failed");
-            }
-        }
-        Err(_) => terminal(
-            &shared,
-            "device observer WaitSet remains shared after disarm",
-        ),
-    }
-}
-fn observe_inner(
-    shared: &Arc<Mutex<Lock, Shared>>,
-    set: &WaitSet,
-    changed: &NotificationOwner,
-    ack: &NotificationSignaler,
-    change_token: u64,
-) -> Result<(), &'static str> {
-    let mut records = [ReadyRecord {
-        token: 0,
-        cookie: 0,
-        observed: ObjectSignals::NONE,
-        reason: 0,
-        reserved: 0,
-    }; 3];
-    loop {
-        if shared.lock().gate == Gate::FailureTerminal {
-            terminal(shared, "concurrent device failure");
-        }
-        let count = set
-            .receive_into(&mut records)
-            .map_err(|_| "device observer Receive failed")?;
-        for event in &records[..count] {
-            if event.cookie == 0 {
-                if event.token != change_token {
-                    return Err("device observer control identity invalid");
-                }
-                match changed.take(u64::MAX) {
-                    Ok(_) | Err(SystemCallError::ObjectNotAvailable) => {}
-                    Err(_) => return Err("device observer control consume failed"),
-                }
-                continue;
-            }
-            let index =
-                usize::try_from(event.cookie - 1).map_err(|_| "device observer cookie invalid")?;
-            if index >= 2 {
-                return Err("device observer cookie invalid");
-            }
-            let action = {
-                let mut state = shared.lock();
-                let record = state.records[index]
-                    .as_mut()
-                    .ok_or("device observer event has no owner")?;
-                if record.token.is_none() {
-                    continue;
-                }
-                if record.token != Some(event.token)
-                    || !event.observed.contains(ObjectSignals::DONE)
-                {
-                    return Err("device observer DONE identity invalid");
-                }
-                (
-                    record
-                        .control
-                        .take()
-                        .ok_or("manager observation authority missing")?,
-                    record.stopping.is_some(),
-                    record.pid,
-                )
-            };
-            let (control, expected, pid) = action;
-            let snapshot =
-                process::query(control.as_handle()).map_err(|_| "manager DONE query failed")?;
+        if let ProcessOwner::Building(prepared) = owner {
             libkernel::debug!(
-                "device observer manager DONE: pid={}, cause={}, detail={:?}",
-                pid,
+                "device observer admitted before Start: role={:?}, pid={}, token={}",
+                self.role,
+                record.pid,
+                self.source
+                    .source()
+                    .expect("manager source attached")
+                    .token()
+            );
+            let spawned = prepared.try_start()?;
+            // SAFETY: Start成功消费builder，原Control关闭责任唯一从prepared移入记录。
+            *owner = ProcessOwner::Running(unsafe { Capability::from_raw(spawned.control) });
+            return Ok(Advance {
+                work_done: 1,
+                step: Step::Runnable,
+            });
+        }
+        let expired = record
+            .stopping
+            .is_some_and(|end| input.now_ns() >= end.at_ns);
+        if expired && record.done.is_none() {
+            self.ready |= wait::probe(control, ObjectSignals::DONE)?.contains(ObjectSignals::DONE);
+        }
+        if self.ready && record.done.is_none() {
+            let snapshot = process::query(control)?;
+            libkernel::debug!(
+                "device observer manager DONE: pid={}, role={:?}, state={}, cause={}, detail={:?}",
+                record.pid,
+                self.role,
+                snapshot.state,
                 snapshot.cause,
                 snapshot.detail
             );
-            if snapshot.state != ProcessState::Dead as u32
-                || !expected
+            record.done = Some(snapshot);
+            if record.stopping.is_none()
+                || snapshot.pid != record.pid
+                || snapshot.state != ProcessState::Dead as u32
                 || snapshot.cause != TerminationCause::Completed as u32
                 || snapshot.detail != TerminationDetail::NONE
             {
-                return Err("device manager terminated unexpectedly");
-            }
-            // DONE已认证且不可能复活，先移除持续电平；保留Control与快照等待同次SourceClosed证明。
-            set.remove(event.token)
-                .map_err(|_| "manager DONE source removal failed")?;
-            let mut state = shared.lock();
-            let record = state.records[index]
-                .as_mut()
-                .ok_or("manager DONE owner missing")?;
-            record.control = Some(control);
-            record.token = None;
-            record.done = Some(snapshot);
-        }
-        for index in 0..2 {
-            let admin = {
-                let mut state = shared.lock();
-                state.records[index].as_mut().and_then(|record| {
-                    if record.stopping.as_ref().is_some_and(|s| s.source_closed) {
-                        match mem::replace(&mut record.admin, Admin::Closing) {
-                            Admin::Held(admin) => Some(admin),
-                            other => {
-                                record.admin = other;
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                })
-            };
-            if let Some(admin) = admin {
-                admin
-                    .entry
-                    .into_capability()
-                    .close()
-                    .map_err(|_| "manager source administration close failed")?;
-                shared.lock().records[index]
-                    .as_mut()
-                    .ok_or("manager source owner missing")?
-                    .admin = Admin::Released;
-                libkernel::debug!(
-                    "device observer source administration closed: role={}",
-                    index
-                );
-                ack.signal(1)
-                    .map_err(|_| "device observer acknowledgement signal failed")?;
-            }
-            let control = {
-                let mut state = shared.lock();
-                state.records[index].as_mut().and_then(|record| {
-                    if record.disarm
-                        && record.done.is_some()
-                        && record.stopping.as_ref().is_some_and(|s| s.source_closed)
-                        && matches!(record.admin, Admin::Released)
-                    {
-                        record.control.take()
-                    } else {
-                        None
-                    }
-                })
-            };
-            if let Some(control) = control {
-                control
-                    .close()
-                    .map_err(|_| "manager observation control close failed")?;
-                shared.lock().records[index]
-                    .as_mut()
-                    .ok_or("manager close owner missing")?
-                    .retired = true;
-                libkernel::debug!("device observer normal disarm complete: role={}", index);
-                ack.signal(1)
-                    .map_err(|_| "device observer acknowledgement signal failed")?;
+                world.failure = Some("device manager exited outside normal completion");
             }
         }
-        let now = libkernel::time::snapshot()
-            .map_err(|_| "device observer clock failed")?
-            .now_ns;
-        let deadline = {
-            let state = shared.lock();
-            if state
-                .records
-                .iter()
-                .all(|record| record.as_ref().is_some_and(Record::finished))
-            {
-                return Ok(());
-            }
-            let mut end = None;
-            for record in state.records.iter().flatten() {
-                if !record.finished()
-                    && let Some(stopping) = &record.stopping
-                {
-                    if now >= stopping.deadline.at_ns {
-                        return Err("device manager normal stop evidence timed out");
-                    }
-                    end = Some(end.map_or(stopping.deadline.at_ns, |old: u64| {
-                        old.min(stopping.deadline.at_ns)
-                    }));
-                }
-            }
-            end.map_or(Deadline::INFINITE, Deadline::at)
-        };
-        set.wait(deadline)
-            .map_err(|_| "device observer wait failed")?;
+        if expired && !(record.done.is_some() && record.source_closed) {
+            world.failure = Some("device manager normal stop deadline expired");
+        }
+        if record.done.is_some() && record.source_closed {
+            self.deadline = Deadline::INFINITE;
+        }
+        Ok(Advance {
+            work_done: 1,
+            step: Step::Parked,
+        })
+    }
+    fn registered(&mut self, _world: &mut World, kind: SourceKind, source: SourceId) {
+        self.source.registered(kind, source);
+    }
+    fn unregistered(&mut self, _world: &mut World, _kind: SourceKind, source: SourceId) {
+        self.source.unregistered(source);
+    }
+    fn refused(&mut self, world: &mut World, failure: RequestFailure<Self>) {
+        if let RequestFailure::Source { kind, .. } = failure {
+            self.source.refused(kind);
+            world.failure = Some("manager observation registration failed");
+        }
+    }
+    fn stop(&mut self, world: &mut World) {
+        world.failure = Some("manager supervision stopped unexpectedly");
+    }
+    fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+}
+pub(super) struct Supervisor {
+    runtime: Runtime<ManagerTask, WaitSet>,
+    world: World,
+    tasks: [u64; 2],
+    terminal: Option<Terminal>,
+}
+impl Supervisor {
+    #[expect(
+        clippy::result_large_err,
+        reason = "关闭失败原样返还唯一owner，错误路径不分配"
+    )]
+    fn close(self) -> Result<(), (Self, SystemCallError)> {
+        let Self {
+            runtime,
+            world,
+            tasks,
+            terminal,
+        } = self;
+        runtime.close().map_err(|(runtime, error)| {
+            (
+                Self {
+                    runtime,
+                    world,
+                    tasks,
+                    terminal,
+                },
+                error,
+            )
+        })
+    }
+    pub(super) fn prepare(
+        assembly: &Assembly<WaitSet>,
+        funding: AccountView<ExecutionResource>,
+        job: Handle,
+        reset: Handle,
+    ) -> Result<Self, SystemCallError> {
+        let terminal = Terminal::prepare(job, reset)?;
+        let mut runtime = Runtime::new(assembly.bind()?, 2, 2, &funding)?;
+        let mut tasks = [0; 2];
+        for role in [Manager::Device, Manager::Driver] {
+            tasks[role.index()] = runtime
+                .spawn(TaskSubmission::new(
+                    ManagerTask {
+                        role,
+                        source: SourceRegistration::new(),
+                        ready: false,
+                        deadline: Deadline::INFINITE,
+                    },
+                    1,
+                    funding.clone(),
+                ))
+                .map_err(|failure| failure.error)?;
+        }
+        Ok(Self {
+            runtime,
+            world: World {
+                records: core::array::from_fn(|_| Record::new()),
+                failure: None,
+            },
+            tasks,
+            terminal: Some(terminal),
+        })
+    }
+    pub(super) fn feed(&mut self, record: erhino_shared::wait_set::ReadyRecord) {
+        self.runtime.feed(record);
+    }
+    pub(super) fn step(&mut self) -> Result<(), SystemCallError> {
+        if self.runtime.drive_state() != libexecution::runtime::DriveState::Drained {
+            self.runtime
+                .turn(&mut self.world, 2)
+                .map_err(|failure| failure.error)?;
+        }
+        Ok(())
+    }
+    pub(super) fn state(&self) -> libexecution::runtime::DriveState {
+        self.runtime.drive_state()
+    }
+    pub(super) fn failure(&self) -> Option<&'static str> {
+        self.world.failure
+    }
+    pub(super) fn started(&self, role: Manager) -> bool {
+        self.world.records[role.index()].started()
+    }
+    pub(super) fn detached(&self, role: Manager) -> bool {
+        self.world.records[role.index()].detached
+    }
+    pub(super) fn done(&self, role: Manager) -> bool {
+        self.world.records[role.index()].done.is_some()
+    }
+    fn wake(&mut self, role: Manager) -> Result<(), SystemCallError> {
+        self.runtime.wake(self.tasks[role.index()])
+    }
+    fn terminal(&mut self, reason: &str) -> ! {
+        let terminal = self.terminal.take().expect("root has one terminal owner");
+        let admins = core::array::from_fn(|index| self.world.records[index].admin.take());
+        terminal.run(admins, reason)
     }
 }
 
-impl super::RootSupervisor {
+impl RootSupervisor {
+    pub(super) fn finish_device_supervision(&mut self) -> Result<(), &'static str> {
+        let supervisor = self
+            .device_supervisor
+            .take()
+            .ok_or("manager supervision missing")?;
+        if !supervisor
+            .world
+            .records
+            .iter()
+            .all(|record| record.detached && record.process.is_none() && record.admin.is_none())
+        {
+            self.device_supervisor = Some(supervisor);
+            return Err("manager responsibilities remain owned");
+        }
+        if let Err((supervisor, _)) = supervisor.close() {
+            self.device_supervisor = Some(supervisor);
+            return Err("manager supervision retirement failed");
+        }
+        libkernel::debug!(
+            "device supervision retired: sources detached, managers collected, no observer thread"
+        );
+        Ok(())
+    }
     pub(super) fn begin_device_supervision(
         &mut self,
         services: Handle,
     ) -> Result<(), &'static str> {
-        if self.device_observer.is_some() {
-            return Err("device observation already prepared");
-        }
         let reset = self
             .reset_authority()
             .ok_or("device reset authority missing")?;
-        match Observer::prepare(services, reset) {
-            Ok(observer) => {
-                self.device_observer = Some(observer);
-                Ok(())
+        let funding = super::supervisor::prepare_funding::<ManagerTask>(&mut None, 2, 2)
+            .map_err(|_| "manager supervision funding failed")?;
+        self.device_supervisor = Some(
+            Supervisor::prepare(&self.assembly, funding, services, reset)
+                .map_err(|_| "manager supervision preparation failed")?,
+        );
+        Ok(())
+    }
+    pub(super) fn device_failure(&mut self, reason: &str) -> ! {
+        if let Some(supervisor) = &mut self.device_supervisor {
+            supervisor.terminal(reason);
+        }
+        // SAFETY: 尚未发布管理者；init整体退出交boot监督，不在缺失终局owner时继续装配。
+        unsafe { libkernel::sys_process_abort() }
+    }
+    pub(super) fn attach_manager_source(
+        &mut self,
+        role: Manager,
+        entry: MailboxSender,
+        server: u64,
+    ) -> Result<(), &'static str> {
+        let record = &mut self
+            .device_supervisor
+            .as_mut()
+            .ok_or("manager supervision missing")?
+            .world
+            .records[role.index()];
+        if record.admin.is_some() {
+            return Err("manager source already installed");
+        }
+        record.admin = Some(SourceAdmin {
+            entry: Arc::try_new(entry).map_err(|_| "manager source storage failed")?,
+            server,
+        });
+        Ok(())
+    }
+    pub(super) fn manager_source_call(
+        &mut self,
+        role: Manager,
+        command: libdevice::protocol::Command<'_>,
+        end: Deadline,
+    ) -> Result<librpc::Reply, &'static str> {
+        let record = &self
+            .device_supervisor
+            .as_ref()
+            .ok_or("manager supervision missing")?
+            .world
+            .records[role.index()];
+        let admin = record.admin.as_ref().ok_or("manager source missing")?;
+        let entry = admin.entry.clone();
+        let server = admin.server;
+        let reply = super::device::call_until(self, &entry, command, end)?;
+        if reply.sender_pid != server {
+            return Err("manager source response identity mismatch");
+        }
+        Ok(reply)
+    }
+    pub(super) fn start_manager(
+        &mut self,
+        role: Manager,
+        prepared: libprocess::PreparedProcess,
+    ) -> Result<libprocess::Spawned, &'static str> {
+        let supervisor = self
+            .device_supervisor
+            .as_mut()
+            .ok_or("manager supervision missing")?;
+        let record = &mut supervisor.world.records[role.index()];
+        if record.process.is_some() || record.pid != 0 {
+            return Err("manager already started");
+        }
+        record.pid = prepared.pid();
+        record.process = Some(ProcessOwner::Building(prepared));
+        supervisor
+            .wake(role)
+            .map_err(|_| "manager preparation wake failed")?;
+        loop {
+            if self
+                .turn_and_wait(Some(Await::ManagerStarted(role)))
+                .is_err()
+            {
+                self.device_failure("manager start infrastructure failed");
             }
-            Err(error) => {
-                // prepare的线程spawn是最后一个可失败动作；此处尚无管理者Start或并行终局owner。
-                libkernel::debug!(
-                    "device observation preparation failed: {:?}; cold reboot required",
-                    error
-                );
-                let _ = process::seal_job(services);
-                match libkernel::system::reset(
-                    reset,
-                    erhino_shared::reset::ResetAction::Reboot,
-                    erhino_shared::reset::ResetReason::SystemFailure,
-                ) {
-                    Ok(never) => match never {},
-                    Err(error) => {
-                        libkernel::debug!("device observation early reboot rejected: {:?}", error);
-                        unsafe { libkernel::sys_process_abort() }
-                    }
-                }
+            let record = &self
+                .device_supervisor
+                .as_ref()
+                .expect("supervisor remains owned")
+                .world
+                .records[role.index()];
+            if record.started() {
+                return Ok(libprocess::Spawned {
+                    pid: record.pid,
+                    control: record
+                        .process
+                        .as_ref()
+                        .expect("running owner present")
+                        .control(),
+                });
             }
         }
+    }
+    pub(super) fn manager_stopping(
+        &mut self,
+        role: Manager,
+        end: Deadline,
+    ) -> Result<Deadline, &'static str> {
+        let supervisor = self
+            .device_supervisor
+            .as_mut()
+            .ok_or("manager supervision missing")?;
+        let record = &mut supervisor.world.records[role.index()];
+        let end = *record.stopping.get_or_insert(end);
+        supervisor
+            .wake(role)
+            .map_err(|_| "manager stop wake failed")?;
+        libkernel::debug!(
+            "device observer normal stop intent: role={:?}, deadline={}",
+            role,
+            end.at_ns
+        );
+        Ok(end)
+    }
+    pub(super) fn manager_source_closed(&mut self, role: Manager) -> Result<(), &'static str> {
+        let supervisor = self
+            .device_supervisor
+            .as_mut()
+            .ok_or("manager supervision missing")?;
+        let record = &mut supervisor.world.records[role.index()];
+        if record.stopping.is_none() {
+            return Err("manager stop intent missing");
+        }
+        record.source_closed = true;
+        record.admin = None;
+        supervisor
+            .wake(role)
+            .map_err(|_| "manager source completion wake failed")
+    }
+    pub(super) fn collect_manager(&mut self, role: Manager) -> Result<(), &'static str> {
+        loop {
+            self.turn_and_wait(Some(Await::ManagerDone(role)))
+                .map_err(|_| "manager completion wait failed")?;
+            if self
+                .device_supervisor
+                .as_ref()
+                .expect("supervisor remains owned")
+                .done(role)
+            {
+                break;
+            }
+        }
+        let supervisor = self
+            .device_supervisor
+            .as_mut()
+            .expect("supervisor remains owned");
+        let record = &mut supervisor.world.records[role.index()];
+        if !record.source_closed {
+            return Err("manager source remains open");
+        }
+        record.detach = true;
+        supervisor
+            .wake(role)
+            .map_err(|_| "manager detach wake failed")?;
+        loop {
+            self.turn_and_wait(Some(Await::ManagerDetached(role)))
+                .map_err(|_| "manager detach wait failed")?;
+            if self
+                .device_supervisor
+                .as_ref()
+                .expect("supervisor remains owned")
+                .detached(role)
+            {
+                break;
+            }
+        }
+        let record = &mut self
+            .device_supervisor
+            .as_mut()
+            .expect("supervisor remains owned")
+            .world
+            .records[role.index()];
+        let Some(ProcessOwner::Running(control)) = record.process.take() else {
+            return Err("manager collection owner missing");
+        };
+        let pid = record.pid;
+        self.collect_machine(libprocess::Collector::new(
+            libprocess::SupervisionTarget::new(pid, control.into_raw()),
+            libprocess::DEFAULT_SUPERVISION_POLICY,
+        ))?;
+        Ok(())
     }
 }

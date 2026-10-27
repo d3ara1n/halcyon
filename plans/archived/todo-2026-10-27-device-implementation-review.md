@@ -1,6 +1,6 @@
 # 设备首批实现检查点独立 Review
 
-状态：**已登记，尚未执行**。用户选择在本次施工检查点转入新会话审查代码、解决问题并收敛架构。本登记不表示首批设备闭包全部完成；尚未闭合的运行证据和独立异常由[设备主计划的唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)保留。审查纪律以 [REVIEW](REVIEW.md) 为准。
+状态：**已完成首轮机制收敛审查并转交活跃报告，本登记归档。** 本轮按用户要求从所有权、生命周期、接口、执行、成本和验证等视角比较替代机制，不作为全量安全审计通过。发现、候选、后续设计与复核由[机制收敛报告](review-2026-10-27-device-implementation.md)唯一承接；原运行证据和独立异常仍由[设备主计划的唯一收口表](../todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)维护。产品实现未修改、未重跑验收；首批设备闭包未交付。审查纪律以 [REVIEW](../REVIEW.md) 为准。
 
 ## 固定对象
 
@@ -8,7 +8,7 @@
 - 实现检查点：`f3337ebd789a79c8cad23c419b690b702e8f96bb`（`feat(device): 接通首批设备体系并保存审查检查点`）。
 - 审查差异：上述基线到实现检查点的完整提交差异，以及使其成立的实际调用链；不使用未来浮动 HEAD 替代固定对象。
 - 本登记及其导航提交不包含新的产品实现。后续修复产生新提交时，在审查报告中登记，不移动本次原始审查对象。
-- 原设计对象：`a0f01e2359749ab2bc2e882016919a28ea3bc9a1`，原[设计增量 Review 登记](todo-2026-10-23-device-implementation-design-review.md)保留其固定历史范围。本次以成形实现及同步演进后的契约审查，不把旧设计登记视为新实现已经通过审查。
+- 原设计对象：`a0f01e2359749ab2bc2e882016919a28ea3bc9a1`，原[设计增量 Review 登记](../todo-2026-10-23-device-implementation-design-review.md)保留其固定历史范围。本次以成形实现及同步演进后的契约审查，不把旧设计登记视为新实现已经通过审查。
 
 ## 当前能力与边界
 
@@ -20,10 +20,10 @@
 
 ## 阅读顺序与事实归属
 
-1. 先读 [AGENTS](../AGENTS.md)、[KNOWN_ISSUES](../KNOWN_ISSUES.md)、本计划及设备主计划的[审查交接](todo-2026-09-device-system-design.md#审查交接2026-10-27)和唯一收口表，明确本次范围与未定项。
-2. 以[设备当前实现](../notes/impls/device.md)为主线，按需读 [mm](../notes/impls/mm.md)、[call](../notes/impls/call.md)、[ipc](../notes/impls/ipc.md)、[startup](../notes/impls/startup.md)、[execution-context](../notes/impls/execution-context.md)。实现说明和源码冲突时以固定源码为准，报告文档差异。
+1. 先读 [AGENTS](../../AGENTS.md)、[KNOWN_ISSUES](../../KNOWN_ISSUES.md)、本计划及设备主计划的[审查交接](../todo-2026-09-device-system-design.md#审查交接2026-10-27)和唯一收口表，明确本次范围与未定项。
+2. 以[设备当前实现](../../notes/impls/device.md)为主线，按需读 [mm](../../notes/impls/mm.md)、[call](../../notes/impls/call.md)、[ipc](../../notes/impls/ipc.md)、[startup](../../notes/impls/startup.md)、[execution-context](../../notes/impls/execution-context.md)。实现说明和源码冲突时以固定源码为准，报告文档差异。
 3. 沿实际入口读类型、授权、状态转换和最后 owner；设备主计划提供已确认契约、设计取舍和运行证据，不要求重演历史调试轮次。
-4. 硬件/ABI 依据从[外部契约索引](../references/CONTRACTS.md)及[固定平台取证](ref-2026-10-23-device-platform-contracts.md)进入；装配和终局分别参考[服务装配](todo-2026-10-07-service-assembly.md)、[关机与设备故障终局](todo-2026-09-system-shutdown-orchestration.md)。
+4. 硬件/ABI 依据从[外部契约索引](../../references/CONTRACTS.md)及[固定平台取证](../ref-2026-10-23-device-platform-contracts.md)进入；装配和终局分别参考[服务装配](../todo-2026-10-07-service-assembly.md)、[关机与设备故障终局](../todo-2026-09-system-shutdown-orchestration.md)。
 
 本次主代理的结构检查和验收审定是可复核的输入，不能替代本次独立审查，也不限制 reviewer 用具体证据推翻其结论。ideas 处于矫正态，目标依据按设备主计划及系统重构登记判断。
 
@@ -54,7 +54,7 @@
 | 最新精确门 | Root retained-entry 第八轮通过；Retry 第四轮 removed-record 真实交错/线程退休通过，其余替换保护依同 actor/强 Rc/唯一 mutator 的源码论证；MMIO 第十二轮两精确 Frozen 窗口及最终收束通过 |
 | 工具最终增量 | IPI 资格纯诊断异常处理在收尾阶段仅做离线验证，未因此关闭 DMA+IPI；具体最终差分、命令和指纹见设备主计划的审查交接 |
 
-原始入口和版本边界统一见设备主计划的[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)及各证据段。`artifacts/` 是本机保留的未提交运行材料；克隆仓库后若缺失，必须明确“原始材料不可得”，不能把链接存在、正文结论或调试器退出 0 当作重新验证。
+原始入口和版本边界统一见设备主计划的[唯一收口表](../todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)及各证据段。`artifacts/` 是本机保留的未提交运行材料；克隆仓库后若缺失，必须明确“原始材料不可得”，不能把链接存在、正文结论或调试器退出 0 当作重新验证。
 
 无需为了开始 Review 重跑全套验收。选择能降低具体风险的最小检查；涉及新发现时保留原失败和版本，区分工具错误、测试消费者错误、真实产品错误及未定项。
 

@@ -28,20 +28,21 @@ fn register_wire_has_exact_fields_and_requires_one_business_capability() {
             text_bytes: 256,
         },
         claimable: true,
+        stop_requirement: libdevice::binding::StopRequirement::ConsumerQuiescence,
     };
     let mut bytes = [0; 512];
     let used = command.encode(Deadline::INFINITE, &mut bytes).unwrap();
-    assert_eq!(used, 32 + 44 + 4 + 2);
+    assert_eq!(used, 32 + 48 + 4 + 2);
     assert_eq!(&bytes[..4], &[1, 0, 3, 0]);
     assert_eq!(&bytes[32..40], &[3, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(&bytes[56..68], &[12, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0]);
     assert_eq!(
-        &bytes[68..used],
+        &bytes[72..used],
         &[4, 0, 0, 0, b'x', b'h', b'c', b'i', 2, 0, 0, 0, 9, 8]
     );
     let (_, decoded) = Command::decode(&bytes[..used], 1).unwrap();
     assert!(
-        matches!(decoded,Command::Register {seq:3,parent:Some(id),name:"xhci",identity:[9,8],limits:Limits {entries:12,text_bytes:256},claimable:true} if id==parent)
+        matches!(decoded,Command::Register {seq:3,parent:Some(id),name:"xhci",identity:[9,8],limits:Limits {entries:12,text_bytes:256},claimable:true,stop_requirement:libdevice::binding::StopRequirement::ConsumerQuiescence} if id==parent)
     );
     assert!(matches!(
         Command::decode(&bytes[..used], 0),
@@ -114,6 +115,7 @@ fn registration_cannot_admit_a_description_that_query_cannot_return() {
             text_bytes: 0,
         },
         claimable: false,
+        stop_requirement: libdevice::binding::StopRequirement::ProviderOwned,
     };
     let used = valid.encode(Deadline::INFINITE, &mut bytes).unwrap();
     assert!(Command::decode(&bytes[..used], 1).is_ok());
@@ -127,6 +129,7 @@ fn registration_cannot_admit_a_description_that_query_cannot_return() {
             text_bytes: 0,
         },
         claimable: false,
+        stop_requirement: libdevice::binding::StopRequirement::ProviderOwned,
     };
     assert_eq!(
         oversized.encode(Deadline::INFINITE, &mut bytes),
@@ -218,7 +221,14 @@ fn provision_result_must_match_operation_epoch_and_capability_count() {
         Err(Error::StaleEpoch)
     );
     assert_eq!(
-        Progress::decode(&bytes[..used], ProvisionCommand::Stop(9), 0),
+        Progress::decode(
+            &bytes[..used],
+            ProvisionCommand::Stop {
+                epoch: 9,
+                consumer_quiescent: false
+            },
+            0
+        ),
         Err(Error::Invalid)
     );
     assert_eq!(
@@ -226,7 +236,13 @@ fn provision_result_must_match_operation_epoch_and_capability_count() {
         Err(Error::Invalid)
     );
     assert_eq!(
-        Progress::Rejected(Error::Unsupported).encode(ProvisionCommand::Stop(9), &mut bytes),
+        Progress::Rejected(Error::Unsupported).encode(
+            ProvisionCommand::Stop {
+                epoch: 9,
+                consumer_quiescent: false
+            },
+            &mut bytes
+        ),
         Err(Error::Invalid)
     );
     let used = Progress::Rejected(Error::Unsupported)
@@ -234,7 +250,14 @@ fn provision_result_must_match_operation_epoch_and_capability_count() {
         .unwrap();
     bytes[2..4].copy_from_slice(&3u16.to_le_bytes());
     assert_eq!(
-        Progress::decode(&bytes[..used], ProvisionCommand::Stop(9), 0),
+        Progress::decode(
+            &bytes[..used],
+            ProvisionCommand::Stop {
+                epoch: 9,
+                consumer_quiescent: false
+            },
+            0
+        ),
         Err(Error::Invalid)
     );
 }
@@ -251,7 +274,14 @@ fn unavailable_not_found_and_error_closed_never_become_safe_closed() {
         .encode(&[], &mut bytes)
         .unwrap();
         assert_eq!(
-            Progress::decode(&bytes[..used], ProvisionCommand::Stop(1), 0),
+            Progress::decode(
+                &bytes[..used],
+                ProvisionCommand::Stop {
+                    epoch: 1,
+                    consumer_quiescent: false
+                },
+                0
+            ),
             Err(error)
         );
         assert_eq!(
@@ -260,17 +290,43 @@ fn unavailable_not_found_and_error_closed_never_become_safe_closed() {
         );
     }
     let used = Progress::Failed(Error::Resource)
-        .encode(ProvisionCommand::Stop(1), &mut bytes)
+        .encode(
+            ProvisionCommand::Stop {
+                epoch: 1,
+                consumer_quiescent: false,
+            },
+            &mut bytes,
+        )
         .unwrap();
     assert_eq!(
-        Progress::decode(&bytes[..used], ProvisionCommand::Stop(1), 0),
+        Progress::decode(
+            &bytes[..used],
+            ProvisionCommand::Stop {
+                epoch: 1,
+                consumer_quiescent: false
+            },
+            0
+        ),
         Ok(Progress::Failed(Error::Resource))
     );
     let used = Progress::Closed
-        .encode(ProvisionCommand::Stop(1), &mut bytes)
+        .encode(
+            ProvisionCommand::Stop {
+                epoch: 1,
+                consumer_quiescent: false,
+            },
+            &mut bytes,
+        )
         .unwrap();
     assert_eq!(
-        Progress::decode(&bytes[..used], ProvisionCommand::Stop(1), 0),
+        Progress::decode(
+            &bytes[..used],
+            ProvisionCommand::Stop {
+                epoch: 1,
+                consumer_quiescent: false
+            },
+            0
+        ),
         Ok(Progress::Closed)
     );
 }
@@ -407,6 +463,7 @@ fn watch_errors_keep_their_status_and_terminal_sequence_cannot_be_forged() {
         sequence: 7,
         pending: TERMINAL,
         reason: Reason::Exhausted,
+        binding: None,
     };
     let mut body = [0; Info::ENCODED_LEN];
     forged.encode(&mut body).unwrap();

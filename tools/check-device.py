@@ -11,6 +11,7 @@ import selectors
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,12 @@ import qemu_dma_race_gdb as dma_probe
 import qemu_dma_install_gdb as dma_install_probe
 import qemu_irq_exit_gdb as irq_exit_probe
 import qemu_driver_retry_gdb as retry_probe
+
+
+class QmpError(RuntimeError):
+    def __init__(self, command, error):
+        super().__init__(f"QMP {command} rejected: {error}")
+        self.error = error
 
 
 class Qmp:
@@ -58,7 +65,7 @@ class Qmp:
             if response.get("id") != self.sequence:
                 continue
             if "error" in response:
-                raise RuntimeError(f"QMP {command} rejected: {response['error']}")
+                raise QmpError(command, response["error"])
             print(f"DEVICE QMP confirmed: {command} {arguments or {}}", flush=True)
             return response.get("return")
 
@@ -97,13 +104,26 @@ class Qmp:
         self.socket.close()
 
 
-def inject_process_fault(kernel, port, pid, role="HID", start_target=None, reject_reset=False, arm_path=None):
+def inject_process_fault(kernel, port, pid, role="HID", start_target=None, reject_reset=False, arm_path=None, loading=False):
     # 复用正式trap入口和调试类型，只模拟目标PID的一次非法指令异常；不改设备/供应事实。
     logs=debug.fresh_logs(Path("artifacts/device-fault"))
     symbols=debug.symbols(kernel)
     entry=symbols["handle_user_trap"]
     start_gate=(next(name for name in symbols if name.endswith("::start_commit_gate"))
                 if start_target else "")
+    loader = None
+    if loading:
+        image = Path("artifacts/initfs/bin/test_target")
+        data = image.read_bytes()
+        header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
+        first = next(struct.unpack_from("<IIQQQQQQ", data, header[5] + i * header[9])
+                     for i in range(header[10])
+                     if struct.unpack_from("<I", data, header[5] + i * header[9])[0] == 1)
+        if first[5] <= 4096:
+            raise RuntimeError("loader fault needs an actual multi-page input segment")
+        loader = {"image": str(image.resolve()), "sha256": hashlib.sha256(data).hexdigest(),
+                  "address": first[3], "file_bytes": first[5],
+                  "first_page_sha256": hashlib.sha256(data[first[2]:first[2]+4096]).hexdigest()}
     script=f'''set pagination off
 set confirm off
 set language c
@@ -114,6 +134,7 @@ target remote 127.0.0.1:{port}
 python
 import gdb
 import json
+import hashlib
 import time
 from pathlib import Path
 TARGET={pid}
@@ -121,19 +142,41 @@ matched=False
 armed={start_target is None}
 START_TARGET={json.dumps(str(start_target)) if start_target else "None"}
 ARM_PATH={json.dumps(str(arm_path)) if arm_path else "None"}
+LOADER={repr(loader)}
+loader_builder=None
+loading_verified=False
 {debug.user_trap_context(kernel,entry)}
+{debug.USER_MEMORY if loading else ""}
 class TargetTrap(gdb.Breakpoint):
     def stop(self):
-        global matched
-        if not armed:return False
+        global matched,TARGET,armed,loader_builder
+        if not armed and (LOADER is None or not Path(START_TARGET).exists()):return False
         if int(gdb.parse_and_eval('$a0'))!=8:return False
         anchor=int(gdb.parse_and_eval('$tp')) & ((1<<64)-1)
         pointer=word(anchor+hart_offsets['current_thread'])
         if not pointer:return False
         shell=word(pointer+process_offset+ptr_offset+pointer_offset)
-        if word(shell+data_offset+pid_offset)!=TARGET:return False
+        pid=word(shell+data_offset+pid_offset)
         frame=int(gdb.parse_and_eval('$a2')) & ((1<<64)-1)
         if frame!=pointer+thread_offsets['frame']:raise gdb.GdbError('trap frame is not target execution owner')
+        registers=frame+context_offsets['x']
+        if LOADER is not None and not armed:
+            target=Path(START_TARGET)
+            if not target.exists():return False
+            TARGET=int(json.loads(target.read_text())['pid'])
+            if pid!=1 or word(registers+17*8)!=0x14:return False
+            if word(registers+11*8)!=LOADER['address'] or word(registers+13*8)!=4096:return False
+            satp=word(anchor+hart_offsets['user_satp'])
+            data=user_memory(satp,word(registers+12*8),4096)
+            if hashlib.sha256(data).hexdigest()!=LOADER['first_page_sha256']:return False
+            loader_builder=word(registers+10*8)
+            armed=True
+            print('DEVICE_PROCESS_LOADING_GATE target_pid=%d builder=%#x remaining_file_bytes=%d' % (TARGET,loader_builder,LOADER['file_bytes']-4096))
+            return False
+        if not armed:return False
+        if LOADER is not None and pid==1 and word(registers+17*8)==0x15 and word(registers+10*8)==loader_builder:
+            raise gdb.GdbError('loading child reached Start before manager fault')
+        if pid!=TARGET:return False
         print('DEVICE_PROCESS_FAULT_ORIGINAL pid=%d cause=%d stval=%#x sepc=%#x' % (TARGET,int(gdb.parse_and_eval('$a0')),int(gdb.parse_and_eval('$a1')),word(frame+context_offsets['sepc'])))
         gdb.execute('set $a0 = 2')
         gdb.execute('set $a1 = 0')
@@ -160,7 +203,7 @@ class StartGate(gdb.Breakpoint):
         self.enabled=False
         print('DEVICE_PROCESS_PRE_START pid=%d shell=%#x; members not published' % (TARGET,shell))
         return False
-if START_TARGET is not None:
+if START_TARGET is not None and LOADER is None:
     StartGate({json.dumps("'" + start_gate + "'")},type=gdb.BP_HARDWARE_BREAKPOINT)
 if ARM_PATH is not None:
     Path(ARM_PATH).write_text("armed\\n")
@@ -175,12 +218,40 @@ detach
 quit 0
 '''
     after_fault=""
+    if loading:
+        after_fault=f'''python
+class LoadingTerminal(gdb.Breakpoint):
+    def stop(self):
+        global loading_verified
+        if int(gdb.parse_and_eval('$a0'))!=8:return False
+        anchor=int(gdb.parse_and_eval('$tp')) & ((1<<64)-1)
+        pointer=word(anchor+hart_offsets['current_thread'])
+        if not pointer:return False
+        shell=word(pointer+process_offset+ptr_offset+pointer_offset)
+        if word(shell+data_offset+pid_offset)!=1:return False
+        frame=int(gdb.parse_and_eval('$a2')) & ((1<<64)-1)
+        registers=frame+context_offsets['x']
+        call=word(registers+17*8)
+        if call==0x15 and word(registers+10*8)==loader_builder:
+            raise gdb.GdbError('loading child escaped manager failure into Start')
+        if call!=0x02:return False
+        loading_verified=True
+        self.enabled=False
+        print('DEVICE_PROCESS_LOADING_FAILURE_VERIFIED target_pid=%d builder=%#x; child never reached Start' % (TARGET,loader_builder))
+        return True
+LoadingTerminal('*{entry:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
+end
+continue
+python
+if not loading_verified:raise gdb.GdbError('root failure did not retain unfinished loading')
+end
+'''
     if reject_reset:
         setup,finish=dma.program(kernel,symbols,True)
         after_fault=f"python\n{setup}\nend\ncontinue\npython\n{finish}\nend\n"
     script=script.replace("__AFTER_FAULT__",after_fault)
     boot_package=Path(os.environ["ERHINO_BOOT_PACKAGE"])
-    (logs/"evidence.json").write_text(json.dumps({"boot_package":str(boot_package),"boot_package_sha256":hashlib.sha256(boot_package.read_bytes()).hexdigest(),"kernel":str(kernel),"kernel_sha256":hashlib.sha256(kernel.read_bytes()).hexdigest(),"role":role,"pid":pid,"trap_entry":hex(entry),"cause":2,"stval":0,"reset_rejected":reject_reset,"scope":"one actual target user ecall, simulated illegal instruction; no timing claim"},indent=2)+"\n")
+    (logs/"evidence.json").write_text(json.dumps({"boot_package":str(boot_package),"boot_package_sha256":hashlib.sha256(boot_package.read_bytes()).hexdigest(),"kernel":str(kernel),"kernel_sha256":hashlib.sha256(kernel.read_bytes()).hexdigest(),"role":role,"pid":pid,"trap_entry":hex(entry),"cause":2,"stval":0,"reset_rejected":reject_reset,"loader":loader,"scope":"one actual target user ecall, simulated illegal instruction; no timing claim"},indent=2)+"\n")
     script_path=logs/"process-fault.gdb"
     script_path.write_text(script.replace("__PHYSICAL_READ__",debug.PHYSICAL_READ))
     if start_target is not None or arm_path is not None:
@@ -242,7 +313,7 @@ def main():
     parser.add_argument("--dma-shared", action="store_true")
     parser.add_argument("--dma-quota", action="store_true")
     parser.add_argument("--dma-install-failure", action="store_true")
-    parser.add_argument("--fault-phase", choices=("wait", "stopping", "start"), default="wait")
+    parser.add_argument("--fault-phase", choices=("wait", "stopping", "start", "loading"), default="wait")
     parser.add_argument("--reject-reset", action="store_true")
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -268,9 +339,11 @@ def main():
         parser.error("IRQ retirement uses the actual function session consumer")
     if args.irq_idle and not args.irq_retirement:
         parser.error("all-idle insertion uses the real IRQ retirement consumer")
+    if args.fault_phase == "loading" and args.manager_fault != "Driver":
+        parser.error("loading fault observes the real post-Driver test_target preparation")
     if args.reject_reset and not (args.worker_fault or (args.manager_fault == "Device" and args.fault_phase == "wait")):
         parser.error("reset rejection needs a real Device manager or physical worker failure with active DMA")
-    fault_scenario = bool(args.manager_fault or args.worker_fault or args.unknown in ("Claim", "GetResource"))
+    fault_scenario = bool(args.manager_fault or args.worker_fault or args.unknown == "Claim")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("QEMU command missing")
@@ -295,6 +368,8 @@ def main():
     prepare_cancel = None
     retry_verified = False
     retry_debugger = None
+    reuse_debugger = None
+    reuse_fault_armed = private / "hid-fault-armed"
     retry_client_verified = False
     retry_facts = None
     connections = {}
@@ -358,14 +433,15 @@ def main():
         listener.bind(("127.0.0.1", 0))
         gdb_port = listener.getsockname()[1]
     early_fault = None
-    early_verified = args.fault_phase != "start"
+    early_verified = args.fault_phase not in ("start", "loading")
+    manager_faulted = False
     early_target = private / "target.json"
     try:
         process = subprocess.Popen(command + ["-qmp", f"unix:{qmp_path},server=on,wait=off", "-gdb", f"tcp:127.0.0.1:{gdb_port}"] +
-                                   (["-S"] if args.manager_fault and args.fault_phase == "start" else []),
+                                   (["-S"] if args.manager_fault and args.fault_phase in ("start", "loading") else []),
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        if args.manager_fault and args.fault_phase == "start":
-            early_fault = inject_process_fault(kernel,gdb_port,0,args.manager_fault,early_target)
+        if args.manager_fault and args.fault_phase in ("start", "loading"):
+            early_fault = inject_process_fault(kernel,gdb_port,0,args.manager_fault,early_target,loading=args.fault_phase == "loading")
         selector.register(process.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + args.timeout
         pending = b""
@@ -375,7 +451,9 @@ def main():
             if early_fault and early_fault[0].poll() is not None:
                 child,output,logs=early_fault
                 output.close()
-                verify_process_fault(logs,child.returncode,managers.get(args.manager_fault),args.manager_fault,True)
+                verify_process_fault(logs,child.returncode,managers.get(args.manager_fault),args.manager_fault,args.fault_phase == "start")
+                if args.fault_phase == "loading" and "DEVICE_PROCESS_LOADING_FAILURE_VERIFIED" not in (logs/"process-fault.log").read_text():
+                    raise RuntimeError(f"loading fault lacks unfinished loader evidence: {logs}")
                 early_fault=None
                 early_verified=True
             if physical_debugger:
@@ -392,6 +470,27 @@ def main():
                         raise RuntimeError(f"physical fault lacks stable DMA/initial DONE/four parked harts: {logs}")
                     physical_verified = True
                     physical_debugger = None
+            if reuse_debugger:
+                child, output, logs = reuse_debugger
+                if child.poll() is None and reuse_fault_armed.exists() and not reuse.get("fault_triggered"):
+                    # 静默 HID 无周期 syscall；断点就绪后用真实输入触发目标原消费路径。
+                    # GDB 的 continue/逐 trap 筛选期间可短暂停机；明确拒绝表示输入未提交。
+                    try:
+                        qmp.key(True, "c")
+                    except QmpError as error:
+                        if error.error != {"class": "GenericError", "desc": "VM not running"}:
+                            raise
+                    else:
+                        reuse["fault_triggered"] = True
+                if child.poll() is not None:
+                    output.close()
+                    verify_process_fault(logs, child.returncode, reuse["pid"], "HID")
+                    reuse["fault_verified"] = True
+                    reuse_debugger = None
+                    if reuse.get("fault_triggered"):
+                        qmp.key(False, "c")
+                    if args.retry_race:
+                        retry_debugger = retry_probe.start(kernel, gdb_port, managers["Driver"], reuse["c"])
             if unknown_probe and unknown_probe[0].poll() is not None:
                 child, output, logs = unknown_probe
                 output.close()
@@ -462,8 +561,8 @@ def main():
                 boundary=(reboot_rejected and initial_done) if args.reject_reset else reset
                 # reset拒绝由原DMA观察体核init DONE/四hart停驻；主线也可合法先取得唯一终局。
                 fault_proved = (physical_faulted and physical_manager_failed and fault_done and physical_verified) if args.worker_fault else (
-                    (unknown_observed and fault_done and (args.unknown != "GetResource" or unknown_exposed)) if args.unknown else
-                    (fault_done or args.reject_reset or args.fault_phase == "stopping"))
+                    (unknown_observed and fault_done) if args.unknown else
+                    (manager_faulted and (fault_done or args.fault_phase not in ("start", "loading"))))
                 if boundary and reboot_accepted and fault_proved and early_verified:
                     if failure_terminal != 1 or not job_sealed or not platform_sealed:
                         raise RuntimeError("manager failure lacks one terminal owner or committed seals")
@@ -723,6 +822,7 @@ def main():
                             "ProvisionGet": "device Provision RPC failed:",
                             "GetResource": "PCI RPC failed:",
                             "Activate": "driver RPC failed: operation=Activate,",
+                            "QueryUse": "driver binding transport failed:",
                             "Master": "xHCI EnableMaster reply failed:",
                         }
                         if prefixes[args.unknown] in line and "phase=Sent," in line:
@@ -730,16 +830,25 @@ def main():
                             if matched:
                                 if args.unknown == "Prepare" and "command=Prepare(1)" not in line:
                                     raise RuntimeError("wrong Provision operation failed")
+                                if args.unknown == "QueryUse" and "command=QueryUse," not in line:
+                                    raise RuntimeError("wrong binding verification operation failed")
                                 if args.unknown == "ProvisionGet" and "command=Get { epoch: 1, index: 0 }" not in line:
                                     raise RuntimeError("wrong Provision Get failed")
                                 unknown_errors[int(matched[1])] = line
                         unknown_exposed |= ("device Binding stopping:" in line and "serial: 1 }" in line
-                                            and "epoch: 1 }" in line and "resources_exposed=true, reported=false" in line)
-                        matched = re.search(r"device binding owner retired: Work \{ reference: BindingRef \{ device: DeviceId \{ incarnation: \d+, serial: (\d+) \}, epoch: 1 \}, .*next: Released,", line)
+                                            and "epoch: 1 }" in line and "resources_exposed=true" in line)
+                        if args.unknown == "QueryUse":
+                            if "PCI host resources acquired; ECAM mapped" in line or unknown_exposed:
+                                raise RuntimeError("rejected pre-IO activation acquired hardware resources")
+                        matched = re.search(r"device binding owner retired: Work \{ reference: BindingRef \{ device: DeviceId \{ incarnation: \d+, serial: (\d+) \}, epoch: 1 \}, .*released: Some\(Snapshot .*phase: Released", line)
                         if matched:
                             unknown_released.add(int(matched[1]))
-                        if args.unknown == "GetResource" and "device binding owner retired:" in line and "serial: 1 }" in line:
-                            raise RuntimeError("exposed resource reply loss was converted into safe release")
+                        if args.unknown == "GetResource":
+                            if "PCI host resources acquired; ECAM mapped" in line:
+                                raise RuntimeError("resource-loss scenario unexpectedly began hardware access")
+                            if matched and int(matched[1]) == 1:
+                                if not unknown_exposed or "reported: true, resources_exposed: true" not in line:
+                                    raise RuntimeError("resource reply loss lacks original consumer quiescence report")
                         matched = re.search(r"xHCI EnableMaster submitted: device=(\d+), epoch=(\d+), context=(\d+), deadline=(\d+)", line)
                         if matched:
                             master_inputs.append(tuple(map(int, matched.groups())))
@@ -774,7 +883,7 @@ def main():
                             incompatible_pids.add(int(matched[1]))
                         pid = re.search(r"pid (\d+):", line)
                         if pid and int(pid[1]) in incompatible_pids:
-                            if any(text in line for text in ("PCI resource Describe/Get matched", "ECAM mapped", "PCI function:")):
+                            if any(text in line for text in ("PCI resource acquired and verified", "ECAM mapped", "PCI function:")):
                                 raise RuntimeError("incompatible PCI candidate accessed hardware")
                         matched = re.search(r"driver binding input prepared: operation=(Claim|Activate), device=(\d+), epoch=(\d+), key=(\S+), registrar=(true|false), trusted_physical=(true|false)", line)
                         if matched:
@@ -886,12 +995,14 @@ def main():
                         admitted = re.search(r"device observer admitted before Start: role=(Device|Driver), pid=(\d+),", line)
                         if admitted:
                             managers[admitted[1]] = int(admitted[2])
-                            if args.fault_phase == "start" and admitted[1] == args.manager_fault:
+                            if args.fault_phase in ("start", "loading") and admitted[1] == args.manager_fault:
                                 pid=managers[args.manager_fault]
                                 early_target.write_text(json.dumps({"pid":pid})+"\n")
                                 evidence=early_fault[2]/"evidence.json"
                                 facts=json.loads(evidence.read_text())
-                                facts.update(pid=pid,scope="pre-Start gate then first actual user ecall; no timing claim")
+                                scope = ("real first-page ProcessWrite after Driver admission; same manager actual user fault, unfinished child through root failure" if args.fault_phase == "loading"
+                                         else "pre-Start gate then first actual user ecall; no timing claim")
+                                facts.update(pid=pid,scope=scope)
                                 evidence.write_text(json.dumps(facts,indent=2)+"\n")
                                 qmp=Qmp(qmp_path)
                                 stage=30
@@ -921,6 +1032,7 @@ def main():
                                 raise RuntimeError("assembly failed before requested manager fault")
                             failure_terminal += 1
                         if args.manager_fault:
+                            manager_faulted |= f"pid {managers.get(args.manager_fault)} aborted: scause=0x2 " in line
                             fault_done |= f"device observer manager DONE: pid={managers.get(args.manager_fault)}," in line
                         reboot_accepted |= "system reset accepted: action Reboot, reason SystemFailure" in line
                         reboot_rejected |= "device failure cold reboot rejected:" in line
@@ -955,7 +1067,7 @@ def main():
                                              scope="live xHCI four ring pages before FS/core retirement consumers; Device fault, rejected ColdReboot, init DONE and four parked harts")
                                 evidence.write_text(json.dumps(facts,indent=2)+"\n")
                             stage = 30
-                        if args.fault_phase in ("wait", "start") or stage >= 30:
+                        if args.fault_phase in ("wait", "start", "loading") or stage >= 30:
                             continue
                     if stage == 0 and "driver process spawned: key=usb-hid," in line:
                         raise RuntimeError("HID process ran before keyboard insertion")
@@ -1030,9 +1142,7 @@ def main():
                         qmp.key(False,"b")
                         stage=19
                     elif stage == 19 and "DEVICE reuse C release observed; waiting HID process fault:" in line:
-                        inject_process_fault(kernel,gdb_port,reuse["pid"])
-                        if args.retry_race:
-                            retry_debugger = retry_probe.start(kernel, gdb_port, managers["Driver"], reuse["c"])
+                        reuse_debugger = inject_process_fault(kernel, gdb_port, reuse["pid"], arm_path=reuse_fault_armed)
                         stage=20
                     elif stage == 20 and "DEVICE reuse B/C Released after process fault" in line:
                         if args.candidates:
@@ -1090,7 +1200,10 @@ def main():
                 if not record.get("claimed") or collected.count(record.get("pid")) != 1:
                     raise RuntimeError("candidate did not hand off to HID or collect exactly once")
             print("DEVICE incompatible real PCI candidates safely released; same-device newer-epoch HID input and original Pool refund confirmed", flush=True)
-        if args.reuse:print("DEVICE shared HID process collected exactly once",flush=True)
+        if args.reuse:
+            if not reuse.get("fault_verified"):
+                raise RuntimeError("shared HID process fault lacks actual ecall injection evidence")
+            print("DEVICE shared HID process collected exactly once",flush=True)
         return 0
     finally:
         # 外层失败锚点可能打断正在运行的GDB。短清理段不再接受重复终止，且任一
@@ -1102,13 +1215,13 @@ def main():
                     previous = signal.signal(signum, signal.SIG_IGN)
                     cleanup.callback(signal.signal, signum, previous)
                 cleanup.callback(private.rmdir)
-                for path in (qmp_path, early_target, physical_armed, function_address, irq_target,
+                for path in (qmp_path, early_target, physical_armed, reuse_fault_armed, function_address, irq_target,
                              irq_idle_ready, irq_idle_inserted, mmio_target, mmio_target.with_suffix(".next"),
                              dma_target, dma_target.with_suffix(".next"),
                              irq_exit_target, irq_exit_target.with_suffix(".next")):
                     cleanup.callback(path.unlink, missing_ok=True)
                 for debugger in (early_fault, physical_debugger, unknown_probe, function_debugger,
-                                 mmio_debugger, dma_debugger, irq_exit_debugger, retry_debugger):
+                                 mmio_debugger, dma_debugger, irq_exit_debugger, retry_debugger, reuse_debugger):
                     if debugger:
                         cleanup.callback(stop_debugger, debugger)
                 if qmp:

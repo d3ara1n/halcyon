@@ -46,11 +46,27 @@ RootSupervisor 的 Cleanup<T> 在 [supervisor.rs](../../user/services/srv_init/s
 
 ## init 与 pm 的真实装配
 
-RootSupervisor 在 main 中建立，实际持一个 Assembly；Job、Batch 各两槽与 Read 一槽的 Runtime 全部从它取得 Registration。services 根建立即准备兜底 frame、运行体与任务槽，子服务启动后再激活。没有原六项 WaitItem/空闲集合或每 duty 的集合接收 owner。
+RootSupervisor 在 main 中建立，实际持一个 Assembly；Job、Batch 各两槽、Read 一槽、固定装配等待槽与两管理者观察的 Runtime 全部从它取得 Registration。管理 DONE 与故障处理先于普通装配推进。services 根建立即准备兜底 frame、运行体与任务槽，子服务启动后再激活。管理者的 Process/SourceAdmin 记录与故障终局由[设备实现](device.md#init-的管理者监督)拥有。
 
 Job duty 持有原机器、待准入任务、Runtime、世界与失败处置；Batch 同时持有已准入任务、未准入输入、失败/成功结果；Read 同时持有运行体、流 owner、缓冲与进度。setup、partial-spawn、run、close 失败不销毁这些槽。批次准入失败不阻止已入队成员继续工作；结果逐项结算，错误摘要与完整失败 owner 分离。
 
 根按持续游标推进可工作运行体，接收一次候选批并给各运行体 feed，再用共同集合与最早期限停驻。可恢复错误退避，永久错误仍以原类型持有责任，其他运行体继续。失败脚本结束后 services 机器接管管理范围，旧 control 仍由原 duty 兑现。流建立失败的 Endpoint/Invitation 有预备清理槽；辅助 controls、mailbox/委托副本与通知由能力账本持有，内核确认 Grant/Send 消费后才兑现移交。正常关闭与失败 reset 均覆盖该账本，活动 Job 的 root 不提前关闭。
+
+### 顺序装配的等待与推进
+
+根装配保持顺序调用，等待期间通过 `turn_and_wait` 推进全部已提交职责。三个接点各有明确 owner：
+
+| 接点 | 责任 |
+|---|---|
+| [waiting.rs](../../user/services/srv_init/src/supervisor/waiting.rs) | WaitDuty 持一个 WaitTask、待登记计划和完成结果；任务持实际来源、观察位与绝对期限 |
+| [rpc.rs](../../user/services/srv_init/src/supervisor/rpc.rs) | 临时借出根唯一 Caller，显式推进原 CallOperation；普通成功复用 ReplyPort，失败按原投递阶段 abort |
+| [loading.rs](../../user/services/srv_init/src/supervisor/loading.rs) | 每轮先推进根职责，再推进一步 Preparation/ImageCopy；取消交原 Collector，装配类型与成本界见[启动实现](startup.md#用户态公共-loader) |
+
+WaitDuty 的来源容量直接采用 `librpc::caller::CALL_WAIT_SOURCES`，覆盖 reply、service、cancel、reply-observer 四个实际对象；不另建嵌套 WaitSet。单次等待借用调用者持有的句柄，收到任一观察或错误、或达到期限后，先注销全部来源，再把结果交回顺序调用者。到期时最后 probe 实际电平，ready 优先于 timeout；空来源计划提供定时等待。
+
+待登记或待领取结果占用同一槽时拒绝再次提交。来源登记失败沿原任务清理已装来源；装配基础设施失败而尚未确认注销时，root 保留调用栈上的能力 owner 并进入故障终局，不能返回后销毁被借用对象。CallOperation 的来源、取消和迟到回复隔离由[RPC 实现](rpc.md#同步-caller)拥有。
+
+### 其它服务与验收接点
 
 pm 的 DomainTask 直接使用 JobDriver，MailboxTask/Flow/域收束共享单个 Assembly 与 Runtime，推进量子仍为每轮一项。域结束后 seal/shutdown_turn，注销来源与退休任务后检查 Task/InputBytes 归零，先关闭 Runtime 再关闭实际集合。不可恢复错误调用 ProcessAbort，由 init 的独立管理能力接管。fs每个provider进程各建自己的Assembly与单Runtime，接收、feed、任务退休与集合关闭在各自进程内收束；两个provider之间没有共享Assembly。
 

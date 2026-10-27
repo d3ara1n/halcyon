@@ -15,7 +15,7 @@ use libfs::{
 };
 use libkernel::ipc::{capability::Capability, message::MailboxSender, object::duplicate};
 use liboal::Namespace;
-use librpc::{Caller, exchange::CallCause};
+use librpc::exchange::CallCause;
 
 const CHUNK: usize = PAYLOAD_MAX - 256;
 const LENGTH: usize = CHUNK * 6;
@@ -113,12 +113,13 @@ fn complete(root: &mut RootSupervisor, copy: CopyTask) -> Result<Progress, &'sta
     }
 }
 fn create(
-    client: &mut Client<'_>,
+    root: &mut RootSupervisor,
+    ns: &Namespace,
     path: &str,
     kind: NodeKind,
     bytes: &[u8],
 ) -> Result<(), &'static str> {
-    client
+    Client::new(ns, root, limits())
         .create(path, kind, FsRights::ALL, bytes, deadline()?)
         .map_err(|error| {
             libkernel::debug!("Copy fixture create failed at {}: {:?}", path, error);
@@ -128,14 +129,14 @@ fn create(
 fn pattern(offset: usize) -> u8 {
     ((offset * 37 + 11) % 251) as u8
 }
-fn source(client: &mut Client<'_>, path: &str) -> Result<(), &'static str> {
-    create(client, path, NodeKind::Stream, &[])?;
+fn source(root: &mut RootSupervisor, ns: &Namespace, path: &str) -> Result<(), &'static str> {
+    create(root, ns, path, NodeKind::Stream, &[])?;
     let mut bytes = [0; CHUNK];
     for offset in (0..LENGTH).step_by(CHUNK) {
         for (i, byte) in bytes.iter_mut().enumerate() {
             *byte = pattern(offset + i);
         }
-        let written = client
+        let written = Client::new(ns, root, limits())
             .write_at(path, offset as u64, &bytes, deadline()?)
             .map_err(|_| "Copy fixture write failed")?;
         if written.count != CHUNK as u64 || written.cause != Status::Ok {
@@ -144,10 +145,15 @@ fn source(client: &mut Client<'_>, path: &str) -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn contents(client: &mut Client<'_>, path: &str, length: usize) -> Result<(), &'static str> {
+fn contents(
+    root: &mut RootSupervisor,
+    ns: &Namespace,
+    path: &str,
+    length: usize,
+) -> Result<(), &'static str> {
     for offset in (0..length).step_by(CHUNK) {
         let count = CHUNK.min(length - offset);
-        let read = client
+        let read = Client::new(ns, root, limits())
             .read_at(path, offset as u64, count as u32, deadline()?)
             .map_err(|_| "Copy content read failed")?;
         if read.count != count as u64
@@ -161,7 +167,7 @@ fn contents(client: &mut Client<'_>, path: &str, length: usize) -> Result<(), &'
             return Err("Copy content differs from source");
         }
     }
-    let end = client
+    let end = Client::new(ns, root, limits())
         .read_at(path, length as u64, 1, deadline()?)
         .map_err(|_| "Copy EOF read failed")?;
     if end.count != 0 || end.end != IoEnd::Eof {
@@ -169,8 +175,8 @@ fn contents(client: &mut Client<'_>, path: &str, length: usize) -> Result<(), &'
     }
     Ok(())
 }
-fn remove(client: &mut Client<'_>, path: &str) -> Result<(), &'static str> {
-    client
+fn remove(root: &mut RootSupervisor, ns: &Namespace, path: &str) -> Result<(), &'static str> {
+    Client::new(ns, root, limits())
         .remove(path, deadline()?)
         .map_err(|_| "Copy fixture removal failed")
 }
@@ -181,14 +187,12 @@ pub(crate) fn exercise(
     secondary: &MailboxSender,
 ) -> Result<(), &'static str> {
     let ns = namespace(primary, secondary)?;
-    let mut caller = Caller::new();
-    let mut client = Client::new(&ns, &mut caller, limits());
-    source(&mut client, SOURCE)?;
+    source(root, &ns, SOURCE)?;
     let mut encoded = [0; 20];
     let used = Value::Unsigned64(0x81927364)
         .encode(&mut encoded)
         .map_err(|_| "Copy Property encoding failed")?;
-    create(&mut client, PROPERTY, NodeKind::Property, &encoded[..used])?;
+    create(root, &ns, PROPERTY, NodeKind::Property, &encoded[..used])?;
     complete(
         root,
         task(
@@ -198,7 +202,7 @@ pub(crate) fn exercise(
             Kind::Property,
         )?,
     )?;
-    if client
+    if Client::new(&ns, root, limits())
         .get::<u64>("/secondary/init-copy-property", deadline()?)
         .map_err(|_| "Copy Property read failed")?
         != 0x81927364
@@ -214,7 +218,7 @@ pub(crate) fn exercise(
     {
         return Err("Copy final progress invalid");
     }
-    contents(&mut client, "/secondary/init-copy-stream", LENGTH)?;
+    contents(root, &ns, "/secondary/init-copy-stream", LENGTH)?;
     libkernel::debug!("FS1 independent cross-provider stream Copy passed");
 
     // 两个真实活任务共享同一无 DUP Namespace/Dispatcher；取消一个不取消另一个。
@@ -237,7 +241,7 @@ pub(crate) fn exercise(
     // 因而后继 ReadAt 可见数据时已越过接受点，不依赖调度碰巧命中。
     let accepted_until = deadline()?;
     loop {
-        let prefix = client
+        let prefix = Client::new(&ns, root, limits())
             .read_at("/secondary/init-copy-cancel", 0, 1, accepted_until)
             .map_err(|_| "Copy accepted prefix observation failed")?;
         if prefix.count != 0 {
@@ -290,8 +294,8 @@ pub(crate) fn exercise(
         );
         return Err("Copy concurrent task did not complete");
     }
-    contents(&mut client, "/secondary/init-copy-concurrent", LENGTH)?;
-    let prefix = client
+    contents(root, &ns, "/secondary/init-copy-concurrent", LENGTH)?;
+    let prefix = Client::new(&ns, root, limits())
         .read_at("/secondary/init-copy-cancel", 0, CHUNK as u32, deadline()?)
         .map_err(|_| "Copy cancelled target disappeared")?;
     if prefix.count == 0
@@ -303,7 +307,7 @@ pub(crate) fn exercise(
     {
         return Err("Copy cancelled prefix corrupted");
     }
-    let beyond = client
+    let beyond = Client::new(&ns, root, limits())
         .read_at("/secondary/init-copy-cancel", transported, 1, deadline()?)
         .map_err(|_| "Copy cancelled bound read failed")?;
     if beyond.count != 0 || beyond.end != IoEnd::Eof {
@@ -312,12 +316,7 @@ pub(crate) fn exercise(
     libkernel::debug!("FS1 Copy shared no-DUP concurrent cancellation passed");
     libkernel::debug!("FS1 Copy cancellation after destination accepted prefix passed");
 
-    create(
-        &mut client,
-        "/primary/init-copy-empty",
-        NodeKind::Stream,
-        &[],
-    )?;
+    create(root, &ns, "/primary/init-copy-empty", NodeKind::Stream, &[])?;
     let empty = complete(
         root,
         task(
@@ -331,7 +330,7 @@ pub(crate) fn exercise(
     {
         return Err("empty Copy progress invalid");
     }
-    contents(&mut client, "/secondary/init-copy-empty", 0)?;
+    contents(root, &ns, "/secondary/init-copy-empty", 0)?;
     start(
         root,
         [task(
@@ -353,7 +352,7 @@ pub(crate) fn exercise(
     ) {
         return Err("Copy replaced existing target");
     }
-    contents(&mut client, "/secondary/init-copy-stream", LENGTH)?;
+    contents(root, &ns, "/secondary/init-copy-stream", LENGTH)?;
     let mut pre_cancel = task(
         &ns,
         SOURCE,
@@ -385,7 +384,7 @@ pub(crate) fn exercise(
         )?],
     )?;
     root.await_copy_progress(0, 1)?;
-    client
+    Client::new(&ns, root, limits())
         .rename(
             "/secondary/init-copy-replaced",
             "/secondary/init-copy-pinned",
@@ -394,7 +393,8 @@ pub(crate) fn exercise(
         )
         .map_err(|_| "Copy target rename failed")?;
     create(
-        &mut client,
+        root,
+        &ns,
         "/secondary/init-copy-replaced",
         NodeKind::Property,
         &encoded[..used],
@@ -402,8 +402,8 @@ pub(crate) fn exercise(
     if !matches!(finish(root)?[0].outcome, Some(Outcome::Complete { .. })) {
         return Err("Copy lost original target after rename");
     }
-    contents(&mut client, "/secondary/init-copy-pinned", LENGTH)?;
-    if client
+    contents(root, &ns, "/secondary/init-copy-pinned", LENGTH)?;
+    if Client::new(&ns, root, limits())
         .get::<u64>("/secondary/init-copy-replaced", deadline()?)
         .map_err(|_| "Copy deleted replacement")?
         != 0x81927364
@@ -497,10 +497,16 @@ pub(crate) fn exercise(
         )?;
         root.set_copy_hold(1, true)?;
         root.await_copy_sent(0, true)?;
-        // Sent 不等于提交：只观察一次，名字可见/尚不可见都是合法结果。
+        // 在原Sent事实之后立即提交取消；另一次观察RPC也会推进原运输，不能靠它冻结收包。
+        root.cancel_copy(0)?;
+        // 取消不撤销服务端已提交效果：只观察一次，名字可见/尚不可见都合法。
         let observed = match kind {
-            Kind::Property => client.get_value(to, deadline()?).map(|_| ()),
-            Kind::Stream => client.read_at(to, 0, 1, deadline()?).map(|_| ()),
+            Kind::Property => Client::new(&ns, root, limits())
+                .get_value(to, deadline()?)
+                .map(|_| ()),
+            Kind::Stream => Client::new(&ns, root, limits())
+                .read_at(to, 0, 1, deadline()?)
+                .map(|_| ()),
         };
         let visible = match observed {
             Ok(()) => true,
@@ -515,7 +521,6 @@ pub(crate) fn exercise(
             kind,
             visible
         );
-        root.cancel_copy(0)?;
         // 后继 waiter 保持存活，原回复邮箱实际处理旧 txid 后才恢复其业务。
         root.await_copy_late_reply()?;
         root.set_copy_hold(1, false)?;
@@ -539,7 +544,7 @@ pub(crate) fn exercise(
         if !matches!(unknown[1].outcome, Some(Outcome::Complete { .. })) {
             return Err("Copy successor failed after late response");
         }
-        if client
+        if Client::new(&ns, root, limits())
             .get::<u64>("/secondary/init-copy-successor", deadline()?)
             .map_err(|_| "Copy reply isolation failed")?
             != 0x81927364
@@ -547,7 +552,7 @@ pub(crate) fn exercise(
             return Err("Copy reply isolation value invalid");
         }
         // 未知目标留给 provider 的原 backing/停止 owner，不按名字删除它。
-        remove(&mut client, "/secondary/init-copy-successor")?;
+        remove(root, &ns, "/secondary/init-copy-successor")?;
     }
     libkernel::debug!("FS1 independent Create uncertainty and reply isolation passed");
     for path in [
@@ -562,7 +567,7 @@ pub(crate) fn exercise(
         "/secondary/init-copy-replaced",
         "/secondary/init-copy-pinned",
     ] {
-        remove(&mut client, path)?;
+        remove(root, &ns, path)?;
     }
     Ok(())
 }
@@ -573,11 +578,7 @@ pub(crate) fn start_shutdown(
     secondary: &MailboxSender,
 ) -> Result<(), &'static str> {
     let ns = namespace(primary, secondary)?;
-    let mut caller = Caller::new();
-    source(
-        &mut Client::new(&ns, &mut caller, limits()),
-        "/primary/init-copy-shutdown-source",
-    )?;
+    source(root, &ns, "/primary/init-copy-shutdown-source")?;
     start(
         root,
         [task(
@@ -600,11 +601,7 @@ pub(crate) fn finish_shutdown(
         return Err("Copy provider shutdown progress invalid");
     }
     let ns = super::namespace(primary)?;
-    let mut caller = Caller::new();
-    remove(
-        &mut Client::new(&ns, &mut caller, limits()),
-        "/init-copy-shutdown-source",
-    )?;
+    remove(root, &ns, "/init-copy-shutdown-source")?;
     libkernel::debug!("FS1 in-flight Copy provider shutdown passed");
     Ok(())
 }

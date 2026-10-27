@@ -78,7 +78,7 @@ fn attributes(arch: &str) -> Vec<u8> {
     sub.extend_from_slice(&body);
 
     let mut data = vec![b'A'];
-    data.extend_from_slice(&(sub.len() as u32).to_le_bytes());
+    data.extend_from_slice(&((sub.len() + 4) as u32).to_le_bytes());
     data.extend_from_slice(&sub);
     data
 }
@@ -206,4 +206,35 @@ fn compatibility_gate() {
     // FLEN=128（Q-capable）不进入 D64：有效 FLEN 必须恰为 64
     assert!(!D64.compatible(128));
     assert!(D64.compatible(64));
+}
+
+#[test]
+fn attributes_respect_vendor_and_subsection_boundaries() {
+    let good = attributes(RV64I);
+    for size in [0u32, 4, (good.len() + 1) as u32] {
+        let mut malformed = good.clone();
+        malformed[1..5].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(
+            requirement(&build_elf(LP64_SOFT, Some(&malformed))),
+            Err(IsaReqError::MalformedAttributes)
+        );
+    }
+    let mut foreign = good.clone();
+    foreign[5..10].copy_from_slice(b"other");
+    assert_eq!(
+        requirement(&build_elf(LP64_SOFT, Some(&foreign))),
+        Err(IsaReqError::MissingArch)
+    );
+    let mut short_file = good.clone();
+    short_file[12..16].copy_from_slice(&4u32.to_le_bytes());
+    assert_eq!(
+        requirement(&build_elf(LP64_SOFT, Some(&short_file))),
+        Err(IsaReqError::MalformedAttributes)
+    );
+    // 未知vendor可跨过；只有后继riscv块声明的架构有效。
+    foreign.extend_from_slice(&good[1..]);
+    assert_eq!(
+        requirement(&build_elf(LP64_SOFT, Some(&foreign))),
+        Ok(IsaRequirement::Base64)
+    );
 }

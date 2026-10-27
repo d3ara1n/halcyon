@@ -13,6 +13,9 @@ use libkernel::ipc::{
     wait_set::WaitSet,
 };
 
+/// reply、service、reply-observer与可选cancel的来源上界。
+pub const CALL_WAIT_SOURCES: usize = 4;
+
 struct ReplyPort {
     owner: Mailbox,
     sender: MailboxSender,
@@ -72,6 +75,36 @@ pub struct Caller {
     port: Option<ReplyPort>,
 }
 
+/// 顺序领域客户端的调用接点；宿主明确拥有调用与等待，库不注入调度回调。
+pub trait Exchange {
+    fn call(
+        &mut self,
+        service: &MailboxSender,
+        deadline: Deadline,
+        request: Request,
+    ) -> Result<Reply, CallError> {
+        self.call_cancelable(service, deadline, request, None)
+    }
+    fn call_cancelable(
+        &mut self,
+        service: &MailboxSender,
+        deadline: Deadline,
+        request: Request,
+        cancel: Option<Handle>,
+    ) -> Result<Reply, CallError>;
+}
+impl Exchange for Caller {
+    fn call_cancelable(
+        &mut self,
+        service: &MailboxSender,
+        deadline: Deadline,
+        request: Request,
+        cancel: Option<Handle>,
+    ) -> Result<Reply, CallError> {
+        Caller::call_cancelable(self, service, deadline, request, cancel)
+    }
+}
+
 enum OperationState {
     Unsent(Request),
     Sent(libkernel::ipc::message::ReplyObserver),
@@ -83,6 +116,7 @@ pub struct CallOperation<'a> {
     caller: &'a mut Caller,
     service: &'a MailboxSender,
     deadline: Deadline,
+    cancel: Option<Handle>,
     wait: Option<CallWait>,
     state: OperationState,
     protocol: u64,
@@ -208,14 +242,6 @@ impl CallWait {
         }
         Ok(true)
     }
-    fn cancelled(&self) -> Result<bool, CallCause> {
-        let Some((_, handle)) = self.cancel else {
-            return Ok(false);
-        };
-        libkernel::ipc::wait::probe(handle, ObjectSignals::READABLE | ObjectSignals::CLOSED)
-            .map(|signals| signals.intersects(ObjectSignals::READABLE | ObjectSignals::CLOSED))
-            .map_err(cause)
-    }
 }
 
 impl Caller {
@@ -273,8 +299,28 @@ impl<'a> CallOperation<'a> {
         caller: &'a mut Caller,
         service: &'a MailboxSender,
         deadline: Deadline,
+        request: Request,
+        cancel: Option<Handle>,
+    ) -> Result<Self, CallError> {
+        Self::prepare(caller, service, deadline, request, cancel, true)
+    }
+    /// 组合宿主使用自己的扁平等待装配；不创建私有WaitSet，也不在此调用宿主。
+    pub fn new_composed(
+        caller: &'a mut Caller,
+        service: &'a MailboxSender,
+        deadline: Deadline,
+        request: Request,
+        cancel: Option<Handle>,
+    ) -> Result<Self, CallError> {
+        Self::prepare(caller, service, deadline, request, cancel, false)
+    }
+    fn prepare(
+        caller: &'a mut Caller,
+        service: &'a MailboxSender,
+        deadline: Deadline,
         mut request: Request,
         cancel: Option<Handle>,
+        private_wait: bool,
     ) -> Result<Self, CallError> {
         let setup = (|| {
             request.new_attempt()?;
@@ -284,6 +330,9 @@ impl<'a> CallOperation<'a> {
             }
             caller.ensure_port()?;
             request.attach_reply(&caller.port.as_ref().expect("ReplyPort just created").sender)?;
+            if !private_wait {
+                return Ok(None);
+            }
             CallWait::new(
                 caller
                     .port
@@ -298,6 +347,7 @@ impl<'a> CallOperation<'a> {
                     .expect("reply preparation lost observer")
                     .as_handle(),
             )
+            .map(Some)
         })();
         let wait = match setup {
             Ok(wait) => wait,
@@ -309,7 +359,8 @@ impl<'a> CallOperation<'a> {
             caller,
             service,
             deadline,
-            wait: Some(wait),
+            wait,
+            cancel,
             state: OperationState::Unsent(request),
             protocol,
             txid,
@@ -317,24 +368,16 @@ impl<'a> CallOperation<'a> {
     }
 
     pub fn advance(&mut self) -> Result<Option<Reply>, CallCause> {
-        if matches!(self.state, OperationState::Unsent(_))
-            && self
-                .wait
-                .as_ref()
-                .expect("live call lost wait owner")
-                .cancelled()?
-        {
+        if matches!(self.state, OperationState::Unsent(_)) && self.cancelled()? {
             return Err(CallCause::Cancelled);
         }
         if let OperationState::Unsent(request) = &mut self.state {
             match request.try_send(self.service, self.deadline) {
                 Ok(()) => {
                     self.state = OperationState::Sent(request.take_observation());
-                    self.wait
-                        .as_mut()
-                        .expect("live call lost wait owner")
-                        .sent(self.service.as_handle())
-                        .map_err(cause)?;
+                    if let Some(wait) = self.wait.as_mut() {
+                        wait.sent(self.service.as_handle()).map_err(cause)?;
+                    }
                     return Ok(None);
                 }
                 Err(SystemCallError::MailboxFull) => return Ok(None),
@@ -362,7 +405,6 @@ impl<'a> CallOperation<'a> {
     }
 
     fn ready_at_deadline(&self) -> Result<bool, CallCause> {
-        let wait = self.wait.as_ref().expect("live call lost wait owner");
         let probe = |handle, signals| libkernel::ipc::wait::probe(handle, signals).map_err(cause);
         if let OperationState::Sent(observation) = &self.state {
             let port = self.caller.port.as_ref().expect("sent call lost ReplyPort");
@@ -376,7 +418,7 @@ impl<'a> CallOperation<'a> {
             if reply.intersects(ObjectSignals::CLOSED) {
                 return Err(CallCause::ServiceClosed);
             }
-            if wait.cancelled()? {
+            if self.cancelled()? {
                 return Err(CallCause::Cancelled);
             }
             if probe(self.service.as_handle(), ObjectSignals::CLOSED)?
@@ -388,7 +430,7 @@ impl<'a> CallOperation<'a> {
             }
             Ok(false)
         } else {
-            if wait.cancelled()? {
+            if self.cancelled()? {
                 return Err(CallCause::Cancelled);
             }
             let service = probe(
@@ -427,6 +469,66 @@ impl<'a> CallOperation<'a> {
                 None => return Err(CallCause::System(SystemCallError::InternalError)),
             }
         }
+    }
+
+    fn cancelled(&self) -> Result<bool, CallCause> {
+        self.cancel
+            .map(|handle| {
+                libkernel::ipc::wait::probe(handle, ObjectSignals::READABLE | ObjectSignals::CLOSED)
+                    .map(|signals| signals.raw() != 0)
+                    .map_err(cause)
+            })
+            .transpose()
+            .map(|ready| ready.unwrap_or(false))
+    }
+    /// 真实就绪优先于期限。宿主只在false时登记下面的来源并让出。
+    pub fn poll_ready(&self) -> Result<bool, CallCause> {
+        if self.phase().is_none() {
+            return Err(CallCause::System(SystemCallError::ObjectBusy));
+        }
+        if self.ready_at_deadline()? {
+            return Ok(true);
+        }
+        if libkernel::time::expired(self.deadline).map_err(cause)? {
+            return Err(CallCause::Timeout);
+        }
+        Ok(false)
+    }
+    /// 来源只借用原调用owner；宿主须先完成注销，再推进到完成或abort。
+    pub fn wait_sources(&self) -> [(Handle, ObjectSignals); CALL_WAIT_SOURCES] {
+        let port = self.caller.port.as_ref().expect("live call owns ReplyPort");
+        let sent = matches!(self.state, OperationState::Sent(_));
+        let observation = match &self.state {
+            OperationState::Unsent(request) => request
+                .observation()
+                .expect("unsent reply observer")
+                .as_handle(),
+            OperationState::Sent(observer) => observer.as_handle(),
+            OperationState::Completed => panic!("completed call has no waiting sources"),
+        };
+        [
+            (
+                port.owner.as_handle(),
+                if sent {
+                    ObjectSignals::READABLE | ObjectSignals::CLOSED
+                } else {
+                    ObjectSignals::CLOSED
+                },
+            ),
+            (
+                self.service.as_handle(),
+                if sent {
+                    ObjectSignals::CLOSED
+                } else {
+                    ObjectSignals::WRITABLE | ObjectSignals::CLOSED
+                },
+            ),
+            (observation, ObjectSignals::PEER_CLOSED),
+            (
+                self.cancel.unwrap_or(Handle::INVALID),
+                ObjectSignals::READABLE | ObjectSignals::CLOSED,
+            ),
+        ]
     }
 
     pub fn abort(&mut self, cause: CallCause) -> Option<CallError> {

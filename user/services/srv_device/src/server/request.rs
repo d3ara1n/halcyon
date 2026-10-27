@@ -111,13 +111,7 @@ impl Request {
                 .as_ref()
                 .is_some_and(|adapter| adapter.context == who)
                 && protocol::ProvisionCommand::decode(&context.payload, input_handles).is_ok_and(
-                    |(_, command)| {
-                        matches!(
-                            command,
-                            protocol::ProvisionCommand::Stop(_)
-                                | protocol::ProvisionCommand::ConfirmStopped(_)
-                        )
-                    },
+                    |(_, command)| matches!(command, protocol::ProvisionCommand::Stop { .. }),
                 )
         } else {
             decoded.as_ref().is_ok_and(|(_, command)| match command {
@@ -131,7 +125,15 @@ impl Request {
                     a.contains(libdevice::registry::Access::CLAIM)
                         || a.contains(libdevice::registry::Access::ADMIN)
                 }),
-                Command::StopBinding | Command::ReportStopped => bound_control,
+                Command::StopBinding => bound_control,
+                Command::ReportQuiescent => {
+                    !bound_control
+                        && bound.as_ref().is_some_and(|binding| {
+                            binding.use_access().is_ok_and(|access| {
+                                access.contains(libdevice::binding::UseAccess::REPORT_QUIESCENT)
+                            })
+                        })
+                }
                 Command::WithdrawDevice => {
                     role.is_some_and(|r| matches!(r.kind, RoleKind::Device { .. }))
                 }
@@ -224,9 +226,11 @@ impl Request {
                 control.observe(event);
                 provider.observe(event);
             }
-            Owner::Binding { control, .. }
-            | Owner::Use { control, .. }
-            | Owner::Watch { control, .. } => control.observe(event),
+            Owner::Binding { control, work, .. } => {
+                control.observe(event);
+                work.observe(event);
+            }
+            Owner::Use { control, .. } | Owner::Watch { control, .. } => control.observe(event),
             Owner::None => {}
         }
     }
@@ -247,9 +251,13 @@ impl Request {
                 control.registered(kind, id);
                 provider.registered(kind, id);
             }
-            Owner::Binding { control, .. }
-            | Owner::Use { control, .. }
-            | Owner::Watch { control, .. } => control.registered(kind, id),
+            Owner::Binding { control, work, .. } => {
+                control.registered(kind, id);
+                work.registered(kind, id);
+            }
+            Owner::Use { control, .. } | Owner::Watch { control, .. } => {
+                control.registered(kind, id)
+            }
             Owner::None => {}
         }
     }
@@ -265,9 +273,11 @@ impl Request {
                 control.unregistered(id);
                 provider.unregistered(id);
             }
-            Owner::Binding { control, .. }
-            | Owner::Use { control, .. }
-            | Owner::Watch { control, .. } => control.unregistered(id),
+            Owner::Binding { control, work, .. } => {
+                control.unregistered(id);
+                work.unregistered(id);
+            }
+            Owner::Use { control, .. } | Owner::Watch { control, .. } => control.unregistered(id),
             Owner::None => {}
         }
     }
@@ -411,6 +421,7 @@ impl Request {
                 identity,
                 limits,
                 claimable,
+                stop_requirement,
             } => {
                 let cap = {
                     let (context, _) = self
@@ -431,6 +442,7 @@ impl Request {
                     identity,
                     limits,
                     claimable,
+                    stop_requirement,
                     endpoint,
                 };
                 if let Some(device) = world
@@ -566,10 +578,31 @@ impl Request {
                 let used = protocol::encode_snapshot(snapshot, &mut body)?;
                 self.encode(None, &body[..used])?;
             }
+            Command::QueryUse => {
+                if self.bound_control {
+                    return Err(Error::Permission);
+                }
+                let binding = self.bound(false)?;
+                let info = protocol::UseInfo {
+                    binding: binding.snapshot(&world.registry)?,
+                    stop_requirement: binding.stop_requirement(),
+                    access: binding.use_access()?,
+                };
+                let used = info.encode(&mut body)?;
+                self.encode(None, &body[..used])?;
+            }
             Command::IssueUse => {
                 let binding = self.bound(true)?;
                 let snapshot = binding.snapshot(&world.registry)?;
+                if snapshot.phase == Phase::Released {
+                    return Err(Error::Closed);
+                }
+                if let Some(entry) = binding.use_entry()? {
+                    self.push(entry, TRANSPORT)?;
+                    return self.encode(None, &[]);
+                }
                 world.registry.binding_usable(snapshot.reference)?;
+                binding.use_access()?;
                 let minted = world.mailbox.mint(0, TRANSPORT)?;
                 let context = minted.sender.description()?.object_id;
                 let role = world.prepare_role(
@@ -583,12 +616,15 @@ impl Request {
                     TRANSPORT,
                 )?;
                 world.roles.insert_prepared(role);
-                // Use 不需要母本恢复；每次发行是一个受控角色，别名复制保留同一 context。
-                world
+                // 原轮只提交一个 Use；母本归 Binding，Released 时关闭。
+                let sender = world
                     .roles
                     .get_mut(context)
                     .expect("device use role disappeared")
-                    .sender = None;
+                    .sender
+                    .take()
+                    .expect("device use sender missing");
+                binding.install_use(sender);
                 self.owner = Owner::Use {
                     context,
                     control: Observed::lifetime(minted.lifetime, 3),
@@ -598,6 +634,9 @@ impl Request {
                 self.encode(None, &[]).unwrap_or_else(|error| fatal(error));
             }
             Command::GetResource { name } => {
+                if self.bound_control {
+                    return Err(Error::Permission);
+                }
                 let (used, capability, rights) =
                     self.bound(false)?
                         .resource(&world.registry, name, &mut body)?;
@@ -609,8 +648,11 @@ impl Request {
                 world.dirty = true;
                 self.encode(None, &[])?;
             }
-            Command::ReportStopped => {
-                self.wake = Some(self.bound(true)?.report_stopped()?);
+            Command::ReportQuiescent => {
+                if self.bound_control {
+                    return Err(Error::Permission);
+                }
+                self.wake = Some(self.bound(false)?.report_quiescent(&world.registry)?);
                 self.encode(None, &[])?;
             }
             Command::WithdrawDevice => {
@@ -645,7 +687,16 @@ impl Request {
                 )?;
             }
             Command::IssueRegistrar => {
-                let snapshot = self.bound(true)?.snapshot(&world.registry)?;
+                let binding = self.bound(true)?;
+                let snapshot = binding.snapshot(&world.registry)?;
+                if snapshot.phase == Phase::Released {
+                    return Err(Error::Closed);
+                }
+                if let Some((a, b)) = binding.registrar()? {
+                    self.push(a.into_capability(), TRANSPORT)?;
+                    self.push(b.into_capability(), TRANSPORT)?;
+                    return self.encode(None, &[]);
+                }
                 let source = Source::prepare(
                     world,
                     Some(snapshot.subject.context()),
@@ -744,7 +795,21 @@ impl Request {
             )?;
             return self.encode(None, &body[..8 + used]);
         }
-        let progress = adapter.command(command)?;
+        let signal = if matches!(command, protocol::ProvisionCommand::Prepare(_)) {
+            Some(
+                self.outbox
+                    .as_mut()
+                    .ok_or(Error::Closed)?
+                    .response_mut()?
+                    .parts()?
+                    .0
+                    .handles
+                    .take(1)?,
+            )
+        } else {
+            None
+        };
+        let progress = adapter.command(command, signal)?;
         let mut bytes = [0; protocol::HEADER_LEN + 16];
         let used = progress.encode(command, &mut bytes)?;
         let (_, body) = Header::decode(&bytes[..used])?;
@@ -817,8 +882,9 @@ impl Request {
             observer.into_capability(),
             Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
         )?;
-        let info = world.registry.create_watch(source, target, context, task)?;
+        world.registry.create_watch(source, target, context, task)?;
         world.roles.insert_prepared(role);
+        let info = world.signal_watch(context)?;
         world
             .roles
             .get_mut(context)

@@ -1,7 +1,6 @@
 //! 有界入站 RPC；统一激活/观察由 libdriver 持有，HID 仅解释本领域供应。
 use super::*;
 use alloc::vec::Vec;
-use libdriver::worker::Activate;
 use libkernel::ipc::message::ReceivedMessage;
 use librpc::{exchange::RequestContext, outbox::Outbox};
 pub(super) struct Request {
@@ -10,7 +9,6 @@ pub(super) struct Request {
     wire: Vec<u8>,
     header: protocol::Header,
     handles: usize,
-    activation: Option<Activate>,
     instance: Option<InstanceRef>,
     outbox: Outbox,
     done: bool,
@@ -42,8 +40,9 @@ impl Request {
         let handles = context.handles.remaining();
         let control_request = kind == protocol::ID
             && world.control.is_manager_context(who)
-            && protocol::Command::decode(&wire, handles)
-                .is_ok_and(|(_, command)| matches!(command, protocol::Command::Stop { .. }));
+            && protocol::Command::decode(&wire, handles).is_ok_and(|(_, command)| {
+                matches!(command, protocol::Command::QueryActivationResult { .. })
+            });
         let outbox = Outbox::prepare(
             context,
             protocol::HEADER_LEN + protocol::BODY_MAX,
@@ -58,7 +57,6 @@ impl Request {
             wire,
             header,
             handles,
-            activation: None,
             instance: world.context(who),
             outbox,
             done: false,
@@ -98,55 +96,61 @@ impl Request {
     }
     fn activate(
         &mut self,
-        id: u64,
+        _id: u64,
         world: &mut World,
         requests: &mut Requests<'_, Family>,
     ) -> Result<(), Error> {
         if !world.control.is_manager_context(self.context) {
             return Err(Error::Permission);
         }
+        let command = world
+            .control
+            .command(self.context, &self.wire, self.handles)?;
         if self.instance.is_none() {
-            let (_, command) = protocol::Command::decode(&self.wire, self.handles)?;
-            self.instance = Some(world.associate(command.reference(), requests)?);
+            self.instance = match command {
+                protocol::Command::Activate { .. } => {
+                    Some(world.associate(command.reference(), requests)?)
+                }
+                protocol::Command::QueryActivationResult { reference } => world
+                    .instances
+                    .iter()
+                    .find(|instance| instance.borrow().slot.reference() == reference)
+                    .cloned(),
+            };
         }
-        let instance = self.instance.as_ref().ok_or(Error::NotReady)?.clone();
+        let instance = self.instance.as_ref().ok_or(Error::NotFound)?.clone();
         let mut state = instance.borrow_mut();
-        if state.task != 0 {
-            requests.wake(state.task)?;
-        }
-        if self.activation.is_none() {
-            self.activation = Some(Activate::adopt(
-                &world.control,
-                &state.slot,
-                self.context,
-                &self.wire,
-                self.handles,
-                &mut self.outbox,
-            )?);
-        }
-        let activation = self.activation.as_mut().ok_or(Error::Invalid)?;
-        let complete = activation.advance(
-            &mut state.slot,
-            &mut world.rpc,
-            id,
-            self.header.deadline,
-            &world.funding,
-        )?;
-        world.rpc_dirty = true;
-        if complete {
-            if state.task != 0 {
-                requests.wake(state.task)?;
+        match command {
+            protocol::Command::Activate { .. } => {
+                if state.slot.accept_activation(
+                    &world.control,
+                    self.context,
+                    &self.wire,
+                    self.handles,
+                    &mut self.outbox,
+                )? {
+                    if state.task != 0 {
+                        requests.wake(state.task)?;
+                    }
+                    if let Some(task) = state.slot.lifecycle_task() {
+                        requests.wake(task)?;
+                    }
+                }
             }
-            state.slot.receipt(
-                &mut self.outbox,
-                self.header.op,
-                "keyboard",
-                b"hid:boot-keyboard",
-            )?;
-            self.done = true;
+            protocol::Command::QueryActivationResult { reference } => {
+                state.slot.query_result(reference)?
+            }
         }
+        state.slot.receipt(
+            &mut self.outbox,
+            self.header.op,
+            "keyboard",
+            b"hid:boot-keyboard",
+        )?;
+        self.done = true;
         Ok(())
     }
+
     fn discover(&mut self, _world: &World) -> Result<(), Error> {
         use liboal::protocol::{self as oal, Response, Status};
         let instance = self.instance.as_ref().ok_or(Error::Permission)?.clone();
@@ -157,8 +161,7 @@ impl Request {
             }
             if !state
                 .slot
-                .activation
-                .as_ref()
+                .activation()
                 .is_some_and(|a| a.snapshot().phase == protocol::Phase::Ready)
             {
                 return Err(Status::Revoked);
@@ -207,8 +210,7 @@ impl Request {
         if function
             && !state
                 .slot
-                .activation
-                .as_ref()
+                .activation()
                 .is_some_and(|a| a.snapshot().phase == protocol::Phase::Ready)
         {
             return Err(Error::Closed);
@@ -230,6 +232,7 @@ impl Request {
         requests: &mut Requests<'_, Family>,
         input: &mut Input<'_>,
     ) -> Result<Advance, SystemCallError> {
+        let changes_instance = self.kind != protocol::ID || self.header.op == 1;
         while let Some(event) = input.pull() {
             self.outbox.observe(event);
         }
@@ -238,12 +241,7 @@ impl Request {
         }
         if !self.done {
             if self.outbox.result().is_some() {
-                if let Some(activation) = &mut self.activation
-                    && !activation.retire(&mut world.rpc)
-                {
-                    return Ok(step(Step::Parked));
-                }
-                if let Some(instance) = &self.instance {
+                if changes_instance && let Some(instance) = &self.instance {
                     let mut state = instance.borrow_mut();
                     if self.kind == protocol::ID {
                         state.slot.reject_uncommitted();
@@ -278,7 +276,7 @@ impl Request {
                     libhid::protocol::ID => self.keyboard(world),
                     _ => Err(Error::Unsupported),
                 };
-                if let Some(instance) = &self.instance {
+                if changes_instance && let Some(instance) = &self.instance {
                     let mut state = instance.borrow_mut();
                     if result.is_err() && self.kind == protocol::ID {
                         state.slot.reject_uncommitted();

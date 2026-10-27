@@ -17,7 +17,7 @@ use libkernel::ipc::{
     capability::Capability,
     message::{MailboxSender, SenderAdoptFailure},
 };
-use librpc::{CallError, Caller, Reply, Request as RpcRequest};
+use librpc::{CallError, Exchange, Reply, Request as RpcRequest};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -138,11 +138,15 @@ impl EnumerationCursor {
 
 pub struct Client<'a> {
     namespace: &'a Namespace,
-    caller: &'a mut Caller,
+    caller: &'a mut dyn Exchange,
     limits: FollowLimits,
 }
 impl<'a> Client<'a> {
-    pub fn new(namespace: &'a Namespace, caller: &'a mut Caller, limits: FollowLimits) -> Self {
+    pub fn new(
+        namespace: &'a Namespace,
+        caller: &'a mut dyn Exchange,
+        limits: FollowLimits,
+    ) -> Self {
         Self {
             namespace,
             caller,
@@ -246,7 +250,7 @@ impl<'a> Client<'a> {
 }
 
 fn call(
-    caller: &mut Caller,
+    caller: &mut dyn Exchange,
     entry: &MailboxSender,
     request: &Request<'_>,
     deadline: Deadline,

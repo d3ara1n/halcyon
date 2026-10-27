@@ -42,11 +42,15 @@ impl Signal {
 }
 impl World {
     pub(super) fn signal_watch(&mut self, context: u64) -> Result<Info, Error> {
-        let info = self.registry.query_watch(context)?;
+        let mut info = self.registry.query_watch(context)?;
         let role = self.roles.get_mut(context).ok_or(Error::Permission)?;
-        let RoleKind::Watch { signal, .. } = &mut role.kind else {
+        let RoleKind::Watch { signal, binding } = &mut role.kind else {
             return Err(Error::Permission);
         };
+        info.binding = binding
+            .as_ref()
+            .map(|binding| binding.snapshot(&self.registry))
+            .transpose()?;
         signal.update(info)?;
         Ok(info)
     }
