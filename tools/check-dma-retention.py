@@ -42,6 +42,7 @@ set tcp auto-retry on
 set tcp connect-timeout 10
 file "{args.kernel.resolve()}"
 target remote 127.0.0.1:{port}
+set scheduler-locking off
 python
 {setup}
 end

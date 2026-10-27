@@ -1,6 +1,6 @@
 # 正式服务装配与监督设计
 
-状态：**设备第二轮持续监督已实施并通过所选组合验证；通用正式服务装配仍待后续设计，原设备独立门未全部关闭**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；已实现合同见[第二轮持续监督设计](#第二轮持续监督设计2026-10-27)，本轮实现、证据与边界见[机制收敛报告](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，原设备开放门见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)。
+状态：**设备第二轮持续监督已实施并通过所选组合验证；通用正式服务装配仍待后续设计**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；已实现合同见[第二轮持续监督设计](#第二轮持续监督设计2026-10-27)，本轮实现、证据与边界见[机制收敛报告](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备组合门及延期的时钟异常见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)。
 
 ## 目标与非目标
 
@@ -90,7 +90,7 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 ## 当前接力
 
-第二轮两条责任链已完成本次迁移并随 `c5d005d` 统一提交，[完整交付独立 Review](todo-2026-10-27-device-convergence-review.md)已登记；不再重做独立线程替换或 loader 分步化。设备后续从[调查接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)及唯一收口表处理 DMA＋IPI 和时钟异常；本案在正式长期服务、恢复或持久化停止提出实际需求时，按上述设计门闭合通用装配。仓库格式/安装更新、透明重启、通用 manifest 继续延期，不恢复双轨匹配或由 srv_device 启动驱动。
+第二轮两条责任链已完成本次迁移并随 `c5d005d` 统一提交，[完整交付独立 Review](todo-2026-10-27-device-convergence-review.md)已登记；不再重做独立线程替换或 loader 分步化。设备 DMA＋IPI 已补证关闭，时钟异常延期，后续从[交付接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)及唯一收口表接手；本案在正式长期服务、恢复或持久化停止提出实际需求时，按上述设计门闭合通用装配。仓库格式/安装更新、透明重启、通用 manifest 继续延期，不恢复双轨匹配或由 srv_device 启动驱动。
 
 ## 首批设备的持续监督接线
 

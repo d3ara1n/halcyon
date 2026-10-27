@@ -1,8 +1,8 @@
 # 设备体系设计：领域模型、驱动管理与资源收束
 
-> 状态：**第二轮机制收敛、生命周期收口及所选组合验证已完成，完整代码交付已提交为 `c5d005d`；首批完整闭包仍有独立门未关闭。** 本篇拥有详细目标、实施与原开放验收门；第二轮发现、处置与验证见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)及[生命周期收口档案](archived/review-2026-10-27-device-lifecycle.md)，当前[固定交付独立 Review](todo-2026-10-27-device-convergence-review.md)已登记、尚未执行。当前交付与后续安排见[提交与调查接力](#第二轮提交与调查接力)。服务装配、平台保留内存和系统终局仍由各自计划拥有；首轮检查点与证据边界见[历史审查交接](#审查交接2026-10-27)。
+> 状态：**第二轮完整代码交付已提交为 `c5d005d`；DMA＋IPI 组合门已补证关闭，独立时钟异常按用户决定延期。** 本篇拥有详细目标、实施与验收门；第二轮发现、处置与验证见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)及[生命周期收口档案](archived/review-2026-10-27-device-lifecycle.md)，当前[固定交付独立 Review](todo-2026-10-27-device-convergence-review.md)已登记、尚未执行。本次单项调查不重新宣告首批总体交付，当前交付与后续安排见[提交与调查接力](#第二轮提交与调查接力)。服务装配、平台保留内存和系统终局仍由各自计划拥有；首轮检查点与证据边界见[历史审查交接](#审查交接2026-10-27)。
 
-第二轮已实施合同及原验证由[机制收敛档案](archived/review-2026-10-27-device-implementation.md)保存；其后的[生命周期与观察收口](archived/review-2026-10-27-device-lifecycle.md)已完成修复、复核及所选组合验证，该档案保存增量目标和证据。[唯一收口表](#当前唯一收口表2026-10-26)继续维护DMA＋IPI待证与独立时钟异常，原全hart idle门已在替代结构下关闭。impls按当前代码回填；历史施工与审查交接段保留当时事实，不从其中的旧目标恢复施工。
+第二轮已实施合同及原验证由[机制收敛档案](archived/review-2026-10-27-device-implementation.md)保存；其后的[生命周期与观察收口](archived/review-2026-10-27-device-lifecycle.md)已完成修复、复核及所选组合验证，该档案保存增量目标和证据。[唯一收口表](#当前唯一收口表2026-10-26)保存已关闭的 DMA＋IPI、全 hart idle 门及延期的独立时钟异常。impls按当前代码回填；历史施工与审查交接段保留当时事实，不从其中的旧目标恢复施工。
 
 ## 目标与范围
 
@@ -200,12 +200,29 @@ C5 的 DMA 未发布空根构造回退按内核独立契约实施：末次 retai
 
 最近版本已通过 `just check`、十分面 Clippy、137项相关 host 测试及 core/reuse/candidates/QueryUse/GetResource/Master 六条真实路线，具体证据与精确交错未动态注入的边界见[生命周期交付档案](archived/review-2026-10-27-device-lifecycle.md#最终组合验证与交付边界)。提交整理已核源码与该版本指纹一致，不重复运行已通过路线；较早第二轮平台/监督/IRQ 证据按原档案的版本和覆盖边界复用，不冒充本轮逐项重跑。
 
-用户已确认后续主线转入剩余问题调查，按以下顺序接续：
+本次 DMA＋IPI 单项调查已完成，后续从以下当前状态接手：
 
-1. **DMA 保留＋IPI 失败组合**：从[唯一收口表](#当前唯一收口表2026-10-26)的原第五轮断点开始，先核当前产物及已修正诊断脚本，再取同次 InitialWatch DONE、同一真实 IPI call 的失败返回/消费、后续原广播及同组 Mapping/Backing 跨四 hart 停驻保留。保持 selector/WFI 和原映射集合判据；证据缺口不自动升级为产品缺陷，不另开重复计划。
-2. **独立平台时钟异常**：按[有限首因调查方案](#实际时钟失败的有限首因调查方案)接续，明确本次要区分的假设和有限观察窗口。历史未复现不算修复；本项不与 DMA＋IPI 的成败互相替代。
+1. **DMA 保留＋IPI 失败组合（已关闭）**：本次第四轮完整路线退出 0，同次 InitialWatch DONE、合格 WFI 目标的失败返回/消费、后续原广播及同组 Mapping/Backing 跨四 hart 停驻保留已取得证据。原 selector/WFI 与映射集合判据不变；[调查记录](#dmaipi-组合调查与关闭2026-10-27)保存工具修正、原失败和覆盖限制，不重复运行本门。
+2. **独立平台时钟异常（延期）**：保留原异常及[有限首因调查方案](#实际时钟失败的有限首因调查方案)，不随 DMA＋IPI 调查自动启动。后续明确安排时，再确定要区分的假设和有限观察窗口；若其他路线再次出现该终局，保存现场并按该路线失败收尾，不将其算作 DMA＋IPI 失败。历史未复现不算修复，本项不与 DMA＋IPI 的成败互相替代。
 
-调查前读取 DEBUG-PLAYBOOK，涉及 GDB/平台再读 TOOLING-PITFALLS。独立代码 Review 单独登记固定交付，不替代上述取证，也不重复已结束的设备迁移、全 hart idle 验收或线程监督改造。通用长期服务/持久化关机及其他扩展仍按各自触发条件设计。
+本次交付仅包含验收工具修正、证据收口及文档导航更新；未修改内核、用户态实现或共享 ABI，没有新确认的产品缺陷。按 REVIEW 的登记范围属于验收工具维护，不新增独立 Review 计划；既有代码 Review 继续按 `c5d005d` 固定交付单独安排。通用长期服务/持久化关机及其他扩展仍按各自触发条件设计。
+
+### DMA＋IPI 组合调查与关闭（2026-10-27）
+
+用户授权按既定方案持续完成单项调查，并将时钟专线延期。基线 `bf15db9`，工作树原有改动仅为本会话的延期安排；由 `just PLATFORM=qemu MODEL=virt MODE=debug make_dtb make_boot_package build_kernel` 准备当前产物。实际 kernel 为 `f084cf97906c26e31ca61e8822bb4070d315254139373fc151211c34ee3d081b`，不沿用第五轮 `7773d62e…` 的地址。所有运行均为 `THROTTLE=100 QEMU_ACCEPTANCE_KEEP_LOG=1 just virt-dma-ipi-retention`，完整 core 保留。
+
+| 本次运行 | 结果与证据 | 判定 |
+|---|---|---|
+| 第一轮 | [汇总](../artifacts/dma-ipi-investigation/20261027T113617Z/run-1-summary.json)、[原 GDB](../artifacts/dma-ipi-retention/20261027T113704.367421Z-88823/gdb.log)，exit 1 | 旧 scope RuntimeError 已被诊断捕获；52 次 IPI 中 44 次早于 Watch，剩余 8 次到 ecall 时 STOPPED 已为 1，未形成原 request-phase。单独 DMA 保留与四 park 通过，组合未注入；不能据此反推历史第四轮原因 |
+| 第二轮 | [汇总](../artifacts/dma-ipi-investigation/20261027T113617Z/run-2-summary.json)、[原 GDB](../artifacts/dma-ipi-retention/20261027T114200.745187Z-89594/gdb.log)，exit 1 | 新窗口控制前拒绝 GDB 默认 replay 模式，未注入 IPI；随后入口显式设置 scheduler-locking off |
+| 第三轮 | [汇总](../artifacts/dma-ipi-investigation/20261027T113617Z/run-3-summary.json)、[原 GDB](../artifacts/dma-ipi-retention/20261027T114522.713956Z-90281/gdb.log)，exit 1 | hart1→hart0 的 FAILED 已由原调用方消费；恢复调度后 hart2→hart0 原广播返回成功，但另一 hart 的虚拟栈读取失败。整体失败保留，不将局部证据拼成通过 |
+| 第四轮 | [汇总与清理](../artifacts/dma-ipi-investigation/20261027T113617Z/run-4-summary.json)、[指纹](../artifacts/dma-ipi-retention/20261027T115226.316524Z-91149/evidence.json)、[原 GDB](../artifacts/dma-ipi-retention/20261027T115226.316524Z-91149/gdb.log)、[客体](../artifacts/dma-ipi-retention/20261027T115226.316524Z-91149/qemu.log)，exit 0 | 原五个 DMA 观察点、同 call 失败返回/消费、同目标后续原广播及四 park 全部通过，组合门关闭 |
+
+工具改动限定为三处：`check-dma-retention.py` 固定 GDB 初始调度模式；`qemu_dma_gdb.py` 在真实 InitialWatch 的 request 入口接入组合窗口；`qemu_dma_ipi_gdb.py` 暂时只运行原请求者、消费一次失败后恢复全部 hart，并修正正式栈的物理读取。窗口内不写 guest REQUESTED/STOPPED、目标 PC 或 timer；原 request 结束仍无合格目标则恢复并失败。旧栈读法把栈窗口当成直映射；改用虚拟读取后实际又在跨 hart 返回处遇到 MemoryError，未取得足够证据归因该次虚拟访问失败。最终从同 ELF 的布局常量按 `mm::stack_layout` / `StackWindowLayout` 定位原 sender 正式栈，在物理模式内完成静态 DWARF Result 解码并保存原字节，不增加产品接口或测试运行体。路线机制与限制由[构建手册](BUILD-AND-TEST.md#节流超时与判定)拥有。
+
+第四轮 hart1 在 REQUESTED=1/STOPPED=0 时向 hart0 注入一次 SBI_ERR_FAILED；目标处于原 WFI 合格点，quantum=0、timer_first=None、timer_pending=false、SIP=0。原 wrapper 存下 error=-1/value=0，原 caller 的同一栈帧读到 `Err(SbiError::Failed)` 且 is_err=true；恢复调度后 hart2 在 STOPPED=1 的广播中向 hart0 返回并消费 `Ok(0)`，本次共记录 8 笔完整调用。两份 Mapping 9/10 各持原 Backing 的 0..2 页范围，reset 拒绝前、InitialWatch DONE、IPI 失败前后和四 park 的五点完全相同；各自 use/write 仍在、无 acquisition/release、Work=Idle。实际启动包 `1ac7f7c3…`、脚本 `d0577c9a…` 及完整 hash 在原指纹中。
+
+验证与交付前检查：当前 just 构建成功；生成脚本 AST、窗口开闭顺序、原 selector/注入/保留主体不变及错误 sender 栈拒绝的离线检查通过；实际第四轮覆盖新窗口控制和跨 hart 物理结果读取。最终源码指纹确认 521 项基线中仅上述三个工具变化，内核/用户态实现未变，故不重复 Rust check/clippy 或其他已过 QEMU 路线。各轮退出后核本次 QEMU/GDB/helper 已清理，最终没有残留；[文档与静态检查](../artifacts/dma-ipi-investigation/20261027T113617Z/final-check.json)记录脚本 AST、43 个新增/修改本地链接及 diff 空白通过。提交整理仅清理当前状态措辞，再核最终链接与已验收工具指纹，不改写前四轮结果。该证据只关闭一次 IPI 失败与稳定 DMA 保留的组合，不证明全部 IPI 永久失败、独占唤醒源或硬件 DMA 静止；本消费者未向设备编程 DMA 地址。时钟专线未运行，原异常仍延期开放。
 
 ## 领域、运行角色与 OAL
 
@@ -672,7 +689,7 @@ HID 驱动校验 boot keyboard 描述并 SET_PROTOCOL(0)，消费 8 字节报告
 
 ## 当前进度与接力
 
-第二轮设备控制链、root 持续监督与分步装配已完成，原首批闭包仍保留 DMA＋IPI 组合证据缺口和独立时钟异常；当前入口为[唯一收口表](#当前唯一收口表2026-10-26)。本轮整理及补充验证见[交付后整理](#第二轮交付后整理)。
+第二轮设备控制链、root 持续监督与分步装配已完成，DMA＋IPI 组合证据缺口已按原判据关闭，独立时钟异常延期；当前入口为[唯一收口表](#当前唯一收口表2026-10-26)。第二轮整理见[交付后整理](#第二轮交付后整理)，本次补证见[DMA＋IPI 调查](#dmaipi-组合调查与关闭2026-10-27)。
 
 > 下方首轮施工、交接及审查交接保留当时事实与授权，不是当前施工指令；其中旧接口、旧工作树状态和“下一步”不再生效。当前目标以第二轮收敛设计为准，原验收证据及剩余门只由唯一收口表维护。
 
@@ -1156,20 +1173,15 @@ QEMU_ACCEPTANCE_KEEP_LOG=1 just acceptance-virt
 
 本表拥有当前剩余门与证据分类；前文各轮施工/失败记录保留事实与路径，不再从历史“尚未接入”重复产生施工任务。原验收合同仍由正文拥有。待证项不是已证缺陷，不能用常规成功或另一个操作的证据替代。
 
-**独立异常记录：实际平台时钟失败，根因未定。** IRQ第三轮platform clock failed及原143主动收割保留，旧首因值不可恢复。一次THROTTLE100/冷启动/仅两错误点调查正常而未命中，仅not-reproduced；多项环境差异不能单项归因或宣布修复。该异常继续单列，不无限阻塞其他独立工作；后续只按明确单项安排，GDB使用100，若再现终局即收割留证，不机械增时或多轮追。下方剩余门不由本例关闭/重算。
+**独立异常记录：实际平台时钟失败，根因未定，按用户决定延期调查。** IRQ第三轮platform clock failed及原143主动收割保留，旧首因值不可恢复。一次THROTTLE100/冷启动/仅两错误点调查正常而未命中，仅not-reproduced；多项环境差异不能单项归因或宣布修复。DMA＋IPI 已补证关闭，不自动启动时钟专线。后续只按明确单项安排，GDB使用100，若其他路线再现时钟终局即收割留证，不机械增时或多轮追，不算作DMA＋IPI机制失败。
 
-**已实现，待集中证据。**
-
-| 门 / 独立合同 | 原 owner 与最小验证边界 | 已有证据、剩余判据 |
-|---|---|---|
-| DMA保留与IPI失败组合 | 内核稳定Mapping/Backing owner、原停止/IPI协议 | third缺失败返回、第四轮资格未知各自保留。第五轮exit1，[原GDB](../artifacts/dma-ipi-retention/20261027T020938.232656Z-2391/gdb.log)到实际IPI ecall，但首候选诊断RuntimeError导致资格/注入/消费/InitialDONE/四park均未完成，不能反推第四轮。最后纯诊断修正已通过[离线生成/反例](../artifacts/device-closing/dma-ipi-fifth-offline/validation.json)，先保存标量、分别记录帧查询异常、原错先锁定且不重复采栈，必需门未改；修正版未运行。后续明确启动此门时，沿原实际 InitialWatch DONE、同 call 失败返回/消费、后续原广播及同组 mapping 跨四 hart 停驻完成取证；不放宽 selector/WFI，不以第二轮普通通过替代。 |
-
-**审查代码责任。** 第二轮目标已写入本篇与服务装配计划，一致性重构、所选组合验证及交付前结构检查已完成；确认缺陷、设计处置和验证证据见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)，本表不复制 findings。全 hart idle 门已在替代结构下通过并移入下表；DMA＋IPI 与独立时钟异常继续开放，首批整体闭包尚未交付。
+**审查代码责任。** 第二轮目标已写入本篇与服务装配计划，一致性重构、所选组合验证及交付前结构检查已完成；确认缺陷、设计处置和验证证据见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)，本表不复制 findings。全 hart idle 与 DMA＋IPI 门均见下表；固定代码交付的独立 Review 仍待执行。本次单项补证不重新核定首批总体交付，也不关闭延期的时钟异常。
 
 **已通过，可复用。**
 
 | 已关闭门 | 原证据入口与限制 |
 |---|---|
+| DMA保留与IPI失败组合 | [本次第四轮完整证据](../artifacts/dma-ipi-investigation/20261027T113617Z/run-4-summary.json)、[实际指纹](../artifacts/dma-ipi-retention/20261027T115226.316524Z-91149/evidence.json)，`THROTTLE=100 QEMU_ACCEPTANCE_KEEP_LOG=1 just virt-dma-ipi-retention`退出0。hart1→hart0原request中的FAILED由原wrapper/caller返回并消费，恢复全部hart调度后hart2→hart0原STOPPED广播返回并消费Ok(0)，四hart进入park；同Mapping9/10、各自同Backing范围0..2/use/write/Idle跨五点不变。原selector/WFI及保留判据不放宽，工具窗口与栈读取修正、历史失败及边界见[调查记录](#dmaipi-组合调查与关闭2026-10-27)。不排除timer/其他唤醒，不证明硬件DMA静止或永久IPI失败活性 |
 | 全 hart idle 与真实 IRQ 唤醒（第二轮结构） | `THROTTLE=100 just acceptance-irq-idle` 退出 0，[入口](../artifacts/run/20261027-142222-48689-acceptance-irq-idle.log)、[原共同快照与 IRQ 证据](../artifacts/device-function/20261027T062229.574930Z-49086/evidence.json)。第六次共同取样四 hart 同时 idle_mask=15、current=0、ready_len=0、remote_head=0、timer_pending=false，maintenance_ready=0，PC 位于原 post-check/WFI 合格点；保留未来 timer。QMP 插入前 source33/gen5 无 pending，插入后同源 pending 且 hart0 SIP.SEIP，随后同源 claim；timer_coincident=false。两轮真实 Take/Ack、旧 token Closed/新代拒旧 token 与完整 core 收口通过。旧八轮事实保留；不声称已证明旧失败的唯一根因。已删除的 PCI 周期 Query 专属探针不再作为前置。  统一root后再次退出0：[新版入口](../artifacts/run/20261027-161721-99758-acceptance-irq-idle.log)、[共同快照](../artifacts/device-function/20261027T081730.356125Z-245/evidence.json)，verified=true；仍为四hart current=0/idle_mask=15，ready/remote/timer_pending/maintenance为空，同source33/gen5由pending=false到真实插入后pending/claim，无timer共现，完整core通过。 |
 | 平台供应、真实PCI/USB/HID、单键盘热插与多Binding进程复用 | 上文正常release、observer-reuse-third及原A/B/C证据；直接端口多设备不代表复合USB接口 |
 | 运行期监督/最早Start/Stopping、HID及真实主控死亡、reset拒绝保留 | 各角色原fault与三阶段DMA日志；不宣称死亡后硬件静止或全额退款 |
@@ -1191,7 +1203,7 @@ QEMU_ACCEPTANCE_KEEP_LOG=1 just acceptance-virt
 | IRQ直接已park退出与含Line成员Set随宿主退出 | [IRQ第六轮原观察](../artifacts/irq-exit/20261026T100635.591971Z-41077/evidence.json)PID28/source32/gen6 Waiting/epoch2、原Line loan/节点链；PID29/gen7实际Running但cap slot4/gen1/rights69持WaitSet KOID19019，唯一Member实际挂原Line。两者Kill后各同generation原Line空链/Idle/强根回原两owner，[客体405–409](../artifacts/qemu-acceptance-20261026-180630-41066.log)Pool19003/19011两维全零及scopeDONE，整轮core/shutdown通过。第四/第五轮WaitOne最小证据仍复用，旧整体失败不改写；不代表Set宿主Waiting/所有等待形态或强公平 |
 | IRQ持续事件有界推进/普通任务服务机会 | 监督已亲读原248/250/276/455及真实接线，按下方“IRQ持续事件证据映射”的结构+host+集成组合审定关闭独立差额：单claim/单Line节点锁外Delivery、SEIP Requeue→原安全点→M单advance_one→有限机会rotor、正式xHCI 16事件/more→Runnable，加PLIC/signal/rotor既有host和真实READABLE业务进展/连续Take-Ack/退出证据。7相关源文件与既有验证版本一致；未执行任意高频/同hart指定比例/无限时长压力，不宣称其运行通过。原持续事件合同保留，全idle共同快照与外部唤醒仍单列 |
 
-当前收口方式：第二轮设备控制链、root持续监督及生命周期增量已经完成，按[提交与调查接力](#第二轮提交与调查接力)统一保存交付并转入剩余问题调查。原 DMA＋IPI 组合与独立时钟异常继续由本表承接；已关闭的全 hart idle 门见上表。历史失败保留原样，不从机制收敛推导首批全部验收交付。
+当前收口方式：第二轮设备控制链、root持续监督及生命周期增量已经完成，DMA＋IPI 组合与全 hart idle 门均已关闭；独立时钟异常延期、固定交付独立 Review 待执行。按[提交与调查接力](#第二轮提交与调查接力)接手，不恢复已关闭门或历史施工。历史失败保留原样，不从本次单项补证推导首批总体交付。
 
 #### 未发布DMA根的首轮历史证据
 

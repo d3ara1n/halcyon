@@ -12,8 +12,71 @@ ipi_calls = {}
 ipi_returns = []
 ipi_rejected = []
 ipi_eligibility = {'calls': 0, 'gates': {}, 'first': None, 'first_rejections': {}}
+ipi_window = None
 ipi_code = __CODE__
+ipi_stack = __STACK__
 print('DMA_IPI_CODE ' + json.dumps(ipi_code, sort_keys=True))
+
+def ipi_stack_address(address, size, slot):
+    # 对应mm::stack_layout与StackWindowLayout::formal_range/translate。
+    # 只接受原发送者的formal栈；ELF的.stack_window是NOLOAD虚拟预约，不能用其p_paddr。
+    require(0 <= slot < ipi_stack['slots'], 'IPI sender stack slot is invalid')
+    base = ipi_stack['window'] + slot * (ipi_stack['size'] + 2 * ipi_stack['guard']) + ipi_stack['guard']
+    require(base <= address and address + size <= base + ipi_stack['size'] - ipi_stack['emergency'],
+            'IPI result is outside the original sender formal stack')
+    return ipi_stack['physical'] + slot * ipi_stack['size'] + address - base
+
+def ipi_result_snapshot(address, slot):
+    kind = gdb.lookup_type('core::result::Result<usize, kernel::sbi::SbiError>')
+    physical = ipi_stack_address(address, kind.sizeof, slot)
+    response = gdb.execute('maintenance packet Qqemu.PhyMemMode:1', to_string=True)
+    require('OK' in response, 'QEMU physical memory mode is unavailable')
+    try:
+        result = gdb.Value(physical).cast(kind.pointer()).dereference()
+        tag = variant(result)
+        error = None
+        if tag == 'Err':
+            inner = result['Err']
+            error = str(inner[next(f.name for f in inner.type.fields() if f.name)])
+        # 所有lazy读取在同一物理模式内完成，跨模式只交标量。
+        raw = gdb.selected_inferior().read_memory(physical, kind.sizeof).tobytes().hex()
+        return {'tag': tag, 'text': str(result), 'error': error, 'physical': physical, 'bytes': raw}
+    finally:
+        gdb.execute('maintenance packet Qqemu.PhyMemMode:0', to_string=True)
+
+def ipi_request_started():
+    global ipi_window
+    require(ipi_window is None, 'initial DONE request window was entered twice')
+    require(physical_word(__REQ__, 1) == 0 and physical_word(__STOP__, 1) == 0,
+            'runtime stop was already published before the selected request')
+    require(gdb.parameter('scheduler-locking') == 'off', 'unexpected initial debugger scheduling mode')
+    # 只调度原请求者直到一次失败结果被消费，避免其他hart先提交STOPPED。
+    # 不改guest停止标志或目标PC；WFI、无quantum及原调用者资格仍在ecall处核验。
+    ipi_window = {'sender_thread': gdb.selected_thread().num, 'released': False}
+    gdb.execute('set scheduler-locking on')
+    ipi_request_end.enabled = True
+    print('DMA_IPI_WINDOW_BEGIN ' + json.dumps(ipi_window, sort_keys=True))
+
+def ipi_release_window():
+    require(ipi_window is not None and not ipi_window['released'], 'IPI request window is not held')
+    require(gdb.selected_thread().num == ipi_window['sender_thread'], 'IPI request window changed sender')
+    gdb.execute('set scheduler-locking off')
+    ipi_request_end.enabled = False
+    ipi_window['released'] = True
+    print('DMA_IPI_WINDOW_END ' + json.dumps(ipi_window, sort_keys=True))
+
+class IpiRequestEnd(gdb.Breakpoint):
+    def stop(self):
+        global failure
+        try:
+            # 原request返回后即调用check；没有合格目标时结束本次有限窗口。
+            ipi_release_window()
+            raise gdb.GdbError('selected request ended without an eligible IPI failure')
+        except Exception as error:
+            failure = str(error)
+            print('DMA_IPI_WINDOW_FAILED ' + json.dumps({
+                'error': failure, 'eligibility': ipi_eligibility}, sort_keys=True))
+            return True
 
 def ipi_snapshot(result):
     # 仅首个候选/每个固定拒绝门采栈；只存标量，不携Frame/Value跨停点。
@@ -245,23 +308,28 @@ class IpiConsumed(gdb.Breakpoint):
         try:
             require('error' in call, 'original IPI caller consumed a result without its raw return observation')
             require(int(gdb.parse_and_eval('$sp')) == call['caller_sp'], 'IPI result belongs to a different caller frame')
-            result_address = physical_word(call['caller_sp'] + __RESULT_SLOT__ - __DELTA__)
-            result = gdb.Value(result_address).cast(gdb.lookup_type('core::result::Result<usize, kernel::sbi::SbiError>').pointer()).dereference()
-            tag = variant(result)
+            slot_address = call['caller_sp'] + __RESULT_SLOT__
+            call['result_slot_address'] = slot_address
+            slot_physical = ipi_stack_address(slot_address, 8, call['sender']['slot'])
+            result_address = physical_word(slot_physical)
+            result = ipi_result_snapshot(result_address, call['sender']['slot'])
+            tag = result['tag']
             rejected = int(gdb.parse_and_eval('$a0'))
-            call.update(result_address=result_address, result=str(result), is_err=bool(rejected))
+            call.update(result_address=result_address, result=result['text'],
+                        result_memory=result, result_slot_physical=slot_physical, is_err=bool(rejected))
             require(rejected == int(call['error'] != 0), 'original Result::is_err did not consume the observed SBI result')
             if call['injected']:
                 require(tag == 'Err', 'original SBI wrapper did not return an error')
-                inner = result['Err']
-                require(str(inner[next(f.name for f in inner.type.fields() if f.name)]).endswith('SbiError::Failed'),
+                require(result['error'].endswith('SbiError::Failed'),
                         'original SBI wrapper did not classify SBI_ERR_FAILED')
             else:
                 require(tag == 'Ok', 'later original IPI did not return Ok')
-            call.update(consumed=True, result_address=result_address, result=str(result), is_err=bool(rejected))
+            call['consumed'] = True
             ipi_returns.append(dict(call))
             del ipi_calls[gdb.selected_thread().num]
             print('DMA_IPI_RETURN ' + json.dumps(call, sort_keys=True))
+            if call['injected']:
+                ipi_release_window()
             return False
         except Exception as error:
             failure = str(error)
@@ -274,6 +342,8 @@ ipi_return = IpiReturn('*__RETURN__', type=gdb.BP_HARDWARE_BREAKPOINT)
 ipi_return.enabled = False
 ipi_consumed = IpiConsumed('*__CONSUMED__', type=gdb.BP_HARDWARE_BREAKPOINT)
 ipi_consumed.enabled = False
+ipi_request_end = IpiRequestEnd('*__CHECK__', type=gdb.BP_HARDWARE_BREAKPOINT)
+ipi_request_end.enabled = False
 '''
 
 FINISH = r'''
@@ -286,6 +356,7 @@ require(any(not call['injected'] and call['stopped'] == 1 and call['error'] == 0
         'later original stop broadcast to the same target was not observed')
 require(ipi_observation['target_registers']['thread'] in parked, 'failed IPI target did not reach terminal park')
 require(not ipi_calls, 'an original observed IPI still lacks caller consumption')
+require(ipi_window is not None and ipi_window['released'], 'debugger request window was not released')
 print('DMA_IPI_RETENTION_PASSED: same exposed mappings survive one request-broadcast IPI failure and four parks; other wake sources not excluded')
 '''
 
@@ -320,6 +391,12 @@ def observation_points(kernel, symbols, ecall):
 
 def program(kernel, symbols, ecall):
     points = observation_points(kernel, symbols, ecall)
+    stack = {
+        'window': symbols['STACK_WINDOW_VA_BASE'], 'size': symbols['STACK_SIZE'],
+        'guard': symbols['STACK_GUARD'], 'emergency': symbols['EMERGENCY_SIZE'],
+        'slots': symbols['HART_NUM_LIMIT'],
+        'physical': symbols['__kernel_pa_end'] - symbols['STACK_SIZE'] * symbols['HART_NUM_LIMIT'],
+    }
     substitutions = {
         'REQ': hex(support.physical_address(kernel, symbols['kernel::runtime_stop::REQUESTED'])),
         'STOP': hex(support.physical_address(kernel, symbols['kernel::runtime_stop::STOPPED'])),
@@ -328,6 +405,8 @@ def program(kernel, symbols, ecall):
         'RETURN': hex(points['raw_return']),
         'CONSUMED': hex(points['consumed']),
         'RESULT_SLOT': str(points['result_slot']),
+        'CHECK': hex(symbols['kernel::runtime_stop::check']),
+        'STACK': repr(stack),
         'CODE': repr({name: value for name, value in points.items() if name != 'code'}),
     }
     setup = SETUP

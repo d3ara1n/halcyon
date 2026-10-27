@@ -99,6 +99,8 @@ GDB专项路线在各自artifacts目录下使用时间戳与进程号创建独�
 
 DMA retention 使用原 init/test_target 的实际角色和 pin，不向设备提交地址。脚本在最终真实 SBI reset ecall 返回 NotSupported；通过正式运行期各页表共享的内核高半区读取稳定 owner，并在 init DONE/全 hart 停驻处复核同一组 backing 区间和写许可、无 runnable mapping 退休债务。`VIRT_DMA_RETENTION_TIMEOUT` 由 Justfile 拥有，路线固定 THROTTLE=100 以避免调试器被周期冻结；它不作为性能证据，也不证明硬件 DMA 已静止。每次运行的 QEMU/GDB 由脚本 finally 收束。
 
+DMA＋IPI 组合在原 InitialWatch DONE 的 request 入口暂用 GDB `scheduler-locking on` 只推进原请求者，使其他 hart 不会在选择失败目标前先提交 STOPPED；一次注入失败被原调用方消费后立即恢复 `off`，后续原停止广播和四 hart 停驻均在恢复调度后观察。若 request 结束仍没有合格目标，恢复调度并明确失败，不写 guest 停止标志或目标 PC 来制造资格。WFI/无 quantum、同 call 的原始返回与 Result 消费、同目标后续广播和同组 DMA 保留判据保持独立；不排除 timer/其他唤醒，不证明全部 IPI 永久失败下的停机活性。返回结果的栈地址按当前 ELF 的布局常量与 `StackWindowLayout` 的正式栈映射换算，仅接受原 sender 的正式栈；栈窗口 NOLOAD 的 ELF p_paddr 和内核直映射偏移都不能代替真实栈物理布局。物理模式内完成原 Result 的 DWARF 解码并保存字节，退出后只保留标量。
+
 M累计栈工具从固定ELF重建CFI与动态目标，源码语义前提须人工核实后由[固定证书](../tools/maintenance-stack-certificate.json)绑定；没有证书、未知site/CFI/业务环或源码变化均不签发上界。本轮推导、命令和拒签负向证据由[对象链修复档案](archived/review-2026-10-07-object-chain.md#新elf累计栈与拒签证据)拥有；证书不是对未来构建的自动许可。
 
 验收脚本只要求当前实际消费者与仍在调用的自检锚点；已删除机制的自检、日志与容量路线同步删除，不保留兼容锚点或为使旧门通过重建机制。路线通过证明该 workload 的当前可观察行为；内部交错、失败退款和付款保证的验证缺口由所属工作记录承载，不以旧锚点缺失代替风险判断。

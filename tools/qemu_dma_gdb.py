@@ -128,6 +128,8 @@ class StopRequest(gdb.Breakpoint):
             require(retained('initial-DONE') == before, 'initial process exit changed retained pins')
             watch_seen = True
             print('DMA_INITIAL_DONE_OBSERVED')
+            if IPI_FAILURE:
+                ipi_request_started()
             return False
         except Exception as error:
             failure = str(error)
