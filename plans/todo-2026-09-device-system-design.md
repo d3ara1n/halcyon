@@ -730,7 +730,7 @@ G1/G3 的 Registry 纯逻辑回归依据来源封口、稳定原轮和旧 Ack �
 
 ## 整体审查修复后的接续（2026-10-28）
 
-本轮 G1–G5、C1、D1 与组合验证发现的 bootstrap 就绪通知接点已完成修复及交付前复核，详细依据、静态/host/QEMU 结果和原始失败保存在[整体报告](archived/review-2026-10-28-device-driver-overall.md)。代码与说明已统一提交为 `e23afdbfe0924058ce498a9b8994d70b10f451e3`，基线为 `d19fdfe4d9f655d20cc8f46d8d0cb570b879f05f`；[固定交付独立 Review](todo-2026-10-28-device-driver-fixes-review.md)已登记、尚未执行，覆盖本轮所有修复、拥有输入公共 loader、就绪通知、准备窗口及实际消费者。提交整理核 18 个产品文件与交付指纹一致，没有重复已通过的编译或 QEMU；仅本地提交，未 push。归档报告中的未提交状态保留归档时事实。当前没有剩余产品修复或半重构迁移，不重做已交付的 root/worker 分步装载。
+本轮 G1–G5、C1、D1 与组合验证发现的 bootstrap 就绪通知接点已完成修复及交付前复核，详细依据、静态/host/QEMU 结果和原始失败保存在[整体报告](archived/review-2026-10-28-device-driver-overall.md)。代码与说明已统一提交为 `e23afdbfe0924058ce498a9b8994d70b10f451e3`，基线为 `d19fdfe4d9f655d20cc8f46d8d0cb570b879f05f`；[固定交付独立 Review](todo-2026-10-28-device-driver-fixes-review.md)仅作可选登记、尚未执行，不阻碍后续工作；如选择执行，范围覆盖本轮所有修复、拥有输入公共 loader、就绪通知、准备窗口及实际消费者。提交整理核 18 个产品文件与交付指纹一致，没有重复已通过的编译或 QEMU；仅本地提交，未 push。归档报告中的未提交状态保留归档时事实。当前没有剩余产品修复或半重构迁移，不重做已交付的 root/worker 分步装载。
 
 Managed 从 Claim 至功能安装采用一次绝对 40s 部署准备窗口：本轮分步装载允许其他 actor 职责持续推进，实际 PCI 正常链已接近原 20s，因此留同量调度余量。它不是性能保证，回复不刷新期限；worker 出生/bootstrap 10s、单次 RPC 5s、停止与硬件期限保持原值。bootstrap entry 的认证提交立即唤醒关联 Managed，通知来源注销独立完成。
 

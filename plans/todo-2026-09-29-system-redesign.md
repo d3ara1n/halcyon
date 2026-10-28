@@ -80,7 +80,7 @@
 |---|---|---|
 | 对象抽象、文件系统与系统视图 | provider 动态视图、共同目录使用与领域操作；旧 FAL 整体拆分 | [OAL/fs/服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)已交付；遗留专项验证按原记录触发，正式服务装配由独立分案承接 |
 | 正式服务装配与监督 | 启动依赖、就绪、发布交付、失效/重启/重连、上级接管、停止接点 | [服务装配分案](todo-2026-10-07-service-assembly.md#当前接力)的设备持续监督已实施；通用正式服务仍待需求与设计闭合，全系统停止由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有 |
-| 设备/驱动与平台资源 | 实例/绑定、资源/session、MMIO/IRQ/DMA、供应依赖、硬件静止与故障终局 | 整体 Review 修复已完成，从[修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)进入提交/独立审查及条件覆盖；原证据见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)，不重复第二轮迁移。[保留内存](todo-2026-09-platform-reserved-memory-lifecycle.md)按实际能力触发，[IRQ 重审](archived/todo-2026-08-26-review-carryover.md)约束验证 |
+| 设备/驱动与平台资源 | 实例/绑定、资源/session、MMIO/IRQ/DMA、供应依赖、硬件静止与故障终局 | 整体 Review 修复已完成，从[修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)按条件接续后续能力与覆盖，独立审查仅保留可选登记；原证据见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)，不重复第二轮迁移。[保留内存](todo-2026-09-platform-reserved-memory-lifecycle.md)按实际能力触发，[IRQ 重审](archived/todo-2026-08-26-review-carryover.md)约束验证 |
 | 不可信域资源硬隔离 | 已有额度付款之外的域间硬容量、Weak尾部与allocator碎片隔离；CPU份额另行建模 | [预算分案](todo-2026-09-14-kernel-memory-budget.md)拥有；Pool页/metadata双维付款已交付，不能再把MetadataSponsor迁移当缺口；开放不可信创建域或承诺硬隔离前触发 |
 | RPC/用户态执行与数据面 | 真实业务需要的事务owner/ReplyPort归还设计、BufferQueue及DMA消费者接点 | 定向或条件后续。SourceRegistration已收敛；Caller/Dispatcher统一候选本轮未采纳，重开条件见[审查档案](archived/review-2026-10-07-object-chain.md#收敛结果与保留边界)。没有依据整体重做执行层，数据面随正式消费者接通 |
 | 性能、分页模式与其他平台能力 | 锁/ASID/定向shootdown、精确CPU计量、Sv48/Sv57和新执行档位 | 分别按[性能专题](todo-2026-10-01-lock-performance.md)、[内存完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)、执行需求触发；不因存在扩展方向撤销当前有限保证 |
@@ -162,7 +162,7 @@
 
 对象链修复已提交为`ac9d7d9364770a69c8135e918d512069980c06bb`，对应[固定提交原始Review](archived/review-2026-10-12-substrate-object-chain.md)已完成；原两项P1的更正依据、当前责任与后续复核由[统一报告](review-2026-10-12-consolidated.md#已退出当前修复队列的判断)拥有，不再作为待修复导航。[轻量收口记录](#近期轻量收口与本轮整理)保留此前文档轮次的范围和证据；按[剩余切面表](#剩余切面与接续顺序)及各分案当前接力继续。当前没有要求补做对象链旧拼装或恢复编译的接力。
 
-设备第二轮及生命周期收口已统一保存交付，DMA＋IPI 组合取证已完成，历史时钟异常按用户决定仅观察；原交付状态与判据由[设备主计划](todo-2026-09-device-system-design.md#第二轮提交与调查接力)拥有。首批设计增量与第二轮代码审查已按用户要求合并，G1–G5、C1 修复与所选验证完成，[最新整体报告](archived/review-2026-10-28-device-driver-overall.md)保存原发现及处置；当前按[修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)处理提交后独立审查、条件覆盖及未归因观察，不把已完成的设备/监督迁移或组合取证恢复为待办。
+设备第二轮及生命周期收口已统一保存交付，DMA＋IPI 组合取证已完成，历史时钟异常按用户决定仅观察；原交付状态与判据由[设备主计划](todo-2026-09-device-system-design.md#第二轮提交与调查接力)拥有。首批设计增量与第二轮代码审查已按用户要求合并，G1–G5、C1 修复与所选验证完成，[最新整体报告](archived/review-2026-10-28-device-driver-overall.md)保存原发现及处置；当前从[修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)按条件接续覆盖及未归因观察，提交后独立审查只作可选登记，不把已完成的设备/监督迁移或组合取证恢复为待办。
 
 ## 初次设计文档交付检查（历史，不是当前代码验收）
 

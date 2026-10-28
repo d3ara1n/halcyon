@@ -8,22 +8,24 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。本轮整理范围见[活跃资料清理](todo-2026-09-29-system-redesign.md#活跃资料清理2026-10-27)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [设备与驱动修复交付独立 Review](todo-2026-10-28-device-driver-fixes-review.md)：固定 `e23afdb`，按登记范围执行；精确动态覆盖及观察项从[设备接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)按条件触发。
-4. [正式服务装配](todo-2026-10-07-service-assembly.md#当前接力)：通用正式服务的装配与恢复按实际需求继续设计；设备持续监督、等待与 loader 迁移不再作为待办。
-5. [系统关机编排](todo-2026-09-system-shutdown-orchestration.md)：正式长期服务的整体收束由本案闭合，设备管理故障接点作为已有实现接入。
+3. [正式服务装配](todo-2026-10-07-service-assembly.md#当前接力)：通用正式服务的装配与恢复按实际需求继续设计；设备持续监督、等待与 loader 迁移不再作为待办。
+4. [系统关机编排](todo-2026-09-system-shutdown-orchestration.md)：正式长期服务的整体收束由本案闭合，设备管理故障接点作为已有实现接入。
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。
 
-旧 midflight Copy 已按[机制替换证据](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置)关闭，不恢复旧施工。平台时钟与 W05-04 Watch 的历史偶发异常统一列入 [KNOWN_ISSUES 观察项](../KNOWN_ISSUES.md#历史偶发异常仅观察)，仅复发时接续原记录，不占当前排期。
+旧 midflight Copy 已按[机制替换证据](archived/todo-2026-09-29-fal-midflight-copy-flake.md#2026-10-11-历史证据复核与最终处置)关闭，不恢复旧施工。平台时钟、W05-04 Watch 与 HID 候选出生的历史偶发异常统一列入 [KNOWN_ISSUES 观察项](../KNOWN_ISSUES.md#历史偶发异常仅观察)，仅复发时接续原记录，不占当前排期；设备的条件覆盖从[修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)进入。
 
 ## Review 收口
 
 五批九份报告已统一核定，原报告与[分批执行记录](archived/todo-2026-10-12-review-convergence.md)保留历史；当前只使用[统一报告](review-2026-10-12-consolidated.md)的有效责任、触发条件与原编号映射。
 
+独立 Review 登记为可选入口，不占当前串行排期；执行与归档按 [REVIEW](REVIEW.md#独立-review-的登记范围)。
+
 | 类型 | 入口 |
 |---|---|
 | 五批 Review 当前责任与处置 | [统一报告](review-2026-10-12-consolidated.md) |
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
+| 设备修复交付的可选独立 Review | [固定 e23afdb 的登记](todo-2026-10-28-device-driver-fixes-review.md)，未执行 |
 | 设备体系设计基线审查档案 | [原发现与修订复核](archived/review-2026-10-23-device-system-design.md)；后续增量与施工入口见设备主计划 |
 | 首批设计增量与第二轮完整交付的整体审查 | [统一报告、修复与验证档案](archived/review-2026-10-28-device-driver-overall.md)；原两份固定登记已归档，历史范围见报告 |
 | 设备首批实现机制收敛与第二轮交付 | [收敛交付档案](archived/review-2026-10-27-device-implementation.md)；[原固定登记档案](archived/todo-2026-10-27-device-implementation-review.md) |
