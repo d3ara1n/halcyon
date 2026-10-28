@@ -1,6 +1,6 @@
 # 设备体系设计：领域模型、驱动管理与资源收束
 
-> 状态：**第二轮交付及原组合门已完成；最新整体 Review 的 G1–G5、C1 与文档偏差已修复、复核并完成所选组合验证，改动尚未提交。** 首批设计增量与第二轮代码登记已合并，[统一报告](archived/review-2026-10-28-device-driver-overall.md)保存发现与修复证据；当前接续从[修复后接续](#整体审查修复后的接续2026-10-28)进入。本篇继续拥有领域目标、验收合同及条件后续。第二轮历史处置见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)及[生命周期档案](archived/review-2026-10-27-device-lifecycle.md)。DMA＋IPI、全 hart idle 和真实 IRQ 门不重开；时钟及候选出生的未归因异常仅观察。服务装配、平台保留内存和系统终局由各自计划拥有。
+> 状态：**第二轮交付及原组合门已完成；最新整体 Review 的 G1–G5、C1 与文档偏差已修复、复核并完成所选组合验证，已提交为 `e23afdb`。** 首批设计增量与第二轮代码登记已合并，[统一报告](archived/review-2026-10-28-device-driver-overall.md)保存发现与修复证据；当前接续从[修复后接续](#整体审查修复后的接续2026-10-28)进入。本篇继续拥有领域目标、验收合同及条件后续。第二轮历史处置见[收敛交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)及[生命周期档案](archived/review-2026-10-27-device-lifecycle.md)。DMA＋IPI、全 hart idle 和真实 IRQ 门不重开；时钟及候选出生的未归因异常仅观察。服务装配、平台保留内存和系统终局由各自计划拥有。
 
 第二轮已实施合同及原验证由[机制收敛档案](archived/review-2026-10-27-device-implementation.md)保存；其后的[生命周期与观察收口](archived/review-2026-10-27-device-lifecycle.md)已完成修复、复核及所选组合验证，该档案保存增量目标和证据。[唯一收口表](#当前唯一收口表2026-10-26)保存已关闭的 DMA＋IPI、全 hart idle 门及未归因的独立时钟异常；本次调查见[时钟复查](#独立时钟异常复查2026-10-27)。impls按当前代码回填；历史施工与审查交接段保留当时事实，不从其中的旧目标恢复施工。
 
@@ -730,7 +730,7 @@ G1/G3 的 Registry 纯逻辑回归依据来源封口、稳定原轮和旧 Ack �
 
 ## 整体审查修复后的接续（2026-10-28）
 
-本轮 G1–G5、C1、D1 与组合验证发现的 bootstrap 就绪通知接点已完成修复及交付前复核，详细依据、静态/host/QEMU 结果和原始失败保存在[整体报告](archived/review-2026-10-28-device-driver-overall.md)。当前工作树尚未提交；获得提交授权并形成固定交付后，按 REVIEW 登记独立审查，覆盖本轮所有修复、拥有输入公共 loader、就绪通知、准备窗口及实际消费者。当前没有剩余产品修复或半重构迁移，不重做已交付的 root/worker 分步装载。
+本轮 G1–G5、C1、D1 与组合验证发现的 bootstrap 就绪通知接点已完成修复及交付前复核，详细依据、静态/host/QEMU 结果和原始失败保存在[整体报告](archived/review-2026-10-28-device-driver-overall.md)。代码与说明已统一提交为 `e23afdbfe0924058ce498a9b8994d70b10f451e3`，基线为 `d19fdfe4d9f655d20cc8f46d8d0cb570b879f05f`；[固定交付独立 Review](todo-2026-10-28-device-driver-fixes-review.md)已登记、尚未执行，覆盖本轮所有修复、拥有输入公共 loader、就绪通知、准备窗口及实际消费者。提交整理核 18 个产品文件与交付指纹一致，没有重复已通过的编译或 QEMU；仅本地提交，未 push。归档报告中的未提交状态保留归档时事实。当前没有剩余产品修复或半重构迁移，不重做已交付的 root/worker 分步装载。
 
 Managed 从 Claim 至功能安装采用一次绝对 40s 部署准备窗口：本轮分步装载允许其他 actor 职责持续推进，实际 PCI 正常链已接近原 20s，因此留同量调度余量。它不是性能保证，回复不刷新期限；worker 出生/bootstrap 10s、单次 RPC 5s、停止与硬件期限保持原值。bootstrap entry 的认证提交立即唤醒关联 Managed，通知来源注销独立完成。
 
