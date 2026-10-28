@@ -1,6 +1,6 @@
 # 正式服务装配与监督设计
 
-状态：**设备第二轮持续监督已实施并通过所选组合验证；通用正式服务装配仍待后续设计**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；已实现合同见[第二轮持续监督设计](#第二轮持续监督设计2026-10-27)，本轮实现、证据与边界见[机制收敛报告](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备组合门及仅观察的时钟异常见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)。
+状态：**设备第二轮持续监督已实施；静态常驻服务基座的设计已收敛，尚未实施**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；下一步依据[常驻基座设计](#静态常驻服务基座设计2026-10-28)实施选定范围。已实现合同见[第二轮持续监督设计](#第二轮持续监督设计2026-10-27)，设备实现证据见[机制收敛报告](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备组合门及仅观察的时钟异常见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)。
 
 ## 目标与非目标
 
@@ -14,7 +14,7 @@
 
 - `srv_init` 的固定 workload、RequiredLaunchSet、RootSupervisor 与已有 pm/fs 消费者承担验收装配和真实监督责任；不能把它们当成没有可用基座。
 - 对象链、自动回收、Job 封口、进程出生/执行绑定、来源登记及运行时分层已完成相应交付。本案不恢复 ProcessDrain 或用户必须持续驱动的内核回收。
-- 当前已有 Registry/服务记录；发布成功、服务就绪、endpoint 可用和进程存活之间的正式系统协议尚未完成本轮详细设计。
+- 当前已有 Registry/服务记录；发布成功、服务就绪、endpoint 可用和进程存活分别表达不同事实。常驻基座的交付与监督目标由下方设计闭合，代码仍是验收部署。
 - 设备的实例、受权使用/绑定、供应依赖和硬件安全责任已按首批范围定稿。virt 的三个 MMIO 根、PCI INTx 根和 DMA 根已交付 init，实际管理者委托及非空消费者已接通。设备驱动装配不能仅凭进程 DONE 推断 DMA 已静止。
 - srv_device由init的独立Job/Pool及root管理记录承载；真实私有bootstrap核context/PID及入口关联，发行受限观察并接枚举/OAL/Watch。两管理者的DONE来源先于Start，运行期/Stopping观察与唯一故障终局均由root推进。正常停止由同一owner确认来源Closed、关闭原admin、核真实Completed、注销来源并交原Collector，无admin副本/ACK或撤防握手；具体边界见设备唯一收口表。
 - boot 已在初始进程启动前接入独立 DONE 观察；init 的最终 reset 被拒绝时自终止，由该观察触发 runtime stop。已暴露 DMA 的实际 pin 与写许可继续保留，相关证据见设备主计划；这不替代设备 halt 或正常停止编排。
@@ -86,11 +86,13 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 设计交付须能依据计划实现选定装配，明确正常、失败、取消、退出、恢复和停止责任。系统能力交付须有真实长期服务接入、替换范围内的旧装配路径删除，并在相应平台验证启动、就绪、故障恢复和停止组合；不能仅用一次验收 workload 跑完宣称正式编排已完成。
 
-本案通用正式装配方案仍未闭合；设备首批的进程分工、静态来源、授权和持续监督已有实现与所选验证，不代表一般服务热升级、持久化停止或配置脚本已设计完成。现有同进程fs/registry装配由发布分案接通，不要求提前拆出srv_service。第二轮实施证据由机制收敛报告归档，设备原独立门仍由主计划维护。
+常驻基座的完成门由下方选定范围具体化；设备首批的进程分工、静态来源、授权和持续监督已有实现与所选验证，不代表一般服务热升级、持久化停止或配置脚本已设计完成。现有同进程fs/registry装配由发布分案接通，不要求提前拆出srv_service。第二轮实施证据由机制收敛报告归档，设备原独立门仍由主计划维护。
 
 ## 当前接力
 
-第二轮两条责任链已完成迁移并随 `c5d005d` 统一提交。首批设计增量与第二轮代码审查已合并，[设备/驱动整体报告](archived/review-2026-10-28-device-driver-overall.md)的 G1–G5、C1 已完成修复与复核；srv_driver 运行期出生现已接同一个公共分步 loader，已提交为 `e23afdb`。可选独立审查入口、精确动态覆盖边界及候选出生观察由[设备修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有，不重做 root/worker 已完成的等待和装载迁移。设备 DMA＋IPI 已补证关闭，未归因异常仅观察。通用正式长期服务、恢复或持久化停止仍在实际需求明确时按上述设计门闭合；仓库格式/安装更新、透明重启、通用 manifest 继续延期。
+下一步是按[静态常驻基座设计](#静态常驻服务基座设计2026-10-28)接通正式部署、文件宿主持续监督及正常停止；本轮只交付设计，没有修改产品代码或运行验收。共同基线为 `f6b712e`；选定能力是可承接后续应用的常驻基座，不能称为已有应用工作流或持久化系统。施工顺序、删除门与验证由该节拥有。
+
+设备第二轮两条责任链已随 `c5d005d` 提交；整体审查 G1–G5、C1 及公共 loader 修复已随 `e23afdb` 交付。可选独立审查、精确动态覆盖及候选出生观察仍由[设备修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有，不重做 root/worker 等待和装载迁移。持久化、仓库安装更新、服务恢复与通用配置的条件后续见本篇延期表。
 
 ## 首批设备的持续监督接线
 
@@ -168,3 +170,148 @@ Preparation 保留借用入口，增加封闭的拥有型输入（ImageView、pa
 Pool、bootstrap mailbox与缓冲由原worker owner贯穿出生/退出；Preparing与Prepared不同时持有同一进程Control，运行或取消之后才由SuperviseTask独占它。没有新增线程、运行体、loader或恢复账本。一次map/unmap内核调用仍可能等待VM事务，本目标消除整份ELF装载和同步回收循环，不声称Task单步有严格墙钟时延上界。
 
 验证目标包括拥有输入的验证器跨步移动、原ELF/ISA fixtures及首错；运行期已有绑定时新worker出生，正常Stop与DONE仍可推进；取消/失败区分Grant前、Grant后、DONE安装中及运行期，真实USB复用与故障路线复用原消费者。本轮已通过与未逐窗注入的边界分别见整体报告及设备主计划的修复后接续，不能把本段目标当成全部运行通过。
+
+## 静态常驻服务基座设计（2026-10-28）
+
+本轮为设计任务。用户授权推进下一步，并在必要时与 BrightReed 讨论以收敛设计、避免不必要的机制扩张。以下为主会话核对代码并经两轮讨论后的收敛结论，不冒称逐项由用户选择；未改变已有设备安全、目录发布或内核退出合同。基线 `f6b712e`，进入时工作树干净。ideas 未扩大审定，impls 继续描述现有实现。
+
+### 目标、用途与现状证据
+
+交付目标是**静态常驻基座**：init 持续监督必需服务，向受权消费者交付真实入口，直至自身政策提交正常停止或进入系统故障终局。常驻生命周期独立于验收脚本结束；空闲时等待真实来源，不靠心跳、循环探针或永久 runnable 维持存活。首批给后续应用铺路，暂不承诺用户可见工作流。
+
+| 当前事实 | 源码依据 | 对本轮的约束 |
+|---|---|---|
+| init 默认执行确定验收并在结束后关机 | [main](../user/services/srv_init/src/main.rs) 的 `main/run/launch_test_services` | 增加明确的系统部署入口，不能只删除最后 reset 或把失败清理循环当常驻运行 |
+| fs 主实例同时持独立文件与 registry provider；次实例只有文件并注册 `fs.secondary` | [fs boot](../user/services/srv_fs/src/server/boot.rs)、[部署容量](../user/services/srv_fs/src/lib.rs) | A/B 两组付款入口与双实例是验收配置；领域实现和收束路径由所有配置共用 |
+| 文件 backend 出生为空目录，数据在内存中；当前没有磁盘后端 | [MemoryBackend::with_bindings](../user/libraries/libfs/src/backend.rs) | 不增加启动归档挂载、驱动仓库、flush 或断电恢复的承诺 |
+| pm 的域没有 CREATE；实际负载是 Tunnel/流控及 test_target 收束 | [pm](../user/services/srv_pm/src/main.rs)、init 的 `pm_grants` | 保留其验收用途，不把二进制名称当成新增正式进程管理服务的理由 |
+| 两设备管理者已在 Start 前挂 DONE，root 等待与 loader 会推进监督 | [device_supervision](../user/services/srv_init/src/device_supervision.rs)、[loading](../user/services/srv_init/src/supervisor/loading.rs) | 扩展已有 root 监督责任，不增加线程、独立 supervisor 或新的执行框架 |
+| fs bootstrap 目前从首条消息取 PID，等待 Ready/Stopped 使用无限期限 | [filesystem](../user/services/srv_init/src/filesystem.rs) 的 `accept_fs_provider/confirm_primary_fs_ready/collect_fs_provider` | 迁移为出生前绑定身份、持续 DONE 观察与有限部署期限；这些接点属于本轮必要闭包 |
+
+首批系统部署选定 init、srv_device、srv_driver、按需驱动和一个 srv_fs（包含 registry）。srv_device、srv_driver 与 srv_fs 三个长期子宿主均为必需；没有键盘或当前平台没有可用设备不是启动失败，驱动仍按原声明和实际硬件启用。fs 初始为空内存目录，registry 初始可为空，boot 映像继续直接从现有启动来源取得。init 是这些管理/发布根的实际接收者；未来应用通过下述授权交付路径接入，不能以尚无应用为理由伪造示例常驻消费者。
+
+系统部署不启动 srv_pm、secondary fs、test_fs、test_target 或压力负载。现有 core/stress/memory/device 验收仍按各自合同选角色；复用同一个服务装配和生命周期，所需 A/B 额度及跨 provider 场景保留。新增显式 `system` 部署选择及对应 just 运行入口，打包仅携其必需映像；选择与既有验收 feature 互斥并在构建入口拒绝冲突。具体 recipe/feature 名称由施工时的 Justfile 同步定义，内核与 BootPackage 不增加部署政策。
+
+### 领域、宿主与四类关系
+
+fs 与 registry 继续共宿主，独立 mailbox、授权、状态和领域协议。这个实例被部署政策选为必需基座；本轮没有业务状态丢失后的重建、旧 capability 处理与重连保证，因此宿主故障进入系统终局。易失内存本身不推出“所有内存文件服务死亡都必须停系统”，该政策只属于 init 的这一部署实例。拆成两个进程在当前共同失败政策下不增加保证，暂不引入其进程、付款、监督与停止成本。
+
+| 关系 | 常驻基座的 owner / 边界 |
+|---|---|
+| 进程与 Job 管理 | init 持 services 上级及文件宿主的 ProcessControl；设备三 Job 关系保持原合同。文件宿主是 services 直接成员，无创建子进程的 Job grant；无需为单个无后代宿主再建子 Job |
+| 内核付款 | 文件宿主用 init 派生的独立双维 Pool，ProcessCreate 与交付给宿主的 CREATE grant 指向同一 Pool；init 保留观察/关闭 owner。root 自身的监督、运输及启动临时分配付 root，不从服务账反推管理权 |
+| 用户态费用 | fs/registry 继续在宿主 Budget 中分领域；基础设施账户与入口账户不同。系统部署只发行一组实际入口；验收主实例发行两组。不是新增不可信域硬容量隔离 |
+| 授权 | 私有 bootstrap sender、停止 Notification owner、文件管理 receiver、registry receiver 与 Pool grant 由 init 出生交付。文件/目录/发布根回到 init，普通消费者不拿根管理、停止 signaler、Pool CREATE 或 ProcessControl |
+| 业务供应 | 文件/目录无设备依赖；驱动从 boot 来源装载，不等待 registry；消费者在实际所需入口就绪后启动。停止先退消费者，再退它依赖的 provider，Job 树不替代供应关系 |
+
+`libprocess` 继续拥有出生、DONE 与 Collector；`libexecution` 拥有等待和执行；`libfs`、`libservice` 各自拥有业务。root 的装配政策留在 srv_init，不把服务名单、重启政策或停止图放入这些公共库。
+
+| 目标模块 / 关键持有 | 修改边界 |
+|---|---|
+| `srv_fs::startup`、`srv_fs::deployment` | 前者拥有宿主 profile 编解码与 grant/报文数量合同，后者集中容量和阶段期限；`server::boot` 组合原领域 provider |
+| `srv_init::supervision` | 接替当前 `device_supervision` 中的长期进程观察骨架；本地 `InstanceRecord` 持唯一进程阶段与 DONE 来源，系统 Terminal 归 root。设备来源/平台封口仍调用 `device`、`driver` 的领域接点 |
+| `srv_init::filesystem::Host` | 接管原 AcceptedFsProvider 的根、bootstrap、release 与就绪/停止事实，关联唯一 InstanceRecord，不持第二份 Control；文件业务探针另放同模块的验收子模块 |
+| `srv_init::deployment` | 拥有静态 profile 的映像选择、装配、常驻推进与内部停止入口；main 选择正式或验收编排，验收 `run` 调用相同宿主装配入口 |
+| 原 `supervisor` 与公共库 | RootSupervisor 继续唯一持 Assembly、能力账本和收集责任；已有 loader/RPC/Collector 及领域协议复用，不增加公共服务状态机或 facade |
+
+### 文件宿主出生、就绪与授权交付
+
+`srv_fs` 的库目标增加宿主私有 `startup` 模块，供同包二进制与 init 共用配置编解码。只表达三个确定 profile：System（文件与 registry、一组入口）、AcceptancePrimary（同宿主、两组入口）、AcceptanceSecondary（文件、一组入口、原发布接收）。payload 固定为两个 little-endian u32：version=1，profile=0/1/2；拒绝其它值、长度与旧空串/`secondary` 解释。五个应用 grant 槽仍为 bootstrap sender、release Notification owner、文件管理 receiver、registry receiver 或 secondary publication inbox、实际 Pool。发送/接收两侧同次迁移，不保留兼容解析。
+
+profile 仅选择有限部署政策；它不是授权。采用前核实际角色、权限、槽数和预期 receiver/Pool；不因 profile 或自报 PID 获权。System 与 Primary 共用初始化和退出；入口数量及账户额度从 profile 导出的同一个配置计算，不保留固定 A/B 数组之外另一套系统实现。
+
+文件宿主的启动责任按以下顺序推进：
+
+1. root 准备实例记录、Pool、bootstrap receiver 与接收存储、停止 signaler、目标 grants、DONE 来源容量及失败收束承载，再创建/装载进程。私有 sender 不交无关进程；真实 sender context 在移交前查询保存在记录，预期 PID 来自 PreparedProcess。
+2. loader 每步用原 Preparation；完成后把唯一 PreparedProcess 交同一持续观察记录，DONE 实际 registered 后才 Start。准备失败/停止通过原取消 Collector 交接；GrantOutcome 仅决定未消费能力的释放，不充当回滚证明。
+3. 宿主准备 backend、入口角色、控制/业务 Ingress、release 观察、退休及运输任务。必要来源全部获得实际安装回执后，才能交根并发 Ready；`spawn` 成功或来源请求已排队不能替代安装回执。Ready 不依赖任何验收请求。
+4. 沿用四种现有根消息：文件、文件管理、目录、发布 authority；每条空正文，System 各一能力、Primary 各两能力。Ready/Stopped 均空正文、零能力。Secondary 仍按现有管理根及 Register 完成合同交付，数量由同一 profile 定义。接收者按种类收齐，不依赖不同来源通知被领取的顺序；重复种类、额外能力和错误身份均拒绝并走原实例失败收束。
+5. 每条消息核出生记录的 PID 与 `sender_context_id`，能力经 typed 采用并核角色/输出权限。根只先存入私有实例记录；收齐合法 Ready、真实进程仍 Running、root 准入仍开放后才允许向消费者交付。Ready 与 DONE 同轮出现时不得开放入口；检查后死亡仍由持续监督接管，不能承诺无故障窗口。
+
+bootstrap 使用已有消息 kind，不增加通用 Lifecycle RPC、Ready ACK 或按名字反查管理入口。System 最多四根+Ready+Stopped 六条，须以编译检查证明不超过共享 ABI mailbox 容量；每条能力数同样核 ABI 上限。初始消息额度有独立准入，正常报告不被公共业务积压挤占；发送失败是部署失败，不静默忽略。
+
+首批授权交付的真正入口是 root 持有的根能力，不要求注册 `fs.memory` 或自造固定服务名。文件访问通过既有 fs Derive 收窄路径与 FsRights，不能只去掉 sender 的 GRANT 位就声称业务只读。目录客户端只在部署政策允许其发现整个本部署目录时，取得已发行 DirectoryAccess 的别名：保留原 Scope::Root 与 DESCRIBE/ENUMERATE/GET_ENTRY/WATCH 权限，不含注册/发布权。当前 service 协议没有远程目录 Derive/Restrict，不宣称逐客户端收窄目录可见范围；本轮不为此新增接口。确需发布的提供者通过现有 DelegateName 取得 exact-name 发布权，文件 Bind 管理根和 registry 根发布权留 init。派生请求若结果未知，停止该未完成消费者装配并由原请求/能力寿命退休，不盲签第二份权限。
+
+入口准备、目标 Pool 与进程监督准入完成后，经现有出生 grants 或受认证的一次运输交付。Grant/Send 成功才解除发送侧唯一 owner；失败保留未消费 Packet/Capability，取消移交原 Collector。root gate 在派生、Start 和后续交付前复核；已提交的交付/迟到结果归原记录收束，不因等待调用返回错误而遗忘。Namespace 由消费者本地持有，没有全局路径隐式重绑。现有 init/test_fs 验收通过同一出口取得文件派生、目录访问与 exact-name 发布角色，各按真实权限验证；未来应用接入时再确定目录布局和业务授权。
+
+### 一个实例 owner、持续监督与停止事实
+
+root 内将当前设备专属的进程观察骨架扩为本地长期实例记录，供两管理者与文件宿主共同使用；不是新增公共服务框架。记录独占 PreparedProcess/Running Control/Collector 的阶段持有及其 DONE 来源，绑定不复用的本次实例身份（实际进程、Control、私有 bootstrap context）。领域记录保有各自入口与停止结果，通过稳定记录关联；不另存第二份 ProcessControl owner 或平行 PID 账本。
+
+| 阶段 | 可观察含义与允许动作 |
+|---|---|
+| Preparing | 输入、Building owner 与失败取消责任已准入；无对外入口 |
+| Starting | DONE 已挂，Start 已提交；接私有根与 Ready，尚不交普通消费者 |
+| Running | 本宿主就绪成立；root 可按实际授权装配消费者，DONE 持续可观察 |
+| Stopping | 原停止意图与绝对期限已提交，禁止新交付；原业务与进程终态分别收集 |
+| Retiring | 正常停止所需事实已齐，或准备取消已交 Collector；先实际注销所有借用 Control/receiver 的来源，再关闭对应 owner |
+| 记录释放 | 原 Collector、输入映射、入口/报告与 Pool 的本地持有均已结束；不伪称跨域仍持有的 backing 已退款 |
+
+阶段只表达责任转换；Ready、Stopped、DONE 等具体事实从各自 owner 得到，不复制 registry 的 Active/Withdrawn 为监督状态。异常状态由 root 的唯一故障原因和系统终局承担，不再造恢复事务。所有事件由 root 同一 Assembly/Runtime 推进，无新共享锁、观察线程或跨线程 ACK。
+
+文件宿主正常停止复用现有 release Notification。root **先**写 Stopping 意图与截止时间，再 signal；Notification 重复提示只维持停止事实。宿主封新文件/管理/目录业务，已准入调用、流、映射、注册、Watch 与来源仍沿原 owner 退休；清理接口不因封普通准入而失效。root 取消自己持有的客户端操作并释放已经无用的文件/目录/发布别名，不能一边保活它们一边等宿主报空。宿主在 Runtime/Assembly 和领域账确实收空后发 Stopped，再正常退出。
+
+root 保存两项独立单调事实：认证的 Stopped，以及真实 DONE 快照。正常完成必须同时具备 Stopped 与 Dead/Completed/NONE detail；之后注销来源、交唯一 Collector、关闭报告接点与 Pool owner。DONE 先被处理时保留原 receiver，继续取已经入队的 Stopped；Stopped 先到时仍等 DONE。异常 DONE 立即升级，不能被 Stopped 掩盖；Running 期间未提交停止的 Completed 也是必需实例意外退出。超时前有界复查真实 DONE 和原 mailbox，已存在的完成事实优先于期限；缺报告不无限等待，也不用 DONE 代替业务收束。
+
+停止先于 Ready 时，root 保留原接收责任，接到的根只用于释放，迟到 Ready 不开放交付；已运行宿主沿同一停止路径退出，未 Start 的进程取消 Building。异常身份/格式使部署失败，收到的未采用能力仍由消息 owner 关闭。停止报告不增设提交确认、结果重传或持久事务。
+
+设备的完成谓词仍为原来源 Closed、Binding/Provision 安全及 Process Completed，不能套用 fs 的 Stopped 替换；共同观察骨架只汇合已由领域确认的结果。当前 `device_supervision::Terminal` 的唯一终局持有提升到 root 系统层，平台封口和设备来源清理由原领域接点提供；fs 失败也到这一出口，不再因“不是设备错误”进入无限失败服务循环。
+
+### 发布未知与恢复边界
+
+System 的初始根直接交付，没有首次按名注册事务。验收 secondary 及未来确需发现的服务仍使用既有单步 Register；启动者/提供者保留原调用和 RegistrationControl，实际发布成功才可宣告该名字的发布完成。Registry 不维护进程健康、不启动服务、不替调用者恢复。
+
+对于本轮的必需实例，启动失败、Ready 超时、运行期意外退出或停止失败都封装配并进入系统故障终局；不自动重启。已发送 Register 的未知结果不重放，不用名字存在推断自己成功，不恢复被 Replace 撤下的旧注册；原控制与运输最后释放后的目录退休继续由 registry 承担。整个必需部署失败时停止其 owner，未决结果不阻止有界故障升级。可选业务服务如何继续运行、显式重启与重新授权不在本次承诺中。
+
+后续若承诺恢复，必须先选定可丢弃/可恢复状态、新实例授权、旧会话结果与重连政策。客户端已有 Namespace/endpoint 不被注册替换自动改变；显式 GetEntry 得到新实例也不允许自动重放旧实例上的未知变更。这些边界复用发布分案，不新增两阶段 Register、代理入口或透明重连层。
+
+### 准入、费用、期限与调度
+
+静态部署描述只列实际映像、宿主 profile、必需角色和付款政策；先校验重复/缺失映像及输入，再发布子进程。root 记录及来源容量按本部署会并存的长期实例计算：System 三个宿主，验收可另含 secondary；不能把“固定三项”藏成公共库上限。每个长期实例独立预留 DONE 和必要的 bootstrap 观察，已有单次 RPC 等待槽/Collector 容量依实际并发复用；不为每实例创建线程、独立 Assembly 或一套 RPC 引擎。
+
+文件 Pool 的页预算覆盖实际 ELF runs、ABI 主栈/出生映射及显式配置的堆/数据工作集；metadata 预算覆盖实际映射、对象、能力、来源与退休峰值。部署值集中在 srv_fs 的容量政策，施工按装载布局及现有工作集核算、验证正常准入和拒绝回退，不从复制设备 Pool 的魔数推导保证。用户态 task/source/缓冲预算由 profile 的真实入口、请求、流、注册/Watch 并存上界推导并 checked arithmetic；停止/报告和退休承载先于公开入口预留。允许超出部署容量的新业务正常返回资源错误，不承诺物理堆耗尽后任意新分配成功。
+
+文件宿主启动和停止各取一个部署级绝对期限；初始政策均为 10s 的故障检测窗口，分别从准备开始和停止意图提交起计，集中由 srv_fs 部署配置拥有。这是本轮选择的运营等待政策，不是从 Collector 重试次数推导的硬件界或 WCET；实施在所选 QEMU/节流条件核验，若有界进展触限按构建手册增大并记录。各 RPC 使用该阶段剩余期限与领域单次期限中较早者，部分根/Ready/Stopped/DONE 不刷新期限。设备既定阶段期限保持各自唯一来源；稳定 Running 无周期健康探针。系统停止的聚合与故障升级期限由关机案拥有。
+
+所有新路径沿 `RootSupervisor::turn_and_wait` 接入 receive/feed、有限轮转与最早期限；DONE/已知故障先于新的装配动作。每个实例每轮至多处理一个 bootstrap 消息或推进一次来源/进程操作，批量授权/清理用游标续进；收到无限业务提示不能挤占监督和清理机会。没有就绪工作时交 Assembly 停驻。启动/取消、调用出错、Collector 失败均保留原责任，不能把局部返回错误解释为可丢弃实例记录。
+
+### 正常停止接点、迁移与验证门
+
+系统正常停止的唯一政策 owner 为 init。首批只提供 root 内部停止入口，验收编排通过它停止同一个部署；普通服务和消费者没有系统停止权，也没有外部关机客户端。系统模式不会因无应用或短任务自然结束自行停机。未来外部管理界面需显式授权协议，不能通过全局目录、PID 或关闭任意 sender 获得停止权。完整聚合由[静态常驻基座停止](todo-2026-09-system-shutdown-orchestration.md#静态常驻基座停止2026-10-28)拥有。
+
+施工按同一闭包依次完成，当前没有依赖新增内核机制的未决前置：
+
+1. srv_fs 集中 profile/启动契约及容量；System 单组入口与验收 A/B 共用初始化、业务和释放。同步 init 发送/解析及现有 test_fs 的实际额度读取，删除旧字符串启动解释和固定两组假设。
+2. root 把长期实例的进程持有/来源与唯一终局归到同一 owner，接通 fs 的预期身份、有限准备、Start 前 DONE、Ready 门和持续监督；移除这些实例在普通批次中的重复 Control 持有及仅阶段末收集路径。普通短任务仍可用原 Batch/Collector。
+3. 正式部署与验收编排分别选择同一装配入口，加入常驻驱动循环和内部停止入口；验收仍用真实 fs/registry/设备消费者。删除为适配旧生命周期保留的无限 bootstrap 等待及独立 fs 释放流程，不复制另一套“system provider”。
+4. 系统停止接入文件宿主和消费者清理，再接既有设备停止与唯一 reset；root 失败接点只保留共同终局。同步 Justfile 打包、配置冲突检查、构建手册、startup/service 等实际 impls；只有代码落地后回填实现事实。
+
+| 要捕获的错误 / 独立合同 | 最小验证边界与判据 |
+|---|---|
+| 默认流程仍随测试结束退出，或常驻只是空循环 | 显式 system 部署观察真实三宿主就绪、无测试进程、持续 DONE 监督及无待办时停驻；有限观察不宣称无限活性 |
+| Ready 过早、身份自认或停止后迟到交付 | 共用启动解码及真实 fs 宿主；错误 context/PID/能力布局拒绝，来源准入后才 Ready，Stop 先到后无新消费者 Start/交付 |
+| 文件启动/RPC等待饿死其他监督 | 复用已有外部 GDB 故障路线，在实际 fs 准备或等待时终止必需实例；一次进入 root 终局，不等待原业务超时才发现 |
+| DONE/Stopped 领取顺序造成误判或漏报 | 原实例记录和 fs 报告：两种顺序都需双事实才收集；缺 Stopped 到期失败；异常 DONE 或未 Stop 的 Completed 不成功。来源退休回执前不关闭借用 owner |
+| 业务饱和占用停止承载，或提前退款 | 原 test_fs/流/Copy/Watch 保持非空并停止，普通请求被封、在途 owner 退休、报告与实际 Completed 匹配；无跨域持有的工作集在 Collector/最后 owner 后核原 Pool，不能仅靠日志“预算空” |
+| 原 A/B、secondary 发布与设备安全接线被改变 | 原 core 与 device 消费者沿同一生命周期完成，既有 Unknown/名称替换/热插合同保留；按实际修改触发精确补证，不重跑无关历史异常 |
+
+host 验证优先复用解码、来源与生命周期设施；新增用例仅针对表中可观察反例，不另造 provider/运行体。实施收尾执行 `just check`、`just clippy` 及构建手册要求的受影响 core、平台、设备停止/故障组合；系统部署的有限观察实例由操作者清理，外部收割不是正常停止通过证据。本轮是设计，未执行上述代码验收。
+
+### 条件后续与设计交付检查
+
+| 延期能力 | owner、触发与完成条件 |
+|---|---|
+| 用户可见应用及外部正常停止请求 | 服务装配/应用接入者；出现真实应用或管理 UI 时，确定目录/名字、最小授权、停止调用权及真实消费者。此前仅声明基座，不制造占位客户端 |
+| 按名字限定目录可见范围的远程发行 | libservice 与 OAL/服务目录改造计划；真实消费者不能被授予现有整个目录访问角色时，先闭合目录授权发行协议及来源/付款/撤销，再接入该消费者。当前不以 sender 运输缩权冒充业务范围缩权 |
+| 服务恢复、可丢弃实例及客户端重连 | 本计划；出现必须在某服务失败后继续可用的需求时，闭合状态恢复、旧权力/未知操作与新实例边界并验证真实故障。当前必需实例失败政策到该合同替换时才删除 |
+| 独立 registry 宿主、通用 manifest 或 supervisor 服务 | 本计划；独立信任/付款/升级/可用性或运行期配置需求成立时重审，须有相应真实装配与删除旧布局的证据；领域独立不是拆进程的充分理由 |
+| 正式受托进程管理服务 | 进程领域/服务装配；真实工作负载需要委托启动或持续管理政策时设计。现有 srv_pm 验收保留，不先更名或包装成正式管理 API |
+| 持久文件系统、仓库及安装更新 | 文件扩展/设备仓库与关机各原计划；真实数据/仓库消费者出现前闭合介质、来源、flush/恢复和停止依赖。内存目录不冒充 bootfs |
+
+外部对照用于检查职责分离，不能直接引入对方框架：systemd **v257** 的 [Type/Restart](https://www.freedesktop.org/software/systemd/man/257/systemd.service.html) 区分进程启动、READY 和重启政策，[unit ordering](https://www.freedesktop.org/software/systemd/man/257/systemd.unit.html) 区分依赖与次序；Genode Foundations **24.05** 的 [3.2.1–3.2.4](https://genode.org/documentation/genode-foundations-24-05.pdf) 说明父级路由、服务公告和 session 寿命，未据此获得自动重连保证。Fuchsia 官方 lifecycle 在线页只作发现材料，未固定版本，不作为本轮合同证据。Halcyon 的选择来自上述实际 owner、目标与故障边界。
+
+BrightReed 的只读讨论与主会话判断收敛为：可先交付有真实授权出口和生命周期的铺路基座；共同故障政策使当前拆宿主没有独立收益；不自注册、不新增生命周期 RPC；文件停止按独立 Stopped/DONE 事实汇合。定稿走查发现目录没有远程缩权发行接口，主会话亲核 service Request/AccessRights 与 Root::prepare 后，将承诺收窄为既有目录角色交付，不为填充方案新增 RPC。主会话亲核上述关键代码，拒绝把易失状态当作普遍的故障终局理由。
+
+交付前结构检查：范围与非目标、正常/失败/取消/退出、授权与付款、唯一进程持有、来源退休、停止与终局已有确定归属；没有新增锁序或内核 ABI，公共目录协议不扩展。持久化、恢复和外部客户端是有触发的能力后续，不是本轮未闭合 owner。设计只对选定基座闭合，D01/D02/D07–D09 的其它未来范围保留。文档验证与提交状态由本节末尾追加；提交后按 REVIEW 登记固定交付的可选独立审查，不把本轮讨论当作独立 Review。
+
+本轮文档验证：5 份变更均为 plans 文档；33 个新增本地链接、20 个标题锚点与代码围栏检查通过，`git diff --check` 通过。BrightReed 的意见仅作为设计收敛与所核源码事实，未执行独立 Review。未修改代码、impls 或 ideas，未运行编译、单测、QEMU，未提交；可选独立审查在交付提交后固定目标登记。下一步直接按本节迁移顺序实施，不能把这些设计检查当作常驻基座已运行的证据。
