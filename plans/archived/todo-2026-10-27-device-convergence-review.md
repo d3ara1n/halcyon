@@ -1,6 +1,6 @@
 # 设备第二轮完整交付的独立 Review
 
-状态：待独立审查。代码交付已固定，本登记与导航更新不改变实现；DMA＋IPI 组合已在后续工具修正下补证，历史时钟异常仅观察，当前状态见[设备交付接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)。本审查的固定对象不随工具后续改动扩展。
+状态：**按用户 2026-10-28 的明确要求，与首批设计增量登记合并为最新代码的设备/驱动整体 Review，本登记归档。** [统一报告](review-2026-10-28-device-driver-overall.md)固定 `d19fdfe`，承接完整设备与驱动责任链及发现的修复、验证与复核。本次不宣称原 `c5d005d` 的所有切面分别通过了审查；下文固定对象、证据和“尚待执行”等表述保留原登记事实，当前接力只从统一报告进入。
 
 ## 固定对象
 
@@ -9,11 +9,11 @@
 - 目标：`c5d005dc7e6c64a74f0bb7e5874494c4532db4b0`，`refactor(device): 收敛逐轮控制与持续监督并闭合生命周期`。
 - 范围：基线到目标的完整交付，包含第二轮机制替代、交付后整理、生命周期收口及相关文档/验收工具。后续登记提交不属于新的产品实现，不另为它登记 Review。
 
-本次不同于[首轮固定检查点审查](archived/todo-2026-10-27-device-implementation-review.md)：该审查已由[原发现及第二轮处置档案](archived/review-2026-10-27-device-implementation.md)结束；此次用新上下文检查最终替代结构，不把旧 C 编号原样当作当前缺陷。新增 L1–L7 的修复与交付前复核由[生命周期档案](archived/review-2026-10-27-device-lifecycle.md)保存。
+本次不同于[首轮固定检查点审查](todo-2026-10-27-device-implementation-review.md)：该审查已由[原发现及第二轮处置档案](review-2026-10-27-device-implementation.md)结束；此次用新上下文检查最终替代结构，不把旧 C 编号原样当作当前缺陷。新增 L1–L7 的修复与交付前复核由[生命周期档案](review-2026-10-27-device-lifecycle.md)保存。
 
 ## 目标与审查范围
 
-审查判断最终实现是否兑现已确认的权限、所有权、活性、失败与费用合同，以及是否还存在可通过共同机制消除的分支和重复事实。以代码为真值，[设备第二轮目标](todo-2026-09-device-system-design.md#第二轮收敛设计2026-10-27)、[生命周期收口目标](archived/review-2026-10-27-device-lifecycle.md#目标设计与责任链)及[持续监督目标](todo-2026-10-07-service-assembly.md#第二轮持续监督设计2026-10-27)为设计依据；当前实现说明见 [device](../notes/impls/device.md)、[rpc](../notes/impls/rpc.md)、[startup](../notes/impls/startup.md)、[runtime](../notes/impls/runtime.md)。
+审查判断最终实现是否兑现已确认的权限、所有权、活性、失败与费用合同，以及是否还存在可通过共同机制消除的分支和重复事实。以代码为真值，[设备第二轮目标](../todo-2026-09-device-system-design.md#第二轮收敛设计2026-10-27)、[生命周期收口目标](review-2026-10-27-device-lifecycle.md#目标设计与责任链)及[持续监督目标](../todo-2026-10-07-service-assembly.md#第二轮持续监督设计2026-10-27)为设计依据；当前实现说明见 [device](../../notes/impls/device.md)、[rpc](../../notes/impls/rpc.md)、[startup](../../notes/impls/startup.md)、[runtime](../../notes/impls/runtime.md)。
 
 | 切面 | 实际范围与重点 |
 |---|---|
@@ -32,14 +32,14 @@
 最终源码版本由 `artifacts/lifecycle/source-version.json` 记录，提交整理核对零漂移。可复用的最近证据为：
 
 - `just check`、十分面 `just clippy`、137项相关 host 测试和 user 格式检查通过。新增 Lifecycle host 用例核退休后的执行身份/IO 权及准备拒绝后禁止复活。
-- `THROTTLE=100` 的 core、device-reuse、device-candidates、unknown QueryUse/GetResource/Master 六条 QEMU 路线均退出0；具体入口、退款/故障覆盖和进程清理见[最终组合验证](archived/review-2026-10-27-device-lifecycle.md#最终组合验证与交付边界)。
-- 第二轮较早的单 root 最早 Start/业务等待/装载/停止故障、reset 拒绝、IRQ idle、平台及未发布根退款证据见[原交付档案](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。保留它们各自的版本限制，不把它们描述为最终提交逐项重跑。
+- `THROTTLE=100` 的 core、device-reuse、device-candidates、unknown QueryUse/GetResource/Master 六条 QEMU 路线均退出0；具体入口、退款/故障覆盖和进程清理见[最终组合验证](review-2026-10-27-device-lifecycle.md#最终组合验证与交付边界)。
+- 第二轮较早的单 root 最早 Start/业务等待/装载/停止故障、reset 拒绝、IRQ idle、平台及未发布根退款证据见[原交付档案](review-2026-10-27-device-implementation.md#第二轮交付与边界)。保留它们各自的版本限制，不把它们描述为最终提交逐项重跑。
 - 终态结果查询、Released 早于报告回复、停止先于迟到安装成功、异步 Source 准入拒绝的精确窗口未逐项动态注入；当前依据为源码责任链、生命周期 host 和实际消费者组合，不外推全部交错。
 
-本机 `artifacts/` 不提交，正文保留命令、结果及证据边界；缺少本机原始证据时明确说明，不将缺文件改写成已通过或产品错误。DMA＋IPI 后续补证及仅观察的独立时钟异常由[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)拥有，不将后续工具版本冒充本固定提交，也不另复制调查记录。
+本机 `artifacts/` 不提交，正文保留命令、结果及证据边界；缺少本机原始证据时明确说明，不将缺文件改写成已通过或产品错误。DMA＋IPI 后续补证及仅观察的独立时钟异常由[唯一收口表](../todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)拥有，不将后续工具版本冒充本固定提交，也不另复制调查记录。
 
 ## 接手与报告
 
-按 [REVIEW](REVIEW.md) 的固定对象与只读审查纪律执行。新的 findings 须给出目标提交中的具体位置、可达路径和违反的合同；先区分代码缺陷、机制改进候选与已登记的证据缺口。必要复核仅运行针对具体风险的现有检查，不机械重跑所有设备路线。
+按 [REVIEW](../REVIEW.md) 的固定对象与只读审查纪律执行。新的 findings 须给出目标提交中的具体位置、可达路径和违反的合同；先区分代码缺陷、机制改进候选与已登记的证据缺口。必要复核仅运行针对具体风险的现有检查，不机械重跑所有设备路线。
 
 审查开始后以 `review-2026-10-27-device-convergence.md` 统一承载发现、修复和复核，并将本登记转为报告入口；目前没有该报告，也没有宣告独立 Review 完成。

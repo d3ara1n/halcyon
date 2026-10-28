@@ -4,42 +4,65 @@ use super::{IsaReqError as Error, IsaRequirement, u16_at, u32_at, u64_at};
 const ATTRIBUTES: u32 = 0x7000_0003;
 const ARCH: u64 = 5;
 
-pub(super) struct IsaReader<'a> {
-    buf: &'a [u8],
+/// 相对原映像的范围；跨步不保存任何内部借用。
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+impl Span {
+    fn len(self) -> usize {
+        self.end - self.start
+    }
+    fn bytes(self, buf: &[u8]) -> Result<&[u8], Error> {
+        buf.get(self.start..self.end)
+            .ok_or(Error::MalformedAttributes)
+    }
+    fn slice(self, start: usize, end: usize) -> Result<Self, Error> {
+        if start > end || end > self.len() {
+            return Err(Error::MalformedAttributes);
+        }
+        Ok(Self {
+            start: self.start + start,
+            end: self.start + end,
+        })
+    }
+}
+pub(super) struct IsaReader {
     shoff: usize,
     shentsize: usize,
     shnum: usize,
     double: bool,
-    phase: Phase<'a>,
+    phase: Phase,
 }
-enum Phase<'a> {
+enum Phase {
     Section(usize),
-    VendorBlock(&'a [u8]),
+    VendorBlock(Span),
     Vendor {
-        data: &'a [u8],
+        data: Span,
         pos: usize,
-        rest: &'a [u8],
+        rest: Span,
     },
     Subsection {
-        data: &'a [u8],
+        data: Span,
         pos: usize,
-        rest: &'a [u8],
+        rest: Span,
     },
     Attribute {
-        data: &'a [u8],
+        data: Span,
         pos: usize,
     },
     String {
-        data: &'a [u8],
+        data: Span,
         start: usize,
         pos: usize,
         arch: bool,
     },
-    Arch(ArchReader<'a>),
+    Arch(ArchReader),
     Done,
 }
-impl<'a> IsaReader<'a> {
-    pub(super) fn new(buf: &'a [u8]) -> Result<Self, Error> {
+impl IsaReader {
+    pub(super) fn new(buf: &[u8]) -> Result<Self, Error> {
         if buf.len() < 64 {
             return Err(Error::MalformedAttributes);
         }
@@ -74,7 +97,6 @@ impl<'a> IsaReader<'a> {
             return Err(Error::MalformedAttributes);
         }
         Ok(Self {
-            buf,
             shoff,
             shentsize,
             shnum,
@@ -82,13 +104,16 @@ impl<'a> IsaReader<'a> {
             phase: Phase::Section(0),
         })
     }
-    pub(super) fn advance(&mut self) -> Result<Option<IsaRequirement>, Error> {
+    pub(super) fn advance(&mut self, buf: &[u8]) -> Result<Option<IsaRequirement>, Error> {
         self.phase = match core::mem::replace(&mut self.phase, Phase::Done) {
             Phase::Section(index) => {
                 if index == self.shnum {
                     return Err(Error::MissingArch);
                 }
-                let sh = &self.buf[self.shoff + index * self.shentsize..][..64];
+                let sh = buf
+                    .get(self.shoff + index * self.shentsize..)
+                    .and_then(|bytes| bytes.get(..64))
+                    .ok_or(Error::MalformedAttributes)?;
                 if u32_at(sh, 4) != ATTRIBUTES {
                     Phase::Section(index + 1)
                 } else {
@@ -96,30 +121,38 @@ impl<'a> IsaReader<'a> {
                         usize::try_from(u64_at(sh, 24)).map_err(|_| Error::MalformedAttributes)?;
                     let size =
                         usize::try_from(u64_at(sh, 32)).map_err(|_| Error::MalformedAttributes)?;
-                    let data = self
-                        .buf
-                        .get(off..off.checked_add(size).ok_or(Error::MalformedAttributes)?)
-                        .ok_or(Error::MalformedAttributes)?;
+                    let span = Span {
+                        start: off,
+                        end: off.checked_add(size).ok_or(Error::MalformedAttributes)?,
+                    };
+                    let data = span.bytes(buf)?;
                     if data.len() < 5 || data[0] != b'A' {
                         return Err(Error::MalformedAttributes);
                     }
-                    Phase::VendorBlock(&data[1..])
+                    Phase::VendorBlock(span.slice(1, size)?)
                 }
             }
             Phase::VendorBlock(bytes) => {
-                if bytes.is_empty() {
+                if bytes.len() == 0 {
                     return Err(Error::MissingArch);
                 }
-                let length = u32_at(bytes.get(..4).ok_or(Error::MalformedAttributes)?, 0) as usize;
+                let length = u32_at(
+                    bytes
+                        .bytes(buf)?
+                        .get(..4)
+                        .ok_or(Error::MalformedAttributes)?,
+                    0,
+                ) as usize;
                 // aaelf32 Build Attributes：vendor长度含自身4字节、名称NTBS及属性数据。
-                let data = bytes.get(4..length).ok_or(Error::MalformedAttributes)?;
-                let rest = &bytes[length..];
+                let data = bytes.slice(4, length)?;
+                let rest = bytes.slice(length, bytes.len())?;
                 Phase::Vendor { data, pos: 0, rest }
             }
             Phase::Vendor { data, pos, rest } => {
-                let byte = *data.get(pos).ok_or(Error::MalformedAttributes)?;
+                let bytes = data.bytes(buf)?;
+                let byte = *bytes.get(pos).ok_or(Error::MalformedAttributes)?;
                 if byte == 0 {
-                    if &data[..pos] == b"riscv" {
+                    if &bytes[..pos] == b"riscv" {
                         Phase::Subsection {
                             data,
                             pos: pos + 1,
@@ -142,12 +175,15 @@ impl<'a> IsaReader<'a> {
                     self.phase = Phase::VendorBlock(rest);
                     return Ok(None);
                 }
-                let (tag, next) = uleb(data, pos)?;
-                let size_bytes = data.get(next..next + 4).ok_or(Error::MalformedAttributes)?;
+                let bytes = data.bytes(buf)?;
+                let (tag, next) = uleb(bytes, pos)?;
+                let size_bytes = bytes
+                    .get(next..next + 4)
+                    .ok_or(Error::MalformedAttributes)?;
                 let size = u32_at(size_bytes, 0) as usize;
                 let end = pos.checked_add(size).ok_or(Error::MalformedAttributes)?;
                 // 长度包含tag与长度字段自身，内容必须从该字段之后开始。
-                let body = data.get(next + 4..end).ok_or(Error::MalformedAttributes)?;
+                let body = data.slice(next + 4, end)?;
                 if tag == 1 {
                     Phase::Attribute { data: body, pos: 0 }
                 } else {
@@ -162,9 +198,10 @@ impl<'a> IsaReader<'a> {
                 if pos == data.len() {
                     return Err(Error::MissingArch);
                 }
-                let (tag, next) = uleb(data, pos)?;
+                let bytes = data.bytes(buf)?;
+                let (tag, next) = uleb(bytes, pos)?;
                 if tag % 2 == 0 {
-                    let (_, next) = uleb(data, next)?;
+                    let (_, next) = uleb(bytes, next)?;
                     Phase::Attribute { data, pos: next }
                 } else {
                     Phase::String {
@@ -181,7 +218,10 @@ impl<'a> IsaReader<'a> {
                 pos,
                 arch,
             } => {
-                let byte = *data.get(pos).ok_or(Error::MalformedAttributes)?;
+                let byte = *data
+                    .bytes(buf)?
+                    .get(pos)
+                    .ok_or(Error::MalformedAttributes)?;
                 if byte != 0 {
                     Phase::String {
                         data,
@@ -190,13 +230,13 @@ impl<'a> IsaReader<'a> {
                         arch,
                     }
                 } else if arch {
-                    Phase::Arch(ArchReader::new(&data[start..pos])?)
+                    Phase::Arch(ArchReader::new(data.slice(start, pos)?, buf)?)
                 } else {
                     Phase::Attribute { data, pos: pos + 1 }
                 }
             }
             Phase::Arch(mut reader) => {
-                if reader.advance()? {
+                if reader.advance(buf)? {
                     if self.double != (reader.has_f && reader.has_d)
                         || !self.double && (reader.has_f || reader.has_d)
                     {
@@ -217,8 +257,8 @@ impl<'a> IsaReader<'a> {
 }
 
 /// 名称逐字节核验，版本数字也逐步消费；超长版本串不会占用一次推进。
-struct ArchReader<'a> {
-    bytes: &'a [u8],
+struct ArchReader {
+    bytes: Span,
     pos: usize,
     start: usize,
     name_end: Option<usize>,
@@ -234,9 +274,9 @@ enum Version {
     MinorStart,
     Minor,
 }
-impl<'a> ArchReader<'a> {
-    fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        if !bytes.starts_with(b"rv64") {
+impl ArchReader {
+    fn new(bytes: Span, buf: &[u8]) -> Result<Self, Error> {
+        if !bytes.bytes(buf)?.starts_with(b"rv64") {
             return Err(Error::BadBase);
         }
         Ok(Self {
@@ -250,8 +290,9 @@ impl<'a> ArchReader<'a> {
             has_d: false,
         })
     }
-    fn advance(&mut self) -> Result<bool, Error> {
-        let byte = self.bytes.get(self.pos).copied();
+    fn advance(&mut self, buf: &[u8]) -> Result<bool, Error> {
+        let bytes = self.bytes.bytes(buf)?;
+        let byte = bytes.get(self.pos).copied();
         if byte.is_none() || byte == Some(b'_') {
             if matches!(self.version, Version::Major | Version::MinorStart) {
                 return Err(Error::UnsupportedExtension);
@@ -265,7 +306,7 @@ impl<'a> ArchReader<'a> {
                 });
             }
             if !self.base {
-                match &self.bytes[self.start..end] {
+                match &bytes[self.start..end] {
                     b"f" => self.has_f = true,
                     b"d" | b"zcd" => self.has_d = true,
                     b"m" | b"a" | b"c" | b"zicsr" | b"zifencei" | b"zicntr" | b"zmmul"

@@ -172,7 +172,7 @@ const MAX_LOAD_SEGMENTS: usize = 64;
 
 /// 同步入口与可分步入口共用同一验证器。
 pub fn validate(buf: &[u8], limits: LoadLimits) -> Result<Elf, ElfError> {
-    let mut validation = Validation::new(buf, limits)?;
+    let mut validation = Validation::new(buf, limits).map_err(|(_, error)| error)?;
     loop {
         if let Some(image) = validation.advance()? {
             return Ok(image);
@@ -181,9 +181,29 @@ pub fn validate(buf: &[u8], limits: LoadLimits) -> Result<Elf, ElfError> {
 }
 
 /// 一步处理一个program header、一个页权限区间或一个ISA解析单元。
-/// 所有输入借用贯穿验证，调用者不能在两次推进之间更换字节。
-pub struct Validation<'a> {
-    buf: &'a [u8],
+/// 输入 owner 贯穿验证；AsRef 必须持续返回相同不可变字节，不提供替换或可变借用入口。
+pub struct Validation<I> {
+    input: I,
+    state: ValidationState,
+}
+impl<I: AsRef<[u8]>> Validation<I> {
+    pub fn new(input: I, limits: LoadLimits) -> Result<Self, (I, ElfError)> {
+        match ValidationState::new(input.as_ref(), limits) {
+            Ok(state) => Ok(Self { input, state }),
+            Err(error) => Err((input, error)),
+        }
+    }
+    pub fn advance(&mut self) -> Result<Option<Elf>, ElfError> {
+        self.state.advance(self.input.as_ref())
+    }
+    pub fn input(&self) -> &I {
+        &self.input
+    }
+    pub fn into_input(self) -> I {
+        self.input
+    }
+}
+struct ValidationState {
     limits: LoadLimits,
     entry: u64,
     phoff: usize,
@@ -194,12 +214,12 @@ pub struct Validation<'a> {
     seen_load: bool,
     phdr: Option<(u64, u64, u64)>,
     plan: Option<RunPlan>,
-    isa: Option<IsaReader<'a>>,
+    isa: Option<IsaReader>,
     done: bool,
     failure: Option<ElfError>,
 }
-impl<'a> Validation<'a> {
-    pub fn new(buf: &'a [u8], limits: LoadLimits) -> Result<Self, ElfError> {
+impl ValidationState {
+    fn new(buf: &[u8], limits: LoadLimits) -> Result<Self, ElfError> {
         use core::mem::size_of;
 
         type Ehdr = [u8; 64];
@@ -267,7 +287,6 @@ impl<'a> Validation<'a> {
             .try_reserve_exact(MAX_LOAD_SEGMENTS)
             .map_err(|_| ElfError::OutOfMemory)?;
         Ok(Self {
-            buf,
             limits,
             entry,
             phoff,
@@ -283,20 +302,20 @@ impl<'a> Validation<'a> {
             failure: None,
         })
     }
-    pub fn advance(&mut self) -> Result<Option<Elf>, ElfError> {
+    fn advance(&mut self, buf: &[u8]) -> Result<Option<Elf>, ElfError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let result = self.step();
+        let result = self.step(buf);
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn step(&mut self) -> Result<Option<Elf>, ElfError> {
+    fn step(&mut self, buf: &[u8]) -> Result<Option<Elf>, ElfError> {
         assert!(!self.done, "ELF validation already completed");
         if self.index < self.phnum {
-            self.header()?;
+            self.header(buf)?;
             self.index += 1;
             return Ok(None);
         }
@@ -310,14 +329,14 @@ impl<'a> Validation<'a> {
             return Ok(None);
         }
         if self.isa.is_none() {
-            self.isa = Some(IsaReader::new(self.buf).map_err(ElfError::Isa)?);
+            self.isa = Some(IsaReader::new(buf).map_err(ElfError::Isa)?);
             return Ok(None);
         }
         let Some(requirement) = self
             .isa
             .as_mut()
             .expect("ELF ISA reader remains owned")
-            .advance()
+            .advance(buf)
             .map_err(ElfError::Isa)?
         else {
             return Ok(None);
@@ -331,9 +350,11 @@ impl<'a> Validation<'a> {
             image_end: plan.image_end,
         }))
     }
-    fn header(&mut self) -> Result<(), ElfError> {
-        let buf = self.buf;
-        let p: &[u8; 56] = buf[self.phoff + self.index * 56..][..56]
+    fn header(&mut self, buf: &[u8]) -> Result<(), ElfError> {
+        let p: &[u8; 56] = buf
+            .get(self.phoff + self.index * 56..)
+            .and_then(|bytes| bytes.get(..56))
+            .ok_or(ElfError::BadProgramHeaders)?
             .try_into()
             .unwrap();
         let kind = u32_at(p, 0);

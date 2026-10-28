@@ -416,8 +416,9 @@ impl Managed {
         while input.pull().is_some() {}
         input.take_timeout();
         if self.phase_end == Deadline::INFINITE && self.next == Next::Claim {
-            // Claim到具名功能安装的共同准备窗口；实测debug出生/协议工作约10s，留运输/调度余量。
-            self.phase_end = libkernel::time::timeout_millis(20_000)?;
+            // Claim 至功能安装共用一次期限；分步装载下实测 PCI 正常链已接近 20s，
+            // 部署窗口留同量调度余量，不改变单次 RPC 或硬件停止期限。
+            self.phase_end = libkernel::time::timeout_millis(40_000)?;
             libkernel::debug!(
                 "driver stage started: device={}, start_ns={}, end_ns={:?}",
                 self.run.borrow().device.serial(),

@@ -181,6 +181,20 @@ impl Manager {
             }
         }
         input.take_timeout();
+        if world.stopping || self.stopping {
+            self.next = None;
+            if let Some((txid, _)) = self.call {
+                if world.rpc.cancel(txid) {
+                    world.rpc_dirty = true;
+                }
+                let Some(completion) = world.rpc.take(txid) else {
+                    return Ok(advance(Step::Parked));
+                };
+                // 停止已封新发现；原调用完成只兑现运输退休，不再接纳迟到扫描结果。
+                drop(completion);
+                self.call = None;
+            }
+        }
         if let Some((txid, operation)) = self.call {
             let Some(completion) = world.rpc.take(txid) else {
                 return Ok(advance(Step::Parked));
@@ -220,7 +234,16 @@ impl Manager {
                 Operation::Enumerate => {
                     let (header, body) =
                         Header::decode(&reply.payload).unwrap_or_else(|error| fatal(error));
-                    if header.op != 14 || header.error.is_some() || reply.handles.remaining() != 0 {
+                    if header.op != 14 || reply.handles.remaining() != 0 {
+                        fatal(Error::Invalid);
+                    }
+                    if header.error == Some(Error::Closed) && body.is_empty() {
+                        // 来源封口可能先于 Scope Watch 提示到达，沿同一停止 owner 收束。
+                        world.stopping = true;
+                        self.next = None;
+                        return Ok(advance(Step::Runnable));
+                    }
+                    if header.error.is_some() {
                         fatal(Error::Invalid);
                     }
                     let page = device::decode_scan(body, self.after, self.end)
@@ -332,6 +355,9 @@ impl Manager {
         }
         if world.stopping {
             self.source.remove(requests)?;
+            if self.source.is_empty() {
+                self.watch = None;
+            }
             if !self.stop_notified {
                 self.stop_notified = true;
                 requests.wake(world.observer_ingress)?;

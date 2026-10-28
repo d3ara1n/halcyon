@@ -581,8 +581,9 @@ fn binding_watch_terminates_on_its_own_release_and_does_not_follow_next_epoch() 
     let a = register(&mut registry, ROOT, &request(1, None, "a", true));
     let reference = BindingRef::new(a, 1).unwrap();
     registry.commit_claim(ROOT, reference, 20).unwrap();
+    let snapshot = registry.binding_snapshot(reference).unwrap();
     registry
-        .create_watch(ROOT, WatchTarget::Binding(reference), 100, 10)
+        .create_watch(ROOT, WatchTarget::Binding(snapshot), 100, 10)
         .unwrap();
     registry.stop_claim(ROOT, reference).unwrap();
     assert!(!registry.query_watch(100).unwrap().terminal());
@@ -593,6 +594,30 @@ fn binding_watch_terminates_on_its_own_release_and_does_not_follow_next_epoch() 
         .commit_claim(ROOT, BindingRef::new(a, 2).unwrap(), 21)
         .unwrap();
     assert_eq!(registry.query_watch(100).unwrap(), terminal);
+}
+
+#[test]
+fn released_control_can_create_terminal_watch_after_registry_identity_retires() {
+    use libdevice::watch::Reason;
+    let (mut registry, _, _) = setup();
+    let id = register(&mut registry, ROOT, &request(1, None, "late-watch", true));
+    let reference = BindingRef::new(id, 1).unwrap();
+    registry.commit_claim(ROOT, reference, 20).unwrap();
+    // 原控制壳保留稳定回执及付款者，不应为了后续观察而保活供应 payload。
+    let funding = registry.funding(ROOT).unwrap().clone();
+    registry.stop_claim(ROOT, reference).unwrap();
+    let released = registry.release_binding(reference).unwrap();
+    registry.withdraw_publication(ROOT, 1).unwrap();
+    registry.control_closed(id).unwrap();
+    assert_eq!(registry.retire_device(id), Ok(1));
+    let info = registry
+        .create_binding_watch(released, 100, 10, &funding)
+        .unwrap();
+    assert_eq!(info.reason, Reason::Released);
+    assert!(info.terminal());
+    assert_ne!(info.pending, 0);
+    assert_eq!(registry.ack_watch(100, info.sequence).unwrap().pending, 0);
+    registry.retire_watch(100).unwrap();
 }
 
 #[test]

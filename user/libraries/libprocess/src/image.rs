@@ -179,7 +179,7 @@ impl Image {
         Ok(Self { object, length })
     }
     /// 映像读取方按需要持有只读映射；构造方和能力转交者无需映入完整映像。
-    pub fn map(&self) -> Result<ImageView<'_>, SystemCallError> {
+    pub fn map(&self) -> Result<ImageView, SystemCallError> {
         let mapping = MappedRegion::map_object(
             &self.object,
             0,
@@ -190,7 +190,7 @@ impl Image {
             Placement::Anywhere,
         )?;
         Ok(ImageView {
-            image: self,
+            length: self.length,
             mapping: Some(mapping),
         })
     }
@@ -199,11 +199,11 @@ impl Image {
     }
 }
 
-pub struct ImageView<'a> {
-    image: &'a Image,
+pub struct ImageView {
+    length: usize,
     mapping: Option<MappedRegion>,
 }
-impl ImageView<'_> {
+impl ImageView {
     /// 真实解除失败仍保留view；重复close接续同一映射。
     pub fn close(&mut self) -> Result<(), SystemCallError> {
         unmap(&mut self.mapping)
@@ -222,10 +222,10 @@ impl ImageView<'_> {
             .expect("image mapping lost range")
             .start;
         // SAFETY: Executable 是不可逆的写许可封闭终态；只读映射在本借用期间保活，没有DMA写者。
-        unsafe { core::slice::from_raw_parts(start as *const u8, self.image.length) }
+        unsafe { core::slice::from_raw_parts(start as *const u8, self.length) }
     }
 }
-impl Drop for ImageView<'_> {
+impl Drop for ImageView {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
             panic!("image view cleanup failed: {:?}", error);

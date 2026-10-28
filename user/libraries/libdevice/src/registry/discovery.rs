@@ -5,10 +5,12 @@ use crate::watch::{Info, Reason, Sequence};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchTarget {
     Scope(Scope),
-    Binding(BindingRef),
+    /// 宿主从认证 Control/Use 取得的原轮快照；不是 wire 提供的授权。
+    Binding(binding::Snapshot),
 }
 pub(super) struct Watch {
-    source: u64,
+    // 终态出生只观察稳定回执，不保活已退出的设备记录/供应 payload。
+    source: Option<u64>,
     target: WatchTarget,
     task: u64,
     sequence: Sequence,
@@ -18,7 +20,7 @@ impl WatchTarget {
     fn scope(self) -> Scope {
         match self {
             Self::Scope(s) => s,
-            Self::Binding(r) => Scope::Subtree(r.device()),
+            Self::Binding(snapshot) => Scope::Subtree(snapshot.reference.device()),
         }
     }
 }
@@ -118,18 +120,14 @@ impl<C> Registry<C> {
         context: u64,
         task: u64,
     ) -> Result<Info, Error> {
-        if context == 0
-            || task == 0
-            || self.context_exists(context)
-            || self.watches.contains_key(context)
-        {
-            return Err(Error::Conflict);
-        }
         match target {
             WatchTarget::Scope(scope) => self.observe_scope(source, scope)?,
-            WatchTarget::Binding(reference) => {
-                if self.binding_snapshot(reference)?.subject.context() != source {
+            WatchTarget::Binding(snapshot) => {
+                if snapshot.subject.context() != source {
                     return Err(Error::Permission);
+                }
+                if self.binding_snapshot(snapshot.reference)? != snapshot {
+                    return Err(Error::StaleEpoch);
                 }
             }
         }
@@ -144,6 +142,37 @@ impl<C> Registry<C> {
                 .ok_or(Error::Quota)?;
         }
         let account = self.funding(source)?.domain().clone();
+        self.insert_watch(Some(source), target, context, task, &account)
+    }
+    /// 宿主必须从认证原轮 Control/Use 读取 snapshot 和付款者，wire 不可提供此证明。
+    pub fn create_binding_watch(
+        &mut self,
+        snapshot: binding::Snapshot,
+        context: u64,
+        task: u64,
+        funding: &Funding,
+    ) -> Result<Info, Error> {
+        let target = WatchTarget::Binding(snapshot);
+        if snapshot.phase != binding::Phase::Released {
+            return self.create_watch(snapshot.subject.context(), target, context, task);
+        }
+        self.insert_watch(None, target, context, task, funding.domain())
+    }
+    fn insert_watch(
+        &mut self,
+        source: Option<u64>,
+        target: WatchTarget,
+        context: u64,
+        task: u64,
+        account: &AccountView<DeviceResource>,
+    ) -> Result<Info, Error> {
+        if context == 0
+            || task == 0
+            || self.context_exists(context)
+            || self.watches.contains_key(context)
+        {
+            return Err(Error::Conflict);
+        }
         let record = Watch {
             source,
             target,
@@ -151,11 +180,13 @@ impl<C> Registry<C> {
             sequence: Sequence::new(),
             _unit: account.acquire(DeviceResource::Watch, 1)?,
         };
-        let entry = prepare(&self.watches, context, record, &account)?;
+        let entry = prepare(&self.watches, context, record, account)?;
         self.watches.insert_prepared(entry);
-        self.retain_source(source)?;
-        if let Scope::Subtree(id) = target.scope() {
-            self.retain_device(id)?;
+        if let Some(source) = source {
+            self.retain_source(source)?;
+            if let Scope::Subtree(id) = target.scope() {
+                self.retain_device(id)?;
+            }
         }
         self.discovery_dirty = true;
         self.query_watch(context)
@@ -163,12 +194,11 @@ impl<C> Registry<C> {
     fn watch_reason(&self, watch: &Watch) -> Option<Reason> {
         match watch.target {
             // 已有绑定观察在来源封口后继续观察停止，直到明确 Released。
-            WatchTarget::Binding(reference) => self
-                .binding_snapshot(reference)
-                .err()
-                .map(|_| Reason::Released),
+            WatchTarget::Binding(snapshot) => (snapshot.phase == binding::Phase::Released
+                || self.binding_snapshot(snapshot.reference).is_err())
+            .then_some(Reason::Released),
             WatchTarget::Scope(_) => self
-                .source_open(watch.source)
+                .source_open(watch.source.expect("scope watch retains its source"))
                 .err()
                 .map(|_| Reason::Revoked),
         }
@@ -212,9 +242,11 @@ impl<C> Registry<C> {
             .ok_or(Error::Permission)?
             .into_value()
             .value;
-        self.release_source(watch.source)?;
-        if let Scope::Subtree(id) = watch.target.scope() {
-            self.release_device(id)?;
+        if let Some(source) = watch.source {
+            self.release_source(source)?;
+            if let Scope::Subtree(id) = watch.target.scope() {
+                self.release_device(id)?;
+            }
         }
         self.discovery_dirty = true;
         Ok(())
@@ -244,7 +276,7 @@ impl<C> Registry<C> {
             let watch = &record.value;
             let reason = self.watch_reason(watch);
             let matches = match watch.target {
-                WatchTarget::Binding(reference) => reference.device() == id,
+                WatchTarget::Binding(snapshot) => snapshot.reference.device() == id,
                 WatchTarget::Scope(scope) => {
                     self.scope_contains(scope, Scope::Subtree(id))
                         .unwrap_or(false)

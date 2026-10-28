@@ -73,6 +73,8 @@ pub(super) struct Device {
     interrupt: Option<Ring>,
     data: Option<Page>,
     transfer: Option<Transfer>,
+    // Disable Slot 后只留结果字节；退休页不再承担迟到消费者的读取寿命。
+    completion: Option<TransferResult>,
     keyboard: Option<Keyboard>,
     configuration_bytes: usize,
     disconnected: bool,
@@ -95,6 +97,7 @@ impl Device {
             interrupt: None,
             data: None,
             transfer: None,
+            completion: None,
             keyboard: None,
             configuration_bytes: 0,
             disconnected: false,
@@ -131,7 +134,8 @@ impl Device {
         if self.command.is_none() {
             self.stage = if self.slot == 0 {
                 Stage::Retire(0)
-            } else if self.stage == Stage::Address {
+            } else if self.transfer.is_none() {
+                // 原定向命令已结束，所有 TD 完成已消费；未配置的端点不需要 Stop。
                 Stage::Disable
             } else {
                 Stage::StopEndpoint(AfterStop::Interface)
@@ -503,10 +507,7 @@ impl Device {
                 )?;
             }
             Stage::StopEndpoint(after) => {
-                let dci = self
-                    .transfer
-                    .as_ref()
-                    .map_or_else(|| self.keyboard.map_or(1, Keyboard::dci), |td| td.dci);
+                let dci = self.transfer.as_ref().ok_or(Error::NotReady)?.dci;
                 self.command(
                     controller,
                     15,
@@ -516,10 +517,7 @@ impl Device {
                 )?;
             }
             Stage::Rewind(after) => {
-                let dci = self
-                    .transfer
-                    .as_ref()
-                    .map_or_else(|| self.keyboard.map_or(1, Keyboard::dci), |td| td.dci);
+                let dci = self.transfer.as_ref().ok_or(Error::NotReady)?.dci;
                 let address = if dci == 1 {
                     self.ep0.as_ref().ok_or(Error::NotReady)?.dequeue()?
                 } else {
@@ -535,12 +533,17 @@ impl Device {
             }
             Stage::Disable => self.command(controller, 10, 0, 0, Stage::WaitDisable)?,
             Stage::Retire(index) => {
+                if index == 0 && self.transfer.is_some() {
+                    // 硬件已经退出，先消费结果为独立回执，再解除任何 CPU 映射。
+                    self.completion = Some(self.completed_transfer()?);
+                    self.transfer = None;
+                }
                 let page = match index {
-                    0 => self.input.as_ref(),
-                    1 => self.output.as_ref(),
-                    2 => self.ep0.as_ref().map(|r| &r.page),
-                    3 => self.interrupt.as_ref().map(|r| &r.page),
-                    4 => self.data.as_ref(),
+                    0 => self.input.as_mut(),
+                    1 => self.output.as_mut(),
+                    2 => self.ep0.as_mut().map(|r| &mut r.page),
+                    3 => self.interrupt.as_mut().map(|r| &mut r.page),
+                    4 => self.data.as_mut(),
                     _ => {
                         self.stage = Stage::Closed;
                         return Ok(());
@@ -558,6 +561,23 @@ impl Device {
         }
         let _ = now;
         Ok(())
+    }
+    fn completed_transfer(&self) -> Result<TransferResult, Error> {
+        let result = self
+            .transfer
+            .as_ref()
+            .and_then(|td| td.result)
+            .ok_or(Error::NotReady)?;
+        Ok(match result {
+            Ok(count) if count <= 8 => {
+                let mut bytes = [0; 8];
+                self.copy(&mut bytes[..count])?;
+                Ok((bytes, count as u8))
+            }
+            // 枚举期间停止没有外部 USB 请求；完整描述符不作为八字节功能结果交付。
+            Ok(_) => Err(Error::Closed),
+            Err(error) => Err(error),
+        })
     }
     fn event(&mut self, controller: &Controller, event: Event) -> Result<(), Error> {
         match event {
@@ -984,6 +1004,14 @@ impl Controller {
     }
     pub fn usb_result(&mut self, connection: u64) -> Result<Option<TransferResult>, Error> {
         let index = self.index(connection)?;
+        if let Some(completion) = self.usb[index]
+            .as_mut()
+            .ok_or(Error::Closed)?
+            .completion
+            .take()
+        {
+            return Ok(Some(completion));
+        }
         let device = self.usb[index].as_ref().ok_or(Error::Closed)?;
         if !matches!(device.stage, Stage::Ready | Stage::Closed) {
             return Ok(None);

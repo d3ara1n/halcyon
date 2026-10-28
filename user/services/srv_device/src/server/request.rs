@@ -682,7 +682,7 @@ impl Request {
                 self.create_watch(
                     id,
                     world,
-                    libdevice::registry::WatchTarget::Binding(snapshot.reference),
+                    libdevice::registry::WatchTarget::Binding(snapshot),
                     Some(binding),
                 )?;
             }
@@ -882,7 +882,16 @@ impl Request {
             observer.into_capability(),
             Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
         )?;
-        world.registry.create_watch(source, target, context, task)?;
+        match target {
+            libdevice::registry::WatchTarget::Binding(snapshot) => {
+                world
+                    .registry
+                    .create_binding_watch(snapshot, context, task, &self.funding)?;
+            }
+            libdevice::registry::WatchTarget::Scope(_) => {
+                world.registry.create_watch(source, target, context, task)?;
+            }
+        }
         world.roles.insert_prepared(role);
         let info = world.signal_watch(context)?;
         world

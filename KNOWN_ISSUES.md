@@ -18,6 +18,7 @@
 |---|---|---|
 | 平台时钟失败 | 2026-10-26 一次 `platform clock failed` 终局；首次失败分支和读数未保存，后续两次首因路线均未复现。不能判断是旧缺陷已间接消失、潜在缺陷还是环境异常 | 失败分支、写前 failed、原 prior/raw、geometry、hart/调用栈与运行环境；[时钟复查](plans/todo-2026-09-device-system-design.md#独立时钟异常复查2026-10-27) |
 | W05-04：Watch 准入未知错误 | 2026-10-10 secondary Watch 饱和循环出现一次非 Quota 错误，未保存具体 Err/count/clock；后续未复现。共用整体期限的候选结构已删除，但无法证明它是原根因 | 具体 Err、成功 count、last_ns/deadline、来源与控制 Lifetime 退休/费用顺序；[Watch 原记录](plans/todo-2026-10-07-fal-service-redesign.md#历史问题重新核定2026-10-11) |
+| 候选路线 HID 出生 Unavailable | 2026-10-28 一次出生未记录 Start 即停止，PID 16 收集与原 Pool 两维退款完成；原现场缺少具体失败分支/阶段/期限。补诊断后同一路线完整通过，未改变 10s 出生期限，不能宣告原异常已定位或修复 | 准备阶段与 GrantOutcome、首个 Start/超时错误、now/end、process/PID、原 Pool 及同轮 Binding/供应状态；[候选出生观察](plans/todo-2026-09-device-system-design.md#候选出生异常仅观察) |
 
 ## 矫正区
 
@@ -27,6 +28,5 @@
 
 | 范围 | 问题 | 改用的依据 | 承接 |
 |---|---|---|---|
-| 设备资源与用户态接线：`user/libraries/libdevice`、`user/libraries/libdriver`、`user/services/srv_device`、`user/services/srv_driver`、`user/drivers/`、`srv_init`、`board/io`、`board/irq`、`shared/erhino_shared::platform`、`boot/bootstrap`、`boot/watch`、`resource_tree`、`resource/mmio`、`resource/irq`、`resource/dma`、线程请求与 VM/Backing 退休接点 | 第二轮设备控制链、持续监督、分步装载及生命周期收口已统一提交并完成所选组合验证，旧独立监督线程已删除。DMA＋IPI 组合证据缺口及全 hart idle／真实 IRQ 门均已关闭；复合 USB 接口未覆盖。本次单项调查未重新核定首批总体交付 | [第二轮设备目标](plans/todo-2026-09-device-system-design.md#第二轮收敛设计2026-10-27)、[持续监督目标](plans/todo-2026-10-07-service-assembly.md#第二轮持续监督设计2026-10-27)、[生命周期收口](plans/archived/review-2026-10-27-device-lifecycle.md) | 后续按[设备交付接力](plans/todo-2026-09-device-system-design.md#第二轮提交与调查接力)及唯一收口表推进；[固定交付独立 Review](plans/todo-2026-10-27-device-convergence-review.md)单独登记，不重复已完成的第二轮迁移与组合取证 |
 | 全项目代码与当前实现说明：`os/`、`shared/`、`user/`、`notes/impls/` | 已授权无兼容约束整体重审；现有组件、接口和消费者不能作为必须保留某项机制的理由 | [系统重构总纲](plans/todo-2026-09-29-system-redesign.md) 的已确认原则及独立分案；只读盘点保留为现状事实 | 各分案设计闭合后精确登记实施范围；未完成前不作为新结构范本 |
 | `notes/ideas/` 全体 | 施工和重构期间的未审定线稿；清理、精简或局部目标改写均不代表机制已重新设计 | [系统重构总纲的审定登记](plans/todo-2026-09-29-system-redesign.md#重构设计依据与-ideas-审定登记)及所属 todo 的详细设计；未登记的 ideas 范围不作目标依据 | 各分案在计划中完成详细设计后登记可参考范围；文档清理、设计审定与代码重构分别记录 |

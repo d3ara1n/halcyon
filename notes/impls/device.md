@@ -42,6 +42,8 @@ Claim 仍由 Seat 拥有唯一当前状态。Created 同步记录宿主已经准
 
 Shared Binding 活动期从 Registry/Seat 查询占用，释放后只保留原 Released 快照与旧角色尾部。Use 母本和唯一子 Registrar/Admin 母本由本 Binding 保存，重复发行复制原身份；Stopping 只能恢复已有出口，Released 关闭母本。只有 Use 可取得真实资源；Control 保留管理、查询与零能力发现。Get 在能力离开唯一出口前置位 resources_exposed，回复丢失不清除。供应 Closed 发布最后提示后 provider 放开其 Signaler；业务 Box 在供应 Closed、依赖释放及来源注销后释放，并归还 Work 的 Registry 身份引用；旧 Control/Use/Watch 持 Shared 回执，不再持供应 sender、Collecting 或供应 RPC。
 
+来源封口立即改变准入，Seat 的停止阶段可能等待维护扫描。Work 先完成 Frozen 候选，再在同一 actor 提交 ResourcesReady，成功后才发表资源表；该提交点的 Closed 进入原轮 Stop，候选别名释放而 provider 继续持实际效果。旧 Control/Use 读取保存的 Released 回执后仍可建立终态 Watch：宿主把该认证快照及原付款者交给 Registry，新 Watch 从出生即终态，不再依赖已退休的来源/设备记录。活动 Watch 仍按原来源和设备引用观察，终态出生的 Watch 仅保有自身费用及 Shared 回执。
+
 登记的不可变 StopRequirement 明确区分 ProviderOwned 与 ConsumerQuiescence。平台 PCI host 和 PCI xHCI 要求消费静止，USB 接口由 provider 独立结束会话。ConsumerQuiescence 的 Use 发行要求原来源 REPORT_STOPPED 权限，并冻结 REPORT_QUIESCENT；QueryUse 返回真实停止要求和操作权。ReportQuiescent 只作用于实际 Use 的原 Binding，Stopping 接纳，Released 返回 Closed，来源封口不撤掉清理权。中央在 Get 已封且 resources_exposed=false 时可自行证明未产生消费访问。
 
 ## srv_device 宿主
@@ -78,11 +80,15 @@ boot Ready精确交两sender槽及各自Mailbox KOID，init核实际kind/rights/
 
 驱动选择使用同一Catalog的严格降优先级游标，Run保存当前implementation及首个导致停止的失败原因，不保存候选集合。真正Released且已Detach的失败Run才可自动尝试下一唯一候选；同级歧义拒绝，Quota/Resource/Busy/NotReady或未提交Claim的终态等待显式政策，不因普通Watch变化重试。正常停止不产生自动fallback原因。Manager重新读取当前DeviceInfo并以最新epoch建立下一Managed，保留原Run直到原任务/调用/订阅/进程关联退场。
 
+Manager 先兑现停止意图，再消费发现 RPC。停止后取消原 txid 并等待真实运输退休，迟到结果只释放；尚未收到 Scope Watch 撤销时，形状合法的 Enumerate Closed 同样进入单调停止。通知来源注销后释放 Scope Watch，Managed 继续从原 Binding Watch 的完整快照确认 Released，不把运输错误当成硬件完成。
+
 init的显式并发Retry消费者仍复用同一编解码/发送/采用函数：主线原Control经root调用，一份WRITE|WAIT别名由独立Caller线程使用；新线程不持RootSupervisor或管理记录。主线通过原Assembly等待线程DONE，再try_join/reap，数量只作辅助检查。只读取证从同一ResultReceiver的Tid/control关联原registry唯一Live槽及stack owner，join/reap后核仍存活registry内同槽为Free；不再解引用已退的control/stack。每次RPC各发一次，Unknown不重发；是否实际命中迟到提交由只读原Request/Run取证决定，不以客户端一成一败代替。
 
 Control的Retry(DeviceId)是非幂等本地选择重置，仍由原Request/Outbox持一次Dispatcher只读Query及原Run/ref/implementation；提交前复核同一记录已Terminal/task=0且无关联、设备取样仍present/无活绑定、本World未Stopping。成功只清纯选择记录，不保证远端来源仍开放或新激活成功；原Claim提交点才是授权门。Outbox先终结时取消原Query，等其实际注销后才退休请求。最坏管理查询数纳入CALLS原配置及来源预付，不另建Retry队列/历史账本。
 
 [`ProcessTask`](../../user/services/srv_driver/src/server/worker.rs) 唯一持进程出生、Pool、ProcessControl、私有 boot/DONE 来源与原 SuperviseTask。关联使用出生前建立的 InstanceId；同 actor 根据原 runs 推导已关联容量，覆盖等 boot 和 Activate Unknown，不保存成员表或成员计数。显式 reusable 政策与每进程 capacity 独立；PCI/xHCI 隔离，HID 容量为二。无成员后先封关联，再 Kill/收集；观察回调在旧来源完全注销后移交 collector。进程 DONE 封复用并经原 runs 游标唤醒其全部成员，普通 HID 由存活 USB owner 收硬件，物理 worker 无安全证据时失败保留。
+
+ProcessTask 的 ProcessOwner 以 Preparing、Prepared、Supervised、Empty 区分唯一进程责任；Preparing 持拥有型公共 Preparation，每次推进一步，Prepared 持未启动进程及待关闭的输入映像。输入关闭成功、DONE 来源实际附着后才 Start；成功即将原 Control 移交 SuperviseTask。失败/停止取消原 Builder，取消 Collector 的 PID/Control 先登记到原 Record，再等来源注销和全部 Run 脱离后收集。Grant 的拥有权由 Preparation 在实际提交点移交；出生绝对期限不随阶段刷新。bootstrap 认证提交入口的同一步唤醒关联 Run，来源注销独立进行，不能等注销回执来补发就绪。
 
 ## 驱动激活与硬件供应
 
@@ -102,7 +108,9 @@ PCI/xHCI 的 Get、子登记以及 xHCI Master 若收到形状合法的 Closed�
 
 [`drv_usb_xhci`](../../user/drivers/drv_usb_xhci/src/server.rs) 和 PCI 共用 [`libdriver::worker`](../../user/libraries/libdriver/src/worker.rs) 的激活/观察认证，实际 Runtime 仍由程序组合。Controller 的硬件知识在 [`libusb::xhci`](../../user/libraries/libusb/src/xhci.rs)：等 CNR、halt/reset、逐页 pin/取得地址并初始化环，原 pci-function 确认 BME 后才发布 DCBAAP/CRCR/ERSTBA 并 Run，Ready/运行同时检查 HCE/HSE。共享页只作固定宽度 volatile 访问并 fence，不构造与设备并发的普通 Rust 引用。Controller 按硬件能力、页几何与两份已付连接存储共同限制 MaxSlotsEn；根端口/slot/context/TD 由各自原 Device 记录持有，全局 command ring 仍串行，独立命令准入游标避免快速完成饿死另一连接。事件按实际 pointer/slot 分派；按有限步骤执行 EnableSlot、AddressDevice、描述符、配置和 endpoint 设置。实际 worker 持续消费有界事件与 IRQ 提示；停止先收 endpoint/SetDequeue/DisableSlot 并清 DCBAA/退休其页，再 halt/收残事件/退休控制器页，最后解除 IRQ 观察及寄存器映射、报告消费者停止。接口供应使用原 Provision/Collecting/Frozen 和每轮独立 session context，HID 只取得 `usb-interface`。USB seq 保留具体输入及结果，Unknown 不换序号；取消复用原 StopEndpoint/SetDequeue，接口终结再 DisableSlot/逐页 DONE。
 
-物理连接的存在直接从Controller原Device的disconnected与真实PORTSC CCS判定；重新Prepare期间keyboard描述符尚未生成不触发登记撤出。interface的ready/描述符仍用于实际供应准备。停止只消费同connection原记录的Stage::Closed，该阶段保留原端点/slot及实际页退休保证；缺记录返回错误，不能以描述符缺失或观察失败当Closed。
+物理连接的存在直接从Controller原Device的disconnected与真实PORTSC CCS判定；重新Prepare期间keyboard描述符尚未生成不触发登记撤出。interface的ready/描述符仍用于实际供应准备。停止只消费同connection原记录的Stage::Closed，该阶段保留原端点/slot及 DMA mapping 退休保证；缺记录返回错误，不能以描述符缺失或观察失败当Closed。
+
+Device 停止先等待原定向命令完成；有 TD 时只从该 TD 选择真实 dci 执行 Stop/SetDequeue，没有 TD 的空闲端点集合直接 Disable Slot，不从描述符推断配置完成。Disable 后把待交付的结果消费为独立字节回执；逐页退休等待 DMA DONE，再显式 Unmap CPU 映射，失败保留 Page 并交原 Engine 的故障政策。所有页收尾完成后才 Closed，迟到 USB 结果从回执读取，不回读已解除的页。Page Drop 仅作构造失败兜底，Unmap 失败会终止进程交 VM 回收，不静默丢 owner。
 
 Engine原pending的Call::Master携带一次绝对期限。Sent且cause为ServiceClosed/Timeout时，先退原RPC/Delivery，再以同Controller.function/ref/context与同deadline重发；不重建Controller、环或DMA域。已观察Stopping时不新发Master，下一步进入原halt/Retire；Frame、取消、shutdown和其他错误不自动重发。期限耗尽或清理失败按原故障保留，成功回复仍严格核opcode/error/空正文/零cap；硬件halt/reset的规范限值独立。
 
@@ -120,7 +128,7 @@ Preparing 核验、订阅建立失败或 Stop 先到时，原 BindingTask 把实
 
 Registry 从申请来源祖先及设备祖先登记来源的 Source.binding 推导真实依赖，释放提交点拒绝仍有活依赖的父轮；独立来源登记的静态拓扑后代不自动成为依赖。Work 保存供应明确 Closed，等待原依赖 Released 后提交中央释放，不重复供应 RPC。停止期限继续有效，后代变化经原维护扫描唤醒父任务；该门不替 provider 证明硬件安全。
 
-Observed 直接消费 SourceRegistration 的 Installing/Removing 状态；观察来源尚在安装或注销时任务保持 Runnable，收到真实回执稳定后才 Parked。Runtime 的登记回执本身不承担自动唤醒业务任务。
+Observed 直接消费 SourceRegistration 的 Installing/Removing 状态；当前宿主在观察来源安装或注销期间保持 Runnable，收到真实回执稳定后才 Parked。Runtime 的成功 Register 回调本身不重新排队，因此等待安装完成的任务须保有推进机会；实际 Remove 成功则在 unregistered 回调后重新调度原任务。两类回执的调度行为不能混为一谈，具体接点见 [`runtime`](../../user/libraries/libexecution/src/runtime.rs)。
 
 ## 设备发现、Watch 与父绑定来源
 

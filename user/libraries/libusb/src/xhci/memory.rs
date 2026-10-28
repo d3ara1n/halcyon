@@ -116,15 +116,20 @@ impl Page {
     }
     /// # Safety
     /// 该页全部硬件访问已结束且其缓存地址不会再次提交；关CPU/清BME不能提供该证明。
-    pub unsafe fn retire(&self, usage: &DmaUse) -> Result<bool, SystemCallError> {
-        let Some(mapping) = &self.mapping else {
-            return Ok(true);
-        };
-        // SAFETY: 调用者提供 Controller halt 或 Disable Slot 完成并收清事件的真实证明。
-        unsafe {
-            usage.retire(mapping)?;
+    pub unsafe fn retire(&mut self, usage: &DmaUse) -> Result<bool, SystemCallError> {
+        if let Some(mapping) = &self.mapping {
+            // SAFETY: 调用者提供 Controller halt 或 Disable Slot 完成并收清事件的真实证明。
+            unsafe {
+                usage.retire(mapping)?;
+            }
+            if !wait::probe(mapping.handle(), ObjectSignals::DONE)?.contains(ObjectSignals::DONE) {
+                return Ok(false);
+            }
         }
-        Ok(wait::probe(mapping.handle(), ObjectSignals::DONE)?.contains(ObjectSignals::DONE))
+        self.close_cpu()?;
+        self.mapping = None;
+        self.address = None;
+        Ok(true)
     }
     pub fn close_cpu(&mut self) -> Result<(), SystemCallError> {
         if let Some(cpu) = self.cpu.take()
@@ -138,7 +143,10 @@ impl Page {
 }
 impl Drop for Page {
     fn drop(&mut self) {
-        let _ = self.close_cpu();
+        if let Err(error) = self.close_cpu() {
+            // 构造失败的兜底也不能静默丢失映射：进程失败后由 VM 退休接管。
+            panic!("xHCI page CPU mapping cleanup failed: {:?}", error);
+        }
     }
 }
 pub(super) fn fence() {

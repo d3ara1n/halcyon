@@ -26,7 +26,7 @@ mod preparation;
 pub mod supervise;
 use crate::context::CurrentProcessInfo;
 use observation::{Observation, ObservationResult, ObservationState};
-pub use preparation::Preparation;
+pub use preparation::{OwnedGrant, OwnedSpawnRequest, Preparation};
 use supervise::{ProcessOperations, RealProcessOperations};
 
 pub use supervise::{
@@ -55,7 +55,7 @@ impl From<SystemCallError> for SpawnError {
 /// 输入 grants 在调用者表中的消费事实，跨装配完成、失败和取消保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantOutcome {
-    /// ProcessGrant 未提交，输入 handles 仍由调用者持有。
+    /// ProcessGrant 未提交；输入关闭责任仍在借用调用者或拥有型请求中，可由取消释放。
     Retained,
     /// ProcessGrant 已提交，输入 handles 已被消费；不表示目标已启动或收束。
     Consumed,

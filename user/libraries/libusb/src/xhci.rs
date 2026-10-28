@@ -482,10 +482,10 @@ impl Controller {
             Phase::Retire(index) => {
                 self.dma.seal()?;
                 let page = match index {
-                    0 => self.dcbaa.as_ref(),
-                    1 => self.command.as_ref().map(|ring| &ring.page),
-                    2 => self.events.as_ref(),
-                    3 => self.erst.as_ref(),
+                    0 => self.dcbaa.as_mut(),
+                    1 => self.command.as_mut().map(|ring| &mut ring.page),
+                    2 => self.events.as_mut(),
+                    3 => self.erst.as_mut(),
                     _ => {
                         self.phase = Phase::Closed;
                         return Ok(Progress::Closed);

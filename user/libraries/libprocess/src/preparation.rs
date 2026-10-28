@@ -1,9 +1,93 @@
 //! 同一ELF装配的可让出owner；每步一页复制或一个ABI有界出生操作，失败仍持Building进程。
 
 use super::*;
+use alloc::borrow::Cow;
 use libkernel::ipc::capability::Capability;
 
-#[derive(Clone, Copy)]
+/// 输入在 ProcessGrant 成功的同一步消费；此前唯一 owner 留在准备对象。
+pub struct OwnedGrant {
+    capability: Option<Capability>,
+    rights: Rights,
+}
+impl OwnedGrant {
+    pub fn new(capability: Capability, rights: Rights) -> Self {
+        Self {
+            capability: Some(capability),
+            rights,
+        }
+    }
+}
+pub struct OwnedSpawnRequest {
+    pub job: Handle,
+    pub parent: CurrentProcessInfo,
+    pub memory_pool: Handle,
+    pub image: crate::image::ImageView,
+    pub payload: Vec<u8>,
+    pub grants: Vec<OwnedGrant>,
+    pub control_rights: Rights,
+}
+enum ImageInput<'a> {
+    Borrowed(&'a [u8]),
+    Mapped(crate::image::ImageView),
+}
+impl AsRef<[u8]> for ImageInput<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Mapped(view) => view.bytes(),
+        }
+    }
+}
+enum Grants<'a> {
+    Borrowed(&'a [HandleGrant]),
+    Owned(Vec<OwnedGrant>),
+}
+impl Grants<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(v) => v.len(),
+            Self::Owned(v) => v.len(),
+        }
+    }
+    fn encode(&self, out: &mut [HandleGrant]) {
+        match self {
+            Self::Borrowed(values) => out.copy_from_slice(values),
+            Self::Owned(values) => {
+                for (slot, value) in out.iter_mut().zip(values) {
+                    *slot = HandleGrant {
+                        handle: value
+                            .capability
+                            .as_ref()
+                            .expect("uncommitted grant remains owned")
+                            .as_handle(),
+                        rights: value.rights,
+                    };
+                }
+            }
+        }
+    }
+    fn consumed(&mut self) {
+        if let Self::Owned(values) = self {
+            for value in values {
+                value
+                    .capability
+                    .take()
+                    .expect("committed grant remains owned")
+                    .into_raw();
+            }
+        }
+    }
+}
+struct Inputs<'a> {
+    job: Handle,
+    parent: CurrentProcessInfo,
+    memory_pool: Handle,
+    payload: Cow<'a, [u8]>,
+    grants: Grants<'a>,
+    control_rights: Rights,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum Phase {
     Validate,
     Create,
@@ -21,15 +105,16 @@ enum Phase {
     Done,
 }
 
-/// 借用固定装配输入，独占验证游标及创建后的 Building 进程。
+/// 借用或拥有固定装配输入，独占验证游标及创建后的 Building 进程。
 ///
 /// `advance` 成功后交出唯一 PreparedProcess；失败保留首错和未完成 owner。
 /// 需要持续推进其他职责的宿主须显式 `cancel` 并接管返回的 Collector；
 /// 直接丢弃会由内部 PreparedProcess 的 Drop 同步完成取消。
 #[must_use = "process preparation must finish or hand off its cancellation"]
 pub struct Preparation<'a> {
-    request: SpawnRequest<'a>,
-    validation: Option<elf::Validation<'a>>,
+    request: Inputs<'a>,
+    validation: Option<elf::Validation<ImageInput<'a>>>,
+    input: Option<ImageInput<'a>>,
     image: Option<elf::Elf>,
     prepared: Option<PreparedProcess>,
     retired_grants: GrantOutcome,
@@ -41,46 +126,90 @@ pub struct Preparation<'a> {
     block_len: usize,
     block_va: usize,
 }
+impl core::fmt::Debug for Preparation<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Preparation")
+            .field("phase", &self.phase)
+            .field("grants", &self.grants())
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
 impl<'a> Preparation<'a> {
     /// 校验输入几何及收束权限；此时尚未创建进程或消费 grants。
     pub fn new(request: SpawnRequest<'a>) -> Result<Self, SpawnError> {
-        if !request
-            .control_rights
-            .contains(Rights::MANAGE | Rights::WAIT | Rights::READ)
-        {
-            return Err(SystemCallError::RightsDenied.into());
-        }
-        if request.grants.len() > PROCESS_MAX_GRANTS {
-            return Err(SpawnError::TooManyGrants);
-        }
-        let block_len = core::mem::size_of::<StartupBlockHeader>()
-            .checked_add((request.grants.len() + 1) * core::mem::size_of::<Handle>())
-            .and_then(|len| len.checked_add(core::mem::size_of::<EntryThreadDescriptor>()))
-            .and_then(|len| len.checked_add(request.payload.len()))
-            .filter(|len| u32::try_from(*len).is_ok())
-            .ok_or(SpawnError::InvalidImage)?;
-        let validation = elf::Validation::new(
-            request.image,
-            elf::LoadLimits {
-                page_size: PROCESS_PAGE_SIZE as u64,
-                image_limit: (PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE) as u64,
+        let value = Self::from_inputs(
+            Inputs {
+                job: request.job,
+                parent: request.parent,
+                memory_pool: request.memory_pool,
+                payload: Cow::Borrowed(request.payload),
+                grants: Grants::Borrowed(request.grants),
+                control_rights: request.control_rights,
             },
-        )
-        .map_err(SpawnError::Elf)?;
-        Ok(Self {
+            ImageInput::Borrowed(request.image),
+        );
+        if let Some(error) = value.failure {
+            Err(error)
+        } else {
+            Ok(value)
+        }
+    }
+    fn from_inputs(request: Inputs<'a>, input: ImageInput<'a>) -> Self {
+        let geometry = (|| {
+            if !request
+                .control_rights
+                .contains(Rights::MANAGE | Rights::WAIT | Rights::READ)
+            {
+                return Err(SystemCallError::RightsDenied.into());
+            }
+            if request.grants.len() > PROCESS_MAX_GRANTS {
+                return Err(SpawnError::TooManyGrants);
+            }
+            let block_len = core::mem::size_of::<StartupBlockHeader>()
+                .checked_add((request.grants.len() + 1) * core::mem::size_of::<Handle>())
+                .and_then(|len| len.checked_add(core::mem::size_of::<EntryThreadDescriptor>()))
+                .and_then(|len| len.checked_add(request.payload.len()))
+                .filter(|len| u32::try_from(*len).is_ok())
+                .ok_or(SpawnError::InvalidImage)?;
+            Ok(block_len)
+        })();
+        let (block_len, mut failure) = match geometry {
+            Ok(length) => (length, None),
+            Err(error) => (0, Some(error)),
+        };
+        let (validation, input) = if failure.is_some() {
+            (None, Some(input))
+        } else {
+            match elf::Validation::new(
+                input,
+                elf::LoadLimits {
+                    page_size: PROCESS_PAGE_SIZE as u64,
+                    image_limit: (PROCESS_USER_TOP - PROCESS_MAIN_STACK_SIZE) as u64,
+                },
+            ) {
+                Ok(validation) => (Some(validation), None),
+                Err((input, error)) => {
+                    failure = Some(SpawnError::Elf(error));
+                    (None, Some(input))
+                }
+            }
+        };
+        Self {
             request,
-            validation: Some(validation),
+            validation,
+            input,
             image: None,
             prepared: None,
             retired_grants: GrantOutcome::Retained,
             phase: Phase::Validate,
-            failure: None,
+            failure,
             granted: [Handle::INVALID; PROCESS_MAX_GRANTS + 1],
             thread: None,
             prefix: Vec::new(),
             block_len,
             block_va: 0,
-        })
+        }
     }
     /// 原输入 grants 的消费事实；完成或取消后仍保留。
     pub fn grants(&self) -> GrantOutcome {
@@ -116,6 +245,22 @@ impl<'a> Preparation<'a> {
         self.prepared.take();
         self.phase = Phase::Done;
         Ok(collector)
+    }
+    /// 进程已移交或成功取消后显式释放装配输入；Unmap 失败保留原映像 owner。
+    pub fn close_inputs(&mut self) -> Result<(), SystemCallError> {
+        if !matches!(self.phase, Phase::Done) {
+            return Err(SystemCallError::ObjectBusy);
+        }
+        if let Some(validation) = self.validation.take() {
+            self.input = Some(validation.into_input());
+        }
+        if let Some(ImageInput::Mapped(view)) = self.input.as_mut() {
+            view.close()?;
+        }
+        self.input = None;
+        self.request.payload = Cow::Borrowed(&[]);
+        self.request.grants = Grants::Borrowed(&[]);
+        Ok(())
     }
     pub(super) fn cancel_blocking(&mut self) -> Option<SystemCallError> {
         self.retired_grants = self.grants();
@@ -156,7 +301,12 @@ impl<'a> Preparation<'a> {
                         return Err(SpawnError::InvalidImage);
                     }
                     self.image = Some(image);
-                    self.validation = None;
+                    self.input = Some(
+                        self.validation
+                            .take()
+                            .expect("validated image remains owned")
+                            .into_input(),
+                    );
                     Phase::Create
                 } else {
                     Phase::Validate
@@ -221,7 +371,11 @@ impl<'a> Preparation<'a> {
                         process::write(
                             self.builder(),
                             target,
-                            &self.request.image[source..source + length],
+                            &self
+                                .input
+                                .as_ref()
+                                .expect("loader image remains owned")
+                                .as_ref()[source..source + length],
                         )?;
                         Phase::WriteImage {
                             segment,
@@ -250,11 +404,13 @@ impl<'a> Preparation<'a> {
             Phase::Grant => {
                 let len = self.request.grants.len();
                 if len > 0 {
-                    process::grant(
-                        self.builder(),
-                        self.request.grants,
-                        &mut self.granted[..len],
-                    )?;
+                    let mut grants = [HandleGrant {
+                        handle: Handle::INVALID,
+                        rights: Rights::from_raw(0),
+                    }; PROCESS_MAX_GRANTS];
+                    self.request.grants.encode(&mut grants[..len]);
+                    process::grant(self.builder(), &grants[..len], &mut self.granted[..len])?;
+                    self.request.grants.consumed();
                     self.prepared
                         .as_mut()
                         .expect("Building owner present")
@@ -388,5 +544,21 @@ impl<'a> Preparation<'a> {
             Phase::Done => return Err(SystemCallError::ObjectClosed.into()),
         };
         Ok(None)
+    }
+}
+impl Preparation<'static> {
+    /// 立即接管所有输入；初始校验失败由 advance 返回，仍须 cancel/close_inputs。
+    pub fn new_owned(request: OwnedSpawnRequest) -> Self {
+        Self::from_inputs(
+            Inputs {
+                job: request.job,
+                parent: request.parent,
+                memory_pool: request.memory_pool,
+                payload: Cow::Owned(request.payload),
+                grants: Grants::Owned(request.grants),
+                control_rights: request.control_rights,
+            },
+            ImageInput::Mapped(request.image),
+        )
     }
 }

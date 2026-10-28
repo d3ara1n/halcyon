@@ -1,13 +1,13 @@
 //! 唯一进程/Pool/出生与原libprocess收集owner；成员关系只从原Run推导。
 use super::*;
-use erhino_shared::proc::{HandleGrant, ProcessState};
+use erhino_shared::proc::ProcessState;
 use libexecution::runtime::{SourceEvent, SourcePlan};
 use libkernel::{
     ipc::message::{MessageStorage, ReceiveBuffer},
     memory_pool::{self, MemoryPool},
     process,
 };
-use libprocess::{GrantOutcome, SpawnRequest};
+use libprocess::{OwnedGrant, OwnedSpawnRequest, Preparation, PreparedProcess};
 fn log_birth_pool(role: &str, handle: erhino_shared::object::Handle) {
     match memory_pool::query(handle) {
         Ok(s) => libkernel::debug!(
@@ -61,10 +61,22 @@ impl Record {
         self.entry.is_some() && !self.dead && self.error.is_none() && self.accepting
     }
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "已准入的 ProcessTask 预留最大 owner，Start/取消提交后移交 Collector 不再分配"
+)]
+enum ProcessOwner {
+    Preparing(Box<Preparation<'static>>),
+    Prepared {
+        process: PreparedProcess,
+        inputs: Option<Box<Preparation<'static>>>,
+    },
+    Supervised(libprocess::SuperviseTask),
+    Empty,
+}
 struct Worker {
     pool: MemoryPool,
-    control: erhino_shared::object::Handle,
-    collector: libprocess::SuperviseTask,
+    process: ProcessOwner,
     boot: Option<Mailbox>,
     expected: u64,
     receiver: ReceiveBuffer,
@@ -76,7 +88,11 @@ struct Worker {
     kill_requested: bool,
 }
 impl Worker {
-    fn spawn(world: &World<'_>, implementation: usize, record: &mut Record) -> Result<Self, Error> {
+    fn prepare(
+        world: &World<'_>,
+        implementation: usize,
+        record: &mut Record,
+    ) -> Result<Self, Error> {
         let pool = memory_pool::derive(
             world.pool.as_handle(),
             libdriver::boot::WORKER_POOL,
@@ -90,16 +106,6 @@ impl Worker {
         let pool_grant = unsafe { Capability::from_raw(pool_grant) };
         let receiver = ReceiveBuffer::new()?;
         let storage = MessageStorage::new()?;
-        let grants = [
-            HandleGrant {
-                handle: sender.as_handle(),
-                rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-            },
-            HandleGrant {
-                handle: pool_grant.as_handle(),
-                rights: Rights::CREATE,
-            },
-        ];
         let declaration = world
             .catalog
             .records()
@@ -115,48 +121,36 @@ impl Worker {
         );
         log_birth_pool("parent", world.pool.as_handle());
         log_birth_pool("child", pool.as_handle());
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(configuration.len())
+            .map_err(|_| Error::Resource)?;
+        payload.extend_from_slice(&configuration);
+        let mut grants = Vec::new();
+        grants.try_reserve_exact(2).map_err(|_| Error::Resource)?;
+        grants.push(OwnedGrant::new(
+            sender.into_capability(),
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        ));
+        grants.push(OwnedGrant::new(pool_grant, Rights::CREATE));
         let image = world
             .images
             .get(implementation)
             .ok_or(Error::Invalid)?
             .map()?;
-        let result = libprocess::spawn(SpawnRequest {
+        let preparing = Preparation::new_owned(OwnedSpawnRequest {
             job: world.job.as_handle(),
             parent: world.process,
             memory_pool: pool.as_handle(),
-            image: image.bytes(),
-            payload: &configuration,
-            grants: &grants,
+            image,
+            payload,
+            grants,
             control_rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
         });
-        if result.is_ok()
-            || matches!(&result, Err(failure) if failure.grants == GrantOutcome::Consumed)
-        {
-            sender.into_capability().into_raw();
-            pool_grant.into_raw();
-        }
-        let spawned = result.map_err(|failure| {
-            libkernel::debug!(
-                "driver worker spawn failed: error={:?}, grants={:?}, cleanup={:?}",
-                failure.error,
-                failure.grants,
-                failure.cleanup_error
-            );
-            log_birth_pool("failed-parent", world.pool.as_handle());
-            log_birth_pool("failed-child", pool.as_handle());
-            Error::Resource
-        })?;
-        // 原监督机器在任何 Activate 前接管唯一 Control；标量 handle 仅供存活期借用。
-        let collector = libprocess::SuperviseTask::new(
-            libprocess::SupervisionTarget::new(spawned.pid, spawned.control),
-            libprocess::DEFAULT_SUPERVISION_POLICY,
-        );
-        record.pid = Some(spawned.pid);
-        record.control = Some(spawned.control);
+        let preparing = Box::try_new(preparing).map_err(|_| Error::Resource)?;
         Ok(Self {
             pool,
-            control: spawned.control,
-            collector,
+            process: ProcessOwner::Preparing(preparing),
             boot: Some(boot),
             expected,
             receiver,
@@ -167,6 +161,143 @@ impl Worker {
             retiring: false,
             kill_requested: false,
         })
+    }
+    fn collector(&mut self) -> Option<&mut libprocess::SuperviseTask> {
+        match &mut self.process {
+            ProcessOwner::Supervised(task) => Some(task),
+            _ => None,
+        }
+    }
+    fn collecting_deadline(&self) -> Deadline {
+        match &self.process {
+            ProcessOwner::Supervised(task) => {
+                <libprocess::SuperviseTask as Task<World<'_>>>::deadline(task)
+            }
+            _ => Deadline::INFINITE,
+        }
+    }
+    fn adopt_cancelled(
+        record: &mut Record,
+        collector: Option<libprocess::Collector>,
+    ) -> ProcessOwner {
+        match collector {
+            Some(collector) => {
+                record.pid = Some(collector.pid());
+                record.control = Some(collector.control());
+                ProcessOwner::Supervised(libprocess::SuperviseTask::from_collector(collector))
+            }
+            None => ProcessOwner::Empty,
+        }
+    }
+    /// 每步推进同一 loader 或一个出生接点；失败/停止仍由原 owner 显式取消。
+    fn birth(
+        &mut self,
+        record: &mut Record,
+        world: &World<'_>,
+        requests: &mut Requests<'_, Family>,
+    ) -> Result<bool, SystemCallError> {
+        match &mut self.process {
+            ProcessOwner::Preparing(preparing) => {
+                if !record.accepting {
+                    let collector = preparing.cancel()?;
+                    // 取消先保留 Collector；局部映射关闭失败将由服务故障终局接管。
+                    let owner = Self::adopt_cancelled(record, collector);
+                    preparing
+                        .close_inputs()
+                        .unwrap_or_else(|error| fatal(error.into()));
+                    self.process = owner;
+                    self.kill_requested = true;
+                } else {
+                    match preparing.advance() {
+                        Ok(Some(process)) => {
+                            record.pid = Some(process.pid());
+                            record.control = Some(process.control());
+                            let ProcessOwner::Preparing(inputs) =
+                                core::mem::replace(&mut self.process, ProcessOwner::Empty)
+                            else {
+                                unreachable!("preparation owner changed within actor")
+                            };
+                            self.process = ProcessOwner::Prepared {
+                                process,
+                                inputs: Some(inputs),
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            libkernel::debug!("driver worker preparation failed: {:?}", error);
+                            record.error.get_or_insert(Error::Resource);
+                            record.accepting = false;
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            ProcessOwner::Prepared { process, inputs } => {
+                if !record.accepting || record.dead {
+                    let collector = process.cancel_to_collector()?;
+                    let owner = Self::adopt_cancelled(record, collector);
+                    if let Some(inputs) = inputs {
+                        inputs
+                            .close_inputs()
+                            .unwrap_or_else(|error| fatal(error.into()));
+                    }
+                    self.process = owner;
+                    self.kill_requested = true;
+                } else if let Some(preparing) = inputs {
+                    preparing.close_inputs()?;
+                    *inputs = None;
+                } else if self.process_source.is_empty() {
+                    self.process_source.install(
+                        requests,
+                        SourcePlan::new(process.control(), ObjectSignals::DONE),
+                        3,
+                    )?;
+                } else if !self.process_source.is_installing() {
+                    match process.try_start() {
+                        Ok(spawned) => {
+                            // 成功后只有不分配的 owner 移交，DONE 已实际附着。
+                            self.process =
+                                ProcessOwner::Supervised(libprocess::SuperviseTask::new(
+                                    libprocess::SupervisionTarget::new(
+                                        spawned.pid,
+                                        spawned.control,
+                                    ),
+                                    libprocess::DEFAULT_SUPERVISION_POLICY,
+                                ));
+                            libkernel::debug!(
+                                "driver process started after DONE attachment: process={}, pid={}",
+                                record.id.serial(),
+                                spawned.pid
+                            );
+                            let declaration = world
+                                .catalog
+                                .records()
+                                .nth(record.implementation)
+                                .expect("driver implementation remains owned")
+                                .unwrap_or_else(|error| fatal(error));
+                            libkernel::debug!(
+                                "driver process spawned: key={}, process={}, pid={}, now_ns={}",
+                                declaration.key,
+                                record.id.serial(),
+                                spawned.pid,
+                                libkernel::time::snapshot()?.now_ns
+                            );
+                        }
+                        Err(error) => {
+                            libkernel::debug!(
+                                "driver worker Start failed: pid={}, error={:?}",
+                                process.pid(),
+                                error
+                            );
+                            record.error.get_or_insert(Error::from(error));
+                            record.accepting = false;
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            ProcessOwner::Supervised(_) | ProcessOwner::Empty => Ok(false),
+        }
     }
     fn observe(&mut self, record: &mut Record, event: SourceEvent) {
         if event.kind == 2 {
@@ -198,7 +329,10 @@ impl Worker {
         if self.process_source.is_empty() {
             self.process_source.install(
                 requests,
-                SourcePlan::new(self.control, ObjectSignals::DONE),
+                SourcePlan::new(
+                    record.control.ok_or(SystemCallError::InternalError)?,
+                    ObjectSignals::DONE,
+                ),
                 3,
             )?;
         }
@@ -223,7 +357,8 @@ impl Worker {
         record: &mut Record,
         requests: &mut Requests<'_, Family>,
     ) -> Result<bool, Error> {
-        if record.entry.is_none() && self.ready {
+        let published = record.entry.is_none() && self.ready;
+        if published {
             let boot = self.boot.as_ref().ok_or(Error::Closed)?;
             self.receiver.receive(boot.as_handle())?;
             let mut message = self
@@ -249,7 +384,7 @@ impl Worker {
             if mailbox == 0 || description.related_object_id != mailbox {
                 return Err(Error::Permission);
             }
-            let snapshot = process::query(self.control)?;
+            let snapshot = process::query(record.control.ok_or(Error::NotReady)?)?;
             if snapshot.state != ProcessState::Running as u32 {
                 return Err(Error::Unavailable);
             }
@@ -266,10 +401,10 @@ impl Worker {
             self.boot_source.remove(requests)?;
             if self.boot_source.is_empty() {
                 self.boot = None;
-                return Ok(true);
             }
         }
-        Ok(false)
+        // 就绪发布与 bootstrap 来源退休是不同事实；最后注销回执不能承担首次唤醒。
+        Ok(published)
     }
 }
 
@@ -294,7 +429,7 @@ impl ProcessTask {
             && worker.boot_source.is_empty()
             && worker.process_source.is_empty()
         {
-            return <libprocess::SuperviseTask as Task<World<'_>>>::deadline(&worker.collector);
+            return worker.collecting_deadline();
         }
         if self.record.borrow().accepting && self.record.borrow().entry.is_none() {
             self.end
@@ -306,12 +441,11 @@ impl ProcessTask {
         if let Some(worker) = self.worker.as_mut() {
             if worker.retiring && worker.boot_source.is_empty() && worker.process_source.is_empty()
             {
-                <libprocess::SuperviseTask as Task<World<'_>>>::registered(
-                    &mut worker.collector,
-                    world,
-                    kind,
-                    id,
-                );
+                if let Some(collector) = worker.collector() {
+                    <libprocess::SuperviseTask as Task<World<'_>>>::registered(
+                        collector, world, kind, id,
+                    );
+                }
             } else {
                 worker.registered(kind, id);
             }
@@ -321,12 +455,11 @@ impl ProcessTask {
         if let Some(worker) = self.worker.as_mut() {
             if worker.retiring && worker.boot_source.is_empty() && worker.process_source.is_empty()
             {
-                <libprocess::SuperviseTask as Task<World<'_>>>::unregistered(
-                    &mut worker.collector,
-                    world,
-                    kind,
-                    id,
-                );
+                if let Some(collector) = worker.collector() {
+                    <libprocess::SuperviseTask as Task<World<'_>>>::unregistered(
+                        collector, world, kind, id,
+                    );
+                }
             } else {
                 worker.unregistered(id);
             }
@@ -351,6 +484,26 @@ impl ProcessTask {
                 }
             }
             if input.take_timeout() && self.record.borrow().entry.is_none() {
+                if let Some(Worker {
+                    process: ProcessOwner::Preparing(preparing),
+                    ..
+                }) = &self.worker
+                {
+                    libkernel::debug!(
+                        "driver preparation deadline expired: process={}, now_ns={}, end_ns={}, state={:?}",
+                        self.record.borrow().id.serial(),
+                        input.now_ns(),
+                        self.end.at_ns,
+                        preparing
+                    );
+                } else {
+                    libkernel::debug!(
+                        "driver bootstrap deadline expired: process={}, now_ns={}, end_ns={}",
+                        self.record.borrow().id.serial(),
+                        input.now_ns(),
+                        self.end.at_ns
+                    );
+                }
                 self.fail(Error::Unavailable);
             }
             if self.record.borrow().dead && !was_dead {
@@ -378,25 +531,32 @@ impl ProcessTask {
                 .unwrap_or_else(|e| fatal(e));
             let spawned = {
                 let mut record = self.record.borrow_mut();
-                Worker::spawn(world, implementation, &mut record)
+                Worker::prepare(world, implementation, &mut record)
             };
             match spawned {
                 Ok(worker) => {
                     libkernel::debug!(
-                        "driver process spawned: key={}, process={}, pid={}, now_ns={}",
+                        "driver process preparation admitted: key={}, process={}, now_ns={}, end_ns={}",
                         declaration.key,
                         process.serial(),
-                        self.record
-                            .borrow()
-                            .pid
-                            .expect("spawned process PID missing"),
-                        libkernel::time::snapshot()?.now_ns
+                        input.now_ns(),
+                        self.end.at_ns
                     );
                     self.worker = Some(worker);
                 }
                 Err(error) => self.fail(error),
             }
             return Ok(advance(Step::Runnable));
+        }
+        if let Some(worker) = self.worker.as_mut() {
+            let was_accepting = self.record.borrow().accepting;
+            let progressed = worker.birth(&mut self.record.borrow_mut(), world, requests)?;
+            if was_accepting && !self.record.borrow().accepting {
+                self.wake_cursor = Some(0);
+            }
+            if progressed {
+                return Ok(advance(Step::Runnable));
+            }
         }
         if let Some(cursor) = self.wake_cursor {
             if let Some((serial, run)) = world.runs.next_after(Some(&cursor)) {
@@ -420,7 +580,7 @@ impl ProcessTask {
                     libkernel::debug!(
                         "driver process collection admitted after all binding detach: process={}, pid={}",
                         process.serial(),
-                        self.record.borrow().pid.expect("worker PID missing")
+                        self.record.borrow().pid.unwrap_or(0)
                     );
                 }
                 worker.retiring = true;
@@ -432,13 +592,17 @@ impl ProcessTask {
                 }
                 worker.boot = None;
                 if !worker.kill_requested {
-                    if process::query(worker.control)?.state != ProcessState::Dead as u32 {
-                        process::kill(worker.control)?;
+                    if let Some(control) = self.record.borrow().control
+                        && process::query(control)?.state != ProcessState::Dead as u32
+                    {
+                        process::kill(control)?;
                     }
                     worker.kill_requested = true;
                 }
-                if !self.record.borrow().collected {
-                    let result = worker.collector.advance_in(world, requests, input)?;
+                if !self.record.borrow().collected
+                    && let Some(collector) = worker.collector()
+                {
+                    let result = collector.advance_in(world, requests, input)?;
                     if result.step != Step::Complete {
                         return Ok(result);
                     }
@@ -449,10 +613,7 @@ impl ProcessTask {
                 let credit = worker.pool.query()?;
                 libkernel::debug!(
                     "driver collected worker Pool retained: pid={}, allocated_pages={}, allocated_metadata={}",
-                    self.record
-                        .borrow()
-                        .pid
-                        .expect("collected worker PID missing"),
+                    self.record.borrow().pid.unwrap_or(0),
                     credit.allocated,
                     credit.metadata.allocated
                 );
@@ -466,7 +627,9 @@ impl ProcessTask {
         let mut failure = None;
         let mut changing = false;
         if let Some(worker) = self.worker.as_mut() {
-            worker.sources(&self.record.borrow(), requests)?;
+            if !matches!(worker.process, ProcessOwner::Empty) {
+                worker.sources(&self.record.borrow(), requests)?;
+            }
             if !self.record.borrow().accepting {
                 worker.boot_source.remove(requests)?;
                 if worker.boot_source.is_empty() {

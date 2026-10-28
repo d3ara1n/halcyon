@@ -8,7 +8,7 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。本轮整理范围见[活跃资料清理](todo-2026-09-29-system-redesign.md#活跃资料清理2026-10-27)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [设备交付接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)：DMA＋IPI 单项调查已完成；固定交付独立 Review 见下表，原判据与证据由[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)拥有。
+3. [设备与驱动修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)：提交后登记固定交付独立 Review；精确动态覆盖及观察项按该记录的触发条件接续。
 4. [正式服务装配](todo-2026-10-07-service-assembly.md#当前接力)：通用正式服务的装配与恢复按实际需求继续设计；设备持续监督、等待与 loader 迁移不再作为待办。
 5. [系统关机编排](todo-2026-09-system-shutdown-orchestration.md)：正式长期服务的整体收束由本案闭合，设备管理故障接点作为已有实现接入。
 
@@ -25,10 +25,9 @@
 | 五批 Review 当前责任与处置 | [统一报告](review-2026-10-12-consolidated.md) |
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
 | 设备体系设计基线审查档案 | [原发现与修订复核](archived/review-2026-10-23-device-system-design.md)；后续增量与施工入口见设备主计划 |
-| 设备首批施工设计增量独立审查 | [固定交付 Review](todo-2026-10-23-device-implementation-design-review.md) |
+| 首批设计增量与第二轮完整交付的整体审查 | [统一报告、修复与验证档案](archived/review-2026-10-28-device-driver-overall.md)；原两份固定登记已归档，历史范围见报告 |
 | 设备首批实现机制收敛与第二轮交付 | [收敛交付档案](archived/review-2026-10-27-device-implementation.md)；[原固定登记档案](archived/todo-2026-10-27-device-implementation-review.md) |
 | 第二轮生命周期、运输退场与观察收口 | [修复、复核及组合验证](archived/review-2026-10-27-device-lifecycle.md) |
-| 设备第二轮完整代码交付独立 Review | [固定 c5d005d 的审查登记](todo-2026-10-27-device-convergence-review.md)；单独安排，DMA＋IPI 已补证 |
 
 ## 条件触发的计划
 

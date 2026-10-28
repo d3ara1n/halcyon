@@ -126,7 +126,8 @@ impl<O: ProcessOperations> Collector<O> {
         }
     }
 
-    fn control(&self) -> erhino_shared::object::Handle {
+    /// 借用原 Control；只在 Collector 仍持有该进程责任时有效，不转移关闭权。
+    pub fn control(&self) -> erhino_shared::object::Handle {
         self.target.control()
     }
 

@@ -163,6 +163,51 @@ fn validates_segments_and_builds_page_runs() {
 }
 
 #[test]
+fn owned_validation_preserves_input_across_moves_and_constructor_rejection() {
+    let image = build_elf(
+        0x1000,
+        &[Header::load(0, 0x1000, 0x1000, 0x1800, PF_R | PF_X)],
+    );
+    let address = image.as_ptr();
+    let mut validation = elf::Validation::new(
+        image,
+        LoadLimits {
+            page_size: PAGE_SIZE,
+            image_limit: IMAGE_LIMIT,
+        },
+    )
+    .unwrap();
+    let parsed = loop {
+        // 输入和跨步游标一起移动，不能保留指向原结构内部的借用。
+        let mut moved = Box::new(validation);
+        let result = moved.advance().unwrap();
+        validation = *moved;
+        if let Some(parsed) = result {
+            break parsed;
+        }
+    };
+    assert_eq!(parsed.entry(), 0x1000);
+    assert_eq!(parsed.segments().len(), 1);
+    let image = validation.into_input();
+    assert_eq!(image.as_ptr(), address);
+
+    let bytes = vec![0; 8];
+    let address = bytes.as_ptr();
+    let (bytes, error) = match elf::Validation::new(
+        bytes,
+        LoadLimits {
+            page_size: PAGE_SIZE,
+            image_limit: IMAGE_LIMIT,
+        },
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("truncated image was admitted"),
+    };
+    assert_eq!(error, ElfError::TooShort);
+    assert_eq!(bytes.as_ptr(), address);
+}
+
+#[test]
 fn accepts_only_supported_auxiliary_headers() {
     let load = Header::load(0, 0x1000, 0x1000, 0x1000, PF_R | PF_X);
     let supported = [

@@ -90,7 +90,7 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 ## 当前接力
 
-第二轮两条责任链已完成本次迁移并随 `c5d005d` 统一提交，[完整交付独立 Review](todo-2026-10-27-device-convergence-review.md)已登记；不再重做独立线程替换或 loader 分步化。设备 DMA＋IPI 已补证关闭，时钟异常仅观察，后续从[交付接力](todo-2026-09-device-system-design.md#第二轮提交与调查接力)及唯一收口表接手；本案在正式长期服务、恢复或持久化停止提出实际需求时，按上述设计门闭合通用装配。仓库格式/安装更新、透明重启、通用 manifest 继续延期，不恢复双轨匹配或由 srv_device 启动驱动。
+第二轮两条责任链已完成迁移并随 `c5d005d` 统一提交。首批设计增量与第二轮代码审查已合并，[设备/驱动整体报告](archived/review-2026-10-28-device-driver-overall.md)的 G1–G5、C1 已完成修复与复核；srv_driver 运行期出生现已接同一个公共分步 loader，改动尚未提交。后续提交与独立审查、精确动态覆盖边界及候选出生观察由[设备修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有，不重做 root/worker 已完成的等待和装载迁移。设备 DMA＋IPI 已补证关闭，未归因异常仅观察。通用正式长期服务、恢复或持久化停止仍在实际需求明确时按上述设计门闭合；仓库格式/安装更新、透明重启、通用 manifest 继续延期。
 
 ## 首批设备的持续监督接线
 
@@ -156,3 +156,15 @@ root 取得真实来源 Closed 后，关闭自己已经无用的 admin/入口；
 上表的等待与装载已接回 root，device_supervision 的独立线程、Shared 锁、双 Notification、终局抢占、admin ACK、撤防及 join/reap 已删除。后续新增装配路径须遵守同一接入约束，不能恢复独立观察者来补偿主线的阻塞等待。
 
 验证覆盖正常两管理者收束；另一业务等 RPC/报告/进程结果时管理者死亡；Start 后最早死亡；Stopping 中异常；完整 source Closed 与 Completed 的两种先后；loader 尚有大量页未处理时死亡观察仍推进；reset 拒绝后 init DONE 与原 DMA 保留。复用原故障消费者和现有执行测试，停止旧线程专属 ACK/join 窗口的复测，保留等价的责任合同。check/clippy、正式组合及证据版本按构建手册执行，本轮实现已覆盖相应正常与故障路线，具体证据和未覆盖边界见机制收敛报告，不外推任意交错。
+
+## 运行期驱动出生的分步接线（2026-10-28）
+
+本轮整体 Review 的 C1 已纳入授权范围。采用输入 owner 与无内部借用游标：ELF Validation 持输入，ISA/架构字符串只持原映像范围和游标；借用与拥有输入共用同一个验证器。ImageView 独立保存长度和只读 MappedRegion，映射强引用保活 backing，不借用 Image，也不复制完整映像。
+
+Preparation 保留借用入口，增加封闭的拥有型输入（ImageView、payload Vec、逐项 OwnedGrant）。两种输入共用同一阶段机。拥有型构造立即接管输入，初始校验错误冻结在原 Preparation，由第一次 advance 返回；取消和 close_inputs 显式释放，失败保留原 owner。ProcessGrant 成功的同一步解除 OwnedGrant 本地关闭责任，GrantOutcome 继续记录是否消费；借用入口的调用者责任不变。完成/成功取消后才允许关闭输入，取消 Collector 与装配者映射清理分别确认。
+
+原 ProcessTask 的出生按 Admitting→Preparing→Prepared/附着DONE→Running 推进：每次调用一次公共 Preparation.advance；准备完成保存实际PID和Control，关闭输入映像成功、DONE来源实际 registered 后才 Start。Grant前后失败或Stop立即取消原Builder、保留同一Collector；源仍安装/注销或Run仍关联时不驱动Collector关闭Control。取消Collector的PID先进入原Record，确保结果可定位。出生绝对期限不刷新；正常Stop不产生候选失败原因，Start成功后仍沿既有Released/Detach→Kill/Collector链。
+
+Pool、bootstrap mailbox与缓冲由原worker owner贯穿出生/退出；Preparing与Prepared不同时持有同一进程Control，运行或取消之后才由SuperviseTask独占它。没有新增线程、运行体、loader或恢复账本。一次map/unmap内核调用仍可能等待VM事务，本目标消除整份ELF装载和同步回收循环，不声称Task单步有严格墙钟时延上界。
+
+验证目标包括拥有输入的验证器跨步移动、原ELF/ISA fixtures及首错；运行期已有绑定时新worker出生，正常Stop与DONE仍可推进；取消/失败区分Grant前、Grant后、DONE安装中及运行期，真实USB复用与故障路线复用原消费者。本轮已通过与未逐窗注入的边界分别见整体报告及设备主计划的修复后接续，不能把本段目标当成全部运行通过。

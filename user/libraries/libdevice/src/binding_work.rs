@@ -663,9 +663,15 @@ impl Work {
             if index == count {
                 let collecting = business.collecting.take().ok_or(Error::NotReady)?;
                 let frozen = collecting.finish().map_err(|_| Error::NotReady)?;
-                self.binding.0.borrow_mut().resources = Some(frozen);
-                registry.resources_ready(reference)?;
-                business.next_get = None;
+                match registry.resources_ready(reference) {
+                    Ok(()) => {
+                        self.binding.0.borrow_mut().resources = Some(frozen);
+                        business.next_get = None;
+                    }
+                    // 祖先准入先于维护扫描封闭：原轮停止接管，残表不发表。
+                    Err(Error::Closed) => self.stop(now, registry)?,
+                    Err(error) => return Err(error),
+                }
                 return Ok(Step::Runnable);
             }
             ProvisionCommand::Get { epoch, index }

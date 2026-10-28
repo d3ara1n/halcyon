@@ -662,6 +662,47 @@ pub(super) fn run(root: &mut RootSupervisor, manager: &Manager) -> Result<(), &'
             Phase::Released,
             end,
         )?;
+        // 原 Control 的终态观察不依赖 Seat 尚未退出；先 Released 再新建订阅。
+        let late = watch(root, &control, Command::WatchBinding, manager, 16, end)?;
+        let info = late.info();
+        if info.reason != libdevice::watch::Reason::Released
+            || info.pending == 0
+            || info.binding.is_none_or(|snapshot| {
+                snapshot.reference != reference || snapshot.phase != Phase::Released
+            })
+        {
+            return Err("released Binding watch initial receipt invalid");
+        }
+        let reply = call_until(
+            root,
+            late.control(),
+            Command::AckWatch {
+                sequence: info.sequence,
+            },
+            end,
+        )?;
+        if reply.sender_pid != manager.pid() {
+            return Err("released Binding watch ack identity invalid");
+        }
+        let acknowledged = Watch::decode_reply(
+            &reply,
+            Command::AckWatch {
+                sequence: info.sequence,
+            }
+            .op(),
+        )
+        .map_err(|_| "released Binding watch ack invalid")?;
+        if acknowledged.pending != 0
+            || acknowledged.binding != info.binding
+            || !acknowledged.terminal()
+        {
+            return Err("released Binding watch terminal receipt changed");
+        }
+        drop(late);
+        debug!(
+            "function session late Binding watch passed: round={}",
+            round
+        );
         debug!(
             "function session Binding released: round={}, device={}, epoch={}, context={}",
             round,

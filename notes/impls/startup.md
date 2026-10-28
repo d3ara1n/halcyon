@@ -78,7 +78,9 @@ VM/backing退款由[`mm.md`](mm.md)拥有，生命周期与启动门由[`task.md
 
 [`shared/elf::Validation`](../../shared/elf/src/lib.rs) 是 bootstrap、用户态 launcher 与 host audit 共用的静态 ELF admission。每步处理一个 program header、一个页权限区间或一个 ISA 解析单元；有限 LOAD/边界数组之外的属性字符串逐字节前进。它检查 segment 顺序/几何、文件边界、页级权限并集与 W^X、entry 的 executable file-byte 来源和 ISA requirement，错误冻结首个拒绝结果，不能重试后跳过检查。`validate` 只是循环驱动同一验证器；输出仍为私有构造的 segments/runs/image_end，调用者不重读原始 headers。属性解析按 vendor 和 Tag_File 各自长度限定范围，只有 riscv 命名空间的架构声明可用于选择执行需求。
 
-[`libprocess::Preparation`](../../user/libraries/libprocess/src/preparation.rs) 借用固定映像、payload 和 grants，持验证游标、未发布进程及原 GrantOutcome。宿主推进同一 owner，完成前不会交出 Builder 或启动目标。
+Validation 持不可变输入 owner，内部 ELF/ISA/架构字符串状态只保存原映像范围和游标，没有指向自身输入的跨步借用。输入可以是借用切片或拥有型只读映射；构造失败返还原输入，跨步移动不改变解析状态。
+
+[`libprocess::Preparation`](../../user/libraries/libprocess/src/preparation.rs) 的借用入口持固定映像、payload 和 grants；拥有型入口持 ImageView、payload Vec 和 OwnedGrant。两者共用验证游标、未发布进程、阶段机和 GrantOutcome。拥有型构造立即接管输入，初始校验错误由第一次 advance 返回并冻结；宿主仍须显式取消和关闭输入。完成前不会交出 Builder 或启动目标。
 
 | 阶段 | 持有与单步工作 |
 |---|---|
@@ -87,11 +89,13 @@ VM/backing退款由[`mm.md`](mm.md)拥有，生命周期与启动门由[`task.md
 | 授权与入口 | 消费显式 grants、映射出生区、绑定执行需求、创建入口线程并转授其 Control；成功 Grant 才记录消费事实 |
 | 出生块与完成 | 构造只含 ABI 有界句柄和 descriptor 的前缀，分别写前缀与 payload；完成后移出唯一 PreparedProcess |
 
-每步至多一页写入或一个 ABI 有界出生操作。Map 分片上界来自 `PROCESS_MAP_MAX_BYTES`，每笔映射对应自己的 backing/region；Write 按目标页边界切分。输入字节持续借用，不为整个 payload 分配第二份缓冲。
+每步至多一页写入或一个 ABI 有界出生操作。Map 分片上界来自 `PROCESS_MAP_MAX_BYTES`，每笔映射对应自己的 backing/region；Write 按目标页边界切分。借用输入贯穿装配，拥有型输入直接接管调用者交付的存储，不复制完整映像。OwnedGrant 在 ProcessGrant 成功的同一步以 into_raw 解除本地关闭责任，之后失败不得再次关闭已消费 handle；借用分支仍由调用者按 GrantOutcome 兑现移交。
 
 [`prepare`](../../user/libraries/libprocess/src/management.rs) 同步驱动同一 Preparation；完成后返回 affine PreparedProcess，唯一持未启动 builder/control。`try_start` 失败保留原 owner，`cancel_to_collector` 显式移交原取消责任；同步 start/cancel 及 Drop 保留完整失败收束。SpawnRequest 的 control rights 在 Create 前核 MANAGE/WAIT/READ，覆盖取消、DONE观察与终态查询。普通 spawn 组合 prepare/start；root 的装配入口每轮只推进一步，并继续服务同一 Assembly 的管理观察，失败取消也交原收集账本。
 
 Preparation 首次失败后冻结状态，重复 advance 返回同一错误。显式 cancel 关闭尚未转授的入口 Control，再关闭 Builder，把实际 DONE/Verify/Close 交给 Collector；Builder 关闭失败仍保留原 Building owner。完成或取消后保留 GrantOutcome，它只描述调用者输入句柄是否已消费，不能证明启动、退款或进程终态。直接 Drop 内部 PreparedProcess 会同步取消；root 使用显式交接以继续推进其它职责。Collection 的状态机由[运行与监督](runtime.md#process-与-job-收束)拥有。
+
+拥有型 Preparation 的 close_inputs 只在完成移交或成功取消后执行，Unmap 失败仍保留原映像 owner。Collector 负责目标进程，输入映射是装配者自己的责任，两者分别确认。srv_driver 的原 ProcessTask 显式推进同一 Preparation、在 Start 前附着 DONE，取消 Collector 保留到原来源退休和关联 Run 脱离；root 继续使用同一状态机的借用入口。
 
 目标映像/栈及目标句柄表由新进程 Pool 付款；调用者自己的 handle 安装、ProcessWrite 暂存和 Grant 输入缓冲仍付调用者 Pool。`LOADER_WRITE_BUFFER_BYTES` 来自 `PROCESS_PAGE_SIZE`，装配在目标预付之外按同一值计一次串行写入的临时 metadata 峰值。出生块位于 validated ELF 映像顶的页对齐地址，最终映射为 READ；内核 Building Write 负责初始化，不给接收进程增加 WRITE 权限。
 
@@ -103,7 +107,7 @@ Preparation 首次失败后冻结状态，重复 advance 返回同一错误。�
 |---|---|
 | ImageCopy | 唯一持未发布 MemoryObject，逐页映入、复制、解除，再 Seal；`waiting()` 提供实际 EXECUTABLE 观察对象，宿主决定如何等待 |
 | Image | 对象实际 Executable 后缩权交付，只持对象及有效字节长度，构造和能力转交方不保留完整映射 |
-| ImageView | 读取方按需建立只读映射并借用 Image；bytes 只在映射关闭前可用 |
+| ImageView | 独立持只读 MappedRegion 和有效长度，view 强引用保活 backing；bytes 借用绑定自身，关闭映射前有效 |
 
 同步 Image::copy 循环驱动同一 ImageCopy。显式 cancel/close 在 Unmap 失败时保留映射 owner，允许重试；ImageCopy 不冻结首错；Unmap 失败后仍持原页，重试解除成功才前移游标。无宿主接管的 Drop 清理失败使当前进程失败，由 VM 退出收束。root 在拷贝失败后显式取消，取消仍失败则持原 owner 进入故障终局。
 
