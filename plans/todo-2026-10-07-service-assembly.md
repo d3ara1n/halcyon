@@ -1,6 +1,6 @@
 # 正式服务装配与监督设计
 
-状态：**静态常驻服务基座及交付后结构清理已完成，所选验收与清理后回归通过；代码未提交，后续能力按条件触发**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；基座交付证据从[实施接力](#静态基座实施接力2026-10-28)进入，后续清理与验证见[交付后结构清理](#交付后结构清理)，目标由[常驻基座设计](#静态常驻服务基座设计2026-10-28)拥有。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，系统终局与停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备独立组合门及观察项由[设备计划](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有。
+状态：**静态常驻服务基座及交付后结构清理已完成，所选验收与清理后回归通过；代码已提交为 `bfb4fdd`，后续能力按条件触发**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；基座交付证据从[实施接力](#静态基座实施接力2026-10-28)进入，后续清理与验证见[交付后结构清理](#交付后结构清理)，目标由[常驻基座设计](#静态常驻服务基座设计2026-10-28)拥有。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，系统终局与停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备独立组合门及观察项由[设备计划](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有。
 
 ## 目标与非目标
 
@@ -100,7 +100,7 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 ## 当前接力
 
-本轮依据 `99f5e9b` 目标设计与 `caa1f5e` 职责澄清完成选定静态基座，验证、结构检查与证据边界见[唯一实施记录](#静态基座实施接力2026-10-28)。用户随后授权的[结构清理](#交付后结构清理)及针对性回归也已完成，没有待接续的本轮施工步骤。应用、管理器、initfs 描述、恢复和持久化按本篇条件表接手；本案继续拥有这些独立后续，暂不整体归档。当前代码未提交，也未授权 commit/push；获准提交后再登记固定代码交付的可选独立 Review。原[固定设计的独立 Review](todo-2026-10-28-service-foundation-design-review.md)仍仅对应原设计提交、可选未执行；HighNewt 的进行中检查属于协作结构检查，不冒充独立 Review。
+本轮依据 `99f5e9b` 目标设计与 `caa1f5e` 职责澄清完成选定静态基座，验证、结构检查与证据边界见[唯一实施记录](#静态基座实施接力2026-10-28)。用户随后授权的[结构清理](#交付后结构清理)及针对性回归也已完成，没有待接续的本轮施工步骤。应用、管理器、initfs 描述、恢复和持久化按本篇条件表接手；本案继续拥有这些独立后续，暂不整体归档。代码交付固定为 `bfb4fdd`，[固定代码的独立 Review](todo-2026-10-28-service-foundation-review.md)已登记为可选、未执行，不占当前排期。原[固定设计的独立 Review](todo-2026-10-28-service-foundation-design-review.md)仍仅对应原设计提交、可选未执行；HighNewt 的进行中检查属于协作结构检查，不冒充独立 Review。
 
 设备第二轮两条责任链已随 `c5d005d` 提交；整体审查 G1–G5、C1 及公共 loader 修复已随 `e23afdb` 交付。可选独立审查、精确动态覆盖及候选出生观察仍由[设备修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有，不重做 root/worker 等待和装载迁移。持久化、仓库安装更新、服务恢复与通用配置的条件后续见本篇延期表。
 
@@ -331,7 +331,7 @@ BrightReed 的只读讨论与主会话判断收敛为：可先交付有真实授
 
 ## 静态基座实施接力（2026-10-28）
 
-授权基线 `caa1f5e`，分支 `refactor/system-redesign`，进入工作树干净。用户经 HighNewt 确认整轮实施；FairRiver 主写代码、impls 与本记录，HighNewt 只读结构检查；后续代码未授权 commit/push。本轮继续采用上述同一闭包与验证门，不拆成独立交付。
+授权基线 `caa1f5e`，分支 `refactor/system-redesign`，进入工作树干净。用户经 HighNewt 确认整轮实施；FairRiver 主写代码、impls 与本记录，HighNewt 只读结构检查；实施阶段未授权 commit/push，交付后的本地提交授权与结果见文末。本轮继续采用上述同一闭包与验证门，不拆成独立交付。
 
 已完成 Profile/Capacity、同一 Runtime 的必要来源回执门、本地 Instance/Record 的唯一 Control 与 Start 前 DONE/私有 bootstrap 观察、真实 Running 交付门、System 静态装配与记录集合驱动的停止。所有普通 ABI 创建自检已前置；验收 primary 保持运行至全局停止，secondary 保留非空 Copy/Watch 的局部退休。原 partial-admission/失败隔离使用已完成 pm 与已实际 detach 的 secondary Control 交原 Batch，未复制 Control。正式根由 root 持有并由共同停止释放；停止、来源注销、Collector 和根 Job 收集均纳入冻结总期限，完成后保留 Completed。
 
@@ -376,9 +376,9 @@ System 工具初次使用错误 syscall 号而未命中，修为实际 Debug=1 �
 
 PreparedProcess finding 已修复并经 HighNewt 静态复核：出生准备完成后的发布失败、`start_manager` 移交前 gate/槽拒绝，以及 Stop-before-Start 的 `cancel_unstarted` 均显式复用 `cancel_prepared`→原 Collector；取消提交失败在 owner 尚存时直接共同终局，不返回触发 PreparedProcess 同步 Drop/INFINITE 等待。未改公共库析构合同，未建第二套清理框架。正常 Disposition/Cleanup 与退款重试保留；移除的是旧无限 failure/reset 重试路径。
 
-结构收口按 REVIEW 核契约、消费者、付款、取消/迟到结果、来源实退、旧路径及 impls。长期控制仍是 Record 的单一所有权，同一 Assembly 推进，无新共享锁、锁序或公共内核 ABI；没有新增用户 fault→kernel panic。host 用例捕获私有启动格式/容量关系，GDB 工具只作为既有真实消费者的外部取证，不造运行体。语法、文档链接及 `git diff --check` 通过。本轮承诺范围无未闭合责任；未穷举每种错误身份、配额和 Stop-before-Ready 交错，这些按对应校验/owner路径静态复核，不冒称均有动态注入。真实硬件、持久化、恢复、外部关机与普通服务管理仍按原条件表；代码提交后才登记固定代码 Review。
+结构收口按 REVIEW 核契约、消费者、付款、取消/迟到结果、来源实退、旧路径及 impls。长期控制仍是 Record 的单一所有权，同一 Assembly 推进，无新共享锁、锁序或公共内核 ABI；没有新增用户 fault→kernel panic。host 用例捕获私有启动格式/容量关系，GDB 工具只作为既有真实消费者的外部取证，不造运行体。语法、文档链接及 `git diff --check` 通过。本轮承诺范围无未闭合责任；未穷举每种错误身份、配额和 Stop-before-Ready 交错，这些按对应校验/owner路径静态复核，不冒称均有动态注入。真实硬件、持久化、恢复、外部关机与普通服务管理仍按原条件表；固定代码 Review 的登记与提交信息见文末。
 
-最终离线收口：四个修改/新增 Python 工具及九段内嵌 GDB Python 解析通过；315个本地文档链接、74个标题锚点及本记录全部证据路径存在性通过，Justfile解析通过。最后 `just check`、十一分面 `just clippy` 返回码均为0；无遗留 QEMU/GDB 进程。COMPASS、总纲与关机案已移除本轮失效的施工下一步，保留条件后续；没有追加已通过的 QEMU 组合。上述检查日志在 `artifacts/service-foundation/offline-checks.log`、`final-checks.status`；当前全部改动仍未提交，未 push。
+最终离线收口：四个修改/新增 Python 工具及九段内嵌 GDB Python 解析通过；315个本地文档链接、74个标题锚点及本记录全部证据路径存在性通过，Justfile解析通过。最后 `just check`、十一分面 `just clippy` 返回码均为0；无遗留 QEMU/GDB 进程。COMPASS、总纲与关机案已移除本轮失效的施工下一步，保留条件后续；没有追加已通过的 QEMU 组合。上述检查日志在 `artifacts/service-foundation/offline-checks.log`、`final-checks.status`；该轮检查结束时改动尚未提交；后续提交见文末，未 push。
 
 ### 部署容量核算与证据口径
 
@@ -414,4 +414,10 @@ MemoryPoolSnapshot没有逐Pool高水位。Ready、停止前与Collector后均�
 
 误用 `just virt-release` 的首轮正常退出仅保留为演示开发证据（`artifacts/service-foundation-cleanup/core-release.log`），不计严格 core 验收；其后使用上表正确入口补证。源码接口残留搜索、文档本地链接/锚点和 `git diff --check` 已核对；文档最终增量为3篇、90个本地链接及19个锚点，全部通过（`artifacts/service-foundation-cleanup/docs-final.log`）。工具未修改，其解析与未变化专项沿用原交付证据。
 
-未改变消息/到期判据、硬件/平台或故障收束，因此未重跑双顺序及全部平台/故障组合；未变化的专项和 host 协议用例继续由上表交付证据拥有，不记为清理后重新运行。当前无本轮新增未闭合责任，未来能力和独立 Review 的条件保持原记录，未提交或 push。
+未改变消息/到期判据、硬件/平台或故障收束，因此未重跑双顺序及全部平台/故障组合；未变化的专项和 host 协议用例继续由上表交付证据拥有，不记为清理后重新运行。当前无本轮新增未闭合责任，未来能力和独立 Review 的条件保持原记录；清理完成后的提交见下节，未 push。
+
+## 提交与后续审查
+
+用户在基座交付、结构清理及证据核对后明确授权本地提交。实现与清理已提交为 `bfb4fddf2e68ee4706bcd0f2f98cab63694ce6e6`（`feat(init): 实现静态常驻服务基座与统一生命周期监督`），包含上述40个路径；未 push。
+
+[固定代码独立 Review](todo-2026-10-28-service-foundation-review.md)已登记，基线为 `caa1f5ef63bf7fe852c71e5c3d310b31fdfab034`，目标为上述代码提交。登记可选、未执行，不阻碍交付或条件后续；登记及本段提交状态回填只更新文档，不改变产品代码或重跑已通过验证。
