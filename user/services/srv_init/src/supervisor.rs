@@ -34,11 +34,6 @@ fn recoverable(error: SystemCallError) -> bool {
             | SystemCallError::ReachLimit
     )
 }
-fn process_retry(cause: SupervisionCause) -> bool {
-    matches!(cause, SupervisionCause::Stopped | SupervisionCause::Timeout)
-        || matches!(cause, SupervisionCause::System(error) if recoverable(error))
-}
-
 #[derive(Default)]
 struct Disposition {
     retry: Option<u64>,
@@ -231,7 +226,8 @@ struct CapabilityEntry {
 pub(super) struct RootSupervisor {
     pub(super) drivers: Option<super::driver::Manager>,
     pub(super) devices: Option<super::device::Manager>,
-    pub(super) device_supervisor: Option<super::device_supervision::Supervisor>,
+    pub(super) instances: Option<super::supervision::Supervisor>,
+    pub(super) terminal: Option<super::supervision::Terminal>,
     pub(super) assembly: Assembly<WaitSet>,
     waiting: waiting::WaitDuty,
     caller: Option<librpc::Caller>,
@@ -246,16 +242,18 @@ pub(super) struct RootSupervisor {
     read: Option<ReadDuty>,
     pub(super) processes: Vec<Supervised>,
     cursor: usize,
-    failing: bool,
-    reset_attempted: bool,
+    pub(super) stop: Option<super::deployment::Stop>,
+    pub(super) system_host: Option<super::filesystem::Host>,
     reset: Option<Handle>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum Await {
-    ManagerStarted(super::device_supervision::Manager),
-    ManagerDone(super::device_supervision::Manager),
-    ManagerDetached(super::device_supervision::Manager),
+    FilesystemReady(super::supervision::Instance),
+    FilesystemStopped(super::supervision::Instance),
+    ManagerStarted(super::supervision::Instance),
+    ManagerDone(super::supervision::Instance),
+    ManagerDetached(super::supervision::Instance),
     Turn,
     AssemblyWait,
     Job(usize),
@@ -374,7 +372,8 @@ impl RootSupervisor {
         Ok(Self {
             drivers: None,
             devices: None,
-            device_supervisor: None,
+            instances: None,
+            terminal: None,
             assembly,
             waiting,
             caller: Some(librpc::Caller::new()),
@@ -389,8 +388,8 @@ impl RootSupervisor {
             read: None,
             processes: Vec::new(),
             cursor: 0,
-            failing: false,
-            reset_attempted: false,
+            stop: None,
+            system_host: None,
             reset: reset.take(),
         })
     }
@@ -720,6 +719,11 @@ impl RootSupervisor {
     }
 
     pub(super) fn bind_services(&mut self, services: Handle) -> Result<(), SystemCallError> {
+        self.terminal = Some(super::supervision::Terminal::prepare(
+            services,
+            self.reset_authority()
+                .ok_or(SystemCallError::ObjectNotAvailable)?,
+        )?);
         self.services = Some(services);
         let index = self.begin_job(services, None);
         let duty = self.jobs[index]
@@ -944,30 +948,35 @@ impl RootSupervisor {
         let index = self.begin_batch(targets, None);
         self.await_batch(index)
     }
+    pub(super) fn root_stop_budget() -> Result<u64, &'static str> {
+        DEFAULT_SUPERVISION_POLICY
+            .wait_timeout_ms
+            .checked_mul(DEFAULT_SUPERVISION_POLICY.wait_attempts as u64)
+            .and_then(|ms| ms.checked_mul(1_000_000))
+            .ok_or("root stop budget overflow")
+    }
+    pub(super) fn consumer_stop_budget(&self) -> Result<u64, &'static str> {
+        let policy = DEFAULT_SUPERVISION_POLICY;
+        let count = self.processes.len() as u64 + u64::from(self.read.is_some());
+        policy
+            .wait_timeout_ms
+            .checked_mul(policy.wait_attempts as u64)
+            .and_then(|ms| ms.checked_mul(1_000_000))
+            .and_then(|ns| ns.checked_mul(count))
+            .ok_or("consumer stop budget overflow")
+    }
+    pub(super) fn stop_consumers(&mut self) -> Result<(), &'static str> {
+        if self.read.is_some() {
+            self.await_read()?;
+            self.close_read()?;
+        }
+        self.collect_services()
+    }
     pub(super) fn collect_services(&mut self) -> Result<(), &'static str> {
         let incoming = core::mem::take(&mut self.processes);
         let index = self.begin_batch(incoming, None);
         self.await_batch(index)
     }
-    pub(super) fn collect_terminated(&mut self) -> Result<usize, &'static str> {
-        let mut count = 0;
-        let mut index = 0;
-        while index < self.processes.len() {
-            let snapshot = process::query(self.processes[index].control)
-                .map_err(|_| "service state query failed")?;
-            if snapshot.state == ProcessState::Building as u32
-                || snapshot.state == ProcessState::Running as u32
-            {
-                index += 1;
-            } else {
-                let target = self.processes.swap_remove(index);
-                self.collect_one(target)?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
     pub(super) fn collect_process(&mut self, pid: u64) -> Result<(), &'static str> {
         let index = self
             .processes
@@ -1554,7 +1563,6 @@ impl RootSupervisor {
     fn step_job(
         duty: &mut JobDuty,
         now: u64,
-        failing: bool,
         assembly: &Assembly<WaitSet>,
     ) -> Result<(), SystemCallError> {
         if !duty.active || duty.complete || !duty.disposition.ready(now) {
@@ -1562,22 +1570,6 @@ impl RootSupervisor {
         }
         Self::prepare_job(duty, assembly)?;
         let rt = duty.runtime.as_mut().expect("job runtime remains owned");
-        if failing && let Some(id) = duty.failed_task {
-            let retry = duty.world.failure.is_some_and(|error| match error.cause {
-                libprocess::JobKillCause::Timeout => true,
-                libprocess::JobKillCause::Process(cause) => process_retry(cause),
-                libprocess::JobKillCause::System(error) => recoverable(error),
-                _ => false,
-            });
-            if retry {
-                rt.get_task_mut(id)
-                    .expect("failed job task remains owned")
-                    .driver
-                    .replenish(DEFAULT_SUPERVISION_POLICY);
-                rt.defer_failed_task(id, Some(later(now)))?;
-                duty.failed_task = None;
-            }
-        }
         if can_drive(rt, now)
             && let Err(failure) = rt.turn(&mut duty.world, 1)
         {
@@ -1600,7 +1592,6 @@ impl RootSupervisor {
     fn step_batch(
         duty: &mut BatchDuty,
         now: u64,
-        failing: bool,
         assembly: &Assembly<WaitSet>,
     ) -> Result<(), SystemCallError> {
         if duty.complete || !duty.disposition.ready(now) {
@@ -1657,38 +1648,7 @@ impl RootSupervisor {
             && duty.pending.is_none()
         {
             // 每轮只领取/报告一个结果；失败记录保留完整机器。
-            if duty.world.failures != 0 {
-                if failing {
-                    if duty.result_cursor < duty.world.results.len() {
-                        let index = duty.result_cursor;
-                        duty.result_cursor += 1;
-                        if duty.world.results[index]
-                            .outcome
-                            .as_ref()
-                            .is_err_and(|failure| process_retry(failure.cause))
-                        {
-                            let failure = duty
-                                .world
-                                .results
-                                .swap_remove(index)
-                                .outcome
-                                .expect_err("selected result retains a collector");
-                            duty.world.failures -= 1;
-                            let mut machine = failure.collector;
-                            machine.replenish(DEFAULT_SUPERVISION_POLICY);
-                            duty.pending = Some(SuperviseTask::from_collector(machine));
-                            duty.result_cursor = 0;
-                            duty.disposition.retry = Some(later(now));
-                        }
-                    } else {
-                        duty.disposition.held = true;
-                        debug!(
-                            "root retained {} failed Process operation(s)",
-                            duty.world.failures
-                        );
-                    }
-                }
-            } else if duty.result_cursor < duty.world.results.len() {
+            if duty.world.failures == 0 && duty.result_cursor < duty.world.results.len() {
                 let done = duty.world.results[duty.result_cursor]
                     .outcome
                     .as_ref()
@@ -1702,7 +1662,7 @@ impl RootSupervisor {
                     done.snapshot.detail.word0
                 );
                 duty.result_cursor += 1;
-            } else {
+            } else if duty.world.failures == 0 {
                 close_runtime(&mut duty.runtime)?;
                 duty.complete = true;
             }
@@ -1731,7 +1691,7 @@ impl RootSupervisor {
     fn step_read(
         duty: &mut ReadDuty,
         now: u64,
-        failing: bool,
+        stopping: bool,
         assembly: &Assembly<WaitSet>,
     ) -> Result<(), SystemCallError> {
         if !duty.disposition.ready(now) {
@@ -1740,7 +1700,7 @@ impl RootSupervisor {
         if duty.complete {
             return Ok(());
         }
-        if failing && duty.runtime.is_none() && duty.world.rpc.is_some() {
+        if stopping && duty.runtime.is_none() && duty.world.rpc.is_some() {
             Self::abandon_clients(duty)?;
             // 尚无在途调用和来源；原生角色关闭即完成这一未准入运行体的收束。
             drop(duty.world.rpc.take());
@@ -1749,7 +1709,7 @@ impl RootSupervisor {
             duty.complete = true;
             return Ok(());
         }
-        if duty.world.rpc.is_none() && duty.world.buffer.is_empty() && !failing {
+        if duty.world.rpc.is_none() && duty.world.buffer.is_empty() && !stopping {
             duty.world
                 .buffer
                 .try_reserve_exact(STREAM_LEN + 1)
@@ -1783,7 +1743,7 @@ impl RootSupervisor {
                 &funding,
             )?);
         }
-        if failing && !duty.pending.is_empty() && duty.world.rpc.is_some() {
+        if stopping && !duty.pending.is_empty() && duty.world.rpc.is_some() {
             Self::abandon_clients(duty)?;
             duty.world
                 .rpc
@@ -1816,7 +1776,7 @@ impl RootSupervisor {
                 }
             }
         }
-        let result = if failing {
+        let result = if stopping {
             rt.seal();
             rt.shutdown_turn(&mut duty.world, 1)
         } else if can_drive(rt, now) {
@@ -1840,7 +1800,7 @@ impl RootSupervisor {
 
     pub(super) fn turn_and_wait(&mut self, awaited: Option<Await>) -> Result<(), SystemCallError> {
         for &record in self.assembly.receive(64)? {
-            if let Some(managers) = &mut self.device_supervisor {
+            if let Some(managers) = &mut self.instances {
                 managers.feed(record);
             }
             self.waiting.feed(record);
@@ -1859,16 +1819,24 @@ impl RootSupervisor {
             }
         }
         let now = libkernel::time::snapshot()?.now_ns;
+        if self.stop.as_ref().is_some_and(|stop| {
+            stop.phase != super::deployment::StopPhase::Completed && now >= stop.deadline.at_ns
+        }) {
+            self.system_failure("system stop aggregate deadline expired");
+        }
+        if let Some(supervisor) = &mut self.instances {
+            supervisor.close_admission(self.stop.is_some());
+        }
         // 管理者DONE和故障先于装配/业务推进；这里只有一个终局owner。
         let failure = self
-            .device_supervisor
+            .instances
             .as_mut()
             .and_then(|managers| match managers.step() {
                 Ok(()) => managers.failure(),
                 Err(_) => Some("manager observation infrastructure failed"),
             });
         if let Some(reason) = failure {
-            self.device_failure(reason);
+            self.system_failure(reason);
         }
         self.waiting.step(now)?;
         // 五个运行体槽持续轮转；每轮各至多一个工作单位。
@@ -1878,7 +1846,7 @@ impl RootSupervisor {
             match index {
                 0 | 1 => {
                     if let Some(duty) = &mut self.jobs[index]
-                        && let Err(error) = Self::step_job(duty, now, self.failing, &self.assembly)
+                        && let Err(error) = Self::step_job(duty, now, &self.assembly)
                     {
                         duty.error = Some(error);
                         duty.disposition.fail(error, now);
@@ -1886,8 +1854,7 @@ impl RootSupervisor {
                 }
                 2 | 3 => {
                     if let Some(duty) = &mut self.batches[index - 2]
-                        && let Err(error) =
-                            Self::step_batch(duty, now, self.failing, &self.assembly)
+                        && let Err(error) = Self::step_batch(duty, now, &self.assembly)
                     {
                         duty.error = Some(error);
                         duty.disposition.fail(error, now);
@@ -1895,7 +1862,8 @@ impl RootSupervisor {
                 }
                 _ => {
                     if let Some(duty) = &mut self.read
-                        && let Err(error) = Self::step_read(duty, now, self.failing, &self.assembly)
+                        && let Err(error) =
+                            Self::step_read(duty, now, self.stop.is_some(), &self.assembly)
                     {
                         duty.error = Some(error);
                         duty.disposition.fail(error, now);
@@ -1908,28 +1876,6 @@ impl RootSupervisor {
         self.endpoint_create_cleanup
             .step(now, libkernel::ipc::tunnel::Endpoint::close);
         self.capability_cleanup.step(now, Capability::close);
-        if self.failing {
-            for duty in &mut self.jobs {
-                if duty.as_ref().is_some_and(|duty| duty.complete) {
-                    *duty = None;
-                }
-            }
-            for duty in &mut self.batches {
-                if duty.as_ref().is_some_and(|duty| duty.complete) {
-                    *duty = None;
-                }
-            }
-        }
-        if self.failing
-            && self
-                .read
-                .as_ref()
-                .is_some_and(|d| d.complete && !d.disposition.held)
-            && self.close_read().is_err()
-            && let Some(duty) = &mut self.read
-        {
-            duty.disposition.held = true;
-        }
         if !self.capabilities.is_empty() {
             let index = self.capability_cursor % self.capabilities.len();
             self.capability_cursor = (index + 1) % self.capabilities.len();
@@ -1940,7 +1886,7 @@ impl RootSupervisor {
                     .flatten()
                     .any(|duty| duty.root == owner.handle())
             });
-            if (entry.closing || self.failing)
+            if entry.closing
                 && !borrowed
                 && entry.disposition.ready(now)
                 && let Some(owner) = entry.owner.take()
@@ -1961,34 +1907,21 @@ impl RootSupervisor {
                 }
             }
         }
-        if self.failing
-            && !self.reset_attempted
-            && self.jobs.iter().all(Option::is_none)
-            && self.batches.iter().all(Option::is_none)
-            && self.read.is_none()
-            && self.processes.is_empty()
-            && self.endpoint_cleanup.owner.is_none()
-            && self.endpoint_create_cleanup.owner.is_none()
-            && self.capability_cleanup.owner.is_none()
-            && self.capabilities.iter().all(|entry| entry.owner.is_none())
-        {
-            self.reset_attempted = true;
-            debug!("failure-path services collection completed");
-            if let Some(reset) = self.reset.take() {
-                match system::reset(reset, ResetAction::Shutdown, ResetReason::SystemFailure) {
-                    Ok(never) => match never {},
-                    Err(error) => debug!("failure shutdown rejected: {:?}", error),
-                }
-            }
-        }
-        let mut deadline = None;
+        let mut deadline = self
+            .stop
+            .as_ref()
+            .filter(|stop| stop.phase != super::deployment::StopPhase::Completed)
+            .map(|stop| stop.deadline.at_ns);
         let (waiting_runnable, waiting_deadline) = self.waiting.state();
-        deadline = waiting_deadline.or(deadline);
+        deadline = match (waiting_deadline, deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let mut runnable = waiting_runnable
             || self.endpoint_cleanup.runnable()
             || self.endpoint_create_cleanup.runnable()
             || self.capability_cleanup.runnable();
-        if let Some(managers) = &self.device_supervisor {
+        if let Some(managers) = &self.instances {
             match managers.state() {
                 DriveState::Runnable => runnable = true,
                 DriveState::Waiting(end) => {
@@ -2010,7 +1943,7 @@ impl RootSupervisor {
             deadline = Some(deadline.map_or(at, |old: u64| old.min(at)));
         }
         for entry in &self.capabilities {
-            if !(entry.closing || self.failing) || entry.owner.is_none() {
+            if !entry.closing || entry.owner.is_none() {
                 continue;
             }
             if let Some(at) = entry.disposition.retry {
@@ -2061,9 +1994,11 @@ impl RootSupervisor {
         }
         // 只向正在等待的脚本阶段返回结果；其他已完成槽不妨碍组合停驻。
         let outcome = match awaited {
-            Some(Await::ManagerStarted(role)) => self.device_supervisor.as_ref().is_some_and(|s| s.started(role)),
-            Some(Await::ManagerDone(role)) => self.device_supervisor.as_ref().is_some_and(|s| s.done(role)),
-            Some(Await::ManagerDetached(role)) => self.device_supervisor.as_ref().is_some_and(|s| s.detached(role)),
+            Some(Await::FilesystemReady(role)) => self.filesystem_ready(role),
+            Some(Await::FilesystemStopped(role)) => self.filesystem_stopped(role),
+            Some(Await::ManagerStarted(role)) => self.instances.as_ref().is_some_and(|s| s.started(role)),
+            Some(Await::ManagerDone(role)) => self.instances.as_ref().is_some_and(|s| s.done(role)),
+            Some(Await::ManagerDetached(role)) => self.instances.as_ref().is_some_and(|s| s.detached(role)),
             Some(Await::Turn) => true,
             Some(Await::AssemblyWait) => self.waiting.complete(),
             Some(Await::Job(index)) => self.jobs[index]
@@ -2119,28 +2054,5 @@ impl RootSupervisor {
         self.assembly
             .wait(deadline.map_or(Deadline::INFINITE, Deadline::at))?;
         Ok(())
-    }
-
-    pub(super) fn serve_forever(mut self) -> ! {
-        if self.device_supervisor.is_some() {
-            self.device_failure("main device assembly failure");
-        }
-        self.failing = true;
-        if !self.processes.is_empty() {
-            let incoming = core::mem::take(&mut self.processes);
-            self.begin_batch(incoming, None);
-        }
-        if let Some(services) = self.services {
-            self.begin_job(services, None);
-        }
-        debug!("init: persistent root supervisor owns all pending duties");
-        loop {
-            if let Err(error) = self.turn_and_wait(None) {
-                debug!("root supervisor infrastructure failure: {:?}", error);
-                if let Ok(now) = libkernel::time::snapshot() {
-                    let _ = libkernel::time::sleep_until(Deadline::at(later(now.now_ns)));
-                }
-            }
-        }
     }
 }

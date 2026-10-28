@@ -21,7 +21,7 @@ mod boot;
 mod family;
 mod lifecycle;
 mod services;
-pub(super) use boot::{Instance, run};
+pub(super) use boot::{Startup, run};
 
 const MAILBOX_SOURCE: u64 = 1;
 const REPLY_SOURCE: u64 = 2;

@@ -18,7 +18,7 @@ just check
 just clippy
 ```
 
-`just check` 对 os workspace 执行带 build-std 的 cargo check，包含它的实际依赖，不等于检查所有 workspace。`just clippy` 覆盖 shared/os/user host、kernel/user RISC-V、stress/memory/device/resource feature 与独立 gc target 十个分面，全部使用 `-D warnings`；resource同时编译真实function/IRQ、MMIO/DMA竞争消费者，user RISC-V 同时选择库与程序，覆盖尚未被可执行程序链接的领域库。完整日志写入 `artifacts/lint/`。
+`just check` 对 os workspace 执行带 build-std 的 cargo check，包含它的实际依赖，不等于检查所有 workspace。`just clippy` 覆盖 shared/os/user host、kernel/user RISC-V、stress/memory/device/resource feature 与独立 gc target 十一个分面（新增 System 部署），全部使用 `-D warnings`；resource同时编译真实function/IRQ、MMIO/DMA竞争消费者，user RISC-V 同时选择库与程序，覆盖尚未被可执行程序链接的领域库。完整日志写入 `artifacts/lint/`。
 
 所有 QEMU 启动路线自动准备产物目录，并通过 `make_dtb` 从对应平台的 `device.dts` 重新生成 `artifacts/<PLATFORM>/<MODEL>/device.dtb`，无需手动预生成；清理产物后可直接运行 `just virt`。`virt-hetero`、`virt-nofd` 在生成变体 DTS 前同样准备目录；`ERHINO_DTB` 只选择 QEMU 加载的 DTB，不改变标准 DTB 的生成位置。
 
@@ -42,19 +42,22 @@ user 的 host 命令只选择公共库，不能把 RV64 服务二进制纳入 ho
 
 ## QEMU 路线与选择
 
-workload（core/stress/memory/device/device-reuse）由用户态 `srv_init` 编译期控制，内核不感知测试政策。服务、驱动、验收进程分别位于 `user/services/`、`user/drivers/`、`user/tests/`；验收配置中的进程也可承载正式机制，成熟度由对应 impls 与任务记录分别说明。
+部署选择（system 或 core/stress/memory/device/device-reuse 验收）由用户态 `srv_init` 编译期控制，内核不感知测试政策。服务、驱动、验收进程分别位于 `user/services/`、`user/drivers/`、`user/tests/`；验收配置中的进程也可承载正式机制，成熟度由对应 impls 与任务记录分别说明。
 
 | 命令 | 覆盖与用途 |
 |---|---|
+| `just system [mode]` | 静态常驻正式部署，默认 release；仅设备/驱动管理者及单个 fs/registry 宿主，无验收消费者，不因空闲关机 |
+| `just system-observe` | 同一 System debug 部署的有限外部观察，核三必需宿主与 init 在真实 Assembly 来源的无限等待；操作者最后收割不代表正常停止 |
 | `just virt [mode]` | 直接运行 virt 演示；默认 debug，终端实时显示编译和系统输出 |
 | `just virt-stress` | core 加 control/Tunnel 重复压力、非空 WaitSet 进程自动退休与完整 16/16 竞态矩阵 |
 | `just virt-release` | `just virt release` 的演示快捷入口 |
 | `just acceptance-virt [mode]` | virt core 自动验收；默认 release，可指定 debug |
 | `just sifive_u [mode]` | 直接运行 sifive_u 演示；默认 release，终态由用户退出 |
+| `just acceptance-fs-stop-order` | 原 core debug 消费者：secondary 正常领取 Stopped 先；primary 的真实 Dead/DONE 提示已形成后，仅延迟 root 调度超过原阶段窗口，验证原到期复查中 DONE 先及完成优先。核真实 tick 增量、后继 root 实际时钟仍小于冻结总期限，随后完整 core 正常停止；不宣称控制两种普通通知交付顺序 |
 | `just acceptance-device [mode]` | 正式 Devices/FunctionAccess/OAL 键盘客户端：无键盘启动、两轮同端口 QMP 热插、客体确认按下/释放、主机删除与客体 Seat 释放分别确认、IRQ Take/Ack 和实际 worker Pool 退款；随后保留 core 全部业务 |
 | `just acceptance-device-reuse` | 正式 debug ELF/GDB 外部用户 fault：A/B 同 HID PID、停 A 保旧 function/Watch、B 继续输入、C 复用、CPU 故障后 B/C 原 Seat Released 与单次进程收集；以本轮 controller Ready 为插入门，不声称 idle |
 | `just acceptance-device-candidates` | 同一debug复用/QMP路线的显式负装配：真实PCI映像在原固定identity/角色门明确Permission且无物理/子登记授权，等原轮Closed/Released/Detach，在同DeviceId新epoch接真实HID及输入；正常声明和原工作集不变 |
-| `just acceptance-device-manager-fault Device/Driver [wait/start/stopping/loading]` | 同一debug装配和外部GDB：root业务等待、Start后首ecall、正常停止中的指定管理者fault。loading仅Driver：核实际test_target首段/首页指纹、剩余复制及未完成子进程未Start即进入终局。均核唯一封口与QMP guest RESET，不以reset证明硬件停止或退款 |
+| `just acceptance-device-manager-fault Device/Driver/Filesystem [wait/start/stopping/loading]` | 同一debug装配和外部GDB：root业务等待、Start后首ecall、正常停止中的指定管理者fault。loading仅Driver：核实际srv_fs首段/首页指纹、剩余复制及未完成子进程未Start即进入终局。均核唯一封口与QMP guest RESET，不以reset证明硬件停止或退款 |
 | `just acceptance-device-reset-rejection` | 真实 xHCI 已交付环地址后使 srv_device fault，拒绝真实 ColdReboot/SystemFailure；复用原 DMA 观察体核 init DONE/四 hart 停驻后同一组 pin/backing/write 许可仍保留，不能据此断言设备 DMA 静止 |
 | `just acceptance-device-controller-fault` | 同一正式debug装配中使实际xHCI PID在真实trap入口fault，核原ProcessTask DONE与Managed受信主控故障、外层唯一终局；拒绝ColdReboot后核实际非空exposed DMA集合跨init DONE/四hart停驻保留，不以CPU完成补静止或Retire |
 | `just acceptance-device-unknown Claim/Prepare/ProvisionGet/GetResource/Activate/QueryUse/Master` | 同一debug core装配，GDB仅令一份真实成功回复的运输Send期限At0，核真实Once/context、DeadlineExpired及原请求Sent错误。Claim走唯一故障终局；Prepare核首次Preparing/Prepared接纳回复；GetResource要求暴露位保持true、PCI未开始ECAM访问、原Use报告后安全释放；QueryUse核激活接纳后的首次权限核验失败，须无资源暴露/硬件访问并退原轮。其余核原轮停止或Master原context/绝对期限恢复及完整core收尾。不声称回复入队后丢失 |

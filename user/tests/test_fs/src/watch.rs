@@ -305,14 +305,16 @@ pub(super) fn check(namespace: &Namespace, caller: &mut Caller, prefix: &str) {
 
 /// 两个真实发行入口共享全局容量，局部额度与退款分别沿自己的控制 owner。
 pub(super) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
-    use srv_fs::deployment::{ENTRY_WATCHES, WATCHES};
+    let capacity = srv_fs::deployment::Capacity::new(srv_fs::startup::Profile::AcceptancePrimary)
+        .expect("acceptance capacity invalid");
+    use srv_fs::deployment::WATCHES;
     let mut a = alloc::vec::Vec::new();
     let mut b = alloc::vec::Vec::new();
-    a.try_reserve_exact(ENTRY_WATCHES[0])
+    a.try_reserve_exact(capacity.entry_watches(0))
         .expect("tenant A watch storage failed");
     b.try_reserve_exact(WATCHES)
         .expect("tenant B watch storage failed");
-    for _ in 0..ENTRY_WATCHES[0] {
+    for _ in 0..capacity.entry_watches(0) {
         let watch = Client::new(namespace, caller, limits())
             .watch("/", 0, deadline())
             .expect("tenant A watch admission failed");
@@ -327,7 +329,7 @@ pub(super) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
         ),
         "tenant A local watch quota missing"
     );
-    for _ in ENTRY_WATCHES[0]..WATCHES {
+    for _ in capacity.entry_watches(0)..WATCHES {
         let watch = Client::new(namespace, caller, limits())
             .watch("/tenant-b", 0, deadline())
             .expect("tenant B rejected while global watch quota remained");
@@ -336,7 +338,7 @@ pub(super) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
         b.push(watch);
     }
     assert!(
-        b.len() < ENTRY_WATCHES[1],
+        b.len() < capacity.entry_watches(1),
         "tenant B fixture exhausted local quota"
     );
     assert!(

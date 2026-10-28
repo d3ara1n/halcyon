@@ -1,4 +1,5 @@
 //! 设备管理者的真实启动与停止装配；init 保留根管理、独立 Job/Pool 及进程监督。
+pub(super) const STOP_TIMEOUT_NS: u64 = 40_000_000_000;
 use super::{
     JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, TopologyNames, init_process_info,
     root_memory_pool,
@@ -193,7 +194,7 @@ impl Manager {
             // 非幂等签发 Unknown 封原根，不以另发来源掩盖可能已提交的权利。
             if let Ok(end) = libkernel::time::timeout_millis(DEADLINE_MS) {
                 let _ = root.manager_source_call(
-                    super::device_supervision::Manager::Device,
+                    super::supervision::Instance::Device,
                     Command::SealSource,
                     end,
                 );
@@ -301,8 +302,8 @@ impl Manager {
             );
             "device manager spawn failed"
         })?;
-        let spawned = root.start_manager(super::device_supervision::Manager::Device, prepared)?;
-        names.register_process(spawned.pid, "srv_device");
+        let pid = root.start_instance(super::supervision::Instance::Device, prepared)?;
+        names.register_process(pid, "srv_device");
         let deadline = libkernel::time::timeout_millis(DEADLINE_MS)
             .map_err(|_| "device startup deadline failed")?;
         let mut ready = root
@@ -310,7 +311,7 @@ impl Manager {
             .map_err(|_| "device manager readiness failed")?;
         if ready.header.kind != protocol::BOOT_READY
             || ready.header.sender_context_id != expected
-            || ready.header.sender_pid != spawned.pid
+            || ready.header.sender_pid != pid
             || ready.payload.len() != 8
             || ready.handles.remaining() != 2
         {
@@ -349,13 +350,8 @@ impl Manager {
         {
             return Err("device root roles share one context");
         }
-        root.attach_manager_source(
-            super::device_supervision::Manager::Device,
-            admin,
-            spawned.pid,
-        )?;
-        let state =
-            process::query(spawned.control).map_err(|_| "device process readiness query failed")?;
+        root.attach_manager_source(super::supervision::Instance::Device, admin, pid)?;
+        let state = root.instance_snapshot(super::supervision::Instance::Device)?;
         if state.state != ProcessState::Running as u32
             || state.cause != TerminationCause::None as u32
             || state.detail != TerminationDetail::NONE
@@ -376,7 +372,7 @@ impl Manager {
             )?;
             let (header, body) = Header::decode(&reply.payload)
                 .map_err(|_| "device observer issuance reply invalid")?;
-            if reply.sender_pid != spawned.pid
+            if reply.sender_pid != pid
                 || header.op != 1
                 || header.error.is_some()
                 || !body.is_empty()
@@ -406,7 +402,7 @@ impl Manager {
                     access: Access::OBSERVE,
                 },
             )?;
-            empty(&denied, spawned.pid, 1, Some(Error::Permission))?;
+            empty(&denied, pid, 1, Some(Error::Permission))?;
             let watch = libdevice::client::Watch::from_reply(
                 call(root, &observer, Command::WatchScope { scope: Scope::Root })?,
                 incarnation,
@@ -496,12 +492,12 @@ impl Manager {
             Err(error) => {
                 let sealed = root
                     .manager_source_call(
-                        super::device_supervision::Manager::Device,
+                        super::supervision::Instance::Device,
                         Command::SealSource,
                         libkernel::time::timeout_millis(DEADLINE_MS)
                             .map_err(|_| "device seal deadline failed")?,
                     )
-                    .and_then(|reply| empty(&reply, spawned.pid, 2, None));
+                    .and_then(|reply| empty(&reply, pid, 2, None));
                 if sealed.is_err() {
                     debug!("device assembly source closure is unconfirmed");
                 }
@@ -510,10 +506,10 @@ impl Manager {
         };
         debug!(
             "device manager assembly ready: pid={}, registry={}, authenticated bootstrap and observer authority",
-            spawned.pid, incarnation
+            pid, incarnation
         );
         Ok(Self {
-            pid: spawned.pid,
+            pid,
             job,
             pool,
             root: Some(root_entry),
@@ -523,10 +519,9 @@ impl Manager {
         })
     }
     pub fn stop(&mut self, root: &mut RootSupervisor) -> Result<(), &'static str> {
-        let deadline =
-            libkernel::time::timeout_millis(40_000).map_err(|_| "device stop deadline failed")?;
-        let deadline =
-            root.manager_stopping(super::device_supervision::Manager::Device, deadline)?;
+        let deadline = libkernel::time::timeout_millis(STOP_TIMEOUT_NS / 1_000_000)
+            .map_err(|_| "device stop deadline failed")?;
+        let deadline = root.manager_stopping(super::supervision::Instance::Device, deadline)?;
         let Self { pid, job, pool, .. } = *self;
         process::seal_job(job).map_err(|_| "device assembly JobSeal failed")?;
         if let Some(watch) = self.watch.as_ref() {
@@ -582,7 +577,7 @@ impl Manager {
         self.observer_admin = None;
         empty(
             &root.manager_source_call(
-                super::device_supervision::Manager::Device,
+                super::supervision::Instance::Device,
                 Command::SealSource,
                 deadline,
             )?,
@@ -593,7 +588,7 @@ impl Manager {
         let source_deadline = deadline;
         loop {
             let reply = root.manager_source_call(
-                super::device_supervision::Manager::Device,
+                super::supervision::Instance::Device,
                 Command::QuerySourceStop,
                 source_deadline,
             )?;
@@ -622,9 +617,9 @@ impl Manager {
                 }
             }
         }
-        root.manager_source_closed(super::device_supervision::Manager::Device)?;
+        root.manager_device_closed(super::supervision::Instance::Device)?;
         self.root = None;
-        root.collect_manager(super::device_supervision::Manager::Device)?;
+        root.collect_manager(super::supervision::Instance::Device)?;
         root.collect_job(job)?;
         root.close_control(job)?;
         root.close_control(pool)?;
@@ -643,7 +638,7 @@ impl RootSupervisor {
             .ok_or("device assembly record missing")?;
         match device.stop(self) {
             Ok(()) => {
-                self.finish_device_supervision()?;
+                self.finish_supervision()?;
                 Ok(())
             }
             Err(error) => {

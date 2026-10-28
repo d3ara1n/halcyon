@@ -60,9 +60,9 @@ BindingControl/Use 的 OAL 根由 [`resource/oal`](../../user/libraries/libdevic
 
 ## init 的管理者监督
 
-不可恢复的来源/运输或绑定安全故障使管理进程显式失败。init 的 [`device_supervision`](../../user/services/srv_init/src/device_supervision.rs) 在 RootSupervisor 的同一 Assembly 上预付两份 ManagerTask。每个任务观察 World 中对应的 Record；记录通过 ProcessOwner 独占未启动 PreparedProcess 或运行期 ProcessControl，并持真实 SourceAdmin、停止期限与 DONE 快照。DONE 来源实际附着之后才消费 Start。srv_driver 的 SourceAdmin 在准备进程之前移入，srv_device 的根 admin 在认证私有 bootstrap 后移入。Job/Pool 的关闭权继续由 root 原能力账本持有，领域装配记录只借用其 handle。
+不可恢复的来源/运输或绑定安全故障使管理进程显式失败。init 的 [`supervision`](../../user/services/srv_init/src/supervision.rs) 在 RootSupervisor 的同一 Assembly 上按部署预付本地 InstanceTask（设备两项，文件另计）。每个任务观察 World 中对应的 Record；记录通过 ProcessOwner 独占未启动 PreparedProcess 或运行期 ProcessControl，并持真实 SourceAdmin、停止期限与 DONE 快照。DONE 来源实际附着之后才消费 Start。srv_driver 的 SourceAdmin 在准备进程之前移入，srv_device 的根 admin 在认证私有 bootstrap 后移入。Job/Pool 的关闭权继续由 root 原能力账本持有，领域装配记录只借用其 handle。
 
-root 每次统一接收后先推进管理 DONE 和故障判断，再推进装配、等待和其它 Runtime。业务报告、设备/功能消费者和并发 Retry 主线的等待同样经过 root；具体接点和来源借用由[执行与监督](runtime.md#顺序装配的等待与推进)拥有，loader/映像复制由[启动实现](startup.md#用户态公共-loader)拥有。独立内核 ABI 自检在设备消费者结束并正常停止两管理者后执行。
+root 每次统一接收后先推进管理 DONE 和故障判断，再推进装配、等待和其它 Runtime。业务报告、设备/功能消费者和并发 Retry 主线的等待同样经过 root；具体接点和来源借用由[执行与监督](runtime.md#顺序装配的等待与推进)拥有，loader/映像复制由[启动实现](startup.md#用户态公共-loader)拥有。独立内核 ABI 创建自检在基础宿主出生前执行；全局停止 Seal 后不再启动验收进程。文件与系统终局的共同持有见[启动实现](startup.md#init-的静态部署与根监督)。
 
 正常停止在第一个可使管理者退出的请求之前提交原实例意图和绝对期限。SourceAdmin 的 QuerySourceStop 确认 Closed 后，由同一 root 直接关闭原 admin；DONE 必须核验 Completed/无异常 detail，先到时保留快照等来源证明。两项事实齐全后实际注销 DONE 来源，将原 Control 交原 Collector，再关闭对应 Job/Pool。全部管理任务退休后关闭其 Runtime 和终局预备资源，不存在 release_admin/disarm/ACK/join 握手。
 

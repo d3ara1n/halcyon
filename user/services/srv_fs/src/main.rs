@@ -9,59 +9,77 @@ extern crate alloc;
 
 mod server;
 
-use erhino_shared::object::{Handle, Rights};
-use libkernel::ipc::{
-    capability::Capability,
-    message::{Mailbox, MailboxSender},
-};
-
-fn startup_handle(
-    startup: &mut libruntime::startup::InitialGrants,
-    index: usize,
-    missing: &'static str,
-) -> Handle {
-    startup
-        .take(index)
-        .map(Capability::into_raw)
-        .expect(missing)
-}
-
-fn startup_sender(
-    startup: &mut libruntime::startup::InitialGrants,
-    index: usize,
-    missing: &'static str,
-) -> MailboxSender {
-    let capability = startup.take(index).expect(missing);
-    MailboxSender::from_capability(capability)
-        .map(|(sender, _)| sender)
-        .map_err(|failure| failure.error)
-        .expect("provider bootstrap sender has an invalid role")
-}
+use erhino_shared::object::Rights;
+use libkernel::ipc::message::{Mailbox, MailboxSender};
 
 fn main() {
     let startup = libruntime::startup::take().expect("provider startup context is missing");
     let (process, payload, mut grants) = startup.into_parts();
-    let instance = match payload.as_bytes() {
-        b"" => server::Instance::Primary,
-        b"secondary" => server::Instance::Secondary {
-            parent_pid: process.parent_pid(),
-        },
-        _ => panic!("provider instance role invalid"),
-    };
-    let bootstrap = startup_sender(&mut grants, 0, "provider bootstrap sender is missing");
-    let release = startup_handle(&mut grants, 1, "provider release owner is missing");
-    let route = startup_handle(&mut grants, 2, "provider route mailbox owner is missing");
-    let registration = startup_handle(&mut grants, 3, "provider registration endpoint is missing");
-    let pool = grants.take(4).expect("provider funding Pool is missing");
+    let profile = srv_fs::startup::Profile::decode(payload.as_bytes())
+        .expect("provider startup profile invalid");
+    assert_eq!(
+        grants.remaining(),
+        srv_fs::startup::GRANTS,
+        "provider startup grant count invalid"
+    );
+    let expected = [
+        (
+            erhino_shared::object::ObjectKind::MailboxSender,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        ),
+        (
+            erhino_shared::object::ObjectKind::NotificationOwner,
+            Rights::READ | Rights::WAIT,
+        ),
+        (
+            erhino_shared::object::ObjectKind::MailboxReceiver,
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+        ),
+        (
+            erhino_shared::object::ObjectKind::MailboxReceiver,
+            Rights::READ | Rights::WAIT | Rights::MANAGE,
+        ),
+        (
+            erhino_shared::object::ObjectKind::MemoryPool,
+            Rights::CREATE,
+        ),
+    ];
+    let mut caps: [_; srv_fs::startup::GRANTS] = core::array::from_fn(|index| grants.take(index));
+    for (index, (kind, rights)) in expected.into_iter().enumerate() {
+        let capability = caps[index]
+            .as_ref()
+            .expect("provider startup grant missing");
+        let description = libkernel::ipc::object::query(capability.as_handle())
+            .expect("provider grant query failed");
+        assert!(
+            description.kind == kind as u32 && description.rights == rights,
+            "provider startup grant role or rights invalid"
+        );
+    }
+    let bootstrap =
+        MailboxSender::from_capability(caps[0].take().expect("validated bootstrap grant"))
+            .map_err(|f| f.error)
+            .expect("provider bootstrap sender invalid")
+            .0;
+    let release = caps[1].take().expect("validated release grant").into_raw();
+    let route = caps[2].take().expect("validated route grant").into_raw();
+    let registration = caps[3]
+        .take()
+        .expect("validated registration grant")
+        .into_raw();
+    let pool = caps[4].take().expect("validated Pool grant");
     let mailbox = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
         .expect("provider mailbox creation failed");
     server::run(
         mailbox,
-        bootstrap,
-        route,
-        release,
-        registration,
-        pool,
-        instance,
+        server::Startup {
+            bootstrap,
+            route,
+            release,
+            registration,
+            pool,
+            profile,
+            parent_pid: process.parent_pid(),
+        },
     );
 }

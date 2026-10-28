@@ -113,46 +113,64 @@ Preparation 首次失败后冻结状态，重复 advance 返回同一错误。�
 
 平台入口以一次性StartupInput建立affine `StartupSeed`；`libprocess::context::StartupContext::adopt(seed)`先验证格式、索引和句柄去重，再Query全表核实可采用role，最后提交Capability owners。失败返回原Seed，不析构原始grant。入口descriptor的Control被转给`libthread::ThreadRegistry`，普通grant由runtime startup API显式转交。出生映像随目标地址空间持有，回收由[mm](mm.md)的View/地址空间退休路径承担。
 
-## init/pm 当前政策
+## init 的静态部署与根监督
 
-`user/services/srv_init` 把 opaque payload 当作私有 ustar，建立：
+[`srv_init::deployment`](../../user/services/srv_init/src/deployment.rs) 拥有编译期部署。`system` 只接受一个文件宿主、设备与驱动管理者及三份按需驱动映像；完整输入先核缺失和重复，内核不解析服务名单。正式拓扑为：
 
 ```text
 root
 ├─ init
 └─ services
-   ├─ device_management
-   │  └─ srv_device
-   ├─ driver_management
-   │  └─ srv_driver
-   ├─ drivers
-   │  └─ 按实际绑定启动的 PCI / xHCI / HID worker
-   ├─ srv_fs（A、B）
-   ├─ srv_pm
-   ├─ pm_domain
-   └─ acceptance
+   ├─ device_management → srv_device
+   ├─ driver_management → srv_driver
+   ├─ drivers → 按实际设备启动的 PCI / xHCI / HID worker
+   └─ srv_fs（文件与独立 registry）
 ```
 
-core/stress 中，init 以 `libprocess::RequiredLaunchSet` 声明式 manifest 要求 `srv_device`、`srv_driver`、`srv_fs`、`srv_pm`、acceptance target 和 pm-domain target 全部存在并成功启动；真实 PCI/xHCI/HID 的声明与 sealed 映像交同一 srv_driver 装配，驱动按实际设备出现而激活。`test_fp` 按 execution domain 可选，stress 档另要求 hammer 映像。必选缺失/失败使整个 stage 失败并由 services JobControl 收束，不继续发布正常拓扑。memory 只要求同一启动包中的 hammer 映像，不启动这些服务。设备管理者的 Start 前持续观察与故障终局见[设备实现](device.md#init-的管理者监督)。
+init 在初始化后继续承担这一必需集合的根监督。没有应用不提交停止，空闲交原 Assembly 等真实来源；System 不运行 pm、secondary、test_fs、test_target 或压力负载。服务管理器、initfs 服务描述、恢复和持久化尚未接入；未来服务管理器管理的普通后代不能仅因进程树位置升级为根必需宿主故障。
 
-srv_device、srv_driver 分别位于 device_management、driver_management 子域，worker 位于同级 drivers Job；三个 Job 都由 init 在 services 下创建，驱动 Job 委托 srv_driver 使用。常规 fs/pm 服务是 services 的直接成员。init 的 RootSupervisor 在子服务启动前持有长期责任槽并预备 services 的待命 Job 机器；普通子进程启动成功后将 ProcessControl 移入预留账本；两设备管理者在 Start 前已由各自管理记录持有 PreparedProcess 并挂好 DONE 来源。辅助 Job、启动 mailbox、委托副本和流控通知均先预备根能力槽再创建；脚本借用 handle，pm sender 保持 typed owner，只有内核 Grant/Send 确认消费才从账本移交。关闭失败保留原 owner，活动 Job 借用的 root 不提前关闭。Process、Job、读取与待关闭 Runtime 的失败保留原机器、世界和结果，由同一个根组合等待与推进，不能只把裸 target 放回集合重新构造。只有 DONE 已观察和 Dead 快照成立后才兑现 control。pm 经出生块 grants 获得 Handle[0] mailbox owner 和 Handle[1] pm_domain JobControl；后者 rights 为 `MANAGE | READ | WAIT`，不含 CREATE。pm 使用正式 JobDriver 收束委托域，运行体以每轮一项推进；测试邮箱持续停驻到域完成后的 shutdown，回调确认 Active 登记实际消费 stop，最终检查注销与额度退款；不可恢复失败调用 ProcessAbort，由 init 的独立管理能力接管。具体结构与失败政策见 [runtime.md](runtime.md)。
+RootSupervisor 在 bind_services 时准备系统 Terminal，持续保有 services 的待命 JobCollector、平台封口与 reset 权限。实例观察由 [`supervision`](../../user/services/srv_init/src/supervision.rs) 在同一 Assembly 的 Runtime 推进，容量来自部署实际同时存在的实例及其来源种类；System 三个，验收可另有 secondary。`Record` 独占 PreparedProcess 或 Running Control，并保存唯一 PID/DONE 快照。`start_instance` 完成启动后只返回 PID；需要当前进程状态的装配者通过 `instance_snapshot` 查询原 Record 的 Control，不接管或复制它。设备 SourceAdmin 和文件 Bootstrap 分别持各自领域结果，完成谓词分别读取设备 Closed、文件 Stopped。DONE 与 fs bootstrap 来源实际 registered 后才消费 Start；gate、停止意图与 fs 启动绝对期限在 Start 前复核。
 
-`srv_fs` 的启动接缝前三项是 init 预建的 bootstrap Mailbox sender、release Notification owner、独立文件管理 Mailbox owner；A 的第四项为 registry Mailbox owner，B 的第四项为 publication handoff inbox owner，另取得实际 Pool grant。init 以同一映像启动两个 provider，为每个实例分别创建监督槽与 ProcessControl；provider 主线程运行正式 Runtime。A 从同一 Budget 的 H/A/B 账户发行有序 A/B 文件、服务目录、发布授权及管理 sender，Lifetime 来源准入后再交 bootstrap Packet，init 采用、保管并向 test_fs 交付 B 组。B 的 exact-name 发布授权经其 inbox 单独交付；B 用单步 Register 发布普通文件入口，init 和消费者通过 A 的 WatchName→Query→GetEntry 取得该真实入口并绑定各自 Namespace，没有 PublishReady 或 ServiceRecord 文件投影。管理根与普通文件根分开接收、付款绑定及关闭，Binding 业务由实际管理协议提交。release 由 provider Runtime 观察，停止新入口/下游后先收束业务，再封运输与来源；provider 最后通过 bootstrap 返回 `ProviderReport`。所有启动 grant 消费、能力交付、release、报告及关闭均进入 RootSupervisor 原账本，失败持原 owner；启动协议由 [boot](../../user/services/srv_fs/src/server/boot.rs) 和 [init](../../user/services/srv_init/src/main.rs) 直接实现。
+root 每次接收先推进实例 DONE/已知故障，再推进调用、装载、普通批次与客户端，每个任务每轮有界。必需宿主未提交停止就 Completed、异常 DONE、启动或停止失败均封新工作，进入同一个 `system_failure`，不重启、不由用户 fault 触发 kernel panic。Terminal 有界封来源、平台与执行后 ColdReboot/SystemFailure；reset 拒绝则终止 init，boot 的原 DONE owner 接管停驻。观察运行体退休不销毁系统 Terminal。
 
-acceptance Job 收容一次性 IPC、Job 与可选竞态负载，结束后整域 job_kill。`srv_init` 默认编译为 core workload，运行确定性内存、IPC、Tunnel、Job、文件/服务目录及监督契约；`acceptance-stress` feature 在同一用户态编排器中追加 control/Tunnel 重复压力、非空集合自动退休与只读终态观察和完整 16/16 竞态矩阵。`acceptance-memory` 启用同一竞态模块，但只在 services 下建立一个子 Job，复用 `race::thread_memory_suite` 的 test_hammer 目标；等待 Dead/Completed，确认 control/发令权关闭，再经原 RootSupervisor 收束 Job、关闭其 authority 并核根辅助能力账本。该路径不启动其他服务，也不声明整套业务覆盖；失败仍由原 services 兜底监督持有责任。
+### 文件宿主与授权
 
-profile 只改变 initfs 是否携带 `test_hammer` 及 init 的剧本分支，内核、StartupBlock 与 syscall ABI 均不感知。initfs镜像打包时对副本执行strip-all，PT_LOAD几何及内容不变，构建目录保留完整调试ELF；128 MiB sifive_u 上 A/B provider 与测试进程可同时装载，不减少用户程序的装载段或取消其他验收。init 在所选负载完成资源收束后，先以错误对象和裁剪掉 `MANAGE` 的 SystemReset 副本验证 capability 负路径，再直接提交 `Shutdown + Requested`。平台拒绝时记录明确错误并终止 init，boot 的预付 DONE 观察提交运行停驻；实际 DMA 保留由内核稳定 owner 承担。当前不经独立电源服务转发。
+[`srv_fs::startup`](../../user/services/srv_fs/src/startup.rs) 定义私有版本 1、profile 两个 little-endian u32；仅接受 System/AcceptancePrimary/AcceptanceSecondary，拒绝旧空串和 `secondary` 字符串。五项应用 grant 为 bootstrap sender、release Notification owner、文件管理 receiver、registry receiver 或 secondary 发布 inbox、实际 Pool；采用前核 count、真实 kind 与准确 rights。profile 选择入口和容量，不授予权限。
 
-[`srv_init::device`](../../user/services/srv_init/src/device.rs) 为设备管理者建立独立 Job/Pool，页预算使用公共 ABI 主栈大小加运行空间，metadata 单独计量；Pool、Job、bootstrap 先进入根账本，Process 监督槽在 spawn 前预留。出生 grant 为私有 bootstrap sender、实际 Pool、只读平台描述与按描述记录同序排列的真实控制别名；原平台根 owner 继续留 init。16 字节用户态委托头只含版本和数量，槽布局由 libdevice::startup 拥有。设备服务在任何 take 前用 InitialGrants::remaining 核实际应用能力数，再逐项核实际槽和对象；remaining 从原 Option 表计算，不含 runtime 已采用的入口控制槽，len 仍表示完整数组几何。Grant 成功或已消费失败均兑现原监督账本。
+System 与 Primary 同时运行文件与 registry，分别发行一组、A/B 两组文件/管理/目录/发布根；Secondary 只发行管理根，文件根沿原单步 Register 发布 `fs.secondary`。同一 [`boot`](../../user/services/srv_fs/src/server/boot.rs) 创建 backend、业务与控制 ingress、release、retire、运输及根任务；必要来源真实安装后才交根、注册和 Ready。停止先到时不发布，已领取未移交的 sender 立即释放。
 
-设备就绪消息仅接受本次独占 bootstrap context 和预期 PID；两份实际 MailboxSender 须关联消息声明的 registry incarnation，且角色 context 不同。init 查询目标仍 Running 后，发行真实观察来源并核其不能派生权限。签发无法确认时封根并交原服务监督收束，不创建替代来源。服务私有就绪等待平台 PCI host 的真实登记回执；零根平台不制造设备。init 通过观察来源订阅真实 Watch，Query 后枚举实际平台记录，核 DeviceId/incarnation、身份、名字与资源上界，Ack 旧序号并检查通知已清，再读取 OAL 根及与根委托一致的页。正常停止先封观察来源，等待 Watch 的 Revoked 通知、Query/Ack 终态并释放订阅，再封根，再关闭入口，等待 DONE 并核 Dead/Completed/NONE detail；之后原 RootSupervisor 收束进程、管理 Job 和 Pool。core/stress 在短寿命服务的批次收集验收前完成这一步，避免将仍需显式 Stop 的管理者当作会自然退出的测试进程。服务内的角色、付款与长期任务见 [device 实现](device.md#srv_device-宿主)。srv_driver 由独立管理记录启动，负责 PCI/xHCI/HID 的选择、激活及 worker 收集；init 通过管理 Stop 和来源封口等待这条实际设备责任链结束，硬件停止由各 provider 承担。
+[`filesystem::Host::launch`](../../user/services/srv_init/src/filesystem/launch.rs) 逐步用共用 ELF Validation 计算 load runs，独立 Pool 页数为实际 runs＋ABI 主栈＋出生页＋显式堆工作集；ProcessCreate 与交给宿主的 Pool grant 为同一付款身份。启动阶段取一个部署绝对期限，准备失败按 GrantOutcome 兑现未消费能力，Building 取消交原 Collector。root 在移交前查询私有 sender context，预期 PID 来自 PreparedProcess。
+
+[`Bootstrap`](../../user/services/srv_init/src/filesystem/hosting.rs) 持预付 ReceiveBuffer/有限报文存储，以及私有 receiver、停止 signaler、Pool 的唯一生命周期关联；这些 capability 的关闭 owner 仍在 root 能力账本，装配和停止通过原实例记录借用。每轮只领取一条报文，核原 context/PID、空正文、准确能力数和 typed sender 权利；四根按 kind 收齐，重复或额外消息拒绝。认证 Ready、真实 Process 仍 Running 且 root gate 开放后才取出 Host。Host 只持业务根、入口身份和实例关联，不保存进程 Control/PID 或上述生命周期句柄。正式根由 RootSupervisor.system_host 保管；验收根交对应消费者，管理与发布母权留 init。
+
+文件 Derive 按路径/FsRights 缩权；目录交付只能使用已有 Scope::Root 与 DESCRIBE/ENUMERATE/GET_ENTRY/WATCH 角色的别名，没有远程目录 Derive，不以去掉 GRANT 冒称目录业务缩权。需要发布的消费者通过 DelegateName 取得 exact-name 角色。注册发现、endpoint 可用、Ready、DONE 分别表达不同事实，不自动重绑已有 Namespace。
+
+### 停止与收集
+
+内部 `request_stop` 单调保存动作、StopPhase 与冻结总期限，Seal services 并封本地 Start/交付；重复同一动作返回原阶段，不能刷新期限或换动作。其责任集合来自原记录，包含尚未 Ready/Start 的实例，不由调用者传入可遗漏的 Host 清单。阶段为 Consumers→Files→Devices→Root→Completed。root 的客户端和普通受管进程先沿原 owner 收束，正式自持根随后释放；文件按 secondary 在 primary 前的顺序，之后交原设备安全链。总期限进入 root 的最早等待与到期升级，覆盖来源注销、取消、Collector 和 services Job 收集。
+
+fs 由 `begin_filesystem_stop` 从原记录取得停止接点，先记 Stopping/绝对期限再 signal release。宿主封普通准入，原流、Copy、映射、注册、Watch 和来源继续退休，Runtime/Assembly 与领域账户收空后发 Stopped，再正常退出。root 保存认证 Stopped 和真实 Dead/Completed/NONE DONE 两项事实；顺序任意，缺项到期失败，异常 DONE 不被 Stopped 掩盖。DONE 先到仍保留原 receiver；到期逐条排空已有有限报文后才裁决缺报告。停止中迟到根核验后立即释放，迟到 Ready 不重新开放交付。
+
+`detach_filesystem` 汇齐两项事实、实际注销两来源后返回唯一待收集进程。正式停止立即交给原 Collector，控制权移交之间没有可失败操作；`close_filesystem_report` 确认来源已注销后才关闭停止与报告接点，最后关闭 Pool 的本地 owner。正式停止报告实际余额，不等待外域仍持有的 backing；零账不是设备安全或正常停止谓词。
+
+设备仍按实际 Source Closed、Binding/Provision 安全与管理进程正常 DONE 完成，父供应保留到后代清理结束。最后由原 JobCollector 收集 services、关闭辅助根并标记 Completed，init 才提交 Requested reset。运行证据及未覆盖交错由服务装配唯一工作记录拥有。
+
+### 验收装配
+
+默认 core、stress、memory、device 仍为独立编译期验收选择，与 system feature 互斥。普通 pm/Tunnel/Job/进程创建 ABI 自检在基础宿主出生前完成，避免全局 Seal 后继续创建目标。core/stress 后半段通过同一 Host::launch 和设备装配运行真实消费者；secondary 保留非空 Copy/Watch 停止，primary 保持运行至全局 request_stop，随后接原 Driver/Device 停止链。
+
+pm 是 services 的普通短任务，出生 grants 为 mailbox receiver 与不含 CREATE 的 pm_domain JobControl，按正式 JobDriver 收束委托域。它与验收进程不进入根必需集合。[`filesystem::acceptance`](../../user/services/srv_init/src/filesystem/acceptance.rs) 拥有局部批次交接与退款验收：`track_stopped_host` 先预留接管容量，再取得已完成 Stopped/DONE 且来源实退的唯一 Control，立即纳入原批次后才关闭报告接点。`collect_pool_after_batch` 以完成的 pm 和该 secondary 覆盖 partial-admission/独立失败隔离，批次收集后从原 Bootstrap 取 Pool 核双维退款并关闭。正式宿主不组织这些验收步骤，验收也不另持一份长期监督账本。
+
+reset capability 的对象类型/权限负测由 `check_acceptance_reset_authority` 在验收收尾执行；`submit_shutdown` 消费已完成停止意图中的动作与原 reset authority，提交最终系统动作。
+
+test_fp 按 execution domain 可选，stress 另要求 hammer 映像；memory 仅复用线程/映射消费者，不启动基础宿主。构建只向 System initfs 放实际必需映像，验收保留正式消费者，strip 只操作归档副本。所有模式继续由同一 BootPackage/启动 ABI 装载，运行记录不写入本实现篇。
 
 ## 验证
 
 - shared host：BootPackage/出生块 canonical geometry、零 padding 与空 payload；
 - capability host：claim/restore、Close/shut 撤返还、rights 收窄、安装预约、真实持有数与 zero policy；
 - libprocess host：ELF 前置、必选映像缺失/启动失败与非法 supervision policy 在 syscall 前拒绝并返还 authority；
-- 工程静态门：`just clippy` 以 `-D warnings` 分别覆盖 shared/os/user host、kernel/user RISC-V、stress/memory feature 与独立 gc target，完整日志写入 `artifacts/lint/`；`acceptance-core` 与完整 `acceptance` 在启动 QEMU 前执行该门；
+- 工程静态门：`just clippy` 以 `-D warnings` 覆盖 shared/os/user host、kernel/user RISC-V、stress/memory/device/resource/System feature 与独立 gc target，共十一个分面，完整日志写入 `artifacts/lint/`；`acceptance-core` 与完整 `acceptance` 在启动 QEMU 前执行该门；
 - QEMU 常规回归：`acceptance-core` 组合静态门、无调试器 debug stress 与 release core。`virt` 提供 debug core；`virt-stress` 保留重复压力、非空 WaitSet 自动退休与 16/16 竞态矩阵；`virt-release` 覆盖优化代码生成和 trap 寄存器保持。完整 core/stress wrapper 核验 workload、必选拓扑、RPC reject cleanup、监督 authority、Tunnel 和 IPC 等实际业务锚点。
 - 平台与故障：`acceptance-platforms` 运行完整 core 的 sifive_u/nofd，默认 release，可在单条 recipe 显式选 debug；hetero 在调度域变更时额外运行。`acceptance-faults` 包含 Boot/IPI/VM fault/VM repair/DMA retention。VM fault 使用 memory workload，GDB 观察真实 RetryFault 后 detach，wrapper 核线程完成、Job/辅助能力收束和 reset；不再重复 FS/PM 与整套 stress。VM repair 是受限现场诊断，不声明完整业务收束。
 - 完整 `acceptance` 组合上述三组，各路线只执行一次。正常 virt 必须由 QEMU 正常退出证明 shutdown 后端成功；`sifive_u` 在内核明确返回 reset 失败后主动收割，仍须满足完整 core 锚点。触发选择由[构建手册](../../plans/BUILD-AND-TEST.md)拥有；内部契约的未覆盖部分由所属计划记录。

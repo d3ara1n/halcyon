@@ -104,7 +104,7 @@ class Qmp:
         self.socket.close()
 
 
-def inject_process_fault(kernel, port, pid, role="HID", start_target=None, reject_reset=False, arm_path=None, loading=False):
+def inject_process_fault(kernel, port, pid, role="HID", start_target=None, reject_reset=False, arm_path=None, loading=False, stopping=False):
     # 复用正式trap入口和调试类型，只模拟目标PID的一次非法指令异常；不改设备/供应事实。
     logs=debug.fresh_logs(Path("artifacts/device-fault"))
     symbols=debug.symbols(kernel)
@@ -113,7 +113,7 @@ def inject_process_fault(kernel, port, pid, role="HID", start_target=None, rejec
                 if start_target else "")
     loader = None
     if loading:
-        image = Path("artifacts/initfs/bin/test_target")
+        image = Path("artifacts/initfs/bin/srv_fs")
         data = image.read_bytes()
         header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
         first = next(struct.unpack_from("<IIQQQQQQ", data, header[5] + i * header[9])
@@ -143,14 +143,15 @@ armed={start_target is None}
 START_TARGET={json.dumps(str(start_target)) if start_target else "None"}
 ARM_PATH={json.dumps(str(arm_path)) if arm_path else "None"}
 LOADER={repr(loader)}
+STOPPING={repr(stopping)}
 loader_builder=None
 loading_verified=False
 {debug.user_trap_context(kernel,entry)}
-{debug.USER_MEMORY if loading else ""}
+{debug.USER_MEMORY if loading or stopping else ""}
 class TargetTrap(gdb.Breakpoint):
     def stop(self):
         global matched,TARGET,armed,loader_builder
-        if not armed and (LOADER is None or not Path(START_TARGET).exists()):return False
+        if not armed and not STOPPING and (LOADER is None or not Path(START_TARGET).exists()):return False
         if int(gdb.parse_and_eval('$a0'))!=8:return False
         anchor=int(gdb.parse_and_eval('$tp')) & ((1<<64)-1)
         pointer=word(anchor+hart_offsets['current_thread'])
@@ -184,7 +185,31 @@ class TargetTrap(gdb.Breakpoint):
         self.enabled=False
         print('DEVICE_PROCESS_FAULT_INJECTED pid=%d frame=%#x hart=%d' % (TARGET,frame,gdb.selected_thread().num))
         return True
-TargetTrap('*{entry:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
+target_probe=TargetTrap('*{entry:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
+if STOPPING:
+    target_probe.enabled=False
+    class StopGate(gdb.Breakpoint):
+        def stop(self):
+            global TARGET,armed
+            target=Path(START_TARGET)
+            if not target.exists():return False
+            frame=int(gdb.parse_and_eval('$a0')) & ((1<<64)-1)
+            pointer=int(gdb.parse_and_eval('$a1')) & ((1<<64)-1)
+            shell=word(pointer+process_offset+ptr_offset+pointer_offset)
+            if word(shell+data_offset+pid_offset)!=1:return False
+            if frame!=pointer+thread_offsets['frame']:raise gdb.GdbError('stop gate frame owner mismatch')
+            registers=frame+context_offsets['x']
+            length=word(registers+11*8)
+            if length>4096:return False
+            message=user_memory(word(pointer+thread_offsets['satp']),word(registers+10*8),length)
+            if b'instance observer normal stop intent: role=Filesystem,' not in message:return False
+            TARGET=int(json.loads(target.read_text())['pid'])
+            armed=True
+            target_probe.enabled=True
+            self.enabled=False
+            print('DEVICE_PROCESS_STOP_GATE target_pid=%d; root normal stop intent committed' % TARGET)
+            return False
+    StopGate('*{symbols['kernel::syscall::debug_print']:#x}',type=gdb.BP_HARDWARE_BREAKPOINT)
 class StartGate(gdb.Breakpoint):
     def stop(self):
         global TARGET,armed
@@ -203,7 +228,7 @@ class StartGate(gdb.Breakpoint):
         self.enabled=False
         print('DEVICE_PROCESS_PRE_START pid=%d shell=%#x; members not published' % (TARGET,shell))
         return False
-if START_TARGET is not None and LOADER is None:
+if START_TARGET is not None and LOADER is None and not STOPPING:
     StartGate({json.dumps("'" + start_gate + "'")},type=gdb.BP_HARDWARE_BREAKPOINT)
 if ARM_PATH is not None:
     Path(ARM_PATH).write_text("armed\\n")
@@ -300,7 +325,7 @@ def main():
     parser.add_argument("--reuse",action="store_true")
     parser.add_argument("--candidates", action="store_true")
     parser.add_argument("--retry-race", action="store_true")
-    parser.add_argument("--manager-fault", choices=("Device", "Driver"))
+    parser.add_argument("--manager-fault", choices=("Device", "Driver", "Filesystem"))
     parser.add_argument("--worker-fault", choices=("Xhci",))
     parser.add_argument("--unknown", choices=rpc_probe.OPERATIONS)
     parser.add_argument("--function-session", action="store_true")
@@ -340,7 +365,7 @@ def main():
     if args.irq_idle and not args.irq_retirement:
         parser.error("all-idle insertion uses the real IRQ retirement consumer")
     if args.fault_phase == "loading" and args.manager_fault != "Driver":
-        parser.error("loading fault observes the real post-Driver test_target preparation")
+        parser.error("loading fault observes the real post-Driver filesystem preparation")
     if args.reject_reset and not (args.worker_fault or (args.manager_fault == "Device" and args.fault_phase == "wait")):
         parser.error("reset rejection needs a real Device manager or physical worker failure with active DMA")
     fault_scenario = bool(args.manager_fault or args.worker_fault or args.unknown == "Claim")
@@ -433,15 +458,21 @@ def main():
         listener.bind(("127.0.0.1", 0))
         gdb_port = listener.getsockname()[1]
     early_fault = None
-    early_verified = args.fault_phase not in ("start", "loading")
+    prearmed = bool(args.manager_fault and (args.fault_phase in ("start", "loading") or
+                       (args.manager_fault == "Filesystem" and args.fault_phase == "stopping")))
+    early_verified = not prearmed
+    delivery_rejected = False
+    reset_boundary_stopped = False
     manager_faulted = False
     early_target = private / "target.json"
     try:
         process = subprocess.Popen(command + ["-qmp", f"unix:{qmp_path},server=on,wait=off", "-gdb", f"tcp:127.0.0.1:{gdb_port}"] +
-                                   (["-S"] if args.manager_fault and args.fault_phase in ("start", "loading") else []),
+                                   (["-S"] if prearmed else []),
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        if args.manager_fault and args.fault_phase in ("start", "loading"):
-            early_fault = inject_process_fault(kernel,gdb_port,0,args.manager_fault,early_target,loading=args.fault_phase == "loading")
+        if prearmed:
+            early_fault = inject_process_fault(kernel,gdb_port,0,args.manager_fault,early_target,
+                                               loading=args.fault_phase == "loading",
+                                               stopping=args.fault_phase == "stopping")
         selector.register(process.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + args.timeout
         pending = b""
@@ -454,6 +485,8 @@ def main():
                 verify_process_fault(logs,child.returncode,managers.get(args.manager_fault),args.manager_fault,args.fault_phase == "start")
                 if args.fault_phase == "loading" and "DEVICE_PROCESS_LOADING_FAILURE_VERIFIED" not in (logs/"process-fault.log").read_text():
                     raise RuntimeError(f"loading fault lacks unfinished loader evidence: {logs}")
+                if args.fault_phase == "stopping" and "DEVICE_PROCESS_STOP_GATE" not in (logs/"process-fault.log").read_text():
+                    raise RuntimeError(f"stopping fault lacks root intent gate evidence: {logs}")
                 early_fault=None
                 early_verified=True
             if physical_debugger:
@@ -558,11 +591,14 @@ def main():
                             event.get("data", {}).get("guest") is True for event in qmp.events)
                 if args.reject_reset and reset:
                     raise RuntimeError("reset rejection unexpectedly rebooted the guest")
+                if reset and not args.reject_reset and not reset_boundary_stopped:
+                    qmp.call("stop")
+                    reset_boundary_stopped = True
                 boundary=(reboot_rejected and initial_done) if args.reject_reset else reset
                 # reset拒绝由原DMA观察体核init DONE/四hart停驻；主线也可合法先取得唯一终局。
                 fault_proved = (physical_faulted and physical_manager_failed and fault_done and physical_verified) if args.worker_fault else (
                     (unknown_observed and fault_done) if args.unknown else
-                    (manager_faulted and (fault_done or args.fault_phase not in ("start", "loading"))))
+                    (manager_faulted and (fault_done or delivery_rejected or args.fault_phase not in ("start", "loading"))))
                 if boundary and reboot_accepted and fault_proved and early_verified:
                     if failure_terminal != 1 or not job_sealed or not platform_sealed:
                         raise RuntimeError("manager failure lacks one terminal owner or committed seals")
@@ -590,7 +626,7 @@ def main():
                     line = raw.decode("utf-8", errors="replace")
                     print(line, flush=True)
                     if args.irq_exit:
-                        if "device observer admitted before Start: role=Device," in line:
+                        if "instance observer admitted before Start: role=Device," in line:
                             irq_exit_debugger = irq_exit_probe.start(kernel, gdb_port, irq_exit_target)
                         admitted = re.search(r"IRQ exit target admitted: mode=(\S+), pid=(\d+), source=(\d+), generation=(\d+)", line)
                         if admitted:
@@ -608,7 +644,7 @@ def main():
                             if (record.get("pid"), record.get("source"), record.get("generation")) != (int(pid), int(source), int(generation)):
                                 raise RuntimeError("IRQ exit cleanup changed the original target/use")
                             record["closed"] = True
-                        if "device failure terminal entered:" in line:
+                        if "system failure terminal entered:" in line:
                             raise RuntimeError("IRQ exit entered failure terminal")
                         if "system reset accepted: action Shutdown, reason Requested" in line:
                             if not irq_exit_verified or set(irq_exit_records) != irq_exit_probe.MODES or not all(r.get("closed") for r in irq_exit_records.values()):
@@ -617,7 +653,7 @@ def main():
                             stage = 41
                         continue
                     if args.dma_races or args.dma_shared or args.dma_quota or args.dma_install_failure:
-                        if (args.dma_races or args.dma_install_failure) and "device observer admitted before Start: role=Device," in line:
+                        if (args.dma_races or args.dma_install_failure) and "instance observer admitted before Start: role=Device," in line:
                             dma_debugger = (dma_install_probe if args.dma_install_failure else dma_probe).start(kernel, gdb_port, dma_target)
                         admitted = re.search(r"DMA race target admitted: mode=(\S+), pid=(\d+), scope=(\d+), memory=(\d+), identity=(\d+)", line)
                         if admitted:
@@ -661,8 +697,8 @@ def main():
                                 if dma_records.get("dma-pin-quota", {}).get("pid") != int(observed[1]):
                                     raise RuntimeError("DMA quota recovery changed the actual target instance")
                                 dma_quota_verified = True
-                        if "device failure terminal entered:" in line:
-                            raise RuntimeError("DMA races entered device failure terminal")
+                        if "system failure terminal entered:" in line:
+                            raise RuntimeError("DMA races entered system failure terminal")
                         if "system reset accepted: action Shutdown, reason Requested" in line:
                             verified = dma_quota_verified if args.dma_quota else (dma_shared_verified if args.dma_shared else dma_verified)
                             if args.dma_install_failure:
@@ -673,7 +709,7 @@ def main():
                             stage = 41
                         continue
                     if args.mmio_publication or args.mmio_forced:
-                        if "device observer admitted before Start: role=Device," in line:
+                        if "instance observer admitted before Start: role=Device," in line:
                             mmio_debugger = (mmio_forced_probe if args.mmio_forced else mmio_probe).start(kernel, gdb_port, mmio_target)
                         admitted = re.search(r"MMIO publication target admitted: mode=(mmio-before|mmio-after|mmio-forced-queued|mmio-forced-publishing), pid=(\d+), scope=(\d+)", line)
                         if admitted:
@@ -719,8 +755,8 @@ def main():
                             if not record.get("done"):
                                 raise RuntimeError("MMIO Pool closure lacks its live-VM revoke proof")
                             record["refunded"] = True
-                        if "device failure terminal entered:" in line:
-                            raise RuntimeError("MMIO publication entered device failure terminal")
+                        if "system failure terminal entered:" in line:
+                            raise RuntimeError("MMIO publication entered system failure terminal")
                         if "system reset accepted: action Shutdown, reason Requested" in line:
                             expected = mmio_forced_probe.MODES if args.mmio_forced else {"mmio-before","mmio-after"}
                             if not mmio_verified or set(mmio_records) != expected or not all(r.get("refunded") for r in mmio_records.values()):
@@ -729,7 +765,7 @@ def main():
                             stage = 41
                         continue
                     if args.function_session:
-                        admitted = re.search(r"device observer admitted before Start: role=Device, pid=(\d+),", line)
+                        admitted = re.search(r"instance observer admitted before Start: role=Device, pid=(\d+),", line)
                         if admitted:
                             function_debugger = function_probe.start(kernel, gdb_port, function_address, irq_target if args.irq_retirement else None, args.irq_idle)
                             if args.irq_retirement: qmp = Qmp(qmp_path)
@@ -795,7 +831,7 @@ def main():
                                 if not irq_rounds.get(round_,{}).get("sequence"):raise RuntimeError("IRQ binding Released without actual taken token")
                                 qmp.call("device_del", {"id":f"irq-{round_}"})
                                 qmp.wait_deleted(f"irq-{round_}")
-                        if "device failure terminal entered:" in line:
+                        if "system failure terminal entered:" in line:
                             raise RuntimeError("function session entered failure terminal")
                         if "system reset accepted: action Shutdown, reason Requested" in line:
                             if not function_verified or not function_passed or not function_old_rejected or set(function_rounds) != {1,2} or not all(r.get("released") for r in function_rounds.values()):
@@ -804,7 +840,7 @@ def main():
                             stage = 41
                         continue
                     if args.unknown:
-                        admitted = re.search(r"device observer admitted before Start: role=(Device|Driver), pid=(\d+),", line)
+                        admitted = re.search(r"instance observer admitted before Start: role=(Device|Driver|Filesystem), pid=(\d+),", line)
                         if admitted:
                             managers[admitted[1]] = int(admitted[2])
                             if admitted[1] == "Device":
@@ -855,9 +891,9 @@ def main():
                         matched = re.search(r"PCI EnableMaster committed: epoch=(\d+), context=(\d+)", line)
                         if matched:
                             master_commits.append(tuple(map(int, matched.groups())))
-                        fault_done |= f"device observer manager DONE: pid={managers.get('Driver')}," in line
+                        fault_done |= f"instance observer DONE: pid={managers.get('Driver')}," in line
                         if not fault_scenario:
-                            if "device failure terminal entered:" in line:
+                            if "system failure terminal entered:" in line:
                                 raise RuntimeError("reply-loss recovery entered a fault terminal")
                             if "system reset accepted: action Shutdown, reason Requested" in line:
                                 if not unknown_observed:
@@ -983,7 +1019,7 @@ def main():
                             qmp.call("device_add", {"driver": "usb-kbd", "bus": "xhci.0", "id": "reuseA", "port": "1"})
                             print(f"DEVICE descriptor-absent reprepare safely released: serial={prepare_cancel}; same-port reinsertion requested", flush=True)
                     if args.retry_race:
-                        admitted = re.search(r"device observer admitted before Start: role=Driver, pid=(\d+),", line)
+                        admitted = re.search(r"instance observer admitted before Start: role=Driver, pid=(\d+),", line)
                         if admitted:
                             managers["Driver"] = int(admitted[1])
                         observed = re.search(r"DEVICE Drivers concurrent Retry replies: serial=(\d+), .*thread_joined=true", line)
@@ -992,16 +1028,16 @@ def main():
                                 raise RuntimeError("Retry clients changed the original terminal C")
                             retry_client_verified = True
                     if fault_scenario:
-                        admitted = re.search(r"device observer admitted before Start: role=(Device|Driver), pid=(\d+),", line)
+                        admitted = re.search(r"instance observer admitted before Start: role=(Device|Driver|Filesystem), pid=(\d+),", line)
                         if admitted:
                             managers[admitted[1]] = int(admitted[2])
-                            if args.fault_phase in ("start", "loading") and admitted[1] == args.manager_fault:
+                            if early_fault is not None and prearmed and admitted[1] == args.manager_fault:
                                 pid=managers[args.manager_fault]
                                 early_target.write_text(json.dumps({"pid":pid})+"\n")
                                 evidence=early_fault[2]/"evidence.json"
                                 facts=json.loads(evidence.read_text())
                                 scope = ("real first-page ProcessWrite after Driver admission; same manager actual user fault, unfinished child through root failure" if args.fault_phase == "loading"
-                                         else "pre-Start gate then first actual user ecall; no timing claim")
+                                         else ("root normal stop intent gate then actual user ecall; no timing claim" if args.fault_phase == "stopping" else "pre-Start gate then first actual user ecall; no timing claim"))
                                 facts.update(pid=pid,scope=scope)
                                 evidence.write_text(json.dumps(facts,indent=2)+"\n")
                                 qmp=Qmp(qmp_path)
@@ -1026,22 +1062,33 @@ def main():
                                 if not physical_owner_done or "Unavailable" not in line:
                                     raise RuntimeError("Driver failure did not originate from this physical worker's unconfirmed DONE")
                                 physical_manager_failed = True
-                            fault_done |= f"device observer manager DONE: pid={managers.get('Driver')}," in line
-                        if "device failure terminal entered:" in line:
+                            fault_done |= f"instance observer DONE: pid={managers.get('Driver')}," in line
+                        if "system failure terminal entered:" in line:
                             if stage != 30:
                                 raise RuntimeError("assembly failed before requested manager fault")
                             failure_terminal += 1
                         if args.manager_fault:
                             manager_faulted |= f"pid {managers.get(args.manager_fault)} aborted: scause=0x2 " in line
-                            fault_done |= f"device observer manager DONE: pid={managers.get(args.manager_fault)}," in line
+                            fault_done |= f"instance observer DONE: pid={managers.get(args.manager_fault)}," in line
+                        if args.manager_fault == "Filesystem":
+                            # 仅认可同一注入实例的真实 Faulted 快照；不把交付拒绝计作消费了 DONE。
+                            snapshot = re.search(r"FS host delivery rejected: pid=(\d+), state=(\d+), cause=(\d+), detail0=(\d+), detail1=(\d+)", line)
+                            if snapshot:
+                                pid, state, cause, detail0, detail1 = map(int, snapshot.groups())
+                                delivery_rejected = (pid == managers.get("Filesystem") and state in (2, 3)
+                                                     and cause == 5 and detail0 >> 32 == 2 and detail1 == 0)
+                                if delivery_rejected:
+                                    print("DEVICE Filesystem actual delivery snapshot: " + json.dumps({"pid": pid, "state": state, "cause": cause, "detail0": detail0, "detail1": detail1, "DONE_consumed": False}), flush=True)
                         reboot_accepted |= "system reset accepted: action Reboot, reason SystemFailure" in line
-                        reboot_rejected |= "device failure cold reboot rejected:" in line
+                        reboot_rejected |= "system failure cold reboot rejected:" in line
                         initial_done |= "initial process reached DONE" in line
-                        job_sealed |= "device failure JobSeal committed" in line
-                        platform_sealed |= "device failure platform root Seal committed" in line
-                        trigger = (args.fault_phase == "wait" and stage == 0 and main_waiting and host_waiting) or (
+                        job_sealed |= "system failure JobSeal committed" in line
+                        platform_sealed |= "system failure platform root Seal committed" in line
+                        trigger = (args.fault_phase == "wait" and stage == 0 and (
+                            ("FS consumer phase wait started:" in line) if args.manager_fault == "Filesystem"
+                            else (main_waiting and host_waiting))) or (
                             args.fault_phase == "stopping" and
-                            f"device observer normal stop intent: role={args.manager_fault}," in line)
+                            f"instance observer normal stop intent: role={args.manager_fault}," in line)
                         if trigger and args.worker_fault and physical_pid is not None:
                             if not dma_baseline_retired or rings_configured is None:
                                 raise RuntimeError("physical fault is not linked to the actual live xHCI rings")
@@ -1053,7 +1100,7 @@ def main():
                             facts.update(xhci_rings=rings_configured, scope="live xHCI worker fault after ring address delivery; actual exposed DMA set, ColdReboot rejection/initial DONE/four parks when requested; no DMA-stop or timing claim")
                             evidence.write_text(json.dumps(facts, indent=2)+"\n")
                             stage = 30
-                        if trigger and args.manager_fault in managers:
+                        if trigger and not prearmed and args.manager_fault in managers:
                             if qmp is None:
                                 qmp = Qmp(qmp_path)
                             fault_logs=inject_process_fault(kernel, gdb_port, managers[args.manager_fault], args.manager_fault,

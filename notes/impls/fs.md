@@ -58,7 +58,7 @@ MemoryBackend 的 RetirementState 从实际退休队列与记录计算：Ready �
 
 [StreamTable](../../user/libraries/libfs/src/stream.rs) 由 World 唯一持有。记录拥有业务 State、不可变 Funding、已选择的 NodeRef/AccessSnapshot、Runnel Producer/Consumer、固定起点/读末端、一个消息大小的待接受块，以及 Stream/Offer/Bytes/观察占用。控制身份是实际铸造 sender 的 object_id，不从正文 session_id 授权或选择账户。准备索引、块缓冲和费用先于 Tunnel 出生；创建失败的完整映射、Endpoint、Invitation 留在同一预建记录，由原 Request 在来源注销后逐步关闭。
 
-srv_fs 的 A/B 根由同一全局预算签发；部署 `ENTRY_SESSIONS` 分别限制 Stream/Offer 局部占用，B 可以用尚未被 A 占用的共享容量。Bytes 先于 Tunnel 出生预留映射几何与记录/块存储；局部、共享或 Bytes 拒绝均返回 Quota，CreateOpen 准备沿原 owner 退出，名字尚不可见。Invitation 的完整输出上限还包括 R/WRITE/WAIT/SIGNAL/MANAGE/TRANSIT；只允许普通 sender 必需位的派生 grant 无法输出合法 Invitation，fs 只读权限本身不补这些运输位。
+srv_fs 的 A/B 根由同一全局预算签发；部署 `Capacity::entry_sessions` 按实际 profile 限制 Stream/Offer 局部占用，B 可以用尚未被 A 占用的共享容量。Bytes 先于 Tunnel 出生预留映射几何与记录/块存储；局部、共享或 Bytes 拒绝均返回 Quota，CreateOpen 准备沿原 owner 退出，名字尚不可见。Invitation 的完整输出上限还包括 R/WRITE/WAIT/SIGNAL/MANAGE/TRANSIT；只允许普通 sender 必需位的派生 grant 无法输出合法 Invitation，fs 只读权限本身不补这些运输位。
 
 [建立与控制接缝](../../user/libraries/libfs/src/provider/streams.rs) 位于原 provider Request。创建任务持控制 Lifetime 和数据来源登记、回执及最近期限；业务与 Runnel 不在任务壳复制。Open 固定已选择实例，Read 固定末端但逐块读取实际当前内容。CreateOpen 的名字仍不可见，先备妥两种来源与回复，最终消费原准备事务并插入预建流记录；失败清理原准备，提交后丢失回复不删除名字。
 
@@ -76,9 +76,9 @@ Watch 准备阶段出生 Owner[R|WAIT|MANAGE]、Signaler 和 Observer[WAIT|TRANS
 
 [文件 Watch 协议绑定](../../user/libraries/libfs/src/client/watch.rs) 为 libfs::client::Watch 实现 librpc::subscription::Protocol，负责 Query/Ack 编码、完整响应校验及 WatchInfo 的 sequence/pending/terminal 投影。通知、控制、捕获序号和来源/RPC 收束由[通用订阅客户端](rpc.md#带序号确认的订阅客户端)持有；init 直接组合 ConsumerTask<libfs::client::Watch>，不存在另一份领域客户端状态机。文件目标的重查由应用完成，随后调用 acknowledge_read。
 
-[部署元数据](../../user/services/srv_fs/src/lib.rs) 由 srv_fs package 的同名 library target 拥有，boot 的 Budget、Counter 及任务/来源容量均使用唯一 deployment 常量。ENTRY_WATCHES 拥有有序入口 A/B 的局部政策，WATCHES 拥有同 provider 全局容量；test_fs 由此驱动局部饱和、全局饱和和释放真实 A 控制后 B 恢复，每次请求使用自己的有限期限。CLOSED 仅是观察条件，真正准入恢复才核退款。该元数据不是运行时授权或额度查询，容量改为运行时装配时消费方须同步迁移。
+[部署元数据](../../user/services/srv_fs/src/lib.rs) 由 srv_fs package 的同名 library target 拥有，boot 的 Budget、Counter 及任务/来源容量使用同一 Profile/Capacity。Capacity::entry_watches 表达验收入口 A/B 的局部政策，System 单入口取得全额，WATCHES 拥有同 provider 全局容量；test_fs 由此驱动局部饱和、全局饱和和释放真实 A 控制后 B 恢复，每次请求使用自己的有限期限。CLOSED 仅是观察条件，真正准入恢复才核退款。该元数据不是运行时授权或额度查询，容量改为运行时装配时消费方须同步迁移。
 
-test_fs 的 [quota](../../user/tests/test_fs/src/quota.rs) 和 [Binding 容量消费者](../../user/tests/test_fs/src/binding.rs) 使用 NODES/GRANTS/BINDINGS 界限驱动共享额度拒绝与实际再准入；Node 的总上界包括宿主所有的 root。名字撤销或最后 sender 关闭后，原 provider 继续持物理退休责任，消费者只由后继真实操作成功核可用容量。当前这三类 tenant local 与 provider global 同值；Watch/Session 的独立 local 政策另由 ENTRY_WATCHES/ENTRY_SESSIONS 表达，消费者不新增账户查询接口。
+test_fs 的 [quota](../../user/tests/test_fs/src/quota.rs) 和 [Binding 容量消费者](../../user/tests/test_fs/src/binding.rs) 使用 NODES/GRANTS/BINDINGS 界限驱动共享额度拒绝与实际再准入；Node 的总上界包括宿主所有的 root。名字撤销或最后 sender 关闭后，原 provider 继续持物理退休责任，消费者只由后继真实操作成功核可用容量。当前这三类 tenant local 与 provider global 同值；Watch/Session 的独立 local 政策另由 Capacity::entry_watches/entry_sessions 按 profile 表达，消费者不新增账户查询接口。
 [Client](../../user/libraries/libfs/src/client.rs) 直接组合Namespace、RPC Exchange与FollowLimits。Get/Set/Create/Remove、小 I/O 和 ReadLink 直接发送带剩余路径的文件请求，只有已验证 Boundary 才由同一 Walk 接续；没有 DirectoryGrant、Position 或强制前置 Lookup。本地 FromProperty 检查类型和范围；纯数组通过已验证 Property 视图逐项使用。Rename 先在原 FollowBudget 中规范化完整目标路径、计入末名字，再取父目录/名字并派生目标父真实授权，把同一预算交给源提交；派生回复先校验 sender 的实际角色和完整 requested Rights，再 take 转 typed owner。请求字节缓冲先 try_reserve_exact，失败在 RPC 投递前返回 OutOfMemory，不进入 allocator abort 或重放变更。Watch 路径创建和控制 Query/Ack/Cancel 已接通，控制与 Observer 两角色按各自身份采用；Open/CreateOpen 返回 StreamOffer、控制 sender 和实际 invitation，stream_control 解码固定 StreamInfo。正式流消费由 test_fs 接入，Copy 消费由 init 原任务族接入。
 
 ## Copy 组合与清理 owner
@@ -93,4 +93,4 @@ test_fs 的 [quota](../../user/tests/test_fs/src/quota.rs) 和 [Binding 容量�
 
 [init 的 Copy 消费](../../user/services/srv_init/src/filesystem/copy.rs) 由既有 InitTask/ReadDuty/Assembly 组合，客户段按实际数量准入独立 Copy 与唯一 Dispatcher，各任务仍独立持来源/取消/清理。ReadWorld 的 copies 按客户保存 outcome/progress/done/hold，不复制未消费的 creation。全部客户清理后由共用 await_transport 封运输，回复来源退出后唤醒原客户完成退休；两类 Watch 使用同一收尾方法。短期编排暂停保留业务期限；Task::stop 先撤暂停再交任务收束。根等待辅助遇 duty.error/提前结束立即返回原监督者，不吞掉失败。init→test_fs 的命令/报告元数据依赖单向，共同 PHASE_TIMEOUT_MILLIS 拥有阶段期限；消费者的命令等待保留有限退出界，不借用单次文件 RPC 的期限。
 
-[init 消费者](../../user/services/srv_init/src/filesystem.rs) 分别持文件根、service 目录和发布根，服务发现通过 WatchName→Query→GetEntry，取得入口后本地 Namespace.bind 再调用文件协议。[独立文件消费者](../../user/tests/test_fs/src/main.rs) 从普通共享 sender 建 Namespace，使用属性、数组、符号链接、小 I/O、OAL 分页及独立 Watch。目录签发与真实双目录改名场景由 [derive](../../user/tests/test_fs/src/derive.rs) 使用两个正式 provider 执行，核对领域/运输上限、母普通关闭后的独立 child、直接父 Rename 与非递归、跨 backing 拒绝及真实错角色输入；没有旧属性能力导出或 affine Take。运行证据和未覆盖的真实显式 revoke 时点由工作记录拥有。
+[init 验收消费者](../../user/services/srv_init/src/filesystem/acceptance.rs) 分别持文件根、service 目录和发布根，服务发现通过 WatchName→Query→GetEntry，取得入口后本地 Namespace.bind 再调用文件协议。[独立文件消费者](../../user/tests/test_fs/src/main.rs) 从普通共享 sender 建 Namespace，使用属性、数组、符号链接、小 I/O、OAL 分页及独立 Watch。目录签发与真实双目录改名场景由 [derive](../../user/tests/test_fs/src/derive.rs) 使用两个正式 provider 执行，核对领域/运输上限、母普通关闭后的独立 child、直接父 Rename 与非递归、跨 backing 拒绝及真实错角色输入；没有旧属性能力导出或 affine Take。运行证据和未覆盖的真实显式 revoke 时点由工作记录拥有。

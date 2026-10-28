@@ -194,6 +194,9 @@ pub(super) struct Release {
     _fee: Charge,
 }
 impl Release {
+    pub fn admitted(&self) -> bool {
+        self.source.source().is_some()
+    }
     pub fn new(
         owner: libkernel::ipc::notification::NotificationOwner,
         account: &libbudget::AccountView<libfs::resource::FsResource>,
@@ -275,6 +278,9 @@ pub(super) struct Retire {
     _fee: Charge,
 }
 impl Retire {
+    pub fn admitted(&self) -> bool {
+        self.source.source().is_some()
+    }
     pub fn new(
         owner: libkernel::ipc::notification::NotificationOwner,
         account: &libbudget::AccountView<libfs::resource::FsResource>,

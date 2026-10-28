@@ -21,6 +21,7 @@
   （`hbreak *地址` 或 `hbreak *符号`）。
 - **断点要在 `-S` 冷启动时就位**：attach 到已悬挂的系统再设断点，代码早已
   跑过，永远命中不了。
+- 外部取证使用原始 `maintenance packet vCont` 时，先设置 `set breakpoint always-inserted on`；GDB 普通 all-stop 默认可能移除断点，原始包不会替它重新插入。原始部分恢复段只留目标原生断点，按返回的真实 stopped CPU/PC/PID 复核，不依赖 Python 断点过滤回调代替该核验。
 - **boot hart 不保证是 CPU#0**：实测同一命令两次运行分别是 CPU#3 和
   CPU#0，按 mhartid 认领而非线程号。
 - **sifive_u 上非 harts[0] 的 hart 断点打不上**（详见 KNOWN_ISSUES）；

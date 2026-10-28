@@ -21,6 +21,25 @@
 #![no_std]
 #![feature(allocator_ext)]
 
+#[cfg(all(
+    feature = "system",
+    any(
+        feature = "acceptance-stress",
+        feature = "acceptance-device",
+        feature = "acceptance-memory",
+        feature = "acceptance-device-function-session",
+        feature = "acceptance-mmio-publication",
+        feature = "acceptance-mmio-forced",
+        feature = "acceptance-dma-races",
+        feature = "acceptance-dma-shared",
+        feature = "acceptance-dma-quota",
+        feature = "acceptance-dma-install-failure",
+        feature = "acceptance-irq-retirement",
+        feature = "acceptance-irq-exit"
+    )
+))]
+compile_error!("system deployment and acceptance features are mutually exclusive");
+
 extern crate alloc;
 extern crate libruntime;
 
@@ -68,9 +87,9 @@ use libkernel::{
     system,
 };
 use libprocess::{
-    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, RequiredLaunchSet,
-    SpawnRequest, SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause,
-    SupervisionStage, SupervisionTarget, collect_process,
+    DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, JobCollector, SpawnRequest,
+    SuperviseResult, SuperviseSink, SuperviseTask, SupervisionCause, SupervisionStage,
+    SupervisionTarget, collect_process,
     context::{CurrentProcessInfo, StartupPayload},
     enumerate_members, spawn,
 };
@@ -87,10 +106,10 @@ mod supervisor;
 use supervisor::RootSupervisor;
 
 mod building;
+mod deployment;
 mod device;
 #[cfg(feature = "acceptance-device")]
 mod device_acceptance;
-mod device_supervision;
 mod dma_checks;
 mod driver;
 mod filesystem;
@@ -103,9 +122,11 @@ mod platform;
 mod public_ipc;
 #[cfg(feature = "acceptance-stress")]
 mod race;
+mod supervision;
 mod time_checks;
 use building::build_spin_building;
-use filesystem::*;
+use filesystem::Host;
+use filesystem::acceptance::*;
 #[cfg(feature = "acceptance-stress")]
 use race::race_matrix;
 
@@ -116,16 +137,12 @@ struct Supervised {
 }
 
 struct LaunchedServices {
-    first_fs: AcceptedFsProvider,
-    registry_root_watch: service_client::Watch,
     pm_mailbox: Handle,
-    fs_bootstrap_second: Handle,
-    fs_release_second: Handle,
-    fs_bootstrap_second_sender: Handle,
-    fs_release_second_owner: Handle,
-    fs_route_second_owner: Handle,
-    fs_second_scope: MailboxSender,
-    fs_second_image: StartupImage,
+    pm_pid: u64,
+    fs_image: StartupImage,
+    device_image: StartupImage,
+    driver_image: StartupImage,
+    workers: [StartupImage; 3],
     test_fs_image: StartupImage,
     target_image: Option<StartupImage>,
     hammer_image: Option<StartupImage>,
@@ -320,40 +337,7 @@ const ACCEPTANCE_WORKLOAD: &str = "core";
 #[cfg(feature = "acceptance-device")]
 const ACCEPTANCE_WORKLOAD: &str = "device";
 
-const REQUIRED_FS: u64 = 1 << 0;
-const REQUIRED_PM: u64 = 1 << 1;
-const REQUIRED_DRIVER: u64 = 1 << 2;
-const REQUIRED_TARGET: u64 = 1 << 3;
-const REQUIRED_PM_TARGET: u64 = 1 << 4;
-const REQUIRED_FS_CONSUMER: u64 = 1 << 5;
-const REQUIRED_DEVICE: u64 = 1 << 6;
-const REQUIRED_IMAGES: u64 = REQUIRED_FS
-    | REQUIRED_PM
-    | REQUIRED_DRIVER
-    | REQUIRED_TARGET
-    | REQUIRED_FS_CONSUMER
-    | REQUIRED_DEVICE;
-const REQUIRED_STARTED: u64 = REQUIRED_FS
-    | REQUIRED_PM
-    | REQUIRED_DRIVER
-    | REQUIRED_TARGET
-    | REQUIRED_PM_TARGET
-    | REQUIRED_DEVICE;
-
-fn required_image(name: &str) -> Option<u64> {
-    match name {
-        "bin/srv_fs" => Some(REQUIRED_FS),
-        "bin/srv_pm" => Some(REQUIRED_PM),
-        "bin/srv_device" => Some(REQUIRED_DEVICE),
-        "bin/srv_driver" => Some(REQUIRED_DRIVER),
-        "bin/test_target" => Some(REQUIRED_TARGET),
-        "bin/test_fs" => Some(REQUIRED_FS_CONSUMER),
-        _ => None,
-    }
-}
-
-/// 从声明式 initfs 政策启动服务拓扑。必选映像缺失或任一必选 spawn 失败使
-/// 整个 stage 失败；test_fp 是按 admitted execution domain 决定的可选服务。
+/// 先核完整映像集合，再启动普通短任务。基础宿主在 ABI 自检之后由共用装配启动。
 fn launch_test_services(
     root: &mut RootSupervisor,
     services: Handle,
@@ -361,467 +345,144 @@ fn launch_test_services(
     acceptance: Handle,
     names: &mut TopologyNames,
 ) -> Result<LaunchedServices, &'static str> {
-    root.begin_device_supervision(services)?;
-    let pm_mailbox = root
-        .create_mailbox(
-            Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
-        )
-        .map_err(|_| "pm mailbox create failed")?;
-    let fs_bootstrap = root
-        .create_mailbox(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
-        )
-        .map_err(|_| "fs bootstrap mailbox create failed")?;
-    let fs_release = root
-        .create_notification(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)
-        .map_err(|_| "fs release notification create failed")?;
-    let fs_route = root
-        .create_mailbox_owner(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
-        .map_err(|_| "fs route mailbox create failed")?;
-    let fs_bootstrap_second = root
-        .create_mailbox(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT,
-        )
-        .map_err(|_| "second fs bootstrap mailbox create failed")?;
-    let fs_release_second = root
-        .create_notification(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)
-        .map_err(|_| "second fs release notification create failed")?;
-    let fs_route_second = root
-        .create_mailbox_owner(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
-        .map_err(|_| "second fs route mailbox create failed")?;
-    let fs_registration = root
-        .create_mailbox_owner(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
-        .map_err(|_| "fs registration mailbox create failed")?;
-    // GRANT 是直接跨表安装：授出的源 handle 被消费，先复制保留 init 对
-    // 委托域的直接收束权（兜底 job_kill 的 authority 源）。
-    let delegated_domain = root
-        .duplicate(pm_domain, JOB_FULL_RIGHTS)
-        .map_err(|_| "pm domain duplicate failed")?;
-    let control_rights = SUPERVISOR_RIGHTS;
-    let mut manifest = RequiredLaunchSet::new(REQUIRED_IMAGES, REQUIRED_STARTED);
-    let mut stage_failure = None;
-    // 按需启动的验收进程直接借用启动包的只读映像，避免复制 ELF 到 init 堆。
-    let mut target_image: Option<StartupImage> = None;
-    let mut hammer_image: Option<StartupImage> = None;
-    let mut test_fs_image: Option<StartupImage> = None;
-    let mut fs_second_image: Option<StartupImage> = None;
-    let mut fs_second_scope = None;
-    let mut primary_provider = None;
-    let mut registry_root_watch = None;
-    let mut driver_image = None;
-    let mut pci_image = None;
-    let mut xhci_image = None;
-    let mut hid_image = None;
-    let result = with_init_payload(|payload| {
+    let mut images = [None; 11];
+    let mut duplicate = false;
+    with_init_payload(|payload| {
         tar::walk(payload, |entry| {
-            if !entry.name.starts_with("bin/") || entry.name.ends_with('/') {
-                return;
-            }
-            if entry.name == "bin/test_hammer" {
-                // 竞态锤不是常驻服务：只留存映像，由剧本按需 spawn。
-                hammer_image = Some(StartupImage::from_slice(entry.data));
-                return;
-            }
-            if entry.name == "bin/drv_pci_generic" {
-                pci_image = Some(StartupImage::from_slice(entry.data));
-                return;
-            }
-            if entry.name == "bin/drv_usb_xhci" {
-                xhci_image = Some(StartupImage::from_slice(entry.data));
-                return;
-            }
-            if entry.name == "bin/drv_usb_hid" {
-                hid_image = Some(StartupImage::from_slice(entry.data));
-                return;
-            }
-            let required = required_image(entry.name);
-            if let Some(bit) = required {
-                manifest.mark_present(bit);
-            } else if entry.name != "bin/test_fp" {
-                debug!("optional initfs image ignored: {}", entry.name);
-                return;
-            }
-            if stage_failure.is_some() {
-                return;
-            }
-            if entry.name == "bin/srv_driver" {
-                driver_image = Some(StartupImage::from_slice(entry.data));
-                return;
-            }
-            if entry.name == "bin/srv_device" {
-                if root.devices.is_some() {
-                    stage_failure = Some("duplicate device manager image");
-                    return;
-                }
-                match device::Manager::launch(root, services, names, entry.data) {
-                    Ok(manager) => {
-                        root.devices = Some(manager);
-                        manifest.mark_started(REQUIRED_DEVICE);
-                    }
-                    Err(error) => stage_failure = Some(error),
-                }
-                return;
-            }
-            if entry.name == "bin/test_fs" {
-                test_fs_image = Some(StartupImage::from_slice(entry.data));
-                return;
-            }
-            let pm_grants = [
-                HandleGrant {
-                    handle: pm_mailbox.owner,
-                    rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-                },
-                HandleGrant {
-                    handle: delegated_domain,
-                    rights: DELEGATED_DOMAIN_RIGHTS,
-                },
-            ];
-            let fs_pool_grant = if entry.name == "bin/srv_fs" {
-                match root.duplicate(root_memory_pool(), Rights::CREATE | Rights::GRANT) {
-                    Ok(pool) => pool,
-                    Err(_) => {
-                        stage_failure = Some("provider Pool grant failed");
-                        return;
-                    }
-                }
-            } else {
-                Handle::INVALID
+            let index = match entry.name {
+                "bin/srv_fs" => 0,
+                "bin/srv_device" => 1,
+                "bin/srv_driver" => 2,
+                "bin/srv_pm" => 3,
+                "bin/test_target" => 4,
+                "bin/test_fs" => 5,
+                "bin/drv_pci_generic" => 6,
+                "bin/drv_usb_xhci" => 7,
+                "bin/drv_usb_hid" => 8,
+                "bin/test_fp" => 9,
+                "bin/test_hammer" => 10,
+                _ => return,
             };
-            let fs_grants = [
-                HandleGrant {
-                    handle: fs_bootstrap.peer,
-                    rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-                },
-                HandleGrant {
-                    handle: fs_release.owner,
-                    rights: Rights::READ | Rights::WAIT,
-                },
-                HandleGrant {
-                    handle: fs_route,
-                    rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
-                },
-                HandleGrant {
-                    handle: fs_registration,
-                    rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
-                },
-                HandleGrant {
-                    handle: fs_pool_grant,
-                    rights: Rights::CREATE,
-                },
-            ];
-            // test_target 首实例入 acceptance 域（枚举+派生验收线的靶域）。
-            let (job, grants): (Handle, &[HandleGrant]) = if entry.name == "bin/test_target" {
-                (acceptance, &[])
-            } else if entry.name == "bin/srv_pm" {
-                (services, pm_grants.as_slice())
-            } else if entry.name == "bin/srv_fs" {
-                (services, fs_grants.as_slice())
-            } else {
-                (services, &[])
-            };
-            if root.reserve_process().is_err() {
-                stage_failure = Some("process supervision admission failed");
-                return;
-            }
-            let spawned = root.spawn_process(SpawnRequest {
-                memory_pool: root_memory_pool(),
-                parent: init_process_info(),
-                job,
-                image: entry.data,
-                payload: &[],
-                grants,
-                control_rights,
-            });
-            if entry.name == "bin/srv_pm"
-                && (spawned.is_ok()
-                    || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
-            {
-                root.transferred(pm_mailbox.owner);
-                root.transferred(delegated_domain);
-            }
-            if entry.name == "bin/srv_fs"
-                && (spawned.is_ok()
-                    || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed))
-            {
-                root.transferred(fs_bootstrap.peer);
-                root.transferred(fs_release.owner);
-                root.transferred(fs_route);
-                root.transferred(fs_registration);
-                root.transferred(fs_pool_grant);
-            }
-            match spawned {
-                Ok(process) => {
-                    if let Some(bit) = required {
-                        manifest.mark_started(bit);
-                    }
-                    debug!("started {} as pid {}", entry.name, process.pid);
-                    names.register_process(process.pid, entry.name);
-                    // 持久 init 保留 control：监督、等待与收束的 authority 源。
-                    if entry.name == "bin/test_target" {
-                        target_image = Some(StartupImage::from_slice(entry.data));
-                        // live kill 正路径改经枚举+派生（Job 管理面验收线 1）：
-                        // acceptance Job 枚举可见 test_target 的 pid，派生 MANAGE
-                        // control 后 kill——保留 control 在派生接管后关闭。
-                        if let Err(error) =
-                            test_derive_kill(root, acceptance, process.pid, process.control)
-                        {
-                            stage_failure = Some(error);
-                            return;
-                        }
-                        // 委托域靶：control 即弃（关闭 control 永不隐式终止），
-                        // pm 的派生因此走铸造路径，域内收束权归 pm。
-                        match root.spawn_process(SpawnRequest {
-                            memory_pool: root_memory_pool(),
-                            parent: init_process_info(),
-                            job: pm_domain,
-                            image: entry.data,
-                            payload: &[],
-                            grants: &[],
-                            control_rights,
-                        }) {
-                            Ok(second) => {
-                                manifest.mark_started(REQUIRED_PM_TARGET);
-                                debug!("pm domain target started as pid {}", second.pid);
-                                names.register_process(second.pid, "bin/test_target@pm_domain");
-                                let _ = unsafe { close(second.control) };
-                            }
-                            Err(error) => {
-                                debug!("required pm-domain target spawn failed: {:?}", error);
-                                stage_failure = Some("required pm-domain target spawn failed");
-                            }
-                        }
-                    } else if entry.name == "bin/srv_fs" {
-                        root.track_process(Supervised {
-                            pid: process.pid,
-                            control: process.control,
-                        });
-                        let prepared = (|| -> Result<_, &'static str> {
-                            let primary = accept_fs_provider(
-                                root,
-                                fs_bootstrap.owner,
-                                fs_release.peer,
-                                true,
-                            )?;
-                            if primary.pid != process.pid {
-                                return Err("primary provider bootstrap sender mismatch");
-                            }
-                            let directory = primary
-                                .directory
-                                .as_ref()
-                                .ok_or("primary provider omitted service directory")?;
-                            let deadline = libkernel::time::timeout_millis(10_000)
-                                .map_err(|_| "registration bootstrap deadline invalid")?;
-                            let watch = name_watch(root, directory)?;
-                            let authority = primary
-                                .registration_root
-                                .as_ref()
-                                .ok_or("primary provider omitted registration authority")?;
-
-                            let scoped = service_client::Publisher {
-                                sender: authority,
-                                caller: root,
-                            }
-                            .delegate_name(
-                                "fs.secondary",
-                                service_protocol::PublishRights::CREATE
-                                    | service_protocol::PublishRights::REPLACE,
-                                deadline,
-                            )
-                            .map_err(|_| "fs name authority delegation failed")?;
-                            Ok((primary, watch, scoped))
-                        })();
-                        let (primary, watch, scope_handle) = match prepared {
-                            Ok(prepared) => prepared,
-                            Err(error) => {
-                                stage_failure = Some(error);
-                                return;
-                            }
-                        };
-                        primary_provider = Some(primary);
-                        registry_root_watch = Some(watch);
-                        fs_second_scope = Some(scope_handle);
-                        fs_second_image = Some(StartupImage::from_slice(entry.data));
-                    } else {
-                        root.track_process(Supervised {
-                            pid: process.pid,
-                            control: process.control,
-                        });
-                    }
-                }
-                Err(error) => {
-                    if required.is_some() {
-                        debug!("required service {} spawn failed: {:?}", entry.name, error);
-                        stage_failure = Some("required service spawn failed");
-                    } else {
-                        debug!("optional service {} degraded: {:?}", entry.name, error);
-                    }
-                }
-            }
+            duplicate |= images[index]
+                .replace(StartupImage::from_slice(entry.data))
+                .is_some();
         })
-    });
-    if let Err(error) = result {
-        debug!("required initfs parse failed: {:?}", error);
-        stage_failure = Some("initfs parse failed");
-    }
-    if stage_failure.is_none() {
-        match (driver_image, pci_image, xhci_image, hid_image) {
-            (Some(manager), Some(pci), Some(xhci), Some(hid)) => {
-                match driver::Manager::launch(
-                    root,
-                    services,
-                    names,
-                    manager.as_slice(),
-                    [pci.as_slice(), xhci.as_slice(), hid.as_slice()],
-                ) {
-                    Ok(manager) => {
-                        root.drivers = Some(manager);
-                        manifest.mark_started(REQUIRED_DRIVER);
-                    }
-                    Err(error) => stage_failure = Some(error),
-                }
-            }
-            _ => stage_failure = Some("driver boot image pairing incomplete"),
-        }
-    }
-    if let Some(failure) = stage_failure {
-        debug!("required service preparation failed: {}", failure);
-    }
-    if manifest.missing_present() != 0 {
-        debug!(
-            "required service images missing: missing={:#x}, seen={:#x}",
-            manifest.missing_present(),
-            manifest.present()
-        );
-        stage_failure = Some("required service image missing");
-    }
-    #[cfg(feature = "acceptance-stress")]
-    if hammer_image.is_none() {
-        debug!("required stress hammer image missing");
-        stage_failure = Some("required stress hammer image missing");
-    }
-    if manifest.missing_started() != 0 {
-        debug!(
-            "required topology incomplete: missing={:#x}, started={:#x}",
-            manifest.missing_started(),
-            manifest.started()
-        );
-        stage_failure = Some("required topology incomplete");
-    }
-    if let Some(failure) = stage_failure {
-        return Err(failure);
-    }
-    debug!(
-        "required service topology complete: images={:#x}, started={:#x}",
-        manifest.present(),
-        manifest.started()
-    );
-    Ok(LaunchedServices {
-        first_fs: primary_provider.ok_or("primary provider bootstrap incomplete")?,
-        registry_root_watch: registry_root_watch.ok_or("service discovery watch missing")?,
-        pm_mailbox: pm_mailbox.peer,
-        fs_bootstrap_second: fs_bootstrap_second.owner,
-        fs_release_second: fs_release_second.peer,
-        fs_bootstrap_second_sender: fs_bootstrap_second.peer,
-        fs_release_second_owner: fs_release_second.owner,
-        fs_route_second_owner: fs_route_second,
-        fs_second_scope: fs_second_scope.ok_or("second fs name scope missing")?,
-        fs_second_image: fs_second_image.ok_or("second fs image missing")?,
-        test_fs_image: test_fs_image.ok_or("FS consumer image missing")?,
-        target_image,
-        hammer_image,
     })
-}
-
-fn launch_secondary_fs(
-    root: &mut RootSupervisor,
-    services: Handle,
-    names: &mut TopologyNames,
-    image: &[u8],
-    grants: [Handle; 3],
-    authority: MailboxSender,
-) -> Result<(), &'static str> {
-    let [bootstrap, release, route] = grants;
-    let inbox = root
+    .map_err(|_| "acceptance boot archive invalid")?;
+    if duplicate || images[..9].iter().any(Option::is_none) {
+        return Err("acceptance image set incomplete or duplicated");
+    }
+    let required: [_; 9] =
+        core::array::from_fn(|index| images[index].expect("required image presence checked"));
+    if cfg!(feature = "acceptance-stress") && images[10].is_none() {
+        return Err("stress hammer image missing");
+    }
+    let mailbox = root
         .create_mailbox(
             Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
         )
-        .map_err(|_| "secondary publication inbox creation failed")?;
-    let fs_pool_grant = root
-        .duplicate(root_memory_pool(), Rights::CREATE | Rights::GRANT)
-        .map_err(|_| "second provider Pool grant failed")?;
+        .map_err(|_| "pm mailbox failed")?;
+    let delegated = root
+        .duplicate(pm_domain, JOB_FULL_RIGHTS)
+        .map_err(|_| "pm domain delegation failed")?;
+    let target = root
+        .spawn_process(SpawnRequest {
+            memory_pool: root_memory_pool(),
+            parent: init_process_info(),
+            job: acceptance,
+            image: required[4].as_slice(),
+            payload: &[],
+            grants: &[],
+            control_rights: SUPERVISOR_RIGHTS,
+        })
+        .map_err(|_| "target spawn failed")?;
+    names.register_process(target.pid, "bin/test_target");
+    test_derive_kill(root, acceptance, target.pid, target.control)?;
+    let target = root
+        .spawn_process(SpawnRequest {
+            memory_pool: root_memory_pool(),
+            parent: init_process_info(),
+            job: pm_domain,
+            image: required[4].as_slice(),
+            payload: &[],
+            grants: &[],
+            control_rights: SUPERVISOR_RIGHTS,
+        })
+        .map_err(|_| "pm target spawn failed")?;
+    names.register_process(target.pid, "bin/test_target@pm_domain");
+    // SAFETY: spawn 交付的唯一 Control 尚未进入账本；pm 持真实域管理权。
+    unsafe { close(target.control) }.map_err(|_| "pm target control close failed")?;
     let grants = [
         HandleGrant {
-            handle: bootstrap,
-            rights: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            handle: mailbox.owner,
+            rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
         },
         HandleGrant {
-            handle: release,
-            rights: Rights::READ | Rights::WAIT,
-        },
-        HandleGrant {
-            handle: route,
-            rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
-        },
-        HandleGrant {
-            handle: inbox.owner,
-            rights: Rights::READ | Rights::WAIT | Rights::MANAGE,
-        },
-        HandleGrant {
-            handle: fs_pool_grant,
-            rights: Rights::CREATE,
+            handle: delegated,
+            rights: DELEGATED_DOMAIN_RIGHTS,
         },
     ];
     root.reserve_process()
-        .map_err(|_| "second fs supervision admission failed")?;
-    let spawned = root.spawn_process(SpawnRequest {
+        .map_err(|_| "pm supervision admission failed")?;
+    let pm = root.spawn_process(SpawnRequest {
         memory_pool: root_memory_pool(),
         parent: init_process_info(),
         job: services,
-        image,
-        payload: b"secondary",
+        image: required[3].as_slice(),
+        payload: &[],
         grants: &grants,
         control_rights: SUPERVISOR_RIGHTS,
     });
-    if spawned.is_ok()
-        || matches!(&spawned, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed)
+    if pm.is_ok()
+        || matches!(&pm, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed)
     {
         for grant in grants {
             root.transferred(grant.handle);
         }
     }
-    let second = spawned.map_err(|error| {
-        debug!("required second fs provider spawn failed: {:?}", error);
-        "required second fs provider spawn failed"
-    })?;
-    debug!("second fs provider started as pid {}", second.pid);
-    names.register_process(second.pid, "bin/srv_fs@second");
+    let pm = pm.map_err(|_| "pm spawn failed")?;
     root.track_process(Supervised {
-        pid: second.pid,
-        control: second.control,
+        pid: pm.pid,
+        control: pm.control,
     });
-    let rights = authority
-        .description()
-        .map_err(|_| "secondary publication authority query failed")?
-        .rights;
-    let mut packet = Packet::new(service_protocol::AUTHORITY_GRANT_KIND, &[])
-        .map_err(|_| "secondary authority packet failed")?;
-    packet
-        .push(authority.into_capability(), rights)
-        .map_err(|_| "secondary authority packet layout failed")?;
-    // 唯一 init sender 向新建空 inbox 投递一次；出生安装不需要此 authority 有 GRANT。
-    packet
-        .try_send(
-            root.sender(inbox.peer),
-            libkernel::time::timeout_millis(10_000)
-                .map_err(|_| "secondary authority delivery deadline failed")?,
-        )
-        .map_err(|_| "secondary authority delivery failed")?;
-    root.close_control(inbox.peer)?;
-    Ok(())
+    names.register_process(pm.pid, "bin/srv_pm");
+    if let Some(image) = images[9] {
+        root.reserve_process()
+            .map_err(|_| "FP supervision admission failed")?;
+        match root.spawn_process(SpawnRequest {
+            memory_pool: root_memory_pool(),
+            parent: init_process_info(),
+            job: services,
+            image: image.as_slice(),
+            payload: &[],
+            grants: &[],
+            control_rights: SUPERVISOR_RIGHTS,
+        }) {
+            Ok(process) => {
+                root.track_process(Supervised {
+                    pid: process.pid,
+                    control: process.control,
+                });
+                names.register_process(process.pid, "bin/test_fp");
+            }
+            Err(error) => debug!("optional service bin/test_fp degraded: {:?}", error),
+        }
+    }
+    debug!(
+        "required service topology complete: ordinary acceptance consumers admitted; foundation images validated"
+    );
+    Ok(LaunchedServices {
+        pm_mailbox: mailbox.peer,
+        pm_pid: pm.pid,
+        fs_image: required[0],
+        device_image: required[1],
+        driver_image: required[2],
+        workers: [required[6], required[7], required[8]],
+        test_fs_image: required[5],
+        target_image: Some(required[4]),
+        hammer_image: images[10],
+    })
 }
 
 struct FsConsumerCoordinator {
@@ -963,7 +624,7 @@ fn launch_fs_consumer(
     services: Handle,
     names: &mut TopologyNames,
     image: &[u8],
-    primary: &AcceptedFsProvider,
+    primary: &Host,
 ) -> Result<FsConsumerCoordinator, &'static str> {
     let root_grant = primary
         .grant
@@ -1159,22 +820,6 @@ fn launch_fs_consumer(
         report_owner: report.owner,
         command_signaler: command.peer,
     })
-}
-
-struct AcceptedFsProvider {
-    pid: u64,
-    grant: Option<MailboxSender>,
-    sender_identity: Option<u64>,
-    mailbox_identity: Option<u64>,
-    directory: Option<MailboxSender>,
-    registration_root: Option<MailboxSender>,
-    grant_b: Option<MailboxSender>,
-    directory_b: Option<MailboxSender>,
-    registration_root_b: Option<MailboxSender>,
-    management: Option<MailboxSender>,
-    management_b: Option<MailboxSender>,
-    bootstrap: Handle,
-    release: Handle,
 }
 
 fn exercise_cancellable_rpc(root: &mut RootSupervisor) -> Result<(), &'static str> {
@@ -1445,26 +1090,36 @@ fn main() {
         Ok(job) => job,
         Err(error) => {
             debug!("services job create failed: {:?}", error);
-            root.serve_forever();
+            root.system_failure("services Job creation failed");
         }
     };
     if let Err(error) = root.bind_services(services) {
         debug!("root standby preparation failed: {:?}", error);
-        root.serve_forever();
+        root.system_failure("root standby preparation failed");
     }
     debug!("services job established");
+    if cfg!(feature = "system") {
+        if let Err(reason) = deployment::system(&mut root, services) {
+            root.system_failure(reason);
+        }
+        root.system_failure("system deployment returned unexpectedly");
+    }
     if let Err(failure) = run(&mut root, services, root_job) {
         match failure {
             RunFailure::Message(stage) => debug!("init acceptance failed: {}", stage),
         }
-        root.serve_forever();
+        root.system_failure("acceptance workload failed");
+    }
+    if let Err(reason) = root.finish_stop(services) {
+        root.system_failure(reason);
     }
     let reset = root.take_reset();
-    submit_shutdown(root_job, reset, root);
+    check_acceptance_reset_authority(root_job, reset);
+    submit_shutdown(reset, root);
 }
 
-/// 先验证 capability 负路径，再提交唯一的成功路径。
-fn submit_shutdown(root_job: Handle, reset: Handle, root: RootSupervisor) -> ! {
+/// 验收 reset capability 的对象类型与权限负路径；不提交成功动作。
+fn check_acceptance_reset_authority(root_job: Handle, reset: Handle) {
     assert!(matches!(
         system::reset(root_job, ResetAction::Shutdown, ResetReason::Requested),
         Err(SystemCallError::WrongObjectType)
@@ -1477,9 +1132,21 @@ fn submit_shutdown(root_job: Handle, reset: Handle, root: RootSupervisor) -> ! {
     ));
     unsafe { close(attenuated) }.expect("attenuated SystemReset close must succeed");
     debug!("system reset authority checks passed");
-    debug!("init: submitting explicit system shutdown");
+}
 
-    match system::reset(reset, ResetAction::Shutdown, ResetReason::Requested) {
+/// 消费已完成停止意图和原 reset authority，提交唯一正常终局动作。
+fn submit_shutdown(reset: Handle, root: RootSupervisor) -> ! {
+    // finish_stop 已完成唯一正常停止意图；最终动作消费同一记录，不另选政策。
+    let action = root
+        .stop
+        .as_ref()
+        .expect("normal stop completed before reset")
+        .action;
+    match action {
+        ResetAction::Shutdown => debug!("init: submitting explicit system shutdown"),
+        ResetAction::Reboot => debug!("init: submitting explicit system cold reboot"),
+    }
+    match system::reset(reset, action, ResetReason::Requested) {
         Err(error) => {
             debug!("system reset failed: {:?}", error);
             core::hint::black_box(&root);
@@ -1494,7 +1161,6 @@ fn submit_shutdown(root_job: Handle, reset: Handle, root: RootSupervisor) -> ! {
 /// 小集合收束辅助：对保留 control 的服务 kill → 等 DONE → 核验终态 → close。
 fn kill_and_supervise(
     root: &mut RootSupervisor,
-    _job: Handle,
     supervised: alloc::vec::Vec<Supervised>,
 ) -> Result<(), &'static str> {
     for target in &supervised {
@@ -2042,183 +1708,9 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
             .ok_or("Once target image missing")?
             .as_slice(),
     )?;
-    #[cfg(feature = "acceptance-device-function-session")]
-    {
-        let manager = root.devices.take().ok_or("device manager unavailable")?;
-        let result = function_checks::run(root, &manager);
-        root.devices = Some(manager);
-        result?;
-    }
-    #[cfg(feature = "acceptance-device")]
-    let driver_reply_backlog = {
-        let manager = root
-            .devices
-            .take()
-            .ok_or("device manager bootstrap incomplete")?;
-        let sources = manager.issue_function_source(root);
-        root.devices = Some(manager);
-        let sources = sources?;
-        let drivers = root
-            .drivers
-            .as_ref()
-            .ok_or("driver assembly record missing")?
-            .observer_handle()?;
-        device_acceptance::exercise(root, acceptance, sources, drivers)?
-    };
     let pm_mailbox = launched.pm_mailbox;
-    let mut first_fs = launched.first_fs;
-    let registry_watch = launched.registry_root_watch;
-    confirm_primary_fs_ready(root, &first_fs)?;
-    root.verify_dispatcher_funding([
-        first_fs
-            .directory
-            .as_ref()
-            .ok_or("primary registry A missing")?,
-        first_fs
-            .directory_b
-            .as_ref()
-            .ok_or("primary registry B missing")?,
-    ])?;
-    // primary 探针只借已就绪文件根，不依赖独立消费者或 secondary。
-    exercise_fs_provider(
-        root,
-        first_fs.grant.as_ref().ok_or("primary file root missing")?,
-    )?;
-    exercise_async_name_watch(
-        root,
-        first_fs
-            .directory
-            .as_ref()
-            .ok_or("primary service directory missing")?,
-        first_fs
-            .registration_root
-            .as_ref()
-            .ok_or("publication root missing")?,
-        first_fs.grant.as_ref().ok_or("primary file root missing")?,
-    )?;
-    filesystem::registry::queued_control(
-        root,
-        first_fs
-            .directory
-            .as_ref()
-            .ok_or("primary service directory missing")?,
-        first_fs
-            .registration_root
-            .as_ref()
-            .ok_or("publication root missing")?,
-        first_fs.grant.as_ref().ok_or("primary file root missing")?,
-    )?;
-    let consumer = launch_fs_consumer(
-        root,
-        services,
-        &mut names,
-        launched.test_fs_image.as_slice(),
-        &first_fs,
-    )?;
-    consumer.await_report(root, test_fs::report::DISCOVERY_ARMED)?;
-    launch_secondary_fs(
-        root,
-        services,
-        &mut names,
-        launched.fs_second_image.as_slice(),
-        [
-            launched.fs_bootstrap_second_sender,
-            launched.fs_release_second_owner,
-            launched.fs_route_second_owner,
-        ],
-        launched.fs_second_scope,
-    )?;
-    let mut second_fs = accept_fs_provider(
-        root,
-        launched.fs_bootstrap_second,
-        launched.fs_release_second,
-        false,
-    )?;
-    let directory = first_fs
-        .directory
-        .as_ref()
-        .ok_or("primary service directory missing")?;
-    let primary_mailbox = first_fs
-        .mailbox_identity
-        .ok_or("primary file mailbox identity missing")?;
-    let (entry, sender_identity, mailbox_identity) =
-        discover_registered_fs(root, directory, primary_mailbox, &registry_watch)?;
-    second_fs.grant = Some(entry);
-    second_fs.sender_identity = Some(sender_identity);
-    second_fs.mailbox_identity = Some(mailbox_identity);
-    consumer.await_report(root, test_fs::report::SECONDARY_DISCOVERED)?;
-    exercise_fs_basic(
-        root,
-        second_fs
-            .grant
-            .as_ref()
-            .ok_or("secondary file root missing")?,
-    )?;
-    consumer.deliver_management(
-        root,
-        second_fs
-            .management
-            .as_ref()
-            .ok_or("secondary management root missing")?,
-    )?;
-    consumer.continue_business(root)?;
-    consumer.await_report(root, test_fs::report::COMPLETE)?;
-    filesystem::copy::exercise(
-        root,
-        first_fs.grant.as_ref().ok_or("primary file root missing")?,
-        second_fs
-            .grant
-            .as_ref()
-            .ok_or("secondary file root missing")?,
-    )?;
-    exercise_cancellable_rpc(root)?;
-    filesystem::copy::start_shutdown(
-        root,
-        first_fs.grant.as_ref().ok_or("primary file root missing")?,
-        second_fs
-            .grant
-            .as_ref()
-            .ok_or("secondary file root missing")?,
-    )?;
-    root.notification_signaler(second_fs.release)
-        .signal(1)
-        .map_err(|_| "secondary release failed")?;
-    filesystem::copy::finish_shutdown(
-        root,
-        first_fs.grant.as_ref().ok_or("primary file root missing")?,
-    )?;
-    consumer.observe_shutdown(root)?;
-    consumer.await_report(root, test_fs::report::PROVIDER_CLOSED)?;
-    consumer.finish(root)?;
-    collect_fs_provider(root, &second_fs)?;
-    observe_withdrawal(root, directory, &registry_watch)?;
-    drop(registry_watch);
-    drop(second_fs.grant.take());
-    drop(second_fs.management.take());
-    drop(second_fs.management_b.take());
-    drop(first_fs.grant.take());
-    drop(first_fs.directory.take());
-    drop(first_fs.registration_root.take());
-    drop(first_fs.grant_b.take());
-    drop(first_fs.directory_b.take());
-    drop(first_fs.registration_root_b.take());
-    drop(first_fs.management.take());
-    drop(first_fs.management_b.take());
-    release_fs_provider(root, &first_fs)?;
-    // 两个真实provider业务已经关闭；把原control一起交原批次，覆盖部分准入/失败隔离。
-    root.verify_failure_isolation(acceptance, [first_fs.pid, second_fs.pid])?;
-    debug!("FS1 provider supervision reclaimed both provider processes");
     let target_image = launched.target_image;
     let hammer_image = launched.hammer_image;
-
-    // 设备和文件消费者已完成，先履行两管理者的正常停止责任；独立内核ABI自检随后执行。
-    root.stop_drivers()?;
-    #[cfg(feature = "acceptance-device")]
-    {
-        debug!("DEVICE Drivers stopped while Observer reply backlog remained unread");
-        drop(driver_reply_backlog);
-    }
-    root.stop_devices()?;
 
     // 运行时拓扑快照（调试参考）：此刻服务在域内运行，验收自测尚未
     // 展开；短寿命服务可能已自动完成退休。
@@ -2395,14 +1887,6 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
         }
     }
 
-    // 短寿命服务的线程已退出并不释放 AddressSpace；在高峰矩阵前收束已进入
-    // Terminating/Dead 的成员，仍 Running 的服务继续由末尾监督闭环持有。
-    let reclaimed = root.collect_terminated()?;
-    debug!(
-        "pre-race service supervision reclaimed {} process(es)",
-        reclaimed
-    );
-
     // 完整生命周期多核竞态矩阵属于 stress workload；core 仍覆盖确定性的
     // Building kill、Job 管理与服务监督收束。
     #[cfg(feature = "acceptance-stress")]
@@ -2418,18 +1902,6 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     }
     #[cfg(not(feature = "acceptance-stress"))]
     let _ = hammer_image;
-
-    // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
-    // 稳态拓扑。
-    root.collect_job(acceptance)?;
-    debug!("acceptance domain collected");
-    root.close_control(acceptance)?;
-
-    // —— 监督闭环：等待全部服务 DONE 后，核验终态并关闭观察权，
-    // 查询稳定终态后释放 control。pm 隧道端点在进程自动退休时关闭并
-    // 发布 PEER_CLOSED；先完成服务监督，再观察对端终态。 ——
-    root.collect_services()?;
-    debug!("all services supervised to completion");
 
     // —— 事件面：自动退休已发布对端终态，电平等待立即返回 ——
     let peer_closed = wait_supervision_signal(
@@ -2488,11 +1960,224 @@ fn run(root: &mut RootSupervisor, services: Handle, root_job: Handle) -> Result<
     }
     debug!("pm delegated domain confirmed Dead");
 
-    // 终态拓扑快照（调试参考）：预期 root 仅剩 init + services，services
-    // 空（Dead 的 pm_domain/acceptance 已从成员表移除）——收束干净的不变量。
-    debug!("topology: final snapshot before system reset");
+    // ABI/pm 阶段的拓扑快照；后续才装配常驻基座，不作为全系统终态证据。
+    debug!("topology: ABI and pm phase snapshot before foundation assembly");
     dump_topology(root_job, &names, 0);
     root.close_control(pm_domain)?;
+    root.begin_supervision()?;
+    root.devices = Some(device::Manager::launch(
+        root,
+        services,
+        &mut names,
+        launched.device_image.as_slice(),
+    )?);
+    root.drivers = Some(driver::Manager::launch(
+        root,
+        services,
+        &mut names,
+        launched.driver_image.as_slice(),
+        [
+            launched.workers[0].as_slice(),
+            launched.workers[1].as_slice(),
+            launched.workers[2].as_slice(),
+        ],
+    )?);
+    let mut first_fs = Host::launch(
+        root,
+        services,
+        &mut names,
+        launched.fs_image.as_slice(),
+        srv_fs::startup::Profile::AcceptancePrimary,
+        None,
+    )?;
+    let registry_watch = name_watch(
+        root,
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or("primary directory missing")?,
+    )?;
+    let fs_second_scope = service_client::Publisher {
+        sender: first_fs
+            .registration_root
+            .as_ref()
+            .ok_or("primary authority missing")?,
+        caller: root,
+    }
+    .delegate_name(
+        "fs.secondary",
+        service_protocol::PublishRights::CREATE | service_protocol::PublishRights::REPLACE,
+        filesystem::deadline()?,
+    )
+    .map_err(|_| "secondary publication authority failed")?;
+    #[cfg(feature = "acceptance-device-function-session")]
+    {
+        let manager = root.devices.take().ok_or("device manager unavailable")?;
+        let result = function_checks::run(root, &manager);
+        root.devices = Some(manager);
+        result?;
+    }
+    #[cfg(feature = "acceptance-device")]
+    let driver_reply_backlog = {
+        let manager = root
+            .devices
+            .take()
+            .ok_or("device manager bootstrap incomplete")?;
+        let sources = manager.issue_function_source(root);
+        root.devices = Some(manager);
+        let sources = sources?;
+        let drivers = root
+            .drivers
+            .as_ref()
+            .ok_or("driver assembly record missing")?
+            .observer_handle()?;
+        device_acceptance::exercise(root, acceptance, sources, drivers)?
+    };
+    root.verify_dispatcher_funding([
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or("primary registry A missing")?,
+        first_fs
+            .directory_b
+            .as_ref()
+            .ok_or("primary registry B missing")?,
+    ])?;
+    // primary 探针只借已就绪文件根，不依赖独立消费者或 secondary。
+    exercise_fs_provider(
+        root,
+        first_fs.grant.as_ref().ok_or("primary file root missing")?,
+    )?;
+    exercise_async_name_watch(
+        root,
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or("primary service directory missing")?,
+        first_fs
+            .registration_root
+            .as_ref()
+            .ok_or("publication root missing")?,
+        first_fs.grant.as_ref().ok_or("primary file root missing")?,
+    )?;
+    filesystem::registry::queued_control(
+        root,
+        first_fs
+            .directory
+            .as_ref()
+            .ok_or("primary service directory missing")?,
+        first_fs
+            .registration_root
+            .as_ref()
+            .ok_or("publication root missing")?,
+        first_fs.grant.as_ref().ok_or("primary file root missing")?,
+    )?;
+    let consumer = launch_fs_consumer(
+        root,
+        services,
+        &mut names,
+        launched.test_fs_image.as_slice(),
+        &first_fs,
+    )?;
+    consumer.await_report(root, test_fs::report::DISCOVERY_ARMED)?;
+    let mut second_fs = Host::launch(
+        root,
+        services,
+        &mut names,
+        launched.fs_image.as_slice(),
+        srv_fs::startup::Profile::AcceptanceSecondary,
+        Some(fs_second_scope),
+    )?;
+    let directory = first_fs
+        .directory
+        .as_ref()
+        .ok_or("primary service directory missing")?;
+    let primary_mailbox = first_fs
+        .mailbox_identity
+        .ok_or("primary file mailbox identity missing")?;
+    let (entry, sender_identity, mailbox_identity) =
+        discover_registered_fs(root, directory, primary_mailbox, &registry_watch)?;
+    second_fs.grant = Some(entry);
+    second_fs.sender_identity = Some(sender_identity);
+    second_fs.mailbox_identity = Some(mailbox_identity);
+    consumer.await_report(root, test_fs::report::SECONDARY_DISCOVERED)?;
+    exercise_fs_basic(
+        root,
+        second_fs
+            .grant
+            .as_ref()
+            .ok_or("secondary file root missing")?,
+    )?;
+    consumer.deliver_management(
+        root,
+        second_fs
+            .management
+            .as_ref()
+            .ok_or("secondary management root missing")?,
+    )?;
+    consumer.continue_business(root)?;
+    consumer.await_report(root, test_fs::report::COMPLETE)?;
+    filesystem::copy::exercise(
+        root,
+        first_fs.grant.as_ref().ok_or("primary file root missing")?,
+        second_fs
+            .grant
+            .as_ref()
+            .ok_or("secondary file root missing")?,
+    )?;
+    exercise_cancellable_rpc(root)?;
+    filesystem::copy::start_shutdown(
+        root,
+        first_fs.grant.as_ref().ok_or("primary file root missing")?,
+        second_fs
+            .grant
+            .as_ref()
+            .ok_or("secondary file root missing")?,
+    )?;
+    root.begin_filesystem_stop(second_fs.instance)?;
+    filesystem::copy::finish_shutdown(
+        root,
+        first_fs.grant.as_ref().ok_or("primary file root missing")?,
+    )?;
+    consumer.observe_shutdown(root)?;
+    consumer.await_report(root, test_fs::report::PROVIDER_CLOSED)?;
+    consumer.finish(root)?;
+    filesystem::acceptance::track_stopped_host(root, second_fs.instance)?;
+    observe_withdrawal(root, directory, &registry_watch)?;
+    drop(registry_watch);
+    drop(second_fs.grant.take());
+    drop(second_fs.management.take());
+    drop(second_fs.management_b.take());
+    filesystem::acceptance::collect_pool_after_batch(
+        root,
+        second_fs.instance,
+        launched.pm_pid,
+        acceptance,
+    )?;
+    // 消费者与需要 Create 的自检已完成，提交全局 gate 前释放 primary 的验收根。
+    first_fs.release_roots();
+    root.request_stop(services, ResetAction::Shutdown)?;
+    debug!("FS1 provider supervision reclaimed both provider processes");
+
+    // 共同停止已完成文件与设备领域责任，释放验收保留的未读 Observer 回包。
+    #[cfg(feature = "acceptance-device")]
+    {
+        debug!("DEVICE Drivers stopped while Observer reply backlog remained unread");
+        drop(driver_reply_backlog);
+    }
+
+    // acceptance 域用完即收：seal + 空即完成，不把一次性验收遗留带进
+    // 稳态拓扑。
+    root.collect_job(acceptance)?;
+    debug!("acceptance domain collected");
+    root.close_control(acceptance)?;
+
+    // —— 监督闭环：等待全部服务 DONE 后，核验终态并关闭观察权，
+    // 查询稳定终态后释放 control。pm 隧道端点在进程自动退休时关闭并
+    // 发布 PEER_CLOSED；先完成服务监督，再观察对端终态。 ——
+    root.collect_services()?;
+    debug!("all services supervised to completion");
+
     root.verify_idle_ownership()?;
     Ok(())
 }
@@ -3256,7 +2941,6 @@ fn test_derive_kill(
             process::kill(retained).expect("live kill of a fresh process must be accepted");
             kill_and_supervise(
                 root,
-                job,
                 alloc::vec::Vec::from([Supervised {
                     pid,
                     control: retained,

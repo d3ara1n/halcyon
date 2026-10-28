@@ -211,7 +211,7 @@ impl RootSupervisor {
         loop {
             if self.turn_and_wait(Some(Await::AssemblyWait)).is_err() {
                 // 尚存的来源仍借用调用栈owner，不能带着未注销token返回并释放它。
-                self.device_failure("root assembly wait cleanup unavailable");
+                self.system_failure("root assembly wait cleanup unavailable");
             }
             if let Some(result) = self.waiting.world.result.take() {
                 return result;

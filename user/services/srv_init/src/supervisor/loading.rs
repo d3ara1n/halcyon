@@ -17,13 +17,30 @@ impl RootSupervisor {
                 .err()
                 .map(|_| SystemCallError::ObjectBusy),
             Ok(None) => None,
-            Err(_) => self.device_failure("root preparation cleanup unavailable"),
+            Err(_) => self.system_failure("root preparation cleanup unavailable"),
         }
     }
 
+    pub(crate) fn cancel_prepared(
+        &mut self,
+        mut prepared: PreparedProcess,
+    ) -> Result<(), &'static str> {
+        let cancellation = prepared.cancel_to_collector();
+        if self.collect_cancelled(cancellation).is_some() {
+            return Err("prepared process collection failed");
+        }
+        Ok(())
+    }
     pub(crate) fn prepare_process(
         &mut self,
         request: SpawnRequest<'_>,
+    ) -> Result<PreparedProcess, SpawnFailure> {
+        self.prepare_process_until(request, Deadline::INFINITE)
+    }
+    pub(crate) fn prepare_process_until(
+        &mut self,
+        request: SpawnRequest<'_>,
+        deadline: Deadline,
     ) -> Result<PreparedProcess, SpawnFailure> {
         let mut preparing = Preparation::new(request).map_err(|error| SpawnFailure {
             error,
@@ -34,7 +51,19 @@ impl RootSupervisor {
             let result = self
                 .turn_and_wait(Some(Await::Turn))
                 .map_err(SpawnError::System)
-                .and_then(|()| preparing.advance());
+                .and_then(|()| {
+                    if self.stopping()
+                        || deadline
+                            .instant()
+                            .map_err(|_| SpawnError::System(SystemCallError::IllegalArgument))?
+                            .is_some_and(|end| {
+                                libkernel::time::snapshot().map_or(true, |now| now.now_ns >= end)
+                            })
+                    {
+                        return Err(SpawnError::System(SystemCallError::DeadlineExpired));
+                    }
+                    preparing.advance()
+                });
             match result {
                 Ok(Some(prepared)) => return Ok(prepared),
                 Ok(None) => {}
@@ -92,7 +121,7 @@ impl RootSupervisor {
             }
         })();
         if result.is_err() && copying.cancel().is_err() {
-            self.device_failure("unpublished image mapping cleanup unavailable");
+            self.system_failure("unpublished image mapping cleanup unavailable");
         }
         result
     }

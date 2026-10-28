@@ -8,8 +8,6 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。本轮整理范围见[活跃资料清理](todo-2026-09-29-system-redesign.md#活跃资料清理2026-10-27)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [静态常驻服务基座](todo-2026-10-07-service-assembly.md#当前接力)：按选定设计接续正式部署、文件宿主持续监督与授权交付；设备等待与 loader 迁移不重做，应用及恢复按记录触发。
-4. [系统关机编排](todo-2026-09-system-shutdown-orchestration.md#静态常驻基座停止2026-10-28)：常驻基座的消费者、文件与设备停止随服务装配同一闭包实施；持久化收束保留条件入口。
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。
 
@@ -38,6 +36,8 @@
 
 | 任务 | 排期条件 |
 |---|---|
+| [服务装配后续](todo-2026-10-07-service-assembly.md#当前接力) | 静态常驻基座已收口；真实应用、管理器、initfs 描述或恢复需求触发对应条件项 |
+| [系统关机编排](todo-2026-09-system-shutdown-orchestration.md#通用关机的剩余范围) | 非持久静态部署停止已收口；持久服务出现前闭合 drain/flush、恢复与停止依赖 |
 | [不可信域metadata硬隔离](todo-2026-09-14-kernel-memory-budget.md) | 开放不可信创建域或承诺独立硬容量隔离前；已有双维Pool付款不重做 |
 | [文件扩展操作](todo-2026-09-fal-extended-operations.md) | 范围外操作出现真实消费者 |
 | [平台保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) | 平台/设备消费动态保留区、memory-region 或 reusable 前 |

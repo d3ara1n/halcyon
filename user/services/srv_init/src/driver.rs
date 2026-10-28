@@ -1,4 +1,5 @@
 //! init 的驱动装配记录；映像/政策/来源管理和执行域由原 RootSupervisor 持有。
+pub(super) const STOP_TIMEOUT_NS: u64 = 40_000_000_000;
 use super::{
     JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, TopologyNames, init_process_info,
     root_memory_pool,
@@ -385,11 +386,7 @@ impl Manager {
         let registry_pid = device.pid();
         root.devices = Some(device);
         let (claim, admin) = issued?;
-        root.attach_manager_source(
-            super::device_supervision::Manager::Driver,
-            admin,
-            registry_pid,
-        )?;
+        root.attach_manager_source(super::supervision::Instance::Driver, admin, registry_pid)?;
         let mut manager = Self {
             pid: 0,
             job,
@@ -455,17 +452,16 @@ impl Manager {
                 libkernel::debug!("driver manager preparation failed: {:?}", failure);
                 "driver manager preparation failed"
             })?;
-            let spawned =
-                root.start_manager(super::device_supervision::Manager::Driver, prepared)?;
-            manager.pid = spawned.pid;
-            names.register_process(spawned.pid, "srv_driver");
+            let pid = root.start_instance(super::supervision::Instance::Driver, prepared)?;
+            manager.pid = pid;
+            names.register_process(pid, "srv_driver");
             let deadline = libkernel::time::timeout_millis(5_000)
                 .map_err(|_| "driver ready deadline failed")?;
             let mut ready = root
                 .receive_until(bootstrap.owner, deadline)
                 .map_err(|_| "driver readiness failed")?;
             if ready.header.kind != protocol::BOOT_READY
-                || ready.header.sender_pid != spawned.pid
+                || ready.header.sender_pid != pid
                 || ready.header.sender_context_id != expected
                 || ready.payload.len() != boot::MANAGER_READY_BYTES
                 || ready.handles.remaining() != boot::MANAGER_READY_SLOTS
@@ -525,7 +521,7 @@ impl Manager {
         deadline: erhino_shared::time::Deadline,
     ) -> Result<(), &'static str> {
         let reply = root.manager_source_call(
-            super::device_supervision::Manager::Driver,
+            super::supervision::Instance::Driver,
             Command::SealSource,
             deadline,
         )?;
@@ -548,10 +544,9 @@ impl Manager {
             .ok_or("driver manager control missing")?;
         // 首批三层Binding清理及管理者DONE等待各留一个10s诊断工作窗；一次绝对期限，
         // 不随Query刷新，也不改变硬件halt/reset或任何安全完成判据。
-        let deadline = libkernel::time::timeout_millis(4 * 10_000)
+        let deadline = libkernel::time::timeout_millis(STOP_TIMEOUT_NS / 1_000_000)
             .map_err(|_| "driver stop deadline failed")?;
-        let deadline =
-            root.manager_stopping(super::device_supervision::Manager::Driver, deadline)?;
+        let deadline = root.manager_stopping(super::supervision::Instance::Driver, deadline)?;
         process::seal_job(self.worker_job).map_err(|_| "driver worker JobSeal failed")?;
         process::seal_job(self.job).map_err(|_| "driver manager JobSeal failed")?;
         libkernel::debug!(
@@ -592,7 +587,7 @@ impl Manager {
         }
         loop {
             let reply = root.manager_source_call(
-                super::device_supervision::Manager::Driver,
+                super::supervision::Instance::Driver,
                 Command::QuerySourceStop,
                 deadline,
             )?;
@@ -603,7 +598,7 @@ impl Manager {
                 .map_err(|_| "driver source completion invalid")?
             {
                 SourceStop::Closed => {
-                    root.manager_source_closed(super::device_supervision::Manager::Driver)?;
+                    root.manager_device_closed(super::supervision::Instance::Driver)?;
                     libkernel::debug!(
                         "driver assembly source Closed: now_ns={}",
                         libkernel::time::snapshot()
@@ -633,7 +628,7 @@ impl Manager {
                 }
             }
         }
-        root.collect_manager(super::device_supervision::Manager::Driver)?;
+        root.collect_manager(super::supervision::Instance::Driver)?;
         root.collect_job(self.worker_job)?;
         root.close_control(self.worker_job)?;
         root.collect_job(self.job)?;

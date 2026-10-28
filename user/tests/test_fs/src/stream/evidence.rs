@@ -21,7 +21,9 @@ fn release(offer: Offer) {
     drop(offer.control);
 }
 pub(crate) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
-    use srv_fs::deployment::{ENTRY_SESSIONS, SESSIONS};
+    let capacity = srv_fs::deployment::Capacity::new(srv_fs::startup::Profile::AcceptancePrimary)
+        .expect("acceptance capacity invalid");
+    use srv_fs::deployment::SESSIONS;
     let path = "/quota-session";
     Client::new(namespace, caller, limits())
         .create(path, NodeKind::Stream, FsRights::ALL, &[], deadline())
@@ -39,11 +41,11 @@ pub(crate) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
     );
     let mut a = Vec::new();
     let mut b = Vec::new();
-    a.try_reserve_exact(ENTRY_SESSIONS[0])
+    a.try_reserve_exact(capacity.entry_sessions(0))
         .expect("A stream fixture allocation failed");
     b.try_reserve_exact(SESSIONS)
         .expect("B stream fixture allocation failed");
-    for _ in 0..ENTRY_SESSIONS[0] {
+    for _ in 0..capacity.entry_sessions(0) {
         a.push(
             Client::new(namespace, caller, limits())
                 .open(path, options(Direction::Read), deadline())
@@ -61,7 +63,7 @@ pub(crate) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
         ),
         "A local stream quota missing"
     );
-    for _ in ENTRY_SESSIONS[0]..SESSIONS {
+    for _ in capacity.entry_sessions(0)..SESSIONS {
         b.push(
             Client::new(namespace, caller, limits())
                 .open(
@@ -73,7 +75,7 @@ pub(crate) fn check_accounts(namespace: &Namespace, caller: &mut Caller) {
         );
     }
     assert!(
-        b.len() < ENTRY_SESSIONS[1],
+        b.len() < capacity.entry_sessions(1),
         "B fixture exhausted local quota"
     );
     assert!(
@@ -321,8 +323,10 @@ pub(crate) fn check_abandoned(
     prefix: &str,
     entry: &MailboxSender,
 ) {
+    let capacity = srv_fs::deployment::Capacity::new(srv_fs::startup::Profile::AcceptancePrimary)
+        .expect("acceptance capacity invalid");
     // 超过 A 的真实局部会话容量；泄漏一个控制壳不能靠空余容量掩盖。
-    for attempt in 0..=srv_fs::deployment::ENTRY_SESSIONS[0] {
+    for attempt in 0..=capacity.entry_sessions(0) {
         abandon_one(namespace, caller, prefix, entry, attempt);
     }
     libkernel::debug!("FS1 CreateOpen committed name survives queued reply abandonment");

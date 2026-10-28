@@ -14,9 +14,9 @@ MEMORY_SCRIPT := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"memory.x"
 # compile
 RUSTFLAGS_OS := "-Clinker=riscv64-elf-ld"
 RUSTFLAGS_USER := ""
-# 用户态验收负载为 core/stress/memory/device/device-reuse；profile 选择停留在 srv_init，不进入内核 ABI。
+# 用户态部署为 system 或 core/stress/memory/device/device-reuse 验收；选择停留在 srv_init，不进入内核 ABI。
 ACCEPTANCE_WORKLOAD := env_var_or_default("ERHINO_ACCEPTANCE_WORKLOAD", "core")
-INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "device-reuse" { "--features srv_init/acceptance-device-reuse" } else if ACCEPTANCE_WORKLOAD == "memory" { "--features srv_init/acceptance-memory" } else if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else if ACCEPTANCE_WORKLOAD == "device" { "--features srv_init/acceptance-device" } else { "" }
+INIT_FEATURES := if ACCEPTANCE_WORKLOAD == "system" { "--features srv_init/system" } else if ACCEPTANCE_WORKLOAD == "device-reuse" { "--features srv_init/acceptance-device-reuse" } else if ACCEPTANCE_WORKLOAD == "memory" { "--features srv_init/acceptance-memory" } else if ACCEPTANCE_WORKLOAD == "stress" { "--features srv_init/acceptance-stress" } else if ACCEPTANCE_WORKLOAD == "device" { "--features srv_init/acceptance-device" } else { "" }
 
 TARGET_DIR := invocation_directory()/"artifacts"
 KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
@@ -50,6 +50,7 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 # 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线 QEMU 运行超时只在本处维护，可用同名环境变量覆盖；调整政策见 plans/BUILD-AND-TEST.md。
+SYSTEM_OBSERVE_TIMEOUT := env_var_or_default("SYSTEM_OBSERVE_TIMEOUT", "240")
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "360")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "70")
 # 两轮热插每轮四个30秒等待边界，加原core收束；仅防挂死，不是性能要求。
@@ -92,6 +93,8 @@ clippy:
             return "$status"
         fi
     }
+    run_lint user-system artifacts/lint/user-system.log \
+        bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features system {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-device artifacts/lint/user-device.log \
         bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features acceptance-device-reuse {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-resources artifacts/lint/user-resources.log \
@@ -130,30 +133,44 @@ build_user: artifact_dir
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ACCEPTANCE_WORKLOAD}}" in
-        core|stress|memory|device|device-reuse) ;;
+        core|stress|memory|device|device-reuse|system) ;;
         *) echo "Unknown acceptance workload: {{ACCEPTANCE_WORKLOAD}}" >&2; exit 2 ;;
     esac
+    if [ "{{ACCEPTANCE_WORKLOAD}}" = system ] && [ "{{INIT_FEATURES}}" != "--features srv_init/system" ]; then
+        echo "System deployment requires the system feature alone" >&2; exit 2
+    fi
+    if [ "{{ACCEPTANCE_WORKLOAD}}" != system ] && [[ "{{INIT_FEATURES}}" == *srv_init/system* ]]; then
+        echo "System feature requires the system deployment" >&2; exit 2
+    fi
     cd user
+    if [ "{{ACCEPTANCE_WORKLOAD}}" = system ]; then
+        RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p srv_init -p srv_device -p srv_driver -p srv_fs -p drv_pci_generic -p drv_usb_xhci -p drv_usb_hid --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
+    else
     RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --exclude test_hammer --bins {{INIT_FEATURES}} {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     if [ "{{ACCEPTANCE_WORKLOAD}}" != core ]; then
         RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_hammer {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
     fi
     RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
+    fi
+    if [ "{{ACCEPTANCE_WORKLOAD}}" = system ]; then
+        python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/{srv_init,srv_device,srv_driver,srv_fs,drv_pci_generic,drv_usb_xhci,drv_usb_hid}
+    else
+        python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
+    fi
     echo -e "\033[0;32mUser space programs build successfully!\033[0m"
 
 make_initfs: build_user
     @rm -rf "{{TARGET_DIR}}/initfs"
     @mkdir -p "{{TARGET_DIR}}/initfs/bin"
-    @ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/srv_pm" "{{TARGET_DIR}}/initfs/bin/srv_pm"; fi
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/srv_device" "{{TARGET_DIR}}/initfs/bin/srv_device"
     @ditto "{{TARGET_DIR}}/build/srv_driver" "{{TARGET_DIR}}/initfs/bin/srv_driver"
-    @ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"
-    @ditto "{{TARGET_DIR}}/build/test_fs" "{{TARGET_DIR}}/initfs/bin/test_fs"
-    @ditto "{{TARGET_DIR}}/build/test_device" "{{TARGET_DIR}}/initfs/bin/test_device"
-    @ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"
-    @if [ "{{ACCEPTANCE_WORKLOAD}}" != core ]; then ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"; fi
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"; fi
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_fs" "{{TARGET_DIR}}/initfs/bin/test_fs"; fi
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_device" "{{TARGET_DIR}}/initfs/bin/test_device"; fi
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_fp" "{{TARGET_DIR}}/initfs/bin/test_fp"; fi
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != core ] && [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_hammer" "{{TARGET_DIR}}/initfs/bin/test_hammer"; fi
     @ditto "{{TARGET_DIR}}/build/drv_pci_generic" "{{TARGET_DIR}}/initfs/bin/drv_pci_generic"
     @ditto "{{TARGET_DIR}}/build/drv_usb_xhci" "{{TARGET_DIR}}/initfs/bin/drv_usb_xhci"
     @ditto "{{TARGET_DIR}}/build/drv_usb_hid" "{{TARGET_DIR}}/initfs/bin/drv_usb_hid"
@@ -243,7 +260,7 @@ run_device_candidates:
 
 # 在业务等待、Start、装载或停止边界fault实际管理者，核root持续观察与真实ColdReboot。
 acceptance-device-manager-fault manager phase="wait":
-    @just output acceptance-device-manager-fault-{{manager}}-{{phase}} test env ERHINO_ACCEPTANCE_WORKLOAD=device just PLATFORM=qemu MODEL=virt MODE=debug run_device_manager_fault {{manager}} {{phase}}
+    @just output acceptance-device-manager-fault-{{manager}}-{{phase}} test env ERHINO_ACCEPTANCE_WORKLOAD={{if manager == "Filesystem" { "core" } else { "device" }}} just PLATFORM=qemu MODEL=virt MODE=debug run_device_manager_fault {{manager}} {{phase}}
 
 [private]
 run_device_manager_fault manager phase: make_dtb make_boot_package build_kernel
@@ -492,3 +509,21 @@ run_qemu_acceptance_platform timeout +OPTIONS: make_dtb make_boot_package build_
 run_qemu_acceptance_bounded timeout +OPTIONS: make_dtb make_boot_package build_kernel
     @echo -e "\033[0;36mQEMU: Simulating acceptance ({{ACCEPTANCE_WORKLOAD}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
     @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
+
+# 正式静态常驻基座：没有验收消费者，不因空闲自行关机。
+system mode="release":
+    @env ERHINO_ACCEPTANCE_WORKLOAD=system just virt {{mode}}
+
+# 有限观察正式部署；外部收割不计正常停止。
+system-observe:
+    @just output system-observe test env ERHINO_ACCEPTANCE_WORKLOAD=system just PLATFORM=qemu MODEL=virt MODE=debug run_system_observe
+
+run_system_observe: make_dtb make_boot_package build_kernel
+    @ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" python3 tools/check-system.py --timeout {{SYSTEM_OBSERVE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
+
+# 原 core 的真实 fs 领取顺序：secondary Stopped先；primary在原到期复查中DONE先。
+acceptance-fs-stop-order:
+    @just output acceptance-fs-stop-order test env ERHINO_ACCEPTANCE_WORKLOAD=core just PLATFORM=qemu MODEL=virt MODE=debug run_fs_stop_order
+
+run_fs_stop_order: make_dtb make_boot_package build_kernel
+    @ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-fs-stop-order.py --timeout {{VIRT_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4

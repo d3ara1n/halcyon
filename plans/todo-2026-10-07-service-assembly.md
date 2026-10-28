@@ -1,6 +1,6 @@
 # 正式服务装配与监督设计
 
-状态：**设备第二轮持续监督已实施；静态常驻服务基座的设计已收敛，尚未实施**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；下一步依据[常驻基座设计](#静态常驻服务基座设计2026-10-28)实施选定范围。已实现合同见[第二轮持续监督设计](#第二轮持续监督设计2026-10-27)，设备实现证据见[机制收敛报告](archived/review-2026-10-27-device-implementation.md#第二轮交付与边界)。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，终局由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备组合门及仅观察的时钟异常见[唯一收口表](todo-2026-09-device-system-design.md#当前唯一收口表2026-10-26)。
+状态：**静态常驻服务基座及交付后结构清理已完成，所选验收与清理后回归通过；代码未提交，后续能力按条件触发**。本案拥有启动依赖、就绪、监督恢复与进程授权装配；基座交付证据从[实施接力](#静态基座实施接力2026-10-28)进入，后续清理与验证见[交付后结构清理](#交付后结构清理)，目标由[常驻基座设计](#静态常驻服务基座设计2026-10-28)拥有。发布发现由[OAL/服务分案](todo-2026-10-07-fal-service-redesign.md)拥有，系统终局与停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有，设备独立组合门及观察项由[设备计划](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有。
 
 ## 目标与非目标
 
@@ -24,7 +24,7 @@ init 负责初始基础服务的装配，并在初始化后继续承担该必需
 
 - `srv_init` 的固定 workload、RequiredLaunchSet、RootSupervisor 与已有 pm/fs 消费者承担验收装配和真实监督责任；不能把它们当成没有可用基座。
 - 对象链、自动回收、Job 封口、进程出生/执行绑定、来源登记及运行时分层已完成相应交付。本案不恢复 ProcessDrain 或用户必须持续驱动的内核回收。
-- 当前已有 Registry/服务记录；发布成功、服务就绪、endpoint 可用和进程存活分别表达不同事实。常驻基座的交付与监督目标由下方设计闭合，代码仍是验收部署。
+- 当前已有 Registry/服务记录；发布成功、服务就绪、endpoint 可用和进程存活分别表达不同事实。System 与验收部署共用宿主装配和监督，System 不包含验收消费者。
 - 设备的实例、受权使用/绑定、供应依赖和硬件安全责任已按首批范围定稿。virt 的三个 MMIO 根、PCI INTx 根和 DMA 根已交付 init，实际管理者委托及非空消费者已接通。设备驱动装配不能仅凭进程 DONE 推断 DMA 已静止。
 - srv_device由init的独立Job/Pool及root管理记录承载；真实私有bootstrap核context/PID及入口关联，发行受限观察并接枚举/OAL/Watch。两管理者的DONE来源先于Start，运行期/Stopping观察与唯一故障终局均由root推进。正常停止由同一owner确认来源Closed、关闭原admin、核真实Completed、注销来源并交原Collector，无admin副本/ACK或撤防握手；具体边界见设备唯一收口表。
 - boot 已在初始进程启动前接入独立 DONE 观察；init 的最终 reset 被拒绝时自终止，由该观察触发 runtime stop。已暴露 DMA 的实际 pin 与写许可继续保留，相关证据见设备主计划；这不替代设备 halt 或正常停止编排。
@@ -100,7 +100,7 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 ## 当前接力
 
-下一步是按[静态常驻基座设计](#静态常驻服务基座设计2026-10-28)及[已确认的职责分层](#已确认的-init-与服务管理职责)接通正式部署、文件宿主持续监督及正常停止；原设计已提交为 `99f5e9b`，职责分层是其后的设计澄清，尚未修改产品代码或运行验收。共同基线为 `f6b712e`；选定能力是可承接后续应用的常驻基座，不能称为已有应用工作流或持久化系统。施工顺序、删除门与验证由静态基座设计节拥有；[固定设计的独立 Review](todo-2026-10-28-service-foundation-design-review.md)可选、未执行，范围仍为原固定提交，不阻碍实施。
+本轮依据 `99f5e9b` 目标设计与 `caa1f5e` 职责澄清完成选定静态基座，验证、结构检查与证据边界见[唯一实施记录](#静态基座实施接力2026-10-28)。用户随后授权的[结构清理](#交付后结构清理)及针对性回归也已完成，没有待接续的本轮施工步骤。应用、管理器、initfs 描述、恢复和持久化按本篇条件表接手；本案继续拥有这些独立后续，暂不整体归档。当前代码未提交，也未授权 commit/push；获准提交后再登记固定代码交付的可选独立 Review。原[固定设计的独立 Review](todo-2026-10-28-service-foundation-design-review.md)仍仅对应原设计提交、可选未执行；HighNewt 的进行中检查属于协作结构检查，不冒充独立 Review。
 
 设备第二轮两条责任链已随 `c5d005d` 提交；整体审查 G1–G5、C1 及公共 loader 修复已随 `e23afdb` 交付。可选独立审查、精确动态覆盖及候选出生观察仍由[设备修复后接续](todo-2026-09-device-system-design.md#整体审查修复后的接续2026-10-28)拥有，不重做 root/worker 等待和装载迁移。持久化、仓库安装更新、服务恢复与通用配置的条件后续见本篇延期表。
 
@@ -116,14 +116,14 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 [`RootSupervisor::turn_and_wait`](../user/services/srv_init/src/supervisor.rs) 持一份 Assembly，分流 Job、Batch、Read、管理者观察及装配等待的来源，每轮推进各自有限工作，再汇总可运行状态、最早期限和本次等待结果。顺序装配在等待外部结果期间继续推进这些责任。
 
-范围以“两管理者开始受监督后仍可达”为界，当前接点如下。首轮 `f3337eb` 的阻塞路径盘点与迁移过程保留在收敛档案，不再用旧源码行号描述当前实现。
+持续监督约束覆盖必需实例开始受监督后仍可达的路径，当前接点如下。第二轮最初覆盖两设备管理者，静态基座将同一约束扩展到文件宿主；首轮 `f3337eb` 的阻塞路径盘点与迁移过程保留在收敛档案。
 
 | 实际路径 | 当前源码 | 接入方式 |
 |---|---|---|
 | 两管理者 bootstrap 等待、设备管理 RPC | [device.rs](../user/services/srv_init/src/device.rs)、[driver.rs](../user/services/srv_init/src/driver.rs) | root 的 receive/wait 与 Exchange；原 CallOperation 的来源进入统一等待槽 |
-| 来源停止查询、DONE 与管理能力关闭 | [device_supervision.rs](../user/services/srv_init/src/device_supervision.rs) | 同一管理记录确认来源 Closed 与实际 DONE，注销后交原 Collector |
-| srv_fs 就绪、发布及注册队列探针 | [filesystem.rs](../user/services/srv_init/src/filesystem.rs)、[registry.rs](../user/services/srv_init/src/filesystem/registry.rs) | 顺序 RPC 用 Exchange；Copy/Watch 保留原 Dispatcher；待领取回复通过 root 观察实际就绪 |
-| 报告、进程与验收阶段等待 | [supervisor/waiting.rs](../user/services/srv_init/src/supervisor/waiting.rs)、[main.rs](../user/services/srv_init/src/main.rs) | 实际来源与绝对期限进入 root；有限 Collector 同样通过 root 等待，独立 ABI 自检在管理者收集后运行 |
+| 来源停止查询、DONE 与管理能力关闭 | [supervision.rs](../user/services/srv_init/src/supervision.rs) | 同一管理记录确认来源 Closed 与实际 DONE，注销后交原 Collector |
+| srv_fs 就绪、发布及注册队列探针 | [hosting.rs](../user/services/srv_init/src/filesystem/hosting.rs)、[acceptance.rs](../user/services/srv_init/src/filesystem/acceptance.rs)、[registry.rs](../user/services/srv_init/src/filesystem/registry.rs) | 宿主报告进入持续监督；顺序 RPC 用 Exchange，Copy/Watch 保留原 Dispatcher，验收探针等待也推进 root |
+| 报告、进程与验收阶段等待 | [supervisor/waiting.rs](../user/services/srv_init/src/supervisor/waiting.rs)、[main.rs](../user/services/srv_init/src/main.rs) | 实际来源与绝对期限进入 root；有限 Collector 同样通过 root 等待，独立 ABI 创建自检在基础宿主出生前运行 |
 | ELF 装载与映像构造 | [supervisor/loading.rs](../user/services/srv_init/src/supervisor/loading.rs) | 同一 Preparation/ImageCopy 每轮推进一步；失败显式交回原收集账本 |
 | 显式并发 Retry 的测试线程 | [driver.rs](../user/services/srv_init/src/driver.rs) | 保留并发调用用途；主线程通过 root 等实际 ThreadControl DONE，再 try_join 领取结果 |
 
@@ -131,7 +131,7 @@ PCI 与 xHCI/root-hub 的子登记能力在原绑定 ResourcesReady 后由 srv_d
 
 ### 唯一控制记录与调度
 
-root 在启动任何管理者前预付固定两份 ManagerRecord、DONE/就绪观察容量、控制运输槽及故障收束存储。ManagerRecord 持本实例的 ProcessControl、实际 SourceAdmin、单调停止意图/期限及真实 DONE 快照；Job/Pool关闭权复用root原能力账本，领域装配记录只保留该实例的借用关联和私有就绪/入口。不存在第二套Shared/Record、监督admin副本或新Job/Pool账本。
+root 在启动必需实例前按选定部署预付 Record、DONE/私有报告观察容量、控制运输槽及故障收束存储。Record 持本实例的 PreparedProcess 或 Running Control、单调停止意图/期限及真实 DONE 快照；设备 SourceAdmin 与文件 Bootstrap 保存各自领域事实。Job/Pool 关闭权复用 root 原能力账本，领域装配记录保留实例关联和业务入口，不复制进程控制权或建立平行账本。
 
 实际 ProcessControl 在 Start 前挂入 root 的持续 DONE 来源；同一 owner 管能力关闭与来源 detach，不需向另一线程交还 capability。服务私有入口仍核真实 context/PID/Process；srv_device 的 SourceAdmin 在私有就绪后纳入同一记录，之前由原 Process/Job/reset 负责故障兜底。
 
@@ -155,7 +155,7 @@ Create 前预留准备与取消责任；所有可失败步骤保留原 Building 
 
 ### 正常停止与故障
 
-正常停止先在同一 ManagerRecord 提交意图/绝对期限，再封相应 Job/来源并发管理 Stop。来源 Closed 通过现有 QuerySourceStop 的原谓词确定；这里可保留仅在收束期间的有限、定时任务重查，不能使用阻塞 sleep，也不为两个来源另造长期观察账本。整个系统运行稳定时没有这项周期工作。
+设备管理者正常停止先在同一 Record 提交意图/绝对期限，再封相应 Job/来源并发管理 Stop。来源 Closed 通过现有 QuerySourceStop 的原谓词确定；这里可保留仅在收束期间的有限、定时任务重查，不能使用阻塞 sleep，也不为两个来源另造长期观察账本。整个系统运行稳定时没有这项周期工作。
 
 root 取得真实来源 Closed 后，关闭自己已经无用的 admin/入口；收到 DONE 必须核 Completed 且无异常 detail，随后实际 detach 来源、交原 collector、关闭控制与 Pool。DONE 先到时保留快照等待原来源证明或期限；不把顺序差异当失败，也不从 DONE 反推安全。不存在 release_admin/disarm/ack/join 的线程间协议。
 
@@ -163,7 +163,7 @@ root 取得真实来源 Closed 后，关闭自己已经无用的 admin/入口；
 
 ### 费用、删除门与验收
 
-管理记录、DONE/就绪/故障来源和有限控制调用槽来自 root 预付账户，容量由实际两管理者及并存装配操作推导；普通请求不能占控制清理预留。loader 的页面暂存按真实容量付款，其阶段结束才退；角色和等待来源全部退休后再关最后控制。没有后台监督线程的栈、ThreadControl 或 changed/ack Notification 费用。
+管理记录、DONE/私有报告来源和有限控制调用槽来自 root 预付账户，容量由实际部署实例及并存装配操作推导；普通请求不能占控制清理预留。loader 的页面暂存按真实容量付款，其阶段结束才退；角色和等待来源全部退休后再关最后控制。没有后台监督线程的栈、ThreadControl 或 changed/ack Notification 费用。
 
 上表的等待与装载已接回 root，device_supervision 的独立线程、Shared 锁、双 Notification、终局抢占、admin ACK、撤防及 join/reap 已删除。后续新增装配路径须遵守同一接入约束，不能恢复独立观察者来补偿主线的阻塞等待。
 
@@ -195,7 +195,7 @@ Pool、bootstrap mailbox与缓冲由原worker owner贯穿出生/退出；Prepari
 | fs 主实例同时持独立文件与 registry provider；次实例只有文件并注册 `fs.secondary` | [fs boot](../user/services/srv_fs/src/server/boot.rs)、[部署容量](../user/services/srv_fs/src/lib.rs) | A/B 两组付款入口与双实例是验收配置；领域实现和收束路径由所有配置共用 |
 | 文件 backend 出生为空目录，数据在内存中；当前没有磁盘后端 | [MemoryBackend::with_bindings](../user/libraries/libfs/src/backend.rs) | 不增加启动归档挂载、驱动仓库、flush 或断电恢复的承诺 |
 | pm 的域没有 CREATE；实际负载是 Tunnel/流控及 test_target 收束 | [pm](../user/services/srv_pm/src/main.rs)、init 的 `pm_grants` | 保留其验收用途，不把二进制名称当成新增正式进程管理服务的理由 |
-| 两设备管理者已在 Start 前挂 DONE，root 等待与 loader 会推进监督 | [device_supervision](../user/services/srv_init/src/device_supervision.rs)、[loading](../user/services/srv_init/src/supervisor/loading.rs) | 扩展已有 root 监督责任，不增加线程、独立 supervisor 或新的执行框架 |
+| 两设备管理者已在 Start 前挂 DONE，root 等待与 loader 会推进监督 | [supervision](../user/services/srv_init/src/supervision.rs)、[loading](../user/services/srv_init/src/supervisor/loading.rs) | 扩展已有 root 监督责任，不增加线程、独立 supervisor 或新的执行框架 |
 | fs bootstrap 目前从首条消息取 PID，等待 Ready/Stopped 使用无限期限 | [filesystem](../user/services/srv_init/src/filesystem.rs) 的 `accept_fs_provider/confirm_primary_fs_ready/collect_fs_provider` | 迁移为出生前绑定身份、持续 DONE 观察与有限部署期限；这些接点属于本轮必要闭包 |
 
 首批系统部署选定 init、srv_device、srv_driver、按需驱动和一个 srv_fs（包含 registry）。srv_device、srv_driver 与 srv_fs 三个长期子宿主均为必需；没有键盘或当前平台没有可用设备不是启动失败，驱动仍按原声明和实际硬件启用。fs 初始为空内存目录，registry 初始可为空，boot 映像继续直接从现有启动来源取得。init 是这些管理/发布根的实际接收者；未来应用通过下述授权交付路径接入，不能以尚无应用为理由伪造示例常驻消费者。
@@ -219,8 +219,8 @@ fs 与 registry 继续共宿主，独立 mailbox、授权、状态和领域协�
 | 目标模块 / 关键持有 | 修改边界 |
 |---|---|
 | `srv_fs::startup`、`srv_fs::deployment` | 前者拥有宿主 profile 编解码与 grant/报文数量合同，后者集中容量和阶段期限；`server::boot` 组合原领域 provider |
-| `srv_init::supervision` | 接替当前 `device_supervision` 中的长期进程观察骨架；本地 `InstanceRecord` 持唯一进程阶段与 DONE 来源，系统 Terminal 归 root。设备来源/平台封口仍调用 `device`、`driver` 的领域接点 |
-| `srv_init::filesystem::Host` | 接管原 AcceptedFsProvider 的根、bootstrap、release 与就绪/停止事实，关联唯一 InstanceRecord，不持第二份 Control；文件业务探针另放同模块的验收子模块 |
+| `srv_init::supervision` | 本地 Record 持唯一进程阶段与 DONE 来源，系统 Terminal 归 root。设备来源/平台封口仍调用 `device`、`driver` 的领域接点 |
+| `srv_init::filesystem::{Host,Bootstrap}` | Host 持业务根与实例关联；Bootstrap 拥有私有报告、release/Pool 关联和就绪/停止事实，由同一 Record 持有。生命周期句柄不再复制到对外 Host，文件业务与批次退款验收位于 acceptance 子模块 |
 | `srv_init::deployment` | 拥有静态 profile 的映像选择、装配、常驻推进与内部停止入口；main 选择正式或验收编排，验收 `run` 调用相同宿主装配入口 |
 | 原 `supervisor` 与公共库 | RootSupervisor 继续唯一持 Assembly、能力账本和收集责任；已有 loader/RPC/Collector 及领域协议复用，不增加公共服务状态机或 facade |
 
@@ -265,7 +265,7 @@ root 保存两项独立单调事实：认证的 Stopped，以及真实 DONE 快�
 
 停止先于 Ready 时，root 保留原接收责任，接到的根只用于释放，迟到 Ready 不开放交付；已运行宿主沿同一停止路径退出，未 Start 的进程取消 Building。异常身份/格式使部署失败，收到的未采用能力仍由消息 owner 关闭。停止报告不增设提交确认、结果重传或持久事务。
 
-设备的完成谓词仍为原来源 Closed、Binding/Provision 安全及 Process Completed，不能套用 fs 的 Stopped 替换；共同观察骨架只汇合已由领域确认的结果。当前 `device_supervision::Terminal` 的唯一终局持有提升到 root 系统层，平台封口和设备来源清理由原领域接点提供；fs 失败也到这一出口，不再因“不是设备错误”进入无限失败服务循环。
+设备的完成谓词仍为原来源 Closed、Binding/Provision 安全及 Process Completed，不能套用 fs 的 Stopped 替换；共同观察骨架只汇合已由领域确认的结果。原 `device_supervision::Terminal` 的唯一终局持有提升到 root 系统层，现由 `supervision::Terminal` 实现；平台封口和设备来源清理由原领域接点提供，fs 失败也到这一出口，不再因“不是设备错误”进入无限失败服务循环。
 
 ### 发布未知与恢复边界
 
@@ -305,7 +305,7 @@ System 的初始根直接交付，没有首次按名注册事务。验收 second
 | 业务饱和占用停止承载，或提前退款 | 原 test_fs/流/Copy/Watch 保持非空并停止，普通请求被封、在途 owner 退休、报告与实际 Completed 匹配；无跨域持有的工作集在 Collector/最后 owner 后核原 Pool，不能仅靠日志“预算空” |
 | 原 A/B、secondary 发布与设备安全接线被改变 | 原 core 与 device 消费者沿同一生命周期完成，既有 Unknown/名称替换/热插合同保留；按实际修改触发精确补证，不重跑无关历史异常 |
 
-host 验证优先复用解码、来源与生命周期设施；新增用例仅针对表中可观察反例，不另造 provider/运行体。实施收尾执行 `just check`、`just clippy` 及构建手册要求的受影响 core、平台、设备停止/故障组合；系统部署的有限观察实例由操作者清理，外部收割不是正常停止通过证据。本轮是设计，未执行上述代码验收。
+host 验证优先复用解码、来源与生命周期设施；新增用例仅针对表中可观察反例，不另造 provider/运行体。实施收尾执行 `just check`、`just clippy` 及构建手册要求的受影响 core、平台、设备停止/故障组合；系统部署的有限观察实例由操作者清理，外部收割不是正常停止通过证据。设计提交时未运行代码验收；后续实施证据由下方实施记录拥有。
 
 ### 条件后续与设计交付检查
 
@@ -326,4 +326,92 @@ BrightReed 的只读讨论与主会话判断收敛为：可先交付有真实授
 
 交付前结构检查：范围与非目标、正常/失败/取消/退出、授权与付款、唯一进程持有、来源退休、停止与终局已有确定归属；没有新增锁序或内核 ABI，公共目录协议不扩展。持久化、恢复和外部客户端是有触发的能力后续，不是本轮未闭合 owner。设计只对选定基座闭合，D01/D02/D07–D09 的其它未来范围保留。文档验证与提交状态由本节末尾追加；提交后按 REVIEW 登记固定交付的可选独立审查，不把本轮讨论当作独立 Review。
 
-本轮文档验证：5 份变更均为 plans 文档；33 个新增本地链接、20 个标题锚点与代码围栏检查通过，`git diff --check` 通过。BrightReed 的意见仅作为设计收敛与所核源码事实，未执行独立 Review。未修改代码、impls 或 ideas，未运行编译、单测、QEMU。用户随后授权提交，设计固定为 `99f5e9bb3b9afd436b0e3aed4acd3662bc0aa698`，可选独立审查已另行登记；仅本地提交，未 push。下一步直接按本节迁移顺序实施，不能把这些设计检查当作常驻基座已运行的证据。
+设计轮文档验证：5 份变更均为 plans 文档；33 个新增本地链接、20 个标题锚点与代码围栏检查通过，`git diff --check` 通过。BrightReed 的意见仅作为设计收敛与所核源码事实，未执行独立 Review。该轮未修改代码、impls 或 ideas，未运行编译、单测、QEMU。用户随后授权提交，设计固定为 `99f5e9bb3b9afd436b0e3aed4acd3662bc0aa698`，可选独立审查已另行登记；仅本地提交，未 push。该设计轮证据不替代下方实施证据。
+
+
+## 静态基座实施接力（2026-10-28）
+
+授权基线 `caa1f5e`，分支 `refactor/system-redesign`，进入工作树干净。用户经 HighNewt 确认整轮实施；FairRiver 主写代码、impls 与本记录，HighNewt 只读结构检查；后续代码未授权 commit/push。本轮继续采用上述同一闭包与验证门，不拆成独立交付。
+
+已完成 Profile/Capacity、同一 Runtime 的必要来源回执门、本地 Instance/Record 的唯一 Control 与 Start 前 DONE/私有 bootstrap 观察、真实 Running 交付门、System 静态装配与记录集合驱动的停止。所有普通 ABI 创建自检已前置；验收 primary 保持运行至全局停止，secondary 保留非空 Copy/Watch 的局部退休。原 partial-admission/失败隔离使用已完成 pm 与已实际 detach 的 secondary Control 交原 Batch，未复制 Control。正式根由 root 持有并由共同停止释放；停止、来源注销、Collector 和根 Job 收集均纳入冻结总期限，完成后保留 Completed。
+
+开发证据：`just build_user` 通过，日志 `artifacts/run/service-foundation-build.log`。旧中间态两次 core 因错误的 Pool rights、根 Packet 的 At0 期限触发共同故障 Reboot；不是有界正常推进撞限，未扩大路线期限。现场分别为 `artifacts/failed-acceptance-20261028-143329-13556.log`、`artifacts/failed-acceptance-20261028-143449-14860.log`。修正后 core debug 开发路线通过：`artifacts/run/20261028-143850-15788-acceptance-virt-debug.log`；该现场早于根终局 owner、总停止期限及根收集收口，只作为中间开发证据。
+
+主要落点：`srv_fs::startup::Profile` 与 `deployment::Capacity` 拥有布局/预算推导；`srv_init::filesystem::{launch,hosting}` 拥有出生交付与认证报告；`supervision::{InstanceTask,Record}` 拥有长期进程与实际来源；`deployment::{system,Stop}` 拥有部署集合与停止聚合。旧 `device_supervision`、空 payload/secondary 字符串解释、独立 fs 阶段末收集和无限失败清理路径已删除。impls 已同步 startup/service/fs/device 的当前结构。
+
+
+### 最终验证与覆盖边界
+
+以下均保留完整日志；基座交付汇总为 `artifacts/service-foundation/results.txt`，中间返回码原表保留在同目录 `attempt-results.txt`。平台聚合首次未完整通过，不能把它的总返回码当最终失败或通过；sifive_u 原成功与 nofd 修正后成功分别列出。本表记录结构清理前的交付验证，不把早期开发检查重复计算为完整验收；后续清理涉及的回归由[清理记录](#交付后结构清理)单列，未变化的专项继续引用本表。
+
+| 验证门 | 最终结果与日志 |
+|---|---|
+| `just check` / 十一分面 `just clippy` | 通过；`artifacts/run/service-foundation-check-final.log`、`artifacts/run/service-foundation-clippy-final.log`，分面详情在 `artifacts/lint/` |
+| srv_fs host 协议与容量 | 两项通过；`artifacts/run/service-foundation-host.log`，显式 `aarch64-apple-darwin`，验证错误 payload/旧格式拒绝与 profile 容量关系 |
+| release core | 通过；`artifacts/run/20261028-144615-23859-acceptance-virt-release.log` |
+| debug stress | 通过；`artifacts/run/20261028-144710-25912-virt-stress.log`，保留原业务/额度/退休场景 |
+| sifive_u / nofd 完整 core | 分别通过；`artifacts/run/20261028-145143-35848-acceptance-sifive_u.log`、`artifacts/run/20261028-150032-40110-virt-nofd.log` |
+| 正式 System 有限来源观察 | 通过；`artifacts/service-foundation/system-observe-fixed.log`，证据 `artifacts/system-observe/20261028T070958.721125Z-44790/evidence.json` |
+| device 非空业务与正常停止 | 通过；`artifacts/run/20261028-151116-45246-acceptance-device-release.log` |
+| Driver 在 fs 装载期间故障 | 通过；`artifacts/run/20261028-151211-47371-acceptance-device-manager-fault-Driver-loading.log` |
+| Filesystem Start / 业务等待 / 停止中故障 | 分别通过；`artifacts/run/20261028-152358-50998-acceptance-device-manager-fault-Filesystem-start.log`、`artifacts/run/20261028-152553-51993-acceptance-device-manager-fault-Filesystem-wait.log`、`artifacts/run/20261028-154047-56311-acceptance-device-manager-fault-Filesystem-stopping.log` |
+| ColdReboot 被拒后的根终局与 DMA 保留 | 通过；`artifacts/run/20261028-154551-58001-acceptance-device-reset-rejection.log` |
+| 两个领取顺序及完成优先 | 通过；`artifacts/run/20261028-162414-88845-acceptance-fs-stop-order.log`，证据 `artifacts/fs-stop-order/20261028T082417.710357Z-89215/evidence.json` |
+
+System 证据限于三必需宿主真实就绪、无验收进程、root 在已 attached 的真实来源上 Infinite 等待且没有 deadline timer，以及恢复运行后的有限存活观察；不宣称四 hart 全 idle 或无限活性。外部进程最终被工具清理，不作正常停止证据。正式停止与故障路线复用同一装配，其全局停止实际推进仍存活的 primary→Driver→Device，保留设备独立安全完成谓词。
+
+双领取顺序的准确结论：secondary 正常领取 Stopped 先（`DONE_seen=false, stage_expired=false`）；primary 的实际 Dead=3 与原 DONE token Hint 已形成，外部仅延迟 root 调度后，在原阶段到期复查中 DONE 先（`DONE_seen=true, stage_expired=true`）。真实 tick 增量107435400、timebase10MHz，即10.74354s，达到原10s窗口。该次 root 在文件收集之后的 Driver 停止实际 snapshot 为199765330000ns，是 primary 领取时刻的后继上界，严格小于冻结总期限298768822000ns，尚余99003492000ns；证据 JSON 核同一日志第380/386/390/430行的顺序及最后 Requested Shutdown。未改 Guest 状态、结果、期限、Runtime 输入预算或产品通知顺序，不泛称控制了两种普通通知交付顺序。
+
+Filesystem Start 故障现场按同PID26实际非法指令与查询 snapshot（state=3/cause=5/detail0=8589934593/detail1=0）绑定交付拒绝，记录 `DONE_consumed=false`；不是伪称监督器已领取 DONE。wait/stopping 按真实 DONE 核对。各路线仍要求实际注入、唯一系统终局、Job/平台封口和 QMP真实 RESET，取证在第一轮 RESET 后结束，不跨 boot 拼证。Reset 拒绝只证明同一组映射仍由稳定 owner 保留及该路线四 hart 停驻，不证明硬件已静止。
+
+### 开发失败、工具尝试与修复复核
+
+nofd 原现场 `artifacts/failed-acceptance-20261028-145255-38743.log` 在基础服务出生前报 `DMA cancellation retained write permission`。原自检仅等 WaitSet READABLE/CLOSED 提示；亲核 WaitSet、MemoryObject seal/publish 与最后 Close 退休后，改为等同一对象真实 EXECUTABLE 再 query 写许可0，并保留 plain Seal/DONE 后续。HighNewt 确认属于本轮必要消费者闭包；未改内核/DMA合同，未扩大期限。修正后的 nofd 成功在上表。该证据证明 LastClose 触发取消后的写许可释放，不单凭该电平宣称全部 mapping/Pool 已退款。
+
+System 工具初次使用错误 syscall 号而未命中，修为实际 Debug=1 后取证通过；中间用户主动收割重启的返回码不记成产品失败。Filesystem Start 工具初版只认 DONE、错过更早真实 Running 拒绝并沿到下轮 boot；已按上述实际 snapshot 分支修复。stopping 初次过晚 attach 错过窗口；其后全 syscall 观察曾干扰旧 Watch 期限，未作为预期 fault 通过；改用原 debug_print 停止意图预置断点后，才取得上表完整成功现场。没有为这些工具失败修改业务期限或弱化 fault 判据。
+
+双顺序工具尝试现场保留在 `artifacts/fs-stop-order/`：`20261028T074703.261826Z-59230` 未保持 raw vCont 断点；`20261028T075402.328185Z-67082` 发现同问题后主动结束；后续 `20261028T075625.660123Z-72010`、`20261028T080648.296768Z-81540` 已见实际 Dead/Hint，但旧 bootstrap 提示仍先被 Runtime 的原输入预算领取，未证明 DONE-first。最终改为上述原 expiry recheck 的调度取证，不改 Runtime/产品预算；其间 `20261028T082356.995355Z-88782` 的 timebase 十六进制解析 preflight 失败未启动 Guest。工具 raw vCont 必须 always-inserted 的规则已入工具手册。所有尝试的外部进程均已清理；最终成功后未继续追自然反转窗口。
+
+交付前结构检查及 HighNewt 协作检查均已复核以下原 findings：首次根/secondary Register 前共用必要来源就绪谓词；五槽角色/权限和出生 grant 对齐；唯一进程 owner、真实 Running 与 Start 前 gate/期限；正式 root 根持有及停止中迟到根立即释放；设备 Closed 与 fs Stopped 各自单一真值；总停止期限覆盖 detach/Collector/根收尾且 Completed 明确；正式 Pool 非零仅观察；System ELF audit 只核实际打包清单。
+
+PreparedProcess finding 已修复并经 HighNewt 静态复核：出生准备完成后的发布失败、`start_manager` 移交前 gate/槽拒绝，以及 Stop-before-Start 的 `cancel_unstarted` 均显式复用 `cancel_prepared`→原 Collector；取消提交失败在 owner 尚存时直接共同终局，不返回触发 PreparedProcess 同步 Drop/INFINITE 等待。未改公共库析构合同，未建第二套清理框架。正常 Disposition/Cleanup 与退款重试保留；移除的是旧无限 failure/reset 重试路径。
+
+结构收口按 REVIEW 核契约、消费者、付款、取消/迟到结果、来源实退、旧路径及 impls。长期控制仍是 Record 的单一所有权，同一 Assembly 推进，无新共享锁、锁序或公共内核 ABI；没有新增用户 fault→kernel panic。host 用例捕获私有启动格式/容量关系，GDB 工具只作为既有真实消费者的外部取证，不造运行体。语法、文档链接及 `git diff --check` 通过。本轮承诺范围无未闭合责任；未穷举每种错误身份、配额和 Stop-before-Ready 交错，这些按对应校验/owner路径静态复核，不冒称均有动态注入。真实硬件、持久化、恢复、外部关机与普通服务管理仍按原条件表；代码提交后才登记固定代码 Review。
+
+最终离线收口：四个修改/新增 Python 工具及九段内嵌 GDB Python 解析通过；315个本地文档链接、74个标题锚点及本记录全部证据路径存在性通过，Justfile解析通过。最后 `just check`、十一分面 `just clippy` 返回码均为0；无遗留 QEMU/GDB 进程。COMPASS、总纲与关机案已移除本轮失效的施工下一步，保留条件后续；没有追加已通过的 QEMU 组合。上述检查日志在 `artifacts/service-foundation/offline-checks.log`、`final-checks.status`；当前全部改动仍未提交，未 push。
+
+### 部署容量核算与证据口径
+
+`startup::Profile` 唯一选择入口与报文数量；`deployment::Capacity` 的基础 task 项为150、基础 source 项为217，另加每入口实际根数（带 registry 为4，secondary为2）。System 为154 task/221 source，AcceptancePrimary 为158/225，Secondary 为152/219；这是宿主运行体容量，不是 init 必需集合的公共上限。每条根带 entries 个能力，System/Primary四根+Ready+Stopped共6条，Secondary管理根+Ready+Stopped共3条，均编译核 ABI 上限。
+
+文件 Pool 页数直接累加 validated ELF runs（含 BSS）、ABI主栈、一页当前出生块与4096页显式堆/数据工作集。System debug 两个 runs 为260页，主栈2048页，出生1页，合计6405页；Ready实际分配2365页，余量4040页。4096页是选择的16MiB运行工作集，并非 allocator 或全部领域额度同时成功的承诺：fs、registry各2MiB用户态Bytes账户限制领域记录/数据，另为 Runtime/Assembly 预付输入、请求/回复临时缓冲、16个流会话（各3页Tunnel）、容器增长/退休并存及allocator粒度留空间。领域费用、映射页和metadata属于不同计量维度，不将它们简单相加声称物理硬保证；超额仍可返回原资源错误。
+
+metadata选择1MiB（131072个8字节槽）的主要依据：独立进程VM固定ledger为4096个96B区域项与16个88B事务项，启动日志给出最低394624B；另有ProcessShell/Thread、cap表、映像/栈/出生/堆/流的MemoryObject、backing、region及Mailbox、Lifetime、Notification和退休责任。debug ELF只读尺寸样本（`artifacts/service-foundation/layout-sizes.log`）为WaitSet Member104B、Registration80B、WaitSet376B、Shell384B、Thread1040B；登记另收费AVL链接/Charge和对象头，不能只计这些payload。最宽225来源的payload约41KiB，来源整体规划留128KiB；16请求最大收/发payload基数约128KiB，角色/Watch/流、cap表扩张与退休并存另留余量。System Ready实际metadata65443槽=523544B，距1MiB余525032B，可容纳这些主要动态项；验收核正常准入、原Quota/恢复和最后owner退款。这是选定配置的容量与检查量级，不是任意全部上界同时饱和都可成功的证明，也不是所有allocator碎片的上界。
+
+MemoryPoolSnapshot没有逐Pool高水位。Ready、停止前与Collector后均为时点样本，不记成峰值；不加内核ABI或周期探针。无外域owner的secondary验收在最后Collector后核双维0；正式聚合只报告余额，不以0账裁决服务完成或设备安全。
+
+## 交付后结构清理
+
+用户在上述验收交付后授权整理代码并更新计划、文档。基线仍为 `caa1f5e` 加本轮未提交实现，已有实现和证据全部保留。代码/工具对照快照为 `artifacts/service-foundation/cleanup-baseline-20261028-180612.tar.gz`（包含新增文件、原 diff 与删除清单），文档对照位于 `artifacts/service-foundation-cleanup/docs-before/`。FairRiver 主写代码及必要工具同步，HighNewt 审阅接口和责任链并主写本文与 impls。
+
+清理范围来自实际调用与成形结构：文件 Host 与 Bootstrap 重复保存生命周期句柄；`retire_filesystem` 的布尔参数隐藏正式 Collector 与验收批次两种控制权去向；长期监督的启动返回值借出 Control，却复用表示出生移交的 `Spawned`；验收退款检查混在正式宿主模块；旧 `serve_forever` 仅转系统故障，以及固定两管理者、旧验收次序等失效描述。
+
+同轮删除未使用的 `_job` 参数和 Secondary 单入口的等价判断，将 reset authority 负测与最终系统动作分开，修正部署局部名称与过时阶段日志。保留有独立合同的 Reboot/重复停止分支、实际 Await 查询、Copy 自有期限以及取消/来源退休状态；不以当前调用者少为理由删除这些契约，也不为统一外观引入通用服务框架。
+
+保持现有外部语义及责任顺序：生命周期关联归原 Bootstrap/实例记录，Host 只保留实例关联和业务根；停止意图先于 signal，Stopped/DONE 汇合和实际来源注销先于 Control 转交。正式收集和验收批次交接采用明确接点，验收在取出 Control 前预留接管容量；取消仍复用 `cancel_prepared`，不恢复同步析构等待。启动只返回借用身份或 PID，进程 owner 留在 Record；不增加公共框架、平行账本或新状态机。
+
+代码清理与验证已完成，相对快照修改10个源码文件，独立差异为 `artifacts/service-foundation-cleanup/code.diff`。`start_instance` 仅返回 PID，`instance_snapshot` 借原 Control 查询；Host 不再保存 bootstrap/release/Pool 句柄。`begin_filesystem_stop` 和 `close_filesystem_report` 统一使用原 Bootstrap，后者显式要求来源已实退；`detach_filesystem` 返回唯一 Supervised，正式调用立即交 Collector，验收 `track_stopped_host` 在预留容量后接管并继续原 Batch。验收退款组织已迁入 acceptance，reset 负测与正式动作分离，旧失败包装和未使用参数已删除。
+
+结构复核已确认 Control 转交之间没有新增可失败操作、报告接点仍在来源实退之后关闭，Pool 的验收零账仍在 Batch 收集之后判断。原 InstanceTask 的消息领取、到期复查、异常 DONE 与终局封口判据未改；不新增状态机或改变公开契约。impls 已按职责归属回填，计划中的两管理者固定容量与 ABI 后置描述已校正。
+
+清理后验证：
+
+| 验证 | 结果与日志 |
+|---|---|
+| `just check` / 十一分面 `just clippy` | 返回0；`artifacts/service-foundation-cleanup/check.log`、`clippy.log`。check 保留原内核两项未使用依赖警告，本次未改变内核依赖 |
+| `just acceptance-virt` | release 完整 core 通过，覆盖 secondary 批次接管/退款、primary 正式 Collector、设备停止及原 reset 负测；`artifacts/run/20261028-181307-2974-acceptance-virt-release.log` |
+| `just system-observe` | 三必需宿主及 root 的真实 Infinite 来源有限观察通过；`artifacts/run/20261028-181130-1970-system-observe.log`，现场 `artifacts/system-observe/20261028T101134.594621Z-2353/evidence.json` |
+
+误用 `just virt-release` 的首轮正常退出仅保留为演示开发证据（`artifacts/service-foundation-cleanup/core-release.log`），不计严格 core 验收；其后使用上表正确入口补证。源码接口残留搜索、文档本地链接/锚点和 `git diff --check` 已核对；文档最终增量为3篇、90个本地链接及19个锚点，全部通过（`artifacts/service-foundation-cleanup/docs-final.log`）。工具未修改，其解析与未变化专项沿用原交付证据。
+
+未改变消息/到期判据、硬件/平台或故障收束，因此未重跑双顺序及全部平台/故障组合；未变化的专项和 host 协议用例继续由上表交付证据拥有，不记为清理后重新运行。当前无本轮新增未闭合责任，未来能力和独立 Review 的条件保持原记录，未提交或 push。

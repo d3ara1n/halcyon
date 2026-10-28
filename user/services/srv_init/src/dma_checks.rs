@@ -186,6 +186,16 @@ pub(super) fn run(handle: Handle) -> Result<(), &'static str> {
     cancelled
         .wait(libkernel::time::Deadline::INFINITE)
         .map_err(|_| "DMA last Close did not cancel unexposed Pin")?;
+    // 集合 READABLE/CLOSED 只提示最后 Close，写许可由原退休责任异步释放。
+    // Seal 仅封新写；实际 EXECUTABLE 才证明原许可已释放，不代替 mapping/Pool DONE。
+    memory
+        .seal()
+        .map_err(|_| "DMA cancellation memory Seal failed")?;
+    let executable = wait::wait_one(memory.handle(), ObjectSignals::EXECUTABLE, REFUND_MILLIS)
+        .map_err(|_| "DMA cancellation executable wait failed")?;
+    if !executable.observed.contains(ObjectSignals::EXECUTABLE) {
+        return Err("DMA cancellation did not release write permission before deadline");
+    }
     if memory
         .query()
         .map_err(|_| "DMA cancellation memory query failed")?
