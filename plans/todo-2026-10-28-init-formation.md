@@ -460,4 +460,4 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 修复后 `just check srv_init`、`just clippy srv_init` 通过，日志分别为 `artifacts/checks/20261029T095211.461840Z-92539/srv_init.log`、`20261029T095211.960153Z-92578/srv_init.log`。独立运行 memory/basic 取得 PID 2 Start、领域完成、正常 DONE、全部收集和 Requested Shutdown；随后 services/basic 的 device/driver/fs 全部 Ready，再按 fs→driver→device 正常 Stopped/DONE 后关机。该出生阻塞已关闭，逐条运行结果由[验收记录](todo-2026-10-29-acceptance-groups.md#逐条运行与修复2026-10-29)拥有；这些正路径不替代组态完成门中的负路径证据。
 
-交付前结构核查：改动只增加源能力的转授权，HandleGrant 目标权限、所有权移交、Consumed 处理、Preparation 失败收束和内核检查均保持；未新增 unsafe、锁或回调，impls 已回填。任务/常驻两类真实消费者验证通过，不为两处权限表达式补镜像单测。本次产品修复尚未提交，提交后按 REVIEW 记录其固定范围。
+交付前结构核查：改动只增加源能力的转授权，HandleGrant 目标权限、所有权移交、Consumed 处理、Preparation 失败收束和内核检查均保持；未新增 unsafe、锁或回调，impls 已回填。任务/常驻两类真实消费者验证通过，不为两处权限表达式补镜像单测。本次产品修复已提交为 `fe0ed70`；[可选独立 Review](todo-2026-10-29-init-grant-fix-review.md)已登记，未执行。

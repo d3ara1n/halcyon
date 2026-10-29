@@ -27,6 +27,7 @@
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
 | 静态常驻基座设计的可选独立 Review | [固定 99f5e9b 的登记](todo-2026-10-28-service-foundation-design-review.md)，未执行 |
 | 静态常驻基座代码交付的可选独立 Review | [固定 bfb4fdd 的登记](todo-2026-10-28-service-foundation-review.md)，未执行 |
+| init 出生转授权修复的可选独立 Review | [固定 fe0ed70 的登记](todo-2026-10-29-init-grant-fix-review.md)，未执行 |
 | 设备修复交付的可选独立 Review | [固定 e23afdb 的登记](todo-2026-10-28-device-driver-fixes-review.md)，未执行 |
 | 设备体系设计基线审查档案 | [原发现与修订复核](archived/review-2026-10-23-device-system-design.md)；后续增量与施工入口见设备主计划 |
 | 首批设计增量与第二轮完整交付的整体审查 | [统一报告、修复与验证档案](archived/review-2026-10-28-device-driver-overall.md)；原两份固定登记已归档，历史范围见报告 |
